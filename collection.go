@@ -86,7 +86,6 @@ func (c *Collection) InsertMany(docs ...any) (result Result, err error) {
 	defer parserPool.Put(p)
 
 	var items = make([]item, 0, len(docs))
-
 	for _, doc := range docs {
 		it, err := parseItem(p, doc, true)
 		if err != nil {
@@ -100,8 +99,19 @@ func (c *Collection) InsertMany(docs ...any) (result Result, err error) {
 
 	for len(items) != 0 {
 		var handled int
-		err = c.db.db.Update(func(txn *badger.Txn) error {
-			for i, it := range items {
+		err = c.db.db.Update(func(txn *badger.Txn) (err error) {
+			var (
+				i  int
+				it item
+			)
+			defer func() {
+				if err == badger.ErrTxnTooBig {
+					items = items[i:]
+					handled = i
+					err = nil
+				}
+			}()
+			for i, it = range items {
 				k := c.dataNS.Peek().AppendPart(it.id).Copy()
 				_, getErr := txn.Get(k)
 				if getErr == nil {
@@ -111,19 +121,9 @@ func (c *Collection) InsertMany(docs ...any) (result Result, err error) {
 					return getErr
 				}
 				if err = txn.Set(k, it.val.MarshalTo(nil)); err != nil {
-					if err == badger.ErrTxnTooBig {
-						items = items[i:]
-						handled = i
-						return nil
-					}
-					return err
+					return
 				}
 				if err = c.handleInsertIndexes(txn, it); err != nil {
-					if err == badger.ErrTxnTooBig {
-						items = items[i:]
-						handled = i
-						return nil
-					}
 					return err
 				}
 			}
@@ -140,11 +140,121 @@ func (c *Collection) InsertMany(docs ...any) (result Result, err error) {
 	return
 }
 
-func (c *Collection) UpsertOne(ctx context.Context, doc any) (docId string, err error) {
-	return
+func (c *Collection) UpsertOne(doc any) (docId any, err error) {
+	p := parserPool.Get()
+	defer parserPool.Put(p)
+
+	it, err := parseItem(p, doc, true)
+	if err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	err = c.db.db.Update(func(txn *badger.Txn) error {
+		k := c.dataNS.Peek().AppendPart(it.id)
+		res, getErr := txn.Get(k)
+		var prevValue item
+		if getErr == nil {
+			if err = res.Value(func(val []byte) error {
+				prevValue.val, err = p.ParseBytes(val)
+				return err
+			}); err != nil {
+				return err
+			}
+		} else if getErr != badger.ErrKeyNotFound {
+			return getErr
+		}
+		if setErr := txn.Set(k, it.val.MarshalTo(nil)); setErr != nil {
+			return setErr
+		}
+		if prevValue.val == nil {
+			if idxErr := c.handleInsertIndexes(txn, it); idxErr != nil {
+				return idxErr
+			}
+		} else {
+			prevValue.id = it.id
+			if idxErr := c.handleUpdateIndexes(txn, prevValue, it); idxErr != nil {
+				return idxErr
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return encoding.DecodeToAny(it.id)
 }
 
-func (c *Collection) UpsertMany(ctx context.Context, docs ...any) (result Result, err error) {
+func (c *Collection) UpsertMany(docs ...any) (result Result, err error) {
+	p := parserPool.Get()
+	defer parserPool.Put(p)
+
+	var items = make([]item, 0, len(docs))
+	for _, doc := range docs {
+		it, err := parseItem(p, doc, true)
+		if err != nil {
+			return Result{}, err
+		}
+		items = append(items, it)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for len(items) != 0 {
+		var handled int
+		err = c.db.db.Update(func(txn *badger.Txn) (err error) {
+			var (
+				i  int
+				it item
+			)
+			defer func() {
+				if err == badger.ErrTxnTooBig {
+					items = items[i:]
+					handled = i
+					err = nil
+				}
+			}()
+			for i, it = range items {
+				k := c.dataNS.Peek().AppendPart(it.id).Copy()
+				res, getErr := txn.Get(k)
+				var prevValue item
+				if getErr == nil {
+					if err = res.Value(func(val []byte) error {
+						prevValue.val, err = p.ParseBytes(val)
+						return err
+					}); err != nil {
+						return err
+					}
+				} else if getErr != badger.ErrKeyNotFound {
+					return getErr
+				}
+				if err = txn.Set(k, it.val.MarshalTo(nil)); err != nil {
+					return
+				}
+
+				if prevValue.val == nil {
+					if err = c.handleInsertIndexes(txn, it); err != nil {
+						return
+					}
+				} else {
+					prevValue.id = it.id
+					if err = c.handleUpdateIndexes(txn, prevValue, it); err != nil {
+						return
+					}
+				}
+			}
+			handled = len(items)
+			items = nil
+			return nil
+		})
+		if err != nil {
+			return
+		} else {
+			result.AffectedRows += handled
+		}
+	}
 	return
 }
 
@@ -156,7 +266,8 @@ func (c *Collection) UpdateMany(ctx context.Context, query, update any) (result 
 	return
 }
 
-func (c *Collection) DeleteId(ctx context.Context, docId string) (err error) {
+func (c *Collection) DeleteId(ctx context.Context, docId any) (err error) {
+
 	return
 }
 
@@ -206,7 +317,15 @@ func (c *Collection) Count(query any) (count int, err error) {
 	return
 }
 
-func (c *Collection) handleInsertIndexes(tx setter, it item) (err error) {
+func (c *Collection) handleInsertIndexes(txn *badger.Txn, it item) (err error) {
+	return
+}
+
+func (c *Collection) handleDeleteIndexes(txn *badger.Txn, it item) (err error) {
+	return
+}
+
+func (c *Collection) handleUpdateIndexes(txn *badger.Txn, prev, new item) (err error) {
 	return
 }
 
