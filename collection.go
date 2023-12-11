@@ -15,7 +15,8 @@ import (
 )
 
 var (
-	ErrDuplicatedId = errors.New("duplicated id")
+	ErrDuplicatedId     = errors.New("duplicated id")
+	ErrDocumentNotFound = errors.New("document not found")
 )
 
 type Collection struct {
@@ -266,9 +267,38 @@ func (c *Collection) UpdateMany(ctx context.Context, query, update any) (result 
 	return
 }
 
-func (c *Collection) DeleteId(ctx context.Context, docId any) (err error) {
+func (c *Collection) DeleteId(docId any) (err error) {
+	p := parserPool.Get()
+	defer parserPool.Put(p)
 
-	return
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.db.db.Update(func(txn *badger.Txn) error {
+		k := key.Key(encoding.AppendAnyValue(c.dataNS.Peek().AppendPart(nil), docId))
+		res, err := txn.Get(k)
+		if err != nil {
+			if err == badger.ErrKeyNotFound {
+				return ErrDocumentNotFound
+			} else {
+				return err
+			}
+		}
+		var it = item{id: k.LastPart()}
+		if err = res.Value(func(val []byte) error {
+			it.val, err = fastjson.ParseBytes(val)
+			return err
+		}); err != nil {
+			return err
+		}
+		if err = txn.Delete(k); err != nil {
+			return err
+		}
+		if err = c.handleDeleteIndexes(txn, it); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 func (c *Collection) DeleteMany(ctx context.Context, query any) (err error) {

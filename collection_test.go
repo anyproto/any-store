@@ -182,6 +182,30 @@ func TestCollection_UpsertMany(t *testing.T) {
 	})
 }
 
+func TestCollection_DeleteId(t *testing.T) {
+	t.Run("not found", func(t *testing.T) {
+		fx := newFixture(t)
+		defer fx.finish()
+
+		coll, err := fx.Collection("test")
+		require.NoError(t, err)
+		assert.ErrorIs(t, coll.DeleteId("123"), ErrDocumentNotFound)
+	})
+	t.Run("success", func(t *testing.T) {
+		fx := newFixture(t)
+		defer fx.finish()
+
+		coll, err := fx.Collection("test")
+		require.NoError(t, err)
+
+		_, err = coll.InsertOne(map[string]string{"id": "123"})
+		require.NoError(t, err)
+
+		assert.NoError(t, coll.DeleteId("123"))
+		assertCount(t, coll, 0)
+	})
+}
+
 func assertCount(t *testing.T, coll *Collection, expected int) {
 	count, err := coll.Count(nil)
 	require.NoError(t, err)
