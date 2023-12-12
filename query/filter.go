@@ -33,6 +33,9 @@ type Comp struct {
 }
 
 func (e *Comp) Ok(v *fastjson.Value) bool {
+	if v == nil {
+		return false
+	}
 	if v.Type() == fastjson.TypeArray {
 		vals, _ := v.Array()
 		for _, val := range vals {
@@ -173,4 +176,14 @@ func (e Not) Ok(v *fastjson.Value) bool {
 
 func (e Not) String() string {
 	return fmt.Sprintf(`{"$not": %s}`, e.Filter.String())
+}
+
+type all struct{}
+
+func (a all) Ok(_ *fastjson.Value) bool {
+	return true
+}
+
+func (a all) String() string {
+	return "null"
 }

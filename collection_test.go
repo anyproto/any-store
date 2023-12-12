@@ -1,12 +1,16 @@
 package anystore
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fastjson"
+
+	"github.com/anyproto/any-store/query"
 )
 
 func TestCollection_InsertOne(t *testing.T) {
@@ -204,6 +208,62 @@ func TestCollection_DeleteId(t *testing.T) {
 		assert.NoError(t, coll.DeleteId("123"))
 		assertCount(t, coll, 0)
 	})
+}
+
+func TestCollection_FindId(t *testing.T) {
+	t.Run("not found", func(t *testing.T) {
+		fx := newFixture(t)
+		defer fx.finish()
+
+		coll, err := fx.Collection("test")
+		require.NoError(t, err)
+		_, err = coll.FindId("123")
+		assert.ErrorIs(t, err, ErrDocumentNotFound)
+	})
+	t.Run("success", func(t *testing.T) {
+		fx := newFixture(t)
+		defer fx.finish()
+
+		coll, err := fx.Collection("test")
+		require.NoError(t, err)
+
+		doc := map[string]any{"id": "123", "a": float64(42)}
+		_, err = coll.InsertOne(doc)
+		require.NoError(t, err)
+		it, err := coll.FindId("123")
+		require.NoError(t, err)
+		var res any
+		require.NoError(t, it.Decode(&res))
+		assert.Equal(t, doc, res)
+	})
+}
+
+func TestCollection_FindMany(t *testing.T) {
+	fx := newFixture(t)
+	defer fx.finish()
+
+	coll, err := fx.Collection("test")
+	require.NoError(t, err)
+
+	for i := 0; i < 100000; i++ {
+		_, err = coll.InsertOne(map[string]any{"id": i, "data": fmt.Sprint(i)})
+		require.NoError(t, err)
+	}
+
+	f, err := query.ParseCondition(`{"id":4}`)
+	require.NoError(t, err)
+
+	st := time.Now()
+	it, err := coll.FindMany(f)
+	require.NoError(t, err)
+	defer it.Close()
+	for it.Next() {
+		var v json.RawMessage
+		require.NoError(t, it.Item().Decode(&v))
+		t.Log(string(v))
+	}
+	t.Log(time.Since(st))
+
 }
 
 func assertCount(t *testing.T, coll *Collection, expected int) {

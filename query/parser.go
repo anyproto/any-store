@@ -59,6 +59,13 @@ func ParseCondition(cond any) (Filter, error) {
 	p := parserPool.Get()
 	defer parserPool.Put(p)
 
+	if cond == nil {
+		return all{}, nil
+	}
+	if f, ok := cond.(Filter); ok {
+		return f, nil
+	}
+
 	v, err := parser.AnyToJSON(p, cond)
 	if err != nil {
 		return nil, err

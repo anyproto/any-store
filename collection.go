@@ -12,6 +12,7 @@ import (
 	"github.com/anyproto/any-store/internal/encoding"
 	"github.com/anyproto/any-store/internal/key"
 	"github.com/anyproto/any-store/internal/parser"
+	"github.com/anyproto/any-store/query"
 )
 
 var (
@@ -60,10 +61,10 @@ func (c *Collection) InsertOne(doc any) (docId any, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	err = c.db.db.Update(func(txn *badger.Txn) error {
-		k := c.dataNS.Peek().AppendPart(it.id)
+		k := key.Key(it.appendId(c.dataNS.Peek().AppendPart(nil)))
 		_, getErr := txn.Get(k)
 		if getErr == nil {
-			idAny, _ := encoding.DecodeToAny(it.id)
+			idAny, _ := encoding.DecodeToAny(it.appendId(nil))
 			return fmt.Errorf("%w: %v", ErrDuplicatedId, idAny)
 		} else if getErr != badger.ErrKeyNotFound {
 			return getErr
@@ -79,7 +80,7 @@ func (c *Collection) InsertOne(doc any) (docId any, err error) {
 	if err != nil {
 		return nil, err
 	}
-	return encoding.DecodeToAny(it.id)
+	return encoding.DecodeToAny(it.appendId(nil))
 }
 
 func (c *Collection) InsertMany(docs ...any) (result Result, err error) {
@@ -113,10 +114,10 @@ func (c *Collection) InsertMany(docs ...any) (result Result, err error) {
 				}
 			}()
 			for i, it = range items {
-				k := c.dataNS.Peek().AppendPart(it.id).Copy()
+				k := key.Key(it.appendId(c.dataNS.Peek().AppendPart(nil).Copy()))
 				_, getErr := txn.Get(k)
 				if getErr == nil {
-					idAny, _ := encoding.DecodeToAny(it.id)
+					idAny, _ := encoding.DecodeToAny(it.appendId(nil))
 					return fmt.Errorf("%w: %v", ErrDuplicatedId, idAny)
 				} else if getErr != badger.ErrKeyNotFound {
 					return getErr
@@ -153,7 +154,7 @@ func (c *Collection) UpsertOne(doc any) (docId any, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	err = c.db.db.Update(func(txn *badger.Txn) error {
-		k := c.dataNS.Peek().AppendPart(it.id)
+		k := key.Key(it.appendId(c.dataNS.Peek().AppendPart(nil)))
 		res, getErr := txn.Get(k)
 		var prevValue item
 		if getErr == nil {
@@ -174,7 +175,6 @@ func (c *Collection) UpsertOne(doc any) (docId any, err error) {
 				return idxErr
 			}
 		} else {
-			prevValue.id = it.id
 			if idxErr := c.handleUpdateIndexes(txn, prevValue, it); idxErr != nil {
 				return idxErr
 			}
@@ -184,7 +184,7 @@ func (c *Collection) UpsertOne(doc any) (docId any, err error) {
 	if err != nil {
 		return nil, err
 	}
-	return encoding.DecodeToAny(it.id)
+	return encoding.DecodeToAny(it.appendId(nil))
 }
 
 func (c *Collection) UpsertMany(docs ...any) (result Result, err error) {
@@ -218,7 +218,7 @@ func (c *Collection) UpsertMany(docs ...any) (result Result, err error) {
 				}
 			}()
 			for i, it = range items {
-				k := c.dataNS.Peek().AppendPart(it.id).Copy()
+				k := key.Key(it.appendId(c.dataNS.Peek().AppendPart(nil).Copy()))
 				res, getErr := txn.Get(k)
 				var prevValue item
 				if getErr == nil {
@@ -240,7 +240,6 @@ func (c *Collection) UpsertMany(docs ...any) (result Result, err error) {
 						return
 					}
 				} else {
-					prevValue.id = it.id
 					if err = c.handleUpdateIndexes(txn, prevValue, it); err != nil {
 						return
 					}
@@ -284,7 +283,7 @@ func (c *Collection) DeleteId(docId any) (err error) {
 				return err
 			}
 		}
-		var it = item{id: k.LastPart()}
+		var it = item{}
 		if err = res.Value(func(val []byte) error {
 			it.val, err = fastjson.ParseBytes(val)
 			return err
@@ -317,12 +316,55 @@ func (c *Collection) DropIndex(ctx context.Context, indexName string) (err error
 	return
 }
 
-func (c *Collection) FindId(ctx context.Context, docId string) (item Item, err error) {
+func (c *Collection) FindId(docId any) (res Item, err error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	err = c.db.db.View(func(txn *badger.Txn) error {
+		key := key.Key(encoding.AppendAnyValue(c.dataNS.Peek().Copy().AppendPart(nil), docId))
+		it, err := txn.Get(key)
+		if err != nil {
+			return err
+		}
+
+		p := parserPool.Get()
+		defer parserPool.Put(p)
+
+		return it.Value(func(val []byte) error {
+			jval, err := p.ParseBytes(val)
+			if err != nil {
+				return err
+			}
+			res = item{
+				val: jval,
+			}
+			return nil
+		})
+	})
+	if err == badger.ErrKeyNotFound {
+		err = ErrDocumentNotFound
+	}
 	return
 }
 
-func (c *Collection) FindMany(ctx context.Context, query any) (iterator Iterator, err error) {
-	return
+func (c *Collection) FindMany(q any) (iterator Iterator, err error) {
+	filter, err := query.ParseCondition(q)
+	if err != nil {
+		return nil, err
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	iter := newDirectIterator()
+	iter.txn = c.db.db.NewTransaction(false)
+	iter.it = iter.txn.NewIterator(badger.IteratorOptions{
+		PrefetchSize:   100,
+		PrefetchValues: true,
+		Prefix:         c.dataNS.Peek(),
+	})
+	iter.it.Rewind()
+	iter.filter = filter
+	return iter, nil
 }
 
 func (c *Collection) Count(query any) (count int, err error) {

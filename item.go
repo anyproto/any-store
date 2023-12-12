@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/valyala/fastjson"
@@ -33,14 +34,27 @@ func newItem(val *fastjson.Value, withId bool) (item, error) {
 		}
 	}
 	it := item{
-		id:  id,
 		val: val,
 	}
-	objVal.Del("id")
 	return it, nil
 }
 
 type item struct {
-	id  []byte
 	val *fastjson.Value
+}
+
+func (i item) appendId(b []byte) []byte {
+	idVal := i.val.Get("id")
+	if idVal == nil {
+		panic("document without id")
+	}
+	return encoding.AppendJSONValue(b, idVal)
+}
+func (i item) Decode(v any) (err error) {
+	bytes := i.val.MarshalTo(nil)
+	return json.Unmarshal(bytes, v)
+}
+
+func (i item) DecodeFastJSON(f func(v *fastjson.Value) error) error {
+	return f(i.val)
 }
