@@ -325,10 +325,6 @@ func (c *Collection) FindMany(ctx context.Context, query any) (iterator Iterator
 	return
 }
 
-func (c *Collection) Len(ctx context.Context) (int, error) {
-	return 0, nil
-}
-
 func (c *Collection) Count(query any) (count int, err error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
