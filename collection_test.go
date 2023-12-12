@@ -9,8 +9,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fastjson"
-
-	"github.com/anyproto/any-store/query"
 )
 
 func TestCollection_InsertOne(t *testing.T) {
@@ -250,11 +248,8 @@ func TestCollection_FindMany(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	f, err := query.ParseCondition(`{"id":4}`)
-	require.NoError(t, err)
-
 	st := time.Now()
-	it, err := coll.FindMany(f)
+	it, err := coll.FindMany(`{"id":{"$in":[5,125]}}`)
 	require.NoError(t, err)
 	defer it.Close()
 	for it.Next() {
@@ -263,7 +258,6 @@ func TestCollection_FindMany(t *testing.T) {
 		t.Log(string(v))
 	}
 	t.Log(time.Since(st))
-
 }
 
 func assertCount(t *testing.T, coll *Collection, expected int) {
