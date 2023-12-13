@@ -83,9 +83,10 @@ func TestCollection_InsertMany(t *testing.T) {
 		coll, err := fx.Collection("test")
 		require.NoError(t, err)
 
+		var a = &fastjson.Arena{}
 		var docs = make([]any, 100000)
 		for i := range docs {
-			docs[i] = newSmallIntObject(i)
+			docs[i] = newSmallIntObject(a, i)
 		}
 		res, err := coll.InsertMany(docs...)
 		require.NoError(t, err)
@@ -186,8 +187,9 @@ func TestCollection_UpsertMany(t *testing.T) {
 		require.NoError(t, err)
 
 		var docs = make([]any, 100000)
+		var a = &fastjson.Arena{}
 		for i := range docs {
-			docs[i] = newSmallIntObject(i)
+			docs[i] = newSmallIntObject(a, i)
 		}
 		res, err := coll.UpsertMany(docs...)
 		require.NoError(t, err)
@@ -278,11 +280,12 @@ func BenchmarkCollection_InsertOne(b *testing.B) {
 
 	coll, err := fx.Collection("test")
 	require.NoError(b, err)
-
+	var a = &fastjson.Arena{}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _ = coll.InsertOne(newSmallIntObjectWithId(i))
+		_, _ = coll.InsertOne(newSmallIntObjectWithId(a, i))
+		a.Reset()
 	}
 }
 
@@ -292,7 +295,7 @@ func BenchmarkCollection_FindId(b *testing.B) {
 
 	coll, err := fx.Collection("test")
 	require.NoError(b, err)
-	_, err = coll.InsertOne(newSmallIntObjectWithId(42))
+	_, err = coll.InsertOne(newSmallIntObjectWithId(&fastjson.Arena{}, 42))
 	require.NoError(b, err)
 
 	b.ReportAllocs()
@@ -308,24 +311,14 @@ func assertCount(t *testing.T, coll *Collection, expected int) {
 	assert.Equal(t, expected, count)
 }
 
-func newSmallIntObject(i int) *fastjson.Value {
-	a := arenaPool.Get()
-	defer func() {
-		a.Reset()
-		arenaPool.Put(a)
-	}()
+func newSmallIntObject(a *fastjson.Arena, i int) *fastjson.Value {
 	val := a.NewObject()
 	obj, _ := val.Object()
 	obj.Set("i", a.NewNumberInt(i))
 	return val
 }
 
-func newSmallIntObjectWithId(i int) *fastjson.Value {
-	a := arenaPool.Get()
-	defer func() {
-		a.Reset()
-		arenaPool.Put(a)
-	}()
+func newSmallIntObjectWithId(a *fastjson.Arena, i int) *fastjson.Value {
 	val := a.NewObject()
 	obj, _ := val.Object()
 	obj.Set("id", a.NewNumberInt(i))
