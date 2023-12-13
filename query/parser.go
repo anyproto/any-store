@@ -26,12 +26,12 @@ const (
 	OpLt
 	OpLte
 
-	_OpArr
 	OpIn
 	OpNin
 	OpAll
-	_OpNot
 	OpNot
+	OpExists
+	OpType
 )
 
 var (
@@ -51,6 +51,9 @@ var (
 	opBytesLte = []byte("$lte")
 	opBytesNot = []byte("$not")
 	opBytesNor = []byte("$nor")
+
+	opBytesExists = []byte("$exists")
+	opBytesType   = []byte("$type")
 )
 
 var parserPool = &fastjson.ParserPool{}
@@ -60,7 +63,7 @@ func ParseCondition(cond any) (Filter, error) {
 	defer parserPool.Put(p)
 
 	if cond == nil {
-		return all{}, nil
+		return All{}, nil
 	}
 	if f, ok := cond.(Filter); ok {
 		return f, nil
@@ -346,6 +349,10 @@ func makeCompFilter(op Operator, v *fastjson.Value) (f Filter, err error) {
 			return nil, fmt.Errorf("no operators found for $not")
 		}
 		return not, nil
+	case OpExists:
+		return parseExists(v)
+	case OpType:
+		return parseType(v)
 	default:
 		return makeArrComp(op, v)
 	}
@@ -378,6 +385,39 @@ func makeEqArray(v *fastjson.Value) []Filter {
 	return res
 }
 
+func parseExists(v *fastjson.Value) (f Filter, err error) {
+	switch v.Type() {
+	case fastjson.TypeFalse, fastjson.TypeNull:
+		return Not{Exists{}}, nil
+	case fastjson.TypeNumber:
+		if i, _ := v.Int(); i == 0 {
+			return Not{Exists{}}, nil
+		}
+	}
+	return Exists{}, nil
+}
+
+func parseType(v *fastjson.Value) (f Filter, err error) {
+	switch v.Type() {
+	case fastjson.TypeNumber:
+		n, _ := v.Int()
+		tv := Type(n)
+		if tv > TypeObject || tv < 0 {
+			return nil, fmt.Errorf("unexpected type: %d", n)
+		}
+		return TypeFilter{Type: encoding.Type(tv)}, err
+	case fastjson.TypeString:
+		bs, _ := v.StringBytes()
+		tv, ok := stringToType[string(bs)]
+		if !ok {
+			return nil, fmt.Errorf("unexpected type: %s", string(bs))
+		}
+		return TypeFilter{Type: encoding.Type(tv)}, err
+	default:
+		return nil, fmt.Errorf("unexpetced type: %s", v.String())
+	}
+}
+
 func isOperator(key []byte) (ok bool, op Operator, err error) {
 	if bytes.HasPrefix(key, opBytesPrefix) {
 		switch {
@@ -407,6 +447,10 @@ func isOperator(key []byte) (ok bool, op Operator, err error) {
 			return true, OpEq, nil
 		case bytes.Equal(key, opBytesNot):
 			return true, OpNot, nil
+		case bytes.Equal(key, opBytesExists):
+			return true, OpExists, nil
+		case bytes.Equal(key, opBytesType):
+			return true, OpType, nil
 		default:
 			return true, 0, fmt.Errorf("unknow operator: %s", string(key))
 		}

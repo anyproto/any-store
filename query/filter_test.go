@@ -136,6 +136,28 @@ func TestComplex(t *testing.T) {
 	assert.False(t, f.Ok(fastjson.MustParse(`{"a":1,"b":[3,2],"c":"test"}`)))
 }
 
+func TestExists_Ok(t *testing.T) {
+	t.Run("true", func(t *testing.T) {
+		f, err := ParseCondition(`{"a":{"$exists":true}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(fastjson.MustParse(`{"a":1}`)))
+		assert.False(t, f.Ok(fastjson.MustParse(`{"b":1}`)))
+	})
+	t.Run("false", func(t *testing.T) {
+		f, err := ParseCondition(`{"a":{"$exists":false}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(fastjson.MustParse(`{"a":1}`)))
+		assert.True(t, f.Ok(fastjson.MustParse(`{"b":1}`)))
+	})
+}
+
+func TestTypeFilter_Ok(t *testing.T) {
+	f, err := ParseCondition(`{"a":{"$type":"number"}}`)
+	require.NoError(t, err)
+	assert.True(t, f.Ok(fastjson.MustParse(`{"a":1}`)))
+	assert.False(t, f.Ok(fastjson.MustParse(`{"a":"1"}`)))
+}
+
 func BenchmarkFilter_Ok(b *testing.B) {
 	doc := fastjson.MustParse(`{"a":2,"b":[3,2,1],"c":"test"}`)
 	bench := func(b *testing.B, query string) {

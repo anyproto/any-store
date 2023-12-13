@@ -178,12 +178,37 @@ func (e Not) String() string {
 	return fmt.Sprintf(`{"$not": %s}`, e.Filter.String())
 }
 
-type all struct{}
+type All struct{}
 
-func (a all) Ok(_ *fastjson.Value) bool {
+func (a All) Ok(_ *fastjson.Value) bool {
 	return true
 }
 
-func (a all) String() string {
+func (a All) String() string {
 	return "null"
+}
+
+type Exists struct{}
+
+func (e Exists) Ok(v *fastjson.Value) bool {
+	return v != nil
+}
+
+func (e Exists) String() string {
+	return fmt.Sprintf(`{"$exists": true}`)
+}
+
+type TypeFilter struct {
+	Type encoding.Type
+}
+
+func (e TypeFilter) Ok(v *fastjson.Value) bool {
+	if v == nil {
+		return false
+	}
+	return encoding.FastJSONTypeToType(v.Type()) == e.Type
+}
+
+func (e TypeFilter) String() string {
+	return fmt.Sprintf(`{"$type": "%s"}`, Type(e.Type).String())
 }

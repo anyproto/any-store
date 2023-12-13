@@ -74,6 +74,30 @@ var validParserCases = []parserCase{
 		`{"a": {"$not": {"$gt": 1.99 }}}`,
 		`{"a": {"$not": {"$gt": 1.99}}}`,
 	},
+	{
+		`{"a": {"$exists": true}}`,
+		`{"a": {"$exists": true}}`,
+	},
+	{
+		`{"a": {"$exists": "1"}}`,
+		`{"a": {"$exists": true}}`,
+	},
+	{
+		`{"a": {"$exists": 0}}`,
+		`{"a": {"$not": {"$exists": true}}}`,
+	},
+	{
+		`{"a": {"$exists": false}}`,
+		`{"a": {"$not": {"$exists": true}}}`,
+	},
+	{
+		`{"a": {"$type": 1}}`,
+		`{"a": {"$type": "number"}}`,
+	},
+	{
+		`{"a": {"$type": "number"}}`,
+		`{"a": {"$type": "number"}}`,
+	},
 }
 
 var errorParserCases = []parserCase{
@@ -130,6 +154,15 @@ var errorParserCases = []parserCase{
 	},
 	{
 		`{"a":{"$all":1}}`, ``,
+	},
+	{
+		`{"a":{"$type": -1}}`, ``,
+	},
+	{
+		`{"a":{"$type": 111}}`, ``,
+	},
+	{
+		`{"a":{"$type": "xyz"}}`, ``,
 	},
 }
 
