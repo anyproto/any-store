@@ -15,22 +15,18 @@ type Item interface {
 	DecodeFastJSON(func(v *fastjson.Value) error) error
 }
 
-func newItem(val *fastjson.Value, withId bool) (item, error) {
+func newItem(val *fastjson.Value, a *fastjson.Arena, autoId bool) (item, error) {
 	objVal, err := val.Object()
 	if err != nil {
 		return item{}, err
 	}
 
-	var id []byte
-
-	if idVal := objVal.Get("id"); idVal != nil {
-		id = encoding.AppendJSONValue(nil, idVal)
-	}
-	if id == nil {
-		if withId {
-			return item{}, fmt.Errorf("document doesn't contain an identifier")
+	if idVal := objVal.Get("id"); idVal == nil {
+		if autoId {
+			id := objectid.NewObjectID().Hex()
+			objVal.Set("id", a.NewString(id))
 		} else {
-			id = encoding.AppendAnyValue(nil, objectid.NewObjectID().Hex())
+			return item{}, fmt.Errorf("document without id")
 		}
 	}
 	it := item{

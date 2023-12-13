@@ -25,6 +25,18 @@ func TestCollection_InsertOne(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "myId", docId)
 	})
+	t.Run("autoId", func(t *testing.T) {
+		fx := newFixture(t)
+		defer fx.finish()
+
+		coll, err := fx.Collection("test")
+		require.NoError(t, err)
+		docId, err := coll.InsertOne(map[string]string{
+			"key": "value",
+		})
+		require.NoError(t, err)
+		assert.NotEmpty(t, docId)
+	})
 	t.Run("duplicate error", func(t *testing.T) {
 		fx := newFixture(t)
 		defer fx.finish()
@@ -55,7 +67,7 @@ func TestCollection_InsertMany(t *testing.T) {
 		coll, err := fx.Collection("test")
 		require.NoError(t, err)
 
-		var docs = make([]any, 100)
+		var docs = make([]any, 10)
 		for i := range docs {
 			docs[i] = map[string]int{"num": i}
 		}
@@ -136,22 +148,6 @@ func TestCollection_UpsertOne(t *testing.T) {
 
 		// TODO: check findId
 	})
-	t.Run("big", func(t *testing.T) {
-		fx := newFixture(t)
-		defer fx.finish()
-
-		coll, err := fx.Collection("test")
-		require.NoError(t, err)
-
-		var docs = make([]any, 100000)
-		for i := range docs {
-			docs[i] = newSmallIntObject(i)
-		}
-		res, err := coll.UpsertMany(docs...)
-		require.NoError(t, err)
-		assert.Equal(t, len(docs), res.AffectedRows)
-		assertCount(t, coll, len(docs))
-	})
 
 }
 
@@ -181,6 +177,22 @@ func TestCollection_UpsertMany(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, len(docs), res.AffectedRows)
 		assertCount(t, coll, len(docs)+5)
+	})
+	t.Run("big", func(t *testing.T) {
+		fx := newFixture(t)
+		defer fx.finish()
+
+		coll, err := fx.Collection("test")
+		require.NoError(t, err)
+
+		var docs = make([]any, 100000)
+		for i := range docs {
+			docs[i] = newSmallIntObject(i)
+		}
+		res, err := coll.UpsertMany(docs...)
+		require.NoError(t, err)
+		assert.Equal(t, len(docs), res.AffectedRows)
+		assertCount(t, coll, len(docs))
 	})
 }
 

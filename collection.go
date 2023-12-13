@@ -52,8 +52,10 @@ func (c *Collection) init() (err error) {
 func (c *Collection) InsertOne(doc any) (docId any, err error) {
 	p := parserPool.Get()
 	defer parserPool.Put(p)
+	a := arenaPool.Get()
+	defer arenaPool.Put(a)
 
-	it, err := parseItem(p, doc, true)
+	it, err := parseItem(p, a, doc, true)
 	if err != nil {
 		return nil, err
 	}
@@ -86,34 +88,32 @@ func (c *Collection) InsertOne(doc any) (docId any, err error) {
 func (c *Collection) InsertMany(docs ...any) (result Result, err error) {
 	p := parserPool.Get()
 	defer parserPool.Put(p)
-
-	var items = make([]item, 0, len(docs))
-	for _, doc := range docs {
-		it, err := parseItem(p, doc, true)
-		if err != nil {
-			return Result{}, err
-		}
-		items = append(items, it)
-	}
+	a := arenaPool.Get()
+	defer arenaPool.Put(a)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for len(items) != 0 {
+	for len(docs) != 0 {
+
 		var handled int
 		err = c.db.db.Update(func(txn *badger.Txn) (err error) {
 			var (
-				i  int
-				it item
+				i   int
+				it  item
+				doc any
 			)
 			defer func() {
 				if err == badger.ErrTxnTooBig {
-					items = items[i:]
+					docs = docs[i:]
 					handled = i
 					err = nil
 				}
 			}()
-			for i, it = range items {
+			for i, doc = range docs {
+				if it, err = parseItem(p, a, doc, true); err != nil {
+					return err
+				}
 				k := key.Key(it.appendId(c.dataNS.Peek().AppendPart(nil).Copy()))
 				_, getErr := txn.Get(k)
 				if getErr == nil {
@@ -129,8 +129,8 @@ func (c *Collection) InsertMany(docs ...any) (result Result, err error) {
 					return err
 				}
 			}
-			handled = len(items)
-			items = nil
+			handled = len(docs)
+			docs = nil
 			return nil
 		})
 		if err != nil {
@@ -145,8 +145,10 @@ func (c *Collection) InsertMany(docs ...any) (result Result, err error) {
 func (c *Collection) UpsertOne(doc any) (docId any, err error) {
 	p := parserPool.Get()
 	defer parserPool.Put(p)
+	a := arenaPool.Get()
+	defer arenaPool.Put(a)
 
-	it, err := parseItem(p, doc, true)
+	it, err := parseItem(p, a, doc, true)
 	if err != nil {
 		return nil, err
 	}
@@ -190,34 +192,31 @@ func (c *Collection) UpsertOne(doc any) (docId any, err error) {
 func (c *Collection) UpsertMany(docs ...any) (result Result, err error) {
 	p := parserPool.Get()
 	defer parserPool.Put(p)
-
-	var items = make([]item, 0, len(docs))
-	for _, doc := range docs {
-		it, err := parseItem(p, doc, true)
-		if err != nil {
-			return Result{}, err
-		}
-		items = append(items, it)
-	}
+	a := arenaPool.Get()
+	defer arenaPool.Put(a)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for len(items) != 0 {
+	for len(docs) != 0 {
 		var handled int
 		err = c.db.db.Update(func(txn *badger.Txn) (err error) {
 			var (
-				i  int
-				it item
+				i   int
+				it  item
+				doc any
 			)
 			defer func() {
 				if err == badger.ErrTxnTooBig {
-					items = items[i:]
+					docs = docs[i:]
 					handled = i
 					err = nil
 				}
 			}()
-			for i, it = range items {
+			for i, doc = range docs {
+				if it, err = parseItem(p, a, doc, true); err != nil {
+					return
+				}
 				k := key.Key(it.appendId(c.dataNS.Peek().AppendPart(nil).Copy()))
 				res, getErr := txn.Get(k)
 				var prevValue item
@@ -245,8 +244,8 @@ func (c *Collection) UpsertMany(docs ...any) (result Result, err error) {
 					}
 				}
 			}
-			handled = len(items)
-			items = nil
+			handled = len(docs)
+			docs = nil
 			return nil
 		})
 		if err != nil {
@@ -397,10 +396,10 @@ func (c *Collection) handleUpdateIndexes(txn *badger.Txn, prev, new item) (err e
 	return
 }
 
-func parseItem(p *fastjson.Parser, doc any, autoId bool) (it item, err error) {
+func parseItem(p *fastjson.Parser, a *fastjson.Arena, doc any, autoId bool) (it item, err error) {
 	docJ, err := parser.AnyToJSON(p, doc)
 	if err != nil {
 		return item{}, err
 	}
-	return newItem(docJ, !autoId)
+	return newItem(docJ, a, autoId)
 }
