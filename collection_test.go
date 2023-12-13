@@ -272,6 +272,36 @@ func TestCollection_FindMany(t *testing.T) {
 	t.Log(time.Since(st))
 }
 
+func BenchmarkCollection_InsertOne(b *testing.B) {
+	fx := newFixture(b)
+	defer fx.finish()
+
+	coll, err := fx.Collection("test")
+	require.NoError(b, err)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = coll.InsertOne(newSmallIntObjectWithId(i))
+	}
+}
+
+func BenchmarkCollection_FindId(b *testing.B) {
+	fx := newFixture(b)
+	defer fx.finish()
+
+	coll, err := fx.Collection("test")
+	require.NoError(b, err)
+	_, err = coll.InsertOne(newSmallIntObjectWithId(42))
+	require.NoError(b, err)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = coll.FindId(42)
+	}
+}
+
 func assertCount(t *testing.T, coll *Collection, expected int) {
 	count, err := coll.Count(nil)
 	require.NoError(t, err)
@@ -280,9 +310,25 @@ func assertCount(t *testing.T, coll *Collection, expected int) {
 
 func newSmallIntObject(i int) *fastjson.Value {
 	a := arenaPool.Get()
-	defer arenaPool.Put(a)
+	defer func() {
+		a.Reset()
+		arenaPool.Put(a)
+	}()
 	val := a.NewObject()
 	obj, _ := val.Object()
+	obj.Set("i", a.NewNumberInt(i))
+	return val
+}
+
+func newSmallIntObjectWithId(i int) *fastjson.Value {
+	a := arenaPool.Get()
+	defer func() {
+		a.Reset()
+		arenaPool.Put(a)
+	}()
+	val := a.NewObject()
+	obj, _ := val.Object()
+	obj.Set("id", a.NewNumberInt(i))
 	obj.Set("i", a.NewNumberInt(i))
 	return val
 }
