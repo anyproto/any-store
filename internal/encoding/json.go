@@ -21,6 +21,7 @@ func AppendJSONValue(b []byte, v *fastjson.Value) []byte {
 	case fastjson.TypeNumber:
 		f, _ := v.Float64()
 		b = append(b, uint8(TypeNumber))
+		fmt.Println(f)
 		b = AppendFloat64(b, f)
 	case fastjson.TypeNull:
 		b = append(b, uint8(TypeNull))

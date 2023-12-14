@@ -10,6 +10,7 @@ import (
 	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-store/internal/encoding"
+	"github.com/anyproto/any-store/internal/index"
 	"github.com/anyproto/any-store/internal/key"
 	"github.com/anyproto/any-store/internal/parser"
 	"github.com/anyproto/any-store/query"
@@ -303,11 +304,11 @@ func (c *Collection) DeleteMany(ctx context.Context, query any) (err error) {
 	return
 }
 
-func (c *Collection) Indexes(ctx context.Context) (indexes []Index, err error) {
+func (c *Collection) Indexes(ctx context.Context) (indexes []index.Index, err error) {
 	return
 }
 
-func (c *Collection) AddIndex(ctx context.Context, index Index) (err error) {
+func (c *Collection) AddIndex(ctx context.Context, index index.Index) (err error) {
 	return
 }
 

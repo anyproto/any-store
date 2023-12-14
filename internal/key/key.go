@@ -75,7 +75,7 @@ func (ns NS) Copy() NS {
 	}
 }
 
-func (ns NS) CopyTo(k Key) []byte {
+func (ns NS) CopyTo(k Key) Key {
 	return ns.prefix.CopyTo(k)
 }
 
