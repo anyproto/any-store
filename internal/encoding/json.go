@@ -6,8 +6,6 @@ import (
 	"github.com/valyala/fastjson"
 )
 
-var arenaPool = &fastjson.ArenaPool{}
-
 func AppendJSONValue(b []byte, v *fastjson.Value) []byte {
 	if v == nil {
 		return append(b, uint8(TypeNull))
@@ -18,10 +16,10 @@ func AppendJSONValue(b []byte, v *fastjson.Value) []byte {
 		stringBytes, _ := v.StringBytes()
 		b = append(b, uint8(TypeString))
 		b = append(b, stringBytes...)
+		b = append(b, EOS)
 	case fastjson.TypeNumber:
 		f, _ := v.Float64()
 		b = append(b, uint8(TypeNumber))
-		fmt.Println(f)
 		b = AppendFloat64(b, f)
 	case fastjson.TypeNull:
 		b = append(b, uint8(TypeNull))
@@ -32,36 +30,55 @@ func AppendJSONValue(b []byte, v *fastjson.Value) []byte {
 	case fastjson.TypeObject:
 		b = append(b, uint8(TypeObject))
 		b = v.MarshalTo(b)
+		b = append(b, EOS)
 	case fastjson.TypeArray:
 		b = append(b, uint8(TypeArray))
 		b = v.MarshalTo(b)
+		b = append(b, EOS)
 	default:
 		panic(fmt.Errorf("unknown fastjson type: %v", v.Type()))
 	}
 	return b
 }
 
-func DecodeToJSON(p *fastjson.Parser, a *fastjson.Arena, b []byte) (v *fastjson.Value, err error) {
+func DecodeToJSON(p *fastjson.Parser, a *fastjson.Arena, b []byte) (v *fastjson.Value, n int, err error) {
 	if len(b) == 0 {
-		return nil, fmt.Errorf("can't decode, bytes is empty")
+		return nil, 0, fmt.Errorf("can't decode, bytes is empty")
 	}
-	switch Type(b[0]) {
-	case TypeObject, TypeArray:
-		return p.ParseBytes(b[1:])
-	case TypeString:
-		return a.NewStringBytes(b[1:]), nil
-	case TypeNumber:
-		if len(b[1:]) != 8 {
-			return nil, fmt.Errorf("unexpected number encoding")
+	var t = Type(b[0])
+	switch t {
+	case TypeObject, TypeArray, TypeString:
+		var end int
+		for i := range b {
+			if b[i] == EOS {
+				end = i
+				break
+			}
 		}
-		return a.NewNumberFloat64(BytesToFloat64(b[1:])), nil
+		if end == 0 {
+			return nil, 0, fmt.Errorf("can't decode string: end of string not found")
+		}
+		if t == TypeString {
+			v = a.NewStringBytes(b[1:end])
+		} else {
+			if v, err = p.ParseBytes(b[1:end]); err != nil {
+				return nil, 0, err
+			}
+		}
+		return v, end + 1, nil
+
+	case TypeNumber:
+		if len(b) < 9 {
+			return nil, 0, fmt.Errorf("unexpected number encoding")
+		}
+		return a.NewNumberFloat64(BytesToFloat64(b[1:])), 9, nil
 	case TypeNull:
-		return a.NewNull(), nil
+		return a.NewNull(), 1, nil
 	case TypeTrue:
-		return a.NewTrue(), nil
+		return a.NewTrue(), 1, nil
 	case TypeFalse:
-		return a.NewFalse(), nil
+		return a.NewFalse(), 1, nil
 	default:
-		return nil, fmt.Errorf("unexpected binary type: %v", Type(b[0]))
+		return nil, 0, fmt.Errorf("unexpected binary type: %v", Type(b[0]))
 	}
 }

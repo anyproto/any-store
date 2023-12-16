@@ -26,11 +26,13 @@ func TestAppendJSONValue(t *testing.T) {
 
 	for _, v := range values {
 		b := AppendJSONValue(nil, v)
-		res, err := DecodeToJSON(p, a, b)
+		res, n, err := DecodeToJSON(p, a, b)
+		assert.True(t, n > 0)
+		t.Log(v.String(), n)
 		require.NoError(t, err)
 		assert.Equal(t, res.String(), v.String())
 	}
 
-	_, err := DecodeToJSON(p, a, nil)
+	_, _, err := DecodeToJSON(p, a, nil)
 	require.Error(t, err)
 }

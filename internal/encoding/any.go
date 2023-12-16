@@ -13,9 +13,11 @@ func AppendAnyValue(b []byte, v any) []byte {
 	case string:
 		b = append(b, uint8(TypeString))
 		b = append(b, []byte(tv)...)
+		b = append(b, EOS)
 	case []byte:
 		b = append(b, uint8(TypeString))
 		b = append(b, tv...)
+		b = append(b, EOS)
 	case uint:
 		b = append(b, uint8(TypeNumber))
 		b = AppendNumber(b, tv)
@@ -64,25 +66,35 @@ func AppendAnyValue(b []byte, v any) []byte {
 	return b
 }
 
-func DecodeToAny(b []byte) (v any, err error) {
+func DecodeToAny(b []byte) (v any, n int, err error) {
 	if len(b) == 0 {
-		return nil, fmt.Errorf("can't decode, bytes is empty")
+		return nil, 0, fmt.Errorf("can't decode, bytes is empty")
 	}
 	switch Type(b[0]) {
 	case TypeObject, TypeArray, TypeString:
-		return string(b[1:]), nil
-	case TypeNumber:
-		if len(b[1:]) != 8 {
-			return nil, fmt.Errorf("unexpected number encoding")
+		var end int
+		for i := range b {
+			if b[i] == EOS {
+				end = i
+				break
+			}
 		}
-		return BytesToFloat64(b[1:]), nil
+		if end == 0 {
+			return nil, 0, fmt.Errorf("can't decode string: end of string not found")
+		}
+		return string(b[1:end]), end + 1, nil
+	case TypeNumber:
+		if len(b) < 9 {
+			return nil, 0, fmt.Errorf("unexpected number encoding")
+		}
+		return BytesToFloat64(b[1:]), 9, nil
 	case TypeNull:
-		return nil, nil
+		return nil, 1, nil
 	case TypeTrue:
-		return true, nil
+		return true, 1, nil
 	case TypeFalse:
-		return false, nil
+		return false, 1, nil
 	default:
-		return nil, fmt.Errorf("unexpected binary type: %v", Type(b[0]))
+		return nil, 0, fmt.Errorf("unexpected binary type: %v", Type(b[0]))
 	}
 }

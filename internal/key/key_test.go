@@ -1,63 +1,37 @@
 package key
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/valyala/fastjson"
 )
 
-func TestKey_AppendPart(t *testing.T) {
-	var k Key
-	k = k.AppendPart([]byte("one")).AppendString("two")
-	assert.Equal(t, "/one/two", k.String())
+func TestKey_AppendJSON(t *testing.T) {
+	ns := NewNS("/test/prefix")
+	k1 := ns.GetKey().AppendJSON(fastjson.MustParse(`3.33`)).AppendJSON(fastjson.MustParse(`"string"`))
+	k2 := ns.GetKey().AppendJSON(fastjson.MustParse(`12.33`)).AppendJSON(fastjson.MustParse(`"string2"`))
+	assert.Equal(t, -1, bytes.Compare(k1, k2))
+	assert.Equal(t, "/test/prefix/3.33/string", k1.String())
+	assert.Equal(t, "/test/prefix/12.33/string2", k2.String())
 }
 
-func TestKey_LastPart(t *testing.T) {
-	t.Run("normal", func(t *testing.T) {
-		var k Key
-		k = k.AppendPart([]byte("root")).AppendPart([]byte("two")).AppendPart([]byte(`last`))
-		assert.Equal(t, `last`, k.LastPart().String())
-	})
-	t.Run("slash", func(t *testing.T) {
-		var k Key
-		k = k.AppendPart([]byte("root")).AppendPart([]byte("two")).AppendPart([]byte(`with/slash`))
-		assert.Equal(t, `with/slash`, k.LastPart().String())
-	})
-	t.Run("null", func(t *testing.T) {
-		var k Key
-		assert.Equal(t, "", k.LastPart().String())
-	})
-}
-
-func TestKey_Equal(t *testing.T) {
-	var k1, k2 Key
-
-	k1 = k1.AppendPart([]byte("one")).AppendPart([]byte("two"))
-	k2 = k2.AppendPart([]byte("one")).AppendPart([]byte("two"))
-	assert.True(t, k1.Equal(k2))
-	k2 = k2.AppendPart([]byte("3"))
-	assert.False(t, k1.Equal(k2))
-}
-
-func TestKeyFromString(t *testing.T) {
-	ss := []string{
-		"/some/string",
-		"some/string",
-		"some/string/",
+func TestKey_ReadJSONValue(t *testing.T) {
+	var jsons = []string{
+		`true`, `false`, `null`, `"string"`, `3.14`, `[1,2,3]`, `{"a":"b"}`,
 	}
-	for _, s := range ss {
-		k := KeyFromString(s)
-		assert.Equal(t, "/some/string", k.String())
-		assert.Equal(t, "string", k.LastPart().String())
-	}
-}
 
-func TestNS_Peek(t *testing.T) {
-	ns := NewNS(KeyFromString("my/namespace"))
-	k := ns.Peek()
-	k = k.AppendPart([]byte("el1"))
-	assert.Equal(t, "/my/namespace/el1", k.String())
-	k = ns.Peek()
-	k = k.AppendPart([]byte("el2"))
-	assert.Equal(t, "/my/namespace/el2", k.String())
+	ns := NewNS("/test/prefix")
+	k := ns.GetKey()
+	for _, j := range jsons {
+		k = k.AppendJSON(fastjson.MustParse(j))
+	}
+	var result []string
+	require.NoError(t, k.ReadJSONValue(ns, &fastjson.Parser{}, &fastjson.Arena{}, func(v *fastjson.Value) error {
+		result = append(result, v.String())
+		return nil
+	}))
+	assert.Equal(t, jsons, result)
 }

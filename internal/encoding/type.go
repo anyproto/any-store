@@ -6,16 +6,18 @@ import (
 	"github.com/valyala/fastjson"
 )
 
+const EOS = byte(0)
+
 type Type uint8
 
 const (
-	TypeNull   = Type(0)
-	TypeNumber = Type(1)
-	TypeString = Type(2)
-	TypeFalse  = Type(3)
-	TypeTrue   = Type(4)
-	TypeArray  = Type(5)
-	TypeObject = Type(6)
+	TypeNull   = Type(1)
+	TypeNumber = Type(2)
+	TypeString = Type(3)
+	TypeFalse  = Type(4)
+	TypeTrue   = Type(5)
+	TypeArray  = Type(6)
+	TypeObject = Type(7)
 )
 
 func FastJSONTypeToType(t fastjson.Type) Type {

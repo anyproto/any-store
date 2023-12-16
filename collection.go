@@ -22,10 +22,10 @@ var (
 )
 
 type Collection struct {
-	db              *DB
-	dataNS, indexNS key.NS
-	name            string
-	mu              sync.RWMutex
+	db     *DB
+	dataNS *key.NS
+	name   string
+	mu     sync.RWMutex
 }
 
 type Result struct {
@@ -45,8 +45,7 @@ func newCollection(db *DB, name string) (c *Collection, err error) {
 }
 
 func (c *Collection) init() (err error) {
-	c.dataNS = key.NewNS(nsPrefix.Copy().AppendString(c.name).AppendString("data"))
-	c.indexNS = key.NewNS(nsPrefix.Copy().AppendString(c.name).AppendString("index"))
+	c.dataNS = key.NewNS(nsPrefix.String() + "/" + c.name)
 	return
 }
 
@@ -64,10 +63,14 @@ func (c *Collection) InsertOne(doc any) (docId any, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	err = c.db.db.Update(func(txn *badger.Txn) error {
-		k := key.Key(it.appendId(c.dataNS.Peek().AppendPart(nil)))
+		var k key.Key
+		c.dataNS.ReuseKey(func(rk key.Key) key.Key {
+			k = it.appendId(rk)
+			return k
+		})
 		_, getErr := txn.Get(k)
 		if getErr == nil {
-			idAny, _ := encoding.DecodeToAny(it.appendId(nil))
+			idAny, _, _ := encoding.DecodeToAny(it.appendId(nil))
 			return fmt.Errorf("%w: %v", ErrDuplicatedId, idAny)
 		} else if getErr != badger.ErrKeyNotFound {
 			return getErr
@@ -83,7 +86,8 @@ func (c *Collection) InsertOne(doc any) (docId any, err error) {
 	if err != nil {
 		return nil, err
 	}
-	return encoding.DecodeToAny(it.appendId(nil))
+	docId, _, err = encoding.DecodeToAny(it.appendId(nil))
+	return
 }
 
 func (c *Collection) InsertMany(docs ...any) (result Result, err error) {
@@ -115,10 +119,10 @@ func (c *Collection) InsertMany(docs ...any) (result Result, err error) {
 				if it, err = parseItem(p, a, doc, true); err != nil {
 					return err
 				}
-				k := key.Key(it.appendId(c.dataNS.Peek().AppendPart(nil).Copy()))
+				k := key.Key(it.appendId(c.dataNS.GetKey()))
 				_, getErr := txn.Get(k)
 				if getErr == nil {
-					idAny, _ := encoding.DecodeToAny(it.appendId(nil))
+					idAny, _, _ := encoding.DecodeToAny(it.appendId(nil))
 					return fmt.Errorf("%w: %v", ErrDuplicatedId, idAny)
 				} else if getErr != badger.ErrKeyNotFound {
 					return getErr
@@ -157,7 +161,11 @@ func (c *Collection) UpsertOne(doc any) (docId any, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	err = c.db.db.Update(func(txn *badger.Txn) error {
-		k := key.Key(it.appendId(c.dataNS.Peek().AppendPart(nil)))
+		var k key.Key
+		c.dataNS.ReuseKey(func(rk key.Key) key.Key {
+			k = it.appendId(rk)
+			return k
+		})
 		res, getErr := txn.Get(k)
 		var prevValue item
 		if getErr == nil {
@@ -187,7 +195,8 @@ func (c *Collection) UpsertOne(doc any) (docId any, err error) {
 	if err != nil {
 		return nil, err
 	}
-	return encoding.DecodeToAny(it.appendId(nil))
+	docId, _, err = encoding.DecodeToAny(it.appendId(nil))
+	return
 }
 
 func (c *Collection) UpsertMany(docs ...any) (result Result, err error) {
@@ -218,7 +227,7 @@ func (c *Collection) UpsertMany(docs ...any) (result Result, err error) {
 				if it, err = parseItem(p, a, doc, true); err != nil {
 					return
 				}
-				k := key.Key(it.appendId(c.dataNS.Peek().AppendPart(nil).Copy()))
+				k := key.Key(it.appendId(c.dataNS.GetKey()))
 				res, getErr := txn.Get(k)
 				var prevValue item
 				if getErr == nil {
@@ -274,7 +283,11 @@ func (c *Collection) DeleteId(docId any) (err error) {
 	defer c.mu.Unlock()
 
 	return c.db.db.Update(func(txn *badger.Txn) error {
-		k := key.Key(encoding.AppendAnyValue(c.dataNS.Peek().AppendPart(nil), docId))
+		var k key.Key
+		c.dataNS.ReuseKey(func(rk key.Key) key.Key {
+			k = rk.AppendAny(docId)
+			return k
+		})
 		res, err := txn.Get(k)
 		if err != nil {
 			if err == badger.ErrKeyNotFound {
@@ -320,8 +333,8 @@ func (c *Collection) FindId(docId any) (res Item, err error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	err = c.db.db.View(func(txn *badger.Txn) error {
-		key := key.Key(encoding.AppendAnyValue(c.dataNS.Peek().Copy().AppendPart(nil), docId))
-		it, err := txn.Get(key)
+		k := c.dataNS.GetKey().AppendAny(docId)
+		it, err := txn.Get(k)
 		if err != nil {
 			return err
 		}
@@ -360,7 +373,7 @@ func (c *Collection) FindMany(q any) (iterator Iterator, err error) {
 	iter.it = iter.txn.NewIterator(badger.IteratorOptions{
 		PrefetchSize:   100,
 		PrefetchValues: true,
-		Prefix:         c.dataNS.Peek(),
+		Prefix:         c.dataNS.Bytes(),
 	})
 	iter.it.Rewind()
 	iter.filter = filter
@@ -374,7 +387,7 @@ func (c *Collection) Count(query any) (count int, err error) {
 		it := txn.NewIterator(badger.IteratorOptions{
 			PrefetchSize:   1000,
 			PrefetchValues: false,
-			Prefix:         c.dataNS.Peek(),
+			Prefix:         c.dataNS.Bytes(),
 		})
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {

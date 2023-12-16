@@ -8,12 +8,11 @@ import (
 	"github.com/dgraph-io/badger/v4"
 	"github.com/valyala/fastjson"
 
-	"github.com/anyproto/any-store/internal/encoding"
 	"github.com/anyproto/any-store/internal/key"
 )
 
 type Info struct {
-	CollectionNS key.NS
+	CollectionNS *key.NS
 	Fields       []string
 	Sparse       bool
 }
@@ -23,21 +22,21 @@ func (i Info) IndexName() string {
 }
 
 func OpenIndex(txn *badger.Txn, info Info) (*Index, error) {
-	var k key.Key
-	k = info.CollectionNS.CopyTo(k).AppendString("index").AppendString(info.IndexName())
+	prefix := info.CollectionNS.String() + "/index/" + info.IndexName()
+	ns := key.NewNS(prefix)
 
 	fieldsPath := make([][]string, 0, len(info.Fields))
 	for _, fn := range info.Fields {
 		fieldsPath = append(fieldsPath, strings.Split(fn, "."))
 	}
 
-	stats, err := openStats(txn, k.Copy().AppendString("stats"))
+	stats, err := openStats(txn, key.NewNS(prefix).GetKey())
 	if err != nil {
 		return nil, err
 	}
 
 	return &Index{
-		dataNS:     key.NewNS(k),
+		dataNS:     ns,
 		sparse:     info.Sparse,
 		fieldPaths: fieldsPath,
 		uniqBuf:    make([][]key.Key, len(info.Fields)),
@@ -46,7 +45,7 @@ func OpenIndex(txn *badger.Txn, info Info) (*Index, error) {
 }
 
 type Index struct {
-	dataNS     key.NS
+	dataNS     *key.NS
 	sparse     bool
 	fieldPaths [][]string
 
@@ -103,7 +102,7 @@ func (idx *Index) writeValues(d *fastjson.Value, i int) bool {
 		if len(arr) != 0 {
 			idx.uniqBuf[i] = idx.uniqBuf[i][:0]
 			for _, av := range arr {
-				idx.keyBuf = encoding.AppendJSONValue(k.AppendPart(nil), av)
+				idx.keyBuf = idx.keyBuf.AppendJSON(av)
 				if idx.isUnique(i, idx.keyBuf[len(k):]) {
 					if !idx.writeValues(d, i+1) {
 						return false
@@ -113,7 +112,7 @@ func (idx *Index) writeValues(d *fastjson.Value, i int) bool {
 			return true
 		}
 	}
-	idx.keyBuf = encoding.AppendJSONValue(k.AppendPart(nil), v)
+	idx.keyBuf = idx.keyBuf.AppendJSON(v)
 	return idx.writeValues(d, i+1)
 }
 func (idx *Index) fillKeysBuf(d *fastjson.Value) {
@@ -147,7 +146,7 @@ func (idx *Index) isUnique(i int, k key.Key) bool {
 func (idx *Index) insertBuf(txn *badger.Txn, id []byte) (err error) {
 	for _, k := range idx.keysBuf {
 		idx.stats.addKey(k)
-		k = k.AppendPart(id)
+		k = append(k, id...)
 		if err = txn.Set(k, nil); err != nil {
 			return
 		}
@@ -158,7 +157,7 @@ func (idx *Index) insertBuf(txn *badger.Txn, id []byte) (err error) {
 func (idx *Index) deleteBuf(txn *badger.Txn, id []byte) (err error) {
 	for _, k := range idx.keysBuf {
 		idx.stats.remove()
-		if err = txn.Delete(k.AppendPart(id)); err != nil {
+		if err = txn.Delete(append(k, id...)); err != nil {
 			return
 		}
 	}

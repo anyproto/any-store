@@ -91,7 +91,7 @@ var validParserCases = []parserCase{
 		`{"a": {"$not": {"$exists": true}}}`,
 	},
 	{
-		`{"a": {"$type": 1}}`,
+		`{"a": {"$type": 2}}`,
 		`{"a": {"$type": "number"}}`,
 	},
 	{

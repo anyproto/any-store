@@ -2,38 +2,55 @@ package key
 
 import (
 	"bytes"
-	"strings"
+	"fmt"
+
+	"github.com/valyala/fastjson"
+
+	"github.com/anyproto/any-store/internal/encoding"
 )
 
-const Separator = byte(0)
+const eos = byte(0)
 
-func KeyFromString(s string) (k Key) {
-	s = strings.Trim(s, "/")
-	parts := strings.Split(s, "/")
-	for _, part := range parts {
-		k = k.AppendPart([]byte(part))
+type Key []byte
+
+func (k Key) AppendAny(v any) Key {
+	return encoding.AppendAnyValue(k, v)
+}
+
+func (k Key) AppendJSON(v *fastjson.Value) Key {
+	return encoding.AppendJSONValue(k, v)
+}
+
+func (k Key) ReadJSONValue(ns *NS, p *fastjson.Parser, a *fastjson.Arena, f func(v *fastjson.Value) error) (err error) {
+	var start = ns.prefixLen
+	var v *fastjson.Value
+	var k2 = k[ns.prefixLen:]
+	for len(k2) > 0 {
+		if v, start, err = encoding.DecodeToJSON(p, a, k2); err != nil {
+			return err
+		}
+		if err = f(v); err != nil {
+			return
+		}
+		k2 = k2[start:]
 	}
 	return
 }
 
-type Key []byte
-
-func (k Key) AppendPart(part []byte) Key {
-	res := append(k, Separator)
-	return append(res, part...)
-}
-
-func (k Key) AppendString(part string) Key {
-	res := append(k, Separator)
-	return append(res, part...)
-}
-
-func (k Key) LastPart() Key {
-	pos := bytes.LastIndexByte(k, Separator)
-	if pos == -1 {
-		return nil
+func (k Key) ReadAnyValue(ns *NS, f func(v any) error) (err error) {
+	var start = ns.prefixLen
+	var v any
+	var k2 = k[ns.prefixLen:]
+	for len(k2) > 0 {
+		if v, start, err = encoding.DecodeToAny(k2); err != nil {
+			return err
+		}
+		if err = f(v); err != nil {
+			return
+		}
+		k2 = k2[start:]
 	}
-	return k[pos+1:]
+	return
 }
 
 func (k Key) Equal(k2 Key) bool {
@@ -41,7 +58,23 @@ func (k Key) Equal(k2 Key) bool {
 }
 
 func (k Key) String() string {
-	return string(bytes.Replace(k, []byte{Separator}, []byte("/"), -1))
+	var res string
+	var startV int
+	for i := range k {
+		if k[i] == encoding.EOS {
+			startV = i + 1
+			break
+		}
+	}
+	res = string(k[:startV-1])
+	err := k.ReadAnyValue(&NS{prefixLen: startV}, func(v any) error {
+		res += fmt.Sprintf("/%v", v)
+		return nil
+	})
+	if err != nil {
+		return res + err.Error()
+	}
+	return res
 }
 
 func (k Key) Copy() Key {
@@ -50,35 +83,4 @@ func (k Key) Copy() Key {
 
 func (k Key) CopyTo(k2 Key) []byte {
 	return append(k2, k...)
-}
-
-func NewNS(prefix Key) NS {
-	return NS{
-		prefix:    prefix,
-		prefixLen: len(prefix),
-	}
-}
-
-type NS struct {
-	prefix    Key
-	prefixLen int
-}
-
-func (ns NS) Peek() Key {
-	return ns.prefix[:ns.prefixLen]
-}
-
-func (ns NS) Copy() NS {
-	return NS{
-		prefixLen: ns.prefixLen,
-		prefix:    bytes.Clone(ns.prefix[:ns.prefixLen]),
-	}
-}
-
-func (ns NS) CopyTo(k Key) Key {
-	return ns.prefix.CopyTo(k)
-}
-
-func (ns NS) String() string {
-	return ns.prefix[:ns.prefixLen].String()
 }

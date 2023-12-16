@@ -29,8 +29,9 @@ func TestAppendAnyValue(t *testing.T) {
 
 	for _, v := range values {
 		b := AppendAnyValue(nil, v)
-		res, err := DecodeToAny(b)
+		res, n, err := DecodeToAny(b)
 		require.NoError(t, err)
+		assert.True(t, n > 0)
 		assert.EqualValues(t, v, res)
 	}
 }

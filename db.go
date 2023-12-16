@@ -8,7 +8,7 @@ import (
 )
 
 var (
-	nsPrefix = key.KeyFromString("any")
+	nsPrefix = key.NewNS("/any")
 
 	arenaPool  = &fastjson.ArenaPool{}
 	parserPool = &fastjson.ParserPool{}

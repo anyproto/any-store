@@ -90,7 +90,7 @@ func (e Comp) String() string {
 	p := parserPool.Get()
 	defer parserPool.Put(p)
 	a := &fastjson.Arena{}
-	val, _ := encoding.DecodeToJSON(p, a, e.eqValue)
+	val, _, _ := encoding.DecodeToJSON(p, a, e.eqValue)
 	return fmt.Sprintf(`{"%s": %s}`, op, val.String())
 }
 
