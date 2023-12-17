@@ -49,10 +49,11 @@ type Index struct {
 	sparse     bool
 	fieldPaths [][]string
 
-	keyBuf   key.Key
-	keysBuf  []key.Key
-	uniqBuf  [][]key.Key
-	jvalsBuf []*fastjson.Value
+	keyBuf      key.Key
+	keysBuf     []key.Key
+	keysBufPrev []key.Key
+	uniqBuf     [][]key.Key
+	jvalsBuf    []*fastjson.Value
 
 	stats *indexStats
 }
@@ -63,21 +64,41 @@ func (idx *Index) Insert(txn *badger.Txn, id []byte, d *fastjson.Value) (err err
 }
 
 func (idx *Index) Update(txn *badger.Txn, id []byte, prev, new *fastjson.Value) (err error) {
+	// calc previous index keys
 	idx.fillKeysBuf(prev)
-	if err = idx.deleteBuf(txn, id); err != nil {
+
+	// copy prev keys to second buffer
+	idx.keysBufPrev = slices.Grow(idx.keysBufPrev, len(idx.keysBuf))[:len(idx.keysBuf)]
+	for i, k := range idx.keysBuf {
+		idx.keysBufPrev[i] = k.CopyTo(idx.keysBufPrev[i][:0])
+	}
+
+	// calc new index keys
+	idx.fillKeysBuf(new)
+
+	// delete equal keys from both bufs
+	idx.keysBuf = slices.DeleteFunc(idx.keysBuf, func(k key.Key) bool {
+		for i, pk := range idx.keysBufPrev {
+			if bytes.Equal(k, pk) {
+				idx.keysBufPrev = slices.Delete(idx.keysBufPrev, i, i+1)
+				return true
+			}
+		}
+		return false
+	})
+	if err = idx.deleteBuf(txn, id, idx.keysBufPrev); err != nil {
 		return err
 	}
-	idx.fillKeysBuf(new)
 	return idx.insertBuf(txn, id)
 }
 
 func (idx *Index) Delete(txn *badger.Txn, id []byte, d *fastjson.Value) (err error) {
 	idx.fillKeysBuf(d)
-	return idx.deleteBuf(txn, id)
+	return idx.deleteBuf(txn, id, idx.keysBuf)
 }
 
 func (idx *Index) FlushStats(txn *badger.Txn) (err error) {
-	return
+	return idx.stats.flush(txn)
 }
 
 func (idx *Index) writeKey() {
@@ -102,7 +123,7 @@ func (idx *Index) writeValues(d *fastjson.Value, i int) bool {
 		if len(arr) != 0 {
 			idx.uniqBuf[i] = idx.uniqBuf[i][:0]
 			for _, av := range arr {
-				idx.keyBuf = idx.keyBuf.AppendJSON(av)
+				idx.keyBuf = k.AppendJSON(av)
 				if idx.isUnique(i, idx.keyBuf[len(k):]) {
 					if !idx.writeValues(d, i+1) {
 						return false
@@ -154,12 +175,25 @@ func (idx *Index) insertBuf(txn *badger.Txn, id []byte) (err error) {
 	return
 }
 
-func (idx *Index) deleteBuf(txn *badger.Txn, id []byte) (err error) {
-	for _, k := range idx.keysBuf {
+func (idx *Index) deleteBuf(txn *badger.Txn, id []byte, keys []key.Key) (err error) {
+	for _, k := range keys {
 		idx.stats.remove()
 		if err = txn.Delete(append(k, id...)); err != nil {
 			return
 		}
+	}
+	return
+}
+
+func (idx *Index) keys(txn *badger.Txn) (ks []key.Key, err error) {
+	it := txn.NewIterator(badger.IteratorOptions{
+		PrefetchSize:   100,
+		PrefetchValues: false,
+		Prefix:         idx.dataNS.Bytes(),
+	})
+	defer it.Close()
+	for it.Rewind(); it.Valid(); it.Next() {
+		ks = append(ks, bytes.Clone(it.Item().Key()))
 	}
 	return
 }

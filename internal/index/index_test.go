@@ -78,6 +78,56 @@ func BenchmarkIndex_fillKeysBuf(b *testing.B) {
 	})
 }
 
+func TestIndex_Update(t *testing.T) {
+	fx := newFixture(t, Info{CollectionNS: key.NewNS("/test/update"), Fields: []string{"a"}})
+	defer fx.finish(t)
+
+	require.NoError(t, fx.db.Update(func(txn *badger.Txn) error {
+		id, prev := newTestDoc(t, map[string]any{"id": 1, "a": []int{1, 2, 3}})
+		if err := fx.Insert(txn, id, prev); err != nil {
+			return err
+		}
+		assertKeys(t, txn, fx, []key.Key{
+			fx.dataNS.GetKey().AppendAny(1).AppendAny(1),
+			fx.dataNS.GetKey().AppendAny(2).AppendAny(1),
+			fx.dataNS.GetKey().AppendAny(3).AppendAny(1),
+		})
+		_, d := newTestDoc(t, map[string]any{"id": 1, "a": []int{1, 3, 4}})
+
+		if err := fx.Update(txn, id, prev, d); err != nil {
+			return err
+		}
+		assertKeys(t, txn, fx, []key.Key{
+			fx.dataNS.GetKey().AppendAny(1).AppendAny(1),
+			fx.dataNS.GetKey().AppendAny(3).AppendAny(1),
+			fx.dataNS.GetKey().AppendAny(4).AppendAny(1),
+		})
+		return nil
+	}))
+}
+
+func TestIndex_FlushStats(t *testing.T) {
+	info := Info{CollectionNS: key.NewNS("/test/collection"), Fields: []string{"a"}}
+	fx := newFixture(t, info)
+	defer fx.finish(t)
+	require.NoError(t, fx.db.Update(func(txn *badger.Txn) error {
+		id, v := newTestDoc(t, map[string]any{"id": "id", "a": []int{1, 2, 3}})
+		if err := fx.Insert(txn, id, v); err != nil {
+			return err
+		}
+		assert.Equal(t, uint64(3), fx.stats.bitmap.GetCardinality())
+		assert.Equal(t, uint64(3), fx.stats.count)
+
+		require.NoError(t, fx.FlushStats(txn))
+
+		idx, err := OpenIndex(txn, info)
+		require.NoError(t, err)
+		assert.Equal(t, uint64(3), idx.stats.bitmap.GetCardinality())
+		assert.Equal(t, uint64(3), idx.stats.count)
+		return nil
+	}))
+}
+
 func newFixture(t *testing.T, i Info) *fixture {
 	tmpDir, err := os.MkdirTemp("", "")
 	require.NoError(t, err)
@@ -112,4 +162,15 @@ func newTestDoc(t *testing.T, doc any) ([]byte, *fastjson.Value) {
 	id := val.Get("id")
 	require.NotNil(t, id)
 	return encoding.AppendJSONValue(nil, id), val
+}
+
+func assertKeys(t *testing.T, txn *badger.Txn, fx *fixture, keys []key.Key) {
+	indexKeys, err := fx.keys(txn)
+	require.NoError(t, err)
+	if !assert.Equal(t, indexKeys, keys) {
+		for i := range keys {
+			t.Log("exp", keys[i].String())
+			t.Log("act", indexKeys[i].String())
+		}
+	}
 }
