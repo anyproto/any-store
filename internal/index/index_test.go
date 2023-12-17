@@ -47,6 +47,28 @@ func TestIndex_Insert(t *testing.T) {
 	})
 }
 
+func TestInfo_fillKeysBuf(t *testing.T) {
+	t.Run("not sparse", func(t *testing.T) {
+		idx, err := OpenIndex(nil, Info{
+			CollectionNS: key.NewNS("/test/namespace"),
+			Fields:       []string{"a"},
+			Sparse:       false,
+		})
+		require.NoError(t, err)
+		idx.fillKeysBuf(fastjson.MustParse(`{"a":1}`))
+		assert.Len(t, idx.keysBuf, 1)
+	})
+	t.Run("sparse", func(t *testing.T) {
+		idx, err := OpenIndex(nil, Info{
+			CollectionNS: key.NewNS("/test/namespace"),
+			Fields:       []string{"a"},
+			Sparse:       true,
+		})
+		require.NoError(t, err)
+		idx.fillKeysBuf(fastjson.MustParse(`{"b":1}`))
+		assert.Len(t, idx.keysBuf, 0)
+	})
+}
 func BenchmarkIndex_fillKeysBuf(b *testing.B) {
 	b.Run("simple", func(b *testing.B) {
 		idx, err := OpenIndex(nil, Info{
