@@ -226,7 +226,7 @@ func parseComp(key string, v *fastjson.Value) (f Filter, err error) {
 		}
 	} else {
 		eq := &Comp{}
-		eq.eqValue = encoding.AppendJSONValue(eq.eqValue, v)
+		eq.EqValue = encoding.AppendJSONValue(eq.EqValue, v)
 		fk.Filter = eq
 	}
 	return fk, nil
@@ -241,7 +241,7 @@ func parseCompObj(v *fastjson.Value) (Filter, error) {
 		return f, nil
 	} else {
 		cmp := &Comp{}
-		cmp.eqValue = encoding.AppendJSONValue(cmp.eqValue, v)
+		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpEq
 		return cmp, nil
 	}
@@ -311,32 +311,32 @@ func makeCompFilter(op Operator, v *fastjson.Value) (f Filter, err error) {
 	switch op {
 	case OpEq:
 		cmp := &Comp{}
-		cmp.eqValue = encoding.AppendJSONValue(cmp.eqValue, v)
+		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpEq
 		return cmp, nil
 	case OpNe:
 		cmp := &Comp{}
-		cmp.eqValue = encoding.AppendJSONValue(cmp.eqValue, v)
+		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpNe
 		return cmp, nil
 	case OpGt:
 		cmp := &Comp{}
-		cmp.eqValue = encoding.AppendJSONValue(cmp.eqValue, v)
+		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpGt
 		return cmp, nil
 	case OpGte:
 		cmp := &Comp{}
-		cmp.eqValue = encoding.AppendJSONValue(cmp.eqValue, v)
+		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpGte
 		return cmp, nil
 	case OpLt:
 		cmp := &Comp{}
-		cmp.eqValue = encoding.AppendJSONValue(cmp.eqValue, v)
+		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpLt
 		return cmp, nil
 	case OpLte:
 		cmp := &Comp{}
-		cmp.eqValue = encoding.AppendJSONValue(cmp.eqValue, v)
+		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpLte
 		return cmp, nil
 	case OpNot:
@@ -379,7 +379,7 @@ func makeEqArray(v *fastjson.Value) []Filter {
 	res := make([]Filter, len(vals))
 	for i, jv := range vals {
 		eq := &Comp{CompOp: CompOpEq}
-		eq.eqValue = encoding.AppendJSONValue(eq.eqValue, jv)
+		eq.EqValue = encoding.AppendJSONValue(eq.EqValue, jv)
 		res[i] = eq
 	}
 	return res

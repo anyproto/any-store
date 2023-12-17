@@ -7,6 +7,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fastjson"
+
+	"github.com/anyproto/any-store/internal/encoding"
 )
 
 func TestKey_AppendJSON(t *testing.T) {
@@ -34,4 +36,26 @@ func TestKey_ReadJSONValue(t *testing.T) {
 		return nil
 	}))
 	assert.Equal(t, jsons, result)
+}
+
+func TestKey_ReadByteValues(t *testing.T) {
+	var jsons = []string{
+		`true`, `false`, `null`, `"string"`, `3.14`, `[1,2,3]`, `{"a":"b"}`,
+	}
+	var expected = make([][]byte, 0, len(jsons))
+
+	ns := NewNS("/test/prefix")
+	k := ns.GetKey()
+	for _, j := range jsons {
+		jv := fastjson.MustParse(j)
+		k = k.AppendJSON(jv)
+		expected = append(expected, encoding.AppendJSONValue(nil, jv))
+	}
+
+	var result [][]byte
+	require.NoError(t, k.ReadByteValues(ns, func(b []byte) error {
+		result = append(result, bytes.Clone(b))
+		return nil
+	}))
+	assert.Equal(t, expected, result)
 }

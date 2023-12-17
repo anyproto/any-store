@@ -12,6 +12,7 @@ import (
 
 type Filter interface {
 	Ok(v *fastjson.Value) bool
+	OkBytes(b []byte) bool
 	fmt.Stringer
 }
 
@@ -27,7 +28,7 @@ const (
 )
 
 type Comp struct {
-	eqValue []byte
+	EqValue []byte
 	buf     []byte
 	CompOp  CompOp
 }
@@ -40,19 +41,26 @@ func (e *Comp) Ok(v *fastjson.Value) bool {
 		vals, _ := v.Array()
 		for _, val := range vals {
 			e.buf = encoding.AppendJSONValue(e.buf[:0], val)
-			if e.comp() {
+			if e.comp(e.buf) {
 				return true
 			}
 		}
 		return false
 	} else {
 		e.buf = encoding.AppendJSONValue(e.buf[:0], v)
-		return e.comp()
+		return e.comp(e.buf)
 	}
 }
 
-func (e Comp) comp() bool {
-	comp := bytes.Compare(e.eqValue, e.buf)
+func (e *Comp) OkBytes(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	return e.comp(b)
+}
+
+func (e Comp) comp(b []byte) bool {
+	comp := bytes.Compare(e.EqValue, b)
 	switch e.CompOp {
 	case CompOpEq:
 		return comp == 0
@@ -90,7 +98,7 @@ func (e Comp) String() string {
 	p := parserPool.Get()
 	defer parserPool.Put(p)
 	a := &fastjson.Arena{}
-	val, _, _ := encoding.DecodeToJSON(p, a, e.eqValue)
+	val, _, _ := encoding.DecodeToJSON(p, a, e.EqValue)
 	return fmt.Sprintf(`{"%s": %s}`, op, val.String())
 }
 
@@ -103,6 +111,10 @@ func (e Key) Ok(v *fastjson.Value) bool {
 	return e.Filter.Ok(v.Get(e.Path...))
 }
 
+func (e Key) OkBytes(b []byte) bool {
+	return e.Filter.OkBytes(b)
+}
+
 func (e Key) String() string {
 	return fmt.Sprintf(`{"%s": %s}`, strings.Join(e.Path, "."), e.Filter.String())
 }
@@ -112,6 +124,15 @@ type And []Filter
 func (e And) Ok(v *fastjson.Value) bool {
 	for _, f := range e {
 		if !f.Ok(v) {
+			return false
+		}
+	}
+	return true
+}
+
+func (e And) OkBytes(b []byte) bool {
+	for _, f := range e {
+		if !f.OkBytes(b) {
 			return false
 		}
 	}
@@ -139,6 +160,15 @@ func (e Or) Ok(v *fastjson.Value) bool {
 	return false
 }
 
+func (e Or) OkBytes(b []byte) bool {
+	for _, f := range e {
+		if f.OkBytes(b) {
+			return true
+		}
+	}
+	return false
+}
+
 func (e Or) String() string {
 	var subS []string
 	for _, f := range e {
@@ -152,6 +182,15 @@ type Nor []Filter
 func (e Nor) Ok(v *fastjson.Value) bool {
 	for _, f := range e {
 		if f.Ok(v) {
+			return false
+		}
+	}
+	return true
+}
+
+func (e Nor) OkBytes(b []byte) bool {
+	for _, f := range e {
+		if f.OkBytes(b) {
 			return false
 		}
 	}
@@ -174,6 +213,10 @@ func (e Not) Ok(v *fastjson.Value) bool {
 	return !e.Filter.Ok(v)
 }
 
+func (e Not) OkBytes(b []byte) bool {
+	return !e.Filter.OkBytes(b)
+}
+
 func (e Not) String() string {
 	return fmt.Sprintf(`{"$not": %s}`, e.Filter.String())
 }
@@ -181,6 +224,10 @@ func (e Not) String() string {
 type All struct{}
 
 func (a All) Ok(_ *fastjson.Value) bool {
+	return true
+}
+
+func (a All) OkBytes(_ []byte) bool {
 	return true
 }
 
@@ -192,6 +239,10 @@ type Exists struct{}
 
 func (e Exists) Ok(v *fastjson.Value) bool {
 	return v != nil
+}
+
+func (e Exists) OkBytes(b []byte) bool {
+	return len(b) != 0
 }
 
 func (e Exists) String() string {
@@ -207,6 +258,13 @@ func (e TypeFilter) Ok(v *fastjson.Value) bool {
 		return false
 	}
 	return encoding.FastJSONTypeToType(v.Type()) == e.Type
+}
+
+func (e TypeFilter) OkBytes(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	return b[0] == uint8(e.Type)
 }
 
 func (e TypeFilter) String() string {

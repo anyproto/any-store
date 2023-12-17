@@ -13,7 +13,7 @@ import (
 func TestComp_Ok(t *testing.T) {
 	a := &fastjson.Arena{}
 	t.Run("eq", func(t *testing.T) {
-		cmp := Comp{CompOp: CompOpEq, eqValue: encoding.AppendAnyValue(nil, 1)}
+		cmp := Comp{CompOp: CompOpEq, EqValue: encoding.AppendAnyValue(nil, 1)}
 		t.Run("true", func(t *testing.T) {
 			assert.True(t, cmp.Ok(a.NewNumberInt(1)))
 		})
@@ -25,7 +25,7 @@ func TestComp_Ok(t *testing.T) {
 		})
 	})
 	t.Run("eq_array", func(t *testing.T) {
-		cmp := Comp{CompOp: CompOpEq, eqValue: encoding.AppendAnyValue(nil, 1)}
+		cmp := Comp{CompOp: CompOpEq, EqValue: encoding.AppendAnyValue(nil, 1)}
 		t.Run("true", func(t *testing.T) {
 			assert.True(t, cmp.Ok(fastjson.MustParse(`[3,2,1]`)))
 			assert.True(t, cmp.Ok(fastjson.MustParse(`[1]`)))
@@ -39,7 +39,7 @@ func TestComp_Ok(t *testing.T) {
 		})
 	})
 	t.Run("ne", func(t *testing.T) {
-		cmp := Comp{CompOp: CompOpNe, eqValue: encoding.AppendAnyValue(nil, 1)}
+		cmp := Comp{CompOp: CompOpNe, EqValue: encoding.AppendAnyValue(nil, 1)}
 		t.Run("true", func(t *testing.T) {
 			assert.True(t, cmp.Ok(a.NewNumberInt(2)))
 			assert.True(t, cmp.Ok(a.NewNumberInt(0)))
@@ -50,7 +50,7 @@ func TestComp_Ok(t *testing.T) {
 		})
 	})
 	t.Run("gt", func(t *testing.T) {
-		cmp := Comp{CompOp: CompOpGt, eqValue: encoding.AppendAnyValue(nil, 1)}
+		cmp := Comp{CompOp: CompOpGt, EqValue: encoding.AppendAnyValue(nil, 1)}
 		t.Run("true", func(t *testing.T) {
 			assert.True(t, cmp.Ok(a.NewNumberInt(2)))
 			assert.True(t, cmp.Ok(a.NewNumberInt(3)))
@@ -62,7 +62,7 @@ func TestComp_Ok(t *testing.T) {
 		})
 	})
 	t.Run("gte", func(t *testing.T) {
-		cmp := Comp{CompOp: CompOpGte, eqValue: encoding.AppendAnyValue(nil, 1)}
+		cmp := Comp{CompOp: CompOpGte, EqValue: encoding.AppendAnyValue(nil, 1)}
 		t.Run("true", func(t *testing.T) {
 			assert.True(t, cmp.Ok(a.NewNumberInt(2)))
 			assert.True(t, cmp.Ok(a.NewNumberInt(3)))
@@ -73,7 +73,7 @@ func TestComp_Ok(t *testing.T) {
 		})
 	})
 	t.Run("lt", func(t *testing.T) {
-		cmp := Comp{CompOp: CompOpLt, eqValue: encoding.AppendAnyValue(nil, 1)}
+		cmp := Comp{CompOp: CompOpLt, EqValue: encoding.AppendAnyValue(nil, 1)}
 		t.Run("true", func(t *testing.T) {
 			assert.True(t, cmp.Ok(a.NewNumberInt(0)))
 			assert.True(t, cmp.Ok(a.NewNumberInt(-1)))
@@ -85,7 +85,7 @@ func TestComp_Ok(t *testing.T) {
 		})
 	})
 	t.Run("lte", func(t *testing.T) {
-		cmp := Comp{CompOp: CompOpLte, eqValue: encoding.AppendAnyValue(nil, 1)}
+		cmp := Comp{CompOp: CompOpLte, EqValue: encoding.AppendAnyValue(nil, 1)}
 		t.Run("true", func(t *testing.T) {
 			assert.True(t, cmp.Ok(a.NewNumberInt(1)))
 			assert.True(t, cmp.Ok(a.NewNumberInt(0)))

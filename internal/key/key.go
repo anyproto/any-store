@@ -53,6 +53,21 @@ func (k Key) ReadAnyValue(ns *NS, f func(v any) error) (err error) {
 	return
 }
 
+func (k Key) ReadByteValues(ns *NS, f func(b []byte) error) (err error) {
+	var start = ns.prefixLen
+	var k2 = k[ns.prefixLen:]
+	for len(k2) > 0 {
+		if _, start, err = encoding.DecodeToAny(k2); err != nil {
+			return err
+		}
+		if err = f(k2[:start]); err != nil {
+			return
+		}
+		k2 = k2[start:]
+	}
+	return
+}
+
 func (k Key) Equal(k2 Key) bool {
 	return bytes.Equal(k, k2)
 }

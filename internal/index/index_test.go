@@ -1,7 +1,6 @@
 package index
 
 import (
-	"os"
 	"testing"
 
 	"github.com/dgraph-io/badger/v4"
@@ -12,6 +11,7 @@ import (
 	"github.com/anyproto/any-store/internal/encoding"
 	"github.com/anyproto/any-store/internal/key"
 	"github.com/anyproto/any-store/internal/parser"
+	"github.com/anyproto/any-store/internal/testdb"
 )
 
 func TestIndex_Insert(t *testing.T) {
@@ -151,15 +151,11 @@ func TestIndex_FlushStats(t *testing.T) {
 }
 
 func newFixture(t *testing.T, i Info) *fixture {
-	tmpDir, err := os.MkdirTemp("", "")
-	require.NoError(t, err)
-	db, err := badger.Open(badger.DefaultOptions(tmpDir).WithLoggingLevel(badger.WARNING))
-	require.NoError(t, err)
 	fx := &fixture{
-		tmpDir: tmpDir,
-		db:     db,
+		db: testdb.NewFixture(t),
 	}
-	require.NoError(t, db.View(func(txn *badger.Txn) error {
+	require.NoError(t, fx.db.View(func(txn *badger.Txn) error {
+		var err error
 		fx.Index, err = OpenIndex(txn, i)
 		return err
 	}))
@@ -167,14 +163,12 @@ func newFixture(t *testing.T, i Info) *fixture {
 }
 
 type fixture struct {
-	tmpDir string
-	db     *badger.DB
+	db *testdb.Fixture
 	*Index
 }
 
 func (fx *fixture) finish(t *testing.T) {
-	require.NoError(t, fx.db.Close())
-	_ = os.RemoveAll(fx.tmpDir)
+	fx.db.Finish(t)
 }
 
 func newTestDoc(t *testing.T, doc any) ([]byte, *fastjson.Value) {
