@@ -40,3 +40,7 @@ func (ns *NS) Copy() *NS {
 		prefixLen: ns.prefixLen,
 	}
 }
+
+func (ns *NS) Len() int {
+	return ns.prefixLen
+}

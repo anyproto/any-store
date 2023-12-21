@@ -1,6 +1,8 @@
 package anystore
 
 import (
+	"sync"
+
 	"github.com/dgraph-io/badger/v4"
 	"github.com/valyala/fastjson"
 
@@ -26,25 +28,41 @@ func Open(path string) (*DB, error) {
 }
 
 func OpenBadgerOptions(options badger.Options) (*DB, error) {
-	db, err := badger.Open(options)
+	bdb, err := badger.Open(options)
 	if err != nil {
 		return nil, err
 	}
-	return &DB{
-		db: db,
-	}, nil
+	db := &DB{
+		db:                bdb,
+		openedCollections: make(map[string]*Collection),
+	}
+	db.system, err = newSystemCollection(db)
+	if err != nil {
+		return nil, err
+	}
+	return db, nil
 }
 
 type DB struct {
-	db *badger.DB
+	db                *badger.DB
+	system            *systemCollection
+	openedCollections map[string]*Collection
+	mu                sync.Mutex
 }
 
 func (db *DB) Collection(name string) (*Collection, error) {
-	return newCollection(db, name)
-}
-
-func (db *DB) CollectionNames() (names []string, err error) {
-	return
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	coll, ok := db.openedCollections[name]
+	if ok {
+		return coll, nil
+	}
+	coll, err := newCollection(db, name)
+	if err != nil {
+		return nil, err
+	}
+	db.openedCollections[name] = coll
+	return coll, nil
 }
 
 func (db *DB) Close() (err error) {

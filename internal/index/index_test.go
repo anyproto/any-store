@@ -16,7 +16,7 @@ import (
 
 func TestIndex_Insert(t *testing.T) {
 	t.Run("simple", func(t *testing.T) {
-		fx := newFixture(t, Info{CollectionNS: key.NewNS("/test/collection"), Fields: []string{"a"}})
+		fx := newFixture(t, Info{IndexNS: key.NewNS("/test/collection"), Fields: []string{"a"}})
 		defer fx.finish(t)
 		require.NoError(t, fx.db.Update(func(txn *badger.Txn) error {
 			for i := 0; i < 10; i++ {
@@ -31,7 +31,7 @@ func TestIndex_Insert(t *testing.T) {
 		assert.Equal(t, uint64(10), fx.stats.count)
 	})
 	t.Run("array", func(t *testing.T) {
-		fx := newFixture(t, Info{CollectionNS: key.NewNS("/test/collection"), Fields: []string{"a"}})
+		fx := newFixture(t, Info{IndexNS: key.NewNS("/test/collection"), Fields: []string{"a"}})
 		defer fx.finish(t)
 		require.NoError(t, fx.db.Update(func(txn *badger.Txn) error {
 			for i := 0; i < 10; i++ {
@@ -50,9 +50,9 @@ func TestIndex_Insert(t *testing.T) {
 func TestInfo_fillKeysBuf(t *testing.T) {
 	t.Run("not sparse", func(t *testing.T) {
 		idx, err := OpenIndex(nil, Info{
-			CollectionNS: key.NewNS("/test/namespace"),
-			Fields:       []string{"a"},
-			Sparse:       false,
+			IndexNS: key.NewNS("/test/namespace"),
+			Fields:  []string{"a"},
+			Sparse:  false,
 		})
 		require.NoError(t, err)
 		idx.fillKeysBuf(fastjson.MustParse(`{"a":1}`))
@@ -60,9 +60,9 @@ func TestInfo_fillKeysBuf(t *testing.T) {
 	})
 	t.Run("sparse", func(t *testing.T) {
 		idx, err := OpenIndex(nil, Info{
-			CollectionNS: key.NewNS("/test/namespace"),
-			Fields:       []string{"a"},
-			Sparse:       true,
+			IndexNS: key.NewNS("/test/namespace"),
+			Fields:  []string{"a"},
+			Sparse:  true,
 		})
 		require.NoError(t, err)
 		idx.fillKeysBuf(fastjson.MustParse(`{"b":1}`))
@@ -72,9 +72,9 @@ func TestInfo_fillKeysBuf(t *testing.T) {
 func BenchmarkIndex_fillKeysBuf(b *testing.B) {
 	b.Run("simple", func(b *testing.B) {
 		idx, err := OpenIndex(nil, Info{
-			CollectionNS: key.NewNS("/test/namespace"),
-			Fields:       []string{"a"},
-			Sparse:       false,
+			IndexNS: key.NewNS("/test/namespace"),
+			Fields:  []string{"a"},
+			Sparse:  false,
 		})
 		require.NoError(b, err)
 		v := fastjson.MustParse(`{"a":"1", "b":"2"}`)
@@ -86,9 +86,9 @@ func BenchmarkIndex_fillKeysBuf(b *testing.B) {
 	})
 	b.Run("arrays", func(b *testing.B) {
 		idx, err := OpenIndex(nil, Info{
-			CollectionNS: key.NewNS("/test/namespace"),
-			Fields:       []string{"a", "b"},
-			Sparse:       false,
+			IndexNS: key.NewNS("/test/namespace"),
+			Fields:  []string{"a", "b"},
+			Sparse:  false,
 		})
 		require.NoError(b, err)
 		v := fastjson.MustParse(`{"a":["1", "2", "3"], "b":["4", "5"]}`)
@@ -101,7 +101,7 @@ func BenchmarkIndex_fillKeysBuf(b *testing.B) {
 }
 
 func TestIndex_Update(t *testing.T) {
-	fx := newFixture(t, Info{CollectionNS: key.NewNS("/test/update"), Fields: []string{"a"}})
+	fx := newFixture(t, Info{IndexNS: key.NewNS("/test/update"), Fields: []string{"a"}})
 	defer fx.finish(t)
 
 	require.NoError(t, fx.db.Update(func(txn *badger.Txn) error {
@@ -129,7 +129,7 @@ func TestIndex_Update(t *testing.T) {
 }
 
 func TestIndex_FlushStats(t *testing.T) {
-	info := Info{CollectionNS: key.NewNS("/test/collection"), Fields: []string{"a"}}
+	info := Info{IndexNS: key.NewNS("/test/collection"), Fields: []string{"a"}}
 	fx := newFixture(t, info)
 	defer fx.finish(t)
 	require.NoError(t, fx.db.Update(func(txn *badger.Txn) error {

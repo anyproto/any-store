@@ -12,9 +12,9 @@ import (
 )
 
 type Info struct {
-	CollectionNS *key.NS
-	Fields       []string
-	Sparse       bool
+	IndexNS *key.NS
+	Fields  []string
+	Sparse  bool
 }
 
 func (i Info) IndexName() string {
@@ -22,7 +22,7 @@ func (i Info) IndexName() string {
 }
 
 func OpenIndex(txn *badger.Txn, info Info) (*Index, error) {
-	prefix := info.CollectionNS.String() + "/index/" + info.IndexName()
+	prefix := info.IndexNS.String()
 	ns := key.NewNS(prefix)
 
 	fieldsPath := make([][]string, 0, len(info.Fields))
@@ -30,7 +30,7 @@ func OpenIndex(txn *badger.Txn, info Info) (*Index, error) {
 		fieldsPath = append(fieldsPath, strings.Split(fn, "."))
 	}
 
-	stats, err := openStats(txn, key.NewNS(prefix).GetKey())
+	stats, err := openStats(txn, key.NewNS(prefix+"/stats").GetKey())
 	if err != nil {
 		return nil, err
 	}
@@ -196,4 +196,16 @@ func (idx *Index) keys(txn *badger.Txn) (ks []key.Key, err error) {
 		ks = append(ks, bytes.Clone(it.Item().Key()))
 	}
 	return
+}
+
+type Stats struct {
+	Bitmap uint64
+	Count  uint64
+}
+
+func (idx *Index) Stats() Stats {
+	return Stats{
+		Bitmap: idx.stats.bitmap.GetCardinality(),
+		Count:  idx.stats.count,
+	}
 }

@@ -81,6 +81,9 @@ func (k Key) String() string {
 			break
 		}
 	}
+	if startV == 0 {
+		return string(k)
+	}
 	res = string(k[:startV-1])
 	err := k.ReadAnyValue(&NS{prefixLen: startV}, func(v any) error {
 		res += fmt.Sprintf("/%v", v)

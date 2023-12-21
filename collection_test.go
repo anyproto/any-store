@@ -274,6 +274,55 @@ func TestCollection_FindMany(t *testing.T) {
 	t.Log(time.Since(st))
 }
 
+func TestCollection_EnsureIndex(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		fx := newFixture(t)
+		defer fx.finish()
+		coll, err := fx.Collection("test")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(Index{
+			Fields: []string{"a"},
+			Sparse: true,
+		}))
+		indexes, err := coll.Indexes()
+		require.NoError(t, err)
+		require.Len(t, indexes, 1)
+		assert.Equal(t, []string{"a"}, indexes[0].Fields)
+		assert.Equal(t, true, indexes[0].Sparse)
+	})
+	t.Run("duplicate", func(t *testing.T) {
+		fx := newFixture(t)
+		defer fx.finish()
+		coll, err := fx.Collection("test")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(Index{
+			Fields: []string{"a"},
+			Sparse: true,
+		}))
+		require.Error(t, coll.EnsureIndex(Index{
+			Fields: []string{"a"},
+			Sparse: true,
+		}))
+	})
+	t.Run("with data", func(t *testing.T) {
+		fx := newFixture(t)
+		defer fx.finish()
+		coll, err := fx.Collection("test")
+		require.NoError(t, err)
+
+		for i := 0; i < 2000; i++ {
+			_, err = coll.InsertOne(map[string]any{"id": i, "a": []int{i, i + 1, i + 2, i + 3, i + 4, i + 5, i + 6, i + 7, i + 8, i + 9}})
+			require.NoError(t, err)
+		}
+		st := time.Now()
+		require.NoError(t, coll.EnsureIndex(Index{
+			Fields: []string{"a"},
+			Sparse: true,
+		}))
+		t.Log(time.Since(st), coll.indexes[0].Stats())
+	})
+}
+
 func BenchmarkCollection_InsertOne(b *testing.B) {
 	fx := newFixture(b)
 	defer fx.finish()

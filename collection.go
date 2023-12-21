@@ -22,10 +22,12 @@ var (
 )
 
 type Collection struct {
-	db     *DB
-	dataNS *key.NS
-	name   string
-	mu     sync.RWMutex
+	db        *DB
+	dataNS    *key.NS
+	indexesNS *key.NS
+	name      string
+	indexes   []*index.Index
+	mu        sync.RWMutex
 }
 
 type Result struct {
@@ -46,7 +48,25 @@ func newCollection(db *DB, name string) (c *Collection, err error) {
 
 func (c *Collection) init() (err error) {
 	c.dataNS = key.NewNS(nsPrefix.String() + "/" + c.name)
-	return
+	c.indexesNS = key.NewNS(c.dataNS.String() + "/indexes")
+	return c.openIndexes()
+}
+
+func (c *Collection) openIndexes() (err error) {
+	indexesInfo, err := c.db.system.Indexes(c.name)
+	if err != nil {
+		return err
+	}
+	return c.db.db.View(func(txn *badger.Txn) error {
+		for _, indexInfo := range indexesInfo {
+			idx, err := index.OpenIndex(txn, indexInfo.internalInfo(c.indexesNS))
+			if err != nil {
+				return err
+			}
+			c.indexes = append(c.indexes, idx)
+		}
+		return nil
+	})
 }
 
 func (c *Collection) InsertOne(doc any) (docId any, err error) {
@@ -78,7 +98,7 @@ func (c *Collection) InsertOne(doc any) (docId any, err error) {
 		if setErr := txn.Set(k, it.val.MarshalTo(nil)); setErr != nil {
 			return setErr
 		}
-		if idxErr := c.handleInsertIndexes(txn, it); idxErr != nil {
+		if idxErr := c.handleInsertIndexes(txn, k[c.dataNS.Len():], it.val); idxErr != nil {
 			return idxErr
 		}
 		return nil
@@ -100,7 +120,6 @@ func (c *Collection) InsertMany(docs ...any) (result Result, err error) {
 	defer c.mu.Unlock()
 
 	for len(docs) != 0 {
-
 		var handled int
 		err = c.db.db.Update(func(txn *badger.Txn) (err error) {
 			var (
@@ -130,7 +149,7 @@ func (c *Collection) InsertMany(docs ...any) (result Result, err error) {
 				if err = txn.Set(k, it.val.MarshalTo(nil)); err != nil {
 					return
 				}
-				if err = c.handleInsertIndexes(txn, it); err != nil {
+				if err = c.handleInsertIndexes(txn, k[c.dataNS.Len():], it.val); err != nil {
 					return err
 				}
 			}
@@ -182,11 +201,11 @@ func (c *Collection) UpsertOne(doc any) (docId any, err error) {
 			return setErr
 		}
 		if prevValue.val == nil {
-			if idxErr := c.handleInsertIndexes(txn, it); idxErr != nil {
+			if idxErr := c.handleInsertIndexes(txn, k[c.dataNS.Len():], it.val); idxErr != nil {
 				return idxErr
 			}
 		} else {
-			if idxErr := c.handleUpdateIndexes(txn, prevValue, it); idxErr != nil {
+			if idxErr := c.handleUpdateIndexes(txn, k[c.dataNS.Len():], prevValue.val, it.val); idxErr != nil {
 				return idxErr
 			}
 		}
@@ -245,11 +264,11 @@ func (c *Collection) UpsertMany(docs ...any) (result Result, err error) {
 				}
 
 				if prevValue.val == nil {
-					if err = c.handleInsertIndexes(txn, it); err != nil {
+					if err = c.handleInsertIndexes(txn, k[c.dataNS.Len():], it.val); err != nil {
 						return
 					}
 				} else {
-					if err = c.handleUpdateIndexes(txn, prevValue, it); err != nil {
+					if err = c.handleUpdateIndexes(txn, k[c.dataNS.Len():], prevValue.val, it.val); err != nil {
 						return
 					}
 				}
@@ -306,7 +325,7 @@ func (c *Collection) DeleteId(docId any) (err error) {
 		if err = txn.Delete(k); err != nil {
 			return err
 		}
-		if err = c.handleDeleteIndexes(txn, it); err != nil {
+		if err = c.handleDeleteIndexes(txn, k[c.dataNS.Len():], it.val); err != nil {
 			return err
 		}
 		return nil
@@ -317,11 +336,69 @@ func (c *Collection) DeleteMany(ctx context.Context, query any) (err error) {
 	return
 }
 
-func (c *Collection) Indexes(ctx context.Context) (indexes []index.Index, err error) {
-	return
+func (c *Collection) Indexes() (indexes []Index, err error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.db.system.Indexes(c.name)
 }
 
-func (c *Collection) AddIndex(ctx context.Context, index index.Index) (err error) {
+func (c *Collection) EnsureIndex(indexInfo Index) (err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err = c.db.system.AddIndex(indexInfo.ToJSON(c.name)); err != nil {
+		return err
+	}
+
+	txn := c.db.db.NewTransaction(true)
+	defer txn.Discard()
+	idx, err := index.OpenIndex(txn, indexInfo.internalInfo(c.indexesNS))
+	if err != nil {
+		return err
+	}
+	p := parserPool.Get()
+	defer parserPool.Put(p)
+
+	var startKey key.Key
+	for {
+		it := txn.NewIterator(badger.IteratorOptions{
+			PrefetchSize:   100,
+			PrefetchValues: true,
+			Prefix:         c.dataNS.Bytes(),
+		})
+		it.Seek(startKey)
+		for i := 0; i < 100; i++ {
+			if !it.Valid() {
+				break
+			}
+			v := it.Item()
+			k := v.Key()
+			id := k[c.dataNS.Len():]
+			if err = v.Value(func(val []byte) error {
+				jv, err := p.ParseBytes(val)
+				if err != nil {
+					return err
+				}
+				if err = idx.Insert(txn, id, jv); err != nil {
+					return err
+				}
+				return nil
+			}); err != nil {
+				it.Close()
+				return err
+			}
+			it.Next()
+		}
+		it.Close()
+		if err = txn.Commit(); err != nil {
+			return
+		}
+		if !it.Valid() {
+			break
+		}
+		startKey = it.Item().Key()
+		txn = c.db.db.NewTransaction(true)
+	}
+	c.indexes = append(c.indexes, idx)
 	return
 }
 
@@ -398,15 +475,30 @@ func (c *Collection) Count(query any) (count int, err error) {
 	return
 }
 
-func (c *Collection) handleInsertIndexes(txn *badger.Txn, it item) (err error) {
+func (c *Collection) handleInsertIndexes(txn *badger.Txn, id []byte, v *fastjson.Value) (err error) {
+	for _, idx := range c.indexes {
+		if err = idx.Insert(txn, id, v); err != nil {
+			return
+		}
+	}
 	return
 }
 
-func (c *Collection) handleDeleteIndexes(txn *badger.Txn, it item) (err error) {
+func (c *Collection) handleDeleteIndexes(txn *badger.Txn, id []byte, v *fastjson.Value) (err error) {
+	for _, idx := range c.indexes {
+		if err = idx.Delete(txn, id, v); err != nil {
+			return
+		}
+	}
 	return
 }
 
-func (c *Collection) handleUpdateIndexes(txn *badger.Txn, prev, new item) (err error) {
+func (c *Collection) handleUpdateIndexes(txn *badger.Txn, id []byte, prev, new *fastjson.Value) (err error) {
+	for _, idx := range c.indexes {
+		if err = idx.Update(txn, id, prev, new); err != nil {
+			return
+		}
+	}
 	return
 }
 
