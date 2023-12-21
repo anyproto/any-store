@@ -5,7 +5,6 @@ import (
 	"slices"
 
 	"github.com/dgraph-io/badger/v4"
-	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-store/internal/key"
 	"github.com/anyproto/any-store/query"
@@ -20,9 +19,6 @@ type IndexIterator struct {
 	Reverse  bool
 
 	it *badger.Iterator
-
-	a *fastjson.Arena
-	p *fastjson.Parser
 
 	values [][]byte
 	err    error
