@@ -36,6 +36,7 @@ func OpenIndex(txn *badger.Txn, info Info) (*Index, error) {
 	}
 
 	return &Index{
+		Name:       info.IndexName(),
 		dataNS:     ns,
 		sparse:     info.Sparse,
 		fieldPaths: fieldsPath,
@@ -45,6 +46,7 @@ func OpenIndex(txn *badger.Txn, info Info) (*Index, error) {
 }
 
 type Index struct {
+	Name       string
 	dataNS     *key.NS
 	sparse     bool
 	fieldPaths [][]string
@@ -95,6 +97,18 @@ func (idx *Index) Update(txn *badger.Txn, id []byte, prev, new *fastjson.Value) 
 func (idx *Index) Delete(txn *badger.Txn, id []byte, d *fastjson.Value) (err error) {
 	idx.fillKeysBuf(d)
 	return idx.deleteBuf(txn, id, idx.keysBuf)
+}
+
+func (idx *Index) Drop(txn *badger.Txn) (err error) {
+	it := txn.NewIterator(badger.IteratorOptions{
+		Prefix: idx.dataNS.Bytes(),
+	})
+	defer it.Close()
+	for it.Rewind(); it.Valid(); it.Next() {
+		_ = txn.Delete(it.Item().Key())
+	}
+	_ = txn.Delete(idx.stats.key)
+	return
 }
 
 func (idx *Index) FlushStats(txn *badger.Txn) (err error) {

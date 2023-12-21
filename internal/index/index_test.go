@@ -150,6 +150,30 @@ func TestIndex_FlushStats(t *testing.T) {
 	}))
 }
 
+func TestIndex_Drop(t *testing.T) {
+	info := Info{IndexNS: key.NewNS("/test/collection"), Fields: []string{"a"}}
+	fx := newFixture(t, info)
+	defer fx.finish(t)
+
+	require.NoError(t, fx.db.Update(func(txn *badger.Txn) error {
+		id, prev := newTestDoc(t, map[string]any{"id": 1, "a": []int{1, 2, 3}})
+		if err := fx.Insert(txn, id, prev); err != nil {
+			return err
+		}
+		assertKeys(t, txn, fx, []key.Key{
+			fx.dataNS.GetKey().AppendAny(1).AppendAny(1),
+			fx.dataNS.GetKey().AppendAny(2).AppendAny(1),
+			fx.dataNS.GetKey().AppendAny(3).AppendAny(1),
+		})
+
+		if err := fx.Drop(txn); err != nil {
+			return err
+		}
+		assertKeys(t, txn, fx, nil)
+		return nil
+	}))
+}
+
 func newFixture(t *testing.T, i Info) *fixture {
 	fx := &fixture{
 		db: testdb.NewFixture(t),

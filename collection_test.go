@@ -311,7 +311,7 @@ func TestCollection_EnsureIndex(t *testing.T) {
 		require.NoError(t, err)
 
 		for i := 0; i < 2000; i++ {
-			_, err = coll.InsertOne(map[string]any{"id": i, "a": []int{i, i + 1, i + 2, i + 3, i + 4, i + 5, i + 6, i + 7, i + 8, i + 9}})
+			_, err = coll.InsertOne(map[string]any{"id": i, "a": []int{i, i + 1}})
 			require.NoError(t, err)
 		}
 		st := time.Now()
@@ -321,6 +321,27 @@ func TestCollection_EnsureIndex(t *testing.T) {
 		}))
 		t.Log(time.Since(st), coll.indexes[0].Stats())
 	})
+}
+
+func TestCollection_DropIndex(t *testing.T) {
+	fx := newFixture(t)
+	defer fx.finish()
+	coll, err := fx.Collection("test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(Index{Fields: []string{"a"}}))
+
+	indexes, err := coll.Indexes()
+	require.NoError(t, err)
+	require.Len(t, indexes, 1)
+
+	indexName := indexes[0].Name()
+	require.NoError(t, coll.DropIndex(indexName))
+
+	indexes, err = coll.Indexes()
+	require.NoError(t, err)
+	require.Len(t, indexes, 0)
+
+	require.ErrorIs(t, coll.DropIndex(indexName), ErrIndexNotFound)
 }
 
 func BenchmarkCollection_InsertOne(b *testing.B) {

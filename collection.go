@@ -18,6 +18,7 @@ import (
 
 var (
 	ErrDuplicatedId     = errors.New("duplicated id")
+	ErrIndexNotFound    = errors.New("index not found")
 	ErrDocumentNotFound = errors.New("document not found")
 )
 
@@ -302,34 +303,38 @@ func (c *Collection) DeleteId(docId any) (err error) {
 	defer c.mu.Unlock()
 
 	return c.db.db.Update(func(txn *badger.Txn) error {
-		var k key.Key
-		c.dataNS.ReuseKey(func(rk key.Key) key.Key {
-			k = rk.AppendAny(docId)
-			return k
-		})
-		res, err := txn.Get(k)
-		if err != nil {
-			if err == badger.ErrKeyNotFound {
-				return ErrDocumentNotFound
-			} else {
-				return err
-			}
-		}
-		var it = item{}
-		if err = res.Value(func(val []byte) error {
-			it.val, err = fastjson.ParseBytes(val)
-			return err
-		}); err != nil {
-			return err
-		}
-		if err = txn.Delete(k); err != nil {
-			return err
-		}
-		if err = c.handleDeleteIndexes(txn, k[c.dataNS.Len():], it.val); err != nil {
-			return err
-		}
-		return nil
+		return c.deleteIdTx(txn, docId)
 	})
+}
+
+func (c *Collection) deleteIdTx(txn *badger.Txn, docId any) (err error) {
+	var k key.Key
+	c.dataNS.ReuseKey(func(rk key.Key) key.Key {
+		k = rk.AppendAny(docId)
+		return k
+	})
+	res, err := txn.Get(k)
+	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			return ErrDocumentNotFound
+		} else {
+			return err
+		}
+	}
+	var it = item{}
+	if err = res.Value(func(val []byte) error {
+		it.val, err = fastjson.ParseBytes(val)
+		return err
+	}); err != nil {
+		return err
+	}
+	if err = txn.Delete(k); err != nil {
+		return err
+	}
+	if err = c.handleDeleteIndexes(txn, k[c.dataNS.Len():], it.val); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (c *Collection) DeleteMany(ctx context.Context, query any) (err error) {
@@ -389,6 +394,7 @@ func (c *Collection) EnsureIndex(indexInfo Index) (err error) {
 			it.Next()
 		}
 		it.Close()
+		_ = idx.FlushStats(txn)
 		if err = txn.Commit(); err != nil {
 			return
 		}
@@ -402,8 +408,28 @@ func (c *Collection) EnsureIndex(indexInfo Index) (err error) {
 	return
 }
 
-func (c *Collection) DropIndex(ctx context.Context, indexName string) (err error) {
-	return
+func (c *Collection) DropIndex(indexName string) (err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var newIndexes = c.indexes[:0]
+	var toDelete *index.Index
+	for _, idx := range c.indexes {
+		if idx.Name == indexName {
+			toDelete = idx
+		} else {
+			newIndexes = append(newIndexes, idx)
+		}
+	}
+	if toDelete == nil {
+		return ErrIndexNotFound
+	}
+
+	c.indexes = newIndexes
+
+	return c.db.db.Update(func(txn *badger.Txn) error {
+		_ = c.db.system.deleteIdTx(txn, c.name+"/"+indexName)
+		return toDelete.Drop(txn)
+	})
 }
 
 func (c *Collection) FindId(docId any) (res Item, err error) {
