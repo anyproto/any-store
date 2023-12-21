@@ -105,9 +105,13 @@ func (idx *Index) Drop(txn *badger.Txn) (err error) {
 	})
 	defer it.Close()
 	for it.Rewind(); it.Valid(); it.Next() {
-		_ = txn.Delete(it.Item().Key())
+		if err = txn.Delete(it.Item().Key()); err != nil && err != badger.ErrKeyNotFound {
+			return err
+		}
 	}
-	_ = txn.Delete(idx.stats.key)
+	if err = txn.Delete(idx.stats.key); err != nil && err != badger.ErrKeyNotFound {
+		return err
+	}
 	return
 }
 
