@@ -324,24 +324,44 @@ func TestCollection_EnsureIndex(t *testing.T) {
 }
 
 func TestCollection_DropIndex(t *testing.T) {
-	fx := newFixture(t)
-	defer fx.finish()
-	coll, err := fx.Collection("test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(Index{Fields: []string{"a"}}))
+	t.Run("empty, not found", func(t *testing.T) {
+		fx := newFixture(t)
+		defer fx.finish()
+		coll, err := fx.Collection("test")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(Index{Fields: []string{"a"}}))
 
-	indexes, err := coll.Indexes()
-	require.NoError(t, err)
-	require.Len(t, indexes, 1)
+		indexes, err := coll.Indexes()
+		require.NoError(t, err)
+		require.Len(t, indexes, 1)
 
-	indexName := indexes[0].Name()
-	require.NoError(t, coll.DropIndex(indexName))
+		indexName := indexes[0].Name()
+		require.NoError(t, coll.DropIndex(indexName))
 
-	indexes, err = coll.Indexes()
-	require.NoError(t, err)
-	require.Len(t, indexes, 0)
+		indexes, err = coll.Indexes()
+		require.NoError(t, err)
+		require.Len(t, indexes, 0)
 
-	require.ErrorIs(t, coll.DropIndex(indexName), ErrIndexNotFound)
+		require.ErrorIs(t, coll.DropIndex(indexName), ErrIndexNotFound)
+	})
+	t.Run("big", func(t *testing.T) {
+		fx := newFixture(t)
+		defer fx.finish()
+		coll, err := fx.Collection("test")
+		require.NoError(t, err)
+
+		idx := Index{Fields: []string{"a"}}
+		require.NoError(t, coll.EnsureIndex(idx))
+
+		for i := 0; i < 5000; i++ {
+			_, err = coll.InsertOne(map[string]any{"id": i, "a": []int{i, i + 1, i + 2, i + 3, i + 4}})
+			require.NoError(t, err)
+		}
+
+		st := time.Now()
+		require.NoError(t, coll.DropIndex(idx.Name()))
+		t.Log(time.Since(st))
+	})
 }
 
 func BenchmarkCollection_InsertOne(b *testing.B) {
