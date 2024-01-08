@@ -5,6 +5,7 @@ import (
 
 	"github.com/dgraph-io/badger/v4"
 
+	"github.com/anyproto/any-store/internal/sort"
 	"github.com/anyproto/any-store/query"
 )
 
@@ -25,7 +26,7 @@ type findQuery struct {
 	coll *Collection
 
 	cond          query.Filter
-	sort          query.Sort
+	sort          sort.Sort
 	fields        []string
 	excludeField  []string
 	indexHint     []string
@@ -52,9 +53,9 @@ func (f *findQuery) Cond(cond any) FindQuery {
 	return f
 }
 
-func (f *findQuery) Sort(sort ...any) FindQuery {
+func (f *findQuery) Sort(sorts ...any) FindQuery {
 	var err error
-	if f.sort, err = query.ParseSort(sort...); err != nil {
+	if f.sort, err = sort.ParseSort(sorts...); err != nil {
 		f.err = errors.Join(f.err, err)
 	}
 	return f

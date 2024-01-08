@@ -1,6 +1,7 @@
 package encoding
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -35,4 +36,25 @@ func TestAppendJSONValue(t *testing.T) {
 
 	_, _, err := DecodeToJSON(p, a, nil)
 	require.Error(t, err)
+}
+
+func TestAppendInvertedJSON(t *testing.T) {
+	var (
+		a = &fastjson.Arena{}
+	)
+
+	var values = [][2]*fastjson.Value{
+		{a.NewString("astring"), a.NewString("bstring")},
+		{a.NewNull(), a.NewFalse()},
+		{a.NewNumberFloat64(42.2), a.NewNumberFloat64(43.3)},
+		{fastjson.MustParse(`["a","b","c"]`), fastjson.MustParse(`["d","b","c"]`)},
+		{fastjson.MustParse(`{"a":1}`), fastjson.MustParse(`{"b":1}`)},
+	}
+
+	for _, v := range values {
+		b1 := AppendInvertedJSON(nil, v[0])
+		b2 := AppendInvertedJSON(nil, v[1])
+		assert.Equal(t, 1, bytes.Compare(b1, b2), v[0].String())
+	}
+
 }

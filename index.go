@@ -20,7 +20,7 @@ func (idx Index) Name() string {
 
 func (idx Index) internalInfo(ns *key.NS) index.Info {
 	return index.Info{
-		IndexNS: ns,
+		IndexNS: key.NewNS(ns.String() + "/" + idx.Name()),
 		Fields:  idx.Fields,
 		Sparse:  idx.Sparse,
 	}

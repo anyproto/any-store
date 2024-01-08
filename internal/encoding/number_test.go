@@ -49,3 +49,21 @@ func BenchmarkAppendFloat64(b *testing.B) {
 	})
 
 }
+
+func BenchmarkBytesToFloat64(b *testing.B) {
+	b.Run("pos", func(b *testing.B) {
+		b.ReportAllocs()
+		buf := AppendFloat64(nil, 4.44444444444)
+		for i := 0; i < b.N; i++ {
+			_ = BytesToFloat64(buf)
+		}
+	})
+	b.Run("neg", func(b *testing.B) {
+		b.ReportAllocs()
+		buf := AppendFloat64(nil, -4.44444444444)
+		for i := 0; i < b.N; i++ {
+			_ = BytesToFloat64(buf)
+		}
+	})
+
+}

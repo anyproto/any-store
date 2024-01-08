@@ -38,9 +38,12 @@ func (k Key) ReadJSONValue(ns *NS, p *fastjson.Parser, a *fastjson.Arena, f func
 }
 
 func (k Key) ReadAnyValue(ns *NS, f func(v any) error) (err error) {
-	var start = ns.prefixLen
 	var v any
-	var k2 = k[ns.prefixLen:]
+	var start int
+	if ns != nil {
+		start = ns.prefixLen
+	}
+	var k2 = k[start:]
 	for len(k2) > 0 {
 		if v, start, err = encoding.DecodeToAny(k2); err != nil {
 			return err
@@ -54,9 +57,13 @@ func (k Key) ReadAnyValue(ns *NS, f func(v any) error) (err error) {
 }
 
 func (k Key) ReadByteValues(ns *NS, f func(b []byte) error) (err error) {
-	var start = ns.prefixLen
-	var k2 = k[ns.prefixLen:]
+	var start int
+	if ns != nil {
+		start = ns.prefixLen
+	}
+	var k2 = k[start:]
 	for len(k2) > 0 {
+		// todo: rewrite to calc len only, without converting
 		if _, start, err = encoding.DecodeToAny(k2); err != nil {
 			return err
 		}

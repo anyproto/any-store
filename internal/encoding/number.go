@@ -31,13 +31,15 @@ func AppendNumber[T constraints.Integer | constraints.Float](b []byte, n T) []by
 
 // BytesToFloat64 decodes float64 from bytes encoded with AppendFloat64
 func BytesToFloat64(b []byte) float64 {
+	_ = b[7] // bounds check
 	// handle negative numbers
 	if b[0]&(1<<7) == 0 {
 		// flip all bits for negative numbers
-		for i := range b {
-			b[i] = ^b[i]
+		var cp [8]byte
+		for i := range b[:8] {
+			cp[i] = ^b[i]
 		}
-		return math.Float64frombits(binary.BigEndian.Uint64(b))
+		return math.Float64frombits(binary.BigEndian.Uint64(cp[:]))
 	}
 	return -math.Float64frombits(binary.BigEndian.Uint64(b))
 }

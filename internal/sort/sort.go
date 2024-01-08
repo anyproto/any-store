@@ -1,12 +1,12 @@
-package query
+package sort
 
 import (
-	"bytes"
 	"fmt"
 	"strings"
 
 	"github.com/valyala/fastjson"
 
+	"github.com/anyproto/any-store/internal/encoding"
 	"github.com/anyproto/any-store/internal/key"
 )
 
@@ -48,21 +48,16 @@ func parseSortString(ss string) (Sort, error) {
 
 type Sort interface {
 	Fields() []string
-	Compare(v1, v2 *fastjson.Value) int
+	AppendKey(k key.Key, v *fastjson.Value) key.Key
 }
 
 type Sorts []Sort
 
-func (ss Sorts) Compare(v1, v2 *fastjson.Value) (cmp int) {
+func (ss Sorts) AppendKey(k key.Key, v *fastjson.Value) key.Key {
 	for _, s := range ss {
-		cmp = s.Compare(v1, v2)
-		if cmp == 0 {
-			continue
-		} else {
-			return
-		}
+		k = s.AppendKey(k, v)
 	}
-	return
+	return k
 }
 
 func (ss Sorts) Fields() []string {
@@ -82,33 +77,14 @@ type SortField struct {
 	bufA, bufB key.Key
 }
 
-func (s *SortField) Compare(v1, v2 *fastjson.Value) int {
-	s.bufA = s.bufA[:0].AppendJSON(v1.Get(s.Path...))
-	s.bufB = s.bufB[:0].AppendJSON(v2.Get(s.Path...))
-	cmp := bytes.Compare(s.bufA, s.bufB)
-	if s.Reverse && cmp != 0 {
-		return -cmp
+func (s *SortField) AppendKey(k key.Key, v *fastjson.Value) key.Key {
+	if !s.Reverse {
+		return encoding.AppendJSONValue(k, v.Get(s.Path...))
+	} else {
+		return encoding.AppendInvertedJSON(k, v.Get(s.Path...))
 	}
-	return cmp
 }
 
 func (s *SortField) Fields() []string {
 	return []string{strings.Join(s.Path, ".")}
-}
-
-type SortDocs struct {
-	Sort Sort
-	Docs []*fastjson.Value
-}
-
-func (s *SortDocs) Len() int {
-	return len(s.Docs)
-}
-
-func (s *SortDocs) Less(i, j int) bool {
-	return s.Sort.Compare(s.Docs[i], s.Docs[j]) == -1
-}
-
-func (s *SortDocs) Swap(i, j int) {
-	s.Docs[i], s.Docs[j] = s.Docs[j], s.Docs[i]
 }

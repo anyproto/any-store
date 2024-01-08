@@ -18,6 +18,15 @@ const (
 	TypeTrue   = Type(5)
 	TypeArray  = Type(6)
 	TypeObject = Type(7)
+
+	// inverted types
+	iTypeNull   = Type(14)
+	iTypeNumber = Type(13)
+	iTypeString = Type(12)
+	iTypeFalse  = Type(11)
+	iTypeTrue   = Type(10)
+	iTypeArray  = Type(9)
+	iTypeObject = Type(8)
 )
 
 func FastJSONTypeToType(t fastjson.Type) Type {

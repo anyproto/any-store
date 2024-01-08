@@ -94,7 +94,32 @@ func DecodeToAny(b []byte) (v any, n int, err error) {
 		return true, 1, nil
 	case TypeFalse:
 		return false, 1, nil
+	case iTypeObject, iTypeArray, iTypeString:
+		var end int
+		for i := range b {
+			if b[i] == EOS {
+				end = i
+				break
+			} else if i != 0 {
+				b[i] = 255 - b[i]
+			}
+		}
+		if end == 0 {
+			return nil, 0, fmt.Errorf("can't decode string: end of string not found")
+		}
+		return string(b[1:end]), end + 1, nil
+	case iTypeNumber:
+		if len(b) < 9 {
+			return nil, 0, fmt.Errorf("unexpected number encoding")
+		}
+		return -BytesToFloat64(b[1:]), 9, nil
+	case iTypeNull:
+		return nil, 1, nil
+	case iTypeTrue:
+		return true, 1, nil
+	case iTypeFalse:
+		return false, 1, nil
 	default:
-		return nil, 0, fmt.Errorf("unexpected binary type: %v", Type(b[0]))
+		return nil, 0, fmt.Errorf("toAny: unexpected binary type: %v: %v", Type(b[0]), b)
 	}
 }
