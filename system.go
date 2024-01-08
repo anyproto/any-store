@@ -22,7 +22,7 @@ func (sc *systemCollection) AddIndex(v *fastjson.Value) (err error) {
 }
 
 func (sc *systemCollection) Indexes(collName string) (indexes []Index, err error) {
-	it, err := sc.FindMany(map[string]string{"collectionName": collName})
+	it, err := sc.Find().Cond(map[string]string{"collectionName": collName}).Iter()
 	if err != nil {
 		return nil, err
 	}

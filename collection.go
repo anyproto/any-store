@@ -13,7 +13,6 @@ import (
 	"github.com/anyproto/any-store/internal/index"
 	"github.com/anyproto/any-store/internal/key"
 	"github.com/anyproto/any-store/internal/parser"
-	"github.com/anyproto/any-store/query"
 )
 
 var (
@@ -441,7 +440,6 @@ func (c *Collection) FindId(docId any) (res Item, err error) {
 		if err != nil {
 			return err
 		}
-
 		p := parserPool.Get()
 		defer parserPool.Put(p)
 
@@ -462,25 +460,8 @@ func (c *Collection) FindId(docId any) (res Item, err error) {
 	return
 }
 
-func (c *Collection) FindMany(q any) (iterator Iterator, err error) {
-	filter, err := query.ParseCondition(q)
-	if err != nil {
-		return nil, err
-	}
-
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	iter := newDirectIterator()
-	iter.txn = c.db.db.NewTransaction(false)
-	iter.it = iter.txn.NewIterator(badger.IteratorOptions{
-		PrefetchSize:   100,
-		PrefetchValues: true,
-		Prefix:         c.dataNS.Bytes(),
-	})
-	iter.it.Rewind()
-	iter.filter = filter
-	return iter, nil
+func (c *Collection) Find() FindQuery {
+	return &findQuery{coll: c}
 }
 
 func (c *Collection) Count(query any) (count int, err error) {
