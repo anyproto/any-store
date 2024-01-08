@@ -2,11 +2,49 @@ package query
 
 import (
 	"bytes"
+	"fmt"
+	"strings"
 
 	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-store/internal/key"
 )
+
+func ParseSort(sorts ...any) (Sort, error) {
+	var result Sorts
+	for _, s := range sorts {
+		switch v := s.(type) {
+		case string:
+			sf, err := parseSortString(v)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, sf)
+		case Sort:
+			result = append(result, v)
+		default:
+			return nil, fmt.Errorf("unexpected sort argument type: %T", s)
+		}
+	}
+	if len(result) == 1 {
+		return result[0], nil
+	}
+	return result, nil
+}
+
+func parseSortString(ss string) (Sort, error) {
+	res := &SortField{}
+	if strings.HasPrefix(ss, "-") {
+		res.Reverse = true
+		res.Path = strings.Split(ss[1:], ".")
+	} else {
+		res.Path = strings.Split(ss, ".")
+	}
+	if len(res.Path) == 0 {
+		return nil, fmt.Errorf("empty sort condition")
+	}
+	return res, nil
+}
 
 type Sort interface {
 	Compare(v1, v2 *fastjson.Value) int
