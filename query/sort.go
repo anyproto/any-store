@@ -11,7 +11,7 @@ import (
 )
 
 func ParseSort(sorts ...any) (Sort, error) {
-	var result Sorts
+	var result = make(Sorts, 0, len(sorts))
 	for _, s := range sorts {
 		switch v := s.(type) {
 		case string:
@@ -47,6 +47,7 @@ func parseSortString(ss string) (Sort, error) {
 }
 
 type Sort interface {
+	Fields() []string
 	Compare(v1, v2 *fastjson.Value) int
 }
 
@@ -64,6 +65,17 @@ func (ss Sorts) Compare(v1, v2 *fastjson.Value) (cmp int) {
 	return
 }
 
+func (ss Sorts) Fields() []string {
+	if len(ss) == 0 {
+		return nil
+	}
+	res := make([]string, 0, len(ss))
+	for _, s := range ss {
+		res = append(res, s.Fields()...)
+	}
+	return res
+}
+
 type SortField struct {
 	Path       []string
 	Reverse    bool
@@ -78,6 +90,10 @@ func (s *SortField) Compare(v1, v2 *fastjson.Value) int {
 		return -cmp
 	}
 	return cmp
+}
+
+func (s *SortField) Fields() []string {
+	return []string{strings.Join(s.Path, ".")}
 }
 
 type SortDocs struct {
