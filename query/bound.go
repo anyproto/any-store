@@ -81,6 +81,25 @@ func (bs Bounds) Append(b Bound) Bounds {
 	return result
 }
 
+func (bs Bounds) Merge() Bounds {
+	var nbs = bs[:0]
+	var needMerge bool
+	for i := 0; i < bs.Len()-1; i++ {
+		if isOverlap(bs[i], bs[i+1]) && isOverlap(bs[i+1], bs[i]) {
+			needMerge = true
+			break
+		}
+	}
+	if needMerge {
+		for i := range bs {
+			nbs = nbs.Append(bs[i])
+		}
+		return nbs.Merge()
+	} else {
+		return bs
+	}
+}
+
 func isOverlap(a, b Bound) bool {
 	// a {x, inf} or b {-inf, x}
 	if len(a.End) == 0 || len(b.Start) == 0 {

@@ -95,6 +95,14 @@ var boundTestData = []boundTestCase{
 		},
 		expected: `Bounds{[-inf,inf]}`,
 	},
+	{
+		unmerged: Bounds{
+			{Start: newBoundKey(1), End: newBoundKey(3)},
+			{Start: newBoundKey(5), End: newBoundKey(7)},
+			{Start: newBoundKey(2), End: newBoundKey(6)},
+		},
+		expected: `Bounds{('1','7')}`,
+	},
 }
 
 func TestBounds_Append(t *testing.T) {
@@ -103,6 +111,7 @@ func TestBounds_Append(t *testing.T) {
 		for _, b := range tc.unmerged {
 			bs = bs.Append(b)
 		}
+		bs = bs.Merge()
 		assert.Equal(t, tc.expected, bs.String())
 	}
 }
