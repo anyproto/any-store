@@ -1,8 +1,14 @@
 package key
 
-import "bytes"
+import (
+	"bytes"
+	"strings"
+)
 
 func NewNS(ns string) *NS {
+	if !strings.HasPrefix(ns, "/") {
+		ns = "/" + ns
+	}
 	return &NS{
 		prefix:    append([]byte(ns), eos),
 		prefixLen: len(ns) + 1,

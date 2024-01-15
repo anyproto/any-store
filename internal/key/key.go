@@ -82,18 +82,29 @@ func (k Key) Equal(k2 Key) bool {
 func (k Key) String() string {
 	var res string
 	var startV int
-	for i := range k {
-		if k[i] == encoding.EOS {
-			startV = i + 1
-			break
+	if len(k) == 0 {
+		return ""
+	}
+	if string(k[0]) == "/" {
+		for i := range k {
+			if k[i] == encoding.EOS {
+				startV = i + 1
+				break
+			}
 		}
+		if startV == 0 {
+			return string(k)
+		}
+		res = string(k[:startV-1])
+	} else {
+		startV = 0
 	}
-	if startV == 0 {
-		return string(k)
-	}
-	res = string(k[:startV-1])
 	err := k.ReadAnyValue(&NS{prefixLen: startV}, func(v any) error {
-		res += fmt.Sprintf("/%v", v)
+		if res == "" {
+			res += fmt.Sprintf("%v", v)
+		} else {
+			res += fmt.Sprintf("/%v", v)
+		}
 		return nil
 	})
 	if err != nil {
