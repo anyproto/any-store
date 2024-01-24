@@ -5,7 +5,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/anyproto/any-store/internal/encoding"
 	"github.com/anyproto/any-store/internal/key"
 )
 
@@ -26,13 +28,14 @@ func TestUniqIterator_Next(t *testing.T) {
 		IdIterator: ti,
 	}
 
-	var expected = [][]any{
-		{float64(1), float64(1)},
-		{float64(2), float64(2)},
+	var expected = []any{
+		float64(1), float64(2),
 	}
-	var result [][]any
+	var result []any
 	for uniq.Next() {
-		result = append(result, toAnyVals(t, uniq.Values()))
+		a, _, e := encoding.DecodeToAny(uniq.CurrentId())
+		require.NoError(t, e)
+		result = append(result, a)
 	}
 	assert.Equal(t, expected, result)
 }
@@ -54,7 +57,7 @@ func (t *testIterator) Valid() bool {
 	return t.pos <= len(t.keys)
 }
 
-func (t *testIterator) Values() [][]byte {
+func (t *testIterator) CurrentId() []byte {
 	if !t.Valid() {
 		return nil
 	}
@@ -64,7 +67,7 @@ func (t *testIterator) Values() [][]byte {
 		values = append(values, bytes.Clone(b))
 		return nil
 	})
-	return values
+	return values[len(values)-1]
 }
 
 func (t *testIterator) Close() error {

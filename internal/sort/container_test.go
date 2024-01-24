@@ -27,7 +27,7 @@ func TestSortField_AppendKey(t *testing.T) {
 	srt := time.Now()
 	sort.Sort(c)
 	t.Log(time.Since(st), time.Since(srt))
-	for _, d := range c.data {
+	for _, d := range c.Data {
 		t.Log(key.Key(d).String())
 	}
 }

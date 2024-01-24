@@ -2,6 +2,7 @@ package sort
 
 import (
 	"bytes"
+	"sort"
 
 	"github.com/valyala/fastjson"
 
@@ -9,28 +10,38 @@ import (
 	"github.com/anyproto/any-store/internal/key"
 )
 
+func NewContainer(sorts Sort) *Container {
+	return &Container{
+		sort: sorts,
+	}
+}
+
 type Container struct {
-	ns   *key.NS
+	NS   *key.NS
 	sort Sort
-	data [][]byte
+	Data [][]byte
 }
 
 func (c *Container) Len() int {
-	return len(c.data)
+	return len(c.Data)
 }
 
 func (c *Container) Less(i, j int) bool {
-	return bytes.Compare(c.data[i], c.data[j]) == -1
+	return bytes.Compare(c.Data[i], c.Data[j]) == -1
 }
 
 func (c *Container) Swap(i, j int) {
-	c.data[i], c.data[j] = c.data[j], c.data[i]
+	c.Data[i], c.Data[j] = c.Data[j], c.Data[i]
 }
 
 func (c *Container) Collect(v *fastjson.Value) {
-	if c.ns == nil {
-		c.ns = key.NewNS("")
+	if c.NS == nil {
+		c.NS = key.NewNS("")
 	}
-	var k = c.sort.AppendKey(c.ns.GetKey(), v)
-	c.data = append(c.data, encoding.AppendJSONValue(k, v.Get("id")))
+	var k = c.sort.AppendKey(c.NS.GetKey(), v)
+	c.Data = append(c.Data, encoding.AppendJSONValue(k, v.Get("id")))
+}
+
+func (c *Container) Sort() {
+	sort.Sort(c)
 }

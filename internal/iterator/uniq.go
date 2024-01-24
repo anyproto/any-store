@@ -7,13 +7,12 @@ type UniqIterator struct {
 
 func (u UniqIterator) Next() bool {
 	for u.IdIterator.Next() {
-		vals := u.Values()
-		val := string(vals[len(vals)-1])
-		_, ok := u.uniq[val]
+		id := string(u.IdIterator.CurrentId())
+		_, ok := u.uniq[id]
 		if ok {
 			continue
 		}
-		u.uniq[val] = struct{}{}
+		u.uniq[id] = struct{}{}
 		return true
 	}
 	return false

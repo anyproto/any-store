@@ -1,90 +1,177 @@
 package iterator
 
 import (
-	"fmt"
 	"testing"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/anyproto/any-store/internal/encoding"
 	"github.com/anyproto/any-store/internal/key"
-	"github.com/anyproto/any-store/internal/testdb"
 	"github.com/anyproto/any-store/query"
 )
 
 func TestIndexIterator_Next(t *testing.T) {
-	fx := testdb.NewFixture(t)
+	fx := newFixture(t)
 	defer fx.Finish(t)
-	ns := key.NewNS("/ns")
-	keys := make([]key.Key, 10)
-	for i := range keys {
-		keys[i] = ns.GetKey().AppendAny(i).AppendAny(fmt.Sprint(i)).AppendAny(i)
-	}
-	fillNs(t, fx.DB, keys...)
-	t.Run("all", func(t *testing.T) {
+	fillTestIndex(t, fx, 5)
+
+	t.Run("no bound direct", func(t *testing.T) {
+		var expected = []float64{0, 1, 2, 3, 4}
+		var actual []float64
 		require.NoError(t, fx.View(func(txn *badger.Txn) error {
-			it := &IndexIterator{
-				IndexNs: ns,
-				Txn:     txn,
+			fx.QCtx.Txn = txn
+			idx := NewIndexIterator(fx.QCtx, fx.indexNS, nil, false)
+			for idx.Next() {
+				actual = append(actual, toAny(t, idx.CurrentId()).(float64))
 			}
-			var i int
-			for it.Next() {
-				expected := []any{
-					float64(i),
-					fmt.Sprint(i),
-					float64(i),
-				}
-				require.Equal(t, expected, toAnyVals(t, it.Values()))
-				i++
-			}
-			assert.Equal(t, 10, i)
-			return it.Close()
+			return idx.Close()
 		}))
+		assert.Equal(t, expected, actual)
 	})
-	t.Run("filters", func(t *testing.T) {
+	t.Run("no bound reverse", func(t *testing.T) {
+		var expected = []float64{4, 3, 2, 1, 0}
+		var actual []float64
 		require.NoError(t, fx.View(func(txn *badger.Txn) error {
-			it := &IndexIterator{
-				IndexNs: ns,
-				Txn:     txn,
-				Filters: []query.Filter{
-					&query.Comp{EqValue: encoding.AppendAnyValue(nil, 5), CompOp: query.CompOpEq},
+			fx.QCtx.Txn = txn
+			idx := NewIndexIterator(fx.QCtx, key.NewNS("testIndex"), nil, true)
+			for idx.Next() {
+				actual = append(actual, toAny(t, idx.CurrentId()).(float64))
+			}
+			return idx.Close()
+		}))
+		assert.Equal(t, expected, actual)
+	})
+	t.Run("one bound direct; lte gte", func(t *testing.T) {
+		var expected = []float64{1, 2, 3}
+		var actual []float64
+		require.NoError(t, fx.View(func(txn *badger.Txn) error {
+			fx.QCtx.Txn = txn
+			idx := NewIndexIterator(fx.QCtx, key.NewNS("testIndex"), query.Bounds{{
+				Start:        fx.indexNS.GetKey().AppendAny(1),
+				StartInclude: true,
+				End:          fx.indexNS.GetKey().AppendAny(3),
+				EndInclude:   true,
+			}}, false)
+			for idx.Next() {
+				actual = append(actual, toAny(t, idx.CurrentId()).(float64))
+			}
+			return idx.Close()
+		}))
+		assert.Equal(t, expected, actual)
+	})
+	t.Run("one bound reverse; lte gte", func(t *testing.T) {
+		var expected = []float64{3, 2, 1}
+		var actual []float64
+		require.NoError(t, fx.View(func(txn *badger.Txn) error {
+			fx.QCtx.Txn = txn
+			idx := NewIndexIterator(fx.QCtx, key.NewNS("testIndex"), query.Bounds{{
+				Start:        fx.indexNS.GetKey().AppendAny(1),
+				StartInclude: true,
+				End:          fx.indexNS.GetKey().AppendAny(3),
+				EndInclude:   true,
+			}}, true)
+			for idx.Next() {
+				actual = append(actual, toAny(t, idx.CurrentId()).(float64))
+			}
+			return idx.Close()
+		}))
+		assert.Equal(t, expected, actual)
+	})
+	t.Run("one bound direct; lt gt", func(t *testing.T) {
+		var expected = []float64{2, 3}
+		var actual []float64
+		require.NoError(t, fx.View(func(txn *badger.Txn) error {
+			fx.QCtx.Txn = txn
+			idx := NewIndexIterator(fx.QCtx, key.NewNS("testIndex"), query.Bounds{{
+				Start: fx.indexNS.GetKey().AppendAny(1),
+				End:   fx.indexNS.GetKey().AppendAny(4),
+			}}, false)
+			for idx.Next() {
+				actual = append(actual, toAny(t, idx.CurrentId()).(float64))
+			}
+			return idx.Close()
+		}))
+		assert.Equal(t, expected, actual)
+	})
+	t.Run("one bound reverse; lt gt", func(t *testing.T) {
+		var expected = []float64{3, 2}
+		var actual []float64
+		require.NoError(t, fx.View(func(txn *badger.Txn) error {
+			fx.QCtx.Txn = txn
+			idx := NewIndexIterator(fx.QCtx, key.NewNS("testIndex"), query.Bounds{{
+				Start: fx.indexNS.GetKey().AppendAny(1),
+				End:   fx.indexNS.GetKey().AppendAny(4),
+			}}, true)
+			for idx.Next() {
+				actual = append(actual, toAny(t, idx.CurrentId()).(float64))
+			}
+			return idx.Close()
+		}))
+		assert.Equal(t, expected, actual)
+	})
+	t.Run("in bounds direct", func(t *testing.T) {
+		var expected = []float64{1, 3, 4}
+		var actual []float64
+		require.NoError(t, fx.View(func(txn *badger.Txn) error {
+			fx.QCtx.Txn = txn
+			idx := NewIndexIterator(fx.QCtx, key.NewNS("testIndex"), query.Bounds{
+				{
+					Start:        fx.indexNS.GetKey().AppendAny(1),
+					StartInclude: true,
+					End:          fx.indexNS.GetKey().AppendAny(1),
+					EndInclude:   true,
 				},
+				{
+					Start:        fx.indexNS.GetKey().AppendAny(3),
+					StartInclude: true,
+					End:          fx.indexNS.GetKey().AppendAny(3),
+					EndInclude:   true,
+				},
+				{
+					Start:        fx.indexNS.GetKey().AppendAny(4),
+					StartInclude: true,
+					End:          fx.indexNS.GetKey().AppendAny(4),
+					EndInclude:   true,
+				},
+			}, false)
+			for idx.Next() {
+				actual = append(actual, toAny(t, idx.CurrentId()).(float64))
 			}
-			var i int
-			for it.Next() {
-				expected := []any{
-					float64(5),
-					"5",
-					float64(5),
-				}
-				require.Equal(t, expected, toAnyVals(t, it.Values()))
-				i++
-			}
-			assert.Equal(t, 1, i)
-			return it.Close()
+			return idx.Close()
 		}))
+		assert.Equal(t, expected, actual)
 	})
-}
-
-func fillNs(t *testing.T, db *badger.DB, keys ...key.Key) {
-	require.NoError(t, db.Update(func(txn *badger.Txn) error {
-		for _, k := range keys {
-			if err := txn.Set(k, nil); err != nil {
-				return err
+	t.Run("in bounds reverse", func(t *testing.T) {
+		var expected = []float64{4, 3, 1}
+		var actual []float64
+		require.NoError(t, fx.View(func(txn *badger.Txn) error {
+			fx.QCtx.Txn = txn
+			idx := NewIndexIterator(fx.QCtx, key.NewNS("testIndex"), query.Bounds{
+				{
+					Start:        fx.indexNS.GetKey().AppendAny(1),
+					StartInclude: true,
+					End:          fx.indexNS.GetKey().AppendAny(1),
+					EndInclude:   true,
+				},
+				{
+					Start:        fx.indexNS.GetKey().AppendAny(3),
+					StartInclude: true,
+					End:          fx.indexNS.GetKey().AppendAny(3),
+					EndInclude:   true,
+				},
+				{
+					Start:        fx.indexNS.GetKey().AppendAny(4),
+					StartInclude: true,
+					End:          fx.indexNS.GetKey().AppendAny(4),
+					EndInclude:   true,
+				},
+			}, true)
+			for idx.Next() {
+				actual = append(actual, toAny(t, idx.CurrentId()).(float64))
 			}
-		}
-		return nil
-	}))
-}
-
-func toAnyVals(t *testing.T, values [][]byte) []any {
-	var anyVals = make([]any, len(values))
-	var err error
-	for i, v := range values {
-		anyVals[i], _, err = encoding.DecodeToAny(v)
-		require.NoError(t, err)
-	}
-	return anyVals
+			return idx.Close()
+		}))
+		assert.Equal(t, expected, actual)
+	})
 }

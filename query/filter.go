@@ -188,17 +188,12 @@ func (e And) OkBytes(b []byte) bool {
 }
 
 func (e And) IndexFilter(fieldName string, bs Bounds) (filter Filter, bounds Bounds) {
-	var af And
-	var ff Filter
 	for _, f := range e {
-		if ff, bs = f.IndexFilter(fieldName, bs); ff != nil {
-			af = append(af, ff)
+		if filter, bounds = f.IndexFilter(fieldName, bs); filter != nil {
+			return
 		}
 	}
-	if len(af) == 0 {
-		return nil, bs
-	}
-	return af, bs
+	return nil, bs
 }
 
 func (e And) String() string {

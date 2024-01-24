@@ -3,6 +3,7 @@ package query
 import (
 	"bytes"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -97,6 +98,21 @@ func (bs Bounds) Merge() Bounds {
 		return nbs.Merge()
 	} else {
 		return bs
+	}
+}
+
+func (bs Bounds) Reverse() {
+	slices.Reverse(bs)
+	for i, b := range bs {
+		if b.EndInclude {
+			b.End = append(b.End, 255)
+		}
+		bs[i] = Bound{
+			Start:        b.End,
+			End:          b.Start,
+			StartInclude: b.EndInclude,
+			EndInclude:   b.StartInclude,
+		}
 	}
 }
 
