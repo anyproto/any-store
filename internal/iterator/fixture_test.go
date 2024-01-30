@@ -70,7 +70,11 @@ func fillTestData(t *testing.T, fx *fixture, n int) {
 		if err != nil {
 			return err
 		}
+		// add some dirty data to be sure that we in bounds
 		if err = txn.Set(key.NewNS("indexTesa").GetKey().AppendAny(-1).AppendAny(-1), nil); err != nil {
+			return err
+		}
+		if err = txn.Set(key.NewNS("indexTesz").GetKey().AppendAny(99999).AppendAny(999999), nil); err != nil {
 			return err
 		}
 		for i := 0; i < n; i++ {
@@ -83,9 +87,7 @@ func fillTestData(t *testing.T, fx *fixture, n int) {
 				return err
 			}
 		}
-		if err = txn.Set(key.NewNS("indexTesz").GetKey().AppendAny(99999).AppendAny(999999), nil); err != nil {
-			return err
-		}
+
 		return nil
 	}))
 }

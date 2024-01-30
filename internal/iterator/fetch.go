@@ -1,6 +1,8 @@
 package iterator
 
 import (
+	"fmt"
+
 	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-store/internal/qcontext"
@@ -60,4 +62,8 @@ func (f *fetchIterator) checkFilter() (ok bool, err error) {
 		return
 	})
 	return
+}
+
+func (f *fetchIterator) String() string {
+	return fmt.Sprintf("FETCH(%s)", f.IdIterator.String())
 }

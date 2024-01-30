@@ -5,6 +5,7 @@ import "github.com/valyala/fastjson"
 type Iterator interface {
 	Next() bool
 	Valid() bool
+	String() string
 	Close() error
 }
 

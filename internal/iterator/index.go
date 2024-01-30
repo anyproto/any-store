@@ -2,6 +2,7 @@ package iterator
 
 import (
 	"bytes"
+	"strings"
 
 	"github.com/dgraph-io/badger/v4"
 
@@ -12,12 +13,13 @@ import (
 
 // NewIndexIterator creates IdIterator over the index. Requires uniq filtering.
 func NewIndexIterator(qCtx *qcontext.QueryContext, indexNs *key.NS, bounds query.Bounds, isReverse bool) IdIterator {
-	return &indexIterator{
+	idxIt := &indexIterator{
 		qCtx:      qCtx,
 		indexNS:   indexNs,
 		isReverse: isReverse,
 		bounds:    bounds,
 	}
+	return NewUniqIdIterator(idxIt)
 }
 
 type indexIterator struct {
@@ -185,4 +187,39 @@ func (i *indexIterator) less(a, b []byte, orEqual bool) bool {
 		return !i.isReverse
 	}
 	return i.isReverse
+}
+
+func (i *indexIterator) boundsToString() (boundsToString query.Bounds) {
+	var nilOrStripNS = func(b []byte) []byte {
+		if len(b) == 0 {
+			return nil
+		}
+		return b[i.indexNS.Len():]
+	}
+	for _, bnd := range i.bounds {
+		boundsToString = append(boundsToString, query.Bound{
+			Start:        nilOrStripNS(bnd.Start),
+			End:          nilOrStripNS(bnd.End),
+			StartInclude: bnd.StartInclude,
+			EndInclude:   bnd.EndInclude,
+		})
+	}
+	return boundsToString
+}
+
+func (i *indexIterator) String() string {
+	indexName := i.indexNS.String()
+	if lastSlash := strings.LastIndex(indexName, "/"); lastSlash != -1 {
+		indexName = indexName[lastSlash+1:]
+	}
+
+	var result = "INDEX(" + indexName
+	boundsToString := i.boundsToString()
+	if len(boundsToString) > 0 {
+		result += ", " + boundsToString.String()
+	}
+	if i.isReverse {
+		result += ", rev"
+	}
+	return result + ")"
 }

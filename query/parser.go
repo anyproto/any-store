@@ -58,6 +58,14 @@ var (
 
 var parserPool = &fastjson.ParserPool{}
 
+func MustParseCondition(cond any) Filter {
+	f, err := ParseCondition(cond)
+	if err != nil {
+		panic(err)
+	}
+	return f
+}
+
 func ParseCondition(cond any) (Filter, error) {
 	p := parserPool.Get()
 	defer parserPool.Put(p)

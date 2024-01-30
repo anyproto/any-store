@@ -23,10 +23,7 @@ func TestUniqIterator_Next(t *testing.T) {
 		},
 	}
 
-	uniq := &UniqIterator{
-		uniq:       make(map[string]struct{}),
-		IdIterator: ti,
-	}
+	uniq := NewUniqIdIterator(ti)
 
 	var expected = []any{
 		float64(1), float64(2),

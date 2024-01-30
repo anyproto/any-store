@@ -37,7 +37,9 @@ func OpenIndex(txn *badger.Txn, info Info) (*Index, error) {
 
 	return &Index{
 		Name:       info.IndexName(),
-		dataNS:     ns,
+		FieldNames: info.Fields,
+		NS:         ns.Copy(),
+		ns:         ns.Copy(),
 		sparse:     info.Sparse,
 		fieldPaths: fieldsPath,
 		uniqBuf:    make([][]key.Key, len(info.Fields)),
@@ -47,7 +49,10 @@ func OpenIndex(txn *badger.Txn, info Info) (*Index, error) {
 
 type Index struct {
 	Name       string
-	dataNS     *key.NS
+	FieldNames []string
+	NS         *key.NS
+
+	ns         *key.NS
 	sparse     bool
 	fieldPaths [][]string
 
@@ -101,7 +106,7 @@ func (idx *Index) Delete(txn *badger.Txn, id []byte, d *fastjson.Value) (err err
 
 func (idx *Index) Drop(txn *badger.Txn) (err error) {
 	it := txn.NewIterator(badger.IteratorOptions{
-		Prefix: idx.dataNS.Bytes(),
+		Prefix: idx.ns.Bytes(),
 	})
 	defer it.Close()
 	for it.Rewind(); it.Valid(); it.Next() {
@@ -156,7 +161,7 @@ func (idx *Index) writeValues(d *fastjson.Value, i int) bool {
 }
 func (idx *Index) fillKeysBuf(d *fastjson.Value) {
 	idx.keysBuf = idx.keysBuf[:0]
-	idx.keyBuf = idx.dataNS.CopyTo(idx.keyBuf[:0])
+	idx.keyBuf = idx.ns.CopyTo(idx.keyBuf[:0])
 	idx.resetUnique()
 	if !idx.writeValues(d, 0) {
 		// we got false in case sparse index and nil value - reset the buffer
@@ -207,7 +212,7 @@ func (idx *Index) keys(txn *badger.Txn) (ks []key.Key, err error) {
 	it := txn.NewIterator(badger.IteratorOptions{
 		PrefetchSize:   100,
 		PrefetchValues: false,
-		Prefix:         idx.dataNS.Bytes(),
+		Prefix:         idx.ns.Bytes(),
 	})
 	defer it.Close()
 	for it.Rewind(); it.Valid(); it.Next() {

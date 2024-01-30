@@ -110,9 +110,9 @@ func TestIndex_Update(t *testing.T) {
 			return err
 		}
 		assertKeys(t, txn, fx, []key.Key{
-			fx.dataNS.GetKey().AppendAny(1).AppendAny(1),
-			fx.dataNS.GetKey().AppendAny(2).AppendAny(1),
-			fx.dataNS.GetKey().AppendAny(3).AppendAny(1),
+			fx.ns.GetKey().AppendAny(1).AppendAny(1),
+			fx.ns.GetKey().AppendAny(2).AppendAny(1),
+			fx.ns.GetKey().AppendAny(3).AppendAny(1),
 		})
 		_, d := newTestDoc(t, map[string]any{"id": 1, "a": []int{1, 3, 4}})
 
@@ -120,9 +120,9 @@ func TestIndex_Update(t *testing.T) {
 			return err
 		}
 		assertKeys(t, txn, fx, []key.Key{
-			fx.dataNS.GetKey().AppendAny(1).AppendAny(1),
-			fx.dataNS.GetKey().AppendAny(3).AppendAny(1),
-			fx.dataNS.GetKey().AppendAny(4).AppendAny(1),
+			fx.ns.GetKey().AppendAny(1).AppendAny(1),
+			fx.ns.GetKey().AppendAny(3).AppendAny(1),
+			fx.ns.GetKey().AppendAny(4).AppendAny(1),
 		})
 		return nil
 	}))
@@ -161,9 +161,9 @@ func TestIndex_Drop(t *testing.T) {
 			return err
 		}
 		assertKeys(t, txn, fx, []key.Key{
-			fx.dataNS.GetKey().AppendAny(1).AppendAny(1),
-			fx.dataNS.GetKey().AppendAny(2).AppendAny(1),
-			fx.dataNS.GetKey().AppendAny(3).AppendAny(1),
+			fx.ns.GetKey().AppendAny(1).AppendAny(1),
+			fx.ns.GetKey().AppendAny(2).AppendAny(1),
+			fx.ns.GetKey().AppendAny(3).AppendAny(1),
 		})
 
 		if err := fx.Drop(txn); err != nil {
@@ -185,9 +185,9 @@ func TestIndex_Delete(t *testing.T) {
 			return err
 		}
 		assertKeys(t, txn, fx, []key.Key{
-			fx.dataNS.GetKey().AppendAny(1).AppendAny(1),
-			fx.dataNS.GetKey().AppendAny(2).AppendAny(1),
-			fx.dataNS.GetKey().AppendAny(3).AppendAny(1),
+			fx.ns.GetKey().AppendAny(1).AppendAny(1),
+			fx.ns.GetKey().AppendAny(2).AppendAny(1),
+			fx.ns.GetKey().AppendAny(3).AppendAny(1),
 		})
 		if err := fx.Delete(txn, id, prev); err != nil {
 			return err

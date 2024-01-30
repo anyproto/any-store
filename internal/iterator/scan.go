@@ -9,7 +9,7 @@ import (
 
 // NewScanIterator creates ValueIterator that used to iterate over the data with optional filtering and sorting by id field
 func NewScanIterator(qCtx *qcontext.QueryContext, cond query.Filter, bounds query.Bounds, reverse bool) ValueIterator {
-	ii := NewIndexIterator(qCtx, qCtx.DataNS, bounds, reverse).(*indexIterator)
+	ii := NewIndexIterator(qCtx, qCtx.DataNS, bounds, reverse).(*uniqIterator).IdIterator.(*indexIterator)
 	return &scanIterator{
 		condition:     cond,
 		indexIterator: ii,
@@ -75,4 +75,18 @@ func (v *scanIterator) checkFilter() (ok bool, err error) {
 		return
 	}
 	return
+}
+
+func (v *scanIterator) String() string {
+	indexName := "id"
+	var result = "SCAN(" + indexName
+	boundsToString := v.boundsToString()
+	if len(boundsToString) > 0 {
+		result += ", " + boundsToString.String()
+	}
+	if v.isReverse {
+		result += ", rev"
+	}
+	return result + ")"
+
 }

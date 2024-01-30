@@ -42,6 +42,9 @@ func (b Bound) String() string {
 type Bounds []Bound
 
 func (bs Bounds) String() string {
+	if len(bs) == 0 {
+		return ""
+	}
 	var sb strings.Builder
 	sb.WriteString("Bounds{")
 	for i, b := range bs {
@@ -112,6 +115,17 @@ func (bs Bounds) Reverse() {
 			End:          b.Start,
 			StartInclude: b.EndInclude,
 			EndInclude:   b.StartInclude,
+		}
+	}
+}
+
+func (bs Bounds) SetPrefix(k key.Key) {
+	for i, b := range bs {
+		if len(b.Start) != 0 {
+			bs[i].Start = append(k.Copy(), b.Start...)
+		}
+		if len(b.End) != 0 {
+			bs[i].End = append(k.Copy(), b.End...)
 		}
 	}
 }

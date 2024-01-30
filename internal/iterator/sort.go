@@ -1,6 +1,8 @@
 package iterator
 
 import (
+	"fmt"
+
 	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-store/internal/key"
@@ -17,10 +19,11 @@ func NewSortIterator(qCtx *qcontext.QueryContext, source ValueIterator, sorts so
 }
 
 type sortIterator struct {
-	qCtx *qcontext.QueryContext
-	c    *sort.Container
-	err  error
 	ValueIterator
+
+	qCtx  *qcontext.QueryContext
+	c     *sort.Container
+	err   error
 	idx   int
 	ready bool
 }
@@ -80,4 +83,8 @@ func (i *sortIterator) Close() error {
 		return err
 	}
 	return i.err
+}
+
+func (i *sortIterator) String() string {
+	return fmt.Sprintf("SORT(%s)", i.ValueIterator.String())
 }

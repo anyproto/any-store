@@ -10,6 +10,14 @@ import (
 	"github.com/anyproto/any-store/internal/key"
 )
 
+func MustParseSort(sorts ...any) Sort {
+	s, err := ParseSort(sorts...)
+	if err != nil {
+		panic(err)
+	}
+	return s
+}
+
 func ParseSort(sorts ...any) (Sort, error) {
 	var result = make(Sorts, 0, len(sorts))
 	for _, s := range sorts {
@@ -35,9 +43,11 @@ func ParseSort(sorts ...any) (Sort, error) {
 func parseSortString(ss string) (Sort, error) {
 	res := &SortField{}
 	if strings.HasPrefix(ss, "-") {
+		res.Field = ss[1:]
 		res.Reverse = true
 		res.Path = strings.Split(ss[1:], ".")
 	} else {
+		res.Field = ss
 		res.Path = strings.Split(ss, ".")
 	}
 	if len(res.Path) == 0 {
@@ -47,7 +57,7 @@ func parseSortString(ss string) (Sort, error) {
 }
 
 type Sort interface {
-	Fields() []string
+	Fields() []SortField
 	AppendKey(k key.Key, v *fastjson.Value) key.Key
 }
 
@@ -60,11 +70,11 @@ func (ss Sorts) AppendKey(k key.Key, v *fastjson.Value) key.Key {
 	return k
 }
 
-func (ss Sorts) Fields() []string {
+func (ss Sorts) Fields() []SortField {
 	if len(ss) == 0 {
 		return nil
 	}
-	res := make([]string, 0, len(ss))
+	res := make([]SortField, 0, len(ss))
 	for _, s := range ss {
 		res = append(res, s.Fields()...)
 	}
@@ -72,9 +82,9 @@ func (ss Sorts) Fields() []string {
 }
 
 type SortField struct {
-	Path       []string
-	Reverse    bool
-	bufA, bufB key.Key
+	Field   string
+	Path    []string
+	Reverse bool
 }
 
 func (s *SortField) AppendKey(k key.Key, v *fastjson.Value) key.Key {
@@ -85,6 +95,6 @@ func (s *SortField) AppendKey(k key.Key, v *fastjson.Value) key.Key {
 	}
 }
 
-func (s *SortField) Fields() []string {
-	return []string{strings.Join(s.Path, ".")}
+func (s *SortField) Fields() []SortField {
+	return []SortField{*s}
 }
