@@ -14,8 +14,25 @@ type Iterator interface {
 }
 
 type itemIterator struct {
-	qCtx *qcontext.QueryContext
+	qCtx          *qcontext.QueryContext
+	limit, offset uint
+	curr          uint
 	iterator.ValueIterator
+}
+
+func (i *itemIterator) Next() bool {
+	for ; i.curr < i.offset; i.curr++ {
+		if !i.ValueIterator.Next() {
+			return false
+		}
+	}
+
+	if i.limit > 0 && i.curr >= (i.offset+i.limit) {
+		return false
+	}
+
+	i.curr++
+	return i.ValueIterator.Next()
 }
 
 func (i *itemIterator) Item() (it Item) {

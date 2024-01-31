@@ -17,8 +17,6 @@ type FindQuery interface {
 	Offset(offset uint) FindQuery
 	Cond(cond any) FindQuery
 	Sort(sort ...any) FindQuery
-	Fields(fields ...string) FindQuery
-	ExcludeFields(fields ...string) FindQuery
 	IndexHint(indexNames ...string) FindQuery
 	Err() error
 
@@ -30,8 +28,6 @@ type findQuery struct {
 
 	cond          query.Filter
 	sort          sort.Sort
-	fields        []string
-	excludeField  []string
 	indexHint     []string
 	limit, offset uint
 
@@ -64,16 +60,6 @@ func (f *findQuery) Sort(sorts ...any) FindQuery {
 	return f
 }
 
-func (f *findQuery) Fields(fields ...string) FindQuery {
-	f.fields = fields
-	return f
-}
-
-func (f *findQuery) ExcludeFields(fields ...string) FindQuery {
-	f.excludeField = fields
-	return f
-}
-
 func (f *findQuery) IndexHint(indexNames ...string) FindQuery {
 	f.indexHint = indexNames
 	return f
@@ -97,6 +83,8 @@ func (f *findQuery) Iter() (Iterator, error) {
 	return &itemIterator{
 		qCtx:          qCtx,
 		ValueIterator: f.makeIterator(qCtx, false),
+		limit:         f.limit,
+		offset:        f.offset,
 	}, nil
 }
 

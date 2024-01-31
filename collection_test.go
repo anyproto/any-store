@@ -263,7 +263,7 @@ func TestCollection_FindMany(t *testing.T) {
 	}
 
 	st := time.Now()
-	it, err := coll.Find().Cond(`{"id":{"$in":[5,125]}}`).Iter()
+	it, err := coll.Find().Cond(`{"id":{"$in":[5,125,1000]}}`).Limit(1).Offset(1).Iter()
 	require.NoError(t, err)
 	defer it.Close()
 	for it.Next() {
