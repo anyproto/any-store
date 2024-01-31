@@ -280,6 +280,7 @@ func TestCollection_EnsureIndex(t *testing.T) {
 		defer fx.finish()
 		coll, err := fx.Collection("test")
 		require.NoError(t, err)
+
 		require.NoError(t, coll.EnsureIndex(Index{
 			Fields: []string{"a"},
 			Sparse: true,
@@ -396,7 +397,7 @@ func BenchmarkCollection_FindId(b *testing.B) {
 }
 
 func assertCount(t *testing.T, coll *Collection, expected int) {
-	count, err := coll.Count(nil)
+	count, err := coll.Count()
 	require.NoError(t, err)
 	assert.Equal(t, expected, count)
 }
