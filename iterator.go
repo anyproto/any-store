@@ -1,71 +1,42 @@
 package anystore
 
 import (
-	"fmt"
-
-	"github.com/dgraph-io/badger/v4"
 	"github.com/valyala/fastjson"
 
-	"github.com/anyproto/any-store/query"
+	"github.com/anyproto/any-store/internal/iterator"
+	"github.com/anyproto/any-store/internal/qcontext"
 )
 
 type Iterator interface {
 	Next() (ok bool)
 	Item() Item
-	Close()
+	Close() (err error)
 }
 
-func newDirectIterator() *directIterator {
-	return &directIterator{
-		p: parserPool.Get(),
-	}
+type itemIterator struct {
+	qCtx *qcontext.QueryContext
+	iterator.ValueIterator
 }
 
-type directIterator struct {
-	it       *badger.Iterator
-	txn      *badger.Txn
-	filter   query.Filter
-	nextItem Item
-	p        *fastjson.Parser
-}
-
-func (d *directIterator) Next() (ok bool) {
-	for d.it.Valid() {
-		itm, err := d.itemIfOk()
+func (i *itemIterator) Item() (it Item) {
+	var err error
+	err = i.CurrentValue(func(v *fastjson.Value) error {
+		it, err = newItem(v, nil, false)
 		if err != nil {
-			panic(fmt.Errorf("iterator error: %w", err))
-		}
-		d.it.Next()
-		if itm != nil {
-			d.nextItem = itm
-			return true
-		}
-	}
-	return false
-}
-
-func (d *directIterator) Item() Item {
-	return d.nextItem
-}
-
-func (d *directIterator) Close() {
-	d.it.Close()
-	d.txn.Discard()
-	parserPool.Put(d.p)
-}
-
-func (d *directIterator) itemIfOk() (itm Item, err error) {
-	if err = d.it.Item().Value(func(val []byte) error {
-		jval, e := d.p.ParseBytes(val)
-		if e != nil {
-			return e
-		}
-		if d.filter.Ok(jval) {
-			itm = item{val: jval}
+			return err
 		}
 		return nil
-	}); err != nil {
-		return
+	})
+	if err != nil {
+		panic(err)
 	}
 	return
+}
+
+func (i *itemIterator) Close() (err error) {
+	if err = i.ValueIterator.Close(); err != nil {
+		i.qCtx.Txn.Discard()
+		return
+	}
+	return i.qCtx.Txn.Commit()
 }

@@ -3,8 +3,11 @@ package anystore
 import (
 	"errors"
 
-	"github.com/dgraph-io/badger/v4"
+	"github.com/valyala/fastjson"
 
+	"github.com/anyproto/any-store/internal/iterator"
+	"github.com/anyproto/any-store/internal/qcontext"
+	"github.com/anyproto/any-store/internal/qplan"
 	"github.com/anyproto/any-store/internal/sort"
 	"github.com/anyproto/any-store/query"
 )
@@ -85,18 +88,27 @@ func (f *findQuery) Iter() (Iterator, error) {
 		return nil, f.err
 	}
 
-	if f.cond == nil {
-		f.cond = query.All{}
+	qCtx := &qcontext.QueryContext{
+		Txn:    f.coll.db.db.NewTransaction(false),
+		DataNS: f.coll.dataNS,
+		Parser: &fastjson.Parser{},
 	}
 
-	iter := newDirectIterator()
-	iter.txn = f.coll.db.db.NewTransaction(false)
-	iter.it = iter.txn.NewIterator(badger.IteratorOptions{
-		PrefetchSize:   100,
-		PrefetchValues: true,
-		Prefix:         f.coll.dataNS.Bytes(),
-	})
-	iter.it.Rewind()
-	iter.filter = f.cond
-	return iter, nil
+	return &itemIterator{
+		qCtx:          qCtx,
+		ValueIterator: f.makeIterator(qCtx, false),
+	}, nil
+}
+
+func (f *findQuery) makeIterator(qCtx *qcontext.QueryContext, needValues bool) iterator.ValueIterator {
+	plan := qplan.QPlan{
+		Indexes:   f.coll.indexes,
+		Condition: f.cond,
+		Sort:      f.sort,
+	}
+	if len(f.indexHint) != 0 {
+		plan.Hint = f.indexHint[0]
+	}
+
+	return plan.Make(qCtx, needValues)
 }

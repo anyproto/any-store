@@ -67,6 +67,8 @@ func (t *testIterator) CurrentId() []byte {
 	return values[len(values)-1]
 }
 
+func (t *testIterator) String() string { return "TEST" }
+
 func (t *testIterator) Close() error {
 	return t.err
 }

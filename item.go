@@ -46,6 +46,7 @@ func (i item) appendId(b []byte) []byte {
 	}
 	return encoding.AppendJSONValue(b, idVal)
 }
+
 func (i item) Decode(v any) (err error) {
 	bytes := i.val.MarshalTo(nil)
 	return json.Unmarshal(bytes, v)
