@@ -11,6 +11,8 @@ type Iterator interface {
 	Next() (ok bool)
 	Item() Item
 	Close() (err error)
+
+	Explain() string
 }
 
 type itemIterator struct {
@@ -56,4 +58,8 @@ func (i *itemIterator) Close() (err error) {
 		return
 	}
 	return i.qCtx.Txn.Commit()
+}
+
+func (i *itemIterator) Explain() string {
+	return i.ValueIterator.String()
 }

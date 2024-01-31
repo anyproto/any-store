@@ -464,14 +464,12 @@ func (c *Collection) Find() FindQuery {
 	return &findQuery{coll: c}
 }
 
-func (c *Collection) Count(query any) (count int, err error) {
+func (c *Collection) Count() (count int, err error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	err = c.db.db.View(func(txn *badger.Txn) error {
 		it := txn.NewIterator(badger.IteratorOptions{
-			PrefetchSize:   1000,
-			PrefetchValues: false,
-			Prefix:         c.dataNS.Bytes(),
+			Prefix: c.dataNS.Bytes(),
 		})
 		defer it.Close()
 		for it.Rewind(); it.Valid(); it.Next() {

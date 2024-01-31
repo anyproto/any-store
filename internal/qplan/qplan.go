@@ -97,7 +97,6 @@ func (q QPlan) Make(qCtx *qcontext.QueryContext, needValues bool) iterator.Value
 
 		if len(sortFields) != 0 && !iw.exactSort {
 			// fetch+sort iterator if needed
-			iter = iterator.NewFetchIterator(qCtx, iter.(iterator.IdIterator), q.Condition)
 			iter = iterator.NewSortIterator(qCtx, iter.(iterator.ValueIterator), q.Sort)
 		}
 		return iter.(iterator.ValueIterator)

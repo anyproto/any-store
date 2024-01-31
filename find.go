@@ -18,6 +18,7 @@ type FindQuery interface {
 	Cond(cond any) FindQuery
 	Sort(sort ...any) FindQuery
 	IndexHint(indexNames ...string) FindQuery
+	Count() (count int, err error)
 	Err() error
 
 	Iter() (Iterator, error)
@@ -82,10 +83,23 @@ func (f *findQuery) Iter() (Iterator, error) {
 
 	return &itemIterator{
 		qCtx:          qCtx,
-		ValueIterator: f.makeIterator(qCtx, false),
+		ValueIterator: f.makeIterator(qCtx, true),
 		limit:         f.limit,
 		offset:        f.offset,
 	}, nil
+}
+
+func (f *findQuery) Count() (count int, err error) {
+	qCtx := &qcontext.QueryContext{
+		Txn:    f.coll.db.db.NewTransaction(false),
+		DataNS: f.coll.dataNS,
+		Parser: &fastjson.Parser{},
+	}
+	iter := f.makeIterator(qCtx, false)
+	for iter.Next() {
+		count++
+	}
+	return count, iter.Close()
 }
 
 func (f *findQuery) makeIterator(qCtx *qcontext.QueryContext, needValues bool) iterator.ValueIterator {
