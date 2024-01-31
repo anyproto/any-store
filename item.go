@@ -12,7 +12,7 @@ import (
 
 type Item interface {
 	Decode(v any) (err error)
-	DecodeFastJSON(func(v *fastjson.Value) error) error
+	Value() *fastjson.Value
 }
 
 func newItem(val *fastjson.Value, a *fastjson.Arena, autoId bool) (item, error) {
@@ -52,6 +52,6 @@ func (i item) Decode(v any) (err error) {
 	return json.Unmarshal(bytes, v)
 }
 
-func (i item) DecodeFastJSON(f func(v *fastjson.Value) error) error {
-	return f(i.val)
+func (i item) Value() *fastjson.Value {
+	return i.val
 }

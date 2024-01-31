@@ -28,16 +28,11 @@ func (sc *systemCollection) Indexes(collName string) (indexes []Index, err error
 	}
 	defer it.Close()
 	for it.Next() {
-		if err = it.Item().DecodeFastJSON(func(v *fastjson.Value) error {
-			idx, err := indexFromJSON(v)
-			if err != nil {
-				return err
-			}
-			indexes = append(indexes, idx)
-			return nil
-		}); err != nil {
-			return
+		idx, err := indexFromJSON(it.Item().Value())
+		if err != nil {
+			return nil, err
 		}
+		indexes = append(indexes, idx)
 	}
 	return
 }
