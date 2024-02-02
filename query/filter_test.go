@@ -55,9 +55,11 @@ func TestComp(t *testing.T) {
 			assert.True(t, cmp.Ok(a.NewNumberInt(2)))
 			assert.True(t, cmp.Ok(a.NewNumberInt(0)))
 			assert.True(t, cmp.Ok(a.NewNumberInt(-1)))
+			assert.True(t, cmp.Ok(fastjson.MustParse(`[0,2,3]`)))
 		})
 		t.Run("false", func(t *testing.T) {
 			assert.False(t, cmp.Ok(a.NewNumberInt(1)))
+			assert.False(t, cmp.Ok(fastjson.MustParse(`[0,1,3]`)))
 		})
 		t.Run("indexFilter", func(t *testing.T) {
 			f, bs := cmp.IndexFilter("", nil)

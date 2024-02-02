@@ -42,13 +42,23 @@ func (e *Comp) Ok(v *fastjson.Value) bool {
 	}
 	if v.Type() == fastjson.TypeArray {
 		vals, _ := v.Array()
-		for _, val := range vals {
-			e.buf = encoding.AppendJSONValue(e.buf[:0], val)
-			if e.comp(e.buf) {
-				return true
+		if e.CompOp == CompOpNe {
+			for _, val := range vals {
+				e.buf = encoding.AppendJSONValue(e.buf[:0], val)
+				if !e.comp(e.buf) {
+					return false
+				}
 			}
+			return true
+		} else {
+			for _, val := range vals {
+				e.buf = encoding.AppendJSONValue(e.buf[:0], val)
+				if e.comp(e.buf) {
+					return true
+				}
+			}
+			return false
 		}
-		return false
 	} else {
 		e.buf = encoding.AppendJSONValue(e.buf[:0], v)
 		return e.comp(e.buf)

@@ -31,7 +31,7 @@
       "expectedIds": [1,2,3,6,8]
     },
     {
-      "cond" : {"b": {"$nin": [6]}},
+      "cond" : {"b": {"$ne": 6}},
       "expectedExplain": "SCAN(id)",
       "expectedIds": [4,5,7,9,10]
     }
