@@ -32,7 +32,11 @@ func OpenBadgerOptions(options badger.Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db := &DB{
+	return OpenWithBadger(bdb)
+}
+
+func OpenWithBadger(bdb *badger.DB) (db *DB, err error) {
+	db = &DB{
 		db:                bdb,
 		openedCollections: make(map[string]*Collection),
 	}
