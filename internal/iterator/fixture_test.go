@@ -2,12 +2,12 @@ package iterator
 
 import (
 	"fmt"
+	"math/rand"
 	"testing"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fastjson"
-	"golang.org/x/exp/rand"
 
 	"github.com/anyproto/any-store/internal/encoding"
 	"github.com/anyproto/any-store/internal/index"

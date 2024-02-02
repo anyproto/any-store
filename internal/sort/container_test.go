@@ -2,12 +2,12 @@ package sort
 
 import (
 	"fmt"
+	"math/rand"
 	"sort"
 	"testing"
 	"time"
 
 	"github.com/valyala/fastjson"
-	"golang.org/x/exp/rand"
 
 	"github.com/anyproto/any-store/internal/key"
 )

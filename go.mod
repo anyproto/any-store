@@ -3,15 +3,15 @@ module github.com/anyproto/any-store
 go 1.21
 
 require (
+	github.com/RoaringBitmap/roaring v1.9.0
 	github.com/dgraph-io/badger/v4 v4.2.0
 	github.com/stretchr/testify v1.8.4
 	github.com/valyala/fastjson v1.6.4
-	golang.org/x/exp v0.0.0-20231206192017-f3f8817b8deb
+	golang.org/x/exp v0.0.0-20240119083558-1b970713d09a
 )
 
 require (
-	github.com/RoaringBitmap/roaring v1.6.0 // indirect
-	github.com/bits-and-blooms/bitset v1.2.0 // indirect
+	github.com/bits-and-blooms/bitset v1.13.0 // indirect
 	github.com/cespare/xxhash/v2 v2.2.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dgraph-io/ristretto v0.1.1 // indirect
