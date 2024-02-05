@@ -85,8 +85,9 @@
     },
     {
       "cond": {"b": {"$nin": [2,4,5]}},
-      "expectedExplain": "SCAN(id)",
-      "expectedIds": [3,8,9,10]
+      "sort": ["-id"],
+      "expectedExplain": "SCAN(id, rev)",
+      "expectedIds": [10,9,8,3]
     },
     {
       "cond": {"$or": [{"id": 3}, {"id": 5}]},

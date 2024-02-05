@@ -20,7 +20,12 @@ func init() {
 }
 
 func TestQueries(t *testing.T) {
-	testFile(t, "data/set1.json")
+	t.Run("set1", func(t *testing.T) {
+		testFile(t, "data/set1.json")
+	})
+	t.Run("set2", func(t *testing.T) {
+		testFile(t, "data/set2.json")
+	})
 }
 
 type TestCases struct {

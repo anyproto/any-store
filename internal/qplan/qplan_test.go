@@ -67,6 +67,20 @@ func TestQPlan_Make(t *testing.T) {
 		it := qp.Make(testQCtx(), true)
 		assert.Equal(t, "FETCH(INDEX(a, Bounds{('5',inf]}))", it.String())
 	})
+	t.Run("index cond+sort", func(t *testing.T) {
+		fx := newFixture(t)
+		defer fx.Finish(t)
+
+		idx := fx.createIndex(t, "a", 10, 5)
+
+		qp := QPlan{
+			Indexes:   []*index.Index{idx},
+			Condition: query.MustParseCondition(`{"a": 5}`),
+			Sort:      sort.MustParseSort("a"),
+		}
+		it := qp.Make(testQCtx(), true)
+		assert.Equal(t, "FETCH(INDEX(a, Bounds{['5','5']}))", it.String())
+	})
 }
 
 func testQCtx() *qcontext.QueryContext {

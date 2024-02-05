@@ -1,0 +1,62 @@
+{
+  "tests" : [
+    {
+      "expectedExplain": "SCAN(id)",
+      "expectedIds": [1,2,3,4,5,6,7,8,9,10]
+    },
+    {
+      "limit": 2,
+      "expectedExplain": "SCAN(id)",
+      "expectedIds": [1,2]
+    },
+    {
+      "limit": 2,
+      "offset": 2,
+      "expectedExplain": "SCAN(id)",
+      "expectedIds": [3,4]
+    },
+    {
+      "cond" : {"id": 2},
+      "expectedExplain": "SCAN(id, Bounds{['2','2']})",
+      "expectedIds": [2]
+    },
+    {
+      "cond" : {"a": "3"},
+      "expectedExplain": "FETCH(INDEX(a, Bounds{['3','3']}))",
+      "expectedIds": [3]
+    },
+    {
+      "cond" : {"b": 6},
+      "expectedExplain": "FETCH(INDEX(b, Bounds{['6','6']}))",
+      "expectedIds": [1,2,3,6,8]
+    },
+    {
+      "cond" : {"a": "3", "c": "2"},
+      "expectedExplain": "FETCH(INDEX(a, Bounds{['3','3']}))",
+      "expectedIds": [3]
+    },
+    {
+      "cond" : {"c": "2"},
+      "sort": ["c"],
+      "expectedExplain": "FETCH(INDEX(c, Bounds{['2','2']}))",
+      "expectedIds": [2,3]
+    }
+  ],
+  "data": [
+    {"id": 1, "a": "1", "b": [1,2,3,4,5,6,7,8,9,10], "c": "1", "d": null},
+    {"id": 2, "a": "2", "b": [2,4,6,8,10], "c": "2", "d": 0},
+    {"id": 3, "a": "3", "b": [3,6,9], "c": "2", "d": "string"},
+    {"id": 4, "a": "4", "b": [4,8], "c": "3", "d": ["array"]},
+    {"id": 5, "a": "5", "b": [5,10], "c": "3", "d": {"object": 1}},
+    {"id": 6, "a": "6", "b": [6,6,2], "c": "3", "d": true},
+    {"id": 7, "a": "7", "b": [7,4], "c": "4", "d": false},
+    {"id": 8, "a": "8", "b": [8,6], "c": "4"},
+    {"id": 9, "a": "9", "b": [9,8], "c": "4"},
+    {"id": 10, "a": "a", "b": [10,20], "c": "4"}
+  ],
+  "indexes": [
+    ["a"],
+    ["b"],
+    ["c"]
+  ]
+}

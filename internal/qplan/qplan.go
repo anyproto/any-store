@@ -5,7 +5,6 @@ import (
 
 	"github.com/anyproto/any-store/internal/index"
 	"github.com/anyproto/any-store/internal/iterator"
-	"github.com/anyproto/any-store/internal/key"
 	"github.com/anyproto/any-store/internal/qcontext"
 	"github.com/anyproto/any-store/internal/sort"
 	"github.com/anyproto/any-store/query"
@@ -87,11 +86,6 @@ func (q QPlan) Make(qCtx *qcontext.QueryContext, needValues bool) iterator.Value
 	if len(weights) != 0 {
 		// found an index
 		iw := weights[0]
-		// first is index + uniq iterator
-		iw.idx.NS.ReuseKey(func(k key.Key) key.Key {
-			iw.bounds.SetPrefix(k)
-			return k
-		})
 		iter = iterator.NewIndexIterator(qCtx, iw.idx.NS, iw.bounds, iw.reverse)
 		iter = iterator.NewFetchIterator(qCtx, iter.(iterator.IdIterator), q.Condition)
 
@@ -160,6 +154,9 @@ func equalNum(sortFields []sort.SortField, indexFields []string) int {
 	for n, sortField := range sortFields[:m] {
 		if sortField.Field != indexFields[n] {
 			return n
+		}
+		if n+1 == m {
+			return m
 		}
 		if n != 0 && prevReverse != sortField.Reverse {
 			return n
