@@ -80,9 +80,9 @@ func (v *scanIterator) checkFilter() (ok bool, err error) {
 func (v *scanIterator) String() string {
 	indexName := "id"
 	var result = "SCAN(" + indexName
-	boundsToString := v.boundsToString()
+	boundsToString := v.bounds.String()
 	if len(boundsToString) > 0 {
-		result += ", " + boundsToString.String()
+		result += ", " + boundsToString
 	}
 	if v.isReverse {
 		result += ", rev"

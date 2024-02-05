@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fastjson"
 
+	"github.com/anyproto/any-store/internal/encoding"
 	"github.com/anyproto/any-store/query"
 )
 
@@ -49,7 +50,7 @@ func TestFetchIterator_Next(t *testing.T) {
 			}
 			idxIt := NewIndexIterator(fx.QCtx, fx.indexNS, query.Bounds{
 				{
-					Start:        fx.indexNS.GetKey().AppendAny(1),
+					Start:        encoding.AppendAnyValue(nil, 1),
 					StartInclude: true,
 				},
 			}, false)

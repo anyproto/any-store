@@ -124,10 +124,6 @@ func (q QPlan) isIdScan(qCtx *qcontext.QueryContext, sortFields []sort.SortField
 	}
 
 	var reverse = sortById && sortFields[0].Reverse
-	qCtx.DataNS.ReuseKey(func(k key.Key) key.Key {
-		bounds.SetPrefix(k)
-		return k
-	})
 	iter = iterator.NewScanIterator(qCtx, q.Condition, bounds, reverse)
 	if (sortById && len(sortFields) > 1) || (!sortById && len(sortFields) != 0) {
 		iter = iterator.NewSortIterator(qCtx, iter.(iterator.ValueIterator), q.Sort)

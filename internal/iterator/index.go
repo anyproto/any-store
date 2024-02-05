@@ -2,6 +2,7 @@ package iterator
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 
 	"github.com/dgraph-io/badger/v4"
@@ -57,6 +58,7 @@ func (i *indexIterator) Next() bool {
 	for i.bIter.Valid() {
 		it := i.bIter.Item()
 		boundCheck, seek := i.checkNextBound(it)
+		//fmt.Println("check bound", key.Key(it.Key()).String(), boundCheck, key.Key(seek).String(), i.bounds.String())
 		if boundCheck {
 			if i.err = i.setCurrentItem(it); i.err != nil {
 				return false
@@ -98,14 +100,10 @@ func (i *indexIterator) prepare() {
 		Prefix:  i.indexNS.Bytes(),
 	})
 
-	if len(i.bounds) > 0 {
-		if len(i.bounds[0].Start) == 0 {
-			i.bounds[0].Start = i.indexNS.Bytes()
-		}
-		if len(i.bounds[len(i.bounds)-1].End) == 0 {
-			i.bounds[len(i.bounds)-1].End = append(i.indexNS.Bytes(), 255)
-		}
-	}
+	i.indexNS.ReuseKey(func(k key.Key) key.Key {
+		i.bounds.SetPrefix(k)
+		return k
+	})
 
 	// reverse bounds
 	if i.isReverse {
@@ -115,17 +113,15 @@ func (i *indexIterator) prepare() {
 	var start []byte
 
 	// seek to start of the first bound if needed
-	if i.bounds.Len() > 0 && i.bounds[0].Start != nil {
+	if i.bounds.Len() > 0 {
 		start = i.bounds[0].Start
 	} else {
 		if i.isReverse {
-			start = i.indexNS.Bytes()
+			start = append(i.indexNS.Bytes(), 255)
 		}
 	}
-	if i.isReverse {
-		start = append(start, 255)
-	}
 	i.bIter.Seek(start)
+	//fmt.Println("prepare seek", key.Key(start).String(), i.boundsToString().String())
 	i.valid = true
 }
 
@@ -149,8 +145,12 @@ func (i *indexIterator) checkNextBound(it *badger.Item) (pass bool, seek []byte)
 
 		// seek to the start of new bound
 		if i.less(k, bound.Start, bound.StartInclude) {
-			if !bound.StartInclude && !i.isReverse {
-				return false, append(bound.Start, 255)
+			if !bound.StartInclude {
+				if i.isReverse {
+					return false, decr(slices.Clone(bound.Start))
+				} else {
+					return false, append(bound.Start, 255)
+				}
 			}
 			return false, bound.Start
 		}
@@ -189,24 +189,6 @@ func (i *indexIterator) less(a, b []byte, orEqual bool) bool {
 	return i.isReverse
 }
 
-func (i *indexIterator) boundsToString() (boundsToString query.Bounds) {
-	var nilOrStripNS = func(b []byte) []byte {
-		if len(b) == 0 {
-			return nil
-		}
-		return b[i.indexNS.Len():]
-	}
-	for _, bnd := range i.bounds {
-		boundsToString = append(boundsToString, query.Bound{
-			Start:        nilOrStripNS(bnd.Start),
-			End:          nilOrStripNS(bnd.End),
-			StartInclude: bnd.StartInclude,
-			EndInclude:   bnd.EndInclude,
-		})
-	}
-	return boundsToString
-}
-
 func (i *indexIterator) String() string {
 	indexName := i.indexNS.String()
 	if lastSlash := strings.LastIndex(indexName, "/"); lastSlash != -1 {
@@ -214,12 +196,22 @@ func (i *indexIterator) String() string {
 	}
 
 	var result = "INDEX(" + indexName
-	boundsToString := i.boundsToString()
+	boundsToString := i.bounds.String()
 	if len(boundsToString) > 0 {
-		result += ", " + boundsToString.String()
+		result += ", " + boundsToString
 	}
 	if i.isReverse {
 		result += ", rev"
 	}
 	return result + ")"
+}
+
+func decr(b []byte) []byte {
+	for i := len(b) - 1; i >= 0; i-- {
+		if b[i] != 0 {
+			b[i]--
+			return b
+		}
+	}
+	return b
 }

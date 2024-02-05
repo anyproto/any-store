@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fastjson"
 
+	"github.com/anyproto/any-store/internal/encoding"
 	"github.com/anyproto/any-store/query"
 )
 
@@ -47,7 +48,7 @@ func TestValueIterator_Next(t *testing.T) {
 			}
 			it := NewScanIterator(fx.QCtx, cond, query.Bounds{
 				{
-					Start:        fx.QCtx.DataNS.GetKey().AppendAny(1),
+					Start:        encoding.AppendAnyValue(nil, 1),
 					StartInclude: true,
 				},
 			}, false)

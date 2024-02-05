@@ -34,6 +34,22 @@
       "cond" : {"b": {"$ne": 6}},
       "expectedExplain": "SCAN(id)",
       "expectedIds": [4,5,7,9,10]
+    },
+    {
+      "cond" : {"c": "3"},
+      "expectedExplain": "SCAN(id)",
+      "expectedIds": [4,5,6]
+    },
+    {
+      "sort": ["-id"],
+      "expectedExplain": "SCAN(id, rev)",
+      "expectedIds": [10,9,8,7,6,5,4,3,2,1]
+    },
+    {
+      "cond": {"id": {"$lt": 4}},
+      "sort": ["-id"],
+      "expectedExplain": "SCAN(id, Bounds{('4',inf]}, rev)",
+      "expectedIds": [3,2,1]
     }
   ],
   "data": [

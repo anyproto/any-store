@@ -2,6 +2,8 @@ package testdb
 
 import (
 	"encoding/json"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"testing"
 	"time"
@@ -12,6 +14,10 @@ import (
 
 	anystore "github.com/anyproto/any-store"
 )
+
+func init() {
+	go http.ListenAndServe(":6060", nil)
+}
 
 func TestQueries(t *testing.T) {
 	testFile(t, "data/set1.json")
@@ -108,8 +114,8 @@ func testFile(t *testing.T, filename string) {
 			expected[i] = fastjson.MustParseBytes(eId).String()
 		}
 
-		assert.Equal(t, expected, result)
-		assert.Equal(t, tc.ExpectedExplain, iter.Explain())
+		assert.Equal(t, expected, result, j)
+		assert.Equal(t, tc.ExpectedExplain, iter.Explain(), j)
 
 		require.NoError(t, iter.Close())
 		t.Logf("%d\t%s\t%v", j, tc.ExpectedExplain, dur)

@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/anyproto/any-store/internal/encoding"
 	"github.com/anyproto/any-store/internal/key"
 	"github.com/anyproto/any-store/query"
 )
@@ -48,9 +49,9 @@ func TestIndexIterator_Next(t *testing.T) {
 		require.NoError(t, fx.View(func(txn *badger.Txn) error {
 			fx.QCtx.Txn = txn
 			idx := NewIndexIterator(fx.QCtx, key.NewNS("testIndex"), query.Bounds{{
-				Start:        fx.indexNS.GetKey().AppendAny(1),
+				Start:        encoding.AppendAnyValue(nil, 1),
 				StartInclude: true,
-				End:          fx.indexNS.GetKey().AppendAny(3),
+				End:          encoding.AppendAnyValue(nil, 3),
 				EndInclude:   true,
 			}}, false)
 			for idx.Next() {
@@ -66,9 +67,9 @@ func TestIndexIterator_Next(t *testing.T) {
 		require.NoError(t, fx.View(func(txn *badger.Txn) error {
 			fx.QCtx.Txn = txn
 			idx := NewIndexIterator(fx.QCtx, key.NewNS("testIndex"), query.Bounds{{
-				Start:        fx.indexNS.GetKey().AppendAny(1),
+				Start:        encoding.AppendAnyValue(nil, 1),
 				StartInclude: true,
-				End:          fx.indexNS.GetKey().AppendAny(3),
+				End:          encoding.AppendAnyValue(nil, 3),
 				EndInclude:   true,
 			}}, true)
 			for idx.Next() {
@@ -84,8 +85,8 @@ func TestIndexIterator_Next(t *testing.T) {
 		require.NoError(t, fx.View(func(txn *badger.Txn) error {
 			fx.QCtx.Txn = txn
 			idx := NewIndexIterator(fx.QCtx, key.NewNS("testIndex"), query.Bounds{{
-				Start: fx.indexNS.GetKey().AppendAny(1),
-				End:   fx.indexNS.GetKey().AppendAny(4),
+				Start: encoding.AppendAnyValue(nil, 1),
+				End:   encoding.AppendAnyValue(nil, 4),
 			}}, false)
 			for idx.Next() {
 				actual = append(actual, toAny(t, idx.CurrentId()).(float64))
@@ -100,8 +101,23 @@ func TestIndexIterator_Next(t *testing.T) {
 		require.NoError(t, fx.View(func(txn *badger.Txn) error {
 			fx.QCtx.Txn = txn
 			idx := NewIndexIterator(fx.QCtx, key.NewNS("testIndex"), query.Bounds{{
-				Start: fx.indexNS.GetKey().AppendAny(1),
-				End:   fx.indexNS.GetKey().AppendAny(4),
+				Start: encoding.AppendAnyValue(nil, 1),
+				End:   encoding.AppendAnyValue(nil, 4),
+			}}, true)
+			for idx.Next() {
+				actual = append(actual, toAny(t, idx.CurrentId()).(float64))
+			}
+			return idx.Close()
+		}))
+		assert.Equal(t, expected, actual)
+	})
+	t.Run("one bound reverse; lt", func(t *testing.T) {
+		var expected = []float64{3, 2, 1, 0}
+		var actual []float64
+		require.NoError(t, fx.View(func(txn *badger.Txn) error {
+			fx.QCtx.Txn = txn
+			idx := NewIndexIterator(fx.QCtx, key.NewNS("testIndex"), query.Bounds{{
+				End: encoding.AppendAnyValue(nil, 4),
 			}}, true)
 			for idx.Next() {
 				actual = append(actual, toAny(t, idx.CurrentId()).(float64))
@@ -117,21 +133,21 @@ func TestIndexIterator_Next(t *testing.T) {
 			fx.QCtx.Txn = txn
 			idx := NewIndexIterator(fx.QCtx, key.NewNS("testIndex"), query.Bounds{
 				{
-					Start:        fx.indexNS.GetKey().AppendAny(1),
+					Start:        encoding.AppendAnyValue(nil, 1),
 					StartInclude: true,
-					End:          fx.indexNS.GetKey().AppendAny(1),
+					End:          encoding.AppendAnyValue(nil, 1),
 					EndInclude:   true,
 				},
 				{
-					Start:        fx.indexNS.GetKey().AppendAny(3),
+					Start:        encoding.AppendAnyValue(nil, 3),
 					StartInclude: true,
-					End:          fx.indexNS.GetKey().AppendAny(3),
+					End:          encoding.AppendAnyValue(nil, 3),
 					EndInclude:   true,
 				},
 				{
-					Start:        fx.indexNS.GetKey().AppendAny(4),
+					Start:        encoding.AppendAnyValue(nil, 4),
 					StartInclude: true,
-					End:          fx.indexNS.GetKey().AppendAny(4),
+					End:          encoding.AppendAnyValue(nil, 4),
 					EndInclude:   true,
 				},
 			}, false)
@@ -149,21 +165,21 @@ func TestIndexIterator_Next(t *testing.T) {
 			fx.QCtx.Txn = txn
 			idx := NewIndexIterator(fx.QCtx, key.NewNS("testIndex"), query.Bounds{
 				{
-					Start:        fx.indexNS.GetKey().AppendAny(1),
+					Start:        encoding.AppendAnyValue(nil, 1),
 					StartInclude: true,
-					End:          fx.indexNS.GetKey().AppendAny(1),
+					End:          encoding.AppendAnyValue(nil, 1),
 					EndInclude:   true,
 				},
 				{
-					Start:        fx.indexNS.GetKey().AppendAny(3),
+					Start:        encoding.AppendAnyValue(nil, 3),
 					StartInclude: true,
-					End:          fx.indexNS.GetKey().AppendAny(3),
+					End:          encoding.AppendAnyValue(nil, 3),
 					EndInclude:   true,
 				},
 				{
-					Start:        fx.indexNS.GetKey().AppendAny(4),
+					Start:        encoding.AppendAnyValue(nil, 4),
 					StartInclude: true,
-					End:          fx.indexNS.GetKey().AppendAny(4),
+					End:          encoding.AppendAnyValue(nil, 4),
 					EndInclude:   true,
 				},
 			}, true)

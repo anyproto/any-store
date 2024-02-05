@@ -14,26 +14,34 @@ type Bound struct {
 	Start, End   key.Key
 	StartInclude bool
 	EndInclude   bool
+	prefix       key.Key
 }
 
 func (b Bound) String() string {
+	stripPrefixString := func(k key.Key) string {
+		if len(b.prefix) != 0 && len(k) > len(b.prefix) {
+			return k[len(b.prefix):].String()
+		}
+		return k.String()
+	}
+
 	var as, bs string
-	if len(b.Start) == 0 {
+	if len(b.Start) == 0 || bytes.Equal(b.prefix, b.Start) || bytes.Equal(append(b.prefix, 255), b.Start) {
 		as = "[-inf"
 	} else {
 		if b.StartInclude {
-			as = "['" + b.Start.String() + "'"
+			as = "['" + stripPrefixString(b.Start) + "'"
 		} else {
-			as = "('" + b.Start.String() + "'"
+			as = "('" + stripPrefixString(b.Start) + "'"
 		}
 	}
-	if len(b.End) == 0 {
+	if len(b.End) == 0 || bytes.Equal(b.prefix, b.End) || bytes.Equal(append(b.prefix, 255), b.End) {
 		bs = "inf]"
 	} else {
 		if b.EndInclude {
-			bs = "'" + b.End.String() + "']"
+			bs = "'" + stripPrefixString(b.End) + "']"
 		} else {
-			bs = "'" + b.End.String() + "')"
+			bs = "'" + stripPrefixString(b.End) + "')"
 		}
 	}
 	return fmt.Sprintf("%s,%s", as, bs)
@@ -108,6 +116,7 @@ func (bs Bounds) Reverse() {
 	slices.Reverse(bs)
 	for i, b := range bs {
 		if b.EndInclude {
+			// add the extra byte to have the correct position on badger.Seek with reverse iteration
 			b.End = append(b.End, 255)
 		}
 		bs[i] = Bound{
@@ -115,18 +124,27 @@ func (bs Bounds) Reverse() {
 			End:          b.Start,
 			StartInclude: b.EndInclude,
 			EndInclude:   b.StartInclude,
+			prefix:       b.prefix,
 		}
 	}
 }
 
 func (bs Bounds) SetPrefix(k key.Key) {
+	var prefix = k.Copy()
 	for i, b := range bs {
 		if len(b.Start) != 0 {
 			bs[i].Start = append(k.Copy(), b.Start...)
+		} else if i == 0 {
+			bs[i].Start = prefix
+			bs[i].StartInclude = true
 		}
 		if len(b.End) != 0 {
 			bs[i].End = append(k.Copy(), b.End...)
+		} else if i == len(bs)-1 {
+			bs[i].End = append(prefix, 255)
+			bs[i].EndInclude = true
 		}
+		bs[i].prefix = prefix
 	}
 }
 
