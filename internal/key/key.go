@@ -44,6 +44,7 @@ func (k Key) ReadAnyValue(ns *NS, f func(v any) error) (err error) {
 		start = ns.prefixLen
 	}
 	var k2 = k[start:]
+
 	for len(k2) > 0 {
 		if v, start, err = encoding.DecodeToAny(k2); err != nil {
 			return err
@@ -52,6 +53,9 @@ func (k Key) ReadAnyValue(ns *NS, f func(v any) error) (err error) {
 			return
 		}
 		k2 = k2[start:]
+		if len(k2) == 1 && k2[0] == 255 {
+			return nil
+		}
 	}
 	return
 }

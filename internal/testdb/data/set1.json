@@ -50,6 +50,93 @@
       "sort": ["-id"],
       "expectedExplain": "SCAN(id, Bounds{('4',inf]}, rev)",
       "expectedIds": [3,2,1]
+    },
+    {
+      "cond": {"id": {"$in": [5,9]}},
+      "expectedExplain": "SCAN(id, Bounds{['5','5'],['9','9']})",
+      "expectedIds": [5,9]
+    },
+    {
+      "cond": {"id": {"$in": [1,10]}},
+      "expectedExplain": "SCAN(id, Bounds{['1','1'],['10','10']})",
+      "expectedIds": [1,10]
+    },
+    {
+      "cond": {"id": {"$in": [5,9]}},
+      "sort": ["-id"],
+      "expectedExplain": "SCAN(id, Bounds{['9','9'],['5','5']}, rev)",
+      "expectedIds": [9,5]
+    },
+    {
+      "cond": {"id": {"$in": [1,10]}},
+      "sort": ["-id"],
+      "expectedExplain": "SCAN(id, Bounds{['10','10'],['1','1']}, rev)",
+      "expectedIds": [10,1]
+    },
+    {
+      "cond": {"id": {"$nin": [1,3,5,7,9,22]}},
+      "expectedExplain": "SCAN(id)",
+      "expectedIds": [2,4,6,8,10]
+    },
+    {
+      "cond": {"b": {"$nin": [2,4,5]}},
+      "expectedExplain": "SCAN(id)",
+      "expectedIds": [3,8,9,10]
+    },
+    {
+      "cond": {"b": {"$nin": [2,4,5]}},
+      "expectedExplain": "SCAN(id)",
+      "expectedIds": [3,8,9,10]
+    },
+    {
+      "cond": {"$or": [{"id": 3}, {"id": 5}]},
+      "expectedExplain": "SCAN(id, Bounds{['3','3'],['5','5']})",
+      "expectedIds": [3,5]
+    },
+    {
+      "cond": {"id": 5, "c": "3", "b": 10},
+      "expectedExplain": "SCAN(id, Bounds{['5','5']})",
+      "expectedIds": [5]
+    },
+    {
+      "cond": {"id": 5, "c": "3", "b": 11},
+      "expectedExplain": "SCAN(id, Bounds{['5','5']})",
+      "expectedIds": []
+    },
+    {
+      "cond": {"$and": [{"b": 2}, {"b": 6}]},
+      "expectedExplain": "SCAN(id)",
+      "expectedIds": [1,2,6]
+    },
+    {
+      "cond": {"d": true},
+      "expectedExplain": "SCAN(id)",
+      "expectedIds": [6]
+    },
+    {
+      "cond": {"d.object": 1},
+      "expectedExplain": "SCAN(id)",
+      "expectedIds": [5]
+    },
+    {
+      "cond": {"d": {"$type": "array"}},
+      "expectedExplain": "SCAN(id)",
+      "expectedIds": [4]
+    },
+    {
+      "cond": {"d": {"$exists": false}},
+      "expectedExplain": "SCAN(id)",
+      "expectedIds": [8,9,10]
+    },
+    {
+      "cond": {"b": {"$all": [2,4,6]}},
+      "expectedExplain": "SCAN(id)",
+      "expectedIds": [1,2]
+    },
+    {
+      "cond": {"$or":[{"d": {"$exists": false}, "a": "a"}, {"a": "1"}]},
+      "expectedExplain": "SCAN(id)",
+      "expectedIds": [1,10]
     }
   ],
   "data": [

@@ -104,7 +104,7 @@ func testFile(t *testing.T, filename string) {
 		iter, err := q.Iter()
 		require.NoError(t, err)
 
-		var result []string
+		var result = make([]string, 0)
 		for iter.Next() {
 			result = append(result, iter.Item().Value().Get("id").String())
 		}
