@@ -66,12 +66,12 @@ func (k Key) ReadByteValues(ns *NS, f func(b []byte) error) (err error) {
 		start = ns.prefixLen
 	}
 	var k2 = k[start:]
+	var val []byte
 	for len(k2) > 0 {
-		// todo: rewrite to calc len only, without converting
-		if _, start, err = encoding.DecodeToAny(k2); err != nil {
+		if val, start, err = encoding.DecodeToByte(k2); err != nil {
 			return err
 		}
-		if err = f(k2[:start]); err != nil {
+		if err = f(val); err != nil {
 			return
 		}
 		k2 = k2[start:]

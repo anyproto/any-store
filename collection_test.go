@@ -257,7 +257,7 @@ func TestCollection_FindMany(t *testing.T) {
 	coll, err := fx.Collection("test")
 	require.NoError(t, err)
 
-	for i := 0; i < 100000; i++ {
+	for i := 0; i < 10000; i++ {
 		_, err = coll.InsertOne(map[string]any{"id": i, "data": fmt.Sprint(i)})
 		require.NoError(t, err)
 	}

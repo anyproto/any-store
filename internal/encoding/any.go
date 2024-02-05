@@ -123,3 +123,61 @@ func DecodeToAny(b []byte) (v any, n int, err error) {
 		return nil, 0, fmt.Errorf("toAny: unexpected binary type: %v: %v", Type(b[0]), b)
 	}
 }
+
+func DecodeToByte(b []byte) (v []byte, n int, err error) {
+	if len(b) == 0 {
+		return nil, 0, fmt.Errorf("can't decode, bytes is empty")
+	}
+	switch Type(b[0]) {
+	case TypeObject, TypeArray, TypeString:
+		var end int
+		for i := range b {
+			if b[i] == EOS {
+				end = i
+				break
+			}
+		}
+		if end == 0 {
+			return nil, 0, fmt.Errorf("can't decode string: end of string not found")
+		}
+		return b[:end+1], end + 1, nil
+	case TypeNumber:
+		if len(b) < 9 {
+			return nil, 0, fmt.Errorf("unexpected number encoding")
+		}
+		return b[:9], 9, nil
+	case TypeNull:
+		return b[:1], 1, nil
+	case TypeTrue:
+		return b[:1], 1, nil
+	case TypeFalse:
+		return b[:1], 1, nil
+	case iTypeObject, iTypeArray, iTypeString:
+		var end int
+		for i := range b {
+			if b[i] == EOS {
+				end = i
+				break
+			} else if i != 0 {
+				b[i] = 255 - b[i]
+			}
+		}
+		if end == 0 {
+			return nil, 0, fmt.Errorf("can't decode string: end of string not found")
+		}
+		return b[:end+1], end + 1, nil
+	case iTypeNumber:
+		if len(b) < 9 {
+			return nil, 0, fmt.Errorf("unexpected number encoding")
+		}
+		return b[:9], 9, nil
+	case iTypeNull:
+		return b[:1], 1, nil
+	case iTypeTrue:
+		return b[:1], 1, nil
+	case iTypeFalse:
+		return b[:1], 1, nil
+	default:
+		return nil, 0, fmt.Errorf("toAny: unexpected binary type: %v: %v", Type(b[0]), b)
+	}
+}

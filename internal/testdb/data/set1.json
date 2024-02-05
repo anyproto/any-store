@@ -137,6 +137,12 @@
       "cond": {"$or":[{"d": {"$exists": false}, "a": "a"}, {"a": "1"}]},
       "expectedExplain": "SCAN(id)",
       "expectedIds": [1,10]
+    },
+    {
+      "cond": {"b": 6},
+      "sort" : ["-a"],
+      "expectedExplain": "SORT(SCAN(id))",
+      "expectedIds": [8,6,3,2,1]
     }
   ],
   "data": [
