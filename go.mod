@@ -5,7 +5,7 @@ go 1.21
 require (
 	github.com/RoaringBitmap/roaring v1.9.0
 	github.com/dgraph-io/badger/v4 v4.2.0
-	github.com/stretchr/testify v1.8.4
+	github.com/stretchr/testify v1.9.0
 	github.com/valyala/fastjson v1.6.4
 	golang.org/x/exp v0.0.0-20240119083558-1b970713d09a
 )
