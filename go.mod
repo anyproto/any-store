@@ -3,7 +3,7 @@ module github.com/anyproto/any-store
 go 1.21
 
 require (
-	github.com/RoaringBitmap/roaring v1.9.0
+	github.com/RoaringBitmap/roaring v1.9.3
 	github.com/dgraph-io/badger/v4 v4.2.0
 	github.com/stretchr/testify v1.8.4
 	github.com/valyala/fastjson v1.6.4
