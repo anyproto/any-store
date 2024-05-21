@@ -23,6 +23,10 @@ const collDrop = `
 	DROP TABLE '%ns_%coll_docs';
 `
 
+const collRename = `
+
+`
+
 func (s CollectionSql) TableName() string {
 	return s.WithColl(`%ns_%coll_docs`)
 }
@@ -33,6 +37,10 @@ func (s CollectionSql) Create() string {
 
 func (s CollectionSql) Drop() string {
 	return s.WithColl(collDrop)
+}
+
+func (s CollectionSql) Rename(newName string) string {
+	return s.With2Coll(`ALTER TABLE '%ns_%coll_docs' RENAME TO '%ns_%2coll_docs';`, newName)
 }
 
 func (s CollectionSql) DeleteStmt(ctx context.Context, c conn.Conn) (conn.Stmt, error) {
@@ -53,4 +61,8 @@ func (s CollectionSql) FindIdStmt(ctx context.Context, c conn.Conn) (conn.Stmt, 
 
 func (s CollectionSql) WithColl(sql string) string {
 	return strings.ReplaceAll(s.WithNS(sql), "%coll", s.CollectionName)
+}
+
+func (s CollectionSql) With2Coll(sql, name string) string {
+	return strings.ReplaceAll(s.WithColl(sql), "%2coll", name)
 }

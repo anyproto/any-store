@@ -198,20 +198,69 @@ func (c *collection) GetIndexes(ctx context.Context) (indexes []Index, err error
 	panic("implement me")
 }
 
-func (c *collection) Rename(ctx context.Context, newName string) (err error) {
-	//TODO implement me
-	panic("implement me")
-}
-
-func (c *collection) Drop(ctx context.Context) (err error) {
-	//TODO implement me
-	panic("implement me")
-}
-
-func (c *collection) Close() error {
-	if !c.closed.CompareAndSwap(false, true) {
+func (c *collection) Rename(ctx context.Context, newName string) error {
+	return c.db.doWriteTx(ctx, func(cn conn.Conn) (err error) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if _, err = c.db.stmt.renameCollection.ExecContext(ctx, []driver.NamedValue{
+			{
+				Name:    "oldName",
+				Ordinal: 1,
+				Value:   c.name,
+			},
+			{
+				Name:    "newName",
+				Ordinal: 2,
+				Value:   newName,
+			},
+		}); err != nil {
+			return
+		}
+		for _, idx := range c.indexes {
+			if err = idx.renameColl(ctx, cn, newName); err != nil {
+				return
+			}
+		}
+		if _, err = cn.ExecContext(ctx, c.sql.Rename(newName), nil); err != nil {
+			return err
+		}
+		c.name = newName
+		c.sql = c.db.sql.Collection(newName)
+		c.tableName = c.sql.TableName()
+		c.closeStmts()
 		return nil
-	}
+	})
+}
+
+func (c *collection) Drop(ctx context.Context) error {
+	return c.db.doWriteTx(ctx, func(cn conn.Conn) (err error) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if err = c.Close(); err != nil {
+			return err
+		}
+		for _, idx := range c.indexes {
+			if err = idx.drop(ctx, cn); err != nil {
+				return
+			}
+		}
+		if _, err = c.db.stmt.renameCollection.ExecContext(ctx, []driver.NamedValue{
+			{
+				Name:    "collName",
+				Ordinal: 1,
+				Value:   c.name,
+			},
+		}); err != nil {
+			return
+		}
+		if _, err = cn.ExecContext(ctx, c.sql.Drop(), nil); err != nil {
+			return
+		}
+		return nil
+	})
+}
+
+func (c *collection) closeStmts() {
 	if c.stmtsReady.Load() {
 		for _, stmt := range []conn.Stmt{
 			c.stmts.insert, c.stmts.update, c.stmts.findId, c.stmts.delete,
@@ -219,6 +268,13 @@ func (c *collection) Close() error {
 			_ = stmt.Close()
 		}
 	}
+}
+
+func (c *collection) Close() error {
+	if !c.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	c.closeStmts()
 	c.db.onCollectionClose(c.name)
 	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"io"
 	"sync"
 
 	"github.com/anyproto/any-store/internal/conn"
@@ -202,7 +203,11 @@ func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collec
 			Value:   collectionName,
 		}})
 		if err != nil {
-			return replaceNoRowsErr(err, ErrCollectionNotFound)
+			return err
+		}
+		rErr := rows.Next(nil)
+		if rErr == io.EOF {
+			return ErrCollectionNotFound
 		}
 		return rows.Close()
 	})

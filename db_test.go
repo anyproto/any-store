@@ -37,6 +37,23 @@ func TestDb_CreateCollection(t *testing.T) {
 	assert.ErrorIs(t, err, ErrCollectionExists)
 }
 
+func TestDb_OpenCollection(t *testing.T) {
+	t.Run("err not found", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.OpenCollection(ctx, "test")
+		require.Nil(t, coll)
+		require.ErrorIs(t, err, ErrCollectionNotFound)
+	})
+	t.Run("success", func(t *testing.T) {
+		fx := newFixture(t)
+		_, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		coll, err := fx.OpenCollection(ctx, "test")
+		require.NoError(t, err)
+		assert.NotNil(t, coll)
+	})
+}
+
 func newFixture(t *testing.T, c ...*Config) *fixture {
 	tmpDir, err := os.MkdirTemp("", "")
 	require.NoError(t, err)
