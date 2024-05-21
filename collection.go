@@ -133,7 +133,7 @@ func (c *collection) FindId(ctx context.Context, docId any) (doc Doc, err error)
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
-	id := encoding.AppendAnyValue(nil, docId)
+	id := encoding.AppendAnyValue(buf.SmallBuf[:0], docId)
 	err = c.db.doReadTx(ctx, func(cn conn.Conn) (err error) {
 		rows, err := cn.QueryContext(ctx, fmt.Sprintf(`SELECT data FROM '%s' WHERE id = ?`, c.tableName), []driver.NamedValue{
 			{Value: id, Ordinal: 1},
