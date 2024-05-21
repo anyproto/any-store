@@ -6,7 +6,6 @@ import (
 )
 
 var defaultSQLiteOptions = map[string]string{
-	"_txlock":       "immediate",
 	"_journal_mode": "WAL",
 	"_busy_timeout": "5000",
 	"_synchronous":  "NORMAL",

@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"io"
@@ -53,6 +54,18 @@ func readIndexInfo(buf *syncpool.DocBuffer, rows driver.Rows) (result []IndexInf
 		})
 	}
 	return
+}
+
+func readOneInt(rows driver.Rows) (i int, err error) {
+	var dest = make([]driver.Value, 1)
+	if err = rows.Next(dest); err != nil {
+		if errors.Is(err, io.EOF) {
+			return 0, sql.ErrNoRows
+		} else {
+			return 0, err
+		}
+	}
+	return int(dest[0].(int64)), nil
 }
 
 func stringArrayToJson(a *fastjson.Arena, array []string) string {

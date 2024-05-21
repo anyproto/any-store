@@ -14,6 +14,7 @@ import (
 	"github.com/anyproto/any-store/internal/conn"
 	"github.com/anyproto/any-store/internal/encoding"
 	"github.com/anyproto/any-store/internal/sql"
+	"github.com/anyproto/any-store/internal/syncpool"
 )
 
 type Collection interface {
@@ -26,6 +27,8 @@ type Collection interface {
 
 	UpdateId(ctx context.Context, id, doc any) (err error)
 	UpsertId(ctx context.Context, id, doc any) (err error)
+
+	Count(ctx context.Context) (count int, err error)
 
 	EnsureIndex(ctx context.Context, info ...IndexInfo) (err error)
 	DropIndex(ctx context.Context, indexName string) (err error)
@@ -64,6 +67,11 @@ type collection struct {
 		findId conn.Stmt
 	}
 
+	queries struct {
+		findId,
+		count string
+	}
+
 	stmtsReady atomic.Bool
 	closed     atomic.Bool
 
@@ -75,6 +83,7 @@ func (c *collection) init(ctx context.Context) error {
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.makeQueries()
 	return c.db.doReadTx(ctx, func(cn conn.Conn) (err error) {
 		rows, err := cn.QueryContext(ctx, c.sql.FindIndexes(), []driver.NamedValue{
 			{
@@ -102,6 +111,11 @@ func (c *collection) init(ctx context.Context) error {
 		}
 		return nil
 	})
+}
+
+func (c *collection) makeQueries() {
+	c.queries.findId = fmt.Sprintf("SELECT data FROM '%s' WHERE id = ?", c.tableName)
+	c.queries.count = fmt.Sprintf("SELECT COUNT(*) FROM '%s'", c.tableName)
 }
 
 func (c *collection) checkStmts(ctx context.Context, cn conn.Conn) (err error) {
@@ -135,7 +149,7 @@ func (c *collection) FindId(ctx context.Context, docId any) (doc Doc, err error)
 
 	id := encoding.AppendAnyValue(buf.SmallBuf[:0], docId)
 	err = c.db.doReadTx(ctx, func(cn conn.Conn) (err error) {
-		rows, err := cn.QueryContext(ctx, fmt.Sprintf(`SELECT data FROM '%s' WHERE id = ?`, c.tableName), []driver.NamedValue{
+		rows, err := cn.QueryContext(ctx, c.queries.findId, []driver.NamedValue{
 			{Value: id, Ordinal: 1},
 		})
 		if err != nil {
@@ -168,9 +182,38 @@ func (c *collection) Query() Query {
 	panic("implement me")
 }
 
-func (c *collection) Insert(ctx context.Context, doc ...any) (err error) {
-	//TODO implement me
-	panic("implement me")
+func (c *collection) Insert(ctx context.Context, docs ...any) (err error) {
+	buf := c.db.syncPool.GetDocBuf()
+	defer c.db.syncPool.ReleaseDocBuf(buf)
+
+	err = c.db.doWriteTx(ctx, func(cn conn.Conn) (txErr error) {
+		if txErr = c.checkStmts(ctx, cn); txErr != nil {
+			return
+		}
+		var it item
+		for _, doc := range docs {
+			if it, txErr = parseItem(buf.Parser, buf.Arena, doc, true); txErr != nil {
+				return txErr
+			}
+			if _, txErr = c.insertItem(ctx, cn, buf, it); txErr != nil {
+				return txErr
+			}
+		}
+		return
+	})
+	return replaceUniqErr(err, ErrDocExists)
+}
+
+func (c *collection) insertItem(ctx context.Context, cn conn.Conn, buf *syncpool.DocBuffer, it item) (id []byte, err error) {
+	id = it.appendId(buf.SmallBuf[:0])
+	if _, err = c.stmts.insert.ExecContext(ctx, []driver.NamedValue{
+		{Value: id, Ordinal: 1},
+		{Value: it.Value().MarshalTo(buf.DocBuf[:0]), Ordinal: 2},
+	}); err != nil {
+		return nil, replaceUniqErr(err, ErrDocExists)
+	}
+	// TODO: handle indexes
+	return
 }
 
 func (c *collection) UpdateId(ctx context.Context, id, doc any) (err error) {
@@ -181,6 +224,21 @@ func (c *collection) UpdateId(ctx context.Context, id, doc any) (err error) {
 func (c *collection) UpsertId(ctx context.Context, id, doc any) (err error) {
 	//TODO implement me
 	panic("implement me")
+}
+
+func (c *collection) Count(ctx context.Context) (count int, err error) {
+	err = c.db.doReadTx(ctx, func(cn conn.Conn) error {
+		rows, txErr := cn.QueryContext(ctx, c.queries.count, nil)
+		if txErr != nil {
+			return txErr
+		}
+		defer func() {
+			_ = rows.Close()
+		}()
+		count, err = readOneInt(rows)
+		return nil
+	})
+	return
 }
 
 func (c *collection) EnsureIndex(ctx context.Context, info ...IndexInfo) (err error) {
@@ -227,6 +285,7 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 		c.name = newName
 		c.sql = c.db.sql.Collection(newName)
 		c.tableName = c.sql.TableName()
+		c.makeQueries()
 		c.closeStmts()
 		return nil
 	})

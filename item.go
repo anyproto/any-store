@@ -8,6 +8,7 @@ import (
 
 	"github.com/anyproto/any-store/internal/encoding"
 	"github.com/anyproto/any-store/internal/objectid"
+	"github.com/anyproto/any-store/internal/parser"
 )
 
 type Item interface {
@@ -33,6 +34,14 @@ func newItem(val *fastjson.Value, a *fastjson.Arena, autoId bool) (item, error) 
 		val: val,
 	}
 	return it, nil
+}
+
+func parseItem(p *fastjson.Parser, a *fastjson.Arena, doc any, autoId bool) (it item, err error) {
+	docJ, err := parser.AnyToJSON(p, doc)
+	if err != nil {
+		return item{}, err
+	}
+	return newItem(docJ, a, autoId)
 }
 
 type item struct {
