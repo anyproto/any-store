@@ -30,8 +30,8 @@ func NewDriver(fr *registry.FilterRegistry, sr *registry.SortRegistry) *sqlite3.
 
 func NewConnManager(driver *sqlite3.SQLiteDriver, dsn string, writeCount, readCount int) (*ConnManager, error) {
 	var (
-		writeConn = make([]*sqlite3.SQLiteConn, 0, writeCount)
-		readConn  = make([]*sqlite3.SQLiteConn, 0, readCount)
+		writeConn = make([]Conn, 0, writeCount)
+		readConn  = make([]Conn, 0, readCount)
 	)
 	closeAll := func() {
 		for _, conn := range writeConn {
@@ -48,11 +48,12 @@ func NewConnManager(driver *sqlite3.SQLiteDriver, dsn string, writeCount, readCo
 			closeAll()
 			return nil, err
 		}
-		writeConn = append(writeConn, conn.(*sqlite3.SQLiteConn))
+		writeConn = append(writeConn, conn.(Conn))
 	}
 
+	readOnlyDsn := dsn + "&mode=ro"
 	for i := 0; i < readCount; i++ {
-		conn, err := driver.Open(dsn)
+		conn, err := driver.Open(readOnlyDsn)
 		if err != nil {
 			closeAll()
 			return nil, err
@@ -61,8 +62,8 @@ func NewConnManager(driver *sqlite3.SQLiteDriver, dsn string, writeCount, readCo
 	}
 
 	cm := &ConnManager{
-		readCh:    make(chan *sqlite3.SQLiteConn, len(readConn)),
-		writeCh:   make(chan *sqlite3.SQLiteConn, len(writeConn)),
+		readCh:    make(chan Conn, len(readConn)),
+		writeCh:   make(chan Conn, len(writeConn)),
 		readConn:  readConn,
 		writeConn: writeConn,
 		driver:    driver,
@@ -77,15 +78,15 @@ func NewConnManager(driver *sqlite3.SQLiteDriver, dsn string, writeCount, readCo
 }
 
 type ConnManager struct {
-	readCh    chan *sqlite3.SQLiteConn
-	writeCh   chan *sqlite3.SQLiteConn
-	readConn  []*sqlite3.SQLiteConn
-	writeConn []*sqlite3.SQLiteConn
+	readCh    chan Conn
+	writeCh   chan Conn
+	readConn  []Conn
+	writeConn []Conn
 	driver    *sqlite3.SQLiteDriver
 	closed    chan struct{}
 }
 
-func (c *ConnManager) GetWrite(ctx context.Context) (conn *sqlite3.SQLiteConn, err error) {
+func (c *ConnManager) GetWrite(ctx context.Context) (conn Conn, err error) {
 	if c == nil {
 		return nil, ErrDBIsNotOpened
 	}
@@ -100,11 +101,11 @@ func (c *ConnManager) GetWrite(ctx context.Context) (conn *sqlite3.SQLiteConn, e
 	}
 }
 
-func (c *ConnManager) ReleaseWrite(conn *sqlite3.SQLiteConn) {
+func (c *ConnManager) ReleaseWrite(conn Conn) {
 	c.writeCh <- conn
 }
 
-func (c *ConnManager) GetRead(ctx context.Context) (conn *sqlite3.SQLiteConn, err error) {
+func (c *ConnManager) GetRead(ctx context.Context) (conn Conn, err error) {
 	if c == nil {
 		return nil, ErrDBIsNotOpened
 	}
@@ -119,7 +120,7 @@ func (c *ConnManager) GetRead(ctx context.Context) (conn *sqlite3.SQLiteConn, er
 	}
 }
 
-func (c *ConnManager) ReleaseRead(conn *sqlite3.SQLiteConn) {
+func (c *ConnManager) ReleaseRead(conn Conn) {
 	c.readCh <- conn
 }
 

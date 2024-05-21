@@ -9,8 +9,6 @@ import (
 	"github.com/anyproto/any-store/internal/encoding"
 )
 
-const eos = byte(0)
-
 func New() Key {
 	return nil
 }
