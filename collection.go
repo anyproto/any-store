@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"github.com/anyproto/any-store/internal/key"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -23,7 +24,8 @@ type Collection interface {
 	FindId(ctx context.Context, id any) (Doc, error)
 	Query() Query
 
-	Insert(ctx context.Context, doc ...any) (err error)
+	InsertOne(ctx context.Context, doc any) (id any, err error)
+	Insert(ctx context.Context, docs ...any) (err error)
 
 	UpdateId(ctx context.Context, id, doc any) (err error)
 	UpsertId(ctx context.Context, id, doc any) (err error)
@@ -180,6 +182,36 @@ func (c *collection) FindId(ctx context.Context, docId any) (doc Doc, err error)
 func (c *collection) Query() Query {
 	//TODO implement me
 	panic("implement me")
+}
+
+func (c *collection) InsertOne(ctx context.Context, doc any) (id any, err error) {
+	buf := c.db.syncPool.GetDocBuf()
+	defer c.db.syncPool.ReleaseDocBuf(buf)
+
+	var idBytes key.Key
+	err = c.db.doWriteTx(ctx, func(cn conn.Conn) (txErr error) {
+		if txErr = c.checkStmts(ctx, cn); txErr != nil {
+			return
+		}
+		var it item
+		if it, txErr = parseItem(buf.Parser, buf.Arena, doc, true); txErr != nil {
+			return txErr
+		}
+		if idBytes, txErr = c.insertItem(ctx, cn, buf, it); txErr != nil {
+			return txErr
+		}
+		return
+	})
+	if err != nil {
+		return nil, replaceUniqErr(err, ErrDocExists)
+	}
+	if err = idBytes.ReadAnyValue(func(v any) error {
+		id = v
+		return nil
+	}); err != nil {
+		return
+	}
+	return id, nil
 }
 
 func (c *collection) Insert(ctx context.Context, docs ...any) (err error) {

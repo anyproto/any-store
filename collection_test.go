@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -28,6 +29,39 @@ func TestCollection_Rename(t *testing.T) {
 	collections, err := fx.GetCollectionNames(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, []string{newName}, collections)
+}
+
+func TestCollection_InsertOne(t *testing.T) {
+	t.Run("with id", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(context.Background(), "test")
+		require.NoError(t, err)
+
+		id, err := coll.InsertOne(ctx, `{"id":42, "d":"a"}`)
+		require.NoError(t, err)
+		assert.Equal(t, float64(42), id)
+	})
+	t.Run("gen id", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(context.Background(), "test")
+		require.NoError(t, err)
+
+		id, err := coll.InsertOne(ctx, `{"d":"a"}`)
+		require.NoError(t, err)
+		idString, ok := id.(string)
+		require.True(t, ok)
+		assert.NotEmpty(t, idString)
+	})
+	t.Run("err exists", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(context.Background(), "test")
+		require.NoError(t, err)
+
+		_, err = coll.InsertOne(ctx, `{"id":"a"}`)
+		require.NoError(t, err)
+		_, err = coll.InsertOne(ctx, `{"id":"a"}`)
+		assert.ErrorIs(t, err, ErrDocExists)
+	})
 }
 
 func TestCollection_Insert(t *testing.T) {
