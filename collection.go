@@ -544,17 +544,18 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 				return
 			}
 		}
-		for _, idx := range c.indexes {
-			if err = idx.RenameColl(ctx, cn, newName); err != nil {
-				return
-			}
-		}
+
 		if _, err = cn.ExecContext(ctx, c.sql.Rename(newName), nil); err != nil {
 			return err
 		}
 		c.name = newName
 		c.sql = c.db.sql.Collection(newName)
 		c.tableName = c.sql.TableName()
+		for _, idx := range c.indexes {
+			if err = idx.RenameColl(ctx, cn, newName); err != nil {
+				return
+			}
+		}
 		c.makeQueries()
 		c.closeStmts()
 		return nil

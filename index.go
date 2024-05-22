@@ -145,7 +145,7 @@ func (idx *index) RenameColl(ctx context.Context, cn conn.Conn, name string) (er
 	idx.sql = idx.c.sql.Index(idx.info.Name)
 	idx.makeQueries()
 	idx.closeStmts()
-	return nil
+	return idx.checkStmts(ctx, cn)
 }
 
 func (idx *index) Insert(ctx context.Context, id key.Key, it item) error {
