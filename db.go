@@ -74,6 +74,7 @@ type db struct {
 		registerCollection,
 		removeCollection,
 		renameCollection,
+		renameCollectionIndex,
 		registerIndex,
 		removeIndex conn.Stmt
 	}
@@ -95,6 +96,9 @@ func (db *db) init(ctx context.Context) error {
 			return
 		}
 		if db.stmt.renameCollection, err = db.sql.RenameCollectionStmt(ctx, c); err != nil {
+			return
+		}
+		if db.stmt.renameCollectionIndex, err = db.sql.RenameCollectionIndexStmt(ctx, c); err != nil {
 			return
 		}
 		if db.stmt.registerIndex, err = db.sql.RegisterIndexStmt(ctx, c); err != nil {

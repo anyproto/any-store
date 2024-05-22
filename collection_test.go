@@ -24,6 +24,7 @@ func TestCollection_Rename(t *testing.T) {
 	coll, err := fx.CreateCollection(ctx, "test")
 	const newName = "newName"
 	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
 	require.NoError(t, coll.Rename(ctx, newName))
 	assert.Equal(t, coll.Name(), newName)
 

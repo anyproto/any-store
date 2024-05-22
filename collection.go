@@ -383,7 +383,7 @@ func (c *collection) Count(ctx context.Context) (count int, err error) {
 func (c *collection) EnsureIndex(ctx context.Context, info ...IndexInfo) (err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
-
+	// TODO: validate fields
 	return c.db.doWriteTx(ctx, func(cn conn.Conn) (txErr error) {
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
@@ -501,6 +501,11 @@ func (c *collection) GetIndexes() (indexes []Index) {
 }
 
 func (c *collection) indexesHandleInsert(ctx context.Context, cn conn.Conn, it item) (err error) {
+	for _, idx := range c.indexes {
+		if err = idx.Insert(ctx, cn, it); err != nil {
+			return
+		}
+	}
 	return
 }
 
@@ -516,19 +521,19 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 	return c.db.doWriteTx(ctx, func(cn conn.Conn) (err error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		if _, err = c.db.stmt.renameCollection.ExecContext(ctx, []driver.NamedValue{
-			{
-				Name:    "oldName",
-				Ordinal: 1,
-				Value:   c.name,
-			},
-			{
-				Name:    "newName",
-				Ordinal: 2,
-				Value:   newName,
-			},
-		}); err != nil {
-			return
+		for _, stmt := range []conn.Stmt{c.db.stmt.renameCollection, c.db.stmt.renameCollectionIndex} {
+			if _, err = stmt.ExecContext(ctx, []driver.NamedValue{
+				{
+					Name:  "oldName",
+					Value: c.name,
+				},
+				{
+					Name:  "newName",
+					Value: newName,
+				},
+			}); err != nil {
+				return
+			}
 		}
 		for _, idx := range c.indexes {
 			if err = idx.RenameColl(ctx, cn, newName); err != nil {
@@ -576,7 +581,7 @@ func (c *collection) Drop(ctx context.Context) error {
 }
 
 func (c *collection) closeStmts() {
-	if c.stmtsReady.Load() {
+	if c.stmtsReady.CompareAndSwap(true, false) {
 		for _, stmt := range []conn.Stmt{
 			c.stmts.insert, c.stmts.update, c.stmts.findId, c.stmts.delete,
 		} {

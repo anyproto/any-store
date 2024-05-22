@@ -17,7 +17,7 @@ const dbInit = `
 	);
 	CREATE TABLE IF NOT EXISTS '%ns_system_indexes' (
 		name TEXT NOT NULL,
-		collection TEXT NOT NULL REFERENCES '%ns_system_collections' (name),
+		collection TEXT NOT NULL,
 		fields TEXT NOT NULL,
 		sparse BOOL NOT NULL DEFAULT FALSE,
 		'unique' BOOL NOT NULL DEFAULT FALSE
@@ -46,6 +46,10 @@ func (s DBSql) RemoveCollectionStmt(ctx context.Context, c conn.Conn) (conn.Stmt
 
 func (s DBSql) RenameCollectionStmt(ctx context.Context, c conn.Conn) (conn.Stmt, error) {
 	return s.Prepare(ctx, c, s.WithNS(`UPDATE '%ns_system_collections' SET name = :newName WHERE name = :oldName`))
+}
+
+func (s DBSql) RenameCollectionIndexStmt(ctx context.Context, c conn.Conn) (conn.Stmt, error) {
+	return s.Prepare(ctx, c, s.WithNS(`UPDATE '%ns_system_indexes' SET collection = :newName WHERE collection = :oldName`))
 }
 
 func (s DBSql) RegisterIndexStmt(ctx context.Context, c conn.Conn) (conn.Stmt, error) {

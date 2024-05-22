@@ -23,10 +23,6 @@ const collDrop = `
 	DROP TABLE '%ns_%coll_docs';
 `
 
-const collRename = `
-
-`
-
 func (s CollectionSql) TableName() string {
 	return s.WithColl(`%ns_%coll_docs`)
 }
