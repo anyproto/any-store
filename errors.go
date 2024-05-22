@@ -15,8 +15,11 @@ var (
 	ErrCollectionExists   = errors.New("any-store: collection exists")
 	ErrCollectionNotFound = errors.New("any-store: collection not found")
 
-	ErrTxIsReadOnly    = errors.New("tx is read-only")
-	ErrTxOtherInstance = errors.New("tx is from an other db instance")
+	ErrIndexExists   = errors.New("any-store: index exists")
+	ErrIndexNotFound = errors.New("any-store: index does not exist")
+
+	ErrTxIsReadOnly    = errors.New("any-store: tx is read-only")
+	ErrTxOtherInstance = errors.New("any-store: tx is from an other db instance")
 )
 
 func replaceNoRowsErr(err, replaceTo error) error {

@@ -66,3 +66,7 @@ func (s CollectionSql) WithColl(sql string) string {
 func (s CollectionSql) With2Coll(sql, name string) string {
 	return strings.ReplaceAll(s.WithColl(sql), "%2coll", name)
 }
+
+func (s CollectionSql) Index(indexName string) IndexSql {
+	return IndexSql{CollectionSql: s, IndexName: indexName}
+}

@@ -220,3 +220,30 @@ func TestCollection_DeleteOne(t *testing.T) {
 		assert.Equal(t, 0, count)
 	})
 }
+
+func TestCollection_EnsureIndex(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, `{"id":1, "doc":"a"}`, `{"id":2, "doc":"b"}`))
+	t.Run("err exists", func(t *testing.T) {
+		err = coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"name"}}, IndexInfo{Fields: []string{"name"}})
+		assert.ErrorIs(t, err, ErrIndexExists)
+	})
+	t.Run("success", func(t *testing.T) {
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"doc"}}))
+		idxs := coll.GetIndexes()
+		require.Len(t, idxs, 1)
+		assert.Equal(t, "doc", idxs[0].Info().Name)
+	})
+}
+
+func TestCollection_DropIndex(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.DropIndex(ctx, "a"))
+	assert.Len(t, coll.GetIndexes(), 0)
+	assert.ErrorIs(t, coll.DropIndex(ctx, "a"), ErrIndexNotFound)
+}

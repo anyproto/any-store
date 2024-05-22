@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -37,7 +38,7 @@ type Collection interface {
 
 	EnsureIndex(ctx context.Context, info ...IndexInfo) (err error)
 	DropIndex(ctx context.Context, indexName string) (err error)
-	GetIndexes(ctx context.Context) (indexes []Index, err error)
+	GetIndexes() (indexes []Index)
 
 	Rename(ctx context.Context, newName string) (err error)
 	Drop(ctx context.Context) (err error)
@@ -74,6 +75,7 @@ type collection struct {
 
 	queries struct {
 		findId,
+		findAll,
 		count string
 	}
 
@@ -121,6 +123,7 @@ func (c *collection) init(ctx context.Context) error {
 func (c *collection) makeQueries() {
 	c.queries.findId = fmt.Sprintf("SELECT data FROM '%s' WHERE id = :id", c.tableName)
 	c.queries.count = fmt.Sprintf("SELECT COUNT(*) FROM '%s'", c.tableName)
+	c.queries.findAll = fmt.Sprintf("SELECT data FROM '%s'", c.tableName)
 }
 
 func (c *collection) checkStmts(ctx context.Context, cn conn.Conn) (err error) {
@@ -378,18 +381,123 @@ func (c *collection) Count(ctx context.Context) (count int, err error) {
 }
 
 func (c *collection) EnsureIndex(ctx context.Context, info ...IndexInfo) (err error) {
-	//TODO implement me
-	panic("implement me")
+	buf := c.db.syncPool.GetDocBuf()
+	defer c.db.syncPool.ReleaseDocBuf(buf)
+
+	return c.db.doWriteTx(ctx, func(cn conn.Conn) (txErr error) {
+		if txErr = c.checkStmts(ctx, cn); txErr != nil {
+			return
+		}
+		var (
+			idx        *index
+			newIndexes []*index
+		)
+		for _, idxInfo := range info {
+			if idx, txErr = c.createIndex(ctx, cn, idxInfo); txErr != nil {
+				return
+			}
+			newIndexes = append(newIndexes, idx)
+		}
+
+		rows, txErr := cn.QueryContext(ctx, c.queries.findAll, nil)
+		if txErr != nil {
+			return
+		}
+		defer func() {
+			_ = rows.Close()
+		}()
+
+		var dest = make([]driver.Value, 1)
+		for {
+			rErr := rows.Next(dest)
+			if rErr != nil {
+				if errors.Is(rErr, io.EOF) {
+					break
+				}
+				return rErr
+			}
+			var it item
+			if it, txErr = parseItem(buf.Parser, buf.Arena, dest[0], false); txErr != nil {
+				return
+			}
+			for _, idx = range newIndexes {
+				if txErr = idx.Insert(ctx, cn, it); txErr != nil {
+					return
+				}
+			}
+		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.indexes = append(c.indexes, newIndexes...)
+		return nil
+	})
+}
+
+func (c *collection) createIndex(ctx context.Context, cn conn.Conn, info IndexInfo) (idx *index, err error) {
+	if info.Name == "" {
+		info.Name = info.createName()
+	}
+	if _, err = c.db.stmt.registerIndex.ExecContext(ctx, []driver.NamedValue{
+		{Name: "indexName", Value: info.Name},
+		{Name: "collName", Value: c.name},
+		{Name: "fields", Value: stringArrayToJson(&fastjson.Arena{}, info.Fields)},
+		{Name: "sparse", Value: info.Sparse},
+		{Name: "unique", Value: info.Unique},
+	}); err != nil {
+		return nil, replaceUniqErr(err, ErrIndexExists)
+	}
+
+	if _, err = cn.ExecContext(ctx, c.sql.Index(info.Name).Create(info.Unique), nil); err != nil {
+		return
+	}
+	return newIndex(ctx, c, info)
 }
 
 func (c *collection) DropIndex(ctx context.Context, indexName string) (err error) {
-	//TODO implement me
-	panic("implement me")
+	return c.db.doWriteTx(ctx, func(cn conn.Conn) (txErr error) {
+		if txErr = c.checkStmts(ctx, cn); txErr != nil {
+			return
+		}
+
+		res, txErr := c.db.stmt.removeIndex.ExecContext(ctx, []driver.NamedValue{
+			{Name: "indexName", Value: indexName},
+			{Name: "collName", Value: c.name},
+		})
+		if txErr != nil {
+			return
+		}
+		affected, txErr := res.RowsAffected()
+		if txErr != nil {
+			return
+		}
+		if affected == 0 {
+			return ErrIndexNotFound
+		}
+
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		for _, idx := range c.indexes {
+			if idx.Info().Name == indexName {
+				if txErr = idx.Drop(ctx, cn); txErr != nil {
+					return nil
+				}
+			}
+		}
+		c.indexes = slices.DeleteFunc(c.indexes, func(i *index) bool {
+			return i.Info().Name == indexName
+		})
+		return
+	})
 }
 
-func (c *collection) GetIndexes(ctx context.Context) (indexes []Index, err error) {
-	//TODO implement me
-	panic("implement me")
+func (c *collection) GetIndexes() (indexes []Index) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	indexes = make([]Index, len(c.indexes))
+	for i, idx := range c.indexes {
+		indexes[i] = idx
+	}
+	return
 }
 
 func (c *collection) indexesHandleInsert(ctx context.Context, cn conn.Conn, it item) (err error) {
@@ -423,7 +531,7 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 			return
 		}
 		for _, idx := range c.indexes {
-			if err = idx.renameColl(ctx, cn, newName); err != nil {
+			if err = idx.RenameColl(ctx, cn, newName); err != nil {
 				return
 			}
 		}
@@ -447,7 +555,7 @@ func (c *collection) Drop(ctx context.Context) error {
 			return err
 		}
 		for _, idx := range c.indexes {
-			if err = idx.drop(ctx, cn); err != nil {
+			if err = idx.Drop(ctx, cn); err != nil {
 				return
 			}
 		}
