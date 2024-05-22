@@ -341,8 +341,23 @@ func (c *collection) UpsertOne(ctx context.Context, doc any) (id any, err error)
 }
 
 func (c *collection) DeleteOne(ctx context.Context, id any) (err error) {
-	//TODO implement me
-	panic("implement me")
+	buf := c.db.syncPool.GetDocBuf()
+	defer c.db.syncPool.ReleaseDocBuf(buf)
+
+	return c.db.doWriteTx(ctx, func(cn conn.Conn) (txErr error) {
+		if txErr = c.checkStmts(ctx, cn); txErr != nil {
+			return
+		}
+		idKey := encoding.AppendAnyValue(buf.SmallBuf[:0], id)
+		it, txErr := c.loadById(ctx, buf, idKey)
+		if txErr != nil {
+			return
+		}
+		if _, txErr = c.stmts.delete.ExecContext(ctx, []driver.NamedValue{{Name: "id", Value: idKey}}); txErr != nil {
+			return
+		}
+		return c.indexesHandleDelete(ctx, cn, it)
+	})
 }
 
 func (c *collection) Count(ctx context.Context) (count int, err error) {
