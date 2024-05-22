@@ -135,7 +135,7 @@ func (idx *index) Len(ctx context.Context) (count int, err error) {
 
 func (idx *index) Drop(ctx context.Context, cn conn.Conn) (err error) {
 	_, err = cn.ExecContext(ctx, idx.sql.Drop(), nil)
-	return nil
+	return
 }
 
 func (idx *index) RenameColl(ctx context.Context, cn conn.Conn, name string) (err error) {
@@ -181,7 +181,7 @@ func (idx *index) writeValues(d *fastjson.Value, i int) bool {
 				} else {
 					idx.keyBuf = k.AppendJSON(av)
 				}
-				if idx.isUnique(i, idx.keyBuf[len(k):]) {
+				if idx.isUnique(i, idx.keyBuf) {
 					if !idx.writeValues(d, i+1) {
 						return false
 					}

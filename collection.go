@@ -488,7 +488,7 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 		for _, idx := range c.indexes {
 			if idx.Info().Name == indexName {
 				if txErr = idx.Drop(ctx, cn); txErr != nil {
-					return nil
+					return
 				}
 			}
 		}
@@ -605,6 +605,9 @@ func (c *collection) Close() error {
 		return nil
 	}
 	c.closeStmts()
+	for _, idx := range c.indexes {
+		_ = idx.Close()
+	}
 	c.db.onCollectionClose(c.name)
 	return nil
 }

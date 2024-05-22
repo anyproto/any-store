@@ -40,7 +40,7 @@ func (s IndexSql) Create(unique bool) string {
 }
 
 func (s IndexSql) Drop() string {
-	return s.WithIndex(`DROP TABLE '%ns_%coll_%idx_idx`)
+	return s.WithIndex(`DROP TABLE '%ns_%coll_%idx_idx'`)
 }
 
 func (s IndexSql) RenameColl(newCollName string) string {
