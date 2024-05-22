@@ -55,7 +55,7 @@ func TestDb_OpenCollection(t *testing.T) {
 }
 
 func newFixture(t *testing.T, c ...*Config) *fixture {
-	tmpDir, err := os.MkdirTemp("", "")
+	tmpDir, err := os.MkdirTemp("", "any-store-*")
 	require.NoError(t, err)
 
 	var conf *Config
@@ -84,7 +84,7 @@ type fixture struct {
 func (fx *fixture) finish() {
 	require.NoError(fx.t, fx.Close())
 	if fx.tmpDir != "" {
-		if !true {
+		if true {
 			_ = os.RemoveAll(fx.tmpDir)
 		} else {
 			fx.t.Log(fx.tmpDir)

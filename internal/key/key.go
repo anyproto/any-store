@@ -23,6 +23,10 @@ func (k Key) AppendJSON(v *fastjson.Value) Key {
 	return encoding.AppendJSONValue(k, v)
 }
 
+func (k Key) AppendInvertedJSON(v *fastjson.Value) Key {
+	return encoding.AppendInvertedJSON(k, v)
+}
+
 func (k Key) ReadJSONValue(p *fastjson.Parser, a *fastjson.Arena, f func(v *fastjson.Value) error) (err error) {
 	var start int
 	var v *fastjson.Value

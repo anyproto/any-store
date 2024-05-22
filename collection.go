@@ -142,6 +142,11 @@ func (c *collection) checkStmts(ctx context.Context, cn conn.Conn) (err error) {
 	if c.stmts.findId, err = c.sql.FindIdStmt(ctx, cn); err != nil {
 		return
 	}
+	for _, idx := range c.indexes {
+		if err = idx.checkStmts(ctx, cn); err != nil {
+			return err
+		}
+	}
 	return
 }
 
@@ -250,7 +255,7 @@ func (c *collection) insertItem(ctx context.Context, cn conn.Conn, buf *syncpool
 	}); err != nil {
 		return nil, replaceUniqErr(err, ErrDocExists)
 	}
-	if err = c.indexesHandleInsert(ctx, cn, it); err != nil {
+	if err = c.indexesHandleInsert(ctx, id, it); err != nil {
 		return nil, err
 	}
 	return
@@ -269,11 +274,11 @@ func (c *collection) UpdateOne(ctx context.Context, doc any) (err error) {
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
-		return c.update(ctx, cn, it)
+		return c.update(ctx, it)
 	})
 }
 
-func (c *collection) update(ctx context.Context, cn conn.Conn, it item) (err error) {
+func (c *collection) update(ctx context.Context, it item) (err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
@@ -289,7 +294,7 @@ func (c *collection) update(ctx context.Context, cn conn.Conn, it item) (err err
 		return
 	}
 
-	return c.indexesHandleUpdate(ctx, cn, prevIt, it)
+	return c.indexesHandleUpdate(ctx, idKey, prevIt, it)
 }
 
 func (c *collection) loadById(ctx context.Context, buf *syncpool.DocBuffer, id key.Key) (it item, err error) {
@@ -326,7 +331,7 @@ func (c *collection) UpsertOne(ctx context.Context, doc any) (id any, err error)
 		}
 		_, insErr := c.insertItem(ctx, cn, buf, it)
 		if errors.Is(insErr, ErrDocExists) {
-			return c.update(ctx, cn, it)
+			return c.update(ctx, it)
 		}
 		return insErr
 	})
@@ -359,7 +364,7 @@ func (c *collection) DeleteOne(ctx context.Context, id any) (err error) {
 		if _, txErr = c.stmts.delete.ExecContext(ctx, []driver.NamedValue{{Name: "id", Value: idKey}}); txErr != nil {
 			return
 		}
-		return c.indexesHandleDelete(ctx, cn, it)
+		return c.indexesHandleDelete(ctx, idKey, it)
 	})
 }
 
@@ -420,8 +425,12 @@ func (c *collection) EnsureIndex(ctx context.Context, info ...IndexInfo) (err er
 			if it, txErr = parseItem(buf.Parser, buf.Arena, dest[0], false); txErr != nil {
 				return
 			}
+			id := it.appendId(buf.SmallBuf[:0])
 			for _, idx = range newIndexes {
-				if txErr = idx.Insert(ctx, cn, it); txErr != nil {
+				if txErr = idx.checkStmts(ctx, cn); txErr != nil {
+					return
+				}
+				if txErr = idx.Insert(ctx, id, it); txErr != nil {
 					return
 				}
 			}
@@ -500,20 +509,20 @@ func (c *collection) GetIndexes() (indexes []Index) {
 	return
 }
 
-func (c *collection) indexesHandleInsert(ctx context.Context, cn conn.Conn, it item) (err error) {
+func (c *collection) indexesHandleInsert(ctx context.Context, id key.Key, it item) (err error) {
 	for _, idx := range c.indexes {
-		if err = idx.Insert(ctx, cn, it); err != nil {
+		if err = idx.Insert(ctx, id, it); err != nil {
 			return
 		}
 	}
 	return
 }
 
-func (c *collection) indexesHandleUpdate(ctx context.Context, cn conn.Conn, prevIt, newIt item) (err error) {
+func (c *collection) indexesHandleUpdate(ctx context.Context, id key.Key, prevIt, newIt item) (err error) {
 	return
 }
 
-func (c *collection) indexesHandleDelete(ctx context.Context, cn conn.Conn, prevIt item) (err error) {
+func (c *collection) indexesHandleDelete(ctx context.Context, id key.Key, prevIt item) (err error) {
 	return
 }
 

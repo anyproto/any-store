@@ -236,6 +236,9 @@ func TestCollection_EnsureIndex(t *testing.T) {
 		idxs := coll.GetIndexes()
 		require.Len(t, idxs, 1)
 		assert.Equal(t, "doc", idxs[0].Info().Name)
+		count, err := idxs[0].Len(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 2, count)
 	})
 }
 

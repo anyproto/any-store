@@ -1,9 +1,11 @@
 package anystore
 
 import (
+	"bytes"
 	"context"
 	"database/sql/driver"
 	"fmt"
+	"slices"
 	"strings"
 	"sync/atomic"
 
@@ -46,6 +48,7 @@ type index struct {
 	fieldPaths [][]string
 	reverse    []bool
 
+	idBuf           key.Key
 	keyBuf          key.Key
 	keysBuf         []key.Key
 	keysBufPrev     []key.Key
@@ -145,8 +148,97 @@ func (idx *index) RenameColl(ctx context.Context, cn conn.Conn, name string) (er
 	return nil
 }
 
-func (idx *index) Insert(ctx context.Context, cn conn.Conn, it item) error {
-	return nil
+func (idx *index) Insert(ctx context.Context, id key.Key, it item) error {
+	idx.fillKeysBuf(it)
+	return idx.insertBuf(ctx, id)
+}
+
+func (idx *index) writeKey() {
+	nl := len(idx.keysBuf) + 1
+	idx.keysBuf = slices.Grow(idx.keysBuf, nl)[:nl]
+	idx.keysBuf[nl-1] = idx.keyBuf.CopyTo(idx.keysBuf[nl-1][:0])
+}
+
+func (idx *index) writeValues(d *fastjson.Value, i int) bool {
+	if i == len(idx.fieldPaths) {
+		idx.writeKey()
+		return true
+	}
+	v := d.Get(idx.fieldPaths[i]...)
+	if v == nil && idx.info.Sparse {
+		return false
+	}
+	reverse := idx.reverse[i]
+
+	k := idx.keyBuf[:0]
+	if v != nil && v.Type() == fastjson.TypeArray {
+		arr, _ := v.Array()
+		if len(arr) != 0 {
+			idx.uniqBuf[i] = idx.uniqBuf[i][:0]
+			for _, av := range arr {
+				if reverse {
+					idx.keyBuf = k.AppendInvertedJSON(av)
+				} else {
+					idx.keyBuf = k.AppendJSON(av)
+				}
+				if idx.isUnique(i, idx.keyBuf[len(k):]) {
+					if !idx.writeValues(d, i+1) {
+						return false
+					}
+				}
+			}
+			return true
+		}
+	}
+	if reverse {
+		idx.keyBuf = k.AppendInvertedJSON(v)
+	} else {
+		idx.keyBuf = k.AppendJSON(v)
+	}
+	return idx.writeValues(d, i+1)
+}
+
+func (idx *index) fillKeysBuf(it item) {
+	idx.keysBuf = idx.keysBuf[:0]
+	idx.resetUnique()
+	if !idx.writeValues(it.Value(), 0) {
+		// we got false in case sparse index and nil value - reset the buffer
+		idx.keysBuf = idx.keysBuf[:0]
+	}
+}
+
+func (idx *index) resetUnique() {
+	for i := range idx.uniqBuf {
+		idx.uniqBuf[i] = idx.uniqBuf[i][:0]
+	}
+}
+
+func (idx *index) isUnique(i int, k key.Key) bool {
+	for _, ek := range idx.uniqBuf[i] {
+		if bytes.Equal(k, ek) {
+			return false
+		}
+	}
+	nl := len(idx.uniqBuf[i]) + 1
+	idx.uniqBuf[i] = slices.Grow(idx.uniqBuf[i], nl)[:nl]
+	idx.uniqBuf[i][nl-1] = k.CopyTo(idx.uniqBuf[i][nl-1][:0])
+	return true
+}
+
+func (idx *index) insertBuf(ctx context.Context, id []byte) (err error) {
+	for _, k := range idx.keysBuf {
+		_, err = idx.stmts.insert.ExecContext(ctx, idx.driverValues(id, k))
+		if err != nil {
+			return
+		}
+	}
+	return
+}
+
+func (idx *index) driverValues(docId, val []byte) []driver.NamedValue {
+	idx.driverValuesBuf[0].Value = docId
+	idx.driverValuesBuf[1].Value = val
+	return idx.driverValuesBuf
 }
 
 func (idx *index) closeStmts() {
