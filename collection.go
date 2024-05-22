@@ -263,6 +263,9 @@ func (c *collection) UpdateOne(ctx context.Context, doc any) (err error) {
 	}
 
 	return c.db.doWriteTx(ctx, func(cn conn.Conn) (txErr error) {
+		if txErr = c.checkStmts(ctx, cn); txErr != nil {
+			return
+		}
 		return c.update(ctx, cn, it)
 	})
 }
@@ -270,10 +273,6 @@ func (c *collection) UpdateOne(ctx context.Context, doc any) (err error) {
 func (c *collection) update(ctx context.Context, cn conn.Conn, it item) (err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
-
-	if err = c.checkStmts(ctx, cn); err != nil {
-		return
-	}
 
 	idKey := it.appendId(buf.SmallBuf[:0])
 	prevIt, err := c.loadById(ctx, buf, idKey)
@@ -310,8 +309,35 @@ func (c *collection) loadById(ctx context.Context, buf *syncpool.DocBuffer, id k
 }
 
 func (c *collection) UpsertOne(ctx context.Context, doc any) (id any, err error) {
-	//TODO implement me
-	panic("implement me")
+	buf := c.db.syncPool.GetDocBuf()
+	defer c.db.syncPool.ReleaseDocBuf(buf)
+
+	var it item
+	if it, err = parseItem(buf.Parser, buf.Arena, doc, true); err != nil {
+		return
+	}
+
+	err = c.db.doWriteTx(ctx, func(cn conn.Conn) (txErr error) {
+		if txErr = c.checkStmts(ctx, cn); txErr != nil {
+			return
+		}
+		_, insErr := c.insertItem(ctx, cn, buf, it)
+		if errors.Is(insErr, ErrDocExists) {
+			return c.update(ctx, cn, it)
+		}
+		return insErr
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if err = key.Key(it.appendId(buf.SmallBuf[:0])).ReadAnyValue(func(v any) error {
+		id = v
+		return nil
+	}); err != nil {
+		return
+	}
+	return id, nil
 }
 
 func (c *collection) DeleteOne(ctx context.Context, id any) (err error) {

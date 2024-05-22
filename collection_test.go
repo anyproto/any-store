@@ -175,3 +175,31 @@ func TestCollection_UpdateOne(t *testing.T) {
 		assert.ErrorIs(t, err, ErrDocWithoutId)
 	})
 }
+
+func TestCollection_UpsertOne(t *testing.T) {
+	t.Run("insert", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		t.Run("gen id", func(t *testing.T) {
+			id, err := coll.UpsertOne(ctx, `{"a":"b"}`)
+			require.NoError(t, err)
+			assert.NotEmpty(t, id)
+		})
+		t.Run("with id", func(t *testing.T) {
+			id, err := coll.UpsertOne(ctx, `{"id":999, "a":"b"}`)
+			require.NoError(t, err)
+			assert.Equal(t, float64(999), id)
+		})
+		t.Run("update", func(t *testing.T) {
+			_, err = coll.UpsertOne(ctx, `{"id":"upd","val":1}`)
+			require.NoError(t, err)
+			newDoc := `{"id":"upd","val":2}`
+			_, err = coll.UpsertOne(ctx, newDoc)
+			require.NoError(t, err)
+			doc, err := coll.FindId(ctx, "upd")
+			require.NoError(t, err)
+			assert.Equal(t, newDoc, doc.Value().String())
+		})
+	})
+}
