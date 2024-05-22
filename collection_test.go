@@ -2,6 +2,7 @@ package anystore
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -135,5 +136,42 @@ func TestCollection_FindId(t *testing.T) {
 		doc, err := coll.FindId(ctx, 1)
 		require.NoError(t, err)
 		assert.Equal(t, docJson, doc.Value().String())
+	})
+}
+
+func TestCollection_UpdateOne(t *testing.T) {
+	t.Run("not found", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+
+		err = coll.UpdateOne(ctx, `{"id":"notFound", "d":2}`)
+		assert.ErrorIs(t, err, ErrDocNotFound)
+	})
+
+	t.Run("success", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+
+		id, err := coll.InsertOne(ctx, `{"key":"value"}`)
+		require.NoError(t, err)
+
+		newDoc := fmt.Sprintf(`{"id":"%s","key":"value2"}`, id)
+
+		err = coll.UpdateOne(ctx, newDoc)
+		require.NoError(t, err)
+
+		doc, err := coll.FindId(ctx, id)
+		require.NoError(t, err)
+		assert.Equal(t, newDoc, doc.Value().String())
+	})
+
+	t.Run("doc without id", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		err = coll.UpdateOne(ctx, `{"a":"b"}`)
+		assert.ErrorIs(t, err, ErrDocWithoutId)
 	})
 }

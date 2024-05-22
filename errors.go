@@ -8,8 +8,9 @@ import (
 )
 
 var (
-	ErrDocExists   = DocError{error: errors.New("any-store: doc exists")}
-	ErrDocNotFound = errors.New("any-store: doc not found")
+	ErrDocExists    = errors.New("any-store: doc exists")
+	ErrDocNotFound  = errors.New("any-store: doc not found")
+	ErrDocWithoutId = errors.New("any-store: doc without id")
 
 	ErrCollectionExists   = errors.New("any-store: collection exists")
 	ErrCollectionNotFound = errors.New("any-store: collection not found")
@@ -17,11 +18,6 @@ var (
 	ErrTxIsReadOnly    = errors.New("tx is read-only")
 	ErrTxOtherInstance = errors.New("tx is from an other db instance")
 )
-
-type DocError struct {
-	error
-	DocId string
-}
 
 func replaceNoRowsErr(err, replaceTo error) error {
 	if err == nil {

@@ -2,7 +2,6 @@ package anystore
 
 import (
 	"encoding/json"
-	"fmt"
 
 	"github.com/valyala/fastjson"
 
@@ -27,7 +26,7 @@ func newItem(val *fastjson.Value, a *fastjson.Arena, autoId bool) (item, error) 
 			id := objectid.NewObjectID().Hex()
 			objVal.Set("id", a.NewString(id))
 		} else {
-			return item{}, fmt.Errorf("document without id")
+			return item{}, ErrDocWithoutId
 		}
 	}
 	it := item{
