@@ -401,6 +401,9 @@ func (c *collection) EnsureIndex(ctx context.Context, info ...IndexInfo) (err er
 			if idx, txErr = c.createIndex(ctx, cn, idxInfo); txErr != nil {
 				return
 			}
+			if txErr = idx.checkStmts(ctx, cn); txErr != nil {
+				return
+			}
 			newIndexes = append(newIndexes, idx)
 		}
 
@@ -427,9 +430,6 @@ func (c *collection) EnsureIndex(ctx context.Context, info ...IndexInfo) (err er
 			}
 			id := it.appendId(buf.SmallBuf[:0])
 			for _, idx = range newIndexes {
-				if txErr = idx.checkStmts(ctx, cn); txErr != nil {
-					return
-				}
 				if txErr = idx.Insert(ctx, id, it); txErr != nil {
 					return
 				}
@@ -519,10 +519,20 @@ func (c *collection) indexesHandleInsert(ctx context.Context, id key.Key, it ite
 }
 
 func (c *collection) indexesHandleUpdate(ctx context.Context, id key.Key, prevIt, newIt item) (err error) {
+	for _, idx := range c.indexes {
+		if err = idx.Update(ctx, id, prevIt, newIt); err != nil {
+			return
+		}
+	}
 	return
 }
 
 func (c *collection) indexesHandleDelete(ctx context.Context, id key.Key, prevIt item) (err error) {
+	for _, idx := range c.indexes {
+		if err = idx.Delete(ctx, id, prevIt); err != nil {
+			return
+		}
+	}
 	return
 }
 

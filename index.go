@@ -57,8 +57,7 @@ type index struct {
 
 	stmts struct {
 		insert,
-		delete,
-		update conn.Stmt
+		delete conn.Stmt
 	}
 	queries struct {
 		count string
@@ -102,9 +101,6 @@ func (idx *index) makeQueries() {
 func (idx *index) checkStmts(ctx context.Context, cn conn.Conn) (err error) {
 	if idx.stmtsReady.CompareAndSwap(false, true) {
 		if idx.stmts.insert, err = idx.sql.InsertStmt(ctx, cn); err != nil {
-			return err
-		}
-		if idx.stmts.update, err = idx.sql.UpdateStmt(ctx, cn); err != nil {
 			return err
 		}
 		if idx.stmts.delete, err = idx.sql.DeleteStmt(ctx, cn); err != nil {
@@ -151,6 +147,40 @@ func (idx *index) RenameColl(ctx context.Context, cn conn.Conn, name string) (er
 func (idx *index) Insert(ctx context.Context, id key.Key, it item) error {
 	idx.fillKeysBuf(it)
 	return idx.insertBuf(ctx, id)
+}
+
+func (idx *index) Update(ctx context.Context, id key.Key, prevIt, newIt item) (err error) {
+	// calc previous index keys
+	idx.fillKeysBuf(prevIt)
+
+	// copy prev keys to second buffer
+	idx.keysBufPrev = slices.Grow(idx.keysBufPrev, len(idx.keysBuf))[:len(idx.keysBuf)]
+	for i, k := range idx.keysBuf {
+		idx.keysBufPrev[i] = k.CopyTo(idx.keysBufPrev[i][:0])
+	}
+
+	// calc new index keys
+	idx.fillKeysBuf(newIt)
+
+	// delete equal keys from both bufs
+	idx.keysBuf = slices.DeleteFunc(idx.keysBuf, func(k key.Key) bool {
+		for i, pk := range idx.keysBufPrev {
+			if bytes.Equal(k, pk) {
+				idx.keysBufPrev = slices.Delete(idx.keysBufPrev, i, i+1)
+				return true
+			}
+		}
+		return false
+	})
+	if err = idx.deleteBuf(ctx, id, idx.keysBufPrev); err != nil {
+		return err
+	}
+	return idx.insertBuf(ctx, id)
+}
+
+func (idx *index) Delete(ctx context.Context, id key.Key, prevIt item) error {
+	idx.fillKeysBuf(prevIt)
+	return idx.deleteBuf(ctx, id, idx.keysBuf)
 }
 
 func (idx *index) writeKey() {
@@ -230,6 +260,16 @@ func (idx *index) insertBuf(ctx context.Context, id []byte) (err error) {
 	for _, k := range idx.keysBuf {
 		_, err = idx.stmts.insert.ExecContext(ctx, idx.driverValues(id, k))
 		if err != nil {
+			return replaceUniqErr(err, ErrUniqueConstraint)
+		}
+	}
+	return
+}
+
+func (idx *index) deleteBuf(ctx context.Context, id []byte, buf []key.Key) (err error) {
+	for _, k := range buf {
+		_, err = idx.stmts.delete.ExecContext(ctx, idx.driverValues(id, k))
+		if err != nil {
 			return
 		}
 	}
@@ -245,7 +285,7 @@ func (idx *index) driverValues(docId, val []byte) []driver.NamedValue {
 func (idx *index) closeStmts() {
 	if idx.stmtsReady.CompareAndSwap(true, false) {
 		for _, stmt := range []conn.Stmt{
-			idx.stmts.insert, idx.stmts.update, idx.stmts.delete,
+			idx.stmts.insert, idx.stmts.delete,
 		} {
 			_ = stmt.Close()
 		}

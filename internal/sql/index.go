@@ -51,10 +51,6 @@ func (s IndexSql) InsertStmt(ctx context.Context, cn conn.Conn) (conn.Stmt, erro
 	return s.Prepare(ctx, cn, s.WithIndex(`INSERT INTO '%ns_%coll_%idx_idx' (docId, val) VALUES (:docId, :val)`))
 }
 
-func (s IndexSql) UpdateStmt(ctx context.Context, cn conn.Conn) (conn.Stmt, error) {
-	return s.Prepare(ctx, cn, s.WithIndex(`UPDATE '%ns_%coll_%idx_idx' SET val = :val WHERE docId = :docId`))
-}
-
 func (s IndexSql) DeleteStmt(ctx context.Context, cn conn.Conn) (conn.Stmt, error) {
 	return s.Prepare(ctx, cn, s.WithIndex(`DELETE FROM '%ns_%coll_%idx_idx' WHERE docId = :docId`))
 }

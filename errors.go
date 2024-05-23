@@ -20,6 +20,8 @@ var (
 
 	ErrTxIsReadOnly    = errors.New("any-store: tx is read-only")
 	ErrTxOtherInstance = errors.New("any-store: tx is from an other db instance")
+
+	ErrUniqueConstraint = errors.New("any-store: unique constraint")
 )
 
 func replaceNoRowsErr(err, replaceTo error) error {

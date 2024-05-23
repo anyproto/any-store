@@ -21,6 +21,12 @@ func assertIdxKeyBuf(t *testing.T, idx *index, keyCase fillKeysCase) {
 	}
 }
 
+func assertIndexLen(t testing.TB, idx Index, expected int) bool {
+	count, err := idx.Len(ctx)
+	require.NoError(t, err)
+	return assert.Equal(t, expected, count)
+}
+
 type fillKeysCaseIndex struct {
 	name  string
 	info  IndexInfo
@@ -104,6 +110,101 @@ func TestIndex_fillKeysBuf(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIndex_Insert(t *testing.T) {
+	fx := newFixture(t)
+	t.Run("uniq", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "test_uniq")
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, coll.Close())
+		}()
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true}))
+
+		require.NoError(t, coll.Insert(ctx, `{"a":1}`, `{"a":2}`, `{"a":3}`))
+		assert.ErrorIs(t, coll.Insert(ctx, `{"a":2}`), ErrUniqueConstraint)
+		assertCollCount(t, coll, 3)
+		assertIndexLen(t, coll.GetIndexes()[0], 3)
+	})
+	t.Run("sparse", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "test_sparse")
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, coll.Close())
+		}()
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Sparse: true}))
+
+		require.NoError(t, coll.Insert(ctx, `{"a":1}`, `{"a":2}`, `{"b":3}`))
+		assertCollCount(t, coll, 3)
+		assertIndexLen(t, coll.GetIndexes()[0], 2)
+	})
+	t.Run("simple", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "test_simple")
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, coll.Close())
+		}()
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+		require.NoError(t, coll.Insert(ctx, `{"a":1}`, `{"a":1}`, `{"b":3}`))
+		assertCollCount(t, coll, 3)
+		assertIndexLen(t, coll.GetIndexes()[0], 3)
+	})
+}
+
+func TestIndex_Update(t *testing.T) {
+	fx := newFixture(t)
+	t.Run("uniq", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "test_uniq")
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, coll.Close())
+		}()
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true}))
+
+		require.NoError(t, coll.Insert(ctx, `{"id":1, "a":1}`, `{"id":2, "a":2}`, `{"id":3,"a":3}`))
+		require.NoError(t, coll.UpdateOne(ctx, `{"id":2,"a":4}`))
+		assert.ErrorIs(t, coll.UpdateOne(ctx, `{"id":2, "a":1}`), ErrUniqueConstraint)
+		res, err := coll.FindId(ctx, 2)
+		require.NoError(t, err)
+		assert.Equal(t, `{"id":2,"a":4}`, res.Value().String())
+	})
+	t.Run("sparse", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "test_sparse")
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, coll.Close())
+		}()
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Sparse: true}))
+
+		require.NoError(t, coll.Insert(ctx, `{"id":1, "a":1}`, `{"id":2, "a":2}`, `{"id":3, "b":3}`))
+		assertIndexLen(t, coll.GetIndexes()[0], 2)
+		require.NoError(t, coll.UpdateOne(ctx, `{"id":1, "b":1}`))
+		assertIndexLen(t, coll.GetIndexes()[0], 1)
+		require.NoError(t, coll.UpdateOne(ctx, `{"id":3, "a":1}`))
+		assertIndexLen(t, coll.GetIndexes()[0], 2)
+	})
+}
+
+func TestIndex_Delete(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test_simple")
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, coll.Close())
+	}()
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.Insert(ctx, `{"id":1, "a":1}`, `{"id":2, "a":1}`, `{"id":3, "b":3}`))
+	assertIndexLen(t, coll.GetIndexes()[0], 3)
+
+	require.NoError(t, coll.DeleteOne(ctx, 1))
+	assertIndexLen(t, coll.GetIndexes()[0], 2)
+
+	require.NoError(t, coll.DeleteOne(ctx, 2))
+	assertIndexLen(t, coll.GetIndexes()[0], 1)
+
+	require.NoError(t, coll.DeleteOne(ctx, 3))
+	assertIndexLen(t, coll.GetIndexes()[0], 0)
 }
 
 func Benchmark_fillKeysBuf(b *testing.B) {

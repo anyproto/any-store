@@ -9,6 +9,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func assertCollCount(t testing.TB, c Collection, expected int) bool {
+	count, err := c.Count(ctx)
+	require.NoError(t, err)
+	return assert.Equal(t, expected, count)
+}
+
 func TestCollection_Drop(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
@@ -72,9 +78,7 @@ func TestCollection_Insert(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
 		require.NoError(t, coll.Insert(ctx, `{"id":1, "doc":"a"}`, `{"id":2, "doc":"b"}`))
-		count, err := coll.Count(ctx)
-		require.NoError(t, err)
-		assert.Equal(t, 2, count)
+		assertCollCount(t, coll, 2)
 	})
 	t.Run("tx success", func(t *testing.T) {
 		fx := newFixture(t)
@@ -92,16 +96,12 @@ func TestCollection_Insert(t *testing.T) {
 		assert.Equal(t, 2, count)
 
 		// expect count=0 outside tx
-		count, err = coll.Count(ctx)
-		require.NoError(t, err)
-		assert.Equal(t, 0, count)
+		assertCollCount(t, coll, 0)
 
 		require.NoError(t, tx.Commit())
 
 		// expect count=2 after commit
-		count, err = coll.Count(ctx)
-		require.NoError(t, err)
-		assert.Equal(t, 2, count)
+		assertCollCount(t, coll, 2)
 	})
 	t.Run("err doc exists", func(t *testing.T) {
 		fx := newFixture(t)
@@ -113,9 +113,7 @@ func TestCollection_Insert(t *testing.T) {
 		err = coll.Insert(ctx, `{"id":3, "doc":"c"}`, `{"id":2, "doc":"b"}`)
 		assert.ErrorIs(t, err, ErrDocExists)
 
-		count, err := coll.Count(ctx)
-		require.NoError(t, err)
-		assert.Equal(t, 2, count)
+		assertCollCount(t, coll, 2)
 	})
 }
 func TestCollection_FindId(t *testing.T) {
@@ -216,9 +214,7 @@ func TestCollection_DeleteOne(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		require.NoError(t, coll.Insert(ctx, `{"id":"toDel", "a":2}`))
 		require.NoError(t, coll.DeleteOne(ctx, "toDel"))
-		count, err := coll.Count(ctx)
-		require.NoError(t, err)
-		assert.Equal(t, 0, count)
+		assertCollCount(t, coll, 0)
 	})
 }
 
