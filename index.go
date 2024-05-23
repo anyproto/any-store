@@ -85,6 +85,7 @@ func (idx *index) init(ctx context.Context) (err error) {
 		idx.fieldPaths = append(idx.fieldPaths, fields)
 		idx.reverse = append(idx.reverse, reverse)
 	}
+	idx.uniqBuf = make([][]key.Key, len(idx.fieldPaths))
 	idx.driverValuesBuf = []driver.NamedValue{
 		{Name: "docId"},
 		{Name: "val"},
