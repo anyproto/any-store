@@ -48,7 +48,6 @@ type index struct {
 	fieldPaths [][]string
 	reverse    []bool
 
-	idBuf           key.Key
 	keyBuf          key.Key
 	keysBuf         []key.Key
 	keysBufPrev     []key.Key
@@ -166,12 +165,12 @@ func (idx *index) writeValues(d *fastjson.Value, i int) bool {
 		return true
 	}
 	v := d.Get(idx.fieldPaths[i]...)
-	if v == nil && idx.info.Sparse {
+	if idx.info.Sparse && (v == nil || v.Type() == fastjson.TypeNull) {
 		return false
 	}
 	reverse := idx.reverse[i]
 
-	k := idx.keyBuf[:0]
+	k := idx.keyBuf
 	if v != nil && v.Type() == fastjson.TypeArray {
 		arr, _ := v.Array()
 		if len(arr) != 0 {
@@ -201,6 +200,7 @@ func (idx *index) writeValues(d *fastjson.Value, i int) bool {
 
 func (idx *index) fillKeysBuf(it item) {
 	idx.keysBuf = idx.keysBuf[:0]
+	idx.keyBuf = idx.keyBuf[:0]
 	idx.resetUnique()
 	if !idx.writeValues(it.Value(), 0) {
 		// we got false in case sparse index and nil value - reset the buffer

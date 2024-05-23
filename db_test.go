@@ -54,7 +54,7 @@ func TestDb_OpenCollection(t *testing.T) {
 	})
 }
 
-func newFixture(t *testing.T, c ...*Config) *fixture {
+func newFixture(t testing.TB, c ...*Config) *fixture {
 	tmpDir, err := os.MkdirTemp("", "any-store-*")
 	require.NoError(t, err)
 
@@ -78,7 +78,7 @@ func newFixture(t *testing.T, c ...*Config) *fixture {
 type fixture struct {
 	DB
 	tmpDir string
-	t      *testing.T
+	t      testing.TB
 }
 
 func (fx *fixture) finish() {
