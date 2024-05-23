@@ -186,7 +186,7 @@ func TestParseCondition(t *testing.T) {
 func BenchmarkParseCondition(b *testing.B) {
 	bench := func(b *testing.B, query string) {
 		jq := fastjson.MustParse(query)
-		b.ReportAllocs()
+		b.ResetTimer()
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			_, _ = ParseCondition(jq)
