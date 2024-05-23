@@ -256,10 +256,13 @@ func (db *db) getWriteTx(ctx context.Context) (tx WriteTx, err error) {
 
 	var ok bool
 	if tx, ok = ctxTx.(WriteTx); ok {
+		if tx.Done() {
+			return nil, ErrTxIsUsed
+		}
 		if tx.instanceId() != db.instanceId {
 			return nil, ErrTxOtherInstance
 		}
-		return noOpTx{ReadTx: tx}, nil
+		return newSavepointTx(ctx, tx)
 	}
 	return nil, ErrTxIsReadOnly
 }
@@ -283,6 +286,9 @@ func (db *db) getReadTx(ctx context.Context) (tx ReadTx, err error) {
 
 	var ok bool
 	if tx, ok = ctxTx.(ReadTx); ok {
+		if tx.Done() {
+			return nil, ErrTxIsUsed
+		}
 		if tx.instanceId() != db.instanceId {
 			return nil, ErrTxOtherInstance
 		}

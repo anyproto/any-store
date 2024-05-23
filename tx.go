@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/anyproto/any-store/internal/conn"
+	"github.com/anyproto/any-store/internal/objectid"
 )
 
 type WriteTx interface {
@@ -16,6 +17,7 @@ type WriteTx interface {
 type ReadTx interface {
 	Context() context.Context
 	Commit() error
+	Done() bool
 	conn() conn.Conn
 	instanceId() string
 }
@@ -45,11 +47,15 @@ func (r *readTx) Context() context.Context {
 }
 
 func (r *readTx) Commit() error {
-	if !r.done.Swap(true) {
+	if r.done.CompareAndSwap(false, true) {
 		defer r.db.cm.ReleaseRead(r.con)
 		return r.commonTx.tx.Commit()
 	}
 	return nil
+}
+
+func (r *readTx) Done() bool {
+	return r.done.Load()
 }
 
 type writeTx struct {
@@ -61,7 +67,7 @@ func (w *writeTx) Context() context.Context {
 }
 
 func (w *writeTx) Rollback() error {
-	if !w.done.Swap(true) {
+	if w.done.CompareAndSwap(false, true) {
 		defer w.db.cm.ReleaseWrite(w.con)
 		return w.commonTx.tx.Rollback()
 	}
@@ -69,11 +75,50 @@ func (w *writeTx) Rollback() error {
 }
 
 func (w *writeTx) Commit() error {
-	if !w.done.Swap(true) {
+	if w.done.CompareAndSwap(false, true) {
 		defer w.db.cm.ReleaseWrite(w.con)
 		return w.commonTx.tx.Commit()
 	}
 	return nil
+}
+
+func newSavepointTx(ctx context.Context, wrTx WriteTx) (WriteTx, error) {
+	tx := &savepointTx{
+		id:      objectid.NewObjectID().Hex(),
+		WriteTx: wrTx,
+	}
+	if _, err := tx.conn().ExecContext(ctx, "SAVEPOINT  '"+tx.id+"'", nil); err != nil {
+		return nil, err
+	}
+	return tx, nil
+}
+
+type savepointTx struct {
+	id string
+	WriteTx
+	done atomic.Bool
+}
+
+func (tx *savepointTx) Commit() error {
+	if tx.done.CompareAndSwap(false, true) {
+		if _, err := tx.conn().ExecContext(context.TODO(), "RELEASE SAVEPOINT '"+tx.id+"'", nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (tx *savepointTx) Rollback() error {
+	if tx.done.CompareAndSwap(false, true) {
+		if _, err := tx.conn().ExecContext(context.TODO(), "ROLLBACK TO SAVEPOINT  '"+tx.id+"'", nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (tx *savepointTx) Done() bool {
+	return tx.done.Load()
 }
 
 type noOpTx struct {

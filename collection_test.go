@@ -10,6 +10,10 @@ import (
 )
 
 func assertCollCount(t testing.TB, c Collection, expected int) bool {
+	return assertCollCountCtx(ctx, t, c, expected)
+}
+
+func assertCollCountCtx(ctx context.Context, t testing.TB, c Collection, expected int) bool {
 	count, err := c.Count(ctx)
 	require.NoError(t, err)
 	return assert.Equal(t, expected, count)

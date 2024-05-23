@@ -19,6 +19,7 @@ var (
 	ErrIndexNotFound = errors.New("any-store: index does not exist")
 
 	ErrTxIsReadOnly    = errors.New("any-store: tx is read-only")
+	ErrTxIsUsed        = errors.New("any-store: tx is been used")
 	ErrTxOtherInstance = errors.New("any-store: tx is from an other db instance")
 
 	ErrUniqueConstraint = errors.New("any-store: unique constraint")
