@@ -1,7 +1,8 @@
-package example
+package main
 
 import (
 	"context"
+	"fmt"
 
 	anystore "github.com/anyproto/any-store"
 )
@@ -19,13 +20,20 @@ func main() {
 		return
 	}
 
-	tx := db.WriteTx(ctx)
-
-	if err = coll.UpsertId(tx.Context(), "1", `{"k":"v"}`); err != nil {
+	tx, err := db.WriteTx(ctx)
+	if err != nil {
 		return
 	}
 
-	if err = tx.Commit(ctx); err != nil {
+	docId, err := coll.UpsertOne(tx.Context(), `{"k":"v"}`)
+	if err != nil {
 		return
 	}
+	fmt.Println(docId)
+
+	if err = tx.Commit(); err != nil {
+		return
+	}
+
+	_ = db.Close()
 }
