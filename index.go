@@ -45,6 +45,7 @@ type index struct {
 	sql  sql.IndexSql
 	info IndexInfo
 
+	fieldNames []string
 	fieldPaths [][]string
 	reverse    []bool
 
@@ -80,6 +81,7 @@ func (idx *index) init(ctx context.Context) (err error) {
 				return fmt.Errorf("invalid index field: '%s'", field)
 			}
 		}
+		idx.fieldNames = append(idx.fieldNames, strings.Join(fields, "."))
 		idx.fieldPaths = append(idx.fieldPaths, fields)
 		idx.reverse = append(idx.reverse, reverse)
 	}
