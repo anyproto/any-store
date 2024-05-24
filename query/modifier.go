@@ -2,6 +2,7 @@ package query
 
 import (
 	"fmt"
+	"strconv"
 
 	"github.com/valyala/fastjson"
 )
@@ -30,7 +31,6 @@ func (mRoot modifierRoot) Modify(a *fastjson.Arena, v *fastjson.Value) (result *
 type modifierSet struct {
 	fieldPath []string
 	val       *fastjson.Value
-	buf       []byte
 }
 
 func (m modifierSet) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
@@ -39,7 +39,15 @@ func (m modifierSet) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastj
 		field := prevField.Get(path)
 		if i == len(m.fieldPath)-1 {
 			modified = !equal(field, m.val)
-			prevField.Set(path, m.val)
+			if prevField.Type() == fastjson.TypeArray {
+				idx, err := strconv.Atoi(path)
+				if err != nil || idx < 0 {
+					return nil, false, fmt.Errorf("cannot create field '%s' in element %s", path, prevField.String())
+				}
+				prevField.SetArrayItem(idx, m.val)
+			} else {
+				prevField.Set(path, m.val)
+			}
 			return v, modified, nil
 		} else {
 			if field == nil {
@@ -49,14 +57,44 @@ func (m modifierSet) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastj
 				case fastjson.TypeObject:
 				case fastjson.TypeArray:
 				default:
-					return nil, false, fmt.Errorf("cannot create field '%s' in element %s", path, field.String())
+					return nil, false, fmt.Errorf("cannot create field '%s' in element %s", m.fieldPath[i+1], field.String())
 				}
 			}
-			prevField.Set(path, field)
+			if prevField.Type() == fastjson.TypeArray {
+				idx, err := strconv.Atoi(path)
+				if err != nil || idx < 0 {
+					return nil, false, fmt.Errorf("cannot create field '%s' in element %s", path, prevField.String())
+				}
+				prevField.SetArrayItem(idx, field)
+			} else {
+				prevField.Set(path, field)
+			}
 			prevField = field
 		}
 	}
 	return
+}
+
+type modifierUnset struct {
+	fieldPath []string
+}
+
+func (m modifierUnset) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
+	prevField := v
+	for i, path := range m.fieldPath {
+		if prevField == nil {
+			return v, false, nil
+		}
+		if i == len(m.fieldPath)-1 {
+			if prevField.Exists(path) {
+				prevField.Del(path)
+				modified = true
+			}
+		} else {
+			prevField = prevField.Get(path)
+		}
+	}
+	return v, modified, nil
 }
 
 func equal(v1, v2 *fastjson.Value) bool {
