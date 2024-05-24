@@ -191,8 +191,7 @@ func (c *collection) FindId(ctx context.Context, docId any) (doc Doc, err error)
 }
 
 func (c *collection) Query() Query {
-	//TODO implement me
-	panic("implement me")
+	return &collQuery{c: c}
 }
 
 func (c *collection) InsertOne(ctx context.Context, doc any) (id any, err error) {

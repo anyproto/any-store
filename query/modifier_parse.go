@@ -34,10 +34,8 @@ func ParseModifier(modifier any) (Modifier, error) {
 	if m, ok := modifier.(Modifier); ok {
 		return m, nil
 	}
-	p := parserPool.Get()
-	defer parserPool.Put(p)
 
-	v, err := parser.AnyToJSON(p, modifier)
+	v, err := parser.AnyToJSON(&fastjson.Parser{}, modifier)
 	if err != nil {
 		return nil, err
 	}

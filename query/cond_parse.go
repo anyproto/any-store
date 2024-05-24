@@ -56,8 +56,6 @@ var (
 	opBytesType   = []byte("$type")
 )
 
-var parserPool = &fastjson.ParserPool{}
-
 func MustParseCondition(cond any) Filter {
 	f, err := ParseCondition(cond)
 	if err != nil {
@@ -67,9 +65,6 @@ func MustParseCondition(cond any) Filter {
 }
 
 func ParseCondition(cond any) (Filter, error) {
-	p := parserPool.Get()
-	defer parserPool.Put(p)
-
 	if cond == nil {
 		return All{}, nil
 	}
@@ -77,7 +72,7 @@ func ParseCondition(cond any) (Filter, error) {
 		return f, nil
 	}
 
-	v, err := parser.AnyToJSON(p, cond)
+	v, err := parser.AnyToJSON(&fastjson.Parser{}, cond)
 	if err != nil {
 		return nil, err
 	}

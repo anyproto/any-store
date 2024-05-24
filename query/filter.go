@@ -146,10 +146,8 @@ func (e *Comp) String() string {
 	case CompOpNe:
 		op = string(opBytesNe)
 	}
-	p := parserPool.Get()
-	defer parserPool.Put(p)
 	a := &fastjson.Arena{}
-	val, _, _ := encoding.DecodeToJSON(p, a, e.EqValue)
+	val, _, _ := encoding.DecodeToJSON(&fastjson.Parser{}, a, e.EqValue)
 	return fmt.Sprintf(`{"%s": %s}`, op, val.String())
 }
 

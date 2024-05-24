@@ -30,20 +30,22 @@ func (r *FilterRegistry) Register(f query.Filter) int {
 	for i := 0; i < len(r.filters); i++ {
 		if r.filters[i].filter == nil {
 			r.filters[i] = filterEntry{filter: f, buf: r.syncPools.GetDocBuf()}
-			return i
+			return i + 1
 		}
 	}
 	r.filters = append(r.filters, filterEntry{filter: f, buf: r.syncPools.GetDocBuf()})
-	return len(r.filters) - 1
+	return len(r.filters)
 }
 
 func (r *FilterRegistry) Release(id int) {
+	id -= 1
 	r.syncPools.ReleaseDocBuf(r.filters[id].buf)
 	r.filters[id].buf = nil
 	r.filters[id].filter = nil
 }
 
 func (r *FilterRegistry) Filter(id int, data string) bool {
+	id -= 1
 	v, err := r.filters[id].buf.Parser.Parse(data)
 	if err != nil {
 		return false
@@ -73,20 +75,22 @@ func (r *SortRegistry) Register(s sort.Sort) int {
 	for i := 0; i < len(r.sorts); i++ {
 		if r.sorts[i].sort == nil {
 			r.sorts[i] = sortEntry{sort: s, buf: r.syncPools.GetDocBuf()}
-			return i
+			return i + 1
 		}
 	}
 	r.sorts = append(r.sorts, sortEntry{sort: s, buf: r.syncPools.GetDocBuf()})
-	return len(r.sorts) - 1
+	return len(r.sorts)
 }
 
 func (r *SortRegistry) Release(id int) {
+	id -= 1
 	r.syncPools.ReleaseDocBuf(r.sorts[id].buf)
 	r.sorts[id].buf = nil
 	r.sorts[id].sort = nil
 }
 
 func (r *SortRegistry) Sort(id int, data string) []byte {
+	id -= 1
 	v, err := r.sorts[id].buf.Parser.Parse(data)
 	if err != nil {
 		return nil
