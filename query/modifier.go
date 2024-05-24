@@ -34,36 +34,105 @@ type modifierSet struct {
 }
 
 func (m modifierSet) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
+	err = walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+		modified = !equal(value, m.val)
+		return m.val, nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	result = v
+	return
+}
+
+type modifierUnset struct {
+	fieldPath []string
+}
+
+func (m modifierUnset) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
+	err = walk(a, v, m.fieldPath, false, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+		modified = value != nil
+		return nil, nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	result = v
+	return
+}
+
+type modifierInc struct {
+	fieldPath []string
+	val       float64
+}
+
+func (m modifierInc) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
+	err = walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+		if value == nil {
+			return a.NewNumberFloat64(m.val), nil
+		}
+		if value.Type() != fastjson.TypeNumber {
+			return nil, fmt.Errorf("not numeric value '%s'", value.String())
+		}
+		return a.NewNumberFloat64(value.GetFloat64() + m.val), nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	result = v
+	return
+}
+
+func walk(
+	a *fastjson.Arena,
+	v *fastjson.Value,
+	fieldPath []string,
+	create bool,
+	finalize func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error),
+) (err error) {
 	prevField := v
-	for i, path := range m.fieldPath {
+	for i, path := range fieldPath {
 		field := prevField.Get(path)
-		if i == len(m.fieldPath)-1 {
-			modified = !equal(field, m.val)
+		if i == len(fieldPath)-1 {
+			var newVal *fastjson.Value
+			if newVal, err = finalize(prevField, field); err != nil {
+				return
+			}
+			if newVal == nil {
+				if field != nil {
+					prevField.Del(path)
+				}
+				return
+			}
 			if prevField.Type() == fastjson.TypeArray {
 				idx, err := strconv.Atoi(path)
 				if err != nil || idx < 0 {
-					return nil, false, fmt.Errorf("cannot create field '%s' in element %s", path, prevField.String())
+					return fmt.Errorf("cannot create field '%s' in element %s", path, prevField.String())
 				}
-				prevField.SetArrayItem(idx, m.val)
+				prevField.SetArrayItem(idx, newVal)
 			} else {
-				prevField.Set(path, m.val)
+				prevField.Set(path, newVal)
 			}
-			return v, modified, nil
+			return
 		} else {
 			if field == nil {
-				field = a.NewObject()
+				if create {
+					field = a.NewObject()
+				} else {
+					return nil
+				}
 			} else {
 				switch field.Type() {
 				case fastjson.TypeObject:
 				case fastjson.TypeArray:
 				default:
-					return nil, false, fmt.Errorf("cannot create field '%s' in element %s", m.fieldPath[i+1], field.String())
+					return fmt.Errorf("cannot create field '%s' in element %s", fieldPath[i+1], field.String())
 				}
 			}
 			if prevField.Type() == fastjson.TypeArray {
 				idx, err := strconv.Atoi(path)
 				if err != nil || idx < 0 {
-					return nil, false, fmt.Errorf("cannot create field '%s' in element %s", path, prevField.String())
+					return fmt.Errorf("cannot create field '%s' in element %s", path, prevField.String())
 				}
 				prevField.SetArrayItem(idx, field)
 			} else {
@@ -73,28 +142,6 @@ func (m modifierSet) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastj
 		}
 	}
 	return
-}
-
-type modifierUnset struct {
-	fieldPath []string
-}
-
-func (m modifierUnset) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
-	prevField := v
-	for i, path := range m.fieldPath {
-		if prevField == nil {
-			return v, false, nil
-		}
-		if i == len(m.fieldPath)-1 {
-			if prevField.Exists(path) {
-				prevField.Del(path)
-				modified = true
-			}
-		} else {
-			prevField = prevField.Get(path)
-		}
-	}
-	return v, modified, nil
 }
 
 func equal(v1, v2 *fastjson.Value) bool {

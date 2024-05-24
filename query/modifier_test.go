@@ -74,13 +74,18 @@ func TestParseModifier(t *testing.T) {
 		},
 		{
 			mod: `{"$set":{"$a":1}}`,
-			err: `unexpect identifier '$a' in $set`,
+			err: `unexpect identifier '$a'`,
 		},
 		{
 			mod: `{"$unset":{"$a":1}}`,
-			err: `unexpect identifier '$a' in $unset`,
+			err: `unexpect identifier '$a'`,
+		},
+		{
+			mod: `{"$inc":{"a":"not a num"}}`,
+			err: `not numeric value for $inc in field 'a'`,
 		},
 	}...)
+
 }
 
 func TestModifierSet_Modify(t *testing.T) {
@@ -203,4 +208,46 @@ func TestModifierUnset_Modify(t *testing.T) {
 			false,
 		},
 	}...)
+}
+
+func TestModifierInc_Modify(t *testing.T) {
+	t.Run("no error", func(t *testing.T) {
+		testModCases(t, []modifierCase{
+			{
+				`{"$inc":{"key":2}}`,
+				`{}`,
+				`{"key":2}`,
+				false,
+			},
+			{
+				`{"$inc":{"key.sKey":2}}`,
+				`{}`,
+				`{"key":{"sKey":2}}`,
+				false,
+			},
+			{
+				`{"$inc":{"key":-2}}`,
+				`{"key":42}`,
+				`{"key":40}`,
+				false,
+			},
+			{
+				`{"$inc":{"a":1, "b":2}}`,
+				`{"a":2}`,
+				`{"a":3,"b":2}`,
+				false,
+			},
+		}...)
+	})
+
+	t.Run("error", func(t *testing.T) {
+		testModCasesErr(t, []modifierCaseError{
+			{
+				`{"$inc":{"a":1}}`,
+				`{"a":"2"}`,
+				`not numeric value '"2"'`,
+			},
+		}...)
+	})
+
 }
