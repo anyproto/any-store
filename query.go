@@ -70,7 +70,6 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator) {
 	if err := q.makeQuery(false); err != nil {
 		return &iterator{err: err}
 	}
-	defer q.qb.release(q.c.db)
 	q.sqlRes = q.qb.build()
 	tx, err := q.c.db.ReadTx(ctx)
 	if err != nil {
@@ -85,7 +84,7 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator) {
 		rows: rows,
 		dest: make([]driver.Value, 1),
 		buf:  q.c.db.syncPool.GetDocBuf(),
-		db:   q.c.db,
+		q:    q,
 	}
 }
 
