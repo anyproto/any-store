@@ -4,9 +4,10 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
-	"github.com/anyproto/any-store/internal/conn"
 	"strconv"
 	"strings"
+
+	"github.com/anyproto/any-store/internal/conn"
 
 	"github.com/anyproto/any-store/internal/sort"
 	"github.com/anyproto/any-store/query"
@@ -143,7 +144,7 @@ type queryBuilder struct {
 
 type qbJoin struct {
 	tableName string
-	bounds    query.Bounds
+	bounds    []query.Bounds
 	sort      []sort.SortField
 }
 
@@ -158,15 +159,13 @@ func (qb *queryBuilder) build() string {
 	qb.buf.WriteString(qb.tableName)
 	qb.buf.WriteString("' ")
 
-	/*
-		for _, join := range qb.joins {
-			qb.buf.WriteString("\nJOIN '")
-			qb.buf.WriteString(qb.tableName)
-			qb.buf.WriteString("'.id = '")
-			qb.buf.WriteString(join.tableName)
-			qb.buf.WriteString("'.docId ")
-		}
-	*/
+	for _, join := range qb.joins {
+		qb.buf.WriteString("\nJOIN '")
+		qb.buf.WriteString(qb.tableName)
+		qb.buf.WriteString("'.id = '")
+		qb.buf.WriteString(join.tableName)
+		qb.buf.WriteString("'.docId ")
+	}
 
 	var whereStarted, needAnd bool
 	var writeWhere = func() {
@@ -177,23 +176,64 @@ func (qb *queryBuilder) build() string {
 	}
 	var writeAnd = func() {
 		if needAnd {
-			qb.buf.WriteString("\nAND ")
+			qb.buf.WriteString("\n\tAND ")
 		} else {
 			needAnd = true
 		}
 	}
 
-	/*
-		for _, join := range qb.joins {
-			writeWhere()
-			writeAnd()
-			for _, b := range join.bounds {
+	var writePlaceholder = func(tableNum, fieldNum, boundNum int, isEnd bool, val []byte) {
+		fieldName := "val_" + strconv.Itoa(tableNum) + "_" + strconv.Itoa(fieldNum) + "_" + strconv.Itoa(boundNum)
+		if isEnd {
+			fieldName += "_end"
+		}
+		qb.buf.WriteString(":")
+		qb.buf.WriteString(fieldName)
+
+		qb.values = append(qb.values, driver.NamedValue{
+			Name:  fieldName,
+			Value: val,
+		})
+	}
+
+	for tableNum, join := range qb.joins {
+		writeWhere()
+		writeAnd()
+		for fieldNum, bounds := range join.bounds {
+			for i, b := range bounds {
 				qb.buf.WriteString("\n\t'")
 				qb.buf.WriteString(join.tableName)
-				qb.buf.WriteString("'.val ")
+				qb.buf.WriteString("'.val")
+				qb.buf.WriteString(strconv.Itoa(fieldNum))
+
+				// fast equal case
+				if b.StartInclude && b.EndInclude && b.Start.Equal(b.End) {
+					qb.buf.WriteString(" = ")
+					writePlaceholder(tableNum, fieldNum, i, false, b.Start)
+					continue
+				}
+				if !b.Start.Empty() {
+					if b.StartInclude {
+						qb.buf.WriteString(" >= ")
+					} else {
+						qb.buf.WriteString(" > ")
+					}
+					writePlaceholder(tableNum, fieldNum, i, false, b.Start)
+					needAnd = true
+				}
+				if !b.End.Empty() {
+					writeAnd()
+					if b.EndInclude {
+						qb.buf.WriteString(" <= ")
+					} else {
+						qb.buf.WriteString(" < ")
+					}
+					writePlaceholder(tableNum, fieldNum, i, true, b.End)
+					needAnd = true
+				}
 			}
 		}
-	*/
+	}
 
 	if qb.filterId > 0 {
 		writeWhere()
@@ -214,6 +254,18 @@ func (qb *queryBuilder) build() string {
 			qb.buf.WriteString("\nORDER BY ")
 		} else {
 			qb.buf.WriteString(", ")
+		}
+	}
+
+	for _, join := range qb.joins {
+		for fieldNum, s := range join.sort {
+			writeOrder()
+			qb.buf.WriteString(join.tableName)
+			qb.buf.WriteString("'.val")
+			qb.buf.WriteString(strconv.Itoa(fieldNum))
+			if s.Reverse {
+				qb.buf.WriteString(" DESC")
+			}
 		}
 	}
 
