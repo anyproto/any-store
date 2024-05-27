@@ -69,11 +69,13 @@ type modifierInc struct {
 func (m modifierInc) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
 	err = walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
 		if value == nil {
+			modified = true
 			return a.NewNumberFloat64(m.val), nil
 		}
 		if value.Type() != fastjson.TypeNumber {
 			return nil, fmt.Errorf("not numeric value '%s'", value.String())
 		}
+		modified = true
 		return a.NewNumberFloat64(value.GetFloat64() + m.val), nil
 	})
 	if err != nil {

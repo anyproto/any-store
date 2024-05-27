@@ -217,25 +217,25 @@ func TestModifierInc_Modify(t *testing.T) {
 				`{"$inc":{"key":2}}`,
 				`{}`,
 				`{"key":2}`,
-				false,
+				true,
 			},
 			{
 				`{"$inc":{"key.sKey":2}}`,
 				`{}`,
 				`{"key":{"sKey":2}}`,
-				false,
+				true,
 			},
 			{
 				`{"$inc":{"key":-2}}`,
 				`{"key":42}`,
 				`{"key":40}`,
-				false,
+				true,
 			},
 			{
 				`{"$inc":{"a":1, "b":2}}`,
 				`{"a":2}`,
 				`{"a":3,"b":2}`,
-				false,
+				true,
 			},
 		}...)
 	})
