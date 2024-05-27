@@ -445,6 +445,15 @@ func (c *collection) createIndex(ctx context.Context, cn conn.Conn, info IndexIn
 	if info.Name == "" {
 		info.Name = info.createName()
 	}
+	var fieldsIsDesc = make([]bool, len(info.Fields))
+	for i, field := range info.Fields {
+		if err = validateIndexField(field); err != nil {
+			return nil, err
+		}
+		if _, isDesc := parseIndexField(field); isDesc {
+			fieldsIsDesc[i] = isDesc
+		}
+	}
 	if _, err = c.db.stmt.registerIndex.ExecContext(ctx, []driver.NamedValue{
 		{Name: "indexName", Value: info.Name},
 		{Name: "collName", Value: c.name},
@@ -455,7 +464,7 @@ func (c *collection) createIndex(ctx context.Context, cn conn.Conn, info IndexIn
 		return nil, replaceUniqErr(err, ErrIndexExists)
 	}
 
-	if _, err = cn.ExecContext(ctx, c.sql.Index(info.Name).Create(info.Unique), nil); err != nil {
+	if _, err = cn.ExecContext(ctx, c.sql.Index(info.Name).Create(info.Unique, fieldsIsDesc), nil); err != nil {
 		return
 	}
 	return newIndex(ctx, c, info)

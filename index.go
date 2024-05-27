@@ -66,6 +66,16 @@ type index struct {
 	stmtsReady atomic.Bool
 }
 
+func validateIndexField(s string) (err error) {
+	if s == "" || s == "-" {
+		return fmt.Errorf("index field is empty")
+	}
+	if strings.HasPrefix(s, "$") {
+		return fmt.Errorf("invalid index field name: %s", s)
+	}
+	return nil
+}
+
 func parseIndexField(s string) (fields []string, reverse bool) {
 	if strings.HasPrefix(s, "-") {
 		return strings.Split(s[1:], "."), true
@@ -88,7 +98,9 @@ func (idx *index) init(ctx context.Context) (err error) {
 	idx.uniqBuf = make([][]key.Key, len(idx.fieldPaths))
 	idx.driverValuesBuf = []driver.NamedValue{
 		{Name: "docId"},
-		{Name: "val"},
+	}
+	for i := 0; i < len(idx.fieldNames); i++ {
+		idx.driverValuesBuf = append(idx.driverValuesBuf, driver.NamedValue{Name: fmt.Sprintf("val%d", i)})
 	}
 	idx.sql = idx.c.sql.Index(idx.info.Name)
 	idx.makeQueries()
@@ -102,10 +114,10 @@ func (idx *index) makeQueries() {
 
 func (idx *index) checkStmts(ctx context.Context, cn conn.Conn) (err error) {
 	if idx.stmtsReady.CompareAndSwap(false, true) {
-		if idx.stmts.insert, err = idx.sql.InsertStmt(ctx, cn); err != nil {
+		if idx.stmts.insert, err = idx.sql.InsertStmt(ctx, cn, len(idx.fieldNames)); err != nil {
 			return err
 		}
-		if idx.stmts.delete, err = idx.sql.DeleteStmt(ctx, cn); err != nil {
+		if idx.stmts.delete, err = idx.sql.DeleteStmt(ctx, cn, len(idx.fieldNames)); err != nil {
 			return err
 		}
 	}
@@ -200,7 +212,6 @@ func (idx *index) writeValues(d *fastjson.Value, i int) bool {
 	if idx.info.Sparse && (v == nil || v.Type() == fastjson.TypeNull) {
 		return false
 	}
-	reverse := idx.reverse[i]
 
 	k := idx.keyBuf
 	if v != nil && v.Type() == fastjson.TypeArray {
@@ -208,11 +219,7 @@ func (idx *index) writeValues(d *fastjson.Value, i int) bool {
 		if len(arr) != 0 {
 			idx.uniqBuf[i] = idx.uniqBuf[i][:0]
 			for _, av := range arr {
-				if reverse {
-					idx.keyBuf = k.AppendInvertedJSON(av)
-				} else {
-					idx.keyBuf = k.AppendJSON(av)
-				}
+				idx.keyBuf = k.AppendJSON(av)
 				if idx.isUnique(i, idx.keyBuf) {
 					if !idx.writeValues(d, i+1) {
 						return false
@@ -222,11 +229,8 @@ func (idx *index) writeValues(d *fastjson.Value, i int) bool {
 			return true
 		}
 	}
-	if reverse {
-		idx.keyBuf = k.AppendInvertedJSON(v)
-	} else {
-		idx.keyBuf = k.AppendJSON(v)
-	}
+
+	idx.keyBuf = k.AppendJSON(v)
 	return idx.writeValues(d, i+1)
 }
 
@@ -278,9 +282,14 @@ func (idx *index) deleteBuf(ctx context.Context, id []byte, buf []key.Key) (err 
 	return
 }
 
-func (idx *index) driverValues(docId, val []byte) []driver.NamedValue {
-	idx.driverValuesBuf[0].Value = docId
-	idx.driverValuesBuf[1].Value = val
+func (idx *index) driverValues(docId, val key.Key) []driver.NamedValue {
+	idx.driverValuesBuf[0].Value = []byte(docId)
+	var i = 1
+	_ = val.ReadByteValues(func(b []byte) error {
+		idx.driverValuesBuf[i].Value = b
+		i++
+		return nil
+	})
 	return idx.driverValuesBuf
 }
 
