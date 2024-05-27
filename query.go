@@ -89,6 +89,7 @@ func (q *collQuery) newIterator(rows driver.Rows, tx ReadTx) *iterator {
 		rows: rows,
 		dest: make([]driver.Value, 1),
 		buf:  q.c.db.syncPool.GetDocBuf(),
+		tx:   tx,
 		q:    q,
 	}
 }

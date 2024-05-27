@@ -31,7 +31,14 @@ type DocBuffer struct {
 }
 
 func (sp *SyncPool) GetDocBuf() *DocBuffer {
-	return sp.pool.Get().(*DocBuffer)
+	buf := sp.pool.Get().(*DocBuffer)
+	if buf == nil {
+		buf = &DocBuffer{
+			Arena:  &fastjson.Arena{},
+			Parser: &fastjson.Parser{},
+		}
+	}
+	return buf
 }
 
 func (sp *SyncPool) ReleaseDocBuf(b *DocBuffer) {

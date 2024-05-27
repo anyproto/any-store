@@ -75,6 +75,10 @@ func TestCollQuery_Explain(t *testing.T) {
 			"SELECT data FROM '_test_docs' WHERE  ((id = :val_0_0_0) OR (id = :val_0_0_1)) AND any_filter(1, data)",
 			"SEARCH _test_docs USING INDEX sqlite_autoindex__test_docs_1 (id=?)",
 		)
+		assertExplain(t, coll.Query().Cond(`{"id":{"$nin":[1,2]}}`),
+			"SELECT data FROM '_test_docs' WHERE any_filter(1, data)",
+			"SCAN _test_docs",
+		)
 		assertExplain(t, coll.Query().Cond(`{"$or":[{"id":{"$gt":3}}, {"id":{"$lt":2}}]}`),
 			"SELECT data FROM '_test_docs' WHERE  ((id < :val_0_0_0_end) OR (id > :val_0_0_1)) AND any_filter(1, data)",
 			"SCAN _test_docs",

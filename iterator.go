@@ -70,6 +70,8 @@ func (i *iterator) Close() (err error) {
 	}
 	if i.buf != nil && i.q != nil {
 		i.q.c.db.syncPool.ReleaseDocBuf(i.buf)
+	}
+	if i.q != nil {
 		i.q.qb.release(i.q.c.db)
 	}
 	return

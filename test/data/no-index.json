@@ -1,0 +1,133 @@
+{
+  "tests" : [
+    {
+      "expectedIds": [1,2,3,4,5,6,7,8,9,10]
+    },
+    {
+      "limit": 2,
+      "expectedIds": [1,2]
+    },
+    {
+      "limit": 2,
+      "offset": 2,
+      "expectedIds": [3,4]
+    },
+    {
+      "cond" : {"id": 2},
+      "expectedIds": [2]
+    },
+    {
+      "cond" : {"a": "3"},
+      "expectedIds": [3]
+    },
+    {
+      "cond" : {"b": 6},
+      "expectedIds": [1,2,3,6,8]
+    },
+    {
+      "cond" : {"b": {"$ne": 6}},
+      "expectedIds": [4,5,7,9,10]
+    },
+    {
+      "cond" : {"c": "3"},
+      "expectedIds": [4,5,6]
+    },
+    {
+      "sort": ["-id"],
+      "expectedIds": [10,9,8,7,6,5,4,3,2,1]
+    },
+    {
+      "cond": {"id": {"$lt": 4}},
+      "sort": ["-id"],
+      "expectedIds": [3,2,1]
+    },
+    {
+      "cond": {"id": {"$in": [5,9]}},
+      "expectedIds": [5,9]
+    },
+    {
+      "cond": {"id": {"$in": [1,10]}},
+      "expectedIds": [1,10]
+    },
+    {
+      "cond": {"id": {"$in": [5,9]}},
+      "sort": ["-id"],
+      "expectedIds": [9,5]
+    },
+    {
+      "cond": {"id": {"$in": [1,10]}},
+      "sort": ["-id"],
+      "expectedIds": [10,1]
+    },
+    {
+      "cond": {"id": {"$nin": [1,3,5,7,9,22]}},
+      "expectedIds": [2,4,6,8,10]
+    },
+    {
+      "cond": {"b": {"$nin": [2,4,5]}},
+      "expectedIds": [3,8,9,10]
+    },
+    {
+      "cond": {"b": {"$nin": [2,4,5]}},
+      "sort": ["-id"],
+      "expectedIds": [10,9,8,3]
+    },
+    {
+      "cond": {"$or": [{"id": 3}, {"id": 5}]},
+      "expectedIds": [3,5]
+    },
+    {
+      "cond": {"id": 5, "c": "3", "b": 10},
+      "expectedIds": [5]
+    },
+    {
+      "cond": {"id": 5, "c": "3", "b": 11},
+      "expectedIds": []
+    },
+    {
+      "cond": {"$and": [{"b": 2}, {"b": 6}]},
+      "expectedIds": [1,2,6]
+    },
+    {
+      "cond": {"d": true},
+      "expectedIds": [6]
+    },
+    {
+      "cond": {"d.object": 1},
+      "expectedIds": [5]
+    },
+    {
+      "cond": {"d": {"$type": "array"}},
+      "expectedIds": [4]
+    },
+    {
+      "cond": {"d": {"$exists": false}},
+      "expectedIds": [8,9,10]
+    },
+    {
+      "cond": {"b": {"$all": [2,4,6]}},
+      "expectedIds": [1,2]
+    },
+    {
+      "cond": {"$or":[{"d": {"$exists": false}, "a": "a"}, {"a": "1"}]},
+      "expectedIds": [1,10]
+    },
+    {
+      "cond": {"b": 6},
+      "sort" : ["-a"],
+      "expectedIds": [8,6,3,2,1]
+    }
+  ],
+  "data": [
+    {"id": 1, "a": "1", "b": [1,2,3,4,5,6,7,8,9,10], "c": "1", "d": null},
+    {"id": 2, "a": "2", "b": [2,4,6,8,10], "c": "2", "d": 0},
+    {"id": 3, "a": "3", "b": [3,6,9], "c": "2", "d": "string"},
+    {"id": 4, "a": "4", "b": [4,8], "c": "3", "d": ["array"]},
+    {"id": 5, "a": "5", "b": [5,10], "c": "3", "d": {"object": 1}},
+    {"id": 6, "a": "6", "b": [6,6,2], "c": "3", "d": true},
+    {"id": 7, "a": "7", "b": [7,4], "c": "4", "d": false},
+    {"id": 8, "a": "8", "b": [8,6], "c": "4"},
+    {"id": 9, "a": "9", "b": [9,8], "c": "4"},
+    {"id": 10, "a": "a", "b": [10,20], "c": "4"}
+  ]
+}
