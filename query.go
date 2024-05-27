@@ -18,7 +18,7 @@ type Query interface {
 	Limit(limit uint) Query
 	Offset(offset uint) Query
 	Sort(sort ...any) Query
-	Iter() Iterator
+	Iter(ctx context.Context) (iter Iterator)
 	Count(ctx context.Context) (count int, err error)
 	Update(ctx context.Context, modifier any) error
 	Delete(ctx context.Context) (err error)
@@ -66,9 +66,27 @@ func (q *collQuery) Sort(sorts ...any) Query {
 	return q
 }
 
-func (q *collQuery) Iter() Iterator {
-	//TODO implement me
-	panic("implement me")
+func (q *collQuery) Iter(ctx context.Context) (iter Iterator) {
+	if err := q.makeQuery(false); err != nil {
+		return &iterator{err: err}
+	}
+	defer q.qb.release(q.c.db)
+	q.sqlRes = q.qb.build()
+	tx, err := q.c.db.ReadTx(ctx)
+	if err != nil {
+		return &iterator{err: err}
+	}
+	rows, err := tx.conn().QueryContext(ctx, q.sqlRes, q.qb.values)
+	if err != nil {
+		return &iterator{err: err}
+	}
+	return &iterator{
+		tx:   tx,
+		rows: rows,
+		dest: make([]driver.Value, 1),
+		buf:  q.c.db.syncPool.GetDocBuf(),
+		db:   q.c.db,
+	}
 }
 
 func (q *collQuery) Update(ctx context.Context, modifier any) error {

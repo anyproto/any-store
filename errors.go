@@ -23,6 +23,8 @@ var (
 	ErrTxOtherInstance = errors.New("any-store: tx is from an other db instance")
 
 	ErrUniqueConstraint = errors.New("any-store: unique constraint")
+
+	ErrIterClosed = errors.New("any-store: iter is closed")
 )
 
 func replaceNoRowsErr(err, replaceTo error) error {
