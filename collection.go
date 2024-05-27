@@ -273,18 +273,20 @@ func (c *collection) UpdateOne(ctx context.Context, doc any) (err error) {
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
-		return c.update(ctx, it)
+		return c.update(ctx, it, item{})
 	})
 }
 
-func (c *collection) update(ctx context.Context, it item) (err error) {
+func (c *collection) update(ctx context.Context, it, prevIt item) (err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	idKey := it.appendId(buf.SmallBuf[:0])
-	prevIt, err := c.loadById(ctx, buf, idKey)
-	if err != nil {
-		return
+	if prevIt.val == nil {
+		prevIt, err = c.loadById(ctx, buf, idKey)
+		if err != nil {
+			return
+		}
 	}
 	if _, err = c.stmts.update.ExecContext(ctx, []driver.NamedValue{
 		{Name: "id", Value: idKey},
@@ -330,7 +332,7 @@ func (c *collection) UpsertOne(ctx context.Context, doc any) (id any, err error)
 		}
 		_, insErr := c.insertItem(ctx, cn, buf, it)
 		if errors.Is(insErr, ErrDocExists) {
-			return c.update(ctx, it)
+			return c.update(ctx, it, item{})
 		}
 		return insErr
 	})

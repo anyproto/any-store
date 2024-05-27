@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/valyala/fastjson"
+
 	"github.com/anyproto/any-store/internal/conn"
 
 	"github.com/anyproto/any-store/internal/sort"
@@ -79,8 +81,11 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator) {
 	if err != nil {
 		return &iterator{err: err}
 	}
+	return q.newIterator(rows, tx)
+}
+
+func (q *collQuery) newIterator(rows driver.Rows, tx ReadTx) *iterator {
 	return &iterator{
-		tx:   tx,
 		rows: rows,
 		dest: make([]driver.Value, 1),
 		buf:  q.c.db.syncPool.GetDocBuf(),
@@ -88,9 +93,67 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator) {
 	}
 }
 
-func (q *collQuery) Update(ctx context.Context, modifier any) error {
-	//TODO implement me
-	panic("implement me")
+func (q *collQuery) Update(ctx context.Context, modifier any) (err error) {
+	mod, err := query.ParseModifier(modifier)
+	if err != nil {
+		return
+	}
+	if err = q.makeQuery(false); err != nil {
+		return
+	}
+	defer q.qb.release(q.c.db)
+	q.sqlRes = q.qb.build()
+
+	tx, err := q.c.db.getWriteTx(ctx)
+	if err != nil {
+		return
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		} else {
+			err = tx.Commit()
+		}
+	}()
+
+	rows, err := tx.conn().QueryContext(ctx, q.sqlRes, q.qb.values)
+	if err != nil {
+		return
+	}
+	iter := q.newIterator(rows, tx)
+	defer func() {
+		_ = iter.Close()
+	}()
+
+	buf := q.c.db.syncPool.GetDocBuf()
+	defer q.c.db.syncPool.ReleaseDocBuf(buf)
+
+	for iter.Next() {
+		var doc Doc
+		if doc, err = iter.Doc(); err != nil {
+			return
+		}
+		var (
+			modifiedVal *fastjson.Value
+			isModified  bool
+		)
+		modifiedVal, isModified, err = mod.Modify(buf.Arena, copyItem(buf, doc.(item)).val)
+		if err != nil {
+			return
+		}
+		if !isModified {
+			continue
+		}
+		var it item
+		if it, err = newItem(modifiedVal, nil, false); err != nil {
+			return
+		}
+		if err = q.c.update(tx.Context(), it, doc.(item)); err != nil {
+			return
+		}
+	}
+	err = iter.Err()
+	return
 }
 
 func (q *collQuery) Delete(ctx context.Context) (err error) {
@@ -297,96 +360,86 @@ func (qb *queryBuilder) build() string {
 		})
 	}
 
-	for i, b := range qb.idBounds {
-		if b.Start.Empty() && b.End.Empty() {
-			continue
+	var writeTableVal = func(tableName string, fieldNum int) {
+		if tableName == "" {
+			qb.buf.WriteString("id")
+		} else {
+			qb.buf.WriteString("'")
+			qb.buf.WriteString(tableName)
+			qb.buf.WriteString("'.val")
+			qb.buf.WriteString(strconv.Itoa(fieldNum))
+		}
+	}
+
+	var writeBound = func(join qbJoin, tableNum, fieldNum, boundNum int) {
+		b := join.bounds[fieldNum][boundNum]
+
+		// fast eq case
+		if b.StartInclude && b.EndInclude && b.Start.Equal(b.End) {
+			writeTableVal(join.tableName, fieldNum)
+			qb.buf.WriteString(" = ")
+			writePlaceholder(tableNum, fieldNum, boundNum, false, b.Start)
+			return
 		}
 
-		// fast equal case
-		if b.StartInclude && b.EndInclude && b.Start.Equal(b.End) {
-			writeWhere()
-			writeAnd()
-			qb.buf.WriteString("id")
-			qb.buf.WriteString(" = ")
-			writePlaceholder(0, 0, i, false, b.Start)
-			continue
-		}
 		if !b.Start.Empty() {
-			writeWhere()
-			writeAnd()
-			qb.buf.WriteString("id")
+			writeTableVal(join.tableName, fieldNum)
 			if b.StartInclude {
 				qb.buf.WriteString(" >= ")
 			} else {
 				qb.buf.WriteString(" > ")
 			}
-			writePlaceholder(0, 0, i, false, b.Start)
+			writePlaceholder(tableNum, fieldNum, boundNum, false, b.Start)
 			needAnd = true
 		}
 		if !b.End.Empty() {
-			writeWhere()
-			writeAnd()
-			qb.buf.WriteString("id")
+			if !b.Start.Empty() {
+				writeAnd()
+			}
+			writeTableVal(join.tableName, fieldNum)
 			if b.EndInclude {
 				qb.buf.WriteString(" <= ")
 			} else {
 				qb.buf.WriteString(" < ")
 			}
-			writePlaceholder(0, 0, i, true, b.End)
+			writePlaceholder(tableNum, fieldNum, boundNum, true, b.End)
 			needAnd = true
+		}
+
+	}
+
+	var writeBounds = func(join qbJoin, tableNum int) {
+		if len(join.bounds) == 0 {
+			return
+		}
+		writeWhere()
+		writeAnd()
+		for fieldNum, bounds := range join.bounds {
+			if fieldNum != 0 {
+				qb.buf.WriteString(" AND (")
+			} else {
+				qb.buf.WriteString(" (")
+			}
+			for i := range bounds {
+				if i != 0 {
+					qb.buf.WriteString(" OR (")
+				} else {
+					qb.buf.WriteString("(")
+				}
+				writeBound(join, tableNum, fieldNum, i)
+				qb.buf.WriteString(")")
+			}
+			qb.buf.WriteString(")")
 		}
 	}
 
-	var writeTableVal = func(tableName string, fieldNum int) {
-		qb.buf.WriteString(" '")
-		qb.buf.WriteString(tableName)
-		qb.buf.WriteString("'.val")
-		qb.buf.WriteString(strconv.Itoa(fieldNum))
+	if len(qb.idBounds) > 0 {
+		writeBounds(qbJoin{bounds: []query.Bounds{qb.idBounds}}, 0)
 	}
 
 	for tableNum, join := range qb.joins {
 		tableNum += 1
-		for fieldNum, bounds := range join.bounds {
-			for i, b := range bounds {
-				if b.Start.Empty() && b.End.Empty() {
-					continue
-				}
-
-				// fast equal case
-				if b.StartInclude && b.EndInclude && b.Start.Equal(b.End) {
-					writeWhere()
-					writeAnd()
-					writeTableVal(join.tableName, fieldNum)
-					qb.buf.WriteString(" = ")
-					writePlaceholder(tableNum, fieldNum, i, false, b.Start)
-					continue
-				}
-				if !b.Start.Empty() {
-					writeWhere()
-					writeAnd()
-					writeTableVal(join.tableName, fieldNum)
-					if b.StartInclude {
-						qb.buf.WriteString(" >= ")
-					} else {
-						qb.buf.WriteString(" > ")
-					}
-					writePlaceholder(tableNum, fieldNum, i, false, b.Start)
-					needAnd = true
-				}
-				if !b.End.Empty() {
-					writeWhere()
-					writeAnd()
-					writeTableVal(join.tableName, fieldNum)
-					if b.EndInclude {
-						qb.buf.WriteString(" <= ")
-					} else {
-						qb.buf.WriteString(" < ")
-					}
-					writePlaceholder(tableNum, fieldNum, i, true, b.End)
-					needAnd = true
-				}
-			}
-		}
+		writeBounds(join, tableNum)
 	}
 
 	if qb.filterId > 0 {

@@ -91,3 +91,8 @@ func jsonToStringArray(p *fastjson.Parser, j string) ([]string, error) {
 	}
 	return result, nil
 }
+
+func copyItem(buf *syncpool.DocBuffer, it item) item {
+	res, _ := buf.Parser.ParseBytes(it.val.MarshalTo(buf.DocBuf[:0]))
+	return item{val: res}
+}
