@@ -1,7 +1,6 @@
 package anystore
 
 import (
-	"database/sql"
 	"errors"
 
 	"github.com/mattn/go-sqlite3"
@@ -26,16 +25,6 @@ var (
 
 	ErrIterClosed = errors.New("any-store: iter is closed")
 )
-
-func replaceNoRowsErr(err, replaceTo error) error {
-	if err == nil {
-		return nil
-	}
-	if errors.Is(err, sql.ErrNoRows) {
-		return replaceTo
-	}
-	return err
-}
 
 func replaceUniqErr(err, replaceTo error) error {
 	if err == nil {
