@@ -14,24 +14,24 @@ import (
 type Operator uint8
 
 const (
-	OpAnd Operator = iota
-	OpOr
-	OpNor
+	opAnd Operator = iota
+	opOr
+	opNor
 
-	_OpVal
-	OpNe
-	OpEq
-	OpGt
-	OpGte
-	OpLt
-	OpLte
+	_opVal
+	opNe
+	opEq
+	opGt
+	opGte
+	opLt
+	opLte
 
-	OpIn
-	OpNin
-	OpAll
-	OpNot
-	OpExists
-	OpType
+	opIn
+	opNin
+	opAll
+	opNot
+	opExists
+	opType
 )
 
 var (
@@ -177,21 +177,21 @@ func parseAnd(val *fastjson.Value) (res Filter, err error) {
 			}
 
 			switch op {
-			case OpAnd:
+			case opAnd:
 				if f, err = parseAndArray(v); err != nil {
 					return
 				}
 				if fs != nil {
 					fs = append(fs, f)
 				}
-			case OpOr:
+			case opOr:
 				if f, err = parseOrArray(v); err != nil {
 					return
 				}
 				if fs != nil {
 					fs = append(fs, f)
 				}
-			case OpNor:
+			case opNor:
 				if f, err = parseNorArray(v); err != nil {
 					return
 				}
@@ -312,37 +312,37 @@ func parseCompObjOp(val *fastjson.Value) (ok bool, f Filter, err error) {
 
 func makeCompFilter(op Operator, v *fastjson.Value) (f Filter, err error) {
 	switch op {
-	case OpEq:
+	case opEq:
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpEq
 		return cmp, nil
-	case OpNe:
+	case opNe:
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpNe
 		return cmp, nil
-	case OpGt:
+	case opGt:
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpGt
 		return cmp, nil
-	case OpGte:
+	case opGte:
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpGte
 		return cmp, nil
-	case OpLt:
+	case opLt:
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpLt
 		return cmp, nil
-	case OpLte:
+	case opLte:
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpLte
 		return cmp, nil
-	case OpNot:
+	case opNot:
 		var isOp bool
 		not := Not{}
 		if isOp, not.Filter, err = parseCompObjOp(v); err != nil {
@@ -352,9 +352,9 @@ func makeCompFilter(op Operator, v *fastjson.Value) (f Filter, err error) {
 			return nil, fmt.Errorf("no operators found for $not")
 		}
 		return not, nil
-	case OpExists:
+	case opExists:
 		return parseExists(v)
-	case OpType:
+	case opType:
 		return parseType(v)
 	default:
 		return makeArrComp(op, v)
@@ -366,11 +366,11 @@ func makeArrComp(op Operator, v *fastjson.Value) (Filter, error) {
 		return nil, fmt.Errorf("expected array for %v operator", op)
 	}
 	switch op {
-	case OpIn:
+	case opIn:
 		return Or(makeEqArray(v)), nil
-	case OpNin:
+	case opNin:
 		return Nor(makeEqArray(v)), nil
-	case OpAll:
+	case opAll:
 		return And(makeEqArray(v)), nil
 	default:
 		panic(fmt.Errorf("unexpected operator: %v", op))
@@ -425,35 +425,35 @@ func isOperator(key []byte) (ok bool, op Operator, err error) {
 	if bytes.HasPrefix(key, opBytesPrefix) {
 		switch {
 		case bytes.Equal(key, opBytesIn):
-			return true, OpIn, nil
+			return true, opIn, nil
 		case bytes.Equal(key, opBytesNin):
-			return true, OpNin, nil
+			return true, opNin, nil
 		case bytes.Equal(key, opBytesOr):
-			return true, OpOr, nil
+			return true, opOr, nil
 		case bytes.Equal(key, opBytesAnd):
-			return true, OpAnd, nil
+			return true, opAnd, nil
 		case bytes.Equal(key, opBytesAll):
-			return true, OpAll, nil
+			return true, opAll, nil
 		case bytes.Equal(key, opBytesNe):
-			return true, OpNe, nil
+			return true, opNe, nil
 		case bytes.Equal(key, opBytesNor):
-			return true, OpNor, nil
+			return true, opNor, nil
 		case bytes.Equal(key, opBytesGt):
-			return true, OpGt, nil
+			return true, opGt, nil
 		case bytes.Equal(key, opBytesGte):
-			return true, OpGte, nil
+			return true, opGte, nil
 		case bytes.Equal(key, opBytesLt):
-			return true, OpLt, nil
+			return true, opLt, nil
 		case bytes.Equal(key, opBytesLte):
-			return true, OpLte, nil
+			return true, opLte, nil
 		case bytes.Equal(key, opBytesEq):
-			return true, OpEq, nil
+			return true, opEq, nil
 		case bytes.Equal(key, opBytesNot):
-			return true, OpNot, nil
+			return true, opNot, nil
 		case bytes.Equal(key, opBytesExists):
-			return true, OpExists, nil
+			return true, opExists, nil
 		case bytes.Equal(key, opBytesType):
-			return true, OpType, nil
+			return true, opType, nil
 		default:
 			return true, 0, fmt.Errorf("unknow operator: %s", string(key))
 		}
@@ -462,5 +462,5 @@ func isOperator(key []byte) (ok bool, op Operator, err error) {
 }
 
 func isTopLevel(op Operator) bool {
-	return op < _OpVal
+	return op < _opVal
 }
