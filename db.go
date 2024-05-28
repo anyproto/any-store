@@ -19,10 +19,19 @@ type DB interface {
 	OpenCollection(ctx context.Context, collectionName string) (Collection, error)
 	GetCollectionNames(ctx context.Context) (collectionNames []string, err error)
 
+	Stats(ctx context.Context) (stats DBStats, err error)
+
 	ReadTx(ctx context.Context) (ReadTx, error)
 	WriteTx(ctx context.Context) (WriteTx, error)
 
 	Close() error
+}
+
+type DBStats struct {
+	CollectionsCount int
+	IndexesCount     int
+	TotalSizeBytes   int
+	DataSizeBytes    int
 }
 
 func Open(ctx context.Context, path string, config *Config) (DB, error) {
@@ -202,18 +211,23 @@ func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collec
 
 	err := db.doReadTx(ctx, func(c conn.Conn) error {
 		rows, err := c.QueryContext(ctx, db.sql.FindCollection(), []driver.NamedValue{{
-			Name:    "collName",
-			Ordinal: 1,
-			Value:   collectionName,
+			Name:  "collName",
+			Value: collectionName,
 		}})
 		if err != nil {
 			return err
 		}
-		rErr := rows.Next(nil)
-		if rErr == io.EOF {
-			return ErrCollectionNotFound
+		defer func() {
+			_ = rows.Close()
+		}()
+		rErr := rows.Next([]driver.Value{})
+		if rErr != nil {
+			if rErr == io.EOF {
+				return ErrCollectionNotFound
+			}
+			return rErr
 		}
-		return rows.Close()
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -245,6 +259,35 @@ func (db *db) GetCollectionNames(ctx context.Context) (collectionNames []string,
 	if err != nil {
 		return nil, err
 	}
+	return
+}
+
+func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
+	err = db.doReadTx(ctx, func(cn conn.Conn) (txErr error) {
+		var getIntByQuery = func(q string) (int, error) {
+			rows, rErr := cn.QueryContext(ctx, q, nil)
+			if rErr != nil {
+				return 0, rErr
+			}
+			defer func() {
+				_ = rows.Close()
+			}()
+			return readOneInt(rows)
+		}
+		if stats.CollectionsCount, txErr = getIntByQuery(db.sql.CountCollections()); txErr != nil {
+			return
+		}
+		if stats.IndexesCount, txErr = getIntByQuery(db.sql.CountIndexes()); txErr != nil {
+			return
+		}
+		if stats.TotalSizeBytes, txErr = getIntByQuery(db.sql.StatsTotalSize()); txErr != nil {
+			return
+		}
+		if stats.DataSizeBytes, txErr = getIntByQuery(db.sql.StatsDataSize()); txErr != nil {
+			return
+		}
+		return
+	})
 	return
 }
 
@@ -303,6 +346,7 @@ func (db *db) doReadTx(ctx context.Context, do func(c conn.Conn) error) error {
 		return err
 	}
 	if err = do(tx.conn()); err != nil {
+		_ = tx.Commit()
 		return err
 	}
 	return tx.Commit()

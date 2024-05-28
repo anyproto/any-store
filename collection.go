@@ -594,7 +594,7 @@ func (c *collection) Drop(ctx context.Context) error {
 				return
 			}
 		}
-		if _, err = c.db.stmt.renameCollection.ExecContext(ctx, []driver.NamedValue{
+		if _, err = c.db.stmt.removeCollection.ExecContext(ctx, []driver.NamedValue{
 			{
 				Name:    "collName",
 				Ordinal: 1,

@@ -23,10 +23,15 @@ func TestCollection_Drop(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
 	require.NoError(t, coll.Drop(ctx))
-	// TODO: add indexed and data
 	_, err = fx.OpenCollection(ctx, "test")
 	assert.ErrorIs(t, err, ErrCollectionNotFound)
+
+	stats, err := fx.Stats(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, stats.IndexesCount)
+	assert.Empty(t, stats.CollectionsCount)
 }
 
 func TestCollection_Rename(t *testing.T) {

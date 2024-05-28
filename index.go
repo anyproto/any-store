@@ -144,7 +144,14 @@ func (idx *index) Len(ctx context.Context) (count int, err error) {
 }
 
 func (idx *index) Drop(ctx context.Context, cn conn.Conn) (err error) {
-	_, err = cn.ExecContext(ctx, idx.sql.Drop(), nil)
+	if _, err = cn.ExecContext(ctx, idx.sql.Drop(), nil); err != nil {
+		return
+	}
+	if _, err = idx.c.db.stmt.removeIndex.ExecContext(ctx, []driver.NamedValue{
+		{Name: "indexName", Value: idx.info.Name}, {Name: "collName", Value: idx.c.name},
+	}); err != nil {
+		return
+	}
 	return
 }
 

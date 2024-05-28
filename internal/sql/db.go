@@ -19,8 +19,8 @@ const dbInit = `
 		name TEXT NOT NULL,
 		collection TEXT NOT NULL,
 		fields TEXT NOT NULL,
-		sparse BOOL NOT NULL DEFAULT FALSE,
-		'unique' BOOL NOT NULL DEFAULT FALSE
+		isSparse BOOL NOT NULL DEFAULT FALSE,
+		isUnique BOOL NOT NULL DEFAULT FALSE
 	);
 	CREATE UNIQUE INDEX IF NOT EXISTS '%ns_system_indexes_index' ON '%ns_system_indexes' (collection, name);
 `
@@ -54,7 +54,7 @@ func (s DBSql) RenameCollectionIndexStmt(ctx context.Context, c conn.Conn) (conn
 
 func (s DBSql) RegisterIndexStmt(ctx context.Context, c conn.Conn) (conn.Stmt, error) {
 	return s.Prepare(ctx, c, s.WithNS(`
-		INSERT INTO '%ns_system_indexes' (name, collection, fields, sparse, 'unique') 
+		INSERT INTO '%ns_system_indexes' (name, collection, fields, isSparse, isUnique) 
 			VALUES(:indexName, :collName, :fields, :sparse, :unique)
 	`))
 }
@@ -64,14 +64,30 @@ func (s DBSql) RemoveIndexStmt(ctx context.Context, c conn.Conn) (conn.Stmt, err
 }
 
 func (s DBSql) FindCollection() string {
-	return s.WithNS(`SELECT * FROM '%ns_system_collections' WHERE name = ?`)
+	return s.WithNS(`SELECT * FROM '%ns_system_collections' WHERE name = :collName`)
 }
 func (s DBSql) FindCollections() string {
 	return s.WithNS(`SELECT name FROM '%ns_system_collections'`)
 }
 
 func (s DBSql) FindIndexes() string {
-	return s.WithNS(`SELECT * FROM '%ns_system_indexes' WHERE collection = :collName`)
+	return s.WithNS(`SELECT name, fields, isSparse, isUnique FROM '%ns_system_indexes' WHERE collection = :collName`)
+}
+
+func (s DBSql) CountIndexes() string {
+	return s.WithNS(`SELECT COUNT(*) FROM '%ns_system_indexes'`)
+}
+
+func (s DBSql) CountCollections() string {
+	return s.WithNS(`SELECT COUNT(*) FROM '%ns_system_collections'`)
+}
+
+func (s DBSql) StatsTotalSize() string {
+	return `SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size();`
+}
+
+func (s DBSql) StatsDataSize() string {
+	return `SELECT (page_count - freelist_count) * page_size as size FROM pragma_page_count(), pragma_freelist_count(), pragma_page_size();`
 }
 
 func (s DBSql) WithNS(sql string) string {

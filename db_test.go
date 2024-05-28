@@ -52,6 +52,41 @@ func TestDb_OpenCollection(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotNil(t, coll)
 	})
+	t.Run("with indexes", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		indexInfo := IndexInfo{Fields: []string{"a", "-b"}, Sparse: true, Unique: true}
+		require.NoError(t, coll.EnsureIndex(ctx, indexInfo))
+		require.NoError(t, coll.Close())
+
+		coll, err = fx.OpenCollection(ctx, "test")
+		require.NoError(t, err)
+		assert.NotNil(t, coll)
+	})
+}
+
+func TestDb_GetCollectionNames(t *testing.T) {
+	fx := newFixture(t)
+	var collNames = []string{"c1", "c2", "c3"}
+	for _, collName := range collNames {
+		coll, err := fx.CreateCollection(ctx, collName)
+		require.NoError(t, err)
+		require.NoError(t, coll.Close())
+	}
+	names, err := fx.GetCollectionNames(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, collNames, names)
+}
+
+func TestDb_Stats(t *testing.T) {
+	fx := newFixture(t)
+	stats, err := fx.Stats(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, 0, stats.IndexesCount)
+	assert.Empty(t, 0, stats.CollectionsCount)
+	assert.NotEmpty(t, stats.TotalSizeBytes)
+	assert.NotEmpty(t, stats.DataSizeBytes)
 }
 
 func newFixture(t testing.TB, c ...*Config) *fixture {

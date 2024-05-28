@@ -42,15 +42,15 @@ func readIndexInfo(buf *syncpool.DocBuffer, rows driver.Rows) (result []IndexInf
 			return nil, err
 		}
 
-		fields, err := jsonToStringArray(buf.Parser, dest[2].(string))
+		fields, err := jsonToStringArray(buf.Parser, dest[1].(string))
 		if err != nil {
 			return nil, err
 		}
 		result = append(result, IndexInfo{
 			Name:   dest[0].(string),
 			Fields: fields,
-			Unique: dest[3].(bool),
-			Sparse: dest[4].(bool),
+			Sparse: dest[2].(int64) != 0,
+			Unique: dest[3].(int64) != 0,
 		})
 	}
 	return
