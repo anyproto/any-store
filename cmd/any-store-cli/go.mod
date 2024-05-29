@@ -1,4 +1,4 @@
-module github.com/anyproto/cmd/any-store-cli
+module github.com/anyproto/any-store/cmd/any-store-cli
 
 go 1.22.1
 
