@@ -117,6 +117,10 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (err error) {
 		}
 	}()
 
+	if err = q.c.checkStmts(tx.Context(), tx.conn()); err != nil {
+		return
+	}
+
 	rows, err := tx.conn().QueryContext(ctx, q.sqlRes, q.qb.values)
 	if err != nil {
 		return
