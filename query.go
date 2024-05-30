@@ -417,9 +417,13 @@ func (qb *queryBuilder) build() string {
 		if len(join.bounds) == 0 {
 			return
 		}
+
 		writeWhere()
 		writeAnd()
 		for fieldNum, bounds := range join.bounds {
+			if len(bounds) == 0 {
+				continue
+			}
 			if fieldNum != 0 {
 				qb.buf.WriteString(" AND (")
 			} else {
