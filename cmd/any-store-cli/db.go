@@ -272,7 +272,7 @@ func (c *Conn) DeleteId(cmd Cmd) (result string, err error) {
 	if err = json.Unmarshal(cmd.Documents[0], &id); err != nil {
 		return
 	}
-	err = coll.DeleteOne(mainCtx.Ctx(), id)
+	err = coll.DeleteId(mainCtx.Ctx(), id)
 	if err != nil {
 		return
 	}
@@ -295,10 +295,8 @@ func (c *Conn) Find(cmd Cmd) (result string, err error) {
 	if err != nil {
 		return
 	}
-	q := coll.Query()
-	if cmd.Query.Find != nil {
-		q.Cond(cmd.Query.Find)
-	}
+	q := coll.Find(cmd.Query.Find)
+
 	if cmd.Query.Sort != nil {
 		q.Sort(toAnySlice(cmd.Query.Sort)...)
 	}
