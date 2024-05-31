@@ -330,18 +330,20 @@ func (c *Conn) Find(cmd Cmd) (result string, err error) {
 	}
 
 	if cmd.Query.Update != nil {
-		cErr := q.Update(mainCtx.Ctx(), cmd.Query.Update)
+		res, cErr := q.Update(mainCtx.Ctx(), cmd.Query.Update)
 		if cErr != nil {
 			return "", cErr
 		}
+		fmt.Printf("Matched:\t%d\nModified:\t%d\n", res.Matched, res.Modified)
 		return
 	}
 
 	if cmd.Query.Delete {
-		cErr := q.Delete(mainCtx.Ctx())
+		res, cErr := q.Delete(mainCtx.Ctx())
 		if cErr != nil {
 			return "", cErr
 		}
+		fmt.Printf("Deleted:\t%d\n", res.Modified)
 		return
 	}
 

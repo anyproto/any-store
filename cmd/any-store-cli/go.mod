@@ -3,7 +3,7 @@ module github.com/anyproto/any-store/cmd/any-store-cli
 go 1.22.1
 
 require (
-	github.com/anyproto/any-store v0.0.0-20240529125212-36e7f66b260b
+	github.com/anyproto/any-store v0.0.0-20240531092024-aeb071ec5c37
 	github.com/fatih/color v1.17.0
 	github.com/peterh/liner v1.2.2
 	github.com/robertkrimen/otto v0.4.0
@@ -19,7 +19,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.22 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/valyala/fastjson v1.6.4 // indirect
-	golang.org/x/exp v0.0.0-20240529005216-23cca8864a10 // indirect
+	golang.org/x/exp v0.0.0-20240530194437-404ba88c7ed0 // indirect
 	golang.org/x/sys v0.18.0 // indirect
 	golang.org/x/text v0.4.0 // indirect
 	gopkg.in/sourcemap.v1 v1.0.5 // indirect
