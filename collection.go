@@ -204,6 +204,7 @@ func (c *collection) InsertOne(ctx context.Context, doc any) (id any, err error)
 			return
 		}
 		var it item
+		buf.Arena.Reset()
 		if it, txErr = parseItem(buf.Parser, buf.Arena, doc, true); txErr != nil {
 			return txErr
 		}
@@ -234,6 +235,7 @@ func (c *collection) Insert(ctx context.Context, docs ...any) (err error) {
 		}
 		var it item
 		for _, doc := range docs {
+			buf.Arena.Reset()
 			if it, txErr = parseItem(buf.Parser, buf.Arena, doc, true); txErr != nil {
 				return txErr
 			}
@@ -265,7 +267,7 @@ func (c *collection) UpdateOne(ctx context.Context, doc any) (err error) {
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	var it item
-	if it, err = parseItem(buf.Parser, buf.Arena, doc, false); err != nil {
+	if it, err = parseItem(buf.Parser, nil, doc, false); err != nil {
 		return
 	}
 
@@ -314,7 +316,8 @@ func (c *collection) loadById(ctx context.Context, buf *syncpool.DocBuffer, id k
 		}
 		return item{}, rErr
 	}
-	return parseItem(buf.Parser, buf.Arena, dest[0], false)
+
+	return parseItem(buf.Parser, nil, dest[0], false)
 }
 
 func (c *collection) UpsertOne(ctx context.Context, doc any) (id any, err error) {
@@ -322,6 +325,7 @@ func (c *collection) UpsertOne(ctx context.Context, doc any) (id any, err error)
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	var it item
+	buf.Arena.Reset()
 	if it, err = parseItem(buf.Parser, buf.Arena, doc, true); err != nil {
 		return
 	}
@@ -430,7 +434,7 @@ func (c *collection) EnsureIndex(ctx context.Context, info ...IndexInfo) (err er
 				return rErr
 			}
 			var it item
-			if it, txErr = parseItem(buf.Parser, buf.Arena, dest[0], false); txErr != nil {
+			if it, txErr = parseItem(buf.Parser, nil, dest[0], false); txErr != nil {
 				return
 			}
 			id := it.appendId(buf.SmallBuf[:0])

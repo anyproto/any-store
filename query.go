@@ -143,6 +143,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (err error) {
 			modifiedVal *fastjson.Value
 			isModified  bool
 		)
+		buf.Arena.Reset()
 		modifiedVal, isModified, err = mod.Modify(buf.Arena, copyItem(buf, doc.(item)).val)
 		if err != nil {
 			return
