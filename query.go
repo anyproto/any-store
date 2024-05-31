@@ -163,8 +163,55 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (err error) {
 }
 
 func (q *collQuery) Delete(ctx context.Context) (err error) {
-	//TODO implement me
-	panic("implement me")
+	qb, err := q.makeQuery()
+	if err != nil {
+		return
+	}
+	sqlRes := qb.build(false)
+
+	tx, err := q.c.db.getWriteTx(ctx)
+	if err != nil {
+		qb.Close()
+		return
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		} else {
+			err = tx.Commit()
+		}
+	}()
+
+	if err = q.c.checkStmts(tx.Context(), tx.conn()); err != nil {
+		qb.Close()
+		return
+	}
+
+	rows, err := tx.conn().QueryContext(ctx, sqlRes, qb.values)
+	if err != nil {
+		qb.Close()
+		return
+	}
+	iter := q.newIterator(rows, tx, qb)
+	defer func() {
+		_ = iter.Close()
+	}()
+
+	buf := q.c.db.syncPool.GetDocBuf()
+	defer q.c.db.syncPool.ReleaseDocBuf(buf)
+
+	for iter.Next() {
+		var doc Doc
+		if doc, err = iter.Doc(); err != nil {
+			return
+		}
+		id := doc.(item).appendId(buf.SmallBuf[:0])
+		if err = q.c.deleteItem(tx.Context(), id, doc.(item)); err != nil {
+			return
+		}
+	}
+	err = iter.Err()
+	return
 }
 
 func (q *collQuery) Count(ctx context.Context) (count int, err error) {

@@ -164,3 +164,18 @@ func TestCollQuery_Update(t *testing.T) {
 
 	assertQueryCount(t, coll.Query().Cond(`{"a":1}`), 2)
 }
+
+func TestCollQuery_Delete(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+
+	require.NoError(t, coll.Insert(ctx, `{"id":1,"a":1}`, `{"id":2,"a":1}`, `{"id":3,"a":1}`, `{"id":4,"a":1}`))
+
+	assertQueryCount(t, coll.Query().Cond(`{"a":1}`), 4)
+
+	require.NoError(t, coll.Query().Cond(`{"id":{"$in":[1,3]}}`).Delete(ctx))
+
+	assertCollCount(t, coll, 2)
+}

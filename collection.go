@@ -362,11 +362,15 @@ func (c *collection) DeleteOne(ctx context.Context, id any) (err error) {
 		if txErr != nil {
 			return
 		}
-		if _, txErr = c.stmts.delete.ExecContext(ctx, []driver.NamedValue{{Name: "id", Value: idKey}}); txErr != nil {
-			return
-		}
-		return c.indexesHandleDelete(ctx, idKey, it)
+		return c.deleteItem(ctx, idKey, it)
 	})
+}
+
+func (c *collection) deleteItem(ctx context.Context, id []byte, prevItem item) (err error) {
+	if _, err = c.stmts.delete.ExecContext(ctx, []driver.NamedValue{{Name: "id", Value: id}}); err != nil {
+		return
+	}
+	return c.indexesHandleDelete(ctx, id, prevItem)
 }
 
 func (c *collection) Count(ctx context.Context) (count int, err error) {
