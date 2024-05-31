@@ -16,10 +16,21 @@ import (
 	"github.com/anyproto/any-store/internal/sql"
 )
 
+// IndexInfo provides information about an index.
 type IndexInfo struct {
-	Name   string
+	// Name is the name of the index. If empty, it will be generated
+	// based on the fields (e.g., "name,-createdDate").
+	Name string
+
+	// Fields are the fields included in the index. Each field can specify
+	// ascending (e.g., "name") or descending (e.g., "-createdDate") order.
 	Fields []string
+
+	// Unique indicates whether the index enforces a unique constraint.
 	Unique bool
+
+	// Sparse indicates whether the index is sparse, indexing only documents
+	// with the specified fields.
 	Sparse bool
 }
 
@@ -27,8 +38,12 @@ func (i IndexInfo) createName() string {
 	return strings.Join(i.Fields, ",")
 }
 
+// Index represents an index on a collection.
 type Index interface {
+	// Info returns the IndexInfo for this index.
 	Info() IndexInfo
+
+	// Len returns the length of the index.
 	Len(ctx context.Context) (int, error)
 }
 

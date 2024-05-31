@@ -9,10 +9,35 @@ import (
 	"github.com/anyproto/any-store/internal/syncpool"
 )
 
+// Iterator represents an iterator over query results.
+//
+// Example of usage:
+//
+//	for iter.Next() {
+//	    doc, err := iter.Doc()
+//	    if err != nil {
+//	        log.Fatalf("error retrieving document: %v", err)
+//	    }
+//	    fmt.Println("Document:", doc.Value().String())
+//	}
+//	if err := iter.Close(); err != nil {
+//	    log.Fatalf("iteration error: %v", err)
+//	}
 type Iterator interface {
+	// Next advances the iterator to the next document.
+	// Returns false if there are no more documents.
 	Next() bool
+
+	// Doc returns the current document.
+	// Returns an error if there is an issue retrieving the document.
 	Doc() (Doc, error)
+
+	// Err returns any error encountered during the lifetime of the iterator,
+	// including errors from invalid queries or during iteration.
 	Err() error
+
+	// Close closes the iterator and releases any associated resources.
+	// Returns an error if there is an issue closing the iterator or any other error encountered during its lifetime.
 	Close() error
 }
 

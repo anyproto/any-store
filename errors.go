@@ -7,23 +7,41 @@ import (
 )
 
 var (
-	ErrDocExists    = errors.New("any-store: doc exists")
-	ErrDocNotFound  = errors.New("any-store: doc not found")
-	ErrDocWithoutId = errors.New("any-store: doc without id")
+	// ErrDocExists is returned when attempting to insert a document that already exists.
+	ErrDocExists = errors.New("any-store: document already exists")
 
-	ErrCollectionExists   = errors.New("any-store: collection exists")
+	// ErrDocNotFound is returned when a document cannot be found by its ID.
+	ErrDocNotFound = errors.New("any-store: document not found")
+
+	// ErrDocWithoutId is returned when a document is provided without a required ID.
+	ErrDocWithoutId = errors.New("any-store: document missing ID")
+
+	// ErrCollectionExists is returned when attempting to create a collection that already exists.
+	ErrCollectionExists = errors.New("any-store: collection already exists")
+
+	// ErrCollectionNotFound is returned when a collection cannot be found.
 	ErrCollectionNotFound = errors.New("any-store: collection not found")
 
-	ErrIndexExists   = errors.New("any-store: index exists")
-	ErrIndexNotFound = errors.New("any-store: index does not exist")
+	// ErrIndexExists is returned when attempting to create an index that already exists.
+	ErrIndexExists = errors.New("any-store: index already exists")
 
-	ErrTxIsReadOnly    = errors.New("any-store: tx is read-only")
-	ErrTxIsUsed        = errors.New("any-store: tx is been used")
-	ErrTxOtherInstance = errors.New("any-store: tx is from an other db instance")
+	// ErrIndexNotFound is returned when an index cannot be found.
+	ErrIndexNotFound = errors.New("any-store: index not found")
 
-	ErrUniqueConstraint = errors.New("any-store: unique constraint")
+	// ErrTxIsReadOnly is returned when a write operation is attempted in a read-only transaction.
+	ErrTxIsReadOnly = errors.New("any-store: transaction is read-only")
 
-	ErrIterClosed = errors.New("any-store: iter is closed")
+	// ErrTxIsUsed is returned when an operation is attempted on a transaction that has already been committed or rolled back.
+	ErrTxIsUsed = errors.New("any-store: transaction has already been used")
+
+	// ErrTxOtherInstance is returned when an operation is attempted using a transaction from a different database instance.
+	ErrTxOtherInstance = errors.New("any-store: transaction belongs to another database instance")
+
+	// ErrUniqueConstraint is returned when a unique constraint violation occurs.
+	ErrUniqueConstraint = errors.New("any-store: unique constraint violation")
+
+	// ErrIterClosed is returned when operations are attempted on a closed iterator.
+	ErrIterClosed = errors.New("any-store: iterator is closed")
 )
 
 func replaceUniqErr(err, replaceTo error) error {

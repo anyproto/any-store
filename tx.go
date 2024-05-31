@@ -9,15 +9,28 @@ import (
 	"github.com/anyproto/any-store/internal/objectid"
 )
 
+// WriteTx represents a read-write transaction.
 type WriteTx interface {
+	// ReadTx is embedded to provide read-only transaction methods.
 	ReadTx
+
+	// Rollback rolls back the transaction.
+	// Returns an error if the rollback fails.
 	Rollback() error
 }
 
+// ReadTx represents a read-only transaction.
 type ReadTx interface {
+	// Context returns the context associated with the transaction.
 	Context() context.Context
+
+	// Commit commits the transaction.
+	// Returns an error if the commit fails.
 	Commit() error
+
+	// Done returns true if the transaction is completed (committed or rolled back).
 	Done() bool
+
 	conn() conn.Conn
 	instanceId() string
 }

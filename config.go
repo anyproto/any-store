@@ -13,9 +13,18 @@ var defaultSQLiteOptions = map[string]string{
 	"_foreign_keys": "true",
 }
 
+// Config provides the configuration options for the database.
 type Config struct {
-	Namespace               string
-	ReadConnections         int
+	// Namespace is a prefix for all created tables and indexes by any-store,
+	// helping to isolate tables and indexes within the same database file.
+	Namespace string
+
+	// ReadConnections specifies the number of read connections to the database,
+	// optimizing read operations by allowing multiple concurrent read connections.
+	ReadConnections int
+
+	// SQLiteConnectionOptions provides additional options for SQLite connections,
+	// corresponding to SQLite pragmas or other connection settings.
 	SQLiteConnectionOptions map[string]string
 }
 

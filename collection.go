@@ -20,29 +20,63 @@ import (
 	"github.com/anyproto/any-store/internal/syncpool"
 )
 
+// Collection represents a collection of documents.
 type Collection interface {
+	// Name returns the name of the collection.
 	Name() string
 
+	// FindId finds a document by its ID.
+	// Returns the document or an error if the document is not found.
 	FindId(ctx context.Context, id any) (Doc, error)
-	Query() Query
 
+	// Find returns a new Query object with given filter
+	Find(filter any) Query
+
+	// InsertOne inserts a single document into the collection.
+	// Returns the ID of the inserted document or an error if the insertion fails.
 	InsertOne(ctx context.Context, doc any) (id any, err error)
+
+	// Insert inserts multiple documents into the collection.
+	// Returns an error if the insertion fails.
 	Insert(ctx context.Context, docs ...any) (err error)
 
+	// UpdateOne updates a single document in the collection.
+	// Returns an error if the update fails.
 	UpdateOne(ctx context.Context, doc any) (err error)
+
+	// UpsertOne inserts a document if it does not exist, or updates it if it does.
+	// Returns the ID of the upserted document or an error if the operation fails.
 	UpsertOne(ctx context.Context, doc any) (id any, err error)
 
-	DeleteOne(ctx context.Context, id any) (err error)
+	// DeleteId deletes a single document by its ID.
+	// Returns an error if the deletion fails.
+	DeleteId(ctx context.Context, id any) (err error)
 
+	// Count returns the number of documents in the collection.
+	// Returns the count of documents or an error if the operation fails.
 	Count(ctx context.Context) (count int, err error)
 
+	// EnsureIndex ensures an index exists on the specified fields.
+	// Returns an error if the operation fails.
 	EnsureIndex(ctx context.Context, info ...IndexInfo) (err error)
+
+	// DropIndex drops an index by its name.
+	// Returns an error if the operation fails.
 	DropIndex(ctx context.Context, indexName string) (err error)
+
+	// GetIndexes returns a list of indexes on the collection.
 	GetIndexes() (indexes []Index)
 
+	// Rename renames the collection.
+	// Returns an error if the operation fails.
 	Rename(ctx context.Context, newName string) (err error)
+
+	// Drop drops the collection.
+	// Returns an error if the operation fails.
 	Drop(ctx context.Context) (err error)
 
+	// Close closes the collection.
+	// Returns an error if the operation fails.
 	Close() error
 }
 
@@ -190,8 +224,13 @@ func (c *collection) FindId(ctx context.Context, docId any) (doc Doc, err error)
 	return
 }
 
-func (c *collection) Query() Query {
-	return &collQuery{c: c}
+func (c *collection) Find(filter any) Query {
+	q := &collQuery{c: c}
+	if filter != nil {
+		return q.Cond(filter)
+	} else {
+		return q
+	}
 }
 
 func (c *collection) InsertOne(ctx context.Context, doc any) (id any, err error) {
@@ -353,7 +392,7 @@ func (c *collection) UpsertOne(ctx context.Context, doc any) (id any, err error)
 	return id, nil
 }
 
-func (c *collection) DeleteOne(ctx context.Context, id any) (err error) {
+func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 

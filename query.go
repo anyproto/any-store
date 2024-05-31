@@ -16,21 +16,41 @@ import (
 	"github.com/anyproto/any-store/query"
 )
 
+// ModifyResult represents the result of a modification operation.
 type ModifyResult struct {
-	Matched  int
+	// Matched is the number of documents matched by the query.
+	Matched int
+
+	// Modified is the number of documents that were actually modified.
 	Modified int
 }
 
+// Query represents a query on a collection.
 type Query interface {
-	Cond(filter any) Query
+
+	// Limit sets the maximum number of documents to return.
 	Limit(limit uint) Query
+
+	// Offset sets the number of documents to skip before starting to return results.
 	Offset(offset uint) Query
+
+	// Sort sets the sort order for the query results.
 	Sort(sort ...any) Query
-	Iter(ctx context.Context) (iter Iterator)
+
+	// Iter executes the query and returns an Iterator for the results.
+	Iter(ctx context.Context) Iterator
+
+	// Count returns the number of documents matching the query.
 	Count(ctx context.Context) (count int, err error)
+
+	// Update modifies documents matching the query.
 	Update(ctx context.Context, modifier any) (res ModifyResult, err error)
+
+	// Delete removes documents matching the query.
 	Delete(ctx context.Context) (res ModifyResult, err error)
-	Explain(ctx context.Context) (query, explain string, err error)
+
+	// Explain provides the query execution plan.
+	Explain(ctx context.Context) (sql, explain string, err error)
 }
 
 type collQuery struct {
