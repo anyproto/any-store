@@ -16,6 +16,11 @@ import (
 	"github.com/anyproto/any-store/query"
 )
 
+type ModifyResult struct {
+	Matched  int
+	Modified int
+}
+
 type Query interface {
 	Cond(filter any) Query
 	Limit(limit uint) Query
@@ -23,8 +28,8 @@ type Query interface {
 	Sort(sort ...any) Query
 	Iter(ctx context.Context) (iter Iterator)
 	Count(ctx context.Context) (count int, err error)
-	Update(ctx context.Context, modifier any) error
-	Delete(ctx context.Context) (err error)
+	Update(ctx context.Context, modifier any) (res ModifyResult, err error)
+	Delete(ctx context.Context) (res ModifyResult, err error)
 	Explain(ctx context.Context) (query, explain string, err error)
 }
 
@@ -92,7 +97,7 @@ func (q *collQuery) newIterator(rows driver.Rows, tx ReadTx, qb *queryBuilder) *
 	}
 }
 
-func (q *collQuery) Update(ctx context.Context, modifier any) (err error) {
+func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResult, err error) {
 	mod, err := query.ParseModifier(modifier)
 	if err != nil {
 		return
@@ -148,9 +153,12 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (err error) {
 		if err != nil {
 			return
 		}
+
+		result.Matched++
 		if !isModified {
 			continue
 		}
+
 		var it item
 		if it, err = newItem(modifiedVal, nil, false); err != nil {
 			return
@@ -158,12 +166,13 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (err error) {
 		if err = q.c.update(tx.Context(), it, doc.(item)); err != nil {
 			return
 		}
+		result.Modified++
 	}
 	err = iter.Err()
 	return
 }
 
-func (q *collQuery) Delete(ctx context.Context) (err error) {
+func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error) {
 	qb, err := q.makeQuery()
 	if err != nil {
 		return
@@ -210,6 +219,8 @@ func (q *collQuery) Delete(ctx context.Context) (err error) {
 		if err = q.c.deleteItem(tx.Context(), id, doc.(item)); err != nil {
 			return
 		}
+		result.Matched++
+		result.Modified++
 	}
 	err = iter.Err()
 	return

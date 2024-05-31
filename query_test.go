@@ -160,7 +160,9 @@ func TestCollQuery_Update(t *testing.T) {
 
 	assertQueryCount(t, coll.Query().Cond(`{"a":1}`), 4)
 
-	require.NoError(t, coll.Query().Cond(`{"id":{"$in":[1,3]}}`).Update(ctx, `{"$inc":{"a":1}}`))
+	mRes, err := coll.Query().Cond(`{"id":{"$in":[1,3]}}`).Update(ctx, `{"$inc":{"a":1}}`)
+	require.NoError(t, err)
+	assert.Equal(t, ModifyResult{Matched: 2, Modified: 2}, mRes)
 
 	assertQueryCount(t, coll.Query().Cond(`{"a":1}`), 2)
 }
@@ -175,7 +177,9 @@ func TestCollQuery_Delete(t *testing.T) {
 
 	assertQueryCount(t, coll.Query().Cond(`{"a":1}`), 4)
 
-	require.NoError(t, coll.Query().Cond(`{"id":{"$in":[1,3]}}`).Delete(ctx))
+	mRes, err := coll.Query().Cond(`{"id":{"$in":[1,3]}}`).Delete(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, ModifyResult{Matched: 2, Modified: 2}, mRes)
 
 	assertCollCount(t, coll, 2)
 }
