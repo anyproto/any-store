@@ -110,8 +110,9 @@ func testFile(t *testing.T, filename string) {
 		for i, eId := range tc.ExpectedIds {
 			expected[i] = fastjson.MustParseBytes(eId).String()
 		}
-
 		assert.Equal(t, expected, result, j)
+		require.NoError(t, iter.Close())
+
 		query, explain, err := q.Explain(ctx)
 		require.NoError(t, err)
 		if tc.ExpectedExplain != "" {
@@ -121,7 +122,6 @@ func testFile(t *testing.T, filename string) {
 			assert.Equal(t, strings.TrimSpace(tc.ExpectedQuery), strings.TrimSpace(query), j)
 		}
 
-		require.NoError(t, iter.Close())
 		t.Logf("%d\t%s\t%v", j, query, dur)
 	}
 

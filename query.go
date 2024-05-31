@@ -1,11 +1,12 @@
 package anystore
 
 import (
+	"bytes"
 	"context"
 	"database/sql/driver"
 	"errors"
 	"strconv"
-	"strings"
+	"sync"
 
 	"github.com/valyala/fastjson"
 
@@ -34,10 +35,6 @@ type collQuery struct {
 	sort sort.Sort
 
 	limit, offset uint
-
-	qb *queryBuilder
-
-	sqlRes string
 
 	err error
 }
@@ -69,28 +66,29 @@ func (q *collQuery) Sort(sorts ...any) Query {
 }
 
 func (q *collQuery) Iter(ctx context.Context) (iter Iterator) {
-	if err := q.makeQuery(false); err != nil {
+	qb, err := q.makeQuery()
+	if err != nil {
 		return &iterator{err: err}
 	}
-	q.sqlRes = q.qb.build()
+	sqlRes := qb.build(false)
 	tx, err := q.c.db.ReadTx(ctx)
 	if err != nil {
 		return &iterator{err: err}
 	}
-	rows, err := tx.conn().QueryContext(ctx, q.sqlRes, q.qb.values)
+	rows, err := tx.conn().QueryContext(ctx, sqlRes, qb.values)
 	if err != nil {
 		return &iterator{err: err}
 	}
-	return q.newIterator(rows, tx)
+	return q.newIterator(rows, tx, qb)
 }
 
-func (q *collQuery) newIterator(rows driver.Rows, tx ReadTx) *iterator {
+func (q *collQuery) newIterator(rows driver.Rows, tx ReadTx, qb *queryBuilder) *iterator {
 	return &iterator{
 		rows: rows,
 		dest: make([]driver.Value, 1),
 		buf:  q.c.db.syncPool.GetDocBuf(),
 		tx:   tx,
-		q:    q,
+		qb:   qb,
 	}
 }
 
@@ -99,14 +97,15 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (err error) {
 	if err != nil {
 		return
 	}
-	if err = q.makeQuery(false); err != nil {
+	qb, err := q.makeQuery()
+	if err != nil {
 		return
 	}
-	defer q.qb.release(q.c.db)
-	q.sqlRes = q.qb.build()
+	sqlRes := qb.build(false)
 
 	tx, err := q.c.db.getWriteTx(ctx)
 	if err != nil {
+		qb.Close()
 		return
 	}
 	defer func() {
@@ -118,14 +117,16 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (err error) {
 	}()
 
 	if err = q.c.checkStmts(tx.Context(), tx.conn()); err != nil {
+		qb.Close()
 		return
 	}
 
-	rows, err := tx.conn().QueryContext(ctx, q.sqlRes, q.qb.values)
+	rows, err := tx.conn().QueryContext(ctx, sqlRes, qb.values)
 	if err != nil {
+		qb.Close()
 		return
 	}
-	iter := q.newIterator(rows, tx)
+	iter := q.newIterator(rows, tx, qb)
 	defer func() {
 		_ = iter.Close()
 	}()
@@ -167,13 +168,14 @@ func (q *collQuery) Delete(ctx context.Context) (err error) {
 }
 
 func (q *collQuery) Count(ctx context.Context) (count int, err error) {
-	if err = q.makeQuery(true); err != nil {
+	qb, err := q.makeQuery()
+	if err != nil {
 		return
 	}
-	defer q.qb.release(q.c.db)
-	q.sqlRes = q.qb.build()
+	defer qb.Close()
+	sqlRes := qb.build(true)
 	err = q.c.db.doReadTx(ctx, func(cn conn.Conn) (txErr error) {
-		rows, txErr := cn.QueryContext(ctx, q.sqlRes, q.qb.values)
+		rows, txErr := cn.QueryContext(ctx, sqlRes, qb.values)
 		if txErr != nil {
 			return txErr
 		}
@@ -187,14 +189,14 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 }
 
 func (q *collQuery) Explain(ctx context.Context) (query, explain string, err error) {
-	if err = q.makeQuery(false); err != nil {
+	qb, err := q.makeQuery()
+	if err != nil {
 		return
 	}
-	defer q.qb.release(q.c.db)
-	q.sqlRes = q.qb.build()
-	query = q.sqlRes
+	defer qb.Close()
+	query = qb.build(false)
 	err = q.c.db.doReadTx(ctx, func(cn conn.Conn) (txErr error) {
-		rows, txErr := cn.QueryContext(ctx, "EXPLAIN QUERY PLAN "+query, q.qb.values)
+		rows, txErr := cn.QueryContext(ctx, "EXPLAIN QUERY PLAN "+query, qb.values)
 		if txErr != nil {
 			return txErr
 		}
@@ -207,21 +209,19 @@ func (q *collQuery) Explain(ctx context.Context) (query, explain string, err err
 	return
 }
 
-func (q *collQuery) makeQuery(count bool) (err error) {
+func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 	if q.err != nil {
-		return q.err
+		return nil, q.err
 	}
 
-	q.qb = &queryBuilder{
-		tableName: q.c.tableName,
-		count:     count,
-		buf:       &strings.Builder{},
-		limit:     int(q.limit),
-		offset:    int(q.offset),
-	}
+	qb = newQueryBuilder()
+	qb.coll = q.c
+	qb.tableName = q.c.tableName
+	qb.limit = int(q.limit)
+	qb.offset = int(q.offset)
 
 	if q.cond != nil {
-		q.qb.filterId = q.c.db.filterReg.Register(q.cond)
+		qb.filterId = q.c.db.filterReg.Register(q.cond)
 	} else {
 		q.cond = query.All{}
 	}
@@ -233,12 +233,12 @@ func (q *collQuery) makeQuery(count bool) (err error) {
 
 	// handle "id" field
 	if _, idBounds := q.cond.IndexFilter("id", nil); len(idBounds) != 0 {
-		q.qb.idBounds = idBounds
+		qb.idBounds = idBounds
 	}
 
 	var checkIdSort = func() {
 		if len(sortFields) > 0 && sortFields[0].Field == "id" {
-			q.qb.sorts = append(q.qb.sorts, qbSort{reverse: sortFields[0].Reverse})
+			qb.sorts = append(qb.sorts, qbSort{reverse: sortFields[0].Reverse})
 			sortFields = sortFields[1:]
 		}
 	}
@@ -261,7 +261,7 @@ func (q *collQuery) makeQuery(count bool) (err error) {
 
 		if en := equalNum(sortFields, idx.fieldNames); en > 0 {
 			for i := 0; i < en; i++ {
-				q.qb.sorts = append(q.qb.sorts, qbSort{
+				qb.sorts = append(qb.sorts, qbSort{
 					tableName: idx.sql.TableName(),
 					fieldNum:  i,
 					reverse:   sortFields[i].Reverse,
@@ -280,26 +280,38 @@ func (q *collQuery) makeQuery(count bool) (err error) {
 			if !hasFilters {
 				join.bounds = nil
 			}
-			q.qb.joins = append(q.qb.joins, join)
+			qb.joins = append(qb.joins, join)
 		}
 
 	}
 
 	if len(sortFields) > 0 && !exactIndexSort {
-		q.qb.sortId = q.c.db.sortReg.Register(q.sort)
+		qb.sortId = q.c.db.sortReg.Register(q.sort)
 	}
 	return
 }
 
+var qbPool = &sync.Pool{
+	New: func() any {
+		return &queryBuilder{
+			buf: &bytes.Buffer{},
+		}
+	},
+}
+
+func newQueryBuilder() *queryBuilder {
+	return qbPool.Get().(*queryBuilder)
+}
+
 type queryBuilder struct {
+	coll      *collection
 	tableName string
-	count     bool
 	joins     []qbJoin
 	sorts     []qbSort
 	idBounds  query.Bounds
 	filterId  int
 	sortId    int
-	buf       *strings.Builder
+	buf       *bytes.Buffer
 	values    []driver.NamedValue
 	limit     int
 	offset    int
@@ -317,9 +329,9 @@ type qbSort struct {
 	reverse   bool
 }
 
-func (qb *queryBuilder) build() string {
+func (qb *queryBuilder) build(count bool) string {
 	qb.buf.WriteString("SELECT ")
-	if qb.count {
+	if count {
 		qb.buf.WriteString("COUNT(*)")
 	} else {
 		qb.buf.WriteString("data")
@@ -459,7 +471,7 @@ func (qb *queryBuilder) build() string {
 		qb.buf.WriteString(", data) ")
 	}
 
-	if qb.count {
+	if count {
 		return qb.buf.String()
 	}
 
@@ -507,14 +519,23 @@ func (qb *queryBuilder) build() string {
 	return qb.buf.String()
 }
 
-func (qb *queryBuilder) release(db *db) {
+func (qb *queryBuilder) Close() {
 	if qb != nil {
 		if qb.filterId > 0 {
-			db.filterReg.Release(qb.filterId)
+			qb.coll.db.filterReg.Release(qb.filterId)
 		}
 		if qb.sortId > 0 {
-			db.sortReg.Release(qb.sortId)
+			qb.coll.db.sortReg.Release(qb.sortId)
 		}
+		qb.coll = nil
+		qb.values = qb.values[:0]
+		qb.sorts = qb.sorts[:0]
+		qb.idBounds = qb.idBounds[:0]
+		qb.joins = qb.joins[:0]
+		qb.filterId = 0
+		qb.sortId = 0
+		qb.buf.Reset()
+		qbPool.Put(qb)
 	}
 }
 

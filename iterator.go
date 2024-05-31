@@ -21,7 +21,7 @@ type iterator struct {
 	tx     ReadTx
 	dest   []driver.Value
 	buf    *syncpool.DocBuffer
-	q      *collQuery
+	qb     *queryBuilder
 	err    error
 	closed bool
 }
@@ -68,11 +68,11 @@ func (i *iterator) Close() (err error) {
 	if i.tx != nil {
 		err = errors.Join(i.tx.Commit())
 	}
-	if i.buf != nil && i.q != nil {
-		i.q.c.db.syncPool.ReleaseDocBuf(i.buf)
+	if i.buf != nil && i.qb != nil {
+		i.qb.coll.db.syncPool.ReleaseDocBuf(i.buf)
 	}
-	if i.q != nil {
-		i.q.qb.release(i.q.c.db)
+	if i.qb != nil {
+		i.qb.Close()
 	}
 	return
 }
