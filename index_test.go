@@ -197,13 +197,13 @@ func TestIndex_Delete(t *testing.T) {
 	require.NoError(t, coll.Insert(ctx, `{"id":1, "a":1}`, `{"id":2, "a":1}`, `{"id":3, "b":3}`))
 	assertIndexLen(t, coll.GetIndexes()[0], 3)
 
-	require.NoError(t, coll.DeleteOne(ctx, 1))
+	require.NoError(t, coll.DeleteId(ctx, 1))
 	assertIndexLen(t, coll.GetIndexes()[0], 2)
 
-	require.NoError(t, coll.DeleteOne(ctx, 2))
+	require.NoError(t, coll.DeleteId(ctx, 2))
 	assertIndexLen(t, coll.GetIndexes()[0], 1)
 
-	require.NoError(t, coll.DeleteOne(ctx, 3))
+	require.NoError(t, coll.DeleteId(ctx, 3))
 	assertIndexLen(t, coll.GetIndexes()[0], 0)
 }
 

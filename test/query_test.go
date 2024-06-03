@@ -83,7 +83,7 @@ func testFile(t *testing.T, filename string) {
 	t.Logf("inserted %d docs; %v", len(docs), time.Since(st))
 
 	for j, tc := range testCases.Tests {
-		q := coll.Query().Limit(tc.Limit).Offset(tc.Offset)
+		q := coll.Find(nil).Limit(tc.Limit).Offset(tc.Offset)
 		if tc.Cond != nil {
 			q.Cond(tc.Cond)
 		}

@@ -217,12 +217,12 @@ func TestCollection_DeleteOne(t *testing.T) {
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
 	t.Run("not found", func(t *testing.T) {
-		err = coll.DeleteOne(ctx, "notFound")
+		err = coll.DeleteId(ctx, "notFound")
 		assert.ErrorIs(t, err, ErrDocNotFound)
 	})
 	t.Run("success", func(t *testing.T) {
 		require.NoError(t, coll.Insert(ctx, `{"id":"toDel", "a":2}`))
-		require.NoError(t, coll.DeleteOne(ctx, "toDel"))
+		require.NoError(t, coll.DeleteId(ctx, "toDel"))
 		assertCollCount(t, coll, 0)
 	})
 }

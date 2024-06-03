@@ -14,7 +14,7 @@ func TestIterator_Doc(t *testing.T) {
 	docs := []any{`{"id":1,"a":"a"}`, `{"id":2,"a":"b"}`, `{"id":3,"a":"c"}`}
 	require.NoError(t, coll.Insert(ctx, docs...))
 	t.Run("error", func(t *testing.T) {
-		iter := coll.Query().Cond("not valid").Iter(ctx)
+		iter := coll.Find("not valid").Iter(ctx)
 		assert.Error(t, iter.Err())
 		_, err = iter.Doc()
 		assert.Error(t, err)
@@ -22,7 +22,7 @@ func TestIterator_Doc(t *testing.T) {
 		assert.ErrorIs(t, iter.Close(), ErrIterClosed)
 	})
 	t.Run("ok", func(t *testing.T) {
-		iter := coll.Query().Sort("id").Iter(ctx)
+		iter := coll.Find(nil).Sort("id").Iter(ctx)
 		var d Doc
 		var i int
 		for iter.Next() {
