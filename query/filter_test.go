@@ -315,6 +315,75 @@ func TestTypeFilter(t *testing.T) {
 	})
 }
 
+func TestRegexp(t *testing.T) {
+	t.Run("ok", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$regex": "a"}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(fastjson.MustParse(`{"name": "a"}`)))
+		assert.False(t, f.Ok(fastjson.MustParse(`{"name": "A"}`)))
+		assert.False(t, f.Ok(fastjson.MustParse(`{"name":"b"}`)))
+	})
+	t.Run("ok - complex expression", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$regex": "^(?i)a"}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(fastjson.MustParse(`{"name": "baaa"}`)))
+		assert.True(t, f.Ok(fastjson.MustParse(`{"name": "A"}`)))
+		assert.True(t, f.Ok(fastjson.MustParse(`{"name": "a"}`)))
+	})
+	t.Run("ok - array", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$regex": "^(?i)a"}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(fastjson.MustParse(`{"name": ["A", "B", "C"]}`)))
+		assert.False(t, f.Ok(fastjson.MustParse(`{"name": ["baaa"]}`)))
+		assert.True(t, f.Ok(fastjson.MustParse(`{"name": ["baaa", "a"]}`)))
+	})
+	t.Run("ok - number", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$regex": "^a(?i)"}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(fastjson.MustParse(`{"name":1}`)))
+	})
+	t.Run("ok - nil value", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$regex": "^a(?i)"}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(nil))
+	})
+
+	t.Run("index: no prefix", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$regex": "prefix"}}`)
+		require.NoError(t, err)
+		_, bounds := f.IndexFilter("name", Bounds{})
+		assert.Len(t, bounds, 0)
+	})
+	t.Run("index: ^(?i)prefix - return prefix", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$regex": "^(?i)prefix"}}`)
+		require.NoError(t, err)
+		_, bounds := f.IndexFilter("name", Bounds{})
+		assert.Len(t, bounds, 1)
+		assert.Equal(t, "prefix", bounds[0].Start.String())
+	})
+	t.Run("index: ^(?i)prefix\\.test - return prefix.test", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$regex": "^(?i)prefix\.test"}}`)
+		require.NoError(t, err)
+		_, bounds := f.IndexFilter("name", Bounds{})
+		assert.Len(t, bounds, 1)
+		assert.Equal(t, "prefix.test", bounds[0].Start.String())
+	})
+	t.Run("index: ^(?i)prefix\\.test{1}* - return prefix.test", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$regex": "^(?i)prefix\.test{a-zA-z}*"}}`)
+		require.NoError(t, err)
+		_, bounds := f.IndexFilter("name", Bounds{})
+		assert.Len(t, bounds, 1)
+		assert.Equal(t, "prefix.test", bounds[0].Start.String())
+	})
+	t.Run("index: ^(?i)prefix+ - return prefix", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$regex": "^(?i)prefix+"}}`)
+		require.NoError(t, err)
+		_, bounds := f.IndexFilter("name", Bounds{})
+		assert.Len(t, bounds, 1)
+		assert.Equal(t, "prefix", bounds[0].Start.String())
+	})
+}
+
 func BenchmarkFilter_Ok(b *testing.B) {
 	doc := fastjson.MustParse(`{"a":2,"b":[3,2,1],"c":"test"}`)
 	bench := func(b *testing.B, query string) {
