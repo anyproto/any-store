@@ -75,6 +75,14 @@ type Collection interface {
 	// Returns an error if the operation fails.
 	Drop(ctx context.Context) (err error)
 
+	// ReadTx starts a new read-only transaction. It's just a proxy to db object.
+	// Returns a ReadTx or an error if there is an issue starting the transaction.
+	ReadTx(ctx context.Context) (ReadTx, error)
+
+	// WriteTx starts a new read-write transaction. It's just a proxy to db object.
+	// Returns a WriteTx or an error if there is an issue starting the transaction.
+	WriteTx(ctx context.Context) (WriteTx, error)
+
 	// Close closes the collection.
 	// Returns an error if the operation fails.
 	Close() error
@@ -665,6 +673,14 @@ func (c *collection) closeStmts() {
 			_ = stmt.Close()
 		}
 	}
+}
+
+func (c *collection) WriteTx(ctx context.Context) (WriteTx, error) {
+	return c.db.WriteTx(ctx)
+}
+
+func (c *collection) ReadTx(ctx context.Context) (ReadTx, error) {
+	return c.db.ReadTx(ctx)
 }
 
 func (c *collection) Close() error {
