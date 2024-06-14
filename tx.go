@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/anyproto/any-store/internal/conn"
 )
@@ -107,7 +108,7 @@ var savepointPool = &sync.Pool{
 func newSavepointTx(ctx context.Context, wrTx WriteTx) (WriteTx, error) {
 	tx := savepointPool.Get().(*savepointTx)
 	tx.reset(wrTx)
-	if _, err := tx.conn().ExecContext(ctx, string(tx.createQuery), nil); err != nil {
+	if _, err := tx.conn().ExecContext(ctx, unsafe.String(unsafe.SliceData(tx.createQuery), len(tx.createQuery)), nil); err != nil {
 		return nil, err
 	}
 	return tx, nil
@@ -157,7 +158,7 @@ func (tx *savepointTx) reset(wtx WriteTx) {
 
 func (tx *savepointTx) Commit() error {
 	if tx.done.CompareAndSwap(false, true) {
-		if _, err := tx.conn().ExecContext(context.TODO(), string(tx.releaseQuery), nil); err != nil {
+		if _, err := tx.conn().ExecContext(context.TODO(), unsafe.String(unsafe.SliceData(tx.releaseQuery), len(tx.releaseQuery)), nil); err != nil {
 			return err
 		}
 		savepointPool.Put(tx)
@@ -167,7 +168,7 @@ func (tx *savepointTx) Commit() error {
 
 func (tx *savepointTx) Rollback() error {
 	if tx.done.CompareAndSwap(false, true) {
-		if _, err := tx.conn().ExecContext(context.TODO(), string(tx.rollbackQuery), nil); err != nil {
+		if _, err := tx.conn().ExecContext(context.TODO(), unsafe.String(unsafe.SliceData(tx.rollbackQuery), len(tx.rollbackQuery)), nil); err != nil {
 			return err
 		}
 		savepointPool.Put(tx)
