@@ -3,10 +3,11 @@ package anystore
 import (
 	"context"
 	"database/sql/driver"
+	"strconv"
+	"sync"
 	"sync/atomic"
 
 	"github.com/anyproto/any-store/internal/conn"
-	"github.com/anyproto/any-store/internal/objectid"
 )
 
 // WriteTx represents a read-write transaction.
@@ -95,37 +96,81 @@ func (w *writeTx) Commit() error {
 	return nil
 }
 
+var savepointIds atomic.Uint64
+
+var savepointPool = &sync.Pool{
+	New: func() any {
+		return &savepointTx{}
+	},
+}
+
 func newSavepointTx(ctx context.Context, wrTx WriteTx) (WriteTx, error) {
-	tx := &savepointTx{
-		id:      objectid.NewObjectID().Hex(),
-		WriteTx: wrTx,
-	}
-	if _, err := tx.conn().ExecContext(ctx, "SAVEPOINT  '"+tx.id+"'", nil); err != nil {
+	tx := savepointPool.Get().(*savepointTx)
+	tx.reset(wrTx)
+	if _, err := tx.conn().ExecContext(ctx, string(tx.createQuery), nil); err != nil {
 		return nil, err
 	}
 	return tx, nil
 }
 
+const (
+	savepointCreateQuery   = "SAVEPOINT sp"
+	savepointReleaseQuery  = "RELEASE SAVEPOINT sp"
+	savepointRollbackQuery = "ROLLBACK TO SAVEPOINT sp"
+)
+
 type savepointTx struct {
-	id string
 	WriteTx
-	done atomic.Bool
+	id            uint64
+	createQuery   []byte
+	releaseQuery  []byte
+	rollbackQuery []byte
+	done          atomic.Bool
+}
+
+func (tx *savepointTx) reset(wtx WriteTx) {
+	tx.id = savepointIds.Add(1)
+	tx.WriteTx = wtx
+	tx.done.Store(false)
+	if len(tx.createQuery) == 0 {
+		tx.createQuery = make([]byte, 0, len(savepointCreateQuery)+10)
+		tx.createQuery = append(tx.createQuery, []byte(savepointCreateQuery)...)
+		tx.createQuery = strconv.AppendUint(tx.createQuery, tx.id, 10)
+	} else {
+		tx.createQuery = strconv.AppendUint(tx.createQuery[:len(savepointCreateQuery)], tx.id, 10)
+	}
+	if len(tx.releaseQuery) == 0 {
+		tx.releaseQuery = make([]byte, 0, len(savepointReleaseQuery)+10)
+		tx.releaseQuery = append(tx.releaseQuery, []byte(savepointReleaseQuery)...)
+		tx.releaseQuery = strconv.AppendUint(tx.releaseQuery, tx.id, 10)
+	} else {
+		tx.releaseQuery = strconv.AppendUint(tx.releaseQuery[:len(savepointReleaseQuery)], tx.id, 10)
+	}
+	if len(tx.rollbackQuery) == 0 {
+		tx.rollbackQuery = make([]byte, 0, len(savepointRollbackQuery)+10)
+		tx.rollbackQuery = append(tx.rollbackQuery, []byte(savepointRollbackQuery)...)
+		tx.rollbackQuery = strconv.AppendUint(tx.rollbackQuery, tx.id, 10)
+	} else {
+		tx.rollbackQuery = strconv.AppendUint(tx.rollbackQuery[:len(savepointRollbackQuery)], tx.id, 10)
+	}
 }
 
 func (tx *savepointTx) Commit() error {
 	if tx.done.CompareAndSwap(false, true) {
-		if _, err := tx.conn().ExecContext(context.TODO(), "RELEASE SAVEPOINT '"+tx.id+"'", nil); err != nil {
+		if _, err := tx.conn().ExecContext(context.TODO(), string(tx.releaseQuery), nil); err != nil {
 			return err
 		}
+		savepointPool.Put(tx)
 	}
 	return nil
 }
 
 func (tx *savepointTx) Rollback() error {
 	if tx.done.CompareAndSwap(false, true) {
-		if _, err := tx.conn().ExecContext(context.TODO(), "ROLLBACK TO SAVEPOINT  '"+tx.id+"'", nil); err != nil {
+		if _, err := tx.conn().ExecContext(context.TODO(), string(tx.rollbackQuery), nil); err != nil {
 			return err
 		}
+		savepointPool.Put(tx)
 	}
 	return nil
 }
