@@ -297,10 +297,7 @@ func (c *collection) Insert(ctx context.Context, docs ...any) (err error) {
 
 func (c *collection) insertItem(ctx context.Context, cn conn.Conn, buf *syncpool.DocBuffer, it item) (id []byte, err error) {
 	id = it.appendId(buf.SmallBuf[:0])
-	if _, err = c.stmts.insert.ExecContext(ctx, []driver.NamedValue{
-		{Name: "id", Value: id},
-		{Name: "data", Value: it.Value().MarshalTo(buf.DocBuf[:0])},
-	}); err != nil {
+	if _, err = c.stmts.insert.ExecContext(ctx, buf.DriverValues(id, it.Value().MarshalTo(buf.DocBuf[:0]))); err != nil {
 		return nil, replaceUniqErr(err, ErrDocExists)
 	}
 	if err = c.indexesHandleInsert(ctx, id, it); err != nil {
@@ -337,10 +334,7 @@ func (c *collection) update(ctx context.Context, it, prevIt item) (err error) {
 			return
 		}
 	}
-	if _, err = c.stmts.update.ExecContext(ctx, []driver.NamedValue{
-		{Name: "id", Value: idKey},
-		{Name: "data", Value: it.Value().MarshalTo(buf.DocBuf[:0])},
-	}); err != nil {
+	if _, err = c.stmts.update.ExecContext(ctx, buf.DriverValues(idKey, it.Value().MarshalTo(buf.DocBuf[:0]))); err != nil {
 		return
 	}
 
@@ -348,7 +342,7 @@ func (c *collection) update(ctx context.Context, it, prevIt item) (err error) {
 }
 
 func (c *collection) loadById(ctx context.Context, buf *syncpool.DocBuffer, id key.Key) (it item, err error) {
-	rows, err := c.stmts.findId.QueryContext(ctx, []driver.NamedValue{{Name: "id", Value: []byte(id)}})
+	rows, err := c.stmts.findId.QueryContext(ctx, buf.DriverValuesId(id))
 	if err != nil {
 		return
 	}
