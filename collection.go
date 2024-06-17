@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/anyproto/any-store/internal/key"
+	"github.com/anyproto/any-store/query"
 
 	"github.com/valyala/fastjson"
 
@@ -41,12 +42,21 @@ type Collection interface {
 	Insert(ctx context.Context, docs ...any) (err error)
 
 	// UpdateOne updates a single document in the collection.
+	// Provided document must contain an id field
 	// Returns an error if the update fails.
 	UpdateOne(ctx context.Context, doc any) (err error)
+
+	// UpdateId updates a single document in the collection with provided modifier
+	// Returns a modify result or error.
+	UpdateId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error)
 
 	// UpsertOne inserts a document if it does not exist, or updates it if it does.
 	// Returns the ID of the upserted document or an error if the operation fails.
 	UpsertOne(ctx context.Context, doc any) (id any, err error)
+
+	// UpsertId updates a single document or creates new one
+	// Returns a modify result or error.
+	UpsertId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error)
 
 	// DeleteId deletes a single document by its ID.
 	// Returns an error if the deletion fails.
@@ -255,7 +265,7 @@ func (c *collection) InsertOne(ctx context.Context, doc any) (id any, err error)
 		if it, txErr = parseItem(buf.Parser, buf.Arena, doc, true); txErr != nil {
 			return txErr
 		}
-		if idBytes, txErr = c.insertItem(ctx, cn, buf, it); txErr != nil {
+		if idBytes, txErr = c.insertItem(ctx, buf, it); txErr != nil {
 			return txErr
 		}
 		return
@@ -286,7 +296,7 @@ func (c *collection) Insert(ctx context.Context, docs ...any) (err error) {
 			if it, txErr = parseItem(buf.Parser, buf.Arena, doc, true); txErr != nil {
 				return txErr
 			}
-			if _, txErr = c.insertItem(ctx, cn, buf, it); txErr != nil {
+			if _, txErr = c.insertItem(ctx, buf, it); txErr != nil {
 				return txErr
 			}
 		}
@@ -295,7 +305,7 @@ func (c *collection) Insert(ctx context.Context, docs ...any) (err error) {
 	return replaceUniqErr(err, ErrDocExists)
 }
 
-func (c *collection) insertItem(ctx context.Context, cn conn.Conn, buf *syncpool.DocBuffer, it item) (id []byte, err error) {
+func (c *collection) insertItem(ctx context.Context, buf *syncpool.DocBuffer, it item) (id []byte, err error) {
 	id = it.appendId(buf.SmallBuf[:0])
 	if _, err = c.stmts.insert.ExecContext(ctx, buf.DriverValues(id, it.Value().MarshalTo(buf.DocBuf[:0]))); err != nil {
 		return nil, replaceUniqErr(err, ErrDocExists)
@@ -321,6 +331,100 @@ func (c *collection) UpdateOne(ctx context.Context, doc any) (err error) {
 		}
 		return c.update(ctx, it, item{})
 	})
+}
+
+func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error) {
+	buf := c.db.syncPool.GetDocBuf()
+	defer c.db.syncPool.ReleaseDocBuf(buf)
+
+	buf2 := c.db.syncPool.GetDocBuf()
+	defer c.db.syncPool.ReleaseDocBuf(buf2)
+
+	if err = c.db.doWriteTx(ctx, func(cn conn.Conn) (txErr error) {
+		if txErr = c.checkStmts(ctx, cn); txErr != nil {
+			return
+		}
+		idKey := encoding.AppendAnyValue(buf.SmallBuf[:0], id)
+		it, txErr := c.loadById(ctx, buf, idKey)
+		if txErr != nil {
+			return
+		}
+
+		buf2.Arena.Reset()
+		newVal, modified, txErr := mod.Modify(buf2.Arena, copyItem(buf2, it).val)
+		if txErr != nil {
+			return
+		}
+		if !modified {
+			return
+		}
+		res.Modified = 1
+		res.Matched = 1
+		return c.update(ctx, item{val: newVal}, it)
+	}); err != nil {
+		return ModifyResult{}, err
+	}
+	return
+}
+
+func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error) {
+	buf := c.db.syncPool.GetDocBuf()
+	defer c.db.syncPool.ReleaseDocBuf(buf)
+
+	buf2 := c.db.syncPool.GetDocBuf()
+	defer c.db.syncPool.ReleaseDocBuf(buf2)
+
+	if err = c.db.doWriteTx(ctx, func(cn conn.Conn) (txErr error) {
+		if txErr = c.checkStmts(ctx, cn); txErr != nil {
+			return
+		}
+		idKey := encoding.AppendAnyValue(buf.SmallBuf[:0], id)
+		var (
+			isInsert bool
+			modValue *fastjson.Value
+			prevItem item
+		)
+		it, loadErr := c.loadById(ctx, buf, idKey)
+		if loadErr != nil {
+			if errors.Is(loadErr, ErrDocNotFound) {
+				// create an object with only id field
+				var idVal *fastjson.Value
+				buf.Arena.Reset()
+				modValue = buf.Arena.NewObject()
+				idVal, _, txErr = encoding.DecodeToJSON(buf.Parser, buf.Arena, idKey)
+				if txErr != nil {
+					return txErr
+				}
+				modValue.Set("id", idVal)
+				isInsert = true
+			} else {
+				return loadErr
+			}
+		} else {
+			prevItem = it
+			modValue = copyItem(buf2, it).val
+		}
+
+		buf2.Arena.Reset()
+		newVal, modified, txErr := mod.Modify(buf2.Arena, modValue)
+		if txErr != nil {
+			return
+		}
+		if !modified {
+			return
+		}
+		res.Modified = 1
+		if isInsert {
+			_, txErr = c.insertItem(ctx, buf2, item{val: newVal})
+			return txErr
+		} else {
+			res.Matched = 1
+			return c.update(ctx, item{val: newVal}, prevItem)
+		}
+	}); err != nil {
+		return ModifyResult{}, err
+	}
+	return
 }
 
 func (c *collection) update(ctx context.Context, it, prevIt item) (err error) {
@@ -375,7 +479,7 @@ func (c *collection) UpsertOne(ctx context.Context, doc any) (id any, err error)
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
-		_, insErr := c.insertItem(ctx, cn, buf, it)
+		_, insErr := c.insertItem(ctx, buf, it)
 		if errors.Is(insErr, ErrDocExists) {
 			return c.update(ctx, it, item{})
 		}

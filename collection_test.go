@@ -7,6 +7,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/anyproto/any-store/query"
 )
 
 func assertCollCount(t testing.TB, c Collection, expected int) bool {
@@ -184,6 +186,48 @@ func TestCollection_UpdateOne(t *testing.T) {
 	})
 }
 
+func TestCollection_UpdateId(t *testing.T) {
+	mod := query.MustParseModifier(`{"$inc":{"a":1}}`)
+	t.Run("not found", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+
+		res, err := coll.UpdateId(ctx, "notFound", mod)
+		assert.ErrorIs(t, err, ErrDocNotFound)
+		assert.Empty(t, res)
+	})
+
+	t.Run("success", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+
+		id, err := coll.InsertOne(ctx, `{"key":"value"}`)
+		require.NoError(t, err)
+
+		res, err := coll.UpdateId(ctx, id, mod)
+		require.NoError(t, err)
+		assert.Equal(t, 1, res.Modified)
+
+		doc, err := coll.FindId(ctx, id)
+		require.NoError(t, err)
+		assert.Equal(t, float64(1), doc.Value().GetFloat64("a"))
+	})
+	t.Run("not modified", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+
+		id, err := coll.InsertOne(ctx, `{"key":"value"}`)
+		require.NoError(t, err)
+
+		res, err := coll.UpdateId(ctx, id, query.MustParseModifier(`{"$set":{"key":"value"}}`))
+		require.NoError(t, err)
+		assert.Equal(t, 0, res.Modified)
+	})
+}
+
 func TestCollection_UpsertOne(t *testing.T) {
 	t.Run("insert", func(t *testing.T) {
 		fx := newFixture(t)
@@ -209,6 +253,37 @@ func TestCollection_UpsertOne(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, newDoc, doc.Value().String())
 		})
+	})
+}
+
+func TestCollection_UpsertId(t *testing.T) {
+	mod := query.MustParseModifier(`{"$inc":{"a":1}}`)
+	t.Run("insert", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		res, err := coll.UpsertId(ctx, 1, mod)
+		require.NoError(t, err)
+		assert.Equal(t, 0, res.Matched)
+		assert.Equal(t, 1, res.Modified)
+
+		doc, err := coll.FindId(ctx, 1)
+		require.NoError(t, err)
+		assert.Equal(t, float64(1), doc.Value().GetFloat64("a"))
+	})
+	t.Run("update", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx, `{"id":1, "a":2}`))
+		res, err := coll.UpsertId(ctx, 1, mod)
+		require.NoError(t, err)
+		assert.Equal(t, 1, res.Matched)
+		assert.Equal(t, 1, res.Modified)
+
+		doc, err := coll.FindId(ctx, 1)
+		require.NoError(t, err)
+		assert.Equal(t, float64(3), doc.Value().GetFloat64("a"))
 	})
 }
 
