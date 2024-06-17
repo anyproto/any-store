@@ -11,6 +11,15 @@ type Modifier interface {
 	Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error)
 }
 
+type ModifyFunc func(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error)
+
+func (m ModifyFunc) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
+	if m == nil {
+		return nil, false, fmt.Errorf("modify func is nil")
+	}
+	return m(a, v)
+}
+
 type modifierRoot []Modifier
 
 func (mRoot modifierRoot) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
