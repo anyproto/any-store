@@ -492,10 +492,10 @@ func isSpecialChar(char byte, specialChars string) bool {
 }
 
 func extractPrefix(pattern string) string {
-	if !strings.HasPrefix(pattern, "^(?i)") {
+	if !strings.HasPrefix(pattern, "^") || strings.HasPrefix(pattern, "^(?i)") {
 		return ""
 	}
-	pattern = strings.TrimPrefix(pattern, "^(?i)")
+	pattern = strings.TrimPrefix(pattern, "^")
 	return findPrefix(pattern)
 }
 
