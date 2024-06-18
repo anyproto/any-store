@@ -3,6 +3,7 @@ package query
 import (
 	"bytes"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/valyala/fastjson"
@@ -32,6 +33,7 @@ const (
 	opNot
 	opExists
 	opType
+	opRegexp
 )
 
 var (
@@ -54,6 +56,7 @@ var (
 
 	opBytesExists = []byte("$exists")
 	opBytesType   = []byte("$type")
+	opBytesRegexp = []byte("$regex")
 )
 
 func MustParseCondition(cond any) Filter {
@@ -356,8 +359,27 @@ func makeCompFilter(op Operator, v *fastjson.Value) (f Filter, err error) {
 		return parseExists(v)
 	case opType:
 		return parseType(v)
+	case opRegexp:
+		return parseRegexp(v)
 	default:
 		return makeArrComp(op, v)
+	}
+}
+
+func parseRegexp(v *fastjson.Value) (Filter, error) {
+	switch v.Type() {
+	case fastjson.TypeString:
+		exp, err := v.StringBytes()
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse regular exporession: %w", err)
+		}
+		compiledRegexp, err := regexp.Compile(string(exp))
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse regular exporession: %w", err)
+		}
+		return Regexp{Regexp: compiledRegexp}, nil
+	default:
+		return nil, fmt.Errorf("unexpetced type: %s", v.String())
 	}
 }
 
@@ -454,6 +476,8 @@ func isOperator(key []byte) (ok bool, op Operator, err error) {
 			return true, opExists, nil
 		case bytes.Equal(key, opBytesType):
 			return true, opType, nil
+		case bytes.Equal(key, opBytesRegexp):
+			return true, opRegexp, nil
 		default:
 			return true, 0, fmt.Errorf("unknow operator: %s", string(key))
 		}

@@ -3,6 +3,7 @@ package query
 import (
 	"bytes"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/valyala/fastjson"
@@ -380,9 +381,9 @@ func (e TypeFilter) OkBytes(b []byte) bool {
 }
 
 func (e TypeFilter) IndexFilter(fieldName string, bs Bounds) (filter Filter, bounds Bounds) {
-	k := []byte{byte(e.Type)}
+	k := []byte{byte(e.Type), 255}
 	return e, bs.Append(Bound{
-		Start:        k,
+		Start:        k[:1],
 		End:          k,
 		StartInclude: true,
 		EndInclude:   true,
@@ -391,4 +392,115 @@ func (e TypeFilter) IndexFilter(fieldName string, bs Bounds) (filter Filter, bou
 
 func (e TypeFilter) String() string {
 	return fmt.Sprintf(`{"$type": "%s"}`, Type(e.Type).String())
+}
+
+type Regexp struct {
+	Regexp *regexp.Regexp
+}
+
+func (r Regexp) Ok(v *fastjson.Value) bool {
+	if v == nil {
+		return false
+	}
+	if v.Type() != fastjson.TypeString && v.Type() != fastjson.TypeArray {
+		return false
+	}
+	if v.Type() == fastjson.TypeArray {
+		vals, _ := v.Array()
+		for _, val := range vals {
+			exp, err := val.StringBytes()
+			if err != nil {
+				return false
+			}
+			if r.Regexp.Match(exp) {
+				return true
+			}
+		}
+		return false
+	}
+	exp, err := v.StringBytes()
+	if err != nil {
+		return false
+	}
+	return r.Regexp.Match(exp)
+}
+
+func (r Regexp) OkBytes(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	return r.Regexp.Match(b)
+}
+
+func (r Regexp) IndexFilter(_ string, bs Bounds) (filter Filter, bounds Bounds) {
+	prefix := extractPrefix(r.Regexp.String())
+	if prefix == "" {
+		return
+	}
+	var (
+		prefixBuf     = make([]byte, 0, len(prefix)+2)
+		prefixEncoded = encoding.AppendAnyValue(prefixBuf, prefix)
+	)
+	// strip the 'eof' byte
+	prefixEncoded = prefixEncoded[:len(prefixEncoded)-1]
+	bound := Bound{
+		Start:        prefixEncoded,
+		End:          append(prefixEncoded, 255),
+		StartInclude: true,
+		EndInclude:   true,
+	}
+	return r, bs.Append(bound)
+}
+
+func findPrefix(pattern string) string {
+	var result []rune
+	specialChars := `^$|*+?(){}[]\.`
+	escaped := false
+
+	for i := 0; i < len(pattern); i++ {
+		char := pattern[i]
+
+		if escaped {
+			escaped = false
+			result = append(result, rune(char))
+			continue
+		}
+
+		if char == '\\' {
+			escaped = true
+			continue
+		}
+
+		if !isSpecialChar(char, specialChars) {
+			result = append(result, rune(char))
+		} else {
+			break
+		}
+	}
+	var resultString string
+	for _, v := range result {
+		resultString += string(v)
+	}
+	return resultString
+}
+
+func isSpecialChar(char byte, specialChars string) bool {
+	for i := 0; i < len(specialChars); i++ {
+		if char == specialChars[i] {
+			return true
+		}
+	}
+	return false
+}
+
+func extractPrefix(pattern string) string {
+	if !strings.HasPrefix(pattern, "^") || strings.HasPrefix(pattern, "^(?i)") {
+		return ""
+	}
+	pattern = strings.TrimPrefix(pattern, "^")
+	return findPrefix(pattern)
+}
+
+func (r Regexp) String() string {
+	return fmt.Sprintf(`{"$regex": "%s"}`, r.Regexp.String())
 }
