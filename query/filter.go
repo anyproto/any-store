@@ -381,9 +381,9 @@ func (e TypeFilter) OkBytes(b []byte) bool {
 }
 
 func (e TypeFilter) IndexFilter(fieldName string, bs Bounds) (filter Filter, bounds Bounds) {
-	k := []byte{byte(e.Type)}
+	k := []byte{byte(e.Type), 255}
 	return e, bs.Append(Bound{
-		Start:        k,
+		Start:        k[:1],
 		End:          k,
 		StartInclude: true,
 		EndInclude:   true,
@@ -438,9 +438,11 @@ func (r Regexp) IndexFilter(_ string, bs Bounds) (filter Filter, bounds Bounds) 
 		return
 	}
 	var (
-		prefixBuf     = make([]byte, 0, len(prefix)+1)
+		prefixBuf     = make([]byte, 0, len(prefix)+2)
 		prefixEncoded = encoding.AppendAnyValue(prefixBuf, prefix)
 	)
+	// strip the 'eof' byte
+	prefixEncoded = prefixEncoded[:len(prefixEncoded)-1]
 	bound := Bound{
 		Start:        prefixEncoded,
 		End:          append(prefixEncoded, 255),

@@ -83,10 +83,11 @@ func testFile(t *testing.T, filename string) {
 	t.Logf("inserted %d docs; %v", len(docs), time.Since(st))
 
 	for j, tc := range testCases.Tests {
-		q := coll.Find(nil).Limit(tc.Limit).Offset(tc.Offset)
+		var cond any
 		if tc.Cond != nil {
-			q.Cond(tc.Cond)
+			cond = tc.Cond
 		}
+		q := coll.Find(cond).Limit(tc.Limit).Offset(tc.Offset)
 		if tc.Sort != nil {
 			var sorts = make([]any, len(tc.Sort))
 			for i, s := range tc.Sort {
