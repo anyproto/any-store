@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/anyproto/any-store/internal/conn"
 	"github.com/anyproto/any-store/internal/objectid"
@@ -127,8 +128,8 @@ type db struct {
 	}
 
 	openedCollections map[string]Collection
-
-	mu sync.Mutex
+	closed            atomic.Bool
+	mu                sync.Mutex
 }
 
 func (db *db) init(ctx context.Context) error {
@@ -409,6 +410,29 @@ func (db *db) doReadTx(ctx context.Context, do func(c conn.Conn) error) error {
 }
 
 func (db *db) Close() error {
+	if !db.closed.CompareAndSwap(false, true) {
+		return conn.ErrDBIsClosed
+	}
+	for _, stmt := range []conn.Stmt{
+		db.stmt.registerCollection,
+		db.stmt.removeCollection,
+		db.stmt.renameCollection,
+		db.stmt.renameCollectionIndex,
+		db.stmt.registerIndex,
+		db.stmt.removeIndex,
+	} {
+		_ = stmt.Close()
+	}
+
+	var collToClose []Collection
+	db.mu.Lock()
+	for _, c := range db.openedCollections {
+		collToClose = append(collToClose, c)
+	}
+	db.mu.Unlock()
+	for _, c := range collToClose {
+		_ = c.Close()
+	}
 	return db.cm.Close()
 }
 
