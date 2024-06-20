@@ -354,12 +354,11 @@ func TestRegexp(t *testing.T) {
 		_, bounds := f.IndexFilter("name", Bounds{})
 		assert.Len(t, bounds, 0)
 	})
-	t.Run("index: ^prefix - return prefix", func(t *testing.T) {
+	t.Run("index: ^(?i)prefix - no prefix", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^(?i)prefix"}}`)
 		require.NoError(t, err)
 		_, bounds := f.IndexFilter("name", Bounds{})
-		assert.Len(t, bounds, 1)
-		assert.Equal(t, "prefix", append(bounds[0].Start, 0).String())
+		assert.Len(t, bounds, 0)
 	})
 	t.Run("index: ^prefix\\.test - return prefix.test", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^prefix\.test"}}`)
@@ -387,7 +386,7 @@ func TestRegexp(t *testing.T) {
 		require.NoError(t, err)
 		_, bounds := f.IndexFilter("name", Bounds{})
 		assert.Len(t, bounds, 1)
-		assert.Equal(t, ".a", bounds[0].Start.String())
+		assert.Equal(t, ".a", append(bounds[0].Start, 0).String())
 	})
 }
 
