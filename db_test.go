@@ -119,7 +119,7 @@ type fixture struct {
 func (fx *fixture) finish() {
 	require.NoError(fx.t, fx.Close())
 	if fx.tmpDir != "" {
-		if false {
+		if true {
 			_ = os.RemoveAll(fx.tmpDir)
 		} else {
 			fx.t.Log(fx.tmpDir)

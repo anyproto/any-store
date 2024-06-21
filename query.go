@@ -1,15 +1,15 @@
 package anystore
 
 import (
-	"bytes"
 	"context"
 	"database/sql/driver"
 	"errors"
-	"strconv"
-	"sync"
+	"slices"
+	stdSort "sort"
 
 	"github.com/valyala/fastjson"
 
+	"github.com/anyproto/any-store/internal/bitmap"
 	"github.com/anyproto/any-store/internal/conn"
 
 	"github.com/anyproto/any-store/internal/sort"
@@ -61,7 +61,15 @@ type collQuery struct {
 
 	limit, offset uint
 
+	sortFields  []sort.SortField
+	queryFields []queryField
+
 	err error
+}
+
+type queryField struct {
+	field  string
+	bounds query.Bounds
 }
 
 func (q *collQuery) Cond(filter any) Query {
@@ -288,6 +296,22 @@ func (q *collQuery) Explain(ctx context.Context) (query, explain string, err err
 	return
 }
 
+type indexWithWeight struct {
+	weight          int
+	firstFieldIdx   int
+	queryFieldsBits bitmap.Bitmap256
+	sortFieldsBits  bitmap.Bitmap256
+	bounds          query.Bounds
+	exactSort       bool
+	*index
+}
+
+type weightedIndexes []indexWithWeight
+
+func (w weightedIndexes) Len() int           { return len(w) }
+func (w weightedIndexes) Less(i, j int) bool { return w[i].weight > w[j].weight }
+func (w weightedIndexes) Swap(i, j int)      { w[i], w[j] = w[j], w[i] }
+
 func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 	if q.err != nil {
 		return nil, q.err
@@ -305,328 +329,197 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 		q.cond = query.All{}
 	}
 
-	var sortFields []sort.SortField
 	if q.sort != nil {
-		sortFields = q.sort.Fields()
+		q.sortFields = q.sort.Fields()
 	}
+
+	var addedSorts bitmap.Bitmap256
 
 	// handle "id" field
 	if _, idBounds := q.cond.IndexFilter("id", nil); len(idBounds) != 0 {
 		qb.idBounds = idBounds
 	}
 
-	var checkIdSort = func() {
-		if len(sortFields) > 0 && sortFields[0].Field == "id" {
-			qb.sorts = append(qb.sorts, qbSort{reverse: sortFields[0].Reverse})
-			sortFields = sortFields[1:]
+	var addIdSort = func(reverse bool) {
+		qb.sorts = append(qb.sorts, qbSort{
+			reverse: reverse,
+		})
+	}
+
+	for i, sf := range q.sortFields {
+		if i < 255 && sf.Field == "id" {
+			if i == 0 {
+				// if an id field is first, other sorts will be useless
+				q.sortFields = q.sortFields[:1]
+				addedSorts = addedSorts.Set(uint8(i))
+				addIdSort(sf.Reverse)
+			}
+			break
 		}
 	}
-	checkIdSort()
 
-	var exactIndexSort bool
-	for _, idx := range q.c.indexes {
-		var (
-			hasFilters bool
-			hasSorts   bool
-			join       qbJoin
-		)
-		for _, field := range idx.fieldNames {
-			_, bounds := q.cond.IndexFilter(field, nil)
-			join.bounds = append(join.bounds, bounds)
-			if len(bounds) > 0 {
-				hasFilters = true
+	// calculate weights
+	var indexesWithWeight = make(weightedIndexes, len(q.c.indexes))
+	for i, idx := range q.c.indexes {
+		indexesWithWeight[i].index = idx
+		indexesWithWeight[i].weight,
+			indexesWithWeight[i].queryFieldsBits,
+			indexesWithWeight[i].firstFieldIdx = q.indexQueryWeight(idx)
+		if sw, sf := q.indexSortWeight(idx); sw > 0 {
+			indexesWithWeight[i].weight += sw
+			indexesWithWeight[i].sortFieldsBits = sf
+			indexesWithWeight[i].exactSort = sf.CountLeadingOnes() == len(q.sortFields)
+		}
+	}
+	stdSort.Sort(indexesWithWeight)
+
+	// filter useless indexes
+	var (
+		usedFieldsBits  bitmap.Bitmap256
+		filteredIndexes = indexesWithWeight[:0]
+		exactSortFound  bool
+		exactSortIdx    int
+	)
+	for _, idx := range indexesWithWeight {
+		if !usedFieldsBits.Get(uint8(idx.firstFieldIdx)) || (!exactSortFound && idx.exactSort) {
+			usedFieldsBits = usedFieldsBits.Or(idx.queryFieldsBits)
+			filteredIndexes = append(filteredIndexes, idx)
+			if idx.exactSort {
+				exactSortFound = true
+				exactSortIdx = len(filteredIndexes) - 1
 			}
 		}
+	}
 
-		if en := equalNum(sortFields, idx.fieldNames); en > 0 {
-			for i := 0; i < en; i++ {
-				qb.sorts = append(qb.sorts, qbSort{
-					tableName: idx.sql.TableName(),
-					fieldNum:  i,
-					reverse:   sortFields[i].Reverse,
-				})
-			}
-			if en == len(sortFields) {
-				exactIndexSort = true
-			}
-			sortFields = sortFields[en:]
-			checkIdSort()
-			hasSorts = true
+	for i, idx := range filteredIndexes {
+		tableName := idx.sql.TableName()
+		used := false
+		join := qbJoin{
+			idx:       idx.index,
+			tableName: tableName,
 		}
-
-		if hasSorts || hasFilters {
-			join.tableName = idx.sql.TableName()
-			if !hasFilters {
-				join.bounds = nil
+		idx.queryFieldsBits.Iterate(func(j int) {
+			if len(q.queryFields[j].bounds) != 0 {
+				join.bounds = append(join.bounds, q.queryFields[j].bounds)
+				used = true
 			}
+		})
+		if !exactSortFound {
+			for j, field := range q.sortFields {
+				if !addedSorts.Get(uint8(j)) {
+					if idx.sortFieldsBits.Get(uint8(j)) {
+						addedSorts = addedSorts.Set(uint8(j))
+						qb.sorts = append(qb.sorts, qbSort{
+							tableName: tableName,
+							fieldNum:  slices.Index(idx.fieldNames, field.Field),
+							reverse:   field.Reverse,
+						})
+						used = true
+					} else if field.Field == "id" {
+						addedSorts = addedSorts.Set(uint8(j))
+						addIdSort(field.Reverse)
+					}
+				}
+			}
+		}
+		if used || (exactSortFound && i == exactSortIdx) {
 			qb.joins = append(qb.joins, join)
 		}
-
 	}
 
-	if len(sortFields) > 0 && !exactIndexSort {
+	if exactSortFound {
+		idx := filteredIndexes[exactSortIdx]
+		for j, field := range q.sortFields {
+			if !addedSorts.Get(uint8(j)) && idx.sortFieldsBits.Get(uint8(j)) {
+				addedSorts = addedSorts.Set(uint8(j))
+				qb.sorts = append(qb.sorts, qbSort{
+					tableName: idx.sql.TableName(),
+					fieldNum:  slices.Index(idx.fieldNames, field.Field),
+					reverse:   field.Reverse,
+				})
+			}
+		}
+	}
+
+	if len(q.sortFields) > addedSorts.CountLeadingOnes() {
 		qb.sortId = q.c.db.sortReg.Register(q.sort)
 	}
 	return
 }
 
-var qbPool = &sync.Pool{
-	New: func() any {
-		return &queryBuilder{
-			buf: &bytes.Buffer{},
+func (q *collQuery) queryField(field string) (queryField, int) {
+	for i, f := range q.queryFields {
+		if f.field == field {
+			return f, i
 		}
-	},
+	}
+	_, bounds := q.cond.IndexFilter(field, nil)
+	f := queryField{
+		field:  field,
+		bounds: bounds,
+	}
+	q.queryFields = append(q.queryFields, f)
+	return f, len(q.queryFields) - 1
 }
 
-func newQueryBuilder() *queryBuilder {
-	return qbPool.Get().(*queryBuilder)
-}
-
-type queryBuilder struct {
-	coll      *collection
-	tableName string
-	joins     []qbJoin
-	sorts     []qbSort
-	idBounds  query.Bounds
-	filterId  int
-	sortId    int
-	buf       *bytes.Buffer
-	values    []driver.NamedValue
-	limit     int
-	offset    int
-}
-
-type qbJoin struct {
-	idx       *index
-	tableName string
-	bounds    []query.Bounds
-}
-
-type qbSort struct {
-	tableName string
-	fieldNum  int
-	reverse   bool
-}
-
-func (qb *queryBuilder) build(count bool) string {
-	qb.buf.WriteString("SELECT ")
-	if count {
-		qb.buf.WriteString("COUNT(*)")
-	} else {
-		qb.buf.WriteString("data")
-	}
-	qb.buf.WriteString(" FROM '")
-	qb.buf.WriteString(qb.tableName)
-	qb.buf.WriteString("' ")
-
-	for _, join := range qb.joins {
-		qb.buf.WriteString("JOIN '")
-		qb.buf.WriteString(join.tableName)
-		qb.buf.WriteString("' ON '")
-		qb.buf.WriteString(join.tableName)
-		qb.buf.WriteString("'.docId = id ")
-	}
-
-	var whereStarted, needAnd bool
-	var writeWhere = func() {
-		if !whereStarted {
-			whereStarted = true
-			qb.buf.WriteString("WHERE ")
+func (q *collQuery) indexQueryWeight(idx *index) (weight int, fieldBits bitmap.Bitmap256, firstFieldIdx int) {
+	var isChain = true
+	for i, field := range idx.fieldNames {
+		qField, fi := q.queryField(field)
+		if fi < 256 { // in case we have more than 255 fields - just ignore it
+			fieldBits = fieldBits.Set(uint8(fi))
+			if i == 0 {
+				firstFieldIdx = fi
+			}
 		}
-	}
-	var writeAnd = func() {
-		if needAnd {
-			qb.buf.WriteString(" AND ")
-		} else {
-			needAnd = true
-		}
-	}
-
-	var writePlaceholder = func(tableNum, fieldNum, boundNum int, isEnd bool, val []byte) {
-		fieldName := "val_" + strconv.Itoa(tableNum) + "_" + strconv.Itoa(fieldNum) + "_" + strconv.Itoa(boundNum)
-		if isEnd {
-			fieldName += "_end"
-		}
-		qb.buf.WriteString(":")
-		qb.buf.WriteString(fieldName)
-
-		qb.values = append(qb.values, driver.NamedValue{
-			Name:  fieldName,
-			Value: val,
-		})
-	}
-
-	var writeTableVal = func(tableName string, fieldNum int) {
-		if tableName == "" {
-			qb.buf.WriteString("id")
-		} else {
-			qb.buf.WriteString("'")
-			qb.buf.WriteString(tableName)
-			qb.buf.WriteString("'.val")
-			qb.buf.WriteString(strconv.Itoa(fieldNum))
-		}
-	}
-
-	var writeBound = func(join qbJoin, tableNum, fieldNum, boundNum int) {
-		b := join.bounds[fieldNum][boundNum]
-
-		// fast eq case
-		if b.StartInclude && b.EndInclude && b.Start.Equal(b.End) {
-			writeTableVal(join.tableName, fieldNum)
-			qb.buf.WriteString(" = ")
-			writePlaceholder(tableNum, fieldNum, boundNum, false, b.Start)
-			return
-		}
-
-		if !b.Start.Empty() {
-			writeTableVal(join.tableName, fieldNum)
-			if b.StartInclude {
-				qb.buf.WriteString(" >= ")
+		if len(qField.bounds) != 0 {
+			if isChain {
+				if i == 0 {
+					weight = 10
+				} else {
+					weight *= 2
+				}
 			} else {
-				qb.buf.WriteString(" > ")
+				weight += 2
 			}
-			writePlaceholder(tableNum, fieldNum, boundNum, false, b.Start)
-			needAnd = true
+		} else {
+			if isChain {
+				isChain = false
+				weight -= 1
+			}
 		}
-		if !b.End.Empty() {
-			if !b.Start.Empty() {
-				writeAnd()
-			}
-			writeTableVal(join.tableName, fieldNum)
-			if b.EndInclude {
-				qb.buf.WriteString(" <= ")
-			} else {
-				qb.buf.WriteString(" < ")
-			}
-			writePlaceholder(tableNum, fieldNum, boundNum, true, b.End)
-			needAnd = true
-		}
-
 	}
+	return
+}
 
-	var writeBounds = func(join qbJoin, tableNum int) {
-		if len(join.bounds) == 0 {
-			return
-		}
-
-		writeWhere()
-		writeAnd()
-		for fieldNum, bounds := range join.bounds {
-			if len(bounds) == 0 {
+func (q *collQuery) indexSortWeight(idx *index) (weight int, fieldBits bitmap.Bitmap256) {
+	var isChain = true
+	sortFields := q.sortFields
+	if len(sortFields) > 256 {
+		sortFields = sortFields[:256]
+	}
+	for i, sf := range sortFields {
+		if isChain && i < len(idx.fieldNames) {
+			if idx.fieldNames[i] == sf.Field {
+				if i == 0 {
+					weight = 10
+				} else {
+					weight *= 2
+					if idx.reverse[i] == sf.Reverse {
+						weight += 2
+					}
+				}
+				fieldBits = fieldBits.Set(uint8(i))
 				continue
 			}
-			if fieldNum != 0 {
-				qb.buf.WriteString(" AND (")
-			} else {
-				qb.buf.WriteString(" (")
-			}
-			for i := range bounds {
-				if i != 0 {
-					qb.buf.WriteString(" OR (")
-				} else {
-					qb.buf.WriteString("(")
-				}
-				writeBound(join, tableNum, fieldNum, i)
-				qb.buf.WriteString(")")
-			}
-			qb.buf.WriteString(")")
 		}
-	}
-
-	if len(qb.idBounds) > 0 {
-		writeBounds(qbJoin{bounds: []query.Bounds{qb.idBounds}}, 0)
-	}
-
-	for tableNum, join := range qb.joins {
-		tableNum += 1
-		writeBounds(join, tableNum)
-	}
-
-	if qb.filterId > 0 {
-		writeWhere()
-		writeAnd()
-		qb.buf.WriteString("any_filter(")
-		qb.buf.WriteString(strconv.Itoa(qb.filterId))
-		qb.buf.WriteString(", data) ")
-	}
-
-	if count {
-		return qb.buf.String()
-	}
-
-	var orderStarted bool
-	var writeOrder = func() {
-		if !orderStarted {
-			orderStarted = true
-			qb.buf.WriteString(" ORDER BY ")
+		isChain = false
+		if slices.Contains(idx.fieldNames, sf.Field) {
+			weight += 5
+			fieldBits = fieldBits.Set(uint8(i))
 		} else {
-			qb.buf.WriteString(", ")
+			break
 		}
 	}
-
-	for _, s := range qb.sorts {
-		writeOrder()
-		if s.tableName != "" {
-			qb.buf.WriteString("'")
-			qb.buf.WriteString(s.tableName)
-			qb.buf.WriteString("'.val")
-			qb.buf.WriteString(strconv.Itoa(s.fieldNum))
-		} else {
-			qb.buf.WriteString("id")
-		}
-		if s.reverse {
-			qb.buf.WriteString(" DESC")
-		}
-	}
-
-	if qb.sortId > 0 {
-		writeOrder()
-		qb.buf.WriteString("any_sort(")
-		qb.buf.WriteString(strconv.Itoa(qb.sortId))
-		qb.buf.WriteString(", data)")
-	}
-
-	if qb.limit > 0 {
-		qb.buf.WriteString(" LIMIT ")
-		qb.buf.WriteString(strconv.Itoa(qb.limit))
-	}
-	if qb.offset > 0 {
-		qb.buf.WriteString(" OFFSET ")
-		qb.buf.WriteString(strconv.Itoa(qb.offset))
-	}
-
-	return qb.buf.String()
-}
-
-func (qb *queryBuilder) Close() {
-	if qb != nil {
-		if qb.filterId > 0 {
-			qb.coll.db.filterReg.Release(qb.filterId)
-		}
-		if qb.sortId > 0 {
-			qb.coll.db.sortReg.Release(qb.sortId)
-		}
-		qb.coll = nil
-		qb.values = qb.values[:0]
-		qb.sorts = qb.sorts[:0]
-		qb.idBounds = qb.idBounds[:0]
-		qb.joins = qb.joins[:0]
-		qb.filterId = 0
-		qb.sortId = 0
-		qb.buf.Reset()
-		qbPool.Put(qb)
-	}
-}
-
-func equalNum(sortFields []sort.SortField, indexFields []string) int {
-	m := min(len(sortFields), len(indexFields))
-	for n, sortField := range sortFields[:m] {
-		if sortField.Field != indexFields[n] {
-			return n
-		}
-		if n+1 == m {
-			return m
-		}
-	}
-	return 0
+	return
 }
