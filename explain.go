@@ -8,15 +8,15 @@ import (
 	"strings"
 )
 
-func scanExplainRows(rows driver.Rows) (string, error) {
+func scanExplainRows(rows driver.Rows) ([]string, error) {
 	var dest = make([]driver.Value, 4)
 	var es = &explainString{}
 	for {
 		if rErr := rows.Next(dest); rErr != nil {
 			if errors.Is(rErr, io.EOF) {
-				return es.String(), nil
+				return es.Result(), nil
 			} else {
-				return "", rErr
+				return nil, rErr
 			}
 		}
 		es.addRow(explainRow{
@@ -35,7 +35,7 @@ type explainRow struct {
 
 type explainString struct {
 	byParent map[int64][]explainRow
-	buf      *strings.Builder
+	buf      []string
 }
 
 func (es *explainString) addRow(r explainRow) {
@@ -46,8 +46,15 @@ func (es *explainString) addRow(r explainRow) {
 }
 
 func (es *explainString) String() string {
+	es.buf = es.buf[:0]
 	es.string(0, 0)
-	return es.buf.String()
+	return strings.Join(es.buf, "\n")
+}
+
+func (es *explainString) Result() []string {
+	es.buf = es.buf[:0]
+	es.string(0, 0)
+	return es.buf
 }
 
 func (es *explainString) string(parent, nest int64) {
@@ -57,18 +64,17 @@ func (es *explainString) string(parent, nest int64) {
 	sort.Slice(es.byParent[parent], func(i, j int) bool {
 		return es.byParent[parent][i].id < es.byParent[parent][j].id
 	})
-	if es.buf == nil {
-		es.buf = &strings.Builder{}
-	}
+
 	for _, r := range es.byParent[parent] {
+		var res string
 		for range nest {
-			es.buf.WriteString("-")
+			res += "-"
 		}
 		if nest > 0 {
-			es.buf.WriteString(" ")
+			res += " "
 		}
-		es.buf.WriteString(r.detail)
-		es.buf.WriteString("\n")
+		res += r.detail
+		es.buf = append(es.buf, res)
 		es.string(r.id, nest+1)
 	}
 }

@@ -319,11 +319,14 @@ func (c *Conn) Find(cmd Cmd) (result string, err error) {
 	}
 
 	if cmd.Query.Explain {
-		query, explain, cErr := q.Explain(mainCtx.Ctx())
+		explain, cErr := q.Explain(mainCtx.Ctx())
 		if cErr != nil {
 			return "", cErr
 		}
-		result = fmt.Sprintf("Query:\n%s\n\nExplain:\n%s\n", query, explain)
+		result = fmt.Sprintf("Query:\n%s\n\nExplain:\n%s\n\n", explain.Sql, strings.Join(explain.SqliteExplain, "\n"))
+		for _, idx := range explain.Indexes {
+			result += fmt.Sprintf("index:\t%s; weight\t%d; used:\t%v\n", idx.Name, idx.Weight, idx.Used)
+		}
 		return
 	}
 

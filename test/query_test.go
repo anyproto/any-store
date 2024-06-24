@@ -114,16 +114,16 @@ func testFile(t *testing.T, filename string) {
 		assert.Equal(t, expected, result, j)
 		require.NoError(t, iter.Close())
 
-		query, explain, err := q.Explain(ctx)
+		explain, err := q.Explain(ctx)
 		require.NoError(t, err)
 		if tc.ExpectedExplain != "" {
-			assert.Equal(t, strings.TrimSpace(tc.ExpectedExplain), strings.TrimSpace(explain), j)
+			assert.Equal(t, strings.TrimSpace(tc.ExpectedExplain), strings.TrimSpace(strings.Join(explain.SqliteExplain, "\n")), j)
 		}
 		if tc.ExpectedQuery != "" {
-			assert.Equal(t, strings.TrimSpace(tc.ExpectedQuery), strings.TrimSpace(query), j)
+			assert.Equal(t, strings.TrimSpace(tc.ExpectedQuery), strings.TrimSpace(explain.Sql), j)
 		}
 
-		t.Logf("%d\t%s\t%v", j, query, dur)
+		t.Logf("%d\t%s\t%v", j, explain.Sql, dur)
 	}
 
 }

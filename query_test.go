@@ -28,18 +28,24 @@ func TestCollQuery_Explain(t *testing.T) {
 	fx := newFixture(t)
 
 	assertExplain := func(t testing.TB, q Query, expQuery, expExplain string) {
-		query, explain, err := q.Explain(ctx)
-		require.NoError(t, err, query)
+		explain, err := q.Explain(ctx)
+		require.NoError(t, err, explain.Sql)
+		sqliteExplain := strings.Join(explain.SqliteExplain, "\n")
 		if expQuery != "" {
-			assert.Equal(t, strings.TrimSpace(expQuery), strings.TrimSpace(query))
+			assert.Equal(t, expQuery, strings.TrimSpace(explain.Sql))
 		} else {
-			t.Log(query)
+			t.Log(explain.Sql)
 		}
 		if expExplain != "" {
-			assert.Equal(t, strings.TrimSpace(expExplain), strings.TrimSpace(explain))
+			assert.Equal(t, strings.TrimSpace(expExplain), sqliteExplain)
 		} else {
 			t.Log(explain)
 		}
+	}
+	assertIndexes := func(t *testing.T, q Query, expIndexes []IndexExplain) {
+		explain, err := q.Explain(ctx)
+		require.NoError(t, err, explain.Sql)
+		assert.Equal(t, expIndexes, explain.Indexes, explain.Sql)
 	}
 
 	t.Run("no index", func(t *testing.T) {
@@ -143,7 +149,95 @@ func TestCollQuery_Explain(t *testing.T) {
 			"SCAN _test_s_a_idx USING COVERING INDEX sqlite_autoindex__test_s_a_idx_1\nSEARCH _test_s_docs USING INDEX sqlite_autoindex__test_s_docs_1 (id=?)\nUSE TEMP B-TREE FOR RIGHT PART OF ORDER BY",
 		)
 	})
-
+	t.Run("many indexes", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "test_m")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx, `{"id":1, "a":"a1", "b":"b1", "c":"c1"}`, `{"id":2, "a":"a2", "c":"c2"}`, `{"id":3, "a":"a3", "c":"c3"}`, `{"id":4, "a":"a4", "c":"c4"}`, `{"id":5, "a":"a5", "c": "c5"}`))
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"d"}}))
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"b", "a"}}))
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"b", "a", "-c"}}))
+		assertIndexes(t, coll.Find(`{"a":1}`),
+			[]IndexExplain{
+				{"a", 10, true},
+				{"b,a", 1, false},
+				{"b,a,-c", 1, false},
+				{"d", -1, false},
+			},
+		)
+		assertIndexes(t, coll.Find(`{"a":1, "d":1}`),
+			[]IndexExplain{
+				{"a", 10, true},
+				{"d", 10, true},
+				{"b,a", 1, false},
+				{"b,a,-c", 1, false},
+			},
+		)
+		assertIndexes(t, coll.Find(`{"a":1, "b":2}`),
+			[]IndexExplain{
+				{"b,a", 20, true},
+				{"b,a,-c", 19, false},
+				{"a", 10, false},
+				{"d", -1, false},
+			},
+		)
+		assertIndexes(t, coll.Find(`{"a":1, "b":2, "c":3}`),
+			[]IndexExplain{
+				{"b,a,-c", 40, true},
+				{"b,a", 20, false},
+				{"a", 10, false},
+				{"d", -1, false},
+			},
+		)
+		assertIndexes(t, coll.Find(`{"a":1, "b":2, "c":3}`),
+			[]IndexExplain{
+				{"b,a,-c", 40, true},
+				{"b,a", 20, false},
+				{"a", 10, false},
+				{"d", -1, false},
+			},
+		)
+		assertIndexes(t, coll.Find(`{"a":1}`).Sort("b", "a"),
+			[]IndexExplain{
+				{"b,a", 23, true},
+				{"b,a,-c", 23, false},
+				{"a", 10, false},
+				{"d", -1, false},
+			},
+		)
+		assertIndexes(t, coll.Find(`{"a":1}`).Sort("a"),
+			[]IndexExplain{
+				{"a", 20, true},
+				{"b,a", 6, false},
+				{"b,a,-c", 6, false},
+				{"d", -1, false},
+			},
+		)
+		assertIndexes(t, coll.Find(`{"a":1}`).Sort("d"),
+			[]IndexExplain{
+				{"a", 10, true},
+				{"d", 9, true},
+				{"b,a", 1, false},
+				{"b,a,-c", 1, false},
+			},
+		)
+		assertIndexes(t, coll.Find(`{"a":1}`).Sort("a", "b"),
+			[]IndexExplain{
+				{"a", 20, true},
+				{"b,a", 11, true},
+				{"b,a,-c", 11, false},
+				{"d", -1, false},
+			},
+		)
+		assertIndexes(t, coll.Find(`{"a":1}`).Sort("b", "a"),
+			[]IndexExplain{
+				{"b,a", 23, true},
+				{"b,a,-c", 23, false},
+				{"a", 10, false},
+				{"d", -1, false},
+			},
+		)
+	})
 }
 
 func assertQueryCount(t testing.TB, q Query, exp int) {

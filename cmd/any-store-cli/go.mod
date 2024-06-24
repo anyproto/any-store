@@ -3,7 +3,7 @@ module github.com/anyproto/any-store/cmd/any-store-cli
 go 1.22.1
 
 require (
-	github.com/anyproto/any-store v0.0.0-20240619124125-4fd019409bc2
+	github.com/anyproto/any-store v0.0.0-20240624144943-ac8093691daa
 	github.com/fatih/color v1.17.0
 	github.com/peterh/liner v1.2.2
 	github.com/robertkrimen/otto v0.4.0
