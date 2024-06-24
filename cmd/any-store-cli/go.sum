@@ -1,5 +1,5 @@
-github.com/anyproto/any-store v0.0.0-20240621174142-fa7d30edb25d h1:1vn3QWaqsYrcJL0qZ1k4JZgsdIp2YqwV3syTqi/5jwc=
-github.com/anyproto/any-store v0.0.0-20240621174142-fa7d30edb25d/go.mod h1:JV7dJ8+xF1VaCQgFQsD8SZSNlxxTGFbDiF8llkB2ILc=
+github.com/anyproto/any-store v0.0.0-20240624144943-ac8093691daa h1:gbI8sVBQ1oPAR0IQRHZRA9kzCjHaLF+g2o+FWTf+Txw=
+github.com/anyproto/any-store v0.0.0-20240624144943-ac8093691daa/go.mod h1:JV7dJ8+xF1VaCQgFQsD8SZSNlxxTGFbDiF8llkB2ILc=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/fatih/color v1.17.0 h1:GlRw1BRJxkpqUCBKzKOw098ed57fEsKeNjpTe3cSjK4=
