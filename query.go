@@ -402,8 +402,10 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 		exactSortIdx    int
 	)
 	for i, idx := range q.indexesWithWeight {
-		if usedFieldsBits.Subtract(idx.queryFieldsBits).Count() != 0 || (!exactSortFound && idx.exactSort) {
-			usedFieldsBits = usedFieldsBits.Or(idx.queryFieldsBits)
+		if usedFieldsBits.Subtract(idx.queryFieldsBits).Count() != 0 ||
+			usedFieldsBits.Subtract(idx.sortFieldsBits).Count() != 0 ||
+			(!exactSortFound && idx.exactSort) {
+			usedFieldsBits = usedFieldsBits.Or(idx.queryFieldsBits).Or(idx.sortFieldsBits)
 			idx.pos = i
 			filteredIndexes = append(filteredIndexes, idx)
 			if idx.exactSort {

@@ -32,7 +32,7 @@ func TestCollQuery_Explain(t *testing.T) {
 		require.NoError(t, err, explain.Sql)
 		sqliteExplain := strings.Join(explain.SqliteExplain, "\n")
 		if expQuery != "" {
-			assert.Equal(t, strings.TrimSpace(explain.Sql), expQuery)
+			assert.Equal(t, expQuery, strings.TrimSpace(explain.Sql))
 		} else {
 			t.Log(explain.Sql)
 		}
