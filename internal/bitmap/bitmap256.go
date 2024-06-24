@@ -61,3 +61,13 @@ func (v Bitmap256) Iterate(f func(i int)) {
 		}
 	}
 }
+
+// Subtract returns a new Bitmap256 containing bits set in b that are not set in the current bitmap.
+func (v Bitmap256) Subtract(b Bitmap256) Bitmap256 {
+	return Bitmap256{
+		^v[0] & b[0],
+		^v[1] & b[1],
+		^v[2] & b[2],
+		^v[3] & b[3],
+	}
+}

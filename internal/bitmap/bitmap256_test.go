@@ -1,35 +1,34 @@
 package bitmap
 
-import "testing"
+import (
+	"testing"
 
-// TestSet tests the Set method of Bitmap256.
+	"github.com/stretchr/testify/assert"
+)
+
 func TestSet(t *testing.T) {
 	var bitmap Bitmap256
 	positions := []uint8{5, 65, 130, 195} // Positions that use all elements of the array
+
 	for _, pos := range positions {
 		bitmap = bitmap.Set(pos)
-		if !bitmap.Get(pos) {
-			t.Errorf("Expected bit %d to be set", pos)
-		}
+		assert.True(t, bitmap.Get(pos), "Expected bit %d to be set", pos)
 	}
 }
 
-// TestClear tests the Clear method of Bitmap256.
 func TestClear(t *testing.T) {
 	var bitmap Bitmap256
 	positions := []uint8{5, 65, 130, 195} // Positions that use all elements of the array
+
 	for _, pos := range positions {
 		bitmap = bitmap.Set(pos)
 	}
 	for _, pos := range positions {
 		bitmap = bitmap.Clear(pos)
-		if bitmap.Get(pos) {
-			t.Errorf("Expected bit %d to be cleared", pos)
-		}
+		assert.False(t, bitmap.Get(pos), "Expected bit %d to be cleared", pos)
 	}
 }
 
-// TestOr tests the Or method of Bitmap256.
 func TestOr(t *testing.T) {
 	var bitmap1 Bitmap256
 	var bitmap2 Bitmap256
@@ -47,45 +46,33 @@ func TestOr(t *testing.T) {
 	result := bitmap1.Or(bitmap2)
 
 	for _, pos := range append(positions1, positions2...) {
-		if !result.Get(pos) {
-			t.Errorf("Expected bit %d to be set in result", pos)
-		}
+		assert.True(t, result.Get(pos), "Expected bit %d to be set in result", pos)
 	}
 }
 
-// TestGet tests the Get method of Bitmap256.
 func TestGet(t *testing.T) {
 	var bitmap Bitmap256
 	positions := []uint8{5, 65, 130, 195} // Positions that use all elements of the array
+
 	for _, pos := range positions {
 		bitmap = bitmap.Set(pos)
-		if !bitmap.Get(pos) {
-			t.Errorf("Expected bit %d to be set", pos)
-		}
-		if bitmap.Get(pos + 1) { // Check adjacent bit to ensure it's not set
-			t.Errorf("Expected bit %d to be not set", pos+1)
-		}
+		assert.True(t, bitmap.Get(pos), "Expected bit %d to be set", pos)
+		assert.False(t, bitmap.Get(pos+1), "Expected bit %d to be not set", pos+1)
 	}
 }
 
-// TestCountLeadingOnes tests the CountLeadingOnes method of Bitmap256.
 func TestCountLeadingOnes(t *testing.T) {
 	var bitmap Bitmap256
 
 	// Test with no leading ones
-	if result := bitmap.CountLeadingOnes(); result != 0 {
-		t.Errorf("Expected 0 leading ones, got %d", result)
-	}
+	assert.Equal(t, 0, bitmap.CountLeadingOnes(), "Expected 0 leading ones")
 
 	// Test with some leading ones
 	positions := []uint8{0, 1, 2, 3, 4, 5, 6, 7, 8}
 	for _, pos := range positions {
 		bitmap = bitmap.Set(pos)
 	}
-
-	if result := bitmap.CountLeadingOnes(); result != len(positions) {
-		t.Errorf("Expected %d leading ones, got %d", len(positions), result)
-	}
+	assert.Equal(t, len(positions), bitmap.CountLeadingOnes(), "Expected %d leading ones", len(positions))
 
 	// Test with a mix of ones and zeros at the start
 	bitmap = Bitmap256{}
@@ -93,30 +80,21 @@ func TestCountLeadingOnes(t *testing.T) {
 	for _, pos := range positions {
 		bitmap = bitmap.Set(pos)
 	}
-
-	if result := bitmap.CountLeadingOnes(); result != 3 {
-		t.Errorf("Expected 3 leading ones, got %d", result)
-	}
+	assert.Equal(t, 3, bitmap.CountLeadingOnes(), "Expected 3 leading ones")
 }
 
-// TestCount tests the Count method of Bitmap256.
 func TestCount(t *testing.T) {
 	var bitmap Bitmap256
 
 	// Test with no bits set
-	if result := bitmap.Count(); result != 0 {
-		t.Errorf("Expected 0 ones, got %d", result)
-	}
+	assert.Equal(t, 0, bitmap.Count(), "Expected 0 ones")
 
 	// Test with some bits set
 	positions := []uint8{0, 1, 2, 3, 4, 5, 6, 7, 8, 64, 65, 66, 130, 195}
 	for _, pos := range positions {
 		bitmap = bitmap.Set(pos)
 	}
-
-	if result := bitmap.Count(); result != len(positions) {
-		t.Errorf("Expected %d ones, got %d", len(positions), result)
-	}
+	assert.Equal(t, len(positions), bitmap.Count(), "Expected %d ones", len(positions))
 }
 
 func TestIterate(t *testing.T) {
@@ -133,12 +111,35 @@ func TestIterate(t *testing.T) {
 	})
 
 	for _, pos := range positions {
-		if !found[int(pos)] {
-			t.Errorf("Expected to find bit %d set", pos)
-		}
+		assert.True(t, found[int(pos)], "Expected to find bit %d set", pos)
 	}
 
-	if len(found) != len(positions) {
-		t.Errorf("Expected to find %d bits set, found %d", len(positions), len(found))
+	assert.Equal(t, len(positions), len(found), "Expected to find %d bits set", len(positions))
+}
+
+func TestSubtract(t *testing.T) {
+	var bitmap1 Bitmap256
+	var bitmap2 Bitmap256
+
+	positions1 := []uint8{1, 2, 5}
+	positions2 := []uint8{1, 2, 6}
+
+	for _, pos := range positions1 {
+		bitmap1 = bitmap1.Set(pos)
+	}
+	for _, pos := range positions2 {
+		bitmap2 = bitmap2.Set(pos)
+	}
+
+	expectedPositions := []uint8{6}
+	result := bitmap1.Subtract(bitmap2)
+
+	for _, pos := range expectedPositions {
+		assert.True(t, result.Get(pos), "Expected bit %d to be set in the result", pos)
+	}
+
+	unexpectedPositions := positions1
+	for _, pos := range unexpectedPositions {
+		assert.False(t, result.Get(pos), "Expected bit %d to not be set in the result", pos)
 	}
 }

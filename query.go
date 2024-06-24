@@ -50,7 +50,19 @@ type Query interface {
 	Delete(ctx context.Context) (res ModifyResult, err error)
 
 	// Explain provides the query execution plan.
-	Explain(ctx context.Context) (sql, explain string, err error)
+	Explain(ctx context.Context) (explain Explain, err error)
+}
+
+type Explain struct {
+	Sql           string
+	SqliteExplain []string
+	Indexes       []IndexExplain
+}
+
+type IndexExplain struct {
+	Name   string
+	Weight int
+	Used   bool
 }
 
 type collQuery struct {
@@ -61,8 +73,9 @@ type collQuery struct {
 
 	limit, offset uint
 
-	sortFields  []sort.SortField
-	queryFields []queryField
+	indexesWithWeight weightedIndexes
+	sortFields        []sort.SortField
+	queryFields       []queryField
 
 	err error
 }
@@ -275,35 +288,44 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	return
 }
 
-func (q *collQuery) Explain(ctx context.Context) (query, explain string, err error) {
+func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	qb, err := q.makeQuery()
 	if err != nil {
 		return
 	}
 	defer qb.Close()
-	query = qb.build(false)
+
+	explain.Sql = qb.build(false)
 	err = q.c.db.doReadTx(ctx, func(cn conn.Conn) (txErr error) {
-		rows, txErr := cn.QueryContext(ctx, "EXPLAIN QUERY PLAN "+query, qb.values)
+		rows, txErr := cn.QueryContext(ctx, "EXPLAIN QUERY PLAN "+explain.Sql, qb.values)
 		if txErr != nil {
 			return txErr
 		}
 		defer func() {
 			_ = rows.Close()
 		}()
-		explain, txErr = scanExplainRows(rows)
+		explain.SqliteExplain, txErr = scanExplainRows(rows)
 		return
 	})
+	for _, idx := range q.indexesWithWeight {
+		explain.Indexes = append(explain.Indexes, IndexExplain{
+			Name:   idx.Info().Name,
+			Weight: idx.weight,
+			Used:   idx.used,
+		})
+	}
 	return
 }
 
 type indexWithWeight struct {
+	*index
 	weight          int
-	firstFieldIdx   int
+	pos             int
 	queryFieldsBits bitmap.Bitmap256
 	sortFieldsBits  bitmap.Bitmap256
 	bounds          query.Bounds
 	exactSort       bool
-	*index
+	used            bool
 }
 
 type weightedIndexes []indexWithWeight
@@ -359,30 +381,30 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 	}
 
 	// calculate weights
-	var indexesWithWeight = make(weightedIndexes, len(q.c.indexes))
+	q.indexesWithWeight = make(weightedIndexes, len(q.c.indexes))
 	for i, idx := range q.c.indexes {
-		indexesWithWeight[i].index = idx
-		indexesWithWeight[i].weight,
-			indexesWithWeight[i].queryFieldsBits,
-			indexesWithWeight[i].firstFieldIdx = q.indexQueryWeight(idx)
+		q.indexesWithWeight[i].index = idx
+		q.indexesWithWeight[i].weight,
+			q.indexesWithWeight[i].queryFieldsBits = q.indexQueryWeight(idx)
 		if sw, sf := q.indexSortWeight(idx); sw > 0 {
-			indexesWithWeight[i].weight += sw
-			indexesWithWeight[i].sortFieldsBits = sf
-			indexesWithWeight[i].exactSort = sf.CountLeadingOnes() == len(q.sortFields)
+			q.indexesWithWeight[i].weight += sw
+			q.indexesWithWeight[i].sortFieldsBits = sf
+			q.indexesWithWeight[i].exactSort = sf.CountLeadingOnes() == len(q.sortFields)
 		}
 	}
-	stdSort.Sort(indexesWithWeight)
+	stdSort.Sort(q.indexesWithWeight)
 
 	// filter useless indexes
 	var (
 		usedFieldsBits  bitmap.Bitmap256
-		filteredIndexes = indexesWithWeight[:0]
+		filteredIndexes = q.indexesWithWeight[:0]
 		exactSortFound  bool
 		exactSortIdx    int
 	)
-	for _, idx := range indexesWithWeight {
-		if !usedFieldsBits.Get(uint8(idx.firstFieldIdx)) || (!exactSortFound && idx.exactSort) {
+	for i, idx := range q.indexesWithWeight {
+		if usedFieldsBits.Subtract(idx.queryFieldsBits).Count() != 0 || (!exactSortFound && idx.exactSort) {
 			usedFieldsBits = usedFieldsBits.Or(idx.queryFieldsBits)
+			idx.pos = i
 			filteredIndexes = append(filteredIndexes, idx)
 			if idx.exactSort {
 				exactSortFound = true
@@ -424,6 +446,7 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 		}
 		if used || (exactSortFound && i == exactSortIdx) {
 			qb.joins = append(qb.joins, join)
+			q.indexesWithWeight[idx.pos].used = true
 		}
 	}
 
@@ -462,16 +485,10 @@ func (q *collQuery) queryField(field string) (queryField, int) {
 	return f, len(q.queryFields) - 1
 }
 
-func (q *collQuery) indexQueryWeight(idx *index) (weight int, fieldBits bitmap.Bitmap256, firstFieldIdx int) {
+func (q *collQuery) indexQueryWeight(idx *index) (weight int, fieldBits bitmap.Bitmap256) {
 	var isChain = true
 	for i, field := range idx.fieldNames {
 		qField, fi := q.queryField(field)
-		if fi < 256 { // in case we have more than 255 fields - just ignore it
-			fieldBits = fieldBits.Set(uint8(fi))
-			if i == 0 {
-				firstFieldIdx = fi
-			}
-		}
 		if len(qField.bounds) != 0 {
 			if isChain {
 				if i == 0 {
@@ -481,6 +498,9 @@ func (q *collQuery) indexQueryWeight(idx *index) (weight int, fieldBits bitmap.B
 				}
 			} else {
 				weight += 2
+			}
+			if i < 256 {
+				fieldBits = fieldBits.Set(uint8(fi))
 			}
 		} else {
 			if isChain {
