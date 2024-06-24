@@ -392,15 +392,17 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 	// filter useless indexes
 	var (
 		usedFieldsBits  bitmap.Bitmap256
+		usedSortBits    bitmap.Bitmap256
 		filteredIndexes = q.indexesWithWeight[:0]
 		exactSortFound  bool
 		exactSortIdx    int
 	)
 	for i, idx := range q.indexesWithWeight {
 		if usedFieldsBits.Subtract(idx.queryFieldsBits).Count() != 0 ||
-			usedFieldsBits.Subtract(idx.sortFieldsBits).Count() != 0 ||
+			usedSortBits.Subtract(idx.sortFieldsBits).Count() != 0 ||
 			(!exactSortFound && idx.exactSort) {
-			usedFieldsBits = usedFieldsBits.Or(idx.queryFieldsBits).Or(idx.sortFieldsBits)
+			usedFieldsBits = usedFieldsBits.Or(idx.queryFieldsBits)
+			usedSortBits = usedSortBits.Or(idx.sortFieldsBits)
 			idx.pos = i
 			filteredIndexes = append(filteredIndexes, idx)
 			if idx.exactSort {
