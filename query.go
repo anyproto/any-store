@@ -368,16 +368,11 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 		})
 	}
 
-	for i, sf := range q.sortFields {
-		if i < 255 && sf.Field == "id" {
-			if i == 0 {
-				// if an id field is first, other sorts will be useless
-				q.sortFields = q.sortFields[:1]
-				addedSorts = addedSorts.Set(uint8(i))
-				addIdSort(sf.Reverse)
-			}
-			break
-		}
+	if len(q.sortFields) != 0 && q.sortFields[0].Field == "id" {
+		// if an id field is first, other sorts will be useless
+		q.sortFields = q.sortFields[:1]
+		addedSorts = addedSorts.Set(uint8(0))
+		addIdSort(q.sortFields[0].Reverse)
 	}
 
 	// calculate weights
