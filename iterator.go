@@ -33,7 +33,6 @@ type Iterator interface {
 	Doc() (Doc, error)
 
 	// Err returns any error encountered during the lifetime of the iterator,
-	// including errors from invalid queries or during iteration.
 	Err() error
 
 	// Close closes the iterator and releases any associated resources.

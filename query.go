@@ -38,7 +38,7 @@ type Query interface {
 	Sort(sort ...any) Query
 
 	// Iter executes the query and returns an Iterator for the results.
-	Iter(ctx context.Context) Iterator
+	Iter(ctx context.Context) (Iterator, error)
 
 	// Count returns the number of documents matching the query.
 	Count(ctx context.Context) (count int, err error)
@@ -111,21 +111,21 @@ func (q *collQuery) Sort(sorts ...any) Query {
 	return q
 }
 
-func (q *collQuery) Iter(ctx context.Context) (iter Iterator) {
+func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	qb, err := q.makeQuery()
 	if err != nil {
-		return &iterator{err: err}
+		return
 	}
 	sqlRes := qb.build(false)
 	tx, err := q.c.db.ReadTx(ctx)
 	if err != nil {
-		return &iterator{err: err}
+		return
 	}
 	rows, err := tx.conn().QueryContext(ctx, sqlRes, qb.values)
 	if err != nil {
-		return &iterator{err: err}
+		return
 	}
-	return q.newIterator(rows, tx, qb)
+	return q.newIterator(rows, tx, qb), nil
 }
 
 func (q *collQuery) newIterator(rows driver.Rows, tx ReadTx, qb *queryBuilder) *iterator {

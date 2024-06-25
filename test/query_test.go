@@ -98,7 +98,8 @@ func testFile(t *testing.T, filename string) {
 
 		st := time.Now()
 
-		iter := q.Iter(ctx)
+		iter, err := q.Iter(ctx)
+		require.NoError(t, err)
 
 		var result = make([]string, 0)
 		for iter.Next() {
