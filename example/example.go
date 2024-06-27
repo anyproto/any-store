@@ -79,7 +79,10 @@ func main() {
 	fmt.Println("document count:", count)
 
 	// find many with condition
-	iter := coll.Find(`{"id":{"$in":[1,2,3]}}`).Sort("-name").Limit(2).Offset(1).Iter(ctx)
+	iter, err := coll.Find(`{"id":{"$in":[1,2,3]}}`).Sort("-name").Limit(2).Offset(1).Iter(ctx)
+	if err != nil {
+		log.Fatalf("query failed: %v", err)
+	}
 	defer func() {
 		if err = iter.Close(); err != nil {
 			log.Fatalf("unable to close iterator: %v", err)
