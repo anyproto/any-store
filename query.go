@@ -5,7 +5,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"slices"
-	stdSort "sort"
+	"sort"
 
 	"github.com/valyala/fastjson"
 
@@ -357,7 +357,7 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 	var addedSorts bitmap.Bitmap256
 
 	// handle "id" field
-	if _, idBounds := q.cond.IndexFilter("id", nil); len(idBounds) != 0 {
+	if idBounds := q.cond.IndexBounds("id", nil); len(idBounds) != 0 {
 		qb.idBounds = idBounds
 	}
 
@@ -386,7 +386,7 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 			q.indexesWithWeight[i].exactSort = sf.CountLeadingOnes() == len(q.sortFields)
 		}
 	}
-	stdSort.Sort(q.indexesWithWeight)
+	sort.Sort(q.indexesWithWeight)
 
 	// filter useless indexes
 	var (
@@ -474,7 +474,7 @@ func (q *collQuery) queryField(field string) (queryField, int) {
 			return f, i
 		}
 	}
-	_, bounds := q.cond.IndexFilter(field, nil)
+	bounds := q.cond.IndexBounds(field, nil)
 	f := queryField{
 		field:  field,
 		bounds: bounds,

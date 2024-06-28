@@ -23,10 +23,8 @@ func TestComp(t *testing.T) {
 			assert.False(t, cmp.Ok(a.NewNumberInt(-1)))
 			assert.False(t, cmp.Ok(a.NewString("1")))
 		})
-		t.Run("indexFilter", func(t *testing.T) {
-			f, bs := cmp.IndexFilter("", nil)
-			assert.NotNil(t, f)
-			require.Len(t, bs, 1)
+		t.Run("bounds", func(t *testing.T) {
+			bs := cmp.IndexBounds("", nil)
 			assert.Equal(t, Bound{
 				Start:        encoding.AppendAnyValue(nil, 1),
 				End:          encoding.AppendAnyValue(nil, 1),
@@ -61,9 +59,8 @@ func TestComp(t *testing.T) {
 			assert.False(t, cmp.Ok(a.NewNumberInt(1)))
 			assert.False(t, cmp.Ok(fastjson.MustParse(`[0,1,3]`)))
 		})
-		t.Run("indexFilter", func(t *testing.T) {
-			f, bs := cmp.IndexFilter("", nil)
-			assert.NotNil(t, f)
+		t.Run("bounds", func(t *testing.T) {
+			bs := cmp.IndexBounds("", nil)
 			require.Len(t, bs, 2)
 			assert.Equal(t, Bounds{
 				{
@@ -86,9 +83,8 @@ func TestComp(t *testing.T) {
 			assert.False(t, cmp.Ok(a.NewNumberInt(1)))
 			assert.False(t, cmp.Ok(a.NewNumberInt(0)))
 		})
-		t.Run("indexFilter", func(t *testing.T) {
-			f, bs := cmp.IndexFilter("", nil)
-			assert.NotNil(t, f)
+		t.Run("bounds", func(t *testing.T) {
+			bs := cmp.IndexBounds("", nil)
 			assert.Equal(t, Bounds{
 				{
 					Start: encoding.AppendAnyValue(nil, 1),
@@ -106,9 +102,8 @@ func TestComp(t *testing.T) {
 		t.Run("false", func(t *testing.T) {
 			assert.False(t, cmp.Ok(a.NewNumberInt(0)))
 		})
-		t.Run("indexFilter", func(t *testing.T) {
-			f, bs := cmp.IndexFilter("", nil)
-			assert.NotNil(t, f)
+		t.Run("bounds", func(t *testing.T) {
+			bs := cmp.IndexBounds("", nil)
 			assert.Equal(t, Bounds{
 				{
 					Start:        encoding.AppendAnyValue(nil, 1),
@@ -128,9 +123,8 @@ func TestComp(t *testing.T) {
 			assert.False(t, cmp.Ok(a.NewNumberInt(1)))
 			assert.False(t, cmp.Ok(a.NewNumberInt(2)))
 		})
-		t.Run("indexFilter", func(t *testing.T) {
-			f, bs := cmp.IndexFilter("", nil)
-			assert.NotNil(t, f)
+		t.Run("bounds", func(t *testing.T) {
+			bs := cmp.IndexBounds("", nil)
 			assert.Equal(t, Bounds{
 				{
 					End: encoding.AppendAnyValue(nil, 1),
@@ -148,9 +142,8 @@ func TestComp(t *testing.T) {
 		t.Run("false", func(t *testing.T) {
 			assert.False(t, cmp.Ok(a.NewNumberInt(2)))
 		})
-		t.Run("indexFilter", func(t *testing.T) {
-			f, bs := cmp.IndexFilter("", nil)
-			assert.NotNil(t, f)
+		t.Run("bounds", func(t *testing.T) {
+			bs := cmp.IndexBounds("", nil)
 			assert.Equal(t, Bounds{
 				{
 					End:        encoding.AppendAnyValue(nil, 1),
@@ -174,15 +167,11 @@ func TestAnd(t *testing.T) {
 		assert.False(t, f.Ok(fastjson.MustParse(`{"a":2,"b":"2","c":4}`)))
 		assert.False(t, f.Ok(fastjson.MustParse(`{"a":1,"b":2,"c":4}`)))
 	})
-	t.Run("indexFilter", func(t *testing.T) {
-		ifl, bs := f.IndexFilter("a", nil)
-		require.NotNil(t, ifl)
+	t.Run("bounds", func(t *testing.T) {
+		bs := f.IndexBounds("a", nil)
 		require.Len(t, bs, 1)
-		assert.True(t, ifl.OkBytes(encoding.AppendAnyValue(nil, 1)))
-		assert.False(t, ifl.OkBytes(encoding.AppendAnyValue(nil, 2)))
 
-		ifl, bs = f.IndexFilter("z", nil)
-		assert.Nil(t, ifl)
+		bs = f.IndexBounds("z", nil)
 		assert.Nil(t, bs)
 	})
 }
@@ -196,21 +185,16 @@ func TestOr(t *testing.T) {
 		assert.True(t, f.Ok(fastjson.MustParse(`{"a":1,"b":"3","c":4}`)))
 		assert.False(t, f.Ok(fastjson.MustParse(`{"a":12,"b":2,"c":4}`)))
 	})
-	t.Run("indexFilter", func(t *testing.T) {
+	t.Run("bounds", func(t *testing.T) {
 		t.Run("no filter", func(t *testing.T) {
-			ifl, bs := f.IndexFilter("a", nil)
-			assert.Nil(t, ifl)
+			bs := f.IndexBounds("a", nil)
 			assert.Nil(t, bs)
 		})
 		t.Run("filter", func(t *testing.T) {
 			f2, err := ParseCondition(`{"$or":[{"a":1},{"a":"2"}]}`)
 			require.NoError(t, err)
-			ifl, bs := f2.IndexFilter("a", nil)
-			assert.NotNil(t, ifl)
+			bs := f2.IndexBounds("a", nil)
 			assert.Len(t, bs, 2)
-			assert.True(t, ifl.OkBytes(encoding.AppendAnyValue(nil, 1)))
-			assert.True(t, ifl.OkBytes(encoding.AppendAnyValue(nil, "2")))
-			assert.False(t, ifl.OkBytes(encoding.AppendAnyValue(nil, 3)))
 		})
 	})
 
@@ -224,21 +208,16 @@ func TestNor(t *testing.T) {
 		assert.False(t, f.Ok(fastjson.MustParse(`{"a":1,"b":"3","c":4}`)))
 		assert.True(t, f.Ok(fastjson.MustParse(`{"a":12,"b":2,"c":4}`)))
 	})
-	t.Run("indexFilter", func(t *testing.T) {
+	t.Run("bounds", func(t *testing.T) {
 		t.Run("no filter", func(t *testing.T) {
-			ifl, bs := f.IndexFilter("a", nil)
-			assert.Nil(t, ifl)
+			bs := f.IndexBounds("a", nil)
 			assert.Nil(t, bs)
 		})
 		t.Run("filter", func(t *testing.T) {
 			f2, err := ParseCondition(`{"$nor":[{"a":1},{"a":"2"}]}`)
 			require.NoError(t, err)
-			ifl, bs := f2.IndexFilter("a", nil)
-			assert.NotNil(t, ifl)
+			bs := f2.IndexBounds("a", nil)
 			assert.Len(t, bs, 0)
-			assert.False(t, ifl.OkBytes(encoding.AppendAnyValue(nil, 1)))
-			assert.False(t, ifl.OkBytes(encoding.AppendAnyValue(nil, "2")))
-			assert.True(t, ifl.OkBytes(encoding.AppendAnyValue(nil, 3)))
 		})
 	})
 }
@@ -251,12 +230,9 @@ func TestNot(t *testing.T) {
 		assert.True(t, f.Ok(fastjson.MustParse(`{"a":1,"b":"3","c":4}`)))
 		assert.False(t, f.Ok(fastjson.MustParse(`{"a":2,"b":2,"c":4}`)))
 	})
-	t.Run("indexFilter", func(t *testing.T) {
-		ifl, bs := f.IndexFilter("a", nil)
-		assert.NotNil(t, ifl)
+	t.Run("bounds", func(t *testing.T) {
+		bs := f.IndexBounds("a", nil)
 		assert.Len(t, bs, 0)
-		assert.True(t, ifl.OkBytes(encoding.AppendAnyValue(nil, 1)))
-		assert.False(t, ifl.OkBytes(encoding.AppendAnyValue(nil, 2)))
 	})
 }
 
@@ -267,9 +243,8 @@ func TestComplex(t *testing.T) {
 		assert.True(t, f.Ok(fastjson.MustParse(`{"a":2,"b":[3,2,1],"c":"test"}`)))
 		assert.False(t, f.Ok(fastjson.MustParse(`{"a":1,"b":[3,2],"c":"test"}`)))
 	})
-	t.Run("indexFilter", func(t *testing.T) {
-		ifl, bs := f.IndexFilter("a", nil)
-		assert.NotNil(t, ifl)
+	t.Run("bounds", func(t *testing.T) {
+		bs := f.IndexBounds("a", nil)
 		assert.Len(t, bs, 3)
 	})
 
@@ -290,11 +265,10 @@ func TestExists(t *testing.T) {
 			assert.True(t, f.Ok(fastjson.MustParse(`{"b":1}`)))
 		})
 	})
-	t.Run("indexFilter", func(t *testing.T) {
+	t.Run("bounds", func(t *testing.T) {
 		f, err := ParseCondition(`{"a":{"$exists":true}}`)
 		require.NoError(t, err)
-		ifl, bs := f.IndexFilter("a", nil)
-		assert.Nil(t, ifl)
+		bs := f.IndexBounds("a", nil)
 		assert.Len(t, bs, 0)
 	})
 }
@@ -306,12 +280,9 @@ func TestTypeFilter(t *testing.T) {
 		assert.True(t, f.Ok(fastjson.MustParse(`{"a":1}`)))
 		assert.False(t, f.Ok(fastjson.MustParse(`{"a":"1"}`)))
 	})
-	t.Run("indexFilter", func(t *testing.T) {
-		ifl, bs := f.IndexFilter("a", nil)
-		require.NotNil(t, ifl)
+	t.Run("bounds", func(t *testing.T) {
+		bs := f.IndexBounds("a", nil)
 		require.Len(t, bs, 1)
-		assert.True(t, f.OkBytes(encoding.AppendAnyValue(nil, 2)))
-		assert.False(t, f.OkBytes(encoding.AppendAnyValue(nil, "2")))
 	})
 }
 
@@ -351,40 +322,40 @@ func TestRegexp(t *testing.T) {
 	t.Run("index: no prefix", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "prefix"}}`)
 		require.NoError(t, err)
-		_, bounds := f.IndexFilter("name", Bounds{})
+		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 0)
 	})
 	t.Run("index: ^(?i)prefix - no prefix", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^(?i)prefix"}}`)
 		require.NoError(t, err)
-		_, bounds := f.IndexFilter("name", Bounds{})
+		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 0)
 	})
 	t.Run("index: ^prefix\\.test - return prefix.test", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^prefix\.test"}}`)
 		require.NoError(t, err)
-		_, bounds := f.IndexFilter("name", Bounds{})
+		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 1)
 		assert.Equal(t, "prefix.test", append(bounds[0].Start, 0).String())
 	})
 	t.Run("index: ^prefix\\.test{1}* - return prefix.test", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^prefix\.test{a-zA-z}*"}}`)
 		require.NoError(t, err)
-		_, bounds := f.IndexFilter("name", Bounds{})
+		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 1)
 		assert.Equal(t, "prefix.test", append(bounds[0].Start, 0).String())
 	})
 	t.Run("index: ^prefix+ - return prefix", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^prefix+"}}`)
 		require.NoError(t, err)
-		_, bounds := f.IndexFilter("name", Bounds{})
+		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 1)
 		assert.Equal(t, "prefix", append(bounds[0].Start, 0).String())
 	})
 	t.Run("index: ^\\.a* - return prefix", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^\.a*"}}`)
 		require.NoError(t, err)
-		_, bounds := f.IndexFilter("name", Bounds{})
+		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 1)
 		assert.Equal(t, ".a", append(bounds[0].Start, 0).String())
 	})
