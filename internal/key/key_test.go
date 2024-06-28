@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fastjson"
 
-	"github.com/anyproto/any-store/internal/encoding"
+	"github.com/anyproto/any-store/encoding"
 )
 
 func TestKey_AppendJSON(t *testing.T) {

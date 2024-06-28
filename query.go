@@ -12,7 +12,6 @@ import (
 	"github.com/anyproto/any-store/internal/bitmap"
 	"github.com/anyproto/any-store/internal/conn"
 
-	"github.com/anyproto/any-store/internal/sort"
 	"github.com/anyproto/any-store/query"
 )
 
@@ -69,12 +68,12 @@ type collQuery struct {
 	c *collection
 
 	cond query.Filter
-	sort sort.Sort
+	sort query.Sort
 
 	limit, offset uint
 
 	indexesWithWeight weightedIndexes
-	sortFields        []sort.SortField
+	sortFields        []query.SortField
 	queryFields       []queryField
 
 	err error
@@ -105,7 +104,7 @@ func (q *collQuery) Offset(offset uint) Query {
 
 func (q *collQuery) Sort(sorts ...any) Query {
 	var err error
-	if q.sort, err = sort.ParseSort(sorts...); err != nil {
+	if q.sort, err = query.ParseSort(sorts...); err != nil {
 		q.err = errors.Join(err)
 	}
 	return q

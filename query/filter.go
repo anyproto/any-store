@@ -8,7 +8,7 @@ import (
 
 	"github.com/valyala/fastjson"
 
-	"github.com/anyproto/any-store/internal/encoding"
+	encoding2 "github.com/anyproto/any-store/encoding"
 )
 
 type Filter interface {
@@ -45,7 +45,7 @@ func (e *Comp) Ok(v *fastjson.Value) bool {
 		vals, _ := v.Array()
 		if e.CompOp == CompOpNe {
 			for _, val := range vals {
-				e.buf = encoding.AppendJSONValue(e.buf[:0], val)
+				e.buf = encoding2.AppendJSONValue(e.buf[:0], val)
 				if !e.comp(e.buf) {
 					return false
 				}
@@ -53,7 +53,7 @@ func (e *Comp) Ok(v *fastjson.Value) bool {
 			return true
 		} else {
 			for _, val := range vals {
-				e.buf = encoding.AppendJSONValue(e.buf[:0], val)
+				e.buf = encoding2.AppendJSONValue(e.buf[:0], val)
 				if e.comp(e.buf) {
 					return true
 				}
@@ -61,7 +61,7 @@ func (e *Comp) Ok(v *fastjson.Value) bool {
 			return false
 		}
 	} else {
-		e.buf = encoding.AppendJSONValue(e.buf[:0], v)
+		e.buf = encoding2.AppendJSONValue(e.buf[:0], v)
 		return e.comp(e.buf)
 	}
 }
@@ -148,7 +148,7 @@ func (e *Comp) String() string {
 		op = string(opBytesNe)
 	}
 	a := &fastjson.Arena{}
-	val, _, _ := encoding.DecodeToJSON(&fastjson.Parser{}, a, e.EqValue)
+	val, _, _ := encoding2.DecodeToJSON(&fastjson.Parser{}, a, e.EqValue)
 	return fmt.Sprintf(`{"%s": %s}`, op, val.String())
 }
 
@@ -363,14 +363,14 @@ func (e Exists) String() string {
 }
 
 type TypeFilter struct {
-	Type encoding.Type
+	Type encoding2.Type
 }
 
 func (e TypeFilter) Ok(v *fastjson.Value) bool {
 	if v == nil {
 		return false
 	}
-	return encoding.FastJSONTypeToType(v.Type()) == e.Type
+	return encoding2.FastJSONTypeToType(v.Type()) == e.Type
 }
 
 func (e TypeFilter) OkBytes(b []byte) bool {
@@ -439,7 +439,7 @@ func (r Regexp) IndexFilter(_ string, bs Bounds) (filter Filter, bounds Bounds) 
 	}
 	var (
 		prefixBuf     = make([]byte, 0, len(prefix)+2)
-		prefixEncoded = encoding.AppendAnyValue(prefixBuf, prefix)
+		prefixEncoded = encoding2.AppendAnyValue(prefixBuf, prefix)
 	)
 	// strip the 'eof' byte
 	prefixEncoded = prefixEncoded[:len(prefixEncoded)-1]

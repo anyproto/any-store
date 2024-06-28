@@ -8,7 +8,7 @@ import (
 
 	"github.com/valyala/fastjson"
 
-	"github.com/anyproto/any-store/internal/encoding"
+	encoding2 "github.com/anyproto/any-store/encoding"
 	"github.com/anyproto/any-store/internal/parser"
 )
 
@@ -232,7 +232,7 @@ func parseComp(key string, v *fastjson.Value) (f Filter, err error) {
 		}
 	} else {
 		eq := &Comp{}
-		eq.EqValue = encoding.AppendJSONValue(eq.EqValue, v)
+		eq.EqValue = encoding2.AppendJSONValue(eq.EqValue, v)
 		fk.Filter = eq
 	}
 	return fk, nil
@@ -247,7 +247,7 @@ func parseCompObj(v *fastjson.Value) (Filter, error) {
 		return f, nil
 	} else {
 		cmp := &Comp{}
-		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
+		cmp.EqValue = encoding2.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpEq
 		return cmp, nil
 	}
@@ -317,32 +317,32 @@ func makeCompFilter(op Operator, v *fastjson.Value) (f Filter, err error) {
 	switch op {
 	case opEq:
 		cmp := &Comp{}
-		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
+		cmp.EqValue = encoding2.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpEq
 		return cmp, nil
 	case opNe:
 		cmp := &Comp{}
-		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
+		cmp.EqValue = encoding2.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpNe
 		return cmp, nil
 	case opGt:
 		cmp := &Comp{}
-		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
+		cmp.EqValue = encoding2.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpGt
 		return cmp, nil
 	case opGte:
 		cmp := &Comp{}
-		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
+		cmp.EqValue = encoding2.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpGte
 		return cmp, nil
 	case opLt:
 		cmp := &Comp{}
-		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
+		cmp.EqValue = encoding2.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpLt
 		return cmp, nil
 	case opLte:
 		cmp := &Comp{}
-		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
+		cmp.EqValue = encoding2.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpLte
 		return cmp, nil
 	case opNot:
@@ -404,7 +404,7 @@ func makeEqArray(v *fastjson.Value) []Filter {
 	res := make([]Filter, len(vals))
 	for i, jv := range vals {
 		eq := &Comp{CompOp: CompOpEq}
-		eq.EqValue = encoding.AppendJSONValue(eq.EqValue, jv)
+		eq.EqValue = encoding2.AppendJSONValue(eq.EqValue, jv)
 		res[i] = eq
 	}
 	return res
@@ -430,14 +430,14 @@ func parseType(v *fastjson.Value) (f Filter, err error) {
 		if tv > TypeObject || tv < 0 {
 			return nil, fmt.Errorf("unexpected type: %d", n)
 		}
-		return TypeFilter{Type: encoding.Type(tv)}, err
+		return TypeFilter{Type: encoding2.Type(tv)}, err
 	case fastjson.TypeString:
 		bs, _ := v.StringBytes()
 		tv, ok := stringToType[string(bs)]
 		if !ok {
 			return nil, fmt.Errorf("unexpected type: %s", string(bs))
 		}
-		return TypeFilter{Type: encoding.Type(tv)}, err
+		return TypeFilter{Type: encoding2.Type(tv)}, err
 	default:
 		return nil, fmt.Errorf("unexpetced type: %s", v.String())
 	}

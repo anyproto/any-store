@@ -10,13 +10,13 @@ import (
 	"sync"
 	"sync/atomic"
 
+	encoding2 "github.com/anyproto/any-store/encoding"
 	"github.com/anyproto/any-store/internal/key"
 	"github.com/anyproto/any-store/query"
 
 	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-store/internal/conn"
-	"github.com/anyproto/any-store/internal/encoding"
 	"github.com/anyproto/any-store/internal/sql"
 	"github.com/anyproto/any-store/internal/syncpool"
 )
@@ -212,7 +212,7 @@ func (c *collection) FindId(ctx context.Context, docId any) (doc Doc, err error)
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
-	id := encoding.AppendAnyValue(buf.SmallBuf[:0], docId)
+	id := encoding2.AppendAnyValue(buf.SmallBuf[:0], docId)
 	err = c.db.doReadTx(ctx, func(cn conn.Conn) (err error) {
 		rows, err := cn.QueryContext(ctx, c.queries.findId, []driver.NamedValue{
 			{Name: "id", Value: id},
@@ -344,7 +344,7 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
-		idKey := encoding.AppendAnyValue(buf.SmallBuf[:0], id)
+		idKey := encoding2.AppendAnyValue(buf.SmallBuf[:0], id)
 		it, txErr := c.loadById(ctx, buf, idKey)
 		if txErr != nil {
 			return
@@ -378,7 +378,7 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
-		idKey := encoding.AppendAnyValue(buf.SmallBuf[:0], id)
+		idKey := encoding2.AppendAnyValue(buf.SmallBuf[:0], id)
 		var (
 			isInsert bool
 			modValue *fastjson.Value
@@ -391,7 +391,7 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 				var idVal *fastjson.Value
 				buf.Arena.Reset()
 				modValue = buf.Arena.NewObject()
-				idVal, _, txErr = encoding.DecodeToJSON(buf.Parser, buf.Arena, idKey)
+				idVal, _, txErr = encoding2.DecodeToJSON(buf.Parser, buf.Arena, idKey)
 				if txErr != nil {
 					return txErr
 				}
@@ -506,7 +506,7 @@ func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
-		idKey := encoding.AppendAnyValue(buf.SmallBuf[:0], id)
+		idKey := encoding2.AppendAnyValue(buf.SmallBuf[:0], id)
 		it, txErr := c.loadById(ctx, buf, idKey)
 		if txErr != nil {
 			return

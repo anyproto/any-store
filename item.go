@@ -5,7 +5,7 @@ import (
 
 	"github.com/valyala/fastjson"
 
-	"github.com/anyproto/any-store/internal/encoding"
+	"github.com/anyproto/any-store/encoding"
 	"github.com/anyproto/any-store/internal/objectid"
 	"github.com/anyproto/any-store/internal/parser"
 )

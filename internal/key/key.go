@@ -6,7 +6,7 @@ import (
 
 	"github.com/valyala/fastjson"
 
-	"github.com/anyproto/any-store/internal/encoding"
+	encoding2 "github.com/anyproto/any-store/encoding"
 )
 
 func New() Key {
@@ -16,15 +16,15 @@ func New() Key {
 type Key []byte
 
 func (k Key) AppendAny(v any) Key {
-	return encoding.AppendAnyValue(k, v)
+	return encoding2.AppendAnyValue(k, v)
 }
 
 func (k Key) AppendJSON(v *fastjson.Value) Key {
-	return encoding.AppendJSONValue(k, v)
+	return encoding2.AppendJSONValue(k, v)
 }
 
 func (k Key) AppendInvertedJSON(v *fastjson.Value) Key {
-	return encoding.AppendInvertedJSON(k, v)
+	return encoding2.AppendInvertedJSON(k, v)
 }
 
 func (k Key) Empty() bool {
@@ -36,7 +36,7 @@ func (k Key) ReadJSONValue(p *fastjson.Parser, a *fastjson.Arena, f func(v *fast
 	var v *fastjson.Value
 	var k2 = k
 	for len(k2) > 0 {
-		if v, start, err = encoding.DecodeToJSON(p, a, k2); err != nil {
+		if v, start, err = encoding2.DecodeToJSON(p, a, k2); err != nil {
 			return err
 		}
 		if err = f(v); err != nil {
@@ -54,7 +54,7 @@ func (k Key) ReadAnyValue(f func(v any) error) (err error) {
 	var k2 = k
 
 	for len(k2) > 0 {
-		if v, start, err = encoding.DecodeToAny(k2); err != nil {
+		if v, start, err = encoding2.DecodeToAny(k2); err != nil {
 			return err
 		}
 		if err = f(v); err != nil {
@@ -74,7 +74,7 @@ func (k Key) ReadByteValues(f func(b []byte) error) (err error) {
 	var k2 = k
 	var val []byte
 	for len(k2) > 0 {
-		if val, start, err = encoding.DecodeToByte(k2); err != nil {
+		if val, start, err = encoding2.DecodeToByte(k2); err != nil {
 			return err
 		}
 		if err = f(val); err != nil {
