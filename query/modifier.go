@@ -1,10 +1,13 @@
 package query
 
 import (
+	"bytes"
 	"fmt"
 	"strconv"
 
 	"github.com/valyala/fastjson"
+
+	"github.com/anyproto/any-store/encoding"
 )
 
 type Modifier interface {
@@ -147,21 +150,13 @@ func (m modifierPop) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastj
 			return nil, err
 		}
 		modified = true
-		return m.prepareNewValue(a, arrayOfValues), nil
+		return prepareNewArrayValue(a, arrayOfValues), nil
 	})
 	if err != nil {
 		return nil, false, err
 	}
 	result = v
 	return
-}
-
-func (m modifierPop) prepareNewValue(a *fastjson.Arena, arrayOfValues []*fastjson.Value) *fastjson.Value {
-	newValue := a.NewArray()
-	for i, val := range arrayOfValues {
-		newValue.SetArrayItem(i, val)
-	}
-	return newValue
 }
 
 func (m modifierPop) getResultArray(arrayOfValues []*fastjson.Value) ([]*fastjson.Value, error) {
@@ -177,6 +172,110 @@ func (m modifierPop) getResultArray(arrayOfValues []*fastjson.Value) ([]*fastjso
 		return nil, fmt.Errorf("failed to pop item: wrong argument")
 	}
 	return arrayOfValues, nil
+}
+
+type modifierPush struct {
+	fieldPath []string
+	val       *fastjson.Value
+}
+
+func (m modifierPush) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
+	err = walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+		if value == nil {
+			return nil, nil
+		}
+		arrayOfValues, err := value.Array()
+		if err != nil {
+			return nil, fmt.Errorf("failed to pop item, %w", err)
+		}
+		arrayOfValues = append(arrayOfValues, m.val)
+		modified = true
+		return prepareNewArrayValue(a, arrayOfValues), nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	result = v
+	return
+}
+
+type modifierPull struct {
+	fieldPath []string
+	val       *fastjson.Value
+}
+
+func (m modifierPull) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
+	err = walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+		if value == nil {
+			return nil, nil
+		}
+		arrayOfValues, err := value.Array()
+		if err != nil {
+			return nil, fmt.Errorf("failed to pop item, %w", err)
+		}
+		if len(arrayOfValues) == 0 {
+			return value, nil
+		}
+		var newArray []*fastjson.Value
+		if m.val.Type() == fastjson.TypeObject {
+			newArray, modified = m.handleObjectValue(arrayOfValues, newArray)
+		} else {
+			newArray, modified = m.handleNonObjectValue(arrayOfValues, newArray)
+		}
+		return prepareNewArrayValue(a, newArray), nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	result = v
+	return
+}
+
+func (m modifierPull) handleNonObjectValue(arrayOfValues, newArray []*fastjson.Value) ([]*fastjson.Value, bool) {
+	var modified bool
+	for _, val := range arrayOfValues {
+		if !compare(val, m.val) {
+			newArray = append(newArray, val)
+		} else {
+			modified = true
+		}
+	}
+	return newArray, modified
+}
+
+func (m modifierPull) handleObjectValue(arrayOfValues, newArray []*fastjson.Value) ([]*fastjson.Value, bool) {
+	var modified bool
+	condition, err := ParseCompObj(m.val)
+	if err == nil {
+		for _, val := range arrayOfValues {
+			if condition.Ok(val) {
+				modified = true
+				continue
+			}
+			newArray = append(newArray, val)
+		}
+	}
+	return newArray, modified
+}
+
+func compare(left *fastjson.Value, right *fastjson.Value) bool {
+	if left.Type() != right.Type() {
+		return false
+	}
+	var leftBytes []byte
+	leftBytes = encoding.AppendJSONValue(leftBytes, left)
+	var rightBytes []byte
+	rightBytes = encoding.AppendJSONValue(rightBytes, right)
+
+	return bytes.Compare(leftBytes, rightBytes) == 0
+}
+
+func prepareNewArrayValue(a *fastjson.Arena, arrayOfValues []*fastjson.Value) *fastjson.Value {
+	newValue := a.NewArray()
+	for i, val := range arrayOfValues {
+		newValue.SetArrayItem(i, val)
+	}
+	return newValue
 }
 
 func walk(
