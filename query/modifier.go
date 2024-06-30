@@ -301,7 +301,7 @@ func (m modifierPullAll) Modify(a *fastjson.Arena, v *fastjson.Value) (result *f
 			return nil, fmt.Errorf("failed to pop item, %w", err)
 		}
 		var newArray []*fastjson.Value
-		newArray, modified = m.removedElements(arrayOfValues, removedElems, modified)
+		newArray, modified = m.removedElements(arrayOfValues, removedElems)
 		return prepareNewArrayValue(a, newArray), nil
 	})
 	if err != nil {
@@ -311,8 +311,11 @@ func (m modifierPullAll) Modify(a *fastjson.Arena, v *fastjson.Value) (result *f
 	return
 }
 
-func (m modifierPullAll) removedElements(arrayOfValues []*fastjson.Value, removedElems []*fastjson.Value, modified bool) ([]*fastjson.Value, bool) {
-	var newArray []*fastjson.Value
+func (m modifierPullAll) removedElements(arrayOfValues []*fastjson.Value, removedElems []*fastjson.Value) ([]*fastjson.Value, bool) {
+	var (
+		newArray []*fastjson.Value
+		modified bool
+	)
 	for _, val := range arrayOfValues {
 		if slices.ContainsFunc(removedElems, func(removedValue *fastjson.Value) bool {
 			return compare(val, removedValue)
@@ -323,6 +326,43 @@ func (m modifierPullAll) removedElements(arrayOfValues []*fastjson.Value, remove
 		newArray = append(newArray, val)
 	}
 	return newArray, modified
+}
+
+type modifierAddToSet struct {
+	fieldPath []string
+	val       *fastjson.Value
+}
+
+func (m modifierAddToSet) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
+	err = walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+		if value == nil {
+			return nil, nil
+		}
+		arrayOfValues, err := value.Array()
+		if err != nil {
+			return nil, fmt.Errorf("failed to pop item, %w", err)
+		}
+		if len(arrayOfValues) == 0 {
+			return value, nil
+		}
+		arrayOfValues, modified = m.addElements(arrayOfValues, m.val)
+		return prepareNewArrayValue(a, arrayOfValues), nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	result = v
+	return
+}
+
+func (m modifierAddToSet) addElements(arrayOfValues []*fastjson.Value, addElem *fastjson.Value) ([]*fastjson.Value, bool) {
+	if slices.ContainsFunc(arrayOfValues, func(val *fastjson.Value) bool {
+		return compare(addElem, val)
+	}) {
+		return arrayOfValues, false
+	}
+	arrayOfValues = append(arrayOfValues, addElem)
+	return arrayOfValues, true
 }
 
 func walk(
