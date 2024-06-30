@@ -94,6 +94,37 @@ func (m modifierInc) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastj
 	return
 }
 
+type modifierRename struct {
+	fieldPath []string
+	val       *fastjson.Value
+}
+
+func (m modifierRename) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
+	err = walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+		if value == nil {
+			return nil, nil
+		}
+		stringBytes, err := m.val.StringBytes()
+		if err != nil {
+			return nil, fmt.Errorf("failed to rename field: %w", err)
+		}
+		set := &modifierSet{fieldPath: []string{string(stringBytes)}, val: value}
+		result, modified, err = set.Modify(a, prevValue)
+		if err != nil {
+			return nil, fmt.Errorf("failed to rename field: %w", err)
+		}
+		if !modified {
+			return value, nil
+		}
+		return
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	result = v
+	return
+}
+
 func walk(
 	a *fastjson.Arena,
 	v *fastjson.Value,
