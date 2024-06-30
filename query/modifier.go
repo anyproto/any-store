@@ -125,6 +125,60 @@ func (m modifierRename) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fa
 	return
 }
 
+type modifierPop struct {
+	fieldPath []string
+	val       *fastjson.Value
+}
+
+func (m modifierPop) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
+	err = walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+		if value == nil {
+			return nil, nil
+		}
+		arrayOfValues, err := value.Array()
+		if err != nil {
+			return nil, fmt.Errorf("failed to pop item, %w", err)
+		}
+		if len(arrayOfValues) == 0 {
+			return value, nil
+		}
+		arrayOfValues, err = m.getResultArray(arrayOfValues)
+		if err != nil {
+			return nil, err
+		}
+		modified = true
+		return m.prepareNewValue(a, arrayOfValues), nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	result = v
+	return
+}
+
+func (m modifierPop) prepareNewValue(a *fastjson.Arena, arrayOfValues []*fastjson.Value) *fastjson.Value {
+	newValue := a.NewArray()
+	for i, val := range arrayOfValues {
+		newValue.SetArrayItem(i, val)
+	}
+	return newValue
+}
+
+func (m modifierPop) getResultArray(arrayOfValues []*fastjson.Value) ([]*fastjson.Value, error) {
+	elem, err := m.val.Int()
+	if err != nil {
+		return nil, fmt.Errorf("failed to pop item, %w", err)
+	}
+	if elem == 1 {
+		arrayOfValues = arrayOfValues[:len(arrayOfValues)-1]
+	} else if elem == -1 {
+		arrayOfValues = arrayOfValues[1:]
+	} else {
+		return nil, fmt.Errorf("failed to pop item: wrong argument")
+	}
+	return arrayOfValues, nil
+}
+
 func walk(
 	a *fastjson.Arena,
 	v *fastjson.Value,

@@ -77,6 +77,12 @@ func parseModRoot(v *fastjson.Value) (m Modifier, err error) {
 				return
 			}
 			root = append(root, setMod...)
+		case bytes.Equal(key, opBytesPop):
+			var setMod modifierRoot
+			if setMod, err = parseMod(v, newPopModifier); err != nil {
+				return
+			}
+			root = append(root, setMod...)
 		default:
 			err = fmt.Errorf("unknown modifier '%s'", string(key))
 		}
@@ -138,6 +144,13 @@ func newIncModifier(key []byte, v *fastjson.Value) (Modifier, error) {
 
 func newRenameModifier(key []byte, v *fastjson.Value) (Modifier, error) {
 	return modifierRename{
+		fieldPath: strings.Split(string(key), "."),
+		val:       v,
+	}, nil
+}
+
+func newPopModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+	return modifierPop{
 		fieldPath: strings.Split(string(key), "."),
 		val:       v,
 	}, nil
