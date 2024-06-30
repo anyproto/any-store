@@ -3,6 +3,7 @@ package query
 import (
 	"bytes"
 	"fmt"
+	"slices"
 	"strconv"
 
 	"github.com/valyala/fastjson"
@@ -276,6 +277,52 @@ func prepareNewArrayValue(a *fastjson.Arena, arrayOfValues []*fastjson.Value) *f
 		newValue.SetArrayItem(i, val)
 	}
 	return newValue
+}
+
+type modifierPullAll struct {
+	fieldPath []string
+	val       *fastjson.Value
+}
+
+func (m modifierPullAll) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
+	err = walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+		if value == nil {
+			return nil, nil
+		}
+		arrayOfValues, err := value.Array()
+		if err != nil {
+			return nil, fmt.Errorf("failed to pop item, %w", err)
+		}
+		if len(arrayOfValues) == 0 {
+			return value, nil
+		}
+		removedElems, err := m.val.Array()
+		if err != nil {
+			return nil, fmt.Errorf("failed to pop item, %w", err)
+		}
+		var newArray []*fastjson.Value
+		newArray, modified = m.removedElements(arrayOfValues, removedElems, modified)
+		return prepareNewArrayValue(a, newArray), nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	result = v
+	return
+}
+
+func (m modifierPullAll) removedElements(arrayOfValues []*fastjson.Value, removedElems []*fastjson.Value, modified bool) ([]*fastjson.Value, bool) {
+	var newArray []*fastjson.Value
+	for _, val := range arrayOfValues {
+		if slices.ContainsFunc(removedElems, func(removedValue *fastjson.Value) bool {
+			return compare(val, removedValue)
+		}) {
+			modified = true
+			continue
+		}
+		newArray = append(newArray, val)
+	}
+	return newArray, modified
 }
 
 func walk(
