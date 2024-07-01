@@ -342,9 +342,6 @@ func (m modifierAddToSet) Modify(a *fastjson.Arena, v *fastjson.Value) (result *
 		if err != nil {
 			return nil, fmt.Errorf("failed to pop item, %w", err)
 		}
-		if len(arrayOfValues) == 0 {
-			return value, nil
-		}
 		arrayOfValues, modified = m.addElements(arrayOfValues, m.val)
 		return prepareNewArrayValue(a, arrayOfValues), nil
 	})
