@@ -8,14 +8,13 @@ import (
 
 	"github.com/valyala/fastjson"
 
-	"github.com/anyproto/any-store/internal/encoding"
+	"github.com/anyproto/any-store/encoding"
 )
 
 type Filter interface {
 	Ok(v *fastjson.Value) bool
-	OkBytes(b []byte) bool
 
-	IndexFilter(fieldName string, bs Bounds) (filter Filter, bounds Bounds)
+	IndexBounds(fieldName string, bs Bounds) (bounds Bounds)
 
 	fmt.Stringer
 }
@@ -80,35 +79,35 @@ func (e *Comp) OkBytes(b []byte) bool {
 	return e.comp(b)
 }
 
-func (e *Comp) IndexFilter(_ string, bs Bounds) (filter Filter, bounds Bounds) {
+func (e *Comp) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	switch e.CompOp {
 	case CompOpEq:
-		return e, bs.Append(Bound{
+		return bs.Append(Bound{
 			Start:        e.EqValue,
 			End:          e.EqValue,
 			StartInclude: true,
 			EndInclude:   true,
 		})
 	case CompOpGt:
-		return e, bs.Append(Bound{
+		return bs.Append(Bound{
 			Start: e.EqValue,
 		})
 	case CompOpGte:
-		return e, bs.Append(Bound{
+		return bs.Append(Bound{
 			Start:        e.EqValue,
 			StartInclude: true,
 		})
 	case CompOpLt:
-		return e, bs.Append(Bound{
+		return bs.Append(Bound{
 			End: e.EqValue,
 		})
 	case CompOpLte:
-		return e, bs.Append(Bound{
+		return bs.Append(Bound{
 			End:        e.EqValue,
 			EndInclude: true,
 		})
 	case CompOpNe:
-		return e, bs.Append(Bound{
+		return bs.Append(Bound{
 			End: e.EqValue,
 		}).Append(Bound{
 			Start: e.EqValue,
@@ -168,15 +167,11 @@ func (e Key) Ok(v *fastjson.Value) bool {
 	return e.Filter.Ok(v.Get(e.Path...))
 }
 
-func (e Key) OkBytes(b []byte) bool {
-	return e.Filter.OkBytes(b)
-}
-
-func (e Key) IndexFilter(fieldName string, bs Bounds) (filter Filter, bounds Bounds) {
+func (e Key) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	if strings.Join(e.Path, ".") == fieldName {
-		return e.Filter.IndexFilter(fieldName, bs)
+		return e.Filter.IndexBounds(fieldName, bs)
 	}
-	return nil, bs
+	return bs
 }
 
 func (e Key) String() string {
@@ -194,22 +189,13 @@ func (e And) Ok(v *fastjson.Value) bool {
 	return true
 }
 
-func (e And) OkBytes(b []byte) bool {
+func (e And) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	for _, f := range e {
-		if !f.OkBytes(b) {
-			return false
-		}
-	}
-	return true
-}
-
-func (e And) IndexFilter(fieldName string, bs Bounds) (filter Filter, bounds Bounds) {
-	for _, f := range e {
-		if filter, bounds = f.IndexFilter(fieldName, bs); filter != nil {
+		if bounds = f.IndexBounds(fieldName, bs); len(bounds) != len(bs) {
 			return
 		}
 	}
-	return nil, bs
+	return bs
 }
 
 func (e And) String() string {
@@ -233,29 +219,14 @@ func (e Or) Ok(v *fastjson.Value) bool {
 	return false
 }
 
-func (e Or) OkBytes(b []byte) bool {
+func (e Or) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	for _, f := range e {
-		if f.OkBytes(b) {
-			return true
-		}
-	}
-	return false
-}
-
-func (e Or) IndexFilter(fieldName string, bs Bounds) (filter Filter, bounds Bounds) {
-	var of Or
-	var ff Filter
-	for _, f := range e {
-		if ff, bs = f.IndexFilter(fieldName, bs); ff != nil {
-			of = append(of, ff)
-		} else {
+		beforeBounds := len(bs)
+		if bs = f.IndexBounds(fieldName, bs); len(bs) == beforeBounds {
 			return
 		}
 	}
-	if len(of) == 0 {
-		return
-	}
-	return of, bs
+	return bs
 }
 
 func (e Or) String() string {
@@ -277,29 +248,8 @@ func (e Nor) Ok(v *fastjson.Value) bool {
 	return true
 }
 
-func (e Nor) OkBytes(b []byte) bool {
-	for _, f := range e {
-		if f.OkBytes(b) {
-			return false
-		}
-	}
-	return true
-}
-
-func (e Nor) IndexFilter(fieldName string, bs Bounds) (filter Filter, bounds Bounds) {
-	var nf Nor
-	var ff Filter
-	for _, f := range e {
-		if ff, _ = f.IndexFilter(fieldName, bs); ff != nil {
-			nf = append(nf, ff)
-		} else {
-			return nil, bs
-		}
-	}
-	if len(nf) == 0 {
-		return nil, bs
-	}
-	return nf, bs
+func (e Nor) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
+	return bs
 }
 
 func (e Nor) String() string {
@@ -318,15 +268,8 @@ func (e Not) Ok(v *fastjson.Value) bool {
 	return !e.Filter.Ok(v)
 }
 
-func (e Not) OkBytes(b []byte) bool {
-	return !e.Filter.OkBytes(b)
-}
-
-func (e Not) IndexFilter(fieldName string, bs Bounds) (filter Filter, bounds Bounds) {
-	if ff, _ := e.Filter.IndexFilter(fieldName, nil); ff != nil {
-		return e, bs
-	}
-	return nil, bs
+func (e Not) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
+	return bs
 }
 
 func (e Not) String() string {
@@ -339,12 +282,8 @@ func (a All) Ok(_ *fastjson.Value) bool {
 	return true
 }
 
-func (a All) OkBytes(_ []byte) bool {
-	return true
-}
-
-func (a All) IndexFilter(fieldName string, bs Bounds) (filter Filter, bounds Bounds) {
-	return nil, bs
+func (a All) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
+	return bs
 }
 
 func (a All) String() string {
@@ -357,12 +296,8 @@ func (e Exists) Ok(v *fastjson.Value) bool {
 	return v != nil
 }
 
-func (e Exists) OkBytes(b []byte) bool {
-	return len(b) != 0
-}
-
-func (a Exists) IndexFilter(fieldName string, bs Bounds) (filter Filter, bounds Bounds) {
-	return
+func (e Exists) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
+	return bs
 }
 
 func (e Exists) String() string {
@@ -380,16 +315,9 @@ func (e TypeFilter) Ok(v *fastjson.Value) bool {
 	return encoding.FastJSONTypeToType(v.Type()) == e.Type
 }
 
-func (e TypeFilter) OkBytes(b []byte) bool {
-	if len(b) == 0 {
-		return false
-	}
-	return b[0] == uint8(e.Type)
-}
-
-func (e TypeFilter) IndexFilter(fieldName string, bs Bounds) (filter Filter, bounds Bounds) {
+func (e TypeFilter) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	k := []byte{byte(e.Type), 255}
-	return e, bs.Append(Bound{
+	return bs.Append(Bound{
 		Start:        k[:1],
 		End:          k,
 		StartInclude: true,
@@ -432,14 +360,7 @@ func (r Regexp) Ok(v *fastjson.Value) bool {
 	return r.Regexp.Match(exp)
 }
 
-func (r Regexp) OkBytes(b []byte) bool {
-	if len(b) == 0 {
-		return false
-	}
-	return r.Regexp.Match(b)
-}
-
-func (r Regexp) IndexFilter(_ string, bs Bounds) (filter Filter, bounds Bounds) {
+func (r Regexp) IndexBounds(_ string, bs Bounds) (bounds Bounds) {
 	prefix := extractPrefix(r.Regexp.String())
 	if prefix == "" {
 		return
@@ -456,7 +377,7 @@ func (r Regexp) IndexFilter(_ string, bs Bounds) (filter Filter, bounds Bounds) 
 		StartInclude: true,
 		EndInclude:   true,
 	}
-	return r, bs.Append(bound)
+	return bs.Append(bound)
 }
 
 func findPrefix(pattern string) string {

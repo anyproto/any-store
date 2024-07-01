@@ -1,6 +1,8 @@
 package query
 
-import "github.com/anyproto/any-store/internal/encoding"
+import (
+	"github.com/anyproto/any-store/encoding"
+)
 
 type Type encoding.Type
 

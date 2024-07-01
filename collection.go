@@ -10,13 +10,13 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/anyproto/any-store/encoding"
 	"github.com/anyproto/any-store/internal/key"
 	"github.com/anyproto/any-store/query"
 
 	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-store/internal/conn"
-	"github.com/anyproto/any-store/internal/encoding"
 	"github.com/anyproto/any-store/internal/sql"
 	"github.com/anyproto/any-store/internal/syncpool"
 )

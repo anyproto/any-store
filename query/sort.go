@@ -1,4 +1,4 @@
-package sort
+package query
 
 import (
 	"fmt"
@@ -6,7 +6,7 @@ import (
 
 	"github.com/valyala/fastjson"
 
-	"github.com/anyproto/any-store/internal/encoding"
+	"github.com/anyproto/any-store/encoding"
 	"github.com/anyproto/any-store/internal/key"
 )
 
@@ -29,6 +29,9 @@ func ParseSort(sorts ...any) (Sort, error) {
 			}
 			result = append(result, sf)
 		case Sort:
+			if len(v.Fields()) == 0 {
+				return nil, fmt.Errorf("sort interface must provide some fields")
+			}
 			result = append(result, v)
 		default:
 			return nil, fmt.Errorf("unexpected sort argument type: %T", s)

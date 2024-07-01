@@ -5,14 +5,13 @@ import (
 	"database/sql/driver"
 	"errors"
 	"slices"
-	stdSort "sort"
+	"sort"
 
 	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-store/internal/bitmap"
 	"github.com/anyproto/any-store/internal/conn"
 
-	"github.com/anyproto/any-store/internal/sort"
 	"github.com/anyproto/any-store/query"
 )
 
@@ -69,12 +68,12 @@ type collQuery struct {
 	c *collection
 
 	cond query.Filter
-	sort sort.Sort
+	sort query.Sort
 
 	limit, offset uint
 
 	indexesWithWeight weightedIndexes
-	sortFields        []sort.SortField
+	sortFields        []query.SortField
 	queryFields       []queryField
 
 	err error
@@ -105,7 +104,7 @@ func (q *collQuery) Offset(offset uint) Query {
 
 func (q *collQuery) Sort(sorts ...any) Query {
 	var err error
-	if q.sort, err = sort.ParseSort(sorts...); err != nil {
+	if q.sort, err = query.ParseSort(sorts...); err != nil {
 		q.err = errors.Join(err)
 	}
 	return q
@@ -358,7 +357,7 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 	var addedSorts bitmap.Bitmap256
 
 	// handle "id" field
-	if _, idBounds := q.cond.IndexFilter("id", nil); len(idBounds) != 0 {
+	if idBounds := q.cond.IndexBounds("id", nil); len(idBounds) != 0 {
 		qb.idBounds = idBounds
 	}
 
@@ -387,7 +386,7 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 			q.indexesWithWeight[i].exactSort = sf.CountLeadingOnes() == len(q.sortFields)
 		}
 	}
-	stdSort.Sort(q.indexesWithWeight)
+	sort.Sort(q.indexesWithWeight)
 
 	// filter useless indexes
 	var (
@@ -475,7 +474,7 @@ func (q *collQuery) queryField(field string) (queryField, int) {
 			return f, i
 		}
 	}
-	_, bounds := q.cond.IndexFilter(field, nil)
+	bounds := q.cond.IndexBounds(field, nil)
 	f := queryField{
 		field:  field,
 		bounds: bounds,

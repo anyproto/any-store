@@ -3,7 +3,6 @@ package registry
 import (
 	"sync"
 
-	"github.com/anyproto/any-store/internal/sort"
 	"github.com/anyproto/any-store/internal/syncpool"
 	"github.com/anyproto/any-store/query"
 )
@@ -58,7 +57,7 @@ func NewSortRegistry(sp *syncpool.SyncPool) *SortRegistry {
 }
 
 type sortEntry struct {
-	sort sort.Sort
+	sort query.Sort
 	buf  *syncpool.DocBuffer
 }
 
@@ -68,7 +67,7 @@ type SortRegistry struct {
 	mu        sync.Mutex
 }
 
-func (r *SortRegistry) Register(s sort.Sort) int {
+func (r *SortRegistry) Register(s query.Sort) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 

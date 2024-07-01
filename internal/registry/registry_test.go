@@ -5,8 +5,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/anyproto/any-store/internal/encoding"
-	"github.com/anyproto/any-store/internal/sort"
+	"github.com/anyproto/any-store/encoding"
 	"github.com/anyproto/any-store/internal/syncpool"
 	"github.com/anyproto/any-store/query"
 )
@@ -30,14 +29,14 @@ func TestSortRegistry_Sort(t *testing.T) {
 
 	const testJson = `{"n0":0, "n1":1, "n2":2}`
 
-	assert.Equal(t, 1, sr.Register(sort.MustParseSort("n0")))
-	assert.Equal(t, 2, sr.Register(sort.MustParseSort("n1")))
-	assert.Equal(t, 3, sr.Register(sort.MustParseSort("n2")))
+	assert.Equal(t, 1, sr.Register(query.MustParseSort("n0")))
+	assert.Equal(t, 2, sr.Register(query.MustParseSort("n1")))
+	assert.Equal(t, 3, sr.Register(query.MustParseSort("n2")))
 
 	assert.Equal(t, encoding.AppendAnyValue(nil, 1), sr.Sort(2, testJson))
 
 	sr.Release(2)
-	assert.Equal(t, 2, sr.Register(sort.MustParseSort("n2")))
+	assert.Equal(t, 2, sr.Register(query.MustParseSort("n2")))
 	assert.Equal(t, encoding.AppendAnyValue(nil, 2), sr.Sort(2, testJson))
 }
 
@@ -53,7 +52,7 @@ func BenchmarkFilterRegistry_Filter(b *testing.B) {
 
 func BenchmarkSortRegistry_Sort(b *testing.B) {
 	sr := NewSortRegistry(syncpool.NewSyncPool())
-	id := sr.Register(sort.MustParseSort("f"))
+	id := sr.Register(query.MustParseSort("f"))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

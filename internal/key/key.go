@@ -6,7 +6,7 @@ import (
 
 	"github.com/valyala/fastjson"
 
-	"github.com/anyproto/any-store/internal/encoding"
+	"github.com/anyproto/any-store/encoding"
 )
 
 func New() Key {
