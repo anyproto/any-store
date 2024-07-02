@@ -20,9 +20,9 @@ func (m ModifyFunc) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjs
 	return m(a, v)
 }
 
-type modifierRoot []Modifier
+type ModifierChain []Modifier
 
-func (mRoot modifierRoot) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
+func (mRoot ModifierChain) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
 	result = v
 	var ok bool
 	for _, m := range mRoot {
