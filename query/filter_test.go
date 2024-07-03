@@ -46,6 +46,11 @@ func TestComp(t *testing.T) {
 			assert.False(t, cmp.Ok(a.NewNumberInt(-1)))
 			assert.False(t, cmp.Ok(fastjson.MustParse(`["1",2]`)))
 		})
+		t.Run("array-array", func(t *testing.T) {
+			aCmp := Comp{CompOp: CompOpEq, EqValue: encoding.AppendJSONValue(nil, fastjson.MustParse(`[1,2,3]`))}
+			assert.True(t, aCmp.Ok(fastjson.MustParse(`[1,2,3]`)))
+			assert.True(t, aCmp.Ok(fastjson.MustParse(`[[1,2,3], 1]`)))
+		})
 	})
 	t.Run("ne", func(t *testing.T) {
 		cmp := Comp{CompOp: CompOpNe, EqValue: encoding.AppendAnyValue(nil, 1)}
@@ -58,6 +63,12 @@ func TestComp(t *testing.T) {
 		t.Run("false", func(t *testing.T) {
 			assert.False(t, cmp.Ok(a.NewNumberInt(1)))
 			assert.False(t, cmp.Ok(fastjson.MustParse(`[0,1,3]`)))
+		})
+		t.Run("array-array", func(t *testing.T) {
+			aCmp := Comp{CompOp: CompOpNe, EqValue: encoding.AppendJSONValue(nil, fastjson.MustParse(`[1,2,3]`))}
+			assert.False(t, aCmp.Ok(fastjson.MustParse(`[1,2,3]`)))
+			assert.False(t, aCmp.Ok(fastjson.MustParse(`[[1,2,3], 1]`)))
+			assert.True(t, aCmp.Ok(fastjson.MustParse(`[1,2]`)))
 		})
 		t.Run("bounds", func(t *testing.T) {
 			bs := cmp.IndexBounds("", nil)
