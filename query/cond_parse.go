@@ -233,6 +233,7 @@ func parseComp(key string, v *fastjson.Value) (f Filter, err error) {
 	} else {
 		eq := &Comp{}
 		eq.EqValue = encoding.AppendJSONValue(eq.EqValue, v)
+		eq.notArray = v.Type() != fastjson.TypeArray
 		fk.Filter = eq
 	}
 	return fk, nil
@@ -249,6 +250,7 @@ func parseCompObj(v *fastjson.Value) (Filter, error) {
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpEq
+		cmp.notArray = v.Type() != fastjson.TypeArray
 		return cmp, nil
 	}
 }
@@ -319,31 +321,37 @@ func makeCompFilter(op Operator, v *fastjson.Value) (f Filter, err error) {
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpEq
+		cmp.notArray = v.Type() != fastjson.TypeArray
 		return cmp, nil
 	case opNe:
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpNe
+		cmp.notArray = v.Type() != fastjson.TypeArray
 		return cmp, nil
 	case opGt:
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpGt
+		cmp.notArray = v.Type() != fastjson.TypeArray
 		return cmp, nil
 	case opGte:
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpGte
+		cmp.notArray = v.Type() != fastjson.TypeArray
 		return cmp, nil
 	case opLt:
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpLt
+		cmp.notArray = v.Type() != fastjson.TypeArray
 		return cmp, nil
 	case opLte:
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpLte
+		cmp.notArray = v.Type() != fastjson.TypeArray
 		return cmp, nil
 	case opNot:
 		var isOp bool
@@ -405,6 +413,7 @@ func makeEqArray(v *fastjson.Value) []Filter {
 	for i, jv := range vals {
 		eq := &Comp{CompOp: CompOpEq}
 		eq.EqValue = encoding.AppendJSONValue(eq.EqValue, jv)
+		eq.notArray = jv.Type() != fastjson.TypeArray
 		res[i] = eq
 	}
 	return res

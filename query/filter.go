@@ -31,9 +31,10 @@ const (
 )
 
 type Comp struct {
-	EqValue []byte
-	buf     []byte
-	CompOp  CompOp
+	EqValue  []byte
+	buf      []byte
+	CompOp   CompOp
+	notArray bool
 }
 
 func (e *Comp) Ok(v *fastjson.Value) bool {
@@ -43,6 +44,12 @@ func (e *Comp) Ok(v *fastjson.Value) bool {
 	if v.Type() == fastjson.TypeArray {
 		vals, _ := v.Array()
 		if e.CompOp == CompOpNe {
+			if !e.notArray {
+				e.buf = encoding.AppendJSONValue(e.buf[:0], v)
+				if !e.comp(e.buf) {
+					return false
+				}
+			}
 			for _, val := range vals {
 				e.buf = encoding.AppendJSONValue(e.buf[:0], val)
 				if !e.comp(e.buf) {
@@ -51,6 +58,12 @@ func (e *Comp) Ok(v *fastjson.Value) bool {
 			}
 			return true
 		} else {
+			if !e.notArray {
+				e.buf = encoding.AppendJSONValue(e.buf[:0], v)
+				if e.comp(e.buf) {
+					return true
+				}
+			}
 			for _, val := range vals {
 				e.buf = encoding.AppendJSONValue(e.buf[:0], val)
 				if e.comp(e.buf) {
