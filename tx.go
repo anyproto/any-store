@@ -39,6 +39,7 @@ type ReadTx interface {
 
 type commonTx struct {
 	db         *db
+	ctx        context.Context
 	initialCtx context.Context
 	con        conn.Conn
 	tx         driver.Tx
@@ -58,7 +59,11 @@ type readTx struct {
 }
 
 func (r *readTx) Context() context.Context {
-	return context.WithValue(r.commonTx.initialCtx, ctxKeyTx, r)
+	if r.ctx != nil {
+		return r.ctx
+	}
+	r.ctx = context.WithValue(r.commonTx.initialCtx, ctxKeyTx, r)
+	return r.ctx
 }
 
 func (r *readTx) Commit() error {
