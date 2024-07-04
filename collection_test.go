@@ -331,3 +331,16 @@ func TestCollection_DropIndex(t *testing.T) {
 	assert.Len(t, coll.GetIndexes(), 0)
 	assert.ErrorIs(t, coll.DropIndex(ctx, "a"), ErrIndexNotFound)
 }
+
+func BenchmarkCollection_Insert(b *testing.B) {
+	fx := newFixture(b)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(b, err)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		coll.Insert(ctx, `{"some":"document"}`)
+	}
+
+}
