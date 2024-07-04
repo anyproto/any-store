@@ -7,7 +7,7 @@ import (
 	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-store/encoding"
-	"github.com/anyproto/any-store/internal/key"
+	"github.com/anyproto/any-store/key"
 )
 
 func MustParseSort(sorts ...any) Sort {

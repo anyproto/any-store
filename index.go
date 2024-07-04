@@ -12,8 +12,8 @@ import (
 	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-store/internal/conn"
-	"github.com/anyproto/any-store/internal/key"
 	"github.com/anyproto/any-store/internal/sql"
+	"github.com/anyproto/any-store/key"
 )
 
 // IndexInfo provides information about an index.

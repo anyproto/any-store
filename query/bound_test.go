@@ -5,7 +5,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/anyproto/any-store/internal/key"
+	"github.com/anyproto/any-store/key"
 )
 
 func newBoundKey(v any) (k key.Key) {
