@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -15,9 +16,13 @@ func mustParseItem(t testing.TB, s any) item {
 }
 
 func assertIdxKeyBuf(t *testing.T, idx *index, keyCase fillKeysCase) {
-	require.Equal(t, len(keyCase.expected), len(idx.keysBuf), keyCase.doc)
+	var keysStrings = make([]string, len(idx.keysBuf))
 	for i, k := range idx.keysBuf {
-		assert.Equal(t, keyCase.expected[i], k.String(), keyCase.doc)
+		keysStrings[i] = k.String()
+	}
+	require.Equal(t, len(keyCase.expected), len(idx.keysBuf), keyCase.doc, strings.Join(keysStrings, ","))
+	for i, k := range keysStrings {
+		assert.Equal(t, keyCase.expected[i], k, keyCase.doc)
 	}
 }
 
@@ -44,8 +49,8 @@ var fillKeysCases = []fillKeysCaseIndex{
 		info: IndexInfo{Fields: []string{"a"}},
 		cases: []fillKeysCase{
 			{`{"a":"b"}`, []string{"b"}},
-			{`{"a":["b","c"]}`, []string{"b", "c"}},
-			{`{"a":["a", "a", "b", "c", "b"]}`, []string{"a", "b", "c"}},
+			{`{"a":["b","c"]}`, []string{"b", "c", `["b","c"]`}},
+			{`{"a":["a", "a", "b", "c", "b"]}`, []string{"a", "b", "c", `["a","a","b","c","b"]`}},
 			{`{}`, []string{"<nil>"}},
 			{`{"a":null}`, []string{"<nil>"}},
 		},
@@ -55,8 +60,8 @@ var fillKeysCases = []fillKeysCaseIndex{
 		info: IndexInfo{Fields: []string{"a"}, Sparse: true},
 		cases: []fillKeysCase{
 			{`{"a":"b"}`, []string{"b"}},
-			{`{"a":["b","c"]}`, []string{"b", "c"}},
-			{`{"a":["a", "a", "b", "c", "b"]}`, []string{"a", "b", "c"}},
+			{`{"a":["b","c"]}`, []string{"b", "c", `["b","c"]`}},
+			{`{"a":["a", "a", "b", "c", "b"]}`, []string{"a", "b", "c", `["a","a","b","c","b"]`}},
 			{`{}`, []string{}},
 			{`{"a":null}`, []string{}},
 		},
@@ -66,8 +71,8 @@ var fillKeysCases = []fillKeysCaseIndex{
 		info: IndexInfo{Fields: []string{"-a"}},
 		cases: []fillKeysCase{
 			{`{"a":"b"}`, []string{"b"}},
-			{`{"a":["b","c"]}`, []string{"b", "c"}},
-			{`{"a":["a", "a", "b", "c", "b"]}`, []string{"a", "b", "c"}},
+			{`{"a":["b","c"]}`, []string{"b", "c", `["b","c"]`}},
+			{`{"a":["a", "a", "b", "c", "b"]}`, []string{"a", "b", "c", `["a","a","b","c","b"]`}},
 		},
 	},
 	{
@@ -76,8 +81,11 @@ var fillKeysCases = []fillKeysCaseIndex{
 		cases: []fillKeysCase{
 			{`{"a":"1"}`, []string{"1/<nil>"}},
 			{`{"a":"1","b":"2"}`, []string{"1/2"}},
-			{`{"a":[1,2],"b":"2"}`, []string{"1/2", "2/2"}},
-			{`{"a":[1,2,1],"b":[2,1,2]}`, []string{"1/2", "1/1", "2/2", "2/1"}},
+			{`{"a":[1,2],"b":"2"}`, []string{"1/2", "2/2", "[1,2]/2"}},
+			{`{"a":[1,2,1],"b":[2,1,2]}`, []string{
+				"1/2", "1/1", "1/[2,1,2]",
+				"2/2", "2/1", "2/[2,1,2]",
+				"[1,2,1]/2", "[1,2,1]/1", "[1,2,1]/[2,1,2]"}},
 		},
 	},
 	{

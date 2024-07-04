@@ -248,7 +248,6 @@ func (idx *index) writeValues(d *fastjson.Value, i int) bool {
 					}
 				}
 			}
-			return true
 		}
 	}
 

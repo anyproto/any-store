@@ -32,6 +32,10 @@
       "cond" : {"c": "2"},
       "sort": ["c"],
       "expectedIds": [2,3]
+    },
+    {
+      "cond": {"b": [4,8]},
+      "expectedIds": [4]
     }
   ],
   "data": [

@@ -116,6 +116,10 @@
       "cond": {"b": 6},
       "sort" : ["-a"],
       "expectedIds": [8,6,3,2,1]
+    },
+    {
+      "cond": {"b": [4,8]},
+      "expectedIds": [4]
     }
   ],
   "data": [
