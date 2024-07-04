@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/mattn/go-sqlite3"
+	"zombiezen.com/go/sqlite"
 
 	"github.com/anyproto/any-store/internal/registry"
 )
@@ -14,21 +14,7 @@ var (
 	ErrDBIsNotOpened = errors.New("db is not opened")
 )
 
-func NewDriver(fr *registry.FilterRegistry, sr *registry.SortRegistry) *sqlite3.SQLiteDriver {
-	return &sqlite3.SQLiteDriver{
-		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
-			if err := conn.RegisterFunc("any_filter", fr.Filter, true); err != nil {
-				return err
-			}
-			if err := conn.RegisterFunc("any_sort", sr.Sort, true); err != nil {
-				return err
-			}
-			return nil
-		},
-	}
-}
-
-func NewConnManager(driver *sqlite3.SQLiteDriver, dsn string, writeCount, readCount int) (*ConnManager, error) {
+func NewConnManager(sr *registry.SortRegistry, fr *registry.FilterRegistry, path string, writeCount, readCount int) (*ConnManager, error) {
 	var (
 		writeConn = make([]Conn, 0, writeCount)
 		readConn  = make([]Conn, 0, readCount)
@@ -43,22 +29,30 @@ func NewConnManager(driver *sqlite3.SQLiteDriver, dsn string, writeCount, readCo
 	}
 
 	for i := 0; i < writeCount; i++ {
-		conn, err := driver.Open(dsn)
+		conn, err := sqlite.OpenConn(path)
+
 		if err != nil {
+			closeAll()
+			return nil, err
+		}
+		if err = setupConn(conn, sr, fr); err != nil {
 			closeAll()
 			return nil, err
 		}
 		writeConn = append(writeConn, conn.(Conn))
 	}
 
-	readOnlyDsn := dsn + "&mode=ro"
 	for i := 0; i < readCount; i++ {
-		conn, err := driver.Open(readOnlyDsn)
+		conn, err := sqlite.OpenConn(path, sqlite.OpenWAL, sqlite.OpenURI)
 		if err != nil {
 			closeAll()
 			return nil, err
 		}
-		readConn = append(readConn, conn.(*sqlite3.SQLiteConn))
+		if err = setupConn(conn, sr, fr); err != nil {
+			closeAll()
+			return nil, err
+		}
+		readConn = append(readConn, conn.(Conn))
 	}
 
 	cm := &ConnManager{
@@ -66,7 +60,6 @@ func NewConnManager(driver *sqlite3.SQLiteDriver, dsn string, writeCount, readCo
 		writeCh:   make(chan Conn, len(writeConn)),
 		readConn:  readConn,
 		writeConn: writeConn,
-		driver:    driver,
 	}
 	for _, conn := range writeConn {
 		cm.writeCh <- conn
@@ -82,8 +75,8 @@ type ConnManager struct {
 	writeCh   chan Conn
 	readConn  []Conn
 	writeConn []Conn
-	driver    *sqlite3.SQLiteDriver
-	closed    chan struct{}
+
+	closed chan struct{}
 }
 
 func (c *ConnManager) GetWrite(ctx context.Context) (conn Conn, err error) {
@@ -136,4 +129,26 @@ func (c *ConnManager) Close() (err error) {
 		}
 	}
 	return err
+}
+
+func setupConn(conn *sqlite.Conn, sr *registry.SortRegistry, fr *registry.FilterRegistry) (err error) {
+	if err = conn.CreateFunction("any_filter", &sqlite.FunctionImpl{
+		NArgs:         2,
+		Deterministic: true,
+		Scalar: func(ctx sqlite.Context, args []sqlite.Value) (sqlite.Value, error) {
+			return sqlite.IntegerValue(fr.Filter(args[0].Int(), args[2].Blob())), nil
+		},
+	}); err != nil {
+		return
+	}
+	if err = conn.CreateFunction("any_sort", &sqlite.FunctionImpl{
+		NArgs:         2,
+		Deterministic: true,
+		Scalar: func(ctx sqlite.Context, args []sqlite.Value) (sqlite.Value, error) {
+			return sqlite.BlobValue(sr.Sort(args[0].Int(), args[2].Blob())), nil
+		},
+	}); err != nil {
+		return
+	}
+	return
 }

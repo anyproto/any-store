@@ -2,7 +2,6 @@ package anystore
 
 import (
 	"context"
-	"database/sql/driver"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -42,7 +41,7 @@ type commonTx struct {
 	ctx        context.Context
 	initialCtx context.Context
 	con        conn.Conn
-	tx         driver.Tx
+	tx         conn.Tx
 	done       atomic.Bool
 }
 

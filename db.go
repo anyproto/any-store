@@ -2,11 +2,11 @@ package anystore
 
 import (
 	"context"
-	"database/sql/driver"
 	"errors"
-	"io"
 	"sync"
 	"sync/atomic"
+
+	"zombiezen.com/go/sqlite"
 
 	"github.com/anyproto/any-store/internal/conn"
 	"github.com/anyproto/any-store/internal/objectid"
@@ -92,7 +92,8 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 
 	var err error
 	if ds.cm, err = conn.NewConnManager(
-		conn.NewDriver(ds.filterReg, ds.sortReg),
+		ds.sortReg,
+		ds.filterReg,
 		config.dsn(path),
 		1,
 		config.ReadConnections,
@@ -134,7 +135,7 @@ type db struct {
 
 func (db *db) init(ctx context.Context) error {
 	return db.doWriteTx(ctx, func(c conn.Conn) (err error) {
-		if _, err = c.ExecContext(ctx, db.sql.InitDB(), nil); err != nil {
+		if err = c.Exec(ctx, db.sql.InitDB()); err != nil {
 			return
 		}
 		if db.stmt.registerCollection, err = db.sql.RegisterCollectionStmt(ctx, c); err != nil {
@@ -165,7 +166,7 @@ func (db *db) WriteTx(ctx context.Context) (WriteTx, error) {
 		return nil, err
 	}
 
-	dTx, err := connWrite.BeginTx(ctx, driver.TxOptions{})
+	dTx, err := connWrite.BeginTx()
 	if err != nil {
 		db.cm.ReleaseWrite(connWrite)
 		return nil, err
@@ -186,7 +187,7 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 		return nil, err
 	}
 
-	dTx, err := connRead.BeginTx(ctx, driver.TxOptions{})
+	dTx, err := connRead.BeginTx()
 	if err != nil {
 		db.cm.ReleaseRead(connRead)
 		return nil, err
@@ -212,18 +213,14 @@ func (db *db) createCollection(ctx context.Context, collectionName string) (Coll
 		return nil, ErrCollectionExists
 	}
 	err := db.doWriteTx(ctx, func(c conn.Conn) error {
-		_, err := db.stmt.registerCollection.ExecContext(ctx, []driver.NamedValue{
-			{
-				Name:    "collName",
-				Ordinal: 1,
-				Value:   collectionName,
-			},
+		err := db.stmt.registerCollection.Exec(ctx, func(stmt *sqlite.Stmt) {
+			stmt.BindText(1, collectionName)
 		})
 		if err != nil {
 			return replaceUniqErr(err, ErrCollectionExists)
 		}
 
-		if _, err = c.ExecContext(ctx, db.sql.Collection(collectionName).Create(), nil); err != nil {
+		if err = c.Exec(ctx, db.sql.Collection(collectionName).Create()); err != nil {
 			return err
 		}
 		return nil
@@ -252,22 +249,20 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 	}
 
 	err := db.doReadTx(ctx, func(c conn.Conn) error {
-		rows, err := c.QueryContext(ctx, db.sql.FindCollection(), []driver.NamedValue{{
-			Name:  "collName",
-			Value: collectionName,
-		}})
+		var hasRow bool
+		err := c.Query(ctx, db.sql.FindCollection(), func(stmt *sqlite.Stmt) error {
+			stmt.BindText(1, collectionName)
+			var stepErr error
+			if hasRow, stepErr = stmt.Step(); stepErr != nil {
+				return stepErr
+			}
+			return nil
+		})
 		if err != nil {
 			return err
 		}
-		defer func() {
-			_ = rows.Close()
-		}()
-		rErr := rows.Next([]driver.Value{})
-		if rErr != nil {
-			if rErr == io.EOF {
-				return ErrCollectionNotFound
-			}
-			return rErr
+		if !hasRow {
+			return ErrCollectionNotFound
 		}
 		return nil
 	})
@@ -298,14 +293,13 @@ func (db *db) Collection(ctx context.Context, collectionName string) (Collection
 
 func (db *db) GetCollectionNames(ctx context.Context) (collectionNames []string, err error) {
 	err = db.doReadTx(ctx, func(c conn.Conn) error {
-		rows, err := c.QueryContext(ctx, db.sql.FindCollections(), nil)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			_ = rows.Close()
-		}()
-		collectionNames, err = readRowsString(rows)
+		err := c.Query(ctx, db.sql.FindCollections(), func(stmt *sqlite.Stmt) error {
+			collectionNames, err = readRowsString(stmt)
+			if err != nil {
+				return err
+			}
+			return nil
+		})
 		if err != nil {
 			return err
 		}

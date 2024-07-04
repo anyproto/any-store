@@ -43,13 +43,16 @@ func (r *FilterRegistry) Release(id int) {
 	r.filters[id].filter = nil
 }
 
-func (r *FilterRegistry) Filter(id int, data string) bool {
+func (r *FilterRegistry) Filter(id int, data []byte) int64 {
 	id -= 1
-	v, err := r.filters[id].buf.Parser.Parse(data)
+	v, err := r.filters[id].buf.Parser.ParseBytes(data)
 	if err != nil {
-		return false
+		return 0
 	}
-	return r.filters[id].filter.Ok(v)
+	if r.filters[id].filter.Ok(v) {
+		return 1
+	}
+	return 0
 }
 
 func NewSortRegistry(sp *syncpool.SyncPool) *SortRegistry {
@@ -88,9 +91,9 @@ func (r *SortRegistry) Release(id int) {
 	r.sorts[id].sort = nil
 }
 
-func (r *SortRegistry) Sort(id int, data string) []byte {
+func (r *SortRegistry) Sort(id int, data []byte) []byte {
 	id -= 1
-	v, err := r.sorts[id].buf.Parser.Parse(data)
+	v, err := r.sorts[id].buf.Parser.ParseBytes(data)
 	if err != nil {
 		return nil
 	}
