@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/anyproto/any-store/key"
+	"github.com/anyproto/any-store/internal/key"
 )
 
 type Bound struct {

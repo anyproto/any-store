@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/anyproto/any-store/encoding"
-	"github.com/anyproto/any-store/key"
+	"github.com/anyproto/any-store/internal/key"
 	"github.com/anyproto/any-store/query"
 
 	"github.com/valyala/fastjson"
