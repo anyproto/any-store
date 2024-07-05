@@ -445,3 +445,27 @@ func extractPrefix(pattern string) string {
 func (r Regexp) String() string {
 	return fmt.Sprintf(`{"$regex": "%s"}`, r.Regexp.String())
 }
+
+type Size struct {
+	Size int64
+}
+
+func (s Size) Ok(v *fastjson.Value) bool {
+	if v == nil {
+		return false
+	}
+	array, err := v.Array()
+	if err != nil {
+		return false
+	}
+	return int64(len(array)) == s.Size
+}
+
+func (s Size) IndexBounds(_ string, bs Bounds) (bounds Bounds) {
+	return bs
+}
+
+func (s Size) String() string {
+	return fmt.Sprintf(`{"$size": "%d"}`, s.Size)
+
+}

@@ -376,6 +376,31 @@ func TestRegexp(t *testing.T) {
 	})
 }
 
+func TestSize(t *testing.T) {
+	t.Run("ok", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$size": 2}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(fastjson.MustParse(`{"name": [1,2]}`)))
+	})
+	t.Run("value nil", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$size": 2}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(fastjson.MustParse(`{"arr": [1,2]}`)))
+	})
+	t.Run("not ok", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$size": 2}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(fastjson.MustParse(`{"name": "a"}`)))
+		assert.False(t, f.Ok(fastjson.MustParse(`{"name": []}`)))
+		assert.False(t, f.Ok(fastjson.MustParse(`{"name": [1]}`)))
+		assert.False(t, f.Ok(fastjson.MustParse(`{"name": [1,2,3]}`)))
+	})
+	t.Run("error parsing expression - expected number", func(t *testing.T) {
+		_, err := ParseCondition(`{"name":{"$size": "2"}}`)
+		require.Error(t, err)
+	})
+}
+
 func BenchmarkFilter_Ok(b *testing.B) {
 	doc := fastjson.MustParse(`{"a":2,"b":[3,2,1],"c":"test"}`)
 	bench := func(b *testing.B, query string) {

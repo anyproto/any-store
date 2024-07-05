@@ -34,6 +34,7 @@ const (
 	opExists
 	opType
 	opRegexp
+	opSize
 )
 
 var (
@@ -57,6 +58,7 @@ var (
 	opBytesExists = []byte("$exists")
 	opBytesType   = []byte("$type")
 	opBytesRegexp = []byte("$regex")
+	opBytesSize   = []byte("$size")
 )
 
 func MustParseCondition(cond any) Filter {
@@ -369,9 +371,19 @@ func makeCompFilter(op Operator, v *fastjson.Value) (f Filter, err error) {
 		return parseType(v)
 	case opRegexp:
 		return parseRegexp(v)
+	case opSize:
+		return parseSize(v)
 	default:
 		return makeArrComp(op, v)
 	}
+}
+
+func parseSize(v *fastjson.Value) (Filter, error) {
+	size, err := v.Int64()
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract size %w", err)
+	}
+	return Size{Size: size}, nil
 }
 
 func parseRegexp(v *fastjson.Value) (Filter, error) {
@@ -487,6 +499,8 @@ func isOperator(key []byte) (ok bool, op Operator, err error) {
 			return true, opType, nil
 		case bytes.Equal(key, opBytesRegexp):
 			return true, opRegexp, nil
+		case bytes.Equal(key, opBytesSize):
+			return true, opSize, nil
 		default:
 			return true, 0, fmt.Errorf("unknow operator: %s", string(key))
 		}
