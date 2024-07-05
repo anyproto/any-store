@@ -30,6 +30,13 @@ const (
 	CompOpNe
 )
 
+func NewComp(op CompOp, value any) *Comp {
+	return &Comp{
+		EqValue: encoding.AppendAnyValue(nil, value),
+		CompOp:  op,
+	}
+}
+
 type Comp struct {
 	EqValue  []byte
 	buf      []byte

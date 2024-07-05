@@ -230,6 +230,9 @@ func (qb *queryBuilder) build(count bool) string {
 		qb.buf.WriteString(strconv.Itoa(qb.limit))
 	}
 	if qb.offset > 0 {
+		if qb.limit == 0 {
+			qb.buf.WriteString(" LIMIT -1")
+		}
 		qb.buf.WriteString(" OFFSET ")
 		qb.buf.WriteString(strconv.Itoa(qb.offset))
 	}
