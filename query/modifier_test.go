@@ -273,6 +273,12 @@ func TestModifierRename_Modify(t *testing.T) {
 				`{"new":"value"}`,
 				true,
 			},
+			{
+				`{"$rename":{"old":"new"}}`,
+				`{"old":"value", "new":"value1"}`,
+				`{"new":"value"}`,
+				true,
+			},
 		}...)
 	})
 }
@@ -471,7 +477,7 @@ func TestModifierPullAll_Modify(t *testing.T) {
 			{
 				`{"$pullAll":{"arr":1}}`,
 				`{"arr":"2"}`,
-				`failed to pop item, value doesn't contain array; it contains string`,
+				`failed to pop item, value doesn't contain array; it contains number`,
 			},
 			{
 				`{"$pullAll":{"arr":1}}`,
@@ -519,5 +525,53 @@ func TestModifierAddToSet_Modify(t *testing.T) {
 				`failed to pop item, value doesn't contain array; it contains string`,
 			},
 		}...)
+	})
+}
+
+func BenchmarkModifier(b *testing.B) {
+	bench := func(b *testing.B, query string) {
+		doc := fastjson.MustParse(`{"a":2,"b":[3,2,1],"c":"test"}`)
+		a := &fastjson.Arena{}
+		p := &fastjson.Parser{}
+		d, err := parser.AnyToJSON(p, doc)
+		modifier, err := ParseModifier(query)
+		require.NoError(b, err)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_, _, err := modifier.Modify(a, d)
+			require.NoError(b, err)
+		}
+	}
+
+	b.Run("set", func(b *testing.B) {
+		bench(b, `{"$set":{"a":3}}`)
+	})
+	b.Run("unset", func(b *testing.B) {
+		bench(b, `{"$unset":{"a":3}}`)
+	})
+	b.Run("inc", func(b *testing.B) {
+		bench(b, `{"$inc":{"a":2}}`)
+	})
+	b.Run("rename", func(b *testing.B) {
+		bench(b, `{"$rename":{"a":"b"}}`)
+	})
+	b.Run("pull", func(b *testing.B) {
+		bench(b, `{"$pull":{"b":3}}`)
+	})
+	b.Run("pull query", func(b *testing.B) {
+		bench(b, `{"$pull":{"b": {"$in":[3,1]}}}`)
+	})
+	b.Run("pop", func(b *testing.B) {
+		bench(b, `{"$pop":{"b":1}}`)
+	})
+	b.Run("push", func(b *testing.B) {
+		bench(b, `{"$push":{"b":6}}`)
+	})
+	b.Run("pull all", func(b *testing.B) {
+		bench(b, `{"$pullAll":{"b":[1,2]}}`)
+	})
+	b.Run("add to set", func(b *testing.B) {
+		bench(b, `{"$addToSet":{"b":[1,2,5]}}`)
 	})
 }

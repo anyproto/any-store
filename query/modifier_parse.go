@@ -167,16 +167,24 @@ func newIncModifier(key []byte, v *fastjson.Value) (Modifier, error) {
 }
 
 func newRenameModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+	stringBytes, err := v.StringBytes()
+	if err != nil {
+		return nil, fmt.Errorf("failed to rename field: %w", err)
+	}
 	return modifierRename{
 		fieldPath: strings.Split(string(key), "."),
-		val:       v,
+		val:       string(stringBytes),
 	}, nil
 }
 
 func newPopModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+	value, err := v.Int()
+	if err != nil {
+		return nil, fmt.Errorf("failed to pop item, %w", err)
+	}
 	return modifierPop{
 		fieldPath: strings.Split(string(key), "."),
-		val:       v,
+		val:       value,
 	}, nil
 }
 
@@ -188,16 +196,28 @@ func newPushModifier(key []byte, v *fastjson.Value) (Modifier, error) {
 }
 
 func newPullModifier(key []byte, v *fastjson.Value) (Modifier, error) {
-	return modifierPull{
+	var err error
+	pull := modifierPull{
 		fieldPath: strings.Split(string(key), "."),
-		val:       v,
-	}, nil
+	}
+	if v.Type() == fastjson.TypeObject {
+		pull.filter, err = ParseCompObj(v)
+		if err == nil {
+			return pull, nil
+		}
+	}
+	pull.val = v
+	return pull, nil
 }
 
 func newPullAllModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+	removedValues, err := v.Array()
+	if err != nil {
+		return nil, fmt.Errorf("failed to pop item, %w", err)
+	}
 	return modifierPullAll{
-		fieldPath: strings.Split(string(key), "."),
-		val:       v,
+		fieldPath:     strings.Split(string(key), "."),
+		removedValues: removedValues,
 	}, nil
 }
 
