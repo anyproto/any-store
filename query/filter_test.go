@@ -51,6 +51,10 @@ func TestComp(t *testing.T) {
 			assert.True(t, aCmp.Ok(fastjson.MustParse(`[1,2,3]`)))
 			assert.True(t, aCmp.Ok(fastjson.MustParse(`[[1,2,3], 1]`)))
 		})
+		t.Run("empty array", func(t *testing.T) {
+			aCmp := Comp{CompOp: CompOpEq, EqValue: encoding.AppendJSONValue(nil, fastjson.MustParse(`[]`))}
+			assert.True(t, aCmp.Ok(fastjson.MustParse(`[]`)))
+		})
 	})
 	t.Run("ne", func(t *testing.T) {
 		cmp := Comp{CompOp: CompOpNe, EqValue: encoding.AppendAnyValue(nil, 1)}
