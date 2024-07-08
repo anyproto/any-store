@@ -212,11 +212,9 @@ func (c *collection) FindId(ctx context.Context, docId any) (doc Doc, err error)
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
-	id := encoding.AppendAnyValue(buf.SmallBuf[:0], docId)
+	buf.SmallBuf = encoding.AppendAnyValue(buf.SmallBuf[:0], docId)
 	err = c.db.doReadTx(ctx, func(cn conn.Conn) (err error) {
-		rows, err := cn.QueryContext(ctx, c.queries.findId, []driver.NamedValue{
-			{Name: "id", Value: id},
-		})
+		rows, err := cn.QueryContext(ctx, c.queries.findId, buf.DriverValuesId(buf.SmallBuf))
 		if err != nil {
 			return err
 		}
@@ -306,8 +304,10 @@ func (c *collection) Insert(ctx context.Context, docs ...any) (err error) {
 }
 
 func (c *collection) insertItem(ctx context.Context, buf *syncpool.DocBuffer, it item) (id []byte, err error) {
-	id = it.appendId(buf.SmallBuf[:0])
-	if _, err = c.stmts.insert.ExecContext(ctx, buf.DriverValues(id, it.Value().MarshalTo(buf.DocBuf[:0]))); err != nil {
+	buf.SmallBuf = it.appendId(buf.SmallBuf[:0])
+	buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
+	id = buf.SmallBuf
+	if _, err = c.stmts.insert.ExecContext(ctx, buf.DriverValues(buf.SmallBuf, buf.DocBuf)); err != nil {
 		return nil, replaceUniqErr(err, ErrDocExists)
 	}
 	if err = c.indexesHandleInsert(ctx, id, it); err != nil {
@@ -344,8 +344,8 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
-		idKey := encoding.AppendAnyValue(buf.SmallBuf[:0], id)
-		it, txErr := c.loadById(ctx, buf, idKey)
+		buf.SmallBuf = encoding.AppendAnyValue(buf.SmallBuf[:0], id)
+		it, txErr := c.loadById(ctx, buf, buf.SmallBuf)
 		if txErr != nil {
 			return
 		}
@@ -378,20 +378,20 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
-		idKey := encoding.AppendAnyValue(buf.SmallBuf[:0], id)
+		buf.SmallBuf = encoding.AppendAnyValue(buf.SmallBuf[:0], id)
 		var (
 			isInsert bool
 			modValue *fastjson.Value
 			prevItem item
 		)
-		it, loadErr := c.loadById(ctx, buf, idKey)
+		it, loadErr := c.loadById(ctx, buf, buf.SmallBuf)
 		if loadErr != nil {
 			if errors.Is(loadErr, ErrDocNotFound) {
 				// create an object with only id field
 				var idVal *fastjson.Value
 				buf.Arena.Reset()
 				modValue = buf.Arena.NewObject()
-				idVal, _, txErr = encoding.DecodeToJSON(buf.Parser, buf.Arena, idKey)
+				idVal, _, txErr = encoding.DecodeToJSON(buf.Parser, buf.Arena, buf.SmallBuf)
 				if txErr != nil {
 					return txErr
 				}
@@ -431,18 +431,19 @@ func (c *collection) update(ctx context.Context, it, prevIt item) (err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
-	idKey := it.appendId(buf.SmallBuf[:0])
+	buf.SmallBuf = it.appendId(buf.SmallBuf[:0])
 	if prevIt.val == nil {
-		prevIt, err = c.loadById(ctx, buf, idKey)
+		prevIt, err = c.loadById(ctx, buf, buf.SmallBuf)
 		if err != nil {
 			return
 		}
 	}
-	if _, err = c.stmts.update.ExecContext(ctx, buf.DriverValues(idKey, it.Value().MarshalTo(buf.DocBuf[:0]))); err != nil {
+	buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
+	if _, err = c.stmts.update.ExecContext(ctx, buf.DriverValues(buf.SmallBuf, buf.DocBuf)); err != nil {
 		return
 	}
 
-	return c.indexesHandleUpdate(ctx, idKey, prevIt, it)
+	return c.indexesHandleUpdate(ctx, buf.SmallBuf, prevIt, it)
 }
 
 func (c *collection) loadById(ctx context.Context, buf *syncpool.DocBuffer, id key.Key) (it item, err error) {
@@ -506,12 +507,12 @@ func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
-		idKey := encoding.AppendAnyValue(buf.SmallBuf[:0], id)
-		it, txErr := c.loadById(ctx, buf, idKey)
+		buf.SmallBuf = encoding.AppendAnyValue(buf.SmallBuf[:0], id)
+		it, txErr := c.loadById(ctx, buf, buf.SmallBuf)
 		if txErr != nil {
 			return
 		}
-		return c.deleteItem(ctx, idKey, it)
+		return c.deleteItem(ctx, buf.SmallBuf, it)
 	})
 }
 
@@ -582,9 +583,9 @@ func (c *collection) EnsureIndex(ctx context.Context, info ...IndexInfo) (err er
 			if it, txErr = parseItem(buf.Parser, nil, dest[0], false); txErr != nil {
 				return
 			}
-			id := it.appendId(buf.SmallBuf[:0])
+			buf.SmallBuf = it.appendId(buf.SmallBuf[:0])
 			for _, idx = range newIndexes {
-				if txErr = idx.Insert(ctx, id, it); txErr != nil {
+				if txErr = idx.Insert(ctx, buf.SmallBuf, it); txErr != nil {
 					return
 				}
 			}

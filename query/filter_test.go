@@ -46,6 +46,15 @@ func TestComp(t *testing.T) {
 			assert.False(t, cmp.Ok(a.NewNumberInt(-1)))
 			assert.False(t, cmp.Ok(fastjson.MustParse(`["1",2]`)))
 		})
+		t.Run("array-array", func(t *testing.T) {
+			aCmp := Comp{CompOp: CompOpEq, EqValue: encoding.AppendJSONValue(nil, fastjson.MustParse(`[1,2,3]`))}
+			assert.True(t, aCmp.Ok(fastjson.MustParse(`[1,2,3]`)))
+			assert.True(t, aCmp.Ok(fastjson.MustParse(`[[1,2,3], 1]`)))
+		})
+		t.Run("empty array", func(t *testing.T) {
+			aCmp := Comp{CompOp: CompOpEq, EqValue: encoding.AppendJSONValue(nil, fastjson.MustParse(`[]`))}
+			assert.True(t, aCmp.Ok(fastjson.MustParse(`[]`)))
+		})
 	})
 	t.Run("ne", func(t *testing.T) {
 		cmp := Comp{CompOp: CompOpNe, EqValue: encoding.AppendAnyValue(nil, 1)}
@@ -58,6 +67,12 @@ func TestComp(t *testing.T) {
 		t.Run("false", func(t *testing.T) {
 			assert.False(t, cmp.Ok(a.NewNumberInt(1)))
 			assert.False(t, cmp.Ok(fastjson.MustParse(`[0,1,3]`)))
+		})
+		t.Run("array-array", func(t *testing.T) {
+			aCmp := Comp{CompOp: CompOpNe, EqValue: encoding.AppendJSONValue(nil, fastjson.MustParse(`[1,2,3]`))}
+			assert.False(t, aCmp.Ok(fastjson.MustParse(`[1,2,3]`)))
+			assert.False(t, aCmp.Ok(fastjson.MustParse(`[[1,2,3], 1]`)))
+			assert.True(t, aCmp.Ok(fastjson.MustParse(`[1,2]`)))
 		})
 		t.Run("bounds", func(t *testing.T) {
 			bs := cmp.IndexBounds("", nil)
@@ -358,6 +373,31 @@ func TestRegexp(t *testing.T) {
 		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 1)
 		assert.Equal(t, ".a", append(bounds[0].Start, 0).String())
+	})
+}
+
+func TestSize(t *testing.T) {
+	t.Run("ok", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$size": 2}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(fastjson.MustParse(`{"name": [1,2]}`)))
+	})
+	t.Run("value nil", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$size": 2}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(fastjson.MustParse(`{"arr": [1,2]}`)))
+	})
+	t.Run("not ok", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$size": 2}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(fastjson.MustParse(`{"name": "a"}`)))
+		assert.False(t, f.Ok(fastjson.MustParse(`{"name": []}`)))
+		assert.False(t, f.Ok(fastjson.MustParse(`{"name": [1]}`)))
+		assert.False(t, f.Ok(fastjson.MustParse(`{"name": [1,2,3]}`)))
+	})
+	t.Run("error parsing expression - expected number", func(t *testing.T) {
+		_, err := ParseCondition(`{"name":{"$size": "2"}}`)
+		require.Error(t, err)
 	})
 }
 

@@ -30,10 +30,18 @@ const (
 	CompOpNe
 )
 
+func NewComp(op CompOp, value any) *Comp {
+	return &Comp{
+		EqValue: encoding.AppendAnyValue(nil, value),
+		CompOp:  op,
+	}
+}
+
 type Comp struct {
-	EqValue []byte
-	buf     []byte
-	CompOp  CompOp
+	EqValue  []byte
+	buf      []byte
+	CompOp   CompOp
+	notArray bool
 }
 
 func (e *Comp) Ok(v *fastjson.Value) bool {
@@ -43,6 +51,12 @@ func (e *Comp) Ok(v *fastjson.Value) bool {
 	if v.Type() == fastjson.TypeArray {
 		vals, _ := v.Array()
 		if e.CompOp == CompOpNe {
+			if !e.notArray {
+				e.buf = encoding.AppendJSONValue(e.buf[:0], v)
+				if !e.comp(e.buf) {
+					return false
+				}
+			}
 			for _, val := range vals {
 				e.buf = encoding.AppendJSONValue(e.buf[:0], val)
 				if !e.comp(e.buf) {
@@ -51,6 +65,12 @@ func (e *Comp) Ok(v *fastjson.Value) bool {
 			}
 			return true
 		} else {
+			if !e.notArray {
+				e.buf = encoding.AppendJSONValue(e.buf[:0], v)
+				if e.comp(e.buf) {
+					return true
+				}
+			}
 			for _, val := range vals {
 				e.buf = encoding.AppendJSONValue(e.buf[:0], val)
 				if e.comp(e.buf) {
@@ -424,4 +444,28 @@ func extractPrefix(pattern string) string {
 
 func (r Regexp) String() string {
 	return fmt.Sprintf(`{"$regex": "%s"}`, r.Regexp.String())
+}
+
+type Size struct {
+	Size int64
+}
+
+func (s Size) Ok(v *fastjson.Value) bool {
+	if v == nil {
+		return false
+	}
+	array, err := v.Array()
+	if err != nil {
+		return false
+	}
+	return int64(len(array)) == s.Size
+}
+
+func (s Size) IndexBounds(_ string, bs Bounds) (bounds Bounds) {
+	return bs
+}
+
+func (s Size) String() string {
+	return fmt.Sprintf(`{"$size": "%d"}`, s.Size)
+
 }

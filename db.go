@@ -170,16 +170,14 @@ func (db *db) WriteTx(ctx context.Context) (WriteTx, error) {
 		db.cm.ReleaseWrite(connWrite)
 		return nil, err
 	}
-	return &writeTx{
-		readTx{
-			commonTx: commonTx{
-				db:         db,
-				initialCtx: ctx,
-				con:        connWrite,
-				tx:         dTx,
-			},
-		},
-	}, nil
+	tx := writeTxPool.Get().(*writeTx)
+	tx.db = db
+	tx.initialCtx = ctx
+	tx.ctx = context.WithValue(ctx, ctxKeyTx, tx)
+	tx.con = connWrite
+	tx.tx = dTx
+	tx.reset()
+	return tx, nil
 }
 
 func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
@@ -193,14 +191,14 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 		db.cm.ReleaseRead(connRead)
 		return nil, err
 	}
-	return &readTx{
-		commonTx: commonTx{
-			db:         db,
-			initialCtx: ctx,
-			con:        connRead,
-			tx:         dTx,
-		},
-	}, nil
+	tx := readTxPool.Get().(*readTx)
+	tx.db = db
+	tx.initialCtx = ctx
+	tx.ctx = context.WithValue(ctx, ctxKeyTx, tx)
+	tx.con = connRead
+	tx.tx = dTx
+	tx.reset()
+	return tx, nil
 }
 
 func (db *db) CreateCollection(ctx context.Context, collectionName string) (Collection, error) {

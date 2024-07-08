@@ -8,6 +8,10 @@
       "expectedIds": [1,2]
     },
     {
+      "offset": 2,
+      "expectedIds": [3,4,5,6,7,8,9,10]
+    },
+    {
       "limit": 2,
       "offset": 2,
       "expectedIds": [3,4]
@@ -116,6 +120,10 @@
       "cond": {"b": 6},
       "sort" : ["-a"],
       "expectedIds": [8,6,3,2,1]
+    },
+    {
+      "cond": {"b": [4,8]},
+      "expectedIds": [4]
     }
   ],
   "data": [

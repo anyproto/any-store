@@ -47,26 +47,26 @@ func parseModRoot(v *fastjson.Value) (m Modifier, err error) {
 	if err != nil {
 		return nil, err
 	}
-	root := modifierRoot{}
+	root := ModifierChain{}
 	obj.Visit(func(key []byte, v *fastjson.Value) {
 		if err != nil {
 			return
 		}
 		switch {
 		case bytes.Equal(key, opBytesSet):
-			var setMod modifierRoot
+			var setMod ModifierChain
 			if setMod, err = parseMod(v, newSetModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
 		case bytes.Equal(key, opBytesUnset):
-			var setMod modifierRoot
+			var setMod ModifierChain
 			if setMod, err = parseMod(v, newUnsetModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
 		case bytes.Equal(key, opBytesInc):
-			var setMod modifierRoot
+			var setMod ModifierChain
 			if setMod, err = parseMod(v, newIncModifier); err != nil {
 				return
 			}
@@ -120,7 +120,7 @@ func parseModRoot(v *fastjson.Value) (m Modifier, err error) {
 	return nil, fmt.Errorf("empty modifier")
 }
 
-func parseMod(v *fastjson.Value, create func(key []byte, val *fastjson.Value) (Modifier, error)) (root modifierRoot, err error) {
+func parseMod(v *fastjson.Value, create func(key []byte, val *fastjson.Value) (Modifier, error)) (root ModifierChain, err error) {
 	obj, err := v.Object()
 	if err != nil {
 		return nil, err

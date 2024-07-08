@@ -34,6 +34,7 @@ const (
 	opExists
 	opType
 	opRegexp
+	opSize
 )
 
 var (
@@ -57,6 +58,7 @@ var (
 	opBytesExists = []byte("$exists")
 	opBytesType   = []byte("$type")
 	opBytesRegexp = []byte("$regex")
+	opBytesSize   = []byte("$size")
 )
 
 func MustParseCondition(cond any) Filter {
@@ -233,6 +235,7 @@ func parseComp(key string, v *fastjson.Value) (f Filter, err error) {
 	} else {
 		eq := &Comp{}
 		eq.EqValue = encoding.AppendJSONValue(eq.EqValue, v)
+		eq.notArray = v.Type() != fastjson.TypeArray
 		fk.Filter = eq
 	}
 	return fk, nil
@@ -249,6 +252,7 @@ func ParseCompObj(v *fastjson.Value) (Filter, error) {
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpEq
+		cmp.notArray = v.Type() != fastjson.TypeArray
 		return cmp, nil
 	}
 }
@@ -319,31 +323,37 @@ func makeCompFilter(op Operator, v *fastjson.Value) (f Filter, err error) {
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpEq
+		cmp.notArray = v.Type() != fastjson.TypeArray
 		return cmp, nil
 	case opNe:
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpNe
+		cmp.notArray = v.Type() != fastjson.TypeArray
 		return cmp, nil
 	case opGt:
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpGt
+		cmp.notArray = v.Type() != fastjson.TypeArray
 		return cmp, nil
 	case opGte:
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpGte
+		cmp.notArray = v.Type() != fastjson.TypeArray
 		return cmp, nil
 	case opLt:
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpLt
+		cmp.notArray = v.Type() != fastjson.TypeArray
 		return cmp, nil
 	case opLte:
 		cmp := &Comp{}
 		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
 		cmp.CompOp = CompOpLte
+		cmp.notArray = v.Type() != fastjson.TypeArray
 		return cmp, nil
 	case opNot:
 		var isOp bool
@@ -361,9 +371,19 @@ func makeCompFilter(op Operator, v *fastjson.Value) (f Filter, err error) {
 		return parseType(v)
 	case opRegexp:
 		return parseRegexp(v)
+	case opSize:
+		return parseSize(v)
 	default:
 		return makeArrComp(op, v)
 	}
+}
+
+func parseSize(v *fastjson.Value) (Filter, error) {
+	size, err := v.Int64()
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract size %w", err)
+	}
+	return Size{Size: size}, nil
 }
 
 func parseRegexp(v *fastjson.Value) (Filter, error) {
@@ -405,6 +425,7 @@ func makeEqArray(v *fastjson.Value) []Filter {
 	for i, jv := range vals {
 		eq := &Comp{CompOp: CompOpEq}
 		eq.EqValue = encoding.AppendJSONValue(eq.EqValue, jv)
+		eq.notArray = jv.Type() != fastjson.TypeArray
 		res[i] = eq
 	}
 	return res
@@ -478,6 +499,8 @@ func isOperator(key []byte) (ok bool, op Operator, err error) {
 			return true, opType, nil
 		case bytes.Equal(key, opBytesRegexp):
 			return true, opRegexp, nil
+		case bytes.Equal(key, opBytesSize):
+			return true, opSize, nil
 		default:
 			return true, 0, fmt.Errorf("unknow operator: %s", string(key))
 		}

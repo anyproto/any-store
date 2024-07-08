@@ -39,6 +39,7 @@ type ReadTx interface {
 
 type commonTx struct {
 	db         *db
+	ctx        context.Context
 	initialCtx context.Context
 	con        conn.Conn
 	tx         driver.Tx
@@ -49,8 +50,18 @@ func (tx *commonTx) conn() conn.Conn {
 	return tx.con
 }
 
+func (tx *commonTx) reset() {
+	tx.done.Store(false)
+}
+
 func (tx *commonTx) instanceId() string {
 	return tx.db.instanceId
+}
+
+var readTxPool = &sync.Pool{
+	New: func() any {
+		return &readTx{}
+	},
 }
 
 type readTx struct {
@@ -58,12 +69,13 @@ type readTx struct {
 }
 
 func (r *readTx) Context() context.Context {
-	return context.WithValue(r.commonTx.initialCtx, ctxKeyTx, r)
+	return r.ctx
 }
 
 func (r *readTx) Commit() error {
 	if r.done.CompareAndSwap(false, true) {
 		defer r.db.cm.ReleaseRead(r.con)
+		defer readTxPool.Put(r)
 		return r.commonTx.tx.Commit()
 	}
 	return nil
@@ -73,17 +85,24 @@ func (r *readTx) Done() bool {
 	return r.done.Load()
 }
 
+var writeTxPool = &sync.Pool{
+	New: func() any {
+		return &writeTx{}
+	},
+}
+
 type writeTx struct {
 	readTx
 }
 
 func (w *writeTx) Context() context.Context {
-	return context.WithValue(w.commonTx.initialCtx, ctxKeyTx, w)
+	return w.ctx
 }
 
 func (w *writeTx) Rollback() error {
 	if w.done.CompareAndSwap(false, true) {
 		defer w.db.cm.ReleaseWrite(w.con)
+		defer writeTxPool.Put(w)
 		return w.commonTx.tx.Rollback()
 	}
 	return nil
@@ -92,6 +111,7 @@ func (w *writeTx) Rollback() error {
 func (w *writeTx) Commit() error {
 	if w.done.CompareAndSwap(false, true) {
 		defer w.db.cm.ReleaseWrite(w.con)
+		defer writeTxPool.Put(w)
 		return w.commonTx.tx.Commit()
 	}
 	return nil
