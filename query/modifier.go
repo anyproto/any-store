@@ -97,26 +97,27 @@ func (m modifierInc) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastj
 
 type modifierRename struct {
 	fieldPath []string
-	val       string
+	val       []string
 }
 
 func (m modifierRename) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
-	err = walk(a, v, m.fieldPath, true, func(path string, prevValue, oldFieldValue *fastjson.Value) (res *fastjson.Value, err error) {
-		if path == m.val {
-			return oldFieldValue, nil
-		}
-		modified = oldFieldValue != nil
-		if modified {
-			err = walk(a, v, []string{m.val}, true, func(path string, prevValue, newFieldValue *fastjson.Value) (res *fastjson.Value, err error) {
-				modified = !equal(newFieldValue, oldFieldValue)
-				return oldFieldValue, nil
-			})
-			if err != nil {
-				return nil, err
-			}
+	var oldFieldValue *fastjson.Value
+	err = walk(a, v, m.fieldPath, true, func(path string, prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+		if value != nil {
+			modified = true
+			oldFieldValue = value
 		}
 		return nil, nil
 	})
+	if modified {
+		err = walk(a, v, m.val, true, func(path string, prevValue, newFieldValue *fastjson.Value) (res *fastjson.Value, err error) {
+			modified = !equal(newFieldValue, oldFieldValue)
+			return oldFieldValue, nil
+		})
+		if err != nil {
+			return nil, false, err
+		}
+	}
 	result = v
 	return
 }
@@ -159,10 +160,8 @@ func (m modifierPop) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastj
 func (m modifierPop) getResultArray(arrayOfValues []*fastjson.Value) ([]*fastjson.Value, error) {
 	if m.val == 1 {
 		arrayOfValues = arrayOfValues[:len(arrayOfValues)-1]
-	} else if m.val == -1 {
-		arrayOfValues = arrayOfValues[1:]
 	} else {
-		return nil, fmt.Errorf("failed to pop item: wrong argument")
+		arrayOfValues = arrayOfValues[1:]
 	}
 	return arrayOfValues, nil
 }
@@ -181,10 +180,7 @@ func (m modifierPush) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fast
 		if err != nil {
 			return nil, fmt.Errorf("failed to pop item, %w", err)
 		}
-		arrayOfValues = append(arrayOfValues, m.val)
-		for i, val := range arrayOfValues {
-			value.SetArrayItem(i, val)
-		}
+		value.SetArrayItem(len(arrayOfValues), m.val)
 		modified = true
 		return value, nil
 	})
@@ -213,17 +209,16 @@ func (m modifierPull) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fast
 		if len(arrayOfValues) == 0 {
 			return value, nil
 		}
-		array := a.NewArray()
 		if m.filter != nil {
-			modified = removeElements(arrayOfValues, array, func(value *fastjson.Value) bool {
+			modified = removeElements(arrayOfValues, value, func(value *fastjson.Value) bool {
 				return m.filter.Ok(value)
 			})
 		} else {
-			modified = removeElements(arrayOfValues, array, func(value *fastjson.Value) bool {
+			modified = removeElements(arrayOfValues, value, func(value *fastjson.Value) bool {
 				return equal(value, m.val)
 			})
 		}
-		return array, nil
+		return value, nil
 	})
 	if err != nil {
 		return nil, false, err
@@ -246,13 +241,12 @@ func (m modifierPullAll) Modify(a *fastjson.Arena, v *fastjson.Value) (result *f
 		if err != nil {
 			return nil, fmt.Errorf("failed to pop item, %w", err)
 		}
-		array := a.NewArray()
-		modified = removeElements(arrayOfValues, array, func(value *fastjson.Value) bool {
+		modified = removeElements(arrayOfValues, value, func(value *fastjson.Value) bool {
 			return slices.ContainsFunc(m.removedValues, func(removedValue *fastjson.Value) bool {
 				return equal(value, removedValue)
 			})
 		})
-		return array, nil
+		return value, nil
 	})
 	if err != nil {
 		return nil, false, err
@@ -261,7 +255,7 @@ func (m modifierPullAll) Modify(a *fastjson.Arena, v *fastjson.Value) (result *f
 	return
 }
 
-func removeElements(arrayOfValues []*fastjson.Value, newArray *fastjson.Value, shouldRemove func(*fastjson.Value) bool) bool {
+func removeElements(arrayOfValues []*fastjson.Value, value *fastjson.Value, shouldRemove func(*fastjson.Value) bool) bool {
 	n := 0
 	var modified bool
 	for _, val := range arrayOfValues {
@@ -272,9 +266,9 @@ func removeElements(arrayOfValues []*fastjson.Value, newArray *fastjson.Value, s
 			modified = true
 		}
 	}
-	arrayOfValues = arrayOfValues[:n]
-	for i, val := range arrayOfValues {
-		newArray.SetArrayItem(i, val)
+	for i := len(arrayOfValues) - 1; i >= n; i-- {
+		key := strconv.FormatInt(int64(i), 10)
+		value.Del(key)
 	}
 	return modified
 }
@@ -289,14 +283,11 @@ func (m modifierAddToSet) Modify(a *fastjson.Arena, v *fastjson.Value) (result *
 		if value == nil {
 			return nil, nil
 		}
-		arrayOfValues, err := value.Array()
+		_, err = value.Array()
 		if err != nil {
 			return nil, fmt.Errorf("failed to pop item, %w", err)
 		}
-		arrayOfValues, modified = m.addElements(arrayOfValues, m.val)
-		for i, val := range arrayOfValues {
-			value.SetArrayItem(i, val)
-		}
+		modified = m.addElements(value, m.val)
 		return value, nil
 	})
 	if err != nil {
@@ -306,14 +297,15 @@ func (m modifierAddToSet) Modify(a *fastjson.Arena, v *fastjson.Value) (result *
 	return
 }
 
-func (m modifierAddToSet) addElements(arrayOfValues []*fastjson.Value, addElem *fastjson.Value) ([]*fastjson.Value, bool) {
+func (m modifierAddToSet) addElements(value *fastjson.Value, addElem *fastjson.Value) bool {
+	arrayOfValues := value.GetArray()
 	if slices.ContainsFunc(arrayOfValues, func(val *fastjson.Value) bool {
 		return equal(addElem, val)
 	}) {
-		return arrayOfValues, false
+		return false
 	}
-	arrayOfValues = append(arrayOfValues, addElem)
-	return arrayOfValues, true
+	value.SetArrayItem(len(arrayOfValues), addElem)
+	return true
 }
 
 func walk(a *fastjson.Arena, v *fastjson.Value, fieldPath []string, create bool, finalize func(path string, prevValue *fastjson.Value, value *fastjson.Value) (res *fastjson.Value, err error)) (err error) {

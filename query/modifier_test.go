@@ -265,7 +265,7 @@ func TestModifierRename_Modify(t *testing.T) {
 				`{"$rename":{"old":"old"}}`,
 				`{"old":"value"}`,
 				`{"old":"value"}`,
-				false,
+				true,
 			},
 			{
 				`{"$rename":{"old":"new"}}`,
@@ -277,6 +277,24 @@ func TestModifierRename_Modify(t *testing.T) {
 				`{"$rename":{"old":"new"}}`,
 				`{"old":"value", "new":"value1"}`,
 				`{"new":"value"}`,
+				true,
+			},
+			{
+				`{"$rename":{"old":"new.new1"}}`,
+				`{"old":"value"}`,
+				`{"new":{"new1":"value"}}`,
+				true,
+			},
+			{
+				`{"$rename":{"old":"new.new1"}}`,
+				`{"old":"value", "new":{"new1":"value"}}`,
+				`{"new":{"new1":"value"}}`,
+				false,
+			},
+			{
+				`{"$rename":{"old.old1":"new.new1"}}`,
+				`{"old": {"old1": "value"}}`,
+				`{"old":{},"new":{"new1":"value"}}`,
 				true,
 			},
 		}...)
@@ -539,6 +557,7 @@ func BenchmarkModifier(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
+			a.Reset()
 			_, _, err := modifier.Modify(a, d)
 			require.NoError(b, err)
 		}
@@ -555,6 +574,9 @@ func BenchmarkModifier(b *testing.B) {
 	})
 	b.Run("rename", func(b *testing.B) {
 		bench(b, `{"$rename":{"a":"b"}}`)
+	})
+	b.Run("rename - object", func(b *testing.B) {
+		bench(b, `{"$rename":{"a":"d.c"}}`)
 	})
 	b.Run("pull", func(b *testing.B) {
 		bench(b, `{"$pull":{"b":3}}`)
