@@ -135,22 +135,14 @@ func parseNorArray(v *fastjson.Value) (f Filter, err error) {
 		return nil, fmt.Errorf("$or must be an array")
 	}
 	arr, _ := v.Array()
-	var fs Nor
-	if len(arr) > 1 {
-		fs = make(Nor, 0, len(arr))
-	}
+	fs := make(Nor, 0, len(arr))
 	for _, el := range arr {
 		if f, err = parseAnd(el); err != nil {
 			return nil, err
 		}
-		if fs != nil {
-			fs = append(fs, f)
-		}
+		fs = append(fs, f)
 	}
-	if fs != nil {
-		return fs, nil
-	}
-	return
+	return fs, nil
 }
 
 func parseAnd(val *fastjson.Value) (res Filter, err error) {

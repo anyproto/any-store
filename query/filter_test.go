@@ -235,6 +235,11 @@ func TestNor(t *testing.T) {
 			assert.Len(t, bs, 0)
 		})
 	})
+	t.Run("with eq", func(t *testing.T) {
+		f, err := ParseCondition(`{"$nor":[{"a":{"$eq": 1}}]}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(fastjson.MustParse(`{"a":1,"b":"2","c":4}`)))
+	})
 }
 
 func TestNot(t *testing.T) {
