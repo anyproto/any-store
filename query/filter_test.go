@@ -399,6 +399,13 @@ func TestSize(t *testing.T) {
 		_, err := ParseCondition(`{"name":{"$size": "2"}}`)
 		require.Error(t, err)
 	})
+	t.Run("to string then parse", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$size": 2}}`)
+		require.NoError(t, err)
+
+		_, err = ParseCondition(f.String())
+		require.NoError(t, err)
+	})
 }
 
 func BenchmarkFilter_Ok(b *testing.B) {

@@ -466,6 +466,5 @@ func (s Size) IndexBounds(_ string, bs Bounds) (bounds Bounds) {
 }
 
 func (s Size) String() string {
-	return fmt.Sprintf(`{"$size": "%d"}`, s.Size)
-
+	return fmt.Sprintf(`{"$size": %d}`, s.Size)
 }
