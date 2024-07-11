@@ -37,6 +37,8 @@ func (r *FilterRegistry) Register(f query.Filter) int {
 }
 
 func (r *FilterRegistry) Release(id int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	id -= 1
 	r.syncPools.ReleaseDocBuf(r.filters[id].buf)
 	r.filters[id].buf = nil
@@ -44,6 +46,8 @@ func (r *FilterRegistry) Release(id int) {
 }
 
 func (r *FilterRegistry) Filter(id int, data string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	id -= 1
 	v, err := r.filters[id].buf.Parser.Parse(data)
 	if err != nil {
@@ -82,6 +86,8 @@ func (r *SortRegistry) Register(s query.Sort) int {
 }
 
 func (r *SortRegistry) Release(id int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	id -= 1
 	r.syncPools.ReleaseDocBuf(r.sorts[id].buf)
 	r.sorts[id].buf = nil
@@ -89,6 +95,8 @@ func (r *SortRegistry) Release(id int) {
 }
 
 func (r *SortRegistry) Sort(id int, data string) []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	id -= 1
 	v, err := r.sorts[id].buf.Parser.Parse(data)
 	if err != nil {
