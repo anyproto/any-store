@@ -1,6 +1,8 @@
 package registry
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -40,6 +42,47 @@ func TestSortRegistry_Sort(t *testing.T) {
 	assert.Equal(t, encoding.AppendAnyValue(nil, 2), sr.Sort(2, testJson))
 }
 
+func TestSortRegistryConcurrent(t *testing.T) {
+	bufSize := 10
+	numWorkers := 20
+	sr := NewSortRegistry(syncpool.NewSyncPool(), bufSize)
+	var wg sync.WaitGroup
+	for j := 0; j < 100; j++ {
+		for i := 0; i < numWorkers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				jsonObj := fmt.Sprintf(`{"f":%d}`, i)
+				id := sr.Register(query.MustParseSort("f"))
+				assert.Equal(t, encoding.AppendAnyValue(nil, i), sr.Sort(id, jsonObj))
+				sr.Release(id)
+				wg.Done()
+			}(j*numWorkers + i)
+		}
+	}
+	wg.Wait()
+}
+
+func TestFilterRegistryConcurrent(t *testing.T) {
+	bufSize := 10
+	numWorkers := 20
+	fr := NewFilterRegistry(syncpool.NewSyncPool(), bufSize)
+	var wg sync.WaitGroup
+	for j := 0; j < 100; j++ {
+		for i := 0; i < numWorkers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				jsonObj := fmt.Sprintf(`{"f":%d}`, i)
+				id := fr.Register(query.MustParseCondition(jsonObj))
+				assert.True(t, fr.Filter(id, jsonObj))
+				assert.False(t, fr.Filter(id, `{"f":-1}`))
+				fr.Release(id)
+				wg.Done()
+			}(j*numWorkers + i)
+		}
+	}
+	wg.Wait()
+}
+
 func BenchmarkFilterRegistry_Filter(b *testing.B) {
 	fr := NewFilterRegistry(syncpool.NewSyncPool(), 4)
 	id := fr.Register(query.MustParseCondition(`{"f":0}`))
@@ -57,5 +100,29 @@ func BenchmarkSortRegistry_Sort(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		sr.Sort(id, `{"f":1}`)
+	}
+}
+
+func BenchmarkFilterRegistry_FilterRelease(b *testing.B) {
+	cond := query.MustParseCondition(`{"f":0}`)
+	fr := NewFilterRegistry(syncpool.NewSyncPool(), 4)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		id := fr.Register(cond)
+		fr.Filter(id, `{"f":1}`)
+		fr.Release(id)
+	}
+}
+
+func BenchmarkSortRegistry_SortRelease(b *testing.B) {
+	sr := NewSortRegistry(syncpool.NewSyncPool(), 4)
+	sort := query.MustParseSort("f")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		id := sr.Register(sort)
+		sr.Sort(id, `{"f":1}`)
+		sr.Release(id)
 	}
 }

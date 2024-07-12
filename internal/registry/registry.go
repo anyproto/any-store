@@ -8,8 +8,8 @@ import (
 	"github.com/anyproto/any-store/query"
 )
 
-func NewFilterRegistry(sp *syncpool.SyncPool, readConnections int) *FilterRegistry {
-	return &FilterRegistry{syncPools: sp, filters: make([]filterEntry, readConnections*2)}
+func NewFilterRegistry(sp *syncpool.SyncPool, bufSize int) *FilterRegistry {
+	return &FilterRegistry{syncPools: sp, filters: make([]filterEntry, bufSize), usersCh: make(chan struct{}, bufSize)}
 }
 
 type filterEntry struct {
@@ -20,11 +20,14 @@ type filterEntry struct {
 
 type FilterRegistry struct {
 	syncPools *syncpool.SyncPool
+	usersCh   chan struct{}
 	filters   []filterEntry
 	mu        sync.Mutex
 }
 
 func (r *FilterRegistry) Register(f query.Filter) int {
+	r.usersCh <- struct{}{}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -37,9 +40,7 @@ func (r *FilterRegistry) Register(f query.Filter) int {
 			return i + 1
 		}
 	}
-	r.filters = append(r.filters, filterEntry{filter: f, buf: r.syncPools.GetDocBuf(), inUse: atomic.Bool{}})
-	r.filters[len(r.filters)-1].inUse.Store(true)
-	return len(r.filters)
+	panic("integrity violation")
 }
 
 func (r *FilterRegistry) Release(id int) {
@@ -49,8 +50,11 @@ func (r *FilterRegistry) Release(id int) {
 	id -= 1
 	r.syncPools.ReleaseDocBuf(r.filters[id].buf)
 	r.filters[id].inUse.Store(false)
+
+	<-r.usersCh
 }
 
+// Filter could be called only between Register and Release calls, so it's safe to use concurrently
 func (r *FilterRegistry) Filter(id int, data string) bool {
 	id -= 1
 	v, err := r.filters[id].buf.Parser.Parse(data)
@@ -60,10 +64,6 @@ func (r *FilterRegistry) Filter(id int, data string) bool {
 	return r.filters[id].filter.Ok(v)
 }
 
-func NewSortRegistry(sp *syncpool.SyncPool, readConnections int) *SortRegistry {
-	return &SortRegistry{syncPools: sp, sorts: make([]sortEntry, readConnections+1)}
-}
-
 type sortEntry struct {
 	sort  query.Sort
 	buf   *syncpool.DocBuffer
@@ -71,12 +71,19 @@ type sortEntry struct {
 }
 
 type SortRegistry struct {
+	usersCh   chan struct{}
 	syncPools *syncpool.SyncPool
 	sorts     []sortEntry
 	mu        sync.Mutex
 }
 
+func NewSortRegistry(sp *syncpool.SyncPool, bufSize int) *SortRegistry {
+	return &SortRegistry{syncPools: sp, sorts: make([]sortEntry, bufSize), usersCh: make(chan struct{}, bufSize)}
+}
+
 func (r *SortRegistry) Register(s query.Sort) int {
+	r.usersCh <- struct{}{}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -89,9 +96,7 @@ func (r *SortRegistry) Register(s query.Sort) int {
 			return i + 1
 		}
 	}
-	r.sorts = append(r.sorts, sortEntry{sort: s, buf: r.syncPools.GetDocBuf(), inUse: atomic.Bool{}})
-	r.sorts[len(r.sorts)-1].inUse.Store(true)
-	return len(r.sorts)
+	panic("integrity violation")
 }
 
 func (r *SortRegistry) Release(id int) {
@@ -101,6 +106,8 @@ func (r *SortRegistry) Release(id int) {
 	id -= 1
 	r.syncPools.ReleaseDocBuf(r.sorts[id].buf)
 	r.sorts[id].inUse.Store(false)
+
+	<-r.usersCh
 }
 
 func (r *SortRegistry) Sort(id int, data string) []byte {
