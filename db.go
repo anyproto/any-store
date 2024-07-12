@@ -81,12 +81,13 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 
 	sPool := syncpool.NewSyncPool()
 
+	registryBufSize := (config.ReadConnections + 1) * 4
 	ds := &db{
 		instanceId:        objectid.NewObjectID().Hex(),
 		config:            config,
 		syncPool:          sPool,
-		filterReg:         registry.NewFilterRegistry(sPool),
-		sortReg:           registry.NewSortRegistry(sPool),
+		filterReg:         registry.NewFilterRegistry(sPool, registryBufSize),
+		sortReg:           registry.NewSortRegistry(sPool, registryBufSize),
 		openedCollections: make(map[string]Collection),
 	}
 

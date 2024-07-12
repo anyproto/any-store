@@ -2,97 +2,108 @@ package registry
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/anyproto/any-store/internal/syncpool"
 	"github.com/anyproto/any-store/query"
 )
 
-func NewFilterRegistry(sp *syncpool.SyncPool) *FilterRegistry {
-	return &FilterRegistry{syncPools: sp}
-}
-
-type filterEntry struct {
-	buf    *syncpool.DocBuffer
-	filter query.Filter
-}
-
 type FilterRegistry struct {
-	syncPools *syncpool.SyncPool
-	filters   []filterEntry
-	mu        sync.Mutex
+	registry *registry[query.Filter]
+}
+
+func NewFilterRegistry(sp *syncpool.SyncPool, bufSize int) *FilterRegistry {
+	return &FilterRegistry{registry: newRegistry[query.Filter](sp, bufSize)}
 }
 
 func (r *FilterRegistry) Register(f query.Filter) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	for i := 0; i < len(r.filters); i++ {
-		if r.filters[i].filter == nil {
-			r.filters[i] = filterEntry{filter: f, buf: r.syncPools.GetDocBuf()}
-			return i + 1
-		}
-	}
-	r.filters = append(r.filters, filterEntry{filter: f, buf: r.syncPools.GetDocBuf()})
-	return len(r.filters)
+	return r.registry.Register(f)
 }
 
 func (r *FilterRegistry) Release(id int) {
-	id -= 1
-	r.syncPools.ReleaseDocBuf(r.filters[id].buf)
-	r.filters[id].buf = nil
-	r.filters[id].filter = nil
+	r.registry.Release(id)
 }
 
+// Filter could be called only between Register and Release calls, so it's safe to use concurrently
 func (r *FilterRegistry) Filter(id int, data string) bool {
 	id -= 1
-	v, err := r.filters[id].buf.Parser.Parse(data)
+	v, err := r.registry.entries[id].buf.Parser.Parse(data)
 	if err != nil {
 		return false
 	}
-	return r.filters[id].filter.Ok(v)
-}
-
-func NewSortRegistry(sp *syncpool.SyncPool) *SortRegistry {
-	return &SortRegistry{syncPools: sp}
-}
-
-type sortEntry struct {
-	sort query.Sort
-	buf  *syncpool.DocBuffer
+	return r.registry.entries[id].value.Ok(v)
 }
 
 type SortRegistry struct {
-	syncPools *syncpool.SyncPool
-	sorts     []sortEntry
-	mu        sync.Mutex
+	registry *registry[query.Sort]
+}
+
+func NewSortRegistry(sp *syncpool.SyncPool, bufSize int) *SortRegistry {
+	return &SortRegistry{registry: newRegistry[query.Sort](sp, bufSize)}
 }
 
 func (r *SortRegistry) Register(s query.Sort) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	for i := 0; i < len(r.sorts); i++ {
-		if r.sorts[i].sort == nil {
-			r.sorts[i] = sortEntry{sort: s, buf: r.syncPools.GetDocBuf()}
-			return i + 1
-		}
-	}
-	r.sorts = append(r.sorts, sortEntry{sort: s, buf: r.syncPools.GetDocBuf()})
-	return len(r.sorts)
+	return r.registry.Register(s)
 }
 
 func (r *SortRegistry) Release(id int) {
-	id -= 1
-	r.syncPools.ReleaseDocBuf(r.sorts[id].buf)
-	r.sorts[id].buf = nil
-	r.sorts[id].sort = nil
+	r.registry.Release(id)
 }
 
 func (r *SortRegistry) Sort(id int, data string) []byte {
 	id -= 1
-	v, err := r.sorts[id].buf.Parser.Parse(data)
+	v, err := r.registry.entries[id].buf.Parser.Parse(data)
 	if err != nil {
 		return nil
 	}
-	return r.sorts[id].sort.AppendKey(r.sorts[id].buf.SmallBuf[:0], v)
+	buf := r.registry.entries[id].buf.SmallBuf[:0]
+	buf = r.registry.entries[id].value.AppendKey(buf, v)
+	r.registry.entries[id].buf.SmallBuf = buf
+	return buf
+}
+
+type registryEntry[T any] struct {
+	buf   *syncpool.DocBuffer
+	inUse atomic.Bool
+	value T
+}
+
+type registry[T any] struct {
+	usersCh   chan struct{}
+	syncPools *syncpool.SyncPool
+	entries   []registryEntry[T]
+	mu        sync.Mutex
+}
+
+func newRegistry[T any](sp *syncpool.SyncPool, bufSize int) *registry[T] {
+	return &registry[T]{syncPools: sp, entries: make([]registryEntry[T], bufSize), usersCh: make(chan struct{}, bufSize)}
+}
+
+func (r *registry[T]) Register(v T) int {
+	r.usersCh <- struct{}{}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for i := 0; i < len(r.entries); i++ {
+		if !r.entries[i].inUse.Load() {
+			// We can use separate Load and Store because we have a lock
+			r.entries[i].inUse.Store(true)
+			r.entries[i].value = v
+			r.entries[i].buf = r.syncPools.GetDocBuf()
+			return i + 1
+		}
+	}
+	panic("integrity violation")
+}
+
+func (r *registry[T]) Release(id int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	id -= 1
+	r.syncPools.ReleaseDocBuf(r.entries[id].buf)
+	r.entries[id].inUse.Store(false)
+
+	<-r.usersCh
 }

@@ -15,7 +15,7 @@ import (
 
 func TestConnManager(t *testing.T) {
 	sp := syncpool.NewSyncPool()
-	driver := NewDriver(registry.NewFilterRegistry(sp), registry.NewSortRegistry(sp))
+	driver := NewDriver(registry.NewFilterRegistry(sp, 4), registry.NewSortRegistry(sp, 4))
 
 	tmpDir, err := os.MkdirTemp("", "")
 	require.NoError(t, err)
