@@ -221,7 +221,7 @@ func parseComp(key string, v *fastjson.Value) (f Filter, err error) {
 		Path: strings.Split(key, "."),
 	}
 	if v.Type() == fastjson.TypeObject {
-		if fk.Filter, err = ParseCompObj(v); err != nil {
+		if fk.Filter, err = parseCompObj(v); err != nil {
 			return nil, err
 		}
 	} else {
@@ -233,7 +233,7 @@ func parseComp(key string, v *fastjson.Value) (f Filter, err error) {
 	return fk, nil
 }
 
-func ParseCompObj(v *fastjson.Value) (Filter, error) {
+func parseCompObj(v *fastjson.Value) (Filter, error) {
 	hasCompOp, f, err := parseCompObjOp(v)
 	if err != nil {
 		return nil, err

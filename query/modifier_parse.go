@@ -208,7 +208,7 @@ func newPullModifier(key []byte, v *fastjson.Value, eb *equalBuf) (Modifier, err
 		equalBuf:  eb,
 	}
 	if v.Type() == fastjson.TypeObject {
-		pull.filter, err = ParseCompObj(v)
+		pull.filter, err = parseCompObj(v)
 		if err == nil {
 			return pull, nil
 		}
