@@ -90,7 +90,7 @@ func (i *iterator) Close() (err error) {
 		err = errors.Join(err, i.rows.Close())
 	}
 	if i.tx != nil {
-		err = errors.Join(i.tx.Commit())
+		err = errors.Join(err, i.tx.Commit())
 	}
 	if i.buf != nil && i.qb != nil {
 		i.qb.coll.db.syncPool.ReleaseDocBuf(i.buf)

@@ -2,18 +2,20 @@ package registry
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/anyproto/any-store/internal/syncpool"
 	"github.com/anyproto/any-store/query"
 )
 
-func NewFilterRegistry(sp *syncpool.SyncPool) *FilterRegistry {
-	return &FilterRegistry{syncPools: sp}
+func NewFilterRegistry(sp *syncpool.SyncPool, readConnections int) *FilterRegistry {
+	return &FilterRegistry{syncPools: sp, filters: make([]filterEntry, readConnections*2)}
 }
 
 type filterEntry struct {
 	buf    *syncpool.DocBuffer
 	filter query.Filter
+	inUse  atomic.Bool
 }
 
 type FilterRegistry struct {
@@ -27,20 +29,26 @@ func (r *FilterRegistry) Register(f query.Filter) int {
 	defer r.mu.Unlock()
 
 	for i := 0; i < len(r.filters); i++ {
-		if r.filters[i].filter == nil {
-			r.filters[i] = filterEntry{filter: f, buf: r.syncPools.GetDocBuf()}
+		if !r.filters[i].inUse.Load() {
+			// We can use separate Load and Store because we have a lock
+			r.filters[i].inUse.Store(true)
+			r.filters[i].filter = f
+			r.filters[i].buf = r.syncPools.GetDocBuf()
 			return i + 1
 		}
 	}
-	r.filters = append(r.filters, filterEntry{filter: f, buf: r.syncPools.GetDocBuf()})
+	r.filters = append(r.filters, filterEntry{filter: f, buf: r.syncPools.GetDocBuf(), inUse: atomic.Bool{}})
+	r.filters[len(r.filters)-1].inUse.Store(true)
 	return len(r.filters)
 }
 
 func (r *FilterRegistry) Release(id int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	id -= 1
 	r.syncPools.ReleaseDocBuf(r.filters[id].buf)
-	r.filters[id].buf = nil
-	r.filters[id].filter = nil
+	r.filters[id].inUse.Store(false)
 }
 
 func (r *FilterRegistry) Filter(id int, data string) bool {
@@ -52,13 +60,14 @@ func (r *FilterRegistry) Filter(id int, data string) bool {
 	return r.filters[id].filter.Ok(v)
 }
 
-func NewSortRegistry(sp *syncpool.SyncPool) *SortRegistry {
-	return &SortRegistry{syncPools: sp}
+func NewSortRegistry(sp *syncpool.SyncPool, readConnections int) *SortRegistry {
+	return &SortRegistry{syncPools: sp, sorts: make([]sortEntry, readConnections+1)}
 }
 
 type sortEntry struct {
-	sort query.Sort
-	buf  *syncpool.DocBuffer
+	sort  query.Sort
+	buf   *syncpool.DocBuffer
+	inUse atomic.Bool
 }
 
 type SortRegistry struct {
@@ -72,20 +81,26 @@ func (r *SortRegistry) Register(s query.Sort) int {
 	defer r.mu.Unlock()
 
 	for i := 0; i < len(r.sorts); i++ {
-		if r.sorts[i].sort == nil {
-			r.sorts[i] = sortEntry{sort: s, buf: r.syncPools.GetDocBuf()}
+		if !r.sorts[i].inUse.Load() {
+			// We can use separate Load and Store because we have a lock
+			r.sorts[i].inUse.Store(true)
+			r.sorts[i].sort = s
+			r.sorts[i].buf = r.syncPools.GetDocBuf()
 			return i + 1
 		}
 	}
-	r.sorts = append(r.sorts, sortEntry{sort: s, buf: r.syncPools.GetDocBuf()})
+	r.sorts = append(r.sorts, sortEntry{sort: s, buf: r.syncPools.GetDocBuf(), inUse: atomic.Bool{}})
+	r.sorts[len(r.sorts)-1].inUse.Store(true)
 	return len(r.sorts)
 }
 
 func (r *SortRegistry) Release(id int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	id -= 1
 	r.syncPools.ReleaseDocBuf(r.sorts[id].buf)
-	r.sorts[id].buf = nil
-	r.sorts[id].sort = nil
+	r.sorts[id].inUse.Store(false)
 }
 
 func (r *SortRegistry) Sort(id int, data string) []byte {

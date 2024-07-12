@@ -85,8 +85,8 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		instanceId:        objectid.NewObjectID().Hex(),
 		config:            config,
 		syncPool:          sPool,
-		filterReg:         registry.NewFilterRegistry(sPool),
-		sortReg:           registry.NewSortRegistry(sPool),
+		filterReg:         registry.NewFilterRegistry(sPool, config.ReadConnections),
+		sortReg:           registry.NewSortRegistry(sPool, config.ReadConnections),
 		openedCollections: make(map[string]Collection),
 	}
 

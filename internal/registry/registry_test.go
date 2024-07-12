@@ -11,7 +11,7 @@ import (
 )
 
 func TestFilterRegistry_Filter(t *testing.T) {
-	fr := NewFilterRegistry(syncpool.NewSyncPool())
+	fr := NewFilterRegistry(syncpool.NewSyncPool(), 4)
 	filter := query.MustParseCondition
 	assert.Equal(t, 1, fr.Register(filter(`{"f":0}`)))
 	assert.Equal(t, 2, fr.Register(filter(`{"f":1}`)))
@@ -25,7 +25,7 @@ func TestFilterRegistry_Filter(t *testing.T) {
 }
 
 func TestSortRegistry_Sort(t *testing.T) {
-	sr := NewSortRegistry(syncpool.NewSyncPool())
+	sr := NewSortRegistry(syncpool.NewSyncPool(), 4)
 
 	const testJson = `{"n0":0, "n1":1, "n2":2}`
 
@@ -41,7 +41,7 @@ func TestSortRegistry_Sort(t *testing.T) {
 }
 
 func BenchmarkFilterRegistry_Filter(b *testing.B) {
-	fr := NewFilterRegistry(syncpool.NewSyncPool())
+	fr := NewFilterRegistry(syncpool.NewSyncPool(), 4)
 	id := fr.Register(query.MustParseCondition(`{"f":0}`))
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -51,7 +51,7 @@ func BenchmarkFilterRegistry_Filter(b *testing.B) {
 }
 
 func BenchmarkSortRegistry_Sort(b *testing.B) {
-	sr := NewSortRegistry(syncpool.NewSyncPool())
+	sr := NewSortRegistry(syncpool.NewSyncPool(), 4)
 	id := sr.Register(query.MustParseSort("f"))
 	b.ReportAllocs()
 	b.ResetTimer()
