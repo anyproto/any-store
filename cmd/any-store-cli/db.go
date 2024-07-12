@@ -348,7 +348,10 @@ func (c *Conn) Find(cmd Cmd) (result string, err error) {
 		return
 	}
 
-	iter := q.Iter(mainCtx.Ctx())
+	iter, err := q.Iter(mainCtx.Ctx())
+	if err != nil {
+		return "", err
+	}
 	defer iter.Close()
 	var doc anystore.Doc
 	for iter.Next() {

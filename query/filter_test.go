@@ -235,6 +235,11 @@ func TestNor(t *testing.T) {
 			assert.Len(t, bs, 0)
 		})
 	})
+	t.Run("with eq", func(t *testing.T) {
+		f, err := ParseCondition(`{"$nor":[{"a":{"$eq": 1}}]}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(fastjson.MustParse(`{"a":1,"b":"2","c":4}`)))
+	})
 }
 
 func TestNot(t *testing.T) {
@@ -398,6 +403,13 @@ func TestSize(t *testing.T) {
 	t.Run("error parsing expression - expected number", func(t *testing.T) {
 		_, err := ParseCondition(`{"name":{"$size": "2"}}`)
 		require.Error(t, err)
+	})
+	t.Run("to string then parse", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$size": 2}}`)
+		require.NoError(t, err)
+
+		_, err = ParseCondition(f.String())
+		require.NoError(t, err)
 	})
 }
 
