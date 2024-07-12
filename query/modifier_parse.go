@@ -48,6 +48,7 @@ func parseModRoot(v *fastjson.Value) (m Modifier, err error) {
 		return nil, err
 	}
 	root := ModifierChain{}
+	eb := &equalBuf{}
 	obj.Visit(func(key []byte, v *fastjson.Value) {
 		if err != nil {
 			return
@@ -55,19 +56,55 @@ func parseModRoot(v *fastjson.Value) (m Modifier, err error) {
 		switch {
 		case bytes.Equal(key, opBytesSet):
 			var setMod ModifierChain
-			if setMod, err = parseMod(v, newSetModifier); err != nil {
+			if setMod, err = parseMod(v, eb, newSetModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
 		case bytes.Equal(key, opBytesUnset):
 			var setMod ModifierChain
-			if setMod, err = parseMod(v, newUnsetModifier); err != nil {
+			if setMod, err = parseMod(v, eb, newUnsetModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
 		case bytes.Equal(key, opBytesInc):
 			var setMod ModifierChain
-			if setMod, err = parseMod(v, newIncModifier); err != nil {
+			if setMod, err = parseMod(v, eb, newIncModifier); err != nil {
+				return
+			}
+			root = append(root, setMod...)
+		case bytes.Equal(key, opBytesRename):
+			var setMod ModifierChain
+			if setMod, err = parseMod(v, eb, newRenameModifier); err != nil {
+				return
+			}
+			root = append(root, setMod...)
+		case bytes.Equal(key, opBytesPop):
+			var setMod ModifierChain
+			if setMod, err = parseMod(v, eb, newPopModifier); err != nil {
+				return
+			}
+			root = append(root, setMod...)
+		case bytes.Equal(key, opBytesPush):
+			var setMod ModifierChain
+			if setMod, err = parseMod(v, eb, newPushModifier); err != nil {
+				return
+			}
+			root = append(root, setMod...)
+		case bytes.Equal(key, opBytesPull):
+			var setMod ModifierChain
+			if setMod, err = parseMod(v, eb, newPullModifier); err != nil {
+				return
+			}
+			root = append(root, setMod...)
+		case bytes.Equal(key, opBytesPullAll):
+			var setMod ModifierChain
+			if setMod, err = parseMod(v, eb, newPullAllModifier); err != nil {
+				return
+			}
+			root = append(root, setMod...)
+		case bytes.Equal(key, opBytesAddToSet):
+			var setMod ModifierChain
+			if setMod, err = parseMod(v, eb, newAddToSetModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
@@ -84,7 +121,7 @@ func parseModRoot(v *fastjson.Value) (m Modifier, err error) {
 	return nil, fmt.Errorf("empty modifier")
 }
 
-func parseMod(v *fastjson.Value, create func(key []byte, val *fastjson.Value) (Modifier, error)) (root ModifierChain, err error) {
+func parseMod(v *fastjson.Value, eb *equalBuf, create func(key []byte, val *fastjson.Value, eb *equalBuf) (Modifier, error)) (root ModifierChain, err error) {
 	obj, err := v.Object()
 	if err != nil {
 		return nil, err
@@ -99,7 +136,7 @@ func parseMod(v *fastjson.Value, create func(key []byte, val *fastjson.Value) (M
 			return
 		}
 		var mod Modifier
-		if mod, err = create(key, v); err != nil {
+		if mod, err = create(key, v, eb); err != nil {
 			return
 		}
 		root = append(root, mod)
@@ -107,25 +144,95 @@ func parseMod(v *fastjson.Value, create func(key []byte, val *fastjson.Value) (M
 	return
 }
 
-func newSetModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+func newSetModifier(key []byte, v *fastjson.Value, eb *equalBuf) (Modifier, error) {
 	return modifierSet{
 		fieldPath: strings.Split(string(key), "."),
 		val:       v,
+		equalBuf:  eb,
 	}, nil
 }
 
-func newUnsetModifier(key []byte, _ *fastjson.Value) (Modifier, error) {
+func newUnsetModifier(key []byte, _ *fastjson.Value, eb *equalBuf) (Modifier, error) {
 	return modifierUnset{
 		fieldPath: strings.Split(string(key), "."),
 	}, nil
 }
 
-func newIncModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+func newIncModifier(key []byte, v *fastjson.Value, eb *equalBuf) (Modifier, error) {
 	if v.Type() != fastjson.TypeNumber {
 		return nil, fmt.Errorf("not numeric value for $inc in field '%s'", string(key))
 	}
 	return modifierInc{
 		fieldPath: strings.Split(string(key), "."),
 		val:       v.GetFloat64(),
+	}, nil
+}
+
+func newRenameModifier(key []byte, v *fastjson.Value, eb *equalBuf) (Modifier, error) {
+	stringBytes, err := v.StringBytes()
+	if err != nil {
+		return nil, fmt.Errorf("failed to rename field: %w", err)
+	}
+	return modifierRename{
+		fieldPath: strings.Split(string(key), "."),
+		val:       strings.Split(string(stringBytes), "."),
+		equalBuf:  eb,
+	}, nil
+}
+
+func newPopModifier(key []byte, v *fastjson.Value, eb *equalBuf) (Modifier, error) {
+	value, err := v.Int()
+	if err != nil {
+		return nil, fmt.Errorf("failed to pop item, %w", err)
+	}
+	if value != 1 && value != -1 {
+		return nil, fmt.Errorf("failed to pop item: wrong argument")
+	}
+	return modifierPop{
+		fieldPath: strings.Split(string(key), "."),
+		val:       value,
+	}, nil
+}
+
+func newPushModifier(key []byte, v *fastjson.Value, eb *equalBuf) (Modifier, error) {
+	return modifierPush{
+		fieldPath: strings.Split(string(key), "."),
+		val:       v,
+	}, nil
+}
+
+func newPullModifier(key []byte, v *fastjson.Value, eb *equalBuf) (Modifier, error) {
+	var err error
+	pull := modifierPull{
+		fieldPath: strings.Split(string(key), "."),
+		equalBuf:  eb,
+	}
+	if v.Type() == fastjson.TypeObject {
+		pull.filter, err = parseCompObj(v)
+		if err == nil {
+			return pull, nil
+		}
+	}
+	pull.val = v
+	return pull, nil
+}
+
+func newPullAllModifier(key []byte, v *fastjson.Value, eb *equalBuf) (Modifier, error) {
+	removedValues, err := v.Array()
+	if err != nil {
+		return nil, fmt.Errorf("failed to pop item, %w", err)
+	}
+	return modifierPullAll{
+		fieldPath:     strings.Split(string(key), "."),
+		removedValues: removedValues,
+		equalBuf:      eb,
+	}, nil
+}
+
+func newAddToSetModifier(key []byte, v *fastjson.Value, eb *equalBuf) (Modifier, error) {
+	return modifierAddToSet{
+		fieldPath: strings.Split(string(key), "."),
+		val:       v,
+		equalBuf:  eb,
 	}, nil
 }

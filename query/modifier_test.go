@@ -251,3 +251,349 @@ func TestModifierInc_Modify(t *testing.T) {
 	})
 
 }
+
+func TestModifierRename_Modify(t *testing.T) {
+	t.Run("no error", func(t *testing.T) {
+		testModCases(t, []modifierCase{
+			{
+				`{"$rename":{"old":"new"}}`,
+				`{}`,
+				`{}`,
+				false,
+			},
+			{
+				`{"$rename":{"old":"old"}}`,
+				`{"old":"value"}`,
+				`{"old":"value"}`,
+				true,
+			},
+			{
+				`{"$rename":{"old":"new"}}`,
+				`{"old":"value"}`,
+				`{"new":"value"}`,
+				true,
+			},
+			{
+				`{"$rename":{"old":"new"}}`,
+				`{"old":"value", "new":"value1"}`,
+				`{"new":"value"}`,
+				true,
+			},
+			{
+				`{"$rename":{"old":"new.new1"}}`,
+				`{"old":"value"}`,
+				`{"new":{"new1":"value"}}`,
+				true,
+			},
+			{
+				`{"$rename":{"old":"new.new1"}}`,
+				`{"old":"value", "new":{"new1":"value"}}`,
+				`{"new":{"new1":"value"}}`,
+				false,
+			},
+			{
+				`{"$rename":{"old.old1":"new.new1"}}`,
+				`{"old": {"old1": "value"}}`,
+				`{"old":{},"new":{"new1":"value"}}`,
+				true,
+			},
+		}...)
+	})
+}
+
+func TestModifierPop_Modify(t *testing.T) {
+	t.Run("no error", func(t *testing.T) {
+		testModCases(t, []modifierCase{
+			{
+				`{"$pop":{"arr": -1}}`,
+				`{}`,
+				`{}`,
+				false,
+			},
+			{
+				`{"$pop":{"arr": -1}}`,
+				`{"arr": [1]}`,
+				`{"arr":[]}`,
+				true,
+			},
+			{
+				`{"$pop":{"arr": 1}}`,
+				`{"arr": [1]}`,
+				`{"arr":[]}`,
+				true,
+			},
+			{
+				`{"$pop":{"arr": -1}}`,
+				`{"arr": [1,2,3]}`,
+				`{"arr":[2,3]}`,
+				true,
+			},
+			{
+				`{"$pop":{"arr": 1}}`,
+				`{"arr": [1,2,3]}`,
+				`{"arr":[1,2]}`,
+				true,
+			},
+			{
+				`{"$pop":{"arr": 1}}`,
+				`{"arr": []}`,
+				`{"arr":[]}`,
+				false,
+			},
+		}...)
+	})
+	t.Run("error", func(t *testing.T) {
+		testModCasesErr(t, []modifierCaseError{
+			{
+				`{"$pop":{"arr":1}}`,
+				`{"arr":"2"}`,
+				`failed to pop item, value doesn't contain array; it contains string`,
+			},
+			{
+				`{"$pop":{"arr":""}}`,
+				`{"arr":[1,2]}`,
+				`failed to pop item, value doesn't contain number; it contains string`,
+			},
+			{
+				`{"$pop":{"arr":2}}`,
+				`{"arr":[1,2]}`,
+				`failed to pop item: wrong argument`,
+			},
+		}...)
+	})
+}
+
+func TestModifierPush_Modify(t *testing.T) {
+	t.Run("no error", func(t *testing.T) {
+		testModCases(t, []modifierCase{
+			{
+				`{"$push":{"arr": -1}}`,
+				`{}`,
+				`{}`,
+				false,
+			},
+			{
+				`{"$push":{"arr": 1}}`,
+				`{"arr": [1]}`,
+				`{"arr":[1,1]}`,
+				true,
+			},
+		}...)
+	})
+	t.Run("error", func(t *testing.T) {
+		testModCasesErr(t, []modifierCaseError{
+			{
+				`{"$push":{"arr":1}}`,
+				`{"arr":"2"}`,
+				`failed to pop item, value doesn't contain array; it contains string`,
+			},
+		}...)
+	})
+}
+
+func TestModifierPull_Modify(t *testing.T) {
+	t.Run("no error", func(t *testing.T) {
+		testModCases(t, []modifierCase{
+			{
+				`{"$pull":{"arr": 1}}`,
+				`{}`,
+				`{}`,
+				false,
+			},
+			{
+				`{"$pull":{"arr": 1}}`,
+				`{"arr": []}`,
+				`{"arr":[]}`,
+				false,
+			},
+			{
+				`{"$pull":{"arr": 1}}`,
+				`{"arr": [2, 3, 1, 4]}`,
+				`{"arr":[2,3,4]}`,
+				true,
+			},
+			{
+				`{"$pull":{"arr": 1}}`,
+				`{"arr": [2, 3, 4]}`,
+				`{"arr":[2,3,4]}`,
+				false,
+			},
+			{
+				`{"$pull":{"arr": {"id":"123","name":"one"}}}`,
+				`{"arr": [{"id":"123","name":"two"},{"id":"321","name":"one"},{"id":"123","name":"one"}]}`,
+				`{"arr":[{"id":"123","name":"two"},{"id":"321","name":"one"}]}`,
+				true,
+			},
+			{
+				`{"$pull":{"arr": {"$in":[2,6]}}}`,
+				`{"arr": [1,2,3,4,5,6,7]}`,
+				`{"arr":[1,3,4,5,7]}`,
+				true,
+			},
+			{
+				`{"$pull":{"arr": {"$gte":6}}}`,
+				`{"arr": [1,2,3,4,5,6,7]}`,
+				`{"arr":[1,2,3,4,5]}`,
+				true,
+			},
+			{
+				`{"$pull":{"arr": {"$gt":6}}}`,
+				`{"arr": [1,2,3,4,5,6,7]}`,
+				`{"arr":[1,2,3,4,5,6]}`,
+				true,
+			},
+			{
+				`{"$pull":{"arr": {"$lte":6}}}`,
+				`{"arr": [1,2,3,4,5,6,7]}`,
+				`{"arr":[7]}`,
+				true,
+			},
+			{
+				`{"$pull":{"arr": {"$lt":6}}}`,
+				`{"arr": [1,2,3,4,5,6,7]}`,
+				`{"arr":[6,7]}`,
+				true,
+			},
+		}...)
+	})
+	t.Run("error", func(t *testing.T) {
+		testModCasesErr(t, []modifierCaseError{
+			{
+				`{"$pull":{"arr":1}}`,
+				`{"arr":"2"}`,
+				`failed to pop item, value doesn't contain array; it contains string`,
+			},
+		}...)
+	})
+}
+
+func TestModifierPullAll_Modify(t *testing.T) {
+	t.Run("no error", func(t *testing.T) {
+		testModCases(t, []modifierCase{
+			{
+				`{"$pullAll":{"arr": [1]}}`,
+				`{}`,
+				`{}`,
+				false,
+			},
+			{
+				`{"$pullAll":{"arr": [1]}}`,
+				`{"arr": []}`,
+				`{"arr":[]}`,
+				false,
+			},
+			{
+				`{"$pullAll":{"arr": [1,2,3,4]}}`,
+				`{"arr": [1,2,3,4,5]}`,
+				`{"arr":[5]}`,
+				true,
+			},
+		}...)
+	})
+	t.Run("error", func(t *testing.T) {
+		testModCasesErr(t, []modifierCaseError{
+			{
+				`{"$pullAll":{"arr":1}}`,
+				`{"arr":"2"}`,
+				`failed to pop item, value doesn't contain array; it contains number`,
+			},
+			{
+				`{"$pullAll":{"arr":1}}`,
+				`{"arr":[1,2,3,4,5]}`,
+				`failed to pop item, value doesn't contain array; it contains number`,
+			},
+		}...)
+	})
+}
+
+func TestModifierAddToSet_Modify(t *testing.T) {
+	t.Run("no error", func(t *testing.T) {
+		testModCases(t, []modifierCase{
+			{
+				`{"$addToSet":{"arr": [1]}}`,
+				`{}`,
+				`{}`,
+				false,
+			},
+			{
+				`{"$addToSet":{"arr": [1]}}`,
+				`{"arr": []}`,
+				`{"arr":[[1]]}`,
+				true,
+			},
+			{
+				`{"$addToSet":{"arr": "test"}}`,
+				`{"arr": [1,2,3,4,5]}`,
+				`{"arr":[1,2,3,4,5,"test"]}`,
+				true,
+			},
+			{
+				`{"$addToSet":{"arr": 5}}`,
+				`{"arr": [1,2,3,4,5]}`,
+				`{"arr":[1,2,3,4,5]}`,
+				false,
+			},
+		}...)
+	})
+	t.Run("error", func(t *testing.T) {
+		testModCasesErr(t, []modifierCaseError{
+			{
+				`{"$addToSet":{"arr":1}}`,
+				`{"arr":"2"}`,
+				`failed to pop item, value doesn't contain array; it contains string`,
+			},
+		}...)
+	})
+}
+
+func BenchmarkModifier(b *testing.B) {
+	bench := func(b *testing.B, query string) {
+		doc := fastjson.MustParse(`{"a":2,"b":[3,2,1],"c":"test"}`)
+		a := &fastjson.Arena{}
+		p := &fastjson.Parser{}
+		d, err := parser.AnyToJSON(p, doc)
+		modifier, err := ParseModifier(query)
+		require.NoError(b, err)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			a.Reset()
+			_, _, err := modifier.Modify(a, d)
+			require.NoError(b, err)
+		}
+	}
+
+	b.Run("set", func(b *testing.B) {
+		bench(b, `{"$set":{"a":3}}`)
+	})
+	b.Run("unset", func(b *testing.B) {
+		bench(b, `{"$unset":{"a":3}}`)
+	})
+	b.Run("inc", func(b *testing.B) {
+		bench(b, `{"$inc":{"a":2}}`)
+	})
+	b.Run("rename", func(b *testing.B) {
+		bench(b, `{"$rename":{"a":"b"}}`)
+	})
+	b.Run("rename - object", func(b *testing.B) {
+		bench(b, `{"$rename":{"a":"d.c"}}`)
+	})
+	b.Run("pull", func(b *testing.B) {
+		bench(b, `{"$pull":{"b":3}}`)
+	})
+	b.Run("pull query", func(b *testing.B) {
+		bench(b, `{"$pull":{"b": {"$in":[3,1]}}}`)
+	})
+	b.Run("pop", func(b *testing.B) {
+		bench(b, `{"$pop":{"b":1}}`)
+	})
+	b.Run("push", func(b *testing.B) {
+		bench(b, `{"$push":{"b":6}}`)
+	})
+	b.Run("pull all", func(b *testing.B) {
+		bench(b, `{"$pullAll":{"b":[1,2]}}`)
+	})
+	b.Run("add to set", func(b *testing.B) {
+		bench(b, `{"$addToSet":{"b":[1,2,5]}}`)
+	})
+}
