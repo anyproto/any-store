@@ -56,7 +56,10 @@ func (r *SortRegistry) Sort(id int, data string) []byte {
 	if err != nil {
 		return nil
 	}
-	return r.registry.entries[id].value.AppendKey(r.registry.entries[id].buf.SmallBuf[:0], v)
+	buf := r.registry.entries[id].buf.SmallBuf[:0]
+	buf = r.registry.entries[id].value.AppendKey(buf, v)
+	r.registry.entries[id].buf.SmallBuf = buf
+	return buf
 }
 
 type registryEntry[T any] struct {
