@@ -1,6 +1,7 @@
 package query
 
 import (
+	"bytes"
 	"fmt"
 	"slices"
 	"strconv"
@@ -41,11 +42,12 @@ func (mRoot ModifierChain) Modify(a *fastjson.Arena, v *fastjson.Value) (result 
 type modifierSet struct {
 	fieldPath []string
 	val       *fastjson.Value
+	equalBuf  *equalBuf
 }
 
 func (m modifierSet) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
 	err = walk(a, v, m.fieldPath, true, func(path string, prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
-		modified = !equal(value, m.val)
+		modified = !m.equalBuf.equal(value, m.val)
 		return m.val, nil
 	})
 	if err != nil {
@@ -98,6 +100,7 @@ func (m modifierInc) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastj
 type modifierRename struct {
 	fieldPath []string
 	val       []string
+	equalBuf  *equalBuf
 }
 
 func (m modifierRename) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
@@ -111,7 +114,7 @@ func (m modifierRename) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fa
 	})
 	if modified {
 		err = walk(a, v, m.val, true, func(path string, prevValue, newFieldValue *fastjson.Value) (res *fastjson.Value, err error) {
-			modified = !equal(newFieldValue, oldFieldValue)
+			modified = !m.equalBuf.equal(newFieldValue, oldFieldValue)
 			return oldFieldValue, nil
 		})
 		if err != nil {
@@ -195,6 +198,7 @@ type modifierPull struct {
 	fieldPath []string
 	filter    Filter
 	val       *fastjson.Value
+	equalBuf  *equalBuf
 }
 
 func (m modifierPull) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
@@ -215,7 +219,7 @@ func (m modifierPull) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fast
 			})
 		} else {
 			modified = removeElements(arrayOfValues, value, func(value *fastjson.Value) bool {
-				return equal(value, m.val)
+				return m.equalBuf.equal(value, m.val)
 			})
 		}
 		return value, nil
@@ -230,6 +234,7 @@ func (m modifierPull) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fast
 type modifierPullAll struct {
 	fieldPath     []string
 	removedValues []*fastjson.Value
+	equalBuf      *equalBuf
 }
 
 func (m modifierPullAll) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
@@ -243,7 +248,7 @@ func (m modifierPullAll) Modify(a *fastjson.Arena, v *fastjson.Value) (result *f
 		}
 		modified = removeElements(arrayOfValues, value, func(value *fastjson.Value) bool {
 			return slices.ContainsFunc(m.removedValues, func(removedValue *fastjson.Value) bool {
-				return equal(value, removedValue)
+				return m.equalBuf.equal(value, removedValue)
 			})
 		})
 		return value, nil
@@ -276,6 +281,7 @@ func removeElements(arrayOfValues []*fastjson.Value, value *fastjson.Value, shou
 type modifierAddToSet struct {
 	fieldPath []string
 	val       *fastjson.Value
+	equalBuf  *equalBuf
 }
 
 func (m modifierAddToSet) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
@@ -300,7 +306,7 @@ func (m modifierAddToSet) Modify(a *fastjson.Arena, v *fastjson.Value) (result *
 func (m modifierAddToSet) addElements(value *fastjson.Value, addElem *fastjson.Value) bool {
 	arrayOfValues := value.GetArray()
 	if slices.ContainsFunc(arrayOfValues, func(val *fastjson.Value) bool {
-		return equal(addElem, val)
+		return m.equalBuf.equal(addElem, val)
 	}) {
 		return false
 	}
@@ -363,7 +369,11 @@ func walk(a *fastjson.Arena, v *fastjson.Value, fieldPath []string, create bool,
 	return
 }
 
-func equal(v1, v2 *fastjson.Value) bool {
+type equalBuf struct {
+	left, right []byte
+}
+
+func (eb *equalBuf) equal(v1, v2 *fastjson.Value) bool {
 	if v1 == v2 {
 		return true
 	}
@@ -373,6 +383,7 @@ func equal(v1, v2 *fastjson.Value) bool {
 	if v1.Type() != v2.Type() {
 		return false
 	}
-	// TODO: maybe not very fast
-	return v1.String() == v2.String()
+	eb.left = v1.MarshalTo(eb.left[:0])
+	eb.right = v2.MarshalTo(eb.right[:0])
+	return bytes.Equal(eb.left, eb.right)
 }
