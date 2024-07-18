@@ -85,7 +85,7 @@ func equalObject(a *fastjson.Value, b *fastjson.Value) bool {
 				eq = Equal(va, vb)
 			}
 		})
-		if !bFound {
+		if !bFound || lb < la {
 			eq = false
 		}
 	})
