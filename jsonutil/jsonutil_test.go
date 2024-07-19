@@ -33,6 +33,7 @@ func TestEqual(t *testing.T) {
 			{`{"a":1, "b":2}`, `{"a":1, "b":2, "c": 3}`},
 			{`{"a":2, "b":2}`, `{"a":1, "b":2}`},
 			{`{"a1":2, "b":2}`, `{"a":1, "b":2}`},
+			{`{}`, `{"a":1}`},
 		}
 		for _, v := range equalList {
 			assert.False(t, Equal(fastjson.MustParse(v[0]), fastjson.MustParse(v[1])), v[0], v[1])

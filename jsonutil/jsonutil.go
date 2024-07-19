@@ -89,6 +89,11 @@ func equalObject(a *fastjson.Value, b *fastjson.Value) bool {
 			eq = false
 		}
 	})
+	if la == 0 {
+		ba.Visit(func(kb []byte, vb *fastjson.Value) {
+			lb++
+		})
+	}
 	if la != lb {
 		return false
 	}
