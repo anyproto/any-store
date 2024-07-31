@@ -2,9 +2,11 @@ package test
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -12,8 +14,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fastjson"
+	"zombiezen.com/go/sqlite"
 
 	anystore "github.com/anyproto/any-store"
+	"github.com/anyproto/any-store/query"
 )
 
 func init() {
@@ -127,4 +131,130 @@ func testFile(t *testing.T, filename string) {
 		t.Logf("%d\t%s\t%v", j, explain.Sql, dur)
 	}
 
+}
+
+func BenchmarkAny(t *testing.B) {
+
+	db, err := anystore.Open(ctx, "azaza.db", nil)
+	require.NoError(t, err)
+	defer db.Close()
+
+	coll, err := db.Collection(ctx, "test")
+	require.NoError(t, err)
+	tx, err := db.WriteTx(ctx)
+	require.NoError(t, err)
+	//for range 10000 {
+	//	randomValue := rand.Intn(100)
+	//	jsonData := fmt.Sprintf(`{"a": %d}`, randomValue)
+	//	err = coll.Insert(tx.Context(), jsonData)
+	//	require.NoError(t, err)
+	//}
+	require.NoError(t, tx.Commit())
+	t.ResetTimer()
+	for i := 0; i < t.N; i++ {
+		iter, err := coll.Find(`{"a": {"$lt": 10}}`).Iter(ctx)
+		require.NoError(t, err)
+		var count int
+		for iter.Next() {
+			_, err = iter.Doc()
+			require.NoError(t, err)
+			count++
+		}
+		t.Log(count)
+		require.NoError(t, iter.Close())
+	}
+}
+func BenchmarkZombie(t *testing.B) {
+	// Open an in-memory database.
+	conn, err := sqlite.OpenConn("azaza.db", sqlite.OpenReadWrite) //todo file
+	filter := query.MustParseCondition(`{"a": {"$lt": 10}}`)
+	parser := &fastjson.Parser{}
+	conn.CreateFunction("any_filter", &sqlite.FunctionImpl{
+		NArgs: 1,
+		Scalar: func(ctx sqlite.Context, args []sqlite.Value) (sqlite.Value, error) {
+			data := args[0]
+			doc, _ := parser.ParseBytes(data.Blob())
+			ok := filter.Ok(doc)
+			if ok {
+				return sqlite.IntegerValue(1), nil
+			}
+			return sqlite.IntegerValue(0), nil
+		},
+		MakeAggregate: nil,
+		Deterministic: true,
+		AllowIndirect: false,
+	})
+	require.NoError(t, err)
+	defer conn.Close()
+
+	//// Создаем таблицу
+	//err = sqlitex.ExecScript(conn, `CREATE TABLE example (
+	//	id INTEGER PRIMARY KEY,
+	//	data TEXT
+	//);`)
+	//if err != nil {
+	//	log.Fatal(err)
+	//}
+
+	//// Вставляем JSON данные в таблицу
+	//jsonData := `{"a": 2}`
+	//stmt := conn.Prep("INSERT INTO example (data) VALUES ($data);")
+	//stmt.SetText("$data", jsonData)
+	//if _, err := stmt.Step(); err != nil {
+	//	log.Fatal(err)
+	//}
+
+	// Начинаем транзакцию
+	//err = sqlitex.ExecuteTransient(conn, "BEGIN TRANSACTION;", nil)
+	//if err != nil {
+	//	log.Fatal(err)
+	//}
+	//stmt := conn.Prep("INSERT INTO example (data) VALUES ($data);")
+	//for i := 0; i < 100000; i++ {
+	//	// Генерируем случайное число
+	//	randomValue := rand.Intn(100) // значение от 0 до 99
+	//
+	//	// Формируем JSON-строку
+	//	jsonData := fmt.Sprintf(`{"a": %d}`, randomValue)
+	//
+	//	// Выполняем вставку
+	//	stmt.SetText("$data", jsonData)
+	//	if _, err := stmt.Step(); err != nil {
+	//		log.Fatal(err)
+	//	}
+	//	stmt.Reset()
+	//}
+	//
+	//// Завершаем транзакцию
+	//err = sqlitex.ExecuteTransient(conn, "COMMIT;", nil)
+	//if err != nil {
+	//	log.Fatal(err)
+	//}
+
+	// Выполняем запрос, чтобы получить записи, где a > 1
+
+	query := `SELECT data 
+	FROM _test_docs
+	WHERE any_filter(data) = 1;`
+	stmt := conn.Prep(query)
+	t.ResetTimer()
+	var buf []byte
+	for i := 0; i < t.N; i++ {
+		var count int
+		for {
+			hasRow, err := stmt.Step()
+			if err != nil {
+				log.Fatal(err)
+			}
+			if !hasRow {
+				break
+			}
+			count++
+			size := stmt.ColumnLen(0)
+			buf = slices.Grow(buf[:0], size)
+			_ = stmt.ColumnBytes(0, buf)
+		}
+		stmt.Reset()
+		t.Log(count)
+	}
 }
