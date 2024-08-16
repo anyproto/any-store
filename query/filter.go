@@ -46,7 +46,11 @@ type Comp struct {
 
 func (e *Comp) Ok(v *fastjson.Value) bool {
 	if v == nil {
-		return false
+		if e.CompOp == CompOpNe {
+			return true
+		} else {
+			return false
+		}
 	}
 	if v.Type() == fastjson.TypeArray {
 		vals, _ := v.Array()
