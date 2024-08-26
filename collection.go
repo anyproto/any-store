@@ -143,7 +143,9 @@ func (c *collection) init(ctx context.Context) error {
 	c.makeQueries()
 	return c.db.doReadTx(ctx, func(cn *driver.Conn) (err error) {
 		var idxInfo []IndexInfo
-		err = cn.Exec(ctx, c.sql.FindIndexes(), nil, func(stmt *sqlite.Stmt) error {
+		err = cn.Exec(ctx, c.sql.FindIndexes(), func(stmt *sqlite.Stmt) {
+			stmt.SetText(":collName", c.name)
+		}, func(stmt *sqlite.Stmt) error {
 			idxInfo, err = readIndexInfo(buf, stmt)
 			if err != nil {
 				return err

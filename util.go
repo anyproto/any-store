@@ -12,11 +12,11 @@ import (
 func readIndexInfo(buf *syncpool.DocBuffer, stmt *sqlite.Stmt) (result []IndexInfo, err error) {
 	for {
 		hasRow, stepErr := stmt.Step()
-		if !hasRow {
-			return
-		}
 		if stepErr != nil {
 			return nil, stepErr
+		}
+		if !hasRow {
+			return
 		}
 		fields, err := jsonToStringArray(buf.Parser, stmt.ColumnText(1))
 		if err != nil {
