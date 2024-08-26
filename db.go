@@ -93,7 +93,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 
 	var err error
 	if ds.cm, err = driver.NewConnManager(
-		config.dsn(path),
+		path,
 		1,
 		config.ReadConnections,
 		ds.filterReg,
