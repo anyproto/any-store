@@ -282,7 +282,7 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	defer qb.Close()
 	sqlRes := qb.build(true)
 	err = q.c.db.doReadTx(ctx, func(cn *driver.Conn) (txErr error) {
-		txErr = cn.Exec(ctx, sqlRes, func(stmt *sqlite.Stmt) {
+		txErr = cn.ExecCached(ctx, sqlRes, func(stmt *sqlite.Stmt) {
 			for i, val := range qb.values {
 				stmt.BindBytes(i+1, val)
 			}

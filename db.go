@@ -286,7 +286,7 @@ func (db *db) Collection(ctx context.Context, collectionName string) (Collection
 
 func (db *db) GetCollectionNames(ctx context.Context) (collectionNames []string, err error) {
 	err = db.doReadTx(ctx, func(c *driver.Conn) error {
-		return c.Exec(ctx, db.sql.FindCollections(), nil, func(stmt *sqlite.Stmt) error {
+		return c.ExecCached(ctx, db.sql.FindCollections(), nil, func(stmt *sqlite.Stmt) error {
 			for {
 				hasRow, stepErr := stmt.Step()
 				if stepErr != nil {

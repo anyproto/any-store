@@ -140,7 +140,7 @@ func (idx *index) Info() IndexInfo {
 
 func (idx *index) Len(ctx context.Context) (count int, err error) {
 	err = idx.c.db.doReadTx(ctx, func(cn *driver.Conn) error {
-		err = cn.Exec(ctx, idx.queries.count, nil, func(stmt *sqlite.Stmt) error {
+		err = cn.ExecCached(ctx, idx.queries.count, nil, func(stmt *sqlite.Stmt) error {
 			hasRow, stepErr := stmt.Step()
 			if stepErr != nil {
 				return stepErr

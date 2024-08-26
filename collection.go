@@ -28,6 +28,10 @@ type Collection interface {
 	// Returns the document or an error if the document is not found.
 	FindId(ctx context.Context, id any) (Doc, error)
 
+	// FindIdWithParser finds a document by its ID. Uses provided fastjson parser.
+	// Returns the document or an error if the document is not found.
+	FindIdWithParser(ctx context.Context, p *fastjson.Parser, id any) (Doc, error)
+
 	// Find returns a new Query object with given filter
 	Find(filter any) Query
 
@@ -203,12 +207,16 @@ func (c *collection) Name() string {
 }
 
 func (c *collection) FindId(ctx context.Context, docId any) (doc Doc, err error) {
+	return c.FindIdWithParser(ctx, &fastjson.Parser{}, docId)
+}
+
+func (c *collection) FindIdWithParser(ctx context.Context, p *fastjson.Parser, docId any) (doc Doc, err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	buf.SmallBuf = encoding.AppendAnyValue(buf.SmallBuf[:0], docId)
 	err = c.db.doReadTx(ctx, func(cn *driver.Conn) (err error) {
-		err = cn.Exec(ctx, c.queries.findId, func(stmt *sqlite.Stmt) {
+		err = cn.ExecCached(ctx, c.queries.findId, func(stmt *sqlite.Stmt) {
 			stmt.BindBytes(1, buf.SmallBuf)
 		}, func(stmt *sqlite.Stmt) error {
 			hasRow, stepErr := stmt.Step()
@@ -224,8 +232,8 @@ func (c *collection) FindId(ctx context.Context, docId any) (doc Doc, err error)
 		if err != nil {
 			return err
 		}
-		data, err := fastjson.ParseBytes(buf.DocBuf)
-		doc = &item{val: data}
+		data, err := p.ParseBytes(buf.DocBuf)
+		doc = item{val: data}
 		return
 	})
 	return
@@ -526,7 +534,7 @@ func (c *collection) deleteItem(ctx context.Context, id []byte, prevItem item) (
 
 func (c *collection) Count(ctx context.Context) (count int, err error) {
 	err = c.db.doReadTx(ctx, func(cn *driver.Conn) error {
-		txErr := cn.Exec(ctx, c.queries.count, nil, func(stmt *sqlite.Stmt) error {
+		txErr := cn.ExecCached(ctx, c.queries.count, nil, func(stmt *sqlite.Stmt) error {
 			hasRow, stepErr := stmt.Step()
 			if stepErr != nil {
 				return stepErr

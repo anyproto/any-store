@@ -34,6 +34,15 @@ func (c *Conn) Exec(ctx context.Context, query string, bind func(stmt *sqlite.St
 	return stmt.Exec(ctx, bind, result)
 }
 
+func (c *Conn) ExecCached(ctx context.Context, query string, bind func(stmt *sqlite.Stmt), result func(stmt *sqlite.Stmt) error) (err error) {
+	sqliteStmt, err := c.conn.Prepare(query)
+	if err != nil {
+		return
+	}
+	stmt := Stmt{stmt: sqliteStmt, conn: c.conn}
+	return stmt.Exec(ctx, bind, result)
+}
+
 func (c *Conn) Query(ctx context.Context, query string) (*sqlite.Stmt, error) {
 	if ctx.Done() != nil {
 		c.conn.SetInterrupt(ctx.Done())
