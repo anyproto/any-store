@@ -1,12 +1,9 @@
 package sql
 
 import (
-	"context"
 	"fmt"
 	"strconv"
 	"strings"
-
-	"github.com/anyproto/any-store/internal/conn"
 )
 
 type IndexSql struct {
@@ -56,7 +53,7 @@ func (s IndexSql) RenameColl(newCollName string) string {
 	return s.With2Coll(s.WithIndex(`ALTER TABLE '%ns_%coll_%idx_idx' RENAME TO '%ns_%2coll_%idx_idx';`), newCollName)
 }
 
-func (s IndexSql) InsertStmt(ctx context.Context, cn conn.Conn, numFields int) (conn.Stmt, error) {
+func (s IndexSql) InsertStmt(numFields int) string {
 	var fields = make([]string, 0, numFields+1)
 	var values = make([]string, 0, numFields+1)
 	fields = append(fields, "docId")
@@ -65,16 +62,16 @@ func (s IndexSql) InsertStmt(ctx context.Context, cn conn.Conn, numFields int) (
 		fields = append(fields, fmt.Sprintf("val%d", i))
 		values = append(values, fmt.Sprintf(":val%d", i))
 	}
-	return s.Prepare(ctx, cn, fmt.Sprintf(s.WithIndex(`INSERT INTO '%ns_%coll_%idx_idx' (%s) VALUES (%s)`), strings.Join(fields, ", "), strings.Join(values, ", ")))
+	return fmt.Sprintf(s.WithIndex(`INSERT INTO '%ns_%coll_%idx_idx' (%s) VALUES (%s)`), strings.Join(fields, ", "), strings.Join(values, ", "))
 }
 
-func (s IndexSql) DeleteStmt(ctx context.Context, cn conn.Conn, numFields int) (conn.Stmt, error) {
+func (s IndexSql) DeleteStmt(numFields int) string {
 	var fields = make([]string, 0, numFields+1)
 	fields = append(fields, "docId = :docId")
 	for i := 0; i < numFields; i++ {
 		fields = append(fields, fmt.Sprintf("val%d = :val%d", i, i))
 	}
-	return s.Prepare(ctx, cn, fmt.Sprintf(s.WithIndex(`DELETE FROM '%ns_%coll_%idx_idx' WHERE %s`), strings.Join(fields, " AND ")))
+	return fmt.Sprintf(s.WithIndex(`DELETE FROM '%ns_%coll_%idx_idx' WHERE %s`), strings.Join(fields, " AND "))
 }
 
 func (s IndexSql) WithIndex(sql string) string {

@@ -1,30 +1,30 @@
 package anystore
 
 import (
-	"database/sql/driver"
-	"errors"
-	"io"
 	"sort"
 	"strings"
+
+	"zombiezen.com/go/sqlite"
 )
 
-func scanExplainRows(rows driver.Rows) ([]string, error) {
-	var dest = make([]driver.Value, 4)
+func scanExplainStmt(stmt *sqlite.Stmt) ([]string, error) {
 	var es = &explainString{}
 	for {
-		if rErr := rows.Next(dest); rErr != nil {
-			if errors.Is(rErr, io.EOF) {
-				return es.Result(), nil
-			} else {
-				return nil, rErr
-			}
+		hasRow, stepErr := stmt.Step()
+		if stepErr != nil {
+			return nil, stepErr
 		}
+		if !hasRow {
+			break
+		}
+
 		es.addRow(explainRow{
-			id:     dest[0].(int64),
-			parent: dest[1].(int64),
-			detail: dest[3].(string),
+			id:     stmt.ColumnInt64(0),
+			parent: stmt.ColumnInt64(1),
+			detail: stmt.ColumnText(3),
 		})
 	}
+	return es.Result(), nil
 }
 
 type explainRow struct {

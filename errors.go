@@ -3,7 +3,7 @@ package anystore
 import (
 	"errors"
 
-	"github.com/mattn/go-sqlite3"
+	"zombiezen.com/go/sqlite"
 )
 
 var (
@@ -48,11 +48,10 @@ func replaceUniqErr(err, replaceTo error) error {
 	if err == nil {
 		return nil
 	}
-	var sqliteErr sqlite3.Error
-	if errors.As(err, &sqliteErr) {
-		if errors.Is(sqliteErr.Code, sqlite3.ErrConstraint) {
-			return replaceTo
-		}
+	switch sqlite.ErrCode(err) {
+	case sqlite.ResultConstraintPrimaryKey,
+		sqlite.ResultConstraintUnique:
+		return replaceTo
 	}
 	return err
 }

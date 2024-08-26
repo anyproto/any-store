@@ -1,71 +1,41 @@
 package anystore
 
 import (
-	"database/sql"
-	"database/sql/driver"
-	"errors"
-	"io"
+	"slices"
 
 	"github.com/valyala/fastjson"
+	"zombiezen.com/go/sqlite"
 
 	"github.com/anyproto/any-store/internal/syncpool"
 )
 
-func readRowsString(rows driver.Rows) (result []string, err error) {
-	var dest = make([]driver.Value, 1)
+func readIndexInfo(buf *syncpool.DocBuffer, stmt *sqlite.Stmt) (result []IndexInfo, err error) {
 	for {
-		if err = rows.Next(dest); err != nil {
-			if errors.Is(err, io.EOF) {
-				return result, nil
-			}
-			return nil, err
+		hasRow, stepErr := stmt.Step()
+		if !hasRow {
+			return
 		}
-		result = append(result, driverValueToString(dest[0]))
-	}
-}
-
-func driverValueToString(v driver.Value) string {
-	if v == nil {
-		return ""
-	}
-	return v.(string)
-}
-
-func readIndexInfo(buf *syncpool.DocBuffer, rows driver.Rows) (result []IndexInfo, err error) {
-	var dest = make([]driver.Value, 5)
-	for {
-		rErr := rows.Next(dest)
-		if rErr != nil {
-			if errors.Is(rErr, io.EOF) {
-				break
-			}
-			return nil, err
+		if stepErr != nil {
+			return nil, stepErr
 		}
-
-		fields, err := jsonToStringArray(buf.Parser, dest[1].(string))
+		fields, err := jsonToStringArray(buf.Parser, stmt.ColumnText(1))
 		if err != nil {
 			return nil, err
 		}
 		result = append(result, IndexInfo{
-			Name:   dest[0].(string),
+			Name:   stmt.ColumnText(0),
 			Fields: fields,
-			Sparse: dest[2].(int64) != 0,
-			Unique: dest[3].(int64) != 0,
+			Sparse: stmt.ColumnInt(2) != 0,
+			Unique: stmt.ColumnInt(2) != 0,
 		})
 	}
-	return
 }
 
-func readOneInt(rows driver.Rows) (i int, err error) {
-	var dest = make([]driver.Value, 1)
-	if err = rows.Next(dest); err != nil {
-		if errors.Is(err, io.EOF) {
-			return 0, sql.ErrNoRows
-		} else {
-			return 0, err
-		}
-	}
-	return int(dest[0].(int64)), nil
+func readBytes(stmt *sqlite.Stmt, buf []byte) []byte {
+	l := stmt.ColumnLen(0)
+	buf = slices.Grow(buf, l)[:l]
+	stmt.ColumnBytes(0, buf)
+	return buf
 }
 
 func stringArrayToJson(a *fastjson.Arena, array []string) string {

@@ -1,10 +1,10 @@
 package anystore
 
 import (
-	"database/sql/driver"
 	"errors"
-	"fmt"
 	"io"
+
+	"zombiezen.com/go/sqlite"
 
 	"github.com/anyproto/any-store/internal/syncpool"
 )
@@ -41,33 +41,32 @@ type Iterator interface {
 }
 
 type iterator struct {
-	rows   driver.Rows
 	tx     ReadTx
-	dest   []driver.Value
 	buf    *syncpool.DocBuffer
 	qb     *queryBuilder
 	err    error
 	closed bool
+	stmt   *sqlite.Stmt
 }
 
 func (i *iterator) Next() bool {
 	if i.err != nil {
 		return false
 	}
-	if i.err = i.rows.Next(i.dest); i.err != nil {
+	hasRow, stepErr := i.stmt.Step()
+	if stepErr != nil {
+		i.err = stepErr
 		return false
 	}
-	return true
+	return hasRow
 }
 
 func (i *iterator) Doc() (Doc, error) {
 	if i.err != nil && !errors.Is(i.err, io.EOF) {
 		return nil, i.err
 	}
-	if i.dest[0] == nil {
-		return nil, fmt.Errorf("should be called after Next")
-	}
-	val, err := i.buf.Parser.ParseBytes(i.dest[0].([]byte))
+	i.buf.DocBuf = readBytes(i.stmt, i.buf.DocBuf)
+	val, err := i.buf.Parser.ParseBytes(i.buf.DocBuf)
 	if err != nil {
 		return nil, err
 	}
@@ -86,8 +85,8 @@ func (i *iterator) Close() (err error) {
 		return ErrIterClosed
 	}
 	i.closed = true
-	if i.rows != nil {
-		err = errors.Join(err, i.rows.Close())
+	if i.stmt != nil {
+		err = errors.Join(err, i.stmt.Finalize())
 	}
 	if i.tx != nil {
 		err = errors.Join(err, i.tx.Commit())

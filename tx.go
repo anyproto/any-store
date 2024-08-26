@@ -2,13 +2,12 @@ package anystore
 
 import (
 	"context"
-	"database/sql/driver"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/anyproto/any-store/internal/conn"
+	"github.com/anyproto/any-store/internal/driver"
 )
 
 // WriteTx represents a read-write transaction.
@@ -33,7 +32,7 @@ type ReadTx interface {
 	// Done returns true if the transaction is completed (committed or rolled back).
 	Done() bool
 
-	conn() conn.Conn
+	conn() *driver.Conn
 	instanceId() string
 }
 
@@ -41,12 +40,11 @@ type commonTx struct {
 	db         *db
 	ctx        context.Context
 	initialCtx context.Context
-	con        conn.Conn
-	tx         driver.Tx
+	con        *driver.Conn
 	done       atomic.Bool
 }
 
-func (tx *commonTx) conn() conn.Conn {
+func (tx *commonTx) conn() *driver.Conn {
 	return tx.con
 }
 
@@ -76,7 +74,7 @@ func (r *readTx) Commit() error {
 	if r.done.CompareAndSwap(false, true) {
 		defer r.db.cm.ReleaseRead(r.con)
 		defer readTxPool.Put(r)
-		return r.commonTx.tx.Commit()
+		return r.con.Commit(context.Background())
 	}
 	return nil
 }
@@ -103,7 +101,7 @@ func (w *writeTx) Rollback() error {
 	if w.done.CompareAndSwap(false, true) {
 		defer w.db.cm.ReleaseWrite(w.con)
 		defer writeTxPool.Put(w)
-		return w.commonTx.tx.Rollback()
+		return w.con.Rollback(context.Background())
 	}
 	return nil
 }
@@ -112,7 +110,7 @@ func (w *writeTx) Commit() error {
 	if w.done.CompareAndSwap(false, true) {
 		defer w.db.cm.ReleaseWrite(w.con)
 		defer writeTxPool.Put(w)
-		return w.commonTx.tx.Commit()
+		return w.con.Commit(context.Background())
 	}
 	return nil
 }
@@ -128,7 +126,7 @@ var savepointPool = &sync.Pool{
 func newSavepointTx(ctx context.Context, wrTx WriteTx) (WriteTx, error) {
 	tx := savepointPool.Get().(*savepointTx)
 	tx.reset(wrTx)
-	if _, err := tx.conn().ExecContext(ctx, unsafe.String(unsafe.SliceData(tx.createQuery), len(tx.createQuery)), nil); err != nil {
+	if err := tx.conn().Exec(ctx, unsafe.String(unsafe.SliceData(tx.createQuery), len(tx.createQuery)), nil, driver.StmtExecNoResults); err != nil {
 		return nil, err
 	}
 	return tx, nil
@@ -178,7 +176,7 @@ func (tx *savepointTx) reset(wtx WriteTx) {
 
 func (tx *savepointTx) Commit() error {
 	if tx.done.CompareAndSwap(false, true) {
-		if _, err := tx.conn().ExecContext(context.TODO(), unsafe.String(unsafe.SliceData(tx.releaseQuery), len(tx.releaseQuery)), nil); err != nil {
+		if err := tx.conn().Exec(context.TODO(), unsafe.String(unsafe.SliceData(tx.releaseQuery), len(tx.releaseQuery)), nil, driver.StmtExecNoResults); err != nil {
 			return err
 		}
 		savepointPool.Put(tx)
@@ -188,7 +186,7 @@ func (tx *savepointTx) Commit() error {
 
 func (tx *savepointTx) Rollback() error {
 	if tx.done.CompareAndSwap(false, true) {
-		if _, err := tx.conn().ExecContext(context.TODO(), unsafe.String(unsafe.SliceData(tx.rollbackQuery), len(tx.rollbackQuery)), nil); err != nil {
+		if err := tx.conn().Exec(context.TODO(), unsafe.String(unsafe.SliceData(tx.rollbackQuery), len(tx.rollbackQuery)), nil, driver.StmtExecNoResults); err != nil {
 			return err
 		}
 		savepointPool.Put(tx)

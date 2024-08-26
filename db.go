@@ -2,13 +2,13 @@ package anystore
 
 import (
 	"context"
-	"database/sql/driver"
 	"errors"
-	"io"
 	"sync"
 	"sync/atomic"
 
-	"github.com/anyproto/any-store/internal/conn"
+	"zombiezen.com/go/sqlite"
+
+	"github.com/anyproto/any-store/internal/driver"
 	"github.com/anyproto/any-store/internal/objectid"
 	"github.com/anyproto/any-store/internal/registry"
 	"github.com/anyproto/any-store/internal/sql"
@@ -92,11 +92,12 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	}
 
 	var err error
-	if ds.cm, err = conn.NewConnManager(
-		conn.NewDriver(ds.filterReg, ds.sortReg),
+	if ds.cm, err = driver.NewConnManager(
 		config.dsn(path),
 		1,
 		config.ReadConnections,
+		ds.filterReg,
+		ds.sortReg,
 	); err != nil {
 		return nil, err
 	}
@@ -112,7 +113,7 @@ type db struct {
 
 	config *Config
 
-	cm        *conn.ConnManager
+	cm        *driver.ConnManager
 	filterReg *registry.FilterRegistry
 	sortReg   *registry.SortRegistry
 
@@ -125,7 +126,7 @@ type db struct {
 		renameCollection,
 		renameCollectionIndex,
 		registerIndex,
-		removeIndex conn.Stmt
+		removeIndex driver.Stmt
 	}
 
 	openedCollections map[string]Collection
@@ -134,26 +135,26 @@ type db struct {
 }
 
 func (db *db) init(ctx context.Context) error {
-	return db.doWriteTx(ctx, func(c conn.Conn) (err error) {
-		if _, err = c.ExecContext(ctx, db.sql.InitDB(), nil); err != nil {
+	return db.doWriteTx(ctx, func(c *driver.Conn) (err error) {
+		if err = c.ExecNoResult(ctx, db.sql.InitDB()); err != nil {
 			return
 		}
-		if db.stmt.registerCollection, err = db.sql.RegisterCollectionStmt(ctx, c); err != nil {
+		if db.stmt.registerCollection, err = c.Prepare(db.sql.RegisterCollectionStmt()); err != nil {
 			return
 		}
-		if db.stmt.removeCollection, err = db.sql.RemoveCollectionStmt(ctx, c); err != nil {
+		if db.stmt.removeCollection, err = c.Prepare(db.sql.RemoveCollectionStmt()); err != nil {
 			return
 		}
-		if db.stmt.renameCollection, err = db.sql.RenameCollectionStmt(ctx, c); err != nil {
+		if db.stmt.renameCollection, err = c.Prepare(db.sql.RenameCollectionStmt()); err != nil {
 			return
 		}
-		if db.stmt.renameCollectionIndex, err = db.sql.RenameCollectionIndexStmt(ctx, c); err != nil {
+		if db.stmt.renameCollectionIndex, err = c.Prepare(db.sql.RenameCollectionIndexStmt()); err != nil {
 			return
 		}
-		if db.stmt.registerIndex, err = db.sql.RegisterIndexStmt(ctx, c); err != nil {
+		if db.stmt.registerIndex, err = c.Prepare(db.sql.RegisterIndexStmt()); err != nil {
 			return
 		}
-		if db.stmt.removeIndex, err = db.sql.RemoveIndexStmt(ctx, c); err != nil {
+		if db.stmt.removeIndex, err = c.Prepare(db.sql.RemoveIndexStmt()); err != nil {
 			return
 		}
 		return
@@ -166,8 +167,7 @@ func (db *db) WriteTx(ctx context.Context) (WriteTx, error) {
 		return nil, err
 	}
 
-	dTx, err := connWrite.BeginTx(ctx, driver.TxOptions{})
-	if err != nil {
+	if err = connWrite.Begin(ctx); err != nil {
 		db.cm.ReleaseWrite(connWrite)
 		return nil, err
 	}
@@ -176,7 +176,6 @@ func (db *db) WriteTx(ctx context.Context) (WriteTx, error) {
 	tx.initialCtx = ctx
 	tx.ctx = context.WithValue(ctx, ctxKeyTx, tx)
 	tx.con = connWrite
-	tx.tx = dTx
 	tx.reset()
 	return tx, nil
 }
@@ -187,8 +186,7 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 		return nil, err
 	}
 
-	dTx, err := connRead.BeginTx(ctx, driver.TxOptions{})
-	if err != nil {
+	if err = connRead.Begin(ctx); err != nil {
 		db.cm.ReleaseRead(connRead)
 		return nil, err
 	}
@@ -197,7 +195,6 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 	tx.initialCtx = ctx
 	tx.ctx = context.WithValue(ctx, ctxKeyTx, tx)
 	tx.con = connRead
-	tx.tx = dTx
 	tx.reset()
 	return tx, nil
 }
@@ -212,19 +209,15 @@ func (db *db) createCollection(ctx context.Context, collectionName string) (Coll
 	if _, ok := db.openedCollections[collectionName]; ok {
 		return nil, ErrCollectionExists
 	}
-	err := db.doWriteTx(ctx, func(c conn.Conn) error {
-		_, err := db.stmt.registerCollection.ExecContext(ctx, []driver.NamedValue{
-			{
-				Name:    "collName",
-				Ordinal: 1,
-				Value:   collectionName,
-			},
-		})
+	err := db.doWriteTx(ctx, func(c *driver.Conn) error {
+		err := db.stmt.registerCollection.Exec(ctx, func(stmt *sqlite.Stmt) {
+			stmt.BindText(1, collectionName)
+		}, driver.StmtExecNoResults)
 		if err != nil {
 			return replaceUniqErr(err, ErrCollectionExists)
 		}
 
-		if _, err = c.ExecContext(ctx, db.sql.Collection(collectionName).Create(), nil); err != nil {
+		if err = c.ExecNoResult(ctx, db.sql.Collection(collectionName).Create()); err != nil {
 			return err
 		}
 		return nil
@@ -252,25 +245,19 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 		return coll, nil
 	}
 
-	err := db.doReadTx(ctx, func(c conn.Conn) error {
-		rows, err := c.QueryContext(ctx, db.sql.FindCollection(), []driver.NamedValue{{
-			Name:  "collName",
-			Value: collectionName,
-		}})
-		if err != nil {
-			return err
-		}
-		defer func() {
-			_ = rows.Close()
-		}()
-		rErr := rows.Next([]driver.Value{})
-		if rErr != nil {
-			if rErr == io.EOF {
+	err := db.doReadTx(ctx, func(c *driver.Conn) error {
+		return c.Exec(ctx, db.sql.FindCollection(), func(stmt *sqlite.Stmt) {
+			stmt.BindText(1, collectionName)
+		}, func(stmt *sqlite.Stmt) error {
+			hasRow, stepErr := stmt.Step()
+			if stepErr != nil {
+				return nil
+			}
+			if !hasRow {
 				return ErrCollectionNotFound
 			}
-			return rErr
-		}
-		return nil
+			return nil
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -298,19 +285,20 @@ func (db *db) Collection(ctx context.Context, collectionName string) (Collection
 }
 
 func (db *db) GetCollectionNames(ctx context.Context) (collectionNames []string, err error) {
-	err = db.doReadTx(ctx, func(c conn.Conn) error {
-		rows, err := c.QueryContext(ctx, db.sql.FindCollections(), nil)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			_ = rows.Close()
-		}()
-		collectionNames, err = readRowsString(rows)
-		if err != nil {
-			return err
-		}
-		return nil
+	err = db.doReadTx(ctx, func(c *driver.Conn) error {
+		return c.Exec(ctx, db.sql.FindCollections(), nil, func(stmt *sqlite.Stmt) error {
+			for {
+				hasRow, stepErr := stmt.Step()
+				if stepErr != nil {
+					return stepErr
+				}
+				if !hasRow {
+					break
+				}
+				collectionNames = append(collectionNames, stmt.ColumnText(0))
+			}
+			return nil
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -319,16 +307,20 @@ func (db *db) GetCollectionNames(ctx context.Context) (collectionNames []string,
 }
 
 func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
-	err = db.doReadTx(ctx, func(cn conn.Conn) (txErr error) {
-		var getIntByQuery = func(q string) (int, error) {
-			rows, rErr := cn.QueryContext(ctx, q, nil)
-			if rErr != nil {
-				return 0, rErr
-			}
-			defer func() {
-				_ = rows.Close()
-			}()
-			return readOneInt(rows)
+	err = db.doReadTx(ctx, func(cn *driver.Conn) (txErr error) {
+		var getIntByQuery = func(q string) (result int, err error) {
+			err = cn.Exec(ctx, q, nil, func(stmt *sqlite.Stmt) error {
+				hasRow, stepErr := stmt.Step()
+				if !hasRow {
+					return nil
+				}
+				if stepErr != nil {
+					return stepErr
+				}
+				result = stmt.ColumnInt(0)
+				return nil
+			})
+			return
 		}
 		if stats.CollectionsCount, txErr = getIntByQuery(db.sql.CountCollections()); txErr != nil {
 			return
@@ -366,7 +358,7 @@ func (db *db) getWriteTx(ctx context.Context) (tx WriteTx, err error) {
 	return nil, ErrTxIsReadOnly
 }
 
-func (db *db) doWriteTx(ctx context.Context, do func(c conn.Conn) error) error {
+func (db *db) doWriteTx(ctx context.Context, do func(c *driver.Conn) error) error {
 	tx, err := db.getWriteTx(ctx)
 	if err != nil {
 		return err
@@ -396,7 +388,7 @@ func (db *db) getReadTx(ctx context.Context) (tx ReadTx, err error) {
 	return nil, ErrTxIsReadOnly
 }
 
-func (db *db) doReadTx(ctx context.Context, do func(c conn.Conn) error) error {
+func (db *db) doReadTx(ctx context.Context, do func(c *driver.Conn) error) error {
 	tx, err := db.getReadTx(ctx)
 	if err != nil {
 		return err
@@ -410,9 +402,9 @@ func (db *db) doReadTx(ctx context.Context, do func(c conn.Conn) error) error {
 
 func (db *db) Close() error {
 	if !db.closed.CompareAndSwap(false, true) {
-		return conn.ErrDBIsClosed
+		return driver.ErrDBIsClosed
 	}
-	for _, stmt := range []conn.Stmt{
+	for _, stmt := range []driver.Stmt{
 		db.stmt.registerCollection,
 		db.stmt.removeCollection,
 		db.stmt.renameCollection,

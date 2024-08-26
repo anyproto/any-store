@@ -25,9 +25,9 @@ func (r *FilterRegistry) Release(id int) {
 }
 
 // Filter could be called only between Register and Release calls, so it's safe to use concurrently
-func (r *FilterRegistry) Filter(id int, data string) bool {
+func (r *FilterRegistry) Filter(id int, data []byte) bool {
 	id -= 1
-	v, err := r.registry.entries[id].buf.Parser.Parse(data)
+	v, err := r.registry.entries[id].buf.Parser.ParseBytes(data)
 	if err != nil {
 		return false
 	}
@@ -50,9 +50,9 @@ func (r *SortRegistry) Release(id int) {
 	r.registry.Release(id)
 }
 
-func (r *SortRegistry) Sort(id int, data string) []byte {
+func (r *SortRegistry) Sort(id int, data []byte) []byte {
 	id -= 1
-	v, err := r.registry.entries[id].buf.Parser.Parse(data)
+	v, err := r.registry.entries[id].buf.Parser.ParseBytes(data)
 	if err != nil {
 		return nil
 	}

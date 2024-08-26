@@ -2,7 +2,6 @@ package anystore
 
 import (
 	"bytes"
-	"database/sql/driver"
 	"strconv"
 	"sync"
 
@@ -30,7 +29,7 @@ type queryBuilder struct {
 	filterId  int
 	sortId    int
 	buf       *bytes.Buffer
-	values    []driver.NamedValue
+	values    [][]byte
 	limit     int
 	offset    int
 }
@@ -89,10 +88,7 @@ func (qb *queryBuilder) build(count bool) string {
 		qb.buf.WriteString(":")
 		qb.buf.WriteString(fieldName)
 
-		qb.values = append(qb.values, driver.NamedValue{
-			Name:  fieldName,
-			Value: val,
-		})
+		qb.values = append(qb.values, val)
 	}
 
 	var writeTableVal = func(tableName string, fieldNum int) {
