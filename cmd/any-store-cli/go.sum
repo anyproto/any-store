@@ -10,6 +10,8 @@ github.com/anyproto/any-store v0.0.2-0.20240826161736-55fc7c70c217 h1:8AZmG/aWvj
 github.com/anyproto/any-store v0.0.2-0.20240826161736-55fc7c70c217/go.mod h1:MA3sSqRXIp0h9bC2LnMuDGVEFGB3BkI/UuWNCleGHMs=
 github.com/anyproto/any-store v0.0.2-0.20240826180443-deed36f3a4ff h1:aICeXtLlVSD0j1Uv3M/aY/yYW7lM/bfMEpp/JsU6apY=
 github.com/anyproto/any-store v0.0.2-0.20240826180443-deed36f3a4ff/go.mod h1:MA3sSqRXIp0h9bC2LnMuDGVEFGB3BkI/UuWNCleGHMs=
+github.com/anyproto/any-store v0.0.2-0.20240827143846-cfd3a41da753 h1:3dGf+48SEFjaunNPshc34marnrqrpUtxBHYrBmIwNc4=
+github.com/anyproto/any-store v0.0.2-0.20240827143846-cfd3a41da753/go.mod h1:MA3sSqRXIp0h9bC2LnMuDGVEFGB3BkI/UuWNCleGHMs=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
