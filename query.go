@@ -15,6 +15,8 @@ import (
 	"github.com/anyproto/any-store/query"
 )
 
+const maxIndexesInQuery = 2
+
 // ModifyResult represents the result of a modification operation.
 type ModifyResult struct {
 	// Matched is the number of documents matched by the query.
@@ -35,6 +37,9 @@ type Query interface {
 
 	// Sort sets the sort order for the query results.
 	Sort(sort ...any) Query
+
+	// IndexHint adds or removes boost for some indexes
+	IndexHint(hints ...IndexHint) Query
 
 	// Iter executes the query and returns an Iterator for the results.
 	Iter(ctx context.Context) (Iterator, error)
@@ -64,6 +69,11 @@ type IndexExplain struct {
 	Used   bool
 }
 
+type IndexHint struct {
+	IndexName string
+	Boost     int
+}
+
 type collQuery struct {
 	c *collection
 
@@ -75,6 +85,7 @@ type collQuery struct {
 	indexesWithWeight weightedIndexes
 	sortFields        []query.SortField
 	queryFields       []queryField
+	indexHints        []IndexHint
 
 	err error
 }
@@ -99,6 +110,11 @@ func (q *collQuery) Limit(limit uint) Query {
 
 func (q *collQuery) Offset(offset uint) Query {
 	q.offset = offset
+	return q
+}
+
+func (q *collQuery) IndexHint(hints ...IndexHint) Query {
+	q.indexHints = hints
 	return q
 }
 
@@ -402,6 +418,11 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 			q.indexesWithWeight[i].sortFieldsBits = sf
 			q.indexesWithWeight[i].exactSort = sf.CountLeadingOnes() == len(q.sortFields)
 		}
+		for _, hint := range q.indexHints {
+			if hint.IndexName == idx.info.Name {
+				q.indexesWithWeight[i].weight += hint.Boost
+			}
+		}
 	}
 	sort.Sort(q.indexesWithWeight)
 
@@ -426,6 +447,10 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 				exactSortIdx = len(filteredIndexes) - 1
 			}
 		}
+	}
+
+	if len(filteredIndexes) > maxIndexesInQuery {
+		filteredIndexes = filteredIndexes[:maxIndexesInQuery]
 	}
 
 	for i, idx := range filteredIndexes {
