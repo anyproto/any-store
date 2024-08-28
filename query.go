@@ -450,7 +450,11 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 	}
 
 	if len(filteredIndexes) > maxIndexesInQuery {
-		filteredIndexes = filteredIndexes[:maxIndexesInQuery]
+		if exactSortFound {
+			filteredIndexes = filteredIndexes[:exactSortIdx+1]
+		} else {
+			filteredIndexes = filteredIndexes[:maxIndexesInQuery]
+		}
 	}
 
 	for i, idx := range filteredIndexes {
