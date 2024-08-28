@@ -32,6 +32,11 @@ Query.prototype.sort = function (limit) {
     return this
 }
 
+Query.prototype.hint = function (hint) {
+    this.query.hint = hint;
+    return this
+}
+
 Query.prototype.count = function () {
     this.query.count = true;
     var res = JSON.stringify(this);
