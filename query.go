@@ -437,6 +437,9 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 		exactSortIdx    int
 	)
 	for i, idx := range q.indexesWithWeight {
+		if idx.weight < 1 {
+			continue
+		}
 		if usedFieldsBits.Subtract(idx.queryFieldsBits).Count() != 0 ||
 			usedSortBits.Subtract(idx.sortFieldsBits).Count() != 0 ||
 			(!exactSortFound && idx.exactSort) {
