@@ -418,9 +418,11 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 			q.indexesWithWeight[i].sortFieldsBits = sf
 			q.indexesWithWeight[i].exactSort = sf.CountLeadingOnes() == len(q.sortFields)
 		}
-		for _, hint := range q.indexHints {
-			if hint.IndexName == idx.info.Name {
-				q.indexesWithWeight[i].weight += hint.Boost
+		if q.indexesWithWeight[i].weight > 0 {
+			for _, hint := range q.indexHints {
+				if hint.IndexName == idx.info.Name {
+					q.indexesWithWeight[i].weight += hint.Boost
+				}
 			}
 		}
 	}
