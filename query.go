@@ -15,7 +15,7 @@ import (
 	"github.com/anyproto/any-store/query"
 )
 
-const maxIndexesInQuery = 2
+const maxIndexesInQuery = 1
 
 // ModifyResult represents the result of a modification operation.
 type ModifyResult struct {
