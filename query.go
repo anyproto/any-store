@@ -2,18 +2,20 @@ package anystore
 
 import (
 	"context"
-	"database/sql/driver"
 	"errors"
 	"slices"
 	"sort"
 
 	"github.com/valyala/fastjson"
+	"zombiezen.com/go/sqlite"
 
 	"github.com/anyproto/any-store/internal/bitmap"
-	"github.com/anyproto/any-store/internal/conn"
+	"github.com/anyproto/any-store/internal/driver"
 
 	"github.com/anyproto/any-store/query"
 )
+
+const maxIndexesInQuery = 1
 
 // ModifyResult represents the result of a modification operation.
 type ModifyResult struct {
@@ -35,6 +37,9 @@ type Query interface {
 
 	// Sort sets the sort order for the query results.
 	Sort(sort ...any) Query
+
+	// IndexHint adds or removes boost for some indexes
+	IndexHint(hints ...IndexHint) Query
 
 	// Iter executes the query and returns an Iterator for the results.
 	Iter(ctx context.Context) (Iterator, error)
@@ -64,6 +69,11 @@ type IndexExplain struct {
 	Used   bool
 }
 
+type IndexHint struct {
+	IndexName string
+	Boost     int
+}
+
 type collQuery struct {
 	c *collection
 
@@ -75,6 +85,7 @@ type collQuery struct {
 	indexesWithWeight weightedIndexes
 	sortFields        []query.SortField
 	queryFields       []queryField
+	indexHints        []IndexHint
 
 	err error
 }
@@ -102,6 +113,11 @@ func (q *collQuery) Offset(offset uint) Query {
 	return q
 }
 
+func (q *collQuery) IndexHint(hints ...IndexHint) Query {
+	q.indexHints = hints
+	return q
+}
+
 func (q *collQuery) Sort(sorts ...any) Query {
 	var err error
 	if q.sort, err = query.ParseSort(sorts...); err != nil {
@@ -120,17 +136,19 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	if err != nil {
 		return
 	}
-	rows, err := tx.conn().QueryContext(ctx, sqlRes, qb.values)
+	stmt, err := tx.conn().Query(ctx, sqlRes)
+	for i, val := range qb.values {
+		stmt.BindBytes(i+1, val)
+	}
 	if err != nil {
 		return
 	}
-	return q.newIterator(rows, tx, qb), nil
+	return q.newIterator(stmt, tx, qb), nil
 }
 
-func (q *collQuery) newIterator(rows driver.Rows, tx ReadTx, qb *queryBuilder) *iterator {
+func (q *collQuery) newIterator(stmt *sqlite.Stmt, tx ReadTx, qb *queryBuilder) *iterator {
 	return &iterator{
-		rows: rows,
-		dest: make([]driver.Value, 1),
+		stmt: stmt,
 		buf:  q.c.db.syncPool.GetDocBuf(),
 		tx:   tx,
 		qb:   qb,
@@ -166,12 +184,15 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		return
 	}
 
-	rows, err := tx.conn().QueryContext(ctx, sqlRes, qb.values)
+	stmt, err := tx.conn().Query(ctx, sqlRes)
 	if err != nil {
 		qb.Close()
 		return
 	}
-	iter := q.newIterator(rows, tx, qb)
+	for i, val := range qb.values {
+		stmt.BindBytes(i+1, val)
+	}
+	iter := q.newIterator(stmt, tx, qb)
 	defer func() {
 		_ = iter.Close()
 	}()
@@ -237,12 +258,15 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 		return
 	}
 
-	rows, err := tx.conn().QueryContext(ctx, sqlRes, qb.values)
+	stmt, err := tx.conn().Query(ctx, sqlRes)
 	if err != nil {
 		qb.Close()
 		return
 	}
-	iter := q.newIterator(rows, tx, qb)
+	for i, val := range qb.values {
+		stmt.BindBytes(i+1, val)
+	}
+	iter := q.newIterator(stmt, tx, qb)
 	defer func() {
 		_ = iter.Close()
 	}()
@@ -273,15 +297,22 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	}
 	defer qb.Close()
 	sqlRes := qb.build(true)
-	err = q.c.db.doReadTx(ctx, func(cn conn.Conn) (txErr error) {
-		rows, txErr := cn.QueryContext(ctx, sqlRes, qb.values)
-		if txErr != nil {
-			return txErr
-		}
-		defer func() {
-			_ = rows.Close()
-		}()
-		count, txErr = readOneInt(rows)
+	err = q.c.db.doReadTx(ctx, func(cn *driver.Conn) (txErr error) {
+		txErr = cn.ExecCached(ctx, sqlRes, func(stmt *sqlite.Stmt) {
+			for i, val := range qb.values {
+				stmt.BindBytes(i+1, val)
+			}
+		}, func(stmt *sqlite.Stmt) error {
+			hasRow, stepErr := stmt.Step()
+			if stepErr != nil {
+				return stepErr
+			}
+			if !hasRow {
+				return nil
+			}
+			count = stmt.ColumnInt(0)
+			return nil
+		})
 		return
 	})
 	return
@@ -295,15 +326,17 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	defer qb.Close()
 
 	explain.Sql = qb.build(false)
-	err = q.c.db.doReadTx(ctx, func(cn conn.Conn) (txErr error) {
-		rows, txErr := cn.QueryContext(ctx, "EXPLAIN QUERY PLAN "+explain.Sql, qb.values)
-		if txErr != nil {
-			return txErr
-		}
-		defer func() {
-			_ = rows.Close()
-		}()
-		explain.SqliteExplain, txErr = scanExplainRows(rows)
+	err = q.c.db.doReadTx(ctx, func(cn *driver.Conn) (txErr error) {
+		txErr = cn.Exec(ctx, "EXPLAIN QUERY PLAN "+explain.Sql, func(stmt *sqlite.Stmt) {
+			for i, val := range qb.values {
+				stmt.BindBytes(i+1, val)
+			}
+		}, func(stmt *sqlite.Stmt) error {
+			if explain.SqliteExplain, txErr = scanExplainStmt(stmt); txErr != nil {
+				return txErr
+			}
+			return nil
+		})
 		return
 	})
 	for _, idx := range q.indexesWithWeight {
@@ -385,6 +418,13 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 			q.indexesWithWeight[i].sortFieldsBits = sf
 			q.indexesWithWeight[i].exactSort = sf.CountLeadingOnes() == len(q.sortFields)
 		}
+		if q.indexesWithWeight[i].weight > 0 {
+			for _, hint := range q.indexHints {
+				if hint.IndexName == idx.info.Name {
+					q.indexesWithWeight[i].weight += hint.Boost
+				}
+			}
+		}
 	}
 	sort.Sort(q.indexesWithWeight)
 
@@ -397,6 +437,9 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 		exactSortIdx    int
 	)
 	for i, idx := range q.indexesWithWeight {
+		if idx.weight < 1 {
+			continue
+		}
 		if usedFieldsBits.Subtract(idx.queryFieldsBits).Count() != 0 ||
 			usedSortBits.Subtract(idx.sortFieldsBits).Count() != 0 ||
 			(!exactSortFound && idx.exactSort) {
@@ -408,6 +451,14 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 				exactSortFound = true
 				exactSortIdx = len(filteredIndexes) - 1
 			}
+		}
+	}
+
+	if len(filteredIndexes) > maxIndexesInQuery {
+		if exactSortFound {
+			filteredIndexes = filteredIndexes[:exactSortIdx+1]
+		} else {
+			filteredIndexes = filteredIndexes[:maxIndexesInQuery]
 		}
 	}
 
@@ -520,7 +571,7 @@ func (q *collQuery) indexSortWeight(idx *index) (weight int, fieldBits bitmap.Bi
 		if isChain && i < len(idx.fieldNames) {
 			if idx.fieldNames[i] == sf.Field {
 				if i == 0 {
-					weight = 10
+					weight = 11
 				} else {
 					weight *= 2
 					if idx.reverse[i] == sf.Reverse {

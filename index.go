@@ -3,15 +3,15 @@ package anystore
 import (
 	"bytes"
 	"context"
-	"database/sql/driver"
 	"fmt"
 	"slices"
 	"strings"
 	"sync/atomic"
 
 	"github.com/valyala/fastjson"
+	"zombiezen.com/go/sqlite"
 
-	"github.com/anyproto/any-store/internal/conn"
+	"github.com/anyproto/any-store/internal/driver"
 	"github.com/anyproto/any-store/internal/key"
 	"github.com/anyproto/any-store/internal/sql"
 )
@@ -64,21 +64,21 @@ type index struct {
 	fieldPaths [][]string
 	reverse    []bool
 
-	keyBuf          key.Key
-	keysBuf         []key.Key
-	keysBufPrev     []key.Key
-	uniqBuf         [][]key.Key
-	jvalsBuf        []*fastjson.Value
-	driverValuesBuf []driver.NamedValue
+	keyBuf      key.Key
+	keysBuf     []key.Key
+	keysBufPrev []key.Key
+	uniqBuf     [][]key.Key
+	jvalsBuf    []*fastjson.Value
 
 	stmts struct {
 		insert,
-		delete conn.Stmt
+		delete driver.Stmt
 	}
 	queries struct {
 		count string
 	}
-	stmtsReady atomic.Bool
+	stmtsReady      atomic.Bool
+	driverValuesBuf [][]byte
 }
 
 func validateIndexField(s string) (err error) {
@@ -111,12 +111,7 @@ func (idx *index) init(ctx context.Context) (err error) {
 		idx.reverse = append(idx.reverse, reverse)
 	}
 	idx.uniqBuf = make([][]key.Key, len(idx.fieldPaths))
-	idx.driverValuesBuf = []driver.NamedValue{
-		{Name: "docId"},
-	}
-	for i := 0; i < len(idx.fieldNames); i++ {
-		idx.driverValuesBuf = append(idx.driverValuesBuf, driver.NamedValue{Name: fmt.Sprintf("val%d", i)})
-	}
+	idx.driverValuesBuf = make([][]byte, 0, len(idx.fieldNames))
 	idx.sql = idx.c.sql.Index(idx.info.Name)
 	idx.makeQueries()
 	return nil
@@ -127,12 +122,12 @@ func (idx *index) makeQueries() {
 	idx.queries.count = fmt.Sprintf("SELECT COUNT(*) FROM '%s'", tableName)
 }
 
-func (idx *index) checkStmts(ctx context.Context, cn conn.Conn) (err error) {
+func (idx *index) checkStmts(ctx context.Context, cn *driver.Conn) (err error) {
 	if idx.stmtsReady.CompareAndSwap(false, true) {
-		if idx.stmts.insert, err = idx.sql.InsertStmt(ctx, cn, len(idx.fieldNames)); err != nil {
+		if idx.stmts.insert, err = cn.Prepare(idx.sql.InsertStmt(len(idx.fieldNames))); err != nil {
 			return err
 		}
-		if idx.stmts.delete, err = idx.sql.DeleteStmt(ctx, cn, len(idx.fieldNames)); err != nil {
+		if idx.stmts.delete, err = cn.Prepare(idx.sql.DeleteStmt(len(idx.fieldNames))); err != nil {
 			return err
 		}
 	}
@@ -144,34 +139,38 @@ func (idx *index) Info() IndexInfo {
 }
 
 func (idx *index) Len(ctx context.Context) (count int, err error) {
-	err = idx.c.db.doReadTx(ctx, func(cn conn.Conn) error {
-		rows, err := cn.QueryContext(ctx, idx.queries.count, nil)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			_ = rows.Close()
-		}()
-		count, err = readOneInt(rows)
+	err = idx.c.db.doReadTx(ctx, func(cn *driver.Conn) error {
+		err = cn.ExecCached(ctx, idx.queries.count, nil, func(stmt *sqlite.Stmt) error {
+			hasRow, stepErr := stmt.Step()
+			if stepErr != nil {
+				return stepErr
+			}
+			if !hasRow {
+				return nil
+			}
+			count = stmt.ColumnInt(0)
+			return nil
+		})
 		return err
 	})
 	return
 }
 
-func (idx *index) Drop(ctx context.Context, cn conn.Conn) (err error) {
-	if _, err = cn.ExecContext(ctx, idx.sql.Drop(), nil); err != nil {
+func (idx *index) Drop(ctx context.Context, cn *driver.Conn) (err error) {
+	if err = cn.ExecNoResult(ctx, idx.sql.Drop()); err != nil {
 		return
 	}
-	if _, err = idx.c.db.stmt.removeIndex.ExecContext(ctx, []driver.NamedValue{
-		{Name: "indexName", Value: idx.info.Name}, {Name: "collName", Value: idx.c.name},
-	}); err != nil {
+	if err = idx.c.db.stmt.removeIndex.Exec(ctx, func(stmt *sqlite.Stmt) {
+		stmt.SetText(":indexName", idx.info.Name)
+		stmt.SetText(":collName", idx.c.name)
+	}, driver.StmtExecNoResults); err != nil {
 		return
 	}
 	return
 }
 
-func (idx *index) RenameColl(ctx context.Context, cn conn.Conn, name string) (err error) {
-	if _, err = cn.ExecContext(ctx, idx.sql.RenameColl(name), nil); err != nil {
+func (idx *index) RenameColl(ctx context.Context, cn *driver.Conn, name string) (err error) {
+	if err = cn.ExecNoResult(ctx, idx.sql.RenameColl(name)); err != nil {
 		return err
 	}
 	idx.sql = idx.c.sql.Index(idx.info.Name)
@@ -285,7 +284,15 @@ func (idx *index) isUnique(i int, k key.Key) bool {
 
 func (idx *index) insertBuf(ctx context.Context, id []byte) (err error) {
 	for _, k := range idx.keysBuf {
-		_, err = idx.stmts.insert.ExecContext(ctx, idx.driverValues(id, k))
+		err = idx.stmts.insert.Exec(ctx, func(stmt *sqlite.Stmt) {
+			stmt.BindBytes(1, id)
+			var i = 2
+			_ = k.ReadByteValues(func(b []byte) error {
+				stmt.BindBytes(i, b)
+				i++
+				return nil
+			})
+		}, driver.StmtExecNoResults)
 		if err != nil {
 			return replaceUniqErr(err, ErrUniqueConstraint)
 		}
@@ -295,7 +302,15 @@ func (idx *index) insertBuf(ctx context.Context, id []byte) (err error) {
 
 func (idx *index) deleteBuf(ctx context.Context, id []byte, buf []key.Key) (err error) {
 	for _, k := range buf {
-		_, err = idx.stmts.delete.ExecContext(ctx, idx.driverValues(id, k))
+		err = idx.stmts.delete.Exec(ctx, func(stmt *sqlite.Stmt) {
+			stmt.BindBytes(1, id)
+			var i = 2
+			_ = k.ReadByteValues(func(b []byte) error {
+				stmt.BindBytes(i, b)
+				i++
+				return nil
+			})
+		}, driver.StmtExecNoResults)
 		if err != nil {
 			return
 		}
@@ -303,20 +318,9 @@ func (idx *index) deleteBuf(ctx context.Context, id []byte, buf []key.Key) (err 
 	return
 }
 
-func (idx *index) driverValues(docId, val key.Key) []driver.NamedValue {
-	idx.driverValuesBuf[0].Value = []byte(docId)
-	var i = 1
-	_ = val.ReadByteValues(func(b []byte) error {
-		idx.driverValuesBuf[i].Value = b
-		i++
-		return nil
-	})
-	return idx.driverValuesBuf
-}
-
 func (idx *index) closeStmts() {
 	if idx.stmtsReady.CompareAndSwap(true, false) {
-		for _, stmt := range []conn.Stmt{
+		for _, stmt := range []driver.Stmt{
 			idx.stmts.insert, idx.stmts.delete,
 		} {
 			_ = stmt.Close()

@@ -308,6 +308,16 @@ func (c *Conn) Find(cmd Cmd) (result string, err error) {
 	if cmd.Query.Offset > 0 {
 		q.Offset(uint(cmd.Query.Offset))
 	}
+	if cmd.Query.Hint != nil {
+		hints := []anystore.IndexHint{}
+		for idxName, boost := range cmd.Query.Hint {
+			hints = append(hints, anystore.IndexHint{
+				IndexName: idxName,
+				Boost:     boost,
+			})
+		}
+		q.IndexHint(hints...)
+	}
 
 	if cmd.Query.Count {
 		count, cErr := q.Count(mainCtx.Ctx())

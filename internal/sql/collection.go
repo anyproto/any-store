@@ -1,10 +1,7 @@
 package sql
 
 import (
-	"context"
 	"strings"
-
-	"github.com/anyproto/any-store/internal/conn"
 )
 
 type CollectionSql struct {
@@ -39,20 +36,20 @@ func (s CollectionSql) Rename(newName string) string {
 	return s.With2Coll(`ALTER TABLE '%ns_%coll_docs' RENAME TO '%ns_%2coll_docs';`, newName)
 }
 
-func (s CollectionSql) DeleteStmt(ctx context.Context, c conn.Conn) (conn.Stmt, error) {
-	return s.Prepare(ctx, c, s.WithColl(`DELETE FROM '%ns_%coll_docs' WHERE id = :id`))
+func (s CollectionSql) DeleteStmt() string {
+	return s.WithColl(`DELETE FROM '%ns_%coll_docs' WHERE id = :id`)
 }
 
-func (s CollectionSql) InsertStmt(ctx context.Context, c conn.Conn) (conn.Stmt, error) {
-	return s.Prepare(ctx, c, s.WithColl(`INSERT INTO '%ns_%coll_docs' (id, data) VALUES (:id, :data)`))
+func (s CollectionSql) InsertStmt() string {
+	return s.WithColl(`INSERT INTO '%ns_%coll_docs' (id, data) VALUES (:id, :data)`)
 }
 
-func (s CollectionSql) UpdateStmt(ctx context.Context, c conn.Conn) (conn.Stmt, error) {
-	return s.Prepare(ctx, c, s.WithColl(`UPDATE '%ns_%coll_docs' SET data = :data WHERE id = :id`))
+func (s CollectionSql) UpdateStmt() string {
+	return s.WithColl(`UPDATE '%ns_%coll_docs' SET data = :data WHERE id = :id`)
 }
 
-func (s CollectionSql) FindIdStmt(ctx context.Context, c conn.Conn) (conn.Stmt, error) {
-	return s.Prepare(ctx, c, s.WithColl(`SELECT data FROM '%ns_%coll_docs' WHERE id = :id`))
+func (s CollectionSql) FindIdStmt() string {
+	return s.WithColl(`SELECT data FROM '%ns_%coll_docs' WHERE id = :id`)
 }
 
 func (s CollectionSql) WithColl(sql string) string {

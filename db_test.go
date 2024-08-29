@@ -63,6 +63,8 @@ func TestDb_OpenCollection(t *testing.T) {
 		coll, err = fx.OpenCollection(ctx, "test")
 		require.NoError(t, err)
 		assert.NotNil(t, coll)
+		indexes := coll.GetIndexes()
+		assert.Len(t, indexes, 1)
 	})
 }
 

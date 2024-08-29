@@ -49,6 +49,7 @@ type Query struct {
 	Delete  bool            `json:"delete"`
 	Explain bool            `json:"explain"`
 	Sort    []string        `json:"sort"`
+	Hint    map[string]int  `json:"hint"`
 }
 
 type Index struct {

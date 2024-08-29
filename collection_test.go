@@ -3,10 +3,12 @@ package anystore
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-store/query"
 )
@@ -340,7 +342,75 @@ func BenchmarkCollection_Insert(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		coll.Insert(ctx, `{"some":"document"}`)
+		require.NoError(b, coll.Insert(ctx, `{"some":"document"}`))
 	}
+}
+
+func BenchmarkCollection_UpdateId(b *testing.B) {
+	fx := newFixture(b)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(b, err)
+
+	require.NoError(b, coll.Insert(ctx, `{"id":1, "v":0}`))
+	mod := query.MustParseModifier(`{"$inc":{"v":1}}`)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_, err = coll.UpdateId(ctx, 1, mod)
+		require.NoError(b, err)
+	}
+}
+
+func BenchmarkCollection_FindId(b *testing.B) {
+	fx := newFixture(b)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(b, err)
+
+	require.NoError(b, coll.Insert(ctx, `{"id":1, "v":0}`))
+
+	b.Run("no parser", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			_, err = coll.FindId(ctx, 1)
+			require.NoError(b, err)
+		}
+	})
+	b.Run("with parser", func(b *testing.B) {
+		p := &fastjson.Parser{}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			_, err = coll.FindIdWithParser(ctx, p, 1)
+			require.NoError(b, err)
+		}
+	})
+}
+
+func BenchmarkCollection_Find(b *testing.B) {
+	fx := newFixture(b)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(b, err)
+	tx, err := coll.WriteTx(ctx)
+	require.NoError(b, err)
+	for i := range 1000 {
+		require.NoError(b, coll.Insert(tx.Context(), fmt.Sprintf(`{"id":%d, "a":%d, "b":%d}`, i, i, rand.Int())))
+	}
+	require.NoError(b, tx.Commit())
+
+	b.Run("count", func(b *testing.B) {
+		for range b.N {
+			b.ReportAllocs()
+			_, _ = coll.Find(nil).Count(ctx)
+		}
+	})
+	b.Run("count by filter", func(b *testing.B) {
+		var f = query.MustParseCondition(`{"a":{"$gt":900}}`)
+		for range b.N {
+			b.ReportAllocs()
+			_, _ = coll.Find(f).Count(ctx)
+		}
+	})
 
 }
