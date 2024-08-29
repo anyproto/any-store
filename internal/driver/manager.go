@@ -31,7 +31,7 @@ func NewConnManager(path string, pragma map[string]string, writeCount, readCount
 	}
 
 	for i := 0; i < writeCount; i++ {
-		conn, err := sqlite.OpenConn(path, sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadWrite)
+		conn, err := sqlite.OpenConn(path, sqlite.OpenCreate|sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadWrite)
 		if err != nil {
 			closeAll()
 			return nil, err
