@@ -1,16 +1,11 @@
 package anystore
 
 import (
-	"net/url"
 	"runtime"
 )
 
 var defaultSQLiteOptions = map[string]string{
-	"_journal_mode": "WAL",
-	"_busy_timeout": "5000",
-	"_synchronous":  "NORMAL",
-	"_cache_size":   "10000000",
-	"_foreign_keys": "true",
+	"cache_size": "100000",
 }
 
 // Config provides the configuration options for the database.
@@ -40,10 +35,15 @@ func (c *Config) setDefaults() {
 	}
 }
 
-func (c *Config) dsn(path string) string {
-	connUrl := url.Values{}
-	for k, v := range c.SQLiteConnectionOptions {
-		connUrl.Add(k, v)
+func (c *Config) pragma() map[string]string {
+	pragma := make(map[string]string)
+	for k, v := range defaultSQLiteOptions {
+		pragma[k] = v
 	}
-	return path + "?" + connUrl.Encode()
+	if c.SQLiteConnectionOptions != nil {
+		for k, v := range c.SQLiteConnectionOptions {
+			pragma[k] = v
+		}
+	}
+	return pragma
 }

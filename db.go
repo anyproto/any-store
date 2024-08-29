@@ -94,6 +94,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	var err error
 	if ds.cm, err = driver.NewConnManager(
 		path,
+		config.pragma(),
 		1,
 		config.ReadConnections,
 		ds.filterReg,

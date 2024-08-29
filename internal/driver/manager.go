@@ -3,8 +3,10 @@ package driver
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
 
 	"github.com/anyproto/any-store/internal/registry"
 )
@@ -14,7 +16,7 @@ var (
 	ErrDBIsNotOpened = errors.New("db is not opened")
 )
 
-func NewConnManager(dsn string, writeCount, readCount int, fr *registry.FilterRegistry, sr *registry.SortRegistry) (*ConnManager, error) {
+func NewConnManager(path string, pragma map[string]string, writeCount, readCount int, fr *registry.FilterRegistry, sr *registry.SortRegistry) (*ConnManager, error) {
 	var (
 		writeConn = make([]*Conn, 0, writeCount)
 		readConn  = make([]*Conn, 0, readCount)
@@ -29,12 +31,12 @@ func NewConnManager(dsn string, writeCount, readCount int, fr *registry.FilterRe
 	}
 
 	for i := 0; i < writeCount; i++ {
-		conn, err := sqlite.OpenConn(dsn)
+		conn, err := sqlite.OpenConn(path, sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadWrite)
 		if err != nil {
 			closeAll()
 			return nil, err
 		}
-		if err = setupConn(fr, sr, conn); err != nil {
+		if err = setupConn(fr, sr, conn, pragma); err != nil {
 			closeAll()
 			return nil, err
 		}
@@ -42,12 +44,12 @@ func NewConnManager(dsn string, writeCount, readCount int, fr *registry.FilterRe
 	}
 
 	for i := 0; i < readCount; i++ {
-		conn, err := sqlite.OpenConn(dsn, sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadOnly)
+		conn, err := sqlite.OpenConn(path, sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadOnly)
 		if err != nil {
 			closeAll()
 			return nil, err
 		}
-		if err = setupConn(fr, sr, conn); err != nil {
+		if err = setupConn(fr, sr, conn, pragma); err != nil {
 			closeAll()
 			return nil, err
 		}
@@ -115,7 +117,7 @@ func (c *ConnManager) ReleaseRead(conn *Conn) {
 	c.readCh <- conn
 }
 
-func setupConn(fr *registry.FilterRegistry, sr *registry.SortRegistry, conn *sqlite.Conn) (err error) {
+func setupConn(fr *registry.FilterRegistry, sr *registry.SortRegistry, conn *sqlite.Conn, pragma map[string]string) (err error) {
 	err = conn.CreateFunction("any_filter", &sqlite.FunctionImpl{
 		NArgs: 2,
 		Scalar: func(ctx sqlite.Context, args []sqlite.Value) (sqlite.Value, error) {
@@ -137,6 +139,14 @@ func setupConn(fr *registry.FilterRegistry, sr *registry.SortRegistry, conn *sql
 		},
 		Deterministic: true,
 	})
+
+	if pragma != nil {
+		for k, v := range pragma {
+			if err = sqlitex.ExecuteTransient(conn, fmt.Sprintf("PRAGMA %s = %s", k, v), nil); err != nil {
+				return
+			}
+		}
+	}
 	return
 }
 
