@@ -168,7 +168,7 @@ func TestCollQuery_Explain(t *testing.T) {
 		assertIndexes(t, coll.Find(`{"a":1, "d":1}`),
 			[]IndexExplain{
 				{"a", 10, true},
-				{"d", 10, true},
+				{"d", 10, false},
 				{"b,a", 1, false},
 				{"b,a,-c", 1, false},
 			},
@@ -237,6 +237,16 @@ func TestCollQuery_Explain(t *testing.T) {
 				{"d", -1, false},
 			},
 		)
+		t.Run("index hint", func(t *testing.T) {
+			assertIndexes(t, coll.Find(`{"a":1}`).Sort("b", "a").IndexHint(IndexHint{IndexName: "b,a,-c", Boost: 10}),
+				[]IndexExplain{
+					{"b,a,-c", 33, true},
+					{"b,a", 23, false},
+					{"a", 10, false},
+					{"d", -1, false},
+				},
+			)
+		})
 	})
 }
 
