@@ -571,7 +571,7 @@ func (q *collQuery) indexSortWeight(idx *index) (weight int, fieldBits bitmap.Bi
 		if isChain && i < len(idx.fieldNames) {
 			if idx.fieldNames[i] == sf.Field {
 				if i == 0 {
-					weight = 10
+					weight = 11
 				} else {
 					weight *= 2
 					if idx.reverse[i] == sf.Reverse {
