@@ -3,7 +3,7 @@ module github.com/anyproto/any-store/cmd/any-store-cli
 go 1.22.1
 
 require (
-	github.com/anyproto/any-store v0.0.2-0.20240828095843-8715e540d1f0
+	github.com/anyproto/any-store v0.0.2-0.20240829132837-f7d9bed0cd8c
 	github.com/fatih/color v1.17.0
 	github.com/peterh/liner v1.2.2
 	github.com/robertkrimen/otto v0.4.0
@@ -27,7 +27,7 @@ require (
 	golang.org/x/text v0.14.0 // indirect
 	gopkg.in/sourcemap.v1 v1.0.5 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	modernc.org/libc v1.59.9 // indirect
+	modernc.org/libc v1.60.0 // indirect
 	modernc.org/mathutil v1.6.0 // indirect
 	modernc.org/memory v1.8.0 // indirect
 	modernc.org/sqlite v1.32.0 // indirect
