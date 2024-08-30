@@ -283,7 +283,7 @@ type modifierAddToSet struct {
 func (m modifierAddToSet) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
 	err = jsonutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
 		if value == nil {
-			return nil, nil
+			value = a.NewArray()
 		}
 		_, err = value.Array()
 		if err != nil {
