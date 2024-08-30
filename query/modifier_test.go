@@ -510,10 +510,16 @@ func TestModifierAddToSet_Modify(t *testing.T) {
 	t.Run("no error", func(t *testing.T) {
 		testModCases(t, []modifierCase{
 			{
+				`{"$addToSet":{"arr": 1}}`,
+				`{}`,
+				`{"arr":[1]}`,
+				true,
+			},
+			{
 				`{"$addToSet":{"arr": [1]}}`,
 				`{}`,
-				`{}`,
-				false,
+				`{"arr":[[1]]}`,
+				true,
 			},
 			{
 				`{"$addToSet":{"arr": [1]}}`,
