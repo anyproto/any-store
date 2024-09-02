@@ -162,7 +162,7 @@ func (db *db) init(ctx context.Context) error {
 	})
 }
 
-func (db *db) WriteTx(ctx context.Context) (WriteTx, error) {
+func (db *db) newWiteTx(ctx context.Context) (WriteTx, error) {
 	connWrite, err := db.cm.GetWrite(ctx)
 	if err != nil {
 		return nil, err
@@ -340,10 +340,10 @@ func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
 	return
 }
 
-func (db *db) getWriteTx(ctx context.Context) (tx WriteTx, err error) {
+func (db *db) WriteTx(ctx context.Context) (tx WriteTx, err error) {
 	ctxTx := ctx.Value(ctxKeyTx)
 	if ctxTx == nil {
-		return db.WriteTx(ctx)
+		return db.newWiteTx(ctx)
 	}
 
 	var ok bool
@@ -360,7 +360,7 @@ func (db *db) getWriteTx(ctx context.Context) (tx WriteTx, err error) {
 }
 
 func (db *db) doWriteTx(ctx context.Context, do func(c *driver.Conn) error) error {
-	tx, err := db.getWriteTx(ctx)
+	tx, err := db.WriteTx(ctx)
 	if err != nil {
 		return err
 	}

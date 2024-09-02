@@ -776,7 +776,7 @@ func (c *collection) closeStmts() {
 }
 
 func (c *collection) WriteTx(ctx context.Context) (WriteTx, error) {
-	return c.db.WriteTx(ctx)
+	return c.db.newWiteTx(ctx)
 }
 
 func (c *collection) ReadTx(ctx context.Context) (ReadTx, error) {

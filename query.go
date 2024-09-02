@@ -166,7 +166,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	}
 	sqlRes := qb.build(false)
 
-	tx, err := q.c.db.getWriteTx(ctx)
+	tx, err := q.c.db.WriteTx(ctx)
 	if err != nil {
 		qb.Close()
 		return
@@ -240,7 +240,7 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	}
 	sqlRes := qb.build(false)
 
-	tx, err := q.c.db.getWriteTx(ctx)
+	tx, err := q.c.db.WriteTx(ctx)
 	if err != nil {
 		qb.Close()
 		return
