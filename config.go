@@ -5,7 +5,8 @@ import (
 )
 
 var defaultSQLiteOptions = map[string]string{
-	"cache_size": "100000",
+	"cache_size":           "100000",
+	"temp_store_directory": "'/data/data/io.anytype.app.debug/files'",
 }
 
 // Config provides the configuration options for the database.
