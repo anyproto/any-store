@@ -9,6 +9,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -101,8 +102,10 @@ func TestDb_Stats(t *testing.T) {
 func TestDb_Close(t *testing.T) {
 	t.Run("race", func(t *testing.T) {
 		fx := newFixture(t)
+
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
+
 		var docs []any
 		for i := range 1000 {
 			docs = append(docs, fastjson.MustParse(fmt.Sprintf(`{"id": %d, "value": %d}`, i, rand.Int())))
@@ -141,11 +144,20 @@ func TestDb_Close(t *testing.T) {
 		}()
 
 		time.Sleep(time.Second / 2)
+
 		require.NoError(t, fx.Close())
+
 		for range len(results) {
 			rErr := <-results
 			if !assert.ErrorIs(t, rErr, driver.ErrDBIsClosed) {
 				t.Logf("%#v", rErr == nil)
+			}
+		}
+		dirEntries, err := os.ReadDir(fx.tmpDir)
+		require.NoError(t, err)
+		for _, dirEntry := range dirEntries {
+			if strings.HasSuffix(dirEntry.Name(), "-wal") {
+				t.Errorf("wal file is not removed after close")
 			}
 		}
 	})

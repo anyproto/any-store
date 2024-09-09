@@ -319,7 +319,7 @@ func (idx *index) deleteBuf(ctx context.Context, id []byte, buf []key.Key) (err 
 }
 
 func (idx *index) closeStmts() {
-	if idx.stmtsReady.CompareAndSwap(true, false) {
+	if idx.stmtsReady.Load() {
 		for _, stmt := range []driver.Stmt{
 			idx.stmts.insert, idx.stmts.delete,
 		} {

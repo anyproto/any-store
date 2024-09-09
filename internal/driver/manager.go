@@ -169,11 +169,8 @@ func (c *ConnManager) Close() (err error) {
 
 	*/
 	close(c.closed)
-	var conn *Conn
-	if err = c.writeConn[0].Close(); err != nil {
-		err = errors.Join(err, err)
-	}
 
+	var conn *Conn
 	for range c.readConn {
 		conn = <-c.readCh
 		if err != nil {
@@ -181,6 +178,10 @@ func (c *ConnManager) Close() (err error) {
 		} else {
 			err = errors.Join(err, conn.Close())
 		}
+	}
+
+	if err = c.writeConn[0].Close(); err != nil {
+		err = errors.Join(err, err)
 	}
 
 	return err

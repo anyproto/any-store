@@ -3,6 +3,7 @@ package anystore
 import (
 	"context"
 	"errors"
+	"log"
 	"sync"
 	"sync/atomic"
 
@@ -428,7 +429,9 @@ func (db *db) Close() error {
 	}
 	db.mu.Unlock()
 	for _, c := range collToClose {
-		_ = c.Close()
+		if cErr := c.Close(); cErr != nil {
+			log.Printf("collection close error: %v", cErr)
+		}
 	}
 	return db.cm.Close()
 }
