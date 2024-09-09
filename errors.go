@@ -4,6 +4,8 @@ import (
 	"errors"
 
 	"zombiezen.com/go/sqlite"
+
+	"github.com/anyproto/any-store/internal/driver"
 )
 
 var (
@@ -42,6 +44,9 @@ var (
 
 	// ErrIterClosed is returned when operations are attempted on a closed iterator.
 	ErrIterClosed = errors.New("any-store: iterator is closed")
+
+	ErrDBIsClosed    = driver.ErrDBIsClosed
+	ErrDBIsNotOpened = driver.ErrDBIsNotOpened
 )
 
 func replaceUniqErr(err, replaceTo error) error {
@@ -52,6 +57,17 @@ func replaceUniqErr(err, replaceTo error) error {
 	case sqlite.ResultConstraintPrimaryKey,
 		sqlite.ResultConstraintUnique:
 		return replaceTo
+	}
+	return err
+}
+
+func replaceInterruptErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	switch sqlite.ErrCode(err) {
+	case sqlite.ResultInterrupt:
+		return ErrDBIsClosed
 	}
 	return err
 }

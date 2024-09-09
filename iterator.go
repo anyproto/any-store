@@ -55,6 +55,7 @@ func (i *iterator) Next() bool {
 	}
 	hasRow, stepErr := i.stmt.Step()
 	if stepErr != nil {
+		stepErr = replaceInterruptErr(stepErr)
 		i.err = stepErr
 		return false
 	}

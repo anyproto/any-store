@@ -12,8 +12,8 @@ import (
 )
 
 var (
-	ErrDBIsClosed    = errors.New("db is closed")
-	ErrDBIsNotOpened = errors.New("db is not opened")
+	ErrDBIsClosed    = errors.New("any-store: db is closed")
+	ErrDBIsNotOpened = errors.New("any-store: db is not opened")
 )
 
 func NewConnManager(path string, pragma map[string]string, writeCount, readCount int, fr *registry.FilterRegistry, sr *registry.SortRegistry) (*ConnManager, error) {
@@ -59,6 +59,7 @@ func NewConnManager(path string, pragma map[string]string, writeCount, readCount
 	cm := &ConnManager{
 		readCh:    make(chan *Conn, len(readConn)),
 		writeCh:   make(chan *Conn, len(writeConn)),
+		closed:    make(chan struct{}),
 		readConn:  readConn,
 		writeConn: writeConn,
 	}
@@ -151,15 +152,37 @@ func setupConn(fr *registry.FilterRegistry, sr *registry.SortRegistry, conn *sql
 }
 
 func (c *ConnManager) Close() (err error) {
-	for _, conn := range c.readConn {
-		if cErr := conn.Close(); cErr != nil {
-			err = errors.Join(err, cErr)
+	/*
+
+		Can't interrupt connections yet because there is a race in sqlite driver
+		Also trying to close active connections causes some panics in the driver
+
+		var closedChan = make(chan struct{})
+		close(closedChan)
+
+		for _, conn := range c.readConn {
+			conn.conn.SetInterrupt(closedChan)
+		}
+		for _, conn := range c.writeConn {
+			conn.conn.SetInterrupt(closedChan)
+		}
+
+	*/
+	close(c.closed)
+
+	var conn *Conn
+	for range c.readConn {
+		conn = <-c.readCh
+		if err != nil {
+			err = errors.Join(err, err)
+		} else {
+			err = errors.Join(err, conn.Close())
 		}
 	}
-	for _, conn := range c.writeConn {
-		if cErr := conn.Close(); cErr != nil {
-			err = errors.Join(err, cErr)
-		}
+
+	if err = c.writeConn[0].Close(); err != nil {
+		err = errors.Join(err, err)
 	}
+
 	return err
 }

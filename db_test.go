@@ -2,14 +2,22 @@ package anystore
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"math/rand"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/valyala/fastjson"
+
+	"github.com/anyproto/any-store/internal/driver"
 )
 
 func init() {
@@ -91,6 +99,71 @@ func TestDb_Stats(t *testing.T) {
 	assert.NotEmpty(t, stats.DataSizeBytes)
 }
 
+func TestDb_Close(t *testing.T) {
+	t.Run("race", func(t *testing.T) {
+		fx := newFixture(t)
+
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+
+		var docs []any
+		for i := range 1000 {
+			docs = append(docs, fastjson.MustParse(fmt.Sprintf(`{"id": %d, "value": %d}`, i, rand.Int())))
+		}
+		require.NoError(t, coll.Insert(ctx, docs...))
+		var results = make(chan error, 2)
+		go func() {
+			// writing
+			for {
+				if _, pErr := coll.UpsertOne(ctx, fmt.Sprintf(`{"id": %d, "value": %d}`, rand.Int(), rand.Int())); pErr != nil {
+					results <- pErr
+					return
+				}
+			}
+		}()
+
+		go func() {
+			// iterating
+			for {
+				iter, pErr := coll.Find(nil).Iter(ctx)
+				if pErr != nil {
+					results <- pErr
+					return
+				}
+				for iter.Next() {
+					if _, pErr = iter.Doc(); pErr != nil {
+						results <- pErr
+						return
+					}
+				}
+				if pErr = iter.Close(); pErr != nil {
+					results <- pErr
+					return
+				}
+			}
+		}()
+
+		time.Sleep(time.Second / 2)
+
+		require.NoError(t, fx.Close())
+
+		for range len(results) {
+			rErr := <-results
+			if !assert.ErrorIs(t, rErr, driver.ErrDBIsClosed) {
+				t.Logf("%#v", rErr == nil)
+			}
+		}
+		dirEntries, err := os.ReadDir(fx.tmpDir)
+		require.NoError(t, err)
+		for _, dirEntry := range dirEntries {
+			if strings.HasSuffix(dirEntry.Name(), "-wal") {
+				t.Errorf("wal file is not removed after close")
+			}
+		}
+	})
+
+}
+
 func newFixture(t testing.TB, c ...*Config) *fixture {
 	tmpDir, err := os.MkdirTemp("", "any-store-*")
 	require.NoError(t, err)
@@ -119,7 +192,10 @@ type fixture struct {
 }
 
 func (fx *fixture) finish() {
-	require.NoError(fx.t, fx.Close())
+	closeErr := fx.Close()
+	if !errors.Is(closeErr, ErrDBIsClosed) {
+		require.NoError(fx.t, closeErr)
+	}
 	if fx.tmpDir != "" {
 		if true {
 			_ = os.RemoveAll(fx.tmpDir)

@@ -8,18 +8,32 @@ import (
 )
 
 type Stmt struct {
-	conn *sqlite.Conn
+	conn *Conn
 	stmt *sqlite.Stmt
 }
 
 func (s Stmt) Exec(ctx context.Context, bind func(stmt *sqlite.Stmt), result func(stmt *sqlite.Stmt) error) (err error) {
 	defer func() {
-		err = errors.Join(err, s.stmt.Reset())
-		err = errors.Join(err, s.stmt.ClearBindings())
+		if s.conn.IsClosed() {
+			err = errors.Join(err, ErrDBIsClosed)
+			return
+		}
+		if rErr := s.stmt.ClearBindings(); rErr != nil {
+			if err == nil {
+				err = rErr
+			}
+			return
+		}
+		if rErr := s.stmt.Reset(); rErr != nil {
+			if err == nil {
+				err = rErr
+			}
+			return
+		}
 	}()
 	if ctx.Done() != nil {
-		s.conn.SetInterrupt(ctx.Done())
-		defer s.conn.SetInterrupt(nil)
+		s.conn.conn.SetInterrupt(ctx.Done())
+		defer s.conn.conn.SetInterrupt(nil)
 	}
 	if bind != nil {
 		bind(s.stmt)
