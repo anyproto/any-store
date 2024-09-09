@@ -365,6 +365,7 @@ func (db *db) doWriteTx(ctx context.Context, do func(c *driver.Conn) error) erro
 		return err
 	}
 	if err = do(tx.conn()); err != nil {
+		err = replaceInterruptErr(err)
 		return errors.Join(err, tx.Rollback())
 	}
 	return tx.Commit()
@@ -395,6 +396,7 @@ func (db *db) doReadTx(ctx context.Context, do func(c *driver.Conn) error) error
 		return err
 	}
 	if err = do(tx.conn()); err != nil {
+		err = replaceInterruptErr(err)
 		_ = tx.Commit()
 		return err
 	}
@@ -403,7 +405,10 @@ func (db *db) doReadTx(ctx context.Context, do func(c *driver.Conn) error) error
 
 func (db *db) Close() error {
 	if !db.closed.CompareAndSwap(false, true) {
-		return driver.ErrDBIsClosed
+		return ErrDBIsClosed
+	}
+	if _, err := db.cm.GetWrite(context.Background()); err != nil {
+		return err
 	}
 	for _, stmt := range []driver.Stmt{
 		db.stmt.registerCollection,

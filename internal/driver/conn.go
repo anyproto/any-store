@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"sync/atomic"
 
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
@@ -12,6 +13,7 @@ type Conn struct {
 	begin,
 	commit,
 	rollback Stmt
+	isClosed atomic.Bool
 }
 
 func (c *Conn) ExecNoResult(ctx context.Context, query string) (err error) {
@@ -30,7 +32,7 @@ func (c *Conn) Exec(ctx context.Context, query string, bind func(stmt *sqlite.St
 	defer func() {
 		_ = sqliteStmt.Finalize()
 	}()
-	stmt := Stmt{stmt: sqliteStmt, conn: c.conn}
+	stmt := Stmt{stmt: sqliteStmt, conn: c}
 	return stmt.Exec(ctx, bind, result)
 }
 
@@ -39,7 +41,7 @@ func (c *Conn) ExecCached(ctx context.Context, query string, bind func(stmt *sql
 	if err != nil {
 		return
 	}
-	stmt := Stmt{stmt: sqliteStmt, conn: c.conn}
+	stmt := Stmt{stmt: sqliteStmt, conn: c}
 	return stmt.Exec(ctx, bind, result)
 }
 
@@ -57,7 +59,7 @@ func (c *Conn) Prepare(query string) (Stmt, error) {
 	if err != nil {
 		return Stmt{}, err
 	}
-	return Stmt{conn: c.conn, stmt: stmt}, nil
+	return Stmt{conn: c, stmt: stmt}, nil
 }
 
 func (c *Conn) Begin(ctx context.Context) (err error) {
@@ -87,6 +89,13 @@ func (c *Conn) Rollback(ctx context.Context) (err error) {
 	return c.rollback.Exec(ctx, nil, StmtExecNoResults)
 }
 
+func (c *Conn) IsClosed() bool {
+	return c.isClosed.Load()
+}
+
 func (c *Conn) Close() (err error) {
-	return c.conn.Close()
+	if !c.isClosed.Swap(true) {
+		return c.conn.Close()
+	}
+	return nil
 }
