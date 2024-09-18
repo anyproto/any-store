@@ -137,11 +137,11 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		return
 	}
 	stmt, err := tx.conn().Query(ctx, sqlRes)
-	for i, val := range qb.values {
-		stmt.BindBytes(i+1, val)
-	}
 	if err != nil {
 		return
+	}
+	for i, val := range qb.values {
+		stmt.BindBytes(i+1, val)
 	}
 	return q.newIterator(stmt, tx, qb), nil
 }
