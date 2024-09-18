@@ -766,7 +766,7 @@ func (c *collection) Drop(ctx context.Context) error {
 }
 
 func (c *collection) closeStmts() {
-	if c.stmtsReady.Load() {
+	if c.stmtsReady.CompareAndSwap(true, false) {
 		for _, stmt := range []driver.Stmt{
 			c.stmts.insert, c.stmts.update, c.stmts.findId, c.stmts.delete,
 		} {
