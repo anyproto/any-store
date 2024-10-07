@@ -6,11 +6,12 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/valyala/fastjson"
+
+	"github.com/anyproto/any-store/anyenc"
 )
 
 func mustParseItem(t testing.TB, s any) item {
-	it, err := parseItem(&fastjson.Parser{}, &fastjson.Arena{}, s, true)
+	it, err := parseItem(&anyenc.Arena{}, s, true)
 	require.NoError(t, err)
 	return it
 }
@@ -48,20 +49,20 @@ var fillKeysCases = []fillKeysCaseIndex{
 		name: "one field",
 		info: IndexInfo{Fields: []string{"a"}},
 		cases: []fillKeysCase{
-			{`{"a":"b"}`, []string{"b"}},
-			{`{"a":["b","c"]}`, []string{"b", "c", `["b","c"]`}},
-			{`{"a":["a", "a", "b", "c", "b"]}`, []string{"a", "b", "c", `["a","a","b","c","b"]`}},
-			{`{}`, []string{"<nil>"}},
-			{`{"a":null}`, []string{"<nil>"}},
+			{`{"a":"b"}`, []string{`"b"`}},
+			{`{"a":["b","c"]}`, []string{`"b"`, `"c"`, `["b","c"]`}},
+			{`{"a":["a", "a", "b", "c", "b"]}`, []string{`"a"`, `"b"`, `"c"`, `["a","a","b","c","b"]`}},
+			{`{}`, []string{"null"}},
+			{`{"a":null}`, []string{"null"}},
 		},
 	},
 	{
 		name: "one field sparse",
 		info: IndexInfo{Fields: []string{"a"}, Sparse: true},
 		cases: []fillKeysCase{
-			{`{"a":"b"}`, []string{"b"}},
-			{`{"a":["b","c"]}`, []string{"b", "c", `["b","c"]`}},
-			{`{"a":["a", "a", "b", "c", "b"]}`, []string{"a", "b", "c", `["a","a","b","c","b"]`}},
+			{`{"a":"b"}`, []string{`"b"`}},
+			{`{"a":["b","c"]}`, []string{`"b"`, `"c"`, `["b","c"]`}},
+			{`{"a":["a", "a", "b", "c", "b"]}`, []string{`"a"`, `"b"`, `"c"`, `["a","a","b","c","b"]`}},
 			{`{}`, []string{}},
 			{`{"a":null}`, []string{}},
 		},
@@ -70,18 +71,18 @@ var fillKeysCases = []fillKeysCaseIndex{
 		name: "reverse",
 		info: IndexInfo{Fields: []string{"-a"}},
 		cases: []fillKeysCase{
-			{`{"a":"b"}`, []string{"b"}},
-			{`{"a":["b","c"]}`, []string{"b", "c", `["b","c"]`}},
-			{`{"a":["a", "a", "b", "c", "b"]}`, []string{"a", "b", "c", `["a","a","b","c","b"]`}},
+			{`{"a":"b"}`, []string{`"b"`}},
+			{`{"a":["b","c"]}`, []string{`"b"`, `"c"`, `["b","c"]`}},
+			{`{"a":["a", "a", "b", "c", "b"]}`, []string{`"a"`, `"b"`, `"c"`, `["a","a","b","c","b"]`}},
 		},
 	},
 	{
 		name: "two fields",
 		info: IndexInfo{Fields: []string{"a", "b"}},
 		cases: []fillKeysCase{
-			{`{"a":"1"}`, []string{"1/<nil>"}},
-			{`{"a":"1","b":"2"}`, []string{"1/2"}},
-			{`{"a":[1,2],"b":"2"}`, []string{"1/2", "2/2", "[1,2]/2"}},
+			{`{"a":1}`, []string{"1/null"}},
+			{`{"a":1,"b":2}`, []string{"1/2"}},
+			{`{"a":[1,2],"b":2}`, []string{"1/2", "2/2", "[1,2]/2"}},
 			{`{"a":[1,2,1],"b":[2,1,2]}`, []string{
 				"1/2", "1/1", "1/[2,1,2]",
 				"2/2", "2/1", "2/[2,1,2]",
@@ -112,7 +113,7 @@ func TestIndex_fillKeysBuf(t *testing.T) {
 	for _, idxCase := range fillKeysCases[:] {
 		t.Run(idxCase.name, func(t *testing.T) {
 			idx := newIdx(idxCase.info)
-			for _, keyCase := range idxCase.cases {
+			for _, keyCase := range idxCase.cases[:] {
 				idx.fillKeysBuf(mustParseItem(t, keyCase.doc))
 				assertIdxKeyBuf(t, idx, keyCase)
 			}

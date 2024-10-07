@@ -6,9 +6,9 @@ import (
 	"slices"
 	"sort"
 
-	"github.com/valyala/fastjson"
 	"zombiezen.com/go/sqlite"
 
+	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/bitmap"
 	"github.com/anyproto/any-store/internal/driver"
 
@@ -206,7 +206,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 			return
 		}
 		var (
-			modifiedVal *fastjson.Value
+			modifiedVal *anyenc.Value
 			isModified  bool
 		)
 		buf.Arena.Reset()

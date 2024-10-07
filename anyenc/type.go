@@ -1,4 +1,4 @@
-package encoding
+package anyenc
 
 import (
 	"fmt"
@@ -18,15 +18,17 @@ const (
 	TypeTrue   = Type(5)
 	TypeArray  = Type(6)
 	TypeObject = Type(7)
+	TypeBinary = Type(8)
 
 	// inverted types
-	iTypeNull   = Type(14)
-	iTypeNumber = Type(13)
-	iTypeString = Type(12)
-	iTypeFalse  = Type(11)
-	iTypeTrue   = Type(10)
-	iTypeArray  = Type(9)
-	iTypeObject = Type(8)
+	iTypeNull    = Type(108)
+	iTypeNumber  = Type(107)
+	iTypeString  = Type(106)
+	iTypeFalse   = Type(105)
+	iTypeTrue    = Type(104)
+	iTypeArray   = Type(103)
+	iTypeObject  = Type(102)
+	iTypeOBinary = Type(101)
 )
 
 func FastJSONTypeToType(t fastjson.Type) Type {
@@ -47,5 +49,28 @@ func FastJSONTypeToType(t fastjson.Type) Type {
 		return TypeNull
 	default:
 		panic(fmt.Errorf("unexpected fastjson type: %v", t))
+	}
+}
+
+func (t Type) String() string {
+	switch t {
+	case TypeNull:
+		return "null"
+	case TypeNumber:
+		return "number"
+	case TypeString:
+		return "string"
+	case TypeFalse:
+		return "false"
+	case TypeTrue:
+		return "true"
+	case TypeArray:
+		return "array"
+	case TypeObject:
+		return "object"
+	case TypeBinary:
+		return "binary"
+	default:
+		return fmt.Sprintf("unknown type: %d", t)
 	}
 }

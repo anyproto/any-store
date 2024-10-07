@@ -1,6 +1,8 @@
 package anystore
 
-import "github.com/valyala/fastjson"
+import (
+	"github.com/anyproto/any-store/anyenc"
+)
 
 // Doc represents a document in the collection.
 type Doc interface {
@@ -11,5 +13,5 @@ type Doc interface {
 
 	// Value returns the document as a *fastjson.Value.
 	// Important: When used in an iterator, the returned value is valid only until the next call to Next.
-	Value() *fastjson.Value
+	Value() *anyenc.Value
 }

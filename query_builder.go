@@ -106,14 +106,14 @@ func (qb *queryBuilder) build(count bool) string {
 		b := join.bounds[fieldNum][boundNum]
 
 		// fast eq case
-		if b.StartInclude && b.EndInclude && b.Start.Equal(b.End) {
+		if b.StartInclude && b.EndInclude && bytes.Equal(b.Start, b.End) {
 			writeTableVal(join.tableName, fieldNum)
 			qb.buf.WriteString(" = ")
 			writePlaceholder(tableNum, fieldNum, boundNum, false, b.Start)
 			return
 		}
 
-		if !b.Start.Empty() {
+		if len(b.Start) != 0 {
 			writeTableVal(join.tableName, fieldNum)
 			if b.StartInclude {
 				qb.buf.WriteString(" >= ")
@@ -123,8 +123,8 @@ func (qb *queryBuilder) build(count bool) string {
 			writePlaceholder(tableNum, fieldNum, boundNum, false, b.Start)
 			needAnd = true
 		}
-		if !b.End.Empty() {
-			if !b.Start.Empty() {
+		if len(b.End) != 0 {
+			if len(b.Start) != 0 {
 				writeAnd()
 			}
 			writeTableVal(join.tableName, fieldNum)

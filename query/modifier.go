@@ -5,18 +5,17 @@ import (
 	"slices"
 	"strconv"
 
-	"github.com/valyala/fastjson"
-
+	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/jsonutil"
 )
 
 type Modifier interface {
-	Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error)
+	Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error)
 }
 
-type ModifyFunc func(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error)
+type ModifyFunc func(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error)
 
-func (m ModifyFunc) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
+func (m ModifyFunc) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
 	if m == nil {
 		return nil, false, fmt.Errorf("modify func is nil")
 	}
@@ -25,7 +24,7 @@ func (m ModifyFunc) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjs
 
 type ModifierChain []Modifier
 
-func (mRoot ModifierChain) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
+func (mRoot ModifierChain) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
 	result = v
 	var ok bool
 	for _, m := range mRoot {
@@ -42,11 +41,11 @@ func (mRoot ModifierChain) Modify(a *fastjson.Arena, v *fastjson.Value) (result 
 
 type modifierSet struct {
 	fieldPath []string
-	val       *fastjson.Value
+	val       *anyenc.Value
 }
 
-func (m modifierSet) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
-	err = jsonutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+func (m modifierSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
+	err = jsonutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		modified = !jsonutil.Equal(value, m.val)
 		return m.val, nil
 	})
@@ -61,8 +60,8 @@ type modifierUnset struct {
 	fieldPath []string
 }
 
-func (m modifierUnset) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
-	err = jsonutil.Walk(a, v, m.fieldPath, false, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+func (m modifierUnset) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
+	err = jsonutil.Walk(a, v, m.fieldPath, false, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		modified = value != nil
 		return nil, nil
 	})
@@ -78,13 +77,13 @@ type modifierInc struct {
 	val       float64
 }
 
-func (m modifierInc) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
-	err = jsonutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+func (m modifierInc) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
+	err = jsonutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			modified = true
 			return a.NewNumberFloat64(m.val), nil
 		}
-		if value.Type() != fastjson.TypeNumber {
+		if value.Type() != anyenc.TypeNumber {
 			return nil, fmt.Errorf("not numeric value '%s'", value.String())
 		}
 		modified = true
@@ -102,9 +101,9 @@ type modifierRename struct {
 	val       []string
 }
 
-func (m modifierRename) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
-	var oldFieldValue *fastjson.Value
-	err = jsonutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+func (m modifierRename) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
+	var oldFieldValue *anyenc.Value
+	err = jsonutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value != nil {
 			modified = true
 			oldFieldValue = value
@@ -112,7 +111,7 @@ func (m modifierRename) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fa
 		return nil, nil
 	})
 	if modified {
-		err = jsonutil.Walk(a, v, m.val, true, func(prevValue, newFieldValue *fastjson.Value) (res *fastjson.Value, err error) {
+		err = jsonutil.Walk(a, v, m.val, true, func(prevValue, newFieldValue *anyenc.Value) (res *anyenc.Value, err error) {
 			modified = !jsonutil.Equal(newFieldValue, oldFieldValue)
 			return oldFieldValue, nil
 		})
@@ -129,8 +128,8 @@ type modifierPop struct {
 	val       int
 }
 
-func (m modifierPop) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
-	err = jsonutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+func (m modifierPop) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
+	err = jsonutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			return nil, nil
 		}
@@ -159,7 +158,7 @@ func (m modifierPop) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastj
 	return
 }
 
-func (m modifierPop) getResultArray(arrayOfValues []*fastjson.Value) ([]*fastjson.Value, error) {
+func (m modifierPop) getResultArray(arrayOfValues []*anyenc.Value) ([]*anyenc.Value, error) {
 	if m.val == 1 {
 		arrayOfValues = arrayOfValues[:len(arrayOfValues)-1]
 	} else {
@@ -170,11 +169,11 @@ func (m modifierPop) getResultArray(arrayOfValues []*fastjson.Value) ([]*fastjso
 
 type modifierPush struct {
 	fieldPath []string
-	val       *fastjson.Value
+	val       *anyenc.Value
 }
 
-func (m modifierPush) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
-	err = jsonutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+func (m modifierPush) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
+	err = jsonutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			return nil, nil
 		}
@@ -196,11 +195,11 @@ func (m modifierPush) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fast
 type modifierPull struct {
 	fieldPath []string
 	filter    Filter
-	val       *fastjson.Value
+	val       *anyenc.Value
 }
 
-func (m modifierPull) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
-	err = jsonutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+func (m modifierPull) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
+	err = jsonutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			return nil, nil
 		}
@@ -212,11 +211,11 @@ func (m modifierPull) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fast
 			return value, nil
 		}
 		if m.filter != nil {
-			modified = removeElements(arrayOfValues, value, func(value *fastjson.Value) bool {
+			modified = removeElements(arrayOfValues, value, func(value *anyenc.Value) bool {
 				return m.filter.Ok(value)
 			})
 		} else {
-			modified = removeElements(arrayOfValues, value, func(value *fastjson.Value) bool {
+			modified = removeElements(arrayOfValues, value, func(value *anyenc.Value) bool {
 				return jsonutil.Equal(value, m.val)
 			})
 		}
@@ -231,11 +230,11 @@ func (m modifierPull) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fast
 
 type modifierPullAll struct {
 	fieldPath     []string
-	removedValues []*fastjson.Value
+	removedValues []*anyenc.Value
 }
 
-func (m modifierPullAll) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
-	err = jsonutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+func (m modifierPullAll) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
+	err = jsonutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			return nil, nil
 		}
@@ -243,8 +242,8 @@ func (m modifierPullAll) Modify(a *fastjson.Arena, v *fastjson.Value) (result *f
 		if err != nil {
 			return nil, fmt.Errorf("failed to pop item, %w", err)
 		}
-		modified = removeElements(arrayOfValues, value, func(value *fastjson.Value) bool {
-			return slices.ContainsFunc(m.removedValues, func(removedValue *fastjson.Value) bool {
+		modified = removeElements(arrayOfValues, value, func(value *anyenc.Value) bool {
+			return slices.ContainsFunc(m.removedValues, func(removedValue *anyenc.Value) bool {
 				return jsonutil.Equal(value, removedValue)
 			})
 		})
@@ -257,7 +256,7 @@ func (m modifierPullAll) Modify(a *fastjson.Arena, v *fastjson.Value) (result *f
 	return
 }
 
-func removeElements(arrayOfValues []*fastjson.Value, value *fastjson.Value, shouldRemove func(*fastjson.Value) bool) bool {
+func removeElements(arrayOfValues []*anyenc.Value, value *anyenc.Value, shouldRemove func(*anyenc.Value) bool) bool {
 	n := 0
 	var modified bool
 	for _, val := range arrayOfValues {
@@ -277,11 +276,11 @@ func removeElements(arrayOfValues []*fastjson.Value, value *fastjson.Value, shou
 
 type modifierAddToSet struct {
 	fieldPath []string
-	val       *fastjson.Value
+	val       *anyenc.Value
 }
 
-func (m modifierAddToSet) Modify(a *fastjson.Arena, v *fastjson.Value) (result *fastjson.Value, modified bool, err error) {
-	err = jsonutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *fastjson.Value) (res *fastjson.Value, err error) {
+func (m modifierAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
+	err = jsonutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			value = a.NewArray()
 		}
@@ -299,9 +298,9 @@ func (m modifierAddToSet) Modify(a *fastjson.Arena, v *fastjson.Value) (result *
 	return
 }
 
-func (m modifierAddToSet) addElements(value *fastjson.Value, addElem *fastjson.Value) bool {
+func (m modifierAddToSet) addElements(value *anyenc.Value, addElem *anyenc.Value) bool {
 	arrayOfValues := value.GetArray()
-	if slices.ContainsFunc(arrayOfValues, func(val *fastjson.Value) bool {
+	if slices.ContainsFunc(arrayOfValues, func(val *anyenc.Value) bool {
 		return jsonutil.Equal(addElem, val)
 	}) {
 		return false

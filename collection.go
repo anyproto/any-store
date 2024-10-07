@@ -11,9 +11,8 @@ import (
 	"github.com/valyala/fastjson"
 	"zombiezen.com/go/sqlite"
 
-	"github.com/anyproto/any-store/encoding"
+	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/driver"
-	"github.com/anyproto/any-store/internal/key"
 	"github.com/anyproto/any-store/internal/sql"
 	"github.com/anyproto/any-store/internal/syncpool"
 	"github.com/anyproto/any-store/query"
@@ -28,9 +27,9 @@ type Collection interface {
 	// Returns the document or an error if the document is not found.
 	FindId(ctx context.Context, id any) (Doc, error)
 
-	// FindIdWithParser finds a document by its ID. Uses provided fastjson parser.
+	// FindIdWithParser finds a document by its ID. Uses provided anyenc parser.
 	// Returns the document or an error if the document is not found.
-	FindIdWithParser(ctx context.Context, p *fastjson.Parser, id any) (Doc, error)
+	FindIdWithParser(ctx context.Context, p *anyenc.Parser, id any) (Doc, error)
 
 	// Find returns a new Query object with given filter
 	Find(filter any) Query
@@ -207,14 +206,14 @@ func (c *collection) Name() string {
 }
 
 func (c *collection) FindId(ctx context.Context, docId any) (doc Doc, err error) {
-	return c.FindIdWithParser(ctx, &fastjson.Parser{}, docId)
+	return c.FindIdWithParser(ctx, &anyenc.Parser{}, docId)
 }
 
-func (c *collection) FindIdWithParser(ctx context.Context, p *fastjson.Parser, docId any) (doc Doc, err error) {
+func (c *collection) FindIdWithParser(ctx context.Context, p *anyenc.Parser, docId any) (doc Doc, err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
-	buf.SmallBuf = encoding.AppendAnyValue(buf.SmallBuf[:0], docId)
+	buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], docId)
 	err = c.db.doReadTx(ctx, func(cn *driver.Conn) (err error) {
 		err = cn.ExecCached(ctx, c.queries.findId, func(stmt *sqlite.Stmt) {
 			stmt.BindBytes(1, buf.SmallBuf)
@@ -232,7 +231,7 @@ func (c *collection) FindIdWithParser(ctx context.Context, p *fastjson.Parser, d
 		if err != nil {
 			return err
 		}
-		data, err := p.ParseBytes(buf.DocBuf)
+		data, err := p.Parse(buf.DocBuf)
 		doc = item{val: data}
 		return
 	})
@@ -252,14 +251,14 @@ func (c *collection) InsertOne(ctx context.Context, doc any) (id any, err error)
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
-	var idBytes key.Key
+	var idBytes anyenc.Tuple
 	err = c.db.doWriteTx(ctx, func(cn *driver.Conn) (txErr error) {
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
 		var it item
 		buf.Arena.Reset()
-		if it, txErr = parseItem(buf.Parser, buf.Arena, doc, true); txErr != nil {
+		if it, txErr = parseItem(buf.Arena, doc, true); txErr != nil {
 			return txErr
 		}
 		if idBytes, txErr = c.insertItem(ctx, buf, it); txErr != nil {
@@ -270,8 +269,8 @@ func (c *collection) InsertOne(ctx context.Context, doc any) (id any, err error)
 	if err != nil {
 		return nil, replaceUniqErr(err, ErrDocExists)
 	}
-	if err = idBytes.ReadAnyValue(func(v any) error {
-		id = v
+	if err = idBytes.ReadValues(buf.Parser, func(v *anyenc.Value) error {
+		id = v.GoType()
 		return nil
 	}); err != nil {
 		return
@@ -290,7 +289,7 @@ func (c *collection) Insert(ctx context.Context, docs ...any) (err error) {
 		var it item
 		for _, doc := range docs {
 			buf.Arena.Reset()
-			if it, txErr = parseItem(buf.Parser, buf.Arena, doc, true); txErr != nil {
+			if it, txErr = parseItem(buf.Arena, doc, true); txErr != nil {
 				return txErr
 			}
 			if _, txErr = c.insertItem(ctx, buf, it); txErr != nil {
@@ -323,7 +322,7 @@ func (c *collection) UpdateOne(ctx context.Context, doc any) (err error) {
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	var it item
-	if it, err = parseItem(buf.Parser, nil, doc, false); err != nil {
+	if it, err = parseItem(nil, doc, false); err != nil {
 		return
 	}
 
@@ -346,7 +345,7 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
-		buf.SmallBuf = encoding.AppendAnyValue(buf.SmallBuf[:0], id)
+		buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], id)
 		it, txErr := c.loadById(ctx, buf, buf.SmallBuf)
 		if txErr != nil {
 			return
@@ -380,20 +379,20 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
-		buf.SmallBuf = encoding.AppendAnyValue(buf.SmallBuf[:0], id)
+		buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], id)
 		var (
 			isInsert bool
-			modValue *fastjson.Value
+			modValue *anyenc.Value
 			prevItem item
 		)
 		it, loadErr := c.loadById(ctx, buf, buf.SmallBuf)
 		if loadErr != nil {
 			if errors.Is(loadErr, ErrDocNotFound) {
 				// create an object with only id field
-				var idVal *fastjson.Value
+				var idVal *anyenc.Value
 				buf.Arena.Reset()
 				modValue = buf.Arena.NewObject()
-				idVal, _, txErr = encoding.DecodeToJSON(buf.Parser, buf.Arena, buf.SmallBuf)
+				idVal, txErr = buf.Parser.Parse(buf.SmallBuf)
 				if txErr != nil {
 					return txErr
 				}
@@ -452,7 +451,7 @@ func (c *collection) update(ctx context.Context, it, prevIt item) (err error) {
 	return c.indexesHandleUpdate(ctx, buf.SmallBuf, prevIt, it)
 }
 
-func (c *collection) loadById(ctx context.Context, buf *syncpool.DocBuffer, id key.Key) (it item, err error) {
+func (c *collection) loadById(ctx context.Context, buf *syncpool.DocBuffer, id anyenc.Tuple) (it item, err error) {
 	err = c.stmts.findId.Exec(ctx, func(stmt *sqlite.Stmt) {
 		stmt.BindBytes(1, id)
 	}, func(stmt *sqlite.Stmt) error {
@@ -470,7 +469,7 @@ func (c *collection) loadById(ctx context.Context, buf *syncpool.DocBuffer, id k
 		return
 	}
 
-	return parseItem(buf.Parser, nil, buf.DocBuf, false)
+	return parseItem(nil, buf.DocBuf, false)
 }
 
 func (c *collection) UpsertOne(ctx context.Context, doc any) (id any, err error) {
@@ -479,7 +478,7 @@ func (c *collection) UpsertOne(ctx context.Context, doc any) (id any, err error)
 
 	var it item
 	buf.Arena.Reset()
-	if it, err = parseItem(buf.Parser, buf.Arena, doc, true); err != nil {
+	if it, err = parseItem(buf.Arena, doc, true); err != nil {
 		return
 	}
 
@@ -497,8 +496,8 @@ func (c *collection) UpsertOne(ctx context.Context, doc any) (id any, err error)
 		return nil, err
 	}
 
-	if err = key.Key(it.appendId(buf.SmallBuf[:0])).ReadAnyValue(func(v any) error {
-		id = v
+	if err = anyenc.Tuple(it.appendId(buf.SmallBuf[:0])).ReadValues(buf.Parser, func(v *anyenc.Value) error {
+		id = v.GoType()
 		return nil
 	}); err != nil {
 		return
@@ -514,7 +513,7 @@ func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
-		buf.SmallBuf = encoding.AppendAnyValue(buf.SmallBuf[:0], id)
+		buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], id)
 		it, txErr := c.loadById(ctx, buf, buf.SmallBuf)
 		if txErr != nil {
 			return
@@ -586,7 +585,7 @@ func (c *collection) EnsureIndex(ctx context.Context, info ...IndexInfo) (err er
 				}
 				buf.DocBuf = readBytes(stmt, buf.DocBuf)
 				var it item
-				if it, txErr = parseItem(buf.Parser, nil, buf.DocBuf, false); txErr != nil {
+				if it, txErr = parseItem(nil, buf.DocBuf, false); txErr != nil {
 					return txErr
 				}
 				buf.SmallBuf = it.appendId(buf.SmallBuf[:0])
@@ -684,7 +683,7 @@ func (c *collection) GetIndexes() (indexes []Index) {
 	return
 }
 
-func (c *collection) indexesHandleInsert(ctx context.Context, id key.Key, it item) (err error) {
+func (c *collection) indexesHandleInsert(ctx context.Context, id anyenc.Tuple, it item) (err error) {
 	for _, idx := range c.indexes {
 		if err = idx.Insert(ctx, id, it); err != nil {
 			return
@@ -693,7 +692,7 @@ func (c *collection) indexesHandleInsert(ctx context.Context, id key.Key, it ite
 	return
 }
 
-func (c *collection) indexesHandleUpdate(ctx context.Context, id key.Key, prevIt, newIt item) (err error) {
+func (c *collection) indexesHandleUpdate(ctx context.Context, id anyenc.Tuple, prevIt, newIt item) (err error) {
 	for _, idx := range c.indexes {
 		if err = idx.Update(ctx, id, prevIt, newIt); err != nil {
 			return
@@ -702,7 +701,7 @@ func (c *collection) indexesHandleUpdate(ctx context.Context, id key.Key, prevIt
 	return
 }
 
-func (c *collection) indexesHandleDelete(ctx context.Context, id key.Key, prevIt item) (err error) {
+func (c *collection) indexesHandleDelete(ctx context.Context, id anyenc.Tuple, prevIt item) (err error) {
 	for _, idx := range c.indexes {
 		if err = idx.Delete(ctx, id, prevIt); err != nil {
 			return

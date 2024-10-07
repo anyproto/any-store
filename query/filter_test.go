@@ -5,15 +5,14 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/valyala/fastjson"
 
-	"github.com/anyproto/any-store/encoding"
+	"github.com/anyproto/any-store/anyenc"
 )
 
 func TestComp(t *testing.T) {
-	a := &fastjson.Arena{}
+	a := &anyenc.Arena{}
 	t.Run("eq", func(t *testing.T) {
-		cmp := Comp{CompOp: CompOpEq, EqValue: encoding.AppendAnyValue(nil, 1)}
+		cmp := Comp{CompOp: CompOpEq, EqValue: anyenc.AppendAnyValue(nil, 1)}
 		t.Run("true", func(t *testing.T) {
 			assert.True(t, cmp.Ok(a.NewNumberInt(1)))
 		})
@@ -26,69 +25,69 @@ func TestComp(t *testing.T) {
 		t.Run("bounds", func(t *testing.T) {
 			bs := cmp.IndexBounds("", nil)
 			assert.Equal(t, Bound{
-				Start:        encoding.AppendAnyValue(nil, 1),
-				End:          encoding.AppendAnyValue(nil, 1),
+				Start:        anyenc.AppendAnyValue(nil, 1),
+				End:          anyenc.AppendAnyValue(nil, 1),
 				StartInclude: true,
 				EndInclude:   true,
 			}, bs[0])
 		})
 	})
 	t.Run("eq_array", func(t *testing.T) {
-		cmp := Comp{CompOp: CompOpEq, EqValue: encoding.AppendAnyValue(nil, 1)}
+		cmp := Comp{CompOp: CompOpEq, EqValue: anyenc.AppendAnyValue(nil, 1)}
 		t.Run("true", func(t *testing.T) {
-			assert.True(t, cmp.Ok(fastjson.MustParse(`[3,2,1]`)))
-			assert.True(t, cmp.Ok(fastjson.MustParse(`[1]`)))
-			assert.True(t, cmp.Ok(fastjson.MustParse(`[1,2]`)))
+			assert.True(t, cmp.Ok(anyenc.MustParseJson(`[3,2,1]`)))
+			assert.True(t, cmp.Ok(anyenc.MustParseJson(`[1]`)))
+			assert.True(t, cmp.Ok(anyenc.MustParseJson(`[1,2]`)))
 		})
 		t.Run("false", func(t *testing.T) {
-			assert.False(t, cmp.Ok(fastjson.MustParse(`[]`)))
-			assert.False(t, cmp.Ok(fastjson.MustParse(`[0,2,3]`)))
+			assert.False(t, cmp.Ok(anyenc.MustParseJson(`[]`)))
+			assert.False(t, cmp.Ok(anyenc.MustParseJson(`[0,2,3]`)))
 			assert.False(t, cmp.Ok(a.NewNumberInt(-1)))
-			assert.False(t, cmp.Ok(fastjson.MustParse(`["1",2]`)))
+			assert.False(t, cmp.Ok(anyenc.MustParseJson(`["1",2]`)))
 		})
 		t.Run("array-array", func(t *testing.T) {
-			aCmp := Comp{CompOp: CompOpEq, EqValue: encoding.AppendJSONValue(nil, fastjson.MustParse(`[1,2,3]`))}
-			assert.True(t, aCmp.Ok(fastjson.MustParse(`[1,2,3]`)))
-			assert.True(t, aCmp.Ok(fastjson.MustParse(`[[1,2,3], 1]`)))
+			aCmp := Comp{CompOp: CompOpEq, EqValue: anyenc.MustParseJson(`[1,2,3]`).MarshalTo(nil)}
+			assert.True(t, aCmp.Ok(anyenc.MustParseJson(`[1,2,3]`)))
+			assert.True(t, aCmp.Ok(anyenc.MustParseJson(`[[1,2,3], 1]`)))
 		})
 		t.Run("empty array", func(t *testing.T) {
-			aCmp := Comp{CompOp: CompOpEq, EqValue: encoding.AppendJSONValue(nil, fastjson.MustParse(`[]`))}
-			assert.True(t, aCmp.Ok(fastjson.MustParse(`[]`)))
+			aCmp := Comp{CompOp: CompOpEq, EqValue: anyenc.MustParseJson(`[]`).MarshalTo(nil)}
+			assert.True(t, aCmp.Ok(anyenc.MustParseJson(`[]`)))
 		})
 	})
 	t.Run("ne", func(t *testing.T) {
-		cmp := Comp{CompOp: CompOpNe, EqValue: encoding.AppendAnyValue(nil, 1)}
+		cmp := Comp{CompOp: CompOpNe, EqValue: anyenc.AppendAnyValue(nil, 1)}
 		t.Run("true", func(t *testing.T) {
 			assert.True(t, cmp.Ok(a.NewNumberInt(2)))
 			assert.True(t, cmp.Ok(a.NewNumberInt(0)))
 			assert.True(t, cmp.Ok(a.NewNumberInt(-1)))
-			assert.True(t, cmp.Ok(fastjson.MustParse(`[0,2,3]`)))
+			assert.True(t, cmp.Ok(anyenc.MustParseJson(`[0,2,3]`)))
 		})
 		t.Run("false", func(t *testing.T) {
 			assert.False(t, cmp.Ok(a.NewNumberInt(1)))
-			assert.False(t, cmp.Ok(fastjson.MustParse(`[0,1,3]`)))
+			assert.False(t, cmp.Ok(anyenc.MustParseJson(`[0,1,3]`)))
 		})
 		t.Run("array-array", func(t *testing.T) {
-			aCmp := Comp{CompOp: CompOpNe, EqValue: encoding.AppendJSONValue(nil, fastjson.MustParse(`[1,2,3]`))}
-			assert.False(t, aCmp.Ok(fastjson.MustParse(`[1,2,3]`)))
-			assert.False(t, aCmp.Ok(fastjson.MustParse(`[[1,2,3], 1]`)))
-			assert.True(t, aCmp.Ok(fastjson.MustParse(`[1,2]`)))
+			aCmp := Comp{CompOp: CompOpNe, EqValue: anyenc.MustParseJson(`[1,2,3]`).MarshalTo(nil)}
+			assert.False(t, aCmp.Ok(anyenc.MustParseJson(`[1,2,3]`)))
+			assert.False(t, aCmp.Ok(anyenc.MustParseJson(`[[1,2,3], 1]`)))
+			assert.True(t, aCmp.Ok(anyenc.MustParseJson(`[1,2]`)))
 		})
 		t.Run("bounds", func(t *testing.T) {
 			bs := cmp.IndexBounds("", nil)
 			require.Len(t, bs, 2)
 			assert.Equal(t, Bounds{
 				{
-					End: encoding.AppendAnyValue(nil, 1),
+					End: anyenc.AppendAnyValue(nil, 1),
 				},
 				{
-					Start: encoding.AppendAnyValue(nil, 1),
+					Start: anyenc.AppendAnyValue(nil, 1),
 				},
 			}, bs)
 		})
 	})
 	t.Run("gt", func(t *testing.T) {
-		cmp := Comp{CompOp: CompOpGt, EqValue: encoding.AppendAnyValue(nil, 1)}
+		cmp := Comp{CompOp: CompOpGt, EqValue: anyenc.AppendAnyValue(nil, 1)}
 		t.Run("true", func(t *testing.T) {
 			assert.True(t, cmp.Ok(a.NewNumberInt(2)))
 			assert.True(t, cmp.Ok(a.NewNumberInt(3)))
@@ -102,13 +101,13 @@ func TestComp(t *testing.T) {
 			bs := cmp.IndexBounds("", nil)
 			assert.Equal(t, Bounds{
 				{
-					Start: encoding.AppendAnyValue(nil, 1),
+					Start: anyenc.AppendAnyValue(nil, 1),
 				},
 			}, bs)
 		})
 	})
 	t.Run("gte", func(t *testing.T) {
-		cmp := Comp{CompOp: CompOpGte, EqValue: encoding.AppendAnyValue(nil, 1)}
+		cmp := Comp{CompOp: CompOpGte, EqValue: anyenc.AppendAnyValue(nil, 1)}
 		t.Run("true", func(t *testing.T) {
 			assert.True(t, cmp.Ok(a.NewNumberInt(2)))
 			assert.True(t, cmp.Ok(a.NewNumberInt(3)))
@@ -121,14 +120,14 @@ func TestComp(t *testing.T) {
 			bs := cmp.IndexBounds("", nil)
 			assert.Equal(t, Bounds{
 				{
-					Start:        encoding.AppendAnyValue(nil, 1),
+					Start:        anyenc.AppendAnyValue(nil, 1),
 					StartInclude: true,
 				},
 			}, bs)
 		})
 	})
 	t.Run("lt", func(t *testing.T) {
-		cmp := Comp{CompOp: CompOpLt, EqValue: encoding.AppendAnyValue(nil, 1)}
+		cmp := Comp{CompOp: CompOpLt, EqValue: anyenc.AppendAnyValue(nil, 1)}
 		t.Run("true", func(t *testing.T) {
 			assert.True(t, cmp.Ok(a.NewNumberInt(0)))
 			assert.True(t, cmp.Ok(a.NewNumberInt(-1)))
@@ -142,13 +141,13 @@ func TestComp(t *testing.T) {
 			bs := cmp.IndexBounds("", nil)
 			assert.Equal(t, Bounds{
 				{
-					End: encoding.AppendAnyValue(nil, 1),
+					End: anyenc.AppendAnyValue(nil, 1),
 				},
 			}, bs)
 		})
 	})
 	t.Run("lte", func(t *testing.T) {
-		cmp := Comp{CompOp: CompOpLte, EqValue: encoding.AppendAnyValue(nil, 1)}
+		cmp := Comp{CompOp: CompOpLte, EqValue: anyenc.AppendAnyValue(nil, 1)}
 		t.Run("true", func(t *testing.T) {
 			assert.True(t, cmp.Ok(a.NewNumberInt(1)))
 			assert.True(t, cmp.Ok(a.NewNumberInt(0)))
@@ -161,16 +160,11 @@ func TestComp(t *testing.T) {
 			bs := cmp.IndexBounds("", nil)
 			assert.Equal(t, Bounds{
 				{
-					End:        encoding.AppendAnyValue(nil, 1),
+					End:        anyenc.AppendAnyValue(nil, 1),
 					EndInclude: true,
 				},
 			}, bs)
 		})
-	})
-	t.Run("okBytes", func(t *testing.T) {
-		cmp := Comp{CompOp: CompOpEq, EqValue: encoding.AppendAnyValue(nil, 1)}
-		assert.True(t, cmp.OkBytes(encoding.AppendAnyValue(nil, 1)))
-		assert.False(t, cmp.OkBytes(encoding.AppendAnyValue(nil, 2)))
 	})
 }
 
@@ -178,9 +172,9 @@ func TestAnd(t *testing.T) {
 	f, err := ParseCondition(`{"a":1, "b":"2"}`)
 	require.NoError(t, err)
 	t.Run("ok", func(t *testing.T) {
-		assert.True(t, f.Ok(fastjson.MustParse(`{"a":1,"b":"2","c":4}`)))
-		assert.False(t, f.Ok(fastjson.MustParse(`{"a":2,"b":"2","c":4}`)))
-		assert.False(t, f.Ok(fastjson.MustParse(`{"a":1,"b":2,"c":4}`)))
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"a":1,"b":"2","c":4}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"a":2,"b":"2","c":4}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"a":1,"b":2,"c":4}`)))
 	})
 	t.Run("bounds", func(t *testing.T) {
 		bs := f.IndexBounds("a", nil)
@@ -196,9 +190,9 @@ func TestOr(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Run("ok", func(t *testing.T) {
-		assert.True(t, f.Ok(fastjson.MustParse(`{"a":1,"b":"2","c":4}`)))
-		assert.True(t, f.Ok(fastjson.MustParse(`{"a":1,"b":"3","c":4}`)))
-		assert.False(t, f.Ok(fastjson.MustParse(`{"a":12,"b":2,"c":4}`)))
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"a":1,"b":"2","c":4}`)))
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"a":1,"b":"3","c":4}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"a":12,"b":2,"c":4}`)))
 	})
 	t.Run("bounds", func(t *testing.T) {
 		t.Run("no filter", func(t *testing.T) {
@@ -219,9 +213,9 @@ func TestNor(t *testing.T) {
 	f, err := ParseCondition(`{"$nor":[{"a":1},{"b":"2"}]}`)
 	require.NoError(t, err)
 	t.Run("ok", func(t *testing.T) {
-		assert.False(t, f.Ok(fastjson.MustParse(`{"a":1,"b":"2","c":4}`)))
-		assert.False(t, f.Ok(fastjson.MustParse(`{"a":1,"b":"3","c":4}`)))
-		assert.True(t, f.Ok(fastjson.MustParse(`{"a":12,"b":2,"c":4}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"a":1,"b":"2","c":4}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"a":1,"b":"3","c":4}`)))
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"a":12,"b":2,"c":4}`)))
 	})
 	t.Run("bounds", func(t *testing.T) {
 		t.Run("no filter", func(t *testing.T) {
@@ -238,7 +232,7 @@ func TestNor(t *testing.T) {
 	t.Run("with eq", func(t *testing.T) {
 		f, err := ParseCondition(`{"$nor":[{"a":{"$eq": 1}}]}`)
 		require.NoError(t, err)
-		assert.False(t, f.Ok(fastjson.MustParse(`{"a":1,"b":"2","c":4}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"a":1,"b":"2","c":4}`)))
 	})
 }
 
@@ -246,9 +240,9 @@ func TestNot(t *testing.T) {
 	f, err := ParseCondition(`{"a":{"$not":{"$eq":2}}}`)
 	require.NoError(t, err)
 	t.Run("ok", func(t *testing.T) {
-		assert.True(t, f.Ok(fastjson.MustParse(`{"a":1,"b":"2","c":4}`)))
-		assert.True(t, f.Ok(fastjson.MustParse(`{"a":1,"b":"3","c":4}`)))
-		assert.False(t, f.Ok(fastjson.MustParse(`{"a":2,"b":2,"c":4}`)))
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"a":1,"b":"2","c":4}`)))
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"a":1,"b":"3","c":4}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"a":2,"b":2,"c":4}`)))
 	})
 	t.Run("bounds", func(t *testing.T) {
 		bs := f.IndexBounds("a", nil)
@@ -260,8 +254,8 @@ func TestComplex(t *testing.T) {
 	f, err := ParseCondition(`{"a":{"$in":[1,2,3]}, "b":{"$all":[1,2]}, "c": "test"}`)
 	require.NoError(t, err)
 	t.Run("ok", func(t *testing.T) {
-		assert.True(t, f.Ok(fastjson.MustParse(`{"a":2,"b":[3,2,1],"c":"test"}`)))
-		assert.False(t, f.Ok(fastjson.MustParse(`{"a":1,"b":[3,2],"c":"test"}`)))
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"a":2,"b":[3,2,1],"c":"test"}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"a":1,"b":[3,2],"c":"test"}`)))
 	})
 	t.Run("bounds", func(t *testing.T) {
 		bs := f.IndexBounds("a", nil)
@@ -275,14 +269,14 @@ func TestExists(t *testing.T) {
 		t.Run("true", func(t *testing.T) {
 			f, err := ParseCondition(`{"a":{"$exists":true}}`)
 			require.NoError(t, err)
-			assert.True(t, f.Ok(fastjson.MustParse(`{"a":1}`)))
-			assert.False(t, f.Ok(fastjson.MustParse(`{"b":1}`)))
+			assert.True(t, f.Ok(anyenc.MustParseJson(`{"a":1}`)))
+			assert.False(t, f.Ok(anyenc.MustParseJson(`{"b":1}`)))
 		})
 		t.Run("false", func(t *testing.T) {
 			f, err := ParseCondition(`{"a":{"$exists":false}}`)
 			require.NoError(t, err)
-			assert.False(t, f.Ok(fastjson.MustParse(`{"a":1}`)))
-			assert.True(t, f.Ok(fastjson.MustParse(`{"b":1}`)))
+			assert.False(t, f.Ok(anyenc.MustParseJson(`{"a":1}`)))
+			assert.True(t, f.Ok(anyenc.MustParseJson(`{"b":1}`)))
 		})
 	})
 	t.Run("bounds", func(t *testing.T) {
@@ -297,8 +291,8 @@ func TestTypeFilter(t *testing.T) {
 	f, err := ParseCondition(`{"a":{"$type":"number"}}`)
 	require.NoError(t, err)
 	t.Run("ok", func(t *testing.T) {
-		assert.True(t, f.Ok(fastjson.MustParse(`{"a":1}`)))
-		assert.False(t, f.Ok(fastjson.MustParse(`{"a":"1"}`)))
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"a":1}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"a":"1"}`)))
 	})
 	t.Run("bounds", func(t *testing.T) {
 		bs := f.IndexBounds("a", nil)
@@ -310,28 +304,28 @@ func TestRegexp(t *testing.T) {
 	t.Run("ok", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "a"}}`)
 		require.NoError(t, err)
-		assert.True(t, f.Ok(fastjson.MustParse(`{"name": "a"}`)))
-		assert.False(t, f.Ok(fastjson.MustParse(`{"name": "A"}`)))
-		assert.False(t, f.Ok(fastjson.MustParse(`{"name":"b"}`)))
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": "a"}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": "A"}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name":"b"}`)))
 	})
 	t.Run("ok - complex expression", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^(?i)a"}}`)
 		require.NoError(t, err)
-		assert.False(t, f.Ok(fastjson.MustParse(`{"name": "baaa"}`)))
-		assert.True(t, f.Ok(fastjson.MustParse(`{"name": "A"}`)))
-		assert.True(t, f.Ok(fastjson.MustParse(`{"name": "a"}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": "baaa"}`)))
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": "A"}`)))
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": "a"}`)))
 	})
 	t.Run("ok - array", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^(?i)a"}}`)
 		require.NoError(t, err)
-		assert.True(t, f.Ok(fastjson.MustParse(`{"name": ["A", "B", "C"]}`)))
-		assert.False(t, f.Ok(fastjson.MustParse(`{"name": ["baaa"]}`)))
-		assert.True(t, f.Ok(fastjson.MustParse(`{"name": ["baaa", "a"]}`)))
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": ["A", "B", "C"]}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": ["baaa"]}`)))
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": ["baaa", "a"]}`)))
 	})
 	t.Run("ok - number", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^a(?i)"}}`)
 		require.NoError(t, err)
-		assert.False(t, f.Ok(fastjson.MustParse(`{"name":1}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name":1}`)))
 	})
 	t.Run("ok - nil value", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^a(?i)"}}`)
@@ -385,20 +379,20 @@ func TestSize(t *testing.T) {
 	t.Run("ok", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$size": 2}}`)
 		require.NoError(t, err)
-		assert.True(t, f.Ok(fastjson.MustParse(`{"name": [1,2]}`)))
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": [1,2]}`)))
 	})
 	t.Run("value nil", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$size": 2}}`)
 		require.NoError(t, err)
-		assert.False(t, f.Ok(fastjson.MustParse(`{"arr": [1,2]}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"arr": [1,2]}`)))
 	})
 	t.Run("not ok", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$size": 2}}`)
 		require.NoError(t, err)
-		assert.False(t, f.Ok(fastjson.MustParse(`{"name": "a"}`)))
-		assert.False(t, f.Ok(fastjson.MustParse(`{"name": []}`)))
-		assert.False(t, f.Ok(fastjson.MustParse(`{"name": [1]}`)))
-		assert.False(t, f.Ok(fastjson.MustParse(`{"name": [1,2,3]}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": "a"}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": []}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": [1]}`)))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": [1,2,3]}`)))
 	})
 	t.Run("error parsing expression - expected number", func(t *testing.T) {
 		_, err := ParseCondition(`{"name":{"$size": "2"}}`)
@@ -414,7 +408,7 @@ func TestSize(t *testing.T) {
 }
 
 func BenchmarkFilter_Ok(b *testing.B) {
-	doc := fastjson.MustParse(`{"a":2,"b":[3,2,1],"c":"test"}`)
+	doc := anyenc.MustParseJson(`{"a":2,"b":[3,2,1],"c":"test"}`)
 	bench := func(b *testing.B, query string) {
 		f, err := ParseCondition(query)
 		require.NoError(b, err)

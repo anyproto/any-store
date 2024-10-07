@@ -1,25 +1,23 @@
 package query
 
 import (
-	"bytes"
 	"fmt"
 	"strings"
 
-	"github.com/valyala/fastjson"
-
+	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/parser"
 )
 
 var (
-	opBytesSet      = []byte("$set")
-	opBytesUnset    = []byte("$unset")
-	opBytesInc      = []byte("$inc")
-	opBytesRename   = []byte("$rename")
-	opBytesPop      = []byte("$pop")
-	opBytesPush     = []byte("$push")
-	opBytesPull     = []byte("$pull")
-	opBytesPullAll  = []byte("$pullAll")
-	opBytesAddToSet = []byte("$addToSet")
+	opBytesSet      = "$set"
+	opBytesUnset    = "$unset"
+	opBytesInc      = "$inc"
+	opBytesRename   = "$rename"
+	opBytesPop      = "$pop"
+	opBytesPush     = "$push"
+	opBytesPull     = "$pull"
+	opBytesPullAll  = "$pullAll"
+	opBytesAddToSet = "$addToSet"
 )
 
 func MustParseModifier(modifier any) Modifier {
@@ -35,73 +33,73 @@ func ParseModifier(modifier any) (Modifier, error) {
 		return m, nil
 	}
 
-	v, err := parser.AnyToJSON(&fastjson.Parser{}, modifier)
+	v, err := parser.Parse(modifier)
 	if err != nil {
 		return nil, err
 	}
 	return parseModRoot(v)
 }
 
-func parseModRoot(v *fastjson.Value) (m Modifier, err error) {
+func parseModRoot(v *anyenc.Value) (m Modifier, err error) {
 	obj, err := v.Object()
 	if err != nil {
 		return nil, err
 	}
 	root := ModifierChain{}
-	obj.Visit(func(key []byte, v *fastjson.Value) {
+	obj.Visit(func(key string, v *anyenc.Value) {
 		if err != nil {
 			return
 		}
-		switch {
-		case bytes.Equal(key, opBytesSet):
+		switch key {
+		case opBytesSet:
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newSetModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
-		case bytes.Equal(key, opBytesUnset):
+		case opBytesUnset:
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newUnsetModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
-		case bytes.Equal(key, opBytesInc):
+		case opBytesInc:
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newIncModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
-		case bytes.Equal(key, opBytesRename):
+		case opBytesRename:
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newRenameModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
-		case bytes.Equal(key, opBytesPop):
+		case opBytesPop:
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newPopModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
-		case bytes.Equal(key, opBytesPush):
+		case opBytesPush:
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newPushModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
-		case bytes.Equal(key, opBytesPull):
+		case opBytesPull:
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newPullModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
-		case bytes.Equal(key, opBytesPullAll):
+		case opBytesPullAll:
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newPullAllModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
-		case bytes.Equal(key, opBytesAddToSet):
+		case opBytesAddToSet:
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newAddToSetModifier); err != nil {
 				return
@@ -120,17 +118,17 @@ func parseModRoot(v *fastjson.Value) (m Modifier, err error) {
 	return nil, fmt.Errorf("empty modifier")
 }
 
-func parseMod(v *fastjson.Value, create func(key []byte, val *fastjson.Value) (Modifier, error)) (root ModifierChain, err error) {
+func parseMod(v *anyenc.Value, create func(key string, val *anyenc.Value) (Modifier, error)) (root ModifierChain, err error) {
 	obj, err := v.Object()
 	if err != nil {
 		return nil, err
 	}
-	obj.Visit(func(key []byte, v *fastjson.Value) {
+	obj.Visit(func(key string, v *anyenc.Value) {
 		if err != nil {
 			return
 		}
 
-		if bytes.HasPrefix(key, opBytesPrefix) {
+		if strings.HasPrefix(key, opBytesPrefixS) {
 			err = fmt.Errorf("unexpect identifier '%s'", string(key))
 			return
 		}
@@ -143,21 +141,21 @@ func parseMod(v *fastjson.Value, create func(key []byte, val *fastjson.Value) (M
 	return
 }
 
-func newSetModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+func newSetModifier(key string, v *anyenc.Value) (Modifier, error) {
 	return modifierSet{
 		fieldPath: strings.Split(string(key), "."),
 		val:       v,
 	}, nil
 }
 
-func newUnsetModifier(key []byte, _ *fastjson.Value) (Modifier, error) {
+func newUnsetModifier(key string, _ *anyenc.Value) (Modifier, error) {
 	return modifierUnset{
 		fieldPath: strings.Split(string(key), "."),
 	}, nil
 }
 
-func newIncModifier(key []byte, v *fastjson.Value) (Modifier, error) {
-	if v.Type() != fastjson.TypeNumber {
+func newIncModifier(key string, v *anyenc.Value) (Modifier, error) {
+	if v.Type() != anyenc.TypeNumber {
 		return nil, fmt.Errorf("not numeric value for $inc in field '%s'", string(key))
 	}
 	return modifierInc{
@@ -166,7 +164,7 @@ func newIncModifier(key []byte, v *fastjson.Value) (Modifier, error) {
 	}, nil
 }
 
-func newRenameModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+func newRenameModifier(key string, v *anyenc.Value) (Modifier, error) {
 	stringBytes, err := v.StringBytes()
 	if err != nil {
 		return nil, fmt.Errorf("failed to rename field: %w", err)
@@ -177,7 +175,7 @@ func newRenameModifier(key []byte, v *fastjson.Value) (Modifier, error) {
 	}, nil
 }
 
-func newPopModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+func newPopModifier(key string, v *anyenc.Value) (Modifier, error) {
 	value, err := v.Int()
 	if err != nil {
 		return nil, fmt.Errorf("failed to pop item, %w", err)
@@ -191,19 +189,19 @@ func newPopModifier(key []byte, v *fastjson.Value) (Modifier, error) {
 	}, nil
 }
 
-func newPushModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+func newPushModifier(key string, v *anyenc.Value) (Modifier, error) {
 	return modifierPush{
 		fieldPath: strings.Split(string(key), "."),
 		val:       v,
 	}, nil
 }
 
-func newPullModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+func newPullModifier(key string, v *anyenc.Value) (Modifier, error) {
 	var err error
 	pull := modifierPull{
 		fieldPath: strings.Split(string(key), "."),
 	}
-	if v.Type() == fastjson.TypeObject {
+	if v.Type() == anyenc.TypeObject {
 		pull.filter, err = parseCompObj(v)
 		if err == nil {
 			return pull, nil
@@ -213,7 +211,7 @@ func newPullModifier(key []byte, v *fastjson.Value) (Modifier, error) {
 	return pull, nil
 }
 
-func newPullAllModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+func newPullAllModifier(key string, v *anyenc.Value) (Modifier, error) {
 	removedValues, err := v.Array()
 	if err != nil {
 		return nil, fmt.Errorf("failed to pop item, %w", err)
@@ -224,7 +222,7 @@ func newPullAllModifier(key []byte, v *fastjson.Value) (Modifier, error) {
 	}, nil
 }
 
-func newAddToSetModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+func newAddToSetModifier(key string, v *anyenc.Value) (Modifier, error) {
 	return modifierAddToSet{
 		fieldPath: strings.Split(string(key), "."),
 		val:       v,

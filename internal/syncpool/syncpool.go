@@ -1,10 +1,9 @@
 package syncpool
 
 import (
-	"database/sql/driver"
 	"sync"
 
-	"github.com/valyala/fastjson"
+	"github.com/anyproto/any-store/anyenc"
 )
 
 func NewSyncPool() *SyncPool {
@@ -12,12 +11,8 @@ func NewSyncPool() *SyncPool {
 		pool: &sync.Pool{
 			New: func() any {
 				return &DocBuffer{
-					Arena:  &fastjson.Arena{},
-					Parser: &fastjson.Parser{},
-					IdDataValues: []driver.NamedValue{
-						{Name: "id"},
-						{Name: "data"},
-					},
+					Arena:  &anyenc.Arena{},
+					Parser: &anyenc.Parser{},
 				}
 			},
 		},
@@ -29,34 +24,18 @@ type SyncPool struct {
 }
 
 type DocBuffer struct {
-	SmallBuf     []byte
-	DocBuf       []byte
-	Arena        *fastjson.Arena
-	Parser       *fastjson.Parser
-	IdDataValues []driver.NamedValue
-}
-
-func (d *DocBuffer) DriverValues(id, value []byte) []driver.NamedValue {
-	d.IdDataValues[0].Value = id
-	d.IdDataValues[1].Value = value
-	return d.IdDataValues
-}
-
-func (d *DocBuffer) DriverValuesId(id []byte) []driver.NamedValue {
-	d.IdDataValues[0].Value = id
-	return d.IdDataValues[:1]
+	SmallBuf []byte
+	DocBuf   []byte
+	Arena    *anyenc.Arena
+	Parser   *anyenc.Parser
 }
 
 func (sp *SyncPool) GetDocBuf() *DocBuffer {
 	buf := sp.pool.Get().(*DocBuffer)
 	if buf == nil {
 		buf = &DocBuffer{
-			Arena:  &fastjson.Arena{},
-			Parser: &fastjson.Parser{},
-			IdDataValues: []driver.NamedValue{
-				{Name: "id"},
-				{Name: "data"},
-			},
+			Arena:  &anyenc.Arena{},
+			Parser: &anyenc.Parser{},
 		}
 	}
 	return buf

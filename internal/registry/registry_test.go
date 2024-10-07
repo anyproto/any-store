@@ -7,7 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/anyproto/any-store/encoding"
+	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/syncpool"
 	"github.com/anyproto/any-store/query"
 )
@@ -35,11 +35,11 @@ func TestSortRegistry_Sort(t *testing.T) {
 	assert.Equal(t, 2, sr.Register(query.MustParseSort("n1")))
 	assert.Equal(t, 3, sr.Register(query.MustParseSort("n2")))
 
-	assert.Equal(t, encoding.AppendAnyValue(nil, 1), sr.Sort(2, testJson))
+	assert.Equal(t, anyenc.AppendAnyValue(nil, 1), sr.Sort(2, testJson))
 
 	sr.Release(2)
 	assert.Equal(t, 2, sr.Register(query.MustParseSort("n2")))
-	assert.Equal(t, encoding.AppendAnyValue(nil, 2), sr.Sort(2, testJson))
+	assert.Equal(t, anyenc.AppendAnyValue(nil, 2), sr.Sort(2, testJson))
 }
 
 func TestSortRegistryConcurrent(t *testing.T) {
@@ -53,7 +53,7 @@ func TestSortRegistryConcurrent(t *testing.T) {
 			go func(i int) {
 				jsonObj := []byte(fmt.Sprintf(`{"f":%d}`, i))
 				id := sr.Register(query.MustParseSort("f"))
-				assert.Equal(t, encoding.AppendAnyValue(nil, i), sr.Sort(id, jsonObj))
+				assert.Equal(t, anyenc.AppendAnyValue(nil, i), sr.Sort(id, jsonObj))
 				sr.Release(id)
 				wg.Done()
 			}(j*numWorkers + i)

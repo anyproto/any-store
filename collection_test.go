@@ -8,8 +8,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/valyala/fastjson"
 
+	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/query"
 )
 
@@ -378,7 +378,7 @@ func BenchmarkCollection_FindId(b *testing.B) {
 		}
 	})
 	b.Run("with parser", func(b *testing.B) {
-		p := &fastjson.Parser{}
+		p := &anyenc.Parser{}
 		b.ReportAllocs()
 		b.ResetTimer()
 		for range b.N {

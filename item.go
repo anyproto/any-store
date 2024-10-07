@@ -3,19 +3,17 @@ package anystore
 import (
 	"encoding/json"
 
-	"github.com/valyala/fastjson"
-
-	"github.com/anyproto/any-store/encoding"
+	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/objectid"
 	"github.com/anyproto/any-store/internal/parser"
 )
 
 type Item interface {
 	Decode(v any) (err error)
-	Value() *fastjson.Value
+	Value() *anyenc.Value
 }
 
-func newItem(val *fastjson.Value, a *fastjson.Arena, autoId bool) (item, error) {
+func newItem(val *anyenc.Value, a *anyenc.Arena, autoId bool) (item, error) {
 	objVal, err := val.Object()
 	if err != nil {
 		return item{}, err
@@ -35,8 +33,8 @@ func newItem(val *fastjson.Value, a *fastjson.Arena, autoId bool) (item, error) 
 	return it, nil
 }
 
-func parseItem(p *fastjson.Parser, a *fastjson.Arena, doc any, autoId bool) (it item, err error) {
-	docJ, err := parser.AnyToJSON(p, doc)
+func parseItem(a *anyenc.Arena, doc any, autoId bool) (it item, err error) {
+	docJ, err := parser.Parse(doc)
 	if err != nil {
 		return item{}, err
 	}
@@ -44,7 +42,7 @@ func parseItem(p *fastjson.Parser, a *fastjson.Arena, doc any, autoId bool) (it 
 }
 
 type item struct {
-	val *fastjson.Value
+	val *anyenc.Value
 }
 
 func (i item) appendId(b []byte) []byte {
@@ -52,7 +50,7 @@ func (i item) appendId(b []byte) []byte {
 	if idVal == nil {
 		panic("document without id")
 	}
-	return encoding.AppendJSONValue(b, idVal)
+	return idVal.MarshalTo(b)
 }
 
 func (i item) Decode(v any) (err error) {
@@ -60,6 +58,6 @@ func (i item) Decode(v any) (err error) {
 	return json.Unmarshal(bytes, v)
 }
 
-func (i item) Value() *fastjson.Value {
+func (i item) Value() *anyenc.Value {
 	return i.val
 }

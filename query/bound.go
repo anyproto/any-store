@@ -7,18 +7,18 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/anyproto/any-store/internal/key"
+	"github.com/anyproto/any-store/anyenc"
 )
 
 type Bound struct {
-	Start, End   key.Key
+	Start, End   anyenc.Tuple
+	prefix       anyenc.Tuple
 	StartInclude bool
 	EndInclude   bool
-	prefix       key.Key
 }
 
 func (b Bound) String() string {
-	stripPrefixString := func(k key.Key) string {
+	stripPrefixString := func(k anyenc.Tuple) string {
 		if len(b.prefix) != 0 && len(k) > len(b.prefix) {
 			return k[len(b.prefix):].String()
 		}
@@ -129,7 +129,7 @@ func (bs Bounds) Reverse() {
 	}
 }
 
-func (bs Bounds) SetPrefix(k key.Key) {
+func (bs Bounds) SetPrefix(k anyenc.Tuple) {
 	var prefix = k.Copy()
 	for i, b := range bs {
 		if len(b.Start) != 0 {

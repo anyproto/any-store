@@ -1,4 +1,4 @@
-package encoding
+package anyenc
 
 import (
 	"encoding/binary"

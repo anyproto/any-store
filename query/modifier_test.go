@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fastjson"
 
+	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/parser"
 )
 
@@ -24,11 +25,10 @@ type modifierCaseError struct {
 }
 
 func testModCases(t *testing.T, cases ...modifierCase) {
-	a := &fastjson.Arena{}
-	p := &fastjson.Parser{}
+	a := &anyenc.Arena{}
 	for _, c := range cases {
 		mod := MustParseModifier(c.mod)
-		d, err := parser.AnyToJSON(p, c.doc)
+		d, err := parser.Parse(c.doc)
 		require.NoError(t, err)
 		res, modified, err := mod.Modify(a, d)
 		require.NoError(t, err)
@@ -38,15 +38,14 @@ func testModCases(t *testing.T, cases ...modifierCase) {
 }
 
 func testModCasesErr(t *testing.T, cases ...modifierCaseError) {
-	a := &fastjson.Arena{}
-	p := &fastjson.Parser{}
+	a := &anyenc.Arena{}
 	for _, c := range cases {
 		mod, err := ParseModifier(c.mod)
 		if err != nil {
 			assert.EqualError(t, err, c.err, err)
 			continue
 		}
-		d, err := parser.AnyToJSON(p, c.doc)
+		d, err := parser.Parse(c.doc)
 		require.NoError(t, err)
 		md, modified, err := mod.Modify(a, d)
 		if !assert.Error(t, err) {
@@ -555,9 +554,8 @@ func TestModifierAddToSet_Modify(t *testing.T) {
 func BenchmarkModifier(b *testing.B) {
 	bench := func(b *testing.B, query string) {
 		doc := fastjson.MustParse(`{"a":2,"b":[3,2,1],"c":"test"}`)
-		a := &fastjson.Arena{}
-		p := &fastjson.Parser{}
-		d, err := parser.AnyToJSON(p, doc)
+		a := &anyenc.Arena{}
+		d, err := parser.Parse(doc)
 		modifier, err := ParseModifier(query)
 		require.NoError(b, err)
 		b.ReportAllocs()

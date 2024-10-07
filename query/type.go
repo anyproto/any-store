@@ -1,19 +1,19 @@
 package query
 
 import (
-	"github.com/anyproto/any-store/encoding"
+	"github.com/anyproto/any-store/anyenc"
 )
 
-type Type encoding.Type
+type Type anyenc.Type
 
 const (
-	TypeNull   = Type(encoding.TypeNull)
-	TypeNumber = Type(encoding.TypeNumber)
-	TypeString = Type(encoding.TypeString)
-	TypeFalse  = Type(encoding.TypeFalse)
-	TypeTrue   = Type(encoding.TypeTrue)
-	TypeArray  = Type(encoding.TypeArray)
-	TypeObject = Type(encoding.TypeObject)
+	TypeNull   = Type(anyenc.TypeNull)
+	TypeNumber = Type(anyenc.TypeNumber)
+	TypeString = Type(anyenc.TypeString)
+	TypeFalse  = Type(anyenc.TypeFalse)
+	TypeTrue   = Type(anyenc.TypeTrue)
+	TypeArray  = Type(anyenc.TypeArray)
+	TypeObject = Type(anyenc.TypeObject)
 )
 
 var stringToType = map[string]Type{}
