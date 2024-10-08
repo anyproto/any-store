@@ -3,7 +3,6 @@ package query
 import (
 	"bytes"
 	"fmt"
-	"slices"
 	"sort"
 	"strings"
 
@@ -109,42 +108,6 @@ func (bs Bounds) Merge() Bounds {
 		return nbs.Merge()
 	} else {
 		return bs
-	}
-}
-
-func (bs Bounds) Reverse() {
-	slices.Reverse(bs)
-	for i, b := range bs {
-		if b.EndInclude {
-			// add the extra byte to have the correct position on badger.Seek with reverse iteration
-			b.End = append(b.End, 255)
-		}
-		bs[i] = Bound{
-			Start:        b.End,
-			End:          b.Start,
-			StartInclude: b.EndInclude,
-			EndInclude:   b.StartInclude,
-			prefix:       b.prefix,
-		}
-	}
-}
-
-func (bs Bounds) SetPrefix(k anyenc.Tuple) {
-	var prefix = k.Copy()
-	for i, b := range bs {
-		if len(b.Start) != 0 {
-			bs[i].Start = append(k.Copy(), b.Start...)
-		} else if i == 0 {
-			bs[i].Start = prefix
-			bs[i].StartInclude = true
-		}
-		if len(b.End) != 0 {
-			bs[i].End = append(k.Copy(), b.End...)
-		} else if i == len(bs)-1 {
-			bs[i].End = append(prefix, 255)
-			bs[i].EndInclude = true
-		}
-		bs[i].prefix = prefix
 	}
 }
 

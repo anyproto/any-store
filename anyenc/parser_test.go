@@ -1,6 +1,7 @@
 package anyenc
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -36,6 +37,17 @@ func TestEncodeDecode(t *testing.T) {
 		assert.Equal(t, js, res)
 		t.Logf("type: %s; json len: %d; anyenc len: %d", decVal.Type(), len(js), len(buf))
 	}
+}
+
+func TestBinary(t *testing.T) {
+	a := &Arena{}
+	p := &Parser{}
+	payload := []byte{1, 2, 3}
+	bin := a.NewBinary(payload)
+	buf := bin.MarshalTo(nil)
+	val, err := p.Parse(buf)
+	require.NoError(t, err)
+	assert.True(t, bytes.Equal(payload, val.GetBytes()))
 }
 
 func BenchmarkParser_Parse(b *testing.B) {

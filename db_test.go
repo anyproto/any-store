@@ -15,8 +15,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/valyala/fastjson"
 
+	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/driver"
 )
 
@@ -106,16 +106,16 @@ func TestDb_Close(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
 
-		var docs []any
+		var docs []*anyenc.Value
 		for i := range 1000 {
-			docs = append(docs, fastjson.MustParse(fmt.Sprintf(`{"id": %d, "value": %d}`, i, rand.Int())))
+			docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id": %d, "value": %d}`, i, rand.Int())))
 		}
 		require.NoError(t, coll.Insert(ctx, docs...))
 		var results = make(chan error, 2)
 		go func() {
 			// writing
 			for {
-				if _, pErr := coll.UpsertOne(ctx, fmt.Sprintf(`{"id": %d, "value": %d}`, rand.Int(), rand.Int())); pErr != nil {
+				if _, pErr := coll.UpsertOne(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id": %d, "value": %d}`, rand.Int(), rand.Int()))); pErr != nil {
 					results <- pErr
 					return
 				}

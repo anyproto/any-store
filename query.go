@@ -221,7 +221,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		}
 
 		var it item
-		if it, err = newItem(modifiedVal, nil, false); err != nil {
+		if it, err = newItem(modifiedVal); err != nil {
 			return
 		}
 		if err = q.c.update(tx.Context(), it, doc.(item)); err != nil {

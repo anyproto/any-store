@@ -36,16 +36,16 @@ type Collection interface {
 
 	// InsertOne inserts a single document into the collection.
 	// Returns the ID of the inserted document or an error if the insertion fails.
-	InsertOne(ctx context.Context, doc any) (id any, err error)
+	InsertOne(ctx context.Context, doc *anyenc.Value) (id any, err error)
 
 	// Insert inserts multiple documents into the collection.
 	// Returns an error if the insertion fails.
-	Insert(ctx context.Context, docs ...any) (err error)
+	Insert(ctx context.Context, docs ...*anyenc.Value) (err error)
 
 	// UpdateOne updates a single document in the collection.
 	// Provided document must contain an id field
 	// Returns an error if the update fails.
-	UpdateOne(ctx context.Context, doc any) (err error)
+	UpdateOne(ctx context.Context, doc *anyenc.Value) (err error)
 
 	// UpdateId updates a single document in the collection with provided modifier
 	// Returns a modify result or error.
@@ -53,7 +53,7 @@ type Collection interface {
 
 	// UpsertOne inserts a document if it does not exist, or updates it if it does.
 	// Returns the ID of the upserted document or an error if the operation fails.
-	UpsertOne(ctx context.Context, doc any) (id any, err error)
+	UpsertOne(ctx context.Context, doc *anyenc.Value) (id any, err error)
 
 	// UpsertId updates a single document or creates new one
 	// Returns a modify result or error.
@@ -247,7 +247,7 @@ func (c *collection) Find(filter any) Query {
 	}
 }
 
-func (c *collection) InsertOne(ctx context.Context, doc any) (id any, err error) {
+func (c *collection) InsertOne(ctx context.Context, doc *anyenc.Value) (id any, err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
@@ -258,7 +258,7 @@ func (c *collection) InsertOne(ctx context.Context, doc any) (id any, err error)
 		}
 		var it item
 		buf.Arena.Reset()
-		if it, txErr = parseItem(buf.Arena, doc, true); txErr != nil {
+		if it, txErr = newItem(doc); txErr != nil {
 			return txErr
 		}
 		if idBytes, txErr = c.insertItem(ctx, buf, it); txErr != nil {
@@ -278,7 +278,7 @@ func (c *collection) InsertOne(ctx context.Context, doc any) (id any, err error)
 	return id, nil
 }
 
-func (c *collection) Insert(ctx context.Context, docs ...any) (err error) {
+func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
@@ -289,7 +289,7 @@ func (c *collection) Insert(ctx context.Context, docs ...any) (err error) {
 		var it item
 		for _, doc := range docs {
 			buf.Arena.Reset()
-			if it, txErr = parseItem(buf.Arena, doc, true); txErr != nil {
+			if it, txErr = newItem(doc); txErr != nil {
 				return txErr
 			}
 			if _, txErr = c.insertItem(ctx, buf, it); txErr != nil {
@@ -317,12 +317,12 @@ func (c *collection) insertItem(ctx context.Context, buf *syncpool.DocBuffer, it
 	return
 }
 
-func (c *collection) UpdateOne(ctx context.Context, doc any) (err error) {
+func (c *collection) UpdateOne(ctx context.Context, doc *anyenc.Value) (err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	var it item
-	if it, err = parseItem(nil, doc, false); err != nil {
+	if it, err = newItem(doc); err != nil {
 		return
 	}
 
@@ -468,17 +468,19 @@ func (c *collection) loadById(ctx context.Context, buf *syncpool.DocBuffer, id a
 	if err != nil {
 		return
 	}
-
-	return parseItem(nil, buf.DocBuf, false)
+	doc, err := buf.Parser.Parse(buf.DocBuf)
+	if err != nil {
+		return
+	}
+	return newItem(doc)
 }
 
-func (c *collection) UpsertOne(ctx context.Context, doc any) (id any, err error) {
+func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (id any, err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	var it item
-	buf.Arena.Reset()
-	if it, err = parseItem(buf.Arena, doc, true); err != nil {
+	if it, err = newItem(doc); err != nil {
 		return
 	}
 
@@ -585,7 +587,11 @@ func (c *collection) EnsureIndex(ctx context.Context, info ...IndexInfo) (err er
 				}
 				buf.DocBuf = readBytes(stmt, buf.DocBuf)
 				var it item
-				if it, txErr = parseItem(nil, buf.DocBuf, false); txErr != nil {
+				var doc *anyenc.Value
+				if doc, txErr = buf.Parser.Parse(buf.DocBuf); txErr != nil {
+					return txErr
+				}
+				if it, txErr = newItem(doc); txErr != nil {
 					return txErr
 				}
 				buf.SmallBuf = it.appendId(buf.SmallBuf[:0])

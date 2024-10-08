@@ -71,7 +71,7 @@ func (i *iterator) Doc() (Doc, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newItem(val, nil, false)
+	return newItem(val)
 }
 
 func (i *iterator) Err() error {

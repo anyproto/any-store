@@ -6,13 +6,21 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/anyproto/any-store/anyenc"
 )
 
 func TestCollQuery_Count(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.Insert(ctx, `{"a":1}`, `{"a":2}`, `{"a":3}`, `{"a":4}`, `{"a":5}`))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1, "a":1}`),
+		anyenc.MustParseJson(`{"id":2, "a":2}`),
+		anyenc.MustParseJson(`{"id":3, "a":3}`),
+		anyenc.MustParseJson(`{"id":4, "a":4}`),
+		anyenc.MustParseJson(`{"id":5, "a":5}`),
+	))
 
 	t.Run("no filter", func(t *testing.T) {
 		assertQueryCount(t, coll.Find(nil), 5)
@@ -51,7 +59,13 @@ func TestCollQuery_Explain(t *testing.T) {
 	t.Run("no index", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
-		require.NoError(t, coll.Insert(ctx, `{"id":1,"a":"a1"}`, `{"id":2, "a":"a2"}`, `{"id":3, "a":"a3"}`, `{"id":4, "a":"a4"}`, `{"id":5, "a":"a5"}`))
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(`{"id":1, "a":"a1"}`),
+			anyenc.MustParseJson(`{"id":2, "a":"a2"}`),
+			anyenc.MustParseJson(`{"id":3, "a":"a3"}`),
+			anyenc.MustParseJson(`{"id":4, "a":"a4"}`),
+			anyenc.MustParseJson(`{"id":5, "a":"a5"}`),
+		))
 
 		assertExplain(t, coll.Find(nil),
 			"SELECT data FROM '_test_docs'",
@@ -105,7 +119,13 @@ func TestCollQuery_Explain(t *testing.T) {
 	t.Run("simple index", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "test_s")
 		require.NoError(t, err)
-		require.NoError(t, coll.Insert(ctx, `{"id":1, "a":"a1", "b":"b1"}`, `{"id":2, "a":"a2"}`, `{"id":3, "a":"a3"}`, `{"id":4, "a":"a4"}`, `{"id":5, "a":"a5"}`))
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(`{"id":1, "a":"a1", "b":"b1"}`),
+			anyenc.MustParseJson(`{"id":2, "a":"a2"}`),
+			anyenc.MustParseJson(`{"id":3, "a":"a3"}`),
+			anyenc.MustParseJson(`{"id":4, "a":"a4"}`),
+			anyenc.MustParseJson(`{"id":5, "a":"a5"}`),
+		))
 		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
 
 		assertExplain(t, coll.Find(nil),
@@ -152,7 +172,13 @@ func TestCollQuery_Explain(t *testing.T) {
 	t.Run("many indexes", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "test_m")
 		require.NoError(t, err)
-		require.NoError(t, coll.Insert(ctx, `{"id":1, "a":"a1", "b":"b1", "c":"c1"}`, `{"id":2, "a":"a2", "c":"c2"}`, `{"id":3, "a":"a3", "c":"c3"}`, `{"id":4, "a":"a4", "c":"c4"}`, `{"id":5, "a":"a5", "c": "c5"}`))
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(`{"id":1, "a":"a1", "b":"b1", "c":"c1"}`),
+			anyenc.MustParseJson(`{"id":2, "a":"a2", "c":"c2"}`),
+			anyenc.MustParseJson(`{"id":3, "a":"a3", "c":"c3"}`),
+			anyenc.MustParseJson(`{"id":4, "a":"a4", "c":"c4"}`),
+			anyenc.MustParseJson(`{"id":5, "a":"a5", "c": "c5"}`),
+		))
 		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
 		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"d"}}))
 		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"b", "a"}}))
@@ -260,7 +286,12 @@ func TestCollQuery_Update(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	require.NoError(t, coll.Insert(ctx, `{"id":1,"a":1}`, `{"id":2,"a":1}`, `{"id":3,"a":1}`, `{"id":4,"a":1}`))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":1}`),
+		anyenc.MustParseJson(`{"id":2,"a":1}`),
+		anyenc.MustParseJson(`{"id":3,"a":1}`),
+		anyenc.MustParseJson(`{"id":4,"a":1}`),
+	))
 
 	assertQueryCount(t, coll.Find(`{"a":1}`), 4)
 
@@ -277,7 +308,12 @@ func TestCollQuery_Delete(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
 
-	require.NoError(t, coll.Insert(ctx, `{"id":1,"a":1}`, `{"id":2,"a":1}`, `{"id":3,"a":1}`, `{"id":4,"a":1}`))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":1}`),
+		anyenc.MustParseJson(`{"id":2,"a":1}`),
+		anyenc.MustParseJson(`{"id":3,"a":1}`),
+		anyenc.MustParseJson(`{"id":4,"a":1}`),
+	))
 
 	assertQueryCount(t, coll.Find(`{"a":1}`), 4)
 

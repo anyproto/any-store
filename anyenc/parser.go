@@ -76,7 +76,7 @@ func parseValue(b []byte, c *cache) (v *Value, tail []byte, err error) {
 		if c != nil {
 			v = c.getValue()
 			v.t = TypeString
-			v.v = slices.Grow(v.v, eosIdx-1)[:eosIdx-1]
+			v.v = slices.Grow(v.v[:0], eosIdx-1)[:eosIdx-1]
 			copy(v.v, b[1:eosIdx])
 		}
 		return v, b[eosIdx+1:], nil
@@ -164,7 +164,6 @@ func parseArray(b []byte, c *cache) (*Value, []byte, error) {
 }
 
 func parseBinary(b []byte, c *cache) (*Value, []byte, error) {
-
 	if len(b) < 4 {
 		return nil, nil, fmt.Errorf("expected minimum 4 byte for binary header, but got %d", len(b))
 	}
@@ -191,10 +190,6 @@ func (c *cache) reset() {
 }
 
 func (c *cache) getValue() *Value {
-	if cap(c.vs) > len(c.vs) {
-		c.vs = c.vs[:len(c.vs)+1]
-	} else {
-		c.vs = append(c.vs, Value{})
-	}
+	c.vs = slices.Grow(c.vs, 1)[:len(c.vs)+1]
 	return &c.vs[len(c.vs)-1]
 }

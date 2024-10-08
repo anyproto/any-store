@@ -2,8 +2,6 @@ package anyenc
 
 import (
 	"fmt"
-
-	"github.com/valyala/fastjson"
 )
 
 const EOS = byte(0)
@@ -19,38 +17,7 @@ const (
 	TypeArray  = Type(6)
 	TypeObject = Type(7)
 	TypeBinary = Type(8)
-
-	// inverted types
-	iTypeNull    = Type(108)
-	iTypeNumber  = Type(107)
-	iTypeString  = Type(106)
-	iTypeFalse   = Type(105)
-	iTypeTrue    = Type(104)
-	iTypeArray   = Type(103)
-	iTypeObject  = Type(102)
-	iTypeOBinary = Type(101)
 )
-
-func FastJSONTypeToType(t fastjson.Type) Type {
-	switch t {
-	case fastjson.TypeNumber:
-		return TypeNumber
-	case fastjson.TypeObject:
-		return TypeObject
-	case fastjson.TypeFalse:
-		return TypeFalse
-	case fastjson.TypeTrue:
-		return TypeTrue
-	case fastjson.TypeString:
-		return TypeString
-	case fastjson.TypeArray:
-		return TypeArray
-	case fastjson.TypeNull:
-		return TypeNull
-	default:
-		panic(fmt.Errorf("unexpected fastjson type: %v", t))
-	}
-}
 
 func (t Type) String() string {
 	switch t {
