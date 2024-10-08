@@ -59,7 +59,7 @@ func testFile(t *testing.T, filename string) {
 
 	var docs = make([]any, len(testCases.Data))
 	for i, doc := range testCases.Data {
-		docs[i] = []byte(doc)
+		docs[i] = string(doc)
 	}
 
 	coll, err := fx.CreateCollection(ctx, "test")
@@ -82,7 +82,7 @@ func testFile(t *testing.T, filename string) {
 	require.NoError(t, coll.Insert(ctx, docs...))
 	t.Logf("inserted %d docs; %v", len(docs), time.Since(st))
 
-	for j, tc := range testCases.Tests {
+	for j, tc := range testCases.Tests[:] {
 		var cond any
 		if tc.Cond != nil {
 			cond = tc.Cond

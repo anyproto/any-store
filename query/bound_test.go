@@ -5,11 +5,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/anyproto/any-store/internal/key"
+	"github.com/anyproto/any-store/anyenc"
 )
 
-func newBoundKey(v any) (k key.Key) {
-	return k.AppendAny(v)
+func newBoundKey(v any) (k anyenc.Tuple) {
+	return anyenc.AppendAnyValue(nil, v)
 }
 
 type boundTestCase struct {

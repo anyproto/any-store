@@ -92,7 +92,7 @@ func (s *SortField) AppendKey(k []byte, v *anyenc.Value) []byte {
 		return v.Get(s.Path...).MarshalTo(k)
 	} else {
 		var prevLen = len(k)
-		v.Get(s.Path...).MarshalTo(k)
+		k = v.Get(s.Path...).MarshalTo(k)
 		for i := range k[prevLen:] {
 			k[i+prevLen] = ^k[i+prevLen]
 		}

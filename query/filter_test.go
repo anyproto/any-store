@@ -350,28 +350,28 @@ func TestRegexp(t *testing.T) {
 		require.NoError(t, err)
 		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 1)
-		assert.Equal(t, "prefix.test", append(bounds[0].Start, 0).String())
+		assert.Equal(t, `"prefix.test"`, append(bounds[0].Start, 0).String())
 	})
 	t.Run("index: ^prefix\\.test{1}* - return prefix.test", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^prefix\.test{a-zA-z}*"}}`)
 		require.NoError(t, err)
 		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 1)
-		assert.Equal(t, "prefix.test", append(bounds[0].Start, 0).String())
+		assert.Equal(t, `"prefix.test"`, append(bounds[0].Start, 0).String())
 	})
 	t.Run("index: ^prefix+ - return prefix", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^prefix+"}}`)
 		require.NoError(t, err)
 		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 1)
-		assert.Equal(t, "prefix", append(bounds[0].Start, 0).String())
+		assert.Equal(t, `"prefix"`, append(bounds[0].Start, 0).String())
 	})
 	t.Run("index: ^\\.a* - return prefix", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^\.a*"}}`)
 		require.NoError(t, err)
 		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 1)
-		assert.Equal(t, ".a", append(bounds[0].Start, 0).String())
+		assert.Equal(t, `".a"`, append(bounds[0].Start, 0).String())
 	})
 }
 

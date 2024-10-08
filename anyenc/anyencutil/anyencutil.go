@@ -1,4 +1,4 @@
-package jsonutil
+package anyencutil
 
 import (
 	"bytes"
