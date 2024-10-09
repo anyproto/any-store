@@ -53,28 +53,6 @@ func TestCollection_Rename(t *testing.T) {
 	assert.Equal(t, []string{newName}, collections)
 }
 
-func TestCollection_InsertOne(t *testing.T) {
-	t.Run("with id", func(t *testing.T) {
-		fx := newFixture(t)
-		coll, err := fx.CreateCollection(context.Background(), "test")
-		require.NoError(t, err)
-
-		id, err := coll.InsertOne(ctx, anyenc.MustParseJson(`{"id":42, "d":"a"}`))
-		require.NoError(t, err)
-		assert.Equal(t, float64(42), id)
-	})
-	t.Run("err exists", func(t *testing.T) {
-		fx := newFixture(t)
-		coll, err := fx.CreateCollection(context.Background(), "test")
-		require.NoError(t, err)
-
-		_, err = coll.InsertOne(ctx, anyenc.MustParseJson(`{"id":"a"}`))
-		require.NoError(t, err)
-		_, err = coll.InsertOne(ctx, anyenc.MustParseJson(`{"id":"a"}`))
-		assert.ErrorIs(t, err, ErrDocExists)
-	})
-}
-
 func TestCollection_Insert(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		fx := newFixture(t)
@@ -156,15 +134,15 @@ func TestCollection_UpdateOne(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
 
-		id, err := coll.InsertOne(ctx, anyenc.MustParseJson(`{"id":"333","key":"value"}`))
+		err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":"333","key":"value"}`))
 		require.NoError(t, err)
 
-		newDoc := fmt.Sprintf(`{"id":"%s","key":"value2"}`, id)
+		newDoc := `{"id":"333","key":"value2"}`
 
 		err = coll.UpdateOne(ctx, anyenc.MustParseJson(newDoc))
 		require.NoError(t, err)
 
-		doc, err := coll.FindId(ctx, id)
+		doc, err := coll.FindId(ctx, "333")
 		require.NoError(t, err)
 		assert.Equal(t, newDoc, doc.Value().String())
 	})
@@ -195,8 +173,9 @@ func TestCollection_UpdateId(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
 
-		id, err := coll.InsertOne(ctx, anyenc.MustParseJson(`{"id":333,"key":"value"}`))
+		err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":333,"key":"value"}`))
 		require.NoError(t, err)
+		id := 333
 
 		res, err := coll.UpdateId(ctx, id, mod)
 		require.NoError(t, err)
@@ -211,10 +190,10 @@ func TestCollection_UpdateId(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
 
-		id, err := coll.InsertOne(ctx, anyenc.MustParseJson(`{"id":1, "key":"value"}`))
+		err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":1, "key":"value"}`))
 		require.NoError(t, err)
 
-		res, err := coll.UpdateId(ctx, id, query.MustParseModifier(`{"$set":{"key":"value"}}`))
+		res, err := coll.UpdateId(ctx, 1, query.MustParseModifier(`{"$set":{"key":"value"}}`))
 		require.NoError(t, err)
 		assert.Equal(t, 0, res.Modified)
 	})
@@ -225,16 +204,11 @@ func TestCollection_UpsertOne(t *testing.T) {
 		fx := newFixture(t)
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
-		t.Run("with id", func(t *testing.T) {
-			id, err := coll.UpsertOne(ctx, anyenc.MustParseJson(`{"id":999, "a":"b"}`))
-			require.NoError(t, err)
-			assert.Equal(t, float64(999), id)
-		})
 		t.Run("update", func(t *testing.T) {
-			_, err = coll.UpsertOne(ctx, anyenc.MustParseJson(`{"id":"upd","val":1}`))
+			err = coll.UpsertOne(ctx, anyenc.MustParseJson(`{"id":"upd","val":1}`))
 			require.NoError(t, err)
 			newDoc := `{"id":"upd","val":2}`
-			_, err = coll.UpsertOne(ctx, anyenc.MustParseJson(newDoc))
+			err = coll.UpsertOne(ctx, anyenc.MustParseJson(newDoc))
 			require.NoError(t, err)
 			doc, err := coll.FindId(ctx, "upd")
 			require.NoError(t, err)

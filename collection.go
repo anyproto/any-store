@@ -34,10 +34,6 @@ type Collection interface {
 	// Find returns a new Query object with given filter
 	Find(filter any) Query
 
-	// InsertOne inserts a single document into the collection.
-	// Returns the ID of the inserted document or an error if the insertion fails.
-	InsertOne(ctx context.Context, doc *anyenc.Value) (id any, err error)
-
 	// Insert inserts multiple documents into the collection.
 	// Returns an error if the insertion fails.
 	Insert(ctx context.Context, docs ...*anyenc.Value) (err error)
@@ -53,7 +49,7 @@ type Collection interface {
 
 	// UpsertOne inserts a document if it does not exist, or updates it if it does.
 	// Returns the ID of the upserted document or an error if the operation fails.
-	UpsertOne(ctx context.Context, doc *anyenc.Value) (id any, err error)
+	UpsertOne(ctx context.Context, doc *anyenc.Value) (err error)
 
 	// UpsertId updates a single document or creates new one
 	// Returns a modify result or error.
@@ -247,37 +243,6 @@ func (c *collection) Find(filter any) Query {
 	}
 }
 
-func (c *collection) InsertOne(ctx context.Context, doc *anyenc.Value) (id any, err error) {
-	buf := c.db.syncPool.GetDocBuf()
-	defer c.db.syncPool.ReleaseDocBuf(buf)
-
-	var idBytes anyenc.Tuple
-	err = c.db.doWriteTx(ctx, func(cn *driver.Conn) (txErr error) {
-		if txErr = c.checkStmts(ctx, cn); txErr != nil {
-			return
-		}
-		var it item
-		buf.Arena.Reset()
-		if it, txErr = newItem(doc); txErr != nil {
-			return txErr
-		}
-		if idBytes, txErr = c.insertItem(ctx, buf, it); txErr != nil {
-			return txErr
-		}
-		return
-	})
-	if err != nil {
-		return nil, replaceUniqErr(err, ErrDocExists)
-	}
-	if err = idBytes.ReadValues(buf.Parser, func(v *anyenc.Value) error {
-		id = v.GoType()
-		return nil
-	}); err != nil {
-		return
-	}
-	return id, nil
-}
-
 func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
@@ -292,7 +257,7 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 			if it, txErr = newItem(doc); txErr != nil {
 				return txErr
 			}
-			if _, txErr = c.insertItem(ctx, buf, it); txErr != nil {
+			if txErr = c.insertItem(ctx, buf, it); txErr != nil {
 				return txErr
 			}
 		}
@@ -301,18 +266,17 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 	return replaceUniqErr(err, ErrDocExists)
 }
 
-func (c *collection) insertItem(ctx context.Context, buf *syncpool.DocBuffer, it item) (id []byte, err error) {
+func (c *collection) insertItem(ctx context.Context, buf *syncpool.DocBuffer, it item) (err error) {
 	buf.SmallBuf = it.appendId(buf.SmallBuf[:0])
 	buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
-	id = buf.SmallBuf
 	if err = c.stmts.insert.Exec(ctx, func(stmt *sqlite.Stmt) {
 		stmt.BindBytes(1, buf.SmallBuf)
 		stmt.BindBytes(2, buf.DocBuf)
 	}, driver.StmtExecNoResults); err != nil {
-		return nil, replaceUniqErr(err, ErrDocExists)
+		return replaceUniqErr(err, ErrDocExists)
 	}
-	if err = c.indexesHandleInsert(ctx, id, it); err != nil {
-		return nil, err
+	if err = c.indexesHandleInsert(ctx, buf.SmallBuf, it); err != nil {
+		return err
 	}
 	return
 }
@@ -416,7 +380,7 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 		}
 		res.Modified = 1
 		if isInsert {
-			_, txErr = c.insertItem(ctx, buf2, item{val: newVal})
+			txErr = c.insertItem(ctx, buf2, item{val: newVal})
 			return txErr
 		} else {
 			res.Matched = 1
@@ -475,7 +439,7 @@ func (c *collection) loadById(ctx context.Context, buf *syncpool.DocBuffer, id a
 	return newItem(doc)
 }
 
-func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (id any, err error) {
+func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
@@ -488,23 +452,13 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (id any, 
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
-		_, insErr := c.insertItem(ctx, buf, it)
+		insErr := c.insertItem(ctx, buf, it)
 		if errors.Is(insErr, ErrDocExists) {
 			return c.update(ctx, it, item{})
 		}
 		return insErr
 	})
-	if err != nil {
-		return nil, err
-	}
-
-	if err = anyenc.Tuple(it.appendId(buf.SmallBuf[:0])).ReadValues(buf.Parser, func(v *anyenc.Value) error {
-		id = v.GoType()
-		return nil
-	}); err != nil {
-		return
-	}
-	return id, nil
+	return err
 }
 
 func (c *collection) DeleteId(ctx context.Context, id any) (err error) {

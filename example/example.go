@@ -6,6 +6,7 @@ import (
 	"log"
 
 	anystore "github.com/anyproto/any-store"
+	"github.com/anyproto/any-store/anyenc"
 )
 
 var ctx = context.Background()
@@ -34,7 +35,7 @@ func main() {
 	}
 
 	// if id not specified it will be created as hex of new object id
-	docId, err := coll.InsertOne(ctx, `{"name": "John"}`)
+	docId, err := coll.InsertOne(ctx, anyenc.MustParseJson(`{"id":1 "name": "John"}`))
 	if err != nil {
 		log.Fatalf("unable to insert document: %v", err)
 	}

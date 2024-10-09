@@ -115,7 +115,7 @@ func TestDb_Close(t *testing.T) {
 		go func() {
 			// writing
 			for {
-				if _, pErr := coll.UpsertOne(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id": %d, "value": %d}`, rand.Int(), rand.Int()))); pErr != nil {
+				if pErr := coll.UpsertOne(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id": %d, "value": %d}`, rand.Int(), rand.Int()))); pErr != nil {
 					results <- pErr
 					return
 				}
