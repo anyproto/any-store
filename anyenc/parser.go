@@ -16,6 +16,7 @@ var (
 	valueNull  = &Value{t: TypeNull}
 )
 
+// MustParse parses bytes to Value. Panics in case of error
 func MustParse(b []byte) *Value {
 	if v, err := Parse(b); err == nil {
 		return v
@@ -24,11 +25,13 @@ func MustParse(b []byte) *Value {
 	}
 }
 
+// Parse parses bytes to Value
 func Parse(b []byte) (*Value, error) {
 	p := &Parser{}
 	return p.Parse(b)
 }
 
+// MustParseJson parses Value from json string. Panics in case of error
 func MustParseJson(jsonString string) *Value {
 	if v, err := ParseJson(jsonString); err == nil {
 		return v
@@ -37,6 +40,7 @@ func MustParseJson(jsonString string) *Value {
 	}
 }
 
+// ParseJson parses Value from json string
 func ParseJson(jsonString string) (*Value, error) {
 	jv, err := fastjson.Parse(jsonString)
 	if err != nil {
@@ -46,11 +50,20 @@ func ParseJson(jsonString string) (*Value, error) {
 	return a.NewFromFastJson(jv), nil
 }
 
+// Parser parses encoded bytes.
+//
+// Parser may be re-used for subsequent parsing.
+//
+// Parser cannot be used from concurrent goroutines.
+// Use per-goroutine parsers or ParserPool instead.
 type Parser struct {
 	b []byte
 	c cache
 }
 
+// Parse parses encoded bytes
+//
+// The returned value is valid until the next call to Parse*.
 func (p *Parser) Parse(b []byte) (v *Value, err error) {
 	p.c.reset()
 	p.b = slices.Grow(p.b[:0], len(b))[:len(b)]

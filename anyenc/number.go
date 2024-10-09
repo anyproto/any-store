@@ -25,6 +25,7 @@ func AppendFloat64(b []byte, f float64) []byte {
 	return bytes
 }
 
+// AppendNumber encodes number
 func AppendNumber[T constraints.Integer | constraints.Float](b []byte, n T) []byte {
 	return AppendFloat64(b, float64(n))
 }

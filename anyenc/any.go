@@ -4,6 +4,7 @@ import (
 	"fmt"
 )
 
+// AppendAnyValue appends encoded value to b. Supports only simple go types.
 func AppendAnyValue(b []byte, v any) []byte {
 	if v == nil {
 		return append(b, uint8(TypeNull))

@@ -9,6 +9,7 @@ import (
 	"github.com/valyala/fastjson"
 )
 
+// Value represents one decoded value.
 type Value struct {
 	o Object
 	a []*Value
@@ -22,9 +23,7 @@ type keyValue struct {
 	value *Value
 }
 
-// Set sets (key, value) entry in the array or object v.
-//
-// The value must be unchanged during v lifetime.
+// Set sets a (key, value) entry in the array or object v.
 func (v *Value) Set(key string, value *Value) {
 	if v == nil {
 		return
@@ -42,6 +41,7 @@ func (v *Value) Set(key string, value *Value) {
 	}
 }
 
+// Del deletes a value by key.
 func (v *Value) Del(key string) {
 	if v == nil {
 		return
@@ -63,9 +63,7 @@ func (v *Value) Del(key string) {
 	}
 }
 
-// SetArrayItem sets the value in the array v at idx position.
-//
-// The value must be unchanged during v lifetime.
+// SetArrayItem sets the value in the array v at the specified index.
 func (v *Value) SetArrayItem(idx int, value *Value) {
 	if v == nil || v.t != TypeArray {
 		return
@@ -76,13 +74,13 @@ func (v *Value) SetArrayItem(idx int, value *Value) {
 	v.a[idx] = value
 }
 
-// Get returns value by the given keys path.
+// Get returns a value by the given key path.
 //
 // Array indexes may be represented as decimal numbers in keys.
 //
-// nil is returned for non-existing keys path.
+// Returns nil for non-existing key paths.
 //
-// The returned value is valid until Parse is called on the Parser returned v.
+// The returned value is valid until Parse is called on the parser that returned v.
 func (v *Value) Get(keys ...string) *Value {
 	if v == nil {
 		return nil
@@ -106,6 +104,7 @@ func (v *Value) Get(keys ...string) *Value {
 	return v
 }
 
+// Float64 returns the value as a float64 or an error if it's not a number.
 func (v *Value) Float64() (float64, error) {
 	if v.Type() != TypeNumber {
 		return 0, fmt.Errorf("value doesn't contain number; it contains %s", v.Type())
@@ -113,6 +112,7 @@ func (v *Value) Float64() (float64, error) {
 	return v.n, nil
 }
 
+// Int returns the value as an int or an error if it's not a number.
 func (v *Value) Int() (int, error) {
 	n, err := v.Float64()
 	if err != nil {
@@ -121,6 +121,8 @@ func (v *Value) Int() (int, error) {
 	return int(n), nil
 }
 
+// StringBytes returns the value as a byte slice or an error if it's not a string.
+// Warning: the returned value is not a copy.
 func (v *Value) StringBytes() ([]byte, error) {
 	if v.Type() != TypeString {
 		return nil, fmt.Errorf("value doesn't contain string; it contains %s", v.Type())
@@ -128,6 +130,8 @@ func (v *Value) StringBytes() ([]byte, error) {
 	return v.v, nil
 }
 
+// Bytes returns the binary data for a binary type or an error if it's not binary.
+// Warning: the returned value is not a copy.
 func (v *Value) Bytes() ([]byte, error) {
 	if v.Type() != TypeBinary {
 		return nil, fmt.Errorf("value doesn't contain binary; it contains %s", v.Type())
@@ -135,6 +139,7 @@ func (v *Value) Bytes() ([]byte, error) {
 	return v.v, nil
 }
 
+// AppendBytes appends binary data to the given byte slice from a binary type value.
 func (v *Value) AppendBytes(b []byte) ([]byte, error) {
 	if r, err := v.Bytes(); err != nil {
 		return nil, err
@@ -143,6 +148,7 @@ func (v *Value) AppendBytes(b []byte) ([]byte, error) {
 	}
 }
 
+// Array returns the value as an array of values or an error if it's not an array.
 func (v *Value) Array() ([]*Value, error) {
 	if v.Type() != TypeArray {
 		return nil, fmt.Errorf("value doesn't contain array; it contains %s", v.Type())
@@ -150,6 +156,7 @@ func (v *Value) Array() ([]*Value, error) {
 	return v.a, nil
 }
 
+// Object returns the value as an object or an error if it's not an object.
 func (v *Value) Object() (*Object, error) {
 	if v.Type() != TypeObject {
 		return nil, fmt.Errorf("value doesn't contain object; it contains %s", v.Type())
@@ -157,6 +164,7 @@ func (v *Value) Object() (*Object, error) {
 	return &v.o, nil
 }
 
+// Bool returns the value as a boolean or an error if it's not a boolean.
 func (v *Value) Bool() (bool, error) {
 	switch v.Type() {
 	case TypeTrue:
@@ -168,6 +176,7 @@ func (v *Value) Bool() (bool, error) {
 	}
 }
 
+// GetFloat64 returns a float64 from the given path or 0 if the value is not a number.
 func (v *Value) GetFloat64(keys ...string) float64 {
 	vv := v.Get(keys...)
 	if vv.Type() != TypeNumber {
@@ -176,6 +185,7 @@ func (v *Value) GetFloat64(keys ...string) float64 {
 	return vv.n
 }
 
+// GetInt returns an int from the given path or 0 if the value is not a number.
 func (v *Value) GetInt(keys ...string) int {
 	vv := v.Get(keys...)
 	if vv.Type() != TypeNumber {
@@ -184,6 +194,7 @@ func (v *Value) GetInt(keys ...string) int {
 	return int(vv.n)
 }
 
+// GetString returns a string from the given path or an empty string if the value is not a string.
 func (v *Value) GetString(keys ...string) string {
 	vv := v.Get(keys...)
 	if vv.Type() != TypeString {
@@ -192,6 +203,7 @@ func (v *Value) GetString(keys ...string) string {
 	return string(v.v)
 }
 
+// GetStringBytes returns a byte slice from the given path or nil if the value is not a string.
 func (v *Value) GetStringBytes(keys ...string) []byte {
 	vv := v.Get(keys...)
 	if vv.Type() != TypeString {
@@ -200,6 +212,7 @@ func (v *Value) GetStringBytes(keys ...string) []byte {
 	return v.v
 }
 
+// GetBytes returns a byte slice from the given path or nil if the value is not binary.
 func (v *Value) GetBytes(keys ...string) []byte {
 	vv := v.Get(keys...)
 	if vv.Type() != TypeBinary {
@@ -208,14 +221,16 @@ func (v *Value) GetBytes(keys ...string) []byte {
 	return v.v
 }
 
+// GetArray returns an array from the given path or nil if the value is not an array.
 func (v *Value) GetArray(keys ...string) []*Value {
 	vv := v.Get(keys...)
 	if vv.Type() != TypeArray {
 		return nil
 	}
-	return v.a
+	return vv.a
 }
 
+// GetObject returns an object from the given path or nil if the value is not an object.
 func (v *Value) GetObject(keys ...string) *Object {
 	vv := v.Get(keys...)
 	if vv.Type() != TypeObject {
@@ -224,6 +239,7 @@ func (v *Value) GetObject(keys ...string) *Object {
 	return &v.o
 }
 
+// GetBool returns true if the value at the path is a boolean true, or false otherwise.
 func (v *Value) GetBool(keys ...string) bool {
 	vv := v.Get(keys...)
 	if vv.Type() == TypeTrue {
@@ -232,6 +248,7 @@ func (v *Value) GetBool(keys ...string) bool {
 	return false
 }
 
+// Type returns the type of the value.
 func (v *Value) Type() Type {
 	if v == nil {
 		return TypeNull
@@ -239,6 +256,7 @@ func (v *Value) Type() Type {
 	return v.t
 }
 
+// MarshalTo appends the value to the given byte slice. You can pass nil as dst.
 func (v *Value) MarshalTo(dst []byte) []byte {
 	if v == nil {
 		return append(dst, byte(TypeNull))
@@ -283,6 +301,7 @@ func (v *Value) marshalObject(dst []byte) []byte {
 	return append(dst, EOS)
 }
 
+// FastJson converts Value to fastjson.Value using the provided arena.
 func (v *Value) FastJson(a *fastjson.Arena) *fastjson.Value {
 	switch v.Type() {
 	case TypeNumber:
@@ -314,10 +333,16 @@ func (v *Value) FastJson(a *fastjson.Arena) *fastjson.Value {
 	}
 }
 
+// String returns a string (JSON) representation of the value. Use it for debugging purposes only.
 func (v *Value) String() string {
 	return v.FastJson(&fastjson.Arena{}).String()
 }
 
+// GoType converts the value to a Go primitive type.
+//
+// Numbers are always float64.
+// Arrays are []any.
+// Objects are map[string]any.
 func (v *Value) GoType() any {
 	switch v.Type() {
 	case TypeNumber:

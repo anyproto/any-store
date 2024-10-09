@@ -2,16 +2,19 @@ package anyenc
 
 import "slices"
 
+// Object represents an anyenc object
 type Object struct {
 	kvs []keyValue
 }
 
+// Visit calls visit func for every key-value pair
 func (o *Object) Visit(visit func(k string, v *Value)) {
 	for _, kv := range o.kvs {
 		visit(kv.key, kv.value)
 	}
 }
 
+// Get gets a value by key
 func (o *Object) Get(key string) *Value {
 	for _, kv := range o.kvs {
 		if kv.key == key {
@@ -21,6 +24,7 @@ func (o *Object) Get(key string) *Value {
 	return nil
 }
 
+// Set sets value
 func (o *Object) Set(key string, value *Value) {
 	for i, kv := range o.kvs {
 		if kv.key == key {
@@ -33,12 +37,14 @@ func (o *Object) Set(key string, value *Value) {
 	o.kvs[len(o.kvs)-1].value = value
 }
 
+// Del deletes value by key
 func (o *Object) Del(key string) {
 	o.kvs = slices.DeleteFunc(o.kvs, func(kv keyValue) bool {
 		return kv.key == key
 	})
 }
 
+// Len returns object length
 func (o *Object) Len() int {
 	return len(o.kvs)
 }

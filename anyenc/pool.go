@@ -4,7 +4,7 @@ import (
 	"sync"
 )
 
-// ParserPool may be used for pooling Parsers for similarly typed JSONs.
+// ParserPool may be used for pooling Parsers for similarly typed values.
 type ParserPool struct {
 	pool sync.Pool
 }
@@ -28,7 +28,7 @@ func (pp *ParserPool) Put(p *Parser) {
 	pp.pool.Put(p)
 }
 
-// ArenaPool may be used for pooling Arenas for similarly typed JSONs.
+// ArenaPool may be used for pooling Arenas for similarly typed values.
 type ArenaPool struct {
 	pool sync.Pool
 }

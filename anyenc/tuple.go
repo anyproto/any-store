@@ -2,12 +2,16 @@ package anyenc
 
 import "fmt"
 
+// Tuple represents an encoded sequence of values as a byte slice.
 type Tuple []byte
 
+// Append adds a new encoded value to the tuple.
 func (t Tuple) Append(v *Value) Tuple {
 	return v.MarshalTo(t)
 }
 
+// ReadValues decodes and reads all values from the start of the tuple.
+// The provided function `f` is called for each value.
 func (t Tuple) ReadValues(p *Parser, f func(v *Value) error) error {
 	return t.ReadBytes(func(b []byte) error {
 		if v, err := p.Parse(b); err != nil {
@@ -21,6 +25,8 @@ func (t Tuple) ReadValues(p *Parser, f func(v *Value) error) error {
 	})
 }
 
+// ReadBytes iterates over every value in the tuple and passes the raw bytes
+// to the provided function `f`. It continues until all values are processed.
 func (t Tuple) ReadBytes(f func(b []byte) error) (err error) {
 	var tail = t
 	var nextTail []byte
@@ -36,6 +42,7 @@ func (t Tuple) ReadBytes(f func(b []byte) error) (err error) {
 	return nil
 }
 
+// String returns a string representation of the tuple.
 func (t Tuple) String() string {
 	var p = &Parser{}
 	var res string
@@ -52,6 +59,7 @@ func (t Tuple) String() string {
 	return res
 }
 
+// Copy creates and returns a copy of the tuple.
 func (t Tuple) Copy() Tuple {
 	c := make(Tuple, len(t))
 	copy(c, t)

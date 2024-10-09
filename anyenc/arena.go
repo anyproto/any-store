@@ -113,6 +113,7 @@ func (a *Arena) NewFalse() *Value {
 	return valueFalse
 }
 
+// NewFromFastJson creates Value from passed fastjson.Value
 func (a *Arena) NewFromFastJson(jv *fastjson.Value) *Value {
 	switch jv.Type() {
 	case fastjson.TypeNull:

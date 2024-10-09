@@ -29,48 +29,49 @@ func main() {
 		log.Fatalf("unable to open collection: %v", err)
 	}
 
-	// cleanup
-	if _, err = coll.Find(nil).Delete(ctx); err != nil {
-		log.Fatalf("unable to delete collection documents: %v", err)
-	}
-
-	// if id not specified it will be created as hex of new object id
-	docId, err := coll.InsertOne(ctx, anyenc.MustParseJson(`{"id":1 "name": "John"}`))
+	// insert document, convert from json
+	doc := anyenc.MustParseJson(`{"id":1, "name": "John"}`)
+	err = coll.Insert(ctx, doc)
 	if err != nil {
 		log.Fatalf("unable to insert document: %v", err)
 	}
-	fmt.Println("user created", docId)
 
-	// you can pass json string, go type, or *fastjson.Value
-	docId, err = coll.InsertOne(ctx, map[string]any{"name": "Jane"})
+	// create document
+	a := &anyenc.Arena{}
+	doc = a.NewObject()
+	doc.Set("id", a.NewNumberInt(2))
+	doc.Set("name", a.NewString("Jane"))
+	err = coll.Insert(ctx, doc)
 	if err != nil {
 		log.Fatalf("unable to insert document: %v", err)
 	}
-	fmt.Println("user created", docId)
 
-	// you can specify id as any valid json type
-	if err = coll.Insert(ctx, `{"id":1, "name": "Alex"}`, `{"id":2, "name": "rob"}`, `{"id":3, "name": "Paul"}`); err != nil {
+	// batch insert
+	if err = coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":3, "name": "Alex"}`),
+		anyenc.MustParseJson(`{"id":4, "name": "rob"}`),
+		anyenc.MustParseJson(`{"id":5, "name": "Paul"}`),
+	); err != nil {
 		log.Fatalf("unable to insert document: %v", err)
 	}
 
 	// upsert
-	docId, err = coll.UpsertOne(ctx, map[string]any{"name": "Mike"})
+	err = coll.UpsertOne(ctx, anyenc.MustParseJson(`{"id":6, "name": "Mike"}`))
 	if err != nil {
 		log.Fatalf("unable to insert document: %v", err)
 	}
-	fmt.Println("user created", docId)
 
 	// update one
-	if err = coll.UpdateOne(ctx, `{"id":2, "name": "Rob"}`); err != nil {
+	if err = coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":4, "name": "Rob"}`)); err != nil {
 		log.Fatalf("unable to update document: %v", err)
 	}
 
 	// find by id
-	doc, err := coll.FindId(ctx, 2)
+	res, err := coll.FindId(ctx, 2)
 	if err != nil {
 		log.Fatalf("unable to find document: %v", err)
 	}
-	fmt.Println("document found:", doc.Value().String())
+	fmt.Println("document found:", res.Value().String())
 
 	// collection count
 	count, err := coll.Count(ctx)
@@ -90,11 +91,11 @@ func main() {
 		}
 	}()
 	for iter.Next() {
-		doc, err = iter.Doc()
+		res, err = iter.Doc()
 		if err != nil {
 			log.Fatalf("load document error: %v", err)
 		}
-		fmt.Println("findMany:", doc.Value().String())
+		fmt.Println("findMany:", res.Value().String())
 	}
 
 	// create index
