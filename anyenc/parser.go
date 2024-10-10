@@ -143,7 +143,9 @@ func parseObject(b []byte, c *cache) (*Value, []byte, error) {
 		}
 		if c != nil {
 			o.o.kvs = slices.Grow(o.o.kvs, 1)[:i+1]
-			o.o.kvs[i].key = unsafe.String(unsafe.SliceData(b[:eosI]), len(b[:eosI]))
+			o.o.kvs[i].keyBuf = slices.Grow(o.o.kvs[i].keyBuf[:0], len(b[:eosI]))[:len(b[:eosI])]
+			copy(o.o.kvs[i].keyBuf, b[:eosI])
+			o.o.kvs[i].key = unsafe.String(unsafe.SliceData(o.o.kvs[i].keyBuf), len(o.o.kvs[i].keyBuf))
 			if o.o.kvs[i].value, b, err = parseValue(b[eosI+1:], c); err != nil {
 				return nil, nil, err
 			}

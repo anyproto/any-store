@@ -22,8 +22,9 @@ type Value struct {
 }
 
 type keyValue struct {
-	key   string
-	value *Value
+	key    string
+	keyBuf []byte
+	value  *Value
 }
 
 // Set sets a (key, value) entry in the array or object v.
