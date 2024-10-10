@@ -200,7 +200,7 @@ func (v *Value) GetString(keys ...string) string {
 	if vv.Type() != TypeString {
 		return ""
 	}
-	return string(v.v)
+	return string(vv.v)
 }
 
 // GetStringBytes returns a byte slice from the given path or nil if the value is not a string.
@@ -209,7 +209,7 @@ func (v *Value) GetStringBytes(keys ...string) []byte {
 	if vv.Type() != TypeString {
 		return nil
 	}
-	return v.v
+	return vv.v
 }
 
 // GetBytes returns a byte slice from the given path or nil if the value is not binary.
@@ -218,7 +218,7 @@ func (v *Value) GetBytes(keys ...string) []byte {
 	if vv.Type() != TypeBinary {
 		return nil
 	}
-	return v.v
+	return vv.v
 }
 
 // GetArray returns an array from the given path or nil if the value is not an array.
@@ -236,7 +236,7 @@ func (v *Value) GetObject(keys ...string) *Object {
 	if vv.Type() != TypeObject {
 		return nil
 	}
-	return &v.o
+	return &vv.o
 }
 
 // GetBool returns true if the value at the path is a boolean true, or false otherwise.
