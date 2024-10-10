@@ -58,12 +58,12 @@ func parseSortString(ss string) (Sort, error) {
 
 type Sort interface {
 	Fields() []SortField
-	AppendKey(k []byte, v *anyenc.Value) []byte
+	AppendKey(k anyenc.Tuple, v *anyenc.Value) anyenc.Tuple
 }
 
 type Sorts []Sort
 
-func (ss Sorts) AppendKey(k []byte, v *anyenc.Value) []byte {
+func (ss Sorts) AppendKey(k anyenc.Tuple, v *anyenc.Value) anyenc.Tuple {
 	for _, s := range ss {
 		k = s.AppendKey(k, v)
 	}
@@ -87,16 +87,11 @@ type SortField struct {
 	Reverse bool
 }
 
-func (s *SortField) AppendKey(k []byte, v *anyenc.Value) []byte {
+func (s *SortField) AppendKey(tuple anyenc.Tuple, v *anyenc.Value) anyenc.Tuple {
 	if !s.Reverse {
-		return v.Get(s.Path...).MarshalTo(k)
+		return tuple.Append(v.Get(s.Path...))
 	} else {
-		var prevLen = len(k)
-		k = v.Get(s.Path...).MarshalTo(k)
-		for i := range k[prevLen:] {
-			k[i+prevLen] = ^k[i+prevLen]
-		}
-		return k
+		return tuple.AppendInverted(v.Get(s.Path...))
 	}
 }
 

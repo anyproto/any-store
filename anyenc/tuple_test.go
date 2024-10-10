@@ -21,6 +21,7 @@ func TestTuple_String(t *testing.T) {
 	tp := testTuple()
 	var exp = `6/"a"/true/false/null/[1,2,3]/{"a":{"b":4}}`
 	assert.Equal(t, exp, tp.String())
+	t.Log(TypeNull, iTypeNull)
 }
 
 func BenchmarkTuple_ReadBytes(b *testing.B) {

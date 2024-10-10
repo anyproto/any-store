@@ -10,6 +10,16 @@ func (t Tuple) Append(v *Value) Tuple {
 	return v.MarshalTo(t)
 }
 
+// AppendInverted adds a new encoded value and inverts bytes
+func (t Tuple) AppendInverted(v *Value) Tuple {
+	var prevLen = len(t)
+	t = v.MarshalTo(t)
+	for i := range t[prevLen:] {
+		t[i+prevLen] = ^t[i+prevLen]
+	}
+	return t
+}
+
 // ReadValues decodes and reads all values from the start of the tuple.
 // The provided function `f` is called for each value.
 func (t Tuple) ReadValues(p *Parser, f func(v *Value) error) error {

@@ -17,6 +17,15 @@ const (
 	TypeArray  = Type(6)
 	TypeObject = Type(7)
 	TypeBinary = Type(8)
+
+	iTypeNull   = ^Type(1)
+	iTypeNumber = ^Type(2)
+	iTypeString = ^Type(3)
+	iTypeFalse  = ^Type(4)
+	iTypeTrue   = ^Type(5)
+	iTypeArray  = ^Type(6)
+	iTypeObject = ^Type(7)
+	iTypeBinary = ^Type(8)
 )
 
 func (t Type) String() string {
