@@ -2,6 +2,8 @@ github.com/anyproto/any-store v0.0.5-0.20240909154743-9b0f47eaf361 h1:5Lyeapm2oq
 github.com/anyproto/any-store v0.0.5-0.20240909154743-9b0f47eaf361/go.mod h1:MA3sSqRXIp0h9bC2LnMuDGVEFGB3BkI/UuWNCleGHMs=
 github.com/anyproto/any-store v0.0.7-0.20241008132710-b3c917df3030 h1:fQUgvth8Fvti/z7T7HbzGX/hHKgxZ84aeRN1XRRgu5E=
 github.com/anyproto/any-store v0.0.7-0.20241008132710-b3c917df3030/go.mod h1:MA3sSqRXIp0h9bC2LnMuDGVEFGB3BkI/UuWNCleGHMs=
+github.com/anyproto/any-store v0.0.7-0.20241009173601-6b23e08cb97e h1:GjRPJS6evWq4VQz7nzx6uKBDb9PGbk+RHqbPaxcV49M=
+github.com/anyproto/any-store v0.0.7-0.20241009173601-6b23e08cb97e/go.mod h1:MA3sSqRXIp0h9bC2LnMuDGVEFGB3BkI/UuWNCleGHMs=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
@@ -39,6 +41,8 @@ golang.org/x/exp v0.0.0-20240823005443-9b4947da3948 h1:kx6Ds3MlpiUHKj7syVnbp57++
 golang.org/x/exp v0.0.0-20240823005443-9b4947da3948/go.mod h1:akd2r19cwCdwSwWeIdzYQGa/EZZyqcOdwWiwj5L5eKQ=
 golang.org/x/exp v0.0.0-20241004190924-225e2abe05e6 h1:1wqE9dj9NpSm04INVsJhhEUzhuDVjbcyKH91sVyPATw=
 golang.org/x/exp v0.0.0-20241004190924-225e2abe05e6/go.mod h1:NQtJDoLvd6faHhE7m4T/1IY708gDefGGjR/iUW8yQQ8=
+golang.org/x/exp v0.0.0-20241009180824-f66d83c29e7c h1:7dEasQXItcW1xKJ2+gg5VOiBnqWrJc+rq0DPKyvvdbY=
+golang.org/x/exp v0.0.0-20241009180824-f66d83c29e7c/go.mod h1:NQtJDoLvd6faHhE7m4T/1IY708gDefGGjR/iUW8yQQ8=
 golang.org/x/mod v0.20.0 h1:utOm6MM3R3dnawAiJgn0y+xvuYRsm1RKM/4giyfDgV0=
 golang.org/x/mod v0.20.0/go.mod h1:hTbmBsO62+eylJbnUtE2MGJUyE7QWk4xUqPFrRgJ+7c=
 golang.org/x/mod v0.21.0 h1:vvrHzRwRfVKSiLrG+d4FMl/Qi4ukBCE6kZlTUkDYRT0=

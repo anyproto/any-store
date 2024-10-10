@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	anystore "github.com/anyproto/any-store"
+	"github.com/anyproto/any-store/anyenc"
 )
 
 func openConn(path string) (err error) {
@@ -151,18 +152,16 @@ func (c *Conn) Insert(cmd Cmd) (result string, err error) {
 	if err != nil {
 		return
 	}
-	if len(cmd.Documents) == 1 {
-		var docId any
-		if docId, err = coll.InsertOne(mainCtx.Ctx(), cmd.Documents[0]); err != nil {
+	var docs = make([]*anyenc.Value, len(cmd.Documents))
+	for i, d := range cmd.Documents {
+		if docs[i], err = anyenc.ParseJson(string(d)); err != nil {
 			return
 		}
-		result = fmt.Sprintf("inserted id: %v", docId)
-	} else {
-		if err = coll.Insert(mainCtx.Ctx(), toAnySlice(cmd.Documents)...); err != nil {
-			return
-		}
-		result = fmt.Sprintf("inserted %d documents", len(cmd.Documents))
 	}
+	if err = coll.Insert(mainCtx.Ctx(), docs...); err != nil {
+		return
+	}
+	result = fmt.Sprintf("inserted %d documents", len(cmd.Documents))
 	return
 }
 
@@ -174,11 +173,14 @@ func (c *Conn) Upsert(cmd Cmd) (result string, err error) {
 	if len(cmd.Documents) == 0 {
 		return "", fmt.Errorf(`expected document`)
 	}
-	var docId any
-	if docId, err = coll.UpsertOne(mainCtx.Ctx(), cmd.Documents[0]); err != nil {
+	var doc *anyenc.Value
+	if doc, err = anyenc.ParseJson(string(cmd.Documents[0])); err != nil {
 		return
 	}
-	result = fmt.Sprintf("upserted id: %v", docId)
+	if err = coll.UpsertOne(mainCtx.Ctx(), doc); err != nil {
+		return
+	}
+	result = fmt.Sprintf("upserted")
 	return
 }
 
@@ -190,7 +192,11 @@ func (c *Conn) Update(cmd Cmd) (result string, err error) {
 	if len(cmd.Documents) == 0 {
 		return "", fmt.Errorf(`expected document`)
 	}
-	if err = coll.UpdateOne(mainCtx.Ctx(), cmd.Documents[0]); err != nil {
+	var doc *anyenc.Value
+	if doc, err = anyenc.ParseJson(string(cmd.Documents[0])); err != nil {
+		return
+	}
+	if err = coll.UpdateOne(mainCtx.Ctx(), doc); err != nil {
 		return
 	}
 	return
