@@ -1,6 +1,9 @@
 package anyenc
 
-import "slices"
+import (
+	"slices"
+	"unsafe"
+)
 
 // Object represents an anyenc object
 type Object struct {
@@ -8,9 +11,9 @@ type Object struct {
 }
 
 // Visit calls visit func for every key-value pair
-func (o *Object) Visit(visit func(k string, v *Value)) {
+func (o *Object) Visit(visit func(k []byte, v *Value)) {
 	for _, kv := range o.kvs {
-		visit(kv.key, kv.value)
+		visit(s2b(kv.key), kv.value)
 	}
 }
 
@@ -47,4 +50,8 @@ func (o *Object) Del(key string) {
 // Len returns object length
 func (o *Object) Len() int {
 	return len(o.kvs)
+}
+
+func s2b(s string) (b []byte) {
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }

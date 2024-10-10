@@ -38,8 +38,8 @@ func TestObject_Visit(t *testing.T) {
 	obj.Set("k2", a.NewNumberInt(2))
 	var keys []string
 	var values []int
-	obj.GetObject().Visit(func(k string, v *Value) {
-		keys = append(keys, k)
+	obj.GetObject().Visit(func(k []byte, v *Value) {
+		keys = append(keys, string(k))
 		values = append(values, v.GetInt())
 	})
 	assert.Equal(t, []string{"k", "k2"}, keys)

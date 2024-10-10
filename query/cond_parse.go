@@ -36,15 +36,14 @@ const (
 )
 
 var (
-	opBytesPrefix  = []byte("$")
-	opBytesPrefixS = string(opBytesPrefix)
-	opBytesAnd     = []byte("$and")
-	opBytesOr      = []byte("$or")
-	opBytesNe      = []byte("$ne")
-	opBytesIn      = []byte("$in")
-	opBytesNin     = []byte("$nin")
-	opBytesAll     = []byte("$all")
-	opBytesEq      = []byte("$eq")
+	opBytesPrefix = []byte("$")
+	opBytesAnd    = []byte("$and")
+	opBytesOr     = []byte("$or")
+	opBytesNe     = []byte("$ne")
+	opBytesIn     = []byte("$in")
+	opBytesNin    = []byte("$nin")
+	opBytesAll    = []byte("$all")
+	opBytesEq     = []byte("$eq")
 
 	opBytesGt  = []byte("$gt")
 	opBytesGte = []byte("$gte")
@@ -158,11 +157,10 @@ func parseAnd(val *anyenc.Value) (res Filter, err error) {
 		isOp bool
 		op   Operator
 	)
-	obj.Visit(func(skey string, v *anyenc.Value) {
+	obj.Visit(func(key []byte, v *anyenc.Value) {
 		if err != nil {
 			return
 		}
-		key := []byte(skey)
 		isOp, op, err = isOperator(key)
 		if err != nil {
 			return
@@ -265,11 +263,10 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 		fs = make(And, 0, obj.Len())
 	}
 
-	obj.Visit(func(sKey string, v *anyenc.Value) {
+	obj.Visit(func(key []byte, v *anyenc.Value) {
 		if err != nil {
 			return
 		}
-		key := []byte(sKey)
 		isOp, op, err = isOperator(key)
 		if err != nil {
 			return

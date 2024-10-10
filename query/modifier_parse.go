@@ -1,6 +1,7 @@
 package query
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 
@@ -9,15 +10,15 @@ import (
 )
 
 var (
-	opBytesSet      = "$set"
-	opBytesUnset    = "$unset"
-	opBytesInc      = "$inc"
-	opBytesRename   = "$rename"
-	opBytesPop      = "$pop"
-	opBytesPush     = "$push"
-	opBytesPull     = "$pull"
-	opBytesPullAll  = "$pullAll"
-	opBytesAddToSet = "$addToSet"
+	opBytesSet      = []byte("$set")
+	opBytesUnset    = []byte("$unset")
+	opBytesInc      = []byte("$inc")
+	opBytesRename   = []byte("$rename")
+	opBytesPop      = []byte("$pop")
+	opBytesPush     = []byte("$push")
+	opBytesPull     = []byte("$pull")
+	opBytesPullAll  = []byte("$pullAll")
+	opBytesAddToSet = []byte("$addToSet")
 )
 
 func MustParseModifier(modifier any) Modifier {
@@ -46,60 +47,60 @@ func parseModRoot(v *anyenc.Value) (m Modifier, err error) {
 		return nil, err
 	}
 	root := ModifierChain{}
-	obj.Visit(func(key string, v *anyenc.Value) {
+	obj.Visit(func(key []byte, v *anyenc.Value) {
 		if err != nil {
 			return
 		}
-		switch key {
-		case opBytesSet:
+		switch {
+		case bytes.Equal(key, opBytesSet):
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newSetModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
-		case opBytesUnset:
+		case bytes.Equal(key, opBytesUnset):
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newUnsetModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
-		case opBytesInc:
+		case bytes.Equal(key, opBytesInc):
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newIncModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
-		case opBytesRename:
+		case bytes.Equal(key, opBytesRename):
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newRenameModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
-		case opBytesPop:
+		case bytes.Equal(key, opBytesPop):
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newPopModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
-		case opBytesPush:
+		case bytes.Equal(key, opBytesPush):
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newPushModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
-		case opBytesPull:
+		case bytes.Equal(key, opBytesPull):
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newPullModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
-		case opBytesPullAll:
+		case bytes.Equal(key, opBytesPullAll):
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newPullAllModifier); err != nil {
 				return
 			}
 			root = append(root, setMod...)
-		case opBytesAddToSet:
+		case bytes.Equal(key, opBytesAddToSet):
 			var setMod ModifierChain
 			if setMod, err = parseMod(v, newAddToSetModifier); err != nil {
 				return
@@ -118,17 +119,17 @@ func parseModRoot(v *anyenc.Value) (m Modifier, err error) {
 	return nil, fmt.Errorf("empty modifier")
 }
 
-func parseMod(v *anyenc.Value, create func(key string, val *anyenc.Value) (Modifier, error)) (root ModifierChain, err error) {
+func parseMod(v *anyenc.Value, create func(key []byte, val *anyenc.Value) (Modifier, error)) (root ModifierChain, err error) {
 	obj, err := v.Object()
 	if err != nil {
 		return nil, err
 	}
-	obj.Visit(func(key string, v *anyenc.Value) {
+	obj.Visit(func(key []byte, v *anyenc.Value) {
 		if err != nil {
 			return
 		}
 
-		if strings.HasPrefix(key, opBytesPrefixS) {
+		if bytes.HasPrefix(key, opBytesPrefix) {
 			err = fmt.Errorf("unexpect identifier '%s'", string(key))
 			return
 		}
@@ -141,20 +142,20 @@ func parseMod(v *anyenc.Value, create func(key string, val *anyenc.Value) (Modif
 	return
 }
 
-func newSetModifier(key string, v *anyenc.Value) (Modifier, error) {
+func newSetModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 	return modifierSet{
 		fieldPath: strings.Split(string(key), "."),
 		val:       v,
 	}, nil
 }
 
-func newUnsetModifier(key string, _ *anyenc.Value) (Modifier, error) {
+func newUnsetModifier(key []byte, _ *anyenc.Value) (Modifier, error) {
 	return modifierUnset{
 		fieldPath: strings.Split(string(key), "."),
 	}, nil
 }
 
-func newIncModifier(key string, v *anyenc.Value) (Modifier, error) {
+func newIncModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 	if v.Type() != anyenc.TypeNumber {
 		return nil, fmt.Errorf("not numeric value for $inc in field '%s'", string(key))
 	}
@@ -164,7 +165,7 @@ func newIncModifier(key string, v *anyenc.Value) (Modifier, error) {
 	}, nil
 }
 
-func newRenameModifier(key string, v *anyenc.Value) (Modifier, error) {
+func newRenameModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 	stringBytes, err := v.StringBytes()
 	if err != nil {
 		return nil, fmt.Errorf("failed to rename field: %w", err)
@@ -175,7 +176,7 @@ func newRenameModifier(key string, v *anyenc.Value) (Modifier, error) {
 	}, nil
 }
 
-func newPopModifier(key string, v *anyenc.Value) (Modifier, error) {
+func newPopModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 	value, err := v.Int()
 	if err != nil {
 		return nil, fmt.Errorf("failed to pop item, %w", err)
@@ -189,14 +190,14 @@ func newPopModifier(key string, v *anyenc.Value) (Modifier, error) {
 	}, nil
 }
 
-func newPushModifier(key string, v *anyenc.Value) (Modifier, error) {
+func newPushModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 	return modifierPush{
 		fieldPath: strings.Split(string(key), "."),
 		val:       v,
 	}, nil
 }
 
-func newPullModifier(key string, v *anyenc.Value) (Modifier, error) {
+func newPullModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 	var err error
 	pull := modifierPull{
 		fieldPath: strings.Split(string(key), "."),
@@ -211,7 +212,7 @@ func newPullModifier(key string, v *anyenc.Value) (Modifier, error) {
 	return pull, nil
 }
 
-func newPullAllModifier(key string, v *anyenc.Value) (Modifier, error) {
+func newPullAllModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 	removedValues, err := v.Array()
 	if err != nil {
 		return nil, fmt.Errorf("failed to pop item, %w", err)
@@ -222,7 +223,7 @@ func newPullAllModifier(key string, v *anyenc.Value) (Modifier, error) {
 	}, nil
 }
 
-func newAddToSetModifier(key string, v *anyenc.Value) (Modifier, error) {
+func newAddToSetModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 	return modifierAddToSet{
 		fieldPath: strings.Split(string(key), "."),
 		val:       v,

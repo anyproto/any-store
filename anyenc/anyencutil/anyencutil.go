@@ -68,19 +68,19 @@ func equalObject(a *anyenc.Value, b *anyenc.Value) bool {
 	ba := b.GetObject()
 	eq := true
 	var la, lb int
-	aa.Visit(func(ka string, va *anyenc.Value) {
+	aa.Visit(func(ka []byte, va *anyenc.Value) {
 		la++
 		lb = 0
 		if !eq {
 			return
 		}
 		var bFound bool
-		ba.Visit(func(kb string, vb *anyenc.Value) {
+		ba.Visit(func(kb []byte, vb *anyenc.Value) {
 			lb++
 			if !eq {
 				return
 			}
-			if ka == kb {
+			if bytes.Equal(ka, kb) {
 				bFound = true
 				eq = Equal(va, vb)
 			}
@@ -90,7 +90,7 @@ func equalObject(a *anyenc.Value, b *anyenc.Value) bool {
 		}
 	})
 	if la == 0 {
-		ba.Visit(func(_ string, _ *anyenc.Value) {
+		ba.Visit(func(_ []byte, _ *anyenc.Value) {
 			lb++
 		})
 	}
