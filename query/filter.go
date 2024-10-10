@@ -37,6 +37,13 @@ func NewComp(op CompOp, value any) *Comp {
 	}
 }
 
+func NewCompValue(op CompOp, value *anyenc.Value) *Comp {
+	return &Comp{
+		EqValue: value.MarshalTo(nil),
+		CompOp:  op,
+	}
+}
+
 type Comp struct {
 	EqValue  []byte
 	buf      []byte
