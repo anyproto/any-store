@@ -5,6 +5,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/anyproto/any-store/anyenc"
 )
 
 func TestDb_WriteTx(t *testing.T) {
@@ -38,11 +40,19 @@ func TestDb_WriteTx(t *testing.T) {
 		tx, err := fx.WriteTx(ctx)
 		require.NoError(t, err)
 
-		require.NoError(t, coll.Insert(tx.Context(), `{"a":1}`, `{"a":2}`, `{"a":3}`))
+		require.NoError(t, coll.Insert(tx.Context(),
+			anyenc.MustParseJson(`{"id":1,"a":1}`),
+			anyenc.MustParseJson(`{"id":2,"a":2}`),
+			anyenc.MustParseJson(`{"id":3,"a":3}`),
+		))
 		assertCollCountCtx(tx.Context(), t, coll, 3)
 
 		// this insert will be failed and should rollback to savepoint
-		require.Error(t, coll.Insert(tx.Context(), `{"a":4}`, `{"a":5}`, `{"a":1}`))
+		require.Error(t, coll.Insert(tx.Context(),
+			anyenc.MustParseJson(`{"id":4,"a":4}`),
+			anyenc.MustParseJson(`{"id":5,"a":5}`),
+			anyenc.MustParseJson(`{"id":6,"a":1}`),
+		))
 		assertCollCountCtx(tx.Context(), t, coll, 3)
 
 		require.NoError(t, tx.Rollback())

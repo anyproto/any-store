@@ -4,9 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/valyala/fastjson"
-
-	"github.com/anyproto/any-store/encoding"
+	"github.com/anyproto/any-store/anyenc"
 )
 
 func MustParseSort(sorts ...any) Sort {
@@ -60,12 +58,12 @@ func parseSortString(ss string) (Sort, error) {
 
 type Sort interface {
 	Fields() []SortField
-	AppendKey(k []byte, v *fastjson.Value) []byte
+	AppendKey(k anyenc.Tuple, v *anyenc.Value) anyenc.Tuple
 }
 
 type Sorts []Sort
 
-func (ss Sorts) AppendKey(k []byte, v *fastjson.Value) []byte {
+func (ss Sorts) AppendKey(k anyenc.Tuple, v *anyenc.Value) anyenc.Tuple {
 	for _, s := range ss {
 		k = s.AppendKey(k, v)
 	}
@@ -89,11 +87,11 @@ type SortField struct {
 	Reverse bool
 }
 
-func (s *SortField) AppendKey(k []byte, v *fastjson.Value) []byte {
+func (s *SortField) AppendKey(tuple anyenc.Tuple, v *anyenc.Value) anyenc.Tuple {
 	if !s.Reverse {
-		return encoding.AppendJSONValue(k, v.Get(s.Path...))
+		return tuple.Append(v.Get(s.Path...))
 	} else {
-		return encoding.AppendInvertedJSON(k, v.Get(s.Path...))
+		return tuple.AppendInverted(v.Get(s.Path...))
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 )
 
 func readIndexInfo(buf *syncpool.DocBuffer, stmt *sqlite.Stmt) (result []IndexInfo, err error) {
+	var p = &fastjson.Parser{}
 	for {
 		hasRow, stepErr := stmt.Step()
 		if stepErr != nil {
@@ -18,7 +19,7 @@ func readIndexInfo(buf *syncpool.DocBuffer, stmt *sqlite.Stmt) (result []IndexIn
 		if !hasRow {
 			return
 		}
-		fields, err := jsonToStringArray(buf.Parser, stmt.ColumnText(1))
+		fields, err := jsonToStringArray(p, stmt.ColumnText(1))
 		if err != nil {
 			return nil, err
 		}
@@ -63,6 +64,6 @@ func jsonToStringArray(p *fastjson.Parser, j string) ([]string, error) {
 }
 
 func copyItem(buf *syncpool.DocBuffer, it item) item {
-	res, _ := buf.Parser.ParseBytes(it.val.MarshalTo(buf.DocBuf[:0]))
+	res, _ := buf.Parser.Parse(it.val.MarshalTo(buf.DocBuf[:0]))
 	return item{val: res}
 }

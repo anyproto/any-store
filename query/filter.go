@@ -8,11 +8,11 @@ import (
 
 	"github.com/valyala/fastjson"
 
-	"github.com/anyproto/any-store/encoding"
+	"github.com/anyproto/any-store/anyenc"
 )
 
 type Filter interface {
-	Ok(v *fastjson.Value) bool
+	Ok(v *anyenc.Value) bool
 
 	IndexBounds(fieldName string, bs Bounds) (bounds Bounds)
 
@@ -32,7 +32,14 @@ const (
 
 func NewComp(op CompOp, value any) *Comp {
 	return &Comp{
-		EqValue: encoding.AppendAnyValue(nil, value),
+		EqValue: anyenc.AppendAnyValue(nil, value),
+		CompOp:  op,
+	}
+}
+
+func NewCompValue(op CompOp, value *anyenc.Value) *Comp {
+	return &Comp{
+		EqValue: value.MarshalTo(nil),
 		CompOp:  op,
 	}
 }
@@ -44,7 +51,7 @@ type Comp struct {
 	notArray bool
 }
 
-func (e *Comp) Ok(v *fastjson.Value) bool {
+func (e *Comp) Ok(v *anyenc.Value) bool {
 	if v == nil {
 		if e.CompOp == CompOpNe {
 			return true
@@ -52,17 +59,17 @@ func (e *Comp) Ok(v *fastjson.Value) bool {
 			return false
 		}
 	}
-	if v.Type() == fastjson.TypeArray {
+	if v.Type() == anyenc.TypeArray {
 		vals, _ := v.Array()
 		if e.CompOp == CompOpNe {
 			if !e.notArray {
-				e.buf = encoding.AppendJSONValue(e.buf[:0], v)
+				e.buf = v.MarshalTo(e.buf[:0])
 				if !e.comp(e.buf) {
 					return false
 				}
 			}
 			for _, val := range vals {
-				e.buf = encoding.AppendJSONValue(e.buf[:0], val)
+				e.buf = val.MarshalTo(e.buf[:0])
 				if !e.comp(e.buf) {
 					return false
 				}
@@ -70,13 +77,13 @@ func (e *Comp) Ok(v *fastjson.Value) bool {
 			return true
 		} else {
 			if !e.notArray {
-				e.buf = encoding.AppendJSONValue(e.buf[:0], v)
+				e.buf = v.MarshalTo(e.buf[:0])
 				if e.comp(e.buf) {
 					return true
 				}
 			}
 			for _, val := range vals {
-				e.buf = encoding.AppendJSONValue(e.buf[:0], val)
+				e.buf = val.MarshalTo(e.buf[:0])
 				if e.comp(e.buf) {
 					return true
 				}
@@ -84,16 +91,9 @@ func (e *Comp) Ok(v *fastjson.Value) bool {
 			return false
 		}
 	} else {
-		e.buf = encoding.AppendJSONValue(e.buf[:0], v)
+		e.buf = v.MarshalTo(e.buf[:0])
 		return e.comp(e.buf)
 	}
-}
-
-func (e *Comp) OkBytes(b []byte) bool {
-	if len(b) == 0 {
-		return false
-	}
-	return e.comp(b)
 }
 
 func (e *Comp) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
@@ -171,7 +171,10 @@ func (e *Comp) String() string {
 		op = string(opBytesNe)
 	}
 	a := &fastjson.Arena{}
-	val, _, _ := encoding.DecodeToJSON(&fastjson.Parser{}, a, e.EqValue)
+	p := parserPool.Get()
+	defer parserPool.Put(p)
+	av, _ := p.Parse(e.EqValue)
+	val := av.FastJson(a)
 	return fmt.Sprintf(`{"%s": %s}`, op, val.String())
 }
 
@@ -180,7 +183,7 @@ type Key struct {
 	Filter
 }
 
-func (e Key) Ok(v *fastjson.Value) bool {
+func (e Key) Ok(v *anyenc.Value) bool {
 	return e.Filter.Ok(v.Get(e.Path...))
 }
 
@@ -197,7 +200,7 @@ func (e Key) String() string {
 
 type And []Filter
 
-func (e And) Ok(v *fastjson.Value) bool {
+func (e And) Ok(v *anyenc.Value) bool {
 	for _, f := range e {
 		if !f.Ok(v) {
 			return false
@@ -227,7 +230,7 @@ func (e And) String() string {
 
 type Or []Filter
 
-func (e Or) Ok(v *fastjson.Value) bool {
+func (e Or) Ok(v *anyenc.Value) bool {
 	for _, f := range e {
 		if f.Ok(v) {
 			return true
@@ -256,7 +259,7 @@ func (e Or) String() string {
 
 type Nor []Filter
 
-func (e Nor) Ok(v *fastjson.Value) bool {
+func (e Nor) Ok(v *anyenc.Value) bool {
 	for _, f := range e {
 		if f.Ok(v) {
 			return false
@@ -281,7 +284,7 @@ type Not struct {
 	Filter
 }
 
-func (e Not) Ok(v *fastjson.Value) bool {
+func (e Not) Ok(v *anyenc.Value) bool {
 	return !e.Filter.Ok(v)
 }
 
@@ -295,7 +298,7 @@ func (e Not) String() string {
 
 type All struct{}
 
-func (a All) Ok(_ *fastjson.Value) bool {
+func (a All) Ok(_ *anyenc.Value) bool {
 	return true
 }
 
@@ -309,7 +312,7 @@ func (a All) String() string {
 
 type Exists struct{}
 
-func (e Exists) Ok(v *fastjson.Value) bool {
+func (e Exists) Ok(v *anyenc.Value) bool {
 	return v != nil
 }
 
@@ -322,14 +325,14 @@ func (e Exists) String() string {
 }
 
 type TypeFilter struct {
-	Type encoding.Type
+	Type anyenc.Type
 }
 
-func (e TypeFilter) Ok(v *fastjson.Value) bool {
+func (e TypeFilter) Ok(v *anyenc.Value) bool {
 	if v == nil {
 		return false
 	}
-	return encoding.FastJSONTypeToType(v.Type()) == e.Type
+	return v.Type() == e.Type
 }
 
 func (e TypeFilter) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
@@ -350,14 +353,14 @@ type Regexp struct {
 	Regexp *regexp.Regexp
 }
 
-func (r Regexp) Ok(v *fastjson.Value) bool {
+func (r Regexp) Ok(v *anyenc.Value) bool {
 	if v == nil {
 		return false
 	}
-	if v.Type() != fastjson.TypeString && v.Type() != fastjson.TypeArray {
+	if v.Type() != anyenc.TypeString && v.Type() != anyenc.TypeArray {
 		return false
 	}
-	if v.Type() == fastjson.TypeArray {
+	if v.Type() == anyenc.TypeArray {
 		vals, _ := v.Array()
 		for _, val := range vals {
 			exp, err := val.StringBytes()
@@ -384,7 +387,7 @@ func (r Regexp) IndexBounds(_ string, bs Bounds) (bounds Bounds) {
 	}
 	var (
 		prefixBuf     = make([]byte, 0, len(prefix)+2)
-		prefixEncoded = encoding.AppendAnyValue(prefixBuf, prefix)
+		prefixEncoded = anyenc.AppendAnyValue(prefixBuf, prefix)
 	)
 	// strip the 'eof' byte
 	prefixEncoded = prefixEncoded[:len(prefixEncoded)-1]
@@ -454,7 +457,7 @@ type Size struct {
 	Size int64
 }
 
-func (s Size) Ok(v *fastjson.Value) bool {
+func (s Size) Ok(v *anyenc.Value) bool {
 	if v == nil {
 		return false
 	}

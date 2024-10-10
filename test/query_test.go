@@ -14,6 +14,7 @@ import (
 	"github.com/valyala/fastjson"
 
 	anystore "github.com/anyproto/any-store"
+	"github.com/anyproto/any-store/anyenc"
 )
 
 func init() {
@@ -57,9 +58,9 @@ func testFile(t *testing.T, filename string) {
 
 	require.NoError(t, json.Unmarshal(fileData, &testCases))
 
-	var docs = make([]any, len(testCases.Data))
+	var docs = make([]*anyenc.Value, len(testCases.Data))
 	for i, doc := range testCases.Data {
-		docs[i] = []byte(doc)
+		docs[i] = anyenc.MustParseJson(string(doc))
 	}
 
 	coll, err := fx.CreateCollection(ctx, "test")
@@ -82,7 +83,7 @@ func testFile(t *testing.T, filename string) {
 	require.NoError(t, coll.Insert(ctx, docs...))
 	t.Logf("inserted %d docs; %v", len(docs), time.Since(st))
 
-	for j, tc := range testCases.Tests {
+	for j, tc := range testCases.Tests[:] {
 		var cond any
 		if tc.Cond != nil {
 			cond = tc.Cond

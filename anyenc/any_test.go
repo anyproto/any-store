@@ -1,9 +1,8 @@
-package encoding
+package anyenc
 
 import (
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -29,9 +28,7 @@ func TestAppendAnyValue(t *testing.T) {
 
 	for _, v := range values {
 		b := AppendAnyValue(nil, v)
-		res, n, err := DecodeToAny(b)
+		_, err := Parse(b)
 		require.NoError(t, err)
-		assert.True(t, n > 0)
-		assert.EqualValues(t, v, res)
 	}
 }

@@ -6,11 +6,12 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/valyala/fastjson"
+
+	"github.com/anyproto/any-store/anyenc"
 )
 
-func mustParseItem(t testing.TB, s any) item {
-	it, err := parseItem(&fastjson.Parser{}, &fastjson.Arena{}, s, true)
+func mustParseItem(t testing.TB, s string) item {
+	it, err := newItem(anyenc.MustParseJson(s))
 	require.NoError(t, err)
 	return it
 }
@@ -48,41 +49,41 @@ var fillKeysCases = []fillKeysCaseIndex{
 		name: "one field",
 		info: IndexInfo{Fields: []string{"a"}},
 		cases: []fillKeysCase{
-			{`{"a":"b"}`, []string{"b"}},
-			{`{"a":["b","c"]}`, []string{"b", "c", `["b","c"]`}},
-			{`{"a":["a", "a", "b", "c", "b"]}`, []string{"a", "b", "c", `["a","a","b","c","b"]`}},
-			{`{}`, []string{"<nil>"}},
-			{`{"a":null}`, []string{"<nil>"}},
+			{`{"id":1,"a":"b"}`, []string{`"b"`}},
+			{`{"id":1,"a":["b","c"]}`, []string{`"b"`, `"c"`, `["b","c"]`}},
+			{`{"id":1,"a":["a", "a", "b", "c", "b"]}`, []string{`"a"`, `"b"`, `"c"`, `["a","a","b","c","b"]`}},
+			{`{"id":1}`, []string{"null"}},
+			{`{"id":1,"a":null}`, []string{"null"}},
 		},
 	},
 	{
 		name: "one field sparse",
 		info: IndexInfo{Fields: []string{"a"}, Sparse: true},
 		cases: []fillKeysCase{
-			{`{"a":"b"}`, []string{"b"}},
-			{`{"a":["b","c"]}`, []string{"b", "c", `["b","c"]`}},
-			{`{"a":["a", "a", "b", "c", "b"]}`, []string{"a", "b", "c", `["a","a","b","c","b"]`}},
-			{`{}`, []string{}},
-			{`{"a":null}`, []string{}},
+			{`{"id":1,"a":"b"}`, []string{`"b"`}},
+			{`{"id":1,"a":["b","c"]}`, []string{`"b"`, `"c"`, `["b","c"]`}},
+			{`{"id":1,"a":["a", "a", "b", "c", "b"]}`, []string{`"a"`, `"b"`, `"c"`, `["a","a","b","c","b"]`}},
+			{`{"id":1}`, []string{}},
+			{`{"id":1,"a":null}`, []string{}},
 		},
 	},
 	{
 		name: "reverse",
 		info: IndexInfo{Fields: []string{"-a"}},
 		cases: []fillKeysCase{
-			{`{"a":"b"}`, []string{"b"}},
-			{`{"a":["b","c"]}`, []string{"b", "c", `["b","c"]`}},
-			{`{"a":["a", "a", "b", "c", "b"]}`, []string{"a", "b", "c", `["a","a","b","c","b"]`}},
+			{`{"id":1,"a":"b"}`, []string{`"b"`}},
+			{`{"id":1,"a":["b","c"]}`, []string{`"b"`, `"c"`, `["b","c"]`}},
+			{`{"id":1,"a":["a", "a", "b", "c", "b"]}`, []string{`"a"`, `"b"`, `"c"`, `["a","a","b","c","b"]`}},
 		},
 	},
 	{
 		name: "two fields",
 		info: IndexInfo{Fields: []string{"a", "b"}},
 		cases: []fillKeysCase{
-			{`{"a":"1"}`, []string{"1/<nil>"}},
-			{`{"a":"1","b":"2"}`, []string{"1/2"}},
-			{`{"a":[1,2],"b":"2"}`, []string{"1/2", "2/2", "[1,2]/2"}},
-			{`{"a":[1,2,1],"b":[2,1,2]}`, []string{
+			{`{"id":1,"a":1}`, []string{"1/null"}},
+			{`{"id":1,"a":1,"b":2}`, []string{"1/2"}},
+			{`{"id":1,"a":[1,2],"b":2}`, []string{"1/2", "2/2", "[1,2]/2"}},
+			{`{"id":1,"a":[1,2,1],"b":[2,1,2]}`, []string{
 				"1/2", "1/1", "1/[2,1,2]",
 				"2/2", "2/1", "2/[2,1,2]",
 				"[1,2,1]/2", "[1,2,1]/1", "[1,2,1]/[2,1,2]"}},
@@ -92,9 +93,9 @@ var fillKeysCases = []fillKeysCaseIndex{
 		name: "two fields sparse",
 		info: IndexInfo{Fields: []string{"a", "b"}, Sparse: true},
 		cases: []fillKeysCase{
-			{`{"a":"1"}`, []string{}},
-			{`{"b":"2"}`, []string{}},
-			{`{"a":[1,2]}`, []string{}},
+			{`{"id":1,"a":"1"}`, []string{}},
+			{`{"id":1,"b":"2"}`, []string{}},
+			{`{"id":1,"a":[1,2]}`, []string{}},
 		},
 	},
 }
@@ -112,7 +113,7 @@ func TestIndex_fillKeysBuf(t *testing.T) {
 	for _, idxCase := range fillKeysCases[:] {
 		t.Run(idxCase.name, func(t *testing.T) {
 			idx := newIdx(idxCase.info)
-			for _, keyCase := range idxCase.cases {
+			for _, keyCase := range idxCase.cases[:] {
 				idx.fillKeysBuf(mustParseItem(t, keyCase.doc))
 				assertIdxKeyBuf(t, idx, keyCase)
 			}
@@ -130,8 +131,12 @@ func TestIndex_Insert(t *testing.T) {
 		}()
 		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true}))
 
-		require.NoError(t, coll.Insert(ctx, `{"a":1}`, `{"a":2}`, `{"a":3}`))
-		assert.ErrorIs(t, coll.Insert(ctx, `{"a":2}`), ErrUniqueConstraint)
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(`{"id":1,"a":1}`),
+			anyenc.MustParseJson(`{"id":2,"a":2}`),
+			anyenc.MustParseJson(`{"id":3,"a":3}`),
+		))
+		assert.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":2}`)), ErrUniqueConstraint)
 		assertCollCount(t, coll, 3)
 		assertIndexLen(t, coll.GetIndexes()[0], 3)
 	})
@@ -143,7 +148,11 @@ func TestIndex_Insert(t *testing.T) {
 		}()
 		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Sparse: true}))
 
-		require.NoError(t, coll.Insert(ctx, `{"a":1}`, `{"a":2}`, `{"b":3}`))
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(`{"id":1,"a":1}`),
+			anyenc.MustParseJson(`{"id":2,"a":2}`),
+			anyenc.MustParseJson(`{"id":3,"b":3}`),
+		))
 		assertCollCount(t, coll, 3)
 		assertIndexLen(t, coll.GetIndexes()[0], 2)
 	})
@@ -154,7 +163,7 @@ func TestIndex_Insert(t *testing.T) {
 			require.NoError(t, coll.Close())
 		}()
 		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-		require.NoError(t, coll.Insert(ctx, `{"a":1}`, `{"a":1}`, `{"b":3}`))
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`), anyenc.MustParseJson(`{"id":2,"a":1}`), anyenc.MustParseJson(`{"id":3,"b":3}`)))
 		assertCollCount(t, coll, 3)
 		assertIndexLen(t, coll.GetIndexes()[0], 3)
 	})
@@ -170,9 +179,9 @@ func TestIndex_Update(t *testing.T) {
 		}()
 		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true}))
 
-		require.NoError(t, coll.Insert(ctx, `{"id":1, "a":1}`, `{"id":2, "a":2}`, `{"id":3,"a":3}`))
-		require.NoError(t, coll.UpdateOne(ctx, `{"id":2,"a":4}`))
-		assert.ErrorIs(t, coll.UpdateOne(ctx, `{"id":2, "a":1}`), ErrUniqueConstraint)
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1, "a":1}`), anyenc.MustParseJson(`{"id":2, "a":2}`), anyenc.MustParseJson(`{"id":3,"a":3}`)))
+		require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":2,"a":4}`)))
+		assert.ErrorIs(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":2, "a":1}`)), ErrUniqueConstraint)
 		res, err := coll.FindId(ctx, 2)
 		require.NoError(t, err)
 		assert.Equal(t, `{"id":2,"a":4}`, res.Value().String())
@@ -185,11 +194,11 @@ func TestIndex_Update(t *testing.T) {
 		}()
 		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Sparse: true}))
 
-		require.NoError(t, coll.Insert(ctx, `{"id":1, "a":1}`, `{"id":2, "a":2}`, `{"id":3, "b":3}`))
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1, "a":1}`), anyenc.MustParseJson(`{"id":2, "a":2}`), anyenc.MustParseJson(`{"id":3, "b":3}`)))
 		assertIndexLen(t, coll.GetIndexes()[0], 2)
-		require.NoError(t, coll.UpdateOne(ctx, `{"id":1, "b":1}`))
+		require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":1, "b":1}`)))
 		assertIndexLen(t, coll.GetIndexes()[0], 1)
-		require.NoError(t, coll.UpdateOne(ctx, `{"id":3, "a":1}`))
+		require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":3, "a":1}`)))
 		assertIndexLen(t, coll.GetIndexes()[0], 2)
 	})
 }
@@ -202,7 +211,7 @@ func TestIndex_Delete(t *testing.T) {
 		require.NoError(t, coll.Close())
 	}()
 	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-	require.NoError(t, coll.Insert(ctx, `{"id":1, "a":1}`, `{"id":2, "a":1}`, `{"id":3, "b":3}`))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1, "a":1}`), anyenc.MustParseJson(`{"id":2, "a":1}`), anyenc.MustParseJson(`{"id":3, "b":3}`)))
 	assertIndexLen(t, coll.GetIndexes()[0], 3)
 
 	require.NoError(t, coll.DeleteId(ctx, 1))

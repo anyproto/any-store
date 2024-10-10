@@ -5,13 +5,15 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/anyproto/any-store/anyenc"
 )
 
 func TestIterator_Doc(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
-	docs := []any{`{"id":1,"a":"a"}`, `{"id":2,"a":"b"}`, `{"id":3,"a":"c"}`}
+	docs := []*anyenc.Value{anyenc.MustParseJson(`{"id":1,"a":"a"}`), anyenc.MustParseJson(`{"id":2,"a":"b"}`), anyenc.MustParseJson(`{"id":3,"a":"c"}`)}
 	require.NoError(t, coll.Insert(ctx, docs...))
 	t.Run("error", func(t *testing.T) {
 		iter, err := coll.Find("not valid").Iter(ctx)
@@ -26,7 +28,7 @@ func TestIterator_Doc(t *testing.T) {
 		for iter.Next() {
 			d, err = iter.Doc()
 			require.NoError(t, err)
-			assert.Equal(t, docs[i], d.Value().String())
+			assert.Equal(t, docs[i].String(), d.Value().String())
 			i++
 		}
 		require.NoError(t, iter.Err())

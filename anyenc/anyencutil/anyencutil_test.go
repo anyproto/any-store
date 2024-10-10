@@ -1,10 +1,11 @@
-package jsonutil
+package anyencutil
 
 import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/valyala/fastjson"
+
+	"github.com/anyproto/any-store/anyenc"
 )
 
 func TestEqual(t *testing.T) {
@@ -20,7 +21,7 @@ func TestEqual(t *testing.T) {
 			{`{"b":2, "a":1}`, `{"a":1, "b":2}`},
 		}
 		for _, v := range equalList {
-			assert.True(t, Equal(fastjson.MustParse(v[0]), fastjson.MustParse(v[1])), v[0], v[1])
+			assert.True(t, Equal(anyenc.MustParseJson(v[0]), anyenc.MustParseJson(v[1])), v[0], v[1])
 		}
 	})
 	t.Run("not equal", func(t *testing.T) {
@@ -36,14 +37,14 @@ func TestEqual(t *testing.T) {
 			{`{}`, `{"a":1}`},
 		}
 		for _, v := range equalList {
-			assert.False(t, Equal(fastjson.MustParse(v[0]), fastjson.MustParse(v[1])), v[0], v[1])
+			assert.False(t, Equal(anyenc.MustParseJson(v[0]), anyenc.MustParseJson(v[1])), v[0], v[1])
 		}
 	})
 }
 
 func BenchmarkEqual(b *testing.B) {
-	var ja = fastjson.MustParse(`{"a":"b", "c":["d", "e"], "f":1, "g": {"a":true, "b":null}}`)
-	var jb = fastjson.MustParse(`{"a":"b", "c":["d", "e"], "f":1, "g": {"a":true, "b":null}}`)
+	var ja = anyenc.MustParseJson(`{"a":"b", "c":["d", "e"], "f":1, "g": {"a":true, "b":null}}`)
+	var jb = anyenc.MustParseJson(`{"a":"b", "c":["d", "e"], "f":1, "g": {"a":true, "b":null}}`)
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
