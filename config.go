@@ -21,6 +21,10 @@ type Config struct {
 	// SQLiteConnectionOptions provides additional options for SQLite connections,
 	// corresponding to SQLite pragmas or other connection settings.
 	SQLiteConnectionOptions map[string]string
+
+	// SyncPoolElementMaxSize defines maximum size of buffer that can be returned to the syncpool
+	// default value id 2MiB
+	SyncPoolElementMaxSize int
 }
 
 func (c *Config) setDefaults() {
@@ -32,6 +36,9 @@ func (c *Config) setDefaults() {
 	}
 	for k, v := range defaultSQLiteOptions {
 		c.SQLiteConnectionOptions[k] = v
+	}
+	if c.SyncPoolElementMaxSize <= 0 {
+		c.SyncPoolElementMaxSize = 2 << 20
 	}
 }
 

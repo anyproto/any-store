@@ -24,6 +24,11 @@ func (a *Arena) Reset() {
 	a.c.reset()
 }
 
+// ApproxSize returns approximate size of arena cache
+func (a *Arena) ApproxSize() int {
+	return a.c.approxSize()
+}
+
 // NewObject returns new empty object value.
 //
 // New entries may be added to the returned object via Set call.

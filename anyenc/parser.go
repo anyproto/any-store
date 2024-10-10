@@ -76,6 +76,11 @@ func (p *Parser) Parse(b []byte) (v *Value, err error) {
 	return
 }
 
+// ApproxSize returns approximate size of parser cache
+func (p *Parser) ApproxSize() int {
+	return p.c.approxSize()
+}
+
 func parseValue(b []byte, c *cache) (v *Value, tail []byte, err error) {
 	if len(b) == 0 {
 		return nil, nil, fmt.Errorf("expected value, but got 0 byte")
@@ -205,4 +210,11 @@ func (c *cache) reset() {
 func (c *cache) getValue() *Value {
 	c.vs = slices.Grow(c.vs, 1)[:len(c.vs)+1]
 	return &c.vs[len(c.vs)-1]
+}
+
+func (c *cache) approxSize() (size int) {
+	for _, v := range c.vs[:cap(c.vs)] {
+		size += len(v.v) + int(valueSize)
+	}
+	return
 }

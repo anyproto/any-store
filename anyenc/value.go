@@ -5,9 +5,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strconv"
+	"unsafe"
 
 	"github.com/valyala/fastjson"
 )
+
+var valueSize = unsafe.Sizeof(Value{})
 
 // Value represents one decoded value.
 type Value struct {

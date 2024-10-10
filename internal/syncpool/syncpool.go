@@ -6,8 +6,9 @@ import (
 	"github.com/anyproto/any-store/anyenc"
 )
 
-func NewSyncPool() *SyncPool {
+func NewSyncPool(sizeLimit int) *SyncPool {
 	return &SyncPool{
+		sizeLimit: sizeLimit,
 		pool: &sync.Pool{
 			New: func() any {
 				return &DocBuffer{
@@ -20,7 +21,8 @@ func NewSyncPool() *SyncPool {
 }
 
 type SyncPool struct {
-	pool *sync.Pool
+	pool      *sync.Pool
+	sizeLimit int
 }
 
 type DocBuffer struct {
@@ -42,5 +44,8 @@ func (sp *SyncPool) GetDocBuf() *DocBuffer {
 }
 
 func (sp *SyncPool) ReleaseDocBuf(b *DocBuffer) {
+	if sp.sizeLimit > 0 && cap(b.DocBuf)+cap(b.SmallBuf)+b.Arena.ApproxSize()+b.Parser.ApproxSize() > sp.sizeLimit {
+		return
+	}
 	sp.pool.Put(b)
 }

@@ -7,7 +7,7 @@ import (
 )
 
 func TestSyncPools_GetDocBuf(t *testing.T) {
-	sp := NewSyncPool()
+	sp := NewSyncPool(1000)
 	buf := sp.GetDocBuf()
 	assert.NotNil(t, buf.Arena)
 	assert.NotNil(t, buf.Parser)

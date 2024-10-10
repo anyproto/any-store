@@ -80,7 +80,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	}
 	config.setDefaults()
 
-	sPool := syncpool.NewSyncPool()
+	sPool := syncpool.NewSyncPool(config.SyncPoolElementMaxSize)
 
 	registryBufSize := (config.ReadConnections + 1) * 4
 	ds := &db{

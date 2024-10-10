@@ -19,7 +19,7 @@ func valFromJson(str string) []byte {
 }
 
 func TestFilterRegistry_Filter(t *testing.T) {
-	fr := NewFilterRegistry(syncpool.NewSyncPool(), 4)
+	fr := NewFilterRegistry(syncpool.NewSyncPool(10000), 4)
 	filter := query.MustParseCondition
 	assert.Equal(t, 1, fr.Register(filter(`{"f":0}`)))
 	assert.Equal(t, 2, fr.Register(filter(`{"f":1}`)))
@@ -33,7 +33,7 @@ func TestFilterRegistry_Filter(t *testing.T) {
 }
 
 func TestSortRegistry_Sort(t *testing.T) {
-	sr := NewSortRegistry(syncpool.NewSyncPool(), 4)
+	sr := NewSortRegistry(syncpool.NewSyncPool(10000), 4)
 
 	var testJson = valFromJson(`{"n0":0, "n1":1, "n2":2}`)
 
@@ -51,7 +51,7 @@ func TestSortRegistry_Sort(t *testing.T) {
 func TestSortRegistryConcurrent(t *testing.T) {
 	bufSize := 10
 	numWorkers := 20
-	sr := NewSortRegistry(syncpool.NewSyncPool(), bufSize)
+	sr := NewSortRegistry(syncpool.NewSyncPool(10000), bufSize)
 	var wg sync.WaitGroup
 	for j := 0; j < 100; j++ {
 		for i := 0; i < numWorkers; i++ {
@@ -71,7 +71,7 @@ func TestSortRegistryConcurrent(t *testing.T) {
 func TestFilterRegistryConcurrent(t *testing.T) {
 	bufSize := 10
 	numWorkers := 20
-	fr := NewFilterRegistry(syncpool.NewSyncPool(), bufSize)
+	fr := NewFilterRegistry(syncpool.NewSyncPool(10000), bufSize)
 	var wg sync.WaitGroup
 	for j := 0; j < 100; j++ {
 		for i := 0; i < numWorkers; i++ {
@@ -90,7 +90,7 @@ func TestFilterRegistryConcurrent(t *testing.T) {
 }
 
 func BenchmarkFilterRegistry_Filter(b *testing.B) {
-	fr := NewFilterRegistry(syncpool.NewSyncPool(), 4)
+	fr := NewFilterRegistry(syncpool.NewSyncPool(10000), 4)
 	id := fr.Register(query.MustParseCondition(`{"f":0}`))
 	testDoc := valFromJson(`{"f":1}`)
 	b.ReportAllocs()
@@ -101,7 +101,7 @@ func BenchmarkFilterRegistry_Filter(b *testing.B) {
 }
 
 func BenchmarkSortRegistry_Sort(b *testing.B) {
-	sr := NewSortRegistry(syncpool.NewSyncPool(), 4)
+	sr := NewSortRegistry(syncpool.NewSyncPool(10000), 4)
 	id := sr.Register(query.MustParseSort("f"))
 	testDoc := valFromJson(`{"f":1}`)
 	b.ReportAllocs()
@@ -113,7 +113,7 @@ func BenchmarkSortRegistry_Sort(b *testing.B) {
 
 func BenchmarkFilterRegistry_FilterRelease(b *testing.B) {
 	cond := query.MustParseCondition(`{"f":0}`)
-	fr := NewFilterRegistry(syncpool.NewSyncPool(), 4)
+	fr := NewFilterRegistry(syncpool.NewSyncPool(10000), 4)
 	testDoc := valFromJson(`{"f":1}`)
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -125,7 +125,7 @@ func BenchmarkFilterRegistry_FilterRelease(b *testing.B) {
 }
 
 func BenchmarkSortRegistry_SortRelease(b *testing.B) {
-	sr := NewSortRegistry(syncpool.NewSyncPool(), 4)
+	sr := NewSortRegistry(syncpool.NewSyncPool(10000), 4)
 	sort := query.MustParseSort("f")
 	b.ReportAllocs()
 	b.ResetTimer()
