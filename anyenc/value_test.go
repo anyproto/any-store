@@ -164,3 +164,15 @@ func TestValue_Del(t *testing.T) {
 	val.Get("a").Del("c")
 	assert.Equal(t, `{"a":{"b":[1,3]}}`, val.String())
 }
+
+func TestValue_InvalidStrings(t *testing.T) {
+	a := &Arena{}
+	obj := a.NewObject()
+	key := "a" + string(EOS) + "b"
+	value := "c" + string(EOS) + "d"
+	obj.Set(key, a.NewString(value))
+	data := obj.MarshalTo(nil)
+	dec, err := Parse(data)
+	require.NoError(t, err)
+	assert.Equal(t, `{"ab":"cd"}`, dec.String())
+}

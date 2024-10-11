@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"slices"
 	"strconv"
 	"unsafe"
 
@@ -276,7 +277,7 @@ func (v *Value) MarshalTo(dst []byte) []byte {
 		dst = append(dst, EOS)
 	case TypeString:
 		dst = append(dst, byte(TypeString))
-		dst = append(dst, v.v...)
+		dst = appendIgnoreEOS(dst, v.v...)
 		dst = append(dst, EOS)
 	case TypeNumber:
 		dst = append(dst, byte(TypeNumber))
@@ -298,7 +299,7 @@ func (v *Value) MarshalTo(dst []byte) []byte {
 func (v *Value) marshalObject(dst []byte) []byte {
 	dst = append(dst, byte(TypeObject))
 	for _, kv := range v.o.kvs {
-		dst = append(dst, kv.key...)
+		dst = appendIgnoreEOS(dst, s2b(kv.key)...)
 		dst = append(dst, EOS)
 		dst = kv.value.MarshalTo(dst)
 	}
@@ -376,4 +377,14 @@ func (v *Value) GoType() any {
 	default:
 		panic(fmt.Errorf("unexpected type: %s", v.Type()))
 	}
+}
+
+func appendIgnoreEOS(slice []byte, elems ...byte) []byte {
+	slice = slices.Grow(slice, len(elems))
+	for i := range elems {
+		if elems[i] != EOS {
+			slice = append(slice, elems[i])
+		}
+	}
+	return slice
 }

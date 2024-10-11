@@ -134,6 +134,9 @@ func parseObject(b []byte, c *cache) (*Value, []byte, error) {
 	var i int
 	var err error
 	for {
+		if len(b) == 0 {
+			return nil, nil, fmt.Errorf("parse object: unexpected end")
+		}
 		if b[0] == EOS {
 			return o, b[1:], nil
 		}
@@ -168,6 +171,9 @@ func parseArray(b []byte, c *cache) (*Value, []byte, error) {
 	var err error
 	var val *Value
 	for {
+		if len(b) == 0 {
+			return nil, nil, fmt.Errorf("parse array: unexpected end")
+		}
 		if b[0] == EOS {
 			return a, b[1:], nil
 		}
