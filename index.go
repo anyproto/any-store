@@ -8,11 +8,10 @@ import (
 	"strings"
 	"sync/atomic"
 
-	"github.com/valyala/fastjson"
 	"zombiezen.com/go/sqlite"
 
+	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/driver"
-	"github.com/anyproto/any-store/internal/key"
 	"github.com/anyproto/any-store/internal/sql"
 )
 
@@ -64,11 +63,10 @@ type index struct {
 	fieldPaths [][]string
 	reverse    []bool
 
-	keyBuf      key.Key
-	keysBuf     []key.Key
-	keysBufPrev []key.Key
-	uniqBuf     [][]key.Key
-	jvalsBuf    []*fastjson.Value
+	keyBuf      anyenc.Tuple
+	keysBuf     []anyenc.Tuple
+	keysBufPrev []anyenc.Tuple
+	uniqBuf     [][]anyenc.Tuple
 
 	stmts struct {
 		insert,
@@ -110,7 +108,7 @@ func (idx *index) init(ctx context.Context) (err error) {
 		idx.fieldPaths = append(idx.fieldPaths, fields)
 		idx.reverse = append(idx.reverse, reverse)
 	}
-	idx.uniqBuf = make([][]key.Key, len(idx.fieldPaths))
+	idx.uniqBuf = make([][]anyenc.Tuple, len(idx.fieldPaths))
 	idx.driverValuesBuf = make([][]byte, 0, len(idx.fieldNames))
 	idx.sql = idx.c.sql.Index(idx.info.Name)
 	idx.makeQueries()
@@ -179,26 +177,26 @@ func (idx *index) RenameColl(ctx context.Context, cn *driver.Conn, name string) 
 	return idx.checkStmts(ctx, cn)
 }
 
-func (idx *index) Insert(ctx context.Context, id key.Key, it item) error {
+func (idx *index) Insert(ctx context.Context, id anyenc.Tuple, it item) error {
 	idx.fillKeysBuf(it)
 	return idx.insertBuf(ctx, id)
 }
 
-func (idx *index) Update(ctx context.Context, id key.Key, prevIt, newIt item) (err error) {
+func (idx *index) Update(ctx context.Context, id anyenc.Tuple, prevIt, newIt item) (err error) {
 	// calc previous index keys
 	idx.fillKeysBuf(prevIt)
 
 	// copy prev keys to second buffer
 	idx.keysBufPrev = slices.Grow(idx.keysBufPrev, len(idx.keysBuf))[:len(idx.keysBuf)]
 	for i, k := range idx.keysBuf {
-		idx.keysBufPrev[i] = k.CopyTo(idx.keysBufPrev[i][:0])
+		idx.keysBufPrev[i] = append(idx.keysBufPrev[i][:0], k...)
 	}
 
 	// calc new index keys
 	idx.fillKeysBuf(newIt)
 
 	// delete equal keys from both bufs
-	idx.keysBuf = slices.DeleteFunc(idx.keysBuf, func(k key.Key) bool {
+	idx.keysBuf = slices.DeleteFunc(idx.keysBuf, func(k anyenc.Tuple) bool {
 		for i, pk := range idx.keysBufPrev {
 			if bytes.Equal(k, pk) {
 				idx.keysBufPrev = slices.Delete(idx.keysBufPrev, i, i+1)
@@ -213,7 +211,7 @@ func (idx *index) Update(ctx context.Context, id key.Key, prevIt, newIt item) (e
 	return idx.insertBuf(ctx, id)
 }
 
-func (idx *index) Delete(ctx context.Context, id key.Key, prevIt item) error {
+func (idx *index) Delete(ctx context.Context, id anyenc.Tuple, prevIt item) error {
 	idx.fillKeysBuf(prevIt)
 	return idx.deleteBuf(ctx, id, idx.keysBuf)
 }
@@ -221,26 +219,26 @@ func (idx *index) Delete(ctx context.Context, id key.Key, prevIt item) error {
 func (idx *index) writeKey() {
 	nl := len(idx.keysBuf) + 1
 	idx.keysBuf = slices.Grow(idx.keysBuf, nl)[:nl]
-	idx.keysBuf[nl-1] = idx.keyBuf.CopyTo(idx.keysBuf[nl-1][:0])
+	idx.keysBuf[nl-1] = append(idx.keysBuf[nl-1][:0], idx.keyBuf...)
 }
 
-func (idx *index) writeValues(d *fastjson.Value, i int) bool {
+func (idx *index) writeValues(d *anyenc.Value, i int) bool {
 	if i == len(idx.fieldPaths) {
 		idx.writeKey()
 		return true
 	}
 	v := d.Get(idx.fieldPaths[i]...)
-	if idx.info.Sparse && (v == nil || v.Type() == fastjson.TypeNull) {
+	if idx.info.Sparse && (v == nil || v.Type() == anyenc.TypeNull) {
 		return false
 	}
 
 	k := idx.keyBuf
-	if v != nil && v.Type() == fastjson.TypeArray {
+	if v != nil && v.Type() == anyenc.TypeArray {
 		arr, _ := v.Array()
 		if len(arr) != 0 {
 			idx.uniqBuf[i] = idx.uniqBuf[i][:0]
 			for _, av := range arr {
-				idx.keyBuf = k.AppendJSON(av)
+				idx.keyBuf = av.MarshalTo(k)
 				if idx.isUnique(i, idx.keyBuf) {
 					if !idx.writeValues(d, i+1) {
 						return false
@@ -250,7 +248,7 @@ func (idx *index) writeValues(d *fastjson.Value, i int) bool {
 		}
 	}
 
-	idx.keyBuf = k.AppendJSON(v)
+	idx.keyBuf = v.MarshalTo(k)
 	return idx.writeValues(d, i+1)
 }
 
@@ -270,7 +268,7 @@ func (idx *index) resetUnique() {
 	}
 }
 
-func (idx *index) isUnique(i int, k key.Key) bool {
+func (idx *index) isUnique(i int, k anyenc.Tuple) bool {
 	for _, ek := range idx.uniqBuf[i] {
 		if bytes.Equal(k, ek) {
 			return false
@@ -278,7 +276,7 @@ func (idx *index) isUnique(i int, k key.Key) bool {
 	}
 	nl := len(idx.uniqBuf[i]) + 1
 	idx.uniqBuf[i] = slices.Grow(idx.uniqBuf[i], nl)[:nl]
-	idx.uniqBuf[i][nl-1] = k.CopyTo(idx.uniqBuf[i][nl-1][:0])
+	idx.uniqBuf[i][nl-1] = append(idx.uniqBuf[i][nl-1][:0], k...)
 	return true
 }
 
@@ -287,7 +285,7 @@ func (idx *index) insertBuf(ctx context.Context, id []byte) (err error) {
 		err = idx.stmts.insert.Exec(ctx, func(stmt *sqlite.Stmt) {
 			stmt.BindBytes(1, id)
 			var i = 2
-			_ = k.ReadByteValues(func(b []byte) error {
+			_ = k.ReadBytes(func(b []byte) error {
 				stmt.BindBytes(i, b)
 				i++
 				return nil
@@ -300,12 +298,12 @@ func (idx *index) insertBuf(ctx context.Context, id []byte) (err error) {
 	return
 }
 
-func (idx *index) deleteBuf(ctx context.Context, id []byte, buf []key.Key) (err error) {
+func (idx *index) deleteBuf(ctx context.Context, id []byte, buf []anyenc.Tuple) (err error) {
 	for _, k := range buf {
 		err = idx.stmts.delete.Exec(ctx, func(stmt *sqlite.Stmt) {
 			stmt.BindBytes(1, id)
 			var i = 2
-			_ = k.ReadByteValues(func(b []byte) error {
+			_ = k.ReadBytes(func(b []byte) error {
 				stmt.BindBytes(i, b)
 				i++
 				return nil

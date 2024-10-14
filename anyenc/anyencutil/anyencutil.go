@@ -1,32 +1,32 @@
-package jsonutil
+package anyencutil
 
 import (
 	"bytes"
 
-	"github.com/valyala/fastjson"
+	"github.com/anyproto/any-store/anyenc"
 )
 
 type Value struct {
-	Value *fastjson.Value
-	p     *fastjson.Parser
+	Value *anyenc.Value
+	p     *anyenc.Parser
 	buf   []byte
 }
 
-func (v *Value) FillCopy(fv *fastjson.Value) {
+func (v *Value) FillCopy(fv *anyenc.Value) {
 	v.buf = fv.MarshalTo(v.buf[:0])
 	if v.p == nil {
-		v.p = &fastjson.Parser{}
+		v.p = &anyenc.Parser{}
 	}
-	v.Value, _ = v.p.ParseBytes(v.buf)
+	v.Value, _ = v.p.Parse(v.buf)
 	return
 }
 
-func (v *Value) Equal(b *fastjson.Value) bool {
+func (v *Value) Equal(b *anyenc.Value) bool {
 	return Equal(v.Value, b)
 }
 
 // Equal checks if two JSON values are equal
-func Equal(a, b *fastjson.Value) bool {
+func Equal(a, b *anyenc.Value) bool {
 	if a == b {
 		return true
 	}
@@ -37,19 +37,19 @@ func Equal(a, b *fastjson.Value) bool {
 		return false
 	}
 	switch a.Type() {
-	case fastjson.TypeArray:
+	case anyenc.TypeArray:
 		return equalArray(a, b)
-	case fastjson.TypeObject:
+	case anyenc.TypeObject:
 		return equalObject(a, b)
-	case fastjson.TypeString:
+	case anyenc.TypeString:
 		return bytes.Equal(a.GetStringBytes(), b.GetStringBytes())
-	case fastjson.TypeNumber:
+	case anyenc.TypeNumber:
 		return a.GetFloat64() == b.GetFloat64()
 	}
 	return true
 }
 
-func equalArray(a *fastjson.Value, b *fastjson.Value) bool {
+func equalArray(a *anyenc.Value, b *anyenc.Value) bool {
 	aa := a.GetArray()
 	ba := b.GetArray()
 	if len(aa) != len(ba) {
@@ -63,19 +63,19 @@ func equalArray(a *fastjson.Value, b *fastjson.Value) bool {
 	return true
 }
 
-func equalObject(a *fastjson.Value, b *fastjson.Value) bool {
+func equalObject(a *anyenc.Value, b *anyenc.Value) bool {
 	aa := a.GetObject()
 	ba := b.GetObject()
 	eq := true
 	var la, lb int
-	aa.Visit(func(ka []byte, va *fastjson.Value) {
+	aa.Visit(func(ka []byte, va *anyenc.Value) {
 		la++
 		lb = 0
 		if !eq {
 			return
 		}
 		var bFound bool
-		ba.Visit(func(kb []byte, vb *fastjson.Value) {
+		ba.Visit(func(kb []byte, vb *anyenc.Value) {
 			lb++
 			if !eq {
 				return
@@ -90,7 +90,7 @@ func equalObject(a *fastjson.Value, b *fastjson.Value) bool {
 		}
 	})
 	if la == 0 {
-		ba.Visit(func(kb []byte, vb *fastjson.Value) {
+		ba.Visit(func(_ []byte, _ *anyenc.Value) {
 			lb++
 		})
 	}

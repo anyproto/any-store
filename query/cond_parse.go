@@ -6,9 +6,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/valyala/fastjson"
-
-	"github.com/anyproto/any-store/encoding"
+	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/parser"
 )
 
@@ -77,15 +75,15 @@ func ParseCondition(cond any) (Filter, error) {
 		return f, nil
 	}
 
-	v, err := parser.AnyToJSON(&fastjson.Parser{}, cond)
+	v, err := parser.Parse(cond)
 	if err != nil {
 		return nil, err
 	}
 	return parseAnd(v)
 }
 
-func parseAndArray(v *fastjson.Value) (f Filter, err error) {
-	if v.Type() != fastjson.TypeArray {
+func parseAndArray(v *anyenc.Value) (f Filter, err error) {
+	if v.Type() != anyenc.TypeArray {
 		return nil, fmt.Errorf("$and must be an array")
 	}
 	arr, _ := v.Array()
@@ -107,8 +105,8 @@ func parseAndArray(v *fastjson.Value) (f Filter, err error) {
 	return
 }
 
-func parseOrArray(v *fastjson.Value) (f Filter, err error) {
-	if v.Type() != fastjson.TypeArray {
+func parseOrArray(v *anyenc.Value) (f Filter, err error) {
+	if v.Type() != anyenc.TypeArray {
 		return nil, fmt.Errorf("$or must be an array")
 	}
 	arr, _ := v.Array()
@@ -130,8 +128,8 @@ func parseOrArray(v *fastjson.Value) (f Filter, err error) {
 	return
 }
 
-func parseNorArray(v *fastjson.Value) (f Filter, err error) {
-	if v.Type() != fastjson.TypeArray {
+func parseNorArray(v *anyenc.Value) (f Filter, err error) {
+	if v.Type() != anyenc.TypeArray {
 		return nil, fmt.Errorf("$or must be an array")
 	}
 	arr, _ := v.Array()
@@ -145,8 +143,8 @@ func parseNorArray(v *fastjson.Value) (f Filter, err error) {
 	return fs, nil
 }
 
-func parseAnd(val *fastjson.Value) (res Filter, err error) {
-	if val.Type() != fastjson.TypeObject {
+func parseAnd(val *anyenc.Value) (res Filter, err error) {
+	if val.Type() != anyenc.TypeObject {
 		return nil, fmt.Errorf("query filter must be an object")
 	}
 	obj, _ := val.Object()
@@ -159,7 +157,7 @@ func parseAnd(val *fastjson.Value) (res Filter, err error) {
 		isOp bool
 		op   Operator
 	)
-	obj.Visit(func(key []byte, v *fastjson.Value) {
+	obj.Visit(func(key []byte, v *anyenc.Value) {
 		if err != nil {
 			return
 		}
@@ -216,24 +214,24 @@ func parseAnd(val *fastjson.Value) (res Filter, err error) {
 	return f, nil
 }
 
-func parseComp(key string, v *fastjson.Value) (f Filter, err error) {
+func parseComp(key string, v *anyenc.Value) (f Filter, err error) {
 	fk := Key{
 		Path: strings.Split(key, "."),
 	}
-	if v.Type() == fastjson.TypeObject {
+	if v.Type() == anyenc.TypeObject {
 		if fk.Filter, err = parseCompObj(v); err != nil {
 			return nil, err
 		}
 	} else {
 		eq := &Comp{}
-		eq.EqValue = encoding.AppendJSONValue(eq.EqValue, v)
-		eq.notArray = v.Type() != fastjson.TypeArray
+		eq.EqValue = v.MarshalTo(nil)
+		eq.notArray = v.Type() != anyenc.TypeArray
 		fk.Filter = eq
 	}
 	return fk, nil
 }
 
-func parseCompObj(v *fastjson.Value) (Filter, error) {
+func parseCompObj(v *anyenc.Value) (Filter, error) {
 	hasCompOp, f, err := parseCompObjOp(v)
 	if err != nil {
 		return nil, err
@@ -242,14 +240,14 @@ func parseCompObj(v *fastjson.Value) (Filter, error) {
 		return f, nil
 	} else {
 		cmp := &Comp{}
-		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
+		cmp.EqValue = v.MarshalTo(nil)
 		cmp.CompOp = CompOpEq
-		cmp.notArray = v.Type() != fastjson.TypeArray
+		cmp.notArray = v.Type() != anyenc.TypeArray
 		return cmp, nil
 	}
 }
 
-func parseCompObjOp(val *fastjson.Value) (ok bool, f Filter, err error) {
+func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 	obj, e := val.Object()
 	if e != nil {
 		return false, nil, fmt.Errorf("expected object")
@@ -265,7 +263,7 @@ func parseCompObjOp(val *fastjson.Value) (ok bool, f Filter, err error) {
 		fs = make(And, 0, obj.Len())
 	}
 
-	obj.Visit(func(key []byte, v *fastjson.Value) {
+	obj.Visit(func(key []byte, v *anyenc.Value) {
 		if err != nil {
 			return
 		}
@@ -309,43 +307,43 @@ func parseCompObjOp(val *fastjson.Value) (ok bool, f Filter, err error) {
 	return true, f, nil
 }
 
-func makeCompFilter(op Operator, v *fastjson.Value) (f Filter, err error) {
+func makeCompFilter(op Operator, v *anyenc.Value) (f Filter, err error) {
 	switch op {
 	case opEq:
 		cmp := &Comp{}
-		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
+		cmp.EqValue = v.MarshalTo(nil)
 		cmp.CompOp = CompOpEq
-		cmp.notArray = v.Type() != fastjson.TypeArray
+		cmp.notArray = v.Type() != anyenc.TypeArray
 		return cmp, nil
 	case opNe:
 		cmp := &Comp{}
-		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
+		cmp.EqValue = v.MarshalTo(nil)
 		cmp.CompOp = CompOpNe
-		cmp.notArray = v.Type() != fastjson.TypeArray
+		cmp.notArray = v.Type() != anyenc.TypeArray
 		return cmp, nil
 	case opGt:
 		cmp := &Comp{}
-		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
+		cmp.EqValue = v.MarshalTo(nil)
 		cmp.CompOp = CompOpGt
-		cmp.notArray = v.Type() != fastjson.TypeArray
+		cmp.notArray = v.Type() != anyenc.TypeArray
 		return cmp, nil
 	case opGte:
 		cmp := &Comp{}
-		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
+		cmp.EqValue = v.MarshalTo(nil)
 		cmp.CompOp = CompOpGte
-		cmp.notArray = v.Type() != fastjson.TypeArray
+		cmp.notArray = v.Type() != anyenc.TypeArray
 		return cmp, nil
 	case opLt:
 		cmp := &Comp{}
-		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
+		cmp.EqValue = v.MarshalTo(nil)
 		cmp.CompOp = CompOpLt
-		cmp.notArray = v.Type() != fastjson.TypeArray
+		cmp.notArray = v.Type() != anyenc.TypeArray
 		return cmp, nil
 	case opLte:
 		cmp := &Comp{}
-		cmp.EqValue = encoding.AppendJSONValue(cmp.EqValue, v)
+		cmp.EqValue = v.MarshalTo(nil)
 		cmp.CompOp = CompOpLte
-		cmp.notArray = v.Type() != fastjson.TypeArray
+		cmp.notArray = v.Type() != anyenc.TypeArray
 		return cmp, nil
 	case opNot:
 		var isOp bool
@@ -370,17 +368,17 @@ func makeCompFilter(op Operator, v *fastjson.Value) (f Filter, err error) {
 	}
 }
 
-func parseSize(v *fastjson.Value) (Filter, error) {
-	size, err := v.Int64()
+func parseSize(v *anyenc.Value) (Filter, error) {
+	size, err := v.Int()
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract size %w", err)
 	}
-	return Size{Size: size}, nil
+	return Size{Size: int64(size)}, nil
 }
 
-func parseRegexp(v *fastjson.Value) (Filter, error) {
+func parseRegexp(v *anyenc.Value) (Filter, error) {
 	switch v.Type() {
-	case fastjson.TypeString:
+	case anyenc.TypeString:
 		exp, err := v.StringBytes()
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse regular exporession: %w", err)
@@ -395,8 +393,8 @@ func parseRegexp(v *fastjson.Value) (Filter, error) {
 	}
 }
 
-func makeArrComp(op Operator, v *fastjson.Value) (Filter, error) {
-	if v.Type() != fastjson.TypeArray {
+func makeArrComp(op Operator, v *anyenc.Value) (Filter, error) {
+	if v.Type() != anyenc.TypeArray {
 		return nil, fmt.Errorf("expected array for %v operator", op)
 	}
 	switch op {
@@ -411,23 +409,23 @@ func makeArrComp(op Operator, v *fastjson.Value) (Filter, error) {
 	}
 }
 
-func makeEqArray(v *fastjson.Value) []Filter {
+func makeEqArray(v *anyenc.Value) []Filter {
 	vals, _ := v.Array()
 	res := make([]Filter, len(vals))
-	for i, jv := range vals {
+	for i, av := range vals {
 		eq := &Comp{CompOp: CompOpEq}
-		eq.EqValue = encoding.AppendJSONValue(eq.EqValue, jv)
-		eq.notArray = jv.Type() != fastjson.TypeArray
+		eq.EqValue = av.MarshalTo(nil)
+		eq.notArray = av.Type() != anyenc.TypeArray
 		res[i] = eq
 	}
 	return res
 }
 
-func parseExists(v *fastjson.Value) (f Filter, err error) {
+func parseExists(v *anyenc.Value) (f Filter, err error) {
 	switch v.Type() {
-	case fastjson.TypeFalse, fastjson.TypeNull:
+	case anyenc.TypeFalse, anyenc.TypeNull:
 		return Not{Exists{}}, nil
-	case fastjson.TypeNumber:
+	case anyenc.TypeNumber:
 		if i, _ := v.Int(); i == 0 {
 			return Not{Exists{}}, nil
 		}
@@ -435,22 +433,22 @@ func parseExists(v *fastjson.Value) (f Filter, err error) {
 	return Exists{}, nil
 }
 
-func parseType(v *fastjson.Value) (f Filter, err error) {
+func parseType(v *anyenc.Value) (f Filter, err error) {
 	switch v.Type() {
-	case fastjson.TypeNumber:
+	case anyenc.TypeNumber:
 		n, _ := v.Int()
 		tv := Type(n)
 		if tv > TypeObject || tv < 0 {
 			return nil, fmt.Errorf("unexpected type: %d", n)
 		}
-		return TypeFilter{Type: encoding.Type(tv)}, err
-	case fastjson.TypeString:
+		return TypeFilter{Type: anyenc.Type(tv)}, err
+	case anyenc.TypeString:
 		bs, _ := v.StringBytes()
 		tv, ok := stringToType[string(bs)]
 		if !ok {
 			return nil, fmt.Errorf("unexpected type: %s", string(bs))
 		}
-		return TypeFilter{Type: encoding.Type(tv)}, err
+		return TypeFilter{Type: anyenc.Type(tv)}, err
 	default:
 		return nil, fmt.Errorf("unexpetced type: %s", v.String())
 	}

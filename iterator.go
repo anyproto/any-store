@@ -67,11 +67,11 @@ func (i *iterator) Doc() (Doc, error) {
 		return nil, i.err
 	}
 	i.buf.DocBuf = readBytes(i.stmt, i.buf.DocBuf)
-	val, err := i.buf.Parser.ParseBytes(i.buf.DocBuf)
+	val, err := i.buf.Parser.Parse(i.buf.DocBuf)
 	if err != nil {
 		return nil, err
 	}
-	return newItem(val, nil, false)
+	return newItem(val)
 }
 
 func (i *iterator) Err() error {

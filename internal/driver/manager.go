@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
@@ -12,11 +13,24 @@ import (
 )
 
 var (
-	ErrDBIsClosed    = errors.New("any-store: db is closed")
-	ErrDBIsNotOpened = errors.New("any-store: db is not opened")
+	ErrDBIsClosed          = errors.New("any-store: db is closed")
+	ErrDBIsNotOpened       = errors.New("any-store: db is not opened")
+	ErrIncompatibleVersion = errors.New("any-store: incompatible version")
 )
 
-func NewConnManager(path string, pragma map[string]string, writeCount, readCount int, fr *registry.FilterRegistry, sr *registry.SortRegistry) (*ConnManager, error) {
+func NewConnManager(
+	path string,
+	pragma map[string]string,
+	writeCount, readCount int,
+	fr *registry.FilterRegistry, sr *registry.SortRegistry,
+	version int,
+) (*ConnManager, error) {
+	_, statErr := os.Stat(path)
+	var newDb bool
+	if os.IsNotExist(statErr) {
+		newDb = true
+	}
+
 	var (
 		writeConn = make([]*Conn, 0, writeCount)
 		readConn  = make([]*Conn, 0, readCount)
@@ -29,7 +43,6 @@ func NewConnManager(path string, pragma map[string]string, writeCount, readCount
 			_ = conn.Close()
 		}
 	}
-
 	for i := 0; i < writeCount; i++ {
 		conn, err := sqlite.OpenConn(path, sqlite.OpenCreate|sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadWrite)
 		if err != nil {
@@ -41,6 +54,12 @@ func NewConnManager(path string, pragma map[string]string, writeCount, readCount
 			return nil, err
 		}
 		writeConn = append(writeConn, &Conn{conn: conn})
+		if i == 0 {
+			if err = checkVersion(conn, version, newDb); err != nil {
+				closeAll()
+				return nil, err
+			}
+		}
 	}
 
 	for i := 0; i < readCount; i++ {
@@ -185,4 +204,23 @@ func (c *ConnManager) Close() (err error) {
 	}
 
 	return err
+}
+
+func checkVersion(conn *sqlite.Conn, version int, isNewDb bool) (err error) {
+	var currVersion int
+	if !isNewDb {
+		err = sqlitex.ExecuteTransient(conn, "PRAGMA user_version", &sqlitex.ExecOptions{
+			ResultFunc: func(stmt *sqlite.Stmt) error {
+				currVersion = stmt.ColumnInt(0)
+				return nil
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if version != currVersion {
+			return errors.Join(ErrIncompatibleVersion, fmt.Errorf("want version: %d; got: %d", version, currVersion))
+		}
+	}
+	return sqlitex.ExecuteTransient(conn, fmt.Sprintf("PRAGMA user_version = %d", version), nil)
 }

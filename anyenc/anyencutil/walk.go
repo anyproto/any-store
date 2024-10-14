@@ -1,20 +1,20 @@
-package jsonutil
+package anyencutil
 
 import (
 	"fmt"
 	"strconv"
 
-	"github.com/valyala/fastjson"
+	"github.com/anyproto/any-store/anyenc"
 )
 
 // Walk walks to the given path and calls the "finalize" function that can replace the value.
 // If create == true path will be created
-func Walk(a *fastjson.Arena, v *fastjson.Value, fieldPath []string, create bool, finalize func(prevValue *fastjson.Value, value *fastjson.Value) (res *fastjson.Value, err error)) (err error) {
+func Walk(a *anyenc.Arena, v *anyenc.Value, fieldPath []string, create bool, finalize func(prevValue *anyenc.Value, value *anyenc.Value) (res *anyenc.Value, err error)) (err error) {
 	prevField := v
 	for i, path := range fieldPath {
 		field := prevField.Get(path)
 		if i == len(fieldPath)-1 {
-			var newVal *fastjson.Value
+			var newVal *anyenc.Value
 			if newVal, err = finalize(prevField, field); err != nil {
 				return
 			}
@@ -24,7 +24,7 @@ func Walk(a *fastjson.Arena, v *fastjson.Value, fieldPath []string, create bool,
 				}
 				return
 			}
-			if prevField.Type() == fastjson.TypeArray {
+			if prevField.Type() == anyenc.TypeArray {
 				idx, err := strconv.Atoi(path)
 				if err != nil || idx < 0 {
 					return fmt.Errorf("cannot create field '%s' in element %s", path, prevField.String())
@@ -43,13 +43,13 @@ func Walk(a *fastjson.Arena, v *fastjson.Value, fieldPath []string, create bool,
 				}
 			} else {
 				switch field.Type() {
-				case fastjson.TypeObject:
-				case fastjson.TypeArray:
+				case anyenc.TypeObject:
+				case anyenc.TypeArray:
 				default:
 					return fmt.Errorf("cannot create field '%s' in element %s", fieldPath[i+1], field.String())
 				}
 			}
-			if prevField.Type() == fastjson.TypeArray {
+			if prevField.Type() == anyenc.TypeArray {
 				idx, err := strconv.Atoi(path)
 				if err != nil || idx < 0 {
 					return fmt.Errorf("cannot create field '%s' in element %s", path, prevField.String())

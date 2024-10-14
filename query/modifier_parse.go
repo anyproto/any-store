@@ -5,8 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/valyala/fastjson"
-
+	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/parser"
 )
 
@@ -35,20 +34,20 @@ func ParseModifier(modifier any) (Modifier, error) {
 		return m, nil
 	}
 
-	v, err := parser.AnyToJSON(&fastjson.Parser{}, modifier)
+	v, err := parser.Parse(modifier)
 	if err != nil {
 		return nil, err
 	}
 	return parseModRoot(v)
 }
 
-func parseModRoot(v *fastjson.Value) (m Modifier, err error) {
+func parseModRoot(v *anyenc.Value) (m Modifier, err error) {
 	obj, err := v.Object()
 	if err != nil {
 		return nil, err
 	}
 	root := ModifierChain{}
-	obj.Visit(func(key []byte, v *fastjson.Value) {
+	obj.Visit(func(key []byte, v *anyenc.Value) {
 		if err != nil {
 			return
 		}
@@ -120,12 +119,12 @@ func parseModRoot(v *fastjson.Value) (m Modifier, err error) {
 	return nil, fmt.Errorf("empty modifier")
 }
 
-func parseMod(v *fastjson.Value, create func(key []byte, val *fastjson.Value) (Modifier, error)) (root ModifierChain, err error) {
+func parseMod(v *anyenc.Value, create func(key []byte, val *anyenc.Value) (Modifier, error)) (root ModifierChain, err error) {
 	obj, err := v.Object()
 	if err != nil {
 		return nil, err
 	}
-	obj.Visit(func(key []byte, v *fastjson.Value) {
+	obj.Visit(func(key []byte, v *anyenc.Value) {
 		if err != nil {
 			return
 		}
@@ -143,21 +142,21 @@ func parseMod(v *fastjson.Value, create func(key []byte, val *fastjson.Value) (M
 	return
 }
 
-func newSetModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+func newSetModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 	return modifierSet{
 		fieldPath: strings.Split(string(key), "."),
 		val:       v,
 	}, nil
 }
 
-func newUnsetModifier(key []byte, _ *fastjson.Value) (Modifier, error) {
+func newUnsetModifier(key []byte, _ *anyenc.Value) (Modifier, error) {
 	return modifierUnset{
 		fieldPath: strings.Split(string(key), "."),
 	}, nil
 }
 
-func newIncModifier(key []byte, v *fastjson.Value) (Modifier, error) {
-	if v.Type() != fastjson.TypeNumber {
+func newIncModifier(key []byte, v *anyenc.Value) (Modifier, error) {
+	if v.Type() != anyenc.TypeNumber {
 		return nil, fmt.Errorf("not numeric value for $inc in field '%s'", string(key))
 	}
 	return modifierInc{
@@ -166,7 +165,7 @@ func newIncModifier(key []byte, v *fastjson.Value) (Modifier, error) {
 	}, nil
 }
 
-func newRenameModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+func newRenameModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 	stringBytes, err := v.StringBytes()
 	if err != nil {
 		return nil, fmt.Errorf("failed to rename field: %w", err)
@@ -177,7 +176,7 @@ func newRenameModifier(key []byte, v *fastjson.Value) (Modifier, error) {
 	}, nil
 }
 
-func newPopModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+func newPopModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 	value, err := v.Int()
 	if err != nil {
 		return nil, fmt.Errorf("failed to pop item, %w", err)
@@ -191,19 +190,19 @@ func newPopModifier(key []byte, v *fastjson.Value) (Modifier, error) {
 	}, nil
 }
 
-func newPushModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+func newPushModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 	return modifierPush{
 		fieldPath: strings.Split(string(key), "."),
 		val:       v,
 	}, nil
 }
 
-func newPullModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+func newPullModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 	var err error
 	pull := modifierPull{
 		fieldPath: strings.Split(string(key), "."),
 	}
-	if v.Type() == fastjson.TypeObject {
+	if v.Type() == anyenc.TypeObject {
 		pull.filter, err = parseCompObj(v)
 		if err == nil {
 			return pull, nil
@@ -213,7 +212,7 @@ func newPullModifier(key []byte, v *fastjson.Value) (Modifier, error) {
 	return pull, nil
 }
 
-func newPullAllModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+func newPullAllModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 	removedValues, err := v.Array()
 	if err != nil {
 		return nil, fmt.Errorf("failed to pop item, %w", err)
@@ -224,7 +223,7 @@ func newPullAllModifier(key []byte, v *fastjson.Value) (Modifier, error) {
 	}, nil
 }
 
-func newAddToSetModifier(key []byte, v *fastjson.Value) (Modifier, error) {
+func newAddToSetModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 	return modifierAddToSet{
 		fieldPath: strings.Split(string(key), "."),
 		val:       v,

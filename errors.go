@@ -45,8 +45,9 @@ var (
 	// ErrIterClosed is returned when operations are attempted on a closed iterator.
 	ErrIterClosed = errors.New("any-store: iterator is closed")
 
-	ErrDBIsClosed    = driver.ErrDBIsClosed
-	ErrDBIsNotOpened = driver.ErrDBIsNotOpened
+	ErrDBIsClosed          = driver.ErrDBIsClosed
+	ErrDBIsNotOpened       = driver.ErrDBIsNotOpened
+	ErrIncompatibleVersion = driver.ErrIncompatibleVersion
 )
 
 func replaceUniqErr(err, replaceTo error) error {
