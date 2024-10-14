@@ -162,11 +162,11 @@ func TestCollQuery_Explain(t *testing.T) {
 		)
 		assertExplain(t, coll.Find(nil).Sort("a", "id"),
 			"SELECT data FROM '_test_s_docs' JOIN '_test_s_a_idx' ON '_test_s_a_idx'.docId = id  ORDER BY '_test_s_a_idx'.val0, id",
-			"SCAN _test_s_a_idx USING COVERING INDEX sqlite_autoindex__test_s_a_idx_1\nSEARCH _test_s_docs USING INDEX sqlite_autoindex__test_s_docs_1 (id=?)\nUSE TEMP B-TREE FOR RIGHT PART OF ORDER BY",
+			"SCAN _test_s_a_idx USING COVERING INDEX sqlite_autoindex__test_s_a_idx_1\nSEARCH _test_s_docs USING INDEX sqlite_autoindex__test_s_docs_1 (id=?)\nUSE TEMP B-TREE FOR LAST TERM OF ORDER BY",
 		)
 		assertExplain(t, coll.Find(nil).Sort("a", "id", "b"),
 			"SELECT data FROM '_test_s_docs' JOIN '_test_s_a_idx' ON '_test_s_a_idx'.docId = id  ORDER BY '_test_s_a_idx'.val0, id, any_sort(1, data)",
-			"SCAN _test_s_a_idx USING COVERING INDEX sqlite_autoindex__test_s_a_idx_1\nSEARCH _test_s_docs USING INDEX sqlite_autoindex__test_s_docs_1 (id=?)\nUSE TEMP B-TREE FOR RIGHT PART OF ORDER BY",
+			"SCAN _test_s_a_idx USING COVERING INDEX sqlite_autoindex__test_s_a_idx_1\nSEARCH _test_s_docs USING INDEX sqlite_autoindex__test_s_docs_1 (id=?)\nUSE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY",
 		)
 	})
 	t.Run("many indexes", func(t *testing.T) {
