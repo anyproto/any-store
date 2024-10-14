@@ -100,6 +100,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		config.ReadConnections,
 		ds.filterReg,
 		ds.sortReg,
+		2, // sqlite user_version
 	); err != nil {
 		return nil, err
 	}
