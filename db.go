@@ -3,6 +3,7 @@ package anystore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -42,6 +43,12 @@ type DB interface {
 	// Stats returns the statistics of the database.
 	// Returns a DBStats struct containing the database statistics or an error if there is an issue retrieving the stats.
 	Stats(ctx context.Context) (DBStats, error)
+
+	// QuickCheck performs PRAGMA quick_check to sqlite. If result not ok returns error.
+	QuickCheck(ctx context.Context) (err error)
+
+	// Checkpoint performs PRAGMA wal_checkpoint to sqlite. isFull=true - wal_checkpoint(FULL), isFull=false - wal_checkpoint(PASSIVE);
+	Checkpoint(ctx context.Context, isFull bool) (err error)
 
 	// ReadTx starts a new read-only transaction.
 	// Returns a ReadTx or an error if there is an issue starting the transaction.
@@ -340,6 +347,35 @@ func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
 		return
 	})
 	return
+}
+
+func (db *db) QuickCheck(ctx context.Context) (err error) {
+	return db.doWriteTx(ctx, func(c *driver.Conn) error {
+		return c.Exec(ctx, "PRAGMA quick_check", nil, func(stmt *sqlite.Stmt) error {
+			hasRow, stepErr := stmt.Step()
+			if !hasRow {
+				return nil
+			}
+			if stepErr != nil {
+				return stepErr
+			}
+			result := stmt.ColumnText(0)
+			if result != "ok" {
+				return fmt.Errorf("quick_check not ok: %s", result)
+			}
+			return nil
+		})
+	})
+}
+
+func (db *db) Checkpoint(ctx context.Context, isFull bool) (err error) {
+	var q = "PRAGMA wal_checkpoint(PASSIVE)"
+	if isFull {
+		q = "PRAGMA wal_checkpoint(FULL)"
+	}
+	return db.doWriteTx(ctx, func(c *driver.Conn) error {
+		return c.ExecNoResult(ctx, q)
+	})
 }
 
 func (db *db) WriteTx(ctx context.Context) (tx WriteTx, err error) {

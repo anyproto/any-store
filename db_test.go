@@ -99,6 +99,17 @@ func TestDb_Stats(t *testing.T) {
 	assert.NotEmpty(t, stats.DataSizeBytes)
 }
 
+func TestDb_QuickCheck(t *testing.T) {
+	fx := newFixture(t)
+	assert.NoError(t, fx.QuickCheck(ctx))
+}
+
+func TestDb_Checkpoint(t *testing.T) {
+	fx := newFixture(t)
+	assert.NoError(t, fx.Checkpoint(ctx, false))
+	assert.NoError(t, fx.Checkpoint(ctx, true))
+}
+
 func TestDb_Close(t *testing.T) {
 	t.Run("race", func(t *testing.T) {
 		fx := newFixture(t)
