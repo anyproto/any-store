@@ -6,7 +6,7 @@ import (
 	"strconv"
 
 	"github.com/anyproto/any-store/anyenc"
-	jsonutil2 "github.com/anyproto/any-store/anyenc/anyencutil"
+	"github.com/anyproto/any-store/anyenc/anyencutil"
 )
 
 type Modifier interface {
@@ -45,8 +45,8 @@ type modifierSet struct {
 }
 
 func (m modifierSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = jsonutil2.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
-		modified = !jsonutil2.Equal(value, m.val)
+	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
+		modified = !anyencutil.Equal(value, m.val)
 		return m.val, nil
 	})
 	if err != nil {
@@ -61,7 +61,7 @@ type modifierUnset struct {
 }
 
 func (m modifierUnset) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = jsonutil2.Walk(a, v, m.fieldPath, false, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
+	err = anyencutil.Walk(a, v, m.fieldPath, false, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		modified = value != nil
 		return nil, nil
 	})
@@ -78,7 +78,7 @@ type modifierInc struct {
 }
 
 func (m modifierInc) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = jsonutil2.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
+	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			modified = true
 			return a.NewNumberFloat64(m.val), nil
@@ -103,7 +103,7 @@ type modifierRename struct {
 
 func (m modifierRename) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
 	var oldFieldValue *anyenc.Value
-	err = jsonutil2.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
+	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value != nil {
 			modified = true
 			oldFieldValue = value
@@ -111,8 +111,8 @@ func (m modifierRename) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc
 		return nil, nil
 	})
 	if modified {
-		err = jsonutil2.Walk(a, v, m.val, true, func(prevValue, newFieldValue *anyenc.Value) (res *anyenc.Value, err error) {
-			modified = !jsonutil2.Equal(newFieldValue, oldFieldValue)
+		err = anyencutil.Walk(a, v, m.val, true, func(prevValue, newFieldValue *anyenc.Value) (res *anyenc.Value, err error) {
+			modified = !anyencutil.Equal(newFieldValue, oldFieldValue)
 			return oldFieldValue, nil
 		})
 		if err != nil {
@@ -129,7 +129,7 @@ type modifierPop struct {
 }
 
 func (m modifierPop) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = jsonutil2.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
+	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			return nil, nil
 		}
@@ -173,7 +173,7 @@ type modifierPush struct {
 }
 
 func (m modifierPush) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = jsonutil2.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
+	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			return nil, nil
 		}
@@ -199,7 +199,7 @@ type modifierPull struct {
 }
 
 func (m modifierPull) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = jsonutil2.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
+	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			return nil, nil
 		}
@@ -216,7 +216,7 @@ func (m modifierPull) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.V
 			})
 		} else {
 			modified = removeElements(arrayOfValues, value, func(value *anyenc.Value) bool {
-				return jsonutil2.Equal(value, m.val)
+				return anyencutil.Equal(value, m.val)
 			})
 		}
 		return value, nil
@@ -234,7 +234,7 @@ type modifierPullAll struct {
 }
 
 func (m modifierPullAll) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = jsonutil2.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
+	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			return nil, nil
 		}
@@ -244,7 +244,7 @@ func (m modifierPullAll) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyen
 		}
 		modified = removeElements(arrayOfValues, value, func(value *anyenc.Value) bool {
 			return slices.ContainsFunc(m.removedValues, func(removedValue *anyenc.Value) bool {
-				return jsonutil2.Equal(value, removedValue)
+				return anyencutil.Equal(value, removedValue)
 			})
 		})
 		return value, nil
@@ -280,7 +280,7 @@ type modifierAddToSet struct {
 }
 
 func (m modifierAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.Value, modified bool, err error) {
-	err = jsonutil2.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
+	err = anyencutil.Walk(a, v, m.fieldPath, true, func(prevValue, value *anyenc.Value) (res *anyenc.Value, err error) {
 		if value == nil {
 			value = a.NewArray()
 		}
@@ -301,7 +301,7 @@ func (m modifierAddToSet) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anye
 func (m modifierAddToSet) addElements(value *anyenc.Value, addElem *anyenc.Value) bool {
 	arrayOfValues := value.GetArray()
 	if slices.ContainsFunc(arrayOfValues, func(val *anyenc.Value) bool {
-		return jsonutil2.Equal(addElem, val)
+		return anyencutil.Equal(addElem, val)
 	}) {
 		return false
 	}
