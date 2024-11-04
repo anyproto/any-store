@@ -119,7 +119,7 @@ type collection struct {
 		insert,
 		update,
 		delete,
-		findId driver.Stmt
+		findId *driver.Stmt
 	}
 
 	queries struct {
@@ -674,7 +674,7 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 	return c.db.doWriteTx(ctx, func(cn *driver.Conn) (err error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		for _, stmt := range []driver.Stmt{c.db.stmt.renameCollection, c.db.stmt.renameCollectionIndex} {
+		for _, stmt := range []*driver.Stmt{c.db.stmt.renameCollection, c.db.stmt.renameCollectionIndex} {
 			if err = stmt.Exec(ctx, func(sStmt *sqlite.Stmt) {
 				sStmt.SetText(":oldName", c.name)
 				sStmt.SetText(":newName", newName)
@@ -704,7 +704,7 @@ func (c *collection) Drop(ctx context.Context) error {
 	return c.db.doWriteTx(ctx, func(cn *driver.Conn) (err error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		if err = c.Close(); err != nil {
+		if err = c.close(); err != nil {
 			return err
 		}
 		for _, idx := range c.indexes {
@@ -726,7 +726,7 @@ func (c *collection) Drop(ctx context.Context) error {
 
 func (c *collection) closeStmts() {
 	if c.stmtsReady.CompareAndSwap(true, false) {
-		for _, stmt := range []driver.Stmt{
+		for _, stmt := range []*driver.Stmt{
 			c.stmts.insert, c.stmts.update, c.stmts.findId, c.stmts.delete,
 		} {
 			_ = stmt.Close()
@@ -743,6 +743,18 @@ func (c *collection) ReadTx(ctx context.Context) (ReadTx, error) {
 }
 
 func (c *collection) Close() error {
+	if cn, err := c.db.cm.GetWrite(context.Background()); err != nil {
+		return err
+	} else {
+		defer c.db.cm.ReleaseWrite(cn)
+	}
+	if err := c.close(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *collection) close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}

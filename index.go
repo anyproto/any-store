@@ -70,7 +70,7 @@ type index struct {
 
 	stmts struct {
 		insert,
-		delete driver.Stmt
+		delete *driver.Stmt
 	}
 	queries struct {
 		count string
@@ -318,7 +318,7 @@ func (idx *index) deleteBuf(ctx context.Context, id []byte, buf []anyenc.Tuple) 
 
 func (idx *index) closeStmts() {
 	if idx.stmtsReady.CompareAndSwap(true, false) {
-		for _, stmt := range []driver.Stmt{
+		for _, stmt := range []*driver.Stmt{
 			idx.stmts.insert, idx.stmts.delete,
 		} {
 			_ = stmt.Close()
