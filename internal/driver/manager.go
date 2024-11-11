@@ -16,6 +16,7 @@ var (
 	ErrDBIsClosed          = errors.New("any-store: db is closed")
 	ErrDBIsNotOpened       = errors.New("any-store: db is not opened")
 	ErrIncompatibleVersion = errors.New("any-store: incompatible version")
+	ErrStmtIsClosed        = errors.New("any-store: stmt is closed")
 )
 
 func NewConnManager(

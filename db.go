@@ -136,7 +136,7 @@ type db struct {
 		renameCollection,
 		renameCollectionIndex,
 		registerIndex,
-		removeIndex driver.Stmt
+		removeIndex *driver.Stmt
 	}
 
 	openedCollections map[string]Collection
@@ -448,7 +448,7 @@ func (db *db) Close() error {
 	if _, err := db.cm.GetWrite(context.Background()); err != nil {
 		return err
 	}
-	for _, stmt := range []driver.Stmt{
+	for _, stmt := range []*driver.Stmt{
 		db.stmt.registerCollection,
 		db.stmt.removeCollection,
 		db.stmt.renameCollection,
@@ -466,7 +466,7 @@ func (db *db) Close() error {
 	}
 	db.mu.Unlock()
 	for _, c := range collToClose {
-		if cErr := c.Close(); cErr != nil {
+		if cErr := c.(*collection).close(); cErr != nil {
 			log.Printf("collection close error: %v", cErr)
 		}
 	}

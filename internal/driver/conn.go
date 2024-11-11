@@ -12,7 +12,7 @@ type Conn struct {
 	conn *sqlite.Conn
 	begin,
 	commit,
-	rollback Stmt
+	rollback *Stmt
 	isClosed atomic.Bool
 }
 
@@ -54,16 +54,16 @@ func (c *Conn) Query(ctx context.Context, query string) (*sqlite.Stmt, error) {
 	return stmt, err
 }
 
-func (c *Conn) Prepare(query string) (Stmt, error) {
+func (c *Conn) Prepare(query string) (*Stmt, error) {
 	stmt, err := c.conn.Prepare(query)
 	if err != nil {
-		return Stmt{}, err
+		return nil, err
 	}
-	return Stmt{conn: c, stmt: stmt}, nil
+	return &Stmt{conn: c, stmt: stmt}, nil
 }
 
 func (c *Conn) Begin(ctx context.Context) (err error) {
-	if c.begin.stmt == nil {
+	if c.begin == nil {
 		if c.begin, err = c.Prepare("BEGIN"); err != nil {
 			return
 		}
@@ -72,7 +72,7 @@ func (c *Conn) Begin(ctx context.Context) (err error) {
 }
 
 func (c *Conn) Commit(ctx context.Context) (err error) {
-	if c.commit.stmt == nil {
+	if c.commit == nil {
 		if c.commit, err = c.Prepare("COMMIT"); err != nil {
 			return
 		}
@@ -81,7 +81,7 @@ func (c *Conn) Commit(ctx context.Context) (err error) {
 }
 
 func (c *Conn) Rollback(ctx context.Context) (err error) {
-	if c.rollback.stmt == nil {
+	if c.rollback == nil {
 		if c.rollback, err = c.Prepare("ROLLBACK"); err != nil {
 			return
 		}
