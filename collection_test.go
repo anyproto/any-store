@@ -263,17 +263,17 @@ func TestCollection_DeleteOne(t *testing.T) {
 	})
 }
 
-func TestCollection_EnsureIndex(t *testing.T) {
+func TestCollection_CreateIndex(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1, "doc":"a"}`), anyenc.MustParseJson(`{"id":2, "doc":"b"}`)))
 	t.Run("err exists", func(t *testing.T) {
-		err = coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"name"}}, IndexInfo{Fields: []string{"name"}})
+		err = coll.CreateIndex(ctx, IndexInfo{Fields: []string{"name"}}, IndexInfo{Fields: []string{"name"}})
 		assert.ErrorIs(t, err, ErrIndexExists)
 	})
 	t.Run("success", func(t *testing.T) {
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"doc"}}))
+		require.NoError(t, coll.CreateIndex(ctx, IndexInfo{Fields: []string{"doc"}}))
 		idxs := coll.GetIndexes()
 		require.Len(t, idxs, 1)
 		assert.Equal(t, "doc", idxs[0].Info().Name)
@@ -281,6 +281,15 @@ func TestCollection_EnsureIndex(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 2, count)
 	})
+}
+
+func TestCollection_EnsureIndex(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1, "doc":"a"}`), anyenc.MustParseJson(`{"id":2, "doc":"b"}`)))
+	err = coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"name"}}, IndexInfo{Fields: []string{"doc"}}, IndexInfo{Fields: []string{"name"}})
+	assert.NoError(t, err, ErrIndexExists)
 }
 
 func TestCollection_DropIndex(t *testing.T) {
