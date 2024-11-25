@@ -3,7 +3,7 @@ module github.com/anyproto/any-store
 go 1.22
 
 require (
-	github.com/stretchr/testify v1.9.0
+	github.com/stretchr/testify v1.10.0
 	github.com/valyala/fastjson v1.6.4
 	golang.org/x/exp v0.0.0-20240506185415-9bf2ced13842
 	zombiezen.com/go/sqlite v1.4.0
