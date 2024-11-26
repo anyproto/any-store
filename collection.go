@@ -63,6 +63,10 @@ type Collection interface {
 	// Returns the count of documents or an error if the operation fails.
 	Count(ctx context.Context) (count int, err error)
 
+	// CreateIndex creates a new index.
+	// Returns an error if index exists or the operation fails.
+	CreateIndex(ctx context.Context, info ...IndexInfo) (err error)
+
 	// EnsureIndex ensures an index exists on the specified fields.
 	// Returns an error if the operation fails.
 	EnsureIndex(ctx context.Context, info ...IndexInfo) (err error)
@@ -508,7 +512,15 @@ func (c *collection) Count(ctx context.Context) (count int, err error) {
 	return
 }
 
+func (c *collection) CreateIndex(ctx context.Context, info ...IndexInfo) (err error) {
+	return c.createIndexes(ctx, false, info...)
+}
+
 func (c *collection) EnsureIndex(ctx context.Context, info ...IndexInfo) (err error) {
+	return c.createIndexes(ctx, true, info...)
+}
+
+func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...IndexInfo) (err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 	// TODO: validate fields
@@ -522,6 +534,9 @@ func (c *collection) EnsureIndex(ctx context.Context, info ...IndexInfo) (err er
 		)
 		for _, idxInfo := range info {
 			if idx, txErr = c.createIndex(ctx, cn, idxInfo); txErr != nil {
+				if ensure && errors.Is(txErr, ErrIndexExists) {
+					continue
+				}
 				return
 			}
 			if txErr = idx.checkStmts(ctx, cn); txErr != nil {
