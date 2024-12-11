@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 
 	"zombiezen.com/go/sqlite"
@@ -87,6 +88,22 @@ func (c *Conn) Rollback(ctx context.Context) (err error) {
 		}
 	}
 	return c.rollback.Exec(ctx, nil, StmtExecNoResults)
+}
+
+func (c *Conn) Backup(ctx context.Context, path string) (err error) {
+	descConn, err := sqlite.OpenConn(path)
+	if err != nil {
+		return
+	}
+	backup, err := sqlite.NewBackup(descConn, "", c.conn, "")
+	if err != nil {
+		return
+	}
+	defer func() {
+		err = errors.Join(err, backup.Close())
+	}()
+	_, err = backup.Step(-1)
+	return
 }
 
 func (c *Conn) IsClosed() bool {
