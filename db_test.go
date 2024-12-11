@@ -110,6 +110,25 @@ func TestDb_Checkpoint(t *testing.T) {
 	assert.NoError(t, fx.Checkpoint(ctx, true))
 }
 
+func TestDb_Backup(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.Collection(ctx, "coll")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"doc"}}))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1, "doc":"a"}`), anyenc.MustParseJson(`{"id":2, "doc":"b"}`)))
+
+	tmpDir, err := os.MkdirTemp("", "any-store-backup-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+	require.NoError(t, fx.Backup(ctx, filepath.Join(tmpDir, "any-store-test.db")))
+
+	fx2 := newFixturePath(t, tmpDir)
+	coll2, err := fx2.Collection(ctx, "coll")
+	require.NoError(t, err)
+	assert.Len(t, coll2.GetIndexes(), 1)
+	assertCollCount(t, coll2, 2)
+}
+
 func TestDb_Close(t *testing.T) {
 	t.Run("race", func(t *testing.T) {
 		fx := newFixture(t)
@@ -178,7 +197,10 @@ func TestDb_Close(t *testing.T) {
 func newFixture(t testing.TB, c ...*Config) *fixture {
 	tmpDir, err := os.MkdirTemp("", "any-store-*")
 	require.NoError(t, err)
+	return newFixturePath(t, tmpDir, c...)
+}
 
+func newFixturePath(t testing.TB, tmpDir string, c ...*Config) *fixture {
 	var conf *Config
 	if len(c) != 0 {
 		conf = c[0]

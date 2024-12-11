@@ -50,6 +50,10 @@ type DB interface {
 	// Checkpoint performs PRAGMA wal_checkpoint to sqlite. isFull=true - wal_checkpoint(FULL), isFull=false - wal_checkpoint(PASSIVE);
 	Checkpoint(ctx context.Context, isFull bool) (err error)
 
+	// Backup creates a backup of the database at the specified file path.
+	// Returns an error if the operation fails.
+	Backup(ctx context.Context, path string) (err error)
+
 	// ReadTx starts a new read-only transaction.
 	// Returns a ReadTx or an error if there is an issue starting the transaction.
 	ReadTx(ctx context.Context) (ReadTx, error)
@@ -171,7 +175,7 @@ func (db *db) init(ctx context.Context) error {
 	})
 }
 
-func (db *db) newWiteTx(ctx context.Context) (WriteTx, error) {
+func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 	connWrite, err := db.cm.GetWrite(ctx)
 	if err != nil {
 		return nil, err
@@ -378,10 +382,19 @@ func (db *db) Checkpoint(ctx context.Context, isFull bool) (err error) {
 	})
 }
 
+func (db *db) Backup(ctx context.Context, path string) (err error) {
+	conn, err := db.cm.GetWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.cm.ReleaseWrite(conn)
+	return conn.Backup(ctx, path)
+}
+
 func (db *db) WriteTx(ctx context.Context) (tx WriteTx, err error) {
 	ctxTx := ctx.Value(ctxKeyTx)
 	if ctxTx == nil {
-		return db.newWiteTx(ctx)
+		return db.newWriteTx(ctx)
 	}
 
 	var ok bool
