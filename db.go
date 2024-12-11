@@ -175,7 +175,7 @@ func (db *db) init(ctx context.Context) error {
 	})
 }
 
-func (db *db) newWiteTx(ctx context.Context) (WriteTx, error) {
+func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 	connWrite, err := db.cm.GetWrite(ctx)
 	if err != nil {
 		return nil, err
@@ -394,7 +394,7 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 func (db *db) WriteTx(ctx context.Context) (tx WriteTx, err error) {
 	ctxTx := ctx.Value(ctxKeyTx)
 	if ctxTx == nil {
-		return db.newWiteTx(ctx)
+		return db.newWriteTx(ctx)
 	}
 
 	var ok bool
