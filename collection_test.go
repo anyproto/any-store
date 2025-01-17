@@ -4,7 +4,11 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -357,6 +361,78 @@ func BenchmarkCollection_FindId(b *testing.B) {
 			require.NoError(b, err)
 		}
 	})
+}
+
+func TestSlowMutex(t *testing.T) {
+	var (
+		collN      = 100
+		docInsertN = 3000
+		findIdN    = 10000
+		readConn   = 16
+		extraCollN = 1000
+	)
+
+	fx := newFixture(t, &Config{
+		ReadConnections: readConn,
+	})
+
+	colls := make([]Collection, collN)
+	st := time.Now()
+	for i := range colls {
+		coll, err := fx.Collection(ctx, fmt.Sprintf("test_%d", i))
+		require.NoError(t, err)
+		colls[i] = coll
+	}
+	t.Logf("created %d colls; %v", collN, time.Since(st))
+
+	var wg sync.WaitGroup
+
+	wg.Add(collN + 2)
+
+	// create extra colls
+	go func() {
+		defer wg.Done()
+		iSt := time.Now()
+		for i := range extraCollN {
+			_, cErr := fx.Collection(ctx, fmt.Sprintf("test2_%d", i))
+			require.NoError(t, cErr)
+			time.Sleep(time.Millisecond * 10)
+		}
+		t.Logf("created %d extra colls; %v", extraCollN, time.Since(iSt))
+	}()
+
+	collLastIds := make([]atomic.Int32, collN)
+
+	// insert
+	go func() {
+		defer wg.Done()
+		iSt := time.Now()
+		data := strings.Repeat("X", 1024)
+		for i := range docInsertN {
+			collI := rand.Intn(len(colls))
+			coll := colls[collI]
+			iErr := coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d, "data":"%s"}`, i, data)))
+			require.NoError(t, iErr)
+			collLastIds[collI].Store(int32(i))
+		}
+		t.Logf("inserted %d docs; %v", docInsertN, time.Since(iSt))
+	}()
+
+	// findId
+	for collI := range colls {
+		go func(collI int) {
+			defer wg.Done()
+			fSt := time.Now()
+			for range findIdN {
+				coll := colls[collI]
+				_, _ = coll.FindId(ctx, int(collLastIds[collI].Load()))
+			}
+			dur := time.Since(fSt)
+			t.Logf("findId: %d; %v; %v per find", findIdN, dur, dur/time.Duration(findIdN))
+		}(collI)
+	}
+	wg.Wait()
+
 }
 
 func BenchmarkCollection_Find(b *testing.B) {
