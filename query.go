@@ -134,10 +134,12 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	sqlRes := qb.build(false)
 	tx, err := q.c.db.ReadTx(ctx)
 	if err != nil {
+		qb.Close()
 		return
 	}
 	stmt, err := tx.conn().Query(ctx, sqlRes)
 	if err != nil {
+		qb.Close()
 		return
 	}
 	for i, val := range qb.values {
