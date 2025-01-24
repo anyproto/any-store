@@ -545,6 +545,10 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 			newIndexes = append(newIndexes, idx)
 		}
 
+		if len(newIndexes) == 0 {
+			return nil
+		}
+
 		txErr = cn.Exec(ctx, c.queries.findAll, nil, func(stmt *sqlite.Stmt) error {
 			for {
 				hasRow, stepErr := stmt.Step()
