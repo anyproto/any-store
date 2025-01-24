@@ -284,12 +284,24 @@ func TestCollection_CreateIndex(t *testing.T) {
 }
 
 func TestCollection_EnsureIndex(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1, "doc":"a"}`), anyenc.MustParseJson(`{"id":2, "doc":"b"}`)))
-	err = coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"name"}}, IndexInfo{Fields: []string{"doc"}}, IndexInfo{Fields: []string{"name"}})
-	assert.NoError(t, err, ErrIndexExists)
+	t.Run("multiple", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1, "doc":"a"}`), anyenc.MustParseJson(`{"id":2, "doc":"b"}`)))
+		err = coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"name"}}, IndexInfo{Fields: []string{"doc"}}, IndexInfo{Fields: []string{"name"}})
+		assert.NoError(t, err, ErrIndexExists)
+	})
+	t.Run("single index", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		idx := IndexInfo{
+			Fields: []string{"a"},
+		}
+		require.NoError(t, coll.EnsureIndex(ctx, idx))
+		require.NoError(t, coll.EnsureIndex(ctx, idx))
+	})
 }
 
 func TestCollection_DropIndex(t *testing.T) {
