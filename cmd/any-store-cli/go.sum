@@ -1,5 +1,7 @@
 github.com/anyproto/any-store v0.1.4-0.20250121142752-d668320d4ee7 h1:nWjCF1ybgDFrdAzRXrvVZMp7nab50W0+OrrvciGVH2c=
 github.com/anyproto/any-store v0.1.4-0.20250121142752-d668320d4ee7/go.mod h1:nbyRoJYOlvSWU1xDOrmgPP96UeoTf4eYZ9k+qqLK9k8=
+github.com/anyproto/any-store v0.1.5-0.20250124120631-ef872af68daa h1:Ui5xIT9PgOwxB1zL/VFKhfCEu79JLLRFMg7oLHsbyCk=
+github.com/anyproto/any-store v0.1.5-0.20250124120631-ef872af68daa/go.mod h1:nbyRoJYOlvSWU1xDOrmgPP96UeoTf4eYZ9k+qqLK9k8=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
