@@ -12,6 +12,7 @@ import (
 type Conn struct {
 	conn *sqlite.Conn
 	begin,
+	beginImmediate,
 	commit,
 	rollback *Stmt
 	isClosed atomic.Bool
@@ -70,6 +71,15 @@ func (c *Conn) Begin(ctx context.Context) (err error) {
 		}
 	}
 	return c.begin.Exec(ctx, nil, StmtExecNoResults)
+}
+
+func (c *Conn) BeginImmediate(ctx context.Context) (err error) {
+	if c.beginImmediate == nil {
+		if c.beginImmediate, err = c.Prepare("BEGIN IMMEDIATE"); err != nil {
+			return
+		}
+	}
+	return c.beginImmediate.Exec(ctx, nil, StmtExecNoResults)
 }
 
 func (c *Conn) Commit(ctx context.Context) (err error) {

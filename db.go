@@ -181,7 +181,7 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 		return nil, err
 	}
 
-	if err = connWrite.Begin(ctx); err != nil {
+	if err = connWrite.BeginImmediate(ctx); err != nil {
 		db.cm.ReleaseWrite(connWrite)
 		return nil, err
 	}
@@ -377,9 +377,12 @@ func (db *db) Checkpoint(ctx context.Context, isFull bool) (err error) {
 	if isFull {
 		q = "PRAGMA wal_checkpoint(FULL)"
 	}
-	return db.doWriteTx(ctx, func(c *driver.Conn) error {
-		return c.ExecNoResult(ctx, q)
-	})
+	conn, err := db.cm.GetWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.cm.ReleaseWrite(conn)
+	return conn.ExecNoResult(ctx, q)
 }
 
 func (db *db) Backup(ctx context.Context, path string) (err error) {
