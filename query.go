@@ -132,7 +132,7 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		return
 	}
 	sqlRes := qb.build(false)
-	tx, err := q.c.db.ReadTx(ctx)
+	tx, err := q.c.db.getReadTx(ctx)
 	if err != nil {
 		qb.Close()
 		return
