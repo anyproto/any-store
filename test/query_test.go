@@ -15,6 +15,7 @@ import (
 
 	anystore "github.com/anyproto/any-store"
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/query"
 )
 
 func init() {
@@ -28,6 +29,32 @@ func TestQueries(t *testing.T) {
 	t.Run("simple indexes", func(t *testing.T) {
 		testFile(t, "data/simple-indexes.json")
 	})
+}
+
+func TestCollection_ReadUncommitted(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	err = coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":1, "doc":"a"}`))
+	require.NoError(t, err)
+	iter, err := coll.Find(query.Key{
+		Path:   []string{"doc"},
+		Filter: query.NewComp(query.CompOpEq, "a"),
+	}).Iter(tx.Context())
+	require.NoError(t, err)
+	var got []string
+	for iter.Next() {
+		doc, err := iter.Doc()
+		require.NoError(t, err)
+		got = append(got, doc.Value().GetString("doc"))
+	}
+	assert.Equal(t, []string{"a"}, got)
+	err = iter.Close()
+	require.NoError(t, err)
+	err = tx.Commit()
+	require.NoError(t, err)
 }
 
 type TestCases struct {
