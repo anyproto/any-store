@@ -112,6 +112,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		ds.filterReg,
 		ds.sortReg,
 		2, // sqlite user_version
+		config.SQLitePageCachePreallocateSize,
 	); err != nil {
 		return nil, err
 	}

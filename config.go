@@ -22,6 +22,11 @@ type Config struct {
 	// corresponding to SQLite pragmas or other connection settings.
 	SQLiteConnectionOptions map[string]string
 
+	// PageCachePreallocateSize is the size of the page cache to preallocate.
+	// It is global, inited once and shared by all connections.
+	// default value is 10M
+	SQLitePageCachePreallocateSize int
+
 	// SyncPoolElementMaxSize defines maximum size of buffer that can be returned to the syncpool
 	// default value id 2MiB
 	SyncPoolElementMaxSize int
@@ -39,6 +44,10 @@ func (c *Config) setDefaults() {
 	}
 	if c.SyncPoolElementMaxSize <= 0 {
 		c.SyncPoolElementMaxSize = 2 << 20
+	}
+
+	if c.SQLitePageCachePreallocateSize <= 0 {
+		c.SQLitePageCachePreallocateSize = 10 << 20
 	}
 }
 
