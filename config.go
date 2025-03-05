@@ -25,6 +25,7 @@ type Config struct {
 	// SQLiteGlobalPageCachePreallocateSizeBytes is the size of the global page cache to preallocate.
 	// Initialised on the first call to NewConnManager and shared by all connections.
 	// default value is 10M
+	// set negative to disable preallocation
 	SQLiteGlobalPageCachePreallocateSizeBytes int
 
 	// SyncPoolElementMaxSize defines maximum size of buffer that can be returned to the syncpool
@@ -46,7 +47,7 @@ func (c *Config) setDefaults() {
 		c.SyncPoolElementMaxSize = 2 << 20
 	}
 
-	if c.SQLiteGlobalPageCachePreallocateSizeBytes <= 0 {
+	if c.SQLiteGlobalPageCachePreallocateSizeBytes == 0 {
 		c.SQLiteGlobalPageCachePreallocateSizeBytes = 10 << 20
 	}
 }
