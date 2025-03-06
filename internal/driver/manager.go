@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 
+	"modernc.org/libc"
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
 
@@ -17,12 +19,14 @@ var (
 	ErrDBIsNotOpened       = errors.New("any-store: db is not opened")
 	ErrIncompatibleVersion = errors.New("any-store: incompatible version")
 	ErrStmtIsClosed        = errors.New("any-store: stmt is closed")
+	initSqliteOnce         sync.Once
 )
 
 func NewConnManager(
 	path string,
 	pragma map[string]string,
 	writeCount, readCount int,
+	preAllocatedPageCacheSize int,
 	fr *registry.FilterRegistry, sr *registry.SortRegistry,
 	version int,
 ) (*ConnManager, error) {
@@ -32,6 +36,17 @@ func NewConnManager(
 		newDb = true
 	}
 
+	initSqliteOnce.Do(func() {
+		if preAllocatedPageCacheSize <= 0 {
+			return
+		}
+		tls := libc.NewTLS()
+		err := sqlitePreallocatePageCache(tls, preAllocatedPageCacheSize)
+		if err != nil {
+			// ignore this error because it's not critical, we can continue without preallocated cache
+			_, _ = fmt.Fprintf(os.Stderr, "sqlite: failed to preallocate pagecache: %v\n", err)
+		}
+	})
 	var (
 		writeConn = make([]*Conn, 0, writeCount)
 		readConn  = make([]*Conn, 0, readCount)

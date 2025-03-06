@@ -5,7 +5,7 @@ import (
 )
 
 var defaultSQLiteOptions = map[string]string{
-	"cache_size": "100000",
+	"cache_size": "-2000", // negative value for kilobytes instead of pages
 }
 
 // Config provides the configuration options for the database.
@@ -21,6 +21,12 @@ type Config struct {
 	// SQLiteConnectionOptions provides additional options for SQLite connections,
 	// corresponding to SQLite pragmas or other connection settings.
 	SQLiteConnectionOptions map[string]string
+
+	// SQLiteGlobalPageCachePreallocateSizeBytes is the size of the global page cache to preallocate.
+	// Initialised on the first call to NewConnManager and shared by all connections.
+	// default value is 10M
+	// set negative to disable preallocation
+	SQLiteGlobalPageCachePreallocateSizeBytes int
 
 	// SyncPoolElementMaxSize defines maximum size of buffer that can be returned to the syncpool
 	// default value id 2MiB
@@ -39,6 +45,10 @@ func (c *Config) setDefaults() {
 	}
 	if c.SyncPoolElementMaxSize <= 0 {
 		c.SyncPoolElementMaxSize = 2 << 20
+	}
+
+	if c.SQLiteGlobalPageCachePreallocateSizeBytes == 0 {
+		c.SQLiteGlobalPageCachePreallocateSizeBytes = 10 << 20
 	}
 }
 

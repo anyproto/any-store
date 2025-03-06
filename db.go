@@ -109,6 +109,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		config.pragma(),
 		1,
 		config.ReadConnections,
+		config.SQLitePageCachePreallocateSize,
 		ds.filterReg,
 		ds.sortReg,
 		2, // sqlite user_version
