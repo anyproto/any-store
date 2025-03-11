@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	"modernc.org/libc"
 	"zombiezen.com/go/sqlite"
@@ -47,6 +48,7 @@ func NewConnManager(
 			_, _ = fmt.Fprintf(os.Stderr, "sqlite: failed to preallocate pagecache: %v\n", err)
 		}
 	})
+
 	var (
 		writeConn = make([]*Conn, 0, writeCount)
 		readConn  = make([]*Conn, 0, readCount)
@@ -55,64 +57,58 @@ func NewConnManager(
 		for _, conn := range writeConn {
 			_ = conn.Close()
 		}
-		for _, conn := range readConn {
-			_ = conn.Close()
-		}
 	}
+
+	cm := &ConnManager{
+		readCh:         make(chan *Conn),
+		readConnLimit:  readCount,
+		readConn:       readConn,
+		readConnTTL:    time.Minute,
+		writeCh:        make(chan *Conn, writeCount),
+		closed:         make(chan struct{}),
+		sortRegistry:   sr,
+		filterRegistry: fr,
+		path:           path,
+		pragma:         pragma,
+	}
+
 	for i := 0; i < writeCount; i++ {
 		conn, err := sqlite.OpenConn(path, sqlite.OpenCreate|sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadWrite)
 		if err != nil {
 			closeAll()
 			return nil, err
 		}
-		if err = setupConn(fr, sr, conn, pragma); err != nil {
+		if err = cm.setupConn(conn); err != nil {
 			closeAll()
 			return nil, err
 		}
-		writeConn = append(writeConn, &Conn{conn: conn})
+		wConn := &Conn{conn: conn}
+		writeConn = append(writeConn, wConn)
 		if i == 0 {
 			if err = checkVersion(conn, version, newDb); err != nil {
 				closeAll()
 				return nil, err
 			}
 		}
+		cm.writeCh <- wConn
 	}
-
-	for i := 0; i < readCount; i++ {
-		conn, err := sqlite.OpenConn(path, sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadOnly)
-		if err != nil {
-			closeAll()
-			return nil, err
-		}
-		if err = setupConn(fr, sr, conn, pragma); err != nil {
-			closeAll()
-			return nil, err
-		}
-		readConn = append(readConn, &Conn{conn: conn})
-	}
-
-	cm := &ConnManager{
-		readCh:    make(chan *Conn, len(readConn)),
-		writeCh:   make(chan *Conn, len(writeConn)),
-		closed:    make(chan struct{}),
-		readConn:  readConn,
-		writeConn: writeConn,
-	}
-	for _, conn := range writeConn {
-		cm.writeCh <- conn
-	}
-	for _, conn := range readConn {
-		cm.readCh <- conn
-	}
+	cm.writeConn = writeConn
 	return cm, nil
 }
 
 type ConnManager struct {
-	readCh    chan *Conn
-	writeCh   chan *Conn
-	readConn  []*Conn
-	writeConn []*Conn
-	closed    chan struct{}
+	readCh         chan *Conn
+	writeCh        chan *Conn
+	readConn       []*Conn
+	writeConn      []*Conn
+	closed         chan struct{}
+	path           string
+	sortRegistry   *registry.SortRegistry
+	filterRegistry *registry.FilterRegistry
+	pragma         map[string]string
+	readConnLimit  int
+	mu             sync.Mutex
+	readConnTTL    time.Duration
 }
 
 func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
@@ -139,25 +135,92 @@ func (c *ConnManager) GetRead(ctx context.Context) (conn *Conn, err error) {
 		return nil, ErrDBIsNotOpened
 	}
 
+	c.mu.Lock()
+
 	select {
+	case <-c.closed:
+		c.mu.Unlock()
+		return nil, ErrDBIsClosed
+	case <-ctx.Done():
+		c.mu.Unlock()
+		return nil, ctx.Err()
+	default:
+	}
+
+	// find inactive conn
+	for _, conn = range c.readConn {
+		if conn.isActive.CompareAndSwap(false, true) {
+			c.mu.Unlock()
+			return conn, nil
+		}
+	}
+
+	// open new conn if limit is not reached
+	if len(c.readConn) < c.readConnLimit {
+		if conn, err = c.openReadConn(); err != nil {
+			c.mu.Unlock()
+			return nil, err
+		}
+		c.readConn = append(c.readConn, conn)
+		conn.isActive.Store(true)
+		c.mu.Unlock()
+		return conn, nil
+	}
+
+	c.mu.Unlock()
+	// wait released conn
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	case <-c.closed:
 		return nil, ErrDBIsClosed
 	case conn = <-c.readCh:
+		c.mu.Lock()
+		conn.isActive.Store(true)
+		c.mu.Unlock()
 		return conn, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
 	}
 }
 
 func (c *ConnManager) ReleaseRead(conn *Conn) {
-	c.readCh <- conn
+	now := time.Now()
+	conn.isActive.Store(false)
+	conn.lastUsage.Store(now.Unix())
+	select {
+	case c.readCh <- conn:
+		return
+	case <-c.closed:
+		c.readCh <- conn
+		return
+	default:
+	}
+
+	var filteredConn = c.readConn[:0]
+	for _, conn = range c.readConn {
+		if !conn.isActive.Load() && now.Sub(time.Unix(conn.lastUsage.Load(), 0)) > c.readConnTTL {
+			_ = conn.Close()
+		} else {
+			filteredConn = append(filteredConn, conn)
+		}
+	}
 }
 
-func setupConn(fr *registry.FilterRegistry, sr *registry.SortRegistry, conn *sqlite.Conn, pragma map[string]string) (err error) {
+func (c *ConnManager) openReadConn() (*Conn, error) {
+	conn, err := sqlite.OpenConn(c.path, sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadOnly)
+	if err != nil {
+		return nil, err
+	}
+	if err = c.setupConn(conn); err != nil {
+		return nil, err
+	}
+	return &Conn{conn: conn}, nil
+}
+
+func (c *ConnManager) setupConn(conn *sqlite.Conn) (err error) {
 	err = conn.CreateFunction("any_filter", &sqlite.FunctionImpl{
 		NArgs: 2,
 		Scalar: func(ctx sqlite.Context, args []sqlite.Value) (sqlite.Value, error) {
-			if fr.Filter(args[0].Int(), args[1].Blob()) {
+			if c.filterRegistry.Filter(args[0].Int(), args[1].Blob()) {
 				return sqlite.IntegerValue(1), nil
 			} else {
 				return sqlite.IntegerValue(0), nil
@@ -171,13 +234,13 @@ func setupConn(fr *registry.FilterRegistry, sr *registry.SortRegistry, conn *sql
 	err = conn.CreateFunction("any_sort", &sqlite.FunctionImpl{
 		NArgs: 2,
 		Scalar: func(ctx sqlite.Context, args []sqlite.Value) (sqlite.Value, error) {
-			return sqlite.BlobValue(sr.Sort(args[0].Int(), args[1].Blob())), nil
+			return sqlite.BlobValue(c.sortRegistry.Sort(args[0].Int(), args[1].Blob())), nil
 		},
 		Deterministic: true,
 	})
 
-	if pragma != nil {
-		for k, v := range pragma {
+	if c.pragma != nil {
+		for k, v := range c.pragma {
 			if err = sqlitex.ExecuteTransient(conn, fmt.Sprintf("PRAGMA %s = %s", k, v), nil); err != nil {
 				return
 			}
@@ -187,38 +250,29 @@ func setupConn(fr *registry.FilterRegistry, sr *registry.SortRegistry, conn *sql
 }
 
 func (c *ConnManager) Close() (err error) {
-	/*
-
-		Can't interrupt connections yet because there is a race in sqlite driver
-		Also trying to close active connections causes some panics in the driver
-
-		var closedChan = make(chan struct{})
-		close(closedChan)
-
-		for _, conn := range c.readConn {
-			conn.conn.SetInterrupt(closedChan)
-		}
-		for _, conn := range c.writeConn {
-			conn.conn.SetInterrupt(closedChan)
-		}
-
-	*/
 	close(c.closed)
-
-	var conn *Conn
-	for range c.readConn {
-		conn = <-c.readCh
-		if err != nil {
-			err = errors.Join(err, err)
+	var activeCount int
+	c.mu.Lock()
+	for _, conn := range c.readConn {
+		if !conn.isActive.Load() {
+			if cErr := conn.Close(); cErr != nil {
+				err = errors.Join(err, cErr)
+			}
 		} else {
-			err = errors.Join(err, conn.Close())
+			activeCount++
+		}
+	}
+	c.mu.Unlock()
+	for range activeCount {
+		conn := <-c.readCh
+		if cErr := conn.Close(); cErr != nil {
+			err = errors.Join(err, cErr)
 		}
 	}
 
 	if err = c.writeConn[0].Close(); err != nil {
 		err = errors.Join(err, err)
 	}
-
 	return err
 }
 
