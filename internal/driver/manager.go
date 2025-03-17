@@ -175,10 +175,9 @@ func (c *ConnManager) GetRead(ctx context.Context) (conn *Conn, err error) {
 	case <-c.closed:
 		return nil, ErrDBIsClosed
 	case conn = <-c.readCh:
-		c.mu.Lock()
-		conn.isActive.Store(true)
-		c.mu.Unlock()
-		return conn, nil
+		return c.GetRead(ctx)
+	case <-time.After(time.Second):
+		return c.GetRead(ctx)
 	}
 }
 
@@ -195,6 +194,9 @@ func (c *ConnManager) ReleaseRead(conn *Conn) {
 	default:
 	}
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	var filteredConn = c.readConn[:0]
 	for _, conn = range c.readConn {
 		if !conn.isActive.Load() && now.Sub(time.Unix(conn.lastUsage.Load(), 0)) > c.readConnTTL {
@@ -203,6 +205,7 @@ func (c *ConnManager) ReleaseRead(conn *Conn) {
 			filteredConn = append(filteredConn, conn)
 		}
 	}
+	c.readConn = filteredConn
 }
 
 func (c *ConnManager) openReadConn() (*Conn, error) {

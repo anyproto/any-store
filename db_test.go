@@ -131,7 +131,7 @@ func TestDb_Backup(t *testing.T) {
 
 func TestDb_Close(t *testing.T) {
 	t.Run("race", func(t *testing.T) {
-		fx := newFixture(t)
+		fx := newFixture(t, &Config{ReadConnections: 2})
 
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)

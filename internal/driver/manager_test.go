@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -52,12 +53,17 @@ func TestConnManager_GetRead(t *testing.T) {
 	var numP = 10
 	for i := 0; i < numP; i++ {
 		go func() {
-			conn, err := fx.GetRead(ctx)
-			require.NoError(t, err)
-			require.NoError(t, conn.Begin(ctx))
-			time.Sleep(time.Millisecond * 10)
-			require.NoError(t, conn.Commit(ctx))
-			fx.ReleaseRead(conn)
+			for {
+				conn, err := fx.GetRead(ctx)
+				if errors.Is(err, ErrDBIsClosed) {
+					return
+				}
+				require.NoError(t, err)
+				require.NoError(t, conn.Begin(ctx))
+				time.Sleep(time.Millisecond * 10)
+				require.NoError(t, conn.Commit(ctx))
+				fx.ReleaseRead(conn)
+			}
 		}()
 		time.Sleep(time.Millisecond * 100)
 	}
