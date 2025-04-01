@@ -2,12 +2,14 @@ module github.com/anyproto/any-store
 
 go 1.23.0
 
+toolchain go1.24.1
+
 require (
 	github.com/stretchr/testify v1.10.0
 	github.com/valyala/fastjson v1.6.4
 	golang.org/x/exp v0.0.0-20250305212735-054e65f0b394
-	modernc.org/libc v1.61.13
-	modernc.org/sqlite v1.36.2
+	modernc.org/libc v1.62.1
+	modernc.org/sqlite v1.37.0
 	zombiezen.com/go/sqlite v1.4.0
 )
 
