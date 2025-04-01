@@ -15,7 +15,9 @@ type Conn struct {
 	beginImmediate,
 	commit,
 	rollback *Stmt
-	isClosed atomic.Bool
+	lastUsage atomic.Int64
+	isClosed  atomic.Bool
+	isActive  atomic.Bool
 }
 
 func (c *Conn) ExecNoResult(ctx context.Context, query string) (err error) {
