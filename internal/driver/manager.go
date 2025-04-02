@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 
 	"modernc.org/libc"
 	"zombiezen.com/go/sqlite"
@@ -29,6 +30,8 @@ func NewConnManager(
 	preAllocatedPageCacheSize int,
 	fr *registry.FilterRegistry, sr *registry.SortRegistry,
 	version int,
+	enableStalledConnDetector bool,
+	stalledConnDetectorCloseTimeout time.Duration,
 ) (*ConnManager, error) {
 	_, statErr := os.Stat(path)
 	var newDb bool
@@ -92,11 +95,14 @@ func NewConnManager(
 	}
 
 	cm := &ConnManager{
-		readCh:    make(chan *Conn, len(readConn)),
-		writeCh:   make(chan *Conn, len(writeConn)),
-		closed:    make(chan struct{}),
-		readConn:  readConn,
-		writeConn: writeConn,
+		readCh:                          make(chan *Conn, len(readConn)),
+		writeCh:                         make(chan *Conn, len(writeConn)),
+		closed:                          make(chan struct{}),
+		readConn:                        readConn,
+		writeConn:                       writeConn,
+		stalledConnStackTraces:          make(map[uintptr][]uintptr),
+		stalledConnDetectorEnabled:      enableStalledConnDetector,
+		stalledConnDetectorCloseTimeout: stalledConnDetectorCloseTimeout,
 	}
 	for _, conn := range writeConn {
 		cm.writeCh <- conn
@@ -113,6 +119,14 @@ type ConnManager struct {
 	readConn  []*Conn
 	writeConn []*Conn
 	closed    chan struct{}
+
+	// when enabled, collects stack traces and duration of taken connections
+	stalledConnDetectorEnabled bool
+	// when stalledConnDetectorCloseTimeout > 0 and stalledConnDetectorEnabled is true,
+	// ConnManager panics on Close in case of any connection is not released after this timeout
+	stalledConnDetectorCloseTimeout time.Duration
+	stalledConnStackMutex           sync.Mutex
+	stalledConnStackTraces          map[uintptr][]uintptr
 }
 
 func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
@@ -124,6 +138,7 @@ func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
 	case <-c.closed:
 		return nil, ErrDBIsClosed
 	case conn = <-c.writeCh:
+		c.stalledAcquireConn(conn)
 		return conn, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -132,6 +147,7 @@ func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
 
 func (c *ConnManager) ReleaseWrite(conn *Conn) {
 	c.writeCh <- conn
+	c.stalledReleaseConn(conn)
 }
 
 func (c *ConnManager) GetRead(ctx context.Context) (conn *Conn, err error) {
@@ -143,6 +159,7 @@ func (c *ConnManager) GetRead(ctx context.Context) (conn *Conn, err error) {
 	case <-c.closed:
 		return nil, ErrDBIsClosed
 	case conn = <-c.readCh:
+		c.stalledAcquireConn(conn)
 		return conn, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -151,6 +168,7 @@ func (c *ConnManager) GetRead(ctx context.Context) (conn *Conn, err error) {
 
 func (c *ConnManager) ReleaseRead(conn *Conn) {
 	c.readCh <- conn
+	c.stalledReleaseConn(conn)
 }
 
 func setupConn(fr *registry.FilterRegistry, sr *registry.SortRegistry, conn *sqlite.Conn, pragma map[string]string) (err error) {
@@ -205,20 +223,22 @@ func (c *ConnManager) Close() (err error) {
 	*/
 	close(c.closed)
 
+	allClosedChan := make(chan struct{})
+	if c.stalledConnDetectorEnabled && c.stalledConnDetectorCloseTimeout > 0 {
+		go c.stalledCloseWatcher(allClosedChan)
+	}
+
 	var conn *Conn
 	for range c.readConn {
 		conn = <-c.readCh
-		if err != nil {
-			err = errors.Join(err, err)
-		} else {
-			err = errors.Join(err, conn.Close())
-		}
+		err = errors.Join(err, conn.Close())
 	}
 
 	if err = c.writeConn[0].Close(); err != nil {
 		err = errors.Join(err, err)
 	}
 
+	close(allClosedChan)
 	return err
 }
 

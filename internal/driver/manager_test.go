@@ -22,7 +22,7 @@ func TestNewConnManager(t *testing.T) {
 		_ = os.RemoveAll(tmpDir)
 	})
 	t.Run("open-close", func(t *testing.T) {
-		cm, err := NewConnManager(filepath.Join(tmpDir, "1.db"), nil, 1, 2, 10, fr, sr, 1)
+		cm, err := NewConnManager(filepath.Join(tmpDir, "1.db"), nil, 1, 2, 10, fr, sr, 1, false, 0)
 		require.NoError(t, err)
 		require.NoError(t, cm.Close())
 	})
@@ -30,14 +30,14 @@ func TestNewConnManager(t *testing.T) {
 		conn, err := sqlite.OpenConn(filepath.Join(tmpDir, "empty.db"), sqlite.OpenCreate|sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadWrite)
 		require.NoError(t, err)
 		_ = conn.Close()
-		_, err = NewConnManager(filepath.Join(tmpDir, "empty.db"), nil, 1, 2, 10, fr, sr, 1)
+		_, err = NewConnManager(filepath.Join(tmpDir, "empty.db"), nil, 1, 2, 10, fr, sr, 1, false, 0)
 		require.ErrorIs(t, err, ErrIncompatibleVersion)
 	})
 	t.Run("old version", func(t *testing.T) {
-		cm, err := NewConnManager(filepath.Join(tmpDir, "old.db"), nil, 1, 2, 10, fr, sr, 1)
+		cm, err := NewConnManager(filepath.Join(tmpDir, "old.db"), nil, 1, 2, 10, fr, sr, 1, false, 0)
 		require.NoError(t, err)
 		require.NoError(t, cm.Close())
-		_, err = NewConnManager(filepath.Join(tmpDir, "old.db"), nil, 1, 2, 10, fr, sr, 2)
+		_, err = NewConnManager(filepath.Join(tmpDir, "old.db"), nil, 1, 2, 10, fr, sr, 2, false, 0)
 		require.ErrorIs(t, err, ErrIncompatibleVersion)
 	})
 }
