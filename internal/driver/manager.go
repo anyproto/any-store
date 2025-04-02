@@ -226,10 +226,7 @@ func (c *ConnManager) Close() (err error) {
 
 	var conn *Conn
 	for range c.readConn {
-		select {
-		case conn = <-c.readCh:
-			break
-		}
+		conn = <-c.readCh
 		err = errors.Join(err, conn.Close())
 	}
 
