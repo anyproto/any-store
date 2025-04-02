@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"runtime"
-	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -96,12 +94,12 @@ func NewConnManager(
 	}
 
 	cm := &ConnManager{
-		readCh:          make(chan *Conn, len(readConn)),
-		writeCh:         make(chan *Conn, len(writeConn)),
-		closed:          make(chan struct{}),
-		readConn:        readConn,
-		writeConn:       writeConn,
-		connStackTraces: make(map[uintptr][]uintptr),
+		readCh:                 make(chan *Conn, len(readConn)),
+		writeCh:                make(chan *Conn, len(writeConn)),
+		closed:                 make(chan struct{}),
+		readConn:               readConn,
+		writeConn:              writeConn,
+		stalledConnStackTraces: make(map[uintptr][]uintptr),
 	}
 	for _, conn := range writeConn {
 		cm.writeCh <- conn
@@ -113,13 +111,19 @@ func NewConnManager(
 }
 
 type ConnManager struct {
-	readCh          chan *Conn
-	writeCh         chan *Conn
-	readConn        []*Conn
-	writeConn       []*Conn
-	connStackMutex  sync.Mutex
-	connStackTraces map[uintptr][]uintptr
-	closed          chan struct{}
+	readCh    chan *Conn
+	writeCh   chan *Conn
+	readConn  []*Conn
+	writeConn []*Conn
+	closed    chan struct{}
+
+	// when enabled, collects stack traces and duration of taken connections
+	stalledConnDetectorEnabled bool
+	// when stalledConnDetectorCloseTimeout > 0 and stalledConnDetectorEnabled is true,
+	// ConnManager panics on Close in case of any connection is not released after this timeout
+	stalledConnDetectorCloseTimeout time.Duration
+	stalledConnStackMutex           sync.Mutex
+	stalledConnStackTraces          map[uintptr][]uintptr
 }
 
 func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
@@ -131,9 +135,11 @@ func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
 	case <-c.closed:
 		return nil, ErrDBIsClosed
 	case conn = <-c.writeCh:
-		c.connStackMutex.Lock()
-		defer c.connStackMutex.Unlock()
-		c.connStackTraces[uintptr(unsafe.Pointer(conn))] = stack()
+		if c.stalledConnDetectorEnabled {
+			c.stalledConnStackMutex.Lock()
+			defer c.stalledConnStackMutex.Unlock()
+			c.stalledConnStackTraces[uintptr(unsafe.Pointer(conn))] = packStack()
+		}
 		return conn, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -142,9 +148,12 @@ func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
 
 func (c *ConnManager) ReleaseWrite(conn *Conn) {
 	c.writeCh <- conn
-	c.connStackMutex.Lock()
-	defer c.connStackMutex.Unlock()
-	delete(c.connStackTraces, uintptr(unsafe.Pointer(conn)))
+	if !c.stalledConnDetectorEnabled {
+		return
+	}
+	c.stalledConnStackMutex.Lock()
+	defer c.stalledConnStackMutex.Unlock()
+	delete(c.stalledConnStackTraces, uintptr(unsafe.Pointer(conn)))
 }
 
 func (c *ConnManager) GetRead(ctx context.Context) (conn *Conn, err error) {
@@ -156,10 +165,11 @@ func (c *ConnManager) GetRead(ctx context.Context) (conn *Conn, err error) {
 	case <-c.closed:
 		return nil, ErrDBIsClosed
 	case conn = <-c.readCh:
-		// get pointer to conn
-		c.connStackMutex.Lock()
-		defer c.connStackMutex.Unlock()
-		c.connStackTraces[uintptr(unsafe.Pointer(conn))] = stack()
+		if c.stalledConnDetectorEnabled {
+			c.stalledConnStackMutex.Lock()
+			defer c.stalledConnStackMutex.Unlock()
+			c.stalledConnStackTraces[uintptr(unsafe.Pointer(conn))] = packStack()
+		}
 		return conn, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -168,9 +178,12 @@ func (c *ConnManager) GetRead(ctx context.Context) (conn *Conn, err error) {
 
 func (c *ConnManager) ReleaseRead(conn *Conn) {
 	c.readCh <- conn
-	c.connStackMutex.Lock()
-	defer c.connStackMutex.Unlock()
-	delete(c.connStackTraces, uintptr(unsafe.Pointer(conn)))
+	if !c.stalledConnDetectorEnabled {
+		return
+	}
+	c.stalledConnStackMutex.Lock()
+	defer c.stalledConnStackMutex.Unlock()
+	delete(c.stalledConnStackTraces, uintptr(unsafe.Pointer(conn)))
 }
 
 func setupConn(fr *registry.FilterRegistry, sr *registry.SortRegistry, conn *sqlite.Conn, pragma map[string]string) (err error) {
@@ -225,28 +238,34 @@ func (c *ConnManager) Close() (err error) {
 	*/
 	close(c.closed)
 
-	var conn *Conn
 	allClosedChan := make(chan struct{})
-	go func() {
-		select {
-		case <-allClosedChan:
-			return
-		case <-time.After(5 * time.Second):
-			_, _ = fmt.Fprintf(os.Stderr, "sqlite: failed to close all connections in 5 seconds\n")
-			c.connStackMutex.Lock()
-			defer c.connStackMutex.Unlock()
-			for _, vals := range c.connStackTraces {
-				fmt.Fprintf(os.Stderr, "### sqlite: unclosed connction:\n%s\n\n\n", stackToStr(vals))
+	if c.stalledConnDetectorEnabled && c.stalledConnDetectorCloseTimeout > 0 {
+		go func() {
+			select {
+			case <-allClosedChan:
+				return
+			case <-time.After(c.stalledConnDetectorCloseTimeout):
+				_, _ = fmt.Fprintf(os.Stderr, "any-store: close failed because of stalled connections\n")
+				c.stalledConnStackMutex.Lock()
+				defer c.stalledConnStackMutex.Unlock()
+				for _, vals := range c.stalledConnStackTraces {
+					duration, stackTrace := unpackStackWithFrames(vals)
+					_, _ = fmt.Fprintf(os.Stderr, "any-store: stalled connection for %s:\n%s\n\n", duration.String(), stackTrace)
+				}
+				if len(c.stalledConnStackTraces) > 0 {
+					panic("any-store: stalled connections")
+				}
 			}
-		}
-	}()
+		}()
+	}
+
+	var conn *Conn
 	for range c.readConn {
-		conn = <-c.readCh
-		if err != nil {
-			err = errors.Join(err, err)
-		} else {
-			err = errors.Join(err, conn.Close())
+		select {
+		case conn = <-c.readCh:
+			break
 		}
+		err = errors.Join(err, conn.Close())
 	}
 
 	if err = c.writeConn[0].Close(); err != nil {
@@ -274,34 +293,4 @@ func checkVersion(conn *sqlite.Conn, version int, isNewDb bool) (err error) {
 		}
 	}
 	return sqlitex.ExecuteTransient(conn, fmt.Sprintf("PRAGMA user_version = %d", version), nil)
-}
-
-func stack() []uintptr {
-	// Allocate space for up to 32 stack frames; adjust as needed.
-	pcs := make([]uintptr, 32)
-	// Skip the first two callers: runtime.Callers and captureStack.
-	n := runtime.Callers(2, pcs)
-	return pcs[:n]
-}
-
-func stackHash(s []uintptr) int64 {
-	// Allocate space for up to 32 stack frames; adjust as needed.
-	var v int64
-	for _, pc := range s {
-		v += int64(pc)
-	}
-	return v
-}
-
-func stackToStr(stack []uintptr) string {
-	frames := runtime.CallersFrames(stack)
-	var s strings.Builder
-	for {
-		frame, more := frames.Next()
-		s.WriteString(fmt.Sprintf("%s\n\t%s:%d\n", frame.Function, frame.File, frame.Line))
-		if !more {
-			break
-		}
-	}
-	return s.String()
 }
