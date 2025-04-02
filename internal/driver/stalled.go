@@ -32,7 +32,7 @@ func (c *ConnManager) stalledAcquireConn(conn *Conn) {
 	if !c.stalledConnDetectorEnabled {
 		return
 	}
-	stack := packStack()
+	stack := packStack(3)
 	c.stalledConnStackMutex.Lock()
 	defer c.stalledConnStackMutex.Unlock()
 	c.stalledConnStackTraces[uintptr(unsafe.Pointer(conn))] = stack
@@ -66,13 +66,12 @@ func (c *ConnManager) stalledCloseWatcher(allClosed chan struct{}) {
 }
 
 // packStack returns a slice of uintptrs representing the current stack, 0-element used to store the current timestamp
-func packStack() []uintptr {
+func packStack(skip int) []uintptr {
 	// Allocate space for up to 32(-1) stack frames; adjust as needed.
 	pcs := make([]uintptr, 32)
 	// use first element to store current timestamp
 	pcs[0] = uintptr(time.Now().Unix()) // on 32 bit systems it will not work after 2106, but who cares about 32 bit systems after 2106
-	// Skip the first two callers: runtime.Callers and captureStack.
-	n := runtime.Callers(2, pcs[1:31])
+	n := runtime.Callers(skip, pcs[1:31])
 	return pcs[:n]
 }
 
