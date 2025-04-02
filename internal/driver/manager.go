@@ -7,7 +7,6 @@ import (
 	"os"
 	"sync"
 	"time"
-	"unsafe"
 
 	"modernc.org/libc"
 	"zombiezen.com/go/sqlite"
@@ -135,11 +134,7 @@ func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
 	case <-c.closed:
 		return nil, ErrDBIsClosed
 	case conn = <-c.writeCh:
-		if c.stalledConnDetectorEnabled {
-			c.stalledConnStackMutex.Lock()
-			defer c.stalledConnStackMutex.Unlock()
-			c.stalledConnStackTraces[uintptr(unsafe.Pointer(conn))] = packStack()
-		}
+		c.stalledAcquireConn(conn)
 		return conn, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -148,12 +143,7 @@ func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
 
 func (c *ConnManager) ReleaseWrite(conn *Conn) {
 	c.writeCh <- conn
-	if !c.stalledConnDetectorEnabled {
-		return
-	}
-	c.stalledConnStackMutex.Lock()
-	defer c.stalledConnStackMutex.Unlock()
-	delete(c.stalledConnStackTraces, uintptr(unsafe.Pointer(conn)))
+	c.stalledReleaseConn(conn)
 }
 
 func (c *ConnManager) GetRead(ctx context.Context) (conn *Conn, err error) {
@@ -165,11 +155,7 @@ func (c *ConnManager) GetRead(ctx context.Context) (conn *Conn, err error) {
 	case <-c.closed:
 		return nil, ErrDBIsClosed
 	case conn = <-c.readCh:
-		if c.stalledConnDetectorEnabled {
-			c.stalledConnStackMutex.Lock()
-			defer c.stalledConnStackMutex.Unlock()
-			c.stalledConnStackTraces[uintptr(unsafe.Pointer(conn))] = packStack()
-		}
+		c.stalledAcquireConn(conn)
 		return conn, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -178,12 +164,7 @@ func (c *ConnManager) GetRead(ctx context.Context) (conn *Conn, err error) {
 
 func (c *ConnManager) ReleaseRead(conn *Conn) {
 	c.readCh <- conn
-	if !c.stalledConnDetectorEnabled {
-		return
-	}
-	c.stalledConnStackMutex.Lock()
-	defer c.stalledConnStackMutex.Unlock()
-	delete(c.stalledConnStackTraces, uintptr(unsafe.Pointer(conn)))
+	c.stalledReleaseConn(conn)
 }
 
 func setupConn(fr *registry.FilterRegistry, sr *registry.SortRegistry, conn *sqlite.Conn, pragma map[string]string) (err error) {
@@ -240,23 +221,7 @@ func (c *ConnManager) Close() (err error) {
 
 	allClosedChan := make(chan struct{})
 	if c.stalledConnDetectorEnabled && c.stalledConnDetectorCloseTimeout > 0 {
-		go func() {
-			select {
-			case <-allClosedChan:
-				return
-			case <-time.After(c.stalledConnDetectorCloseTimeout):
-				_, _ = fmt.Fprintf(os.Stderr, "any-store: close failed because of stalled connections\n")
-				c.stalledConnStackMutex.Lock()
-				defer c.stalledConnStackMutex.Unlock()
-				for _, vals := range c.stalledConnStackTraces {
-					duration, stackTrace := unpackStackWithFrames(vals)
-					_, _ = fmt.Fprintf(os.Stderr, "any-store: stalled connection for %s:\n%s\n\n", duration.String(), stackTrace)
-				}
-				if len(c.stalledConnStackTraces) > 0 {
-					panic("any-store: stalled connections")
-				}
-			}
-		}()
+		go c.stalledCloseWatcher(allClosedChan)
 	}
 
 	var conn *Conn
