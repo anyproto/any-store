@@ -30,6 +30,8 @@ func NewConnManager(
 	preAllocatedPageCacheSize int,
 	fr *registry.FilterRegistry, sr *registry.SortRegistry,
 	version int,
+	enableStalledConnDetector bool,
+	stalledConnDetectorCloseTimeout time.Duration,
 ) (*ConnManager, error) {
 	_, statErr := os.Stat(path)
 	var newDb bool
@@ -93,12 +95,14 @@ func NewConnManager(
 	}
 
 	cm := &ConnManager{
-		readCh:                 make(chan *Conn, len(readConn)),
-		writeCh:                make(chan *Conn, len(writeConn)),
-		closed:                 make(chan struct{}),
-		readConn:               readConn,
-		writeConn:              writeConn,
-		stalledConnStackTraces: make(map[uintptr][]uintptr),
+		readCh:                          make(chan *Conn, len(readConn)),
+		writeCh:                         make(chan *Conn, len(writeConn)),
+		closed:                          make(chan struct{}),
+		readConn:                        readConn,
+		writeConn:                       writeConn,
+		stalledConnStackTraces:          make(map[uintptr][]uintptr),
+		stalledConnDetectorEnabled:      enableStalledConnDetector,
+		stalledConnDetectorCloseTimeout: stalledConnDetectorCloseTimeout,
 	}
 	for _, conn := range writeConn {
 		cm.writeCh <- conn
