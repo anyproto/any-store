@@ -23,14 +23,18 @@ var (
 	initSqliteOnce         sync.Once
 )
 
-func NewConnManager(
-	path string,
-	pragma map[string]string,
-	writeCount, readCount int,
-	preAllocatedPageCacheSize int,
-	fr *registry.FilterRegistry, sr *registry.SortRegistry,
-	version int,
-) (*ConnManager, error) {
+type Config struct {
+	Pragma                    map[string]string
+	WriteCunt, ReadCount      int
+	PreAllocatedPageCacheSize int
+	SortRegistry              *registry.SortRegistry
+	FilterRegistry            *registry.FilterRegistry
+	Version                   int
+	CloseTimeout              time.Duration
+	ReadConnTTL               time.Duration
+}
+
+func NewConnManager(path string, conf Config) (*ConnManager, error) {
 	_, statErr := os.Stat(path)
 	var newDb bool
 	if os.IsNotExist(statErr) {
@@ -38,11 +42,11 @@ func NewConnManager(
 	}
 
 	initSqliteOnce.Do(func() {
-		if preAllocatedPageCacheSize <= 0 {
+		if conf.PreAllocatedPageCacheSize <= 0 {
 			return
 		}
 		tls := libc.NewTLS()
-		err := sqlitePreallocatePageCache(tls, preAllocatedPageCacheSize)
+		err := sqlitePreallocatePageCache(tls, conf.PreAllocatedPageCacheSize)
 		if err != nil {
 			// ignore this error because it's not critical, we can continue without preallocated cache
 			_, _ = fmt.Fprintf(os.Stderr, "sqlite: failed to preallocate pagecache: %v\n", err)
@@ -50,8 +54,8 @@ func NewConnManager(
 	})
 
 	var (
-		writeConn = make([]*Conn, 0, writeCount)
-		readConn  = make([]*Conn, 0, readCount)
+		writeConn = make([]*Conn, 0, conf.WriteCunt)
+		readConn  = make([]*Conn, 0, conf.ReadCount)
 	)
 	closeAll := func() {
 		for _, conn := range writeConn {
@@ -59,20 +63,24 @@ func NewConnManager(
 		}
 	}
 
+	if conf.CloseTimeout <= 0 {
+		conf.CloseTimeout = time.Hour
+	}
 	cm := &ConnManager{
 		readCh:         make(chan *Conn),
-		readConnLimit:  readCount,
+		readConnLimit:  conf.ReadCount,
 		readConn:       readConn,
-		readConnTTL:    time.Minute,
-		writeCh:        make(chan *Conn, writeCount),
+		readConnTTL:    conf.ReadConnTTL,
+		writeCh:        make(chan *Conn, conf.WriteCunt),
 		closed:         make(chan struct{}),
-		sortRegistry:   sr,
-		filterRegistry: fr,
+		sortRegistry:   conf.SortRegistry,
+		filterRegistry: conf.FilterRegistry,
 		path:           path,
-		pragma:         pragma,
+		pragma:         conf.Pragma,
+		closeTimeout:   conf.CloseTimeout,
 	}
 
-	for i := 0; i < writeCount; i++ {
+	for i := 0; i < conf.WriteCunt; i++ {
 		conn, err := sqlite.OpenConn(path, sqlite.OpenCreate|sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadWrite)
 		if err != nil {
 			closeAll()
@@ -85,7 +93,7 @@ func NewConnManager(
 		wConn := &Conn{conn: conn}
 		writeConn = append(writeConn, wConn)
 		if i == 0 {
-			if err = checkVersion(conn, version, newDb); err != nil {
+			if err = checkVersion(conn, conf.Version, newDb); err != nil {
 				closeAll()
 				return nil, err
 			}
@@ -109,6 +117,7 @@ type ConnManager struct {
 	readConnLimit  int
 	mu             sync.Mutex
 	readConnTTL    time.Duration
+	closeTimeout   time.Duration
 }
 
 func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
@@ -266,10 +275,23 @@ func (c *ConnManager) Close() (err error) {
 		}
 	}
 	c.mu.Unlock()
+
+waitConn:
 	for range activeCount {
-		conn := <-c.readCh
-		if cErr := conn.Close(); cErr != nil {
-			err = errors.Join(err, cErr)
+		select {
+		case <-time.After(c.closeTimeout):
+			c.mu.Lock()
+			for _, conn := range c.readConn {
+				if cErr := conn.Close(); cErr != nil {
+					err = errors.Join(err, cErr)
+				}
+			}
+			c.mu.Unlock()
+			break waitConn
+		case conn := <-c.readCh:
+			if cErr := conn.Close(); cErr != nil {
+				err = errors.Join(err, cErr)
+			}
 		}
 	}
 

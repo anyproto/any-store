@@ -7,6 +7,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"zombiezen.com/go/sqlite"
 
@@ -104,16 +105,18 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	}
 
 	var err error
-	if ds.cm, err = driver.NewConnManager(
-		path,
-		config.pragma(),
-		1,
-		config.ReadConnections,
-		config.SQLiteGlobalPageCachePreallocateSizeBytes,
-		ds.filterReg,
-		ds.sortReg,
-		2, // sqlite user_version
-	); err != nil {
+	conf := driver.Config{
+		Pragma:                    config.pragma(),
+		WriteCunt:                 1,
+		ReadCount:                 config.ReadConnections,
+		PreAllocatedPageCacheSize: config.SQLiteGlobalPageCachePreallocateSizeBytes,
+		SortRegistry:              ds.sortReg,
+		FilterRegistry:            ds.filterReg,
+		Version:                   2,
+		CloseTimeout:              time.Minute,
+		ReadConnTTL:               time.Minute,
+	}
+	if ds.cm, err = driver.NewConnManager(path, conf); err != nil {
 		return nil, err
 	}
 	if err = ds.init(ctx); err != nil {

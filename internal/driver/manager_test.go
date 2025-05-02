@@ -21,11 +21,21 @@ func TestNewConnManager(t *testing.T) {
 	sr := registry.NewSortRegistry(sp, 256)
 	tmpDir, tErr := os.MkdirTemp("", "")
 	require.NoError(t, tErr)
+	conf := Config{
+		WriteCunt:                 1,
+		ReadCount:                 2,
+		PreAllocatedPageCacheSize: 30,
+		SortRegistry:              sr,
+		FilterRegistry:            fr,
+		Version:                   1,
+		CloseTimeout:              time.Minute,
+		ReadConnTTL:               time.Minute,
+	}
 	t.Cleanup(func() {
 		_ = os.RemoveAll(tmpDir)
 	})
 	t.Run("open-close", func(t *testing.T) {
-		cm, err := NewConnManager(filepath.Join(tmpDir, "1.db"), nil, 1, 2, 30, fr, sr, 1)
+		cm, err := NewConnManager(filepath.Join(tmpDir, "1.db"), conf)
 		require.NoError(t, err)
 		require.NoError(t, cm.Close())
 	})
@@ -33,14 +43,15 @@ func TestNewConnManager(t *testing.T) {
 		conn, err := sqlite.OpenConn(filepath.Join(tmpDir, "empty.db"), sqlite.OpenCreate|sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadWrite)
 		require.NoError(t, err)
 		_ = conn.Close()
-		_, err = NewConnManager(filepath.Join(tmpDir, "empty.db"), nil, 1, 2, 30, fr, sr, 1)
+		_, err = NewConnManager(filepath.Join(tmpDir, "empty.db"), conf)
 		require.ErrorIs(t, err, ErrIncompatibleVersion)
 	})
 	t.Run("old version", func(t *testing.T) {
-		cm, err := NewConnManager(filepath.Join(tmpDir, "old.db"), nil, 1, 2, 30, fr, sr, 1)
+		cm, err := NewConnManager(filepath.Join(tmpDir, "old.db"), conf)
 		require.NoError(t, err)
 		require.NoError(t, cm.Close())
-		_, err = NewConnManager(filepath.Join(tmpDir, "old.db"), nil, 1, 2, 30, fr, sr, 2)
+		conf.Version = 0
+		_, err = NewConnManager(filepath.Join(tmpDir, "old.db"), conf)
 		require.ErrorIs(t, err, ErrIncompatibleVersion)
 	})
 }
@@ -85,7 +96,16 @@ func newFixture(t *testing.T) *ConnManager {
 		}
 		_ = os.RemoveAll(tmpDir)
 	})
-	cm, err := NewConnManager(filepath.Join(tmpDir, "1.db"), nil, 1, 2, 30, fr, sr, 1)
+	cm, err := NewConnManager(filepath.Join(tmpDir, "1.db"), Config{
+		WriteCunt:                 1,
+		ReadCount:                 2,
+		PreAllocatedPageCacheSize: 30,
+		SortRegistry:              sr,
+		FilterRegistry:            fr,
+		Version:                   1,
+		CloseTimeout:              time.Minute,
+		ReadConnTTL:               time.Minute,
+	})
 	require.NoError(t, err)
 	return cm
 }
