@@ -1,12 +1,16 @@
 package anystore
 
 import (
+	"fmt"
+	"math/rand"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/internal/objectid"
 )
 
 func TestDb_WriteTx(t *testing.T) {
@@ -57,5 +61,32 @@ func TestDb_WriteTx(t *testing.T) {
 
 		require.NoError(t, tx.Rollback())
 		assertCollCount(t, coll, 0)
+	})
+	t.Run("rollback - commit race", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		var wg sync.WaitGroup
+
+		var insertFunc = func() {
+			tx, txErr := coll.WriteTx(ctx)
+			require.NoError(t, txErr)
+			defer func() {
+				assert.NoError(t, tx.Rollback())
+			}()
+			assert.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":"%s", "data": %d}`, objectid.NewObjectID().Hex(), rand.Int()))))
+			assert.NoError(t, tx.Commit())
+		}
+
+		for range 10 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for range 100 {
+					insertFunc()
+				}
+			}()
+		}
+		wg.Wait()
 	})
 }

@@ -10,6 +10,16 @@ import (
 	"github.com/anyproto/any-store/internal/driver"
 )
 
+var txVersion atomic.Uint32
+
+func newTxVersion() uint32 {
+	if ver := txVersion.Add(1); ver != 0 {
+		return ver
+	} else {
+		return txVersion.Add(1)
+	}
+}
+
 // WriteTx represents a read-write transaction.
 type WriteTx interface {
 	// ReadTx is embedded to provide read-only transaction methods.
@@ -37,82 +47,77 @@ type ReadTx interface {
 }
 
 type commonTx struct {
-	db         *db
-	ctx        context.Context
-	initialCtx context.Context
-	con        *driver.Conn
-	done       atomic.Bool
+	db      *db
+	ctx     context.Context
+	con     *driver.Conn
+	version atomic.Uint32
 }
 
 func (tx *commonTx) conn() *driver.Conn {
 	return tx.con
 }
 
-func (tx *commonTx) reset() {
-	tx.done.Store(false)
-}
-
 func (tx *commonTx) instanceId() string {
 	return tx.db.instanceId
 }
 
-var readTxPool = &sync.Pool{
+var txPool = &sync.Pool{
 	New: func() any {
-		return &readTx{}
+		return &commonTx{}
 	},
 }
 
 type readTx struct {
-	commonTx
+	*commonTx
+	version uint32
 }
 
-func (r *readTx) Context() context.Context {
+func (r readTx) Context() context.Context {
 	return r.ctx
 }
 
-func (r *readTx) Commit() error {
-	if r.done.CompareAndSwap(false, true) {
+func (r readTx) Commit() error {
+	if r.commonTx.version.CompareAndSwap(r.version, 0) {
 		defer r.db.cm.ReleaseRead(r.con)
-		defer readTxPool.Put(r)
+		defer txPool.Put(r.commonTx)
 		return r.con.Commit(context.Background())
 	}
 	return nil
 }
 
-func (r *readTx) Done() bool {
-	return r.done.Load()
-}
-
-var writeTxPool = &sync.Pool{
-	New: func() any {
-		return &writeTx{}
-	},
+func (r readTx) Done() bool {
+	return r.commonTx.version.Load() != r.version
 }
 
 type writeTx struct {
-	readTx
+	*commonTx
+	version uint32
 }
 
-func (w *writeTx) Context() context.Context {
+func (w writeTx) Context() context.Context {
 	return w.ctx
 }
 
-func (w *writeTx) Rollback() error {
-	if w.done.CompareAndSwap(false, true) {
+func (w writeTx) Rollback() error {
+	if w.commonTx.version.CompareAndSwap(w.version, 0) {
 		defer w.db.cm.ReleaseWrite(w.con)
-		defer writeTxPool.Put(w)
+		defer txPool.Put(w.commonTx)
 		return w.con.Rollback(context.Background())
 	}
 	return nil
 }
 
-func (w *writeTx) Commit() error {
-	if w.done.CompareAndSwap(false, true) {
+func (w writeTx) Commit() error {
+	if w.commonTx.version.CompareAndSwap(w.version, 0) {
 		defer w.db.cm.ReleaseWrite(w.con)
-		defer writeTxPool.Put(w)
+		defer txPool.Put(w.commonTx)
 		return w.con.Commit(context.Background())
 	}
 	return nil
+}
+
+func (w writeTx) Done() bool {
+	return w.commonTx.version.Load() != w.version
 }
 
 var savepointIds atomic.Uint64
@@ -129,7 +134,7 @@ func newSavepointTx(ctx context.Context, wrTx WriteTx) (WriteTx, error) {
 	if err := tx.conn().Exec(ctx, unsafe.String(unsafe.SliceData(tx.createQuery), len(tx.createQuery)), nil, driver.StmtExecNoResults); err != nil {
 		return nil, err
 	}
-	return tx, nil
+	return savepointWrapper{savepointTx: tx, version: tx.version.Load()}, nil
 }
 
 const (
@@ -138,19 +143,24 @@ const (
 	savepointRollbackQuery = "ROLLBACK TO SAVEPOINT sp"
 )
 
+type savepointWrapper struct {
+	*savepointTx
+	version uint32
+}
+
 type savepointTx struct {
 	WriteTx
 	id            uint64
 	createQuery   []byte
 	releaseQuery  []byte
 	rollbackQuery []byte
-	done          atomic.Bool
+	version       atomic.Uint32
 }
 
 func (tx *savepointTx) reset(wtx WriteTx) {
 	tx.id = savepointIds.Add(1)
 	tx.WriteTx = wtx
-	tx.done.Store(false)
+	tx.version.Store(newTxVersion())
 	if len(tx.createQuery) == 0 {
 		tx.createQuery = make([]byte, 0, len(savepointCreateQuery)+10)
 		tx.createQuery = append(tx.createQuery, []byte(savepointCreateQuery)...)
@@ -174,28 +184,28 @@ func (tx *savepointTx) reset(wtx WriteTx) {
 	}
 }
 
-func (tx *savepointTx) Commit() error {
-	if tx.done.CompareAndSwap(false, true) {
-		if err := tx.conn().Exec(context.TODO(), unsafe.String(unsafe.SliceData(tx.releaseQuery), len(tx.releaseQuery)), nil, driver.StmtExecNoResults); err != nil {
+func (w savepointWrapper) Commit() error {
+	if w.savepointTx.version.CompareAndSwap(w.version, 0) {
+		if err := w.conn().Exec(context.TODO(), unsafe.String(unsafe.SliceData(w.releaseQuery), len(w.releaseQuery)), nil, driver.StmtExecNoResults); err != nil {
 			return err
 		}
-		savepointPool.Put(tx)
+		savepointPool.Put(w.savepointTx)
 	}
 	return nil
 }
 
-func (tx *savepointTx) Rollback() error {
-	if tx.done.CompareAndSwap(false, true) {
-		if err := tx.conn().Exec(context.TODO(), unsafe.String(unsafe.SliceData(tx.rollbackQuery), len(tx.rollbackQuery)), nil, driver.StmtExecNoResults); err != nil {
+func (w savepointWrapper) Rollback() error {
+	if w.savepointTx.version.CompareAndSwap(w.version, 0) {
+		if err := w.conn().Exec(context.TODO(), unsafe.String(unsafe.SliceData(w.rollbackQuery), len(w.rollbackQuery)), nil, driver.StmtExecNoResults); err != nil {
 			return err
 		}
-		savepointPool.Put(tx)
+		savepointPool.Put(w.savepointTx)
 	}
 	return nil
 }
 
-func (tx *savepointTx) Done() bool {
-	return tx.done.Load()
+func (w savepointWrapper) Done() bool {
+	return w.savepointTx.version.Load() != w.version
 }
 
 type noOpTx struct {

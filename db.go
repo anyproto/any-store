@@ -188,13 +188,15 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 		db.cm.ReleaseWrite(connWrite)
 		return nil, err
 	}
-	tx := writeTxPool.Get().(*writeTx)
+
+	version := newTxVersion()
+	tx := txPool.Get().(*commonTx)
 	tx.db = db
-	tx.initialCtx = ctx
-	tx.ctx = context.WithValue(ctx, ctxKeyTx, tx)
 	tx.con = connWrite
-	tx.reset()
-	return tx, nil
+	tx.version.Store(version)
+	wTx := writeTx{commonTx: tx, version: version}
+	tx.ctx = context.WithValue(ctx, ctxKeyTx, wTx)
+	return wTx, nil
 }
 
 func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
@@ -207,13 +209,15 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 		db.cm.ReleaseRead(connRead)
 		return nil, err
 	}
-	tx := readTxPool.Get().(*readTx)
+
+	version := newTxVersion()
+	tx := txPool.Get().(*commonTx)
 	tx.db = db
-	tx.initialCtx = ctx
-	tx.ctx = context.WithValue(ctx, ctxKeyTx, tx)
 	tx.con = connRead
-	tx.reset()
-	return tx, nil
+	tx.version.Store(version)
+	rTx := readTx{commonTx: tx, version: version}
+	tx.ctx = context.WithValue(ctx, ctxKeyTx, rTx)
+	return rTx, nil
 }
 
 func (db *db) CreateCollection(ctx context.Context, collectionName string) (Collection, error) {
