@@ -118,6 +118,10 @@ type ConnManager struct {
 	mu             sync.Mutex
 	readConnTTL    time.Duration
 	closeTimeout   time.Duration
+
+	stalledConnStackMutex      sync.Mutex
+	stalledConnStackTraces     map[uintptr][]uintptr
+	stalledConnDetectorEnabled bool
 }
 
 func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
@@ -129,6 +133,7 @@ func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
 	case <-c.closed:
 		return nil, ErrDBIsClosed
 	case conn = <-c.writeCh:
+		c.stalledAcquireConn(conn)
 		return conn, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -137,6 +142,7 @@ func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
 
 func (c *ConnManager) ReleaseWrite(conn *Conn) {
 	c.writeCh <- conn
+	c.stalledReleaseConn(conn)
 }
 
 func (c *ConnManager) GetRead(ctx context.Context) (conn *Conn, err error) {
@@ -160,6 +166,7 @@ func (c *ConnManager) GetRead(ctx context.Context) (conn *Conn, err error) {
 	for _, conn = range c.readConn {
 		if conn.isActive.CompareAndSwap(false, true) {
 			c.mu.Unlock()
+			c.stalledAcquireConn(conn)
 			return conn, nil
 		}
 	}
@@ -173,6 +180,7 @@ func (c *ConnManager) GetRead(ctx context.Context) (conn *Conn, err error) {
 		c.readConn = append(c.readConn, conn)
 		conn.isActive.Store(true)
 		c.mu.Unlock()
+		c.stalledAcquireConn(conn)
 		return conn, nil
 	}
 
@@ -194,6 +202,7 @@ func (c *ConnManager) ReleaseRead(conn *Conn) {
 	now := time.Now()
 	conn.isActive.Store(false)
 	conn.lastUsage.Store(now.Unix())
+	c.stalledReleaseConn(conn)
 	select {
 	case c.readCh <- conn:
 		return

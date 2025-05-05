@@ -2,6 +2,7 @@ package anystore
 
 import (
 	"runtime"
+	"time"
 )
 
 var defaultSQLiteOptions = map[string]string{
@@ -31,6 +32,12 @@ type Config struct {
 	// SyncPoolElementMaxSize defines maximum size of buffer that can be returned to the syncpool
 	// default value id 2MiB
 	SyncPoolElementMaxSize int
+
+	// StalledConnectionsDetectorEnabled enables the collection of stack traces and duration of acquired connections
+	// You can then use StalledConnections method of the ConnManager
+	StalledConnectionsDetectorEnabled bool
+	// StalledConnectionsPanicOnClose enables panic on Close in case of any connection is not released after this timeout
+	StalledConnectionsPanicOnClose time.Duration
 }
 
 func (c *Config) setDefaults() {
