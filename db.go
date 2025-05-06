@@ -112,7 +112,6 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		SortRegistry:              ds.sortReg,
 		FilterRegistry:            ds.filterReg,
 		Version:                   2,
-		CloseTimeout:              time.Minute,
 		ReadConnTTL:               time.Minute,
 	}
 	if ds.cm, err = driver.NewConnManager(path, conf); err != nil {

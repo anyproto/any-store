@@ -30,7 +30,6 @@ type Config struct {
 	SortRegistry              *registry.SortRegistry
 	FilterRegistry            *registry.FilterRegistry
 	Version                   int
-	CloseTimeout              time.Duration
 	ReadConnTTL               time.Duration
 }
 
@@ -55,9 +54,6 @@ func NewConnManager(path string, conf Config) (*ConnManager, error) {
 
 	var readConn = make([]*Conn, 0, conf.ReadCount)
 
-	if conf.CloseTimeout <= 0 {
-		conf.CloseTimeout = time.Hour
-	}
 	cm := &ConnManager{
 		readCh:         make(chan *Conn),
 		readConnLimit:  conf.ReadCount,
@@ -69,7 +65,6 @@ func NewConnManager(path string, conf Config) (*ConnManager, error) {
 		filterRegistry: conf.FilterRegistry,
 		path:           path,
 		pragma:         conf.Pragma,
-		closeTimeout:   conf.CloseTimeout,
 	}
 
 	// open write connection
@@ -105,7 +100,6 @@ type ConnManager struct {
 	readConnLimit  int
 	mu             sync.Mutex
 	readConnTTL    time.Duration
-	closeTimeout   time.Duration
 
 	stalledConnStackMutex      sync.Mutex
 	stalledConnStackTraces     map[uintptr][]uintptr

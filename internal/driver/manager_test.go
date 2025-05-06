@@ -28,7 +28,6 @@ func TestNewConnManager(t *testing.T) {
 		SortRegistry:              sr,
 		FilterRegistry:            fr,
 		Version:                   1,
-		CloseTimeout:              time.Minute,
 		ReadConnTTL:               time.Minute,
 	}
 	t.Cleanup(func() {
@@ -109,7 +108,6 @@ func newFixture(t *testing.T) *ConnManager {
 		SortRegistry:              sr,
 		FilterRegistry:            fr,
 		Version:                   1,
-		CloseTimeout:              time.Minute,
 		ReadConnTTL:               time.Minute,
 	})
 	require.NoError(t, err)
