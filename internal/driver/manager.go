@@ -25,7 +25,7 @@ var (
 
 type Config struct {
 	Pragma                    map[string]string
-	WriteCunt, ReadCount      int
+	ReadCount                 int
 	PreAllocatedPageCacheSize int
 	SortRegistry              *registry.SortRegistry
 	FilterRegistry            *registry.FilterRegistry
@@ -53,15 +53,7 @@ func NewConnManager(path string, conf Config) (*ConnManager, error) {
 		}
 	})
 
-	var (
-		writeConn = make([]*Conn, 0, conf.WriteCunt)
-		readConn  = make([]*Conn, 0, conf.ReadCount)
-	)
-	closeAll := func() {
-		for _, conn := range writeConn {
-			_ = conn.Close()
-		}
-	}
+	var readConn = make([]*Conn, 0, conf.ReadCount)
 
 	if conf.CloseTimeout <= 0 {
 		conf.CloseTimeout = time.Hour
@@ -71,7 +63,7 @@ func NewConnManager(path string, conf Config) (*ConnManager, error) {
 		readConnLimit:  conf.ReadCount,
 		readConn:       readConn,
 		readConnTTL:    conf.ReadConnTTL,
-		writeCh:        make(chan *Conn, conf.WriteCunt),
+		writeCh:        make(chan *Conn, 1),
 		closed:         make(chan struct{}),
 		sortRegistry:   conf.SortRegistry,
 		filterRegistry: conf.FilterRegistry,
@@ -80,27 +72,23 @@ func NewConnManager(path string, conf Config) (*ConnManager, error) {
 		closeTimeout:   conf.CloseTimeout,
 	}
 
-	for i := 0; i < conf.WriteCunt; i++ {
-		conn, err := sqlite.OpenConn(path, sqlite.OpenCreate|sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadWrite)
-		if err != nil {
-			closeAll()
-			return nil, err
-		}
-		if err = cm.setupConn(conn); err != nil {
-			closeAll()
-			return nil, err
-		}
-		wConn := &Conn{conn: conn}
-		writeConn = append(writeConn, wConn)
-		if i == 0 {
-			if err = checkVersion(conn, conf.Version, newDb); err != nil {
-				closeAll()
-				return nil, err
-			}
-		}
-		cm.writeCh <- wConn
+	// open write connection
+	conn, err := sqlite.OpenConn(path, sqlite.OpenCreate|sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadWrite)
+	if err != nil {
+		return nil, err
 	}
-	cm.writeConn = writeConn
+	if err = cm.setupConn(conn); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	wConn := &Conn{conn: conn, activeStmts: map[*Stmt]struct{}{}}
+
+	if err = checkVersion(conn, conf.Version, newDb); err != nil {
+		_ = wConn.Close()
+		return nil, err
+	}
+	cm.writeCh <- wConn
+	cm.writeConn = wConn
 	return cm, nil
 }
 
@@ -108,7 +96,7 @@ type ConnManager struct {
 	readCh         chan *Conn
 	writeCh        chan *Conn
 	readConn       []*Conn
-	writeConn      []*Conn
+	writeConn      *Conn
 	closed         chan struct{}
 	path           string
 	sortRegistry   *registry.SortRegistry
@@ -234,7 +222,7 @@ func (c *ConnManager) openReadConn() (*Conn, error) {
 	if err = c.setupConn(conn); err != nil {
 		return nil, err
 	}
-	return &Conn{conn: conn}, nil
+	return &Conn{conn: conn, activeStmts: map[*Stmt]struct{}{}}, nil
 }
 
 func (c *ConnManager) setupConn(conn *sqlite.Conn) (err error) {
@@ -272,41 +260,12 @@ func (c *ConnManager) setupConn(conn *sqlite.Conn) (err error) {
 
 func (c *ConnManager) Close() (err error) {
 	close(c.closed)
-	var activeCount int
 	c.mu.Lock()
 	for _, conn := range c.readConn {
-		if !conn.isActive.Load() {
-			if cErr := conn.Close(); cErr != nil {
-				err = errors.Join(err, cErr)
-			}
-		} else {
-			activeCount++
-		}
+		err = errors.Join(err, conn.Close())
 	}
+	err = errors.Join(err, c.writeConn.Close())
 	c.mu.Unlock()
-
-waitConn:
-	for range activeCount {
-		select {
-		case <-time.After(c.closeTimeout):
-			c.mu.Lock()
-			for _, conn := range c.readConn {
-				if cErr := conn.Close(); cErr != nil {
-					err = errors.Join(err, cErr)
-				}
-			}
-			c.mu.Unlock()
-			break waitConn
-		case conn := <-c.readCh:
-			if cErr := conn.Close(); cErr != nil {
-				err = errors.Join(err, cErr)
-			}
-		}
-	}
-
-	if err = c.writeConn[0].Close(); err != nil {
-		err = errors.Join(err, err)
-	}
 	return err
 }
 

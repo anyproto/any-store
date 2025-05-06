@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"zombiezen.com/go/sqlite"
 
@@ -22,7 +23,6 @@ func TestNewConnManager(t *testing.T) {
 	tmpDir, tErr := os.MkdirTemp("", "")
 	require.NoError(t, tErr)
 	conf := Config{
-		WriteCunt:                 1,
 		ReadCount:                 2,
 		PreAllocatedPageCacheSize: 30,
 		SortRegistry:              sr,
@@ -61,6 +61,12 @@ var ctx = context.Background()
 func TestConnManager_GetRead(t *testing.T) {
 	fx := newFixture(t)
 
+	var assertNilORClosed = func(err error) {
+		if err != nil {
+			assert.ErrorIs(t, err, ErrStmtIsClosed)
+		}
+	}
+
 	var numP = 10
 	for i := 0; i < numP; i++ {
 		go func() {
@@ -70,9 +76,10 @@ func TestConnManager_GetRead(t *testing.T) {
 					return
 				}
 				require.NoError(t, err)
-				require.NoError(t, conn.Begin(ctx))
+				assertNilORClosed(conn.Begin(ctx))
+
 				time.Sleep(time.Millisecond * 10)
-				require.NoError(t, conn.Commit(ctx))
+				assertNilORClosed(conn.Commit(ctx))
 				fx.ReleaseRead(conn)
 			}
 		}()
@@ -97,7 +104,6 @@ func newFixture(t *testing.T) *ConnManager {
 		_ = os.RemoveAll(tmpDir)
 	})
 	cm, err := NewConnManager(filepath.Join(tmpDir, "1.db"), Config{
-		WriteCunt:                 1,
 		ReadCount:                 2,
 		PreAllocatedPageCacheSize: 30,
 		SortRegistry:              sr,

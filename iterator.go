@@ -3,9 +3,9 @@ package anystore
 import (
 	"errors"
 	"io"
+	"slices"
 
-	"zombiezen.com/go/sqlite"
-
+	"github.com/anyproto/any-store/internal/driver"
 	"github.com/anyproto/any-store/internal/syncpool"
 )
 
@@ -46,7 +46,7 @@ type iterator struct {
 	qb     *queryBuilder
 	err    error
 	closed bool
-	stmt   *sqlite.Stmt
+	stmt   *driver.Stmt
 }
 
 func (i *iterator) Next() bool {
@@ -66,7 +66,14 @@ func (i *iterator) Doc() (Doc, error) {
 	if i.err != nil && !errors.Is(i.err, io.EOF) {
 		return nil, i.err
 	}
-	i.buf.DocBuf = readBytes(i.stmt, i.buf.DocBuf)
+	l, err := i.stmt.ColumnLen(0)
+	if err != nil {
+		return nil, err
+	}
+	i.buf.DocBuf = slices.Grow(i.buf.DocBuf, l)[:l]
+	if _, err = i.stmt.ColumnBytes(0, i.buf.DocBuf); err != nil {
+		return nil, err
+	}
 	val, err := i.buf.Parser.Parse(i.buf.DocBuf)
 	if err != nil {
 		return nil, err
@@ -87,7 +94,7 @@ func (i *iterator) Close() (err error) {
 	}
 	i.closed = true
 	if i.stmt != nil {
-		err = errors.Join(err, i.stmt.Finalize())
+		err = errors.Join(err, i.stmt.Close())
 	}
 	if i.tx != nil {
 		err = errors.Join(err, i.tx.Commit())

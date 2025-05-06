@@ -2,7 +2,6 @@ package driver
 
 import (
 	"fmt"
-	"os"
 	"runtime"
 	"strings"
 	"time"
@@ -45,24 +44,6 @@ func (c *ConnManager) stalledReleaseConn(conn *Conn) {
 	c.stalledConnStackMutex.Lock()
 	defer c.stalledConnStackMutex.Unlock()
 	delete(c.stalledConnStackTraces, uintptr(unsafe.Pointer(conn)))
-}
-
-func (c *ConnManager) stalledCloseWatcher(allClosed chan struct{}) {
-	select {
-	case <-allClosed:
-		return
-	case <-time.After(c.closeTimeout):
-		_, _ = fmt.Fprintf(os.Stderr, "any-store: close failed because of stalled connections\n")
-		c.stalledConnStackMutex.Lock()
-		defer c.stalledConnStackMutex.Unlock()
-		for _, vals := range c.stalledConnStackTraces {
-			duration, stackTrace := unpackStackWithFrames(vals)
-			_, _ = fmt.Fprintf(os.Stderr, "any-store: stalled connection for %s:\n%s\n\n", duration.String(), stackTrace)
-		}
-		if len(c.stalledConnStackTraces) > 0 {
-			panic("any-store: stalled connections")
-		}
-	}
 }
 
 // packStack returns a slice of uintptrs representing the current stack, 0-element used to store the current timestamp

@@ -107,7 +107,6 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	var err error
 	conf := driver.Config{
 		Pragma:                    config.pragma(),
-		WriteCunt:                 1,
 		ReadCount:                 config.ReadConnections,
 		PreAllocatedPageCacheSize: config.SQLiteGlobalPageCachePreallocateSizeBytes,
 		SortRegistry:              ds.sortReg,
