@@ -18,6 +18,7 @@ import (
 
 	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/driver"
+	"github.com/anyproto/any-store/internal/objectid"
 )
 
 func init() {
@@ -131,7 +132,7 @@ func TestDb_Backup(t *testing.T) {
 
 func TestDb_Close(t *testing.T) {
 	t.Run("race", func(t *testing.T) {
-		fx := newFixture(t)
+		fx := newFixture(t, &Config{ReadConnections: 2})
 
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
@@ -141,12 +142,12 @@ func TestDb_Close(t *testing.T) {
 			docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id": %d, "value": %d}`, i, rand.Int())))
 		}
 		require.NoError(t, coll.Insert(ctx, docs...))
-		var results = make(chan error, 2)
+		var results = make(chan error, 3)
 		go func() {
 			// writing
 			for {
 				if pErr := coll.UpsertOne(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id": %d, "value": %d}`, rand.Int(), rand.Int()))); pErr != nil {
-					results <- pErr
+					results <- errors.Join(pErr, errors.New("upsertOne"))
 					return
 				}
 			}
@@ -157,19 +158,37 @@ func TestDb_Close(t *testing.T) {
 			for {
 				iter, pErr := coll.Find(nil).Iter(ctx)
 				if pErr != nil {
-					results <- pErr
+					results <- errors.Join(pErr, errors.New("find"))
 					return
 				}
 				for iter.Next() {
 					if _, pErr = iter.Doc(); pErr != nil {
-						results <- pErr
+						results <- errors.Join(pErr, errors.New("doc"))
 						return
 					}
 				}
 				if pErr = iter.Close(); pErr != nil {
-					results <- pErr
+					results <- errors.Join(pErr, errors.New("close"))
 					return
 				}
+			}
+		}()
+
+		go func() {
+			// tx insert
+			tx, tErr := coll.WriteTx(ctx)
+			if tErr != nil {
+				results <- errors.Join(tErr, errors.New("writeTx"))
+				return
+			}
+			tErr = coll.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id": "%s", "value": %d}`, objectid.NewObjectID().Hex(), rand.Int())))
+			if tErr != nil {
+				results <- errors.Join(tErr, errors.New("insert tx"))
+				return
+			}
+			if tErr = tx.Commit(); tErr != nil {
+				results <- errors.Join(tErr, errors.New("insert tx commit"))
+				return
 			}
 		}()
 
@@ -179,9 +198,7 @@ func TestDb_Close(t *testing.T) {
 
 		for range len(results) {
 			rErr := <-results
-			if !assert.ErrorIs(t, rErr, driver.ErrDBIsClosed) {
-				t.Logf("%#v", rErr == nil)
-			}
+			assert.True(t, errors.Is(rErr, driver.ErrDBIsClosed) || errors.Is(rErr, driver.ErrStmtIsClosed), rErr.Error())
 		}
 		dirEntries, err := os.ReadDir(fx.tmpDir)
 		require.NoError(t, err)

@@ -23,16 +23,17 @@ var (
 	initSqliteOnce         sync.Once
 )
 
-func NewConnManager(
-	path string,
-	pragma map[string]string,
-	writeCount, readCount int,
-	preAllocatedPageCacheSize int,
-	fr *registry.FilterRegistry, sr *registry.SortRegistry,
-	version int,
-	enableStalledConnDetector bool,
-	stalledConnDetectorCloseTimeout time.Duration,
-) (*ConnManager, error) {
+type Config struct {
+	Pragma                    map[string]string
+	ReadCount                 int
+	PreAllocatedPageCacheSize int
+	SortRegistry              *registry.SortRegistry
+	FilterRegistry            *registry.FilterRegistry
+	Version                   int
+	ReadConnTTL               time.Duration
+}
+
+func NewConnManager(path string, conf Config) (*ConnManager, error) {
 	_, statErr := os.Stat(path)
 	var newDb bool
 	if os.IsNotExist(statErr) {
@@ -40,93 +41,69 @@ func NewConnManager(
 	}
 
 	initSqliteOnce.Do(func() {
-		if preAllocatedPageCacheSize <= 0 {
+		if conf.PreAllocatedPageCacheSize <= 0 {
 			return
 		}
 		tls := libc.NewTLS()
-		err := sqlitePreallocatePageCache(tls, preAllocatedPageCacheSize)
+		err := sqlitePreallocatePageCache(tls, conf.PreAllocatedPageCacheSize)
 		if err != nil {
 			// ignore this error because it's not critical, we can continue without preallocated cache
 			_, _ = fmt.Fprintf(os.Stderr, "sqlite: failed to preallocate pagecache: %v\n", err)
 		}
 	})
-	var (
-		writeConn = make([]*Conn, 0, writeCount)
-		readConn  = make([]*Conn, 0, readCount)
-	)
-	closeAll := func() {
-		for _, conn := range writeConn {
-			_ = conn.Close()
-		}
-		for _, conn := range readConn {
-			_ = conn.Close()
-		}
-	}
-	for i := 0; i < writeCount; i++ {
-		conn, err := sqlite.OpenConn(path, sqlite.OpenCreate|sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadWrite)
-		if err != nil {
-			closeAll()
-			return nil, err
-		}
-		if err = setupConn(fr, sr, conn, pragma); err != nil {
-			closeAll()
-			return nil, err
-		}
-		writeConn = append(writeConn, &Conn{conn: conn})
-		if i == 0 {
-			if err = checkVersion(conn, version, newDb); err != nil {
-				closeAll()
-				return nil, err
-			}
-		}
-	}
 
-	for i := 0; i < readCount; i++ {
-		conn, err := sqlite.OpenConn(path, sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadOnly)
-		if err != nil {
-			closeAll()
-			return nil, err
-		}
-		if err = setupConn(fr, sr, conn, pragma); err != nil {
-			closeAll()
-			return nil, err
-		}
-		readConn = append(readConn, &Conn{conn: conn})
-	}
+	var readConn = make([]*Conn, 0, conf.ReadCount)
 
 	cm := &ConnManager{
-		readCh:                          make(chan *Conn, len(readConn)),
-		writeCh:                         make(chan *Conn, len(writeConn)),
-		closed:                          make(chan struct{}),
-		readConn:                        readConn,
-		writeConn:                       writeConn,
-		stalledConnStackTraces:          make(map[uintptr][]uintptr),
-		stalledConnDetectorEnabled:      enableStalledConnDetector,
-		stalledConnDetectorCloseTimeout: stalledConnDetectorCloseTimeout,
+		readCh:         make(chan *Conn),
+		readConnLimit:  conf.ReadCount,
+		readConn:       readConn,
+		readConnTTL:    conf.ReadConnTTL,
+		writeCh:        make(chan *Conn, 1),
+		closed:         make(chan struct{}),
+		sortRegistry:   conf.SortRegistry,
+		filterRegistry: conf.FilterRegistry,
+		path:           path,
+		pragma:         conf.Pragma,
 	}
-	for _, conn := range writeConn {
-		cm.writeCh <- conn
+
+	// open write connection
+	conn, err := sqlite.OpenConn(path, sqlite.OpenCreate|sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadWrite)
+	if err != nil {
+		return nil, err
 	}
-	for _, conn := range readConn {
-		cm.readCh <- conn
+	if err = cm.setupConn(conn); err != nil {
+		_ = conn.Close()
+		return nil, err
 	}
+	wConn := &Conn{conn: conn, activeStmts: map[*Stmt]struct{}{}}
+
+	if err = checkVersion(conn, conf.Version, newDb); err != nil {
+		_ = wConn.Close()
+		return nil, err
+	}
+	cm.writeCh <- wConn
+	cm.writeConn = wConn
 	return cm, nil
 }
 
 type ConnManager struct {
-	readCh    chan *Conn
-	writeCh   chan *Conn
-	readConn  []*Conn
-	writeConn []*Conn
-	closed    chan struct{}
+	readCh         chan *Conn
+	writeCh        chan *Conn
+	readConn       []*Conn
+	writeConn      *Conn
+	closed         chan struct{}
+	path           string
+	sortRegistry   *registry.SortRegistry
+	filterRegistry *registry.FilterRegistry
+	pragma         map[string]string
+	readConnLimit  int
+	mu             sync.Mutex
+	readConnTTL    time.Duration
 
-	// when enabled, collects stack traces and duration of taken connections
+	stalledConnStackMutex      sync.Mutex
+	stalledConnStackTraces     map[uintptr][]uintptr
 	stalledConnDetectorEnabled bool
-	// when stalledConnDetectorCloseTimeout > 0 and stalledConnDetectorEnabled is true,
-	// ConnManager panics on Close in case of any connection is not released after this timeout
-	stalledConnDetectorCloseTimeout time.Duration
-	stalledConnStackMutex           sync.Mutex
-	stalledConnStackTraces          map[uintptr][]uintptr
 }
 
 func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
@@ -155,27 +132,98 @@ func (c *ConnManager) GetRead(ctx context.Context) (conn *Conn, err error) {
 		return nil, ErrDBIsNotOpened
 	}
 
+	c.mu.Lock()
+
 	select {
+	case <-c.closed:
+		c.mu.Unlock()
+		return nil, ErrDBIsClosed
+	case <-ctx.Done():
+		c.mu.Unlock()
+		return nil, ctx.Err()
+	default:
+	}
+
+	// find inactive conn
+	for _, conn = range c.readConn {
+		if conn.isActive.CompareAndSwap(false, true) {
+			c.mu.Unlock()
+			c.stalledAcquireConn(conn)
+			return conn, nil
+		}
+	}
+
+	// open new conn if limit is not reached
+	if len(c.readConn) < c.readConnLimit {
+		if conn, err = c.openReadConn(); err != nil {
+			c.mu.Unlock()
+			return nil, err
+		}
+		c.readConn = append(c.readConn, conn)
+		conn.isActive.Store(true)
+		c.mu.Unlock()
+		c.stalledAcquireConn(conn)
+		return conn, nil
+	}
+
+	c.mu.Unlock()
+	// wait released conn
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	case <-c.closed:
 		return nil, ErrDBIsClosed
 	case conn = <-c.readCh:
-		c.stalledAcquireConn(conn)
-		return conn, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+		return c.GetRead(ctx)
+	case <-time.After(time.Second):
+		return c.GetRead(ctx)
 	}
 }
 
 func (c *ConnManager) ReleaseRead(conn *Conn) {
-	c.readCh <- conn
+	now := time.Now()
+	conn.isActive.Store(false)
+	conn.lastUsage.Store(now.Unix())
 	c.stalledReleaseConn(conn)
+	select {
+	case c.readCh <- conn:
+		return
+	case <-c.closed:
+		c.readCh <- conn
+		return
+	default:
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var filteredConn = c.readConn[:0]
+	for _, conn = range c.readConn {
+		if !conn.isActive.Load() && now.Sub(time.Unix(conn.lastUsage.Load(), 0)) > c.readConnTTL {
+			_ = conn.Close()
+		} else {
+			filteredConn = append(filteredConn, conn)
+		}
+	}
+	c.readConn = filteredConn
 }
 
-func setupConn(fr *registry.FilterRegistry, sr *registry.SortRegistry, conn *sqlite.Conn, pragma map[string]string) (err error) {
+func (c *ConnManager) openReadConn() (*Conn, error) {
+	conn, err := sqlite.OpenConn(c.path, sqlite.OpenWAL|sqlite.OpenURI|sqlite.OpenReadOnly)
+	if err != nil {
+		return nil, err
+	}
+	if err = c.setupConn(conn); err != nil {
+		return nil, err
+	}
+	return &Conn{conn: conn, activeStmts: map[*Stmt]struct{}{}}, nil
+}
+
+func (c *ConnManager) setupConn(conn *sqlite.Conn) (err error) {
 	err = conn.CreateFunction("any_filter", &sqlite.FunctionImpl{
 		NArgs: 2,
 		Scalar: func(ctx sqlite.Context, args []sqlite.Value) (sqlite.Value, error) {
-			if fr.Filter(args[0].Int(), args[1].Blob()) {
+			if c.filterRegistry.Filter(args[0].Int(), args[1].Blob()) {
 				return sqlite.IntegerValue(1), nil
 			} else {
 				return sqlite.IntegerValue(0), nil
@@ -189,13 +237,13 @@ func setupConn(fr *registry.FilterRegistry, sr *registry.SortRegistry, conn *sql
 	err = conn.CreateFunction("any_sort", &sqlite.FunctionImpl{
 		NArgs: 2,
 		Scalar: func(ctx sqlite.Context, args []sqlite.Value) (sqlite.Value, error) {
-			return sqlite.BlobValue(sr.Sort(args[0].Int(), args[1].Blob())), nil
+			return sqlite.BlobValue(c.sortRegistry.Sort(args[0].Int(), args[1].Blob())), nil
 		},
 		Deterministic: true,
 	})
 
-	if pragma != nil {
-		for k, v := range pragma {
+	if c.pragma != nil {
+		for k, v := range c.pragma {
 			if err = sqlitex.ExecuteTransient(conn, fmt.Sprintf("PRAGMA %s = %s", k, v), nil); err != nil {
 				return
 			}
@@ -205,40 +253,13 @@ func setupConn(fr *registry.FilterRegistry, sr *registry.SortRegistry, conn *sql
 }
 
 func (c *ConnManager) Close() (err error) {
-	/*
-
-		Can't interrupt connections yet because there is a race in sqlite driver
-		Also trying to close active connections causes some panics in the driver
-
-		var closedChan = make(chan struct{})
-		close(closedChan)
-
-		for _, conn := range c.readConn {
-			conn.conn.SetInterrupt(closedChan)
-		}
-		for _, conn := range c.writeConn {
-			conn.conn.SetInterrupt(closedChan)
-		}
-
-	*/
 	close(c.closed)
-
-	allClosedChan := make(chan struct{})
-	if c.stalledConnDetectorEnabled && c.stalledConnDetectorCloseTimeout > 0 {
-		go c.stalledCloseWatcher(allClosedChan)
-	}
-
-	var conn *Conn
-	for range c.readConn {
-		conn = <-c.readCh
+	c.mu.Lock()
+	for _, conn := range c.readConn {
 		err = errors.Join(err, conn.Close())
 	}
-
-	if err = c.writeConn[0].Close(); err != nil {
-		err = errors.Join(err, err)
-	}
-
-	close(allClosedChan)
+	err = errors.Join(err, c.writeConn.Close())
+	c.mu.Unlock()
 	return err
 }
 

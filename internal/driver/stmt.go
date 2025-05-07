@@ -2,7 +2,6 @@ package driver
 
 import (
 	"context"
-	"errors"
 	"sync"
 
 	"zombiezen.com/go/sqlite"
@@ -20,11 +19,11 @@ func (s *Stmt) Exec(ctx context.Context, bind func(stmt *sqlite.Stmt), result fu
 	if s.stmt == nil {
 		return ErrStmtIsClosed
 	}
+	return s.exec(ctx, bind, result)
+}
+
+func (s *Stmt) exec(ctx context.Context, bind func(stmt *sqlite.Stmt), result func(stmt *sqlite.Stmt) error) (err error) {
 	defer func() {
-		if s.conn.IsClosed() {
-			err = errors.Join(err, ErrDBIsClosed)
-			return
-		}
 		if rErr := s.stmt.ClearBindings(); rErr != nil {
 			if err == nil {
 				err = rErr
@@ -51,12 +50,55 @@ func (s *Stmt) Exec(ctx context.Context, bind func(stmt *sqlite.Stmt), result fu
 	return
 }
 
+func (s *Stmt) Step() (rowReturned bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stmt == nil {
+		return false, ErrStmtIsClosed
+	}
+	return s.stmt.Step()
+}
+
+func (s *Stmt) BindBytes(param int, value []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stmt == nil {
+		return
+	}
+	s.stmt.BindBytes(param, value)
+}
+
+func (s *Stmt) ColumnBytes(col int, buf []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stmt == nil {
+		return 0, ErrStmtIsClosed
+	}
+	return s.stmt.ColumnBytes(col, buf), nil
+}
+
+func (s *Stmt) ColumnLen(col int) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stmt == nil {
+		return 0, ErrStmtIsClosed
+	}
+	return s.stmt.ColumnLen(col), nil
+}
+
 func (s *Stmt) Close() error {
+	s.conn.mu.Lock()
+	defer s.conn.mu.Unlock()
+	return s.close()
+}
+
+func (s *Stmt) close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.stmt == nil {
 		return nil
 	}
+	delete(s.conn.activeStmts, s)
 	err := s.stmt.Finalize()
 	s.stmt = nil
 	return err

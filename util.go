@@ -32,7 +32,12 @@ func readIndexInfo(buf *syncpool.DocBuffer, stmt *sqlite.Stmt) (result []IndexIn
 	}
 }
 
-func readBytes(stmt *sqlite.Stmt, buf []byte) []byte {
+type iStmt interface {
+	ColumnLen(col int) int
+	ColumnBytes(col int, buf []byte) int
+}
+
+func readBytes(stmt iStmt, buf []byte) []byte {
 	l := stmt.ColumnLen(0)
 	buf = slices.Grow(buf, l)[:l]
 	stmt.ColumnBytes(0, buf)

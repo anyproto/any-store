@@ -11,7 +11,6 @@ import (
 	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/bitmap"
 	"github.com/anyproto/any-store/internal/driver"
-
 	"github.com/anyproto/any-store/query"
 )
 
@@ -148,7 +147,7 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	return q.newIterator(stmt, tx, qb), nil
 }
 
-func (q *collQuery) newIterator(stmt *sqlite.Stmt, tx ReadTx, qb *queryBuilder) *iterator {
+func (q *collQuery) newIterator(stmt *driver.Stmt, tx ReadTx, qb *queryBuilder) *iterator {
 	return &iterator{
 		stmt: stmt,
 		buf:  q.c.db.syncPool.GetDocBuf(),
