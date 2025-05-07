@@ -289,13 +289,20 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 }
 
 func (db *db) Collection(ctx context.Context, collectionName string) (Collection, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	coll, err := db.createCollection(ctx, collectionName)
+	coll, err := db.OpenCollection(ctx, collectionName)
 	if err == nil {
 		return coll, nil
 	}
-	if err != nil && !errors.Is(err, ErrCollectionExists) {
+	if !errors.Is(err, ErrCollectionNotFound) {
+		return nil, err
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	coll, err = db.createCollection(ctx, collectionName)
+	if err == nil {
+		return coll, nil
+	}
+	if !errors.Is(err, ErrCollectionExists) {
 		return nil, err
 	}
 	return db.openCollection(ctx, collectionName)
