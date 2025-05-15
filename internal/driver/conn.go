@@ -164,6 +164,9 @@ func (c *Conn) Backup(ctx context.Context, path string) (err error) {
 	if err != nil {
 		return
 	}
+	defer func() {
+		_ = descConn.Close()
+	}()
 	backup, err := sqlite.NewBackup(descConn, "", c.conn, "")
 	if err != nil {
 		return
