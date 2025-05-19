@@ -8,7 +8,7 @@ require (
 	github.com/stretchr/testify v1.10.0
 	github.com/valyala/fastjson v1.6.4
 	golang.org/x/exp v0.0.0-20250408133849-7e4ce0ab07d0
-	modernc.org/libc v1.65.6
+	modernc.org/libc v1.65.7
 	modernc.org/sqlite v1.37.0
 	zombiezen.com/go/sqlite v1.4.0
 )
@@ -24,5 +24,5 @@ require (
 	golang.org/x/sys v0.33.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
-	modernc.org/memory v1.10.0 // indirect
+	modernc.org/memory v1.11.0 // indirect
 )
