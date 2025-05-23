@@ -193,6 +193,7 @@ func (c *Conn) Close() (err error) {
 		for stmt := range c.activeStmts {
 			err = errors.Join(err, stmt.close())
 		}
+		c.isClosed = true
 		return errors.Join(err, c.conn.Close())
 	}
 }
