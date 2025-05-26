@@ -9,7 +9,7 @@ require (
 	github.com/valyala/fastjson v1.6.4
 	golang.org/x/exp v0.0.0-20250408133849-7e4ce0ab07d0
 	modernc.org/libc v1.65.7
-	modernc.org/sqlite v1.37.0
+	modernc.org/sqlite v1.37.1
 	zombiezen.com/go/sqlite v1.4.0
 )
 
