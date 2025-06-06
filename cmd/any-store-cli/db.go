@@ -66,6 +66,23 @@ func (c *Conn) Exec(cmdLine string) (result string, err error) {
 	return c.ExecCmd(cmd)
 }
 
+var availableCommands = `List of available commands:
+show collections
+show stats
+createCollection
+insert
+update
+upsert
+count
+find
+findId
+deleteId
+ensureIndex
+dropIndex
+drop
+help
+`
+
 func (c *Conn) ExecCmd(cmd Cmd) (result string, err error) {
 	switch cmd.Cmd {
 	case "show collections":
@@ -94,8 +111,10 @@ func (c *Conn) ExecCmd(cmd Cmd) (result string, err error) {
 		return c.DropIndex(cmd)
 	case "drop":
 		return c.Drop(cmd)
+	case "help":
+		return availableCommands, nil
 	}
-	return "", fmt.Errorf("unexpected command: %s", cmd.Cmd)
+	return availableCommands, fmt.Errorf("unexpected command: %s", cmd.Cmd)
 }
 
 func (c *Conn) Complete(line string) (result []string) {

@@ -46,7 +46,7 @@ func runLiner() {
 
 		st := time.Now()
 		if res, err := conn.Exec(cmdLine); err != nil {
-			fmt.Fprintf(os.Stderr, "exec error: %v\n", err)
+			fmt.Fprintf(os.Stderr, "exec error: %v\n\n%s", err, res)
 		} else {
 			if res != "" {
 				fmt.Println(res)
@@ -54,5 +54,4 @@ func runLiner() {
 			fmt.Fprintf(os.Stderr, "%s %v\n", color.MagentaString("ok"), time.Since(st))
 		}
 	}
-	return
 }
