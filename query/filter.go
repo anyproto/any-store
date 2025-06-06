@@ -58,6 +58,9 @@ func (e *Comp) Ok(v *anyenc.Value, buf *[]byte) bool {
 			return false
 		}
 	}
+	if *buf != nil {
+		*buf = (*buf)[:0]
+	}
 	if v.Type() == anyenc.TypeArray {
 		vals, _ := v.Array()
 		if e.CompOp == CompOpNe {
