@@ -12,7 +12,7 @@ import (
 )
 
 type Filter interface {
-	Ok(v *anyenc.Value) bool
+	Ok(v *anyenc.Value, buf []byte) bool
 
 	IndexBounds(fieldName string, bs Bounds) (bounds Bounds)
 
@@ -46,12 +46,11 @@ func NewCompValue(op CompOp, value *anyenc.Value) *Comp {
 
 type Comp struct {
 	EqValue  []byte
-	buf      []byte
 	CompOp   CompOp
 	notArray bool
 }
 
-func (e *Comp) Ok(v *anyenc.Value) bool {
+func (e *Comp) Ok(v *anyenc.Value, buf []byte) bool {
 	if v == nil {
 		if e.CompOp == CompOpNe {
 			return true
@@ -63,36 +62,36 @@ func (e *Comp) Ok(v *anyenc.Value) bool {
 		vals, _ := v.Array()
 		if e.CompOp == CompOpNe {
 			if !e.notArray {
-				e.buf = v.MarshalTo(e.buf[:0])
-				if !e.comp(e.buf) {
+				buf = v.MarshalTo(buf[:0])
+				if !e.comp(buf) {
 					return false
 				}
 			}
 			for _, val := range vals {
-				e.buf = val.MarshalTo(e.buf[:0])
-				if !e.comp(e.buf) {
+				buf = val.MarshalTo(buf[:0])
+				if !e.comp(buf) {
 					return false
 				}
 			}
 			return true
 		} else {
 			if !e.notArray {
-				e.buf = v.MarshalTo(e.buf[:0])
-				if e.comp(e.buf) {
+				buf = v.MarshalTo(buf[:0])
+				if e.comp(buf) {
 					return true
 				}
 			}
 			for _, val := range vals {
-				e.buf = val.MarshalTo(e.buf[:0])
-				if e.comp(e.buf) {
+				buf = val.MarshalTo(buf[:0])
+				if e.comp(buf) {
 					return true
 				}
 			}
 			return false
 		}
 	} else {
-		e.buf = v.MarshalTo(e.buf[:0])
-		return e.comp(e.buf)
+		buf = v.MarshalTo(buf[:0])
+		return e.comp(buf)
 	}
 }
 
@@ -183,8 +182,8 @@ type Key struct {
 	Filter
 }
 
-func (e Key) Ok(v *anyenc.Value) bool {
-	return e.Filter.Ok(v.Get(e.Path...))
+func (e Key) Ok(v *anyenc.Value, buf []byte) bool {
+	return e.Filter.Ok(v.Get(e.Path...), buf)
 }
 
 func (e Key) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
@@ -200,9 +199,9 @@ func (e Key) String() string {
 
 type And []Filter
 
-func (e And) Ok(v *anyenc.Value) bool {
+func (e And) Ok(v *anyenc.Value, buf []byte) bool {
 	for _, f := range e {
-		if !f.Ok(v) {
+		if !f.Ok(v, buf) {
 			return false
 		}
 	}
@@ -230,9 +229,9 @@ func (e And) String() string {
 
 type Or []Filter
 
-func (e Or) Ok(v *anyenc.Value) bool {
+func (e Or) Ok(v *anyenc.Value, buf []byte) bool {
 	for _, f := range e {
-		if f.Ok(v) {
+		if f.Ok(v, buf) {
 			return true
 		}
 	}
@@ -259,9 +258,9 @@ func (e Or) String() string {
 
 type Nor []Filter
 
-func (e Nor) Ok(v *anyenc.Value) bool {
+func (e Nor) Ok(v *anyenc.Value, buf []byte) bool {
 	for _, f := range e {
-		if f.Ok(v) {
+		if f.Ok(v, buf) {
 			return false
 		}
 	}
@@ -284,8 +283,8 @@ type Not struct {
 	Filter
 }
 
-func (e Not) Ok(v *anyenc.Value) bool {
-	return !e.Filter.Ok(v)
+func (e Not) Ok(v *anyenc.Value, buf []byte) bool {
+	return !e.Filter.Ok(v, buf)
 }
 
 func (e Not) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
@@ -298,7 +297,7 @@ func (e Not) String() string {
 
 type All struct{}
 
-func (a All) Ok(_ *anyenc.Value) bool {
+func (a All) Ok(_ *anyenc.Value, buf []byte) bool {
 	return true
 }
 
@@ -312,7 +311,7 @@ func (a All) String() string {
 
 type Exists struct{}
 
-func (e Exists) Ok(v *anyenc.Value) bool {
+func (e Exists) Ok(v *anyenc.Value, buf []byte) bool {
 	return v != nil
 }
 
@@ -328,7 +327,7 @@ type TypeFilter struct {
 	Type anyenc.Type
 }
 
-func (e TypeFilter) Ok(v *anyenc.Value) bool {
+func (e TypeFilter) Ok(v *anyenc.Value, buf []byte) bool {
 	if v == nil {
 		return false
 	}
@@ -353,7 +352,7 @@ type Regexp struct {
 	Regexp *regexp.Regexp
 }
 
-func (r Regexp) Ok(v *anyenc.Value) bool {
+func (r Regexp) Ok(v *anyenc.Value, buf []byte) bool {
 	if v == nil {
 		return false
 	}
@@ -457,7 +456,7 @@ type Size struct {
 	Size int64
 }
 
-func (s Size) Ok(v *anyenc.Value) bool {
+func (s Size) Ok(v *anyenc.Value, buf []byte) bool {
 	if v == nil {
 		return false
 	}
