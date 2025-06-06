@@ -9,10 +9,27 @@ import (
 	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/syncpool"
 )
 
 type Filter interface {
-	Ok(v *anyenc.Value) bool
+	// Ok evaluates whether the given value satisfies the filter condition.
+	//
+	// Parameters:
+	//   v - The parsed JSON/data value to be evaluated against the filter
+	//   docBuf - A reusable document buffer from the sync pool to avoid allocations.
+	//            If nil, the implementation may allocate buffers as needed.
+	//            Contains SmallBuf, DocBuf, Arena, and Parser that can be used
+	//            by filter implementations for temporary operations.
+	//
+	// Returns:
+	//   bool - true if the value passes the filter condition, false otherwise
+	//
+	// Performance Notes:
+	// The docBuf parameter was added to improve performance by reusing pooled buffers
+	// rather than allocating new ones on each call. More complex filter implementations
+	// can utilize the Arena and secondary buffers for sophisticated operations.
+	Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool
 
 	IndexBounds(fieldName string, bs Bounds) (bounds Bounds)
 
@@ -46,12 +63,22 @@ func NewCompValue(op CompOp, value *anyenc.Value) *Comp {
 
 type Comp struct {
 	EqValue  []byte
-	buf      []byte
 	CompOp   CompOp
 	notArray bool
 }
 
-func (e *Comp) Ok(v *anyenc.Value) bool {
+// Ok evaluates the comparison filter against the given value.
+// Uses docBuf.SmallBuf as workspace for marshaling values to bytes during comparison.
+//
+// Implementation details:
+//
+// - nil values: only CompOpNe returns true, others return false
+// - Array values: applies comparison to each element (and optionally the array itself)
+//   - CompOpNe: true only if ALL elements fail the comparison
+//   - Other ops: true if ANY element passes the comparison
+//
+// - Scalar values: marshals to bytes and applies comparison directly
+func (e *Comp) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 	if v == nil {
 		if e.CompOp == CompOpNe {
 			return true
@@ -59,40 +86,47 @@ func (e *Comp) Ok(v *anyenc.Value) bool {
 			return false
 		}
 	}
+	var buf []byte
+	if docBuf != nil {
+		buf = docBuf.SmallBuf[:0]
+		defer func() { docBuf.SmallBuf = buf }()
+	}
+
 	if v.Type() == anyenc.TypeArray {
 		vals, _ := v.Array()
 		if e.CompOp == CompOpNe {
 			if !e.notArray {
-				e.buf = v.MarshalTo(e.buf[:0])
-				if !e.comp(e.buf) {
+				buf = v.MarshalTo(buf[:0])
+				if !e.comp(buf) {
 					return false
 				}
 			}
 			for _, val := range vals {
-				e.buf = val.MarshalTo(e.buf[:0])
-				if !e.comp(e.buf) {
+				buf = val.MarshalTo(buf[:0])
+				if !e.comp(buf) {
 					return false
 				}
 			}
+
 			return true
 		} else {
 			if !e.notArray {
-				e.buf = v.MarshalTo(e.buf[:0])
-				if e.comp(e.buf) {
+				buf = v.MarshalTo(buf[:0])
+				if e.comp(buf) {
 					return true
 				}
 			}
 			for _, val := range vals {
-				e.buf = val.MarshalTo(e.buf[:0])
-				if e.comp(e.buf) {
+				buf = val.MarshalTo(buf[:0])
+				if e.comp(buf) {
 					return true
 				}
 			}
 			return false
 		}
 	} else {
-		e.buf = v.MarshalTo(e.buf[:0])
-		return e.comp(e.buf)
+		buf = v.MarshalTo(buf[:0])
+		return e.comp(buf)
 	}
 }
 
@@ -183,8 +217,8 @@ type Key struct {
 	Filter
 }
 
-func (e Key) Ok(v *anyenc.Value) bool {
-	return e.Filter.Ok(v.Get(e.Path...))
+func (e Key) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
+	return e.Filter.Ok(v.Get(e.Path...), buf)
 }
 
 func (e Key) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
@@ -200,9 +234,9 @@ func (e Key) String() string {
 
 type And []Filter
 
-func (e And) Ok(v *anyenc.Value) bool {
+func (e And) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 	for _, f := range e {
-		if !f.Ok(v) {
+		if !f.Ok(v, buf) {
 			return false
 		}
 	}
@@ -230,9 +264,9 @@ func (e And) String() string {
 
 type Or []Filter
 
-func (e Or) Ok(v *anyenc.Value) bool {
+func (e Or) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 	for _, f := range e {
-		if f.Ok(v) {
+		if f.Ok(v, buf) {
 			return true
 		}
 	}
@@ -259,9 +293,9 @@ func (e Or) String() string {
 
 type Nor []Filter
 
-func (e Nor) Ok(v *anyenc.Value) bool {
+func (e Nor) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 	for _, f := range e {
-		if f.Ok(v) {
+		if f.Ok(v, buf) {
 			return false
 		}
 	}
@@ -284,8 +318,8 @@ type Not struct {
 	Filter
 }
 
-func (e Not) Ok(v *anyenc.Value) bool {
-	return !e.Filter.Ok(v)
+func (e Not) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
+	return !e.Filter.Ok(v, buf)
 }
 
 func (e Not) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
@@ -298,7 +332,7 @@ func (e Not) String() string {
 
 type All struct{}
 
-func (a All) Ok(_ *anyenc.Value) bool {
+func (a All) Ok(_ *anyenc.Value, buf *syncpool.DocBuffer) bool {
 	return true
 }
 
@@ -312,7 +346,7 @@ func (a All) String() string {
 
 type Exists struct{}
 
-func (e Exists) Ok(v *anyenc.Value) bool {
+func (e Exists) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 	return v != nil
 }
 
@@ -328,7 +362,7 @@ type TypeFilter struct {
 	Type anyenc.Type
 }
 
-func (e TypeFilter) Ok(v *anyenc.Value) bool {
+func (e TypeFilter) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 	if v == nil {
 		return false
 	}
@@ -353,7 +387,7 @@ type Regexp struct {
 	Regexp *regexp.Regexp
 }
 
-func (r Regexp) Ok(v *anyenc.Value) bool {
+func (r Regexp) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 	if v == nil {
 		return false
 	}
@@ -457,7 +491,7 @@ type Size struct {
 	Size int64
 }
 
-func (s Size) Ok(v *anyenc.Value) bool {
+func (s Size) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 	if v == nil {
 		return false
 	}

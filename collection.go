@@ -14,8 +14,8 @@ import (
 	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/driver"
 	"github.com/anyproto/any-store/internal/sql"
-	"github.com/anyproto/any-store/internal/syncpool"
 	"github.com/anyproto/any-store/query"
+	"github.com/anyproto/any-store/syncpool"
 )
 
 // Collection represents a collection of documents.

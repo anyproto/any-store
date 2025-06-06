@@ -4,8 +4,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/anyproto/any-store/internal/syncpool"
 	"github.com/anyproto/any-store/query"
+	"github.com/anyproto/any-store/syncpool"
 )
 
 type FilterRegistry struct {
@@ -31,7 +31,11 @@ func (r *FilterRegistry) Filter(id int, data []byte) bool {
 	if err != nil {
 		return false
 	}
-	return r.registry.entries[id].value.Ok(v)
+
+	buf := r.registry.entries[id].buf
+	ok := r.registry.entries[id].value.Ok(v, buf)
+
+	return ok
 }
 
 type SortRegistry struct {
@@ -85,7 +89,7 @@ func (r *registry[T]) Register(v T) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for i := 0; i < len(r.entries); i++ {
+	for i := range r.entries {
 		if !r.entries[i].inUse.Load() {
 			// We can use separate Load and Store because we have a lock
 			r.entries[i].inUse.Store(true)

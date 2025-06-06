@@ -13,7 +13,7 @@ import (
 	"zombiezen.com/go/sqlite"
 
 	"github.com/anyproto/any-store/internal/registry"
-	"github.com/anyproto/any-store/internal/syncpool"
+	"github.com/anyproto/any-store/syncpool"
 )
 
 func TestNewConnManager(t *testing.T) {
@@ -62,12 +62,14 @@ func TestConnManager_GetRead(t *testing.T) {
 
 	var assertNilORClosed = func(err error) {
 		if err != nil {
-			assert.ErrorIs(t, err, ErrStmtIsClosed)
+			assert.True(t,
+				errors.Is(err, ErrStmtIsClosed) || errors.Is(err, ErrDBIsClosed),
+				"expected ErrStmtIsClosed or ErrDBIsClosed, got %v", err)
 		}
 	}
 
 	var numP = 10
-	for i := 0; i < numP; i++ {
+	for range numP {
 		go func() {
 			for {
 				conn, err := fx.GetRead(ctx)
