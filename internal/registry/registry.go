@@ -31,8 +31,8 @@ func (r *FilterRegistry) Filter(id int, data []byte) bool {
 	if err != nil {
 		return false
 	}
-	buf := r.registry.entries[id].buf.SmallBuf[:0]
-	r.registry.entries[id].buf.SmallBuf = buf
+	entry := &r.registry.entries[id]
+	buf := &entry.buf.SmallBuf
 
 	return r.registry.entries[id].value.Ok(v, buf)
 }
