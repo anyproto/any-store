@@ -62,28 +62,21 @@ func (e *Comp) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 	var buf []byte
 	if docBuf != nil {
 		buf = docBuf.SmallBuf[:0]
+		defer func() { docBuf.SmallBuf = buf }()
 	}
+
 	if v.Type() == anyenc.TypeArray {
 		vals, _ := v.Array()
 		if e.CompOp == CompOpNe {
 			if !e.notArray {
 				buf = v.MarshalTo(buf[:0])
 				if !e.comp(buf) {
-					// todo: use benchmarks from query, check allocs amount
-					if docBuf != nil {
-						docBuf.SmallBuf = buf
-					}
-
 					return false
 				}
 			}
 			for _, val := range vals {
 				buf = val.MarshalTo(buf[:0])
 				if !e.comp(buf) {
-					if docBuf != nil {
-						docBuf.SmallBuf = buf
-					}
-
 					return false
 				}
 			}
@@ -93,20 +86,12 @@ func (e *Comp) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 			if !e.notArray {
 				buf = v.MarshalTo(buf[:0])
 				if e.comp(buf) {
-					if docBuf != nil {
-						docBuf.SmallBuf = buf
-					}
-
 					return true
 				}
 			}
 			for _, val := range vals {
 				buf = val.MarshalTo(buf[:0])
 				if e.comp(buf) {
-					if docBuf != nil {
-						docBuf.SmallBuf = buf
-					}
-
 					return true
 				}
 			}
@@ -114,10 +99,6 @@ func (e *Comp) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 		}
 	} else {
 		buf = v.MarshalTo(buf[:0])
-		if docBuf != nil {
-			docBuf.SmallBuf = buf
-		}
-
 		return e.comp(buf)
 	}
 }
