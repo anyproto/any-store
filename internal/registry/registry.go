@@ -31,10 +31,13 @@ func (r *FilterRegistry) Filter(id int, data []byte) bool {
 	if err != nil {
 		return false
 	}
-	buf := r.registry.entries[id].buf.SmallBuf[:0]
-	r.registry.entries[id].buf.SmallBuf = buf
+	// TODO: smallbuf or docbuf?
+	buf := r.registry.entries[id].buf
+	// check allocks here
 
-	return r.registry.entries[id].value.Ok(v, buf)
+	ok := r.registry.entries[id].value.Ok(v, buf)
+
+	return ok
 }
 
 type SortRegistry struct {
