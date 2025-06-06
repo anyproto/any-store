@@ -13,7 +13,7 @@ import (
 	"zombiezen.com/go/sqlite"
 
 	"github.com/anyproto/any-store/internal/registry"
-	"github.com/anyproto/any-store/internal/syncpool"
+	"github.com/anyproto/any-store/syncpool"
 )
 
 func TestNewConnManager(t *testing.T) {

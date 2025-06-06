@@ -9,7 +9,7 @@ import (
 	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/internal/syncpool"
+	"github.com/anyproto/any-store/syncpool"
 )
 
 type Filter interface {

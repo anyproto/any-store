@@ -6,7 +6,7 @@ import (
 	"github.com/valyala/fastjson"
 	"zombiezen.com/go/sqlite"
 
-	"github.com/anyproto/any-store/internal/syncpool"
+	"github.com/anyproto/any-store/syncpool"
 )
 
 func readIndexInfo(buf *syncpool.DocBuffer, stmt *sqlite.Stmt) (result []IndexInfo, err error) {

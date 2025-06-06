@@ -15,7 +15,7 @@ import (
 	"github.com/anyproto/any-store/internal/objectid"
 	"github.com/anyproto/any-store/internal/registry"
 	"github.com/anyproto/any-store/internal/sql"
-	"github.com/anyproto/any-store/internal/syncpool"
+	"github.com/anyproto/any-store/syncpool"
 )
 
 // DB represents a document-oriented database.

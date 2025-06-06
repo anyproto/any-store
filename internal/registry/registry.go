@@ -4,8 +4,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/anyproto/any-store/internal/syncpool"
 	"github.com/anyproto/any-store/query"
+	"github.com/anyproto/any-store/syncpool"
 )
 
 type FilterRegistry struct {
