@@ -31,10 +31,8 @@ func (r *FilterRegistry) Filter(id int, data []byte) bool {
 	if err != nil {
 		return false
 	}
-	// TODO: smallbuf or docbuf?
-	buf := r.registry.entries[id].buf
-	// check allocks here
 
+	buf := r.registry.entries[id].buf
 	ok := r.registry.entries[id].value.Ok(v, buf)
 
 	return ok

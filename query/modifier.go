@@ -212,7 +212,6 @@ func (m modifierPull) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc.V
 		}
 		if m.filter != nil {
 			modified = removeElements(arrayOfValues, value, func(value *anyenc.Value) bool {
-				// TODO: buf?
 				return m.filter.Ok(value, nil)
 			})
 		} else {
