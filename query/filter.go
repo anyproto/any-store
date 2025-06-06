@@ -13,7 +13,23 @@ import (
 )
 
 type Filter interface {
-	Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool
+	// Ok evaluates whether the given value satisfies the filter condition.
+	//
+	// Parameters:
+	//   v - The parsed JSON/data value to be evaluated against the filter
+	//   docBuf - A reusable document buffer from the sync pool to avoid allocations.
+	//            If nil, the implementation may allocate buffers as needed.
+	//            Contains SmallBuf, DocBuf, Arena, and Parser that can be used
+	//            by filter implementations for temporary operations.
+	//
+	// Returns:
+	//   bool - true if the value passes the filter condition, false otherwise
+	//
+	// Performance Notes:
+	// The docBuf parameter was added to improve performance by reusing pooled buffers
+	// rather than allocating new ones on each call. More complex filter implementations
+	// can utilize the Arena and secondary buffers for sophisticated operations.
+	Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool
 
 	IndexBounds(fieldName string, bs Bounds) (bounds Bounds)
 
@@ -51,6 +67,17 @@ type Comp struct {
 	notArray bool
 }
 
+// Ok evaluates the comparison filter against the given value.
+// Uses docBuf.SmallBuf as workspace for marshaling values to bytes during comparison.
+//
+// Implementation details:
+//
+// - nil values: only CompOpNe returns true, others return false
+// - Array values: applies comparison to each element (and optionally the array itself)
+//   - CompOpNe: true only if ALL elements fail the comparison
+//   - Other ops: true if ANY element passes the comparison
+//
+// - Scalar values: marshals to bytes and applies comparison directly
 func (e *Comp) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 	if v == nil {
 		if e.CompOp == CompOpNe {
