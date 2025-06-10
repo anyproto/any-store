@@ -440,29 +440,45 @@ func TestSize(t *testing.T) {
 
 func BenchmarkFilter_Ok(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"a":2,"b":[3,2,1],"c":"test"}`)
-	bench := func(b *testing.B, query string) {
+	bench := func(b *testing.B, query string, docBuf *syncpool.DocBuffer) {
 		f, err := ParseCondition(query)
 		require.NoError(b, err)
 		b.ReportAllocs()
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			f.Ok(doc, nil)
+			f.Ok(doc, docBuf)
 		}
 	}
 
+	docBuf := &syncpool.DocBuffer{}
 	b.Run("simple eq", func(b *testing.B) {
-		bench(b, `{"a":2}`)
+		bench(b, `{"a":2}`, nil)
+	})
+	b.Run("simple eq with buf", func(b *testing.B) {
+		bench(b, `{"a":2}`, docBuf)
 	})
 	b.Run("eq array", func(b *testing.B) {
-		bench(b, `{"b":3}`)
+		bench(b, `{"b":3}`, nil)
+	})
+	b.Run("eq array with buf", func(b *testing.B) {
+		bench(b, `{"b":3}`, docBuf)
 	})
 	b.Run("double eq", func(b *testing.B) {
-		bench(b, `{"a":2, "c":"test"}`)
+		bench(b, `{"a":2, "c":"test"}`, nil)
+	})
+	b.Run("double eq with buf", func(b *testing.B) {
+		bench(b, `{"a":2, "c":"test"}`, docBuf)
 	})
 	b.Run("in", func(b *testing.B) {
-		bench(b, `{"a":{"$in":[1,2]}}`)
+		bench(b, `{"a":{"$in":[1,2]}}`, nil)
+	})
+	b.Run("in with buf", func(b *testing.B) {
+		bench(b, `{"a":{"$in":[1,2]}}`, docBuf)
 	})
 	b.Run("all", func(b *testing.B) {
-		bench(b, `{"b":{"$all":[1,3]}}`)
+		bench(b, `{"b":{"$all":[1,3]}}`, nil)
+	})
+	b.Run("all with buf", func(b *testing.B) {
+		bench(b, `{"b":{"$all":[1,3]}}`, docBuf)
 	})
 }
