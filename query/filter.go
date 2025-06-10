@@ -14,23 +14,10 @@ import (
 
 type Filter interface {
 	// Ok evaluates whether the given value satisfies the filter condition.
-	//
-	// Parameters:
-	//   v - The parsed JSON/data value to be evaluated against the filter
-	//   docBuf - A reusable document buffer from the sync pool to avoid allocations.
-	//            If nil, the implementation may allocate buffers as needed.
-	//            Contains SmallBuf, DocBuf, Arena, and Parser that can be used
-	//            by filter implementations for temporary operations.
-	//
-	// Returns:
-	//   bool - true if the value passes the filter condition, false otherwise
-	//
-	// Performance Notes:
-	// The docBuf parameter was added to improve performance by reusing pooled buffers
-	// rather than allocating new ones on each call. More complex filter implementations
-	// can utilize the Arena and secondary buffers for sophisticated operations.
+	// docBuf is optional and can be nil it's used for reuse memory in some filters
 	Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool
 
+	// IndexBounds appends bounds to the bs for the given field if it is applicable
 	IndexBounds(fieldName string, bs Bounds) (bounds Bounds)
 
 	fmt.Stringer
@@ -67,17 +54,6 @@ type Comp struct {
 	notArray bool
 }
 
-// Ok evaluates the comparison filter against the given value.
-// Uses docBuf.SmallBuf as workspace for marshaling values to bytes during comparison.
-//
-// Implementation details:
-//
-// - nil values: only CompOpNe returns true, others return false
-// - Array values: applies comparison to each element (and optionally the array itself)
-//   - CompOpNe: true only if ALL elements fail the comparison
-//   - Other ops: true if ANY element passes the comparison
-//
-// - Scalar values: marshals to bytes and applies comparison directly
 func (e *Comp) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 	if v == nil {
 		if e.CompOp == CompOpNe {
@@ -86,24 +62,22 @@ func (e *Comp) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 			return false
 		}
 	}
-	var buf []byte
-	if docBuf != nil {
-		buf = docBuf.SmallBuf[:0]
-		defer func() { docBuf.SmallBuf = buf }()
+	if docBuf == nil {
+		docBuf = &syncpool.DocBuffer{}
 	}
 
 	if v.Type() == anyenc.TypeArray {
 		vals, _ := v.Array()
 		if e.CompOp == CompOpNe {
 			if !e.notArray {
-				buf = v.MarshalTo(buf[:0])
-				if !e.comp(buf) {
+				docBuf.SmallBuf = v.MarshalTo(docBuf.SmallBuf[:0])
+				if !e.comp(docBuf.SmallBuf) {
 					return false
 				}
 			}
 			for _, val := range vals {
-				buf = val.MarshalTo(buf[:0])
-				if !e.comp(buf) {
+				docBuf.SmallBuf = val.MarshalTo(docBuf.SmallBuf[:0])
+				if !e.comp(docBuf.SmallBuf) {
 					return false
 				}
 			}
@@ -111,22 +85,22 @@ func (e *Comp) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 			return true
 		} else {
 			if !e.notArray {
-				buf = v.MarshalTo(buf[:0])
-				if e.comp(buf) {
+				docBuf.SmallBuf = v.MarshalTo(docBuf.SmallBuf[:0])
+				if e.comp(docBuf.SmallBuf) {
 					return true
 				}
 			}
 			for _, val := range vals {
-				buf = val.MarshalTo(buf[:0])
-				if e.comp(buf) {
+				docBuf.SmallBuf = val.MarshalTo(docBuf.SmallBuf[:0])
+				if e.comp(docBuf.SmallBuf) {
 					return true
 				}
 			}
 			return false
 		}
 	} else {
-		buf = v.MarshalTo(buf[:0])
-		return e.comp(buf)
+		docBuf.SmallBuf = v.MarshalTo(docBuf.SmallBuf[:0])
+		return e.comp(docBuf.SmallBuf)
 	}
 }
 
