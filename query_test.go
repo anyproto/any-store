@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -115,6 +116,39 @@ func TestCollQuery_Explain(t *testing.T) {
 			"SELECT data FROM '_test_docs'  ORDER BY id DESC",
 			"SCAN _test_docs USING INDEX sqlite_autoindex__test_docs_1",
 		)
+	})
+	t.Run("more than 1000", func(t *testing.T) {
+		var builder strings.Builder
+		builder.Grow(4000)
+		builder.WriteString(`{"id":{"$in":[`)
+		l := 999
+		for i := 1; i <= l; i++ {
+			builder.WriteString(strconv.Itoa(i))
+			if i < l {
+				builder.WriteString(",")
+			}
+		}
+
+		builder.WriteString("]}}")
+
+		result := builder.String()
+		t.Log(result)
+		coll, _ := fx.CreateCollection(ctx, "test_foo")
+
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(`{"id":1, "a":"a1"}`),
+			anyenc.MustParseJson(`{"id":2, "a":"a2"}`),
+			anyenc.MustParseJson(`{"id":3, "a":"a3"}`),
+			anyenc.MustParseJson(`{"id":4, "a":"a4"}`),
+			anyenc.MustParseJson(`{"id":5, "a":"a5"}`),
+		))
+		t.Log(coll)
+
+		assertExplain(t, coll.Find(result),
+			"SELECT data FROM '_test_docs' WHERE  ((id = :val_0_0_0) OR (id = :val_0_0_1)) AND any_filter(1, data)",
+			"SEARCH _test_docs USING INDEX sqlite_autoindex__test_docs_1 (id=?)",
+		)
+
 	})
 	t.Run("simple index", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "test_s")
