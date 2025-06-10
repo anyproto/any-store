@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/syncpool"
 )
 
 func TestComp(t *testing.T) {
@@ -165,6 +166,36 @@ func TestComp(t *testing.T) {
 				},
 			}, bs)
 		})
+	})
+	t.Run("with buf", func(t *testing.T) {
+		cmp := Comp{CompOp: CompOpEq, EqValue: anyenc.AppendAnyValue(nil, 1)}
+		docBuf := &syncpool.DocBuffer{}
+		assert.True(t, cmp.Ok(a.NewNumberInt(1), docBuf))
+		assert.False(t, cmp.Ok(a.NewNumberInt(-1), docBuf))
+		assert.False(t, cmp.Ok(a.NewString("1"), docBuf))
+		assert.True(t, cmp.Ok(anyenc.MustParseJson(`[3,2,1]`), docBuf))
+		assert.True(t, cmp.Ok(anyenc.MustParseJson(`[1]`), docBuf))
+		assert.False(t, cmp.Ok(anyenc.MustParseJson(`[]`), docBuf))
+		assert.False(t, cmp.Ok(anyenc.MustParseJson(`[0,2,3]`), docBuf))
+
+		aCmp := Comp{CompOp: CompOpEq, EqValue: anyenc.MustParseJson(`[1,2,3]`).MarshalTo(nil)}
+		assert.True(t, aCmp.Ok(anyenc.MustParseJson(`[1,2,3]`), docBuf))
+		assert.True(t, aCmp.Ok(anyenc.MustParseJson(`[[1,2,3], 1]`), docBuf))
+
+		aCmp = Comp{CompOp: CompOpEq, EqValue: anyenc.MustParseJson(`[]`).MarshalTo(nil)}
+		assert.True(t, aCmp.Ok(anyenc.MustParseJson(`[]`), docBuf))
+		assert.False(t, aCmp.Ok(anyenc.MustParseJson(`[1]`), docBuf))
+
+		cmp = Comp{CompOp: CompOpNe, EqValue: anyenc.AppendAnyValue(nil, 1)}
+		assert.True(t, cmp.Ok(a.NewNumberInt(0), docBuf))
+		assert.True(t, cmp.Ok(a.NewNumberInt(-1), docBuf))
+		assert.True(t, cmp.Ok(anyenc.MustParseJson(`[0,2,3]`), docBuf))
+		assert.False(t, cmp.Ok(anyenc.MustParseJson(`[0,1,3]`), docBuf))
+
+		aCmp = Comp{CompOp: CompOpNe, EqValue: anyenc.MustParseJson(`[1,2,3]`).MarshalTo(nil)}
+		assert.False(t, aCmp.Ok(anyenc.MustParseJson(`[1,2,3]`), docBuf))
+		assert.False(t, aCmp.Ok(anyenc.MustParseJson(`[[1,2,3], 1]`), docBuf))
+		assert.True(t, aCmp.Ok(anyenc.MustParseJson(`[1,2]`), docBuf))
 	})
 }
 
