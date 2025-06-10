@@ -6,7 +6,7 @@ import (
 	"slices"
 
 	"github.com/anyproto/any-store/internal/driver"
-	"github.com/anyproto/any-store/internal/syncpool"
+	"github.com/anyproto/any-store/syncpool"
 )
 
 // Iterator represents an iterator over query results.
