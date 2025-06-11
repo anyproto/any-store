@@ -25,6 +25,8 @@ type Filter interface {
 
 type CompOp uint8
 
+var orExpressionLimit = 900
+
 const (
 	CompOpEq CompOp = iota
 	CompOpGt
@@ -237,13 +239,29 @@ func (e And) String() string {
 }
 
 type In struct {
+	Min    []byte
+	Max    []byte
 	Values map[string]struct{}
 }
 
 func NewInValue(values ...*anyenc.Value) In {
 	inValues := make(map[string]struct{}, len(values))
+	var min []byte
+	var max []byte
+	var buf []byte
+	if len(values) > 0 {
+		min = values[0].MarshalTo(buf[:0])
+		max = values[0].MarshalTo(buf[:0])
+	}
 	for _, v := range values {
-		inValues[string(v.MarshalTo(nil))] = struct{}{}
+		vBytes := v.MarshalTo(buf[:0])
+		if bytes.Compare(vBytes, min) == -1 {
+			min = vBytes
+		} else if bytes.Compare(vBytes, max) == 1 {
+			max = vBytes
+		}
+
+		inValues[string(vBytes)] = struct{}{}
 	}
 	return In{
 		Values: inValues,
@@ -259,6 +277,23 @@ func (e In) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 }
 
 func (e In) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
+	if len(e.Values) < orExpressionLimit {
+		for val := range e.Values {
+			bs = bs.Append(Bound{
+				Start:        []byte(val),
+				End:          []byte(val),
+				StartInclude: true,
+				EndInclude:   true,
+			})
+		}
+	} else {
+		bs = bs.Append(Bound{
+			Start:        0,
+			End:          0,
+			StartInclude: true,
+			EndInclude:   true,
+		})
+	}
 	return bs
 }
 
@@ -284,7 +319,7 @@ func (e Or) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 }
 
 func (e Or) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
-	if len(e) > 900 {
+	if len(e) > orExpressionLimit {
 		return bs
 	}
 	for _, f := range e {
