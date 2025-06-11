@@ -8,6 +8,8 @@ import (
 
 	"github.com/valyala/fastjson"
 
+	"slices"
+
 	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/syncpool"
 )
@@ -245,26 +247,30 @@ type In struct {
 }
 
 func NewInValue(values ...*anyenc.Value) In {
-	inValues := make(map[string]struct{}, len(values))
-	var min []byte
-	var max []byte
-	var buf []byte
-	if len(values) > 0 {
-		min = values[0].MarshalTo(buf[:0])
-		max = values[0].MarshalTo(buf[:0])
+	if len(values) == 0 {
+		return In{Values: make(map[string]struct{})}
 	}
-	for _, v := range values {
-		vBytes := v.MarshalTo(buf[:0])
-		if bytes.Compare(vBytes, min) == -1 {
+
+	inValues := make(map[string]struct{}, len(values))
+
+	first := values[0].MarshalTo(nil)
+	min, max := first, slices.Clone(first)
+	inValues[string(first)] = struct{}{}
+
+	for _, v := range values[1:] {
+		vBytes := v.MarshalTo(nil)
+		if bytes.Compare(vBytes, min) < 0 {
 			min = vBytes
-		} else if bytes.Compare(vBytes, max) == 1 {
+		} else if bytes.Compare(vBytes, max) > 0 {
 			max = vBytes
 		}
-
 		inValues[string(vBytes)] = struct{}{}
 	}
+
 	return In{
 		Values: inValues,
+		Min:    min,
+		Max:    max,
 	}
 }
 
@@ -288,8 +294,8 @@ func (e In) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 		}
 	} else {
 		bs = bs.Append(Bound{
-			Start:        0,
-			End:          0,
+			Start:        e.Min,
+			End:          e.Max,
 			StartInclude: true,
 			EndInclude:   true,
 		})
