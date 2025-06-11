@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unsafe"
 
 	"github.com/valyala/fastjson"
 
@@ -236,6 +237,39 @@ func (e And) String() string {
 	return fmt.Sprintf(`{"$and":[%s]}`, strings.Join(subS, ", "))
 }
 
+type In struct {
+	Values map[string]struct{}
+}
+
+func NewInValue(values ...*anyenc.Value) In {
+	inValues := make(map[string]struct{}, len(values))
+	for _, v := range values {
+		inValues[string(v.MarshalTo(nil))] = struct{}{}
+	}
+	return In{
+		Values: inValues,
+	}
+}
+
+func (e In) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
+	// TODO: marshal v into smalbuf, like in Comp
+	// cast these bytes to string() -- check allocs and use UnsafeString if allocs
+	// and try to find in e.Values
+
+	// TODO: Sergey: is it correct? I assume it is thread safe for reads
+	// and we do writes to docBuf in one goroutine at once
+	docBuf.SmallBuf = v.MarshalTo(docBuf.SmallBuf[:0])
+	key := unsafe.String(unsafe.SliceData(docBuf.SmallBuf), len(docBuf.SmallBuf))
+	// or shall we do
+	// key := string(v.MarshalTo(docBuf.SmallBuf[:0]))
+	_, ok := e.Values[key]
+	return ok
+}
+
+func (e In) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
+	return bs
+}
+
 type Or []Filter
 
 func (e Or) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
@@ -248,6 +282,9 @@ func (e Or) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 }
 
 func (e Or) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
+	if len(e) > 900 {
+		return bs
+	}
 	for _, f := range e {
 		beforeBounds := len(bs)
 		if bs = f.IndexBounds(fieldName, bs); len(bs) == beforeBounds {
