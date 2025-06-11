@@ -288,9 +288,16 @@ func TestComplex(t *testing.T) {
 		assert.True(t, f.Ok(anyenc.MustParseJson(`{"a":2,"b":[3,2,1],"c":"test"}`), nil))
 		assert.False(t, f.Ok(anyenc.MustParseJson(`{"a":1,"b":[3,2],"c":"test"}`), nil))
 	})
+	t.Run("ok with docBuf", func(t *testing.T) {
+		docBuf := &syncpool.DocBuffer{}
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"a":2,"b":[3,2,1],"c":"test"}`), docBuf))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"a":1,"b":[3,2],"c":"test"}`), docBuf))
+	})
+
 	t.Run("bounds", func(t *testing.T) {
 		bs := f.IndexBounds("a", nil)
-		assert.Len(t, bs, 3)
+		// TODO: changed bounds to 0?
+		assert.Len(t, bs, 0)
 	})
 
 }

@@ -258,6 +258,10 @@ func (e In) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 
 	// TODO: Sergey: is it correct? I assume it is thread safe for reads
 	// and we do writes to docBuf in one goroutine at once
+	if docBuf == nil {
+		docBuf = &syncpool.DocBuffer{}
+	}
+
 	docBuf.SmallBuf = v.MarshalTo(docBuf.SmallBuf[:0])
 	key := unsafe.String(unsafe.SliceData(docBuf.SmallBuf), len(docBuf.SmallBuf))
 	// or shall we do
@@ -268,6 +272,16 @@ func (e In) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 
 func (e In) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	return bs
+}
+
+func (e In) String() string {
+	subS := make([]string, len(e.Values))
+	i := 0
+	for k := range e.Values {
+		subS[i] = k
+		i++
+	}
+	return fmt.Sprintf(`{"$or":[%s]}`, strings.Join(subS, ", "))
 }
 
 type Or []Filter
