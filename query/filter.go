@@ -269,7 +269,7 @@ func (e In) String() string {
 		subS[i] = k
 		i++
 	}
-	return fmt.Sprintf(`{"$or":[%s]}`, strings.Join(subS, ", "))
+	return fmt.Sprintf(`{"$in":[%s]}`, strings.Join(subS, ", "))
 }
 
 type Or []Filter
