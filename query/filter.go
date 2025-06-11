@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-	"unsafe"
 
 	"github.com/valyala/fastjson"
 
@@ -252,21 +251,10 @@ func NewInValue(values ...*anyenc.Value) In {
 }
 
 func (e In) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
-	// TODO: marshal v into smalbuf, like in Comp
-	// cast these bytes to string() -- check allocs and use UnsafeString if allocs
-	// and try to find in e.Values
-
-	// TODO: Sergey: is it correct? I assume it is thread safe for reads
-	// and we do writes to docBuf in one goroutine at once
 	if docBuf == nil {
 		docBuf = &syncpool.DocBuffer{}
 	}
-
-	docBuf.SmallBuf = v.MarshalTo(docBuf.SmallBuf[:0])
-	key := unsafe.String(unsafe.SliceData(docBuf.SmallBuf), len(docBuf.SmallBuf))
-	// or shall we do
-	// key := string(v.MarshalTo(docBuf.SmallBuf[:0]))
-	_, ok := e.Values[key]
+	_, ok := e.Values[string(v.MarshalTo(docBuf.SmallBuf[:0]))]
 	return ok
 }
 
