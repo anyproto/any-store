@@ -241,8 +241,8 @@ func (e And) String() string {
 }
 
 type In struct {
-	Min    []byte
-	Max    []byte
+	min    []byte
+	max    []byte
 	Values map[string]struct{}
 }
 
@@ -269,8 +269,8 @@ func NewInValue(values ...*anyenc.Value) In {
 
 	return In{
 		Values: inValues,
-		Min:    min,
-		Max:    max,
+		min:    min,
+		max:    max,
 	}
 }
 
@@ -294,8 +294,8 @@ func (e In) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 		}
 	} else {
 		bs = bs.Append(Bound{
-			Start:        e.Min,
-			End:          e.Max,
+			Start:        e.min,
+			End:          e.max,
 			StartInclude: true,
 			EndInclude:   true,
 		})
