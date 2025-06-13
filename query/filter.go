@@ -306,8 +306,12 @@ func (e In) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 func (e In) String() string {
 	subS := make([]string, len(e.Values))
 	i := 0
+	a := &fastjson.Arena{}
+	p := parserPool.Get()
+	defer parserPool.Put(p)
 	for k := range e.Values {
-		subS[i] = k
+		v, _ := p.Parse([]byte(k))
+		subS[i] = v.FastJson(a).String()
 		i++
 	}
 	return fmt.Sprintf(`{"$in":[%s]}`, strings.Join(subS, ", "))

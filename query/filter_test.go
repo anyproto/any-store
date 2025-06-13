@@ -296,8 +296,7 @@ func TestComplex(t *testing.T) {
 
 	t.Run("bounds", func(t *testing.T) {
 		bs := f.IndexBounds("a", nil)
-		// TODO: changed bounds to 0?
-		assert.Len(t, bs, 0)
+		assert.Len(t, bs, 3)
 	})
 
 }
