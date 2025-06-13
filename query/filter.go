@@ -8,6 +8,8 @@ import (
 
 	"github.com/valyala/fastjson"
 
+	"slices"
+
 	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/syncpool"
 )
@@ -24,6 +26,8 @@ type Filter interface {
 }
 
 type CompOp uint8
+
+var orExpressionLimit = 900
 
 const (
 	CompOpEq CompOp = iota
@@ -236,6 +240,83 @@ func (e And) String() string {
 	return fmt.Sprintf(`{"$and":[%s]}`, strings.Join(subS, ", "))
 }
 
+type In struct {
+	min    []byte
+	max    []byte
+	Values map[string]struct{}
+}
+
+func NewInValue(values ...*anyenc.Value) In {
+	if len(values) == 0 {
+		return In{Values: make(map[string]struct{})}
+	}
+
+	inValues := make(map[string]struct{}, len(values))
+
+	first := values[0].MarshalTo(nil)
+	min, max := first, slices.Clone(first)
+	inValues[string(first)] = struct{}{}
+
+	for _, v := range values[1:] {
+		vBytes := v.MarshalTo(nil)
+		if bytes.Compare(vBytes, min) < 0 {
+			min = vBytes
+		} else if bytes.Compare(vBytes, max) > 0 {
+			max = vBytes
+		}
+		inValues[string(vBytes)] = struct{}{}
+	}
+
+	return In{
+		Values: inValues,
+		min:    min,
+		max:    max,
+	}
+}
+
+func (e In) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
+	if docBuf == nil {
+		docBuf = &syncpool.DocBuffer{}
+	}
+	_, ok := e.Values[string(v.MarshalTo(docBuf.SmallBuf[:0]))]
+	return ok
+}
+
+func (e In) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
+	if len(e.Values) < orExpressionLimit {
+		for val := range e.Values {
+			bs = bs.Append(Bound{
+				Start:        []byte(val),
+				End:          []byte(val),
+				StartInclude: true,
+				EndInclude:   true,
+			})
+		}
+	} else {
+		bs = bs.Append(Bound{
+			Start:        e.min,
+			End:          e.max,
+			StartInclude: true,
+			EndInclude:   true,
+		})
+	}
+	return bs
+}
+
+func (e In) String() string {
+	subS := make([]string, len(e.Values))
+	i := 0
+	a := &fastjson.Arena{}
+	p := parserPool.Get()
+	defer parserPool.Put(p)
+	for k := range e.Values {
+		v, _ := p.Parse([]byte(k))
+		subS[i] = v.FastJson(a).String()
+		i++
+	}
+	return fmt.Sprintf(`{"$in":[%s]}`, strings.Join(subS, ", "))
+}
+
 type Or []Filter
 
 func (e Or) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
@@ -248,6 +329,9 @@ func (e Or) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 }
 
 func (e Or) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
+	if len(e) > orExpressionLimit {
+		return bs
+	}
 	for _, f := range e {
 		beforeBounds := len(bs)
 		if bs = f.IndexBounds(fieldName, bs); len(bs) == beforeBounds {

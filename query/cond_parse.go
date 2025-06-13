@@ -399,7 +399,8 @@ func makeArrComp(op Operator, v *anyenc.Value) (Filter, error) {
 	}
 	switch op {
 	case opIn:
-		return Or(makeEqArray(v)), nil
+		vals, _ := v.Array()
+		return NewInValue(vals...), nil
 	case opNin:
 		return Nor(makeEqArray(v)), nil
 	case opAll:
