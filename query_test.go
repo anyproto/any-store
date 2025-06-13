@@ -142,13 +142,10 @@ func TestCollQuery_Explain(t *testing.T) {
 			anyenc.MustParseJson(`{"id":4, "a":"a4"}`),
 			anyenc.MustParseJson(`{"id":5, "a":"a5"}`),
 		))
-		t.Log(coll)
-
 		assertExplain(t, coll.Find(result),
-			"SELECT data FROM '_test_docs' WHERE  ((id = :val_0_0_0) OR (id = :val_0_0_1)) AND any_filter(1, data)",
-			"SEARCH _test_docs USING INDEX sqlite_autoindex__test_docs_1 (id=?)",
+			"SELECT data FROM '_test_foo_docs' WHERE  ((id >= :val_0_0_0 AND id <= :val_0_0_0_end)) AND any_filter(1, data)",
+			"SEARCH _test_foo_docs USING INDEX sqlite_autoindex__test_foo_docs_1 (id>? AND id<?)",
 		)
-
 	})
 	t.Run("simple index", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "test_s")
