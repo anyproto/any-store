@@ -3,7 +3,7 @@ module github.com/anyproto/any-store/cmd/any-store-cli
 go 1.23.0
 
 require (
-	github.com/anyproto/any-store v0.2.3-0.20250616162034-1973fbb063f4
+	github.com/anyproto/any-store v0.2.3-0.20250616170547-1bda18d68259
 	github.com/fatih/color v1.18.0
 	github.com/peterh/liner v1.2.2
 	github.com/robertkrimen/otto v0.5.1
@@ -34,5 +34,3 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	modernc.org/sqlite v1.38.0 // indirect
 )
-
-replace github.com/anyproto/any-store => ../../
