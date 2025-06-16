@@ -5,12 +5,12 @@ go 1.23.0
 toolchain go1.24.1
 
 require (
+	github.com/anyproto/go-sqlite v0.0.0-20250616170219-59149cc0daad
 	github.com/stretchr/testify v1.10.0
 	github.com/valyala/fastjson v1.6.4
-	golang.org/x/exp v0.0.0-20250408133849-7e4ce0ab07d0
-	modernc.org/libc v1.65.7
-	modernc.org/sqlite v1.37.1
-	zombiezen.com/go/sqlite v1.4.2
+	golang.org/x/exp v0.0.0-20250606033433-dcc06ee1d476
+	modernc.org/libc v1.65.10
+	modernc.org/sqlite v1.38.0
 
 )
 
@@ -27,5 +27,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-replace zombiezen.com/go/sqlite => github.com/anyproto/go-sqlite v0.0.0-20250616161524-72ceaebb483c

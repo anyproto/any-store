@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"zombiezen.com/go/sqlite"
+	"github.com/anyproto/go-sqlite"
 )
 
 type Stmt struct {

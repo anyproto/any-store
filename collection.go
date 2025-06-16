@@ -8,8 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/anyproto/go-sqlite"
 	"github.com/valyala/fastjson"
-	"zombiezen.com/go/sqlite"
 
 	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/driver"

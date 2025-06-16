@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"zombiezen.com/go/sqlite"
+	"github.com/anyproto/go-sqlite"
 
 	"github.com/anyproto/any-store/internal/driver"
 	"github.com/anyproto/any-store/internal/objectid"
