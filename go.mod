@@ -11,6 +11,7 @@ require (
 	modernc.org/libc v1.65.7
 	modernc.org/sqlite v1.37.1
 	zombiezen.com/go/sqlite v1.4.2
+
 )
 
 require (
@@ -26,3 +27,5 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+replace zombiezen.com/go/sqlite => github.com/anyproto/go-sqlite v0.0.0-20250616161524-72ceaebb483c

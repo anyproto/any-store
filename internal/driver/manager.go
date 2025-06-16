@@ -222,8 +222,8 @@ func (c *ConnManager) openReadConn() (*Conn, error) {
 func (c *ConnManager) setupConn(conn *sqlite.Conn) (err error) {
 	err = conn.CreateFunction("any_filter", &sqlite.FunctionImpl{
 		NArgs: 2,
-		Scalar: func(ctx sqlite.Context, args []sqlite.Value) (sqlite.Value, error) {
-			if c.filterRegistry.Filter(args[0].Int(), args[1].Blob()) {
+		AnyStore: func(ctx sqlite.Context, index int, value []byte) (sqlite.Value, error) {
+			if c.filterRegistry.Filter(index, value) {
 				return sqlite.IntegerValue(1), nil
 			} else {
 				return sqlite.IntegerValue(0), nil
@@ -236,8 +236,8 @@ func (c *ConnManager) setupConn(conn *sqlite.Conn) (err error) {
 	}
 	err = conn.CreateFunction("any_sort", &sqlite.FunctionImpl{
 		NArgs: 2,
-		Scalar: func(ctx sqlite.Context, args []sqlite.Value) (sqlite.Value, error) {
-			return sqlite.BlobValue(c.sortRegistry.Sort(args[0].Int(), args[1].Blob())), nil
+		AnyStore: func(ctx sqlite.Context, index int, value []byte) (sqlite.Value, error) {
+			return sqlite.BlobValue(c.sortRegistry.Sort(index, value)), nil
 		},
 		Deterministic: true,
 	})
