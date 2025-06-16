@@ -1,5 +1,5 @@
-github.com/anyproto/go-sqlite v0.0.0-20250616170219-59149cc0daad h1:Gn7lVZwU7z4R37EFUjZ2kkLCd7Q/EXDWpCuWyQoA6ZI=
-github.com/anyproto/go-sqlite v0.0.0-20250616170219-59149cc0daad/go.mod h1:nW7TvS+4bzPU2vNaPlPFNPYcejK5RdjH6qZY2kjT3Io=
+github.com/anyproto/go-sqlite v1.4.2-any h1:ZTIcq/u2mYYJ6rJB4I3Ds5QH/7IlONebMiG14FyZcD4=
+github.com/anyproto/go-sqlite v1.4.2-any/go.mod h1:nW7TvS+4bzPU2vNaPlPFNPYcejK5RdjH6qZY2kjT3Io=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=

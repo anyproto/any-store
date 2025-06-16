@@ -12,7 +12,7 @@ require (
 )
 
 require (
-	github.com/anyproto/go-sqlite v0.0.0-20250616170219-59149cc0daad // indirect
+	github.com/anyproto/go-sqlite v1.4.2-any // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect

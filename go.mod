@@ -5,7 +5,7 @@ go 1.23.0
 toolchain go1.24.1
 
 require (
-	github.com/anyproto/go-sqlite v0.0.0-20250616170219-59149cc0daad
+	github.com/anyproto/go-sqlite v1.4.2-any
 	github.com/stretchr/testify v1.10.0
 	github.com/valyala/fastjson v1.6.4
 	golang.org/x/exp v0.0.0-20250606033433-dcc06ee1d476
