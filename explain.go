@@ -4,7 +4,7 @@ import (
 	"sort"
 	"strings"
 
-	"zombiezen.com/go/sqlite"
+	"github.com/anyproto/go-sqlite"
 )
 
 func scanExplainStmt(stmt *sqlite.Stmt) ([]string, error) {

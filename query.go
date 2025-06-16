@@ -6,7 +6,7 @@ import (
 	"slices"
 	"sort"
 
-	"zombiezen.com/go/sqlite"
+	"github.com/anyproto/go-sqlite"
 
 	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/bitmap"

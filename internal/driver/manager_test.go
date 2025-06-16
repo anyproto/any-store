@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anyproto/go-sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"zombiezen.com/go/sqlite"
 
 	"github.com/anyproto/any-store/internal/registry"
 	"github.com/anyproto/any-store/syncpool"

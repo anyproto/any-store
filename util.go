@@ -3,8 +3,8 @@ package anystore
 import (
 	"slices"
 
+	"github.com/anyproto/go-sqlite"
 	"github.com/valyala/fastjson"
-	"zombiezen.com/go/sqlite"
 
 	"github.com/anyproto/any-store/syncpool"
 )

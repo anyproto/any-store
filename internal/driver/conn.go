@@ -6,8 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"zombiezen.com/go/sqlite"
-	"zombiezen.com/go/sqlite/sqlitex"
+	"github.com/anyproto/go-sqlite"
+	"github.com/anyproto/go-sqlite/sqlitex"
 )
 
 type Conn struct {

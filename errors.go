@@ -3,7 +3,7 @@ package anystore
 import (
 	"errors"
 
-	"zombiezen.com/go/sqlite"
+	"github.com/anyproto/go-sqlite"
 
 	"github.com/anyproto/any-store/internal/driver"
 )
