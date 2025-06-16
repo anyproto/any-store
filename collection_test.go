@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -396,4 +398,36 @@ func BenchmarkCollection_Find(b *testing.B) {
 		}
 	})
 
+}
+
+func BenchmarkCollection_InQuery(b *testing.B) {
+	fx := newFixture(b)
+	var builder strings.Builder
+	builder.Grow(4000)
+	builder.WriteString(`{"id":{"$in":[`)
+	l := 1001
+	for i := 1; i <= l; i++ {
+		builder.WriteString(strconv.Itoa(i))
+		if i < l {
+			builder.WriteString(",")
+		}
+	}
+	builder.WriteString(",400000")
+	builder.WriteString("]}}")
+
+	query := query.MustParseCondition(builder.String())
+	coll, _ := fx.CreateCollection(ctx, "test_foo")
+	coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}})
+	vals := make([]*anyenc.Value, 1000000)
+	for i := range 1000000 {
+		// try to make random
+		vals[i] = anyenc.MustParseJson(fmt.Sprintf(`{"id":%d, "a":%d}`, i+980, i+981))
+	}
+	b.Log(coll.Find(query).Explain(ctx))
+	coll.Insert(ctx, vals...)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		coll.Find(query).Count(ctx)
+	}
 }

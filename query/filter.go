@@ -25,6 +25,8 @@ type Filter interface {
 
 type CompOp uint8
 
+var orExpressionLimit = 950
+
 const (
 	CompOpEq CompOp = iota
 	CompOpGt
@@ -236,6 +238,56 @@ func (e And) String() string {
 	return fmt.Sprintf(`{"$and":[%s]}`, strings.Join(subS, ", "))
 }
 
+type In struct {
+	Values map[string]struct{}
+}
+
+func NewInValue(values ...*anyenc.Value) In {
+	inValues := make(map[string]struct{}, len(values))
+	for _, v := range values {
+		inValues[string(v.MarshalTo(nil))] = struct{}{}
+	}
+	return In{
+		Values: inValues,
+	}
+}
+
+func (e In) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
+	if docBuf == nil {
+		docBuf = &syncpool.DocBuffer{}
+	}
+	_, ok := e.Values[string(v.MarshalTo(docBuf.SmallBuf[:0]))]
+	return ok
+}
+
+func (e In) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
+	if len(e.Values) < orExpressionLimit {
+		for val := range e.Values {
+			bs = bs.Append(Bound{
+				Start:        []byte(val),
+				End:          []byte(val),
+				StartInclude: true,
+				EndInclude:   true,
+			})
+		}
+	}
+	return bs
+}
+
+func (e In) String() string {
+	subS := make([]string, len(e.Values))
+	i := 0
+	a := &fastjson.Arena{}
+	p := parserPool.Get()
+	defer parserPool.Put(p)
+	for k := range e.Values {
+		v, _ := p.Parse([]byte(k))
+		subS[i] = v.FastJson(a).String()
+		i++
+	}
+	return fmt.Sprintf(`{"$in":[%s]}`, strings.Join(subS, ", "))
+}
+
 type Or []Filter
 
 func (e Or) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
@@ -248,6 +300,9 @@ func (e Or) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 }
 
 func (e Or) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
+	if len(e) > orExpressionLimit {
+		return bs
+	}
 	for _, f := range e {
 		beforeBounds := len(bs)
 		if bs = f.IndexBounds(fieldName, bs); len(bs) == beforeBounds {
@@ -413,7 +468,7 @@ func findPrefix(pattern string) string {
 	specialChars := `^$|*+?(){}[]\.`
 	escaped := false
 
-	for i := 0; i < len(pattern); i++ {
+	for i := range len(pattern) {
 		char := pattern[i]
 
 		if escaped {
