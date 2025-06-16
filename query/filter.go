@@ -8,8 +8,6 @@ import (
 
 	"github.com/valyala/fastjson"
 
-	"slices"
-
 	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/syncpool"
 )
@@ -27,7 +25,7 @@ type Filter interface {
 
 type CompOp uint8
 
-var orExpressionLimit = 900
+var orExpressionLimit = 950
 
 const (
 	CompOpEq CompOp = iota
@@ -241,36 +239,16 @@ func (e And) String() string {
 }
 
 type In struct {
-	min    []byte
-	max    []byte
 	Values map[string]struct{}
 }
 
 func NewInValue(values ...*anyenc.Value) In {
-	if len(values) == 0 {
-		return In{Values: make(map[string]struct{})}
-	}
-
 	inValues := make(map[string]struct{}, len(values))
-
-	first := values[0].MarshalTo(nil)
-	min, max := first, slices.Clone(first)
-	inValues[string(first)] = struct{}{}
-
-	for _, v := range values[1:] {
-		vBytes := v.MarshalTo(nil)
-		if bytes.Compare(vBytes, min) < 0 {
-			min = vBytes
-		} else if bytes.Compare(vBytes, max) > 0 {
-			max = vBytes
-		}
-		inValues[string(vBytes)] = struct{}{}
+	for _, v := range values {
+		inValues[string(v.MarshalTo(nil))] = struct{}{}
 	}
-
 	return In{
 		Values: inValues,
-		min:    min,
-		max:    max,
 	}
 }
 
@@ -292,13 +270,6 @@ func (e In) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 				EndInclude:   true,
 			})
 		}
-	} else {
-		bs = bs.Append(Bound{
-			Start:        e.min,
-			End:          e.max,
-			StartInclude: true,
-			EndInclude:   true,
-		})
 	}
 	return bs
 }
@@ -497,7 +468,7 @@ func findPrefix(pattern string) string {
 	specialChars := `^$|*+?(){}[]\.`
 	escaped := false
 
-	for i := 0; i < len(pattern); i++ {
+	for i := range len(pattern) {
 		char := pattern[i]
 
 		if escaped {
