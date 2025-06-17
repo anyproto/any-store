@@ -128,11 +128,9 @@ func TestCollQuery_Explain(t *testing.T) {
 				builder.WriteString(",")
 			}
 		}
-
 		builder.WriteString("]}}")
-
 		result := builder.String()
-		t.Log(result)
+
 		coll, _ := fx.CreateCollection(ctx, "test_foo")
 
 		require.NoError(t, coll.Insert(ctx,
@@ -353,4 +351,23 @@ func TestCollQuery_Delete(t *testing.T) {
 	assert.Equal(t, ModifyResult{Matched: 2, Modified: 2}, mRes)
 
 	assertCollCount(t, coll, 2)
+}
+
+func TestFilterIn(t *testing.T) {
+	fx := newFixture(t)
+	t.Run("in array with arrays", func(t *testing.T) {
+		coll, _ := fx.CreateCollection(ctx, "test_in_arr")
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(`{"id":1, "a":"a1"}`),
+			anyenc.MustParseJson(`{"id":2, "a":"a2"}`),
+			anyenc.MustParseJson(`{"id":3, "a":"a3"}`),
+			anyenc.MustParseJson(`{"id":4, "a":["a3", "a5", "a6"]}`),
+			anyenc.MustParseJson(`{"id":5, "a":"a5"}`),
+		))
+		result := coll.Find(`{"a": {"$in": ["a3", "a5"]}}`)
+		length, err := result.Count(ctx)
+		assert.NoError(t, err)
+		assert.Equal(t, 3, length)
+	})
+
 }
