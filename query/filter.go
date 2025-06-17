@@ -259,13 +259,9 @@ func (e In) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 	if v != nil {
 		if v.Type() == anyenc.TypeArray {
 			arr, _ := v.Array()
-			found := 0
 			for _, item := range arr {
 				_, ok := e.Values[string(item.MarshalTo(docBuf.SmallBuf[:0]))]
 				if ok {
-					found++
-				}
-				if found == len(e.Values) {
 					return true
 				}
 			}

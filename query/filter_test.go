@@ -464,8 +464,13 @@ func TestIn(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, f.Ok(doc, docBuf))
 	})
-	t.Run("not ok array", func(t *testing.T) {
+	t.Run("ok just one array", func(t *testing.T) {
 		f, err := ParseCondition(`{"b": {"$in": [1,4]}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(doc, docBuf))
+	})
+	t.Run("not ok any array", func(t *testing.T) {
+		f, err := ParseCondition(`{"b": {"$in": [8,4]}}`)
 		require.NoError(t, err)
 		assert.False(t, f.Ok(doc, docBuf))
 	})
