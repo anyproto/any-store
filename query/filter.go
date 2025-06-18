@@ -256,8 +256,23 @@ func (e In) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 	if docBuf == nil {
 		docBuf = &syncpool.DocBuffer{}
 	}
-	_, ok := e.Values[string(v.MarshalTo(docBuf.SmallBuf[:0]))]
-	return ok
+	if v != nil {
+		if v.Type() == anyenc.TypeArray {
+			arr, _ := v.Array()
+			for _, item := range arr {
+				_, ok := e.Values[string(item.MarshalTo(docBuf.SmallBuf[:0]))]
+				if ok {
+					return true
+				}
+			}
+			return false
+		} else {
+			_, ok := e.Values[string(v.MarshalTo(docBuf.SmallBuf[:0]))]
+			return ok
+		}
+	} else {
+		return false
+	}
 }
 
 func (e In) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {

@@ -444,6 +444,39 @@ func TestSize(t *testing.T) {
 	})
 }
 
+func TestIn(t *testing.T) {
+	doc := anyenc.MustParseJson(`{"a":2,"b":[3,2,1],"c":"test"}`)
+	docBuf := &syncpool.DocBuffer{}
+
+	t.Run("ok", func(t *testing.T) {
+		f, err := ParseCondition(`{"c": {"$in": ["test"]}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(doc, docBuf))
+	})
+	t.Run("not ok", func(t *testing.T) {
+		f, err := ParseCondition(`{"a": {"$in": ["42"]}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(doc, docBuf))
+	})
+
+	t.Run("ok array", func(t *testing.T) {
+		f, err := ParseCondition(`{"b": {"$in": [1,2]}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(doc, docBuf))
+	})
+	t.Run("ok just one array", func(t *testing.T) {
+		f, err := ParseCondition(`{"b": {"$in": [1,4]}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(doc, docBuf))
+	})
+	t.Run("not ok any array", func(t *testing.T) {
+		f, err := ParseCondition(`{"b": {"$in": [8,4]}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(doc, docBuf))
+	})
+
+}
+
 func BenchmarkFilter_Ok(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"a":2,"b":[3,2,1],"c":"test"}`)
 	docBuf := &syncpool.DocBuffer{}

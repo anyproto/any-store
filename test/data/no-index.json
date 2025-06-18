@@ -64,6 +64,18 @@
       "expectedIds": [10,1]
     },
     {
+      "cond": {"b": {"$in": [1]}},
+      "expectedIds": [1]
+    },
+    {
+      "cond": {"b": {"$in": [1,10]}},
+      "expectedIds": [1,2,5,10]
+    },
+    {
+      "cond": {"b": {"$in": [1,10,3]}},
+      "expectedIds": [1,2,3,5,10]
+    },
+    {
       "cond": {"id": {"$nin": [1,3,5,7,9,22]}},
       "expectedIds": [2,4,6,8,10]
     },
