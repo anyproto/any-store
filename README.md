@@ -75,14 +75,12 @@ func main() {
 
 The full end‑to‑end example lives in [`example/`](example) and in the [API docs](https://pkg.go.dev/github.com/anyproto/any-store).
 
----
 
 ## Documentation
 
 * **API reference** – [https://pkg.go.dev/github.com/anyproto/any-store](https://pkg.go.dev/github.com/anyproto/any-store)
 * **CLI manual** – `any-store-cli --help`
 
----
 
 ## Design highlights
 
@@ -93,7 +91,6 @@ The full end‑to‑end example lives in [`example/`](example) and in the [API 
 | **Encoding arena**  | Efficient [AnyEnc](anyenc) value arena to minimise GC churn                |
 | **Connection pool** | Separate read / write SQLite connections for concurrent workloads          |
 
----
 
 
 ## Contributing
@@ -105,7 +102,6 @@ The full end‑to‑end example lives in [`example/`](example) and in the [API 
 
 Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing.
 
----
 
 ## ⚖️ License
 
