@@ -9,7 +9,6 @@ Any Store brings schema‑less flexibility, rich indexes and ACID transactions t
 
 > ⚠️ **Status:** pre‑1.0 – APIs may change. We actively dog‑food the library in production and welcome early adopters & contributors.
 
----
 
 ## Features
 
@@ -21,7 +20,6 @@ Any Store brings schema‑less flexibility, rich indexes and ACID transactions t
 * **CLI** – quick inspection, import/export and interactive shell.
 * **Cross‑platform** – pure Go, no CGO, runs anywhere Go runs.
 
----
 
 ## Quick start
 
