@@ -1,175 +1,114 @@
-
 # Any Store
 
-Any Store is a document-oriented database with a MongoDB-like query language. It is built on top of SQLite. The database supports transactions and indexes.
+[![Go Reference](https://pkg.go.dev/badge/github.com/anyproto/any-store.svg)](https://pkg.go.dev/github.com/anyproto/any-store)
+[![Go Report Card](https://goreportcard.com/badge/github.com/anyproto/any-store)](https://goreportcard.com/report/github.com/anyproto/any-store)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Warning:** This library is not well tested and the API is still unstable. However, it is under active development.
+A **document‑oriented database** with a MongoDB‑like query language, running on top of a single SQLite file.
+Any Store brings schema‑less flexibility, rich indexes and ACID transactions to embedded Go applications.
 
-## Installation
+> ⚠️ **Status:** pre‑1.0 – APIs may change. We actively dog‑food the library in production and welcome early adopters & contributors.
 
-To install Any Store, run:
-```sh
+---
+
+## Features
+
+* **SQLite + JSON** – proven, battle‑tested storage engine with SQLite 3.45+ JSON functions.
+* **Mongo‑style queries** – `$in`, `$inc`, comparison & logical operators out of the box.
+* **Automatic indexes** – create, ensure or drop compound & unique indexes at runtime.
+* **ACID transactions** – explicit read / write transactions plus convenience helpers.
+* **Streaming iterators** – low‑memory scans with cursor API.
+* **CLI** – quick inspection, import/export and interactive shell.
+* **Cross‑platform** – pure Go, no CGO, runs anywhere Go runs.
+
+---
+
+## Quick start
+
+### Install library
+
+```bash
 go get github.com/anyproto/any-store
 ```
 
-For the CLI interface, run:
-```sh
+### Install CLI (optional)
+
+```bash
 go install github.com/anyproto/any-store/cmd/any-store-cli@latest
 ```
 
-## Usage Example
-
-Here is an all-in-one example demonstrating various operations with Any Store:
+### Hello, Any Store
 
 ```go
 package main
 
 import (
-	"context"
-	"fmt"
-	"log"
+    "context"
+    "fmt"
+    "log"
 
-	anystore "github.com/anyproto/any-store"
-	"github.com/anyproto/any-store/anyenc"
+    anystore "github.com/anyproto/any-store"
+    "github.com/anyproto/any-store/anyenc"
 )
 
-var ctx = context.Background()
-
 func main() {
-	// open database
-	db, err := anystore.Open(ctx, "/tmp/file.db", nil)
-	if err != nil {
-		log.Fatalf("unable to open db: %v", err)
-	}
+    ctx := context.Background()
 
-	defer func() {
-		if err = db.Close(); err != nil {
-			log.Fatalf("close db eroor: %v", err)
-		}
-	}()
+    db, err := anystore.Open(ctx, "/tmp/demo.db", nil)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
 
-	coll, err := db.Collection(ctx, "users")
-	if err != nil {
-		log.Fatalf("unable to open collection: %v", err)
-	}
+    users, _ := db.Collection(ctx, "users")
 
-	// insert document, convert from json
-	doc := anyenc.MustParseJson(`{"id":1, "name": "John"}`)
-	err = coll.Insert(ctx, doc)
-	if err != nil {
-		log.Fatalf("unable to insert document: %v", err)
-	}
+    _ = users.Insert(ctx,
+        anyenc.MustParseJson(`{"id": 1, "name": "John"}`),
+        anyenc.MustParseJson(`{"id": 2, "name": "Jane"}`),
+    )
 
-	// create document
-	a := &anyenc.Arena{}
-	doc = a.NewObject()
-	doc.Set("id", a.NewNumberInt(2))
-	doc.Set("name", a.NewString("Jane"))
-	err = coll.Insert(ctx, doc)
-	if err != nil {
-		log.Fatalf("unable to insert document: %v", err)
-	}
-
-	// batch insert
-	if err = coll.Insert(ctx,
-		anyenc.MustParseJson(`{"id":3, "name": "Alex"}`),
-		anyenc.MustParseJson(`{"id":4, "name": "rob"}`),
-		anyenc.MustParseJson(`{"id":5, "name": "Paul"}`),
-	); err != nil {
-		log.Fatalf("unable to insert document: %v", err)
-	}
-
-	// upsert
-	err = coll.UpsertOne(ctx, anyenc.MustParseJson(`{"id":6, "name": "Mike"}`))
-	if err != nil {
-		log.Fatalf("unable to insert document: %v", err)
-	}
-
-	// update one
-	if err = coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":4, "name": "Rob"}`)); err != nil {
-		log.Fatalf("unable to update document: %v", err)
-	}
-
-	// find by id
-	res, err := coll.FindId(ctx, 2)
-	if err != nil {
-		log.Fatalf("unable to find document: %v", err)
-	}
-	fmt.Println("document found:", res.Value().String())
-
-	// collection count
-	count, err := coll.Count(ctx)
-	if err != nil {
-		log.Fatalf("unable to count documents: %v", err)
-	}
-	fmt.Println("document count:", count)
-
-	// find many with condition
-	iter, err := coll.Find(`{"id":{"$in":[1,2,3]}}`).Sort("-name").Limit(2).Offset(1).Iter(ctx)
-	if err != nil {
-		log.Fatalf("query failed: %v", err)
-	}
-	defer func() {
-		if err = iter.Close(); err != nil {
-			log.Fatalf("unable to close iterator: %v", err)
-		}
-	}()
-	for iter.Next() {
-		res, err = iter.Doc()
-		if err != nil {
-			log.Fatalf("load document error: %v", err)
-		}
-		fmt.Println("findMany:", res.Value().String())
-	}
-
-	// create index
-	if err = coll.EnsureIndex(ctx, anystore.IndexInfo{Fields: []string{"name"}}); err != nil {
-		fmt.Println("unable to ensure index:", err)
-	}
-
-	// update many
-	result, err := coll.Find(`{"name": {"$in": ["Rob","Alex"]}}`).Update(ctx, `{"$inc":{"rating":0.1}}`)
-	if err != nil {
-		log.Fatalf("cannot update document: %v", err)
-	}
-	fmt.Printf("updated documents count: %d\n", result.Modified)
-
-	// transaction
-	tx, err := db.WriteTx(ctx)
-	if err != nil {
-		log.Fatalf("cannot create tx: %v", err)
-	}
-
-	// it's important to pass tx.Context() to any operations within transaction
-	// because sqlite can handle only one transaction in time - passing ctx instead tx.Context() will cause possibly deadlock
-	result, err = coll.Find(`{"name": "Mike"}`).Delete(tx.Context())
-	if err != nil {
-		log.Fatalf("cannot delete document: %v", err)
-	}
-	fmt.Println("deleted count:", result.Modified)
-
-	// document is deleted inside transaction
-	count, err = coll.Find(`{"name": "Mike"}`).Count(tx.Context())
-	if err != nil {
-		log.Fatalf("cannot count documents: %v", err)
-	}
-	fmt.Println("count within transaction:", count)
-
-	// by passing other ctx we can find Mike in other transaction
-	count, err = coll.Find(`{"name": "Mike"}`).Count(ctx)
-	if err != nil {
-		log.Fatalf("cannot count documents: %v", err)
-	}
-	fmt.Println("count outside transaction:", count)
-
-	if err = tx.Commit(); err != nil {
-		log.Fatalf("cannot commit transaction: %v", err)
-	}
-
+    res, _ := users.Find(`{"id": {"$in": [1,2]}}`).Sort("-name").Iter(ctx)
+    for res.Next() {
+        doc, _ := res.Doc()
+        fmt.Println(doc.Value().String())
+    }
 }
-
 ```
 
-## License
+The full end‑to‑end example lives in [`example/`](example) and in the [API docs](https://pkg.go.dev/github.com/anyproto/any-store).
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE.md) file for details.
+---
+
+## Documentation
+
+* **API reference** – [https://pkg.go.dev/github.com/anyproto/any-store](https://pkg.go.dev/github.com/anyproto/any-store)
+* **CLI manual** – `any-store-cli --help`
+
+---
+
+## Design highlights
+
+| Layer               | Responsibility                                                             |
+| ------------------- | -------------------------------------------------------------------------- |
+| **Query builder**   | Parses Mongo‑like JSON filters and modifiers                               |
+| **Index engine**    | Generates composite SQLite indexes, picks optimal index via cost estimator |
+| **Encoding arena**  | Efficient [AnyEnc](anyenc) value arena to minimise GC churn                |
+| **Connection pool** | Separate read / write SQLite connections for concurrent workloads          |
+
+---
+
+
+## Contributing
+
+1. Fork & clone
+2. `make test` – run unit tests
+3. Create your feature branch
+4. Open a PR and sign the CLA
+
+Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing.
+
+---
+
+## ⚖️ License
+
+Any Store is released under the MIT License – see [LICENSE](LICENSE) for details.
