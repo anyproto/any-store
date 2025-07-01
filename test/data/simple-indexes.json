@@ -40,6 +40,10 @@
     {
       "cond": {"b": [4,8]},
       "expectedIds": [4]
+    },
+    {
+      "cond": {"d": null},
+      "expectedIds": [1,8,9,10]
     }
   ],
   "data": [
@@ -57,6 +61,7 @@
   "indexes": [
     ["a"],
     ["b"],
-    ["c"]
+    ["c"],
+    ["d"]
   ]
 }

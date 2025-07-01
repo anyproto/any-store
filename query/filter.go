@@ -56,13 +56,11 @@ type Comp struct {
 	notArray bool
 }
 
+var valueNull = anyenc.MustParseJson("null")
+
 func (e *Comp) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 	if v == nil {
-		if e.CompOp == CompOpNe {
-			return true
-		} else {
-			return false
-		}
+		v = valueNull
 	}
 	if docBuf == nil {
 		docBuf = &syncpool.DocBuffer{}
