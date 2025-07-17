@@ -8,8 +8,8 @@ require (
 	github.com/anyproto/go-sqlite v1.4.2-any
 	github.com/stretchr/testify v1.10.0
 	github.com/valyala/fastjson v1.6.4
-	golang.org/x/exp v0.0.0-20250606033433-dcc06ee1d476
-	modernc.org/libc v1.66.2
+	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b
+	modernc.org/libc v1.66.3
 	modernc.org/sqlite v1.38.0
 )
 
