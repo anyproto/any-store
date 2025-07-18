@@ -189,7 +189,6 @@ func (c *ConnManager) ReleaseRead(conn *Conn) {
 	case c.readCh <- conn:
 		return
 	case <-c.closed:
-		c.readCh <- conn
 		return
 	default:
 	}
