@@ -76,7 +76,7 @@ func NewConnManager(path string, conf Config) (*ConnManager, error) {
 		_ = conn.Close()
 		return nil, err
 	}
-	wConn := &Conn{conn: conn, activeStmts: map[*Stmt]struct{}{}}
+	wConn := &Conn{conn: conn, activeStmts: map[*sqlite.Stmt]*Stmt{}}
 
 	if err = checkVersion(conn, conf.Version, newDb); err != nil {
 		_ = wConn.Close()
@@ -189,7 +189,6 @@ func (c *ConnManager) ReleaseRead(conn *Conn) {
 	case c.readCh <- conn:
 		return
 	case <-c.closed:
-		c.readCh <- conn
 		return
 	default:
 	}
@@ -216,7 +215,7 @@ func (c *ConnManager) openReadConn() (*Conn, error) {
 	if err = c.setupConn(conn); err != nil {
 		return nil, err
 	}
-	return &Conn{conn: conn, activeStmts: map[*Stmt]struct{}{}}, nil
+	return &Conn{conn: conn, activeStmts: map[*sqlite.Stmt]*Stmt{}}, nil
 }
 
 func (c *ConnManager) setupConn(conn *sqlite.Conn) (err error) {

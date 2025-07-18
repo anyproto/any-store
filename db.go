@@ -474,18 +474,10 @@ func (db *db) Close() error {
 	if !db.closed.CompareAndSwap(false, true) {
 		return ErrDBIsClosed
 	}
-	if _, err := db.cm.GetWrite(context.Background()); err != nil {
+
+	cn, err := db.cm.GetWrite(context.Background())
+	if err != nil {
 		return err
-	}
-	for _, stmt := range []*driver.Stmt{
-		db.stmt.registerCollection,
-		db.stmt.removeCollection,
-		db.stmt.renameCollection,
-		db.stmt.renameCollectionIndex,
-		db.stmt.registerIndex,
-		db.stmt.removeIndex,
-	} {
-		_ = stmt.Close()
 	}
 
 	var collToClose []Collection
@@ -499,6 +491,7 @@ func (db *db) Close() error {
 			log.Printf("collection close error: %v", cErr)
 		}
 	}
+	db.cm.ReleaseWrite(cn)
 	return db.cm.Close()
 }
 

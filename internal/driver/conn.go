@@ -16,7 +16,7 @@ type Conn struct {
 	beginImmediate,
 	commit,
 	rollback *Stmt
-	activeStmts map[*Stmt]struct{}
+	activeStmts map[*sqlite.Stmt]*Stmt
 	isClosed    bool
 	lastUsage   atomic.Int64
 	isActive    atomic.Bool
@@ -63,7 +63,7 @@ func (c *Conn) ExecCached(ctx context.Context, query string, bind func(stmt *sql
 	if err != nil {
 		return
 	}
-	stmt := Stmt{stmt: sqliteStmt, conn: c}
+	stmt := &Stmt{stmt: sqliteStmt, conn: c}
 	return stmt.exec(ctx, bind, result)
 }
 
@@ -179,8 +179,11 @@ func (c *Conn) Backup(ctx context.Context, path string) (err error) {
 }
 
 func (c *Conn) newStmt(stmt *sqlite.Stmt) *Stmt {
+	if dStmt := c.activeStmts[stmt]; dStmt != nil {
+		return dStmt
+	}
 	dStmt := &Stmt{conn: c, stmt: stmt}
-	c.activeStmts[dStmt] = struct{}{}
+	c.activeStmts[stmt] = dStmt
 	return dStmt
 }
 
@@ -190,7 +193,7 @@ func (c *Conn) Close() (err error) {
 	if c.isClosed {
 		return ErrDBIsClosed
 	} else {
-		for stmt := range c.activeStmts {
+		for _, stmt := range c.activeStmts {
 			err = errors.Join(err, stmt.close())
 		}
 		c.isClosed = true

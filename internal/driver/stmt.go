@@ -101,7 +101,7 @@ func (s *Stmt) close() error {
 	if s.stmt == nil {
 		return nil
 	}
-	delete(s.conn.activeStmts, s)
+	delete(s.conn.activeStmts, s.stmt)
 	err := s.stmt.Finalize()
 	s.stmt = nil
 	return err
