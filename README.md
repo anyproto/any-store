@@ -12,7 +12,6 @@ Any Store brings schema‑less flexibility, rich indexes and ACID transactions t
 
 ## Features
 
-* **SQLite + JSON** – proven, battle‑tested storage engine with SQLite 3.45+ JSON functions.
 * **Mongo‑style queries** – `$in`, `$inc`, comparison & logical operators out of the box.
 * **Automatic indexes** – create, ensure or drop compound & unique indexes at runtime.
 * **ACID transactions** – explicit read / write transactions plus convenience helpers.
