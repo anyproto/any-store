@@ -9,7 +9,7 @@ require (
 	github.com/stretchr/testify v1.10.0
 	github.com/valyala/fastjson v1.6.4
 	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b
-	modernc.org/libc v1.66.3
+	modernc.org/libc v1.66.7
 	modernc.org/sqlite v1.38.0
 )
 
