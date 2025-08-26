@@ -119,7 +119,7 @@ jobs:
           name: Release ${{ github.ref_name }}
           generate_release_notes: true
           draft: false
-          prerelease: true
+          prerelease: false
           # for triggering workflow "push-docker-image-release" - https://docs.github.com/en/actions/using-workflows/triggering-a-workflow#triggering-a-workflow-from-a-workflow
           token: ${{ secrets.ANYTYPE_PAT }}
           files: |
@@ -132,7 +132,7 @@ jobs:
           name: Release ${{ github.ref_name }}
           generate_release_notes: true
           draft: false
-          prerelease: true
+          prerelease: false
           # for triggering workflow "push-docker-image-release" - https://docs.github.com/en/actions/using-workflows/triggering-a-workflow#triggering-a-workflow-from-a-workflow
           token: ${{ secrets.ANYTYPE_PAT }}
           files: |
@@ -145,7 +145,7 @@ jobs:
           name: Release ${{ github.ref_name }}
           generate_release_notes: true
           draft: false
-          prerelease: true
+          prerelease: false
           # for triggering workflow "push-docker-image-release" - https://docs.github.com/en/actions/using-workflows/triggering-a-workflow#triggering-a-workflow-from-a-workflow
           token: ${{ secrets.ANYTYPE_PAT }}
           files: |
