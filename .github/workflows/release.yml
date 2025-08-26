@@ -1,0 +1,154 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+
+permissions:
+  actions: 'write'
+  packages: 'write'
+  contents: 'write'
+
+
+jobs:
+  build:
+    name: build release
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        arch:
+          - amd64
+          - arm64
+        os:
+          - linux
+        go-version:
+          - '1.24'
+        include:
+          - arch: amd64
+            rpm_arch: x86_64
+          - arch: arm64
+            rpm_arch: aarch64
+    env:
+      GOPRIVATE: github.com/anyproto
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v4
+        with:
+          go-version: '${{ matrix.go-version }}'
+          check-latest: true
+
+      - name: git config
+        run: git config --global url.https://${{ secrets.ANYTYPE_PAT }}@github.com/.insteadOf https://github.com/
+
+      # build {{
+      - name: deps
+        run: make deps CGO_ENABLED=0
+
+      - name: unit tests
+        run: make test CGO_ENABLED=0
+
+      - name: build
+        run: make build CGO_ENABLED=0 BUILD_GOOS=${{ matrix.os }} BUILD_GOARCH=${{ matrix.arch }}
+      # }}
+
+      - name: get release version
+        id: release-version
+        run: |
+          echo "$GITHUB_REF_NAME" | sed 's|^[a-zA-Z]\+|RELEASE_VERSION=|' >> $GITHUB_OUTPUT
+          echo "$GITHUB_REF_NAME" | sed 's|^[a-zA-Z]\+|RELEASE_VERSION_RPM=|; s|-|_|g' >> $GITHUB_OUTPUT # FPM automatically converts versions for RPM
+
+      # create asset {{
+      - name: create zip archive
+        if: matrix.os == 'windows'
+        run: |
+          zip --junk-paths ${{ github.event.repository.name }}-${{ steps.release-version.outputs.RELEASE_VERSION }}.${{ matrix.os }}-${{ matrix.arch }}.zip bin/*
+      - name: create tar archive
+        if: matrix.os != 'windows'
+        run: |
+          tar \
+            --create \
+            --gzip \
+            --verbose \
+            --exclude='.gitignore' \
+            --file=${{ github.event.repository.name }}-${{ steps.release-version.outputs.RELEASE_VERSION }}.${{ matrix.os }}-${{ matrix.arch }}.tgz \
+            --directory=bin/ \
+            .
+      - name: create package deb
+        if: matrix.os == 'linux'
+        uses: fb929/github-action-fpm@master
+        with:
+          fpm_opts:
+            --name ${{ github.event.repository.name }}
+            --version ${{ steps.release-version.outputs.RELEASE_VERSION }}
+            --architecture ${{ matrix.arch }}
+            --url ${{ github.repositoryUrl }}
+            --description "commit ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+            --exclude '*/.gitignore'
+            --exclude '*/.git'
+            --input-type dir
+            --output-type deb
+          fpm_args: ./bin
+      - name: create package rpm
+        if: matrix.os == 'linux'
+        uses: fb929/github-action-fpm@master
+        with:
+          fpm_opts:
+            --name ${{ github.event.repository.name }}
+            --version ${{ steps.release-version.outputs.RELEASE_VERSION }}
+            --architecture ${{ matrix.rpm_arch }}
+            --url ${{ github.repositoryUrl }}
+            --description "commit ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+            --exclude '*/.gitignore'
+            --exclude '*/.git'
+            --input-type dir
+            --output-type rpm
+          fpm_args: ./bin
+      # }}
+
+      - name: debug
+        run: |
+          ls -al ./
+
+      # upload-release-asset {{
+      - name: Create release and upload asset zip
+        uses: softprops/action-gh-release@v2.0.4
+        if: matrix.os == 'windows'
+        with:
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: true
+          # for triggering workflow "push-docker-image-release" - https://docs.github.com/en/actions/using-workflows/triggering-a-workflow#triggering-a-workflow-from-a-workflow
+          token: ${{ secrets.ANYTYPE_PAT }}
+          files: |
+            ./${{ github.event.repository.name }}-${{ steps.release-version.outputs.RELEASE_VERSION }}.${{ matrix.os }}-${{ matrix.arch }}.zip
+
+      - name: Create release and upload asset tgz
+        uses: softprops/action-gh-release@v2.0.4
+        if: matrix.os != 'windows'
+        with:
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: true
+          # for triggering workflow "push-docker-image-release" - https://docs.github.com/en/actions/using-workflows/triggering-a-workflow#triggering-a-workflow-from-a-workflow
+          token: ${{ secrets.ANYTYPE_PAT }}
+          files: |
+            ./${{ github.event.repository.name }}-${{ steps.release-version.outputs.RELEASE_VERSION }}.${{ matrix.os }}-${{ matrix.arch }}.tgz
+
+      - name: Create release and upload assets deb and rpm
+        uses: softprops/action-gh-release@v2.0.4
+        if: matrix.os == 'linux'
+        with:
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: true
+          # for triggering workflow "push-docker-image-release" - https://docs.github.com/en/actions/using-workflows/triggering-a-workflow#triggering-a-workflow-from-a-workflow
+          token: ${{ secrets.ANYTYPE_PAT }}
+          files: |
+            ./${{ github.event.repository.name }}_${{ steps.release-version.outputs.RELEASE_VERSION }}_${{ matrix.arch }}.deb
+            ./${{ github.event.repository.name }}-${{ steps.release-version.outputs.RELEASE_VERSION_RPM }}-1.${{ matrix.rpm_arch }}.rpm
+      # }}
