@@ -559,6 +559,9 @@ func (q *collQuery) indexQueryWeight(idx *index) (weight int, fieldBits bitmap.B
 			}
 		}
 	}
+	if weight > 0 && idx.info.Unique {
+		weight++
+	}
 	return
 }
 
