@@ -10,7 +10,7 @@ require (
 	github.com/valyala/fastjson v1.6.4
 	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b
 	modernc.org/libc v1.66.3
-	modernc.org/sqlite v1.37.1
+	modernc.org/sqlite v1.39.0
 )
 
 require (
