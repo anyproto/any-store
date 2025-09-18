@@ -324,11 +324,11 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 		if txErr != nil {
 			return
 		}
+		res.Matched = 1
 		if !modified {
 			return
 		}
 		res.Modified = 1
-		res.Matched = 1
 		return c.update(ctx, item{val: newVal}, it)
 	}); err != nil {
 		return ModifyResult{}, err
@@ -380,6 +380,9 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 			return
 		}
 		if !modified {
+			if !isInsert {
+				res.Matched = 1
+			}
 			return
 		}
 		res.Modified = 1
