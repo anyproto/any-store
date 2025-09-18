@@ -198,6 +198,7 @@ func TestCollection_UpdateId(t *testing.T) {
 		res, err := coll.UpdateId(ctx, 1, query.MustParseModifier(`{"$set":{"key":"value"}}`))
 		require.NoError(t, err)
 		assert.Equal(t, 0, res.Modified)
+		assert.Equal(t, 1, res.Matched)
 	})
 }
 
@@ -247,6 +248,19 @@ func TestCollection_UpsertId(t *testing.T) {
 		doc, err := coll.FindId(ctx, 1)
 		require.NoError(t, err)
 		assert.Equal(t, float64(3), doc.Value().GetFloat64("a"))
+	})
+	t.Run("not modified", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+
+		err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":1, "key":"value"}`))
+		require.NoError(t, err)
+
+		res, err := coll.UpsertId(ctx, 1, query.MustParseModifier(`{"$set":{"key":"value"}}`))
+		require.NoError(t, err)
+		assert.Equal(t, 0, res.Modified)
+		assert.Equal(t, 1, res.Matched)
 	})
 }
 
