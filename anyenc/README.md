@@ -19,7 +19,7 @@ Each serialized item starts with a byte that defines its type. Supported data ty
 #### Serialization Details:
 
 - **Null, True, False**: Represented by a single byte indicating the type (`0x01`, `0x05`, or `0x04`).
-- **Number**: A type byte (`0x02`) followed by an 8-byte encoded numer.
+- **Number**: A type byte (`0x02`) followed by an 8-byte encoded number.
 - **String**: A type byte (`0x03`), followed by the string data, terminated by `0x00`.
 - **Array**: A type byte (`0x06`), followed by serialized elements, ending with `0x00`.
 - **Object**: A type byte (`0x07`), followed by key-value pairs (key string terminated by `0x00`, followed by the value), and ending with `0x00` for both key and value.
