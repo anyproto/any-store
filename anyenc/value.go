@@ -23,9 +23,8 @@ type Value struct {
 }
 
 type keyValue struct {
-	key    string
-	keyBuf []byte
-	value  *Value
+	key   string
+	value *Value
 }
 
 // Set sets a (key, value) entry in the array or object v.
@@ -299,7 +298,11 @@ func (v *Value) MarshalTo(dst []byte) []byte {
 func (v *Value) marshalObject(dst []byte) []byte {
 	dst = append(dst, byte(TypeObject))
 	for _, kv := range v.o.kvs {
-		dst = appendIgnoreEOS(dst, s2b(kv.key)...)
+		if len(kv.key) == 0 {
+			dst = append(dst, emptyKey)
+		} else {
+			dst = appendIgnoreEOS(dst, s2b(kv.key)...)
+		}
 		dst = append(dst, EOS)
 		dst = kv.value.MarshalTo(dst)
 	}
