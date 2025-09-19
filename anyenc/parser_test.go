@@ -18,6 +18,7 @@ var encDecData = []string{
 	`["1","2","3"]`,
 	`{"key":"value"}`,
 	`{"id":12345,"key":"value","int":42,"array":[1,2,3],"object":{"float":33.2,"null":null,"true":true,"false":false}}`,
+	`[{},{"":[{"":1},{}]},{"a":"b"}]`,
 }
 
 func TestEncodeDecode(t *testing.T) {

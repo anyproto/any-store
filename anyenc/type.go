@@ -28,6 +28,10 @@ const (
 	iTypeBinary = ^Type(8)
 )
 
+const (
+	emptyKey = 0x1F
+)
+
 func (t Type) String() string {
 	switch t {
 	case TypeNull:

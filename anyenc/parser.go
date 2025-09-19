@@ -120,8 +120,9 @@ func parseValue(b []byte, c *cache) (v *Value, tail []byte, err error) {
 		return valueFalse, b[1:], nil
 	case TypeNull:
 		return valueNull, b[1:], nil
+	default:
+		return nil, nil, fmt.Errorf("unknown type %d", Type(b[0]))
 	}
-	return
 }
 
 func parseObject(b []byte, c *cache) (*Value, []byte, error) {
@@ -146,8 +147,11 @@ func parseObject(b []byte, c *cache) (*Value, []byte, error) {
 		}
 		if c != nil {
 			o.o.kvs = slices.Grow(o.o.kvs, 1)[:i+1]
-			o.o.kvs[i].keyBuf = slices.Grow(o.o.kvs[i].keyBuf[:0], len(b[:eosI]))[:len(b[:eosI])]
-			o.o.kvs[i].key = unsafe.String(unsafe.SliceData(b[:eosI]), len(b[:eosI]))
+			if len(b[:eosI]) == 1 && b[0] == emptyKey {
+				o.o.kvs[i].key = ""
+			} else {
+				o.o.kvs[i].key = unsafe.String(unsafe.SliceData(b[:eosI]), len(b[:eosI]))
+			}
 			if o.o.kvs[i].value, b, err = parseValue(b[eosI+1:], c); err != nil {
 				return nil, nil, err
 			}
