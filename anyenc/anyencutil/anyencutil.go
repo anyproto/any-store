@@ -45,6 +45,8 @@ func Equal(a, b *anyenc.Value) bool {
 		return bytes.Equal(a.GetStringBytes(), b.GetStringBytes())
 	case anyenc.TypeNumber:
 		return a.GetFloat64() == b.GetFloat64()
+	case anyenc.TypeBinary:
+		return bytes.Equal(a.GetBytes(), b.GetBytes())
 	}
 	return true
 }
