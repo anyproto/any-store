@@ -40,6 +40,35 @@ func TestEqual(t *testing.T) {
 			assert.False(t, Equal(anyenc.MustParseJson(v[0]), anyenc.MustParseJson(v[1])), v[0], v[1])
 		}
 	})
+	t.Run("bytes type", func(t *testing.T) {
+		arena := &anyenc.Arena{}
+
+		bytes1 := []byte{1, 2, 3, 4, 5}
+		bytes2 := []byte{1, 2, 3, 4, 5}
+		bytes3 := []byte{1, 2, 3, 4, 6}
+
+		val1 := arena.NewBinary(bytes1)
+		val2 := arena.NewBinary(bytes2)
+		val3 := arena.NewBinary(bytes3)
+
+		assert.True(t, Equal(val1, val2))
+		assert.False(t, Equal(val1, val3))
+
+		emptyBytes1 := arena.NewBinary([]byte{})
+		emptyBytes2 := arena.NewBinary([]byte{})
+		assert.True(t, Equal(emptyBytes1, emptyBytes2))
+		assert.False(t, Equal(emptyBytes1, val1))
+	})
+	t.Run("bytes vs other types", func(t *testing.T) {
+		arena := &anyenc.Arena{}
+
+		bytesVal := arena.NewBinary([]byte{1, 2, 3})
+		strVal := anyenc.MustParseJson(`"123"`)
+		numVal := anyenc.MustParseJson(`123`)
+
+		assert.False(t, Equal(bytesVal, strVal))
+		assert.False(t, Equal(bytesVal, numVal))
+	})
 }
 
 func BenchmarkEqual(b *testing.B) {
