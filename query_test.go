@@ -303,6 +303,34 @@ func TestCollQuery_Explain(t *testing.T) {
 			)
 		})
 	})
+	t.Run("composite index", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "test_comp")
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(`{"id":1, "a":1, "b":1}`),
+			anyenc.MustParseJson(`{"id":2, "a":1, "b":2}`),
+			anyenc.MustParseJson(`{"id":3, "a":1, "b":3}`),
+			anyenc.MustParseJson(`{"id":4, "a":2, "b":1}`),
+			anyenc.MustParseJson(`{"id":5, "a":2, "b":2}`),
+			anyenc.MustParseJson(`{"id":6, "a":2, "b":3}`),
+		))
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}}))
+
+		assertExplain(t, coll.Find(`{"a":1}`),
+			"SELECT data FROM '_test_comp_docs' JOIN '_test_comp_a,b_idx' ON '_test_comp_a,b_idx'.docId = id WHERE  (('_test_comp_a,b_idx'.val0 = :val_1_0_0)) AND any_filter(1, data)",
+			"SEARCH _test_comp_a,b_idx USING COVERING INDEX sqlite_autoindex__test_comp_a,b_idx_1 (val0=?)\nSEARCH _test_comp_docs USING INDEX sqlite_autoindex__test_comp_docs_1 (id=?)",
+		)
+
+		assertExplain(t, coll.Find(`{"a":1,"b":2}`),
+			"SELECT data FROM '_test_comp_docs' JOIN '_test_comp_a,b_idx' ON '_test_comp_a,b_idx'.docId = id WHERE  (('_test_comp_a,b_idx'.val0 = :val_1_0_0)) AND (('_test_comp_a,b_idx'.val1 = :val_1_1_0)) AND any_filter(1, data)",
+			"SEARCH _test_comp_a,b_idx USING COVERING INDEX sqlite_autoindex__test_comp_a,b_idx_1 (val0=? AND val1=?)\nSEARCH _test_comp_docs USING INDEX sqlite_autoindex__test_comp_docs_1 (id=?)",
+		)
+
+		assertExplain(t, coll.Find(`{"b":2}`),
+			"SELECT data FROM '_test_comp_docs' JOIN '_test_comp_a,b_idx' ON '_test_comp_a,b_idx'.docId = id WHERE  (('_test_comp_a,b_idx'.val1 = :val_1_0_0)) AND any_filter(1, data)",
+			"SCAN _test_comp_a,b_idx\nSEARCH _test_comp_docs USING INDEX sqlite_autoindex__test_comp_docs_1 (id=?)",
+		)
+	})
 }
 
 func assertQueryCount(t testing.TB, q Query, exp int) {
