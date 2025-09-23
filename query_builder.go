@@ -119,7 +119,7 @@ func (qb *queryBuilder) build(count bool) string {
 		}
 
 		if len(b.Start) != 0 {
-			writeTableVal(join.tableName, valNum)
+			writeTableVal(join.tableName, fieldNum)
 			if b.StartInclude {
 				qb.buf.WriteString(" >= ")
 			} else {
@@ -132,7 +132,7 @@ func (qb *queryBuilder) build(count bool) string {
 			if len(b.Start) != 0 {
 				writeAnd()
 			}
-			writeTableVal(join.tableName, valNum)
+			writeTableVal(join.tableName, fieldNum)
 			if b.EndInclude {
 				qb.buf.WriteString(" <= ")
 			} else {

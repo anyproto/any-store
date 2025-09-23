@@ -330,6 +330,16 @@ func TestCollQuery_Explain(t *testing.T) {
 			"SELECT data FROM '_test_comp_docs' JOIN '_test_comp_a,b_idx' ON '_test_comp_a,b_idx'.docId = id WHERE  (('_test_comp_a,b_idx'.val1 = :val_1_0_0)) AND any_filter(1, data)",
 			"SCAN _test_comp_a,b_idx\nSEARCH _test_comp_docs USING INDEX sqlite_autoindex__test_comp_docs_1 (id=?)",
 		)
+
+		assertExplain(t, coll.Find(`{"b":{"$gt":1}}`),
+			"SELECT data FROM '_test_comp_docs' JOIN '_test_comp_a,b_idx' ON '_test_comp_a,b_idx'.docId = id WHERE  (('_test_comp_a,b_idx'.val1 > :val_1_0_0)) AND any_filter(1, data)",
+			"SCAN _test_comp_a,b_idx\nSEARCH _test_comp_docs USING INDEX sqlite_autoindex__test_comp_docs_1 (id=?)",
+		)
+
+		assertExplain(t, coll.Find(`{"b":{"$lte":1}}`),
+			"SELECT data FROM '_test_comp_docs' JOIN '_test_comp_a,b_idx' ON '_test_comp_a,b_idx'.docId = id WHERE  (('_test_comp_a,b_idx'.val1 <= :val_1_0_0_end)) AND any_filter(1, data)",
+			"SCAN _test_comp_a,b_idx\nSEARCH _test_comp_docs USING INDEX sqlite_autoindex__test_comp_docs_1 (id=?)",
+		)
 	})
 }
 
