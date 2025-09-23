@@ -1,3 +1,5 @@
+github.com/anyproto/any-store v0.3.8-0.20250923132448-a9d11eb70600 h1:th7fBWdWR4/QIou+Jv0WAKwml3jJ9eMx516mshrCZUo=
+github.com/anyproto/any-store v0.3.8-0.20250923132448-a9d11eb70600/go.mod h1:P9CnoL9Q06eh051DwtcvCiiWCwdXO7AbEILcnD6yrss=
 github.com/anyproto/go-sqlite v1.4.2-any h1:ZTIcq/u2mYYJ6rJB4I3Ds5QH/7IlONebMiG14FyZcD4=
 github.com/anyproto/go-sqlite v1.4.2-any/go.mod h1:nW7TvS+4bzPU2vNaPlPFNPYcejK5RdjH6qZY2kjT3Io=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
