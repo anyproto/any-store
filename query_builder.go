@@ -37,7 +37,12 @@ type queryBuilder struct {
 type qbJoin struct {
 	idx       *index
 	tableName string
-	bounds    []query.Bounds
+	bounds    []qbBounds
+}
+
+type qbBounds struct {
+	fieldNum int
+	bounds   query.Bounds
 }
 
 type qbSort struct {
@@ -102,14 +107,14 @@ func (qb *queryBuilder) build(count bool) string {
 		}
 	}
 
-	var writeBound = func(join qbJoin, tableNum, fieldNum, boundNum int) {
-		b := join.bounds[fieldNum][boundNum]
+	var writeBound = func(join qbJoin, tableNum, valNum, boundNum, fieldNum int) {
+		b := join.bounds[valNum].bounds[boundNum]
 
 		// fast eq case
 		if b.StartInclude && b.EndInclude && bytes.Equal(b.Start, b.End) {
 			writeTableVal(join.tableName, fieldNum)
 			qb.buf.WriteString(" = ")
-			writePlaceholder(tableNum, fieldNum, boundNum, false, b.Start)
+			writePlaceholder(tableNum, valNum, boundNum, false, b.Start)
 			return
 		}
 
@@ -120,7 +125,7 @@ func (qb *queryBuilder) build(count bool) string {
 			} else {
 				qb.buf.WriteString(" > ")
 			}
-			writePlaceholder(tableNum, fieldNum, boundNum, false, b.Start)
+			writePlaceholder(tableNum, valNum, boundNum, false, b.Start)
 			needAnd = true
 		}
 		if len(b.End) != 0 {
@@ -133,7 +138,7 @@ func (qb *queryBuilder) build(count bool) string {
 			} else {
 				qb.buf.WriteString(" < ")
 			}
-			writePlaceholder(tableNum, fieldNum, boundNum, true, b.End)
+			writePlaceholder(tableNum, valNum, boundNum, true, b.End)
 			needAnd = true
 		}
 
@@ -146,22 +151,22 @@ func (qb *queryBuilder) build(count bool) string {
 
 		writeWhere()
 		writeAnd()
-		for fieldNum, bounds := range join.bounds {
-			if len(bounds) == 0 {
+		for valNum, bounds := range join.bounds {
+			if len(bounds.bounds) == 0 {
 				continue
 			}
-			if fieldNum != 0 {
+			if valNum != 0 {
 				qb.buf.WriteString(" AND (")
 			} else {
 				qb.buf.WriteString(" (")
 			}
-			for i := range bounds {
+			for i := range bounds.bounds {
 				if i != 0 {
 					qb.buf.WriteString(" OR (")
 				} else {
 					qb.buf.WriteString("(")
 				}
-				writeBound(join, tableNum, fieldNum, i)
+				writeBound(join, tableNum, valNum, i, bounds.fieldNum)
 				qb.buf.WriteString(")")
 			}
 			qb.buf.WriteString(")")
@@ -169,7 +174,7 @@ func (qb *queryBuilder) build(count bool) string {
 	}
 
 	if len(qb.idBounds) > 0 {
-		writeBounds(qbJoin{bounds: []query.Bounds{qb.idBounds}}, 0)
+		writeBounds(qbJoin{bounds: []qbBounds{{bounds: qb.idBounds}}}, 0)
 	}
 
 	for tableNum, join := range qb.joins {

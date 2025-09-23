@@ -472,7 +472,10 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 		}
 		idx.queryFieldsBits.Iterate(func(j int) {
 			if len(q.queryFields[j].bounds) != 0 {
-				join.bounds = append(join.bounds, q.queryFields[j].bounds)
+				join.bounds = append(join.bounds, qbBounds{
+					fieldNum: slices.Index(idx.fieldNames, q.queryFields[j].field),
+					bounds:   q.queryFields[j].bounds,
+				})
 				used = true
 			}
 		})
