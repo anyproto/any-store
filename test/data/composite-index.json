@@ -1,0 +1,41 @@
+{
+  "tests" : [
+    { "cond" : {"a": 1}, "expectedIds": [1,2,3] },
+    { "cond" : {"a": 1}, "expectedIds": [3,2,1], "sort" : ["-id"] },
+    { "cond" : {"a": 1, "b": {"$gt": 1}}, "expectedIds": [2,3] },
+    { "cond" : {"b": 2}, "expectedIds": [2,5] },
+    { "cond" : {"b": {"$lt": 2}}, "expectedIds": [1,4] },
+
+    { "cond": {"a": 2}, "expectedIds": [4,5,6] },
+    { "cond": {"a": 1}, "sort": ["-b"], "expectedIds": [3,2,1] },
+    { "cond": {"a": 2, "b": {"$lt": 3}}, "expectedIds": [4,5] },
+    { "cond": {"a": 2, "b": {"$gt": 1}}, "expectedIds": [5,6] },
+    { "cond": {"a": 1, "b": {"$lt": 3}}, "expectedIds": [1,2] },
+    { "cond": {"b": {"$gt": 1}}, "expectedIds": [2,3,5,6] },
+
+    { "cond": {"b": {"$gt": 1}, "id": {"$lt": 6}}, "expectedIds": [2,3,5] },
+    { "cond": {"a": 1, "id": {"$gt": 1}}, "expectedIds": [2,3] },
+    { "cond": {"b": 2, "id": {"$gt": 2}}, "expectedIds": [5] },
+    { "cond": {"a": 2, "id": {"$lt": 6}}, "expectedIds": [4,5] },
+
+    { "cond": {"a": 1, "b": {"$gt": 1}}, "sort": ["-b","id"], "expectedIds": [3,2] },
+    { "cond": {}, "sort": ["a","b"], "expectedIds": [1,2,3,4,5,6] },
+    { "cond": {}, "sort": ["a","-b","id"], "expectedIds": [3,2,1,6,5,4] },
+    { "cond": {"b": 1}, "sort": ["-a","id"], "expectedIds": [4,1] },
+
+    { "cond": {"a": 2, "b": 3}, "expectedIds": [6] },
+    { "cond": {"a": {"$gt": 1}, "b": {"$lt": 3}}, "expectedIds": [4,5] },
+    { "cond": {"a": {"$gt": 0}}, "sort": ["b","a","id"], "expectedIds": [1,4,2,5,3,6] }
+  ],
+  "data": [
+    {"id": 1, "a": 1, "b": 1},
+    {"id": 2, "a": 1, "b": 2},
+    {"id": 3, "a": 1, "b": 3},
+    {"id": 4, "a": 2, "b": 1},
+    {"id": 5, "a": 2, "b": 2},
+    {"id": 6, "a": 2, "b": 3}
+  ],
+  "indexes": [
+    ["a", "b"]
+  ]
+}
