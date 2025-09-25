@@ -12,13 +12,13 @@ import (
 )
 
 type Options struct {
-	IdleAfter     time.Duration
-	AcquireWrite  func(ctx context.Context, fn func(conn *driver.Conn) error) error
-	Flush         func(ctx context.Context, conn *driver.Conn) (Stats, error)
-	Trackers      []Tracker
-	OnIdleSafe    []OnIdleSafeCallback
-	Logger        *log.Logger
-	Clock         Clock
+	IdleAfter           time.Duration
+	ForceFlushIdleAfter time.Duration // Idle threshold for force flush (default 100ms)
+	AcquireWrite        func(ctx context.Context, fn func(conn *driver.Conn) error) error
+	Flush               func(ctx context.Context, conn *driver.Conn) (Stats, error)
+	Trackers            []Tracker
+	OnIdleSafe          []OnIdleSafeCallback
+	Logger              *log.Logger
 }
 
 type Controller struct {
@@ -37,8 +37,8 @@ func NewController(opts Options) *Controller {
 	if opts.IdleAfter <= 0 {
 		opts.IdleAfter = 20 * time.Second
 	}
-	if opts.Clock == nil {
-		opts.Clock = RealClock{}
+	if opts.ForceFlushIdleAfter <= 0 {
+		opts.ForceFlushIdleAfter = 100 * time.Millisecond
 	}
 	if opts.Logger == nil {
 		opts.Logger = log.New(log.Writer(), "[recovery] ", log.LstdFlags)
@@ -146,7 +146,7 @@ func (c *Controller) idleLoop() {
 			return
 		case <-c.timer.C:
 			lastWriteTime, ok := c.lastWriteTime.Load().(time.Time)
-			idleTime := c.opts.Clock.Now().Sub(lastWriteTime)
+			idleTime := time.Since(lastWriteTime)
 
 			if !ok || idleTime >= c.opts.IdleAfter {
 				flushed, err := c.performFlush(c.ctx)
@@ -171,6 +171,10 @@ func (c *Controller) idleLoop() {
 }
 
 func (c *Controller) performFlush(ctx context.Context) (bool, error) {
+	return c.performFlushInternal(ctx, c.opts.IdleAfter)
+}
+
+func (c *Controller) performFlushInternal(ctx context.Context, idleAfter time.Duration) (bool, error) {
 	var stats Stats
 	var flushed bool
 
@@ -179,9 +183,9 @@ func (c *Controller) performFlush(ctx context.Context) (bool, error) {
 		// Someone might have done writes while we were waiting
 		lastWriteTime, ok := c.lastWriteTime.Load().(time.Time)
 		if ok {
-			idleTime := c.opts.Clock.Now().Sub(lastWriteTime)
-			if idleTime < c.opts.IdleAfter {
-				// Not idle anymore, skip flush
+			idleTime := time.Since(lastWriteTime)
+			if idleTime < idleAfter {
+				// Not idle enough, skip flush
 				return nil
 			}
 		}
@@ -232,6 +236,39 @@ func (c *Controller) LastFlushStats() (Stats, bool) {
 		return v.(Stats), true
 	}
 	return Stats{}, false
+}
+
+func (c *Controller) ForceFlush(ctx context.Context) error {
+	if c == nil {
+		return fmt.Errorf("controller is nil")
+	}
+
+	// Keep trying to flush with short idle threshold until successful or context cancelled
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("force flush cancelled: %w", ctx.Err())
+		default:
+		}
+
+		flushed, err := c.performFlushInternal(ctx, c.opts.ForceFlushIdleAfter)
+		if err != nil {
+			return fmt.Errorf("force flush failed: %w", err)
+		}
+
+		if flushed {
+			// Successfully flushed
+			return nil
+		}
+
+		// Not idle enough yet, wait a bit and retry
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("force flush cancelled: %w", ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+			// Short wait before retry
+		}
+	}
 }
 
 func defaultFlush(ctx context.Context, conn *driver.Conn) (Stats, error) {

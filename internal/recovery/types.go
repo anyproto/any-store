@@ -6,12 +6,12 @@ import (
 )
 
 type Stats struct {
-	LastFlushTime     time.Time
-	FlushDuration     time.Duration
-	BytesFlushed      int64
-	WalFramesFlushed  int
-	CheckpointMode    string
-	Success           bool
+	LastFlushTime    time.Time
+	FlushDuration    time.Duration
+	BytesFlushed     int64
+	WalFramesFlushed int
+	CheckpointMode   string
+	Success          bool
 }
 
 type Tracker interface {
@@ -22,18 +22,3 @@ type Tracker interface {
 }
 
 type OnIdleSafeCallback func(stats Stats)
-
-type Clock interface {
-	Now() time.Time
-	After(d time.Duration) <-chan time.Time
-}
-
-type RealClock struct{}
-
-func (RealClock) Now() time.Time {
-	return time.Now()
-}
-
-func (RealClock) After(d time.Duration) <-chan time.Time {
-	return time.After(d)
-}

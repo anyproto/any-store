@@ -63,6 +63,11 @@ type RecoveryConfig struct {
 	// Default: 20s
 	IdleAfter time.Duration
 
+	// ForceFlushIdleAfter is the idle threshold used for ForceFlush
+	// This is shorter than IdleAfter to ensure quick flush on app suspension
+	// Default: 100ms
+	ForceFlushIdleAfter time.Duration
+
 	// CheckpointMode specifies the WAL checkpoint mode to use during idle flush
 	// Default: CheckpointPassive
 	CheckpointMode CheckpointMode
@@ -107,6 +112,9 @@ func (c *Config) setDefaults() {
 	if c.Recovery.Enabled {
 		if c.Recovery.IdleAfter <= 0 {
 			c.Recovery.IdleAfter = 20 * time.Second
+		}
+		if c.Recovery.ForceFlushIdleAfter <= 0 {
+			c.Recovery.ForceFlushIdleAfter = 100 * time.Millisecond
 		}
 		if c.Recovery.CheckpointMode == "" {
 			c.Recovery.CheckpointMode = CheckpointPassive

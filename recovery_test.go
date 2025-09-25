@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/internal/driver"
 	"github.com/anyproto/any-store/internal/recovery"
 )
 
@@ -258,4 +260,130 @@ func TestRecovery_CheckpointModes(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestRecovery_ForceFlush(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	flushCount := 0
+	config := &Config{
+		Recovery: RecoveryConfig{
+			Enabled:             true,
+			IdleAfter:           10 * time.Second,      // Very long idle time
+			ForceFlushIdleAfter: 10 * time.Millisecond, // Short threshold for force flush
+			OnIdleSafe: []recovery.OnIdleSafeCallback{
+				func(stats recovery.Stats) {
+					flushCount++
+				},
+			},
+		},
+	}
+
+	ctx := context.Background()
+	db, err := Open(ctx, dbPath, config)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Create collection and add data
+	coll, err := db.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+
+	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":1, "data":"test"}`))
+	require.NoError(t, err)
+
+	// Wait just a bit to ensure we meet the ForceFlushIdleAfter threshold
+	time.Sleep(15 * time.Millisecond)
+
+	// Force flush immediately - should work even though not idle for regular flush
+	err = db.ForceFlush(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, flushCount, "ForceFlush should trigger callback")
+
+	// Check recovery state
+	state := db.RecoveryState()
+	assert.True(t, state.Enabled)
+	assert.True(t, state.Success)
+
+	// Force flush again
+	err = db.ForceFlush(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, flushCount, "Second ForceFlush should also work")
+}
+
+func TestRecovery_ForceFlushNotEnabled(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	// Recovery disabled
+	config := &Config{}
+
+	ctx := context.Background()
+	db, err := Open(ctx, dbPath, config)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// ForceFlush should return error when recovery is not enabled
+	err = db.ForceFlush(ctx)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "recovery is not enabled")
+}
+
+func TestRecovery_ForceFlushWithTimeout(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	shouldBlock := true
+	blockMutex := &sync.Mutex{}
+	config := &Config{
+		Recovery: RecoveryConfig{
+			Enabled:             true,
+			IdleAfter:           10 * time.Second,
+			ForceFlushIdleAfter: 10 * time.Millisecond,
+			Flush: func(ctx context.Context, conn *driver.Conn) (recovery.Stats, error) {
+				blockMutex.Lock()
+				block := shouldBlock
+				blockMutex.Unlock()
+
+				if block {
+					// Block until context is cancelled
+					<-ctx.Done()
+					return recovery.Stats{}, ctx.Err()
+				}
+				return recovery.Stats{Success: true}, nil
+			},
+		},
+	}
+
+	ctx := context.Background()
+	db, err := Open(ctx, dbPath, config)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Do a write so we have a lastWriteTime
+	coll, err := db.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`))
+	require.NoError(t, err)
+
+	// Wait a bit to meet ForceFlushIdleAfter threshold
+	time.Sleep(15 * time.Millisecond)
+
+	// Try force flush with timeout - should fail due to blocking
+	ctxTimeout, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+
+	err = db.ForceFlush(ctxTimeout)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "context deadline exceeded")
+
+	// Now unblock and try again
+	blockMutex.Lock()
+	shouldBlock = false
+	blockMutex.Unlock()
+
+	ctxTimeout2, cancel2 := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel2()
+	err = db.ForceFlush(ctxTimeout2)
+	assert.NoError(t, err)
 }

@@ -3,6 +3,7 @@ package recovery
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,7 +42,6 @@ func (m *mockTracker) MarkClean() {
 func (m *mockTracker) Close() error {
 	return nil
 }
-
 
 func TestController_OnOpen(t *testing.T) {
 	tracker := &mockTracker{dirty: true}
@@ -213,9 +213,8 @@ func TestController_RaceConditionWriteDuringFlush(t *testing.T) {
 	flushAttempted := false
 
 	controller := NewController(Options{
-		IdleAfter: 200 * time.Millisecond,  // Use larger idle time for test stability
+		IdleAfter: 200 * time.Millisecond, // Use larger idle time for test stability
 		Trackers:  []Tracker{tracker},
-		Clock:     RealClock{},
 		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
 			// Signal that acquire was called
 			select {
@@ -283,7 +282,7 @@ func TestController_FlushAfterWriteDelay(t *testing.T) {
 	proceedWithAcquire := make(chan struct{})
 
 	controller := NewController(Options{
-		IdleAfter: 200 * time.Millisecond,  // Use larger idle time for test stability
+		IdleAfter: 200 * time.Millisecond, // Use larger idle time for test stability
 		Trackers:  []Tracker{tracker},
 		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
 			// Signal that acquire started
@@ -356,7 +355,6 @@ func TestController_MultipleWritesDuringFlush(t *testing.T) {
 	controller := NewController(Options{
 		IdleAfter: 100 * time.Millisecond,
 		Trackers:  []Tracker{tracker},
-		Clock:     RealClock{},
 		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
 			select {
 			case writeConnAcquired <- struct{}{}:
@@ -407,4 +405,232 @@ func TestController_MultipleWritesDuringFlush(t *testing.T) {
 	// Should have skipped flush due to recent writes
 	assert.Equal(t, 0, flushCount, "Flush should be skipped due to recent writes")
 	assert.Equal(t, 0, tracker.cleanCount, "Should not mark clean when flush is skipped")
+}
+
+func TestController_ForceFlush(t *testing.T) {
+	tracker := &mockTracker{}
+	flushCount := 0
+
+	controller := NewController(Options{
+		IdleAfter: 10 * time.Second, // Very long idle time
+		Trackers:  []Tracker{tracker},
+		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+			return fn(nil)
+		},
+		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
+			flushCount++
+			return Stats{
+				LastFlushTime:  time.Now(),
+				CheckpointMode: "PASSIVE",
+				Success:        true,
+			}, nil
+		},
+	})
+
+	ctx := context.Background()
+
+	// ForceFlush should work even if controller is not started
+	err := controller.ForceFlush(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, flushCount, "ForceFlush should execute even without Start")
+	assert.Equal(t, 1, tracker.cleanCount, "Should mark clean after force flush")
+
+	// Start the controller
+	err = controller.Start(ctx)
+	require.NoError(t, err)
+	defer controller.Stop()
+
+	// Write event - very recent
+	controller.OnWriteEvent(driver.Event{
+		Type: driver.EventReleaseWrite,
+		When: time.Now(),
+	})
+
+	// ForceFlush should work immediately even though we're not idle
+	err = controller.ForceFlush(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, flushCount, "ForceFlush should execute immediately")
+	assert.Equal(t, 2, tracker.cleanCount, "Should mark clean after force flush")
+}
+
+func TestController_ForceFlushWithTimeout(t *testing.T) {
+	tracker := &mockTracker{}
+	flushCount := 0
+	blockFlush := make(chan struct{})
+
+	controller := NewController(Options{
+		IdleAfter: 10 * time.Second,
+		Trackers:  []Tracker{tracker},
+		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+			// Simulate slow acquire
+			select {
+			case <-blockFlush:
+				return fn(nil)
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
+			flushCount++
+			return Stats{}, nil
+		},
+	})
+
+	// Try force flush with short timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err := controller.ForceFlush(ctx)
+	assert.Error(t, err, "ForceFlush should timeout")
+	assert.Contains(t, err.Error(), "context deadline exceeded")
+	assert.Equal(t, 0, flushCount, "Flush should not execute on timeout")
+
+	// Now let it succeed
+	close(blockFlush)
+	err = controller.ForceFlush(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, 1, flushCount, "Flush should execute after unblocking")
+}
+
+func TestController_ForceFlushConcurrent(t *testing.T) {
+	tracker := &mockTracker{}
+	flushCount := int32(0)
+
+	controller := NewController(Options{
+		IdleAfter: 10 * time.Second,
+		Trackers:  []Tracker{tracker},
+		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+			// Simulate some work
+			time.Sleep(10 * time.Millisecond)
+			return fn(nil)
+		},
+		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
+			atomic.AddInt32(&flushCount, 1)
+			return Stats{
+				LastFlushTime:  time.Now(),
+				CheckpointMode: "PASSIVE",
+				Success:        true,
+			}, nil
+		},
+	})
+
+	ctx := context.Background()
+	err := controller.Start(ctx)
+	require.NoError(t, err)
+	defer controller.Stop()
+
+	// Launch multiple concurrent force flushes
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := controller.ForceFlush(context.Background())
+			assert.NoError(t, err)
+		}()
+	}
+
+	wg.Wait()
+
+	// All should succeed, each performing a flush
+	assert.Equal(t, int32(5), atomic.LoadInt32(&flushCount), "All force flushes should execute")
+}
+
+func TestController_ForceFlushWithActiveWrites(t *testing.T) {
+	tracker := &mockTracker{}
+	flushCount := 0
+	attemptCount := 0
+
+	controller := NewController(Options{
+		IdleAfter:           10 * time.Second,
+		ForceFlushIdleAfter: 50 * time.Millisecond,
+		Trackers:            []Tracker{tracker},
+		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+			attemptCount++
+			return fn(nil)
+		},
+		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
+			flushCount++
+			return Stats{
+				LastFlushTime:  time.Now(),
+				CheckpointMode: "PASSIVE",
+				Success:        true,
+			}, nil
+		},
+	})
+
+	ctx := context.Background()
+	err := controller.Start(ctx)
+	require.NoError(t, err)
+	defer controller.Stop()
+
+	// Test 1: Write old enough - should flush immediately
+	controller.OnWriteEvent(driver.Event{
+		Type: driver.EventReleaseWrite,
+		When: time.Now().Add(-60 * time.Millisecond),
+	})
+
+	err = controller.ForceFlush(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, flushCount, "Should flush with 60ms old write")
+	assert.Equal(t, 1, attemptCount, "Should succeed on first attempt")
+
+	// Test 2: Very recent write - should retry until idle
+	attemptCount = 0
+	go func() {
+		// Simulate ongoing writes that stop after 30ms
+		for i := 0; i < 3; i++ {
+			time.Sleep(10 * time.Millisecond)
+			controller.OnWriteEvent(driver.Event{
+				Type: driver.EventReleaseWrite,
+				When: time.Now(),
+			})
+		}
+	}()
+
+	// Give writes a moment to start
+	time.Sleep(5 * time.Millisecond)
+
+	// ForceFlush should retry a few times then succeed
+	err = controller.ForceFlush(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, flushCount, "Should eventually flush")
+	assert.GreaterOrEqual(t, attemptCount, 1, "Should require at least one attempt")
+
+	// Test 3: Context cancellation during retry
+	attemptCount = 0
+
+	// Simulate continuous writes that keep updating lastWriteTime
+	stopWrites := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stopWrites:
+				return
+			default:
+				controller.OnWriteEvent(driver.Event{
+					Type: driver.EventReleaseWrite,
+					When: time.Now(),
+				})
+				time.Sleep(5 * time.Millisecond) // Write every 5ms
+			}
+		}
+	}()
+
+	// Give writes a moment to start
+	time.Sleep(10 * time.Millisecond)
+
+	// Try force flush with very short timeout - should fail due to continuous writes
+	// Since ForceFlushIdleAfter is 50ms and we write every 5ms, it will never be idle enough
+	ctxTimeout, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
+	defer cancel()
+
+	err = controller.ForceFlush(ctxTimeout)
+	close(stopWrites) // Stop writes after test
+
+	assert.Error(t, err)
+	if err != nil {
+		assert.Contains(t, err.Error(), "cancelled")
+	}
+	assert.GreaterOrEqual(t, attemptCount, 2, "Should have tried multiple times before timeout")
 }

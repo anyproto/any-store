@@ -69,6 +69,12 @@ type DB interface {
 	// Returns empty stats if recovery is not enabled.
 	RecoveryState() RecoveryStats
 
+	// ForceFlush performs an immediate flush and WAL checkpoint.
+	// This is useful when the app needs to ensure durability before suspension (e.g., going to background).
+	// It waits for any active write transactions to complete before flushing.
+	// Returns an error if the flush fails or if recovery is not enabled.
+	ForceFlush(ctx context.Context) error
+
 	// Close closes the database connection.
 	// Returns an error if there is an issue closing the connection.
 	Close() error
@@ -180,10 +186,10 @@ type db struct {
 
 	config *Config
 
-	cm               *driver.ConnManager
+	cm                 *driver.ConnManager
 	recoveryController *recovery.Controller
-	filterReg        *registry.FilterRegistry
-	sortReg          *registry.SortRegistry
+	filterReg          *registry.FilterRegistry
+	sortReg            *registry.SortRegistry
 
 	syncPool *syncpool.SyncPool
 
@@ -608,11 +614,12 @@ func (db *db) setupRecovery(ctx context.Context, path string) error {
 
 	// Create controller
 	opts := recovery.Options{
-		IdleAfter:    db.config.Recovery.IdleAfter,
-		AcquireWrite: db.withWriteConn,
-		Flush:        flushFunc,
-		Trackers:     trackers,
-		OnIdleSafe:   onIdleSafe,
+		IdleAfter:           db.config.Recovery.IdleAfter,
+		ForceFlushIdleAfter: db.config.Recovery.ForceFlushIdleAfter,
+		AcquireWrite:        db.withWriteConn,
+		Flush:               flushFunc,
+		Trackers:            trackers,
+		OnIdleSafe:          onIdleSafe,
 	}
 
 	db.recoveryController = recovery.NewController(opts)
@@ -662,6 +669,14 @@ func (db *db) RecoveryState() RecoveryStats {
 		CheckpointMode:   stats.CheckpointMode,
 		Success:          stats.Success,
 	}
+}
+
+func (db *db) ForceFlush(ctx context.Context) error {
+	if db.recoveryController == nil {
+		return fmt.Errorf("recovery is not enabled")
+	}
+
+	return db.recoveryController.ForceFlush(ctx)
 }
 
 func (db *db) onCollectionClose(name string) {
