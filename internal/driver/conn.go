@@ -178,6 +178,15 @@ func (c *Conn) Backup(ctx context.Context, path string) (err error) {
 	return
 }
 
+func (c *Conn) Fsync(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.isClosed {
+		return ErrDBIsClosed
+	}
+	return sqlitex.ExecTransient(c.conn, "PRAGMA synchronous = FULL", nil)
+}
+
 func (c *Conn) newStmt(stmt *sqlite.Stmt) *Stmt {
 	if dStmt := c.activeStmts[stmt]; dStmt != nil {
 		return dStmt

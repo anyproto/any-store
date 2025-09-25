@@ -1,8 +1,12 @@
 package anystore
 
 import (
+	"context"
 	"runtime"
 	"time"
+
+	"github.com/anyproto/any-store/internal/driver"
+	"github.com/anyproto/any-store/internal/recovery"
 )
 
 var defaultSQLiteOptions = map[string]string{
@@ -38,6 +42,48 @@ type Config struct {
 	StalledConnectionsDetectorEnabled bool
 	// StalledConnectionsPanicOnClose enables panic on Close in case of any connection is not released after this timeout
 	StalledConnectionsPanicOnClose time.Duration
+
+	// RecoveryConfig provides configuration for crash recovery and idle durability
+	Recovery RecoveryConfig
+}
+
+type CheckpointMode string
+
+const (
+	CheckpointPassive  CheckpointMode = "PASSIVE"
+	CheckpointFull     CheckpointMode = "FULL"
+	CheckpointTruncate CheckpointMode = "TRUNCATE"
+)
+
+type RecoveryConfig struct {
+	// Enabled enables the recovery controller
+	Enabled bool
+
+	// IdleAfter is the duration to wait after the last write before performing an idle flush
+	// Default: 20s
+	IdleAfter time.Duration
+
+	// CheckpointMode specifies the WAL checkpoint mode to use during idle flush
+	// Default: CheckpointPassive
+	CheckpointMode CheckpointMode
+
+	// Flush is an optional custom flush function
+	// If nil, uses default flush (fsync + WAL checkpoint)
+	Flush func(ctx context.Context, conn *driver.Conn) (recovery.Stats, error)
+
+	// Trackers are recovery trackers to register with the controller
+	Trackers []recovery.Tracker
+
+	// OnIdleSafe are callbacks to invoke after successful idle flush
+	OnIdleSafe []recovery.OnIdleSafeCallback
+
+	// QuickCheckTimeout is the timeout for running QuickCheck on dirty database open
+	// Default: 5 minutes
+	QuickCheckTimeout time.Duration
+
+	// UseSentinel enables the default sentinel file tracker
+	// When true, creates a .lock file alongside the database to detect unclean shutdown
+	UseSentinel bool
 }
 
 func (c *Config) setDefaults() {
@@ -56,6 +102,18 @@ func (c *Config) setDefaults() {
 
 	if c.SQLiteGlobalPageCachePreallocateSizeBytes == 0 {
 		c.SQLiteGlobalPageCachePreallocateSizeBytes = 10 << 20
+	}
+
+	if c.Recovery.Enabled {
+		if c.Recovery.IdleAfter <= 0 {
+			c.Recovery.IdleAfter = 20 * time.Second
+		}
+		if c.Recovery.CheckpointMode == "" {
+			c.Recovery.CheckpointMode = CheckpointPassive
+		}
+		if c.Recovery.QuickCheckTimeout <= 0 {
+			c.Recovery.QuickCheckTimeout = 5 * time.Minute
+		}
 	}
 }
 
