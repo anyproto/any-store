@@ -16,6 +16,7 @@ Any Store brings schema‑less flexibility, rich indexes and ACID transactions t
 * **Automatic indexes** – create, ensure or drop compound & unique indexes at runtime.
 * **ACID transactions** – explicit read / write transactions plus convenience helpers.
 * **Streaming iterators** – low‑memory scans with cursor API.
+* **Crash recovery** – automatic WAL checkpoint and fsync after idle periods.
 * **CLI** – quick inspection, import/export and interactive shell.
 * **Cross‑platform** – pure Go, no CGO, runs anywhere Go runs.
 
@@ -90,6 +91,22 @@ The full end‑to‑end example lives in [`example/`](example) and in the [API 
 | **Encoding arena**  | Efficient [AnyEnc](anyenc) value arena to minimise GC churn                |
 | **Connection pool** | Separate read / write SQLite connections for concurrent workloads          |
 
+
+## Recovery
+
+Any Store includes crash recovery to ensure durability after unexpected shutdowns. When enabled, it creates a sentinel file (.lock) alongside the database to track dirty state. The sentinel is removed on clean shutdown or after successful idle flush, and recreated on the next write. If the database opens with the sentinel present (indicating a crash or unfinished writes), it runs a quick integrity check. During normal operation, it automatically performs WAL checkpoints and fsync after idle periods.
+
+```go
+db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
+    Recovery: anystore.RecoveryConfig{
+        Enabled:   true,
+        IdleAfter: 20 * time.Second,  // Flush after 20s of inactivity
+    },
+})
+
+// Force flush before app suspension
+db.ForceFlush(ctx)
+```
 
 
 ## Contributing
