@@ -20,26 +20,28 @@ const (
 // NewFlushFunc creates a flush function based on the given FlushMode.
 // Returns an error if the mode is invalid.
 func NewFlushFunc(mode FlushMode) (func(ctx context.Context, conn *driver.Conn) error, error) {
-	switch mode {
-	case FlushModeFsync, FlushModeCheckpointPassive, FlushModeCheckpointFull, FlushModeCheckpointRestart:
-		// Valid mode
-	case "":
-		// Default to passive
+	if mode == "" {
 		mode = FlushModeCheckpointPassive
+	}
+
+	switch mode {
+	case FlushModeFsync:
+		return func(ctx context.Context, conn *driver.Conn) error {
+			return conn.Fsync(ctx)
+		}, nil
+	case FlushModeCheckpointPassive:
+		return func(ctx context.Context, conn *driver.Conn) error {
+			return conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(PASSIVE)")
+		}, nil
+	case FlushModeCheckpointFull:
+		return func(ctx context.Context, conn *driver.Conn) error {
+			return conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(FULL)")
+		}, nil
+	case FlushModeCheckpointRestart:
+		return func(ctx context.Context, conn *driver.Conn) error {
+			return conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(RESTART)")
+		}, nil
 	default:
 		return nil, fmt.Errorf("invalid flush mode: %s", mode)
 	}
-
-	return func(ctx context.Context, conn *driver.Conn) error {
-		switch mode {
-		case FlushModeFsync:
-			return conn.Fsync(ctx)
-		case FlushModeCheckpointFull:
-			return conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(FULL)")
-		case FlushModeCheckpointRestart:
-			return conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(RESTART)")
-		default: // FlushModeCheckpointPassive
-			return conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(PASSIVE)")
-		}
-	}, nil
 }

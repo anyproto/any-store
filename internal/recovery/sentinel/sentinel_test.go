@@ -13,7 +13,7 @@ import (
 func TestSentinelTracker_OnOpen(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	sentinelPath := dbPath + ".lock"
+	sentinelPath := dbPath + lockFileSuffix
 
 	tracker, _ := New(dbPath)
 	ctx := context.Background()
@@ -40,7 +40,7 @@ func TestSentinelTracker_OnOpen(t *testing.T) {
 func TestSentinelTracker_MarkDirty(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	sentinelPath := dbPath + ".lock"
+	sentinelPath := dbPath + lockFileSuffix
 
 	tracker, _ := New(dbPath)
 
@@ -63,7 +63,7 @@ func TestSentinelTracker_MarkDirty(t *testing.T) {
 func TestSentinelTracker_MarkClean(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	sentinelPath := dbPath + ".lock"
+	sentinelPath := dbPath + lockFileSuffix
 
 	tracker, _ := New(dbPath)
 
@@ -88,7 +88,7 @@ func TestSentinelTracker_MarkClean(t *testing.T) {
 func TestSentinelTracker_OnIdleSafeCallback(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	sentinelPath := dbPath + ".lock"
+	sentinelPath := dbPath + lockFileSuffix
 
 	tracker, onIdleSafe := New(dbPath)
 
@@ -132,7 +132,7 @@ func TestSentinelTracker_ConcurrentAccess(t *testing.T) {
 func TestSentinelTracker_NestedDirectories(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "nested", "path", "test.db")
-	sentinelPath := dbPath + ".lock"
+	sentinelPath := dbPath + lockFileSuffix
 
 	tracker, _ := New(dbPath)
 

@@ -10,6 +10,8 @@ import (
 	"github.com/anyproto/any-store/internal/recovery"
 )
 
+const lockFileSuffix = ".lock"
+
 type SentinelTracker struct {
 	path    string
 	mu      sync.Mutex
@@ -17,7 +19,7 @@ type SentinelTracker struct {
 }
 
 func New(dbPath string) (*SentinelTracker, recovery.OnIdleSafeCallback) {
-	sentinelPath := dbPath + ".lock"
+	sentinelPath := dbPath + lockFileSuffix
 	tracker := &SentinelTracker{
 		path: sentinelPath,
 	}

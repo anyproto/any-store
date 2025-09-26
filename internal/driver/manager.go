@@ -33,8 +33,7 @@ type Config struct {
 	Version                   int
 	ReadConnTTL               time.Duration
 
-	// WriteObservers are callbacks for write connection events (unexported)
-	// will be called synchronously on acquire and release of the write connection
+	// WriteObservers will be called synchronously on acquire and release of the write connection
 	WriteObservers []WriteObserver
 }
 
