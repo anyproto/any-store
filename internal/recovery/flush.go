@@ -3,7 +3,6 @@ package recovery
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/anyproto/any-store/internal/driver"
 )
@@ -20,7 +19,7 @@ const (
 
 // NewFlushFunc creates a flush function based on the given FlushMode.
 // Returns an error if the mode is invalid.
-func NewFlushFunc(mode FlushMode) (func(ctx context.Context, conn *driver.Conn) (Stats, error), error) {
+func NewFlushFunc(mode FlushMode) (func(ctx context.Context, conn *driver.Conn) error, error) {
 	switch mode {
 	case FlushModeFsync, FlushModeCheckpointPassive, FlushModeCheckpointFull, FlushModeCheckpointRestart:
 		// Valid mode
@@ -31,34 +30,16 @@ func NewFlushFunc(mode FlushMode) (func(ctx context.Context, conn *driver.Conn) 
 		return nil, fmt.Errorf("invalid flush mode: %s", mode)
 	}
 
-	return func(ctx context.Context, conn *driver.Conn) (Stats, error) {
-		start := time.Now()
-		stats := Stats{
-			LastFlushTime: start,
-		}
-
-		var err error
+	return func(ctx context.Context, conn *driver.Conn) error {
 		switch mode {
 		case FlushModeFsync:
-			stats.CheckpointMode = "FSYNC_ONLY"
-			err = conn.Fsync(ctx)
+			return conn.Fsync(ctx)
 		case FlushModeCheckpointFull:
-			stats.CheckpointMode = "FULL"
-			err = conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(FULL)")
+			return conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(FULL)")
 		case FlushModeCheckpointRestart:
-			stats.CheckpointMode = "RESTART"
-			err = conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(RESTART)")
+			return conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(RESTART)")
 		default: // FlushModeCheckpointPassive
-			stats.CheckpointMode = "PASSIVE"
-			err = conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(PASSIVE)")
+			return conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(PASSIVE)")
 		}
-
-		if err != nil {
-			return stats, err
-		}
-
-		stats.FlushDuration = time.Since(start)
-		stats.Success = true
-		return stats, nil
 	}, nil
 }

@@ -64,9 +64,9 @@ func TestController_StartStop(t *testing.T) {
 		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
 			return fn(nil)
 		},
-		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
+		Flush: func(ctx context.Context, conn *driver.Conn) error {
 			flushCalled = true
-			return Stats{Success: true}, nil
+			return nil
 		},
 	})
 
@@ -97,7 +97,6 @@ func TestController_StartStop(t *testing.T) {
 func TestController_IdleFlush(t *testing.T) {
 	tracker := &mockTracker{}
 	flushCount := 0
-	var flushStats Stats
 
 	controller := NewController(Options{
 		IdleAfter: 100 * time.Millisecond,
@@ -105,16 +104,9 @@ func TestController_IdleFlush(t *testing.T) {
 		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
 			return fn(nil)
 		},
-		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
+		Flush: func(ctx context.Context, conn *driver.Conn) error {
 			flushCount++
-			flushStats = Stats{
-				LastFlushTime:  time.Now(),
-				FlushDuration:  100 * time.Millisecond,
-				BytesFlushed:   1024,
-				CheckpointMode: "PASSIVE",
-				Success:        true,
-			}
-			return flushStats, nil
+			return nil
 		},
 	})
 
@@ -136,15 +128,10 @@ func TestController_IdleFlush(t *testing.T) {
 	assert.Equal(t, 1, flushCount)
 	assert.Equal(t, 1, tracker.cleanCount)
 
-	// Verify last flush stats
-	stats, ok := controller.LastFlushStats()
-	assert.True(t, ok)
-	assert.Equal(t, flushStats.BytesFlushed, stats.BytesFlushed)
-	assert.True(t, stats.Success)
+	// Flush count already verified above
 }
 
 func TestController_OnIdleSafeCallback(t *testing.T) {
-	var callbackStats Stats
 	callbackCalled := false
 
 	controller := NewController(Options{
@@ -152,18 +139,12 @@ func TestController_OnIdleSafeCallback(t *testing.T) {
 		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
 			return fn(nil)
 		},
-		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
-			return Stats{
-				LastFlushTime:  time.Now(),
-				BytesFlushed:   2048,
-				CheckpointMode: "FULL",
-				Success:        true,
-			}, nil
+		Flush: func(ctx context.Context, conn *driver.Conn) error {
+			return nil
 		},
 		OnIdleSafe: []OnIdleSafeCallback{
-			func(stats Stats) {
+			func() {
 				callbackCalled = true
-				callbackStats = stats
 			},
 		},
 	})
@@ -185,9 +166,6 @@ func TestController_OnIdleSafeCallback(t *testing.T) {
 
 	// Verify callback was called
 	assert.True(t, callbackCalled)
-	assert.Equal(t, int64(2048), callbackStats.BytesFlushed)
-	assert.Equal(t, "FULL", callbackStats.CheckpointMode)
-	assert.True(t, callbackStats.Success)
 }
 
 func TestController_MarkDirtyClean(t *testing.T) {
@@ -228,13 +206,9 @@ func TestController_RaceConditionWriteDuringFlush(t *testing.T) {
 
 			return fn(nil)
 		},
-		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
+		Flush: func(ctx context.Context, conn *driver.Conn) error {
 			flushCount++
-			return Stats{
-				LastFlushTime:  time.Now(),
-				CheckpointMode: "PASSIVE",
-				Success:        true,
-			}, nil
+			return nil
 		},
 	})
 
@@ -298,13 +272,9 @@ func TestController_FlushAfterWriteDelay(t *testing.T) {
 			}
 			return fn(nil)
 		},
-		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
+		Flush: func(ctx context.Context, conn *driver.Conn) error {
 			flushCount++
-			return Stats{
-				LastFlushTime:  time.Now(),
-				CheckpointMode: "PASSIVE",
-				Success:        true,
-			}, nil
+			return nil
 		},
 	})
 
@@ -363,13 +333,9 @@ func TestController_MultipleWritesDuringFlush(t *testing.T) {
 			}
 			return fn(nil)
 		},
-		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
+		Flush: func(ctx context.Context, conn *driver.Conn) error {
 			flushCount++
-			return Stats{
-				LastFlushTime:  time.Now(),
-				CheckpointMode: "PASSIVE",
-				Success:        true,
-			}, nil
+			return nil
 		},
 	})
 
@@ -441,13 +407,9 @@ func TestController_ForceFlushBug(t *testing.T) {
 			}
 			return err
 		},
-		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
+		Flush: func(ctx context.Context, conn *driver.Conn) error {
 			flushCount++
-			return Stats{
-				LastFlushTime:  time.Now(),
-				CheckpointMode: "PASSIVE",
-				Success:        true,
-			}, nil
+			return nil
 		},
 	}
 
@@ -498,9 +460,9 @@ controller := NewController(Options{
 				return ctx.Err()
 			}
 		},
-		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
+		Flush: func(ctx context.Context, conn *driver.Conn) error {
 			// Not used by ForceFlush
-			return Stats{}, nil
+			return nil
 		},
 	})
 
@@ -537,13 +499,9 @@ controller := NewController(Options{
 			// We pass nil here since the flush function will handle it
 			return fn(nil)
 		},
-		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
+		Flush: func(ctx context.Context, conn *driver.Conn) error {
 			// Not used by ForceFlush
-			return Stats{
-				LastFlushTime:  time.Now(),
-				CheckpointMode: "PASSIVE",
-				Success:        true,
-			}, nil
+			return nil
 		},
 	})
 
@@ -586,13 +544,9 @@ controller := NewController(Options{
 			// We pass nil here since the flush function will handle it
 			return fn(nil)
 		},
-		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
+		Flush: func(ctx context.Context, conn *driver.Conn) error {
 			// Not used by ForceFlush
-			return Stats{
-				LastFlushTime:  time.Now(),
-				CheckpointMode: "PASSIVE",
-				Success:        true,
-			}, nil
+			return nil
 		},
 	})
 

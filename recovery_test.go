@@ -168,8 +168,7 @@ func TestRecovery_IdleFlushIntegration(t *testing.T) {
 	// Check recovery state
 	state := db.RecoveryState()
 	assert.True(t, state.Enabled)
-	assert.True(t, state.Success, "idle flush should have been triggered")
-	assert.NotZero(t, state.LastFlushTime)
+	assert.NotEmpty(t, state.FlushMode, "flush mode should be set when recovery enabled")
 }
 
 func TestRecovery_Disabled(t *testing.T) {
@@ -235,9 +234,9 @@ func TestRecovery_DisableSentinel(t *testing.T) {
 	_, err = os.Stat(sentinelPath)
 	assert.True(t, os.IsNotExist(err), "sentinel file should not exist after flush when DisableSentinel is true")
 
-	// Check recovery state shows flush happened
+	// Check recovery state shows enabled
 	state = db.RecoveryState()
-	assert.True(t, state.Success)
+	assert.True(t, state.Enabled)
 }
 
 func TestRecovery_FlushModes(t *testing.T) {
@@ -246,10 +245,10 @@ func TestRecovery_FlushModes(t *testing.T) {
 		mode           FlushMode
 		expectedMode   string
 	}{
-		{"FsyncOnly", FlushModeFsync, "FSYNC_ONLY"},
-		{"Passive", FlushModeCheckpointPassive, "PASSIVE"},
-		{"Full", FlushModeCheckpointFull, "FULL"},
-		{"Restart", FlushModeCheckpointRestart, "RESTART"},
+		{"FsyncOnly", FlushModeFsync, "FSYNC"},
+		{"Passive", FlushModeCheckpointPassive, "CHECKPOINT_PASSIVE"},
+		{"Full", FlushModeCheckpointFull, "CHECKPOINT_FULL"},
+		{"Restart", FlushModeCheckpointRestart, "CHECKPOINT_RESTART"},
 	}
 
 	for _, tc := range testCases {
@@ -281,9 +280,8 @@ func TestRecovery_FlushModes(t *testing.T) {
 
 			// Check recovery state
 			state := db.RecoveryState()
-			if state.Success {
-				assert.Equal(t, tc.expectedMode, state.CheckpointMode)
-			}
+			assert.True(t, state.Enabled)
+			assert.Equal(t, tc.expectedMode, state.FlushMode)
 
 			err = db.Close()
 			require.NoError(t, err)
@@ -324,7 +322,6 @@ func TestRecovery_ForceFlush(t *testing.T) {
 	// Check recovery state
 	state := db.RecoveryState()
 	assert.True(t, state.Enabled)
-	assert.True(t, state.Success)
 
 	// Force flush again
 	err = db.ForceFlush(ctx, 10*time.Millisecond, FlushModeCheckpointPassive)

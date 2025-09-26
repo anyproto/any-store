@@ -15,7 +15,7 @@ type Options struct {
 	IdleAfter time.Duration
 	// AcquireWrite acquires write connection. If silent is true, won't trigger write events on release
 	AcquireWrite func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error
-	Flush        func(ctx context.Context, conn *driver.Conn) (Stats, error)
+	Flush        func(ctx context.Context, conn *driver.Conn) error
 	Trackers     []Tracker
 	OnIdleSafe   []OnIdleSafeCallback
 	Logger       *log.Logger
@@ -23,8 +23,7 @@ type Options struct {
 
 type Controller struct {
 	opts          Options
-	flush         func(ctx context.Context, conn *driver.Conn) (Stats, error)
-	lastFlush     atomic.Value
+	flush         func(ctx context.Context, conn *driver.Conn) error
 	timer         *time.Timer
 	timerMu       sync.Mutex
 	running       atomic.Bool
@@ -182,8 +181,7 @@ func (c *Controller) performFlushInternal(ctx context.Context, idleAfter time.Du
 	return c.performFlushInternalWithFunc(ctx, idleAfter, c.flush)
 }
 
-func (c *Controller) performFlushInternalWithFunc(ctx context.Context, idleAfter time.Duration, flushFunc func(context.Context, *driver.Conn) (Stats, error)) (bool, error) {
-	var stats Stats
+func (c *Controller) performFlushInternalWithFunc(ctx context.Context, idleAfter time.Duration, flushFunc func(context.Context, *driver.Conn) error) (bool, error) {
 	var flushed bool
 
 	// Use silent acquire to avoid triggering write events during flush operations
@@ -199,8 +197,7 @@ func (c *Controller) performFlushInternalWithFunc(ctx context.Context, idleAfter
 			}
 		}
 
-		var flushErr error
-		stats, flushErr = flushFunc(ctx, conn)
+		flushErr := flushFunc(ctx, conn)
 		if flushErr == nil {
 			flushed = true
 		}
@@ -213,16 +210,16 @@ func (c *Controller) performFlushInternalWithFunc(ctx context.Context, idleAfter
 
 	// Only mark success and notify if we actually flushed
 	if flushed {
-		stats.Success = true
-		fmt.Printf("db %s flushed: %v\n", ctx.Value("dbPath"), stats)
-		c.lastFlush.Store(stats)
+		if c.opts.Logger != nil {
+			c.opts.Logger.Printf("db flush completed\n")
+		}
 
 		for _, tracker := range c.opts.Trackers {
 			tracker.MarkClean()
 		}
 
 		for _, callback := range c.opts.OnIdleSafe {
-			callback(stats)
+			callback()
 		}
 	}
 
@@ -239,13 +236,6 @@ func (c *Controller) MarkClean() {
 	for _, tracker := range c.opts.Trackers {
 		tracker.MarkClean()
 	}
-}
-
-func (c *Controller) LastFlushStats() (Stats, bool) {
-	if v := c.lastFlush.Load(); v != nil {
-		return v.(Stats), true
-	}
-	return Stats{}, false
 }
 
 func (c *Controller) ForceFlush(ctx context.Context, waitMinIdleTime time.Duration, mode FlushMode) error {

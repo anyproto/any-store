@@ -22,7 +22,7 @@ func New(dbPath string) (*SentinelTracker, recovery.OnIdleSafeCallback) {
 		path: sentinelPath,
 	}
 
-	onIdleSafe := func(stats recovery.Stats) {
+	onIdleSafe := func() {
 		tracker.mu.Lock()
 		defer tracker.mu.Unlock()
 

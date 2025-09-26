@@ -100,23 +100,8 @@ type RecoveryStats struct {
 	// Enabled indicates if recovery is enabled
 	Enabled bool
 
-	// LastFlushTime is the time of the last successful flush
-	LastFlushTime time.Time
-
-	// FlushDuration is the duration of the last flush
-	FlushDuration time.Duration
-
-	// BytesFlushed is the number of bytes flushed in the last operation
-	BytesFlushed int64
-
-	// WalFramesFlushed is the number of WAL frames flushed
-	WalFramesFlushed int
-
-	// CheckpointMode is the checkpoint mode used in the last flush
-	CheckpointMode string
-
-	// Success indicates if the last flush was successful
-	Success bool
+	// FlushMode is the configured flush mode
+	FlushMode string
 }
 
 // Open opens a database at the specified path with the given configuration.
@@ -634,19 +619,9 @@ func (db *db) RecoveryState() RecoveryStats {
 		return RecoveryStats{Enabled: false}
 	}
 
-	stats, ok := db.recoveryController.LastFlushStats()
-	if !ok {
-		return RecoveryStats{Enabled: true}
-	}
-
 	return RecoveryStats{
-		Enabled:          true,
-		LastFlushTime:    stats.LastFlushTime,
-		FlushDuration:    stats.FlushDuration,
-		BytesFlushed:     stats.BytesFlushed,
-		WalFramesFlushed: stats.WalFramesFlushed,
-		CheckpointMode:   stats.CheckpointMode,
-		Success:          stats.Success,
+		Enabled:   true,
+		FlushMode: string(db.config.Recovery.FlushMode),
 	}
 }
 

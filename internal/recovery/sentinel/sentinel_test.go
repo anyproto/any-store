@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/anyproto/any-store/internal/recovery"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -99,10 +98,7 @@ func TestSentinelTracker_OnIdleSafeCallback(t *testing.T) {
 	require.NoError(t, err)
 
 	// Call the OnIdleSafe callback
-	stats := recovery.Stats{
-		Success: true,
-	}
-	onIdleSafe(stats)
+	onIdleSafe()
 
 	// Verify sentinel was removed
 	_, err = os.Stat(sentinelPath)
