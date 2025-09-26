@@ -1,11 +1,9 @@
 package anystore
 
 import (
-	"context"
 	"runtime"
 	"time"
 
-	"github.com/anyproto/any-store/internal/driver"
 	"github.com/anyproto/any-store/internal/recovery"
 )
 
@@ -47,12 +45,13 @@ type Config struct {
 	Recovery RecoveryConfig
 }
 
-type CheckpointMode string
+type FlushMode string
 
 const (
-	CheckpointPassive  CheckpointMode = "PASSIVE"
-	CheckpointFull     CheckpointMode = "FULL"
-	CheckpointTruncate CheckpointMode = "TRUNCATE"
+	FlushModeFsync             FlushMode = "FSYNC"              // Only fsync, no checkpoint
+	FlushModeCheckpointPassive FlushMode = "CHECKPOINT_PASSIVE" // Checkpoint with PASSIVE mode + fsync
+	FlushModeCheckpointFull    FlushMode = "CHECKPOINT_FULL"    // Checkpoint with FULL mode + fsync
+	FlushModeCheckpointRestart FlushMode = "CHECKPOINT_RESTART" // Checkpoint with RESTART mode + fsync
 )
 
 type RecoveryConfig struct {
@@ -63,32 +62,13 @@ type RecoveryConfig struct {
 	// Default: 20s
 	IdleAfter time.Duration
 
-	// ForceFlushIdleAfter is the idle threshold used for ForceFlush
-	// This is shorter than IdleAfter to ensure quick flush on app suspension
-	// Default: 100ms
-	ForceFlushIdleAfter time.Duration
+	// FlushMode specifies how to flush data during idle periods
+	// Default: FlushModeCheckpointPassive
+	FlushMode FlushMode
 
-	// CheckpointMode specifies the WAL checkpoint mode to use during idle flush
-	// Default: CheckpointPassive
-	CheckpointMode CheckpointMode
-
-	// Flush is an optional custom flush function
-	// If nil, uses default flush (fsync + WAL checkpoint)
-	Flush func(ctx context.Context, conn *driver.Conn) (recovery.Stats, error)
-
-	// Trackers are recovery trackers to register with the controller
-	Trackers []recovery.Tracker
-
-	// OnIdleSafe are callbacks to invoke after successful idle flush
-	OnIdleSafe []recovery.OnIdleSafeCallback
-
-	// QuickCheckTimeout is the timeout for running QuickCheck on dirty database open
-	// Default: 5 minutes
-	QuickCheckTimeout time.Duration
-
-	// UseSentinel enables the default sentinel file tracker
-	// When true, creates a .lock file alongside the database to detect unclean shutdown
-	UseSentinel bool
+	// DisableSentinel disables the sentinel file (.lock) that tracks database dirty state
+	// When false (default), the sentinel file is used to detect unclean shutdowns and run QuickCheck
+	DisableSentinel bool
 }
 
 func (c *Config) setDefaults() {
@@ -113,14 +93,8 @@ func (c *Config) setDefaults() {
 		if c.Recovery.IdleAfter <= 0 {
 			c.Recovery.IdleAfter = 20 * time.Second
 		}
-		if c.Recovery.ForceFlushIdleAfter <= 0 {
-			c.Recovery.ForceFlushIdleAfter = 100 * time.Millisecond
-		}
-		if c.Recovery.CheckpointMode == "" {
-			c.Recovery.CheckpointMode = CheckpointPassive
-		}
-		if c.Recovery.QuickCheckTimeout <= 0 {
-			c.Recovery.QuickCheckTimeout = 5 * time.Minute
+		if c.Recovery.FlushMode == "" {
+			c.Recovery.FlushMode = FlushModeCheckpointPassive
 		}
 	}
 }
@@ -136,4 +110,9 @@ func (c *Config) pragma() map[string]string {
 		}
 	}
 	return pragma
+}
+
+// toRecoveryFlushMode converts config.FlushMode to recovery.FlushMode
+func (m FlushMode) toRecoveryFlushMode() recovery.FlushMode {
+	return recovery.FlushMode(m)
 }

@@ -32,6 +32,10 @@ type Config struct {
 	FilterRegistry            *registry.FilterRegistry
 	Version                   int
 	ReadConnTTL               time.Duration
+
+	// WriteObservers are callbacks for write connection events (unexported)
+	// will be called synchronously on acquire and release of the write connection
+	WriteObservers []WriteObserver
 }
 
 type EventType int
@@ -80,6 +84,7 @@ func NewConnManager(path string, conf Config) (*ConnManager, error) {
 		filterRegistry: conf.FilterRegistry,
 		path:           path,
 		pragma:         conf.Pragma,
+		observers:      conf.WriteObservers,
 	}
 
 	// open write connection
@@ -121,7 +126,6 @@ type ConnManager struct {
 	stalledConnDetectorEnabled bool
 
 	lastWriteRelease atomic.Value
-	observersMu      sync.RWMutex
 	observers        []WriteObserver
 }
 
@@ -285,19 +289,9 @@ func (c *ConnManager) Close() (err error) {
 	return err
 }
 
-func (c *ConnManager) RegisterWriteObserver(observer WriteObserver) {
-	c.observersMu.Lock()
-	defer c.observersMu.Unlock()
-	c.observers = append(c.observers, observer)
-}
-
 func (c *ConnManager) notifyObservers(event Event) {
-	c.observersMu.RLock()
-	observers := c.observers
-	c.observersMu.RUnlock()
-
-	for _, observer := range observers {
-		go observer(event)
+	for _, observer := range c.observers {
+		observer(event)
 	}
 }
 

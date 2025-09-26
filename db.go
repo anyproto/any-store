@@ -73,7 +73,7 @@ type DB interface {
 	// This is useful when the app needs to ensure durability before suspension (e.g., going to background).
 	// It waits for any active write transactions to complete before flushing.
 	// Returns an error if the flush fails or if recovery is not enabled.
-	ForceFlush(ctx context.Context) error
+	ForceFlush(ctx context.Context, waitMinIdleTime time.Duration, mode FlushMode) error
 
 	// Close closes the database connection.
 	// Returns an error if there is an issue closing the connection.
@@ -140,6 +140,14 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		openedCollections: make(map[string]Collection),
 	}
 
+	// Create recovery controller first if enabled
+	var recoveryController *recovery.Controller
+	var quickCheckNeeded bool
+	if config.Recovery.Enabled {
+		recoveryController, quickCheckNeeded = ds.createRecoveryController(ctx, path)
+		ds.recoveryController = recoveryController
+	}
+
 	var err error
 	conf := driver.Config{
 		Pragma:                    config.pragma(),
@@ -150,16 +158,13 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		Version:                   2,
 		ReadConnTTL:               time.Minute,
 	}
-	if ds.cm, err = driver.NewConnManager(path, conf); err != nil {
-		return nil, err
+
+	if recoveryController != nil {
+		conf.WriteObservers = []driver.WriteObserver{recoveryController.OnWriteEvent}
 	}
 
-	// Setup recovery controller if enabled
-	if config.Recovery.Enabled {
-		if err = ds.setupRecovery(ctx, path); err != nil {
-			_ = ds.cm.Close()
-			return nil, err
-		}
+	if ds.cm, err = driver.NewConnManager(path, conf); err != nil {
+		return nil, err
 	}
 
 	if err = ds.init(ctx); err != nil {
@@ -168,6 +173,19 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		}
 		_ = ds.cm.Close()
 		return nil, err
+	}
+
+	// Run QuickCheck if database was dirty
+	if quickCheckNeeded {
+		quickCheckCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+		if err := ds.QuickCheck(quickCheckCtx); err != nil {
+			if ds.recoveryController != nil {
+				_ = ds.recoveryController.Stop()
+			}
+			_ = ds.cm.Close()
+			return nil, fmt.Errorf("QuickCheck failed on dirty database: %w", err)
+		}
 	}
 
 	// Start recovery controller after initialization
@@ -569,85 +587,46 @@ func (db *db) Close() error {
 	return db.cm.Close()
 }
 
-func (db *db) setupRecovery(ctx context.Context, path string) error {
+func (db *db) createRecoveryController(ctx context.Context, path string) (*recovery.Controller, bool) {
 	var trackers []recovery.Tracker
-	var onIdleSafe []recovery.OnIdleSafeCallback
+	var onIdleSafeCallbacks []recovery.OnIdleSafeCallback
 
-	// Add sentinel tracker if enabled
-	if db.config.Recovery.UseSentinel {
-		tracker, callback := sentinel.New(path)
+	// Add sentinel tracker unless disabled
+	if !db.config.Recovery.DisableSentinel {
+		tracker, onIdleSafeCallback := sentinel.New(path)
 		trackers = append(trackers, tracker)
-		onIdleSafe = append(onIdleSafe, callback)
+		onIdleSafeCallbacks = append(onIdleSafeCallbacks, onIdleSafeCallback)
 	}
 
-	// Add configured trackers
-	trackers = append(trackers, db.config.Recovery.Trackers...)
-	onIdleSafe = append(onIdleSafe, db.config.Recovery.OnIdleSafe...)
-
-	// Create custom flush function if needed
-	var flushFunc func(context.Context, *driver.Conn) (recovery.Stats, error)
-	if db.config.Recovery.Flush != nil {
-		flushFunc = db.config.Recovery.Flush
-	} else {
-		// Default flush with configured checkpoint mode
-		flushFunc = func(ctx context.Context, conn *driver.Conn) (recovery.Stats, error) {
-			stats := recovery.Stats{
-				LastFlushTime:  time.Now(),
-				CheckpointMode: string(db.config.Recovery.CheckpointMode),
-			}
-			start := time.Now()
-
-			pragma := fmt.Sprintf("PRAGMA wal_checkpoint(%s)", db.config.Recovery.CheckpointMode)
-			if err := conn.ExecNoResult(ctx, pragma); err != nil {
-				return stats, fmt.Errorf("checkpoint failed: %w", err)
-			}
-
-			if err := conn.Fsync(ctx); err != nil {
-				return stats, fmt.Errorf("fsync failed: %w", err)
-			}
-
-			stats.FlushDuration = time.Since(start)
-			stats.Success = true
-			return stats, nil
-		}
+	// Create flush function from FlushMode
+	flushFunc, err := recovery.NewFlushFunc(db.config.Recovery.FlushMode.toRecoveryFlushMode())
+	if err != nil {
+		return nil, false
 	}
 
-	// Create controller
+	// Create controller with simplified options
 	opts := recovery.Options{
-		IdleAfter:           db.config.Recovery.IdleAfter,
-		ForceFlushIdleAfter: db.config.Recovery.ForceFlushIdleAfter,
-		AcquireWrite:        db.withWriteConn,
-		Flush:               flushFunc,
-		Trackers:            trackers,
-		OnIdleSafe:          onIdleSafe,
+		IdleAfter:    db.config.Recovery.IdleAfter,
+		AcquireWrite: db.withWriteConn,
+		Flush:        flushFunc,
+		Trackers:     trackers,
+		OnIdleSafe:   onIdleSafeCallbacks,
 	}
 
-	db.recoveryController = recovery.NewController(opts)
+	controller := recovery.NewController(opts)
 
-	// Register observer
-	db.cm.RegisterWriteObserver(db.recoveryController.OnWriteEvent)
+	// Store context with dbPath for debugging
+	ctx = context.WithValue(ctx, "dbPath", path)
 
 	// Check if database is dirty
-	dirty, err := db.recoveryController.OnOpen(ctx)
+	dirty, err := controller.OnOpen(ctx)
 	if err != nil {
-		return fmt.Errorf("recovery OnOpen failed: %w", err)
+		// Log error but still return controller
+		// The error will be handled when we try to start the controller
+		return controller, false
 	}
 
-	// Run QuickCheck if dirty
-	if dirty {
-		quickCheckCtx := ctx
-		if db.config.Recovery.QuickCheckTimeout > 0 {
-			var cancel context.CancelFunc
-			quickCheckCtx, cancel = context.WithTimeout(ctx, db.config.Recovery.QuickCheckTimeout)
-			defer cancel()
-		}
-
-		if err := db.QuickCheck(quickCheckCtx); err != nil {
-			return fmt.Errorf("QuickCheck failed on dirty database: %w", err)
-		}
-	}
-
-	return nil
+	return controller, dirty
 }
 
 func (db *db) RecoveryState() RecoveryStats {
@@ -671,12 +650,12 @@ func (db *db) RecoveryState() RecoveryStats {
 	}
 }
 
-func (db *db) ForceFlush(ctx context.Context) error {
+func (db *db) ForceFlush(ctx context.Context, waitMinIdleTime time.Duration, mode FlushMode) error {
 	if db.recoveryController == nil {
 		return fmt.Errorf("recovery is not enabled")
 	}
 
-	return db.recoveryController.ForceFlush(ctx)
+	return db.recoveryController.ForceFlush(ctx, waitMinIdleTime, mode.toRecoveryFlushMode())
 }
 
 func (db *db) onCollectionClose(name string) {

@@ -104,8 +104,8 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
     },
 })
 
-// Force flush before app suspension
-db.ForceFlush(ctx)
+// Force flush before app suspension (wait for 100ms of idle)
+db.ForceFlush(ctx, 100*time.Millisecond)
 ```
 
 

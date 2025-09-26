@@ -12,17 +12,17 @@ import (
 )
 
 type Options struct {
-	IdleAfter           time.Duration
-	ForceFlushIdleAfter time.Duration // Idle threshold for force flush (default 100ms)
-	AcquireWrite        func(ctx context.Context, fn func(conn *driver.Conn) error) error
-	Flush               func(ctx context.Context, conn *driver.Conn) (Stats, error)
-	Trackers            []Tracker
-	OnIdleSafe          []OnIdleSafeCallback
-	Logger              *log.Logger
+	IdleAfter    time.Duration
+	AcquireWrite func(ctx context.Context, fn func(conn *driver.Conn) error) error
+	Flush        func(ctx context.Context, conn *driver.Conn) (Stats, error)
+	Trackers     []Tracker
+	OnIdleSafe   []OnIdleSafeCallback
+	Logger       *log.Logger
 }
 
 type Controller struct {
 	opts          Options
+	flush         func(ctx context.Context, conn *driver.Conn) (Stats, error)
 	lastFlush     atomic.Value
 	timer         *time.Timer
 	timerMu       sync.Mutex
@@ -37,14 +37,13 @@ func NewController(opts Options) *Controller {
 	if opts.IdleAfter <= 0 {
 		opts.IdleAfter = 20 * time.Second
 	}
-	if opts.ForceFlushIdleAfter <= 0 {
-		opts.ForceFlushIdleAfter = 100 * time.Millisecond
-	}
 	if opts.Logger == nil {
 		opts.Logger = log.New(log.Writer(), "[recovery] ", log.LstdFlags)
 	}
 	if opts.Flush == nil {
-		opts.Flush = defaultFlush
+		// This shouldn't happen in production, but provide a default for safety
+		flush, _ := NewFlushFunc(FlushModeCheckpointPassive)
+		opts.Flush = flush
 	}
 
 	// Create a stopped timer upfront - avoids all nil checks and races
@@ -55,6 +54,7 @@ func NewController(opts Options) *Controller {
 
 	return &Controller{
 		opts:  opts,
+		flush: opts.Flush,
 		timer: timer,
 	}
 }
@@ -68,6 +68,9 @@ func (c *Controller) OnOpen(ctx context.Context) (dirty bool, err error) {
 		if trackerDirty {
 			dirty = true
 		}
+	}
+	if dirty {
+		fmt.Printf("db %s is dirty on open\n", ctx.Value("dbPath"))
 	}
 	return dirty, nil
 }
@@ -175,6 +178,10 @@ func (c *Controller) performFlush(ctx context.Context) (bool, error) {
 }
 
 func (c *Controller) performFlushInternal(ctx context.Context, idleAfter time.Duration) (bool, error) {
+	return c.performFlushInternalWithFunc(ctx, idleAfter, c.flush)
+}
+
+func (c *Controller) performFlushInternalWithFunc(ctx context.Context, idleAfter time.Duration, flushFunc func(context.Context, *driver.Conn) (Stats, error)) (bool, error) {
 	var stats Stats
 	var flushed bool
 
@@ -191,7 +198,7 @@ func (c *Controller) performFlushInternal(ctx context.Context, idleAfter time.Du
 		}
 
 		var flushErr error
-		stats, flushErr = c.opts.Flush(ctx, conn)
+		stats, flushErr = flushFunc(ctx, conn)
 		if flushErr == nil {
 			flushed = true
 		}
@@ -205,6 +212,7 @@ func (c *Controller) performFlushInternal(ctx context.Context, idleAfter time.Du
 	// Only mark success and notify if we actually flushed
 	if flushed {
 		stats.Success = true
+		fmt.Printf("db %s flushed: %v\n", ctx.Value("dbPath"), stats)
 		c.lastFlush.Store(stats)
 
 		for _, tracker := range c.opts.Trackers {
@@ -238,9 +246,19 @@ func (c *Controller) LastFlushStats() (Stats, bool) {
 	return Stats{}, false
 }
 
-func (c *Controller) ForceFlush(ctx context.Context) error {
+func (c *Controller) ForceFlush(ctx context.Context, waitMinIdleTime time.Duration, mode FlushMode) error {
 	if c == nil {
 		return fmt.Errorf("controller is nil")
+	}
+
+	if waitMinIdleTime <= 0 {
+		waitMinIdleTime = 100 * time.Millisecond
+	}
+
+	// Create custom flush function for this force flush
+	flushFunc, err := NewFlushFunc(mode)
+	if err != nil {
+		return fmt.Errorf("invalid flush mode: %w", err)
 	}
 
 	// Keep trying to flush with short idle threshold until successful or context cancelled
@@ -251,7 +269,7 @@ func (c *Controller) ForceFlush(ctx context.Context) error {
 		default:
 		}
 
-		flushed, err := c.performFlushInternal(ctx, c.opts.ForceFlushIdleAfter)
+		flushed, err := c.performFlushInternalWithFunc(ctx, waitMinIdleTime, flushFunc)
 		if err != nil {
 			return fmt.Errorf("force flush failed: %w", err)
 		}
@@ -271,22 +289,3 @@ func (c *Controller) ForceFlush(ctx context.Context) error {
 	}
 }
 
-func defaultFlush(ctx context.Context, conn *driver.Conn) (Stats, error) {
-	stats := Stats{
-		LastFlushTime:  time.Now(),
-		CheckpointMode: "PASSIVE",
-	}
-
-	start := time.Now()
-
-	if err := conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(PASSIVE)"); err != nil {
-		return stats, fmt.Errorf("checkpoint failed: %w", err)
-	}
-
-	if err := conn.Fsync(ctx); err != nil {
-		return stats, fmt.Errorf("fsync failed: %w", err)
-	}
-
-	stats.FlushDuration = time.Since(start)
-	return stats, nil
-}
