@@ -514,12 +514,12 @@ func (db *db) doWriteTx(ctx context.Context, do func(c *driver.Conn) error) erro
 	return tx.Commit()
 }
 
-func (db *db) withWriteConn(ctx context.Context, fn func(conn *driver.Conn) error) error {
+func (db *db) withWriteConn(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
 	conn, err := db.cm.GetWrite(ctx)
 	if err != nil {
 		return err
 	}
-	defer db.cm.ReleaseWrite(conn)
+	defer db.cm.ReleaseWriteWithOptions(conn, silent)
 	return fn(conn)
 }
 

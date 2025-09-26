@@ -61,7 +61,7 @@ func TestController_StartStop(t *testing.T) {
 	controller := NewController(Options{
 		IdleAfter: 100 * time.Millisecond,
 		Trackers:  []Tracker{tracker},
-		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
 			return fn(nil)
 		},
 		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
@@ -102,7 +102,7 @@ func TestController_IdleFlush(t *testing.T) {
 	controller := NewController(Options{
 		IdleAfter: 100 * time.Millisecond,
 		Trackers:  []Tracker{tracker},
-		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
 			return fn(nil)
 		},
 		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
@@ -149,7 +149,7 @@ func TestController_OnIdleSafeCallback(t *testing.T) {
 
 	controller := NewController(Options{
 		IdleAfter: 100 * time.Millisecond,
-		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
 			return fn(nil)
 		},
 		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
@@ -215,7 +215,7 @@ func TestController_RaceConditionWriteDuringFlush(t *testing.T) {
 	controller := NewController(Options{
 		IdleAfter: 200 * time.Millisecond, // Use larger idle time for test stability
 		Trackers:  []Tracker{tracker},
-		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
 			// Signal that acquire was called
 			select {
 			case writeConnAcquired <- struct{}{}:
@@ -284,7 +284,7 @@ func TestController_FlushAfterWriteDelay(t *testing.T) {
 	controller := NewController(Options{
 		IdleAfter: 200 * time.Millisecond, // Use larger idle time for test stability
 		Trackers:  []Tracker{tracker},
-		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
 			// Signal that acquire started
 			select {
 			case acquireStarted <- struct{}{}:
@@ -355,7 +355,7 @@ func TestController_MultipleWritesDuringFlush(t *testing.T) {
 	controller := NewController(Options{
 		IdleAfter: 100 * time.Millisecond,
 		Trackers:  []Tracker{tracker},
-		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
 			select {
 			case writeConnAcquired <- struct{}{}:
 				<-writeConnReleased
@@ -411,6 +411,71 @@ func TestController_ForceFlush(t *testing.T) {
 	t.Skip("ForceFlush with FlushMode requires real driver.Conn - tested in integration tests")
 }
 
+func TestController_ForceFlushBug(t *testing.T) {
+	// This test reproduces the bug where ForceFlush's retry loop
+	// can never succeed because performFlushInternalWithFunc uses
+	// AcquireWrite with silent=true, but the test was not properly
+	// simulating that behavior
+
+	tracker := &mockTracker{}
+	flushCount := 0
+	acquireCount := 0
+
+	var controller *Controller
+
+	opts := Options{
+		IdleAfter: 10 * time.Second,
+		Trackers:  []Tracker{tracker},
+		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
+			acquireCount++
+			// Simulate the real behavior: acquiring the write lock
+			err := fn(nil)
+
+			// The bug fix: performFlushInternalWithFunc uses silent=true
+			// so it should NOT update lastWriteTime
+			if !silent && controller != nil {
+				controller.OnWriteEvent(driver.Event{
+					Type: driver.EventReleaseWrite,
+					When: time.Now(),
+				})
+			}
+			return err
+		},
+		Flush: func(ctx context.Context, conn *driver.Conn) (Stats, error) {
+			flushCount++
+			return Stats{
+				LastFlushTime:  time.Now(),
+				CheckpointMode: "PASSIVE",
+				Success:        true,
+			}, nil
+		},
+	}
+
+	controller = NewController(opts)
+
+	ctx := context.Background()
+	err := controller.Start(ctx)
+	require.NoError(t, err)
+	defer controller.Stop()
+
+	// Simulate a recent write
+	controller.OnWriteEvent(driver.Event{
+		Type: driver.EventReleaseWrite,
+		When: time.Now(),
+	})
+
+	// Sleep a bit to ensure we're past waitMinIdleTime
+	time.Sleep(60 * time.Millisecond)
+
+	// Try performFlushInternal - this should succeed because
+	// it uses silent=true and doesn't reset lastWriteTime
+	flushed, err := controller.performFlushInternal(ctx, 50*time.Millisecond)
+	require.NoError(t, err)
+	assert.True(t, flushed, "Should have flushed")
+	assert.Equal(t, 1, flushCount, "Should have flushed once")
+	assert.Equal(t, 1, acquireCount, "Should have acquired once")
+}
+
 func TestController_ForceFlushWithTimeout(t *testing.T) {
 	t.Skip("ForceFlush with FlushMode requires real driver.Conn - tested in integration tests")
 	return
@@ -422,7 +487,7 @@ func TestController_ForceFlushWithTimeout(t *testing.T) {
 controller := NewController(Options{
 		IdleAfter: 10 * time.Second,
 		Trackers:  []Tracker{tracker},
-		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
 			// Simulate slow acquire
 			select {
 			case <-blockFlush:
@@ -465,7 +530,7 @@ func TestController_ForceFlushConcurrent(t *testing.T) {
 controller := NewController(Options{
 		IdleAfter: 10 * time.Second,
 		Trackers:  []Tracker{tracker},
-		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
 			// Simulate some work
 			time.Sleep(10 * time.Millisecond)
 			// ForceFlush will create its own flush function
@@ -515,7 +580,7 @@ func TestController_ForceFlushWithActiveWrites(t *testing.T) {
 controller := NewController(Options{
 		IdleAfter: 10 * time.Second,
 		Trackers:  []Tracker{tracker},
-		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
 			attemptCount++
 			// ForceFlush will create its own flush function
 			// We pass nil here since the flush function will handle it

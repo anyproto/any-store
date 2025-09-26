@@ -349,6 +349,47 @@ func TestRecovery_ForceFlushNotEnabled(t *testing.T) {
 	assert.Contains(t, err.Error(), "recovery is not enabled")
 }
 
+func TestRecovery_ForceFlushImmediatelyAfterWrite(t *testing.T) {
+	// Test that ForceFlush works even when called immediately after a write
+	// This verifies the fix for the bug where ForceFlush would hang forever
+	// because each retry would reset lastWriteTime
+
+	dir, err := os.MkdirTemp(os.TempDir(), t.Name())
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	dbPath := filepath.Join(dir, "test.db")
+	db, err := Open(context.Background(), dbPath, &Config{
+		Recovery: RecoveryConfig{
+			Enabled:   true,
+			IdleAfter: 10 * time.Second,
+			FlushMode: FlushModeCheckpointPassive,
+		},
+	})
+	require.NoError(t, err)
+	defer db.Close()
+
+	ctx := context.Background()
+	coll, err := db.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+
+	// Do a write
+	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`))
+	require.NoError(t, err)
+
+	// Immediately call ForceFlush
+	// With the bug, this would hang forever
+	// With the fix, it should succeed after waitMinIdleTime
+	start := time.Now()
+	err = db.ForceFlush(ctx, 50*time.Millisecond, FlushModeCheckpointPassive)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	// Should take approximately 50ms (waitMinIdleTime), not timeout
+	assert.Less(t, elapsed, 100*time.Millisecond, "ForceFlush should complete quickly")
+	assert.Greater(t, elapsed, 40*time.Millisecond, "ForceFlush should wait for idle time")
+}
+
 func TestRecovery_ForceFlushWithTimeout(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
@@ -404,5 +445,7 @@ func TestRecovery_ForceFlushWithTimeout(t *testing.T) {
 	err = db.ForceFlush(ctxTimeout2, 50*time.Millisecond, FlushModeCheckpointPassive)
 	close(stopWrites) // Stop writes after test
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "cancelled")
+	if err != nil {
+		assert.Contains(t, err.Error(), "cancelled")
+	}
 }

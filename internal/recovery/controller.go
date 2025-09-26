@@ -12,8 +12,9 @@ import (
 )
 
 type Options struct {
-	IdleAfter    time.Duration
-	AcquireWrite func(ctx context.Context, fn func(conn *driver.Conn) error) error
+	IdleAfter time.Duration
+	// AcquireWrite acquires write connection. If silent is true, won't trigger write events on release
+	AcquireWrite func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error
 	Flush        func(ctx context.Context, conn *driver.Conn) (Stats, error)
 	Trackers     []Tracker
 	OnIdleSafe   []OnIdleSafeCallback
@@ -185,7 +186,8 @@ func (c *Controller) performFlushInternalWithFunc(ctx context.Context, idleAfter
 	var stats Stats
 	var flushed bool
 
-	err := c.opts.AcquireWrite(ctx, func(conn *driver.Conn) error {
+	// Use silent acquire to avoid triggering write events during flush operations
+	err := c.opts.AcquireWrite(ctx, true, func(conn *driver.Conn) error {
 		// Re-check if we're still idle after acquiring the connection
 		// Someone might have done writes while we were waiting
 		lastWriteTime, ok := c.lastWriteTime.Load().(time.Time)
@@ -288,4 +290,3 @@ func (c *Controller) ForceFlush(ctx context.Context, waitMinIdleTime time.Durati
 		}
 	}
 }
-

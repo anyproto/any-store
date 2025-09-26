@@ -147,11 +147,19 @@ func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
 }
 
 func (c *ConnManager) ReleaseWrite(conn *Conn) {
+	c.ReleaseWriteWithOptions(conn, false)
+}
+
+// ReleaseWriteWithOptions releases the write connection with options
+// silent: if true, doesn't notify observers (useful for flush operations or empty transactions)
+func (c *ConnManager) ReleaseWriteWithOptions(conn *Conn, silent bool) {
 	now := time.Now()
 	c.lastWriteRelease.Store(now)
 	c.writeCh <- conn
 	c.stalledReleaseConn(conn)
-	c.notifyObservers(Event{Type: EventReleaseWrite, When: now})
+	if !silent {
+		c.notifyObservers(Event{Type: EventReleaseWrite, When: now})
+	}
 }
 
 func (c *ConnManager) GetRead(ctx context.Context) (conn *Conn, err error) {
