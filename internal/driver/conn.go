@@ -178,6 +178,55 @@ func (c *Conn) Backup(ctx context.Context, path string) (err error) {
 	return
 }
 
+func (c *Conn) Fsync(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.isClosed {
+		return ErrDBIsClosed
+	}
+
+	// Get current synchronous setting
+	var currentSync string
+	err := sqlitex.ExecuteTransient(c.conn, "PRAGMA synchronous", &sqlitex.ExecOptions{
+		ResultFunc: func(stmt *sqlite.Stmt) error {
+			currentSync = stmt.ColumnText(0)
+			return nil
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	// If already FULL (2) or EXTRA (3), fsync is already happening on every commit, so no-op
+	// SQLite returns these as integers: 0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA
+	if currentSync == "2" || currentSync == "3" {
+		return nil
+	}
+
+	// Temporarily set synchronous to FULL
+	if err = sqlitex.ExecuteTransient(c.conn, "PRAGMA synchronous = FULL", nil); err != nil {
+		return err
+	}
+
+	// Perform an empty immediate transaction - this will trigger fsync on commit with synchronous=FULL
+	if err = sqlitex.ExecuteTransient(c.conn, "BEGIN IMMEDIATE", nil); err != nil {
+		// Restore original setting if we failed to begin transaction
+		_ = sqlitex.ExecuteTransient(c.conn, "PRAGMA synchronous = "+currentSync, nil)
+		return err
+	}
+
+	// Commit the empty transaction to trigger fsync
+	err = sqlitex.ExecuteTransient(c.conn, "COMMIT", nil)
+
+	// Restore original synchronous setting regardless of transaction result
+	restoreErr := sqlitex.ExecuteTransient(c.conn, "PRAGMA synchronous = "+currentSync, nil)
+
+	if err != nil {
+		return err
+	}
+	return restoreErr
+}
+
 func (c *Conn) newStmt(stmt *sqlite.Stmt) *Stmt {
 	if dStmt := c.activeStmts[stmt]; dStmt != nil {
 		return dStmt

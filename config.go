@@ -3,6 +3,8 @@ package anystore
 import (
 	"runtime"
 	"time"
+
+	"github.com/anyproto/any-store/internal/recovery"
 )
 
 var defaultSQLiteOptions = map[string]string{
@@ -38,6 +40,35 @@ type Config struct {
 	StalledConnectionsDetectorEnabled bool
 	// StalledConnectionsPanicOnClose enables panic on Close in case of any connection is not released after this timeout
 	StalledConnectionsPanicOnClose time.Duration
+
+	// RecoveryConfig provides configuration for crash recovery and idle durability
+	Recovery RecoveryConfig
+}
+
+type FlushMode string
+
+const (
+	FlushModeFsync             FlushMode = "FSYNC"              // Only fsync, no checkpoint
+	FlushModeCheckpointPassive FlushMode = "CHECKPOINT_PASSIVE" // Checkpoint with PASSIVE mode + fsync
+	FlushModeCheckpointFull    FlushMode = "CHECKPOINT_FULL"    // Checkpoint with FULL mode + fsync
+	FlushModeCheckpointRestart FlushMode = "CHECKPOINT_RESTART" // Checkpoint with RESTART mode + fsync
+)
+
+type RecoveryConfig struct {
+	// Enabled enables the recovery controller
+	Enabled bool
+
+	// IdleAfter is the duration to wait after the last write before performing an idle flush
+	// Default: 20s
+	IdleAfter time.Duration
+
+	// FlushMode specifies how to flush data during idle periods
+	// Default: FlushModeCheckpointPassive
+	FlushMode FlushMode
+
+	// DisableSentinel disables the sentinel file (.lock) that tracks database dirty state
+	// When false (default), the sentinel file is used to detect unclean shutdowns and run QuickCheck
+	DisableSentinel bool
 }
 
 func (c *Config) setDefaults() {
@@ -57,6 +88,15 @@ func (c *Config) setDefaults() {
 	if c.SQLiteGlobalPageCachePreallocateSizeBytes == 0 {
 		c.SQLiteGlobalPageCachePreallocateSizeBytes = 10 << 20
 	}
+
+	if c.Recovery.Enabled {
+		if c.Recovery.IdleAfter <= 0 {
+			c.Recovery.IdleAfter = 20 * time.Second
+		}
+		if c.Recovery.FlushMode == "" {
+			c.Recovery.FlushMode = FlushModeCheckpointPassive
+		}
+	}
 }
 
 func (c *Config) pragma() map[string]string {
@@ -70,4 +110,9 @@ func (c *Config) pragma() map[string]string {
 		}
 	}
 	return pragma
+}
+
+// toRecoveryFlushMode converts config.FlushMode to recovery.FlushMode
+func (m FlushMode) toRecoveryFlushMode() recovery.FlushMode {
+	return recovery.FlushMode(m)
 }

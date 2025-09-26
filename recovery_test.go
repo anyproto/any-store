@@ -1,0 +1,448 @@
+package anystore
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/anyproto/any-store/anyenc"
+)
+
+func TestRecovery_SentinelCleanShutdown(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	sentinelPath := dbPath + ".lock"
+
+	// Open database with recovery enabled
+	config := &Config{
+		Recovery: RecoveryConfig{
+			Enabled:   true,
+			IdleAfter: 100 * time.Millisecond,
+		},
+	}
+
+	ctx := context.Background()
+	db, err := Open(ctx, dbPath, config)
+	require.NoError(t, err)
+
+	// Verify sentinel file is created
+	_, err = os.Stat(sentinelPath)
+	assert.NoError(t, err, "sentinel file should exist after database open")
+
+	// Create a collection and add some data
+	coll, err := db.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+
+	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":"doc1", "data":"test"}`))
+	require.NoError(t, err)
+
+	// Wait for idle flush
+	time.Sleep(200 * time.Millisecond)
+
+	// Check recovery state
+	state := db.RecoveryState()
+	assert.True(t, state.Enabled)
+
+	// Close database normally
+	err = db.Close()
+	require.NoError(t, err)
+
+	// Verify sentinel file is removed after clean shutdown
+	_, err = os.Stat(sentinelPath)
+	assert.True(t, os.IsNotExist(err), "sentinel file should be removed after clean shutdown")
+
+	// Reopen database - should not require QuickCheck
+	db2, err := Open(ctx, dbPath, config)
+	require.NoError(t, err)
+	defer db2.Close()
+
+	// Verify data is intact
+	coll2, err := db2.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+
+	iter, err := coll2.Find(`{"id":"doc1"}`).Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+
+	assert.True(t, iter.Next())
+	doc, err := iter.Doc()
+	require.NoError(t, err)
+	assert.Equal(t, "test", string(doc.Value().GetStringBytes("data")))
+}
+
+func TestRecovery_SentinelDirtyShutdown(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	sentinelPath := dbPath + ".lock"
+
+	config := &Config{
+		Recovery: RecoveryConfig{
+			Enabled:   true,
+			IdleAfter: 10 * time.Minute, // Long idle time to prevent flush
+		},
+	}
+
+	ctx := context.Background()
+
+	// First, create database and add data
+	{
+		db, err := Open(ctx, dbPath, config)
+		require.NoError(t, err)
+
+		// Verify sentinel file is created
+		_, err = os.Stat(sentinelPath)
+		assert.NoError(t, err, "sentinel file should exist")
+
+		coll, err := db.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+
+		err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":"doc1", "data":"test"}`))
+		require.NoError(t, err)
+
+		// Simulate dirty shutdown by manually creating sentinel
+		// (normally Close() would remove it)
+		db.Close()
+
+		// Recreate sentinel to simulate crash
+		file, err := os.Create(sentinelPath)
+		require.NoError(t, err)
+		file.Close()
+	}
+
+	// Verify sentinel exists (simulating dirty state)
+	_, err := os.Stat(sentinelPath)
+	require.NoError(t, err, "sentinel should exist to simulate dirty state")
+
+	// Reopen database - should detect dirty state and run QuickCheck
+	db2, err := Open(ctx, dbPath, config)
+	require.NoError(t, err)
+	defer db2.Close()
+
+	// Verify data is intact after recovery
+	coll2, err := db2.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+
+	iter, err := coll2.Find(`{"id":"doc1"}`).Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+
+	assert.True(t, iter.Next())
+	doc, err := iter.Doc()
+	require.NoError(t, err)
+	assert.Equal(t, "test", string(doc.Value().GetStringBytes("data")))
+}
+
+func TestRecovery_IdleFlushIntegration(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	config := &Config{
+		Recovery: RecoveryConfig{
+			Enabled:   true,
+			IdleAfter: 100 * time.Millisecond,
+		},
+	}
+
+	ctx := context.Background()
+	db, err := Open(ctx, dbPath, config)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Create collection and insert data
+	coll, err := db.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+
+	// Perform a write
+	doc := anyenc.MustParseJson(`{"id":1, "data":"test"}`)
+	err = coll.Insert(ctx, doc)
+	require.NoError(t, err)
+
+	// Wait for idle flush to trigger (needs to wait for idle period after last write)
+	time.Sleep(200 * time.Millisecond)
+
+	// Check recovery state
+	state := db.RecoveryState()
+	assert.True(t, state.Enabled)
+	assert.NotEmpty(t, state.FlushMode, "flush mode should be set when recovery enabled")
+}
+
+func TestRecovery_Disabled(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	sentinelPath := dbPath + ".lock"
+
+	// Open database with recovery disabled (default)
+	config := &Config{}
+
+	ctx := context.Background()
+	db, err := Open(ctx, dbPath, config)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Verify sentinel file is NOT created
+	_, err = os.Stat(sentinelPath)
+	assert.True(t, os.IsNotExist(err), "sentinel file should not exist when recovery is disabled")
+
+	// Check recovery state shows disabled
+	state := db.RecoveryState()
+	assert.False(t, state.Enabled)
+}
+
+func TestRecovery_DisableSentinel(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	sentinelPath := dbPath + ".lock"
+
+	// Open database with recovery enabled but sentinel disabled
+	config := &Config{
+		Recovery: RecoveryConfig{
+			Enabled:         true,
+			IdleAfter:       100 * time.Millisecond,
+			DisableSentinel: true,
+		},
+	}
+
+	ctx := context.Background()
+	db, err := Open(ctx, dbPath, config)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Verify sentinel file is NOT created even though recovery is enabled
+	_, err = os.Stat(sentinelPath)
+	assert.True(t, os.IsNotExist(err), "sentinel file should not exist when DisableSentinel is true")
+
+	// Check recovery state shows enabled
+	state := db.RecoveryState()
+	assert.True(t, state.Enabled)
+
+	// Create collection and add data
+	coll, err := db.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+
+	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`))
+	require.NoError(t, err)
+
+	// Wait for idle flush
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify sentinel file still doesn't exist
+	_, err = os.Stat(sentinelPath)
+	assert.True(t, os.IsNotExist(err), "sentinel file should not exist after flush when DisableSentinel is true")
+
+	// Check recovery state shows enabled
+	state = db.RecoveryState()
+	assert.True(t, state.Enabled)
+}
+
+func TestRecovery_FlushModes(t *testing.T) {
+	testCases := []struct {
+		name           string
+		mode           FlushMode
+		expectedMode   string
+	}{
+		{"FsyncOnly", FlushModeFsync, "FSYNC"},
+		{"Passive", FlushModeCheckpointPassive, "CHECKPOINT_PASSIVE"},
+		{"Full", FlushModeCheckpointFull, "CHECKPOINT_FULL"},
+		{"Restart", FlushModeCheckpointRestart, "CHECKPOINT_RESTART"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dbPath := filepath.Join(dir, "test.db")
+
+			config := &Config{
+				Recovery: RecoveryConfig{
+					Enabled:   true,
+					IdleAfter: 100 * time.Millisecond,
+					FlushMode: tc.mode,
+				},
+			}
+
+			ctx := context.Background()
+			db, err := Open(ctx, dbPath, config)
+			require.NoError(t, err)
+
+			// Create collection and add data
+			coll, err := db.CreateCollection(ctx, "test")
+			require.NoError(t, err)
+
+			err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`))
+			require.NoError(t, err)
+
+			// Wait for idle flush
+			time.Sleep(300 * time.Millisecond)
+
+			// Check recovery state
+			state := db.RecoveryState()
+			assert.True(t, state.Enabled)
+			assert.Equal(t, tc.expectedMode, state.FlushMode)
+
+			err = db.Close()
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestRecovery_ForceFlush(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	config := &Config{
+		Recovery: RecoveryConfig{
+			Enabled:   true,
+			IdleAfter: 10 * time.Second, // Very long idle time
+		},
+	}
+
+	ctx := context.Background()
+	db, err := Open(ctx, dbPath, config)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Create collection and add data
+	coll, err := db.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+
+	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":1, "data":"test"}`))
+	require.NoError(t, err)
+
+	// Wait just a bit to ensure we meet the ForceFlushIdleAfter threshold
+	time.Sleep(15 * time.Millisecond)
+
+	// Force flush immediately - should work even though not idle for regular flush
+	err = db.ForceFlush(ctx, 10*time.Millisecond, FlushModeCheckpointPassive)
+	require.NoError(t, err)
+
+	// Check recovery state
+	state := db.RecoveryState()
+	assert.True(t, state.Enabled)
+
+	// Force flush again
+	err = db.ForceFlush(ctx, 10*time.Millisecond, FlushModeCheckpointPassive)
+	require.NoError(t, err)
+}
+
+func TestRecovery_ForceFlushNotEnabled(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	// Recovery disabled
+	config := &Config{}
+
+	ctx := context.Background()
+	db, err := Open(ctx, dbPath, config)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// ForceFlush should return error when recovery is not enabled
+	err = db.ForceFlush(ctx, 10*time.Millisecond, FlushModeCheckpointPassive)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "recovery is not enabled")
+}
+
+func TestRecovery_ForceFlushImmediatelyAfterWrite(t *testing.T) {
+	// Test that ForceFlush works even when called immediately after a write
+	// This verifies the fix for the bug where ForceFlush would hang forever
+	// because each retry would reset lastWriteTime
+
+	dir, err := os.MkdirTemp(os.TempDir(), t.Name())
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	dbPath := filepath.Join(dir, "test.db")
+	db, err := Open(context.Background(), dbPath, &Config{
+		Recovery: RecoveryConfig{
+			Enabled:   true,
+			IdleAfter: 10 * time.Second,
+			FlushMode: FlushModeCheckpointPassive,
+		},
+	})
+	require.NoError(t, err)
+	defer db.Close()
+
+	ctx := context.Background()
+	coll, err := db.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+
+	// Do a write
+	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`))
+	require.NoError(t, err)
+
+	// Immediately call ForceFlush
+	// With the bug, this would hang forever
+	// With the fix, it should succeed after waitMinIdleTime
+	start := time.Now()
+	err = db.ForceFlush(ctx, 50*time.Millisecond, FlushModeCheckpointPassive)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err)
+	// Should take approximately 50ms (waitMinIdleTime), not timeout
+	assert.Less(t, elapsed, 100*time.Millisecond, "ForceFlush should complete quickly")
+	assert.Greater(t, elapsed, 40*time.Millisecond, "ForceFlush should wait for idle time")
+}
+
+func TestRecovery_ForceFlushWithTimeout(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	config := &Config{
+		Recovery: RecoveryConfig{
+			Enabled:   true,
+			IdleAfter: 10 * time.Second,
+		},
+	}
+
+	ctx := context.Background()
+	db, err := Open(ctx, dbPath, config)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Do a write so we have a lastWriteTime
+	coll, err := db.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`))
+	require.NoError(t, err)
+
+	// Wait a bit to meet waitMinIdleTime threshold
+	time.Sleep(15 * time.Millisecond)
+
+	// Try force flush with very short timeout and immediate retry
+	// This tests context cancellation handling
+	ctxTimeout, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+
+	// Should succeed even with short timeout since we waited 15ms
+	err = db.ForceFlush(ctxTimeout, 10*time.Millisecond, FlushModeCheckpointPassive)
+	assert.NoError(t, err)
+
+	// Now test with ongoing writes that prevent flush
+	stopWrites := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stopWrites:
+				return
+			default:
+				// Keep writing to prevent idle
+				_ = coll.Insert(context.Background(), anyenc.MustParseJson(`{"id":2}`))
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+	}()
+
+	// This should timeout because writes keep happening
+	ctxTimeout2, cancel2 := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel2()
+	err = db.ForceFlush(ctxTimeout2, 50*time.Millisecond, FlushModeCheckpointPassive)
+	close(stopWrites) // Stop writes after test
+	assert.Error(t, err)
+	if err != nil {
+		assert.Contains(t, err.Error(), "cancelled")
+	}
+}
