@@ -6,11 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-
-	"github.com/anyproto/any-store/internal/recovery"
+	"syscall"
 )
 
 const lockFileSuffix = ".lock"
+
+var pid = fmt.Sprintf("%d", syscall.Getpid())
 
 type SentinelTracker struct {
 	path    string
@@ -18,27 +19,13 @@ type SentinelTracker struct {
 	isDirty bool // Track dirty state to avoid unnecessary syscalls
 }
 
-func New(dbPath string) (*SentinelTracker, recovery.OnIdleSafeCallback) {
+func New(dbPath string) *SentinelTracker {
 	sentinelPath := dbPath + lockFileSuffix
 	tracker := &SentinelTracker{
 		path: sentinelPath,
 	}
 
-	onIdleSafe := func() {
-		tracker.mu.Lock()
-		defer tracker.mu.Unlock()
-
-		// Skip if already clean
-		if !tracker.isDirty {
-			return
-		}
-
-		if err := os.Remove(tracker.path); err == nil || os.IsNotExist(err) {
-			tracker.isDirty = false
-		}
-	}
-
-	return tracker, onIdleSafe
+	return tracker
 }
 
 func (s *SentinelTracker) OnOpen(ctx context.Context) (dirty bool, err error) {
@@ -86,7 +73,7 @@ func (s *SentinelTracker) MarkDirty() {
 	}
 	defer file.Close()
 
-	_, _ = file.WriteString("1")
+	_, _ = file.WriteString(pid)
 	_ = file.Sync()
 	s.isDirty = true
 }
@@ -103,8 +90,4 @@ func (s *SentinelTracker) MarkClean() {
 	if err := os.Remove(s.path); err == nil || os.IsNotExist(err) {
 		s.isDirty = false
 	}
-}
-
-func (s *SentinelTracker) Close() error {
-	return nil
 }

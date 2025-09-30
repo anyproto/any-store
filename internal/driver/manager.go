@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/anyproto/go-sqlite"
@@ -124,8 +123,7 @@ type ConnManager struct {
 	stalledConnStackTraces     map[uintptr][]uintptr
 	stalledConnDetectorEnabled bool
 
-	lastWriteRelease atomic.Value
-	observers        []WriteObserver
+	observers []WriteObserver
 }
 
 func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
@@ -152,12 +150,10 @@ func (c *ConnManager) ReleaseWrite(conn *Conn) {
 // ReleaseWriteWithOptions releases the write connection with options
 // silent: if true, doesn't notify observers (useful for flush operations or empty transactions)
 func (c *ConnManager) ReleaseWriteWithOptions(conn *Conn, silent bool) {
-	now := time.Now()
-	c.lastWriteRelease.Store(now)
 	c.writeCh <- conn
 	c.stalledReleaseConn(conn)
 	if !silent {
-		c.notifyObservers(Event{Type: EventReleaseWrite, When: now})
+		c.notifyObservers(Event{Type: EventReleaseWrite, When: time.Now()})
 	}
 }
 
@@ -300,13 +296,6 @@ func (c *ConnManager) notifyObservers(event Event) {
 	for _, observer := range c.observers {
 		observer(event)
 	}
-}
-
-func (c *ConnManager) LastWriteRelease() time.Time {
-	if v := c.lastWriteRelease.Load(); v != nil {
-		return v.(time.Time)
-	}
-	return time.Time{}
 }
 
 func checkVersion(conn *sqlite.Conn, version int, isNewDb bool) (err error) {

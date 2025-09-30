@@ -1,4 +1,4 @@
-package recovery
+package durability
 
 import (
 	"context"
@@ -11,10 +11,11 @@ import (
 type FlushMode string
 
 const (
-	FlushModeFsync             FlushMode = "FSYNC"
-	FlushModeCheckpointPassive FlushMode = "CHECKPOINT_PASSIVE"
-	FlushModeCheckpointFull    FlushMode = "CHECKPOINT_FULL"
-	FlushModeCheckpointRestart FlushMode = "CHECKPOINT_RESTART"
+	FlushModeFsync              FlushMode = "FSYNC"
+	FlushModeCheckpointPassive  FlushMode = "CHECKPOINT_PASSIVE"
+	FlushModeCheckpointFull     FlushMode = "CHECKPOINT_FULL"
+	FlushModeCheckpointRestart  FlushMode = "CHECKPOINT_RESTART"
+	FlushModeCheckpointTruncate FlushMode = "CHECKPOINT_TRUNCATE"
 )
 
 // NewFlushFunc creates a flush function based on the given FlushMode.
@@ -40,6 +41,10 @@ func NewFlushFunc(mode FlushMode) (func(ctx context.Context, conn *driver.Conn) 
 	case FlushModeCheckpointRestart:
 		return func(ctx context.Context, conn *driver.Conn) error {
 			return conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(RESTART)")
+		}, nil
+	case FlushModeCheckpointTruncate:
+		return func(ctx context.Context, conn *driver.Conn) error {
+			return conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
 		}, nil
 	default:
 		return nil, fmt.Errorf("invalid flush mode: %s", mode)

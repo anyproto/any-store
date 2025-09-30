@@ -4,7 +4,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/anyproto/any-store/internal/recovery"
+	"github.com/anyproto/any-store/internal/durability"
 )
 
 var defaultSQLiteOptions = map[string]string{
@@ -41,8 +41,8 @@ type Config struct {
 	// StalledConnectionsPanicOnClose enables panic on Close in case of any connection is not released after this timeout
 	StalledConnectionsPanicOnClose time.Duration
 
-	// RecoveryConfig provides configuration for crash recovery and idle durability
-	Recovery RecoveryConfig
+	// DurabilityConfig provides configuration for crash recovery and idle auto-flush
+	Durability DurabilityConfig
 }
 
 type FlushMode string
@@ -54,21 +54,21 @@ const (
 	FlushModeCheckpointRestart FlushMode = "CHECKPOINT_RESTART" // Checkpoint with RESTART mode + fsync
 )
 
-type RecoveryConfig struct {
-	// Enabled enables the recovery controller
-	Enabled bool
+type DurabilityConfig struct {
+	// Enable auto-flush according to IdleAfter and FlushMode
+	AutoFlush bool
 
-	// IdleAfter is the duration to wait after the last write before performing an idle flush
+	// IdleAfter is the duration to wait after the last write before performing autoflush
 	// Default: 20s
 	IdleAfter time.Duration
 
-	// FlushMode specifies how to flush data during idle periods
+	// FlushMode specifies how to autoflush data during idle periods
 	// Default: FlushModeCheckpointPassive
 	FlushMode FlushMode
 
-	// DisableSentinel disables the sentinel file (.lock) that tracks database dirty state
-	// When false (default), the sentinel file is used to detect unclean shutdowns and run QuickCheck
-	DisableSentinel bool
+	// Sentinel enables the sentinel file (.lock) that tracks database dirty state
+	// When true (default is false), the sentinel file is used to detect unclean shutdowns and perform QuickCheck on open
+	Sentinel bool
 }
 
 func (c *Config) setDefaults() {
@@ -89,12 +89,12 @@ func (c *Config) setDefaults() {
 		c.SQLiteGlobalPageCachePreallocateSizeBytes = 10 << 20
 	}
 
-	if c.Recovery.Enabled {
-		if c.Recovery.IdleAfter <= 0 {
-			c.Recovery.IdleAfter = 20 * time.Second
+	if c.Durability.AutoFlush {
+		if c.Durability.IdleAfter <= 0 {
+			c.Durability.IdleAfter = 20 * time.Second
 		}
-		if c.Recovery.FlushMode == "" {
-			c.Recovery.FlushMode = FlushModeCheckpointPassive
+		if c.Durability.FlushMode == "" {
+			c.Durability.FlushMode = FlushModeCheckpointPassive
 		}
 	}
 }
@@ -113,6 +113,6 @@ func (c *Config) pragma() map[string]string {
 }
 
 // toRecoveryFlushMode converts config.FlushMode to recovery.FlushMode
-func (m FlushMode) toRecoveryFlushMode() recovery.FlushMode {
-	return recovery.FlushMode(m)
+func (m FlushMode) toRecoveryFlushMode() durability.FlushMode {
+	return durability.FlushMode(m)
 }
