@@ -31,7 +31,20 @@ type Config struct {
 	FilterRegistry            *registry.FilterRegistry
 	Version                   int
 	ReadConnTTL               time.Duration
+
+	// WriteObservers will be called synchronously on acquire and release of the write connection
+	WriteObservers []WriteObserver
 }
+
+type EventType int
+
+const (
+	EventAcquireWrite EventType = iota
+	EventReleaseWriteWithChanges
+	EventReleaseWriteWithoutChanges
+)
+
+type WriteObserver func(eventType EventType)
 
 func NewConnManager(path string, conf Config) (*ConnManager, error) {
 	_, statErr := os.Stat(path)
@@ -65,6 +78,7 @@ func NewConnManager(path string, conf Config) (*ConnManager, error) {
 		filterRegistry: conf.FilterRegistry,
 		path:           path,
 		pragma:         conf.Pragma,
+		observers:      conf.WriteObservers,
 	}
 
 	// open write connection
@@ -104,6 +118,8 @@ type ConnManager struct {
 	stalledConnStackMutex      sync.Mutex
 	stalledConnStackTraces     map[uintptr][]uintptr
 	stalledConnDetectorEnabled bool
+
+	observers []WriteObserver
 }
 
 func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
@@ -116,6 +132,7 @@ func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
 		return nil, ErrDBIsClosed
 	case conn = <-c.writeCh:
 		c.stalledAcquireConn(conn)
+		c.notifyObservers(EventAcquireWrite)
 		return conn, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -123,8 +140,20 @@ func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
 }
 
 func (c *ConnManager) ReleaseWrite(conn *Conn) {
+	c.ReleaseWriteWithOptions(conn, false)
+}
+
+// ReleaseWriteWithOptions releases the write connection with options
+// noChanges: if true, means no changes has been made withing the write conn
+func (c *ConnManager) ReleaseWriteWithOptions(conn *Conn, noChanges bool) {
 	c.writeCh <- conn
 	c.stalledReleaseConn(conn)
+
+	if noChanges {
+		c.notifyObservers(EventReleaseWriteWithoutChanges)
+	} else {
+		c.notifyObservers(EventReleaseWriteWithChanges)
+	}
 }
 
 func (c *ConnManager) GetRead(ctx context.Context) (conn *Conn, err error) {
@@ -260,6 +289,12 @@ func (c *ConnManager) Close() (err error) {
 	err = errors.Join(err, c.writeConn.Close())
 	c.mu.Unlock()
 	return err
+}
+
+func (c *ConnManager) notifyObservers(event EventType) {
+	for _, observer := range c.observers {
+		observer(event)
+	}
 }
 
 func checkVersion(conn *sqlite.Conn, version int, isNewDb bool) (err error) {

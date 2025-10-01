@@ -105,10 +105,10 @@ func TestDb_QuickCheck(t *testing.T) {
 	assert.NoError(t, fx.QuickCheck(ctx))
 }
 
-func TestDb_Checkpoint(t *testing.T) {
+func TestDb_Flush(t *testing.T) {
 	fx := newFixture(t)
-	assert.NoError(t, fx.Checkpoint(ctx, false))
-	assert.NoError(t, fx.Checkpoint(ctx, true))
+	assert.NoError(t, fx.Flush(ctx, 0, FlushModeFsync))
+	assert.NoError(t, fx.Flush(ctx, 0, FlushModeCheckpointFull))
 }
 
 func TestDb_Backup(t *testing.T) {

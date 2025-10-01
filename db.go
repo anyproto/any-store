@@ -12,6 +12,8 @@ import (
 	"github.com/anyproto/go-sqlite"
 
 	"github.com/anyproto/any-store/internal/driver"
+	"github.com/anyproto/any-store/internal/durability"
+	"github.com/anyproto/any-store/internal/durability/sentinel"
 	"github.com/anyproto/any-store/internal/objectid"
 	"github.com/anyproto/any-store/internal/registry"
 	"github.com/anyproto/any-store/internal/sql"
@@ -48,8 +50,9 @@ type DB interface {
 	// QuickCheck performs PRAGMA quick_check to sqlite. If result not ok returns error.
 	QuickCheck(ctx context.Context) (err error)
 
-	// Checkpoint performs PRAGMA wal_checkpoint to sqlite. isFull=true - wal_checkpoint(FULL), isFull=false - wal_checkpoint(PASSIVE);
-	Checkpoint(ctx context.Context, isFull bool) (err error)
+	// Flush perform fsync or WAL checkpoint (depends on FlushMode) on sqlite
+	// When waitIdleDuration > 0, wait for waitIdleTime since the last write tx got released
+	Flush(ctx context.Context, waitIdleDuration time.Duration, mode FlushMode) error
 
 	// Backup creates a backup of the database at the specified file path.
 	// Returns an error if the operation fails.
@@ -104,6 +107,9 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		openedCollections: make(map[string]Collection),
 	}
 
+	var quickCheckNeeded bool
+	ds.recoveryController, quickCheckNeeded = ds.createRecoveryController(ctx, path)
+
 	var err error
 	conf := driver.Config{
 		Pragma:                    config.pragma(),
@@ -113,14 +119,40 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		FilterRegistry:            ds.filterReg,
 		Version:                   2,
 		ReadConnTTL:               time.Minute,
+		WriteObservers:            []driver.WriteObserver{ds.recoveryController.OnWriteEvent},
 	}
+
 	if ds.cm, err = driver.NewConnManager(path, conf); err != nil {
 		return nil, err
 	}
+
 	if err = ds.init(ctx); err != nil {
+		_ = ds.recoveryController.Stop()
 		_ = ds.cm.Close()
 		return nil, err
 	}
+
+	// Run QuickCheck if database was dirty
+	if quickCheckNeeded {
+		quickCheckCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+		if err := ds.QuickCheck(quickCheckCtx); err != nil {
+			if ds.recoveryController != nil {
+				_ = ds.recoveryController.Stop()
+			}
+			_ = ds.cm.Close()
+			return nil, fmt.Errorf("QuickCheck failed on dirty database: %w", err)
+		}
+	}
+
+	// Start recovery controller after initialization
+	if ds.recoveryController != nil {
+		if err = ds.recoveryController.Start(ctx); err != nil {
+			_ = ds.cm.Close()
+			return nil, err
+		}
+	}
+
 	return ds, nil
 }
 
@@ -129,9 +161,10 @@ type db struct {
 
 	config *Config
 
-	cm        *driver.ConnManager
-	filterReg *registry.FilterRegistry
-	sortReg   *registry.SortRegistry
+	cm                 *driver.ConnManager
+	recoveryController *durability.Controller
+	filterReg          *registry.FilterRegistry
+	sortReg            *registry.SortRegistry
 
 	syncPool *syncpool.SyncPool
 
@@ -385,19 +418,6 @@ func (db *db) QuickCheck(ctx context.Context) (err error) {
 	})
 }
 
-func (db *db) Checkpoint(ctx context.Context, isFull bool) (err error) {
-	var q = "PRAGMA wal_checkpoint(PASSIVE)"
-	if isFull {
-		q = "PRAGMA wal_checkpoint(FULL)"
-	}
-	conn, err := db.cm.GetWrite(ctx)
-	if err != nil {
-		return err
-	}
-	defer db.cm.ReleaseWrite(conn)
-	return conn.ExecNoResult(ctx, q)
-}
-
 func (db *db) Backup(ctx context.Context, path string) (err error) {
 	conn, err := db.cm.GetWrite(ctx)
 	if err != nil {
@@ -436,6 +456,15 @@ func (db *db) doWriteTx(ctx context.Context, do func(c *driver.Conn) error) erro
 		return errors.Join(err, tx.Rollback())
 	}
 	return tx.Commit()
+}
+
+func (db *db) withWriteConn(ctx context.Context, fn func(conn *driver.Conn) error) error {
+	conn, err := db.cm.GetWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.cm.ReleaseWriteWithOptions(conn, true)
+	return fn(conn)
 }
 
 func (db *db) getReadTx(ctx context.Context) (tx ReadTx, err error) {
@@ -492,7 +521,55 @@ func (db *db) Close() error {
 		}
 	}
 	db.cm.ReleaseWrite(cn)
+
+	if err := db.recoveryController.Stop(); err != nil {
+		log.Printf("recovery controller stop error: %v", err)
+	}
+
 	return db.cm.Close()
+}
+
+func (db *db) createRecoveryController(ctx context.Context, path string) (*durability.Controller, bool) {
+	// Create flush function from FlushMode
+	flushFunc, err := durability.NewFlushFunc(db.config.Durability.FlushMode.toRecoveryFlushMode())
+	if err != nil {
+		return nil, false
+	}
+
+	// Create controller with simplified options
+	opts := durability.Options{
+		AutoFlushEnable:    db.config.Durability.AutoFlush,
+		AutoFlushIdleAfter: db.config.Durability.IdleAfter,
+		AcquireWrite:       db.withWriteConn,
+		AutoFlushFunc:      flushFunc,
+	}
+
+	// Add sentinel tracker unless disabled
+	if db.config.Durability.Sentinel {
+		opts.Sentinel = sentinel.New(path)
+	}
+	controller := durability.NewController(opts)
+
+	// Store context with dbPath for debugging
+	ctx = context.WithValue(ctx, "dbPath", path)
+
+	// Check if database is dirty
+	dirty, err := controller.OnOpen(ctx)
+	if err != nil {
+		// Log error but still return controller
+		// The error will be handled when we try to start the controller
+		return controller, false
+	}
+
+	return controller, dirty
+}
+
+func (db *db) Flush(ctx context.Context, waitIdleTime time.Duration, mode FlushMode) error {
+	if db.recoveryController == nil {
+		return fmt.Errorf("recovery is not enabled")
+	}
+
+	return db.recoveryController.Flush(ctx, waitIdleTime, mode.toRecoveryFlushMode())
 }
 
 func (db *db) onCollectionClose(name string) {
