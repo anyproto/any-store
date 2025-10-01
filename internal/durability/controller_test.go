@@ -61,7 +61,7 @@ func TestController_StartStop(t *testing.T) {
 		AutoFlushEnable:    true,
 		AutoFlushIdleAfter: 100 * time.Millisecond,
 		Sentinel:           tracker,
-		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
 			return fn(nil)
 		},
 		AutoFlushFunc: func(ctx context.Context, conn *driver.Conn) error {
@@ -96,7 +96,7 @@ func TestController_IdleFlush(t *testing.T) {
 		AutoFlushEnable:    true,
 		AutoFlushIdleAfter: 100 * time.Millisecond,
 		Sentinel:           tracker,
-		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
 			return fn(nil)
 		},
 		AutoFlushFunc: func(ctx context.Context, conn *driver.Conn) error {
@@ -111,7 +111,7 @@ func TestController_IdleFlush(t *testing.T) {
 	defer controller.Stop()
 
 	controller.OnWriteEvent(driver.Event{
-		Type: driver.EventReleaseWrite,
+		Type: driver.EventReleaseWriteWithChanges,
 		When: time.Now(),
 	})
 
@@ -134,7 +134,7 @@ func TestController_RaceConditionWriteDuringFlush(t *testing.T) {
 		AutoFlushEnable:    true,
 		AutoFlushIdleAfter: 200 * time.Millisecond,
 		Sentinel:           tracker,
-		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
 			select {
 			case writeConnAcquired <- struct{}{}:
 				<-writeConnReleased
@@ -155,7 +155,7 @@ func TestController_RaceConditionWriteDuringFlush(t *testing.T) {
 
 	initialWriteTime := time.Now().Add(-300 * time.Millisecond)
 	controller.OnWriteEvent(driver.Event{
-		Type: driver.EventReleaseWrite,
+		Type: driver.EventReleaseWriteWithChanges,
 		When: initialWriteTime,
 	})
 
@@ -163,7 +163,7 @@ func TestController_RaceConditionWriteDuringFlush(t *testing.T) {
 
 	newWriteTime := time.Now().Add(-50 * time.Millisecond)
 	controller.OnWriteEvent(driver.Event{
-		Type: driver.EventReleaseWrite,
+		Type: driver.EventReleaseWriteWithChanges,
 		When: newWriteTime,
 	})
 
@@ -189,7 +189,7 @@ func TestController_FlushAfterWriteDelay(t *testing.T) {
 		AutoFlushEnable:    true,
 		AutoFlushIdleAfter: 200 * time.Millisecond,
 		Sentinel:           tracker,
-		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
 			select {
 			case acquireStarted <- struct{}{}:
 			default:
@@ -213,14 +213,14 @@ func TestController_FlushAfterWriteDelay(t *testing.T) {
 	defer controller.Stop()
 
 	controller.OnWriteEvent(driver.Event{
-		Type: driver.EventReleaseWrite,
+		Type: driver.EventReleaseWriteWithChanges,
 		When: time.Now().Add(-300 * time.Millisecond),
 	})
 
 	<-acquireStarted
 
 	controller.OnWriteEvent(driver.Event{
-		Type: driver.EventReleaseWrite,
+		Type: driver.EventReleaseWriteWithChanges,
 		When: time.Now().Add(-50 * time.Millisecond),
 	})
 
@@ -246,7 +246,7 @@ func TestController_MultipleWritesDuringFlush(t *testing.T) {
 		AutoFlushEnable:    true,
 		AutoFlushIdleAfter: 100 * time.Millisecond,
 		Sentinel:           tracker,
-		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
 			select {
 			case writeConnAcquired <- struct{}{}:
 				<-writeConnReleased
@@ -266,7 +266,7 @@ func TestController_MultipleWritesDuringFlush(t *testing.T) {
 	defer controller.Stop()
 
 	controller.OnWriteEvent(driver.Event{
-		Type: driver.EventReleaseWrite,
+		Type: driver.EventReleaseWriteWithChanges,
 		When: time.Now().Add(-200 * time.Millisecond),
 	})
 
@@ -276,7 +276,7 @@ func TestController_MultipleWritesDuringFlush(t *testing.T) {
 	// to ensure at least one write is recent enough to skip the flush
 	for i := 0; i < 5; i++ {
 		controller.OnWriteEvent(driver.Event{
-			Type: driver.EventReleaseWrite,
+			Type: driver.EventReleaseWriteWithChanges,
 			When: time.Now().Add(-time.Duration(20-i*2) * time.Millisecond),
 		})
 		time.Sleep(2 * time.Millisecond)
@@ -289,8 +289,8 @@ func TestController_MultipleWritesDuringFlush(t *testing.T) {
 	assert.Equal(t, 0, tracker.cleanCount, "Should not mark clean when flush is skipped")
 }
 
-func TestController_SilentFlushDoesNotResetWriteTime(t *testing.T) {
-	// Tests that flush operations using silent=true do not trigger write events,
+func TestController_FlushDoesNotResetWriteTime(t *testing.T) {
+	// Tests that flush operations do not trigger write events,
 	// preventing an infinite loop where flush retries would keep resetting lastWriteTime
 	tracker := &mockTracker{}
 	flushCount := 0
@@ -302,13 +302,13 @@ func TestController_SilentFlushDoesNotResetWriteTime(t *testing.T) {
 		AutoFlushEnable:    true,
 		AutoFlushIdleAfter: 10 * time.Second,
 		Sentinel:           tracker,
-		AcquireWrite: func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
 			acquireCount++
 			err := fn(nil)
 			// Only trigger write events for non-silent acquires (simulates real behavior)
-			if !silent && controller != nil {
+			if controller != nil {
 				controller.OnWriteEvent(driver.Event{
-					Type: driver.EventReleaseWrite,
+					Type: driver.EventReleaseWriteWithoutChanges,
 					When: time.Now(),
 				})
 			}
@@ -328,7 +328,7 @@ func TestController_SilentFlushDoesNotResetWriteTime(t *testing.T) {
 	defer controller.Stop()
 
 	controller.OnWriteEvent(driver.Event{
-		Type: driver.EventReleaseWrite,
+		Type: driver.EventReleaseWriteWithChanges,
 		When: time.Now(),
 	})
 

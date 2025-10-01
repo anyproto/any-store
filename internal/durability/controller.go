@@ -17,7 +17,7 @@ type Options struct {
 	AutoFlushFunc      func(ctx context.Context, conn *driver.Conn) error
 
 	// AcquireWrite acquires write connection. If silent is true, won't trigger write events on release
-	AcquireWrite func(ctx context.Context, silent bool, fn func(conn *driver.Conn) error) error
+	AcquireWrite func(ctx context.Context, fn func(conn *driver.Conn) error) error
 	Sentinel     Sentinel
 	Logger       *log.Logger
 }
@@ -112,7 +112,7 @@ func (c *Controller) Stop() error {
 }
 
 func (c *Controller) OnWriteEvent(event driver.Event) {
-	if event.Type == driver.EventReleaseWrite && c.running.Load() {
+	if event.Type == driver.EventReleaseWriteWithChanges && c.running.Load() {
 		c.lastWriteTime.Store(event.When)
 
 		if !c.opts.AutoFlushEnable {
@@ -178,7 +178,7 @@ func (c *Controller) performFlushInternalWithFunc(ctx context.Context, idleAfter
 	var flushed bool
 
 	// Use silent acquire to avoid triggering write events during flush operations
-	err := c.opts.AcquireWrite(ctx, true, func(conn *driver.Conn) error {
+	err := c.opts.AcquireWrite(ctx, func(conn *driver.Conn) error {
 		if idleAfter > 0 {
 			// Re-check if we're still idle after acquiring the connection
 			// Someone might have done writes while we were waiting

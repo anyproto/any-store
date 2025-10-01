@@ -40,7 +40,8 @@ type EventType int
 
 const (
 	EventAcquireWrite EventType = iota
-	EventReleaseWrite
+	EventReleaseWriteWithChanges
+	EventReleaseWriteWithoutChanges
 )
 
 type Event struct {
@@ -148,12 +149,15 @@ func (c *ConnManager) ReleaseWrite(conn *Conn) {
 }
 
 // ReleaseWriteWithOptions releases the write connection with options
-// silent: if true, doesn't notify observers (useful for flush operations or empty transactions)
-func (c *ConnManager) ReleaseWriteWithOptions(conn *Conn, silent bool) {
+// noChanges: if true, means no changes has been made withing the write conn
+func (c *ConnManager) ReleaseWriteWithOptions(conn *Conn, noChanges bool) {
 	c.writeCh <- conn
 	c.stalledReleaseConn(conn)
-	if !silent {
-		c.notifyObservers(Event{Type: EventReleaseWrite, When: time.Now()})
+
+	if noChanges {
+		c.notifyObservers(Event{Type: EventReleaseWriteWithoutChanges, When: time.Now()})
+	} else {
+		c.notifyObservers(Event{Type: EventReleaseWriteWithChanges, When: time.Now()})
 	}
 }
 
