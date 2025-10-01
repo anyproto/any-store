@@ -44,12 +44,7 @@ const (
 	EventReleaseWriteWithoutChanges
 )
 
-type Event struct {
-	Type EventType
-	When time.Time
-}
-
-type WriteObserver func(Event)
+type WriteObserver func(eventType EventType)
 
 func NewConnManager(path string, conf Config) (*ConnManager, error) {
 	_, statErr := os.Stat(path)
@@ -137,7 +132,7 @@ func (c *ConnManager) GetWrite(ctx context.Context) (conn *Conn, err error) {
 		return nil, ErrDBIsClosed
 	case conn = <-c.writeCh:
 		c.stalledAcquireConn(conn)
-		c.notifyObservers(Event{Type: EventAcquireWrite, When: time.Now()})
+		c.notifyObservers(EventAcquireWrite)
 		return conn, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -155,9 +150,9 @@ func (c *ConnManager) ReleaseWriteWithOptions(conn *Conn, noChanges bool) {
 	c.stalledReleaseConn(conn)
 
 	if noChanges {
-		c.notifyObservers(Event{Type: EventReleaseWriteWithoutChanges, When: time.Now()})
+		c.notifyObservers(EventReleaseWriteWithoutChanges)
 	} else {
-		c.notifyObservers(Event{Type: EventReleaseWriteWithChanges, When: time.Now()})
+		c.notifyObservers(EventReleaseWriteWithChanges)
 	}
 }
 
@@ -296,7 +291,7 @@ func (c *ConnManager) Close() (err error) {
 	return err
 }
 
-func (c *ConnManager) notifyObservers(event Event) {
+func (c *ConnManager) notifyObservers(event EventType) {
 	for _, observer := range c.observers {
 		observer(event)
 	}

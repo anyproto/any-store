@@ -111,9 +111,9 @@ func (c *Controller) Stop() error {
 	return nil
 }
 
-func (c *Controller) OnWriteEvent(event driver.Event) {
-	if event.Type == driver.EventReleaseWriteWithChanges && c.running.Load() {
-		c.lastWriteTime.Store(event.When)
+func (c *Controller) OnWriteEvent(event driver.EventType) {
+	if event == driver.EventReleaseWriteWithChanges && c.running.Load() {
+		c.lastWriteTime.Store(time.Now())
 
 		if !c.opts.AutoFlushEnable {
 			return

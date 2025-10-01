@@ -110,10 +110,7 @@ func TestController_IdleFlush(t *testing.T) {
 	require.NoError(t, err)
 	defer controller.Stop()
 
-	controller.OnWriteEvent(driver.Event{
-		Type: driver.EventReleaseWriteWithChanges,
-		When: time.Now(),
-	})
+	controller.OnWriteEvent(driver.EventReleaseWriteWithChanges)
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -153,19 +150,13 @@ func TestController_RaceConditionWriteDuringFlush(t *testing.T) {
 	err := controller.Start(ctx)
 	require.NoError(t, err)
 
-	initialWriteTime := time.Now().Add(-300 * time.Millisecond)
-	controller.OnWriteEvent(driver.Event{
-		Type: driver.EventReleaseWriteWithChanges,
-		When: initialWriteTime,
-	})
+	//initialWriteTime := time.Now().Add(-300 * time.Millisecond)
+	controller.OnWriteEvent(driver.EventReleaseWriteWithChanges)
 
 	<-writeConnAcquired
 
-	newWriteTime := time.Now().Add(-50 * time.Millisecond)
-	controller.OnWriteEvent(driver.Event{
-		Type: driver.EventReleaseWriteWithChanges,
-		When: newWriteTime,
-	})
+	//newWriteTime := time.Now().Add(-50 * time.Millisecond)
+	controller.OnWriteEvent(driver.EventReleaseWriteWithChanges)
 
 	close(writeConnReleased)
 	time.Sleep(50 * time.Millisecond)
@@ -212,17 +203,11 @@ func TestController_FlushAfterWriteDelay(t *testing.T) {
 	require.NoError(t, err)
 	defer controller.Stop()
 
-	controller.OnWriteEvent(driver.Event{
-		Type: driver.EventReleaseWriteWithChanges,
-		When: time.Now().Add(-300 * time.Millisecond),
-	})
+	controller.OnWriteEvent(driver.EventReleaseWriteWithChanges)
 
 	<-acquireStarted
 
-	controller.OnWriteEvent(driver.Event{
-		Type: driver.EventReleaseWriteWithChanges,
-		When: time.Now().Add(-50 * time.Millisecond),
-	})
+	controller.OnWriteEvent(driver.EventReleaseWriteWithChanges)
 
 	close(proceedWithAcquire)
 	time.Sleep(50 * time.Millisecond)
@@ -265,20 +250,14 @@ func TestController_MultipleWritesDuringFlush(t *testing.T) {
 	require.NoError(t, err)
 	defer controller.Stop()
 
-	controller.OnWriteEvent(driver.Event{
-		Type: driver.EventReleaseWriteWithChanges,
-		When: time.Now().Add(-200 * time.Millisecond),
-	})
+	controller.OnWriteEvent(driver.EventReleaseWriteWithChanges)
 
 	<-writeConnAcquired
 
 	// Simulate multiple writes with decreasing age (20ms, 18ms, 16ms, 14ms, 12ms ago)
 	// to ensure at least one write is recent enough to skip the flush
 	for i := 0; i < 5; i++ {
-		controller.OnWriteEvent(driver.Event{
-			Type: driver.EventReleaseWriteWithChanges,
-			When: time.Now().Add(-time.Duration(20-i*2) * time.Millisecond),
-		})
+		controller.OnWriteEvent(driver.EventReleaseWriteWithChanges)
 		time.Sleep(2 * time.Millisecond)
 	}
 
@@ -307,10 +286,7 @@ func TestController_FlushDoesNotResetWriteTime(t *testing.T) {
 			err := fn(nil)
 			// Only trigger write events for non-silent acquires (simulates real behavior)
 			if controller != nil {
-				controller.OnWriteEvent(driver.Event{
-					Type: driver.EventReleaseWriteWithoutChanges,
-					When: time.Now(),
-				})
+				controller.OnWriteEvent(driver.EventReleaseWriteWithoutChanges)
 			}
 			return err
 		},
@@ -327,10 +303,7 @@ func TestController_FlushDoesNotResetWriteTime(t *testing.T) {
 	require.NoError(t, err)
 	defer controller.Stop()
 
-	controller.OnWriteEvent(driver.Event{
-		Type: driver.EventReleaseWriteWithChanges,
-		When: time.Now(),
-	})
+	controller.OnWriteEvent(driver.EventReleaseWriteWithChanges)
 
 	time.Sleep(60 * time.Millisecond)
 
