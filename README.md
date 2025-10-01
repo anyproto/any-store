@@ -16,7 +16,7 @@ Any Store brings schema‑less flexibility, rich indexes and ACID transactions t
 * **Automatic indexes** – create, ensure or drop compound & unique indexes at runtime.
 * **ACID transactions** – explicit read / write transactions plus convenience helpers.
 * **Streaming iterators** – low‑memory scans with cursor API.
-* **Crash recovery** – automatic WAL checkpoint and fsync after idle periods.
+* **Durability** – db flush and protections mechanisms in case of power-loss.
 * **CLI** – quick inspection, import/export and interactive shell.
 * **Cross‑platform** – pure Go, no CGO, runs anywhere Go runs.
 
@@ -92,21 +92,25 @@ The full end‑to‑end example lives in [`example/`](example) and in the [API 
 | **Connection pool** | Separate read / write SQLite connections for concurrent workloads          |
 
 
-## Recovery
+## Durability
 
-Any Store includes crash recovery to ensure durability after unexpected shutdowns. When enabled, it creates a sentinel file (.lock) alongside the database to track dirty state. The sentinel is removed on clean shutdown or after successful idle flush, and recreated on the next write. If the database opens with the sentinel present (indicating a crash or unfinished writes), it runs a quick integrity check. During normal operation, it automatically performs WAL checkpoints and fsync after idle periods.
+Any Store automatically performs WAL checkpoints and fsync after idle periods to ensure data durability.
 
 ```go
 db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
-    Recovery: anystore.RecoveryConfig{
-        Enabled:   true,
+    Durability: anystore.DurabilityConfig{
+        AutoFlush: true,
         IdleAfter: 20 * time.Second,  // Flush after 20s of inactivity
+        FlushMode: anystore.FlushModeCheckpointPassive, // other options are FlushModeFsync, FlushModeCheckpointFull, FlushModeCheckpointRestart
+        Sentinel:  true,  // Track dirty db state for automatic quickCheck on start
     },
 })
 
-// Force flush before app suspension (wait for 100ms of idle)
-db.ForceFlush(ctx, 100*time.Millisecond)
+// Manual flush, e.g. before app suspension (ensure we have at least 100ms of idle, to ensure we finished pending writes)
+db.Flush(ctx, 100*time.Millisecond, anystore.FlushModeCheckpointPassive)
 ```
+
+**Sentinel:** When enabled, creates a `.lock` file to detect not explicitly persisted writes and run integrity check on open.
 
 
 ## Contributing
