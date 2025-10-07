@@ -191,7 +191,6 @@ func (c *Controller) autoFlushLoop() {
 		case <-c.autoFlushCtx.Done():
 			return
 		case <-c.timer.C:
-			fmt.Printf("### Auto flush %p after %s of idle\n", c, c.timeSinceLastWrite().String())
 			if c.timeSinceLastWrite() >= c.opts.AutoFlushIdleAfter {
 				flushed, err := c.performFlush(c.autoFlushCtx)
 				if err != nil {
@@ -239,6 +238,7 @@ func (c *Controller) performFlushInternalWithFunc(ctx context.Context, idleAfter
 		if flushErr == nil {
 			flushed = true
 		}
+
 		return flushErr
 	})
 

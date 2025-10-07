@@ -2,8 +2,10 @@ package anystore
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,7 +16,10 @@ import (
 )
 
 func TestRecovery_SentinelCleanShutdown(t *testing.T) {
-	dir := t.TempDir()
+	dir, err := os.MkdirTemp(os.TempDir(), t.Name())
+	require.NoError(t, err)
+	//defer os.RemoveAll(dir)
+
 	dbPath := filepath.Join(dir, "test.db")
 	sentinelPath := dbPath + ".lock"
 
@@ -310,13 +315,15 @@ func TestRecovery_ForceFlushWithTimeout(t *testing.T) {
 	assert.NoError(t, err)
 
 	stopWrites := make(chan struct{})
+	var counter atomic.Int64
+	counter.Store(1)
 	go func() {
 		for {
 			select {
 			case <-stopWrites:
 				return
 			default:
-				_ = coll.Insert(context.Background(), anyenc.MustParseJson(`{"id":2}`))
+				_ = coll.Insert(context.Background(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, counter.Add(1))))
 				time.Sleep(5 * time.Millisecond)
 			}
 		}

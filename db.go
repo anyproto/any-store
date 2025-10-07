@@ -229,6 +229,7 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 	tx := txPool.Get().(*commonTx)
 	tx.db = db
 	tx.con = connWrite
+	tx.modified = false
 	tx.version.Store(version)
 	wTx := writeTx{commonTx: tx, version: version}
 	tx.ctx = context.WithValue(ctx, ctxKeyTx, wTx)
@@ -404,6 +405,10 @@ func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
 }
 
 func (db *db) QuickCheck(ctx context.Context) (err error) {
+	start := time.Now()
+	defer func() {
+		fmt.Printf("QuickCheck finished in %s with err: %v\n", time.Since(start), err)
+	}()
 	return db.doWriteTx(ctx, func(c *driver.Conn) error {
 		return c.Exec(ctx, "PRAGMA quick_check", nil, func(stmt *sqlite.Stmt) error {
 			hasRow, stepErr := stmt.Step()
@@ -458,6 +463,24 @@ func (db *db) doWriteTx(ctx context.Context, do func(c *driver.Conn) error) erro
 	if err = do(tx.conn()); err != nil {
 		err = replaceInterruptErr(err)
 		return errors.Join(err, tx.Rollback())
+	}
+	tx.SetModified()
+	return tx.Commit()
+}
+
+func (db *db) doWriteTxModified(ctx context.Context, do func(c *driver.Conn) (bool, error)) error {
+	tx, err := db.WriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	var modified bool
+	if modified, err = do(tx.conn()); err != nil {
+		err = replaceInterruptErr(err)
+		return errors.Join(err, tx.Rollback())
+	}
+
+	if modified {
+		tx.SetModified()
 	}
 	return tx.Commit()
 }

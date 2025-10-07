@@ -309,7 +309,7 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 	buf2 := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf2)
 
-	if err = c.db.doWriteTx(ctx, func(cn *driver.Conn) (txErr error) {
+	if err = c.db.doWriteTxModified(ctx, func(cn *driver.Conn) (modified bool, txErr error) {
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
@@ -329,7 +329,7 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 			return
 		}
 		res.Modified = 1
-		return c.update(ctx, item{val: newVal}, it)
+		return true, c.update(ctx, item{val: newVal}, it)
 	}); err != nil {
 		return ModifyResult{}, err
 	}
@@ -343,7 +343,7 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 	buf2 := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf2)
 
-	if err = c.db.doWriteTx(ctx, func(cn *driver.Conn) (txErr error) {
+	if err = c.db.doWriteTxModified(ctx, func(cn *driver.Conn) (modified bool, txErr error) {
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
@@ -362,12 +362,12 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 				modValue = buf.Arena.NewObject()
 				idVal, txErr = buf.Parser.Parse(buf.SmallBuf)
 				if txErr != nil {
-					return txErr
+					return false, txErr
 				}
 				modValue.Set("id", idVal)
 				isInsert = true
 			} else {
-				return loadErr
+				return false, loadErr
 			}
 		} else {
 			prevItem = it
@@ -388,10 +388,10 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 		res.Modified = 1
 		if isInsert {
 			txErr = c.insertItem(ctx, buf2, item{val: newVal})
-			return txErr
+			return true, txErr
 		} else {
 			res.Matched = 1
-			return c.update(ctx, item{val: newVal}, prevItem)
+			return true, c.update(ctx, item{val: newVal}, prevItem)
 		}
 	}); err != nil {
 		return ModifyResult{}, err
@@ -472,7 +472,7 @@ func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
-	return c.db.doWriteTx(ctx, func(cn *driver.Conn) (txErr error) {
+	return c.db.doWriteTxModified(ctx, func(cn *driver.Conn) (modified bool, txErr error) {
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
@@ -481,7 +481,7 @@ func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
 		if txErr != nil {
 			return
 		}
-		return c.deleteItem(ctx, buf.SmallBuf, it)
+		return true, c.deleteItem(ctx, buf.SmallBuf, it)
 	})
 }
 
@@ -524,10 +524,13 @@ func (c *collection) EnsureIndex(ctx context.Context, info ...IndexInfo) (err er
 }
 
 func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...IndexInfo) (err error) {
+	if len(info) == 0 {
+		return nil
+	}
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 	// TODO: validate fields
-	return c.db.doWriteTx(ctx, func(cn *driver.Conn) (txErr error) {
+	return c.db.doWriteTxModified(ctx, func(cn *driver.Conn) (modified bool, txErr error) {
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
@@ -549,7 +552,7 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 		}
 
 		if len(newIndexes) == 0 {
-			return nil
+			return false, nil
 		}
 
 		txErr = cn.Exec(ctx, c.queries.findAll, nil, func(stmt *sqlite.Stmt) error {
@@ -586,7 +589,7 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		c.indexes = append(c.indexes, newIndexes...)
-		return nil
+		return true, nil
 	})
 }
 
