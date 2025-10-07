@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -412,24 +411,18 @@ func (db *db) QuickCheck(ctx context.Context) (err error) {
 	}()
 	return db.doWriteTx(ctx, func(c *driver.Conn) error {
 		return c.Exec(ctx, "PRAGMA quick_check", nil, func(stmt *sqlite.Stmt) error {
-			var results []string
-			for {
-				hasRow, stepErr := stmt.Step()
-				if stepErr != nil {
-					return stepErr
-				}
-				if !hasRow {
-					break
-				}
-				results = append(results, stmt.ColumnText(0))
+			hasRow, stepErr := stmt.Step()
+			if !hasRow {
+				return nil
 			}
-
-			if len(results) == 0 {
-				return fmt.Errorf("quick_check returned no rows")
+			if stepErr != nil {
+				return stepErr
 			}
-			if len(results) > 1 || results[0] != "ok" {
-				return fmt.Errorf("quick_check failed: %v", strings.Join(results, "; "))
+			result := stmt.ColumnText(0)
+			if result != "ok" {
+				return fmt.Errorf("quick_check not ok: %s", result)
 			}
+			return nil
 		})
 	})
 }
