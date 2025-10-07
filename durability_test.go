@@ -30,14 +30,14 @@ func TestRecovery_SentinelCleanShutdown(t *testing.T) {
 	db, err := Open(ctx, dbPath, config)
 	require.NoError(t, err)
 
-	_, err = os.Stat(sentinelPath)
-	assert.NoError(t, err, "sentinel file should exist after database open")
-
 	coll, err := db.CreateCollection(ctx, "test")
 	require.NoError(t, err)
 
 	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":"doc1", "data":"test"}`))
 	require.NoError(t, err)
+
+	_, err = os.Stat(sentinelPath)
+	assert.NoError(t, err, "sentinel file should exist after write")
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -82,14 +82,14 @@ func TestRecovery_SentinelDirtyShutdown(t *testing.T) {
 		db, err := Open(ctx, dbPath, config)
 		require.NoError(t, err)
 
-		_, err = os.Stat(sentinelPath)
-		assert.NoError(t, err, "sentinel file should exist")
-
 		coll, err := db.CreateCollection(ctx, "test")
 		require.NoError(t, err)
 
 		err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":"doc1", "data":"test"}`))
 		require.NoError(t, err)
+
+		_, err = os.Stat(sentinelPath)
+		assert.NoError(t, err, "sentinel file should exist after write")
 
 		db.Close()
 

@@ -141,7 +141,11 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 				_ = ds.recoveryController.Stop()
 			}
 			_ = ds.cm.Close()
-			return nil, fmt.Errorf("QuickCheck failed on dirty database: %w", err)
+			return nil, fmt.Errorf("%w: %w", ErrQuickCheckFailed, err)
+		}
+		// Mark DB as clean after successful quickcheck
+		if ds.recoveryController != nil {
+			ds.recoveryController.MarkCleanAfterCheck()
 		}
 	}
 
