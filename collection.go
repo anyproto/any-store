@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/anyproto/any-store/anyenc/anyencutil"
 	"github.com/anyproto/go-sqlite"
 	"github.com/valyala/fastjson"
 
@@ -294,7 +295,7 @@ func (c *collection) UpdateOne(ctx context.Context, doc *anyenc.Value) (err erro
 		return
 	}
 
-	return c.db.doWriteTx(ctx, func(cn *driver.Conn) (txErr error) {
+	return c.db.doWriteTxModified(ctx, func(cn *driver.Conn) (modified bool, txErr error) {
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
@@ -329,7 +330,7 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 			return
 		}
 		res.Modified = 1
-		return true, c.update(ctx, item{val: newVal}, it)
+		return c.update(ctx, item{val: newVal}, it)
 	}); err != nil {
 		return ModifyResult{}, err
 	}
@@ -391,7 +392,7 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 			return true, txErr
 		} else {
 			res.Matched = 1
-			return true, c.update(ctx, item{val: newVal}, prevItem)
+			return c.update(ctx, item{val: newVal}, prevItem)
 		}
 	}); err != nil {
 		return ModifyResult{}, err
@@ -399,7 +400,7 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 	return
 }
 
-func (c *collection) update(ctx context.Context, it, prevIt item) (err error) {
+func (c *collection) update(ctx context.Context, it, prevIt item) (modified bool, err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
@@ -408,6 +409,10 @@ func (c *collection) update(ctx context.Context, it, prevIt item) (err error) {
 		prevIt, err = c.loadById(ctx, buf, buf.SmallBuf)
 		if err != nil {
 			return
+		}
+
+		if anyencutil.Equal(prevIt.Value(), it.Value()) {
+			return false, nil
 		}
 	}
 
@@ -419,7 +424,7 @@ func (c *collection) update(ctx context.Context, it, prevIt item) (err error) {
 		return
 	}
 
-	return c.indexesHandleUpdate(ctx, buf.SmallBuf, prevIt, it)
+	return true, c.indexesHandleUpdate(ctx, buf.SmallBuf, prevIt, it)
 }
 
 func (c *collection) loadById(ctx context.Context, buf *syncpool.DocBuffer, id anyenc.Tuple) (it item, err error) {
@@ -455,7 +460,7 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err erro
 		return
 	}
 
-	err = c.db.doWriteTx(ctx, func(cn *driver.Conn) (txErr error) {
+	err = c.db.doWriteTxModified(ctx, func(cn *driver.Conn) (modified bool, txErr error) {
 		if txErr = c.checkStmts(ctx, cn); txErr != nil {
 			return
 		}
@@ -463,7 +468,7 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err erro
 		if errors.Is(insErr, ErrDocExists) {
 			return c.update(ctx, it, item{})
 		}
-		return insErr
+		return true, insErr
 	})
 	return err
 }
@@ -771,7 +776,7 @@ func (c *collection) Close() error {
 	if cn, err := c.db.cm.GetWrite(context.Background()); err != nil {
 		return err
 	} else {
-		defer c.db.cm.ReleaseWrite(cn)
+		defer c.db.cm.ReleaseWriteWithOptions(cn, true)
 	}
 	if err := c.close(); err != nil {
 		return err
