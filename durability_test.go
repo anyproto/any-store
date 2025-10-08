@@ -16,9 +16,7 @@ import (
 )
 
 func TestRecovery_SentinelCleanShutdown(t *testing.T) {
-	dir, err := os.MkdirTemp(os.TempDir(), t.Name())
-	require.NoError(t, err)
-	//defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	dbPath := filepath.Join(dir, "test.db")
 	sentinelPath := dbPath + ".lock"
@@ -254,9 +252,7 @@ func TestRecovery_ManualFlush(t *testing.T) {
 }
 
 func TestRecovery_ForceFlushImmediatelyAfterWrite(t *testing.T) {
-	dir, err := os.MkdirTemp(os.TempDir(), t.Name())
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	dbPath := filepath.Join(dir, "test.db")
 	db, err := Open(context.Background(), dbPath, &Config{
@@ -328,6 +324,7 @@ func TestRecovery_ForceFlushWithTimeout(t *testing.T) {
 			}
 		}
 	}()
+	time.Sleep(10 * time.Millisecond)
 
 	ctxTimeout2, cancel2 := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel2()
