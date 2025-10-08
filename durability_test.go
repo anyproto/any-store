@@ -2,8 +2,10 @@ package anystore
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 
 func TestRecovery_SentinelCleanShutdown(t *testing.T) {
 	dir := t.TempDir()
+
 	dbPath := filepath.Join(dir, "test.db")
 	sentinelPath := dbPath + ".lock"
 
@@ -30,14 +33,14 @@ func TestRecovery_SentinelCleanShutdown(t *testing.T) {
 	db, err := Open(ctx, dbPath, config)
 	require.NoError(t, err)
 
-	_, err = os.Stat(sentinelPath)
-	assert.NoError(t, err, "sentinel file should exist after database open")
-
 	coll, err := db.CreateCollection(ctx, "test")
 	require.NoError(t, err)
 
 	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":"doc1", "data":"test"}`))
 	require.NoError(t, err)
+
+	_, err = os.Stat(sentinelPath)
+	assert.NoError(t, err, "sentinel file should exist after write")
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -82,14 +85,14 @@ func TestRecovery_SentinelDirtyShutdown(t *testing.T) {
 		db, err := Open(ctx, dbPath, config)
 		require.NoError(t, err)
 
-		_, err = os.Stat(sentinelPath)
-		assert.NoError(t, err, "sentinel file should exist")
-
 		coll, err := db.CreateCollection(ctx, "test")
 		require.NoError(t, err)
 
 		err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":"doc1", "data":"test"}`))
 		require.NoError(t, err)
+
+		_, err = os.Stat(sentinelPath)
+		assert.NoError(t, err, "sentinel file should exist after write")
 
 		db.Close()
 
@@ -249,9 +252,7 @@ func TestRecovery_ManualFlush(t *testing.T) {
 }
 
 func TestRecovery_ForceFlushImmediatelyAfterWrite(t *testing.T) {
-	dir, err := os.MkdirTemp(os.TempDir(), t.Name())
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	dbPath := filepath.Join(dir, "test.db")
 	db, err := Open(context.Background(), dbPath, &Config{
@@ -310,17 +311,20 @@ func TestRecovery_ForceFlushWithTimeout(t *testing.T) {
 	assert.NoError(t, err)
 
 	stopWrites := make(chan struct{})
+	var counter atomic.Int64
+	counter.Store(1)
 	go func() {
 		for {
 			select {
 			case <-stopWrites:
 				return
 			default:
-				_ = coll.Insert(context.Background(), anyenc.MustParseJson(`{"id":2}`))
+				_ = coll.Insert(context.Background(), anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, counter.Add(1))))
 				time.Sleep(5 * time.Millisecond)
 			}
 		}
 	}()
+	time.Sleep(10 * time.Millisecond)
 
 	ctxTimeout2, cancel2 := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel2()

@@ -92,18 +92,3 @@ func TestSentinelTracker_ConcurrentAccess(t *testing.T) {
 		<-done
 	}
 }
-
-func TestSentinelTracker_NestedDirectories(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "nested", "path", "test.db")
-	sentinelPath := dbPath + lockFileSuffix
-
-	tracker := New(dbPath)
-
-	tracker.MarkDirty()
-
-	_, err := os.Stat(sentinelPath)
-	assert.NoError(t, err, "sentinel should be created even in nested directories")
-
-	os.RemoveAll(filepath.Join(dir, "nested"))
-}

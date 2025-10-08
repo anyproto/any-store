@@ -74,7 +74,7 @@ func TestController_StartStop(t *testing.T) {
 
 	err := controller.Start(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 1, tracker.dirtyCount)
+	assert.Equal(t, 0, tracker.dirtyCount, "Should not mark dirty on Start()")
 
 	err = controller.Start(ctx)
 	assert.Error(t, err)

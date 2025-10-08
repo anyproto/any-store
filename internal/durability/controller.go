@@ -72,6 +72,14 @@ func (c *Controller) OnOpen(ctx context.Context) (dirty bool, err error) {
 	return dirty, nil
 }
 
+// MarkCleanAfterCheck marks the DB as clean after a successful integrity check.
+// This should be called after quickcheck/integrity verification when no corruption is found.
+func (c *Controller) MarkCleanAfterCheck() {
+	if c.opts.Sentinel != nil {
+		c.opts.Sentinel.MarkClean()
+	}
+}
+
 func (c *Controller) Start(ctx context.Context) error {
 	if !c.running.CompareAndSwap(false, true) {
 		return fmt.Errorf("controller already running")
@@ -82,10 +90,6 @@ func (c *Controller) Start(ctx context.Context) error {
 	if c.opts.AutoFlushEnable {
 		c.autoFlushWG.Add(1)
 		go c.autoFlushLoop()
-	}
-
-	if c.opts.Sentinel != nil {
-		c.opts.Sentinel.MarkDirty()
 	}
 
 	return nil
@@ -114,6 +118,11 @@ func (c *Controller) Stop() error {
 func (c *Controller) OnWriteEvent(event driver.EventType) {
 	if event == driver.EventReleaseWriteWithChanges && c.running.Load() {
 		c.lastWriteTime.Store(time.Now().UnixMilli())
+
+		// Mark DB as dirty on first write
+		if c.opts.Sentinel != nil {
+			c.opts.Sentinel.MarkDirty()
+		}
 
 		if !c.opts.AutoFlushEnable {
 			return
@@ -229,6 +238,7 @@ func (c *Controller) performFlushInternalWithFunc(ctx context.Context, idleAfter
 		if flushErr == nil {
 			flushed = true
 		}
+
 		return flushErr
 	})
 

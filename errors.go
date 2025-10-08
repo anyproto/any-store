@@ -45,7 +45,11 @@ var (
 	// ErrIterClosed is returned when operations are attempted on a closed iterator.
 	ErrIterClosed = errors.New("any-store: iterator is closed")
 
-	ErrDBIsClosed          = driver.ErrDBIsClosed
+	// ErrQuickCheckFailed is returned when we did a quick check (e.g. when opening db in a dirty state with sentinel config on) and it failed, indicating possible database corruption.
+	ErrQuickCheckFailed = errors.New("any-store: quick check failed on db open")
+
+	ErrDBIsClosed = driver.ErrDBIsClosed
+
 	ErrDBIsNotOpened       = driver.ErrDBIsNotOpened
 	ErrIncompatibleVersion = driver.ErrIncompatibleVersion
 )

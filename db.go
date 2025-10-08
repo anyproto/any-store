@@ -84,6 +84,9 @@ type DBStats struct {
 
 	// DataSizeBytes is the total size of the data stored in the database in bytes, excluding free space.
 	DataSizeBytes int
+
+	DirtyOnOpen             bool          // indicates we have sentinel file on open
+	DirtyQuickCheckDuration time.Duration // time spent in quickcheck if dirty
 }
 
 // Open opens a database at the specified path with the given configuration.
@@ -134,6 +137,8 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 
 	// Run QuickCheck if database was dirty
 	if quickCheckNeeded {
+		ds.dirtyOnOpen = true
+		start := time.Now()
 		quickCheckCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
 		if err := ds.QuickCheck(quickCheckCtx); err != nil {
@@ -141,7 +146,12 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 				_ = ds.recoveryController.Stop()
 			}
 			_ = ds.cm.Close()
-			return nil, fmt.Errorf("QuickCheck failed on dirty database: %w", err)
+			return nil, fmt.Errorf("%w: %w", ErrQuickCheckFailed, err)
+		}
+		ds.dirtyQuickCheckDuration = time.Since(start)
+		// Mark DB as clean after successful quickcheck
+		if ds.recoveryController != nil {
+			ds.recoveryController.MarkCleanAfterCheck()
 		}
 	}
 
@@ -180,7 +190,10 @@ type db struct {
 
 	openedCollections map[string]Collection
 	closed            atomic.Bool
-	mu                sync.Mutex
+
+	dirtyOnOpen             bool
+	dirtyQuickCheckDuration time.Duration
+	mu                      sync.Mutex
 }
 
 func (db *db) init(ctx context.Context) error {
@@ -225,6 +238,7 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 	tx := txPool.Get().(*commonTx)
 	tx.db = db
 	tx.con = connWrite
+	tx.modified = false
 	tx.version.Store(version)
 	wTx := writeTx{commonTx: tx, version: version}
 	tx.ctx = context.WithValue(ctx, ctxKeyTx, wTx)
@@ -396,6 +410,8 @@ func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
 		}
 		return
 	})
+	stats.DirtyOnOpen = db.dirtyOnOpen
+	stats.DirtyQuickCheckDuration = db.dirtyQuickCheckDuration
 	return
 }
 
@@ -454,6 +470,24 @@ func (db *db) doWriteTx(ctx context.Context, do func(c *driver.Conn) error) erro
 	if err = do(tx.conn()); err != nil {
 		err = replaceInterruptErr(err)
 		return errors.Join(err, tx.Rollback())
+	}
+	tx.SetModified()
+	return tx.Commit()
+}
+
+func (db *db) doWriteTxModified(ctx context.Context, do func(c *driver.Conn) (bool, error)) error {
+	tx, err := db.WriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	var modified bool
+	if modified, err = do(tx.conn()); err != nil {
+		err = replaceInterruptErr(err)
+		return errors.Join(err, tx.Rollback())
+	}
+
+	if modified {
+		tx.SetModified()
 	}
 	return tx.Commit()
 }

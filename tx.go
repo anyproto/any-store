@@ -24,10 +24,13 @@ func newTxVersion() uint32 {
 type WriteTx interface {
 	// ReadTx is embedded to provide read-only transaction methods.
 	ReadTx
-
 	// Rollback rolls back the transaction.
 	// Returns an error if the rollback fails.
 	Rollback() error
+
+	// SetModified marks the transaction as having made modifications
+	// used internally for sentinel mechanism
+	SetModified()
 }
 
 // ReadTx represents a read-only transaction.
@@ -51,10 +54,16 @@ type commonTx struct {
 	ctx     context.Context
 	con     *driver.Conn
 	version atomic.Uint32
+
+	modified bool // indicates if the writeConn made any actual modifications
 }
 
 func (tx *commonTx) conn() *driver.Conn {
 	return tx.con
+}
+
+func (tx *commonTx) SetModified() {
+	tx.modified = true
 }
 
 func (tx *commonTx) instanceId() string {
@@ -100,7 +109,7 @@ func (w writeTx) Context() context.Context {
 
 func (w writeTx) Rollback() error {
 	if w.commonTx.version.CompareAndSwap(w.version, 0) {
-		defer w.db.cm.ReleaseWrite(w.con)
+		defer w.db.cm.ReleaseWriteWithOptions(w.con, true)
 		defer txPool.Put(w.commonTx)
 		return w.con.Rollback(context.Background())
 	}
@@ -109,9 +118,12 @@ func (w writeTx) Rollback() error {
 
 func (w writeTx) Commit() error {
 	if w.commonTx.version.CompareAndSwap(w.version, 0) {
-		defer w.db.cm.ReleaseWrite(w.con)
 		defer txPool.Put(w.commonTx)
-		return w.con.Commit(context.Background())
+		err := w.con.Commit(context.Background())
+
+		// Use ReleaseWriteWithOptions with noChanges flag based on whether transaction made changes
+		w.db.cm.ReleaseWriteWithOptions(w.con, !w.modified)
+		return err
 	}
 	return nil
 }

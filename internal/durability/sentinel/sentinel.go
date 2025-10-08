@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sync"
 	"syscall"
 )
@@ -56,11 +55,6 @@ func (s *SentinelTracker) MarkDirty() {
 	// Check if file already exists before trying to create
 	if _, err := os.Stat(s.path); err == nil {
 		s.isDirty = true
-		return
-	}
-
-	dir := filepath.Dir(s.path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
 		return
 	}
 
