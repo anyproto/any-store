@@ -554,7 +554,7 @@ func (db *db) Close() error {
 			log.Printf("collection close error: %v", cErr)
 		}
 	}
-	db.cm.ReleaseWrite(cn)
+	db.cm.ReleaseWriteWithOptions(cn, true)
 
 	if err := db.recoveryController.Stop(); err != nil {
 		log.Printf("recovery controller stop error: %v", err)

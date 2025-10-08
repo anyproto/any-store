@@ -413,8 +413,6 @@ func (c *collection) update(ctx context.Context, it, prevIt item) (modified bool
 
 		if anyencutil.Equal(prevIt.Value(), it.Value()) {
 			return false, nil
-		} else {
-			fmt.Printf("### update %s: %s != %s\n", string(buf.SmallBuf), prevIt.Value().String(), it.Value().String())
 		}
 	}
 
@@ -778,7 +776,7 @@ func (c *collection) Close() error {
 	if cn, err := c.db.cm.GetWrite(context.Background()); err != nil {
 		return err
 	} else {
-		defer c.db.cm.ReleaseWrite(cn)
+		defer c.db.cm.ReleaseWriteWithOptions(cn, true)
 	}
 	if err := c.close(); err != nil {
 		return err
