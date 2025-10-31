@@ -118,6 +118,14 @@ func (a *Arena) NewFalse() *Value {
 	return valueFalse
 }
 
+// NewBool returns true or false value based on v.
+func (a *Arena) NewBool(v bool) *Value {
+	if v {
+		return valueTrue
+	}
+	return valueFalse
+}
+
 // NewFromFastJson creates Value from passed fastjson.Value
 func (a *Arena) NewFromFastJson(jv *fastjson.Value) *Value {
 	switch jv.Type() {
