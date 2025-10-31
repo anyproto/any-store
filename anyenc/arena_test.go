@@ -41,6 +41,29 @@ func TestArena_Reset(t *testing.T) {
 	wg.Wait()
 }
 
+func TestArena_NewBool(t *testing.T) {
+	a := &Arena{}
+	
+	t.Run("true", func(t *testing.T) {
+		v := a.NewBool(true)
+		assert.NotNil(t, v)
+		assert.Equal(t, TypeTrue, v.Type())
+		assert.True(t, v.GetBool())
+	})
+	
+	t.Run("false", func(t *testing.T) {
+		v := a.NewBool(false)
+		assert.NotNil(t, v)
+		assert.Equal(t, TypeFalse, v.Type())
+		assert.False(t, v.GetBool())
+	})
+	
+	t.Run("consistency with NewTrue and NewFalse", func(t *testing.T) {
+		assert.Equal(t, a.NewTrue(), a.NewBool(true))
+		assert.Equal(t, a.NewFalse(), a.NewBool(false))
+	})
+}
+
 func BenchmarkArena_Reset(b *testing.B) {
 	a := &Arena{}
 	b.ReportAllocs()
