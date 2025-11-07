@@ -267,16 +267,20 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 }
 
 func (db *db) CreateCollection(ctx context.Context, collectionName string) (Collection, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
 	return db.createCollection(ctx, collectionName)
 }
 
 func (db *db) createCollection(ctx context.Context, collectionName string) (Collection, error) {
+	db.mu.Lock()
 	if _, ok := db.openedCollections[collectionName]; ok {
+		db.mu.Unlock()
 		return nil, ErrCollectionExists
 	}
+	db.mu.Unlock()
+	var coll Collection
 	err := db.doWriteTx(ctx, func(c *driver.Conn) error {
+		db.mu.Lock()
+		defer db.mu.Unlock()
 		err := db.stmt.registerCollection.Exec(ctx, func(stmt *sqlite.Stmt) {
 			stmt.BindText(1, collectionName)
 		}, driver.StmtExecNoResults)
@@ -287,16 +291,16 @@ func (db *db) createCollection(ctx context.Context, collectionName string) (Coll
 		if err = c.ExecNoResult(ctx, db.sql.Collection(collectionName).Create()); err != nil {
 			return err
 		}
+		if coll, err = newCollection(ctx, db, collectionName); err != nil {
+			return err
+		}
+		db.openedCollections[collectionName] = coll
+
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	coll, err := newCollection(ctx, db, collectionName)
-	if err != nil {
-		return nil, err
-	}
-	db.openedCollections[collectionName] = coll
 	return coll, nil
 }
 
@@ -346,8 +350,6 @@ func (db *db) Collection(ctx context.Context, collectionName string) (Collection
 	if !errors.Is(err, ErrCollectionNotFound) {
 		return nil, err
 	}
-	db.mu.Lock()
-	defer db.mu.Unlock()
 	coll, err = db.createCollection(ctx, collectionName)
 	if err == nil {
 		return coll, nil
@@ -355,7 +357,7 @@ func (db *db) Collection(ctx context.Context, collectionName string) (Collection
 	if !errors.Is(err, ErrCollectionExists) {
 		return nil, err
 	}
-	return db.openCollection(ctx, collectionName)
+	return db.OpenCollection(ctx, collectionName)
 }
 
 func (db *db) GetCollectionNames(ctx context.Context) (collectionNames []string, err error) {
