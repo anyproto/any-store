@@ -46,7 +46,7 @@ func (c *Conn) makeAutocomplete() (err error) {
 	c.autocompleteColl = c.autocompleteColl[:0]
 	for _, collName := range collNames {
 		c.autocompleteDb = append(c.autocompleteDb, "db."+collName+".")
-		for _, cmd := range []string{"insert", "find", "deleteId", "update", "upsert", "ensureIndex", "dropIndex", "drop", "count"} {
+		for _, cmd := range []string{"insert", "find", "findOne", "deleteId", "update", "upsert", "ensureIndex", "dropIndex", "drop", "count"} {
 			c.autocompleteColl = append(c.autocompleteColl, "db."+collName+"."+cmd+"(")
 		}
 		c.js.RegisterCollection(collName)
@@ -84,6 +84,8 @@ func (c *Conn) ExecCmd(cmd Cmd) (result string, err error) {
 		return c.Count(cmd)
 	case "find":
 		return c.Find(cmd)
+	case "findOne":
+		return c.FindOne(cmd)
 	case "findId":
 		return c.FindId(cmd)
 	case "deleteId":
@@ -293,6 +295,38 @@ func (c *Conn) Drop(cmd Cmd) (result string, err error) {
 	if err = coll.Drop(mainCtx.Ctx()); err != nil {
 		return "", err
 	}
+	return
+}
+
+func (c *Conn) FindOne(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	q := coll.Find(cmd.Query.Find)
+	q.Limit(1)
+
+	iter, err := q.Iter(mainCtx.Ctx())
+	if err != nil {
+		return "", err
+	}
+	defer iter.Close()
+	if iter.Next() {
+		var doc anystore.Doc
+		if doc, err = iter.Doc(); err != nil {
+			return "", err
+		}
+		var anyVal any
+		if err = json.Unmarshal([]byte(doc.Value().String()), &anyVal); err != nil {
+			return "", err
+		}
+		res, err := json.MarshalIndent(anyVal, "", "  ")
+		if err != nil {
+			return "", err
+		}
+		fmt.Println(string(res))
+	}
+	err = iter.Err()
 	return
 }
 

@@ -99,6 +99,22 @@ Collection.prototype.find = function (condition) {
     return this.query;
 }
 
+Collection.prototype.findOne = function (condition) {
+    this.query.query.find = condition || {}
+    this.query.query.limit = 1
+    this.query.cmd = "findOne"
+    var res = JSON.stringify(this.query);
+    this.query.cmd = "find";
+    this.query.query = {
+        find: {},
+    };
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
 Collection.prototype.count = function () {
     var res = JSON.stringify({
         collection: this.collection,
