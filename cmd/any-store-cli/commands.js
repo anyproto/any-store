@@ -71,7 +71,7 @@ Query.prototype.delete = function () {
 }
 
 Query.prototype.update = function (upd) {
-    this.query.update = upd;
+    this.query.update = upd || {};
     var res = JSON.stringify(this);
     this.query = {};
     return {
@@ -95,7 +95,7 @@ function Collection(name) {
 }
 
 Collection.prototype.find = function (condition) {
-    this.query.query.find = condition
+    this.query.query.find = condition || {}
     return this.query;
 }
 

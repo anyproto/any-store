@@ -36,6 +36,9 @@ func Test_Js(t *testing.T) {
 		assertCmd(t, `db.coll.find()`, Cmd{
 			Cmd:        "find",
 			Collection: "coll",
+			Query: Query{
+				Find: json.RawMessage(`{}`),
+			},
 		})
 	})
 	t.Run("find with limit offset sort", func(t *testing.T) {
