@@ -29,16 +29,18 @@ func openConn(path string) (err error) {
 var conn *Conn
 
 type Conn struct {
-	db               anystore.DB
-	js               *js
-	autocomplete     []string
-	autocompleteDb   []string
-	autocompleteColl []string
+	db                anystore.DB
+	js                *js
+	autocomplete      []string
+	autocompleteDb    []string
+	autocompleteColl  []string
+	autocompleteQuery []string
 }
 
 func (c *Conn) makeAutocomplete() (err error) {
 	c.autocomplete = append(c.autocomplete[:0], "show collections", "show stats", "db.")
 	c.autocompleteDb = append(c.autocompleteDb[:0], "db.createCollection(")
+	c.autocompleteQuery = append(c.autocompleteQuery[:0], "limit(", "offset(", "sort(", "hint(", "pretty()", "count()", "explain()", "delete()", "update(")
 	collNames, err := c.db.GetCollectionNames(mainCtx.Ctx())
 	if err != nil {
 		return
@@ -46,7 +48,7 @@ func (c *Conn) makeAutocomplete() (err error) {
 	c.autocompleteColl = c.autocompleteColl[:0]
 	for _, collName := range collNames {
 		c.autocompleteDb = append(c.autocompleteDb, "db."+collName+".")
-		for _, cmd := range []string{"insert", "find", "findOne", "deleteId", "update", "upsert", "ensureIndex", "dropIndex", "drop", "count"} {
+		for _, cmd := range []string{"insert", "find", "findOne", "findId", "deleteId", "update", "upsert", "ensureIndex", "dropIndex", "drop", "count"} {
 			c.autocompleteColl = append(c.autocompleteColl, "db."+collName+"."+cmd+"(")
 		}
 		c.js.RegisterCollection(collName)
@@ -101,22 +103,59 @@ func (c *Conn) ExecCmd(cmd Cmd) (result string, err error) {
 }
 
 func (c *Conn) Complete(line string) (result []string) {
-	line = strings.ToLower(line)
-	var autocomplete []string
-	if !strings.HasPrefix(line, "db.") {
-		autocomplete = c.autocomplete
-	} else {
-		if strings.Count(line, ".") == 1 {
-			autocomplete = c.autocompleteDb
+	lowerLine := strings.ToLower(line)
+	if !strings.HasPrefix(lowerLine, "db.") {
+		for _, cmd := range c.autocomplete {
+			if strings.HasPrefix(cmd, lowerLine) {
+				result = append(result, cmd)
+			}
+		}
+		return
+	}
+
+	dotCount := strings.Count(lowerLine, ".")
+	if dotCount == 1 {
+		for _, cmd := range c.autocompleteDb {
+			if strings.HasPrefix(cmd, lowerLine) {
+				result = append(result, cmd)
+			}
+		}
+		return
+	}
+
+	// find the last dot or parenthesis
+	lastDot := strings.LastIndex(line, ".")
+	lastParen := strings.LastIndex(line, ")")
+
+	if lastDot > lastParen {
+		// we are after a dot, suggest methods
+		prefix := line[:lastDot+1]
+		toComplete := strings.ToLower(line[lastDot+1:])
+
+		// check if it's db.collection. or something else
+		if strings.Count(line, ".") == 2 && !strings.Contains(line, "(") {
+			for _, cmd := range c.autocompleteColl {
+				if strings.HasPrefix(strings.ToLower(cmd), lowerLine) {
+					result = append(result, cmd)
+				}
+			}
 		} else {
-			autocomplete = c.autocompleteColl
+			// suggest query methods
+			for _, cmd := range c.autocompleteQuery {
+				if strings.HasPrefix(cmd, toComplete) {
+					result = append(result, prefix+cmd)
+				}
+			}
+		}
+	} else {
+		// we might be in the middle of a command or at the start
+		for _, cmd := range c.autocompleteColl {
+			if strings.HasPrefix(strings.ToLower(cmd), lowerLine) {
+				result = append(result, cmd)
+			}
 		}
 	}
-	for _, cmd := range autocomplete {
-		if strings.HasPrefix(cmd, line) {
-			result = append(result, cmd)
-		}
-	}
+
 	return
 }
 
