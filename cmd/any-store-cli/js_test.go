@@ -62,6 +62,13 @@ func Test_Js(t *testing.T) {
 			Query:      Query{Find: json.RawMessage(`{"a":"b"}`), Explain: true},
 		})
 	})
+	t.Run("find pretty", func(t *testing.T) {
+		assertCmd(t, `db.coll.find({a:"b"}).pretty()`, Cmd{
+			Cmd:        "find",
+			Collection: "coll",
+			Query:      Query{Find: json.RawMessage(`{"a":"b"}`), Pretty: true},
+		})
+	})
 	t.Run("find update", func(t *testing.T) {
 		assertCmd(t, `db.coll.find({a:"b"}).update({b:"c"})`, Cmd{
 			Cmd:        "find",
@@ -129,6 +136,14 @@ func Test_Js(t *testing.T) {
 			Cmd:        "findId",
 			Collection: "coll",
 			Documents:  []json.RawMessage{json.RawMessage(`1`), json.RawMessage(`2`)},
+		})
+	})
+	t.Run("findId pretty", func(t *testing.T) {
+		assertCmd(t, `db.coll.findId(1).pretty()`, Cmd{
+			Cmd:        "findId",
+			Collection: "coll",
+			Documents:  []json.RawMessage{json.RawMessage(`1`)},
+			Query:      Query{Pretty: true},
 		})
 	})
 }

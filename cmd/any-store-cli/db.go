@@ -264,7 +264,11 @@ func (c *Conn) FindId(cmd Cmd) (result string, err error) {
 	if err != nil {
 		return
 	}
-	result = doc.Value().String()
+	if cmd.Query.Pretty {
+		result, err = prettyJson(doc.Value().String())
+	} else {
+		result = doc.Value().String()
+	}
 	return
 }
 
@@ -316,15 +320,11 @@ func (c *Conn) FindOne(cmd Cmd) (result string, err error) {
 		if doc, err = iter.Doc(); err != nil {
 			return "", err
 		}
-		var anyVal any
-		if err = json.Unmarshal([]byte(doc.Value().String()), &anyVal); err != nil {
-			return "", err
-		}
-		res, err := json.MarshalIndent(anyVal, "", "  ")
+		res, err := prettyJson(doc.Value().String())
 		if err != nil {
 			return "", err
 		}
-		fmt.Println(string(res))
+		fmt.Println(res)
 	}
 	err = iter.Err()
 	return
@@ -408,10 +408,30 @@ func (c *Conn) Find(cmd Cmd) (result string, err error) {
 		if doc, err = iter.Doc(); err != nil {
 			return "", err
 		}
-		fmt.Println(doc.Value().String())
+		if cmd.Query.Pretty {
+			res, err := prettyJson(doc.Value().String())
+			if err != nil {
+				return "", err
+			}
+			fmt.Println(res)
+		} else {
+			fmt.Println(doc.Value().String())
+		}
 	}
 	err = iter.Err()
 	return
+}
+
+func prettyJson(s string) (string, error) {
+	var anyVal any
+	if err := json.Unmarshal([]byte(s), &anyVal); err != nil {
+		return "", err
+	}
+	res, err := json.MarshalIndent(anyVal, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(res), nil
 }
 
 func toAnySlice[T any](slice []T) []any {

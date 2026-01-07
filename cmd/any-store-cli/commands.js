@@ -37,6 +37,11 @@ Query.prototype.hint = function (hint) {
     return this
 }
 
+Query.prototype.pretty = function () {
+    this.query.pretty = true;
+    return this
+}
+
 Query.prototype.count = function () {
     this.query.count = true;
     var res = JSON.stringify(this);
@@ -218,16 +223,9 @@ Collection.prototype.deleteId = function () {
 }
 
 Collection.prototype.findId = function () {
-    var res = JSON.stringify({
-        collection: this.collection,
-        cmd: "findId",
-        documents: Array.prototype.slice.call(arguments)
-    });
-    return {
-        result: function () {
-            return res
-        }
-    }
+    this.query.cmd = "findId"
+    this.query.documents = Array.prototype.slice.call(arguments)
+    return this.query
 }
 
 var db = new DB();

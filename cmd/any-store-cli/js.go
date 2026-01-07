@@ -48,6 +48,7 @@ type Query struct {
 	Count   bool            `json:"count"`
 	Delete  bool            `json:"delete"`
 	Explain bool            `json:"explain"`
+	Pretty  bool            `json:"pretty"`
 	Sort    []string        `json:"sort"`
 	Hint    map[string]int  `json:"hint"`
 }
