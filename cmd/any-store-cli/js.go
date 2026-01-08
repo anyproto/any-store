@@ -35,6 +35,7 @@ func (j *js) init() (err error) {
 type Cmd struct {
 	Cmd        string            `json:"cmd"`
 	Collection string            `json:"collection"`
+	Path       string            `json:"path"`
 	Index      Index             `json:"index"`
 	Query      Query             `json:"query"`
 	Documents  []json.RawMessage `json:"documents"`

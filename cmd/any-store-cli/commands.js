@@ -11,6 +11,17 @@ DB.prototype.createCollection = function (name) {
     }
 }
 
+DB.prototype.backup = function (path) {
+    return {
+        result: function () {
+            return JSON.stringify({
+                cmd: 'backup',
+                path: path,
+            })
+        }
+    }
+}
+
 function Query(name) {
     this.collection = name;
     this.cmd = "find";

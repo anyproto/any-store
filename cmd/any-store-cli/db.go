@@ -39,7 +39,7 @@ type Conn struct {
 
 func (c *Conn) makeAutocomplete() (err error) {
 	c.autocomplete = append(c.autocomplete[:0], "show collections", "show stats", "db.")
-	c.autocompleteDb = append(c.autocompleteDb[:0], "db.createCollection(")
+	c.autocompleteDb = append(c.autocompleteDb[:0], "db.createCollection(", "db.backup(")
 	c.autocompleteQuery = append(c.autocompleteQuery[:0], "limit(", "offset(", "sort(", "hint(", "pretty()", "count()", "explain()", "delete()", "update(")
 	collNames, err := c.db.GetCollectionNames(mainCtx.Ctx())
 	if err != nil {
@@ -76,6 +76,8 @@ func (c *Conn) ExecCmd(cmd Cmd) (result string, err error) {
 		return c.ShowStats()
 	case "createCollection":
 		return c.CreateCollection(cmd)
+	case "backup":
+		return c.Backup(cmd)
 	case "insert":
 		return c.Insert(cmd)
 	case "update":
@@ -186,6 +188,17 @@ func (c *Conn) CreateCollection(cmd Cmd) (result string, err error) {
 		_ = c.makeAutocomplete()
 	}
 	return
+}
+
+func (c *Conn) Backup(cmd Cmd) (result string, err error) {
+	if cmd.Path == "" {
+		return "", fmt.Errorf("backup path is required")
+	}
+	err = c.db.Backup(mainCtx.Ctx(), cmd.Path)
+	if err != nil {
+		return "", err
+	}
+	return "ok", nil
 }
 
 func (c *Conn) Insert(cmd Cmd) (result string, err error) {
