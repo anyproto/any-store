@@ -40,7 +40,7 @@ type Conn struct {
 func (c *Conn) makeAutocomplete() (err error) {
 	c.autocomplete = append(c.autocomplete[:0], "show collections", "show stats", "db.")
 	c.autocompleteDb = append(c.autocompleteDb[:0], "db.createCollection(", "db.backup(")
-	c.autocompleteQuery = append(c.autocompleteQuery[:0], "limit(", "offset(", "sort(", "hint(", "pretty()", "count()", "explain()", "delete()", "update(")
+	c.autocompleteQuery = append(c.autocompleteQuery[:0], "limit(", "offset(", "sort(", "hint(", "project(", "pretty()", "count()", "explain()", "delete()", "update(")
 	collNames, err := c.db.GetCollectionNames(mainCtx.Ctx())
 	if err != nil {
 		return
@@ -316,10 +316,18 @@ func (c *Conn) FindId(cmd Cmd) (result string, err error) {
 	if err != nil {
 		return
 	}
+
+	val := doc.Value()
+	if len(cmd.Query.Project) > 0 {
+		if val, err = applyProjection(val, cmd.Query.Project); err != nil {
+			return
+		}
+	}
+
 	if cmd.Query.Pretty {
-		result, err = prettyJson(doc.Value().String())
+		result, err = prettyJson(val.String())
 	} else {
-		result = doc.Value().String()
+		result = val.String()
 	}
 	return
 }
@@ -372,7 +380,15 @@ func (c *Conn) FindOne(cmd Cmd) (result string, err error) {
 		if doc, err = iter.Doc(); err != nil {
 			return "", err
 		}
-		res, err := prettyJson(doc.Value().String())
+
+		val := doc.Value()
+		if len(cmd.Query.Project) > 0 {
+			if val, err = applyProjection(val, cmd.Query.Project); err != nil {
+				return "", err
+			}
+		}
+
+		res, err := prettyJson(val.String())
 		if err != nil {
 			return "", err
 		}
@@ -460,14 +476,20 @@ func (c *Conn) Find(cmd Cmd) (result string, err error) {
 		if doc, err = iter.Doc(); err != nil {
 			return "", err
 		}
+		val := doc.Value()
+		if len(cmd.Query.Project) > 0 {
+			if val, err = applyProjection(val, cmd.Query.Project); err != nil {
+				return "", err
+			}
+		}
 		if cmd.Query.Pretty {
-			res, err := prettyJson(doc.Value().String())
+			res, err := prettyJson(val.String())
 			if err != nil {
 				return "", err
 			}
 			fmt.Println(res)
 		} else {
-			fmt.Println(doc.Value().String())
+			fmt.Println(val.String())
 		}
 	}
 	err = iter.Err()
@@ -492,4 +514,47 @@ func toAnySlice[T any](slice []T) []any {
 		res[i] = v
 	}
 	return res
+}
+
+func applyProjection(val *anyenc.Value, projection json.RawMessage) (*anyenc.Value, error) {
+	var projMap map[string]int
+	if err := json.Unmarshal(projection, &projMap); err != nil {
+		return nil, err
+	}
+	if len(projMap) == 0 {
+		return val, nil
+	}
+
+	obj, err := val.Object()
+	if err != nil {
+		return val, nil // Not an object, can't project
+	}
+
+	// Check if it's inclusion or exclusion projection
+	inclusion := false
+	for _, v := range projMap {
+		if v > 0 {
+			inclusion = true
+			break
+		}
+	}
+
+	arena := &anyenc.Arena{}
+	newVal := arena.NewObject()
+	if inclusion {
+		obj.Visit(func(k []byte, v *anyenc.Value) {
+			key := string(k)
+			if projMap[key] > 0 || key == "id" {
+				newVal.Set(key, v)
+			}
+		})
+	} else {
+		obj.Visit(func(k []byte, v *anyenc.Value) {
+			key := string(k)
+			if projMap[key] == 0 {
+				newVal.Set(key, v)
+			}
+		})
+	}
+	return newVal, nil
 }

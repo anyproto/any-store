@@ -44,6 +44,7 @@ type Cmd struct {
 type Query struct {
 	Find    json.RawMessage `json:"find"`
 	Update  json.RawMessage `json:"update"`
+	Project json.RawMessage `json:"project"`
 	Limit   int             `json:"limit"`
 	Offset  int             `json:"offset"`
 	Count   bool            `json:"count"`

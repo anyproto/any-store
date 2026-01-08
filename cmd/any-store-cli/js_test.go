@@ -75,6 +75,13 @@ func Test_Js(t *testing.T) {
 			Query:      Query{Find: json.RawMessage(`{"a":"b"}`), Pretty: true},
 		})
 	})
+	t.Run("find project", func(t *testing.T) {
+		assertCmd(t, `db.coll.find({a:"b"}).project({a:1})`, Cmd{
+			Cmd:        "find",
+			Collection: "coll",
+			Query:      Query{Find: json.RawMessage(`{"a":"b"}`), Project: json.RawMessage(`{"a":1}`)},
+		})
+	})
 	t.Run("find update", func(t *testing.T) {
 		assertCmd(t, `db.coll.find({a:"b"}).update({b:"c"})`, Cmd{
 			Cmd:        "find",

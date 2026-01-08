@@ -48,6 +48,11 @@ Query.prototype.hint = function (hint) {
     return this
 }
 
+Query.prototype.project = function (project) {
+    this.query.project = project;
+    return this
+}
+
 Query.prototype.pretty = function () {
     this.query.pretty = true;
     return this
