@@ -38,7 +38,7 @@ type Conn struct {
 }
 
 func (c *Conn) makeAutocomplete() (err error) {
-	c.autocomplete = append(c.autocomplete[:0], "show collections", "show stats", "db.")
+	c.autocomplete = append(c.autocomplete[:0], "show collections", "show stats", "db.", "help")
 	c.autocompleteDb = append(c.autocompleteDb[:0], "db.createCollection(", "db.backup(")
 	c.autocompleteQuery = append(c.autocompleteQuery[:0], "limit(", "offset(", "sort(", "hint(", "project(", "pretty()", "count()", "explain()", "delete()", "update(")
 	collNames, err := c.db.GetCollectionNames(mainCtx.Ctx())
@@ -58,6 +58,11 @@ func (c *Conn) makeAutocomplete() (err error) {
 
 func (c *Conn) Exec(cmdLine string) (result string, err error) {
 	var cmd Cmd
+	if strings.HasPrefix(cmdLine, "help") {
+		cmd.Cmd = "help"
+		cmd.Path = strings.TrimSpace(strings.TrimPrefix(cmdLine, "help"))
+		return c.ExecCmd(cmd)
+	}
 	if strings.HasPrefix(cmdLine, "db.") {
 		if cmd, err = c.js.GetQuery(cmdLine); err != nil {
 			return
@@ -100,12 +105,104 @@ func (c *Conn) ExecCmd(cmd Cmd) (result string, err error) {
 		return c.DropIndex(cmd)
 	case "drop":
 		return c.Drop(cmd)
+	case "help":
+		return c.Help(cmd)
 	}
 	return "", fmt.Errorf("unexpected command: %s", cmd.Cmd)
 }
 
+var helpData = map[string]string{
+	"show collections": "Description: Show all collections in the database\nExample: show collections",
+	"show stats":       "Description: Show database statistics\nExample: show stats",
+	"createCollection": "Description: Create a new collection\nExample: db.createCollection(\"myCollection\")",
+	"backup":           "Description: Backup the database to a file\nExample: db.backup(\"backup.db\")",
+	"insert":           "Description: Insert one or more documents into a collection\nExample: db.collection.insert({id: \"1\", name: \"test\"})",
+	"update":           "Description: Update documents in a collection\nExample: db.collection.update({$set: {name: \"new name\"}})",
+	"upsert":           "Description: Upsert documents into a collection\nExample: db.collection.upsert({id: \"1\", name: \"test\"})",
+	"count":            "Description: Count documents in a collection\nExample: db.collection.count()",
+	"find":             "Description: Find documents in a collection\nExample: db.collection.find({name: \"test\"}).limit(10)",
+	"findOne":          "Description: Find one document in a collection\nExample: db.collection.findOne({id: \"1\"})",
+	"findId":           "Description: Find documents by ID\nExample: db.collection.findId(\"1\", \"2\")",
+	"deleteId":         "Description: Delete documents by ID\nExample: db.collection.deleteId(\"1\", \"2\")",
+	"ensureIndex":      "Description: Create an index on a collection\nExample: db.collection.ensureIndex({name: \"indexName\", fields: [\"fieldName\"], unique: true})",
+	"dropIndex":        "Description: Drop an index from a collection\nExample: db.collection.dropIndex(\"indexName\")",
+	"drop":             "Description: Drop a collection\nExample: db.collection.drop()",
+	"limit":            "Description: Limit the number of documents returned by a query\nExample: db.collection.find({}).limit(10)",
+	"offset":           "Description: Skip a number of documents in a query\nExample: db.collection.find({}).offset(20)",
+	"sort":             "Description: Sort the documents returned by a query\nExample: db.collection.find({}).sort(\"name\", \"-age\")",
+	"hint":             "Description: Force the use of a specific index\nExample: db.collection.find({}).hint({indexName: 1})",
+	"project":          "Description: Specify the fields to return in a query\nExample: db.collection.find({}).project({name: 1, age: 1})",
+	"pretty":           "Description: Pretty-print the JSON output\nExample: db.collection.find({}).pretty()",
+	"explain":          "Description: Show the query execution plan\nExample: db.collection.find({}).explain()",
+	"delete":           "Description: Delete the documents matched by a query\nExample: db.collection.find({status: \"old\"}).delete()",
+}
+
+func (c *Conn) Help(cmd Cmd) (string, error) {
+	if cmd.Path == "" {
+		var sb strings.Builder
+		sb.WriteString("Available commands:\n")
+		sb.WriteString("  show collections\n")
+		sb.WriteString("  show stats\n")
+		sb.WriteString("  db\n")
+		sb.WriteString("    .createCollection(name)\n")
+		sb.WriteString("    .backup(path)\n")
+		sb.WriteString("    .{collection}\n")
+		sb.WriteString("      .insert(doc, ...)\n")
+		sb.WriteString("      .upsert(doc, ...)\n")
+		sb.WriteString("      .find(query)\n")
+		sb.WriteString("        .limit(n)\n")
+		sb.WriteString("        .offset(n)\n")
+		sb.WriteString("        .sort(field, ...)\n")
+		sb.WriteString("        .project(spec)\n")
+		sb.WriteString("        .hint(spec)\n")
+		sb.WriteString("        .count()\n")
+		sb.WriteString("        .explain()\n")
+		sb.WriteString("        .pretty()\n")
+		sb.WriteString("        .update(doc)\n")
+		sb.WriteString("        .delete()\n")
+		sb.WriteString("      .findOne(query)\n")
+		sb.WriteString("      .findId(id, ...)\n")
+		sb.WriteString("      .update(updateDoc)\n")
+		sb.WriteString("      .deleteId(id, ...)\n")
+		sb.WriteString("      .count()\n")
+		sb.WriteString("      .ensureIndex(indexDef)\n")
+		sb.WriteString("      .dropIndex(name)\n")
+		sb.WriteString("      .drop()\n")
+		sb.WriteString("\nUse \"help {command}\" for more information on a specific command.")
+		return sb.String(), nil
+	}
+
+	if help, ok := helpData[cmd.Path]; ok {
+		return help, nil
+	}
+
+	// Try to match without "db.collection." or "db." prefix if the user typed that
+	cleanCmd := cmd.Path
+	if strings.HasPrefix(cleanCmd, "db.") {
+		parts := strings.Split(cleanCmd, ".")
+		if len(parts) > 1 {
+			cleanCmd = parts[len(parts)-1]
+		}
+	}
+	if help, ok := helpData[cleanCmd]; ok {
+		return help, nil
+	}
+
+	return "", fmt.Errorf("no help available for command: %s", cmd.Path)
+}
+
 func (c *Conn) Complete(line string) (result []string) {
 	lowerLine := strings.ToLower(line)
+	if strings.HasPrefix(lowerLine, "help ") {
+		prefix := line[:5]
+		toComplete := strings.ToLower(line[5:])
+		for cmd := range helpData {
+			if strings.HasPrefix(strings.ToLower(cmd), toComplete) {
+				result = append(result, prefix+cmd)
+			}
+		}
+		return
+	}
 	if !strings.HasPrefix(lowerLine, "db.") {
 		for _, cmd := range c.autocomplete {
 			if strings.HasPrefix(cmd, lowerLine) {
