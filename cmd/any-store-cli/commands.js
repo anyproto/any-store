@@ -11,6 +11,16 @@ DB.prototype.createCollection = function (name) {
     }
 }
 
+DB.prototype.quickCheck = function () {
+    return {
+        result: function () {
+            return JSON.stringify({
+                cmd: 'quickCheck',
+            })
+        }
+    }
+}
+
 DB.prototype.backup = function (path) {
     return {
         result: function () {
@@ -148,6 +158,31 @@ Collection.prototype.count = function () {
     }
 }
 
+Collection.prototype.getIndexes = function () {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "getIndexes",
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.rename = function (newName) {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "rename",
+        path: newName,
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
 Collection.prototype.ensureIndex = function (index) {
     var res = JSON.stringify({
         collection: this.collection,
@@ -217,6 +252,32 @@ Collection.prototype.update = function () {
         collection: this.collection,
         cmd: "update",
         documents: Array.prototype.slice.call(arguments)
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.updateId = function (id, mod) {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "updateId",
+        documents: [id, mod]
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.upsertId = function (id, mod) {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "upsertId",
+        documents: [id, mod]
     });
     return {
         result: function () {

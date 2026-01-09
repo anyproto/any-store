@@ -24,6 +24,7 @@ func TestAppendAnyValue(t *testing.T) {
 		int64(10),
 		float32(32.32),
 		float64(64.64),
+		MustParseJson(`{"test":"value"}`),
 	}
 
 	for _, v := range values {

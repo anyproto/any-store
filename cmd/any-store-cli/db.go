@@ -3,10 +3,13 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 
 	anystore "github.com/anyproto/any-store"
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/query"
+	_ "net/http/pprof"
 )
 
 func openConn(path string) (err error) {
@@ -26,6 +29,10 @@ func openConn(path string) (err error) {
 	return
 }
 
+func init() {
+	go http.ListenAndServe(":6060", nil)
+}
+
 var conn *Conn
 
 type Conn struct {
@@ -39,7 +46,7 @@ type Conn struct {
 
 func (c *Conn) makeAutocomplete() (err error) {
 	c.autocomplete = append(c.autocomplete[:0], "show collections", "show stats", "db.", "help")
-	c.autocompleteDb = append(c.autocompleteDb[:0], "db.createCollection(", "db.backup(")
+	c.autocompleteDb = append(c.autocompleteDb[:0], "db.createCollection(", "db.backup(", "db.quickCheck()")
 	c.autocompleteQuery = append(c.autocompleteQuery[:0], "limit(", "offset(", "sort(", "hint(", "project(", "pretty()", "count()", "explain()", "delete()", "update(")
 	collNames, err := c.db.GetCollectionNames(mainCtx.Ctx())
 	if err != nil {
@@ -48,7 +55,7 @@ func (c *Conn) makeAutocomplete() (err error) {
 	c.autocompleteColl = c.autocompleteColl[:0]
 	for _, collName := range collNames {
 		c.autocompleteDb = append(c.autocompleteDb, "db."+collName+".")
-		for _, cmd := range []string{"insert", "find", "findOne", "findId", "deleteId", "update", "upsert", "ensureIndex", "dropIndex", "drop", "count"} {
+		for _, cmd := range []string{"insert", "find", "findOne", "findId", "deleteId", "update", "updateId", "upsert", "upsertId", "ensureIndex", "dropIndex", "getIndexes", "rename", "drop", "count"} {
 			c.autocompleteColl = append(c.autocompleteColl, "db."+collName+"."+cmd+"(")
 		}
 		c.js.RegisterCollection(collName)
@@ -79,16 +86,24 @@ func (c *Conn) ExecCmd(cmd Cmd) (result string, err error) {
 		return c.ShowCollections()
 	case "show stats":
 		return c.ShowStats()
+	case "quickCheck":
+		return c.QuickCheck()
 	case "createCollection":
 		return c.CreateCollection(cmd)
 	case "backup":
 		return c.Backup(cmd)
+	case "rename":
+		return c.Rename(cmd)
 	case "insert":
 		return c.Insert(cmd)
 	case "update":
 		return c.Update(cmd)
+	case "updateId":
+		return c.UpdateId(cmd)
 	case "upsert":
 		return c.Upsert(cmd)
+	case "upsertId":
+		return c.UpsertId(cmd)
 	case "count":
 		return c.Count(cmd)
 	case "find":
@@ -103,6 +118,8 @@ func (c *Conn) ExecCmd(cmd Cmd) (result string, err error) {
 		return c.EnsureIndex(cmd)
 	case "dropIndex":
 		return c.DropIndex(cmd)
+	case "getIndexes":
+		return c.GetIndexes(cmd)
 	case "drop":
 		return c.Drop(cmd)
 	case "help":
@@ -114,18 +131,23 @@ func (c *Conn) ExecCmd(cmd Cmd) (result string, err error) {
 var helpData = map[string]string{
 	"show collections": "Description: Show all collections in the database\nExample: show collections",
 	"show stats":       "Description: Show database statistics\nExample: show stats",
+	"quickCheck":       "Description: Perform a quick check of the database integrity\nExample: db.quickCheck()",
 	"createCollection": "Description: Create a new collection\nExample: db.createCollection(\"myCollection\")",
 	"backup":           "Description: Backup the database to a file\nExample: db.backup(\"backup.db\")",
+	"rename":           "Description: Rename the collection\nExample: db.collection.rename(\"newName\")",
 	"insert":           "Description: Insert one or more documents into a collection\nExample: db.collection.insert({id: \"1\", name: \"test\"})",
 	"update":           "Description: Update documents in a collection\nExample: db.collection.update({$set: {name: \"new name\"}})",
+	"updateId":         "Description: Update a document by ID with a modifier\nExample: db.collection.updateId(\"1\", {$set: {name: \"new name\"}})",
 	"upsert":           "Description: Upsert documents into a collection\nExample: db.collection.upsert({id: \"1\", name: \"test\"})",
+	"upsertId":         "Description: Upsert a document by ID with a modifier\nExample: db.collection.upsertId(\"1\", {$set: {name: \"new name\"}})",
 	"count":            "Description: Count documents in a collection\nExample: db.collection.count()",
 	"find":             "Description: Find documents in a collection\nExample: db.collection.find({name: \"test\"}).limit(10)",
 	"findOne":          "Description: Find one document in a collection\nExample: db.collection.findOne({id: \"1\"})",
 	"findId":           "Description: Find documents by ID\nExample: db.collection.findId(\"1\", \"2\")",
 	"deleteId":         "Description: Delete documents by ID\nExample: db.collection.deleteId(\"1\", \"2\")",
-	"ensureIndex":      "Description: Create an index on a collection\nExample: db.collection.ensureIndex({name: \"indexName\", fields: [\"fieldName\"], unique: true})",
+	"ensureIndex":      "Description: Ensure an index exists on a collection\nExample: db.collection.ensureIndex({name: \"indexName\", fields: [\"fieldName\"], unique: true})",
 	"dropIndex":        "Description: Drop an index from a collection\nExample: db.collection.dropIndex(\"indexName\")",
+	"getIndexes":       "Description: Get all indexes on a collection\nExample: db.collection.getIndexes()",
 	"drop":             "Description: Drop a collection\nExample: db.collection.drop()",
 	"limit":            "Description: Limit the number of documents returned by a query\nExample: db.collection.find({}).limit(10)",
 	"offset":           "Description: Skip a number of documents in a query\nExample: db.collection.find({}).offset(20)",
@@ -146,9 +168,11 @@ func (c *Conn) Help(cmd Cmd) (string, error) {
 		sb.WriteString("  db\n")
 		sb.WriteString("    .createCollection(name)\n")
 		sb.WriteString("    .backup(path)\n")
+		sb.WriteString("    .quickCheck()\n")
 		sb.WriteString("    .{collection}\n")
 		sb.WriteString("      .insert(doc, ...)\n")
 		sb.WriteString("      .upsert(doc, ...)\n")
+		sb.WriteString("      .upsertId(id, mod)\n")
 		sb.WriteString("      .find(query)\n")
 		sb.WriteString("        .limit(n)\n")
 		sb.WriteString("        .offset(n)\n")
@@ -163,10 +187,13 @@ func (c *Conn) Help(cmd Cmd) (string, error) {
 		sb.WriteString("      .findOne(query)\n")
 		sb.WriteString("      .findId(id, ...)\n")
 		sb.WriteString("      .update(updateDoc)\n")
+		sb.WriteString("      .updateId(id, mod)\n")
 		sb.WriteString("      .deleteId(id, ...)\n")
 		sb.WriteString("      .count()\n")
 		sb.WriteString("      .ensureIndex(indexDef)\n")
 		sb.WriteString("      .dropIndex(name)\n")
+		sb.WriteString("      .getIndexes()\n")
+		sb.WriteString("      .rename(newName)\n")
 		sb.WriteString("      .drop()\n")
 		sb.WriteString("\nUse \"help {command}\" for more information on a specific command.")
 		return sb.String(), nil
@@ -279,6 +306,14 @@ func (c *Conn) ShowStats() (result string, err error) {
 	return buf.String(), nil
 }
 
+func (c *Conn) QuickCheck() (result string, err error) {
+	err = c.db.QuickCheck(mainCtx.Ctx())
+	if err != nil {
+		return "", err
+	}
+	return "ok", nil
+}
+
 func (c *Conn) CreateCollection(cmd Cmd) (result string, err error) {
 	_, err = c.db.CreateCollection(mainCtx.Ctx(), cmd.Collection)
 	if err == nil {
@@ -295,6 +330,18 @@ func (c *Conn) Backup(cmd Cmd) (result string, err error) {
 	if err != nil {
 		return "", err
 	}
+	return "ok", nil
+}
+
+func (c *Conn) Rename(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	if err = coll.Rename(mainCtx.Ctx(), cmd.Path); err != nil {
+		return
+	}
+	_ = c.makeAutocomplete()
 	return "ok", nil
 }
 
@@ -353,6 +400,60 @@ func (c *Conn) Update(cmd Cmd) (result string, err error) {
 	return
 }
 
+func (c *Conn) UpdateId(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	if len(cmd.Documents) < 2 {
+		return "", fmt.Errorf(`expected id and modifier`)
+	}
+	id, err := anyenc.ParseJson(string(cmd.Documents[0]))
+	if err != nil {
+		return
+	}
+	modVal, err := anyenc.ParseJson(string(cmd.Documents[1]))
+	if err != nil {
+		return
+	}
+	mod, err := query.ParseModifier(modVal)
+	if err != nil {
+		return
+	}
+	res, err := coll.UpdateId(mainCtx.Ctx(), id, mod)
+	if err != nil {
+		return
+	}
+	return fmt.Sprintf("matched: %v, modified: %v", res.Matched, res.Modified), nil
+}
+
+func (c *Conn) UpsertId(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	if len(cmd.Documents) < 2 {
+		return "", fmt.Errorf(`expected id and modifier`)
+	}
+	id, err := anyenc.ParseJson(string(cmd.Documents[0]))
+	if err != nil {
+		return
+	}
+	modVal, err := anyenc.ParseJson(string(cmd.Documents[1]))
+	if err != nil {
+		return
+	}
+	mod, err := query.ParseModifier(modVal)
+	if err != nil {
+		return
+	}
+	res, err := coll.UpsertId(mainCtx.Ctx(), id, mod)
+	if err != nil {
+		return
+	}
+	return fmt.Sprintf("matched: %v, modified: %v", res.Matched, res.Modified), nil
+}
+
 func (c *Conn) Count(cmd Cmd) (result string, err error) {
 	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
 	if err != nil {
@@ -395,6 +496,23 @@ func (c *Conn) DropIndex(cmd Cmd) (result string, err error) {
 		return
 	}
 	return
+}
+
+func (c *Conn) GetIndexes(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	indexes := coll.GetIndexes()
+	infos := make([]anystore.IndexInfo, len(indexes))
+	for i, idx := range indexes {
+		infos[i] = idx.Info()
+	}
+	var b []byte
+	if b, err = json.MarshalIndent(infos, "", "  "); err != nil {
+		return
+	}
+	return string(b), nil
 }
 
 func (c *Conn) FindId(cmd Cmd) (result string, err error) {

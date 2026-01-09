@@ -159,4 +159,36 @@ func Test_Js(t *testing.T) {
 			Query:      Query{Pretty: true},
 		})
 	})
+	t.Run("quickCheck", func(t *testing.T) {
+		assertCmd(t, `db.quickCheck()`, Cmd{
+			Cmd: "quickCheck",
+		})
+	})
+	t.Run("getIndexes", func(t *testing.T) {
+		assertCmd(t, `db.coll.getIndexes()`, Cmd{
+			Cmd:        "getIndexes",
+			Collection: "coll",
+		})
+	})
+	t.Run("rename", func(t *testing.T) {
+		assertCmd(t, `db.coll.rename("newName")`, Cmd{
+			Cmd:        "rename",
+			Collection: "coll",
+			Path:       "newName",
+		})
+	})
+	t.Run("updateId", func(t *testing.T) {
+		assertCmd(t, `db.coll.updateId(1, {$set:{a:1}})`, Cmd{
+			Cmd:        "updateId",
+			Collection: "coll",
+			Documents:  []json.RawMessage{json.RawMessage(`1`), json.RawMessage(`{"$set":{"a":1}}`)},
+		})
+	})
+	t.Run("upsertId", func(t *testing.T) {
+		assertCmd(t, `db.coll.upsertId(1, {$set:{a:1}})`, Cmd{
+			Cmd:        "upsertId",
+			Collection: "coll",
+			Documents:  []json.RawMessage{json.RawMessage(`1`), json.RawMessage(`{"$set":{"a":1}}`)},
+		})
+	})
 }

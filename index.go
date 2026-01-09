@@ -19,18 +19,18 @@ import (
 type IndexInfo struct {
 	// Name is the name of the index. If empty, it will be generated
 	// based on the fields (e.g., "name,-createdDate").
-	Name string
+	Name string `json:"name"`
 
 	// Fields are the fields included in the index. Each field can specify
 	// ascending (e.g., "name") or descending (e.g., "-createdDate") order.
-	Fields []string
+	Fields []string `json:"fields"`
 
 	// Unique indicates whether the index enforces a unique constraint.
-	Unique bool
+	Unique bool `json:"unique"`
 
 	// Sparse indicates whether the index is sparse, indexing only documents
 	// with the specified fields.
-	Sparse bool
+	Sparse bool `json:"sparse"`
 }
 
 func (i IndexInfo) createName() string {

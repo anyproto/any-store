@@ -61,6 +61,8 @@ func AppendAnyValue(b []byte, v any) []byte {
 		} else {
 			b = append(b, uint8(TypeFalse))
 		}
+	case *Value:
+		return tv.MarshalTo(b)
 	default:
 		panic(fmt.Sprintf("TODO: make other types: %T", v))
 	}
