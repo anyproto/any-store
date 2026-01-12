@@ -35,6 +35,7 @@ func (j *js) init() (err error) {
 type Cmd struct {
 	Cmd        string            `json:"cmd"`
 	Collection string            `json:"collection"`
+	Path       string            `json:"path"`
 	Index      Index             `json:"index"`
 	Query      Query             `json:"query"`
 	Documents  []json.RawMessage `json:"documents"`
@@ -43,11 +44,13 @@ type Cmd struct {
 type Query struct {
 	Find    json.RawMessage `json:"find"`
 	Update  json.RawMessage `json:"update"`
+	Project json.RawMessage `json:"project"`
 	Limit   int             `json:"limit"`
 	Offset  int             `json:"offset"`
 	Count   bool            `json:"count"`
 	Delete  bool            `json:"delete"`
 	Explain bool            `json:"explain"`
+	Pretty  bool            `json:"pretty"`
 	Sort    []string        `json:"sort"`
 	Hint    map[string]int  `json:"hint"`
 }

@@ -11,10 +11,36 @@ DB.prototype.createCollection = function (name) {
     }
 }
 
+DB.prototype.quickCheck = function () {
+    return {
+        result: function () {
+            return JSON.stringify({
+                cmd: 'quickCheck',
+            })
+        }
+    }
+}
+
+DB.prototype.backup = function (path) {
+    return {
+        result: function () {
+            return JSON.stringify({
+                cmd: 'backup',
+                path: path,
+            })
+        }
+    }
+}
+
 function Query(name) {
     this.collection = name;
     this.cmd = "find";
     this.query = {};
+}
+
+Query.prototype.reset = function () {
+    this.query = {};
+    this.cmd = "find";
 }
 
 Query.prototype.limit = function (limit) {
@@ -34,6 +60,16 @@ Query.prototype.sort = function (limit) {
 
 Query.prototype.hint = function (hint) {
     this.query.hint = hint;
+    return this
+}
+
+Query.prototype.project = function (project) {
+    this.query.project = project;
+    return this
+}
+
+Query.prototype.pretty = function () {
+    this.query.pretty = true;
     return this
 }
 
@@ -71,7 +107,7 @@ Query.prototype.delete = function () {
 }
 
 Query.prototype.update = function (upd) {
-    this.query.update = upd;
+    this.query.update = upd || {};
     var res = JSON.stringify(this);
     this.query = {};
     return {
@@ -83,7 +119,7 @@ Query.prototype.update = function (upd) {
 
 Query.prototype.result = function () {
     var res = JSON.stringify(this);
-    this.query = {};
+    this.reset();
     return res
 }
 
@@ -95,14 +131,56 @@ function Collection(name) {
 }
 
 Collection.prototype.find = function (condition) {
-    this.query.query.find = condition
+    this.query.reset();
+    this.query.query.find = condition || {}
     return this.query;
+}
+
+Collection.prototype.findOne = function (condition) {
+    this.query.reset();
+    this.query.query.find = condition || {}
+    this.query.query.limit = 1
+    this.query.query.pretty = true
+    this.query.cmd = "findOne"
+    var res = JSON.stringify(this.query);
+    this.query.cmd = "find";
+    this.query.reset();
+    return {
+        result: function () {
+            return res
+        }
+    }
 }
 
 Collection.prototype.count = function () {
     var res = JSON.stringify({
         collection: this.collection,
         cmd: "count",
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.getIndexes = function () {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "getIndexes",
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.rename = function (newName) {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "rename",
+        path: newName,
     });
     return {
         result: function () {
@@ -188,6 +266,32 @@ Collection.prototype.update = function () {
     }
 }
 
+Collection.prototype.updateId = function (id, mod) {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "updateId",
+        documents: [id, mod]
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.upsertId = function (id, mod) {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "upsertId",
+        documents: [id, mod]
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
 Collection.prototype.deleteId = function () {
     var res = JSON.stringify({
         collection: this.collection,
@@ -202,15 +306,16 @@ Collection.prototype.deleteId = function () {
 }
 
 Collection.prototype.findId = function () {
-    var res = JSON.stringify({
-        collection: this.collection,
-        cmd: "findId",
-        documents: Array.prototype.slice.call(arguments)
-    });
-    return {
-        result: function () {
-            return res
-        }
+    this.query.cmd = "findId"
+    this.query.documents = Array.prototype.slice.call(arguments)
+    return this.query
+}
+
+var it = {
+    result: function () {
+        return JSON.stringify({
+            cmd: 'it',
+        })
     }
 }
 

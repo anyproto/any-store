@@ -11,6 +11,8 @@ require (
 	github.com/stretchr/testify v1.11.1
 )
 
+replace github.com/anyproto/any-store => ../../
+
 require (
 	github.com/anyproto/go-sqlite v1.4.2-any // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect

@@ -26,6 +26,12 @@ func Test_Js(t *testing.T) {
 			Collection: "collName",
 		})
 	})
+	t.Run("backup", func(t *testing.T) {
+		assertCmd(t, `db.backup("backupPath")`, Cmd{
+			Cmd:  "backup",
+			Path: "backupPath",
+		})
+	})
 	t.Run("count", func(t *testing.T) {
 		assertCmd(t, `db.coll.count()`, Cmd{
 			Cmd:        "count",
@@ -36,6 +42,9 @@ func Test_Js(t *testing.T) {
 		assertCmd(t, `db.coll.find()`, Cmd{
 			Cmd:        "find",
 			Collection: "coll",
+			Query: Query{
+				Find: json.RawMessage(`{}`),
+			},
 		})
 	})
 	t.Run("find with limit offset sort", func(t *testing.T) {
@@ -57,6 +66,20 @@ func Test_Js(t *testing.T) {
 			Cmd:        "find",
 			Collection: "coll",
 			Query:      Query{Find: json.RawMessage(`{"a":"b"}`), Explain: true},
+		})
+	})
+	t.Run("find pretty", func(t *testing.T) {
+		assertCmd(t, `db.coll.find({a:"b"}).pretty()`, Cmd{
+			Cmd:        "find",
+			Collection: "coll",
+			Query:      Query{Find: json.RawMessage(`{"a":"b"}`), Pretty: true},
+		})
+	})
+	t.Run("find project", func(t *testing.T) {
+		assertCmd(t, `db.coll.find({a:"b"}).project({a:1})`, Cmd{
+			Cmd:        "find",
+			Collection: "coll",
+			Query:      Query{Find: json.RawMessage(`{"a":"b"}`), Project: json.RawMessage(`{"a":1}`)},
 		})
 	})
 	t.Run("find update", func(t *testing.T) {
@@ -126,6 +149,44 @@ func Test_Js(t *testing.T) {
 			Cmd:        "findId",
 			Collection: "coll",
 			Documents:  []json.RawMessage{json.RawMessage(`1`), json.RawMessage(`2`)},
+		})
+	})
+	t.Run("findId pretty", func(t *testing.T) {
+		assertCmd(t, `db.coll.findId(1).pretty()`, Cmd{
+			Cmd:        "findId",
+			Collection: "coll",
+			Documents:  []json.RawMessage{json.RawMessage(`1`)},
+			Query:      Query{Pretty: true},
+		})
+	})
+	t.Run("quickCheck", func(t *testing.T) {
+		assertCmd(t, `db.quickCheck()`, Cmd{
+			Cmd: "quickCheck",
+		})
+	})
+	t.Run("getIndexes", func(t *testing.T) {
+		assertCmd(t, `db.coll.getIndexes()`, Cmd{
+			Cmd:        "getIndexes",
+			Collection: "coll",
+		})
+	})
+	t.Run("rename", func(t *testing.T) {
+		assertCmd(t, `db.coll.rename("newName")`, Cmd{
+			Cmd:        "rename",
+			Collection: "coll",
+			Path:       "newName",
+		})
+	})
+	t.Run("updateId", func(t *testing.T) {
+		assertCmd(t, `db.coll.updateId(1, {$set:{a:1}})`, Cmd{
+			Cmd:        "updateId",
+			Collection: "coll",
+			Documents:  []json.RawMessage{json.RawMessage(`1`), json.RawMessage(`{"$set":{"a":1}}`)},
+		})
+	})
+	t.Run("it", func(t *testing.T) {
+		assertCmd(t, `it`, Cmd{
+			Cmd: "it",
 		})
 	})
 }
