@@ -3,15 +3,13 @@ module github.com/anyproto/any-store/cmd/any-store-cli
 go 1.24.0
 
 require (
-	github.com/anyproto/any-store v0.4.3-0.20251107160214-2fda0e7c9396
+	github.com/anyproto/any-store v0.4.4
 	github.com/fatih/color v1.18.0
 	github.com/peterh/liner v1.2.2
 	github.com/robertkrimen/otto v0.5.1
 	github.com/spf13/pflag v1.0.6
 	github.com/stretchr/testify v1.11.1
 )
-
-replace github.com/anyproto/any-store => ../../
 
 require (
 	github.com/anyproto/go-sqlite v1.4.2-any // indirect
@@ -25,14 +23,14 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
-	github.com/valyala/fastjson v1.6.4 // indirect
-	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
-	golang.org/x/sys v0.37.0 // indirect
+	github.com/valyala/fastjson v1.6.7 // indirect
+	golang.org/x/exp v0.0.0-20251219203646-944ab1f22d93 // indirect
+	golang.org/x/sys v0.40.0 // indirect
 	golang.org/x/text v0.22.0 // indirect
 	gopkg.in/sourcemap.v1 v1.0.5 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	modernc.org/libc v1.66.10 // indirect
+	modernc.org/libc v1.67.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.40.0 // indirect
+	modernc.org/sqlite v1.43.0 // indirect
 )
