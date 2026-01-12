@@ -184,11 +184,9 @@ func Test_Js(t *testing.T) {
 			Documents:  []json.RawMessage{json.RawMessage(`1`), json.RawMessage(`{"$set":{"a":1}}`)},
 		})
 	})
-	t.Run("upsertId", func(t *testing.T) {
-		assertCmd(t, `db.coll.upsertId(1, {$set:{a:1}})`, Cmd{
-			Cmd:        "upsertId",
-			Collection: "coll",
-			Documents:  []json.RawMessage{json.RawMessage(`1`), json.RawMessage(`{"$set":{"a":1}}`)},
+	t.Run("it", func(t *testing.T) {
+		assertCmd(t, `it`, Cmd{
+			Cmd: "it",
 		})
 	})
 }

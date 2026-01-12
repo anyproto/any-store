@@ -38,6 +38,11 @@ function Query(name) {
     this.query = {};
 }
 
+Query.prototype.reset = function () {
+    this.query = {};
+    this.cmd = "find";
+}
+
 Query.prototype.limit = function (limit) {
     this.query.limit = limit;
     return this
@@ -114,7 +119,7 @@ Query.prototype.update = function (upd) {
 
 Query.prototype.result = function () {
     var res = JSON.stringify(this);
-    this.query = {};
+    this.reset();
     return res
 }
 
@@ -126,19 +131,20 @@ function Collection(name) {
 }
 
 Collection.prototype.find = function (condition) {
+    this.query.reset();
     this.query.query.find = condition || {}
     return this.query;
 }
 
 Collection.prototype.findOne = function (condition) {
+    this.query.reset();
     this.query.query.find = condition || {}
     this.query.query.limit = 1
+    this.query.query.pretty = true
     this.query.cmd = "findOne"
     var res = JSON.stringify(this.query);
     this.query.cmd = "find";
-    this.query.query = {
-        find: {},
-    };
+    this.query.reset();
     return {
         result: function () {
             return res
@@ -303,6 +309,14 @@ Collection.prototype.findId = function () {
     this.query.cmd = "findId"
     this.query.documents = Array.prototype.slice.call(arguments)
     return this.query
+}
+
+var it = {
+    result: function () {
+        return JSON.stringify({
+            cmd: 'it',
+        })
+    }
 }
 
 var db = new DB();

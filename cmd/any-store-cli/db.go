@@ -42,10 +42,20 @@ type Conn struct {
 	autocompleteDb    []string
 	autocompleteColl  []string
 	autocompleteQuery []string
+
+	lastIter  anystore.Iterator
+	lastQuery Query
+}
+
+func (c *Conn) closeLastIter() {
+	if c.lastIter != nil {
+		_ = c.lastIter.Close()
+		c.lastIter = nil
+	}
 }
 
 func (c *Conn) makeAutocomplete() (err error) {
-	c.autocomplete = append(c.autocomplete[:0], "show collections", "show stats", "db.", "help")
+	c.autocomplete = append(c.autocomplete[:0], "show collections", "show stats", "db.", "help", "it")
 	c.autocompleteDb = append(c.autocompleteDb[:0], "db.createCollection(", "db.backup(", "db.quickCheck()")
 	c.autocompleteQuery = append(c.autocompleteQuery[:0], "limit(", "offset(", "sort(", "hint(", "project(", "pretty()", "count()", "explain()", "delete()", "update(")
 	collNames, err := c.db.GetCollectionNames(mainCtx.Ctx())
@@ -81,6 +91,9 @@ func (c *Conn) Exec(cmdLine string) (result string, err error) {
 }
 
 func (c *Conn) ExecCmd(cmd Cmd) (result string, err error) {
+	if cmd.Cmd != "it" {
+		c.closeLastIter()
+	}
 	switch cmd.Cmd {
 	case "show collections":
 		return c.ShowCollections()
@@ -124,6 +137,8 @@ func (c *Conn) ExecCmd(cmd Cmd) (result string, err error) {
 		return c.Drop(cmd)
 	case "help":
 		return c.Help(cmd)
+	case "it":
+		return c.IterNext()
 	}
 	return "", fmt.Errorf("unexpected command: %s", cmd.Cmd)
 }
@@ -595,22 +610,80 @@ func (c *Conn) FindOne(cmd Cmd) (result string, err error) {
 		if doc, err = iter.Doc(); err != nil {
 			return "", err
 		}
+		err = c.printDoc(doc, cmd.Query)
+	} else {
+		err = iter.Err()
+	}
+	return
+}
 
-		val := doc.Value()
-		if len(cmd.Query.Project) > 0 {
-			if val, err = applyProjection(val, cmd.Query.Project); err != nil {
-				return "", err
-			}
+func (c *Conn) printDoc(doc anystore.Doc, query Query) error {
+	val := doc.Value()
+	var err error
+	if len(query.Project) > 0 {
+		if val, err = applyProjection(val, query.Project); err != nil {
+			return err
 		}
-
+	}
+	if query.Pretty {
 		res, err := prettyJson(val.String())
+		if err != nil {
+			return err
+		}
+		fmt.Println(res)
+	} else {
+		fmt.Println(val.String())
+	}
+	return nil
+}
+
+func (c *Conn) printIter(iter anystore.Iterator, query Query, first bool) (string, error) {
+	batchSize := 30
+	count := 0
+
+	if !first {
+		doc, err := iter.Doc()
 		if err != nil {
 			return "", err
 		}
-		fmt.Println(res)
+		if err := c.printDoc(doc, query); err != nil {
+			return "", err
+		}
+		count++
 	}
-	err = iter.Err()
-	return
+
+	for (query.Limit == 0 || count < query.Limit) && count < batchSize && iter.Next() {
+		doc, err := iter.Doc()
+		if err != nil {
+			return "", err
+		}
+		if err := c.printDoc(doc, query); err != nil {
+			return "", err
+		}
+		count++
+	}
+
+	if count == batchSize && (query.Limit == 0 || (query.Limit > 0 && count < query.Limit)) && iter.Next() {
+		fmt.Println("Type \"it\" for more")
+		c.lastIter = iter
+		c.lastQuery = query
+	} else {
+		if err := iter.Err(); err != nil {
+			return "", err
+		}
+		_ = iter.Close()
+	}
+	return "", nil
+}
+
+func (c *Conn) IterNext() (result string, err error) {
+	if c.lastIter == nil {
+		return "", fmt.Errorf("no active iterator")
+	}
+	iter := c.lastIter
+	query := c.lastQuery
+	c.lastIter = nil
+	return c.printIter(iter, query, false)
 }
 
 func (c *Conn) Find(cmd Cmd) (result string, err error) {
@@ -625,8 +698,6 @@ func (c *Conn) Find(cmd Cmd) (result string, err error) {
 	}
 	if cmd.Query.Limit > 0 {
 		q.Limit(uint(cmd.Query.Limit))
-	} else {
-		q.Limit(50)
 	}
 	if cmd.Query.Offset > 0 {
 		q.Offset(uint(cmd.Query.Offset))
@@ -685,30 +756,7 @@ func (c *Conn) Find(cmd Cmd) (result string, err error) {
 	if err != nil {
 		return "", err
 	}
-	defer iter.Close()
-	var doc anystore.Doc
-	for iter.Next() {
-		if doc, err = iter.Doc(); err != nil {
-			return "", err
-		}
-		val := doc.Value()
-		if len(cmd.Query.Project) > 0 {
-			if val, err = applyProjection(val, cmd.Query.Project); err != nil {
-				return "", err
-			}
-		}
-		if cmd.Query.Pretty {
-			res, err := prettyJson(val.String())
-			if err != nil {
-				return "", err
-			}
-			fmt.Println(res)
-		} else {
-			fmt.Println(val.String())
-		}
-	}
-	err = iter.Err()
-	return
+	return c.printIter(iter, cmd.Query, true)
 }
 
 func prettyJson(s string) (string, error) {
