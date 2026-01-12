@@ -317,7 +317,10 @@ func (c *Conn) ShowStats() (result string, err error) {
 	buf.WriteString(fmt.Sprintf("Collections:\t%d\n", stats.CollectionsCount))
 	buf.WriteString(fmt.Sprintf("Indexes:\t%d\n", stats.IndexesCount))
 	buf.WriteString(fmt.Sprintf("Data size:\t%d KiB\n", stats.DataSizeBytes/1024))
-	buf.WriteString(fmt.Sprintf("Total size:\t%d KiB\n", stats.DataSizeBytes/1024))
+	buf.WriteString(fmt.Sprintf("Total size:\t%d KiB\n", stats.TotalSizeBytes/1024))
+	if stats.DirtyOnOpen {
+		buf.WriteString(fmt.Sprintf("The database was not closed properly, quick check took %v\n", stats.DirtyQuickCheckDuration))
+	}
 	return buf.String(), nil
 }
 
