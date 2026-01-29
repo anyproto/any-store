@@ -9,5 +9,5 @@ permissions: write-all
 
 jobs:
   release-reusable:
-    uses: anyproto/shared-actions/.github/workflows/release-go-daemons-reusable.yml@main
+    uses: anyproto/shared-actions/.github/workflows/release-go-daemons-reusable.yml@v1
     secrets: inherit # pass all secrets
