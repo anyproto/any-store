@@ -87,6 +87,9 @@ func (s *Stmt) ColumnLen(col int) (int, error) {
 }
 
 func (s *Stmt) Close() error {
+	if s == nil {
+		return nil
+	}
 	s.conn.mu.Lock()
 	defer s.conn.mu.Unlock()
 	if s.conn.isClosed {
