@@ -177,9 +177,15 @@ func (c *collection) makeQueries() {
 }
 
 func (c *collection) checkStmts(ctx context.Context, cn *driver.Conn) (err error) {
-	if !c.stmtsReady.CompareAndSwap(false, true) {
+	if c.stmtsReady.Load() {
 		return nil
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stmtsReady.Load() {
+		return nil
+	}
+
 	if c.stmts.delete, err = cn.Prepare(c.sql.DeleteStmt()); err != nil {
 		return
 	}
@@ -197,6 +203,7 @@ func (c *collection) checkStmts(ctx context.Context, cn *driver.Conn) (err error
 			return err
 		}
 	}
+	c.stmtsReady.Store(true)
 	return
 }
 
