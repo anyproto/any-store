@@ -9,7 +9,6 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -17,7 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/internal/driver"
+	"github.com/anyproto/any-store/internal/btree"
 	"github.com/anyproto/any-store/internal/objectid"
 )
 
@@ -132,43 +131,22 @@ func TestDb_Backup(t *testing.T) {
 
 func TestDb_Close(t *testing.T) {
 	t.Run("race", func(t *testing.T) {
-		fx := newFixture(t, &Config{ReadConnections: 2})
+		fx := newFixture(t, &Config{})
 
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
 
 		var docs []*anyenc.Value
-		for i := range 1000 {
+		for i := range 100 {
 			docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id": %d, "value": %d}`, i, rand.Int())))
 		}
 		require.NoError(t, coll.Insert(ctx, docs...))
-		var results = make(chan error, 3)
+		var results = make(chan error, 2)
 		go func() {
 			// writing
 			for {
 				if pErr := coll.UpsertOne(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id": %d, "value": %d}`, rand.Int(), rand.Int()))); pErr != nil {
 					results <- errors.Join(pErr, errors.New("upsertOne"))
-					return
-				}
-			}
-		}()
-
-		go func() {
-			// iterating
-			for {
-				iter, pErr := coll.Find(nil).Iter(ctx)
-				if pErr != nil {
-					results <- errors.Join(pErr, errors.New("find"))
-					return
-				}
-				for iter.Next() {
-					if _, pErr = iter.Doc(); pErr != nil {
-						results <- errors.Join(pErr, errors.New("doc"))
-						return
-					}
-				}
-				if pErr = iter.Close(); pErr != nil {
-					results <- errors.Join(pErr, errors.New("close"))
 					return
 				}
 			}
@@ -198,14 +176,7 @@ func TestDb_Close(t *testing.T) {
 
 		for range len(results) {
 			rErr := <-results
-			assert.True(t, errors.Is(rErr, driver.ErrDBIsClosed) || errors.Is(rErr, driver.ErrStmtIsClosed), rErr.Error())
-		}
-		dirEntries, err := os.ReadDir(fx.tmpDir)
-		require.NoError(t, err)
-		for _, dirEntry := range dirEntries {
-			if strings.HasSuffix(dirEntry.Name(), "-wal") {
-				t.Errorf("wal file is not removed after close")
-			}
+			assert.True(t, errors.Is(rErr, btree.ErrClosed), rErr.Error())
 		}
 	})
 

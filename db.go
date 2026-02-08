@@ -2,23 +2,26 @@ package anystore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/anyproto/go-sqlite"
-
-	"github.com/anyproto/any-store/internal/driver"
+	"github.com/anyproto/any-store/internal/btree"
 	"github.com/anyproto/any-store/internal/durability"
 	"github.com/anyproto/any-store/internal/durability/sentinel"
 	"github.com/anyproto/any-store/internal/objectid"
 	"github.com/anyproto/any-store/internal/registry"
-	"github.com/anyproto/any-store/internal/sql"
 	"github.com/anyproto/any-store/syncpool"
 )
+
+const systemNamespace = "_system"
 
 // DB represents a document-oriented database.
 type DB interface {
@@ -47,10 +50,10 @@ type DB interface {
 	// Returns a DBStats struct containing the database statistics or an error if there is an issue retrieving the stats.
 	Stats(ctx context.Context) (DBStats, error)
 
-	// QuickCheck performs PRAGMA quick_check to sqlite. If result not ok returns error.
+	// QuickCheck performs a quick integrity check. If result not ok returns error.
 	QuickCheck(ctx context.Context) (err error)
 
-	// Flush perform fsync or WAL checkpoint (depends on FlushMode) on sqlite
+	// Flush perform checkpoint on the btree database
 	// When waitIdleDuration > 0, wait for waitIdleTime since the last write tx got released
 	Flush(ctx context.Context, waitIdleDuration time.Duration, mode FlushMode) error
 
@@ -100,7 +103,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 
 	sPool := syncpool.NewSyncPool(config.SyncPoolElementMaxSize)
 
-	registryBufSize := (config.ReadConnections + 1) * 4
+	registryBufSize := 4
 	ds := &db{
 		instanceId:        objectid.NewObjectID().Hex(),
 		config:            config,
@@ -113,25 +116,20 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	var quickCheckNeeded bool
 	ds.recoveryController, quickCheckNeeded = ds.createRecoveryController(ctx, path)
 
-	var err error
-	conf := driver.Config{
-		Pragma:                    config.pragma(),
-		ReadCount:                 config.ReadConnections,
-		PreAllocatedPageCacheSize: config.SQLiteGlobalPageCachePreallocateSizeBytes,
-		SortRegistry:              ds.sortReg,
-		FilterRegistry:            ds.filterReg,
-		Version:                   2,
-		ReadConnTTL:               time.Minute,
-		WriteObservers:            []driver.WriteObserver{ds.recoveryController.OnWriteEvent},
+	opts := btree.Options{
+		PageSize:  4096,
+		CacheSize: 2000,
+		InProcess: true,
 	}
 
-	if ds.cm, err = driver.NewConnManager(path, conf); err != nil {
+	var err error
+	if ds.btreeDB, err = btree.Open(path, opts); err != nil {
 		return nil, err
 	}
 
 	if err = ds.init(ctx); err != nil {
 		_ = ds.recoveryController.Stop()
-		_ = ds.cm.Close()
+		_ = ds.btreeDB.Close()
 		return nil, err
 	}
 
@@ -145,11 +143,10 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 			if ds.recoveryController != nil {
 				_ = ds.recoveryController.Stop()
 			}
-			_ = ds.cm.Close()
+			_ = ds.btreeDB.Close()
 			return nil, fmt.Errorf("%w: %w", ErrQuickCheckFailed, err)
 		}
 		ds.dirtyQuickCheckDuration = time.Since(start)
-		// Mark DB as clean after successful quickcheck
 		if ds.recoveryController != nil {
 			ds.recoveryController.MarkCleanAfterCheck()
 		}
@@ -158,7 +155,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	// Start recovery controller after initialization
 	if ds.recoveryController != nil {
 		if err = ds.recoveryController.Start(ctx); err != nil {
-			_ = ds.cm.Close()
+			_ = ds.btreeDB.Close()
 			return nil, err
 		}
 	}
@@ -171,22 +168,13 @@ type db struct {
 
 	config *Config
 
-	cm                 *driver.ConnManager
+	btreeDB            *btree.DB
+	systemNS           *btree.Namespace
 	recoveryController *durability.Controller
 	filterReg          *registry.FilterRegistry
 	sortReg            *registry.SortRegistry
 
 	syncPool *syncpool.SyncPool
-
-	sql  sql.DBSql
-	stmt struct {
-		registerCollection,
-		removeCollection,
-		renameCollection,
-		renameCollectionIndex,
-		registerIndex,
-		removeIndex *driver.Stmt
-	}
 
 	openedCollections map[string]Collection
 	closed            atomic.Bool
@@ -194,50 +182,58 @@ type db struct {
 	dirtyOnOpen             bool
 	dirtyQuickCheckDuration time.Duration
 	mu                      sync.Mutex
+	writeMu                 sync.Mutex
+}
+
+func collKey(name string) []byte {
+	return []byte("coll:" + name)
+}
+
+type indexMeta struct {
+	Name   string   `json:"name"`
+	Fields []string `json:"fields"`
+	Sparse bool     `json:"sparse"`
+	Unique bool     `json:"unique"`
+}
+
+func indexKey(collName, indexName string) []byte {
+	return []byte("idx:" + collName + ":" + indexName)
+}
+
+func indexKeyPrefix(collName string) string {
+	return "idx:" + collName + ":"
 }
 
 func (db *db) init(ctx context.Context) error {
-	return db.doWriteTx(ctx, func(c *driver.Conn) (err error) {
-		if err = c.ExecNoResult(ctx, db.sql.InitDB()); err != nil {
-			return
+	return db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+		// Ensure system namespace exists
+		ns, err := db.btreeDB.GetNamespace(systemNamespace)
+		if err != nil {
+			if errors.Is(err, btree.ErrNamespaceNotFound) {
+				ns, err = tx.CreateNamespace(systemNamespace)
+				if err != nil {
+					return err
+				}
+			} else {
+				return err
+			}
 		}
-		if db.stmt.registerCollection, err = c.Prepare(db.sql.RegisterCollectionStmt()); err != nil {
-			return
-		}
-		if db.stmt.removeCollection, err = c.Prepare(db.sql.RemoveCollectionStmt()); err != nil {
-			return
-		}
-		if db.stmt.renameCollection, err = c.Prepare(db.sql.RenameCollectionStmt()); err != nil {
-			return
-		}
-		if db.stmt.renameCollectionIndex, err = c.Prepare(db.sql.RenameCollectionIndexStmt()); err != nil {
-			return
-		}
-		if db.stmt.registerIndex, err = c.Prepare(db.sql.RegisterIndexStmt()); err != nil {
-			return
-		}
-		if db.stmt.removeIndex, err = c.Prepare(db.sql.RemoveIndexStmt()); err != nil {
-			return
-		}
-		return
+		db.systemNS = ns
+		return nil
 	})
 }
 
 func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
-	connWrite, err := db.cm.GetWrite(ctx)
+	btWtx, err := db.btreeDB.BeginWrite()
 	if err != nil {
-		return nil, err
-	}
-
-	if err = connWrite.BeginImmediate(ctx); err != nil {
-		db.cm.ReleaseWrite(connWrite)
 		return nil, err
 	}
 
 	version := newTxVersion()
 	tx := txPool.Get().(*commonTx)
 	tx.db = db
-	tx.con = connWrite
+	tx.readTx = &btWtx.ReadTx
+	tx.writeTx = btWtx
 	tx.modified = false
 	tx.version.Store(version)
 	wTx := writeTx{commonTx: tx, version: version}
@@ -246,20 +242,16 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 }
 
 func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
-	connRead, err := db.cm.GetRead(ctx)
+	btRtx, err := db.btreeDB.BeginRead()
 	if err != nil {
-		return nil, err
-	}
-
-	if err = connRead.Begin(ctx); err != nil {
-		db.cm.ReleaseRead(connRead)
 		return nil, err
 	}
 
 	version := newTxVersion()
 	tx := txPool.Get().(*commonTx)
 	tx.db = db
-	tx.con = connRead
+	tx.readTx = btRtx
+	tx.writeTx = nil
 	tx.version.Store(version)
 	rTx := readTx{commonTx: tx, version: version}
 	tx.ctx = context.WithValue(ctx, ctxKeyTx, rTx)
@@ -278,19 +270,34 @@ func (db *db) createCollection(ctx context.Context, collectionName string) (Coll
 	}
 	db.mu.Unlock()
 	var coll Collection
-	err := db.doWriteTx(ctx, func(c *driver.Conn) error {
+	err := db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
 		db.mu.Lock()
 		defer db.mu.Unlock()
-		err := db.stmt.registerCollection.Exec(ctx, func(stmt *sqlite.Stmt) {
-			stmt.BindText(1, collectionName)
-		}, driver.StmtExecNoResults)
-		if err != nil {
-			return replaceUniqErr(err, ErrCollectionExists)
-		}
 
-		if err = c.ExecNoResult(ctx, db.sql.Collection(collectionName).Create()); err != nil {
+		// Check if collection already exists in system namespace
+		key := collKey(collectionName)
+		_, err := tx.Get(db.systemNS, key)
+		if err == nil {
+			return ErrCollectionExists
+		}
+		if !errors.Is(err, btree.ErrKeyNotFound) {
 			return err
 		}
+
+		// Create namespace for the collection
+		_, err = tx.CreateNamespace(collectionName)
+		if err != nil {
+			if errors.Is(err, btree.ErrNamespaceExists) {
+				return ErrCollectionExists
+			}
+			return err
+		}
+
+		// Register in system namespace
+		if err = tx.Put(db.systemNS, key, []byte("1")); err != nil {
+			return err
+		}
+
 		if coll, err = newCollection(ctx, db, collectionName); err != nil {
 			return err
 		}
@@ -316,19 +323,16 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 		return coll, nil
 	}
 
-	err := db.doReadTx(ctx, func(c *driver.Conn) error {
-		return c.Exec(ctx, db.sql.FindCollection(), func(stmt *sqlite.Stmt) {
-			stmt.BindText(1, collectionName)
-		}, func(stmt *sqlite.Stmt) error {
-			hasRow, stepErr := stmt.Step()
-			if stepErr != nil {
-				return nil
-			}
-			if !hasRow {
+	err := db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		key := collKey(collectionName)
+		_, err := tx.Get(db.systemNS, key)
+		if err != nil {
+			if errors.Is(err, btree.ErrKeyNotFound) {
 				return ErrCollectionNotFound
 			}
-			return nil
-		})
+			return err
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -361,20 +365,26 @@ func (db *db) Collection(ctx context.Context, collectionName string) (Collection
 }
 
 func (db *db) GetCollectionNames(ctx context.Context) (collectionNames []string, err error) {
-	err = db.doReadTx(ctx, func(c *driver.Conn) error {
-		return c.ExecCached(ctx, db.sql.FindCollections(), nil, func(stmt *sqlite.Stmt) error {
-			for {
-				hasRow, stepErr := stmt.Step()
-				if stepErr != nil {
-					return stepErr
-				}
-				if !hasRow {
-					break
-				}
-				collectionNames = append(collectionNames, stmt.ColumnText(0))
-			}
+	err = db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		cursor := tx.NewCursor(db.systemNS)
+		prefix := []byte("coll:")
+		if err := cursor.Seek(prefix); err != nil {
 			return nil
-		})
+		}
+		for cursor.Valid() {
+			key, err := cursor.Key()
+			if err != nil {
+				return err
+			}
+			if !strings.HasPrefix(string(key), "coll:") {
+				break
+			}
+			collectionNames = append(collectionNames, string(key[5:]))
+			if err := cursor.Next(); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -383,66 +393,77 @@ func (db *db) GetCollectionNames(ctx context.Context) (collectionNames []string,
 }
 
 func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
-	err = db.doReadTx(ctx, func(cn *driver.Conn) (txErr error) {
-		var getIntByQuery = func(q string) (result int, err error) {
-			err = cn.Exec(ctx, q, nil, func(stmt *sqlite.Stmt) error {
-				hasRow, stepErr := stmt.Step()
-				if !hasRow {
-					return nil
+	err = db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		cursor := tx.NewCursor(db.systemNS)
+		if err := cursor.Seek([]byte("coll:")); err == nil {
+			for cursor.Valid() {
+				key, err := cursor.Key()
+				if err != nil {
+					return err
 				}
-				if stepErr != nil {
-					return stepErr
+				if !strings.HasPrefix(string(key), "coll:") {
+					break
 				}
-				result = stmt.ColumnInt(0)
-				return nil
-			})
-			return
+				stats.CollectionsCount++
+				if err := cursor.Next(); err != nil {
+					return err
+				}
+			}
 		}
-		if stats.CollectionsCount, txErr = getIntByQuery(db.sql.CountCollections()); txErr != nil {
-			return
+		if err := cursor.Seek([]byte("idx:")); err == nil {
+			for cursor.Valid() {
+				key, err := cursor.Key()
+				if err != nil {
+					return err
+				}
+				if !strings.HasPrefix(string(key), "idx:") {
+					break
+				}
+				stats.IndexesCount++
+				if err := cursor.Next(); err != nil {
+					return err
+				}
+			}
 		}
-		if stats.IndexesCount, txErr = getIntByQuery(db.sql.CountIndexes()); txErr != nil {
-			return
-		}
-		if stats.TotalSizeBytes, txErr = getIntByQuery(db.sql.StatsTotalSize()); txErr != nil {
-			return
-		}
-		if stats.DataSizeBytes, txErr = getIntByQuery(db.sql.StatsDataSize()); txErr != nil {
-			return
-		}
-		return
+		return nil
 	})
+
+	// Get file size for TotalSizeBytes
+	if fi, fErr := os.Stat(db.btreeDB.Path()); fErr == nil {
+		stats.TotalSizeBytes = int(fi.Size())
+		stats.DataSizeBytes = stats.TotalSizeBytes
+	}
+
 	stats.DirtyOnOpen = db.dirtyOnOpen
 	stats.DirtyQuickCheckDuration = db.dirtyQuickCheckDuration
 	return
 }
 
 func (db *db) QuickCheck(ctx context.Context) (err error) {
-	return db.doWriteTx(ctx, func(c *driver.Conn) error {
-		return c.Exec(ctx, "PRAGMA quick_check", nil, func(stmt *sqlite.Stmt) error {
-			hasRow, stepErr := stmt.Step()
-			if !hasRow {
-				return nil
-			}
-			if stepErr != nil {
-				return stepErr
-			}
-			result := stmt.ColumnText(0)
-			if result != "ok" {
-				return fmt.Errorf("quick_check not ok: %s", result)
-			}
-			return nil
-		})
+	// btree doesn't have a built-in quick check, just verify we can read
+	return db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		cursor := tx.NewCursor(db.systemNS)
+		if err := cursor.First(); err != nil {
+			return err
+		}
+		return nil
 	})
 }
 
 func (db *db) Backup(ctx context.Context, path string) (err error) {
-	conn, err := db.cm.GetWrite(ctx)
+	// Read the source file and copy it
+	srcPath := db.btreeDB.Path()
+
+	// Checkpoint first to ensure all WAL data is in the main file
+	if err = db.btreeDB.Checkpoint(); err != nil {
+		return err
+	}
+
+	srcData, err := os.ReadFile(srcPath)
 	if err != nil {
 		return err
 	}
-	defer db.cm.ReleaseWrite(conn)
-	return conn.Backup(ctx, path)
+	return os.WriteFile(path, srcData, 0644)
 }
 
 func (db *db) WriteTx(ctx context.Context) (tx WriteTx, err error) {
@@ -464,27 +485,25 @@ func (db *db) WriteTx(ctx context.Context) (tx WriteTx, err error) {
 	return nil, ErrTxIsReadOnly
 }
 
-func (db *db) doWriteTx(ctx context.Context, do func(c *driver.Conn) error) error {
+func (db *db) doWriteTx(ctx context.Context, do func(tx *btree.WriteTx) error) error {
 	tx, err := db.WriteTx(ctx)
 	if err != nil {
 		return err
 	}
-	if err = do(tx.conn()); err != nil {
-		err = replaceInterruptErr(err)
+	if err = do(tx.btreeWriteTx()); err != nil {
 		return errors.Join(err, tx.Rollback())
 	}
 	tx.SetModified()
 	return tx.Commit()
 }
 
-func (db *db) doWriteTxModified(ctx context.Context, do func(c *driver.Conn) (bool, error)) error {
+func (db *db) doWriteTxModified(ctx context.Context, do func(tx *btree.WriteTx) (bool, error)) error {
 	tx, err := db.WriteTx(ctx)
 	if err != nil {
 		return err
 	}
 	var modified bool
-	if modified, err = do(tx.conn()); err != nil {
-		err = replaceInterruptErr(err)
+	if modified, err = do(tx.btreeWriteTx()); err != nil {
 		return errors.Join(err, tx.Rollback())
 	}
 
@@ -492,15 +511,6 @@ func (db *db) doWriteTxModified(ctx context.Context, do func(c *driver.Conn) (bo
 		tx.SetModified()
 	}
 	return tx.Commit()
-}
-
-func (db *db) withWriteConn(ctx context.Context, fn func(conn *driver.Conn) error) error {
-	conn, err := db.cm.GetWrite(ctx)
-	if err != nil {
-		return err
-	}
-	defer db.cm.ReleaseWriteWithOptions(conn, true)
-	return fn(conn)
 }
 
 func (db *db) getReadTx(ctx context.Context) (tx ReadTx, err error) {
@@ -522,13 +532,12 @@ func (db *db) getReadTx(ctx context.Context) (tx ReadTx, err error) {
 	return nil, ErrTxIsReadOnly
 }
 
-func (db *db) doReadTx(ctx context.Context, do func(c *driver.Conn) error) error {
+func (db *db) doReadTx(ctx context.Context, do func(tx *btree.ReadTx) error) error {
 	tx, err := db.getReadTx(ctx)
 	if err != nil {
 		return err
 	}
-	if err = do(tx.conn()); err != nil {
-		err = replaceInterruptErr(err)
+	if err = do(tx.btreeReadTx()); err != nil {
 		_ = tx.Commit()
 		return err
 	}
@@ -540,10 +549,8 @@ func (db *db) Close() error {
 		return ErrDBIsClosed
 	}
 
-	cn, err := db.cm.GetWrite(context.Background())
-	if err != nil {
-		return err
-	}
+	// Signal btree to reject new transactions early
+	db.btreeDB.SetClosing()
 
 	var collToClose []Collection
 	db.mu.Lock()
@@ -556,44 +563,38 @@ func (db *db) Close() error {
 			log.Printf("collection close error: %v", cErr)
 		}
 	}
-	db.cm.ReleaseWriteWithOptions(cn, true)
 
 	if err := db.recoveryController.Stop(); err != nil {
 		log.Printf("recovery controller stop error: %v", err)
 	}
 
-	return db.cm.Close()
+	return db.btreeDB.Close()
 }
 
 func (db *db) createRecoveryController(ctx context.Context, path string) (*durability.Controller, bool) {
-	// Create flush function from FlushMode
 	flushFunc, err := durability.NewFlushFunc(db.config.Durability.FlushMode.toRecoveryFlushMode())
 	if err != nil {
 		return nil, false
 	}
 
-	// Create controller with simplified options
 	opts := durability.Options{
 		AutoFlushEnable:    db.config.Durability.AutoFlush,
 		AutoFlushIdleAfter: db.config.Durability.IdleAfter,
-		AcquireWrite:       db.withWriteConn,
-		AutoFlushFunc:      flushFunc,
+		AcquireWrite: func(ctx context.Context, fn func(bdb *btree.DB) error) error {
+			return fn(db.btreeDB)
+		},
+		AutoFlushFunc: flushFunc,
 	}
 
-	// Add sentinel tracker unless disabled
 	if db.config.Durability.Sentinel {
 		opts.Sentinel = sentinel.New(path)
 	}
 	controller := durability.NewController(opts)
 
-	// Store context with dbPath for debugging
 	ctx = context.WithValue(ctx, "dbPath", path)
 
-	// Check if database is dirty
 	dirty, err := controller.OnOpen(ctx)
 	if err != nil {
-		// Log error but still return controller
-		// The error will be handled when we try to start the controller
 		return controller, false
 	}
 
@@ -612,4 +613,184 @@ func (db *db) onCollectionClose(name string) {
 	db.mu.Lock()
 	delete(db.openedCollections, name)
 	db.mu.Unlock()
+}
+
+// getIndexInfos reads all index metadata for a collection from the system namespace
+func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, error) {
+	prefix := indexKeyPrefix(collName)
+	cursor := tx.NewCursor(db.systemNS)
+	if err := cursor.Seek([]byte(prefix)); err != nil {
+		return nil, nil
+	}
+	var result []IndexInfo
+	for cursor.Valid() {
+		key, err := cursor.Key()
+		if err != nil {
+			return nil, err
+		}
+		if !strings.HasPrefix(string(key), prefix) {
+			break
+		}
+		val, err := cursor.Value()
+		if err != nil {
+			return nil, err
+		}
+		var meta indexMeta
+		if err := json.Unmarshal(val, &meta); err != nil {
+			return nil, err
+		}
+		result = append(result, IndexInfo{
+			Name:   meta.Name,
+			Fields: meta.Fields,
+			Sparse: meta.Sparse,
+			Unique: meta.Unique,
+		})
+		if err := cursor.Next(); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+// registerIndex stores index metadata in the system namespace
+func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) error {
+	key := indexKey(collName, info.Name)
+	// Check if already exists
+	if _, err := tx.Get(db.systemNS, key); err == nil {
+		return ErrIndexExists
+	}
+	meta := indexMeta{
+		Name:   info.Name,
+		Fields: info.Fields,
+		Sparse: info.Sparse,
+		Unique: info.Unique,
+	}
+	data, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	return tx.Put(db.systemNS, key, data)
+}
+
+// removeIndex removes index metadata from the system namespace
+func (db *db) removeIndex(tx *btree.WriteTx, collName, indexName string) error {
+	key := indexKey(collName, indexName)
+	return tx.Delete(db.systemNS, key)
+}
+
+// removeCollection removes collection metadata from the system namespace
+func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
+	// Remove collection key
+	if err := tx.Delete(db.systemNS, collKey(collName)); err != nil {
+		return err
+	}
+	// Remove all index keys for this collection
+	prefix := indexKeyPrefix(collName)
+	cursor := tx.NewCursor(db.systemNS)
+	if err := cursor.Seek([]byte(prefix)); err != nil {
+		return nil
+	}
+	var keysToDelete [][]byte
+	for cursor.Valid() {
+		key, err := cursor.Key()
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(string(key), prefix) {
+			break
+		}
+		keysToDelete = append(keysToDelete, append([]byte(nil), key...))
+		if err := cursor.Next(); err != nil {
+			return err
+		}
+	}
+	for _, key := range keysToDelete {
+		if err := tx.Delete(db.systemNS, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// renameCollection renames collection metadata in the system namespace
+func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error {
+	// Remove old collection key, add new one
+	if err := tx.Delete(db.systemNS, collKey(oldName)); err != nil {
+		return err
+	}
+	if err := tx.Put(db.systemNS, collKey(newName), []byte("1")); err != nil {
+		return err
+	}
+
+	// Rename index keys
+	oldPrefix := indexKeyPrefix(oldName)
+	cursor := tx.NewCursor(db.systemNS)
+	if err := cursor.Seek([]byte(oldPrefix)); err != nil {
+		return nil
+	}
+	type kv struct {
+		oldKey []byte
+		meta   indexMeta
+	}
+	var entries []kv
+	for cursor.Valid() {
+		key, err := cursor.Key()
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(string(key), oldPrefix) {
+			break
+		}
+		val, err := cursor.Value()
+		if err != nil {
+			return err
+		}
+		var meta indexMeta
+		if err := json.Unmarshal(val, &meta); err != nil {
+			return err
+		}
+		entries = append(entries, kv{oldKey: append([]byte(nil), key...), meta: meta})
+		if err := cursor.Next(); err != nil {
+			return err
+		}
+	}
+	for _, e := range entries {
+		if err := tx.Delete(db.systemNS, e.oldKey); err != nil {
+			return err
+		}
+		newKey := indexKey(newName, e.meta.Name)
+		data, err := json.Marshal(e.meta)
+		if err != nil {
+			return err
+		}
+		if err := tx.Put(db.systemNS, newKey, data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// listCollectionNames returns sorted collection names from system namespace
+func (db *db) listCollectionNames(tx *btree.ReadTx) ([]string, error) {
+	cursor := tx.NewCursor(db.systemNS)
+	prefix := []byte("coll:")
+	if err := cursor.Seek(prefix); err != nil {
+		return nil, nil
+	}
+	var names []string
+	for cursor.Valid() {
+		key, err := cursor.Key()
+		if err != nil {
+			return nil, err
+		}
+		if !strings.HasPrefix(string(key), "coll:") {
+			break
+		}
+		names = append(names, string(key[5:]))
+		if err := cursor.Next(); err != nil {
+			return nil, err
+		}
+	}
+	sort.Strings(names)
+	return names, nil
 }

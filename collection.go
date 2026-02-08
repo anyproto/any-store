@@ -3,18 +3,13 @@ package anystore
 import (
 	"context"
 	"errors"
-	"fmt"
 	"slices"
 	"sync"
 	"sync/atomic"
 
-	"github.com/anyproto/any-store/anyenc/anyencutil"
-	"github.com/anyproto/go-sqlite"
-	"github.com/valyala/fastjson"
-
 	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/internal/driver"
-	"github.com/anyproto/any-store/internal/sql"
+	"github.com/anyproto/any-store/anyenc/anyencutil"
+	"github.com/anyproto/any-store/internal/btree"
 	"github.com/anyproto/any-store/query"
 	"github.com/anyproto/any-store/syncpool"
 )
@@ -103,10 +98,8 @@ type Collection interface {
 func newCollection(ctx context.Context, db *db, name string) (Collection, error) {
 	coll := &collection{
 		name: name,
-		sql:  db.sql.Collection(name),
 		db:   db,
 	}
-	coll.tableName = coll.sql.TableName()
 	if err := coll.init(ctx); err != nil {
 		return nil, err
 	}
@@ -114,53 +107,33 @@ func newCollection(ctx context.Context, db *db, name string) (Collection, error)
 }
 
 type collection struct {
-	name      string
-	tableName string
-	sql       sql.CollectionSql
-	indexes   []*index
-	db        *db
+	name    string
+	indexes []*index
+	db      *db
+	ns      *btree.Namespace
 
-	stmts struct {
-		insert,
-		update,
-		delete,
-		findId *driver.Stmt
-	}
-
-	queries struct {
-		findId,
-		findAll,
-		count string
-	}
-
-	stmtsReady atomic.Bool
-	closed     atomic.Bool
-
-	mu sync.Mutex
+	closed atomic.Bool
+	mu     sync.Mutex
 }
 
 func (c *collection) init(ctx context.Context) error {
-	buf := c.db.syncPool.GetDocBuf()
-	defer c.db.syncPool.ReleaseDocBuf(buf)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.makeQueries()
-	return c.db.doReadTx(ctx, func(cn *driver.Conn) (err error) {
-		var idxInfo []IndexInfo
-		err = cn.Exec(ctx, c.sql.FindIndexes(), func(stmt *sqlite.Stmt) {
-			stmt.SetText(":collName", c.name)
-		}, func(stmt *sqlite.Stmt) error {
-			idxInfo, err = readIndexInfo(buf, stmt)
-			if err != nil {
-				return err
-			}
-			return nil
-		})
+
+	// Get the namespace for this collection
+	ns, err := c.db.btreeDB.GetNamespace(c.name)
+	if err != nil {
+		return err
+	}
+	c.ns = ns
+
+	return c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
+		idxInfos, err := c.db.getIndexInfos(tx, c.name)
 		if err != nil {
 			return err
 		}
-		for _, info := range idxInfo {
-			idx, err := newIndex(ctx, c, info)
+		for _, info := range idxInfos {
+			idx, err := newIndex(c, info)
 			if err != nil {
 				return err
 			}
@@ -168,43 +141,6 @@ func (c *collection) init(ctx context.Context) error {
 		}
 		return nil
 	})
-}
-
-func (c *collection) makeQueries() {
-	c.queries.findId = fmt.Sprintf("SELECT data FROM '%s' WHERE id = :id", c.tableName)
-	c.queries.count = fmt.Sprintf("SELECT COUNT(*) FROM '%s'", c.tableName)
-	c.queries.findAll = fmt.Sprintf("SELECT data FROM '%s'", c.tableName)
-}
-
-func (c *collection) checkStmts(ctx context.Context, cn *driver.Conn) (err error) {
-	if c.stmtsReady.Load() {
-		return nil
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.stmtsReady.Load() {
-		return nil
-	}
-
-	if c.stmts.delete, err = cn.Prepare(c.sql.DeleteStmt()); err != nil {
-		return
-	}
-	if c.stmts.insert, err = cn.Prepare(c.sql.InsertStmt()); err != nil {
-		return
-	}
-	if c.stmts.update, err = cn.Prepare(c.sql.UpdateStmt()); err != nil {
-		return
-	}
-	if c.stmts.findId, err = cn.Prepare(c.sql.FindIdStmt()); err != nil {
-		return
-	}
-	for _, idx := range c.indexes {
-		if err = idx.checkStmts(ctx, cn); err != nil {
-			return err
-		}
-	}
-	c.stmtsReady.Store(true)
-	return
 }
 
 func (c *collection) Name() string {
@@ -222,23 +158,15 @@ func (c *collection) FindIdWithParser(ctx context.Context, p *anyenc.Parser, doc
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], docId)
-	err = c.db.doReadTx(ctx, func(cn *driver.Conn) (err error) {
-		err = cn.ExecCached(ctx, c.queries.findId, func(stmt *sqlite.Stmt) {
-			stmt.BindBytes(1, buf.SmallBuf)
-		}, func(stmt *sqlite.Stmt) error {
-			hasRow, stepErr := stmt.Step()
-			if stepErr != nil {
-				return stepErr
-			}
-			if !hasRow {
+	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
+		val, err := tx.Get(c.ns, buf.SmallBuf)
+		if err != nil {
+			if errors.Is(err, btree.ErrKeyNotFound) {
 				return ErrDocNotFound
 			}
-			buf.DocBuf = readBytes(stmt, buf.DocBuf)
-			return nil
-		})
-		if err != nil {
 			return err
 		}
+		buf.DocBuf = append(buf.DocBuf[:0], val...)
 		data, err := p.Parse(buf.DocBuf)
 		doc = item{val: data}
 		return
@@ -259,38 +187,35 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
-	err = c.db.doWriteTx(ctx, func(cn *driver.Conn) (txErr error) {
-		if txErr = c.checkStmts(ctx, cn); txErr != nil {
-			return
-		}
+	err = c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (txErr error) {
 		var it item
 		for _, doc := range docs {
 			buf.Arena.Reset()
 			if it, txErr = newItem(doc); txErr != nil {
 				return txErr
 			}
-			if txErr = c.insertItem(ctx, buf, it); txErr != nil {
+			if txErr = c.insertItem(tx, buf, it); txErr != nil {
 				return txErr
 			}
 		}
 		return
 	})
-	return replaceUniqErr(err, ErrDocExists)
+	return
 }
 
-func (c *collection) insertItem(ctx context.Context, buf *syncpool.DocBuffer, it item) (err error) {
+func (c *collection) insertItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, it item) (err error) {
 	buf.SmallBuf = it.appendId(buf.SmallBuf[:0])
 	buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
-	if err = c.stmts.insert.Exec(ctx, func(stmt *sqlite.Stmt) {
-		stmt.BindBytes(1, buf.SmallBuf)
-		stmt.BindBytes(2, buf.DocBuf)
-	}, driver.StmtExecNoResults); err != nil {
-		return replaceUniqErr(err, ErrDocExists)
+
+	// Check if key already exists
+	if _, err := tx.Get(c.ns, buf.SmallBuf); err == nil {
+		return ErrDocExists
 	}
-	if err = c.indexesHandleInsert(ctx, buf.SmallBuf, it); err != nil {
+
+	if err = tx.Put(c.ns, buf.SmallBuf, buf.DocBuf); err != nil {
 		return err
 	}
-	return
+	return nil
 }
 
 func (c *collection) UpdateOne(ctx context.Context, doc *anyenc.Value) (err error) {
@@ -302,11 +227,8 @@ func (c *collection) UpdateOne(ctx context.Context, doc *anyenc.Value) (err erro
 		return
 	}
 
-	return c.db.doWriteTxModified(ctx, func(cn *driver.Conn) (modified bool, txErr error) {
-		if txErr = c.checkStmts(ctx, cn); txErr != nil {
-			return
-		}
-		return c.update(ctx, it, item{})
+	return c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+		return c.update(tx, it, item{})
 	})
 }
 
@@ -317,12 +239,9 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 	buf2 := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf2)
 
-	if err = c.db.doWriteTxModified(ctx, func(cn *driver.Conn) (modified bool, txErr error) {
-		if txErr = c.checkStmts(ctx, cn); txErr != nil {
-			return
-		}
+	if err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
 		buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], id)
-		it, txErr := c.loadById(ctx, buf, buf.SmallBuf)
+		it, txErr := c.loadById(tx, buf, buf.SmallBuf)
 		if txErr != nil {
 			return
 		}
@@ -337,7 +256,7 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 			return
 		}
 		res.Modified = 1
-		return c.update(ctx, item{val: newVal}, it)
+		return c.update(tx, item{val: newVal}, it)
 	}); err != nil {
 		return ModifyResult{}, err
 	}
@@ -351,20 +270,16 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 	buf2 := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf2)
 
-	if err = c.db.doWriteTxModified(ctx, func(cn *driver.Conn) (modified bool, txErr error) {
-		if txErr = c.checkStmts(ctx, cn); txErr != nil {
-			return
-		}
+	if err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
 		buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], id)
 		var (
 			isInsert bool
 			modValue *anyenc.Value
 			prevItem item
 		)
-		it, loadErr := c.loadById(ctx, buf, buf.SmallBuf)
+		it, loadErr := c.loadById(tx, buf, buf.SmallBuf)
 		if loadErr != nil {
 			if errors.Is(loadErr, ErrDocNotFound) {
-				// create an object with only id field
 				var idVal *anyenc.Value
 				buf.Arena.Reset()
 				modValue = buf.Arena.NewObject()
@@ -395,11 +310,11 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 		}
 		res.Modified = 1
 		if isInsert {
-			txErr = c.insertItem(ctx, buf2, item{val: newVal})
+			txErr = c.insertItem(tx, buf2, item{val: newVal})
 			return true, txErr
 		} else {
 			res.Matched = 1
-			return c.update(ctx, item{val: newVal}, prevItem)
+			return c.update(tx, item{val: newVal}, prevItem)
 		}
 	}); err != nil {
 		return ModifyResult{}, err
@@ -407,13 +322,13 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 	return
 }
 
-func (c *collection) update(ctx context.Context, it, prevIt item) (modified bool, err error) {
+func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	buf.SmallBuf = it.appendId(buf.SmallBuf[:0])
 	if prevIt.val == nil {
-		prevIt, err = c.loadById(ctx, buf, buf.SmallBuf)
+		prevIt, err = c.loadById(tx, buf, buf.SmallBuf)
 		if err != nil {
 			return
 		}
@@ -424,33 +339,22 @@ func (c *collection) update(ctx context.Context, it, prevIt item) (modified bool
 	}
 
 	buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
-	if err = c.stmts.update.Exec(ctx, func(stmt *sqlite.Stmt) {
-		stmt.BindBytes(1, buf.DocBuf)
-		stmt.BindBytes(2, buf.SmallBuf)
-	}, driver.StmtExecNoResults); err != nil {
+	if err = tx.Put(c.ns, buf.SmallBuf, buf.DocBuf); err != nil {
 		return
 	}
 
-	return true, c.indexesHandleUpdate(ctx, buf.SmallBuf, prevIt, it)
+	return true, nil
 }
 
-func (c *collection) loadById(ctx context.Context, buf *syncpool.DocBuffer, id anyenc.Tuple) (it item, err error) {
-	err = c.stmts.findId.Exec(ctx, func(stmt *sqlite.Stmt) {
-		stmt.BindBytes(1, id)
-	}, func(stmt *sqlite.Stmt) error {
-		hasRow, stepErr := stmt.Step()
-		if stepErr != nil {
-			return stepErr
-		}
-		if !hasRow {
-			return ErrDocNotFound
-		}
-		buf.DocBuf = readBytes(stmt, buf.DocBuf)
-		return nil
-	})
+func (c *collection) loadById(tx *btree.WriteTx, buf *syncpool.DocBuffer, id anyenc.Tuple) (it item, err error) {
+	val, err := tx.Get(c.ns, id)
 	if err != nil {
+		if errors.Is(err, btree.ErrKeyNotFound) {
+			return item{}, ErrDocNotFound
+		}
 		return
 	}
+	buf.DocBuf = append(buf.DocBuf[:0], val...)
 	doc, err := buf.Parser.Parse(buf.DocBuf)
 	if err != nil {
 		return
@@ -467,13 +371,10 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err erro
 		return
 	}
 
-	err = c.db.doWriteTxModified(ctx, func(cn *driver.Conn) (modified bool, txErr error) {
-		if txErr = c.checkStmts(ctx, cn); txErr != nil {
-			return
-		}
-		insErr := c.insertItem(ctx, buf, it)
+	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+		insErr := c.insertItem(tx, buf, it)
 		if errors.Is(insErr, ErrDocExists) {
-			return c.update(ctx, it, item{})
+			return c.update(tx, it, item{})
 		}
 		return true, insErr
 	})
@@ -484,43 +385,32 @@ func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
-	return c.db.doWriteTxModified(ctx, func(cn *driver.Conn) (modified bool, txErr error) {
-		if txErr = c.checkStmts(ctx, cn); txErr != nil {
-			return
-		}
+	return c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
 		buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], id)
-		it, txErr := c.loadById(ctx, buf, buf.SmallBuf)
+		// Verify document exists
+		_, txErr = c.loadById(tx, buf, buf.SmallBuf)
 		if txErr != nil {
 			return
 		}
-		return true, c.deleteItem(ctx, buf.SmallBuf, it)
+		return true, c.deleteItem(tx, buf.SmallBuf)
 	})
 }
 
-func (c *collection) deleteItem(ctx context.Context, id []byte, prevItem item) (err error) {
-	if err = c.stmts.delete.Exec(ctx, func(stmt *sqlite.Stmt) {
-		stmt.BindBytes(1, id)
-	}, driver.StmtExecNoResults); err != nil {
-		return
-	}
-	return c.indexesHandleDelete(ctx, id, prevItem)
+func (c *collection) deleteItem(tx *btree.WriteTx, id []byte) (err error) {
+	return tx.Delete(c.ns, id)
 }
 
 func (c *collection) Count(ctx context.Context) (count int, err error) {
-	err = c.db.doReadTx(ctx, func(cn *driver.Conn) error {
-		txErr := cn.ExecCached(ctx, c.queries.count, nil, func(stmt *sqlite.Stmt) error {
-			hasRow, stepErr := stmt.Step()
-			if stepErr != nil {
-				return stepErr
-			}
-			if !hasRow {
-				return nil
-			}
-			count = stmt.ColumnInt(0)
+	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		cursor := tx.NewCursor(c.ns)
+		if err := cursor.First(); err != nil {
 			return nil
-		})
-		if txErr != nil {
-			return txErr
+		}
+		for cursor.Valid() {
+			count++
+			if err := cursor.Next(); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -539,63 +429,21 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 	if len(info) == 0 {
 		return nil
 	}
-	buf := c.db.syncPool.GetDocBuf()
-	defer c.db.syncPool.ReleaseDocBuf(buf)
-	// TODO: validate fields
-	return c.db.doWriteTxModified(ctx, func(cn *driver.Conn) (modified bool, txErr error) {
-		if txErr = c.checkStmts(ctx, cn); txErr != nil {
-			return
-		}
-		var (
-			idx        *index
-			newIndexes []*index
-		)
+	return c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+		var newIndexes []*index
 		for _, idxInfo := range info {
-			if idx, txErr = c.createIndex(ctx, cn, idxInfo); txErr != nil {
+			idx, txErr := c.createIndex(ctx, tx, idxInfo)
+			if txErr != nil {
 				if ensure && errors.Is(txErr, ErrIndexExists) {
 					continue
 				}
-				return
-			}
-			if txErr = idx.checkStmts(ctx, cn); txErr != nil {
-				return
+				return false, txErr
 			}
 			newIndexes = append(newIndexes, idx)
 		}
 
 		if len(newIndexes) == 0 {
 			return false, nil
-		}
-
-		txErr = cn.Exec(ctx, c.queries.findAll, nil, func(stmt *sqlite.Stmt) error {
-			for {
-				hasRow, stepErr := stmt.Step()
-				if stepErr != nil {
-					return stepErr
-				}
-				if !hasRow {
-					break
-				}
-				buf.DocBuf = readBytes(stmt, buf.DocBuf)
-				var it item
-				var doc *anyenc.Value
-				if doc, txErr = buf.Parser.Parse(buf.DocBuf); txErr != nil {
-					return txErr
-				}
-				if it, txErr = newItem(doc); txErr != nil {
-					return txErr
-				}
-				buf.SmallBuf = it.appendId(buf.SmallBuf[:0])
-				for _, idx = range newIndexes {
-					if txErr = idx.Insert(ctx, buf.SmallBuf, it); txErr != nil {
-						return txErr
-					}
-				}
-			}
-			return nil
-		})
-		if txErr != nil {
-			return
 		}
 
 		c.mu.Lock()
@@ -605,63 +453,42 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 	})
 }
 
-func (c *collection) createIndex(ctx context.Context, cn *driver.Conn, info IndexInfo) (idx *index, err error) {
+func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info IndexInfo) (idx *index, err error) {
 	if info.Name == "" {
 		info.Name = info.createName()
 	}
-	var fieldsIsDesc = make([]bool, len(info.Fields))
-	for i, field := range info.Fields {
+	for _, field := range info.Fields {
 		if err = validateIndexField(field); err != nil {
 			return nil, err
 		}
-		if _, isDesc := parseIndexField(field); isDesc {
-			fieldsIsDesc[i] = isDesc
-		}
-	}
-	if err = c.db.stmt.registerIndex.Exec(ctx, func(stmt *sqlite.Stmt) {
-		stmt.SetText(":indexName", info.Name)
-		stmt.SetText(":collName", c.name)
-		stmt.SetText(":fields", stringArrayToJson(&fastjson.Arena{}, info.Fields))
-		stmt.SetBool(":sparse", info.Sparse)
-		stmt.SetBool(":unique", info.Unique)
-	}, driver.StmtExecNoResults); err != nil {
-		return nil, replaceUniqErr(err, ErrIndexExists)
 	}
 
-	if err = cn.ExecNoResult(ctx, c.sql.Index(info.Name).Create(info.Unique, fieldsIsDesc)); err != nil {
-		return
+	// Register in system namespace
+	if err = c.db.registerIndex(tx, c.name, info); err != nil {
+		return nil, err
 	}
-	return newIndex(ctx, c, info)
+
+	return newIndex(c, info)
 }
 
 func (c *collection) DropIndex(ctx context.Context, indexName string) (err error) {
-	return c.db.doWriteTx(ctx, func(cn *driver.Conn) (txErr error) {
-		if txErr = c.checkStmts(ctx, cn); txErr != nil {
-			return
-		}
-
-		txErr = c.db.stmt.removeIndex.Exec(ctx, func(stmt *sqlite.Stmt) {
-			stmt.SetText(":indexName", indexName)
-			stmt.SetText(":collName", c.name)
-		}, func(stmt *sqlite.Stmt) error {
-			hasRow, stepErr := stmt.Step()
-			if stepErr != nil {
-				return stepErr
-			}
-			if !hasRow {
-				return ErrIndexNotFound
-			}
-			return nil
-		})
-
+	return c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (txErr error) {
+		// Check index exists
+		found := false
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		for _, idx := range c.indexes {
 			if idx.Info().Name == indexName {
-				if txErr = idx.Drop(ctx, cn); txErr != nil {
-					return
-				}
+				found = true
+				break
 			}
+		}
+		if !found {
+			return ErrIndexNotFound
+		}
+
+		if txErr = c.db.removeIndex(tx, c.name, indexName); txErr != nil {
+			return
 		}
 		c.indexes = slices.DeleteFunc(c.indexes, func(i *index) bool {
 			return i.Info().Name == indexName
@@ -680,95 +507,40 @@ func (c *collection) GetIndexes() (indexes []Index) {
 	return
 }
 
-func (c *collection) indexesHandleInsert(ctx context.Context, id anyenc.Tuple, it item) (err error) {
-	for _, idx := range c.indexes {
-		if err = idx.Insert(ctx, id, it); err != nil {
-			return
-		}
-	}
-	return
-}
-
-func (c *collection) indexesHandleUpdate(ctx context.Context, id anyenc.Tuple, prevIt, newIt item) (err error) {
-	for _, idx := range c.indexes {
-		if err = idx.Update(ctx, id, prevIt, newIt); err != nil {
-			return
-		}
-	}
-	return
-}
-
-func (c *collection) indexesHandleDelete(ctx context.Context, id anyenc.Tuple, prevIt item) (err error) {
-	for _, idx := range c.indexes {
-		if err = idx.Delete(ctx, id, prevIt); err != nil {
-			return
-		}
-	}
-	return
-}
-
 func (c *collection) Rename(ctx context.Context, newName string) error {
-	return c.db.doWriteTx(ctx, func(cn *driver.Conn) (err error) {
+	return c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (err error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		for _, stmt := range []*driver.Stmt{c.db.stmt.renameCollection, c.db.stmt.renameCollectionIndex} {
-			if err = stmt.Exec(ctx, func(sStmt *sqlite.Stmt) {
-				sStmt.SetText(":oldName", c.name)
-				sStmt.SetText(":newName", newName)
-			}, driver.StmtExecNoResults); err != nil {
-				return
-			}
-		}
 
-		if err = cn.ExecNoResult(ctx, c.sql.Rename(newName)); err != nil {
+		if err = c.db.renameCollection(tx, c.name, newName); err != nil {
 			return err
 		}
+
+		// Note: btree namespaces can't be renamed, so we keep the old namespace
+		// but update the name in our metadata
 		c.name = newName
-		c.sql = c.db.sql.Collection(newName)
-		c.tableName = c.sql.TableName()
-		for _, idx := range c.indexes {
-			if err = idx.RenameColl(ctx, cn, newName); err != nil {
-				return
-			}
-		}
-		c.makeQueries()
-		c.closeStmts()
 		return nil
 	})
 }
 
 func (c *collection) Drop(ctx context.Context) error {
-	return c.db.doWriteTx(ctx, func(cn *driver.Conn) (err error) {
+	return c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (err error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if err = c.close(); err != nil {
 			return err
 		}
-		for _, idx := range c.indexes {
-			if err = idx.Drop(ctx, cn); err != nil {
+		if err = c.db.removeCollection(tx, c.name); err != nil {
+			return
+		}
+		// Delete the namespace
+		if err = tx.DeleteNamespace(c.name); err != nil {
+			if !errors.Is(err, btree.ErrNamespaceNotFound) {
 				return
 			}
 		}
-		if err = c.db.stmt.removeCollection.Exec(ctx, func(stmt *sqlite.Stmt) {
-			stmt.SetText(":collName", c.name)
-		}, driver.StmtExecNoResults); err != nil {
-			return
-		}
-		if err = cn.ExecNoResult(ctx, c.sql.Drop()); err != nil {
-			return
-		}
 		return nil
 	})
-}
-
-func (c *collection) closeStmts() {
-	if c.stmtsReady.CompareAndSwap(true, false) {
-		for _, stmt := range []*driver.Stmt{
-			c.stmts.insert, c.stmts.update, c.stmts.findId, c.stmts.delete,
-		} {
-			_ = stmt.Close()
-		}
-	}
 }
 
 func (c *collection) WriteTx(ctx context.Context) (WriteTx, error) {
@@ -780,11 +552,6 @@ func (c *collection) ReadTx(ctx context.Context) (ReadTx, error) {
 }
 
 func (c *collection) Close() error {
-	if cn, err := c.db.cm.GetWrite(context.Background()); err != nil {
-		return err
-	} else {
-		defer c.db.cm.ReleaseWriteWithOptions(cn, true)
-	}
 	if err := c.close(); err != nil {
 		return err
 	}
@@ -795,10 +562,23 @@ func (c *collection) close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	c.closeStmts()
-	for _, idx := range c.indexes {
-		_ = idx.Close()
-	}
 	c.db.onCollectionClose(c.name)
 	return nil
+}
+
+// loadByIdRead loads a document by ID using a read transaction
+func (c *collection) loadByIdRead(tx *btree.ReadTx, buf *syncpool.DocBuffer, id anyenc.Tuple) (it item, err error) {
+	val, err := tx.Get(c.ns, id)
+	if err != nil {
+		if errors.Is(err, btree.ErrKeyNotFound) {
+			return item{}, ErrDocNotFound
+		}
+		return
+	}
+	buf.DocBuf = append(buf.DocBuf[:0], val...)
+	doc, err := buf.Parser.Parse(buf.DocBuf)
+	if err != nil {
+		return
+	}
+	return newItem(doc)
 }

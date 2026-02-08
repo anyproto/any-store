@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/anyproto/any-store/internal/driver"
+	"github.com/anyproto/any-store/internal/btree"
 )
 
 type mockTracker struct {
@@ -64,10 +64,10 @@ func TestController_StartStop(t *testing.T) {
 		AutoFlushEnable:    true,
 		AutoFlushIdleAfter: 100 * time.Millisecond,
 		Sentinel:           tracker,
-		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, fn func(db *btree.DB) error) error {
 			return fn(nil)
 		},
-		AutoFlushFunc: func(ctx context.Context, conn *driver.Conn) error {
+		AutoFlushFunc: func(ctx context.Context, db *btree.DB) error {
 			flushCalled.Store(true)
 			return nil
 		},
@@ -99,10 +99,10 @@ func TestController_IdleFlush(t *testing.T) {
 		AutoFlushEnable:    true,
 		AutoFlushIdleAfter: 100 * time.Millisecond,
 		Sentinel:           tracker,
-		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, fn func(db *btree.DB) error) error {
 			return fn(nil)
 		},
-		AutoFlushFunc: func(ctx context.Context, conn *driver.Conn) error {
+		AutoFlushFunc: func(ctx context.Context, db *btree.DB) error {
 			flushCount.Add(1)
 			return nil
 		},
@@ -113,7 +113,7 @@ func TestController_IdleFlush(t *testing.T) {
 	require.NoError(t, err)
 	defer controller.Stop()
 
-	controller.OnWriteEvent(driver.EventReleaseWriteWithChanges)
+	controller.OnWriteEvent()
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -122,8 +122,6 @@ func TestController_IdleFlush(t *testing.T) {
 }
 
 func TestController_RaceConditionWriteDuringFlush(t *testing.T) {
-	// Tests that when a write happens while flush is acquiring the connection,
-	// the flush is skipped because the system is no longer idle
 	tracker := &mockTracker{}
 	var flushCount atomic.Int32
 	writeConnAcquired := make(chan struct{}, 1)
@@ -134,7 +132,7 @@ func TestController_RaceConditionWriteDuringFlush(t *testing.T) {
 		AutoFlushEnable:    true,
 		AutoFlushIdleAfter: 200 * time.Millisecond,
 		Sentinel:           tracker,
-		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, fn func(db *btree.DB) error) error {
 			select {
 			case writeConnAcquired <- struct{}{}:
 				<-writeConnReleased
@@ -143,7 +141,7 @@ func TestController_RaceConditionWriteDuringFlush(t *testing.T) {
 			flushAttempted.Store(true)
 			return fn(nil)
 		},
-		AutoFlushFunc: func(ctx context.Context, conn *driver.Conn) error {
+		AutoFlushFunc: func(ctx context.Context, db *btree.DB) error {
 			flushCount.Add(1)
 			return nil
 		},
@@ -153,13 +151,11 @@ func TestController_RaceConditionWriteDuringFlush(t *testing.T) {
 	err := controller.Start(ctx)
 	require.NoError(t, err)
 
-	//initialWriteTime := time.Now().Add(-300 * time.Millisecond)
-	controller.OnWriteEvent(driver.EventReleaseWriteWithChanges)
+	controller.OnWriteEvent()
 
 	<-writeConnAcquired
 
-	//newWriteTime := time.Now().Add(-50 * time.Millisecond)
-	controller.OnWriteEvent(driver.EventReleaseWriteWithChanges)
+	controller.OnWriteEvent()
 
 	close(writeConnReleased)
 	time.Sleep(50 * time.Millisecond)
@@ -172,8 +168,6 @@ func TestController_RaceConditionWriteDuringFlush(t *testing.T) {
 }
 
 func TestController_FlushAfterWriteDelay(t *testing.T) {
-	// Tests that flush is skipped when a write happens during acquire,
-	// but succeeds on the next attempt when system becomes idle
 	tracker := &mockTracker{}
 	var flushCount atomic.Int32
 	acquireStarted := make(chan struct{})
@@ -183,7 +177,7 @@ func TestController_FlushAfterWriteDelay(t *testing.T) {
 		AutoFlushEnable:    true,
 		AutoFlushIdleAfter: 200 * time.Millisecond,
 		Sentinel:           tracker,
-		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, fn func(db *btree.DB) error) error {
 			select {
 			case acquireStarted <- struct{}{}:
 			default:
@@ -195,7 +189,7 @@ func TestController_FlushAfterWriteDelay(t *testing.T) {
 			}
 			return fn(nil)
 		},
-		AutoFlushFunc: func(ctx context.Context, conn *driver.Conn) error {
+		AutoFlushFunc: func(ctx context.Context, db *btree.DB) error {
 			flushCount.Add(1)
 			return nil
 		},
@@ -206,11 +200,11 @@ func TestController_FlushAfterWriteDelay(t *testing.T) {
 	require.NoError(t, err)
 	defer controller.Stop()
 
-	controller.OnWriteEvent(driver.EventReleaseWriteWithChanges)
+	controller.OnWriteEvent()
 
 	<-acquireStarted
 
-	controller.OnWriteEvent(driver.EventReleaseWriteWithChanges)
+	controller.OnWriteEvent()
 
 	close(proceedWithAcquire)
 	time.Sleep(50 * time.Millisecond)
@@ -234,7 +228,7 @@ func TestController_MultipleWritesDuringFlush(t *testing.T) {
 		AutoFlushEnable:    true,
 		AutoFlushIdleAfter: 100 * time.Millisecond,
 		Sentinel:           tracker,
-		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, fn func(db *btree.DB) error) error {
 			select {
 			case writeConnAcquired <- struct{}{}:
 				<-writeConnReleased
@@ -242,7 +236,7 @@ func TestController_MultipleWritesDuringFlush(t *testing.T) {
 			}
 			return fn(nil)
 		},
-		AutoFlushFunc: func(ctx context.Context, conn *driver.Conn) error {
+		AutoFlushFunc: func(ctx context.Context, db *btree.DB) error {
 			flushCount.Add(1)
 			return nil
 		},
@@ -253,14 +247,12 @@ func TestController_MultipleWritesDuringFlush(t *testing.T) {
 	require.NoError(t, err)
 	defer controller.Stop()
 
-	controller.OnWriteEvent(driver.EventReleaseWriteWithChanges)
+	controller.OnWriteEvent()
 
 	<-writeConnAcquired
 
-	// Simulate multiple writes with decreasing age (20ms, 18ms, 16ms, 14ms, 12ms ago)
-	// to ensure at least one write is recent enough to skip the flush
-	for i := 0; i < 5; i++ {
-		controller.OnWriteEvent(driver.EventReleaseWriteWithChanges)
+	for range 5 {
+		controller.OnWriteEvent()
 		time.Sleep(2 * time.Millisecond)
 	}
 
@@ -272,8 +264,6 @@ func TestController_MultipleWritesDuringFlush(t *testing.T) {
 }
 
 func TestController_FlushDoesNotResetWriteTime(t *testing.T) {
-	// Tests that flush operations do not trigger write events,
-	// preventing an infinite loop where flush retries would keep resetting lastWriteTime
 	tracker := &mockTracker{}
 	var flushCount atomic.Int32
 	var acquireCount atomic.Int32
@@ -284,16 +274,11 @@ func TestController_FlushDoesNotResetWriteTime(t *testing.T) {
 		AutoFlushEnable:    true,
 		AutoFlushIdleAfter: 10 * time.Second,
 		Sentinel:           tracker,
-		AcquireWrite: func(ctx context.Context, fn func(conn *driver.Conn) error) error {
+		AcquireWrite: func(ctx context.Context, fn func(db *btree.DB) error) error {
 			acquireCount.Add(1)
-			err := fn(nil)
-			// Only trigger write events for non-silent acquires (simulates real behavior)
-			if controller != nil {
-				controller.OnWriteEvent(driver.EventReleaseWriteWithoutChanges)
-			}
-			return err
+			return fn(nil)
 		},
-		AutoFlushFunc: func(ctx context.Context, conn *driver.Conn) error {
+		AutoFlushFunc: func(ctx context.Context, db *btree.DB) error {
 			flushCount.Add(1)
 			return nil
 		},
@@ -306,7 +291,7 @@ func TestController_FlushDoesNotResetWriteTime(t *testing.T) {
 	require.NoError(t, err)
 	defer controller.Stop()
 
-	controller.OnWriteEvent(driver.EventReleaseWriteWithChanges)
+	controller.OnWriteEvent()
 
 	time.Sleep(60 * time.Millisecond)
 

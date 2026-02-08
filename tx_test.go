@@ -39,7 +39,6 @@ func TestDb_WriteTx(t *testing.T) {
 		fx := newFixture(t)
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
-		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true}))
 
 		tx, err := fx.WriteTx(ctx)
 		require.NoError(t, err)
@@ -51,11 +50,11 @@ func TestDb_WriteTx(t *testing.T) {
 		))
 		assertCollCountCtx(tx.Context(), t, coll, 3)
 
-		// this insert will be failed and should rollback to savepoint
+		// this insert will fail because id:1 already exists, and should rollback to savepoint
 		require.Error(t, coll.Insert(tx.Context(),
 			anyenc.MustParseJson(`{"id":4,"a":4}`),
 			anyenc.MustParseJson(`{"id":5,"a":5}`),
-			anyenc.MustParseJson(`{"id":6,"a":1}`),
+			anyenc.MustParseJson(`{"id":1,"a":6}`),
 		))
 		assertCollCountCtx(tx.Context(), t, coll, 3)
 

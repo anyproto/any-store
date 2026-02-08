@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"sync"
+	"sync/atomic"
 )
 
 // Options configures the database.
@@ -28,11 +29,13 @@ func DefaultOptions() Options {
 
 // DB represents an open database.
 type DB struct {
-	mu     sync.RWMutex
-	pager  *pager
-	path   string
-	opts   Options
-	closed bool
+	mu      sync.RWMutex
+	writeMu sync.Mutex // serializes write transactions
+	pager   *pager
+	path    string
+	opts    Options
+	closing atomic.Bool // set to reject new transactions
+	closed  atomic.Bool // set when Close() is actually called
 
 	// Namespace root pages are stored in a master table on page 1.
 	// Format: each cell in the master B-tree maps namespace name -> root page number (4 bytes).
@@ -77,13 +80,19 @@ func Open(path string, opts Options) (*DB, error) {
 
 // Close closes the database.
 func (db *DB) Close() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.closed {
+	if !db.closed.CompareAndSwap(false, true) {
 		return ErrClosed
 	}
-	db.closed = true
+	db.closing.Store(true)
+	// Wait for write mutex to ensure no writer is active
+	db.writeMu.Lock()
+	db.writeMu.Unlock()
 	return db.pager.close()
+}
+
+// SetClosing marks the database as closing, causing new transactions to fail.
+func (db *DB) SetClosing() {
+	db.closing.Store(true)
 }
 
 // Path returns the database file path.
@@ -93,8 +102,11 @@ func (db *DB) Path() string {
 
 // BeginRead starts a read-only transaction.
 func (db *DB) BeginRead() (*ReadTx, error) {
+	if db.closing.Load() {
+		return nil, ErrClosed
+	}
 	db.mu.RLock()
-	if db.closed {
+	if db.closing.Load() {
 		db.mu.RUnlock()
 		return nil, ErrClosed
 	}
@@ -111,22 +123,34 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 }
 
 // BeginWrite starts a read-write transaction. Only one write transaction
-// can be active at a time (single-writer semantics).
+// can be active at a time (single-writer semantics). Blocks until any
+// existing write transaction completes.
 func (db *DB) BeginWrite() (*WriteTx, error) {
+	if db.closing.Load() {
+		return nil, ErrClosed
+	}
+	db.writeMu.Lock()
+	if db.closing.Load() {
+		db.writeMu.Unlock()
+		return nil, ErrClosed
+	}
 	db.mu.RLock()
-	if db.closed {
+	if db.closing.Load() {
 		db.mu.RUnlock()
+		db.writeMu.Unlock()
 		return nil, ErrClosed
 	}
 
 	if err := db.pager.beginRead(); err != nil {
 		db.mu.RUnlock()
+		db.writeMu.Unlock()
 		return nil, err
 	}
 
 	if err := db.pager.beginWrite(); err != nil {
 		db.pager.endRead()
 		db.mu.RUnlock()
+		db.writeMu.Unlock()
 		return nil, err
 	}
 
@@ -141,9 +165,12 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 // Checkpoint triggers a WAL checkpoint, writing committed WAL frames
 // back to the database file.
 func (db *DB) Checkpoint() error {
+	if db.closing.Load() {
+		return ErrClosed
+	}
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	if db.closed {
+	if db.closing.Load() {
 		return ErrClosed
 	}
 	return db.pager.checkpoint()
@@ -408,12 +435,14 @@ func (tx *WriteTx) Commit() error {
 	threshold := AutoCheckpointThreshold
 	needCheckpoint := threshold > 0 && tx.pager.wal.nFrame >= threshold
 	tx.pager.endRead()
-	tx.db.mu.RUnlock()
 
-	// Auto-checkpoint after all locks are released to prevent WAL bloat.
+	// Auto-checkpoint before releasing db.mu.RLock to avoid deadlock with Close().
+	// Use tryCheckpoint to avoid blocking if another checkpoint is in progress.
 	if err == nil && needCheckpoint {
-		_ = tx.db.Checkpoint()
+		_ = tx.pager.tryCheckpoint()
 	}
+	tx.db.mu.RUnlock()
+	tx.db.writeMu.Unlock()
 	return err
 }
 
@@ -426,6 +455,7 @@ func (tx *WriteTx) Rollback() error {
 	err := tx.pager.rollback()
 	tx.pager.endRead()
 	tx.db.mu.RUnlock()
+	tx.db.writeMu.Unlock()
 	return err
 }
 
