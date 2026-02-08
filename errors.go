@@ -3,9 +3,7 @@ package anystore
 import (
 	"errors"
 
-	"github.com/anyproto/go-sqlite"
-
-	"github.com/anyproto/any-store/internal/driver"
+	"github.com/anyproto/any-store/internal/btree"
 )
 
 var (
@@ -48,31 +46,8 @@ var (
 	// ErrQuickCheckFailed is returned when we did a quick check (e.g. when opening db in a dirty state with sentinel config on) and it failed, indicating possible database corruption.
 	ErrQuickCheckFailed = errors.New("any-store: quick check failed on db open")
 
-	ErrDBIsClosed = driver.ErrDBIsClosed
+	ErrDBIsClosed = btree.ErrClosed
 
-	ErrDBIsNotOpened       = driver.ErrDBIsNotOpened
-	ErrIncompatibleVersion = driver.ErrIncompatibleVersion
+	ErrDBIsNotOpened       = errors.New("any-store: database is not opened")
+	ErrIncompatibleVersion = errors.New("any-store: incompatible version")
 )
-
-func replaceUniqErr(err, replaceTo error) error {
-	if err == nil {
-		return nil
-	}
-	switch sqlite.ErrCode(err) {
-	case sqlite.ResultConstraintPrimaryKey,
-		sqlite.ResultConstraintUnique:
-		return replaceTo
-	}
-	return err
-}
-
-func replaceInterruptErr(err error) error {
-	if err == nil {
-		return nil
-	}
-	switch sqlite.ErrCode(err) {
-	case sqlite.ResultInterrupt:
-		return ErrDBIsClosed
-	}
-	return err
-}

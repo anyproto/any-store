@@ -6,11 +6,9 @@ import (
 	"slices"
 	"sort"
 
-	"github.com/anyproto/go-sqlite"
-
 	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/bitmap"
-	"github.com/anyproto/any-store/internal/driver"
+	"github.com/anyproto/any-store/internal/btree"
 	"github.com/anyproto/any-store/query"
 )
 
@@ -130,30 +128,30 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	if err != nil {
 		return
 	}
-	sqlRes := qb.build(false)
+
 	tx, err := q.c.db.getReadTx(ctx)
 	if err != nil {
 		qb.Close()
 		return
 	}
-	stmt, err := tx.conn().Query(ctx, sqlRes)
-	if err != nil {
-		qb.Close()
-		return
-	}
-	for i, val := range qb.values {
-		stmt.BindBytes(i+1, val)
-	}
-	return q.newIterator(stmt, tx, qb), nil
-}
 
-func (q *collQuery) newIterator(stmt *driver.Stmt, tx ReadTx, qb *queryBuilder) *iterator {
-	return &iterator{
-		stmt: stmt,
-		buf:  q.c.db.syncPool.GetDocBuf(),
-		tx:   tx,
-		qb:   qb,
+	cursor := tx.btreeReadTx().NewCursor(q.c.ns)
+
+	var filter query.Filter
+	if q.cond != nil {
+		filter = q.cond
 	}
+
+	return &iterator{
+		cursor: cursor,
+		filter: filter,
+		sorter: q.sort,
+		buf:    q.c.db.syncPool.GetDocBuf(),
+		tx:     tx,
+		qb:     qb,
+		limit:  int(q.limit),
+		offset: int(q.offset),
+	}, nil
 }
 
 func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResult, err error) {
@@ -165,7 +163,6 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	if err != nil {
 		return
 	}
-	sqlRes := qb.build(false)
 
 	tx, err := q.c.db.WriteTx(ctx)
 	if err != nil {
@@ -180,20 +177,23 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		}
 	}()
 
-	if err = q.c.checkStmts(tx.Context(), tx.conn()); err != nil {
-		qb.Close()
-		return
+	btWtx := tx.btreeWriteTx()
+	cursor := btWtx.NewCursor(q.c.ns)
+
+	var filter query.Filter
+	if q.cond != nil {
+		filter = q.cond
 	}
 
-	stmt, err := tx.conn().Query(ctx, sqlRes)
-	if err != nil {
-		qb.Close()
-		return
+	iter := &iterator{
+		cursor: cursor,
+		filter: filter,
+		buf:    q.c.db.syncPool.GetDocBuf(),
+		tx:     tx,
+		qb:     qb,
+		limit:  int(q.limit),
+		offset: int(q.offset),
 	}
-	for i, val := range qb.values {
-		stmt.BindBytes(i+1, val)
-	}
-	iter := q.newIterator(stmt, tx, qb)
 	defer func() {
 		_ = iter.Close()
 	}()
@@ -225,7 +225,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		if it, err = newItem(modifiedVal); err != nil {
 			return
 		}
-		if _, err = q.c.update(tx.Context(), it, doc.(item)); err != nil {
+		if _, err = q.c.update(btWtx, it, doc.(item)); err != nil {
 			return
 		}
 		result.Modified++
@@ -239,7 +239,6 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	if err != nil {
 		return
 	}
-	sqlRes := qb.build(false)
 
 	tx, err := q.c.db.WriteTx(ctx)
 	if err != nil {
@@ -254,40 +253,57 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 		}
 	}()
 
-	if err = q.c.checkStmts(tx.Context(), tx.conn()); err != nil {
-		qb.Close()
-		return
+	btWtx := tx.btreeWriteTx()
+
+	// First collect all docs to delete (can't modify while iterating)
+	cursor := btWtx.NewCursor(q.c.ns)
+
+	var filter query.Filter
+	if q.cond != nil {
+		filter = q.cond
 	}
 
-	stmt, err := tx.conn().Query(ctx, sqlRes)
-	if err != nil {
-		qb.Close()
-		return
+	iterBuf := q.c.db.syncPool.GetDocBuf()
+	iter := &iterator{
+		cursor: cursor,
+		filter: filter,
+		buf:    iterBuf,
+		qb:     qb,
+		limit:  int(q.limit),
+		offset: int(q.offset),
 	}
-	for i, val := range qb.values {
-		stmt.BindBytes(i+1, val)
-	}
-	iter := q.newIterator(stmt, tx, qb)
-	defer func() {
-		_ = iter.Close()
-	}()
 
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
+	// Collect IDs to delete
+	var idsToDelete [][]byte
 	for iter.Next() {
 		var doc Doc
 		if doc, err = iter.Doc(); err != nil {
+			q.c.db.syncPool.ReleaseDocBuf(iterBuf)
+			qb.Close()
 			return
 		}
 		id := doc.(item).appendId(buf.SmallBuf[:0])
-		if err = q.c.deleteItem(tx.Context(), id, doc.(item)); err != nil {
+		idsToDelete = append(idsToDelete, append([]byte(nil), id...))
+	}
+	if err = iter.Err(); err != nil {
+		q.c.db.syncPool.ReleaseDocBuf(iterBuf)
+		qb.Close()
+		return
+	}
+	q.c.db.syncPool.ReleaseDocBuf(iterBuf)
+	qb.Close()
+
+	// Now delete collected docs
+	for _, id := range idsToDelete {
+		if err = q.c.deleteItem(btWtx, id); err != nil {
 			return
 		}
 		result.Matched++
 		result.Modified++
 	}
-	err = iter.Err()
 	return
 }
 
@@ -297,49 +313,63 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 		return
 	}
 	defer qb.Close()
-	sqlRes := qb.build(true)
-	err = q.c.db.doReadTx(ctx, func(cn *driver.Conn) (txErr error) {
-		txErr = cn.ExecCached(ctx, sqlRes, func(stmt *sqlite.Stmt) {
-			for i, val := range qb.values {
-				stmt.BindBytes(i+1, val)
-			}
-		}, func(stmt *sqlite.Stmt) error {
-			hasRow, stepErr := stmt.Step()
-			if stepErr != nil {
-				return stepErr
-			}
-			if !hasRow {
-				return nil
-			}
-			count = stmt.ColumnInt(0)
+
+	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		cursor := tx.NewCursor(q.c.ns)
+		buf := q.c.db.syncPool.GetDocBuf()
+		defer q.c.db.syncPool.ReleaseDocBuf(buf)
+
+		if err := cursor.First(); err != nil {
 			return nil
-		})
-		return
+		}
+		var skipped, counted int
+		for cursor.Valid() {
+			if q.cond != nil {
+				val, err := cursor.Value()
+				if err != nil {
+					return err
+				}
+				doc, err := buf.Parser.Parse(val)
+				if err != nil {
+					return err
+				}
+				if !q.cond.Ok(doc, buf) {
+					if err := cursor.Next(); err != nil {
+						return err
+					}
+					continue
+				}
+			}
+			if q.offset > 0 && skipped < int(q.offset) {
+				skipped++
+				if err := cursor.Next(); err != nil {
+					return err
+				}
+				continue
+			}
+			counted++
+			if q.limit > 0 && counted >= int(q.limit) {
+				break
+			}
+			if err := cursor.Next(); err != nil {
+				return err
+			}
+		}
+		count = counted
+		return nil
 	})
 	return
 }
 
 func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
-	qb, err := q.makeQuery()
+	_, err = q.makeQuery()
 	if err != nil {
 		return
 	}
-	defer qb.Close()
 
-	explain.Sql = qb.build(false)
-	err = q.c.db.doReadTx(ctx, func(cn *driver.Conn) (txErr error) {
-		txErr = cn.Exec(ctx, "EXPLAIN QUERY PLAN "+explain.Sql, func(stmt *sqlite.Stmt) {
-			for i, val := range qb.values {
-				stmt.BindBytes(i+1, val)
-			}
-		}, func(stmt *sqlite.Stmt) error {
-			if explain.SqliteExplain, txErr = scanExplainStmt(stmt); txErr != nil {
-				return txErr
-			}
-			return nil
-		})
-		return
-	})
+	explain.Sql = "FULL_SCAN"
+	explain.SqliteExplain = []string{"btree full scan"}
+
 	for _, idx := range q.indexesWithWeight {
 		explain.Indexes = append(explain.Indexes, IndexExplain{
 			Name:   idx.Info().Name,
@@ -374,13 +404,10 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 
 	qb = newQueryBuilder()
 	qb.coll = q.c
-	qb.tableName = q.c.tableName
 	qb.limit = int(q.limit)
 	qb.offset = int(q.offset)
 
-	if q.cond != nil {
-		qb.filterId = q.c.db.filterReg.Register(q.cond)
-	} else {
+	if q.cond == nil {
 		q.cond = query.All{}
 	}
 
@@ -388,27 +415,12 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 		q.sortFields = q.sort.Fields()
 	}
 
-	var addedSorts bitmap.Bitmap256
-
 	// handle "id" field
 	if idBounds := q.cond.IndexBounds("id", nil); len(idBounds) != 0 {
 		qb.idBounds = idBounds
 	}
 
-	var addIdSort = func(reverse bool) {
-		qb.sorts = append(qb.sorts, qbSort{
-			reverse: reverse,
-		})
-	}
-
-	if len(q.sortFields) != 0 && q.sortFields[0].Field == "id" {
-		// if an id field is first, other sorts will be useless
-		q.sortFields = q.sortFields[:1]
-		addedSorts = addedSorts.Set(uint8(0))
-		addIdSort(q.sortFields[0].Reverse)
-	}
-
-	// calculate weights
+	// calculate weights (kept for index choosing logic, not used for actual queries)
 	q.indexesWithWeight = make(weightedIndexes, len(q.c.indexes))
 	for i, idx := range q.c.indexes {
 		q.indexesWithWeight[i].index = idx
@@ -429,13 +441,11 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 	}
 	sort.Sort(q.indexesWithWeight)
 
-	// filter useless indexes
+	// filter useless indexes (kept for index choosing logic)
 	var (
-		usedFieldsBits  bitmap.Bitmap256
-		usedSortBits    bitmap.Bitmap256
-		filteredIndexes = q.indexesWithWeight[:0]
-		exactSortFound  bool
-		exactSortIdx    int
+		usedFieldsBits bitmap.Bitmap256
+		usedSortBits   bitmap.Bitmap256
+		exactSortFound bool
 	)
 	for i, idx := range q.indexesWithWeight {
 		if idx.weight < 1 {
@@ -446,80 +456,13 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 			(!exactSortFound && idx.exactSort) {
 			usedFieldsBits = usedFieldsBits.Or(idx.queryFieldsBits)
 			usedSortBits = usedSortBits.Or(idx.sortFieldsBits)
-			idx.pos = i
-			filteredIndexes = append(filteredIndexes, idx)
 			if idx.exactSort {
 				exactSortFound = true
-				exactSortIdx = len(filteredIndexes) - 1
 			}
+			_ = i // index choosing logic preserved but not used
 		}
 	}
 
-	if len(filteredIndexes) > maxIndexesInQuery {
-		if exactSortFound {
-			filteredIndexes = filteredIndexes[:exactSortIdx+1]
-		} else {
-			filteredIndexes = filteredIndexes[:maxIndexesInQuery]
-		}
-	}
-
-	for i, idx := range filteredIndexes {
-		tableName := idx.sql.TableName()
-		used := false
-		join := qbJoin{
-			idx:       idx.index,
-			tableName: tableName,
-		}
-		idx.queryFieldsBits.Iterate(func(j int) {
-			if len(q.queryFields[j].bounds) != 0 {
-				join.bounds = append(join.bounds, qbBounds{
-					fieldNum: slices.Index(idx.fieldNames, q.queryFields[j].field),
-					bounds:   q.queryFields[j].bounds,
-				})
-				used = true
-			}
-		})
-		if !exactSortFound {
-			for j, field := range q.sortFields {
-				if !addedSorts.Get(uint8(j)) {
-					if idx.sortFieldsBits.Get(uint8(j)) {
-						addedSorts = addedSorts.Set(uint8(j))
-						qb.sorts = append(qb.sorts, qbSort{
-							tableName: tableName,
-							fieldNum:  slices.Index(idx.fieldNames, field.Field),
-							reverse:   field.Reverse,
-						})
-						used = true
-					} else if field.Field == "id" {
-						addedSorts = addedSorts.Set(uint8(j))
-						addIdSort(field.Reverse)
-					}
-				}
-			}
-		}
-		if used || (exactSortFound && i == exactSortIdx) {
-			qb.joins = append(qb.joins, join)
-			q.indexesWithWeight[idx.pos].used = true
-		}
-	}
-
-	if exactSortFound {
-		idx := filteredIndexes[exactSortIdx]
-		for j, field := range q.sortFields {
-			if !addedSorts.Get(uint8(j)) && idx.sortFieldsBits.Get(uint8(j)) {
-				addedSorts = addedSorts.Set(uint8(j))
-				qb.sorts = append(qb.sorts, qbSort{
-					tableName: idx.sql.TableName(),
-					fieldNum:  slices.Index(idx.fieldNames, field.Field),
-					reverse:   field.Reverse,
-				})
-			}
-		}
-	}
-
-	if len(q.sortFields) > addedSorts.CountLeadingOnes() {
-		qb.sortId = q.c.db.sortReg.Register(q.sort)
-	}
 	return
 }
 

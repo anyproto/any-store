@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/anyproto/any-store/internal/driver"
+	"github.com/anyproto/any-store/internal/btree"
 )
 
 // FlushMode represents how to flush data during idle periods
@@ -20,31 +20,19 @@ const (
 
 // NewFlushFunc creates a flush function based on the given FlushMode.
 // Returns an error if the mode is invalid.
-func NewFlushFunc(mode FlushMode) (func(ctx context.Context, conn *driver.Conn) error, error) {
+func NewFlushFunc(mode FlushMode) (func(ctx context.Context, db *btree.DB) error, error) {
 	if mode == "" {
 		mode = FlushModeCheckpointPassive
 	}
 
 	switch mode {
-	case FlushModeFsync:
-		return func(ctx context.Context, conn *driver.Conn) error {
-			return conn.Fsync(ctx)
-		}, nil
-	case FlushModeCheckpointPassive:
-		return func(ctx context.Context, conn *driver.Conn) error {
-			return conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(PASSIVE)")
-		}, nil
-	case FlushModeCheckpointFull:
-		return func(ctx context.Context, conn *driver.Conn) error {
-			return conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(FULL)")
-		}, nil
-	case FlushModeCheckpointRestart:
-		return func(ctx context.Context, conn *driver.Conn) error {
-			return conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(RESTART)")
-		}, nil
-	case FlushModeCheckpointTruncate:
-		return func(ctx context.Context, conn *driver.Conn) error {
-			return conn.ExecNoResult(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
+	case FlushModeFsync,
+		FlushModeCheckpointPassive,
+		FlushModeCheckpointFull,
+		FlushModeCheckpointRestart,
+		FlushModeCheckpointTruncate:
+		return func(ctx context.Context, db *btree.DB) error {
+			return db.Checkpoint()
 		}, nil
 	default:
 		return nil, fmt.Errorf("invalid flush mode: %s", mode)

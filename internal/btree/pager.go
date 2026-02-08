@@ -414,10 +414,19 @@ func (p *pager) savepoint() (int, error) {
 	}
 
 	id := len(p.savepoints)
+	pages := make(map[uint32][]byte)
+
+	// Save copies of all currently dirty pages so we can restore them on rollback
+	for pgno, pg := range p.writePages {
+		dataCopy := make([]byte, len(pg.data))
+		copy(dataCopy, pg.data)
+		pages[pgno] = dataCopy
+	}
+
 	p.savepoints = append(p.savepoints, savepointState{
 		id:       id,
 		dbSize:   p.dbSize,
-		pages:    make(map[uint32][]byte),
+		pages:    pages,
 		walFrame: p.wal.nFrame,
 	})
 	return id, nil
@@ -432,17 +441,37 @@ func (p *pager) rollbackToSavepoint(id int) error {
 		return ErrInvalidSavepoint
 	}
 
-	// Roll back from newest to the target savepoint
-	for i := len(p.savepoints) - 1; i >= id; i-- {
-		sp := &p.savepoints[i]
-		for pgno, data := range sp.pages {
+	sp := &p.savepoints[id]
+
+	// Discard pages allocated after the savepoint
+	for pgno := range p.writePages {
+		if pgno > sp.dbSize {
+			p.cache.discard(pgno)
+			delete(p.writePages, pgno)
+		}
+	}
+
+	// Restore saved page copies from all savepoints being rolled back.
+	// Process from oldest to newest so that the oldest copy wins.
+	for i := id; i < len(p.savepoints); i++ {
+		for pgno, data := range p.savepoints[i].pages {
 			if pg := p.cache.fetch(pgno); pg != nil {
 				copy(pg.data, data)
+				off := 0
+				if pgno == 1 {
+					off = dbHeaderSize
+				}
+				if pg.data[off] != 0 {
+					pg.header.deserialize(pg.data[off:])
+				}
+				// Page is restored to pre-savepoint state but stays dirty
+				// so it can be modified again in the current transaction.
 				p.cache.release(pg)
 			}
 		}
-		p.dbSize = sp.dbSize
 	}
+
+	p.dbSize = sp.dbSize
 
 	// Remove savepoints above the target (but keep the target)
 	p.savepoints = p.savepoints[:id]
@@ -478,6 +507,15 @@ func (p *pager) releaseSavepoint(id int) error {
 // checkpoint runs a WAL checkpoint.
 func (p *pager) checkpoint() error {
 	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.wal.checkpoint(p.file)
+}
+
+// tryCheckpoint attempts a checkpoint without blocking.
+func (p *pager) tryCheckpoint() error {
+	if !p.mu.TryLock() {
+		return nil
+	}
 	defer p.mu.Unlock()
 	return p.wal.checkpoint(p.file)
 }

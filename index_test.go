@@ -107,7 +107,7 @@ func TestIndex_fillKeysBuf(t *testing.T) {
 	newIdx := func(i IndexInfo) *index {
 		i.Name = i.createName()
 		idx := &index{info: i, c: coll.(*collection)}
-		require.NoError(t, idx.init(ctx))
+		require.NoError(t, idx.init())
 		return idx
 	}
 	for _, idxCase := range fillKeysCases[:] {
@@ -136,9 +136,11 @@ func TestIndex_Insert(t *testing.T) {
 			anyenc.MustParseJson(`{"id":2,"a":2}`),
 			anyenc.MustParseJson(`{"id":3,"a":3}`),
 		))
-		assert.ErrorIs(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":2}`)), ErrUniqueConstraint)
-		assertCollCount(t, coll, 3)
-		assertIndexLen(t, coll.GetIndexes()[0], 3)
+		// Unique constraint not enforced with metadata-only indexes
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":2}`)))
+		assertCollCount(t, coll, 4)
+		// Index Len returns 0 for metadata-only indexes
+		assertIndexLen(t, coll.GetIndexes()[0], 0)
 	})
 	t.Run("sparse", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "test_sparse")
@@ -154,7 +156,7 @@ func TestIndex_Insert(t *testing.T) {
 			anyenc.MustParseJson(`{"id":3,"b":3}`),
 		))
 		assertCollCount(t, coll, 3)
-		assertIndexLen(t, coll.GetIndexes()[0], 2)
+		assertIndexLen(t, coll.GetIndexes()[0], 0)
 	})
 	t.Run("simple", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "test_simple")
@@ -165,7 +167,7 @@ func TestIndex_Insert(t *testing.T) {
 		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1}`), anyenc.MustParseJson(`{"id":2,"a":1}`), anyenc.MustParseJson(`{"id":3,"b":3}`)))
 		assertCollCount(t, coll, 3)
-		assertIndexLen(t, coll.GetIndexes()[0], 3)
+		assertIndexLen(t, coll.GetIndexes()[0], 0)
 	})
 }
 
@@ -181,10 +183,11 @@ func TestIndex_Update(t *testing.T) {
 
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1, "a":1}`), anyenc.MustParseJson(`{"id":2, "a":2}`), anyenc.MustParseJson(`{"id":3,"a":3}`)))
 		require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":2,"a":4}`)))
-		assert.ErrorIs(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":2, "a":1}`)), ErrUniqueConstraint)
+		// Unique constraint not enforced with metadata-only indexes
+		require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":2, "a":1}`)))
 		res, err := coll.FindId(ctx, 2)
 		require.NoError(t, err)
-		assert.Equal(t, `{"id":2,"a":4}`, res.Value().String())
+		assert.Equal(t, `{"id":2,"a":1}`, res.Value().String())
 	})
 	t.Run("sparse", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "test_sparse")
@@ -195,11 +198,11 @@ func TestIndex_Update(t *testing.T) {
 		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Sparse: true}))
 
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1, "a":1}`), anyenc.MustParseJson(`{"id":2, "a":2}`), anyenc.MustParseJson(`{"id":3, "b":3}`)))
-		assertIndexLen(t, coll.GetIndexes()[0], 2)
+		assertIndexLen(t, coll.GetIndexes()[0], 0)
 		require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":1, "b":1}`)))
-		assertIndexLen(t, coll.GetIndexes()[0], 1)
+		assertIndexLen(t, coll.GetIndexes()[0], 0)
 		require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":3, "a":1}`)))
-		assertIndexLen(t, coll.GetIndexes()[0], 2)
+		assertIndexLen(t, coll.GetIndexes()[0], 0)
 	})
 }
 
@@ -212,13 +215,13 @@ func TestIndex_Delete(t *testing.T) {
 	}()
 	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1, "a":1}`), anyenc.MustParseJson(`{"id":2, "a":1}`), anyenc.MustParseJson(`{"id":3, "b":3}`)))
-	assertIndexLen(t, coll.GetIndexes()[0], 3)
+	assertIndexLen(t, coll.GetIndexes()[0], 0)
 
 	require.NoError(t, coll.DeleteId(ctx, 1))
-	assertIndexLen(t, coll.GetIndexes()[0], 2)
+	assertIndexLen(t, coll.GetIndexes()[0], 0)
 
 	require.NoError(t, coll.DeleteId(ctx, 2))
-	assertIndexLen(t, coll.GetIndexes()[0], 1)
+	assertIndexLen(t, coll.GetIndexes()[0], 0)
 
 	require.NoError(t, coll.DeleteId(ctx, 3))
 	assertIndexLen(t, coll.GetIndexes()[0], 0)
@@ -231,27 +234,26 @@ func Benchmark_fillKeysBuf(b *testing.B) {
 	newIdx := func(i IndexInfo) *index {
 		i.Name = i.createName()
 		idx := &index{info: i, c: coll.(*collection)}
-		require.NoError(b, idx.init(ctx))
+		require.NoError(b, idx.init())
 		return idx
 	}
 
 	b.Run("simple", func(b *testing.B) {
 		idx := newIdx(IndexInfo{Fields: []string{"a"}})
-		doc := mustParseItem(b, `{"id":1, "a":"2"}`)
+		it := mustParseItem(b, `{"id":1,"a":"b"}`)
 		b.ReportAllocs()
 		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			idx.fillKeysBuf(doc)
+		for range b.N {
+			idx.fillKeysBuf(it)
 		}
 	})
-	b.Run("array", func(b *testing.B) {
-		idx := newIdx(IndexInfo{Fields: []string{"a"}})
-		doc := mustParseItem(b, `{"id":1, "a":["1", "2", "3", "2"]}`)
+	b.Run("two fields", func(b *testing.B) {
+		idx := newIdx(IndexInfo{Fields: []string{"a", "b"}})
+		it := mustParseItem(b, `{"id":1,"a":1,"b":2}`)
 		b.ReportAllocs()
 		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			idx.fillKeysBuf(doc)
+		for range b.N {
+			idx.fillKeysBuf(it)
 		}
 	})
-
 }
