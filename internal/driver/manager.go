@@ -283,11 +283,14 @@ func (c *ConnManager) setupConn(conn *sqlite.Conn) (err error) {
 func (c *ConnManager) Close() (err error) {
 	close(c.closed)
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	for _, conn := range c.readConn {
 		err = errors.Join(err, conn.Close())
 	}
-	err = errors.Join(err, c.writeConn.Close())
-	c.mu.Unlock()
+	// Wait for the write connection to be returned to the channel.
+	// This ensures no active writer is using it before we close.
+	writeConn := <-c.writeCh
+	err = errors.Join(err, writeConn.Close())
 	return err
 }
 
