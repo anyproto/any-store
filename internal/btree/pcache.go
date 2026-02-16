@@ -6,7 +6,7 @@ package btree
 
 import "sync"
 
-const defaultCacheSize = 2000
+const defaultCacheSize = 5000
 
 // pcache is the page cache.
 type pcache struct {

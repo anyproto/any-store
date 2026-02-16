@@ -287,6 +287,15 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 
 	// Fast path: check write-transaction page map (no lock needed)
 	if pg := p.writePages[pgno]; pg != nil {
+		// Save copy for savepoint rollback if needed (lazy copy-on-write)
+		if len(p.savepoints) > 0 {
+			sp := &p.savepoints[len(p.savepoints)-1]
+			if _, exists := sp.pages[pgno]; !exists {
+				dataCopy := make([]byte, len(pg.data))
+				copy(dataCopy, pg.data)
+				sp.pages[pgno] = dataCopy
+			}
+		}
 		pg.pinCount++
 		return pg, nil
 	}
@@ -408,25 +417,17 @@ func (p *pager) rollback() error {
 }
 
 // savepoint creates a new savepoint and returns its ID.
+// Page copies are saved lazily in getWritablePage when pages are actually modified.
 func (p *pager) savepoint() (int, error) {
 	if p.state != pagerWriter {
 		return 0, ErrReadOnly
 	}
 
 	id := len(p.savepoints)
-	pages := make(map[uint32][]byte)
-
-	// Save copies of all currently dirty pages so we can restore them on rollback
-	for pgno, pg := range p.writePages {
-		dataCopy := make([]byte, len(pg.data))
-		copy(dataCopy, pg.data)
-		pages[pgno] = dataCopy
-	}
-
 	p.savepoints = append(p.savepoints, savepointState{
 		id:       id,
 		dbSize:   p.dbSize,
-		pages:    pages,
+		pages:    make(map[uint32][]byte),
 		walFrame: p.wal.nFrame,
 	})
 	return id, nil

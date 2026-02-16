@@ -308,6 +308,12 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 }
 
 func (q *collQuery) Count(ctx context.Context) (count int, err error) {
+	// Fast path: no filter, no offset, no limit — use lightweight page-header count
+	_, isAll := q.cond.(query.All)
+	if (q.cond == nil || isAll) && q.offset == 0 && q.limit == 0 && q.sort == nil {
+		return q.c.Count(ctx)
+	}
+
 	qb, err := q.makeQuery()
 	if err != nil {
 		return

@@ -402,17 +402,9 @@ func (c *collection) deleteItem(tx *btree.WriteTx, id []byte) (err error) {
 
 func (c *collection) Count(ctx context.Context) (count int, err error) {
 	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		cursor := tx.NewCursor(c.ns)
-		if err := cursor.First(); err != nil {
-			return nil
-		}
-		for cursor.Valid() {
-			count++
-			if err := cursor.Next(); err != nil {
-				return err
-			}
-		}
-		return nil
+		var txErr error
+		count, txErr = tx.Count(c.ns)
+		return txErr
 	})
 	return
 }
