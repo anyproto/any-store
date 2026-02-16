@@ -118,8 +118,8 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 
 	opts := btree.Options{
 		PageSize:  4096,
-		CacheSize: 2000,
-		InProcess: true,
+		CacheSize: 5000,
+		InProcess: false,
 	}
 
 	var err error

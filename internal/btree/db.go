@@ -40,6 +40,9 @@ type DB struct {
 	// Namespace root pages are stored in a master table on page 1.
 	// Format: each cell in the master B-tree maps namespace name -> root page number (4 bytes).
 	masterBT *btree
+
+	readTxPool  sync.Pool
+	writeTxPool sync.Pool
 }
 
 // Open opens or creates a database at the given path.
@@ -116,10 +119,11 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 		return nil, err
 	}
 
-	return &ReadTx{
-		db:    db,
-		pager: db.pager,
-	}, nil
+	tx := db.getReadTx()
+	tx.db = db
+	tx.pager = db.pager
+	tx.closed = false
+	return tx, nil
 }
 
 // BeginWrite starts a read-write transaction. Only one write transaction
@@ -154,12 +158,33 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 		return nil, err
 	}
 
-	return &WriteTx{
-		ReadTx: ReadTx{
-			db:    db,
-			pager: db.pager,
-		},
-	}, nil
+	tx := db.getWriteTx()
+	tx.ReadTx.db = db
+	tx.ReadTx.pager = db.pager
+	tx.ReadTx.closed = false
+	return tx, nil
+}
+
+func (db *DB) getReadTx() *ReadTx {
+	if tx, ok := db.readTxPool.Get().(*ReadTx); ok {
+		return tx
+	}
+	return &ReadTx{}
+}
+
+func (db *DB) putReadTx(tx *ReadTx) {
+	db.readTxPool.Put(tx)
+}
+
+func (db *DB) getWriteTx() *WriteTx {
+	if tx, ok := db.writeTxPool.Get().(*WriteTx); ok {
+		return tx
+	}
+	return &WriteTx{}
+}
+
+func (db *DB) putWriteTx(tx *WriteTx) {
+	db.writeTxPool.Put(tx)
 }
 
 // Checkpoint triggers a WAL checkpoint, writing committed WAL frames
@@ -386,6 +411,16 @@ func (tx *ReadTx) NewCursor(ns *Namespace) *Cursor {
 	return bt.NewCursor()
 }
 
+// Count returns the total number of key-value pairs in the namespace.
+// This is a lightweight operation that only reads page headers without parsing cell data.
+func (tx *ReadTx) Count(ns *Namespace) (int, error) {
+	if tx.closed {
+		return 0, ErrTxClosed
+	}
+	bt := &btree{pager: tx.pager, rootPage: ns.rootPage}
+	return bt.Count()
+}
+
 // Rollback ends the read transaction (for ReadTx, this is the same as commit).
 func (tx *ReadTx) Rollback() error {
 	if tx.closed {
@@ -393,7 +428,9 @@ func (tx *ReadTx) Rollback() error {
 	}
 	tx.closed = true
 	tx.pager.endRead()
-	tx.db.mu.RUnlock()
+	db := tx.db
+	db.mu.RUnlock()
+	db.putReadTx(tx)
 	return nil
 }
 
@@ -441,8 +478,10 @@ func (tx *WriteTx) Commit() error {
 	if err == nil && needCheckpoint {
 		_ = tx.pager.tryCheckpoint()
 	}
-	tx.db.mu.RUnlock()
-	tx.db.writeMu.Unlock()
+	db := tx.db
+	db.mu.RUnlock()
+	db.writeMu.Unlock()
+	db.putWriteTx(tx)
 	return err
 }
 
@@ -454,8 +493,10 @@ func (tx *WriteTx) Rollback() error {
 	tx.closed = true
 	err := tx.pager.rollback()
 	tx.pager.endRead()
-	tx.db.mu.RUnlock()
-	tx.db.writeMu.Unlock()
+	db := tx.db
+	db.mu.RUnlock()
+	db.writeMu.Unlock()
+	db.putWriteTx(tx)
 	return err
 }
 

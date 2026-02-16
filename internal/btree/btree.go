@@ -234,8 +234,10 @@ func (bt *btree) Put(key, value []byte) error {
 		return err
 	}
 
-	// Build path from root to leaf for potential split propagation
-	var path []uint32
+	// Build path from root to leaf for potential split propagation.
+	// Use stack-allocated array for common case (tree depth ≤ 8).
+	var pathBuf [8]uint32
+	path := pathBuf[:0]
 	for pg.header.isInterior() {
 		path = append(path, pg.pgno)
 		childPgno, _ := searchInteriorPage(pg, key)
@@ -367,27 +369,47 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte) error {
 }
 
 // collectLeafCells reads all cells from a leaf page.
+// Cell data is copied into a single contiguous buffer to avoid per-cell allocations.
 func (bt *btree) collectLeafCells(pg *page) []cellData {
 	n := int(pg.header.cellCount)
 	cells := make([]cellData, n)
+	// Estimate actual content size from page header to avoid over-allocation.
+	contentOff := int(pg.header.cellContentOff)
+	if contentOff == 0 {
+		contentOff = int(bt.pager.pageSize)
+	}
+	contentSize := int(bt.pager.pageSize) - contentOff
+	buf := make([]byte, 0, contentSize)
 	for i := range n {
 		off := pg.getCellOffset(i)
 		cells[i], _ = parseLeafCell(pg.data, int(off))
-		// Make copies of key and value
-		cells[i].key = bytes.Clone(cells[i].key)
-		cells[i].value = bytes.Clone(cells[i].value)
+		kStart := len(buf)
+		buf = append(buf, cells[i].key...)
+		vStart := len(buf)
+		buf = append(buf, cells[i].value...)
+		cells[i].key = buf[kStart:vStart]
+		cells[i].value = buf[vStart:len(buf)]
 	}
 	return cells
 }
 
 // collectInteriorCells reads all cells from an interior page.
+// Cell keys are copied into a single contiguous buffer to avoid per-cell allocations.
 func (bt *btree) collectInteriorCells(pg *page) []cellData {
 	n := int(pg.header.cellCount)
 	cells := make([]cellData, n)
+	contentOff := int(pg.header.cellContentOff)
+	if contentOff == 0 {
+		contentOff = int(bt.pager.pageSize)
+	}
+	contentSize := int(bt.pager.pageSize) - contentOff
+	buf := make([]byte, 0, contentSize)
 	for i := range n {
 		off := pg.getCellOffset(i)
 		cells[i], _ = parseInteriorCell(pg.data, int(off))
-		cells[i].key = bytes.Clone(cells[i].key)
+		kStart := len(buf)
+		buf = append(buf, cells[i].key...)
+		cells[i].key = buf[kStart:len(buf)]
 	}
 	return cells
 }
@@ -750,6 +772,48 @@ func (bt *btree) deleteFromLeaf(pg *page, key []byte) error {
 	cells = append(cells[:idx], cells[idx+1:]...)
 	bt.rebuildLeafPage(pg, cells)
 	return nil
+}
+
+// Count returns the total number of key-value pairs in the B-tree.
+// It traverses all pages but only reads page headers (cellCount),
+// avoiding any key/value parsing — similar to SQLite's COUNT(*) optimization.
+func (bt *btree) Count() (int, error) {
+	return bt.countPage(bt.rootPage)
+}
+
+func (bt *btree) countPage(pgno uint32) (int, error) {
+	pg, err := bt.pager.getPage(pgno)
+	if err != nil {
+		return 0, err
+	}
+
+	if pg.header.isLeaf() {
+		count := int(pg.header.cellCount)
+		bt.pager.releasePage(pg)
+		return count, nil
+	}
+
+	// Interior page: count all children
+	n := int(pg.header.cellCount)
+	children := make([]uint32, 0, n+1)
+	cpOff := pg.cellPointerOffset()
+	for i := range n {
+		off := int(binary.BigEndian.Uint16(pg.data[cpOff+i*2:]))
+		childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
+		children = append(children, childPgno)
+	}
+	children = append(children, pg.header.rightChild)
+	bt.pager.releasePage(pg)
+
+	total := 0
+	for _, child := range children {
+		c, err := bt.countPage(child)
+		if err != nil {
+			return 0, err
+		}
+		total += c
+	}
+	return total, nil
 }
 
 // Cursor provides ordered iteration over a B-tree.
