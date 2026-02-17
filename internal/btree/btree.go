@@ -109,6 +109,98 @@ func leafCellSize(key, value []byte) int {
 	return varintSize(uint64(len(key))) + len(key) + varintSize(uint64(len(value))) + len(value)
 }
 
+// leafSplitPoint finds the optimal split index for leaf cells, targeting ~2/3 fill
+// on the left page (SQLite-style). Returns the index of the first cell that should
+// go to the right page. The returned value is always in [1, len(cells)-1], so
+// both left and right sides have at least one cell.
+//
+// SQLite's balance_nonroot (btree.c ~line 8600) redistributes cells among siblings
+// so that each page is approximately equally full. For a simple 2-way split, this
+// translates to keeping the left page as full as possible (up to ~2/3 of usable
+// space) so that future insertions into either side are less likely to trigger
+// another split.
+func leafSplitPoint(cells []cellData, usableSize int) int {
+	if len(cells) <= 2 {
+		return 1
+	}
+
+	// Target: fill the left page to ~2/3 of usable space.
+	// Available space = usableSize - leafHeaderSize (8 bytes).
+	// Each cell also needs a 2-byte cell pointer.
+	target := (usableSize - 8) * 2 / 3
+	cumSize := 0
+	bestIdx := len(cells) / 2 // fallback to 50/50
+
+	for i, c := range cells {
+		if i == 0 {
+			// always put at least 1 cell on left
+			cumSize += leafCellSizeWithOverflow(c.key, c.value, usableSize) + 2
+			continue
+		}
+		cellSz := leafCellSizeWithOverflow(c.key, c.value, usableSize) + 2
+		if cumSize+cellSz > target {
+			bestIdx = i
+			break
+		}
+		cumSize += cellSz
+		if i == len(cells)-1 {
+			// Don't put all cells on the left; right needs at least 1
+			bestIdx = i
+		}
+	}
+
+	// Ensure at least 1 cell on each side
+	if bestIdx < 1 {
+		bestIdx = 1
+	}
+	if bestIdx >= len(cells) {
+		bestIdx = len(cells) - 1
+	}
+	return bestIdx
+}
+
+// interiorSplitPoint finds the optimal split index for interior cells, targeting
+// ~2/3 fill on the left page. Returns the index of the middle cell that will be
+// promoted as the separator. The left page gets cells[:mid], the right page
+// gets cells[mid+1:], and cells[mid] is promoted to the parent.
+// The returned value is always in [1, len(cells)-2] when len(cells) >= 3,
+// or len(cells)/2 for smaller arrays.
+func interiorSplitPoint(cells []cellData, usableSize int) int {
+	if len(cells) <= 2 {
+		return len(cells) / 2
+	}
+
+	// Target: fill the left page to ~2/3 of usable space.
+	// Available space = usableSize - interiorHeaderSize (12 bytes).
+	// Each cell also needs a 2-byte cell pointer.
+	target := (usableSize - 12) * 2 / 3
+	cumSize := 0
+	bestIdx := len(cells) / 2 // fallback to 50/50
+
+	for i, c := range cells {
+		cellSz := interiorCellSize(c.key) + 2
+		if i > 0 && cumSize+cellSz > target {
+			bestIdx = i
+			break
+		}
+		cumSize += cellSz
+		if i == len(cells)-1 {
+			bestIdx = i
+		}
+	}
+
+	// For interior splits, the cell at bestIdx is promoted.
+	// Ensure at least 1 cell on left (bestIdx >= 1) and
+	// at least 1 cell on right (bestIdx <= len(cells)-2).
+	if bestIdx < 1 {
+		bestIdx = 1
+	}
+	if bestIdx > len(cells)-2 {
+		bestIdx = len(cells) - 2
+	}
+	return bestIdx
+}
+
 // leafCellSizeWithOverflow returns the in-page size of a leaf cell, accounting for overflow.
 func leafCellSizeWithOverflow(key, value []byte, usableSize int) int {
 	totalPayload := len(key) + len(value)
@@ -390,9 +482,22 @@ func (bt *btree) insertIntoLeafWithPath(pg *page, key, value []byte, path []uint
 	if contentStart == 0 {
 		contentStart = pageUsable
 	}
-	freeSpace := contentStart - hdrSize
+	gapSpace := contentStart - hdrSize
 
-	if cellSize+2 <= freeSpace {
+	if cellSize+2 <= gapSpace {
+		return bt.insertLeafCellAt(pg, idx, key, value)
+	}
+
+	// Check if defragmentation would free enough space.
+	// Total free space = contiguous gap + fragmented bytes.
+	// SQLite's allocateSpace() (btree.c ~line 1882) calls defragmentPage()
+	// when the gap is insufficient but total free space is enough.
+	totalFree := gapSpace + int(pg.header.fragBytes)
+	if cellSize+2 <= totalFree {
+		cells := bt.collectLeafCells(pg)
+		if err := bt.rebuildLeafPage(pg, cells); err != nil {
+			return err
+		}
 		return bt.insertLeafCellAt(pg, idx, key, value)
 	}
 
@@ -412,15 +517,25 @@ func (bt *btree) insertIntoLeaf(pg *page, key, value []byte) error {
 		return bt.updateLeafCell(pg, idx, key, value)
 	}
 
-	// Check if there's enough space
+	// Check if there's enough contiguous space
 	hdrSize := pg.cellPointerOffset() + int(pg.header.cellCount+1)*2
 	contentStart := int(pg.header.cellContentOff)
 	if contentStart == 0 {
 		contentStart = pageUsable
 	}
-	freeSpace := contentStart - hdrSize
+	gapSpace := contentStart - hdrSize
 
-	if cellSize+2 <= freeSpace { // +2 for cell pointer
+	if cellSize+2 <= gapSpace { // +2 for cell pointer
+		return bt.insertLeafCellAt(pg, idx, key, value)
+	}
+
+	// Check if defragmentation would free enough space
+	totalFree := gapSpace + int(pg.header.fragBytes)
+	if cellSize+2 <= totalFree {
+		cells := bt.collectLeafCells(pg)
+		if err := bt.rebuildLeafPage(pg, cells); err != nil {
+			return err
+		}
 		return bt.insertLeafCellAt(pg, idx, key, value)
 	}
 
@@ -495,20 +610,76 @@ func (bt *btree) insertLeafCellAt(pg *page, idx int, key, value []byte) error {
 	return nil
 }
 
-// updateLeafCell updates an existing leaf cell in place or by delete+insert.
+// updateLeafCell updates an existing leaf cell. When the new cell fits in the
+// same space as the old cell, the update is done in-place without rebuilding
+// the entire page. This avoids the O(n) cost of collectLeafCells + rebuildLeafPage
+// for the common case where the value size doesn't change significantly.
+//
+// SQLite's approach is similar: btree.c's sqlite3BtreeInsert checks if the new
+// payload fits in the existing cell space before falling back to dropCell+insertCell.
 func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte) error {
 	usableSize := bt.usablePageSize()
 
+	// Parse old cell to get its size and overflow info
+	cellOff := int(pg.getCellOffset(idx))
+	oldCell, oldCellSize := parseLeafCellWithSize(pg.data, cellOff, usableSize)
+
 	// Free old overflow pages if the existing cell has them
-	off := pg.getCellOffset(idx)
-	oldCell, _ := parseLeafCellWithSize(pg.data, int(off), usableSize)
 	if oldCell.overflowPg != 0 {
 		if err := bt.pager.freeOverflowChain(oldCell.overflowPg); err != nil {
 			return err
 		}
 	}
 
-	// Collect all cells, replace the target, rebuild
+	// Compute new cell size
+	newCellSize := leafCellSizeWithOverflow(key, value, usableSize)
+
+	// Fast path: if the new cell fits exactly in the old cell's space,
+	// overwrite in place. This avoids the full page rebuild.
+	if newCellSize <= oldCellSize {
+		totalPayload := len(key) + len(value)
+		maxLocal := maxLocalPayload(usableSize)
+
+		if totalPayload > maxLocal {
+			// New cell needs overflow
+			localSize := localPayloadSize(totalPayload, usableSize)
+			localValSize := localSize - len(key)
+			if localValSize < 0 {
+				localValSize = 0
+			}
+			overflowData := value[localValSize:]
+			overflowPgno, err := bt.pager.writeOverflowChain(overflowData)
+			if err != nil {
+				return err
+			}
+			writeLeafCellOverflow(pg.data[cellOff:], key, len(value), value[:localValSize], overflowPgno)
+		} else {
+			writeLeafCell(pg.data[cellOff:], key, value)
+		}
+
+		// Account for wasted space as fragmentation.
+		// SQLite tracks fragmentation in the page header's fragBytes field.
+		waste := oldCellSize - newCellSize
+		if waste > 0 {
+			newFrag := int(pg.header.fragBytes) + waste
+			if newFrag <= 255 {
+				pg.header.fragBytes = uint8(newFrag)
+				hdrOff := 0
+				if pg.pgno == 1 {
+					hdrOff = dbHeaderSize
+				}
+				pg.header.serialize(pg.data[hdrOff:])
+				return nil
+			}
+			// Too much fragmentation — fall through to full rebuild
+		} else {
+			// Exact fit, no wasted space
+			return nil
+		}
+	}
+
+	// Slow path: new cell doesn't fit or too much fragmentation.
+	// Collect all cells, replace the target, and rebuild the page.
 	cells := bt.collectLeafCells(pg)
 	cells[idx] = cellData{key: key, value: value}
 	return bt.rebuildLeafPage(pg, cells)
@@ -689,7 +860,8 @@ func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte
 	newCell := cellData{key: bytes.Clone(key), value: bytes.Clone(value)}
 	cells = append(cells[:idx], append([]cellData{newCell}, cells[idx:]...)...)
 
-	mid := len(cells) / 2
+	// Find split point targeting ~2/3 fill on the left page (SQLite-style).
+	mid := leafSplitPoint(cells, bt.usablePageSize())
 	leftCells := cells[:mid]
 	rightCells := cells[mid:]
 
@@ -832,7 +1004,8 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 		cells[insertIdx+1].leftChild = rightPgno
 	}
 
-	midIdx := len(cells) / 2
+	// Find split point targeting ~2/3 fill on the left page (SQLite-style).
+	midIdx := interiorSplitPoint(cells, bt.usablePageSize())
 	leftCells := cells[:midIdx]
 	sepCellKey := bytes.Clone(cells[midIdx].key)
 	rightCells := cells[midIdx+1:]
@@ -870,8 +1043,8 @@ func (bt *btree) splitLeafAndInsert(pg *page, idx int, key, value []byte) error 
 	newCell := cellData{key: bytes.Clone(key), value: bytes.Clone(value)}
 	cells = append(cells[:idx], append([]cellData{newCell}, cells[idx:]...)...)
 
-	// Split roughly in half
-	mid := len(cells) / 2
+	// Find split point targeting ~2/3 fill on the left page (SQLite-style).
+	mid := leafSplitPoint(cells, bt.usablePageSize())
 	leftCells := cells[:mid]
 	rightCells := cells[mid:]
 
@@ -1011,6 +1184,16 @@ func (bt *btree) insertIntoInterior(pg *page, key, value []byte) error {
 
 // Delete removes a key from the B-tree.
 // Uses path tracking so empty leaf pages can be freed and removed from parents.
+//
+// Optimized to avoid full page rebuilds: instead of collectLeafCells + rebuildLeafPage,
+// the cell is dropped in-place by removing the cell pointer and tracking the freed
+// space as fragmentation. This is modeled after SQLite's dropCell() (btree.c line 7252)
+// which calls freeSpace() to add the cell's space to the freeblock chain. Our
+// simplified approach tracks freed space as fragBytes, which is reset to 0 on the
+// next full rebuild (split, compaction, etc.).
+//
+// When fragmentation exceeds the threshold (60 bytes, matching SQLite's limit),
+// a full rebuild is triggered to defragment the page.
 func (bt *btree) Delete(key []byte) error {
 	// Phase 1: Read-only descent to find the leaf
 	pg, err := bt.getPage(bt.rootPage)
@@ -1045,16 +1228,11 @@ func (bt *btree) Delete(key []byte) error {
 		return ErrKeyNotFound
 	}
 
-	// Collect ALL cells first (reading overflow data) BEFORE freeing anything.
-	// This avoids reading from already-freed overflow pages.
 	usableSize := bt.usablePageSize()
-	off := wpg.getCellOffset(idx)
-	oldCell, _ := parseLeafCellWithSize(wpg.data, int(off), usableSize)
+	cellOff := int(wpg.getCellOffset(idx))
+	oldCell, oldCellSize := parseLeafCellWithSize(wpg.data, cellOff, usableSize)
 
-	cells := bt.collectLeafCells(wpg)
-
-	// Now free overflow pages for the deleted cell (after collectLeafCells has
-	// already read the full value from overflow).
+	// Free overflow pages first (cell data is still in page buffer)
 	if oldCell.overflowPg != 0 {
 		if err := bt.pager.freeOverflowChain(oldCell.overflowPg); err != nil {
 			bt.pager.releasePage(wpg)
@@ -1062,10 +1240,51 @@ func (bt *btree) Delete(key []byte) error {
 		}
 	}
 
-	cells = append(cells[:idx], cells[idx+1:]...)
-	if err := bt.rebuildLeafPage(wpg, cells); err != nil {
-		bt.pager.releasePage(wpg)
-		return err
+	n := int(wpg.header.cellCount)
+
+	// Check if we can do a fast in-place delete
+	newFrag := int(wpg.header.fragBytes) + oldCellSize
+	needsRebuild := false
+
+	// If the cell is at the content area boundary, reclaim space directly
+	contentStart := int(wpg.header.cellContentOff)
+	if contentStart == 0 {
+		contentStart = usableSize
+	}
+	if cellOff == contentStart {
+		// Cell is at the start of content area — reclaim by advancing contentStart
+		newFrag -= oldCellSize
+		wpg.header.cellContentOff = uint16(contentStart + oldCellSize)
+	} else if newFrag > 60 {
+		// SQLite's fragmentation limit is 60 bytes (btree.c pageFindSlot).
+		// Too much fragmentation — need a full rebuild to defragment.
+		needsRebuild = true
+	}
+
+	if needsRebuild {
+		// Fall back to full rebuild (reads all cells, rewrites compacted)
+		cells := bt.collectLeafCells(wpg)
+		cells = append(cells[:idx], cells[idx+1:]...)
+		if err := bt.rebuildLeafPage(wpg, cells); err != nil {
+			bt.pager.releasePage(wpg)
+			return err
+		}
+	} else {
+		// Fast path: remove cell pointer and track freed space as fragmentation
+		wpg.header.fragBytes = uint8(newFrag)
+		wpg.header.cellCount = uint16(n - 1)
+
+		// Shift cell pointers to remove the deleted entry
+		for i := idx; i < n-1; i++ {
+			wpg.setCellOffset(i, wpg.getCellOffset(i+1))
+		}
+
+		// Serialize updated header
+		hdrOff := 0
+		if wpg.pgno == 1 {
+			hdrOff = dbHeaderSize
+		}
+		wpg.header.serialize(wpg.data[hdrOff:])
 	}
 
 	// If page is empty and not the root, free it and remove from parent

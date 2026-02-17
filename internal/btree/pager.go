@@ -57,6 +57,12 @@ type pager struct {
 	// Reusable slice for collecting dirty pages during commit
 	dirtyBuf []*page
 
+	// dontWritePages tracks pages that were dirtied but whose content doesn't
+	// need to be persisted (e.g., freed leaf pages added to a freelist trunk).
+	// Matches SQLite's PGHDR_DONT_WRITE flag (pager.c:6283). We use a map
+	// because we cannot modify the page struct in page.go.
+	dontWritePages map[uint32]bool
+
 	// inProcess uses heap-backed shm (faster, single-process only)
 	inProcess bool
 
@@ -160,9 +166,12 @@ func (p *pager) initNewDB() error {
 	buf := make([]byte, p.pageSize)
 	p.header.serialize(buf[:dbHeaderSize])
 
-	// Initialize page 1 as a leaf table b-tree page (for the master namespace table)
+	// Initialize page 1 as a leaf index b-tree page (fix 3.5/4.6).
+	// Our B-tree is an index B-tree (key-value pairs), not a table B-tree
+	// (integer-keyed rows). The correct type is pageTypeLeafIdx (10) =
+	// PTF_ZERODATA | PTF_LEAF, not pageTypeLeafTbl (13).
 	hdrOff := dbHeaderSize
-	buf[hdrOff] = pageTypeLeafTbl // page type
+	buf[hdrOff] = pageTypeLeafIdx // page type
 	buf[hdrOff+1] = 0             // first free block (high byte)
 	buf[hdrOff+2] = 0             // first free block (low byte)
 	buf[hdrOff+3] = 0             // cell count (high byte)
@@ -296,6 +305,27 @@ func (p *pager) getPageAt(pgno, walMaxFrame uint32) (*page, error) {
 	return pg, nil
 }
 
+// getPageNoContent returns a page without reading from disk/WAL (fix 5.4).
+// If the page is already in cache, it's returned as-is (matching SQLite's
+// behavior where PAGER_GET_NOCONTENT still returns cached pages). If not in
+// cache, a new blank page is created. This is used when allocating pages from
+// the freelist or growing the database, where the old content is irrelevant.
+// Modeled after SQLite's PAGER_GET_NOCONTENT flag in pager.c:5507.
+func (p *pager) getPageNoContent(pgno uint32) (*page, error) {
+	if pgno == 0 {
+		return nil, ErrInvalidPage
+	}
+	// Cache hit: return as-is (the content may be stale but the caller will overwrite it)
+	if pg := p.cache.fetch(pgno); pg != nil {
+		return pg, nil
+	}
+	// Cache miss: create a blank page without any disk/WAL read
+	pg := p.cache.create(pgno)
+	clear(pg.data)
+	pg.header = pageHeader{}
+	return pg, nil
+}
+
 // getWritablePage returns a page ready for writing. It marks the page as dirty
 // and saves a copy for savepoint rollback if needed.
 func (p *pager) getWritablePage(pgno uint32) (*page, error) {
@@ -305,6 +335,10 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 
 	// Fast path: check write-transaction page map (no lock needed)
 	if pg := p.writePages[pgno]; pg != nil {
+		// Clear dontWrite flag: the page is being re-acquired for writing,
+		// so its content is meaningful again (fix 5.4). Matches SQLite's
+		// pcache.c:596-597 where PGHDR_DONT_WRITE is cleared by makeDirty.
+		delete(p.dontWritePages, pgno)
 		// Save copy for savepoint rollback if needed (lazy copy-on-write)
 		if len(p.savepoints) > 0 {
 			sp := &p.savepoints[len(p.savepoints)-1]
@@ -357,7 +391,12 @@ func (p *pager) allocatePage() (*page, error) {
 	p.dbSize++
 	pgno := p.dbSize
 
-	pg := p.cache.create(pgno)
+	// Use getPageNoContent: new pages have no existing content to read (fix 5.4).
+	pg, err := p.getPageNoContent(pgno)
+	if err != nil {
+		p.dbSize--
+		return nil, err
+	}
 	clear(pg.data)
 	p.cache.makeDirty(pg)
 	p.writePages[pgno] = pg
@@ -425,6 +464,14 @@ func (p *pager) freePage(pgno uint32) error {
 			binary.BigEndian.PutUint32(trunkPg.data[4:8], uint32(leafCount+1))
 			p.releasePage(trunkPg)
 			p.header.TotalFreelistPgs++
+			// Mark the freed page as dontWrite if it's dirty (fix 5.4).
+			// The page content is now irrelevant since it's a freelist leaf.
+			// Only done when adding as leaf to trunk, NOT when becoming a trunk
+			// (trunk page content is meaningful -- it holds freelist structure).
+			// Matches SQLite's freePage2() (btree.c:6920).
+			if p.writePages[pgno] != nil {
+				p.dontWrite(pgno)
+			}
 			return nil
 		}
 		p.releasePage(trunkPg)
@@ -489,8 +536,11 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 
 		p.header.TotalFreelistPgs--
 
-		// Create the page in cache
-		pg := p.cache.create(leafPgno)
+		// Use getPageNoContent: old freelist leaf content is irrelevant (fix 5.4).
+		pg, err := p.getPageNoContent(leafPgno)
+		if err != nil {
+			return nil, err
+		}
 		clear(pg.data)
 		p.cache.makeDirty(pg)
 		p.writePages[leafPgno] = pg
@@ -523,6 +573,23 @@ func (p *pager) releasePage(pg *page) {
 	p.cache.release(pg)
 }
 
+// dontWrite marks a page so that it will be skipped during WAL writes on commit
+// (fix 5.4). This is used for freed pages added as leaves to a freelist trunk:
+// their content is irrelevant and need not be persisted.
+//
+// Matches SQLite's sqlite3PagerDontWrite() (pager.c:6283). The flag is only set
+// when no savepoints are active, matching SQLite's condition (pPager->nSavepoint==0).
+// With savepoints, the page data may need to be preserved for rollback.
+func (p *pager) dontWrite(pgno uint32) {
+	if len(p.savepoints) > 0 {
+		return
+	}
+	if p.dontWritePages == nil {
+		p.dontWritePages = make(map[uint32]bool)
+	}
+	p.dontWritePages[pgno] = true
+}
+
 // commit writes all dirty pages to WAL and commits the transaction.
 // Returns the WAL frame count at commit time (for auto-checkpoint decisions).
 func (p *pager) commit() (nFrame uint32, err error) {
@@ -547,6 +614,23 @@ func (p *pager) commit() (nFrame uint32, err error) {
 	}
 
 	p.dirtyBuf = p.cache.appendDirtyPages(p.dirtyBuf[:0])
+
+	// Filter out dontWrite pages before WAL write (fix 5.4).
+	// These are freed leaf pages whose content is irrelevant.
+	if len(p.dontWritePages) > 0 {
+		n := 0
+		for _, pg := range p.dirtyBuf {
+			if p.dontWritePages[pg.pgno] {
+				p.cache.makeClean(pg)
+			} else {
+				p.dirtyBuf[n] = pg
+				n++
+			}
+		}
+		p.dirtyBuf = p.dirtyBuf[:n]
+		clear(p.dontWritePages)
+	}
+
 	if len(p.dirtyBuf) == 0 {
 		p.state.Store(int32(pagerOpen))
 		p.savepoints = p.savepoints[:0]
@@ -573,6 +657,7 @@ func (p *pager) commit() (nFrame uint32, err error) {
 
 	p.savepoints = p.savepoints[:0]
 	clear(p.writePages)
+	clear(p.dontWritePages)
 	p.state.Store(int32(pagerOpen))
 	p.wal.endWrite()
 
@@ -600,6 +685,7 @@ func (p *pager) rollback() error {
 
 	p.savepoints = p.savepoints[:0]
 	clear(p.writePages)
+	clear(p.dontWritePages)
 	p.state.Store(int32(pagerOpen))
 	p.wal.endWrite()
 	return nil
@@ -629,6 +715,7 @@ func (p *pager) pagerError() {
 
 	p.savepoints = p.savepoints[:0]
 	clear(p.writePages)
+	clear(p.dontWritePages)
 
 	// Release the WAL write lock so other writers are not blocked (fix 2.2).
 	p.wal.endWrite()
@@ -742,17 +829,42 @@ func (p *pager) releaseSavepoint(id int) error {
 	return nil
 }
 
+// syncWalForCheckpoint syncs the WAL file before checkpoint when noSync=true
+// (fix 2.7). SQLite's synchronous=NORMAL skips per-commit WAL syncs but still
+// syncs the WAL before checkpoint (wal.c:2260, CKPT_SYNC_FLAGS). Our wal.go
+// guards the pre-checkpoint WAL sync with !w.noSync, making noSync=true
+// equivalent to SQLite's synchronous=OFF rather than NORMAL.
+//
+// This pager-level sync bridges the gap: when noSync=true, the pager syncs
+// the WAL file before delegating to wal.checkpoint(). When noSync=false, the
+// WAL checkpoint already handles this sync internally, so no extra sync is needed.
+//
+// The sync is best-effort: errors are silently ignored because the checkpoint
+// itself will encounter and report any persistent I/O errors.
+func (p *pager) syncWalForCheckpoint() {
+	if p.wal == nil || p.wal.file == nil || p.wal.memFrames != nil {
+		return
+	}
+	_ = fdatasync(p.wal.file)
+}
+
 // checkpoint runs a WAL checkpoint.
 // Does NOT take pager.mu.Lock — readers can continue during checkpoint.
 // The WAL checkpoint internally acquires lockWrite (blocks new writers)
 // and uses mxSafeFrame to avoid interfering with active readers.
 func (p *pager) checkpoint() error {
+	if p.noSync {
+		p.syncWalForCheckpoint()
+	}
 	return p.wal.checkpoint(p.file)
 }
 
 // tryCheckpoint attempts a checkpoint. Unlike the old version, this no longer
 // needs TryLock on pager.mu since checkpoint doesn't block readers.
 func (p *pager) tryCheckpoint() error {
+	if p.noSync {
+		p.syncWalForCheckpoint()
+	}
 	return p.wal.checkpoint(p.file)
 }
 

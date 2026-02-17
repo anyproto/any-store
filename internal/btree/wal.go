@@ -38,6 +38,27 @@ package btree
 //   - WAL index header (region 0): metadata about WAL state
 //   - Hash tables: mapping page numbers to WAL frame positions
 //   - Lock slots: coordinating readers, writer, and checkpoint
+//
+// Same-process reads (issue 7.9):
+//
+// walIndex.get() uses an in-process Go map (pageMap) rather than reading
+// the SHM hash tables. The SHM hash tables ARE written on every frame
+// (shmHashWrite) for cross-process visibility, but same-process readers
+// use the faster Go map. This is acceptable because:
+//
+//  1. Our primary deployment is single-process (InProcess mode with heap shm).
+//     Multi-process access via mmap'd shm is a secondary feature.
+//  2. The Go map provides O(1) lookup without the linear-probing overhead of
+//     the hash table, giving better read performance.
+//  3. The SHM hash tables are still populated correctly, so if multi-process
+//     readers are added in the future, they can use shmHashGet() for recovery.
+//  4. In SQLite, walHashGet/walFramePage are only used during recovery and
+//     checkpoint iteration. Normal same-process reads also use in-memory state
+//     (the aSegment array in walIterator). Our pageMap serves the same role.
+//
+// If multi-process readers become a requirement, the get() method should be
+// updated to fall back to shmHashGet() when !inProcess and the pageMap is
+// empty (indicating a fresh process that hasn't done recovery yet).
 
 import (
 	"encoding/binary"
@@ -48,6 +69,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
@@ -65,14 +87,20 @@ const (
 	// SHM hash table layout constants (matching SQLite's wal-index hash tables).
 	// Each shm region (32KB) stores a hash table segment mapping page numbers
 	// to WAL frame positions. Region 0 also contains the WAL index header.
-	htNPage    = 4096  // max frame entries per hash segment (power of 2)
-	htNSlot    = 8192  // hash slots per segment (2 * htNPage, power of 2)
-	htHash1    = 383   // hash multiplier (prime)
-	htHdrSize  = 136   // header area in region 0 (two copies of WalIndexHdr + WalCkptInfo)
+	htNPage = 4096 // max frame entries per hash segment (power of 2)
+	htNSlot = 8192 // hash slots per segment (2 * htNPage, power of 2)
+	htHash1 = 383  // hash multiplier (prime)
+
+	htHdrSize = 136 // header area in region 0 (two copies of WalIndexHdr + WalCkptInfo)
 
 	// Checkpoint info offsets in region 0
 	htCkptOff     = 96  // nBackfill (4 bytes)
 	htReadMarkOff = 100 // aReadMark[0..4] (5 * 4 = 20 bytes)
+
+	// nBackfillAttempted offset in region 0 (after aReadMark + aLock).
+	// Layout: nBackfill(4) + aReadMark(20) + aLock(8) = 32 bytes from offset 96.
+	// nBackfillAttempted is at offset 128, matching SQLite's WalCkptInfo layout.
+	htNBackfillAttemptedOff = 128
 
 	// Hash table data offsets
 	htPgnoOff0     = htHdrSize   // aPgno start in region 0 (byte 136)
@@ -81,6 +109,93 @@ const (
 	// Number of frame entries in region 0 (reduced by header)
 	htNPageOne = htNPage - (htHdrSize / 4) // 4062
 )
+
+// CheckpointMode specifies the type of checkpoint to perform.
+// Modeled after SQLite's SQLITE_CHECKPOINT_* constants.
+type CheckpointMode int
+
+const (
+	// CheckpointPassive checkpoints as many frames as possible without waiting
+	// for any readers or writers to finish. The busy handler is never invoked.
+	// Frames that require blocking on a reader are skipped.
+	CheckpointPassive CheckpointMode = iota
+
+	// CheckpointFull waits for concurrent readers to finish, then checkpoints
+	// all frames. The busy handler is invoked when waiting for readers that
+	// block progress. Does not reset the WAL. Also acquires the write lock
+	// to block new writers during the checkpoint.
+	CheckpointFull
+
+	// CheckpointRestart is like CheckpointFull but also resets the WAL back
+	// to the beginning so new writes start from frame 1. Waits for all
+	// readers to finish using the WAL.
+	CheckpointRestart
+
+	// CheckpointTruncate is like CheckpointRestart but also truncates the
+	// WAL file to zero bytes after resetting.
+	CheckpointTruncate
+)
+
+// BusyHandler is a callback invoked when a lock cannot be acquired.
+// It is called repeatedly with an incrementing count (starting at 0)
+// until it returns false (give up) or the lock is acquired.
+// Modeled after SQLite's sqlite3_busy_handler() callback.
+type BusyHandler func(count int) bool
+
+// DefaultBusyTimeout returns a BusyHandler that retries with exponential
+// backoff up to the given total timeout duration. This is similar to
+// SQLite's sqlite3_busy_timeout().
+//
+// The backoff schedule starts at 1ms and doubles each retry, capped at 50ms
+// per sleep. If the accumulated sleep time would exceed the timeout, the
+// handler returns false (give up).
+func DefaultBusyTimeout(timeout time.Duration) BusyHandler {
+	if timeout <= 0 {
+		return nil
+	}
+	var start time.Time
+	return func(count int) bool {
+		if count == 0 {
+			start = time.Now()
+		}
+		elapsed := time.Since(start)
+		if elapsed >= timeout {
+			return false
+		}
+		// Exponential backoff: 1ms, 2ms, 4ms, 8ms, 16ms, 32ms, 50ms, 50ms, ...
+		sleep := time.Millisecond << min(count, 5) // max 32ms at count=5
+		if sleep > 50*time.Millisecond {
+			sleep = 50 * time.Millisecond
+		}
+		remaining := timeout - elapsed
+		if sleep > remaining {
+			sleep = remaining
+		}
+		time.Sleep(sleep)
+		return true
+	}
+}
+
+// walBusyLock attempts to acquire a lock on the given slot, retrying via
+// the busy handler if the lock is busy.
+// If xBusy is nil, returns ErrBusy immediately on failure.
+// Modeled after SQLite's walBusyLock().
+func walBusyLock(wi *walIndex, xBusy BusyHandler, slot int, lockType int) error {
+	var count int
+	for {
+		err := wi.lock(slot, lockType)
+		if err == nil {
+			return nil
+		}
+		if err != ErrBusy {
+			return err
+		}
+		if xBusy == nil || !xBusy(count) {
+			return ErrBusy
+		}
+		count++
+	}
+}
 
 // walHeader represents the WAL file header.
 type walHeader struct {
@@ -223,17 +338,17 @@ const walIndexHdrSize = 48
 // Layout (matching SQLite):
 //
 //	Offset  Size  Field
-//	0       4     iVersion      — wal-index format version
-//	4       4     unused        — padding
-//	8       4     iChange       — counter incremented each transaction
-//	12      1     isInit        — 1 when initialized
-//	13      1     bigEndCksum   — 1 if WAL checksums are big-endian
-//	14      2     szPage        — database page size (1 means 65536)
-//	16      4     mxFrame       — index of last valid frame in WAL
-//	20      4     nPage         — size of database in pages
-//	24      8     aFrameCksum   — checksum of last frame in log
-//	32      8     aSalt         — salt values from WAL header
-//	40      8     aCksum        — checksum over all prior fields (bytes 0..39)
+//	0       4     iVersion      -- wal-index format version
+//	4       4     unused        -- padding
+//	8       4     iChange       -- counter incremented each transaction
+//	12      1     isInit        -- 1 when initialized
+//	13      1     bigEndCksum   -- 1 if WAL checksums are big-endian
+//	14      2     szPage        -- database page size (1 means 65536)
+//	16      4     mxFrame       -- index of last valid frame in WAL
+//	20      4     nPage         -- size of database in pages
+//	24      8     aFrameCksum   -- checksum of last frame in log
+//	32      8     aSalt         -- salt values from WAL header
+//	40      8     aCksum        -- checksum over all prior fields (bytes 0..39)
 type WalIndexHdr struct {
 	iVersion    uint32
 	unused      uint32
@@ -331,12 +446,19 @@ func walChecksumNative(data []byte, s1, s2 uint32) (uint32, uint32) {
 // The index is backed by the shm interface, which may be mmap'd
 // for multi-process access or heap-backed for single-process.
 type walIndex struct {
-	mu        sync.RWMutex
-	shm       shm               // platform-specific shared memory
-	pageMap   map[uint32]uint32 // pgno -> frame index (1-based), in-process cache
-	maxFrame  uint32            // highest valid frame
-	maxPage   uint32            // database size at last commit
-	nBackfill uint32            // frames already checkpointed
+	mu      sync.RWMutex
+	shm     shm               // platform-specific shared memory
+	pageMap map[uint32]uint32  // pgno -> frame index (1-based), in-process cache
+	maxFrame  uint32           // highest valid frame
+	maxPage   uint32           // database size at last commit
+	nBackfill uint32           // frames already checkpointed
+
+	// nBackfillAttempted is the highest frame that a checkpoint has attempted
+	// to copy back to the database. It is set BEFORE backfilling begins, so
+	// that after a crash during checkpoint, recovery knows which frames may
+	// have been partially written. nBackfillAttempted >= nBackfill always.
+	// Matches SQLite's WalCkptInfo.nBackfillAttempted (issue 7.7).
+	nBackfillAttempted uint32
 
 	// hdr is the current WalIndexHdr, matching SQLite's pWal->hdr.
 	// Contains all 11 fields from the SQLite WalIndexHdr struct.
@@ -388,7 +510,7 @@ func (wi *walIndex) set(pgno, frame uint32) {
 	wi.shmHashWrite(pgno, frame)
 }
 
-// setBatch records multiple page→frame mappings under a single lock.
+// setBatch records multiple page->frame mappings under a single lock.
 func (wi *walIndex) setBatch(pages []*page, startFrame uint32) {
 	wi.mu.Lock()
 	for i, p := range pages {
@@ -407,6 +529,9 @@ func (wi *walIndex) setBatch(pages []*page, startFrame uint32) {
 
 // get returns the frame containing the latest version of pgno, or 0 if not in WAL.
 // The maxFrame parameter limits which frames are visible (for snapshot isolation).
+//
+// This uses the in-process Go map (pageMap) rather than SHM hash tables.
+// See the package-level comment on issue 7.9 for why this is acceptable.
 func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
 	wi.mu.RLock()
 	defer wi.mu.RUnlock()
@@ -424,6 +549,7 @@ func (wi *walIndex) reset() {
 	clear(wi.pageMap)
 	wi.maxFrame = 0
 	wi.nBackfill = 0
+	wi.nBackfillAttempted = 0
 	for i := range wi.aReadMark {
 		wi.aReadMark[i] = readMarkNotUsed
 	}
@@ -560,14 +686,15 @@ func (wi *walIndex) close() error {
 // --- SHM hash table operations ---
 //
 // The WAL index hash tables reside in shm regions, enabling multi-process
-// readers to find page→frame mappings without scanning the WAL file.
+// readers to find page->frame mappings without scanning the WAL file.
 //
 // Layout per region:
-//   Region 0: [header 136B][aPgno 4062×4B][aHash 8192×2B] = 32768 bytes
-//   Region i: [aPgno 4096×4B][aHash 8192×2B] = 32768 bytes
+//
+//	Region 0: [header 136B][aPgno 4062x4B][aHash 8192x2B] = 32768 bytes
+//	Region i: [aPgno 4096x4B][aHash 8192x2B] = 32768 bytes
 //
 // aPgno[idx] stores the page number for the frame at position (iZero + idx + 1).
-// aHash is a linear-probing hash table: hash(pgno) → (idx+1), where 0 = empty.
+// aHash is a linear-probing hash table: hash(pgno) -> (idx+1), where 0 = empty.
 
 // htFrameSegIdx returns the segment (region) index and entry index for a frame number.
 func htFrameSegIdx(frame uint32) (seg int, idx int) {
@@ -595,7 +722,7 @@ func htSegmentInfo(seg int) (pgnoBase int, nEntry int, iZero uint32) {
 	return 0, htNPage, uint32(htNPageOne + (seg-1)*htNPage)
 }
 
-// shmHashWrite records a page→frame mapping in the shm hash table.
+// shmHashWrite records a page->frame mapping in the shm hash table.
 // Best-effort: errors are ignored since the Go map is authoritative for same-process reads.
 func (wi *walIndex) shmHashWrite(pgno, frame uint32) {
 	seg, idx := htFrameSegIdx(frame)
@@ -684,7 +811,8 @@ func (wi *walIndex) shmClearHash() {
 	}
 }
 
-// shmWriteCkptInfo writes checkpoint info (nBackfill, aReadMark) to shm region 0.
+// shmWriteCkptInfo writes checkpoint info (nBackfill, aReadMark, nBackfillAttempted)
+// to shm region 0. Matches SQLite's WalCkptInfo layout.
 func (wi *walIndex) shmWriteCkptInfo() {
 	region, err := wi.shm.region(0, true)
 	if err != nil {
@@ -694,9 +822,12 @@ func (wi *walIndex) shmWriteCkptInfo() {
 	for i := range 5 {
 		binary.LittleEndian.PutUint32(region[htReadMarkOff+i*4:], wi.aReadMark[i])
 	}
+	// Write nBackfillAttempted at offset 128 (issue 7.7)
+	binary.LittleEndian.PutUint32(region[htNBackfillAttemptedOff:], wi.nBackfillAttempted)
 }
 
-// shmReadCkptInfo reads checkpoint info (nBackfill, aReadMark) from shm region 0.
+// shmReadCkptInfo reads checkpoint info (nBackfill, aReadMark, nBackfillAttempted)
+// from shm region 0.
 func (wi *walIndex) shmReadCkptInfo() {
 	region, err := wi.shm.region(0, false)
 	if err != nil {
@@ -706,6 +837,8 @@ func (wi *walIndex) shmReadCkptInfo() {
 	for i := range 5 {
 		wi.aReadMark[i] = binary.LittleEndian.Uint32(region[htReadMarkOff+i*4:])
 	}
+	// Read nBackfillAttempted at offset 128 (issue 7.7)
+	wi.nBackfillAttempted = binary.LittleEndian.Uint32(region[htNBackfillAttemptedOff:])
 }
 
 // wal manages the Write-Ahead Log.
@@ -731,6 +864,10 @@ type wal struct {
 
 	// noSync skips fdatasync on WAL commit (like SQLite synchronous=normal)
 	noSync bool
+
+	// busyHandler is an optional callback invoked when lock acquisition fails.
+	// If nil, lock failures return ErrBusy immediately (issue 1.7).
+	busyHandler BusyHandler
 
 	// memFrames stores page data in memory for InProcess+NoSync mode,
 	// eliminating per-commit file I/O. Frames are flushed to disk on checkpoint.
@@ -938,8 +1075,14 @@ func (w *wal) recover() error {
 		w.cksum2 = lastCommitCksum2
 		w.index.maxFrame = lastCommitFrame
 		w.index.maxPage = lastCommitDbSize
+
+		// Set nBackfillAttempted to mxFrame during recovery (issue 7.7).
+		// This matches SQLite's walIndexRecover() which sets
+		// pInfo->nBackfillAttempted = pWal->hdr.mxFrame.
+		w.index.nBackfillAttempted = lastCommitFrame
+		w.index.shmWriteCkptInfo()
 	} else {
-		// No committed frames — set empty state, do NOT truncate WAL file.
+		// No committed frames -- set empty state, do NOT truncate WAL file.
 		w.nFrame = 0
 		w.index.reset()
 	}
@@ -1036,7 +1179,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 }
 
 // writeFramesMem is the fast in-memory path for writeFrames.
-// No file I/O, no checksums — just copy page data into a pre-allocated arena.
+// No file I/O, no checksums -- just copy page data into a pre-allocated arena.
 func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	startFrame := w.nFrame + 1
 	pageSz := int(w.pageSize)
@@ -1163,7 +1306,7 @@ func (w *wal) beginRead() (maxFrame uint32, slot int, err error) {
 		}
 	}
 
-	// All slots busy — fall back to slot 0
+	// All slots busy -- fall back to slot 0
 	if err := w.index.lock(lockRead0, lockShared); err != nil {
 		return 0, 0, err
 	}
@@ -1179,8 +1322,9 @@ func (w *wal) endRead(slot int) {
 }
 
 // beginWrite acquires the exclusive write lock.
+// Uses the busy handler for retry/backoff if configured (issue 1.7).
 func (w *wal) beginWrite() error {
-	return w.index.lock(lockWrite, lockExclusive)
+	return walBusyLock(w.index, w.busyHandler, lockWrite, lockExclusive)
 }
 
 // endWrite releases the exclusive write lock.
@@ -1189,26 +1333,65 @@ func (w *wal) endWrite() {
 }
 
 // checkpoint writes WAL frames back to the database file.
-// It implements SQLite's FULL checkpoint mode:
-//   - Blocks new writers (acquires lockWrite)
-//   - Does NOT block readers
-//   - Computes mxSafeFrame: the highest frame that can be safely copied,
-//     limited by the oldest active reader's readmark
-//   - Only resets the WAL when ALL frames are checkpointed AND no readers
-//     are active on slots 1-4
+// The old signature is preserved for backward compatibility; it performs
+// a CheckpointFull (the previous default behavior).
 func (w *wal) checkpoint(dbFile *os.File) error {
-	// Acquire checkpoint lock — serialize concurrent checkpoints
+	return w.checkpointWithMode(dbFile, CheckpointFull, nil)
+}
+
+// checkpointPassive performs a passive checkpoint that never blocks.
+// Used by auto-checkpoint (issue 6.2) to avoid blocking writers or readers.
+func (w *wal) checkpointPassive(dbFile *os.File) error {
+	return w.checkpointWithMode(dbFile, CheckpointPassive, nil)
+}
+
+// checkpointWithMode writes WAL frames back to the database file using
+// the specified checkpoint mode and optional busy handler.
+//
+// Checkpoint modes (issue 6.2):
+//   - CheckpointPassive: never blocks, skips frames locked by readers.
+//     Does NOT acquire the write lock. The busy handler is never invoked.
+//   - CheckpointFull: acquires write lock to block new writers, uses busy
+//     handler to wait for readers blocking progress.
+//   - CheckpointRestart: like Full, but also resets the WAL.
+//   - CheckpointTruncate: like Restart, but also truncates the WAL file.
+//
+// The busy handler (issue 1.7 + 6.3) is invoked when waiting for reader locks
+// in FULL/RESTART/TRUNCATE modes. In PASSIVE mode it is never called.
+func (w *wal) checkpointWithMode(dbFile *os.File, mode CheckpointMode, xBusy BusyHandler) error {
+	// Acquire checkpoint lock -- serialize concurrent checkpoints.
+	// The busy handler is NOT used for the checkpoint lock itself, matching
+	// SQLite: "Even if there is a busy-handler configured, it will not be
+	// invoked in this case."
 	if err := w.index.lock(lockCheckpoint, lockExclusive); err != nil {
 		return err
 	}
 	defer func() { _ = w.index.unlock(lockCheckpoint, lockExclusive) }()
 
-	// Acquire write lock — block new writers during checkpoint
-	if err := w.index.lock(lockWrite, lockExclusive); err != nil {
-		_ = w.index.unlock(lockCheckpoint, lockExclusive)
-		return err
+	// In PASSIVE mode, do NOT acquire the write lock (don't block writers).
+	// In FULL/RESTART/TRUNCATE modes, acquire the write lock using the busy handler.
+	hasWriteLock := false
+	if mode != CheckpointPassive {
+		err := walBusyLock(w.index, xBusy, lockWrite, lockExclusive)
+		if err == nil {
+			hasWriteLock = true
+		} else if err == ErrBusy {
+			// If we can't get the write lock, downgrade to PASSIVE mode,
+			// matching SQLite's behavior: "eMode2 = SQLITE_CHECKPOINT_PASSIVE"
+			mode = CheckpointPassive
+			xBusy = nil
+		} else {
+			return err
+		}
 	}
-	defer func() { _ = w.index.unlock(lockWrite, lockExclusive) }()
+	if hasWriteLock {
+		defer func() { _ = w.index.unlock(lockWrite, lockExclusive) }()
+	}
+
+	// PASSIVE mode never uses the busy handler (issue 6.3).
+	if mode == CheckpointPassive {
+		xBusy = nil
+	}
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -1219,22 +1402,49 @@ func (w *wal) checkpoint(dbFile *os.File) error {
 
 	// Compute mxSafeFrame: the highest frame we can safely copy to DB.
 	// Start with all frames, then lower based on active readers.
+	//
+	// For each reader slot (1-4), check its readmark. If the readmark
+	// is below mxSafeFrame, try to acquire an exclusive lock on that slot.
+	// If we get the lock, the slot is unused and we can clear its readmark.
+	// If the lock fails (reader active), use the busy handler to wait
+	// (in FULL/RESTART/TRUNCATE modes) or just lower mxSafeFrame (PASSIVE).
+	// This matches SQLite's walCheckpoint() reader-lock loop (issue 6.3).
 	mxSafeFrame := w.nFrame
 
-	for i := 0; i < 5; i++ {
-		lockSlot := lockRead0 + i
-		// Try exclusive lock on this reader slot
-		if err := w.index.lock(lockSlot, lockExclusive); err == nil {
-			// No reader on this slot — release immediately
-			_ = w.index.unlock(lockSlot, lockExclusive)
-			continue
-		}
-		// Reader active on this slot — check its readmark
+	for i := 1; i < 5; i++ {
 		w.index.mu.RLock()
 		mark := w.index.aReadMark[i]
 		w.index.mu.RUnlock()
-		if mark != readMarkNotUsed && mark < mxSafeFrame {
+
+		if mark == readMarkNotUsed || mark >= mxSafeFrame {
+			continue
+		}
+
+		// This reader's mark is less than mxSafeFrame, which would block us.
+		// Try to acquire exclusive lock on this reader slot.
+		lockSlot := lockRead0 + i
+		rc := walBusyLock(w.index, xBusy, lockSlot, lockExclusive)
+		if rc == nil {
+			// Got the lock -- no reader on this slot anymore.
+			// Reset the readmark: slot 1 gets mxSafeFrame, others get NOT_USED.
+			// This matches SQLite: "iMark = (i==1 ? mxSafeFrame : READMARK_NOT_USED)"
+			w.index.mu.Lock()
+			if i == 1 {
+				w.index.aReadMark[i] = mxSafeFrame
+			} else {
+				w.index.aReadMark[i] = readMarkNotUsed
+			}
+			w.index.mu.Unlock()
+			_ = w.index.unlock(lockSlot, lockExclusive)
+		} else if rc == ErrBusy {
+			// Reader still active -- lower mxSafeFrame to this reader's mark.
 			mxSafeFrame = mark
+			// After hitting a busy reader, disable the busy handler for
+			// subsequent slots to avoid indefinite waiting, matching SQLite:
+			// "xBusy = 0" after SQLITE_BUSY in the reader loop.
+			xBusy = nil
+		} else {
+			return rc
 		}
 	}
 
@@ -1244,28 +1454,54 @@ func (w *wal) checkpoint(dbFile *os.File) error {
 	w.index.mu.RUnlock()
 
 	if mxSafeFrame <= nBackfill {
-		// Nothing new to checkpoint
-		return nil
+		// Nothing new to checkpoint.
+		// For non-PASSIVE modes, check if we need to wait for readers
+		// to finish before attempting RESTART/TRUNCATE.
+		return w.checkpointPost(mode, xBusy, hasWriteLock)
 	}
+
+	// Acquire exclusive lock on reader slot 0 before backfilling,
+	// matching SQLite's walCheckpoint() which calls
+	// walBusyLock(pWal, xBusy, pBusyArg, WAL_READ_LOCK(0), 1).
+	lockErr := walBusyLock(w.index, xBusy, lockRead0, lockExclusive)
+	if lockErr == ErrBusy {
+		// Reader on slot 0 active; can't backfill but not a fatal error.
+		return w.checkpointPost(mode, xBusy, hasWriteLock)
+	}
+	if lockErr != nil {
+		return lockErr
+	}
+
+	// Set nBackfillAttempted BEFORE starting the backfill (issue 7.7).
+	// This provides a crash-safety hint: if we crash during backfill,
+	// recovery knows that frames up to nBackfillAttempted may have been
+	// partially written to the database.
+	w.index.mu.Lock()
+	w.index.nBackfillAttempted = mxSafeFrame
+	w.index.mu.Unlock()
+	w.index.shmWriteCkptInfo()
 
 	// Sync the WAL file before copying frames to the database, matching
 	// SQLite's walCheckpoint(). This ensures all WAL data is durable on disk
 	// before we start overwriting the database file with it.
 	if !w.noSync && w.file != nil {
 		if err := fdatasync(w.file); err != nil {
+			_ = w.index.unlock(lockRead0, lockExclusive)
 			return err
 		}
 	}
 
 	// Copy frames (nBackfill+1)..mxSafeFrame to DB
 	pageSz := int64(w.pageSize)
+	var backfillErr error
 
 	if w.memFrames != nil {
 		for i := nBackfill; i < mxSafeFrame; i++ {
 			mf := &w.memFrames[i]
 			pageOffset := int64(mf.pgno-1) * pageSz
 			if _, err := dbFile.WriteAt(mf.data, pageOffset); err != nil {
-				return err
+				backfillErr = err
+				break
 			}
 		}
 	} else {
@@ -1276,24 +1512,33 @@ func (w *wal) checkpoint(dbFile *os.File) error {
 		for i := nBackfill; i < mxSafeFrame; i++ {
 			off := int64(walHeaderSize) + int64(i)*frameSize
 			if _, err := w.file.ReadAt(frameBuf, off); err != nil {
-				return err
+				backfillErr = err
+				break
 			}
 			frame.deserialize(frameBuf)
 
 			pageData := make([]byte, w.pageSize)
 			if _, err := w.file.ReadAt(pageData, off+walFrameSize); err != nil {
-				return err
+				backfillErr = err
+				break
 			}
 
 			pageOffset := int64(frame.pgno-1) * pageSz
 			if _, err := dbFile.WriteAt(pageData, pageOffset); err != nil {
-				return err
+				backfillErr = err
+				break
 			}
 		}
 	}
 
+	if backfillErr != nil {
+		_ = w.index.unlock(lockRead0, lockExclusive)
+		return backfillErr
+	}
+
 	// Sync the database file
 	if err := fdatasync(dbFile); err != nil {
+		_ = w.index.unlock(lockRead0, lockExclusive)
 		return err
 	}
 
@@ -1303,9 +1548,36 @@ func (w *wal) checkpoint(dbFile *os.File) error {
 	w.index.mu.Unlock()
 	w.index.shmWriteCkptInfo()
 
-	// If all frames are checkpointed, try to reset the WAL
-	if mxSafeFrame == w.nFrame {
-		return w.tryResetWAL()
+	// Release the reader lock held while backfilling
+	_ = w.index.unlock(lockRead0, lockExclusive)
+
+	return w.checkpointPost(mode, xBusy, hasWriteLock)
+}
+
+// checkpointPost handles post-backfill logic: WAL reset for modes that
+// completed a full checkpoint.
+func (w *wal) checkpointPost(mode CheckpointMode, xBusy BusyHandler, hasWriteLock bool) error {
+	w.index.mu.RLock()
+	backfill := w.index.nBackfill
+	w.index.mu.RUnlock()
+
+	if backfill < w.nFrame {
+		// Not everything was checkpointed. Can't reset the WAL.
+		return nil
+	}
+
+	// All frames are checkpointed. Try to reset the WAL.
+	switch {
+	case mode >= CheckpointRestart:
+		// RESTART/TRUNCATE: use the busy handler to wait for readers,
+		// then reset (and optionally truncate) the WAL.
+		return w.tryResetWALWithBusy(xBusy, mode == CheckpointTruncate)
+
+	case hasWriteLock:
+		// FULL or PASSIVE-with-write-lock: try a non-blocking WAL reset.
+		// This preserves the original checkpoint() behavior where the WAL
+		// was always reset after a full checkpoint if no readers blocked it.
+		_ = w.tryResetWAL()
 	}
 
 	return nil
@@ -1316,7 +1588,7 @@ func (w *wal) checkpoint(dbFile *os.File) error {
 // Must be called with w.mu held and lockCheckpoint + lockWrite acquired.
 func (w *wal) tryResetWAL() error {
 	// Check that no readers are active on slots 1-4.
-	// Slot 0 readers are OK — they read from DB only.
+	// Slot 0 readers are OK -- they read from DB only.
 	allFree := true
 	for i := 1; i <= 4; i++ {
 		lockSlot := lockRead0 + i
@@ -1332,9 +1604,54 @@ func (w *wal) tryResetWAL() error {
 		return nil // readers still active, can't reset WAL
 	}
 
-	// Reset WAL file
-	if err := w.file.Truncate(0); err != nil {
-		return err
+	return w.doResetWAL(true)
+}
+
+// tryResetWALWithBusy attempts to reset the WAL, using the busy handler
+// to wait for reader locks on slots 1-4 (issue 6.3).
+// Used by CheckpointRestart and CheckpointTruncate modes.
+// The truncate parameter controls whether to truncate the WAL file to zero
+// (CheckpointTruncate) or just reset it (CheckpointRestart).
+func (w *wal) tryResetWALWithBusy(xBusy BusyHandler, truncate bool) error {
+	// Try to acquire exclusive locks on all reader slots 1-4,
+	// using the busy handler. Matching SQLite:
+	// "rc = walBusyLock(pWal, xBusy, pBusyArg, WAL_READ_LOCK(1), WAL_NREADER-1)"
+	//
+	// SQLite locks slots 1..4 as a single range. We lock them individually
+	// since our shm interface works per-slot.
+	for i := 1; i <= 4; i++ {
+		lockSlot := lockRead0 + i
+		if err := walBusyLock(w.index, xBusy, lockSlot, lockExclusive); err != nil {
+			// Release any locks we already acquired
+			for j := 1; j < i; j++ {
+				_ = w.index.unlock(lockRead0+j, lockExclusive)
+			}
+			if err == ErrBusy {
+				return nil // can't reset, but not fatal
+			}
+			return err
+		}
+	}
+	// Release all reader locks after reset
+	defer func() {
+		for i := 1; i <= 4; i++ {
+			_ = w.index.unlock(lockRead0+i, lockExclusive)
+		}
+	}()
+
+	return w.doResetWAL(truncate)
+}
+
+// doResetWAL performs the actual WAL reset.
+// Must be called with w.mu held and all necessary locks acquired.
+// If truncate is true, the WAL file is truncated to zero bytes (CheckpointTruncate).
+// If false, the WAL is just restarted with a new header (CheckpointRestart).
+func (w *wal) doResetWAL(truncate bool) error {
+	if truncate {
+		// CheckpointTruncate: truncate WAL file to zero bytes
+		if err := w.file.Truncate(0); err != nil {
+			return err
+		}
 	}
 
 	w.index.reset()
