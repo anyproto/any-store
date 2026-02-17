@@ -13,17 +13,20 @@ import (
 
 // Options configures the database.
 type Options struct {
-	PageSize  uint32 // Page size in bytes (default: 4096)
-	CacheSize int    // Maximum number of cached pages (default: 2000)
-	InProcess bool   // Use in-process locking only (faster, but single-process access only)
-	NoSync    bool   // Skip fsync on WAL commit (like SQLite synchronous=normal in WAL mode)
+	PageSize            uint32 // Page size in bytes (default: 4096)
+	CacheSize           int    // Maximum number of cached pages (default: 2000)
+	InProcess           bool   // Use in-process locking only (faster, but single-process access only)
+	NoSync              bool   // Skip fsync on WAL commit (like SQLite synchronous=normal in WAL mode)
+	AutoCheckpointAfter uint32 // WAL frames before auto-checkpoint (0 = use default 10000)
+	DisableAutoCheckpoint bool // Disable auto-checkpoint entirely (manual Checkpoint() only)
 }
 
 // DefaultOptions returns default database options.
 func DefaultOptions() Options {
 	return Options{
-		PageSize:  DefaultPageSize,
-		CacheSize: defaultCacheSize,
+		PageSize:            DefaultPageSize,
+		CacheSize:           defaultCacheSize,
+		AutoCheckpointAfter: AutoCheckpointThreshold,
 	}
 }
 
@@ -59,6 +62,9 @@ func Open(path string, opts Options) (*DB, error) {
 	}
 	if opts.CacheSize <= 0 {
 		opts.CacheSize = defaultCacheSize
+	}
+	if opts.AutoCheckpointAfter == 0 && !opts.DisableAutoCheckpoint {
+		opts.AutoCheckpointAfter = AutoCheckpointThreshold
 	}
 
 	p := newPager(path, opts.PageSize, opts.CacheSize)
@@ -114,7 +120,8 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 		return nil, ErrClosed
 	}
 
-	if err := db.pager.beginRead(); err != nil {
+	maxFrame, slot, err := db.pager.beginRead()
+	if err != nil {
 		db.mu.RUnlock()
 		return nil, err
 	}
@@ -123,6 +130,8 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 	tx.db = db
 	tx.pager = db.pager
 	tx.closed = false
+	tx.walMaxFrame = maxFrame
+	tx.walSlot = slot
 	return tx, nil
 }
 
@@ -145,14 +154,15 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 		return nil, ErrClosed
 	}
 
-	if err := db.pager.beginRead(); err != nil {
+	maxFrame, slot, err := db.pager.beginRead()
+	if err != nil {
 		db.mu.RUnlock()
 		db.writeMu.Unlock()
 		return nil, err
 	}
 
 	if err := db.pager.beginWrite(); err != nil {
-		db.pager.endRead()
+		db.pager.endRead(slot)
 		db.mu.RUnlock()
 		db.writeMu.Unlock()
 		return nil, err
@@ -162,6 +172,8 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	tx.ReadTx.db = db
 	tx.ReadTx.pager = db.pager
 	tx.ReadTx.closed = false
+	tx.ReadTx.walMaxFrame = maxFrame
+	tx.ReadTx.walSlot = slot
 	return tx, nil
 }
 
@@ -249,6 +261,7 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 }
 
 // DeleteNamespace deletes a namespace. Must be called within a write transaction.
+// All pages belonging to the namespace's B-tree are freed to the freelist.
 func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 	if tx.closed {
 		return ErrTxClosed
@@ -266,19 +279,89 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 		return ErrNamespaceNotFound
 	}
 
+	// Get the root page number before removing the entry
+	off := masterPg.getCellOffset(idx)
+	cell, _ := parseLeafCell(masterPg.data, int(off))
+	var rootPage uint32
+	if len(cell.value) >= 4 {
+		rootPage = binary.BigEndian.Uint32(cell.value)
+	}
+
 	cells := db.masterBT.collectLeafCells(masterPg)
 	cells = append(cells[:idx], cells[idx+1:]...)
-	db.masterBT.rebuildLeafPage(masterPg, cells)
+	if err := db.masterBT.rebuildLeafPage(masterPg, cells); err != nil {
+		db.pager.releasePage(masterPg)
+		return err
+	}
 	db.pager.releasePage(masterPg)
+
+	// Free all pages in the namespace's B-tree
+	if rootPage != 0 {
+		return db.freeTreePages(rootPage)
+	}
 	return nil
+}
+
+// freeTreePages recursively frees all pages in a B-tree,
+// including any overflow page chains attached to leaf cells.
+func (db *DB) freeTreePages(pgno uint32) error {
+	pg, err := db.pager.getPage(pgno)
+	if err != nil {
+		return err
+	}
+
+	if pg.header.isInterior() {
+		// Collect child page numbers before freeing
+		n := int(pg.header.cellCount)
+		cpOff := pg.cellPointerOffset()
+		children := make([]uint32, 0, n+1)
+		for i := range n {
+			off := int(binary.BigEndian.Uint16(pg.data[cpOff+i*2:]))
+			childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
+			children = append(children, childPgno)
+		}
+		children = append(children, pg.header.rightChild)
+		db.pager.releasePage(pg)
+
+		// Recurse into children first (free leaves before interior)
+		for _, child := range children {
+			if err := db.freeTreePages(child); err != nil {
+				return err
+			}
+		}
+	} else {
+		// Leaf page: free any overflow chains
+		usableSize := int(db.pager.pageSize)
+		n := int(pg.header.cellCount)
+		for i := range n {
+			off := pg.getCellOffset(i)
+			cell, _ := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			if cell.overflowPg != 0 {
+				db.pager.releasePage(pg)
+				if err := db.pager.freeOverflowChain(cell.overflowPg); err != nil {
+					return err
+				}
+				// Re-get page since we released it
+				pg, err = db.pager.getPage(pgno)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		db.pager.releasePage(pg)
+	}
+
+	// Free this page
+	return db.pager.freePage(pgno)
 }
 
 // GetNamespace returns a Namespace handle for the given name.
 func (db *DB) GetNamespace(name string) (*Namespace, error) {
-	if err := db.pager.beginRead(); err != nil {
+	_, slot, err := db.pager.beginRead()
+	if err != nil {
 		return nil, err
 	}
-	defer db.pager.endRead()
+	defer db.pager.endRead(slot)
 
 	return db.getNamespaceLocked(name)
 }
@@ -313,10 +396,11 @@ func (db *DB) getNamespaceLocked(name string) (*Namespace, error) {
 
 // ListNamespaces returns the names of all namespaces.
 func (db *DB) ListNamespaces() ([]string, error) {
-	if err := db.pager.beginRead(); err != nil {
+	_, slot, err := db.pager.beginRead()
+	if err != nil {
 		return nil, err
 	}
-	defer db.pager.endRead()
+	defer db.pager.endRead(slot)
 
 	pg, err := db.pager.getPage(1)
 	if err != nil {
@@ -353,9 +437,11 @@ func (ns *Namespace) RootPage() uint32 {
 
 // ReadTx is a read-only transaction.
 type ReadTx struct {
-	db     *DB
-	pager  *pager
-	closed bool
+	db          *DB
+	pager       *pager
+	closed      bool
+	walMaxFrame uint32 // WAL snapshot for this transaction
+	walSlot     int    // reader slot number (for endRead)
 }
 
 // Get retrieves a value by key from the given namespace.
@@ -365,13 +451,14 @@ func (tx *ReadTx) Get(ns *Namespace, key []byte) ([]byte, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
 	}
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage}
-	pg, err := tx.pager.getPage(bt.rootPage)
+	maxFrame := tx.walMaxFrame
+	pg, err := tx.pager.getPageAt(ns.rootPage, maxFrame)
 	if err != nil {
 		return nil, err
 	}
 
 	// Search without starting a new read tx (we're already in one)
+	usableSize := int(tx.pager.pageSize)
 	for {
 		if pg.header.isLeaf() {
 			idx, found := searchLeafPage(pg, key)
@@ -380,13 +467,28 @@ func (tx *ReadTx) Get(ns *Namespace, key []byte) ([]byte, error) {
 				return nil, ErrKeyNotFound
 			}
 			off := pg.getCellOffset(idx)
-			cell, _ := parseLeafCell(pg.data, int(off))
+			cell, _ := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			if cell.overflowPg != 0 {
+				// Read full value from overflow chain
+				pos := int(off)
+				keyLen, kn := getVarint(pg.data[pos:])
+				pos += kn + int(keyLen)
+				valLen, _ := getVarint(pg.data[pos:])
+				fullVal := make([]byte, int(valLen))
+				copy(fullVal, cell.value)
+				if err := tx.pager.readOverflowChain(cell.overflowPg, fullVal[len(cell.value):]); err != nil {
+					tx.pager.releasePage(pg)
+					return nil, err
+				}
+				tx.pager.releasePage(pg)
+				return fullVal, nil
+			}
 			tx.pager.releasePage(pg)
 			return cell.value, nil
 		}
 		childPgno, _ := searchInteriorPage(pg, key)
 		tx.pager.releasePage(pg)
-		pg, err = tx.pager.getPage(childPgno)
+		pg, err = tx.pager.getPageAt(childPgno, maxFrame)
 		if err != nil {
 			return nil, err
 		}
@@ -407,7 +509,7 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 
 // NewCursor creates a cursor for iterating over the namespace.
 func (tx *ReadTx) NewCursor(ns *Namespace) *Cursor {
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage}
+	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame}
 	return bt.NewCursor()
 }
 
@@ -417,7 +519,7 @@ func (tx *ReadTx) Count(ns *Namespace) (int, error) {
 	if tx.closed {
 		return 0, ErrTxClosed
 	}
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage}
+	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame}
 	return bt.Count()
 }
 
@@ -427,7 +529,7 @@ func (tx *ReadTx) Rollback() error {
 		return ErrTxClosed
 	}
 	tx.closed = true
-	tx.pager.endRead()
+	tx.pager.endRead(tx.walSlot)
 	db := tx.db
 	db.mu.RUnlock()
 	db.putReadTx(tx)
@@ -444,7 +546,7 @@ func (tx *WriteTx) Put(ns *Namespace, key, value []byte) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage}
+	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame}
 	return bt.Put(key, value)
 }
 
@@ -453,7 +555,7 @@ func (tx *WriteTx) Delete(ns *Namespace, key []byte) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage}
+	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame}
 	return bt.Delete(key)
 }
 
@@ -468,13 +570,13 @@ func (tx *WriteTx) Commit() error {
 		return ErrTxClosed
 	}
 	tx.closed = true
-	err := tx.pager.commit()
-	threshold := AutoCheckpointThreshold
-	needCheckpoint := threshold > 0 && tx.pager.wal.nFrame >= threshold
-	tx.pager.endRead()
+	nFrame, err := tx.pager.commit()
+	threshold := tx.db.opts.AutoCheckpointAfter
+	needCheckpoint := threshold > 0 && nFrame >= threshold
+	tx.pager.endRead(tx.walSlot)
 
 	// Auto-checkpoint before releasing db.mu.RLock to avoid deadlock with Close().
-	// Use tryCheckpoint to avoid blocking if another checkpoint is in progress.
+	// Checkpoint does NOT block readers — it only blocks new writers.
 	if err == nil && needCheckpoint {
 		_ = tx.pager.tryCheckpoint()
 	}
@@ -492,7 +594,7 @@ func (tx *WriteTx) Rollback() error {
 	}
 	tx.closed = true
 	err := tx.pager.rollback()
-	tx.pager.endRead()
+	tx.pager.endRead(tx.walSlot)
 	db := tx.db
 	db.mu.RUnlock()
 	db.writeMu.Unlock()

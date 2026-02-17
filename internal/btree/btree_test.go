@@ -1060,11 +1060,12 @@ func tempPager(t *testing.T) *pager {
 	t.Helper()
 	p := newPager(filepath.Join(t.TempDir(), "t.db"), 4096, 100)
 	require.NoError(t, p.open())
-	require.NoError(t, p.beginRead())
+	_, slot, err := p.beginRead()
+	require.NoError(t, err)
 	require.NoError(t, p.beginWrite())
 	t.Cleanup(func() {
 		_ = p.rollback()
-		p.endRead()
+		p.endRead(slot)
 		_ = p.close()
 	})
 	return p
@@ -1244,6 +1245,6 @@ func TestPagerAllocateWithoutWriteTx(t *testing.T) {
 
 func TestPagerCommitWithoutWriteTx(t *testing.T) {
 	db := tempDB(t)
-	err := db.pager.commit()
+	_, err := db.pager.commit()
 	assert.ErrorIs(t, err, ErrReadOnly)
 }

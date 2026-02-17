@@ -456,10 +456,10 @@ func TestWALBeginReadEndRead(t *testing.T) {
 	w := newWal(path, 4096)
 	require.NoError(t, w.open())
 
-	maxFrame, err := w.beginRead()
+	maxFrame, slot, err := w.beginRead()
 	require.NoError(t, err)
 	assert.Equal(t, uint32(0), maxFrame)
-	w.endRead()
+	w.endRead(slot)
 
 	// Write some data, then read
 	require.NoError(t, w.beginWrite())
@@ -467,10 +467,10 @@ func TestWALBeginReadEndRead(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
 
-	maxFrame, err = w.beginRead()
+	maxFrame, slot, err = w.beginRead()
 	require.NoError(t, err)
 	assert.Equal(t, uint32(1), maxFrame)
-	w.endRead()
+	w.endRead(slot)
 
 	require.NoError(t, w.close())
 }

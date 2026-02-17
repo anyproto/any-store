@@ -59,6 +59,25 @@ const (
 	// WAL index (shared memory) constants
 	walIndexHeaderSize = 48
 	walHashSize        = 4096 // entries per hash table segment
+
+	// SHM hash table layout constants (matching SQLite's wal-index hash tables).
+	// Each shm region (32KB) stores a hash table segment mapping page numbers
+	// to WAL frame positions. Region 0 also contains the WAL index header.
+	htNPage    = 4096  // max frame entries per hash segment (power of 2)
+	htNSlot    = 8192  // hash slots per segment (2 * htNPage, power of 2)
+	htHash1    = 383   // hash multiplier (prime)
+	htHdrSize  = 136   // header area in region 0 (two copies of WalIndexHdr + WalCkptInfo)
+
+	// Checkpoint info offsets in region 0
+	htCkptOff     = 96  // nBackfill (4 bytes)
+	htReadMarkOff = 100 // aReadMark[0..4] (5 * 4 = 20 bytes)
+
+	// Hash table data offsets
+	htPgnoOff0     = htHdrSize   // aPgno start in region 0 (byte 136)
+	htHashArrayOff = htNPage * 4 // aHash start in all regions (byte 16384)
+
+	// Number of frame entries in region 0 (reduced by header)
+	htNPageOne = htNPage - (htHdrSize / 4) // 4062
 )
 
 // walHeader represents the WAL file header.
@@ -182,6 +201,9 @@ func walChecksum(data []byte, s1, s2 uint32) (uint32, uint32) {
 	return s1, s2
 }
 
+// readMarkNotUsed is the sentinel value for an unused read mark slot.
+const readMarkNotUsed = uint32(0xFFFFFFFF)
+
 // walIndex manages the WAL index stored in shared memory.
 // It maps page numbers to their latest WAL frame positions.
 // The index is backed by the shm interface, which may be mmap'd
@@ -193,6 +215,11 @@ type walIndex struct {
 	maxFrame  uint32            // highest valid frame
 	maxPage   uint32            // database size at last commit
 	nBackfill uint32            // frames already checkpointed
+
+	// aReadMark tracks each reader's WAL snapshot position.
+	// Slot 0 is special: readers on slot 0 read entirely from the DB (nBackfill == maxFrame).
+	// Slots 1-4 are for readers that need WAL frames.
+	aReadMark [5]uint32
 }
 
 func newWalIndex(shmPath string, inProcess bool) (*walIndex, error) {
@@ -206,10 +233,15 @@ func newWalIndex(shmPath string, inProcess bool) (*walIndex, error) {
 			return nil, err
 		}
 	}
-	return &walIndex{
+	wi := &walIndex{
 		shm:     s,
 		pageMap: make(map[uint32]uint32),
-	}, nil
+	}
+	// Initialize all read marks as unused
+	for i := range wi.aReadMark {
+		wi.aReadMark[i] = readMarkNotUsed
+	}
+	return wi, nil
 }
 
 // set records a page at a given frame position.
@@ -220,6 +252,7 @@ func (wi *walIndex) set(pgno, frame uint32) {
 		wi.maxFrame = frame
 	}
 	wi.mu.Unlock()
+	wi.shmHashWrite(pgno, frame)
 }
 
 // setBatch records multiple page→frame mappings under a single lock.
@@ -233,6 +266,10 @@ func (wi *walIndex) setBatch(pages []*page, startFrame uint32) {
 		wi.maxFrame = f
 	}
 	wi.mu.Unlock()
+	// Write to shm hash tables for cross-process visibility
+	for i, p := range pages {
+		wi.shmHashWrite(p.pgno, startFrame+uint32(i))
+	}
 }
 
 // get returns the frame containing the latest version of pgno, or 0 if not in WAL.
@@ -247,13 +284,18 @@ func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
 	return 0
 }
 
-// reset clears the WAL index (after a checkpoint).
+// reset clears the WAL index (after a checkpoint + WAL truncate).
 func (wi *walIndex) reset() {
 	wi.mu.Lock()
 	defer wi.mu.Unlock()
 	clear(wi.pageMap)
 	wi.maxFrame = 0
 	wi.nBackfill = 0
+	for i := range wi.aReadMark {
+		wi.aReadMark[i] = readMarkNotUsed
+	}
+	wi.shmClearHash()
+	wi.shmWriteCkptInfo()
 }
 
 // writeHeader writes the WAL index header to region 0 of the shm.
@@ -293,6 +335,157 @@ func (wi *walIndex) close() error {
 		return wi.shm.close()
 	}
 	return nil
+}
+
+// --- SHM hash table operations ---
+//
+// The WAL index hash tables reside in shm regions, enabling multi-process
+// readers to find page→frame mappings without scanning the WAL file.
+//
+// Layout per region:
+//   Region 0: [header 136B][aPgno 4062×4B][aHash 8192×2B] = 32768 bytes
+//   Region i: [aPgno 4096×4B][aHash 8192×2B] = 32768 bytes
+//
+// aPgno[idx] stores the page number for the frame at position (iZero + idx + 1).
+// aHash is a linear-probing hash table: hash(pgno) → (idx+1), where 0 = empty.
+
+// htFrameSegIdx returns the segment (region) index and entry index for a frame number.
+func htFrameSegIdx(frame uint32) (seg int, idx int) {
+	if frame <= htNPageOne {
+		return 0, int(frame) - 1
+	}
+	f := int(frame) - htNPageOne - 1
+	return 1 + f/htNPage, f % htNPage
+}
+
+// htPgnoOffset returns the byte offset of aPgno[idx] within the segment's region.
+func htPgnoOffset(seg, idx int) int {
+	if seg == 0 {
+		return htPgnoOff0 + idx*4
+	}
+	return idx * 4
+}
+
+// htSegmentInfo returns the aPgno base offset, entry count, and iZero for a segment.
+// iZero is the frame number that maps to aPgno[0] minus 1 (so frame = iZero + idx + 1).
+func htSegmentInfo(seg int) (pgnoBase int, nEntry int, iZero uint32) {
+	if seg == 0 {
+		return htPgnoOff0, int(htNPageOne), 0
+	}
+	return 0, htNPage, uint32(htNPageOne + (seg-1)*htNPage)
+}
+
+// shmHashWrite records a page→frame mapping in the shm hash table.
+// Best-effort: errors are ignored since the Go map is authoritative for same-process reads.
+func (wi *walIndex) shmHashWrite(pgno, frame uint32) {
+	seg, idx := htFrameSegIdx(frame)
+
+	region, err := wi.shm.region(seg, true)
+	if err != nil {
+		return
+	}
+
+	// Write pgno to aPgno[idx]
+	pgnoOff := htPgnoOffset(seg, idx)
+	binary.LittleEndian.PutUint32(region[pgnoOff:], pgno)
+
+	// Insert into hash table (linear probing)
+	h := int(pgno*htHash1) & (htNSlot - 1)
+	for range htNSlot {
+		slotOff := htHashArrayOff + h*2
+		if binary.LittleEndian.Uint16(region[slotOff:]) == 0 {
+			binary.LittleEndian.PutUint16(region[slotOff:], uint16(idx+1))
+			return
+		}
+		h = (h + 1) & (htNSlot - 1)
+	}
+}
+
+// shmHashGet looks up the latest frame for pgno from shm hash tables.
+// Returns 0 if not found. Only frames <= maxFrame are considered.
+// This is the cross-process read path; same-process readers use the Go map.
+func (wi *walIndex) shmHashGet(pgno, maxFrame uint32) uint32 {
+	if maxFrame == 0 {
+		return 0
+	}
+
+	lastSeg, _ := htFrameSegIdx(maxFrame)
+
+	for seg := lastSeg; seg >= 0; seg-- {
+		region, err := wi.shm.region(seg, false)
+		if err != nil {
+			continue
+		}
+
+		pgnoBase, nEntry, iZero := htSegmentInfo(seg)
+		h := int(pgno*htHash1) & (htNSlot - 1)
+
+		var bestFrame uint32
+		for range htNSlot {
+			slotOff := htHashArrayOff + h*2
+			entry := binary.LittleEndian.Uint16(region[slotOff:])
+			if entry == 0 {
+				break // end of probe chain
+			}
+			idx := int(entry) - 1
+			if idx < nEntry {
+				storedPgno := binary.LittleEndian.Uint32(region[pgnoBase+idx*4:])
+				if storedPgno == pgno {
+					frame := iZero + uint32(idx) + 1
+					if frame <= maxFrame && frame > bestFrame {
+						bestFrame = frame
+					}
+				}
+			}
+			h = (h + 1) & (htNSlot - 1)
+		}
+
+		if bestFrame > 0 {
+			return bestFrame
+		}
+	}
+
+	return 0
+}
+
+// shmClearHash zeros out all hash table data in shm regions.
+// Called during WAL reset. Preserves the header area in region 0.
+func (wi *walIndex) shmClearHash() {
+	for seg := range shmMaxRegions {
+		region, err := wi.shm.region(seg, false)
+		if err != nil {
+			break
+		}
+		if seg == 0 {
+			clear(region[htPgnoOff0:])
+		} else {
+			clear(region[:])
+		}
+	}
+}
+
+// shmWriteCkptInfo writes checkpoint info (nBackfill, aReadMark) to shm region 0.
+func (wi *walIndex) shmWriteCkptInfo() {
+	region, err := wi.shm.region(0, true)
+	if err != nil {
+		return
+	}
+	binary.LittleEndian.PutUint32(region[htCkptOff:], wi.nBackfill)
+	for i := range 5 {
+		binary.LittleEndian.PutUint32(region[htReadMarkOff+i*4:], wi.aReadMark[i])
+	}
+}
+
+// shmReadCkptInfo reads checkpoint info (nBackfill, aReadMark) from shm region 0.
+func (wi *walIndex) shmReadCkptInfo() {
+	region, err := wi.shm.region(0, false)
+	if err != nil {
+		return
+	}
+	wi.nBackfill = binary.LittleEndian.Uint32(region[htCkptOff:])
+	for i := range 5 {
+		wi.aReadMark[i] = binary.LittleEndian.Uint32(region[htReadMarkOff+i*4:])
+	}
 }
 
 // wal manages the Write-Ahead Log.
@@ -690,25 +883,78 @@ func (w *wal) readFrame(frame uint32, buf []byte) error {
 	return err
 }
 
-// beginRead acquires a shared read lock and returns the current max frame
-// number for snapshot isolation.
-func (w *wal) beginRead() (uint32, error) {
-	// Acquire a shared lock on a reader slot.
-	// For simplicity, we use lockRead0. A full implementation would
-	// cycle through reader slots like SQLite does.
-	if err := w.index.lock(lockRead0, lockShared); err != nil {
-		return 0, err
+// beginRead acquires a shared read lock on a reader slot and returns the
+// current max frame number for snapshot isolation plus the slot number.
+// Reader slot rotation (like SQLite):
+//   - Slot 0: used when nBackfill == maxFrame (read everything from DB, skip WAL)
+//   - Slots 1-4: used for readers that need WAL frames. Best slot is the one
+//     with the largest readmark <= current maxFrame.
+func (w *wal) beginRead() (maxFrame uint32, slot int, err error) {
+	w.index.mu.RLock()
+	mxFrame := w.index.maxFrame
+	nBackfill := w.index.nBackfill
+	w.index.mu.RUnlock()
+
+	if mxFrame == 0 || nBackfill == mxFrame {
+		// All frames are checkpointed. Use slot 0 (read from DB, skip WAL).
+		if err := w.index.lock(lockRead0, lockShared); err != nil {
+			return 0, 0, err
+		}
+		w.index.mu.Lock()
+		w.index.aReadMark[0] = mxFrame
+		w.index.mu.Unlock()
+		return mxFrame, 0, nil
 	}
 
+	// Find the best reader slot (1-4).
+	// Best slot = one with largest readmark <= mxFrame.
+	// If none has a valid mark, find an unused slot.
+	bestSlot := -1
+	bestMark := uint32(0)
+
 	w.index.mu.RLock()
-	maxFrame := w.index.maxFrame
+	for i := 1; i <= 4; i++ {
+		mark := w.index.aReadMark[i]
+		if mark != readMarkNotUsed && mark <= mxFrame && mark > bestMark {
+			bestSlot = i
+			bestMark = mark
+		}
+	}
 	w.index.mu.RUnlock()
-	return maxFrame, nil
+
+	if bestSlot != -1 {
+		// Try to acquire the best slot
+		lockSlot := lockRead0 + bestSlot
+		if err := w.index.lock(lockSlot, lockShared); err == nil {
+			return mxFrame, bestSlot, nil
+		}
+		// If lock fails, fall through to find an unused slot
+	}
+
+	// Find an unused slot and set its mark to mxFrame
+	for i := 1; i <= 4; i++ {
+		lockSlot := lockRead0 + i
+		if err := w.index.lock(lockSlot, lockShared); err == nil {
+			w.index.mu.Lock()
+			w.index.aReadMark[i] = mxFrame
+			w.index.mu.Unlock()
+			return mxFrame, i, nil
+		}
+	}
+
+	// All slots busy — fall back to slot 0
+	if err := w.index.lock(lockRead0, lockShared); err != nil {
+		return 0, 0, err
+	}
+	w.index.mu.Lock()
+	w.index.aReadMark[0] = mxFrame
+	w.index.mu.Unlock()
+	return mxFrame, 0, nil
 }
 
-// endRead releases the reader lock.
-func (w *wal) endRead() {
-	_ = w.index.unlock(lockRead0, lockShared)
+// endRead releases the reader lock for the given slot.
+func (w *wal) endRead(slot int) {
+	_ = w.index.unlock(lockRead0+slot, lockShared)
 }
 
 // beginWrite acquires the exclusive write lock.
@@ -721,14 +967,27 @@ func (w *wal) endWrite() {
 	_ = w.index.unlock(lockWrite, lockExclusive)
 }
 
-// checkpoint writes WAL frames back to the database file (passive checkpoint).
-// It only checkpoints frames that are not needed by any active reader.
+// checkpoint writes WAL frames back to the database file.
+// It implements SQLite's FULL checkpoint mode:
+//   - Blocks new writers (acquires lockWrite)
+//   - Does NOT block readers
+//   - Computes mxSafeFrame: the highest frame that can be safely copied,
+//     limited by the oldest active reader's readmark
+//   - Only resets the WAL when ALL frames are checkpointed AND no readers
+//     are active on slots 1-4
 func (w *wal) checkpoint(dbFile *os.File) error {
-	// Acquire checkpoint lock
+	// Acquire checkpoint lock — serialize concurrent checkpoints
 	if err := w.index.lock(lockCheckpoint, lockExclusive); err != nil {
 		return err
 	}
 	defer func() { _ = w.index.unlock(lockCheckpoint, lockExclusive) }()
+
+	// Acquire write lock — block new writers during checkpoint
+	if err := w.index.lock(lockWrite, lockExclusive); err != nil {
+		_ = w.index.unlock(lockCheckpoint, lockExclusive)
+		return err
+	}
+	defer func() { _ = w.index.unlock(lockWrite, lockExclusive) }()
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -737,18 +996,42 @@ func (w *wal) checkpoint(dbFile *os.File) error {
 		return nil
 	}
 
-	// Try to get exclusive lock on reader slot to ensure no active readers.
-	// This is the passive checkpoint approach - if readers exist, skip.
-	if err := w.index.lock(lockRead0, lockExclusive); err != nil {
-		return nil // readers active, skip checkpoint (passive mode)
-	}
-	defer func() { _ = w.index.unlock(lockRead0, lockExclusive) }()
+	// Compute mxSafeFrame: the highest frame we can safely copy to DB.
+	// Start with all frames, then lower based on active readers.
+	mxSafeFrame := w.nFrame
 
+	for i := 0; i < 5; i++ {
+		lockSlot := lockRead0 + i
+		// Try exclusive lock on this reader slot
+		if err := w.index.lock(lockSlot, lockExclusive); err == nil {
+			// No reader on this slot — release immediately
+			_ = w.index.unlock(lockSlot, lockExclusive)
+			continue
+		}
+		// Reader active on this slot — check its readmark
+		w.index.mu.RLock()
+		mark := w.index.aReadMark[i]
+		w.index.mu.RUnlock()
+		if mark != readMarkNotUsed && mark < mxSafeFrame {
+			mxSafeFrame = mark
+		}
+	}
+
+	// nBackfill is the number of frames already copied to DB
+	w.index.mu.RLock()
+	nBackfill := w.index.nBackfill
+	w.index.mu.RUnlock()
+
+	if mxSafeFrame <= nBackfill {
+		// Nothing new to checkpoint
+		return nil
+	}
+
+	// Copy frames (nBackfill+1)..mxSafeFrame to DB
 	pageSz := int64(w.pageSize)
 
 	if w.memFrames != nil {
-		// In-memory WAL: write directly from memFrames to DB file
-		for i := uint32(0); i < w.nFrame; i++ {
+		for i := nBackfill; i < mxSafeFrame; i++ {
 			mf := &w.memFrames[i]
 			pageOffset := int64(mf.pgno-1) * pageSz
 			if _, err := dbFile.WriteAt(mf.data, pageOffset); err != nil {
@@ -756,19 +1039,22 @@ func (w *wal) checkpoint(dbFile *os.File) error {
 			}
 		}
 	} else {
-		// File-based WAL: read frames then write pages to DB
 		frameSize := int64(walFrameSize) + int64(w.pageSize)
-		walDataSize := int64(w.nFrame) * frameSize
-		walData := make([]byte, walDataSize)
-		if _, err := w.file.ReadAt(walData, int64(walHeaderSize)); err != nil {
-			return err
-		}
-
 		var frame walFrame
-		for i := uint32(0); i < w.nFrame; i++ {
-			off := int64(i) * frameSize
-			frame.deserialize(walData[off:])
-			pageData := walData[off+walFrameSize : off+frameSize]
+		frameBuf := make([]byte, walFrameSize)
+
+		for i := nBackfill; i < mxSafeFrame; i++ {
+			off := int64(walHeaderSize) + int64(i)*frameSize
+			if _, err := w.file.ReadAt(frameBuf, off); err != nil {
+				return err
+			}
+			frame.deserialize(frameBuf)
+
+			pageData := make([]byte, w.pageSize)
+			if _, err := w.file.ReadAt(pageData, off+walFrameSize); err != nil {
+				return err
+			}
+
 			pageOffset := int64(frame.pgno-1) * pageSz
 			if _, err := dbFile.WriteAt(pageData, pageOffset); err != nil {
 				return err
@@ -779,6 +1065,41 @@ func (w *wal) checkpoint(dbFile *os.File) error {
 	// Sync the database file
 	if err := fdatasync(dbFile); err != nil {
 		return err
+	}
+
+	// Update nBackfill
+	w.index.mu.Lock()
+	w.index.nBackfill = mxSafeFrame
+	w.index.mu.Unlock()
+	w.index.shmWriteCkptInfo()
+
+	// If all frames are checkpointed, try to reset the WAL
+	if mxSafeFrame == w.nFrame {
+		return w.tryResetWAL()
+	}
+
+	return nil
+}
+
+// tryResetWAL attempts to reset the WAL file after a full checkpoint.
+// Only succeeds if no readers are active on slots 1-4.
+// Must be called with w.mu held and lockCheckpoint + lockWrite acquired.
+func (w *wal) tryResetWAL() error {
+	// Check that no readers are active on slots 1-4.
+	// Slot 0 readers are OK — they read from DB only.
+	allFree := true
+	for i := 1; i <= 4; i++ {
+		lockSlot := lockRead0 + i
+		if err := w.index.lock(lockSlot, lockExclusive); err == nil {
+			_ = w.index.unlock(lockSlot, lockExclusive)
+		} else {
+			allFree = false
+			break
+		}
+	}
+
+	if !allFree {
+		return nil // readers still active, can't reset WAL
 	}
 
 	// Reset WAL file

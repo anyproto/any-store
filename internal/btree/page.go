@@ -89,7 +89,43 @@ const (
 
 	// leafPayloadFrac is the fraction of page for leaf payload.
 	leafPayloadFrac = 32
+
+	// overflowPtrSize is the size of the overflow page pointer at the end
+	// of a leaf cell that has overflowed.
+	overflowPtrSize = 4
 )
+
+// maxLocalPayload returns the max payload stored locally before overflow.
+// Matches SQLite's formula for index B-trees.
+func maxLocalPayload(usableSize int) int {
+	return ((usableSize - 12) * 64 / 255) - 23
+}
+
+// minLocalPayload returns the min payload stored locally for overflow cells.
+func minLocalPayload(usableSize int) int {
+	return ((usableSize - 12) * 32 / 255) - 23
+}
+
+// overflowPageUsable returns the usable space per overflow page (pageSize - 4 byte next ptr).
+func overflowPageUsable(pageSize int) int {
+	return pageSize - 4
+}
+
+// localPayloadSize computes how many bytes of payload are stored locally
+// when total payload exceeds maxLocal. Uses SQLite's surplus algorithm.
+func localPayloadSize(totalPayload, usableSize int) int {
+	maxLocal := maxLocalPayload(usableSize)
+	if totalPayload <= maxLocal {
+		return totalPayload
+	}
+	minLocal := minLocalPayload(usableSize)
+	ovflUsable := overflowPageUsable(usableSize)
+	surplus := minLocal + (totalPayload-minLocal)%ovflUsable
+	if surplus <= maxLocal {
+		return surplus
+	}
+	return minLocal
+}
 
 // dbHeader represents the 100-byte database file header.
 type dbHeader struct {

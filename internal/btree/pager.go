@@ -10,13 +10,15 @@ package btree
 //   - Transaction commit/rollback coordination
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 )
 
 // pagerState represents the pager's state machine.
-type pagerState int
+type pagerState int32
 
 const (
 	pagerOpen   pagerState = iota // File opened, no transaction
@@ -35,13 +37,14 @@ type pager struct {
 	path     string
 	pageSize uint32
 	dbSize   uint32 // database size in pages
-	state    pagerState
+	state    atomic.Int32 // pagerState
 
 	// Savepoint support: snapshots of dirty pages at savepoint boundaries
 	savepoints []savepointState
 
-	// WAL snapshot for the current read transaction
-	walMaxFrame uint32
+	// WAL snapshot for the current write transaction (set atomically).
+	// Readers use per-tx walMaxFrame instead.
+	walMaxFrame atomic.Uint32
 
 	// Write-transaction page map: bypasses pcache lock for hot pages during writes.
 	// Only accessed by the single writer goroutine, so no lock needed.
@@ -126,7 +129,7 @@ func (p *pager) open() error {
 		p.dbSize = p.wal.index.maxPage
 	}
 
-	p.state = pagerOpen
+	p.state.Store(int32(pagerOpen))
 	return nil
 }
 
@@ -182,30 +185,30 @@ func (p *pager) initNewDB() error {
 		return err
 	}
 
-	p.state = pagerOpen
+	p.state.Store(int32(pagerOpen))
 	return nil
 }
 
 // beginRead starts a read transaction, taking a WAL snapshot.
-func (p *pager) beginRead() error {
+// Returns the WAL max frame for snapshot isolation and the reader slot number.
+func (p *pager) beginRead() (maxFrame uint32, slot int, err error) {
 	p.mu.RLock()
-	if p.state == pagerError {
+	if pagerState(p.state.Load()) == pagerError {
 		p.mu.RUnlock()
-		return ErrCorrupt
+		return 0, 0, ErrCorrupt
 	}
-	maxFrame, err := p.wal.beginRead()
+	maxFrame, slot, err = p.wal.beginRead()
 	if err != nil {
 		p.mu.RUnlock()
-		return err
+		return 0, 0, err
 	}
-	p.walMaxFrame = maxFrame
-	return nil
+	p.walMaxFrame.Store(maxFrame) // for internal pager operations (e.g. getPage in write path)
+	return maxFrame, slot, nil
 }
 
-// endRead ends a read transaction.
-func (p *pager) endRead() {
-	p.wal.endRead()
-	p.walMaxFrame = 0
+// endRead ends a read transaction for the given reader slot.
+func (p *pager) endRead(slot int) {
+	p.wal.endRead(slot)
 	p.mu.RUnlock()
 }
 
@@ -214,7 +217,7 @@ func (p *pager) beginWrite() error {
 	if err := p.wal.beginWrite(); err != nil {
 		return err
 	}
-	p.state = pagerWriter
+	p.state.Store(int32(pagerWriter))
 	if p.writePages == nil {
 		p.writePages = make(map[uint32]*page, 64)
 	}
@@ -222,7 +225,15 @@ func (p *pager) beginWrite() error {
 }
 
 // getPage returns the page with the given page number, reading from WAL or disk as needed.
+// Uses the pager's walMaxFrame (set during beginRead for the current writer).
 func (p *pager) getPage(pgno uint32) (*page, error) {
+	return p.getPageAt(pgno, p.walMaxFrame.Load())
+}
+
+// getPageAt returns the page with the given page number, using the specified
+// walMaxFrame for snapshot isolation. This allows different readers to have
+// different WAL snapshots.
+func (p *pager) getPageAt(pgno, walMaxFrame uint32) (*page, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
 	}
@@ -236,8 +247,8 @@ func (p *pager) getPage(pgno uint32) (*page, error) {
 	pg := p.cache.create(pgno)
 
 	// Try to read from WAL first
-	if p.walMaxFrame > 0 {
-		frame := p.wal.index.get(pgno, p.walMaxFrame)
+	if walMaxFrame > 0 {
+		frame := p.wal.index.get(pgno, walMaxFrame)
 		if frame > 0 {
 			if err := p.wal.readFrame(frame, pg.data); err != nil {
 				p.cache.release(pg)
@@ -281,7 +292,7 @@ func (p *pager) getPage(pgno uint32) (*page, error) {
 // getWritablePage returns a page ready for writing. It marks the page as dirty
 // and saves a copy for savepoint rollback if needed.
 func (p *pager) getWritablePage(pgno uint32) (*page, error) {
-	if p.state != pagerWriter {
+	if pagerState(p.state.Load()) != pagerWriter {
 		return nil, ErrReadOnly
 	}
 
@@ -321,12 +332,21 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 }
 
 // allocatePage allocates a new page and returns it.
+// It first checks the freelist for reusable pages before growing the database.
 func (p *pager) allocatePage() (*page, error) {
-	if p.state != pagerWriter {
+	if pagerState(p.state.Load()) != pagerWriter {
 		return nil, ErrReadOnly
 	}
 
-	// TODO: check freelist first
+	// Check freelist first
+	if p.header.FirstFreelistPg != 0 {
+		pg, err := p.allocateFromFreelist()
+		if err == nil {
+			return pg, nil
+		}
+		// Fall through to grow database if freelist read fails
+	}
+
 	p.dbSize++
 	pgno := p.dbSize
 
@@ -337,33 +357,133 @@ func (p *pager) allocatePage() (*page, error) {
 	return pg, nil
 }
 
+// Freelist format (SQLite-compatible trunk/leaf linked list):
+//
+//	Trunk page:
+//	  Offset 0:  4 bytes - next trunk page number (0 = last trunk)
+//	  Offset 4:  4 bytes - number of leaf page numbers on this trunk
+//	  Offset 8+: 4 bytes each - leaf page numbers
+//
+// Max leaves per trunk = (pageSize - 8) / 4
+
+// freelistMaxLeaves returns the max number of leaf entries per trunk page.
+func (p *pager) freelistMaxLeaves() int {
+	return (int(p.pageSize) - 8) / 4
+}
+
+// freePage adds a page to the freelist.
+func (p *pager) freePage(pgno uint32) error {
+	if pagerState(p.state.Load()) != pagerWriter {
+		return ErrReadOnly
+	}
+	if pgno == 0 || pgno == 1 {
+		return ErrInvalidPage
+	}
+
+	trunkPgno := p.header.FirstFreelistPg
+
+	if trunkPgno != 0 {
+		// Read the current trunk page
+		trunkPg, err := p.getWritablePage(trunkPgno)
+		if err != nil {
+			return err
+		}
+		leafCount := int(binary.BigEndian.Uint32(trunkPg.data[4:8]))
+		maxLeaves := p.freelistMaxLeaves()
+
+		if leafCount < maxLeaves {
+			// Trunk has room — append as leaf entry
+			binary.BigEndian.PutUint32(trunkPg.data[8+leafCount*4:], pgno)
+			binary.BigEndian.PutUint32(trunkPg.data[4:8], uint32(leafCount+1))
+			p.releasePage(trunkPg)
+			p.header.TotalFreelistPgs++
+			return nil
+		}
+		p.releasePage(trunkPg)
+	}
+
+	// No trunk or trunk is full — freed page becomes new trunk
+	newTrunkPg, err := p.getWritablePage(pgno)
+	if err != nil {
+		// Page may not be in cache yet; create it
+		newTrunkPg = p.cache.create(pgno)
+		p.cache.makeDirty(newTrunkPg)
+		p.writePages[pgno] = newTrunkPg
+	}
+	clear(newTrunkPg.data)
+	binary.BigEndian.PutUint32(newTrunkPg.data[0:4], trunkPgno) // next trunk = old trunk
+	binary.BigEndian.PutUint32(newTrunkPg.data[4:8], 0)         // leaf count = 0
+	newTrunkPg.header = pageHeader{} // clear parsed header
+	p.releasePage(newTrunkPg)
+
+	p.header.FirstFreelistPg = pgno
+	p.header.TotalFreelistPgs++
+	return nil
+}
+
+// allocateFromFreelist pops a page from the freelist and returns it.
+func (p *pager) allocateFromFreelist() (*page, error) {
+	trunkPgno := p.header.FirstFreelistPg
+	if trunkPgno == 0 {
+		return nil, ErrInvalidPage
+	}
+
+	trunkPg, err := p.getWritablePage(trunkPgno)
+	if err != nil {
+		return nil, err
+	}
+
+	leafCount := int(binary.BigEndian.Uint32(trunkPg.data[4:8]))
+
+	if leafCount > 0 {
+		// Pop the last leaf page number
+		leafPgno := binary.BigEndian.Uint32(trunkPg.data[8+(leafCount-1)*4:])
+		binary.BigEndian.PutUint32(trunkPg.data[4:8], uint32(leafCount-1))
+		p.releasePage(trunkPg)
+
+		p.header.TotalFreelistPgs--
+
+		// Create the page in cache
+		pg := p.cache.create(leafPgno)
+		clear(pg.data)
+		p.cache.makeDirty(pg)
+		p.writePages[leafPgno] = pg
+		return pg, nil
+	}
+
+	// Trunk has no leaves — use the trunk page itself
+	nextTrunk := binary.BigEndian.Uint32(trunkPg.data[0:4])
+	p.header.FirstFreelistPg = nextTrunk
+	p.header.TotalFreelistPgs--
+
+	// Reuse the trunk page
+	clear(trunkPg.data)
+	trunkPg.header = pageHeader{}
+	return trunkPg, nil
+}
+
 // releasePage unpins a page.
 func (p *pager) releasePage(pg *page) {
 	if pg == nil {
-		return
-	}
-	if pg.dirty {
-		// Dirty pages are only accessed by the single writer goroutine
-		// and never go to LRU, so we can skip the pcache lock.
-		pg.pinCount--
 		return
 	}
 	p.cache.release(pg)
 }
 
 // commit writes all dirty pages to WAL and commits the transaction.
-func (p *pager) commit() error {
-	if p.state != pagerWriter {
-		return ErrReadOnly
+// Returns the WAL frame count at commit time (for auto-checkpoint decisions).
+func (p *pager) commit() (nFrame uint32, err error) {
+	if pagerState(p.state.Load()) != pagerWriter {
+		return 0, ErrReadOnly
 	}
 
 	p.dirtyBuf = p.cache.appendDirtyPages(p.dirtyBuf[:0])
 	if len(p.dirtyBuf) == 0 {
-		p.state = pagerOpen
+		p.state.Store(int32(pagerOpen))
 		p.savepoints = p.savepoints[:0]
 		clear(p.writePages)
 		p.wal.endWrite()
-		return nil
+		return 0, nil
 	}
 
 	// Update the database header on page 1
@@ -380,9 +500,14 @@ func (p *pager) commit() error {
 
 	// Write all dirty pages to WAL
 	if err := p.wal.writeFrames(p.dirtyBuf, true, p.dbSize); err != nil {
-		p.state = pagerError
-		return err
+		p.state.Store(int32(pagerError))
+		return 0, err
 	}
+
+	// Capture nFrame under w.mu for happens-before ordering with checkpoint
+	p.wal.mu.Lock()
+	nFrame = p.wal.nFrame
+	p.wal.mu.Unlock()
 
 	// Mark all pages as clean
 	for _, pg := range p.dirtyBuf {
@@ -391,15 +516,15 @@ func (p *pager) commit() error {
 
 	p.savepoints = p.savepoints[:0]
 	clear(p.writePages)
-	p.state = pagerOpen
+	p.state.Store(int32(pagerOpen))
 	p.wal.endWrite()
 
-	return nil
+	return nFrame, nil
 }
 
 // rollback discards all changes in the current write transaction.
 func (p *pager) rollback() error {
-	if p.state != pagerWriter {
+	if pagerState(p.state.Load()) != pagerWriter {
 		return nil
 	}
 
@@ -411,7 +536,7 @@ func (p *pager) rollback() error {
 
 	p.savepoints = p.savepoints[:0]
 	clear(p.writePages)
-	p.state = pagerOpen
+	p.state.Store(int32(pagerOpen))
 	p.wal.endWrite()
 	return nil
 }
@@ -419,7 +544,7 @@ func (p *pager) rollback() error {
 // savepoint creates a new savepoint and returns its ID.
 // Page copies are saved lazily in getWritablePage when pages are actually modified.
 func (p *pager) savepoint() (int, error) {
-	if p.state != pagerWriter {
+	if pagerState(p.state.Load()) != pagerWriter {
 		return 0, ErrReadOnly
 	}
 
@@ -435,7 +560,7 @@ func (p *pager) savepoint() (int, error) {
 
 // rollbackToSavepoint rolls back to the given savepoint, restoring pages.
 func (p *pager) rollbackToSavepoint(id int) error {
-	if p.state != pagerWriter {
+	if pagerState(p.state.Load()) != pagerWriter {
 		return ErrReadOnly
 	}
 	if id < 0 || id >= len(p.savepoints) {
@@ -482,7 +607,7 @@ func (p *pager) rollbackToSavepoint(id int) error {
 // releaseSavepoint releases a savepoint and all savepoints above it,
 // merging their changes into the parent savepoint (or transaction).
 func (p *pager) releaseSavepoint(id int) error {
-	if p.state != pagerWriter {
+	if pagerState(p.state.Load()) != pagerWriter {
 		return ErrReadOnly
 	}
 	if id < 0 || id >= len(p.savepoints) {
@@ -506,19 +631,99 @@ func (p *pager) releaseSavepoint(id int) error {
 }
 
 // checkpoint runs a WAL checkpoint.
+// Does NOT take pager.mu.Lock — readers can continue during checkpoint.
+// The WAL checkpoint internally acquires lockWrite (blocks new writers)
+// and uses mxSafeFrame to avoid interfering with active readers.
 func (p *pager) checkpoint() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	return p.wal.checkpoint(p.file)
 }
 
-// tryCheckpoint attempts a checkpoint without blocking.
+// tryCheckpoint attempts a checkpoint. Unlike the old version, this no longer
+// needs TryLock on pager.mu since checkpoint doesn't block readers.
 func (p *pager) tryCheckpoint() error {
-	if !p.mu.TryLock() {
-		return nil
-	}
-	defer p.mu.Unlock()
 	return p.wal.checkpoint(p.file)
+}
+
+// writeOverflowChain writes data to a chain of overflow pages and returns
+// the first page number in the chain.
+func (p *pager) writeOverflowChain(data []byte) (uint32, error) {
+	if pagerState(p.state.Load()) != pagerWriter {
+		return 0, ErrReadOnly
+	}
+
+	usable := overflowPageUsable(int(p.pageSize))
+	var firstPgno uint32
+	var prevPg *page
+
+	for len(data) > 0 {
+		pg, err := p.allocatePage()
+		if err != nil {
+			return 0, err
+		}
+		if firstPgno == 0 {
+			firstPgno = pg.pgno
+		}
+		if prevPg != nil {
+			// Set next pointer on previous page
+			binary.BigEndian.PutUint32(prevPg.data[0:4], pg.pgno)
+			p.releasePage(prevPg)
+		}
+
+		// Write next pointer (0 = last page for now) and data
+		binary.BigEndian.PutUint32(pg.data[0:4], 0)
+		chunk := usable
+		if chunk > len(data) {
+			chunk = len(data)
+		}
+		copy(pg.data[4:4+chunk], data[:chunk])
+		data = data[chunk:]
+		prevPg = pg
+	}
+	if prevPg != nil {
+		p.releasePage(prevPg)
+	}
+	return firstPgno, nil
+}
+
+// readOverflowChain reads data from a chain of overflow pages into buf.
+func (p *pager) readOverflowChain(firstPgno uint32, buf []byte) error {
+	usable := overflowPageUsable(int(p.pageSize))
+	pgno := firstPgno
+	off := 0
+
+	for pgno != 0 && off < len(buf) {
+		pg, err := p.getPage(pgno)
+		if err != nil {
+			return err
+		}
+		chunk := usable
+		if chunk > len(buf)-off {
+			chunk = len(buf) - off
+		}
+		copy(buf[off:off+chunk], pg.data[4:4+chunk])
+		pgno = binary.BigEndian.Uint32(pg.data[0:4])
+		p.releasePage(pg)
+		off += chunk
+	}
+	return nil
+}
+
+// freeOverflowChain frees all pages in an overflow chain.
+func (p *pager) freeOverflowChain(firstPgno uint32) error {
+	pgno := firstPgno
+	for pgno != 0 {
+		pg, err := p.getPage(pgno)
+		if err != nil {
+			return err
+		}
+		nextPgno := binary.BigEndian.Uint32(pg.data[0:4])
+		p.releasePage(pg)
+		if err := p.freePage(pgno); err != nil {
+			return err
+		}
+		pgno = nextPgno
+	}
+	return nil
 }
 
 // close closes the pager, WAL, and database file.

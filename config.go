@@ -12,6 +12,11 @@ type Config struct {
 	// default value is 2MiB
 	SyncPoolElementMaxSize int
 
+	// NoSync skips fsync on WAL commit (like SQLite synchronous=NORMAL in WAL mode).
+	// Data is still durable at checkpoint time. Reduces write latency at the cost
+	// of losing the last committed transaction(s) on power loss.
+	NoSync bool
+
 	// DurabilityConfig provides configuration for crash recovery and idle auto-flush
 	Durability DurabilityConfig
 }
