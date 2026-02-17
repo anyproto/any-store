@@ -10,6 +10,12 @@ import (
 	"unsafe"
 )
 
+// shmDMSOffset is the byte offset of the "dead man switch" (DMS) lock in the
+// SHM file. Each open connection holds a shared lock on this byte. On close,
+// we try to acquire an exclusive lock: if successful, we're the last connection
+// and can safely delete the SHM file. This matches SQLite's UNIX_SHM_DMS pattern.
+const shmDMSOffset = 120 + int64(lockSlotCount) // right after the per-slot lock bytes
+
 // mmapShm implements the shm interface using mmap on a .shm file.
 // This enables multi-process access to the WAL index, matching SQLite's approach.
 type mmapShm struct {
@@ -20,17 +26,28 @@ type mmapShm struct {
 }
 
 // newPlatformShm creates a new mmap-backed shm.
+// Acquires a shared DMS lock to track that this connection is using the SHM file.
 func newPlatformShm(path string) (shm, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		return nil, fmt.Errorf("btree: open shm file: %w", err)
 	}
 
-	return &mmapShm{
+	s := &mmapShm{
 		file:    f,
 		path:    path,
 		regions: make([][]byte, 0, shmMaxRegions),
-	}, nil
+	}
+
+	// Acquire a shared DMS lock. All open connections hold this lock.
+	// On close, we try to upgrade to exclusive: if successful, we're the last
+	// connection and can safely delete the SHM file.
+	if err := s.fcntlLock(syscall.F_RDLCK, shmDMSOffset); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("btree: acquire DMS lock: %w", err)
+	}
+
+	return s, nil
 }
 
 func (s *mmapShm) region(index int, create bool) ([]byte, error) {
@@ -138,13 +155,28 @@ func (s *mmapShm) close() error {
 		}
 	}
 
+	// Determine if we're the last connection by trying to acquire an exclusive
+	// DMS lock. If successful, no other process holds the SHM file open, so we
+	// can safely delete it. This matches SQLite's unixShmUnmap() behavior.
+	//
+	// We must do this BEFORE closing the file descriptor, since closing the fd
+	// releases all our fcntl locks.
+	deleteFile := false
+	if s.file != nil {
+		// Try to upgrade our shared DMS lock to exclusive.
+		if err := s.fcntlLock(syscall.F_WRLCK, shmDMSOffset); err == nil {
+			deleteFile = true
+		}
+	}
+
 	var err error
 	if s.file != nil {
 		err = s.file.Close()
 		s.file = nil
 	}
 
-	// Remove the shm file on close (like SQLite does).
-	_ = os.Remove(s.path)
+	if deleteFile {
+		_ = os.Remove(s.path)
+	}
 	return err
 }

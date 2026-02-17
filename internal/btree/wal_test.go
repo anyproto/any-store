@@ -345,20 +345,24 @@ func TestWALIndexWriteHeader(t *testing.T) {
 	require.NoError(t, err)
 	defer idx.close()
 
+	idx.nBackfill = 5
 	require.NoError(t, idx.writeHeader(10, 20, 5))
+	idx.shmWriteCkptInfo()
 
 	// Read back from shm region 0
 	region, err := idx.shm.region(0, false)
 	require.NoError(t, err)
 
-	assert.Equal(t, uint32(10), binary.LittleEndian.Uint32(region[0:4]))
-	assert.Equal(t, uint32(20), binary.LittleEndian.Uint32(region[4:8]))
-	assert.Equal(t, uint32(5), binary.LittleEndian.Uint32(region[8:12]))
+	// WalIndexHdr copy 1: mxFrame at offset 16, nPage at offset 20
+	assert.Equal(t, uint32(10), binary.LittleEndian.Uint32(region[16:20]))
+	assert.Equal(t, uint32(20), binary.LittleEndian.Uint32(region[20:24]))
 
-	// Second copy
-	assert.Equal(t, uint32(10), binary.LittleEndian.Uint32(region[48:52]))
-	assert.Equal(t, uint32(20), binary.LittleEndian.Uint32(region[52:56]))
-	assert.Equal(t, uint32(5), binary.LittleEndian.Uint32(region[56:60]))
+	// WalIndexHdr copy 2: starts at offset 48
+	assert.Equal(t, uint32(10), binary.LittleEndian.Uint32(region[64:68]))
+	assert.Equal(t, uint32(20), binary.LittleEndian.Uint32(region[68:72]))
+
+	// nBackfill is in checkpoint info area at offset 96
+	assert.Equal(t, uint32(5), binary.LittleEndian.Uint32(region[96:100]))
 }
 
 func TestWALCheckpointEmpty(t *testing.T) {

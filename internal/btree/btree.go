@@ -24,6 +24,11 @@ func (bt *btree) getPage(pgno uint32) (*page, error) {
 	return bt.pager.getPage(pgno)
 }
 
+// usablePageSize returns the usable page size, accounting for reserved space.
+func (bt *btree) usablePageSize() int {
+	return int(bt.pager.pageSize) - int(bt.pager.header.ReservedSpace)
+}
+
 // cellData represents a parsed cell from a B-tree page.
 type cellData struct {
 	key        []byte
@@ -256,7 +261,7 @@ func (bt *btree) Get(key []byte) ([]byte, error) {
 	}
 	defer bt.pager.releasePage(pg)
 
-	usableSize := int(bt.pager.pageSize)
+	usableSize := bt.usablePageSize()
 	for {
 		if pg.header.isLeaf() {
 			idx, found := searchLeafPage(pg, key)
@@ -273,7 +278,7 @@ func (bt *btree) Get(key []byte) ([]byte, error) {
 				valLen, _ := getVarint(pg.data[pos:])
 				fullVal := make([]byte, int(valLen))
 				copy(fullVal, cell.value)
-				if err := bt.pager.readOverflowChain(cell.overflowPg, fullVal[len(cell.value):]); err != nil {
+				if err := bt.pager.readOverflowChainAt(cell.overflowPg, fullVal[len(cell.value):], bt.walMaxFrame); err != nil {
 					return nil, err
 				}
 				return fullVal, nil
@@ -303,8 +308,30 @@ func (bt *btree) Has(key []byte) (bool, error) {
 	return true, nil
 }
 
+// maxInteriorKeySize returns the maximum key size that can fit in an interior
+// cell without overflow. Our implementation does not support overflow for
+// interior cells or keys, so keys must be small enough to fit entirely on-page.
+// The limit is based on the usable page size: we need the interior cell
+// (4-byte child ptr + varint keyLen + key) plus a 2-byte cell pointer to fit
+// within the page, leaving room for the 12-byte interior header.
+func maxInteriorKeySize(usableSize int) int {
+	// An interior page has a 12-byte header. Each cell needs a 2-byte pointer.
+	// Cell content: 4 (leftChild) + varint(keyLen) + keyLen.
+	// For safety, limit key size to maxLocalPayload which is the overflow
+	// threshold for index btrees. This ensures the key never needs overflow
+	// in either leaf or interior cells.
+	return maxLocalPayload(usableSize)
+}
+
 // Put inserts or updates a key-value pair in the B-tree.
 func (bt *btree) Put(key, value []byte) error {
+	// Validate key size: keys must fit in interior cells without overflow.
+	// Our implementation does not support key overflow or interior cell overflow.
+	pageUsable := bt.usablePageSize()
+	if len(key) > maxInteriorKeySize(pageUsable) {
+		return ErrKeyTooLarge
+	}
+
 	// Descend through interior pages with read-only access to find the leaf.
 	// Only the leaf page (and parents on split) are dirtied, avoiding
 	// unnecessary page copies for the common non-split case.
@@ -355,7 +382,7 @@ func (bt *btree) insertIntoLeafWithPath(pg *page, key, value []byte, path []uint
 		return bt.updateLeafCell(pg, idx, key, value)
 	}
 
-	pageUsable := int(bt.pager.pageSize)
+	pageUsable := bt.usablePageSize()
 	cellSize := leafCellSizeWithOverflow(key, value, pageUsable)
 
 	hdrSize := pg.cellPointerOffset() + int(pg.header.cellCount+1)*2
@@ -377,7 +404,7 @@ func (bt *btree) insertIntoLeafWithPath(pg *page, key, value []byte, path []uint
 func (bt *btree) insertIntoLeaf(pg *page, key, value []byte) error {
 	idx, found := searchLeafPage(pg, key)
 
-	pageUsable := int(bt.pager.pageSize)
+	pageUsable := bt.usablePageSize()
 	cellSize := leafCellSizeWithOverflow(key, value, pageUsable)
 
 	if found {
@@ -404,7 +431,7 @@ func (bt *btree) insertIntoLeaf(pg *page, key, value []byte) error {
 // insertLeafCellAt inserts a cell at position idx in a leaf page.
 // Returns an error if overflow pages need to be allocated and allocation fails.
 func (bt *btree) insertLeafCellAt(pg *page, idx int, key, value []byte) error {
-	pageUsable := int(bt.pager.pageSize)
+	pageUsable := bt.usablePageSize()
 	totalPayload := len(key) + len(value)
 	maxLocal := maxLocalPayload(pageUsable)
 
@@ -470,7 +497,7 @@ func (bt *btree) insertLeafCellAt(pg *page, idx int, key, value []byte) error {
 
 // updateLeafCell updates an existing leaf cell in place or by delete+insert.
 func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte) error {
-	usableSize := int(bt.pager.pageSize)
+	usableSize := bt.usablePageSize()
 
 	// Free old overflow pages if the existing cell has them
 	off := pg.getCellOffset(idx)
@@ -493,7 +520,7 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte) error {
 func (bt *btree) collectLeafCells(pg *page) []cellData {
 	n := int(pg.header.cellCount)
 	cells := make([]cellData, n)
-	usableSize := int(bt.pager.pageSize)
+	usableSize := bt.usablePageSize()
 	// Estimate actual content size from page header to avoid over-allocation.
 	contentOff := int(pg.header.cellContentOff)
 	if contentOff == 0 {
@@ -519,7 +546,7 @@ func (bt *btree) collectLeafCells(pg *page) []cellData {
 			copy(fullVal, cells[i].value) // local portion
 			overflowSize := int(valLen) - len(cells[i].value)
 			if overflowSize > 0 {
-				_ = bt.pager.readOverflowChain(cells[i].overflowPg, fullVal[len(cells[i].value):])
+				_ = bt.pager.readOverflowChainAt(cells[i].overflowPg, fullVal[len(cells[i].value):], bt.walMaxFrame)
 			}
 			cells[i].key = buf[kStart:len(buf)]
 			cells[i].value = fullVal
@@ -539,11 +566,12 @@ func (bt *btree) collectLeafCells(pg *page) []cellData {
 func (bt *btree) collectInteriorCells(pg *page) []cellData {
 	n := int(pg.header.cellCount)
 	cells := make([]cellData, n)
+	usable := bt.usablePageSize()
 	contentOff := int(pg.header.cellContentOff)
 	if contentOff == 0 {
-		contentOff = int(bt.pager.pageSize)
+		contentOff = usable
 	}
-	contentSize := int(bt.pager.pageSize) - contentOff
+	contentSize := usable - contentOff
 	buf := make([]byte, 0, contentSize)
 	for i := range n {
 		off := pg.getCellOffset(i)
@@ -558,7 +586,7 @@ func (bt *btree) collectInteriorCells(pg *page) []cellData {
 // rebuildLeafPage rewrites a leaf page from a list of cells.
 // Cells with large values will have overflow chains written automatically.
 func (bt *btree) rebuildLeafPage(pg *page, cells []cellData) error {
-	pageUsable := int(bt.pager.pageSize)
+	pageUsable := bt.usablePageSize()
 	hdrOff := 0
 	if pg.pgno == 1 {
 		hdrOff = dbHeaderSize
@@ -618,7 +646,7 @@ func (bt *btree) rebuildLeafPage(pg *page, cells []cellData) error {
 
 // rebuildInteriorPage rewrites an interior page from cells and a right child.
 func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint32) {
-	pageUsable := int(bt.pager.pageSize)
+	pageUsable := bt.usablePageSize()
 	hdrOff := 0
 	if pg.pgno == 1 {
 		hdrOff = dbHeaderSize
@@ -698,6 +726,39 @@ func (bt *btree) insertIntoParentWithPath(leftPg *page, key []byte, rightPgno ui
 		return err
 	}
 
+	return bt.insertSepIntoInterior(parentPg, leftPg.pgno, key, rightPgno, parentPath)
+}
+
+// insertSepIntoAncestor inserts a separator key into an ancestor page identified
+// by leftPgno. Unlike insertIntoParentWithPath, this takes a page number instead
+// of a page pointer, avoiding use-after-release issues during recursive splits.
+func (bt *btree) insertSepIntoAncestor(leftPgno uint32, key []byte, rightPgno uint32, path []uint32) error {
+	if leftPgno == bt.rootPage || len(path) == 0 {
+		// Need to split the root. Re-acquire as writable.
+		wpg, err := bt.pager.getWritablePage(leftPgno)
+		if err != nil {
+			return err
+		}
+		err = bt.splitRoot(wpg, key, rightPgno)
+		bt.pager.releasePage(wpg)
+		return err
+	}
+
+	// Get the parent page (last element of path) as writable
+	parentPgno := path[len(path)-1]
+	parentPath := path[:len(path)-1]
+
+	parentPg, err := bt.pager.getWritablePage(parentPgno)
+	if err != nil {
+		return err
+	}
+
+	return bt.insertSepIntoInterior(parentPg, leftPgno, key, rightPgno, parentPath)
+}
+
+// insertSepIntoInterior inserts a separator key into an interior page.
+// This is the core logic shared by insertIntoParentWithPath and insertSepIntoAncestor.
+func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []byte, rightPgno uint32, parentPath []uint32) error {
 	// Insert separator into parent interior page
 	n := int(parentPg.header.cellCount)
 	cpOff := parentPg.cellPointerOffset()
@@ -715,7 +776,7 @@ func (bt *btree) insertIntoParentWithPath(leftPg *page, key []byte, rightPgno ui
 	}
 
 	cellSize := interiorCellSize(key)
-	pageUsable := int(bt.pager.pageSize)
+	pageUsable := bt.usablePageSize()
 	hdrSize := cpOff + (n+1)*2
 	contentStart := int(parentPg.header.cellContentOff)
 	if contentStart == 0 {
@@ -726,29 +787,20 @@ func (bt *btree) insertIntoParentWithPath(leftPg *page, key []byte, rightPgno ui
 	if cellSize+2 <= freeSpace {
 		// Insert cell into parent in-place
 		newContentStart := contentStart - cellSize
-		writeInteriorCell(parentPg.data[newContentStart:], leftPg.pgno, key)
+		writeInteriorCell(parentPg.data[newContentStart:], leftPgno, key)
 
-		// Update the cell that previously pointed to leftPg to now point
-		// to rightPgno via the rightChild update
 		// Shift cell pointers
 		for i := n; i > insertIdx; i-- {
 			parentPg.setCellOffset(i, parentPg.getCellOffset(i-1))
 		}
 		parentPg.setCellOffset(insertIdx, uint16(newContentStart))
 
-		// The rightChild of the new cell's right side:
-		// If insertIdx < n, the old cell at insertIdx had leftChild pointing somewhere.
-		// The new cell's leftChild = leftPg.pgno (the left split page).
-		// The right side of the separator goes to rightPgno.
-		// We need to update: if insertIdx == n, rightChild stays; otherwise
-		// the cell at insertIdx+1's leftChild becomes rightPgno.
 		if insertIdx < n {
 			// The cell now at insertIdx+1 should have its leftChild set to rightPgno
 			off := int(parentPg.getCellOffset(insertIdx + 1))
 			binary.BigEndian.PutUint32(parentPg.data[off:off+4], rightPgno)
 		} else {
 			// Separator goes at the end, rightChild becomes rightPgno
-			// and old rightChild was what the leftPg's child was
 			parentPg.header.rightChild = rightPgno
 		}
 
@@ -763,12 +815,19 @@ func (bt *btree) insertIntoParentWithPath(leftPg *page, key []byte, rightPgno ui
 		return nil
 	}
 
-	// Parent is full — need to split it too
+	// Parent is full — split it
 	cells := bt.collectInteriorCells(parentPg)
-	newCell := cellData{leftChild: leftPg.pgno, key: bytes.Clone(key)}
+	origRightChild := parentPg.header.rightChild
+	origCellCount := len(cells)
 
-	// Insert the new cell and fix child pointers
-	cells = append(cells[:insertIdx], append([]cellData{newCell}, cells[insertIdx:]...)...)
+	newCell := cellData{leftChild: leftPgno, key: bytes.Clone(key)}
+
+	expanded := make([]cellData, 0, len(cells)+1)
+	expanded = append(expanded, cells[:insertIdx]...)
+	expanded = append(expanded, newCell)
+	expanded = append(expanded, cells[insertIdx:]...)
+	cells = expanded
+
 	if insertIdx < len(cells)-1 {
 		cells[insertIdx+1].leftChild = rightPgno
 	}
@@ -776,15 +835,13 @@ func (bt *btree) insertIntoParentWithPath(leftPg *page, key []byte, rightPgno ui
 	midIdx := len(cells) / 2
 	leftCells := cells[:midIdx]
 	sepCellKey := bytes.Clone(cells[midIdx].key)
-	rightChildOfSep := cells[midIdx].leftChild
-	_ = rightChildOfSep
 	rightCells := cells[midIdx+1:]
 
-	var rc uint32
-	if insertIdx >= len(cells)-1 {
-		rc = rightPgno
+	var newRightChildForRightPg uint32
+	if insertIdx == origCellCount {
+		newRightChildForRightPg = rightPgno
 	} else {
-		rc = parentPg.header.rightChild
+		newRightChildForRightPg = origRightChild
 	}
 
 	newRightPg, err := bt.pager.allocatePage()
@@ -794,11 +851,15 @@ func (bt *btree) insertIntoParentWithPath(leftPg *page, key []byte, rightPgno ui
 	}
 
 	bt.rebuildInteriorPage(parentPg, leftCells, cells[midIdx].leftChild)
-	bt.rebuildInteriorPage(newRightPg, rightCells, rc)
+	bt.rebuildInteriorPage(newRightPg, rightCells, newRightChildForRightPg)
+
+	newRightPgno := newRightPg.pgno
 	bt.pager.releasePage(newRightPg)
+
+	parentPgno := parentPg.pgno
 	bt.pager.releasePage(parentPg)
 
-	return bt.insertIntoParentWithPath(parentPg, sepCellKey, newRightPg.pgno, parentPath)
+	return bt.insertSepIntoAncestor(parentPgno, sepCellKey, newRightPgno, parentPath)
 }
 
 // splitLeafAndInsert splits a leaf page and inserts the new key-value pair.
@@ -841,19 +902,54 @@ func (bt *btree) splitLeafAndInsert(pg *page, idx int, key, value []byte) error 
 
 // insertIntoParent inserts a separator key into the parent of leftPg.
 // If leftPg is the root, a new root is created.
+// For non-root pages, we find the parent by traversing from the root.
 func (bt *btree) insertIntoParent(leftPg *page, key []byte, rightPgno uint32) error {
 	if leftPg.pgno == bt.rootPage {
 		return bt.splitRoot(leftPg, key, rightPgno)
 	}
 
-	// For simplicity, we track parent via a path. In this implementation,
-	// we create a new root if the current page is the root.
-	// For non-root splits, we need to find the parent.
-	// This is handled by the recursive insert approach.
+	// Build path from root to leftPg's parent by traversing the tree.
+	// We need the path so that if the parent itself needs to split,
+	// we can propagate upward.
+	var pathBuf [8]uint32
+	path := pathBuf[:0]
+	pg, err := bt.getPage(bt.rootPage)
+	if err != nil {
+		return err
+	}
+	// Use the separator key to navigate to the parent of leftPg.
+	for pg.header.isInterior() {
+		childPgno, _ := searchInteriorPage(pg, key)
+		if childPgno == leftPg.pgno {
+			// Found: pg is the parent of leftPg
+			path = append(path, pg.pgno)
+			bt.pager.releasePage(pg)
+			return bt.insertIntoParentWithPath(leftPg, key, rightPgno, path)
+		}
+		// Check if leftPg is the rightChild
+		if pg.header.rightChild == leftPg.pgno {
+			path = append(path, pg.pgno)
+			bt.pager.releasePage(pg)
+			return bt.insertIntoParentWithPath(leftPg, key, rightPgno, path)
+		}
+		path = append(path, pg.pgno)
+		bt.pager.releasePage(pg)
+		pg, err = bt.getPage(childPgno)
+		if err != nil {
+			return err
+		}
+	}
+	bt.pager.releasePage(pg)
+
+	// Should not reach here if the tree is consistent; fall back to splitRoot
+	// as a safety net.
 	return bt.splitRoot(leftPg, key, rightPgno)
 }
 
 // splitRoot creates a new root page when the current root splits.
+// Modeled after SQLite's balance_deeper(): copies root content to a new child
+// page, then converts the root into an interior page pointing to the new child
+// and the right sibling. Handles both leaf and interior roots correctly.
 func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) error {
 	// Allocate a new page for the old root's content
 	newLeftPg, err := bt.pager.allocatePage()
@@ -861,16 +957,22 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 		return err
 	}
 
-	// Copy old root content to new left page
-	copy(newLeftPg.data, oldRoot.data)
-	if oldRoot.pgno == 1 {
-		// Clear DB header area in the new page (it's not page 1)
+	// Copy old root content to new left page.
+	// Detect whether the root is a leaf or interior page and use the
+	// appropriate collect/rebuild path so we don't misinterpret cell formats.
+	if oldRoot.header.isLeaf() {
+		// Leaf root: collect leaf cells and rebuild as leaf in the new page.
+		cells := bt.collectLeafCells(oldRoot)
 		newLeftPg.header = oldRoot.header
-		if err := bt.rebuildLeafPage(newLeftPg, bt.collectLeafCells(oldRoot)); err != nil {
+		if err := bt.rebuildLeafPage(newLeftPg, cells); err != nil {
 			return err
 		}
 	} else {
+		// Interior root: collect interior cells and rebuild as interior in the
+		// new page, preserving the rightChild pointer.
+		cells := bt.collectInteriorCells(oldRoot)
 		newLeftPg.header = oldRoot.header
+		bt.rebuildInteriorPage(newLeftPg, cells, oldRoot.header.rightChild)
 	}
 
 	bt.pager.releasePage(newLeftPg)
@@ -943,10 +1045,16 @@ func (bt *btree) Delete(key []byte) error {
 		return ErrKeyNotFound
 	}
 
-	// Free overflow pages if this cell has them
-	usableSize := int(bt.pager.pageSize)
+	// Collect ALL cells first (reading overflow data) BEFORE freeing anything.
+	// This avoids reading from already-freed overflow pages.
+	usableSize := bt.usablePageSize()
 	off := wpg.getCellOffset(idx)
 	oldCell, _ := parseLeafCellWithSize(wpg.data, int(off), usableSize)
+
+	cells := bt.collectLeafCells(wpg)
+
+	// Now free overflow pages for the deleted cell (after collectLeafCells has
+	// already read the full value from overflow).
 	if oldCell.overflowPg != 0 {
 		if err := bt.pager.freeOverflowChain(oldCell.overflowPg); err != nil {
 			bt.pager.releasePage(wpg)
@@ -954,7 +1062,6 @@ func (bt *btree) Delete(key []byte) error {
 		}
 	}
 
-	cells := bt.collectLeafCells(wpg)
 	cells = append(cells[:idx], cells[idx+1:]...)
 	if err := bt.rebuildLeafPage(wpg, cells); err != nil {
 		bt.pager.releasePage(wpg)
@@ -976,12 +1083,13 @@ func (bt *btree) Delete(key []byte) error {
 
 // leafUsedSpace returns the approximate used space on a leaf page.
 func (bt *btree) leafUsedSpace(pg *page) int {
+	usable := bt.usablePageSize()
 	contentOff := int(pg.header.cellContentOff)
 	if contentOff == 0 {
-		contentOff = int(bt.pager.pageSize)
+		contentOff = usable
 	}
 	cellPtrEnd := pg.cellPointerOffset() + int(pg.header.cellCount)*2
-	return cellPtrEnd + (int(bt.pager.pageSize) - contentOff)
+	return cellPtrEnd + (usable - contentOff)
 }
 
 // tryMergeLeaf attempts to merge a leaf page with a sibling.
@@ -1070,7 +1178,7 @@ func (bt *btree) tryMergeLeaf(leafPgno uint32, path []uint32) error {
 	}
 
 	// Check if merged content fits in one page
-	usableSize := int(bt.pager.pageSize)
+	usableSize := bt.usablePageSize()
 	totalSize := 8 // leaf header
 	for _, c := range allCells {
 		totalSize += leafCellSizeWithOverflow(c.key, c.value, usableSize) + 2
@@ -1362,7 +1470,7 @@ func (c *Cursor) Key() ([]byte, error) {
 	defer c.bt.pager.releasePage(pg)
 
 	off := pg.getCellOffset(frame.cellIdx)
-	cell, _ := parseLeafCellWithSize(pg.data, int(off), int(c.bt.pager.pageSize))
+	cell, _ := parseLeafCellWithSize(pg.data, int(off), c.bt.usablePageSize())
 	return cell.key, nil
 }
 
@@ -1382,7 +1490,7 @@ func (c *Cursor) Value() ([]byte, error) {
 	}
 	defer c.bt.pager.releasePage(pg)
 
-	usableSize := int(c.bt.pager.pageSize)
+	usableSize := c.bt.usablePageSize()
 	off := pg.getCellOffset(frame.cellIdx)
 	cell, _ := parseLeafCellWithSize(pg.data, int(off), usableSize)
 
@@ -1397,7 +1505,7 @@ func (c *Cursor) Value() ([]byte, error) {
 		copy(fullVal, cell.value) // local portion
 		overflowSize := int(valLen) - len(cell.value)
 		if overflowSize > 0 {
-			if err := c.bt.pager.readOverflowChain(cell.overflowPg, fullVal[len(cell.value):]); err != nil {
+			if err := c.bt.pager.readOverflowChainAt(cell.overflowPg, fullVal[len(cell.value):], c.bt.walMaxFrame); err != nil {
 				return nil, err
 			}
 		}
@@ -1473,6 +1581,99 @@ func (c *Cursor) Next() error {
 
 		if childPg.header.cellCount > 0 {
 			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: 0})
+			c.valid = true
+			c.bt.pager.releasePage(childPg)
+			return nil
+		}
+		c.bt.pager.releasePage(childPg)
+	}
+
+	c.valid = false
+	return nil
+}
+
+// Previous moves the cursor to the previous key in order.
+// Modeled after sqlite3BtreePrevious / btreePrevious in btree.c.
+// The logic mirrors Next() but in reverse: on a leaf we decrement the cell
+// index; on an interior page we descend into the previous child's rightmost
+// leaf.
+func (c *Cursor) Previous() error {
+	if !c.valid && len(c.stack) == 0 {
+		return nil
+	}
+
+	for len(c.stack) > 0 {
+		frame := &c.stack[len(c.stack)-1]
+
+		pg, err := c.bt.getPage(frame.pgno)
+		if err != nil {
+			return err
+		}
+
+		if pg.header.isLeaf() {
+			frame.cellIdx--
+			if frame.cellIdx >= 0 {
+				c.valid = true
+				c.bt.pager.releasePage(pg)
+				return nil
+			}
+			// Past the beginning of this leaf — pop and go up
+			c.bt.pager.releasePage(pg)
+			c.stack = c.stack[:len(c.stack)-1]
+			continue
+		}
+
+		// Interior page: descend to the previous child's rightmost leaf.
+		// frame.cellIdx tracks which child subtree we just exhausted.
+		// Decrement to find the previous child.
+		frame.cellIdx--
+		if frame.cellIdx < 0 {
+			// No more children to the left at this interior level — pop up
+			c.bt.pager.releasePage(pg)
+			c.stack = c.stack[:len(c.stack)-1]
+			continue
+		}
+
+		// Get the child page at the (decremented) cellIdx position.
+		var childPgno uint32
+		if frame.cellIdx < int(pg.header.cellCount) {
+			off := pg.getCellOffset(frame.cellIdx)
+			cell, _ := parseInteriorCell(pg.data, int(off))
+			childPgno = cell.leftChild
+		} else if frame.cellIdx == int(pg.header.cellCount) {
+			childPgno = pg.header.rightChild
+		} else {
+			c.bt.pager.releasePage(pg)
+			c.stack = c.stack[:len(c.stack)-1]
+			continue
+		}
+
+		c.bt.pager.releasePage(pg)
+
+		// Descend to the rightmost leaf of this child subtree
+		childPg, err := c.bt.getPage(childPgno)
+		if err != nil {
+			return err
+		}
+		for childPg.header.isInterior() {
+			n := int(childPg.header.cellCount)
+			if n == 0 {
+				break
+			}
+			// Push frame pointing to the rightChild position (cellIdx = n)
+			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: n})
+			nextPgno := childPg.header.rightChild
+			c.bt.pager.releasePage(childPg)
+			childPg, err = c.bt.getPage(nextPgno)
+			if err != nil {
+				return err
+			}
+		}
+
+		n := int(childPg.header.cellCount)
+		if n > 0 {
+			// Position at the last cell of this leaf
+			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: n - 1})
 			c.valid = true
 			c.bt.pager.releasePage(childPg)
 			return nil

@@ -106,9 +106,11 @@ func minLocalPayload(usableSize int) int {
 	return ((usableSize - 12) * 32 / 255) - 23
 }
 
-// overflowPageUsable returns the usable space per overflow page (pageSize - 4 byte next ptr).
-func overflowPageUsable(pageSize int) int {
-	return pageSize - 4
+// overflowPageUsable returns the usable space per overflow page (usableSize - 4 byte next ptr).
+// In SQLite, overflow pages also respect reserved space: ovflPageSize = usableSize - 4.
+// Callers must pass usableSize (pageSize - reservedSpace), NOT raw pageSize.
+func overflowPageUsable(usableSize int) int {
+	return usableSize - 4
 }
 
 // localPayloadSize computes how many bytes of payload are stored locally

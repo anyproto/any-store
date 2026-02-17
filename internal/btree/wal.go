@@ -45,7 +45,9 @@ import (
 	"math/bits"
 	"math/rand/v2"
 	"os"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -157,52 +159,172 @@ func (wf *walFrame) deserialize(buf []byte) {
 }
 
 // walChecksum computes the WAL checksum over 32-bit big-endian words.
+// Matches SQLite's walChecksumBytes() paired-word recurrence:
+//
+//	s1 += x[i]   + s2;
+//	s2 += x[i+1] + s1;
+//
+// Data is interpreted as big-endian 32-bit words (since our walMagic has the
+// big-endian checksum bit set), processed in pairs. The input length must be
+// a multiple of 8 bytes.
+//
 // Uses unsafe pointer arithmetic to eliminate bounds checking in the hot loop.
 func walChecksum(data []byte, s1, s2 uint32) (uint32, uint32) {
-	if len(data) < 4 {
+	if len(data) < 8 {
 		return s1, s2
 	}
 	n := len(data) / 4
 	p := unsafe.Pointer(&data[0])
 	i := 0
-	// Unrolled 8x for throughput
+	// Unrolled 8x (4 pairs) for throughput
 	for ; i+7 < n; i += 8 {
 		base := unsafe.Add(p, uintptr(i)*4)
 		w0 := bits.ReverseBytes32(*(*uint32)(base))
-		s1 += w0 + s2
-		s2 += s1
 		w1 := bits.ReverseBytes32(*(*uint32)(unsafe.Add(base, 4)))
-		s1 += w1 + s2
-		s2 += s1
+		s1 += w0 + s2
+		s2 += w1 + s1
+
 		w2 := bits.ReverseBytes32(*(*uint32)(unsafe.Add(base, 8)))
-		s1 += w2 + s2
-		s2 += s1
 		w3 := bits.ReverseBytes32(*(*uint32)(unsafe.Add(base, 12)))
-		s1 += w3 + s2
-		s2 += s1
+		s1 += w2 + s2
+		s2 += w3 + s1
+
 		w4 := bits.ReverseBytes32(*(*uint32)(unsafe.Add(base, 16)))
-		s1 += w4 + s2
-		s2 += s1
 		w5 := bits.ReverseBytes32(*(*uint32)(unsafe.Add(base, 20)))
-		s1 += w5 + s2
-		s2 += s1
+		s1 += w4 + s2
+		s2 += w5 + s1
+
 		w6 := bits.ReverseBytes32(*(*uint32)(unsafe.Add(base, 24)))
-		s1 += w6 + s2
-		s2 += s1
 		w7 := bits.ReverseBytes32(*(*uint32)(unsafe.Add(base, 28)))
-		s1 += w7 + s2
-		s2 += s1
+		s1 += w6 + s2
+		s2 += w7 + s1
 	}
-	for ; i < n; i++ {
-		w := bits.ReverseBytes32(*(*uint32)(unsafe.Add(p, uintptr(i)*4)))
-		s1 += w + s2
-		s2 += s1
+	// Handle remaining pairs (n is always even since len is multiple of 8)
+	for ; i+1 < n; i += 2 {
+		w0 := bits.ReverseBytes32(*(*uint32)(unsafe.Add(p, uintptr(i)*4)))
+		w1 := bits.ReverseBytes32(*(*uint32)(unsafe.Add(p, uintptr(i+1)*4)))
+		s1 += w0 + s2
+		s2 += w1 + s1
 	}
 	return s1, s2
 }
 
 // readMarkNotUsed is the sentinel value for an unused read mark slot.
 const readMarkNotUsed = uint32(0xFFFFFFFF)
+
+// walIndexHdrSize is the size of one WalIndexHdr in the SHM (48 bytes),
+// matching SQLite's struct WalIndexHdr.
+const walIndexHdrSize = 48
+
+// WalIndexHdr mirrors SQLite's WalIndexHdr struct (48 bytes).
+// Two copies are stored at the start of SHM region 0, followed by WalCkptInfo.
+// The dual-copy design allows readers to detect torn writes by comparing both copies.
+//
+// Layout (matching SQLite):
+//
+//	Offset  Size  Field
+//	0       4     iVersion      — wal-index format version
+//	4       4     unused        — padding
+//	8       4     iChange       — counter incremented each transaction
+//	12      1     isInit        — 1 when initialized
+//	13      1     bigEndCksum   — 1 if WAL checksums are big-endian
+//	14      2     szPage        — database page size (1 means 65536)
+//	16      4     mxFrame       — index of last valid frame in WAL
+//	20      4     nPage         — size of database in pages
+//	24      8     aFrameCksum   — checksum of last frame in log
+//	32      8     aSalt         — salt values from WAL header
+//	40      8     aCksum        — checksum over all prior fields (bytes 0..39)
+type WalIndexHdr struct {
+	iVersion    uint32
+	unused      uint32
+	iChange     uint32
+	isInit      uint8
+	bigEndCksum uint8
+	szPage      uint16
+	mxFrame     uint32
+	nPage       uint32
+	aFrameCksum [2]uint32
+	aSalt       [2]uint32
+	aCksum      [2]uint32
+}
+
+// serialize writes the WalIndexHdr into a 48-byte buffer (little-endian,
+// matching SQLite's native byte order for the wal-index on little-endian platforms).
+func (h *WalIndexHdr) serialize(buf []byte) {
+	binary.LittleEndian.PutUint32(buf[0:4], h.iVersion)
+	binary.LittleEndian.PutUint32(buf[4:8], h.unused)
+	binary.LittleEndian.PutUint32(buf[8:12], h.iChange)
+	buf[12] = h.isInit
+	buf[13] = h.bigEndCksum
+	binary.LittleEndian.PutUint16(buf[14:16], h.szPage)
+	binary.LittleEndian.PutUint32(buf[16:20], h.mxFrame)
+	binary.LittleEndian.PutUint32(buf[20:24], h.nPage)
+	binary.LittleEndian.PutUint32(buf[24:28], h.aFrameCksum[0])
+	binary.LittleEndian.PutUint32(buf[28:32], h.aFrameCksum[1])
+	binary.LittleEndian.PutUint32(buf[32:36], h.aSalt[0])
+	binary.LittleEndian.PutUint32(buf[36:40], h.aSalt[1])
+	binary.LittleEndian.PutUint32(buf[40:44], h.aCksum[0])
+	binary.LittleEndian.PutUint32(buf[44:48], h.aCksum[1])
+}
+
+// deserialize reads a WalIndexHdr from a 48-byte buffer.
+func (h *WalIndexHdr) deserialize(buf []byte) {
+	h.iVersion = binary.LittleEndian.Uint32(buf[0:4])
+	h.unused = binary.LittleEndian.Uint32(buf[4:8])
+	h.iChange = binary.LittleEndian.Uint32(buf[8:12])
+	h.isInit = buf[12]
+	h.bigEndCksum = buf[13]
+	h.szPage = binary.LittleEndian.Uint16(buf[14:16])
+	h.mxFrame = binary.LittleEndian.Uint32(buf[16:20])
+	h.nPage = binary.LittleEndian.Uint32(buf[20:24])
+	h.aFrameCksum[0] = binary.LittleEndian.Uint32(buf[24:28])
+	h.aFrameCksum[1] = binary.LittleEndian.Uint32(buf[28:32])
+	h.aSalt[0] = binary.LittleEndian.Uint32(buf[32:36])
+	h.aSalt[1] = binary.LittleEndian.Uint32(buf[36:40])
+	h.aCksum[0] = binary.LittleEndian.Uint32(buf[40:44])
+	h.aCksum[1] = binary.LittleEndian.Uint32(buf[44:48])
+}
+
+// computeCksum computes the aCksum field over bytes 0..39 of the header.
+// Uses the WAL checksum with native byte order (nativeCksum=true in SQLite,
+// which on little-endian means we interpret as native u32 words).
+func (h *WalIndexHdr) computeCksum() {
+	var buf [40]byte
+	binary.LittleEndian.PutUint32(buf[0:4], h.iVersion)
+	binary.LittleEndian.PutUint32(buf[4:8], h.unused)
+	binary.LittleEndian.PutUint32(buf[8:12], h.iChange)
+	buf[12] = h.isInit
+	buf[13] = h.bigEndCksum
+	binary.LittleEndian.PutUint16(buf[14:16], h.szPage)
+	binary.LittleEndian.PutUint32(buf[16:20], h.mxFrame)
+	binary.LittleEndian.PutUint32(buf[20:24], h.nPage)
+	binary.LittleEndian.PutUint32(buf[24:28], h.aFrameCksum[0])
+	binary.LittleEndian.PutUint32(buf[28:32], h.aFrameCksum[1])
+	binary.LittleEndian.PutUint32(buf[32:36], h.aSalt[0])
+	binary.LittleEndian.PutUint32(buf[36:40], h.aSalt[1])
+	// Use walChecksumNative for native-endian word processing (like SQLite does
+	// for the wal-index header checksum).
+	h.aCksum[0], h.aCksum[1] = walChecksumNative(buf[:], 0, 0)
+}
+
+// walChecksumNative computes the WAL checksum treating data as native-endian
+// 32-bit words (no byte swap). Used for wal-index header checksums.
+// Same paired-word recurrence as walChecksum but without byte swapping.
+func walChecksumNative(data []byte, s1, s2 uint32) (uint32, uint32) {
+	if len(data) < 8 {
+		return s1, s2
+	}
+	n := len(data) / 4
+	p := unsafe.Pointer(&data[0])
+	i := 0
+	for ; i+1 < n; i += 2 {
+		w0 := *(*uint32)(unsafe.Add(p, uintptr(i)*4))
+		w1 := *(*uint32)(unsafe.Add(p, uintptr(i+1)*4))
+		s1 += w0 + s2
+		s2 += w1 + s1
+	}
+	return s1, s2
+}
 
 // walIndex manages the WAL index stored in shared memory.
 // It maps page numbers to their latest WAL frame positions.
@@ -215,6 +337,16 @@ type walIndex struct {
 	maxFrame  uint32            // highest valid frame
 	maxPage   uint32            // database size at last commit
 	nBackfill uint32            // frames already checkpointed
+
+	// hdr is the current WalIndexHdr, matching SQLite's pWal->hdr.
+	// Contains all 11 fields from the SQLite WalIndexHdr struct.
+	hdr WalIndexHdr
+
+	// iChange is incremented on each write transaction.
+	iChange uint32
+
+	// inProcess indicates heap-backed shm (no multi-process coordination needed).
+	inProcess bool
 
 	// aReadMark tracks each reader's WAL snapshot position.
 	// Slot 0 is special: readers on slot 0 read entirely from the DB (nBackfill == maxFrame).
@@ -234,8 +366,9 @@ func newWalIndex(shmPath string, inProcess bool) (*walIndex, error) {
 		}
 	}
 	wi := &walIndex{
-		shm:     s,
-		pageMap: make(map[uint32]uint32),
+		shm:       s,
+		pageMap:   make(map[uint32]uint32),
+		inProcess: inProcess,
 	}
 	// Initialize all read marks as unused
 	for i := range wi.aReadMark {
@@ -299,24 +432,111 @@ func (wi *walIndex) reset() {
 }
 
 // writeHeader writes the WAL index header to region 0 of the shm.
-// This allows other processes to discover the WAL state.
+// Matches SQLite's walIndexWriteHdr():
+//   - Computes aCksum over the header fields
+//   - Writes copy 2 first (offset 48)
+//   - Issues a memory barrier (walShmBarrier)
+//   - Writes copy 1 (offset 0)
+//
+// The dual-copy + barrier design allows readers to detect torn writes
+// by comparing both copies.
 func (wi *walIndex) writeHeader(maxFrame, maxPage, nBackfill uint32) error {
 	region, err := wi.shm.region(0, true)
 	if err != nil {
 		return err
 	}
 
-	// Write header at offset 0 in region 0.
-	// Format: maxFrame(4) + maxPage(4) + nBackfill(4) + reserved(36) = 48 bytes
-	binary.LittleEndian.PutUint32(region[0:4], maxFrame)
-	binary.LittleEndian.PutUint32(region[4:8], maxPage)
-	binary.LittleEndian.PutUint32(region[8:12], nBackfill)
+	// Populate the header struct
+	wi.hdr.isInit = 1
+	wi.hdr.iVersion = walVersion
+	wi.hdr.mxFrame = maxFrame
+	wi.hdr.nPage = maxPage
+	wi.hdr.iChange = wi.iChange
 
-	// Write a second copy for atomicity detection (at offset 48).
-	binary.LittleEndian.PutUint32(region[48:52], maxFrame)
-	binary.LittleEndian.PutUint32(region[52:56], maxPage)
-	binary.LittleEndian.PutUint32(region[56:60], nBackfill)
+	// Compute the header checksum over bytes 0..39 (all fields except aCksum)
+	wi.hdr.computeCksum()
+
+	// Serialize header to a buffer
+	var buf [walIndexHdrSize]byte
+	wi.hdr.serialize(buf[:])
+
+	// Write copy 2 first (offset walIndexHdrSize = 48), then barrier, then copy 1
+	// This matches SQLite's write order: copy 2 first, barrier, copy 1.
+	copy(region[walIndexHdrSize:walIndexHdrSize*2], buf[:])
+
+	// Memory barrier between the two copies (7.2 + 7.5).
+	// For mmap'd shared memory, this ensures that the second copy is fully
+	// visible to other processes before we start writing the first copy.
+	if !wi.inProcess {
+		walShmBarrier()
+	}
+
+	copy(region[0:walIndexHdrSize], buf[:])
+
 	return nil
+}
+
+// readHeader reads and validates the WAL index header from SHM region 0.
+// It compares both copies of the header to detect torn writes (7.3).
+// Returns the header and true if valid, or a zero header and false if
+// the header is corrupt or the two copies don't match.
+func (wi *walIndex) readHeader() (WalIndexHdr, bool) {
+	region, err := wi.shm.region(0, false)
+	if err != nil {
+		return WalIndexHdr{}, false
+	}
+
+	if len(region) < walIndexHdrSize*2 {
+		return WalIndexHdr{}, false
+	}
+
+	// Read copy 1 (offset 0)
+	var hdr1 WalIndexHdr
+	hdr1.deserialize(region[0:walIndexHdrSize])
+
+	// Memory barrier before reading copy 2
+	if !wi.inProcess {
+		walShmBarrier()
+	}
+
+	// Read copy 2 (offset walIndexHdrSize = 48)
+	var hdr2 WalIndexHdr
+	hdr2.deserialize(region[walIndexHdrSize : walIndexHdrSize*2])
+
+	// Both copies must match
+	var buf1, buf2 [walIndexHdrSize]byte
+	hdr1.serialize(buf1[:])
+	hdr2.serialize(buf2[:])
+	if buf1 != buf2 {
+		return WalIndexHdr{}, false
+	}
+
+	// Verify isInit flag
+	if hdr1.isInit != 1 {
+		return WalIndexHdr{}, false
+	}
+
+	// Verify checksum: recompute aCksum over bytes 0..39 and compare
+	saved := hdr1.aCksum
+	hdr1.computeCksum()
+	if hdr1.aCksum != saved {
+		return WalIndexHdr{}, false
+	}
+
+	return hdr1, true
+}
+
+// walShmBarrier issues a memory barrier for cross-process mmap'd memory.
+// On x86/amd64, stores are already ordered (TSO), but we need a compiler barrier
+// to prevent the Go compiler from reordering. On ARM64, we need a full fence.
+// This matches SQLite's walShmBarrier() / sqlite3OsShmBarrier().
+func walShmBarrier() {
+	// atomic.StoreUint32 on a dummy variable acts as both a compiler barrier
+	// and a memory fence (uses MFENCE on x86, DMB on ARM64).
+	var dummy uint32
+	atomic.StoreUint32(&dummy, 0)
+	// Also yield to help with cache coherency visibility across processes.
+	runtime.Gosched()
 }
 
 // lock acquires a shm lock.
@@ -554,7 +774,15 @@ func (w *wal) open() error {
 	}
 	w.index = idx
 
-	// Acquire recover lock to prevent concurrent recovery.
+	// Acquire exclusive locks on all lock slots except WAL_WRITE_LOCK (slot 0)
+	// and WAL_READ_LOCK(0) (slot 3), matching SQLite's walIndexRecover().
+	// This means locking WAL_CKPT_LOCK (1) and WAL_RECOVER_LOCK (2) exclusively,
+	// which prevents concurrent checkpoints and other recoveries.
+	if err := w.index.lock(lockCheckpoint, lockExclusive); err != nil {
+		return err
+	}
+	defer func() { _ = w.index.unlock(lockCheckpoint, lockExclusive) }()
+
 	if err := w.index.lock(lockRecover, lockExclusive); err != nil {
 		return err
 	}
@@ -610,7 +838,11 @@ func (w *wal) writeHeader() error {
 	return w.index.writeHeader(0, 0, 0)
 }
 
-// recover reads the WAL file and rebuilds the index from committed frames.
+// recover reads the WAL file and rebuilds the in-memory index from committed frames.
+//
+// Matches SQLite's walIndexRecover(): the WAL file is never modified during
+// recovery. Uncommitted trailing frames are simply ignored by setting mxFrame
+// to the last committed frame. The WAL file retains its full on-disk size.
 func (w *wal) recover() error {
 	buf := make([]byte, walHeaderSize)
 	if _, err := w.file.ReadAt(buf, 0); err != nil {
@@ -645,6 +877,7 @@ func (w *wal) recover() error {
 	var nFrame uint32
 	var lastCommitFrame uint32
 	var lastCommitDbSize uint32
+	var lastCommitCksum1, lastCommitCksum2 uint32
 
 	s1, s2 := w.cksum1, w.cksum2
 
@@ -677,48 +910,36 @@ func (w *wal) recover() error {
 		if frame.dbSize > 0 {
 			lastCommitFrame = nFrame
 			lastCommitDbSize = frame.dbSize
+			lastCommitCksum1 = s1
+			lastCommitCksum2 = s2
 		}
 
 		offset += frameSize
 	}
 
-	// Only keep frames up to the last commit
+	// Only index frames up to the last commit (like SQLite: set mxFrame,
+	// do NOT truncate the WAL file). Uncommitted trailing frames are ignored.
 	if lastCommitFrame > 0 {
-		w.nFrame = lastCommitFrame
-		w.index.maxPage = lastCommitDbSize
-
-		// Rebuild index with only committed frames
+		// Rebuild index with only committed frames (clear and re-add).
 		w.index.reset()
-		offset = int64(walHeaderSize)
-		s1, s2 = w.cksum1, w.cksum2
 
+		offset = int64(walHeaderSize)
 		for i := uint32(1); i <= lastCommitFrame; i++ {
 			if _, err := w.file.ReadAt(frameHeaderBuf, offset); err != nil {
 				return err
 			}
-			if _, err := w.file.ReadAt(pageBuf, offset+walFrameSize); err != nil {
-				return err
-			}
 			frame.deserialize(frameHeaderBuf)
-			s1, s2 = walChecksum(frameHeaderBuf[0:8], s1, s2)
-			s1, s2 = walChecksum(pageBuf, s1, s2)
-
 			w.index.set(frame.pgno, i)
 			offset += frameSize
 		}
 
-		w.cksum1 = s1
-		w.cksum2 = s2
+		w.nFrame = lastCommitFrame
+		w.cksum1 = lastCommitCksum1
+		w.cksum2 = lastCommitCksum2
 		w.index.maxFrame = lastCommitFrame
 		w.index.maxPage = lastCommitDbSize
-
-		// Truncate uncommitted trailing frames
-		truncAt := int64(walHeaderSize) + int64(lastCommitFrame)*frameSize
-		if err := w.file.Truncate(truncAt); err != nil {
-			return err
-		}
 	} else {
-		// No committed frames - reset WAL
+		// No committed frames — set empty state, do NOT truncate WAL file.
 		w.nFrame = 0
 		w.index.reset()
 	}
@@ -1025,6 +1246,15 @@ func (w *wal) checkpoint(dbFile *os.File) error {
 	if mxSafeFrame <= nBackfill {
 		// Nothing new to checkpoint
 		return nil
+	}
+
+	// Sync the WAL file before copying frames to the database, matching
+	// SQLite's walCheckpoint(). This ensures all WAL data is durable on disk
+	// before we start overwriting the database file with it.
+	if !w.noSync && w.file != nil {
+		if err := fdatasync(w.file); err != nil {
+			return err
+		}
 	}
 
 	// Copy frames (nBackfill+1)..mxSafeFrame to DB
