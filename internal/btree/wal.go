@@ -448,7 +448,7 @@ func walChecksumNative(data []byte, s1, s2 uint32) (uint32, uint32) {
 type walIndex struct {
 	mu      sync.RWMutex
 	shm     shm               // platform-specific shared memory
-	pageMap map[uint32]uint32  // pgno -> frame index (1-based), in-process cache
+	pageMap map[uint32][]uint32 // pgno -> sorted list of frame indices (1-based)
 	maxFrame  uint32           // highest valid frame
 	maxPage   uint32           // database size at last commit
 	nBackfill uint32           // frames already checkpointed
@@ -489,7 +489,7 @@ func newWalIndex(shmPath string, inProcess bool) (*walIndex, error) {
 	}
 	wi := &walIndex{
 		shm:       s,
-		pageMap:   make(map[uint32]uint32),
+		pageMap:   make(map[uint32][]uint32),
 		inProcess: inProcess,
 	}
 	// Initialize all read marks as unused
@@ -502,7 +502,7 @@ func newWalIndex(shmPath string, inProcess bool) (*walIndex, error) {
 // set records a page at a given frame position.
 func (wi *walIndex) set(pgno, frame uint32) {
 	wi.mu.Lock()
-	wi.pageMap[pgno] = frame
+	wi.pageMap[pgno] = append(wi.pageMap[pgno], frame)
 	if frame > wi.maxFrame {
 		wi.maxFrame = frame
 	}
@@ -515,7 +515,7 @@ func (wi *walIndex) setBatch(pages []*page, startFrame uint32) {
 	wi.mu.Lock()
 	for i, p := range pages {
 		frame := startFrame + uint32(i)
-		wi.pageMap[p.pgno] = frame
+		wi.pageMap[p.pgno] = append(wi.pageMap[p.pgno], frame)
 	}
 	if f := startFrame + uint32(len(pages)) - 1; f > wi.maxFrame {
 		wi.maxFrame = f
@@ -527,7 +527,8 @@ func (wi *walIndex) setBatch(pages []*page, startFrame uint32) {
 	}
 }
 
-// get returns the frame containing the latest version of pgno, or 0 if not in WAL.
+// get returns the frame containing the latest version of pgno that is
+// within the given maxFrame snapshot, or 0 if not in WAL.
 // The maxFrame parameter limits which frames are visible (for snapshot isolation).
 //
 // This uses the in-process Go map (pageMap) rather than SHM hash tables.
@@ -535,11 +536,31 @@ func (wi *walIndex) setBatch(pages []*page, startFrame uint32) {
 func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
 	wi.mu.RLock()
 	defer wi.mu.RUnlock()
-	frame := wi.pageMap[pgno]
-	if frame > 0 && frame <= maxFrame {
-		return frame
+	frames := wi.pageMap[pgno]
+	if len(frames) == 0 {
+		return 0
+	}
+	// Frames are appended in order, so the list is sorted ascending.
+	// Search backwards for the highest frame <= maxFrame.
+	for i := len(frames) - 1; i >= 0; i-- {
+		if frames[i] <= maxFrame {
+			return frames[i]
+		}
 	}
 	return 0
+}
+
+// getLatest returns the latest WAL frame for pgno regardless of any snapshot
+// limit, or 0 if the page is not in the WAL. Used to detect whether a cached
+// page may have been updated beyond a reader's snapshot.
+func (wi *walIndex) getLatest(pgno uint32) uint32 {
+	wi.mu.RLock()
+	defer wi.mu.RUnlock()
+	frames := wi.pageMap[pgno]
+	if len(frames) == 0 {
+		return 0
+	}
+	return frames[len(frames)-1]
 }
 
 // reset clears the WAL index (after a checkpoint + WAL truncate).
@@ -859,6 +880,13 @@ type wal struct {
 	// Reusable write buffer to avoid per-commit allocations
 	writeBuf []byte
 
+	// headerOnDisk is false when the WAL file is empty (0 bytes) and the
+	// header has not yet been written to disk. The header is written lazily
+	// on the first writeFrames call. This matches SQLite's behavior where
+	// after a clean close the WAL file is empty/deleted and only recreated
+	// when the first write transaction commits.
+	headerOnDisk bool
+
 	// inProcess uses heap-backed shm instead of mmap+fcntl (faster, single-process only)
 	inProcess bool
 
@@ -934,10 +962,12 @@ func (w *wal) open() error {
 		return w.recover()
 	}
 
-	// New WAL - write header
-	if err := w.writeHeader(); err != nil {
-		return err
-	}
+	// New/empty WAL: initialize in-memory state without writing to disk.
+	// The header will be written lazily on the first writeFrames call.
+	// This matches SQLite's behavior where after a clean close the WAL file
+	// is empty/deleted and only populated when the first write commits.
+	w.initHeaderState()
+
 	// Enable in-memory WAL for InProcess+NoSync (no per-commit file I/O)
 	if w.inProcess && w.noSync {
 		w.memFrames = make([]memFrame, 0, 1024)
@@ -945,7 +975,49 @@ func (w *wal) open() error {
 	return nil
 }
 
-// writeHeader writes a fresh WAL header.
+// initHeaderState initializes the in-memory WAL header state without writing
+// to disk. Used when the WAL file is empty (after a clean close). The header
+// will be flushed to disk lazily on the first writeFrames call.
+func (w *wal) initHeaderState() {
+	w.header = walHeader{
+		magic:      walMagic,
+		version:    walVersion,
+		pageSize:   w.pageSize,
+		checkpoint: 0,
+		salt1:      rand.Uint32(),
+		salt2:      rand.Uint32(),
+	}
+
+	// Compute checksum state from the header fields
+	var buf [walHeaderSize]byte
+	w.header.serialize(buf[:])
+	w.cksum1, w.cksum2 = walChecksum(buf[0:24], 0, 0)
+	w.nFrame = 0
+	w.headerOnDisk = false
+	w.index.reset()
+
+	// Update shm header
+	_ = w.index.writeHeader(0, 0, 0)
+}
+
+// flushHeader writes the already-initialized in-memory header to disk.
+// Called lazily on the first writeFrames when headerOnDisk is false.
+// Must be called with w.mu held.
+func (w *wal) flushHeader() error {
+	buf := make([]byte, walHeaderSize)
+	w.header.serialize(buf)
+
+	if _, err := w.file.WriteAt(buf, 0); err != nil {
+		return err
+	}
+	if err := w.file.Sync(); err != nil {
+		return err
+	}
+	w.headerOnDisk = true
+	return nil
+}
+
+// writeHeader writes a fresh WAL header to disk.
 func (w *wal) writeHeader() error {
 	w.header = walHeader{
 		magic:      walMagic,
@@ -969,6 +1041,7 @@ func (w *wal) writeHeader() error {
 	// Initialize checksum state from header
 	w.cksum1, w.cksum2 = walChecksum(buf[0:24], 0, 0)
 	w.nFrame = 0
+	w.headerOnDisk = true
 	w.index.reset()
 
 	// Update shm header
@@ -981,6 +1054,8 @@ func (w *wal) writeHeader() error {
 // recovery. Uncommitted trailing frames are simply ignored by setting mxFrame
 // to the last committed frame. The WAL file retains its full on-disk size.
 func (w *wal) recover() error {
+	w.headerOnDisk = true // WAL file already has a header on disk
+
 	buf := make([]byte, walHeaderSize)
 	if _, err := w.file.ReadAt(buf, 0); err != nil {
 		return err
@@ -1107,6 +1182,15 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	// Lazily write the WAL header to disk on first frame write.
+	// The header was initialized in memory during open() but not flushed
+	// to keep the WAL file empty until actual writes occur.
+	if !w.headerOnDisk {
+		if err := w.flushHeader(); err != nil {
+			return err
+		}
+	}
 
 	frameSize := int(walFrameSize) + int(w.pageSize)
 	offset := int64(walHeaderSize) + int64(w.nFrame)*int64(frameSize)

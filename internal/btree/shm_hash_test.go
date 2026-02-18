@@ -151,11 +151,16 @@ func TestShmHashIntegrationWithSetBatch(t *testing.T) {
 	maxFrame := wi.maxFrame
 	wi.mu.RUnlock()
 
-	// The Go map and shm hash table should agree
+	// The shm hash table returns the latest frame for a page (within maxFrame),
+	// which should match the last entry in the Go map's frame list.
 	wi.mu.RLock()
-	for pgno, frame := range wi.pageMap {
+	for pgno, frames := range wi.pageMap {
+		if len(frames) == 0 {
+			continue
+		}
+		latestFrame := frames[len(frames)-1]
 		shmFrame := wi.shmHashGet(pgno, maxFrame)
-		assert.Equal(t, frame, shmFrame, "page %d: map=%d shm=%d", pgno, frame, shmFrame)
+		assert.Equal(t, latestFrame, shmFrame, "page %d: map latest=%d shm=%d", pgno, latestFrame, shmFrame)
 	}
 	wi.mu.RUnlock()
 	_ = ns

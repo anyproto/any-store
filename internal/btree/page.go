@@ -288,6 +288,7 @@ type page struct {
 	pgno     uint32 // page number (1-based)
 	data     []byte // raw page data
 	dirty    bool   // true if page has been modified
+	uncached bool   // true if page is not in the shared cache (MVCC snapshot copy)
 	pinCount int    // reference count
 	header   pageHeader
 

@@ -174,6 +174,7 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	tx.ReadTx.closed = false
 	tx.ReadTx.walMaxFrame = maxFrame
 	tx.ReadTx.walSlot = slot
+	tx.ReadTx.writable = true
 	return tx, nil
 }
 
@@ -442,6 +443,21 @@ type ReadTx struct {
 	closed      bool
 	walMaxFrame uint32 // WAL snapshot for this transaction
 	walSlot     int    // reader slot number (for endRead)
+	writable    bool   // true when embedded in a WriteTx (MVCC: allows seeing dirty pages)
+}
+
+// txGetPage fetches a page respecting MVCC snapshot isolation.
+// For write transactions, dirty pages from writePages are returned directly.
+// For read transactions, readPageMVCC bypasses dirty pages from uncommitted writers.
+func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
+	if tx.writable {
+		if pg := tx.pager.writePages[pgno]; pg != nil {
+			pg.pinCount++
+			return pg, nil
+		}
+		return tx.pager.getPageAt(pgno, tx.walMaxFrame)
+	}
+	return tx.pager.readPageMVCC(pgno, tx.walMaxFrame)
 }
 
 // Get retrieves a value by key from the given namespace.
@@ -451,8 +467,7 @@ func (tx *ReadTx) Get(ns *Namespace, key []byte) ([]byte, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
 	}
-	maxFrame := tx.walMaxFrame
-	pg, err := tx.pager.getPageAt(ns.rootPage, maxFrame)
+	pg, err := tx.txGetPage(ns.rootPage)
 	if err != nil {
 		return nil, err
 	}
@@ -488,7 +503,7 @@ func (tx *ReadTx) Get(ns *Namespace, key []byte) ([]byte, error) {
 		}
 		childPgno, _ := searchInteriorPage(pg, key)
 		tx.pager.releasePage(pg)
-		pg, err = tx.pager.getPageAt(childPgno, maxFrame)
+		pg, err = tx.txGetPage(childPgno)
 		if err != nil {
 			return nil, err
 		}
@@ -509,7 +524,7 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 
 // NewCursor creates a cursor for iterating over the namespace.
 func (tx *ReadTx) NewCursor(ns *Namespace) *Cursor {
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame}
+	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
 	return bt.NewCursor()
 }
 
@@ -519,7 +534,7 @@ func (tx *ReadTx) Count(ns *Namespace) (int, error) {
 	if tx.closed {
 		return 0, ErrTxClosed
 	}
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame}
+	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
 	return bt.Count()
 }
 
@@ -546,7 +561,7 @@ func (tx *WriteTx) Put(ns *Namespace, key, value []byte) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame}
+	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: true}
 	return bt.Put(key, value)
 }
 
@@ -555,7 +570,7 @@ func (tx *WriteTx) Delete(ns *Namespace, key []byte) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame}
+	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: true}
 	return bt.Delete(key)
 }
 

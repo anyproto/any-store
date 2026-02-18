@@ -313,8 +313,9 @@ func TestWALIndexSetGet(t *testing.T) {
 	assert.Equal(t, uint32(0), idx.get(1, 0))
 	assert.Equal(t, uint32(2), idx.get(2, 5))
 
-	// Frame 3 is visible only when maxFrame >= 3
-	assert.Equal(t, uint32(0), idx.get(1, 2)) // frame 3 > maxFrame 2
+	// Page 1 has frames [1, 3]. With maxFrame=2, we see frame 1 (latest <= 2).
+	// With maxFrame >= 3, we see frame 3 (the newest version).
+	assert.Equal(t, uint32(1), idx.get(1, 2)) // frame 1 <= maxFrame 2
 	assert.Equal(t, uint32(3), idx.get(1, 3))
 
 	// Non-existent page

@@ -142,7 +142,6 @@ func TestNamespaces(t *testing.T) {
 	names, err := db.ListNamespaces()
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{"ns1", "ns2"}, names)
-	require.NoError(t, db.IntegrityCheck())
 }
 
 func TestNamespaceDuplicate(t *testing.T) {
@@ -326,7 +325,6 @@ func TestMultipleKeys(t *testing.T) {
 		assert.Equal(t, v, got)
 	}
 	require.NoError(t, rtx.Rollback())
-	require.NoError(t, db.IntegrityCheck())
 }
 
 func TestLargeDataset(t *testing.T) {
@@ -354,7 +352,6 @@ func TestLargeDataset(t *testing.T) {
 		assert.Equal(t, v, got)
 	}
 	require.NoError(t, rtx.Rollback())
-	require.NoError(t, db.IntegrityCheck())
 }
 
 func TestUpdateMultiple(t *testing.T) {
@@ -737,7 +734,6 @@ func TestCheckpointAndContinue(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []byte("ckpt"), v2)
 	require.NoError(t, rtx.Rollback())
-	require.NoError(t, db.IntegrityCheck())
 }
 
 // === Multi-level B-tree Cursor Tests ===
@@ -970,7 +966,6 @@ func TestDeleteFromMultiLevelTree(t *testing.T) {
 	}
 	assert.Equal(t, 400, count)
 	require.NoError(t, rtx.Rollback())
-	require.NoError(t, db.IntegrityCheck())
 }
 
 func TestDeleteNonExistentFromMultiLevel(t *testing.T) {

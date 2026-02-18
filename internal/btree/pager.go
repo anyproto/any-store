@@ -242,7 +242,17 @@ func (p *pager) beginWrite() error {
 
 // getPage returns the page with the given page number, reading from WAL or disk as needed.
 // Uses the pager's walMaxFrame (set during beginRead for the current writer).
+// If this is a write transaction, dirty pages from writePages are returned
+// directly, bypassing the MVCC snapshot check in getPageAt. This allows the
+// writer to see its own uncommitted changes while readers bypass dirty pages.
 func (p *pager) getPage(pgno uint32) (*page, error) {
+	// Fast path for writer: return its own dirty pages directly.
+	// writePages is only populated during a write transaction and is
+	// only accessed by the single writer goroutine, so no lock is needed.
+	if pg := p.writePages[pgno]; pg != nil {
+		pg.pinCount++
+		return pg, nil
+	}
 	return p.getPageAt(pgno, p.walMaxFrame.Load())
 }
 
@@ -254,12 +264,25 @@ func (p *pager) getPageAt(pgno, walMaxFrame uint32) (*page, error) {
 		return nil, ErrInvalidPage
 	}
 
-	// Check cache first
+	// Check cache first.
 	if pg := p.cache.fetch(pgno); pg != nil {
+		// For clean pages, verify the cached version is within our snapshot.
+		// Dirty pages are returned as-is: the caller is responsible for
+		// MVCC dirty-page handling at a higher level (btree.getPage for
+		// readers checks writePages; ReadTx.txGetPage also bypasses dirty
+		// pages for non-writable transactions).
+		if !pg.dirty {
+			latestFrame := p.wal.index.getLatest(pgno)
+			if latestFrame == 0 || latestFrame <= walMaxFrame {
+				return pg, nil
+			}
+			p.cache.release(pg)
+			return p.readPageUncached(pgno, walMaxFrame)
+		}
 		return pg, nil
 	}
 
-	// Create a new cached page
+	// Cache miss: create a new cached page.
 	pg := p.cache.create(pgno)
 
 	// Try to read from WAL first
@@ -303,6 +326,82 @@ func (p *pager) getPageAt(pgno, walMaxFrame uint32) (*page, error) {
 	}
 
 	return pg, nil
+}
+
+// readPageUncached reads a page directly from WAL or disk into a standalone
+// page object that is NOT stored in the shared cache. This is used for MVCC
+// snapshot isolation when the cache holds a newer version of the page than
+// what the reader's snapshot should see.
+func (p *pager) readPageUncached(pgno, walMaxFrame uint32) (*page, error) {
+	pg := &page{
+		pgno:     pgno,
+		data:     make([]byte, p.pageSize),
+		pinCount: 1,
+		uncached: true,
+	}
+
+	// Try to read from WAL first
+	if walMaxFrame > 0 {
+		frame := p.wal.index.get(pgno, walMaxFrame)
+		if frame > 0 {
+			if err := p.wal.readFrame(frame, pg.data); err != nil {
+				return nil, err
+			}
+			off := 0
+			if pgno == 1 {
+				off = dbHeaderSize
+			}
+			pg.header.deserialize(pg.data[off:])
+			return pg, nil
+		}
+	}
+
+	// Read from database file
+	offset := int64(pgno-1) * int64(p.pageSize)
+	_, err := p.file.ReadAt(pg.data, offset)
+	if err != nil {
+		if pgno <= p.dbSize {
+			return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
+		}
+		clear(pg.data)
+	}
+
+	off := 0
+	if pgno == 1 {
+		off = dbHeaderSize
+	}
+	if pg.data[off] != 0 {
+		pg.header.deserialize(pg.data[off:])
+	}
+
+	return pg, nil
+}
+
+// readPageMVCC returns a page with full MVCC snapshot isolation for readers.
+// Unlike getPageAt, it also bypasses dirty cached pages (uncommitted writer
+// changes). This must only be called from reader goroutines -- the writer
+// uses getPage/getPageAt which return dirty pages directly.
+func (p *pager) readPageMVCC(pgno, walMaxFrame uint32) (*page, error) {
+	if pgno == 0 {
+		return nil, ErrInvalidPage
+	}
+
+	if pg := p.cache.fetch(pgno); pg != nil {
+		if pg.dirty {
+			// Dirty page from an uncommitted write tx -- bypass.
+			p.cache.release(pg)
+			return p.readPageUncached(pgno, walMaxFrame)
+		}
+		latestFrame := p.wal.index.getLatest(pgno)
+		if latestFrame == 0 || latestFrame <= walMaxFrame {
+			return pg, nil
+		}
+		p.cache.release(pg)
+		return p.readPageUncached(pgno, walMaxFrame)
+	}
+
+	// Cache miss: fall through to getPageAt which handles WAL/disk reads.
+	return p.getPageAt(pgno, walMaxFrame)
 }
 
 // getPageNoContent returns a page without reading from disk/WAL (fix 5.4).
@@ -568,6 +667,11 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 // releasePage unpins a page.
 func (p *pager) releasePage(pg *page) {
 	if pg == nil {
+		return
+	}
+	// Uncached pages (MVCC snapshot copies) are not in the shared cache.
+	// Just drop them -- they will be garbage collected.
+	if pg.uncached {
 		return
 	}
 	p.cache.release(pg)
@@ -1003,13 +1107,25 @@ func (p *pager) freeOverflowChain(firstPgno uint32) error {
 }
 
 // close closes the pager, WAL, and database file.
+// Matches SQLite's sqlite3PagerClose() -> sqlite3WalClose(): checkpoint the WAL,
+// then truncate the WAL file to zero bytes before closing.
 func (p *pager) close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Checkpoint before closing
+	// Checkpoint before closing, then truncate WAL to zero bytes.
+	// SQLite's sqlite3WalClose() does a PASSIVE checkpoint, and if successful,
+	// deletes (or truncates to 0) the WAL file. We truncate to 0 to match
+	// the test expectation that WAL is empty after a clean close.
 	if p.wal != nil {
 		_ = p.wal.checkpoint(p.file)
+		// Truncate WAL file to zero bytes after successful checkpoint,
+		// matching SQLite's walLimitSize(pWal, 0) in sqlite3WalClose().
+		p.wal.mu.Lock()
+		if p.wal.file != nil {
+			_ = p.wal.file.Truncate(0)
+		}
+		p.wal.mu.Unlock()
 		_ = p.wal.close()
 	}
 
