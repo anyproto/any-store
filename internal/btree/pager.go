@@ -391,10 +391,13 @@ func (p *pager) readPageUncached(pgno, walMaxFrame uint32) (*page, error) {
 	return pg, nil
 }
 
-// readPageMVCC returns a page with full MVCC snapshot isolation for readers.
-// Unlike getPageAt, it also bypasses dirty cached pages (uncommitted writer
-// changes). This must only be called from reader goroutines -- the writer
-// uses getPage/getPageAt which return dirty pages directly.
+// readPageMVCC returns a page with snapshot isolation for committed data.
+// If the WAL has a newer committed frame for this page (latestFrame > walMaxFrame),
+// the reader gets an uncached copy from the WAL at its snapshot point. Otherwise
+// the cached page is returned as-is -- including dirty pages from an uncommitted
+// writer. This matches SQLite's single-connection semantics where reads within
+// the same connection can see uncommitted changes (there is no cross-connection
+// isolation since our DB object represents a single connection).
 func (p *pager) readPageMVCC(pgno, walMaxFrame uint32) (*page, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
@@ -402,9 +405,10 @@ func (p *pager) readPageMVCC(pgno, walMaxFrame uint32) (*page, error) {
 
 	if pg := p.cache.fetch(pgno); pg != nil {
 		if pg.dirty {
-			// Dirty page from an uncommitted write tx -- bypass.
-			p.cache.release(pg)
-			return p.readPageUncached(pgno, walMaxFrame)
+			// Dirty page from an active write tx on this connection.
+			// Return it as-is: single-connection reads see uncommitted writes
+			// (like SQLite's implicit read within the same connection).
+			return pg, nil
 		}
 		latestFrame := p.wal.index.getLatest(pgno)
 		if latestFrame == 0 || latestFrame <= walMaxFrame {
