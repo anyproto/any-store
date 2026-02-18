@@ -148,7 +148,11 @@ func ComputeWeights(indexes []*IndexInfo, params *WeightParams) ([]WeightedIndex
 						}
 					}
 				}
-				if allQueryFieldsBits.Subtract(chainFieldsBits).Count() == 0 {
+				// Check: all query fields with bounds are covered by the chain.
+				// Subtract(b) returns bits in b NOT in the receiver,
+				// so chainFieldsBits.Subtract(allQueryFieldsBits) gives
+				// query field bits that are NOT in the chain.
+				if chainFieldsBits.Subtract(allQueryFieldsBits).Count() == 0 {
 					weighted[i].FilterFullyCovered = true
 				}
 			}
