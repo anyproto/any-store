@@ -63,6 +63,20 @@ type pager struct {
 	// because we cannot modify the page struct in page.go.
 	dontWritePages map[uint32]bool
 
+	// hasContent tracks pages that were freed as freelist leaf pages during
+	// the current write transaction. When such a page is re-allocated from
+	// the freelist, it must NOT use the NOCONTENT optimization because the
+	// page's prior content may need to be preserved for savepoint rollback.
+	// Matches SQLite's BtShared.pHasContent bitvec (btree.c:617-685).
+	//
+	// Without this, a page freed and re-allocated within the same transaction
+	// after a savepoint would lose its original content: freePage marks it as
+	// dontWrite (skipping the WAL write), and allocateFromFreelist would use
+	// getPageNoContent (skipping savepoint journaling). On savepoint rollback
+	// the page content is not restored, leading to corrupt overflow chains.
+	// This is the exact bug from SQLite ticket 7f7f8026eda387d544b.
+	hasContent map[uint32]bool
+
 	// inProcess uses heap-backed shm (faster, single-process only)
 	inProcess bool
 
@@ -571,6 +585,11 @@ func (p *pager) freePage(pgno uint32) error {
 			if p.writePages[pgno] != nil {
 				p.dontWrite(pgno)
 			}
+			// Track that this page had content before being freed, so that if
+			// it is re-allocated from the freelist within the same transaction,
+			// its content will be properly journaled for savepoint rollback.
+			// Matches SQLite's btreeSetHasContent() (btree.c:6922).
+			p.setHasContent(pgno)
 			return nil
 		}
 		p.releasePage(trunkPg)
@@ -634,6 +653,28 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 		p.releasePage(trunkPg)
 
 		p.header.TotalFreelistPgs--
+
+		// Check if this page had meaningful content before being freed
+		// in the current transaction. If so, we must NOT use the NOCONTENT
+		// optimization — the page must go through getWritablePage so its
+		// content is saved in the savepoint journal for potential rollback.
+		// Matches SQLite's btreeGetHasContent() check (btree.c:6725):
+		//   noContent = !btreeGetHasContent(pBt, *pPgno)? PAGER_GET_NOCONTENT : 0;
+		//   rc = btreeGetUnusedPage(pBt, *pPgno, ppPage, noContent);
+		//   if( rc==SQLITE_OK ){
+		//     rc = sqlite3PagerWrite((*ppPage)->pDbPage);
+		//   }
+		if p.getHasContent(leafPgno) {
+			// Page was freed in this transaction — fetch with content so
+			// savepoint journaling captures the pre-free data.
+			pg, err := p.getWritablePage(leafPgno)
+			if err != nil {
+				return nil, err
+			}
+			clear(pg.data)
+			delete(p.dontWritePages, leafPgno)
+			return pg, nil
+		}
 
 		// Use getPageNoContent: old freelist leaf content is irrelevant (fix 5.4).
 		pg, err := p.getPageNoContent(leafPgno)
@@ -700,6 +741,25 @@ func (p *pager) dontWrite(pgno uint32) {
 	p.dontWritePages[pgno] = true
 }
 
+// setHasContent marks a page as having had meaningful content before being
+// freed as a freelist leaf page. When this page is later re-allocated from
+// the freelist, the NOCONTENT optimization must be skipped so that the page's
+// prior content is properly saved in the savepoint journal.
+// Matches SQLite's btreeSetHasContent() (btree.c:651-664).
+func (p *pager) setHasContent(pgno uint32) {
+	if p.hasContent == nil {
+		p.hasContent = make(map[uint32]bool)
+	}
+	p.hasContent[pgno] = true
+}
+
+// getHasContent returns true if the page was freed as a freelist leaf within
+// the current transaction and may contain content needed for savepoint rollback.
+// Matches SQLite's btreeGetHasContent() (btree.c:673-676).
+func (p *pager) getHasContent(pgno uint32) bool {
+	return p.hasContent[pgno]
+}
+
 // commit writes all dirty pages to WAL and commits the transaction.
 // Returns the WAL frame count at commit time (for auto-checkpoint decisions).
 func (p *pager) commit() (nFrame uint32, err error) {
@@ -745,6 +805,7 @@ func (p *pager) commit() (nFrame uint32, err error) {
 		p.state.Store(int32(pagerOpen))
 		p.savepoints = p.savepoints[:0]
 		clear(p.writePages)
+		clear(p.hasContent)
 		p.wal.endWrite()
 		return 0, nil
 	}
@@ -768,6 +829,7 @@ func (p *pager) commit() (nFrame uint32, err error) {
 	p.savepoints = p.savepoints[:0]
 	clear(p.writePages)
 	clear(p.dontWritePages)
+	clear(p.hasContent)
 	p.state.Store(int32(pagerOpen))
 	p.wal.endWrite()
 
@@ -796,6 +858,7 @@ func (p *pager) rollback() error {
 	p.savepoints = p.savepoints[:0]
 	clear(p.writePages)
 	clear(p.dontWritePages)
+	clear(p.hasContent)
 	p.state.Store(int32(pagerOpen))
 	p.wal.endWrite()
 	return nil
@@ -826,6 +889,7 @@ func (p *pager) pagerError() {
 	p.savepoints = p.savepoints[:0]
 	clear(p.writePages)
 	clear(p.dontWritePages)
+	clear(p.hasContent)
 
 	// Release the WAL write lock so other writers are not blocked (fix 2.2).
 	p.wal.endWrite()
