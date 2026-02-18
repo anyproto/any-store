@@ -1,7 +1,6 @@
 package bench
 
 import (
-	"context"
 	"crypto/rand"
 	"fmt"
 	"os"
@@ -11,8 +10,6 @@ import (
 	"testing"
 
 	"github.com/anyproto/any-store/internal/btree"
-	"github.com/anyproto/any-store/internal/driver"
-	"github.com/anyproto/go-sqlite"
 	badger "github.com/dgraph-io/badger/v4"
 	bolt "go.etcd.io/bbolt"
 )
@@ -119,126 +116,6 @@ func (e *btreeEngine) IterateAll() (int, error) {
 		count++
 	}
 	return count, nil
-}
-
-// ============================================================
-// SQLite engine (internal/driver, using go-sqlite)
-// ============================================================
-
-type sqliteEngine struct {
-	cm *driver.ConnManager
-}
-
-func (e *sqliteEngine) Name() string { return "sqlite" }
-
-func (e *sqliteEngine) Open(dir string) error {
-	path := filepath.Join(dir, "bench.sqlite")
-	cm, err := driver.NewConnManager(path, driver.Config{
-		Pragma: map[string]string{
-			"journal_mode": "wal",
-			"synchronous":  "off",
-		},
-		ReadCount: 4,
-		Version:   1,
-	})
-	if err != nil {
-		return err
-	}
-	e.cm = cm
-
-	ctx := context.Background()
-	conn, err := cm.GetWrite(ctx)
-	if err != nil {
-		return err
-	}
-	defer cm.ReleaseWrite(conn)
-	return conn.ExecNoResult(ctx, "CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB)")
-}
-
-func (e *sqliteEngine) Close() error {
-	return e.cm.Close()
-}
-
-func (e *sqliteEngine) WriteBatch(offset, n int) error {
-	ctx := context.Background()
-	conn, err := e.cm.GetWrite(ctx)
-	if err != nil {
-		return err
-	}
-	defer e.cm.ReleaseWrite(conn)
-
-	if err := conn.BeginImmediate(ctx); err != nil {
-		return err
-	}
-	for i := range n {
-		k := makeKey(offset + i)
-		v := makeValue(offset + i)
-		if err := conn.Exec(ctx,
-			"INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)",
-			func(stmt *sqlite.Stmt) {
-				stmt.BindBytes(1, k)
-				stmt.BindBytes(2, v)
-			}, driver.StmtExecNoResults); err != nil {
-			_ = conn.Rollback(ctx)
-			return err
-		}
-	}
-	return conn.Commit(ctx)
-}
-
-func (e *sqliteEngine) Get(index int) ([]byte, error) {
-	ctx := context.Background()
-	conn, err := e.cm.GetRead(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer e.cm.ReleaseRead(conn)
-
-	var result []byte
-	err = conn.Exec(ctx,
-		"SELECT v FROM kv WHERE k = ?",
-		func(stmt *sqlite.Stmt) {
-			stmt.BindBytes(1, makeKey(index))
-		},
-		func(stmt *sqlite.Stmt) error {
-			hasRow, err := stmt.Step()
-			if err != nil {
-				return err
-			}
-			if !hasRow {
-				return nil
-			}
-			n := stmt.ColumnLen(0)
-			result = make([]byte, n)
-			stmt.ColumnBytes(0, result)
-			return nil
-		})
-	return result, err
-}
-
-func (e *sqliteEngine) IterateAll() (int, error) {
-	ctx := context.Background()
-	conn, err := e.cm.GetRead(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer e.cm.ReleaseRead(conn)
-
-	count := 0
-	err = conn.Exec(ctx, "SELECT k FROM kv ORDER BY k", nil, func(stmt *sqlite.Stmt) error {
-		for {
-			hasRow, err := stmt.Step()
-			if err != nil {
-				return err
-			}
-			if !hasRow {
-				break
-			}
-			count++
-		}
-		return nil
-	})
-	return count, err
 }
 
 // ============================================================
@@ -375,7 +252,6 @@ func (e *badgerEngine) IterateAll() (int, error) {
 func allEngines() []engine {
 	return []engine{
 		&btreeEngine{},
-		&sqliteEngine{},
 		&boltEngine{},
 		&badgerEngine{},
 	}
