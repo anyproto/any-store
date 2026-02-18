@@ -99,5 +99,5 @@ func compareTuplePrefix(key, bound []byte) int {
 }
 
 func (it *CoverFilterIter) String() string {
-	return fmt.Sprintf("CoverFilter(%s)[bounds=%s] -> %s", it.IdxInfo.Name, it.Bounds.String(), it.Source)
+	return fmt.Sprintf("%s -> CoverFilter(%s)[bounds=%s]", it.Source, it.IdxInfo.Name, it.Bounds.String())
 }

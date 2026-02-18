@@ -51,6 +51,5 @@ func (it *FilterIter) Next() (key []byte, docId []byte, err error) {
 }
 
 func (it *FilterIter) String() string {
-	s := fmt.Sprintf("Filter -> %s", it.Source)
-	return s
+	return fmt.Sprintf("%s -> Filter", it.Source)
 }

@@ -80,5 +80,5 @@ func (it *SortIter) collectAndSort() error {
 }
 
 func (it *SortIter) String() string {
-	return fmt.Sprintf("Sort -> %s", it.Source)
+	return fmt.Sprintf("%s -> Sort", it.Source)
 }

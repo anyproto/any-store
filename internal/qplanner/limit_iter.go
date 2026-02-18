@@ -34,10 +34,10 @@ func (it *LimitIter) Next() (key []byte, docId []byte, err error) {
 
 func (it *LimitIter) String() string {
 	if it.Offset > 0 && it.Limit > 0 {
-		return fmt.Sprintf("Limit(offset=%d,limit=%d) -> %s", it.Offset, it.Limit, it.Source)
+		return fmt.Sprintf("%s -> Limit(offset=%d,limit=%d)", it.Source, it.Offset, it.Limit)
 	}
 	if it.Offset > 0 {
-		return fmt.Sprintf("Limit(offset=%d) -> %s", it.Offset, it.Source)
+		return fmt.Sprintf("%s -> Limit(offset=%d)", it.Source, it.Offset)
 	}
-	return fmt.Sprintf("Limit(%d) -> %s", it.Limit, it.Source)
+	return fmt.Sprintf("%s -> Limit(%d)", it.Source, it.Limit)
 }

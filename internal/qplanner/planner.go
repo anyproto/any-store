@@ -151,7 +151,7 @@ func BuildPlan(params *PlanParams) *Plan {
 				PreSorted: primaryIdx.PartialSort,
 			}
 		}
-	} else if primaryIdx != nil && (primaryIdx.ExactSort || primaryIdx.PartialSort) {
+	} else if primaryIdx != nil && (primaryIdx.ExactSort || primaryIdx.PartialSort) && !idBoundsPreferred(params.IDBounds) {
 		// Index covers sort (fully or partially) but has no query bounds - scan full index
 		reverse := false
 		if params.Sorter != nil {
@@ -289,6 +289,17 @@ func setPlanRef(it Iterator, plan *Plan) {
 	case *LimitIter:
 		setPlanRef(v.Source, plan)
 	}
+}
+
+// idBoundsPreferred returns true when id bounds are specific enough that
+// direct data-namespace lookups + in-memory sort is cheaper than a full index scan.
+// This is the case for small $in sets where all bounds are fixed-point.
+func idBoundsPreferred(idBounds query.Bounds) bool {
+	if len(idBounds) == 0 {
+		return false
+	}
+	// If all id bounds are point lookups, prefer direct data access
+	return allBoundsFixed(idBounds)
 }
 
 // allBoundsFixed returns true if all bounds have Start == End (point lookups).
