@@ -298,7 +298,7 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 
 	// Now delete collected docs
 	for _, id := range idsToDelete {
-		if err = q.c.deleteItem(btWtx, id); err != nil {
+		if err = q.c.deleteItem(btWtx, buf, id); err != nil {
 			return
 		}
 		result.Matched++

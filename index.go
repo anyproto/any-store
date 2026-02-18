@@ -3,11 +3,13 @@ package anystore
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/internal/btree"
 )
 
 // IndexInfo provides information about an index.
@@ -41,8 +43,12 @@ type Index interface {
 	Len(ctx context.Context) (int, error)
 }
 
-func newIndex(c *collection, info IndexInfo) (idx *index, err error) {
-	idx = &index{info: info, c: c}
+func indexNsName(collName, indexName string) string {
+	return "ix:" + collName + ":" + indexName
+}
+
+func newIndex(c *collection, info IndexInfo, ns *btree.Namespace) (idx *index, err error) {
+	idx = &index{info: info, c: c, ns: ns}
 	if err = idx.init(); err != nil {
 		return nil, err
 	}
@@ -52,6 +58,7 @@ func newIndex(c *collection, info IndexInfo) (idx *index, err error) {
 type index struct {
 	c    *collection
 	info IndexInfo
+	ns   *btree.Namespace
 
 	fieldNames []string
 	fieldPaths [][]string
@@ -101,8 +108,65 @@ func (idx *index) Info() IndexInfo {
 }
 
 func (idx *index) Len(ctx context.Context) (count int, err error) {
-	// For now, indexes are metadata-only; return 0
-	return 0, nil
+	err = idx.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		var txErr error
+		count, txErr = tx.Count(idx.ns)
+		return txErr
+	})
+	return
+}
+
+// insertKeys inserts index entries for the given item into the index namespace.
+func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
+	idx.fillKeysBuf(it)
+	idKey := it.appendId(nil)
+	for _, key := range idx.keysBuf {
+		if idx.info.Unique {
+			// For unique indexes: key = Tuple(v1, v2, ...), value = docId
+			// Check if key already exists with a different docId
+			if existingVal, err := tx.Get(idx.ns, key); err == nil {
+				if !bytes.Equal(existingVal, idKey) {
+					return ErrUniqueConstraint
+				}
+				continue
+			}
+			if err := tx.Put(idx.ns, key, idKey); err != nil {
+				return err
+			}
+		} else {
+			// For non-unique indexes: key = Tuple(v1, v2, ..., docId), value = nil
+			fullKey := append(anyenc.Tuple(nil), key...)
+			fullKey = append(fullKey, idKey...)
+			if err := tx.Put(idx.ns, fullKey, nil); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// deleteKeys deletes index entries for the given item from the index namespace.
+func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
+	idx.fillKeysBuf(it)
+	idKey := it.appendId(nil)
+	for _, key := range idx.keysBuf {
+		if idx.info.Unique {
+			if err := tx.Delete(idx.ns, key); err != nil {
+				if !errors.Is(err, btree.ErrKeyNotFound) {
+					return err
+				}
+			}
+		} else {
+			fullKey := append(anyenc.Tuple(nil), key...)
+			fullKey = append(fullKey, idKey...)
+			if err := tx.Delete(idx.ns, fullKey); err != nil {
+				if !errors.Is(err, btree.ErrKeyNotFound) {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (idx *index) writeKey() {

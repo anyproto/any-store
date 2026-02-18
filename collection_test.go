@@ -284,8 +284,7 @@ func TestCollection_CreateIndex(t *testing.T) {
 		assert.Equal(t, "doc", idxs[0].Info().Name)
 		count, err := idxs[0].Len(ctx)
 		require.NoError(t, err)
-		// indexes are metadata-only for now, Len returns 0
-		assert.Equal(t, 0, count)
+		assert.Equal(t, 2, count)
 	})
 }
 

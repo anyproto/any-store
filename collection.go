@@ -133,9 +133,14 @@ func (c *collection) init(ctx context.Context) error {
 			return err
 		}
 		for _, info := range idxInfos {
-			idx, err := newIndex(c, info)
-			if err != nil {
-				return err
+			nsName := indexNsName(c.name, info.Name)
+			ns, nsErr := c.db.btreeDB.GetNamespace(nsName)
+			if nsErr != nil {
+				return nsErr
+			}
+			idx, idxErr := newIndex(c, info, ns)
+			if idxErr != nil {
+				return idxErr
 			}
 			c.indexes = append(c.indexes, idx)
 		}
@@ -214,6 +219,13 @@ func (c *collection) insertItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, it i
 
 	if err = tx.Put(c.ns, buf.SmallBuf, buf.DocBuf); err != nil {
 		return err
+	}
+
+	// Insert index entries
+	for _, idx := range c.indexes {
+		if err = idx.insertKeys(tx, it); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -338,6 +350,16 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 		}
 	}
 
+	// Update index entries: delete old, insert new
+	for _, idx := range c.indexes {
+		if err = idx.deleteKeys(tx, prevIt); err != nil {
+			return
+		}
+		if err = idx.insertKeys(tx, it); err != nil {
+			return
+		}
+	}
+
 	buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
 	if err = tx.Put(c.ns, buf.SmallBuf, buf.DocBuf); err != nil {
 		return
@@ -392,11 +414,23 @@ func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
 		if txErr != nil {
 			return
 		}
-		return true, c.deleteItem(tx, buf.SmallBuf)
+		return true, c.deleteItem(tx, buf, buf.SmallBuf)
 	})
 }
 
-func (c *collection) deleteItem(tx *btree.WriteTx, id []byte) (err error) {
+func (c *collection) deleteItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, id []byte) (err error) {
+	// Delete index entries
+	if len(c.indexes) > 0 {
+		it, loadErr := c.loadById(tx, buf, id)
+		if loadErr != nil {
+			return loadErr
+		}
+		for _, idx := range c.indexes {
+			if err = idx.deleteKeys(tx, it); err != nil {
+				return err
+			}
+		}
+	}
 	return tx.Delete(c.ns, id)
 }
 
@@ -460,7 +494,24 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 		return nil, err
 	}
 
-	return newIndex(c, info)
+	// Create index namespace
+	nsName := indexNsName(c.name, info.Name)
+	ns, err := tx.CreateNamespace(nsName)
+	if err != nil {
+		return nil, err
+	}
+
+	idx, err = newIndex(c, info, ns)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build index from existing documents
+	if err = c.buildIndex(tx, idx); err != nil {
+		return nil, err
+	}
+
+	return idx, nil
 }
 
 func (c *collection) DropIndex(ctx context.Context, indexName string) (err error) {
@@ -482,10 +533,17 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 		if txErr = c.db.removeIndex(tx, c.name, indexName); txErr != nil {
 			return
 		}
+		// Delete the index namespace
+		nsName := indexNsName(c.name, indexName)
+		if txErr = tx.DeleteNamespace(nsName); txErr != nil {
+			if !errors.Is(txErr, btree.ErrNamespaceNotFound) {
+				return
+			}
+		}
 		c.indexes = slices.DeleteFunc(c.indexes, func(i *index) bool {
 			return i.Info().Name == indexName
 		})
-		return
+		return nil
 	})
 }
 
@@ -522,10 +580,19 @@ func (c *collection) Drop(ctx context.Context) error {
 		if err = c.close(); err != nil {
 			return err
 		}
+		// Delete all index namespaces
+		for _, idx := range c.indexes {
+			nsName := indexNsName(c.name, idx.info.Name)
+			if err = tx.DeleteNamespace(nsName); err != nil {
+				if !errors.Is(err, btree.ErrNamespaceNotFound) {
+					return
+				}
+			}
+		}
 		if err = c.db.removeCollection(tx, c.name); err != nil {
 			return
 		}
-		// Delete the namespace
+		// Delete the collection namespace
 		if err = tx.DeleteNamespace(c.name); err != nil {
 			if !errors.Is(err, btree.ErrNamespaceNotFound) {
 				return
@@ -555,6 +622,39 @@ func (c *collection) close() error {
 		return nil
 	}
 	c.db.onCollectionClose(c.name)
+	return nil
+}
+
+// buildIndex populates index entries from all existing documents in the collection.
+func (c *collection) buildIndex(tx *btree.WriteTx, idx *index) error {
+	buf := c.db.syncPool.GetDocBuf()
+	defer c.db.syncPool.ReleaseDocBuf(buf)
+
+	cursor := tx.NewCursor(c.ns)
+	if err := cursor.First(); err != nil {
+		return err
+	}
+	for cursor.Valid() {
+		val, err := cursor.Value()
+		if err != nil {
+			return err
+		}
+		buf.DocBuf = append(buf.DocBuf[:0], val...)
+		doc, err := buf.Parser.Parse(buf.DocBuf)
+		if err != nil {
+			return err
+		}
+		it, err := newItem(doc)
+		if err != nil {
+			return err
+		}
+		if err = idx.insertKeys(tx, it); err != nil {
+			return err
+		}
+		if err = cursor.Next(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
