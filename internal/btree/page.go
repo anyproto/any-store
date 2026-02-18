@@ -348,6 +348,27 @@ func (p *page) getCellOffsetSafe(i int) (uint16, error) {
 	return binary.BigEndian.Uint16(p.data[base : base+2]), nil
 }
 
+// contentAreaOffset returns the resolved cell content area offset, validating
+// it against the usable page size. Matches SQLite's allocateSpace() validation
+// (btree.c lines 1843-1853): if cellContentOff is 0 and usableSize is 65536,
+// treat as 65536; if cellContentOff > usableSize, return ErrCorrupt; if
+// cellContentOff < gap (cell pointer array end), return ErrCorrupt.
+func (p *page) contentAreaOffset(usableSize int) (int, error) {
+	top := int(p.header.cellContentOff)
+	gap := p.cellPointerOffset() + int(p.header.cellCount)*2
+	if top == 0 {
+		if usableSize == 65536 {
+			top = 65536
+		} else {
+			top = usableSize
+		}
+	}
+	if top > usableSize || top < gap {
+		return 0, ErrCorrupt
+	}
+	return top, nil
+}
+
 // setCellOffset sets the offset of the i-th cell in the cell pointer array.
 func (p *page) setCellOffset(i int, off uint16) {
 	base := p.cellPointerOffset() + i*2

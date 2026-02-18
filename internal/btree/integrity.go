@@ -163,9 +163,12 @@ func (ic *integrityChecker) checkList(isFreeList bool, firstPgno uint32, expecte
 func (ic *integrityChecker) checkPageCoverage(pg *page, context string, h []uint32) {
 	// contentOffset is cellContentOff from the page header.
 	// This is the start of the cell content area, NOT the end of the cell pointer array.
-	contentOffset := int(pg.header.cellContentOff)
-	if contentOffset == 0 {
-		contentOffset = ic.usableSize
+	// Validate against usableSize, matching SQLite's allocateSpace()
+	// validation (btree.c lines 1843-1853).
+	contentOffset, coErr := pg.contentAreaOffset(ic.usableSize)
+	if coErr != nil {
+		ic.report("%s: invalid cell content offset", context)
+		return
 	}
 
 	// Walk freeblock chain and add to heap
@@ -245,10 +248,13 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 	nCells := int(pg.header.cellCount)
 	isLeaf := pg.header.isLeaf()
 
-	// contentOffset from the page header (start of cell content area)
-	contentOffset := int(pg.header.cellContentOff)
-	if contentOffset == 0 {
-		contentOffset = ic.usableSize
+	// contentOffset from the page header (start of cell content area).
+	// Validate against usableSize, matching SQLite's allocateSpace()
+	// validation (btree.c lines 1843-1853).
+	contentOffset, coErr := pg.contentAreaOffset(ic.usableSize)
+	if coErr != nil {
+		ic.report("%s: invalid cell content offset", context)
+		return 0
 	}
 
 	doCoverageCheck := true
@@ -468,9 +474,13 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 
 	{
 		nCells := int(pg1.header.cellCount)
-		contentOffset := int(pg1.header.cellContentOff)
-		if contentOffset == 0 {
-			contentOffset = ic.usableSize
+		// Validate contentOffset, matching SQLite's allocateSpace()
+		// validation (btree.c lines 1843-1853).
+		contentOffset, coErr := pg1.contentAreaOffset(ic.usableSize)
+		if coErr != nil {
+			ic.report("tree master page 1: invalid cell content offset")
+			db.pager.releasePage(pg1)
+			goto checkOrphans
 		}
 
 		var h []uint32

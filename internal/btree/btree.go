@@ -802,9 +802,11 @@ func (bt *btree) insertIntoLeafWithPath(pg *page, key, value []byte, path []uint
 	cellSize := leafCellSizeWithOverflow(key, value, pageUsable)
 
 	hdrSize := pg.cellPointerOffset() + int(pg.header.cellCount+1)*2
-	contentStart := int(pg.header.cellContentOff)
-	if contentStart == 0 {
-		contentStart = pageUsable
+	// Validate cellContentOff before using as slice index.
+	// Matches SQLite's allocateSpace() validation (btree.c lines 1843-1853).
+	contentStart, err := pg.contentAreaOffset(pageUsable)
+	if err != nil {
+		return err
 	}
 	gapSpace := contentStart - hdrSize
 
@@ -846,9 +848,11 @@ func (bt *btree) insertIntoLeaf(pg *page, key, value []byte) error {
 
 	// Check if there's enough contiguous space
 	hdrSize := pg.cellPointerOffset() + int(pg.header.cellCount+1)*2
-	contentStart := int(pg.header.cellContentOff)
-	if contentStart == 0 {
-		contentStart = pageUsable
+	// Validate cellContentOff before using as slice index.
+	// Matches SQLite's allocateSpace() validation (btree.c lines 1843-1853).
+	contentStart, err := pg.contentAreaOffset(pageUsable)
+	if err != nil {
+		return err
 	}
 	gapSpace := contentStart - hdrSize
 
@@ -894,12 +898,17 @@ func (bt *btree) insertLeafCellAt(pg *page, idx int, key, value []byte) error {
 		cellSize = leafCellSize(key, value)
 	}
 
-	// Compute new content offset
-	contentStart := int(pg.header.cellContentOff)
-	if contentStart == 0 {
-		contentStart = pageUsable
+	// Compute new content offset.
+	// Validate cellContentOff before using as slice index.
+	// Matches SQLite's allocateSpace() validation (btree.c lines 1843-1853).
+	contentStart, cerr := pg.contentAreaOffset(pageUsable)
+	if cerr != nil {
+		return cerr
 	}
 	newContentStart := contentStart - cellSize
+	if newContentStart < 0 || newContentStart >= len(pg.data) {
+		return ErrCorrupt
+	}
 
 	// Write cell data
 	if overflowPgno != 0 {
@@ -1017,11 +1026,16 @@ func (bt *btree) collectLeafCells(pg *page) []cellData {
 	cells := make([]cellData, n)
 	usableSize := bt.usablePageSize()
 	// Estimate actual content size from page header to avoid over-allocation.
-	contentOff := int(pg.header.cellContentOff)
-	if contentOff == 0 {
+	// Validate contentOff to avoid negative capacity from corrupted headers.
+	// Matches SQLite's allocateSpace() validation (btree.c lines 1843-1853).
+	contentOff, coErr := pg.contentAreaOffset(usableSize)
+	if coErr != nil {
 		contentOff = usableSize
 	}
 	contentSize := usableSize - contentOff
+	if contentSize < 0 {
+		contentSize = 0
+	}
 	buf := make([]byte, 0, contentSize)
 	for i := range n {
 		off := pg.getCellOffset(i)
@@ -1298,9 +1312,12 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 
 	cellSize := interiorCellSizeWithOverflow(key, pageUsable)
 	hdrSize := cpOff + (n+1)*2
-	contentStart := int(parentPg.header.cellContentOff)
-	if contentStart == 0 {
-		contentStart = pageUsable
+	// Validate cellContentOff before using as slice index.
+	// Matches SQLite's allocateSpace() validation (btree.c lines 1843-1853).
+	contentStart, cerr := parentPg.contentAreaOffset(pageUsable)
+	if cerr != nil {
+		bt.pager.releasePage(parentPg)
+		return cerr
 	}
 	freeSpace := contentStart - hdrSize
 
@@ -1308,6 +1325,10 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 		// Insert cell into parent in-place
 		maxLocal := maxLocalPayload(pageUsable)
 		newContentStart := contentStart - cellSize
+		if newContentStart < 0 || newContentStart >= len(parentPg.data) {
+			bt.pager.releasePage(parentPg)
+			return ErrCorrupt
+		}
 		if len(key) > maxLocal {
 			localSize := localPayloadSize(len(key), pageUsable)
 			overflowData := key[localSize:]
@@ -1621,10 +1642,13 @@ func (bt *btree) Delete(key []byte) error {
 	newFrag := int(wpg.header.fragBytes) + oldCellSize
 	needsRebuild := false
 
-	// If the cell is at the content area boundary, reclaim space directly
-	contentStart := int(wpg.header.cellContentOff)
-	if contentStart == 0 {
-		contentStart = usableSize
+	// If the cell is at the content area boundary, reclaim space directly.
+	// Validate cellContentOff before using.
+	// Matches SQLite's allocateSpace() validation (btree.c lines 1843-1853).
+	contentStart, coErr := wpg.contentAreaOffset(usableSize)
+	if coErr != nil {
+		bt.pager.releasePage(wpg)
+		return coErr
 	}
 	if cellOff == contentStart {
 		// Cell is at the start of content area — reclaim by advancing contentStart
@@ -1686,9 +1710,10 @@ func (bt *btree) Delete(key []byte) error {
 // leafUsedSpace returns the approximate used space on a leaf page.
 func (bt *btree) leafUsedSpace(pg *page) int {
 	usable := bt.usablePageSize()
-	contentOff := int(pg.header.cellContentOff)
-	if contentOff == 0 {
-		contentOff = usable
+	// Validate contentOff to avoid computing with corrupted headers.
+	contentOff, err := pg.contentAreaOffset(usable)
+	if err != nil {
+		return usable // treat corrupted page as fully used
 	}
 	cellPtrEnd := pg.cellPointerOffset() + int(pg.header.cellCount)*2
 	return cellPtrEnd + (usable - contentOff)
@@ -1954,6 +1979,12 @@ func (bt *btree) countPage(pgno uint32) (int, error) {
 	return total, nil
 }
 
+// btCursorMaxDepth is the maximum depth of the cursor stack.
+// Matches SQLite's BTCURSOR_MAX_DEPTH (btreeInt.h). Any B-tree deeper than
+// this is considered corrupt. This limit also catches circular page references
+// that would otherwise cause infinite loops during cursor traversal.
+const btCursorMaxDepth = 20
+
 // Cursor provides ordered iteration over a B-tree.
 type Cursor struct {
 	bt    *btree
@@ -1976,11 +2007,15 @@ func (c *Cursor) First() error {
 		return err
 	}
 
-	// Descend to leftmost leaf
+	// Descend to leftmost leaf (mirrors SQLite's moveToLeftmost via moveToChild).
 	for pg.header.isInterior() {
 		if pg.header.cellCount == 0 {
 			c.bt.pager.releasePage(pg)
 			return nil
+		}
+		if len(c.stack) >= btCursorMaxDepth-1 {
+			c.bt.pager.releasePage(pg)
+			return ErrCorrupt
 		}
 		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: 0})
 		off := int(pg.getCellOffset(0))
@@ -2015,8 +2050,13 @@ func (c *Cursor) Last() error {
 		return err
 	}
 
+	// Descend to rightmost leaf (mirrors SQLite's moveToRightmost via moveToChild).
 	for pg.header.isInterior() {
 		n := int(pg.header.cellCount)
+		if len(c.stack) >= btCursorMaxDepth-1 {
+			c.bt.pager.releasePage(pg)
+			return ErrCorrupt
+		}
 		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: n})
 		childPgno := pg.header.rightChild
 		c.bt.pager.releasePage(pg)
@@ -2051,6 +2091,10 @@ func (c *Cursor) Seek(key []byte) error {
 		if serr != nil {
 			c.bt.pager.releasePage(pg)
 			return serr
+		}
+		if len(c.stack) >= btCursorMaxDepth-1 {
+			c.bt.pager.releasePage(pg)
+			return ErrCorrupt
 		}
 		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: cellIdx})
 		c.bt.pager.releasePage(pg)
@@ -2206,7 +2250,7 @@ func (c *Cursor) Next() error {
 
 		c.bt.pager.releasePage(pg)
 
-		// Descend to leftmost leaf of child
+		// Descend to leftmost leaf of child (mirrors SQLite's moveToLeftmost).
 		childPg, err := c.bt.getPage(childPgno)
 		if err != nil {
 			return err
@@ -2214,6 +2258,10 @@ func (c *Cursor) Next() error {
 		for childPg.header.isInterior() {
 			if childPg.header.cellCount == 0 {
 				break
+			}
+			if len(c.stack) >= btCursorMaxDepth-1 {
+				c.bt.pager.releasePage(childPg)
+				return ErrCorrupt
 			}
 			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: 0})
 			off := int(childPg.getCellOffset(0))
@@ -2303,7 +2351,7 @@ func (c *Cursor) Previous() error {
 
 		c.bt.pager.releasePage(pg)
 
-		// Descend to the rightmost leaf of this child subtree
+		// Descend to the rightmost leaf of this child subtree (mirrors SQLite's moveToRightmost).
 		childPg, err := c.bt.getPage(childPgno)
 		if err != nil {
 			return err
@@ -2312,6 +2360,10 @@ func (c *Cursor) Previous() error {
 			n := int(childPg.header.cellCount)
 			if n == 0 {
 				break
+			}
+			if len(c.stack) >= btCursorMaxDepth-1 {
+				c.bt.pager.releasePage(childPg)
+				return ErrCorrupt
 			}
 			// Push frame pointing to the rightChild position (cellIdx = n)
 			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: n})
