@@ -1,6 +1,7 @@
 package qplanner
 
 import (
+	"bytes"
 	"fmt"
 	"sort"
 
@@ -11,10 +12,11 @@ import (
 // SortIter collects all results from the source iterator, fetches documents,
 // computes sort keys, sorts in memory, then yields results in sorted order.
 type SortIter struct {
-	Source Iterator
-	Data   *CursorSource
-	Sorter query.Sort
-	Buf    *syncpool.DocBuffer
+	Source    Iterator
+	Data      *CursorSource
+	Sorter    query.Sort
+	Buf       *syncpool.DocBuffer
+	PreSorted bool // hint that upstream data is partially sorted (helps quicksort)
 
 	entries []sortEntry
 	idx     int
@@ -71,22 +73,7 @@ func (it *SortIter) collectAndSort() error {
 	}
 
 	sort.SliceStable(it.entries, func(a, b int) bool {
-		ka, kb := it.entries[a].sortKey, it.entries[b].sortKey
-		if len(ka) < len(kb) {
-			return true
-		}
-		if len(ka) > len(kb) {
-			return false
-		}
-		for i := range ka {
-			if ka[i] < kb[i] {
-				return true
-			}
-			if ka[i] > kb[i] {
-				return false
-			}
-		}
-		return false
+		return bytes.Compare(it.entries[a].sortKey, it.entries[b].sortKey) < 0
 	})
 
 	return nil

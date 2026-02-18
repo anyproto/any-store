@@ -43,6 +43,8 @@ type PlanIndex struct {
 	Bounds             query.Bounds
 	Weight             int
 	ExactSort          bool
+	PartialSort        bool
+	PartialSortFields  int
 	Used               bool
 	FilterFullyCovered bool // index bounds fully express the query filter
 }
@@ -51,48 +53,48 @@ type PlanIndex struct {
 func BuildPlan(params *PlanParams) *Plan {
 	var root Iterator
 
-	// Try to find a usable index
-	var bestIdx *PlanIndex
+	// Collect all used indexes
+	var usedIndexes []*PlanIndex
 	for i := range params.Indexes {
-		idx := &params.Indexes[i]
-		if idx.Weight < 1 || !idx.Used {
-			continue
+		if params.Indexes[i].Used && params.Indexes[i].Weight >= 1 {
+			usedIndexes = append(usedIndexes, &params.Indexes[i])
 		}
-		if len(idx.Bounds) > 0 {
-			bestIdx = idx
-			break
-		}
-		if idx.ExactSort {
-			bestIdx = idx
-			break
+	}
+
+	// Find the primary index (best one with bounds or sort coverage)
+	var primaryIdx *PlanIndex
+	var coverIndexes []*PlanIndex
+	for _, idx := range usedIndexes {
+		if primaryIdx == nil && (len(idx.Bounds) > 0 || idx.ExactSort || idx.PartialSort) {
+			primaryIdx = idx
+		} else {
+			coverIndexes = append(coverIndexes, idx)
 		}
 	}
 
 	needSort := params.Sorter != nil
 	needFilter := params.Filter != nil && !isAllFilter(params.Filter)
 
-	if bestIdx != nil && len(bestIdx.Bounds) > 0 {
+	if primaryIdx != nil && len(primaryIdx.Bounds) > 0 {
 		// Check if all bounds are fixed-point (Start == End) for cover lookup
-		allFixed := bestIdx.Info.Unique && allBoundsFixed(bestIdx.Bounds)
+		allFixed := primaryIdx.Info.Unique && allBoundsFixed(primaryIdx.Bounds)
 
 		if allFixed {
 			root = &CoverIter{
 				Source: &CursorSource{
 					Tx: params.Tx,
-					Ns: bestIdx.Info.Ns,
+					Ns: primaryIdx.Info.Ns,
 				},
-				IdxInfo: bestIdx.Info,
-				Bounds:  bestIdx.Bounds,
+				IdxInfo: primaryIdx.Info,
+				Bounds:  primaryIdx.Bounds,
 			}
 		} else {
 			// Determine if we should reverse the index scan
 			reverse := false
-			if bestIdx.ExactSort && params.Sorter != nil {
-				// Check if first sort field's direction matches index direction
+			if (primaryIdx.ExactSort || primaryIdx.PartialSort) && params.Sorter != nil {
 				fields := params.Sorter.Fields()
-				if len(fields) > 0 && len(bestIdx.Info.Reverse) > 0 {
-					// If sort wants reverse of what index provides, scan backwards
-					if fields[0].Reverse != bestIdx.Info.Reverse[0] {
+				if len(fields) > 0 && len(primaryIdx.Info.Reverse) > 0 {
+					if fields[0].Reverse != primaryIdx.Info.Reverse[0] {
 						reverse = true
 					}
 				}
@@ -101,11 +103,25 @@ func BuildPlan(params *PlanParams) *Plan {
 			root = &IndexIter{
 				Source: &CursorSource{
 					Tx: params.Tx,
-					Ns: bestIdx.Info.Ns,
+					Ns: primaryIdx.Info.Ns,
 				},
-				IdxInfo: bestIdx.Info,
-				Bounds:  bestIdx.Bounds,
+				IdxInfo: primaryIdx.Info,
+				Bounds:  primaryIdx.Bounds,
 				Reverse: reverse,
+			}
+		}
+
+		// Apply cover filtration from additional indexes
+		for _, coverIdx := range coverIndexes {
+			if len(coverIdx.Bounds) > 0 {
+				root = &CoverFilterIter{
+					Source:  root,
+					Data:    &CursorSource{Tx: params.Tx, Ns: params.DataNs},
+					IdxInfo: coverIdx.Info,
+					Index:   &CursorSource{Tx: params.Tx, Ns: coverIdx.Info.Ns},
+					Bounds:  coverIdx.Bounds,
+					Buf:     params.Buf,
+				}
 			}
 		}
 
@@ -122,25 +138,26 @@ func BuildPlan(params *PlanParams) *Plan {
 			}
 		}
 
-		// Sort if index doesn't cover sorting
-		if needSort && !bestIdx.ExactSort {
+		// Sort if index doesn't cover sorting fully
+		if needSort && !primaryIdx.ExactSort {
 			root = &SortIter{
 				Source: root,
 				Data: &CursorSource{
 					Tx: params.Tx,
 					Ns: params.DataNs,
 				},
-				Sorter: params.Sorter,
-				Buf:    params.Buf,
+				Sorter:    params.Sorter,
+				Buf:       params.Buf,
+				PreSorted: primaryIdx.PartialSort,
 			}
 		}
-	} else if bestIdx != nil && bestIdx.ExactSort {
-		// Index covers sort but has no query bounds - scan full index
+	} else if primaryIdx != nil && (primaryIdx.ExactSort || primaryIdx.PartialSort) {
+		// Index covers sort (fully or partially) but has no query bounds - scan full index
 		reverse := false
 		if params.Sorter != nil {
 			fields := params.Sorter.Fields()
-			if len(fields) > 0 && len(bestIdx.Info.Reverse) > 0 {
-				if fields[0].Reverse != bestIdx.Info.Reverse[0] {
+			if len(fields) > 0 && len(primaryIdx.Info.Reverse) > 0 {
+				if fields[0].Reverse != primaryIdx.Info.Reverse[0] {
 					reverse = true
 				}
 			}
@@ -149,10 +166,24 @@ func BuildPlan(params *PlanParams) *Plan {
 		root = &IndexIter{
 			Source: &CursorSource{
 				Tx: params.Tx,
-				Ns: bestIdx.Info.Ns,
+				Ns: primaryIdx.Info.Ns,
 			},
-			IdxInfo: bestIdx.Info,
+			IdxInfo: primaryIdx.Info,
 			Reverse: reverse,
+		}
+
+		// Apply cover filtration from additional indexes
+		for _, coverIdx := range coverIndexes {
+			if len(coverIdx.Bounds) > 0 {
+				root = &CoverFilterIter{
+					Source:  root,
+					Data:    &CursorSource{Tx: params.Tx, Ns: params.DataNs},
+					IdxInfo: coverIdx.Info,
+					Index:   &CursorSource{Tx: params.Tx, Ns: coverIdx.Info.Ns},
+					Bounds:  coverIdx.Bounds,
+					Buf:     params.Buf,
+				}
+			}
 		}
 
 		// Fetch data and filter
@@ -167,7 +198,20 @@ func BuildPlan(params *PlanParams) *Plan {
 				Buf:    params.Buf,
 			}
 		}
-		// No sort needed - index covers it
+
+		// If only partial sort, still need a full re-sort (but pre-sorted data helps quicksort)
+		if needSort && !primaryIdx.ExactSort {
+			root = &SortIter{
+				Source: root,
+				Data: &CursorSource{
+					Tx: params.Tx,
+					Ns: params.DataNs,
+				},
+				Sorter:    params.Sorter,
+				Buf:       params.Buf,
+				PreSorted: primaryIdx.PartialSort,
+			}
+		}
 	} else {
 		// Full scan path
 		idSorted := false
@@ -236,6 +280,8 @@ func setPlanRef(it Iterator, plan *Plan) {
 	switch v := it.(type) {
 	case *FilterIter:
 		v.Plan = plan
+		setPlanRef(v.Source, plan)
+	case *CoverFilterIter:
 		setPlanRef(v.Source, plan)
 	case *SortIter:
 		// Don't propagate plan ref past SortIter — it collects all docs,

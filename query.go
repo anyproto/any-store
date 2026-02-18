@@ -1,20 +1,14 @@
 package anystore
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"slices"
-	"sort"
 
 	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/internal/bitmap"
 	"github.com/anyproto/any-store/internal/btree"
 	"github.com/anyproto/any-store/internal/qplanner"
 	"github.com/anyproto/any-store/query"
 )
-
-const maxIndexesInQuery = 1
 
 // ModifyResult represents the result of a modification operation.
 type ModifyResult struct {
@@ -81,17 +75,11 @@ type collQuery struct {
 
 	limit, offset uint
 
-	indexesWithWeight weightedIndexes
-	sortFields        []query.SortField
-	queryFields       []queryField
-	indexHints        []IndexHint
+	weightedIndexes []qplanner.WeightedIndex
+	sortFields      []query.SortField
+	indexHints      []IndexHint
 
 	err error
-}
-
-type queryField struct {
-	field  string
-	bounds query.Bounds
 }
 
 func (q *collQuery) Cond(filter any) Query {
@@ -388,33 +376,15 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 		return
 	}
 
-	for _, idx := range q.indexesWithWeight {
+	for _, idx := range q.weightedIndexes {
 		explain.Indexes = append(explain.Indexes, IndexExplain{
-			Name:   idx.Info().Name,
-			Weight: idx.weight,
-			Used:   idx.used,
+			Name:   idx.Info.Name,
+			Weight: idx.Weight,
+			Used:   idx.Used,
 		})
 	}
 	return
 }
-
-type indexWithWeight struct {
-	*index
-	weight             int
-	pos                int
-	queryFieldsBits    bitmap.Bitmap256
-	sortFieldsBits     bitmap.Bitmap256
-	bounds             query.Bounds
-	exactSort          bool
-	used               bool
-	filterFullyCovered bool
-}
-
-type weightedIndexes []indexWithWeight
-
-func (w weightedIndexes) Len() int           { return len(w) }
-func (w weightedIndexes) Less(i, j int) bool { return w[i].weight > w[j].weight }
-func (w weightedIndexes) Swap(i, j int)      { w[i], w[j] = w[j], w[i] }
 
 func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 	if q.err != nil {
@@ -439,271 +409,58 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 		qb.idBounds = idBounds
 	}
 
-	// calculate weights (kept for index choosing logic, not used for actual queries)
-	q.indexesWithWeight = make(weightedIndexes, len(q.c.indexes))
+	// Build IndexInfo list for the planner
+	indexInfos := make([]*qplanner.IndexInfo, len(q.c.indexes))
 	for i, idx := range q.c.indexes {
-		q.indexesWithWeight[i].index = idx
-		q.indexesWithWeight[i].weight,
-			q.indexesWithWeight[i].queryFieldsBits = q.indexQueryWeight(idx)
-		if sw, sf := q.indexSortWeight(idx); sw > 0 {
-			q.indexesWithWeight[i].weight += sw
-			q.indexesWithWeight[i].sortFieldsBits = sf
-			q.indexesWithWeight[i].exactSort = sf.CountLeadingOnes() == len(q.sortFields)
-		}
-		if q.indexesWithWeight[i].weight > 0 {
-			for _, hint := range q.indexHints {
-				if hint.IndexName == idx.info.Name {
-					q.indexesWithWeight[i].weight += hint.Boost
-				}
-			}
-		}
-	}
-	sort.Sort(q.indexesWithWeight)
-
-	// Build bitmap of all query fields that have bounds
-	var allQueryFieldsBits bitmap.Bitmap256
-	for i, f := range q.queryFields {
-		if len(f.bounds) != 0 && i < 256 {
-			allQueryFieldsBits = allQueryFieldsBits.Set(uint8(i))
+		indexInfos[i] = &qplanner.IndexInfo{
+			Name:       idx.info.Name,
+			FieldNames: idx.fieldNames,
+			FieldPaths: idx.fieldPaths,
+			Reverse:    idx.reverse,
+			Unique:     idx.info.Unique,
+			Sparse:     idx.info.Sparse,
+			Ns:         idx.ns,
 		}
 	}
 
-	// filter useless indexes and mark used ones
-	var (
-		usedFieldsBits bitmap.Bitmap256
-		usedSortBits   bitmap.Bitmap256
-		exactSortFound bool
-		usedCount      int
-	)
-	for i, idx := range q.indexesWithWeight {
-		if idx.weight < 1 {
-			continue
-		}
-		if usedCount >= maxIndexesInQuery {
-			break
-		}
-		if usedFieldsBits.Subtract(idx.queryFieldsBits).Count() != 0 ||
-			usedSortBits.Subtract(idx.sortFieldsBits).Count() != 0 ||
-			(!exactSortFound && idx.exactSort) {
-			usedFieldsBits = usedFieldsBits.Or(idx.queryFieldsBits)
-			usedSortBits = usedSortBits.Or(idx.sortFieldsBits)
-			if idx.exactSort {
-				exactSortFound = true
-			}
-			q.indexesWithWeight[i].used = true
-			bounds, chainLen := q.computeIndexBounds(idx.index)
-			q.indexesWithWeight[i].bounds = bounds
-			// Check if the index chain covers ALL query fields with bounds
-			if chainLen > 0 && allQueryFieldsBits.Count() > 0 {
-				var chainFieldsBits bitmap.Bitmap256
-				for ci := range chainLen {
-					if ci < len(idx.fieldNames) {
-						_, fi := q.queryField(idx.fieldNames[ci])
-						if fi < 256 {
-							chainFieldsBits = chainFieldsBits.Set(uint8(fi))
-						}
-					}
-				}
-				if allQueryFieldsBits.Subtract(chainFieldsBits).Count() == 0 {
-					q.indexesWithWeight[i].filterFullyCovered = true
-				}
-			}
-			usedCount++
-		}
+	// Convert hints
+	hints := make([]qplanner.IndexHintParam, len(q.indexHints))
+	for i, h := range q.indexHints {
+		hints[i] = qplanner.IndexHintParam{IndexName: h.IndexName, Boost: h.Boost}
 	}
+
+	// Compute weights using the qplanner package
+	q.weightedIndexes, _ = qplanner.ComputeWeights(indexInfos, &qplanner.WeightParams{
+		Cond:       q.cond,
+		SortFields: q.sortFields,
+		IndexHints: hints,
+		MaxIndexes: 2,
+	})
 
 	return
-}
-
-func (q *collQuery) queryField(field string) (queryField, int) {
-	for i, f := range q.queryFields {
-		if f.field == field {
-			return f, i
-		}
-	}
-	bounds := q.cond.IndexBounds(field, nil)
-	f := queryField{
-		field:  field,
-		bounds: bounds,
-	}
-	q.queryFields = append(q.queryFields, f)
-	return f, len(q.queryFields) - 1
-}
-
-func (q *collQuery) indexQueryWeight(idx *index) (weight int, fieldBits bitmap.Bitmap256) {
-	var isChain = true
-	for i, field := range idx.fieldNames {
-		qField, fi := q.queryField(field)
-		if len(qField.bounds) != 0 {
-			if isChain {
-				if i == 0 {
-					weight = 10
-				} else {
-					weight *= 2
-				}
-			} else {
-				weight += 2
-			}
-			if i < 256 {
-				fieldBits = fieldBits.Set(uint8(fi))
-			}
-		} else {
-			if isChain {
-				isChain = false
-				weight -= 1
-			}
-		}
-	}
-	if weight > 0 && idx.info.Unique {
-		weight++
-	}
-	return
-}
-
-// computeIndexBounds computes combined tuple bounds for an index
-// by combining per-field bounds from the query condition.
-// It also returns the number of leading chain fields used.
-func (q *collQuery) computeIndexBounds(idx *index) (query.Bounds, int) {
-	// Collect per-field bounds for leading chain fields
-	type fieldBound struct {
-		bounds query.Bounds
-		fixed  bool // all bounds have Start == End
-	}
-
-	var chain []fieldBound
-	for _, field := range idx.fieldNames {
-		fb := q.cond.IndexBounds(field, nil)
-		if len(fb) == 0 {
-			break
-		}
-		allFixed := true
-		for _, b := range fb {
-			if len(b.Start) == 0 || !bytes.Equal(b.Start, b.End) {
-				allFixed = false
-				break
-			}
-		}
-		chain = append(chain, fieldBound{bounds: fb, fixed: allFixed})
-		if !allFixed {
-			break // can't extend past a range field
-		}
-	}
-
-	if len(chain) == 0 {
-		return nil, 0
-	}
-
-	chainLen := len(chain)
-
-	// Build combined bounds by extending prefix through chain
-	// Start with bounds from first field
-	var result query.Bounds
-	for _, b := range chain[0].bounds {
-		result = append(result, b)
-	}
-
-	// For subsequent fields where all previous are fixed, extend the prefix
-	for i := 1; i < len(chain); i++ {
-		if !chain[i-1].fixed {
-			break
-		}
-		var extended query.Bounds
-		for _, prev := range result {
-			for _, cur := range chain[i].bounds {
-				eb := query.Bound{
-					StartInclude: cur.StartInclude,
-					EndInclude:   cur.EndInclude,
-				}
-				if len(cur.Start) > 0 {
-					eb.Start = append(append(anyenc.Tuple(nil), prev.Start...), cur.Start...)
-				} else {
-					// cur.Start is -inf: combined start is just the prefix
-					eb.Start = append(anyenc.Tuple(nil), prev.Start...)
-					eb.StartInclude = true
-				}
-				if len(cur.End) > 0 {
-					eb.End = append(append(anyenc.Tuple(nil), prev.End...), cur.End...)
-				} else {
-					// cur.End is +inf: use prefix + 0xff to capture all entries under prefix
-					eb.End = append(append(anyenc.Tuple(nil), prev.End...), 0xff)
-					eb.EndInclude = true
-				}
-				extended = append(extended, eb)
-			}
-		}
-		result = extended
-	}
-
-	return result, chainLen
 }
 
 // buildPlanIndexes converts weighted indexes to PlanIndex entries for the planner.
 func (q *collQuery) buildPlanIndexes() []qplanner.PlanIndex {
-	result := make([]qplanner.PlanIndex, 0, len(q.indexesWithWeight))
-	for _, iw := range q.indexesWithWeight {
-		bounds := iw.bounds
+	result := make([]qplanner.PlanIndex, 0, len(q.weightedIndexes))
+	for _, wi := range q.weightedIndexes {
+		bounds := wi.Bounds
 		// For non-unique indexes, keys have docId appended after index fields.
 		// Adjust End bounds to include all docId suffixes by appending 0xff.
-		if !iw.info.Unique && len(bounds) > 0 {
-			adjusted := make(query.Bounds, len(bounds))
-			for i, b := range bounds {
-				adjusted[i] = b
-				if len(b.End) > 0 && b.EndInclude {
-					adjusted[i].End = append(append(anyenc.Tuple(nil), b.End...), 0xff)
-					adjusted[i].EndInclude = true
-				}
-			}
-			bounds = adjusted
+		if !wi.Info.Unique && len(bounds) > 0 {
+			bounds = qplanner.AdjustBoundsForNonUnique(bounds)
 		}
 		pi := qplanner.PlanIndex{
-			Info: &qplanner.IndexInfo{
-				Name:       iw.info.Name,
-				FieldNames: iw.fieldNames,
-				FieldPaths: iw.fieldPaths,
-				Reverse:    iw.reverse,
-				Unique:     iw.info.Unique,
-				Sparse:     iw.info.Sparse,
-				Ns:         iw.ns,
-			},
+			Info:               wi.Info,
 			Bounds:             bounds,
-			Weight:             iw.weight,
-			ExactSort:          iw.exactSort,
-			Used:               iw.used,
-			FilterFullyCovered: iw.filterFullyCovered,
+			Weight:             wi.Weight,
+			ExactSort:          wi.ExactSort,
+			PartialSort:        wi.PartialSort,
+			PartialSortFields:  wi.PartialSortFields,
+			Used:               wi.Used,
+			FilterFullyCovered: wi.FilterFullyCovered,
 		}
 		result = append(result, pi)
 	}
 	return result
-}
-
-func (q *collQuery) indexSortWeight(idx *index) (weight int, fieldBits bitmap.Bitmap256) {
-	var isChain = true
-	sortFields := q.sortFields
-	if len(sortFields) > 256 {
-		sortFields = sortFields[:256]
-	}
-	for i, sf := range sortFields {
-		if isChain && i < len(idx.fieldNames) {
-			if idx.fieldNames[i] == sf.Field {
-				if i == 0 {
-					weight = 11
-				} else {
-					weight *= 2
-					if idx.reverse[i] == sf.Reverse {
-						weight += 2
-					}
-				}
-				fieldBits = fieldBits.Set(uint8(i))
-				continue
-			}
-		}
-		isChain = false
-		if slices.Contains(idx.fieldNames, sf.Field) {
-			weight += 5
-			fieldBits = fieldBits.Set(uint8(i))
-		} else {
-			break
-		}
-	}
-	return
 }

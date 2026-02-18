@@ -17,7 +17,14 @@ type Bound struct {
 }
 
 func (b Bound) String() string {
+	stripTrailing0xff := func(k anyenc.Tuple) anyenc.Tuple {
+		if len(k) > 0 && k[len(k)-1] == 0xff {
+			return k[:len(k)-1]
+		}
+		return k
+	}
 	stripPrefixString := func(k anyenc.Tuple) string {
+		k = stripTrailing0xff(k)
 		if len(b.prefix) != 0 && len(k) > len(b.prefix) {
 			return k[len(b.prefix):].String()
 		}

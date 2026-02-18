@@ -32,6 +32,9 @@ func TestQueries(t *testing.T) {
 	t.Run("composite indexe", func(t *testing.T) {
 		testFile(t, "data/composite-index.json")
 	})
+	t.Run("multi index", func(t *testing.T) {
+		testFile(t, "data/multi-index.json")
+	})
 }
 
 func TestCollection_ReadUncommitted(t *testing.T) {
