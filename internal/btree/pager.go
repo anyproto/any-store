@@ -643,6 +643,12 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 		clear(pg.data)
 		p.cache.makeDirty(pg)
 		p.writePages[leafPgno] = pg
+		// Clear dontWrite flag: when a page is freed and then re-allocated
+		// within the same transaction, the freePage() call may have marked it
+		// dontWrite. Now that it's being reused, its content is meaningful
+		// and must be written to WAL on commit. Matches SQLite's pcache.c
+		// makeDirty() which clears PGHDR_DONT_WRITE.
+		delete(p.dontWritePages, leafPgno)
 		return pg, nil
 	}
 

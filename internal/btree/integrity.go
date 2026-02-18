@@ -277,7 +277,12 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 		// Parse cell and compute its size
 		var cellSize int
 		if isLeaf {
-			cell, sz := parseLeafCellWithSize(pg.data, cellOff, ic.usableSize)
+			cell, sz, cerr := parseLeafCellWithSize(pg.data, cellOff, ic.usableSize)
+			if cerr != nil {
+				ic.report("%s cell %d: corrupt cell data", context, i)
+				doCoverageCheck = false
+				continue
+			}
 			cellSize = sz
 
 			// Bounds check: cell must not extend past the page
@@ -296,21 +301,30 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 			// Overflow validation
 			if cell.overflowPg != 0 {
 				pos := cellOff
-				keyLen, kn := getVarint(pg.data[pos:])
-				pos += kn + int(keyLen)
-				valLen, _ := getVarint(pg.data[pos:])
-				localValSz := localValueSize(int(keyLen), int(valLen), ic.usableSize)
-				overflowBytes := int(valLen) - localValSz
-				ovflUsable := overflowPageUsable(ic.usableSize)
-				nOverflow := (overflowBytes + ovflUsable - 1) / ovflUsable
-				ic.checkList(false, cell.overflowPg, uint32(nOverflow))
+				keyLen, kn, verr := getVarintSafe(pg.data[pos:])
+				if verr == nil {
+					pos += kn + int(keyLen)
+					valLen, _, verr2 := getVarintSafe(pg.data[pos:])
+					if verr2 == nil {
+						localValSz := localValueSize(int(keyLen), int(valLen), ic.usableSize)
+						overflowBytes := int(valLen) - localValSz
+						ovflUsable := overflowPageUsable(ic.usableSize)
+						nOverflow := (overflowBytes + ovflUsable - 1) / ovflUsable
+						ic.checkList(false, cell.overflowPg, uint32(nOverflow))
+					}
+				}
 			}
 
 			// Add to heap for coverage check
 			heapInsert(&h, (uint32(cellOff)<<16)|uint32(cellOff+cellSize-1))
 		} else {
 			// Interior cell (with overflow support)
-			cell, sz := parseInteriorCell(pg.data, cellOff, ic.usableSize)
+			cell, sz, cerr := parseInteriorCell(pg.data, cellOff, ic.usableSize)
+			if cerr != nil {
+				ic.report("%s cell %d: corrupt cell data", context, i)
+				doCoverageCheck = false
+				continue
+			}
 			cellSize = sz
 
 			if cellOff+cellSize > ic.usableSize {
@@ -320,22 +334,27 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 			}
 
 			// For key ordering, we need the full key (may require overflow read)
-			fullKey := interiorFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame)
-			if prevKey != nil && bytes.Compare(prevKey, fullKey) >= 0 {
-				ic.report("%s cell %d: key out of order", context, i)
+			fullKey, fkerr := interiorFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame)
+			if fkerr != nil {
+				ic.report("%s cell %d: corrupt interior key", context, i)
+			} else {
+				if prevKey != nil && bytes.Compare(prevKey, fullKey) >= 0 {
+					ic.report("%s cell %d: key out of order", context, i)
+				}
+				prevKey = bytes.Clone(fullKey)
 			}
-			prevKey = bytes.Clone(fullKey)
 
 			// Overflow validation for interior cells
 			if cell.overflowPg != 0 {
 				pos := cellOff + 4
-				keyLen, kn := getVarint(pg.data[pos:])
-				_ = kn
-				localSz := localPayloadSize(int(keyLen), ic.usableSize)
-				overflowBytes := int(keyLen) - localSz
-				ovflUsable := overflowPageUsable(ic.usableSize)
-				nOverflow := (overflowBytes + ovflUsable - 1) / ovflUsable
-				ic.checkList(false, cell.overflowPg, uint32(nOverflow))
+				keyLen, _, verr := getVarintSafe(pg.data[pos:])
+				if verr == nil {
+					localSz := localPayloadSize(int(keyLen), ic.usableSize)
+					overflowBytes := int(keyLen) - localSz
+					ovflUsable := overflowPageUsable(ic.usableSize)
+					nOverflow := (overflowBytes + ovflUsable - 1) / ovflUsable
+					ic.checkList(false, cell.overflowPg, uint32(nOverflow))
+				}
 			}
 
 			// Recursively check child page
@@ -363,7 +382,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 			cpOff := pg.cellPointerOffset()
 			for i := 0; i < nCells; i++ {
 				cellOff := int(binary.BigEndian.Uint16(pg.data[cpOff+i*2:]))
-				_, sz := parseInteriorCell(pg.data, cellOff, ic.usableSize)
+				_, sz, _ := parseInteriorCell(pg.data, cellOff, ic.usableSize)
 				heapInsert(&h, (uint32(cellOff)<<16)|uint32(cellOff+sz-1))
 			}
 		}
@@ -470,7 +489,12 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 				continue
 			}
 
-			cell, cellSize := parseLeafCellWithSize(pg1.data, cellOff, ic.usableSize)
+			cell, cellSize, cerr := parseLeafCellWithSize(pg1.data, cellOff, ic.usableSize)
+			if cerr != nil {
+				ic.report("tree master page 1 cell %d: corrupt cell data", i)
+				doCoverageCheck = false
+				continue
+			}
 			if cellOff+cellSize > ic.usableSize {
 				ic.report("tree master page 1 cell %d: extends off end of page", i)
 				doCoverageCheck = false

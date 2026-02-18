@@ -130,11 +130,11 @@ func TestDebugMVCC(t *testing.T) {
 	} else {
 		t.Logf("readPageUncached page 1: type=%d cellCount=%d", pg1.header.pageType, pg1.header.cellCount)
 		// Check if we can find t1 namespace
-		idx, found := searchLeafPage(pg1, []byte("t1"))
+		idx, found, _ := searchLeafPage(pg1, []byte("t1"))
 		t.Logf("  t1 found=%v at idx=%d", found, idx)
 		if found {
 			off := pg1.getCellOffset(idx)
-			cell, _ := parseLeafCell(pg1.data, int(off))
+			cell, _, _ := parseLeafCell(pg1.data, int(off))
 			rootPage := binary.BigEndian.Uint32(cell.value)
 			t.Logf("  t1 rootPage=%d", rootPage)
 		}

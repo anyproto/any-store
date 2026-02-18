@@ -339,6 +339,15 @@ func (p *page) getCellOffset(i int) uint16 {
 	return binary.BigEndian.Uint16(p.data[base : base+2])
 }
 
+// getCellOffsetSafe returns the offset of the i-th cell, with bounds checking.
+func (p *page) getCellOffsetSafe(i int) (uint16, error) {
+	base := p.cellPointerOffset() + i*2
+	if base+2 > len(p.data) {
+		return 0, ErrCorrupt
+	}
+	return binary.BigEndian.Uint16(p.data[base : base+2]), nil
+}
+
 // setCellOffset sets the offset of the i-th cell in the cell pointer array.
 func (p *page) setCellOffset(i int, off uint16) {
 	base := p.cellPointerOffset() + i*2
@@ -441,6 +450,35 @@ func getVarint(buf []byte) (uint64, int) {
 	// 9th byte uses all 8 bits
 	v = (v << 8) | uint64(buf[8])
 	return v, 9
+}
+
+// getVarintSafe is like getVarint but returns an error if the buffer is too short.
+func getVarintSafe(buf []byte) (uint64, int, error) {
+	if len(buf) == 0 {
+		return 0, 0, ErrCorrupt
+	}
+	if buf[0] < 0x80 {
+		return uint64(buf[0]), 1, nil
+	}
+
+	var v uint64
+	for i := range 8 {
+		if i >= len(buf) {
+			return 0, 0, ErrCorrupt
+		}
+		b := buf[i]
+		if b < 0x80 {
+			v = (v << 7) | uint64(b)
+			return v, i + 1, nil
+		}
+		v = (v << 7) | uint64(b&0x7f)
+	}
+	if len(buf) < 9 {
+		return 0, 0, ErrCorrupt
+	}
+	// 9th byte uses all 8 bits
+	v = (v << 8) | uint64(buf[8])
+	return v, 9, nil
 }
 
 // varintSize returns the number of bytes needed to encode v as a varint.

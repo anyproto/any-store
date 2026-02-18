@@ -53,23 +53,40 @@ type cellData struct {
 // Leaf cell format: varint(keyLen) | key | varint(valLen) | value_local | [4-byte overflow pgno]
 // When payload (keyLen + valLen) exceeds maxLocal, only a local portion of
 // the value is stored in-page and the rest is on overflow pages.
-func parseLeafCell(data []byte, offset int) (cellData, int) {
+func parseLeafCell(data []byte, offset int) (cellData, int, error) {
 	return parseLeafCellWithSize(data, offset, 0)
 }
 
 // parseLeafCellWithSize is like parseLeafCell but uses usableSize to detect overflow.
 // If usableSize is 0, overflow detection is skipped (backward compat).
-func parseLeafCellWithSize(data []byte, offset int, usableSize int) (cellData, int) {
+func parseLeafCellWithSize(data []byte, offset int, usableSize int) (cellData, int, error) {
 	var c cellData
 	pos := offset
+	dataLen := len(data)
 
-	keyLen, n := getVarint(data[pos:])
+	if pos >= dataLen {
+		return c, 0, ErrCorrupt
+	}
+
+	keyLen, n, err := getVarintSafe(data[pos:])
+	if err != nil {
+		return c, 0, ErrCorrupt
+	}
 	pos += n
 
+	if int(keyLen) < 0 || pos+int(keyLen) > dataLen {
+		return c, 0, ErrCorrupt
+	}
 	c.key = data[pos : pos+int(keyLen)]
 	pos += int(keyLen)
 
-	valLen, n := getVarint(data[pos:])
+	if pos >= dataLen {
+		return c, 0, ErrCorrupt
+	}
+	valLen, n, err := getVarintSafe(data[pos:])
+	if err != nil {
+		return c, 0, ErrCorrupt
+	}
 	pos += n
 
 	totalPayload := int(keyLen) + int(valLen)
@@ -82,16 +99,22 @@ func parseLeafCellWithSize(data []byte, offset int, usableSize int) (cellData, i
 		// Overflow cell: only localValSize bytes of value stored in-page.
 		// The key is always stored fully on-page for binary search.
 		localValSize := localValueSize(int(keyLen), int(valLen), usableSize)
+		if pos+localValSize+4 > dataLen {
+			return c, 0, ErrCorrupt
+		}
 		c.value = data[pos : pos+localValSize]
 		pos += localValSize
 		c.overflowPg = binary.BigEndian.Uint32(data[pos : pos+4])
 		pos += 4
 	} else {
+		if int(valLen) < 0 || pos+int(valLen) > dataLen {
+			return c, 0, ErrCorrupt
+		}
 		c.value = data[pos : pos+int(valLen)]
 		pos += int(valLen)
 	}
 
-	return c, pos - offset
+	return c, pos - offset, nil
 }
 
 // parseInteriorCell parses an interior cell at the given offset.
@@ -99,14 +122,24 @@ func parseLeafCellWithSize(data []byte, offset int, usableSize int) (cellData, i
 // When keyLen exceeds maxLocal, only localPayloadSize bytes of key are stored
 // in-page and the rest is on overflow pages (matching SQLite's index btree interior cells).
 // If usableSize is 0, overflow detection is skipped.
-func parseInteriorCell(data []byte, offset int, usableSize ...int) (cellData, int) {
+func parseInteriorCell(data []byte, offset int, usableSize ...int) (cellData, int, error) {
 	var c cellData
 	pos := offset
+	dataLen := len(data)
 
+	if pos+4 > dataLen {
+		return c, 0, ErrCorrupt
+	}
 	c.leftChild = binary.BigEndian.Uint32(data[pos : pos+4])
 	pos += 4
 
-	keyLen, n := getVarint(data[pos:])
+	if pos >= dataLen {
+		return c, 0, ErrCorrupt
+	}
+	keyLen, n, err := getVarintSafe(data[pos:])
+	if err != nil {
+		return c, 0, ErrCorrupt
+	}
 	pos += n
 
 	us := 0
@@ -116,16 +149,22 @@ func parseInteriorCell(data []byte, offset int, usableSize ...int) (cellData, in
 
 	if us > 0 && int(keyLen) > maxLocalPayload(us) {
 		localSize := localPayloadSize(int(keyLen), us)
+		if pos+localSize+4 > dataLen {
+			return c, 0, ErrCorrupt
+		}
 		c.key = data[pos : pos+localSize]
 		pos += localSize
 		c.overflowPg = binary.BigEndian.Uint32(data[pos : pos+4])
 		pos += 4
 	} else {
+		if int(keyLen) < 0 || pos+int(keyLen) > dataLen {
+			return c, 0, ErrCorrupt
+		}
 		c.key = data[pos : pos+int(keyLen)]
 		pos += int(keyLen)
 	}
 
-	return c, pos - offset
+	return c, pos - offset, nil
 }
 
 // leafCellSize returns the serialized size of a leaf cell (in-page portion).
@@ -306,27 +345,47 @@ func writeInteriorCellOverflow(buf []byte, leftChild uint32, fullKeyLen int, loc
 }
 
 // searchLeafPage does binary search on a leaf page, returns the cell index
-// where key should be inserted. If found, returns (index, true).
-func searchLeafPage(pg *page, key []byte) (int, bool) {
+// where key should be inserted. If found, returns (index, true, nil).
+// Returns ErrCorrupt if the page data is malformed.
+func searchLeafPage(pg *page, key []byte) (int, bool, error) {
 	n := int(pg.header.cellCount)
 	data := pg.data
+	dataLen := len(data)
 	cpOff := pg.cellPointerOffset()
 	lo, hi := 0, n
 	for lo < hi {
 		mid := lo + (hi-lo)/2
-		off := int(binary.BigEndian.Uint16(data[cpOff+mid*2:]))
+		cpBase := cpOff + mid*2
+		if cpBase+2 > dataLen {
+			return 0, false, ErrCorrupt
+		}
+		off := int(binary.BigEndian.Uint16(data[cpBase:]))
+		if off >= dataLen {
+			return 0, false, ErrCorrupt
+		}
 		// Fast path: 1-byte varint for key lengths < 128
 		var cellKey []byte
 		b := data[off]
 		if b < 0x80 {
-			cellKey = data[off+1 : off+1+int(b)]
+			end := off + 1 + int(b)
+			if end > dataLen {
+				return 0, false, ErrCorrupt
+			}
+			cellKey = data[off+1 : end]
 		} else {
-			keyLen, vn := getVarint(data[off:])
-			cellKey = data[off+vn : off+vn+int(keyLen)]
+			keyLen, vn, err := getVarintSafe(data[off:])
+			if err != nil {
+				return 0, false, ErrCorrupt
+			}
+			end := off + vn + int(keyLen)
+			if int(keyLen) < 0 || end > dataLen {
+				return 0, false, ErrCorrupt
+			}
+			cellKey = data[off+vn : end]
 		}
 		cmp := bytes.Compare(cellKey, key)
 		if cmp == 0 {
-			return mid, true
+			return mid, true, nil
 		}
 		if cmp < 0 {
 			lo = mid + 1
@@ -334,7 +393,7 @@ func searchLeafPage(pg *page, key []byte) (int, bool) {
 			hi = mid
 		}
 	}
-	return lo, false
+	return lo, false, nil
 }
 
 // interiorCellKey extracts the key from an interior cell at the given offset
@@ -343,38 +402,65 @@ func searchLeafPage(pg *page, key []byte) (int, bool) {
 // For keys that fit locally, the returned slice points into the page buffer.
 // For overflow keys, this function cannot read the full key — use
 // interiorCellFullKey instead.
-func interiorCellKey(data []byte, offset int) (key []byte, leftChild uint32) {
+func interiorCellKey(data []byte, offset int) (key []byte, leftChild uint32, err error) {
+	dataLen := len(data)
+	if offset+5 > dataLen {
+		return nil, 0, ErrCorrupt
+	}
 	leftChild = binary.BigEndian.Uint32(data[offset : offset+4])
 	// Fast path: 1-byte varint for key lengths < 128 (common case)
 	b := data[offset+4]
 	if b < 0x80 {
 		keyStart := offset + 5
-		return data[keyStart : keyStart+int(b)], leftChild
+		keyEnd := keyStart + int(b)
+		if keyEnd > dataLen {
+			return nil, 0, ErrCorrupt
+		}
+		return data[keyStart:keyEnd], leftChild, nil
 	}
-	keyLen, n := getVarint(data[offset+4:])
+	keyLen, n, verr := getVarintSafe(data[offset+4:])
+	if verr != nil {
+		return nil, 0, ErrCorrupt
+	}
 	keyStart := offset + 4 + n
-	return data[keyStart : keyStart+int(keyLen)], leftChild
+	keyEnd := keyStart + int(keyLen)
+	if int(keyLen) < 0 || keyEnd > dataLen {
+		return nil, 0, ErrCorrupt
+	}
+	return data[keyStart:keyEnd], leftChild, nil
 }
 
 // interiorCellFullKey extracts the full key from an interior cell, reading
 // overflow pages if necessary. Returns an allocated copy for overflow keys.
-func (bt *btree) interiorCellFullKey(data []byte, offset int, usableSize int) (key []byte, leftChild uint32) {
+func (bt *btree) interiorCellFullKey(data []byte, offset int, usableSize int) (key []byte, leftChild uint32, err error) {
+	dataLen := len(data)
+	if offset+4 > dataLen {
+		return nil, 0, ErrCorrupt
+	}
 	leftChild = binary.BigEndian.Uint32(data[offset : offset+4])
-	key = interiorFullKey(data, offset, usableSize, bt.pager, bt.walMaxFrame)
-	return key, leftChild
+	key, err = interiorFullKey(data, offset, usableSize, bt.pager, bt.walMaxFrame)
+	return key, leftChild, err
 }
 
 // searchInteriorPage is a package-level wrapper for backward compatibility
 // with tests. It does not support overflow keys. Use bt.searchInterior instead.
-func searchInteriorPage(pg *page, key []byte) (childPgno uint32, cellIdx int) {
+func searchInteriorPage(pg *page, key []byte) (childPgno uint32, cellIdx int, err error) {
 	n := int(pg.header.cellCount)
 	data := pg.data
+	dataLen := len(data)
 	cpOff := pg.cellPointerOffset()
 	lo, hi := 0, n
 	for lo < hi {
 		mid := lo + (hi-lo)/2
-		off := int(binary.BigEndian.Uint16(data[cpOff+mid*2:]))
-		cellKey, _ := interiorCellKey(data, off)
+		cpBase := cpOff + mid*2
+		if cpBase+2 > dataLen {
+			return 0, 0, ErrCorrupt
+		}
+		off := int(binary.BigEndian.Uint16(data[cpBase:]))
+		cellKey, _, kerr := interiorCellKey(data, off)
+		if kerr != nil {
+			return 0, 0, kerr
+		}
 		cmp := bytes.Compare(cellKey, key)
 		if cmp == 0 {
 			lo = mid + 1
@@ -387,31 +473,50 @@ func searchInteriorPage(pg *page, key []byte) (childPgno uint32, cellIdx int) {
 		}
 	}
 	if lo == 0 {
+		if cpOff+2 > dataLen {
+			return 0, 0, ErrCorrupt
+		}
 		off := int(binary.BigEndian.Uint16(data[cpOff:]))
-		_, lc := interiorCellKey(data, off)
-		return lc, 0
+		_, lc, kerr := interiorCellKey(data, off)
+		if kerr != nil {
+			return 0, 0, kerr
+		}
+		return lc, 0, nil
 	}
 	if lo < n {
-		off := int(binary.BigEndian.Uint16(data[cpOff+lo*2:]))
-		_, lc := interiorCellKey(data, off)
-		return lc, lo
+		cpBase := cpOff + lo*2
+		if cpBase+2 > dataLen {
+			return 0, 0, ErrCorrupt
+		}
+		off := int(binary.BigEndian.Uint16(data[cpBase:]))
+		_, lc, kerr := interiorCellKey(data, off)
+		if kerr != nil {
+			return 0, 0, kerr
+		}
+		return lc, lo, nil
 	}
-	return pg.header.rightChild, n
+	return pg.header.rightChild, n, nil
 }
 
 // searchInteriorWithOverflow is a standalone function for searching interior pages
 // with overflow key support. Used by ReadTx which doesn't have a btree struct.
-func searchInteriorWithOverflow(pg *page, key []byte, usableSize int, p *pager, walMaxFrame uint32) (childPgno uint32, cellIdx int) {
+func searchInteriorWithOverflow(pg *page, key []byte, usableSize int, p *pager, walMaxFrame uint32) (childPgno uint32, cellIdx int, err error) {
 	n := int(pg.header.cellCount)
 	data := pg.data
+	dataLen := len(data)
 	cpOff := pg.cellPointerOffset()
 	lo, hi := 0, n
 	for lo < hi {
 		mid := lo + (hi-lo)/2
-		off := int(binary.BigEndian.Uint16(data[cpOff+mid*2:]))
-		cellKey := interiorFullKey(data, off, usableSize, p, walMaxFrame)
-		leftChild := binary.BigEndian.Uint32(data[off : off+4])
-		_ = leftChild
+		cpBase := cpOff + mid*2
+		if cpBase+2 > dataLen {
+			return 0, 0, ErrCorrupt
+		}
+		off := int(binary.BigEndian.Uint16(data[cpBase:]))
+		cellKey, kerr := interiorFullKey(data, off, usableSize, p, walMaxFrame)
+		if kerr != nil {
+			return 0, 0, kerr
+		}
 		cmp := bytes.Compare(cellKey, key)
 		if cmp == 0 {
 			lo = mid + 1
@@ -424,50 +529,88 @@ func searchInteriorWithOverflow(pg *page, key []byte, usableSize int, p *pager, 
 		}
 	}
 	if lo == 0 {
+		if cpOff+2 > dataLen {
+			return 0, 0, ErrCorrupt
+		}
 		off := int(binary.BigEndian.Uint16(data[cpOff:]))
+		if off+4 > dataLen {
+			return 0, 0, ErrCorrupt
+		}
 		lc := binary.BigEndian.Uint32(data[off : off+4])
-		return lc, 0
+		return lc, 0, nil
 	}
 	if lo < n {
-		off := int(binary.BigEndian.Uint16(data[cpOff+lo*2:]))
+		cpBase := cpOff + lo*2
+		if cpBase+2 > dataLen {
+			return 0, 0, ErrCorrupt
+		}
+		off := int(binary.BigEndian.Uint16(data[cpBase:]))
+		if off+4 > dataLen {
+			return 0, 0, ErrCorrupt
+		}
 		lc := binary.BigEndian.Uint32(data[off : off+4])
-		return lc, lo
+		return lc, lo, nil
 	}
-	return pg.header.rightChild, n
+	return pg.header.rightChild, n, nil
 }
 
 // interiorFullKey reads the full key from an interior cell, handling overflow.
-func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFrame uint32) []byte {
-	keyLen, n := getVarint(data[offset+4:])
+func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFrame uint32) ([]byte, error) {
+	dataLen := len(data)
+	if offset+4 >= dataLen {
+		return nil, ErrCorrupt
+	}
+	keyLen, n, err := getVarintSafe(data[offset+4:])
+	if err != nil {
+		return nil, ErrCorrupt
+	}
 	keyStart := offset + 4 + n
 	maxLocal := maxLocalPayload(usableSize)
 
+	if int(keyLen) < 0 {
+		return nil, ErrCorrupt
+	}
+
 	if int(keyLen) <= maxLocal {
-		return data[keyStart : keyStart+int(keyLen)]
+		if keyStart+int(keyLen) > dataLen {
+			return nil, ErrCorrupt
+		}
+		return data[keyStart : keyStart+int(keyLen)], nil
 	}
 
 	// Overflow: read local portion + overflow chain
 	localSize := localPayloadSize(int(keyLen), usableSize)
+	if keyStart+localSize+4 > dataLen {
+		return nil, ErrCorrupt
+	}
 	fullKey := make([]byte, int(keyLen))
 	copy(fullKey, data[keyStart:keyStart+localSize])
 	overflowPg := binary.BigEndian.Uint32(data[keyStart+localSize : keyStart+localSize+4])
 	_ = p.readOverflowChainAt(overflowPg, fullKey[localSize:], walMaxFrame)
-	return fullKey
+	return fullKey, nil
 }
 
 // searchInterior does binary search on an interior page.
 // Returns the child page to descend into and the cell index.
 // Handles overflow keys by reading the full key from overflow pages when needed.
-func (bt *btree) searchInterior(pg *page, key []byte) (childPgno uint32, cellIdx int) {
+func (bt *btree) searchInterior(pg *page, key []byte) (childPgno uint32, cellIdx int, err error) {
 	n := int(pg.header.cellCount)
 	data := pg.data
+	dataLen := len(data)
 	cpOff := pg.cellPointerOffset()
 	usableSize := bt.usablePageSize()
 	lo, hi := 0, n
 	for lo < hi {
 		mid := lo + (hi-lo)/2
-		off := int(binary.BigEndian.Uint16(data[cpOff+mid*2:]))
-		cellKey, _ := bt.interiorCellFullKey(data, off, usableSize)
+		cpBase := cpOff + mid*2
+		if cpBase+2 > dataLen {
+			return 0, 0, ErrCorrupt
+		}
+		off := int(binary.BigEndian.Uint16(data[cpBase:]))
+		cellKey, _, kerr := bt.interiorCellFullKey(data, off, usableSize)
+		if kerr != nil {
+			return 0, 0, kerr
+		}
 		cmp := bytes.Compare(cellKey, key)
 		if cmp == 0 {
 			lo = mid + 1
@@ -480,16 +623,29 @@ func (bt *btree) searchInterior(pg *page, key []byte) (childPgno uint32, cellIdx
 		}
 	}
 	if lo == 0 {
+		if cpOff+2 > dataLen {
+			return 0, 0, ErrCorrupt
+		}
 		off := int(binary.BigEndian.Uint16(data[cpOff:]))
-		_, lc := bt.interiorCellFullKey(data, off, usableSize)
-		return lc, 0
+		_, lc, kerr := bt.interiorCellFullKey(data, off, usableSize)
+		if kerr != nil {
+			return 0, 0, kerr
+		}
+		return lc, 0, nil
 	}
 	if lo < n {
-		off := int(binary.BigEndian.Uint16(data[cpOff+lo*2:]))
-		_, lc := bt.interiorCellFullKey(data, off, usableSize)
-		return lc, lo
+		cpBase := cpOff + lo*2
+		if cpBase+2 > dataLen {
+			return 0, 0, ErrCorrupt
+		}
+		off := int(binary.BigEndian.Uint16(data[cpBase:]))
+		_, lc, kerr := bt.interiorCellFullKey(data, off, usableSize)
+		if kerr != nil {
+			return 0, 0, kerr
+		}
+		return lc, lo, nil
 	}
-	return pg.header.rightChild, n
+	return pg.header.rightChild, n, nil
 }
 
 // Get looks up a key in the B-tree and returns its value.
@@ -511,18 +667,30 @@ func (bt *btree) Get(key []byte) ([]byte, error) {
 	usableSize := bt.usablePageSize()
 	for {
 		if pg.header.isLeaf() {
-			idx, found := searchLeafPage(pg, key)
+			idx, found, serr := searchLeafPage(pg, key)
+			if serr != nil {
+				return nil, serr
+			}
 			if !found {
 				return nil, ErrKeyNotFound
 			}
 			off := pg.getCellOffset(idx)
-			cell, _ := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			if cerr != nil {
+				return nil, cerr
+			}
 			if cell.overflowPg != 0 {
 				// Read full value from overflow chain
 				pos := int(off)
-				keyLen, kn := getVarint(pg.data[pos:])
+				keyLen, kn, verr := getVarintSafe(pg.data[pos:])
+				if verr != nil {
+					return nil, ErrCorrupt
+				}
 				pos += kn + int(keyLen)
-				valLen, _ := getVarint(pg.data[pos:])
+				valLen, _, verr := getVarintSafe(pg.data[pos:])
+				if verr != nil {
+					return nil, ErrCorrupt
+				}
 				fullVal := make([]byte, int(valLen))
 				copy(fullVal, cell.value)
 				if err := bt.pager.readOverflowChainAt(cell.overflowPg, fullVal[len(cell.value):], bt.walMaxFrame); err != nil {
@@ -534,7 +702,11 @@ func (bt *btree) Get(key []byte) ([]byte, error) {
 		}
 
 		// Interior page - descend
-		childPgno, _ := bt.searchInterior(pg, key)
+		childPgno, _, serr := bt.searchInterior(pg, key)
+		if serr != nil {
+			bt.pager.releasePage(pg)
+			return nil, serr
+		}
 		bt.pager.releasePage(pg)
 		pg, err = bt.pager.getPageAt(childPgno, maxFrame)
 		if err != nil {
@@ -583,7 +755,11 @@ func (bt *btree) Put(key, value []byte) error {
 	path := pathBuf[:0]
 	for pg.header.isInterior() {
 		path = append(path, pg.pgno)
-		childPgno, _ := bt.searchInterior(pg, key)
+		childPgno, _, serr := bt.searchInterior(pg, key)
+		if serr != nil {
+			bt.pager.releasePage(pg)
+			return serr
+		}
 		bt.pager.releasePage(pg)
 		pg, err = bt.getPage(childPgno)
 		if err != nil {
@@ -613,7 +789,10 @@ func (bt *btree) insertIntoPage(pg *page, key, value []byte) error {
 
 // insertIntoLeafWithPath inserts into a leaf page, using path for split propagation.
 func (bt *btree) insertIntoLeafWithPath(pg *page, key, value []byte, path []uint32) error {
-	idx, found := searchLeafPage(pg, key)
+	idx, found, serr := searchLeafPage(pg, key)
+	if serr != nil {
+		return serr
+	}
 
 	if found {
 		return bt.updateLeafCell(pg, idx, key, value)
@@ -652,7 +831,10 @@ func (bt *btree) insertIntoLeafWithPath(pg *page, key, value []byte, path []uint
 
 // insertIntoLeaf inserts into a leaf page, splitting if necessary.
 func (bt *btree) insertIntoLeaf(pg *page, key, value []byte) error {
-	idx, found := searchLeafPage(pg, key)
+	idx, found, serr := searchLeafPage(pg, key)
+	if serr != nil {
+		return serr
+	}
 
 	pageUsable := bt.usablePageSize()
 	cellSize := leafCellSizeWithOverflow(key, value, pageUsable)
@@ -759,7 +941,10 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte) error {
 
 	// Parse old cell to get its size and overflow info
 	cellOff := int(pg.getCellOffset(idx))
-	oldCell, oldCellSize := parseLeafCellWithSize(pg.data, cellOff, usableSize)
+	oldCell, oldCellSize, cerr := parseLeafCellWithSize(pg.data, cellOff, usableSize)
+	if cerr != nil {
+		return cerr
+	}
 
 	// Compute new cell size
 	newCellSize := leafCellSizeWithOverflow(key, value, usableSize)
@@ -840,7 +1025,7 @@ func (bt *btree) collectLeafCells(pg *page) []cellData {
 	buf := make([]byte, 0, contentSize)
 	for i := range n {
 		off := pg.getCellOffset(i)
-		cells[i], _ = parseLeafCellWithSize(pg.data, int(off), usableSize)
+		cells[i], _, _ = parseLeafCellWithSize(pg.data, int(off), usableSize)
 		kStart := len(buf)
 		buf = append(buf, cells[i].key...)
 
@@ -883,7 +1068,7 @@ func (bt *btree) collectInteriorCells(pg *page) []cellData {
 	maxLocal := maxLocalPayload(usable)
 	for i := range n {
 		off := pg.getCellOffset(i)
-		cells[i], _ = parseInteriorCell(pg.data, int(off), usable)
+		cells[i], _, _ = parseInteriorCell(pg.data, int(off), usable)
 		if cells[i].overflowPg != 0 {
 			// Read full key from overflow pages
 			pos := int(off) + 4
@@ -1104,7 +1289,7 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 	insertIdx := n
 	for i := range n {
 		off := int(binary.BigEndian.Uint16(data[cpOff+i*2:]))
-		cellKey, _ := bt.interiorCellFullKey(data, off, pageUsable)
+		cellKey, _, _ := bt.interiorCellFullKey(data, off, pageUsable)
 		if bytes.Compare(cellKey, key) >= 0 {
 			insertIdx = i
 			break
@@ -1275,7 +1460,7 @@ func (bt *btree) insertIntoParent(leftPg *page, key []byte, rightPgno uint32) er
 	}
 	// Use the separator key to navigate to the parent of leftPg.
 	for pg.header.isInterior() {
-		childPgno, _ := bt.searchInterior(pg, key)
+		childPgno, _, _ := bt.searchInterior(pg, key)
 		if childPgno == leftPg.pgno {
 			// Found: pg is the parent of leftPg
 			path = append(path, pg.pgno)
@@ -1344,7 +1529,10 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 
 // insertIntoInterior handles insertion through an interior page.
 func (bt *btree) insertIntoInterior(pg *page, key, value []byte) error {
-	childPgno, _ := bt.searchInterior(pg, key)
+	childPgno, _, serr := bt.searchInterior(pg, key)
+	if serr != nil {
+		return serr
+	}
 
 	childPg, err := bt.pager.getWritablePage(childPgno)
 	if err != nil {
@@ -1388,7 +1576,11 @@ func (bt *btree) Delete(key []byte) error {
 	path := pathBuf[:0]
 	for pg.header.isInterior() {
 		path = append(path, pg.pgno)
-		childPgno, _ := bt.searchInterior(pg, key)
+		childPgno, _, serr := bt.searchInterior(pg, key)
+		if serr != nil {
+			bt.pager.releasePage(pg)
+			return serr
+		}
 		bt.pager.releasePage(pg)
 		pg, err = bt.getPage(childPgno)
 		if err != nil {
@@ -1405,7 +1597,11 @@ func (bt *btree) Delete(key []byte) error {
 		return err
 	}
 
-	idx, found := searchLeafPage(wpg, key)
+	idx, found, serr := searchLeafPage(wpg, key)
+	if serr != nil {
+		bt.pager.releasePage(wpg)
+		return serr
+	}
 	if !found {
 		bt.pager.releasePage(wpg)
 		return ErrKeyNotFound
@@ -1413,7 +1609,11 @@ func (bt *btree) Delete(key []byte) error {
 
 	usableSize := bt.usablePageSize()
 	cellOff := int(wpg.getCellOffset(idx))
-	oldCell, oldCellSize := parseLeafCellWithSize(wpg.data, cellOff, usableSize)
+	oldCell, oldCellSize, cerr := parseLeafCellWithSize(wpg.data, cellOff, usableSize)
+	if cerr != nil {
+		bt.pager.releasePage(wpg)
+		return cerr
+	}
 
 	n := int(wpg.header.cellCount)
 
@@ -1725,8 +1925,18 @@ func (bt *btree) countPage(pgno uint32) (int, error) {
 	n := int(pg.header.cellCount)
 	children := make([]uint32, 0, n+1)
 	cpOff := pg.cellPointerOffset()
+	dataLen := len(pg.data)
 	for i := range n {
-		off := int(binary.BigEndian.Uint16(pg.data[cpOff+i*2:]))
+		cpBase := cpOff + i*2
+		if cpBase+2 > dataLen {
+			bt.pager.releasePage(pg)
+			return 0, ErrCorrupt
+		}
+		off := int(binary.BigEndian.Uint16(pg.data[cpBase:]))
+		if off+4 > dataLen {
+			bt.pager.releasePage(pg)
+			return 0, ErrCorrupt
+		}
 		childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
 		children = append(children, childPgno)
 	}
@@ -1773,7 +1983,11 @@ func (c *Cursor) First() error {
 			return nil
 		}
 		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: 0})
-		off := pg.getCellOffset(0)
+		off := int(pg.getCellOffset(0))
+		if off+4 > len(pg.data) {
+			c.bt.pager.releasePage(pg)
+			return ErrCorrupt
+		}
 		childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
 		c.bt.pager.releasePage(pg)
 
@@ -1833,7 +2047,11 @@ func (c *Cursor) Seek(key []byte) error {
 	}
 
 	for pg.header.isInterior() {
-		childPgno, cellIdx := c.bt.searchInterior(pg, key)
+		childPgno, cellIdx, serr := c.bt.searchInterior(pg, key)
+		if serr != nil {
+			c.bt.pager.releasePage(pg)
+			return serr
+		}
 		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: cellIdx})
 		c.bt.pager.releasePage(pg)
 
@@ -1843,7 +2061,11 @@ func (c *Cursor) Seek(key []byte) error {
 		}
 	}
 
-	idx, _ := searchLeafPage(pg, key)
+	idx, _, serr := searchLeafPage(pg, key)
+	if serr != nil {
+		c.bt.pager.releasePage(pg)
+		return serr
+	}
 	if idx < int(pg.header.cellCount) {
 		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: idx})
 		c.valid = true
@@ -1873,8 +2095,14 @@ func (c *Cursor) Key() ([]byte, error) {
 	}
 	defer c.bt.pager.releasePage(pg)
 
-	off := pg.getCellOffset(frame.cellIdx)
-	cell, _ := parseLeafCellWithSize(pg.data, int(off), c.bt.usablePageSize())
+	off, oerr := pg.getCellOffsetSafe(frame.cellIdx)
+	if oerr != nil {
+		return nil, oerr
+	}
+	cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), c.bt.usablePageSize())
+	if cerr != nil {
+		return nil, cerr
+	}
 	return cell.key, nil
 }
 
@@ -1895,15 +2123,27 @@ func (c *Cursor) Value() ([]byte, error) {
 	defer c.bt.pager.releasePage(pg)
 
 	usableSize := c.bt.usablePageSize()
-	off := pg.getCellOffset(frame.cellIdx)
-	cell, _ := parseLeafCellWithSize(pg.data, int(off), usableSize)
+	off, oerr := pg.getCellOffsetSafe(frame.cellIdx)
+	if oerr != nil {
+		return nil, oerr
+	}
+	cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+	if cerr != nil {
+		return nil, cerr
+	}
 
 	if cell.overflowPg != 0 {
 		// Read full valLen to compute overflow size
 		pos := int(off)
-		keyLen, kn := getVarint(pg.data[pos:])
+		keyLen, kn, verr := getVarintSafe(pg.data[pos:])
+		if verr != nil {
+			return nil, ErrCorrupt
+		}
 		pos += kn + int(keyLen)
-		valLen, _ := getVarint(pg.data[pos:])
+		valLen, _, verr := getVarintSafe(pg.data[pos:])
+		if verr != nil {
+			return nil, ErrCorrupt
+		}
 
 		fullVal := make([]byte, int(valLen))
 		copy(fullVal, cell.value) // local portion
@@ -1950,7 +2190,11 @@ func (c *Cursor) Next() error {
 		frame.cellIdx++
 		var childPgno uint32
 		if frame.cellIdx < int(pg.header.cellCount) {
-			off := pg.getCellOffset(frame.cellIdx)
+			off := int(pg.getCellOffset(frame.cellIdx))
+			if off+4 > len(pg.data) {
+				c.bt.pager.releasePage(pg)
+				return ErrCorrupt
+			}
 			childPgno = binary.BigEndian.Uint32(pg.data[off : off+4])
 		} else if frame.cellIdx == int(pg.header.cellCount) {
 			childPgno = pg.header.rightChild
@@ -1972,7 +2216,11 @@ func (c *Cursor) Next() error {
 				break
 			}
 			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: 0})
-			off := childPg.getCellOffset(0)
+			off := int(childPg.getCellOffset(0))
+			if off+4 > len(childPg.data) {
+				c.bt.pager.releasePage(childPg)
+				return ErrCorrupt
+			}
 			nextPgno := binary.BigEndian.Uint32(childPg.data[off : off+4])
 			c.bt.pager.releasePage(childPg)
 			childPg, err = c.bt.getPage(nextPgno)
@@ -2039,7 +2287,11 @@ func (c *Cursor) Previous() error {
 		// Get the child page at the (decremented) cellIdx position.
 		var childPgno uint32
 		if frame.cellIdx < int(pg.header.cellCount) {
-			off := pg.getCellOffset(frame.cellIdx)
+			off := int(pg.getCellOffset(frame.cellIdx))
+			if off+4 > len(pg.data) {
+				c.bt.pager.releasePage(pg)
+				return ErrCorrupt
+			}
 			childPgno = binary.BigEndian.Uint32(pg.data[off : off+4])
 		} else if frame.cellIdx == int(pg.header.cellCount) {
 			childPgno = pg.header.rightChild

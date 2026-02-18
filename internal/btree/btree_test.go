@@ -1114,7 +1114,8 @@ func TestSearchInteriorPageAllGreater(t *testing.T) {
 	}
 	bt.rebuildInteriorPage(pg, cells, 30)
 
-	child, idx := searchInteriorPage(pg, []byte("aaa"))
+	child, idx, serr := searchInteriorPage(pg, []byte("aaa"))
+	assert.NoError(t, serr)
 	assert.Equal(t, uint32(10), child)
 	assert.Equal(t, 0, idx)
 
@@ -1135,19 +1136,23 @@ func TestSearchInteriorPageBetweenKeys(t *testing.T) {
 	}
 	bt.rebuildInteriorPage(pg, cells, 40)
 
-	child, idx := searchInteriorPage(pg, []byte("ccc"))
+	child, idx, serr := searchInteriorPage(pg, []byte("ccc"))
+	assert.NoError(t, serr)
 	assert.Equal(t, uint32(20), child)
 	assert.Equal(t, 1, idx)
 
-	child, idx = searchInteriorPage(pg, []byte("eee"))
+	child, idx, serr = searchInteriorPage(pg, []byte("eee"))
+	assert.NoError(t, serr)
 	assert.Equal(t, uint32(30), child)
 	assert.Equal(t, 2, idx)
 
-	child, idx = searchInteriorPage(pg, []byte("ggg"))
+	child, idx, serr = searchInteriorPage(pg, []byte("ggg"))
+	assert.NoError(t, serr)
 	assert.Equal(t, uint32(40), child)
 	assert.Equal(t, 3, idx)
 
-	child, idx = searchInteriorPage(pg, []byte("ddd"))
+	child, idx, serr = searchInteriorPage(pg, []byte("ddd"))
+	assert.NoError(t, serr)
 	assert.Equal(t, uint32(30), child)
 	assert.Equal(t, 2, idx)
 

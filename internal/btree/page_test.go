@@ -176,7 +176,8 @@ func TestLeafCellParseWrite(t *testing.T) {
 	n := writeLeafCell(buf, key, value)
 	assert.Equal(t, leafCellSize(key, value), n)
 
-	cell, m := parseLeafCell(buf, 0)
+	cell, m, err := parseLeafCell(buf, 0)
+	assert.NoError(t, err)
 	assert.Equal(t, n, m)
 	assert.Equal(t, key, cell.key)
 	assert.Equal(t, value, cell.value)
@@ -191,7 +192,8 @@ func TestInteriorCellParseWrite(t *testing.T) {
 	n := writeInteriorCell(buf, leftChild, key)
 	assert.Equal(t, interiorCellSize(key), n)
 
-	cell, m := parseInteriorCell(buf, 0)
+	cell, m, err := parseInteriorCell(buf, 0)
+	assert.NoError(t, err)
 	assert.Equal(t, n, m)
 	assert.Equal(t, key, cell.key)
 	assert.Equal(t, leftChild, cell.leftChild)
@@ -200,7 +202,8 @@ func TestInteriorCellParseWrite(t *testing.T) {
 func TestLeafCellEmptyKeyValue(t *testing.T) {
 	buf := make([]byte, 100)
 	n := writeLeafCell(buf, []byte{}, []byte{})
-	cell, m := parseLeafCell(buf, 0)
+	cell, m, err := parseLeafCell(buf, 0)
+	assert.NoError(t, err)
 	assert.Equal(t, n, m)
 	assert.Empty(t, cell.key)
 	assert.Empty(t, cell.value)

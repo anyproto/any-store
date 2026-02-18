@@ -226,8 +226,11 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 	if err != nil {
 		return err
 	}
-	_, found := searchLeafPage(pg, nameKey)
+	_, found, serr := searchLeafPage(pg, nameKey)
 	db.pager.releasePage(pg)
+	if serr != nil {
+		return serr
+	}
 	if found {
 		return ErrNamespaceExists
 	}
@@ -274,7 +277,11 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 		return err
 	}
 
-	idx, found := searchLeafPage(masterPg, nameKey)
+	idx, found, serr := searchLeafPage(masterPg, nameKey)
+	if serr != nil {
+		db.pager.releasePage(masterPg)
+		return serr
+	}
 	if !found {
 		db.pager.releasePage(masterPg)
 		return ErrNamespaceNotFound
@@ -282,7 +289,11 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 
 	// Get the root page number before removing the entry
 	off := masterPg.getCellOffset(idx)
-	cell, _ := parseLeafCell(masterPg.data, int(off))
+	cell, _, cerr := parseLeafCell(masterPg.data, int(off))
+	if cerr != nil {
+		db.pager.releasePage(masterPg)
+		return cerr
+	}
 	var rootPage uint32
 	if len(cell.value) >= 4 {
 		rootPage = binary.BigEndian.Uint32(cell.value)
@@ -336,7 +347,11 @@ func (db *DB) freeTreePages(pgno uint32) error {
 		n := int(pg.header.cellCount)
 		for i := range n {
 			off := pg.getCellOffset(i)
-			cell, _ := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			if cerr != nil {
+				db.pager.releasePage(pg)
+				return cerr
+			}
 			if cell.overflowPg != 0 {
 				db.pager.releasePage(pg)
 				if err := db.pager.freeOverflowChain(cell.overflowPg); err != nil {
@@ -376,13 +391,19 @@ func (db *DB) getNamespaceLocked(name string) (*Namespace, error) {
 	}
 	defer db.pager.releasePage(pg)
 
-	idx, found := searchLeafPage(pg, nameKey)
+	idx, found, serr := searchLeafPage(pg, nameKey)
+	if serr != nil {
+		return nil, serr
+	}
 	if !found {
 		return nil, ErrNamespaceNotFound
 	}
 
 	off := pg.getCellOffset(idx)
-	cell, _ := parseLeafCell(pg.data, int(off))
+	cell, _, cerr := parseLeafCell(pg.data, int(off))
+	if cerr != nil {
+		return nil, cerr
+	}
 	if len(cell.value) < 4 {
 		return nil, ErrCorrupt
 	}
@@ -413,7 +434,10 @@ func (db *DB) ListNamespaces() ([]string, error) {
 	names := make([]string, 0, n)
 	for i := range n {
 		off := pg.getCellOffset(i)
-		cell, _ := parseLeafCell(pg.data, int(off))
+		cell, _, cerr := parseLeafCell(pg.data, int(off))
+		if cerr != nil {
+			return nil, cerr
+		}
 		names = append(names, string(bytes.Clone(cell.key)))
 	}
 	return names, nil
@@ -476,19 +500,35 @@ func (tx *ReadTx) Get(ns *Namespace, key []byte) ([]byte, error) {
 	usableSize := int(tx.pager.pageSize) - int(tx.pager.header.ReservedSpace)
 	for {
 		if pg.header.isLeaf() {
-			idx, found := searchLeafPage(pg, key)
+			idx, found, serr := searchLeafPage(pg, key)
+			if serr != nil {
+				tx.pager.releasePage(pg)
+				return nil, serr
+			}
 			if !found {
 				tx.pager.releasePage(pg)
 				return nil, ErrKeyNotFound
 			}
 			off := pg.getCellOffset(idx)
-			cell, _ := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			if cerr != nil {
+				tx.pager.releasePage(pg)
+				return nil, cerr
+			}
 			if cell.overflowPg != 0 {
 				// Read full value from overflow chain
 				pos := int(off)
-				keyLen, kn := getVarint(pg.data[pos:])
+				keyLen, kn, verr := getVarintSafe(pg.data[pos:])
+				if verr != nil {
+					tx.pager.releasePage(pg)
+					return nil, ErrCorrupt
+				}
 				pos += kn + int(keyLen)
-				valLen, _ := getVarint(pg.data[pos:])
+				valLen, _, verr := getVarintSafe(pg.data[pos:])
+				if verr != nil {
+					tx.pager.releasePage(pg)
+					return nil, ErrCorrupt
+				}
 				fullVal := make([]byte, int(valLen))
 				copy(fullVal, cell.value)
 				if err := tx.pager.readOverflowChain(cell.overflowPg, fullVal[len(cell.value):]); err != nil {
@@ -501,7 +541,11 @@ func (tx *ReadTx) Get(ns *Namespace, key []byte) ([]byte, error) {
 			tx.pager.releasePage(pg)
 			return cell.value, nil
 		}
-		childPgno, _ := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame)
+		childPgno, _, serr := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame)
+		if serr != nil {
+			tx.pager.releasePage(pg)
+			return nil, serr
+		}
 		tx.pager.releasePage(pg)
 		pg, err = tx.txGetPage(childPgno)
 		if err != nil {
