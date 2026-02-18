@@ -49,7 +49,7 @@ func TestCollQuery_Explain(t *testing.T) {
 
 		explain, err := coll.Find(nil).Explain(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, "FULL_SCAN", explain.Sql)
+		assert.Contains(t, explain.Sql, "FullScan")
 		assert.Empty(t, explain.Indexes)
 	})
 	t.Run("more than 1000", func(t *testing.T) {
@@ -78,7 +78,7 @@ func TestCollQuery_Explain(t *testing.T) {
 
 		explain, err := coll.Find(result).Explain(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, "FULL_SCAN", explain.Sql)
+		assert.NotEmpty(t, explain.Sql)
 	})
 	t.Run("simple index", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "test_simple_idx")
@@ -91,11 +91,11 @@ func TestCollQuery_Explain(t *testing.T) {
 
 		explain, err := coll.Find(`{"a":"a1"}`).Explain(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, "FULL_SCAN", explain.Sql)
-		// Index weight should be calculated even though not used for actual query
+		assert.Contains(t, explain.Sql, "IndexScan")
 		require.Len(t, explain.Indexes, 1)
 		assert.Equal(t, "a", explain.Indexes[0].Name)
 		assert.Greater(t, explain.Indexes[0].Weight, 0)
+		assert.True(t, explain.Indexes[0].Used)
 	})
 	t.Run("many indexes", func(t *testing.T) {
 		coll, err := fx.CreateCollection(ctx, "test_many_idx")
@@ -109,13 +109,13 @@ func TestCollQuery_Explain(t *testing.T) {
 
 		explain, err := coll.Find(`{"a":"a1"}`).Explain(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, "FULL_SCAN", explain.Sql)
+		assert.Contains(t, explain.Sql, "IndexScan")
 		require.Len(t, explain.Indexes, 2)
 
 		t.Run("index hint", func(t *testing.T) {
 			explain, err := coll.Find(`{"a":"a1"}`).IndexHint(IndexHint{IndexName: "b", Boost: 100}).Explain(ctx)
 			require.NoError(t, err)
-			assert.Equal(t, "FULL_SCAN", explain.Sql)
+			assert.Contains(t, explain.Sql, "IndexScan")
 		})
 	})
 	t.Run("composite index", func(t *testing.T) {
@@ -129,9 +129,10 @@ func TestCollQuery_Explain(t *testing.T) {
 
 		explain, err := coll.Find(`{"a":"a1","b":"b1"}`).Explain(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, "FULL_SCAN", explain.Sql)
+		assert.Contains(t, explain.Sql, "IndexScan")
 		require.Len(t, explain.Indexes, 1)
 		assert.Greater(t, explain.Indexes[0].Weight, 0)
+		assert.True(t, explain.Indexes[0].Used)
 	})
 }
 

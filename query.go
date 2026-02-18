@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"slices"
@@ -9,6 +10,7 @@ import (
 	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/bitmap"
 	"github.com/anyproto/any-store/internal/btree"
+	"github.com/anyproto/any-store/internal/qplanner"
 	"github.com/anyproto/any-store/query"
 )
 
@@ -135,22 +137,27 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		return
 	}
 
-	cursor := tx.btreeReadTx().NewCursor(q.c.ns)
+	buf := q.c.db.syncPool.GetDocBuf()
+	btx := tx.btreeReadTx()
 
-	var filter query.Filter
-	if q.cond != nil {
-		filter = q.cond
-	}
+	plan := qplanner.BuildPlan(&qplanner.PlanParams{
+		Tx:       btx,
+		DataNs:   q.c.ns,
+		Filter:   q.cond,
+		Sorter:   q.sort,
+		IDBounds: qb.idBounds,
+		Limit:    int(q.limit),
+		Offset:   int(q.offset),
+		Buf:      buf,
+		Indexes:  q.buildPlanIndexes(),
+	})
 
-	return &iterator{
-		cursor: cursor,
-		filter: filter,
-		sorter: q.sort,
-		buf:    q.c.db.syncPool.GetDocBuf(),
-		tx:     tx,
-		qb:     qb,
-		limit:  int(q.limit),
-		offset: int(q.offset),
+	return &planIterator{
+		plan: plan,
+		tx:   tx,
+		buf:  buf,
+		qb:   qb,
+		data: &qplanner.CursorSource{Tx: btx, Ns: q.c.ns},
 	}, nil
 }
 
@@ -321,60 +328,65 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	defer qb.Close()
 
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		cursor := tx.NewCursor(q.c.ns)
 		buf := q.c.db.syncPool.GetDocBuf()
 		defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
-		if err := cursor.First(); err != nil {
-			return nil
-		}
-		var skipped, counted int
-		for cursor.Valid() {
-			if q.cond != nil {
-				val, err := cursor.Value()
-				if err != nil {
-					return err
-				}
-				doc, err := buf.Parser.Parse(val)
-				if err != nil {
-					return err
-				}
-				if !q.cond.Ok(doc, buf) {
-					if err := cursor.Next(); err != nil {
-						return err
-					}
-					continue
-				}
+		plan := qplanner.BuildPlan(&qplanner.PlanParams{
+			Tx:       tx,
+			DataNs:   q.c.ns,
+			Filter:   q.cond,
+			Sorter:   nil, // no sort needed for count
+			IDBounds: qb.idBounds,
+			Limit:    int(q.limit),
+			Offset:   int(q.offset),
+			Buf:      buf,
+			Indexes:  q.buildPlanIndexes(),
+		})
+
+		for {
+			_, docId, iterErr := plan.Root.Next()
+			if iterErr != nil {
+				return iterErr
 			}
-			if q.offset > 0 && skipped < int(q.offset) {
-				skipped++
-				if err := cursor.Next(); err != nil {
-					return err
-				}
-				continue
-			}
-			counted++
-			if q.limit > 0 && counted >= int(q.limit) {
+			if docId == nil {
 				break
 			}
-			if err := cursor.Next(); err != nil {
-				return err
-			}
+			count++
 		}
-		count = counted
 		return nil
 	})
 	return
 }
 
 func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
-	_, err = q.makeQuery()
+	qb, err := q.makeQuery()
 	if err != nil {
 		return
 	}
+	defer qb.Close()
 
-	explain.Sql = "FULL_SCAN"
-	explain.SqliteExplain = []string{"btree full scan"}
+	buf := q.c.db.syncPool.GetDocBuf()
+	defer q.c.db.syncPool.ReleaseDocBuf(buf)
+
+	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		plan := qplanner.BuildPlan(&qplanner.PlanParams{
+			Tx:       tx,
+			DataNs:   q.c.ns,
+			Filter:   q.cond,
+			Sorter:   q.sort,
+			IDBounds: qb.idBounds,
+			Limit:    int(q.limit),
+			Offset:   int(q.offset),
+			Buf:      buf,
+			Indexes:  q.buildPlanIndexes(),
+		})
+		explain.Sql = plan.String()
+		explain.SqliteExplain = []string{plan.String()}
+		return nil
+	})
+	if err != nil {
+		return
+	}
 
 	for _, idx := range q.indexesWithWeight {
 		explain.Indexes = append(explain.Indexes, IndexExplain{
@@ -388,13 +400,14 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 
 type indexWithWeight struct {
 	*index
-	weight          int
-	pos             int
-	queryFieldsBits bitmap.Bitmap256
-	sortFieldsBits  bitmap.Bitmap256
-	bounds          query.Bounds
-	exactSort       bool
-	used            bool
+	weight             int
+	pos                int
+	queryFieldsBits    bitmap.Bitmap256
+	sortFieldsBits     bitmap.Bitmap256
+	bounds             query.Bounds
+	exactSort          bool
+	used               bool
+	filterFullyCovered bool
 }
 
 type weightedIndexes []indexWithWeight
@@ -447,15 +460,27 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 	}
 	sort.Sort(q.indexesWithWeight)
 
-	// filter useless indexes (kept for index choosing logic)
+	// Build bitmap of all query fields that have bounds
+	var allQueryFieldsBits bitmap.Bitmap256
+	for i, f := range q.queryFields {
+		if len(f.bounds) != 0 && i < 256 {
+			allQueryFieldsBits = allQueryFieldsBits.Set(uint8(i))
+		}
+	}
+
+	// filter useless indexes and mark used ones
 	var (
 		usedFieldsBits bitmap.Bitmap256
 		usedSortBits   bitmap.Bitmap256
 		exactSortFound bool
+		usedCount      int
 	)
 	for i, idx := range q.indexesWithWeight {
 		if idx.weight < 1 {
 			continue
+		}
+		if usedCount >= maxIndexesInQuery {
+			break
 		}
 		if usedFieldsBits.Subtract(idx.queryFieldsBits).Count() != 0 ||
 			usedSortBits.Subtract(idx.sortFieldsBits).Count() != 0 ||
@@ -465,7 +490,25 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 			if idx.exactSort {
 				exactSortFound = true
 			}
-			_ = i // index choosing logic preserved but not used
+			q.indexesWithWeight[i].used = true
+			bounds, chainLen := q.computeIndexBounds(idx.index)
+			q.indexesWithWeight[i].bounds = bounds
+			// Check if the index chain covers ALL query fields with bounds
+			if chainLen > 0 && allQueryFieldsBits.Count() > 0 {
+				var chainFieldsBits bitmap.Bitmap256
+				for ci := range chainLen {
+					if ci < len(idx.fieldNames) {
+						_, fi := q.queryField(idx.fieldNames[ci])
+						if fi < 256 {
+							chainFieldsBits = chainFieldsBits.Set(uint8(fi))
+						}
+					}
+				}
+				if allQueryFieldsBits.Subtract(chainFieldsBits).Count() == 0 {
+					q.indexesWithWeight[i].filterFullyCovered = true
+				}
+			}
+			usedCount++
 		}
 	}
 
@@ -515,6 +558,122 @@ func (q *collQuery) indexQueryWeight(idx *index) (weight int, fieldBits bitmap.B
 		weight++
 	}
 	return
+}
+
+// computeIndexBounds computes combined tuple bounds for an index
+// by combining per-field bounds from the query condition.
+// It also returns the number of leading chain fields used.
+func (q *collQuery) computeIndexBounds(idx *index) (query.Bounds, int) {
+	// Collect per-field bounds for leading chain fields
+	type fieldBound struct {
+		bounds query.Bounds
+		fixed  bool // all bounds have Start == End
+	}
+
+	var chain []fieldBound
+	for _, field := range idx.fieldNames {
+		fb := q.cond.IndexBounds(field, nil)
+		if len(fb) == 0 {
+			break
+		}
+		allFixed := true
+		for _, b := range fb {
+			if len(b.Start) == 0 || !bytes.Equal(b.Start, b.End) {
+				allFixed = false
+				break
+			}
+		}
+		chain = append(chain, fieldBound{bounds: fb, fixed: allFixed})
+		if !allFixed {
+			break // can't extend past a range field
+		}
+	}
+
+	if len(chain) == 0 {
+		return nil, 0
+	}
+
+	chainLen := len(chain)
+
+	// Build combined bounds by extending prefix through chain
+	// Start with bounds from first field
+	var result query.Bounds
+	for _, b := range chain[0].bounds {
+		result = append(result, b)
+	}
+
+	// For subsequent fields where all previous are fixed, extend the prefix
+	for i := 1; i < len(chain); i++ {
+		if !chain[i-1].fixed {
+			break
+		}
+		var extended query.Bounds
+		for _, prev := range result {
+			for _, cur := range chain[i].bounds {
+				eb := query.Bound{
+					StartInclude: cur.StartInclude,
+					EndInclude:   cur.EndInclude,
+				}
+				if len(cur.Start) > 0 {
+					eb.Start = append(append(anyenc.Tuple(nil), prev.Start...), cur.Start...)
+				} else {
+					// cur.Start is -inf: combined start is just the prefix
+					eb.Start = append(anyenc.Tuple(nil), prev.Start...)
+					eb.StartInclude = true
+				}
+				if len(cur.End) > 0 {
+					eb.End = append(append(anyenc.Tuple(nil), prev.End...), cur.End...)
+				} else {
+					// cur.End is +inf: use prefix + 0xff to capture all entries under prefix
+					eb.End = append(append(anyenc.Tuple(nil), prev.End...), 0xff)
+					eb.EndInclude = true
+				}
+				extended = append(extended, eb)
+			}
+		}
+		result = extended
+	}
+
+	return result, chainLen
+}
+
+// buildPlanIndexes converts weighted indexes to PlanIndex entries for the planner.
+func (q *collQuery) buildPlanIndexes() []qplanner.PlanIndex {
+	result := make([]qplanner.PlanIndex, 0, len(q.indexesWithWeight))
+	for _, iw := range q.indexesWithWeight {
+		bounds := iw.bounds
+		// For non-unique indexes, keys have docId appended after index fields.
+		// Adjust End bounds to include all docId suffixes by appending 0xff.
+		if !iw.info.Unique && len(bounds) > 0 {
+			adjusted := make(query.Bounds, len(bounds))
+			for i, b := range bounds {
+				adjusted[i] = b
+				if len(b.End) > 0 && b.EndInclude {
+					adjusted[i].End = append(append(anyenc.Tuple(nil), b.End...), 0xff)
+					adjusted[i].EndInclude = true
+				}
+			}
+			bounds = adjusted
+		}
+		pi := qplanner.PlanIndex{
+			Info: &qplanner.IndexInfo{
+				Name:       iw.info.Name,
+				FieldNames: iw.fieldNames,
+				FieldPaths: iw.fieldPaths,
+				Reverse:    iw.reverse,
+				Unique:     iw.info.Unique,
+				Sparse:     iw.info.Sparse,
+				Ns:         iw.ns,
+			},
+			Bounds:             bounds,
+			Weight:             iw.weight,
+			ExactSort:          iw.exactSort,
+			Used:               iw.used,
+			FilterFullyCovered: iw.filterFullyCovered,
+		}
+		result = append(result, pi)
+	}
+	return result
 }
 
 func (q *collQuery) indexSortWeight(idx *index) (weight int, fieldBits bitmap.Bitmap256) {
