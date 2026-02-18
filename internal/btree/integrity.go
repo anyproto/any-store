@@ -299,9 +299,8 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 				keyLen, kn := getVarint(pg.data[pos:])
 				pos += kn + int(keyLen)
 				valLen, _ := getVarint(pg.data[pos:])
-				totalPayload := int(keyLen) + int(valLen)
-				localSize := localPayloadSize(totalPayload, ic.usableSize)
-				overflowBytes := totalPayload - localSize
+				localValSz := localValueSize(int(keyLen), int(valLen), ic.usableSize)
+				overflowBytes := int(valLen) - localValSz
 				ovflUsable := overflowPageUsable(ic.usableSize)
 				nOverflow := (overflowBytes + ovflUsable - 1) / ovflUsable
 				ic.checkList(false, cell.overflowPg, uint32(nOverflow))
@@ -310,8 +309,8 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 			// Add to heap for coverage check
 			heapInsert(&h, (uint32(cellOff)<<16)|uint32(cellOff+cellSize-1))
 		} else {
-			// Interior cell
-			cell, sz := parseInteriorCell(pg.data, cellOff)
+			// Interior cell (with overflow support)
+			cell, sz := parseInteriorCell(pg.data, cellOff, ic.usableSize)
 			cellSize = sz
 
 			if cellOff+cellSize > ic.usableSize {
@@ -320,11 +319,24 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 				continue
 			}
 
-			// Key ordering check
-			if prevKey != nil && bytes.Compare(prevKey, cell.key) >= 0 {
+			// For key ordering, we need the full key (may require overflow read)
+			fullKey := interiorFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame)
+			if prevKey != nil && bytes.Compare(prevKey, fullKey) >= 0 {
 				ic.report("%s cell %d: key out of order", context, i)
 			}
-			prevKey = bytes.Clone(cell.key)
+			prevKey = bytes.Clone(fullKey)
+
+			// Overflow validation for interior cells
+			if cell.overflowPg != 0 {
+				pos := cellOff + 4
+				keyLen, kn := getVarint(pg.data[pos:])
+				_ = kn
+				localSz := localPayloadSize(int(keyLen), ic.usableSize)
+				overflowBytes := int(keyLen) - localSz
+				ovflUsable := overflowPageUsable(ic.usableSize)
+				nOverflow := (overflowBytes + ovflUsable - 1) / ovflUsable
+				ic.checkList(false, cell.overflowPg, uint32(nOverflow))
+			}
 
 			// Recursively check child page
 			childDepth := ic.checkTreePage(cell.leftChild)
@@ -351,7 +363,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 			cpOff := pg.cellPointerOffset()
 			for i := 0; i < nCells; i++ {
 				cellOff := int(binary.BigEndian.Uint16(pg.data[cpOff+i*2:]))
-				_, sz := parseInteriorCell(pg.data, cellOff)
+				_, sz := parseInteriorCell(pg.data, cellOff, ic.usableSize)
 				heapInsert(&h, (uint32(cellOff)<<16)|uint32(cellOff+sz-1))
 			}
 		}

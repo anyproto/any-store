@@ -501,7 +501,7 @@ func (tx *ReadTx) Get(ns *Namespace, key []byte) ([]byte, error) {
 			tx.pager.releasePage(pg)
 			return cell.value, nil
 		}
-		childPgno, _ := searchInteriorPage(pg, key)
+		childPgno, _ := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame)
 		tx.pager.releasePage(pg)
 		pg, err = tx.txGetPage(childPgno)
 		if err != nil {

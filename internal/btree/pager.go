@@ -902,8 +902,10 @@ func (p *pager) rollbackToSavepoint(id int) error {
 	p.header = sp.header
 	p.dbSize = sp.dbSize
 
-	// Remove savepoints above the target (but keep the target)
-	p.savepoints = p.savepoints[:id]
+	// Remove savepoints above the target but keep the target itself.
+	// This matches SQLite's behavior (pager.c:7025): ROLLBACK TO keeps the
+	// savepoint active so it can be released or rolled back again later.
+	p.savepoints = p.savepoints[:id+1]
 	return nil
 }
 

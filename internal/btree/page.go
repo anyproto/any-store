@@ -129,6 +129,28 @@ func localPayloadSize(totalPayload, usableSize int) int {
 	return minLocal
 }
 
+// localValueSize computes how many bytes of value are stored locally in a
+// leaf cell. In our format the key is always stored fully on-page (for binary
+// search), so only the value portion can overflow.
+//
+// If totalPayload (keyLen+valLen) <= maxLocal, the full value is stored
+// locally (no overflow). Otherwise, localPayloadSize gives the total local
+// bytes; subtracting keyLen gives the local value portion. When the key
+// alone exceeds localPayloadSize, zero value bytes are stored locally.
+func localValueSize(keyLen, valLen, usableSize int) int {
+	totalPayload := keyLen + valLen
+	maxLocal := maxLocalPayload(usableSize)
+	if totalPayload <= maxLocal {
+		return valLen
+	}
+	localSize := localPayloadSize(totalPayload, usableSize)
+	localVal := localSize - keyLen
+	if localVal < 0 {
+		localVal = 0
+	}
+	return localVal
+}
+
 // dbHeader represents the 100-byte database file header.
 type dbHeader struct {
 	PageSize         uint32
