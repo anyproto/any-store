@@ -30,6 +30,7 @@ func TestOverflowPutGet(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, bigValue, got)
 	require.NoError(t, rtx.Rollback())
+	require.NoError(t, db.IntegrityCheck())
 	_ = ns
 }
 
@@ -53,6 +54,7 @@ func TestOverflowUpdateLargeToSmall(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, smallValue, got)
 	require.NoError(t, tx.Commit())
+	require.NoError(t, db.IntegrityCheck())
 	_ = ns
 }
 
@@ -73,6 +75,7 @@ func TestOverflowUpdateSmallToLarge(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, bigValue, got)
 	require.NoError(t, tx.Commit())
+	require.NoError(t, db.IntegrityCheck())
 	_ = ns
 }
 
@@ -157,6 +160,7 @@ func TestOverflowCursor(t *testing.T) {
 	}
 	assert.Equal(t, 20, count)
 	require.NoError(t, rtx.Rollback())
+	require.NoError(t, db.IntegrityCheck())
 	_ = ns
 }
 
@@ -211,6 +215,7 @@ func TestOverflow1MB(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, bigValue, got)
 	require.NoError(t, rtx.Rollback())
+	require.NoError(t, db.IntegrityCheck())
 	_ = ns
 }
 
@@ -241,6 +246,7 @@ func TestOverflowMultipleKeys(t *testing.T) {
 		assert.Equal(t, expected, got, "mismatch for key big-%02d", i)
 	}
 	require.NoError(t, rtx.Rollback())
+	require.NoError(t, db.IntegrityCheck())
 	_ = ns
 }
 
