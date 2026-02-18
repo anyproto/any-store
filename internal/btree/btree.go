@@ -35,6 +35,7 @@ type cellData struct {
 	value      []byte
 	leftChild  uint32 // only for interior pages
 	overflowPg uint32 // overflow page number (0 = no overflow)
+	fullValLen int    // total value length when overflowPg != 0 (value holds only local portion)
 }
 
 // parseLeafCell parses a leaf cell at the given offset in page data.
@@ -131,13 +132,13 @@ func leafSplitPoint(cells []cellData, usableSize int) int {
 	cumSize := 0
 	bestIdx := len(cells) / 2 // fallback to 50/50
 
-	for i, c := range cells {
+	for i := range cells {
 		if i == 0 {
 			// always put at least 1 cell on left
-			cumSize += leafCellSizeWithOverflow(c.key, c.value, usableSize) + 2
+			cumSize += leafCellSizeForCell(&cells[i], usableSize) + 2
 			continue
 		}
-		cellSz := leafCellSizeWithOverflow(c.key, c.value, usableSize) + 2
+		cellSz := leafCellSizeForCell(&cells[i], usableSize) + 2
 		if cumSize+cellSz > target {
 			bestIdx = i
 			break
@@ -210,6 +211,18 @@ func leafCellSizeWithOverflow(key, value []byte, usableSize int) int {
 		return varintSize(uint64(len(key))) + varintSize(uint64(len(value))) + localSize + overflowPtrSize
 	}
 	return leafCellSize(key, value)
+}
+
+// leafCellSizeForCell returns the in-page size of a leaf cell from a cellData.
+// When the cell preserves an existing overflow pointer (overflowPg != 0),
+// fullValLen is used to compute the correct local payload size.
+func leafCellSizeForCell(c *cellData, usableSize int) int {
+	if c.overflowPg != 0 {
+		totalPayload := len(c.key) + c.fullValLen
+		localSize := localPayloadSize(totalPayload, usableSize)
+		return varintSize(uint64(len(c.key))) + varintSize(uint64(c.fullValLen)) + localSize + overflowPtrSize
+	}
+	return leafCellSizeWithOverflow(c.key, c.value, usableSize)
 }
 
 // interiorCellSize returns the serialized size of an interior cell.
@@ -671,14 +684,16 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte) error {
 				pg.header.serialize(pg.data[hdrOff:])
 				return nil
 			}
-			// Too much fragmentation — fall through to full rebuild
-		} else {
-			// Exact fit, no wasted space
-			return nil
+			// Too much fragmentation — cell was already written in-place,
+			// so collect as-is and rebuild (preserves existing overflow chain).
+			cells := bt.collectLeafCells(pg)
+			return bt.rebuildLeafPage(pg, cells)
 		}
+		// Exact fit, no wasted space
+		return nil
 	}
 
-	// Slow path: new cell doesn't fit or too much fragmentation.
+	// Slow path: new cell doesn't fit in old space.
 	// Collect all cells, replace the target, and rebuild the page.
 	cells := bt.collectLeafCells(pg)
 	cells[idx] = cellData{key: key, value: value}
@@ -706,22 +721,19 @@ func (bt *btree) collectLeafCells(pg *page) []cellData {
 		buf = append(buf, cells[i].key...)
 
 		if cells[i].overflowPg != 0 {
-			// Read original valLen from the cell to compute full value size
+			// Preserve overflow pointer and local value only (SQLite-style).
+			// rebuildLeafPage will reuse the existing overflow chain.
 			pos := int(off)
 			keyLen, kn := getVarint(pg.data[pos:])
 			pos += kn + int(keyLen)
 			valLen, _ := getVarint(pg.data[pos:])
+			cells[i].fullValLen = int(valLen)
 
-			// Reconstruct full value: local portion + overflow
-			fullVal := make([]byte, int(valLen))
-			copy(fullVal, cells[i].value) // local portion
-			overflowSize := int(valLen) - len(cells[i].value)
-			if overflowSize > 0 {
-				_ = bt.pager.readOverflowChainAt(cells[i].overflowPg, fullVal[len(cells[i].value):], bt.walMaxFrame)
-			}
-			cells[i].key = buf[kStart:len(buf)]
-			cells[i].value = fullVal
-			cells[i].overflowPg = 0 // full value now in memory
+			vStart := len(buf)
+			buf = append(buf, cells[i].value...)
+			cells[i].key = buf[kStart:vStart]
+			cells[i].value = buf[vStart:len(buf)]
+			// overflowPg preserved — rebuildLeafPage will reuse it
 		} else {
 			vStart := len(buf)
 			buf = append(buf, cells[i].value...)
@@ -778,27 +790,35 @@ func (bt *btree) rebuildLeafPage(pg *page, cells []cellData) error {
 	maxLocal := maxLocalPayload(pageUsable)
 	contentOff := pageUsable
 	for i, c := range cells {
-		totalPayload := len(c.key) + len(c.value)
-
-		if totalPayload > maxLocal {
-			// Need overflow
+		if c.overflowPg != 0 {
+			// Reuse existing overflow chain (SQLite-style: preserve overflow ptr)
+			totalPayload := len(c.key) + c.fullValLen
 			localSize := localPayloadSize(totalPayload, pageUsable)
-			localValSize := localSize - len(c.key)
-			if localValSize < 0 {
-				localValSize = 0
-			}
-			overflowData := c.value[localValSize:]
-			overflowPgno, err := bt.pager.writeOverflowChain(overflowData)
-			if err != nil {
-				return err
-			}
-			size := varintSize(uint64(len(c.key))) + varintSize(uint64(len(c.value))) + localSize + overflowPtrSize
+			size := varintSize(uint64(len(c.key))) + varintSize(uint64(c.fullValLen)) + localSize + overflowPtrSize
 			contentOff -= size
-			writeLeafCellOverflow(pg.data[contentOff:], c.key, len(c.value), c.value[:localValSize], overflowPgno)
+			writeLeafCellOverflow(pg.data[contentOff:], c.key, c.fullValLen, c.value, c.overflowPg)
 		} else {
-			size := leafCellSize(c.key, c.value)
-			contentOff -= size
-			writeLeafCell(pg.data[contentOff:], c.key, c.value)
+			totalPayload := len(c.key) + len(c.value)
+			if totalPayload > maxLocal {
+				// New overflow needed
+				localSize := localPayloadSize(totalPayload, pageUsable)
+				localValSize := localSize - len(c.key)
+				if localValSize < 0 {
+					localValSize = 0
+				}
+				overflowData := c.value[localValSize:]
+				overflowPgno, err := bt.pager.writeOverflowChain(overflowData)
+				if err != nil {
+					return err
+				}
+				size := varintSize(uint64(len(c.key))) + varintSize(uint64(len(c.value))) + localSize + overflowPtrSize
+				contentOff -= size
+				writeLeafCellOverflow(pg.data[contentOff:], c.key, len(c.value), c.value[:localValSize], overflowPgno)
+			} else {
+				size := leafCellSize(c.key, c.value)
+				contentOff -= size
+				writeLeafCell(pg.data[contentOff:], c.key, c.value)
+			}
 		}
 		// Write cell pointer
 		ptrOff := hdrOff + pg.header.headerSize() + i*2
@@ -1399,8 +1419,8 @@ func (bt *btree) tryMergeLeaf(leafPgno uint32, path []uint32) error {
 	// Check if merged content fits in one page
 	usableSize := bt.usablePageSize()
 	totalSize := 8 // leaf header
-	for _, c := range allCells {
-		totalSize += leafCellSizeWithOverflow(c.key, c.value, usableSize) + 2
+	for i := range allCells {
+		totalSize += leafCellSizeForCell(&allCells[i], usableSize) + 2
 	}
 	if totalSize > usableSize {
 		return nil // doesn't fit
