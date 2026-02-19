@@ -753,29 +753,77 @@ func (p *pager) getHasContent(pgno uint32) bool {
 	return p.hasContent[pgno]
 }
 
-// commit writes all dirty pages to WAL and commits the transaction.
-// Returns the WAL frame count at commit time (for auto-checkpoint decisions).
-func (p *pager) commit() (nFrame uint32, err error) {
-	if pagerState(p.state.Load()) != pagerWriter {
-		return 0, ErrReadOnly
+// readHeaderCounters reads the FileChangeCount and SchemaCookie from page 1.
+// It checks the SHM header to discover the true WAL state (including frames
+// written by other processes), then uses shmHashGet + direct WAL file read to
+// get the latest page 1 data. Falls back to the database file if page 1 is
+// not in the WAL. This bypasses both the page cache and the in-process WAL
+// index to ensure cross-process visibility.
+func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaCookie uint32, err error) {
+	// Determine the effective max frame by checking the SHM header,
+	// which reflects writes from ALL processes sharing this database.
+	effectiveMaxFrame := walMaxFrame
+	if hdr, valid := p.wal.index.readHeader(); valid && hdr.mxFrame > effectiveMaxFrame {
+		effectiveMaxFrame = hdr.mxFrame
 	}
 
-	// Ensure page 1 is always fetched as writable and dirtied when the
-	// database header has changed (fix 5.3). The header contains freelist
-	// fields (FirstFreelistPg, TotalFreelistPgs) and DatabaseSize that
-	// may have been modified in-memory without dirtying page 1.
-	p.header.DatabaseSize = p.dbSize
-	if p.header != p.savedHeader || p.writePages[1] != nil {
-		pg1, err := p.getWritablePage(1)
-		if err != nil {
-			p.pagerError()
-			return 0, err
+	// Look up page 1's latest frame using SHM hash tables.
+	// shmHashGet reads the cross-process SHM, not the in-process Go map.
+	if effectiveMaxFrame > 0 {
+		frame := p.wal.index.shmHashGet(1, effectiveMaxFrame)
+		if frame > 0 {
+			buf := make([]byte, dbHeaderSize)
+			if err := p.readWalFrameData(frame, buf); err == nil {
+				return binary.BigEndian.Uint32(buf[24:28]), binary.BigEndian.Uint32(buf[40:44]), nil
+			}
 		}
-		p.header.FileChangeCount++
-		p.header.serialize(pg1.data[:dbHeaderSize])
-		p.releasePage(pg1)
 	}
 
+	// No WAL frame for page 1; read from database file.
+	buf := make([]byte, dbHeaderSize)
+	if _, err := p.file.ReadAt(buf, 0); err != nil {
+		return 0, 0, err
+	}
+	return binary.BigEndian.Uint32(buf[24:28]), binary.BigEndian.Uint32(buf[40:44]), nil
+}
+
+// readWalFrameData reads the first `len(buf)` bytes of page data from a WAL
+// frame. Unlike wal.readFrame, this does not check the in-process nFrame
+// counter, making it safe for cross-process reads where another process wrote
+// the frame. For in-process+noSync mode (memFrames), it reads from the
+// in-memory frames.
+func (p *pager) readWalFrameData(frame uint32, buf []byte) error {
+	if p.wal.memFrames != nil {
+		p.wal.mu.Lock()
+		defer p.wal.mu.Unlock()
+		idx := frame - 1
+		if idx < uint32(len(p.wal.memFrames)) {
+			copy(buf, p.wal.memFrames[idx].data)
+			return nil
+		}
+		return ErrWALCorrupt
+	}
+	if p.wal.file == nil {
+		return ErrWALCorrupt
+	}
+	frameSize := int64(walFrameSize) + int64(p.pageSize)
+	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
+	_, err := p.wal.file.ReadAt(buf, offset)
+	return err
+}
+
+// commit writes all dirty pages to WAL and commits the transaction.
+// dataChanged/schemaChanged control whether FileChangeCount/SchemaCookie are
+// incremented. Returns the WAL frame count and the new counter values.
+func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC uint32, err error) {
+	if pagerState(p.state.Load()) != pagerWriter {
+		return 0, 0, 0, ErrReadOnly
+	}
+
+	// Update the in-memory header with current database size.
+	p.header.DatabaseSize = p.dbSize
+
+	// Collect dirty pages first to determine if there are real changes.
 	p.dirtyBuf = p.cache.appendDirtyPages(p.dirtyBuf[:0])
 
 	// Filter out dontWrite pages before WAL write (fix 5.4).
@@ -794,19 +842,45 @@ func (p *pager) commit() (nFrame uint32, err error) {
 		clear(p.dontWritePages)
 	}
 
-	if len(p.dirtyBuf) == 0 {
+	// Determine if there are real changes: dirty data pages or header
+	// modifications (freelist, dbSize changes). Counter increments are
+	// deferred until we confirm there's something to commit.
+	hasRealChanges := len(p.dirtyBuf) > 0 || p.header != p.savedHeader || p.writePages[1] != nil
+
+	if !hasRealChanges {
+		// Empty transaction — counters not incremented.
 		p.state.Store(int32(pagerOpen))
 		p.savepoints = p.savepoints[:0]
 		clear(p.writePages)
 		clear(p.hasContent)
 		p.wal.endWrite()
-		return 0, nil
+		return 0, p.header.FileChangeCount, p.header.SchemaCookie, nil
 	}
+
+	// There are real changes — apply counter increments if flagged.
+	if dataChanged {
+		p.header.FileChangeCount++
+	}
+	if schemaChanged {
+		p.header.SchemaCookie++
+	}
+
+	// Ensure page 1 is always written with the updated header (fix 5.3).
+	pg1, err := p.getWritablePage(1)
+	if err != nil {
+		p.pagerError()
+		return 0, 0, 0, err
+	}
+	p.header.serialize(pg1.data[:dbHeaderSize])
+	p.releasePage(pg1)
+
+	// Re-collect dirty pages since page 1 may be newly dirty.
+	p.dirtyBuf = p.cache.appendDirtyPages(p.dirtyBuf[:0])
 
 	// Write all dirty pages to WAL
 	if err := p.wal.writeFrames(p.dirtyBuf, true, p.dbSize); err != nil {
 		p.pagerError()
-		return 0, err
+		return 0, 0, 0, err
 	}
 
 	// Capture nFrame under w.mu for happens-before ordering with checkpoint
@@ -826,7 +900,7 @@ func (p *pager) commit() (nFrame uint32, err error) {
 	p.state.Store(int32(pagerOpen))
 	p.wal.endWrite()
 
-	return nFrame, nil
+	return nFrame, p.header.FileChangeCount, p.header.SchemaCookie, nil
 }
 
 // rollback discards all changes in the current write transaction.

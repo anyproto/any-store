@@ -1250,6 +1250,6 @@ func TestPagerAllocateWithoutWriteTx(t *testing.T) {
 
 func TestPagerCommitWithoutWriteTx(t *testing.T) {
 	db := tempDB(t)
-	_, err := db.pager.commit()
+	_, _, _, err := db.pager.commit(false, false)
 	assert.ErrorIs(t, err, ErrReadOnly)
 }

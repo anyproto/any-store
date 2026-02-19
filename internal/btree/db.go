@@ -44,6 +44,12 @@ type DB struct {
 	// Format: each cell in the master B-tree maps namespace name -> root page number (4 bytes).
 	masterBT *btree
 
+	// Local counter cache for multi-process staleness detection.
+	// Updated under writeMu (during Commit or UpdateLocalCounters),
+	// read under mu.RLock (during BeginRead/BeginWrite).
+	localFileChangeCounter uint32
+	localSchemaCookie      uint32
+
 	readTxPool  sync.Pool
 	writeTxPool sync.Pool
 }
@@ -83,6 +89,21 @@ func Open(path string, opts Options) (*DB, error) {
 			rootPage: 1,
 		},
 	}
+
+	// Initialize local counters from the on-disk state (reading through WAL).
+	maxFrame, slot, err := p.beginRead()
+	if err != nil {
+		p.close()
+		return nil, err
+	}
+	fcc, sc, err := p.readHeaderCounters(maxFrame)
+	p.endRead(slot)
+	if err != nil {
+		p.close()
+		return nil, err
+	}
+	db.localFileChangeCounter = fcc
+	db.localSchemaCookie = sc
 
 	return db, nil
 }
@@ -126,12 +147,24 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 		return nil, err
 	}
 
+	// Read on-disk counters for staleness detection.
+	fcc, sc, err := db.pager.readHeaderCounters(maxFrame)
+	if err != nil {
+		db.pager.endRead(slot)
+		db.mu.RUnlock()
+		return nil, err
+	}
+
 	tx := db.getReadTx()
 	tx.db = db
 	tx.pager = db.pager
 	tx.closed = false
 	tx.walMaxFrame = maxFrame
 	tx.walSlot = slot
+	tx.diskFileChangeCounter = fcc
+	tx.diskSchemaCookie = sc
+	tx.localFileChangeCounter = db.localFileChangeCounter
+	tx.localSchemaCookie = db.localSchemaCookie
 	return tx, nil
 }
 
@@ -161,6 +194,15 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 		return nil, err
 	}
 
+	// Read on-disk counters for staleness detection.
+	fcc, sc, err := db.pager.readHeaderCounters(maxFrame)
+	if err != nil {
+		db.pager.endRead(slot)
+		db.mu.RUnlock()
+		db.writeMu.Unlock()
+		return nil, err
+	}
+
 	if err := db.pager.beginWrite(); err != nil {
 		db.pager.endRead(slot)
 		db.mu.RUnlock()
@@ -175,6 +217,12 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	tx.ReadTx.walMaxFrame = maxFrame
 	tx.ReadTx.walSlot = slot
 	tx.ReadTx.writable = true
+	tx.ReadTx.diskFileChangeCounter = fcc
+	tx.ReadTx.diskSchemaCookie = sc
+	tx.ReadTx.localFileChangeCounter = db.localFileChangeCounter
+	tx.ReadTx.localSchemaCookie = db.localSchemaCookie
+	tx.dataChanged = false   // pool reuse safety
+	tx.schemaChanged = false // pool reuse safety
 	return tx, nil
 }
 
@@ -212,6 +260,17 @@ func (db *DB) Checkpoint() error {
 		return ErrClosed
 	}
 	return db.pager.checkpoint()
+}
+
+// UpdateLocalCounters manually sets the local counter cache. This is used by
+// a process that has detected staleness and rebuilt its in-memory state: after
+// rebuilding, call this to record the new baseline so subsequent transactions
+// no longer report as stale. Takes writeMu to serialize with Commit.
+func (db *DB) UpdateLocalCounters(fileChangeCounter, schemaCookie uint32) {
+	db.writeMu.Lock()
+	db.localFileChangeCounter = fileChangeCounter
+	db.localSchemaCookie = schemaCookie
+	db.writeMu.Unlock()
 }
 
 // CreateNamespace creates a new namespace. Must be called within a write transaction.
@@ -497,6 +556,12 @@ type ReadTx struct {
 	walMaxFrame uint32 // WAL snapshot for this transaction
 	walSlot     int    // reader slot number (for endRead)
 	writable    bool   // true when embedded in a WriteTx (MVCC: allows seeing dirty pages)
+
+	// Disk counters from page 1 at transaction start (for staleness detection).
+	diskFileChangeCounter  uint32
+	diskSchemaCookie       uint32
+	localFileChangeCounter uint32 // snapshot of DB's local value
+	localSchemaCookie      uint32 // snapshot of DB's local value
 }
 
 // txGetPage fetches a page respecting MVCC snapshot isolation.
@@ -621,6 +686,31 @@ func (tx *ReadTx) GetNamespace(name string) (*Namespace, error) {
 	return tx.db.getNamespaceAt(name, tx.walMaxFrame)
 }
 
+// IsDataStale returns true if the on-disk FileChangeCount differs from the
+// locally cached value, indicating another process has committed data changes
+// since this DB last committed or synced counters.
+func (tx *ReadTx) IsDataStale() bool {
+	return tx.diskFileChangeCounter != tx.localFileChangeCounter
+}
+
+// IsSchemaStale returns true if the on-disk SchemaCookie differs from the
+// locally cached value, indicating another process has committed schema changes.
+func (tx *ReadTx) IsSchemaStale() bool {
+	return tx.diskSchemaCookie != tx.localSchemaCookie
+}
+
+// DiskFileChangeCounter returns the FileChangeCount read from page 1 at
+// the start of this transaction.
+func (tx *ReadTx) DiskFileChangeCounter() uint32 {
+	return tx.diskFileChangeCounter
+}
+
+// DiskSchemaCookie returns the SchemaCookie read from page 1 at the start
+// of this transaction.
+func (tx *ReadTx) DiskSchemaCookie() uint32 {
+	return tx.diskSchemaCookie
+}
+
 // Rollback ends the read transaction (for ReadTx, this is the same as commit).
 func (tx *ReadTx) Rollback() error {
 	if tx.closed {
@@ -637,6 +727,8 @@ func (tx *ReadTx) Rollback() error {
 // WriteTx is a read-write transaction.
 type WriteTx struct {
 	ReadTx
+	dataChanged   bool // set by MarkDataChanged; causes FileChangeCount++ on commit
+	schemaChanged bool // set by MarkSchemaChanged; causes SchemaCookie++ on commit
 }
 
 // GetNamespace returns a Namespace handle for the given name.
@@ -646,6 +738,18 @@ func (tx *WriteTx) GetNamespace(name string) (*Namespace, error) {
 		return nil, ErrTxClosed
 	}
 	return tx.db.getNamespaceLocked(name)
+}
+
+// MarkDataChanged signals that this transaction modifies data, causing
+// FileChangeCount to be incremented on commit.
+func (tx *WriteTx) MarkDataChanged() {
+	tx.dataChanged = true
+}
+
+// MarkSchemaChanged signals that this transaction modifies schema, causing
+// SchemaCookie to be incremented on commit.
+func (tx *WriteTx) MarkSchemaChanged() {
+	tx.schemaChanged = true
 }
 
 // Put inserts or updates a key-value pair in the given namespace.
@@ -677,7 +781,11 @@ func (tx *WriteTx) Commit() error {
 		return ErrTxClosed
 	}
 	tx.closed = true
-	nFrame, err := tx.pager.commit()
+	nFrame, newFCC, newSC, err := tx.pager.commit(tx.dataChanged, tx.schemaChanged)
+	if err == nil {
+		tx.db.localFileChangeCounter = newFCC
+		tx.db.localSchemaCookie = newSC
+	}
 	threshold := tx.db.opts.AutoCheckpointAfter
 	needCheckpoint := threshold > 0 && nFrame >= threshold
 	tx.pager.endRead(tx.walSlot)
