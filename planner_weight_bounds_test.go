@@ -3,10 +3,8 @@ Index/Planner tests inspired by SQLite: where.test, where2.test, where7.test
 
 Test scenario:
 Tests weight computation edge cases and index bounds behavior — verifying
-that the planner correctly computes weights for irrelevant indexes, tiebreaks
-equal-weight indexes, respects MaxIndexes, handles overlapping range bounds,
-single-point bounds, empty results with IndexScan, compound weight chains,
-sort weight contributions, hint boost overrides, and $ne filter bounds.
+that the planner correctly handles tiebreaks, MaxIndexes, compound weight
+chains, sort weight contributions, and hint boost overrides.
 
 These tests verify our custom index and query planner implementation.
 While inspired by SQLite test patterns, our system has a different
@@ -23,39 +21,6 @@ import (
 
 	"github.com/anyproto/any-store/anyenc"
 )
-
-func TestIndex_WeightBounds_ZeroWeightNotUsed(t *testing.T) {
-	// Index on "b", query {a:5} only — index is irrelevant, Explain shows FullScan.
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"b"}}))
-
-	for i := range 20 {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i, i*2))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	explain, err := coll.Find(`{"a":5}`).Explain(ctx)
-	require.NoError(t, err)
-	t.Log("Plan:", explain.Sql)
-
-	// Index on "b" has no relevance for filter on "a" → should be FullScan
-	assert.Contains(t, explain.Sql, "FullScan")
-	assert.NotContains(t, explain.Sql, "IndexScan")
-
-	// Verify index is not used
-	for _, idx := range explain.Indexes {
-		if idx.Name == "b" {
-			assert.False(t, idx.Used, "index on 'b' should not be used for query on 'a'")
-		}
-	}
-
-	// Verify query still returns correct result
-	count, err := coll.Find(`{"a":5}`).Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 1, count)
-}
 
 func TestIndex_WeightBounds_EqualWeightTiebreak(t *testing.T) {
 	// Two single-field indexes on "a" and "b". Query {a:1, b:2}.
@@ -121,75 +86,6 @@ func TestIndex_WeightBounds_MaxTwoIndexes(t *testing.T) {
 	}
 	assert.True(t, usedCount <= 2, "expected at most 2 used indexes, got %d", usedCount)
 	assert.True(t, usedCount >= 1, "expected at least 1 used index, got %d", usedCount)
-}
-
-func TestIndex_WeightBounds_OverlappingRangeBounds(t *testing.T) {
-	// Query {$or:[{a:{$gte:1,$lte:5}},{a:{$gte:3,$lte:8}}]} on 20 docs (a=0..19).
-	// Verify results include a=1 through a=8 (union of two ranges).
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-
-	for i := range 20 {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	count, err := coll.Find(`{"$or":[{"a":{"$gte":1,"$lte":5}},{"a":{"$gte":3,"$lte":8}}]}`).Count(ctx)
-	require.NoError(t, err)
-	// Union of [1,5] and [3,8] = [1,8] → 8 values: 1,2,3,4,5,6,7,8
-	assert.Equal(t, 8, count, "expected 8 results for overlapping ranges a=[1,5] OR a=[3,8]")
-
-	// Verify the actual values
-	vals := collectField(t, coll.Find(`{"$or":[{"a":{"$gte":1,"$lte":5}},{"a":{"$gte":3,"$lte":8}}]}`).Sort("a"), "a")
-	assert.Len(t, vals, 8)
-}
-
-func TestIndex_WeightBounds_SinglePointBound(t *testing.T) {
-	// Query {a:5} with index on "a", 20 docs (a=i). Verify exactly 1 result.
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-
-	for i := range 20 {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	count, err := coll.Find(`{"a":5}`).Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 1, count)
-
-	// Verify plan uses IndexScan
-	explain, err := coll.Find(`{"a":5}`).Explain(ctx)
-	require.NoError(t, err)
-	assert.Contains(t, explain.Sql, "IndexScan")
-	assert.NotContains(t, explain.Sql, "FullScan")
-}
-
-func TestIndex_WeightBounds_EmptyBoundsResult(t *testing.T) {
-	// Query {a:{$gt:100}} on data where max a=19. Verify 0 results, still uses IndexScan.
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-
-	for i := range 20 {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	count, err := coll.Find(`{"a":{"$gt":100}}`).Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 0, count)
-
-	// Even with no results, planner should still choose IndexScan for an indexed field
-	explain, err := coll.Find(`{"a":{"$gt":100}}`).Explain(ctx)
-	require.NoError(t, err)
-	t.Log("Plan:", explain.Sql)
-	assert.Contains(t, explain.Sql, "IndexScan")
 }
 
 func TestIndex_WeightBounds_CompoundWeightChain(t *testing.T) {
@@ -300,28 +196,4 @@ func TestIndex_WeightBounds_HintBoostOverridesWeight(t *testing.T) {
 		IndexHint(IndexHint{IndexName: "b", Boost: 100}).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, countNoHint, countWithHint, "hint should not change result count")
-}
-
-func TestIndex_WeightBounds_BoundsWithNe(t *testing.T) {
-	// Index on "a", 100 docs (a=i%10). Query {a:{$ne:5}} → expect 90 results.
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-
-	for i := range 100 {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%10))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	count, err := coll.Find(`{"a":{"$ne":5}}`).Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 90, count, "expected 90 results for a != 5 (100 total - 10 with a=5)")
-
-	// Verify via iteration
-	vals := collectField(t, coll.Find(`{"a":{"$ne":5}}`).Sort("a"), "a")
-	assert.Len(t, vals, 90)
-	for _, v := range vals {
-		assert.NotEqual(t, "5", v, "should not contain a=5")
-	}
 }

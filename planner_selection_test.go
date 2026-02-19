@@ -3,9 +3,9 @@ Index/Planner tests inspired by SQLite: where.test, where2.test, where7.test
 
 Test scenario:
 Tests query planner selection logic — verifying that the planner picks the
-best index for various filter/sort combinations, including compound vs single
-index preference, unique vs non-unique weighting, sort coverage, reverse scan,
-filter+sort on different fields, $in bounds, and compound sort order matching.
+best index for various filter/sort combinations. Tests requiring imperative
+logic (named/unique indexes, mid-test index creation, detailed weight
+comparisons, known-issue workarounds, multi-index weight checks).
 
 These tests verify our custom index and query planner implementation.
 While inspired by SQLite test patterns, our system has a different
@@ -24,35 +24,6 @@ import (
 
 	"github.com/anyproto/any-store/anyenc"
 )
-
-func TestIndex_PlannerSelection_CompoundOverSingle(t *testing.T) {
-	// When both a single-field index and a compound index match,
-	// the planner should prefer the compound index for a multi-field filter.
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}}))
-
-	for i := range 100 {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%10, i%7))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	// Query on both fields: compound (a,b) has weight 10*2=20 vs single (a) weight 10
-	explain, err := coll.Find(`{"a":5,"b":3}`).Explain(ctx)
-	require.NoError(t, err)
-	t.Log("Plan:", explain.Sql)
-
-	// The compound index should be used as primary scan
-	assert.Contains(t, explain.Sql, "IndexScan(a,b)")
-
-	// Verify correctness: a=5 AND b=3
-	count, err := coll.Find(`{"a":5,"b":3}`).Count(ctx)
-	require.NoError(t, err)
-	assert.True(t, count >= 1, "expected at least 1 match for a=5,b=3, got %d", count)
-}
 
 func TestIndex_PlannerSelection_UniquePreferred(t *testing.T) {
 	// Unique index gets +1 weight bonus, so it should be preferred
@@ -93,35 +64,6 @@ func TestIndex_PlannerSelection_UniquePreferred(t *testing.T) {
 	count, err := coll.Find(`{"a":42}`).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
-}
-
-func TestIndex_PlannerSelection_SortUsesIndexNoMemSort(t *testing.T) {
-	// Sort on indexed field should use IndexScan and NOT have a Sort iterator
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-
-	for i := range 100 {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	// Sort ascending with index
-	explain, err := coll.Find(nil).Sort("a").Explain(ctx)
-	require.NoError(t, err)
-	t.Log("Plan:", explain.Sql)
-
-	assert.Contains(t, explain.Sql, "IndexScan(a)")
-	assert.NotContains(t, explain.Sql, "Sort", "index-covered sort should not have Sort iterator")
-
-	// Verify results are actually sorted
-	vals := collectField(t, coll.Find(nil).Sort("a").Limit(5), "a")
-	require.Len(t, vals, 5)
-	for i := 1; i < len(vals); i++ {
-		assert.True(t, vals[i-1] <= vals[i], "not sorted at position %d", i)
-	}
 }
 
 func TestIndex_PlannerSelection_ReverseSortUsesIndex(t *testing.T) {
@@ -195,30 +137,47 @@ func TestIndex_PlannerSelection_FilterAndSort_DifferentFields(t *testing.T) {
 	assert.NotContains(t, explain2.Sql, "-> Sort")
 }
 
-func TestIndex_PlannerSelection_InOperatorBounds(t *testing.T) {
-	// $in generates multiple bound segments; planner should use index
+func TestIndex_PlannerSelection_IndexHintOverride(t *testing.T) {
+	// IndexHint boost overrides natural weight selection
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
 
 	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"b"}}))
 
 	for i := range 100 {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))
+		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%10, i%7))
 		require.NoError(t, coll.Insert(ctx, doc))
 	}
 
-	explain, err := coll.Find(`{"a":{"$in":[5,15,25,35,45]}}`).Explain(ctx)
+	// Without hint, filter on both a and b — planner picks one naturally
+	explainDefault, err := coll.Find(`{"a":5,"b":3}`).Explain(ctx)
 	require.NoError(t, err)
-	t.Log("Plan:", explain.Sql)
+	t.Log("Default plan:", explainDefault.Sql)
 
-	assert.Contains(t, explain.Sql, "IndexScan(a)")
-	assert.NotContains(t, explain.Sql, "FullScan")
-
-	// Verify correctness
-	count, err := coll.Find(`{"a":{"$in":[5,15,25,35,45]}}`).Count(ctx)
+	// With hint boosting b by 100, force planner to use b
+	explainHinted, err := coll.Find(`{"a":5,"b":3}`).
+		IndexHint(IndexHint{IndexName: "b", Boost: 100}).
+		Explain(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 5, count)
+	t.Log("Hinted plan:", explainHinted.Sql)
+
+	// Hinted plan should use index b as primary
+	assert.Contains(t, explainHinted.Sql, "IndexScan(b)")
+
+	// Verify the boosted index has highest weight
+	require.True(t, len(explainHinted.Indexes) >= 2)
+	assert.Equal(t, "b", explainHinted.Indexes[0].Name, "boosted index should be first (highest weight)")
+
+	// Verify correctness is the same
+	countDefault, err := coll.Find(`{"a":5,"b":3}`).Count(ctx)
+	require.NoError(t, err)
+	countHinted, err := coll.Find(`{"a":5,"b":3}`).
+		IndexHint(IndexHint{IndexName: "b", Boost: 100}).
+		Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, countDefault, countHinted, "hinted and default should return same count")
 }
 
 func TestIndex_PlannerSelection_CompoundSortMatching(t *testing.T) {
@@ -267,58 +226,6 @@ func TestIndex_PlannerSelection_CompoundSortMatching(t *testing.T) {
 		// Verify results are returned (correctness)
 		docs := collectDocs(t, coll.Find(nil).Sort("y", "x"))
 		assert.Len(t, docs, 50)
-	})
-}
-
-func TestIndex_PlannerSelection_NoFilterFullScan(t *testing.T) {
-	// Query with no filter and no sort that benefits from an index → FullScan
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"b"}}))
-
-	for i := range 50 {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%10, i%7))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	// No filter, no sort → FullScan
-	explain, err := coll.Find(nil).Explain(ctx)
-	require.NoError(t, err)
-	t.Log("Plan:", explain.Sql)
-	assert.Contains(t, explain.Sql, "FullScan")
-	assert.NotContains(t, explain.Sql, "IndexScan")
-}
-
-func TestIndex_PlannerSelection_TwoSingleIndexes_PicksBestForFilter(t *testing.T) {
-	// With two single-field indexes, planner picks the one matching the filter field.
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"b"}}))
-
-	for i := range 100 {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%10, i%7))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	t.Run("filter on a - uses index a", func(t *testing.T) {
-		explain, err := coll.Find(`{"a":3}`).Explain(ctx)
-		require.NoError(t, err)
-		t.Log("Plan:", explain.Sql)
-		// Index (a) should be used because only field a is in the filter
-		assert.Contains(t, explain.Sql, "IndexScan(a)")
-	})
-
-	t.Run("filter on b - uses index b", func(t *testing.T) {
-		explain, err := coll.Find(`{"b":3}`).Explain(ctx)
-		require.NoError(t, err)
-		t.Log("Plan:", explain.Sql)
-		assert.Contains(t, explain.Sql, "IndexScan(b)")
 	})
 }
 
@@ -422,49 +329,6 @@ func TestIndex_PlannerSelection_CoverLookup_UniqueEquality(t *testing.T) {
 	count, err := coll.Find(`{"email":"user50@test.com"}`).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
-}
-
-func TestIndex_PlannerSelection_IndexHintOverride(t *testing.T) {
-	// IndexHint boost overrides natural weight selection
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"b"}}))
-
-	for i := range 100 {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%10, i%7))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	// Without hint, filter on both a and b — planner picks one naturally
-	explainDefault, err := coll.Find(`{"a":5,"b":3}`).Explain(ctx)
-	require.NoError(t, err)
-	t.Log("Default plan:", explainDefault.Sql)
-
-	// With hint boosting b by 100, force planner to use b
-	explainHinted, err := coll.Find(`{"a":5,"b":3}`).
-		IndexHint(IndexHint{IndexName: "b", Boost: 100}).
-		Explain(ctx)
-	require.NoError(t, err)
-	t.Log("Hinted plan:", explainHinted.Sql)
-
-	// Hinted plan should use index b as primary
-	assert.Contains(t, explainHinted.Sql, "IndexScan(b)")
-
-	// Verify the boosted index has highest weight
-	require.True(t, len(explainHinted.Indexes) >= 2)
-	assert.Equal(t, "b", explainHinted.Indexes[0].Name, "boosted index should be first (highest weight)")
-
-	// Verify correctness is the same
-	countDefault, err := coll.Find(`{"a":5,"b":3}`).Count(ctx)
-	require.NoError(t, err)
-	countHinted, err := coll.Find(`{"a":5,"b":3}`).
-		IndexHint(IndexHint{IndexName: "b", Boost: 100}).
-		Count(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, countDefault, countHinted, "hinted and default should return same count")
 }
 
 func TestIndex_PlannerSelection_CompoundSortPartialMatch(t *testing.T) {

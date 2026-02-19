@@ -1,0 +1,32 @@
+{
+  "data": [
+    {"id": 0, "name": "charlie"},
+    {"id": 1, "name": "alice"},
+    {"id": 2, "name": "bob"},
+    {"id": 3, "name": "dave"},
+    {"id": 4, "name": "eve"}
+  ],
+  "indexes": [["name"]],
+  "tests": [
+    {
+      "name": "equality",
+      "cond": {"name": "bob"},
+      "expectedCount": 1
+    },
+    {
+      "name": "range",
+      "cond": {"name": {"$gte": "bob", "$lte": "dave"}},
+      "expectedCount": 3
+    },
+    {
+      "name": "sort asc",
+      "sort": ["name"],
+      "expectedIds": [1, 2, 0, 3, 4]
+    },
+    {
+      "name": "sort desc",
+      "sort": ["-name"],
+      "expectedIds": [4, 3, 0, 2, 1]
+    }
+  ]
+}

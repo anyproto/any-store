@@ -2,9 +2,12 @@ package test
 
 import (
 	"encoding/json"
+	"fmt"
+	"io/fs"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -23,18 +26,29 @@ func init() {
 }
 
 func TestQueries(t *testing.T) {
-	t.Run("no-index", func(t *testing.T) {
-		testFile(t, "data/no-index.json")
+	dataDir := "data"
+	err := filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(path, ".json") {
+			return nil
+		}
+		// Compute relative path from dataDir and strip .json extension
+		rel, err := filepath.Rel(dataDir, path)
+		if err != nil {
+			return err
+		}
+		name := strings.TrimSuffix(rel, ".json")
+		t.Run(name, func(t *testing.T) {
+			testFile(t, path)
+		})
+		return nil
 	})
-	t.Run("simple indexes", func(t *testing.T) {
-		testFile(t, "data/simple-indexes.json")
-	})
-	t.Run("composite indexe", func(t *testing.T) {
-		testFile(t, "data/composite-index.json")
-	})
-	t.Run("multi index", func(t *testing.T) {
-		testFile(t, "data/multi-index.json")
-	})
+	require.NoError(t, err)
 }
 
 func TestCollection_ReadUncommitted(t *testing.T) {
@@ -68,17 +82,28 @@ type TestCases struct {
 	Data          []json.RawMessage `json:"data"`
 	Indexes       [][]string        `json:"indexes"`
 	SparseIndexes [][]string        `json:"sparseIndexes"`
+	UniqueIndexes [][]string        `json:"uniqueIndexes"`
 }
 
 type TestCase struct {
+	Name   string          `json:"name"`
 	Cond   json.RawMessage `json:"cond"`
 	Limit  uint            `json:"limit"`
 	Offset uint            `json:"offset"`
 	Sort   []string        `json:"sort"`
 
-	ExpectedExplain string            `json:"expectedExplain"`
-	ExpectedQuery   string            `json:"expectedQuery"`
-	ExpectedIds     []json.RawMessage `json:"expectedIds"`
+	ExpectedExplain         string            `json:"expectedExplain"`
+	ExpectedQuery           string            `json:"expectedQuery"`
+	ExpectedIds             []json.RawMessage `json:"expectedIds"`
+	ExpectedCount           *int              `json:"expectedCount"`
+	ExpectedPlanContains    []string          `json:"expectedPlanContains"`
+	ExpectedPlanNotContains []string          `json:"expectedPlanNotContains"`
+	IndexHints              []IndexHintJSON   `json:"indexHints"`
+}
+
+type IndexHintJSON struct {
+	IndexName string `json:"indexName"`
+	Boost     int    `json:"boost"`
 }
 
 func testFile(t *testing.T, filename string) {
@@ -112,53 +137,93 @@ func testFile(t *testing.T, filename string) {
 		}))
 	}
 
-	st := time.Now()
-	require.NoError(t, coll.Insert(ctx, docs...))
-	t.Logf("inserted %d docs; %v", len(docs), time.Since(st))
+	for _, indexFields := range testCases.UniqueIndexes {
+		require.NoError(t, coll.EnsureIndex(ctx, anystore.IndexInfo{
+			Fields: indexFields,
+			Unique: true,
+		}))
+	}
+
+	if len(docs) > 0 {
+		st := time.Now()
+		require.NoError(t, coll.Insert(ctx, docs...))
+		t.Logf("inserted %d docs; %v", len(docs), time.Since(st))
+	}
 
 	for j, tc := range testCases.Tests[:] {
-		var cond any
-		if tc.Cond != nil {
-			cond = tc.Cond
+		testName := fmt.Sprintf("%d", j)
+		if tc.Name != "" {
+			testName = tc.Name
 		}
-		q := coll.Find(cond).Limit(tc.Limit).Offset(tc.Offset)
-		if tc.Sort != nil {
-			var sorts = make([]any, len(tc.Sort))
-			for i, s := range tc.Sort {
-				sorts[i] = s
+		t.Run(testName, func(t *testing.T) {
+			var cond any
+			if tc.Cond != nil {
+				cond = tc.Cond
 			}
-			q.Sort(sorts...)
-		}
+			q := coll.Find(cond).Limit(tc.Limit).Offset(tc.Offset)
+			if tc.Sort != nil {
+				var sorts = make([]any, len(tc.Sort))
+				for i, s := range tc.Sort {
+					sorts[i] = s
+				}
+				q.Sort(sorts...)
+			}
 
-		st := time.Now()
+			for _, h := range tc.IndexHints {
+				q = q.IndexHint(anystore.IndexHint{IndexName: h.IndexName, Boost: h.Boost})
+			}
 
-		iter, err := q.Iter(ctx)
-		require.NoError(t, err)
+			st := time.Now()
 
-		var result = make([]string, 0)
-		for iter.Next() {
-			doc, err := iter.Doc()
-			require.NoError(t, err)
-			result = append(result, doc.Value().Get("id").String())
-		}
-		dur := time.Since(st)
-		var expected = make([]string, len(tc.ExpectedIds))
-		for i, eId := range tc.ExpectedIds {
-			expected[i] = fastjson.MustParseBytes(eId).String()
-		}
-		assert.Equal(t, expected, result, j)
-		require.NoError(t, iter.Close())
+			if tc.ExpectedCount != nil {
+				count, err := q.Count(ctx)
+				require.NoError(t, err)
+				assert.Equal(t, *tc.ExpectedCount, count)
+			}
 
-		explain, err := q.Explain(ctx)
-		require.NoError(t, err)
-		if tc.ExpectedExplain != "" {
-			assert.Equal(t, strings.TrimSpace(tc.ExpectedExplain), strings.TrimSpace(strings.Join(explain.SqliteExplain, "\n")), j)
-		}
-		if tc.ExpectedQuery != "" {
-			assert.Equal(t, strings.TrimSpace(tc.ExpectedQuery), strings.TrimSpace(explain.Sql), j)
-		}
+			if tc.ExpectedIds != nil {
+				iter, err := q.Iter(ctx)
+				require.NoError(t, err)
 
-		t.Logf("%d\t%s\t%v", j, explain.Sql, dur)
+				var result = make([]string, 0)
+				for iter.Next() {
+					doc, err := iter.Doc()
+					require.NoError(t, err)
+					result = append(result, doc.Value().Get("id").String())
+				}
+				var expected = make([]string, len(tc.ExpectedIds))
+				for i, eId := range tc.ExpectedIds {
+					expected[i] = fastjson.MustParseBytes(eId).String()
+				}
+				assert.Equal(t, expected, result)
+				require.NoError(t, iter.Close())
+			}
+
+			dur := time.Since(st)
+
+			needExplain := tc.ExpectedExplain != "" || tc.ExpectedQuery != "" ||
+				len(tc.ExpectedPlanContains) > 0 || len(tc.ExpectedPlanNotContains) > 0
+
+			if needExplain {
+				explain, err := q.Explain(ctx)
+				require.NoError(t, err)
+				if tc.ExpectedExplain != "" {
+					assert.Equal(t, strings.TrimSpace(tc.ExpectedExplain), strings.TrimSpace(strings.Join(explain.SqliteExplain, "\n")))
+				}
+				if tc.ExpectedQuery != "" {
+					assert.Equal(t, strings.TrimSpace(tc.ExpectedQuery), strings.TrimSpace(explain.Sql))
+				}
+				for _, s := range tc.ExpectedPlanContains {
+					assert.Contains(t, explain.Sql, s)
+				}
+				for _, s := range tc.ExpectedPlanNotContains {
+					assert.NotContains(t, explain.Sql, s)
+				}
+				t.Logf("%s\t%v", explain.Sql, dur)
+			} else {
+				t.Logf("dur: %v", dur)
+			}
+		})
 	}
 
 }

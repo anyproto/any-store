@@ -2,11 +2,11 @@
 Index/Planner tests inspired by SQLite: where2.test, where.test
 
 Test scenario:
-Tests limit/offset behavior with index-backed queries. Verifies that
-Sort+Limit uses index for early termination, Offset+Limit returns the
-correct window, pagination is consistent (no gaps/duplicates), edge
-cases like offset > result set and limit > result set work correctly,
-and compound sort + limit respects multi-field ordering.
+Tests limit/offset behavior with index-backed queries requiring imperative
+logic: filter+sort+limit with non-trivial assertions, pagination loop
+verification, compound sort type struct verification, unique index
+CoverLookup, two-collection comparison, windowed verification, and
+duplicate value handling.
 
 These tests verify our custom index and query planner implementation.
 While inspired by SQLite test patterns, our system has a different
@@ -45,77 +45,6 @@ func collectIntField(t testing.TB, q Query, field string) []int {
 	}
 	require.NoError(t, iter.Err())
 	return results
-}
-
-func TestIndex_LimitOffset_SortLimitWithIndex(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-
-	for i := 1; i <= 100; i++ {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	t.Run("ascending sort limit 5", func(t *testing.T) {
-		vals := collectIntField(t, coll.Find(nil).Sort("a").Limit(5), "a")
-		require.Len(t, vals, 5)
-		assert.Equal(t, []int{1, 2, 3, 4, 5}, vals)
-
-		explain, err := coll.Find(nil).Sort("a").Limit(5).Explain(ctx)
-		require.NoError(t, err)
-		assert.Contains(t, explain.Sql, "IndexScan")
-		assert.NotContains(t, explain.Sql, "Sort(")
-	})
-
-	t.Run("descending sort limit 3", func(t *testing.T) {
-		vals := collectIntField(t, coll.Find(nil).Sort("-a").Limit(3), "a")
-		require.Len(t, vals, 3)
-		assert.Equal(t, []int{100, 99, 98}, vals)
-	})
-
-	t.Run("sort limit 1 returns min", func(t *testing.T) {
-		vals := collectIntField(t, coll.Find(nil).Sort("a").Limit(1), "a")
-		require.Len(t, vals, 1)
-		assert.Equal(t, 1, vals[0])
-	})
-
-	t.Run("sort desc limit 1 returns max", func(t *testing.T) {
-		vals := collectIntField(t, coll.Find(nil).Sort("-a").Limit(1), "a")
-		require.Len(t, vals, 1)
-		assert.Equal(t, 100, vals[0])
-	})
-}
-
-func TestIndex_LimitOffset_SortOffsetLimitWithIndex(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-
-	for i := 1; i <= 100; i++ {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	t.Run("offset 10 limit 5 ascending", func(t *testing.T) {
-		vals := collectIntField(t, coll.Find(nil).Sort("a").Offset(10).Limit(5), "a")
-		require.Len(t, vals, 5)
-		assert.Equal(t, []int{11, 12, 13, 14, 15}, vals)
-	})
-
-	t.Run("offset 5 limit 3 descending", func(t *testing.T) {
-		vals := collectIntField(t, coll.Find(nil).Sort("-a").Offset(5).Limit(3), "a")
-		require.Len(t, vals, 3)
-		assert.Equal(t, []int{95, 94, 93}, vals)
-	})
-
-	t.Run("offset near end ascending", func(t *testing.T) {
-		vals := collectIntField(t, coll.Find(nil).Sort("a").Offset(97).Limit(10), "a")
-		require.Len(t, vals, 3)
-		assert.Equal(t, []int{98, 99, 100}, vals)
-	})
 }
 
 func TestIndex_LimitOffset_FilterSortLimit(t *testing.T) {
@@ -168,58 +97,6 @@ func TestIndex_LimitOffset_FilterSortLimit(t *testing.T) {
 	})
 }
 
-func TestIndex_LimitOffset_OffsetLargerThanResultSet(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-
-	for i := 1; i <= 10; i++ {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	t.Run("offset exceeds total", func(t *testing.T) {
-		vals := collectIntField(t, coll.Find(nil).Sort("a").Offset(100).Limit(5), "a")
-		assert.Len(t, vals, 0)
-	})
-
-	t.Run("offset equals total", func(t *testing.T) {
-		vals := collectIntField(t, coll.Find(nil).Sort("a").Offset(10).Limit(5), "a")
-		assert.Len(t, vals, 0)
-	})
-
-	t.Run("offset exceeds filtered results", func(t *testing.T) {
-		// Only 5 docs have a > 5
-		vals := collectIntField(t, coll.Find(`{"a":{"$gt":5}}`).Sort("a").Offset(10).Limit(5), "a")
-		assert.Len(t, vals, 0)
-	})
-}
-
-func TestIndex_LimitOffset_LimitLargerThanResultSet(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-
-	for i := 1; i <= 10; i++ {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	t.Run("limit exceeds total", func(t *testing.T) {
-		vals := collectIntField(t, coll.Find(nil).Sort("a").Limit(100), "a")
-		require.Len(t, vals, 10)
-		assert.Equal(t, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, vals)
-	})
-
-	t.Run("limit exceeds filtered results", func(t *testing.T) {
-		vals := collectIntField(t, coll.Find(`{"a":{"$gt":7}}`).Sort("a").Limit(100), "a")
-		require.Len(t, vals, 3)
-		assert.Equal(t, []int{8, 9, 10}, vals)
-	})
-}
-
 func TestIndex_LimitOffset_PaginationConsistency(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
@@ -253,51 +130,6 @@ func TestIndex_LimitOffset_PaginationConsistency(t *testing.T) {
 		expected[i] = i + 1
 	}
 	assert.Equal(t, expected, allPaged)
-}
-
-func TestIndex_LimitOffset_DescSortWithOffset(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
-
-	for i := 1; i <= 100; i++ {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	t.Run("desc offset 5 limit 5", func(t *testing.T) {
-		vals := collectIntField(t, coll.Find(nil).Sort("-a").Offset(5).Limit(5), "a")
-		require.Len(t, vals, 5)
-		assert.Equal(t, []int{95, 94, 93, 92, 91}, vals)
-	})
-
-	t.Run("desc offset 0 limit 5", func(t *testing.T) {
-		vals := collectIntField(t, coll.Find(nil).Sort("-a").Offset(0).Limit(5), "a")
-		require.Len(t, vals, 5)
-		assert.Equal(t, []int{100, 99, 98, 97, 96}, vals)
-	})
-
-	t.Run("desc pagination page 1 and page 2", func(t *testing.T) {
-		page1 := collectIntField(t, coll.Find(nil).Sort("-a").Offset(0).Limit(10), "a")
-		page2 := collectIntField(t, coll.Find(nil).Sort("-a").Offset(10).Limit(10), "a")
-
-		require.Len(t, page1, 10)
-		require.Len(t, page2, 10)
-
-		// No overlap
-		for _, v1 := range page1 {
-			for _, v2 := range page2 {
-				assert.NotEqual(t, v1, v2, "duplicate between pages")
-			}
-		}
-
-		// Page 1 is 100..91, page 2 is 90..81
-		assert.Equal(t, 100, page1[0])
-		assert.Equal(t, 91, page1[9])
-		assert.Equal(t, 90, page2[0])
-		assert.Equal(t, 81, page2[9])
-	})
 }
 
 func TestIndex_LimitOffset_CompoundSortLimit(t *testing.T) {

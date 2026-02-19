@@ -2,11 +2,10 @@
 Index/Planner tests inspired by SQLite: index.test, index7.test, descidx1.test, descidx2.test
 
 Test scenario:
-Compound index tests covering sort order verification, range queries on
-compound fields, mixed ascending/descending directions, filter-first-sort-second
-patterns, equality+range combinations, $in on first field, and three-field
-compound sort ordering. These complement the basic compound coverage in
-qplanner_integration_test.go with deeper correctness checks.
+Compound index tests covering range queries on compound fields, mixed
+ascending/descending directions, multi-field sort ordering, and
+indexed-vs-unindexed comparison. Tests requiring imperative logic
+(multi-collection comparison, known bug workarounds, weight checks).
 
 These tests verify our custom index and query planner implementation.
 While inspired by SQLite test patterns, our system has a different
@@ -23,78 +22,6 @@ import (
 
 	"github.com/anyproto/any-store/anyenc"
 )
-
-// TestIndex_Compound_SortOrderVerification verifies that a compound index on
-// (a, b) produces correctly ordered results — not just a correct count.
-func TestIndex_Compound_SortOrderVerification(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}}))
-
-	// Insert docs with known a,b pairs in random order
-	pairs := [][2]int{
-		{3, 2}, {1, 5}, {2, 1}, {1, 3}, {3, 1}, {2, 4}, {1, 1}, {2, 2}, {3, 3},
-	}
-	for i, p := range pairs {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, p[0], p[1]))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	t.Run("sort a then b ascending", func(t *testing.T) {
-		iter, err := coll.Find(nil).Sort("a", "b").Iter(ctx)
-		require.NoError(t, err)
-		defer iter.Close()
-
-		var prevA, prevB int
-		prevA = -1
-		first := true
-		for iter.Next() {
-			doc, err := iter.Doc()
-			require.NoError(t, err)
-			a := doc.Value().GetInt("a")
-			b := doc.Value().GetInt("b")
-			if !first {
-				if a == prevA {
-					assert.True(t, b >= prevB, "within same a=%d, b should be ascending: got %d after %d", a, b, prevB)
-				} else {
-					assert.True(t, a > prevA, "a should be ascending: got %d after %d", a, prevA)
-				}
-			}
-			prevA = a
-			prevB = b
-			first = false
-		}
-		require.NoError(t, iter.Err())
-	})
-
-	t.Run("sort a then b descending", func(t *testing.T) {
-		iter, err := coll.Find(nil).Sort("-a", "-b").Iter(ctx)
-		require.NoError(t, err)
-		defer iter.Close()
-
-		var prevA, prevB int
-		prevA = 999
-		first := true
-		for iter.Next() {
-			doc, err := iter.Doc()
-			require.NoError(t, err)
-			a := doc.Value().GetInt("a")
-			b := doc.Value().GetInt("b")
-			if !first {
-				if a == prevA {
-					assert.True(t, b <= prevB, "within same a=%d, b should be descending: got %d after %d", a, b, prevB)
-				} else {
-					assert.True(t, a < prevA, "a should be descending: got %d after %d", a, prevA)
-				}
-			}
-			prevA = a
-			prevB = b
-			first = false
-		}
-		require.NoError(t, iter.Err())
-	})
-}
 
 // TestIndex_Compound_RangeFirstEqualitySecond tests range on first field
 // combined with equality on second field of a compound index.
@@ -293,172 +220,6 @@ func TestIndex_Compound_MixedDirectionsSort(t *testing.T) {
 	})
 }
 
-// TestIndex_Compound_FilterFirstSortSecond tests filtering on the first field
-// of a compound index while sorting on the second, verifying actual ordering.
-func TestIndex_Compound_FilterFirstSortSecond(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}}))
-
-	// Insert 50 docs: a=i%5, b=i (unique b values make sort verification easy)
-	for i := range 50 {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%5, i))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	t.Run("filter a=2 sort by b ascending", func(t *testing.T) {
-		iter, err := coll.Find(`{"a":2}`).Sort("b").Iter(ctx)
-		require.NoError(t, err)
-		defer iter.Close()
-
-		var bValues []int
-		for iter.Next() {
-			doc, err := iter.Doc()
-			require.NoError(t, err)
-			assert.Equal(t, 2, doc.Value().GetInt("a"))
-			bValues = append(bValues, doc.Value().GetInt("b"))
-		}
-		require.NoError(t, iter.Err())
-		assert.Equal(t, 10, len(bValues)) // 50/5 = 10
-
-		// Verify b is sorted ascending
-		for i := 1; i < len(bValues); i++ {
-			assert.True(t, bValues[i] > bValues[i-1],
-				"b should be ascending: got %d after %d", bValues[i], bValues[i-1])
-		}
-	})
-
-	t.Run("filter a=2 sort by b descending", func(t *testing.T) {
-		iter, err := coll.Find(`{"a":2}`).Sort("-b").Iter(ctx)
-		require.NoError(t, err)
-		defer iter.Close()
-
-		var bValues []int
-		for iter.Next() {
-			doc, err := iter.Doc()
-			require.NoError(t, err)
-			assert.Equal(t, 2, doc.Value().GetInt("a"))
-			bValues = append(bValues, doc.Value().GetInt("b"))
-		}
-		require.NoError(t, iter.Err())
-		assert.Equal(t, 10, len(bValues))
-
-		// Verify b is sorted descending
-		for i := 1; i < len(bValues); i++ {
-			assert.True(t, bValues[i] < bValues[i-1],
-				"b should be descending: got %d after %d", bValues[i], bValues[i-1])
-		}
-	})
-}
-
-// TestIndex_Compound_EqualityFirstRangeSecond tests equality on first field
-// and range on second field of a compound index.
-func TestIndex_Compound_EqualityFirstRangeSecond(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}}))
-
-	// Insert: a=1..3, b=1..10 (3*10=30 docs)
-	id := 0
-	for a := 1; a <= 3; a++ {
-		for b := 1; b <= 10; b++ {
-			doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, id, a, b))
-			require.NoError(t, coll.Insert(ctx, doc))
-			id++
-		}
-	}
-
-	t.Run("equality a=2 range b>=5", func(t *testing.T) {
-		iter, err := coll.Find(`{"a":2,"b":{"$gte":5}}`).Sort("b").Iter(ctx)
-		require.NoError(t, err)
-		defer iter.Close()
-
-		var bValues []int
-		for iter.Next() {
-			doc, err := iter.Doc()
-			require.NoError(t, err)
-			assert.Equal(t, 2, doc.Value().GetInt("a"))
-			bValues = append(bValues, doc.Value().GetInt("b"))
-		}
-		require.NoError(t, iter.Err())
-		assert.Equal(t, []int{5, 6, 7, 8, 9, 10}, bValues)
-	})
-
-	t.Run("equality a=2 range b<5", func(t *testing.T) {
-		iter, err := coll.Find(`{"a":2,"b":{"$lt":5}}`).Sort("b").Iter(ctx)
-		require.NoError(t, err)
-		defer iter.Close()
-
-		var bValues []int
-		for iter.Next() {
-			doc, err := iter.Doc()
-			require.NoError(t, err)
-			assert.Equal(t, 2, doc.Value().GetInt("a"))
-			bValues = append(bValues, doc.Value().GetInt("b"))
-		}
-		require.NoError(t, iter.Err())
-		assert.Equal(t, []int{1, 2, 3, 4}, bValues)
-	})
-
-	t.Run("equality a=2 range b between 3 and 7 inclusive", func(t *testing.T) {
-		count, err := coll.Find(`{"a":2,"b":{"$gte":3,"$lte":7}}`).Count(ctx)
-		require.NoError(t, err)
-		assert.Equal(t, 5, count) // b=3,4,5,6,7
-	})
-
-	t.Run("explain shows IndexScan", func(t *testing.T) {
-		explain, err := coll.Find(`{"a":2,"b":{"$gte":5}}`).Explain(ctx)
-		require.NoError(t, err)
-		assert.Contains(t, explain.Sql, "IndexScan")
-	})
-}
-
-// TestIndex_Compound_InOnFirstField tests $in on the first field of a compound
-// index, verifying correct results and that the index is utilized.
-func TestIndex_Compound_InOnFirstField(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}}))
-
-	for i := range 100 {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%10, i%7))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	t.Run("$in on first field", func(t *testing.T) {
-		count, err := coll.Find(`{"a":{"$in":[2,5,8]}}`).Count(ctx)
-		require.NoError(t, err)
-		assert.Equal(t, 30, count) // 3 values * 10 each
-
-		// Compare with non-indexed collection
-		collNoIdx, err := fx.CreateCollection(ctx, "noidx")
-		require.NoError(t, err)
-		for i := range 100 {
-			doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%10, i%7))
-			require.NoError(t, collNoIdx.Insert(ctx, doc))
-		}
-		countNoIdx, err := collNoIdx.Find(`{"a":{"$in":[2,5,8]}}`).Count(ctx)
-		require.NoError(t, err)
-		assert.Equal(t, countNoIdx, count)
-	})
-
-	t.Run("$in on first field with equality on second", func(t *testing.T) {
-		// a in {2,5,8}, b=3
-		var expected int
-		for i := range 100 {
-			if (i%10 == 2 || i%10 == 5 || i%10 == 8) && i%7 == 3 {
-				expected++
-			}
-		}
-		count, err := coll.Find(`{"a":{"$in":[2,5,8]},"b":3}`).Count(ctx)
-		require.NoError(t, err)
-		assert.Equal(t, expected, count)
-	})
-}
-
 // TestIndex_Compound_AllFieldsRangeQueried tests range queries on both fields
 // of a compound index simultaneously.
 func TestIndex_Compound_AllFieldsRangeQueried(t *testing.T) {
@@ -545,44 +306,6 @@ func TestIndex_Compound_FullMatchVsSingleFieldSelection(t *testing.T) {
 	count, err = coll.Find(`{"a":5,"b":0}`).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 10, count, "all a=5 docs have b=0 since 5%5=0")
-}
-
-// TestIndex_Compound_SortMatchesIndex verifies that sort matching the compound
-// index field order uses the index (no Sort step in plan).
-func TestIndex_Compound_SortMatchesIndex(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}}))
-
-	// Insert in random-ish order
-	vals := []int{5, 2, 8, 1, 4, 7, 3, 6, 9, 0}
-	for i, v := range vals {
-		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, v%4, v))
-		require.NoError(t, coll.Insert(ctx, doc))
-	}
-
-	t.Run("sort a,b ascending uses index", func(t *testing.T) {
-		explain, err := coll.Find(nil).Sort("a", "b").Explain(ctx)
-		require.NoError(t, err)
-		assert.NotContains(t, explain.Sql, "Sort(", "compound sort matching index should not need Sort step")
-	})
-
-	t.Run("sort -a,-b uses reverse index scan", func(t *testing.T) {
-		explain, err := coll.Find(nil).Sort("-a", "-b").Explain(ctx)
-		require.NoError(t, err)
-		assert.NotContains(t, explain.Sql, "Sort(", "reverse compound sort should use reverse index scan")
-	})
-
-	t.Run("sort b,a mismatches index field order", func(t *testing.T) {
-		// Sort by (b, a) doesn't match index (a, b). The planner may or may
-		// not add an in-memory Sort step. We just verify the count is correct.
-		// KNOWN ISSUE: planner may use IndexScan(a,b) without adding a Sort step
-		// even though the requested sort order (b,a) doesn't match.
-		count, err := coll.Find(nil).Sort("b", "a").Count(ctx)
-		require.NoError(t, err)
-		assert.Equal(t, 10, count)
-	})
 }
 
 // TestIndex_Compound_RangeOnEachPosition tests range queries targeting

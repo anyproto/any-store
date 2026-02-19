@@ -1,0 +1,95 @@
+{
+  "data": [
+    {"id": 0, "a": 0, "b": 0},
+    {"id": 1, "a": 1, "b": 1},
+    {"id": 2, "a": 2, "b": 2},
+    {"id": 3, "a": 0, "b": 3},
+    {"id": 4, "a": 1, "b": 4},
+    {"id": 5, "a": 2, "b": 5},
+    {"id": 6, "a": 0, "b": 6},
+    {"id": 7, "a": 1, "b": 7},
+    {"id": 8, "a": 2, "b": 8},
+    {"id": 9, "a": 0, "b": 9},
+    {"id": 10, "a": 1, "b": 0},
+    {"id": 11, "a": 2, "b": 1},
+    {"id": 12, "a": 0, "b": 2},
+    {"id": 13, "a": 1, "b": 3},
+    {"id": 14, "a": 2, "b": 4},
+    {"id": 15, "a": 0, "b": 5},
+    {"id": 16, "a": 1, "b": 6},
+    {"id": 17, "a": 2, "b": 7},
+    {"id": 18, "a": 0, "b": 8},
+    {"id": 19, "a": 1, "b": 9},
+    {"id": 20, "a": 2, "b": 0},
+    {"id": 21, "a": 0, "b": 1},
+    {"id": 22, "a": 1, "b": 2},
+    {"id": 23, "a": 2, "b": 3},
+    {"id": 24, "a": 0, "b": 4},
+    {"id": 25, "a": 1, "b": 5},
+    {"id": 26, "a": 2, "b": 6},
+    {"id": 27, "a": 0, "b": 7},
+    {"id": 28, "a": 1, "b": 8},
+    {"id": 29, "a": 2, "b": 9}
+  ],
+  "indexes": [["a", "b"]],
+  "tests": [
+    {
+      "name": "sort a,b asc",
+      "sort": ["a", "b"],
+      "expectedIds": [0, 21, 12, 3, 24, 15, 6, 27, 18, 9, 10, 1, 22, 13, 4, 25, 16, 7, 28, 19, 20, 11, 2, 23, 14, 5, 26, 17, 8, 29]
+    },
+    {
+      "name": "filter a=1 sort b",
+      "cond": {"a": 1},
+      "sort": ["b"],
+      "expectedIds": [10, 1, 22, 13, 4, 25, 16, 7, 28, 19]
+    },
+    {
+      "name": "filter a=1 sort -b",
+      "cond": {"a": 1},
+      "sort": ["-b"],
+      "expectedIds": [19, 28, 7, 16, 25, 4, 13, 22, 1, 10]
+    },
+    {
+      "name": "equality a=2, range b gte 5",
+      "cond": {"a": 2, "b": {"$gte": 5}},
+      "sort": ["b"],
+      "expectedIds": [5, 26, 17, 8, 29]
+    },
+    {
+      "name": "equality a=2, range b lt 5",
+      "cond": {"a": 2, "b": {"$lt": 5}},
+      "sort": ["b"],
+      "expectedIds": [20, 11, 2, 23, 14]
+    },
+    {
+      "name": "range both fields count",
+      "cond": {"a": {"$gte": 1, "$lte": 2}, "b": {"$gte": 3, "$lte": 7}},
+      "expectedCount": 10
+    },
+    {
+      "name": "$in on first field",
+      "cond": {"a": {"$in": [0, 2]}},
+      "expectedCount": 20
+    },
+    {
+      "name": "filter+sort uses compound index",
+      "cond": {"a": 1},
+      "sort": ["b"],
+      "expectedPlanContains": ["IndexScan(a,b)"],
+      "expectedIds": [10, 1, 22, 13, 4, 25, 16, 7, 28, 19]
+    },
+    {
+      "name": "sort matches index no sort step",
+      "sort": ["a", "b"],
+      "expectedPlanNotContains": ["Sort("],
+      "expectedIds": [0, 21, 12, 3, 24, 15, 6, 27, 18, 9, 10, 1, 22, 13, 4, 25, 16, 7, 28, 19, 20, 11, 2, 23, 14, 5, 26, 17, 8, 29]
+    },
+    {
+      "name": "reverse sort no sort step",
+      "sort": ["-a", "-b"],
+      "expectedPlanNotContains": ["Sort("],
+      "expectedIds": [29, 8, 17, 26, 5, 14, 23, 2, 11, 20, 19, 28, 7, 16, 25, 4, 13, 22, 1, 10, 9, 18, 27, 6, 15, 24, 3, 12, 21, 0]
+    }
+  ]
+}

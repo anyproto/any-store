@@ -1,0 +1,142 @@
+{
+  "indexes": [
+    [
+      "a"
+    ]
+  ],
+  "data": [
+    {
+      "id": 0,
+      "a": 0
+    },
+    {
+      "id": 1,
+      "a": 1
+    },
+    {
+      "id": 2,
+      "a": 2
+    },
+    {
+      "id": 3,
+      "a": 3
+    },
+    {
+      "id": 4,
+      "a": 4
+    },
+    {
+      "id": 5,
+      "a": 5
+    },
+    {
+      "id": 6,
+      "a": 6
+    },
+    {
+      "id": 7,
+      "a": 7
+    },
+    {
+      "id": 8,
+      "a": 8
+    },
+    {
+      "id": 9,
+      "a": 9
+    },
+    {
+      "id": 10,
+      "a": 10
+    },
+    {
+      "id": 11,
+      "a": 11
+    },
+    {
+      "id": 12,
+      "a": 12
+    },
+    {
+      "id": 13,
+      "a": 13
+    },
+    {
+      "id": 14,
+      "a": 14
+    },
+    {
+      "id": 15,
+      "a": 15
+    },
+    {
+      "id": 16,
+      "a": 16
+    },
+    {
+      "id": 17,
+      "a": 17
+    },
+    {
+      "id": 18,
+      "a": 18
+    },
+    {
+      "id": 19,
+      "a": 19
+    }
+  ],
+  "tests": [
+    {
+      "name": "single point",
+      "cond": {
+        "a": 5
+      },
+      "expectedCount": 1,
+      "expectedPlanContains": [
+        "IndexScan"
+      ]
+    },
+    {
+      "name": "empty bounds",
+      "cond": {
+        "a": {
+          "$gt": 100
+        }
+      },
+      "expectedCount": 0,
+      "expectedPlanContains": [
+        "IndexScan"
+      ]
+    },
+    {
+      "name": "overlapping ranges",
+      "cond": {
+        "$or": [
+          {
+            "a": {
+              "$gte": 1,
+              "$lte": 5
+            }
+          },
+          {
+            "a": {
+              "$gte": 3,
+              "$lte": 8
+            }
+          }
+        ]
+      },
+      "expectedCount": 8
+    },
+    {
+      "name": "ne bounds",
+      "cond": {
+        "a": {
+          "$ne": 5
+        }
+      },
+      "expectedCount": 19
+    }
+  ]
+}
