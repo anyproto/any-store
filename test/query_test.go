@@ -92,7 +92,6 @@ type TestCase struct {
 	Offset uint            `json:"offset"`
 	Sort   []string        `json:"sort"`
 
-	ExpectedExplain         string            `json:"expectedExplain"`
 	ExpectedQuery           string            `json:"expectedQuery"`
 	ExpectedIds             []json.RawMessage `json:"expectedIds"`
 	ExpectedCount           *int              `json:"expectedCount"`
@@ -201,15 +200,12 @@ func testFile(t *testing.T, filename string) {
 
 			dur := time.Since(st)
 
-			needExplain := tc.ExpectedExplain != "" || tc.ExpectedQuery != "" ||
+			needExplain := tc.ExpectedQuery != "" ||
 				len(tc.ExpectedPlanContains) > 0 || len(tc.ExpectedPlanNotContains) > 0
 
 			if needExplain {
 				explain, err := q.Explain(ctx)
 				require.NoError(t, err)
-				if tc.ExpectedExplain != "" {
-					assert.Equal(t, strings.TrimSpace(tc.ExpectedExplain), strings.TrimSpace(strings.Join(explain.SqliteExplain, "\n")))
-				}
 				if tc.ExpectedQuery != "" {
 					assert.Equal(t, strings.TrimSpace(tc.ExpectedQuery), strings.TrimSpace(explain.Sql))
 				}

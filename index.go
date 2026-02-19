@@ -10,6 +10,7 @@ import (
 
 	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/btree"
+	"github.com/anyproto/any-store/internal/qplanner"
 )
 
 // IndexInfo provides information about an index.
@@ -63,6 +64,9 @@ type index struct {
 	fieldNames []string
 	fieldPaths [][]string
 	reverse    []bool
+
+	sketch         *qplanner.IndexSketch
+	sketchModified bool
 
 	keyBuf      anyenc.Tuple
 	keysBuf     []anyenc.Tuple
@@ -141,6 +145,14 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 				return err
 			}
 		}
+		if idx.sketch != nil {
+			idx.sketch.Increment(key)
+			idx.sketchModified = true
+		}
+	}
+	if idx.sketch != nil {
+		idx.sketch.DocCount++
+		idx.sketchModified = true
 	}
 	return nil
 }
@@ -165,6 +177,14 @@ func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 				}
 			}
 		}
+		if idx.sketch != nil {
+			idx.sketch.Decrement(key)
+			idx.sketchModified = true
+		}
+	}
+	if idx.sketch != nil && idx.sketch.DocCount > 0 {
+		idx.sketch.DocCount--
+		idx.sketchModified = true
 	}
 	return nil
 }

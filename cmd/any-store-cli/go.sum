@@ -1,7 +1,7 @@
-github.com/anyproto/any-store v0.4.4 h1:OcRFOYIqY/LqiAxjPyM9bVXyTxBdwo3jvu4vAnDa4cE=
-github.com/anyproto/any-store v0.4.4/go.mod h1:Npi35qMUVZ8ouiV4o9AqpZDs6LbDOF+5ZLlVijXofFM=
 github.com/anyproto/go-sqlite v1.4.2-any h1:ZTIcq/u2mYYJ6rJB4I3Ds5QH/7IlONebMiG14FyZcD4=
 github.com/anyproto/go-sqlite v1.4.2-any/go.mod h1:nW7TvS+4bzPU2vNaPlPFNPYcejK5RdjH6qZY2kjT3Io=
+github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
+github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=

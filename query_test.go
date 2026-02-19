@@ -94,7 +94,6 @@ func TestCollQuery_Explain(t *testing.T) {
 		assert.Contains(t, explain.Sql, "IndexScan")
 		require.Len(t, explain.Indexes, 1)
 		assert.Equal(t, "a", explain.Indexes[0].Name)
-		assert.Greater(t, explain.Indexes[0].Weight, 0)
 		assert.True(t, explain.Indexes[0].Used)
 	})
 	t.Run("many indexes", func(t *testing.T) {
@@ -131,7 +130,6 @@ func TestCollQuery_Explain(t *testing.T) {
 		require.NoError(t, err)
 		assert.Contains(t, explain.Sql, "IndexScan")
 		require.Len(t, explain.Indexes, 1)
-		assert.Greater(t, explain.Indexes[0].Weight, 0)
 		assert.True(t, explain.Indexes[0].Used)
 	})
 }

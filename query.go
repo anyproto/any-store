@@ -51,15 +51,18 @@ type Query interface {
 }
 
 type Explain struct {
-	Sql           string
-	SqliteExplain []string
-	Indexes       []IndexExplain
+	Sql string
+
+	// Rich explain output: multi-line plan with cost breakdown and candidates
+	Plan string
+
+	Indexes []IndexExplain
 }
 
 type IndexExplain struct {
-	Name   string
-	Weight int
-	Used   bool
+	Name string
+	Cost float64 // CBO computed cost
+	Used bool
 }
 
 type IndexHint struct {
@@ -75,9 +78,7 @@ type collQuery struct {
 
 	limit, offset uint
 
-	weightedIndexes []qplanner.WeightedIndex
-	sortFields      []query.SortField
-	indexHints      []IndexHint
+	indexHints []IndexHint
 
 	err error
 }
@@ -129,15 +130,17 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	btx := tx.btreeReadTx()
 
 	plan := qplanner.BuildPlan(&qplanner.PlanParams{
-		Tx:       btx,
-		DataNs:   q.c.ns,
-		Filter:   q.cond,
-		Sorter:   q.sort,
-		IDBounds: qb.idBounds,
-		Limit:    int(q.limit),
-		Offset:   int(q.offset),
-		Buf:      buf,
-		Indexes:  q.buildPlanIndexes(),
+		Tx:         btx,
+		DataNs:     q.c.ns,
+		Filter:     q.cond,
+		Sorter:     q.sort,
+		IDBounds:   qb.idBounds,
+		Limit:      int(q.limit),
+		Offset:     int(q.offset),
+		Buf:        buf,
+		TotalDocs:  q.docCount(btx),
+		Indexes:    q.buildCBOIndexes(),
+		IndexHints: q.buildIndexHints(),
 	})
 
 	return &planIterator{
@@ -320,15 +323,17 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 		defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
 		plan := qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:       tx,
-			DataNs:   q.c.ns,
-			Filter:   q.cond,
-			Sorter:   nil, // no sort needed for count
-			IDBounds: qb.idBounds,
-			Limit:    int(q.limit),
-			Offset:   int(q.offset),
-			Buf:      buf,
-			Indexes:  q.buildPlanIndexes(),
+			Tx:         tx,
+			DataNs:     q.c.ns,
+			Filter:     q.cond,
+			Sorter:     nil, // no sort needed for count
+			IDBounds:   qb.idBounds,
+			Limit:      int(q.limit),
+			Offset:     int(q.offset),
+			Buf:        buf,
+			TotalDocs:  q.docCount(tx),
+			Indexes:    q.buildCBOIndexes(),
+			IndexHints: q.buildIndexHints(),
 		})
 
 		for {
@@ -356,33 +361,41 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
+	cboIndexes := q.buildCBOIndexes()
+
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		plan := qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:       tx,
-			DataNs:   q.c.ns,
-			Filter:   q.cond,
-			Sorter:   q.sort,
-			IDBounds: qb.idBounds,
-			Limit:    int(q.limit),
-			Offset:   int(q.offset),
-			Buf:      buf,
-			Indexes:  q.buildPlanIndexes(),
+			Tx:         tx,
+			DataNs:     q.c.ns,
+			Filter:     q.cond,
+			Sorter:     q.sort,
+			IDBounds:   qb.idBounds,
+			Limit:      int(q.limit),
+			Offset:     int(q.offset),
+			Buf:        buf,
+			TotalDocs:  q.docCount(tx),
+			Indexes:    cboIndexes,
+			IndexHints: q.buildIndexHints(),
 		})
 		explain.Sql = plan.String()
-		explain.SqliteExplain = []string{plan.String()}
+		explain.Plan = plan.ExplainString()
+
+		// Report indexes with used index first
+		for _, idx := range cboIndexes {
+			used := idx.Info.Name == plan.IndexName
+			ie := IndexExplain{
+				Name: idx.Info.Name,
+				Cost: plan.Cost,
+				Used: used,
+			}
+			if used {
+				explain.Indexes = append([]IndexExplain{ie}, explain.Indexes...)
+			} else {
+				explain.Indexes = append(explain.Indexes, ie)
+			}
+		}
 		return nil
 	})
-	if err != nil {
-		return
-	}
-
-	for _, idx := range q.weightedIndexes {
-		explain.Indexes = append(explain.Indexes, IndexExplain{
-			Name:   idx.Info.Name,
-			Weight: idx.Weight,
-			Used:   idx.Used,
-		})
-	}
 	return
 }
 
@@ -400,19 +413,39 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 		q.cond = query.All{}
 	}
 
-	if q.sort != nil {
-		q.sortFields = q.sort.Fields()
-	}
-
 	// handle "id" field
 	if idBounds := q.cond.IndexBounds("id", nil); len(idBounds) != 0 {
 		qb.idBounds = idBounds
 	}
 
-	// Build IndexInfo list for the planner
-	indexInfos := make([]*qplanner.IndexInfo, len(q.c.indexes))
-	for i, idx := range q.c.indexes {
-		indexInfos[i] = &qplanner.IndexInfo{
+	return
+}
+
+// docCount returns the total number of documents from the first index's sketch DocCount.
+// Falls back to tx.Count() if no indexes have sketches.
+func (q *collQuery) docCount(tx interface {
+	Count(ns *btree.Namespace) (int, error)
+}) int {
+	for _, idx := range q.c.indexes {
+		if idx.sketch != nil {
+			return int(idx.sketch.DocCount)
+		}
+	}
+	count, _ := tx.Count(q.c.ns)
+	return count
+}
+
+// buildCBOIndexes builds CBOIndex entries from the collection's indexes for the CBO planner.
+func (q *collQuery) buildCBOIndexes() []qplanner.CBOIndex {
+	result := make([]qplanner.CBOIndex, 0, len(q.c.indexes))
+
+	var sortFields []query.SortField
+	if q.sort != nil {
+		sortFields = q.sort.Fields()
+	}
+
+	for _, idx := range q.c.indexes {
+		info := &qplanner.IndexInfo{
 			Name:       idx.info.Name,
 			FieldNames: idx.fieldNames,
 			FieldPaths: idx.fieldPaths,
@@ -421,46 +454,46 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 			Sparse:     idx.info.Sparse,
 			Ns:         idx.ns,
 		}
-	}
 
-	// Convert hints
+		// Compute bounds for this index
+		bounds, chainLen := qplanner.ComputeIndexBounds(info, q.cond)
+		pointLookup := qplanner.AllBoundsFixed(bounds)
+		if !idx.info.Unique && len(bounds) > 0 {
+			bounds = qplanner.AdjustBoundsForNonUnique(bounds)
+		}
+
+		// Compute equality prefix: number of leading index fields pinned by equality
+		equalityPrefix := 0
+		if pointLookup && chainLen > 0 {
+			equalityPrefix = chainLen
+		}
+
+		// Check sort coverage (accounting for equality-pinned prefix)
+		exactSort, partialSort := qplanner.IndexSortMatch(info, sortFields, equalityPrefix)
+
+		cboIdx := qplanner.CBOIndex{
+			Info:        info,
+			Sketch:      idx.sketch,
+			Bounds:      bounds,
+			Reverse:     idx.reverse,
+			PointLookup: pointLookup,
+			BoundFields: chainLen,
+			ExactSort:   exactSort,
+			PartialSort: partialSort,
+		}
+		result = append(result, cboIdx)
+	}
+	return result
+}
+
+// buildIndexHints converts public IndexHint to internal IndexHintParam.
+func (q *collQuery) buildIndexHints() []qplanner.IndexHintParam {
+	if len(q.indexHints) == 0 {
+		return nil
+	}
 	hints := make([]qplanner.IndexHintParam, len(q.indexHints))
 	for i, h := range q.indexHints {
 		hints[i] = qplanner.IndexHintParam{IndexName: h.IndexName, Boost: h.Boost}
 	}
-
-	// Compute weights using the qplanner package
-	q.weightedIndexes, _ = qplanner.ComputeWeights(indexInfos, &qplanner.WeightParams{
-		Cond:       q.cond,
-		SortFields: q.sortFields,
-		IndexHints: hints,
-		MaxIndexes: 2,
-	})
-
-	return
-}
-
-// buildPlanIndexes converts weighted indexes to PlanIndex entries for the planner.
-func (q *collQuery) buildPlanIndexes() []qplanner.PlanIndex {
-	result := make([]qplanner.PlanIndex, 0, len(q.weightedIndexes))
-	for _, wi := range q.weightedIndexes {
-		bounds := wi.Bounds
-		// For non-unique indexes, keys have docId appended after index fields.
-		// Adjust End bounds to include all docId suffixes by appending 0xff.
-		if !wi.Info.Unique && len(bounds) > 0 {
-			bounds = qplanner.AdjustBoundsForNonUnique(bounds)
-		}
-		pi := qplanner.PlanIndex{
-			Info:               wi.Info,
-			Bounds:             bounds,
-			Weight:             wi.Weight,
-			ExactSort:          wi.ExactSort,
-			PartialSort:        wi.PartialSort,
-			PartialSortFields:  wi.PartialSortFields,
-			Used:               wi.Used,
-			FilterFullyCovered: wi.FilterFullyCovered,
-		}
-		result = append(result, pi)
-	}
-	return result
+	return hints
 }

@@ -277,21 +277,10 @@ func TestIndex_Compound_FullMatchVsSingleFieldSelection(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, explain.Sql, "IndexScan")
 
-	// The compound index should have higher weight or be the used one
+	// The compound index should be the used one
 	require.True(t, len(explain.Indexes) >= 2, "should have at least 2 indexes reported")
-	var compoundIdx, singleIdx *IndexExplain
-	for i := range explain.Indexes {
-		if explain.Indexes[i].Name == "a,b" {
-			compoundIdx = &explain.Indexes[i]
-		} else if explain.Indexes[i].Name == "a" {
-			singleIdx = &explain.Indexes[i]
-		}
-	}
-	if compoundIdx != nil && singleIdx != nil {
-		assert.True(t, compoundIdx.Weight >= singleIdx.Weight,
-			"compound index weight (%d) should be >= single index weight (%d)",
-			compoundIdx.Weight, singleIdx.Weight)
-	}
+	assert.Equal(t, "a,b", explain.Indexes[0].Name, "compound index should be used")
+	assert.True(t, explain.Indexes[0].Used)
 
 	// Verify correctness regardless of index choice
 	count, err := coll.Find(`{"a":5,"b":3}`).Count(ctx)

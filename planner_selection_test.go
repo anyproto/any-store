@@ -48,17 +48,10 @@ func TestIndex_PlannerSelection_UniquePreferred(t *testing.T) {
 	// Unique + point lookup → CoverLookup
 	assert.Contains(t, explain.Sql, "CoverLookup(a_uni)")
 
-	// Verify the unique index has higher weight than non-unique
-	var uniWeight, nonUniWeight int
-	for _, idx := range explain.Indexes {
-		if idx.Name == "a_uni" {
-			uniWeight = idx.Weight
-		}
-		if idx.Name == "a_nouni" {
-			nonUniWeight = idx.Weight
-		}
-	}
-	assert.Greater(t, uniWeight, nonUniWeight, "unique index should have higher weight")
+	// Verify the unique index is the one used
+	require.True(t, len(explain.Indexes) >= 2)
+	assert.Equal(t, "a_uni", explain.Indexes[0].Name, "unique index should be used")
+	assert.True(t, explain.Indexes[0].Used)
 
 	// Verify correctness
 	count, err := coll.Find(`{"a":42}`).Count(ctx)
@@ -112,8 +105,7 @@ func TestIndex_PlannerSelection_FilterAndSort_DifferentFields(t *testing.T) {
 		require.NoError(t, coll.Insert(ctx, doc))
 	}
 
-	// Filter on a=5, sort by b. Weight: a gets query weight 10, b gets sort weight 11.
-	// b has higher weight so it might be primary. Either way, results must be correct.
+	// Filter on a=5, sort by b. Either way, results must be correct.
 	explain, err := coll.Find(`{"a":5}`).Sort("b").Explain(ctx)
 	require.NoError(t, err)
 	t.Log("Plan:", explain.Sql)
@@ -215,14 +207,14 @@ func TestIndex_PlannerSelection_CompoundSortMatching(t *testing.T) {
 		assert.Len(t, docs, 50)
 	})
 
-	t.Run("wrong field order - still uses index", func(t *testing.T) {
-		// Sort("y","x") with index (x,y): field chain breaks at position 0
-		// but both fields exist in the index (non-chain +5 each = weight 10).
-		// Planner's ExactSort bitmap check counts bits regardless of order.
+	t.Run("wrong field order - uses full scan with sort", func(t *testing.T) {
+		// Sort("y","x") with index (x,y): field order mismatch means the
+		// index can't provide the required sort order. CBO correctly falls
+		// back to FullScan + in-memory Sort.
 		explain, err := coll.Find(nil).Sort("y", "x").Explain(ctx)
 		require.NoError(t, err)
 		t.Log("Plan:", explain.Sql)
-		assert.Contains(t, explain.Sql, "IndexScan(x,y)")
+		assert.Contains(t, explain.Sql, "Sort")
 		// Verify results are returned (correctness)
 		docs := collectDocs(t, coll.Find(nil).Sort("y", "x"))
 		assert.Len(t, docs, 50)
@@ -422,8 +414,8 @@ func TestIndex_PlannerSelection_EqualityVsRange(t *testing.T) {
 	})
 }
 
-func TestIndex_PlannerSelection_WeightExplain(t *testing.T) {
-	// Verify Explain.Indexes contains correct weight/used info
+func TestIndex_PlannerSelection_ExplainIndexes(t *testing.T) {
+	// Verify Explain.Indexes contains correct used info
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
 	require.NoError(t, err)
@@ -440,21 +432,16 @@ func TestIndex_PlannerSelection_WeightExplain(t *testing.T) {
 	explain, err := coll.Find(`{"a":5,"b":3}`).Explain(ctx)
 	require.NoError(t, err)
 
-	// Indexes should be sorted by weight descending
+	// Used index should be first
 	require.True(t, len(explain.Indexes) >= 3, "expected at least 3 indexes in explain")
-	for i := 1; i < len(explain.Indexes); i++ {
-		assert.True(t, explain.Indexes[i-1].Weight >= explain.Indexes[i].Weight,
-			"indexes should be sorted by weight descending, got %d >= %d at position %d",
-			explain.Indexes[i-1].Weight, explain.Indexes[i].Weight, i)
-	}
 
-	// The compound index (a,b) should have the highest weight for {a:5, b:3}
+	// The compound index (a,b) should be chosen for {a:5, b:3}
 	assert.Equal(t, "a,b", explain.Indexes[0].Name)
 	assert.True(t, explain.Indexes[0].Used)
 
-	// Log all weights for debugging
+	// Log all indexes for debugging
 	for _, idx := range explain.Indexes {
-		t.Logf("Index %s: weight=%d, used=%v", idx.Name, idx.Weight, idx.Used)
+		t.Logf("Index %s: cost=%.1f, used=%v", idx.Name, idx.Cost, idx.Used)
 	}
 }
 
@@ -496,5 +483,56 @@ func TestIndex_PlannerSelection_ExplainPlanString(t *testing.T) {
 		assert.True(t,
 			strings.Contains(explain.Sql, "Limit(3)") || strings.Contains(explain.Sql, "Limit(offset="),
 			"plan should contain Limit")
+	})
+}
+
+func TestIndex_PlannerSelection_RichExplainPlan(t *testing.T) {
+	// Verify the rich explain output contains plan details, cost breakdown, and candidates
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"b"}}))
+
+	for i := range 100 {
+		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%10, i%7))
+		require.NoError(t, coll.Insert(ctx, doc))
+	}
+
+	t.Run("rich explain is non-empty with expected sections", func(t *testing.T) {
+		explain, err := coll.Find(`{"a":5}`).Sort("b").Limit(5).Explain(ctx)
+		require.NoError(t, err)
+
+		assert.NotEmpty(t, explain.Plan, "explain.Plan should not be empty")
+		t.Log("Rich explain:\n", explain.Plan)
+
+		// Header
+		assert.Contains(t, explain.Plan, "Plan:")
+		assert.Contains(t, explain.Plan, "Cost:")
+
+		// Selectivity info
+		assert.Contains(t, explain.Plan, "Selectivity:")
+
+		// Iterator chain
+		assert.Contains(t, explain.Plan, "Iterator:")
+
+		// Candidates section
+		assert.Contains(t, explain.Plan, "Candidates:")
+		assert.Contains(t, explain.Plan, "FullScan")
+		assert.Contains(t, explain.Plan, "[chosen]")
+		assert.Contains(t, explain.Plan, "est_rows=")
+	})
+
+	t.Run("full scan explain has candidates", func(t *testing.T) {
+		explain, err := coll.Find(`{"a":5}`).Explain(ctx)
+		require.NoError(t, err)
+
+		assert.NotEmpty(t, explain.Plan)
+		assert.Contains(t, explain.Plan, "Candidates:")
+		// Should have at least FullScan + IndexSeek(a) candidates
+		assert.Contains(t, explain.Plan, "FullScan")
+		assert.Contains(t, explain.Plan, "IndexSeek(a)")
+		t.Log("Rich explain:\n", explain.Plan)
 	})
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/anyenc/anyencutil"
 	"github.com/anyproto/any-store/internal/btree"
+	"github.com/anyproto/any-store/internal/qplanner"
 	"github.com/anyproto/any-store/query"
 	"github.com/anyproto/any-store/syncpool"
 )
@@ -142,6 +143,7 @@ func (c *collection) init(ctx context.Context) error {
 			if idxErr != nil {
 				return idxErr
 			}
+			c.loadSketch(tx, idx)
 			c.indexes = append(c.indexes, idx)
 		}
 		return nil
@@ -203,7 +205,7 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 				return txErr
 			}
 		}
-		return
+		return c.persistSketches(tx)
 	})
 	return
 }
@@ -365,6 +367,10 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 		return
 	}
 
+	if err = c.persistSketches(tx); err != nil {
+		return false, err
+	}
+
 	return true, nil
 }
 
@@ -398,7 +404,10 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err erro
 		if errors.Is(insErr, ErrDocExists) {
 			return c.update(tx, it, item{})
 		}
-		return true, insErr
+		if insErr != nil {
+			return false, insErr
+		}
+		return true, c.persistSketches(tx)
 	})
 	return err
 }
@@ -429,6 +438,9 @@ func (c *collection) deleteItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, id [
 			if err = idx.deleteKeys(tx, it); err != nil {
 				return err
 			}
+		}
+		if err = c.persistSketches(tx); err != nil {
+			return err
 		}
 	}
 	return tx.Delete(c.ns, id)
@@ -506,10 +518,20 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 		return nil, err
 	}
 
-	// Build index from existing documents
+	// Initialize sketch for the new index
+	idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
+
+	// Build index from existing documents (also populates sketch via insertKeys)
 	if err = c.buildIndex(tx, idx); err != nil {
 		return nil, err
 	}
+
+	// Persist the sketch
+	skKey := sketchKey(c.name, info.Name)
+	if err = tx.Put(c.db.systemNS, skKey, idx.sketch.MarshalBinary()); err != nil {
+		return nil, err
+	}
+	idx.sketchModified = false
 
 	return idx, nil
 }
@@ -540,6 +562,9 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 				return
 			}
 		}
+		// Delete sketch data
+		skKey := sketchKey(c.name, indexName)
+		_ = tx.Delete(c.db.systemNS, skKey) // ignore if not found
 		c.indexes = slices.DeleteFunc(c.indexes, func(i *index) bool {
 			return i.Info().Name == indexName
 		})
@@ -653,6 +678,35 @@ func (c *collection) buildIndex(tx *btree.WriteTx, idx *index) error {
 		}
 		if err = cursor.Next(); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// loadSketch loads a sketch from the _system namespace for the given index.
+// If no sketch data exists, it creates a new empty sketch.
+func (c *collection) loadSketch(tx *btree.ReadTx, idx *index) {
+	skSize := qplanner.DefaultSketchSize
+	idx.sketch = qplanner.NewIndexSketch(skSize)
+	key := sketchKey(c.name, idx.info.Name)
+	data, err := tx.Get(c.db.systemNS, key)
+	if err != nil {
+		// No sketch data yet — start with empty sketch
+		return
+	}
+	idx.sketch.UnmarshalBinary(data)
+}
+
+// persistSketches writes all modified sketches to the _system namespace.
+func (c *collection) persistSketches(tx *btree.WriteTx) error {
+	for _, idx := range c.indexes {
+		if idx.sketchModified {
+			key := sketchKey(c.name, idx.info.Name)
+			data := idx.sketch.MarshalBinary()
+			if err := tx.Put(c.db.systemNS, key, data); err != nil {
+				return err
+			}
+			idx.sketchModified = false
 		}
 	}
 	return nil

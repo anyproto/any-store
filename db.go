@@ -17,7 +17,6 @@ import (
 	"github.com/anyproto/any-store/internal/durability"
 	"github.com/anyproto/any-store/internal/durability/sentinel"
 	"github.com/anyproto/any-store/internal/objectid"
-	"github.com/anyproto/any-store/internal/registry"
 	"github.com/anyproto/any-store/syncpool"
 )
 
@@ -103,13 +102,10 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 
 	sPool := syncpool.NewSyncPool(config.SyncPoolElementMaxSize)
 
-	registryBufSize := 4
 	ds := &db{
 		instanceId:        objectid.NewObjectID().Hex(),
 		config:            config,
 		syncPool:          sPool,
-		filterReg:         registry.NewFilterRegistry(sPool, registryBufSize),
-		sortReg:           registry.NewSortRegistry(sPool, registryBufSize),
 		openedCollections: make(map[string]Collection),
 	}
 
@@ -172,8 +168,6 @@ type db struct {
 	btreeDB            *btree.DB
 	systemNS           *btree.Namespace
 	recoveryController *durability.Controller
-	filterReg          *registry.FilterRegistry
-	sortReg            *registry.SortRegistry
 
 	syncPool *syncpool.SyncPool
 
@@ -191,14 +185,19 @@ func collKey(name string) []byte {
 }
 
 type indexMeta struct {
-	Name   string   `json:"name"`
-	Fields []string `json:"fields"`
-	Sparse bool     `json:"sparse"`
-	Unique bool     `json:"unique"`
+	Name       string   `json:"name"`
+	Fields     []string `json:"fields"`
+	Sparse     bool     `json:"sparse"`
+	Unique     bool     `json:"unique"`
+	SketchSize int      `json:"sketchSize,omitempty"`
 }
 
 func indexKey(collName, indexName string) []byte {
 	return []byte("idx:" + collName + ":" + indexName)
+}
+
+func sketchKey(collName, indexName string) []byte {
+	return []byte("stat_data:" + collName + ":" + indexName)
 }
 
 func indexKeyPrefix(collName string) string {
@@ -230,6 +229,8 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 		return nil, err
 	}
 
+	db.checkStale(&btWtx.ReadTx)
+
 	version := newTxVersion()
 	tx := txPool.Get().(*commonTx)
 	tx.db = db
@@ -248,6 +249,8 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 		return nil, err
 	}
 
+	db.checkStale(btRtx)
+
 	version := newTxVersion()
 	tx := txPool.Get().(*commonTx)
 	tx.db = db
@@ -257,6 +260,29 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 	rTx := readTx{commonTx: tx, version: version}
 	tx.ctx = context.WithValue(ctx, ctxKeyTx, rTx)
 	return rTx, nil
+}
+
+// checkStale checks if the on-disk data or schema has changed (by another process)
+// and reloads in-memory caches (sketches, index metadata) if necessary.
+func (db *db) checkStale(tx *btree.ReadTx) {
+	if tx.IsSchemaStale() || tx.IsDataStale() {
+		db.reloadSketches(tx)
+		db.btreeDB.UpdateLocalCounters(tx.DiskFileChangeCounter(), tx.DiskSchemaCookie())
+	}
+}
+
+// reloadSketches reloads all sketch data from the _system namespace for opened collections.
+func (db *db) reloadSketches(tx *btree.ReadTx) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	for _, coll := range db.openedCollections {
+		c := coll.(*collection)
+		c.mu.Lock()
+		for _, idx := range c.indexes {
+			c.loadSketch(tx, idx)
+		}
+		c.mu.Unlock()
+	}
 }
 
 func (db *db) CreateCollection(ctx context.Context, collectionName string) (Collection, error) {
