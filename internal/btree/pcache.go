@@ -50,6 +50,26 @@ func (pc *pcache) fetch(pgno uint32) *page {
 	return p
 }
 
+// fetchPinned retrieves a page from the cache and returns both the page and
+// whether it was dirty at fetch time. The dirty flag is captured under the
+// pcache lock, avoiding a data race with concurrent makeDirty calls.
+// Returns (nil, false) if the page is not cached.
+func (pc *pcache) fetchPinned(pgno uint32) (*page, bool) {
+	pc.mu.Lock()
+	p := pc.pages[pgno]
+	if p == nil {
+		pc.mu.Unlock()
+		return nil, false
+	}
+	p.pinCount++
+	wasDirty := p.dirty
+	if !wasDirty {
+		pc.lruRemove(p)
+	}
+	pc.mu.Unlock()
+	return p, wasDirty
+}
+
 // create allocates a new page in the cache and returns it pinned.
 // If the cache is full, it evicts clean pages first.
 func (pc *pcache) create(pgno uint32) *page {

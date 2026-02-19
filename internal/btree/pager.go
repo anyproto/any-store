@@ -15,6 +15,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // pagerState represents the pager's state machine.
@@ -51,7 +52,8 @@ type pager struct {
 	walMaxFrame atomic.Uint32
 
 	// Write-transaction page map: bypasses pcache lock for hot pages during writes.
-	// Only accessed by the single writer goroutine, so no lock needed.
+	// Only accessed by the single writer goroutine — readers must NOT read this
+	// map (use getPageAt or readPageMVCC instead to avoid data races).
 	writePages map[uint32]*page
 
 	// Reusable slice for collecting dirty pages during commit
@@ -145,6 +147,7 @@ func (p *pager) open() error {
 	p.wal = newWal(p.path+"-wal", p.pageSize)
 	p.wal.inProcess = p.inProcess
 	p.wal.noSync = p.noSync
+	p.wal.busyHandler = DefaultBusyTimeout(5 * time.Second)
 	if err := p.wal.open(); err != nil {
 		return err
 	}
@@ -209,6 +212,7 @@ func (p *pager) initNewDB() error {
 	p.wal = newWal(p.path+"-wal", p.pageSize)
 	p.wal.inProcess = p.inProcess
 	p.wal.noSync = p.noSync
+	p.wal.busyHandler = DefaultBusyTimeout(5 * time.Second)
 	if err := p.wal.open(); err != nil {
 		return err
 	}
@@ -278,14 +282,16 @@ func (p *pager) getPageAt(pgno, walMaxFrame uint32) (*page, error) {
 		return nil, ErrInvalidPage
 	}
 
-	// Check cache first.
-	if pg := p.cache.fetch(pgno); pg != nil {
+	// Check cache first. Use fetchPinned to capture the dirty flag under
+	// the pcache lock, avoiding a data race with concurrent makeDirty calls
+	// from the writer goroutine.
+	if pg, wasDirty := p.cache.fetchPinned(pgno); pg != nil {
 		// For clean pages, verify the cached version is within our snapshot.
 		// Dirty pages are returned as-is: the caller is responsible for
 		// MVCC dirty-page handling at a higher level (btree.getPage for
 		// readers checks writePages; ReadTx.txGetPage also bypasses dirty
 		// pages for non-writable transactions).
-		if !pg.dirty {
+		if !wasDirty {
 			latestFrame := p.wal.index.getLatest(pgno)
 			if latestFrame == 0 || latestFrame <= walMaxFrame {
 				return pg, nil
@@ -358,15 +364,18 @@ func (p *pager) readPageUncached(pgno, walMaxFrame uint32) (*page, error) {
 	if walMaxFrame > 0 {
 		frame := p.wal.index.get(pgno, walMaxFrame)
 		if frame > 0 {
-			if err := p.wal.readFrame(frame, pg.data); err != nil {
-				return nil, err
+			if err := p.wal.readFrame(frame, pg.data); err == nil {
+				off := 0
+				if pgno == 1 {
+					off = dbHeaderSize
+				}
+				pg.header.deserialize(pg.data[off:])
+				return pg, nil
 			}
-			off := 0
-			if pgno == 1 {
-				off = dbHeaderSize
-			}
-			pg.header.deserialize(pg.data[off:])
-			return pg, nil
+			// readFrame can fail if the WAL was reset (checkpointed and
+			// truncated) between the index.get lookup and now. In this case,
+			// the page data has been written to the database file by the
+			// checkpoint, so we fall through to reading from disk.
 		}
 	}
 
@@ -392,34 +401,14 @@ func (p *pager) readPageUncached(pgno, walMaxFrame uint32) (*page, error) {
 }
 
 // readPageMVCC returns a page with snapshot isolation for committed data.
-// If the WAL has a newer committed frame for this page (latestFrame > walMaxFrame),
-// the reader gets an uncached copy from the WAL at its snapshot point. Otherwise
-// the cached page is returned as-is -- including dirty pages from an uncommitted
-// writer. This matches SQLite's single-connection semantics where reads within
-// the same connection can see uncommitted changes (there is no cross-connection
-// isolation since our DB object represents a single connection).
+// Always returns an uncached copy to avoid data races with the writer goroutine,
+// which may dirty and modify cached pages at any time. The uncached page reads
+// from the WAL (at the reader's snapshot point) or from disk.
 func (p *pager) readPageMVCC(pgno, walMaxFrame uint32) (*page, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
 	}
-
-	if pg := p.cache.fetch(pgno); pg != nil {
-		if pg.dirty {
-			// Dirty page from an active write tx on this connection.
-			// Return it as-is: single-connection reads see uncommitted writes
-			// (like SQLite's implicit read within the same connection).
-			return pg, nil
-		}
-		latestFrame := p.wal.index.getLatest(pgno)
-		if latestFrame == 0 || latestFrame <= walMaxFrame {
-			return pg, nil
-		}
-		p.cache.release(pg)
-		return p.readPageUncached(pgno, walMaxFrame)
-	}
-
-	// Cache miss: fall through to getPageAt which handles WAL/disk reads.
-	return p.getPageAt(pgno, walMaxFrame)
+	return p.readPageUncached(pgno, walMaxFrame)
 }
 
 // getPageNoContent returns a page without reading from disk/WAL (fix 5.4).

@@ -2,6 +2,7 @@ package btree
 
 import (
 	"fmt"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -256,7 +257,20 @@ func TestConcurrentReadersAndCheckpoint(t *testing.T) {
 }
 
 func TestCheckpointWithWriterAndReaders(t *testing.T) {
-	db, ns := tempDBWithNS(t, "data")
+	// Use InProcess mode for proper goroutine-level lock isolation.
+	// POSIX fcntl locks are per-process and don't provide isolation
+	// between goroutines on the same file descriptor.
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.InProcess = true
+	db, err := Open(filepath.Join(dir, "test.db"), opts)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("data")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Commit())
 
 	// Insert initial data
 	tx, err := db.BeginWrite()
@@ -279,18 +293,27 @@ func TestCheckpointWithWriterAndReaders(t *testing.T) {
 		for round := range 5 {
 			wtx, err := db.BeginWrite()
 			if err != nil {
+				t.Logf("Writer BeginWrite error: %v", err)
 				errors.Add(1)
 				return
 			}
-			nsW, _ := db.getNamespaceLocked("data")
+			nsW, wnsErr := wtx.GetNamespace("data")
+			if wnsErr != nil {
+				t.Logf("Writer GetNamespace error: %v", wnsErr)
+				errors.Add(1)
+				_ = wtx.Rollback()
+				return
+			}
 			k := fmt.Appendf(nil, "round-%d", round)
 			v := fmt.Appendf(nil, "value-%d", round)
 			if err := wtx.Put(nsW, k, v); err != nil {
+				t.Logf("Writer Put error: %v", err)
 				errors.Add(1)
 				_ = wtx.Rollback()
 				return
 			}
 			if err := wtx.Commit(); err != nil {
+				t.Logf("Writer Commit error: %v", err)
 				errors.Add(1)
 				return
 			}
@@ -308,10 +331,17 @@ func TestCheckpointWithWriterAndReaders(t *testing.T) {
 					errors.Add(1)
 					return
 				}
-				nsR, _ := db.getNamespaceLocked("data")
+				nsR, nsErr := rtx.GetNamespace("data")
+				if nsErr != nil {
+					t.Logf("GetNamespace error: %v (walMaxFrame=%d)", nsErr, rtx.walMaxFrame)
+					errors.Add(1)
+					_ = rtx.Rollback()
+					continue
+				}
 				// Original keys should always be readable
 				_, err = rtx.Get(nsR, []byte("key-0000"))
 				if err != nil {
+					t.Logf("Get error: %v (walMaxFrame=%d, ns.root=%d)", err, rtx.walMaxFrame, nsR.rootPage)
 					errors.Add(1)
 				}
 				_ = rtx.Rollback()

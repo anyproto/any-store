@@ -1264,7 +1264,10 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 
 // writeFramesMem is the fast in-memory path for writeFrames.
 // No file I/O, no checksums -- just copy page data into a pre-allocated arena.
+// Acquires w.mu to synchronize with readFrame which reads w.nFrame and w.memFrames.
 func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
+	w.mu.Lock()
+
 	startFrame := w.nFrame + 1
 	pageSz := int(w.pageSize)
 
@@ -1299,7 +1302,9 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 		w.nFrame++
 	}
 
-	// Batch update walIndex
+	w.mu.Unlock()
+
+	// Batch update walIndex (has its own lock)
 	w.index.setBatch(pages, startFrame)
 
 	if commit && dbSize > 0 {
@@ -1312,8 +1317,14 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 }
 
 // readFrame reads the page data for a given frame number.
+// Acquires w.mu to synchronize with writeFrames/writeFramesMem which modify
+// w.nFrame and w.memFrames. The lock is released before file I/O to avoid
+// blocking the writer during disk reads.
 func (w *wal) readFrame(frame uint32, buf []byte) error {
-	if frame == 0 || frame > w.nFrame {
+	w.mu.Lock()
+	nf := w.nFrame
+	if frame == 0 || frame > nf {
+		w.mu.Unlock()
 		return ErrWALCorrupt
 	}
 	// Fast path: read from in-memory frames
@@ -1321,10 +1332,14 @@ func (w *wal) readFrame(frame uint32, buf []byte) error {
 		idx := frame - 1
 		if idx < uint32(len(w.memFrames)) {
 			copy(buf[:w.pageSize], w.memFrames[idx].data)
+			w.mu.Unlock()
 			return nil
 		}
+		w.mu.Unlock()
 		return ErrWALCorrupt
 	}
+	w.mu.Unlock()
+	// File I/O is done without the lock held.
 	frameSize := int64(walFrameSize) + int64(w.pageSize)
 	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
 	_, err := w.file.ReadAt(buf[:w.pageSize], offset)
@@ -1562,8 +1577,8 @@ func (w *wal) checkpointWithMode(dbFile *os.File, mode CheckpointMode, xBusy Bus
 	// partially written to the database.
 	w.index.mu.Lock()
 	w.index.nBackfillAttempted = mxSafeFrame
-	w.index.mu.Unlock()
 	w.index.shmWriteCkptInfo()
+	w.index.mu.Unlock()
 
 	// Sync the WAL file before copying frames to the database, matching
 	// SQLite's walCheckpoint(). This ensures all WAL data is durable on disk
@@ -1629,8 +1644,8 @@ func (w *wal) checkpointWithMode(dbFile *os.File, mode CheckpointMode, xBusy Bus
 	// Update nBackfill
 	w.index.mu.Lock()
 	w.index.nBackfill = mxSafeFrame
-	w.index.mu.Unlock()
 	w.index.shmWriteCkptInfo()
+	w.index.mu.Unlock()
 
 	// Release the reader lock held while backfilling
 	_ = w.index.unlock(lockRead0, lockExclusive)

@@ -365,18 +365,19 @@ func TestSqlite_WAL_3(t *testing.T) {
 
 	// --- wal-3.2 (lines 140-142) ---
 	// Original: Concurrent reader (db2) still sees all 7 rows.
-	// DEVIATION: Original SQLite test uses a separate connection (db2) which has
-	// cross-connection MVCC isolation. Our single-DB API acts as a single connection,
-	// so readers see the writer's uncommitted dirty pages (0 rows after deletes).
+	// Our ReadTx uses readPageMVCC which provides snapshot isolation: the reader
+	// sees only committed data and is isolated from the writer's dirty pages.
+	// This matches the original SQLite test's intent (db2 sees 7 rows) rather
+	// than the previous single-connection deviation where readers saw dirty pages.
 	var rtx2 *ReadTx
 	t.Run("wal-3.2", func(t *testing.T) {
 		rtx2, err = db.BeginRead()
 		require.NoError(t, err)
-		ns, err := db.getNamespaceLocked("t1")
+		ns, err := rtx2.GetNamespace("t1")
 		require.NoError(t, err)
 		cur := rtx2.NewCursor(ns)
 		count := countCursor(t, cur)
-		assert.Equal(t, 0, count, "single-connection reader sees writer's uncommitted deletes")
+		assert.Equal(t, 7, count, "reader sees committed data, isolated from uncommitted deletes")
 	})
 
 	// --- wal-3.3 (lines 143-146) ---

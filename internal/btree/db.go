@@ -373,16 +373,18 @@ func (db *DB) freeTreePages(pgno uint32) error {
 
 // GetNamespace returns a Namespace handle for the given name.
 func (db *DB) GetNamespace(name string) (*Namespace, error) {
-	_, slot, err := db.pager.beginRead()
+	maxFrame, slot, err := db.pager.beginRead()
 	if err != nil {
 		return nil, err
 	}
 	defer db.pager.endRead(slot)
 
-	return db.getNamespaceLocked(name)
+	return db.getNamespaceAt(name, maxFrame)
 }
 
 // getNamespaceLocked returns a Namespace handle (caller must hold read lock).
+// Uses pager.getPage which reads from writePages — safe only when called from
+// the writer goroutine (e.g. WriteTx.CreateNamespace after modifying page 1).
 func (db *DB) getNamespaceLocked(name string) (*Namespace, error) {
 	nameKey := []byte(name)
 	pg, err := db.pager.getPage(1)
@@ -391,6 +393,27 @@ func (db *DB) getNamespaceLocked(name string) (*Namespace, error) {
 	}
 	defer db.pager.releasePage(pg)
 
+	return db.resolveNamespace(name, nameKey, pg)
+}
+
+// getNamespaceAt returns a Namespace handle using readPageMVCC for snapshot
+// isolation. Safe to call from any goroutine (readers or writer) because
+// it does not access pager.writePages, and readPageMVCC returns an uncached
+// copy when the page is dirty (avoiding races with the writer).
+func (db *DB) getNamespaceAt(name string, walMaxFrame uint32) (*Namespace, error) {
+	nameKey := []byte(name)
+	pg, err := db.pager.readPageMVCC(1, walMaxFrame)
+	if err != nil {
+		return nil, err
+	}
+	defer db.pager.releasePage(pg)
+
+	return db.resolveNamespace(name, nameKey, pg)
+}
+
+// resolveNamespace searches page 1 (the master table) for the given namespace
+// and returns a Namespace handle.
+func (db *DB) resolveNamespace(name string, nameKey []byte, pg *page) (*Namespace, error) {
 	idx, found, serr := searchLeafPage(pg, nameKey)
 	if serr != nil {
 		return nil, serr
@@ -418,13 +441,13 @@ func (db *DB) getNamespaceLocked(name string) (*Namespace, error) {
 
 // ListNamespaces returns the names of all namespaces.
 func (db *DB) ListNamespaces() ([]string, error) {
-	_, slot, err := db.pager.beginRead()
+	maxFrame, slot, err := db.pager.beginRead()
 	if err != nil {
 		return nil, err
 	}
 	defer db.pager.endRead(slot)
 
-	pg, err := db.pager.getPage(1)
+	pg, err := db.pager.readPageMVCC(1, maxFrame)
 	if err != nil {
 		return nil, err
 	}
@@ -582,6 +605,16 @@ func (tx *ReadTx) Count(ns *Namespace) (int, error) {
 	return bt.Count()
 }
 
+// GetNamespace returns a Namespace handle for the given name.
+// Uses the transaction's WAL snapshot via getPageAt, which is safe to call
+// concurrently with writer goroutines (does not access pager.writePages).
+func (tx *ReadTx) GetNamespace(name string) (*Namespace, error) {
+	if tx.closed {
+		return nil, ErrTxClosed
+	}
+	return tx.db.getNamespaceAt(name, tx.walMaxFrame)
+}
+
 // Rollback ends the read transaction (for ReadTx, this is the same as commit).
 func (tx *ReadTx) Rollback() error {
 	if tx.closed {
@@ -598,6 +631,15 @@ func (tx *ReadTx) Rollback() error {
 // WriteTx is a read-write transaction.
 type WriteTx struct {
 	ReadTx
+}
+
+// GetNamespace returns a Namespace handle for the given name.
+// Uses pager.getPage which sees dirty pages from the current write transaction.
+func (tx *WriteTx) GetNamespace(name string) (*Namespace, error) {
+	if tx.closed {
+		return nil, ErrTxClosed
+	}
+	return tx.db.getNamespaceLocked(name)
 }
 
 // Put inserts or updates a key-value pair in the given namespace.
