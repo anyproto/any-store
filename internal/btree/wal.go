@@ -870,8 +870,7 @@ type wal struct {
 	index    *walIndex
 	pageSize uint32
 	path     string
-	nFrame   atomic.Uint32 // total frames written (atomic: read by readFrame, written by writeFrames)
-	readers  sync.Mutex    // protects reader slot allocation
+	nFrame atomic.Uint32 // total frames written (atomic: read by readFrame, written by writeFrames)
 
 	// Cumulative checksum state for appending frames
 	cksum1 uint32
@@ -1770,6 +1769,15 @@ func (w *wal) doResetWAL(truncate bool) error {
 	}
 
 	return w.writeHeader()
+}
+
+// truncateFile truncates the WAL file to zero bytes under the WAL mutex.
+func (w *wal) truncateFile() {
+	w.mu.Lock()
+	if w.file != nil {
+		_ = w.file.Truncate(0)
+	}
+	w.mu.Unlock()
 }
 
 // close closes the WAL file and shared memory.

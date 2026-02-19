@@ -794,8 +794,8 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 // in-memory frames.
 func (p *pager) readWalFrameData(frame uint32, buf []byte) error {
 	if p.wal.memFrames != nil {
-		p.wal.mu.Lock()
-		defer p.wal.mu.Unlock()
+		p.wal.mu.RLock()
+		defer p.wal.mu.RUnlock()
 		idx := frame - 1
 		if idx < uint32(len(p.wal.memFrames)) {
 			copy(buf, p.wal.memFrames[idx].data)
@@ -1258,11 +1258,7 @@ func (p *pager) close() error {
 		_ = p.wal.checkpoint(p.file)
 		// Truncate WAL file to zero bytes after successful checkpoint,
 		// matching SQLite's walLimitSize(pWal, 0) in sqlite3WalClose().
-		p.wal.mu.Lock()
-		if p.wal.file != nil {
-			_ = p.wal.file.Truncate(0)
-		}
-		p.wal.mu.Unlock()
+		p.wal.truncateFile()
 		_ = p.wal.close()
 	}
 

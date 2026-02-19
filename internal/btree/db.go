@@ -118,6 +118,9 @@ func (db *DB) Close() error {
 	// Wait for write mutex to ensure no writer is active
 	db.writeMu.Lock()
 	db.writeMu.Unlock()
+	// Wait for all active readers to finish
+	db.mu.Lock()
+	db.mu.Unlock()
 	return db.pager.close()
 }
 
