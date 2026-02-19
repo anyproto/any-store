@@ -2,6 +2,7 @@ package qplanner
 
 import (
 	"encoding/binary"
+	"sync/atomic"
 
 	"github.com/cespare/xxhash/v2"
 )
@@ -9,10 +10,11 @@ import (
 // IndexSketch is a frequency sketch for cardinality estimation.
 // Each index maintains a sketch to estimate how many documents match a specific value.
 // DocCount tracks the total number of documents in the collection, avoiding expensive tree traversals.
+// All methods are safe for concurrent use via atomic operations.
 type IndexSketch struct {
 	Buckets  []uint64
 	Size     int
-	DocCount uint64
+	docCount atomic.Uint64
 }
 
 // NewIndexSketch creates a new sketch with the given number of buckets.
@@ -33,31 +35,60 @@ func (s *IndexSketch) bucket(value []byte) uint64 {
 
 // Increment increments the count for the given encoded value.
 func (s *IndexSketch) Increment(value []byte) {
-	s.Buckets[s.bucket(value)]++
+	atomic.AddUint64(&s.Buckets[s.bucket(value)], 1)
 }
 
 // Decrement decrements the count for the given encoded value.
 // The count is clamped to 0 to avoid underflow.
 func (s *IndexSketch) Decrement(value []byte) {
 	b := s.bucket(value)
-	if s.Buckets[b] > 0 {
-		s.Buckets[b]--
+	for {
+		old := atomic.LoadUint64(&s.Buckets[b])
+		if old == 0 {
+			return
+		}
+		if atomic.CompareAndSwapUint64(&s.Buckets[b], old, old-1) {
+			return
+		}
 	}
 }
 
 // Estimate returns the estimated count for the given encoded value.
 func (s *IndexSketch) Estimate(value []byte) uint64 {
-	return s.Buckets[s.bucket(value)]
+	return atomic.LoadUint64(&s.Buckets[s.bucket(value)])
+}
+
+// IncrementDocCount atomically increments the document count.
+func (s *IndexSketch) IncrementDocCount() {
+	s.docCount.Add(1)
+}
+
+// DecrementDocCount atomically decrements the document count, clamped to 0.
+func (s *IndexSketch) DecrementDocCount() {
+	for {
+		old := s.docCount.Load()
+		if old == 0 {
+			return
+		}
+		if s.docCount.CompareAndSwap(old, old-1) {
+			return
+		}
+	}
+}
+
+// GetDocCount atomically returns the document count.
+func (s *IndexSketch) GetDocCount() uint64 {
+	return s.docCount.Load()
 }
 
 // MarshalBinary serializes the sketch to a byte slice.
 // Format: [buckets (8*size bytes)] [docCount (8 bytes)]
 func (s *IndexSketch) MarshalBinary() []byte {
 	data := make([]byte, 8*s.Size+8)
-	for i, v := range s.Buckets {
-		binary.LittleEndian.PutUint64(data[i*8:], v)
+	for i := range s.Size {
+		binary.LittleEndian.PutUint64(data[i*8:], atomic.LoadUint64(&s.Buckets[i]))
 	}
-	binary.LittleEndian.PutUint64(data[8*s.Size:], s.DocCount)
+	binary.LittleEndian.PutUint64(data[8*s.Size:], s.docCount.Load())
 	return data
 }
 
@@ -71,17 +102,17 @@ func (s *IndexSketch) UnmarshalBinary(data []byte) {
 		n = s.Size
 	}
 	for i := range n {
-		s.Buckets[i] = binary.LittleEndian.Uint64(data[i*8:])
+		atomic.StoreUint64(&s.Buckets[i], binary.LittleEndian.Uint64(data[i*8:]))
 	}
 	if hasDocCount && len(data) >= 8*s.Size+8 {
-		s.DocCount = binary.LittleEndian.Uint64(data[8*s.Size:])
+		s.docCount.Store(binary.LittleEndian.Uint64(data[8*s.Size:]))
 	}
 }
 
 // Reset zeroes all buckets and the document count.
 func (s *IndexSketch) Reset() {
 	for i := range s.Buckets {
-		s.Buckets[i] = 0
+		atomic.StoreUint64(&s.Buckets[i], 0)
 	}
-	s.DocCount = 0
+	s.docCount.Store(0)
 }

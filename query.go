@@ -428,7 +428,7 @@ func (q *collQuery) docCount(tx interface {
 }) int {
 	for _, idx := range q.c.indexes {
 		if idx.sketch != nil {
-			return int(idx.sketch.DocCount)
+			return int(idx.sketch.GetDocCount())
 		}
 	}
 	count, _ := tx.Count(q.c.ns)

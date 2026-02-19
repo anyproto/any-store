@@ -1,6 +1,7 @@
 package qplanner
 
 import (
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -15,7 +16,7 @@ func mockSketch(estimate uint64) *IndexSketch {
 	// Increment a dummy key `estimate` times so that any hash-colliding lookup returns ~estimate.
 	// For testing, we just set all buckets to the same value.
 	for i := range s.Buckets {
-		s.Buckets[i] = estimate
+		atomic.StoreUint64(&s.Buckets[i], estimate)
 	}
 	return s
 }

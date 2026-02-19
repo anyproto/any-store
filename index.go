@@ -151,7 +151,7 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 		}
 	}
 	if idx.sketch != nil {
-		idx.sketch.DocCount++
+		idx.sketch.IncrementDocCount()
 		idx.sketchModified = true
 	}
 	return nil
@@ -182,8 +182,8 @@ func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 			idx.sketchModified = true
 		}
 	}
-	if idx.sketch != nil && idx.sketch.DocCount > 0 {
-		idx.sketch.DocCount--
+	if idx.sketch != nil {
+		idx.sketch.DecrementDocCount()
 		idx.sketchModified = true
 	}
 	return nil
