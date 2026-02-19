@@ -150,7 +150,7 @@ func TestWALWriteReadFrames(t *testing.T) {
 
 	// Write frames with commit
 	require.NoError(t, w.writeFrames([]*page{pg1, pg2}, true, 2))
-	assert.Equal(t, uint32(2), w.nFrame)
+	assert.Equal(t, uint32(2), w.nFrame.Load())
 	assert.Equal(t, uint32(2), w.index.maxFrame)
 
 	// Read frame 1
@@ -191,7 +191,7 @@ func TestWALWriteNoCommit(t *testing.T) {
 
 	// Write without commit
 	require.NoError(t, w.writeFrames([]*page{pg}, false, 1))
-	assert.Equal(t, uint32(1), w.nFrame)
+	assert.Equal(t, uint32(1), w.nFrame.Load())
 	// walIndex.maxFrame tracks highest frame set (used internally),
 	// but the commit-visible maxFrame is only updated on commit.
 	// The key behavior is that recovery will NOT replay uncommitted frames.
@@ -209,7 +209,7 @@ func TestWALWriteEmptyFrames(t *testing.T) {
 	require.NoError(t, w.beginWrite())
 
 	require.NoError(t, w.writeFrames(nil, true, 0))
-	assert.Equal(t, uint32(0), w.nFrame)
+	assert.Equal(t, uint32(0), w.nFrame.Load())
 
 	w.endWrite()
 	require.NoError(t, w.close())
@@ -235,7 +235,7 @@ func TestWALRecoveryCommitted(t *testing.T) {
 	w2 := newWal(path, 4096)
 	require.NoError(t, w2.open())
 
-	assert.Equal(t, uint32(1), w2.nFrame)
+	assert.Equal(t, uint32(1), w2.nFrame.Load())
 	assert.Equal(t, uint32(5), w2.index.maxPage)
 
 	// Verify we can read the recovered frame
@@ -270,11 +270,11 @@ func TestWALRecoveryUncommittedTruncated(t *testing.T) {
 	w2 := newWal(path, 4096)
 	require.NoError(t, w2.open())
 
-	assert.Equal(t, uint32(1), w2.nFrame)
+	assert.Equal(t, uint32(1), w2.nFrame.Load())
 	assert.Equal(t, uint32(1), w2.index.maxPage)
 
 	// Frame for page 2 should not be in index
-	frame := w2.index.get(2, w2.nFrame)
+	frame := w2.index.get(2, w2.nFrame.Load())
 	assert.Equal(t, uint32(0), frame)
 
 	require.NoError(t, w2.close())
@@ -290,7 +290,7 @@ func TestWALRecoveryCorruptHeader(t *testing.T) {
 	w := newWal(path, 4096)
 	require.NoError(t, w.open()) // Should handle gracefully by resetting
 
-	assert.Equal(t, uint32(0), w.nFrame)
+	assert.Equal(t, uint32(0), w.nFrame.Load())
 	require.NoError(t, w.close())
 }
 
@@ -409,7 +409,7 @@ func TestWALCheckpointWritesBack(t *testing.T) {
 	require.NoError(t, w.checkpoint(dbFile))
 
 	// WAL should be reset
-	assert.Equal(t, uint32(0), w.nFrame)
+	assert.Equal(t, uint32(0), w.nFrame.Load())
 
 	// Read DB file and verify data was written
 	readBuf := make([]byte, 4096)
@@ -441,10 +441,10 @@ func TestWALMultipleCommits(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg2}, true, 1))
 	w.endWrite()
 
-	assert.Equal(t, uint32(2), w.nFrame)
+	assert.Equal(t, uint32(2), w.nFrame.Load())
 
 	// Latest frame for page 1 should be frame 2
-	frame := w.index.get(1, w.nFrame)
+	frame := w.index.get(1, w.nFrame.Load())
 	assert.Equal(t, uint32(2), frame)
 
 	// Read latest frame
@@ -524,7 +524,7 @@ func TestWALRecoveryMultipleCommits(t *testing.T) {
 	w2 := newWal(path, 4096)
 	require.NoError(t, w2.open())
 
-	assert.Equal(t, uint32(2), w2.nFrame)
+	assert.Equal(t, uint32(2), w2.nFrame.Load())
 	assert.Equal(t, uint32(2), w2.index.maxPage)
 
 	buf := make([]byte, 4096)

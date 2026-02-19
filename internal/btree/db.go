@@ -45,10 +45,11 @@ type DB struct {
 	masterBT *btree
 
 	// Local counter cache for multi-process staleness detection.
-	// Updated under writeMu (during Commit or UpdateLocalCounters),
-	// read under mu.RLock (during BeginRead/BeginWrite).
-	localFileChangeCounter uint32
-	localSchemaCookie      uint32
+	// Accessed atomically: written by Commit (under writeMu + mu.RLock)
+	// and read by BeginRead/BeginWrite (under mu.RLock). Since both
+	// paths hold mu.RLock (not exclusive), atomics are required.
+	localFileChangeCounter atomic.Uint32
+	localSchemaCookie      atomic.Uint32
 
 	readTxPool  sync.Pool
 	writeTxPool sync.Pool
@@ -102,8 +103,8 @@ func Open(path string, opts Options) (*DB, error) {
 		p.close()
 		return nil, err
 	}
-	db.localFileChangeCounter = fcc
-	db.localSchemaCookie = sc
+	db.localFileChangeCounter.Store(fcc)
+	db.localSchemaCookie.Store(sc)
 
 	return db, nil
 }
@@ -163,8 +164,8 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 	tx.walSlot = slot
 	tx.diskFileChangeCounter = fcc
 	tx.diskSchemaCookie = sc
-	tx.localFileChangeCounter = db.localFileChangeCounter
-	tx.localSchemaCookie = db.localSchemaCookie
+	tx.localFileChangeCounter = db.localFileChangeCounter.Load()
+	tx.localSchemaCookie = db.localSchemaCookie.Load()
 	return tx, nil
 }
 
@@ -219,8 +220,8 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	tx.ReadTx.writable = true
 	tx.ReadTx.diskFileChangeCounter = fcc
 	tx.ReadTx.diskSchemaCookie = sc
-	tx.ReadTx.localFileChangeCounter = db.localFileChangeCounter
-	tx.ReadTx.localSchemaCookie = db.localSchemaCookie
+	tx.ReadTx.localFileChangeCounter = db.localFileChangeCounter.Load()
+	tx.ReadTx.localSchemaCookie = db.localSchemaCookie.Load()
 	tx.dataChanged = false   // pool reuse safety
 	tx.schemaChanged = false // pool reuse safety
 	return tx, nil
@@ -265,12 +266,10 @@ func (db *DB) Checkpoint() error {
 // UpdateLocalCounters manually sets the local counter cache. This is used by
 // a process that has detected staleness and rebuilt its in-memory state: after
 // rebuilding, call this to record the new baseline so subsequent transactions
-// no longer report as stale. Takes writeMu to serialize with Commit.
+// no longer report as stale. Uses atomic stores, safe to call concurrently.
 func (db *DB) UpdateLocalCounters(fileChangeCounter, schemaCookie uint32) {
-	db.writeMu.Lock()
-	db.localFileChangeCounter = fileChangeCounter
-	db.localSchemaCookie = schemaCookie
-	db.writeMu.Unlock()
+	db.localFileChangeCounter.Store(fileChangeCounter)
+	db.localSchemaCookie.Store(schemaCookie)
 }
 
 // CreateNamespace creates a new namespace. Must be called within a write transaction.
@@ -783,8 +782,8 @@ func (tx *WriteTx) Commit() error {
 	tx.closed = true
 	nFrame, newFCC, newSC, err := tx.pager.commit(tx.dataChanged, tx.schemaChanged)
 	if err == nil {
-		tx.db.localFileChangeCounter = newFCC
-		tx.db.localSchemaCookie = newSC
+		tx.db.localFileChangeCounter.Store(newFCC)
+		tx.db.localSchemaCookie.Store(newSC)
 	}
 	threshold := tx.db.opts.AutoCheckpointAfter
 	needCheckpoint := threshold > 0 && nFrame >= threshold

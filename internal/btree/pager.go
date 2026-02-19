@@ -883,10 +883,8 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 		return 0, 0, 0, err
 	}
 
-	// Capture nFrame under w.mu for happens-before ordering with checkpoint
-	p.wal.mu.Lock()
-	nFrame = p.wal.nFrame
-	p.wal.mu.Unlock()
+	// Capture nFrame atomically for checkpoint threshold decision.
+	nFrame = p.wal.nFrame.Load()
 
 	// Mark all pages as clean
 	for _, pg := range p.dirtyBuf {
@@ -979,7 +977,7 @@ func (p *pager) savepoint() (int, error) {
 		id:       id,
 		dbSize:   p.dbSize,
 		pages:    make(map[uint32][]byte),
-		walFrame: p.wal.nFrame,
+		walFrame: p.wal.nFrame.Load(),
 		header:   p.header, // snapshot header for rollback (fix 9.3)
 	})
 	return id, nil

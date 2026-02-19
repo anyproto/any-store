@@ -864,14 +864,14 @@ func (wi *walIndex) shmReadCkptInfo() {
 
 // wal manages the Write-Ahead Log.
 type wal struct {
-	mu       sync.Mutex
+	mu       sync.RWMutex // protects memFrames slice; readers use RLock, writer uses Lock
 	file     *os.File
 	header   walHeader
 	index    *walIndex
 	pageSize uint32
 	path     string
-	nFrame   uint32     // total frames written
-	readers  sync.Mutex // protects reader slot allocation
+	nFrame   atomic.Uint32 // total frames written (atomic: read by readFrame, written by writeFrames)
+	readers  sync.Mutex    // protects reader slot allocation
 
 	// Cumulative checksum state for appending frames
 	cksum1 uint32
@@ -992,7 +992,7 @@ func (w *wal) initHeaderState() {
 	var buf [walHeaderSize]byte
 	w.header.serialize(buf[:])
 	w.cksum1, w.cksum2 = walChecksum(buf[0:24], 0, 0)
-	w.nFrame = 0
+	w.nFrame.Store(0)
 	w.headerOnDisk = false
 	w.index.reset()
 
@@ -1040,7 +1040,7 @@ func (w *wal) writeHeader() error {
 
 	// Initialize checksum state from header
 	w.cksum1, w.cksum2 = walChecksum(buf[0:24], 0, 0)
-	w.nFrame = 0
+	w.nFrame.Store(0)
 	w.headerOnDisk = true
 	w.index.reset()
 
@@ -1145,7 +1145,7 @@ func (w *wal) recover() error {
 			offset += frameSize
 		}
 
-		w.nFrame = lastCommitFrame
+		w.nFrame.Store(lastCommitFrame)
 		w.cksum1 = lastCommitCksum1
 		w.cksum2 = lastCommitCksum2
 		w.index.maxFrame = lastCommitFrame
@@ -1158,7 +1158,7 @@ func (w *wal) recover() error {
 		w.index.shmWriteCkptInfo()
 	} else {
 		// No committed frames -- set empty state, do NOT truncate WAL file.
-		w.nFrame = 0
+		w.nFrame.Store(0)
 		w.index.reset()
 	}
 
@@ -1193,7 +1193,8 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	}
 
 	frameSize := int(walFrameSize) + int(w.pageSize)
-	offset := int64(walHeaderSize) + int64(w.nFrame)*int64(frameSize)
+	nf := w.nFrame.Load()
+	offset := int64(walHeaderSize) + int64(nf)*int64(frameSize)
 
 	// Reuse write buffer to avoid per-commit allocations
 	needSize := len(pages) * frameSize
@@ -1205,7 +1206,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	buf := w.writeBuf
 
 	s1, s2 := w.cksum1, w.cksum2
-	startFrame := w.nFrame + 1
+	startFrame := nf + 1
 
 	for i, p := range pages {
 		pos := i * frameSize
@@ -1231,7 +1232,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		copy(buf[pos+walFrameSize:pos+frameSize], p.data)
 	}
 
-	w.nFrame += uint32(len(pages))
+	w.nFrame.Store(nf + uint32(len(pages)))
 	w.cksum1 = s1
 	w.cksum2 = s2
 
@@ -1264,11 +1265,14 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 
 // writeFramesMem is the fast in-memory path for writeFrames.
 // No file I/O, no checksums -- just copy page data into a pre-allocated arena.
-// Acquires w.mu to synchronize with readFrame which reads w.nFrame and w.memFrames.
+// Acquires w.mu to synchronize with readFrame which reads w.memFrames.
+// nFrame is updated atomically after the slice is populated, ensuring readers
+// only see the new nFrame after the memFrames data is visible.
 func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	w.mu.Lock()
 
-	startFrame := w.nFrame + 1
+	nf := w.nFrame.Load()
+	startFrame := nf + 1
 	pageSz := int(w.pageSize)
 
 	// Ensure arena has enough space for all pages in this batch
@@ -1299,9 +1303,12 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 			dbSize: dbSizeField,
 			data:   dataCopy,
 		})
-		w.nFrame++
+		nf++
 	}
 
+	// Store nFrame while still holding the lock so readers see consistent
+	// memFrames slice + nFrame via their RLock.
+	w.nFrame.Store(nf)
 	w.mu.Unlock()
 
 	// Batch update walIndex (has its own lock)
@@ -1317,29 +1324,28 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 }
 
 // readFrame reads the page data for a given frame number.
-// Acquires w.mu to synchronize with writeFrames/writeFramesMem which modify
-// w.nFrame and w.memFrames. The lock is released before file I/O to avoid
-// blocking the writer during disk reads.
+// For the file-based path, only an atomic load of nFrame is needed (WAL frames
+// on disk are immutable once written). For the memFrames path, RLock protects
+// the slice from concurrent append by writeFramesMem.
 func (w *wal) readFrame(frame uint32, buf []byte) error {
-	w.mu.Lock()
-	nf := w.nFrame
+	nf := w.nFrame.Load()
 	if frame == 0 || frame > nf {
-		w.mu.Unlock()
 		return ErrWALCorrupt
 	}
-	// Fast path: read from in-memory frames
+	// Fast path: read from in-memory frames (needs RLock for slice access)
 	if w.memFrames != nil {
+		w.mu.RLock()
 		idx := frame - 1
 		if idx < uint32(len(w.memFrames)) {
 			copy(buf[:w.pageSize], w.memFrames[idx].data)
-			w.mu.Unlock()
+			w.mu.RUnlock()
 			return nil
 		}
-		w.mu.Unlock()
+		w.mu.RUnlock()
 		return ErrWALCorrupt
 	}
-	w.mu.Unlock()
-	// File I/O is done without the lock held.
+	// File path: no lock needed. WAL frames are immutable once written,
+	// and nFrame was already validated atomically above.
 	frameSize := int64(walFrameSize) + int64(w.pageSize)
 	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
 	_, err := w.file.ReadAt(buf[:w.pageSize], offset)
@@ -1495,7 +1501,8 @@ func (w *wal) checkpointWithMode(dbFile *os.File, mode CheckpointMode, xBusy Bus
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.nFrame == 0 {
+	nf := w.nFrame.Load()
+	if nf == 0 {
 		return nil
 	}
 
@@ -1508,7 +1515,7 @@ func (w *wal) checkpointWithMode(dbFile *os.File, mode CheckpointMode, xBusy Bus
 	// If the lock fails (reader active), use the busy handler to wait
 	// (in FULL/RESTART/TRUNCATE modes) or just lower mxSafeFrame (PASSIVE).
 	// This matches SQLite's walCheckpoint() reader-lock loop (issue 6.3).
-	mxSafeFrame := w.nFrame
+	mxSafeFrame := nf
 
 	for i := 1; i < 5; i++ {
 		w.index.mu.RLock()
@@ -1660,7 +1667,7 @@ func (w *wal) checkpointPost(mode CheckpointMode, xBusy BusyHandler, hasWriteLoc
 	backfill := w.index.nBackfill
 	w.index.mu.RUnlock()
 
-	if backfill < w.nFrame {
+	if backfill < w.nFrame.Load() {
 		// Not everything was checkpointed. Can't reset the WAL.
 		return nil
 	}
@@ -1754,7 +1761,7 @@ func (w *wal) doResetWAL(truncate bool) error {
 	}
 
 	w.index.reset()
-	w.nFrame = 0
+	w.nFrame.Store(0)
 
 	// Reset memFrames and arena for reuse
 	if w.memFrames != nil {

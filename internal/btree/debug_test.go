@@ -34,7 +34,7 @@ func TestDebugMVCC(t *testing.T) {
 	}
 
 	// Read current WAL state
-	t.Logf("WAL nFrame after setup: %d", db.pager.wal.nFrame)
+	t.Logf("WAL nFrame after setup: %d", db.pager.wal.nFrame.Load())
 	t.Logf("WAL index maxFrame: %d", db.pager.wal.index.maxFrame)
 	
 	// Dump all page->frame mappings
@@ -71,7 +71,7 @@ func TestDebugMVCC(t *testing.T) {
 	require.NoError(t, wtx.Commit())
 
 	t.Logf("After writer commit:")
-	t.Logf("  WAL nFrame: %d", db.pager.wal.nFrame)
+	t.Logf("  WAL nFrame: %d", db.pager.wal.nFrame.Load())
 	t.Logf("  WAL index maxFrame: %d", db.pager.wal.index.maxFrame)
 	
 	// Dump updated page->frame mappings
