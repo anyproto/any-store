@@ -67,8 +67,8 @@ func TestCollection_Insert(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 2, count)
 
-		// btree InProcess mode has no MVCC, reads see uncommitted writes
-		assertCollCount(t, coll, 2)
+		// MVCC: a separate read outside the write tx cannot see uncommitted writes
+		assertCollCount(t, coll, 0)
 
 		require.NoError(t, tx.Commit())
 
