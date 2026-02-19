@@ -372,7 +372,13 @@ func (db *DB) freeTreePages(pgno uint32) error {
 }
 
 // GetNamespace returns a Namespace handle for the given name.
+// If a write transaction is active (pager in writer state), this uses the
+// writer path to see uncommitted dirty pages. This is safe because
+// GetNamespace is called from the writer goroutine when inside a write tx.
 func (db *DB) GetNamespace(name string) (*Namespace, error) {
+	if pagerState(db.pager.state.Load()) == pagerWriter {
+		return db.getNamespaceLocked(name)
+	}
 	maxFrame, slot, err := db.pager.beginRead()
 	if err != nil {
 		return nil, err

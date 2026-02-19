@@ -439,6 +439,33 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 		return nil
 	}
 
+	// Cap nPages against the actual database size to protect against corrupted
+	// headers claiming billions of pages. This matches SQLite's approach where
+	// btreePagecount() uses the actual file/WAL size, not the header field.
+	//
+	// Use max(filePages, walIndex.maxPage) because pages allocated in the WAL
+	// may have page numbers beyond the current physical DB file size (they get
+	// written to the DB file during checkpoint).
+	pageSize := db.pager.pageSize
+	if pageSize > 0 {
+		fi, statErr := db.pager.file.Stat()
+		if statErr == nil {
+			filePages := uint32(fi.Size() / int64(pageSize))
+			maxPossible := filePages
+			// WAL's maxPage tracks the committed database size including
+			// pages that only exist in the WAL (not yet checkpointed).
+			db.pager.wal.index.mu.RLock()
+			walMaxPage := db.pager.wal.index.maxPage
+			db.pager.wal.index.mu.RUnlock()
+			if walMaxPage > maxPossible {
+				maxPossible = walMaxPage
+			}
+			if maxPossible > 0 && nPages > maxPossible {
+				nPages = maxPossible
+			}
+		}
+	}
+
 	ic := &integrityChecker{
 		pager:       db.pager,
 		walMaxFrame: maxFrame,
@@ -540,7 +567,13 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 
 checkOrphans:
 	// 3. Check for orphan pages
+	// The tooManyErrors check matches SQLite's `sCheck.mxErr` guard in the
+	// orphan loop (btree.c:11237), preventing iteration over billions of
+	// pages when nPages comes from a corrupted (but capped) header.
 	for pgno := uint32(2); pgno <= nPages; pgno++ {
+		if ic.tooManyErrors() {
+			break
+		}
 		if !ic.isReferenced(pgno) {
 			ic.report("page %d: never used", pgno)
 		}
