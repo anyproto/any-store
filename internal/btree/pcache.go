@@ -15,6 +15,11 @@ type pcache struct {
 	maxPages int              // maximum number of cached pages
 	pageSize int              // size of each page in bytes
 
+	// purgeable controls whether the cache can evict pages.
+	// When false (InMemory databases), pages are never evicted and the
+	// cache can grow beyond maxPages. Matches SQLite's pcache1.bPurgeable.
+	purgeable bool
+
 	// LRU list for clean pages (dirty pages are not evicted)
 	lruHead *page
 	lruTail *page
@@ -25,14 +30,15 @@ type pcache struct {
 	nDirty    int
 }
 
-func newPcache(pageSize, maxPages int) *pcache {
+func newPcache(pageSize, maxPages int, purgeable bool) *pcache {
 	if maxPages <= 0 {
 		maxPages = defaultCacheSize
 	}
 	return &pcache{
-		pages:    make(map[uint32]*page),
-		maxPages: maxPages,
-		pageSize: pageSize,
+		pages:     make(map[uint32]*page),
+		maxPages:  maxPages,
+		pageSize:  pageSize,
+		purgeable: purgeable,
 	}
 }
 
@@ -84,9 +90,11 @@ func (pc *pcache) create(pgno uint32) *page {
 		return p
 	}
 
-	// Evict clean pages if cache is full
-	for len(pc.pages) >= pc.maxPages && pc.nClean > 0 {
-		pc.evictOne()
+	// Evict clean pages if cache is full (skip for non-purgeable / InMemory caches)
+	if pc.purgeable {
+		for len(pc.pages) >= pc.maxPages && pc.nClean > 0 {
+			pc.evictOne()
+		}
 	}
 
 	p := &page{

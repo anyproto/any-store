@@ -57,7 +57,7 @@ func (e *btreeEngine) Name() string { return "btree" }
 func (e *btreeEngine) Open(dir string) error {
 	opts := btree.DefaultOptions()
 	opts.InProcess = true
-	opts.NoSync = true                // match SQLite synchronous=normal behavior
+	opts.NoCommitSync = true                // match SQLite synchronous=normal behavior
 	btree.AutoCheckpointThreshold = 0 // disable during benchmarks; checkpoint manually if needed
 	db, err := btree.Open(filepath.Join(dir, "bench.db"), opts)
 	if err != nil {

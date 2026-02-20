@@ -8,7 +8,7 @@ import (
 )
 
 func TestPcacheCreateFetch(t *testing.T) {
-	pc := newPcache(4096, 100)
+	pc := newPcache(4096, 100, true)
 
 	pg := pc.create(1)
 	require.NotNil(t, pg)
@@ -28,7 +28,7 @@ func TestPcacheCreateFetch(t *testing.T) {
 }
 
 func TestPcacheCreateExisting(t *testing.T) {
-	pc := newPcache(4096, 100)
+	pc := newPcache(4096, 100, true)
 
 	pg1 := pc.create(5)
 	pg1.data[0] = 42
@@ -41,7 +41,7 @@ func TestPcacheCreateExisting(t *testing.T) {
 }
 
 func TestPcacheRelease(t *testing.T) {
-	pc := newPcache(4096, 100)
+	pc := newPcache(4096, 100, true)
 
 	pg := pc.create(1)
 	assert.Equal(t, 1, pg.pinCount)
@@ -53,7 +53,7 @@ func TestPcacheRelease(t *testing.T) {
 }
 
 func TestPcacheDirtyPages(t *testing.T) {
-	pc := newPcache(4096, 100)
+	pc := newPcache(4096, 100, true)
 
 	pg1 := pc.create(1)
 	pg2 := pc.create(2)
@@ -85,7 +85,7 @@ func TestPcacheDirtyPages(t *testing.T) {
 }
 
 func TestPcacheMakeCleanPinned(t *testing.T) {
-	pc := newPcache(4096, 100)
+	pc := newPcache(4096, 100, true)
 
 	pg := pc.create(1)
 	pc.makeDirty(pg)
@@ -103,7 +103,7 @@ func TestPcacheMakeCleanPinned(t *testing.T) {
 }
 
 func TestPcacheLRUEviction(t *testing.T) {
-	pc := newPcache(4096, 3) // max 3 pages
+	pc := newPcache(4096, 3, true) // max 3 pages
 
 	// Create and release 3 clean pages
 	for i := uint32(1); i <= 3; i++ {
@@ -124,7 +124,7 @@ func TestPcacheLRUEviction(t *testing.T) {
 }
 
 func TestPcacheDirtyPagesNotEvicted(t *testing.T) {
-	pc := newPcache(4096, 2) // max 2 pages
+	pc := newPcache(4096, 2, true) // max 2 pages
 
 	pg1 := pc.create(1)
 	pc.makeDirty(pg1)
@@ -144,7 +144,7 @@ func TestPcacheDirtyPagesNotEvicted(t *testing.T) {
 }
 
 func TestPcacheDiscard(t *testing.T) {
-	pc := newPcache(4096, 100)
+	pc := newPcache(4096, 100, true)
 
 	pg := pc.create(1)
 	pc.release(pg)
@@ -158,7 +158,7 @@ func TestPcacheDiscard(t *testing.T) {
 }
 
 func TestPcacheDiscardDirty(t *testing.T) {
-	pc := newPcache(4096, 100)
+	pc := newPcache(4096, 100, true)
 
 	pg := pc.create(1)
 	pc.makeDirty(pg)
@@ -171,7 +171,7 @@ func TestPcacheDiscardDirty(t *testing.T) {
 }
 
 func TestPcacheClear(t *testing.T) {
-	pc := newPcache(4096, 100)
+	pc := newPcache(4096, 100, true)
 
 	for i := uint32(1); i <= 10; i++ {
 		pg := pc.create(i)
@@ -191,7 +191,7 @@ func TestPcacheClear(t *testing.T) {
 }
 
 func TestPcacheTruncate(t *testing.T) {
-	pc := newPcache(4096, 100)
+	pc := newPcache(4096, 100, true)
 
 	for i := uint32(1); i <= 10; i++ {
 		pg := pc.create(i)
@@ -209,7 +209,7 @@ func TestPcacheTruncate(t *testing.T) {
 }
 
 func TestPcacheTruncateDirty(t *testing.T) {
-	pc := newPcache(4096, 100)
+	pc := newPcache(4096, 100, true)
 
 	for i := uint32(1); i <= 5; i++ {
 		pg := pc.create(i)
@@ -225,7 +225,7 @@ func TestPcacheTruncateDirty(t *testing.T) {
 }
 
 func TestPcacheFetchMovesFromLRU(t *testing.T) {
-	pc := newPcache(4096, 100)
+	pc := newPcache(4096, 100, true)
 
 	pg := pc.create(1)
 	pc.release(pg)
@@ -241,9 +241,9 @@ func TestPcacheFetchMovesFromLRU(t *testing.T) {
 }
 
 func TestPcacheDefaultCacheSize(t *testing.T) {
-	pc := newPcache(4096, 0)
+	pc := newPcache(4096, 0, true)
 	assert.Equal(t, defaultCacheSize, pc.maxPages)
 
-	pc2 := newPcache(4096, -1)
+	pc2 := newPcache(4096, -1, true)
 	assert.Equal(t, defaultCacheSize, pc2.maxPages)
 }

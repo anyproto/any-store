@@ -90,6 +90,9 @@ func TestDb_GetCollectionNames(t *testing.T) {
 }
 
 func TestDb_Stats(t *testing.T) {
+	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
+		t.Skip("Stats checks file sizes on disk")
+	}
 	fx := newFixture(t)
 	stats, err := fx.Stats(ctx)
 	require.NoError(t, err)
@@ -111,6 +114,9 @@ func TestDb_Flush(t *testing.T) {
 }
 
 func TestDb_Backup(t *testing.T) {
+	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
+		t.Skip("Backup reads DB file from disk")
+	}
 	fx := newFixture(t)
 	coll, err := fx.Collection(ctx, "coll")
 	require.NoError(t, err)
@@ -183,6 +189,21 @@ func TestDb_Close(t *testing.T) {
 }
 
 func newFixture(t testing.TB, c ...*Config) *fixture {
+	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
+		var conf *Config
+		if len(c) != 0 {
+			conf = c[0]
+		}
+		if conf == nil {
+			conf = &Config{}
+		}
+		conf.InMemory = true
+		db, err := Open(ctx, ":memory:", conf)
+		require.NoError(t, err)
+		fx := &fixture{DB: db, t: t}
+		t.Cleanup(fx.finish)
+		return fx
+	}
 	tmpDir, err := os.MkdirTemp("", "any-store-*")
 	require.NoError(t, err)
 	return newFixturePath(t, tmpDir, c...)

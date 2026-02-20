@@ -10,6 +10,11 @@ import (
 	"unsafe"
 )
 
+// hasMmapShm indicates this platform supports mmap-based shared memory
+// for multi-process WAL coordination. When false, only heap SHM is
+// available and InProcess mode is forced.
+const hasMmapShm = true
+
 // shmDMSOffset is the byte offset of the "dead man switch" (DMS) lock in the
 // SHM file. Each open connection holds a shared lock on this byte. On close,
 // we try to acquire an exclusive lock: if successful, we're the last connection

@@ -15,10 +15,36 @@ import (
 type Options struct {
 	PageSize            uint32 // Page size in bytes (default: 4096)
 	CacheSize           int    // Maximum number of cached pages (default: 2000)
-	InProcess           bool   // Use in-process locking only (faster, but single-process access only)
-	NoSync              bool   // Skip fsync on WAL commit (like SQLite synchronous=normal in WAL mode)
 	AutoCheckpointAfter uint32 // WAL frames before auto-checkpoint (0 = use default 10000)
 	DisableAutoCheckpoint bool // Disable auto-checkpoint entirely (manual Checkpoint() only)
+
+	// InProcess uses heap-backed shared memory for the WAL index instead of
+	// mmap'd files with POSIX fcntl locks. Faster, but restricts access to a
+	// single OS process. Equivalent to SQLite's PRAGMA locking_mode=EXCLUSIVE
+	// (WAL_HEAPMEMORY_MODE): SHM locks become no-ops, memory barriers are
+	// skipped, and no .db-wal-shm file is created.
+	//
+	// Forced to true automatically on platforms without mmap SHM support
+	// (e.g. Windows) and when InMemory is true.
+	InProcess bool
+
+	// NoCommitSync skips fdatasync on WAL commit. WAL frames are still written
+	// to the WAL file on disk, but durability is deferred until checkpoint.
+	// Equivalent to SQLite's PRAGMA synchronous=NORMAL in WAL mode:
+	//   - false (default) = synchronous=FULL  — fsync every WAL commit
+	//   - true            = synchronous=NORMAL — fsync only on checkpoint
+	NoCommitSync bool
+
+	// InMemory keeps the entire database in memory with no files on disk.
+	// WAL frames are stored in a heap-backed slice (memFrames) instead of
+	// being written to a WAL file. Checkpoint moves frames into the in-memory
+	// page cache (which is made non-purgeable so pages are never evicted).
+	// The database does not survive process crashes.
+	//
+	// When InMemory is true, InProcess and NoCommitSync are forced to true
+	// automatically (heap SHM, no fsync — both meaningless for in-memory).
+	// The path argument to Open is ignored and can be any string.
+	InMemory bool
 }
 
 // DefaultOptions returns default database options.
@@ -74,9 +100,19 @@ func Open(path string, opts Options) (*DB, error) {
 		opts.AutoCheckpointAfter = AutoCheckpointThreshold
 	}
 
-	p := newPager(path, opts.PageSize, opts.CacheSize)
+	if opts.InMemory {
+		opts.InProcess = true
+		opts.NoCommitSync = true
+	}
+	if !hasMmapShm {
+		// Platform lacks mmap SHM (e.g. Windows); force heap SHM.
+		opts.InProcess = true
+	}
+
+	p := newPager(path, opts.PageSize, opts.CacheSize, !opts.InMemory)
 	p.inProcess = opts.InProcess
-	p.noSync = opts.NoSync
+	p.noCommitSync = opts.NoCommitSync
+	p.inMemory = opts.InMemory
 	if err := p.open(); err != nil {
 		return nil, err
 	}
@@ -118,6 +154,9 @@ func (db *DB) Close() error {
 	// Wait for write mutex to ensure no writer is active
 	db.writeMu.Lock()
 	db.writeMu.Unlock()
+	// Wait for all active readers to finish
+	db.mu.Lock()
+	db.mu.Unlock()
 	return db.pager.close()
 }
 
