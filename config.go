@@ -20,6 +20,7 @@ type Config struct {
 	// InMemory keeps the entire database in memory with no files on disk.
 	// The database does not survive process crashes. When true, InProcess
 	// and NoCommitSync are forced on automatically.
+	// The path argument to Open is ignored and can be any string (e.g. ":memory:").
 	InMemory bool
 
 	// DurabilityConfig provides configuration for crash recovery and idle auto-flush

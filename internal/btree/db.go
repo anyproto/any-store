@@ -40,6 +40,7 @@ type Options struct {
 	//
 	// When InMemory is true, InProcess and NoCommitSync are forced to true
 	// automatically (heap SHM, no fsync — both meaningless for in-memory).
+	// The path argument to Open is ignored and can be any string.
 	InMemory bool
 }
 
