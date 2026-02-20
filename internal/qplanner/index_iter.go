@@ -168,6 +168,14 @@ func (it *IndexIter) nextNoBounds() (key []byte, docId []byte, err error) {
 	return it.extractResult(k)
 }
 
+// Close releases the underlying cursor resources.
+func (it *IndexIter) Close() {
+	if it.cursor != nil {
+		it.cursor.Close()
+		it.cursor = nil
+	}
+}
+
 func (it *IndexIter) extractResult(k []byte) (key []byte, docId []byte, err error) {
 	if it.IdxInfo.Unique {
 		val, verr := it.cursor.Value()

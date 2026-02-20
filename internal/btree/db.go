@@ -617,8 +617,7 @@ func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 }
 
 // Get retrieves a value by key from the given namespace.
-// The returned slice points directly into the page buffer and is only valid
-// until the transaction ends or any write operation occurs.
+// The returned slice is a copy and is safe to retain after pages are released.
 func (tx *ReadTx) Get(ns *Namespace, key []byte) ([]byte, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
@@ -670,8 +669,9 @@ func (tx *ReadTx) Get(ns *Namespace, key []byte) ([]byte, error) {
 				tx.pager.releasePage(pg)
 				return fullVal, nil
 			}
+			val := append([]byte(nil), cell.value...)
 			tx.pager.releasePage(pg)
-			return cell.value, nil
+			return val, nil
 		}
 		childPgno, _, serr := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame)
 		if serr != nil {

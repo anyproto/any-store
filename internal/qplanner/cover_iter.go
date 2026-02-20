@@ -45,6 +45,9 @@ func (it *CoverIter) Next() (key []byte, docId []byte, err error) {
 	return nil, nil, nil
 }
 
+// Close releases resources (CoverIter has no cursor to close).
+func (it *CoverIter) Close() {}
+
 func (it *CoverIter) String() string {
 	return fmt.Sprintf("CoverLookup(%s)[%d bounds]", it.IdxInfo.Name, len(it.Bounds))
 }

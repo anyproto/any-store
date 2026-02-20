@@ -395,6 +395,7 @@ func (db *db) Collection(ctx context.Context, collectionName string) (Collection
 func (db *db) GetCollectionNames(ctx context.Context) (collectionNames []string, err error) {
 	err = db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		cursor := tx.NewCursor(db.systemNS)
+		defer cursor.Close()
 		prefix := []byte("coll:")
 		if err := cursor.Seek(prefix); err != nil {
 			return nil
@@ -423,6 +424,7 @@ func (db *db) GetCollectionNames(ctx context.Context) (collectionNames []string,
 func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
 	err = db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		cursor := tx.NewCursor(db.systemNS)
+		defer cursor.Close()
 		if err := cursor.Seek([]byte("coll:")); err == nil {
 			for cursor.Valid() {
 				key, err := cursor.Key()
@@ -471,6 +473,7 @@ func (db *db) QuickCheck(ctx context.Context) (err error) {
 	// btree doesn't have a built-in quick check, just verify we can read
 	return db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		cursor := tx.NewCursor(db.systemNS)
+		defer cursor.Close()
 		if err := cursor.First(); err != nil {
 			return err
 		}
@@ -647,6 +650,7 @@ func (db *db) onCollectionClose(name string) {
 func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, error) {
 	prefix := indexKeyPrefix(collName)
 	cursor := tx.NewCursor(db.systemNS)
+	defer cursor.Close()
 	if err := cursor.Seek([]byte(prefix)); err != nil {
 		return nil, nil
 	}
@@ -715,6 +719,7 @@ func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 	// Remove all index keys for this collection
 	prefix := indexKeyPrefix(collName)
 	cursor := tx.NewCursor(db.systemNS)
+	defer cursor.Close()
 	if err := cursor.Seek([]byte(prefix)); err != nil {
 		return nil
 	}
@@ -753,6 +758,7 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 	// Rename index keys
 	oldPrefix := indexKeyPrefix(oldName)
 	cursor := tx.NewCursor(db.systemNS)
+	defer cursor.Close()
 	if err := cursor.Seek([]byte(oldPrefix)); err != nil {
 		return nil
 	}
@@ -801,6 +807,7 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 // listCollectionNames returns sorted collection names from system namespace
 func (db *db) listCollectionNames(tx *btree.ReadTx) ([]string, error) {
 	cursor := tx.NewCursor(db.systemNS)
+	defer cursor.Close()
 	prefix := []byte("coll:")
 	if err := cursor.Seek(prefix); err != nil {
 		return nil, nil

@@ -116,6 +116,14 @@ func (it *FullScanIter) Next() (key []byte, docId []byte, err error) {
 	}
 }
 
+// Close releases the underlying cursor resources.
+func (it *FullScanIter) Close() {
+	if it.cursor != nil {
+		it.cursor.Close()
+		it.cursor = nil
+	}
+}
+
 func (it *FullScanIter) String() string {
 	s := "FullScan"
 	if it.Reverse {

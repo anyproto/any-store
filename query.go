@@ -279,6 +279,7 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	for iter.Next() {
 		var doc Doc
 		if doc, err = iter.Doc(); err != nil {
+			cursor.Close()
 			q.c.db.syncPool.ReleaseDocBuf(iterBuf)
 			qb.Close()
 			return
@@ -287,10 +288,12 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 		idsToDelete = append(idsToDelete, append([]byte(nil), id...))
 	}
 	if err = iter.Err(); err != nil {
+		cursor.Close()
 		q.c.db.syncPool.ReleaseDocBuf(iterBuf)
 		qb.Close()
 		return
 	}
+	cursor.Close()
 	q.c.db.syncPool.ReleaseDocBuf(iterBuf)
 	qb.Close()
 

@@ -224,6 +224,9 @@ func (i *iterator) Close() (err error) {
 		return ErrIterClosed
 	}
 	i.closed = true
+	if i.cursor != nil {
+		i.cursor.Close()
+	}
 	if i.tx != nil {
 		err = errors.Join(err, i.tx.Commit())
 	}
@@ -298,6 +301,9 @@ func (pi *planIterator) Close() (err error) {
 		return ErrIterClosed
 	}
 	pi.closed = true
+	if pi.plan != nil {
+		pi.plan.Close()
+	}
 	if pi.tx != nil {
 		err = errors.Join(err, pi.tx.Commit())
 	}

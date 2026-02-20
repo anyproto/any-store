@@ -1640,6 +1640,7 @@ func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode Checkpoint
 		frameSize := int64(walFrameSize) + int64(w.pageSize)
 		var frame walFrame
 		frameBuf := make([]byte, walFrameSize)
+		pageData := make([]byte, w.pageSize) // reused across iterations
 
 		for i := nBackfill; i < mxSafeFrame; i++ {
 			off := int64(walHeaderSize) + int64(i)*frameSize
@@ -1649,7 +1650,6 @@ func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode Checkpoint
 			}
 			frame.deserialize(frameBuf)
 
-			pageData := make([]byte, w.pageSize)
 			if _, err := w.file.ReadAt(pageData, off+walFrameSize); err != nil {
 				backfillErr = err
 				break

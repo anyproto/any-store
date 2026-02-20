@@ -649,8 +649,7 @@ func (bt *btree) searchInterior(pg *page, key []byte) (childPgno uint32, cellIdx
 }
 
 // Get looks up a key in the B-tree and returns its value.
-// The returned slice points directly into the page buffer and is only valid
-// until the read transaction ends or any write operation occurs.
+// The returned slice is a copy and is safe to retain after the page is released.
 func (bt *btree) Get(key []byte) ([]byte, error) {
 	maxFrame, slot, err := bt.pager.beginRead()
 	if err != nil {
@@ -698,7 +697,7 @@ func (bt *btree) Get(key []byte) ([]byte, error) {
 				}
 				return fullVal, nil
 			}
-			return cell.value, nil
+			return append([]byte(nil), cell.value...), nil
 		}
 
 		// Interior page - descend
@@ -2029,6 +2028,10 @@ func (bt *btree) countPage(pgno uint32) (int, error) {
 const btCursorMaxDepth = 20
 
 // Cursor provides ordered iteration over a B-tree.
+// The leaf frame keeps its page pinned (pg != nil) so that Key/Value can
+// read directly from the page buffer without re-acquiring it. Interior
+// frames release their pages after extracting child pointers. Close()
+// must be called when the cursor is no longer needed.
 type Cursor struct {
 	bt    *btree
 	stack []cursorFrame
@@ -2038,10 +2041,28 @@ type Cursor struct {
 type cursorFrame struct {
 	pgno    uint32
 	cellIdx int
+	pg      *page // pinned page (non-nil only for the leaf frame)
+}
+
+// Close releases all pinned pages and invalidates the cursor.
+func (c *Cursor) Close() {
+	c.releasePages()
+	c.valid = false
+}
+
+// releasePages releases all pinned pages in the cursor stack.
+func (c *Cursor) releasePages() {
+	for i := range c.stack {
+		if c.stack[i].pg != nil {
+			c.bt.pager.releasePage(c.stack[i].pg)
+			c.stack[i].pg = nil
+		}
+	}
 }
 
 // First positions the cursor at the first (smallest) key.
 func (c *Cursor) First() error {
+	c.releasePages()
 	c.stack = c.stack[:0]
 	c.valid = false
 
@@ -2076,15 +2097,17 @@ func (c *Cursor) First() error {
 	}
 
 	if pg.header.cellCount > 0 {
-		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: 0})
+		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: 0, pg: pg})
 		c.valid = true
+	} else {
+		c.bt.pager.releasePage(pg)
 	}
-	c.bt.pager.releasePage(pg)
 	return nil
 }
 
 // Last positions the cursor at the last (largest) key.
 func (c *Cursor) Last() error {
+	c.releasePages()
 	c.stack = c.stack[:0]
 	c.valid = false
 
@@ -2112,15 +2135,17 @@ func (c *Cursor) Last() error {
 
 	n := int(pg.header.cellCount)
 	if n > 0 {
-		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: n - 1})
+		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: n - 1, pg: pg})
 		c.valid = true
+	} else {
+		c.bt.pager.releasePage(pg)
 	}
-	c.bt.pager.releasePage(pg)
 	return nil
 }
 
 // Seek positions the cursor at the first key >= the given key.
 func (c *Cursor) Seek(key []byte) error {
+	c.releasePages()
 	c.stack = c.stack[:0]
 	c.valid = false
 
@@ -2154,7 +2179,7 @@ func (c *Cursor) Seek(key []byte) error {
 		return serr
 	}
 	if idx < int(pg.header.cellCount) {
-		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: idx})
+		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: idx, pg: pg})
 		c.valid = true
 	} else {
 		// Need to go to next leaf via parent
@@ -2163,30 +2188,27 @@ func (c *Cursor) Seek(key []byte) error {
 		return c.Next()
 	}
 
-	c.bt.pager.releasePage(pg)
 	return nil
 }
 
 // Key returns the current key.
-// The returned slice points directly into the page buffer and is only valid
-// until the next cursor movement, transaction end, or any write operation.
+// The returned slice points directly into the pinned page buffer and is valid
+// until the next cursor movement or Close(). Equivalent to sqlite3BtreePayloadFetch.
 func (c *Cursor) Key() ([]byte, error) {
 	if !c.valid {
 		return nil, ErrKeyNotFound
 	}
 
-	frame := c.stack[len(c.stack)-1]
-	pg, err := c.bt.getPage(frame.pgno)
-	if err != nil {
-		return nil, err
+	frame := &c.stack[len(c.stack)-1]
+	if frame.pg == nil {
+		return nil, ErrCorrupt
 	}
-	defer c.bt.pager.releasePage(pg)
 
-	off, oerr := pg.getCellOffsetSafe(frame.cellIdx)
+	off, oerr := frame.pg.getCellOffsetSafe(frame.cellIdx)
 	if oerr != nil {
 		return nil, oerr
 	}
-	cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), c.bt.usablePageSize())
+	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), c.bt.usablePageSize())
 	if cerr != nil {
 		return nil, cerr
 	}
@@ -2194,27 +2216,25 @@ func (c *Cursor) Key() ([]byte, error) {
 }
 
 // Value returns the current value.
-// For non-overflow values, the returned slice points directly into the page buffer
-// and is only valid until the next cursor movement or transaction end.
+// For non-overflow values, the returned slice points directly into the pinned
+// page buffer and is valid until the next cursor movement or Close().
 // For overflow values, a new slice is allocated and returned.
 func (c *Cursor) Value() ([]byte, error) {
 	if !c.valid {
 		return nil, ErrKeyNotFound
 	}
 
-	frame := c.stack[len(c.stack)-1]
-	pg, err := c.bt.getPage(frame.pgno)
-	if err != nil {
-		return nil, err
+	frame := &c.stack[len(c.stack)-1]
+	if frame.pg == nil {
+		return nil, ErrCorrupt
 	}
-	defer c.bt.pager.releasePage(pg)
 
 	usableSize := c.bt.usablePageSize()
-	off, oerr := pg.getCellOffsetSafe(frame.cellIdx)
+	off, oerr := frame.pg.getCellOffsetSafe(frame.cellIdx)
 	if oerr != nil {
 		return nil, oerr
 	}
-	cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), usableSize)
 	if cerr != nil {
 		return nil, cerr
 	}
@@ -2222,12 +2242,12 @@ func (c *Cursor) Value() ([]byte, error) {
 	if cell.overflowPg != 0 {
 		// Read full valLen to compute overflow size
 		pos := int(off)
-		keyLen, kn, verr := getVarintSafe(pg.data[pos:])
+		keyLen, kn, verr := getVarintSafe(frame.pg.data[pos:])
 		if verr != nil {
 			return nil, ErrCorrupt
 		}
 		pos += kn + int(keyLen)
-		valLen, _, verr := getVarintSafe(pg.data[pos:])
+		valLen, _, verr := getVarintSafe(frame.pg.data[pos:])
 		if verr != nil {
 			return nil, ErrCorrupt
 		}
@@ -2246,6 +2266,71 @@ func (c *Cursor) Value() ([]byte, error) {
 	return cell.value, nil
 }
 
+// AppendKey appends the current key to b and returns the result.
+// This is the safe-copy path (equivalent to sqlite3BtreePayload).
+func (c *Cursor) AppendKey(b []byte) ([]byte, error) {
+	if !c.valid {
+		return b, ErrKeyNotFound
+	}
+	frame := &c.stack[len(c.stack)-1]
+	if frame.pg == nil {
+		return b, ErrCorrupt
+	}
+	off, oerr := frame.pg.getCellOffsetSafe(frame.cellIdx)
+	if oerr != nil {
+		return b, oerr
+	}
+	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), c.bt.usablePageSize())
+	if cerr != nil {
+		return b, cerr
+	}
+	return append(b, cell.key...), nil
+}
+
+// AppendValue appends the current value to b and returns the result.
+// For overflow values, reads the full chain. This is the safe-copy path.
+func (c *Cursor) AppendValue(b []byte) ([]byte, error) {
+	if !c.valid {
+		return b, ErrKeyNotFound
+	}
+	frame := &c.stack[len(c.stack)-1]
+	if frame.pg == nil {
+		return b, ErrCorrupt
+	}
+	usableSize := c.bt.usablePageSize()
+	off, oerr := frame.pg.getCellOffsetSafe(frame.cellIdx)
+	if oerr != nil {
+		return b, oerr
+	}
+	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), usableSize)
+	if cerr != nil {
+		return b, cerr
+	}
+	if cell.overflowPg != 0 {
+		pos := int(off)
+		keyLen, kn, verr := getVarintSafe(frame.pg.data[pos:])
+		if verr != nil {
+			return b, ErrCorrupt
+		}
+		pos += kn + int(keyLen)
+		valLen, _, verr := getVarintSafe(frame.pg.data[pos:])
+		if verr != nil {
+			return b, ErrCorrupt
+		}
+		start := len(b)
+		b = append(b, make([]byte, int(valLen))...)
+		fullVal := b[start:]
+		copy(fullVal, cell.value)
+		if overflowSize := int(valLen) - len(cell.value); overflowSize > 0 {
+			if err := c.bt.pager.readOverflowChainAt(cell.overflowPg, fullVal[len(cell.value):], c.bt.walMaxFrame); err != nil {
+				return b[:start], err
+			}
+		}
+		return b, nil
+	}
+	return append(b, cell.value...), nil
+}
+
 // Next advances the cursor to the next key in order.
 func (c *Cursor) Next() error {
 	if !c.valid && len(c.stack) == 0 {
@@ -2255,25 +2340,26 @@ func (c *Cursor) Next() error {
 	for len(c.stack) > 0 {
 		frame := &c.stack[len(c.stack)-1]
 
+		// Leaf frame: the page is pinned in frame.pg.
+		if frame.pg != nil {
+			frame.cellIdx++
+			if frame.cellIdx < int(frame.pg.header.cellCount) {
+				c.valid = true
+				return nil
+			}
+			// Past end of this leaf — release pinned page, pop frame, go up.
+			c.bt.pager.releasePage(frame.pg)
+			frame.pg = nil
+			c.stack = c.stack[:len(c.stack)-1]
+			continue
+		}
+
+		// Interior frame: re-acquire page to read child pointers.
 		pg, err := c.bt.getPage(frame.pgno)
 		if err != nil {
 			return err
 		}
 
-		if pg.header.isLeaf() {
-			frame.cellIdx++
-			if frame.cellIdx < int(pg.header.cellCount) {
-				c.valid = true
-				c.bt.pager.releasePage(pg)
-				return nil
-			}
-			// Pop leaf and go up
-			c.bt.pager.releasePage(pg)
-			c.stack = c.stack[:len(c.stack)-1]
-			continue
-		}
-
-		// Interior page: descend to the next child
 		frame.cellIdx++
 		var childPgno uint32
 		if frame.cellIdx < int(pg.header.cellCount) {
@@ -2321,9 +2407,8 @@ func (c *Cursor) Next() error {
 		}
 
 		if childPg.header.cellCount > 0 {
-			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: 0})
+			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: 0, pg: childPg})
 			c.valid = true
-			c.bt.pager.releasePage(childPg)
 			return nil
 		}
 		c.bt.pager.releasePage(childPg)
@@ -2346,27 +2431,27 @@ func (c *Cursor) Previous() error {
 	for len(c.stack) > 0 {
 		frame := &c.stack[len(c.stack)-1]
 
+		// Leaf frame: the page is pinned in frame.pg.
+		if frame.pg != nil {
+			frame.cellIdx--
+			if frame.cellIdx >= 0 {
+				c.valid = true
+				return nil
+			}
+			// Past the beginning of this leaf — release pinned page, pop, go up.
+			c.bt.pager.releasePage(frame.pg)
+			frame.pg = nil
+			c.stack = c.stack[:len(c.stack)-1]
+			continue
+		}
+
+		// Interior frame: re-acquire page to read child pointers.
 		pg, err := c.bt.getPage(frame.pgno)
 		if err != nil {
 			return err
 		}
 
-		if pg.header.isLeaf() {
-			frame.cellIdx--
-			if frame.cellIdx >= 0 {
-				c.valid = true
-				c.bt.pager.releasePage(pg)
-				return nil
-			}
-			// Past the beginning of this leaf — pop and go up
-			c.bt.pager.releasePage(pg)
-			c.stack = c.stack[:len(c.stack)-1]
-			continue
-		}
-
-		// Interior page: descend to the previous child's rightmost leaf.
-		// frame.cellIdx tracks which child subtree we just exhausted.
-		// Decrement to find the previous child.
+		// Descend to the previous child's rightmost leaf.
 		frame.cellIdx--
 		if frame.cellIdx < 0 {
 			// No more children to the left at this interior level — pop up
@@ -2421,9 +2506,8 @@ func (c *Cursor) Previous() error {
 		n := int(childPg.header.cellCount)
 		if n > 0 {
 			// Position at the last cell of this leaf
-			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: n - 1})
+			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: n - 1, pg: childPg})
 			c.valid = true
-			c.bt.pager.releasePage(childPg)
 			return nil
 		}
 		c.bt.pager.releasePage(childPg)

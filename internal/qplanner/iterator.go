@@ -14,6 +14,9 @@ type Iterator interface {
 	// Next advances to the next result. Returns false when exhausted or on error.
 	Next() (key []byte, docId []byte, err error)
 
+	// Close releases any resources held by this iterator (e.g. btree cursors).
+	Close()
+
 	// String returns a human-readable description of this iterator (for explain).
 	fmt.Stringer
 }

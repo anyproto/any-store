@@ -656,6 +656,7 @@ func (c *collection) buildIndex(tx *btree.WriteTx, idx *index) error {
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	cursor := tx.NewCursor(c.ns)
+	defer cursor.Close()
 	if err := cursor.First(); err != nil {
 		return err
 	}
