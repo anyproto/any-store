@@ -213,14 +213,13 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	modBuf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(modBuf)
 
+	var getErr error
 	for _, id := range idsToUpdate {
-		val, getErr := btx.Get(q.c.ns, id)
+		buf.DocBuf, getErr = btx.AppendValue(q.c.ns, id, buf.DocBuf[:0])
 		if getErr != nil {
 			err = getErr
 			return
 		}
-
-		buf.DocBuf = append(buf.DocBuf[:0], val...)
 		doc, parseErr := buf.Parser.Parse(buf.DocBuf)
 		if parseErr != nil {
 			err = parseErr

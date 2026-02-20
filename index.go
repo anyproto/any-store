@@ -124,12 +124,15 @@ func (idx *index) Len(ctx context.Context) (count int, err error) {
 func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 	idx.fillKeysBuf(it)
 	idKey := it.appendId(nil)
+	var valueBuf []byte
 	for _, key := range idx.keysBuf {
 		if idx.info.Unique {
 			// For unique indexes: key = Tuple(v1, v2, ...), value = docId
 			// Check if key already exists with a different docId
-			if existingVal, err := tx.Get(idx.ns, key); err == nil {
-				if !bytes.Equal(existingVal, idKey) {
+			var err error
+			valueBuf, err = tx.AppendValue(idx.ns, key, valueBuf[:0])
+			if err == nil {
+				if !bytes.Equal(valueBuf, idKey) {
 					return ErrUniqueConstraint
 				}
 				continue

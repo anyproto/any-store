@@ -166,14 +166,13 @@ func (c *collection) FindIdWithParser(ctx context.Context, p *anyenc.Parser, doc
 
 	buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], docId)
 	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
-		val, err := tx.Get(c.ns, buf.SmallBuf)
+		buf.DocBuf, err = tx.AppendValue(c.ns, buf.SmallBuf, buf.DocBuf[:0])
 		if err != nil {
 			if errors.Is(err, btree.ErrKeyNotFound) {
 				return ErrDocNotFound
 			}
 			return err
 		}
-		buf.DocBuf = append(buf.DocBuf[:0], val...)
 		data, err := p.Parse(buf.DocBuf)
 		doc = item{val: data}
 		return
@@ -375,14 +374,13 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 }
 
 func (c *collection) loadById(tx *btree.WriteTx, buf *syncpool.DocBuffer, id anyenc.Tuple) (it item, err error) {
-	val, err := tx.Get(c.ns, id)
+	buf.DocBuf, err = tx.AppendValue(c.ns, id, buf.DocBuf[:0])
 	if err != nil {
 		if errors.Is(err, btree.ErrKeyNotFound) {
 			return item{}, ErrDocNotFound
 		}
 		return
 	}
-	buf.DocBuf = append(buf.DocBuf[:0], val...)
 	doc, err := buf.Parser.Parse(buf.DocBuf)
 	if err != nil {
 		return
@@ -690,7 +688,7 @@ func (c *collection) loadSketch(tx *btree.ReadTx, idx *index) {
 	skSize := qplanner.DefaultSketchSize
 	idx.sketch = qplanner.NewIndexSketch(skSize)
 	key := sketchKey(c.name, idx.info.Name)
-	data, err := tx.Get(c.db.systemNS, key)
+	data, err := tx.AppendValue(c.db.systemNS, key, nil)
 	if err != nil {
 		// No sketch data yet — start with empty sketch
 		return
@@ -715,14 +713,13 @@ func (c *collection) persistSketches(tx *btree.WriteTx) error {
 
 // loadByIdRead loads a document by ID using a read transaction
 func (c *collection) loadByIdRead(tx *btree.ReadTx, buf *syncpool.DocBuffer, id anyenc.Tuple) (it item, err error) {
-	val, err := tx.Get(c.ns, id)
+	buf.DocBuf, err = tx.AppendValue(c.ns, id, buf.DocBuf[:0])
 	if err != nil {
 		if errors.Is(err, btree.ErrKeyNotFound) {
 			return item{}, ErrDocNotFound
 		}
 		return
 	}
-	buf.DocBuf = append(buf.DocBuf[:0], val...)
 	doc, err := buf.Parser.Parse(buf.DocBuf)
 	if err != nil {
 		return

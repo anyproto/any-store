@@ -101,7 +101,7 @@ func (e *btreeEngine) Get(index int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	val, err := tx.Get(e.ns, makeKey(index))
+	val, err := tx.AppendValue(e.ns, makeKey(index), nil)
 	_ = tx.Rollback()
 	return val, err
 }
