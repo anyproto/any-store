@@ -1074,7 +1074,7 @@ func TestIndex_Corruption_CrashRecoveryWithIndex(t *testing.T) {
 }
 
 // TestIndex_Corruption_PersistenceAfterUncleanClose verifies that indexes
-// survive an unclean close (NoSync mode) and WAL recovery restores them.
+// survive an unclean close (NoCommitSync mode) and WAL recovery restores them.
 func TestIndex_Corruption_PersistenceAfterUncleanClose(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "idx-unclean-*")
 	require.NoError(t, err)
@@ -1082,9 +1082,9 @@ func TestIndex_Corruption_PersistenceAfterUncleanClose(t *testing.T) {
 
 	dbPath := filepath.Join(tmpDir, "test.db")
 
-	// Phase 1: insert data with index using NoSync
+	// Phase 1: insert data with index using NoCommitSync
 	func() {
-		conf := &Config{NoSync: true}
+		conf := &Config{NoCommitSync: true}
 		db, err := Open(ctx, dbPath, conf)
 		require.NoError(t, err)
 
@@ -1319,7 +1319,7 @@ func TestIndex_Corruption_CrashRecoveryMultipleIndexes(t *testing.T) {
 
 	// Phase 1
 	func() {
-		db, err := Open(ctx, dbPath, &Config{NoSync: true})
+		db, err := Open(ctx, dbPath, &Config{NoCommitSync: true})
 		require.NoError(t, err)
 
 		coll, err := db.CreateCollection(ctx, "test")

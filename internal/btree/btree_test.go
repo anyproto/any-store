@@ -1058,7 +1058,7 @@ func TestCursorNextOnInvalid(t *testing.T) {
 // Returns pager and cleanup function that properly ends transactions.
 func tempPager(t *testing.T) *pager {
 	t.Helper()
-	p := newPager(filepath.Join(t.TempDir(), "t.db"), 4096, 100)
+	p := newPager(filepath.Join(t.TempDir(), "t.db"), 4096, 100, true)
 	require.NoError(t, p.open())
 	_, slot, err := p.beginRead()
 	require.NoError(t, err)

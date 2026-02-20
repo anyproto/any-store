@@ -889,15 +889,18 @@ type wal struct {
 	// inProcess uses heap-backed shm instead of mmap+fcntl (faster, single-process only)
 	inProcess bool
 
-	// noSync skips fdatasync on WAL commit (like SQLite synchronous=normal)
-	noSync bool
+	// noCommitSync skips fdatasync on WAL commit (like SQLite synchronous=normal)
+	noCommitSync bool
+
+	// inMemory keeps the entire WAL in memory with no WAL file
+	inMemory bool
 
 	// busyHandler is an optional callback invoked when lock acquisition fails.
 	// If nil, lock failures return ErrBusy immediately (issue 1.7).
 	busyHandler BusyHandler
 
-	// memFrames stores page data in memory for InProcess+NoSync mode,
-	// eliminating per-commit file I/O. Frames are flushed to disk on checkpoint.
+	// memFrames stores page data in memory for InMemory mode,
+	// eliminating per-commit file I/O. Frames are flushed to pcache on checkpoint.
 	memFrames []memFrame
 
 	// memArena is a pre-allocated byte pool for memFrame data to avoid
@@ -924,6 +927,18 @@ func newWal(path string, pageSize uint32) *wal {
 func (w *wal) open() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	if w.inMemory {
+		// InMemory mode: no WAL file, heap-backed everything
+		idx, err := newWalIndex(w.path+"-shm", true)
+		if err != nil {
+			return err
+		}
+		w.index = idx
+		w.initHeaderState()
+		w.memFrames = make([]memFrame, 0, 1024)
+		return nil
+	}
 
 	f, err := os.OpenFile(w.path, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
@@ -967,10 +982,6 @@ func (w *wal) open() error {
 	// is empty/deleted and only populated when the first write commits.
 	w.initHeaderState()
 
-	// Enable in-memory WAL for InProcess+NoSync (no per-commit file I/O)
-	if w.inProcess && w.noSync {
-		w.memFrames = make([]memFrame, 0, 1024)
-	}
 	return nil
 }
 
@@ -1173,9 +1184,9 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		return nil
 	}
 
-	// Fast path: in-memory WAL for InProcess+NoSync mode.
+	// Fast path: in-memory WAL for InMemory mode.
 	// Stores page data in memory, skipping file I/O and checksums entirely.
-	if w.memFrames != nil {
+	if w.inMemory {
 		return w.writeFramesMem(pages, commit, dbSize)
 	}
 
@@ -1249,7 +1260,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 			w.index.maxPage = dbSize
 			w.index.mu.Unlock()
 		}
-		if !w.noSync {
+		if !w.noCommitSync {
 			if err := fdatasync(w.file); err != nil {
 				return err
 			}
@@ -1331,8 +1342,10 @@ func (w *wal) readFrame(frame uint32, buf []byte) error {
 	if frame == 0 || frame > nf {
 		return ErrWALCorrupt
 	}
-	// Fast path: read from in-memory frames (needs RLock for slice access)
-	if w.memFrames != nil {
+	// Fast path: read from in-memory frames (needs RLock for slice access).
+	// Use the immutable inMemory flag instead of checking the mutable memFrames
+	// slice header to avoid a data race with writeFramesMem's append.
+	if w.inMemory {
 		w.mu.RLock()
 		idx := frame - 1
 		if idx < uint32(len(w.memFrames)) {
@@ -1437,16 +1450,15 @@ func (w *wal) endWrite() {
 }
 
 // checkpoint writes WAL frames back to the database file.
-// The old signature is preserved for backward compatibility; it performs
-// a CheckpointFull (the previous default behavior).
-func (w *wal) checkpoint(dbFile *os.File) error {
-	return w.checkpointWithMode(dbFile, CheckpointFull, nil)
+// For InMemory databases, cache is used to store checkpointed pages instead of dbFile.
+func (w *wal) checkpoint(dbFile *os.File, cache *pcache) error {
+	return w.checkpointWithMode(dbFile, cache, CheckpointFull, nil)
 }
 
 // checkpointPassive performs a passive checkpoint that never blocks.
 // Used by auto-checkpoint (issue 6.2) to avoid blocking writers or readers.
-func (w *wal) checkpointPassive(dbFile *os.File) error {
-	return w.checkpointWithMode(dbFile, CheckpointPassive, nil)
+func (w *wal) checkpointPassive(dbFile *os.File, cache *pcache) error {
+	return w.checkpointWithMode(dbFile, cache, CheckpointPassive, nil)
 }
 
 // checkpointWithMode writes WAL frames back to the database file using
@@ -1462,7 +1474,7 @@ func (w *wal) checkpointPassive(dbFile *os.File) error {
 //
 // The busy handler (issue 1.7 + 6.3) is invoked when waiting for reader locks
 // in FULL/RESTART/TRUNCATE modes. In PASSIVE mode it is never called.
-func (w *wal) checkpointWithMode(dbFile *os.File, mode CheckpointMode, xBusy BusyHandler) error {
+func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode CheckpointMode, xBusy BusyHandler) error {
 	// Acquire checkpoint lock -- serialize concurrent checkpoints.
 	// The busy handler is NOT used for the checkpoint lock itself, matching
 	// SQLite: "Even if there is a busy-handler configured, it will not be
@@ -1589,7 +1601,7 @@ func (w *wal) checkpointWithMode(dbFile *os.File, mode CheckpointMode, xBusy Bus
 	// Sync the WAL file before copying frames to the database, matching
 	// SQLite's walCheckpoint(). This ensures all WAL data is durable on disk
 	// before we start overwriting the database file with it.
-	if !w.noSync && w.file != nil {
+	if !w.noCommitSync && w.file != nil {
 		if err := fdatasync(w.file); err != nil {
 			_ = w.index.unlock(lockRead0, lockExclusive)
 			return err
@@ -1600,13 +1612,28 @@ func (w *wal) checkpointWithMode(dbFile *os.File, mode CheckpointMode, xBusy Bus
 	pageSz := int64(w.pageSize)
 	var backfillErr error
 
-	if w.memFrames != nil {
+	if w.inMemory {
 		for i := nBackfill; i < mxSafeFrame; i++ {
 			mf := &w.memFrames[i]
-			pageOffset := int64(mf.pgno-1) * pageSz
-			if _, err := dbFile.WriteAt(mf.data, pageOffset); err != nil {
-				backfillErr = err
-				break
+			if dbFile != nil {
+				// Disk mode: write to DB file
+				pageOffset := int64(mf.pgno-1) * pageSz
+				if _, err := dbFile.WriteAt(mf.data, pageOffset); err != nil {
+					backfillErr = err
+					break
+				}
+			} else if cache != nil {
+				// InMemory mode: write to pcache
+				pg := cache.create(mf.pgno)
+				copy(pg.data, mf.data)
+				off := 0
+				if mf.pgno == 1 {
+					off = dbHeaderSize
+				}
+				if pg.data[off] != 0 {
+					pg.header.deserialize(pg.data[off:])
+				}
+				cache.release(pg)
 			}
 		}
 	} else {
@@ -1641,10 +1668,12 @@ func (w *wal) checkpointWithMode(dbFile *os.File, mode CheckpointMode, xBusy Bus
 		return backfillErr
 	}
 
-	// Sync the database file
-	if err := fdatasync(dbFile); err != nil {
-		_ = w.index.unlock(lockRead0, lockExclusive)
-		return err
+	// Sync the database file (skip for InMemory)
+	if dbFile != nil {
+		if err := fdatasync(dbFile); err != nil {
+			_ = w.index.unlock(lockRead0, lockExclusive)
+			return err
+		}
 	}
 
 	// Update nBackfill
@@ -1752,7 +1781,7 @@ func (w *wal) tryResetWALWithBusy(xBusy BusyHandler, truncate bool) error {
 // If truncate is true, the WAL file is truncated to zero bytes (CheckpointTruncate).
 // If false, the WAL is just restarted with a new header (CheckpointRestart).
 func (w *wal) doResetWAL(truncate bool) error {
-	if truncate {
+	if truncate && w.file != nil {
 		// CheckpointTruncate: truncate WAL file to zero bytes
 		if err := w.file.Truncate(0); err != nil {
 			return err
@@ -1763,9 +1792,15 @@ func (w *wal) doResetWAL(truncate bool) error {
 	w.nFrame.Store(0)
 
 	// Reset memFrames and arena for reuse
-	if w.memFrames != nil {
+	if w.inMemory {
 		w.memFrames = w.memFrames[:0]
 		w.memArenaOff = 0
+	}
+
+	if w.inMemory {
+		// InMemory: just reinitialize header state, no disk write
+		w.initHeaderState()
+		return nil
 	}
 
 	return w.writeHeader()

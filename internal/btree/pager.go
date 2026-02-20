@@ -82,8 +82,11 @@ type pager struct {
 	// inProcess uses heap-backed shm (faster, single-process only)
 	inProcess bool
 
-	// noSync skips fdatasync on WAL commit (deferred durability)
-	noSync bool
+	// noCommitSync skips fdatasync on WAL commit (deferred durability)
+	noCommitSync bool
+
+	// inMemory keeps the entire database in memory with no files on disk
+	inMemory bool
 }
 
 // savepointState captures the state needed to rollback to a savepoint.
@@ -96,11 +99,12 @@ type savepointState struct {
 }
 
 // newPager creates a new pager for the given database path.
-func newPager(path string, pageSize uint32, cacheSize int) *pager {
+// purgeable controls whether the page cache can evict pages (false for InMemory databases).
+func newPager(path string, pageSize uint32, cacheSize int, purgeable bool) *pager {
 	return &pager{
 		path:     path,
 		pageSize: pageSize,
-		cache:    newPcache(int(pageSize), cacheSize),
+		cache:    newPcache(int(pageSize), cacheSize, purgeable),
 	}
 }
 
@@ -108,6 +112,11 @@ func newPager(path string, pageSize uint32, cacheSize int) *pager {
 func (p *pager) open() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	if p.inMemory {
+		// In-memory database: no file on disk
+		return p.initNewDB()
+	}
 
 	f, err := os.OpenFile(p.path, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
@@ -141,12 +150,13 @@ func (p *pager) open() error {
 
 	p.pageSize = p.header.PageSize
 	p.dbSize = p.header.DatabaseSize
-	p.cache = newPcache(int(p.pageSize), p.cache.maxPages)
+	p.cache = newPcache(int(p.pageSize), p.cache.maxPages, p.cache.purgeable)
 
 	// Open WAL
 	p.wal = newWal(p.path+"-wal", p.pageSize)
 	p.wal.inProcess = p.inProcess
-	p.wal.noSync = p.noSync
+	p.wal.noCommitSync = p.noCommitSync
+	p.wal.inMemory = p.inMemory
 	p.wal.busyHandler = DefaultBusyTimeout(5 * time.Second)
 	if err := p.wal.open(); err != nil {
 		return err
@@ -198,20 +208,32 @@ func (p *pager) initNewDB() error {
 	buf[hdrOff+6] = byte(usable)      // cell content offset (low byte)
 	buf[hdrOff+7] = 0                 // fragmented free bytes
 
-	if _, err := p.file.WriteAt(buf, 0); err != nil {
-		return err
-	}
-	if err := p.file.Sync(); err != nil {
-		return err
+	if p.file != nil {
+		if _, err := p.file.WriteAt(buf, 0); err != nil {
+			return err
+		}
+		if err := p.file.Sync(); err != nil {
+			return err
+		}
 	}
 
 	p.dbSize = 1
-	p.cache = newPcache(int(p.pageSize), p.cache.maxPages)
+	p.cache = newPcache(int(p.pageSize), p.cache.maxPages, p.cache.purgeable)
+
+	// For inMemory mode, pre-populate page 1 in pcache so reads find it
+	if p.inMemory {
+		pg := p.cache.create(1)
+		copy(pg.data, buf)
+		off := dbHeaderSize
+		pg.header.deserialize(pg.data[off:])
+		p.cache.release(pg)
+	}
 
 	// Open WAL
 	p.wal = newWal(p.path+"-wal", p.pageSize)
 	p.wal.inProcess = p.inProcess
-	p.wal.noSync = p.noSync
+	p.wal.noCommitSync = p.noCommitSync
+	p.wal.inMemory = p.inMemory
 	p.wal.busyHandler = DefaultBusyTimeout(5 * time.Second)
 	if err := p.wal.open(); err != nil {
 		return err
@@ -324,15 +346,21 @@ func (p *pager) getPageAt(pgno, walMaxFrame uint32) (*page, error) {
 	}
 
 	// Read from database file
-	offset := int64(pgno-1) * int64(p.pageSize)
-	_, err := p.file.ReadAt(pg.data, offset)
-	if err != nil {
-		// If page is beyond current file but within dbSize, it's a new page
-		if pgno <= p.dbSize {
-			p.cache.release(pg)
-			return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
+	if p.file != nil {
+		offset := int64(pgno-1) * int64(p.pageSize)
+		_, err := p.file.ReadAt(pg.data, offset)
+		if err != nil {
+			// If page is beyond current file but within dbSize, it's a new page
+			if pgno <= p.dbSize {
+				p.cache.release(pg)
+				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
+			}
+			// Zero-fill new pages
+			clear(pg.data)
 		}
-		// Zero-fill new pages
+	} else {
+		// InMemory: no file; zero-fill new pages (existing pages should
+		// have been found in cache above or in the WAL)
 		clear(pg.data)
 	}
 
@@ -380,13 +408,23 @@ func (p *pager) readPageUncached(pgno, walMaxFrame uint32) (*page, error) {
 	}
 
 	// Read from database file
-	offset := int64(pgno-1) * int64(p.pageSize)
-	_, err := p.file.ReadAt(pg.data, offset)
-	if err != nil {
-		if pgno <= p.dbSize {
-			return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
+	if p.file != nil {
+		offset := int64(pgno-1) * int64(p.pageSize)
+		_, err := p.file.ReadAt(pg.data, offset)
+		if err != nil {
+			if pgno <= p.dbSize {
+				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
+			}
+			clear(pg.data)
 		}
-		clear(pg.data)
+	} else {
+		// InMemory: no file; try pcache for checkpointed data (copy to preserve MVCC isolation)
+		if cached := p.cache.fetch(pgno); cached != nil {
+			copy(pg.data, cached.data)
+			p.cache.release(cached)
+		} else {
+			clear(pg.data)
+		}
 	}
 
 	off := 0
@@ -759,18 +797,40 @@ func (p *pager) getHasContent(pgno uint32) bool {
 // get the latest page 1 data. Falls back to the database file if page 1 is
 // not in the WAL. This bypasses both the page cache and the in-process WAL
 // index to ensure cross-process visibility.
+//
+// For inProcess mode (heap SHM), the in-process Go map (walIndex.get) is used
+// instead of shmHashGet to avoid data races on the raw SHM byte regions.
+// The SHM hash tables are written without synchronization (best-effort for
+// cross-process readers), but in single-process mode the Go map with its
+// RWMutex provides safe concurrent access.
 func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaCookie uint32, err error) {
 	// Determine the effective max frame by checking the SHM header,
 	// which reflects writes from ALL processes sharing this database.
+	// For inProcess mode, the SHM header is not updated by writers
+	// (writeFrames skips writeHeader when inProcess=true), so we use
+	// the in-process walIndex.maxFrame directly.
 	effectiveMaxFrame := walMaxFrame
-	if hdr, valid := p.wal.index.readHeader(); valid && hdr.mxFrame > effectiveMaxFrame {
+	if p.inProcess {
+		p.wal.index.mu.RLock()
+		if p.wal.index.maxFrame > effectiveMaxFrame {
+			effectiveMaxFrame = p.wal.index.maxFrame
+		}
+		p.wal.index.mu.RUnlock()
+	} else if hdr, valid := p.wal.index.readHeader(); valid && hdr.mxFrame > effectiveMaxFrame {
 		effectiveMaxFrame = hdr.mxFrame
 	}
 
-	// Look up page 1's latest frame using SHM hash tables.
-	// shmHashGet reads the cross-process SHM, not the in-process Go map.
+	// Look up page 1's latest frame.
+	// For inProcess mode, use the Go map (walIndex.get) which is protected by
+	// a RWMutex, avoiding data races on the unsynchronized SHM byte regions.
+	// For multi-process mode, use shmHashGet which reads the cross-process SHM.
 	if effectiveMaxFrame > 0 {
-		frame := p.wal.index.shmHashGet(1, effectiveMaxFrame)
+		var frame uint32
+		if p.inProcess {
+			frame = p.wal.index.get(1, effectiveMaxFrame)
+		} else {
+			frame = p.wal.index.shmHashGet(1, effectiveMaxFrame)
+		}
 		if frame > 0 {
 			buf := make([]byte, dbHeaderSize)
 			if err := p.readWalFrameData(frame, buf); err == nil {
@@ -780,6 +840,16 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 	}
 
 	// No WAL frame for page 1; read from database file.
+	if p.file == nil {
+		// InMemory: page 1 is in pcache; read header from there.
+		if pg := p.cache.fetch(1); pg != nil {
+			fcc := binary.BigEndian.Uint32(pg.data[24:28])
+			sc := binary.BigEndian.Uint32(pg.data[40:44])
+			p.cache.release(pg)
+			return fcc, sc, nil
+		}
+		return p.header.FileChangeCount, p.header.SchemaCookie, nil
+	}
 	buf := make([]byte, dbHeaderSize)
 	if _, err := p.file.ReadAt(buf, 0); err != nil {
 		return 0, 0, err
@@ -790,10 +860,11 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 // readWalFrameData reads the first `len(buf)` bytes of page data from a WAL
 // frame. Unlike wal.readFrame, this does not check the in-process nFrame
 // counter, making it safe for cross-process reads where another process wrote
-// the frame. For in-process+noSync mode (memFrames), it reads from the
-// in-memory frames.
+// the frame. For InMemory mode (memFrames), it reads from the in-memory frames.
 func (p *pager) readWalFrameData(frame uint32, buf []byte) error {
-	if p.wal.memFrames != nil {
+	// Use the immutable inMemory flag instead of checking the mutable memFrames
+	// slice header to avoid a data race with writeFramesMem's append.
+	if p.wal.inMemory {
 		p.wal.mu.RLock()
 		defer p.wal.mu.RUnlock()
 		idx := frame - 1
@@ -1070,20 +1141,20 @@ func (p *pager) releaseSavepoint(id int) error {
 	return nil
 }
 
-// syncWalForCheckpoint syncs the WAL file before checkpoint when noSync=true
+// syncWalForCheckpoint syncs the WAL file before checkpoint when noCommitSync=true
 // (fix 2.7). SQLite's synchronous=NORMAL skips per-commit WAL syncs but still
 // syncs the WAL before checkpoint (wal.c:2260, CKPT_SYNC_FLAGS). Our wal.go
-// guards the pre-checkpoint WAL sync with !w.noSync, making noSync=true
+// guards the pre-checkpoint WAL sync with !w.noCommitSync, making noCommitSync=true
 // equivalent to SQLite's synchronous=OFF rather than NORMAL.
 //
-// This pager-level sync bridges the gap: when noSync=true, the pager syncs
-// the WAL file before delegating to wal.checkpoint(). When noSync=false, the
+// This pager-level sync bridges the gap: when noCommitSync=true, the pager syncs
+// the WAL file before delegating to wal.checkpoint(). When noCommitSync=false, the
 // WAL checkpoint already handles this sync internally, so no extra sync is needed.
 //
 // The sync is best-effort: errors are silently ignored because the checkpoint
 // itself will encounter and report any persistent I/O errors.
 func (p *pager) syncWalForCheckpoint() {
-	if p.wal == nil || p.wal.file == nil || p.wal.memFrames != nil {
+	if p.wal == nil || p.wal.file == nil || p.wal.inMemory {
 		return
 	}
 	_ = fdatasync(p.wal.file)
@@ -1094,19 +1165,19 @@ func (p *pager) syncWalForCheckpoint() {
 // The WAL checkpoint internally acquires lockWrite (blocks new writers)
 // and uses mxSafeFrame to avoid interfering with active readers.
 func (p *pager) checkpoint() error {
-	if p.noSync {
+	if p.noCommitSync {
 		p.syncWalForCheckpoint()
 	}
-	return p.wal.checkpoint(p.file)
+	return p.wal.checkpoint(p.file, p.cache)
 }
 
 // tryCheckpoint attempts a checkpoint. Unlike the old version, this no longer
 // needs TryLock on pager.mu since checkpoint doesn't block readers.
 func (p *pager) tryCheckpoint() error {
-	if p.noSync {
+	if p.noCommitSync {
 		p.syncWalForCheckpoint()
 	}
-	return p.wal.checkpoint(p.file)
+	return p.wal.checkpoint(p.file, p.cache)
 }
 
 // writeOverflowChain writes data to a chain of overflow pages and returns
@@ -1250,15 +1321,19 @@ func (p *pager) close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Checkpoint before closing, then truncate WAL to zero bytes.
-	// SQLite's sqlite3WalClose() does a PASSIVE checkpoint, and if successful,
-	// deletes (or truncates to 0) the WAL file. We truncate to 0 to match
-	// the test expectation that WAL is empty after a clean close.
 	if p.wal != nil {
-		_ = p.wal.checkpoint(p.file)
-		// Truncate WAL file to zero bytes after successful checkpoint,
-		// matching SQLite's walLimitSize(pWal, 0) in sqlite3WalClose().
-		p.wal.truncateFile()
+		if p.inMemory {
+			// InMemory: just reset WAL state, nothing to checkpoint to disk
+		} else {
+			// Checkpoint before closing, then truncate WAL to zero bytes.
+			// SQLite's sqlite3WalClose() does a PASSIVE checkpoint, and if successful,
+			// deletes (or truncates to 0) the WAL file. We truncate to 0 to match
+			// the test expectation that WAL is empty after a clean close.
+			_ = p.wal.checkpoint(p.file, p.cache)
+			// Truncate WAL file to zero bytes after successful checkpoint,
+			// matching SQLite's walLimitSize(pWal, 0) in sqlite3WalClose().
+			p.wal.truncateFile()
+		}
 		_ = p.wal.close()
 	}
 

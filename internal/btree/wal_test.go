@@ -378,7 +378,7 @@ func TestWALCheckpointEmpty(t *testing.T) {
 	require.NoError(t, w.open())
 
 	// Checkpoint with no frames should be no-op
-	require.NoError(t, w.checkpoint(dbFile))
+	require.NoError(t, w.checkpoint(dbFile, nil))
 
 	require.NoError(t, w.close())
 }
@@ -406,7 +406,7 @@ func TestWALCheckpointWritesBack(t *testing.T) {
 	w.endWrite()
 
 	// Checkpoint
-	require.NoError(t, w.checkpoint(dbFile))
+	require.NoError(t, w.checkpoint(dbFile, nil))
 
 	// WAL should be reset
 	assert.Equal(t, uint32(0), w.nFrame.Load())

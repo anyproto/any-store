@@ -120,7 +120,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		PageSize:  4096,
 		CacheSize: 5000,
 		InProcess: false,
-		NoSync:    config.NoSync,
+		NoCommitSync: config.NoCommitSync,
 	}
 
 	var err error
