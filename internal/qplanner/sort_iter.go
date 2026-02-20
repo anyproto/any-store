@@ -3,7 +3,7 @@ package qplanner
 import (
 	"bytes"
 	"fmt"
-	"sort"
+	"slices"
 
 	"github.com/anyproto/any-store/query"
 	"github.com/anyproto/any-store/syncpool"
@@ -12,20 +12,22 @@ import (
 // SortIter collects all results from the source iterator, fetches documents,
 // computes sort keys, sorts in memory, then yields results in sorted order.
 type SortIter struct {
-	Source    Iterator
-	Data      *CursorSource
-	Sorter    query.Sort
-	Buf       *syncpool.DocBuffer
-	PreSorted bool // hint that upstream data is partially sorted (helps quicksort)
+	Source          Iterator
+	Data            *CursorSource
+	Sorter          query.Sort
+	Buf             *syncpool.DocBuffer
+	PartiallySorted bool // leading index fields match sort order; pdqsort benefits automatically
 
+	arena   []byte
 	entries []sortEntry
 	idx     int
 	inited  bool
 }
 
 type sortEntry struct {
-	docId   []byte
-	sortKey []byte
+	off    uint32 // offset into arena
+	keyLen uint16 // total length (sort key + docId suffix)
+	docLen uint16 // docId length (trailing portion)
 }
 
 func (it *SortIter) Next() (key []byte, docId []byte, err error) {
@@ -42,7 +44,28 @@ func (it *SortIter) Next() (key []byte, docId []byte, err error) {
 
 	e := it.entries[it.idx]
 	it.idx++
-	return e.docId, e.docId, nil
+	docId = it.arena[e.off+uint32(e.keyLen)-uint32(e.docLen) : e.off+uint32(e.keyLen)]
+	return docId, docId, nil
+}
+
+// growArena ensures the arena has at least need bytes of free capacity,
+// growing in tiered steps to avoid frequent small reallocations
+// and excessive doubling at large sizes.
+func (it *SortIter) growArena(need int) {
+	if cap(it.arena)-len(it.arena) >= need {
+		return
+	}
+	grow := 100 << 10 // 100KB
+	switch c := cap(it.arena); {
+	case c < 1<<10:
+		grow = 1 << 10 // 1KB
+	case c < 10<<10:
+		grow = 10 << 10 // 10KB
+	}
+	if grow < need {
+		grow = need
+	}
+	it.arena = slices.Grow(it.arena, grow)
 }
 
 func (it *SortIter) collectAndSort() error {
@@ -65,15 +88,20 @@ func (it *SortIter) collectAndSort() error {
 			return perr
 		}
 
-		sk := it.Sorter.AppendKey(nil, doc)
+		it.growArena(256)
+		off := uint32(len(it.arena))
+		it.arena = it.Sorter.AppendKey(it.arena, doc)
+		it.arena = append(it.arena, docId...)
+		keyLen := uint16(len(it.arena) - int(off))
 		it.entries = append(it.entries, sortEntry{
-			docId:   append([]byte(nil), docId...),
-			sortKey: sk,
+			off: off, keyLen: keyLen, docLen: uint16(len(docId)),
 		})
 	}
 
-	sort.SliceStable(it.entries, func(a, b int) bool {
-		return bytes.Compare(it.entries[a].sortKey, it.entries[b].sortKey) < 0
+	slices.SortFunc(it.entries, func(a, b sortEntry) int {
+		ak := it.arena[a.off : a.off+uint32(a.keyLen)]
+		bk := it.arena[b.off : b.off+uint32(b.keyLen)]
+		return bytes.Compare(ak, bk)
 	})
 
 	return nil

@@ -678,7 +678,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 			},
 			Sorter:    params.Sorter,
 			Buf:       params.Buf,
-			PreSorted: idx.PartialSort,
+			PartiallySorted: idx.PartialSort,
 		}
 	}
 
