@@ -273,3 +273,29 @@ func TestOverflowNamespaceDelete(t *testing.T) {
 
 	assert.True(t, db.pager.header.TotalFreelistPgs > 0)
 }
+
+// TestOverflowUpdateInlinePageOverflow reproduces a panic in rebuildLeafPage when
+// updating an existing key's value to something much larger (but still inline).
+// With 4-byte keys and 100-byte values, a leaf page holds exactly 37 cells.
+// Updating one cell from val=100 to val=990 (still inline, 4+990 < maxLocal)
+// causes the total cell content to exceed usableSize. rebuildLeafPage subtracts
+// each cell size from contentOff, which goes negative, resulting in:
+//
+//	panic: runtime error: slice bounds out of range [-N:]
+func TestOverflowUpdateInlinePageOverflow(t *testing.T) {
+	db := tempDB(t)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace("t1")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	// Fill one leaf page with 37 cells (4-byte key + 100-byte value each).
+	putN(t, db, "t1", 37, 100)
+
+	// Update key 1 to a much larger value that still fits inline.
+	// This triggers updateLeafCell → rebuildLeafPage with overflow.
+	updateOne(t, db, "t1", 1, 990)
+
+	require.NoError(t, db.IntegrityCheck())
+}
