@@ -12,14 +12,14 @@ type Config struct {
 	// default value is 2MiB
 	SyncPoolElementMaxSize int
 
-	// NoCommitSync skips fsync on WAL commit (like SQLite synchronous=NORMAL in WAL mode).
-	// Data is still durable at checkpoint time. Reduces write latency at the cost
-	// of losing the last committed transaction(s) on power loss.
-	NoCommitSync bool
+	// CommitSync forces fsync on every WAL commit (like SQLite synchronous=FULL in WAL mode).
+	// When false (default), fsync is deferred to checkpoint time, which reduces write latency
+	// at the cost of losing the last committed transaction(s) on power loss.
+	CommitSync bool
 
 	// InMemory keeps the entire database in memory with no files on disk.
 	// The database does not survive process crashes. When true, InProcess
-	// and NoCommitSync are forced on automatically.
+	// and CommitSync=false are forced on automatically.
 	// The path argument to Open is ignored and can be any string (e.g. ":memory:").
 	InMemory bool
 

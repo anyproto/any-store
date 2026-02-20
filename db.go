@@ -116,7 +116,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		PageSize:     4096,
 		CacheSize:    5000,
 		InProcess:    false,
-		NoCommitSync: config.NoCommitSync,
+		NoCommitSync: !config.CommitSync,
 		InMemory:     config.InMemory,
 	}
 
