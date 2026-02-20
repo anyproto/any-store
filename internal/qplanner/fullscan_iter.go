@@ -18,6 +18,7 @@ type FullScanIter struct {
 	IDBounds query.Bounds
 	Buf      *syncpool.DocBuffer
 	Reverse  bool
+	Plan     *Plan // set by setPlanRef for doc value caching
 
 	cursor  *btree.Cursor
 	started bool
@@ -109,6 +110,9 @@ func (it *FullScanIter) Next() (key []byte, docId []byte, err error) {
 			}
 			if !it.Filter.Ok(doc, it.Buf) {
 				continue
+			}
+			if it.Plan != nil {
+				it.Plan.DocParsed = doc
 			}
 		}
 

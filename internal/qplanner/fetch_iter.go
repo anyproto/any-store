@@ -1,13 +1,18 @@
 package qplanner
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/anyproto/any-store/syncpool"
+)
 
 // FetchIter wraps an index-yielding iterator (which produces docIds)
 // and performs point-lookups in the data namespace to fetch full documents.
-// It caches the fetched value in Plan.DocValue to avoid double-fetch.
+// It parses and caches the result in Plan.DocParsed to avoid double-fetch/double-parse.
 type FetchIter struct {
 	Source Iterator
 	Data   *CursorSource
+	Buf    *syncpool.DocBuffer
 	Plan   *Plan // set by BuildPlan for doc value caching
 }
 
@@ -24,9 +29,13 @@ func (it *FetchIter) Next() (key []byte, docId []byte, err error) {
 			continue
 		}
 
-		// Cache the fetched value to avoid re-fetching later
-		if it.Plan != nil {
-			it.Plan.DocValue = append(it.Plan.DocValue[:0], val...)
+		// Parse and cache the value to avoid re-fetching and re-parsing later
+		if it.Plan != nil && it.Buf != nil {
+			doc, perr := it.Buf.Parser.Parse(val)
+			if perr != nil {
+				return nil, nil, perr
+			}
+			it.Plan.DocParsed = doc
 		}
 
 		return key, docId, nil

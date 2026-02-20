@@ -31,8 +31,8 @@ type ExplainInfo struct {
 
 // Plan holds the root iterator of a query execution plan.
 type Plan struct {
-	Root     Iterator
-	DocValue []byte // set by FilterIter/FetchIter when they fetch doc data
+	Root      Iterator
+	DocParsed *anyenc.Value // set by FilterIter/FetchIter/FullScanIter after parsing
 
 	// CBO metadata (for Explain)
 	Name      string  // "FullScan", "IndexSeek", "IndexScan"
@@ -654,6 +654,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 			Tx: params.Tx,
 			Ns: params.DataNs,
 		},
+		Buf: params.Buf,
 	}
 
 	if needFilter {
@@ -706,6 +707,7 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 			Tx: params.Tx,
 			Ns: params.DataNs,
 		},
+		Buf: params.Buf,
 	}
 
 	if needFilter {
@@ -739,7 +741,7 @@ func shouldReverse(sorter query.Sort, idx *CBOIndex) bool {
 	return fields[0].Reverse != idx.Reverse[0]
 }
 
-// setPlanRef walks the iterator chain and sets the Plan reference on FilterIter/FetchIter nodes.
+// setPlanRef walks the iterator chain and sets the Plan reference on FilterIter/FetchIter/FullScanIter nodes.
 // It stops at SortIter because SortIter collects all docs first, making cached values stale.
 func setPlanRef(it Iterator, plan *Plan) {
 	switch v := it.(type) {
@@ -749,9 +751,12 @@ func setPlanRef(it Iterator, plan *Plan) {
 	case *FetchIter:
 		v.Plan = plan
 		setPlanRef(v.Source, plan)
+	case *FullScanIter:
+		v.Plan = plan
+		// don't recurse — FullScanIter is a leaf
 	case *SortIter:
 		// Don't propagate plan ref past SortIter — it collects all docs,
-		// so any cached DocValue would be stale by the time Next() returns.
+		// so any cached DocParsed would be stale by the time Next() returns.
 	case *LimitIter:
 		setPlanRef(v.Source, plan)
 	}
