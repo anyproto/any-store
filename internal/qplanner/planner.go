@@ -14,6 +14,13 @@ type Plan struct {
 	DocValue []byte // set by FilterIter/FullScanIter when they fetch doc data
 }
 
+// Close releases all cursor resources held by the plan's iterator chain.
+func (p *Plan) Close() {
+	if p.Root != nil {
+		p.Root.Close()
+	}
+}
+
 // String returns a human-readable description of the full plan chain.
 func (p *Plan) String() string {
 	if p.Root == nil {

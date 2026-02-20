@@ -32,6 +32,13 @@ func (it *LimitIter) Next() (key []byte, docId []byte, err error) {
 	}
 }
 
+// Close releases resources by closing the source iterator.
+func (it *LimitIter) Close() {
+	if it.Source != nil {
+		it.Source.Close()
+	}
+}
+
 func (it *LimitIter) String() string {
 	if it.Offset > 0 && it.Limit > 0 {
 		return fmt.Sprintf("%s -> Limit(offset=%d,limit=%d)", it.Source, it.Offset, it.Limit)

@@ -79,6 +79,13 @@ func (it *SortIter) collectAndSort() error {
 	return nil
 }
 
+// Close releases resources by closing the source iterator.
+func (it *SortIter) Close() {
+	if it.Source != nil {
+		it.Source.Close()
+	}
+}
+
 func (it *SortIter) String() string {
 	return fmt.Sprintf("%s -> Sort", it.Source)
 }

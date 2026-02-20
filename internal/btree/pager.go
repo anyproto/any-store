@@ -79,6 +79,11 @@ type pager struct {
 	// This is the exact bug from SQLite ticket 7f7f8026eda387d544b.
 	hasContent map[uint32]bool
 
+	// pagePool recycles page objects with their data buffers for uncached
+	// (MVCC snapshot) pages, avoiding per-read-transaction heap allocations.
+	// Inspired by SQLite's pcache1 free-list recycling (pcache1.c:429-465).
+	pagePool sync.Pool
+
 	// inProcess uses heap-backed shm (faster, single-process only)
 	inProcess bool
 
@@ -393,12 +398,10 @@ func (p *pager) getPageAt(pgno, walMaxFrame uint32) (*page, error) {
 // snapshot isolation when the cache holds a newer version of the page than
 // what the reader's snapshot should see.
 func (p *pager) readPageUncached(pgno, walMaxFrame uint32) (*page, error) {
-	pg := &page{
-		pgno:     pgno,
-		data:     make([]byte, p.pageSize),
-		pinCount: 1,
-		uncached: true,
-	}
+	pg := p.acquireTempPage()
+	pg.pgno = pgno
+	pg.pinCount = 1
+	pg.uncached = true
 
 	// Try to read from WAL first
 	if walMaxFrame > 0 {
@@ -425,6 +428,7 @@ func (p *pager) readPageUncached(pgno, walMaxFrame uint32) (*page, error) {
 		_, err := p.file.ReadAt(pg.data, offset)
 		if err != nil {
 			if pgno <= p.dbSize {
+				p.recycleTempPage(pg)
 				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 			}
 			clear(pg.data)
@@ -754,14 +758,40 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 	return trunkPg, nil
 }
 
-// releasePage unpins a page.
+// acquireTempPage returns a page from the pool or allocates a new one.
+// The returned page has a valid data buffer but all other fields are unset.
+func (p *pager) acquireTempPage() *page {
+	if v := p.pagePool.Get(); v != nil {
+		return v.(*page)
+	}
+	return &page{
+		data: make([]byte, p.pageSize),
+	}
+}
+
+// recycleTempPage returns an uncached page to the pool for reuse.
+func (p *pager) recycleTempPage(pg *page) {
+	pg.pgno = 0
+	pg.dirty = false
+	pg.uncached = false
+	pg.pinCount = 0
+	pg.header = pageHeader{}
+	pg.next = nil
+	pg.prev = nil
+	p.pagePool.Put(pg)
+}
+
+// releasePage unpins a page. For uncached (MVCC snapshot) pages, the page is
+// recycled to the pool immediately. This is safe because:
+//   - Cursors keep pages pinned until movement or Close()
+//   - Get() clones the value before releasing
+//   - Count() only reads header.cellCount before releasing
 func (p *pager) releasePage(pg *page) {
 	if pg == nil {
 		return
 	}
-	// Uncached pages (MVCC snapshot copies) are not in the shared cache.
-	// Just drop them -- they will be garbage collected.
 	if pg.uncached {
+		p.recycleTempPage(pg)
 		return
 	}
 	p.cache.release(pg)

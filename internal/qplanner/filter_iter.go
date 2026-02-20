@@ -50,6 +50,13 @@ func (it *FilterIter) Next() (key []byte, docId []byte, err error) {
 	}
 }
 
+// Close releases resources by closing the source iterator.
+func (it *FilterIter) Close() {
+	if it.Source != nil {
+		it.Source.Close()
+	}
+}
+
 func (it *FilterIter) String() string {
 	return fmt.Sprintf("%s -> Filter", it.Source)
 }

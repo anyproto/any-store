@@ -98,6 +98,13 @@ func compareTuplePrefix(key, bound []byte) int {
 	return 0
 }
 
+// Close releases resources by closing the source iterator.
+func (it *CoverFilterIter) Close() {
+	if it.Source != nil {
+		it.Source.Close()
+	}
+}
+
 func (it *CoverFilterIter) String() string {
 	return fmt.Sprintf("%s -> CoverFilter(%s)[bounds=%s]", it.Source, it.IdxInfo.Name, it.Bounds.String())
 }
