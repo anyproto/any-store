@@ -33,6 +33,13 @@ func (it *FetchIter) Next() (key []byte, docId []byte, err error) {
 	}
 }
 
+// Close releases resources by closing the source iterator.
+func (it *FetchIter) Close() {
+	if it.Source != nil {
+		it.Source.Close()
+	}
+}
+
 func (it *FetchIter) String() string {
 	return fmt.Sprintf("%s -> Fetch", it.Source)
 }
