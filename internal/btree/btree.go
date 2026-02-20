@@ -795,7 +795,7 @@ func (bt *btree) insertIntoLeafWithPath(pg *page, key, value []byte, path []uint
 	}
 
 	if found {
-		return bt.updateLeafCell(pg, idx, key, value)
+		return bt.updateLeafCell(pg, idx, key, value, path)
 	}
 
 	pageUsable := bt.usablePageSize()
@@ -843,7 +843,7 @@ func (bt *btree) insertIntoLeaf(pg *page, key, value []byte) error {
 
 	if found {
 		// Update existing cell
-		return bt.updateLeafCell(pg, idx, key, value)
+		return bt.updateLeafCell(pg, idx, key, value, nil)
 	}
 
 	// Check if there's enough contiguous space
@@ -943,9 +943,11 @@ func (bt *btree) insertLeafCellAt(pg *page, idx int, key, value []byte) error {
 // the entire page. This avoids the O(n) cost of collectLeafCells + rebuildLeafPage
 // for the common case where the value size doesn't change significantly.
 //
-// SQLite's approach is similar: btree.c's sqlite3BtreeInsert checks if the new
-// payload fits in the existing cell space before falling back to dropCell+insertCell.
-func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte) error {
+// When the new cell is larger and causes the page to overflow, the page is split
+// using the path for parent propagation. This mirrors SQLite's approach in
+// sqlite3BtreeInsert (btree.c): dropCell + insertCell, then balance() if the
+// page overflows.
+func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []uint32) error {
 	usableSize := bt.usablePageSize()
 
 	// Parse old cell to get its size and overflow info
@@ -1014,7 +1016,48 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte) error {
 	// so we must NOT free old overflow above when taking this path.
 	cells := bt.collectLeafCells(pg)
 	cells[idx] = cellData{key: key, value: value}
-	return bt.rebuildLeafPage(pg, cells)
+
+	// Check if all cells still fit on one page after replacement.
+	// This mirrors SQLite's insertCellFast (btree.c ~line 7433): if the new
+	// cell doesn't fit in nFree, it sets nOverflow and defers to balance().
+	pageUsable := bt.usablePageSize()
+	hdrOff := 0
+	if pg.pgno == 1 {
+		hdrOff = dbHeaderSize
+	}
+	hdrSize := hdrOff + 8 + len(cells)*2 // page header + cell pointers
+	totalContent := 0
+	for _, c := range cells {
+		totalContent += leafCellSizeWithOverflow(c.key, c.value, pageUsable)
+	}
+
+	if hdrSize+totalContent <= pageUsable {
+		return bt.rebuildLeafPage(pg, cells)
+	}
+
+	// Page overflow — split and propagate to parent.
+	// Mirrors SQLite's balance() called after insertCellFast detects overflow.
+	mid := leafSplitPoint(cells, pageUsable)
+	leftCells := cells[:mid]
+	rightCells := cells[mid:]
+	sepKey := bytes.Clone(rightCells[0].key)
+
+	rightPg, err := bt.pager.allocatePage()
+	if err != nil {
+		return err
+	}
+	if err := bt.rebuildLeafPage(pg, leftCells); err != nil {
+		return err
+	}
+	if err := bt.rebuildLeafPage(rightPg, rightCells); err != nil {
+		return err
+	}
+	bt.pager.releasePage(rightPg)
+
+	if path != nil {
+		return bt.insertIntoParentWithPath(pg, sepKey, rightPg.pgno, path)
+	}
+	return bt.insertIntoParent(pg, sepKey, rightPg.pgno)
 }
 
 // collectLeafCells reads all cells from a leaf page.
