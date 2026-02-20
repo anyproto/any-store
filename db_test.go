@@ -189,6 +189,21 @@ func TestDb_Close(t *testing.T) {
 }
 
 func newFixture(t testing.TB, c ...*Config) *fixture {
+	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
+		var conf *Config
+		if len(c) != 0 {
+			conf = c[0]
+		}
+		if conf == nil {
+			conf = &Config{}
+		}
+		conf.InMemory = true
+		db, err := Open(ctx, ":memory:", conf)
+		require.NoError(t, err)
+		fx := &fixture{DB: db, t: t}
+		t.Cleanup(fx.finish)
+		return fx
+	}
 	tmpDir, err := os.MkdirTemp("", "any-store-*")
 	require.NoError(t, err)
 	return newFixturePath(t, tmpDir, c...)
@@ -198,13 +213,6 @@ func newFixturePath(t testing.TB, tmpDir string, c ...*Config) *fixture {
 	var conf *Config
 	if len(c) != 0 {
 		conf = c[0]
-	}
-
-	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
-		if conf == nil {
-			conf = &Config{}
-		}
-		conf.InMemory = true
 	}
 
 	db, err := Open(ctx, filepath.Join(tmpDir, "any-store-test.db"), conf)
