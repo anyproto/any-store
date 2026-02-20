@@ -256,7 +256,19 @@ func (p *pager) beginRead() (maxFrame uint32, slot int, err error) {
 		p.mu.RUnlock()
 		return 0, 0, err
 	}
-	p.walMaxFrame.Store(maxFrame) // for internal pager operations (e.g. getPage in write path)
+	// Update pager's walMaxFrame monotonically: never decrease, since a reader
+	// with an older snapshot must not overwrite a newer value set by the writer.
+	// The writer's getWritablePage → getPage uses p.walMaxFrame.Load() for pages
+	// not yet in writePages; a stale value would read an old page version.
+	for {
+		old := p.walMaxFrame.Load()
+		if maxFrame <= old {
+			break
+		}
+		if p.walMaxFrame.CompareAndSwap(old, maxFrame) {
+			break
+		}
+	}
 	return maxFrame, slot, nil
 }
 
