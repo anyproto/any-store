@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 
-	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/btree"
 	"github.com/anyproto/any-store/internal/qplanner"
 	"github.com/anyproto/any-store/query"
@@ -161,10 +160,10 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	if err != nil {
 		return
 	}
+	defer qb.Close()
 
 	tx, err := q.c.db.WriteTx(ctx)
 	if err != nil {
-		qb.Close()
 		return
 	}
 	defer func() {
@@ -176,41 +175,68 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	}()
 
 	btWtx := tx.btreeWriteTx()
-	cursor := btWtx.NewCursor(q.c.ns)
-
-	var filter query.Filter
-	if q.cond != nil {
-		filter = q.cond
-	}
-
-	iter := &iterator{
-		cursor: cursor,
-		filter: filter,
-		buf:    q.c.db.syncPool.GetDocBuf(),
-		tx:     tx,
-		qb:     qb,
-		limit:  int(q.limit),
-		offset: int(q.offset),
-	}
-	defer func() {
-		_ = iter.Close()
-	}()
+	btx := tx.btreeReadTx()
 
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
-	for iter.Next() {
-		var doc Doc
-		if doc, err = iter.Doc(); err != nil {
+	plan := qplanner.BuildPlan(&qplanner.PlanParams{
+		Tx:         btx,
+		DataNs:     q.c.ns,
+		Filter:     q.cond,
+		IDBounds:   qb.idBounds,
+		Limit:      int(q.limit),
+		Offset:     int(q.offset),
+		Buf:        buf,
+		TotalDocs:  q.docCount(btx),
+		Indexes:    q.buildCBOIndexes(),
+		IndexHints: q.buildIndexHints(),
+	})
+
+	// Collect all matching docIds first to avoid cursor invalidation
+	// when index entries are modified during updates.
+	var idsToUpdate [][]byte
+	for {
+		_, docId, iterErr := plan.Root.Next()
+		if iterErr != nil {
+			plan.Close()
+			err = iterErr
 			return
 		}
-		var (
-			modifiedVal *anyenc.Value
-			isModified  bool
-		)
-		buf.Arena.Reset()
-		modifiedVal, isModified, err = mod.Modify(buf.Arena, copyItem(buf, doc.(item)).val)
-		if err != nil {
+		if docId == nil {
+			break
+		}
+		idsToUpdate = append(idsToUpdate, append([]byte(nil), docId...))
+	}
+	plan.Close()
+
+	modBuf := q.c.db.syncPool.GetDocBuf()
+	defer q.c.db.syncPool.ReleaseDocBuf(modBuf)
+
+	for _, id := range idsToUpdate {
+		val, getErr := btx.Get(q.c.ns, id)
+		if getErr != nil {
+			err = getErr
+			return
+		}
+
+		buf.DocBuf = append(buf.DocBuf[:0], val...)
+		doc, parseErr := buf.Parser.Parse(buf.DocBuf)
+		if parseErr != nil {
+			err = parseErr
+			return
+		}
+
+		oldItem, itemErr := newItem(doc)
+		if itemErr != nil {
+			err = itemErr
+			return
+		}
+
+		modBuf.Arena.Reset()
+		modifiedVal, isModified, modErr := mod.Modify(modBuf.Arena, copyItem(modBuf, oldItem).val)
+		if modErr != nil {
+			err = modErr
 			return
 		}
 
@@ -223,12 +249,11 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		if it, err = newItem(modifiedVal); err != nil {
 			return
 		}
-		if _, err = q.c.update(btWtx, it, doc.(item)); err != nil {
+		if _, err = q.c.update(btWtx, it, oldItem); err != nil {
 			return
 		}
 		result.Modified++
 	}
-	err = iter.Err()
 	return
 }
 
@@ -237,10 +262,10 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	if err != nil {
 		return
 	}
+	defer qb.Close()
 
 	tx, err := q.c.db.WriteTx(ctx)
 	if err != nil {
-		qb.Close()
 		return
 	}
 	defer func() {
@@ -252,50 +277,39 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	}()
 
 	btWtx := tx.btreeWriteTx()
-
-	// First collect all docs to delete (can't modify while iterating)
-	cursor := btWtx.NewCursor(q.c.ns)
-
-	var filter query.Filter
-	if q.cond != nil {
-		filter = q.cond
-	}
-
-	iterBuf := q.c.db.syncPool.GetDocBuf()
-	iter := &iterator{
-		cursor: cursor,
-		filter: filter,
-		buf:    iterBuf,
-		qb:     qb,
-		limit:  int(q.limit),
-		offset: int(q.offset),
-	}
+	btx := tx.btreeReadTx()
 
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
-	// Collect IDs to delete
+	plan := qplanner.BuildPlan(&qplanner.PlanParams{
+		Tx:         btx,
+		DataNs:     q.c.ns,
+		Filter:     q.cond,
+		IDBounds:   qb.idBounds,
+		Limit:      int(q.limit),
+		Offset:     int(q.offset),
+		Buf:        buf,
+		TotalDocs:  q.docCount(btx),
+		Indexes:    q.buildCBOIndexes(),
+		IndexHints: q.buildIndexHints(),
+	})
+
+	// Collect IDs to delete (can't modify while iterating)
 	var idsToDelete [][]byte
-	for iter.Next() {
-		var doc Doc
-		if doc, err = iter.Doc(); err != nil {
-			cursor.Close()
-			q.c.db.syncPool.ReleaseDocBuf(iterBuf)
-			qb.Close()
+	for {
+		_, docId, iterErr := plan.Root.Next()
+		if iterErr != nil {
+			plan.Close()
+			err = iterErr
 			return
 		}
-		id := doc.(item).appendId(buf.SmallBuf[:0])
-		idsToDelete = append(idsToDelete, append([]byte(nil), id...))
+		if docId == nil {
+			break
+		}
+		idsToDelete = append(idsToDelete, append([]byte(nil), docId...))
 	}
-	if err = iter.Err(); err != nil {
-		cursor.Close()
-		q.c.db.syncPool.ReleaseDocBuf(iterBuf)
-		qb.Close()
-		return
-	}
-	cursor.Close()
-	q.c.db.syncPool.ReleaseDocBuf(iterBuf)
-	qb.Close()
+	plan.Close()
 
 	// Now delete collected docs
 	for _, id := range idsToDelete {
