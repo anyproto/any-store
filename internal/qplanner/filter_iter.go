@@ -32,14 +32,15 @@ func (it *FilterIter) Next() (key []byte, docId []byte, err error) {
 			// Reuse parsed value from upstream FetchIter
 			doc = it.Plan.DocParsed
 		} else {
-			val, gerr := it.Data.Get(docId)
+			var gerr error
+			it.Buf.DocBuf, gerr = it.Data.AppendValue(docId, it.Buf.DocBuf[:0])
 			if gerr != nil {
 				// doc may have been deleted from data but still in index; skip
 				continue
 			}
 
 			var perr error
-			doc, perr = it.Buf.Parser.Parse(val)
+			doc, perr = it.Buf.Parser.Parse(it.Buf.DocBuf)
 			if perr != nil {
 				return nil, nil, perr
 			}

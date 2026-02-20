@@ -49,7 +49,10 @@ func (pi *planIterator) Next() bool {
 	if docId == nil {
 		return false
 	}
-	pi.docId = append(pi.docId[:0], docId...)
+	if pi.plan.DocParsed == nil {
+		// Only copy docId when we'll need it in Doc() fallback
+		pi.docId = append(pi.docId[:0], docId...)
+	}
 	return true
 }
 
@@ -61,11 +64,11 @@ func (pi *planIterator) Doc() (Doc, error) {
 	if pi.plan.DocParsed != nil {
 		doc = pi.plan.DocParsed
 	} else {
-		val, err := pi.data.Get(pi.docId)
+		var err error
+		pi.buf.DocBuf, err = pi.data.AppendValue(pi.docId, pi.buf.DocBuf[:0])
 		if err != nil {
 			return nil, err
 		}
-		pi.buf.DocBuf = append(pi.buf.DocBuf[:0], val...)
 		var perr error
 		doc, perr = pi.buf.Parser.Parse(pi.buf.DocBuf)
 		if perr != nil {

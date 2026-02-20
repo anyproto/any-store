@@ -37,6 +37,12 @@ func (cs *CursorSource) Get(key []byte) ([]byte, error) {
 	return cs.Tx.Get(cs.Ns, key)
 }
 
+// AppendValue appends the value for key to buf and returns the extended buffer.
+// Zero alloc when buf has sufficient capacity.
+func (cs *CursorSource) AppendValue(key, buf []byte) ([]byte, error) {
+	return cs.Tx.AppendValue(cs.Ns, key, buf)
+}
+
 // IndexInfo holds metadata about an index needed by the planner.
 type IndexInfo struct {
 	Name       string

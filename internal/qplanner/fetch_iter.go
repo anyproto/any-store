@@ -23,15 +23,16 @@ func (it *FetchIter) Next() (key []byte, docId []byte, err error) {
 			return nil, nil, err
 		}
 
-		val, gerr := it.Data.Get(docId)
+		var gerr error
+		it.Buf.DocBuf, gerr = it.Data.AppendValue(docId, it.Buf.DocBuf[:0])
 		if gerr != nil {
 			// doc may have been deleted from data but still in index; skip
 			continue
 		}
 
 		// Parse and cache the value to avoid re-fetching and re-parsing later
-		if it.Plan != nil && it.Buf != nil {
-			doc, perr := it.Buf.Parser.Parse(val)
+		if it.Plan != nil {
+			doc, perr := it.Buf.Parser.Parse(it.Buf.DocBuf)
 			if perr != nil {
 				return nil, nil, perr
 			}

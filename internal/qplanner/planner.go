@@ -755,8 +755,8 @@ func setPlanRef(it Iterator, plan *Plan) {
 		v.Plan = plan
 		// don't recurse — FullScanIter is a leaf
 	case *SortIter:
-		// Don't propagate plan ref past SortIter — it collects all docs,
-		// so any cached DocParsed would be stale by the time Next() returns.
+		v.Plan = plan
+		setPlanRef(v.Source, plan)
 	case *LimitIter:
 		setPlanRef(v.Source, plan)
 	}

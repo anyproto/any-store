@@ -16,6 +16,7 @@ type SortIter struct {
 	Data            *CursorSource
 	Sorter          query.Sort
 	Buf             *syncpool.DocBuffer
+	Plan            *Plan
 	PartiallySorted bool // leading index fields match sort order; pdqsort benefits automatically
 
 	arena   []byte
@@ -45,6 +46,21 @@ func (it *SortIter) Next() (key []byte, docId []byte, err error) {
 	e := it.entries[it.idx]
 	it.idx++
 	docId = it.arena[e.off+uint32(e.keyLen)-uint32(e.docLen) : e.off+uint32(e.keyLen)]
+
+	// Pre-fetch and parse doc so planIterator.Doc() can reuse DocParsed
+	if it.Plan != nil {
+		var gerr error
+		it.Buf.DocBuf, gerr = it.Data.AppendValue(docId, it.Buf.DocBuf[:0])
+		if gerr != nil {
+			return nil, nil, gerr
+		}
+		doc, perr := it.Buf.Parser.Parse(it.Buf.DocBuf)
+		if perr != nil {
+			return nil, nil, perr
+		}
+		it.Plan.DocParsed = doc
+	}
+
 	return docId, docId, nil
 }
 
@@ -78,14 +94,19 @@ func (it *SortIter) collectAndSort() error {
 			break
 		}
 
-		val, gerr := it.Data.Get(docId)
-		if gerr != nil {
-			continue
-		}
-
-		doc, perr := it.Buf.Parser.Parse(val)
-		if perr != nil {
-			return perr
+		// Prefer already-parsed doc from upstream (FullScanIter/FetchIter/FilterIter)
+		doc := it.Plan.DocParsed
+		if doc == nil {
+			var gerr error
+			it.Buf.DocBuf, gerr = it.Data.AppendValue(docId, it.Buf.DocBuf[:0])
+			if gerr != nil {
+				continue
+			}
+			var perr error
+			doc, perr = it.Buf.Parser.Parse(it.Buf.DocBuf)
+			if perr != nil {
+				return perr
+			}
 		}
 
 		it.growArena(256)
