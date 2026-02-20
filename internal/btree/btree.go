@@ -648,18 +648,19 @@ func (bt *btree) searchInterior(pg *page, key []byte) (childPgno uint32, cellIdx
 	return pg.header.rightChild, n, nil
 }
 
-// Get looks up a key in the B-tree and returns its value.
-// The returned slice is a copy and is safe to retain after the page is released.
-func (bt *btree) Get(key []byte) ([]byte, error) {
+// AppendValue looks up a key in the B-tree and appends its value to buf.
+// The returned slice is safe to retain after the page is released.
+// Pass nil for buf to allocate a new slice (equivalent to Get).
+func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 	maxFrame, slot, err := bt.pager.beginRead()
 	if err != nil {
-		return nil, err
+		return buf, err
 	}
 	defer bt.pager.endRead(slot)
 
 	pg, err := bt.pager.getPageAt(bt.rootPage, maxFrame)
 	if err != nil {
-		return nil, err
+		return buf, err
 	}
 	defer bt.pager.releasePage(pg)
 
@@ -668,50 +669,58 @@ func (bt *btree) Get(key []byte) ([]byte, error) {
 		if pg.header.isLeaf() {
 			idx, found, serr := searchLeafPage(pg, key)
 			if serr != nil {
-				return nil, serr
+				return buf, serr
 			}
 			if !found {
-				return nil, ErrKeyNotFound
+				return buf, ErrKeyNotFound
 			}
 			off := pg.getCellOffset(idx)
 			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
 			if cerr != nil {
-				return nil, cerr
+				return buf, cerr
 			}
 			if cell.overflowPg != 0 {
 				// Read full value from overflow chain
 				pos := int(off)
 				keyLen, kn, verr := getVarintSafe(pg.data[pos:])
 				if verr != nil {
-					return nil, ErrCorrupt
+					return buf, ErrCorrupt
 				}
 				pos += kn + int(keyLen)
 				valLen, _, verr := getVarintSafe(pg.data[pos:])
 				if verr != nil {
-					return nil, ErrCorrupt
+					return buf, ErrCorrupt
 				}
-				fullVal := make([]byte, int(valLen))
+				start := len(buf)
+				buf = append(buf, make([]byte, int(valLen))...)
+				fullVal := buf[start:]
 				copy(fullVal, cell.value)
 				if err := bt.pager.readOverflowChainAt(cell.overflowPg, fullVal[len(cell.value):], bt.walMaxFrame); err != nil {
-					return nil, err
+					return buf[:start], err
 				}
-				return fullVal, nil
+				return buf, nil
 			}
-			return append([]byte(nil), cell.value...), nil
+			return append(buf, cell.value...), nil
 		}
 
 		// Interior page - descend
 		childPgno, _, serr := bt.searchInterior(pg, key)
 		if serr != nil {
 			bt.pager.releasePage(pg)
-			return nil, serr
+			return buf, serr
 		}
 		bt.pager.releasePage(pg)
 		pg, err = bt.pager.getPageAt(childPgno, maxFrame)
 		if err != nil {
-			return nil, err
+			return buf, err
 		}
 	}
+}
+
+// Get looks up a key in the B-tree and returns its value.
+// The returned slice is a copy and is safe to retain after the page is released.
+func (bt *btree) Get(key []byte) ([]byte, error) {
+	return bt.AppendValue(key, nil)
 }
 
 // Has checks if a key exists in the B-tree.
@@ -2264,71 +2273,6 @@ func (c *Cursor) Value() ([]byte, error) {
 	}
 
 	return cell.value, nil
-}
-
-// AppendKey appends the current key to b and returns the result.
-// This is the safe-copy path (equivalent to sqlite3BtreePayload).
-func (c *Cursor) AppendKey(b []byte) ([]byte, error) {
-	if !c.valid {
-		return b, ErrKeyNotFound
-	}
-	frame := &c.stack[len(c.stack)-1]
-	if frame.pg == nil {
-		return b, ErrCorrupt
-	}
-	off, oerr := frame.pg.getCellOffsetSafe(frame.cellIdx)
-	if oerr != nil {
-		return b, oerr
-	}
-	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), c.bt.usablePageSize())
-	if cerr != nil {
-		return b, cerr
-	}
-	return append(b, cell.key...), nil
-}
-
-// AppendValue appends the current value to b and returns the result.
-// For overflow values, reads the full chain. This is the safe-copy path.
-func (c *Cursor) AppendValue(b []byte) ([]byte, error) {
-	if !c.valid {
-		return b, ErrKeyNotFound
-	}
-	frame := &c.stack[len(c.stack)-1]
-	if frame.pg == nil {
-		return b, ErrCorrupt
-	}
-	usableSize := c.bt.usablePageSize()
-	off, oerr := frame.pg.getCellOffsetSafe(frame.cellIdx)
-	if oerr != nil {
-		return b, oerr
-	}
-	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), usableSize)
-	if cerr != nil {
-		return b, cerr
-	}
-	if cell.overflowPg != 0 {
-		pos := int(off)
-		keyLen, kn, verr := getVarintSafe(frame.pg.data[pos:])
-		if verr != nil {
-			return b, ErrCorrupt
-		}
-		pos += kn + int(keyLen)
-		valLen, _, verr := getVarintSafe(frame.pg.data[pos:])
-		if verr != nil {
-			return b, ErrCorrupt
-		}
-		start := len(b)
-		b = append(b, make([]byte, int(valLen))...)
-		fullVal := b[start:]
-		copy(fullVal, cell.value)
-		if overflowSize := int(valLen) - len(cell.value); overflowSize > 0 {
-			if err := c.bt.pager.readOverflowChainAt(cell.overflowPg, fullVal[len(cell.value):], c.bt.walMaxFrame); err != nil {
-				return b[:start], err
-			}
-		}
-		return b, nil
-	}
-	return append(b, cell.value...), nil
 }
 
 // Next advances the cursor to the next key in order.

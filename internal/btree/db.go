@@ -616,15 +616,15 @@ func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 	return tx.pager.readPageMVCC(pgno, tx.walMaxFrame)
 }
 
-// Get retrieves a value by key from the given namespace.
-// The returned slice is a copy and is safe to retain after pages are released.
-func (tx *ReadTx) Get(ns *Namespace, key []byte) ([]byte, error) {
+// AppendValue retrieves a value by key from the given namespace, appending it to buf.
+// Pass nil for buf to allocate a new slice (equivalent to Get).
+func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, error) {
 	if tx.closed {
-		return nil, ErrTxClosed
+		return buf, ErrTxClosed
 	}
 	pg, err := tx.txGetPage(ns.rootPage)
 	if err != nil {
-		return nil, err
+		return buf, err
 	}
 
 	// Search without starting a new read tx (we're already in one)
@@ -634,17 +634,17 @@ func (tx *ReadTx) Get(ns *Namespace, key []byte) ([]byte, error) {
 			idx, found, serr := searchLeafPage(pg, key)
 			if serr != nil {
 				tx.pager.releasePage(pg)
-				return nil, serr
+				return buf, serr
 			}
 			if !found {
 				tx.pager.releasePage(pg)
-				return nil, ErrKeyNotFound
+				return buf, ErrKeyNotFound
 			}
 			off := pg.getCellOffset(idx)
 			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
 			if cerr != nil {
 				tx.pager.releasePage(pg)
-				return nil, cerr
+				return buf, cerr
 			}
 			if cell.overflowPg != 0 {
 				// Read full value from overflow chain
@@ -652,38 +652,46 @@ func (tx *ReadTx) Get(ns *Namespace, key []byte) ([]byte, error) {
 				keyLen, kn, verr := getVarintSafe(pg.data[pos:])
 				if verr != nil {
 					tx.pager.releasePage(pg)
-					return nil, ErrCorrupt
+					return buf, ErrCorrupt
 				}
 				pos += kn + int(keyLen)
 				valLen, _, verr := getVarintSafe(pg.data[pos:])
 				if verr != nil {
 					tx.pager.releasePage(pg)
-					return nil, ErrCorrupt
+					return buf, ErrCorrupt
 				}
-				fullVal := make([]byte, int(valLen))
+				start := len(buf)
+				buf = append(buf, make([]byte, int(valLen))...)
+				fullVal := buf[start:]
 				copy(fullVal, cell.value)
 				if err := tx.pager.readOverflowChain(cell.overflowPg, fullVal[len(cell.value):]); err != nil {
 					tx.pager.releasePage(pg)
-					return nil, err
+					return buf[:start], err
 				}
 				tx.pager.releasePage(pg)
-				return fullVal, nil
+				return buf, nil
 			}
-			val := append([]byte(nil), cell.value...)
+			buf = append(buf, cell.value...)
 			tx.pager.releasePage(pg)
-			return val, nil
+			return buf, nil
 		}
 		childPgno, _, serr := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame)
 		if serr != nil {
 			tx.pager.releasePage(pg)
-			return nil, serr
+			return buf, serr
 		}
 		tx.pager.releasePage(pg)
 		pg, err = tx.txGetPage(childPgno)
 		if err != nil {
-			return nil, err
+			return buf, err
 		}
 	}
+}
+
+// Get retrieves a value by key from the given namespace.
+// The returned slice is a copy and is safe to retain after pages are released.
+func (tx *ReadTx) Get(ns *Namespace, key []byte) ([]byte, error) {
+	return tx.AppendValue(ns, key, nil)
 }
 
 // Has checks if a key exists in the given namespace.
