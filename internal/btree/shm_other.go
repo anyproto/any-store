@@ -7,6 +7,10 @@ import (
 	"sync"
 )
 
+// hasMmapShm indicates this platform lacks mmap-based shared memory.
+// Only heap SHM is available; InProcess mode is forced.
+const hasMmapShm = false
+
 // heapShm implements the shm interface using heap memory.
 // This fallback supports only single-process access.
 // Multi-process access requires platform-specific mmap implementation.

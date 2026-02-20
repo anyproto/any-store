@@ -23,6 +23,9 @@ type Options struct {
 	// single OS process. Equivalent to SQLite's PRAGMA locking_mode=EXCLUSIVE
 	// (WAL_HEAPMEMORY_MODE): SHM locks become no-ops, memory barriers are
 	// skipped, and no .db-wal-shm file is created.
+	//
+	// Forced to true automatically on platforms without mmap SHM support
+	// (e.g. Windows) and when InMemory is true.
 	InProcess bool
 
 	// NoCommitSync skips fdatasync on WAL commit. WAL frames are still written
@@ -100,6 +103,10 @@ func Open(path string, opts Options) (*DB, error) {
 	if opts.InMemory {
 		opts.InProcess = true
 		opts.NoCommitSync = true
+	}
+	if !hasMmapShm {
+		// Platform lacks mmap SHM (e.g. Windows); force heap SHM.
+		opts.InProcess = true
 	}
 
 	p := newPager(path, opts.PageSize, opts.CacheSize, !opts.InMemory)
