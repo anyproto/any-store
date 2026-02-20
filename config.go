@@ -17,6 +17,11 @@ type Config struct {
 	// of losing the last committed transaction(s) on power loss.
 	NoCommitSync bool
 
+	// InMemory keeps the entire database in memory with no files on disk.
+	// The database does not survive process crashes. When true, InProcess
+	// and NoCommitSync are forced on automatically.
+	InMemory bool
+
 	// DurabilityConfig provides configuration for crash recovery and idle auto-flush
 	Durability DurabilityConfig
 }

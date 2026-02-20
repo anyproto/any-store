@@ -21,6 +21,10 @@ func newFixture(t testing.TB, c ...*anystore.Config) *fixture {
 	if len(c) != 0 {
 		conf = c[0]
 	}
+	if conf == nil {
+		conf = &anystore.Config{}
+	}
+	conf.InMemory = true
 
 	db, err := anystore.Open(ctx, filepath.Join(tmpDir, "any-store-test.db"), conf)
 	require.NoError(t, err)

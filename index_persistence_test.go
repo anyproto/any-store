@@ -25,7 +25,15 @@ import (
 	"github.com/anyproto/any-store/anyenc"
 )
 
+func skipIfInMemory(t *testing.T) {
+	t.Helper()
+	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
+		t.Skip("persistence tests require disk")
+	}
+}
+
 func TestIndex_Persistence_IndexSurvivesRestart(t *testing.T) {
+	skipIfInMemory(t)
 	tmpDir, err := os.MkdirTemp("", "idx-persist-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
@@ -65,6 +73,7 @@ func TestIndex_Persistence_IndexSurvivesRestart(t *testing.T) {
 }
 
 func TestIndex_Persistence_DataIntactAfterReopen(t *testing.T) {
+	skipIfInMemory(t)
 	tmpDir, err := os.MkdirTemp("", "idx-persist-data-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
@@ -127,6 +136,7 @@ func TestIndex_Persistence_DataIntactAfterReopen(t *testing.T) {
 }
 
 func TestIndex_Persistence_UniqueConstraintAfterReopen(t *testing.T) {
+	skipIfInMemory(t)
 	tmpDir, err := os.MkdirTemp("", "idx-persist-uniq-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
@@ -160,6 +170,7 @@ func TestIndex_Persistence_UniqueConstraintAfterReopen(t *testing.T) {
 }
 
 func TestIndex_Persistence_SparseIndexAfterReopen(t *testing.T) {
+	skipIfInMemory(t)
 	tmpDir, err := os.MkdirTemp("", "idx-persist-sparse-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
@@ -200,6 +211,7 @@ func TestIndex_Persistence_SparseIndexAfterReopen(t *testing.T) {
 }
 
 func TestIndex_Persistence_CompoundIndexAfterReopen(t *testing.T) {
+	skipIfInMemory(t)
 	tmpDir, err := os.MkdirTemp("", "idx-persist-compound-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
@@ -237,6 +249,7 @@ func TestIndex_Persistence_CompoundIndexAfterReopen(t *testing.T) {
 }
 
 func TestIndex_Persistence_CreateIndexOnExistingDataAfterReopen(t *testing.T) {
+	skipIfInMemory(t)
 	tmpDir, err := os.MkdirTemp("", "idx-persist-create-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
@@ -273,6 +286,7 @@ func TestIndex_Persistence_CreateIndexOnExistingDataAfterReopen(t *testing.T) {
 }
 
 func TestIndex_Persistence_CheckpointThenReopen(t *testing.T) {
+	skipIfInMemory(t)
 	tmpDir, err := os.MkdirTemp("", "idx-persist-ckpt-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
@@ -310,6 +324,7 @@ func TestIndex_Persistence_CheckpointThenReopen(t *testing.T) {
 }
 
 func TestIndex_Persistence_MultipleIndexesSurvive(t *testing.T) {
+	skipIfInMemory(t)
 	tmpDir, err := os.MkdirTemp("", "idx-persist-multi-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
@@ -366,6 +381,7 @@ func TestIndex_Persistence_MultipleIndexesSurvive(t *testing.T) {
 }
 
 func TestIndex_Persistence_MutateCloseReopenVerify(t *testing.T) {
+	skipIfInMemory(t)
 	tmpDir, err := os.MkdirTemp("", "idx-persist-mutate-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
@@ -424,6 +440,7 @@ func TestIndex_Persistence_MutateCloseReopenVerify(t *testing.T) {
 }
 
 func TestIndex_Persistence_DropIndexThenReopen(t *testing.T) {
+	skipIfInMemory(t)
 	tmpDir, err := os.MkdirTemp("", "idx-persist-drop-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
