@@ -432,13 +432,18 @@ func interiorCellKey(data []byte, offset int) (key []byte, leftChild uint32, err
 
 // interiorCellFullKey extracts the full key from an interior cell, reading
 // overflow pages if necessary. Returns an allocated copy for overflow keys.
+// When bt.writable is true, uses readOverflowChain (checks writePages for COW pages).
 func (bt *btree) interiorCellFullKey(data []byte, offset int, usableSize int) (key []byte, leftChild uint32, err error) {
 	dataLen := len(data)
 	if offset+4 > dataLen {
 		return nil, 0, ErrCorrupt
 	}
 	leftChild = binary.BigEndian.Uint32(data[offset : offset+4])
-	key, err = interiorFullKey(data, offset, usableSize, bt.pager, bt.walMaxFrame)
+	if bt.writable {
+		key, err = interiorFullKeyWriter(data, offset, usableSize, bt.pager)
+	} else {
+		key, err = interiorFullKey(data, offset, usableSize, bt.pager, bt.walMaxFrame)
+	}
 	return key, leftChild, err
 }
 
@@ -586,7 +591,47 @@ func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFr
 	fullKey := make([]byte, int(keyLen))
 	copy(fullKey, data[keyStart:keyStart+localSize])
 	overflowPg := binary.BigEndian.Uint32(data[keyStart+localSize : keyStart+localSize+4])
-	_ = p.readOverflowChainAt(overflowPg, fullKey[localSize:], walMaxFrame)
+	if err := p.readOverflowChainAt(overflowPg, fullKey[localSize:], walMaxFrame); err != nil {
+		return nil, err
+	}
+	return fullKey, nil
+}
+
+// interiorFullKeyWriter is like interiorFullKey but uses readOverflowChain (writer context).
+// This ensures overflow pages in writePages (COW) are found during write transactions.
+func interiorFullKeyWriter(data []byte, offset int, usableSize int, p *pager) ([]byte, error) {
+	dataLen := len(data)
+	if offset+4 >= dataLen {
+		return nil, ErrCorrupt
+	}
+	keyLen, n, err := getVarintSafe(data[offset+4:])
+	if err != nil {
+		return nil, ErrCorrupt
+	}
+	keyStart := offset + 4 + n
+	maxLocal := maxLocalPayload(usableSize)
+
+	if int(keyLen) < 0 {
+		return nil, ErrCorrupt
+	}
+
+	if int(keyLen) <= maxLocal {
+		if keyStart+int(keyLen) > dataLen {
+			return nil, ErrCorrupt
+		}
+		return data[keyStart : keyStart+int(keyLen)], nil
+	}
+
+	localSize := localPayloadSize(int(keyLen), usableSize)
+	if keyStart+localSize+4 > dataLen {
+		return nil, ErrCorrupt
+	}
+	fullKey := make([]byte, int(keyLen))
+	copy(fullKey, data[keyStart:keyStart+localSize])
+	overflowPg := binary.BigEndian.Uint32(data[keyStart+localSize : keyStart+localSize+4])
+	if err := p.readOverflowChain(overflowPg, fullKey[localSize:]); err != nil {
+		return nil, err
+	}
 	return fullKey, nil
 }
 
@@ -828,7 +873,10 @@ func (bt *btree) insertIntoLeafWithPath(pg *page, key, value []byte, path []uint
 	// when the gap is insufficient but total free space is enough.
 	totalFree := gapSpace + int(pg.header.fragBytes)
 	if cellSize+2 <= totalFree {
-		cells := bt.collectLeafCells(pg)
+		cells, err := bt.collectLeafCells(pg)
+		if err != nil {
+			return err
+		}
 		if err := bt.rebuildLeafPage(pg, cells); err != nil {
 			return err
 		}
@@ -871,7 +919,10 @@ func (bt *btree) insertIntoLeaf(pg *page, key, value []byte) error {
 	// Check if defragmentation would free enough space
 	totalFree := gapSpace + int(pg.header.fragBytes)
 	if cellSize+2 <= totalFree {
-		cells := bt.collectLeafCells(pg)
+		cells, err := bt.collectLeafCells(pg)
+		if err != nil {
+			return err
+		}
 		if err := bt.rebuildLeafPage(pg, cells); err != nil {
 			return err
 		}
@@ -1022,7 +1073,10 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []uin
 	// Slow path: new cell doesn't fit or too much fragmentation.
 	// collectLeafCells frees all overflow chains (including old ones),
 	// so we must NOT free old overflow above when taking this path.
-	cells := bt.collectLeafCells(pg)
+	cells, err := bt.collectLeafCells(pg)
+	if err != nil {
+		return err
+	}
 	cells[idx] = cellData{key: key, value: value}
 
 	// Check if all cells still fit on one page after replacement.
@@ -1072,7 +1126,7 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []uin
 // Cell data is copied into a single contiguous buffer to avoid per-cell allocations.
 // Overflow values are fully read from overflow pages, and the old overflow chains
 // are freed (since the caller will rebuild the page with new overflow chains).
-func (bt *btree) collectLeafCells(pg *page) []cellData {
+func (bt *btree) collectLeafCells(pg *page) ([]cellData, error) {
 	n := int(pg.header.cellCount)
 	cells := make([]cellData, n)
 	usableSize := bt.usablePageSize()
@@ -1106,10 +1160,14 @@ func (bt *btree) collectLeafCells(pg *page) []cellData {
 			copy(fullVal, cells[i].value) // local portion
 			overflowSize := int(valLen) - len(cells[i].value)
 			if overflowSize > 0 {
-				_ = bt.pager.readOverflowChainAt(cells[i].overflowPg, fullVal[len(cells[i].value):], bt.walMaxFrame)
+				if err := bt.pager.readOverflowChain(cells[i].overflowPg, fullVal[len(cells[i].value):]); err != nil {
+					return nil, ErrCorrupt
+				}
 			}
 			// Free the old overflow chain — rebuildLeafPage will create new ones.
-			_ = bt.pager.freeOverflowChain(cells[i].overflowPg)
+			if err := bt.pager.freeOverflowChain(cells[i].overflowPg); err != nil {
+				return nil, ErrCorrupt
+			}
 			cells[i].key = buf[kStart:len(buf)]
 			cells[i].value = fullVal
 			cells[i].overflowPg = 0 // full value now in memory
@@ -1120,13 +1178,13 @@ func (bt *btree) collectLeafCells(pg *page) []cellData {
 			cells[i].value = buf[vStart:len(buf)]
 		}
 	}
-	return cells
+	return cells, nil
 }
 
 // collectInteriorCells reads all cells from an interior page.
 // For cells with overflow keys, the full key is read from overflow pages
 // and the overflow chain is freed (since the caller will rebuild the page).
-func (bt *btree) collectInteriorCells(pg *page) []cellData {
+func (bt *btree) collectInteriorCells(pg *page) ([]cellData, error) {
 	n := int(pg.header.cellCount)
 	cells := make([]cellData, n)
 	usable := bt.usablePageSize()
@@ -1143,8 +1201,12 @@ func (bt *btree) collectInteriorCells(pg *page) []cellData {
 			fullKey := make([]byte, int(keyLen))
 			copy(fullKey, pg.data[pos:pos+localSize])
 			overflowPg := binary.BigEndian.Uint32(pg.data[pos+localSize : pos+localSize+4])
-			_ = bt.pager.readOverflowChainAt(overflowPg, fullKey[localSize:], bt.walMaxFrame)
-			_ = bt.pager.freeOverflowChain(overflowPg)
+			if err := bt.pager.readOverflowChain(overflowPg, fullKey[localSize:]); err != nil {
+				return nil, ErrCorrupt
+			}
+			if err := bt.pager.freeOverflowChain(overflowPg); err != nil {
+				return nil, ErrCorrupt
+			}
 			cells[i].key = fullKey
 			cells[i].overflowPg = 0
 		} else {
@@ -1152,7 +1214,7 @@ func (bt *btree) collectInteriorCells(pg *page) []cellData {
 		}
 		_ = maxLocal
 	}
-	return cells
+	return cells, nil
 }
 
 // rebuildLeafPage rewrites a leaf page from a list of cells.
@@ -1268,7 +1330,10 @@ func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint
 
 // splitLeafAndInsertWithPath splits a leaf page using the path for parent propagation.
 func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte, path []uint32) error {
-	cells := bt.collectLeafCells(pg)
+	cells, err := bt.collectLeafCells(pg)
+	if err != nil {
+		return err
+	}
 
 	newCell := cellData{key: bytes.Clone(key), value: bytes.Clone(value)}
 	cells = append(cells[:idx], append([]cellData{newCell}, cells[idx:]...)...)
@@ -1420,7 +1485,11 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 	}
 
 	// Parent is full — split it
-	cells := bt.collectInteriorCells(parentPg)
+	cells, err := bt.collectInteriorCells(parentPg)
+	if err != nil {
+		bt.pager.releasePage(parentPg)
+		return err
+	}
 	origRightChild := parentPg.header.rightChild
 	origCellCount := len(cells)
 
@@ -1477,7 +1546,10 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 
 // splitLeafAndInsert splits a leaf page and inserts the new key-value pair.
 func (bt *btree) splitLeafAndInsert(pg *page, idx int, key, value []byte) error {
-	cells := bt.collectLeafCells(pg)
+	cells, err := bt.collectLeafCells(pg)
+	if err != nil {
+		return err
+	}
 
 	// Insert the new cell at the correct position
 	newCell := cellData{key: bytes.Clone(key), value: bytes.Clone(value)}
@@ -1575,7 +1647,10 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 	// appropriate collect/rebuild path so we don't misinterpret cell formats.
 	if oldRoot.header.isLeaf() {
 		// Leaf root: collect leaf cells and rebuild as leaf in the new page.
-		cells := bt.collectLeafCells(oldRoot)
+		cells, err := bt.collectLeafCells(oldRoot)
+		if err != nil {
+			return err
+		}
 		newLeftPg.header = oldRoot.header
 		if err := bt.rebuildLeafPage(newLeftPg, cells); err != nil {
 			return err
@@ -1583,7 +1658,10 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 	} else {
 		// Interior root: collect interior cells and rebuild as interior in the
 		// new page, preserving the rightChild pointer.
-		cells := bt.collectInteriorCells(oldRoot)
+		cells, err := bt.collectInteriorCells(oldRoot)
+		if err != nil {
+			return err
+		}
 		newLeftPg.header = oldRoot.header
 		if err := bt.rebuildInteriorPage(newLeftPg, cells, oldRoot.header.rightChild); err != nil {
 			return err
@@ -1714,7 +1792,11 @@ func (bt *btree) Delete(key []byte) error {
 	if needsRebuild {
 		// Fall back to full rebuild — collectLeafCells frees all overflow chains
 		// (including the deleted cell's), so we must NOT free them above.
-		cells := bt.collectLeafCells(wpg)
+		cells, err := bt.collectLeafCells(wpg)
+		if err != nil {
+			bt.pager.releasePage(wpg)
+			return err
+		}
 		cells = append(cells[:idx], cells[idx+1:]...)
 		if err := bt.rebuildLeafPage(wpg, cells); err != nil {
 			bt.pager.releasePage(wpg)
@@ -1841,8 +1923,18 @@ func (bt *btree) tryMergeLeaf(leafPgno uint32, path []uint32) error {
 		return err
 	}
 
-	leafCells := bt.collectLeafCells(leafPg)
-	sibCells := bt.collectLeafCells(sibPg)
+	leafCells, err := bt.collectLeafCells(leafPg)
+	if err != nil {
+		bt.pager.releasePage(leafPg)
+		bt.pager.releasePage(sibPg)
+		return err
+	}
+	sibCells, err := bt.collectLeafCells(sibPg)
+	if err != nil {
+		bt.pager.releasePage(leafPg)
+		bt.pager.releasePage(sibPg)
+		return err
+	}
 	bt.pager.releasePage(leafPg)
 	bt.pager.releasePage(sibPg)
 
@@ -1905,7 +1997,11 @@ func (bt *btree) removeChildFromParent(childPgno uint32, path []uint32) error {
 		return err
 	}
 
-	cells := bt.collectInteriorCells(parentPg)
+	cells, err := bt.collectInteriorCells(parentPg)
+	if err != nil {
+		bt.pager.releasePage(parentPg)
+		return err
+	}
 	rightChild := parentPg.header.rightChild
 
 	// Find which cell or rightChild references this child
@@ -2050,7 +2146,7 @@ type Cursor struct {
 type cursorFrame struct {
 	pgno    uint32
 	cellIdx int
-	pg      *page // pinned page (non-nil only for the leaf frame)
+	pg      *page // pinned page (all levels: interior + leaf)
 }
 
 // Close releases all pinned pages and invalidates the cursor.
@@ -2080,7 +2176,7 @@ func (c *Cursor) First() error {
 		return err
 	}
 
-	// Descend to leftmost leaf (mirrors SQLite's moveToLeftmost via moveToChild).
+	// Descend to leftmost leaf, keeping all pages pinned.
 	for pg.header.isInterior() {
 		if pg.header.cellCount == 0 {
 			c.bt.pager.releasePage(pg)
@@ -2090,14 +2186,13 @@ func (c *Cursor) First() error {
 			c.bt.pager.releasePage(pg)
 			return ErrCorrupt
 		}
-		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: 0})
 		off := int(pg.getCellOffset(0))
 		if off+4 > len(pg.data) {
 			c.bt.pager.releasePage(pg)
 			return ErrCorrupt
 		}
 		childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
-		c.bt.pager.releasePage(pg)
+		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: 0, pg: pg})
 
 		pg, err = c.bt.getPage(childPgno)
 		if err != nil {
@@ -2125,16 +2220,15 @@ func (c *Cursor) Last() error {
 		return err
 	}
 
-	// Descend to rightmost leaf (mirrors SQLite's moveToRightmost via moveToChild).
+	// Descend to rightmost leaf, keeping all pages pinned.
 	for pg.header.isInterior() {
 		n := int(pg.header.cellCount)
 		if len(c.stack) >= btCursorMaxDepth-1 {
 			c.bt.pager.releasePage(pg)
 			return ErrCorrupt
 		}
-		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: n})
 		childPgno := pg.header.rightChild
-		c.bt.pager.releasePage(pg)
+		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: n, pg: pg})
 
 		pg, err = c.bt.getPage(childPgno)
 		if err != nil {
@@ -2173,8 +2267,7 @@ func (c *Cursor) Seek(key []byte) error {
 			c.bt.pager.releasePage(pg)
 			return ErrCorrupt
 		}
-		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: cellIdx})
-		c.bt.pager.releasePage(pg)
+		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: cellIdx, pg: pg})
 
 		pg, err = c.bt.getPage(childPgno)
 		if err != nil {
@@ -2191,10 +2284,9 @@ func (c *Cursor) Seek(key []byte) error {
 		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: idx, pg: pg})
 		c.valid = true
 	} else {
-		// Need to go to next leaf via parent
-		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: idx})
+		// Need to go to next leaf via parent — leaf page is not pinned
 		c.bt.pager.releasePage(pg)
-		return c.Next()
+		return c.advanceToNextLeaf()
 	}
 
 	return nil
@@ -2265,7 +2357,14 @@ func (c *Cursor) Value() ([]byte, error) {
 		copy(fullVal, cell.value) // local portion
 		overflowSize := int(valLen) - len(cell.value)
 		if overflowSize > 0 {
-			if err := c.bt.pager.readOverflowChainAt(cell.overflowPg, fullVal[len(cell.value):], c.bt.walMaxFrame); err != nil {
+			var err error
+			if c.bt.writable {
+				// Writer context: overflow pages may be in writePages (COW).
+				err = c.bt.pager.readOverflowChain(cell.overflowPg, fullVal[len(cell.value):])
+			} else {
+				err = c.bt.pager.readOverflowChainAt(cell.overflowPg, fullVal[len(cell.value):], c.bt.walMaxFrame)
+			}
+			if err != nil {
 				return nil, err
 			}
 		}
@@ -2281,49 +2380,65 @@ func (c *Cursor) Next() error {
 		return nil
 	}
 
-	for len(c.stack) > 0 {
-		frame := &c.stack[len(c.stack)-1]
-
-		// Leaf frame: the page is pinned in frame.pg.
-		if frame.pg != nil {
+	// Fast path: advance within current leaf page.
+	if depth := len(c.stack); depth > 0 {
+		frame := &c.stack[depth-1]
+		if frame.pg != nil && frame.pg.header.isLeaf() {
 			frame.cellIdx++
 			if frame.cellIdx < int(frame.pg.header.cellCount) {
 				c.valid = true
 				return nil
 			}
-			// Past end of this leaf — release pinned page, pop frame, go up.
+			// Past end of this leaf — release and pop.
 			c.bt.pager.releasePage(frame.pg)
+			frame.pg = nil
+			c.stack = c.stack[:depth-1]
+		}
+	}
+
+	return c.advanceToNextLeaf()
+}
+
+// advanceToNextLeaf walks up the interior frames (which are pinned) to find
+// the next child subtree, then descends to its leftmost leaf.
+func (c *Cursor) advanceToNextLeaf() error {
+	for len(c.stack) > 0 {
+		frame := &c.stack[len(c.stack)-1]
+		pg := frame.pg
+		if pg == nil {
+			// Should not happen with pinned interior pages, but be safe.
+			c.stack = c.stack[:len(c.stack)-1]
+			continue
+		}
+
+		// If this is a leaf (e.g. from Seek overshoot), release and pop.
+		if pg.header.isLeaf() {
+			c.bt.pager.releasePage(pg)
 			frame.pg = nil
 			c.stack = c.stack[:len(c.stack)-1]
 			continue
 		}
 
-		// Interior frame: re-acquire page to read child pointers.
-		pg, err := c.bt.getPage(frame.pgno)
-		if err != nil {
-			return err
-		}
-
+		// Interior frame: page is pinned, just read the next child pointer.
 		frame.cellIdx++
 		var childPgno uint32
 		if frame.cellIdx < int(pg.header.cellCount) {
 			off := int(pg.getCellOffset(frame.cellIdx))
 			if off+4 > len(pg.data) {
-				c.bt.pager.releasePage(pg)
 				return ErrCorrupt
 			}
 			childPgno = binary.BigEndian.Uint32(pg.data[off : off+4])
 		} else if frame.cellIdx == int(pg.header.cellCount) {
 			childPgno = pg.header.rightChild
 		} else {
+			// Past all children — release this interior page and pop up.
 			c.bt.pager.releasePage(pg)
+			frame.pg = nil
 			c.stack = c.stack[:len(c.stack)-1]
 			continue
 		}
 
-		c.bt.pager.releasePage(pg)
-
-		// Descend to leftmost leaf of child (mirrors SQLite's moveToLeftmost).
+		// Descend to leftmost leaf of child, pinning all pages.
 		childPg, err := c.bt.getPage(childPgno)
 		if err != nil {
 			return err
@@ -2336,14 +2451,13 @@ func (c *Cursor) Next() error {
 				c.bt.pager.releasePage(childPg)
 				return ErrCorrupt
 			}
-			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: 0})
 			off := int(childPg.getCellOffset(0))
 			if off+4 > len(childPg.data) {
 				c.bt.pager.releasePage(childPg)
 				return ErrCorrupt
 			}
 			nextPgno := binary.BigEndian.Uint32(childPg.data[off : off+4])
-			c.bt.pager.releasePage(childPg)
+			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: 0, pg: childPg})
 			childPg, err = c.bt.getPage(nextPgno)
 			if err != nil {
 				return err
@@ -2372,34 +2486,44 @@ func (c *Cursor) Previous() error {
 		return nil
 	}
 
-	for len(c.stack) > 0 {
-		frame := &c.stack[len(c.stack)-1]
-
-		// Leaf frame: the page is pinned in frame.pg.
-		if frame.pg != nil {
+	// Fast path: move backward within current leaf page.
+	if depth := len(c.stack); depth > 0 {
+		frame := &c.stack[depth-1]
+		if frame.pg != nil && frame.pg.header.isLeaf() {
 			frame.cellIdx--
 			if frame.cellIdx >= 0 {
 				c.valid = true
 				return nil
 			}
-			// Past the beginning of this leaf — release pinned page, pop, go up.
+			// Past the beginning of this leaf — release and pop.
 			c.bt.pager.releasePage(frame.pg)
+			frame.pg = nil
+			c.stack = c.stack[:depth-1]
+		}
+	}
+
+	for len(c.stack) > 0 {
+		frame := &c.stack[len(c.stack)-1]
+		pg := frame.pg
+		if pg == nil {
+			c.stack = c.stack[:len(c.stack)-1]
+			continue
+		}
+
+		// Leaf that we already exhausted
+		if pg.header.isLeaf() {
+			c.bt.pager.releasePage(pg)
 			frame.pg = nil
 			c.stack = c.stack[:len(c.stack)-1]
 			continue
 		}
 
-		// Interior frame: re-acquire page to read child pointers.
-		pg, err := c.bt.getPage(frame.pgno)
-		if err != nil {
-			return err
-		}
-
-		// Descend to the previous child's rightmost leaf.
+		// Interior frame: page is pinned.
 		frame.cellIdx--
 		if frame.cellIdx < 0 {
-			// No more children to the left at this interior level — pop up
+			// No more children to the left — release and pop up.
 			c.bt.pager.releasePage(pg)
+			frame.pg = nil
 			c.stack = c.stack[:len(c.stack)-1]
 			continue
 		}
@@ -2409,7 +2533,6 @@ func (c *Cursor) Previous() error {
 		if frame.cellIdx < int(pg.header.cellCount) {
 			off := int(pg.getCellOffset(frame.cellIdx))
 			if off+4 > len(pg.data) {
-				c.bt.pager.releasePage(pg)
 				return ErrCorrupt
 			}
 			childPgno = binary.BigEndian.Uint32(pg.data[off : off+4])
@@ -2417,13 +2540,12 @@ func (c *Cursor) Previous() error {
 			childPgno = pg.header.rightChild
 		} else {
 			c.bt.pager.releasePage(pg)
+			frame.pg = nil
 			c.stack = c.stack[:len(c.stack)-1]
 			continue
 		}
 
-		c.bt.pager.releasePage(pg)
-
-		// Descend to the rightmost leaf of this child subtree (mirrors SQLite's moveToRightmost).
+		// Descend to the rightmost leaf of this child subtree, pinning all pages.
 		childPg, err := c.bt.getPage(childPgno)
 		if err != nil {
 			return err
@@ -2437,10 +2559,8 @@ func (c *Cursor) Previous() error {
 				c.bt.pager.releasePage(childPg)
 				return ErrCorrupt
 			}
-			// Push frame pointing to the rightChild position (cellIdx = n)
-			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: n})
 			nextPgno := childPg.header.rightChild
-			c.bt.pager.releasePage(childPg)
+			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: n, pg: childPg})
 			childPg, err = c.bt.getPage(nextPgno)
 			if err != nil {
 				return err
@@ -2449,7 +2569,6 @@ func (c *Cursor) Previous() error {
 
 		n := int(childPg.header.cellCount)
 		if n > 0 {
-			// Position at the last cell of this leaf
 			c.stack = append(c.stack, cursorFrame{pgno: childPg.pgno, cellIdx: n - 1, pg: childPg})
 			c.valid = true
 			return nil

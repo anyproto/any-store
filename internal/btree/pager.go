@@ -315,30 +315,21 @@ func (p *pager) getPage(pgno uint32) (*page, error) {
 
 // getPageAt returns the page with the given page number, using the specified
 // walMaxFrame for snapshot isolation. This allows different readers to have
-// different WAL snapshots.
+// different WAL snapshots. With COW, cached pages are always clean.
 func (p *pager) getPageAt(pgno, walMaxFrame uint32) (*page, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
 	}
 
-	// Check cache first. Use fetchPinned to capture the dirty flag under
-	// the pcache lock, avoiding a data race with concurrent makeDirty calls
-	// from the writer goroutine.
-	if pg, wasDirty := p.cache.fetchPinned(pgno); pg != nil {
-		// For clean pages, verify the cached version is within our snapshot.
-		// Dirty pages are returned as-is: the caller is responsible for
-		// MVCC dirty-page handling at a higher level (btree.getPage for
-		// readers checks writePages; ReadTx.txGetPage also bypasses dirty
-		// pages for non-writable transactions).
-		if !wasDirty {
-			latestFrame := p.wal.index.getLatest(pgno)
-			if latestFrame == 0 || latestFrame <= walMaxFrame {
-				return pg, nil
-			}
-			p.cache.release(pg)
-			return p.readPageUncached(pgno, walMaxFrame)
+	// Check cache first. With COW, cached pages are always clean (the writer
+	// creates copies instead of modifying cached pages), so no dirty check needed.
+	if pg := p.cache.fetch(pgno); pg != nil {
+		latestFrame := p.wal.index.getLatest(pgno)
+		if latestFrame == 0 || latestFrame <= walMaxFrame {
+			return pg, nil
 		}
-		return pg, nil
+		p.cache.release(pg)
+		return p.readPageUncached(pgno, walMaxFrame)
 	}
 
 	// Cache miss: create a new cached page.
@@ -455,45 +446,60 @@ func (p *pager) readPageUncached(pgno, walMaxFrame uint32) (*page, error) {
 }
 
 // readPageMVCC returns a page with snapshot isolation for committed data.
-// Always returns an uncached copy to avoid data races with the writer goroutine,
-// which may dirty and modify cached pages at any time. The uncached page reads
-// from the WAL (at the reader's snapshot point) or from disk.
+// With COW, cached pages are always clean (the writer never modifies them),
+// so readers can safely use cached pages. Falls back to an uncached copy only
+// when the cache holds a newer version than the reader's WAL snapshot.
 func (p *pager) readPageMVCC(pgno, walMaxFrame uint32) (*page, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
+	}
+	// Fast path: with COW, cached pages are always clean and safe for readers.
+	if pg := p.cache.fetch(pgno); pg != nil {
+		latestFrame := p.wal.index.getLatest(pgno)
+		if latestFrame == 0 || latestFrame <= walMaxFrame {
+			return pg, nil
+		}
+		// Cache has a newer version — need WAL read at our snapshot.
+		p.cache.release(pg)
 	}
 	return p.readPageUncached(pgno, walMaxFrame)
 }
 
 // getPageNoContent returns a page without reading from disk/WAL (fix 5.4).
-// If the page is already in cache, it's returned as-is (matching SQLite's
-// behavior where PAGER_GET_NOCONTENT still returns cached pages). If not in
-// cache, a new blank page is created. This is used when allocating pages from
-// the freelist or growing the database, where the old content is irrelevant.
+// With COW, creates a new writable page in writePages. The page content is
+// irrelevant since the caller will overwrite it.
+// Used when allocating pages from the freelist or growing the database.
 // Modeled after SQLite's PAGER_GET_NOCONTENT flag in pager.c:5507.
 func (p *pager) getPageNoContent(pgno uint32) (*page, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
 	}
-	// Cache hit: return as-is (the content may be stale but the caller will overwrite it)
-	if pg := p.cache.fetch(pgno); pg != nil {
+	// Check writePages first (page might already be COW'd).
+	if pg := p.writePages[pgno]; pg != nil {
+		pg.pinCount++
 		return pg, nil
 	}
-	// Cache miss: create a blank page without any disk/WAL read
-	pg := p.cache.create(pgno)
+	// Create a new COW page (not in cache).
+	pg := p.acquireTempPage()
+	pg.pgno = pgno
+	pg.pinCount = 1
+	pg.dirty = true
+	pg.uncached = false
 	clear(pg.data)
 	pg.header = pageHeader{}
+	p.writePages[pgno] = pg
 	return pg, nil
 }
 
-// getWritablePage returns a page ready for writing. It marks the page as dirty
-// and saves a copy for savepoint rollback if needed.
+// getWritablePage returns a page ready for writing using Copy-On-Write.
+// The cached page is never modified — instead, a private COW copy is created
+// in writePages. This allows readers to safely use cached pages concurrently.
 func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 	if pagerState(p.state.Load()) != pagerWriter {
 		return nil, ErrReadOnly
 	}
 
-	// Fast path: check write-transaction page map (no lock needed)
+	// Fast path: already COW'd in this transaction.
 	if pg := p.writePages[pgno]; pg != nil {
 		// Clear dontWrite flag: the page is being re-acquired for writing,
 		// so its content is meaningful again (fix 5.4). Matches SQLite's
@@ -512,24 +518,36 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 		return pg, nil
 	}
 
-	pg, err := p.getPage(pgno)
+	// Get the read-only page from cache/WAL/disk.
+	readPg, err := p.getPage(pgno)
 	if err != nil {
 		return nil, err
 	}
 
-	// Save copy for savepoint rollback if we have active savepoints
-	if len(p.savepoints) > 0 && !pg.dirty {
+	// COW: create a private writable copy. The cached page stays clean.
+	cowPg := p.acquireTempPage()
+	cowPg.pgno = pgno
+	cowPg.pinCount = 1
+	cowPg.dirty = true
+	cowPg.uncached = false
+	copy(cowPg.data, readPg.data)
+	cowPg.header = readPg.header
+
+	// Release the read-only cached page.
+	p.releasePage(readPg)
+
+	// Save original data for savepoint rollback if needed.
+	if len(p.savepoints) > 0 {
 		sp := &p.savepoints[len(p.savepoints)-1]
 		if _, exists := sp.pages[pgno]; !exists {
-			dataCopy := make([]byte, len(pg.data))
-			copy(dataCopy, pg.data)
+			dataCopy := make([]byte, len(cowPg.data))
+			copy(dataCopy, cowPg.data)
 			sp.pages[pgno] = dataCopy
 		}
 	}
 
-	p.cache.makeDirty(pg)
-	p.writePages[pgno] = pg
-	return pg, nil
+	p.writePages[pgno] = cowPg
+	return cowPg, nil
 }
 
 // allocatePage allocates a new page and returns it.
@@ -552,14 +570,12 @@ func (p *pager) allocatePage() (*page, error) {
 	pgno := p.dbSize
 
 	// Use getPageNoContent: new pages have no existing content to read (fix 5.4).
+	// With COW, getPageNoContent creates a COW page in writePages directly.
 	pg, err := p.getPageNoContent(pgno)
 	if err != nil {
 		p.dbSize--
 		return nil, err
 	}
-	clear(pg.data)
-	p.cache.makeDirty(pg)
-	p.writePages[pgno] = pg
 	return pg, nil
 }
 
@@ -642,13 +658,15 @@ func (p *pager) freePage(pgno uint32) error {
 		p.releasePage(trunkPg)
 	}
 
-	// No trunk or trunk is full — freed page becomes new trunk
+	// No trunk or trunk is full — freed page becomes new trunk.
+	// With COW, getWritablePage creates a COW copy; if the page isn't readable
+	// (e.g., newly allocated in this tx), use getPageNoContent as fallback.
 	newTrunkPg, err := p.getWritablePage(pgno)
 	if err != nil {
-		// Page may not be in cache yet; create it
-		newTrunkPg = p.cache.create(pgno)
-		p.cache.makeDirty(newTrunkPg)
-		p.writePages[pgno] = newTrunkPg
+		newTrunkPg, err = p.getPageNoContent(pgno)
+		if err != nil {
+			return err
+		}
 	}
 	clear(newTrunkPg.data)
 	binary.BigEndian.PutUint32(newTrunkPg.data[0:4], trunkPgno) // next trunk = old trunk
@@ -724,13 +742,12 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 		}
 
 		// Use getPageNoContent: old freelist leaf content is irrelevant (fix 5.4).
+		// With COW, getPageNoContent creates a COW page in writePages directly.
 		pg, err := p.getPageNoContent(leafPgno)
 		if err != nil {
 			return nil, err
 		}
 		clear(pg.data)
-		p.cache.makeDirty(pg)
-		p.writePages[leafPgno] = pg
 		// Clear dontWrite flag: when a page is freed and then re-allocated
 		// within the same transaction, the freePage() call may have marked it
 		// dontWrite. Now that it's being reused, its content is meaningful
@@ -782,16 +799,20 @@ func (p *pager) recycleTempPage(pg *page) {
 }
 
 // releasePage unpins a page. For uncached (MVCC snapshot) pages, the page is
-// recycled to the pool immediately. This is safe because:
-//   - Cursors keep pages pinned until movement or Close()
-//   - Get() clones the value before releasing
-//   - Count() only reads header.cellCount before releasing
+// recycled to the pool immediately. For dirty COW pages (in writePages), just
+// decrements pinCount — they stay alive until commit/rollback.
 func (p *pager) releasePage(pg *page) {
 	if pg == nil {
 		return
 	}
 	if pg.uncached {
 		p.recycleTempPage(pg)
+		return
+	}
+	if pg.dirty {
+		// COW page in writePages — just decrement pinCount.
+		// The page stays alive in writePages until commit/rollback.
+		pg.pinCount--
 		return
 	}
 	p.cache.release(pg)
@@ -926,8 +947,8 @@ func (p *pager) readWalFrameData(frame uint32, buf []byte) error {
 }
 
 // commit writes all dirty pages to WAL and commits the transaction.
-// dataChanged/schemaChanged control whether FileChangeCount/SchemaCookie are
-// incremented. Returns the WAL frame count and the new counter values.
+// With COW, dirty pages are in writePages (not in the shared cache).
+// After WAL write, committed pages are inserted into the cache for future reads.
 func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC uint32, err error) {
 	if pagerState(p.state.Load()) != pagerWriter {
 		return 0, 0, 0, ErrReadOnly
@@ -936,8 +957,11 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	// Update the in-memory header with current database size.
 	p.header.DatabaseSize = p.dbSize
 
-	// Collect dirty pages first to determine if there are real changes.
-	p.dirtyBuf = p.cache.appendDirtyPages(p.dirtyBuf[:0])
+	// Collect dirty pages from writePages (COW pages).
+	p.dirtyBuf = p.dirtyBuf[:0]
+	for _, pg := range p.writePages {
+		p.dirtyBuf = append(p.dirtyBuf, pg)
+	}
 
 	// Filter out dontWrite pages before WAL write (fix 5.4).
 	// These are freed leaf pages whose content is irrelevant.
@@ -945,7 +969,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 		n := 0
 		for _, pg := range p.dirtyBuf {
 			if p.dontWritePages[pg.pgno] {
-				p.cache.makeClean(pg)
+				// Skip — will be recycled when writePages is cleared.
 			} else {
 				p.dirtyBuf[n] = pg
 				n++
@@ -979,6 +1003,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	}
 
 	// Ensure page 1 is always written with the updated header (fix 5.3).
+	pg1AlreadyInWrite := p.writePages[1] != nil
 	pg1, err := p.getWritablePage(1)
 	if err != nil {
 		p.pagerError()
@@ -987,8 +1012,15 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	p.header.serialize(pg1.data[:dbHeaderSize])
 	p.releasePage(pg1)
 
-	// Re-collect dirty pages since page 1 may be newly dirty.
-	p.dirtyBuf = p.cache.appendDirtyPages(p.dirtyBuf[:0])
+	// Re-collect from writePages if page 1 was newly COW'd.
+	if !pg1AlreadyInWrite {
+		p.dirtyBuf = p.dirtyBuf[:0]
+		for _, pg := range p.writePages {
+			if !p.dontWritePages[pg.pgno] {
+				p.dirtyBuf = append(p.dirtyBuf, pg)
+			}
+		}
+	}
 
 	// Write all dirty pages to WAL
 	if err := p.wal.writeFrames(p.dirtyBuf, true, p.dbSize); err != nil {
@@ -999,9 +1031,10 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	// Capture nFrame atomically for checkpoint threshold decision.
 	nFrame = p.wal.nFrame.Load()
 
-	// Mark all pages as clean
+	// Update cache with committed pages. insertClean replaces old cache entries
+	// atomically — readers holding old pages see valid stale data until released.
 	for _, pg := range p.dirtyBuf {
-		p.cache.makeClean(pg)
+		p.cache.insertClean(pg)
 	}
 
 	p.savepoints = p.savepoints[:0]
@@ -1015,21 +1048,16 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 }
 
 // rollback discards all changes in the current write transaction.
+// With COW, the cache was never modified — just discard the COW pages.
 func (p *pager) rollback() error {
 	st := pagerState(p.state.Load())
 	if st != pagerWriter && st != pagerError {
 		return nil
 	}
 
-	// Discard all dirty pages from cache
-	dirtyPages := p.cache.dirtyPages()
-	for _, pg := range dirtyPages {
-		p.cache.discard(pg.pgno)
-	}
-
 	// Restore the database header from the snapshot saved at beginWrite (fix 5.2).
 	// This ensures FirstFreelistPg, TotalFreelistPgs, and DatabaseSize are
-	// reverted to their pre-transaction values after dirty pages are discarded.
+	// reverted to their pre-transaction values.
 	p.header = p.savedHeader
 	p.dbSize = p.header.DatabaseSize
 
@@ -1053,11 +1081,8 @@ func (p *pager) rollback() error {
 func (p *pager) pagerError() {
 	p.state.Store(int32(pagerError))
 
-	// Purge the cache — its contents cannot be trusted after an error.
-	dirtyPages := p.cache.dirtyPages()
-	for _, pg := range dirtyPages {
-		p.cache.discard(pg.pgno)
-	}
+	// With COW, cache has no dirty pages. Still clear it to be safe
+	// after an error (the cache state may be inconsistent).
 	p.cache.clear()
 
 	// Restore the database header to pre-transaction state.
@@ -1107,23 +1132,22 @@ func (p *pager) rollbackToSavepoint(id int) error {
 
 	sp := &p.savepoints[id]
 
-	// Discard pages allocated after the savepoint
+	// Discard COW pages allocated after the savepoint.
+	// With COW, these are only in writePages (not in cache).
 	for pgno := range p.writePages {
 		if pgno > sp.dbSize {
-			p.cache.discard(pgno)
 			delete(p.writePages, pgno)
 		}
 	}
 
 	// Restore saved page copies from all savepoints being rolled back.
+	// With COW, restore onto the COW pages in writePages (not cached pages).
 	// Iterate from NEWEST to OLDEST (fix 9.1): this ensures that when a page
 	// has copies at multiple savepoint levels, the oldest (correct) copy is
-	// written last and wins. This is analogous to SQLite's pDone bitvec that
-	// skips pages already restored — our reverse iteration achieves the same
-	// result by letting the oldest copy overwrite newer ones.
+	// written last and wins.
 	for i := len(p.savepoints) - 1; i >= id; i-- {
 		for pgno, data := range p.savepoints[i].pages {
-			if pg := p.cache.fetch(pgno); pg != nil {
+			if pg := p.writePages[pgno]; pg != nil {
 				copy(pg.data, data)
 				off := 0
 				if pgno == 1 {
@@ -1137,9 +1161,6 @@ func (p *pager) rollbackToSavepoint(id int) error {
 					p.header.deserialize(pg.data[:dbHeaderSize])
 					p.dbSize = p.header.DatabaseSize
 				}
-				// Page is restored to pre-savepoint state but stays dirty
-				// so it can be modified again in the current transaction.
-				p.cache.release(pg)
 			}
 		}
 	}
@@ -1266,8 +1287,42 @@ func (p *pager) writeOverflowChain(data []byte) (uint32, error) {
 // readOverflowChain reads data from a chain of overflow pages into buf.
 // Uses the pager's global walMaxFrame. For reader-specific snapshots,
 // use readOverflowChainAt instead (fix 8.3).
+// readOverflowChain reads overflow pages in the writer context.
+// Uses getPage which checks writePages first (COW pages not yet in cache).
 func (p *pager) readOverflowChain(firstPgno uint32, buf []byte) error {
-	return p.readOverflowChainAt(firstPgno, buf, p.walMaxFrame.Load())
+	usable := overflowPageUsable(p.usableSize())
+	pgno := firstPgno
+	off := 0
+
+	maxIter := len(buf)/usable + 2
+	if maxIter < 10 {
+		maxIter = 10
+	}
+	iter := 0
+	dbSize := p.dbSize
+
+	for pgno != 0 && off < len(buf) {
+		if pgno < 2 || pgno > dbSize {
+			return ErrCorrupt
+		}
+		iter++
+		if iter > maxIter {
+			return ErrCorrupt
+		}
+		pg, err := p.getPage(pgno)
+		if err != nil {
+			return err
+		}
+		chunk := usable
+		if chunk > len(buf)-off {
+			chunk = len(buf) - off
+		}
+		copy(buf[off:off+chunk], pg.data[4:4+chunk])
+		pgno = binary.BigEndian.Uint32(pg.data[0:4])
+		p.releasePage(pg)
+		off += chunk
+	}
+	return nil
 }
 
 // readOverflowChainAt reads data from a chain of overflow pages into buf

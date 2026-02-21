@@ -56,26 +56,6 @@ func (pc *pcache) fetch(pgno uint32) *page {
 	return p
 }
 
-// fetchPinned retrieves a page from the cache and returns both the page and
-// whether it was dirty at fetch time. The dirty flag is captured under the
-// pcache lock, avoiding a data race with concurrent makeDirty calls.
-// Returns (nil, false) if the page is not cached.
-func (pc *pcache) fetchPinned(pgno uint32) (*page, bool) {
-	pc.mu.Lock()
-	p := pc.pages[pgno]
-	if p == nil {
-		pc.mu.Unlock()
-		return nil, false
-	}
-	p.pinCount++
-	wasDirty := p.dirty
-	if !wasDirty {
-		pc.lruRemove(p)
-	}
-	pc.mu.Unlock()
-	return p, wasDirty
-}
-
 // create allocates a new page in the cache and returns it pinned.
 // If the cache is full, it evicts clean pages first.
 func (pc *pcache) create(pgno uint32) *page {
@@ -106,13 +86,15 @@ func (pc *pcache) create(pgno uint32) *page {
 	return p
 }
 
-// release unpins a page. If the page is clean, it goes to the LRU list.
+// release unpins a page. If the page is clean and still current in the cache,
+// it goes to the LRU list. Orphaned pages (replaced by commit's insertClean)
+// are silently dropped — they'll be GC'd when all references are released.
 func (pc *pcache) release(p *page) {
 	pc.mu.Lock()
 	p.pinCount--
 	if p.pinCount <= 0 {
 		p.pinCount = 0
-		if !p.dirty {
+		if !p.dirty && pc.pages[p.pgno] == p {
 			pc.lruAppend(p)
 		}
 	}
@@ -181,6 +163,31 @@ func (pc *pcache) makeClean(p *page) {
 			pc.lruAppend(p)
 		}
 	}
+}
+
+// makeCleanBatch marks multiple pages as clean in a single lock acquisition.
+func (pc *pcache) makeCleanBatch(pages []*page) {
+	pc.mu.Lock()
+	for _, p := range pages {
+		if p.dirty {
+			p.dirty = false
+			if p.prev != nil {
+				p.prev.next = p.next
+			} else {
+				pc.dirtyHead = p.next
+			}
+			if p.next != nil {
+				p.next.prev = p.prev
+			}
+			p.next = nil
+			p.prev = nil
+			pc.nDirty--
+			if p.pinCount == 0 {
+				pc.lruAppend(p)
+			}
+		}
+	}
+	pc.mu.Unlock()
 }
 
 // dirtyPages returns all dirty pages using the provided slice to avoid allocations.
@@ -312,4 +319,50 @@ func (pc *pcache) evictOne() {
 	p.prev = nil
 	pc.nClean--
 	delete(pc.pages, p.pgno)
+}
+
+// insertClean inserts a page into the cache as clean and unpinned, replacing
+// any existing entry for the same page number. The old entry (if any) is
+// orphaned — readers that still hold it will use stale-but-valid data and
+// the page will be GC'd when all references are released.
+// Used by the commit path to update the cache with newly-committed COW pages.
+func (pc *pcache) insertClean(pg *page) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	if old := pc.pages[pg.pgno]; old != nil {
+		// Remove old entry from LRU (it should be clean with COW).
+		if !old.dirty {
+			pc.lruRemove(old)
+		} else {
+			// Shouldn't happen with COW, but handle gracefully.
+			if old.prev != nil {
+				old.prev.next = old.next
+			} else {
+				pc.dirtyHead = old.next
+			}
+			if old.next != nil {
+				old.next.prev = old.prev
+			}
+			old.next = nil
+			old.prev = nil
+			pc.nDirty--
+		}
+		// Old page is now orphaned. Readers holding it see valid old data.
+	}
+
+	pg.dirty = false
+	pg.uncached = false
+	pg.pinCount = 0
+	pg.next = nil
+	pg.prev = nil
+	pc.pages[pg.pgno] = pg
+	pc.lruAppend(pg)
+
+	// Evict if over limit.
+	if pc.purgeable {
+		for len(pc.pages) > pc.maxPages && pc.nClean > 0 {
+			pc.evictOne()
+		}
+	}
 }

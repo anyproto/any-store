@@ -34,17 +34,61 @@ const (
 // newHeapShm creates a heap-backed shm that uses only in-process locking.
 // This is faster than mmap+fcntl but only supports single-process access.
 func newHeapShm() shm {
-	return &inProcessShm{
-		regions: make([][]byte, 0, shmMaxRegions),
-	}
+	return &inProcessShm{shmRegions: newShmRegions()}
 }
+
+// newNoLockShm creates a heap-backed shm with no-op locking.
+// Used in InProcess mode where lock coordination is handled at higher levels
+// (DB.writeMu for writers, DB.mu for readers) and SHM slot locking is redundant.
+func newNoLockShm() shm {
+	return &noLockShm{shmRegions: newShmRegions()}
+}
+
+// shmRegions is the shared heap-backed region store used by both noLockShm
+// and inProcessShm, avoiding region management duplication.
+type shmRegions struct {
+	regions [][]byte
+	mu      sync.Mutex
+}
+
+func newShmRegions() shmRegions {
+	return shmRegions{regions: make([][]byte, 0, shmMaxRegions)}
+}
+
+func (r *shmRegions) region(index int, create bool) ([]byte, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if index < len(r.regions) && r.regions[index] != nil {
+		return r.regions[index], nil
+	}
+	if !create {
+		return nil, fmt.Errorf("btree: shm region %d not available", index)
+	}
+	for len(r.regions) <= index {
+		r.regions = append(r.regions, nil)
+	}
+	r.regions[index] = make([]byte, shmRegionSize)
+	return r.regions[index], nil
+}
+
+func (r *shmRegions) close() {
+	r.mu.Lock()
+	r.regions = nil
+	r.mu.Unlock()
+}
+
+// noLockShm implements shm with no-op locking for single-process InProcess mode.
+type noLockShm struct{ shmRegions }
+
+func (s *noLockShm) lock(_ int, _ int) error   { return nil }
+func (s *noLockShm) unlock(_ int, _ int) error { return nil }
+func (s *noLockShm) close() error              { s.shmRegions.close(); return nil }
 
 // inProcessShm implements shm using heap memory with in-process locks only.
 // No file I/O or syscalls are needed, making it much faster for single-process use.
 type inProcessShm struct {
-	mu      [lockSlotCount]shmLock
-	regions [][]byte
-	regMu   sync.Mutex
+	locks [lockSlotCount]shmLock
+	shmRegions
 }
 
 type shmLock struct {
@@ -52,28 +96,11 @@ type shmLock struct {
 	state int // 0=unlocked, >0=shared count, -1=exclusive
 }
 
-func (s *inProcessShm) region(index int, create bool) ([]byte, error) {
-	s.regMu.Lock()
-	defer s.regMu.Unlock()
-
-	if index < len(s.regions) && s.regions[index] != nil {
-		return s.regions[index], nil
-	}
-	if !create {
-		return nil, fmt.Errorf("btree: shm region %d not available", index)
-	}
-	for len(s.regions) <= index {
-		s.regions = append(s.regions, nil)
-	}
-	s.regions[index] = make([]byte, shmRegionSize)
-	return s.regions[index], nil
-}
-
 func (s *inProcessShm) lock(slot int, lockType int) error {
 	if slot < 0 || slot >= lockSlotCount {
 		return fmt.Errorf("btree: invalid lock slot %d", slot)
 	}
-	l := &s.mu[slot]
+	l := &s.locks[slot]
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	switch lockType {
@@ -95,7 +122,7 @@ func (s *inProcessShm) unlock(slot int, lockType int) error {
 	if slot < 0 || slot >= lockSlotCount {
 		return fmt.Errorf("btree: invalid lock slot %d", slot)
 	}
-	l := &s.mu[slot]
+	l := &s.locks[slot]
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	switch lockType {
@@ -112,9 +139,7 @@ func (s *inProcessShm) unlock(slot int, lockType int) error {
 }
 
 func (s *inProcessShm) close() error {
-	s.regMu.Lock()
-	s.regions = nil
-	s.regMu.Unlock()
+	s.shmRegions.close()
 	return nil
 }
 

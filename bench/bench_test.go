@@ -11,8 +11,8 @@ import (
 	"testing"
 
 	"github.com/anyproto/any-store/internal/btree"
-	"github.com/anyproto/any-store/internal/driver"
-	"github.com/anyproto/go-sqlite"
+	anystore "github.com/anyproto/any-store-sqlite"
+	"github.com/anyproto/any-store-sqlite/anyenc"
 	badger "github.com/dgraph-io/badger/v4"
 	bolt "go.etcd.io/bbolt"
 )
@@ -57,6 +57,7 @@ func (e *btreeEngine) Name() string { return "btree" }
 func (e *btreeEngine) Open(dir string) error {
 	opts := btree.DefaultOptions()
 	opts.InProcess = true
+	opts.NoCommitSync = true // match anystore-sqlite's synchronous=NORMAL (WAL default)
 	btree.AutoCheckpointThreshold = 0 // disable during benchmarks; checkpoint manually if needed
 	db, err := btree.Open(filepath.Join(dir, "bench.db"), opts)
 	if err != nil {
@@ -121,123 +122,88 @@ func (e *btreeEngine) IterateAll() (int, error) {
 }
 
 // ============================================================
-// SQLite engine (internal/driver, using go-sqlite)
+// any-store (SQLite-backed, main branch)
 // ============================================================
 
-type sqliteEngine struct {
-	cm *driver.ConnManager
+type anystoreEngine struct {
+	db   anystore.DB
+	coll anystore.Collection
 }
 
-func (e *sqliteEngine) Name() string { return "sqlite" }
+func (e *anystoreEngine) Name() string { return "anystore-sqlite" }
 
-func (e *sqliteEngine) Open(dir string) error {
-	path := filepath.Join(dir, "bench.sqlite")
-	cm, err := driver.NewConnManager(path, driver.Config{
-		Pragma: map[string]string{
-			"journal_mode": "wal",
-			"synchronous":  "off",
-		},
-		ReadCount: 4,
-		Version:   1,
-	})
-	if err != nil {
-		return err
-	}
-	e.cm = cm
-
+func (e *anystoreEngine) Open(dir string) error {
 	ctx := context.Background()
-	conn, err := cm.GetWrite(ctx)
+	db, err := anystore.Open(ctx, filepath.Join(dir, "bench.anystore"), nil)
 	if err != nil {
 		return err
 	}
-	defer cm.ReleaseWrite(conn)
-	return conn.ExecNoResult(ctx, "CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB)")
+	e.db = db
+	coll, err := db.Collection(ctx, "bench")
+	if err != nil {
+		return err
+	}
+	e.coll = coll
+	return nil
 }
 
-func (e *sqliteEngine) Close() error {
-	return e.cm.Close()
+func (e *anystoreEngine) Close() error {
+	return e.db.Close()
 }
 
-func (e *sqliteEngine) WriteBatch(offset, n int) error {
+func (e *anystoreEngine) WriteBatch(offset, n int) error {
 	ctx := context.Background()
-	conn, err := e.cm.GetWrite(ctx)
-	if err != nil {
-		return err
-	}
-	defer e.cm.ReleaseWrite(conn)
-
-	if err := conn.BeginImmediate(ctx); err != nil {
-		return err
-	}
+	arena := &anyenc.Arena{}
+	docs := make([]*anyenc.Value, n)
 	for i := range n {
-		k := makeKey(offset + i)
-		v := makeValue(offset + i)
-		if err := conn.Exec(ctx,
-			"INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)",
-			func(stmt *sqlite.Stmt) {
-				stmt.BindBytes(1, k)
-				stmt.BindBytes(2, v)
-			}, driver.StmtExecNoResults); err != nil {
-			_ = conn.Rollback(ctx)
+		arena.Reset()
+		doc := arena.NewObject()
+		doc.Set("id", arena.NewStringBytes(makeKey(offset+i)))
+		doc.Set("v", arena.NewStringBytes(makeValue(offset+i)))
+		// MarshalTo to detach from arena before reset
+		buf := doc.MarshalTo(nil)
+		p := &anyenc.Parser{}
+		v, err := p.Parse(buf)
+		if err != nil {
 			return err
 		}
+		docs[i] = v
 	}
-	return conn.Commit(ctx)
+	return e.coll.Insert(ctx, docs...)
 }
 
-func (e *sqliteEngine) Get(index int) ([]byte, error) {
+func (e *anystoreEngine) Get(index int) ([]byte, error) {
 	ctx := context.Background()
-	conn, err := e.cm.GetRead(ctx)
+	doc, err := e.coll.FindId(ctx, string(makeKey(index)))
 	if err != nil {
 		return nil, err
 	}
-	defer e.cm.ReleaseRead(conn)
-
-	var result []byte
-	err = conn.Exec(ctx,
-		"SELECT v FROM kv WHERE k = ?",
-		func(stmt *sqlite.Stmt) {
-			stmt.BindBytes(1, makeKey(index))
-		},
-		func(stmt *sqlite.Stmt) error {
-			hasRow, err := stmt.Step()
-			if err != nil {
-				return err
-			}
-			if !hasRow {
-				return nil
-			}
-			n := stmt.ColumnLen(0)
-			result = make([]byte, n)
-			stmt.ColumnBytes(0, result)
-			return nil
-		})
-	return result, err
+	v := doc.Value().Get("v")
+	if v == nil {
+		return nil, nil
+	}
+	return []byte(v.GetStringBytes()), nil
 }
 
-func (e *sqliteEngine) IterateAll() (int, error) {
+func (e *anystoreEngine) IterateAll() (int, error) {
 	ctx := context.Background()
-	conn, err := e.cm.GetRead(ctx)
+	iter, err := e.coll.Find(nil).Iter(ctx)
 	if err != nil {
 		return 0, err
 	}
-	defer e.cm.ReleaseRead(conn)
-
+	defer iter.Close()
 	count := 0
-	err = conn.Exec(ctx, "SELECT k FROM kv ORDER BY k", nil, func(stmt *sqlite.Stmt) error {
-		for {
-			hasRow, err := stmt.Step()
-			if err != nil {
-				return err
-			}
-			if !hasRow {
-				break
-			}
-			count++
+	for iter.Next() {
+		_, err := iter.Doc()
+		if err != nil {
+			return 0, err
 		}
-		return nil
-	})
-	return count, err
+		count++
+	}
+	if err := iter.Close(); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 // ============================================================
@@ -374,7 +340,7 @@ func (e *badgerEngine) IterateAll() (int, error) {
 func allEngines() []engine {
 	return []engine{
 		&btreeEngine{},
-		&sqliteEngine{},
+		&anystoreEngine{},
 		&boltEngine{},
 		&badgerEngine{},
 	}

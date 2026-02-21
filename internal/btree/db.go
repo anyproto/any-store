@@ -187,12 +187,19 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 		return nil, err
 	}
 
-	// Read on-disk counters for staleness detection.
-	fcc, sc, err := db.pager.readHeaderCounters(maxFrame)
-	if err != nil {
-		db.pager.endRead(slot)
-		db.mu.RUnlock()
-		return nil, err
+	// In InProcess mode, there's only one process so the local counter cache
+	// is always authoritative — skip the expensive WAL/disk read.
+	var fcc, sc uint32
+	if db.opts.InProcess {
+		fcc = db.localFileChangeCounter.Load()
+		sc = db.localSchemaCookie.Load()
+	} else {
+		fcc, sc, err = db.pager.readHeaderCounters(maxFrame)
+		if err != nil {
+			db.pager.endRead(slot)
+			db.mu.RUnlock()
+			return nil, err
+		}
 	}
 
 	tx := db.getReadTx()
@@ -234,13 +241,19 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 		return nil, err
 	}
 
-	// Read on-disk counters for staleness detection.
-	fcc, sc, err := db.pager.readHeaderCounters(maxFrame)
-	if err != nil {
-		db.pager.endRead(slot)
-		db.mu.RUnlock()
-		db.writeMu.Unlock()
-		return nil, err
+	// In InProcess mode, skip expensive WAL/disk counter read.
+	var fcc, sc uint32
+	if db.opts.InProcess {
+		fcc = db.localFileChangeCounter.Load()
+		sc = db.localSchemaCookie.Load()
+	} else {
+		fcc, sc, err = db.pager.readHeaderCounters(maxFrame)
+		if err != nil {
+			db.pager.endRead(slot)
+			db.mu.RUnlock()
+			db.writeMu.Unlock()
+			return nil, err
+		}
 	}
 
 	if err := db.pager.beginWrite(); err != nil {
@@ -396,7 +409,11 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 		rootPage = binary.BigEndian.Uint32(cell.value)
 	}
 
-	cells := db.masterBT.collectLeafCells(masterPg)
+	cells, err := db.masterBT.collectLeafCells(masterPg)
+	if err != nil {
+		db.pager.releasePage(masterPg)
+		return err
+	}
 	cells = append(cells[:idx], cells[idx+1:]...)
 	if err := db.masterBT.rebuildLeafPage(masterPg, cells); err != nil {
 		db.pager.releasePage(masterPg)
@@ -775,6 +792,7 @@ type WriteTx struct {
 	ReadTx
 	dataChanged   bool // set by MarkDataChanged; causes FileChangeCount++ on commit
 	schemaChanged bool // set by MarkSchemaChanged; causes SchemaCookie++ on commit
+	bt            btree // reusable btree for Put/Delete/NewCursor (avoids heap alloc per call)
 }
 
 // GetNamespace returns a Namespace handle for the given name.
@@ -798,13 +816,21 @@ func (tx *WriteTx) MarkSchemaChanged() {
 	tx.schemaChanged = true
 }
 
+// initBT initializes the embedded btree for the given namespace.
+func (tx *WriteTx) initBT(ns *Namespace) *btree {
+	tx.bt.pager = tx.pager
+	tx.bt.rootPage = ns.rootPage
+	tx.bt.walMaxFrame = tx.walMaxFrame
+	tx.bt.writable = true
+	return &tx.bt
+}
+
 // Put inserts or updates a key-value pair in the given namespace.
 func (tx *WriteTx) Put(ns *Namespace, key, value []byte) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: true}
-	return bt.Put(key, value)
+	return tx.initBT(ns).Put(key, value)
 }
 
 // Delete removes a key from the given namespace.
@@ -812,8 +838,7 @@ func (tx *WriteTx) Delete(ns *Namespace, key []byte) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: true}
-	return bt.Delete(key)
+	return tx.initBT(ns).Delete(key)
 }
 
 // AutoCheckpointThreshold is the number of WAL frames after which an

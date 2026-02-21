@@ -479,7 +479,7 @@ type walIndex struct {
 func newWalIndex(shmPath string, inProcess bool) (*walIndex, error) {
 	var s shm
 	if inProcess {
-		s = newHeapShm()
+		s = newNoLockShm()
 	} else {
 		var err error
 		s, err = newPlatformShm(shmPath)
@@ -876,8 +876,11 @@ type wal struct {
 	cksum1 uint32
 	cksum2 uint32
 
-	// Reusable write buffer to avoid per-commit allocations
+	// Reusable write buffer for frame headers (avoids per-commit allocations)
 	writeBuf []byte
+
+	// Cached file descriptor for pwritev (set on first writeFrames call)
+	fileFd uintptr
 
 	// headerOnDisk is false when the WAL file is empty (0 bytes) and the
 	// header has not yet been written to disk. The header is written lazily
@@ -1202,25 +1205,25 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		}
 	}
 
-	frameSize := int(walFrameSize) + int(w.pageSize)
 	nf := w.nFrame.Load()
+	frameSize := int(walFrameSize) + int(w.pageSize)
 	offset := int64(walHeaderSize) + int64(nf)*int64(frameSize)
 
-	// Reuse write buffer to avoid per-commit allocations
-	needSize := len(pages) * frameSize
+	// Reuse header buffer (N × 24 bytes) — much smaller than the old
+	// N × (24 + pageSize) buffer since page data is written directly.
+	needSize := len(pages) * walFrameSize
 	if cap(w.writeBuf) >= needSize {
 		w.writeBuf = w.writeBuf[:needSize]
 	} else {
 		w.writeBuf = make([]byte, needSize)
 	}
-	buf := w.writeBuf
+	hdrBuf := w.writeBuf
 
 	s1, s2 := w.cksum1, w.cksum2
 	startFrame := nf + 1
 
 	for i, p := range pages {
-		pos := i * frameSize
-		frameBuf := buf[pos : pos+walFrameSize]
+		frameBuf := hdrBuf[i*walFrameSize : (i+1)*walFrameSize]
 
 		binary.BigEndian.PutUint32(frameBuf[0:4], p.pgno)
 		var dbSizeField uint32
@@ -1237,19 +1240,23 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 
 		binary.BigEndian.PutUint32(frameBuf[16:20], s1)
 		binary.BigEndian.PutUint32(frameBuf[20:24], s2)
-
-		// Copy page data into buffer
-		copy(buf[pos+walFrameSize:pos+frameSize], p.data)
 	}
 
-	w.nFrame.Store(nf + uint32(len(pages)))
 	w.cksum1 = s1
 	w.cksum2 = s2
 
-	// Single write call for all frames
-	if _, err := w.file.WriteAt(buf, offset); err != nil {
+	// Cache file descriptor on first call to avoid repeated os.File.Fd() overhead.
+	if w.fileFd == 0 {
+		w.fileFd = w.file.Fd()
+	}
+
+	// Write frames: scatter-gather on Linux (pwritev), copy-based fallback elsewhere.
+	if err := walWriteFrameData(w.fileFd, hdrBuf, pages, offset, w.pageSize); err != nil {
 		return err
 	}
+
+	// Update nFrame after disk write succeeds (matches SQLite's order: write data, then update state).
+	w.nFrame.Store(nf + uint32(len(pages)))
 
 	// Batch update walIndex under a single lock
 	w.index.setBatch(pages, startFrame)
@@ -1831,6 +1838,7 @@ func (w *wal) close() error {
 			firstErr = err
 		}
 		w.file = nil
+		w.fileFd = 0
 	}
 	return firstErr
 }

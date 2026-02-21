@@ -6,12 +6,13 @@ toolchain go1.24.1
 
 require (
 	github.com/anyproto/any-store v0.0.0
-	github.com/anyproto/go-sqlite v1.4.2-any
+	github.com/anyproto/any-store-sqlite v0.0.0
 	github.com/dgraph-io/badger/v4 v4.5.1
 	go.etcd.io/bbolt v1.4.0
 )
 
 require (
+	github.com/anyproto/go-sqlite v1.4.2-any // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dgraph-io/ristretto/v2 v2.1.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
@@ -36,3 +37,5 @@ require (
 )
 
 replace github.com/anyproto/any-store => ../
+
+replace github.com/anyproto/any-store-sqlite => /home/dev/work/any-store-main

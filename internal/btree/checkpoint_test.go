@@ -363,3 +363,87 @@ func TestCheckpointWithWriterAndReaders(t *testing.T) {
 	assert.Equal(t, int32(0), errors.Load(), "concurrent read/write/checkpoint had errors")
 	_ = ns
 }
+
+// TestCheckpointRespectsActiveReader verifies that checkpoint does not overwrite
+// WAL frames that an active reader still depends on. With no-op SHM locking,
+// checkpoint would think no readers are active and backfill pages into the DB
+// file, then reset the WAL. The reader would then read stale/zeroed data.
+func TestCheckpointRespectsActiveReader(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.InProcess = true
+	db, err := Open(filepath.Join(dir, "test.db"), opts)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Create namespace and seed initial data.
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("data")
+	require.NoError(t, err)
+	for i := range 100 {
+		k := fmt.Appendf(nil, "key-%04d", i)
+		v := fmt.Appendf(nil, "val-%04d", i)
+		require.NoError(t, wtx.Put(ns, k, v))
+	}
+	require.NoError(t, wtx.Commit())
+
+	// Open a long-lived reader BEFORE further writes.
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	rns, err := rtx.GetNamespace("data")
+	require.NoError(t, err)
+
+	// Verify reader can see initial data.
+	val, err := rtx.Get(rns, []byte("key-0050"))
+	require.NoError(t, err)
+	require.Equal(t, "val-0050", string(val))
+
+	// Write more data — this creates new WAL frames beyond the reader's snapshot.
+	for round := range 10 {
+		wtx2, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns2, _ := wtx2.GetNamespace("data")
+		for i := range 50 {
+			k := fmt.Appendf(nil, "round%d-%04d", round, i)
+			v := fmt.Appendf(nil, "rval%d-%04d", round, i)
+			require.NoError(t, wtx2.Put(ns2, k, v))
+		}
+		require.NoError(t, wtx2.Commit())
+	}
+
+	// Checkpoint while the old reader is still active.
+	// With correct locking, checkpoint sees the reader's slot lock and
+	// does NOT reset the WAL (or only backfills up to the reader's snapshot).
+	err = db.Checkpoint()
+	require.NoError(t, err)
+
+	// Write MORE data after checkpoint. If checkpoint wrongly reset the WAL
+	// (because no-op locking made it think no readers were active), these new
+	// writes overwrite WAL frames that the old reader still depends on.
+	for round := 10; round < 20; round++ {
+		wtx3, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns3, _ := wtx3.GetNamespace("data")
+		for i := range 50 {
+			k := fmt.Appendf(nil, "post%d-%04d", round, i)
+			v := fmt.Appendf(nil, "pval%d-%04d", round, i)
+			require.NoError(t, wtx3.Put(ns3, k, v))
+		}
+		require.NoError(t, wtx3.Commit())
+	}
+
+	// The old reader must still see its snapshot correctly.
+	// If checkpoint ignored the reader lock, the WAL was reset and the
+	// post-checkpoint writes overwrote frames the reader depends on,
+	// causing corrupt/wrong reads.
+	for i := range 100 {
+		k := fmt.Appendf(nil, "key-%04d", i)
+		expected := fmt.Sprintf("val-%04d", i)
+		val, err := rtx.Get(rns, k)
+		require.NoError(t, err, "failed to read key-%04d after checkpoint+writes", i)
+		require.Equal(t, expected, string(val), "wrong value for key-%04d after checkpoint+writes", i)
+	}
+
+	require.NoError(t, rtx.Rollback())
+}
