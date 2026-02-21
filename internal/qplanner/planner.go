@@ -105,11 +105,17 @@ func (p *Plan) ExplainString() string {
 
 // formatFullScanDetails returns a cost formula string for a full scan plan.
 func formatFullScanDetails(totalDocs, estimatedYield float64, needSort bool) string {
-	s := fmt.Sprintf("%.0f×fetch(%.1f) + %.0f×filter(%.1f)", totalDocs, CostDocFetch, totalDocs, CostFilter)
+	perDocCost := CostDocFetch
+	label := "fetch"
+	if totalDocs > 500 {
+		perDocCost = CostSeqRead
+		label = "seq"
+	}
+	s := fmt.Sprintf("%.0f×%s(%.1f) + %.0f×filter(%.1f)", totalDocs, label, perDocCost, totalDocs, CostFilter)
 	if needSort {
 		s += fmt.Sprintf(" + sort(%.0f)=%.1f", estimatedYield, sortCost(estimatedYield))
 	}
-	base := (totalDocs * CostDocFetch) + (totalDocs * CostFilter)
+	base := (totalDocs * perDocCost) + (totalDocs * CostFilter)
 	if needSort {
 		base += sortCost(estimatedYield)
 	}
@@ -118,25 +124,25 @@ func formatFullScanDetails(totalDocs, estimatedYield float64, needSort bool) str
 }
 
 // formatSeekDetails returns a cost formula string for an index seek plan.
-func formatSeekDetails(estRows, seekSortCost float64) string {
+func formatSeekDetails(estRows, fetchCost, seekSortCost float64) string {
 	s := fmt.Sprintf("seek(%.1f) + %.0f×fetch(%.1f) + %.0f×filter(%.1f)",
-		CostIndexSeek, estRows, CostDocFetch, estRows, CostFilter)
+		CostIndexSeek, estRows, fetchCost, estRows, CostFilter)
 	if seekSortCost > 0 {
 		s += fmt.Sprintf(" + sort=%.1f", seekSortCost)
 	}
-	total := (1 * CostIndexSeek) + (estRows * CostDocFetch) + (estRows * CostFilter) + seekSortCost
+	total := (1 * CostIndexSeek) + (estRows * fetchCost) + (estRows * CostFilter) + seekSortCost
 	s += fmt.Sprintf(" = %.1f", total)
 	return s
 }
 
 // formatScanDetails returns a cost formula string for an index scan plan.
-func formatScanDetails(scanRows float64, hasLimit bool) string {
+func formatScanDetails(scanRows, fetchCost float64, hasLimit bool) string {
 	s := fmt.Sprintf("%.0f×seek(%.1f) + %.0f×fetch(%.1f) + %.0f×filter(%.1f)",
-		scanRows, CostIndexSeek, scanRows, CostDocFetch, scanRows, CostFilter)
+		scanRows, CostIndexSeek, scanRows, fetchCost, scanRows, CostFilter)
 	if hasLimit {
 		s += " [limit-optimized]"
 	}
-	total := (scanRows * CostIndexSeek) + (scanRows * CostDocFetch) + (scanRows * CostFilter)
+	total := (scanRows * CostIndexSeek) + (scanRows * fetchCost) + (scanRows * CostFilter)
 	s += fmt.Sprintf(" = %.1f", total)
 	return s
 }
@@ -269,7 +275,8 @@ func BuildPlan(params *PlanParams) *Plan {
 
 		// Index seek cost: B-tree seek + fetch only matching docs + evaluate filter
 		// The key advantage is that e << totalDocs for selective queries
-		seekCost := (1 * CostIndexSeek) + (e * CostDocFetch) + (e * CostFilter)
+		fetchCost := indexFetchCost(totalDocs)
+		seekCost := (1 * CostIndexSeek) + (e * fetchCost) + (e * CostFilter)
 		seekSortCost := 0.0
 		if needSort && !idx.ExactSort {
 			seekSortCost = sortCost(filteredYield)
@@ -286,7 +293,7 @@ func BuildPlan(params *PlanParams) *Plan {
 			Name:    fmt.Sprintf("IndexSeek(%s)", idx.Info.Name),
 			Cost:    seekCost,
 			EstRows: e,
-			Details: formatSeekDetails(e, seekSortCost),
+			Details: formatSeekDetails(e, fetchCost, seekSortCost),
 		})
 
 		isBetter := seekCost < bestCost
@@ -311,6 +318,7 @@ func BuildPlan(params *PlanParams) *Plan {
 				continue
 			}
 
+			fetchCost := indexFetchCost(totalDocs)
 			var scanCost float64
 			if params.Limit > 0 {
 				// With LIMIT: expected docs to scan = LIMIT / P_total, capped at TotalDocs
@@ -321,10 +329,10 @@ func BuildPlan(params *PlanParams) *Plan {
 				if s < 1 {
 					s = 1
 				}
-				scanCost = (s * CostIndexSeek) + (s * CostDocFetch) + (s * CostFilter)
+				scanCost = (s * CostIndexSeek) + (s * fetchCost) + (s * CostFilter)
 			} else {
 				// Without LIMIT: scan all docs via index (no sort penalty)
-				scanCost = (totalDocs * CostIndexSeek) + (totalDocs * CostDocFetch) + (totalDocs * CostFilter)
+				scanCost = (totalDocs * CostIndexSeek) + (totalDocs * fetchCost) + (totalDocs * CostFilter)
 			}
 			// No sort penalty since index provides order
 
@@ -346,7 +354,7 @@ func BuildPlan(params *PlanParams) *Plan {
 				Name:    fmt.Sprintf("IndexScan(%s)", idx.Info.Name),
 				Cost:    scanCost,
 				EstRows: scanRows,
-				Details: formatScanDetails(scanRows, params.Limit > 0),
+				Details: formatScanDetails(scanRows, fetchCost, params.Limit > 0),
 			})
 
 			if scanCost < bestCost {
@@ -406,12 +414,30 @@ func BuildPlan(params *PlanParams) *Plan {
 }
 
 // computeFullScanCost computes the cost for a full collection scan.
+// For collections above the sequential-read threshold, cursor reads are much cheaper
+// than random B-tree point lookups, so we use CostSeqRead instead of CostDocFetch.
+// For small collections, B-tree depth is shallow and both access patterns
+// have similar cost, so we use CostDocFetch (preserving original behavior).
 func computeFullScanCost(totalDocs, estimatedYield float64, needSort bool) float64 {
-	cost := (totalDocs * CostDocFetch) + (totalDocs * CostFilter)
+	perDocCost := CostDocFetch
+	if totalDocs > 500 {
+		perDocCost = CostSeqRead
+	}
+	cost := (totalDocs * perDocCost) + (totalDocs * CostFilter)
 	if needSort {
 		cost += sortCost(estimatedYield)
 	}
 	return cost
+}
+
+// indexFetchCost returns the per-doc cost for random B-tree point lookups.
+// For large collections (>500 docs), deeper B-trees make each random lookup
+// more expensive due to additional tree level traversals (index + data trees).
+func indexFetchCost(totalDocs float64) float64 {
+	if totalDocs <= 500 {
+		return CostDocFetch
+	}
+	return CostDocFetch * math.Log10(totalDocs)
 }
 
 // sortCost computes the sort cost using n*log2(n)*CostSortSwap.

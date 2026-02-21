@@ -47,18 +47,11 @@ func (it *SortIter) Next() (key []byte, docId []byte, err error) {
 	it.idx++
 	docId = it.arena[e.off+uint32(e.keyLen)-uint32(e.docLen) : e.off+uint32(e.keyLen)]
 
-	// Pre-fetch and parse doc so planIterator.Doc() can reuse DocParsed
+	// Clear DocParsed so planIterator.Doc() does a lazy fetch by docId.
+	// collectAndSort() leaves DocParsed pointing at the last collected doc,
+	// which is NOT the doc for this sorted entry.
 	if it.Plan != nil {
-		var gerr error
-		it.Buf.DocBuf, gerr = it.Data.AppendValue(docId, it.Buf.DocBuf[:0])
-		if gerr != nil {
-			return nil, nil, gerr
-		}
-		doc, perr := it.Buf.Parser.Parse(it.Buf.DocBuf)
-		if perr != nil {
-			return nil, nil, perr
-		}
-		it.Plan.DocParsed = doc
+		it.Plan.DocParsed = nil
 	}
 
 	return docId, docId, nil

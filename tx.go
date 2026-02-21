@@ -120,6 +120,12 @@ func (w writeTx) Rollback() error {
 func (w writeTx) Commit() error {
 	if w.commonTx.version.CompareAndSwap(w.version, 0) {
 		defer txPool.Put(w.commonTx)
+		if w.modified {
+			if err := w.db.persistAllDirtySketches(w.writeTx); err != nil {
+				_ = w.writeTx.Rollback()
+				return err
+			}
+		}
 		err := w.writeTx.Commit()
 		if err == nil && w.modified {
 			w.db.recoveryController.OnWriteEvent()
