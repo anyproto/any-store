@@ -72,6 +72,7 @@ type index struct {
 	keysBuf     []anyenc.Tuple
 	keysBufPrev []anyenc.Tuple
 	uniqBuf     [][]anyenc.Tuple
+	fullKeyBuf  anyenc.Tuple // reusable buffer for non-unique index full keys (key+docId)
 }
 
 func validateIndexField(s string) (err error) {
@@ -142,9 +143,9 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 			}
 		} else {
 			// For non-unique indexes: key = Tuple(v1, v2, ..., docId), value = nil
-			fullKey := append(anyenc.Tuple(nil), key...)
-			fullKey = append(fullKey, idKey...)
-			if err := tx.Put(idx.ns, fullKey, nil); err != nil {
+			idx.fullKeyBuf = append(idx.fullKeyBuf[:0], key...)
+			idx.fullKeyBuf = append(idx.fullKeyBuf, idKey...)
+			if err := tx.Put(idx.ns, idx.fullKeyBuf, nil); err != nil {
 				return err
 			}
 		}
@@ -172,9 +173,9 @@ func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 				}
 			}
 		} else {
-			fullKey := append(anyenc.Tuple(nil), key...)
-			fullKey = append(fullKey, idKey...)
-			if err := tx.Delete(idx.ns, fullKey); err != nil {
+			idx.fullKeyBuf = append(idx.fullKeyBuf[:0], key...)
+			idx.fullKeyBuf = append(idx.fullKeyBuf, idKey...)
+			if err := tx.Delete(idx.ns, idx.fullKeyBuf); err != nil {
 				if !errors.Is(err, btree.ErrKeyNotFound) {
 					return err
 				}

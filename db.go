@@ -646,6 +646,20 @@ func (db *db) onCollectionClose(name string) {
 	db.mu.Unlock()
 }
 
+// persistAllDirtySketches writes all modified sketches for all open collections.
+// Called once per write transaction commit to batch sketch persistence.
+func (db *db) persistAllDirtySketches(tx *btree.WriteTx) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	for _, coll := range db.openedCollections {
+		c := coll.(*collection)
+		if err := c.persistSketches(tx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // getIndexInfos reads all index metadata for a collection from the system namespace
 func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, error) {
 	prefix := indexKeyPrefix(collName)

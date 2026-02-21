@@ -253,6 +253,9 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		}
 		result.Modified++
 	}
+	if result.Modified > 0 {
+		tx.SetModified()
+	}
 	return
 }
 
@@ -317,6 +320,9 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 		}
 		result.Matched++
 		result.Modified++
+	}
+	if result.Modified > 0 {
+		tx.SetModified()
 	}
 	return
 }

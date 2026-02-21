@@ -204,7 +204,7 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 				return txErr
 			}
 		}
-		return c.persistSketches(tx)
+		return nil
 	})
 	return
 }
@@ -366,10 +366,6 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 		return
 	}
 
-	if err = c.persistSketches(tx); err != nil {
-		return false, err
-	}
-
 	return true, nil
 }
 
@@ -405,7 +401,7 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err erro
 		if insErr != nil {
 			return false, insErr
 		}
-		return true, c.persistSketches(tx)
+		return true, nil
 	})
 	return err
 }
@@ -436,9 +432,6 @@ func (c *collection) deleteItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, id [
 			if err = idx.deleteKeys(tx, it); err != nil {
 				return err
 			}
-		}
-		if err = c.persistSketches(tx); err != nil {
-			return err
 		}
 	}
 	return tx.Delete(c.ns, id)
