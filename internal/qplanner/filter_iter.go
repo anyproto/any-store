@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/internal/btree"
 	"github.com/anyproto/any-store/query"
 	"github.com/anyproto/any-store/syncpool"
 )
@@ -13,11 +14,12 @@ import (
 // It reuses upstream cached DocParsed when available (e.g. from FetchIter),
 // and caches its own parsed result in Plan.DocParsed to avoid double-fetch.
 type FilterIter struct {
-	Source Iterator
-	Data   *CursorSource
-	Filter query.Filter
-	Buf    *syncpool.DocBuffer
-	Plan   *Plan // set by BuildPlan to cache fetched doc values
+	Source     Iterator
+	Data       *CursorSource
+	Filter     query.Filter
+	Buf        *syncpool.DocBuffer
+	Plan       *Plan // set by BuildPlan to cache fetched doc values
+	dataCursor *btree.Cursor
 }
 
 func (it *FilterIter) Next() (key []byte, docId []byte, err error) {
@@ -32,12 +34,18 @@ func (it *FilterIter) Next() (key []byte, docId []byte, err error) {
 			// Reuse parsed value from upstream FetchIter
 			doc = it.Plan.DocParsed
 		} else {
-			var gerr error
-			it.Buf.DocBuf, gerr = it.Data.AppendValue(docId, it.Buf.DocBuf[:0])
-			if gerr != nil {
+			if it.dataCursor == nil {
+				it.dataCursor = it.Data.NewCursor()
+			}
+			if serr := it.dataCursor.SeekExact(docId); serr != nil {
 				// doc may have been deleted from data but still in index; skip
 				continue
 			}
+			val, verr := it.dataCursor.Value()
+			if verr != nil {
+				return nil, nil, verr
+			}
+			it.Buf.DocBuf = append(it.Buf.DocBuf[:0], val...)
 
 			var perr error
 			doc, perr = it.Buf.Parser.Parse(it.Buf.DocBuf)
@@ -61,6 +69,9 @@ func (it *FilterIter) Next() (key []byte, docId []byte, err error) {
 
 // Close releases resources by closing the source iterator.
 func (it *FilterIter) Close() {
+	if it.dataCursor != nil {
+		it.dataCursor.Close()
+	}
 	if it.Source != nil {
 		it.Source.Close()
 	}

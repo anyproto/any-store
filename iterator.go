@@ -5,6 +5,7 @@ import (
 	"io"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/internal/btree"
 	"github.com/anyproto/any-store/internal/qplanner"
 	"github.com/anyproto/any-store/syncpool"
 )
@@ -26,14 +27,15 @@ type Iterator interface {
 
 // planIterator wraps a qplanner.Plan to implement the public Iterator interface.
 type planIterator struct {
-	plan   *qplanner.Plan
-	tx     ReadTx
-	buf    *syncpool.DocBuffer
-	qb     *queryBuilder
-	data   *qplanner.CursorSource
-	err    error
-	closed bool
-	docId  []byte
+	plan       *qplanner.Plan
+	tx         ReadTx
+	buf        *syncpool.DocBuffer
+	qb         *queryBuilder
+	data       *qplanner.CursorSource
+	dataCursor *btree.Cursor
+	err        error
+	closed     bool
+	docId      []byte
 }
 
 func (pi *planIterator) Next() bool {
@@ -64,11 +66,17 @@ func (pi *planIterator) Doc() (Doc, error) {
 	if pi.plan.DocParsed != nil {
 		doc = pi.plan.DocParsed
 	} else {
-		var err error
-		pi.buf.DocBuf, err = pi.data.AppendValue(pi.docId, pi.buf.DocBuf[:0])
+		if pi.dataCursor == nil {
+			pi.dataCursor = pi.data.NewCursor()
+		}
+		if err := pi.dataCursor.SeekExact(pi.docId); err != nil {
+			return nil, err
+		}
+		val, err := pi.dataCursor.Value()
 		if err != nil {
 			return nil, err
 		}
+		pi.buf.DocBuf = append(pi.buf.DocBuf[:0], val...)
 		var perr error
 		doc, perr = pi.buf.Parser.Parse(pi.buf.DocBuf)
 		if perr != nil {
@@ -90,6 +98,9 @@ func (pi *planIterator) Close() (err error) {
 		return ErrIterClosed
 	}
 	pi.closed = true
+	if pi.dataCursor != nil {
+		pi.dataCursor.Close()
+	}
 	if pi.plan != nil {
 		pi.plan.Close()
 	}
