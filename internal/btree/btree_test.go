@@ -938,6 +938,133 @@ func TestCursorValueOnMultiLevel(t *testing.T) {
 	require.NoError(t, rtx.Rollback())
 }
 
+// === SeekNear / SeekExact Tests ===
+
+func TestCursor_SeekNear(t *testing.T) {
+	db, ns := tempDBWithNS(t, "data")
+	n := 500
+	insertManyKeys(t, db, ns, n)
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	ns2, _ := db.getNamespaceLocked("data")
+	cur := rtx.NewCursor(ns2)
+
+	// Verify SeekNear matches Seek for every existing key.
+	for i := range n {
+		k := fmt.Appendf(nil, "key-%04d", i)
+		seekCur := rtx.NewCursor(ns2)
+		require.NoError(t, seekCur.Seek(k))
+		require.NoError(t, cur.SeekNear(k))
+		assert.Equal(t, seekCur.Valid(), cur.Valid(), "valid mismatch for key %s", k)
+		if cur.Valid() {
+			got, _ := cur.Key()
+			want, _ := seekCur.Key()
+			assert.Equal(t, want, got, "key mismatch for %s", k)
+		}
+	}
+
+	// Key not found — SeekNear returns first key >= target (gap key).
+	require.NoError(t, cur.Seek([]byte("key-0100"))) // position on leaf
+	require.NoError(t, cur.SeekNear([]byte("key-0100x")))
+	assert.True(t, cur.Valid())
+	k, _ := cur.Key()
+	assert.Equal(t, []byte("key-0101"), k)
+
+	// Key before all keys in tree — falls back to Seek.
+	require.NoError(t, cur.SeekNear([]byte("aaa")))
+	assert.True(t, cur.Valid())
+	k, _ = cur.Key()
+	assert.Equal(t, []byte("key-0000"), k)
+
+	// Key after all keys in tree.
+	require.NoError(t, cur.SeekNear([]byte("zzz")))
+	assert.False(t, cur.Valid())
+}
+
+func TestCursor_SeekNear_EmptyTree(t *testing.T) {
+	db, ns := tempDBWithNS(t, "empty")
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	cur := rtx.NewCursor(ns)
+
+	require.NoError(t, cur.SeekNear([]byte("anything")))
+	assert.False(t, cur.Valid())
+}
+
+func TestCursor_SeekExact(t *testing.T) {
+	db, ns := tempDBWithNS(t, "data")
+	n := 200
+	insertManyKeys(t, db, ns, n)
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	ns2, _ := db.getNamespaceLocked("data")
+	cur := rtx.NewCursor(ns2)
+
+	// Existing keys succeed.
+	for i := range n {
+		k := fmt.Appendf(nil, "key-%04d", i)
+		require.NoError(t, cur.SeekExact(k), "SeekExact should succeed for %s", k)
+		assert.True(t, cur.Valid())
+		got, _ := cur.Key()
+		assert.Equal(t, k, got)
+	}
+
+	// Missing keys return ErrKeyNotFound.
+	assert.ErrorIs(t, cur.SeekExact([]byte("key-9999")), ErrKeyNotFound)
+	assert.ErrorIs(t, cur.SeekExact([]byte("nonexistent")), ErrKeyNotFound)
+	assert.ErrorIs(t, cur.SeekExact([]byte("aaa")), ErrKeyNotFound)
+}
+
+func TestCursor_SeekExact_EmptyTree(t *testing.T) {
+	db, ns := tempDBWithNS(t, "empty")
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	cur := rtx.NewCursor(ns)
+	assert.ErrorIs(t, cur.SeekExact([]byte("anything")), ErrKeyNotFound)
+}
+
+func TestCursor_SeekNear_SameLeaf(t *testing.T) {
+	db, ns := tempDBWithNS(t, "data")
+	n := 500
+	insertManyKeys(t, db, ns, n)
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	ns2, _ := db.getNamespaceLocked("data")
+	cur := rtx.NewCursor(ns2)
+
+	// Position cursor on a leaf in the middle of the tree.
+	require.NoError(t, cur.Seek([]byte("key-0250")))
+	require.True(t, cur.Valid())
+	stackLen := len(cur.stack)
+	leafPgno := cur.stack[stackLen-1].pgno
+
+	// SeekNear to nearby keys on the same leaf should reuse the pinned page.
+	// Try a few keys that are close and likely on the same leaf.
+	for delta := -3; delta <= 3; delta++ {
+		idx := 250 + delta
+		if idx < 0 || idx >= n {
+			continue
+		}
+		k := fmt.Appendf(nil, "key-%04d", idx)
+		require.NoError(t, cur.SeekNear(k))
+		require.True(t, cur.Valid(), "should be valid for %s", k)
+		got, _ := cur.Key()
+		assert.Equal(t, k, got)
+		// Stack length shouldn't change — still on same leaf.
+		if cur.stack[len(cur.stack)-1].pgno == leafPgno {
+			assert.Equal(t, stackLen, len(cur.stack), "stack length changed for nearby key %s", k)
+		}
+	}
+}
+
 // === Delete from multi-level tree ===
 
 func TestDeleteFromMultiLevelTree(t *testing.T) {

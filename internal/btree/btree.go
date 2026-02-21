@@ -2200,6 +2200,96 @@ func (c *Cursor) Seek(key []byte) error {
 	return nil
 }
 
+// leafKeyAt extracts the key at cell index idx from a leaf page.
+// The returned slice points into the page buffer. This is a lightweight
+// alternative to parseLeafCellWithSize when only the key is needed.
+func leafKeyAt(pg *page, idx int) ([]byte, error) {
+	data := pg.data
+	dataLen := len(data)
+	off, err := pg.getCellOffsetSafe(idx)
+	if err != nil {
+		return nil, err
+	}
+	pos := int(off)
+	if pos >= dataLen {
+		return nil, ErrCorrupt
+	}
+	b := data[pos]
+	if b < 0x80 {
+		end := pos + 1 + int(b)
+		if end > dataLen {
+			return nil, ErrCorrupt
+		}
+		return data[pos+1 : end], nil
+	}
+	keyLen, n, verr := getVarintSafe(data[pos:])
+	if verr != nil {
+		return nil, ErrCorrupt
+	}
+	end := pos + n + int(keyLen)
+	if int(keyLen) < 0 || end > dataLen {
+		return nil, ErrCorrupt
+	}
+	return data[pos+n : end], nil
+}
+
+// SeekNear positions the cursor at the first key >= the given key.
+// It optimises for the case where the target key falls within the currently
+// pinned leaf page, avoiding a full root-to-leaf traversal.
+func (c *Cursor) SeekNear(key []byte) error {
+	// Fast path: check if key falls within the pinned leaf page.
+	if c.valid && len(c.stack) > 0 {
+		leaf := &c.stack[len(c.stack)-1]
+		if leaf.pg != nil {
+			n := int(leaf.pg.header.cellCount)
+			if n > 0 {
+				firstKey, err := leafKeyAt(leaf.pg, 0)
+				if err != nil {
+					return err
+				}
+				lastKey, err := leafKeyAt(leaf.pg, n-1)
+				if err != nil {
+					return err
+				}
+				if bytes.Compare(key, firstKey) >= 0 && bytes.Compare(key, lastKey) <= 0 {
+					idx, _, serr := searchLeafPage(leaf.pg, key)
+					if serr != nil {
+						return serr
+					}
+					leaf.cellIdx = idx
+					if idx < n {
+						c.valid = true
+					} else {
+						return c.Next()
+					}
+					return nil
+				}
+			}
+		}
+	}
+	// Slow path: full traversal from root.
+	return c.Seek(key)
+}
+
+// SeekExact positions the cursor at the entry matching key exactly.
+// Returns ErrKeyNotFound if the key does not exist.
+func (c *Cursor) SeekExact(key []byte) error {
+	if err := c.SeekNear(key); err != nil {
+		return err
+	}
+	if !c.valid {
+		return ErrKeyNotFound
+	}
+	k, err := c.Key()
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(k, key) {
+		return ErrKeyNotFound
+	}
+	return nil
+}
+
 // Key returns the current key.
 // The returned slice points directly into the pinned page buffer and is valid
 // until the next cursor movement or Close(). Equivalent to sqlite3BtreePayloadFetch.
