@@ -27,4 +27,13 @@
 //
 // Data is organized into namespaces, each backed by a separate B-tree root page.
 // A master namespace table (on page 1) tracks all namespace root pages.
+//
+// # Build Tags
+//
+//   - nopwritev: Disable pwritev scatter-gather I/O for WAL writes.
+//     Forces the copy-based fallback (single pwrite per batch) on all platforms.
+//     Useful for debugging or working around kernel bugs.
+//
+//     go build  -tags nopwritev ./...
+//     go test   -tags nopwritev ./...
 package btree
