@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package btree
 
@@ -17,24 +17,20 @@ func walWriteFrameData(fd uintptr, hdrBuf []byte, pages []*page, offset int64, p
 	iovecs := make([]syscall.Iovec, 2*n)
 	for i, p := range pages {
 		hdrStart := i * walFrameSize
-		iovecs[2*i] = syscall.Iovec{
-			Base: &hdrBuf[hdrStart],
-			Len:  walFrameSize,
-		}
-		iovecs[2*i+1] = syscall.Iovec{
-			Base: &p.data[0],
-			Len:  uint64(pageSize),
-		}
+		iovecs[2*i].Base = &hdrBuf[hdrStart]
+		iovecs[2*i].SetLen(walFrameSize)
+		iovecs[2*i+1].Base = &p.data[0]
+		iovecs[2*i+1].SetLen(int(pageSize))
 	}
 
-	// Write all iovecs, handling partial writes and IOV_MAX (1024 on Linux).
+	// Write all iovecs, handling partial writes and IOV_MAX (1024 on Linux and darwin).
 	for len(iovecs) > 0 {
 		batch := iovecs
 		if len(batch) > 1024 {
 			batch = batch[:1024]
 		}
 		written, _, errno := syscall.Syscall6(
-			syscall.SYS_PWRITEV,
+			sysPWRITEV,
 			fd,
 			uintptr(unsafe.Pointer(&batch[0])),
 			uintptr(len(batch)),
@@ -49,14 +45,17 @@ func walWriteFrameData(fd uintptr, hdrBuf []byte, pages []*page, offset int64, p
 		}
 		offset += int64(written)
 		// Advance past fully written iovecs.
-		rem := uint64(written)
+		// Use uintptr arithmetic since written is uintptr and Iovec.Len
+		// is uint64 on all targeted platforms (linux, darwin 64-bit).
+		rem := uintptr(written)
 		for len(iovecs) > 0 && rem > 0 {
-			if rem >= iovecs[0].Len {
-				rem -= iovecs[0].Len
+			iovLen := uintptr(iovecs[0].Len)
+			if rem >= iovLen {
+				rem -= iovLen
 				iovecs = iovecs[1:]
 			} else {
 				iovecs[0].Base = (*byte)(unsafe.Add(unsafe.Pointer(iovecs[0].Base), rem))
-				iovecs[0].Len -= rem
+				iovecs[0].SetLen(int(iovLen - rem))
 				rem = 0
 			}
 		}
