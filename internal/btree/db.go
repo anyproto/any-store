@@ -288,9 +288,9 @@ func (db *DB) putWriteTx(tx *WriteTx) {
 	db.writeTxPool.Put(tx)
 }
 
-// Checkpoint triggers a WAL checkpoint, writing committed WAL frames
-// back to the database file.
-func (db *DB) Checkpoint() error {
+// Checkpoint triggers a WAL checkpoint with the specified mode, writing
+// committed WAL frames back to the database file.
+func (db *DB) Checkpoint(mode CheckpointMode) error {
 	if db.closing.Load() {
 		return ErrClosed
 	}
@@ -299,7 +299,7 @@ func (db *DB) Checkpoint() error {
 	if db.closing.Load() {
 		return ErrClosed
 	}
-	return db.pager.checkpoint()
+	return db.pager.checkpointWithMode(mode)
 }
 
 // UpdateLocalCounters manually sets the local counter cache. This is used by

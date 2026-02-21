@@ -25,7 +25,7 @@ Deviations from original:
   doublings (4096 rows) to keep test runtime reasonable while still creating a
   large enough WAL to test the same behavior. Each row has 100-byte random values.
 - wal9-1.3 through 1.5: Skipped -- check exact file/SHM sizes (SQLite internals).
-- wal9-1.6: PRAGMA wal_checkpoint mapped to db.Checkpoint().
+- wal9-1.6: PRAGMA wal_checkpoint mapped to db.Checkpoint(CheckpointFull).
 - wal9-1.7: Original uses db2 (second connection). Adapted as begin write, insert,
   rollback on the same DB. Verifies rollback worked by checking row count unchanged.
 - wal64k-1.0 through 1.3: Skipped -- require test_syscall pagesize and SHM file checks.
@@ -133,7 +133,7 @@ func TestSqlite_WAL9(t *testing.T) {
 	// --- wal9-1.6 (lines 69-72) ---
 	// Original: PRAGMA wal_checkpoint -> verify a==0, b==c, b>14500
 	t.Run("1.6_checkpoint", func(t *testing.T) {
-		require.NoError(t, db.Checkpoint())
+		require.NoError(t, db.Checkpoint(CheckpointFull))
 	})
 
 	// --- wal9-1.7 (lines 85-91) ---

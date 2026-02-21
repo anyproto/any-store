@@ -184,7 +184,6 @@ func TestRecovery_FlushModes(t *testing.T) {
 		name string
 		mode FlushMode
 	}{
-		{"FsyncOnly", FlushModeFsync},
 		{"Passive", FlushModeCheckpointPassive},
 		{"Full", FlushModeCheckpointFull},
 		{"Restart", FlushModeCheckpointRestart},

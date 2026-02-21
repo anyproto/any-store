@@ -87,7 +87,7 @@ func TestInMemory_Checkpoint(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// Manual checkpoint should succeed (moves frames to pcache)
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	// Data should still be readable after checkpoint
 	rtx, err := db.BeginRead()
@@ -318,7 +318,7 @@ func TestInMemory_LargeData(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// Checkpoint and verify data survives
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	rtx, err := db.BeginRead()
 	require.NoError(t, err)

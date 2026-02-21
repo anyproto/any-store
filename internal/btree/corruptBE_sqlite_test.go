@@ -84,7 +84,7 @@ func setupCorruptBSmall(t *testing.T) (string, []byte, uint32, int) {
 	rootPage := ns.RootPage()
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.IntegrityCheck())
 	require.NoError(t, db.Close())
 
@@ -126,7 +126,7 @@ func setupCorruptBLarge(t *testing.T) (string, []byte, uint32, int) {
 	rootPage := ns.RootPage()
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.IntegrityCheck())
 	require.NoError(t, db.Close())
 
@@ -556,7 +556,7 @@ func TestSqlite_CorruptC_2_13(t *testing.T) {
 	require.NoError(t, tx.Put(ns, []byte{1}, []byte{1}))
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	// Read, corrupt firstFreeBlk on page 1 (offset 100 = B-tree header start,
@@ -617,7 +617,7 @@ func TestSqlite_CorruptC_2_14(t *testing.T) {
 	require.NoError(t, tx.Put(ns, key, bigVal))
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	// Read file, corrupt bytes near EOF
@@ -684,7 +684,7 @@ func TestSqlite_CorruptC_3_ByteFuzz(t *testing.T) {
 	}
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.IntegrityCheck())
 	require.NoError(t, db.Close())
 
@@ -798,7 +798,7 @@ func TestSqlite_CorruptD_1_1_1(t *testing.T) {
 	}
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	data, err := os.ReadFile(path)
@@ -867,7 +867,7 @@ func TestSqlite_CorruptD_1_1_2(t *testing.T) {
 	}
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	data, err := os.ReadFile(path)
@@ -938,7 +938,7 @@ func TestSqlite_CorruptE_3_KeyOrderingVectors(t *testing.T) {
 	rootPage := ns.RootPage()
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.IntegrityCheck())
 	require.NoError(t, db.Close())
 

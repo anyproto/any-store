@@ -105,7 +105,7 @@ func TestIntegrityCheckAfterCheckpoint(t *testing.T) {
 		require.NoError(t, tx.Put(ns, []byte(key), []byte("val")))
 	}
 	require.NoError(t, tx.Commit())
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.IntegrityCheck())
 }
 
@@ -349,7 +349,7 @@ func TestIntegrityCheckReopen(t *testing.T) {
 		require.NoError(t, tx.Put(ns, []byte(fmt.Sprintf("key-%04d", i)), []byte("value")))
 	}
 	require.NoError(t, tx.Commit())
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	db2, err := Open(path, DefaultOptions())

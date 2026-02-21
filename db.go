@@ -486,7 +486,7 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 	srcPath := db.btreeDB.Path()
 
 	// Checkpoint first to ensure all WAL data is in the main file
-	if err = db.btreeDB.Checkpoint(); err != nil {
+	if err = db.btreeDB.Checkpoint(btree.CheckpointFull); err != nil {
 		return err
 	}
 

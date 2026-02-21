@@ -27,13 +27,31 @@ type Config struct {
 	Durability DurabilityConfig
 }
 
+// FlushMode controls checkpoint behavior during flush, matching SQLite's
+// SQLITE_CHECKPOINT_* modes.
 type FlushMode string
 
 const (
-	FlushModeFsync             FlushMode = "FSYNC"              // Only fsync, no checkpoint
-	FlushModeCheckpointPassive FlushMode = "CHECKPOINT_PASSIVE" // Checkpoint with PASSIVE mode
-	FlushModeCheckpointFull    FlushMode = "CHECKPOINT_FULL"    // Checkpoint with FULL mode
-	FlushModeCheckpointRestart FlushMode = "CHECKPOINT_RESTART" // Checkpoint with RESTART mode
+	// FlushModeCheckpointPassive checkpoints as many WAL frames as possible
+	// without waiting for any readers or writers to finish. Might leave the
+	// checkpoint unfinished if there are concurrent readers or writers.
+	FlushModeCheckpointPassive FlushMode = "CHECKPOINT_PASSIVE"
+
+	// FlushModeCheckpointFull waits until there is no writer and all readers
+	// are reading from the most recent snapshot, then checkpoints all frames.
+	// Blocks new writers while pending, but new readers continue unimpeded.
+	// The WAL is preserved (not reset).
+	FlushModeCheckpointFull FlushMode = "CHECKPOINT_FULL"
+
+	// FlushModeCheckpointRestart is like Full but after checkpointing also
+	// waits until all readers are reading from the database file only, then
+	// resets the WAL so new writes start from the beginning. Blocks new
+	// writers while pending, but does not impede readers.
+	FlushModeCheckpointRestart FlushMode = "CHECKPOINT_RESTART"
+
+	// FlushModeCheckpointTruncate is like Restart but also truncates the WAL
+	// file to zero bytes.
+	FlushModeCheckpointTruncate FlushMode = "CHECKPOINT_TRUNCATE"
 )
 
 type DurabilityConfig struct {

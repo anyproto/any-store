@@ -79,7 +79,7 @@ func TestSqlite_CorruptI_4(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// Checkpoint and close
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	// Read file and corrupt
@@ -165,7 +165,7 @@ func TestSqlite_CorruptI_6(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// Checkpoint and close
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	// Read file and corrupt
@@ -237,7 +237,7 @@ func TestSqlite_CorruptI_8(t *testing.T) {
 	putN(t, db, "t1", numRows, 300)
 
 	// Checkpoint and close
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	// Read file and corrupt
@@ -343,7 +343,7 @@ func TestSqlite_CorruptJ_1(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// Checkpoint and close
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	// Read file and corrupt
@@ -418,7 +418,7 @@ func TestSqlite_CorruptL_17(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// Checkpoint to flush everything to main DB
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	// Verify DB is large
 	dbInfo, err := os.Stat(path)
@@ -458,7 +458,7 @@ func TestSqlite_CorruptL_17(t *testing.T) {
 	// Attempt Checkpoint -- should fail because WAL references pages
 	// beyond the truncated DB
 	panicked := catchPanic(func() {
-		err = db2.Checkpoint()
+		err = db2.Checkpoint(CheckpointFull)
 	})
 	assert.Nil(t, panicked, "Checkpoint should not panic on truncated DB")
 	// We expect either Checkpoint to error or the data to be corrupted.

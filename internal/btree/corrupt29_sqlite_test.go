@@ -88,7 +88,7 @@ func setupCorrupt29DB(t *testing.T) (string, []byte, uint32) {
 	rootPage := ns.RootPage()
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.IntegrityCheck())
 	require.NoError(t, db.Close())
 
@@ -340,7 +340,7 @@ func setupCorrupt7DB(t *testing.T) (string, []byte, uint32) {
 	rootPage := ns.RootPage()
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.IntegrityCheck())
 	require.NoError(t, db.Close())
 
@@ -508,7 +508,7 @@ func TestSqlite_Corrupt2_1_3(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Put(ns, []byte{1}, []byte{1}))
 	require.NoError(t, tx.Commit())
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	template, err := os.ReadFile(path)
@@ -592,7 +592,7 @@ func TestSqlite_Corrupt2_1_5(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Put(ns, []byte{1}, []byte{1}))
 	require.NoError(t, tx.Commit())
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	data, err := os.ReadFile(path)
@@ -660,7 +660,7 @@ func TestSqlite_Corrupt2_5_1(t *testing.T) {
 	t2Root := ns2.RootPage()
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.IntegrityCheck())
 	require.NoError(t, db.Close())
 
@@ -733,7 +733,7 @@ func TestSqlite_Corrupt2_7_1a(t *testing.T) {
 	rootPage := ns.RootPage()
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	data, err := os.ReadFile(path)
@@ -800,7 +800,7 @@ func TestSqlite_Corrupt2_7_1b(t *testing.T) {
 	rootPage := ns.RootPage()
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	data, err := os.ReadFile(path)
@@ -866,7 +866,7 @@ func TestSqlite_Corrupt2_8_1(t *testing.T) {
 	rootPage := ns.RootPage()
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	data, err := os.ReadFile(path)
@@ -928,7 +928,7 @@ func TestSqlite_Corrupt2_14_2(t *testing.T) {
 	require.NoError(t, tx.Delete(ns, []byte{1}))
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	data, err := os.ReadFile(path)
@@ -993,7 +993,7 @@ func setupCorrupt6DB(t *testing.T) (string, []byte, uint32) {
 	rootPage := ns.RootPage()
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.IntegrityCheck())
 	require.NoError(t, db.Close())
 
@@ -1379,7 +1379,7 @@ func setupCorrupt4DB(t *testing.T) (string, []byte) {
 	require.NoError(t, tx.Delete(ns, []byte{1}))
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	template, err := os.ReadFile(path)
@@ -1494,7 +1494,7 @@ func setupCorrupt9DB(t *testing.T) (string, []byte) {
 	}
 	require.NoError(t, tx.Commit())
 
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.IntegrityCheck())
 	require.NoError(t, db.Close())
 

@@ -259,7 +259,7 @@ func TestSqlite_Walcrash_5(t *testing.T) {
 			}
 
 			// Checkpoint
-			require.NoError(t, db.Checkpoint())
+			require.NoError(t, db.Checkpoint(CheckpointFull))
 
 			// Insert 3 more rows (after checkpoint, each in own tx)
 			for j := 0; j < 3; j++ {
@@ -334,7 +334,7 @@ func TestSqlite_Walcrash_6(t *testing.T) {
 			}
 
 			// Checkpoint
-			require.NoError(t, db.Checkpoint())
+			require.NoError(t, db.Checkpoint(CheckpointFull))
 
 			// Insert 4 rows of 9000-byte overflow blobs (each in own tx)
 			for j := 0; j < 4; j++ {
@@ -396,7 +396,7 @@ func TestSqlite_Walcrash_7(t *testing.T) {
 			require.NoError(t, tx.Commit())
 
 			// First checkpoint
-			require.NoError(t, db.Checkpoint())
+			require.NoError(t, db.Checkpoint(CheckpointFull))
 
 			// Insert more data (updates master table / page 1)
 			tx, err = db.BeginWrite()
@@ -409,7 +409,7 @@ func TestSqlite_Walcrash_7(t *testing.T) {
 			// Second checkpoint + crash
 			// DEVIATION: In original, crash happens DURING checkpoint of main DB.
 			// We do checkpoint then rawClose (tests recovery from clean checkpoint state).
-			require.NoError(t, db.Checkpoint())
+			require.NoError(t, db.Checkpoint(CheckpointFull))
 			rawClose(db)
 
 			// Reopen and verify

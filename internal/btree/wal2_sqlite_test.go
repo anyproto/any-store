@@ -126,7 +126,7 @@ func TestSqlite_WAL2_7(t *testing.T) {
 	defer func() { _ = db2.Close() }()
 
 	// Try checkpoint
-	_ = db2.Checkpoint()
+	_ = db2.Checkpoint(CheckpointFull)
 
 	// Verify: namespace t1 should not exist or should have no data,
 	// because the CREATE TABLE frame was corrupted and skipped.
@@ -211,7 +211,7 @@ func TestSqlite_WAL2_8(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// PRAGMA wal_checkpoint
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	// Verify: t2's root page >= 8192
 	ns2, err := db.GetNamespace("t2")

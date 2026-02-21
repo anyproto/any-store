@@ -116,23 +116,27 @@ type CheckpointMode int
 
 const (
 	// CheckpointPassive checkpoints as many frames as possible without waiting
-	// for any readers or writers to finish. The busy handler is never invoked.
-	// Frames that require blocking on a reader are skipped.
+	// for any database readers or writers to finish. The busy handler is never
+	// invoked. Might leave the checkpoint unfinished if there are concurrent
+	// readers or writers.
 	CheckpointPassive CheckpointMode = iota
 
-	// CheckpointFull waits for concurrent readers to finish, then checkpoints
-	// all frames. The busy handler is invoked when waiting for readers that
-	// block progress. Does not reset the WAL. Also acquires the write lock
-	// to block new writers during the checkpoint.
+	// CheckpointFull blocks (invokes the busy handler) until there is no
+	// database writer and all readers are reading from the most recent
+	// database snapshot. It then checkpoints all frames in the log file and
+	// syncs the database file. Blocks new writers while pending, but new
+	// readers are allowed to continue. Does not reset the WAL.
 	CheckpointFull
 
-	// CheckpointRestart is like CheckpointFull but also resets the WAL back
-	// to the beginning so new writes start from frame 1. Waits for all
-	// readers to finish using the WAL.
+	// CheckpointRestart works the same as CheckpointFull with the addition
+	// that after checkpointing it blocks (calls the busy handler) until all
+	// readers are reading from the database file only. This ensures that the
+	// next writer will restart the log file from the beginning. Blocks new
+	// writers while pending, but does not impede readers.
 	CheckpointRestart
 
-	// CheckpointTruncate is like CheckpointRestart but also truncates the
-	// WAL file to zero bytes after resetting.
+	// CheckpointTruncate works the same as CheckpointRestart with the addition
+	// that it also truncates the log file to zero bytes.
 	CheckpointTruncate
 )
 
@@ -1574,7 +1578,7 @@ func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode Checkpoint
 		// Nothing new to checkpoint.
 		// For non-PASSIVE modes, check if we need to wait for readers
 		// to finish before attempting RESTART/TRUNCATE.
-		return w.checkpointPost(mode, xBusy, hasWriteLock)
+		return w.checkpointPost(mode, xBusy)
 	}
 
 	// Acquire exclusive lock on reader slot 0 before backfilling,
@@ -1583,7 +1587,7 @@ func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode Checkpoint
 	lockErr := walBusyLock(w.index, xBusy, lockRead0, lockExclusive)
 	if lockErr == ErrBusy {
 		// Reader on slot 0 active; can't backfill but not a fatal error.
-		return w.checkpointPost(mode, xBusy, hasWriteLock)
+		return w.checkpointPost(mode, xBusy)
 	}
 	if lockErr != nil {
 		return lockErr
@@ -1599,9 +1603,11 @@ func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode Checkpoint
 	w.index.mu.Unlock()
 
 	// Sync the WAL file before copying frames to the database, matching
-	// SQLite's walCheckpoint(). This ensures all WAL data is durable on disk
-	// before we start overwriting the database file with it.
-	if !w.noCommitSync && w.file != nil {
+	// SQLite's walCheckpoint() (CKPT_SYNC_FLAGS). This ensures all WAL data
+	// is durable on disk before we start overwriting the database file with it.
+	// Always sync regardless of noCommitSync: noCommitSync only skips per-commit
+	// syncs (like SQLite synchronous=NORMAL), but checkpoint always syncs.
+	if w.file != nil {
 		if err := fdatasync(w.file); err != nil {
 			_ = w.index.unlock(lockRead0, lockExclusive)
 			return err
@@ -1685,12 +1691,12 @@ func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode Checkpoint
 	// Release the reader lock held while backfilling
 	_ = w.index.unlock(lockRead0, lockExclusive)
 
-	return w.checkpointPost(mode, xBusy, hasWriteLock)
+	return w.checkpointPost(mode, xBusy)
 }
 
 // checkpointPost handles post-backfill logic: WAL reset for modes that
 // completed a full checkpoint.
-func (w *wal) checkpointPost(mode CheckpointMode, xBusy BusyHandler, hasWriteLock bool) error {
+func (w *wal) checkpointPost(mode CheckpointMode, xBusy BusyHandler) error {
 	w.index.mu.RLock()
 	backfill := w.index.nBackfill
 	w.index.mu.RUnlock()
@@ -1700,45 +1706,15 @@ func (w *wal) checkpointPost(mode CheckpointMode, xBusy BusyHandler, hasWriteLoc
 		return nil
 	}
 
-	// All frames are checkpointed. Try to reset the WAL.
-	switch {
-	case mode >= CheckpointRestart:
-		// RESTART/TRUNCATE: use the busy handler to wait for readers,
-		// then reset (and optionally truncate) the WAL.
+	// All frames are checkpointed. Only RESTART/TRUNCATE modes reset the WAL.
+	// FULL mode preserves the WAL as a crash-safety net: if a subsequent
+	// checkpoint partially writes pages to the DB and SIGKILL hits mid-backfill,
+	// the WAL data is still available for recovery.
+	if mode >= CheckpointRestart {
 		return w.tryResetWALWithBusy(xBusy, mode == CheckpointTruncate)
-
-	case hasWriteLock:
-		// FULL or PASSIVE-with-write-lock: try a non-blocking WAL reset.
-		// This preserves the original checkpoint() behavior where the WAL
-		// was always reset after a full checkpoint if no readers blocked it.
-		_ = w.tryResetWAL()
 	}
 
 	return nil
-}
-
-// tryResetWAL attempts to reset the WAL file after a full checkpoint.
-// Only succeeds if no readers are active on slots 1-4.
-// Must be called with w.mu held and lockCheckpoint + lockWrite acquired.
-func (w *wal) tryResetWAL() error {
-	// Check that no readers are active on slots 1-4.
-	// Slot 0 readers are OK -- they read from DB only.
-	allFree := true
-	for i := 1; i <= 4; i++ {
-		lockSlot := lockRead0 + i
-		if err := w.index.lock(lockSlot, lockExclusive); err == nil {
-			_ = w.index.unlock(lockSlot, lockExclusive)
-		} else {
-			allFree = false
-			break
-		}
-	}
-
-	if !allFree {
-		return nil // readers still active, can't reset WAL
-	}
-
-	return w.doResetWAL(true)
 }
 
 // tryResetWALWithBusy attempts to reset the WAL, using the busy handler

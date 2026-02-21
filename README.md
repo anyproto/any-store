@@ -101,7 +101,7 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
     Durability: anystore.DurabilityConfig{
         AutoFlush: true,
         IdleAfter: 20 * time.Second,  // Flush after 20s of inactivity
-        FlushMode: anystore.FlushModeCheckpointPassive, // other options are FlushModeFsync, FlushModeCheckpointFull, FlushModeCheckpointRestart
+        FlushMode: anystore.FlushModeCheckpointPassive, // other options are FlushModeCheckpointFull, FlushModeCheckpointRestart
         Sentinel:  true,  // Track dirty db state for automatic quickCheck on start
     },
 })

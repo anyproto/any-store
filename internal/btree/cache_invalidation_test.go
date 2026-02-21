@@ -380,7 +380,7 @@ func TestCacheInvalidation_FileReopened(t *testing.T) {
 	require.NoError(t, wtx.Commit())
 
 	// Checkpoint to ensure data is in the main file
-	require.NoError(t, db1.Checkpoint())
+	require.NoError(t, db1.Checkpoint(CheckpointFull))
 
 	// Get the counter values
 	rtx, err := db1.BeginRead()
@@ -418,7 +418,7 @@ func TestCacheInvalidation_Checkpoint(t *testing.T) {
 	require.NoError(t, wtx.Commit())
 
 	// Verify data survives checkpoint
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	rtx, err := db.BeginRead()
 	require.NoError(t, err)

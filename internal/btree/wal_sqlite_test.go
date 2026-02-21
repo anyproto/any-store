@@ -939,7 +939,7 @@ func TestSqlite_WAL_4_6(t *testing.T) {
 		require.NoError(t, tx.Commit())
 
 		// Checkpoint
-		require.NoError(t, db.Checkpoint())
+		require.NoError(t, db.Checkpoint(CheckpointFull))
 
 		// Begin write, insert ('w','x'), savepoint, insert ('y','z'), rollback, commit
 		tx, err = db.BeginWrite()

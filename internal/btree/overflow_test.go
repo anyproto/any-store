@@ -179,7 +179,7 @@ func TestOverflowPersistence(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Put(ns, []byte("bigkey"), bigValue))
 	require.NoError(t, tx.Commit())
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	// Reopen and verify
