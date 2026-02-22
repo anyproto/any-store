@@ -26,14 +26,15 @@ func (bt *btree) getPage(pgno uint32) (*page, error) {
 			pg.pinCount++
 			return pg, nil
 		}
-	} else if bt.walMaxFrame > 0 {
-		// Reader MVCC path: bypass dirty pages from uncommitted writer.
-		return bt.pager.readPageMVCC(pgno, bt.walMaxFrame)
+		if bt.walMaxFrame > 0 {
+			return bt.pager.getPageAt(pgno, bt.walMaxFrame)
+		}
+		return bt.pager.getPage(pgno)
 	}
-	if bt.walMaxFrame > 0 {
-		return bt.pager.getPageAt(pgno, bt.walMaxFrame)
-	}
-	return bt.pager.getPage(pgno)
+	// Reader: always use MVCC to avoid racing with writer's writePages
+	// and dirty pages in the shared cache. Safe with walMaxFrame==0 too —
+	// readPageMVCC reads directly from the database file when WAL is empty.
+	return bt.pager.readPageMVCC(pgno, bt.walMaxFrame)
 }
 
 // usablePageSize returns the usable page size, accounting for reserved space.

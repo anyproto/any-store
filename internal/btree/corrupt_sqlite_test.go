@@ -88,7 +88,7 @@ func setupCorruptDB(t *testing.T) (string, []byte) {
 	}
 
 	// Checkpoint to flush WAL to main DB file
-	if err := db.Checkpoint(); err != nil {
+	if err := db.Checkpoint(CheckpointFull); err != nil {
 		t.Fatal(err)
 	}
 
@@ -291,7 +291,7 @@ func TestSqlite_Corrupt_6_FreeblockSize(t *testing.T) {
 	}
 
 	// Checkpoint to flush to main DB and close
-	if err := db.Checkpoint(); err != nil {
+	if err := db.Checkpoint(CheckpointFull); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -420,7 +420,7 @@ func TestSqlite_Corrupt_7_CellOffsetArray(t *testing.T) {
 	}
 
 	// Checkpoint and close
-	if err := db.Checkpoint(); err != nil {
+	if err := db.Checkpoint(CheckpointFull); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -557,7 +557,7 @@ func TestSqlite_Corrupt_8_1_OverflowPointer(t *testing.T) {
 	}
 
 	// Checkpoint and close
-	if err := db.Checkpoint(); err != nil {
+	if err := db.Checkpoint(CheckpointFull); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -688,7 +688,7 @@ func TestSqlite_Corrupt_8_2_CellAreaCorrupt(t *testing.T) {
 	}
 
 	// Checkpoint and close
-	if err := db.Checkpoint(); err != nil {
+	if err := db.Checkpoint(CheckpointFull); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {

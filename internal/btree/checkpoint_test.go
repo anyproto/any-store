@@ -34,7 +34,7 @@ func TestCheckpointDoesNotBlockReaders(t *testing.T) {
 	// Run checkpoint while reader is active — should NOT block
 	done := make(chan error, 1)
 	go func() {
-		done <- db.Checkpoint()
+		done <- db.Checkpoint(CheckpointFull)
 	}()
 
 	select {
@@ -71,7 +71,7 @@ func TestCheckpointBlocksWriters(t *testing.T) {
 	// Start checkpoint in background — it acquires the write lock
 	checkpointDone := make(chan struct{})
 	go func() {
-		_ = db.Checkpoint()
+		_ = db.Checkpoint(CheckpointFull)
 		close(checkpointDone)
 	}()
 
@@ -127,7 +127,7 @@ func TestCheckpointPartialWithActiveReader(t *testing.T) {
 
 	// Checkpoint should do a partial checkpoint — it can't copy
 	// frames past the reader's snapshot
-	err = db.Checkpoint()
+	err = db.Checkpoint(CheckpointFull)
 	require.NoError(t, err)
 
 	// Reader should still see its snapshot (batch 1 data)
@@ -140,7 +140,7 @@ func TestCheckpointPartialWithActiveReader(t *testing.T) {
 	require.NoError(t, rtx.Rollback())
 
 	// Now a full checkpoint should work (no readers)
-	err = db.Checkpoint()
+	err = db.Checkpoint(CheckpointFull)
 	require.NoError(t, err)
 
 	// Verify all data is still accessible
@@ -245,7 +245,7 @@ func TestConcurrentReadersAndCheckpoint(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range 5 {
-				_ = db.Checkpoint()
+				_ = db.Checkpoint(CheckpointFull)
 				time.Sleep(time.Millisecond)
 			}
 		}()
@@ -354,7 +354,7 @@ func TestCheckpointWithWriterAndReaders(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for range 5 {
-			_ = db.Checkpoint()
+			_ = db.Checkpoint(CheckpointFull)
 			time.Sleep(time.Millisecond)
 		}
 	}()

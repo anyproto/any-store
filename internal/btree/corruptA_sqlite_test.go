@@ -49,7 +49,7 @@ func setupCorruptTestDB(t *testing.T) (string, []byte) {
 	require.NoError(t, tx.Commit())
 
 	// Checkpoint to flush WAL to main DB file
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	// Read the clean template
@@ -83,7 +83,7 @@ func TestSqlite_CorruptA_1_1(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// Checkpoint to ensure data in main DB file
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	// Verify file size >= 1024 (corruptA-1.1)
 	info, err := os.Stat(path)

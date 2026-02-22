@@ -405,11 +405,11 @@ func TestWALCheckpointWritesBack(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
 
-	// Checkpoint
+	// Checkpoint (FULL mode no longer resets the WAL)
 	require.NoError(t, w.checkpoint(dbFile, nil))
 
-	// WAL should be reset
-	assert.Equal(t, uint32(0), w.nFrame.Load())
+	// WAL frames should still exist (FULL mode preserves WAL for crash safety)
+	assert.Equal(t, uint32(1), w.nFrame.Load())
 
 	// Read DB file and verify data was written
 	readBuf := make([]byte, 4096)

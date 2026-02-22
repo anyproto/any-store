@@ -181,7 +181,7 @@ func TestShmHashAfterCheckpoint(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// Checkpoint should clear hash tables on WAL reset
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	// After checkpoint + WAL reset, hash tables should be cleared
 	wi := db.pager.wal.index

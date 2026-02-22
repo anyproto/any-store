@@ -288,9 +288,9 @@ func (db *DB) putWriteTx(tx *WriteTx) {
 	db.writeTxPool.Put(tx)
 }
 
-// Checkpoint triggers a WAL checkpoint, writing committed WAL frames
-// back to the database file.
-func (db *DB) Checkpoint() error {
+// Checkpoint triggers a WAL checkpoint with the specified mode, writing
+// committed WAL frames back to the database file.
+func (db *DB) Checkpoint(mode CheckpointMode) error {
 	if db.closing.Load() {
 		return ErrClosed
 	}
@@ -299,7 +299,7 @@ func (db *DB) Checkpoint() error {
 	if db.closing.Load() {
 		return ErrClosed
 	}
-	return db.pager.checkpoint()
+	return db.pager.checkpointWithMode(mode)
 }
 
 // UpdateLocalCounters manually sets the local counter cache. This is used by
@@ -664,7 +664,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 				buf = append(buf, make([]byte, int(valLen))...)
 				fullVal := buf[start:]
 				copy(fullVal, cell.value)
-				if err := tx.pager.readOverflowChain(cell.overflowPg, fullVal[len(cell.value):]); err != nil {
+				if err := tx.pager.readOverflowChainAt(cell.overflowPg, fullVal[len(cell.value):], tx.walMaxFrame); err != nil {
 					tx.pager.releasePage(pg)
 					return buf[:start], err
 				}

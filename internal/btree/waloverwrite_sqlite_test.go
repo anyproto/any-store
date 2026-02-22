@@ -236,7 +236,7 @@ func TestSqlite_WALOverwrite(t *testing.T) {
 			// --- 1.$tn.7 (lines 114-140) ---
 			// Original: PRAGMA wal_checkpoint; db transaction { ... savepoint ... rollback ... }
 			//           Check WAL frame count between 55 and 75
-			require.NoError(t, db.Checkpoint())
+			require.NoError(t, db.Checkpoint(CheckpointFull))
 
 			{
 				tx, err := db.BeginWrite()

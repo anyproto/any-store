@@ -142,7 +142,7 @@ func TestCrash3_PartialCheckpoint(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// Manually checkpoint (writes to DB) but then also keep the WAL intact
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	// Write more data after checkpoint
 	tx2, err := db.BeginWrite()
@@ -191,7 +191,7 @@ func TestCrash4_PostCheckpointPreTruncate(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// Checkpoint normally (writes frames to DB and truncates WAL)
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	// Add more data
 	tx2, err := db.BeginWrite()
@@ -233,7 +233,7 @@ func TestCrash5_CorruptWALHeader(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Put(ns, []byte("before"), []byte("corrupt")))
 	require.NoError(t, tx.Commit())
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	// Write more data WITHOUT checkpointing
 	tx2, err := db.BeginWrite()
@@ -402,7 +402,7 @@ func TestCrash8_FullStackCrash(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// Checkpoint first batch
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	// Commit 2: modify both namespaces
 	tx2, err := db.BeginWrite()

@@ -109,7 +109,7 @@ func TestDb_QuickCheck(t *testing.T) {
 
 func TestDb_Flush(t *testing.T) {
 	fx := newFixture(t)
-	assert.NoError(t, fx.Flush(ctx, 0, FlushModeFsync))
+	assert.NoError(t, fx.Flush(ctx, 0, FlushModeCheckpointPassive))
 	assert.NoError(t, fx.Flush(ctx, 0, FlushModeCheckpointFull))
 }
 

@@ -106,7 +106,7 @@ func TestFreelistPersistence(t *testing.T) {
 	require.NoError(t, tx2.Commit())
 
 	// Checkpoint to persist freelist to DB file
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	// Read the header from disk to verify freelist persistence
 	pg, err := db.pager.getPage(1)

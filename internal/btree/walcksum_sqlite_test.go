@@ -246,15 +246,15 @@ func TestSqlite_WALCksum_1(t *testing.T) {
 	})
 
 	// --- walcksum-1.$endian.8 (lines 263-275) ---
-	// Original: Checkpoint, insert one row, verify frames 1 and 2 have valid
-	// checksums, and frame 3 does NOT (it's a stale frame from before checkpoint).
+	// Original: Checkpoint, insert one row, verify all frames have valid checksums.
+	// FULL checkpoint preserves the WAL (no reset), so all frames remain valid.
 	t.Run("walcksum-1.8", func(t *testing.T) {
 		// Reopen DB (recovers from WAL)
 		db, err := Open(dbPath, Options{PageSize: 1024})
 		require.NoError(t, err)
 
-		// PRAGMA wal_checkpoint
-		require.NoError(t, db.Checkpoint())
+		// PRAGMA wal_checkpoint (FULL mode preserves WAL)
+		require.NoError(t, db.Checkpoint(CheckpointFull))
 
 		// INSERT INTO t1 VALUES(89, 'eightynine')
 		tx, err := db.BeginWrite()
@@ -267,38 +267,20 @@ func TestSqlite_WALCksum_1(t *testing.T) {
 		// rawClose to keep WAL on disk for inspection
 		rawClose(db)
 
-		// Count total valid frames after checkpoint + insert
+		// Count total valid frames after checkpoint + insert.
+		// FULL checkpoint preserves WAL, so all frames (old + new) remain valid.
 		validFrames := verifyWALFrameChecksums(t, walPath, 1024)
 		t.Logf("Valid frames after checkpoint + insert: %d", validFrames)
+		assert.True(t, validFrames >= 2, "should have at least 2 valid frames")
 
-		// Frames 1 and 2 should be valid (from the new insert after checkpoint)
 		t.Run("f=1", func(t *testing.T) {
 			ok := verifyWALFrameChecksumAt(t, walPath, 1024, 1)
-			assert.True(t, ok, "frame 1 checksum should be valid after checkpoint+insert")
+			assert.True(t, ok, "frame 1 checksum should be valid")
 		})
 		if validFrames >= 2 {
 			t.Run("f=2", func(t *testing.T) {
 				ok := verifyWALFrameChecksumAt(t, walPath, 1024, 2)
-				assert.True(t, ok, "frame 2 checksum should be valid after checkpoint+insert")
-			})
-		}
-
-		// Frame 3 should NOT be valid — it's a stale frame from before checkpoint.
-		// After checkpoint + new header, the salt values change, so old frames
-		// won't have matching salt or checksum chain.
-		if validFrames >= 2 {
-			t.Run("f=3_stale", func(t *testing.T) {
-				// Read WAL to check if there's data at frame 3's position
-				data, err := os.ReadFile(walPath)
-				require.NoError(t, err)
-				frameSize := int(walFrameSize) + 1024
-				frame3Offset := walHeaderSize + 2*frameSize
-				if len(data) > frame3Offset+frameSize {
-					// Frame 3 position has data, but its checksum should be invalid
-					// because the WAL was reset with new salt after checkpoint
-					ok := verifyWALFrameChecksumAt(t, walPath, 1024, 3)
-					assert.False(t, ok, "frame 3 should have invalid checksum (stale from before checkpoint)")
-				}
+				assert.True(t, ok, "frame 2 checksum should be valid")
 			})
 		}
 	})
@@ -335,7 +317,7 @@ func TestSqlite_WALCksum_2_1(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// PRAGMA wal_checkpoint
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	// INSERT INTO t1 VALUES(randomblob(800)) -- 1 row
 	nextKey := uint32(1)
@@ -449,7 +431,7 @@ func TestSqlite_WALCksum_3(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// PRAGMA wal_checkpoint
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	// INSERT INTO t1 VALUES(1, randomblob(2048), 'one')
 	tx, err = db.BeginWrite()
@@ -599,7 +581,7 @@ func TestSqlite_WALCksum_4(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// PRAGMA wal_checkpoint
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	// INSERT INTO t1 VALUES(1, randomblob(2048), 'one')
 	tx, err = db.BeginWrite()
@@ -778,7 +760,7 @@ func TestSqlite_WALCksum_5(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// PRAGMA wal_checkpoint
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	// --- walcksum-5.1 (lines 453-465) ---
 	// Original: BEGIN, SELECT count(*) (expect 3), SAVEPOINT one, insert rows 4-7,

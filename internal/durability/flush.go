@@ -11,7 +11,6 @@ import (
 type FlushMode string
 
 const (
-	FlushModeFsync              FlushMode = "FSYNC"
 	FlushModeCheckpointPassive  FlushMode = "CHECKPOINT_PASSIVE"
 	FlushModeCheckpointFull     FlushMode = "CHECKPOINT_FULL"
 	FlushModeCheckpointRestart  FlushMode = "CHECKPOINT_RESTART"
@@ -26,13 +25,21 @@ func NewFlushFunc(mode FlushMode) (func(ctx context.Context, db *btree.DB) error
 	}
 
 	switch mode {
-	case FlushModeFsync,
-		FlushModeCheckpointPassive,
-		FlushModeCheckpointFull,
-		FlushModeCheckpointRestart,
-		FlushModeCheckpointTruncate:
+	case FlushModeCheckpointPassive:
 		return func(ctx context.Context, db *btree.DB) error {
-			return db.Checkpoint()
+			return db.Checkpoint(btree.CheckpointPassive)
+		}, nil
+	case FlushModeCheckpointFull:
+		return func(ctx context.Context, db *btree.DB) error {
+			return db.Checkpoint(btree.CheckpointFull)
+		}, nil
+	case FlushModeCheckpointRestart:
+		return func(ctx context.Context, db *btree.DB) error {
+			return db.Checkpoint(btree.CheckpointRestart)
+		}, nil
+	case FlushModeCheckpointTruncate:
+		return func(ctx context.Context, db *btree.DB) error {
+			return db.Checkpoint(btree.CheckpointTruncate)
 		}, nil
 	default:
 		return nil, fmt.Errorf("invalid flush mode: %s", mode)

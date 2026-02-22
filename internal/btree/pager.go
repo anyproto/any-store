@@ -1183,43 +1183,18 @@ func (p *pager) releaseSavepoint(id int) error {
 	return nil
 }
 
-// syncWalForCheckpoint syncs the WAL file before checkpoint when noCommitSync=true
-// (fix 2.7). SQLite's synchronous=NORMAL skips per-commit WAL syncs but still
-// syncs the WAL before checkpoint (wal.c:2260, CKPT_SYNC_FLAGS). Our wal.go
-// guards the pre-checkpoint WAL sync with !w.noCommitSync, making noCommitSync=true
-// equivalent to SQLite's synchronous=OFF rather than NORMAL.
-//
-// This pager-level sync bridges the gap: when noCommitSync=true, the pager syncs
-// the WAL file before delegating to wal.checkpoint(). When noCommitSync=false, the
-// WAL checkpoint already handles this sync internally, so no extra sync is needed.
-//
-// The sync is best-effort: errors are silently ignored because the checkpoint
-// itself will encounter and report any persistent I/O errors.
-func (p *pager) syncWalForCheckpoint() {
-	if p.wal == nil || p.wal.file == nil || p.wal.inMemory {
-		return
-	}
-	_ = fdatasync(p.wal.file)
-}
-
-// checkpoint runs a WAL checkpoint.
+// checkpointWithMode runs a WAL checkpoint with the specified mode.
 // Does NOT take pager.mu.Lock — readers can continue during checkpoint.
-// The WAL checkpoint internally acquires lockWrite (blocks new writers)
-// and uses mxSafeFrame to avoid interfering with active readers.
-func (p *pager) checkpoint() error {
-	if p.noCommitSync {
-		p.syncWalForCheckpoint()
-	}
-	return p.wal.checkpoint(p.file, p.cache)
+// The WAL's busy handler is used for FULL/RESTART/TRUNCATE modes to wait
+// for readers that block progress, matching SQLite's behavior.
+func (p *pager) checkpointWithMode(mode CheckpointMode) error {
+	return p.wal.checkpointWithMode(p.file, p.cache, mode, p.wal.busyHandler)
 }
 
-// tryCheckpoint attempts a checkpoint. Unlike the old version, this no longer
-// needs TryLock on pager.mu since checkpoint doesn't block readers.
+// tryCheckpoint attempts a passive checkpoint for auto-checkpoint.
+// Uses PASSIVE mode to avoid blocking writers or readers, matching SQLite.
 func (p *pager) tryCheckpoint() error {
-	if p.noCommitSync {
-		p.syncWalForCheckpoint()
-	}
-	return p.wal.checkpoint(p.file, p.cache)
+	return p.wal.checkpointPassive(p.file, p.cache)
 }
 
 // writeOverflowChain writes data to a chain of overflow pages and returns
@@ -1263,17 +1238,8 @@ func (p *pager) writeOverflowChain(data []byte) (uint32, error) {
 	return firstPgno, nil
 }
 
-// readOverflowChain reads data from a chain of overflow pages into buf.
-// Uses the pager's global walMaxFrame. For reader-specific snapshots,
-// use readOverflowChainAt instead (fix 8.3).
-func (p *pager) readOverflowChain(firstPgno uint32, buf []byte) error {
-	return p.readOverflowChainAt(firstPgno, buf, p.walMaxFrame.Load())
-}
-
 // readOverflowChainAt reads data from a chain of overflow pages into buf
-// using the specified walMaxFrame for snapshot isolation (fix 8.3).
-// This ensures overflow reads use the correct reader snapshot rather than
-// the pager's global walMaxFrame which may have advanced.
+// using the specified walMaxFrame for snapshot isolation.
 func (p *pager) readOverflowChainAt(firstPgno uint32, buf []byte, walMaxFrame uint32) error {
 	usable := overflowPageUsable(p.usableSize())
 	pgno := firstPgno
@@ -1371,7 +1337,7 @@ func (p *pager) close() error {
 			// SQLite's sqlite3WalClose() does a PASSIVE checkpoint, and if successful,
 			// deletes (or truncates to 0) the WAL file. We truncate to 0 to match
 			// the test expectation that WAL is empty after a clean close.
-			_ = p.wal.checkpoint(p.file, p.cache)
+			_ = p.wal.checkpointPassive(p.file, p.cache)
 			// Truncate WAL file to zero bytes after successful checkpoint,
 			// matching SQLite's walLimitSize(pWal, 0) in sqlite3WalClose().
 			p.wal.truncateFile()

@@ -85,7 +85,7 @@ func TestReopenDB(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Put(ns, []byte("key1"), []byte("val1")))
 	require.NoError(t, tx.Commit())
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	db2, err := Open(path, DefaultOptions())
@@ -115,7 +115,7 @@ func TestReopenMultipleNamespaces(t *testing.T) {
 	require.NoError(t, tx.Put(ns1, []byte("k1"), []byte("v1")))
 	require.NoError(t, tx.Put(ns2, []byte("k2"), []byte("v2")))
 	require.NoError(t, tx.Commit())
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
 	db2, err := Open(path, DefaultOptions())
@@ -461,7 +461,7 @@ func TestClosedDBErrors(t *testing.T) {
 	assert.ErrorIs(t, err, ErrClosed)
 	_, err = db.BeginWrite()
 	assert.ErrorIs(t, err, ErrClosed)
-	assert.ErrorIs(t, db.Checkpoint(), ErrClosed)
+	assert.ErrorIs(t, db.Checkpoint(CheckpointFull), ErrClosed)
 }
 
 // === Savepoint Tests ===
@@ -705,7 +705,7 @@ func TestCheckpoint(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Put(ns, []byte("a"), []byte("b")))
 	require.NoError(t, tx.Commit())
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 }
 
 func TestCheckpointAndContinue(t *testing.T) {
@@ -716,7 +716,7 @@ func TestCheckpointAndContinue(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Put(ns, []byte("before"), []byte("ckpt")))
 	require.NoError(t, tx.Commit())
-	require.NoError(t, db.Checkpoint())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	tx2, err := db.BeginWrite()
 	require.NoError(t, err)
