@@ -664,7 +664,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 				buf = append(buf, make([]byte, int(valLen))...)
 				fullVal := buf[start:]
 				copy(fullVal, cell.value)
-				if err := tx.pager.readOverflowChain(cell.overflowPg, fullVal[len(cell.value):]); err != nil {
+				if err := tx.pager.readOverflowChainAt(cell.overflowPg, fullVal[len(cell.value):], tx.walMaxFrame); err != nil {
 					tx.pager.releasePage(pg)
 					return buf[:start], err
 				}

@@ -1238,17 +1238,8 @@ func (p *pager) writeOverflowChain(data []byte) (uint32, error) {
 	return firstPgno, nil
 }
 
-// readOverflowChain reads data from a chain of overflow pages into buf.
-// Uses the pager's global walMaxFrame. For reader-specific snapshots,
-// use readOverflowChainAt instead (fix 8.3).
-func (p *pager) readOverflowChain(firstPgno uint32, buf []byte) error {
-	return p.readOverflowChainAt(firstPgno, buf, p.walMaxFrame.Load())
-}
-
 // readOverflowChainAt reads data from a chain of overflow pages into buf
-// using the specified walMaxFrame for snapshot isolation (fix 8.3).
-// This ensures overflow reads use the correct reader snapshot rather than
-// the pager's global walMaxFrame which may have advanced.
+// using the specified walMaxFrame for snapshot isolation.
 func (p *pager) readOverflowChainAt(firstPgno uint32, buf []byte, walMaxFrame uint32) error {
 	usable := overflowPageUsable(p.usableSize())
 	pgno := firstPgno
