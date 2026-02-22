@@ -93,6 +93,29 @@ persistence means checksums add overhead without value.
 
 ## Pager / Cache
 
+### Shared Page Cache Requires MVCC-Safe Reads
+**Severity: Critical (fixed)**
+
+SQLite C uses a separate page cache per connection and clears it entirely
+(`pager_reset`) when a new read transaction detects the WAL has advanced
+(`pagerBeginReadTransaction` → `sqlite3WalBeginReadTransaction(&changed)` →
+`pager_reset` on changed). This ensures the cache is always consistent with the
+current snapshot.
+
+Our implementation uses a SINGLE shared page cache across all concurrent readers
+and the writer. We cannot clear the cache per-transaction without breaking other
+concurrent readers. This means `getPageAt`'s cache-hit check
+(`getLatest(pgno) <= walMaxFrame`) is insufficient: it verifies the latest WAL
+frame is within the caller's snapshot, but not that the cached data is from that
+latest frame. A reader with an older snapshot can populate the cache with old WAL
+data, and subsequent callers get stale data.
+
+**Invariant**: Readers MUST NOT use the shared cache (`getPageAt`) for data
+reads. Overflow pages use `readOverflowChainMVCC` (→ `readPageUncached`).
+B-tree node pages use `readPageMVCC` (→ `readPageUncached`). Only the single
+writer may use `getPageAt`, because its snapshot is always the latest and it
+needs to see its own dirty pages via the cache.
+
 ### No mmap for Database File Reads
 **Review: 2.9 | Severity: Minor**
 
