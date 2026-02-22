@@ -439,7 +439,7 @@ func (bt *btree) interiorCellFullKey(data []byte, offset int, usableSize int) (k
 		return nil, 0, ErrCorrupt
 	}
 	leftChild = binary.BigEndian.Uint32(data[offset : offset+4])
-	key, err = interiorFullKey(data, offset, usableSize, bt.pager, bt.walMaxFrame)
+	key, err = interiorFullKey(data, offset, usableSize, bt.pager, bt.walMaxFrame, !bt.writable)
 	return key, leftChild, err
 }
 
@@ -501,7 +501,7 @@ func searchInteriorPage(pg *page, key []byte) (childPgno uint32, cellIdx int, er
 
 // searchInteriorWithOverflow is a standalone function for searching interior pages
 // with overflow key support. Used by ReadTx which doesn't have a btree struct.
-func searchInteriorWithOverflow(pg *page, key []byte, usableSize int, p *pager, walMaxFrame uint32) (childPgno uint32, cellIdx int, err error) {
+func searchInteriorWithOverflow(pg *page, key []byte, usableSize int, p *pager, walMaxFrame uint32, mvcc bool) (childPgno uint32, cellIdx int, err error) {
 	n := int(pg.header.cellCount)
 	data := pg.data
 	dataLen := len(data)
@@ -514,7 +514,7 @@ func searchInteriorWithOverflow(pg *page, key []byte, usableSize int, p *pager, 
 			return 0, 0, ErrCorrupt
 		}
 		off := int(binary.BigEndian.Uint16(data[cpBase:]))
-		cellKey, kerr := interiorFullKey(data, off, usableSize, p, walMaxFrame)
+		cellKey, kerr := interiorFullKey(data, off, usableSize, p, walMaxFrame, mvcc)
 		if kerr != nil {
 			return 0, 0, kerr
 		}
@@ -556,7 +556,9 @@ func searchInteriorWithOverflow(pg *page, key []byte, usableSize int, p *pager, 
 }
 
 // interiorFullKey reads the full key from an interior cell, handling overflow.
-func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFrame uint32) ([]byte, error) {
+// mvcc controls overflow page reads: true uses readPageUncached (for readers),
+// false uses getPageAt (for writers who need to see their own dirty pages).
+func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFrame uint32, mvcc bool) ([]byte, error) {
 	dataLen := len(data)
 	if offset+4 >= dataLen {
 		return nil, ErrCorrupt
@@ -587,7 +589,11 @@ func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFr
 	fullKey := make([]byte, int(keyLen))
 	copy(fullKey, data[keyStart:keyStart+localSize])
 	overflowPg := binary.BigEndian.Uint32(data[keyStart+localSize : keyStart+localSize+4])
-	_ = p.readOverflowChainAt(overflowPg, fullKey[localSize:], walMaxFrame)
+	if mvcc {
+		_ = p.readOverflowChainMVCC(overflowPg, fullKey[localSize:], walMaxFrame)
+	} else {
+		_ = p.readOverflowChainAt(overflowPg, fullKey[localSize:], walMaxFrame)
+	}
 	return fullKey, nil
 }
 
@@ -696,7 +702,12 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 				buf = append(buf, make([]byte, int(valLen))...)
 				fullVal := buf[start:]
 				copy(fullVal, cell.value)
-				if err := bt.pager.readOverflowChainAt(cell.overflowPg, fullVal[len(cell.value):], bt.walMaxFrame); err != nil {
+				if bt.writable {
+					err = bt.pager.readOverflowChainAt(cell.overflowPg, fullVal[len(cell.value):], bt.walMaxFrame)
+				} else {
+					err = bt.pager.readOverflowChainMVCC(cell.overflowPg, fullVal[len(cell.value):], bt.walMaxFrame)
+				}
+				if err != nil {
 					return buf[:start], err
 				}
 				return buf, nil
@@ -2356,7 +2367,13 @@ func (c *Cursor) Value() ([]byte, error) {
 		copy(fullVal, cell.value) // local portion
 		overflowSize := int(valLen) - len(cell.value)
 		if overflowSize > 0 {
-			if err := c.bt.pager.readOverflowChainAt(cell.overflowPg, fullVal[len(cell.value):], c.bt.walMaxFrame); err != nil {
+			var err error
+			if c.bt.writable {
+				err = c.bt.pager.readOverflowChainAt(cell.overflowPg, fullVal[len(cell.value):], c.bt.walMaxFrame)
+			} else {
+				err = c.bt.pager.readOverflowChainMVCC(cell.overflowPg, fullVal[len(cell.value):], c.bt.walMaxFrame)
+			}
+			if err != nil {
 				return nil, err
 			}
 		}

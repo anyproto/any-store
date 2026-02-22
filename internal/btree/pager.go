@@ -37,7 +37,7 @@ type pager struct {
 	header   dbHeader
 	path     string
 	pageSize uint32
-	dbSize   uint32 // database size in pages
+	dbSize   uint32       // database size in pages
 	state    atomic.Int32 // pagerState
 
 	// Savepoint support: snapshots of dirty pages at savepoint boundaries
@@ -653,7 +653,7 @@ func (p *pager) freePage(pgno uint32) error {
 	clear(newTrunkPg.data)
 	binary.BigEndian.PutUint32(newTrunkPg.data[0:4], trunkPgno) // next trunk = old trunk
 	binary.BigEndian.PutUint32(newTrunkPg.data[4:8], 0)         // leaf count = 0
-	newTrunkPg.header = pageHeader{} // clear parsed header
+	newTrunkPg.header = pageHeader{}                            // clear parsed header
 	p.releasePage(newTrunkPg)
 
 	p.header.FirstFreelistPg = pgno
@@ -1240,7 +1240,21 @@ func (p *pager) writeOverflowChain(data []byte) (uint32, error) {
 
 // readOverflowChainAt reads data from a chain of overflow pages into buf
 // using the specified walMaxFrame for snapshot isolation.
+// Uses getPageAt (shared cache) — suitable for the writer who needs to see
+// its own dirty pages. Readers should use readOverflowChainMVCC instead to
+// avoid populating the cache with stale snapshot data.
 func (p *pager) readOverflowChainAt(firstPgno uint32, buf []byte, walMaxFrame uint32) error {
+	return p.readOverflowChainInternal(firstPgno, buf, walMaxFrame, false)
+}
+
+// readOverflowChainMVCC reads overflow data bypassing the shared page cache.
+// This prevents readers from polluting the cache with old-snapshot data that
+// the writer could later read as current, causing on-disk corruption.
+func (p *pager) readOverflowChainMVCC(firstPgno uint32, buf []byte, walMaxFrame uint32) error {
+	return p.readOverflowChainInternal(firstPgno, buf, walMaxFrame, true)
+}
+
+func (p *pager) readOverflowChainInternal(firstPgno uint32, buf []byte, walMaxFrame uint32, mvcc bool) error {
 	usable := overflowPageUsable(p.usableSize())
 	pgno := firstPgno
 	off := 0
@@ -1268,7 +1282,13 @@ func (p *pager) readOverflowChainAt(firstPgno uint32, buf []byte, walMaxFrame ui
 			return ErrCorrupt
 		}
 
-		pg, err := p.getPageAt(pgno, walMaxFrame)
+		var pg *page
+		var err error
+		if mvcc {
+			pg, err = p.readPageUncached(pgno, walMaxFrame)
+		} else {
+			pg, err = p.getPageAt(pgno, walMaxFrame)
+		}
 		if err != nil {
 			return err
 		}

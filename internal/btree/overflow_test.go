@@ -438,6 +438,217 @@ func TestOverflowConcurrentReaderStress(t *testing.T) {
 	}
 }
 
+// TestGetPageAtCacheCoherencyBug demonstrates a cache coherency bug in
+// pager.getPageAt that causes overflow data corruption.
+//
+// Root cause: getPageAt checks `getLatest(pgno) <= walMaxFrame` to decide
+// if a cached page is valid. This only verifies the LATEST WAL frame for the
+// page is within the caller's snapshot — it does NOT verify the CACHED DATA
+// is actually from that latest frame. A reader with an older snapshot can
+// populate the cache with old WAL data, and subsequent callers (including the
+// writer via collectLeafCells) get that stale data because the latest-frame
+// check passes.
+//
+// Scenario:
+//  1. TX1 writes key K with overflow value V1 → overflow pages P at WAL frame F1
+//  2. Reader R1 opens (walMaxFrame = F1)
+//  3. TX2 updates K to V2 → frees V1's overflow pages, reallocates them from
+//     freelist (same page numbers, LIFO) → pages P at WAL frame F2 with V2 data
+//  4. Cache cleared (simulates LRU eviction under memory pressure)
+//  5. R1 reads K → readOverflowChainAt → getPageAt (cache miss) → populates
+//     cache with V1 data from WAL frame F1
+//  6. R2 opens (walMaxFrame ≥ F2), reads K → readOverflowChainAt → getPageAt
+//     (cache HIT) → getLatest(P) = F2, F2 ≤ R2.walMaxFrame → returns stale V1!
+//
+// The same bug affects the writer (via collectLeafCells/readOverflowChainAt),
+// causing corrupted values to be committed to WAL (on-disk corruption).
+func TestGetPageAtCacheCoherencyBug(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	opts := Options{
+		PageSize:              4096,
+		CacheSize:             100,
+		InProcess:             true,
+		DisableAutoCheckpoint: true, // prevent WAL reset
+	}
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// TX1: Create namespace and insert key with overflow value V1.
+	// Value of 5000 bytes requires ~2 overflow pages for 4KB page size
+	// (maxLocal ≈ 1001, overflow usable = 4092 per page).
+	tx1, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx1.CreateNamespace("data")
+	require.NoError(t, err)
+	v1 := bytes.Repeat([]byte("A"), 5000)
+	require.NoError(t, tx1.Put(ns, []byte("key"), v1))
+	require.NoError(t, tx1.Commit())
+	_ = ns
+
+	// Open reader R1 at TX1's snapshot.
+	rtx1, err := db.BeginRead()
+	require.NoError(t, err)
+	nsR1, _ := db.getNamespaceLocked("data")
+
+	// TX2: Update key to V2 (different data, same size → same number of overflow pages).
+	// The update frees V1's overflow pages and reallocates from the freelist.
+	// Due to LIFO freelist ordering, the same physical page numbers are reused
+	// (in reverse chain order). After commit, those pages exist at two WAL frames:
+	// F1 with V1 data and F2 with V2 data.
+	tx2, err := db.BeginWrite()
+	require.NoError(t, err)
+	nsW2, _ := db.getNamespaceLocked("data")
+	v2 := bytes.Repeat([]byte("B"), 5000)
+	require.NoError(t, tx2.Put(nsW2, []byte("key"), v2))
+	require.NoError(t, tx2.Commit())
+
+	// Clear entire page cache — simulates LRU eviction under memory pressure.
+	db.pager.cache.clear()
+
+	// R1 reads key → readOverflowChainAt → getPageAt (cache miss for each
+	// overflow page) → cache.create populates entries with V1 data from WAL
+	// frames at R1's snapshot.
+	gotR1, err := rtx1.Get(nsR1, []byte("key"))
+	require.NoError(t, err)
+	require.Equal(t, v1, gotR1, "R1 should see V1 from its snapshot")
+	require.NoError(t, rtx1.Rollback())
+
+	// Cache now contains overflow pages with STALE V1 data.
+	// Open R2 at current snapshot (walMaxFrame ≥ F2).
+	rtx2, err := db.BeginRead()
+	require.NoError(t, err)
+	nsR2, _ := db.getNamespaceLocked("data")
+	gotR2, err := rtx2.Get(nsR2, []byte("key"))
+	require.NoError(t, err)
+
+	// BUG: getPageAt returns stale V1 data from reader-polluted cache.
+	// The check `getLatest(pgno) <= walMaxFrame` passes because the latest
+	// frame IS within R2's snapshot, but the cached data is from an older frame.
+	if !bytes.Equal(v2, gotR2) {
+		// Find first differing byte
+		diffIdx := -1
+		for i := range min(len(v2), len(gotR2)) {
+			if v2[i] != gotR2[i] {
+				diffIdx = i
+				break
+			}
+		}
+		t.Fatalf("cache coherency bug: R2 sees stale data instead of V2\n"+
+			"  expected len=%d first byte=0x%02x\n"+
+			"  got      len=%d first byte=0x%02x\n"+
+			"  first diff at byte %d",
+			len(v2), v2[0], len(gotR2), gotR2[0], diffIdx)
+	}
+	require.NoError(t, rtx2.Rollback())
+}
+
+// TestGetPageAtWriterCorruption demonstrates that the cache coherency bug
+// in getPageAt causes the WRITER to commit corrupted data to WAL via
+// collectLeafCells during a page split, resulting in persistent on-disk
+// corruption.
+//
+// When a leaf page containing an overflow cell needs to be split, the writer
+// calls collectLeafCells which reads ALL cells' overflow data via
+// readOverflowChainAt → getPageAt. If the cache was polluted by a reader
+// with stale overflow data, collectLeafCells reads the wrong values and
+// commits them to WAL.
+func TestGetPageAtWriterCorruption(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	opts := Options{
+		PageSize:              4096,
+		CacheSize:             100,
+		InProcess:             true,
+		DisableAutoCheckpoint: true,
+	}
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// TX1: Create namespace. Insert "key-big" with overflow V1 and fill the
+	// leaf page near capacity with small keys, so the next insert triggers a split.
+	tx1, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx1.CreateNamespace("data")
+	require.NoError(t, err)
+
+	v1 := bytes.Repeat([]byte("A"), 5000)
+	require.NoError(t, tx1.Put(ns, []byte("key-big"), v1))
+
+	// Fill the page with small keys (100-byte values, ~111 bytes each cell).
+	// One overflow cell takes ~490 bytes inline. Available: ~4088-490 = ~3598.
+	// Each small cell: ~111 bytes. Fit about 32 small cells.
+	for i := 0; i < 30; i++ {
+		k := fmt.Appendf(nil, "key-%03d", i)
+		v := bytes.Repeat([]byte{byte(i)}, 100)
+		require.NoError(t, tx1.Put(ns, k, v))
+	}
+	require.NoError(t, tx1.Commit())
+	_ = ns
+
+	// Open reader R1 at TX1's snapshot.
+	rtx1, err := db.BeginRead()
+	require.NoError(t, err)
+	nsR1, _ := db.getNamespaceLocked("data")
+
+	// TX2: Update "key-big" to V2 (different data, same size).
+	// Freelist recycles V1's overflow pages for V2.
+	tx2, err := db.BeginWrite()
+	require.NoError(t, err)
+	nsW2, _ := db.getNamespaceLocked("data")
+	v2 := bytes.Repeat([]byte("B"), 5000)
+	require.NoError(t, tx2.Put(nsW2, []byte("key-big"), v2))
+	require.NoError(t, tx2.Commit())
+
+	// Clear cache → simulates LRU eviction.
+	db.pager.cache.clear()
+
+	// R1 reads "key-big" → populates cache with V1 overflow data.
+	gotR1, err := rtx1.Get(nsR1, []byte("key-big"))
+	require.NoError(t, err)
+	require.Equal(t, v1, gotR1)
+	require.NoError(t, rtx1.Rollback())
+
+	// TX3: Insert more small keys to trigger a leaf page split.
+	// The split calls collectLeafCells which reads ALL cells including
+	// "key-big"'s overflow data via readOverflowChainAt → getPageAt.
+	// With stale cache, it reads V1 data instead of V2 → corruption.
+	tx3, err := db.BeginWrite()
+	require.NoError(t, err)
+	nsW3, _ := db.getNamespaceLocked("data")
+	for i := 30; i < 60; i++ {
+		k := fmt.Appendf(nil, "key-%03d", i)
+		v := bytes.Repeat([]byte{byte(i)}, 100)
+		require.NoError(t, tx3.Put(nsW3, k, v))
+	}
+	require.NoError(t, tx3.Commit())
+
+	// Read "key-big" back — should be V2 (unchanged by TX3).
+	rtx2, err := db.BeginRead()
+	require.NoError(t, err)
+	nsR2, _ := db.getNamespaceLocked("data")
+	gotFinal, err := rtx2.Get(nsR2, []byte("key-big"))
+	require.NoError(t, err)
+
+	if !bytes.Equal(v2, gotFinal) {
+		diffIdx := -1
+		for i := range min(len(v2), len(gotFinal)) {
+			if v2[i] != gotFinal[i] {
+				diffIdx = i
+				break
+			}
+		}
+		t.Fatalf("writer corruption via collectLeafCells:\n"+
+			"  expected len=%d first byte=0x%02x (V2)\n"+
+			"  got      len=%d first byte=0x%02x\n"+
+			"  first diff at byte %d",
+			len(v2), v2[0], len(gotFinal), gotFinal[0], diffIdx)
+	}
+	require.NoError(t, rtx2.Rollback())
+}
+
 func TestOverflowUpdateInlinePageOverflow(t *testing.T) {
 	db := tempDB(t)
 	tx, err := db.BeginWrite()

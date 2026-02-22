@@ -340,7 +340,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 			}
 
 			// For key ordering, we need the full key (may require overflow read)
-			fullKey, fkerr := interiorFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame)
+			fullKey, fkerr := interiorFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, false)
 			if fkerr != nil {
 				ic.report("%s cell %d: corrupt interior key", context, i)
 			} else {

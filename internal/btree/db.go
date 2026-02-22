@@ -13,10 +13,10 @@ import (
 
 // Options configures the database.
 type Options struct {
-	PageSize            uint32 // Page size in bytes (default: 4096)
-	CacheSize           int    // Maximum number of cached pages (default: 2000)
-	AutoCheckpointAfter uint32 // WAL frames before auto-checkpoint (0 = use default 10000)
-	DisableAutoCheckpoint bool // Disable auto-checkpoint entirely (manual Checkpoint() only)
+	PageSize              uint32 // Page size in bytes (default: 4096)
+	CacheSize             int    // Maximum number of cached pages (default: 2000)
+	AutoCheckpointAfter   uint32 // WAL frames before auto-checkpoint (0 = use default 10000)
+	DisableAutoCheckpoint bool   // Disable auto-checkpoint entirely (manual Checkpoint() only)
 
 	// InProcess uses heap-backed shared memory for the WAL index instead of
 	// mmap'd files with POSIX fcntl locks. Faster, but restricts access to a
@@ -616,6 +616,17 @@ func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 	return tx.pager.readPageMVCC(pgno, tx.walMaxFrame)
 }
 
+// readOverflow reads overflow chain data using the correct isolation level.
+// Writers use the shared cache (to see their own dirty pages).
+// Readers bypass the cache to avoid polluting it with stale snapshot data
+// that the writer could later read, causing on-disk corruption.
+func (tx *ReadTx) readOverflow(firstPgno uint32, buf []byte) error {
+	if tx.writable {
+		return tx.pager.readOverflowChainAt(firstPgno, buf, tx.walMaxFrame)
+	}
+	return tx.pager.readOverflowChainMVCC(firstPgno, buf, tx.walMaxFrame)
+}
+
 // AppendValue retrieves a value by key from the given namespace, appending it to buf.
 // Pass nil for buf to allocate a new slice (equivalent to Get).
 func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, error) {
@@ -664,7 +675,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 				buf = append(buf, make([]byte, int(valLen))...)
 				fullVal := buf[start:]
 				copy(fullVal, cell.value)
-				if err := tx.pager.readOverflowChainAt(cell.overflowPg, fullVal[len(cell.value):], tx.walMaxFrame); err != nil {
+				if err := tx.readOverflow(cell.overflowPg, fullVal[len(cell.value):]); err != nil {
 					tx.pager.releasePage(pg)
 					return buf[:start], err
 				}
@@ -675,7 +686,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 			tx.pager.releasePage(pg)
 			return buf, nil
 		}
-		childPgno, _, serr := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame)
+		childPgno, _, serr := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame, !tx.writable)
 		if serr != nil {
 			tx.pager.releasePage(pg)
 			return buf, serr
