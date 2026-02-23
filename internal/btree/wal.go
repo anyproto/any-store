@@ -147,35 +147,42 @@ const (
 type BusyHandler func(count int) bool
 
 // DefaultBusyTimeout returns a BusyHandler that retries with exponential
-// backoff up to the given total timeout duration. This is similar to
-// SQLite's sqlite3_busy_timeout().
+// backoff up to the given total timeout duration. Modeled after SQLite's
+// sqliteDefaultBusyCallback (main.c): the handler is stateless, computing
+// the cumulative sleep from the count parameter alone. This makes it safe
+// for concurrent use from multiple walBusyLock call sites.
 //
-// The backoff schedule starts at 1ms and doubles each retry, capped at 50ms
-// per sleep. If the accumulated sleep time would exceed the timeout, the
-// handler returns false (give up).
+// Delay schedule (ms): 1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100, ...
+// Matches SQLite's delays[] table; after the table is exhausted the last
+// delay (100ms) repeats.
 func DefaultBusyTimeout(timeout time.Duration) BusyHandler {
 	if timeout <= 0 {
 		return nil
 	}
-	var start time.Time
+	tmout := timeout.Milliseconds()
 	return func(count int) bool {
-		if count == 0 {
-			start = time.Now()
+		// SQLite's delays[] and totals[] tables (main.c:1717-1720).
+		// delays[i] is the sleep for attempt i; totals[i] is the
+		// cumulative sleep before attempt i.
+		var delays = [...]int64{1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100}
+		var totals = [...]int64{0, 1, 3, 8, 18, 33, 53, 78, 103, 128, 178, 228}
+		nDelay := len(delays)
+
+		var delay, prior int64
+		if count < nDelay {
+			delay = delays[count]
+			prior = totals[count]
+		} else {
+			delay = delays[nDelay-1]
+			prior = totals[nDelay-1] + delay*int64(count-(nDelay-1))
 		}
-		elapsed := time.Since(start)
-		if elapsed >= timeout {
-			return false
+		if prior+delay > tmout {
+			delay = tmout - prior
+			if delay <= 0 {
+				return false
+			}
 		}
-		// Exponential backoff: 1ms, 2ms, 4ms, 8ms, 16ms, 32ms, 50ms, 50ms, ...
-		sleep := time.Millisecond << min(count, 5) // max 32ms at count=5
-		if sleep > 50*time.Millisecond {
-			sleep = 50 * time.Millisecond
-		}
-		remaining := timeout - elapsed
-		if sleep > remaining {
-			sleep = remaining
-		}
-		time.Sleep(sleep)
+		time.Sleep(time.Duration(delay) * time.Millisecond)
 		return true
 	}
 }
