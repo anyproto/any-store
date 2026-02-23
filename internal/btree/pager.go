@@ -189,7 +189,7 @@ func (p *pager) initNewDB() error {
 		ReservedSpace:    0,
 		FileChangeCount:  1,
 		DatabaseSize:     1, // Just page 1
-		SchemaFormat:     4,
+		SchemaFormat:     5,
 		DefaultCacheSize: defaultCacheSize,
 		TextEncoding:     1, // UTF-8
 	}

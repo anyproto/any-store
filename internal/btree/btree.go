@@ -51,15 +51,18 @@ type cellData struct {
 }
 
 // parseLeafCell parses a leaf cell at the given offset in page data.
-// Leaf cell format: varint(keyLen) | key | varint(valLen) | value_local | [4-byte overflow pgno]
-// When payload (keyLen + valLen) exceeds maxLocal, only a local portion of
-// the value is stored in-page and the rest is on overflow pages.
+// Leaf cell format (v5): [varint(keyLen)] [varint(valLen)] [key||value] [4-byte overflow?]
+// When usableSize is 0 (via this wrapper), overflow detection is skipped.
 func parseLeafCell(data []byte, offset int) (cellData, int, error) {
 	return parseLeafCellWithSize(data, offset, 0)
 }
 
 // parseLeafCellWithSize is like parseLeafCell but uses usableSize to detect overflow.
-// If usableSize is 0, overflow detection is skipped (backward compat).
+// If usableSize is 0, overflow detection is skipped.
+//
+// IMPORTANT: For overflow cells, c.key and c.value are the LOCAL portions only.
+// c.key may be a prefix (not the full key). Callers needing the full key must
+// check c.overflowPg != 0 and use leafFullKey.
 func parseLeafCellWithSize(data []byte, offset int, usableSize int) (cellData, int, error) {
 	var c cellData
 	pos := offset
@@ -69,45 +72,60 @@ func parseLeafCellWithSize(data []byte, offset int, usableSize int) (cellData, i
 		return c, 0, ErrCorrupt
 	}
 
+	// Read keyLen varint
 	keyLen, n, err := getVarintSafe(data[pos:])
 	if err != nil {
 		return c, 0, ErrCorrupt
 	}
 	pos += n
 
-	if int(keyLen) < 0 || pos+int(keyLen) > dataLen {
-		return c, 0, ErrCorrupt
-	}
-	c.key = data[pos : pos+int(keyLen)]
-	pos += int(keyLen)
-
 	if pos >= dataLen {
 		return c, 0, ErrCorrupt
 	}
+
+	// Read valLen varint (immediately after keyLen in new format)
 	valLen, n, err := getVarintSafe(data[pos:])
 	if err != nil {
 		return c, 0, ErrCorrupt
 	}
 	pos += n
 
+	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc || int(valLen) < 0 || int(valLen) > maxPayloadAlloc {
+		return c, 0, ErrCorrupt
+	}
 	totalPayload := int(keyLen) + int(valLen)
+	if totalPayload < 0 || totalPayload > maxPayloadAlloc {
+		return c, 0, ErrCorrupt
+	}
 	maxLocal := 0
 	if usableSize > 0 {
 		maxLocal = maxLocalPayload(usableSize)
 	}
 
 	if usableSize > 0 && totalPayload > maxLocal {
-		// Overflow cell: only localValSize bytes of value stored in-page.
-		// The key is always stored fully on-page for binary search.
-		localValSize := localValueSize(int(keyLen), int(valLen), usableSize)
-		if pos+localValSize+4 > dataLen {
+		// Overflow cell: payload is (key||value) contiguous blob,
+		// only nLocal bytes stored on-page.
+		nLocal := localPayloadSize(totalPayload, usableSize)
+		if pos+nLocal+4 > dataLen {
 			return c, 0, ErrCorrupt
 		}
-		c.value = data[pos : pos+localValSize]
-		pos += localValSize
+		// Distribute local bytes between key and value
+		localKeyBytes := min(nLocal, int(keyLen))
+		localValBytes := nLocal - localKeyBytes
+		c.key = data[pos : pos+localKeyBytes]
+		pos += localKeyBytes
+		if localValBytes > 0 {
+			c.value = data[pos : pos+localValBytes]
+			pos += localValBytes
+		}
 		c.overflowPg = binary.BigEndian.Uint32(data[pos : pos+4])
 		pos += 4
 	} else {
+		if int(keyLen) < 0 || pos+int(keyLen) > dataLen {
+			return c, 0, ErrCorrupt
+		}
+		c.key = data[pos : pos+int(keyLen)]
+		pos += int(keyLen)
 		if int(valLen) < 0 || pos+int(valLen) > dataLen {
 			return c, 0, ErrCorrupt
 		}
@@ -168,10 +186,10 @@ func parseInteriorCell(data []byte, offset int, usableSize ...int) (cellData, in
 	return c, pos - offset, nil
 }
 
-// leafCellSize returns the serialized size of a leaf cell (in-page portion).
-// For cells that overflow, this includes the 4-byte overflow pointer.
+// leafCellSize returns the serialized size of a leaf cell (no overflow).
+// Format: [varint(keyLen)] [varint(valLen)] [key] [value]
 func leafCellSize(key, value []byte) int {
-	return varintSize(uint64(len(key))) + len(key) + varintSize(uint64(len(value))) + len(value)
+	return varintSize(uint64(len(key))) + varintSize(uint64(len(value))) + len(key) + len(value)
 }
 
 // leafSplitPoint finds the optimal split index for leaf cells, targeting ~2/3 fill
@@ -267,15 +285,16 @@ func interiorSplitPoint(cells []cellData, usableSize int) int {
 }
 
 // leafCellSizeWithOverflow returns the in-page size of a leaf cell, accounting for overflow.
-// The key is always stored fully on-page; only the value can overflow.
+// The payload (key||value) is treated as a single blob for overflow purposes.
 func leafCellSizeWithOverflow(key, value []byte, usableSize int) int {
 	totalPayload := len(key) + len(value)
+	hdr := varintSize(uint64(len(key))) + varintSize(uint64(len(value)))
 	maxLocal := maxLocalPayload(usableSize)
 	if totalPayload > maxLocal {
-		localVal := localValueSize(len(key), len(value), usableSize)
-		return varintSize(uint64(len(key))) + len(key) + varintSize(uint64(len(value))) + localVal + overflowPtrSize
+		nLocal := localPayloadSize(totalPayload, usableSize)
+		return hdr + nLocal + overflowPtrSize
 	}
-	return leafCellSize(key, value)
+	return hdr + totalPayload
 }
 
 // interiorCellSize returns the serialized size of an interior cell (no overflow).
@@ -296,27 +315,35 @@ func interiorCellSizeWithOverflow(key []byte, usableSize int) int {
 }
 
 // writeLeafCell writes a leaf cell to buf and returns bytes written.
+// Format: [varint(keyLen)] [varint(valLen)] [key] [value]
 func writeLeafCell(buf []byte, key, value []byte) int {
 	pos := 0
 	pos += putVarint(buf[pos:], uint64(len(key)))
+	pos += putVarint(buf[pos:], uint64(len(value)))
 	copy(buf[pos:], key)
 	pos += len(key)
-	pos += putVarint(buf[pos:], uint64(len(value)))
 	copy(buf[pos:], value)
 	pos += len(value)
 	return pos
 }
 
-// writeLeafCellOverflow writes a leaf cell with overflow pointer.
-// localVal is the portion of value stored in-page, overflowPgno is the first overflow page.
-func writeLeafCellOverflow(buf []byte, key []byte, fullValLen int, localVal []byte, overflowPgno uint32) int {
+// writeLeafCellOverflow writes a leaf cell with overflow.
+// nLocal is the number of bytes of (key||value) stored on-page.
+// Matches SQLite's fillInCell() for index btrees, adapted for
+// separate key/value varints (see format documentation in page.go).
+func writeLeafCellOverflow(buf []byte, key []byte, value []byte, nLocal int, overflowPgno uint32) int {
 	pos := 0
 	pos += putVarint(buf[pos:], uint64(len(key)))
-	copy(buf[pos:], key)
-	pos += len(key)
-	pos += putVarint(buf[pos:], uint64(fullValLen))
-	copy(buf[pos:], localVal)
-	pos += len(localVal)
+	pos += putVarint(buf[pos:], uint64(len(value)))
+	// Write first nLocal bytes of (key || value)
+	localKeyBytes := min(nLocal, len(key))
+	copy(buf[pos:], key[:localKeyBytes])
+	pos += localKeyBytes
+	localValBytes := nLocal - localKeyBytes
+	if localValBytes > 0 {
+		copy(buf[pos:], value[:localValBytes])
+		pos += localValBytes
+	}
 	binary.BigEndian.PutUint32(buf[pos:], overflowPgno)
 	pos += 4
 	return pos
@@ -348,6 +375,11 @@ func writeInteriorCellOverflow(buf []byte, leftChild uint32, fullKeyLen int, loc
 // searchLeafPage does binary search on a leaf page, returns the cell index
 // where key should be inserted. If found, returns (index, true, nil).
 // Returns ErrCorrupt if the page data is malformed.
+//
+// This function does NOT support overflow keys (it reads the local key prefix).
+// For pages that may have overflow keys, use bt.searchLeaf or
+// searchLeafWithOverflow instead. For non-overflow cells (the common case),
+// this is the fastest path.
 func searchLeafPage(pg *page, key []byte) (int, bool, error) {
 	n := int(pg.header.cellCount)
 	data := pg.data
@@ -364,26 +396,159 @@ func searchLeafPage(pg *page, key []byte) (int, bool, error) {
 		if off >= dataLen {
 			return 0, false, ErrCorrupt
 		}
-		// Fast path: 1-byte varint for key lengths < 128
+		// New format: [varint(keyLen)] [varint(valLen)] [key||value...]
+		// Fast path: 1-byte keyLen varint (< 128)
 		var cellKey []byte
 		b := data[off]
 		if b < 0x80 {
-			end := off + 1 + int(b)
-			if end > dataLen {
+			kl := int(b)
+			// Skip valLen varint (1-byte fast path)
+			valOff := off + 1
+			if valOff >= dataLen {
 				return 0, false, ErrCorrupt
 			}
-			cellKey = data[off+1 : end]
+			if data[valOff] < 0x80 {
+				// Both varints are 1-byte — common fast path
+				keyStart := valOff + 1
+				end := keyStart + kl
+				if end > dataLen {
+					return 0, false, ErrCorrupt
+				}
+				cellKey = data[keyStart:end]
+			} else {
+				// Multi-byte valLen varint
+				_, vn, verr := getVarintSafe(data[valOff:])
+				if verr != nil {
+					return 0, false, ErrCorrupt
+				}
+				keyStart := valOff + vn
+				end := keyStart + kl
+				if end > dataLen {
+					return 0, false, ErrCorrupt
+				}
+				cellKey = data[keyStart:end]
+			}
 		} else {
-			keyLen, vn, err := getVarintSafe(data[off:])
+			keyLen, kn, err := getVarintSafe(data[off:])
 			if err != nil {
 				return 0, false, ErrCorrupt
 			}
-			end := off + vn + int(keyLen)
+			pos := off + kn
+			if pos >= dataLen {
+				return 0, false, ErrCorrupt
+			}
+			_, vn, verr := getVarintSafe(data[pos:])
+			if verr != nil {
+				return 0, false, ErrCorrupt
+			}
+			keyStart := pos + vn
+			end := keyStart + int(keyLen)
 			if int(keyLen) < 0 || end > dataLen {
 				return 0, false, ErrCorrupt
 			}
-			cellKey = data[off+vn : end]
+			cellKey = data[keyStart:end]
 		}
+		cmp := bytes.Compare(cellKey, key)
+		if cmp == 0 {
+			return mid, true, nil
+		}
+		if cmp < 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo, false, nil
+}
+
+// searchLeaf does binary search on a leaf page with overflow key support.
+// Used by btree methods that need to search leaves where keys may overflow.
+func (bt *btree) searchLeaf(pg *page, key []byte) (int, bool, error) {
+	usableSize := bt.usablePageSize()
+	return searchLeafWithOverflow(pg, key, usableSize, bt.pager, bt.walMaxFrame, !bt.writable)
+}
+
+// searchLeafWithOverflow is a standalone function for searching leaf pages
+// with overflow key support. Used by ReadTx which doesn't have a btree struct.
+func searchLeafWithOverflow(pg *page, key []byte, usableSize int, p *pager, walMaxFrame uint32, mvcc bool) (int, bool, error) {
+	n := int(pg.header.cellCount)
+	data := pg.data
+	dataLen := len(data)
+	cpOff := pg.cellPointerOffset()
+	maxLocal := maxLocalPayload(usableSize)
+	lo, hi := 0, n
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		cpBase := cpOff + mid*2
+		if cpBase+2 > dataLen {
+			return 0, false, ErrCorrupt
+		}
+		off := int(binary.BigEndian.Uint16(data[cpBase:]))
+		if off >= dataLen {
+			return 0, false, ErrCorrupt
+		}
+
+		// Read keyLen and valLen varints
+		keyLen, kn, kerr := getVarintSafe(data[off:])
+		if kerr != nil {
+			return 0, false, ErrCorrupt
+		}
+		pos := off + kn
+		if pos >= dataLen {
+			return 0, false, ErrCorrupt
+		}
+		valLen, vn, verr := getVarintSafe(data[pos:])
+		if verr != nil {
+			return 0, false, ErrCorrupt
+		}
+		payloadStart := pos + vn
+
+		totalPayload := int(keyLen) + int(valLen)
+		var cellKey []byte
+		if totalPayload <= maxLocal {
+			// Fast path: no overflow, key fully on-page
+			end := payloadStart + int(keyLen)
+			if int(keyLen) < 0 || end > dataLen {
+				return 0, false, ErrCorrupt
+			}
+			cellKey = data[payloadStart:end]
+		} else {
+			// Overflow cell — may need to read full key
+			nLocal := localPayloadSize(totalPayload, usableSize)
+			localKeyBytes := min(nLocal, int(keyLen))
+			if localKeyBytes == int(keyLen) {
+				// Key fits fully in local portion
+				end := payloadStart + localKeyBytes
+				if end > dataLen {
+					return 0, false, ErrCorrupt
+				}
+				cellKey = data[payloadStart:end]
+			} else {
+				// Key overflows — compare prefix first for early exit
+				if payloadStart+localKeyBytes > dataLen {
+					return 0, false, ErrCorrupt
+				}
+				prefix := data[payloadStart : payloadStart+localKeyBytes]
+				cmpLen := min(localKeyBytes, len(key))
+				prefixCmp := bytes.Compare(prefix[:cmpLen], key[:cmpLen])
+				if prefixCmp != 0 {
+					// Prefix alone determines ordering
+					if prefixCmp < 0 {
+						lo = mid + 1
+					} else {
+						hi = mid
+					}
+					continue
+				}
+				// Need full key — read from overflow
+				var fkerr error
+				cellKey, fkerr = leafFullKey(data, off, usableSize, p, walMaxFrame, mvcc)
+				if fkerr != nil {
+					return 0, false, fkerr
+				}
+			}
+		}
+
 		cmp := bytes.Compare(cellKey, key)
 		if cmp == 0 {
 			return mid, true, nil
@@ -555,6 +720,87 @@ func searchInteriorWithOverflow(pg *page, key []byte, usableSize int, p *pager, 
 	return pg.header.rightChild, n, nil
 }
 
+// leafFullKey reads the full key from a leaf cell, reading overflow pages
+// if the key spills. Returns a slice into page buffer for non-overflow keys,
+// or an allocated copy for overflow keys.
+// Matches SQLite's accessPayload() slow path in sqlite3BtreeIndexMoveto().
+func leafFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFrame uint32, mvcc bool) ([]byte, error) {
+	dataLen := len(data)
+	if offset >= dataLen {
+		return nil, ErrCorrupt
+	}
+	keyLen, n, err := getVarintSafe(data[offset:])
+	if err != nil {
+		return nil, ErrCorrupt
+	}
+	pos := offset + n
+	if pos >= dataLen {
+		return nil, ErrCorrupt
+	}
+	valLen, n, err := getVarintSafe(data[pos:])
+	if err != nil {
+		return nil, ErrCorrupt
+	}
+	pos += n
+
+	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc {
+		return nil, ErrCorrupt
+	}
+	if int(valLen) < 0 || int(valLen) > maxPayloadAlloc {
+		return nil, ErrCorrupt
+	}
+
+	totalPayload := int(keyLen) + int(valLen)
+	if totalPayload < 0 || totalPayload > maxPayloadAlloc {
+		return nil, ErrCorrupt
+	}
+	maxLocal := maxLocalPayload(usableSize)
+
+	if totalPayload <= maxLocal {
+		// No overflow: key is fully on-page
+		if pos+int(keyLen) > dataLen {
+			return nil, ErrCorrupt
+		}
+		return data[pos : pos+int(keyLen)], nil
+	}
+
+	// Overflow cell
+	nLocal := localPayloadSize(totalPayload, usableSize)
+	localKeyBytes := min(nLocal, int(keyLen))
+
+	if localKeyBytes == int(keyLen) {
+		// Key fits fully in local portion (only value overflows)
+		if pos+localKeyBytes > dataLen {
+			return nil, ErrCorrupt
+		}
+		return data[pos : pos+localKeyBytes], nil
+	}
+
+	// Key overflows: allocate and reconstruct
+	if pos+nLocal+4 > dataLen {
+		return nil, ErrCorrupt
+	}
+	fullKey := make([]byte, int(keyLen))
+	copy(fullKey, data[pos:pos+localKeyBytes])
+	overflowPg := binary.BigEndian.Uint32(data[pos+nLocal : pos+nLocal+4])
+
+	// Read key remainder from overflow chain.
+	// The overflow chain contains (keyRemainder || valueRemainder).
+	// We only need keyLen - localKeyBytes bytes.
+	keyOverflow := int(keyLen) - localKeyBytes
+	overflowBuf := make([]byte, keyOverflow)
+	if mvcc {
+		err = p.readOverflowChainMVCC(overflowPg, overflowBuf, walMaxFrame)
+	} else {
+		err = p.readOverflowChainAt(overflowPg, overflowBuf, walMaxFrame)
+	}
+	if err != nil {
+		return nil, err
+	}
+	copy(fullKey[localKeyBytes:], overflowBuf)
+	return fullKey, nil
+}
+
 // interiorFullKey reads the full key from an interior cell, handling overflow.
 // mvcc controls overflow page reads: true uses readPageUncached (for readers),
 // false uses getPageAt (for writers who need to see their own dirty pages).
@@ -570,7 +816,7 @@ func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFr
 	keyStart := offset + 4 + n
 	maxLocal := maxLocalPayload(usableSize)
 
-	if int(keyLen) < 0 {
+	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc {
 		return nil, ErrCorrupt
 	}
 
@@ -672,9 +918,10 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 	defer bt.pager.releasePage(pg)
 
 	usableSize := bt.usablePageSize()
+	mvcc := !bt.writable
 	for {
 		if pg.header.isLeaf() {
-			idx, found, serr := searchLeafPage(pg, key)
+			idx, found, serr := searchLeafWithOverflow(pg, key, usableSize, bt.pager, maxFrame, mvcc)
 			if serr != nil {
 				return buf, serr
 			}
@@ -687,28 +934,47 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 				return buf, cerr
 			}
 			if cell.overflowPg != 0 {
-				// Read full value from overflow chain
+				// Unified payload format: read keyLen, valLen, compute nLocal
 				pos := int(off)
 				keyLen, kn, verr := getVarintSafe(pg.data[pos:])
 				if verr != nil {
 					return buf, ErrCorrupt
 				}
-				pos += kn + int(keyLen)
+				pos += kn
 				valLen, _, verr := getVarintSafe(pg.data[pos:])
 				if verr != nil {
 					return buf, ErrCorrupt
 				}
+
+				totalPayload := int(keyLen) + int(valLen)
+				nLocal := localPayloadSize(totalPayload, usableSize)
+				localKeyBytes := min(nLocal, int(keyLen))
+				localValBytes := nLocal - localKeyBytes
+				keyOverflow := int(keyLen) - localKeyBytes
+				overflowSize := totalPayload - nLocal
+
 				start := len(buf)
 				buf = append(buf, make([]byte, int(valLen))...)
 				fullVal := buf[start:]
-				copy(fullVal, cell.value)
-				if bt.writable {
-					err = bt.pager.readOverflowChainAt(cell.overflowPg, fullVal[len(cell.value):], bt.walMaxFrame)
-				} else {
-					err = bt.pager.readOverflowChainMVCC(cell.overflowPg, fullVal[len(cell.value):], bt.walMaxFrame)
+				// Copy local value portion
+				if localValBytes > 0 {
+					copy(fullVal, cell.value)
 				}
-				if err != nil {
-					return buf[:start], err
+				// Read overflow and extract value remainder
+				if overflowSize > 0 {
+					overflowBuf := make([]byte, overflowSize)
+					if bt.writable {
+						err = bt.pager.readOverflowChainAt(cell.overflowPg, overflowBuf, maxFrame)
+					} else {
+						err = bt.pager.readOverflowChainMVCC(cell.overflowPg, overflowBuf, maxFrame)
+					}
+					if err != nil {
+						return buf[:start], err
+					}
+					valOverflow := int(valLen) - localValBytes
+					if valOverflow > 0 {
+						copy(fullVal[localValBytes:], overflowBuf[keyOverflow:])
+					}
 				}
 				return buf, nil
 			}
@@ -809,7 +1075,7 @@ func (bt *btree) insertIntoPage(pg *page, key, value []byte) error {
 
 // insertIntoLeafWithPath inserts into a leaf page, using path for split propagation.
 func (bt *btree) insertIntoLeafWithPath(pg *page, key, value []byte, path []uint32) error {
-	idx, found, serr := searchLeafPage(pg, key)
+	idx, found, serr := bt.searchLeaf(pg, key)
 	if serr != nil {
 		return serr
 	}
@@ -853,7 +1119,7 @@ func (bt *btree) insertIntoLeafWithPath(pg *page, key, value []byte, path []uint
 
 // insertIntoLeaf inserts into a leaf page, splitting if necessary.
 func (bt *btree) insertIntoLeaf(pg *page, key, value []byte) error {
-	idx, found, serr := searchLeafPage(pg, key)
+	idx, found, serr := bt.searchLeaf(pg, key)
 	if serr != nil {
 		return serr
 	}
@@ -905,15 +1171,23 @@ func (bt *btree) insertLeafCellAt(pg *page, idx int, key, value []byte) error {
 	var overflowPgno uint32
 
 	if totalPayload > maxLocal {
-		// Need overflow pages. Key is always fully on-page; only value overflows.
-		localValSize := localValueSize(len(key), len(value), pageUsable)
-		overflowData := value[localValSize:]
+		// Need overflow pages. Unified payload: (key||value) can overflow at any point.
+		nLocal := localPayloadSize(totalPayload, pageUsable)
+		localKeyBytes := min(nLocal, len(key))
+		localValBytes := nLocal - localKeyBytes
+		// Build overflow data: key remainder (if any) + value remainder
+		overflowData := make([]byte, 0, totalPayload-nLocal)
+		if localKeyBytes < len(key) {
+			overflowData = append(overflowData, key[localKeyBytes:]...)
+		}
+		overflowData = append(overflowData, value[localValBytes:]...)
 		var err error
 		overflowPgno, err = bt.pager.writeOverflowChain(overflowData)
 		if err != nil {
 			return err
 		}
-		cellSize = varintSize(uint64(len(key))) + len(key) + varintSize(uint64(len(value))) + localValSize + overflowPtrSize
+		hdr := varintSize(uint64(len(key))) + varintSize(uint64(len(value)))
+		cellSize = hdr + nLocal + overflowPtrSize
 	} else {
 		cellSize = leafCellSize(key, value)
 	}
@@ -932,8 +1206,8 @@ func (bt *btree) insertLeafCellAt(pg *page, idx int, key, value []byte) error {
 
 	// Write cell data
 	if overflowPgno != 0 {
-		localValSize := localValueSize(len(key), len(value), pageUsable)
-		writeLeafCellOverflow(pg.data[newContentStart:], key, len(value), value[:localValSize], overflowPgno)
+		nLocal := localPayloadSize(totalPayload, pageUsable)
+		writeLeafCellOverflow(pg.data[newContentStart:], key, value, nLocal, overflowPgno)
 	} else {
 		writeLeafCell(pg.data[newContentStart:], key, value)
 	}
@@ -995,14 +1269,20 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []uin
 		maxLocal := maxLocalPayload(usableSize)
 
 		if totalPayload > maxLocal {
-			// New cell needs overflow. Key is always fully on-page.
-			localValSize := localValueSize(len(key), len(value), usableSize)
-			overflowData := value[localValSize:]
+			// New cell needs overflow. Unified payload: (key||value).
+			nLocal := localPayloadSize(totalPayload, usableSize)
+			localKeyBytes := min(nLocal, len(key))
+			localValBytes := nLocal - localKeyBytes
+			overflowData := make([]byte, 0, totalPayload-nLocal)
+			if localKeyBytes < len(key) {
+				overflowData = append(overflowData, key[localKeyBytes:]...)
+			}
+			overflowData = append(overflowData, value[localValBytes:]...)
 			overflowPgno, err := bt.pager.writeOverflowChain(overflowData)
 			if err != nil {
 				return err
 			}
-			writeLeafCellOverflow(pg.data[cellOff:], key, len(value), value[:localValSize], overflowPgno)
+			writeLeafCellOverflow(pg.data[cellOff:], key, value, nLocal, overflowPgno)
 		} else {
 			writeLeafCell(pg.data[cellOff:], key, value)
 		}
@@ -1103,29 +1383,51 @@ func (bt *btree) collectLeafCells(pg *page) []cellData {
 	for i := range n {
 		off := pg.getCellOffset(i)
 		cells[i], _, _ = parseLeafCellWithSize(pg.data, int(off), usableSize)
-		kStart := len(buf)
-		buf = append(buf, cells[i].key...)
 
 		if cells[i].overflowPg != 0 {
-			// Read original valLen from the cell to compute full value size
+			// Read keyLen and valLen from cell header (new format: both varints first)
 			pos := int(off)
 			keyLen, kn := getVarint(pg.data[pos:])
-			pos += kn + int(keyLen)
-			valLen, _ := getVarint(pg.data[pos:])
+			pos += kn
+			valLen, vn := getVarint(pg.data[pos:])
+			pos += vn
 
-			// Reconstruct full value: local portion + overflow
-			fullVal := make([]byte, int(valLen))
-			copy(fullVal, cells[i].value) // local portion
-			overflowSize := int(valLen) - len(cells[i].value)
-			if overflowSize > 0 {
-				_ = bt.pager.readOverflowChainAt(cells[i].overflowPg, fullVal[len(cells[i].value):], bt.walMaxFrame)
+			totalPayload := int(keyLen) + int(valLen)
+			nLocal := localPayloadSize(totalPayload, usableSize)
+			localKeyBytes := min(nLocal, int(keyLen))
+			localValBytes := nLocal - localKeyBytes
+
+			// Read entire overflow chain
+			overflowSize := totalPayload - nLocal
+			overflowBuf := make([]byte, overflowSize)
+			_ = bt.pager.readOverflowChainAt(cells[i].overflowPg, overflowBuf, bt.walMaxFrame)
+
+			// Reconstruct full key
+			fullKey := make([]byte, int(keyLen))
+			copy(fullKey, pg.data[pos:pos+localKeyBytes])
+			keyOverflow := int(keyLen) - localKeyBytes
+			if keyOverflow > 0 {
+				copy(fullKey[localKeyBytes:], overflowBuf[:keyOverflow])
 			}
+
+			// Reconstruct full value
+			fullVal := make([]byte, int(valLen))
+			if localValBytes > 0 {
+				copy(fullVal, pg.data[pos+localKeyBytes:pos+localKeyBytes+localValBytes])
+			}
+			valOverflow := int(valLen) - localValBytes
+			if valOverflow > 0 {
+				copy(fullVal[localValBytes:], overflowBuf[keyOverflow:])
+			}
+
 			// Free the old overflow chain — rebuildLeafPage will create new ones.
 			_ = bt.pager.freeOverflowChain(cells[i].overflowPg)
-			cells[i].key = buf[kStart:len(buf)]
+			cells[i].key = fullKey
 			cells[i].value = fullVal
-			cells[i].overflowPg = 0 // full value now in memory
+			cells[i].overflowPg = 0 // full key/value now in memory
 		} else {
+			kStart := len(buf)
+			buf = append(buf, cells[i].key...)
 			vStart := len(buf)
 			buf = append(buf, cells[i].value...)
 			cells[i].key = buf[kStart:vStart]
@@ -1194,16 +1496,23 @@ func (bt *btree) rebuildLeafPage(pg *page, cells []cellData) error {
 		totalPayload := len(c.key) + len(c.value)
 
 		if totalPayload > maxLocal {
-			// Need overflow. Key is always fully on-page.
-			localValSize := localValueSize(len(c.key), len(c.value), pageUsable)
-			overflowData := c.value[localValSize:]
+			// Need overflow. Unified payload: (key||value).
+			nLocal := localPayloadSize(totalPayload, pageUsable)
+			localKeyBytes := min(nLocal, len(c.key))
+			localValBytes := nLocal - localKeyBytes
+			overflowData := make([]byte, 0, totalPayload-nLocal)
+			if localKeyBytes < len(c.key) {
+				overflowData = append(overflowData, c.key[localKeyBytes:]...)
+			}
+			overflowData = append(overflowData, c.value[localValBytes:]...)
 			overflowPgno, err := bt.pager.writeOverflowChain(overflowData)
 			if err != nil {
 				return err
 			}
-			size := varintSize(uint64(len(c.key))) + len(c.key) + varintSize(uint64(len(c.value))) + localValSize + overflowPtrSize
+			hdr := varintSize(uint64(len(c.key))) + varintSize(uint64(len(c.value)))
+			size := hdr + nLocal + overflowPtrSize
 			contentOff -= size
-			writeLeafCellOverflow(pg.data[contentOff:], c.key, len(c.value), c.value[:localValSize], overflowPgno)
+			writeLeafCellOverflow(pg.data[contentOff:], c.key, c.value, nLocal, overflowPgno)
 		} else {
 			size := leafCellSize(c.key, c.value)
 			contentOff -= size
@@ -1681,7 +1990,7 @@ func (bt *btree) Delete(key []byte) error {
 		return err
 	}
 
-	idx, found, serr := searchLeafPage(wpg, key)
+	idx, found, serr := bt.searchLeaf(wpg, key)
 	if serr != nil {
 		bt.pager.releasePage(wpg)
 		return serr
@@ -2194,7 +2503,7 @@ func (c *Cursor) Seek(key []byte) error {
 		}
 	}
 
-	idx, _, serr := searchLeafPage(pg, key)
+	idx, _, serr := c.bt.searchLeaf(pg, key)
 	if serr != nil {
 		c.bt.pager.releasePage(pg)
 		return serr
@@ -2215,6 +2524,9 @@ func (c *Cursor) Seek(key []byte) error {
 // leafKeyAt extracts the key at cell index idx from a leaf page.
 // The returned slice points into the page buffer. This is a lightweight
 // alternative to parseLeafCellWithSize when only the key is needed.
+// For overflow cells where the key spills off-page, returns ErrCorrupt
+// so that callers (SeekNear) fall back to full Seek. This avoids needing
+// pager access in this lightweight function.
 func leafKeyAt(pg *page, idx int) ([]byte, error) {
 	data := pg.data
 	dataLen := len(data)
@@ -2226,23 +2538,52 @@ func leafKeyAt(pg *page, idx int) ([]byte, error) {
 	if pos >= dataLen {
 		return nil, ErrCorrupt
 	}
+	// New format: [varint(keyLen)] [varint(valLen)] [key||value...]
 	b := data[pos]
 	if b < 0x80 {
-		end := pos + 1 + int(b)
+		kl := int(b)
+		// Skip valLen varint
+		valOff := pos + 1
+		if valOff >= dataLen {
+			return nil, ErrCorrupt
+		}
+		if data[valOff] < 0x80 {
+			keyStart := valOff + 1
+			end := keyStart + kl
+			if end > dataLen {
+				return nil, ErrCorrupt
+			}
+			return data[keyStart:end], nil
+		}
+		_, vn, verr := getVarintSafe(data[valOff:])
+		if verr != nil {
+			return nil, ErrCorrupt
+		}
+		keyStart := valOff + vn
+		end := keyStart + kl
 		if end > dataLen {
 			return nil, ErrCorrupt
 		}
-		return data[pos+1 : end], nil
+		return data[keyStart:end], nil
 	}
-	keyLen, n, verr := getVarintSafe(data[pos:])
+	keyLen, kn, kerr := getVarintSafe(data[pos:])
+	if kerr != nil {
+		return nil, ErrCorrupt
+	}
+	pos += kn
+	if pos >= dataLen {
+		return nil, ErrCorrupt
+	}
+	_, vn, verr := getVarintSafe(data[pos:])
 	if verr != nil {
 		return nil, ErrCorrupt
 	}
-	end := pos + n + int(keyLen)
+	keyStart := pos + vn
+	end := keyStart + int(keyLen)
 	if int(keyLen) < 0 || end > dataLen {
 		return nil, ErrCorrupt
 	}
-	return data[pos+n : end], nil
+	return data[keyStart:end], nil
 }
 
 // SeekNear positions the cursor at the first key >= the given key.
@@ -2264,7 +2605,7 @@ func (c *Cursor) SeekNear(key []byte) error {
 					return err
 				}
 				if bytes.Compare(key, firstKey) >= 0 && bytes.Compare(key, lastKey) <= 0 {
-					idx, _, serr := searchLeafPage(leaf.pg, key)
+					idx, _, serr := c.bt.searchLeaf(leaf.pg, key)
 					if serr != nil {
 						return serr
 					}
@@ -2303,8 +2644,9 @@ func (c *Cursor) SeekExact(key []byte) error {
 }
 
 // Key returns the current key.
-// The returned slice points directly into the pinned page buffer and is valid
-// until the next cursor movement or Close(). Equivalent to sqlite3BtreePayloadFetch.
+// For non-overflow cells, the returned slice points directly into the pinned
+// page buffer and is valid until the next cursor movement or Close().
+// For overflow cells where the key spills, a new slice is allocated.
 func (c *Cursor) Key() ([]byte, error) {
 	if !c.valid {
 		return nil, ErrKeyNotFound
@@ -2315,13 +2657,18 @@ func (c *Cursor) Key() ([]byte, error) {
 		return nil, ErrCorrupt
 	}
 
+	usableSize := c.bt.usablePageSize()
 	off, oerr := frame.pg.getCellOffsetSafe(frame.cellIdx)
 	if oerr != nil {
 		return nil, oerr
 	}
-	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), c.bt.usablePageSize())
+	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), usableSize)
 	if cerr != nil {
 		return nil, cerr
+	}
+	if cell.overflowPg != 0 {
+		// Key may be partial — use leafFullKey to reconstruct
+		return leafFullKey(frame.pg.data, int(off), usableSize, c.bt.pager, c.bt.walMaxFrame, !c.bt.writable)
 	}
 	return cell.key, nil
 }
@@ -2351,31 +2698,47 @@ func (c *Cursor) Value() ([]byte, error) {
 	}
 
 	if cell.overflowPg != 0 {
-		// Read full valLen to compute overflow size
+		// Unified payload format: read keyLen, valLen from header varints,
+		// compute nLocal, then reconstruct the full value.
 		pos := int(off)
 		keyLen, kn, verr := getVarintSafe(frame.pg.data[pos:])
 		if verr != nil {
 			return nil, ErrCorrupt
 		}
-		pos += kn + int(keyLen)
-		valLen, _, verr := getVarintSafe(frame.pg.data[pos:])
+		pos += kn
+		valLen, vn, verr := getVarintSafe(frame.pg.data[pos:])
 		if verr != nil {
 			return nil, ErrCorrupt
 		}
+		pos += vn
 
+		totalPayload := int(keyLen) + int(valLen)
+		nLocal := localPayloadSize(totalPayload, usableSize)
+		localKeyBytes := min(nLocal, int(keyLen))
+		localValBytes := nLocal - localKeyBytes
+		keyOverflow := int(keyLen) - localKeyBytes
+
+		// Read entire overflow chain
+		overflowSize := totalPayload - nLocal
+		overflowBuf := make([]byte, overflowSize)
+		var err error
+		if c.bt.writable {
+			err = c.bt.pager.readOverflowChainAt(cell.overflowPg, overflowBuf, c.bt.walMaxFrame)
+		} else {
+			err = c.bt.pager.readOverflowChainMVCC(cell.overflowPg, overflowBuf, c.bt.walMaxFrame)
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		// Reconstruct full value: local portion + overflow portion (after key overflow)
 		fullVal := make([]byte, int(valLen))
-		copy(fullVal, cell.value) // local portion
-		overflowSize := int(valLen) - len(cell.value)
-		if overflowSize > 0 {
-			var err error
-			if c.bt.writable {
-				err = c.bt.pager.readOverflowChainAt(cell.overflowPg, fullVal[len(cell.value):], c.bt.walMaxFrame)
-			} else {
-				err = c.bt.pager.readOverflowChainMVCC(cell.overflowPg, fullVal[len(cell.value):], c.bt.walMaxFrame)
-			}
-			if err != nil {
-				return nil, err
-			}
+		if localValBytes > 0 {
+			copy(fullVal, cell.value) // cell.value holds local value bytes
+		}
+		valOverflow := int(valLen) - localValBytes
+		if valOverflow > 0 {
+			copy(fullVal[localValBytes:], overflowBuf[keyOverflow:])
 		}
 		return fullVal, nil
 	}

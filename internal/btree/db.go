@@ -117,6 +117,15 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 
+	// Reject databases created with an older schema format.
+	// Schema format 5 introduced unified leaf cell overflow (key+value as a
+	// single payload blob). Older formats stored key fully on-page and only
+	// allowed value overflow, which panics on large keys.
+	if p.header.SchemaFormat != 0 && p.header.SchemaFormat < 5 {
+		_ = p.close()
+		return nil, ErrOldFormat
+	}
+
 	db := &DB{
 		pager: p,
 		path:  path,
@@ -640,9 +649,10 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 
 	// Search without starting a new read tx (we're already in one)
 	usableSize := int(tx.pager.pageSize) - int(tx.pager.header.ReservedSpace)
+	mvcc := !tx.writable
 	for {
 		if pg.header.isLeaf() {
-			idx, found, serr := searchLeafPage(pg, key)
+			idx, found, serr := searchLeafWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame, mvcc)
 			if serr != nil {
 				tx.pager.releasePage(pg)
 				return buf, serr
@@ -658,26 +668,43 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 				return buf, cerr
 			}
 			if cell.overflowPg != 0 {
-				// Read full value from overflow chain
+				// Unified payload format: read keyLen, valLen, compute nLocal
 				pos := int(off)
 				keyLen, kn, verr := getVarintSafe(pg.data[pos:])
 				if verr != nil {
 					tx.pager.releasePage(pg)
 					return buf, ErrCorrupt
 				}
-				pos += kn + int(keyLen)
+				pos += kn
 				valLen, _, verr := getVarintSafe(pg.data[pos:])
 				if verr != nil {
 					tx.pager.releasePage(pg)
 					return buf, ErrCorrupt
 				}
+
+				totalPayload := int(keyLen) + int(valLen)
+				nLocal := localPayloadSize(totalPayload, usableSize)
+				localKeyBytes := min(nLocal, int(keyLen))
+				localValBytes := nLocal - localKeyBytes
+				keyOverflow := int(keyLen) - localKeyBytes
+				overflowSize := totalPayload - nLocal
+
 				start := len(buf)
 				buf = append(buf, make([]byte, int(valLen))...)
 				fullVal := buf[start:]
-				copy(fullVal, cell.value)
-				if err := tx.readOverflow(cell.overflowPg, fullVal[len(cell.value):]); err != nil {
-					tx.pager.releasePage(pg)
-					return buf[:start], err
+				if localValBytes > 0 {
+					copy(fullVal, cell.value)
+				}
+				if overflowSize > 0 {
+					overflowBuf := make([]byte, overflowSize)
+					if err := tx.readOverflow(cell.overflowPg, overflowBuf); err != nil {
+						tx.pager.releasePage(pg)
+						return buf[:start], err
+					}
+					valOverflow := int(valLen) - localValBytes
+					if valOverflow > 0 {
+						copy(fullVal[localValBytes:], overflowBuf[keyOverflow:])
+					}
 				}
 				tx.pager.releasePage(pg)
 				return buf, nil
@@ -686,7 +713,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 			tx.pager.releasePage(pg)
 			return buf, nil
 		}
-		childPgno, _, serr := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame, !tx.writable)
+		childPgno, _, serr := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame, mvcc)
 		if serr != nil {
 			tx.pager.releasePage(pg)
 			return buf, serr

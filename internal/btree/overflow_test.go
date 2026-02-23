@@ -666,3 +666,247 @@ func TestOverflowUpdateInlinePageOverflow(t *testing.T) {
 
 	require.NoError(t, db.IntegrityCheck())
 }
+
+// --- Leaf Key Overflow Tests ---
+// These test keys that exceed maxLocalPayload (~1001 bytes for 4KB pages),
+// exercising the new unified payload overflow format (schema v5).
+
+func TestLeafKeyOverflow_PutGet(t *testing.T) {
+	db, ns := tempDBWithNS(t, "data")
+	_ = ns
+
+	// Key of 1500 bytes exceeds maxLocal (~1001 for 4KB page)
+	bigKey := bytes.Repeat([]byte("K"), 1500)
+	val := []byte("hello-overflow-key")
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns2, _ := db.getNamespaceLocked("data")
+	require.NoError(t, tx.Put(ns2, bigKey, val))
+	require.NoError(t, tx.Commit())
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	ns3, _ := db.getNamespaceLocked("data")
+	got, err := rtx.Get(ns3, bigKey)
+	require.NoError(t, err)
+	assert.Equal(t, val, got)
+	require.NoError(t, rtx.Rollback())
+	require.NoError(t, db.IntegrityCheck())
+}
+
+func TestLeafKeyOverflow_CursorIteration(t *testing.T) {
+	db, ns := tempDBWithNS(t, "data")
+	_ = ns
+
+	type kv struct {
+		key, val []byte
+	}
+	var entries []kv
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns2, _ := db.getNamespaceLocked("data")
+
+	// Mix of small keys and overflow keys
+	for i := 0; i < 10; i++ {
+		var k []byte
+		if i%2 == 0 {
+			// Overflow key (~1200 bytes)
+			k = append(bytes.Repeat([]byte{byte('A' + i)}, 1200), fmt.Appendf(nil, "-%02d", i)...)
+		} else {
+			k = fmt.Appendf(nil, "small-%02d", i)
+		}
+		v := fmt.Appendf(nil, "val-%02d", i)
+		entries = append(entries, kv{k, v})
+		require.NoError(t, tx.Put(ns2, k, v))
+	}
+	require.NoError(t, tx.Commit())
+
+	// Sort entries by key for comparison (btree stores in byte order)
+	for i := 0; i < len(entries); i++ {
+		for j := i + 1; j < len(entries); j++ {
+			if bytes.Compare(entries[i].key, entries[j].key) > 0 {
+				entries[i], entries[j] = entries[j], entries[i]
+			}
+		}
+	}
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	ns3, _ := db.getNamespaceLocked("data")
+	cur := rtx.NewCursor(ns3)
+
+	count := 0
+	for err := cur.First(); err == nil && cur.Valid(); err = cur.Next() {
+		k, kerr := cur.Key()
+		require.NoError(t, kerr)
+		v, verr := cur.Value()
+		require.NoError(t, verr)
+		require.True(t, count < len(entries), "too many entries")
+		assert.Equal(t, entries[count].key, k, "key mismatch at index %d", count)
+		assert.Equal(t, entries[count].val, v, "value mismatch at index %d", count)
+		count++
+	}
+	assert.Equal(t, len(entries), count)
+	require.NoError(t, rtx.Rollback())
+	require.NoError(t, db.IntegrityCheck())
+}
+
+func TestLeafKeyOverflow_Delete(t *testing.T) {
+	db, ns := tempDBWithNS(t, "data")
+	_ = ns
+
+	bigKey := bytes.Repeat([]byte("D"), 1500)
+	val := []byte("delete-me")
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns2, _ := db.getNamespaceLocked("data")
+	require.NoError(t, tx.Put(ns2, bigKey, val))
+	require.NoError(t, tx.Commit())
+
+	// Delete the overflow key
+	tx2, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns3, _ := db.getNamespaceLocked("data")
+	require.NoError(t, tx2.Delete(ns3, bigKey))
+	require.NoError(t, tx2.Commit())
+
+	// Verify deleted
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	ns4, _ := db.getNamespaceLocked("data")
+	_, err = rtx.Get(ns4, bigKey)
+	assert.ErrorIs(t, err, ErrKeyNotFound)
+	require.NoError(t, rtx.Rollback())
+
+	// Overflow pages should be freed
+	assert.True(t, db.pager.header.TotalFreelistPgs > 0)
+	require.NoError(t, db.IntegrityCheck())
+}
+
+func TestLeafKeyOverflow_Update(t *testing.T) {
+	db, ns := tempDBWithNS(t, "data")
+	_ = ns
+
+	bigKey := bytes.Repeat([]byte("U"), 1500)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns2, _ := db.getNamespaceLocked("data")
+	require.NoError(t, tx.Put(ns2, bigKey, []byte("val1")))
+	require.NoError(t, tx.Commit())
+
+	// Update value
+	tx2, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns3, _ := db.getNamespaceLocked("data")
+	require.NoError(t, tx2.Put(ns3, bigKey, []byte("val2-updated")))
+	require.NoError(t, tx2.Commit())
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	ns4, _ := db.getNamespaceLocked("data")
+	got, err := rtx.Get(ns4, bigKey)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("val2-updated"), got)
+	require.NoError(t, rtx.Rollback())
+	require.NoError(t, db.IntegrityCheck())
+}
+
+func TestLeafKeyOverflow_Split(t *testing.T) {
+	db, ns := tempDBWithNS(t, "data")
+	_ = ns
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns2, _ := db.getNamespaceLocked("data")
+
+	// Insert many overflow keys to force multiple leaf splits
+	keys := make([][]byte, 20)
+	vals := make([][]byte, 20)
+	for i := 0; i < 20; i++ {
+		k := append(bytes.Repeat([]byte{byte('A' + i%26)}, 1200), fmt.Appendf(nil, "-%03d", i)...)
+		v := fmt.Appendf(nil, "split-val-%03d", i)
+		keys[i] = k
+		vals[i] = v
+		require.NoError(t, tx.Put(ns2, k, v))
+	}
+	require.NoError(t, tx.Commit())
+
+	// Verify all keys readable
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	ns3, _ := db.getNamespaceLocked("data")
+	for i := 0; i < 20; i++ {
+		got, err := rtx.Get(ns3, keys[i])
+		require.NoError(t, err, "Get key %d", i)
+		assert.Equal(t, vals[i], got, "mismatch key %d", i)
+	}
+	require.NoError(t, rtx.Rollback())
+	require.NoError(t, db.IntegrityCheck())
+}
+
+func TestLeafKeyOverflow_IntegrityCheck(t *testing.T) {
+	db, ns := tempDBWithNS(t, "data")
+	_ = ns
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns2, _ := db.getNamespaceLocked("data")
+
+	// Mix overflow keys, overflow values, both overflow, and normal entries
+	entries := []struct{ key, val []byte }{
+		{bytes.Repeat([]byte("K"), 1500), []byte("small-val")},                      // key overflow only
+		{[]byte("small-key"), bytes.Repeat([]byte("V"), 5000)},                       // val overflow only
+		{bytes.Repeat([]byte("B"), 1500), bytes.Repeat([]byte("W"), 5000)},           // both overflow
+		{[]byte("normal"), []byte("normal-val")},                                     // no overflow
+		{bytes.Repeat([]byte("X"), 2000), bytes.Repeat([]byte("Y"), 2000)},           // large both
+	}
+	for _, e := range entries {
+		require.NoError(t, tx.Put(ns2, e.key, e.val))
+	}
+	require.NoError(t, tx.Commit())
+
+	require.NoError(t, db.IntegrityCheck())
+
+	// Checkpoint and reopen to verify on-disk integrity
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+	require.NoError(t, db.IntegrityCheck())
+}
+
+func TestLeafKeyOverflow_MixedSizes(t *testing.T) {
+	db, ns := tempDBWithNS(t, "data")
+	_ = ns
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns2, _ := db.getNamespaceLocked("data")
+
+	type kv struct{ key, val []byte }
+	var entries []kv
+
+	// Insert keys of varying sizes: some below maxLocal, some above
+	sizes := []int{10, 100, 500, 1000, 1002, 1100, 1500, 2000, 3000}
+	for _, sz := range sizes {
+		k := bytes.Repeat([]byte("M"), sz)
+		k = append(k, fmt.Appendf(nil, "-%d", sz)...)
+		v := fmt.Appendf(nil, "value-for-size-%d", sz)
+		entries = append(entries, kv{k, v})
+		require.NoError(t, tx.Put(ns2, k, v))
+	}
+	require.NoError(t, tx.Commit())
+
+	// Read all back
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	ns3, _ := db.getNamespaceLocked("data")
+	for _, e := range entries {
+		got, err := rtx.Get(ns3, e.key)
+		require.NoError(t, err, "Get failed for key size %d", len(e.key))
+		assert.Equal(t, e.val, got, "mismatch for key size %d", len(e.key))
+	}
+	require.NoError(t, rtx.Rollback())
+	require.NoError(t, db.IntegrityCheck())
+}

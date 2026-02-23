@@ -450,7 +450,10 @@ func TestSqlite_Corrupt_7_CellOffsetArray(t *testing.T) {
 		cellOff := int(binary.BigEndian.Uint16(data[cpOff : cpOff+2]))
 		absOff := page2Off + cellOff
 		keyLen, kn := getVarint(data[absOff:])
-		cellKey := data[absOff+kn : absOff+kn+int(keyLen)]
+		// New format: skip valLen varint before key data
+		_, vn := getVarint(data[absOff+kn:])
+		keyStart := absOff + kn + vn
+		cellKey := data[keyStart : keyStart+int(keyLen)]
 		if len(cellKey) == 4 && binary.BigEndian.Uint32(cellKey) == 10 {
 			key10CellOff = cellOff
 			t.Logf("found key=10 at page-relative offset %d", cellOff)
@@ -462,9 +465,9 @@ func TestSqlite_Corrupt_7_CellOffsetArray(t *testing.T) {
 	}
 
 	// Point the first cell pointer to the value data area of key=10's cell.
-	// Cell layout: varint(keyLen=4) [1 byte] + key [4 bytes] + varint(valLen=20) [1 byte] + value [20 bytes]
+	// New cell layout: varint(keyLen=4) [1B] + varint(valLen=20) [1B] + key [4B] + value [20B]
 	// Value starts at cellOff + 6. The value bytes (0x00,0x01,...) will be
-	// parsed as: getVarint(0x00) -> keyLen=0, empty key, getVarint(0x01) -> valLen=1.
+	// parsed as: getVarint(0x00) -> keyLen=0, getVarint(0x01) -> valLen=1.
 	// This looks like a valid but tiny cell to btreeInitPage.
 	targetOff := key10CellOff + 6
 
@@ -582,17 +585,17 @@ func TestSqlite_Corrupt_8_1_OverflowPointer(t *testing.T) {
 	}
 	cellOff := int(binary.BigEndian.Uint16(data[page2Off+8 : page2Off+10]))
 
-	// Parse the cell to find the overflow pointer
+	// Parse the cell to find the overflow pointer (v5 format: keyLen, valLen, payload)
 	absOff := page2Off + cellOff
 	keyLen, kn := getVarint(data[absOff:])
-	pos := absOff + kn + int(keyLen) // skip key
-	valLen, vn := getVarint(data[pos:])
-	pos += vn
+	valLen, vn := getVarint(data[absOff+kn:])
+	pos := absOff + kn + vn // after both varints
 
-	// Calculate local value size
+	// Calculate local payload size (unified format)
 	usable := 1024
-	localValSz := localValueSize(int(keyLen), int(valLen), usable)
-	ovfPtrOff := pos + localValSz // absolute offset of overflow page pointer
+	totalPayload := int(keyLen) + int(valLen)
+	nLocal := localPayloadSize(totalPayload, usable)
+	ovfPtrOff := pos + nLocal // absolute offset of overflow page pointer
 
 	t.Logf("overflow pointer at absolute offset %d (page-relative: %d)", ovfPtrOff, ovfPtrOff-page2Off)
 

@@ -47,4 +47,8 @@ var (
 
 	// ErrWALCorrupt indicates the WAL file is corrupted.
 	ErrWALCorrupt = errors.New("btree: WAL is corrupt")
+
+	// ErrOldFormat indicates the database was created with an older schema format
+	// that is no longer supported. The database must be recreated.
+	ErrOldFormat = errors.New("btree: unsupported old schema format (requires version 5+)")
 )

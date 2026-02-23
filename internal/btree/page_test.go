@@ -18,7 +18,7 @@ func TestDBHeaderSerializeDeserialize(t *testing.T) {
 		FirstFreelistPg:  3,
 		TotalFreelistPgs: 1,
 		SchemaCookie:     5,
-		SchemaFormat:     4,
+		SchemaFormat:     5,
 		DefaultCacheSize: 2000,
 		TextEncoding:     1,
 		UserVersion:      7,

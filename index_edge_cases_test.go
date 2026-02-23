@@ -332,3 +332,38 @@ func TestIndex_EdgeCases_EmptyCollection(t *testing.T) {
 
 	assertIndexLen(t, coll.GetIndexes()[0], 0)
 }
+
+// TestIndex_EdgeCases_LargeKeyPanic reproduces a panic in btree.rebuildLeafPage
+// when a non-unique index key exceeds the page's local payload capacity (~1002 bytes
+// for a 4096-byte page). The index key for non-unique indexes is Tuple(field_value, doc_id),
+// so large field values produce keys that don't fit on a single page.
+// Bug: contentOff goes negative → slice bounds out of range [-N:]
+func TestIndex_EdgeCases_LargeKeyPanic(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "testcoll")
+	require.NoError(t, err)
+
+	arena := &anyenc.Arena{}
+	// Insert 50 docs with large "data" fields (2KB-5KB).
+	// The index key will be Tuple(data_value, doc_id) which exceeds page capacity.
+	for i := 0; i < 50; i++ {
+		arena.Reset()
+		obj := arena.NewObject()
+		obj.Set("id", arena.NewString(fmt.Sprintf("doc-%04d", i)))
+		obj.Set("val", arena.NewNumberInt(i))
+		dataSize := 2048 + (i * 64) // 2KB to ~5KB
+		data := make([]byte, dataSize)
+		for j := range data {
+			data[j] = byte('a' + (j % 26))
+		}
+		obj.Set("data", arena.NewString(string(data)))
+		require.NoError(t, coll.UpsertOne(ctx, obj), "insert doc %d", i)
+	}
+
+	// Creating a non-unique index on "data" triggers the panic:
+	// EnsureIndex → buildIndex → insertKeys → btree.Put →
+	// splitLeafAndInsertWithPath → rebuildLeafPage → PANIC
+	// (slice bounds out of range [-N:] because the key exceeds maxLocalPayload)
+	err = coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"data"}})
+	require.NoError(t, err, "EnsureIndex on large-value field should not panic")
+}

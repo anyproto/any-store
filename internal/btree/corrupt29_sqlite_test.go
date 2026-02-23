@@ -122,18 +122,16 @@ func findOverflowPageInCell(t *testing.T, data []byte, pageStart, pageSize int) 
 	cellOff := int(binary.BigEndian.Uint16(data[hdrOff+8 : hdrOff+10]))
 	absOff := pageStart + cellOff
 
-	// Parse cell: varint(keyLen)
+	// Parse cell (v5 format): varint(keyLen), varint(valLen), payload
 	keyLen, kn := getVarint(data[absOff:])
-	pos := absOff + kn + int(keyLen)
+	valLen, vn := getVarint(data[absOff+kn:])
+	pos := absOff + kn + vn // after both varints
 
-	// varint(valLen)
-	valLen, vn := getVarint(data[pos:])
-	pos += vn
-
-	// Compute local value size
+	// Compute local payload size (unified format)
 	usable := pageSize
-	localVal := localValueSize(int(keyLen), int(valLen), usable)
-	ovflPtrAbsOff = pos + localVal
+	totalPayload := int(keyLen) + int(valLen)
+	nLocal := localPayloadSize(totalPayload, usable)
+	ovflPtrAbsOff = pos + nLocal
 
 	if ovflPtrAbsOff+4 > len(data) {
 		t.Fatalf("overflow pointer offset %d extends past file (size=%d)", ovflPtrAbsOff, len(data))

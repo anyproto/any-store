@@ -298,22 +298,36 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 				continue
 			}
 
-			// Key ordering check
-			if prevKey != nil && bytes.Compare(prevKey, cell.key) >= 0 {
-				ic.report("%s cell %d: key out of order", context, i)
+			// Key ordering check — need full key for overflow cells
+			var fullKey []byte
+			if cell.overflowPg != 0 {
+				fk, fkerr := leafFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, false)
+				if fkerr != nil {
+					ic.report("%s cell %d: corrupt leaf key", context, i)
+				} else {
+					fullKey = fk
+				}
+			} else {
+				fullKey = cell.key
 			}
-			prevKey = bytes.Clone(cell.key)
+			if fullKey != nil {
+				if prevKey != nil && bytes.Compare(prevKey, fullKey) >= 0 {
+					ic.report("%s cell %d: key out of order", context, i)
+				}
+				prevKey = bytes.Clone(fullKey)
+			}
 
-			// Overflow validation
+			// Overflow validation (unified payload format v5)
 			if cell.overflowPg != 0 {
 				pos := cellOff
 				keyLen, kn, verr := getVarintSafe(pg.data[pos:])
 				if verr == nil {
-					pos += kn + int(keyLen)
+					pos += kn
 					valLen, _, verr2 := getVarintSafe(pg.data[pos:])
 					if verr2 == nil {
-						localValSz := localValueSize(int(keyLen), int(valLen), ic.usableSize)
-						overflowBytes := int(valLen) - localValSz
+						totalPayload := int(keyLen) + int(valLen)
+						nLocal := localPayloadSize(totalPayload, ic.usableSize)
+						overflowBytes := totalPayload - nLocal
 						ovflUsable := overflowPageUsable(ic.usableSize)
 						nOverflow := (overflowBytes + ovflUsable - 1) / ovflUsable
 						ic.checkList(false, cell.overflowPg, uint32(nOverflow))

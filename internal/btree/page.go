@@ -93,6 +93,10 @@ const (
 	// overflowPtrSize is the size of the overflow page pointer at the end
 	// of a leaf cell that has overflowed.
 	overflowPtrSize = 4
+	// maxPayloadAlloc is the maximum allocation size for key/value payloads
+	// read from disk. Protects against OOM from corrupted varints that decode
+	// to absurdly large values. 1 GB is generous for any real workload.
+	maxPayloadAlloc = 1 << 30
 )
 
 // maxLocalPayload returns the max payload stored locally before overflow.
@@ -129,27 +133,24 @@ func localPayloadSize(totalPayload, usableSize int) int {
 	return minLocal
 }
 
-// localValueSize computes how many bytes of value are stored locally in a
-// leaf cell. In our format the key is always stored fully on-page (for binary
-// search), so only the value portion can overflow.
+// Leaf cell format (schema format 5+):
 //
-// If totalPayload (keyLen+valLen) <= maxLocal, the full value is stored
-// locally (no overflow). Otherwise, localPayloadSize gives the total local
-// bytes; subtracting keyLen gives the local value portion. When the key
-// alone exceeds localPayloadSize, zero value bytes are stored locally.
-func localValueSize(keyLen, valLen, usableSize int) int {
-	totalPayload := keyLen + valLen
-	maxLocal := maxLocalPayload(usableSize)
-	if totalPayload <= maxLocal {
-		return valLen
-	}
-	localSize := localPayloadSize(totalPayload, usableSize)
-	localVal := localSize - keyLen
-	if localVal < 0 {
-		localVal = 0
-	}
-	return localVal
-}
+//   [varint(keyLen)] [varint(valLen)] [payload...] [4-byte overflow_ptr?]
+//
+// The payload is the concatenation (key || value), treated as a single blob
+// for overflow purposes. When totalPayload = keyLen + valLen exceeds
+// maxLocalPayload(usableSize), only nLocal = localPayloadSize(totalPayload,
+// usableSize) bytes of payload are stored on-page, and the remainder is
+// written to an overflow chain. The overflow pointer (4 bytes) is appended
+// after the local payload.
+//
+// This matches SQLite's index btree format where the entire cell payload can
+// overflow. The key difference from SQLite is that we use two varints
+// (keyLen, valLen) instead of one (nPayload) because our btree has separate
+// key/value semantics (e.g., Put(docId, encodedDocument) in collection.go).
+// Both lengths are always fully on-page, so cell size computation and overflow
+// detection remain I/O-free. For key-only entries (non-unique indexes),
+// varint(0) for valLen adds just 1 byte.
 
 // dbHeader represents the 100-byte database file header.
 type dbHeader struct {
