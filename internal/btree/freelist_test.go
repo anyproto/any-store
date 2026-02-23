@@ -29,7 +29,7 @@ func TestFreelistAllocFree(t *testing.T) {
 	assert.NotEqual(t, uint32(0), p.header.FirstFreelistPg)
 
 	// Reallocate - should reuse freed pages
-	dbSizeBefore := p.dbSize
+	dbSizeBefore := p.dbSize.Load()
 	reused := make([]uint32, 5)
 	for i := range reused {
 		pg, err := p.allocatePage()
@@ -39,7 +39,7 @@ func TestFreelistAllocFree(t *testing.T) {
 	}
 
 	// DB should not have grown
-	assert.Equal(t, dbSizeBefore, p.dbSize)
+	assert.Equal(t, dbSizeBefore, p.dbSize.Load())
 	assert.Equal(t, uint32(0), p.header.TotalFreelistPgs)
 	assert.Equal(t, uint32(0), p.header.FirstFreelistPg)
 }
@@ -70,13 +70,13 @@ func TestFreelistTrunkOverflow(t *testing.T) {
 	// we need 2 trunk pages.
 
 	// Reallocate all - should reuse
-	dbSizeBefore := p.dbSize
+	dbSizeBefore := p.dbSize.Load()
 	for range total {
 		pg, err := p.allocatePage()
 		require.NoError(t, err)
 		p.releasePage(pg)
 	}
-	assert.Equal(t, dbSizeBefore, p.dbSize)
+	assert.Equal(t, dbSizeBefore, p.dbSize.Load())
 	assert.Equal(t, uint32(0), p.header.TotalFreelistPgs)
 }
 
@@ -149,7 +149,7 @@ func TestDeleteFreesPages(t *testing.T) {
 	assert.True(t, db.pager.header.TotalFreelistPgs > 0, "freelist should have free pages after mass delete")
 
 	// Now insert again - should reuse pages (DB shouldn't grow much)
-	dbSizeBefore := db.pager.dbSize
+	dbSizeBefore := db.pager.dbSize.Load()
 	tx3, err := db.BeginWrite()
 	require.NoError(t, err)
 	ns4, _ := db.getNamespaceLocked("data")
@@ -161,8 +161,8 @@ func TestDeleteFreesPages(t *testing.T) {
 	require.NoError(t, tx3.Commit())
 
 	// DB size should not have grown significantly (reusing freelist pages)
-	assert.True(t, db.pager.dbSize <= dbSizeBefore+5,
-		"DB grew too much: before=%d after=%d", dbSizeBefore, db.pager.dbSize)
+	assert.True(t, db.pager.dbSize.Load() <= dbSizeBefore+5,
+		"DB grew too much: before=%d after=%d", dbSizeBefore, db.pager.dbSize.Load())
 }
 
 func TestNamespaceDeleteFreesPages(t *testing.T) {
@@ -191,7 +191,7 @@ func TestNamespaceDeleteFreesPages(t *testing.T) {
 		"freelist should have free pages after namespace delete")
 
 	// Create a new namespace — should reuse freed pages
-	dbSizeBefore := db.pager.dbSize
+	dbSizeBefore := db.pager.dbSize.Load()
 	tx3, err := db.BeginWrite()
 	require.NoError(t, err)
 	ns2, err := tx3.CreateNamespace("reuse")
@@ -203,8 +203,8 @@ func TestNamespaceDeleteFreesPages(t *testing.T) {
 	}
 	require.NoError(t, tx3.Commit())
 
-	assert.True(t, db.pager.dbSize <= dbSizeBefore+5,
-		"DB grew too much: before=%d after=%d", dbSizeBefore, db.pager.dbSize)
+	assert.True(t, db.pager.dbSize.Load() <= dbSizeBefore+5,
+		"DB grew too much: before=%d after=%d", dbSizeBefore, db.pager.dbSize.Load())
 }
 
 func TestFreePageInvalidPages(t *testing.T) {

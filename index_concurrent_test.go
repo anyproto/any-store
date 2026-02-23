@@ -14,6 +14,8 @@ package anystore
 
 import (
 	"fmt"
+	"math/rand"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -720,4 +722,123 @@ func TestIndex_Concurrent_ConcurrentDeleteAndQuery(t *testing.T) {
 	total, err := coll.Find(nil).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 90, total)
+}
+
+// TestConcurrentReadersOverflowKeys tests MVCC isolation when a writer creates
+// overflow index keys while multiple readers scan the btree simultaneously.
+// This targets the new schema format 5 unified key+value overflow.
+func TestConcurrentReadersOverflowKeys(t *testing.T) {
+	ctx := ctx
+	dbPath := filepath.Join(t.TempDir(), "concurrent-overflow.db")
+
+	db, err := Open(ctx, dbPath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	coll, err := db.Collection(ctx, "testcoll")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rng := rand.New(rand.NewSource(777888))
+	arena := &anyenc.Arena{}
+
+	// Insert initial docs with large "data" fields to create overflow keys
+	for i := 0; i < 100; i++ {
+		arena.Reset()
+		obj := arena.NewObject()
+		obj.Set("id", arena.NewString(fmt.Sprintf("doc-%06d", i)))
+		obj.Set("val", arena.NewNumberInt(i))
+		// Large data field: 1500-3000 bytes to force overflow in index keys
+		dataSize := 1500 + rng.Intn(1500)
+		obj.Set("data", arena.NewString(randomString(rng, dataSize)))
+		if err := coll.UpsertOne(ctx, obj); err != nil {
+			t.Fatalf("insert doc %d: %v", i, err)
+		}
+	}
+
+	// Create index on "data" field (overflow keys)
+	if err := coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"data"}}); err != nil {
+		t.Fatalf("EnsureIndex(data): %v", err)
+	}
+	t.Log("Index with overflow keys created")
+
+	// Concurrent readers + writer
+	var wg sync.WaitGroup
+	var readErrors int64
+	var writeErrors int64
+	done := make(chan struct{})
+
+	// Spawn reader goroutines that scan the collection
+	for r := 0; r < 8; r++ {
+		wg.Add(1)
+		go func(readerID int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				// Full scan
+				iter, err := coll.Find(nil).Iter(ctx)
+				if err != nil {
+					atomic.AddInt64(&readErrors, 1)
+					continue
+				}
+				for iter.Next() {
+					doc, err := iter.Doc()
+					if err != nil {
+						atomic.AddInt64(&readErrors, 1)
+						break
+					}
+					// Read the data field to force overflow page traversal
+					_ = doc.Value().GetStringBytes("data")
+				}
+				iter.Close()
+			}
+		}(r)
+	}
+
+	// Writer goroutine: update docs with new large data values
+	writerRng := rand.New(rand.NewSource(999111))
+	for round := 0; round < 50; round++ {
+		for j := 0; j < 10; j++ {
+			arena.Reset()
+			obj := arena.NewObject()
+			docID := writerRng.Intn(100)
+			obj.Set("id", arena.NewString(fmt.Sprintf("doc-%06d", docID)))
+			obj.Set("val", arena.NewNumberInt(round*10+j))
+			dataSize := 1500 + writerRng.Intn(1500)
+			obj.Set("data", arena.NewString(randomString(writerRng, dataSize)))
+			if err := coll.UpsertOne(ctx, obj); err != nil {
+				atomic.AddInt64(&writeErrors, 1)
+			}
+		}
+		// Checkpoint every 10 rounds
+		if round%10 == 0 {
+			_ = db.Flush(ctx, 0, FlushModeCheckpointPassive)
+		}
+	}
+
+	close(done)
+	wg.Wait()
+
+	re := atomic.LoadInt64(&readErrors)
+	we := atomic.LoadInt64(&writeErrors)
+	if re > 0 || we > 0 {
+		t.Fatalf("Errors during concurrent access: reads=%d, writes=%d", re, we)
+	}
+
+	// Final verification
+	count, err := coll.Count(ctx)
+	if err != nil {
+		t.Fatalf("final count: %v", err)
+	}
+	if err := db.QuickCheck(ctx); err != nil {
+		t.Fatalf("QuickCheck: %v", err)
+	}
+	t.Logf("Concurrent overflow keys test passed (%d docs, 8 readers, 50 write rounds)", count)
 }

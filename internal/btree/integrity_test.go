@@ -268,8 +268,8 @@ func TestIntegrityCheckOrphanPage(t *testing.T) {
 	require.NoError(t, err)
 	pg1, err := db.pager.getWritablePage(1)
 	require.NoError(t, err)
-	oldSize := db.pager.dbSize
-	db.pager.dbSize = oldSize + 1
+	oldSize := db.pager.dbSize.Load()
+	db.pager.dbSize.Store(oldSize + 1)
 	db.pager.header.DatabaseSize = oldSize + 1
 	binary.BigEndian.PutUint32(pg1.data[28:32], oldSize+1)
 	db.pager.releasePage(pg1)

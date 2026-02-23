@@ -37,7 +37,7 @@ type pager struct {
 	header   dbHeader
 	path     string
 	pageSize uint32
-	dbSize   uint32       // database size in pages
+	dbSize   atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
 	state    atomic.Int32 // pagerState
 
 	// Savepoint support: snapshots of dirty pages at savepoint boundaries
@@ -154,7 +154,7 @@ func (p *pager) open() error {
 	}
 
 	p.pageSize = p.header.PageSize
-	p.dbSize = p.header.DatabaseSize
+	p.dbSize.Store(p.header.DatabaseSize)
 	p.cache = newPcache(int(p.pageSize), p.cache.maxPages, p.cache.purgeable)
 
 	// Open WAL
@@ -169,7 +169,7 @@ func (p *pager) open() error {
 
 	// Update dbSize from WAL if it has committed frames
 	if p.wal.index.maxPage > 0 {
-		p.dbSize = p.wal.index.maxPage
+		p.dbSize.Store(p.wal.index.maxPage)
 	}
 
 	p.state.Store(int32(pagerOpen))
@@ -222,7 +222,7 @@ func (p *pager) initNewDB() error {
 		}
 	}
 
-	p.dbSize = 1
+	p.dbSize.Store(1)
 	p.cache = newPcache(int(p.pageSize), p.cache.maxPages, p.cache.purgeable)
 
 	// For inMemory mode, pre-populate page 1 in pcache so reads find it
@@ -368,7 +368,7 @@ func (p *pager) getPageAt(pgno, walMaxFrame uint32) (*page, error) {
 		_, err := p.file.ReadAt(pg.data, offset)
 		if err != nil {
 			// If page is beyond current file but within dbSize, it's a new page
-			if pgno <= p.dbSize {
+			if pgno <= p.dbSize.Load() {
 				p.cache.release(pg)
 				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 			}
@@ -427,7 +427,7 @@ func (p *pager) readPageUncached(pgno, walMaxFrame uint32) (*page, error) {
 		offset := int64(pgno-1) * int64(p.pageSize)
 		_, err := p.file.ReadAt(pg.data, offset)
 		if err != nil {
-			if pgno <= p.dbSize {
+			if pgno <= p.dbSize.Load() {
 				p.recycleTempPage(pg)
 				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 			}
@@ -548,13 +548,12 @@ func (p *pager) allocatePage() (*page, error) {
 		// Fall through to grow database if freelist read fails
 	}
 
-	p.dbSize++
-	pgno := p.dbSize
+	pgno := p.dbSize.Add(1)
 
 	// Use getPageNoContent: new pages have no existing content to read (fix 5.4).
 	pg, err := p.getPageNoContent(pgno)
 	if err != nil {
-		p.dbSize--
+		p.dbSize.Add(^uint32(0)) // decrement
 		return nil, err
 	}
 	clear(pg.data)
@@ -593,7 +592,7 @@ func (p *pager) freePage(pgno uint32) error {
 		return ErrInvalidPage
 	}
 	// Bounds check: page number must be within database size (fix 5.1).
-	if pgno > p.dbSize {
+	if pgno > p.dbSize.Load() {
 		return ErrCorrupt
 	}
 
@@ -601,7 +600,7 @@ func (p *pager) freePage(pgno uint32) error {
 
 	if trunkPgno != 0 {
 		// Validate trunk page number (fix 5.1).
-		if trunkPgno > p.dbSize {
+		if trunkPgno > p.dbSize.Load() {
 			return ErrCorrupt
 		}
 		// Read the current trunk page
@@ -668,7 +667,7 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 		return nil, ErrInvalidPage
 	}
 	// Validate trunk page number (fix 5.1).
-	if trunkPgno > p.dbSize {
+	if trunkPgno > p.dbSize.Load() {
 		return nil, ErrCorrupt
 	}
 
@@ -691,7 +690,7 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 		leafPgno := binary.BigEndian.Uint32(trunkPg.data[8+(leafCount-1)*4:])
 
 		// Validate leaf page number (fix 5.1).
-		if leafPgno < 2 || leafPgno > p.dbSize {
+		if leafPgno < 2 || leafPgno > p.dbSize.Load() {
 			p.releasePage(trunkPg)
 			return nil, ErrCorrupt
 		}
@@ -746,7 +745,7 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 	nextTrunk := binary.BigEndian.Uint32(trunkPg.data[0:4])
 
 	// Validate next trunk page number (fix 5.1): 0 means end of list.
-	if nextTrunk != 0 && nextTrunk > p.dbSize {
+	if nextTrunk != 0 && nextTrunk > p.dbSize.Load() {
 		p.releasePage(trunkPg)
 		return nil, ErrCorrupt
 	}
@@ -936,7 +935,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	}
 
 	// Update the in-memory header with current database size.
-	p.header.DatabaseSize = p.dbSize
+	p.header.DatabaseSize = p.dbSize.Load()
 
 	// Collect dirty pages first to determine if there are real changes.
 	p.dirtyBuf = p.cache.appendDirtyPages(p.dirtyBuf[:0])
@@ -993,7 +992,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	p.dirtyBuf = p.cache.appendDirtyPages(p.dirtyBuf[:0])
 
 	// Write all dirty pages to WAL
-	if err := p.wal.writeFrames(p.dirtyBuf, true, p.dbSize); err != nil {
+	if err := p.wal.writeFrames(p.dirtyBuf, true, p.dbSize.Load()); err != nil {
 		p.pagerError()
 		return 0, 0, 0, err
 	}
@@ -1033,7 +1032,7 @@ func (p *pager) rollback() error {
 	// This ensures FirstFreelistPg, TotalFreelistPgs, and DatabaseSize are
 	// reverted to their pre-transaction values after dirty pages are discarded.
 	p.header = p.savedHeader
-	p.dbSize = p.header.DatabaseSize
+	p.dbSize.Store(p.header.DatabaseSize)
 
 	p.savepoints = p.savepoints[:0]
 	clear(p.writePages)
@@ -1064,7 +1063,7 @@ func (p *pager) pagerError() {
 
 	// Restore the database header to pre-transaction state.
 	p.header = p.savedHeader
-	p.dbSize = p.header.DatabaseSize
+	p.dbSize.Store(p.header.DatabaseSize)
 
 	p.savepoints = p.savepoints[:0]
 	clear(p.writePages)
@@ -1090,7 +1089,7 @@ func (p *pager) savepoint() (int, error) {
 	id := len(p.savepoints)
 	p.savepoints = append(p.savepoints, savepointState{
 		id:       id,
-		dbSize:   p.dbSize,
+		dbSize:   p.dbSize.Load(),
 		pages:    make(map[uint32][]byte),
 		walFrame: p.wal.nFrame.Load(),
 		header:   p.header, // snapshot header for rollback (fix 9.3)
@@ -1137,7 +1136,7 @@ func (p *pager) rollbackToSavepoint(id int) error {
 				// Also restore the database header if this is page 1 (fix 9.3).
 				if pgno == 1 {
 					p.header.deserialize(pg.data[:dbHeaderSize])
-					p.dbSize = p.header.DatabaseSize
+					p.dbSize.Store(p.header.DatabaseSize)
 				}
 				// Page is restored to pre-savepoint state but stays dirty
 				// so it can be modified again in the current transaction.
@@ -1150,7 +1149,7 @@ func (p *pager) rollbackToSavepoint(id int) error {
 	// This covers the case where page 1 was not in any savepoint's page map
 	// but the header was modified in memory (e.g., freelist changes).
 	p.header = sp.header
-	p.dbSize = sp.dbSize
+	p.dbSize.Store(sp.dbSize)
 
 	// Remove savepoints above the target but keep the target itself.
 	// This matches SQLite's behavior (pager.c:7025): ROLLBACK TO keeps the
@@ -1269,7 +1268,7 @@ func (p *pager) readOverflowChainInternal(firstPgno uint32, buf []byte, walMaxFr
 	}
 	iter := 0
 
-	dbSize := p.dbSize
+	dbSize := p.dbSize.Load()
 
 	for pgno != 0 && off < len(buf) {
 		// Bounds checking (fix 8.2): page numbers must be >= 2 and <= dbSize.
@@ -1312,7 +1311,7 @@ func (p *pager) freeOverflowChain(firstPgno uint32) error {
 
 	// Max iteration counter to prevent infinite loops on circular chains (fix 8.2).
 	// Use dbSize as an upper bound — a chain cannot have more pages than the database.
-	maxIter := int(p.dbSize)
+	maxIter := int(p.dbSize.Load())
 	if maxIter < 10 {
 		maxIter = 10
 	}
@@ -1320,7 +1319,7 @@ func (p *pager) freeOverflowChain(firstPgno uint32) error {
 
 	for pgno != 0 {
 		// Bounds checking (fix 8.2): page numbers must be >= 2 and <= dbSize.
-		if pgno < 2 || pgno > p.dbSize {
+		if pgno < 2 || pgno > p.dbSize.Load() {
 			return ErrCorrupt
 		}
 
