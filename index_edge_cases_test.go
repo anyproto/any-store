@@ -14,7 +14,10 @@ architecture (document-oriented with weight-based planner vs SQL VDBE).
 package anystore
 
 import (
+	"context"
 	"fmt"
+	"math/rand"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -366,4 +369,71 @@ func TestIndex_EdgeCases_LargeKeyPanic(t *testing.T) {
 	// (slice bounds out of range [-N:] because the key exceeds maxLocalPayload)
 	err = coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"data"}})
 	require.NoError(t, err, "EnsureIndex on large-value field should not panic")
+}
+
+func randomString(rng *rand.Rand, n int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = letters[rng.Intn(len(letters))]
+	}
+	return string(b)
+}
+
+func TestDropRecreateIndexCorruption(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "corrupt.db")
+
+	db, err := Open(ctx, dbPath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	coll, err := db.Collection(ctx, "testcoll")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rng := rand.New(rand.NewSource(11223344))
+	arena := &anyenc.Arena{}
+
+	// Step 1: Insert 500 docs
+	for i := 0; i < 500; i++ {
+		arena.Reset()
+		obj := arena.NewObject()
+		obj.Set("id", arena.NewString(fmt.Sprintf("doc-%06d", i)))
+		obj.Set("val", arena.NewNumberInt(rng.Intn(100000)))
+		obj.Set("data", arena.NewString(randomString(rng, 50+rng.Intn(100))))
+		if err := coll.UpsertOne(ctx, obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Step 2: Cycle create/update/drop index
+	for cycle := 0; cycle < 10; cycle++ {
+		// EnsureIndex - corruption detected on cycle 4
+		if err := coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"val"}}); err != nil {
+			t.Fatalf("BUG CONFIRMED - cycle %d: EnsureIndex(val): %v", cycle, err)
+		}
+
+		// Updates between create and drop
+		for j := 0; j < 20; j++ {
+			arena.Reset()
+			obj := arena.NewObject()
+			key := fmt.Sprintf("doc-%06d", rng.Intn(500))
+			obj.Set("id", arena.NewString(key))
+			obj.Set("val", arena.NewNumberInt(rng.Intn(100000)))
+			obj.Set("data", arena.NewString(randomString(rng, 50+rng.Intn(100))))
+			_ = coll.UpsertOne(ctx, obj)
+		}
+
+		// Drop all indexes
+		for _, idx := range coll.GetIndexes() {
+			if err := coll.DropIndex(ctx, idx.Info().Name); err != nil {
+				t.Fatalf("cycle %d: DropIndex: %v", cycle, err)
+			}
+		}
+	}
+	t.Log("All cycles passed - bug not triggered with this seed")
 }

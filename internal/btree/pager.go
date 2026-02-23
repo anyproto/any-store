@@ -719,6 +719,7 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 				return nil, err
 			}
 			clear(pg.data)
+			pg.header = pageHeader{}
 			delete(p.dontWritePages, leafPgno)
 			return pg, nil
 		}
@@ -729,6 +730,7 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 			return nil, err
 		}
 		clear(pg.data)
+		pg.header = pageHeader{}
 		p.cache.makeDirty(pg)
 		p.writePages[leafPgno] = pg
 		// Clear dontWrite flag: when a page is freed and then re-allocated
