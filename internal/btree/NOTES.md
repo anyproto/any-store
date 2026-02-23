@@ -873,6 +873,89 @@ store key/value pairs by adding a second varint for value length. This means:
 
 ---
 
+## 19. Atomic `dbSize` -- Why Go Needs `atomic.Uint32` While SQLite C Doesn't
+
+### The Problem
+
+The `pager.dbSize` field (database size in pages) is written by the writer goroutine
+in `allocatePage()` and read by concurrent reader goroutines in
+`readOverflowChainInternal()` for bounds-checking overflow page numbers. Without
+synchronization this is a data race under Go's memory model.
+
+### How SQLite C Avoids the Race
+
+SQLite sidesteps this entirely through its process/threading model:
+
+1. **`Pager.dbSize` is per-connection.** Each SQLite connection has its own `Pager`
+   struct. A reader snapshots `dbSize` once during `sqlite3PagerSharedLock()` →
+   `pagerPagecount()` → `sqlite3WalDbsize()`, which returns `pWal->hdr.nPage` --
+   a local copy of the WAL index header captured at `walTryBeginRead()` time. No
+   other thread ever touches that `Pager` object concurrently. There is no shared
+   mutable state to race on.
+
+2. **`BtShared.nPage` is mutex-protected.** When multiple connections share a
+   `BtShared` (shared-cache mode), every access to `pBt->nPage` is guarded by
+   `pBt->mutex`. Each access site has `assert(sqlite3_mutex_held(pBt->mutex))`.
+   The pthread mutex provides a full acquire/release barrier, so the C memory model
+   guarantees visibility.
+
+3. **The WAL shared-memory `nPage`** (the `volatile WalIndexHdr` in `.shm`) uses a
+   double-copy + `walShmBarrier()` (→ `__sync_synchronize()`) + checksum protocol
+   for cross-process visibility without a mutex. OS-level `flock` byte-range locks
+   provide inter-process ordering.
+
+In summary, SQLite never has two threads concurrently accessing the same `dbSize`
+field without a synchronization primitive: the field is either per-connection
+(no sharing) or mutex-protected (shared cache).
+
+### Why Go Needs Atomics
+
+The Go implementation has a single `pager` struct shared by all goroutines within
+a process. The writer goroutine increments `dbSize` in `allocatePage()` while
+reader goroutines read it in `readOverflowChainInternal()` for bounds checking.
+This is a genuine concurrent access to a shared field.
+
+Go's memory model (defined by the Go specification, not C11/POSIX) requires that
+concurrent access to a shared variable be synchronized via `sync/atomic` operations,
+`sync.Mutex`, or channels. A plain `uint32` read/write from different goroutines is
+a data race -- even if "logically" only one goroutine writes at any given time --
+unless the Go race detector can see a happens-before relationship.
+
+The options were:
+- **Mutex on every read** -- too expensive; readers would contend with the writer
+  on every overflow bounds check
+- **Per-reader `dbSize` snapshot** (matching SQLite's per-connection model) -- would
+  require threading a snapshot value through every reader call path
+- **`atomic.Uint32`** -- minimal overhead (~1 ns per Load on x86), zero contention,
+  zero API changes
+
+We chose `atomic.Uint32` as the simplest correct solution. The writer uses
+`dbSize.Add(1)` in `allocatePage()` and `dbSize.Store()` for rollback/init paths.
+Readers use `dbSize.Load()` for bounds checking. This is safe under Go's memory
+model and introduces no contention.
+
+### Drift
+
+| Aspect | SQLite C | Go |
+|--------|----------|-----|
+| `dbSize` ownership | Per-connection (`Pager.dbSize`) -- no sharing | Single shared `pager.dbSize` |
+| Writer/reader isolation | Separate `Pager` instances per thread | Shared struct, goroutine concurrency |
+| Synchronization | None needed (no sharing) or `pBt->mutex` | `atomic.Uint32` (Load/Store/Add) |
+| WAL snapshot | `pWal->hdr.nPage` local copy at read-lock time | `walMaxFrame` per reader, atomic `dbSize` for bounds |
+| Performance cost | Zero (no sharing = no synchronization) | ~1 ns per `atomic.Load` on x86 |
+
+**Classification: Divergent** -- This drift stems from a fundamental architectural
+difference: SQLite uses per-connection state isolation (each connection has its own
+`Pager`), while the Go implementation shares a single `pager` across goroutines. The
+Go memory model mandates explicit synchronization for any cross-goroutine field access,
+even for benign races that C compilers and POSIX threads would handle correctly via
+hardware cache coherence. The `atomic.Uint32` is the minimal correct fix; an
+alternative would be to refactor toward per-reader `dbSize` snapshots (matching
+SQLite's architecture), but that would be a much larger change for the same correctness
+guarantee.
+
+---
+
 ## Summary Table
 
 | Area | Drift Type | Severity | Notes |
@@ -895,6 +978,7 @@ store key/value pairs by adding a second varint for value length. This means:
 | 16. Savepoints | Divergent | Medium | In-memory vs on-disk sub-journal |
 | 17. Auto-vacuum | Missing | Medium | Not implemented |
 | 18. Table B-trees | Structural | High | Not implemented; index B-trees only |
+| 19. Atomic dbSize | Divergent | Low | Go memory model requires atomics for shared pager field |
 
 ---
 
