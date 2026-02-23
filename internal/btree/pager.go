@@ -167,8 +167,18 @@ func (p *pager) open() error {
 		return err
 	}
 
-	// Update dbSize from WAL if it has committed frames
-	if p.wal.index.maxPage > 0 {
+	// After WAL recovery, refresh the full header from WAL's page 1.
+	// The DB file header may be stale (e.g. freelist pointers) if a crash
+	// occurred before checkpoint. Without this, commit() would serialize
+	// stale p.header fields back into page 1, corrupting the freelist.
+	if p.wal.index.maxFrame > 0 {
+		frame := p.wal.index.get(1, p.wal.index.maxFrame)
+		if frame > 0 {
+			walBuf := make([]byte, p.pageSize)
+			if err := p.wal.readFrame(frame, walBuf); err == nil {
+				p.header.deserialize(walBuf[:dbHeaderSize])
+			}
+		}
 		p.dbSize.Store(p.wal.index.maxPage)
 	}
 
