@@ -7,7 +7,58 @@ package btree
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
+	"log"
+	"os"
+	"sync/atomic"
 )
+
+// debugOverflowReadErrors, when non-zero, causes collectLeafCells and
+// collectInteriorCells to panic when readOverflowChainAt returns an error,
+// rather than silently ignoring it. Set via atomic for test use only.
+var debugOverflowReadErrors atomic.Int32
+
+// SetDebugOverflowReadErrors enables or disables the debug mode that panics
+// on overflow read errors in collectLeafCells/collectInteriorCells.
+func SetDebugOverflowReadErrors(enabled bool) {
+	if enabled {
+		debugOverflowReadErrors.Store(1)
+	} else {
+		debugOverflowReadErrors.Store(0)
+	}
+}
+
+// debugTrace controls verbose tracing of overflow/savepoint operations.
+// Set BTREE_TRACE=1 to log to stderr, or BTREE_TRACE=/path/to/file to log to a file.
+var (
+	debugTrace    bool
+	debugTraceLog *log.Logger
+)
+
+func init() {
+	v := os.Getenv("BTREE_TRACE")
+	if v == "" {
+		return
+	}
+	debugTrace = true
+	if v == "1" || v == "stderr" {
+		debugTraceLog = log.New(os.Stderr, "[BTREE-TRACE] ", log.Lmicroseconds)
+	} else {
+		f, err := os.OpenFile(v, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			log.Printf("BTREE_TRACE: cannot open %s: %v, falling back to stderr", v, err)
+			debugTraceLog = log.New(os.Stderr, "[BTREE-TRACE] ", log.Lmicroseconds)
+		} else {
+			debugTraceLog = log.New(f, "[BTREE-TRACE] ", log.Lmicroseconds)
+		}
+	}
+}
+
+func trace(format string, args ...any) {
+	if debugTrace {
+		debugTraceLog.Printf(format, args...)
+	}
+}
 
 // btree represents a single B-tree (one namespace).
 type btree struct {
@@ -1400,7 +1451,16 @@ func (bt *btree) collectLeafCells(pg *page) []cellData {
 			// Read entire overflow chain
 			overflowSize := totalPayload - nLocal
 			overflowBuf := make([]byte, overflowSize)
-			_ = bt.pager.readOverflowChainAt(cells[i].overflowPg, overflowBuf, bt.walMaxFrame)
+			if err := bt.pager.readOverflowChainAt(cells[i].overflowPg, overflowBuf, bt.walMaxFrame); err != nil {
+				trace("collectLeafCells: readOverflowChainAt FAILED pg=%d walMaxFrame=%d err=%v leafPage=%d cell=%d key=%q",
+					cells[i].overflowPg, bt.walMaxFrame, err, pg.pgno, i, cells[i].key)
+				if debugOverflowReadErrors.Load() != 0 {
+					panic(fmt.Sprintf("collectLeafCells: readOverflowChainAt(pg=%d, walMaxFrame=%d) failed: %v",
+						cells[i].overflowPg, bt.walMaxFrame, err))
+				}
+			} else {
+				trace("collectLeafCells: read overflow pg=%d size=%d leafPage=%d cell=%d", cells[i].overflowPg, overflowSize, pg.pgno, i)
+			}
 
 			// Reconstruct full key
 			fullKey := make([]byte, int(keyLen))
@@ -1457,7 +1517,12 @@ func (bt *btree) collectInteriorCells(pg *page) []cellData {
 			fullKey := make([]byte, int(keyLen))
 			copy(fullKey, pg.data[pos:pos+localSize])
 			overflowPg := binary.BigEndian.Uint32(pg.data[pos+localSize : pos+localSize+4])
-			_ = bt.pager.readOverflowChainAt(overflowPg, fullKey[localSize:], bt.walMaxFrame)
+			if err := bt.pager.readOverflowChainAt(overflowPg, fullKey[localSize:], bt.walMaxFrame); err != nil {
+				if debugOverflowReadErrors.Load() != 0 {
+					panic(fmt.Sprintf("collectInteriorCells: readOverflowChainAt(pg=%d, walMaxFrame=%d) failed: %v",
+						overflowPg, bt.walMaxFrame, err))
+				}
+			}
 			_ = bt.pager.freeOverflowChain(overflowPg)
 			cells[i].key = fullKey
 			cells[i].overflowPg = 0
