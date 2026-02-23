@@ -346,7 +346,7 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 	hdrOff := 0
 	rootPg.header.pageType = pageTypeLeafIdx
 	rootPg.header.cellCount = 0
-	rootPg.header.cellContentOff = uint16(db.pager.pageSize) - uint16(db.pager.header.ReservedSpace)
+	rootPg.header.cellContentOff = uint16(db.pager.usableSize())
 	rootPg.header.serialize(rootPg.data[hdrOff:])
 	db.pager.releasePage(rootPg)
 
@@ -417,7 +417,7 @@ func (db *DB) freeTreePages(pgno uint32) error {
 		}
 	} else {
 		// Leaf page: free any overflow chains
-		usableSize := int(db.pager.pageSize) - int(db.pager.header.ReservedSpace)
+		usableSize := db.pager.usableSize()
 		n := int(pg.header.cellCount)
 		for i := range n {
 			off := pg.getCellOffset(i)
@@ -637,7 +637,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 	}
 
 	// Search without starting a new read tx (we're already in one)
-	usableSize := int(tx.pager.pageSize) - int(tx.pager.header.ReservedSpace)
+	usableSize := tx.pager.usableSize()
 	mvcc := !tx.writable
 	for {
 		if pg.header.isLeaf() {

@@ -34,9 +34,10 @@ type pager struct {
 	file     *os.File
 	wal      *wal
 	cache    *pcache
-	header   dbHeader
-	path     string
-	pageSize uint32
+	header       dbHeader
+	path         string
+	pageSize     uint32
+	usableSize_  int // pageSize - ReservedSpace; immutable after open, safe for concurrent reads
 	dbSize   atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
 	state    atomic.Int32 // pagerState
 
@@ -154,6 +155,7 @@ func (p *pager) open() error {
 	}
 
 	p.pageSize = p.header.PageSize
+	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
 	p.dbSize.Store(p.header.DatabaseSize)
 	p.cache = newPcache(int(p.pageSize), p.cache.maxPages, p.cache.purgeable)
 
@@ -203,6 +205,7 @@ func (p *pager) initNewDB() error {
 		DefaultCacheSize: defaultCacheSize,
 		TextEncoding:     1, // UTF-8
 	}
+	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
 
 	// Create page 1 with the database header and an empty leaf table page
 	buf := make([]byte, p.pageSize)
@@ -584,8 +587,9 @@ func (p *pager) allocatePage() (*page, error) {
 // usableSize returns the usable page size (total page size minus reserved space).
 // This must be used for all cell/content calculations. The full pageSize is only
 // used for I/O operations (file reads/writes, buffer allocation, WAL frame sizes).
+// Safe for concurrent use: returns an immutable value set at open time.
 func (p *pager) usableSize() int {
-	return int(p.pageSize) - int(p.header.ReservedSpace)
+	return p.usableSize_
 }
 
 // freelistMaxLeaves returns the max number of leaf entries per trunk page.
@@ -1439,19 +1443,20 @@ func (p *pager) close() error {
 		if p.inMemory {
 			// InMemory: just reset WAL state, nothing to checkpoint to disk
 		} else {
-			// Checkpoint before closing, then truncate WAL to zero bytes.
-			// SQLite's sqlite3WalClose() does a PASSIVE checkpoint, and if successful,
-			// deletes (or truncates to 0) the WAL file. We truncate to 0 to match
-			// the test expectation that WAL is empty after a clean close.
+			// Checkpoint before closing. Only truncate WAL if all frames
+			// were copied to the database file. A partial PASSIVE checkpoint
+			// (due to active readers) returns ErrBusy; truncating the WAL
+			// in that case would destroy uncopied frames and corrupt the DB.
+			// Matches SQLite's sqlite3WalClose(): walLimitSize only called
+			// when rc==SQLITE_OK.
 			trace("close: starting passive checkpoint before WAL truncation, dbSize=%d", p.dbSize.Load())
 			cpErr := p.wal.checkpointPassive(p.file, p.cache)
 			if cpErr != nil {
-				trace("close: checkpointPassive FAILED: %v", cpErr)
+				trace("close: checkpointPassive incomplete or failed: %v", cpErr)
 			}
-			_ = cpErr
-			// Truncate WAL file to zero bytes after successful checkpoint,
-			// matching SQLite's walLimitSize(pWal, 0) in sqlite3WalClose().
-			p.wal.truncateFile()
+			if cpErr == nil {
+				p.wal.truncateFile()
+			}
 		}
 		_ = p.wal.close()
 	}

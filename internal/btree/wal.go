@@ -1468,8 +1468,24 @@ func (w *wal) checkpoint(dbFile *os.File, cache *pcache) error {
 
 // checkpointPassive performs a passive checkpoint that never blocks.
 // Used by auto-checkpoint (issue 6.2) to avoid blocking writers or readers.
+// Returns ErrBusy if not all frames were copied (partial checkpoint),
+// matching SQLite's SQLITE_BUSY return from sqlite3WalCheckpoint in
+// PASSIVE mode when readers block progress. Callers must not truncate
+// the WAL when ErrBusy is returned.
 func (w *wal) checkpointPassive(dbFile *os.File, cache *pcache) error {
-	return w.checkpointWithMode(dbFile, cache, CheckpointPassive, nil)
+	err := w.checkpointWithMode(dbFile, cache, CheckpointPassive, nil)
+	if err != nil {
+		return err
+	}
+	// Check if all frames were backfilled. A partial checkpoint means
+	// some frames remain only in the WAL and must not be discarded.
+	w.index.mu.RLock()
+	complete := w.index.nBackfill >= w.index.maxFrame
+	w.index.mu.RUnlock()
+	if !complete {
+		return ErrBusy
+	}
+	return nil
 }
 
 // checkpointWithMode writes WAL frames back to the database file using

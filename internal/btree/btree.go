@@ -90,7 +90,7 @@ func (bt *btree) getPage(pgno uint32) (*page, error) {
 
 // usablePageSize returns the usable page size, accounting for reserved space.
 func (bt *btree) usablePageSize() int {
-	return int(bt.pager.pageSize) - int(bt.pager.header.ReservedSpace)
+	return bt.pager.usableSize()
 }
 
 // cellData represents a parsed cell from a B-tree page.
