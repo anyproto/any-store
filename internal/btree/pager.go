@@ -181,7 +181,12 @@ func (p *pager) open() error {
 				p.header.deserialize(walBuf[:dbHeaderSize])
 			}
 		}
-		p.dbSize.Store(p.wal.index.maxPage)
+		// Use max of DB file's DatabaseSize and WAL's maxPage.
+		// After checkpoint + WAL reset, the DB file may have a larger
+		// DatabaseSize than what survives in the WAL after recovery.
+		if p.wal.index.maxPage > p.dbSize.Load() {
+			p.dbSize.Store(p.wal.index.maxPage)
+		}
 	}
 
 	p.state.Store(int32(pagerOpen))
