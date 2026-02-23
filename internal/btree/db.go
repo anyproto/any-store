@@ -4,7 +4,6 @@ package btree
 // It manages namespaces, transactions, and the underlying pager/WAL.
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"sync"
@@ -326,19 +325,15 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 		return ErrTxClosed
 	}
 
-	// Check if namespace already exists
-	nameKey := []byte(name)
-	pg, err := db.pager.getPage(1)
-	if err != nil {
-		return err
-	}
-	_, found, serr := searchLeafPage(pg, nameKey)
-	db.pager.releasePage(pg)
-	if serr != nil {
-		return serr
-	}
-	if found {
+	// Check if namespace already exists using proper tree traversal
+	// (page 1 may be an interior node after splits).
+	// Uses getNamespaceLocked which sees dirty pages from the current write tx.
+	_, err := db.getNamespaceLocked(name)
+	if err == nil {
 		return ErrNamespaceExists
+	}
+	if !errors.Is(err, ErrNamespaceNotFound) {
+		return err
 	}
 
 	// Allocate a new page for the namespace's B-tree root
@@ -355,19 +350,13 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 	rootPg.header.serialize(rootPg.data[hdrOff:])
 	db.pager.releasePage(rootPg)
 
-	// Store namespace -> root page mapping in master table
+	// Store namespace -> root page mapping in master table using proper
+	// btree Put which handles multi-level trees and splits correctly.
 	var rootPgBuf [4]byte
 	binary.BigEndian.PutUint32(rootPgBuf[:], rootPg.pgno)
 
-	masterPg, err := db.pager.getWritablePage(1)
-	if err != nil {
-		return err
-	}
-
-	bt := &btree{pager: db.pager, rootPage: 1}
-	err = bt.insertIntoLeaf(masterPg, nameKey, rootPgBuf[:])
-	db.pager.releasePage(masterPg)
-	return err
+	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walMaxFrame, writable: true}
+	return bt.Put([]byte(name), rootPgBuf[:])
 }
 
 // DeleteNamespace deletes a namespace. Must be called within a write transaction.
@@ -377,41 +366,20 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 		return ErrTxClosed
 	}
 
-	nameKey := []byte(name)
-	masterPg, err := db.pager.getWritablePage(1)
+	// Look up the namespace's root page using proper tree traversal
+	// (page 1 may be an interior node after splits).
+	// Uses getNamespaceLocked which sees dirty pages from the current write tx.
+	ns, err := db.getNamespaceLocked(name)
 	if err != nil {
 		return err
 	}
+	rootPage := ns.rootPage
 
-	idx, found, serr := searchLeafPage(masterPg, nameKey)
-	if serr != nil {
-		db.pager.releasePage(masterPg)
-		return serr
-	}
-	if !found {
-		db.pager.releasePage(masterPg)
-		return ErrNamespaceNotFound
-	}
-
-	// Get the root page number before removing the entry
-	off := masterPg.getCellOffset(idx)
-	cell, _, cerr := parseLeafCell(masterPg.data, int(off))
-	if cerr != nil {
-		db.pager.releasePage(masterPg)
-		return cerr
-	}
-	var rootPage uint32
-	if len(cell.value) >= 4 {
-		rootPage = binary.BigEndian.Uint32(cell.value)
-	}
-
-	cells := db.masterBT.collectLeafCells(masterPg)
-	cells = append(cells[:idx], cells[idx+1:]...)
-	if err := db.masterBT.rebuildLeafPage(masterPg, cells); err != nil {
-		db.pager.releasePage(masterPg)
+	// Delete namespace entry from master table
+	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walMaxFrame, writable: true}
+	if err := bt.Delete([]byte(name)); err != nil {
 		return err
 	}
-	db.pager.releasePage(masterPg)
 
 	// Free all pages in the namespace's B-tree
 	if rootPage != 0 {
@@ -498,14 +466,8 @@ func (db *DB) GetNamespace(name string) (*Namespace, error) {
 // Uses pager.getPage which reads from writePages — safe only when called from
 // the writer goroutine (e.g. WriteTx.CreateNamespace after modifying page 1).
 func (db *DB) getNamespaceLocked(name string) (*Namespace, error) {
-	nameKey := []byte(name)
-	pg, err := db.pager.getPage(1)
-	if err != nil {
-		return nil, err
-	}
-	defer db.pager.releasePage(pg)
-
-	return db.resolveNamespace(name, nameKey, pg)
+	bt := &btree{pager: db.pager, rootPage: 1, writable: true}
+	return db.resolveNamespace(name, bt)
 }
 
 // getNamespaceAt returns a Namespace handle using readPageMVCC for snapshot
@@ -513,42 +475,66 @@ func (db *DB) getNamespaceLocked(name string) (*Namespace, error) {
 // it does not access pager.writePages, and readPageMVCC returns an uncached
 // copy when the page is dirty (avoiding races with the writer).
 func (db *DB) getNamespaceAt(name string, walMaxFrame uint32) (*Namespace, error) {
+	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: walMaxFrame, writable: false}
+	return db.resolveNamespace(name, bt)
+}
+
+// resolveNamespace searches the master table btree for the given namespace
+// and returns a Namespace handle. Uses proper tree traversal that works
+// whether page 1 is a leaf or interior node.
+func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 	nameKey := []byte(name)
-	pg, err := db.pager.readPageMVCC(1, walMaxFrame)
+
+	// Search through the master btree (handles multi-level trees).
+	pg, err := bt.getPage(bt.rootPage)
 	if err != nil {
 		return nil, err
 	}
-	defer db.pager.releasePage(pg)
 
-	return db.resolveNamespace(name, nameKey, pg)
-}
+	usableSize := bt.usablePageSize()
+	mvcc := !bt.writable
+	for {
+		if pg.header.isLeaf() {
+			idx, found, serr := searchLeafWithOverflow(pg, nameKey, usableSize, bt.pager, bt.walMaxFrame, mvcc)
+			if serr != nil {
+				bt.pager.releasePage(pg)
+				return nil, serr
+			}
+			if !found {
+				bt.pager.releasePage(pg)
+				return nil, ErrNamespaceNotFound
+			}
+			off := pg.getCellOffset(idx)
+			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			if cerr != nil {
+				bt.pager.releasePage(pg)
+				return nil, cerr
+			}
+			if len(cell.value) < 4 {
+				bt.pager.releasePage(pg)
+				return nil, ErrCorrupt
+			}
+			rootPage := binary.BigEndian.Uint32(cell.value)
+			bt.pager.releasePage(pg)
+			return &Namespace{
+				name:     name,
+				rootPage: rootPage,
+				db:       db,
+			}, nil
+		}
 
-// resolveNamespace searches page 1 (the master table) for the given namespace
-// and returns a Namespace handle.
-func (db *DB) resolveNamespace(name string, nameKey []byte, pg *page) (*Namespace, error) {
-	idx, found, serr := searchLeafPage(pg, nameKey)
-	if serr != nil {
-		return nil, serr
+		// Interior page — descend to the correct child
+		childPgno, _, serr := searchInteriorWithOverflow(pg, nameKey, usableSize, bt.pager, bt.walMaxFrame, mvcc)
+		if serr != nil {
+			bt.pager.releasePage(pg)
+			return nil, serr
+		}
+		bt.pager.releasePage(pg)
+		pg, err = bt.getPage(childPgno)
+		if err != nil {
+			return nil, err
+		}
 	}
-	if !found {
-		return nil, ErrNamespaceNotFound
-	}
-
-	off := pg.getCellOffset(idx)
-	cell, _, cerr := parseLeafCell(pg.data, int(off))
-	if cerr != nil {
-		return nil, cerr
-	}
-	if len(cell.value) < 4 {
-		return nil, ErrCorrupt
-	}
-	rootPage := binary.BigEndian.Uint32(cell.value)
-
-	return &Namespace{
-		name:     name,
-		rootPage: rootPage,
-		db:       db,
-	}, nil
 }
 
 // ListNamespaces returns the names of all namespaces.
@@ -559,21 +545,24 @@ func (db *DB) ListNamespaces() ([]string, error) {
 	}
 	defer db.pager.endRead(slot)
 
-	pg, err := db.pager.readPageMVCC(1, maxFrame)
-	if err != nil {
-		return nil, err
-	}
-	defer db.pager.releasePage(pg)
+	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: maxFrame, writable: false}
+	cursor := bt.NewCursor()
+	defer cursor.Close()
 
-	n := int(pg.header.cellCount)
-	names := make([]string, 0, n)
-	for i := range n {
-		off := pg.getCellOffset(i)
-		cell, _, cerr := parseLeafCell(pg.data, int(off))
-		if cerr != nil {
-			return nil, cerr
+	if err := cursor.First(); err != nil {
+		return nil, nil // empty master table
+	}
+
+	var names []string
+	for cursor.Valid() {
+		key, err := cursor.Key()
+		if err != nil {
+			return nil, err
 		}
-		names = append(names, string(bytes.Clone(cell.key)))
+		names = append(names, string(key))
+		if err := cursor.Next(); err != nil {
+			return nil, err
+		}
 	}
 	return names, nil
 }

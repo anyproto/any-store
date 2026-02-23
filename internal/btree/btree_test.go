@@ -144,6 +144,32 @@ func TestNamespaces(t *testing.T) {
 	assert.ElementsMatch(t, []string{"ns1", "ns2"}, names)
 }
 
+func TestCreateManyNamespaces(t *testing.T) {
+	db := tempDB(t)
+	// Creating >233 namespaces triggers a page 1 split in the master table btree.
+	// This verifies namespace operations work when page 1 is an interior node.
+	const count = 300
+	for i := range count {
+		name := fmt.Sprintf("ns-%04d", i)
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		_, err = tx.CreateNamespace(name)
+		require.NoError(t, err, "namespace %d (%s)", i, name)
+		require.NoError(t, tx.Commit())
+	}
+	names, err := db.ListNamespaces()
+	require.NoError(t, err)
+	assert.Len(t, names, count)
+
+	// Verify all namespaces are retrievable
+	for i := range count {
+		name := fmt.Sprintf("ns-%04d", i)
+		ns, err := db.GetNamespace(name)
+		require.NoError(t, err, "GetNamespace %s", name)
+		assert.Equal(t, name, ns.Name())
+	}
+}
+
 func TestNamespaceDuplicate(t *testing.T) {
 	db := tempDB(t)
 	tx, err := db.BeginWrite()
