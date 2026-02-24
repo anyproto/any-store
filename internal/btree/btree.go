@@ -2453,9 +2453,9 @@ type Cursor struct {
 }
 
 type cursorFrame struct {
-	pgno    uint32
-	cellIdx int
 	pg      *page // pinned page (non-nil only for the leaf frame)
+	cellIdx int
+	pgno    uint32
 }
 
 // Close releases all pinned pages and invalidates the cursor.

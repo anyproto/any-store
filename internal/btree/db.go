@@ -569,9 +569,9 @@ func (db *DB) ListNamespaces() ([]string, error) {
 
 // Namespace represents a named key-value namespace (separate B-tree).
 type Namespace struct {
+	db       *DB
 	name     string
 	rootPage uint32
-	db       *DB
 }
 
 // Name returns the namespace name.
@@ -588,16 +588,16 @@ func (ns *Namespace) RootPage() uint32 {
 type ReadTx struct {
 	db          *DB
 	pager       *pager
-	closed      bool
-	walMaxFrame uint32 // WAL snapshot for this transaction
 	walSlot     int    // reader slot number (for endRead)
-	writable    bool   // true when embedded in a WriteTx (MVCC: allows seeing dirty pages)
+	walMaxFrame uint32 // WAL snapshot for this transaction
 
 	// Disk counters from page 1 at transaction start (for staleness detection).
 	diskFileChangeCounter  uint32
 	diskSchemaCookie       uint32
 	localFileChangeCounter uint32 // snapshot of DB's local value
 	localSchemaCookie      uint32 // snapshot of DB's local value
+	closed                 bool
+	writable               bool // true when embedded in a WriteTx (MVCC: allows seeing dirty pages)
 }
 
 // txGetPage fetches a page respecting MVCC snapshot isolation.

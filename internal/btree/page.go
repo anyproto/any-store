@@ -256,12 +256,12 @@ func (h *dbHeader) deserialize(buf []byte) error {
 
 // pageHeader represents the B-tree page header.
 type pageHeader struct {
-	pageType       uint8  // one of pageType* constants
+	rightChild     uint32 // right-most child pointer (interior pages only)
 	firstFreeBlk   uint16 // offset to first free block, 0 if none
 	cellCount      uint16 // number of cells on this page
 	cellContentOff uint16 // offset to first byte of cell content area
+	pageType       uint8  // one of pageType* constants
 	fragBytes      uint8  // number of fragmented free bytes
-	rightChild     uint32 // right-most child pointer (interior pages only)
 }
 
 // headerSize returns the size of this page header in bytes.
@@ -308,16 +308,14 @@ func (ph *pageHeader) deserialize(buf []byte) {
 
 // page represents an in-memory database page.
 type page struct {
-	pgno     uint32 // page number (1-based)
-	data     []byte // raw page data
-	dirty    bool   // true if page has been modified
-	uncached bool   // true if page is not in the shared cache (MVCC snapshot copy)
-	pinCount int    // reference count
-	header   pageHeader
-
-	// For page cache linked list
-	next *page
-	prev *page
+	data     []byte     // raw page data
+	next     *page      // page cache linked list
+	prev     *page      // page cache linked list
+	pinCount int        // reference count
+	header   pageHeader // parsed page header
+	pgno     uint32     // page number (1-based)
+	dirty    bool       // true if page has been modified
+	uncached bool       // true if page is not in the shared cache (MVCC snapshot copy)
 }
 
 // usableSize returns the usable size of the page (total minus reserved).
