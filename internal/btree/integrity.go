@@ -468,9 +468,7 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 			maxPossible := filePages
 			// WAL's maxPage tracks the committed database size including
 			// pages that only exist in the WAL (not yet checkpointed).
-			db.pager.wal.index.mu.RLock()
-			walMaxPage := db.pager.wal.index.maxPage
-			db.pager.wal.index.mu.RUnlock()
+			walMaxPage := db.pager.wal.index.maxPage.Load()
 			if walMaxPage > maxPossible {
 				maxPossible = walMaxPage
 			}

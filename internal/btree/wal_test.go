@@ -151,7 +151,7 @@ func TestWALWriteReadFrames(t *testing.T) {
 	// Write frames with commit
 	require.NoError(t, w.writeFrames([]*page{pg1, pg2}, true, 2))
 	assert.Equal(t, uint32(2), w.nFrame.Load())
-	assert.Equal(t, uint32(2), w.index.maxFrame)
+	assert.Equal(t, uint32(2), w.index.maxFrame.Load())
 
 	// Read frame 1
 	buf := make([]byte, 4096)
@@ -195,7 +195,7 @@ func TestWALWriteNoCommit(t *testing.T) {
 	// walIndex.maxFrame tracks highest frame set (used internally),
 	// but the commit-visible maxFrame is only updated on commit.
 	// The key behavior is that recovery will NOT replay uncommitted frames.
-	assert.Equal(t, uint32(1), w.index.maxFrame)
+	assert.Equal(t, uint32(1), w.index.maxFrame.Load())
 
 	w.endWrite()
 	require.NoError(t, w.close())
@@ -236,7 +236,7 @@ func TestWALRecoveryCommitted(t *testing.T) {
 	require.NoError(t, w2.open())
 
 	assert.Equal(t, uint32(1), w2.nFrame.Load())
-	assert.Equal(t, uint32(5), w2.index.maxPage)
+	assert.Equal(t, uint32(5), w2.index.maxPage.Load())
 
 	// Verify we can read the recovered frame
 	buf := make([]byte, 4096)
@@ -271,7 +271,7 @@ func TestWALRecoveryUncommittedTruncated(t *testing.T) {
 	require.NoError(t, w2.open())
 
 	assert.Equal(t, uint32(1), w2.nFrame.Load())
-	assert.Equal(t, uint32(1), w2.index.maxPage)
+	assert.Equal(t, uint32(1), w2.index.maxPage.Load())
 
 	// Frame for page 2 should not be in index
 	frame := w2.index.get(2, w2.nFrame.Load())
@@ -331,10 +331,10 @@ func TestWALIndexReset(t *testing.T) {
 
 	idx.set(1, 1)
 	idx.set(2, 2)
-	assert.Equal(t, uint32(2), idx.maxFrame)
+	assert.Equal(t, uint32(2), idx.maxFrame.Load())
 
 	idx.reset()
-	assert.Equal(t, uint32(0), idx.maxFrame)
+	assert.Equal(t, uint32(0), idx.maxFrame.Load())
 	assert.Equal(t, uint32(0), idx.get(1, 100))
 	assert.Equal(t, uint32(0), idx.get(2, 100))
 }
@@ -346,7 +346,7 @@ func TestWALIndexWriteHeader(t *testing.T) {
 	require.NoError(t, err)
 	defer idx.close()
 
-	idx.nBackfill = 5
+	idx.nBackfill.Store(5)
 	require.NoError(t, idx.writeHeader(10, 20, 5))
 	idx.shmWriteCkptInfo()
 
@@ -525,7 +525,7 @@ func TestWALRecoveryMultipleCommits(t *testing.T) {
 	require.NoError(t, w2.open())
 
 	assert.Equal(t, uint32(2), w2.nFrame.Load())
-	assert.Equal(t, uint32(2), w2.index.maxPage)
+	assert.Equal(t, uint32(2), w2.index.maxPage.Load())
 
 	buf := make([]byte, 4096)
 	require.NoError(t, w2.readFrame(1, buf))

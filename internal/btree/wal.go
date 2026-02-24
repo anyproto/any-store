@@ -62,6 +62,7 @@ package btree
 
 import (
 	"encoding/binary"
+	"errors"
 	"hash/crc32"
 	"math/bits"
 	"math/rand/v2"
@@ -338,6 +339,10 @@ func walChecksum(data []byte, s1, s2 uint32) (uint32, uint32) {
 // readMarkNotUsed is the sentinel value for an unused read mark slot.
 const readMarkNotUsed = uint32(0xFFFFFFFF)
 
+// errWALRetry is an internal sentinel signaling that beginRead should retry.
+// It is never returned to callers; the retry loop in beginRead handles it.
+var errWALRetry = errors.New("btree: WAL retry")
+
 // walIndexHdrSize is the size of one WalIndexHdr in the SHM (48 bytes),
 // matching SQLite's struct WalIndexHdr.
 const walIndexHdrSize = 48
@@ -457,19 +462,24 @@ func walChecksumNative(data []byte, s1, s2 uint32) (uint32, uint32) {
 // The index is backed by the shm interface, which may be mmap'd
 // for multi-process access or heap-backed for single-process.
 type walIndex struct {
+	// mu protects pageMap only. All scalar fields (maxFrame, maxPage,
+	// nBackfill, nBackfillAttempted, aReadMark) are atomic.Uint32 and
+	// must be accessed via Load/Store without holding mu. This matches
+	// SQLite's lock-free walTryBeginRead design. Do NOT add mu.RLock/Lock
+	// around atomic field accesses.
 	mu      sync.RWMutex
 	shm     shm               // platform-specific shared memory
 	pageMap map[uint32][]uint32 // pgno -> sorted list of frame indices (1-based)
-	maxFrame  uint32           // highest valid frame
-	maxPage   uint32           // database size at last commit
-	nBackfill uint32           // frames already checkpointed
+	maxFrame  atomic.Uint32    // highest valid frame
+	maxPage   atomic.Uint32    // database size at last commit
+	nBackfill atomic.Uint32    // frames already checkpointed
 
 	// nBackfillAttempted is the highest frame that a checkpoint has attempted
 	// to copy back to the database. It is set BEFORE backfilling begins, so
 	// that after a crash during checkpoint, recovery knows which frames may
 	// have been partially written. nBackfillAttempted >= nBackfill always.
 	// Matches SQLite's WalCkptInfo.nBackfillAttempted (issue 7.7).
-	nBackfillAttempted uint32
+	nBackfillAttempted atomic.Uint32
 
 	// hdr is the current WalIndexHdr, matching SQLite's pWal->hdr.
 	// Contains all 11 fields from the SQLite WalIndexHdr struct.
@@ -484,7 +494,7 @@ type walIndex struct {
 	// aReadMark tracks each reader's WAL snapshot position.
 	// Slot 0 is special: readers on slot 0 read entirely from the DB (nBackfill == maxFrame).
 	// Slots 1-4 are for readers that need WAL frames.
-	aReadMark [5]uint32
+	aReadMark [5]atomic.Uint32
 }
 
 func newWalIndex(shmPath string, inProcess bool) (*walIndex, error) {
@@ -505,7 +515,7 @@ func newWalIndex(shmPath string, inProcess bool) (*walIndex, error) {
 	}
 	// Initialize all read marks as unused
 	for i := range wi.aReadMark {
-		wi.aReadMark[i] = readMarkNotUsed
+		wi.aReadMark[i].Store(readMarkNotUsed)
 	}
 	return wi, nil
 }
@@ -514,10 +524,10 @@ func newWalIndex(shmPath string, inProcess bool) (*walIndex, error) {
 func (wi *walIndex) set(pgno, frame uint32) {
 	wi.mu.Lock()
 	wi.pageMap[pgno] = append(wi.pageMap[pgno], frame)
-	if frame > wi.maxFrame {
-		wi.maxFrame = frame
-	}
 	wi.mu.Unlock()
+	if frame > wi.maxFrame.Load() {
+		wi.maxFrame.Store(frame)
+	}
 	wi.shmHashWrite(pgno, frame)
 }
 
@@ -528,10 +538,10 @@ func (wi *walIndex) setBatch(pages []*page, startFrame uint32) {
 		frame := startFrame + uint32(i)
 		wi.pageMap[p.pgno] = append(wi.pageMap[p.pgno], frame)
 	}
-	if f := startFrame + uint32(len(pages)) - 1; f > wi.maxFrame {
-		wi.maxFrame = f
-	}
 	wi.mu.Unlock()
+	if f := startFrame + uint32(len(pages)) - 1; f > wi.maxFrame.Load() {
+		wi.maxFrame.Store(f)
+	}
 	// Write to shm hash tables for cross-process visibility
 	for i, p := range pages {
 		wi.shmHashWrite(p.pgno, startFrame+uint32(i))
@@ -547,14 +557,18 @@ func (wi *walIndex) setBatch(pages []*page, startFrame uint32) {
 func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
 	wi.mu.RLock()
 	defer wi.mu.RUnlock()
+	// Skip frames that have been checkpointed back to the DB.
+	// This matches SQLite's minFrame filter (wal.c:3571) and prevents
+	// readers from seeing stale WAL frames after a checkpoint + truncate.
+	minFrame := wi.nBackfill.Load() + 1
 	frames := wi.pageMap[pgno]
 	if len(frames) == 0 {
 		return 0
 	}
 	// Frames are appended in order, so the list is sorted ascending.
-	// Search backwards for the highest frame <= maxFrame.
+	// Search backwards for the highest frame in [minFrame, maxFrame].
 	for i := len(frames) - 1; i >= 0; i-- {
-		if frames[i] <= maxFrame {
+		if frames[i] <= maxFrame && frames[i] >= minFrame {
 			return frames[i]
 		}
 	}
@@ -577,13 +591,13 @@ func (wi *walIndex) getLatest(pgno uint32) uint32 {
 // reset clears the WAL index (after a checkpoint + WAL truncate).
 func (wi *walIndex) reset() {
 	wi.mu.Lock()
-	defer wi.mu.Unlock()
 	clear(wi.pageMap)
-	wi.maxFrame = 0
-	wi.nBackfill = 0
-	wi.nBackfillAttempted = 0
+	wi.mu.Unlock()
+	wi.maxFrame.Store(0)
+	wi.nBackfill.Store(0)
+	wi.nBackfillAttempted.Store(0)
 	for i := range wi.aReadMark {
-		wi.aReadMark[i] = readMarkNotUsed
+		wi.aReadMark[i].Store(readMarkNotUsed)
 	}
 	wi.shmClearHash()
 	wi.shmWriteCkptInfo()
@@ -850,12 +864,12 @@ func (wi *walIndex) shmWriteCkptInfo() {
 	if err != nil {
 		return
 	}
-	binary.LittleEndian.PutUint32(region[htCkptOff:], wi.nBackfill)
+	binary.LittleEndian.PutUint32(region[htCkptOff:], wi.nBackfill.Load())
 	for i := range 5 {
-		binary.LittleEndian.PutUint32(region[htReadMarkOff+i*4:], wi.aReadMark[i])
+		binary.LittleEndian.PutUint32(region[htReadMarkOff+i*4:], wi.aReadMark[i].Load())
 	}
 	// Write nBackfillAttempted at offset 128 (issue 7.7)
-	binary.LittleEndian.PutUint32(region[htNBackfillAttemptedOff:], wi.nBackfillAttempted)
+	binary.LittleEndian.PutUint32(region[htNBackfillAttemptedOff:], wi.nBackfillAttempted.Load())
 }
 
 // shmReadCkptInfo reads checkpoint info (nBackfill, aReadMark, nBackfillAttempted)
@@ -865,12 +879,12 @@ func (wi *walIndex) shmReadCkptInfo() {
 	if err != nil {
 		return
 	}
-	wi.nBackfill = binary.LittleEndian.Uint32(region[htCkptOff:])
+	wi.nBackfill.Store(binary.LittleEndian.Uint32(region[htCkptOff:]))
 	for i := range 5 {
-		wi.aReadMark[i] = binary.LittleEndian.Uint32(region[htReadMarkOff+i*4:])
+		wi.aReadMark[i].Store(binary.LittleEndian.Uint32(region[htReadMarkOff+i*4:]))
 	}
 	// Read nBackfillAttempted at offset 128 (issue 7.7)
-	wi.nBackfillAttempted = binary.LittleEndian.Uint32(region[htNBackfillAttemptedOff:])
+	wi.nBackfillAttempted.Store(binary.LittleEndian.Uint32(region[htNBackfillAttemptedOff:]))
 }
 
 // wal manages the Write-Ahead Log.
@@ -1169,13 +1183,13 @@ func (w *wal) recover() error {
 		w.nFrame.Store(lastCommitFrame)
 		w.cksum1 = lastCommitCksum1
 		w.cksum2 = lastCommitCksum2
-		w.index.maxFrame = lastCommitFrame
-		w.index.maxPage = lastCommitDbSize
+		w.index.maxFrame.Store(lastCommitFrame)
+		w.index.maxPage.Store(lastCommitDbSize)
 
 		// Set nBackfillAttempted to mxFrame during recovery (issue 7.7).
 		// This matches SQLite's walIndexRecover() which sets
 		// pInfo->nBackfillAttempted = pWal->hdr.mxFrame.
-		w.index.nBackfillAttempted = lastCommitFrame
+		w.index.nBackfillAttempted.Store(lastCommitFrame)
 		w.index.shmWriteCkptInfo()
 	} else {
 		// No committed frames -- set empty state, do NOT truncate WAL file.
@@ -1184,7 +1198,7 @@ func (w *wal) recover() error {
 	}
 
 	// Update shm header with recovered state
-	return w.index.writeHeader(w.index.maxFrame, w.index.maxPage, 0)
+	return w.index.writeHeader(w.index.maxFrame.Load(), w.index.maxPage.Load(), 0)
 }
 
 // writeFrames appends frames to the WAL. If commit is true, the last frame
@@ -1267,9 +1281,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 
 	if commit {
 		if dbSize > 0 {
-			w.index.mu.Lock()
-			w.index.maxPage = dbSize
-			w.index.mu.Unlock()
+			w.index.maxPage.Store(dbSize)
 		}
 		if !w.noCommitSync {
 			if err := fdatasync(w.file); err != nil {
@@ -1277,7 +1289,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 			}
 		}
 		if !w.inProcess {
-			return w.index.writeHeader(w.index.maxFrame, w.index.maxPage, w.index.nBackfill)
+			return w.index.writeHeader(w.index.maxFrame.Load(), w.index.maxPage.Load(), w.index.nBackfill.Load())
 		}
 	}
 
@@ -1336,9 +1348,7 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	w.index.setBatch(pages, startFrame)
 
 	if commit && dbSize > 0 {
-		w.index.mu.Lock()
-		w.index.maxPage = dbSize
-		w.index.mu.Unlock()
+		w.index.maxPage.Store(dbSize)
 	}
 
 	return nil
@@ -1382,19 +1392,45 @@ func (w *wal) readFrame(frame uint32, buf []byte) error {
 //   - Slots 1-4: used for readers that need WAL frames. Best slot is the one
 //     with the largest readmark <= current maxFrame.
 func (w *wal) beginRead() (maxFrame uint32, slot int, err error) {
-	w.index.mu.RLock()
-	mxFrame := w.index.maxFrame
-	nBackfill := w.index.nBackfill
-	w.index.mu.RUnlock()
+	// Retry loop matching SQLite's WAL_RETRY protocol (wal.c:3239-3245).
+	// If a checkpoint resets the WAL between our metadata read and lock
+	// acquisition, tryBeginRead returns errWALRetry and we try again.
+	// The minFrame filter in walIndex.get() provides defense-in-depth for
+	// concurrent checkpoint advances, but cannot detect a full WAL reset
+	// where frame numbers restart from 1 (nBackfill drops to 0, new-epoch
+	// frames would pass the filter with stale maxFrame). The retry detects
+	// this by comparing maxFrame/nBackfill before and after lock acquisition.
+	const retryLimit = 100
+	for i := 0; i < retryLimit; i++ {
+		maxFrame, slot, err = w.tryBeginRead()
+		if !errors.Is(err, errWALRetry) {
+			return maxFrame, slot, err
+		}
+		if i >= 5 {
+			runtime.Gosched()
+		}
+	}
+	return 0, 0, ErrProtocol
+}
+
+// tryBeginRead attempts to acquire a reader slot and returns the current
+// max frame number. Returns errWALRetry if the WAL state changed between
+// reading metadata and acquiring the lock, signaling the caller to retry.
+func (w *wal) tryBeginRead() (maxFrame uint32, slot int, err error) {
+	mxFrame := w.index.maxFrame.Load()
+	nBackfill := w.index.nBackfill.Load()
 
 	if mxFrame == 0 || nBackfill == mxFrame {
 		// All frames are checkpointed. Use slot 0 (read from DB, skip WAL).
 		if err := w.index.lock(lockRead0, lockShared); err != nil {
 			return 0, 0, err
 		}
-		w.index.mu.Lock()
-		w.index.aReadMark[0] = mxFrame
-		w.index.mu.Unlock()
+		// Re-validate: detect WAL reset between metadata read and lock.
+		if w.index.maxFrame.Load() != mxFrame || w.index.nBackfill.Load() != nBackfill {
+			_ = w.index.unlock(lockRead0, lockShared)
+			return 0, 0, errWALRetry
+		}
+		w.index.aReadMark[0].Store(mxFrame)
 		return mxFrame, 0, nil
 	}
 
@@ -1404,20 +1440,23 @@ func (w *wal) beginRead() (maxFrame uint32, slot int, err error) {
 	bestSlot := -1
 	bestMark := uint32(0)
 
-	w.index.mu.RLock()
 	for i := 1; i <= 4; i++ {
-		mark := w.index.aReadMark[i]
+		mark := w.index.aReadMark[i].Load()
 		if mark != readMarkNotUsed && mark <= mxFrame && mark > bestMark {
 			bestSlot = i
 			bestMark = mark
 		}
 	}
-	w.index.mu.RUnlock()
 
 	if bestSlot != -1 {
 		// Try to acquire the best slot
 		lockSlot := lockRead0 + bestSlot
 		if err := w.index.lock(lockSlot, lockShared); err == nil {
+			// Re-validate: detect WAL reset between metadata read and lock.
+			if w.index.maxFrame.Load() != mxFrame || w.index.nBackfill.Load() != nBackfill {
+				_ = w.index.unlock(lockSlot, lockShared)
+				return 0, 0, errWALRetry
+			}
 			return mxFrame, bestSlot, nil
 		}
 		// If lock fails, fall through to find an unused slot
@@ -1427,9 +1466,12 @@ func (w *wal) beginRead() (maxFrame uint32, slot int, err error) {
 	for i := 1; i <= 4; i++ {
 		lockSlot := lockRead0 + i
 		if err := w.index.lock(lockSlot, lockShared); err == nil {
-			w.index.mu.Lock()
-			w.index.aReadMark[i] = mxFrame
-			w.index.mu.Unlock()
+			// Re-validate: detect WAL reset between metadata read and lock.
+			if w.index.maxFrame.Load() != mxFrame || w.index.nBackfill.Load() != nBackfill {
+				_ = w.index.unlock(lockSlot, lockShared)
+				return 0, 0, errWALRetry
+			}
+			w.index.aReadMark[i].Store(mxFrame)
 			return mxFrame, i, nil
 		}
 	}
@@ -1438,9 +1480,12 @@ func (w *wal) beginRead() (maxFrame uint32, slot int, err error) {
 	if err := w.index.lock(lockRead0, lockShared); err != nil {
 		return 0, 0, err
 	}
-	w.index.mu.Lock()
-	w.index.aReadMark[0] = mxFrame
-	w.index.mu.Unlock()
+	// Re-validate: detect WAL reset between metadata read and lock.
+	if w.index.maxFrame.Load() != mxFrame || w.index.nBackfill.Load() != nBackfill {
+		_ = w.index.unlock(lockRead0, lockShared)
+		return 0, 0, errWALRetry
+	}
+	w.index.aReadMark[0].Store(mxFrame)
 	return mxFrame, 0, nil
 }
 
@@ -1479,9 +1524,7 @@ func (w *wal) checkpointPassive(dbFile *os.File, cache *pcache) error {
 	}
 	// Check if all frames were backfilled. A partial checkpoint means
 	// some frames remain only in the WAL and must not be discarded.
-	w.index.mu.RLock()
-	complete := w.index.nBackfill >= w.index.maxFrame
-	w.index.mu.RUnlock()
+	complete := w.index.nBackfill.Load() >= w.index.maxFrame.Load()
 	if !complete {
 		return ErrBusy
 	}
@@ -1556,9 +1599,7 @@ func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode Checkpoint
 	mxSafeFrame := nf
 
 	for i := 1; i < 5; i++ {
-		w.index.mu.RLock()
-		mark := w.index.aReadMark[i]
-		w.index.mu.RUnlock()
+		mark := w.index.aReadMark[i].Load()
 
 		if mark == readMarkNotUsed || mark >= mxSafeFrame {
 			continue
@@ -1572,13 +1613,11 @@ func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode Checkpoint
 			// Got the lock -- no reader on this slot anymore.
 			// Reset the readmark: slot 1 gets mxSafeFrame, others get NOT_USED.
 			// This matches SQLite: "iMark = (i==1 ? mxSafeFrame : READMARK_NOT_USED)"
-			w.index.mu.Lock()
 			if i == 1 {
-				w.index.aReadMark[i] = mxSafeFrame
+				w.index.aReadMark[i].Store(mxSafeFrame)
 			} else {
-				w.index.aReadMark[i] = readMarkNotUsed
+				w.index.aReadMark[i].Store(readMarkNotUsed)
 			}
-			w.index.mu.Unlock()
 			_ = w.index.unlock(lockSlot, lockExclusive)
 		} else if rc == ErrBusy {
 			// Reader still active -- lower mxSafeFrame to this reader's mark.
@@ -1593,9 +1632,7 @@ func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode Checkpoint
 	}
 
 	// nBackfill is the number of frames already copied to DB
-	w.index.mu.RLock()
-	nBackfill := w.index.nBackfill
-	w.index.mu.RUnlock()
+	nBackfill := w.index.nBackfill.Load()
 
 	if mxSafeFrame <= nBackfill {
 		// Nothing new to checkpoint.
@@ -1620,10 +1657,8 @@ func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode Checkpoint
 	// This provides a crash-safety hint: if we crash during backfill,
 	// recovery knows that frames up to nBackfillAttempted may have been
 	// partially written to the database.
-	w.index.mu.Lock()
-	w.index.nBackfillAttempted = mxSafeFrame
+	w.index.nBackfillAttempted.Store(mxSafeFrame)
 	w.index.shmWriteCkptInfo()
-	w.index.mu.Unlock()
 
 	// Sync the WAL file before copying frames to the database, matching
 	// SQLite's walCheckpoint() (CKPT_SYNC_FLAGS). This ensures all WAL data
@@ -1706,10 +1741,8 @@ func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode Checkpoint
 	}
 
 	// Update nBackfill
-	w.index.mu.Lock()
-	w.index.nBackfill = mxSafeFrame
+	w.index.nBackfill.Store(mxSafeFrame)
 	w.index.shmWriteCkptInfo()
-	w.index.mu.Unlock()
 
 	// Release the reader lock held while backfilling
 	_ = w.index.unlock(lockRead0, lockExclusive)
@@ -1720,9 +1753,7 @@ func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode Checkpoint
 // checkpointPost handles post-backfill logic: WAL reset for modes that
 // completed a full checkpoint.
 func (w *wal) checkpointPost(mode CheckpointMode, xBusy BusyHandler) error {
-	w.index.mu.RLock()
-	backfill := w.index.nBackfill
-	w.index.mu.RUnlock()
+	backfill := w.index.nBackfill.Load()
 
 	if backfill < w.nFrame.Load() {
 		// Not everything was checkpointed. Can't reset the WAL.
@@ -1780,15 +1811,24 @@ func (w *wal) tryResetWALWithBusy(xBusy BusyHandler, truncate bool) error {
 // If truncate is true, the WAL file is truncated to zero bytes (CheckpointTruncate).
 // If false, the WAL is just restarted with a new header (CheckpointRestart).
 func (w *wal) doResetWAL(truncate bool) error {
+	if debugTrace {
+		trace("doResetWAL: truncate=%v nFrame=%d maxFrame=%d nBackfill=%d",
+			truncate, w.nFrame.Load(), w.index.maxFrame.Load(), w.index.nBackfill.Load())
+	}
+	// Reset metadata BEFORE truncating the file. This ensures concurrent
+	// readers see nFrame=0 / empty pageMap before the file shrinks,
+	// preventing TOCTOU races where readFrame passes the nFrame check
+	// but gets EOF from the truncated file. Matches SQLite's ordering:
+	// walRestartHdr (reset header) → sqlite3OsTruncate (wal.c:2363-2364).
+	w.index.reset()
+	w.nFrame.Store(0)
+
 	if truncate && w.file != nil {
 		// CheckpointTruncate: truncate WAL file to zero bytes
 		if err := w.file.Truncate(0); err != nil {
 			return err
 		}
 	}
-
-	w.index.reset()
-	w.nFrame.Store(0)
 
 	// Reset memFrames and arena for reuse
 	if w.inMemory {

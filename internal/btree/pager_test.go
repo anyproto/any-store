@@ -1517,21 +1517,27 @@ func TestShmCkptInfo_RoundTrip(t *testing.T) {
 	_, err = idx.shm.region(0, true)
 	require.NoError(t, err)
 
-	idx.nBackfill = 42
-	idx.nBackfillAttempted = 100
-	idx.aReadMark = [5]uint32{0, 10, 20, readMarkNotUsed, readMarkNotUsed}
+	idx.nBackfill.Store(42)
+	idx.nBackfillAttempted.Store(100)
+	idx.aReadMark[0].Store(0)
+	idx.aReadMark[1].Store(10)
+	idx.aReadMark[2].Store(20)
+	idx.aReadMark[3].Store(readMarkNotUsed)
+	idx.aReadMark[4].Store(readMarkNotUsed)
 	idx.shmWriteCkptInfo()
 
 	// Clear and read back
-	idx.nBackfill = 0
-	idx.nBackfillAttempted = 0
-	idx.aReadMark = [5]uint32{}
+	idx.nBackfill.Store(0)
+	idx.nBackfillAttempted.Store(0)
+	for i := range idx.aReadMark {
+		idx.aReadMark[i].Store(0)
+	}
 	idx.shmReadCkptInfo()
 
-	assert.Equal(t, uint32(42), idx.nBackfill)
-	assert.Equal(t, uint32(100), idx.nBackfillAttempted)
-	assert.Equal(t, uint32(10), idx.aReadMark[1])
-	assert.Equal(t, uint32(20), idx.aReadMark[2])
+	assert.Equal(t, uint32(42), idx.nBackfill.Load())
+	assert.Equal(t, uint32(100), idx.nBackfillAttempted.Load())
+	assert.Equal(t, uint32(10), idx.aReadMark[1].Load())
+	assert.Equal(t, uint32(20), idx.aReadMark[2].Load())
 }
 
 func TestShmReadCkptInfo_NoRegion(t *testing.T) {
@@ -1777,9 +1783,7 @@ func TestWALBeginRead_BestSlotLockFails(t *testing.T) {
 	w.endWrite()
 
 	// Set a readmark on slot 1 so it's the "best" slot
-	w.index.mu.Lock()
-	w.index.aReadMark[1] = 1
-	w.index.mu.Unlock()
+	w.index.aReadMark[1].Store(1)
 
 	// Lock slot 1 exclusively so the "best slot" lock fails
 	require.NoError(t, w.index.lock(lockRead0+1, lockExclusive))
@@ -1986,9 +1990,7 @@ func TestCheckpointPost_IncompleteBackfill(t *testing.T) {
 	w.endWrite()
 
 	// Set nBackfill < nFrame -> checkpointPost should return nil (can't reset)
-	w.index.mu.Lock()
-	w.index.nBackfill = 0
-	w.index.mu.Unlock()
+	w.index.nBackfill.Store(0)
 
 	err := w.checkpointPost(CheckpointRestart, nil)
 	require.NoError(t, err)
@@ -3018,9 +3020,7 @@ func TestCheckpointWithMode_ReaderLockLoopBusyThenOK(t *testing.T) {
 	p.endRead(slot)
 
 	// Set a low readmark on slot 2 to trigger the reader-lock loop
-	p.wal.index.mu.Lock()
-	p.wal.index.aReadMark[2] = 0 // very low mark
-	p.wal.index.mu.Unlock()
+	p.wal.index.aReadMark[2].Store(0) // very low mark
 
 	// Checkpoint should successfully clear the unused slot 2 readmark
 	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointPassive, nil)
@@ -4742,7 +4742,7 @@ func TestWALRecover_UncommittedTrailingFrames(t *testing.T) {
 	require.NoError(t, w2.open())
 
 	assert.Equal(t, uint32(1), w2.nFrame.Load())
-	assert.Equal(t, uint32(1), w2.index.maxFrame)
+	assert.Equal(t, uint32(1), w2.index.maxFrame.Load())
 
 	w2.close()
 }
@@ -4849,9 +4849,7 @@ func TestBeginRead_BestSlotLockFails(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 2))
 
 	// Set readmark on slot 1 to a valid value
-	w.index.mu.Lock()
-	w.index.aReadMark[1] = 1
-	w.index.mu.Unlock()
+	w.index.aReadMark[1].Store(1)
 
 	// Hold exclusive lock on slot 1 (so the "best slot" path fails)
 	require.NoError(t, w.index.lock(lockRead0+1, lockExclusive))
@@ -5391,11 +5389,9 @@ func TestWalBeginRead_AllSlotsBusy_FallbackSlot0(t *testing.T) {
 
 	// Set maxFrame > 0 and nBackfill < maxFrame so we don't take the
 	// early-return path at beginRead:1390.
-	w.index.mu.Lock()
-	w.index.maxFrame = 10
-	w.index.nBackfill = 0
+	w.index.maxFrame.Store(10)
+	w.index.nBackfill.Store(0)
 	// Leave all aReadMark as readMarkNotUsed (default), so bestSlot == -1.
-	w.index.mu.Unlock()
 
 	// Lock reader slots 1-4 exclusively so the loop at 1427 fails for all.
 	for i := 1; i <= 4; i++ {
@@ -5424,10 +5420,8 @@ func TestWalBeginRead_AllSlotsBusy_Slot0AlsoLocked(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	w.index.mu.Lock()
-	w.index.maxFrame = 10
-	w.index.nBackfill = 0
-	w.index.mu.Unlock()
+	w.index.maxFrame.Store(10)
+	w.index.nBackfill.Store(0)
 
 	// Lock all reader slots exclusively (including slot 0).
 	for i := 0; i <= 4; i++ {
@@ -5452,12 +5446,10 @@ func TestWalBeginRead_BestSlotLockFails_FindUnused(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	w.index.mu.Lock()
-	w.index.maxFrame = 10
-	w.index.nBackfill = 0
+	w.index.maxFrame.Store(10)
+	w.index.nBackfill.Store(0)
 	// Set aReadMark[1] to a valid mark so bestSlot = 1.
-	w.index.aReadMark[1] = 5
-	w.index.mu.Unlock()
+	w.index.aReadMark[1].Store(5)
 
 	// Lock slot 1 exclusively so acquiring shared lock fails.
 	require.NoError(t, w.index.lock(lockRead0+1, lockExclusive))
@@ -5720,9 +5712,7 @@ func TestCheckpointWithMode_ReaderLockNonBusyError(t *testing.T) {
 	require.NoError(t, err)
 
 	// Set aReadMark[1] to a small value so the checkpoint tries to lock it.
-	p.wal.index.mu.Lock()
-	p.wal.index.aReadMark[1] = 1
-	p.wal.index.mu.Unlock()
+	p.wal.index.aReadMark[1].Store(1)
 
 	// Replace shm to make reader lock slot (lockRead0+1) fail with non-ErrBusy.
 	p.wal.index.shm = &errorLockShm{
@@ -5823,9 +5813,7 @@ func TestTryResetWAL_NonBusyReaderLockError(t *testing.T) {
 
 	// checkpointWithMode with RESTART mode calls tryResetWALWithBusy.
 	// First need nBackfill == maxFrame to reach the tryResetWAL path.
-	p.wal.index.mu.Lock()
-	p.wal.index.nBackfill = p.wal.index.maxFrame
-	p.wal.index.mu.Unlock()
+	p.wal.index.nBackfill.Store(p.wal.index.maxFrame.Load())
 
 	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointRestart, nil)
 	assert.ErrorIs(t, err, os.ErrPermission)
@@ -6107,7 +6095,7 @@ func TestWalRecover_WithCommittedFrames(t *testing.T) {
 	require.NoError(t, err)
 	// Only the committed frame (frame 1) should be indexed.
 	assert.Equal(t, uint32(1), w.nFrame.Load())
-	assert.Equal(t, uint32(3), w.index.maxPage)
+	assert.Equal(t, uint32(3), w.index.maxPage.Load())
 	w.close()
 }
 

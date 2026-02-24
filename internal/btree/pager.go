@@ -173,8 +173,8 @@ func (p *pager) open() error {
 	// The DB file header may be stale (e.g. freelist pointers) if a crash
 	// occurred before checkpoint. Without this, commit() would serialize
 	// stale p.header fields back into page 1, corrupting the freelist.
-	if p.wal.index.maxFrame > 0 {
-		frame := p.wal.index.get(1, p.wal.index.maxFrame)
+	if p.wal.index.maxFrame.Load() > 0 {
+		frame := p.wal.index.get(1, p.wal.index.maxFrame.Load())
 		if frame > 0 {
 			walBuf := make([]byte, p.pageSize)
 			if err := p.wal.readFrame(frame, walBuf); err == nil {
@@ -184,8 +184,8 @@ func (p *pager) open() error {
 		// Use max of DB file's DatabaseSize and WAL's maxPage.
 		// After checkpoint + WAL reset, the DB file may have a larger
 		// DatabaseSize than what survives in the WAL after recovery.
-		if p.wal.index.maxPage > p.dbSize.Load() {
-			p.dbSize.Store(p.wal.index.maxPage)
+		if p.wal.index.maxPage.Load() > p.dbSize.Load() {
+			p.dbSize.Store(p.wal.index.maxPage.Load())
 		}
 	}
 
@@ -366,17 +366,19 @@ func (p *pager) getPageAt(pgno, walMaxFrame uint32) (*page, error) {
 	if walMaxFrame > 0 {
 		frame := p.wal.index.get(pgno, walMaxFrame)
 		if frame > 0 {
-			if err := p.wal.readFrame(frame, pg.data); err != nil {
-				p.cache.release(pg)
-				return nil, err
+			if err := p.wal.readFrame(frame, pg.data); err == nil {
+				// Parse page header
+				off := 0
+				if pgno == 1 {
+					off = dbHeaderSize
+				}
+				pg.header.deserialize(pg.data[off:])
+				return pg, nil
 			}
-			// Parse page header
-			off := 0
-			if pgno == 1 {
-				off = dbHeaderSize
-			}
-			pg.header.deserialize(pg.data[off:])
-			return pg, nil
+			// readFrame can fail if the WAL was reset (checkpointed and
+			// truncated) between the index.get lookup and now. In this case,
+			// the page data has been written to the database file by the
+			// checkpoint, so we fall through to reading from disk.
 		}
 	}
 
@@ -926,11 +928,9 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 	// the in-process walIndex.maxFrame directly.
 	effectiveMaxFrame := walMaxFrame
 	if p.inProcess {
-		p.wal.index.mu.RLock()
-		if p.wal.index.maxFrame > effectiveMaxFrame {
-			effectiveMaxFrame = p.wal.index.maxFrame
+		if mf := p.wal.index.maxFrame.Load(); mf > effectiveMaxFrame {
+			effectiveMaxFrame = mf
 		}
-		p.wal.index.mu.RUnlock()
 	} else if hdr, valid := p.wal.index.readHeader(); valid && hdr.mxFrame > effectiveMaxFrame {
 		effectiveMaxFrame = hdr.mxFrame
 	}
@@ -1021,7 +1021,22 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	// These are freed leaf pages whose content is irrelevant.
 	if len(p.dontWritePages) > 0 {
 		if debugTrace {
-			trace("commit: filtering %d dontWrite pages from %d dirty pages", len(p.dontWritePages), len(p.dirtyBuf))
+			trace("commit: filtering %d dontWrite pages from %d dirty pages savepoints=%d",
+				len(p.dontWritePages), len(p.dirtyBuf), len(p.savepoints))
+			// Bug 13 diagnostic: check if any dontWrite page has non-zero content
+			for pgno := range p.dontWritePages {
+				if pg := p.writePages[pgno]; pg != nil {
+					allZero := true
+					for _, b := range pg.data {
+						if b != 0 {
+							allZero = false
+							break
+						}
+					}
+					trace("BUG13-DIAG commit: dontWrite pg=%d allZero=%v dirty=%v",
+						pgno, allZero, pg.dirty)
+				}
+			}
 		}
 		n := 0
 		for _, pg := range p.dirtyBuf {
@@ -1275,6 +1290,18 @@ func (p *pager) rollbackToSavepoint(id int) error {
 	// This matches SQLite's behavior (pager.c:7025): ROLLBACK TO keeps the
 	// savepoint active so it can be released or rolled back again later.
 	p.savepoints = p.savepoints[:id+1]
+
+	if debugTrace {
+		// Bug 13 diagnostic: log residual dontWritePages/hasContent after rollback
+		if len(p.dontWritePages) > 0 || len(p.hasContent) > 0 {
+			trace("BUG13-DIAG rollbackToSavepoint: RESIDUAL dontWritePages=%d hasContent=%d after rollback id=%d",
+				len(p.dontWritePages), len(p.hasContent), id)
+			for pg := range p.dontWritePages {
+				trace("BUG13-DIAG   residual dontWrite pg=%d inWritePages=%v", pg, p.writePages[pg] != nil)
+			}
+		}
+	}
+
 	return nil
 }
 

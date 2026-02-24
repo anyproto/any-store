@@ -114,20 +114,26 @@ func TestShmCkptInfo(t *testing.T) {
 	defer wi.close()
 
 	// Set some values
-	wi.nBackfill = 42
-	wi.aReadMark = [5]uint32{0, 100, 200, readMarkNotUsed, readMarkNotUsed}
+	wi.nBackfill.Store(42)
+	wi.aReadMark[0].Store(0)
+	wi.aReadMark[1].Store(100)
+	wi.aReadMark[2].Store(200)
+	wi.aReadMark[3].Store(readMarkNotUsed)
+	wi.aReadMark[4].Store(readMarkNotUsed)
 	wi.shmWriteCkptInfo()
 
 	// Reset in-memory values
-	wi.nBackfill = 0
-	wi.aReadMark = [5]uint32{}
+	wi.nBackfill.Store(0)
+	for i := range wi.aReadMark {
+		wi.aReadMark[i].Store(0)
+	}
 
 	// Read back from shm
 	wi.shmReadCkptInfo()
-	assert.Equal(t, uint32(42), wi.nBackfill)
-	assert.Equal(t, uint32(100), wi.aReadMark[1])
-	assert.Equal(t, uint32(200), wi.aReadMark[2])
-	assert.Equal(t, readMarkNotUsed, wi.aReadMark[3])
+	assert.Equal(t, uint32(42), wi.nBackfill.Load())
+	assert.Equal(t, uint32(100), wi.aReadMark[1].Load())
+	assert.Equal(t, uint32(200), wi.aReadMark[2].Load())
+	assert.Equal(t, readMarkNotUsed, wi.aReadMark[3].Load())
 }
 
 func TestShmHashIntegrationWithSetBatch(t *testing.T) {
@@ -147,9 +153,7 @@ func TestShmHashIntegrationWithSetBatch(t *testing.T) {
 
 	// Verify we can look up pages via the shm hash tables
 	wi := db.pager.wal.index
-	wi.mu.RLock()
-	maxFrame := wi.maxFrame
-	wi.mu.RUnlock()
+	maxFrame := wi.maxFrame.Load()
 
 	// The shm hash table returns the latest frame for a page (within maxFrame),
 	// which should match the last entry in the Go map's frame list.
@@ -185,9 +189,7 @@ func TestShmHashAfterCheckpoint(t *testing.T) {
 
 	// After checkpoint + WAL reset, hash tables should be cleared
 	wi := db.pager.wal.index
-	wi.mu.RLock()
-	maxFrame := wi.maxFrame
-	wi.mu.RUnlock()
+	maxFrame := wi.maxFrame.Load()
 
 	// If WAL was reset, maxFrame should be 0 and lookups return 0
 	if maxFrame == 0 {
