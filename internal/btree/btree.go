@@ -8,8 +8,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"log"
-	"os"
 	"sync/atomic"
 )
 
@@ -25,38 +23,6 @@ func SetDebugOverflowReadErrors(enabled bool) {
 		debugOverflowReadErrors.Store(1)
 	} else {
 		debugOverflowReadErrors.Store(0)
-	}
-}
-
-// debugTrace controls verbose tracing of overflow/savepoint operations.
-// Set BTREE_TRACE=1 to log to stderr, or BTREE_TRACE=/path/to/file to log to a file.
-var (
-	debugTrace    bool
-	debugTraceLog *log.Logger
-)
-
-func init() {
-	v := os.Getenv("BTREE_TRACE")
-	if v == "" {
-		return
-	}
-	debugTrace = true
-	if v == "1" || v == "stderr" {
-		debugTraceLog = log.New(os.Stderr, "[BTREE-TRACE] ", log.Lmicroseconds)
-	} else {
-		f, err := os.OpenFile(v, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if err != nil {
-			log.Printf("BTREE_TRACE: cannot open %s: %v, falling back to stderr", v, err)
-			debugTraceLog = log.New(os.Stderr, "[BTREE-TRACE] ", log.Lmicroseconds)
-		} else {
-			debugTraceLog = log.New(f, "[BTREE-TRACE] ", log.Lmicroseconds)
-		}
-	}
-}
-
-func trace(format string, args ...any) {
-	if debugTrace {
-		debugTraceLog.Printf(format, args...)
 	}
 }
 
@@ -1452,13 +1418,15 @@ func (bt *btree) collectLeafCells(pg *page) []cellData {
 			overflowSize := totalPayload - nLocal
 			overflowBuf := make([]byte, overflowSize)
 			if err := bt.pager.readOverflowChainAt(cells[i].overflowPg, overflowBuf, bt.walMaxFrame); err != nil {
-				trace("collectLeafCells: readOverflowChainAt FAILED pg=%d walMaxFrame=%d err=%v leafPage=%d cell=%d key=%q",
-					cells[i].overflowPg, bt.walMaxFrame, err, pg.pgno, i, cells[i].key)
+				if debugTrace {
+					trace("collectLeafCells: readOverflowChainAt FAILED pg=%d walMaxFrame=%d err=%v leafPage=%d cell=%d key=%q",
+						cells[i].overflowPg, bt.walMaxFrame, err, pg.pgno, i, cells[i].key)
+				}
 				if debugOverflowReadErrors.Load() != 0 {
 					panic(fmt.Sprintf("collectLeafCells: readOverflowChainAt(pg=%d, walMaxFrame=%d) failed: %v",
 						cells[i].overflowPg, bt.walMaxFrame, err))
 				}
-			} else {
+			} else if debugTrace {
 				trace("collectLeafCells: read overflow pg=%d size=%d leafPage=%d cell=%d", cells[i].overflowPg, overflowSize, pg.pgno, i)
 			}
 

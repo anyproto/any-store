@@ -670,16 +670,22 @@ func (p *pager) freePage(pgno uint32) error {
 			// With active savepoints, we MUST have a savepoint copy for rollback.
 			// If getWritablePage fails, propagate the error rather than silently
 			// creating a page without a savepoint copy (which would cause Bug 9).
-			trace("freePage: getWritablePage(%d) failed with savepoints active: %v", pgno, err)
+			if debugTrace {
+				trace("freePage: getWritablePage(%d) failed with savepoints active: %v", pgno, err)
+			}
 			return err
 		}
 		// No savepoints: safe to use cache.create (no rollback possible).
-		trace("freePage: getWritablePage(%d) failed: %v — using cache.create (no savepoints)", pgno, err)
+		if debugTrace {
+			trace("freePage: getWritablePage(%d) failed: %v — using cache.create (no savepoints)", pgno, err)
+		}
 		newTrunkPg = p.cache.create(pgno)
 		p.cache.makeDirty(newTrunkPg)
 		p.writePages[pgno] = newTrunkPg
 	} else {
-		trace("freePage: pg=%d becomes new trunk (old trunk=%d), savepoint copy saved via getWritablePage", pgno, trunkPgno)
+		if debugTrace {
+			trace("freePage: pg=%d becomes new trunk (old trunk=%d), savepoint copy saved via getWritablePage", pgno, trunkPgno)
+		}
 	}
 	clear(newTrunkPg.data)
 	binary.BigEndian.PutUint32(newTrunkPg.data[0:4], trunkPgno) // next trunk = old trunk
@@ -745,7 +751,9 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 		if p.getHasContent(leafPgno) {
 			// Page was freed in this transaction — fetch with content so
 			// savepoint journaling captures the pre-free data.
-			trace("allocateFromFreelist: leaf pg=%d hasContent=true → getWritablePage (savepoint copy)", leafPgno)
+			if debugTrace {
+				trace("allocateFromFreelist: leaf pg=%d hasContent=true → getWritablePage (savepoint copy)", leafPgno)
+			}
 			pg, err := p.getWritablePage(leafPgno)
 			if err != nil {
 				return nil, err
@@ -764,7 +772,9 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 		// the page with its new data while the freelist header is restored to
 		// reference it — causing corruption (Bug 9).
 		if len(p.savepoints) > 0 {
-			trace("allocateFromFreelist: leaf pg=%d hasContent=false but savepoints=%d → getWritablePage (savepoint safety)", leafPgno, len(p.savepoints))
+			if debugTrace {
+				trace("allocateFromFreelist: leaf pg=%d hasContent=false but savepoints=%d → getWritablePage (savepoint safety)", leafPgno, len(p.savepoints))
+			}
 			pg, err := p.getWritablePage(leafPgno)
 			if err != nil {
 				return nil, err
@@ -777,7 +787,9 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 
 		// No savepoints: use getPageNoContent since old freelist leaf content
 		// is irrelevant and doesn't need savepoint journaling (fix 5.4).
-		trace("allocateFromFreelist: leaf pg=%d hasContent=false, no savepoints → getPageNoContent", leafPgno)
+		if debugTrace {
+			trace("allocateFromFreelist: leaf pg=%d hasContent=false, no savepoints → getPageNoContent", leafPgno)
+		}
 		pg, err := p.getPageNoContent(leafPgno)
 		if err != nil {
 			return nil, err
@@ -861,10 +873,14 @@ func (p *pager) releasePage(pg *page) {
 // With savepoints, the page data may need to be preserved for rollback.
 func (p *pager) dontWrite(pgno uint32) {
 	if len(p.savepoints) > 0 {
-		trace("dontWrite: SKIPPED pg=%d (savepoints=%d active)", pgno, len(p.savepoints))
+		if debugTrace {
+			trace("dontWrite: SKIPPED pg=%d (savepoints=%d active)", pgno, len(p.savepoints))
+		}
 		return
 	}
-	trace("dontWrite: marking pg=%d (no savepoints)", pgno)
+	if debugTrace {
+		trace("dontWrite: marking pg=%d (no savepoints)", pgno)
+	}
 	if p.dontWritePages == nil {
 		p.dontWritePages = make(map[uint32]bool)
 	}
@@ -990,8 +1006,10 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 		return 0, 0, 0, ErrReadOnly
 	}
 
-	trace("commit: dbSize=%d savepoints=%d writePages=%d dontWritePages=%d hasContent=%d",
-		p.dbSize.Load(), len(p.savepoints), len(p.writePages), len(p.dontWritePages), len(p.hasContent))
+	if debugTrace {
+		trace("commit: dbSize=%d savepoints=%d writePages=%d dontWritePages=%d hasContent=%d",
+			p.dbSize.Load(), len(p.savepoints), len(p.writePages), len(p.dontWritePages), len(p.hasContent))
+	}
 
 	// Update the in-memory header with current database size.
 	p.header.DatabaseSize = p.dbSize.Load()
@@ -1002,11 +1020,15 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	// Filter out dontWrite pages before WAL write (fix 5.4).
 	// These are freed leaf pages whose content is irrelevant.
 	if len(p.dontWritePages) > 0 {
-		trace("commit: filtering %d dontWrite pages from %d dirty pages", len(p.dontWritePages), len(p.dirtyBuf))
+		if debugTrace {
+			trace("commit: filtering %d dontWrite pages from %d dirty pages", len(p.dontWritePages), len(p.dirtyBuf))
+		}
 		n := 0
 		for _, pg := range p.dirtyBuf {
 			if p.dontWritePages[pg.pgno] {
-				trace("commit: dontWrite filtering pg=%d (skipping WAL write)", pg.pgno)
+				if debugTrace {
+					trace("commit: dontWrite filtering pg=%d (skipping WAL write)", pg.pgno)
+				}
 				p.cache.makeClean(pg)
 			} else {
 				p.dirtyBuf[n] = pg
@@ -1170,8 +1192,10 @@ func (p *pager) savepoint() (int, error) {
 	id := len(p.savepoints)
 	dbSz := p.dbSize.Load()
 	walFr := p.wal.nFrame.Load()
-	trace("savepoint: creating id=%d dbSize=%d walFrame=%d writePages=%d dontWritePages=%d hasContent=%d",
-		id, dbSz, walFr, len(p.writePages), len(p.dontWritePages), len(p.hasContent))
+	if debugTrace {
+		trace("savepoint: creating id=%d dbSize=%d walFrame=%d writePages=%d dontWritePages=%d hasContent=%d",
+			id, dbSz, walFr, len(p.writePages), len(p.dontWritePages), len(p.hasContent))
+	}
 	p.savepoints = append(p.savepoints, savepointState{
 		id:       id,
 		dbSize:   dbSz,
@@ -1193,13 +1217,17 @@ func (p *pager) rollbackToSavepoint(id int) error {
 
 	sp := &p.savepoints[id]
 
-	trace("rollbackToSavepoint: id=%d spDbSize=%d currentDbSize=%d numSavepoints=%d writePages=%d",
-		id, sp.dbSize, p.dbSize.Load(), len(p.savepoints), len(p.writePages))
+	if debugTrace {
+		trace("rollbackToSavepoint: id=%d spDbSize=%d currentDbSize=%d numSavepoints=%d writePages=%d",
+			id, sp.dbSize, p.dbSize.Load(), len(p.savepoints), len(p.writePages))
+	}
 
 	// Discard pages allocated after the savepoint
 	for pgno := range p.writePages {
 		if pgno > sp.dbSize {
-			trace("rollbackToSavepoint: discard pg=%d (> spDbSize=%d)", pgno, sp.dbSize)
+			if debugTrace {
+				trace("rollbackToSavepoint: discard pg=%d (> spDbSize=%d)", pgno, sp.dbSize)
+			}
 			p.cache.discard(pgno)
 			delete(p.writePages, pgno)
 		}
@@ -1212,7 +1240,9 @@ func (p *pager) rollbackToSavepoint(id int) error {
 	// skips pages already restored — our reverse iteration achieves the same
 	// result by letting the oldest copy overwrite newer ones.
 	for i := len(p.savepoints) - 1; i >= id; i-- {
-		trace("rollbackToSavepoint: restoring sp[%d] pages (%d entries)", i, len(p.savepoints[i].pages))
+		if debugTrace {
+			trace("rollbackToSavepoint: restoring sp[%d] pages (%d entries)", i, len(p.savepoints[i].pages))
+		}
 		for pgno, data := range p.savepoints[i].pages {
 			if pg := p.cache.fetch(pgno); pg != nil {
 				copy(pg.data, data)
@@ -1258,7 +1288,9 @@ func (p *pager) releaseSavepoint(id int) error {
 		return ErrInvalidSavepoint
 	}
 
-	trace("releaseSavepoint: id=%d numSavepoints=%d", id, len(p.savepoints))
+	if debugTrace {
+		trace("releaseSavepoint: id=%d numSavepoints=%d", id, len(p.savepoints))
+	}
 	// Merge page copies down to parent savepoint
 	if id > 0 {
 		parent := &p.savepoints[id-1]
@@ -1328,7 +1360,9 @@ func (p *pager) writeOverflowChain(data []byte) (uint32, error) {
 	if prevPg != nil {
 		p.releasePage(prevPg)
 	}
-	trace("writeOverflowChain: firstPg=%d totalDataLen=%d", firstPgno, origDataLen)
+	if debugTrace {
+		trace("writeOverflowChain: firstPg=%d totalDataLen=%d", firstPgno, origDataLen)
+	}
 	return firstPgno, nil
 }
 
@@ -1400,7 +1434,9 @@ func (p *pager) readOverflowChainInternal(firstPgno uint32, buf []byte, walMaxFr
 
 // freeOverflowChain frees all pages in an overflow chain.
 func (p *pager) freeOverflowChain(firstPgno uint32) error {
-	trace("freeOverflowChain: start firstPg=%d", firstPgno)
+	if debugTrace {
+		trace("freeOverflowChain: start firstPg=%d", firstPgno)
+	}
 	pgno := firstPgno
 
 	// Max iteration counter to prevent infinite loops on circular chains (fix 8.2).
@@ -1454,10 +1490,14 @@ func (p *pager) close() error {
 			// in that case would destroy uncopied frames and corrupt the DB.
 			// Matches SQLite's sqlite3WalClose(): walLimitSize only called
 			// when rc==SQLITE_OK.
-			trace("close: starting passive checkpoint before WAL truncation, dbSize=%d", p.dbSize.Load())
+			if debugTrace {
+				trace("close: starting passive checkpoint before WAL truncation, dbSize=%d", p.dbSize.Load())
+			}
 			cpErr := p.wal.checkpointPassive(p.file, p.cache)
 			if cpErr != nil {
-				trace("close: checkpointPassive incomplete or failed: %v", cpErr)
+				if debugTrace {
+					trace("close: checkpointPassive incomplete or failed: %v", cpErr)
+				}
 			}
 			if cpErr == nil {
 				p.wal.truncateFile()
