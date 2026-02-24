@@ -12,10 +12,16 @@ import (
 
 // Options configures the database.
 type Options struct {
-	PageSize              uint32 // Page size in bytes (default: 4096)
-	CacheSize             int    // Maximum number of cached pages (default: 2000)
-	AutoCheckpointAfter   uint32 // WAL frames before auto-checkpoint (0 = use default 10000)
-	DisableAutoCheckpoint bool   // Disable auto-checkpoint entirely (manual Checkpoint() only)
+	PageSize  uint32 // Page size in bytes (default: 4096)
+	CacheSize int    // Maximum number of cached pages (default: 2000)
+
+	// DisableAutoCheckpoint disables auto-checkpoint entirely (manual Checkpoint() only).
+	DisableAutoCheckpoint bool
+
+	// AutoCheckpointAfter is the number of WAL frames after which an
+	// automatic passive checkpoint is triggered. 0 means use default (10000).
+	// Ignored when DisableAutoCheckpoint is true.
+	AutoCheckpointAfter int
 
 	// InProcess uses heap-backed shared memory for the WAL index instead of
 	// mmap'd files with POSIX fcntl locks. Faster, but restricts access to a
@@ -843,10 +849,9 @@ func (tx *WriteTx) Delete(ns *Namespace, key []byte) error {
 	return bt.Delete(key)
 }
 
-// AutoCheckpointThreshold is the number of WAL frames after which an
-// automatic passive checkpoint is triggered. Set to 0 to disable.
-// Default: 10000 frames.
-var AutoCheckpointThreshold uint32 = 10000
+// AutoCheckpointThreshold is the default number of WAL frames after which
+// an automatic passive checkpoint is triggered.
+var AutoCheckpointThreshold = 10000
 
 // Commit commits the transaction, writing all changes to the WAL.
 func (tx *WriteTx) Commit() error {
@@ -860,7 +865,7 @@ func (tx *WriteTx) Commit() error {
 		tx.db.localSchemaCookie.Store(newSC)
 	}
 	threshold := tx.db.opts.AutoCheckpointAfter
-	needCheckpoint := threshold > 0 && nFrame >= threshold
+	needCheckpoint := threshold > 0 && int(nFrame) >= threshold
 	tx.pager.endRead(tx.walSlot)
 
 	// Auto-checkpoint before releasing db.mu.RLock to avoid deadlock with Close().

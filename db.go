@@ -113,11 +113,13 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	ds.recoveryController, quickCheckNeeded = ds.createRecoveryController(ctx, path)
 
 	opts := btree.Options{
-		PageSize:     4096,
-		CacheSize:    5000,
-		InProcess:    false,
-		NoCommitSync: !config.CommitSync,
-		InMemory:     config.InMemory,
+		PageSize:              4096,
+		CacheSize:             5000,
+		InProcess:             false,
+		NoCommitSync:          !config.CommitSync,
+		InMemory:              config.InMemory,
+		DisableAutoCheckpoint: config.DisableAutoCheckpoint,
+		AutoCheckpointAfter:   config.AutoCheckpointAfter,
 	}
 
 	var err error

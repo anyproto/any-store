@@ -17,6 +17,14 @@ type Config struct {
 	// at the cost of losing the last committed transaction(s) on power loss.
 	CommitSync bool
 
+	// DisableAutoCheckpoint disables WAL auto-checkpoint entirely.
+	// When true, checkpoint must be triggered manually or via durability auto-flush.
+	DisableAutoCheckpoint bool
+
+	// AutoCheckpointAfter overrides the default WAL auto-checkpoint threshold (10000 frames).
+	// Only used when DisableAutoCheckpoint is false. 0 means use default.
+	AutoCheckpointAfter int
+
 	// InMemory keeps the entire database in memory with no files on disk.
 	// The database does not survive process crashes. When true, InProcess
 	// and CommitSync=false are forced on automatically.
