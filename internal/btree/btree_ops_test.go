@@ -299,7 +299,59 @@ func TestTryMergeLeafEmptyPath(t *testing.T) {
 }
 
 func TestTryMergeLeafNoFit(t *testing.T) {
-	t.Skip("BUG: tryMergeLeaf-overflow-double-ref — tryMergeLeaf with overflow pages causes 2nd reference integrity errors (see BUGS.md)")
+	// Regression test for tryMergeLeaf-overflow-double-ref bug (BUGS.md).
+	// With 512-byte pages and 100-byte values, cells require overflow pages.
+	// Calling tryMergeLeaf on two leaves whose combined content exceeds one
+	// page must return nil (no merge) WITHOUT freeing overflow chains.
+	db := tempDBWithPageSize(t, 512)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace("t1")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	// Insert 60 rows with 100-byte values to force overflow pages.
+	putN(t, db, "t1", 60, 100)
+
+	// Delete key 1 to leave a partially-empty leaf.
+	tx2, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := db.getNamespaceLocked("t1")
+	require.NoError(t, err)
+	key1 := binary.BigEndian.AppendUint32(nil, 1)
+	require.NoError(t, tx2.Delete(ns, key1))
+	require.NoError(t, tx2.Commit())
+
+	// Find the leaf containing key 2 and call tryMergeLeaf.
+	tx3, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err = db.getNamespaceLocked("t1")
+	require.NoError(t, err)
+	bt := &btree{pager: db.pager, rootPage: ns.rootPage, writable: true, walMaxFrame: tx3.walMaxFrame}
+
+	searchKey := binary.BigEndian.AppendUint32(nil, 2)
+	pg, err := bt.getPage(bt.rootPage)
+	require.NoError(t, err)
+	var pathBuf [8]uint32
+	path := pathBuf[:0]
+	for pg.header.isInterior() {
+		path = append(path, pg.pgno)
+		childPgno, _, _ := bt.searchInterior(pg, searchKey)
+		bt.pager.releasePage(pg)
+		pg, err = bt.getPage(childPgno)
+		require.NoError(t, err)
+	}
+	leafPgno := pg.pgno
+	bt.pager.releasePage(pg)
+
+	// tryMergeLeaf should return nil (doesn't fit) with no side effects.
+	err = bt.tryMergeLeaf(leafPgno, path)
+	assert.NoError(t, err)
+
+	require.NoError(t, tx3.Commit())
+	require.NoError(t, db.IntegrityCheck())
+	assert.Equal(t, 59, countKeys(t, db, "t1"))
 }
 
 func TestTryMergeLeafRightChild(t *testing.T) {

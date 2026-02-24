@@ -164,7 +164,36 @@ func TestMergeCursor_TryMergeLeafLeftDirectionSmallPage(t *testing.T) {
 // then deleting almost all of them, we trigger the root collapse with the special
 // page-1 DB header preservation logic.
 func TestMergeCursor_RootCollapseOnPage1(t *testing.T) {
-	t.Skip("BUG: page1-root-collapse-corruption -- deleting many namespaces from page-1 master btree causes tree corruption (namespace not found + invalid cell content offset); see BUGS.md")
+	// Regression test for page1-root-collapse-corruption (BUGS.md).
+	// Creates enough namespaces on a small-page DB to make page 1 interior,
+	// then deletes most of them to trigger root collapse on page 1.
+	db := tempDBWithPageSize(t, 512)
+
+	const total = 25
+	{
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		for i := 0; i < total; i++ {
+			name := fmt.Sprintf("rc-%04d", i)
+			_, err = tx.CreateNamespace(name)
+			require.NoError(t, err)
+		}
+		require.NoError(t, tx.Commit())
+	}
+
+	// Delete namespaces one at a time.
+	for i := 0; i < total-2; i++ {
+		name := fmt.Sprintf("rc-%04d", i)
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		require.NoError(t, tx.DeleteNamespace(name))
+		require.NoError(t, tx.Commit())
+	}
+
+	require.NoError(t, db.IntegrityCheck())
+	names, err := db.ListNamespaces()
+	require.NoError(t, err)
+	assert.Len(t, names, 2)
 }
 
 // TestMergeCursor_RootCollapseViaDirectBtree exercises the root collapse path
@@ -208,20 +237,13 @@ func TestMergeCursor_RootCollapseViaDirectBtree(t *testing.T) {
 
 	// Delete namespaces one at a time in separate write transactions.
 	// This avoids the bulk delete sensitivity bug by committing after each delete.
-	deleteCount := 0
 	for i := 0; i < total-2; i++ {
 		name := fmt.Sprintf("ns-%04d", i)
 		tx, err := db.BeginWrite()
 		require.NoError(t, err)
 		err = tx.DeleteNamespace(name)
-		if err != nil {
-			// The master btree page-1 restructuring causes namespace lookup
-			// failures in some cases. Skip with a bug marker.
-			require.NoError(t, tx.Rollback())
-			t.Skipf("BUG: page1-delete-namespace -- DeleteNamespace(%s) failed at deletion #%d: %v (see BUGS.md)", name, deleteCount, err)
-		}
+		require.NoError(t, err)
 		require.NoError(t, tx.Commit())
-		deleteCount++
 	}
 
 	require.NoError(t, db.IntegrityCheck())
@@ -234,14 +256,70 @@ func TestMergeCursor_RootCollapseViaDirectBtree(t *testing.T) {
 // page free path (L2354-2360). This requires a 3-level tree where deleting enough
 // entries causes an interior page (that is NOT the root) to become empty.
 func TestMergeCursor_NonRootEmptyInteriorFree(t *testing.T) {
-	t.Skip("BUG: bulk-delete-orphan-pages -- heavy deletion from 3-level tree leaves orphaned pages not returned to freelist (see BUGS.md)")
+	// Regression test for bulk-delete-orphan-pages (BUGS.md).
+	// Creates a 3-level tree with 512-byte pages, then deletes most entries
+	// to trigger non-root empty interior page handling.
+	db := tempDBWithPageSize(t, 512)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace("t1")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	// Insert 600 entries to create a 3-level tree.
+	putN(t, db, "t1", 600, 10)
+
+	// Delete 590 entries in batches to trigger interior page collapse.
+	for batch := 0; batch < 59; batch++ {
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns, err := db.getNamespaceLocked("t1")
+		require.NoError(t, err)
+		for i := batch*10 + 1; i <= batch*10+10; i++ {
+			key := binary.BigEndian.AppendUint32(nil, uint32(i))
+			_ = tx.Delete(ns, key) // ignore key-not-found on already-deleted
+		}
+		require.NoError(t, tx.Commit())
+	}
+
+	require.NoError(t, db.IntegrityCheck())
+	assert.Equal(t, 10, countKeys(t, db, "t1"))
 }
 
 // TestMergeCursor_DeleteAllFromThreeLevelTree deletes every entry from a 3-level
 // tree. This should trigger the full cascade: leaf free -> removeChildFromParent
 // -> interior empty -> recursive removeChildFromParent -> root collapse.
 func TestMergeCursor_DeleteAllFromThreeLevelTree(t *testing.T) {
-	t.Skip("BUG: bulk-delete-orphan-pages -- heavy deletion from 3-level tree leaves orphaned pages not returned to freelist (see BUGS.md)")
+	// Regression test for bulk-delete-orphan-pages (BUGS.md).
+	// Deletes every entry from a 3-level tree. This triggers the full cascade:
+	// leaf free -> removeChildFromParent -> interior empty -> collapse -> root collapse.
+	db := tempDBWithPageSize(t, 512)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace("t1")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	const total = 600
+	putN(t, db, "t1", total, 10)
+
+	// Delete all entries in batches of 10.
+	for batch := 0; batch < total/10; batch++ {
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns, err := db.getNamespaceLocked("t1")
+		require.NoError(t, err)
+		for i := batch*10 + 1; i <= batch*10+10; i++ {
+			key := binary.BigEndian.AppendUint32(nil, uint32(i))
+			_ = tx.Delete(ns, key)
+		}
+		require.NoError(t, tx.Commit())
+	}
+
+	require.NoError(t, db.IntegrityCheck())
+	assert.Equal(t, 0, countKeys(t, db, "t1"))
 }
 
 // =============================================================================

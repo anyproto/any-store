@@ -469,11 +469,7 @@ func TestDelCurCov_NonRootEmptyInterior(t *testing.T) {
 		_ = tx2.Delete(ns2, key)
 		require.NoError(t, tx2.Commit())
 	}
-	// IntegrityCheck may fail due to known orphaned-page bug in 3-level trees.
-	err = db.IntegrityCheck()
-	if err != nil {
-		t.Skipf("BUG: bulk-delete-orphan-pages -- IntegrityCheck failed: %v", err)
-	}
+	require.NoError(t, db.IntegrityCheck())
 	require.Equal(t, 0, countKeys(t, db, "t1"))
 }
 

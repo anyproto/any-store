@@ -314,6 +314,19 @@ func leafCellSizeWithOverflow(key, value []byte, usableSize int) int {
 	return hdr + totalPayload
 }
 
+// leafCellSizeFromLengths returns the in-page size of a leaf cell from key/value lengths.
+// Same as leafCellSizeWithOverflow but takes int lengths instead of byte slices.
+func leafCellSizeFromLengths(keyLen, valLen, usableSize int) int {
+	totalPayload := keyLen + valLen
+	hdr := varintSize(uint64(keyLen)) + varintSize(uint64(valLen))
+	maxLocal := maxLocalPayload(usableSize)
+	if totalPayload > maxLocal {
+		nLocal := localPayloadSize(totalPayload, usableSize)
+		return hdr + nLocal + overflowPtrSize
+	}
+	return hdr + totalPayload
+}
+
 // interiorCellSize returns the serialized size of an interior cell (no overflow).
 func interiorCellSize(key []byte) int {
 	return 4 + varintSize(uint64(len(key))) + len(key)
@@ -2195,6 +2208,29 @@ func (bt *btree) tryMergeLeaf(leafPgno uint32, path []uint32) error {
 		return err
 	}
 
+	// Check if merged content fits BEFORE calling collectLeafCells.
+	// collectLeafCells frees overflow chains as a side effect; if the merge
+	// won't proceed, freeing overflow chains corrupts the pages (the cells
+	// still reference the now-freed overflow pages). Compute size from raw
+	// page data using only the varint key/value lengths.
+	usableSize := bt.usablePageSize()
+	totalSize := 8 // leaf header
+	for _, pg := range []*page{leafPg, sibPg} {
+		n := int(pg.header.cellCount)
+		for i := range n {
+			off := int(pg.getCellOffset(i))
+			keyLen, kn := getVarint(pg.data[off:])
+			valLen, _ := getVarint(pg.data[off+kn:])
+			totalSize += leafCellSizeFromLengths(int(keyLen), int(valLen), usableSize) + 2
+		}
+	}
+	if totalSize > usableSize {
+		bt.pager.releasePage(leafPg)
+		bt.pager.releasePage(sibPg)
+		return nil // doesn't fit — no side effects
+	}
+
+	// Merge will proceed. Collect cells (reads overflow data, frees old chains).
 	leafCells := bt.collectLeafCells(leafPg)
 	sibCells := bt.collectLeafCells(sibPg)
 	bt.pager.releasePage(leafPg)
@@ -2207,16 +2243,6 @@ func (bt *btree) tryMergeLeaf(leafPgno uint32, path []uint32) error {
 	} else {
 		allCells = append(allCells, sibCells...)
 		allCells = append(allCells, leafCells...)
-	}
-
-	// Check if merged content fits in one page
-	usableSize := bt.usablePageSize()
-	totalSize := 8 // leaf header
-	for _, c := range allCells {
-		totalSize += leafCellSizeWithOverflow(c.key, c.value, usableSize) + 2
-	}
-	if totalSize > usableSize {
-		return nil // doesn't fit
 	}
 
 	// Merge: keep the left page, free the right page
@@ -2252,7 +2278,6 @@ func (bt *btree) removeChildFromParent(childPgno uint32, path []uint32) error {
 	}
 
 	parentPgno := path[len(path)-1]
-	parentPath := path[:len(path)-1]
 
 	parentPg, err := bt.pager.getWritablePage(parentPgno)
 	if err != nil {
@@ -2291,15 +2316,32 @@ func (bt *btree) removeChildFromParent(childPgno uint32, path []uint32) error {
 	// If parent is now empty interior page (0 cells) and not root,
 	// collapse: make the rightChild the replacement and free this page.
 	if len(cells) == 0 && parentPg.pgno == bt.rootPage {
-		// Root with 0 cells: collapse tree height by copying rightChild to root
+		// Root with 0 cells: collapse tree height by copying rightChild to root.
+		// Matches SQLite's copyNodeContent() (btree.c:8148).
 		childPg, err := bt.getPage(rightChild)
 		if err != nil {
 			bt.pager.releasePage(parentPg)
 			return err
 		}
 		if parentPg.pgno == 1 {
-			// Preserve DB header on page 1
-			copy(parentPg.data[dbHeaderSize:], childPg.data[0:])
+			// Page 1 has a 100-byte DB header. Cell content uses absolute offsets,
+			// so content must stay at the same position. Only the page header and
+			// cell pointers are shifted from offset 0 (child) to offset 100 (page 1).
+			pageSize := bt.usablePageSize()
+			iData := int(binary.BigEndian.Uint16(childPg.data[5:7]))
+			if iData == 0 {
+				iData = pageSize
+			}
+
+			// Clear page 1 content area (preserve DB header).
+			clear(parentPg.data[dbHeaderSize:pageSize])
+
+			// Step 1: Copy cell content at the SAME absolute offset.
+			copy(parentPg.data[iData:pageSize], childPg.data[iData:pageSize])
+
+			// Step 2: Copy header + cell pointers with offset adjustment.
+			cpSize := childPg.header.headerSize() + int(childPg.header.cellCount)*2
+			copy(parentPg.data[dbHeaderSize:dbHeaderSize+cpSize], childPg.data[0:cpSize])
 		} else {
 			copy(parentPg.data, childPg.data)
 		}
@@ -2320,12 +2362,21 @@ func (bt *btree) removeChildFromParent(childPgno uint32, path []uint32) error {
 	}
 
 	if len(cells) == 0 && parentPg.pgno != bt.rootPage {
-		// Non-root empty interior page: free it and remove from grandparent
-		bt.pager.releasePage(parentPg)
-		if err := bt.pager.freePage(parentPgno); err != nil {
+		// Non-root interior with only one child (rightChild). Copy the child's
+		// content into this page and free the child — same collapse operation as
+		// root collapse but for non-root pages. This prevents orphaning the
+		// rightChild subtree. Matches SQLite's balance_nonroot shallowing logic.
+		childPg, err := bt.getPage(rightChild)
+		if err != nil {
+			bt.pager.releasePage(parentPg)
 			return err
 		}
-		return bt.removeChildFromParent(parentPgno, parentPath)
+		copy(parentPg.data, childPg.data)
+		parentPg.header = childPg.header
+		parentPg.header.serialize(parentPg.data)
+		bt.pager.releasePage(childPg)
+		bt.pager.releasePage(parentPg)
+		return bt.pager.freePage(rightChild)
 	}
 
 	bt.pager.releasePage(parentPg)

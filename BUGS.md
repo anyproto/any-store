@@ -1,22 +1,21 @@
 # Bugs Found During Coverage Testing
 
-## tryMergeLeaf-overflow-double-ref
+All bugs below have been **fixed**. Tests are unskipped and passing.
+
+## tryMergeLeaf-overflow-double-ref (FIXED)
 
 **Location**: `internal/btree/btree.go` — `tryMergeLeaf()`
 
-**Description**: When `tryMergeLeaf` merges two leaf pages that contain overflow chains,
-the overflow pages end up referenced twice (once from the merged page and once from the
-freed page that wasn't properly cleaned up). This causes `IntegrityCheck()` to report
-"2nd reference (tree t1 overflow)" errors.
+**Root Cause**: `collectLeafCells()` frees overflow chains as a side effect. When
+`tryMergeLeaf` called it on both pages before checking whether the merge would fit,
+a failed fit check left both pages referencing already-freed overflow pages.
 
-**Reproduction**:
-1. Create a DB with 512-byte page size
-2. Insert 60 rows with 100-byte values into namespace "t1" (forces overflow pages)
-3. Delete key 1 to leave a partially-empty leaf
-4. Call `tryMergeLeaf` on the leaf containing key 2
-5. Commit and run `IntegrityCheck()` — reports double-referenced overflow pages
+**Fix**: Check whether the merged content fits BEFORE calling `collectLeafCells`,
+using `leafCellSizeFromLengths()` to compute sizes directly from the page's varint
+headers without touching overflow chains. Matches SQLite's approach of verifying
+feasibility before destructive operations.
 
-**Test**: `TestTryMergeLeafNoFit` in `btree_coverage_test.go` (skipped)
+**Test**: `TestTryMergeLeafNoFit` in `btree_ops_test.go`
 
 ## Observation: Bulk Delete Sensitivity
 
@@ -30,37 +29,34 @@ tree structure mid-operation. Using smaller batches across multiple transactions
 reliably. This was observed during deep coverage testing but did not require any test
 skipping since the batch approach provides equivalent coverage.
 
-## page1-root-collapse-corruption
+## page1-root-collapse-corruption (FIXED)
 
-**Location**: `internal/btree/btree.go` -- `removeChildFromParent()` / `Delete()`
+**Location**: `internal/btree/btree.go` -- `removeChildFromParent()`
 
-**Description**: Deleting many namespaces from the master btree (rooted on page 1) with
-small page sizes (512 bytes) causes tree corruption. After deleting ~22 namespaces, the
-master btree restructuring (through `removeChildFromParent` root collapse on page 1)
-causes subsequent namespace lookups to fail with "namespace not found". The `IntegrityCheck`
-reports "invalid cell content offset" on the master page 1 and many "never used" pages.
+**Root Cause**: The page-1 root collapse did `copy(parentPg.data[dbHeaderSize:],
+childPg.data[0:])` which shifted ALL child data by 100 bytes. Cell content uses absolute
+offsets stored in cell pointers, so the shift broke all cell references. Additionally,
+the last 100 bytes of cell content (at the end of the page) were lost entirely.
 
-This bug prevents testing the page-1 root collapse code path (L2332-2342) and the
-non-root empty interior free path (L2354-2360) through the namespace API.
-
-**Reproduction**:
-1. Create a DB with 512-byte page size
-2. Create 30+ namespaces in a single write transaction
-3. Delete namespaces one by one in separate write transactions
-4. After ~22 deletions, `DeleteNamespace` fails with "namespace not found"
+**Fix**: Match SQLite's `copyNodeContent()` (btree.c:8148) two-step copy:
+1. Copy cell content to the SAME absolute offset (preserves cell pointer validity)
+2. Copy header + cell pointers with the 0→100 offset adjustment
 
 **Tests**: `TestMergeCursor_RootCollapseOnPage1` and `TestMergeCursor_RootCollapseViaDirectBtree`
-in `btree_merge_cursor_test.go` (skipped)
+in `btree_merge_cursor_test.go`
 
-## bulk-delete-orphan-pages
+## bulk-delete-orphan-pages (FIXED)
 
-**Location**: `internal/btree/btree.go` -- `Delete()` / `removeChildFromParent()`
+**Location**: `internal/btree/btree.go` -- `removeChildFromParent()`
 
-**Description**: Heavy deletion from a 3-level B-tree with small page sizes (512 bytes)
-leaves orphaned pages that are not returned to the freelist. After deleting most entries
-(e.g., 590 out of 600), `IntegrityCheck` reports pages as "never used" -- these are
-interior pages that were freed during tree collapse but their page numbers were not
-properly added to the freelist.
+**Root Cause**: When a non-root interior page became empty (0 cells, only rightChild),
+the code freed the page and called `removeChildFromParent` recursively to remove it
+from the grandparent. This orphaned the rightChild subtree — it was neither on the
+freelist nor reachable from the tree.
+
+**Fix**: When a non-root interior page becomes empty, copy the rightChild's content into
+this page and free the rightChild (same collapse operation as root collapse). This
+preserves the subtree, matching SQLite's balance-shallower approach.
 
 **Tests**: `TestMergeCursor_NonRootEmptyInteriorFree` and
-`TestMergeCursor_DeleteAllFromThreeLevelTree` in `btree_merge_cursor_test.go` (skipped)
+`TestMergeCursor_DeleteAllFromThreeLevelTree` in `btree_merge_cursor_test.go`
