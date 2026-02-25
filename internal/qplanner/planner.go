@@ -18,7 +18,15 @@ type CandidatePlan struct {
 	Name    string  // "FullScan", "IndexSeek(a)", "IndexScan(a)"
 	Cost    float64 // computed cost
 	EstRows float64 // estimated rows scanned/fetched
-	Details string  // one-line cost formula
+	details func() string // lazy one-line cost formula (only evaluated by ExplainString)
+}
+
+// Details returns the cost formula string, computing it lazily on first call.
+func (c *CandidatePlan) Details() string {
+	if c.details != nil {
+		return c.details()
+	}
+	return ""
 }
 
 // ExplainInfo holds rich explain metadata collected during BuildPlan.
@@ -78,10 +86,11 @@ func (p *Plan) ExplainString() string {
 	sb.WriteString(fmt.Sprintf("  Iterator: %s\n", p.String()))
 
 	// Chosen candidate's cost details
-	for _, c := range info.Candidates {
+	for i := range info.Candidates {
+		c := &info.Candidates[i]
 		if c.Cost == p.Cost && strings.Contains(c.Name, p.Name) {
-			if c.Details != "" {
-				sb.WriteString(fmt.Sprintf("  Cost breakdown: %s\n", c.Details))
+			if d := c.Details(); d != "" {
+				sb.WriteString(fmt.Sprintf("  Cost breakdown: %s\n", d))
 			}
 			break
 		}
@@ -223,7 +232,7 @@ func BuildPlan(params *PlanParams) *Plan {
 		Name:    "FullScan",
 		Cost:    fullScanCost,
 		EstRows: fullScanDocs,
-		Details: formatFullScanDetails(fullScanDocs, estimatedYield, needSort),
+		details: func() string { return formatFullScanDetails(fullScanDocs, estimatedYield, needSort) },
 	})
 
 	bestPlanName := "FullScan"
@@ -231,20 +240,26 @@ func BuildPlan(params *PlanParams) *Plan {
 	var bestIndex *CBOIndex
 
 
-	// Build hint lookup
-	hintBoosts := make(map[string]int)
-	for _, h := range params.IndexHints {
-		hintBoosts[h.IndexName] = h.Boost
+	// Build hint lookup (skip allocation when no hints)
+	var hintBoosts map[string]int
+	if len(params.IndexHints) > 0 {
+		hintBoosts = make(map[string]int, len(params.IndexHints))
+		for _, h := range params.IndexHints {
+			hintBoosts[h.IndexName] = h.Boost
+		}
 	}
 
 	// Compute per-field selectivity from single-field indexes with sketches.
 	// This allows compound indexes with partial bounds to get accurate estimates.
-	fieldSelectivity := make(map[string]float64)
+	var fieldSelectivity map[string]float64
 	for i := range params.Indexes {
 		idx := &params.Indexes[i]
 		if len(idx.Info.FieldNames) == 1 && idx.PointLookup && idx.Sketch != nil && len(idx.Bounds) > 0 {
 			est := float64(idx.Sketch.Estimate(idx.Bounds[0].Start))
 			if est > 0 {
+				if fieldSelectivity == nil {
+					fieldSelectivity = make(map[string]float64)
+				}
 				fieldSelectivity[idx.Info.FieldNames[0]] = est / totalDocs
 			}
 		}
@@ -289,11 +304,12 @@ func BuildPlan(params *PlanParams) *Plan {
 			seekCost -= float64(boost)
 		}
 
+		seekE, seekFetchCost, seekSC := e, fetchCost, seekSortCost
 		candidates = append(candidates, CandidatePlan{
 			Name:    fmt.Sprintf("IndexSeek(%s)", idx.Info.Name),
 			Cost:    seekCost,
 			EstRows: e,
-			Details: formatSeekDetails(e, fetchCost, seekSortCost),
+			details: func() string { return formatSeekDetails(seekE, seekFetchCost, seekSC) },
 		})
 
 		isBetter := seekCost < bestCost
@@ -350,11 +366,12 @@ func BuildPlan(params *PlanParams) *Plan {
 			} else {
 				scanRows = totalDocs
 			}
+			scanSR, scanFC, scanHL := scanRows, fetchCost, params.Limit > 0
 			candidates = append(candidates, CandidatePlan{
 				Name:    fmt.Sprintf("IndexScan(%s)", idx.Info.Name),
 				Cost:    scanCost,
 				EstRows: scanRows,
-				Details: formatScanDetails(scanRows, fetchCost, params.Limit > 0),
+				details: func() string { return formatScanDetails(scanSR, scanFC, scanHL) },
 			})
 
 			if scanCost < bestCost {
@@ -882,18 +899,15 @@ func ComputeIndexBounds(idx *IndexInfo, cond query.Filter) (query.Bounds, int) {
 	return result, chainLen
 }
 
-// AdjustBoundsForNonUnique adjusts End bounds for non-unique indexes by appending 0xff
-// to capture all docId suffixes.
+// AdjustBoundsForNonUnique adjusts End bounds in-place for non-unique indexes
+// by appending 0xff to capture all docId suffixes.
 func AdjustBoundsForNonUnique(bounds query.Bounds) query.Bounds {
-	adjusted := make(query.Bounds, len(bounds))
-	for i, b := range bounds {
-		adjusted[i] = b
-		if len(b.End) > 0 && b.EndInclude {
-			adjusted[i].End = append(append(anyenc.Tuple(nil), b.End...), 0xff)
-			adjusted[i].EndInclude = true
+	for i := range bounds {
+		if len(bounds[i].End) > 0 && bounds[i].EndInclude {
+			bounds[i].End = append(bounds[i].End, 0xff)
 		}
 	}
-	return adjusted
+	return bounds
 }
 
 // IndexSortMatch checks if an index covers the sort fields.
