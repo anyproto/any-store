@@ -193,9 +193,10 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		IndexHints: q.buildIndexHints(),
 	})
 
-	// Collect all matching docIds first to avoid cursor invalidation
-	// when index entries are modified during updates.
-	var idsToUpdate [][]byte
+	// Collect all matching docIds into a contiguous buffer to avoid
+	// per-ID allocations and cursor invalidation during updates.
+	var idBuf []byte       // contiguous buffer for all IDs
+	var idOffsets []uint32  // start offsets of each ID in idBuf
 	for {
 		_, docId, iterErr := plan.Root.Next()
 		if iterErr != nil {
@@ -206,9 +207,20 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		if docId == nil {
 			break
 		}
-		idsToUpdate = append(idsToUpdate, append([]byte(nil), docId...))
+		idOffsets = append(idOffsets, uint32(len(idBuf)))
+		idBuf = append(idBuf, docId...)
 	}
 	plan.Close()
+
+	// Build slice references into the contiguous buffer.
+	idsToUpdate := make([][]byte, len(idOffsets))
+	for i, off := range idOffsets {
+		end := len(idBuf)
+		if i+1 < len(idOffsets) {
+			end = int(idOffsets[i+1])
+		}
+		idsToUpdate[i] = idBuf[off:end]
+	}
 
 	modBuf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(modBuf)
@@ -297,8 +309,9 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 		IndexHints: q.buildIndexHints(),
 	})
 
-	// Collect IDs to delete (can't modify while iterating)
-	var idsToDelete [][]byte
+	// Collect IDs to delete into a contiguous buffer (can't modify while iterating).
+	var idBuf []byte
+	var idOffsets []uint32
 	for {
 		_, docId, iterErr := plan.Root.Next()
 		if iterErr != nil {
@@ -309,9 +322,20 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 		if docId == nil {
 			break
 		}
-		idsToDelete = append(idsToDelete, append([]byte(nil), docId...))
+		idOffsets = append(idOffsets, uint32(len(idBuf)))
+		idBuf = append(idBuf, docId...)
 	}
 	plan.Close()
+
+	// Build slice references into the contiguous buffer.
+	idsToDelete := make([][]byte, len(idOffsets))
+	for i, off := range idOffsets {
+		end := len(idBuf)
+		if i+1 < len(idOffsets) {
+			end = int(idOffsets[i+1])
+		}
+		idsToDelete[i] = idBuf[off:end]
+	}
 
 	// Now delete collected docs
 	for _, id := range idsToDelete {
@@ -467,15 +491,7 @@ func (q *collQuery) buildCBOIndexes() []qplanner.CBOIndex {
 	}
 
 	for _, idx := range q.c.indexes {
-		info := &qplanner.IndexInfo{
-			Name:       idx.info.Name,
-			FieldNames: idx.fieldNames,
-			FieldPaths: idx.fieldPaths,
-			Reverse:    idx.reverse,
-			Unique:     idx.info.Unique,
-			Sparse:     idx.info.Sparse,
-			Ns:         idx.ns,
-		}
+		info := idx.cboInfo
 
 		// Compute bounds for this index
 		bounds, chainLen := qplanner.ComputeIndexBounds(info, q.cond)
