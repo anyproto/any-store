@@ -741,8 +741,10 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 
 // NewCursor creates a cursor for iterating over the namespace.
 func (tx *ReadTx) NewCursor(ns *Namespace) *Cursor {
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
-	return bt.NewCursor()
+	c := &Cursor{}
+	c.btData = btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
+	c.bt = &c.btData
+	return c
 }
 
 // Count returns the total number of key-value pairs in the namespace.
