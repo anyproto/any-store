@@ -1396,7 +1396,7 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []uin
 // are freed (since the caller will rebuild the page with new overflow chains).
 func (bt *btree) collectLeafCells(pg *page) []cellData {
 	n := int(pg.header.cellCount)
-	cells := make([]cellData, n)
+	cells := make([]cellData, n, n+1) // +1 cap: callers insert one more cell after collecting
 	usableSize := bt.usablePageSize()
 	// Estimate actual content size from page header to avoid over-allocation.
 	// Validate contentOff to avoid negative capacity from corrupted headers.
@@ -1486,6 +1486,18 @@ func (bt *btree) collectInteriorCells(pg *page) []cellData {
 	cells := make([]cellData, n)
 	usable := bt.usablePageSize()
 	maxLocal := maxLocalPayload(usable)
+
+	// Estimate content size for non-overflow keys to use a single contiguous buffer.
+	contentOff, coErr := pg.contentAreaOffset(usable)
+	if coErr != nil {
+		contentOff = usable
+	}
+	contentSize := usable - contentOff
+	if contentSize < 0 {
+		contentSize = 0
+	}
+	buf := make([]byte, 0, contentSize)
+
 	for i := range n {
 		off := pg.getCellOffset(i)
 		cells[i], _, _ = parseInteriorCell(pg.data, int(off), usable)
@@ -1508,7 +1520,10 @@ func (bt *btree) collectInteriorCells(pg *page) []cellData {
 			cells[i].key = fullKey
 			cells[i].overflowPg = 0
 		} else {
-			cells[i].key = bytes.Clone(cells[i].key)
+			// Copy key into contiguous buffer instead of individual bytes.Clone per key
+			kStart := len(buf)
+			buf = append(buf, cells[i].key...)
+			cells[i].key = buf[kStart:len(buf)]
 		}
 		_ = maxLocal
 	}
@@ -1637,8 +1652,15 @@ func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint
 func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte, path []uint32) error {
 	cells := bt.collectLeafCells(pg)
 
-	newCell := cellData{key: bytes.Clone(key), value: bytes.Clone(value)}
-	cells = append(cells[:idx], append([]cellData{newCell}, cells[idx:]...)...)
+	// Clone key+value into a single allocation.
+	combined := make([]byte, len(key)+len(value))
+	copy(combined, key)
+	copy(combined[len(key):], value)
+	newCell := cellData{key: combined[:len(key)], value: combined[len(key):]}
+	// Insert newCell at idx with a single grow + shift instead of two intermediate slices.
+	cells = append(cells, cellData{})
+	copy(cells[idx+1:], cells[idx:len(cells)-1])
+	cells[idx] = newCell
 
 	// Find split point targeting ~2/3 fill on the left page (SQLite-style).
 	mid := leafSplitPoint(cells, bt.usablePageSize())
@@ -1846,9 +1868,16 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 func (bt *btree) splitLeafAndInsert(pg *page, idx int, key, value []byte) error {
 	cells := bt.collectLeafCells(pg)
 
-	// Insert the new cell at the correct position
-	newCell := cellData{key: bytes.Clone(key), value: bytes.Clone(value)}
-	cells = append(cells[:idx], append([]cellData{newCell}, cells[idx:]...)...)
+	// Insert the new cell at the correct position.
+	// Clone key+value into a single allocation.
+	combined := make([]byte, len(key)+len(value))
+	copy(combined, key)
+	copy(combined[len(key):], value)
+	newCell := cellData{key: combined[:len(key)], value: combined[len(key):]}
+	// Single grow + shift instead of two intermediate slices.
+	cells = append(cells, cellData{})
+	copy(cells[idx+1:], cells[idx:len(cells)-1])
+	cells[idx] = newCell
 
 	// Find split point targeting ~2/3 fill on the left page (SQLite-style).
 	mid := leafSplitPoint(cells, bt.usablePageSize())
@@ -2402,9 +2431,10 @@ func (bt *btree) countPage(pgno uint32) (int, error) {
 		return count, nil
 	}
 
-	// Interior page: count all children
+	// Interior page: recurse into children directly from page data
+	// to avoid allocating a slice of child page numbers.
 	n := int(pg.header.cellCount)
-	children := make([]uint32, 0, n+1)
+	total := 0
 	cpOff := pg.cellPointerOffset()
 	dataLen := len(pg.data)
 	for i := range n {
@@ -2419,19 +2449,21 @@ func (bt *btree) countPage(pgno uint32) (int, error) {
 			return 0, ErrCorrupt
 		}
 		childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
-		children = append(children, childPgno)
-	}
-	children = append(children, pg.header.rightChild)
-	bt.pager.releasePage(pg)
-
-	total := 0
-	for _, child := range children {
-		c, err := bt.countPage(child)
-		if err != nil {
-			return 0, err
+		c, cerr := bt.countPage(childPgno)
+		if cerr != nil {
+			bt.pager.releasePage(pg)
+			return 0, cerr
 		}
 		total += c
 	}
+	rightChild := pg.header.rightChild
+	bt.pager.releasePage(pg)
+
+	c, err := bt.countPage(rightChild)
+	if err != nil {
+		return 0, err
+	}
+	total += c
 	return total, nil
 }
 
@@ -2447,9 +2479,10 @@ const btCursorMaxDepth = 20
 // frames release their pages after extracting child pointers. Close()
 // must be called when the cursor is no longer needed.
 type Cursor struct {
-	bt    *btree
-	stack []cursorFrame
-	valid bool
+	bt     *btree
+	btData btree // embedded btree data to avoid separate heap allocation
+	stack  []cursorFrame
+	valid  bool
 }
 
 type cursorFrame struct {
@@ -3022,6 +3055,9 @@ func (c *Cursor) Valid() bool {
 }
 
 // NewCursor creates a new cursor for the B-tree.
+// The btree data is copied into the Cursor to avoid a separate heap allocation.
 func (bt *btree) NewCursor() *Cursor {
-	return &Cursor{bt: bt}
+	c := &Cursor{btData: *bt}
+	c.bt = &c.btData
+	return c
 }
