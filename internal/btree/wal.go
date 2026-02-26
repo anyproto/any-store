@@ -890,7 +890,7 @@ func (wi *walIndex) shmReadCkptInfo() {
 // wal manages the Write-Ahead Log.
 type wal struct {
 	mu       sync.RWMutex // protects memFrames slice; readers use RLock, writer uses Lock
-	file     *os.File
+	file     File
 	header   walHeader
 	index    *walIndex
 	pageSize uint32
@@ -965,7 +965,7 @@ func (w *wal) open() error {
 		return nil
 	}
 
-	f, err := os.OpenFile(w.path, os.O_RDWR|os.O_CREATE, 0666)
+	f, err := osOpenFile(w.path, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		return err
 	}
@@ -1039,6 +1039,9 @@ func (w *wal) initHeaderState() {
 // Called lazily on the first writeFrames when headerOnDisk is false.
 // Must be called with w.mu held.
 func (w *wal) flushHeader() error {
+	if w.file == nil {
+		return errors.New("btree: WAL file closed")
+	}
 	buf := make([]byte, walHeaderSize)
 	w.header.serialize(buf)
 
@@ -1213,6 +1216,10 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	// Stores page data in memory, skipping file I/O and checksums entirely.
 	if w.inMemory {
 		return w.writeFramesMem(pages, commit, dbSize)
+	}
+
+	if w.file == nil {
+		return errors.New("btree: WAL file closed")
 	}
 
 	w.mu.Lock()
@@ -1507,7 +1514,7 @@ func (w *wal) endWrite() {
 
 // checkpoint writes WAL frames back to the database file.
 // For InMemory databases, cache is used to store checkpointed pages instead of dbFile.
-func (w *wal) checkpoint(dbFile *os.File, cache *pcache) error {
+func (w *wal) checkpoint(dbFile File, cache *pcache) error {
 	return w.checkpointWithMode(dbFile, cache, CheckpointFull, nil)
 }
 
@@ -1517,7 +1524,7 @@ func (w *wal) checkpoint(dbFile *os.File, cache *pcache) error {
 // matching SQLite's SQLITE_BUSY return from sqlite3WalCheckpoint in
 // PASSIVE mode when readers block progress. Callers must not truncate
 // the WAL when ErrBusy is returned.
-func (w *wal) checkpointPassive(dbFile *os.File, cache *pcache) error {
+func (w *wal) checkpointPassive(dbFile File, cache *pcache) error {
 	err := w.checkpointWithMode(dbFile, cache, CheckpointPassive, nil)
 	if err != nil {
 		return err
@@ -1544,7 +1551,7 @@ func (w *wal) checkpointPassive(dbFile *os.File, cache *pcache) error {
 //
 // The busy handler (issue 1.7 + 6.3) is invoked when waiting for reader locks
 // in FULL/RESTART/TRUNCATE modes. In PASSIVE mode it is never called.
-func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode CheckpointMode, xBusy BusyHandler) error {
+func (w *wal) checkpointWithMode(dbFile File, cache *pcache, mode CheckpointMode, xBusy BusyHandler) error {
 	// Acquire checkpoint lock -- serialize concurrent checkpoints.
 	// The busy handler is NOT used for the checkpoint lock itself, matching
 	// SQLite: "Even if there is a busy-handler configured, it will not be
@@ -1701,6 +1708,10 @@ func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode Checkpoint
 			}
 		}
 	} else {
+		if w.file == nil {
+			_ = w.index.unlock(lockRead0, lockExclusive)
+			return errors.New("btree: WAL file closed")
+		}
 		frameSize := int64(walFrameSize) + int64(w.pageSize)
 		var frame walFrame
 		frameBuf := make([]byte, walFrameSize)
