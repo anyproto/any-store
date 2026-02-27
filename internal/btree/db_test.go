@@ -132,7 +132,7 @@ func TestOpen_AutoCheckpointDisabled(t *testing.T) {
 	db, err := Open(filepath.Join(dir, "t.db"), Options{DisableAutoCheckpoint: true})
 	require.NoError(t, err)
 	defer db.Close()
-	assert.Equal(t, uint32(0), db.opts.AutoCheckpointAfter)
+	assert.Equal(t, 0, db.opts.AutoCheckpointAfter)
 }
 
 // === CreateNamespace error paths (line 323) — 85% ===
