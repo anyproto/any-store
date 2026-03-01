@@ -216,7 +216,10 @@ func parseAnd(val *anyenc.Value) (res Filter, err error) {
 
 func parseComp(key string, v *anyenc.Value) (f Filter, err error) {
 	fk := Key{
-		Path: strings.Split(key, "."),
+		FullPath: key,
+	}
+	if strings.Contains(key, ".") {
+		fk.Path = strings.Split(key, ".")
 	}
 	if v.Type() == anyenc.TypeObject {
 		if fk.Filter, err = parseCompObj(v); err != nil {
