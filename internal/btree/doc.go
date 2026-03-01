@@ -23,6 +23,15 @@
 //   - Read transactions see a consistent snapshot via WAL
 //   - Write transactions support nested savepoints
 //
+// # VFS Build Tag
+//
+// By default the engine calls *os.File methods directly with zero interface
+// overhead. Building with -tags vfs switches to an interface-based I/O path
+// that allows replacing OS operations at runtime via SetVFS/ResetVFS for
+// fault injection in tests. Without the tag, SetVFS panics.
+//
+//	go test -tags vfs ./internal/btree/ -run TestCheckpoint
+//
 // # Namespaces
 //
 // Data is organized into namespaces, each backed by a separate B-tree root page.
