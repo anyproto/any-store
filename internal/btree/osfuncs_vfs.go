@@ -1,0 +1,39 @@
+//go:build vfs
+
+package btree
+
+import "os"
+
+type fileHandle = File
+
+var (
+	defaultOpenFile = func(name string, flag int, perm os.FileMode) (File, error) {
+		return os.OpenFile(name, flag, perm)
+	}
+	defaultRemove    = os.Remove
+	defaultFdatasync = func(f File) error { return f.Sync() }
+
+	osOpenFile = defaultOpenFile
+	osRemove   = defaultRemove
+	fdatasync  = defaultFdatasync
+)
+
+// SetVFS replaces OS-level operations for testing. Nil fields keep defaults.
+func SetVFS(vfs VFS) {
+	if vfs.OpenFile != nil {
+		osOpenFile = vfs.OpenFile
+	}
+	if vfs.Remove != nil {
+		osRemove = vfs.Remove
+	}
+	if vfs.Fdatasync != nil {
+		fdatasync = vfs.Fdatasync
+	}
+}
+
+// ResetVFS restores all OS-level operations to their defaults.
+func ResetVFS() {
+	osOpenFile = defaultOpenFile
+	osRemove = defaultRemove
+	fdatasync = defaultFdatasync
+}
