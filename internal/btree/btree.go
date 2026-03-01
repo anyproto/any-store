@@ -2479,10 +2479,11 @@ const btCursorMaxDepth = 20
 // frames release their pages after extracting child pointers. Close()
 // must be called when the cursor is no longer needed.
 type Cursor struct {
-	bt     *btree
-	btData btree // embedded btree data to avoid separate heap allocation
-	stack  []cursorFrame
-	valid  bool
+	bt       *btree
+	btData   btree // embedded btree data to avoid separate heap allocation
+	stack    []cursorFrame
+	stackBuf [8]cursorFrame // pre-allocated stack to avoid growth allocs for typical tree depths
+	valid    bool
 }
 
 type cursorFrame struct {
@@ -3054,10 +3055,85 @@ func (c *Cursor) Valid() bool {
 	return c.valid
 }
 
+// CountUntil counts entries from the current position until the end key,
+// using page-level batch counting to avoid per-entry key extraction.
+// The cursor must be positioned at or after the start of the range.
+// After this call, the cursor is positioned past the end key (or invalid).
+func (c *Cursor) CountUntil(endKey []byte, endInclusive bool) (int, error) {
+	count := 0
+	usableSize := c.bt.usablePageSize()
+
+	for c.valid {
+		frame := &c.stack[len(c.stack)-1]
+		if frame.pg == nil {
+			return count, ErrCorrupt
+		}
+
+		cellCount := int(frame.pg.header.cellCount)
+		if frame.cellIdx >= cellCount {
+			// Shouldn't happen for valid cursor, advance
+			if err := c.Next(); err != nil {
+				return count, err
+			}
+			continue
+		}
+
+		remaining := cellCount - frame.cellIdx
+
+		if len(endKey) > 0 && remaining > 1 {
+			// Batch optimization: check last entry on page against end bound.
+			// If it's within bounds, count all remaining entries at once.
+			lastIdx := cellCount - 1
+			lastOff, oerr := frame.pg.getCellOffsetSafe(lastIdx)
+			if oerr != nil {
+				return count, oerr
+			}
+			lastCell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(lastOff), usableSize)
+			if cerr != nil {
+				return count, cerr
+			}
+
+			if lastCell.overflowPg == 0 {
+				cmp := bytes.Compare(lastCell.key, endKey)
+				if cmp < 0 || (cmp == 0 && endInclusive) {
+					// All remaining entries on this page are within bounds
+					count += remaining
+					// Advance past this page
+					frame.cellIdx = cellCount - 1
+					if err := c.Next(); err != nil {
+						return count, err
+					}
+					continue
+				}
+			}
+		}
+
+		// End bound is on this page (or single entry left, or overflow key)
+		// Fall back to per-entry counting
+		k, kerr := c.Key()
+		if kerr != nil {
+			return count, kerr
+		}
+		if len(endKey) > 0 {
+			cmp := bytes.Compare(k, endKey)
+			if cmp > 0 || (cmp == 0 && !endInclusive) {
+				c.valid = false
+				return count, nil
+			}
+		}
+		count++
+		if err := c.Next(); err != nil {
+			return count, err
+		}
+	}
+	return count, nil
+}
+
 // NewCursor creates a new cursor for the B-tree.
 // The btree data is copied into the Cursor to avoid a separate heap allocation.
 func (bt *btree) NewCursor() *Cursor {
 	c := &Cursor{btData: *bt}
 	c.bt = &c.btData
+	c.stack = c.stackBuf[:0]
 	return c
 }
