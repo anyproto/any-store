@@ -231,6 +231,8 @@ func (h *dbHeader) deserialize(buf []byte) error {
 	ps := binary.BigEndian.Uint16(buf[16:18])
 	if ps == 1 {
 		h.PageSize = 65536
+	} else if ps < MinPageSize || (ps&(ps-1)) != 0 {
+		return ErrCorrupt // invalid: 0, non-power-of-two, or < 512
 	} else {
 		h.PageSize = uint32(ps)
 	}

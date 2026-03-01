@@ -6552,3 +6552,51 @@ func TestCov2_WriteHeader_FileError(t *testing.T) {
 	_ = os.Chmod(walPath, 0666)
 	_ = w.close()
 }
+
+// ============================================================
+// Bug 15: page_size=0 in corrupt DB header causes panic
+// ============================================================
+
+func TestCorruptPageSizeZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	// Create a valid database
+	db, err := Open(path, DefaultOptions())
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	// Corrupt page_size field to 0
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte{0, 0}, 16)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	// Opening should return ErrCorrupt, not panic
+	_, err = Open(path, DefaultOptions())
+	require.Error(t, err, "expected error opening DB with page_size=0")
+	require.ErrorIs(t, err, ErrCorrupt)
+}
+
+func TestCorruptPageSizeNonPowerOfTwo(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	db, err := Open(path, DefaultOptions())
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	// Corrupt page_size to 1000 (not a power of 2)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	var buf [2]byte
+	binary.BigEndian.PutUint16(buf[:], 1000)
+	_, err = f.WriteAt(buf[:], 16)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	_, err = Open(path, DefaultOptions())
+	require.Error(t, err, "expected error opening DB with non-power-of-2 page_size")
+	require.ErrorIs(t, err, ErrCorrupt)
+}

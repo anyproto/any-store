@@ -141,10 +141,11 @@ func (p *pager) open() error {
 	}
 
 	// Existing database - read header
-	buf := make([]byte, p.pageSize)
-	if p.pageSize == 0 {
-		buf = make([]byte, DefaultPageSize)
+	readSize := p.pageSize
+	if readSize == 0 {
+		readSize = DefaultPageSize
 	}
+	buf := make([]byte, readSize)
 	n, err := f.ReadAt(buf, 0)
 	if err != nil && n < dbHeaderSize {
 		return fmt.Errorf("btree: failed to read database header: %w", err)
