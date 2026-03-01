@@ -9,6 +9,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// allowDoubleOpen removes a path from the open registry so a second Open()
+// can succeed. Used only in multi-process simulation tests.
+func allowDoubleOpen(path string) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return
+	}
+	openDBs.Delete(abs)
+}
+
 // TestCacheInvalidation_SingleProcess_NotStaleAfterOwnWrite verifies that
 // after a process writes and commits with MarkDataChanged, its next
 // transaction does NOT report staleness (same-process avoidance).
@@ -45,6 +55,7 @@ func TestCacheInvalidation_MultiProcess_DetectsExternalWrite(t *testing.T) {
 	defer db1.Close()
 
 	// Open second DB handle (simulates another process)
+	allowDoubleOpen(dbPath)
 	db2, err := Open(dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db2.Close()
@@ -94,6 +105,7 @@ func TestCacheInvalidation_SchemaCookie(t *testing.T) {
 	require.NoError(t, err)
 	defer db1.Close()
 
+	allowDoubleOpen(dbPath)
 	db2, err := Open(dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db2.Close()
@@ -132,6 +144,7 @@ func TestCacheInvalidation_NoMarks_CountersUnchanged(t *testing.T) {
 	require.NoError(t, err)
 	defer db1.Close()
 
+	allowDoubleOpen(dbPath)
 	db2, err := Open(dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db2.Close()
@@ -172,6 +185,7 @@ func TestCacheInvalidation_UpdateLocalCounters(t *testing.T) {
 	require.NoError(t, err)
 	defer db1.Close()
 
+	allowDoubleOpen(dbPath)
 	db2, err := Open(dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db2.Close()
@@ -283,6 +297,7 @@ func TestCacheInvalidation_WriteTx_StaleCheck(t *testing.T) {
 	require.NoError(t, err)
 	defer db1.Close()
 
+	allowDoubleOpen(dbPath)
 	db2, err := Open(dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db2.Close()
@@ -339,6 +354,7 @@ func TestCacheInvalidation_DataOnly_SchemaUnchanged(t *testing.T) {
 	require.NoError(t, err)
 	defer db1.Close()
 
+	allowDoubleOpen(dbPath)
 	db2, err := Open(dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db2.Close()

@@ -40,6 +40,10 @@ func rawClose(db *DB) {
 		_ = db.pager.file.Close()
 		db.pager.file = nil
 	}
+	// Remove from open registry so the path can be re-opened.
+	if !db.opts.InMemory {
+		openDBs.Delete(db.path)
+	}
 }
 
 // TestCrash1_PartialWALFrame: Truncate WAL mid-frame. Only committed data visible.

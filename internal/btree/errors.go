@@ -54,4 +54,7 @@ var (
 
 	// ErrProtocol indicates the WAL retry protocol was exhausted.
 	ErrProtocol = errors.New("btree: WAL protocol retry limit exhausted")
+
+	// ErrDatabaseOpen indicates the database file is already open in this process.
+	ErrDatabaseOpen = errors.New("btree: database already open in this process")
 )
