@@ -168,6 +168,51 @@ func (it *IndexIter) nextNoBounds() (key []byte, docId []byte, err error) {
 	return it.extractResult(k)
 }
 
+// CountEntries counts all entries within bounds using batch page-level counting.
+// This is much faster than calling Next() repeatedly when only a count is needed.
+func (it *IndexIter) CountEntries() (int, error) {
+	if it.cursor == nil {
+		it.cursor = it.Source.NewCursor()
+	}
+
+	total := 0
+	for _, b := range it.Bounds {
+		// Seek to start
+		if len(b.Start) > 0 {
+			if err := it.cursor.Seek(b.Start); err != nil {
+				return 0, err
+			}
+			if it.cursor.Valid() && !b.StartInclude {
+				k, kerr := it.cursor.Key()
+				if kerr != nil {
+					return 0, kerr
+				}
+				if bytes.Equal(k, b.Start) {
+					if err := it.cursor.Next(); err != nil {
+						return 0, err
+					}
+				}
+			}
+		} else {
+			if err := it.cursor.First(); err != nil {
+				return 0, err
+			}
+		}
+
+		if !it.cursor.Valid() {
+			continue
+		}
+
+		// Use batch counting
+		n, err := it.cursor.CountUntil(b.End, b.EndInclude)
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
 // Close releases the underlying cursor resources.
 func (it *IndexIter) Close() {
 	if it.cursor != nil {

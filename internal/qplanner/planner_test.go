@@ -220,17 +220,17 @@ func TestBuildPlan_IDBounds_FullScan(t *testing.T) {
 }
 
 func TestCalculateSelectivity_NoFilter(t *testing.T) {
-	p := calculateSelectivity(nil, nil, 100)
+	p := calculateSelectivity(nil, nil, 100, nil)
 	assert.Equal(t, 1.0, p)
 }
 
 func TestCalculateSelectivity_AllFilter(t *testing.T) {
-	p := calculateSelectivity(query.All{}, nil, 100)
+	p := calculateSelectivity(query.All{}, nil, 100, nil)
 	assert.Equal(t, 1.0, p)
 }
 
 func TestCalculateSelectivity_NoIndexes(t *testing.T) {
-	p := calculateSelectivity(query.MustParseCondition(`{"a": 1}`), nil, 100)
+	p := calculateSelectivity(query.MustParseCondition(`{"a": 1}`), nil, 100, nil)
 	assert.Equal(t, DefaultRangeSelectivity, p)
 }
 
