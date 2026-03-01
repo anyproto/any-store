@@ -31,7 +31,7 @@ const (
 // pager manages database pages, cache, and WAL interaction.
 type pager struct {
 	mu       sync.RWMutex
-	file     File
+	file     fileHandle
 	wal      *wal
 	cache    *pcache
 	header       dbHeader

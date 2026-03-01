@@ -33,7 +33,7 @@ const shmDMSOffset = 120 + int64(lockSlotCount) // right after the per-slot lock
 // This enables multi-process access to the WAL index, matching SQLite's approach.
 type mmapShm struct {
 	mu      sync.Mutex
-	file    File
+	file    fileHandle
 	path    string
 	regions [][]byte // mmap'd regions
 }
