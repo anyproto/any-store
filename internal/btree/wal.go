@@ -557,15 +557,13 @@ func (wi *walIndex) setBatch(pages []*page, startFrame uint32) {
 // See the package-level comment on issue 7.9 for why this is acceptable.
 func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
 	wi.mu.RLock()
-	defer wi.mu.RUnlock()
 	// Skip frames that have been checkpointed back to the DB.
 	// This matches SQLite's minFrame filter (wal.c:3571) and prevents
 	// readers from seeing stale WAL frames after a checkpoint + truncate.
 	minFrame := wi.nBackfill.Load() + 1
 	frames := wi.pageMap[pgno]
-	if len(frames) == 0 {
-		return 0
-	}
+	wi.mu.RUnlock()
+
 	// Frames are appended in order, so the list is sorted ascending.
 	// Search backwards for the highest frame in [minFrame, maxFrame].
 	for i := len(frames) - 1; i >= 0; i-- {
@@ -573,6 +571,16 @@ func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
 			return frames[i]
 		}
 	}
+
+	// Cross-process fallback: read from SHM hash tables when not in
+	// single-process mode. Another process may have written frames
+	// that are not in our pageMap.
+	if !wi.inProcess {
+		if frame := wi.shmHashGet(pgno, maxFrame); frame >= minFrame {
+			return frame
+		}
+	}
+
 	return 0
 }
 
@@ -581,12 +589,19 @@ func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
 // page may have been updated beyond a reader's snapshot.
 func (wi *walIndex) getLatest(pgno uint32) uint32 {
 	wi.mu.RLock()
-	defer wi.mu.RUnlock()
 	frames := wi.pageMap[pgno]
-	if len(frames) == 0 {
-		return 0
+	wi.mu.RUnlock()
+
+	if len(frames) > 0 {
+		return frames[len(frames)-1]
 	}
-	return frames[len(frames)-1]
+
+	// Cross-process fallback: check SHM hash tables
+	if !wi.inProcess {
+		return wi.shmHashGet(pgno, wi.maxFrame.Load())
+	}
+
+	return 0
 }
 
 // reset clears the WAL index (after a checkpoint + WAL truncate).

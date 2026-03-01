@@ -536,3 +536,35 @@ func TestWALRecoveryMultipleCommits(t *testing.T) {
 
 	require.NoError(t, w2.close())
 }
+
+func TestWalIndexGetCrossProcessFallback(t *testing.T) {
+	// Use a heap SHM but with inProcess=false to test the fallback logic.
+	// This simulates a second process whose pageMap is empty for frames
+	// written by another process, but the SHM hash tables have them.
+	wi := &walIndex{
+		shm:       newHeapShm(),
+		pageMap:   make(map[uint32][]uint32),
+		inProcess: false,
+	}
+
+	// Write frames to SHM hash tables only (simulating another process)
+	wi.shmHashWrite(5, 1)
+	wi.maxFrame.Store(1)
+	wi.nBackfill.Store(0)
+
+	// get() should find frame 1 for page 5 via SHM fallback
+	frame := wi.get(5, 1)
+	assert.Equal(t, uint32(1), frame, "get() SHM fallback: expected frame 1")
+
+	// getLatest() should also find it
+	frame = wi.getLatest(5)
+	assert.Equal(t, uint32(1), frame, "getLatest() SHM fallback: expected frame 1")
+
+	// With inProcess=true, should NOT fall back to SHM
+	wi.inProcess = true
+	frame = wi.get(5, 1)
+	assert.Equal(t, uint32(0), frame, "get() inProcess should not use SHM fallback")
+
+	frame = wi.getLatest(5)
+	assert.Equal(t, uint32(0), frame, "getLatest() inProcess should not use SHM fallback")
+}
