@@ -2969,3 +2969,144 @@ func TestCov2_AppendValue_ParseCellError2(t *testing.T) {
 func TestCov2_AppendValue_OverflowVarintErrors(t *testing.T) {
 	t.Skip("BUG: L663-672 structurally unreachable - getVarintSafe on same data that parseLeafCellWithSize already parsed")
 }
+
+// === Bug 14: WriteTx abandoned does not deadlock Close ===
+
+func TestWriteTxAbandonedDoesNotDeadlockClose(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	db, err := Open(path, DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Start a write transaction and abandon it (don't commit or rollback)
+	tx, err := db.BeginWrite()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tx // intentionally abandoned
+
+	// Close should not deadlock — it should force-rollback the abandoned tx
+	done := make(chan error, 1)
+	go func() {
+		done <- db.Close()
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close deadlocked on abandoned WriteTx")
+	}
+}
+
+func TestWriteTxAbandonedThenNewWriteTxWorks(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	db, err := Open(path, DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Start and abandon a write transaction
+	tx1, err := db.BeginWrite()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Manually force-release the abandoned tx (simulates what Close does internally)
+	tx1.closed = true
+	_ = tx1.pager.rollback()
+	tx1.pager.endRead(tx1.walSlot)
+	db.activeWriteTx.Store(nil)
+	db.mu.RUnlock()
+	db.writeMu.Unlock()
+
+	// A new write tx should succeed
+	tx2, err := db.BeginWrite()
+	if err != nil {
+		t.Fatalf("new WriteTx after abandoned one failed: %v", err)
+	}
+	if err := tx2.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWriteTxCommitClearsActiveWriteTx(t *testing.T) {
+	db := tempDB(t)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+
+	// activeWriteTx should be set
+	assert.NotNil(t, db.activeWriteTx.Load())
+
+	require.NoError(t, tx.Commit())
+
+	// activeWriteTx should be cleared after commit
+	assert.Nil(t, db.activeWriteTx.Load())
+}
+
+func TestWriteTxRollbackClearsActiveWriteTx(t *testing.T) {
+	db := tempDB(t)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+
+	// activeWriteTx should be set
+	assert.NotNil(t, db.activeWriteTx.Load())
+
+	require.NoError(t, tx.Rollback())
+
+	// activeWriteTx should be cleared after rollback
+	assert.Nil(t, db.activeWriteTx.Load())
+}
+
+// === Bug 16: Double open prevention ===
+
+func TestDoubleOpenReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	db1, err := Open(path, DefaultOptions())
+	require.NoError(t, err)
+	defer db1.Close()
+
+	// Second open of same file should fail
+	_, err = Open(path, DefaultOptions())
+	assert.ErrorIs(t, err, ErrDatabaseOpen)
+}
+
+func TestDoubleOpenAllowedAfterClose(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	db1, err := Open(path, DefaultOptions())
+	require.NoError(t, err)
+	require.NoError(t, db1.Close())
+
+	// After close, re-open should work
+	db2, err := Open(path, DefaultOptions())
+	require.NoError(t, err)
+	defer db2.Close()
+}
+
+func TestDoubleOpenInMemoryAllowed(t *testing.T) {
+	opts := DefaultOptions()
+	opts.InMemory = true
+
+	db1, err := Open("mem1", opts)
+	require.NoError(t, err)
+	defer db1.Close()
+
+	// In-memory DBs should allow "double open" (they're independent)
+	db2, err := Open("mem1", opts)
+	require.NoError(t, err)
+	defer db2.Close()
+}

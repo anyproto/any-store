@@ -6,9 +6,15 @@ package btree
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 )
+
+// openDBs tracks database files currently open in this process.
+// Keyed by canonical absolute path. Prevents double-open corruption.
+var openDBs sync.Map
 
 // Options configures the database.
 type Options struct {
@@ -71,6 +77,11 @@ type DB struct {
 	closing atomic.Bool // set to reject new transactions
 	closed  atomic.Bool // set when Close() is actually called
 
+	// activeWriteTx tracks the in-progress write transaction so that
+	// Close can force-rollback an abandoned WriteTx (one that was
+	// neither committed nor rolled back) and recover the write mutex.
+	activeWriteTx atomic.Pointer[WriteTx]
+
 	// Namespace root pages are stored in a master table on page 1.
 	// Format: each cell in the master B-tree maps namespace name -> root page number (4 bytes).
 	masterBT *btree
@@ -114,6 +125,25 @@ func Open(path string, opts Options) (*DB, error) {
 		opts.InProcess = true
 	}
 
+	// Prevent double-open of the same database file.
+	var canonicalPath string
+	if !opts.InMemory {
+		var err error
+		canonicalPath, err = filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("btree: cannot resolve path: %w", err)
+		}
+		if _, loaded := openDBs.LoadOrStore(canonicalPath, true); loaded {
+			return nil, ErrDatabaseOpen
+		}
+	}
+	openSuccess := false
+	defer func() {
+		if !openSuccess && canonicalPath != "" {
+			openDBs.Delete(canonicalPath)
+		}
+	}()
+
 	p := newPager(path, opts.PageSize, opts.CacheSize, !opts.InMemory)
 	p.inProcess = opts.InProcess
 	p.noCommitSync = opts.NoCommitSync
@@ -156,6 +186,10 @@ func Open(path string, opts Options) (*DB, error) {
 	db.localFileChangeCounter.Store(fcc)
 	db.localSchemaCookie.Store(sc)
 
+	if canonicalPath != "" {
+		db.path = canonicalPath
+	}
+	openSuccess = true
 	return db, nil
 }
 
@@ -165,13 +199,33 @@ func (db *DB) Close() error {
 		return ErrClosed
 	}
 	db.closing.Store(true)
-	// Wait for write mutex to ensure no writer is active
-	db.writeMu.Lock()
+
+	// Try to acquire write mutex. If an abandoned WriteTx holds it,
+	// TryLock will fail. In that case we force-rollback the abandoned
+	// transaction and release its locks. Go sync.Mutex is not
+	// goroutine-bound, so Unlock from a different goroutine is valid.
+	if !db.writeMu.TryLock() {
+		if tx := db.activeWriteTx.Load(); tx != nil && !tx.closed {
+			tx.closed = true
+			_ = tx.pager.rollback()
+			tx.pager.endRead(tx.walSlot)
+			db.activeWriteTx.Store(nil)
+			db.mu.RUnlock() // release the RLock held by BeginWrite
+			db.writeMu.Unlock()
+		}
+		// Re-acquire to follow the existing protocol
+		db.writeMu.Lock()
+	}
 	db.writeMu.Unlock()
 	// Wait for all active readers to finish
 	db.mu.Lock()
 	db.mu.Unlock()
-	return db.pager.close()
+	err := db.pager.close()
+	// Remove from open registry after full cleanup
+	if !db.opts.InMemory {
+		openDBs.Delete(db.path)
+	}
+	return err
 }
 
 // SetClosing marks the database as closing, causing new transactions to fail.
@@ -277,6 +331,7 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	tx.ReadTx.localSchemaCookie = db.localSchemaCookie.Load()
 	tx.dataChanged = false   // pool reuse safety
 	tx.schemaChanged = false // pool reuse safety
+	db.activeWriteTx.Store(tx)
 	return tx, nil
 }
 
@@ -859,6 +914,7 @@ func (tx *WriteTx) Commit() error {
 		return ErrTxClosed
 	}
 	tx.closed = true
+	tx.db.activeWriteTx.Store(nil)
 	nFrame, newFCC, newSC, err := tx.pager.commit(tx.dataChanged, tx.schemaChanged)
 	if err == nil {
 		tx.db.localFileChangeCounter.Store(newFCC)
@@ -886,6 +942,7 @@ func (tx *WriteTx) Rollback() error {
 		return ErrTxClosed
 	}
 	tx.closed = true
+	tx.db.activeWriteTx.Store(nil)
 	err := tx.pager.rollback()
 	tx.pager.endRead(tx.walSlot)
 	db := tx.db
