@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -461,7 +460,7 @@ func (db *db) Stats(ctx context.Context) (stats DBStats, err error) {
 	})
 
 	// Get file size for TotalSizeBytes
-	if fi, fErr := os.Stat(db.btreeDB.Path()); fErr == nil {
+	if fi, fErr := osStat(db.btreeDB.Path()); fErr == nil {
 		stats.TotalSizeBytes = int(fi.Size())
 		stats.DataSizeBytes = stats.TotalSizeBytes
 	}
@@ -492,11 +491,11 @@ func (db *db) Backup(ctx context.Context, path string) (err error) {
 		return err
 	}
 
-	srcData, err := os.ReadFile(srcPath)
+	srcData, err := osReadFile(srcPath)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, srcData, 0644)
+	return osWriteFile(path, srcData, 0644)
 }
 
 func (db *db) WriteTx(ctx context.Context) (tx WriteTx, err error) {

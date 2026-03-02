@@ -31,7 +31,7 @@ const (
 // pager manages database pages, cache, and WAL interaction.
 type pager struct {
 	mu       sync.RWMutex
-	file     *os.File
+	file     fileHandle
 	wal      *wal
 	cache    *pcache
 	header       dbHeader
@@ -124,7 +124,7 @@ func (p *pager) open() error {
 		return p.initNewDB()
 	}
 
-	f, err := os.OpenFile(p.path, os.O_RDWR|os.O_CREATE, 0666)
+	f, err := osOpenFile(p.path, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		return err
 	}

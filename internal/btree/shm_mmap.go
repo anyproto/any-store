@@ -10,6 +10,14 @@ import (
 	"unsafe"
 )
 
+var (
+	sysMmap   = syscall.Mmap
+	sysMunmap = syscall.Munmap
+	sysFcntl  = func(fd, cmd, arg uintptr) (uintptr, uintptr, syscall.Errno) {
+		return syscall.Syscall(syscall.SYS_FCNTL, fd, cmd, arg)
+	}
+)
+
 // hasMmapShm indicates this platform supports mmap-based shared memory
 // for multi-process WAL coordination. When false, only heap SHM is
 // available and InProcess mode is forced.
@@ -25,7 +33,7 @@ const shmDMSOffset = 120 + int64(lockSlotCount) // right after the per-slot lock
 // This enables multi-process access to the WAL index, matching SQLite's approach.
 type mmapShm struct {
 	mu      sync.Mutex
-	file    *os.File
+	file    fileHandle
 	path    string
 	regions [][]byte // mmap'd regions
 }
@@ -33,7 +41,7 @@ type mmapShm struct {
 // newPlatformShm creates a new mmap-backed shm.
 // Acquires a shared DMS lock to track that this connection is using the SHM file.
 func newPlatformShm(path string) (shm, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
+	f, err := osOpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		return nil, fmt.Errorf("btree: open shm file: %w", err)
 	}
@@ -82,7 +90,7 @@ func (s *mmapShm) region(index int, create bool) ([]byte, error) {
 
 	// mmap the region.
 	offset := int64(index) * int64(shmRegionSize)
-	data, err := syscall.Mmap(int(s.file.Fd()), offset, shmRegionSize,
+	data, err := sysMmap(int(s.file.Fd()), offset, shmRegionSize,
 		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
 		return nil, fmt.Errorf("btree: mmap shm region %d: %w", index, err)
@@ -129,6 +137,9 @@ func shmLockOffset(slot int) int64 {
 
 // fcntlLock performs a POSIX fcntl lock operation on a 1-byte range.
 func (s *mmapShm) fcntlLock(lockType int, offset int64) error {
+	if s.file == nil {
+		return fmt.Errorf("btree: shm file closed")
+	}
 	flock := syscall.Flock_t{
 		Type:   int16(lockType),
 		Whence: 0, // SEEK_SET
@@ -136,8 +147,8 @@ func (s *mmapShm) fcntlLock(lockType int, offset int64) error {
 		Len:    1,
 	}
 	// Use F_SETLK for non-blocking lock attempts.
-	_, _, errno := syscall.Syscall(syscall.SYS_FCNTL,
-		uintptr(s.file.Fd()),
+	_, _, errno := sysFcntl(
+		s.file.Fd(),
 		uintptr(syscall.F_SETLK),
 		uintptr(unsafe.Pointer(&flock)))
 	if errno != 0 {
@@ -155,7 +166,7 @@ func (s *mmapShm) close() error {
 
 	for i, region := range s.regions {
 		if region != nil {
-			_ = syscall.Munmap(region)
+			_ = sysMunmap(region)
 			s.regions[i] = nil
 		}
 	}
@@ -181,7 +192,7 @@ func (s *mmapShm) close() error {
 	}
 
 	if deleteFile {
-		_ = os.Remove(s.path)
+		_ = osRemove(s.path)
 	}
 	return err
 }

@@ -64,6 +64,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
+	"io"
 	"math/bits"
 	"math/rand/v2"
 	"os"
@@ -890,7 +891,7 @@ func (wi *walIndex) shmReadCkptInfo() {
 // wal manages the Write-Ahead Log.
 type wal struct {
 	mu       sync.RWMutex // protects memFrames slice; readers use RLock, writer uses Lock
-	file     *os.File
+	file     fileHandle
 	header   walHeader
 	index    *walIndex
 	pageSize uint32
@@ -965,7 +966,7 @@ func (w *wal) open() error {
 		return nil
 	}
 
-	f, err := os.OpenFile(w.path, os.O_RDWR|os.O_CREATE, 0666)
+	f, err := osOpenFile(w.path, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		return err
 	}
@@ -1039,6 +1040,9 @@ func (w *wal) initHeaderState() {
 // Called lazily on the first writeFrames when headerOnDisk is false.
 // Must be called with w.mu held.
 func (w *wal) flushHeader() error {
+	if w.file == nil {
+		return errors.New("btree: WAL file closed")
+	}
 	buf := make([]byte, walHeaderSize)
 	w.header.serialize(buf)
 
@@ -1215,6 +1219,10 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		return w.writeFramesMem(pages, commit, dbSize)
 	}
 
+	if w.file == nil {
+		return errors.New("btree: WAL file closed")
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -1272,8 +1280,12 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	w.cksum2 = s2
 
 	// Single write call for all frames
-	if _, err := w.file.WriteAt(buf, offset); err != nil {
+	n, err := w.file.WriteAt(buf, offset)
+	if err != nil {
 		return err
+	}
+	if n != len(buf) {
+		return io.ErrShortWrite
 	}
 
 	// Batch update walIndex under a single lock
@@ -1507,7 +1519,7 @@ func (w *wal) endWrite() {
 
 // checkpoint writes WAL frames back to the database file.
 // For InMemory databases, cache is used to store checkpointed pages instead of dbFile.
-func (w *wal) checkpoint(dbFile *os.File, cache *pcache) error {
+func (w *wal) checkpoint(dbFile fileHandle, cache *pcache) error {
 	return w.checkpointWithMode(dbFile, cache, CheckpointFull, nil)
 }
 
@@ -1517,7 +1529,7 @@ func (w *wal) checkpoint(dbFile *os.File, cache *pcache) error {
 // matching SQLite's SQLITE_BUSY return from sqlite3WalCheckpoint in
 // PASSIVE mode when readers block progress. Callers must not truncate
 // the WAL when ErrBusy is returned.
-func (w *wal) checkpointPassive(dbFile *os.File, cache *pcache) error {
+func (w *wal) checkpointPassive(dbFile fileHandle, cache *pcache) error {
 	err := w.checkpointWithMode(dbFile, cache, CheckpointPassive, nil)
 	if err != nil {
 		return err
@@ -1544,7 +1556,7 @@ func (w *wal) checkpointPassive(dbFile *os.File, cache *pcache) error {
 //
 // The busy handler (issue 1.7 + 6.3) is invoked when waiting for reader locks
 // in FULL/RESTART/TRUNCATE modes. In PASSIVE mode it is never called.
-func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode CheckpointMode, xBusy BusyHandler) error {
+func (w *wal) checkpointWithMode(dbFile fileHandle, cache *pcache, mode CheckpointMode, xBusy BusyHandler) error {
 	// Acquire checkpoint lock -- serialize concurrent checkpoints.
 	// The busy handler is NOT used for the checkpoint lock itself, matching
 	// SQLite: "Even if there is a busy-handler configured, it will not be
@@ -1682,8 +1694,13 @@ func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode Checkpoint
 			if dbFile != nil {
 				// Disk mode: write to DB file
 				pageOffset := int64(mf.pgno-1) * pageSz
-				if _, err := dbFile.WriteAt(mf.data, pageOffset); err != nil {
+				n, err := dbFile.WriteAt(mf.data, pageOffset)
+				if err != nil {
 					backfillErr = err
+					break
+				}
+				if n != len(mf.data) {
+					backfillErr = io.ErrShortWrite
 					break
 				}
 			} else if cache != nil {
@@ -1701,6 +1718,10 @@ func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode Checkpoint
 			}
 		}
 	} else {
+		if w.file == nil {
+			_ = w.index.unlock(lockRead0, lockExclusive)
+			return errors.New("btree: WAL file closed")
+		}
 		frameSize := int64(walFrameSize) + int64(w.pageSize)
 		var frame walFrame
 		frameBuf := make([]byte, walFrameSize)
@@ -1708,20 +1729,35 @@ func (w *wal) checkpointWithMode(dbFile *os.File, cache *pcache, mode Checkpoint
 
 		for i := nBackfill; i < mxSafeFrame; i++ {
 			off := int64(walHeaderSize) + int64(i)*frameSize
-			if _, err := w.file.ReadAt(frameBuf, off); err != nil {
+			n, err := w.file.ReadAt(frameBuf, off)
+			if err != nil {
 				backfillErr = err
+				break
+			}
+			if n != len(frameBuf) {
+				backfillErr = io.ErrUnexpectedEOF
 				break
 			}
 			frame.deserialize(frameBuf)
 
-			if _, err := w.file.ReadAt(pageData, off+walFrameSize); err != nil {
+			n, err = w.file.ReadAt(pageData, off+walFrameSize)
+			if err != nil {
 				backfillErr = err
+				break
+			}
+			if n != len(pageData) {
+				backfillErr = io.ErrUnexpectedEOF
 				break
 			}
 
 			pageOffset := int64(frame.pgno-1) * pageSz
-			if _, err := dbFile.WriteAt(pageData, pageOffset); err != nil {
+			n, err = dbFile.WriteAt(pageData, pageOffset)
+			if err != nil {
 				backfillErr = err
+				break
+			}
+			if n != len(pageData) {
+				backfillErr = io.ErrShortWrite
 				break
 			}
 		}
