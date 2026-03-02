@@ -480,7 +480,7 @@ func (q *collQuery) buildCBOIndexes() []qplanner.CBOIndex {
 		// Compute bounds for this index
 		bounds, chainLen := qplanner.ComputeIndexBounds(info, q.cond)
 		pointLookup := qplanner.AllBoundsFixed(bounds)
-		if !idx.info.Unique && len(bounds) > 0 {
+		if len(bounds) > 0 {
 			bounds = qplanner.AdjustBoundsForNonUnique(bounds)
 		}
 

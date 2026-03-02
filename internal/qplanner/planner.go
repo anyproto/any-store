@@ -626,7 +626,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	reverse := shouldReverse(params.Sorter, idx)
 
 	// Check for unique index point lookup (CoverIter shortcut)
-	if idx.Info.Unique && AllBoundsFixed(idx.Bounds) {
+	if idx.Info.Unique && idx.PointLookup {
 		var root Iterator = &CoverIter{
 			Source: &CursorSource{
 				Tx: params.Tx,

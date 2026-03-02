@@ -10,7 +10,7 @@ import (
 )
 
 // IndexIter iterates over an index namespace using bounds.
-// For non-unique indexes, key = indexFields + docId; for unique indexes, value = docId.
+// key = indexFields + docId for both unique and non-unique indexes.
 type IndexIter struct {
 	Source  *CursorSource
 	IdxInfo *IndexInfo
@@ -177,14 +177,7 @@ func (it *IndexIter) Close() {
 }
 
 func (it *IndexIter) extractResult(k []byte) (key []byte, docId []byte, err error) {
-	if it.IdxInfo.Unique {
-		val, verr := it.cursor.Value()
-		if verr != nil {
-			return nil, nil, verr
-		}
-		return k, val, nil
-	}
-	// Non-unique: key = indexFields + docId, extract docId
+	// Both unique and non-unique: key = indexFields + docId
 	docID := extractDocId(k, len(it.IdxInfo.FieldNames))
 	return k, docID, nil
 }

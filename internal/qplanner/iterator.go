@@ -43,6 +43,12 @@ func (cs *CursorSource) AppendValue(key, buf []byte) ([]byte, error) {
 	return cs.Tx.AppendValue(cs.Ns, key, buf)
 }
 
+// AppendSeekKey finds the first key >= prefix and appends it to buf.
+// Single-shot traversal without cursor allocation.
+func (cs *CursorSource) AppendSeekKey(prefix, buf []byte) ([]byte, error) {
+	return cs.Tx.AppendSeekKey(cs.Ns, prefix, buf)
+}
+
 // IndexInfo holds metadata about an index needed by the planner.
 type IndexInfo struct {
 	Name       string
