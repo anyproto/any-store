@@ -68,6 +68,8 @@ type index struct {
 	sketch         *qplanner.IndexSketch
 	sketchModified bool
 
+	cboInfo *qplanner.IndexInfo // cached CBO index info, built once during init
+
 	keyBuf      anyenc.Tuple
 	keysBuf     []anyenc.Tuple
 	keysBufPrev []anyenc.Tuple
@@ -106,6 +108,17 @@ func (idx *index) init() (err error) {
 		idx.reverse = append(idx.reverse, reverse)
 	}
 	idx.uniqBuf = make([][]anyenc.Tuple, len(idx.fieldPaths))
+
+	// Build cached CBO index info once (avoids per-query allocation)
+	idx.cboInfo = &qplanner.IndexInfo{
+		Name:       idx.info.Name,
+		FieldNames: idx.fieldNames,
+		FieldPaths: idx.fieldPaths,
+		Reverse:    idx.reverse,
+		Unique:     idx.info.Unique,
+		Sparse:     idx.info.Sparse,
+		Ns:         idx.ns,
+	}
 	return nil
 }
 

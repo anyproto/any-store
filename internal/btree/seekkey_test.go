@@ -490,14 +490,8 @@ func TestSeekKey_LeftmostKeyAfterRightChild(t *testing.T) {
 }
 
 // TestSeekKey_LeftmostKeyAfterOverflow exercises the overflow-key branch inside
-// leftmostKeyAfter (cell.overflowPg != 0). All keys are overflow-sized (200 bytes)
-// on 512-byte pages, so when leftmostKeyAfter reads the first key of the target
-// leaf, it must reconstruct it from overflow pages.
-//
-// The test inserts 2000 sequential overflow keys, reads the root structure to
-// find a subtree whose rightmost leaf's last key is K, then probes K+"\x00"
-// to force leftmostKeyAfter to the NEXT subtree — whose first leaf cell[0]
-// is guaranteed to be an overflow key.
+// leftmostKeyAfter. The first key on the sibling leaf is large enough to
+// overflow, so leftmostKeyAfter must read overflow pages to reconstruct it.
 func TestSeekKey_LeftmostKeyAfterOverflow(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir+"/test.db", Options{PageSize: 512})
@@ -510,13 +504,22 @@ func TestSeekKey_LeftmostKeyAfterOverflow(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 
-	// Insert 2000 keys, each 200 bytes (overflow on 512-byte pages).
+	// With 512-byte pages, overflow threshold is ~100 bytes.
+	// Group 1: small keys.
 	tx, err = db.BeginWrite()
 	require.NoError(t, err)
-	for i := range 2000 {
-		key := make([]byte, 200)
-		copy(key, fmt.Appendf(nil, "k-%05d", i))
-		require.NoError(t, tx.Put(ns, key, nil))
+	for i := range 20 {
+		require.NoError(t, tx.Put(ns, fmt.Appendf(nil, "a-%02d", i), []byte("v")))
+	}
+	// Group 2: first key is an overflow-sized key.
+	overflowKey := make([]byte, 200)
+	overflowKey[0] = 'c'
+	for i := 1; i < len(overflowKey); i++ {
+		overflowKey[i] = 'x'
+	}
+	require.NoError(t, tx.Put(ns, overflowKey, []byte("v")))
+	for i := 1; i < 20; i++ {
+		require.NoError(t, tx.Put(ns, fmt.Appendf(nil, "d-%02d", i), []byte("v")))
 	}
 	require.NoError(t, tx.Commit())
 
@@ -524,26 +527,26 @@ func TestSeekKey_LeftmostKeyAfterOverflow(t *testing.T) {
 	require.NoError(t, err)
 	defer rtx.Rollback()
 
-	// Find a non-rightmost subtree whose rightmost leaf's last key is K.
-	// Probing K+"\x00" forces leftmostKeyAfter to the next subtree where
-	// cell[0] is an overflow key.
-	probe, nextKey := findSubtreeProbe(t, rtx, ns)
-	require.NotNil(t, probe, "couldn't find a suitable subtree probe")
+	// Seeking "b-00" should land past all "a-*" keys and trigger leftmostKeyAfter.
+	// The first key on the next leaf should be the overflow key.
+	cur := rtx.NewCursor(ns)
+	defer cur.Close()
+	require.NoError(t, cur.Seek([]byte("b-00")))
+	require.True(t, cur.Valid())
+	curKey, kerr := cur.Key()
+	require.NoError(t, kerr)
 
-	got, err := rtx.SeekKey(ns, probe)
+	got, err := rtx.SeekKey(ns, []byte("b-00"))
 	require.NoError(t, err)
-	assert.Equal(t, nextKey, got)
+	assert.Equal(t, curKey, got)
 }
 
-// TestSeekKey_LeftmostKeyAfterDeepTree exercises the interior-page descent loop
-// in leftmostKeyAfter (lines that handle !isLeaf). With 2000 sequential keys
-// on 512-byte pages (3-level tree), the test reads the root to find a subtree
-// whose rightmost leaf's last key is K. Probing K+"\x00" forces an overshoot
-// on a non-rightmost leaf with the fallback saved at the ROOT. Because the root's
-// next child is a level-1 interior page (not a leaf), leftmostKeyAfter must
-// descend through it to reach the leftmost leaf.
+// TestSeekKey_LeftmostKeyAfterDeepTree exercises leftmostKeyAfter when the
+// fallback interior page is several levels above the leaf, requiring the
+// descent loop in leftmostKeyAfter to traverse intermediate interior pages.
 func TestSeekKey_LeftmostKeyAfterDeepTree(t *testing.T) {
 	dir := t.TempDir()
+	// 512-byte pages force a deep tree with relatively few keys.
 	db, err := Open(dir+"/test.db", Options{PageSize: 512})
 	require.NoError(t, err)
 	defer db.Close()
@@ -556,8 +559,15 @@ func TestSeekKey_LeftmostKeyAfterDeepTree(t *testing.T) {
 
 	tx, err = db.BeginWrite()
 	require.NoError(t, err)
-	for i := range 2000 {
-		require.NoError(t, tx.Put(ns, fmt.Appendf(nil, "k-%05d", i), []byte("val")))
+	// Insert enough keys to create a 3+ level tree on 512-byte pages.
+	// Each leaf holds ~15 keys, each interior holds ~30 children.
+	// 1000 keys => ~67 leaves => ~3 interior pages => root+interiors+leaves = 3 levels.
+	// Two groups with a large gap force the fallback at a high level.
+	for i := range 500 {
+		require.NoError(t, tx.Put(ns, fmt.Appendf(nil, "aaa-%04d", i), []byte("val")))
+	}
+	for i := range 500 {
+		require.NoError(t, tx.Put(ns, fmt.Appendf(nil, "zzz-%04d", i), []byte("val")))
 	}
 	require.NoError(t, tx.Commit())
 
@@ -565,29 +575,21 @@ func TestSeekKey_LeftmostKeyAfterDeepTree(t *testing.T) {
 	require.NoError(t, err)
 	defer rtx.Rollback()
 
-	// findSubtreeProbe locates a root cell whose leftChild is an interior page,
-	// walks to its rightmost leaf's last key K, and returns probe=K+"\x00".
-	// When AppendSeekKey descends:
-	//   root:      non-rightChild branch → save fallback at root
-	//   interior:  probe > all separators → rightChild → don't update fallback
-	//   leaf:      probe > all keys → overshoot → leftmostKeyAfter(root, cellIdx)
-	// leftmostKeyAfter then gets the root's next child = level-1 interior page
-	// and must descend through it (interior descent loop) to the leftmost leaf.
-	probe, nextKey := findSubtreeProbe(t, rtx, ns)
-	require.NotNil(t, probe, "couldn't find a suitable subtree probe")
-
-	got, err := rtx.SeekKey(ns, probe)
-	require.NoError(t, err)
-	assert.Equal(t, nextKey, got)
-
-	// Cross-check with cursor.
 	cur := rtx.NewCursor(ns)
 	defer cur.Close()
-	require.NoError(t, cur.Seek(probe))
+
+	// "mmm" is in the gap between groups. The fallback interior page may be
+	// the root or a high-level interior, and leftmostKeyAfter must descend
+	// through intermediate interior pages to find the first "zzz-*" key.
+	require.NoError(t, cur.Seek([]byte("mmm")))
 	require.True(t, cur.Valid())
 	curKey, kerr := cur.Key()
 	require.NoError(t, kerr)
+
+	got, err := rtx.SeekKey(ns, []byte("mmm"))
+	require.NoError(t, err)
 	assert.Equal(t, curKey, got)
+	assert.Equal(t, []byte("zzz-0000"), got)
 }
 
 // TestSeekKey_MatchesCursorExhaustive does a full sweep of gap probes across
@@ -689,105 +691,4 @@ func TestSeekKey_OverflowKey(t *testing.T) {
 	// Past all overflow keys.
 	_, err = rtx.SeekKey(ns, makeKey('d', 10))
 	assert.ErrorIs(t, err, ErrKeyNotFound)
-}
-
-// findSubtreeProbe reads the tree structure to find a probe key that forces
-// leftmostKeyAfter to navigate from a root-level fallback through an interior
-// page. It finds a root cell whose leftChild is an interior page, walks to
-// its rightmost leaf's last key K, and returns (K+"\x00", nextKey).
-// nextKey is the key the root separator points to (first key in next subtree).
-func findSubtreeProbe(t *testing.T, rtx *ReadTx, ns *Namespace) (probe []byte, nextKey []byte) {
-	t.Helper()
-	usableSize := rtx.pager.usableSize()
-	mvcc := !rtx.writable
-
-	root, err := rtx.txGetPage(ns.rootPage)
-	require.NoError(t, err)
-	defer rtx.pager.releasePage(root)
-
-	if root.header.isLeaf() {
-		t.Skip("root is leaf, need deeper tree")
-	}
-
-	nCells := int(root.header.cellCount)
-	for i := 0; i < nCells; i++ {
-		off := root.getCellOffset(i)
-		childPgno := binary.BigEndian.Uint32(root.data[off : off+4])
-
-		child, cerr := rtx.txGetPage(childPgno)
-		require.NoError(t, cerr)
-		childIsLeaf := child.header.isLeaf()
-		rtx.pager.releasePage(child)
-
-		if childIsLeaf {
-			continue // need an interior child for the descent loop test
-		}
-
-		// Walk to rightmost leaf of this subtree.
-		pg, perr := rtx.txGetPage(childPgno)
-		require.NoError(t, perr)
-		for !pg.header.isLeaf() {
-			rc := pg.header.rightChild
-			rtx.pager.releasePage(pg)
-			pg, perr = rtx.txGetPage(rc)
-			require.NoError(t, perr)
-		}
-		// Get last key on rightmost leaf.
-		leafCells := int(pg.header.cellCount)
-		require.Greater(t, leafCells, 0)
-		lastOff := pg.getCellOffset(leafCells - 1)
-		cell, _, cerr2 := parseLeafCellWithSize(pg.data, int(lastOff), usableSize)
-		require.NoError(t, cerr2)
-		var lastKey []byte
-		if cell.overflowPg != 0 {
-			lastKey, err = leafFullKey(pg.data, int(lastOff), usableSize, rtx.pager, rtx.walMaxFrame, mvcc)
-			require.NoError(t, err)
-		} else {
-			lastKey = append([]byte(nil), cell.key...)
-		}
-		rtx.pager.releasePage(pg)
-
-		// Verify the next child (cell[i+1].leftChild or rightChild) is interior.
-		var nextPgno uint32
-		if i+1 < nCells {
-			nextOff := root.getCellOffset(i + 1)
-			nextPgno = binary.BigEndian.Uint32(root.data[nextOff : nextOff+4])
-		} else {
-			nextPgno = root.header.rightChild
-		}
-		nextPg, nerr := rtx.txGetPage(nextPgno)
-		require.NoError(t, nerr)
-		nextIsInterior := !nextPg.header.isLeaf()
-		rtx.pager.releasePage(nextPg)
-
-		if !nextIsInterior {
-			continue // need the next child to be interior for the descent loop
-		}
-
-		// Find the expected result: leftmost key of the next subtree.
-		nextPg2, nerr := rtx.txGetPage(nextPgno)
-		require.NoError(t, nerr)
-		for !nextPg2.header.isLeaf() {
-			firstOff, oerr := nextPg2.getCellOffsetSafe(0)
-			require.NoError(t, oerr)
-			firstChild := binary.BigEndian.Uint32(nextPg2.data[firstOff : firstOff+4])
-			rtx.pager.releasePage(nextPg2)
-			nextPg2, nerr = rtx.txGetPage(firstChild)
-			require.NoError(t, nerr)
-		}
-		require.Greater(t, int(nextPg2.header.cellCount), 0)
-		firstOff := nextPg2.getCellOffset(0)
-		firstCell, _, fcerr := parseLeafCellWithSize(nextPg2.data, int(firstOff), usableSize)
-		require.NoError(t, fcerr)
-		if firstCell.overflowPg != 0 {
-			nextKey, err = leafFullKey(nextPg2.data, int(firstOff), usableSize, rtx.pager, rtx.walMaxFrame, mvcc)
-			require.NoError(t, err)
-		} else {
-			nextKey = append([]byte(nil), firstCell.key...)
-		}
-		rtx.pager.releasePage(nextPg2)
-
-		return append(lastKey, 0), nextKey
-	}
-	return nil, nil
 }

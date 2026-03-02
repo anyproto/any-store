@@ -187,23 +187,32 @@ func (e *Comp) String() string {
 }
 
 type Key struct {
-	Path []string
+	Path     []string
+	FullPath string // pre-joined path for fast comparison (avoids strings.Join per call)
 	Filter
 }
 
 func (e Key) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
+	if e.Path == nil {
+		// Single-segment key: use FullPath directly to avoid variadic slice allocation
+		return e.Filter.Ok(v.Get(e.FullPath), buf)
+	}
 	return e.Filter.Ok(v.Get(e.Path...), buf)
 }
 
 func (e Key) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
-	if strings.Join(e.Path, ".") == fieldName {
+	name := e.FullPath
+	if name == "" {
+		name = strings.Join(e.Path, ".")
+	}
+	if name == fieldName {
 		return e.Filter.IndexBounds(fieldName, bs)
 	}
 	return bs
 }
 
 func (e Key) String() string {
-	return fmt.Sprintf(`{"%s": %s}`, strings.Join(e.Path, "."), e.Filter.String())
+	return fmt.Sprintf(`{"%s": %s}`, e.FullPath, e.Filter.String())
 }
 
 type And []Filter

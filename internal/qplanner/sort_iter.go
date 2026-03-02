@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"slices"
 
-	"github.com/anyproto/any-store/internal/btree"
 	"github.com/anyproto/any-store/query"
 	"github.com/anyproto/any-store/syncpool"
 )
@@ -20,8 +19,7 @@ type SortIter struct {
 	Plan            *Plan
 	PartiallySorted bool // leading index fields match sort order; pdqsort benefits automatically
 
-	dataCursor *btree.Cursor
-	arena      []byte
+	arena []byte
 	entries    []sortEntry
 	idx        int
 	inited     bool
@@ -92,17 +90,12 @@ func (it *SortIter) collectAndSort() error {
 		// Prefer already-parsed doc from upstream (FullScanIter/FetchIter/FilterIter)
 		doc := it.Plan.DocParsed
 		if doc == nil {
-			if it.dataCursor == nil {
-				it.dataCursor = it.Data.NewCursor()
-			}
-			if serr := it.dataCursor.SeekExact(docId); serr != nil {
+			// Cursor-free point lookup: avoids Cursor allocation
+			var verr error
+			it.Buf.DocBuf, verr = it.Data.AppendValue(docId, it.Buf.DocBuf[:0])
+			if verr != nil {
 				continue
 			}
-			val, verr := it.dataCursor.Value()
-			if verr != nil {
-				return verr
-			}
-			it.Buf.DocBuf = append(it.Buf.DocBuf[:0], val...)
 			var perr error
 			doc, perr = it.Buf.Parser.Parse(it.Buf.DocBuf)
 			if perr != nil {
@@ -131,9 +124,6 @@ func (it *SortIter) collectAndSort() error {
 
 // Close releases resources by closing the source iterator.
 func (it *SortIter) Close() {
-	if it.dataCursor != nil {
-		it.dataCursor.Close()
-	}
 	if it.Source != nil {
 		it.Source.Close()
 	}

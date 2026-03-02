@@ -21,6 +21,12 @@ type Iterator interface {
 	fmt.Stringer
 }
 
+// CountableIterator is an optional interface for iterators that support
+// efficient batch counting without extracting individual keys.
+type CountableIterator interface {
+	CountEntries() (int, error)
+}
+
 // CursorSource provides cursors and direct lookups for a btree namespace.
 type CursorSource struct {
 	Tx *btree.ReadTx
