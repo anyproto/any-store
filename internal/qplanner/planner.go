@@ -202,13 +202,13 @@ type CBOIndex struct {
 	Bounds  query.Bounds
 	Reverse []bool // per-field reverse flags
 
-	// PointLookup is true when ALL original bounds are equality (Start == End),
-	// before AdjustBoundsForNonUnique modifies End. This allows correct sketch estimation.
-	PointLookup bool
-
 	// BoundFields is the number of index fields covered by the bound chain.
 	// Sketch estimates are only valid when BoundFields == len(Info.FieldNames).
 	BoundFields int
+
+	// PointLookup is true when ALL original bounds are equality (Start == End),
+	// before AdjustBoundsForNonUnique modifies End. This allows correct sketch estimation.
+	PointLookup bool
 
 	// Sort coverage analysis
 	ExactSort   bool
@@ -262,7 +262,6 @@ func BuildPlan(params *PlanParams) *Plan {
 	bestPlanName := "FullScan"
 	bestCost := fullScanCost
 	var bestIndex *CBOIndex
-
 
 	// Build hint lookup (skip allocation when no hints)
 	var hintBoosts map[string]int
@@ -1071,8 +1070,10 @@ func isAllFilter(f query.Filter) bool {
 // BoundsResult stores IndexBounds results for all unique fields, computed once per query.
 // All bounds live in one slice; FieldBounds entries point into it by index.
 type BoundsResult struct {
-	Bounds []query.Bound // flat slice of all bounds across all fields
-	Fields []FieldBounds // per-field metadata pointing into Bounds
+	Bounds    []query.Bound // flat slice of all bounds across all fields
+	Fields    []FieldBounds // per-field metadata pointing into Bounds
+	boundsBuf [8]query.Bound
+	fieldsBuf [8]FieldBounds
 }
 
 // FieldBounds holds pre-computed bounds for a single filter field.
@@ -1085,8 +1086,8 @@ type FieldBounds struct {
 
 // Build computes bounds for all unique fields across the given indexes.
 func (br *BoundsResult) Build(indexInfos []*IndexInfo, filter query.Filter) {
-	br.Bounds = br.Bounds[:0]
-	br.Fields = br.Fields[:0]
+	br.Bounds = br.boundsBuf[:0]
+	br.Fields = br.fieldsBuf[:0]
 	for _, info := range indexInfos {
 		for _, field := range info.FieldNames {
 			// Check if already computed
@@ -1184,8 +1185,13 @@ func ComputeIndexBounds(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
 		return chain[0].bounds, chainLen
 	}
 
-	// Compound index: build combined tuple bounds
-	var result query.Bounds
+	// Compound index: build combined tuple bounds using arena to avoid per-tuple heap allocs.
+	// Each sub-slice reserves 1 extra cap byte so AdjustBoundsForNonUnique can append 0xff in-place.
+	var arenaBuf [256]byte
+	arena := arenaBuf[:0]
+
+	var resultBuf [4]query.Bound
+	result := query.Bounds(resultBuf[:0])
 	for _, b := range chain[0].bounds {
 		result = append(result, b)
 	}
@@ -1194,7 +1200,8 @@ func ComputeIndexBounds(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
 		if !chain[i-1].fixed {
 			break
 		}
-		var extended query.Bounds
+		var extBuf [4]query.Bound
+		extended := query.Bounds(extBuf[:0])
 		for _, prev := range result {
 			for _, cur := range chain[i].bounds {
 				eb := query.Bound{
@@ -1202,15 +1209,34 @@ func ComputeIndexBounds(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
 					EndInclude:   cur.EndInclude,
 				}
 				if len(cur.Start) > 0 {
-					eb.Start = append(append(anyenc.Tuple(nil), prev.Start...), cur.Start...)
+					off := len(arena)
+					arena = append(arena, prev.Start...)
+					arena = append(arena, cur.Start...)
+					n := len(arena) - off
+					arena = append(arena, 0)
+					eb.Start = anyenc.Tuple(arena[off : off+n : off+n+1])
 				} else {
-					eb.Start = append(anyenc.Tuple(nil), prev.Start...)
+					off := len(arena)
+					arena = append(arena, prev.Start...)
+					n := len(arena) - off
+					arena = append(arena, 0)
+					eb.Start = anyenc.Tuple(arena[off : off+n : off+n+1])
 					eb.StartInclude = true
 				}
 				if len(cur.End) > 0 {
-					eb.End = append(append(anyenc.Tuple(nil), prev.End...), cur.End...)
+					off := len(arena)
+					arena = append(arena, prev.End...)
+					arena = append(arena, cur.End...)
+					n := len(arena) - off
+					arena = append(arena, 0)
+					eb.End = anyenc.Tuple(arena[off : off+n : off+n+1])
 				} else {
-					eb.End = append(append(anyenc.Tuple(nil), prev.End...), 0xff)
+					off := len(arena)
+					arena = append(arena, prev.End...)
+					arena = append(arena, 0xff)
+					n := len(arena) - off
+					arena = append(arena, 0)
+					eb.End = anyenc.Tuple(arena[off : off+n : off+n+1])
 					eb.EndInclude = true
 				}
 				extended = append(extended, eb)
@@ -1284,4 +1310,3 @@ func IndexSortMatch(idx *IndexInfo, sortFields []query.SortField, equalityPrefix
 	}
 	return false, true
 }
-

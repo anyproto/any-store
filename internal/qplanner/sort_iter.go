@@ -12,17 +12,16 @@ import (
 // SortIter collects all results from the source iterator, fetches documents,
 // computes sort keys, sorts in memory, then yields results in sorted order.
 type SortIter struct {
-	Source          Iterator
-	Data            *CursorSource
-	Sorter          query.Sort
-	Buf             *syncpool.DocBuffer
-	Plan            *Plan
+	Source  Iterator
+	Data    *CursorSource
+	Sorter  query.Sort
+	Buf     *syncpool.DocBuffer
+	Plan    *Plan
+	arena   []byte
+	entries []sortEntry
+	idx     int
 	PartiallySorted bool // leading index fields match sort order; pdqsort benefits automatically
-
-	arena []byte
-	entries    []sortEntry
-	idx        int
-	inited     bool
+	inited          bool
 }
 
 type sortEntry struct {

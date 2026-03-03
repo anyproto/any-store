@@ -12,13 +12,12 @@ import (
 // IndexIter iterates over an index namespace using bounds.
 // key = indexFields + docId for both unique and non-unique indexes.
 type IndexIter struct {
-	Source  *CursorSource
-	IdxInfo *IndexInfo
-	Bounds  query.Bounds
-	Reverse bool
-
+	Source   *CursorSource
+	IdxInfo  *IndexInfo
 	cursor   *btree.Cursor
+	Bounds   query.Bounds
 	boundIdx int
+	Reverse  bool
 	started  bool
 }
 
