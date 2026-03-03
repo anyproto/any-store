@@ -477,6 +477,179 @@ func TestIn(t *testing.T) {
 
 }
 
+func TestIn_IndexBounds(t *testing.T) {
+	t.Run("point lookups", func(t *testing.T) {
+		in := NewInValue(
+			anyenc.MustParseJson(`1`),
+			anyenc.MustParseJson(`2`),
+			anyenc.MustParseJson(`3`),
+		)
+		bs := in.IndexBounds("a", nil)
+		require.Len(t, bs, 3)
+		// bounds should be sorted
+		for i := 1; i < len(bs); i++ {
+			assert.True(t, bs.Less(i-1, i), "bounds should be sorted")
+		}
+		// each bound is a point lookup
+		for _, b := range bs {
+			assert.True(t, b.StartInclude)
+			assert.True(t, b.EndInclude)
+			assert.Equal(t, b.Start, b.End)
+		}
+	})
+	t.Run("over limit returns input", func(t *testing.T) {
+		values := make(map[string]struct{}, orExpressionLimit+1)
+		for i := 0; i < orExpressionLimit+1; i++ {
+			values[string(anyenc.AppendAnyValue(nil, i))] = struct{}{}
+		}
+		in := In{Values: values}
+		input := Bounds{{Start: []byte{1}, End: []byte{2}, StartInclude: true, EndInclude: true}}
+		bs := in.IndexBounds("a", input)
+		assert.Equal(t, input, bs)
+	})
+	t.Run("duplicates are merged", func(t *testing.T) {
+		in := NewInValue(
+			anyenc.MustParseJson(`1`),
+			anyenc.MustParseJson(`1`),
+			anyenc.MustParseJson(`2`),
+		)
+		bs := in.IndexBounds("a", nil)
+		assert.Len(t, bs, 2)
+	})
+	t.Run("appends to existing bounds", func(t *testing.T) {
+		in := NewInValue(
+			anyenc.MustParseJson(`5`),
+		)
+		existing := Bounds{{
+			Start: anyenc.AppendAnyValue(nil, 1), End: anyenc.AppendAnyValue(nil, 1),
+			StartInclude: true, EndInclude: true,
+		}}
+		bs := in.IndexBounds("a", existing)
+		assert.Len(t, bs, 2)
+	})
+}
+
+func TestKey_IndexBounds(t *testing.T) {
+	t.Run("field match delegates to inner", func(t *testing.T) {
+		k := Key{
+			Path:   []string{"a"},
+			Filter: NewComp(CompOpEq, 1),
+		}
+		bs := k.IndexBounds("a", nil)
+		require.Len(t, bs, 1)
+		assert.Equal(t, anyenc.Tuple(anyenc.AppendAnyValue(nil, 1)), bs[0].Start)
+	})
+	t.Run("field mismatch returns input", func(t *testing.T) {
+		k := Key{
+			Path:   []string{"a"},
+			Filter: NewComp(CompOpEq, 1),
+		}
+		bs := k.IndexBounds("b", nil)
+		assert.Nil(t, bs)
+	})
+}
+
+func TestAll_IndexBounds(t *testing.T) {
+	a := All{}
+	input := Bounds{{Start: []byte{1}, End: []byte{2}}}
+	bs := a.IndexBounds("a", input)
+	assert.Equal(t, input, bs)
+
+	bs = a.IndexBounds("a", nil)
+	assert.Nil(t, bs)
+}
+
+func TestExists_IndexBounds(t *testing.T) {
+	e := Exists{}
+	input := Bounds{{Start: []byte{1}, End: []byte{2}}}
+	bs := e.IndexBounds("a", input)
+	assert.Equal(t, input, bs)
+
+	bs = e.IndexBounds("a", nil)
+	assert.Nil(t, bs)
+}
+
+func TestCompNe_IndexBounds(t *testing.T) {
+	cmp := NewComp(CompOpNe, 5)
+	bs := cmp.IndexBounds("a", nil)
+	require.Len(t, bs, 2)
+	val5 := anyenc.Tuple(anyenc.AppendAnyValue(nil, 5))
+	// first bound: (-inf, 5)
+	assert.Nil(t, bs[0].Start)
+	assert.Equal(t, val5, bs[0].End)
+	assert.False(t, bs[0].EndInclude)
+	// second bound: (5, inf)
+	assert.Equal(t, val5, bs[1].Start)
+	assert.Nil(t, bs[1].End)
+	assert.False(t, bs[1].StartInclude)
+}
+
+func TestOr_IndexBounds_NonOverlapping(t *testing.T) {
+	// Non-overlapping ranges from different branches stay separate
+	f, err := ParseCondition(`{"$or":[{"a":{"$lte":5}},{"a":{"$gte":10}}]}`)
+	require.NoError(t, err)
+	bs := f.IndexBounds("a", nil)
+	require.Len(t, bs, 2)
+	// first: (-inf, 5]
+	assert.Nil(t, bs[0].Start)
+	assert.Equal(t, anyenc.Tuple(anyenc.AppendAnyValue(nil, 5)), bs[0].End)
+	assert.True(t, bs[0].EndInclude)
+	// second: [10, inf)
+	assert.Equal(t, anyenc.Tuple(anyenc.AppendAnyValue(nil, 10)), bs[1].Start)
+	assert.True(t, bs[1].StartInclude)
+	assert.Nil(t, bs[1].End)
+}
+
+func BenchmarkIndexBounds(b *testing.B) {
+	b.Run("Comp/Eq", func(b *testing.B) {
+		cmp := NewComp(CompOpEq, 42)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			cmp.IndexBounds("a", nil)
+		}
+	})
+	b.Run("In/10", func(b *testing.B) {
+		benchInIndexBounds(b, 10)
+	})
+	b.Run("In/100", func(b *testing.B) {
+		benchInIndexBounds(b, 100)
+	})
+	b.Run("In/500", func(b *testing.B) {
+		benchInIndexBounds(b, 500)
+	})
+	b.Run("And/2fields", func(b *testing.B) {
+		f, _ := ParseCondition(`{"a":1, "b":2}`)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			f.IndexBounds("a", nil)
+		}
+	})
+	b.Run("Or/3branches", func(b *testing.B) {
+		f, _ := ParseCondition(`{"$or":[{"a":1},{"a":2},{"a":3}]}`)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			f.IndexBounds("a", nil)
+		}
+	})
+}
+
+func benchInIndexBounds(b *testing.B, n int) {
+	values := make([]*anyenc.Value, n)
+	a := &anyenc.Arena{}
+	for i := range values {
+		values[i] = a.NewNumberInt(i)
+	}
+	in := NewInValue(values...)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		in.IndexBounds("a", nil)
+	}
+}
+
 func BenchmarkFilter_Ok(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"a":2,"b":[3,2,1],"c":"test"}`)
 	docBuf := &syncpool.DocBuffer{}

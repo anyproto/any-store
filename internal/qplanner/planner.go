@@ -119,10 +119,10 @@ func (p *Plan) ExplainString() string {
 }
 
 // formatFullScanDetails returns a cost formula string for a full scan plan.
-func formatFullScanDetails(totalDocs, estimatedYield float64, needSort bool) string {
+func formatFullScanDetails(totalDocs, estimatedYield float64, needSort, idBoundsSeek bool) string {
 	perDocCost := CostDocFetch
 	label := "fetch"
-	if totalDocs > 500 {
+	if totalDocs > 500 && !idBoundsSeek {
 		perDocCost = CostSeqRead
 		label = "seq"
 	}
@@ -139,13 +139,13 @@ func formatFullScanDetails(totalDocs, estimatedYield float64, needSort bool) str
 }
 
 // formatSeekDetails returns a cost formula string for an index seek plan.
-func formatSeekDetails(estRows, fetchCost, seekSortCost float64) string {
-	s := fmt.Sprintf("seek(%.1f) + %.0f×fetch(%.1f) + %.0f×filter(%.1f)",
-		CostIndexSeek, estRows, fetchCost, estRows, CostFilter)
+func formatSeekDetails(nSeeks, estRows, fetchCost, seekSortCost float64) string {
+	s := fmt.Sprintf("%.0f×seek(%.1f) + %.0f×fetch(%.1f) + %.0f×filter(%.1f)",
+		nSeeks, CostIndexSeek, estRows, fetchCost, estRows, CostFilter)
 	if seekSortCost > 0 {
 		s += fmt.Sprintf(" + sort=%.1f", seekSortCost)
 	}
-	total := (1 * CostIndexSeek) + (estRows * fetchCost) + (estRows * CostFilter) + seekSortCost
+	total := (nSeeks * CostIndexSeek) + (estRows * fetchCost) + (estRows * CostFilter) + seekSortCost
 	s += fmt.Sprintf(" = %.1f", total)
 	return s
 }
@@ -183,10 +183,10 @@ type PlanParams struct {
 	// FilterIter are skipped (covering index count optimization).
 	CountOnly bool
 
-	// FBCache is an optional pre-computed field bounds cache.
+	// FieldBounds is an optional pre-computed bounds result.
 	// When set, calculateSelectivity uses cached bounds instead of calling
 	// filter.IndexBounds repeatedly (avoids ~N redundant filter tree traversals).
-	FBCache *FieldBoundsCache
+	FieldBounds *BoundsResult
 }
 
 // IndexHintParam mirrors the public IndexHint type.
@@ -226,7 +226,7 @@ func BuildPlan(params *PlanParams) *Plan {
 	}
 
 	// Calculate combined selectivity for all filter predicates
-	pTotal := calculateSelectivity(params.Filter, params.Indexes, totalDocs, params.FBCache)
+	pTotal := calculateSelectivity(params.Filter, params.Indexes, totalDocs, params.FieldBounds)
 
 	estimatedYield := totalDocs * pTotal
 
@@ -240,20 +240,22 @@ func BuildPlan(params *PlanParams) *Plan {
 	// ---- Plan A: Full Collection Scan ----
 	// When idBounds are present with point lookups, FullScan only reads those specific docs.
 	fullScanDocs := totalDocs
+	idBoundsSeek := false
 	if len(params.IDBounds) > 0 && AllBoundsFixed(params.IDBounds) {
 		fullScanDocs = float64(len(params.IDBounds))
+		idBoundsSeek = true
 		if fullScanDocs < estimatedYield {
 			estimatedYield = fullScanDocs
 		}
 	}
-	fullScanCost := computeFullScanCost(fullScanDocs, estimatedYield, needSort)
+	fullScanCost := computeFullScanCost(fullScanDocs, estimatedYield, needSort, idBoundsSeek)
 
 	if collectExplain {
 		candidates = append(candidates, CandidatePlan{
 			Name:    "FullScan",
 			Cost:    fullScanCost,
 			EstRows: fullScanDocs,
-			details: func() string { return formatFullScanDetails(fullScanDocs, estimatedYield, needSort) },
+			details: func() string { return formatFullScanDetails(fullScanDocs, estimatedYield, needSort, idBoundsSeek) },
 		})
 	}
 
@@ -317,17 +319,21 @@ func BuildPlan(params *PlanParams) *Plan {
 			filteredYield = e
 		}
 
-		// Index seek cost: B-tree seek + fetch only matching docs + evaluate filter
+		// Index seek cost: B-tree seeks (one per bound) + fetch only matching docs + evaluate filter
 		// The key advantage is that e << totalDocs for selective queries
 		fetchCost := indexFetchCost(totalDocs)
-		seekCost := (1 * CostIndexSeek) + (e * fetchCost) + (e * CostFilter)
+		nSeeks := float64(len(idx.Bounds))
+		if nSeeks < 1 {
+			nSeeks = 1
+		}
+		seekCost := (nSeeks * CostIndexSeek) + (e * fetchCost) + (e * CostFilter)
 
 		// Covering count: when only counting and this index covers the filter with
 		// equality bounds, no document fetch or filter evaluation is needed.
 		// Cost is just the index traversal (sequential reads through the index).
 		isCovering := params.CountOnly && idx.PointLookup && indexCoversFilter(idx, params.Filter)
 		if isCovering {
-			seekCost = (1 * CostIndexSeek) + (e * CostSeqRead)
+			seekCost = (nSeeks * CostIndexSeek) + (e * CostSeqRead)
 		}
 
 		seekSortCost := 0.0
@@ -343,12 +349,12 @@ func BuildPlan(params *PlanParams) *Plan {
 		}
 
 		if collectExplain {
-			seekE, seekFetchCost, seekSC := e, fetchCost, seekSortCost
+			seekNS, seekE, seekFetchCost, seekSC := nSeeks, e, fetchCost, seekSortCost
 			candidates = append(candidates, CandidatePlan{
 				Name:    "IndexSeek(" + idx.Info.Name + ")",
 				Cost:    seekCost,
 				EstRows: e,
-				details: func() string { return formatSeekDetails(seekE, seekFetchCost, seekSC) },
+				details: func() string { return formatSeekDetails(seekNS, seekE, seekFetchCost, seekSC) },
 			})
 		}
 
@@ -479,9 +485,11 @@ func BuildPlan(params *PlanParams) *Plan {
 // than random B-tree point lookups, so we use CostSeqRead instead of CostDocFetch.
 // For small collections, B-tree depth is shallow and both access patterns
 // have similar cost, so we use CostDocFetch (preserving original behavior).
-func computeFullScanCost(totalDocs, estimatedYield float64, needSort bool) float64 {
+// When idBoundsSeek is true, the scan does random point lookups (not sequential),
+// so CostDocFetch is used regardless of collection size.
+func computeFullScanCost(totalDocs, estimatedYield float64, needSort, idBoundsSeek bool) float64 {
 	perDocCost := CostDocFetch
-	if totalDocs > 500 {
+	if totalDocs > 500 && !idBoundsSeek {
 		perDocCost = CostSeqRead
 	}
 	cost := (totalDocs * perDocCost) + (totalDocs * CostFilter)
@@ -510,7 +518,7 @@ func sortCost(n float64) float64 {
 }
 
 // calculateSelectivity computes the combined selectivity for all filter predicates.
-func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs float64, fbCache *FieldBoundsCache) float64 {
+func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs float64, br *BoundsResult) float64 {
 	if filter == nil || isAllFilter(filter) {
 		return 1.0
 	}
@@ -537,9 +545,9 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 			}
 			var bounds query.Bounds
 			var isEquality bool
-			if fbCache != nil {
+			if br != nil {
 				var fixed, found bool
-				bounds, fixed, found = fbCache.Lookup(fieldName)
+				bounds, fixed, found = br.Lookup(fieldName)
 				if !found || len(bounds) == 0 {
 					continue
 				}
@@ -794,7 +802,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	// Index verification for count queries: instead of fetching documents to
 	// check uncovered filter fields, verify each docId against single-field
 	// indexes for those fields. This avoids expensive document fetches.
-	if params.CountOnly && idx.PointLookup && params.FBCache != nil {
+	if params.CountOnly && idx.PointLookup && params.FieldBounds != nil {
 		if verifyRoot := buildVerifyChain(params, idx, root); verifyRoot != nil {
 			return verifyRoot
 		}
@@ -954,14 +962,7 @@ func indexCoversFilter(idx *CBOIndex, filter query.Filter) bool {
 func filterFieldsCoveredBy(f query.Filter, idxFields []string, hasFields *bool) bool {
 	switch ft := f.(type) {
 	case query.Key:
-		var name string
-		if ft.FullPath != "" {
-			name = ft.FullPath
-		} else if len(ft.Path) == 1 {
-			name = ft.Path[0]
-		} else {
-			name = strings.Join(ft.Path, ".")
-		}
+		name := strings.Join(ft.Path, ".")
 		for _, idxF := range idxFields {
 			if idxF == name {
 				*hasFields = true
@@ -987,7 +988,7 @@ func filterFieldsCoveredBy(f query.Filter, idxFields []string, hasFields *bool) 
 func collectUncoveredFilterFields(f query.Filter, coveredFields []string) []string {
 	switch ft := f.(type) {
 	case query.Key:
-		name := ft.FullPath
+		name := strings.Join(ft.Path, ".")
 		for _, cf := range coveredFields {
 			if cf == name {
 				return []string{} // covered
@@ -1032,7 +1033,7 @@ func buildVerifyChain(params *PlanParams, idx *CBOIndex, root Iterator) Iterator
 
 	current := root
 	for _, field := range uncovered {
-		bounds, fixed, found := params.FBCache.Lookup(field)
+		bounds, fixed, found := params.FieldBounds.Lookup(field)
 		if !found || !fixed || len(bounds) != 1 {
 			return nil
 		}
@@ -1067,136 +1068,107 @@ func isAllFilter(f query.Filter) bool {
 	return ok
 }
 
-// FieldBoundsCache pre-computes IndexBounds for all unique field names,
-// avoiding repeated filter tree traversals. Use with ComputeIndexBoundsFromCache.
-type FieldBoundsCache struct {
-	entries   [8]fieldBoundsEntry // inline storage for typical queries (≤8 fields)
-	n         int
-	arenaBuf  [128]byte    // inline arena for compound tuple construction
-	arena     []byte       // current arena slice (grows from arenaBuf)
-	boundsBuf    [4]query.Bound // inline buffer for per-field bounds (avoids Bounds.Append allocs)
-	boundsN      int            // number of bounds used in boundsBuf
-	compBoundBuf [2]query.Bound // inline buffer for compound index combined bounds
-	compBoundN   int            // number of compound bounds used
+// BoundsResult stores IndexBounds results for all unique fields, computed once per query.
+// All bounds live in one slice; FieldBounds entries point into it by index.
+type BoundsResult struct {
+	Bounds []query.Bound // flat slice of all bounds across all fields
+	Fields []FieldBounds // per-field metadata pointing into Bounds
 }
 
-type fieldBoundsEntry struct {
-	field  string
-	bounds query.Bounds
-	fixed  bool // all bounds are equality (Start == End)
+// FieldBounds holds pre-computed bounds for a single filter field.
+type FieldBounds struct {
+	Field string
+	Start int  // start index into BoundsResult.Bounds
+	Count int  // number of bounds for this field
+	Fixed bool // all bounds are equality (Start == End)
 }
 
-// allocTuple allocates a tuple from the arena, returning a sub-slice with 1 byte
-// of extra capacity. The extra byte allows AdjustBoundsForNonUnique to append
-// 0xff without triggering a heap allocation.
-func (c *FieldBoundsCache) allocTuple(parts ...[]byte) anyenc.Tuple {
-	total := 0
-	for _, p := range parts {
-		total += len(p)
-	}
-	if c.arena == nil {
-		c.arena = c.arenaBuf[:0]
-	}
-	off := len(c.arena)
-	for _, p := range parts {
-		c.arena = append(c.arena, p...)
-	}
-	// Reserve 1 extra byte so AdjustBoundsForNonUnique can append 0xff in-place
-	c.arena = append(c.arena, 0)
-	return c.arena[off : off+total : off+total+1]
-}
-
-// Build populates the cache by calling filter.IndexBounds once per unique field
-// across all index infos.
-func (c *FieldBoundsCache) Build(indexInfos []*IndexInfo, filter query.Filter) {
-	c.n = 0
-	c.arena = nil
-	c.boundsN = 0
-	c.compBoundN = 0
+// Build computes bounds for all unique fields across the given indexes.
+func (br *BoundsResult) Build(indexInfos []*IndexInfo, filter query.Filter) {
+	br.Bounds = br.Bounds[:0]
+	br.Fields = br.Fields[:0]
 	for _, info := range indexInfos {
 		for _, field := range info.FieldNames {
-			// Check if already cached
+			// Check if already computed
 			found := false
-			for j := 0; j < c.n; j++ {
-				if c.entries[j].field == field {
+			for j := range br.Fields {
+				if br.Fields[j].Field == field {
 					found = true
 					break
 				}
 			}
-			if found || c.n >= len(c.entries) {
+			if found {
 				continue
 			}
-			// Use inline boundsBuf to avoid allocation in Bounds.Append.
-			// Pass a pre-allocated slice with capacity so append reuses it.
-			var fb query.Bounds
-			if c.boundsN < len(c.boundsBuf) {
-				fb = filter.IndexBounds(field, c.boundsBuf[c.boundsN:c.boundsN:c.boundsN+1])
-				if len(fb) > 0 {
-					c.boundsN += len(fb)
-				}
-			} else {
-				fb = filter.IndexBounds(field, nil)
-			}
+			start := len(br.Bounds)
+			bs := filter.IndexBounds(field, nil)
+			br.Bounds = append(br.Bounds, bs...)
+			count := len(bs)
 			allFixed := true
-			for _, b := range fb {
+			for _, b := range br.Bounds[start:] {
 				if len(b.Start) == 0 || !bytes.Equal(b.Start, b.End) {
 					allFixed = false
 					break
 				}
 			}
-			c.entries[c.n] = fieldBoundsEntry{field: field, bounds: fb, fixed: allFixed}
-			c.n++
+			br.Fields = append(br.Fields, FieldBounds{
+				Field: field,
+				Start: start,
+				Count: count,
+				Fixed: allFixed,
+			})
 		}
 	}
 }
 
-// Lookup returns the cached bounds for a field name, or nil if not found.
-func (c *FieldBoundsCache) Lookup(field string) (query.Bounds, bool, bool) {
-	for i := 0; i < c.n; i++ {
-		if c.entries[i].field == field {
-			return c.entries[i].bounds, c.entries[i].fixed, true
+// Lookup returns the bounds for a field name.
+func (br *BoundsResult) Lookup(field string) (bounds query.Bounds, fixed bool, found bool) {
+	for i := range br.Fields {
+		if br.Fields[i].Field == field {
+			s := br.Fields[i].Start
+			return br.Bounds[s : s+br.Fields[i].Count], br.Fields[i].Fixed, true
 		}
 	}
 	return nil, false, false
 }
 
-// FieldCount returns the number of unique filter fields in the cache.
-func (c *FieldBoundsCache) FieldCount() int {
-	return c.n
+// FieldCount returns the number of unique filter fields.
+func (br *BoundsResult) FieldCount() int {
+	return len(br.Fields)
 }
 
-// AllFixed returns true if all cached fields have equality (fixed point) bounds.
-func (c *FieldBoundsCache) AllFixed() bool {
-	for i := 0; i < c.n; i++ {
-		if !c.entries[i].fixed {
+// AllFixed returns true if all fields have equality (fixed point) bounds.
+func (br *BoundsResult) AllFixed() bool {
+	if len(br.Fields) == 0 {
+		return false
+	}
+	for i := range br.Fields {
+		if !br.Fields[i].Fixed {
 			return false
 		}
 	}
-	return c.n > 0
+	return true
 }
 
-// ComputeIndexBounds computes combined tuple bounds for an index (exported for use from query.go).
-func ComputeIndexBounds(idx *IndexInfo, cond query.Filter) (query.Bounds, int) {
+// ComputeIndexBounds computes combined tuple bounds for an index
+// using pre-computed per-field bounds from BoundsResult.
+func ComputeIndexBounds(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
 	type fieldBound struct {
 		bounds query.Bounds
 		fixed  bool
 	}
 
-	var chain []fieldBound
+	var chainBuf [4]fieldBound // stack-allocated for typical compound indexes
+	chain := chainBuf[:0]
 	for _, field := range idx.FieldNames {
-		fb := cond.IndexBounds(field, nil)
-		if len(fb) == 0 {
+		fb, fixed, found := br.Lookup(field)
+		if !found || len(fb) == 0 {
 			break
 		}
-		allFixed := true
-		for _, b := range fb {
-			if len(b.Start) == 0 || !bytes.Equal(b.Start, b.End) {
-				allFixed = false
-				break
-			}
+		if len(chain) < len(chainBuf) {
+			chain = append(chain, fieldBound{bounds: fb, fixed: fixed})
 		}
-		chain = append(chain, fieldBound{bounds: fb, fixed: allFixed})
-		if !allFixed {
+		if !fixed {
 			break
 		}
 	}
@@ -1207,6 +1179,12 @@ func ComputeIndexBounds(idx *IndexInfo, cond query.Filter) (query.Bounds, int) {
 
 	chainLen := len(chain)
 
+	// Single-field index: return cached bounds directly (no copy needed)
+	if len(chain) == 1 {
+		return chain[0].bounds, chainLen
+	}
+
+	// Compound index: build combined tuple bounds
 	var result query.Bounds
 	for _, b := range chain[0].bounds {
 		result = append(result, b)
@@ -1242,91 +1220,6 @@ func ComputeIndexBounds(idx *IndexInfo, cond query.Filter) (query.Bounds, int) {
 	}
 
 	return result, chainLen
-}
-
-// ComputeIndexBoundsFromCache computes combined tuple bounds using pre-cached field bounds.
-// This avoids repeated filter.IndexBounds calls when processing multiple indexes.
-// Compound tuple byte slices are allocated from the cache's arena to reduce heap allocations.
-func ComputeIndexBoundsFromCache(idx *IndexInfo, cache *FieldBoundsCache) (query.Bounds, int) {
-	type fieldBound struct {
-		bounds query.Bounds
-		fixed  bool
-	}
-
-	var chainBuf [4]fieldBound // stack-allocated for typical compound indexes
-	chain := chainBuf[:0]
-	for _, field := range idx.FieldNames {
-		fb, fixed, found := cache.Lookup(field)
-		if !found || len(fb) == 0 {
-			break
-		}
-		if len(chain) < len(chainBuf) {
-			chain = append(chain, fieldBound{bounds: fb, fixed: fixed})
-		}
-		if !fixed {
-			break
-		}
-	}
-
-	if len(chain) == 0 {
-		return nil, 0
-	}
-
-	chainLen := len(chain)
-
-	// Single-field index: return cached bounds directly (no copy needed)
-	if len(chain) == 1 {
-		return chain[0].bounds, chainLen
-	}
-
-	// Compound index: build combined tuple bounds using arena for byte allocations
-	var resultBuf [1]query.Bound // stack alloc for single-bound case (most common)
-	result := resultBuf[:0]
-	for _, b := range chain[0].bounds {
-		result = append(result, b)
-	}
-
-	var extBuf [1]query.Bound // stack alloc for extended bounds
-	for i := 1; i < len(chain); i++ {
-		if !chain[i-1].fixed {
-			break
-		}
-		extended := extBuf[:0]
-		for _, prev := range result {
-			for _, cur := range chain[i].bounds {
-				eb := query.Bound{
-					StartInclude: cur.StartInclude,
-					EndInclude:   cur.EndInclude,
-				}
-				if len(cur.Start) > 0 {
-					eb.Start = cache.allocTuple(prev.Start, cur.Start)
-				} else {
-					eb.Start = cache.allocTuple(prev.Start)
-					eb.StartInclude = true
-				}
-				if len(cur.End) > 0 {
-					eb.End = cache.allocTuple(prev.End, cur.End)
-				} else {
-					eb.End = cache.allocTuple(prev.End, []byte{0xff})
-					eb.EndInclude = true
-				}
-				extended = append(extended, eb)
-			}
-		}
-		result = extended
-	}
-
-	// Use cache's inline compound bounds buffer if space is available
-	if cache.compBoundN+len(result) <= len(cache.compBoundBuf) {
-		off := cache.compBoundN
-		copy(cache.compBoundBuf[off:], result)
-		cache.compBoundN += len(result)
-		return cache.compBoundBuf[off : off+len(result) : off+len(result)], chainLen
-	}
-	// Fallback: heap-allocate when inline buffer is full
-	heapResult := make(query.Bounds, len(result))
-	copy(heapResult, result)
-	return heapResult, chainLen
 }
 
 // AdjustBoundsForNonUnique adjusts End bounds in-place for non-unique indexes

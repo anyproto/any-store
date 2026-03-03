@@ -25,7 +25,7 @@ type Filter interface {
 
 type CompOp uint8
 
-var orExpressionLimit = 950
+var orExpressionLimit = 10000
 
 const (
 	CompOpEq CompOp = iota
@@ -187,32 +187,23 @@ func (e *Comp) String() string {
 }
 
 type Key struct {
-	Path     []string
-	FullPath string // pre-joined path for fast comparison (avoids strings.Join per call)
+	Path []string
 	Filter
 }
 
 func (e Key) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
-	if e.Path == nil {
-		// Single-segment key: use FullPath directly to avoid variadic slice allocation
-		return e.Filter.Ok(v.Get(e.FullPath), buf)
-	}
 	return e.Filter.Ok(v.Get(e.Path...), buf)
 }
 
 func (e Key) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
-	name := e.FullPath
-	if name == "" {
-		name = strings.Join(e.Path, ".")
-	}
-	if name == fieldName {
+	if strings.Join(e.Path, ".") == fieldName {
 		return e.Filter.IndexBounds(fieldName, bs)
 	}
 	return bs
 }
 
 func (e Key) String() string {
-	return fmt.Sprintf(`{"%s": %s}`, e.FullPath, e.Filter.String())
+	return fmt.Sprintf(`{"%s": %s}`, strings.Join(e.Path, "."), e.Filter.String())
 }
 
 type And []Filter
@@ -283,17 +274,20 @@ func (e In) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 }
 
 func (e In) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
-	if len(e.Values) < orExpressionLimit {
-		for val := range e.Values {
-			bs = bs.Append(Bound{
-				Start:        []byte(val),
-				End:          []byte(val),
-				StartInclude: true,
-				EndInclude:   true,
-			})
-		}
+	if len(e.Values) >= orExpressionLimit {
+		return bs
 	}
-	return bs
+	result := make(Bounds, len(bs), len(bs)+len(e.Values))
+	copy(result, bs)
+	for val := range e.Values {
+		result = append(result, Bound{
+			Start:        []byte(val),
+			End:          []byte(val),
+			StartInclude: true,
+			EndInclude:   true,
+		})
+	}
+	return result.SortAndMerge()
 }
 
 func (e In) String() string {
@@ -325,13 +319,16 @@ func (e Or) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	if len(e) > orExpressionLimit {
 		return bs
 	}
+	result := make(Bounds, len(bs), len(bs)+len(e))
+	copy(result, bs)
 	for _, f := range e {
-		beforeBounds := len(bs)
-		if bs = f.IndexBounds(fieldName, bs); len(bs) == beforeBounds {
-			return
+		beforeLen := len(result)
+		result = f.IndexBounds(fieldName, result)
+		if len(result) == beforeLen {
+			return bs // branch produced no bounds → can't narrow
 		}
 	}
-	return bs
+	return result.SortAndMerge()
 }
 
 func (e Or) String() string {

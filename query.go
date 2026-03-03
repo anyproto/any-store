@@ -128,18 +128,20 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	buf := q.c.db.syncPool.GetDocBuf()
 	btx := tx.btreeReadTx()
 
+	br := q.buildBoundsResult()
 	plan := qplanner.BuildPlan(&qplanner.PlanParams{
-		Tx:         btx,
-		DataNs:     q.c.ns,
-		Filter:     q.cond,
-		Sorter:     q.sort,
-		IDBounds:   qb.idBounds,
-		Limit:      int(q.limit),
-		Offset:     int(q.offset),
-		Buf:        buf,
-		TotalDocs:  q.docCount(btx),
-		Indexes:    q.buildCBOIndexes(),
-		IndexHints: q.buildIndexHints(),
+		Tx:          btx,
+		DataNs:      q.c.ns,
+		Filter:      q.cond,
+		Sorter:      q.sort,
+		IDBounds:    qb.idBounds,
+		Limit:       int(q.limit),
+		Offset:      int(q.offset),
+		Buf:         buf,
+		TotalDocs:   q.docCount(btx),
+		Indexes:     q.buildCBOIndexesInto(nil, &br),
+		IndexHints:  q.buildIndexHints(),
+		FieldBounds: &br,
 	})
 
 	return &planIterator{
@@ -180,17 +182,19 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
+	br := q.buildBoundsResult()
 	plan := qplanner.BuildPlan(&qplanner.PlanParams{
-		Tx:         btx,
-		DataNs:     q.c.ns,
-		Filter:     q.cond,
-		IDBounds:   qb.idBounds,
-		Limit:      int(q.limit),
-		Offset:     int(q.offset),
-		Buf:        buf,
-		TotalDocs:  q.docCount(btx),
-		Indexes:    q.buildCBOIndexes(),
-		IndexHints: q.buildIndexHints(),
+		Tx:          btx,
+		DataNs:      q.c.ns,
+		Filter:      q.cond,
+		IDBounds:    qb.idBounds,
+		Limit:       int(q.limit),
+		Offset:      int(q.offset),
+		Buf:         buf,
+		TotalDocs:   q.docCount(btx),
+		Indexes:     q.buildCBOIndexesInto(nil, &br),
+		IndexHints:  q.buildIndexHints(),
+		FieldBounds: &br,
 	})
 
 	// Collect all matching docIds into a contiguous buffer to avoid
@@ -296,17 +300,19 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
+	br := q.buildBoundsResult()
 	plan := qplanner.BuildPlan(&qplanner.PlanParams{
-		Tx:         btx,
-		DataNs:     q.c.ns,
-		Filter:     q.cond,
-		IDBounds:   qb.idBounds,
-		Limit:      int(q.limit),
-		Offset:     int(q.offset),
-		Buf:        buf,
-		TotalDocs:  q.docCount(btx),
-		Indexes:    q.buildCBOIndexes(),
-		IndexHints: q.buildIndexHints(),
+		Tx:          btx,
+		DataNs:      q.c.ns,
+		Filter:      q.cond,
+		IDBounds:    qb.idBounds,
+		Limit:       int(q.limit),
+		Offset:      int(q.offset),
+		Buf:         buf,
+		TotalDocs:   q.docCount(btx),
+		Indexes:     q.buildCBOIndexesInto(nil, &br),
+		IndexHints:  q.buildIndexHints(),
+		FieldBounds: &br,
 	})
 
 	// Collect IDs to delete into a contiguous buffer (can't modify while iterating).
@@ -388,37 +394,28 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 		return
 	}
 
-	// Pre-compute field bounds cache to avoid repeated filter.IndexBounds calls
-	var fbCache qplanner.FieldBoundsCache
-	var idxInfoBuf [8]*qplanner.IndexInfo
-	idxInfos := idxInfoBuf[:0]
-	for i := range q.c.indexes {
-		if len(idxInfos) < len(idxInfoBuf) {
-			idxInfos = append(idxInfos, q.c.indexes[i].cboInfo)
-		}
-	}
-	fbCache.Build(idxInfos, q.cond)
+	br := q.buildBoundsResult()
 	var cboBuf [8]qplanner.CBOIndex
-	cboIndexes := q.buildCBOIndexesInto(cboBuf[:0], &fbCache)
+	cboIndexes := q.buildCBOIndexesInto(cboBuf[:0], &br)
 
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		buf := q.c.db.syncPool.GetDocBuf()
 		defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
 		plan := qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:         tx,
-			DataNs:     q.c.ns,
-			Filter:     q.cond,
-			Sorter:     nil, // no sort needed for count
-			IDBounds:   idBounds,
-			Limit:      int(q.limit),
-			Offset:     int(q.offset),
-			Buf:        buf,
-			TotalDocs:  q.docCount(tx),
-			Indexes:    cboIndexes,
-			IndexHints: q.buildIndexHints(),
-			CountOnly:  true,
-			FBCache:    &fbCache,
+			Tx:          tx,
+			DataNs:      q.c.ns,
+			Filter:      q.cond,
+			Sorter:      nil, // no sort needed for count
+			IDBounds:    idBounds,
+			Limit:       int(q.limit),
+			Offset:      int(q.offset),
+			Buf:         buf,
+			TotalDocs:   q.docCount(tx),
+			Indexes:     cboIndexes,
+			IndexHints:  q.buildIndexHints(),
+			CountOnly:   true,
+			FieldBounds: &br,
 		})
 
 		// Use batch counting if the root iterator supports it (covering index count)
@@ -455,21 +452,23 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
-	cboIndexes := q.buildCBOIndexes()
+	br := q.buildBoundsResult()
+	cboIndexes := q.buildCBOIndexesInto(nil, &br)
 
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		plan := qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:         tx,
-			DataNs:     q.c.ns,
-			Filter:     q.cond,
-			Sorter:     q.sort,
-			IDBounds:   qb.idBounds,
-			Limit:      int(q.limit),
-			Offset:     int(q.offset),
-			Buf:        buf,
-			TotalDocs:  q.docCount(tx),
-			Indexes:    cboIndexes,
-			IndexHints: q.buildIndexHints(),
+			Tx:          tx,
+			DataNs:      q.c.ns,
+			Filter:      q.cond,
+			Sorter:      q.sort,
+			IDBounds:    qb.idBounds,
+			Limit:       int(q.limit),
+			Offset:      int(q.offset),
+			Buf:         buf,
+			TotalDocs:   q.docCount(tx),
+			Indexes:     cboIndexes,
+			IndexHints:  q.buildIndexHints(),
+			FieldBounds: &br,
 		})
 		explain.Sql = plan.String()
 		explain.Plan = plan.ExplainString()
@@ -539,13 +538,7 @@ func (q *collQuery) isIDOnlyFilter() bool {
 func isIDOnlyFilterNode(f query.Filter) bool {
 	switch ft := f.(type) {
 	case query.Key:
-		if ft.FullPath == "id" {
-			return true
-		}
-		if len(ft.Path) == 1 && ft.Path[0] == "id" {
-			return true
-		}
-		return false
+		return len(ft.Path) == 1 && ft.Path[0] == "id"
 	case query.And:
 		// All children must be id-only
 		for _, child := range ft {
@@ -559,19 +552,22 @@ func isIDOnlyFilterNode(f query.Filter) bool {
 	}
 }
 
-// buildCBOIndexes builds CBOIndex entries from the collection's indexes for the CBO planner.
-func (q *collQuery) buildCBOIndexes() []qplanner.CBOIndex {
-	return q.buildCBOIndexesWithCache(nil)
+// buildBoundsResult computes IndexBounds once per unique field across all indexes.
+func (q *collQuery) buildBoundsResult() qplanner.BoundsResult {
+	var br qplanner.BoundsResult
+	var idxInfoBuf [8]*qplanner.IndexInfo
+	idxInfos := idxInfoBuf[:0]
+	for i := range q.c.indexes {
+		if len(idxInfos) < len(idxInfoBuf) {
+			idxInfos = append(idxInfos, q.c.indexes[i].cboInfo)
+		}
+	}
+	br.Build(idxInfos, q.cond)
+	return br
 }
 
-// buildCBOIndexesWithCache builds CBOIndex entries using an optional pre-computed field bounds cache.
-// When cache is non-nil, avoids repeated filter.IndexBounds calls across indexes.
-func (q *collQuery) buildCBOIndexesWithCache(cache *qplanner.FieldBoundsCache) []qplanner.CBOIndex {
-	return q.buildCBOIndexesInto(nil, cache)
-}
-
-// buildCBOIndexesInto builds CBOIndex entries into the provided buffer (or allocates if nil).
-func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, cache *qplanner.FieldBoundsCache) []qplanner.CBOIndex {
+// buildCBOIndexesInto builds CBOIndex entries into the provided buffer using pre-computed bounds.
+func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.BoundsResult) []qplanner.CBOIndex {
 	result := buf
 
 	var sortFields []query.SortField
@@ -579,34 +575,11 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, cache *qplanner
 		sortFields = q.sort.Fields()
 	}
 
-	// For Count queries (no sort) with all-equality filter fields, detect
-	// "perfect" compound indexes that cover all filter fields. Once found,
-	// skip remaining indexes since they can't beat a full-coverage point lookup.
-	noSort := len(sortFields) == 0
-	numFilterFields := 0
-	if noSort && cache != nil && cache.AllFixed() {
-		numFilterFields = cache.FieldCount()
-	}
-
 	for _, idx := range q.c.indexes {
 		info := idx.cboInfo
 
 		// Compute bounds for this index
-		var bounds query.Bounds
-		var chainLen int
-		if cache != nil {
-			bounds, chainLen = qplanner.ComputeIndexBoundsFromCache(info, cache)
-		} else {
-			bounds, chainLen = qplanner.ComputeIndexBounds(info, q.cond)
-		}
-
-		// Skip indexes with no matching bounds and no sort relevance.
-		// These would be skipped later in BuildPlan anyway, but we save
-		// the CBOIndex struct construction and append cost.
-		// Only skip when using cache (Count/Iter fast path); Explain needs all indexes.
-		if cache != nil && len(bounds) == 0 && noSort {
-			continue
-		}
+		bounds, chainLen := qplanner.ComputeIndexBounds(info, br)
 
 		pointLookup := qplanner.AllBoundsFixed(bounds)
 		// Note: AdjustBoundsForNonUnique is deferred to BuildPlan's
@@ -636,12 +609,6 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, cache *qplanner
 			PartialSort: partialSort,
 		}
 		result = append(result, cboIdx)
-
-		// Early exit: if this index covers all filter fields with equality
-		// and we don't need sort, this is optimal. No need to evaluate more indexes.
-		if numFilterFields > 0 && pointLookup && chainLen >= numFilterFields {
-			break
-		}
 	}
 	return result
 }

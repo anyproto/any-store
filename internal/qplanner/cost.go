@@ -2,7 +2,7 @@ package qplanner
 
 const (
 	// Query Cost Weights
-	CostIndexSeek = 0.0 // Cost of a B-tree traversal to find a key (negligible for embedded DB)
+	CostIndexSeek = 0.5 // Cost of a B-tree traversal to find a key (per bound/seek)
 	CostDocFetch  = 2.0 // Cost of a random point lookup in the data B-tree (index -> data)
 	CostSeqRead   = 0.1 // Cost of a sequential cursor read per doc (full scan)
 	CostFilter    = 0.5 // Cost of in-memory evaluation of a predicate
