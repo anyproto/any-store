@@ -211,7 +211,11 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 
 func (c *collection) insertItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, it item) (err error) {
 	buf.SmallBuf = it.appendId(buf.SmallBuf[:0])
-	buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
+	if c.db.config.DisableCompression {
+		buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
+	} else {
+		buf.DocBuf, buf.ScratchBuf = it.Value().MarshalCompressed(buf.DocBuf[:0], buf.ScratchBuf)
+	}
 
 	// Check if key already exists
 	if _, err := tx.Get(c.ns, buf.SmallBuf); err == nil {
@@ -361,7 +365,11 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 		}
 	}
 
-	buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
+	if c.db.config.DisableCompression {
+		buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
+	} else {
+		buf.DocBuf, buf.ScratchBuf = it.Value().MarshalCompressed(buf.DocBuf[:0], buf.ScratchBuf)
+	}
 	if err = tx.Put(c.ns, buf.SmallBuf, buf.DocBuf); err != nil {
 		return
 	}

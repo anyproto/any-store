@@ -31,6 +31,10 @@ type Config struct {
 	// The path argument to Open is ignored and can be any string (e.g. ":memory:").
 	InMemory bool
 
+	// DisableCompression disables S2 compression for document values.
+	// By default, objects larger than 256 bytes are compressed with S2.
+	DisableCompression bool
+
 	// DurabilityConfig provides configuration for crash recovery and idle auto-flush
 	Durability DurabilityConfig
 }

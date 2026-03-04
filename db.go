@@ -288,10 +288,6 @@ func (db *db) reloadSketches(tx *btree.ReadTx) {
 }
 
 func (db *db) CreateCollection(ctx context.Context, collectionName string) (Collection, error) {
-	return db.createCollection(ctx, collectionName)
-}
-
-func (db *db) createCollection(ctx context.Context, collectionName string) (Collection, error) {
 	db.mu.Lock()
 	if _, ok := db.openedCollections[collectionName]; ok {
 		db.mu.Unlock()
@@ -383,7 +379,7 @@ func (db *db) Collection(ctx context.Context, collectionName string) (Collection
 	if !errors.Is(err, ErrCollectionNotFound) {
 		return nil, err
 	}
-	coll, err = db.createCollection(ctx, collectionName)
+	coll, err = db.CreateCollection(ctx, collectionName)
 	if err == nil {
 		return coll, nil
 	}
