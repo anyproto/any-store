@@ -109,20 +109,18 @@ func TestPcacheEvictOne_EmptyLRU(t *testing.T) {
 
 func TestPcacheLruRemove_NotInLRU(t *testing.T) {
 	// Test lruRemove on a page that is NOT in the LRU list.
-	// This covers the branch where p is neither lruHead nor lruTail.
+	// Should be a no-op: nClean stays at 0.
 	pc := newPcache(4096, 100, true)
 
 	// Create a page that is pinned (never released, so not in LRU)
 	pg := pc.create(1)
 	assert.Equal(t, 0, pc.nClean)
 
-	// lruRemove on a pinned page: since p.prev==nil, p.next==nil,
-	// lruHead(nil)!=p, lruTail(nil)!=p, the code falls through and decrements nClean.
-	// This is expected behavior from the SQLite-style lruRemove.
+	// lruRemove on a page not in LRU should be a no-op
 	pc.mu.Lock()
 	pc.lruRemove(pg)
 	pc.mu.Unlock()
-	assert.Equal(t, -1, pc.nClean)
+	assert.Equal(t, 0, pc.nClean)
 }
 
 func TestPcacheLruRemove_Head(t *testing.T) {

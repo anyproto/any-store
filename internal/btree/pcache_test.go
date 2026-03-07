@@ -247,3 +247,116 @@ func TestPcacheDefaultCacheSize(t *testing.T) {
 	pc2 := newPcache(4096, -1, true)
 	assert.Equal(t, defaultCacheSize, pc2.maxPages)
 }
+
+func TestPcacheStressCallbackInvoked(t *testing.T) {
+	pc := newPcache(4096, 3, true) // max 3 pages
+
+	var stressCalled int
+	var stressVictim uint32
+	pc.xStress = func(p *page) error {
+		stressCalled++
+		stressVictim = p.pgno
+		// Simulate what pagerStress does: write to WAL then makeClean
+		pc.makeClean(p)
+		return nil
+	}
+
+	// Fill cache with dirty pages and release them (unpinned)
+	for i := uint32(1); i <= 3; i++ {
+		pg := pc.create(i)
+		pc.makeDirty(pg)
+		pc.release(pg)
+	}
+	assert.Equal(t, 3, pc.nDirty)
+	assert.Equal(t, 0, pc.nClean)
+
+	// Creating a 4th page should trigger stress callback since no clean
+	// pages are available for eviction
+	pg4 := pc.create(4)
+	require.NotNil(t, pg4)
+	assert.Equal(t, 1, stressCalled)
+	assert.NotZero(t, stressVictim)
+	pc.release(pg4)
+}
+
+func TestPcacheStressOnlyUnreferenced(t *testing.T) {
+	pc := newPcache(4096, 3, true) // max 3 pages
+
+	var stressCalled int
+	pc.xStress = func(p *page) error {
+		stressCalled++
+		pc.makeClean(p)
+		return nil
+	}
+
+	// Fill cache with dirty pages, but keep them ALL pinned
+	pgs := make([]*page, 3)
+	for i := uint32(1); i <= 3; i++ {
+		pg := pc.create(i)
+		pc.makeDirty(pg)
+		// Do NOT release — keep pinned
+		pgs[i-1] = pg
+	}
+
+	// All dirty pages are pinned, stress callback should not find a victim
+	pg4 := pc.create(4)
+	require.NotNil(t, pg4)
+	assert.Equal(t, 0, stressCalled) // no victim found, no stress call
+	assert.Len(t, pc.pages, 4)       // cache grows beyond maxPages
+
+	// Cleanup
+	pc.release(pg4)
+	for _, pg := range pgs {
+		pc.release(pg)
+	}
+}
+
+func TestPcacheNoStressWhenCleanPagesAvailable(t *testing.T) {
+	pc := newPcache(4096, 3, true) // max 3 pages
+
+	var stressCalled int
+	pc.xStress = func(p *page) error {
+		stressCalled++
+		pc.makeClean(p)
+		return nil
+	}
+
+	// Fill cache with clean pages (released, not dirty)
+	for i := uint32(1); i <= 3; i++ {
+		pg := pc.create(i)
+		pc.release(pg)
+	}
+	assert.Equal(t, 3, pc.nClean)
+
+	// Creating a 4th page should evict a clean page, NOT trigger stress
+	pg4 := pc.create(4)
+	require.NotNil(t, pg4)
+	assert.Equal(t, 0, stressCalled) // clean eviction worked, no stress needed
+	assert.Len(t, pc.pages, 3)       // one was evicted
+	pc.release(pg4)
+}
+
+func TestPcacheStressDisabledForInMemory(t *testing.T) {
+	pc := newPcache(4096, 3, false) // non-purgeable (InMemory)
+
+	var stressCalled int
+	pc.xStress = func(p *page) error {
+		stressCalled++
+		pc.makeClean(p)
+		return nil
+	}
+
+	// Fill cache with dirty pages
+	for i := uint32(1); i <= 3; i++ {
+		pg := pc.create(i)
+		pc.makeDirty(pg)
+		pc.release(pg)
+	}
+
+	// Creating a 4th page should NOT trigger stress for non-purgeable caches
+	pg4 := pc.create(4)
+	require.NotNil(t, pg4)
+	assert.Equal(t, 0, stressCalled) // non-purgeable skips stress entirely
+	assert.Len(t, pc.pages, 4)       // cache grows beyond maxPages
+	pc.release(pg4)
+}

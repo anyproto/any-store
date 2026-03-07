@@ -137,15 +137,15 @@ The current `writeFrames()` has bugs that must be fixed first. Calling `writeFra
 
 Add a stress callback that the pager registers, invoked when cache is full and all clean pages are exhausted.
 
-- [ ] Add `xStress func(p *page) error` field to `pcache` struct (`pcache.go:12`)
-- [ ] Add `szSpill int` field to `pcache` struct (spill threshold, 0 = use maxPages)
-- [ ] Add `findSpillVictim() *page` method: walk dirty list, return first page with `pinCount == 0`
-- [ ] Modify `create()` (`pcache.go:81`): after clean eviction loop exhausts clean pages, if cache still full and `xStress != nil`, find unreferenced dirty victim, unlock mutex, call `xStress(victim)`, re-lock (victim now clean and evictable)
-- [ ] Write tests: `TestPcacheStressCallbackInvoked` — set small maxPages, fill cache with dirty pages, verify stress callback fires
-- [ ] Write tests: `TestPcacheStressOnlyUnreferenced` — pinned dirty pages not offered to stress callback
-- [ ] Write tests: `TestPcacheNoStressWhenCleanPagesAvailable` — stress callback not invoked when clean eviction succeeds
-- [ ] Write tests: `TestPcacheStressDisabledForInMemory` — non-purgeable caches don't invoke stress
-- [ ] Run tests — must pass before next task
+- [x] Add `xStress func(p *page) error` field to `pcache` struct (`pcache.go:12`)
+- [x] Add `szSpill int` field to `pcache` struct (spill threshold, 0 = use maxPages)
+- [x] Add `findSpillVictim() *page` method: walk dirty list, return first page with `pinCount == 0`
+- [x] Modify `create()` (`pcache.go:81`): after clean eviction loop exhausts clean pages, if cache still full and `xStress != nil`, find unreferenced dirty victim, unlock mutex, call `xStress(victim)`, re-lock (victim now clean and evictable)
+- [x] Write tests: `TestPcacheStressCallbackInvoked` — set small maxPages, fill cache with dirty pages, verify stress callback fires
+- [x] Write tests: `TestPcacheStressOnlyUnreferenced` — pinned dirty pages not offered to stress callback
+- [x] Write tests: `TestPcacheNoStressWhenCleanPagesAvailable` — stress callback not invoked when clean eviction succeeds
+- [x] Write tests: `TestPcacheStressDisabledForInMemory` — non-purgeable caches don't invoke stress
+- [x] Run tests — must pass before next task
 
 ### Task 6: Implement pagerStress callback
 

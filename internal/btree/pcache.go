@@ -28,6 +28,15 @@ type pcache struct {
 	// Dirty page list
 	dirtyHead *page
 	nDirty    int
+
+	// xStress is invoked when the cache is full and all clean pages are
+	// exhausted. It should write the dirty page to WAL and call makeClean.
+	// Modeled after SQLite's xStress in pcache.c.
+	xStress func(p *page) error
+
+	// szSpill is the spill threshold: xStress fires when page count exceeds
+	// szSpill. 0 means use maxPages as the threshold.
+	szSpill int
 }
 
 func newPcache(pageSize, maxPages int, purgeable bool) *pcache {
@@ -77,16 +86,18 @@ func (pc *pcache) fetchPinned(pgno uint32) (*page, bool) {
 }
 
 // create allocates a new page in the cache and returns it pinned.
-// If the cache is full, it evicts clean pages first.
+// If the cache is full, it evicts clean pages first. If no clean pages
+// are available and xStress is set, invokes the stress callback to spill
+// a dirty page, making it clean and evictable.
 func (pc *pcache) create(pgno uint32) *page {
 	pc.mu.Lock()
-	defer pc.mu.Unlock()
 
 	if p := pc.pages[pgno]; p != nil {
 		p.pinCount++
 		if !p.dirty {
 			pc.lruRemove(p)
 		}
+		pc.mu.Unlock()
 		return p
 	}
 
@@ -94,6 +105,28 @@ func (pc *pcache) create(pgno uint32) *page {
 	if pc.purgeable {
 		for len(pc.pages) >= pc.maxPages && pc.nClean > 0 {
 			pc.evictOne()
+		}
+
+		// If still full and stress callback available, try to spill a dirty page.
+		// Modeled after sqlite3PcacheFetchStress() in pcache.c.
+		spill := pc.szSpill
+		if spill == 0 {
+			spill = pc.maxPages
+		}
+		if len(pc.pages) >= spill && pc.xStress != nil {
+			victim := pc.findSpillVictim()
+			if victim != nil {
+				pc.mu.Unlock()
+				// DRIFT from SQLite: we ignore the xStress error here because
+				// create() has no error return. SQLite's FetchStress returns
+				// the error but only for OOM/non-BUSY cases.
+				pc.xStress(victim)
+				pc.mu.Lock()
+				// After stress callback, victim should be clean. Retry eviction.
+				for len(pc.pages) >= pc.maxPages && pc.nClean > 0 {
+					pc.evictOne()
+				}
+			}
 		}
 	}
 
@@ -103,6 +136,7 @@ func (pc *pcache) create(pgno uint32) *page {
 		pinCount: 1,
 	}
 	pc.pages[pgno] = p
+	pc.mu.Unlock()
 	return p
 }
 
@@ -278,19 +312,19 @@ func (pc *pcache) lruAppend(p *page) {
 }
 
 func (pc *pcache) lruRemove(p *page) {
+	// Not in LRU list — nothing to do.
+	if p.prev == nil && p.next == nil && pc.lruHead != p {
+		return
+	}
 	if p.prev != nil {
 		p.prev.next = p.next
-	} else if pc.lruHead == p {
+	} else {
 		pc.lruHead = p.next
 	}
 	if p.next != nil {
 		p.next.prev = p.prev
-	} else if pc.lruTail == p {
+	} else {
 		pc.lruTail = p.prev
-	}
-	if pc.lruHead == p || pc.lruTail == p {
-		// p was not in LRU list
-		return
 	}
 	p.next = nil
 	p.prev = nil
@@ -312,4 +346,16 @@ func (pc *pcache) evictOne() {
 	p.prev = nil
 	pc.nClean--
 	delete(pc.pages, p.pgno)
+}
+
+// findSpillVictim walks the dirty list and returns the first page with
+// pinCount == 0, or nil if all dirty pages are pinned.
+// Must be called with pc.mu held.
+func (pc *pcache) findSpillVictim() *page {
+	for p := pc.dirtyHead; p != nil; p = p.next {
+		if p.pinCount == 0 {
+			return p
+		}
+	}
+	return nil
 }
