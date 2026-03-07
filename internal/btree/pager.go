@@ -1451,8 +1451,13 @@ func (p *pager) rollbackToSavepoint(id int) error {
 					p.header.deserialize(pg.data[:dbHeaderSize])
 					p.dbSize.Store(p.header.DatabaseSize)
 				}
-				// Page is restored to pre-savepoint state but stays dirty
-				// so it can be modified again in the current transaction.
+				// Re-dirty pages that were made clean by pagerStress spill.
+				// Without this, spilled pages remain clean after data
+				// restoration, and their content is lost at commit because
+				// appendDirtyPages only collects dirty pages.
+				if !pg.dirty {
+					p.cache.makeDirty(pg)
+				}
 				p.cache.release(pg)
 			}
 		}
