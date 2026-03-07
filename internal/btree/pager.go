@@ -68,6 +68,12 @@ type pager struct {
 	// Used to roll back spilled frames on transaction rollback.
 	savedWalFrame uint32
 
+	// savedWalCksum1/2 are the WAL cumulative checksums at beginWrite() time.
+	// Must be restored on rollback so the next transaction's frames have
+	// correct checksums when overwriting spill positions.
+	savedWalCksum1 uint32
+	savedWalCksum2 uint32
+
 	// doNotSpill is a bitmask of spillFlag* constants that inhibit the
 	// pagerStress callback. Modeled after SQLite's Pager.doNotSpill (pager.c:648).
 	doNotSpill uint8
@@ -123,8 +129,10 @@ type savepointState struct {
 	id       int
 	dbSize   uint32
 	pages    map[uint32][]byte // pgno -> copy of page data before modification
-	walFrame uint32            // WAL frame count at savepoint time
-	header   dbHeader          // snapshot of database header at savepoint time (fix 9.3)
+	walFrame   uint32            // WAL frame count at savepoint time
+	walCksum1  uint32            // WAL cumulative checksum-1 at savepoint time
+	walCksum2  uint32            // WAL cumulative checksum-2 at savepoint time
+	header     dbHeader          // snapshot of database header at savepoint time (fix 9.3)
 }
 
 // newPager creates a new pager for the given database path.
@@ -337,8 +345,11 @@ func (p *pager) beginWrite() error {
 	p.state.Store(int32(pagerWriter))
 	// Save a snapshot of the database header so rollback can restore it (fix 5.2).
 	p.savedHeader = p.header
-	// Save WAL frame count so rollback can clean up spilled frames.
+	// Save WAL frame count and checksums so rollback can clean up spilled frames
+	// and restore the checksum chain for the next transaction.
 	p.savedWalFrame = p.wal.nFrame.Load()
+	p.savedWalCksum1 = p.wal.cksum1
+	p.savedWalCksum2 = p.wal.cksum2
 	if p.writePages == nil {
 		p.writePages = make(map[uint32]*page, 64)
 	}
@@ -1059,6 +1070,12 @@ func (p *pager) pagerStress(pg *page) error {
 		return nil
 	}
 
+	// Do not spill page 1. It contains the database header and master table
+	// metadata. SQLite explicitly skips page 1 in pagerStress (pager.c:4642).
+	if pg.pgno == 1 {
+		return nil
+	}
+
 	// subjournalPageIfRequired equivalent (SQLite pager.c:4647):
 	// Save page data for savepoint rollback before spilling.
 	if len(p.savepoints) > 0 {
@@ -1137,10 +1154,13 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 		clear(p.dontWritePages)
 	}
 
-	// Determine if there are real changes: dirty data pages or header
-	// modifications (freelist, dbSize changes). Counter increments are
-	// deferred until we confirm there's something to commit.
-	hasRealChanges := len(p.dirtyBuf) > 0 || p.header != p.savedHeader || p.writePages[1] != nil
+	// Determine if there are real changes: dirty data pages, header
+	// modifications (freelist, dbSize changes), or spilled pages. Counter
+	// increments are deferred until we confirm there's something to commit.
+	// The nFrame check catches transactions where all dirty pages were spilled
+	// (making dirtyBuf empty) but a commit frame is still needed.
+	hasRealChanges := len(p.dirtyBuf) > 0 || p.header != p.savedHeader ||
+		p.writePages[1] != nil || p.wal.nFrame.Load() > p.savedWalFrame
 
 	if !hasRealChanges {
 		// Empty transaction — counters not incremented.
@@ -1243,6 +1263,12 @@ func (p *pager) rollback() error {
 	// file are harmless (no commit marker), but pageMap entries and maxFrame
 	// must be restored to the pre-transaction state.
 	p.wal.index.rollbackToFrame(p.savedWalFrame)
+	// Restore nFrame so the next transaction overwrites the dead spill frames
+	// instead of writing past them. Also restore cumulative checksums so the
+	// checksum chain is correct when frames are overwritten.
+	p.wal.nFrame.Store(p.savedWalFrame)
+	p.wal.cksum1 = p.savedWalCksum1
+	p.wal.cksum2 = p.savedWalCksum2
 
 	// Restore the database header from the snapshot saved at beginWrite (fix 5.2).
 	// This ensures FirstFreelistPg, TotalFreelistPgs, and DatabaseSize are
@@ -1278,6 +1304,14 @@ func (p *pager) pagerError() {
 	}
 	p.cache.clear()
 
+	// Roll back spilled frames in the WAL index and restore nFrame/checksums.
+	// Without this, pageMap and nFrame remain inflated after error recovery,
+	// causing checkpoint to copy uncommitted spill data to the database.
+	p.wal.index.rollbackToFrame(p.savedWalFrame)
+	p.wal.nFrame.Store(p.savedWalFrame)
+	p.wal.cksum1 = p.savedWalCksum1
+	p.wal.cksum2 = p.savedWalCksum2
+
 	// Restore the database header to pre-transaction state.
 	p.header = p.savedHeader
 	p.dbSize.Store(p.header.DatabaseSize)
@@ -1311,11 +1345,13 @@ func (p *pager) savepoint() (int, error) {
 			id, dbSz, walFr, len(p.writePages), len(p.dontWritePages), len(p.hasContent))
 	}
 	p.savepoints = append(p.savepoints, savepointState{
-		id:       id,
-		dbSize:   dbSz,
-		pages:    make(map[uint32][]byte),
-		walFrame: walFr,
-		header:   p.header, // snapshot header for rollback (fix 9.3)
+		id:        id,
+		dbSize:    dbSz,
+		pages:     make(map[uint32][]byte),
+		walFrame:  walFr,
+		walCksum1: p.wal.cksum1,
+		walCksum2: p.wal.cksum2,
+		header:    p.header, // snapshot header for rollback (fix 9.3)
 	})
 	return id, nil
 }
@@ -1352,6 +1388,11 @@ func (p *pager) rollbackToSavepoint(id int) error {
 
 	// Roll back spilled frames in the WAL index to the savepoint's WAL position.
 	p.wal.index.rollbackToFrame(sp.walFrame)
+	// Restore nFrame and cumulative checksums so the next write overwrites
+	// the dead spill frames with a correct checksum chain.
+	p.wal.nFrame.Store(sp.walFrame)
+	p.wal.cksum1 = sp.walCksum1
+	p.wal.cksum2 = sp.walCksum2
 
 	// Restore saved page copies from all savepoints being rolled back.
 	// Iterate from NEWEST to OLDEST (fix 9.1): this ensures that when a page
@@ -1364,7 +1405,18 @@ func (p *pager) rollbackToSavepoint(id int) error {
 			trace("rollbackToSavepoint: restoring sp[%d] pages (%d entries)", i, len(p.savepoints[i].pages))
 		}
 		for pgno, data := range p.savepoints[i].pages {
-			if pg := p.cache.fetch(pgno); pg != nil {
+			pg := p.cache.fetch(pgno)
+			if pg == nil {
+				// Page was spilled and evicted from pcache. It may still
+				// be in writePages — re-insert it into cache so its data
+				// can be restored and it becomes dirty again.
+				if wp := p.writePages[pgno]; wp != nil {
+					p.cache.reinsertDirty(wp)
+					wp.pinCount++
+					pg = wp
+				}
+			}
+			if pg != nil {
 				copy(pg.data, data)
 				off := 0
 				if pgno == 1 {

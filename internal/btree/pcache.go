@@ -122,6 +122,16 @@ func (pc *pcache) create(pgno uint32) *page {
 				// the error but only for OOM/non-BUSY cases.
 				pc.xStress(victim)
 				pc.mu.Lock()
+				// Re-check: another goroutine may have created this page while
+				// we dropped the lock (e.g., concurrent readers).
+				if p := pc.pages[pgno]; p != nil {
+					p.pinCount++
+					if !p.dirty {
+						pc.lruRemove(p)
+					}
+					pc.mu.Unlock()
+					return p
+				}
 				// After stress callback, victim should be clean. Retry eviction.
 				for len(pc.pages) >= pc.maxPages && pc.nClean > 0 {
 					pc.evictOne()

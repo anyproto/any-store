@@ -261,7 +261,9 @@ Document every intentional divergence from the SQLite C implementation here. Eac
 
 | Location | SQLite Behavior | Our Behavior | Reason |
 |----------|----------------|--------------|--------|
-| *(to be filled during implementation)* | | | |
+| `pager.go:1056` pagerStress writer check | pagerStress always has writer context | Shared cache means readers can trigger xStress; guard against non-writer state | Go's shared pcache between reader/writer goroutines |
+| `pcache.go:120` xStress error ignored | FetchStress returns error for OOM | create() has no error return; error is silently ignored | Go pcache API design — create returns *page, not (*page, error) |
+| `wal.go:500` SHM hash write deferral | walIndexAppend always writes SHM hash | SHM hash writes deferred until commit via pendingShmFrames | Stronger cross-process isolation — SQLite relies on walIndexWriteHdr not being called |
 
 ## Post-Completion
 

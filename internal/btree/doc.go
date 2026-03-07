@@ -23,6 +23,15 @@
 //   - Read transactions see a consistent snapshot via WAL
 //   - Write transactions support nested savepoints
 //
+// # Cache Spill
+//
+// During large write transactions, the page cache may fill up. When this
+// happens, the pagerStress callback spills dirty pages to the WAL
+// mid-transaction (without a commit marker), marks them clean, and makes
+// them evictable. This bounds memory usage to approximately CacheSize pages
+// regardless of transaction size. Spilled frames are invisible to readers
+// until commit, matching SQLite's pagerStress design (pager.c:4609-4681).
+//
 // # VFS Build Tag
 //
 // By default the engine calls *os.File methods directly with zero interface
