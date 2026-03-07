@@ -185,12 +185,12 @@ Verify the commit flow works correctly when pages have been spilled mid-transact
 
 End-to-end tests verifying bounded memory, concurrent readers, checkpoint, and InMemory mode.
 
-- [ ] Write tests: `TestLargeTransactionBoundedMemory` — insert enough data to exceed CacheSize, verify cache stays near limit (pages are spilled), all data readable after commit
-- [ ] Write tests: `TestSpillThenCheckpoint` — spill, commit, checkpoint, verify database file correct
-- [ ] Write tests: `TestSpillMultipleRounds` — trigger spill multiple times in one transaction, commit, verify
-- [ ] Write tests: `TestConcurrentReaderDuringSpill` — reader holds snapshot while writer spills, verify reader sees consistent pre-spill data
-- [ ] Write tests: `TestSpillInMemoryMode` — verify InMemory databases handle spill correctly via `writeFramesMem`
-- [ ] Run tests — must pass before next task
+- [x] Write tests: `TestLargeTransactionBoundedMemory` — insert enough data to exceed CacheSize, verify cache stays near limit (pages are spilled), all data readable after commit
+- [x] Write tests: `TestSpillThenCheckpoint` — spill, commit, checkpoint, verify database file correct
+- [x] Write tests: `TestSpillMultipleRounds` — trigger spill multiple times in one transaction, commit, verify
+- [x] Write tests: `TestConcurrentReaderDuringSpill` — reader holds snapshot while writer spills, verify reader sees consistent pre-spill data
+- [x] Write tests: `TestSpillInMemoryMode` — verify InMemory databases handle spill correctly via `writeFramesMem`
+- [x] Run tests — must pass before next task
 
 ### Task 9: Verify acceptance criteria
 

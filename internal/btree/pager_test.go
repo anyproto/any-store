@@ -2,6 +2,7 @@ package btree
 
 import (
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
 	"os"
 	"path/filepath"
@@ -7062,4 +7063,318 @@ func TestPagerStressThenSavepointRollback(t *testing.T) {
 	assert.Equal(t, "pg3-init!!", string(rpg3.data[100:110]),
 		"page 3 data should be committed correctly")
 	p.cache.release(rpg3)
+}
+
+// ============================================================
+// Integration and stress tests for cache spill (Task 8)
+// ============================================================
+
+// TestLargeTransactionBoundedMemory inserts enough data to exceed CacheSize,
+// verifies the cache stays near the limit (pages are spilled), and all data
+// is readable after commit.
+func TestLargeTransactionBoundedMemory(t *testing.T) {
+	dir := t.TempDir()
+	cacheSize := 20 // small cache to force spilling
+	p := newPager(filepath.Join(dir, "test.db"), 4096, cacheSize, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf)
+	require.NoError(t, p.beginWrite())
+
+	// Allocate many pages — well beyond cacheSize to trigger spilling
+	numPages := cacheSize * 5 // 100 pages vs cache of 20
+	pageNos := make([]uint32, numPages)
+	for i := 0; i < numPages; i++ {
+		pg, err := p.allocatePage()
+		require.NoError(t, err)
+		pageNos[i] = pg.pgno
+		// Write distinct data to each page
+		copy(pg.data[100:], []byte(fmt.Sprintf("page-%04d", i)))
+		p.releasePage(pg)
+	}
+
+	// Verify cache size stayed near the limit (with some tolerance for
+	// pinned pages and page 1). The key assertion: cache did NOT grow to
+	// numPages, proving that spilling occurred.
+	p.cache.mu.Lock()
+	cachedCount := len(p.cache.pages)
+	p.cache.mu.Unlock()
+	assert.Less(t, cachedCount, numPages,
+		"cache should NOT contain all pages — spilling should have occurred")
+	// The cache should be near maxPages (some tolerance for overhead pages)
+	assert.LessOrEqual(t, cachedCount, cacheSize+5,
+		"cache should stay near maxPages limit")
+
+	// Commit
+	_, _, _, err = p.commit(true, false)
+	require.NoError(t, err)
+	p.endRead(slot)
+
+	// Verify all data is readable after commit
+	mf2, slot2, err := p.beginRead()
+	require.NoError(t, err)
+	defer p.endRead(slot2)
+
+	for i, pgno := range pageNos {
+		pg, err := p.getPageAt(pgno, mf2)
+		require.NoError(t, err, "failed to read page %d (pgno=%d)", i, pgno)
+		expected := fmt.Sprintf("page-%04d", i)
+		assert.Equal(t, expected, string(pg.data[100:109]),
+			"page %d data mismatch after commit with spilling", i)
+		p.cache.release(pg)
+	}
+}
+
+// TestSpillThenCheckpoint verifies that after spilling, committing, and
+// checkpointing, the database file contains correct data.
+func TestSpillThenCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 10, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	// Begin write transaction
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf)
+	require.NoError(t, p.beginWrite())
+
+	// Allocate pages exceeding cache to trigger spill
+	numPages := 30
+	pageNos := make([]uint32, numPages)
+	for i := 0; i < numPages; i++ {
+		pg, err := p.allocatePage()
+		require.NoError(t, err)
+		pageNos[i] = pg.pgno
+		copy(pg.data[100:], []byte(fmt.Sprintf("ckpt-%04d", i)))
+		p.releasePage(pg)
+	}
+
+	// Commit
+	_, _, _, err = p.commit(true, false)
+	require.NoError(t, err)
+	p.endRead(slot)
+
+	// Checkpoint — moves WAL frames to database file
+	require.NoError(t, p.checkpointWithMode(CheckpointFull))
+
+	// Verify data by re-reading after checkpoint (WAL should be empty,
+	// data should come from the database file)
+	mf2, slot2, err := p.beginRead()
+	require.NoError(t, err)
+	defer p.endRead(slot2)
+
+	for i, pgno := range pageNos {
+		pg, err := p.getPageAt(pgno, mf2)
+		require.NoError(t, err, "failed to read page %d after checkpoint", pgno)
+		expected := fmt.Sprintf("ckpt-%04d", i)
+		assert.Equal(t, expected, string(pg.data[100:109]),
+			"page %d data mismatch after checkpoint", pgno)
+		p.cache.release(pg)
+	}
+}
+
+// TestSpillMultipleRounds triggers spill multiple times in one transaction
+// by writing enough pages in waves to exceed the cache repeatedly.
+func TestSpillMultipleRounds(t *testing.T) {
+	dir := t.TempDir()
+	cacheSize := 10
+	p := newPager(filepath.Join(dir, "test.db"), 4096, cacheSize, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf)
+	require.NoError(t, p.beginWrite())
+
+	// Write 3 waves, each exceeding cache size to force multiple spill rounds
+	totalPages := cacheSize * 3
+	pageNos := make([]uint32, totalPages)
+	for i := 0; i < totalPages; i++ {
+		pg, err := p.allocatePage()
+		require.NoError(t, err)
+		pageNos[i] = pg.pgno
+		copy(pg.data[100:], []byte(fmt.Sprintf("wave-%04d", i)))
+		p.releasePage(pg)
+	}
+
+	// Verify spilling occurred: nFrame should be > 0 (spilled frames exist)
+	// but mxCommitFrame should still be 0 (no commit yet)
+	assert.Greater(t, p.wal.nFrame.Load(), uint32(0),
+		"frames should have been written via spill")
+	assert.Equal(t, uint32(0), p.wal.index.mxCommitFrame.Load(),
+		"mxCommitFrame should be 0 before commit")
+
+	// Commit
+	_, _, _, err = p.commit(true, false)
+	require.NoError(t, err)
+	p.endRead(slot)
+
+	// After commit, mxCommitFrame should include all spilled + committed frames
+	assert.Equal(t, p.wal.nFrame.Load(), p.wal.index.mxCommitFrame.Load(),
+		"mxCommitFrame should match nFrame after commit")
+
+	// Verify all data
+	mf2, slot2, err := p.beginRead()
+	require.NoError(t, err)
+	defer p.endRead(slot2)
+
+	for i, pgno := range pageNos {
+		pg, err := p.getPageAt(pgno, mf2)
+		require.NoError(t, err)
+		expected := fmt.Sprintf("wave-%04d", i)
+		assert.Equal(t, expected, string(pg.data[100:109]),
+			"page %d data mismatch after multi-round spill commit", i)
+		p.cache.release(pg)
+	}
+}
+
+// TestConcurrentReaderDuringSpill verifies that a reader holding a snapshot
+// while the writer spills pages sees consistent pre-spill data.
+func TestConcurrentReaderDuringSpill(t *testing.T) {
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 20, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	// First transaction: write committed baseline data
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf)
+	require.NoError(t, p.beginWrite())
+
+	pg2, err := p.allocatePage()
+	require.NoError(t, err)
+	pg2no := pg2.pgno
+	copy(pg2.data[100:], "baseline!!")
+	p.releasePage(pg2)
+
+	pg3, err := p.allocatePage()
+	require.NoError(t, err)
+	pg3no := pg3.pgno
+	copy(pg3.data[100:], "base-pg3!!")
+	p.releasePage(pg3)
+
+	_, _, _, err = p.commit(true, false)
+	require.NoError(t, err)
+	p.endRead(slot)
+
+	// Start a reader that takes a snapshot of the committed data
+	readerMf, readerSlot, err := p.beginRead()
+	require.NoError(t, err)
+
+	// Start a writer that modifies and spills pages
+	mf2, writerSlot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf2)
+	require.NoError(t, p.beginWrite())
+
+	// Modify page 2 and force it to spill
+	pg2w, err := p.getWritablePage(pg2no)
+	require.NoError(t, err)
+	copy(pg2w.data[100:], "modified!!")
+	p.releasePage(pg2w)
+
+	// Spill the modified page
+	err = p.pagerStress(pg2w)
+	require.NoError(t, err)
+
+	// Also allocate many pages to trigger more spilling
+	for i := 0; i < 30; i++ {
+		pg, err := p.allocatePage()
+		require.NoError(t, err)
+		copy(pg.data[100:], []byte(fmt.Sprintf("extra%04d", i)))
+		p.releasePage(pg)
+	}
+
+	// Reader should still see the original committed data, not spilled data
+	rpg2, err := p.getPageAt(pg2no, readerMf)
+	require.NoError(t, err)
+	assert.Equal(t, "baseline!!", string(rpg2.data[100:110]),
+		"reader should see pre-spill committed data for page 2")
+	p.cache.release(rpg2)
+
+	rpg3, err := p.getPageAt(pg3no, readerMf)
+	require.NoError(t, err)
+	assert.Equal(t, "base-pg3!!", string(rpg3.data[100:110]),
+		"reader should see original data for unmodified page 3")
+	p.cache.release(rpg3)
+
+	// End reader
+	p.endRead(readerSlot)
+
+	// Commit the writer
+	_, _, _, err = p.commit(true, false)
+	require.NoError(t, err)
+	p.endRead(writerSlot)
+
+	// New reader should see the committed (modified) data
+	mf3, slot3, err := p.beginRead()
+	require.NoError(t, err)
+	defer p.endRead(slot3)
+
+	rpg2new, err := p.getPageAt(pg2no, mf3)
+	require.NoError(t, err)
+	assert.Equal(t, "modified!!", string(rpg2new.data[100:110]),
+		"new reader should see committed modified data")
+	p.cache.release(rpg2new)
+}
+
+// TestSpillInMemoryMode verifies that InMemory databases handle spill
+// correctly via writeFramesMem.
+func TestSpillInMemoryMode(t *testing.T) {
+	dir := t.TempDir()
+	cacheSize := 15
+	p := newPager(filepath.Join(dir, "test.db"), 4096, cacheSize, true)
+	p.inProcess = true
+	p.inMemory = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf)
+	require.NoError(t, p.beginWrite())
+
+	// Allocate pages exceeding cache to trigger spill via writeFramesMem
+	numPages := cacheSize * 3
+	pageNos := make([]uint32, numPages)
+	for i := 0; i < numPages; i++ {
+		pg, err := p.allocatePage()
+		require.NoError(t, err)
+		pageNos[i] = pg.pgno
+		copy(pg.data[100:], []byte(fmt.Sprintf("mem-%05d", i)))
+		p.releasePage(pg)
+	}
+
+	// Verify spilling occurred
+	assert.Greater(t, p.wal.nFrame.Load(), uint32(0),
+		"frames should have been written to memFrames via spill")
+
+	// Commit
+	_, _, _, err = p.commit(true, false)
+	require.NoError(t, err)
+	p.endRead(slot)
+
+	// Verify all data is readable
+	mf2, slot2, err := p.beginRead()
+	require.NoError(t, err)
+	defer p.endRead(slot2)
+
+	for i, pgno := range pageNos {
+		pg, err := p.getPageAt(pgno, mf2)
+		require.NoError(t, err, "failed to read page %d in InMemory mode", pgno)
+		expected := fmt.Sprintf("mem-%05d", i)
+		assert.Equal(t, expected, string(pg.data[100:109]),
+			"InMemory page %d data mismatch after spill+commit", i)
+		p.cache.release(pg)
+	}
 }
