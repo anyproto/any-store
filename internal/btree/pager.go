@@ -57,6 +57,10 @@ type pager struct {
 	// map (use getPageAt or readPageMVCC instead to avoid data races).
 	writePages map[uint32]*page
 
+	// savedWalFrame is the WAL frame count at beginWrite() time.
+	// Used to roll back spilled frames on transaction rollback.
+	savedWalFrame uint32
+
 	// Reusable slice for collecting dirty pages during commit
 	dirtyBuf []*page
 
@@ -318,6 +322,8 @@ func (p *pager) beginWrite() error {
 	p.state.Store(int32(pagerWriter))
 	// Save a snapshot of the database header so rollback can restore it (fix 5.2).
 	p.savedHeader = p.header
+	// Save WAL frame count so rollback can clean up spilled frames.
+	p.savedWalFrame = p.wal.nFrame.Load()
 	if p.writePages == nil {
 		p.writePages = make(map[uint32]*page, 64)
 	}
@@ -1156,6 +1162,11 @@ func (p *pager) rollback() error {
 		p.cache.discard(pg.pgno)
 	}
 
+	// Roll back spilled frames in the WAL index. Spilled frames in the WAL
+	// file are harmless (no commit marker), but pageMap entries and maxFrame
+	// must be restored to the pre-transaction state.
+	p.wal.index.rollbackToFrame(p.savedWalFrame)
+
 	// Restore the database header from the snapshot saved at beginWrite (fix 5.2).
 	// This ensures FirstFreelistPg, TotalFreelistPgs, and DatabaseSize are
 	// reverted to their pre-transaction values after dirty pages are discarded.
@@ -1257,6 +1268,9 @@ func (p *pager) rollbackToSavepoint(id int) error {
 			delete(p.writePages, pgno)
 		}
 	}
+
+	// Roll back spilled frames in the WAL index to the savepoint's WAL position.
+	p.wal.index.rollbackToFrame(sp.walFrame)
 
 	// Restore saved page copies from all savepoints being rolled back.
 	// Iterate from NEWEST to OLDEST (fix 9.1): this ensures that when a page

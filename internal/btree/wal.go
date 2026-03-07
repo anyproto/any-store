@@ -582,6 +582,29 @@ func (wi *walIndex) flushPendingShmFrames() {
 	wi.pendingShmFrames = wi.pendingShmFrames[:0]
 }
 
+// rollbackToFrame removes all pageMap entries with frame > target and restores
+// maxFrame to target. Also clears pendingShmFrames since spilled frames are
+// being discarded. Called on transaction rollback or savepoint rollback to
+// clean up frames written by spill (writeFrames with commit=false).
+func (wi *walIndex) rollbackToFrame(target uint32) {
+	wi.mu.Lock()
+	for pgno, frames := range wi.pageMap {
+		// Find cutoff: keep only frames <= target
+		n := len(frames)
+		for n > 0 && frames[n-1] > target {
+			n--
+		}
+		if n == 0 {
+			delete(wi.pageMap, pgno)
+		} else if n < len(frames) {
+			wi.pageMap[pgno] = frames[:n]
+		}
+	}
+	wi.mu.Unlock()
+	wi.maxFrame.Store(target)
+	wi.pendingShmFrames = wi.pendingShmFrames[:0]
+}
+
 // get returns the frame containing the latest version of pgno that is
 // within the given maxFrame snapshot, or 0 if not in WAL.
 // The maxFrame parameter limits which frames are visible (for snapshot isolation).

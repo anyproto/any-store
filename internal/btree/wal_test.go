@@ -692,6 +692,122 @@ func TestWriteFramesCommitFalseDoesNotWriteShmHash(t *testing.T) {
 	require.NoError(t, w.close())
 }
 
+func TestRollbackCleansUpSpilledFrames(t *testing.T) {
+	// After spilling frames (commit=false), rollbackToFrame should remove
+	// pageMap entries for spilled frames and restore maxFrame.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	w := newWal(path, 4096)
+	w.inProcess = true
+	require.NoError(t, w.open())
+	require.NoError(t, w.beginWrite())
+
+	// Commit pages 1 and 2 (frames 1 and 2)
+	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
+	copy(pg1.data, "committed page 1")
+	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
+	copy(pg2.data, "committed page 2")
+	require.NoError(t, w.writeFrames([]*page{pg1, pg2}, true, 2))
+
+	// Verify baseline state
+	savedFrame := w.nFrame.Load()
+	assert.Equal(t, uint32(2), savedFrame)
+	assert.Equal(t, uint32(2), w.index.maxFrame.Load())
+	assert.Equal(t, uint32(2), w.index.mxCommitFrame.Load())
+
+	// Spill pages 3 and 4 (frames 3 and 4, commit=false)
+	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
+	copy(pg3.data, "spilled page 3")
+	pg4 := &page{pgno: 4, data: make([]byte, 4096)}
+	copy(pg4.data, "spilled page 4")
+	require.NoError(t, w.writeFrames([]*page{pg3, pg4}, false, 0))
+
+	// Verify spilled state: maxFrame advanced but mxCommitFrame did not
+	assert.Equal(t, uint32(4), w.index.maxFrame.Load())
+	assert.Equal(t, uint32(2), w.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(4), w.nFrame.Load())
+
+	// Writer can see spilled frames in pageMap
+	assert.Equal(t, uint32(3), w.index.get(3, 4))
+	assert.Equal(t, uint32(4), w.index.get(4, 4))
+
+	// Rollback to savedFrame (discard spilled frames)
+	w.index.rollbackToFrame(savedFrame)
+
+	// maxFrame should be restored
+	assert.Equal(t, uint32(2), w.index.maxFrame.Load())
+
+	// Spilled pages should be gone from pageMap
+	assert.Equal(t, uint32(0), w.index.get(3, 10))
+	assert.Equal(t, uint32(0), w.index.get(4, 10))
+
+	// Committed pages should still be visible
+	assert.Equal(t, uint32(1), w.index.get(1, 10))
+	assert.Equal(t, uint32(2), w.index.get(2, 10))
+
+	// pendingShmFrames should be cleared
+	assert.Len(t, w.index.pendingShmFrames, 0)
+
+	w.endWrite()
+	require.NoError(t, w.close())
+}
+
+func TestRollbackToSavepointWithSpilledFrames(t *testing.T) {
+	// Savepoint, spill frames, rollback to savepoint — WAL index should
+	// be restored to the savepoint's walFrame position.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	w := newWal(path, 4096)
+	w.inProcess = true
+	require.NoError(t, w.open())
+	require.NoError(t, w.beginWrite())
+
+	// Commit pages 1 and 2 (frames 1 and 2)
+	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
+	copy(pg1.data, "committed page 1")
+	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
+	copy(pg2.data, "committed page 2")
+	require.NoError(t, w.writeFrames([]*page{pg1, pg2}, true, 2))
+
+	// Record the savepoint WAL position
+	savepointFrame := w.nFrame.Load()
+	assert.Equal(t, uint32(2), savepointFrame)
+
+	// Commit page 3 (frame 3) — this is after the savepoint
+	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
+	copy(pg3.data, "committed page 3")
+	require.NoError(t, w.writeFrames([]*page{pg3}, true, 3))
+
+	// Spill page 4 (frame 4, commit=false)
+	pg4 := &page{pgno: 4, data: make([]byte, 4096)}
+	copy(pg4.data, "spilled page 4")
+	require.NoError(t, w.writeFrames([]*page{pg4}, false, 0))
+
+	// Verify state before rollback
+	assert.Equal(t, uint32(4), w.index.maxFrame.Load())
+	assert.Equal(t, uint32(3), w.index.mxCommitFrame.Load())
+
+	// Rollback to savepoint (frame 2)
+	w.index.rollbackToFrame(savepointFrame)
+
+	// maxFrame should be restored to savepoint position
+	assert.Equal(t, uint32(2), w.index.maxFrame.Load())
+
+	// Pages written after savepoint should be gone
+	assert.Equal(t, uint32(0), w.index.get(3, 10))
+	assert.Equal(t, uint32(0), w.index.get(4, 10))
+
+	// Pages from before savepoint should still be visible
+	assert.Equal(t, uint32(1), w.index.get(1, 10))
+	assert.Equal(t, uint32(2), w.index.get(2, 10))
+
+	// pendingShmFrames should be cleared
+	assert.Len(t, w.index.pendingShmFrames, 0)
+
+	w.endWrite()
+	require.NoError(t, w.close())
+}
+
 func TestWriteFramesCommitFlushesToShm(t *testing.T) {
 	// After spill + commit, all frames (spilled and committed) should be
 	// visible in SHM hash tables.

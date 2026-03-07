@@ -114,14 +114,14 @@ The current `writeFrames()` has bugs that must be fixed first. Calling `writeFra
 
 **Problem:** After spill, frames are in WAL and `pageMap`. On rollback, they must be cleaned up. Spilled frames in WAL are harmless (no commit marker), but `pageMap` entries and `maxFrame` must be restored.
 
-- [ ] Add `savedWalFrame uint32` field to `pager` struct (`pager.go:32`)
-- [ ] Update `beginWrite()` (`pager.go:314`): save `p.savedWalFrame = p.wal.nFrame.Load()`
-- [ ] Add `rollbackToFrame(frame uint32)` method to `walIndex`: remove `pageMap` entries with frame > target, restore `maxFrame`, clear `pendingShmFrames`
-- [ ] Update `pager.rollback()` (`pager.go:1146`): call `walIndex.rollbackToFrame(p.savedWalFrame)` after discarding dirty pages
-- [ ] Update `pager.rollbackToSavepoint()` (`pager.go:1234`): roll back WAL to savepoint's `walFrame` count via `rollbackToFrame()`
-- [ ] Write tests: `TestRollbackCleansUpSpilledFrames` — spill, rollback, verify `pageMap` rolled back and `maxFrame` restored
-- [ ] Write tests: `TestRollbackToSavepointWithSpilledFrames` — savepoint, spill, rollback to savepoint, verify correct state
-- [ ] Run tests — must pass before next task
+- [x] Add `savedWalFrame uint32` field to `pager` struct (`pager.go:32`)
+- [x] Update `beginWrite()` (`pager.go:314`): save `p.savedWalFrame = p.wal.nFrame.Load()`
+- [x] Add `rollbackToFrame(frame uint32)` method to `walIndex`: remove `pageMap` entries with frame > target, restore `maxFrame`, clear `pendingShmFrames`
+- [x] Update `pager.rollback()` (`pager.go:1146`): call `walIndex.rollbackToFrame(p.savedWalFrame)` after discarding dirty pages
+- [x] Update `pager.rollbackToSavepoint()` (`pager.go:1234`): roll back WAL to savepoint's `walFrame` count via `rollbackToFrame()`
+- [x] Write tests: `TestRollbackCleansUpSpilledFrames` — spill, rollback, verify `pageMap` rolled back and `maxFrame` restored
+- [x] Write tests: `TestRollbackToSavepointWithSpilledFrames` — savepoint, spill, rollback to savepoint, verify correct state
+- [x] Run tests — must pass before next task
 
 ### Task 4: Cross-process reader isolation verification
 
