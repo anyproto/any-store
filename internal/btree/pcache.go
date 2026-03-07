@@ -146,7 +146,12 @@ func (pc *pcache) release(p *page) {
 	p.pinCount--
 	if p.pinCount <= 0 {
 		p.pinCount = 0
-		if !p.dirty {
+		// Only add to LRU if the page is still tracked in pcache.pages.
+		// After a stress spill + eviction, the page may still be referenced
+		// by pager.writePages but is no longer in pcache.pages. Adding such
+		// "ghost" pages to the LRU would cause evictOne to loop without
+		// reducing len(pages).
+		if !p.dirty && pc.pages[p.pgno] == p {
 			pc.lruAppend(p)
 		}
 	}
@@ -191,6 +196,30 @@ func (pc *pcache) fetchAndMakeDirty(pgno uint32) *page {
 	}
 	pc.mu.Unlock()
 	return p
+}
+
+// reinsertDirty re-registers a page in the cache (if evicted) and marks it
+// dirty. Used when a spilled page (made clean by pagerStress, possibly
+// evicted from pcache) is re-acquired for writing via pager.writePages.
+// Without this, post-spill modifications would be lost at commit time
+// because appendDirtyPages only collects dirty pages.
+func (pc *pcache) reinsertDirty(p *page) {
+	pc.mu.Lock()
+	if pc.pages[p.pgno] != p {
+		pc.pages[p.pgno] = p
+	}
+	if !p.dirty {
+		p.dirty = true
+		pc.lruRemove(p)
+		p.next = pc.dirtyHead
+		p.prev = nil
+		if pc.dirtyHead != nil {
+			pc.dirtyHead.prev = p
+		}
+		pc.dirtyHead = p
+		pc.nDirty++
+	}
+	pc.mu.Unlock()
 }
 
 // makeClean marks a page as clean (after writing to disk).

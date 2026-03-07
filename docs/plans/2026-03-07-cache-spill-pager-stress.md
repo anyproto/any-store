@@ -153,21 +153,21 @@ Add a stress callback that the pager registers, invoked when cache is full and a
 
 Register a stress callback during pager initialization. When invoked, spill the given dirty page to the WAL.
 
-- [ ] Add `doNotSpill uint8` field to `pager` struct (bitmask for SPILLFLAG constants)
-- [ ] Add spillFlag constants: `spillFlagOff = 0x01`, `spillFlagRollback = 0x02`
-- [ ] Implement `pagerStress(pg *page) error` method:
+- [x] Add `doNotSpill uint8` field to `pager` struct (bitmask for SPILLFLAG constants)
+- [x] Add spillFlag constants: `spillFlagOff = 0x01`, `spillFlagRollback = 0x02`
+- [x] Implement `pagerStress(pg *page) error` method:
   1. Check `doNotSpill` flags — return nil if set
   2. If savepoints active: save page data in savepoint if not already saved (`subjournalPageIfRequired` equivalent)
   3. Call `writeFrames([pg], false, 0)` — spill single page to WAL without commit
   4. Call `cache.makeClean(pg)` — page becomes evictable
-- [ ] Register callback: in `newPager()` or `open()`, set `p.cache.xStress = p.pagerStress`
-- [ ] Update `rollback()` (`pager.go:1146`): set `doNotSpill |= spillFlagRollback` before restoring pages, clear after
-- [ ] Update `rollbackToSavepoint()` (`pager.go:1234`): set `doNotSpill |= spillFlagRollback` during restore, clear after
-- [ ] Write tests: `TestPagerStressSpillsDirtyPage` — trigger stress, verify page written to WAL without commit marker, page marked clean
-- [ ] Write tests: `TestPagerStressSpillFlagOff` — set spillFlagOff, verify no spill occurs
-- [ ] Write tests: `TestPagerStressSpillFlagRollback` — during rollback, verify no spill occurs
-- [ ] Write tests: `TestPagerStressWithSavepoint` — spill with active savepoint, verify page data saved for rollback
-- [ ] Run tests — must pass before next task
+- [x] Register callback: in `newPager()` or `open()`, set `p.cache.xStress = p.pagerStress`
+- [x] Update `rollback()` (`pager.go:1146`): set `doNotSpill |= spillFlagRollback` before restoring pages, clear after
+- [x] Update `rollbackToSavepoint()` (`pager.go:1234`): set `doNotSpill |= spillFlagRollback` during restore, clear after
+- [x] Write tests: `TestPagerStressSpillsDirtyPage` — trigger stress, verify page written to WAL without commit marker, page marked clean
+- [x] Write tests: `TestPagerStressSpillFlagOff` — set spillFlagOff, verify no spill occurs
+- [x] Write tests: `TestPagerStressSpillFlagRollback` — during rollback, verify no spill occurs
+- [x] Write tests: `TestPagerStressWithSavepoint` — spill with active savepoint, verify page data saved for rollback
+- [x] Run tests — must pass before next task
 
 ### Task 7: End-to-end commit flow with spill
 

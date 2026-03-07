@@ -28,6 +28,13 @@ const (
 	pagerError                    // Error state, requires rollback
 )
 
+// spillFlag constants control when the pagerStress callback is inhibited.
+// Modeled after SQLite's SPILLFLAG_* constants (pager.c:447-449).
+const (
+	spillFlagOff      uint8 = 0x01 // Never spill cache (user request)
+	spillFlagRollback uint8 = 0x02 // Currently rolling back, suppress spill
+)
+
 // pager manages database pages, cache, and WAL interaction.
 type pager struct {
 	mu       sync.RWMutex
@@ -60,6 +67,10 @@ type pager struct {
 	// savedWalFrame is the WAL frame count at beginWrite() time.
 	// Used to roll back spilled frames on transaction rollback.
 	savedWalFrame uint32
+
+	// doNotSpill is a bitmask of spillFlag* constants that inhibit the
+	// pagerStress callback. Modeled after SQLite's Pager.doNotSpill (pager.c:648).
+	doNotSpill uint8
 
 	// Reusable slice for collecting dirty pages during commit
 	dirtyBuf []*page
@@ -119,11 +130,13 @@ type savepointState struct {
 // newPager creates a new pager for the given database path.
 // purgeable controls whether the page cache can evict pages (false for InMemory databases).
 func newPager(path string, pageSize uint32, cacheSize int, purgeable bool) *pager {
-	return &pager{
+	p := &pager{
 		path:     path,
 		pageSize: pageSize,
 		cache:    newPcache(int(pageSize), cacheSize, purgeable),
 	}
+	p.cache.xStress = p.pagerStress
+	return p
 }
 
 // open opens the database file, initializes the WAL, and recovers if needed.
@@ -171,6 +184,7 @@ func (p *pager) open() error {
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
 	p.dbSize.Store(p.header.DatabaseSize)
 	p.cache = newPcache(int(p.pageSize), p.cache.maxPages, p.cache.purgeable)
+	p.cache.xStress = p.pagerStress
 
 	// Open WAL
 	p.wal = newWal(p.path+"-wal", p.pageSize)
@@ -255,6 +269,7 @@ func (p *pager) initNewDB() error {
 
 	p.dbSize.Store(1)
 	p.cache = newPcache(int(p.pageSize), p.cache.maxPages, p.cache.purgeable)
+	p.cache.xStress = p.pagerStress
 
 	// For inMemory mode, pre-populate page 1 in pcache so reads find it
 	if p.inMemory {
@@ -534,6 +549,13 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 		// so its content is meaningful again (fix 5.4). Matches SQLite's
 		// pcache.c:596-597 where PGHDR_DONT_WRITE is cleared by makeDirty.
 		delete(p.dontWritePages, pgno)
+		// Re-dirty pages that were made clean by pagerStress (spill).
+		// Without this, post-spill modifications would be lost at commit
+		// because appendDirtyPages only collects dirty pages. Also re-registers
+		// the page in pcache if it was evicted after the spill.
+		if !pg.dirty {
+			p.cache.reinsertDirty(pg)
+		}
 		// Save copy for savepoint rollback if needed (lazy copy-on-write)
 		if len(p.savepoints) > 0 {
 			sp := &p.savepoints[len(p.savepoints)-1]
@@ -1014,6 +1036,51 @@ func (p *pager) readWalFrameData(frame uint32, buf []byte) error {
 	return err
 }
 
+// pagerStress is the pcache stress callback invoked when the cache is full
+// and all clean pages are exhausted. It spills a single dirty page to the WAL
+// without committing, making it clean and evictable.
+// Modeled after SQLite's pagerStress() (pager.c:4609-4681).
+func (p *pager) pagerStress(pg *page) error {
+	// Do not spill if OFF or ROLLBACK flags are set (SQLite pager.c:4636-4641).
+	if p.doNotSpill&(spillFlagOff|spillFlagRollback) != 0 {
+		return nil
+	}
+
+	// Do not spill in error state (SQLite pager.c:4632).
+	if pagerState(p.state.Load()) == pagerError {
+		return nil
+	}
+
+	// Do not spill if not in a write transaction — readers share the cache
+	// and could trigger create(), but only the writer can write to WAL.
+	// DRIFT from SQLite: SQLite's pagerStress always has a writer context;
+	// our shared cache means readers can trigger xStress too.
+	if pagerState(p.state.Load()) != pagerWriter {
+		return nil
+	}
+
+	// subjournalPageIfRequired equivalent (SQLite pager.c:4647):
+	// Save page data for savepoint rollback before spilling.
+	if len(p.savepoints) > 0 {
+		sp := &p.savepoints[len(p.savepoints)-1]
+		if _, exists := sp.pages[pg.pgno]; !exists {
+			dataCopy := make([]byte, len(pg.data))
+			copy(dataCopy, pg.data)
+			sp.pages[pg.pgno] = dataCopy
+		}
+	}
+
+	// Write the page to WAL without commit (SQLite pager.c:4649).
+	if err := p.wal.writeFrames([]*page{pg}, false, 0); err != nil {
+		return err
+	}
+
+	// Mark the page as clean so it becomes evictable (SQLite pager.c:4677).
+	p.cache.makeClean(pg)
+
+	return nil
+}
+
 // commit writes all dirty pages to WAL and commits the transaction.
 // dataChanged/schemaChanged control whether FileChangeCount/SchemaCookie are
 // incremented. Returns the WAL frame count and the new counter values.
@@ -1156,6 +1223,9 @@ func (p *pager) rollback() error {
 		return nil
 	}
 
+	// Suppress spills during rollback (SQLite pager.c:2457).
+	p.doNotSpill |= spillFlagRollback
+
 	// Discard all dirty pages from cache
 	dirtyPages := p.cache.dirtyPages()
 	for _, pg := range dirtyPages {
@@ -1173,6 +1243,7 @@ func (p *pager) rollback() error {
 	p.header = p.savedHeader
 	p.dbSize.Store(p.header.DatabaseSize)
 
+	p.doNotSpill &^= spillFlagRollback
 	p.savepoints = p.savepoints[:0]
 	clear(p.writePages)
 	clear(p.dontWritePages)
@@ -1258,6 +1329,9 @@ func (p *pager) rollbackToSavepoint(id int) error {
 			id, sp.dbSize, p.dbSize.Load(), len(p.savepoints), len(p.writePages))
 	}
 
+	// Suppress spills during savepoint rollback (SQLite pager.c:2457).
+	p.doNotSpill |= spillFlagRollback
+
 	// Discard pages allocated after the savepoint
 	for pgno := range p.writePages {
 		if pgno > sp.dbSize {
@@ -1309,6 +1383,8 @@ func (p *pager) rollbackToSavepoint(id int) error {
 	// but the header was modified in memory (e.g., freelist changes).
 	p.header = sp.header
 	p.dbSize.Store(sp.dbSize)
+
+	p.doNotSpill &^= spillFlagRollback
 
 	// Remove savepoints above the target but keep the target itself.
 	// This matches SQLite's behavior (pager.c:7025): ROLLBACK TO keeps the

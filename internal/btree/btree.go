@@ -941,7 +941,25 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 	}
 	defer bt.pager.endRead(slot)
 
-	pg, err := bt.pager.getPageAt(bt.rootPage, maxFrame)
+	// For writable btrees, use maxFrame that includes spill frames.
+	// Spilled pages are written to WAL mid-transaction by pagerStress but
+	// are invisible to readers (mxCommitFrame). The writer must see them
+	// to traverse the tree correctly after spills + evictions.
+	if bt.writable {
+		if mf := bt.pager.wal.index.maxFrame.Load(); mf > maxFrame {
+			maxFrame = mf
+		}
+	}
+
+	// For writable btrees, use bt.getPage which checks writePages first
+	// to find pages that were spilled and evicted from pcache.
+	// For readers, use getPageAt with the snapshot maxFrame.
+	var pg *page
+	if bt.writable {
+		pg, err = bt.getPage(bt.rootPage)
+	} else {
+		pg, err = bt.pager.getPageAt(bt.rootPage, maxFrame)
+	}
 	if err != nil {
 		return buf, err
 	}
@@ -1018,7 +1036,11 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 			return buf, serr
 		}
 		bt.pager.releasePage(pg)
-		pg, err = bt.pager.getPageAt(childPgno, maxFrame)
+		if bt.writable {
+			pg, err = bt.getPage(childPgno)
+		} else {
+			pg, err = bt.pager.getPageAt(childPgno, maxFrame)
+		}
 		if err != nil {
 			return buf, err
 		}

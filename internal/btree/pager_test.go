@@ -6654,3 +6654,180 @@ func TestReadHeaderCountersIgnoresSpilledFrames(t *testing.T) {
 	p.wal.endWrite()
 	p.endRead(slot)
 }
+
+// ============================================================
+// pagerStress — stress callback tests
+// ============================================================
+
+func TestPagerStressSpillsDirtyPage(t *testing.T) {
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+
+	maxFrame, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(maxFrame)
+	require.NoError(t, p.beginWrite())
+	defer func() {
+		p.wal.endWrite()
+		p.endRead(slot)
+		p.close()
+	}()
+
+	// Allocate a new dirty page
+	pg2, err := p.allocatePage()
+	require.NoError(t, err)
+	pg2.data[100] = 0xBB
+	p.releasePage(pg2) // unpin so it can be a stress victim
+
+	// Capture WAL frame count before stress
+	nFrameBefore := p.wal.nFrame.Load()
+	mxCommitBefore := p.wal.index.mxCommitFrame.Load()
+
+	// Call pagerStress directly on the unpinned dirty page
+	err = p.pagerStress(pg2)
+	require.NoError(t, err)
+
+	// Verify: page written to WAL (nFrame advanced)
+	assert.Equal(t, nFrameBefore+1, p.wal.nFrame.Load(), "nFrame should advance by 1")
+
+	// Verify: mxCommitFrame NOT advanced (spill, not commit)
+	assert.Equal(t, mxCommitBefore, p.wal.index.mxCommitFrame.Load(), "mxCommitFrame should not advance")
+
+	// Verify: page is now clean
+	assert.False(t, pg2.dirty, "page should be clean after stress")
+
+	// Verify: spilled page data is in WAL (readable via pageMap)
+	frame := p.wal.index.getLatest(pg2.pgno)
+	assert.NotZero(t, frame, "spilled page should be in pageMap")
+}
+
+func TestPagerStressSpillFlagOff(t *testing.T) {
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+
+	maxFrame, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(maxFrame)
+	require.NoError(t, p.beginWrite())
+	defer func() {
+		p.doNotSpill &^= spillFlagOff
+		p.wal.endWrite()
+		p.endRead(slot)
+		p.close()
+	}()
+
+	// Allocate a dirty page
+	pg, err := p.allocatePage()
+	require.NoError(t, err)
+	pg.data[100] = 0xCC
+	p.releasePage(pg)
+
+	nFrameBefore := p.wal.nFrame.Load()
+
+	// Set spillFlagOff — should prevent spill
+	p.doNotSpill |= spillFlagOff
+	err = p.pagerStress(pg)
+	require.NoError(t, err)
+
+	// Verify: no WAL write occurred
+	assert.Equal(t, nFrameBefore, p.wal.nFrame.Load(), "nFrame should not change with spillFlagOff")
+
+	// Verify: page is still dirty
+	assert.True(t, pg.dirty, "page should remain dirty when spill is suppressed")
+}
+
+func TestPagerStressSpillFlagRollback(t *testing.T) {
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+
+	maxFrame, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(maxFrame)
+	require.NoError(t, p.beginWrite())
+	defer func() {
+		p.doNotSpill &^= spillFlagRollback
+		p.wal.endWrite()
+		p.endRead(slot)
+		p.close()
+	}()
+
+	// Allocate a dirty page
+	pg, err := p.allocatePage()
+	require.NoError(t, err)
+	pg.data[100] = 0xDD
+	p.releasePage(pg)
+
+	nFrameBefore := p.wal.nFrame.Load()
+
+	// Set spillFlagRollback — should prevent spill
+	p.doNotSpill |= spillFlagRollback
+	err = p.pagerStress(pg)
+	require.NoError(t, err)
+
+	// Verify: no WAL write occurred
+	assert.Equal(t, nFrameBefore, p.wal.nFrame.Load(), "nFrame should not change with spillFlagRollback")
+
+	// Verify: page is still dirty
+	assert.True(t, pg.dirty, "page should remain dirty during rollback")
+}
+
+func TestPagerStressWithSavepoint(t *testing.T) {
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+
+	maxFrame, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(maxFrame)
+	require.NoError(t, p.beginWrite())
+	defer func() {
+		p.wal.endWrite()
+		p.endRead(slot)
+		p.close()
+	}()
+
+	// Allocate and dirty a page BEFORE the savepoint
+	pg, err := p.allocatePage()
+	require.NoError(t, err)
+	pgno := pg.pgno
+	pg.data[0] = 0x01
+	pg.data[1] = 0x02
+	pg.data[2] = 0x03
+	p.releasePage(pg)
+
+	// Create a savepoint — page is dirty but not recorded in savepoint yet
+	spID, err := p.savepoint()
+	require.NoError(t, err)
+
+	// Verify page is NOT in the savepoint's pages map
+	assert.NotContains(t, p.savepoints[spID].pages, pgno,
+		"page should not be in savepoint before stress")
+
+	// Now call pagerStress to spill the page
+	err = p.pagerStress(pg)
+	require.NoError(t, err)
+
+	// Verify: page data was saved in the savepoint (subjournalPageIfRequired)
+	assert.Contains(t, p.savepoints[spID].pages, pgno,
+		"page should be saved in savepoint after stress")
+
+	// Verify saved data matches pre-spill content
+	savedData := p.savepoints[spID].pages[pgno]
+	assert.Equal(t, byte(0x01), savedData[0])
+	assert.Equal(t, byte(0x02), savedData[1])
+	assert.Equal(t, byte(0x03), savedData[2])
+
+	// Verify: page is clean after stress
+	assert.False(t, pg.dirty, "page should be clean after stress")
+
+	// Verify: page was written to WAL
+	frame := p.wal.index.getLatest(pgno)
+	assert.NotZero(t, frame, "spilled page should be in WAL")
+}
