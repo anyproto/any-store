@@ -77,11 +77,6 @@ type DB struct {
 	closing atomic.Bool // set to reject new transactions
 	closed  atomic.Bool // set when Close() is actually called
 
-	// activeWriteTx tracks the in-progress write transaction so that
-	// Close can force-rollback an abandoned WriteTx (one that was
-	// neither committed nor rolled back) and recover the write mutex.
-	activeWriteTx atomic.Pointer[WriteTx]
-
 	// Namespace root pages are stored in a master table on page 1.
 	// Format: each cell in the master B-tree maps namespace name -> root page number (4 bytes).
 	masterBT *btree
@@ -200,20 +195,19 @@ func (db *DB) Close() error {
 	}
 	db.closing.Store(true)
 
-	// Try to acquire write mutex. If an abandoned WriteTx holds it,
-	// TryLock will fail. In that case we force-rollback the abandoned
-	// transaction and release its locks. Go sync.Mutex is not
-	// goroutine-bound, so Unlock from a different goroutine is valid.
 	if !db.writeMu.TryLock() {
-		if tx := db.activeWriteTx.Load(); tx != nil && !tx.closed {
-			tx.closed = true
-			_ = tx.pager.rollback()
-			tx.pager.endRead(tx.walSlot)
-			db.activeWriteTx.Store(nil)
-			db.mu.RUnlock() // release the RLock held by BeginWrite
-			db.writeMu.Unlock()
+		// Writer holds writeMu. If pager is in writer state, the tx
+		// is abandoned — force rollback at the pager level, matching
+		// SQLite's sqlite3BtreeRollback() in sqlite3BtreeClose().
+		if pagerState(db.pager.state.Load()) == pagerWriter {
+			_ = db.pager.rollback()
+			db.pager.endRead(db.pager.writerWalSlot)
+			db.mu.RUnlock()     // release RLock held by BeginWrite
+			db.writeMu.Unlock() // release writeMu (cross-goroutine, valid in Go)
 		}
-		// Re-acquire to follow the existing protocol
+		// Re-acquire to follow existing protocol (blocks briefly if
+		// BeginWrite is in flight but hasn't reached pagerWriter yet —
+		// it will see closing==true and abort).
 		db.writeMu.Lock()
 	}
 	db.writeMu.Unlock()
@@ -311,6 +305,11 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 		return nil, err
 	}
 
+	// Store WAL slot on pager BEFORE beginWrite() so that Close can
+	// read it after observing pagerWriter via the atomic state store
+	// inside beginWrite() (happens-before guarantee).
+	db.pager.writerWalSlot = slot
+
 	if err := db.pager.beginWrite(); err != nil {
 		db.pager.endRead(slot)
 		db.mu.RUnlock()
@@ -331,7 +330,6 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	tx.ReadTx.localSchemaCookie = db.localSchemaCookie.Load()
 	tx.dataChanged = false   // pool reuse safety
 	tx.schemaChanged = false // pool reuse safety
-	db.activeWriteTx.Store(tx)
 	return tx, nil
 }
 
@@ -914,7 +912,6 @@ func (tx *WriteTx) Commit() error {
 		return ErrTxClosed
 	}
 	tx.closed = true
-	tx.db.activeWriteTx.Store(nil)
 	nFrame, newFCC, newSC, err := tx.pager.commit(tx.dataChanged, tx.schemaChanged)
 	if err == nil {
 		tx.db.localFileChangeCounter.Store(newFCC)
@@ -942,7 +939,6 @@ func (tx *WriteTx) Rollback() error {
 		return ErrTxClosed
 	}
 	tx.closed = true
-	tx.db.activeWriteTx.Store(nil)
 	err := tx.pager.rollback()
 	tx.pager.endRead(tx.walSlot)
 	db := tx.db

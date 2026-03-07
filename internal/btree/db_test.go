@@ -3020,11 +3020,9 @@ func TestWriteTxAbandonedThenNewWriteTxWorks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Manually force-release the abandoned tx (simulates what Close does internally)
-	tx1.closed = true
+	// Force-release the abandoned tx at pager level (what Close does)
 	_ = tx1.pager.rollback()
 	tx1.pager.endRead(tx1.walSlot)
-	db.activeWriteTx.Store(nil)
 	db.mu.RUnlock()
 	db.writeMu.Unlock()
 
@@ -3036,36 +3034,6 @@ func TestWriteTxAbandonedThenNewWriteTxWorks(t *testing.T) {
 	if err := tx2.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestWriteTxCommitClearsActiveWriteTx(t *testing.T) {
-	db := tempDB(t)
-
-	tx, err := db.BeginWrite()
-	require.NoError(t, err)
-
-	// activeWriteTx should be set
-	assert.NotNil(t, db.activeWriteTx.Load())
-
-	require.NoError(t, tx.Commit())
-
-	// activeWriteTx should be cleared after commit
-	assert.Nil(t, db.activeWriteTx.Load())
-}
-
-func TestWriteTxRollbackClearsActiveWriteTx(t *testing.T) {
-	db := tempDB(t)
-
-	tx, err := db.BeginWrite()
-	require.NoError(t, err)
-
-	// activeWriteTx should be set
-	assert.NotNil(t, db.activeWriteTx.Load())
-
-	require.NoError(t, tx.Rollback())
-
-	// activeWriteTx should be cleared after rollback
-	assert.Nil(t, db.activeWriteTx.Load())
 }
 
 // === Bug 16: Double open prevention ===

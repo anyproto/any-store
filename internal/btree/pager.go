@@ -93,6 +93,14 @@ type pager struct {
 
 	// inMemory keeps the entire database in memory with no files on disk
 	inMemory bool
+
+	// writerWalSlot is the writer's WAL reader slot number, stored here
+	// so Close can release it when force-rolling back an abandoned WriteTx.
+	// Written by BeginWrite before pager.beginWrite() (which stores
+	// pagerWriter atomically), so it is visible to Close after observing
+	// pagerWriter via state.Load() (Go memory model: sequenced-before →
+	// happens-before the atomic store, synchronized-with the atomic load).
+	writerWalSlot int
 }
 
 // savepointState captures the state needed to rollback to a savepoint.
