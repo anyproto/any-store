@@ -1076,7 +1076,10 @@ func (p *pager) pagerStress(pg *page) error {
 
 	// Skip dontWrite pages (freed freelist leaves whose content is irrelevant).
 	// SQLite checks PGHDR_DONT_WRITE in pagerStress (pager.c:4642-4644).
+	// Make them clean so they become evictable — without this, the cache grows
+	// unbounded when many freed pages accumulate as the only dirty victims.
 	if p.dontWritePages[pg.pgno] {
+		p.cache.makeClean(pg)
 		return nil
 	}
 
@@ -1632,7 +1635,15 @@ func (p *pager) readOverflowChainInternal(firstPgno uint32, buf []byte, walMaxFr
 		if mvcc {
 			pg, err = p.readPageUncached(pgno, walMaxFrame)
 		} else {
-			pg, err = p.getPageAt(pgno, walMaxFrame)
+			// Writer path: check writePages first for pages that were spilled
+			// by pagerStress and evicted from cache. These pages won't be found
+			// by getPageAt because their WAL frames are beyond mxCommitFrame.
+			if wp := p.writePages[pgno]; wp != nil {
+				wp.pinCount++
+				pg = wp
+			} else {
+				pg, err = p.getPageAt(pgno, walMaxFrame)
+			}
 		}
 		if err != nil {
 			return err
