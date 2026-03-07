@@ -988,14 +988,27 @@ Practical issues and limitations with severity ratings, organized by subsystem.
 
 ### WAL
 
-**No Cache Spill (pagerStress)** -- Severity: Critical (skipped)
+**Cache Spill (pagerStress)** -- Severity: Critical (implemented)
 
-SQLite's `pagerStress()` writes dirty pages to the WAL mid-transaction when the
-cache is full, then marks them clean for eviction. Our cache grows unbounded
-during large transactions. A transaction modifying 100K 4KB pages consumes ~400MB
-regardless of cache size setting. Requires mid-transaction non-commit WAL frames,
-a pcache stress callback, and pager sub-states. The current unbounded growth is a
-memory issue, not a correctness issue.
+Implements SQLite's `pagerStress()` mechanism: when the page cache is full and
+all clean pages are exhausted, the pcache stress callback spills dirty pages to
+the WAL mid-transaction (non-commit frames with `dbSize=0`), marks them clean,
+and makes them evictable. This bounds cache memory to approximately `CacheSize`
+during large write transactions.
+
+Key components:
+- `walIndex.mxCommitFrame`: separates committed frame count (visible to readers)
+  from total frame count including spilled frames (writer-internal)
+- `walIndex.pendingShmFrames` + `flushPendingShmFrames()`: defers SHM hash writes
+  until commit so cross-process readers cannot see uncommitted spilled frames
+- `walIndex.rollbackToFrame()`: cleans up `pageMap` entries and restores
+  `maxFrame` on rollback of transactions with spilled frames
+- `pcache.xStress`: callback invoked when cache is full and `nClean == 0`;
+  finds an unpinned dirty victim page for spilling
+- `pager.pagerStress()`: the stress callback implementation — saves savepoint
+  data if needed, writes the page to WAL with `commit=false`, marks it clean
+- `pager.doNotSpill`: bitmask (`spillFlagOff`, `spillFlagRollback`) preventing
+  re-entrant spills during rollback operations
 
 **Checkpoint Copies All Frame Versions** -- Severity: Minor
 

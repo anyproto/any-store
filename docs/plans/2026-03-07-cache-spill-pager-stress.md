@@ -202,8 +202,8 @@ End-to-end tests verifying bounded memory, concurrent readers, checkpoint, and I
 
 ### Task 10: [Final] Update documentation
 
-- [ ] Update `internal/btree/NOTES.md` line ~991: change "Severity: Critical (skipped)" to document implementation
-- [ ] Update README.md if needed
+- [x] Update `internal/btree/NOTES.md` line ~991: change "Severity: Critical (skipped)" to document implementation
+- [x] Update README.md if needed
 
 ## Technical Details
 
