@@ -13,8 +13,6 @@ func osOpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
 
 var osRemove = os.Remove
 
-func fdatasync(f *os.File) error { return f.Sync() }
-
 // SetVFS replaces OS-level operations. Panics unless built with -tags vfs.
 func SetVFS(_ VFS) {
 	panic("btree: SetVFS requires building with -tags vfs")

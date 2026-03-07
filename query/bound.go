@@ -71,51 +71,52 @@ func (bs Bounds) String() string {
 	return sb.String()
 }
 func (bs Bounds) Append(b Bound) Bounds {
-	var result = bs[:0]
+	if len(bs) == 0 {
+		return Bounds{b}
+	}
 
-	// Flag to check if the new bound has been merged
-	merged := false
+	// Fast path for single existing bound (covers Eq, Gte, Lte and second call from Ne).
+	if len(bs) == 1 {
+		if isOverlap(bs[0], b) && isOverlap(b, bs[0]) {
+			return Bounds{mergeBounds(bs[0], b)}
+		}
+		if bytes.Compare(b.Start, bs[0].Start) < 0 {
+			return Bounds{b, bs[0]}
+		}
+		return Bounds{bs[0], b}
+	}
 
-	// Iterate through existing bounds
+	result := make(Bounds, 0, len(bs)+1)
 	for _, existingBound := range bs {
-		// Check for overlap
 		if isOverlap(existingBound, b) && isOverlap(b, existingBound) {
-			// Merge overlapping bounds
-			mergedBound := mergeBounds(existingBound, b)
-			result = append(result, mergedBound)
-			merged = true
+			b = mergeBounds(existingBound, b)
 		} else {
-			// No overlap, add the existing bound as it is
 			result = append(result, existingBound)
 		}
 	}
 
-	// If the new bound wasn't merged, add it separately
-	if !merged {
-		result = append(result, b)
-		sort.Sort(result)
-	}
-
+	result = append(result, b)
+	sort.Sort(result)
 	return result
 }
 
-func (bs Bounds) Merge() Bounds {
-	var nbs = bs[:0]
-	var needMerge bool
-	for i := 0; i < bs.Len()-1; i++ {
-		if isOverlap(bs[i], bs[i+1]) && isOverlap(bs[i+1], bs[i]) {
-			needMerge = true
-			break
-		}
-	}
-	if needMerge {
-		for i := range bs {
-			nbs = nbs.Append(bs[i])
-		}
-		return nbs.Merge()
-	} else {
+// SortAndMerge sorts bounds by Start key and merges overlapping/adjacent entries
+// in a single O(N log N) pass. Use after batch-appending multiple bounds.
+func (bs Bounds) SortAndMerge() Bounds {
+	if len(bs) <= 1 {
 		return bs
 	}
+	sort.Sort(bs)
+	result := bs[:1] // reuse backing array, safe since result grows ≤ input
+	for _, b := range bs[1:] {
+		last := &result[len(result)-1]
+		if isOverlap(*last, b) && isOverlap(b, *last) {
+			*last = mergeBounds(*last, b)
+		} else {
+			result = append(result, b)
+		}
+	}
+	return result
 }
 
 func isOverlap(a, b Bound) bool {

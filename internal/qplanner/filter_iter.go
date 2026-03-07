@@ -14,12 +14,11 @@ import (
 // It reuses upstream cached DocParsed when available (e.g. from FetchIter),
 // and caches its own parsed result in Plan.DocParsed to avoid double-fetch.
 type FilterIter struct {
-	Source     Iterator
-	Data       *CursorSource
-	Filter     query.Filter
-	Buf        *syncpool.DocBuffer
-	Plan       *Plan // set by BuildPlan to cache fetched doc values
-	dataCursor *btree.Cursor
+	Source Iterator
+	Data   *CursorSource
+	Filter query.Filter
+	Buf    *syncpool.DocBuffer
+	Plan   *Plan // set by BuildPlan to cache fetched doc values
 }
 
 func (it *FilterIter) Next() (key []byte, docId []byte, err error) {
@@ -34,18 +33,15 @@ func (it *FilterIter) Next() (key []byte, docId []byte, err error) {
 			// Reuse parsed value from upstream FetchIter
 			doc = it.Plan.DocParsed
 		} else {
-			if it.dataCursor == nil {
-				it.dataCursor = it.Data.NewCursor()
+			// Cursor-free point lookup: avoids Cursor allocation
+			it.Buf.DocBuf, err = it.Data.AppendValue(docId, it.Buf.DocBuf[:0])
+			if err != nil {
+				if err == btree.ErrKeyNotFound {
+					// doc may have been deleted from data but still in index; skip
+					continue
+				}
+				return nil, nil, err
 			}
-			if serr := it.dataCursor.SeekExact(docId); serr != nil {
-				// doc may have been deleted from data but still in index; skip
-				continue
-			}
-			val, verr := it.dataCursor.Value()
-			if verr != nil {
-				return nil, nil, verr
-			}
-			it.Buf.DocBuf = append(it.Buf.DocBuf[:0], val...)
 
 			var perr error
 			doc, perr = it.Buf.Parser.Parse(it.Buf.DocBuf)
@@ -69,9 +65,6 @@ func (it *FilterIter) Next() (key []byte, docId []byte, err error) {
 
 // Close releases resources by closing the source iterator.
 func (it *FilterIter) Close() {
-	if it.dataCursor != nil {
-		it.dataCursor.Close()
-	}
 	if it.Source != nil {
 		it.Source.Close()
 	}

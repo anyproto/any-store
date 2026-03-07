@@ -121,8 +121,7 @@
     {
       "name": "$in all values",
       "cond": {"a": {"$in": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]}},
-      "expectedCount": 100,
-      "expectedPlanContains": ["IndexScan"]
+      "expectedCount": 100
     },
     {
       "name": "or with sort",

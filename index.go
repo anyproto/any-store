@@ -68,11 +68,14 @@ type index struct {
 	sketch         *qplanner.IndexSketch
 	sketchModified bool
 
+	cboInfo *qplanner.IndexInfo // cached CBO index info, built once during init
+
 	keyBuf      anyenc.Tuple
 	keysBuf     []anyenc.Tuple
 	keysBufPrev []anyenc.Tuple
 	uniqBuf     [][]anyenc.Tuple
-	fullKeyBuf  anyenc.Tuple // reusable buffer for non-unique index full keys (key+docId)
+	fullKeyBuf anyenc.Tuple // reusable buffer for full keys (key+docId)
+	seekBuf    anyenc.Tuple // reusable buffer for unique constraint seek results
 }
 
 func validateIndexField(s string) (err error) {
@@ -105,6 +108,17 @@ func (idx *index) init() (err error) {
 		idx.reverse = append(idx.reverse, reverse)
 	}
 	idx.uniqBuf = make([][]anyenc.Tuple, len(idx.fieldPaths))
+
+	// Build cached CBO index info once (avoids per-query allocation)
+	idx.cboInfo = &qplanner.IndexInfo{
+		Name:       idx.info.Name,
+		FieldNames: idx.fieldNames,
+		FieldPaths: idx.fieldPaths,
+		Reverse:    idx.reverse,
+		Unique:     idx.info.Unique,
+		Sparse:     idx.info.Sparse,
+		Ns:         idx.ns,
+	}
 	return nil
 }
 
@@ -122,32 +136,29 @@ func (idx *index) Len(ctx context.Context) (count int, err error) {
 }
 
 // insertKeys inserts index entries for the given item into the index namespace.
+// Both unique and non-unique indexes use key=Tuple(fields..., docId), value=nil.
+// For unique indexes, a single-shot SeekKey + prefix check enforces the constraint.
 func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 	idx.fillKeysBuf(it)
 	idKey := it.appendId(nil)
-	var valueBuf []byte
+
 	for _, key := range idx.keysBuf {
+		idx.fullKeyBuf = append(idx.fullKeyBuf[:0], key...)
+		idx.fullKeyBuf = append(idx.fullKeyBuf, idKey...)
+
 		if idx.info.Unique {
-			// For unique indexes: key = Tuple(v1, v2, ...), value = docId
-			// Check if key already exists with a different docId
 			var err error
-			valueBuf, err = tx.AppendValue(idx.ns, key, valueBuf[:0])
-			if err == nil {
-				if !bytes.Equal(valueBuf, idKey) {
+			idx.seekBuf, err = tx.AppendSeekKey(idx.ns, key, idx.seekBuf[:0])
+			if err == nil && bytes.HasPrefix(idx.seekBuf, key) {
+				if !bytes.Equal(idx.seekBuf, idx.fullKeyBuf) {
 					return ErrUniqueConstraint
 				}
-				continue
+				continue // same doc, idempotent
 			}
-			if err := tx.Put(idx.ns, key, idKey); err != nil {
-				return err
-			}
-		} else {
-			// For non-unique indexes: key = Tuple(v1, v2, ..., docId), value = nil
-			idx.fullKeyBuf = append(idx.fullKeyBuf[:0], key...)
-			idx.fullKeyBuf = append(idx.fullKeyBuf, idKey...)
-			if err := tx.Put(idx.ns, idx.fullKeyBuf, nil); err != nil {
-				return err
-			}
+		}
+
+		if err := tx.Put(idx.ns, idx.fullKeyBuf, nil); err != nil {
+			return err
 		}
 		if idx.sketch != nil {
 			idx.sketch.Increment(key)
@@ -162,23 +173,16 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 }
 
 // deleteKeys deletes index entries for the given item from the index namespace.
+// Both unique and non-unique indexes use key=Tuple(fields..., docId), value=nil.
 func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 	idx.fillKeysBuf(it)
 	idKey := it.appendId(nil)
 	for _, key := range idx.keysBuf {
-		if idx.info.Unique {
-			if err := tx.Delete(idx.ns, key); err != nil {
-				if !errors.Is(err, btree.ErrKeyNotFound) {
-					return err
-				}
-			}
-		} else {
-			idx.fullKeyBuf = append(idx.fullKeyBuf[:0], key...)
-			idx.fullKeyBuf = append(idx.fullKeyBuf, idKey...)
-			if err := tx.Delete(idx.ns, idx.fullKeyBuf); err != nil {
-				if !errors.Is(err, btree.ErrKeyNotFound) {
-					return err
-				}
+		idx.fullKeyBuf = append(idx.fullKeyBuf[:0], key...)
+		idx.fullKeyBuf = append(idx.fullKeyBuf, idKey...)
+		if err := tx.Delete(idx.ns, idx.fullKeyBuf); err != nil {
+			if !errors.Is(err, btree.ErrKeyNotFound) {
+				return err
 			}
 		}
 		if idx.sketch != nil {

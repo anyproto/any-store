@@ -10,15 +10,14 @@ import (
 )
 
 // IndexIter iterates over an index namespace using bounds.
-// For non-unique indexes, key = indexFields + docId; for unique indexes, value = docId.
+// key = indexFields + docId for both unique and non-unique indexes.
 type IndexIter struct {
-	Source  *CursorSource
-	IdxInfo *IndexInfo
-	Bounds  query.Bounds
-	Reverse bool
-
+	Source   *CursorSource
+	IdxInfo  *IndexInfo
 	cursor   *btree.Cursor
+	Bounds   query.Bounds
 	boundIdx int
+	Reverse  bool
 	started  bool
 }
 
@@ -168,6 +167,51 @@ func (it *IndexIter) nextNoBounds() (key []byte, docId []byte, err error) {
 	return it.extractResult(k)
 }
 
+// CountEntries counts all entries within bounds using batch page-level counting.
+// This is much faster than calling Next() repeatedly when only a count is needed.
+func (it *IndexIter) CountEntries() (int, error) {
+	if it.cursor == nil {
+		it.cursor = it.Source.NewCursor()
+	}
+
+	total := 0
+	for _, b := range it.Bounds {
+		// Seek to start
+		if len(b.Start) > 0 {
+			if err := it.cursor.Seek(b.Start); err != nil {
+				return 0, err
+			}
+			if it.cursor.Valid() && !b.StartInclude {
+				k, kerr := it.cursor.Key()
+				if kerr != nil {
+					return 0, kerr
+				}
+				if bytes.Equal(k, b.Start) {
+					if err := it.cursor.Next(); err != nil {
+						return 0, err
+					}
+				}
+			}
+		} else {
+			if err := it.cursor.First(); err != nil {
+				return 0, err
+			}
+		}
+
+		if !it.cursor.Valid() {
+			continue
+		}
+
+		// Use batch counting
+		n, err := it.cursor.CountUntil(b.End, b.EndInclude)
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
 // Close releases the underlying cursor resources.
 func (it *IndexIter) Close() {
 	if it.cursor != nil {
@@ -177,14 +221,7 @@ func (it *IndexIter) Close() {
 }
 
 func (it *IndexIter) extractResult(k []byte) (key []byte, docId []byte, err error) {
-	if it.IdxInfo.Unique {
-		val, verr := it.cursor.Value()
-		if verr != nil {
-			return nil, nil, verr
-		}
-		return k, val, nil
-	}
-	// Non-unique: key = indexFields + docId, extract docId
+	// Both unique and non-unique: key = indexFields + docId
 	docID := extractDocId(k, len(it.IdxInfo.FieldNames))
 	return k, docID, nil
 }

@@ -25,7 +25,7 @@ type Filter interface {
 
 type CompOp uint8
 
-var orExpressionLimit = 950
+var orExpressionLimit = 10000
 
 const (
 	CompOpEq CompOp = iota
@@ -274,17 +274,20 @@ func (e In) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 }
 
 func (e In) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
-	if len(e.Values) < orExpressionLimit {
-		for val := range e.Values {
-			bs = bs.Append(Bound{
-				Start:        []byte(val),
-				End:          []byte(val),
-				StartInclude: true,
-				EndInclude:   true,
-			})
-		}
+	if len(e.Values) >= orExpressionLimit {
+		return bs
 	}
-	return bs
+	result := make(Bounds, len(bs), len(bs)+len(e.Values))
+	copy(result, bs)
+	for val := range e.Values {
+		result = append(result, Bound{
+			Start:        []byte(val),
+			End:          []byte(val),
+			StartInclude: true,
+			EndInclude:   true,
+		})
+	}
+	return result.SortAndMerge()
 }
 
 func (e In) String() string {
@@ -316,13 +319,16 @@ func (e Or) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	if len(e) > orExpressionLimit {
 		return bs
 	}
+	result := make(Bounds, len(bs), len(bs)+len(e))
+	copy(result, bs)
 	for _, f := range e {
-		beforeBounds := len(bs)
-		if bs = f.IndexBounds(fieldName, bs); len(bs) == beforeBounds {
-			return
+		beforeLen := len(result)
+		result = f.IndexBounds(fieldName, result)
+		if len(result) == beforeLen {
+			return bs // branch produced no bounds → can't narrow
 		}
 	}
-	return bs
+	return result.SortAndMerge()
 }
 
 func (e Or) String() string {

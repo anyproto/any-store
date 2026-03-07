@@ -7,6 +7,7 @@ import (
 	"slices"
 	"unsafe"
 
+	"github.com/klauspost/compress/s2"
 	"github.com/valyala/fastjson"
 )
 
@@ -120,6 +121,8 @@ func parseValue(b []byte, c *cache) (v *Value, tail []byte, err error) {
 		return valueFalse, b[1:], nil
 	case TypeNull:
 		return valueNull, b[1:], nil
+	case TypeCompressedObjectS2:
+		return parseCompressedObjectS2(b, c)
 	default:
 		return nil, nil, fmt.Errorf("unknown type %d", Type(b[0]))
 	}
@@ -211,7 +214,8 @@ func parseBinary(b []byte, c *cache) (*Value, []byte, error) {
 }
 
 type cache struct {
-	vs []Value
+	vs        []Value
+	decompBuf []byte
 }
 
 func (c *cache) reset() {
@@ -227,5 +231,41 @@ func (c *cache) approxSize() (size int) {
 	for _, v := range c.vs[:cap(c.vs)] {
 		size += len(v.v) + int(valueSize)
 	}
+	size += cap(c.decompBuf)
 	return
+}
+
+func parseCompressedObjectS2(b []byte, c *cache) (*Value, []byte, error) {
+	if len(b) < 5 {
+		return nil, nil, fmt.Errorf("compressed object: expected at least 5 bytes, got %d", len(b))
+	}
+	compLen := binary.BigEndian.Uint32(b[1:5])
+	if uint32(len(b)-5) < compLen {
+		return nil, nil, fmt.Errorf("compressed object: expected %d compressed bytes, got %d", compLen, len(b)-5)
+	}
+	compressed := b[5 : 5+compLen]
+	tail := b[5+compLen:]
+
+	var (
+		decompressed []byte
+		err          error
+	)
+	if c != nil {
+		c.decompBuf, err = s2.Decode(c.decompBuf[:cap(c.decompBuf)], compressed)
+		if err != nil {
+			return nil, nil, fmt.Errorf("compressed object: s2 decode: %w", err)
+		}
+		decompressed = c.decompBuf
+	} else {
+		decompressed, err = s2.Decode(nil, compressed)
+		if err != nil {
+			return nil, nil, fmt.Errorf("compressed object: s2 decode: %w", err)
+		}
+	}
+
+	v, _, err := parseValue(decompressed, c)
+	if err != nil {
+		return nil, nil, fmt.Errorf("compressed object: parse inner: %w", err)
+	}
+	return v, tail, nil
 }

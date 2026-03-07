@@ -13,15 +13,14 @@ import (
 // FullScanIter scans the data namespace, applies a filter in memory,
 // and optionally applies id-bounds to skip ranges.
 type FullScanIter struct {
-	Source   *CursorSource
 	Filter   query.Filter
-	IDBounds query.Bounds
+	Source   *CursorSource
 	Buf      *syncpool.DocBuffer
-	Reverse  bool
 	Plan     *Plan // set by setPlanRef for doc value caching
-
 	cursor   *btree.Cursor
+	IDBounds query.Bounds
 	boundIdx int
+	Reverse  bool
 	started  bool
 }
 

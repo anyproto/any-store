@@ -16,16 +16,18 @@ const (
 	TypeTrue   = Type(5)
 	TypeArray  = Type(6)
 	TypeObject = Type(7)
-	TypeBinary = Type(8)
+	TypeBinary             = Type(8)
+	TypeCompressedObjectS2 = Type(9)
 
-	iTypeNull   = ^Type(1)
-	iTypeNumber = ^Type(2)
-	iTypeString = ^Type(3)
-	iTypeFalse  = ^Type(4)
-	iTypeTrue   = ^Type(5)
-	iTypeArray  = ^Type(6)
-	iTypeObject = ^Type(7)
-	iTypeBinary = ^Type(8)
+	iTypeNull               = ^Type(1)
+	iTypeNumber             = ^Type(2)
+	iTypeString             = ^Type(3)
+	iTypeFalse              = ^Type(4)
+	iTypeTrue               = ^Type(5)
+	iTypeArray              = ^Type(6)
+	iTypeObject             = ^Type(7)
+	iTypeBinary             = ^Type(8)
+	iTypeCompressedObjectS2 = ^Type(9)
 )
 
 const (
@@ -50,6 +52,8 @@ func (t Type) String() string {
 		return "object"
 	case TypeBinary:
 		return "binary"
+	case TypeCompressedObjectS2:
+		return "compressedObjectS2"
 	default:
 		return fmt.Sprintf("unknown type: %d", t)
 	}

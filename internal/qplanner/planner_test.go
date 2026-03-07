@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/query"
 )
 
@@ -96,7 +97,8 @@ func TestBuildPlan_IndexScan_SortWithoutLimit(t *testing.T) {
 }
 
 func TestBuildPlan_LowSelectivity_FullScan(t *testing.T) {
-	// When index estimates most of the collection, full scan is cheaper.
+	// When index estimates most of the collection, full scan is cheaper
+	// because sequential reads + filter is cheaper than seek + random fetch + filter.
 	plan := BuildPlan(&PlanParams{
 		Filter:    query.MustParseCondition(`{"a": 42}`),
 		TotalDocs: 100,
@@ -108,8 +110,7 @@ func TestBuildPlan_LowSelectivity_FullScan(t *testing.T) {
 			BoundFields: 1,
 		}},
 	})
-	// With 100% selectivity, both plans cost the same → tie-break prefers index
-	assert.Equal(t, "IndexSeek", plan.Name)
+	assert.Equal(t, "FullScan", plan.Name)
 }
 
 func TestBuildPlan_UniqueIndex_CoverLookup(t *testing.T) {
@@ -195,8 +196,8 @@ func TestBuildPlan_SingleDoc(t *testing.T) {
 			BoundFields: 1,
 		}},
 	})
-	// With 1 doc, IndexSeek should tie or beat FullScan
-	assert.Equal(t, "IndexSeek", plan.Name)
+	// With 1 doc, FullScan is cheaper than index seek overhead
+	assert.Equal(t, "FullScan", plan.Name)
 }
 
 func TestBuildPlan_IDBounds_FullScan(t *testing.T) {
@@ -219,17 +220,17 @@ func TestBuildPlan_IDBounds_FullScan(t *testing.T) {
 }
 
 func TestCalculateSelectivity_NoFilter(t *testing.T) {
-	p := calculateSelectivity(nil, nil, 100)
+	p := calculateSelectivity(nil, nil, 100, nil)
 	assert.Equal(t, 1.0, p)
 }
 
 func TestCalculateSelectivity_AllFilter(t *testing.T) {
-	p := calculateSelectivity(query.All{}, nil, 100)
+	p := calculateSelectivity(query.All{}, nil, 100, nil)
 	assert.Equal(t, 1.0, p)
 }
 
 func TestCalculateSelectivity_NoIndexes(t *testing.T) {
-	p := calculateSelectivity(query.MustParseCondition(`{"a": 1}`), nil, 100)
+	p := calculateSelectivity(query.MustParseCondition(`{"a": 1}`), nil, 100, nil)
 	assert.Equal(t, DefaultRangeSelectivity, p)
 }
 
@@ -307,10 +308,16 @@ func TestAllBoundsFixed(t *testing.T) {
 	})
 }
 
+func buildBoundsResult(idx *IndexInfo, cond query.Filter) *BoundsResult {
+	var br BoundsResult
+	br.Build([]*IndexInfo{idx}, cond)
+	return &br
+}
+
 func TestComputeIndexBounds_SingleField(t *testing.T) {
 	idx := &IndexInfo{FieldNames: []string{"a"}}
 	cond := query.MustParseCondition(`{"a": 5}`)
-	bounds, chainLen := ComputeIndexBounds(idx, cond)
+	bounds, chainLen := ComputeIndexBounds(idx, buildBoundsResult(idx, cond))
 	require.True(t, len(bounds) > 0, "should produce bounds for equality")
 	assert.Equal(t, 1, chainLen)
 }
@@ -318,7 +325,7 @@ func TestComputeIndexBounds_SingleField(t *testing.T) {
 func TestComputeIndexBounds_CompoundField(t *testing.T) {
 	idx := &IndexInfo{FieldNames: []string{"a", "b"}}
 	cond := query.MustParseCondition(`{"a": 5, "b": 3}`)
-	bounds, chainLen := ComputeIndexBounds(idx, cond)
+	bounds, chainLen := ComputeIndexBounds(idx, buildBoundsResult(idx, cond))
 	require.True(t, len(bounds) > 0, "should produce compound bounds")
 	assert.Equal(t, 2, chainLen)
 }
@@ -326,7 +333,7 @@ func TestComputeIndexBounds_CompoundField(t *testing.T) {
 func TestComputeIndexBounds_PartialCompound(t *testing.T) {
 	idx := &IndexInfo{FieldNames: []string{"a", "b", "c"}}
 	cond := query.MustParseCondition(`{"a": 5}`)
-	bounds, chainLen := ComputeIndexBounds(idx, cond)
+	bounds, chainLen := ComputeIndexBounds(idx, buildBoundsResult(idx, cond))
 	require.True(t, len(bounds) > 0)
 	assert.Equal(t, 1, chainLen) // only first field has bounds
 }
@@ -334,7 +341,7 @@ func TestComputeIndexBounds_PartialCompound(t *testing.T) {
 func TestComputeIndexBounds_NoMatch(t *testing.T) {
 	idx := &IndexInfo{FieldNames: []string{"x"}}
 	cond := query.MustParseCondition(`{"a": 5}`)
-	bounds, chainLen := ComputeIndexBounds(idx, cond)
+	bounds, chainLen := ComputeIndexBounds(idx, buildBoundsResult(idx, cond))
 	assert.Nil(t, bounds)
 	assert.Equal(t, 0, chainLen)
 }
@@ -345,8 +352,9 @@ func TestAdjustBoundsForNonUnique(t *testing.T) {
 	}
 	adjusted := AdjustBoundsForNonUnique(bounds)
 	require.Len(t, adjusted, 1)
-	// End should be extended with 0xff
-	assert.True(t, len(adjusted[0].End) > len(bounds[0].End))
+	// End should be extended with 0xff (modified in-place)
+	assert.Equal(t, anyenc.Tuple{1, 0xff}, adjusted[0].End)
+	assert.Equal(t, anyenc.Tuple{1}, adjusted[0].Start)
 }
 
 func TestSortCost(t *testing.T) {

@@ -1132,7 +1132,7 @@ func (w *wal) flushHeader() error {
 	if _, err := w.file.WriteAt(buf, 0); err != nil {
 		return err
 	}
-	if err := w.file.Sync(); err != nil {
+	if err := fdatasync(w.file); err != nil {
 		return err
 	}
 	w.headerOnDisk = true
@@ -1156,7 +1156,7 @@ func (w *wal) writeHeader() error {
 	if _, err := w.file.WriteAt(buf, 0); err != nil {
 		return err
 	}
-	if err := w.file.Sync(); err != nil {
+	if err := fdatasync(w.file); err != nil {
 		return err
 	}
 

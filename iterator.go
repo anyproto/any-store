@@ -27,15 +27,15 @@ type Iterator interface {
 
 // planIterator wraps a qplanner.Plan to implement the public Iterator interface.
 type planIterator struct {
-	plan       *qplanner.Plan
 	tx         ReadTx
+	err        error
+	plan       *qplanner.Plan
 	buf        *syncpool.DocBuffer
 	qb         *queryBuilder
 	data       *qplanner.CursorSource
 	dataCursor *btree.Cursor
-	err        error
-	closed     bool
 	docId      []byte
+	closed     bool
 }
 
 func (pi *planIterator) Next() bool {
