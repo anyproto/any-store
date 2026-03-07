@@ -1052,21 +1052,19 @@ func (p *pager) readWalFrameData(frame uint32, buf []byte) error {
 // without committing, making it clean and evictable.
 // Modeled after SQLite's pagerStress() (pager.c:4609-4681).
 func (p *pager) pagerStress(pg *page) error {
-	// Do not spill if OFF or ROLLBACK flags are set (SQLite pager.c:4636-4641).
-	if p.doNotSpill&(spillFlagOff|spillFlagRollback) != 0 {
-		return nil
-	}
-
-	// Do not spill in error state (SQLite pager.c:4632).
-	if pagerState(p.state.Load()) == pagerError {
-		return nil
-	}
-
-	// Do not spill if not in a write transaction — readers share the cache
-	// and could trigger create(), but only the writer can write to WAL.
+	// Check pager state first (atomic) before accessing non-atomic fields.
+	// This guards against reader goroutines triggering xStress via create():
+	// readers will see state != pagerWriter and return immediately, avoiding
+	// a data race on doNotSpill which is only written by the writer goroutine.
 	// DRIFT from SQLite: SQLite's pagerStress always has a writer context;
 	// our shared cache means readers can trigger xStress too.
-	if pagerState(p.state.Load()) != pagerWriter {
+	st := pagerState(p.state.Load())
+	if st == pagerError || st != pagerWriter {
+		return nil
+	}
+
+	// Do not spill if OFF or ROLLBACK flags are set (SQLite pager.c:4636-4641).
+	if p.doNotSpill&(spillFlagOff|spillFlagRollback) != 0 {
 		return nil
 	}
 
@@ -1270,6 +1268,15 @@ func (p *pager) rollback() error {
 	p.wal.cksum1 = p.savedWalCksum1
 	p.wal.cksum2 = p.savedWalCksum2
 
+	// Truncate in-memory WAL frames to match restored nFrame. Without this,
+	// writeFramesMem appends past the stale entries, and readFrame(N) reads
+	// memFrames[N-1] which points to rolled-back data instead of new data.
+	if p.wal.inMemory {
+		p.wal.mu.Lock()
+		p.wal.memFrames = p.wal.memFrames[:p.savedWalFrame]
+		p.wal.mu.Unlock()
+	}
+
 	// Restore the database header from the snapshot saved at beginWrite (fix 5.2).
 	// This ensures FirstFreelistPg, TotalFreelistPgs, and DatabaseSize are
 	// reverted to their pre-transaction values after dirty pages are discarded.
@@ -1311,6 +1318,13 @@ func (p *pager) pagerError() {
 	p.wal.nFrame.Store(p.savedWalFrame)
 	p.wal.cksum1 = p.savedWalCksum1
 	p.wal.cksum2 = p.savedWalCksum2
+
+	// Truncate in-memory WAL frames to match restored nFrame.
+	if p.wal.inMemory {
+		p.wal.mu.Lock()
+		p.wal.memFrames = p.wal.memFrames[:p.savedWalFrame]
+		p.wal.mu.Unlock()
+	}
 
 	// Restore the database header to pre-transaction state.
 	p.header = p.savedHeader
@@ -1393,6 +1407,13 @@ func (p *pager) rollbackToSavepoint(id int) error {
 	p.wal.nFrame.Store(sp.walFrame)
 	p.wal.cksum1 = sp.walCksum1
 	p.wal.cksum2 = sp.walCksum2
+
+	// Truncate in-memory WAL frames to match restored nFrame.
+	if p.wal.inMemory {
+		p.wal.mu.Lock()
+		p.wal.memFrames = p.wal.memFrames[:sp.walFrame]
+		p.wal.mu.Unlock()
+	}
 
 	// Restore saved page copies from all savepoints being rolled back.
 	// Iterate from NEWEST to OLDEST (fix 9.1): this ensures that when a page

@@ -602,7 +602,17 @@ func (wi *walIndex) rollbackToFrame(target uint32) {
 	}
 	wi.mu.Unlock()
 	wi.maxFrame.Store(target)
-	wi.pendingShmFrames = wi.pendingShmFrames[:0]
+	// Only discard pending SHM entries for frames beyond the rollback target.
+	// Entries at or below the target belong to spills from before the savepoint
+	// and must be preserved for flushPendingShmFrames at commit time.
+	n := 0
+	for _, pf := range wi.pendingShmFrames {
+		if pf.frame <= target {
+			wi.pendingShmFrames[n] = pf
+			n++
+		}
+	}
+	wi.pendingShmFrames = wi.pendingShmFrames[:n]
 }
 
 // get returns the frame containing the latest version of pgno that is
@@ -1349,10 +1359,6 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		copy(buf[pos+walFrameSize:pos+frameSize], p.data)
 	}
 
-	w.nFrame.Store(nf + uint32(len(pages)))
-	w.cksum1 = s1
-	w.cksum2 = s2
-
 	// Single write call for all frames
 	n, err := w.file.WriteAt(buf, offset)
 	if err != nil {
@@ -1361,6 +1367,13 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	if n != len(buf) {
 		return io.ErrShortWrite
 	}
+
+	// Only advance nFrame and checksums after successful write. If WriteAt
+	// fails (disk full, I/O error), the WAL state remains at the pre-write
+	// position so subsequent writes use the correct offset and checksum chain.
+	w.nFrame.Store(nf + uint32(len(pages)))
+	w.cksum1 = s1
+	w.cksum2 = s2
 
 	// Batch update walIndex under a single lock.
 	// Pass commit so setBatch defers SHM hash writes for non-commit (spill) frames.
