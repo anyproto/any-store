@@ -493,6 +493,15 @@ type walIndex struct {
 	// inProcess indicates heap-backed shm (no multi-process coordination needed).
 	inProcess bool
 
+	// pendingShmFrames accumulates frame->pgno pairs for deferred SHM hash writes.
+	// During spill (writeFrames with commit=false), SHM hash writes are deferred
+	// to prevent cross-process readers from seeing uncommitted frames.
+	// Flushed to SHM hash tables on commit via flushPendingShmFrames().
+	// DRIFT from SQLite: SQLite always calls walIndexAppend (writes SHM hash) even
+	// for non-commit frames, relying on walIndexWriteHdr not being called to hide them.
+	// We defer the SHM writes entirely for stronger isolation.
+	pendingShmFrames []struct{ pgno, frame uint32 }
+
 	// aReadMark tracks each reader's WAL snapshot position.
 	// Slot 0 is special: readers on slot 0 read entirely from the DB (nBackfill == maxFrame).
 	// Slots 1-4 are for readers that need WAL frames.
@@ -534,7 +543,10 @@ func (wi *walIndex) set(pgno, frame uint32) {
 }
 
 // setBatch records multiple page->frame mappings under a single lock.
-func (wi *walIndex) setBatch(pages []*page, startFrame uint32) {
+// When commit is false (spill), SHM hash writes are deferred to prevent
+// cross-process readers from seeing uncommitted frames. The in-process
+// pageMap is always updated immediately so the writer can see its own pages.
+func (wi *walIndex) setBatch(pages []*page, startFrame uint32, commit bool) {
 	wi.mu.Lock()
 	for i, p := range pages {
 		frame := startFrame + uint32(i)
@@ -544,10 +556,30 @@ func (wi *walIndex) setBatch(pages []*page, startFrame uint32) {
 	if f := startFrame + uint32(len(pages)) - 1; f > wi.maxFrame.Load() {
 		wi.maxFrame.Store(f)
 	}
-	// Write to shm hash tables for cross-process visibility
-	for i, p := range pages {
-		wi.shmHashWrite(p.pgno, startFrame+uint32(i))
+	if commit {
+		// Write to shm hash tables immediately for cross-process visibility
+		for i, p := range pages {
+			wi.shmHashWrite(p.pgno, startFrame+uint32(i))
+		}
+	} else {
+		// Defer SHM hash writes until commit
+		for i, p := range pages {
+			wi.pendingShmFrames = append(wi.pendingShmFrames, struct{ pgno, frame uint32 }{
+				pgno:  p.pgno,
+				frame: startFrame + uint32(i),
+			})
+		}
 	}
+}
+
+// flushPendingShmFrames writes all deferred SHM hash entries accumulated during
+// spill (non-commit writeFrames calls). Called on commit to make spilled frames
+// visible to cross-process readers.
+func (wi *walIndex) flushPendingShmFrames() {
+	for _, pf := range wi.pendingShmFrames {
+		wi.shmHashWrite(pf.pgno, pf.frame)
+	}
+	wi.pendingShmFrames = wi.pendingShmFrames[:0]
 }
 
 // get returns the frame containing the latest version of pgno that is
@@ -1307,10 +1339,13 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		return io.ErrShortWrite
 	}
 
-	// Batch update walIndex under a single lock
-	w.index.setBatch(pages, startFrame)
+	// Batch update walIndex under a single lock.
+	// Pass commit so setBatch defers SHM hash writes for non-commit (spill) frames.
+	w.index.setBatch(pages, startFrame, commit)
 
 	if commit {
+		// Flush any previously deferred SHM hash entries from spill frames.
+		w.index.flushPendingShmFrames()
 		// Advance mxCommitFrame so readers can see the committed frames.
 		w.index.mxCommitFrame.Store(w.index.maxFrame.Load())
 		if dbSize > 0 {
@@ -1377,10 +1412,13 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	w.nFrame.Store(nf)
 	w.mu.Unlock()
 
-	// Batch update walIndex (has its own lock)
-	w.index.setBatch(pages, startFrame)
+	// Batch update walIndex (has its own lock).
+	// Pass commit so setBatch defers SHM hash writes for non-commit (spill) frames.
+	w.index.setBatch(pages, startFrame, commit)
 
 	if commit {
+		// Flush any previously deferred SHM hash entries from spill frames.
+		w.index.flushPendingShmFrames()
 		// Advance mxCommitFrame so readers can see the committed frames.
 		w.index.mxCommitFrame.Store(w.index.maxFrame.Load())
 		if dbSize > 0 {

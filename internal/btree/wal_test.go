@@ -646,3 +646,92 @@ func TestGetLatestIgnoresSpilledFrames(t *testing.T) {
 	frame = wi.getLatest(2)
 	assert.Equal(t, uint32(2), frame, "getLatest should see frame after mxCommitFrame advances")
 }
+
+func TestWriteFramesCommitFalseDoesNotWriteShmHash(t *testing.T) {
+	// Spill frames (commit=false) should NOT write to SHM hash tables.
+	// Cross-process readers use SHM hash to find pages, so deferred writes
+	// prevent them from seeing uncommitted spilled frames.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	w := newWal(path, 4096)
+	// Use non-inProcess mode to exercise SHM hash path
+	w.inProcess = false
+	require.NoError(t, w.open())
+	require.NoError(t, w.beginWrite())
+
+	// First commit page 1 so we have a baseline
+	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
+	copy(pg1.data, "committed page 1")
+	require.NoError(t, w.writeFrames([]*page{pg1}, true, 1))
+
+	// Verify committed page 1 is in SHM hash
+	frame := w.index.shmHashGet(1, 10)
+	assert.Equal(t, uint32(1), frame, "committed page should be in SHM hash")
+
+	// Now spill pages 2 and 3 (commit=false)
+	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
+	copy(pg2.data, "spilled page 2")
+	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
+	copy(pg3.data, "spilled page 3")
+	require.NoError(t, w.writeFrames([]*page{pg2, pg3}, false, 0))
+
+	// Spilled pages should NOT be in SHM hash
+	frame = w.index.shmHashGet(2, 10)
+	assert.Equal(t, uint32(0), frame, "spilled page 2 should not be in SHM hash")
+	frame = w.index.shmHashGet(3, 10)
+	assert.Equal(t, uint32(0), frame, "spilled page 3 should not be in SHM hash")
+
+	// But writer can still find them via pageMap
+	assert.Equal(t, uint32(2), w.index.get(2, 3))
+	assert.Equal(t, uint32(3), w.index.get(3, 3))
+
+	// Verify pending SHM frames were accumulated
+	assert.Len(t, w.index.pendingShmFrames, 2, "should have 2 pending SHM frames")
+
+	w.endWrite()
+	require.NoError(t, w.close())
+}
+
+func TestWriteFramesCommitFlushesToShm(t *testing.T) {
+	// After spill + commit, all frames (spilled and committed) should be
+	// visible in SHM hash tables.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	w := newWal(path, 4096)
+	w.inProcess = false
+	require.NoError(t, w.open())
+	require.NoError(t, w.beginWrite())
+
+	// Spill pages 1 and 2 (commit=false)
+	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
+	copy(pg1.data, "spilled page 1")
+	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
+	copy(pg2.data, "spilled page 2")
+	require.NoError(t, w.writeFrames([]*page{pg1, pg2}, false, 0))
+
+	// Verify NOT in SHM hash yet
+	assert.Equal(t, uint32(0), w.index.shmHashGet(1, 10))
+	assert.Equal(t, uint32(0), w.index.shmHashGet(2, 10))
+
+	// Now commit page 3
+	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
+	copy(pg3.data, "committed page 3")
+	require.NoError(t, w.writeFrames([]*page{pg3}, true, 3))
+
+	// All frames should now be in SHM hash (pending flushed + commit batch)
+	frame := w.index.shmHashGet(1, 10)
+	assert.Equal(t, uint32(1), frame, "spilled page 1 should be in SHM hash after commit")
+	frame = w.index.shmHashGet(2, 10)
+	assert.Equal(t, uint32(2), frame, "spilled page 2 should be in SHM hash after commit")
+	frame = w.index.shmHashGet(3, 10)
+	assert.Equal(t, uint32(3), frame, "committed page 3 should be in SHM hash after commit")
+
+	// Pending SHM frames should be cleared
+	assert.Len(t, w.index.pendingShmFrames, 0, "pending SHM frames should be empty after commit")
+
+	// mxCommitFrame should include all frames
+	assert.Equal(t, uint32(3), w.index.mxCommitFrame.Load())
+
+	w.endWrite()
+	require.NoError(t, w.close())
+}

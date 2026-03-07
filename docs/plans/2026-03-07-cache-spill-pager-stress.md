@@ -100,15 +100,15 @@ The current `writeFrames()` has bugs that must be fixed first. Calling `writeFra
 
 **Fix:** Defer all `shmHashWrite()` calls until commit. Accumulate frame->pgno pairs in a slice, flush them in one batch at commit time. The in-process `pageMap` still gets entries immediately (needed for writer to see its own spilled pages).
 
-- [ ] Add `pendingShmFrames []struct{ pgno, frame uint32 }` field to `walIndex` struct
-- [ ] Modify `setBatch()` (`wal.go:536`): always update `pageMap`, only call `shmHashWrite` when not deferring (add `commit bool` parameter or separate deferred path)
-- [ ] Add `flushPendingShmFrames()` method to `walIndex`: writes all pending entries to SHM hash tables, clears the pending slice
-- [ ] Update `writeFrames()`: call `flushPendingShmFrames()` on commit after `setBatch()`
-- [ ] Update `writeFramesMem()`: same treatment (though InMemory is always `inProcess=true`, keep consistent)
-- [ ] Ensure `set()` (`wal.go:525`) used during recovery still writes SHM hash immediately
-- [ ] Write tests: `TestWriteFramesCommitFalseDoesNotWriteShmHash` — spill frames, verify `shmHashGet()` returns 0 for spilled pages before commit
-- [ ] Write tests: `TestWriteFramesCommitFlushesToShm` — spill + commit, verify `shmHashGet()` finds all frames after commit
-- [ ] Run tests — must pass before next task
+- [x] Add `pendingShmFrames []struct{ pgno, frame uint32 }` field to `walIndex` struct
+- [x] Modify `setBatch()` (`wal.go:536`): always update `pageMap`, only call `shmHashWrite` when not deferring (add `commit bool` parameter or separate deferred path)
+- [x] Add `flushPendingShmFrames()` method to `walIndex`: writes all pending entries to SHM hash tables, clears the pending slice
+- [x] Update `writeFrames()`: call `flushPendingShmFrames()` on commit after `setBatch()`
+- [x] Update `writeFramesMem()`: same treatment (though InMemory is always `inProcess=true`, keep consistent)
+- [x] Ensure `set()` (`wal.go:525`) used during recovery still writes SHM hash immediately
+- [x] Write tests: `TestWriteFramesCommitFalseDoesNotWriteShmHash` — spill frames, verify `shmHashGet()` returns 0 for spilled pages before commit
+- [x] Write tests: `TestWriteFramesCommitFlushesToShm` — spill + commit, verify `shmHashGet()` finds all frames after commit
+- [x] Run tests — must pass before next task
 
 ### Task 3: Handle rollback of spilled frames
 
