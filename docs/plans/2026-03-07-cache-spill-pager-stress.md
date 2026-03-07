@@ -194,11 +194,11 @@ End-to-end tests verifying bounded memory, concurrent readers, checkpoint, and I
 
 ### Task 9: Verify acceptance criteria
 
-- [ ] Verify all requirements from Overview are implemented
-- [ ] Verify edge cases are handled (rollback, savepoints, cross-process, recovery)
-- [ ] Run full test suite (`go test ./...`)
-- [ ] Run linter (`golangci-lint run` or project linter) — all issues must be fixed
-- [ ] Verify cache memory stays bounded during large transactions
+- [x] Verify all requirements from Overview are implemented
+- [x] Verify edge cases are handled (rollback, savepoints, cross-process, recovery)
+- [x] Run full test suite (`go test ./...`)
+- [x] Run linter (`golangci-lint run` or project linter) — all issues must be fixed
+- [x] Verify cache memory stays bounded during large transactions
 
 ### Task 10: [Final] Update documentation
 
