@@ -808,6 +808,157 @@ func TestRollbackToSavepointWithSpilledFrames(t *testing.T) {
 	require.NoError(t, w.close())
 }
 
+func TestCrossProcessReaderDoesNotSeeSpilledFrames(t *testing.T) {
+	// Multi-process mode: spill frames (no commit), verify SHM header mxFrame
+	// is unchanged and shmHashGet doesn't find spilled pages. This ensures
+	// cross-process readers are fully isolated from uncommitted spills.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	w := newWal(path, 4096)
+	w.inProcess = false
+	require.NoError(t, w.open())
+	require.NoError(t, w.beginWrite())
+
+	// Commit pages 1 and 2
+	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
+	copy(pg1.data, "committed page 1")
+	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
+	copy(pg2.data, "committed page 2")
+	require.NoError(t, w.writeFrames([]*page{pg1, pg2}, true, 2))
+
+	// Read SHM header after commit — mxFrame should be 2
+	hdr1, ok := w.index.readHeader()
+	require.True(t, ok, "SHM header should be valid after commit")
+	assert.Equal(t, uint32(2), hdr1.mxFrame, "SHM header mxFrame should be 2 after commit")
+	assert.Equal(t, uint32(2), hdr1.nPage, "SHM header nPage should be 2 after commit")
+
+	// Verify committed pages are in SHM hash
+	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10), "committed page 1 should be in SHM hash")
+	assert.Equal(t, uint32(2), w.index.shmHashGet(2, 10), "committed page 2 should be in SHM hash")
+
+	// Spill pages 3 and 4 (commit=false)
+	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
+	copy(pg3.data, "spilled page 3")
+	pg4 := &page{pgno: 4, data: make([]byte, 4096)}
+	copy(pg4.data, "spilled page 4")
+	require.NoError(t, w.writeFrames([]*page{pg3, pg4}, false, 0))
+
+	// SHM header mxFrame should still be 2 (no writeHeader on non-commit)
+	hdr2, ok := w.index.readHeader()
+	require.True(t, ok, "SHM header should still be valid after spill")
+	assert.Equal(t, uint32(2), hdr2.mxFrame, "SHM header mxFrame must not advance on spill")
+	assert.Equal(t, uint32(2), hdr2.nPage, "SHM header nPage must not change on spill")
+
+	// mxCommitFrame should still be 2
+	assert.Equal(t, uint32(2), w.index.mxCommitFrame.Load(), "mxCommitFrame must not advance on spill")
+	// maxFrame (writer-internal) should be 4
+	assert.Equal(t, uint32(4), w.index.maxFrame.Load(), "maxFrame should include spilled frames")
+
+	// Spilled pages should NOT be in SHM hash
+	assert.Equal(t, uint32(0), w.index.shmHashGet(3, 10), "spilled page 3 must not be in SHM hash")
+	assert.Equal(t, uint32(0), w.index.shmHashGet(4, 10), "spilled page 4 must not be in SHM hash")
+
+	// Committed pages still accessible via SHM hash
+	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10), "committed page 1 still in SHM hash")
+	assert.Equal(t, uint32(2), w.index.shmHashGet(2, 10), "committed page 2 still in SHM hash")
+
+	// A cross-process reader using getLatest (with empty pageMap) should not see spilled pages
+	// Simulate by creating a fresh walIndex pointing to same SHM
+	reader := &walIndex{
+		shm:       w.index.shm,
+		pageMap:   make(map[uint32][]uint32),
+		inProcess: false,
+	}
+	reader.mxCommitFrame.Store(w.index.mxCommitFrame.Load())
+	reader.nBackfill.Store(0)
+
+	// Reader should see committed pages via SHM hash
+	assert.Equal(t, uint32(1), reader.getLatest(1), "cross-process reader sees committed page 1")
+	assert.Equal(t, uint32(2), reader.getLatest(2), "cross-process reader sees committed page 2")
+	// Reader should NOT see spilled pages
+	assert.Equal(t, uint32(0), reader.getLatest(3), "cross-process reader must not see spilled page 3")
+	assert.Equal(t, uint32(0), reader.getLatest(4), "cross-process reader must not see spilled page 4")
+
+	w.endWrite()
+	require.NoError(t, w.close())
+}
+
+func TestRecoveryIgnoresSpilledFrames(t *testing.T) {
+	// Write committed frames followed by spilled (non-commit) frames to WAL,
+	// close, reopen — recovery should only index committed frames.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+
+	w := newWal(path, 4096)
+	require.NoError(t, w.open())
+	require.NoError(t, w.beginWrite())
+
+	// Commit pages 1, 2, 3 (frames 1-3)
+	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
+	copy(pg1.data, "committed page 1")
+	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
+	copy(pg2.data, "committed page 2")
+	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
+	copy(pg3.data, "committed page 3")
+	require.NoError(t, w.writeFrames([]*page{pg1, pg2, pg3}, true, 3))
+
+	// Spill pages 4 and 5, plus update page 1 (frames 4-6, no commit)
+	pg4 := &page{pgno: 4, data: make([]byte, 4096)}
+	copy(pg4.data, "spilled page 4")
+	pg5 := &page{pgno: 5, data: make([]byte, 4096)}
+	copy(pg5.data, "spilled page 5")
+	pg1v2 := &page{pgno: 1, data: make([]byte, 4096)}
+	copy(pg1v2.data, "spilled update to page 1")
+	require.NoError(t, w.writeFrames([]*page{pg4, pg5, pg1v2}, false, 0))
+
+	// Verify pre-close state: 6 total frames, only 3 committed
+	assert.Equal(t, uint32(6), w.nFrame.Load())
+	assert.Equal(t, uint32(6), w.index.maxFrame.Load())
+	assert.Equal(t, uint32(3), w.index.mxCommitFrame.Load())
+
+	w.endWrite()
+	require.NoError(t, w.close())
+
+	// Reopen — recovery should only see committed frames 1-3
+	w2 := newWal(path, 4096)
+	require.NoError(t, w2.open())
+
+	// nFrame should be 3 (only committed frames)
+	assert.Equal(t, uint32(3), w2.nFrame.Load(), "recovery: nFrame should be 3")
+	assert.Equal(t, uint32(3), w2.index.maxFrame.Load(), "recovery: maxFrame should be 3")
+	assert.Equal(t, uint32(3), w2.index.mxCommitFrame.Load(), "recovery: mxCommitFrame should be 3")
+	assert.Equal(t, uint32(3), w2.index.maxPage.Load(), "recovery: maxPage should be 3")
+
+	// Committed pages should be in index
+	assert.Equal(t, uint32(1), w2.index.get(1, 3), "recovery: page 1 at frame 1")
+	assert.Equal(t, uint32(2), w2.index.get(2, 3), "recovery: page 2 at frame 2")
+	assert.Equal(t, uint32(3), w2.index.get(3, 3), "recovery: page 3 at frame 3")
+
+	// Spilled pages should NOT be in index
+	assert.Equal(t, uint32(0), w2.index.get(4, 10), "recovery: spilled page 4 not visible")
+	assert.Equal(t, uint32(0), w2.index.get(5, 10), "recovery: spilled page 5 not visible")
+
+	// Page 1 should be at frame 1 (committed version), NOT frame 6 (spilled update)
+	assert.Equal(t, uint32(1), w2.index.get(1, 10), "recovery: page 1 should be at committed frame, not spilled")
+
+	// Verify data integrity of committed frames
+	buf := make([]byte, 4096)
+	require.NoError(t, w2.readFrame(1, buf))
+	assert.Equal(t, pg1.data, buf, "recovery: page 1 data should be committed version")
+	require.NoError(t, w2.readFrame(2, buf))
+	assert.Equal(t, pg2.data, buf, "recovery: page 2 data intact")
+	require.NoError(t, w2.readFrame(3, buf))
+	assert.Equal(t, pg3.data, buf, "recovery: page 3 data intact")
+
+	// SHM header should reflect committed state
+	hdr, ok := w2.index.readHeader()
+	require.True(t, ok, "recovery: SHM header should be valid")
+	assert.Equal(t, uint32(3), hdr.mxFrame, "recovery: SHM header mxFrame should be 3")
+	assert.Equal(t, uint32(3), hdr.nPage, "recovery: SHM header nPage should be 3")
+
+	require.NoError(t, w2.close())
+}
+
 func TestWriteFramesCommitFlushesToShm(t *testing.T) {
 	// After spill + commit, all frames (spilled and committed) should be
 	// visible in SHM hash tables.

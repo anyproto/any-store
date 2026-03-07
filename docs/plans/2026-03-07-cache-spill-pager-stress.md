@@ -127,9 +127,9 @@ The current `writeFrames()` has bugs that must be fixed first. Calling `writeFra
 
 **Problem:** Cross-process readers must not see spilled frames before commit. Verify end-to-end with SHM.
 
-- [ ] Write tests: `TestCrossProcessReaderDoesNotSeeSpilledFrames` — multi-process mode: spill (no commit), verify SHM header `mxFrame` unchanged, `shmHashGet` doesn't find spilled frames
-- [ ] Write tests: `TestRecoveryIgnoresSpilledFrames` — write spill frames to WAL (no commit marker), recover, verify only committed frames are visible
-- [ ] Run tests — must pass before next task
+- [x] Write tests: `TestCrossProcessReaderDoesNotSeeSpilledFrames` — multi-process mode: spill (no commit), verify SHM header `mxFrame` unchanged, `shmHashGet` doesn't find spilled frames
+- [x] Write tests: `TestRecoveryIgnoresSpilledFrames` — write spill frames to WAL (no commit marker), recover, verify only committed frames are visible
+- [x] Run tests — must pass before next task
 
 ### Task 5: Add pcache stress callback
 
