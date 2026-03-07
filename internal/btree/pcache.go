@@ -215,7 +215,14 @@ func (pc *pcache) fetchAndMakeDirty(pgno uint32) *page {
 // because appendDirtyPages only collects dirty pages.
 func (pc *pcache) reinsertDirty(p *page) {
 	pc.mu.Lock()
-	if pc.pages[p.pgno] != p {
+	if existing := pc.pages[p.pgno]; existing != p {
+		// A concurrent reader may have created a new cache entry for this
+		// pgno while the spilled page was evicted. If the reader already
+		// released it, the page sits in the LRU. Remove it before
+		// overwriting to prevent evictOne from later deleting our entry.
+		if existing != nil && !existing.dirty {
+			pc.lruRemove(existing)
+		}
 		pc.pages[p.pgno] = p
 	}
 	if !p.dirty {

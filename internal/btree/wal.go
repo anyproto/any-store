@@ -1382,8 +1382,6 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	if commit {
 		// Flush any previously deferred SHM hash entries from spill frames.
 		w.index.flushPendingShmFrames()
-		// Advance mxCommitFrame so readers can see the committed frames.
-		w.index.mxCommitFrame.Store(w.index.maxFrame.Load())
 		if dbSize > 0 {
 			w.index.maxPage.Store(dbSize)
 		}
@@ -1392,6 +1390,11 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 				return err
 			}
 		}
+		// Advance mxCommitFrame AFTER fdatasync so in-process readers only
+		// see committed frames once they are durable on disk. This matches
+		// SQLite where walIndexWriteHdr (which publishes mxFrame) is called
+		// after fdatasync.
+		w.index.mxCommitFrame.Store(w.index.maxFrame.Load())
 		if !w.inProcess {
 			return w.index.writeHeader(w.index.mxCommitFrame.Load(), w.index.maxPage.Load(), w.index.nBackfill.Load())
 		}
@@ -1637,7 +1640,9 @@ func (w *wal) checkpointPassive(dbFile fileHandle, cache *pcache) error {
 	}
 	// Check if all frames were backfilled. A partial checkpoint means
 	// some frames remain only in the WAL and must not be discarded.
-	complete := w.index.nBackfill.Load() >= w.index.maxFrame.Load()
+	// Use mxCommitFrame (not maxFrame) so spilled uncommitted frames don't
+	// prevent WAL reset. During active spill maxFrame > mxCommitFrame.
+	complete := w.index.nBackfill.Load() >= w.index.mxCommitFrame.Load()
 	if !complete {
 		return ErrBusy
 	}
@@ -1695,13 +1700,17 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, cache *pcache, mode Checkpoi
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	nf := w.nFrame.Load()
+	// Use mxCommitFrame (not nFrame) so spilled uncommitted frames are
+	// excluded. nFrame may be ahead of mxCommitFrame during an active spill.
+	// SQLite's walCheckpoint uses pWal->hdr.mxFrame which is only updated
+	// at commit time via walIndexWriteHdr.
+	nf := w.index.mxCommitFrame.Load()
 	if nf == 0 {
 		return nil
 	}
 
 	// Compute mxSafeFrame: the highest frame we can safely copy to DB.
-	// Start with all frames, then lower based on active readers.
+	// Start with all committed frames, then lower based on active readers.
 	//
 	// For each reader slot (1-4), check its readmark. If the readmark
 	// is below mxSafeFrame, try to acquire an exclusive lock on that slot.
@@ -1892,7 +1901,9 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, cache *pcache, mode Checkpoi
 func (w *wal) checkpointPost(mode CheckpointMode, xBusy BusyHandler) error {
 	backfill := w.index.nBackfill.Load()
 
-	if backfill < w.nFrame.Load() {
+	// Use mxCommitFrame (not nFrame) so spilled uncommitted frames don't
+	// prevent WAL reset when all committed frames are checkpointed.
+	if backfill < w.index.mxCommitFrame.Load() {
 		// Not everything was checkpointed. Can't reset the WAL.
 		return nil
 	}
