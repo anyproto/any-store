@@ -173,13 +173,13 @@ Register a stress callback during pager initialization. When invoked, spill the 
 
 Verify the commit flow works correctly when pages have been spilled mid-transaction. Spilled pages are `makeClean()`'d, so `appendDirtyPages()` won't include them. Remaining dirty pages get written with `commit=true`. The commit frames follow spill frames contiguously since `nFrame` was already incremented during spill.
 
-- [ ] Verify `commit()` (`pager.go:1013`) needs no structural changes (spilled pages already clean, not re-collected)
-- [ ] Ensure `commit()` calls `flushPendingShmFrames()` after `writeFrames(true)`
-- [ ] Ensure `commit()` updates `mxCommitFrame` to current `maxFrame` (via writeFrames commit path)
-- [ ] Write tests: `TestPagerStressThenCommit` — spill some pages, then commit, verify all data correct and readable
-- [ ] Write tests: `TestPagerStressThenRollback` — spill some pages, rollback, verify spilled frames cleaned up
-- [ ] Write tests: `TestPagerStressThenSavepointRollback` — savepoint, modify, spill, rollback to savepoint, verify data restored
-- [ ] Run tests — must pass before next task
+- [x] Verify `commit()` (`pager.go:1013`) needs no structural changes (spilled pages already clean, not re-collected)
+- [x] Ensure `commit()` calls `flushPendingShmFrames()` after `writeFrames(true)`
+- [x] Ensure `commit()` updates `mxCommitFrame` to current `maxFrame` (via writeFrames commit path)
+- [x] Write tests: `TestPagerStressThenCommit` — spill some pages, then commit, verify all data correct and readable
+- [x] Write tests: `TestPagerStressThenRollback` — spill some pages, rollback, verify spilled frames cleaned up
+- [x] Write tests: `TestPagerStressThenSavepointRollback` — savepoint, modify, spill, rollback to savepoint, verify data restored
+- [x] Run tests — must pass before next task
 
 ### Task 8: Integration and stress tests
 

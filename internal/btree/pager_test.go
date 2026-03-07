@@ -6831,3 +6831,235 @@ func TestPagerStressWithSavepoint(t *testing.T) {
 	frame := p.wal.index.getLatest(pgno)
 	assert.NotZero(t, frame, "spilled page should be in WAL")
 }
+
+// ============================================================
+// End-to-end commit flow with spill (Task 7)
+// ============================================================
+
+func TestPagerStressThenCommit(t *testing.T) {
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	// Begin write transaction
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf)
+	require.NoError(t, p.beginWrite())
+
+	// Allocate pages with known data
+	pg2, err := p.allocatePage()
+	require.NoError(t, err)
+	pg2no := pg2.pgno
+	copy(pg2.data[100:], "page2-data")
+	p.releasePage(pg2)
+
+	pg3, err := p.allocatePage()
+	require.NoError(t, err)
+	pg3no := pg3.pgno
+	copy(pg3.data[100:], "page3-data")
+	p.releasePage(pg3)
+
+	pg4, err := p.allocatePage()
+	require.NoError(t, err)
+	pg4no := pg4.pgno
+	copy(pg4.data[100:], "page4-data")
+	p.releasePage(pg4)
+
+	// Spill page 2 via pagerStress — written to WAL without commit
+	err = p.pagerStress(pg2)
+	require.NoError(t, err)
+	assert.False(t, pg2.dirty, "spilled page should be clean")
+
+	mxCommitBefore := p.wal.index.mxCommitFrame.Load()
+	assert.Equal(t, uint32(0), mxCommitBefore, "mxCommitFrame should not advance after spill")
+
+	// Commit remaining dirty pages (pg3, pg4, pg1 header)
+	_, _, _, err = p.commit(true, false)
+	require.NoError(t, err)
+	p.endRead(slot)
+
+	// Verify mxCommitFrame advanced to include spilled + committed frames
+	mxCommitAfter := p.wal.index.mxCommitFrame.Load()
+	assert.Equal(t, p.wal.nFrame.Load(), mxCommitAfter,
+		"mxCommitFrame should equal nFrame after commit")
+
+	// Begin new read and verify ALL pages are readable (including spilled ones)
+	mf2, slot2, err := p.beginRead()
+	require.NoError(t, err)
+	defer p.endRead(slot2)
+
+	rpg2, err := p.getPageAt(pg2no, mf2)
+	require.NoError(t, err)
+	assert.Equal(t, "page2-data", string(rpg2.data[100:110]),
+		"spilled page data should be readable after commit")
+	p.cache.release(rpg2)
+
+	rpg3, err := p.getPageAt(pg3no, mf2)
+	require.NoError(t, err)
+	assert.Equal(t, "page3-data", string(rpg3.data[100:110]),
+		"normally committed page data should be readable")
+	p.cache.release(rpg3)
+
+	rpg4, err := p.getPageAt(pg4no, mf2)
+	require.NoError(t, err)
+	assert.Equal(t, "page4-data", string(rpg4.data[100:110]),
+		"normally committed page data should be readable")
+	p.cache.release(rpg4)
+}
+
+func TestPagerStressThenRollback(t *testing.T) {
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	// First transaction: write committed data to page 2
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf)
+	require.NoError(t, p.beginWrite())
+
+	pg2, err := p.allocatePage()
+	require.NoError(t, err)
+	pg2no := pg2.pgno
+	copy(pg2.data[100:], "original!!")
+	p.releasePage(pg2)
+
+	_, _, _, err = p.commit(true, false)
+	require.NoError(t, err)
+	p.endRead(slot)
+
+	savedMaxFrame := p.wal.nFrame.Load()
+	savedMxCommit := p.wal.index.mxCommitFrame.Load()
+
+	// Second transaction: modify page 2, spill it, then rollback
+	mf2, slot2, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf2)
+	require.NoError(t, p.beginWrite())
+
+	pg2w, err := p.getWritablePage(pg2no)
+	require.NoError(t, err)
+	copy(pg2w.data[100:], "modified!!")
+	p.releasePage(pg2w)
+
+	// Spill the modified page
+	err = p.pagerStress(pg2w)
+	require.NoError(t, err)
+
+	// nFrame advanced but mxCommitFrame didn't
+	assert.Greater(t, p.wal.nFrame.Load(), savedMaxFrame,
+		"nFrame should advance after spill")
+	assert.Equal(t, savedMxCommit, p.wal.index.mxCommitFrame.Load(),
+		"mxCommitFrame should not advance after spill")
+
+	// Rollback
+	require.NoError(t, p.rollback())
+	p.endRead(slot2)
+
+	// After rollback: maxFrame should be restored to pre-spill value
+	assert.Equal(t, savedMaxFrame, p.wal.index.maxFrame.Load(),
+		"maxFrame should be restored after rollback")
+
+	// Verify original data is intact by reading in a new transaction
+	mf3, slot3, err := p.beginRead()
+	require.NoError(t, err)
+	defer p.endRead(slot3)
+
+	rpg2, err := p.getPageAt(pg2no, mf3)
+	require.NoError(t, err)
+	assert.Equal(t, "original!!", string(rpg2.data[100:110]),
+		"page should have original data after rollback of spilled transaction")
+	p.cache.release(rpg2)
+}
+
+func TestPagerStressThenSavepointRollback(t *testing.T) {
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	// Begin write transaction, allocate pages with initial data
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf)
+	require.NoError(t, p.beginWrite())
+
+	pg2, err := p.allocatePage()
+	require.NoError(t, err)
+	pg2no := pg2.pgno
+	copy(pg2.data[100:], "before-sp!")
+	p.releasePage(pg2)
+
+	pg3, err := p.allocatePage()
+	require.NoError(t, err)
+	pg3no := pg3.pgno
+	copy(pg3.data[100:], "pg3-init!!")
+	p.releasePage(pg3)
+
+	// Create savepoint
+	spID, err := p.savepoint()
+	require.NoError(t, err)
+	walFrameAtSavepoint := p.wal.nFrame.Load()
+
+	// Modify page 2 after savepoint
+	pg2w, err := p.getWritablePage(pg2no)
+	require.NoError(t, err)
+	copy(pg2w.data[100:], "after-sp!!")
+	p.releasePage(pg2w)
+
+	// Spill modified page 2 — should save pre-spill data in savepoint
+	err = p.pagerStress(pg2w)
+	require.NoError(t, err)
+	assert.False(t, pg2w.dirty, "spilled page should be clean")
+	assert.Greater(t, p.wal.nFrame.Load(), walFrameAtSavepoint,
+		"nFrame should advance after spill")
+
+	// Rollback to savepoint — should restore page 2 to "before-sp!"
+	require.NoError(t, p.rollbackToSavepoint(spID))
+
+	// Verify WAL frame count is rolled back
+	assert.Equal(t, walFrameAtSavepoint, p.wal.index.maxFrame.Load(),
+		"maxFrame should be restored to savepoint state")
+
+	// Read page 2 to verify data was restored
+	pg2r, err := p.getWritablePage(pg2no)
+	require.NoError(t, err)
+	assert.Equal(t, "before-sp!", string(pg2r.data[100:110]),
+		"page 2 should be restored to pre-savepoint data")
+	p.releasePage(pg2r)
+
+	// Page 3 should be unaffected (was not modified after savepoint)
+	pg3r, err := p.getWritablePage(pg3no)
+	require.NoError(t, err)
+	assert.Equal(t, "pg3-init!!", string(pg3r.data[100:110]),
+		"page 3 should be unchanged by savepoint rollback")
+	p.releasePage(pg3r)
+
+	// Commit should work correctly after savepoint rollback
+	_, _, _, err = p.commit(true, false)
+	require.NoError(t, err)
+	p.endRead(slot)
+
+	// Verify data after commit
+	mf2, slot2, err := p.beginRead()
+	require.NoError(t, err)
+	defer p.endRead(slot2)
+
+	rpg2, err := p.getPageAt(pg2no, mf2)
+	require.NoError(t, err)
+	assert.Equal(t, "before-sp!", string(rpg2.data[100:110]),
+		"committed data should reflect pre-savepoint state")
+	p.cache.release(rpg2)
+
+	rpg3, err := p.getPageAt(pg3no, mf2)
+	require.NoError(t, err)
+	assert.Equal(t, "pg3-init!!", string(rpg3.data[100:110]),
+		"page 3 data should be committed correctly")
+	p.cache.release(rpg3)
+}

@@ -1232,6 +1232,13 @@ func (p *pager) rollback() error {
 		p.cache.discard(pg.pgno)
 	}
 
+	// Discard spilled (clean) pages from cache. Spilled pages were written
+	// to WAL mid-transaction and marked clean by pagerStress, so they won't
+	// appear in dirtyPages. Their cached content is stale after rollback.
+	for pgno := range p.writePages {
+		p.cache.discard(pgno)
+	}
+
 	// Roll back spilled frames in the WAL index. Spilled frames in the WAL
 	// file are harmless (no commit marker), but pageMap entries and maxFrame
 	// must be restored to the pre-transaction state.
