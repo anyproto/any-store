@@ -550,6 +550,7 @@ func TestWalIndexGetCrossProcessFallback(t *testing.T) {
 	// Write frames to SHM hash tables only (simulating another process)
 	wi.shmHashWrite(5, 1)
 	wi.maxFrame.Store(1)
+	wi.mxCommitFrame.Store(1) // getLatest() uses mxCommitFrame for SHM fallback bound
 	wi.nBackfill.Store(0)
 
 	// get() should find frame 1 for page 5 via SHM fallback
@@ -567,4 +568,81 @@ func TestWalIndexGetCrossProcessFallback(t *testing.T) {
 
 	frame = wi.getLatest(5)
 	assert.Equal(t, uint32(0), frame, "getLatest() inProcess should not use SHM fallback")
+}
+
+func TestWriteFramesCommitFalseDoesNotAdvanceMxCommitFrame(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	w := newWal(path, 4096)
+	require.NoError(t, w.open())
+	require.NoError(t, w.beginWrite())
+
+	// First commit some frames so mxCommitFrame is non-zero
+	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
+	copy(pg1.data, "committed page 1")
+	require.NoError(t, w.writeFrames([]*page{pg1}, true, 1))
+	assert.Equal(t, uint32(1), w.index.maxFrame.Load())
+	assert.Equal(t, uint32(1), w.index.mxCommitFrame.Load())
+
+	// Now write frames WITHOUT commit (simulating spill)
+	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
+	copy(pg2.data, "spilled page 2")
+	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
+	copy(pg3.data, "spilled page 3")
+	require.NoError(t, w.writeFrames([]*page{pg2, pg3}, false, 0))
+
+	// maxFrame should advance to 3 (writer sees all frames)
+	assert.Equal(t, uint32(3), w.index.maxFrame.Load())
+	// mxCommitFrame should still be 1 (readers only see committed)
+	assert.Equal(t, uint32(1), w.index.mxCommitFrame.Load())
+
+	// Writer can find spilled pages via pageMap
+	assert.Equal(t, uint32(2), w.index.get(2, 3))
+	assert.Equal(t, uint32(3), w.index.get(3, 3))
+
+	// Now commit — mxCommitFrame should catch up
+	pg4 := &page{pgno: 4, data: make([]byte, 4096)}
+	copy(pg4.data, "committed page 4")
+	require.NoError(t, w.writeFrames([]*page{pg4}, true, 4))
+	assert.Equal(t, uint32(4), w.index.maxFrame.Load())
+	assert.Equal(t, uint32(4), w.index.mxCommitFrame.Load())
+
+	w.endWrite()
+	require.NoError(t, w.close())
+}
+
+func TestGetLatestIgnoresSpilledFrames(t *testing.T) {
+	// Test that getLatest() uses mxCommitFrame for SHM hash fallback,
+	// so cross-process readers don't see spilled frames.
+	wi := &walIndex{
+		shm:       newHeapShm(),
+		pageMap:   make(map[uint32][]uint32),
+		inProcess: false,
+	}
+
+	// Simulate a commit: page 1 at frame 1
+	wi.shmHashWrite(1, 1)
+	wi.maxFrame.Store(1)
+	wi.mxCommitFrame.Store(1)
+
+	// Simulate spill: page 2 at frame 2, written to SHM hash but not committed.
+	// In real code, spill does NOT write SHM hash (deferred), but here we test
+	// that getLatest bounds the SHM search to mxCommitFrame even if SHM has the entry.
+	wi.shmHashWrite(2, 2)
+	wi.maxFrame.Store(2)
+	// mxCommitFrame stays at 1
+
+	// getLatest for page 2: pageMap is empty (cross-process scenario),
+	// SHM fallback uses mxCommitFrame=1, so frame 2 is invisible.
+	frame := wi.getLatest(2)
+	assert.Equal(t, uint32(0), frame, "getLatest should not see spilled frame beyond mxCommitFrame")
+
+	// getLatest for page 1: should still find frame 1 (within mxCommitFrame)
+	frame = wi.getLatest(1)
+	assert.Equal(t, uint32(1), frame, "getLatest should find committed frame")
+
+	// After commit, advancing mxCommitFrame makes frame 2 visible
+	wi.mxCommitFrame.Store(2)
+	frame = wi.getLatest(2)
+	assert.Equal(t, uint32(2), frame, "getLatest should see frame after mxCommitFrame advances")
 }

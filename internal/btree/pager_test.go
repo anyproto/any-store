@@ -5390,6 +5390,7 @@ func TestWalBeginRead_AllSlotsBusy_FallbackSlot0(t *testing.T) {
 	// Set maxFrame > 0 and nBackfill < maxFrame so we don't take the
 	// early-return path at beginRead:1390.
 	w.index.maxFrame.Store(10)
+	w.index.mxCommitFrame.Store(10) // beginRead uses mxCommitFrame for reader visibility
 	w.index.nBackfill.Store(0)
 	// Leave all aReadMark as readMarkNotUsed (default), so bestSlot == -1.
 
@@ -5421,6 +5422,7 @@ func TestWalBeginRead_AllSlotsBusy_Slot0AlsoLocked(t *testing.T) {
 	defer w.close()
 
 	w.index.maxFrame.Store(10)
+	w.index.mxCommitFrame.Store(10) // beginRead uses mxCommitFrame for reader visibility
 	w.index.nBackfill.Store(0)
 
 	// Lock all reader slots exclusively (including slot 0).
@@ -5447,6 +5449,7 @@ func TestWalBeginRead_BestSlotLockFails_FindUnused(t *testing.T) {
 	defer w.close()
 
 	w.index.maxFrame.Store(10)
+	w.index.mxCommitFrame.Store(10) // beginRead uses mxCommitFrame for reader visibility
 	w.index.nBackfill.Store(0)
 	// Set aReadMark[1] to a valid mark so bestSlot = 1.
 	w.index.aReadMark[1].Store(5)
@@ -6599,4 +6602,55 @@ func TestCorruptPageSizeNonPowerOfTwo(t *testing.T) {
 	_, err = Open(path, DefaultOptions())
 	require.Error(t, err, "expected error opening DB with non-power-of-2 page_size")
 	require.ErrorIs(t, err, ErrCorrupt)
+}
+
+func TestReadHeaderCountersIgnoresSpilledFrames(t *testing.T) {
+	// Verify that readHeaderCounters uses mxCommitFrame (not maxFrame),
+	// so spilled uncommitted page 1 updates are invisible to readers.
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	// Begin a read + write transaction
+	maxFrame, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(maxFrame)
+	require.NoError(t, p.beginWrite())
+
+	// Write page 1 with known FileChangeCount=100, SchemaCookie=200 and COMMIT
+	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
+	binary.BigEndian.PutUint32(pg1.data[24:28], 100) // FileChangeCount
+	binary.BigEndian.PutUint32(pg1.data[40:44], 200) // SchemaCookie
+	require.NoError(t, p.wal.writeFrames([]*page{pg1}, true, 1))
+
+	// Verify mxCommitFrame is now 1
+	assert.Equal(t, uint32(1), p.wal.index.mxCommitFrame.Load())
+
+	// readHeaderCounters should see FileChangeCount=100, SchemaCookie=200
+	fcc, sc, err := p.readHeaderCounters(0)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(100), fcc, "committed FileChangeCount")
+	assert.Equal(t, uint32(200), sc, "committed SchemaCookie")
+
+	// Now "spill" a new version of page 1 WITHOUT commit (different values)
+	pg1spill := &page{pgno: 1, data: make([]byte, 4096)}
+	binary.BigEndian.PutUint32(pg1spill.data[24:28], 999) // FileChangeCount
+	binary.BigEndian.PutUint32(pg1spill.data[40:44], 888) // SchemaCookie
+	require.NoError(t, p.wal.writeFrames([]*page{pg1spill}, false, 0))
+
+	// maxFrame advanced but mxCommitFrame did NOT
+	assert.Equal(t, uint32(2), p.wal.index.maxFrame.Load())
+	assert.Equal(t, uint32(1), p.wal.index.mxCommitFrame.Load())
+
+	// readHeaderCounters should still see the COMMITTED values (100, 200)
+	// because inProcess mode uses mxCommitFrame to bound WAL lookups.
+	fcc, sc, err = p.readHeaderCounters(0)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(100), fcc, "should see committed FileChangeCount, not spilled")
+	assert.Equal(t, uint32(200), sc, "should see committed SchemaCookie, not spilled")
+
+	p.wal.endWrite()
+	p.endRead(slot)
 }

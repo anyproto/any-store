@@ -937,7 +937,8 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 	// the in-process walIndex.maxFrame directly.
 	effectiveMaxFrame := walMaxFrame
 	if p.inProcess {
-		if mf := p.wal.index.maxFrame.Load(); mf > effectiveMaxFrame {
+		// Use mxCommitFrame (not maxFrame) so spilled uncommitted frames are invisible to readers.
+		if mf := p.wal.index.mxCommitFrame.Load(); mf > effectiveMaxFrame {
 			effectiveMaxFrame = mf
 		}
 	} else if hdr, valid := p.wal.index.readHeader(); valid && hdr.mxFrame > effectiveMaxFrame {

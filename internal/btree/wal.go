@@ -471,8 +471,9 @@ type walIndex struct {
 	mu      sync.RWMutex
 	shm     shm               // platform-specific shared memory
 	pageMap map[uint32][]uint32 // pgno -> sorted list of frame indices (1-based)
-	maxFrame  atomic.Uint32    // highest valid frame
-	maxPage   atomic.Uint32    // database size at last commit
+	maxFrame      atomic.Uint32 // highest valid frame (committed + spilled)
+	mxCommitFrame atomic.Uint32 // highest COMMITTED frame — visible to readers
+	maxPage       atomic.Uint32 // database size at last commit
 	nBackfill atomic.Uint32    // frames already checkpointed
 
 	// nBackfillAttempted is the highest frame that a checkpoint has attempted
@@ -596,9 +597,10 @@ func (wi *walIndex) getLatest(pgno uint32) uint32 {
 		return frames[len(frames)-1]
 	}
 
-	// Cross-process fallback: check SHM hash tables
+	// Cross-process fallback: check SHM hash tables.
+	// Use mxCommitFrame (not maxFrame) so spilled uncommitted frames are invisible.
 	if !wi.inProcess {
-		return wi.shmHashGet(pgno, wi.maxFrame.Load())
+		return wi.shmHashGet(pgno, wi.mxCommitFrame.Load())
 	}
 
 	return 0
@@ -610,6 +612,7 @@ func (wi *walIndex) reset() {
 	clear(wi.pageMap)
 	wi.mu.Unlock()
 	wi.maxFrame.Store(0)
+	wi.mxCommitFrame.Store(0)
 	wi.nBackfill.Store(0)
 	wi.nBackfillAttempted.Store(0)
 	for i := range wi.aReadMark {
@@ -1203,6 +1206,7 @@ func (w *wal) recover() error {
 		w.cksum1 = lastCommitCksum1
 		w.cksum2 = lastCommitCksum2
 		w.index.maxFrame.Store(lastCommitFrame)
+		w.index.mxCommitFrame.Store(lastCommitFrame)
 		w.index.maxPage.Store(lastCommitDbSize)
 
 		// Set nBackfillAttempted to mxFrame during recovery (issue 7.7).
@@ -1216,8 +1220,8 @@ func (w *wal) recover() error {
 		w.index.reset()
 	}
 
-	// Update shm header with recovered state
-	return w.index.writeHeader(w.index.maxFrame.Load(), w.index.maxPage.Load(), 0)
+	// Update shm header with recovered state (use mxCommitFrame for reader visibility)
+	return w.index.writeHeader(w.index.mxCommitFrame.Load(), w.index.maxPage.Load(), 0)
 }
 
 // writeFrames appends frames to the WAL. If commit is true, the last frame
@@ -1307,6 +1311,8 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	w.index.setBatch(pages, startFrame)
 
 	if commit {
+		// Advance mxCommitFrame so readers can see the committed frames.
+		w.index.mxCommitFrame.Store(w.index.maxFrame.Load())
 		if dbSize > 0 {
 			w.index.maxPage.Store(dbSize)
 		}
@@ -1316,7 +1322,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 			}
 		}
 		if !w.inProcess {
-			return w.index.writeHeader(w.index.maxFrame.Load(), w.index.maxPage.Load(), w.index.nBackfill.Load())
+			return w.index.writeHeader(w.index.mxCommitFrame.Load(), w.index.maxPage.Load(), w.index.nBackfill.Load())
 		}
 	}
 
@@ -1374,8 +1380,12 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	// Batch update walIndex (has its own lock)
 	w.index.setBatch(pages, startFrame)
 
-	if commit && dbSize > 0 {
-		w.index.maxPage.Store(dbSize)
+	if commit {
+		// Advance mxCommitFrame so readers can see the committed frames.
+		w.index.mxCommitFrame.Store(w.index.maxFrame.Load())
+		if dbSize > 0 {
+			w.index.maxPage.Store(dbSize)
+		}
 	}
 
 	return nil
@@ -1444,7 +1454,9 @@ func (w *wal) beginRead() (maxFrame uint32, slot int, err error) {
 // max frame number. Returns errWALRetry if the WAL state changed between
 // reading metadata and acquiring the lock, signaling the caller to retry.
 func (w *wal) tryBeginRead() (maxFrame uint32, slot int, err error) {
-	mxFrame := w.index.maxFrame.Load()
+	// Use mxCommitFrame (not maxFrame) so readers only see committed frames.
+	// This prevents spilled but uncommitted frames from being visible.
+	mxFrame := w.index.mxCommitFrame.Load()
 	nBackfill := w.index.nBackfill.Load()
 
 	if mxFrame == 0 || nBackfill == mxFrame {
@@ -1453,7 +1465,7 @@ func (w *wal) tryBeginRead() (maxFrame uint32, slot int, err error) {
 			return 0, 0, err
 		}
 		// Re-validate: detect WAL reset between metadata read and lock.
-		if w.index.maxFrame.Load() != mxFrame || w.index.nBackfill.Load() != nBackfill {
+		if w.index.mxCommitFrame.Load() != mxFrame || w.index.nBackfill.Load() != nBackfill {
 			_ = w.index.unlock(lockRead0, lockShared)
 			return 0, 0, errWALRetry
 		}
@@ -1480,7 +1492,7 @@ func (w *wal) tryBeginRead() (maxFrame uint32, slot int, err error) {
 		lockSlot := lockRead0 + bestSlot
 		if err := w.index.lock(lockSlot, lockShared); err == nil {
 			// Re-validate: detect WAL reset between metadata read and lock.
-			if w.index.maxFrame.Load() != mxFrame || w.index.nBackfill.Load() != nBackfill {
+			if w.index.mxCommitFrame.Load() != mxFrame || w.index.nBackfill.Load() != nBackfill {
 				_ = w.index.unlock(lockSlot, lockShared)
 				return 0, 0, errWALRetry
 			}
@@ -1494,7 +1506,7 @@ func (w *wal) tryBeginRead() (maxFrame uint32, slot int, err error) {
 		lockSlot := lockRead0 + i
 		if err := w.index.lock(lockSlot, lockShared); err == nil {
 			// Re-validate: detect WAL reset between metadata read and lock.
-			if w.index.maxFrame.Load() != mxFrame || w.index.nBackfill.Load() != nBackfill {
+			if w.index.mxCommitFrame.Load() != mxFrame || w.index.nBackfill.Load() != nBackfill {
 				_ = w.index.unlock(lockSlot, lockShared)
 				return 0, 0, errWALRetry
 			}
@@ -1508,7 +1520,7 @@ func (w *wal) tryBeginRead() (maxFrame uint32, slot int, err error) {
 		return 0, 0, err
 	}
 	// Re-validate: detect WAL reset between metadata read and lock.
-	if w.index.maxFrame.Load() != mxFrame || w.index.nBackfill.Load() != nBackfill {
+	if w.index.mxCommitFrame.Load() != mxFrame || w.index.nBackfill.Load() != nBackfill {
 		_ = w.index.unlock(lockRead0, lockShared)
 		return 0, 0, errWALRetry
 	}
