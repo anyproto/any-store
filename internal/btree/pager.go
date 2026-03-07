@@ -1074,6 +1074,12 @@ func (p *pager) pagerStress(pg *page) error {
 		return nil
 	}
 
+	// Skip dontWrite pages (freed freelist leaves whose content is irrelevant).
+	// SQLite checks PGHDR_DONT_WRITE in pagerStress (pager.c:4642-4644).
+	if p.dontWritePages[pg.pgno] {
+		return nil
+	}
+
 	// subjournalPageIfRequired equivalent (SQLite pager.c:4647):
 	// Save page data for savepoint rollback before spilling.
 	if len(p.savepoints) > 0 {
@@ -1433,8 +1439,7 @@ func (p *pager) rollbackToSavepoint(id int) error {
 				// can be restored and it becomes dirty again.
 				if wp := p.writePages[pgno]; wp != nil {
 					p.cache.reinsertDirty(wp)
-					wp.pinCount++
-					pg = wp
+					pg = p.cache.fetch(pgno) // pin under pcache mutex to avoid data race on pinCount
 				}
 			}
 			if pg != nil {
