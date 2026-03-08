@@ -1159,8 +1159,8 @@ func (p *pager) pagerStress(pg *page) error {
 
 	// Page 1 contains the database header and must not be spilled.
 	// In SQLite, page 1 stays pinned throughout the transaction so pcache
-	// never selects it as a victim. In our implementation, page 1 may become
-	// unpinned between b-tree operations, so we guard it explicitly.
+	// never selects it as a victim. We guard it explicitly because page 1
+	// may become unpinned between b-tree operations.
 	if pg.pgno == 1 {
 		return nil
 	}

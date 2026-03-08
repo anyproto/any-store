@@ -660,12 +660,11 @@ func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
 // walMaxFrame (which is bounded by mxCommitFrame from beginRead) to decide
 // whether the cached page is still valid.
 //
-// DRIFT from SQLite: SQLite has per-connection page caches so readers never
-// see spill frames — the writer's private pWal->hdr.mxFrame (including spills)
-// is not published to shared memory until commit. We share one pageMap across
-// all goroutines, so spill frames are visible to getLatest, causing transient
-// unnecessary cache misses during active spill (latestFrame > walMaxFrame).
-// This is correct (readPageUncached returns the right data) and short-lived.
+// Note: We now use per-connection page caches matching SQLite's model, but
+// we still share one pageMap across all goroutines. Spill frames are visible
+// to getLatest, causing transient cache misses during active spill when
+// latestFrame > walMaxFrame. Each reader's private cache absorbs repeated
+// misses within a transaction. This is correct and short-lived.
 func (wi *walIndex) getLatest(pgno uint32) uint32 {
 	wi.mu.RLock()
 	frames := wi.pageMap[pgno]

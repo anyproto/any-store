@@ -138,13 +138,13 @@ Rewrite any-store's shared page cache (`pcache`) to use per-connection private c
 - [x] run full test suite with -race — must pass
 
 ### Task 8: Update DRIFT comments and documentation
-- [ ] remove/update DRIFT at `pcache.go:141-144` (re-check after stress — removed)
-- [ ] remove/update DRIFT at `pager.go:1081-1082` ("shared cache means readers could trigger xStress" — removed)
-- [ ] remove/update DRIFT at `pager.go:1093-1097` ("page 1 may become unpinned" — removed)
-- [ ] update DRIFT at `wal.go:663-668` ("SQLite has per-connection page caches" — resolved, update comment)
-- [ ] update `internal/btree/NOTES.md` — section on cache spill drifts, MVCC/snapshot isolation
-- [ ] update code comments throughout pager.go, pcache.go referencing "shared cache" or "concurrent readers"
-- [ ] run tests — must pass
+- [x] remove/update DRIFT at `pcache.go:141-144` (re-check after stress — removed)
+- [x] remove/update DRIFT at `pager.go:1081-1082` ("shared cache means readers could trigger xStress" — removed)
+- [x] remove/update DRIFT at `pager.go:1093-1097` ("page 1 may become unpinned" — removed)
+- [x] update DRIFT at `wal.go:663-668` ("SQLite has per-connection page caches" — resolved, update comment)
+- [x] update `internal/btree/NOTES.md` — section on cache spill drifts, MVCC/snapshot isolation
+- [x] update code comments throughout pager.go, pcache.go referencing "shared cache" or "concurrent readers"
+- [x] run tests — must pass
 
 ### Task 9: Verify acceptance criteria and benchmark comparison
 - [ ] run full test suite: `cd internal/btree && go test -race -count=1 -timeout=300s ./...`

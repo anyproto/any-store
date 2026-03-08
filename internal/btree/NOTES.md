@@ -457,14 +457,14 @@ sub-journaling for savepoints.
 
 ### Go (pcache.go)
 
-- Single-layer design with `sync.Mutex` protection
+- Single-layer design, no mutex (each cache is single-goroutine owned)
+- Per-connection caches matching SQLite's model: writer has `writerCache`,
+  each reader gets a private cache from a `sync.Pool`
 - LRU eviction using doubly-linked list (head = oldest = evict first)
 - Pin counting (similar to SQLite's reference counting)
 - `purgeable` flag matching SQLite's `pcache1.bPurgeable`
 - Separate dirty list (singly-linked via `next`/`prev`)
-- `fetchPinned()` captures dirty flag atomically for MVCC safety
-- Page pool (`sync.Pool`) for recycling uncached MVCC snapshot pages
-- No shared cache mode
+- `page.cache` backpointer for routing releases to the correct cache
 
 ### Drift
 
@@ -472,13 +472,13 @@ sub-journaling for savepoints.
 |--------|--------|-----|
 | Architecture | Two-layer (pluggable) | Single-layer |
 | Page flags | Bitmask on each page | Separate maps (`dontWritePages`, `hasContent`) |
-| Shared cache | Supported | Not supported |
+| Cache ownership | Per-connection (private) | Per-connection (private) — matches SQLite |
 | Page groups | Fixed-size groups with internal free-list | Individual `make([]byte, pageSize)` |
-| MVCC page pool | N/A (WAL handles isolation) | `sync.Pool` for uncached snapshot pages |
-| Thread safety | Global mutex | Per-cache `sync.Mutex` |
+| Thread safety | Per-connection (no mutex needed) | Per-connection (no mutex needed) — matches SQLite |
 
-**Classification: Structural** -- The Go pcache is simpler (no pluggable backend, no
-shared cache) but adds MVCC-specific features like `fetchPinned()` and the temp page pool.
+**Classification: Structural** -- The Go pcache is simpler (no pluggable backend) but
+matches SQLite's per-connection ownership model. No mutex needed since each cache is
+accessed by a single goroutine.
 
 ---
 
@@ -532,12 +532,12 @@ because auto-vacuum is not implemented.
 
 Three functions:
 - `writeOverflowChain()`: Allocates pages, writes data sequentially
-- `readOverflowChainAt()`: Reads via shared cache (`getPageAt`) -- for writers
-- `readOverflowChainMVCC()`: Reads via uncached pages (`readPageUncached`) -- for readers
+- `readOverflowChainAt()`: Reads via writer cache (`getPageWriter`) -- for writers
+- `readOverflowChainReader()`: Reads via reader's private cache (`getPageReader`) -- for readers
 
 Key features:
-- **MVCC-aware overflow reading**: Readers bypass the shared cache to prevent
-  polluting it with stale snapshot data that the writer could later read as current
+- **Per-connection cache isolation**: Readers use their own private cache for overflow
+  reads, matching SQLite's per-connection model
 - **Circular chain protection**: `maxIter` counter prevents infinite loops on
   corrupt circular overflow chains
 - **Bounds checking**: Overflow page numbers validated against `dbSize`
@@ -550,15 +550,14 @@ Key features:
 |--------|--------|-----|
 | Overflow page cache | `aOverflow[]` on cursor | None |
 | Partial reads | Offset-based reads supported | Always reads from start |
-| MVCC isolation | Not needed (WAL provides isolation at frame level) | Explicit MVCC: readers bypass shared cache |
+| Cache isolation | Per-connection caches | Per-connection caches — matches SQLite |
 | Direct overflow read | Bypass page cache for large reads | Not implemented |
 | Circular chain protection | Trusts page structure | `maxIter` counter + bounds checking |
 | Write support | `eOp=1` writes through overflow chain | Separate `writeOverflowChain()` |
 
-**Classification: Divergent** -- The Go implementation adds MVCC-aware overflow
-reading that SQLite doesn't need (SQLite's WAL provides isolation at the page level
-without shared-cache pollution concerns). The Go implementation lacks the overflow
-page cache, which means repeated reads of the same overflow cell are more expensive.
+**Classification: Divergent** -- The Go implementation matches SQLite's per-connection
+cache model for overflow reads. It lacks the overflow page cache (`aOverflow[]`), which
+means repeated reads of the same overflow cell are more expensive.
 
 ---
 
@@ -578,42 +577,39 @@ holds "current" versions, and WAL provides the historical view.
 
 ### Go
 
-The Go implementation has an additional MVCC layer:
+The Go implementation uses per-connection page caches matching SQLite's model:
 
 1. **`walMaxFrame` per transaction**: Each read transaction records its snapshot point
-2. **`readPageMVCC()`**: Always returns uncached pages to avoid data races with the
-   writer goroutine, which may dirty and modify cached pages at any time
-3. **`readPageUncached()`**: Creates a standalone page not stored in the shared cache
+2. **Per-connection reader caches**: Each reader gets a private `pcache` from a pool,
+   pages are cached across lookups within the transaction and recycled on rollback
+3. **`getPageReader()`**: Checks reader cache, validates against WAL index, reads from
+   WAL/disk/masterStore on miss, populates cache for subsequent accesses
 4. **Writer fast path**: `writePages` map allows the writer to see its own dirty pages
    without going through the cache
-5. **`getPageAt()` cache coherency**: When a cached page exists but has been updated
-   beyond the reader's snapshot (`latestFrame > walMaxFrame`), the reader bypasses
-   the cache and reads directly from WAL/disk
-6. **Page pool recycling**: `sync.Pool` reuses page objects for uncached reads
+5. **Cache staleness check**: When a cached page has been updated beyond the reader's
+   snapshot (`latestFrame > walMaxFrame`), the reader evicts the stale entry and
+   re-reads from WAL/disk
 
 ### Invariant
 
-Readers MUST NOT use the shared cache (`getPageAt`) for data reads. Overflow pages
-use `readOverflowChainMVCC` (-> `readPageUncached`). B-tree node pages use
-`readPageMVCC` (-> `readPageUncached`). Only the single writer may use `getPageAt`,
-because its snapshot is always the latest and it needs to see its own dirty pages
-via the cache.
+Readers use their private cache via `getPageReader()`. Overflow pages use
+`readOverflowChainReader()`. The writer uses `writerCache` via `getPageWriter()` /
+`getPageAtImpl()`. Each goroutine accesses only its own cache — no mutex needed.
 
 ### Drift
 
 | Aspect | SQLite | Go |
 |--------|--------|-----|
-| Isolation mechanism | WAL frame lookup bounded by `mxFrame` | WAL + explicit uncached page reads |
-| Cache sharing | Single cache, WAL provides time-travel | Readers bypass dirty/newer cached pages |
+| Isolation mechanism | WAL frame lookup bounded by `mxFrame` | WAL frame lookup bounded by `walMaxFrame` — matches SQLite |
+| Cache ownership | Per-connection private caches | Per-connection private caches — matches SQLite |
 | Writer dirty pages | In-cache with `PGHDR_DIRTY` flag | Separate `writePages` map |
-| Overflow MVCC | Not needed (page-level isolation suffices) | `readOverflowChainMVCC()` bypasses cache |
-| Concurrent readers | Multiple readers, each with own `mxFrame` | Same, plus explicit uncached page copies |
+| Overflow reads | Per-connection cache | Per-connection reader cache — matches SQLite |
+| Concurrent readers | Multiple readers, each with own `mxFrame` | Same, each with own `walMaxFrame` and private cache |
 
-**Classification: Divergent** -- The Go implementation has a more explicit MVCC layer
-because Go's concurrency model (goroutines sharing memory) creates data race risks that
-SQLite's process-level isolation avoids. SQLite's page cache is protected by a mutex
-per BtShared, and WAL provides time-travel. Go needs additional care because the writer
-goroutine modifies cached pages in-place while reader goroutines may be accessing them.
+**Classification: Structural** -- The Go implementation now matches SQLite's per-connection
+cache model. Each reader has its own private cache, and the writer has its own cache.
+No mutex is needed on the page cache since each cache is accessed by a single goroutine.
+The remaining difference is the `writePages` map for the writer's dirty-page fast path.
 
 ---
 
@@ -1027,11 +1023,6 @@ comments in source):
    victim. We add an explicit guard because page 1 may become unpinned between
    b-tree operations.
 
-3. **pcache re-check after stress** (`pcache.go:createInternal`): SQLite does not
-   re-check after the stress callback because pcache operations are single-threaded
-   per connection. We drop the pcache lock during stress, so another goroutine can
-   create the same page while the lock is dropped.
-
 4. **Deferred SHM hash writes** (`wal.go:setBatch`): SQLite writes SHM hash entries
    immediately in `walFrames()` via `walIndexAppend()`, then cleans them up with
    `walCleanupHash()` on rollback. We defer SHM writes for spill frames into
@@ -1044,19 +1035,14 @@ comments in source):
    write and just mark them clean, avoiding unnecessary I/O. Safe because dontWrite
    page data is never read back.
 
-6. **Shared pageMap causes transient cache misses** (`wal.go:getLatest`): SQLite has
-   per-connection page caches, so readers never see spill frames — the writer's
-   private `pWal->hdr.mxFrame` is not published to shared memory until commit. We
-   share one `pageMap` across all goroutines, so `getLatest()` returns spill frames,
-   causing transient unnecessary cache misses during active spill when
-   `latestFrame > walMaxFrame`. This is correct (readers re-read the same committed
-   data) and short-lived (only during active spill).
+6. **Shared pageMap causes transient cache misses** (`wal.go:getLatest`): We now use
+   per-connection page caches matching SQLite's model, but we still share one `pageMap`
+   across all goroutines. Spill frames are visible to `getLatest()`, causing transient
+   cache misses during active spill when `latestFrame > walMaxFrame`. Each reader's
+   private cache absorbs repeated misses within a transaction. This is correct and
+   short-lived (only during active spill).
 
 Additionally, the following Go-specific mechanisms have no SQLite analogue:
-- `pcache.createNoStress()`: prevents reader goroutines from triggering
-  `pagerStress`, which accesses writer-only unsynchronized fields
-- `pcache.reinsertDirty()`: handles displaced reader cache entries when a spilled
-  page is re-acquired by the writer
 - `db.writerLocksDone`: atomic CAS guard ensuring Close/Commit/Rollback lock
   cleanup runs exactly once despite concurrent goroutines
 - In-memory WAL `memFrames` truncation on rollback (no SQLite equivalent since
