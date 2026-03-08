@@ -147,14 +147,14 @@ Rewrite any-store's shared page cache (`pcache`) to use per-connection private c
 - [x] run tests — must pass
 
 ### Task 9: Verify acceptance criteria and benchmark comparison
-- [ ] run full test suite: `cd internal/btree && go test -race -count=1 -timeout=300s ./...`
-- [ ] run stress tests: `go test -race -run 'TestCacheStress|TestCheckpoint|TestConcurrent|TestSavepoint|TestOverflow' -count=3 -timeout=300s`
-- [ ] run InMemory tests: `go test -race -run TestInMemory -count=3`
-- [ ] run from repo root: `cd /home/dev/work/any-store && go test -race ./...`
-- [ ] run benchmarks: `go test -bench=. -benchmem -count=5 ./internal/btree/ > bench-after.txt`
-- [ ] compare benchmarks: `benchstat bench-before.txt bench-after.txt`
-- [ ] verify reader performance improved (cache hits vs allocate-per-page)
-- [ ] verify no DRIFT comments remain that reference shared cache
+- [x] run full test suite: `cd internal/btree && go test -race -count=1 -timeout=300s ./...`
+- [x] run stress tests: `go test -race -run 'TestCacheStress|TestCheckpoint|TestConcurrent|TestSavepoint|TestOverflow' -count=3 -timeout=300s`
+- [x] run InMemory tests: `go test -race -run TestInMemory -count=3`
+- [x] run from repo root: `cd /home/dev/work/any-store && go test -race ./...`
+- [x] run benchmarks: `go test -bench=. -benchmem -count=5 ./internal/btree/ > bench-after.txt`
+- [x] compare benchmarks: `benchstat bench-before.txt bench-after.txt`
+- [x] verify reader performance improved (cache hits vs allocate-per-page)
+- [x] verify no DRIFT comments remain that reference shared cache
 
 ### Task 10: [Final] Update documentation
 - [ ] update README.md if any public API semantics changed

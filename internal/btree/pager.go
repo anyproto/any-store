@@ -74,6 +74,12 @@ type pager struct {
 	file     fileHandle
 	wal      *wal
 	writerCache *pcache
+
+	// writerOpMu serializes pager write operations (commit, rollback) so
+	// that DB.Close can safely force-rollback an abandoned transaction
+	// without racing with a concurrent commit. Per-connection pcache has
+	// no mutex, so this pager-level lock is the serialization point.
+	writerOpMu sync.Mutex
 	master   *masterStore // InMemory "disk" — holds checkpointed page data
 	header       dbHeader
 	path         string
@@ -1202,6 +1208,8 @@ func (p *pager) pagerStress(pg *page) error {
 // dataChanged/schemaChanged control whether FileChangeCount/SchemaCookie are
 // incremented. Returns the WAL frame count and the new counter values.
 func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC uint32, err error) {
+	p.writerOpMu.Lock()
+	defer p.writerOpMu.Unlock()
 	if pagerState(p.state.Load()) != pagerWriter {
 		return 0, 0, 0, ErrReadOnly
 	}
@@ -1338,6 +1346,13 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 
 // rollback discards all changes in the current write transaction.
 func (p *pager) rollback() error {
+	p.writerOpMu.Lock()
+	defer p.writerOpMu.Unlock()
+	return p.rollbackLocked()
+}
+
+// rollbackLocked is the inner rollback implementation. Caller must hold writerOpMu.
+func (p *pager) rollbackLocked() error {
 	st := pagerState(p.state.Load())
 	if st != pagerWriter && st != pagerError {
 		return nil

@@ -208,10 +208,16 @@ func (db *DB) Close() error {
 	db.closing.Store(true)
 
 	if !db.writeMu.TryLock() {
-		// Writer holds writeMu. Force-rollback the abandoned/in-flight tx.
+		// Writer holds writeMu. Wait for any active pager operation to
+		// finish, then force-rollback the abandoned/in-flight transaction.
+		// writerOpMu serializes with commit/rollback so we never touch
+		// writerCache concurrently (pcache has no mutex).
+		db.pager.writerOpMu.Lock()
 		if pagerState(db.pager.state.Load()) == pagerWriter {
-			_ = db.pager.rollback()
+			_ = db.pager.rollbackLocked()
 		}
+		db.pager.writerOpMu.Unlock()
+
 		// Use CAS to ensure the writer lock cleanup (endRead + RUnlock +
 		// Unlock) happens exactly once. Without this, the writer goroutine
 		// completing concurrently could race with Close and double-release.

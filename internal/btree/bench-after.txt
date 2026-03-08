@@ -1,0 +1,50 @@
+goos: linux
+goarch: arm64
+pkg: github.com/anyproto/any-store/internal/btree
+BenchmarkGet-8                 	  190520	      6249 ns/op	   12646 B/op	       7 allocs/op
+BenchmarkGet-8                 	  194874	      5203 ns/op	   12647 B/op	       7 allocs/op
+BenchmarkGet-8                 	  250873	      4744 ns/op	   12647 B/op	       7 allocs/op
+BenchmarkGet-8                 	  214815	      5678 ns/op	   12647 B/op	       7 allocs/op
+BenchmarkGet-8                 	  258218	      4943 ns/op	   12647 B/op	       7 allocs/op
+BenchmarkGetBatch-8            	    6351	    182350 ns/op	  393683 B/op	     283 allocs/op
+BenchmarkGetBatch-8            	    6679	    179115 ns/op	  393899 B/op	     283 allocs/op
+BenchmarkGetBatch-8            	    5215	    257029 ns/op	  393867 B/op	     283 allocs/op
+BenchmarkGetBatch-8            	    5838	    243117 ns/op	  393905 B/op	     283 allocs/op
+BenchmarkGetBatch-8            	    5814	    215319 ns/op	  393478 B/op	     283 allocs/op
+BenchmarkCursorScan/keys=100-8 	   88575	     14790 ns/op	   20997 B/op	      13 allocs/op
+BenchmarkCursorScan/keys=100-8 	   69744	     16257 ns/op	   20998 B/op	      13 allocs/op
+BenchmarkCursorScan/keys=100-8 	   76388	     15366 ns/op	   20997 B/op	      13 allocs/op
+BenchmarkCursorScan/keys=100-8 	   86786	     17564 ns/op	   20998 B/op	      13 allocs/op
+BenchmarkCursorScan/keys=100-8 	   72691	     15702 ns/op	   20997 B/op	      13 allocs/op
+BenchmarkCursorScan/keys=1000-8         	    9552	    125476 ns/op	  171433 B/op	      85 allocs/op
+BenchmarkCursorScan/keys=1000-8         	   10074	    116753 ns/op	  171427 B/op	      85 allocs/op
+BenchmarkCursorScan/keys=1000-8         	   10000	    146811 ns/op	  171444 B/op	      85 allocs/op
+BenchmarkCursorScan/keys=1000-8         	    8239	    132544 ns/op	  171434 B/op	      85 allocs/op
+BenchmarkCursorScan/keys=1000-8         	    9619	    112381 ns/op	  171430 B/op	      85 allocs/op
+BenchmarkCursorScan/keys=10000-8        	    1045	   1056172 ns/op	 1684088 B/op	     811 allocs/op
+BenchmarkCursorScan/keys=10000-8        	    1434	    842366 ns/op	 1684168 B/op	     811 allocs/op
+BenchmarkCursorScan/keys=10000-8        	    1389	    835891 ns/op	 1684157 B/op	     811 allocs/op
+BenchmarkCursorScan/keys=10000-8        	    1520	    854187 ns/op	 1684185 B/op	     811 allocs/op
+BenchmarkCursorScan/keys=10000-8        	    1249	    814664 ns/op	 1684164 B/op	     811 allocs/op
+BenchmarkPut-8                          	   10000	   2392140 ns/op	    2817 B/op	       2 allocs/op
+BenchmarkPut-8                          	   10000	   2051939 ns/op	    2817 B/op	       2 allocs/op
+BenchmarkPut-8                          	   10000	   3967899 ns/op	    2817 B/op	       2 allocs/op
+BenchmarkPut-8                          	   10000	   1831561 ns/op	    2817 B/op	       2 allocs/op
+BenchmarkPut-8                          	   10000	   1710097 ns/op	    2817 B/op	       2 allocs/op
+BenchmarkConcurrentReaders-8            	  218750	      5035 ns/op	   12642 B/op	       7 allocs/op
+BenchmarkConcurrentReaders-8            	  243528	      4381 ns/op	   12642 B/op	       7 allocs/op
+BenchmarkConcurrentReaders-8            	  318398	      3402 ns/op	   12642 B/op	       7 allocs/op
+BenchmarkConcurrentReaders-8            	  380306	      2992 ns/op	   12642 B/op	       7 allocs/op
+BenchmarkConcurrentReaders-8            	  378386	      3084 ns/op	   12642 B/op	       7 allocs/op
+BenchmarkWriterWithReaders-8            	   40105	     26040 ns/op	   42776 B/op	      24 allocs/op
+BenchmarkWriterWithReaders-8            	   41893	     33181 ns/op	   49674 B/op	      28 allocs/op
+BenchmarkWriterWithReaders-8            	   47773	     37803 ns/op	   69667 B/op	      39 allocs/op
+BenchmarkWriterWithReaders-8            	   34980	     35813 ns/op	   57480 B/op	      32 allocs/op
+BenchmarkWriterWithReaders-8            	   27015	     39240 ns/op	   54731 B/op	      31 allocs/op
+BenchmarkReadTxPageAllocs-8             	    6561	    160506 ns/op	   43069 B/op	    1256 allocs/op
+BenchmarkReadTxPageAllocs-8             	    5427	    233842 ns/op	   43061 B/op	    1256 allocs/op
+BenchmarkReadTxPageAllocs-8             	    8874	    125997 ns/op	   43059 B/op	    1256 allocs/op
+BenchmarkReadTxPageAllocs-8             	    9421	    126722 ns/op	   43061 B/op	    1256 allocs/op
+BenchmarkReadTxPageAllocs-8             	    9495	    126666 ns/op	   43059 B/op	    1256 allocs/op
+PASS
+ok  	github.com/anyproto/any-store/internal/btree	200.540s
