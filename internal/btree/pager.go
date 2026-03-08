@@ -411,7 +411,7 @@ func (p *pager) getPage(pgno uint32) (*page, error) {
 }
 
 // getPageWriter returns a page using the writer's cache, reading from
-// WAL or disk on cache miss. Used by the writer and integrity checker.
+// WAL or disk on cache miss. Used by the writer goroutine only.
 func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage

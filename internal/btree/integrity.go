@@ -32,6 +32,7 @@ func (e *IntegrityError) Error() string {
 // integrityChecker holds state for a single integrity check run.
 type integrityChecker struct {
 	pager       *pager
+	cache       *pcache  // private reader cache (avoids racing with writerCache)
 	walMaxFrame uint32
 	pageRef     []byte   // bit-packed: 1 bit per page
 	nPages      uint32   // total database pages
@@ -41,6 +42,11 @@ type integrityChecker struct {
 
 	// Context for error messages
 	treeName string // current tree name (e.g., "master" or namespace name)
+}
+
+// getPage fetches a page using the checker's private reader cache.
+func (ic *integrityChecker) getPage(pgno uint32) (*page, error) {
+	return ic.pager.getPageReader(pgno, ic.walMaxFrame, ic.cache)
 }
 
 func (ic *integrityChecker) tooManyErrors() bool {
@@ -106,7 +112,7 @@ func (ic *integrityChecker) checkList(isFreeList bool, firstPgno uint32, expecte
 		}
 		count++
 
-		pg, err := ic.pager.getPageWriter(pgno, ic.walMaxFrame)
+		pg, err := ic.getPage(pgno)
 		if err != nil {
 			ic.report("%s: unable to get page %d: %v", context, pgno, err)
 			return
@@ -231,7 +237,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 		return 0
 	}
 
-	pg, err := ic.pager.getPageWriter(pgno, ic.walMaxFrame)
+	pg, err := ic.getPage(pgno)
 	if err != nil {
 		ic.report("%s: unable to get page: %v", context, err)
 		return 0
@@ -301,7 +307,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 			// Key ordering check — need full key for overflow cells
 			var fullKey []byte
 			if cell.overflowPg != 0 {
-				fk, fkerr := leafFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, nil)
+				fk, fkerr := leafFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, ic.cache)
 				if fkerr != nil {
 					ic.report("%s cell %d: corrupt leaf key", context, i)
 				} else {
@@ -354,7 +360,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 			}
 
 			// For key ordering, we need the full key (may require overflow read)
-			fullKey, fkerr := interiorFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, nil)
+			fullKey, fkerr := interiorFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, ic.cache)
 			if fkerr != nil {
 				ic.report("%s cell %d: corrupt interior key", context, i)
 			} else {
@@ -436,8 +442,12 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 	}
 	defer db.pager.endRead(slot)
 
+	// Use a private reader cache to avoid racing with the writer's cache.
+	cache := newPcache(int(db.pager.pageSize), 200, true)
+	defer cache.clear()
+
 	// Read page 1 to get the current header
-	pg1, err := db.pager.getPageWriter(1, maxFrame)
+	pg1, err := db.pager.getPageReader(1, maxFrame, cache)
 	if err != nil {
 		return err
 	}
@@ -480,6 +490,7 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 
 	ic := &integrityChecker{
 		pager:       db.pager,
+		cache:       cache,
 		walMaxFrame: maxFrame,
 		pageRef:     make([]byte, nPages/8+1),
 		nPages:      nPages,
@@ -499,7 +510,7 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 
 	// 2. Check master B-tree (page 1) structure
 	ic.treeName = "master"
-	pg1, err = db.pager.getPageWriter(1, maxFrame)
+	pg1, err = ic.getPage(1)
 	if err != nil {
 		return err
 	}
