@@ -6699,9 +6699,13 @@ func TestPagerStressSpillsDirtyPage(t *testing.T) {
 	// Verify: page is now clean
 	assert.False(t, pg2.dirty, "page should be clean after stress")
 
-	// Verify: spilled page data is in WAL (readable via pageMap)
-	frame := p.wal.index.getLatest(pg2.pgno)
-	assert.NotZero(t, frame, "spilled page should be in pageMap")
+	// Verify: spilled page data is in WAL (readable via pageMap).
+	// getLatest() correctly filters by mxCommitFrame (hiding spilled frames
+	// from readers), so we check pageMap directly to confirm the frame exists.
+	p.wal.index.mu.RLock()
+	frames := p.wal.index.pageMap[pg2.pgno]
+	p.wal.index.mu.RUnlock()
+	assert.NotEmpty(t, frames, "spilled page should be in pageMap")
 }
 
 func TestPagerStressSpillFlagOff(t *testing.T) {
@@ -6828,9 +6832,12 @@ func TestPagerStressWithSavepoint(t *testing.T) {
 	// Verify: page is clean after stress
 	assert.False(t, pg.dirty, "page should be clean after stress")
 
-	// Verify: page was written to WAL
-	frame := p.wal.index.getLatest(pgno)
-	assert.NotZero(t, frame, "spilled page should be in WAL")
+	// Verify: page was written to WAL (check pageMap directly since
+	// getLatest() correctly filters by mxCommitFrame, hiding spilled frames).
+	p.wal.index.mu.RLock()
+	frames := p.wal.index.pageMap[pgno]
+	p.wal.index.mu.RUnlock()
+	assert.NotEmpty(t, frames, "spilled page should be in WAL")
 }
 
 // ============================================================

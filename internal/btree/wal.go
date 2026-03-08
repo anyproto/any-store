@@ -650,22 +650,30 @@ func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
 	return 0
 }
 
-// getLatest returns the latest WAL frame for pgno regardless of any snapshot
-// limit, or 0 if the page is not in the WAL. Used to detect whether a cached
-// page may have been updated beyond a reader's snapshot.
+// getLatest returns the latest committed WAL frame for pgno, or 0 if the page
+// is not in the WAL. Used to detect whether a cached page may have been updated
+// beyond a reader's snapshot. Only committed frames are considered so that
+// spilled (uncommitted) frames don't cause unnecessary cache invalidation for
+// concurrent readers.
 func (wi *walIndex) getLatest(pgno uint32) uint32 {
 	wi.mu.RLock()
 	frames := wi.pageMap[pgno]
 	wi.mu.RUnlock()
 
-	if len(frames) > 0 {
-		return frames[len(frames)-1]
+	// Filter by mxCommitFrame so spilled uncommitted frames are invisible
+	// to readers. Without this, concurrent readers would lose cache hits
+	// during spill (latestFrame > walMaxFrame triggers readPageUncached).
+	mxCommit := wi.mxCommitFrame.Load()
+	for i := len(frames) - 1; i >= 0; i-- {
+		if frames[i] <= mxCommit {
+			return frames[i]
+		}
 	}
 
 	// Cross-process fallback: check SHM hash tables.
 	// Use mxCommitFrame (not maxFrame) so spilled uncommitted frames are invisible.
 	if !wi.inProcess {
-		return wi.shmHashGet(pgno, wi.mxCommitFrame.Load())
+		return wi.shmHashGet(pgno, mxCommit)
 	}
 
 	return 0
@@ -683,6 +691,7 @@ func (wi *walIndex) reset() {
 	for i := range wi.aReadMark {
 		wi.aReadMark[i].Store(readMarkNotUsed)
 	}
+	wi.pendingShmFrames = wi.pendingShmFrames[:0]
 	wi.shmClearHash()
 	wi.shmWriteCkptInfo()
 }
