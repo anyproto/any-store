@@ -1340,8 +1340,9 @@ func (p *pager) rollback() error {
 // DRIFT from SQLite: SQLite's pager_error() only sets errCode and transitions
 // to PAGER_ERROR, deferring cleanup to the subsequent sqlite3PagerRollback().
 // We perform eager cleanup here (cache purge, WAL rollback, lock release,
-// transition to pagerOpen) to avoid leaving the WAL write lock held, which
-// would block other writers in our concurrent goroutine model.
+// transition to pagerOpen) because there is no guaranteed subsequent rollback
+// call — if the caller's goroutine panics or abandons the transaction, the
+// WAL write lock would remain held, blocking the next BeginWrite.
 func (p *pager) pagerError() {
 	p.state.Store(int32(pagerError))
 

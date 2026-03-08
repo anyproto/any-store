@@ -1016,8 +1016,10 @@ comments in source):
 1. **pagerError eager cleanup** (`pager.go:pagerError`): SQLite's `pager_error()`
    only sets errCode and transitions to `PAGER_ERROR`, deferring cleanup to a
    subsequent `sqlite3PagerRollback()`. We perform eager cleanup (cache purge,
-   WAL rollback, lock release, transition to pagerOpen) to avoid leaving the WAL
-   write lock held, which would block other writers in our concurrent goroutine model.
+   WAL rollback, lock release, transition to pagerOpen) because there is no
+   guaranteed subsequent rollback call — if the caller's goroutine panics or
+   abandons the transaction, the WAL write lock would remain held, blocking the
+   next `BeginWrite`.
 
 2. **Page-1 explicit exclusion** (`pager.go:pagerStress`): SQLite does not check
    `pgno==1` in `pagerStress()`. Page 1 is structurally protected: it stays pinned
