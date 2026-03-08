@@ -157,8 +157,8 @@ Rewrite any-store's shared page cache (`pcache`) to use per-connection private c
 - [x] verify no DRIFT comments remain that reference shared cache
 
 ### Task 10: [Final] Update documentation
-- [ ] update README.md if any public API semantics changed
-- [ ] update memory notes if new patterns discovered during implementation
+- [x] update README.md if any public API semantics changed
+- [x] update memory notes if new patterns discovered during implementation
 
 *Note: ralphex automatically moves completed plans to `docs/plans/completed/`*
 
