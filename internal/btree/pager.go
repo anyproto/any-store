@@ -413,10 +413,6 @@ func (p *pager) getPage(pgno uint32) (*page, error) {
 // getPageWriter returns a page using the writer's cache, reading from
 // WAL or disk on cache miss. Used by the writer and integrity checker.
 func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
-	return p.getPageAtImpl(pgno, walMaxFrame)
-}
-
-func (p *pager) getPageAtImpl(pgno, walMaxFrame uint32) (*page, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
 	}
@@ -499,7 +495,7 @@ func (p *pager) getPageAtImpl(pgno, walMaxFrame uint32) (*page, error) {
 }
 
 // readTempPage reads a page into a standalone temporary page object that is
-// NOT stored in any cache. Used by getPageAtImpl when the writer cache holds
+// NOT stored in any cache. Used by getPageWriter when the writer cache holds
 // a stale clean page — the temp page avoids disturbing the cache while
 // returning the correct snapshot data.
 func (p *pager) readTempPage(pgno, walMaxFrame uint32) (*page, error) {
@@ -1101,26 +1097,22 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 			frame = p.wal.index.shmHashGet(1, effectiveMaxFrame)
 		}
 		if frame > 0 {
-			buf := make([]byte, dbHeaderSize)
-			if err := p.readWalFrameData(frame, buf); err == nil {
+			var buf [dbHeaderSize]byte
+			if err := p.readWalFrameData(frame, buf[:]); err == nil {
 				return binary.BigEndian.Uint32(buf[24:28]), binary.BigEndian.Uint32(buf[40:44]), nil
 			}
 		}
 	}
 
-	// No WAL frame for page 1; read from database file.
+	// No WAL frame for page 1; read from database file or header.
 	if p.file == nil {
-		// InMemory: page 1 is in pcache; read header from there.
-		if pg := p.writerCache.fetch(1); pg != nil {
-			fcc := binary.BigEndian.Uint32(pg.data[24:28])
-			sc := binary.BigEndian.Uint32(pg.data[40:44])
-			p.writerCache.release(pg)
-			return fcc, sc, nil
-		}
+		// InMemory: use the pager's in-memory header which is updated on
+		// every commit. Avoids accessing writerCache from reader goroutines
+		// (pcache has no mutex, so concurrent access would be a data race).
 		return p.header.FileChangeCount, p.header.SchemaCookie, nil
 	}
-	buf := make([]byte, dbHeaderSize)
-	if _, err := p.file.ReadAt(buf, 0); err != nil {
+	var buf [dbHeaderSize]byte
+	if _, err := p.file.ReadAt(buf[:], 0); err != nil {
 		return 0, 0, err
 	}
 	return binary.BigEndian.Uint32(buf[24:28]), binary.BigEndian.Uint32(buf[40:44]), nil
@@ -1231,20 +1223,6 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 		if debugTrace {
 			trace("commit: filtering %d dontWrite pages from %d dirty pages savepoints=%d",
 				len(p.dontWritePages), len(p.dirtyBuf), len(p.savepoints))
-			// Bug 13 diagnostic: check if any dontWrite page has non-zero content
-			for pgno := range p.dontWritePages {
-				if pg := p.writePages[pgno]; pg != nil {
-					allZero := true
-					for _, b := range pg.data {
-						if b != 0 {
-							allZero = false
-							break
-						}
-					}
-					trace("BUG13-DIAG commit: dontWrite pg=%d allZero=%v dirty=%v",
-						pgno, allZero, pg.dirty)
-				}
-			}
 		}
 		n := 0
 		for _, pg := range p.dirtyBuf {
@@ -1300,24 +1278,8 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	// Re-collect dirty pages since page 1 may be newly dirty.
 	p.dirtyBuf = p.writerCache.appendDirtyPages(p.dirtyBuf[:0])
 
-	// Detect zero-content pages about to be written to WAL (Bug 9 detection)
 	if debugTrace {
 		trace("commit: writing %d dirty pages to WAL", len(p.dirtyBuf))
-		for _, pg := range p.dirtyBuf {
-			allZero := true
-			for _, b := range pg.data {
-				if b != 0 {
-					allZero = false
-					break
-				}
-			}
-			if allZero && pg.pgno != 1 {
-				// Check if it's a freelist trunk page (first 8 bytes = nextTrunk + leafCount)
-				isFreelistTrunk := pg.pgno == p.header.FirstFreelistPg
-				trace("commit: WARNING zero-content page %d about to be written to WAL! isFreelistTrunk=%v firstFreelist=%d",
-					pg.pgno, isFreelistTrunk, p.header.FirstFreelistPg)
-			}
-		}
 	}
 
 	// Write all dirty pages to WAL
@@ -1604,17 +1566,6 @@ func (p *pager) rollbackToSavepoint(id int) error {
 	// This matches SQLite's behavior (pager.c:7025): ROLLBACK TO keeps the
 	// savepoint active so it can be released or rolled back again later.
 	p.savepoints = p.savepoints[:id+1]
-
-	if debugTrace {
-		// Bug 13 diagnostic: log residual dontWritePages/hasContent after rollback
-		if len(p.dontWritePages) > 0 || len(p.hasContent) > 0 {
-			trace("BUG13-DIAG rollbackToSavepoint: RESIDUAL dontWritePages=%d hasContent=%d after rollback id=%d",
-				len(p.dontWritePages), len(p.hasContent), id)
-			for pg := range p.dontWritePages {
-				trace("BUG13-DIAG   residual dontWrite pg=%d inWritePages=%v", pg, p.writePages[pg] != nil)
-			}
-		}
-	}
 
 	return nil
 }

@@ -72,7 +72,7 @@ func seedData(t *testing.T, db *DB, nsName string, n int, valSize int) *Namespac
 // -------------------------------------------------------------------
 // Flow 1: Reader cache hit during writer spill
 //
-// Reader calls getPageAtImpl, finds clean cached page, calls getLatest
+// Reader calls getPageWriter, finds clean cached page, calls getLatest
 // which returns a spill frame. latestFrame > walMaxFrame → reader drops
 // the valid cached page and re-reads via readPageUncached.
 //

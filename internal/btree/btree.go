@@ -865,10 +865,14 @@ func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFr
 	fullKey := make([]byte, int(keyLen))
 	copy(fullKey, data[keyStart:keyStart+localSize])
 	overflowPg := binary.BigEndian.Uint32(data[keyStart+localSize : keyStart+localSize+4])
+	var readErr error
 	if cache != nil {
-		_ = p.readOverflowChainReader(overflowPg, fullKey[localSize:], walMaxFrame, cache)
+		readErr = p.readOverflowChainReader(overflowPg, fullKey[localSize:], walMaxFrame, cache)
 	} else {
-		_ = p.readOverflowChainAt(overflowPg, fullKey[localSize:], walMaxFrame)
+		readErr = p.readOverflowChainAt(overflowPg, fullKey[localSize:], walMaxFrame)
+	}
+	if readErr != nil {
+		return nil, readErr
 	}
 	return fullKey, nil
 }

@@ -593,8 +593,8 @@ The Go implementation uses per-connection page caches matching SQLite's model:
 ### Invariant
 
 Readers use their private cache via `getPageReader()`. Overflow pages use
-`readOverflowChainReader()`. The writer uses `writerCache` via `getPageWriter()` /
-`getPageAtImpl()`. Each goroutine accesses only its own cache — no mutex needed.
+`readOverflowChainReader()`. The writer uses `writerCache` via `getPageWriter()`.
+Each goroutine accesses only its own cache — no mutex needed.
 
 ### Drift
 
@@ -1023,6 +1023,13 @@ comments in source):
    victim. We add an explicit guard because page 1 may become unpinned between
    b-tree operations.
 
+3. **`pcache.create()` drops xStress error** (`pcache.go:create`): SQLite's
+   `pcache1Fetch` propagates non-BUSY errors from xStress to the caller, allowing
+   the pager to abort page acquisition. Our `create()` has no error return (it
+   always returns a `*page`), so xStress errors are silently dropped. In practice,
+   `pagerStress` calls `pagerError` on WAL write failure, which performs eager
+   cleanup, so the dropped error is harmless.
+
 4. **Deferred SHM hash writes** (`wal.go:setBatch`): SQLite writes SHM hash entries
    immediately in `walFrames()` via `walIndexAppend()`, then cleans them up with
    `walCleanupHash()` on rollback. We defer SHM writes for spill frames into
@@ -1043,6 +1050,10 @@ comments in source):
    short-lived (only during active spill).
 
 Additionally, the following Go-specific mechanisms have no SQLite analogue:
+- `pager.writerOpMu`: mutex serializing commit/rollback with DB.Close
+  force-rollback. SQLite does not allow `sqlite3_close()` during active
+  transactions (returns `SQLITE_BUSY`); Go's DB.Close performs a force-rollback,
+  requiring this mutex to prevent it from racing with a concurrent commit.
 - `db.writerLocksDone`: atomic CAS guard ensuring Close/Commit/Rollback lock
   cleanup runs exactly once despite concurrent goroutines
 - In-memory WAL `memFrames` truncation on rollback (no SQLite equivalent since
@@ -1075,11 +1086,11 @@ corrupted WAL header could cause issues during recovery.
 Intentional design choice for the `InProcess + NoSync` fast path. No disk
 persistence means checksums add overhead without value.
 
-**Auto-Checkpoint Uses FULL Mode** -- Severity: Minor
+**Auto-Checkpoint Uses PASSIVE Mode** -- Severity: Minor
 
-Default threshold is 10,000 frames vs SQLite's 1,000. Auto-checkpoint currently
-runs as FULL (blocking writers). PASSIVE mode is implemented and available
-via `checkpointPassive()`, but auto-checkpoint has not yet been wired to use it.
+Default threshold is 10,000 frames vs SQLite's 1,000. Auto-checkpoint runs as
+PASSIVE (`tryCheckpoint()` -> `checkpointPassive()`), matching SQLite's default
+auto-checkpoint behavior. PASSIVE mode does not block writers or readers.
 
 ### Pager / Cache
 
