@@ -49,10 +49,9 @@ func (bt *btree) getPage(pgno uint32) (*page, error) {
 		}
 		return bt.pager.getPage(pgno)
 	}
-	// Reader: always use MVCC to avoid racing with writer's writePages
-	// and dirty pages in the shared cache. Safe with walMaxFrame==0 too —
-	// readPageMVCC reads directly from the database file when WAL is empty.
-	return bt.pager.readPageMVCC(pgno, bt.walMaxFrame)
+	// Reader: use private cache for snapshot isolation. Falls back to
+	// uncached reads when bt.cache is nil.
+	return bt.pager.getPageReader(pgno, bt.walMaxFrame, bt.cache)
 }
 
 // usablePageSize returns the usable page size, accounting for reserved space.
@@ -496,12 +495,12 @@ func searchLeafPage(pg *page, key []byte) (int, bool, error) {
 // Used by btree methods that need to search leaves where keys may overflow.
 func (bt *btree) searchLeaf(pg *page, key []byte) (int, bool, error) {
 	usableSize := bt.usablePageSize()
-	return searchLeafWithOverflow(pg, key, usableSize, bt.pager, bt.walMaxFrame, !bt.writable)
+	return searchLeafWithOverflow(pg, key, usableSize, bt.pager, bt.walMaxFrame, bt.cache)
 }
 
 // searchLeafWithOverflow is a standalone function for searching leaf pages
 // with overflow key support. Used by ReadTx which doesn't have a btree struct.
-func searchLeafWithOverflow(pg *page, key []byte, usableSize int, p *pager, walMaxFrame uint32, mvcc bool) (int, bool, error) {
+func searchLeafWithOverflow(pg *page, key []byte, usableSize int, p *pager, walMaxFrame uint32, cache *pcache) (int, bool, error) {
 	n := int(pg.header.cellCount)
 	data := pg.data
 	dataLen := len(data)
@@ -573,7 +572,7 @@ func searchLeafWithOverflow(pg *page, key []byte, usableSize int, p *pager, walM
 				}
 				// Need full key — read from overflow
 				var fkerr error
-				cellKey, fkerr = leafFullKey(data, off, usableSize, p, walMaxFrame, mvcc)
+				cellKey, fkerr = leafFullKey(data, off, usableSize, p, walMaxFrame, cache)
 				if fkerr != nil {
 					return 0, false, fkerr
 				}
@@ -635,7 +634,7 @@ func (bt *btree) interiorCellFullKey(data []byte, offset int, usableSize int) (k
 		return nil, 0, ErrCorrupt
 	}
 	leftChild = binary.BigEndian.Uint32(data[offset : offset+4])
-	key, err = interiorFullKey(data, offset, usableSize, bt.pager, bt.walMaxFrame, !bt.writable)
+	key, err = interiorFullKey(data, offset, usableSize, bt.pager, bt.walMaxFrame, bt.cache)
 	return key, leftChild, err
 }
 
@@ -697,7 +696,7 @@ func searchInteriorPage(pg *page, key []byte) (childPgno uint32, cellIdx int, er
 
 // searchInteriorWithOverflow is a standalone function for searching interior pages
 // with overflow key support. Used by ReadTx which doesn't have a btree struct.
-func searchInteriorWithOverflow(pg *page, key []byte, usableSize int, p *pager, walMaxFrame uint32, mvcc bool) (childPgno uint32, cellIdx int, err error) {
+func searchInteriorWithOverflow(pg *page, key []byte, usableSize int, p *pager, walMaxFrame uint32, cache *pcache) (childPgno uint32, cellIdx int, err error) {
 	n := int(pg.header.cellCount)
 	data := pg.data
 	dataLen := len(data)
@@ -710,7 +709,7 @@ func searchInteriorWithOverflow(pg *page, key []byte, usableSize int, p *pager, 
 			return 0, 0, ErrCorrupt
 		}
 		off := int(binary.BigEndian.Uint16(data[cpBase:]))
-		cellKey, kerr := interiorFullKey(data, off, usableSize, p, walMaxFrame, mvcc)
+		cellKey, kerr := interiorFullKey(data, off, usableSize, p, walMaxFrame, cache)
 		if kerr != nil {
 			return 0, 0, kerr
 		}
@@ -755,7 +754,7 @@ func searchInteriorWithOverflow(pg *page, key []byte, usableSize int, p *pager, 
 // if the key spills. Returns a slice into page buffer for non-overflow keys,
 // or an allocated copy for overflow keys.
 // Matches SQLite's accessPayload() slow path in sqlite3BtreeIndexMoveto().
-func leafFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFrame uint32, mvcc bool) ([]byte, error) {
+func leafFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFrame uint32, cache *pcache) ([]byte, error) {
 	dataLen := len(data)
 	if offset >= dataLen {
 		return nil, ErrCorrupt
@@ -820,8 +819,8 @@ func leafFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFrame 
 	// We only need keyLen - localKeyBytes bytes.
 	keyOverflow := int(keyLen) - localKeyBytes
 	overflowBuf := make([]byte, keyOverflow)
-	if mvcc {
-		err = p.readOverflowChainMVCC(overflowPg, overflowBuf, walMaxFrame)
+	if cache != nil {
+		err = p.readOverflowChainReader(overflowPg, overflowBuf, walMaxFrame, cache)
 	} else {
 		err = p.readOverflowChainAt(overflowPg, overflowBuf, walMaxFrame)
 	}
@@ -833,9 +832,9 @@ func leafFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFrame 
 }
 
 // interiorFullKey reads the full key from an interior cell, handling overflow.
-// mvcc controls overflow page reads: true uses readPageUncached (for readers),
-// false uses getPageAt (for writers who need to see their own dirty pages).
-func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFrame uint32, mvcc bool) ([]byte, error) {
+// cache controls overflow page reads: non-nil uses the reader's private cache,
+// nil uses readOverflowChainAt (for writers who need to see their own dirty pages).
+func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFrame uint32, cache *pcache) ([]byte, error) {
 	dataLen := len(data)
 	if offset+4 >= dataLen {
 		return nil, ErrCorrupt
@@ -866,8 +865,8 @@ func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFr
 	fullKey := make([]byte, int(keyLen))
 	copy(fullKey, data[keyStart:keyStart+localSize])
 	overflowPg := binary.BigEndian.Uint32(data[keyStart+localSize : keyStart+localSize+4])
-	if mvcc {
-		_ = p.readOverflowChainMVCC(overflowPg, fullKey[localSize:], walMaxFrame)
+	if cache != nil {
+		_ = p.readOverflowChainReader(overflowPg, fullKey[localSize:], walMaxFrame, cache)
 	} else {
 		_ = p.readOverflowChainAt(overflowPg, fullKey[localSize:], walMaxFrame)
 	}
@@ -954,12 +953,12 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 
 	// For writable btrees, use bt.getPage which checks writePages first
 	// to find pages that were spilled and evicted from pcache.
-	// For readers, use getPageAt with the snapshot maxFrame.
+	// For readers, use getPageReader with the reader's private cache.
 	var pg *page
 	if bt.writable {
 		pg, err = bt.getPage(bt.rootPage)
 	} else {
-		pg, err = bt.pager.getPageAt(bt.rootPage, maxFrame)
+		pg, err = bt.pager.getPageReader(bt.rootPage, maxFrame, bt.cache)
 	}
 	if err != nil {
 		return buf, err
@@ -967,10 +966,9 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 	defer bt.pager.releasePage(pg)
 
 	usableSize := bt.usablePageSize()
-	mvcc := !bt.writable
 	for {
 		if pg.header.isLeaf() {
-			idx, found, serr := searchLeafWithOverflow(pg, key, usableSize, bt.pager, maxFrame, mvcc)
+			idx, found, serr := searchLeafWithOverflow(pg, key, usableSize, bt.pager, maxFrame, bt.cache)
 			if serr != nil {
 				return buf, serr
 			}
@@ -1012,10 +1010,10 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 				// Read overflow and extract value remainder
 				if overflowSize > 0 {
 					overflowBuf := make([]byte, overflowSize)
-					if bt.writable {
-						err = bt.pager.readOverflowChainAt(cell.overflowPg, overflowBuf, maxFrame)
+					if bt.cache != nil {
+						err = bt.pager.readOverflowChainReader(cell.overflowPg, overflowBuf, maxFrame, bt.cache)
 					} else {
-						err = bt.pager.readOverflowChainMVCC(cell.overflowPg, overflowBuf, maxFrame)
+						err = bt.pager.readOverflowChainAt(cell.overflowPg, overflowBuf, maxFrame)
 					}
 					if err != nil {
 						return buf[:start], err
@@ -1040,7 +1038,7 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 		if bt.writable {
 			pg, err = bt.getPage(childPgno)
 		} else {
-			pg, err = bt.pager.getPageAt(childPgno, maxFrame)
+			pg, err = bt.pager.getPageReader(childPgno, maxFrame, bt.cache)
 		}
 		if err != nil {
 			return buf, err
@@ -2775,7 +2773,7 @@ func (c *Cursor) Key() ([]byte, error) {
 	}
 	if cell.overflowPg != 0 {
 		// Key may be partial — use leafFullKey to reconstruct
-		return leafFullKey(frame.pg.data, int(off), usableSize, c.bt.pager, c.bt.walMaxFrame, !c.bt.writable)
+		return leafFullKey(frame.pg.data, int(off), usableSize, c.bt.pager, c.bt.walMaxFrame, c.bt.cache)
 	}
 	return cell.key, nil
 }
@@ -2829,10 +2827,10 @@ func (c *Cursor) Value() ([]byte, error) {
 		overflowSize := totalPayload - nLocal
 		overflowBuf := make([]byte, overflowSize)
 		var err error
-		if c.bt.writable {
-			err = c.bt.pager.readOverflowChainAt(cell.overflowPg, overflowBuf, c.bt.walMaxFrame)
+		if c.bt.cache != nil {
+			err = c.bt.pager.readOverflowChainReader(cell.overflowPg, overflowBuf, c.bt.walMaxFrame, c.bt.cache)
 		} else {
-			err = c.bt.pager.readOverflowChainMVCC(cell.overflowPg, overflowBuf, c.bt.walMaxFrame)
+			err = c.bt.pager.readOverflowChainAt(cell.overflowPg, overflowBuf, c.bt.walMaxFrame)
 		}
 		if err != nil {
 			return nil, err

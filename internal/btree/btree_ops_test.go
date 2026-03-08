@@ -720,22 +720,22 @@ func TestSearchInteriorWithOverflowBranches(t *testing.T) {
 
 	usable := p.usableSize()
 
-	child, idx, serr := searchInteriorWithOverflow(pg, []byte("aaa"), usable, p, 0, false)
+	child, idx, serr := searchInteriorWithOverflow(pg, []byte("aaa"), usable, p, 0, nil)
 	assert.NoError(t, serr)
 	assert.Equal(t, uint32(10), child)
 	assert.Equal(t, 0, idx)
 
-	child, idx, serr = searchInteriorWithOverflow(pg, []byte("ppp"), usable, p, 0, false)
+	child, idx, serr = searchInteriorWithOverflow(pg, []byte("ppp"), usable, p, 0, nil)
 	assert.NoError(t, serr)
 	assert.Equal(t, uint32(20), child)
 	assert.Equal(t, 1, idx)
 
-	child, idx, serr = searchInteriorWithOverflow(pg, []byte("zzz-after"), usable, p, 0, false)
+	child, idx, serr = searchInteriorWithOverflow(pg, []byte("zzz-after"), usable, p, 0, nil)
 	assert.NoError(t, serr)
 	assert.Equal(t, uint32(30), child)
 	assert.Equal(t, 2, idx)
 
-	child, idx, serr = searchInteriorWithOverflow(pg, []byte("mmm"), usable, p, 0, false)
+	child, idx, serr = searchInteriorWithOverflow(pg, []byte("mmm"), usable, p, 0, nil)
 	assert.NoError(t, serr)
 	assert.Equal(t, uint32(20), child)
 	assert.Equal(t, 1, idx)
@@ -1577,7 +1577,7 @@ func TestLeafFullKeyNoOverflow(t *testing.T) {
 	bt.rebuildLeafPage(pg, []cellData{{key: []byte("hello"), value: []byte("world")}})
 
 	off := int(pg.getCellOffset(0))
-	k, err := leafFullKey(pg.data, off, p.usableSize(), p, 0, false)
+	k, err := leafFullKey(pg.data, off, p.usableSize(), p, 0, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, []byte("hello"), k)
 	p.releasePage(pg)
@@ -1591,7 +1591,7 @@ func TestInteriorFullKeyNoOverflow(t *testing.T) {
 	bt.rebuildInteriorPage(pg, []cellData{{leftChild: 10, key: []byte("sep")}}, 20)
 
 	off := int(pg.getCellOffset(0))
-	k, err := interiorFullKey(pg.data, off, p.usableSize(), p, 0, false)
+	k, err := interiorFullKey(pg.data, off, p.usableSize(), p, 0, nil)
 	assert.NoError(t, err)
 	assert.Equal(t, []byte("sep"), k)
 	p.releasePage(pg)
@@ -2949,7 +2949,7 @@ func TestSearchInteriorWithOverflowCorruptCellPointer(t *testing.T) {
 	cpOff := pg.cellPointerOffset()
 	binary.BigEndian.PutUint16(pg.data[cpOff:], uint16(len(pg.data)+10))
 
-	_, _, serr := searchInteriorWithOverflow(pg, []byte("aaa"), p.usableSize(), p, 0, false)
+	_, _, serr := searchInteriorWithOverflow(pg, []byte("aaa"), p.usableSize(), p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -2961,11 +2961,11 @@ func TestSearchInteriorWithOverflowCorruptCellPointer(t *testing.T) {
 func TestLeafFullKeyCorruptOffset(t *testing.T) {
 	data := make([]byte, 100)
 	// offset beyond data
-	_, err := leafFullKey(data, 200, 4096, nil, 0, false)
+	_, err := leafFullKey(data, 200, 4096, nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 
 	// keyLen varint error (truncated)
-	_, err = leafFullKey(data, 99, 4096, nil, 0, false)
+	_, err = leafFullKey(data, 99, 4096, nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -2975,7 +2975,7 @@ func TestLeafFullKeyCorruptOffset(t *testing.T) {
 
 func TestInteriorFullKeyCorruptOffset(t *testing.T) {
 	data := make([]byte, 10)
-	_, err := interiorFullKey(data, 200, 4096, nil, 0, false)
+	_, err := interiorFullKey(data, 200, 4096, nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -3075,7 +3075,7 @@ func TestSearchLeafWithOverflowCorruptKeyLenVarint(t *testing.T) {
 	pg.data[off+2] = 0xFF
 	pg.data[off+3] = 0xFF
 
-	_, _, serr := searchLeafWithOverflow(pg, []byte("abc"), p.usableSize(), p, 0, false)
+	_, _, serr := searchLeafWithOverflow(pg, []byte("abc"), p.usableSize(), p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -3657,7 +3657,7 @@ func TestCov_SearchLeafWithOverflowValLenVarintError(t *testing.T) {
 	pg.data[len(pg.data)-2] = 0x80 // valLen multi-byte start, truncated
 	pg.data[len(pg.data)-1] = 0x80 // still continuation
 
-	_, _, serr := searchLeafWithOverflow(pg, []byte("abc"), p.usableSize(), p, 0, false)
+	_, _, serr := searchLeafWithOverflow(pg, []byte("abc"), p.usableSize(), p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -3673,7 +3673,7 @@ func TestCov_SearchLeafWithOverflowNoOverflowKeyEndBeyondData(t *testing.T) {
 	off := int(pg.getCellOffset(0))
 	pg.data[off] = 100 // keyLen=100 (1-byte varint), but insufficient space
 
-	_, _, serr := searchLeafWithOverflow(pg, []byte("abc"), p.usableSize(), p, 0, false)
+	_, _, serr := searchLeafWithOverflow(pg, []byte("abc"), p.usableSize(), p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -3694,7 +3694,7 @@ func TestCov_SearchLeafWithOverflowKeyLocalEndBeyondData(t *testing.T) {
 	pg.data[off] = 0x84   // multi-byte keyLen
 	pg.data[off+1] = 0x00 // keyLen = 512
 
-	_, _, serr := searchLeafWithOverflow(pg, []byte("short"), p.usableSize(), p, 0, false)
+	_, _, serr := searchLeafWithOverflow(pg, []byte("short"), p.usableSize(), p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -3781,7 +3781,7 @@ func TestCov_SearchInteriorWithOverflowLo0Path(t *testing.T) {
 	cpOff := pg.cellPointerOffset()
 	binary.BigEndian.PutUint16(pg.data[cpOff:], uint16(len(pg.data)-2))
 
-	_, _, serr := searchInteriorWithOverflow(pg, []byte("aaa"), p.usableSize(), p, 0, false)
+	_, _, serr := searchInteriorWithOverflow(pg, []byte("aaa"), p.usableSize(), p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -3802,7 +3802,7 @@ func TestCov_SearchInteriorWithOverflowLoLtNPath(t *testing.T) {
 	cpOff := pg.cellPointerOffset()
 	binary.BigEndian.PutUint16(pg.data[cpOff+2:], uint16(len(pg.data)-2))
 
-	_, _, serr := searchInteriorWithOverflow(pg, []byte("ccc"), p.usableSize(), p, 0, false)
+	_, _, serr := searchInteriorWithOverflow(pg, []byte("ccc"), p.usableSize(), p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -3825,12 +3825,12 @@ func TestCov_LeafFullKeyVarintErrors(t *testing.T) {
 	data[8] = 0x80
 	data[9] = 0x80 // 10 continuation bytes = varint decode error
 
-	_, err := leafFullKey(data, 0, 4096, nil, 0, false)
+	_, err := leafFullKey(data, 0, 4096, nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 
 	// L788-790: pos >= dataLen after keyLen
 	data2 := []byte{0x05} // keyLen=5, nothing after
-	_, err = leafFullKey(data2, 0, 4096, nil, 0, false)
+	_, err = leafFullKey(data2, 0, 4096, nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 
 	// L792-794: valLen varint error
@@ -3838,7 +3838,7 @@ func TestCov_LeafFullKeyVarintErrors(t *testing.T) {
 	data3[0] = 0x05 // keyLen=5
 	data3[1] = 0x80 // valLen continuation
 	data3[2] = 0x80 // still continuation, but too truncated
-	_, err = leafFullKey(data3, 0, 4096, nil, 0, false)
+	_, err = leafFullKey(data3, 0, 4096, nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 
 	// L797-799: negative/too-large keyLen
@@ -3851,7 +3851,7 @@ func TestCov_LeafFullKeyVarintErrors(t *testing.T) {
 	data4[3] = 0x80
 	data4[4] = 0x04 // large keyLen
 	data4[5] = 0x01 // valLen=1
-	_, err = leafFullKey(data4, 0, 4096, nil, 0, false)
+	_, err = leafFullKey(data4, 0, 4096, nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 
 	// L800-802: negative/too-large valLen
@@ -3862,7 +3862,7 @@ func TestCov_LeafFullKeyVarintErrors(t *testing.T) {
 	data5[3] = 0x80
 	data5[4] = 0x80
 	data5[5] = 0x04 // large valLen
-	_, err = leafFullKey(data5, 0, 4096, nil, 0, false)
+	_, err = leafFullKey(data5, 0, 4096, nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -3873,7 +3873,7 @@ func TestCov_LeafFullKeyNoOverflowKeyBeyondData(t *testing.T) {
 	data[1] = 0x01 // valLen=1
 	// totalPayload=81, which doesn't exceed maxLocal for usableSize=4096
 	// but pos+80 > 10
-	_, err := leafFullKey(data, 0, 4096, nil, 0, false)
+	_, err := leafFullKey(data, 0, 4096, nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -3886,7 +3886,7 @@ func TestCov_LeafFullKeyOverflowKeyLocalBeyondData(t *testing.T) {
 	// nLocal = localPayloadSize(500, 512)
 	// localKeyBytes = min(nLocal, 100) = nLocal (since nLocal < 100 with 512 page)
 	// pos+localKeyBytes > 20
-	_, err := leafFullKey(data, 0, 512, nil, 0, false)
+	_, err := leafFullKey(data, 0, 512, nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -3898,7 +3898,7 @@ func TestCov_LeafFullKeyOverflowNLocalBeyondData(t *testing.T) {
 	// totalPayload=600, maxLocal(512)~102
 	// localKeyBytes = min(nLocal, 300) = nLocal (since nLocal < 300)
 	// Key overflows, need pos+nLocal+4 > 20
-	_, err := leafFullKey(data, 0, 512, nil, 0, false)
+	_, err := leafFullKey(data, 0, 512, nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -3916,7 +3916,7 @@ func TestCov_InteriorFullKeyVarintError(t *testing.T) {
 	data[7] = 0x80
 	data[8] = 0x80
 	data[9] = 0x80 // too many continuation bytes
-	_, err := interiorFullKey(data, 0, 4096, nil, 0, false)
+	_, err := interiorFullKey(data, 0, 4096, nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
@@ -4963,7 +4963,7 @@ func TestCov_LeafFullKeyTotalPayloadOverflow(t *testing.T) {
 	n += putVarint(data[n:], 600000000) // valLen
 	// totalPayload = 1200000000 > 1073741824
 
-	_, err := leafFullKey(data, 0, 4096, nil, 0, false)
+	_, err := leafFullKey(data, 0, 4096, nil, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 

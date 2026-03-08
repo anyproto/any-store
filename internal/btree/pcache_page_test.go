@@ -3646,3 +3646,197 @@ func TestReaderCachePool_LargeCacheSize(t *testing.T) {
 	// max(10000/10, 50) = 1000
 	assert.Equal(t, 1000, db.readerCacheSize)
 }
+
+// ===== Task 5: Wire readers to private caches =====
+
+func TestConcurrentReadersIndependentCaches(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write some data
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("test")
+	require.NoError(t, err)
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("key-%04d", i)
+		val := fmt.Sprintf("value-%04d", i)
+		require.NoError(t, wtx.Put(ns, []byte(key), []byte(val)))
+	}
+	require.NoError(t, wtx.Commit())
+
+	// Start two readers concurrently — each should get its own cache
+	rtx1, err := db.BeginRead()
+	require.NoError(t, err)
+	rtx2, err := db.BeginRead()
+	require.NoError(t, err)
+
+	// Verify each reader has its own cache
+	require.NotNil(t, rtx1.cache)
+	require.NotNil(t, rtx2.cache)
+	assert.True(t, rtx1.cache != rtx2.cache, "readers should have distinct cache instances")
+
+	// Read from both — each should populate its own cache
+	ns1, err := rtx1.GetNamespace("test")
+	require.NoError(t, err)
+	ns2, err := rtx2.GetNamespace("test")
+	require.NoError(t, err)
+
+	v1, err := rtx1.Get(ns1, []byte("key-0050"))
+	require.NoError(t, err)
+	assert.Equal(t, "value-0050", string(v1))
+
+	v2, err := rtx2.Get(ns2, []byte("key-0050"))
+	require.NoError(t, err)
+	assert.Equal(t, "value-0050", string(v2))
+
+	// Rollback both
+	require.NoError(t, rtx1.Rollback())
+	require.NoError(t, rtx2.Rollback())
+}
+
+func TestReaderCacheStalenessAfterCommit(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write initial data
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns, []byte("key1"), []byte("v1")))
+	require.NoError(t, wtx.Commit())
+
+	// Start a reader — caches pages
+	rtx1, err := db.BeginRead()
+	require.NoError(t, err)
+	ns1, err := rtx1.GetNamespace("test")
+	require.NoError(t, err)
+	v, err := rtx1.Get(ns1, []byte("key1"))
+	require.NoError(t, err)
+	assert.Equal(t, "v1", string(v))
+
+	// Writer commits new data
+	wtx, err = db.BeginWrite()
+	require.NoError(t, err)
+	ns2, err := wtx.GetNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns2, []byte("key1"), []byte("v2")))
+	require.NoError(t, wtx.Commit())
+
+	// The old reader should still see the old value (snapshot isolation)
+	v, err = rtx1.Get(ns1, []byte("key1"))
+	require.NoError(t, err)
+	assert.Equal(t, "v1", string(v))
+	require.NoError(t, rtx1.Rollback())
+
+	// A new reader should see the new value
+	rtx2, err := db.BeginRead()
+	require.NoError(t, err)
+	ns3, err := rtx2.GetNamespace("test")
+	require.NoError(t, err)
+	v, err = rtx2.Get(ns3, []byte("key1"))
+	require.NoError(t, err)
+	assert.Equal(t, "v2", string(v))
+	require.NoError(t, rtx2.Rollback())
+}
+
+func TestReaderCacheRecycledOnRollback(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write data
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns, []byte("key1"), []byte("val1")))
+	require.NoError(t, wtx.Commit())
+
+	// Reader 1: allocates cache, populates it, rollback clears + recycles
+	rtx1, err := db.BeginRead()
+	require.NoError(t, err)
+	require.NotNil(t, rtx1.cache)
+	ns1, err := rtx1.GetNamespace("test")
+	require.NoError(t, err)
+	_, err = rtx1.Get(ns1, []byte("key1"))
+	require.NoError(t, err)
+	require.NoError(t, rtx1.Rollback())
+
+	// After rollback, cache field should be nil on the tx
+	assert.Nil(t, rtx1.cache, "cache should be nil after rollback")
+
+	// Reader 2: gets a cache (from pool or new) and it works correctly
+	rtx2, err := db.BeginRead()
+	require.NoError(t, err)
+	require.NotNil(t, rtx2.cache, "new reader should always get a cache")
+	ns2, err := rtx2.GetNamespace("test")
+	require.NoError(t, err)
+	v, err := rtx2.Get(ns2, []byte("key1"))
+	require.NoError(t, err)
+	assert.Equal(t, "val1", string(v))
+	require.NoError(t, rtx2.Rollback())
+}
+
+func TestWriterDoesNotGetReaderCache(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Writer should have nil cache (uses shared pcache)
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	assert.Nil(t, wtx.ReadTx.cache, "writer should not have a reader cache")
+	require.NoError(t, wtx.Rollback())
+}
+
+func TestCursorWithReaderCache(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write data
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("test")
+	require.NoError(t, err)
+	for i := 0; i < 50; i++ {
+		key := fmt.Sprintf("key-%04d", i)
+		val := fmt.Sprintf("value-%04d", i)
+		require.NoError(t, wtx.Put(ns, []byte(key), []byte(val)))
+	}
+	require.NoError(t, wtx.Commit())
+
+	// Read with cursor using reader cache
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	ns2, err := rtx.GetNamespace("test")
+	require.NoError(t, err)
+
+	cursor := rtx.NewCursor(ns2)
+	require.NoError(t, cursor.First())
+
+	count := 0
+	for cursor.Valid() {
+		k, kerr := cursor.Key()
+		require.NoError(t, kerr)
+		v, verr := cursor.Value()
+		require.NoError(t, verr)
+		expected := fmt.Sprintf("key-%04d", count)
+		assert.Equal(t, expected, string(k))
+		assert.Equal(t, fmt.Sprintf("value-%04d", count), string(v))
+		count++
+		require.NoError(t, cursor.Next())
+	}
+	assert.Equal(t, 50, count)
+	cursor.Close()
+	require.NoError(t, rtx.Rollback())
+}

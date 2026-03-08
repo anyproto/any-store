@@ -301,7 +301,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 			// Key ordering check — need full key for overflow cells
 			var fullKey []byte
 			if cell.overflowPg != 0 {
-				fk, fkerr := leafFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, false)
+				fk, fkerr := leafFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, nil)
 				if fkerr != nil {
 					ic.report("%s cell %d: corrupt leaf key", context, i)
 				} else {
@@ -354,7 +354,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 			}
 
 			// For key ordering, we need the full key (may require overflow read)
-			fullKey, fkerr := interiorFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, false)
+			fullKey, fkerr := interiorFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, nil)
 			if fkerr != nil {
 				ic.report("%s cell %d: corrupt interior key", context, i)
 			} else {

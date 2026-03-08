@@ -103,18 +103,18 @@ Rewrite any-store's shared page cache (`pcache`) to use per-connection private c
 - [x] run tests — must pass
 
 ### Task 5: Wire readers to private caches
-- [ ] update `BeginRead` in `internal/btree/db.go` to allocate reader cache from pool, assign to `tx.cache`
-- [ ] update `ReadTx.Rollback` to clear and recycle reader cache back to pool
-- [ ] update `btree.getPage` reader path to call `getPageReader(pgno, walMaxFrame, bt.cache)` instead of `readPageMVCC`
-- [ ] update `ReadTx.txGetPage` reader path to use `getPageReader` with `tx.cache`
-- [ ] update `ReadTx.readOverflow` reader path to use `readOverflowChainReader` with `tx.cache`
-- [ ] update `ReadTx.NewCursor` / `ReadTx.AppendValue` / `ReadTx.GetNamespace` — ensure btree structs get `cache` from ReadTx
-- [ ] update `searchLeafWithOverflow`, `searchInteriorWithOverflow`, `leafFullKey`, `interiorFullKey` — replace `mvcc bool` param with `cache *pcache` (nil = writer path, non-nil = reader path using cache for overflow reads)
-- [ ] update all callers of above functions to pass cache instead of mvcc bool
-- [ ] write test: concurrent readers each get independent caches, verify no cross-contamination
-- [ ] write test: reader cache correctly handles page staleness (writer commits between reader cache accesses)
-- [ ] run full test suite with -race — must pass
-- [ ] run stress tests `go test -race -run 'TestCacheStress|TestCheckpoint|TestConcurrent|TestSavepoint' -count=3 -timeout=300s` — must pass
+- [x] update `BeginRead` in `internal/btree/db.go` to allocate reader cache from pool, assign to `tx.cache`
+- [x] update `ReadTx.Rollback` to clear and recycle reader cache back to pool
+- [x] update `btree.getPage` reader path to call `getPageReader(pgno, walMaxFrame, bt.cache)` instead of `readPageMVCC`
+- [x] update `ReadTx.txGetPage` reader path to use `getPageReader` with `tx.cache`
+- [x] update `ReadTx.readOverflow` reader path to use `readOverflowChainReader` with `tx.cache`
+- [x] update `ReadTx.NewCursor` / `ReadTx.AppendValue` / `ReadTx.GetNamespace` — ensure btree structs get `cache` from ReadTx
+- [x] update `searchLeafWithOverflow`, `searchInteriorWithOverflow`, `leafFullKey`, `interiorFullKey` — replace `mvcc bool` param with `cache *pcache` (nil = writer path, non-nil = reader path using cache for overflow reads)
+- [x] update all callers of above functions to pass cache instead of mvcc bool
+- [x] write test: concurrent readers each get independent caches, verify no cross-contamination
+- [x] write test: reader cache correctly handles page staleness (writer commits between reader cache accesses)
+- [x] run full test suite with -race — must pass
+- [x] run stress tests `go test -race -run 'TestCacheStress|TestCheckpoint|TestConcurrent|TestSavepoint' -count=3 -timeout=300s` — must pass
 
 ### Task 6: Remove shared-cache workarounds from pcache
 - [ ] remove `sync.Mutex` from pcache struct and all `mu.Lock()`/`mu.Unlock()` calls in `internal/btree/pcache.go`

@@ -202,7 +202,7 @@ func TestGap_DB_AppendValue_ParseCellError(t *testing.T) {
 	if err != nil {
 		return
 	}
-	ns2, err := db2.getNamespaceAt("ns1", rtx.walMaxFrame)
+	ns2, err := db2.getNamespaceAt("ns1", rtx.walMaxFrame, nil)
 	if err != nil {
 		rtx.Rollback()
 		return

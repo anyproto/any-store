@@ -167,7 +167,7 @@ func TestSearchCorrupt_SearchLeafWithOverflow_KeyFitsLocallyEndBeyondData(t *tes
 	pg.data[newOff] = byte(keyLen) // keyLen (1-byte varint)
 	putVarint(pg.data[newOff+1:], uint64(valLen))
 
-	_, _, serr := searchLeafWithOverflow(pg, shortKey, usableSize, p, 0, false)
+	_, _, serr := searchLeafWithOverflow(pg, shortKey, usableSize, p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -233,7 +233,7 @@ func TestSearchCorrupt_SearchLeafWithOverflow_LeafFullKeyError(t *testing.T) {
 	}
 
 	// Search with same key prefix - prefix comparison should be 0, triggering leafFullKey.
-	_, _, serr := searchLeafWithOverflow(pg, bigKey, usableSize, p, 0, false)
+	_, _, serr := searchLeafWithOverflow(pg, bigKey, usableSize, p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -260,7 +260,7 @@ func TestSearchCorrupt_LeafFullKey_KeyLenVarintError(t *testing.T) {
 		pg.data[off+i] = 0xFF
 	}
 
-	_, fkerr := leafFullKey(pg.data, off, usableSize, p, 0, false)
+	_, fkerr := leafFullKey(pg.data, off, usableSize, p, 0, nil)
 	assert.ErrorIs(t, fkerr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -298,7 +298,7 @@ func TestSearchCorrupt_LeafFullKey_OverflowKeyFitsLocallyBeyondData(t *testing.T
 	pg.data[off] = byte(keyLen) // keyLen (1-byte varint since keyLen < 128)
 	putVarint(pg.data[off+1:], uint64(valLen))
 
-	_, fkerr := leafFullKey(pg.data, off, usableSize, p, 0, false)
+	_, fkerr := leafFullKey(pg.data, off, usableSize, p, 0, nil)
 	assert.ErrorIs(t, fkerr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -454,7 +454,7 @@ func TestSearchCorrupt_SearchInteriorWithOverflow_CpBaseBeyondData(t *testing.T)
 	pg.header.rightChild = 99
 	pg.header.serialize(pg.data[pgHdrOff(pg):])
 
-	_, _, serr := searchInteriorWithOverflow(pg, []byte("any"), usableSize, p, 0, false)
+	_, _, serr := searchInteriorWithOverflow(pg, []byte("any"), usableSize, p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -471,7 +471,7 @@ func TestSearchCorrupt_SearchInteriorWithOverflow_Lo0CpOff(t *testing.T) {
 	origData := pg.data
 	pg.data = origData[:pg.cellPointerOffset()]
 
-	_, _, serr := searchInteriorWithOverflow(pg, []byte("aaa"), usableSize, p, 0, false)
+	_, _, serr := searchInteriorWithOverflow(pg, []byte("aaa"), usableSize, p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	pg.data = origData
 	p.releasePage(pg)
@@ -489,7 +489,7 @@ func TestSearchCorrupt_SearchInteriorWithOverflow_Lo0OffPlus4(t *testing.T) {
 	cpOff := pg.cellPointerOffset()
 	binary.BigEndian.PutUint16(pg.data[cpOff:], uint16(len(pg.data)-2))
 
-	_, _, serr := searchInteriorWithOverflow(pg, []byte("aaa"), usableSize, p, 0, false)
+	_, _, serr := searchInteriorWithOverflow(pg, []byte("aaa"), usableSize, p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }
@@ -534,7 +534,7 @@ func TestSearchCorrupt_SearchInteriorWithOverflow_LoLtN_CpBase(t *testing.T) {
 	origData := pg.data
 	pg.data = origData[:cpOff+11]
 
-	_, _, serr := searchInteriorWithOverflow(pg, []byte("ee"), usableSize, p, 0, false)
+	_, _, serr := searchInteriorWithOverflow(pg, []byte("ee"), usableSize, p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	pg.data = origData
 	p.releasePage(pg)
@@ -561,7 +561,7 @@ func TestSearchCorrupt_SearchInteriorWithOverflow_LoLtN_OffPlus4(t *testing.T) {
 	cpOff := pg.cellPointerOffset()
 	binary.BigEndian.PutUint16(pg.data[cpOff+6:], uint16(len(pg.data)-2))
 
-	_, _, serr := searchInteriorWithOverflow(pg, []byte("eee"), usableSize, p, 0, false)
+	_, _, serr := searchInteriorWithOverflow(pg, []byte("eee"), usableSize, p, 0, nil)
 	assert.ErrorIs(t, serr, ErrCorrupt)
 	p.releasePage(pg)
 }

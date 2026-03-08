@@ -269,9 +269,18 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 		return nil, err
 	}
 
+	// Allocate reader cache from pool for per-connection page caching.
+	var cache *pcache
+	if c, ok := db.readerCachePool.Get().(*pcache); ok {
+		cache = c
+	} else {
+		cache = newPcache(int(db.opts.PageSize), db.readerCacheSize, true)
+	}
+
 	tx := db.getReadTx()
 	tx.db = db
 	tx.pager = db.pager
+	tx.cache = cache
 	tx.closed = false
 	tx.walMaxFrame = maxFrame
 	tx.walSlot = slot
@@ -335,6 +344,7 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	tx := db.getWriteTx()
 	tx.ReadTx.db = db
 	tx.ReadTx.pager = db.pager
+	tx.ReadTx.cache = nil // writer uses shared pcache, not a reader cache
 	tx.ReadTx.closed = false
 	tx.ReadTx.walMaxFrame = maxFrame
 	tx.ReadTx.walSlot = slot
@@ -533,7 +543,7 @@ func (db *DB) GetNamespace(name string) (*Namespace, error) {
 	}
 	defer db.pager.endRead(slot)
 
-	return db.getNamespaceAt(name, maxFrame)
+	return db.getNamespaceAt(name, maxFrame, nil)
 }
 
 // getNamespaceLocked returns a Namespace handle (caller must hold read lock).
@@ -544,12 +554,13 @@ func (db *DB) getNamespaceLocked(name string) (*Namespace, error) {
 	return db.resolveNamespace(name, bt)
 }
 
-// getNamespaceAt returns a Namespace handle using readPageMVCC for snapshot
-// isolation. Safe to call from any goroutine (readers or writer) because
-// it does not access pager.writePages, and readPageMVCC returns an uncached
-// copy when the page is dirty (avoiding races with the writer).
-func (db *DB) getNamespaceAt(name string, walMaxFrame uint32) (*Namespace, error) {
-	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: walMaxFrame, writable: false}
+// getNamespaceAt returns a Namespace handle using snapshot isolation.
+// When cache is non-nil, pages are cached in the reader's private cache.
+// When cache is nil, falls back to uncached reads.
+// Safe to call from any goroutine (readers or writer) because
+// it does not access pager.writePages.
+func (db *DB) getNamespaceAt(name string, walMaxFrame uint32, cache *pcache) (*Namespace, error) {
+	bt := &btree{pager: db.pager, cache: cache, rootPage: 1, walMaxFrame: walMaxFrame, writable: false}
 	return db.resolveNamespace(name, bt)
 }
 
@@ -566,10 +577,9 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 	}
 
 	usableSize := bt.usablePageSize()
-	mvcc := !bt.writable
 	for {
 		if pg.header.isLeaf() {
-			idx, found, serr := searchLeafWithOverflow(pg, nameKey, usableSize, bt.pager, bt.walMaxFrame, mvcc)
+			idx, found, serr := searchLeafWithOverflow(pg, nameKey, usableSize, bt.pager, bt.walMaxFrame, bt.cache)
 			if serr != nil {
 				bt.pager.releasePage(pg)
 				return nil, serr
@@ -598,7 +608,7 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 		}
 
 		// Interior page — descend to the correct child
-		childPgno, _, serr := searchInteriorWithOverflow(pg, nameKey, usableSize, bt.pager, bt.walMaxFrame, mvcc)
+		childPgno, _, serr := searchInteriorWithOverflow(pg, nameKey, usableSize, bt.pager, bt.walMaxFrame, bt.cache)
 		if serr != nil {
 			bt.pager.releasePage(pg)
 			return nil, serr
@@ -686,7 +696,7 @@ func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 		}
 		return tx.pager.getPageWriter(pgno, tx.walMaxFrame)
 	}
-	return tx.pager.readPageMVCC(pgno, tx.walMaxFrame)
+	return tx.pager.getPageReader(pgno, tx.walMaxFrame, tx.cache)
 }
 
 // readOverflow reads overflow chain data using the correct isolation level.
@@ -697,7 +707,7 @@ func (tx *ReadTx) readOverflow(firstPgno uint32, buf []byte) error {
 	if tx.writable {
 		return tx.pager.readOverflowChainAt(firstPgno, buf, tx.walMaxFrame)
 	}
-	return tx.pager.readOverflowChainMVCC(firstPgno, buf, tx.walMaxFrame)
+	return tx.pager.readOverflowChainReader(firstPgno, buf, tx.walMaxFrame, tx.cache)
 }
 
 // AppendValue retrieves a value by key from the given namespace, appending it to buf.
@@ -713,10 +723,9 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 
 	// Search without starting a new read tx (we're already in one)
 	usableSize := tx.pager.usableSize()
-	mvcc := !tx.writable
 	for {
 		if pg.header.isLeaf() {
-			idx, found, serr := searchLeafWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame, mvcc)
+			idx, found, serr := searchLeafWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame, tx.cache)
 			if serr != nil {
 				tx.pager.releasePage(pg)
 				return buf, serr
@@ -777,7 +786,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 			tx.pager.releasePage(pg)
 			return buf, nil
 		}
-		childPgno, _, serr := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame, mvcc)
+		childPgno, _, serr := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame, tx.cache)
 		if serr != nil {
 			tx.pager.releasePage(pg)
 			return buf, serr
@@ -810,7 +819,7 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 
 // NewCursor creates a cursor for iterating over the namespace.
 func (tx *ReadTx) NewCursor(ns *Namespace) *Cursor {
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
+	bt := &btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
 	return bt.NewCursor()
 }
 
@@ -820,7 +829,7 @@ func (tx *ReadTx) Count(ns *Namespace) (int, error) {
 	if tx.closed {
 		return 0, ErrTxClosed
 	}
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
+	bt := &btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
 	return bt.Count()
 }
 
@@ -831,7 +840,7 @@ func (tx *ReadTx) GetNamespace(name string) (*Namespace, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
 	}
-	return tx.db.getNamespaceAt(name, tx.walMaxFrame)
+	return tx.db.getNamespaceAt(name, tx.walMaxFrame, tx.cache)
 }
 
 // IsDataStale returns true if the on-disk FileChangeCount differs from the
@@ -865,6 +874,12 @@ func (tx *ReadTx) Rollback() error {
 		return ErrTxClosed
 	}
 	tx.closed = true
+	// Clear and recycle the reader cache back to the pool.
+	if tx.cache != nil {
+		tx.cache.clear()
+		tx.db.readerCachePool.Put(tx.cache)
+		tx.cache = nil
+	}
 	tx.pager.endRead(tx.walSlot)
 	db := tx.db
 	db.mu.RUnlock()
