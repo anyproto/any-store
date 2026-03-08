@@ -1842,7 +1842,7 @@ func TestCheckpointPassive_PartialCheckpoint(t *testing.T) {
 	p.endRead(slot3)
 
 	// Passive checkpoint should return ErrBusy (partial)
-	err = p.wal.checkpointPassive(p.file, p.cache)
+	err = p.wal.checkpointPassive(p.file, p.master)
 	// Could be nil or ErrBusy depending on lock state
 	_ = err
 
@@ -1926,7 +1926,7 @@ func TestCheckpointWithMode_PassiveNoBusyHandler(t *testing.T) {
 	p.endRead(slot)
 
 	// Passive mode: no busy handler used
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointPassive, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointPassive, nil)
 	require.NoError(t, err)
 }
 
@@ -1955,7 +1955,7 @@ func TestCheckpointWithMode_FullWithBusyHandler(t *testing.T) {
 		return true
 	}
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, busy)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, busy)
 	require.NoError(t, err)
 	_ = busyCalled
 }
@@ -1968,7 +1968,7 @@ func TestCheckpointWithMode_Empty(t *testing.T) {
 	defer p.close()
 
 	// Checkpoint with no data
-	err := p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err := p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	require.NoError(t, err)
 }
 
@@ -2473,7 +2473,7 @@ func TestCheckpointWithMode_ReadersBlockSafeFrame(t *testing.T) {
 	p.endRead(slot3)
 
 	// Passive checkpoint: reader on old slot limits mxSafeFrame
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointPassive, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointPassive, nil)
 	require.NoError(t, err)
 
 	p.endRead(slot2)
@@ -2520,16 +2520,16 @@ func TestCheckpointWithMode_InMemory(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
 
-	// Checkpoint to pcache
-	cache := newPcache(4096, 100, false)
-	err := w.checkpointWithMode(nil, cache, CheckpointPassive, nil)
+	// Checkpoint to masterStore
+	ms := &masterStore{pages: make(map[uint32][]byte)}
+	err := w.checkpointWithMode(nil, ms, CheckpointPassive, nil)
 	require.NoError(t, err)
 
-	// Verify page 1 is in cache
-	cached := cache.fetch(1)
-	require.NotNil(t, cached)
-	assert.Equal(t, pg.data, cached.data)
-	cache.release(cached)
+	// Verify page 1 is in masterStore
+	dst := make([]byte, 4096)
+	found := ms.readPageInto(1, dst)
+	require.True(t, found)
+	assert.Equal(t, pg.data, dst)
 }
 
 // ============================================================
@@ -2622,7 +2622,7 @@ func TestCheckpointWithMode_Read0LockBusy(t *testing.T) {
 	// Hold lock on read0 to block backfill
 	require.NoError(t, p.wal.index.lock(lockRead0, lockShared))
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointPassive, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointPassive, nil)
 	// Should succeed but with incomplete backfill
 	require.NoError(t, err)
 
@@ -2701,7 +2701,7 @@ func TestCheckpointWithMode_DowngradeToPassive(t *testing.T) {
 	// Hold write lock to force downgrade from FULL to PASSIVE
 	require.NoError(t, p.wal.index.lock(lockWrite, lockExclusive))
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	require.NoError(t, err)
 
 	_ = p.wal.index.unlock(lockWrite, lockExclusive)
@@ -3024,7 +3024,7 @@ func TestCheckpointWithMode_ReaderLockLoopBusyThenOK(t *testing.T) {
 	p.wal.index.aReadMark[2].Store(0) // very low mark
 
 	// Checkpoint should successfully clear the unused slot 2 readmark
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointPassive, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointPassive, nil)
 	require.NoError(t, err)
 }
 
@@ -3054,18 +3054,14 @@ func TestCheckpointWithMode_InMemoryPage1(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg2}, true, 2))
 	w.endWrite()
 
-	cache := newPcache(4096, 100, false)
-	err := w.checkpointWithMode(nil, cache, CheckpointPassive, nil)
+	ms := &masterStore{pages: make(map[uint32][]byte)}
+	err := w.checkpointWithMode(nil, ms, CheckpointPassive, nil)
 	require.NoError(t, err)
 
-	// Both pages should be in cache
-	c1 := cache.fetch(1)
-	require.NotNil(t, c1)
-	cache.release(c1)
-
-	c2 := cache.fetch(2)
-	require.NotNil(t, c2)
-	cache.release(c2)
+	// Both pages should be in masterStore
+	dst := make([]byte, 4096)
+	require.True(t, ms.readPageInto(1, dst))
+	require.True(t, ms.readPageInto(2, dst))
 }
 
 // ============================================================
@@ -3431,7 +3427,7 @@ func TestCheckpointWithMode_FullFallbackToPassive(t *testing.T) {
 	// Hold write lock -> FULL downgrades to PASSIVE
 	require.NoError(t, p.wal.index.lock(lockWrite, lockExclusive))
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointRestart, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil)
 	require.NoError(t, err)
 
 	_ = p.wal.index.unlock(lockWrite, lockExclusive)
@@ -4373,7 +4369,7 @@ func TestCheckpointWithMode_FdatasyncWALError(t *testing.T) {
 	// Close the WAL file to cause fdatasync error during checkpoint
 	p.wal.file.Close()
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	assert.Error(t, err)
 
 	p.wal.file = nil // prevent double close
@@ -4408,7 +4404,7 @@ func TestCheckpointWithMode_BackfillErrors(t *testing.T) {
 	p.file.Close()
 
 	// Open a read-only copy for the WAL file
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	assert.Error(t, err) // dbFile.WriteAt should fail
 
 	p.file = nil // prevent double-close
@@ -4708,7 +4704,7 @@ func TestCheckpointWithMode_ReaderBlocksMxSafeFrame(t *testing.T) {
 	p.endRead(slot2)
 
 	// PASSIVE checkpoint - should be limited by the reader's mark
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointPassive, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointPassive, nil)
 	require.NoError(t, err)
 
 	_ = mfRead
@@ -4804,7 +4800,7 @@ func TestCheckpointPost_PartialCheckpoint(t *testing.T) {
 	p.endRead(slot)
 
 	// RESTART checkpoint
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointRestart, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil)
 	require.NoError(t, err)
 }
 
@@ -4832,8 +4828,8 @@ func TestCheckpointWithMode_InMemory_PcachePath(t *testing.T) {
 	require.NoError(t, err)
 	p.endRead(slot)
 
-	// Checkpoint in InMemory mode - should use pcache path
-	err = p.wal.checkpointWithMode(nil, p.cache, CheckpointFull, nil)
+	// Checkpoint in InMemory mode - should use masterStore path
+	err = p.wal.checkpointWithMode(nil, p.master, CheckpointFull, nil)
 	require.NoError(t, err)
 }
 
@@ -4892,7 +4888,7 @@ func TestCheckpointWithMode_Truncate_Full(t *testing.T) {
 	p.endRead(slot)
 
 	// TRUNCATE checkpoint
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointTruncate, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointTruncate, nil)
 	require.NoError(t, err)
 
 	// WAL file should have header size (32 bytes) after truncate+writeHeader
@@ -4927,7 +4923,7 @@ func TestCheckpointWithMode_FullNoReset(t *testing.T) {
 	p.endRead(slot)
 
 	// FULL checkpoint - should not reset WAL
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	require.NoError(t, err)
 
 	// WAL should still have frames (FULL does not truncate/reset)
@@ -5152,7 +5148,7 @@ func TestCheckpointWithMode_DbFileWriteError(t *testing.T) {
 	require.NoError(t, err)
 	defer roFile.Close()
 
-	err = p.wal.checkpointWithMode(roFile, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(roFile, p.master, CheckpointFull, nil)
 	assert.Error(t, err)
 
 	p.close()
@@ -5304,7 +5300,7 @@ func TestCheckpointWithMode_FileReadPageDataError(t *testing.T) {
 	require.NoError(t, err)
 	p.wal.file = f
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	assert.Error(t, err)
 
 	p.wal.close()
@@ -5355,7 +5351,7 @@ func TestCheckpointWithMode_FdatasyncDbFileError_Precise(t *testing.T) {
 
 	tmpFile2, err := os.OpenFile(tmpPath, os.O_RDWR, 0666)
 	require.NoError(t, err)
-	err = p.wal.checkpointWithMode(tmpFile2, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(tmpFile2, p.master, CheckpointFull, nil)
 	require.NoError(t, err)
 	tmpFile2.Close()
 
@@ -5686,7 +5682,7 @@ func TestCheckpointWithMode_WriteLockNonBusyError(t *testing.T) {
 		lockErr:  os.ErrPermission,
 	}
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	assert.ErrorIs(t, err, os.ErrPermission)
 
 	// Restore original shm for clean close.
@@ -5725,7 +5721,7 @@ func TestCheckpointWithMode_ReaderLockNonBusyError(t *testing.T) {
 		lockErr:  os.ErrPermission,
 	}
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	assert.ErrorIs(t, err, os.ErrPermission)
 
 	p.wal.index.shm = newHeapShm()
@@ -5762,7 +5758,7 @@ func TestCheckpointWithMode_BackfillLockNonBusyError(t *testing.T) {
 		lockErr:      os.ErrPermission,
 	}
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	assert.ErrorIs(t, err, os.ErrPermission)
 
 	p.wal.index.shm = newHeapShm()
@@ -5819,7 +5815,7 @@ func TestTryResetWAL_NonBusyReaderLockError(t *testing.T) {
 	// First need nBackfill == maxFrame to reach the tryResetWAL path.
 	p.wal.index.nBackfill.Store(p.wal.index.maxFrame.Load())
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointRestart, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil)
 	assert.ErrorIs(t, err, os.ErrPermission)
 
 	p.wal.index.shm = newHeapShm()
@@ -5855,7 +5851,7 @@ func TestCheckpointWithMode_FdatasyncDbFileError_RO(t *testing.T) {
 	require.NoError(t, err)
 	defer roFile.Close()
 
-	err = p.wal.checkpointWithMode(roFile, p.cache, CheckpointPassive, nil)
+	err = p.wal.checkpointWithMode(roFile, p.master, CheckpointPassive, nil)
 	// On Linux, fdatasync on a read-only fd returns EBADF or succeeds silently.
 	// We just verify no panic and the function returns (either nil or error).
 	_ = err

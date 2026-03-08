@@ -3285,3 +3285,119 @@ func TestPageCacheBackpointer_DifferentCaches(t *testing.T) {
 	assert.Equal(t, 1, pc1.nClean)
 	assert.Equal(t, 1, pc2.nClean)
 }
+
+// ===== masterStore coverage =====
+
+func TestMasterStore_ReadWriteBasic(t *testing.T) {
+	ms := &masterStore{pages: make(map[uint32][]byte)}
+
+	// Write a page
+	src := make([]byte, 4096)
+	copy(src, "hello masterStore")
+	ms.writePage(1, src)
+
+	// Read it back
+	dst := make([]byte, 4096)
+	found := ms.readPageInto(1, dst)
+	assert.True(t, found)
+	assert.Equal(t, src, dst)
+}
+
+func TestMasterStore_ReadNotFound(t *testing.T) {
+	ms := &masterStore{pages: make(map[uint32][]byte)}
+
+	dst := make([]byte, 4096)
+	found := ms.readPageInto(42, dst)
+	assert.False(t, found)
+}
+
+func TestMasterStore_OverwriteExisting(t *testing.T) {
+	ms := &masterStore{pages: make(map[uint32][]byte)}
+
+	src1 := make([]byte, 4096)
+	copy(src1, "version 1")
+	ms.writePage(1, src1)
+
+	src2 := make([]byte, 4096)
+	copy(src2, "version 2")
+	ms.writePage(1, src2)
+
+	dst := make([]byte, 4096)
+	found := ms.readPageInto(1, dst)
+	assert.True(t, found)
+	assert.Equal(t, src2, dst, "should have version 2 data")
+}
+
+func TestMasterStore_IsolatesFromSource(t *testing.T) {
+	ms := &masterStore{pages: make(map[uint32][]byte)}
+
+	src := make([]byte, 4096)
+	copy(src, "original")
+	ms.writePage(1, src)
+
+	// Modify the source buffer after writing
+	copy(src, "modified")
+
+	// masterStore should have a copy, not the original buffer
+	dst := make([]byte, 4096)
+	ms.readPageInto(1, dst)
+	assert.Equal(t, byte('o'), dst[0], "masterStore should hold a copy, not a reference")
+}
+
+func TestMasterStore_MultiplePages(t *testing.T) {
+	ms := &masterStore{pages: make(map[uint32][]byte)}
+
+	for pgno := uint32(1); pgno <= 10; pgno++ {
+		src := make([]byte, 4096)
+		binary.BigEndian.PutUint32(src, pgno)
+		ms.writePage(pgno, src)
+	}
+
+	// Verify each page
+	for pgno := uint32(1); pgno <= 10; pgno++ {
+		dst := make([]byte, 4096)
+		found := ms.readPageInto(pgno, dst)
+		assert.True(t, found, "page %d should exist", pgno)
+		assert.Equal(t, pgno, binary.BigEndian.Uint32(dst), "page %d should have correct data", pgno)
+	}
+}
+
+func TestMasterStore_InMemoryCheckpointBackfill(t *testing.T) {
+	// Full integration test: InMemory DB writes data, checkpoints, and reads back via masterStore.
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.InMemory = true
+	db, err := Open(filepath.Join(dir, "test.db"), opts)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Verify masterStore was created
+	require.NotNil(t, db.pager.master)
+
+	// Write some data
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("key1"), []byte("val1")))
+	require.NoError(t, tx.Commit())
+
+	// Read it back (verifies WAL read path works)
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	val, err := rtx.Get(ns, []byte("key1"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("val1"), val)
+	require.NoError(t, rtx.Rollback())
+
+	// Force a checkpoint to flush WAL to masterStore
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+
+	// Read again after checkpoint (reads from masterStore, not WAL)
+	rtx2, err := db.BeginRead()
+	require.NoError(t, err)
+	val2, err := rtx2.Get(ns, []byte("key1"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("val1"), val2)
+	require.NoError(t, rtx2.Rollback())
+}

@@ -1637,9 +1637,9 @@ func (w *wal) endWrite() {
 }
 
 // checkpoint writes WAL frames back to the database file.
-// For InMemory databases, cache is used to store checkpointed pages instead of dbFile.
-func (w *wal) checkpoint(dbFile fileHandle, cache *pcache) error {
-	return w.checkpointWithMode(dbFile, cache, CheckpointFull, nil)
+// For InMemory databases, master is used to store checkpointed pages instead of dbFile.
+func (w *wal) checkpoint(dbFile fileHandle, master *masterStore) error {
+	return w.checkpointWithMode(dbFile, master, CheckpointFull, nil)
 }
 
 // checkpointPassive performs a passive checkpoint that never blocks.
@@ -1648,8 +1648,8 @@ func (w *wal) checkpoint(dbFile fileHandle, cache *pcache) error {
 // matching SQLite's SQLITE_BUSY return from sqlite3WalCheckpoint in
 // PASSIVE mode when readers block progress. Callers must not truncate
 // the WAL when ErrBusy is returned.
-func (w *wal) checkpointPassive(dbFile fileHandle, cache *pcache) error {
-	err := w.checkpointWithMode(dbFile, cache, CheckpointPassive, nil)
+func (w *wal) checkpointPassive(dbFile fileHandle, master *masterStore) error {
+	err := w.checkpointWithMode(dbFile, master, CheckpointPassive, nil)
 	if err != nil {
 		return err
 	}
@@ -1677,7 +1677,7 @@ func (w *wal) checkpointPassive(dbFile fileHandle, cache *pcache) error {
 //
 // The busy handler (issue 1.7 + 6.3) is invoked when waiting for reader locks
 // in FULL/RESTART/TRUNCATE modes. In PASSIVE mode it is never called.
-func (w *wal) checkpointWithMode(dbFile fileHandle, cache *pcache, mode CheckpointMode, xBusy BusyHandler) error {
+func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode CheckpointMode, xBusy BusyHandler) error {
 	// Acquire checkpoint lock -- serialize concurrent checkpoints.
 	// The busy handler is NOT used for the checkpoint lock itself, matching
 	// SQLite: "Even if there is a busy-handler configured, it will not be
@@ -1828,18 +1828,9 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, cache *pcache, mode Checkpoi
 					backfillErr = io.ErrShortWrite
 					break
 				}
-			} else if cache != nil {
-				// InMemory mode: write to pcache
-				pg := cache.create(mf.pgno)
-				copy(pg.data, mf.data)
-				off := 0
-				if mf.pgno == 1 {
-					off = dbHeaderSize
-				}
-				if pg.data[off] != 0 {
-					pg.header.deserialize(pg.data[off:])
-				}
-				cache.release(pg)
+			} else if master != nil {
+				// InMemory mode: write to masterStore
+				master.writePage(mf.pgno, mf.data)
 			}
 		}
 	} else {

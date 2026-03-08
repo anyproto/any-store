@@ -35,12 +35,46 @@ const (
 	spillFlagRollback uint8 = 0x02 // Currently rolling back, suppress spill
 )
 
+// masterStore is the authoritative page store for InMemory databases.
+// It replaces the database file as the "disk" backing, holding checkpointed
+// page data that has been flushed from the WAL. Protected by a RWMutex so
+// readers can access checkpointed pages concurrently with checkpoint writes.
+type masterStore struct {
+	mu    sync.RWMutex
+	pages map[uint32][]byte // pgno -> page data copy
+}
+
+// readPageInto copies the page data for pgno into dst. Returns true if found.
+func (ms *masterStore) readPageInto(pgno uint32, dst []byte) bool {
+	ms.mu.RLock()
+	src, ok := ms.pages[pgno]
+	if ok {
+		copy(dst, src)
+	}
+	ms.mu.RUnlock()
+	return ok
+}
+
+// writePage stores a copy of src as the page data for pgno.
+func (ms *masterStore) writePage(pgno uint32, src []byte) {
+	ms.mu.Lock()
+	if existing, ok := ms.pages[pgno]; ok {
+		copy(existing, src)
+	} else {
+		data := make([]byte, len(src))
+		copy(data, src)
+		ms.pages[pgno] = data
+	}
+	ms.mu.Unlock()
+}
+
 // pager manages database pages, cache, and WAL interaction.
 type pager struct {
 	mu       sync.RWMutex
 	file     fileHandle
 	wal      *wal
 	cache    *pcache
+	master   *masterStore // InMemory "disk" — holds checkpointed page data
 	header       dbHeader
 	path         string
 	pageSize     uint32
@@ -153,7 +187,9 @@ func (p *pager) open() error {
 	defer p.mu.Unlock()
 
 	if p.inMemory {
-		// In-memory database: no file on disk
+		// In-memory database: no file on disk.
+		// Create masterStore to hold checkpointed page data (replaces the DB file).
+		p.master = &masterStore{pages: make(map[uint32][]byte)}
 		return p.initNewDB()
 	}
 
@@ -279,13 +315,9 @@ func (p *pager) initNewDB() error {
 	p.cache = newPcache(int(p.pageSize), p.cache.maxPages, p.cache.purgeable)
 	p.cache.xStress = p.pagerStress
 
-	// For inMemory mode, pre-populate page 1 in pcache so reads find it
-	if p.inMemory {
-		pg := p.cache.create(1)
-		copy(pg.data, buf)
-		off := dbHeaderSize
-		pg.header.deserialize(pg.data[off:])
-		p.cache.release(pg)
+	// For inMemory mode, pre-populate page 1 in masterStore so reads find it
+	if p.inMemory && p.master != nil {
+		p.master.writePage(1, buf)
 	}
 
 	// Open WAL
@@ -459,9 +491,12 @@ func (p *pager) getPageAtImpl(pgno, walMaxFrame uint32, noStress bool) (*page, e
 			// Zero-fill new pages
 			clear(pg.data)
 		}
+	} else if p.master != nil {
+		// InMemory: read from masterStore (replaces the DB file)
+		if !p.master.readPageInto(pgno, pg.data) {
+			clear(pg.data)
+		}
 	} else {
-		// InMemory: no file; zero-fill new pages (existing pages should
-		// have been found in cache above or in the WAL)
 		clear(pg.data)
 	}
 
@@ -517,14 +552,13 @@ func (p *pager) readPageUncached(pgno, walMaxFrame uint32) (*page, error) {
 			}
 			clear(pg.data)
 		}
-	} else {
-		// InMemory: no file; try pcache for checkpointed data (copy to preserve MVCC isolation)
-		if cached := p.cache.fetch(pgno); cached != nil {
-			copy(pg.data, cached.data)
-			p.cache.release(cached)
-		} else {
+	} else if p.master != nil {
+		// InMemory: read from masterStore (replaces pcache as "disk")
+		if !p.master.readPageInto(pgno, pg.data) {
 			clear(pg.data)
 		}
+	} else {
+		clear(pg.data)
 	}
 
 	off := 0
@@ -1584,13 +1618,13 @@ func (p *pager) releaseSavepoint(id int) error {
 // The WAL's busy handler is used for FULL/RESTART/TRUNCATE modes to wait
 // for readers that block progress, matching SQLite's behavior.
 func (p *pager) checkpointWithMode(mode CheckpointMode) error {
-	return p.wal.checkpointWithMode(p.file, p.cache, mode, p.wal.busyHandler)
+	return p.wal.checkpointWithMode(p.file, p.master, mode, p.wal.busyHandler)
 }
 
 // tryCheckpoint attempts a passive checkpoint for auto-checkpoint.
 // Uses PASSIVE mode to avoid blocking writers or readers, matching SQLite.
 func (p *pager) tryCheckpoint() error {
-	return p.wal.checkpointPassive(p.file, p.cache)
+	return p.wal.checkpointPassive(p.file, p.master)
 }
 
 // writeOverflowChain writes data to a chain of overflow pages and returns
@@ -1765,7 +1799,7 @@ func (p *pager) close() error {
 			if debugTrace {
 				trace("close: starting passive checkpoint before WAL truncation, dbSize=%d", p.dbSize.Load())
 			}
-			cpErr := p.wal.checkpointPassive(p.file, p.cache)
+			cpErr := p.wal.checkpointPassive(p.file, p.master)
 			if cpErr != nil {
 				if debugTrace {
 					trace("close: checkpointPassive incomplete or failed: %v", cpErr)

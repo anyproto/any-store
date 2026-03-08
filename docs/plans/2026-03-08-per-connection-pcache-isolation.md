@@ -82,15 +82,15 @@ Rewrite any-store's shared page cache (`pcache`) to use per-connection private c
 - [x] run tests — must pass
 
 ### Task 3: Add masterStore for InMemory mode
-- [ ] add `masterStore` struct to `internal/btree/pager.go` with `readPageInto(pgno, dst)` and `writePage(pgno, src)` methods using `sync.RWMutex`
-- [ ] add `masterStore *masterStore` field to pager struct
-- [ ] create masterStore in `newPager` when InMemory is true (non-purgeable map)
-- [ ] update `checkpointWithMode` in `internal/btree/wal.go` — InMemory backfill writes to masterStore instead of pcache (change signature to accept `*masterStore`)
-- [ ] update pager's `checkpointWithMode` wrapper to pass masterStore
-- [ ] update `readPageUncached` InMemory fallback: read from masterStore instead of shared pcache fetch+copy
-- [ ] write tests for masterStore read/write operations
-- [ ] write test for InMemory checkpoint backfill using masterStore
-- [ ] run tests — must pass
+- [x] add `masterStore` struct to `internal/btree/pager.go` with `readPageInto(pgno, dst)` and `writePage(pgno, src)` methods using `sync.RWMutex`
+- [x] add `masterStore *masterStore` field to pager struct
+- [x] create masterStore in `newPager` when InMemory is true (non-purgeable map)
+- [x] update `checkpointWithMode` in `internal/btree/wal.go` — InMemory backfill writes to masterStore instead of pcache (change signature to accept `*masterStore`)
+- [x] update pager's `checkpointWithMode` wrapper to pass masterStore
+- [x] update `readPageUncached` InMemory fallback: read from masterStore instead of shared pcache fetch+copy
+- [x] write tests for masterStore read/write operations
+- [x] write test for InMemory checkpoint backfill using masterStore
+- [x] run tests — must pass
 
 ### Task 4: Add reader cache pool and getPageReader
 - [ ] add `readerCachePool sync.Pool` and computed `readerCacheSize` (max(CacheSize/10, 50)) to DB struct in `internal/btree/db.go`
