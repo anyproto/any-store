@@ -581,6 +581,70 @@ func TestCommit_AutoCheckpoint(t *testing.T) {
 	_ = ns
 }
 
+func TestCommit_AutoCheckpoint_LongReader_WALRecyclesAfterRelease(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.AutoCheckpointAfter = 8
+	opts.InProcess = true
+	db, err := Open(filepath.Join(dir, "test.db"), opts)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Setup namespace.
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("data")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	// Hold a long-lived reader to pin an old snapshot.
+	pinReader, err := db.BeginRead()
+	require.NoError(t, err)
+
+	// Generate enough writes to repeatedly trigger auto-checkpoint.
+	for i := range 200 {
+		wtx, werr := db.BeginWrite()
+		require.NoError(t, werr)
+		ns2, nerr := wtx.GetNamespace("data")
+		require.NoError(t, nerr)
+		key := fmt.Appendf(nil, "k-%06d", i)
+		val := make([]byte, 200)
+		require.NoError(t, wtx.Put(ns2, key, val))
+		require.NoError(t, wtx.Commit())
+	}
+
+	// With a pinned reader, WAL should keep frames.
+	nFramePinned := db.pager.wal.nFrame.Load()
+	require.Greater(t, nFramePinned, uint32(0))
+
+	// Release reader and perform one more write to trigger tryCheckpoint()
+	// and best-effort restart.
+	require.NoError(t, pinReader.Rollback())
+
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns2, err := wtx.GetNamespace("data")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns2, []byte("post-release"), []byte("v")))
+	require.NoError(t, wtx.Commit())
+
+	// After reader release, auto-checkpoint should be able to recycle WAL.
+	// Allow <=1 frame in case the final write raced with reset timing.
+	nFrameAfter := db.pager.wal.nFrame.Load()
+	assert.LessOrEqual(t, nFrameAfter, uint32(1))
+
+	// Verify data remains readable.
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	gotNs, err := rtx.GetNamespace("data")
+	require.NoError(t, err)
+	count, err := rtx.Count(gotNs)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, count, 201)
+	_ = ns
+}
+
 // === freeTreePages with interior nodes (line 393) ===
 // Cover the interior node path by deleting a namespace with many entries
 
