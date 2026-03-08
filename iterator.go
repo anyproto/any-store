@@ -3,6 +3,7 @@ package anystore
 import (
 	"errors"
 	"io"
+	"time"
 
 	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/btree"
@@ -59,26 +60,50 @@ func (pi *planIterator) Next() bool {
 }
 
 func (pi *planIterator) Doc() (Doc, error) {
+	perf := pipelinePerfEnabled()
+	if perf {
+		pipePerf.docCalls.Add(1)
+	}
 	if pi.err != nil && !errors.Is(pi.err, io.EOF) {
 		return nil, pi.err
 	}
 	var doc *anyenc.Value
 	if pi.plan.DocParsed != nil {
+		if perf {
+			pipePerf.docParsedHits.Add(1)
+		}
 		doc = pi.plan.DocParsed
 	} else {
+		if perf {
+			pipePerf.docFallbacks.Add(1)
+		}
 		if pi.dataCursor == nil {
 			pi.dataCursor = pi.data.NewCursor()
 		}
+		var seekStart time.Time
+		if perf {
+			seekStart = time.Now()
+		}
 		if err := pi.dataCursor.SeekExact(pi.docId); err != nil {
 			return nil, err
+		}
+		if perf {
+			pipePerf.docFallbackSeekNs.Add(perfSinceNs(seekStart))
 		}
 		val, err := pi.dataCursor.Value()
 		if err != nil {
 			return nil, err
 		}
 		pi.buf.DocBuf = append(pi.buf.DocBuf[:0], val...)
+		var parseStart time.Time
+		if perf {
+			parseStart = time.Now()
+		}
 		var perr error
 		doc, perr = pi.buf.Parser.Parse(pi.buf.DocBuf)
+		if perf {
+			pipePerf.docFallbackParseNs.Add(perfSinceNs(parseStart))
+		}
 		if perr != nil {
 			return nil, perr
 		}

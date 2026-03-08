@@ -811,6 +811,31 @@ func TestCommit_SchemaChanged(t *testing.T) {
 	require.NoError(t, rtx.Rollback())
 }
 
+func TestBeginReadFast(t *testing.T) {
+	db := tempDB(t)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("fast")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("k"), []byte("v")))
+	require.NoError(t, tx.Commit())
+
+	rtx, err := db.BeginReadFast()
+	require.NoError(t, err)
+	assert.False(t, rtx.writable)
+	// Fast read skips on-disk counter fetch and uses local counters.
+	assert.Equal(t, rtx.localFileChangeCounter, rtx.diskFileChangeCounter)
+	assert.Equal(t, rtx.localSchemaCookie, rtx.diskSchemaCookie)
+
+	ns2, err := rtx.GetNamespace("fast")
+	require.NoError(t, err)
+	got, err := rtx.Get(ns2, []byte("k"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("v"), got)
+	require.NoError(t, rtx.Rollback())
+}
+
 // === DeleteNamespace with rootPage=0 edge case ===
 // freeTreePages is called only when rootPage != 0 (line 385-387)
 

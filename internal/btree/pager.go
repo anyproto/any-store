@@ -84,6 +84,13 @@ type pager struct {
 	// (MVCC snapshot) pages, avoiding per-read-transaction heap allocations.
 	// Inspired by SQLite's pcache1 free-list recycling (pcache1.c:429-465).
 	pagePool sync.Pool
+	// borrowedPagePool recycles lightweight page wrappers that reference external
+	// immutable buffers (read-tx snapshot cache hits). These wrappers must not
+	// carry their own backing buffers into pagePool.
+	borrowedPagePool sync.Pool
+	// snapshotBufPool recycles page-sized byte buffers used by ReadTx snapshot
+	// cache entries to reduce per-transaction allocations.
+	snapshotBufPool sync.Pool
 
 	// inProcess uses heap-backed shm (faster, single-process only)
 	inProcess bool
@@ -838,11 +845,45 @@ func (p *pager) acquireTempPage() *page {
 	}
 }
 
+// acquireBorrowedPage returns a lightweight page wrapper with no owned buffer.
+func (p *pager) acquireBorrowedPage() *page {
+	if v := p.borrowedPagePool.Get(); v != nil {
+		return v.(*page)
+	}
+	return &page{}
+}
+
+func (p *pager) acquireSnapshotBuf() []byte {
+	if v := p.snapshotBufPool.Get(); v != nil {
+		return v.([]byte)
+	}
+	return make([]byte, p.pageSize)
+}
+
+func (p *pager) releaseSnapshotBuf(buf []byte) {
+	if cap(buf) < int(p.pageSize) {
+		return
+	}
+	p.snapshotBufPool.Put(buf[:int(p.pageSize)])
+}
+
 // recycleTempPage returns an uncached page to the pool for reuse.
 func (p *pager) recycleTempPage(pg *page) {
 	pg.pgno = 0
 	pg.dirty = false
 	pg.uncached = false
+	if pg.borrowed {
+		// Borrowed page wrappers reference external immutable storage and must
+		// not be reused via pagePool (would leak foreign buffers into pool state).
+		pg.borrowed = false
+		pg.data = nil
+		pg.pinCount = 0
+		pg.header = pageHeader{}
+		pg.next = nil
+		pg.prev = nil
+		p.borrowedPagePool.Put(pg)
+		return
+	}
 	pg.pinCount = 0
 	pg.header = pageHeader{}
 	pg.next = nil

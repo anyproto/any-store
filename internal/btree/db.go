@@ -184,8 +184,10 @@ func (db *DB) Path() string {
 	return db.path
 }
 
-// BeginRead starts a read-only transaction.
-func (db *DB) BeginRead() (*ReadTx, error) {
+// beginRead starts a read-only transaction.
+// When readCounters is false, disk counters are initialized from local counters
+// without reading page-1 metadata, which is useful for hot point-lookups.
+func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 	if db.closing.Load() {
 		return nil, ErrClosed
 	}
@@ -201,25 +203,45 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 		return nil, err
 	}
 
-	// Read on-disk counters for staleness detection.
-	fcc, sc, err := db.pager.readHeaderCounters(maxFrame)
-	if err != nil {
-		db.pager.endRead(slot)
-		db.mu.RUnlock()
-		return nil, err
+	localFCC := db.localFileChangeCounter.Load()
+	localSC := db.localSchemaCookie.Load()
+	fcc := localFCC
+	sc := localSC
+	if readCounters {
+		// Read on-disk counters for staleness detection.
+		fcc, sc, err = db.pager.readHeaderCounters(maxFrame)
+		if err != nil {
+			db.pager.endRead(slot)
+			db.mu.RUnlock()
+			return nil, err
+		}
 	}
 
 	tx := db.getReadTx()
 	tx.db = db
 	tx.pager = db.pager
 	tx.closed = false
+	tx.writable = false
 	tx.walMaxFrame = maxFrame
 	tx.walSlot = slot
 	tx.diskFileChangeCounter = fcc
 	tx.diskSchemaCookie = sc
-	tx.localFileChangeCounter = db.localFileChangeCounter.Load()
-	tx.localSchemaCookie = db.localSchemaCookie.Load()
+	tx.localFileChangeCounter = localFCC
+	tx.localSchemaCookie = localSC
+	tx.readPageCacheMax = readTxDefaultPageCachePages
+	tx.resetReadPageCache()
 	return tx, nil
+}
+
+// BeginRead starts a read-only transaction.
+func (db *DB) BeginRead() (*ReadTx, error) {
+	return db.beginRead(true)
+}
+
+// BeginReadFast starts a read-only transaction without reading page-1 counters.
+// It preserves snapshot isolation for data access, but skips staleness metadata.
+func (db *DB) BeginReadFast() (*ReadTx, error) {
+	return db.beginRead(false)
 }
 
 // BeginWrite starts a read-write transaction. Only one write transaction
@@ -275,6 +297,8 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	tx.ReadTx.diskSchemaCookie = sc
 	tx.ReadTx.localFileChangeCounter = db.localFileChangeCounter.Load()
 	tx.ReadTx.localSchemaCookie = db.localSchemaCookie.Load()
+	tx.ReadTx.readPageCacheMax = 0
+	tx.ReadTx.resetReadPageCache()
 	tx.dataChanged = false   // pool reuse safety
 	tx.schemaChanged = false // pool reuse safety
 	return tx, nil
@@ -604,7 +628,26 @@ type ReadTx struct {
 	localSchemaCookie      uint32 // snapshot of DB's local value
 	closed                 bool
 	writable               bool // true when embedded in a WriteTx (MVCC: allows seeing dirty pages)
+
+	// Bounded per-read-tx snapshot cache.
+	// Stores page copies keyed by pgno to reduce repeated MVCC readPageUncached I/O
+	// during hot point-lookups (e.g. index scan + fetch).
+	readPageCache     map[uint32]readPageCacheEntry
+	readPageSeen      map[uint32]struct{}
+	readPageCacheTick uint64
+	readPageCacheMax  int
+
 }
+
+// At 4KiB pages this is ~512KiB per active read transaction.
+const readTxDefaultPageCachePages = 128
+
+type readPageCacheEntry struct {
+	data []byte
+	hdr  pageHeader
+	tick uint64
+}
+
 
 // txGetPage fetches a page respecting MVCC snapshot isolation.
 // For write transactions, dirty pages from writePages are returned directly.
@@ -617,8 +660,93 @@ func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 		}
 		return tx.pager.getPageAt(pgno, tx.walMaxFrame)
 	}
-	return tx.pager.readPageMVCC(pgno, tx.walMaxFrame)
+	return tx.readPageMVCCCached(pgno)
 }
+
+func (tx *ReadTx) readPageMVCCCached(pgno uint32) (*page, error) {
+	if tx.readPageCacheMax <= 0 {
+		return tx.pager.readPageMVCC(pgno, tx.walMaxFrame)
+	}
+	tx.readPageCacheTick++
+	if ent, ok := tx.readPageCache[pgno]; ok {
+		ent.tick = tx.readPageCacheTick
+		tx.readPageCache[pgno] = ent
+		pg := tx.pager.acquireBorrowedPage()
+		pg.pgno = pgno
+		pg.pinCount = 1
+		pg.uncached = true
+		pg.borrowed = true
+		pg.data = ent.data
+		pg.header = ent.hdr
+		return pg, nil
+	}
+
+	pg, err := tx.pager.readPageMVCC(pgno, tx.walMaxFrame)
+	if err != nil {
+		return nil, err
+	}
+	// Cache only after second touch within a tx to avoid alloc churn on one-off pages.
+	if tx.readPageSeen == nil {
+		tx.readPageSeen = make(map[uint32]struct{}, tx.readPageCacheMax*2)
+	}
+	if _, seen := tx.readPageSeen[pgno]; seen {
+		tx.readPageCacheStore(pgno, pg.data, pg.header)
+	} else {
+		if len(tx.readPageSeen) >= tx.readPageCacheMax*2 {
+			clear(tx.readPageSeen)
+		}
+		tx.readPageSeen[pgno] = struct{}{}
+	}
+	return pg, nil
+}
+
+func (tx *ReadTx) readPageCacheStore(pgno uint32, data []byte, hdr pageHeader) {
+	if tx.readPageCacheMax <= 0 {
+		return
+	}
+	if tx.readPageCache == nil {
+		tx.readPageCache = make(map[uint32]readPageCacheEntry, tx.readPageCacheMax)
+	}
+	if len(tx.readPageCache) >= tx.readPageCacheMax {
+		var oldestPg uint32
+		var oldestTick uint64
+		first := true
+		for k, v := range tx.readPageCache {
+			if first || v.tick < oldestTick {
+				first = false
+				oldestPg = k
+				oldestTick = v.tick
+			}
+		}
+		if old, ok := tx.readPageCache[oldestPg]; ok && old.data != nil {
+			tx.pager.releaseSnapshotBuf(old.data)
+		}
+		delete(tx.readPageCache, oldestPg)
+	}
+	copied := tx.pager.acquireSnapshotBuf()
+	copy(copied, data)
+	tx.readPageCache[pgno] = readPageCacheEntry{
+		data: copied,
+		hdr:  hdr,
+		tick: tx.readPageCacheTick,
+	}
+}
+
+func (tx *ReadTx) resetReadPageCache() {
+	if tx.readPageCache != nil {
+		for _, ent := range tx.readPageCache {
+			if ent.data != nil {
+				tx.pager.releaseSnapshotBuf(ent.data)
+			}
+		}
+		clear(tx.readPageCache)
+	}
+	if tx.readPageSeen != nil {
+		clear(tx.readPageSeen)
+	}
+	tx.readPageCacheTick = 0
+}
+
 
 // readOverflow reads overflow chain data using the correct isolation level.
 // Writers use the shared cache (to see their own dirty pages).
@@ -963,6 +1091,7 @@ func (tx *ReadTx) Rollback() error {
 		return ErrTxClosed
 	}
 	tx.closed = true
+	tx.resetReadPageCache()
 	tx.pager.endRead(tx.walSlot)
 	db := tx.db
 	db.mu.RUnlock()
@@ -1040,6 +1169,7 @@ func (tx *WriteTx) Commit() error {
 	if err == nil && needCheckpoint {
 		_ = tx.pager.tryCheckpoint()
 	}
+	tx.resetReadPageCache()
 	db := tx.db
 	db.mu.RUnlock()
 	db.writeMu.Unlock()
@@ -1054,6 +1184,7 @@ func (tx *WriteTx) Rollback() error {
 	}
 	tx.closed = true
 	err := tx.pager.rollback()
+	tx.resetReadPageCache()
 	tx.pager.endRead(tx.walSlot)
 	db := tx.db
 	db.mu.RUnlock()

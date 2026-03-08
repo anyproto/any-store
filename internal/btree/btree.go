@@ -2716,11 +2716,13 @@ func (c *Cursor) SeekNear(key []byte) error {
 			if n > 0 {
 				firstKey, err := leafKeyAt(leaf.pg, 0)
 				if err != nil {
-					return err
+					// leafKeyAt cannot reconstruct overflow keys. Fall back to full seek.
+					return c.Seek(key)
 				}
 				lastKey, err := leafKeyAt(leaf.pg, n-1)
 				if err != nil {
-					return err
+					// leafKeyAt cannot reconstruct overflow keys. Fall back to full seek.
+					return c.Seek(key)
 				}
 				if bytes.Compare(key, firstKey) >= 0 && bytes.Compare(key, lastKey) <= 0 {
 					idx, _, serr := c.bt.searchLeaf(leaf.pg, key)
@@ -2751,14 +2753,73 @@ func (c *Cursor) SeekExact(key []byte) error {
 	if !c.valid {
 		return ErrKeyNotFound
 	}
-	k, err := c.Key()
+	eq, err := c.currentKeyEqual(key)
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(k, key) {
+	if !eq {
 		return ErrKeyNotFound
 	}
 	return nil
+}
+
+// AppendValueByKey seeks an exact key and appends its value bytes into buf.
+// It combines seek, exact-match check, and value extraction in one path,
+// allowing cursor-based callers to avoid extra key/value parsing work.
+func (c *Cursor) AppendValueByKey(key []byte, buf []byte) ([]byte, error) {
+	if err := c.SeekNear(key); err != nil {
+		return buf, err
+	}
+	if !c.valid {
+		return buf, ErrKeyNotFound
+	}
+	eq, err := c.currentKeyEqual(key)
+	if err != nil {
+		return buf, err
+	}
+	if !eq {
+		return buf, ErrKeyNotFound
+	}
+
+	frame := &c.stack[len(c.stack)-1]
+	if frame.pg == nil {
+		return buf, ErrCorrupt
+	}
+	usableSize := c.bt.usablePageSize()
+	off, oerr := frame.pg.getCellOffsetSafe(frame.cellIdx)
+	if oerr != nil {
+		return buf, oerr
+	}
+	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), usableSize)
+	if cerr != nil {
+		return buf, cerr
+	}
+	if cell.overflowPg != 0 {
+		// Fall back to full value reconstruction for overflow payloads.
+		v, verr := c.Value()
+		if verr != nil {
+			return buf, verr
+		}
+		return append(buf, v...), nil
+	}
+	return append(buf, cell.value...), nil
+}
+
+// currentKeyEqual checks whether the cursor's current key is equal to key.
+// Fast path uses in-page key extraction; overflow keys fall back to Key().
+func (c *Cursor) currentKeyEqual(key []byte) (bool, error) {
+	frame := &c.stack[len(c.stack)-1]
+	if frame.pg == nil {
+		return false, ErrCorrupt
+	}
+	if k, err := leafKeyAt(frame.pg, frame.cellIdx); err == nil {
+		return bytes.Equal(k, key), nil
+	}
+	k, err := c.Key()
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(k, key), nil
 }
 
 // Key returns the current key.

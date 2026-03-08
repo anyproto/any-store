@@ -165,6 +165,30 @@ func (c *collection) FindIdWithParser(ctx context.Context, p *anyenc.Parser, doc
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], docId)
+	if ctx.Value(ctxKeyTx) == nil {
+		tx, txErr := c.db.btreeDB.BeginReadFast()
+		if txErr != nil {
+			return nil, txErr
+		}
+		defer func() {
+			if rbErr := tx.Rollback(); rbErr != nil && err == nil {
+				err = rbErr
+			}
+		}()
+		buf.DocBuf, err = tx.AppendValue(c.ns, buf.SmallBuf, buf.DocBuf[:0])
+		if err != nil {
+			if errors.Is(err, btree.ErrKeyNotFound) {
+				return nil, ErrDocNotFound
+			}
+			return nil, err
+		}
+		data, pErr := p.Parse(buf.DocBuf)
+		if pErr != nil {
+			return nil, pErr
+		}
+		return item{val: data}, nil
+	}
+
 	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
 		buf.DocBuf, err = tx.AppendValue(c.ns, buf.SmallBuf, buf.DocBuf[:0])
 		if err != nil {
@@ -177,7 +201,7 @@ func (c *collection) FindIdWithParser(ctx context.Context, p *anyenc.Parser, doc
 		doc = item{val: data}
 		return
 	})
-	return
+	return doc, err
 }
 
 func (c *collection) Find(filter any) Query {

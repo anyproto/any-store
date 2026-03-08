@@ -2,6 +2,7 @@ package qplanner
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/btree"
@@ -22,6 +23,21 @@ type FilterIter struct {
 }
 
 func (it *FilterIter) Next() (key []byte, docId []byte, err error) {
+	perf := perfCountersEnabled()
+	var start time.Time
+	if perf {
+		start = time.Now()
+		qpPerf.filterNextCalls.Add(1)
+	}
+	defer func() {
+		if perf {
+			qpPerf.filterNextNs.Add(uint64(time.Since(start).Nanoseconds()))
+			if docId != nil {
+				qpPerf.filterYields.Add(1)
+			}
+		}
+	}()
+
 	for {
 		key, docId, err = it.Source.Next()
 		if err != nil || docId == nil {
@@ -53,7 +69,15 @@ func (it *FilterIter) Next() (key []byte, docId []byte, err error) {
 			}
 		}
 
-		if it.Filter == nil || it.Filter.Ok(doc, it.Buf) {
+		var evalStart time.Time
+		if perf {
+			evalStart = time.Now()
+		}
+		ok := it.Filter == nil || it.Filter.Ok(doc, it.Buf)
+		if perf {
+			qpPerf.filterEvalNs.Add(uint64(time.Since(evalStart).Nanoseconds()))
+		}
+		if ok {
 			return key, docId, nil
 		}
 		// Reset cached value on rejection — next iteration will get a new one

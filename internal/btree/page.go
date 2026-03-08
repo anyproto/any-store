@@ -316,6 +316,7 @@ type page struct {
 	pgno     uint32     // page number (1-based)
 	dirty    bool       // true if page has been modified
 	uncached bool       // true if page is not in the shared cache (MVCC snapshot copy)
+	borrowed bool       // true if data points to external immutable storage (must not enter pagePool)
 }
 
 // usableSize returns the usable size of the page (total minus reserved).

@@ -3,6 +3,7 @@ package qplanner
 import (
 	"bytes"
 	"fmt"
+	"time"
 
 	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/btree"
@@ -22,6 +23,21 @@ type IndexIter struct {
 }
 
 func (it *IndexIter) Next() (key []byte, docId []byte, err error) {
+	perf := perfCountersEnabled()
+	var start time.Time
+	if perf {
+		start = time.Now()
+		qpPerf.indexNextCalls.Add(1)
+	}
+	defer func() {
+		if perf {
+			qpPerf.indexNextNs.Add(uint64(time.Since(start).Nanoseconds()))
+			if docId != nil {
+				qpPerf.indexYields.Add(1)
+			}
+		}
+	}()
+
 	if it.cursor == nil {
 		it.cursor = it.Source.NewCursor()
 	}
@@ -240,20 +256,14 @@ func (it *IndexIter) String() string {
 // extractDocId extracts the docId portion from a non-unique index key.
 // The key is a tuple of (field1, field2, ..., docId).
 func extractDocId(key anyenc.Tuple, numFields int) []byte {
-	var offset int
-	var count int
-	_ = key.ReadBytes(func(b []byte) error {
-		count++
-		if count <= numFields {
-			offset += len(b)
-			return nil
-		}
-		return errStopIter
-	})
+	offset, err := key.OffsetAfter(numFields)
+	if err != nil {
+		// Corrupt tuple shouldn't crash planner path; keep previous behavior
+		// and let downstream key lookups fail naturally.
+		return key
+	}
 	if offset < len(key) {
 		return key[offset:]
 	}
 	return key
 }
-
-var errStopIter = fmt.Errorf("stop")

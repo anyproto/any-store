@@ -2,6 +2,7 @@ package qplanner
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/anyproto/any-store/internal/btree"
 	"github.com/anyproto/any-store/syncpool"
@@ -18,6 +19,21 @@ type FetchIter struct {
 }
 
 func (it *FetchIter) Next() (key []byte, docId []byte, err error) {
+	perf := perfCountersEnabled()
+	var start time.Time
+	if perf {
+		start = time.Now()
+		qpPerf.fetchNextCalls.Add(1)
+	}
+	defer func() {
+		if perf {
+			qpPerf.fetchNextNs.Add(uint64(time.Since(start).Nanoseconds()))
+			if docId != nil {
+				qpPerf.fetchYields.Add(1)
+			}
+		}
+	}()
+
 	for {
 		key, docId, err = it.Source.Next()
 		if err != nil || docId == nil {
@@ -25,7 +41,14 @@ func (it *FetchIter) Next() (key []byte, docId []byte, err error) {
 		}
 
 		// Cursor-free point lookup: avoids Cursor struct allocation and stack growth.
+		var lookupStart time.Time
+		if perf {
+			lookupStart = time.Now()
+		}
 		it.Buf.DocBuf, err = it.Data.AppendValue(docId, it.Buf.DocBuf[:0])
+		if perf {
+			qpPerf.fetchLookupNs.Add(uint64(time.Since(lookupStart).Nanoseconds()))
+		}
 		if err != nil {
 			if err == btree.ErrKeyNotFound {
 				// doc may have been deleted from data but still in index; skip
@@ -36,7 +59,14 @@ func (it *FetchIter) Next() (key []byte, docId []byte, err error) {
 
 		// Parse and cache the value to avoid re-fetching and re-parsing later
 		if it.Plan != nil {
+			var parseStart time.Time
+			if perf {
+				parseStart = time.Now()
+			}
 			doc, perr := it.Buf.Parser.Parse(it.Buf.DocBuf)
+			if perf {
+				qpPerf.fetchParseNs.Add(uint64(time.Since(parseStart).Nanoseconds()))
+			}
 			if perr != nil {
 				return nil, nil, perr
 			}
