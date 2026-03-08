@@ -680,6 +680,13 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 		return nil, err
 	}
 
+	// If getPage returned a temp page (stale-cache path in getPageWriter),
+	// adopt it into the writer so releasePage routes to writerCache.release
+	// instead of recycleTempPage, which would corrupt the dirty list.
+	if pg.uncached {
+		pg.uncached = false
+	}
+
 	// Save copy for savepoint rollback if we have active savepoints
 	if len(p.savepoints) > 0 && !pg.dirty {
 		sp := &p.savepoints[len(p.savepoints)-1]
