@@ -93,14 +93,14 @@ Rewrite any-store's shared page cache (`pcache`) to use per-connection private c
 - [x] run tests — must pass
 
 ### Task 4: Add reader cache pool and getPageReader
-- [ ] add `readerCachePool sync.Pool` and computed `readerCacheSize` (max(CacheSize/10, 50)) to DB struct in `internal/btree/db.go`
-- [ ] add `cache *pcache` field to ReadTx struct
-- [ ] add `cache *pcache` field to btree struct in `internal/btree/btree.go`
-- [ ] add `getPageReader(pgno, walMaxFrame uint32, cache *pcache)` method to pager in `internal/btree/pager.go` — checks reader cache, validates against WAL index, reads from WAL/disk/masterStore on miss, populates reader cache
-- [ ] add `readOverflowChainReader(firstPgno uint32, buf []byte, walMaxFrame uint32, cache *pcache)` to pager — overflow chain reading using reader cache
-- [ ] write tests for getPageReader (cache hit, cache miss, stale cache eviction, InMemory fallback to masterStore)
-- [ ] write tests for readOverflowChainReader
-- [ ] run tests — must pass
+- [x] add `readerCachePool sync.Pool` and computed `readerCacheSize` (max(CacheSize/10, 50)) to DB struct in `internal/btree/db.go`
+- [x] add `cache *pcache` field to ReadTx struct
+- [x] add `cache *pcache` field to btree struct in `internal/btree/btree.go`
+- [x] add `getPageReader(pgno, walMaxFrame uint32, cache *pcache)` method to pager in `internal/btree/pager.go` — checks reader cache, validates against WAL index, reads from WAL/disk/masterStore on miss, populates reader cache
+- [x] add `readOverflowChainReader(firstPgno uint32, buf []byte, walMaxFrame uint32, cache *pcache)` to pager — overflow chain reading using reader cache
+- [x] write tests for getPageReader (cache hit, cache miss, stale cache eviction, InMemory fallback to masterStore)
+- [x] write tests for readOverflowChainReader
+- [x] run tests — must pass
 
 ### Task 5: Wire readers to private caches
 - [ ] update `BeginRead` in `internal/btree/db.go` to allocate reader cache from pool, assign to `tx.cache`

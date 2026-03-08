@@ -3401,3 +3401,248 @@ func TestMasterStore_InMemoryCheckpointBackfill(t *testing.T) {
 	assert.Equal(t, []byte("val1"), val2)
 	require.NoError(t, rtx2.Rollback())
 }
+
+// ===== getPageReader and readOverflowChainReader coverage =====
+
+func TestGetPageReader_CacheHit(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write some data so there's content to read.
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	cache := newPcache(4096, 50, true)
+
+	// First read: cache miss, reads from WAL/disk.
+	maxFrame, slot, err := db.pager.beginRead()
+	require.NoError(t, err)
+	defer db.pager.endRead(slot)
+
+	pg1, err := db.pager.getPageReader(1, maxFrame, cache)
+	require.NoError(t, err)
+	assert.NotNil(t, pg1)
+	assert.Equal(t, uint32(1), pg1.pgno)
+	assert.Equal(t, cache, pg1.cache, "page should belong to reader cache")
+	db.pager.releasePage(pg1)
+
+	// Second read: cache hit.
+	pg2, err := db.pager.getPageReader(1, maxFrame, cache)
+	require.NoError(t, err)
+	assert.NotNil(t, pg2)
+	assert.Equal(t, pg1, pg2, "should return same page from cache")
+	db.pager.releasePage(pg2)
+}
+
+func TestGetPageReader_CacheMiss(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write data to create page 2.
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("key1"), []byte("val1")))
+	require.NoError(t, tx.Commit())
+
+	cache := newPcache(4096, 50, true)
+
+	maxFrame, slot, err := db.pager.beginRead()
+	require.NoError(t, err)
+	defer db.pager.endRead(slot)
+
+	// Read pages 1 and 2 - both should be cache misses initially.
+	pg1, err := db.pager.getPageReader(1, maxFrame, cache)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(1), pg1.pgno)
+	db.pager.releasePage(pg1)
+
+	// Page 2 should also be readable.
+	pg2, err := db.pager.getPageReader(2, maxFrame, cache)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(2), pg2.pgno)
+	db.pager.releasePage(pg2)
+
+	// Verify cache now has both pages.
+	assert.NotNil(t, cache.fetch(1))
+	cache.release(cache.fetch(1)) // double release to balance
+	assert.NotNil(t, cache.fetch(2))
+	cache.release(cache.fetch(2))
+}
+
+func TestGetPageReader_NilCacheFallback(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer db.Close()
+
+	maxFrame, slot, err := db.pager.beginRead()
+	require.NoError(t, err)
+	defer db.pager.endRead(slot)
+
+	// With nil cache, should fall back to uncached read.
+	pg, err := db.pager.getPageReader(1, maxFrame, nil)
+	require.NoError(t, err)
+	assert.True(t, pg.uncached, "with nil cache, should return uncached page")
+	db.pager.releasePage(pg)
+}
+
+func TestGetPageReader_InvalidPage(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer db.Close()
+
+	cache := newPcache(4096, 50, true)
+
+	_, err = db.pager.getPageReader(0, 0, cache)
+	assert.ErrorIs(t, err, ErrInvalidPage)
+}
+
+func TestGetPageReader_InMemoryFallback(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.InMemory = true
+	db, err := Open(filepath.Join(dir, "test.db"), opts)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write data
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("key"), []byte("val")))
+	require.NoError(t, tx.Commit())
+
+	// Force checkpoint so data is in masterStore
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+
+	cache := newPcache(4096, 50, true)
+
+	maxFrame, slot, err := db.pager.beginRead()
+	require.NoError(t, err)
+	defer db.pager.endRead(slot)
+
+	// Should read from masterStore on cache miss
+	pg, err := db.pager.getPageReader(1, maxFrame, cache)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(1), pg.pgno)
+	assert.Equal(t, cache, pg.cache)
+	db.pager.releasePage(pg)
+}
+
+func TestGetPageReader_StaleEviction(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write initial data
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("key1"), []byte("val1")))
+	require.NoError(t, tx.Commit())
+
+	cache := newPcache(4096, 50, true)
+
+	// Read page 1 into cache
+	maxFrame1, slot1, err := db.pager.beginRead()
+	require.NoError(t, err)
+	pg1, err := db.pager.getPageReader(1, maxFrame1, cache)
+	require.NoError(t, err)
+	pg1Ptr := pg1
+	db.pager.releasePage(pg1)
+	db.pager.endRead(slot1)
+
+	// Verify page is cached
+	cached := cache.fetch(1)
+	require.NotNil(t, cached, "page should be in cache")
+	assert.Equal(t, pg1Ptr, cached, "should be same page object from cache")
+	cache.release(cached)
+
+	// Clear the cache (simulating pool recycling)
+	cache.clear()
+
+	// Verify page was evicted
+	assert.Nil(t, cache.fetch(1), "page should be gone after clear")
+
+	// Read again - should allocate a new page object
+	maxFrame2, slot2, err := db.pager.beginRead()
+	require.NoError(t, err)
+	defer db.pager.endRead(slot2)
+
+	pg2, err := db.pager.getPageReader(1, maxFrame2, cache)
+	require.NoError(t, err)
+	assert.NotEqual(t, pg1Ptr, pg2, "after clear, should get new page object")
+	assert.Equal(t, uint32(1), pg2.pgno)
+	db.pager.releasePage(pg2)
+}
+
+func TestReadOverflowChainReader(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 512})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write a large value that triggers overflow
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	largeVal := make([]byte, 2000) // will overflow with 512-byte pages
+	for i := range largeVal {
+		largeVal[i] = byte(i % 256)
+	}
+	require.NoError(t, tx.Put(ns, []byte("bigkey"), largeVal))
+	require.NoError(t, tx.Commit())
+
+	// Read the value back using a reader cache
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+
+	val, err := rtx.Get(ns, []byte("bigkey"))
+	require.NoError(t, err)
+	assert.Equal(t, largeVal, val, "should read back the large overflow value")
+}
+
+func TestReaderCachePool_Lifecycle(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 500})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Verify readerCacheSize is computed correctly: max(500/10, 50) = 50
+	assert.Equal(t, 50, db.readerCacheSize)
+}
+
+func TestReaderCachePool_SmallCacheSize(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 100})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// max(100/10, 50) = 50
+	assert.Equal(t, 50, db.readerCacheSize)
+}
+
+func TestReaderCachePool_LargeCacheSize(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 10000})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// max(10000/10, 50) = 1000
+	assert.Equal(t, 1000, db.readerCacheSize)
+}

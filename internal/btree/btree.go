@@ -29,6 +29,7 @@ func SetDebugOverflowReadErrors(enabled bool) {
 // btree represents a single B-tree (one namespace).
 type btree struct {
 	pager       *pager
+	cache       *pcache // per-reader private page cache (nil for writers)
 	rootPage    uint32
 	walMaxFrame uint32 // WAL snapshot for this operation (0 = use pager default)
 	writable    bool   // true if this btree is used by a write transaction

@@ -583,6 +583,75 @@ func (p *pager) readPageMVCC(pgno, walMaxFrame uint32) (*page, error) {
 	return p.readPageUncached(pgno, walMaxFrame)
 }
 
+// getPageReader returns a page using the reader's private cache for snapshot
+// isolation. On cache hit the page is returned directly (all pages in a reader
+// cache were populated during this transaction, so they're valid for this
+// snapshot). On cache miss the page is read from WAL/disk/masterStore and
+// stored in the reader cache for subsequent lookups within the same transaction.
+func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, error) {
+	if pgno == 0 {
+		return nil, ErrInvalidPage
+	}
+	// If no reader cache provided, fall back to uncached reads.
+	if cache == nil {
+		return p.readPageUncached(pgno, walMaxFrame)
+	}
+
+	// Check reader cache.
+	if pg := cache.fetch(pgno); pg != nil {
+		return pg, nil
+	}
+
+	// Cache miss: create a page in the reader cache (no stress callback).
+	pg := cache.createNoStress(pgno)
+
+	// Try to read from WAL first.
+	if walMaxFrame > 0 {
+		frame := p.wal.index.get(pgno, walMaxFrame)
+		if frame > 0 {
+			if err := p.wal.readFrame(frame, pg.data); err == nil {
+				off := 0
+				if pgno == 1 {
+					off = dbHeaderSize
+				}
+				pg.header.deserialize(pg.data[off:])
+				return pg, nil
+			}
+			// WAL reset race: fall through to disk/masterStore.
+		}
+	}
+
+	// Read from database file.
+	if p.file != nil {
+		offset := int64(pgno-1) * int64(p.pageSize)
+		_, err := p.file.ReadAt(pg.data, offset)
+		if err != nil {
+			if pgno <= p.dbSize.Load() {
+				cache.release(pg)
+				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
+			}
+			clear(pg.data)
+		}
+	} else if p.master != nil {
+		// InMemory: read from masterStore.
+		if !p.master.readPageInto(pgno, pg.data) {
+			clear(pg.data)
+		}
+	} else {
+		clear(pg.data)
+	}
+
+	off := 0
+	if pgno == 1 {
+		off = dbHeaderSize
+	}
+	if pg.data[off] != 0 {
+		pg.header.deserialize(pg.data[off:])
+	}
+
+	return pg, nil
+}
+
 // getPageNoContent returns a page without reading from disk/WAL (fix 5.4).
 // If the page is already in cache, it's returned as-is (matching SQLite's
 // behavior where PAGER_GET_NOCONTENT still returns cached pages). If not in
@@ -1686,6 +1755,47 @@ func (p *pager) readOverflowChainAt(firstPgno uint32, buf []byte, walMaxFrame ui
 // the writer could later read as current, causing on-disk corruption.
 func (p *pager) readOverflowChainMVCC(firstPgno uint32, buf []byte, walMaxFrame uint32) error {
 	return p.readOverflowChainInternal(firstPgno, buf, walMaxFrame, true)
+}
+
+// readOverflowChainReader reads overflow chain data using the reader's private
+// cache. Pages are cached across overflow reads within the same transaction.
+func (p *pager) readOverflowChainReader(firstPgno uint32, buf []byte, walMaxFrame uint32, cache *pcache) error {
+	if cache == nil {
+		return p.readOverflowChainMVCC(firstPgno, buf, walMaxFrame)
+	}
+	usable := overflowPageUsable(p.usableSize())
+	pgno := firstPgno
+	off := 0
+
+	maxIter := len(buf)/usable + 2
+	if maxIter < 10 {
+		maxIter = 10
+	}
+	iter := 0
+	dbSize := p.dbSize.Load()
+
+	for pgno != 0 && off < len(buf) {
+		if pgno < 2 || pgno > dbSize {
+			return ErrCorrupt
+		}
+		iter++
+		if iter > maxIter {
+			return ErrCorrupt
+		}
+		pg, err := p.getPageReader(pgno, walMaxFrame, cache)
+		if err != nil {
+			return err
+		}
+		chunk := usable
+		if chunk > len(buf)-off {
+			chunk = len(buf) - off
+		}
+		copy(buf[off:off+chunk], pg.data[4:4+chunk])
+		pgno = binary.BigEndian.Uint32(pg.data[0:4])
+		p.releasePage(pg)
+		off += chunk
+	}
+	return nil
 }
 
 func (p *pager) readOverflowChainInternal(firstPgno uint32, buf []byte, walMaxFrame uint32, mvcc bool) error {

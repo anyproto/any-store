@@ -91,6 +91,11 @@ type DB struct {
 
 	readTxPool  sync.Pool
 	writeTxPool sync.Pool
+
+	// readerCachePool recycles per-reader pcache instances.
+	// Each reader gets a private cache to avoid per-page allocations.
+	readerCachePool sync.Pool
+	readerCacheSize int // max(CacheSize/10, 50)
 }
 
 // Open opens or creates a database at the given path.
@@ -157,6 +162,11 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, ErrOldFormat
 	}
 
+	readerCacheSize := opts.CacheSize / 10
+	if readerCacheSize < 50 {
+		readerCacheSize = 50
+	}
+
 	db := &DB{
 		pager: p,
 		path:  path,
@@ -165,6 +175,7 @@ func Open(path string, opts Options) (*DB, error) {
 			pager:    p,
 			rootPage: 1,
 		},
+		readerCacheSize: readerCacheSize,
 	}
 
 	// Initialize local counters from the on-disk state (reading through WAL).
@@ -651,8 +662,9 @@ func (ns *Namespace) RootPage() uint32 {
 type ReadTx struct {
 	db          *DB
 	pager       *pager
-	walSlot     int    // reader slot number (for endRead)
-	walMaxFrame uint32 // WAL snapshot for this transaction
+	cache       *pcache // per-reader private page cache (nil for write transactions)
+	walSlot     int     // reader slot number (for endRead)
+	walMaxFrame uint32  // WAL snapshot for this transaction
 
 	// Disk counters from page 1 at transaction start (for staleness detection).
 	diskFileChangeCounter  uint32
