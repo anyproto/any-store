@@ -689,6 +689,14 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 	if pg.uncached {
 		pg.uncached = false
 		pg.cache = p.writerCache
+		// Discard any stale cache entry before adopting the temp page.
+		// The stale page may still be on the LRU list (released at
+		// getPageWriter:434); without this, a later evictOne on the stale
+		// page would delete(pc.pages, pgno) and remove the NEW adopted
+		// page from the map, creating a ghost dirty-list entry.
+		if old := p.writerCache.pages[pgno]; old != nil {
+			p.writerCache.discard(pgno)
+		}
 		p.writerCache.pages[pgno] = pg
 	}
 
@@ -1171,6 +1179,14 @@ func (p *pager) readWalFrameData(frame uint32, buf []byte) error {
 // Only the writer's cache has xStress set; reader caches have no stress callback.
 // Modeled after SQLite's pagerStress() (pager.c:4609-4681).
 func (p *pager) pagerStress(pg *page) error {
+	// Defense-in-depth: do not spill in error state (SQLite pager.c:4632).
+	// SQLite marks this path NEVER() — it should be unreachable because
+	// pcache.create is not called in error state — but the guard prevents
+	// writing to a potentially corrupt WAL if the invariant is violated.
+	if pagerState(p.state.Load()) == pagerError {
+		return nil
+	}
+
 	// Do not spill if OFF or ROLLBACK flags are set (SQLite pager.c:4636-4641).
 	if p.doNotSpill&(spillFlagOff|spillFlagRollback) != 0 {
 		return nil
@@ -1208,6 +1224,11 @@ func (p *pager) pagerStress(pg *page) error {
 
 	// Write the page to WAL without commit (SQLite pager.c:4649).
 	if err := p.wal.writeFrames([]*page{pg}, false, 0); err != nil {
+		// Transition to error state on WAL write failure, matching SQLite's
+		// return pager_error(pPager, rc) at pager.c:4680. Without this the
+		// error is silently dropped by pcache.create() (which has no error
+		// return) and the transaction continues on a corrupt WAL.
+		p.pagerError()
 		return err
 	}
 

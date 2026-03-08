@@ -93,7 +93,9 @@ func (pc *pcache) create(pgno uint32) *page {
 			if victim != nil {
 				// DRIFT from SQLite: we ignore the xStress error here because
 				// create() has no error return. SQLite's FetchStress returns
-				// the error but only for OOM/non-BUSY cases.
+				// the error but only for OOM/non-BUSY cases. The pagerStress
+				// callback calls pagerError() on failure to transition the
+				// pager to error state, so the error is not silently lost.
 				pc.xStress(victim)
 				// After stress callback, victim should be clean. Retry eviction.
 				for len(pc.pages) >= pc.maxPages && pc.nClean > 0 {
