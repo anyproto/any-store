@@ -467,7 +467,7 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 		if err != nil {
 			// If page is beyond current file but within dbSize, it's a new page
 			if pgno <= p.dbSize.Load() {
-				p.writerCache.release(pg)
+				p.writerCache.discard(pg.pgno)
 				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 			}
 			// Zero-fill new pages
@@ -595,7 +595,7 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 		_, err := p.file.ReadAt(pg.data, offset)
 		if err != nil {
 			if pgno <= p.dbSize.Load() {
-				cache.release(pg)
+				cache.discard(pg.pgno)
 				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 			}
 			clear(pg.data)
@@ -1374,10 +1374,12 @@ func (p *pager) rollbackLocked() error {
 }
 
 // rollbackForClose is a variant of rollbackLocked for use by DB.Close().
-// It skips writerCache and writePages cleanup because the writer goroutine
+// It only performs WAL-level rollback and lock release — all writer-owned
+// state (writePages, dontWritePages, hasContent, header, savepoints, WAL
+// checksums) is deliberately left untouched because the writer goroutine
 // may still be in a B-tree operation accessing those structures, and pcache
-// has no mutex. Since the database is closing, cache state doesn't matter —
-// it will be garbage-collected. Caller must hold writerOpMu.
+// has no mutex. Since the database is closing, that state will be GC'd.
+// Caller must hold writerOpMu.
 func (p *pager) rollbackForClose() {
 	st := pagerState(p.state.Load())
 	if st != pagerWriter && st != pagerError {
@@ -1385,10 +1387,9 @@ func (p *pager) rollbackForClose() {
 	}
 
 	// Roll back spilled frames in the WAL index.
+	// index.rollbackToFrame and nFrame are safe (own locking / atomic).
 	p.wal.index.rollbackToFrame(p.savedWalFrame)
 	p.wal.nFrame.Store(p.savedWalFrame)
-	p.wal.cksum1 = p.savedWalCksum1
-	p.wal.cksum2 = p.savedWalCksum2
 
 	if p.wal.inMemory {
 		p.wal.mu.Lock()
@@ -1396,13 +1397,12 @@ func (p *pager) rollbackForClose() {
 		p.wal.mu.Unlock()
 	}
 
-	p.header = p.savedHeader
-	p.dbSize.Store(p.header.DatabaseSize)
+	// Skip writePages, dontWritePages, hasContent, header, savepoints,
+	// and WAL checksum restoration — all are writer-owned, non-atomic
+	// state that the writer goroutine may be reading concurrently.
+	// Touching them here would be a data race (concurrent map access on
+	// writePages can panic). None of it matters after Close().
 
-	p.savepoints = p.savepoints[:0]
-	clear(p.writePages)
-	clear(p.dontWritePages)
-	clear(p.hasContent)
 	p.state.Store(int32(pagerOpen))
 	p.wal.endWrite()
 }
