@@ -1161,6 +1161,59 @@ needed for auto-vacuum and locality hints.
 Overflow page usable size uses raw `pageSize - 4` instead of `usableSize - 4`.
 Dormant while `ReservedSpace == 0`.
 
+### Multi-Process WAL Write Safety -- Severity: Critical (latent)
+
+When `InProcess` is false (default on linux/darwin amd64/arm64), two separate OS
+processes can open the same database file. Readers work correctly across processes
+thanks to the `shmHashGet()` fallback in `walIndex.get()`. However, **writes from
+a second process** will corrupt the WAL due to three gaps in the shared `wal` struct:
+
+**Gap 1: No BUSY_SNAPSHOT check**
+
+SQLite's `sqlite3WalBeginWriteTransaction()` (wal.c:3712) compares the
+connection's local WAL index header (`pWal->hdr`) against the current SHM
+header. If they differ (another connection committed since this reader started),
+it returns `SQLITE_BUSY_SNAPSHOT` — rejecting the write.
+
+any-store's `beginWrite()` (pager.go:379) acquires the SHM write lock but does
+not check whether the WAL state has changed since `beginRead()`. If Process B
+commits between Process A's `beginRead` and `beginWrite`, Process A reads stale
+page versions for pages not yet in `writePages`, producing writes based on
+outdated data.
+
+Within a single process this is safe: `BeginWrite()` calls `beginRead` then
+`beginWrite` atomically under `writeMu`, so no other goroutine can interpose.
+
+**Gap 2: Stale `wal.cksum1/cksum2` and `wal.nFrame`**
+
+SQLite uses `pWal->hdr.aFrameCksum[0/1]` and `pWal->hdr.mxFrame` (from the WAL
+index header, validated by the BUSY_SNAPSHOT check) for checksum chaining and
+file offset calculation.
+
+any-store uses `wal.cksum1/cksum2` (plain fields, set during recovery or last
+local write) and `wal.nFrame` (atomic, only updated by this process). After
+another process appends frames these are stale:
+- `wal.nFrame` stale → `writeFrames` writes at wrong file offset, overwriting
+  the other process's committed frames.
+- `wal.cksum1/cksum2` stale → new frames have incorrect cumulative checksums,
+  rejected on next WAL recovery.
+
+With Gap 1 fixed (BUSY_SNAPSHOT rejection), this path would never be reached.
+
+**Gap 3: `walIndex.pageMap` incomplete -- already handled**
+
+Process A's Go map lacks frames written by Process B. `walIndex.get()` already
+falls back to `shmHashGet()` when `!inProcess` (wal.go:648). Not a real gap.
+
+**Current impact**: The `openDBs` sync.Map (db.go:17) prevents double-open within
+one process. Multi-process write requires two separate OS processes opening the
+same file, which is not a current deployment pattern.
+
+**Fix if needed**: Add a BUSY_SNAPSHOT equivalent in `beginWrite()` — compare
+`mxCommitFrame` from SHM against the writer's `walMaxFrame`. If they differ,
+return `ErrBusySnapshot`. Then re-derive `wal.cksum1/cksum2` and `wal.nFrame`
+from the WAL file or SHM header before writing.
+
 ### Not Implemented (by design)
 
 These SQLite features are intentionally absent:
