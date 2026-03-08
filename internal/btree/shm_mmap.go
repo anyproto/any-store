@@ -183,22 +183,24 @@ func (s *mmapShm) unlock(slot int, lockType int) error {
 	switch lockType {
 	case lockShared:
 		if current > 0 {
-			s.locks[slot] = current - 1
 			// Only release fcntl lock when last shared holder releases.
+			// Update the counter AFTER fcntl succeeds to keep in-process
+			// state consistent on failure (matches SQLite's unixShmLock).
 			if current == 1 {
 				if err := s.fcntlLock(syscall.F_UNLCK, shmLockOffset(slot)); err != nil {
 					s.mu.Unlock()
 					return err
 				}
 			}
+			s.locks[slot] = current - 1
 		}
 	case lockExclusive:
 		if current == -1 {
-			s.locks[slot] = 0
 			if err := s.fcntlLock(syscall.F_UNLCK, shmLockOffset(slot)); err != nil {
 				s.mu.Unlock()
 				return err
 			}
+			s.locks[slot] = 0
 		}
 	}
 

@@ -558,9 +558,10 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 	if pgno == 0 {
 		return nil, ErrInvalidPage
 	}
-	// If no reader cache provided, fall back to the writer cache path.
+	// If no reader cache provided, read an uncached temporary page.
+	// Never fall back to writerCache — that would race with the writer goroutine.
 	if cache == nil {
-		return p.getPageWriter(pgno, walMaxFrame)
+		return p.readTempPage(pgno, walMaxFrame)
 	}
 
 	// Check reader cache.
@@ -1370,6 +1371,40 @@ func (p *pager) rollbackLocked() error {
 	p.state.Store(int32(pagerOpen))
 	p.wal.endWrite()
 	return nil
+}
+
+// rollbackForClose is a variant of rollbackLocked for use by DB.Close().
+// It skips writerCache and writePages cleanup because the writer goroutine
+// may still be in a B-tree operation accessing those structures, and pcache
+// has no mutex. Since the database is closing, cache state doesn't matter —
+// it will be garbage-collected. Caller must hold writerOpMu.
+func (p *pager) rollbackForClose() {
+	st := pagerState(p.state.Load())
+	if st != pagerWriter && st != pagerError {
+		return
+	}
+
+	// Roll back spilled frames in the WAL index.
+	p.wal.index.rollbackToFrame(p.savedWalFrame)
+	p.wal.nFrame.Store(p.savedWalFrame)
+	p.wal.cksum1 = p.savedWalCksum1
+	p.wal.cksum2 = p.savedWalCksum2
+
+	if p.wal.inMemory {
+		p.wal.mu.Lock()
+		p.wal.memFrames = p.wal.memFrames[:p.savedWalFrame]
+		p.wal.mu.Unlock()
+	}
+
+	p.header = p.savedHeader
+	p.dbSize.Store(p.header.DatabaseSize)
+
+	p.savepoints = p.savepoints[:0]
+	clear(p.writePages)
+	clear(p.dontWritePages)
+	clear(p.hasContent)
+	p.state.Store(int32(pagerOpen))
+	p.wal.endWrite()
 }
 
 // pagerError transitions the pager to the error state. It ensures the WAL

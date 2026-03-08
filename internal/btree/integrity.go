@@ -472,19 +472,21 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 	// written to the DB file during checkpoint).
 	pageSize := db.pager.pageSize
 	if pageSize > 0 {
-		fi, statErr := db.pager.file.Stat()
-		if statErr == nil {
-			filePages := uint32(fi.Size() / int64(pageSize))
-			maxPossible := filePages
-			// WAL's maxPage tracks the committed database size including
-			// pages that only exist in the WAL (not yet checkpointed).
-			walMaxPage := db.pager.wal.index.maxPage.Load()
-			if walMaxPage > maxPossible {
-				maxPossible = walMaxPage
+		var maxPossible uint32
+		if db.pager.file != nil {
+			fi, statErr := db.pager.file.Stat()
+			if statErr == nil {
+				maxPossible = uint32(fi.Size() / int64(pageSize))
 			}
-			if maxPossible > 0 && nPages > maxPossible {
-				nPages = maxPossible
-			}
+		}
+		// WAL's maxPage tracks the committed database size including
+		// pages that only exist in the WAL (not yet checkpointed).
+		walMaxPage := db.pager.wal.index.maxPage.Load()
+		if walMaxPage > maxPossible {
+			maxPossible = walMaxPage
+		}
+		if maxPossible > 0 && nPages > maxPossible {
+			nPages = maxPossible
 		}
 	}
 

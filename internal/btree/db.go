@@ -208,13 +208,14 @@ func (db *DB) Close() error {
 	db.closing.Store(true)
 
 	if !db.writeMu.TryLock() {
-		// Writer holds writeMu. Wait for any active pager operation to
-		// finish, then force-rollback the abandoned/in-flight transaction.
-		// writerOpMu serializes with commit/rollback so we never touch
-		// writerCache concurrently (pcache has no mutex).
+		// Writer holds writeMu. Force-rollback the abandoned/in-flight tx.
+		// writerOpMu serializes with commit/rollback so we don't interleave
+		// with a concurrent Commit or Rollback call.
+		// Use rollbackForClose which skips writerCache operations to avoid
+		// racing with the writer's B-tree ops (pcache has no mutex).
 		db.pager.writerOpMu.Lock()
 		if pagerState(db.pager.state.Load()) == pagerWriter {
-			_ = db.pager.rollbackLocked()
+			db.pager.rollbackForClose()
 		}
 		db.pager.writerOpMu.Unlock()
 
