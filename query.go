@@ -200,7 +200,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	// Collect all matching docIds into a contiguous buffer to avoid
 	// per-ID allocations and cursor invalidation during updates.
 	var idBuf []byte       // contiguous buffer for all IDs
-	var idOffsets []uint32  // start offsets of each ID in idBuf
+	var idOffsets []uint32 // start offsets of each ID in idBuf
 	for {
 		_, docId, iterErr := plan.Root.Next()
 		if iterErr != nil {
@@ -558,9 +558,7 @@ func (q *collQuery) buildBoundsResult() qplanner.BoundsResult {
 	var idxInfoBuf [8]*qplanner.IndexInfo
 	idxInfos := idxInfoBuf[:0]
 	for i := range q.c.indexes {
-		if len(idxInfos) < len(idxInfoBuf) {
-			idxInfos = append(idxInfos, q.c.indexes[i].cboInfo)
-		}
+		idxInfos = append(idxInfos, q.c.indexes[i].cboInfo)
 	}
 	br.Build(idxInfos, q.cond)
 	return br

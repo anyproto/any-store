@@ -194,14 +194,13 @@ func TestIndex_PlannerSelection_CompoundSortMatching(t *testing.T) {
 		assert.NotContains(t, explain.Sql, "-> Sort")
 	})
 
-	t.Run("reversed y direction - uses index anyway", func(t *testing.T) {
-		// The planner's ExactSort check counts matching field names regardless
-		// of direction mismatch (direction only affects weight bonus).
-		// So Sort("x","-y") with index (x,y) still gets ExactSort=true.
+	t.Run("reversed y direction - requires in-memory sort", func(t *testing.T) {
+		// Mixed sort directions (x asc, y desc) cannot be produced by a single
+		// plain index scan direction, so planner should add Sort iterator.
 		explain, err := coll.Find(nil).Sort("x", "-y").Explain(ctx)
 		require.NoError(t, err)
 		t.Log("Plan:", explain.Sql)
-		assert.Contains(t, explain.Sql, "IndexScan(x,y)")
+		assert.Contains(t, explain.Sql, "Sort")
 		// Verify results are returned (correctness)
 		docs := collectDocs(t, coll.Find(nil).Sort("x", "-y"))
 		assert.Len(t, docs, 50)

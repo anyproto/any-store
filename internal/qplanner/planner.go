@@ -21,9 +21,9 @@ type fieldSelEntry struct {
 
 // CandidatePlan represents one plan alternative considered by the CBO.
 type CandidatePlan struct {
-	Name    string  // "FullScan", "IndexSeek(a)", "IndexScan(a)"
-	Cost    float64 // computed cost
-	EstRows float64 // estimated rows scanned/fetched
+	Name    string        // "FullScan", "IndexSeek(a)", "IndexScan(a)"
+	Cost    float64       // computed cost
+	EstRows float64       // estimated rows scanned/fetched
 	details func() string // lazy one-line cost formula (only evaluated by ExplainString)
 }
 
@@ -833,8 +833,8 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 				Tx: params.Tx,
 				Ns: params.DataNs,
 			},
-			Sorter:    params.Sorter,
-			Buf:       params.Buf,
+			Sorter:          params.Sorter,
+			Buf:             params.Buf,
 			PartiallySorted: idx.PartialSort,
 		}
 	}
@@ -892,12 +892,13 @@ func shouldReverse(sorter query.Sort, idx *CBOIndex) bool {
 		return false
 	}
 	fields := sorter.Fields()
-	if len(fields) == 0 || len(idx.Reverse) == 0 {
+	if len(fields) == 0 {
 		return false
 	}
-	// If the first sort field's direction differs from the index's first field direction,
-	// we need to reverse the scan.
-	return fields[0].Reverse != idx.Reverse[0]
+	// Scan direction controls final output direction for index iteration.
+	// Use requested sort direction directly for stable behavior with reverse indexes.
+	_ = idx
+	return fields[0].Reverse
 }
 
 // setPlanRef walks the iterator chain and sets the Plan reference on FilterIter/FetchIter/FullScanIter nodes.
@@ -1266,39 +1267,41 @@ func IndexSortMatch(idx *IndexInfo, sortFields []query.SortField, equalityPrefix
 	if len(sortFields) == 0 || len(idx.FieldNames) == 0 {
 		return false, false
 	}
-
-	bestMatch := 0
-
-	// Try 1: match sort fields starting from the beginning of the index
-	match := 0
-	for i, sf := range sortFields {
-		if i >= len(idx.FieldNames) {
-			break
+	matchAt := func(start int) int {
+		if start < 0 || start >= len(idx.FieldNames) {
+			return 0
 		}
-		if idx.FieldNames[i] != sf.Field {
-			break
-		}
-		match++
-	}
-	if match > bestMatch {
-		bestMatch = match
-	}
-
-	// Try 2: match sort fields starting after the equality prefix
-	if equalityPrefix > 0 && equalityPrefix < len(idx.FieldNames) {
-		match = 0
+		match := 0
+		modeSet := false
+		sameMode := false // true: idx dir == sort dir, false: idx dir != sort dir
 		for si, sf := range sortFields {
-			ii := equalityPrefix + si
+			ii := start + si
 			if ii >= len(idx.FieldNames) {
 				break
 			}
 			if idx.FieldNames[ii] != sf.Field {
 				break
 			}
+			idxRev := false
+			if ii < len(idx.Reverse) {
+				idxRev = idx.Reverse[ii]
+			}
+			curSame := idxRev == sf.Reverse
+			if !modeSet {
+				sameMode = curSame
+				modeSet = true
+			} else if curSame != sameMode {
+				break
+			}
 			match++
 		}
-		if match > bestMatch {
-			bestMatch = match
+		return match
+	}
+
+	bestMatch := matchAt(0)
+	if equalityPrefix > 0 && equalityPrefix < len(idx.FieldNames) {
+		if m := matchAt(equalityPrefix); m > bestMatch {
+			bestMatch = m
 		}
 	}
 
