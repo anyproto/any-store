@@ -74,8 +74,9 @@ type DB struct {
 	pager   *pager
 	path    string
 	opts    Options
-	closing atomic.Bool // set to reject new transactions
-	closed  atomic.Bool // set when Close() is actually called
+	closing          atomic.Bool // set to reject new transactions
+	closed           atomic.Bool // set when Close() is actually called
+	writerLocksDone  atomic.Bool // CAS guard: writer lock cleanup (endRead+RUnlock+Unlock) runs exactly once
 
 	// Namespace root pages are stored in a master table on page 1.
 	// Format: each cell in the master B-tree maps namespace name -> root page number (4 bytes).
@@ -196,18 +197,18 @@ func (db *DB) Close() error {
 	db.closing.Store(true)
 
 	if !db.writeMu.TryLock() {
-		// Writer holds writeMu. If pager is in writer state, the tx
-		// is abandoned — force rollback at the pager level, matching
-		// SQLite's sqlite3BtreeRollback() in sqlite3BtreeClose().
+		// Writer holds writeMu. Force-rollback the abandoned/in-flight tx.
 		if pagerState(db.pager.state.Load()) == pagerWriter {
 			_ = db.pager.rollback()
-			db.pager.endRead(db.pager.writerWalSlot)
-			db.mu.RUnlock()     // release RLock held by BeginWrite
-			db.writeMu.Unlock() // release writeMu (cross-goroutine, valid in Go)
 		}
-		// Re-acquire to follow existing protocol (blocks briefly if
-		// BeginWrite is in flight but hasn't reached pagerWriter yet —
-		// it will see closing==true and abort).
+		// Use CAS to ensure the writer lock cleanup (endRead + RUnlock +
+		// Unlock) happens exactly once. Without this, the writer goroutine
+		// completing concurrently could race with Close and double-release.
+		if db.writerLocksDone.CompareAndSwap(false, true) {
+			db.pager.endRead(db.pager.writerWalSlot)
+			db.mu.RUnlock()
+			db.writeMu.Unlock()
+		}
 		db.writeMu.Lock()
 	}
 	db.writeMu.Unlock()
@@ -316,6 +317,9 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 		db.writeMu.Unlock()
 		return nil, err
 	}
+
+	// Reset the cleanup guard for this write transaction.
+	db.writerLocksDone.Store(false)
 
 	tx := db.getWriteTx()
 	tx.ReadTx.db = db
@@ -919,16 +923,20 @@ func (tx *WriteTx) Commit() error {
 	}
 	threshold := tx.db.opts.AutoCheckpointAfter
 	needCheckpoint := threshold > 0 && int(nFrame) >= threshold
-	tx.pager.endRead(tx.walSlot)
-
-	// Auto-checkpoint before releasing db.mu.RLock to avoid deadlock with Close().
-	// Checkpoint does NOT block readers — it only blocks new writers.
-	if err == nil && needCheckpoint {
-		_ = tx.pager.tryCheckpoint()
-	}
+	// Use CAS to ensure writer lock cleanup happens exactly once.
+	// Close() may race with Commit, so both use writerLocksDone to coordinate.
 	db := tx.db
-	db.mu.RUnlock()
-	db.writeMu.Unlock()
+	if db.writerLocksDone.CompareAndSwap(false, true) {
+		tx.pager.endRead(tx.walSlot)
+
+		// Auto-checkpoint before releasing db.mu.RLock to avoid deadlock with Close().
+		// Checkpoint does NOT block readers — it only blocks new writers.
+		if err == nil && needCheckpoint {
+			_ = tx.pager.tryCheckpoint()
+		}
+		db.mu.RUnlock()
+		db.writeMu.Unlock()
+	}
 	db.putWriteTx(tx)
 	return err
 }
@@ -940,10 +948,14 @@ func (tx *WriteTx) Rollback() error {
 	}
 	tx.closed = true
 	err := tx.pager.rollback()
-	tx.pager.endRead(tx.walSlot)
+	// Use CAS to ensure writer lock cleanup happens exactly once.
+	// Close() may race with Rollback, so both use writerLocksDone to coordinate.
 	db := tx.db
-	db.mu.RUnlock()
-	db.writeMu.Unlock()
+	if db.writerLocksDone.CompareAndSwap(false, true) {
+		tx.pager.endRead(tx.walSlot)
+		db.mu.RUnlock()
+		db.writeMu.Unlock()
+	}
 	db.putWriteTx(tx)
 	return err
 }
