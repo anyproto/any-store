@@ -1090,16 +1090,21 @@ func (p *pager) pagerStress(pg *page) error {
 		return nil
 	}
 
-	// Do not spill page 1. It contains the database header and master table
-	// metadata. SQLite explicitly skips page 1 in pagerStress (pager.c:4642).
+	// DRIFT from SQLite: SQLite does not explicitly check pgno==1 in pagerStress.
+	// Instead, page 1 is structurally protected: it stays pinned (referenced)
+	// throughout the transaction, so pcache never selects it as a spill victim.
+	// We add an explicit guard because page 1 may become unpinned between
+	// b-tree operations in our implementation.
 	if pg.pgno == 1 {
 		return nil
 	}
 
-	// Skip dontWrite pages (freed freelist leaves whose content is irrelevant).
-	// SQLite checks PGHDR_DONT_WRITE in pagerStress (pager.c:4642-4644).
-	// Make them clean so they become evictable — without this, the cache grows
-	// unbounded when many freed pages accumulate as the only dirty victims.
+	// DRIFT from SQLite: SQLite's pagerStress in WAL mode writes DONT_WRITE
+	// pages to WAL anyway (the data is irrelevant but the frame is still
+	// written). We skip the WAL write and just mark them clean, avoiding
+	// unnecessary I/O. Safe because dontWrite page data is never read back.
+	// We must still make them clean so they become evictable — without this,
+	// the cache grows unbounded when freed pages are the only dirty victims.
 	if p.dontWritePages[pg.pgno] {
 		p.cache.makeClean(pg)
 		return nil
@@ -1332,6 +1337,11 @@ func (p *pager) rollback() error {
 // Recovery path: the cache is purged and the header is restored from the
 // saved snapshot. The next call to rollback() (or beginRead which checks
 // for pagerError) will transition back to pagerOpen.
+// DRIFT from SQLite: SQLite's pager_error() only sets errCode and transitions
+// to PAGER_ERROR, deferring cleanup to the subsequent sqlite3PagerRollback().
+// We perform eager cleanup here (cache purge, WAL rollback, lock release,
+// transition to pagerOpen) to avoid leaving the WAL write lock held, which
+// would block other writers in our concurrent goroutine model.
 func (p *pager) pagerError() {
 	p.state.Store(int32(pagerError))
 
@@ -1669,15 +1679,7 @@ func (p *pager) readOverflowChainInternal(firstPgno uint32, buf []byte, walMaxFr
 		if mvcc {
 			pg, err = p.readPageUncached(pgno, walMaxFrame)
 		} else {
-			// Writer path: check writePages first for pages that were spilled
-			// by pagerStress and evicted from cache. These pages won't be found
-			// by getPageAt because their WAL frames are beyond mxCommitFrame.
-			if wp := p.writePages[pgno]; wp != nil {
-				wp.pinCount++
-				pg = wp
-			} else {
-				pg, err = p.getPageWriter(pgno, walMaxFrame)
-			}
+			pg, err = p.getPage(pgno)
 		}
 		if err != nil {
 			return err

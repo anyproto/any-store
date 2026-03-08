@@ -562,7 +562,11 @@ func (wi *walIndex) setBatch(pages []*page, startFrame uint32, commit bool) {
 			wi.shmHashWrite(p.pgno, startFrame+uint32(i))
 		}
 	} else {
-		// Defer SHM hash writes until commit
+		// DRIFT from SQLite: SQLite writes SHM hash entries immediately in
+		// walFrames() via walIndexAppend(), then cleans them up with
+		// walCleanupHash() on rollback. We defer SHM writes for spill frames
+		// and flush on commit, avoiding cross-process readers seeing
+		// uncommitted frames without needing post-rollback cleanup.
 		for i, p := range pages {
 			wi.pendingShmFrames = append(wi.pendingShmFrames, struct{ pgno, frame uint32 }{
 				pgno:  p.pgno,
@@ -650,30 +654,32 @@ func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
 	return 0
 }
 
-// getLatest returns the latest committed WAL frame for pgno, or 0 if the page
-// is not in the WAL. Used to detect whether a cached page may have been updated
-// beyond a reader's snapshot. Only committed frames are considered so that
-// spilled (uncommitted) frames don't cause unnecessary cache invalidation for
-// concurrent readers.
+// getLatest returns the latest WAL frame for pgno, or 0 if the page is not
+// in the WAL. Used to detect whether a cached page may have been updated
+// beyond a reader's snapshot. The caller compares the result against its
+// walMaxFrame (which is bounded by mxCommitFrame from beginRead) to decide
+// whether the cached page is still valid.
+//
+// DRIFT from SQLite: SQLite has per-connection page caches so readers never
+// see spill frames — the writer's private pWal->hdr.mxFrame (including spills)
+// is not published to shared memory until commit. We share one pageMap across
+// all goroutines, so spill frames are visible to getLatest, causing transient
+// unnecessary cache misses during active spill (latestFrame > walMaxFrame).
+// This is correct (readPageUncached returns the right data) and short-lived.
 func (wi *walIndex) getLatest(pgno uint32) uint32 {
 	wi.mu.RLock()
 	frames := wi.pageMap[pgno]
 	wi.mu.RUnlock()
 
-	// Filter by mxCommitFrame so spilled uncommitted frames are invisible
-	// to readers. Without this, concurrent readers would lose cache hits
-	// during spill (latestFrame > walMaxFrame triggers readPageUncached).
-	mxCommit := wi.mxCommitFrame.Load()
-	for i := len(frames) - 1; i >= 0; i-- {
-		if frames[i] <= mxCommit {
-			return frames[i]
-		}
+	if len(frames) > 0 {
+		return frames[len(frames)-1]
 	}
 
 	// Cross-process fallback: check SHM hash tables.
-	// Use mxCommitFrame (not maxFrame) so spilled uncommitted frames are invisible.
+	// Use mxCommitFrame so spilled uncommitted frames (which are not
+	// written to SHM hash during spill) are bounded correctly.
 	if !wi.inProcess {
-		return wi.shmHashGet(pgno, mxCommit)
+		return wi.shmHashGet(pgno, wi.mxCommitFrame.Load())
 	}
 
 	return 0

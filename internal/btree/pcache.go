@@ -138,8 +138,10 @@ func (pc *pcache) createInternal(pgno uint32, noStress bool) *page {
 					// the error but only for OOM/non-BUSY cases.
 					pc.xStress(victim)
 					pc.mu.Lock()
-					// Re-check: another goroutine may have created this page while
-					// we dropped the lock (e.g., concurrent readers).
+					// DRIFT from SQLite: SQLite does not re-check after stress
+					// because pcache operations are single-threaded per connection.
+					// We must re-check because concurrent reader goroutines can
+					// create cache entries while the pcache lock was dropped.
 					if p := pc.pages[pgno]; p != nil {
 						p.pinCount++
 						if !p.dirty {
