@@ -505,7 +505,7 @@ func TestGetPageAtCacheCoherencyBug(t *testing.T) {
 	require.NoError(t, tx2.Commit())
 
 	// Clear entire page cache — simulates LRU eviction under memory pressure.
-	db.pager.cache.clear()
+	db.pager.writerCache.clear()
 
 	// R1 reads key → readOverflowChainAt → getPageAt (cache miss for each
 	// overflow page) → cache.create populates entries with V1 data from WAL
@@ -603,7 +603,7 @@ func TestGetPageAtWriterCorruption(t *testing.T) {
 	require.NoError(t, tx2.Commit())
 
 	// Clear cache → simulates LRU eviction.
-	db.pager.cache.clear()
+	db.pager.writerCache.clear()
 
 	// R1 reads "key-big" → populates cache with V1 overflow data.
 	gotR1, err := rtx1.Get(nsR1, []byte("key-big"))

@@ -27,31 +27,39 @@ func TestCheckpointDoesNotBlockReaders(t *testing.T) {
 	}
 	require.NoError(t, tx.Commit())
 
-	// Start a reader
+	// Start a reader holding an old snapshot
 	rtx, err := db.BeginRead()
 	require.NoError(t, err)
 	ns3, _ := db.getNamespaceLocked("data")
 
-	// Run checkpoint while reader is active — should NOT block
+	// CheckpointFull waits for readers to finish (busy handler) but does NOT
+	// block readers — "new database readers are allowed to continue unimpeded"
+	// (sqlite.org/c3ref/wal_checkpoint_v2.html). Use a short busy timeout so
+	// we don't wait 5s for the reader that will release below.
+	db.pager.wal.busyHandler = DefaultBusyTimeout(200 * time.Millisecond)
+
+	// Start checkpoint in background — it will busy-wait for the reader
 	done := make(chan error, 1)
 	go func() {
 		done <- db.Checkpoint(CheckpointFull)
 	}()
 
-	select {
-	case err := <-done:
-		// Checkpoint completed without blocking
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("checkpoint blocked for too long — it should not block readers")
-	}
-
-	// Reader should still be able to read after checkpoint
+	// Reader should NOT be blocked while checkpoint is pending.
+	// Verify the reader can still read its snapshot unimpeded.
 	v, err := rtx.Get(ns3, []byte("key-0050"))
 	require.NoError(t, err)
 	assert.Equal(t, []byte("val-0050"), v)
 
+	// Release the reader so checkpoint can complete
 	require.NoError(t, rtx.Rollback())
+
+	// Now checkpoint should complete promptly
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("checkpoint did not complete after reader was released")
+	}
 	_ = ns
 }
 
@@ -99,6 +107,9 @@ func TestCheckpointBlocksWriters(t *testing.T) {
 
 func TestCheckpointPartialWithActiveReader(t *testing.T) {
 	db, ns := tempDBWithNS(t, "data")
+	// Short busy timeout: CheckpointFull waits for readers via busy handler;
+	// keep it short so the test doesn't spend 5s per checkpoint call.
+	db.pager.wal.busyHandler = DefaultBusyTimeout(200 * time.Millisecond)
 
 	// Insert batch 1
 	tx, err := db.BeginWrite()
@@ -198,6 +209,8 @@ func TestReaderSlotRotation(t *testing.T) {
 
 func TestConcurrentReadersAndCheckpoint(t *testing.T) {
 	db, ns := tempDBWithNS(t, "data")
+	// Short busy timeout for concurrent reader+checkpoint tests.
+	db.pager.wal.busyHandler = DefaultBusyTimeout(200 * time.Millisecond)
 
 	// Insert initial data
 	tx, err := db.BeginWrite()
@@ -225,7 +238,7 @@ func TestConcurrentReadersAndCheckpoint(t *testing.T) {
 					errors.Add(1)
 					return
 				}
-				nsR, _ := db.getNamespaceLocked("data")
+				nsR, _ := rtx.GetNamespace("data")
 				cur := rtx.NewCursor(nsR)
 				count := 0
 				for err := cur.First(); err == nil && cur.Valid(); err = cur.Next() {

@@ -1541,13 +1541,13 @@ func TestCheckpointBackfill_ShortWrite_InlineRead(t *testing.T) {
 //
 // Old buggy code in pager.close():
 //
-//	cpErr := p.wal.checkpointPassive(p.file, p.cache)
+//	cpErr := p.wal.checkpointPassive(p.file, p.master)
 //	_ = cpErr                // BUG: error ignored!
 //	p.wal.truncateFile()     // BUG: always truncated, even on failure!
 //
 // Fixed code:
 //
-//	cpErr := p.wal.checkpointPassive(p.file, p.cache)
+//	cpErr := p.wal.checkpointPassive(p.file, p.master)
 //	if cpErr == nil {
 //	    p.wal.truncateFile() // Only truncate on success
 //	}

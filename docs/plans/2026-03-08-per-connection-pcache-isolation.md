@@ -117,15 +117,15 @@ Rewrite any-store's shared page cache (`pcache`) to use per-connection private c
 - [x] run stress tests `go test -race -run 'TestCacheStress|TestCheckpoint|TestConcurrent|TestSavepoint' -count=3 -timeout=300s` — must pass
 
 ### Task 6: Remove shared-cache workarounds from pcache
-- [ ] remove `sync.Mutex` from pcache struct and all `mu.Lock()`/`mu.Unlock()` calls in `internal/btree/pcache.go`
-- [ ] remove `fetchPinned()` method — replace its call in `getPageAtImpl` with plain `fetch()` + separate dirty check
-- [ ] remove `createNoStress()` method and `noStress` parameter from `createInternal()`
-- [ ] remove `reinsertDirty()` method — replace its call in `getWritablePage` with `makeDirty()`
-- [ ] remove re-check-after-stress block (lines 141-152 in current pcache.go)
-- [ ] remove `fetchAndMakeDirty()` (uses mutex, writer has single-goroutine access — inline or simplify)
-- [ ] rename `pager.cache` → `pager.writerCache` throughout `internal/btree/pager.go`
-- [ ] update all tests that reference `pager.cache` or `db.pager.cache` to use `pager.writerCache`
-- [ ] run full test suite with -race — must pass
+- [x] remove `sync.Mutex` from pcache struct and all `mu.Lock()`/`mu.Unlock()` calls in `internal/btree/pcache.go`
+- [x] remove `fetchPinned()` method — replace its call in `getPageAtImpl` with plain `fetch()` + separate dirty check
+- [x] remove `createNoStress()` method and `noStress` parameter from `createInternal()`
+- [x] remove `reinsertDirty()` method — replace its call in `getWritablePage` with `makeDirty()`
+- [x] remove re-check-after-stress block (lines 141-152 in current pcache.go)
+- [x] remove `fetchAndMakeDirty()` (uses mutex, writer has single-goroutine access — inline or simplify)
+- [x] rename `pager.cache` → `pager.writerCache` throughout `internal/btree/pager.go`
+- [x] update all tests that reference `pager.cache` or `db.pager.cache` to use `pager.writerCache`
+- [x] run full test suite with -race — must pass
 
 ### Task 7: Simplify pager writer path
 - [ ] simplify `getPageAtImpl` — remove `noStress` parameter, always allow stress (writer-only)

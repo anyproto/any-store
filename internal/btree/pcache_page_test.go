@@ -24,9 +24,10 @@ func TestPcacheFetchAndMakeDirty_Clean(t *testing.T) {
 	assert.Equal(t, 1, pc.nClean)
 	assert.False(t, pg.dirty)
 
-	// fetchAndMakeDirty should fetch it, mark dirty, remove from LRU
-	p := pc.fetchAndMakeDirty(1)
+	// fetch + makeDirty should fetch it, mark dirty, remove from LRU
+	p := pc.fetch(1)
 	require.NotNil(t, p)
+	pc.makeDirty(p)
 	assert.True(t, p.dirty)
 	assert.Equal(t, 0, pc.nClean)
 	assert.Equal(t, 1, pc.nDirty)
@@ -41,9 +42,10 @@ func TestPcacheFetchAndMakeDirty_AlreadyDirty(t *testing.T) {
 	assert.True(t, pg.dirty)
 	assert.Equal(t, 1, pc.nDirty)
 
-	// fetchAndMakeDirty on already-dirty page should just pin it
-	p := pc.fetchAndMakeDirty(1)
+	// fetch + makeDirty on already-dirty page should just pin it
+	p := pc.fetch(1)
 	require.NotNil(t, p)
+	pc.makeDirty(p) // no-op since already dirty
 	assert.True(t, p.dirty)
 	assert.Equal(t, 1, pc.nDirty) // no double-count
 }
@@ -51,8 +53,8 @@ func TestPcacheFetchAndMakeDirty_AlreadyDirty(t *testing.T) {
 func TestPcacheFetchAndMakeDirty_NotFound(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	// fetchAndMakeDirty on non-existent page should return nil
-	p := pc.fetchAndMakeDirty(999)
+	// fetch on non-existent page should return nil
+	p := pc.fetch(999)
 	assert.Nil(t, p)
 }
 
@@ -65,11 +67,13 @@ func TestPcacheFetchAndMakeDirty_MultipleDirty(t *testing.T) {
 	pg2 := pc.create(2)
 	pc.release(pg2)
 
-	// fetchAndMakeDirty both — second should chain in front of first
-	p1 := pc.fetchAndMakeDirty(1)
+	// fetch + makeDirty both — second should chain in front of first
+	p1 := pc.fetch(1)
 	require.NotNil(t, p1)
-	p2 := pc.fetchAndMakeDirty(2)
+	pc.makeDirty(p1)
+	p2 := pc.fetch(2)
 	require.NotNil(t, p2)
+	pc.makeDirty(p2)
 
 	assert.Equal(t, 2, pc.nDirty)
 	// dirtyHead should be p2 (last inserted)
@@ -101,9 +105,7 @@ func TestPcacheEvictOne_EmptyLRU(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
 	// Manually call evictOne on empty LRU — should be no-op
-	pc.mu.Lock()
 	pc.evictOne() // lruHead == nil path
-	pc.mu.Unlock()
 	assert.Nil(t, pc.lruHead)
 }
 
@@ -117,9 +119,7 @@ func TestPcacheLruRemove_NotInLRU(t *testing.T) {
 	assert.Equal(t, 0, pc.nClean)
 
 	// lruRemove on a page not in LRU should be a no-op
-	pc.mu.Lock()
 	pc.lruRemove(pg)
-	pc.mu.Unlock()
 	assert.Equal(t, 0, pc.nClean)
 }
 
@@ -136,9 +136,7 @@ func TestPcacheLruRemove_Head(t *testing.T) {
 	assert.Equal(t, 3, pc.nClean)
 
 	// Remove head
-	pc.mu.Lock()
 	pc.lruRemove(pg1)
-	pc.mu.Unlock()
 	assert.Equal(t, 2, pc.nClean)
 	assert.Equal(t, pg2, pc.lruHead)
 	assert.Equal(t, pg3, pc.lruTail)
@@ -155,9 +153,7 @@ func TestPcacheLruRemove_Tail(t *testing.T) {
 	assert.Equal(t, 2, pc.nClean)
 
 	// Remove tail
-	pc.mu.Lock()
 	pc.lruRemove(pg2)
-	pc.mu.Unlock()
 	assert.Equal(t, 1, pc.nClean)
 	assert.Equal(t, pg1, pc.lruHead)
 	assert.Equal(t, pg1, pc.lruTail)
@@ -177,9 +173,7 @@ func TestPcacheLruRemove_Middle(t *testing.T) {
 	assert.Equal(t, 3, pc.nClean)
 
 	// Remove the middle page
-	pc.mu.Lock()
 	pc.lruRemove(pgs[1])
-	pc.mu.Unlock()
 	assert.Equal(t, 2, pc.nClean)
 	assert.Equal(t, pgs[0], pc.lruHead)
 	assert.Equal(t, pgs[2], pc.lruTail)
@@ -211,37 +205,36 @@ func TestPcacheAppendDirtyPages(t *testing.T) {
 	assert.Len(t, result, 2)
 }
 
-func TestPcacheFetchPinned_Clean(t *testing.T) {
+func TestPcacheFetch_Clean(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
 	pg := pc.create(1)
 	pc.release(pg)
 
-	// fetchPinned on a clean page: wasDirty=false
-	p, wasDirty := pc.fetchPinned(1)
+	// fetch on a clean page: dirty=false
+	p := pc.fetch(1)
 	require.NotNil(t, p)
-	assert.False(t, wasDirty)
+	assert.False(t, p.dirty)
 }
 
-func TestPcacheFetchPinned_Dirty(t *testing.T) {
+func TestPcacheFetch_Dirty(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
 	pg := pc.create(1)
 	pc.makeDirty(pg)
 	pc.release(pg)
 
-	// fetchPinned on a dirty page: wasDirty=true
-	p, wasDirty := pc.fetchPinned(1)
+	// fetch on a dirty page: dirty=true
+	p := pc.fetch(1)
 	require.NotNil(t, p)
-	assert.True(t, wasDirty)
+	assert.True(t, p.dirty)
 }
 
-func TestPcacheFetchPinned_NotFound(t *testing.T) {
+func TestPcacheFetch_NotFound(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	p, wasDirty := pc.fetchPinned(999)
+	p := pc.fetch(999)
 	assert.Nil(t, p)
-	assert.False(t, wasDirty)
 }
 
 func TestPcacheCreateExistingDirty(t *testing.T) {

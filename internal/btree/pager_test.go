@@ -2796,7 +2796,7 @@ func TestGetPageAt_InMemory_CacheMiss(t *testing.T) {
 	p.endRead(slot)
 
 	// Evict page 2 from cache to force cache miss
-	p.cache.discard(pg2.pgno)
+	p.writerCache.discard(pg2.pgno)
 
 	// Read page 2 with WAL maxFrame
 	mf2, slot2, err := p.beginRead()
@@ -2827,7 +2827,7 @@ func TestGetPageAt_ReadFromWAL(t *testing.T) {
 	p.endRead(slot)
 
 	// Evict page 1 from cache so it must be read from WAL
-	p.cache.discard(1)
+	p.writerCache.discard(1)
 
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
@@ -3390,7 +3390,7 @@ func TestGetPageAt_ReadFromFile(t *testing.T) {
 	require.NoError(t, p.checkpointWithMode(CheckpointTruncate))
 
 	// Evict from cache
-	p.cache.discard(pg2.pgno)
+	p.writerCache.discard(pg2.pgno)
 
 	// Read from file (WAL maxFrame=0 after truncate)
 	mf2, slot2, err := p.beginRead()
@@ -3577,7 +3577,7 @@ func TestGetPageAt_WALReadFrameError(t *testing.T) {
 	p.walMaxFrame.Store(mf2)
 
 	// Evict the page from cache so getPageAt must read from WAL
-	p.cache.clear()
+	p.writerCache.clear()
 
 	// Close the WAL file to cause readFrame to fail
 	p.wal.file.Close()
@@ -3605,7 +3605,7 @@ func TestGetPageAt_InMemory_ZeroFill(t *testing.T) {
 	p.dbSize.Store(3)
 
 	// Clear cache to force cache miss
-	p.cache.clear()
+	p.writerCache.clear()
 
 	// getPageAt for page 3 should zero-fill (InMemory, no file, cache miss)
 	pg, err := p.getPageAt(3, mf)
@@ -3795,7 +3795,7 @@ func TestReadHeaderCounters_InMemory_PcacheMiss(t *testing.T) {
 	p.header.SchemaCookie = 7
 
 	// Clear cache so pcache.fetch(1) returns nil
-	p.cache.clear()
+	p.writerCache.clear()
 
 	fcc, sc, err := p.readHeaderCounters(mf)
 	require.NoError(t, err)
@@ -6896,19 +6896,19 @@ func TestPagerStressThenCommit(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "page2-data", string(rpg2.data[100:110]),
 		"spilled page data should be readable after commit")
-	p.cache.release(rpg2)
+	p.writerCache.release(rpg2)
 
 	rpg3, err := p.getPageAt(pg3no, mf2)
 	require.NoError(t, err)
 	assert.Equal(t, "page3-data", string(rpg3.data[100:110]),
 		"normally committed page data should be readable")
-	p.cache.release(rpg3)
+	p.writerCache.release(rpg3)
 
 	rpg4, err := p.getPageAt(pg4no, mf2)
 	require.NoError(t, err)
 	assert.Equal(t, "page4-data", string(rpg4.data[100:110]),
 		"normally committed page data should be readable")
-	p.cache.release(rpg4)
+	p.writerCache.release(rpg4)
 }
 
 func TestPagerStressThenRollback(t *testing.T) {
@@ -6975,7 +6975,7 @@ func TestPagerStressThenRollback(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "original!!", string(rpg2.data[100:110]),
 		"page should have original data after rollback of spilled transaction")
-	p.cache.release(rpg2)
+	p.writerCache.release(rpg2)
 }
 
 func TestPagerStressThenSavepointRollback(t *testing.T) {
@@ -7056,13 +7056,13 @@ func TestPagerStressThenSavepointRollback(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "before-sp!", string(rpg2.data[100:110]),
 		"committed data should reflect pre-savepoint state")
-	p.cache.release(rpg2)
+	p.writerCache.release(rpg2)
 
 	rpg3, err := p.getPageAt(pg3no, mf2)
 	require.NoError(t, err)
 	assert.Equal(t, "pg3-init!!", string(rpg3.data[100:110]),
 		"page 3 data should be committed correctly")
-	p.cache.release(rpg3)
+	p.writerCache.release(rpg3)
 }
 
 // TestSavepointRollbackReDirtiesSpilledPages verifies that pages made clean
@@ -7124,7 +7124,7 @@ func TestSavepointRollbackReDirtiesSpilledPages(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "pre-save!!", string(rpg2.data[100:110]),
 		"pre-savepoint data must survive commit after spill + savepoint rollback")
-	p.cache.release(rpg2)
+	p.writerCache.release(rpg2)
 }
 
 // ============================================================
@@ -7162,9 +7162,7 @@ func TestLargeTransactionBoundedMemory(t *testing.T) {
 	// Verify cache size stayed near the limit (with some tolerance for
 	// pinned pages and page 1). The key assertion: cache did NOT grow to
 	// numPages, proving that spilling occurred.
-	p.cache.mu.Lock()
-	cachedCount := len(p.cache.pages)
-	p.cache.mu.Unlock()
+	cachedCount := len(p.writerCache.pages)
 	assert.Less(t, cachedCount, numPages,
 		"cache should NOT contain all pages — spilling should have occurred")
 	// The cache should be near maxPages (some tolerance for overhead pages)
@@ -7187,7 +7185,7 @@ func TestLargeTransactionBoundedMemory(t *testing.T) {
 		expected := fmt.Sprintf("page-%04d", i)
 		assert.Equal(t, expected, string(pg.data[100:109]),
 			"page %d data mismatch after commit with spilling", i)
-		p.cache.release(pg)
+		p.writerCache.release(pg)
 	}
 }
 
@@ -7237,7 +7235,7 @@ func TestSpillThenCheckpoint(t *testing.T) {
 		expected := fmt.Sprintf("ckpt-%04d", i)
 		assert.Equal(t, expected, string(pg.data[100:109]),
 			"page %d data mismatch after checkpoint", pgno)
-		p.cache.release(pg)
+		p.writerCache.release(pg)
 	}
 }
 
@@ -7294,7 +7292,7 @@ func TestSpillMultipleRounds(t *testing.T) {
 		expected := fmt.Sprintf("wave-%04d", i)
 		assert.Equal(t, expected, string(pg.data[100:109]),
 			"page %d data mismatch after multi-round spill commit", i)
-		p.cache.release(pg)
+		p.writerCache.release(pg)
 	}
 }
 
@@ -7362,13 +7360,13 @@ func TestConcurrentReaderDuringSpill(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "baseline!!", string(rpg2.data[100:110]),
 		"reader should see pre-spill committed data for page 2")
-	p.cache.release(rpg2)
+	p.writerCache.release(rpg2)
 
 	rpg3, err := p.getPageAt(pg3no, readerMf)
 	require.NoError(t, err)
 	assert.Equal(t, "base-pg3!!", string(rpg3.data[100:110]),
 		"reader should see original data for unmodified page 3")
-	p.cache.release(rpg3)
+	p.writerCache.release(rpg3)
 
 	// End reader
 	p.endRead(readerSlot)
@@ -7387,7 +7385,7 @@ func TestConcurrentReaderDuringSpill(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "modified!!", string(rpg2new.data[100:110]),
 		"new reader should see committed modified data")
-	p.cache.release(rpg2new)
+	p.writerCache.release(rpg2new)
 }
 
 // TestSpillInMemoryMode verifies that the writeFramesMem path handles spill
@@ -7439,6 +7437,6 @@ func TestSpillInMemoryMode(t *testing.T) {
 		expected := fmt.Sprintf("mem-%05d", i)
 		assert.Equal(t, expected, string(pg.data[100:109]),
 			"InMemory page %d data mismatch after spill+commit", i)
-		p.cache.release(pg)
+		p.writerCache.release(pg)
 	}
 }
