@@ -550,7 +550,10 @@ func (db *DB) GetNamespace(name string) (*Namespace, error) {
 	}
 	defer db.pager.endRead(slot)
 
-	return db.getNamespaceAt(name, maxFrame, nil)
+	cache := newPcache(int(db.pager.pageSize), 200, true)
+	defer cache.clear()
+
+	return db.getNamespaceAt(name, maxFrame, cache)
 }
 
 // getNamespaceLocked returns a Namespace handle (caller must hold read lock).
@@ -636,7 +639,10 @@ func (db *DB) ListNamespaces() ([]string, error) {
 	}
 	defer db.pager.endRead(slot)
 
-	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: maxFrame, writable: false}
+	cache := newPcache(int(db.pager.pageSize), 200, true)
+	defer cache.clear()
+
+	bt := &btree{pager: db.pager, cache: cache, rootPage: 1, walMaxFrame: maxFrame, writable: false}
 	cursor := bt.NewCursor()
 	defer cursor.Close()
 
