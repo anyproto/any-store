@@ -90,6 +90,19 @@ func (pc *pcache) fetchPinned(pgno uint32) (*page, bool) {
 // are available and xStress is set, invokes the stress callback to spill
 // a dirty page, making it clean and evictable.
 func (pc *pcache) create(pgno uint32) *page {
+	return pc.createInternal(pgno, false)
+}
+
+// createNoStress is like create but never invokes the xStress callback.
+// Used by getPageAt which is called from both writer and reader goroutines.
+// Reader goroutines must not trigger xStress (pagerStress) because it
+// accesses writer-only unsynchronized fields (doNotSpill, dontWritePages,
+// savepoints). Normal clean-page eviction still happens.
+func (pc *pcache) createNoStress(pgno uint32) *page {
+	return pc.createInternal(pgno, true)
+}
+
+func (pc *pcache) createInternal(pgno uint32, noStress bool) *page {
 	pc.mu.Lock()
 
 	if p := pc.pages[pgno]; p != nil {
@@ -109,32 +122,38 @@ func (pc *pcache) create(pgno uint32) *page {
 
 		// If still full and stress callback available, try to spill a dirty page.
 		// Modeled after sqlite3PcacheFetchStress() in pcache.c.
-		spill := pc.szSpill
-		if spill == 0 {
-			spill = pc.maxPages
-		}
-		if len(pc.pages) >= spill && pc.xStress != nil {
-			victim := pc.findSpillVictim()
-			if victim != nil {
-				pc.mu.Unlock()
-				// DRIFT from SQLite: we ignore the xStress error here because
-				// create() has no error return. SQLite's FetchStress returns
-				// the error but only for OOM/non-BUSY cases.
-				pc.xStress(victim)
-				pc.mu.Lock()
-				// Re-check: another goroutine may have created this page while
-				// we dropped the lock (e.g., concurrent readers).
-				if p := pc.pages[pgno]; p != nil {
-					p.pinCount++
-					if !p.dirty {
-						pc.lruRemove(p)
-					}
+		// noStress skips this: reader goroutines must not invoke pagerStress
+		// which accesses writer-only fields without synchronization.
+		if !noStress {
+			spill := pc.szSpill
+			if spill == 0 {
+				spill = pc.maxPages
+			}
+			if len(pc.pages) >= spill && pc.xStress != nil {
+				victim := pc.findSpillVictim()
+				if victim != nil {
 					pc.mu.Unlock()
-					return p
-				}
-				// After stress callback, victim should be clean. Retry eviction.
-				for len(pc.pages) >= pc.maxPages && pc.nClean > 0 {
-					pc.evictOne()
+					// DRIFT from SQLite: we ignore the xStress error here because
+					// create() has no error return. SQLite's FetchStress returns
+					// the error but only for OOM/non-BUSY cases.
+					pc.xStress(victim)
+					pc.mu.Lock()
+					// DRIFT from SQLite: SQLite does not re-check after stress
+					// because pcache operations are single-threaded per connection.
+					// We must re-check because concurrent reader goroutines can
+					// create cache entries while the pcache lock was dropped.
+					if p := pc.pages[pgno]; p != nil {
+						p.pinCount++
+						if !p.dirty {
+							pc.lruRemove(p)
+						}
+						pc.mu.Unlock()
+						return p
+					}
+					// After stress callback, victim should be clean. Retry eviction.
+					for len(pc.pages) >= pc.maxPages && pc.nClean > 0 {
+						pc.evictOne()
+					}
 				}
 			}
 		}
@@ -217,11 +236,28 @@ func (pc *pcache) reinsertDirty(p *page) {
 	pc.mu.Lock()
 	if existing := pc.pages[p.pgno]; existing != p {
 		// A concurrent reader may have created a new cache entry for this
-		// pgno while the spilled page was evicted. If the reader already
-		// released it, the page sits in the LRU. Remove it before
-		// overwriting to prevent evictOne from later deleting our entry.
-		if existing != nil && !existing.dirty {
-			pc.lruRemove(existing)
+		// pgno while the spilled page was evicted. Remove it before
+		// overwriting to prevent evictOne from later deleting our entry
+		// or orphaning a dirty page in the dirty linked list.
+		if existing != nil {
+			if existing.dirty {
+				// Remove from dirty linked list to prevent orphaned entries
+				// that would cause stale data in appendDirtyPages/dirtyPages.
+				if existing.prev != nil {
+					existing.prev.next = existing.next
+				} else {
+					pc.dirtyHead = existing.next
+				}
+				if existing.next != nil {
+					existing.next.prev = existing.prev
+				}
+				existing.next = nil
+				existing.prev = nil
+				existing.dirty = false
+				pc.nDirty--
+			} else {
+				pc.lruRemove(existing)
+			}
 		}
 		pc.pages[p.pgno] = p
 	}

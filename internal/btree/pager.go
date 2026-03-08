@@ -369,13 +369,26 @@ func (p *pager) getPage(pgno uint32) (*page, error) {
 		pg.pinCount++
 		return pg, nil
 	}
-	return p.getPageAt(pgno, p.walMaxFrame.Load())
+	return p.getPageWriter(pgno, p.walMaxFrame.Load())
 }
 
 // getPageAt returns the page with the given page number, using the specified
 // walMaxFrame for snapshot isolation. This allows different readers to have
-// different WAL snapshots.
+// different WAL snapshots. Uses createNoStress: reader goroutines must not
+// trigger pagerStress which accesses writer-only unsynchronized fields.
 func (p *pager) getPageAt(pgno, walMaxFrame uint32) (*page, error) {
+	return p.getPageAtImpl(pgno, walMaxFrame, true)
+}
+
+// getPageWriter returns the page for the writer context. Like getPageAt but
+// uses create() which allows the stress callback (pagerStress) to spill dirty
+// pages when the cache is full. This ensures update-heavy transactions on
+// existing pages also trigger cache spill, not just new page allocations.
+func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
+	return p.getPageAtImpl(pgno, walMaxFrame, false)
+}
+
+func (p *pager) getPageAtImpl(pgno, walMaxFrame uint32, noStress bool) (*page, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
 	}
@@ -401,7 +414,17 @@ func (p *pager) getPageAt(pgno, walMaxFrame uint32) (*page, error) {
 	}
 
 	// Cache miss: create a new cached page.
-	pg := p.cache.create(pgno)
+	// noStress=true (reader path): uses createNoStress to avoid invoking
+	// pagerStress which accesses writer-only unsynchronized fields.
+	// noStress=false (writer path): uses create() which allows the stress
+	// callback to spill dirty pages, keeping cache size bounded during
+	// update-heavy transactions on existing pages.
+	var pg *page
+	if noStress {
+		pg = p.cache.createNoStress(pgno)
+	} else {
+		pg = p.cache.create(pgno)
+	}
 
 	// Try to read from WAL first
 	if walMaxFrame > 0 {
@@ -1052,12 +1075,11 @@ func (p *pager) readWalFrameData(frame uint32, buf []byte) error {
 // without committing, making it clean and evictable.
 // Modeled after SQLite's pagerStress() (pager.c:4609-4681).
 func (p *pager) pagerStress(pg *page) error {
-	// Check pager state first (atomic) before accessing non-atomic fields.
-	// This guards against reader goroutines triggering xStress via create():
-	// readers will see state != pagerWriter and return immediately, avoiding
-	// a data race on doNotSpill which is only written by the writer goroutine.
+	// Defense-in-depth: verify pager is in writer state. The primary guard
+	// is that getPageAt uses createNoStress (readers never invoke xStress).
+	// This check catches any unexpected caller path.
 	// DRIFT from SQLite: SQLite's pagerStress always has a writer context;
-	// our shared cache means readers can trigger xStress too.
+	// our shared cache means readers could trigger xStress via create().
 	st := pagerState(p.state.Load())
 	if st == pagerError || st != pagerWriter {
 		return nil
@@ -1068,9 +1090,23 @@ func (p *pager) pagerStress(pg *page) error {
 		return nil
 	}
 
-	// Do not spill page 1. It contains the database header and master table
-	// metadata. SQLite explicitly skips page 1 in pagerStress (pager.c:4642).
+	// DRIFT from SQLite: SQLite does not explicitly check pgno==1 in pagerStress.
+	// Instead, page 1 is structurally protected: it stays pinned (referenced)
+	// throughout the transaction, so pcache never selects it as a spill victim.
+	// We add an explicit guard because page 1 may become unpinned between
+	// b-tree operations in our implementation.
 	if pg.pgno == 1 {
+		return nil
+	}
+
+	// DRIFT from SQLite: SQLite's pagerStress in WAL mode writes DONT_WRITE
+	// pages to WAL anyway (the data is irrelevant but the frame is still
+	// written). We skip the WAL write and just mark them clean, avoiding
+	// unnecessary I/O. Safe because dontWrite page data is never read back.
+	// We must still make them clean so they become evictable — without this,
+	// the cache grows unbounded when freed pages are the only dirty victims.
+	if p.dontWritePages[pg.pgno] {
+		p.cache.makeClean(pg)
 		return nil
 	}
 
@@ -1301,6 +1337,11 @@ func (p *pager) rollback() error {
 // Recovery path: the cache is purged and the header is restored from the
 // saved snapshot. The next call to rollback() (or beginRead which checks
 // for pagerError) will transition back to pagerOpen.
+// DRIFT from SQLite: SQLite's pager_error() only sets errCode and transitions
+// to PAGER_ERROR, deferring cleanup to the subsequent sqlite3PagerRollback().
+// We perform eager cleanup here (cache purge, WAL rollback, lock release,
+// transition to pagerOpen) to avoid leaving the WAL write lock held, which
+// would block other writers in our concurrent goroutine model.
 func (p *pager) pagerError() {
 	p.state.Store(int32(pagerError))
 
@@ -1318,6 +1359,12 @@ func (p *pager) pagerError() {
 	p.wal.nFrame.Store(p.savedWalFrame)
 	p.wal.cksum1 = p.savedWalCksum1
 	p.wal.cksum2 = p.savedWalCksum2
+
+	// Restore mxCommitFrame: the commit path advances mxCommitFrame before
+	// writeHeader (wal.go), so a writeHeader failure leaves mxCommitFrame
+	// ahead of the rolled-back WAL state. At beginWrite() time,
+	// mxCommitFrame == nFrame == savedWalFrame, so restore to that value.
+	p.wal.index.mxCommitFrame.Store(p.savedWalFrame)
 
 	// Truncate in-memory WAL frames to match restored nFrame.
 	if p.wal.inMemory {
@@ -1426,16 +1473,21 @@ func (p *pager) rollbackToSavepoint(id int) error {
 			trace("rollbackToSavepoint: restoring sp[%d] pages (%d entries)", i, len(p.savepoints[i].pages))
 		}
 		for pgno, data := range p.savepoints[i].pages {
-			pg := p.cache.fetch(pgno)
-			if pg == nil {
-				// Page was spilled and evicted from pcache. It may still
-				// be in writePages — re-insert it into cache so its data
-				// can be restored and it becomes dirty again.
-				if wp := p.writePages[pgno]; wp != nil {
-					p.cache.reinsertDirty(wp)
-					wp.pinCount++
-					pg = wp
-				}
+			// Always check writePages first. When a page was spilled and
+			// evicted, a concurrent reader (e.g., integrity check) may have
+			// created a different cache entry for this pgno via getPageAt.
+			// Using cache.fetch alone could return the reader-created page,
+			// leaving writePages pointing to a stale object and causing
+			// data loss on subsequent writes via getWritablePage.
+			var pg *page
+			if wp := p.writePages[pgno]; wp != nil {
+				// Ensure the writer's page is in the cache (replaces any
+				// reader-created entry). reinsertDirty handles dirty list
+				// cleanup for displaced pages.
+				p.cache.reinsertDirty(wp)
+				pg = p.cache.fetch(pgno) // pin under pcache mutex to avoid data race on pinCount
+			} else {
+				pg = p.cache.fetch(pgno)
 			}
 			if pg != nil {
 				copy(pg.data, data)
@@ -1451,8 +1503,13 @@ func (p *pager) rollbackToSavepoint(id int) error {
 					p.header.deserialize(pg.data[:dbHeaderSize])
 					p.dbSize.Store(p.header.DatabaseSize)
 				}
-				// Page is restored to pre-savepoint state but stays dirty
-				// so it can be modified again in the current transaction.
+				// Re-dirty pages that were made clean by pagerStress spill.
+				// Without this, spilled pages remain clean after data
+				// restoration, and their content is lost at commit because
+				// appendDirtyPages only collects dirty pages.
+				if !pg.dirty {
+					p.cache.makeDirty(pg)
+				}
 				p.cache.release(pg)
 			}
 		}
@@ -1622,7 +1679,7 @@ func (p *pager) readOverflowChainInternal(firstPgno uint32, buf []byte, walMaxFr
 		if mvcc {
 			pg, err = p.readPageUncached(pgno, walMaxFrame)
 		} else {
-			pg, err = p.getPageAt(pgno, walMaxFrame)
+			pg, err = p.getPage(pgno)
 		}
 		if err != nil {
 			return err

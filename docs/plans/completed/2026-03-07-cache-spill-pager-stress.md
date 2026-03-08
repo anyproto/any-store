@@ -274,3 +274,6 @@ Document every intentional divergence from the SQLite C implementation here. Eac
 **Performance testing:**
 - Benchmark spill overhead vs unbounded cache (tradeoff: more WAL I/O vs less memory)
 - Tune `szSpill` default (SQLite uses `cache_spill` pragma, default = `cache_size`)
+
+**fuzz test***
+- run fuzz tests against our branch in ../any-store-tests-main ( go test -v -run TestCrashFuzz ./storetest/)

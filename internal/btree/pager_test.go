@@ -6699,9 +6699,11 @@ func TestPagerStressSpillsDirtyPage(t *testing.T) {
 	// Verify: page is now clean
 	assert.False(t, pg2.dirty, "page should be clean after stress")
 
-	// Verify: spilled page data is in WAL (readable via pageMap)
-	frame := p.wal.index.getLatest(pg2.pgno)
-	assert.NotZero(t, frame, "spilled page should be in pageMap")
+	// Verify: spilled page data is in WAL (readable via pageMap).
+	p.wal.index.mu.RLock()
+	frames := p.wal.index.pageMap[pg2.pgno]
+	p.wal.index.mu.RUnlock()
+	assert.NotEmpty(t, frames, "spilled page should be in pageMap")
 }
 
 func TestPagerStressSpillFlagOff(t *testing.T) {
@@ -6828,9 +6830,11 @@ func TestPagerStressWithSavepoint(t *testing.T) {
 	// Verify: page is clean after stress
 	assert.False(t, pg.dirty, "page should be clean after stress")
 
-	// Verify: page was written to WAL
-	frame := p.wal.index.getLatest(pgno)
-	assert.NotZero(t, frame, "spilled page should be in WAL")
+	// Verify: page was written to WAL.
+	p.wal.index.mu.RLock()
+	frames := p.wal.index.pageMap[pgno]
+	p.wal.index.mu.RUnlock()
+	assert.NotEmpty(t, frames, "spilled page should be in WAL")
 }
 
 // ============================================================
@@ -7063,6 +7067,68 @@ func TestPagerStressThenSavepointRollback(t *testing.T) {
 	assert.Equal(t, "pg3-init!!", string(rpg3.data[100:110]),
 		"page 3 data should be committed correctly")
 	p.cache.release(rpg3)
+}
+
+// TestSavepointRollbackReDirtiesSpilledPages verifies that pages made clean
+// by pagerStress are re-dirtied after savepoint rollback restores their data.
+// Without the re-dirty fix, spilled pages remain clean after data restoration
+// and their content is lost at commit (appendDirtyPages skips clean pages).
+func TestSavepointRollbackReDirtiesSpilledPages(t *testing.T) {
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	// Begin write transaction and modify a page BEFORE the savepoint.
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf)
+	require.NoError(t, p.beginWrite())
+
+	pg2, err := p.allocatePage()
+	require.NoError(t, err)
+	pg2no := pg2.pgno
+	copy(pg2.data[100:], "pre-save!!")
+	p.releasePage(pg2)
+
+	// Create savepoint — pg2 is dirty with "pre-save!!"
+	spID, err := p.savepoint()
+	require.NoError(t, err)
+
+	// Modify pg2 AFTER savepoint — creates savepoint copy
+	pg2w, err := p.getWritablePage(pg2no)
+	require.NoError(t, err)
+	copy(pg2w.data[100:], "post-save!")
+	p.releasePage(pg2w)
+
+	// Spill pg2 — makes it clean
+	require.NoError(t, p.pagerStress(pg2w))
+	assert.False(t, pg2w.dirty, "spilled page should be clean")
+
+	// Rollback to savepoint — restores pg2 data to "pre-save!!"
+	require.NoError(t, p.rollbackToSavepoint(spID))
+
+	// Verify pg2 is dirty after rollback (the fix under test).
+	assert.True(t, pg2w.dirty,
+		"spilled page must be re-dirtied after savepoint rollback restores its data")
+
+	// Commit immediately WITHOUT re-acquiring pg2 via getWritablePage.
+	// Before the fix, pg2 was clean and its data would be lost.
+	_, _, _, err = p.commit(true, false)
+	require.NoError(t, err)
+	p.endRead(slot)
+
+	// Verify pg2's pre-savepoint data survived commit.
+	mf2, slot2, err := p.beginRead()
+	require.NoError(t, err)
+	defer p.endRead(slot2)
+
+	rpg2, err := p.getPageAt(pg2no, mf2)
+	require.NoError(t, err)
+	assert.Equal(t, "pre-save!!", string(rpg2.data[100:110]),
+		"pre-savepoint data must survive commit after spill + savepoint rollback")
+	p.cache.release(rpg2)
 }
 
 // ============================================================
@@ -7328,8 +7394,10 @@ func TestConcurrentReaderDuringSpill(t *testing.T) {
 	p.cache.release(rpg2new)
 }
 
-// TestSpillInMemoryMode verifies that InMemory databases handle spill
-// correctly via writeFramesMem.
+// TestSpillInMemoryMode verifies that the writeFramesMem path handles spill
+// correctly. Note: production InMemory databases use purgeable=false (db.go:142),
+// so spilling never triggers in real InMemory mode. This test forces
+// purgeable=true to exercise the writeFramesMem spill code path.
 func TestSpillInMemoryMode(t *testing.T) {
 	dir := t.TempDir()
 	cacheSize := 15

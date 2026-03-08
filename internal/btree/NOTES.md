@@ -1010,6 +1010,56 @@ Key components:
 - `pager.doNotSpill`: bitmask (`spillFlagOff`, `spillFlagRollback`) preventing
   re-entrant spills during rollback operations
 
+Cache spill drifts from SQLite (all intentional, marked with `DRIFT from SQLite`
+comments in source):
+
+1. **pagerError eager cleanup** (`pager.go:pagerError`): SQLite's `pager_error()`
+   only sets errCode and transitions to `PAGER_ERROR`, deferring cleanup to a
+   subsequent `sqlite3PagerRollback()`. We perform eager cleanup (cache purge,
+   WAL rollback, lock release, transition to pagerOpen) to avoid leaving the WAL
+   write lock held, which would block other writers in our concurrent goroutine model.
+
+2. **Page-1 explicit exclusion** (`pager.go:pagerStress`): SQLite does not check
+   `pgno==1` in `pagerStress()`. Page 1 is structurally protected: it stays pinned
+   (referenced) throughout the transaction, so pcache never selects it as a spill
+   victim. We add an explicit guard because page 1 may become unpinned between
+   b-tree operations.
+
+3. **pcache re-check after stress** (`pcache.go:createInternal`): SQLite does not
+   re-check after the stress callback because pcache operations are single-threaded
+   per connection. We drop the pcache lock during stress, so another goroutine can
+   create the same page while the lock is dropped.
+
+4. **Deferred SHM hash writes** (`wal.go:setBatch`): SQLite writes SHM hash entries
+   immediately in `walFrames()` via `walIndexAppend()`, then cleans them up with
+   `walCleanupHash()` on rollback. We defer SHM writes for spill frames into
+   `pendingShmFrames` and flush on commit, avoiding the need for post-rollback
+   cleanup of cross-process-visible state.
+
+5. **dontWrite pages made clean without WAL write** (`pager.go:pagerStress`):
+   SQLite's `pagerStress` in WAL mode writes `PGHDR_DONT_WRITE` pages to WAL
+   anyway (the data is irrelevant but the frame is still written). We skip the WAL
+   write and just mark them clean, avoiding unnecessary I/O. Safe because dontWrite
+   page data is never read back.
+
+6. **Shared pageMap causes transient cache misses** (`wal.go:getLatest`): SQLite has
+   per-connection page caches, so readers never see spill frames — the writer's
+   private `pWal->hdr.mxFrame` is not published to shared memory until commit. We
+   share one `pageMap` across all goroutines, so `getLatest()` returns spill frames,
+   causing transient unnecessary cache misses during active spill when
+   `latestFrame > walMaxFrame`. This is correct (readers re-read the same committed
+   data) and short-lived (only during active spill).
+
+Additionally, the following Go-specific mechanisms have no SQLite analogue:
+- `pcache.createNoStress()`: prevents reader goroutines from triggering
+  `pagerStress`, which accesses writer-only unsynchronized fields
+- `pcache.reinsertDirty()`: handles displaced reader cache entries when a spilled
+  page is re-acquired by the writer
+- `db.writerLocksDone`: atomic CAS guard ensuring Close/Commit/Rollback lock
+  cleanup runs exactly once despite concurrent goroutines
+- In-memory WAL `memFrames` truncation on rollback (no SQLite equivalent since
+  SQLite's in-memory WAL is a separate VFS shim)
+
 **Checkpoint Copies All Frame Versions** -- Severity: Minor
 
 If a page was modified 10 times in the WAL, all 10 versions are copied during

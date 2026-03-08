@@ -1,6 +1,7 @@
 package btree
 
 import (
+	stderrors "errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -291,7 +292,17 @@ func TestCheckpointWithWriterAndReaders(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for round := range 5 {
-			wtx, err := db.BeginWrite()
+			var wtx *WriteTx
+			var err error
+			// Retry on ErrBusy: CheckpointFull holds the WAL write lock
+			// temporarily, so the writer may need to wait.
+			for retries := 0; retries < 3; retries++ {
+				wtx, err = db.BeginWrite()
+				if err == nil || !stderrors.Is(err, ErrBusy) {
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
 			if err != nil {
 				t.Logf("Writer BeginWrite error: %v", err)
 				errors.Add(1)
