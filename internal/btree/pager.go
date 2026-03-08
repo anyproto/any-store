@@ -369,13 +369,26 @@ func (p *pager) getPage(pgno uint32) (*page, error) {
 		pg.pinCount++
 		return pg, nil
 	}
-	return p.getPageAt(pgno, p.walMaxFrame.Load())
+	return p.getPageWriter(pgno, p.walMaxFrame.Load())
 }
 
 // getPageAt returns the page with the given page number, using the specified
 // walMaxFrame for snapshot isolation. This allows different readers to have
-// different WAL snapshots.
+// different WAL snapshots. Uses createNoStress: reader goroutines must not
+// trigger pagerStress which accesses writer-only unsynchronized fields.
 func (p *pager) getPageAt(pgno, walMaxFrame uint32) (*page, error) {
+	return p.getPageAtImpl(pgno, walMaxFrame, true)
+}
+
+// getPageWriter returns the page for the writer context. Like getPageAt but
+// uses create() which allows the stress callback (pagerStress) to spill dirty
+// pages when the cache is full. This ensures update-heavy transactions on
+// existing pages also trigger cache spill, not just new page allocations.
+func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
+	return p.getPageAtImpl(pgno, walMaxFrame, false)
+}
+
+func (p *pager) getPageAtImpl(pgno, walMaxFrame uint32, noStress bool) (*page, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
 	}
@@ -401,12 +414,17 @@ func (p *pager) getPageAt(pgno, walMaxFrame uint32) (*page, error) {
 	}
 
 	// Cache miss: create a new cached page.
-	// Use createNoStress: getPageAt is called from both writer and reader
-	// goroutines (e.g., integrity checks). Reader goroutines must not
-	// trigger pagerStress which accesses writer-only unsynchronized fields.
-	// Writer-only paths (getPageNoContent, freePage) use create() directly
-	// which allows stress. Clean-page eviction still happens here.
-	pg := p.cache.createNoStress(pgno)
+	// noStress=true (reader path): uses createNoStress to avoid invoking
+	// pagerStress which accesses writer-only unsynchronized fields.
+	// noStress=false (writer path): uses create() which allows the stress
+	// callback to spill dirty pages, keeping cache size bounded during
+	// update-heavy transactions on existing pages.
+	var pg *page
+	if noStress {
+		pg = p.cache.createNoStress(pgno)
+	} else {
+		pg = p.cache.create(pgno)
+	}
 
 	// Try to read from WAL first
 	if walMaxFrame > 0 {
@@ -1332,6 +1350,12 @@ func (p *pager) pagerError() {
 	p.wal.cksum1 = p.savedWalCksum1
 	p.wal.cksum2 = p.savedWalCksum2
 
+	// Restore mxCommitFrame: the commit path advances mxCommitFrame before
+	// writeHeader (wal.go), so a writeHeader failure leaves mxCommitFrame
+	// ahead of the rolled-back WAL state. At beginWrite() time,
+	// mxCommitFrame == nFrame == savedWalFrame, so restore to that value.
+	p.wal.index.mxCommitFrame.Store(p.savedWalFrame)
+
 	// Truncate in-memory WAL frames to match restored nFrame.
 	if p.wal.inMemory {
 		p.wal.mu.Lock()
@@ -1652,7 +1676,7 @@ func (p *pager) readOverflowChainInternal(firstPgno uint32, buf []byte, walMaxFr
 				wp.pinCount++
 				pg = wp
 			} else {
-				pg, err = p.getPageAt(pgno, walMaxFrame)
+				pg, err = p.getPageWriter(pgno, walMaxFrame)
 			}
 		}
 		if err != nil {

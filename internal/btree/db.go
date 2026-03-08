@@ -668,7 +668,7 @@ func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 			pg.pinCount++
 			return pg, nil
 		}
-		return tx.pager.getPageAt(pgno, tx.walMaxFrame)
+		return tx.pager.getPageWriter(pgno, tx.walMaxFrame)
 	}
 	return tx.pager.readPageMVCC(pgno, tx.walMaxFrame)
 }

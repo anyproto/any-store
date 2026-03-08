@@ -44,7 +44,7 @@ func (bt *btree) getPage(pgno uint32) (*page, error) {
 			return pg, nil
 		}
 		if bt.walMaxFrame > 0 {
-			return bt.pager.getPageAt(pgno, bt.walMaxFrame)
+			return bt.pager.getPageWriter(pgno, bt.walMaxFrame)
 		}
 		return bt.pager.getPage(pgno)
 	}
