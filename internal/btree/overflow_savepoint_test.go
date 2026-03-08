@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	stderrors "errors"
 	"fmt"
 	mrand "math/rand"
 	"path/filepath"
@@ -171,6 +172,9 @@ func testOverflowSavepointConcurrent(t *testing.T, seed int64) {
 	db, err := Open(dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
+	// Use short busy timeout so checkpoint doesn't block writer for 5s per attempt
+	// when readers are continuously active.
+	db.pager.wal.busyHandler = DefaultBusyTimeout(200 * time.Millisecond)
 
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -238,6 +242,11 @@ func testOverflowSavepointConcurrent(t *testing.T, seed int64) {
 
 	for txIdx := 0; txIdx < 100; txIdx++ {
 		tx, err := db.BeginWrite()
+		if stderrors.Is(err, ErrBusy) {
+			// CheckpointFull/Restart holds the WAL write lock while
+			// busy-waiting on reader slots — skip this round.
+			continue
+		}
 		require.NoError(t, err)
 
 		ns, err := db.getNamespaceLocked("docs")

@@ -189,7 +189,7 @@ func TestCacheStressSavepointRollbackAndEviction(t *testing.T) {
 	
 	// 3. Simulate reader polluting pcache with "clean" versions of those pages
 	for i := 1; i <= 10; i++ {
-		pg, err := db.pager.getPageAt(uint32(i), wtx.walMaxFrame)
+		pg, err := db.pager.getPageWriter(uint32(i), wtx.walMaxFrame)
 		require.NoError(t, err)
 		db.pager.releasePage(pg)
 	}

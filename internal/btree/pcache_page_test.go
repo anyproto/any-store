@@ -899,7 +899,7 @@ func TestIntegrityCheck_CorruptFreelistLeafCount(t *testing.T) {
 	trunkPgno := db.pager.header.FirstFreelistPg
 	maxFrame, slot, rerr := db.pager.beginRead()
 	require.NoError(t, rerr)
-	trunkPg, rerr := db.pager.getPageAt(trunkPgno, maxFrame)
+	trunkPg, rerr := db.pager.getPageWriter(trunkPgno, maxFrame)
 	require.NoError(t, rerr)
 	origLeafCount := binary.BigEndian.Uint32(trunkPg.data[4:8])
 	db.pager.releasePage(trunkPg)
@@ -994,7 +994,7 @@ func TestIntegrityCheck_CorruptFreeblockSize(t *testing.T) {
 
 	// Read page to check if it has freeblocks
 	maxFrame, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, maxFrame)
+	pg, _ := db.pager.getPageWriter(rootPage, maxFrame)
 	hasFreeBlk := pg.header.firstFreeBlk != 0
 	db.pager.releasePage(pg)
 	db.pager.endRead(slot)
@@ -1569,7 +1569,7 @@ func TestIntegrityCheck_FreeblockChainUnordered(t *testing.T) {
 
 	// Check if root page has a freeblock chain
 	maxFrame, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, maxFrame)
+	pg, _ := db.pager.getPageWriter(rootPage, maxFrame)
 	firstFb := pg.header.firstFreeBlk
 	db.pager.releasePage(pg)
 	db.pager.endRead(slot)
@@ -1627,7 +1627,7 @@ func TestIntegrityCheck_FreeblockExtendsOffPage(t *testing.T) {
 	rootPage := ns.rootPage
 
 	maxFrame, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, maxFrame)
+	pg, _ := db.pager.getPageWriter(rootPage, maxFrame)
 	firstFb := pg.header.firstFreeBlk
 	db.pager.releasePage(pg)
 	db.pager.endRead(slot)
@@ -1887,7 +1887,7 @@ func TestIntegrityCheck_TooManyErrors_CheckTreePage(t *testing.T) {
 
 	// Find the root page and verify it's interior
 	maxFrame, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, maxFrame)
+	pg, _ := db.pager.getPageWriter(rootPage, maxFrame)
 	isInterior := pg.header.isInterior()
 	nCells := int(pg.header.cellCount)
 	var firstChildPage uint32
@@ -1953,7 +1953,7 @@ func TestIntegrityCheck_FreeblockSizeTooSmall_Deterministic(t *testing.T) {
 
 	// Find the root page and check if it has freeblocks
 	maxFrame, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, maxFrame)
+	pg, _ := db.pager.getPageWriter(rootPage, maxFrame)
 	firstFb := pg.header.firstFreeBlk
 	db.pager.releasePage(pg)
 	db.pager.endRead(slot)
@@ -1975,7 +1975,7 @@ func TestIntegrityCheck_FreeblockSizeTooSmall_Deterministic(t *testing.T) {
 		require.NoError(t, tx.Commit())
 
 		maxFrame, slot, _ = db.pager.beginRead()
-		pg, _ = db.pager.getPageAt(rootPage, maxFrame)
+		pg, _ = db.pager.getPageWriter(rootPage, maxFrame)
 		firstFb = pg.header.firstFreeBlk
 		db.pager.releasePage(pg)
 		db.pager.endRead(slot)
@@ -2208,7 +2208,7 @@ func TestIntegrityCheck_InteriorCellExtendsOffPage(t *testing.T) {
 
 	// Verify root is interior
 	mf, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, mf)
+	pg, _ := db.pager.getPageWriter(rootPage, mf)
 	require.True(t, pg.header.isInterior(), "root must be interior")
 	require.True(t, pg.header.cellCount >= 1, "need cells")
 	origCellOff := int(pg.getCellOffset(0))
@@ -2317,7 +2317,7 @@ func TestIntegrityCheck_InteriorCorruptKey(t *testing.T) {
 
 	// Verify root is interior
 	mf, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, mf)
+	pg, _ := db.pager.getPageWriter(rootPage, mf)
 	require.True(t, pg.header.isInterior())
 	require.True(t, pg.header.cellCount >= 1)
 	// Get a valid cell to use as template
@@ -2404,7 +2404,7 @@ func TestIntegrityCheck_ChildDepthDiffers_RightChild(t *testing.T) {
 	rootPage := ns.rootPage
 
 	maxFrame, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, maxFrame)
+	pg, _ := db.pager.getPageWriter(rootPage, maxFrame)
 	isInterior := pg.header.isInterior()
 	nCells := int(pg.header.cellCount)
 	rightChild := pg.header.rightChild
@@ -2420,7 +2420,7 @@ func TestIntegrityCheck_ChildDepthDiffers_RightChild(t *testing.T) {
 	var leafPage uint32
 	maxFrame, slot, _ = db.pager.beginRead()
 	for pgno := uint32(2); pgno < 20; pgno++ {
-		p, e := db.pager.getPageAt(pgno, maxFrame)
+		p, e := db.pager.getPageWriter(pgno, maxFrame)
 		if e == nil && p.header.isLeaf() {
 			leafPage = pgno
 			db.pager.releasePage(p)
@@ -2479,7 +2479,7 @@ func TestIntegrityCheck_InteriorNoCells(t *testing.T) {
 	rootPage := ns.rootPage
 
 	maxFrame, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, maxFrame)
+	pg, _ := db.pager.getPageWriter(rootPage, maxFrame)
 	isInterior := pg.header.isInterior()
 	db.pager.releasePage(pg)
 	db.pager.endRead(slot)
@@ -2856,7 +2856,7 @@ func TestIntegrityCheck_OverflowChainWrongLength(t *testing.T) {
 
 	// Find the overflow page number
 	maxFrame, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, maxFrame)
+	pg, _ := db.pager.getPageWriter(rootPage, maxFrame)
 	cellOff := int(pg.getCellOffset(0))
 	cell, _, cerr := parseLeafCellWithSize(pg.data, cellOff, 512)
 	db.pager.releasePage(pg)
@@ -3481,10 +3481,11 @@ func TestGetPageReader_NilCacheFallback(t *testing.T) {
 	require.NoError(t, err)
 	defer db.pager.endRead(slot)
 
-	// With nil cache, should fall back to uncached read.
+	// With nil cache, should fall back to the writer cache path.
 	pg, err := db.pager.getPageReader(1, maxFrame, nil)
 	require.NoError(t, err)
-	assert.True(t, pg.uncached, "with nil cache, should return uncached page")
+	assert.NotNil(t, pg, "with nil cache, should still return a page")
+	assert.Equal(t, uint32(1), pg.pgno)
 	db.pager.releasePage(pg)
 }
 

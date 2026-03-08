@@ -106,7 +106,7 @@ func (ic *integrityChecker) checkList(isFreeList bool, firstPgno uint32, expecte
 		}
 		count++
 
-		pg, err := ic.pager.getPageAt(pgno, ic.walMaxFrame)
+		pg, err := ic.pager.getPageWriter(pgno, ic.walMaxFrame)
 		if err != nil {
 			ic.report("%s: unable to get page %d: %v", context, pgno, err)
 			return
@@ -231,7 +231,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 		return 0
 	}
 
-	pg, err := ic.pager.getPageAt(pgno, ic.walMaxFrame)
+	pg, err := ic.pager.getPageWriter(pgno, ic.walMaxFrame)
 	if err != nil {
 		ic.report("%s: unable to get page: %v", context, err)
 		return 0
@@ -437,7 +437,7 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 	defer db.pager.endRead(slot)
 
 	// Read page 1 to get the current header
-	pg1, err := db.pager.getPageAt(1, maxFrame)
+	pg1, err := db.pager.getPageWriter(1, maxFrame)
 	if err != nil {
 		return err
 	}
@@ -499,7 +499,7 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 
 	// 2. Check master B-tree (page 1) structure
 	ic.treeName = "master"
-	pg1, err = db.pager.getPageAt(1, maxFrame)
+	pg1, err = db.pager.getPageWriter(1, maxFrame)
 	if err != nil {
 		return err
 	}

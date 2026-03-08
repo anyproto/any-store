@@ -460,8 +460,8 @@ func TestSharedCache_EvictionUnderConcurrentLoad(t *testing.T) {
 // -------------------------------------------------------------------
 // Flow 6: Reader overflow chain during active spill
 //
-// readOverflowChainMVCC uses readPageUncached (correct for MVCC).
-// readOverflowChainInternal non-MVCC path uses getPage (shared cache).
+// readOverflowChainReader uses getPageReader (correct for MVCC).
+// readOverflowChainAt non-MVCC path uses getPage (shared cache).
 // Verify readers with large overflow values see consistent data during spill.
 // -------------------------------------------------------------------
 

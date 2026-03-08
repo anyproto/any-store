@@ -97,7 +97,7 @@ func TestTryCheckpoint(t *testing.T) {
 }
 
 // ============================================================
-// readPageMVCC — 66.7% coverage (needs pgno=0 path)
+// getPageReader — 66.7% coverage (needs pgno=0 path)
 // ============================================================
 
 func TestReadPageMVCC_InvalidPage(t *testing.T) {
@@ -107,7 +107,7 @@ func TestReadPageMVCC_InvalidPage(t *testing.T) {
 	require.NoError(t, p.open())
 	defer p.close()
 
-	_, err := p.readPageMVCC(0, 0)
+	_, err := p.getPageReader(0, 0, nil)
 	assert.ErrorIs(t, err, ErrInvalidPage)
 }
 
@@ -133,9 +133,8 @@ func TestReadPageMVCC_ValidPage(t *testing.T) {
 	// Now do an MVCC read
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
-	pg2, err := p.readPageMVCC(1, mf2)
+	pg2, err := p.getPageReader(1, mf2, nil)
 	require.NoError(t, err)
-	assert.True(t, pg2.uncached)
 	p.releasePage(pg2)
 	p.endRead(slot2)
 }
@@ -620,7 +619,7 @@ func TestAllocateFromFreelist_UseTrunkItself(t *testing.T) {
 }
 
 // ============================================================
-// readPageUncached — various branches (80.6%)
+// getPageReader — various branches (80.6%)
 // ============================================================
 
 func TestReadPageUncached_ReadFromDisk(t *testing.T) {
@@ -631,9 +630,8 @@ func TestReadPageUncached_ReadFromDisk(t *testing.T) {
 	defer p.close()
 
 	// Read page 1 from disk (no WAL frames)
-	pg, err := p.readPageUncached(1, 0)
+	pg, err := p.getPageReader(1, 0, nil)
 	require.NoError(t, err)
-	assert.True(t, pg.uncached)
 	p.releasePage(pg)
 }
 
@@ -645,15 +643,13 @@ func TestReadPageUncached_PageBeyondDbSize(t *testing.T) {
 	defer p.close()
 
 	// Page 999 > dbSize(1), so it's zero-filled (not an error)
-	pg, err := p.readPageUncached(999, 0)
+	pg, err := p.getPageReader(999, 0, nil)
 	require.NoError(t, err)
-	assert.True(t, pg.uncached)
 	p.releasePage(pg)
 
 	// Page 1 is within dbSize and exists in file -> read from disk
-	pg2, err := p.readPageUncached(1, 0)
+	pg2, err := p.getPageReader(1, 0, nil)
 	require.NoError(t, err)
-	assert.True(t, pg2.uncached)
 	p.releasePage(pg2)
 }
 
@@ -665,8 +661,8 @@ func TestReadPageUncached_InMemoryFallback(t *testing.T) {
 	require.NoError(t, p.open())
 	defer p.close()
 
-	// In memory mode, readPageUncached falls back to pcache
-	pg, err := p.readPageUncached(1, 0)
+	// In memory mode, getPageReader falls back to pcache
+	pg, err := p.getPageReader(1, 0, nil)
 	require.NoError(t, err)
 	p.releasePage(pg)
 }
@@ -682,7 +678,7 @@ func TestGetPageAt_InvalidPage(t *testing.T) {
 	require.NoError(t, p.open())
 	defer p.close()
 
-	_, err := p.getPageAt(0, 0)
+	_, err := p.getPageWriter(0, 0)
 	assert.ErrorIs(t, err, ErrInvalidPage)
 }
 
@@ -695,7 +691,7 @@ func TestGetPageAt_InMemoryNullFile(t *testing.T) {
 	defer p.close()
 
 	// Page 1 should be in cache (initNewDB puts it there for InMemory)
-	pg, err := p.getPageAt(1, 0)
+	pg, err := p.getPageWriter(1, 0)
 	require.NoError(t, err)
 	p.releasePage(pg)
 }
@@ -1016,7 +1012,7 @@ func TestWriteOverflowChain_NotWriter(t *testing.T) {
 }
 
 // ============================================================
-// readOverflowChainInternal — branches (93.1%)
+// readOverflowChainAt — branches (93.1%)
 // ============================================================
 
 func TestReadOverflowChainInternal_CorruptPageNumbers(t *testing.T) {
@@ -1067,7 +1063,7 @@ func TestReadOverflowChainMVCC(t *testing.T) {
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
 	buf := make([]byte, len(data))
-	err = p.readOverflowChainMVCC(firstPg, buf, mf2)
+	err = p.readOverflowChainReader(firstPg, buf, mf2, nil)
 	require.NoError(t, err)
 	assert.Equal(t, data, buf)
 	p.endRead(slot2)
@@ -2333,7 +2329,7 @@ func TestGetPageAt_CacheHitDirtyPage(t *testing.T) {
 	p.releasePage(pg)
 
 	// getPageAt should return the dirty page as-is
-	pg2, err := p.getPageAt(1, mf)
+	pg2, err := p.getPageWriter(1, mf)
 	require.NoError(t, err)
 	assert.True(t, pg2.dirty)
 	p.releasePage(pg2)
@@ -2374,10 +2370,10 @@ func TestGetPageAt_CacheHitNewerVersion(t *testing.T) {
 	p.endRead(slot2)
 
 	// Now read at old snapshot: page 1 is cached at newer version,
-	// so getPageAt should fallback to readPageUncached
+	// so getPageWriter should fallback to getPageReader
 	mf3, slot3, err := p.beginRead()
 	require.NoError(t, err)
-	pg3, err := p.getPageAt(1, 1) // old maxFrame
+	pg3, err := p.getPageWriter(1, 1) // old maxFrame
 	require.NoError(t, err)
 	p.releasePage(pg3)
 	_ = mf3
@@ -2801,7 +2797,7 @@ func TestGetPageAt_InMemory_CacheMiss(t *testing.T) {
 	// Read page 2 with WAL maxFrame
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
-	pgR, err := p.getPageAt(pg2.pgno, mf2)
+	pgR, err := p.getPageWriter(pg2.pgno, mf2)
 	require.NoError(t, err)
 	p.releasePage(pgR)
 	p.endRead(slot2)
@@ -2831,7 +2827,7 @@ func TestGetPageAt_ReadFromWAL(t *testing.T) {
 
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
-	pg2, err := p.getPageAt(1, mf2)
+	pg2, err := p.getPageWriter(1, mf2)
 	require.NoError(t, err)
 	assert.Equal(t, uint32(1), pg2.pgno)
 	p.releasePage(pg2)
@@ -2839,7 +2835,7 @@ func TestGetPageAt_ReadFromWAL(t *testing.T) {
 }
 
 // ============================================================
-// Additional: readPageUncached from WAL (line 426-434)
+// Additional: getPageReader from WAL (line 426-434)
 // ============================================================
 
 func TestReadPageUncached_FromWAL(t *testing.T) {
@@ -2865,16 +2861,15 @@ func TestReadPageUncached_FromWAL(t *testing.T) {
 	// Read page 1 uncached from WAL
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
-	pg2, err := p.readPageUncached(1, mf2)
+	pg2, err := p.getPageReader(1, mf2, nil)
 	require.NoError(t, err)
-	assert.True(t, pg2.uncached)
 	assert.Equal(t, uint32(1), pg2.pgno)
 	p.releasePage(pg2)
 	p.endRead(slot2)
 }
 
 // ============================================================
-// Additional: readPageUncached InMemory fallback pcache copy (line 454-461)
+// Additional: getPageReader InMemory fallback pcache copy (line 454-461)
 // ============================================================
 
 func TestReadPageUncached_InMemory_PcacheCopy(t *testing.T) {
@@ -2886,14 +2881,13 @@ func TestReadPageUncached_InMemory_PcacheCopy(t *testing.T) {
 	defer p.close()
 
 	// Page 1 is in pcache (initNewDB populates it for InMemory)
-	// Read page 1 uncached with walMaxFrame=0 (no WAL frames) -> falls through to pcache
-	pg, err := p.readPageUncached(1, 0)
+	// Read page 1 with walMaxFrame=0 (no WAL frames) -> falls through to pcache
+	pg, err := p.getPageReader(1, 0, nil)
 	require.NoError(t, err)
-	assert.True(t, pg.uncached)
 	p.releasePage(pg)
 
 	// Try reading a page not in pcache
-	pg2, err := p.readPageUncached(999, 0)
+	pg2, err := p.getPageReader(999, 0, nil)
 	require.NoError(t, err)
 	// Should be zero-filled
 	allZero := true
@@ -3125,7 +3119,7 @@ func TestFreeOverflowChain_InvalidNextPgno(t *testing.T) {
 }
 
 // ============================================================
-// Additional: readOverflowChainInternal max iteration (line 1375-1377)
+// Additional: readOverflowChainAt max iteration (line 1375-1377)
 // ============================================================
 
 func TestReadOverflowChain_InvalidPgno(t *testing.T) {
@@ -3166,7 +3160,7 @@ func TestReadOverflowChain_InvalidPgno(t *testing.T) {
 }
 
 // ============================================================
-// Additional: readOverflowChainInternal MVCC path (line 1382)
+// Additional: readOverflowChainAt MVCC path (line 1382)
 // ============================================================
 
 func TestReadOverflowChain_MVCCPath(t *testing.T) {
@@ -3197,7 +3191,7 @@ func TestReadOverflowChain_MVCCPath(t *testing.T) {
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
 	buf := make([]byte, len(data))
-	err = p.readOverflowChainMVCC(firstPg, buf, mf2)
+	err = p.readOverflowChainReader(firstPg, buf, mf2, nil)
 	require.NoError(t, err)
 	assert.Equal(t, data, buf)
 	p.endRead(slot2)
@@ -3395,7 +3389,7 @@ func TestGetPageAt_ReadFromFile(t *testing.T) {
 	// Read from file (WAL maxFrame=0 after truncate)
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
-	pgR, err := p.getPageAt(pg2.pgno, mf2)
+	pgR, err := p.getPageWriter(pg2.pgno, mf2)
 	require.NoError(t, err)
 	p.releasePage(pgR)
 	p.endRead(slot2)
@@ -3582,7 +3576,7 @@ func TestGetPageAt_WALReadFrameError(t *testing.T) {
 	// Close the WAL file to cause readFrame to fail
 	p.wal.file.Close()
 
-	_, err = p.getPageAt(pgno, mf2)
+	_, err = p.getPageWriter(pgno, mf2)
 	assert.Error(t, err)
 	p.endRead(slot2)
 }
@@ -3608,7 +3602,7 @@ func TestGetPageAt_InMemory_ZeroFill(t *testing.T) {
 	p.writerCache.clear()
 
 	// getPageAt for page 3 should zero-fill (InMemory, no file, cache miss)
-	pg, err := p.getPageAt(3, mf)
+	pg, err := p.getPageWriter(3, mf)
 	require.NoError(t, err)
 	// Verify zero-filled
 	allZero := true
@@ -3885,9 +3879,9 @@ func TestWriteOverflowChain_AllocateError(t *testing.T) {
 	p.endRead(slot)
 }
 
-// --- pager.go:1375-1377 readOverflowChainInternal() maxIter exceeded ---
+// --- pager.go:1375-1377 readOverflowChainAt() maxIter exceeded ---
 func TestReadOverflowChain_MaxIterExceeded(t *testing.T) {
-	// The maxIter protection in readOverflowChainInternal is unreachable because
+	// The maxIter protection in readOverflowChainAt is unreachable because
 	// maxIter = len(buf)/usable + 2, which means the buffer fills before maxIter
 	// is exceeded. Test the bounds checking path (pgno > dbSize) instead.
 	dir := t.TempDir()
@@ -4632,7 +4626,7 @@ func TestGetPageAt_CleanPageStaleSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf2)
 
-	cachedPg, err := p.getPageAt(pgno, mf2)
+	cachedPg, err := p.getPageWriter(pgno, mf2)
 	require.NoError(t, err)
 	p.releasePage(cachedPg)
 
@@ -4647,12 +4641,12 @@ func TestGetPageAt_CleanPageStaleSnapshot(t *testing.T) {
 	p.endRead(slot2)
 
 	// Now read with the OLD maxFrame (mf2) - the cached page should have
-	// latestFrame > mf2, triggering readPageUncached
+	// latestFrame > mf2, triggering getPageReader
 	mf3, slot3, err := p.beginRead()
 	require.NoError(t, err)
 
 	// Use mf2 (old snapshot) to trigger the stale cache path
-	stale, err := p.getPageAt(pgno, mf2)
+	stale, err := p.getPageWriter(pgno, mf2)
 	require.NoError(t, err)
 	p.releasePage(stale)
 	_ = mf3
@@ -6202,7 +6196,7 @@ func TestCov2_WriteOverflowChain_AllocatePageError(t *testing.T) {
 	t.Skip("BUG: L1306-1308 requires allocatePage to fail during overflow chain write - defensive I/O error path")
 }
 
-// --- pager.go L1375-1377: max iteration error in readOverflowChainInternal ---
+// --- pager.go L1375-1377: max iteration error in readOverflowChainAt ---
 // maxIter = len(buf)/usable + 2, and the loop can do at most
 // ceil(len(buf)/usable) iterations before off >= len(buf). Since
 // ceil(len(buf)/usable) <= len(buf)/usable + 1 < maxIter, the loop always
@@ -6892,19 +6886,19 @@ func TestPagerStressThenCommit(t *testing.T) {
 	require.NoError(t, err)
 	defer p.endRead(slot2)
 
-	rpg2, err := p.getPageAt(pg2no, mf2)
+	rpg2, err := p.getPageWriter(pg2no, mf2)
 	require.NoError(t, err)
 	assert.Equal(t, "page2-data", string(rpg2.data[100:110]),
 		"spilled page data should be readable after commit")
 	p.writerCache.release(rpg2)
 
-	rpg3, err := p.getPageAt(pg3no, mf2)
+	rpg3, err := p.getPageWriter(pg3no, mf2)
 	require.NoError(t, err)
 	assert.Equal(t, "page3-data", string(rpg3.data[100:110]),
 		"normally committed page data should be readable")
 	p.writerCache.release(rpg3)
 
-	rpg4, err := p.getPageAt(pg4no, mf2)
+	rpg4, err := p.getPageWriter(pg4no, mf2)
 	require.NoError(t, err)
 	assert.Equal(t, "page4-data", string(rpg4.data[100:110]),
 		"normally committed page data should be readable")
@@ -6971,7 +6965,7 @@ func TestPagerStressThenRollback(t *testing.T) {
 	require.NoError(t, err)
 	defer p.endRead(slot3)
 
-	rpg2, err := p.getPageAt(pg2no, mf3)
+	rpg2, err := p.getPageWriter(pg2no, mf3)
 	require.NoError(t, err)
 	assert.Equal(t, "original!!", string(rpg2.data[100:110]),
 		"page should have original data after rollback of spilled transaction")
@@ -7052,13 +7046,13 @@ func TestPagerStressThenSavepointRollback(t *testing.T) {
 	require.NoError(t, err)
 	defer p.endRead(slot2)
 
-	rpg2, err := p.getPageAt(pg2no, mf2)
+	rpg2, err := p.getPageWriter(pg2no, mf2)
 	require.NoError(t, err)
 	assert.Equal(t, "before-sp!", string(rpg2.data[100:110]),
 		"committed data should reflect pre-savepoint state")
 	p.writerCache.release(rpg2)
 
-	rpg3, err := p.getPageAt(pg3no, mf2)
+	rpg3, err := p.getPageWriter(pg3no, mf2)
 	require.NoError(t, err)
 	assert.Equal(t, "pg3-init!!", string(rpg3.data[100:110]),
 		"page 3 data should be committed correctly")
@@ -7120,7 +7114,7 @@ func TestSavepointRollbackReDirtiesSpilledPages(t *testing.T) {
 	require.NoError(t, err)
 	defer p.endRead(slot2)
 
-	rpg2, err := p.getPageAt(pg2no, mf2)
+	rpg2, err := p.getPageWriter(pg2no, mf2)
 	require.NoError(t, err)
 	assert.Equal(t, "pre-save!!", string(rpg2.data[100:110]),
 		"pre-savepoint data must survive commit after spill + savepoint rollback")
@@ -7180,7 +7174,7 @@ func TestLargeTransactionBoundedMemory(t *testing.T) {
 	defer p.endRead(slot2)
 
 	for i, pgno := range pageNos {
-		pg, err := p.getPageAt(pgno, mf2)
+		pg, err := p.getPageWriter(pgno, mf2)
 		require.NoError(t, err, "failed to read page %d (pgno=%d)", i, pgno)
 		expected := fmt.Sprintf("page-%04d", i)
 		assert.Equal(t, expected, string(pg.data[100:109]),
@@ -7230,7 +7224,7 @@ func TestSpillThenCheckpoint(t *testing.T) {
 	defer p.endRead(slot2)
 
 	for i, pgno := range pageNos {
-		pg, err := p.getPageAt(pgno, mf2)
+		pg, err := p.getPageWriter(pgno, mf2)
 		require.NoError(t, err, "failed to read page %d after checkpoint", pgno)
 		expected := fmt.Sprintf("ckpt-%04d", i)
 		assert.Equal(t, expected, string(pg.data[100:109]),
@@ -7287,7 +7281,7 @@ func TestSpillMultipleRounds(t *testing.T) {
 	defer p.endRead(slot2)
 
 	for i, pgno := range pageNos {
-		pg, err := p.getPageAt(pgno, mf2)
+		pg, err := p.getPageWriter(pgno, mf2)
 		require.NoError(t, err)
 		expected := fmt.Sprintf("wave-%04d", i)
 		assert.Equal(t, expected, string(pg.data[100:109]),
@@ -7356,13 +7350,13 @@ func TestConcurrentReaderDuringSpill(t *testing.T) {
 	}
 
 	// Reader should still see the original committed data, not spilled data
-	rpg2, err := p.getPageAt(pg2no, readerMf)
+	rpg2, err := p.getPageWriter(pg2no, readerMf)
 	require.NoError(t, err)
 	assert.Equal(t, "baseline!!", string(rpg2.data[100:110]),
 		"reader should see pre-spill committed data for page 2")
 	p.writerCache.release(rpg2)
 
-	rpg3, err := p.getPageAt(pg3no, readerMf)
+	rpg3, err := p.getPageWriter(pg3no, readerMf)
 	require.NoError(t, err)
 	assert.Equal(t, "base-pg3!!", string(rpg3.data[100:110]),
 		"reader should see original data for unmodified page 3")
@@ -7381,7 +7375,7 @@ func TestConcurrentReaderDuringSpill(t *testing.T) {
 	require.NoError(t, err)
 	defer p.endRead(slot3)
 
-	rpg2new, err := p.getPageAt(pg2no, mf3)
+	rpg2new, err := p.getPageWriter(pg2no, mf3)
 	require.NoError(t, err)
 	assert.Equal(t, "modified!!", string(rpg2new.data[100:110]),
 		"new reader should see committed modified data")
@@ -7432,7 +7426,7 @@ func TestSpillInMemoryMode(t *testing.T) {
 	defer p.endRead(slot2)
 
 	for i, pgno := range pageNos {
-		pg, err := p.getPageAt(pgno, mf2)
+		pg, err := p.getPageWriter(pgno, mf2)
 		require.NoError(t, err, "failed to read page %d in InMemory mode", pgno)
 		expected := fmt.Sprintf("mem-%05d", i)
 		assert.Equal(t, expected, string(pg.data[100:109]),

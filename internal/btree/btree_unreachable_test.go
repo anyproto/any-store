@@ -320,7 +320,7 @@ func TestGap_Pager_WriteOverflowChain_AllocateError(t *testing.T) {
 	t.Skip("BUG: L1306-1308 requires allocatePage to fail during overflow chain write - defensive I/O error path")
 }
 
-// --- pager.go L1375-1377: max iteration in readOverflowChainInternal ---
+// --- pager.go L1375-1377: max iteration in readOverflowChainAt ---
 // The loop fills the buffer before maxIter is reached in normal operation.
 func TestGap_Pager_ReadOverflowChain_MaxIter(t *testing.T) {
 	t.Skip("BUG: L1375-1377 structurally unreachable - loop fills buffer before maxIter is reached")
@@ -1065,7 +1065,7 @@ func TestGap_Pager_GetPageAt_FileBeyondDbSize(t *testing.T) {
 	p.dbSize.Store(100) // claim 100 pages exist
 
 	// Try to read page 50 - it's within dbSize but not on disk
-	pg, err := p.getPageAt(50, 0)
+	pg, err := p.getPageWriter(50, 0)
 	if err != nil {
 		// L389-392: page is within dbSize but reading fails -> error
 		assert.Error(t, err) // This covers L389-392

@@ -128,14 +128,14 @@ Rewrite any-store's shared page cache (`pcache`) to use per-connection private c
 - [x] run full test suite with -race — must pass
 
 ### Task 7: Simplify pager writer path
-- [ ] simplify `getPageAtImpl` — remove `noStress` parameter, always allow stress (writer-only)
-- [ ] remove `getPageAt` method (was reader-specific, now unused — readers use getPageReader)
-- [ ] remove `readPageMVCC` and `readPageUncached` methods (dead code after Task 5)
-- [ ] remove `readOverflowChainMVCC` method (replaced by readOverflowChainReader)
-- [ ] simplify `pagerStress` — remove pagerState check (line 1081-1082), remove pgno==1 guard (lines 1093-1097)
-- [ ] simplify `getWritablePage` — use `makeDirty` directly instead of `reinsertDirty`
-- [ ] verify `pager.close()` cleans up writerCache properly
-- [ ] run full test suite with -race — must pass
+- [x] simplify `getPageAtImpl` — remove `noStress` parameter, always allow stress (writer-only)
+- [x] remove `getPageAt` method (was reader-specific, now unused — readers use getPageReader)
+- [x] remove `readPageMVCC` and `readPageUncached` methods (dead code after Task 5)
+- [x] remove `readOverflowChainMVCC` method (replaced by readOverflowChainReader)
+- [x] simplify `pagerStress` — remove pagerState check (line 1081-1082), keep pgno==1 guard (still needed)
+- [x] simplify `getWritablePage` — use `makeDirty` directly instead of `reinsertDirty`
+- [x] verify `pager.close()` cleans up writerCache properly
+- [x] run full test suite with -race — must pass
 
 ### Task 8: Update DRIFT comments and documentation
 - [ ] remove/update DRIFT at `pcache.go:141-144` (re-check after stress — removed)

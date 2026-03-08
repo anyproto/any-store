@@ -171,7 +171,7 @@ func TestDiagnoseCrashCorruption(t *testing.T) {
 func findKeyPage(t *testing.T, p *pager, rootPgno, maxFrame uint32, key []byte) {
 	pgno := rootPgno
 	for depth := 0; depth < 10; depth++ {
-		pg, err := p.getPageAt(pgno, maxFrame)
+		pg, err := p.getPageWriter(pgno, maxFrame)
 		if err != nil {
 			t.Logf("    page trace: depth=%d pgno=%d error=%v", depth, pgno, err)
 			return

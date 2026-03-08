@@ -687,7 +687,7 @@ type ReadTx struct {
 
 // txGetPage fetches a page respecting MVCC snapshot isolation.
 // For write transactions, dirty pages from writePages are returned directly.
-// For read transactions, readPageMVCC bypasses dirty pages from uncommitted writers.
+// For read transactions, getPageReader uses a private cache for snapshot isolation.
 func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 	if tx.writable {
 		if pg := tx.pager.writePages[pgno]; pg != nil {
@@ -834,8 +834,8 @@ func (tx *ReadTx) Count(ns *Namespace) (int, error) {
 }
 
 // GetNamespace returns a Namespace handle for the given name.
-// Uses the transaction's WAL snapshot via getPageAt, which is safe to call
-// concurrently with writer goroutines (does not access pager.writePages).
+// Uses the transaction's WAL snapshot via getPageReader with the reader's
+// private cache. Safe to call concurrently with the writer goroutine.
 func (tx *ReadTx) GetNamespace(name string) (*Namespace, error) {
 	if tx.closed {
 		return nil, ErrTxClosed

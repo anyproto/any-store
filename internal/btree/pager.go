@@ -391,7 +391,7 @@ func (p *pager) beginWrite() error {
 // getPage returns the page with the given page number, reading from WAL or disk as needed.
 // Uses the pager's walMaxFrame (set during beginRead for the current writer).
 // If this is a write transaction, dirty pages from writePages are returned
-// directly, bypassing the MVCC snapshot check in getPageAt. This allows the
+// directly, bypassing the MVCC snapshot check in getPageWriter. This allows the
 // writer to see its own uncommitted changes while readers bypass dirty pages.
 func (p *pager) getPage(pgno uint32) (*page, error) {
 	// Fast path for writer: return its own dirty pages directly.
@@ -404,13 +404,8 @@ func (p *pager) getPage(pgno uint32) (*page, error) {
 	return p.getPageWriter(pgno, p.walMaxFrame.Load())
 }
 
-// getPageAt returns the page with the given page number, using the specified
-// walMaxFrame for snapshot isolation.
-func (p *pager) getPageAt(pgno, walMaxFrame uint32) (*page, error) {
-	return p.getPageAtImpl(pgno, walMaxFrame)
-}
-
-// getPageWriter returns the page for the writer context.
+// getPageWriter returns a page using the writer's cache, reading from
+// WAL or disk on cache miss. Used by the writer and integrity checker.
 func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 	return p.getPageAtImpl(pgno, walMaxFrame)
 }
@@ -430,8 +425,12 @@ func (p *pager) getPageAtImpl(pgno, walMaxFrame uint32) (*page, error) {
 			if latestFrame == 0 || latestFrame <= walMaxFrame {
 				return pg, nil
 			}
+			// Stale clean page — release and read a fresh uncached copy.
+			// We don't discard from cache here because another reference
+			// might exist (e.g., in writePages after a spill). The stale
+			// page will eventually be evicted from LRU.
 			p.writerCache.release(pg)
-			return p.readPageUncached(pgno, walMaxFrame)
+			return p.readTempPage(pgno, walMaxFrame)
 		}
 		return pg, nil
 	}
@@ -493,17 +492,17 @@ func (p *pager) getPageAtImpl(pgno, walMaxFrame uint32) (*page, error) {
 	return pg, nil
 }
 
-// readPageUncached reads a page directly from WAL or disk into a standalone
-// page object that is NOT stored in the shared cache. This is used for MVCC
-// snapshot isolation when the cache holds a newer version of the page than
-// what the reader's snapshot should see.
-func (p *pager) readPageUncached(pgno, walMaxFrame uint32) (*page, error) {
+// readTempPage reads a page into a standalone temporary page object that is
+// NOT stored in any cache. Used by getPageAtImpl when the writer cache holds
+// a stale clean page — the temp page avoids disturbing the cache while
+// returning the correct snapshot data.
+func (p *pager) readTempPage(pgno, walMaxFrame uint32) (*page, error) {
 	pg := p.acquireTempPage()
 	pg.pgno = pgno
 	pg.pinCount = 1
 	pg.uncached = true
 
-	// Try to read from WAL first
+	// Try to read from WAL first.
 	if walMaxFrame > 0 {
 		frame := p.wal.index.get(pgno, walMaxFrame)
 		if frame > 0 {
@@ -515,14 +514,10 @@ func (p *pager) readPageUncached(pgno, walMaxFrame uint32) (*page, error) {
 				pg.header.deserialize(pg.data[off:])
 				return pg, nil
 			}
-			// readFrame can fail if the WAL was reset (checkpointed and
-			// truncated) between the index.get lookup and now. In this case,
-			// the page data has been written to the database file by the
-			// checkpoint, so we fall through to reading from disk.
 		}
 	}
 
-	// Read from database file
+	// Read from database file.
 	if p.file != nil {
 		offset := int64(pgno-1) * int64(p.pageSize)
 		_, err := p.file.ReadAt(pg.data, offset)
@@ -534,7 +529,6 @@ func (p *pager) readPageUncached(pgno, walMaxFrame uint32) (*page, error) {
 			clear(pg.data)
 		}
 	} else if p.master != nil {
-		// InMemory: read from masterStore (replaces pcache as "disk")
 		if !p.master.readPageInto(pgno, pg.data) {
 			clear(pg.data)
 		}
@@ -553,17 +547,6 @@ func (p *pager) readPageUncached(pgno, walMaxFrame uint32) (*page, error) {
 	return pg, nil
 }
 
-// readPageMVCC returns a page with snapshot isolation for committed data.
-// Always returns an uncached copy to avoid data races with the writer goroutine,
-// which may dirty and modify cached pages at any time. The uncached page reads
-// from the WAL (at the reader's snapshot point) or from disk.
-func (p *pager) readPageMVCC(pgno, walMaxFrame uint32) (*page, error) {
-	if pgno == 0 {
-		return nil, ErrInvalidPage
-	}
-	return p.readPageUncached(pgno, walMaxFrame)
-}
-
 // getPageReader returns a page using the reader's private cache for snapshot
 // isolation. On cache hit the page is returned directly (all pages in a reader
 // cache were populated during this transaction, so they're valid for this
@@ -573,9 +556,9 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 	if pgno == 0 {
 		return nil, ErrInvalidPage
 	}
-	// If no reader cache provided, fall back to uncached reads.
+	// If no reader cache provided, fall back to the writer cache path.
 	if cache == nil {
-		return p.readPageUncached(pgno, walMaxFrame)
+		return p.getPageWriter(pgno, walMaxFrame)
 	}
 
 	// Check reader cache.
@@ -1163,28 +1146,21 @@ func (p *pager) readWalFrameData(frame uint32, buf []byte) error {
 	return err
 }
 
-// pagerStress is the pcache stress callback invoked when the cache is full
-// and all clean pages are exhausted. It spills a single dirty page to the WAL
-// without committing, making it clean and evictable.
+// pagerStress is the pcache stress callback invoked when the writer's cache
+// is full and all clean pages are exhausted. It spills a single dirty page
+// to the WAL without committing, making it clean and evictable.
+// Only the writer's cache has xStress set; reader caches have no stress callback.
 // Modeled after SQLite's pagerStress() (pager.c:4609-4681).
 func (p *pager) pagerStress(pg *page) error {
-	// Defense-in-depth: verify pager is in writer state. With per-connection
-	// caches, only the writer's cache has xStress set, but verify anyway.
-	st := pagerState(p.state.Load())
-	if st == pagerError || st != pagerWriter {
-		return nil
-	}
-
 	// Do not spill if OFF or ROLLBACK flags are set (SQLite pager.c:4636-4641).
 	if p.doNotSpill&(spillFlagOff|spillFlagRollback) != 0 {
 		return nil
 	}
 
-	// DRIFT from SQLite: SQLite does not explicitly check pgno==1 in pagerStress.
-	// Instead, page 1 is structurally protected: it stays pinned (referenced)
-	// throughout the transaction, so pcache never selects it as a spill victim.
-	// We add an explicit guard because page 1 may become unpinned between
-	// b-tree operations in our implementation.
+	// Page 1 contains the database header and must not be spilled.
+	// In SQLite, page 1 stays pinned throughout the transaction so pcache
+	// never selects it as a victim. In our implementation, page 1 may become
+	// unpinned between b-tree operations, so we guard it explicitly.
 	if pg.pgno == 1 {
 		return nil
 	}
@@ -1716,27 +1692,52 @@ func (p *pager) writeOverflowChain(data []byte) (uint32, error) {
 	return firstPgno, nil
 }
 
-// readOverflowChainAt reads data from a chain of overflow pages into buf
-// using the specified walMaxFrame for snapshot isolation.
-// Uses getPageAt (shared cache) — suitable for the writer who needs to see
-// its own dirty pages. Readers should use readOverflowChainMVCC instead to
-// avoid populating the cache with stale snapshot data.
+// readOverflowChainAt reads data from a chain of overflow pages into buf,
+// using the writer's page cache (getPage). Suitable for the writer path.
 func (p *pager) readOverflowChainAt(firstPgno uint32, buf []byte, walMaxFrame uint32) error {
-	return p.readOverflowChainInternal(firstPgno, buf, walMaxFrame, false)
-}
+	usable := overflowPageUsable(p.usableSize())
+	pgno := firstPgno
+	off := 0
 
-// readOverflowChainMVCC reads overflow data bypassing the shared page cache.
-// This prevents readers from polluting the cache with old-snapshot data that
-// the writer could later read as current, causing on-disk corruption.
-func (p *pager) readOverflowChainMVCC(firstPgno uint32, buf []byte, walMaxFrame uint32) error {
-	return p.readOverflowChainInternal(firstPgno, buf, walMaxFrame, true)
+	// Compute max iterations to prevent infinite loops on circular chains (fix 8.2).
+	maxIter := len(buf)/usable + 2
+	if maxIter < 10 {
+		maxIter = 10
+	}
+	iter := 0
+	dbSize := p.dbSize.Load()
+
+	for pgno != 0 && off < len(buf) {
+		if pgno < 2 || pgno > dbSize {
+			return ErrCorrupt
+		}
+		iter++
+		if iter > maxIter {
+			return ErrCorrupt
+		}
+
+		pg, err := p.getPage(pgno)
+		if err != nil {
+			return err
+		}
+		chunk := usable
+		if chunk > len(buf)-off {
+			chunk = len(buf) - off
+		}
+		copy(buf[off:off+chunk], pg.data[4:4+chunk])
+		pgno = binary.BigEndian.Uint32(pg.data[0:4])
+		p.releasePage(pg)
+		off += chunk
+	}
+	return nil
 }
 
 // readOverflowChainReader reads overflow chain data using the reader's private
 // cache. Pages are cached across overflow reads within the same transaction.
+// Falls back to the writer path (readOverflowChainAt) if no reader cache.
 func (p *pager) readOverflowChainReader(firstPgno uint32, buf []byte, walMaxFrame uint32, cache *pcache) error {
 	if cache == nil {
-		return p.readOverflowChainMVCC(firstPgno, buf, walMaxFrame)
+		return p.readOverflowChainAt(firstPgno, buf, walMaxFrame)
 	}
 	usable := overflowPageUsable(p.usableSize())
 	pgno := firstPgno
@@ -1758,56 +1759,6 @@ func (p *pager) readOverflowChainReader(firstPgno uint32, buf []byte, walMaxFram
 			return ErrCorrupt
 		}
 		pg, err := p.getPageReader(pgno, walMaxFrame, cache)
-		if err != nil {
-			return err
-		}
-		chunk := usable
-		if chunk > len(buf)-off {
-			chunk = len(buf) - off
-		}
-		copy(buf[off:off+chunk], pg.data[4:4+chunk])
-		pgno = binary.BigEndian.Uint32(pg.data[0:4])
-		p.releasePage(pg)
-		off += chunk
-	}
-	return nil
-}
-
-func (p *pager) readOverflowChainInternal(firstPgno uint32, buf []byte, walMaxFrame uint32, mvcc bool) error {
-	usable := overflowPageUsable(p.usableSize())
-	pgno := firstPgno
-	off := 0
-
-	// Compute max iterations to prevent infinite loops on circular chains (fix 8.2).
-	// The maximum number of overflow pages needed is ceil(len(buf) / usable).
-	maxIter := len(buf)/usable + 2
-	if maxIter < 10 {
-		maxIter = 10
-	}
-	iter := 0
-
-	dbSize := p.dbSize.Load()
-
-	for pgno != 0 && off < len(buf) {
-		// Bounds checking (fix 8.2): page numbers must be >= 2 and <= dbSize.
-		// Page 0 is invalid and page 1 is the database header page.
-		if pgno < 2 || pgno > dbSize {
-			return ErrCorrupt
-		}
-
-		// Max iteration counter to prevent infinite loops on circular chains (fix 8.2).
-		iter++
-		if iter > maxIter {
-			return ErrCorrupt
-		}
-
-		var pg *page
-		var err error
-		if mvcc {
-			pg, err = p.readPageUncached(pgno, walMaxFrame)
-		} else {
-			pg, err = p.getPage(pgno)
-		}
 		if err != nil {
 			return err
 		}
