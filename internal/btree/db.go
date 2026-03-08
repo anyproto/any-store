@@ -281,7 +281,7 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 	if c, ok := db.readerCachePool.Get().(*pcache); ok {
 		cache = c
 	} else {
-		cache = newPcache(int(db.opts.PageSize), db.readerCacheSize, true)
+		cache = newPcache(int(db.pager.pageSize), db.readerCacheSize, true)
 	}
 
 	tx := db.getReadTx()

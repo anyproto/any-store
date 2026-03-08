@@ -3398,8 +3398,7 @@ func TestMasterStore_InMemoryCheckpointBackfill(t *testing.T) {
 // ===== getPageReader and readOverflowChainReader coverage =====
 
 func TestGetPageReader_CacheHit(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	db, err := Open("", Options{PageSize: 4096, InMemory: true})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3535,8 +3534,7 @@ func TestGetPageReader_InMemoryFallback(t *testing.T) {
 }
 
 func TestGetPageReader_StaleEviction(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	db, err := Open("", Options{PageSize: 4096, InMemory: true})
 	require.NoError(t, err)
 	defer db.Close()
 

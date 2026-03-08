@@ -1114,9 +1114,17 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 
 	// No WAL frame for page 1; read from database file or header.
 	if p.file == nil {
-		// InMemory: use the pager's in-memory header which is updated on
-		// every commit. Avoids accessing writerCache from reader goroutines
-		// (pcache has no mutex, so concurrent access would be a data race).
+		// InMemory: read page 1 from masterStore which is protected by
+		// sync.RWMutex — safe for concurrent access from reader goroutines.
+		// We cannot read p.header directly because commit() mutates
+		// FileChangeCount/SchemaCookie without synchronization, which would
+		// be a data race with concurrent BeginRead callers.
+		var buf [dbHeaderSize]byte
+		if p.master != nil && p.master.readPageInto(1, buf[:]) {
+			return binary.BigEndian.Uint32(buf[24:28]), binary.BigEndian.Uint32(buf[40:44]), nil
+		}
+		// masterStore has no page 1 yet (before first checkpoint); header
+		// is safe to read because no concurrent writer exists at this point.
 		return p.header.FileChangeCount, p.header.SchemaCookie, nil
 	}
 	var buf [dbHeaderSize]byte
