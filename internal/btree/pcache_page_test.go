@@ -756,11 +756,18 @@ func TestMmapShm_FcntlLockError(t *testing.T) {
 	_ = savedFile.Close()
 	ms.file = savedFile // fd is now invalid
 
-	// lock should fail with bad fd
+	// lock should fail with bad fd — fcntl called because in-process counter is 0
 	err = ms.lock(0, lockShared)
 	assert.Error(t, err)
 
-	// unlock should also fail
+	// unlock is a no-op: the lock above failed so the in-process counter
+	// was never incremented. No fcntl call is made, so no error.
+	err = ms.unlock(0, lockShared)
+	assert.NoError(t, err)
+
+	// Verify fcntl error propagates through unlock: manually set the
+	// counter to simulate a held lock, then unlock triggers fcntl on bad fd.
+	ms.locks[0] = 1
 	err = ms.unlock(0, lockShared)
 	assert.Error(t, err)
 
@@ -3199,4 +3206,82 @@ func TestCov2_FcntlLock_OtherError(t *testing.T) {
 	assert.NotErrorIs(t, err, ErrBusy)
 
 	s.file = nil
+}
+
+// ===== page.cache backpointer coverage =====
+
+func TestPageCacheBackpointer_SetOnCreate(t *testing.T) {
+	pc := newPcache(4096, 100, true)
+
+	// Creating a page should set pg.cache to the owning pcache.
+	pg := pc.create(1)
+	assert.Equal(t, pc, pg.cache, "page.cache should point to owning pcache after create")
+	assert.Equal(t, uint32(1), pg.pgno)
+	assert.Equal(t, 1, pg.pinCount)
+}
+
+func TestPageCacheBackpointer_PreservedOnFetch(t *testing.T) {
+	pc := newPcache(4096, 100, true)
+
+	pg := pc.create(1)
+	pc.release(pg)
+
+	// Fetching should preserve the cache backpointer.
+	fetched := pc.fetch(1)
+	require.NotNil(t, fetched)
+	assert.Equal(t, pc, fetched.cache, "page.cache should be preserved after fetch")
+}
+
+func TestPageCacheBackpointer_ReleaseRoutesViaCache(t *testing.T) {
+	pc := newPcache(4096, 100, true)
+
+	pg := pc.create(1)
+	assert.Equal(t, pc, pg.cache)
+
+	// Release via the page's cache backpointer (simulating releasePage routing).
+	pg.cache.release(pg)
+	assert.Equal(t, 0, pg.pinCount)
+	assert.Equal(t, 1, pc.nClean, "page should be on LRU after release")
+}
+
+func TestPageCacheBackpointer_ClearedOnRecycle(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Create a page with a cache set, simulating a cached page being recycled.
+	pg := &page{
+		data:     make([]byte, 4096),
+		cache:    &pcache{},
+		uncached: true,
+		pgno:     42,
+	}
+
+	// recycleTempPage should clear pg.cache.
+	db.pager.recycleTempPage(pg)
+	assert.Nil(t, pg.cache, "page.cache should be nil after recycleTempPage")
+	assert.Equal(t, uint32(0), pg.pgno, "pgno should be zeroed")
+	assert.False(t, pg.uncached, "uncached should be false")
+}
+
+func TestPageCacheBackpointer_DifferentCaches(t *testing.T) {
+	pc1 := newPcache(4096, 100, true)
+	pc2 := newPcache(4096, 100, true)
+
+	pg1 := pc1.create(1)
+	pg2 := pc2.create(1)
+
+	assert.Equal(t, pc1, pg1.cache, "pg1 should point to pc1")
+	assert.Equal(t, pc2, pg2.cache, "pg2 should point to pc2")
+	assert.True(t, pg1.cache != pg2.cache, "different caches should have different backpointers")
+
+	// Releasing each page should route to the correct cache.
+	pg1.cache.release(pg1)
+	assert.Equal(t, 1, pc1.nClean)
+	assert.Equal(t, 0, pc2.nClean)
+
+	pg2.cache.release(pg2)
+	assert.Equal(t, 1, pc1.nClean)
+	assert.Equal(t, 1, pc2.nClean)
 }

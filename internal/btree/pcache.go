@@ -162,6 +162,7 @@ func (pc *pcache) createInternal(pgno uint32, noStress bool) *page {
 	p := &page{
 		pgno:     pgno,
 		data:     make([]byte, pc.pageSize),
+		cache:    pc,
 		pinCount: 1,
 	}
 	pc.pages[pgno] = p

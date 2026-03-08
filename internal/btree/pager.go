@@ -914,6 +914,7 @@ func (p *pager) recycleTempPage(pg *page) {
 	pg.pgno = 0
 	pg.dirty = false
 	pg.uncached = false
+	pg.cache = nil
 	pg.pinCount = 0
 	pg.header = pageHeader{}
 	pg.next = nil
@@ -932,6 +933,12 @@ func (p *pager) releasePage(pg *page) {
 	}
 	if pg.uncached {
 		p.recycleTempPage(pg)
+		return
+	}
+	// Route via the page's owning cache if set (supports per-connection caches).
+	// Fall back to the pager's shared cache for pages without a backpointer.
+	if pg.cache != nil {
+		pg.cache.release(pg)
 		return
 	}
 	p.cache.release(pg)

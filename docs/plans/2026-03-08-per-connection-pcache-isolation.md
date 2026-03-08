@@ -74,12 +74,12 @@ Rewrite any-store's shared page cache (`pcache`) to use per-connection private c
 - [x] run tests `cd internal/btree && go test -race -count=1 -timeout=300s ./...` — must pass
 
 ### Task 2: Add `cache *pcache` backpointer to page struct
-- [ ] add `cache *pcache` field to `page` struct in `internal/btree/page.go`
-- [ ] set `pg.cache` when pcache creates pages in `createInternal` (`internal/btree/pcache.go`)
-- [ ] update `releasePage` in `internal/btree/pager.go` to route via `pg.cache` when set (keep existing `uncached` and shared-cache paths as fallbacks)
-- [ ] update `recycleTempPage` to clear `pg.cache = nil`
-- [ ] write test verifying page.cache is set correctly after create and cleared after recycle
-- [ ] run tests — must pass
+- [x] add `cache *pcache` field to `page` struct in `internal/btree/page.go`
+- [x] set `pg.cache` when pcache creates pages in `createInternal` (`internal/btree/pcache.go`)
+- [x] update `releasePage` in `internal/btree/pager.go` to route via `pg.cache` when set (keep existing `uncached` and shared-cache paths as fallbacks)
+- [x] update `recycleTempPage` to clear `pg.cache = nil`
+- [x] write test verifying page.cache is set correctly after create and cleared after recycle
+- [x] run tests — must pass
 
 ### Task 3: Add masterStore for InMemory mode
 - [ ] add `masterStore` struct to `internal/btree/pager.go` with `readPageInto(pgno, dst)` and `writePage(pgno, src)` methods using `sync.RWMutex`
