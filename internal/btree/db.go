@@ -126,6 +126,9 @@ func Open(path string, opts Options) (*DB, error) {
 		opts.InProcess = true
 	}
 
+	// Lazy-init global page slab if not already configured via ConfigPageCache.
+	globalPageSlab.Init(int(opts.PageSize), defaultSlabPages)
+
 	// Prevent double-open of the same database file.
 	var canonicalPath string
 	if !opts.InMemory {

@@ -84,19 +84,19 @@ SQLite ref: `pcache.c:558` (`pcacheManageDirtyList(p, PCACHE_DIRTYLIST_FRONT)` o
 ### Task 3: Global slab allocator
 **New file `page_slab.go`. Process-global pre-allocated pool for `[]byte` page buffers.**
 SQLite ref: `pcache1.c:222-236` (pcache1_g struct), `pcache1.c:271-291` (sqlite3PCacheBufferSetup), `pcache1.c:341-374` (pcache1Alloc), `pcache1.c:379-406` (pcache1Free), `pcache1.c:518-524` (pcache1UnderMemoryPressure), `pcache1.c:350,389` (bUnderPressure AtomicStore).
-- [ ] create `internal/btree/page_slab.go` with `pageSlab` struct: `mu sync.Mutex`, `freeList [][]byte`, `nTotal int`, `nSlab int`, `nOverflow int`, `nReserve int`, `underPressure atomic.Bool`, `pageSize int`
-- [ ] implement `Init(pageSize, nPages int)` — pre-allocate nPages buffers, set `nReserve = nPages/10 + 1` (matches `pcache1.c:279`)
-- [ ] implement `Get() []byte` — pop from freeList under lock; if empty, `make([]byte, pageSize)` overflow; update `underPressure` (matches `pcache1.c:344-356`)
-- [ ] implement `Put(buf []byte)` — append to freeList under lock; update `underPressure` (matches `pcache1.c:379-391`)
-- [ ] implement `UnderPressure() bool` — atomic load (matches `pcache1.c:520`)
-- [ ] add `var globalPageSlab pageSlab` package-level singleton
-- [ ] add `ConfigPageCache(pageSize, nPages int)` public API to init the slab (mirrors `sqlite3_config(SQLITE_CONFIG_PAGECACHE)`)
-- [ ] add lazy init in `Open()` — if slab not initialized, init with default size based on first DB's page size
-- [ ] write test: Init, Get N pages, verify all returned, freeList empty
-- [ ] write test: Get beyond slab capacity, verify overflow works, `UnderPressure()` returns true
-- [ ] write test: Put pages back, verify `UnderPressure()` clears when freeList refills
-- [ ] write test: concurrent Get/Put from multiple goroutines (race detector)
-- [ ] run tests — must pass before next task
+- [x] create `internal/btree/page_slab.go` with `pageSlab` struct: `mu sync.Mutex`, `freeList [][]byte`, `nTotal int`, `nSlab int`, `nOverflow int`, `nReserve int`, `underPressure atomic.Bool`, `pageSize int`
+- [x] implement `Init(pageSize, nPages int)` — pre-allocate nPages buffers, set `nReserve = nPages/10 + 1` (matches `pcache1.c:279`)
+- [x] implement `Get() []byte` — pop from freeList under lock; if empty, `make([]byte, pageSize)` overflow; update `underPressure` (matches `pcache1.c:344-356`)
+- [x] implement `Put(buf []byte)` — append to freeList under lock; update `underPressure` (matches `pcache1.c:379-391`)
+- [x] implement `UnderPressure() bool` — atomic load (matches `pcache1.c:520`)
+- [x] add `var globalPageSlab pageSlab` package-level singleton
+- [x] add `ConfigPageCache(pageSize, nPages int)` public API to init the slab (mirrors `sqlite3_config(SQLITE_CONFIG_PAGECACHE)`)
+- [x] add lazy init in `Open()` — if slab not initialized, init with default size based on first DB's page size
+- [x] write test: Init, Get N pages, verify all returned, freeList empty
+- [x] write test: Get beyond slab capacity, verify overflow works, `UnderPressure()` returns true
+- [x] write test: Put pages back, verify `UnderPressure()` clears when freeList refills
+- [x] write test: concurrent Get/Put from multiple goroutines (race detector)
+- [x] run tests — must pass before next task
 
 ### Task 4: Per-cache bulk allocation (pFree)
 **Depends on: Task 3 (global slab). Pre-allocate ~100 page objects per cache on first use, drawing buffers from global slab.**
