@@ -393,23 +393,12 @@ func (p *pager) getPageAtImpl(pgno, walMaxFrame uint32, noStress bool) (*page, e
 		return nil, ErrInvalidPage
 	}
 
-	// Check cache first. Use fetchPinned to capture the dirty flag under
-	// the pcache lock, avoiding a data race with concurrent makeDirty calls
-	// from the writer goroutine.
-	if pg, wasDirty := p.cache.fetchPinned(pgno); pg != nil {
-		// For clean pages, verify the cached version is within our snapshot.
-		// Dirty pages are returned as-is: the caller is responsible for
-		// MVCC dirty-page handling at a higher level (btree.getPage for
-		// readers checks writePages; ReadTx.txGetPage also bypasses dirty
-		// pages for non-writable transactions).
-		if !wasDirty {
-			latestFrame := p.wal.index.getLatest(pgno)
-			if latestFrame == 0 || latestFrame <= walMaxFrame {
-				return pg, nil
-			}
-			p.cache.release(pg)
-			return p.readPageUncached(pgno, walMaxFrame)
-		}
+	// Check cache first. SQLite returns cached pages directly without any
+	// WAL lookup (pager.c:5568-5573 getPageNormal). The shared cache is only
+	// accessed by the writer goroutine (readers use readPageMVCC which
+	// bypasses the cache), so cached pages are always valid for the writer's
+	// snapshot. Cache is cleared on checkpoint/WAL restart.
+	if pg := p.cache.fetch(pgno); pg != nil {
 		return pg, nil
 	}
 
