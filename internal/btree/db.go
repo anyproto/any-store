@@ -91,6 +91,11 @@ type DB struct {
 
 	readTxPool  sync.Pool
 	writeTxPool sync.Pool
+
+	// readerCachePool recycles per-reader pcache instances.
+	// Each reader gets a private cache to avoid per-page allocations.
+	readerCachePool sync.Pool
+	readerCacheSize int // max(CacheSize/10, 50)
 }
 
 // Open opens or creates a database at the given path.
@@ -157,6 +162,11 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, ErrOldFormat
 	}
 
+	readerCacheSize := opts.CacheSize / 10
+	if readerCacheSize < 50 {
+		readerCacheSize = 50
+	}
+
 	db := &DB{
 		pager: p,
 		path:  path,
@@ -165,6 +175,7 @@ func Open(path string, opts Options) (*DB, error) {
 			pager:    p,
 			rootPage: 1,
 		},
+		readerCacheSize: readerCacheSize,
 	}
 
 	// Initialize local counters from the on-disk state (reading through WAL).
@@ -198,9 +209,16 @@ func (db *DB) Close() error {
 
 	if !db.writeMu.TryLock() {
 		// Writer holds writeMu. Force-rollback the abandoned/in-flight tx.
+		// writerOpMu serializes with commit/rollback so we don't interleave
+		// with a concurrent Commit or Rollback call.
+		// Use rollbackForClose which skips writerCache operations to avoid
+		// racing with the writer's B-tree ops (pcache has no mutex).
+		db.pager.writerOpMu.Lock()
 		if pagerState(db.pager.state.Load()) == pagerWriter {
-			_ = db.pager.rollback()
+			db.pager.rollbackForClose()
 		}
+		db.pager.writerOpMu.Unlock()
+
 		// Use CAS to ensure the writer lock cleanup (endRead + RUnlock +
 		// Unlock) happens exactly once. Without this, the writer goroutine
 		// completing concurrently could race with Close and double-release.
@@ -258,9 +276,18 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 		return nil, err
 	}
 
+	// Allocate reader cache from pool for per-connection page caching.
+	var cache *pcache
+	if c, ok := db.readerCachePool.Get().(*pcache); ok {
+		cache = c
+	} else {
+		cache = newPcache(int(db.pager.pageSize), db.readerCacheSize, true)
+	}
+
 	tx := db.getReadTx()
 	tx.db = db
 	tx.pager = db.pager
+	tx.cache = cache
 	tx.closed = false
 	tx.walMaxFrame = maxFrame
 	tx.walSlot = slot
@@ -274,6 +301,13 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 // BeginWrite starts a read-write transaction. Only one write transaction
 // can be active at a time (single-writer semantics). Blocks until any
 // existing write transaction completes.
+//
+// For multi-process mode, if another process committed since our last read
+// (ErrBusySnapshot), we automatically retry with a fresh SHM snapshot.
+// DRIFT from SQLite: SQLite returns SQLITE_BUSY_SNAPSHOT to the caller,
+// requiring it to retry. We retry internally for ergonomic API (max 5 attempts).
+const maxBusySnapshotRetries = 5
+
 func (db *DB) BeginWrite() (*WriteTx, error) {
 	if db.closing.Load() {
 		return nil, ErrClosed
@@ -290,32 +324,45 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 		return nil, ErrClosed
 	}
 
-	maxFrame, slot, err := db.pager.beginRead()
-	if err != nil {
-		db.mu.RUnlock()
-		db.writeMu.Unlock()
-		return nil, err
-	}
+	var maxFrame uint32
+	var slot int
+	var fcc, sc uint32
 
-	// Read on-disk counters for staleness detection.
-	fcc, sc, err := db.pager.readHeaderCounters(maxFrame)
-	if err != nil {
+	for attempt := 0; ; attempt++ {
+		var err error
+		maxFrame, slot, err = db.pager.beginRead()
+		if err != nil {
+			db.mu.RUnlock()
+			db.writeMu.Unlock()
+			return nil, err
+		}
+
+		// Read on-disk counters for staleness detection.
+		fcc, sc, err = db.pager.readHeaderCounters(maxFrame)
+		if err != nil {
+			db.pager.endRead(slot)
+			db.mu.RUnlock()
+			db.writeMu.Unlock()
+			return nil, err
+		}
+
+		// Store WAL slot on pager BEFORE beginWrite() so that Close can
+		// read it after observing pagerWriter via the atomic state store
+		// inside beginWrite() (happens-before guarantee).
+		db.pager.writerWalSlot = slot
+
+		err = db.pager.beginWrite()
+		if err == nil {
+			break
+		}
 		db.pager.endRead(slot)
-		db.mu.RUnlock()
-		db.writeMu.Unlock()
-		return nil, err
-	}
-
-	// Store WAL slot on pager BEFORE beginWrite() so that Close can
-	// read it after observing pagerWriter via the atomic state store
-	// inside beginWrite() (happens-before guarantee).
-	db.pager.writerWalSlot = slot
-
-	if err := db.pager.beginWrite(); err != nil {
-		db.pager.endRead(slot)
-		db.mu.RUnlock()
-		db.writeMu.Unlock()
-		return nil, err
+		if !errors.Is(err, ErrBusySnapshot) || attempt >= maxBusySnapshotRetries {
+			db.mu.RUnlock()
+			db.writeMu.Unlock()
+			return nil, err
+		}
+		// Clear writerCache: another process committed, our cached pages are stale
+		db.pager.writerCache.clear()
 	}
 
 	// Reset the cleanup guard for this write transaction.
@@ -324,6 +371,7 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	tx := db.getWriteTx()
 	tx.ReadTx.db = db
 	tx.ReadTx.pager = db.pager
+	tx.ReadTx.cache = nil // writer uses shared pcache, not a reader cache
 	tx.ReadTx.closed = false
 	tx.ReadTx.walMaxFrame = maxFrame
 	tx.ReadTx.walSlot = slot
@@ -522,7 +570,10 @@ func (db *DB) GetNamespace(name string) (*Namespace, error) {
 	}
 	defer db.pager.endRead(slot)
 
-	return db.getNamespaceAt(name, maxFrame)
+	cache := newPcache(int(db.pager.pageSize), 200, true)
+	defer cache.clear()
+
+	return db.getNamespaceAt(name, maxFrame, cache)
 }
 
 // getNamespaceLocked returns a Namespace handle (caller must hold read lock).
@@ -533,12 +584,13 @@ func (db *DB) getNamespaceLocked(name string) (*Namespace, error) {
 	return db.resolveNamespace(name, bt)
 }
 
-// getNamespaceAt returns a Namespace handle using readPageMVCC for snapshot
-// isolation. Safe to call from any goroutine (readers or writer) because
-// it does not access pager.writePages, and readPageMVCC returns an uncached
-// copy when the page is dirty (avoiding races with the writer).
-func (db *DB) getNamespaceAt(name string, walMaxFrame uint32) (*Namespace, error) {
-	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: walMaxFrame, writable: false}
+// getNamespaceAt returns a Namespace handle using snapshot isolation.
+// When cache is non-nil, pages are cached in the reader's private cache.
+// When cache is nil, falls back to uncached reads.
+// Safe to call from any goroutine (readers or writer) because
+// it does not access pager.writePages.
+func (db *DB) getNamespaceAt(name string, walMaxFrame uint32, cache *pcache) (*Namespace, error) {
+	bt := &btree{pager: db.pager, cache: cache, rootPage: 1, walMaxFrame: walMaxFrame, writable: false}
 	return db.resolveNamespace(name, bt)
 }
 
@@ -555,10 +607,9 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 	}
 
 	usableSize := bt.usablePageSize()
-	mvcc := !bt.writable
 	for {
 		if pg.header.isLeaf() {
-			idx, found, serr := searchLeafWithOverflow(pg, nameKey, usableSize, bt.pager, bt.walMaxFrame, mvcc)
+			idx, found, serr := searchLeafWithOverflow(pg, nameKey, usableSize, bt.pager, bt.walMaxFrame, bt.cache)
 			if serr != nil {
 				bt.pager.releasePage(pg)
 				return nil, serr
@@ -587,7 +638,7 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 		}
 
 		// Interior page — descend to the correct child
-		childPgno, _, serr := searchInteriorWithOverflow(pg, nameKey, usableSize, bt.pager, bt.walMaxFrame, mvcc)
+		childPgno, _, serr := searchInteriorWithOverflow(pg, nameKey, usableSize, bt.pager, bt.walMaxFrame, bt.cache)
 		if serr != nil {
 			bt.pager.releasePage(pg)
 			return nil, serr
@@ -608,7 +659,10 @@ func (db *DB) ListNamespaces() ([]string, error) {
 	}
 	defer db.pager.endRead(slot)
 
-	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: maxFrame, writable: false}
+	cache := newPcache(int(db.pager.pageSize), 200, true)
+	defer cache.clear()
+
+	bt := &btree{pager: db.pager, cache: cache, rootPage: 1, walMaxFrame: maxFrame, writable: false}
 	cursor := bt.NewCursor()
 	defer cursor.Close()
 
@@ -651,8 +705,9 @@ func (ns *Namespace) RootPage() uint32 {
 type ReadTx struct {
 	db          *DB
 	pager       *pager
-	walSlot     int    // reader slot number (for endRead)
-	walMaxFrame uint32 // WAL snapshot for this transaction
+	cache       *pcache // per-reader private page cache (nil for write transactions)
+	walSlot     int     // reader slot number (for endRead)
+	walMaxFrame uint32  // WAL snapshot for this transaction
 
 	// Disk counters from page 1 at transaction start (for staleness detection).
 	diskFileChangeCounter  uint32
@@ -665,7 +720,7 @@ type ReadTx struct {
 
 // txGetPage fetches a page respecting MVCC snapshot isolation.
 // For write transactions, dirty pages from writePages are returned directly.
-// For read transactions, readPageMVCC bypasses dirty pages from uncommitted writers.
+// For read transactions, getPageReader uses a private cache for snapshot isolation.
 func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 	if tx.writable {
 		if pg := tx.pager.writePages[pgno]; pg != nil {
@@ -674,7 +729,7 @@ func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 		}
 		return tx.pager.getPageWriter(pgno, tx.walMaxFrame)
 	}
-	return tx.pager.readPageMVCC(pgno, tx.walMaxFrame)
+	return tx.pager.getPageReader(pgno, tx.walMaxFrame, tx.cache)
 }
 
 // readOverflow reads overflow chain data using the correct isolation level.
@@ -685,7 +740,7 @@ func (tx *ReadTx) readOverflow(firstPgno uint32, buf []byte) error {
 	if tx.writable {
 		return tx.pager.readOverflowChainAt(firstPgno, buf, tx.walMaxFrame)
 	}
-	return tx.pager.readOverflowChainMVCC(firstPgno, buf, tx.walMaxFrame)
+	return tx.pager.readOverflowChainReader(firstPgno, buf, tx.walMaxFrame, tx.cache)
 }
 
 // AppendValue retrieves a value by key from the given namespace, appending it to buf.
@@ -701,10 +756,9 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 
 	// Search without starting a new read tx (we're already in one)
 	usableSize := tx.pager.usableSize()
-	mvcc := !tx.writable
 	for {
 		if pg.header.isLeaf() {
-			idx, found, serr := searchLeafWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame, mvcc)
+			idx, found, serr := searchLeafWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame, tx.cache)
 			if serr != nil {
 				tx.pager.releasePage(pg)
 				return buf, serr
@@ -765,7 +819,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 			tx.pager.releasePage(pg)
 			return buf, nil
 		}
-		childPgno, _, serr := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame, mvcc)
+		childPgno, _, serr := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame, tx.cache)
 		if serr != nil {
 			tx.pager.releasePage(pg)
 			return buf, serr
@@ -817,7 +871,6 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 	}
 
 	usableSize := tx.pager.usableSize()
-	mvcc := !tx.writable
 	rightmost := true // tracks if we're on the rightmost path through the tree
 
 	// When we take a non-rightChild branch at an interior page, we save that
@@ -829,7 +882,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 
 	for {
 		if pg.header.isLeaf() {
-			idx, _, serr := searchLeafWithOverflow(pg, prefix, usableSize, tx.pager, tx.walMaxFrame, mvcc)
+			idx, _, serr := searchLeafWithOverflow(pg, prefix, usableSize, tx.pager, tx.walMaxFrame, tx.cache)
 			if serr != nil {
 				tx.pager.releasePage(pg)
 				return buf, serr
@@ -853,7 +906,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 				return buf, cerr
 			}
 			if cell.overflowPg != 0 {
-				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walMaxFrame, mvcc)
+				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walMaxFrame, tx.cache)
 				tx.pager.releasePage(pg)
 				if kerr != nil {
 					return buf, kerr
@@ -864,7 +917,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 			tx.pager.releasePage(pg)
 			return buf, nil
 		}
-		childPgno, cellIdx, serr := searchInteriorWithOverflow(pg, prefix, usableSize, tx.pager, tx.walMaxFrame, mvcc)
+		childPgno, cellIdx, serr := searchInteriorWithOverflow(pg, prefix, usableSize, tx.pager, tx.walMaxFrame, tx.cache)
 		if serr != nil {
 			tx.pager.releasePage(pg)
 			return buf, serr
@@ -913,7 +966,6 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 
 	// Descend to the leftmost key of this subtree.
 	usableSize := tx.pager.usableSize()
-	mvcc := !tx.writable
 	pg, err = tx.txGetPage(nextPgno)
 	if err != nil {
 		return buf, err
@@ -931,7 +983,7 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 				return buf, cerr
 			}
 			if cell.overflowPg != 0 {
-				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walMaxFrame, mvcc)
+				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walMaxFrame, tx.cache)
 				tx.pager.releasePage(pg)
 				if kerr != nil {
 					return buf, kerr
@@ -964,7 +1016,7 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 // NewCursor creates a cursor for iterating over the namespace.
 func (tx *ReadTx) NewCursor(ns *Namespace) *Cursor {
 	c := &Cursor{}
-	c.btData = btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
+	c.btData = btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
 	c.bt = &c.btData
 	return c
 }
@@ -975,18 +1027,18 @@ func (tx *ReadTx) Count(ns *Namespace) (int, error) {
 	if tx.closed {
 		return 0, ErrTxClosed
 	}
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
+	bt := &btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
 	return bt.Count()
 }
 
 // GetNamespace returns a Namespace handle for the given name.
-// Uses the transaction's WAL snapshot via getPageAt, which is safe to call
-// concurrently with writer goroutines (does not access pager.writePages).
+// Uses the transaction's WAL snapshot via getPageReader with the reader's
+// private cache. Safe to call concurrently with the writer goroutine.
 func (tx *ReadTx) GetNamespace(name string) (*Namespace, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
 	}
-	return tx.db.getNamespaceAt(name, tx.walMaxFrame)
+	return tx.db.getNamespaceAt(name, tx.walMaxFrame, tx.cache)
 }
 
 // IsDataStale returns true if the on-disk FileChangeCount differs from the
@@ -1020,6 +1072,12 @@ func (tx *ReadTx) Rollback() error {
 		return ErrTxClosed
 	}
 	tx.closed = true
+	// Clear and recycle the reader cache back to the pool.
+	if tx.cache != nil {
+		tx.cache.clear()
+		tx.db.readerCachePool.Put(tx.cache)
+		tx.cache = nil
+	}
 	tx.pager.endRead(tx.walSlot)
 	db := tx.db
 	db.mu.RUnlock()

@@ -563,6 +563,9 @@ func runSavepointCrashCycleConcurrent(t *testing.T, path string, rng *rand.Rand,
 	t.Helper()
 
 	db := openDBNoCleanup(t, path)
+	// Use short busy timeout so checkpoint doesn't block writer for 5s per attempt
+	// when readers are continuously active.
+	db.pager.wal.busyHandler = DefaultBusyTimeout(200 * time.Millisecond)
 
 	nsName := "docs"
 	func() {

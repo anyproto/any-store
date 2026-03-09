@@ -439,9 +439,9 @@ func TestOverflowConcurrentReaderStress(t *testing.T) {
 }
 
 // TestGetPageAtCacheCoherencyBug demonstrates a cache coherency bug in
-// pager.getPageAt that causes overflow data corruption.
+// pager.getPageWriter that causes overflow data corruption.
 //
-// Root cause: getPageAt checks `getLatest(pgno) <= walMaxFrame` to decide
+// Root cause: getPageWriter checks `getLatest(pgno) <= walMaxFrame` to decide
 // if a cached page is valid. This only verifies the LATEST WAL frame for the
 // page is within the caller's snapshot — it does NOT verify the CACHED DATA
 // is actually from that latest frame. A reader with an older snapshot can
@@ -455,9 +455,9 @@ func TestOverflowConcurrentReaderStress(t *testing.T) {
 //  3. TX2 updates K to V2 → frees V1's overflow pages, reallocates them from
 //     freelist (same page numbers, LIFO) → pages P at WAL frame F2 with V2 data
 //  4. Cache cleared (simulates LRU eviction under memory pressure)
-//  5. R1 reads K → readOverflowChainAt → getPageAt (cache miss) → populates
+//  5. R1 reads K → readOverflowChainAt → getPageWriter (cache miss) → populates
 //     cache with V1 data from WAL frame F1
-//  6. R2 opens (walMaxFrame ≥ F2), reads K → readOverflowChainAt → getPageAt
+//  6. R2 opens (walMaxFrame ≥ F2), reads K → readOverflowChainAt → getPageWriter
 //     (cache HIT) → getLatest(P) = F2, F2 ≤ R2.walMaxFrame → returns stale V1!
 //
 // The same bug affects the writer (via collectLeafCells/readOverflowChainAt),
@@ -505,9 +505,9 @@ func TestGetPageAtCacheCoherencyBug(t *testing.T) {
 	require.NoError(t, tx2.Commit())
 
 	// Clear entire page cache — simulates LRU eviction under memory pressure.
-	db.pager.cache.clear()
+	db.pager.writerCache.clear()
 
-	// R1 reads key → readOverflowChainAt → getPageAt (cache miss for each
+	// R1 reads key → readOverflowChainAt → getPageWriter (cache miss for each
 	// overflow page) → cache.create populates entries with V1 data from WAL
 	// frames at R1's snapshot.
 	gotR1, err := rtx1.Get(nsR1, []byte("key"))
@@ -523,7 +523,7 @@ func TestGetPageAtCacheCoherencyBug(t *testing.T) {
 	gotR2, err := rtx2.Get(nsR2, []byte("key"))
 	require.NoError(t, err)
 
-	// BUG: getPageAt returns stale V1 data from reader-polluted cache.
+	// BUG: getPageWriter returns stale V1 data from reader-polluted cache.
 	// The check `getLatest(pgno) <= walMaxFrame` passes because the latest
 	// frame IS within R2's snapshot, but the cached data is from an older frame.
 	if !bytes.Equal(v2, gotR2) {
@@ -545,13 +545,13 @@ func TestGetPageAtCacheCoherencyBug(t *testing.T) {
 }
 
 // TestGetPageAtWriterCorruption demonstrates that the cache coherency bug
-// in getPageAt causes the WRITER to commit corrupted data to WAL via
+// in getPageWriter causes the WRITER to commit corrupted data to WAL via
 // collectLeafCells during a page split, resulting in persistent on-disk
 // corruption.
 //
 // When a leaf page containing an overflow cell needs to be split, the writer
 // calls collectLeafCells which reads ALL cells' overflow data via
-// readOverflowChainAt → getPageAt. If the cache was polluted by a reader
+// readOverflowChainAt → getPageWriter. If the cache was polluted by a reader
 // with stale overflow data, collectLeafCells reads the wrong values and
 // commits them to WAL.
 func TestGetPageAtWriterCorruption(t *testing.T) {
@@ -603,7 +603,7 @@ func TestGetPageAtWriterCorruption(t *testing.T) {
 	require.NoError(t, tx2.Commit())
 
 	// Clear cache → simulates LRU eviction.
-	db.pager.cache.clear()
+	db.pager.writerCache.clear()
 
 	// R1 reads "key-big" → populates cache with V1 overflow data.
 	gotR1, err := rtx1.Get(nsR1, []byte("key-big"))
@@ -613,7 +613,7 @@ func TestGetPageAtWriterCorruption(t *testing.T) {
 
 	// TX3: Insert more small keys to trigger a leaf page split.
 	// The split calls collectLeafCells which reads ALL cells including
-	// "key-big"'s overflow data via readOverflowChainAt → getPageAt.
+	// "key-big"'s overflow data via readOverflowChainAt → getPageWriter.
 	// With stale cache, it reads V1 data instead of V2 → corruption.
 	tx3, err := db.BeginWrite()
 	require.NoError(t, err)

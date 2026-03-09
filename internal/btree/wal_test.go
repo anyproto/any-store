@@ -140,7 +140,8 @@ func TestWALWriteReadFrames(t *testing.T) {
 	require.NoError(t, w.open())
 
 	// Acquire write lock
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 
 	// Create test pages
 	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
@@ -184,7 +185,8 @@ func TestWALWriteNoCommit(t *testing.T) {
 	path := filepath.Join(dir, "test.wal")
 	w := newWal(path, 4096)
 	require.NoError(t, w.open())
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	copy(pg.data, "uncommitted")
@@ -206,7 +208,8 @@ func TestWALWriteEmptyFrames(t *testing.T) {
 	path := filepath.Join(dir, "test.wal")
 	w := newWal(path, 4096)
 	require.NoError(t, w.open())
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 
 	require.NoError(t, w.writeFrames(nil, true, 0))
 	assert.Equal(t, uint32(0), w.nFrame.Load())
@@ -222,7 +225,8 @@ func TestWALRecoveryCommitted(t *testing.T) {
 	// Write some committed data
 	w := newWal(path, 4096)
 	require.NoError(t, w.open())
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 
 	pg := &page{pgno: 5, data: make([]byte, 4096)}
 	copy(pg.data, "committed data")
@@ -253,7 +257,8 @@ func TestWALRecoveryUncommittedTruncated(t *testing.T) {
 	// Write committed + uncommitted frames
 	w := newWal(path, 4096)
 	require.NoError(t, w.open())
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 
 	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
 	copy(pg1.data, "committed")
@@ -347,7 +352,7 @@ func TestWALIndexWriteHeader(t *testing.T) {
 	defer idx.close()
 
 	idx.nBackfill.Store(5)
-	require.NoError(t, idx.writeHeader(10, 20, 5))
+	require.NoError(t, idx.writeHeader(10, 20, 5, [2]uint32{}, [2]uint32{}))
 	idx.shmWriteCkptInfo()
 
 	// Read back from shm region 0
@@ -397,7 +402,8 @@ func TestWALCheckpointWritesBack(t *testing.T) {
 	walPath := filepath.Join(dir, "test.wal")
 	w := newWal(walPath, 4096)
 	require.NoError(t, w.open())
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 
 	// Write a frame
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
@@ -428,14 +434,16 @@ func TestWALMultipleCommits(t *testing.T) {
 	require.NoError(t, w.open())
 
 	// First commit
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
 	copy(pg1.data, "commit 1")
 	require.NoError(t, w.writeFrames([]*page{pg1}, true, 1))
 	w.endWrite()
 
 	// Second commit (updates same page)
-	require.NoError(t, w.beginWrite())
+	_, bwErr = w.beginWrite()
+	require.NoError(t, bwErr)
 	pg2 := &page{pgno: 1, data: make([]byte, 4096)}
 	copy(pg2.data, "commit 2")
 	require.NoError(t, w.writeFrames([]*page{pg2}, true, 1))
@@ -467,7 +475,8 @@ func TestWALBeginReadEndRead(t *testing.T) {
 	w.endRead(slot)
 
 	// Write some data, then read
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -506,13 +515,15 @@ func TestWALRecoveryMultipleCommits(t *testing.T) {
 	require.NoError(t, w.open())
 
 	// Two commits
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
 	copy(pg1.data, "first commit")
 	require.NoError(t, w.writeFrames([]*page{pg1}, true, 1))
 	w.endWrite()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr = w.beginWrite()
+	require.NoError(t, bwErr)
 	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
 	copy(pg2.data, "second commit")
 	require.NoError(t, w.writeFrames([]*page{pg2}, true, 2))
@@ -575,7 +586,8 @@ func TestWriteFramesCommitFalseDoesNotAdvanceMxCommitFrame(t *testing.T) {
 	path := filepath.Join(dir, "test.wal")
 	w := newWal(path, 4096)
 	require.NoError(t, w.open())
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 
 	// First commit some frames so mxCommitFrame is non-zero
 	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
@@ -657,7 +669,8 @@ func TestWriteFramesCommitFalseDoesNotWriteShmHash(t *testing.T) {
 	// Use non-inProcess mode to exercise SHM hash path
 	w.inProcess = false
 	require.NoError(t, w.open())
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 
 	// First commit page 1 so we have a baseline
 	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
@@ -700,7 +713,8 @@ func TestRollbackCleansUpSpilledFrames(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 
 	// Commit pages 1 and 2 (frames 1 and 2)
 	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
@@ -760,7 +774,8 @@ func TestRollbackToSavepointWithSpilledFrames(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 
 	// Commit pages 1 and 2 (frames 1 and 2)
 	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
@@ -817,7 +832,8 @@ func TestCrossProcessReaderDoesNotSeeSpilledFrames(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = false
 	require.NoError(t, w.open())
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 
 	// Commit pages 1 and 2
 	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
@@ -891,7 +907,8 @@ func TestRecoveryIgnoresSpilledFrames(t *testing.T) {
 
 	w := newWal(path, 4096)
 	require.NoError(t, w.open())
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 
 	// Commit pages 1, 2, 3 (frames 1-3)
 	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
@@ -967,7 +984,8 @@ func TestWriteFramesCommitFlushesToShm(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = false
 	require.NoError(t, w.open())
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 
 	// Spill pages 1 and 2 (commit=false)
 	pg1 := &page{pgno: 1, data: make([]byte, 4096)}

@@ -97,7 +97,7 @@ func TestTryCheckpoint(t *testing.T) {
 }
 
 // ============================================================
-// readPageMVCC — 66.7% coverage (needs pgno=0 path)
+// getPageReader — 66.7% coverage (needs pgno=0 path)
 // ============================================================
 
 func TestReadPageMVCC_InvalidPage(t *testing.T) {
@@ -107,7 +107,7 @@ func TestReadPageMVCC_InvalidPage(t *testing.T) {
 	require.NoError(t, p.open())
 	defer p.close()
 
-	_, err := p.readPageMVCC(0, 0)
+	_, err := p.getPageReader(0, 0, nil)
 	assert.ErrorIs(t, err, ErrInvalidPage)
 }
 
@@ -133,9 +133,8 @@ func TestReadPageMVCC_ValidPage(t *testing.T) {
 	// Now do an MVCC read
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
-	pg2, err := p.readPageMVCC(1, mf2)
+	pg2, err := p.getPageReader(1, mf2, nil)
 	require.NoError(t, err)
-	assert.True(t, pg2.uncached)
 	p.releasePage(pg2)
 	p.endRead(slot2)
 }
@@ -620,7 +619,7 @@ func TestAllocateFromFreelist_UseTrunkItself(t *testing.T) {
 }
 
 // ============================================================
-// readPageUncached — various branches (80.6%)
+// getPageReader — various branches (80.6%)
 // ============================================================
 
 func TestReadPageUncached_ReadFromDisk(t *testing.T) {
@@ -631,9 +630,8 @@ func TestReadPageUncached_ReadFromDisk(t *testing.T) {
 	defer p.close()
 
 	// Read page 1 from disk (no WAL frames)
-	pg, err := p.readPageUncached(1, 0)
+	pg, err := p.getPageReader(1, 0, nil)
 	require.NoError(t, err)
-	assert.True(t, pg.uncached)
 	p.releasePage(pg)
 }
 
@@ -645,15 +643,13 @@ func TestReadPageUncached_PageBeyondDbSize(t *testing.T) {
 	defer p.close()
 
 	// Page 999 > dbSize(1), so it's zero-filled (not an error)
-	pg, err := p.readPageUncached(999, 0)
+	pg, err := p.getPageReader(999, 0, nil)
 	require.NoError(t, err)
-	assert.True(t, pg.uncached)
 	p.releasePage(pg)
 
 	// Page 1 is within dbSize and exists in file -> read from disk
-	pg2, err := p.readPageUncached(1, 0)
+	pg2, err := p.getPageReader(1, 0, nil)
 	require.NoError(t, err)
-	assert.True(t, pg2.uncached)
 	p.releasePage(pg2)
 }
 
@@ -665,8 +661,8 @@ func TestReadPageUncached_InMemoryFallback(t *testing.T) {
 	require.NoError(t, p.open())
 	defer p.close()
 
-	// In memory mode, readPageUncached falls back to pcache
-	pg, err := p.readPageUncached(1, 0)
+	// In memory mode, getPageReader falls back to pcache
+	pg, err := p.getPageReader(1, 0, nil)
 	require.NoError(t, err)
 	p.releasePage(pg)
 }
@@ -682,7 +678,7 @@ func TestGetPageAt_InvalidPage(t *testing.T) {
 	require.NoError(t, p.open())
 	defer p.close()
 
-	_, err := p.getPageAt(0, 0)
+	_, err := p.getPageWriter(0, 0)
 	assert.ErrorIs(t, err, ErrInvalidPage)
 }
 
@@ -695,7 +691,7 @@ func TestGetPageAt_InMemoryNullFile(t *testing.T) {
 	defer p.close()
 
 	// Page 1 should be in cache (initNewDB puts it there for InMemory)
-	pg, err := p.getPageAt(1, 0)
+	pg, err := p.getPageWriter(1, 0)
 	require.NoError(t, err)
 	p.releasePage(pg)
 }
@@ -1016,7 +1012,7 @@ func TestWriteOverflowChain_NotWriter(t *testing.T) {
 }
 
 // ============================================================
-// readOverflowChainInternal — branches (93.1%)
+// readOverflowChainAt — branches (93.1%)
 // ============================================================
 
 func TestReadOverflowChainInternal_CorruptPageNumbers(t *testing.T) {
@@ -1067,7 +1063,7 @@ func TestReadOverflowChainMVCC(t *testing.T) {
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
 	buf := make([]byte, len(data))
-	err = p.readOverflowChainMVCC(firstPg, buf, mf2)
+	err = p.readOverflowChainReader(firstPg, buf, mf2, nil)
 	require.NoError(t, err)
 	assert.Equal(t, data, buf)
 	p.endRead(slot2)
@@ -1408,7 +1404,7 @@ func TestWalIndex_WriteHeader_InProcess(t *testing.T) {
 	require.NoError(t, err)
 	defer idx.close()
 
-	require.NoError(t, idx.writeHeader(10, 20, 5))
+	require.NoError(t, idx.writeHeader(10, 20, 5, [2]uint32{}, [2]uint32{}))
 	assert.Equal(t, uint32(10), idx.hdr.mxFrame)
 	assert.Equal(t, uint32(20), idx.hdr.nPage)
 }
@@ -1423,7 +1419,7 @@ func TestWalIndex_ReadHeader_Valid(t *testing.T) {
 	require.NoError(t, err)
 	defer idx.close()
 
-	require.NoError(t, idx.writeHeader(5, 10, 0))
+	require.NoError(t, idx.writeHeader(5, 10, 0, [2]uint32{}, [2]uint32{}))
 	hdr, valid := idx.readHeader()
 	assert.True(t, valid)
 	assert.Equal(t, uint32(5), hdr.mxFrame)
@@ -1464,7 +1460,7 @@ func TestWalIndex_ReadHeader_MismatchedCopies(t *testing.T) {
 	defer idx.close()
 
 	// Write valid header
-	require.NoError(t, idx.writeHeader(5, 10, 0))
+	require.NoError(t, idx.writeHeader(5, 10, 0, [2]uint32{}, [2]uint32{}))
 
 	// Corrupt copy 2 to mismatch copy 1
 	region, err := idx.shm.region(0, false)
@@ -1481,7 +1477,7 @@ func TestWalIndex_ReadHeader_BadChecksum(t *testing.T) {
 	require.NoError(t, err)
 	defer idx.close()
 
-	require.NoError(t, idx.writeHeader(5, 10, 0))
+	require.NoError(t, idx.writeHeader(5, 10, 0, [2]uint32{}, [2]uint32{}))
 
 	// Corrupt checksum in both copies (aCksum at offset 40)
 	region, err := idx.shm.region(0, false)
@@ -1577,7 +1573,8 @@ func TestWALFlushHeader(t *testing.T) {
 	assert.False(t, w.headerOnDisk)
 
 	// Write frames triggers flushHeader
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -1619,7 +1616,9 @@ func TestWALRecover_CorruptFrame(t *testing.T) {
 	// Write some valid data
 	w := newWal(path, 4096)
 	require.NoError(t, w.open())
-	require.NoError(t, w.beginWrite())
+	defer w.close()
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	copy(pg.data, "valid data")
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
@@ -1627,7 +1626,8 @@ func TestWALRecover_CorruptFrame(t *testing.T) {
 
 	// Write an extra uncommitted frame with corrupt salt
 	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
-	require.NoError(t, w.beginWrite())
+	_, bwErr = w.beginWrite()
+	require.NoError(t, bwErr)
 	require.NoError(t, w.writeFrames([]*page{pg2}, false, 2))
 	w.endWrite()
 
@@ -1661,8 +1661,10 @@ func TestWriteFrames_NoCommitSync(t *testing.T) {
 	w := newWal(path, 4096)
 	w.noCommitSync = true
 	require.NoError(t, w.open())
+	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -1676,8 +1678,10 @@ func TestWriteFrames_NotInProcess(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = false
 	require.NoError(t, w.open())
+	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -1693,8 +1697,10 @@ func TestWriteFramesMem_LargeArenaRealloc(t *testing.T) {
 	w := newWal("/tmp/inmem", 4096)
 	w.inMemory = true
 	require.NoError(t, w.open())
+	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 
 	// Write enough pages to trigger arena reallocation
 	pages := make([]*page, 300)
@@ -1716,8 +1722,10 @@ func TestReadFrame_InMemoryCorrupt(t *testing.T) {
 	w := newWal("/tmp/inmem", 4096)
 	w.inMemory = true
 	require.NoError(t, w.open())
+	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -1743,9 +1751,11 @@ func TestWALBeginRead_AllSlotsBusy(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
+	defer w.close()
 
 	// Write data so maxFrame > 0 and nBackfill != maxFrame
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -1776,9 +1786,11 @@ func TestWALBeginRead_BestSlotLockFails(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
+	defer w.close()
 
 	// Write data
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -1842,7 +1854,7 @@ func TestCheckpointPassive_PartialCheckpoint(t *testing.T) {
 	p.endRead(slot3)
 
 	// Passive checkpoint should return ErrBusy (partial)
-	err = p.wal.checkpointPassive(p.file, p.cache)
+	err = p.wal.checkpointPassive(p.file, p.master)
 	// Could be nil or ErrBusy depending on lock state
 	_ = err
 
@@ -1926,7 +1938,7 @@ func TestCheckpointWithMode_PassiveNoBusyHandler(t *testing.T) {
 	p.endRead(slot)
 
 	// Passive mode: no busy handler used
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointPassive, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointPassive, nil)
 	require.NoError(t, err)
 }
 
@@ -1955,7 +1967,7 @@ func TestCheckpointWithMode_FullWithBusyHandler(t *testing.T) {
 		return true
 	}
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, busy)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, busy)
 	require.NoError(t, err)
 	_ = busyCalled
 }
@@ -1968,7 +1980,7 @@ func TestCheckpointWithMode_Empty(t *testing.T) {
 	defer p.close()
 
 	// Checkpoint with no data
-	err := p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err := p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	require.NoError(t, err)
 }
 
@@ -1985,7 +1997,8 @@ func TestCheckpointPost_IncompleteBackfill(t *testing.T) {
 	defer w.close()
 
 	// Write frames
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -2010,7 +2023,8 @@ func TestTryResetWALWithBusy_AllSlotsAvailable(t *testing.T) {
 	defer w.close()
 
 	// Write and checkpoint
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -2030,7 +2044,8 @@ func TestTryResetWALWithBusy_Truncate(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -2054,7 +2069,8 @@ func TestTryResetWALWithBusy_SlotsBusy(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -2079,7 +2095,8 @@ func TestTryResetWALWithBusy_PartialLockFail(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -2106,7 +2123,8 @@ func TestDoResetWAL_InMemory(t *testing.T) {
 	defer w.close()
 
 	// Write frames
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -2129,7 +2147,8 @@ func TestDoResetWAL_Truncate(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -2154,7 +2173,8 @@ func TestDoResetWAL_NoTruncate(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -2227,6 +2247,7 @@ func TestPagerOpen_ExistingDBWithWALRecovery(t *testing.T) {
 	p := newPager(dbPath, 4096, 100, true)
 	p.inProcess = true
 	require.NoError(t, p.open())
+	defer p.close()
 
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
@@ -2333,7 +2354,7 @@ func TestGetPageAt_CacheHitDirtyPage(t *testing.T) {
 	p.releasePage(pg)
 
 	// getPageAt should return the dirty page as-is
-	pg2, err := p.getPageAt(1, mf)
+	pg2, err := p.getPageWriter(1, mf)
 	require.NoError(t, err)
 	assert.True(t, pg2.dirty)
 	p.releasePage(pg2)
@@ -2374,10 +2395,10 @@ func TestGetPageAt_CacheHitNewerVersion(t *testing.T) {
 	p.endRead(slot2)
 
 	// Now read at old snapshot: page 1 is cached at newer version,
-	// so getPageAt should fallback to readPageUncached
+	// so getPageWriter should fallback to getPageReader
 	mf3, slot3, err := p.beginRead()
 	require.NoError(t, err)
-	pg3, err := p.getPageAt(1, 1) // old maxFrame
+	pg3, err := p.getPageWriter(1, 1) // old maxFrame
 	require.NoError(t, err)
 	p.releasePage(pg3)
 	_ = mf3
@@ -2473,7 +2494,7 @@ func TestCheckpointWithMode_ReadersBlockSafeFrame(t *testing.T) {
 	p.endRead(slot3)
 
 	// Passive checkpoint: reader on old slot limits mxSafeFrame
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointPassive, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointPassive, nil)
 	require.NoError(t, err)
 
 	p.endRead(slot2)
@@ -2490,7 +2511,9 @@ func TestWALRecover_NoCommittedFrames(t *testing.T) {
 	// Write uncommitted frames only
 	w := newWal(path, 4096)
 	require.NoError(t, w.open())
-	require.NoError(t, w.beginWrite())
+	defer w.close()
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, false, 1))
 	w.endWrite()
@@ -2514,22 +2537,23 @@ func TestCheckpointWithMode_InMemory(t *testing.T) {
 	defer w.close()
 
 	// Write frames
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	copy(pg.data, "in-memory data")
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
 
-	// Checkpoint to pcache
-	cache := newPcache(4096, 100, false)
-	err := w.checkpointWithMode(nil, cache, CheckpointPassive, nil)
+	// Checkpoint to masterStore
+	ms := &masterStore{pages: make(map[uint32][]byte)}
+	err := w.checkpointWithMode(nil, ms, CheckpointPassive, nil)
 	require.NoError(t, err)
 
-	// Verify page 1 is in cache
-	cached := cache.fetch(1)
-	require.NotNil(t, cached)
-	assert.Equal(t, pg.data, cached.data)
-	cache.release(cached)
+	// Verify page 1 is in masterStore
+	dst := make([]byte, 4096)
+	found := ms.readPageInto(1, dst)
+	require.True(t, found)
+	assert.Equal(t, pg.data, dst)
 }
 
 // ============================================================
@@ -2542,7 +2566,7 @@ func TestWalIndex_ReadWriteHeader_NotInProcess(t *testing.T) {
 	require.NoError(t, err)
 	defer idx.close()
 
-	require.NoError(t, idx.writeHeader(5, 10, 0))
+	require.NoError(t, idx.writeHeader(5, 10, 0, [2]uint32{}, [2]uint32{}))
 
 	hdr, valid := idx.readHeader()
 	assert.True(t, valid)
@@ -2622,7 +2646,7 @@ func TestCheckpointWithMode_Read0LockBusy(t *testing.T) {
 	// Hold lock on read0 to block backfill
 	require.NoError(t, p.wal.index.lock(lockRead0, lockShared))
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointPassive, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointPassive, nil)
 	// Should succeed but with incomplete backfill
 	require.NoError(t, err)
 
@@ -2638,6 +2662,7 @@ func TestPagerClose_IncompleteCheckpoint(t *testing.T) {
 	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
 	p.inProcess = true
 	require.NoError(t, p.open())
+	defer p.close()
 
 	// Write data
 	mf, slot, err := p.beginRead()
@@ -2701,7 +2726,7 @@ func TestCheckpointWithMode_DowngradeToPassive(t *testing.T) {
 	// Hold write lock to force downgrade from FULL to PASSIVE
 	require.NoError(t, p.wal.index.lock(lockWrite, lockExclusive))
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	require.NoError(t, err)
 
 	_ = p.wal.index.unlock(lockWrite, lockExclusive)
@@ -2752,7 +2777,8 @@ func TestReadFrame_InMemoryOutOfRange(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -2796,12 +2822,12 @@ func TestGetPageAt_InMemory_CacheMiss(t *testing.T) {
 	p.endRead(slot)
 
 	// Evict page 2 from cache to force cache miss
-	p.cache.discard(pg2.pgno)
+	p.writerCache.discard(pg2.pgno)
 
 	// Read page 2 with WAL maxFrame
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
-	pgR, err := p.getPageAt(pg2.pgno, mf2)
+	pgR, err := p.getPageWriter(pg2.pgno, mf2)
 	require.NoError(t, err)
 	p.releasePage(pgR)
 	p.endRead(slot2)
@@ -2827,11 +2853,11 @@ func TestGetPageAt_ReadFromWAL(t *testing.T) {
 	p.endRead(slot)
 
 	// Evict page 1 from cache so it must be read from WAL
-	p.cache.discard(1)
+	p.writerCache.discard(1)
 
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
-	pg2, err := p.getPageAt(1, mf2)
+	pg2, err := p.getPageWriter(1, mf2)
 	require.NoError(t, err)
 	assert.Equal(t, uint32(1), pg2.pgno)
 	p.releasePage(pg2)
@@ -2839,7 +2865,7 @@ func TestGetPageAt_ReadFromWAL(t *testing.T) {
 }
 
 // ============================================================
-// Additional: readPageUncached from WAL (line 426-434)
+// Additional: getPageReader from WAL (line 426-434)
 // ============================================================
 
 func TestReadPageUncached_FromWAL(t *testing.T) {
@@ -2865,16 +2891,15 @@ func TestReadPageUncached_FromWAL(t *testing.T) {
 	// Read page 1 uncached from WAL
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
-	pg2, err := p.readPageUncached(1, mf2)
+	pg2, err := p.getPageReader(1, mf2, nil)
 	require.NoError(t, err)
-	assert.True(t, pg2.uncached)
 	assert.Equal(t, uint32(1), pg2.pgno)
 	p.releasePage(pg2)
 	p.endRead(slot2)
 }
 
 // ============================================================
-// Additional: readPageUncached InMemory fallback pcache copy (line 454-461)
+// Additional: getPageReader InMemory fallback pcache copy (line 454-461)
 // ============================================================
 
 func TestReadPageUncached_InMemory_PcacheCopy(t *testing.T) {
@@ -2886,14 +2911,13 @@ func TestReadPageUncached_InMemory_PcacheCopy(t *testing.T) {
 	defer p.close()
 
 	// Page 1 is in pcache (initNewDB populates it for InMemory)
-	// Read page 1 uncached with walMaxFrame=0 (no WAL frames) -> falls through to pcache
-	pg, err := p.readPageUncached(1, 0)
+	// Read page 1 with walMaxFrame=0 (no WAL frames) -> falls through to pcache
+	pg, err := p.getPageReader(1, 0, nil)
 	require.NoError(t, err)
-	assert.True(t, pg.uncached)
 	p.releasePage(pg)
 
 	// Try reading a page not in pcache
-	pg2, err := p.readPageUncached(999, 0)
+	pg2, err := p.getPageReader(999, 0, nil)
 	require.NoError(t, err)
 	// Should be zero-filled
 	allZero := true
@@ -3024,7 +3048,7 @@ func TestCheckpointWithMode_ReaderLockLoopBusyThenOK(t *testing.T) {
 	p.wal.index.aReadMark[2].Store(0) // very low mark
 
 	// Checkpoint should successfully clear the unused slot 2 readmark
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointPassive, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointPassive, nil)
 	require.NoError(t, err)
 }
 
@@ -3040,7 +3064,8 @@ func TestCheckpointWithMode_InMemoryPage1(t *testing.T) {
 	defer w.close()
 
 	// Write frame for page 1 (tests the pgno==1 offset path in InMemory checkpoint)
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	// Set page type at dbHeaderSize offset (for page 1)
 	pg.data[dbHeaderSize] = pageTypeLeafIdx
@@ -3048,24 +3073,21 @@ func TestCheckpointWithMode_InMemoryPage1(t *testing.T) {
 	w.endWrite()
 
 	// Also write non-page-1 frame
-	require.NoError(t, w.beginWrite())
+	_, bwErr = w.beginWrite()
+	require.NoError(t, bwErr)
 	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
 	pg2.data[0] = pageTypeLeafIdx
 	require.NoError(t, w.writeFrames([]*page{pg2}, true, 2))
 	w.endWrite()
 
-	cache := newPcache(4096, 100, false)
-	err := w.checkpointWithMode(nil, cache, CheckpointPassive, nil)
+	ms := &masterStore{pages: make(map[uint32][]byte)}
+	err := w.checkpointWithMode(nil, ms, CheckpointPassive, nil)
 	require.NoError(t, err)
 
-	// Both pages should be in cache
-	c1 := cache.fetch(1)
-	require.NotNil(t, c1)
-	cache.release(c1)
-
-	c2 := cache.fetch(2)
-	require.NotNil(t, c2)
-	cache.release(c2)
+	// Both pages should be in masterStore
+	dst := make([]byte, 4096)
+	require.True(t, ms.readPageInto(1, dst))
+	require.True(t, ms.readPageInto(2, dst))
 }
 
 // ============================================================
@@ -3129,7 +3151,7 @@ func TestFreeOverflowChain_InvalidNextPgno(t *testing.T) {
 }
 
 // ============================================================
-// Additional: readOverflowChainInternal max iteration (line 1375-1377)
+// Additional: readOverflowChainAt max iteration (line 1375-1377)
 // ============================================================
 
 func TestReadOverflowChain_InvalidPgno(t *testing.T) {
@@ -3170,7 +3192,7 @@ func TestReadOverflowChain_InvalidPgno(t *testing.T) {
 }
 
 // ============================================================
-// Additional: readOverflowChainInternal MVCC path (line 1382)
+// Additional: readOverflowChainAt MVCC path (line 1382)
 // ============================================================
 
 func TestReadOverflowChain_MVCCPath(t *testing.T) {
@@ -3201,7 +3223,7 @@ func TestReadOverflowChain_MVCCPath(t *testing.T) {
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
 	buf := make([]byte, len(data))
-	err = p.readOverflowChainMVCC(firstPg, buf, mf2)
+	err = p.readOverflowChainReader(firstPg, buf, mf2, nil)
 	require.NoError(t, err)
 	assert.Equal(t, data, buf)
 	p.endRead(slot2)
@@ -3394,12 +3416,12 @@ func TestGetPageAt_ReadFromFile(t *testing.T) {
 	require.NoError(t, p.checkpointWithMode(CheckpointTruncate))
 
 	// Evict from cache
-	p.cache.discard(pg2.pgno)
+	p.writerCache.discard(pg2.pgno)
 
 	// Read from file (WAL maxFrame=0 after truncate)
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
-	pgR, err := p.getPageAt(pg2.pgno, mf2)
+	pgR, err := p.getPageWriter(pg2.pgno, mf2)
 	require.NoError(t, err)
 	p.releasePage(pgR)
 	p.endRead(slot2)
@@ -3431,7 +3453,7 @@ func TestCheckpointWithMode_FullFallbackToPassive(t *testing.T) {
 	// Hold write lock -> FULL downgrades to PASSIVE
 	require.NoError(t, p.wal.index.lock(lockWrite, lockExclusive))
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointRestart, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil)
 	require.NoError(t, err)
 
 	_ = p.wal.index.unlock(lockWrite, lockExclusive)
@@ -3448,12 +3470,14 @@ func TestWALClose_FileAlreadyClosed(t *testing.T) {
 	w.inProcess = true
 	require.NoError(t, w.open())
 
-	// Close file handle manually
+	// Close file handle manually and nil it to prevent FD double-close
+	// which can corrupt other tests' file descriptors via FD reuse.
 	w.file.Close()
+	w.file = nil
 
-	// wal.close() should catch the error from file.Close()
+	// wal.close() should handle nil file gracefully
 	err := w.close()
-	assert.Error(t, err)
+	assert.NoError(t, err)
 }
 
 // ============================================================
@@ -3581,12 +3605,13 @@ func TestGetPageAt_WALReadFrameError(t *testing.T) {
 	p.walMaxFrame.Store(mf2)
 
 	// Evict the page from cache so getPageAt must read from WAL
-	p.cache.clear()
+	p.writerCache.clear()
 
 	// Close the WAL file to cause readFrame to fail
 	p.wal.file.Close()
+	p.wal.file = nil // prevent double-close in defer p.close()
 
-	_, err = p.getPageAt(pgno, mf2)
+	_, err = p.getPageWriter(pgno, mf2)
 	assert.Error(t, err)
 	p.endRead(slot2)
 }
@@ -3609,10 +3634,10 @@ func TestGetPageAt_InMemory_ZeroFill(t *testing.T) {
 	p.dbSize.Store(3)
 
 	// Clear cache to force cache miss
-	p.cache.clear()
+	p.writerCache.clear()
 
 	// getPageAt for page 3 should zero-fill (InMemory, no file, cache miss)
-	pg, err := p.getPageAt(3, mf)
+	pg, err := p.getPageWriter(3, mf)
 	require.NoError(t, err)
 	// Verify zero-filled
 	allZero := true
@@ -3781,7 +3806,7 @@ func TestAllocateFromFreelist_TrunkGetError(t *testing.T) {
 	p.endRead(slot)
 }
 
-// --- pager.go:950 readHeaderCounters() InMemory pcache miss fallback ---
+// --- pager.go:950 readHeaderCounters() InMemory masterStore fallback ---
 func TestReadHeaderCounters_InMemory_PcacheMiss(t *testing.T) {
 	dir := t.TempDir()
 	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
@@ -3794,16 +3819,26 @@ func TestReadHeaderCounters_InMemory_PcacheMiss(t *testing.T) {
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
 
-	// Set expected values on header
+	// Write page 1 into masterStore with known counter values.
+	// This simulates the state after a checkpoint: WAL is cleared and
+	// masterStore holds the committed page data.
+	pg1 := make([]byte, 4096)
 	p.header.FileChangeCount = 42
 	p.header.SchemaCookie = 7
+	p.header.serialize(pg1[:dbHeaderSize])
+	p.master.writePage(1, pg1)
 
-	// Clear cache so pcache.fetch(1) returns nil
-	p.cache.clear()
+	// Ensure WAL has no frame for page 1 so the fallback is exercised.
+	// After open+initNewDB the WAL may have page 1; clear it.
+	p.wal.index.mu.Lock()
+	p.wal.index.pageMap = make(map[uint32][]uint32)
+	p.wal.index.mu.Unlock()
+	p.wal.index.mxCommitFrame.Store(0)
+	p.wal.index.maxFrame.Store(0)
 
 	fcc, sc, err := p.readHeaderCounters(mf)
 	require.NoError(t, err)
-	// Should fall back to p.header values
+	// Should read from masterStore (RWMutex-protected), not p.header directly.
 	assert.Equal(t, uint32(42), fcc)
 	assert.Equal(t, uint32(7), sc)
 
@@ -3861,6 +3896,7 @@ func TestPagerCommit_WriteFramesError(t *testing.T) {
 
 	// Close the WAL file to make writeFrames fail
 	p.wal.file.Close()
+	p.wal.file = nil // prevent double-close in defer p.close()
 
 	_, _, _, err = p.commit(true, false)
 	assert.Error(t, err)
@@ -3889,9 +3925,9 @@ func TestWriteOverflowChain_AllocateError(t *testing.T) {
 	p.endRead(slot)
 }
 
-// --- pager.go:1375-1377 readOverflowChainInternal() maxIter exceeded ---
+// --- pager.go:1375-1377 readOverflowChainAt() maxIter exceeded ---
 func TestReadOverflowChain_MaxIterExceeded(t *testing.T) {
-	// The maxIter protection in readOverflowChainInternal is unreachable because
+	// The maxIter protection in readOverflowChainAt is unreachable because
 	// maxIter = len(buf)/usable + 2, which means the buffer fills before maxIter
 	// is exceeded. Test the bounds checking path (pgno > dbSize) instead.
 	dir := t.TempDir()
@@ -4037,7 +4073,7 @@ func TestWalIndex_WriteHeader_RegionError(t *testing.T) {
 	// For heap shm, region with grow=true always succeeds.
 	// To trigger an error, we'd need a custom shm impl.
 	// Let's just verify writeHeader works normally
-	err = wi.writeHeader(10, 5, 0)
+	err = wi.writeHeader(10, 5, 0, [2]uint32{}, [2]uint32{})
 	assert.NoError(t, err)
 }
 
@@ -4048,7 +4084,7 @@ func TestWalIndex_ReadHeader_ValidRoundtrip(t *testing.T) {
 	defer wi.close()
 
 	// Write a valid header and read it back
-	err = wi.writeHeader(5, 3, 0)
+	err = wi.writeHeader(5, 3, 0, [2]uint32{}, [2]uint32{})
 	require.NoError(t, err)
 	hdr, ok := wi.readHeader()
 	assert.True(t, ok)
@@ -4139,6 +4175,7 @@ func TestWALWriteHeader_SyncError(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
+	defer w.close()
 
 	// Close the file to cause write + sync errors
 	w.file.Close()
@@ -4188,6 +4225,7 @@ func TestWALRecover_PartialFrame(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
+	defer w.close()
 
 	// Write a valid header
 	require.NoError(t, w.writeHeader())
@@ -4218,6 +4256,7 @@ func TestWALRecover_RebuildReadError(t *testing.T) {
 	p := newPager(path, 4096, 100, true)
 	p.inProcess = true
 	require.NoError(t, p.open())
+	defer p.close()
 
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
@@ -4250,6 +4289,7 @@ func TestWALWriteFrames_FlushHeaderError(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
+	defer w.close()
 
 	// headerOnDisk is false after open with empty WAL
 	assert.False(t, w.headerOnDisk)
@@ -4276,6 +4316,7 @@ func TestWALWriteFrames_WriteAtError(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
+	defer w.close()
 
 	// Flush header first so the flushHeader path is skipped
 	require.NoError(t, w.flushHeader())
@@ -4301,6 +4342,7 @@ func TestWALWriteFrames_FdatasyncError(t *testing.T) {
 	w.inProcess = true
 	w.noCommitSync = false
 	require.NoError(t, w.open())
+	defer w.close()
 
 	// Flush header
 	require.NoError(t, w.flushHeader())
@@ -4326,6 +4368,7 @@ func TestCheckpointWithMode_LockCheckpointError(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
+	defer w.close()
 
 	// Hold the checkpoint lock exclusively first
 	require.NoError(t, w.index.lock(lockCheckpoint, lockExclusive))
@@ -4354,6 +4397,7 @@ func TestCheckpointWithMode_FdatasyncWALError(t *testing.T) {
 	p := newPager(path, 4096, 100, true)
 	p.inProcess = true
 	require.NoError(t, p.open())
+	defer p.close()
 
 	// Write some data so checkpoint has something to do
 	mf, slot, err := p.beginRead()
@@ -4373,7 +4417,7 @@ func TestCheckpointWithMode_FdatasyncWALError(t *testing.T) {
 	// Close the WAL file to cause fdatasync error during checkpoint
 	p.wal.file.Close()
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	assert.Error(t, err)
 
 	p.wal.file = nil // prevent double close
@@ -4408,7 +4452,7 @@ func TestCheckpointWithMode_BackfillErrors(t *testing.T) {
 	p.file.Close()
 
 	// Open a read-only copy for the WAL file
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	assert.Error(t, err) // dbFile.WriteAt should fail
 
 	p.file = nil // prevent double-close
@@ -4422,6 +4466,7 @@ func TestCheckpointWithMode_FdatasyncDbFileError(t *testing.T) {
 	p := newPager(path, 4096, 100, true)
 	p.inProcess = true
 	require.NoError(t, p.open())
+	defer p.close()
 
 	// Write data
 	mf, slot, err := p.beginRead()
@@ -4468,6 +4513,7 @@ func TestTryResetWALWithBusy_NonBusyError(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
+	defer w.close()
 
 	// Write some frames
 	pg := &page{pgno: 2, data: make([]byte, 4096)}
@@ -4492,6 +4538,7 @@ func TestDoResetWAL_TruncateError(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
+	defer w.close()
 
 	// Close the file to make truncate fail
 	w.file.Close()
@@ -4636,7 +4683,7 @@ func TestGetPageAt_CleanPageStaleSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf2)
 
-	cachedPg, err := p.getPageAt(pgno, mf2)
+	cachedPg, err := p.getPageWriter(pgno, mf2)
 	require.NoError(t, err)
 	p.releasePage(cachedPg)
 
@@ -4651,12 +4698,12 @@ func TestGetPageAt_CleanPageStaleSnapshot(t *testing.T) {
 	p.endRead(slot2)
 
 	// Now read with the OLD maxFrame (mf2) - the cached page should have
-	// latestFrame > mf2, triggering readPageUncached
+	// latestFrame > mf2, triggering getPageReader
 	mf3, slot3, err := p.beginRead()
 	require.NoError(t, err)
 
 	// Use mf2 (old snapshot) to trigger the stale cache path
-	stale, err := p.getPageAt(pgno, mf2)
+	stale, err := p.getPageWriter(pgno, mf2)
 	require.NoError(t, err)
 	p.releasePage(stale)
 	_ = mf3
@@ -4708,7 +4755,7 @@ func TestCheckpointWithMode_ReaderBlocksMxSafeFrame(t *testing.T) {
 	p.endRead(slot2)
 
 	// PASSIVE checkpoint - should be limited by the reader's mark
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointPassive, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointPassive, nil)
 	require.NoError(t, err)
 
 	_ = mfRead
@@ -4724,6 +4771,7 @@ func TestWALRecover_UncommittedTrailingFrames(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
+	defer w.close()
 
 	// Write a committed frame
 	pg1 := &page{pgno: 2, data: make([]byte, 4096)}
@@ -4755,6 +4803,7 @@ func TestBeginRead_AllSlotsBusy(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
+	defer w.close()
 
 	// Write a frame so maxFrame > 0 and nBackfill != maxFrame
 	pg := &page{pgno: 2, data: make([]byte, 4096)}
@@ -4804,7 +4853,7 @@ func TestCheckpointPost_PartialCheckpoint(t *testing.T) {
 	p.endRead(slot)
 
 	// RESTART checkpoint
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointRestart, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil)
 	require.NoError(t, err)
 }
 
@@ -4832,8 +4881,8 @@ func TestCheckpointWithMode_InMemory_PcachePath(t *testing.T) {
 	require.NoError(t, err)
 	p.endRead(slot)
 
-	// Checkpoint in InMemory mode - should use pcache path
-	err = p.wal.checkpointWithMode(nil, p.cache, CheckpointFull, nil)
+	// Checkpoint in InMemory mode - should use masterStore path
+	err = p.wal.checkpointWithMode(nil, p.master, CheckpointFull, nil)
 	require.NoError(t, err)
 }
 
@@ -4844,6 +4893,7 @@ func TestBeginRead_BestSlotLockFails(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
+	defer w.close()
 
 	// Write frames
 	pg := &page{pgno: 2, data: make([]byte, 4096)}
@@ -4892,7 +4942,7 @@ func TestCheckpointWithMode_Truncate_Full(t *testing.T) {
 	p.endRead(slot)
 
 	// TRUNCATE checkpoint
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointTruncate, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointTruncate, nil)
 	require.NoError(t, err)
 
 	// WAL file should have header size (32 bytes) after truncate+writeHeader
@@ -4927,7 +4977,7 @@ func TestCheckpointWithMode_FullNoReset(t *testing.T) {
 	p.endRead(slot)
 
 	// FULL checkpoint - should not reset WAL
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	require.NoError(t, err)
 
 	// WAL should still have frames (FULL does not truncate/reset)
@@ -5133,6 +5183,7 @@ func TestCheckpointWithMode_DbFileWriteError(t *testing.T) {
 	p := newPager(path, 4096, 100, true)
 	p.inProcess = true
 	require.NoError(t, p.open())
+	defer p.close()
 
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
@@ -5152,7 +5203,7 @@ func TestCheckpointWithMode_DbFileWriteError(t *testing.T) {
 	require.NoError(t, err)
 	defer roFile.Close()
 
-	err = p.wal.checkpointWithMode(roFile, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(roFile, p.master, CheckpointFull, nil)
 	assert.Error(t, err)
 
 	p.close()
@@ -5166,6 +5217,7 @@ func TestWALWriteFrames_NonInProcess_CommitShmHeader(t *testing.T) {
 	w.inProcess = false
 	w.noCommitSync = true
 	require.NoError(t, w.open())
+	defer w.close()
 
 	pg := &page{pgno: 2, data: make([]byte, 4096)}
 	copy(pg.data[4:], "test commit non-inprocess")
@@ -5182,6 +5234,7 @@ func TestWALRecover_BadSalt(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
+	defer w.close()
 
 	pg := &page{pgno: 2, data: make([]byte, 4096)}
 	copy(pg.data[4:], "good frame")
@@ -5212,6 +5265,7 @@ func TestWALRecover_BadChecksum(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
+	defer w.close()
 
 	pg := &page{pgno: 2, data: make([]byte, 4096)}
 	copy(pg.data[4:], "good frame for cksum test")
@@ -5304,7 +5358,7 @@ func TestCheckpointWithMode_FileReadPageDataError(t *testing.T) {
 	require.NoError(t, err)
 	p.wal.file = f
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	assert.Error(t, err)
 
 	p.wal.close()
@@ -5320,6 +5374,7 @@ func TestCheckpointWithMode_FdatasyncDbFileError_Precise(t *testing.T) {
 	p := newPager(path, 4096, 100, true)
 	p.inProcess = true
 	require.NoError(t, p.open())
+	defer p.close()
 
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
@@ -5355,7 +5410,7 @@ func TestCheckpointWithMode_FdatasyncDbFileError_Precise(t *testing.T) {
 
 	tmpFile2, err := os.OpenFile(tmpPath, os.O_RDWR, 0666)
 	require.NoError(t, err)
-	err = p.wal.checkpointWithMode(tmpFile2, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(tmpFile2, p.master, CheckpointFull, nil)
 	require.NoError(t, err)
 	tmpFile2.Close()
 
@@ -5528,7 +5583,7 @@ func TestWalIndex_WriteHeader_RegionError_Injected(t *testing.T) {
 		regionErr:  os.ErrClosed,
 	}
 
-	err := w.index.writeHeader(10, 5, 0)
+	err := w.index.writeHeader(10, 5, 0, [2]uint32{}, [2]uint32{})
 	assert.ErrorIs(t, err, os.ErrClosed)
 }
 
@@ -5665,6 +5720,7 @@ func TestCheckpointWithMode_WriteLockNonBusyError(t *testing.T) {
 	p := newPager(dbPath, 4096, 100, true)
 	p.inProcess = true
 	require.NoError(t, p.open())
+	defer p.close()
 
 	// Write some data to create WAL frames.
 	mf, slot, err := p.beginRead()
@@ -5686,7 +5742,7 @@ func TestCheckpointWithMode_WriteLockNonBusyError(t *testing.T) {
 		lockErr:  os.ErrPermission,
 	}
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	assert.ErrorIs(t, err, os.ErrPermission)
 
 	// Restore original shm for clean close.
@@ -5701,6 +5757,7 @@ func TestCheckpointWithMode_ReaderLockNonBusyError(t *testing.T) {
 	p := newPager(dbPath, 4096, 100, true)
 	p.inProcess = true
 	require.NoError(t, p.open())
+	defer p.close()
 
 	// Write data and commit.
 	mf, slot, err := p.beginRead()
@@ -5725,7 +5782,7 @@ func TestCheckpointWithMode_ReaderLockNonBusyError(t *testing.T) {
 		lockErr:  os.ErrPermission,
 	}
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	assert.ErrorIs(t, err, os.ErrPermission)
 
 	p.wal.index.shm = newHeapShm()
@@ -5739,6 +5796,7 @@ func TestCheckpointWithMode_BackfillLockNonBusyError(t *testing.T) {
 	p := newPager(dbPath, 4096, 100, true)
 	p.inProcess = true
 	require.NoError(t, p.open())
+	defer p.close()
 
 	// Write data and commit.
 	mf, slot, err := p.beginRead()
@@ -5762,7 +5820,7 @@ func TestCheckpointWithMode_BackfillLockNonBusyError(t *testing.T) {
 		lockErr:      os.ErrPermission,
 	}
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointFull, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	assert.ErrorIs(t, err, os.ErrPermission)
 
 	p.wal.index.shm = newHeapShm()
@@ -5791,6 +5849,7 @@ func TestTryResetWAL_NonBusyReaderLockError(t *testing.T) {
 	p := newPager(dbPath, 4096, 100, true)
 	p.inProcess = true
 	require.NoError(t, p.open())
+	defer p.close()
 
 	// Write data and commit.
 	mf, slot, err := p.beginRead()
@@ -5819,7 +5878,7 @@ func TestTryResetWAL_NonBusyReaderLockError(t *testing.T) {
 	// First need nBackfill == maxFrame to reach the tryResetWAL path.
 	p.wal.index.nBackfill.Store(p.wal.index.maxFrame.Load())
 
-	err = p.wal.checkpointWithMode(p.file, p.cache, CheckpointRestart, nil)
+	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil)
 	assert.ErrorIs(t, err, os.ErrPermission)
 
 	p.wal.index.shm = newHeapShm()
@@ -5833,6 +5892,7 @@ func TestCheckpointWithMode_FdatasyncDbFileError_RO(t *testing.T) {
 	p := newPager(dbPath, 4096, 100, true)
 	p.inProcess = true
 	require.NoError(t, p.open())
+	defer p.close()
 
 	// Write data and commit.
 	mf, slot, err := p.beginRead()
@@ -5855,7 +5915,7 @@ func TestCheckpointWithMode_FdatasyncDbFileError_RO(t *testing.T) {
 	require.NoError(t, err)
 	defer roFile.Close()
 
-	err = p.wal.checkpointWithMode(roFile, p.cache, CheckpointPassive, nil)
+	err = p.wal.checkpointWithMode(roFile, p.master, CheckpointPassive, nil)
 	// On Linux, fdatasync on a read-only fd returns EBADF or succeeds silently.
 	// We just verify no panic and the function returns (either nil or error).
 	_ = err
@@ -5881,6 +5941,7 @@ func TestWalOpen_LockCheckpointError(t *testing.T) {
 	w2 := newWal(filepath.Join(dir, "test.db"), 4096)
 	w2.inProcess = true
 	require.NoError(t, w2.open())
+	defer w2.close()
 
 	// Lock checkpoint exclusively to block next open.
 	require.NoError(t, w2.index.lock(lockCheckpoint, lockExclusive))
@@ -6206,7 +6267,7 @@ func TestCov2_WriteOverflowChain_AllocatePageError(t *testing.T) {
 	t.Skip("BUG: L1306-1308 requires allocatePage to fail during overflow chain write - defensive I/O error path")
 }
 
-// --- pager.go L1375-1377: max iteration error in readOverflowChainInternal ---
+// --- pager.go L1375-1377: max iteration error in readOverflowChainAt ---
 // maxIter = len(buf)/usable + 2, and the loop can do at most
 // ceil(len(buf)/usable) iterations before off >= len(buf). Since
 // ceil(len(buf)/usable) <= len(buf)/usable + 1 < maxIter, the loop always
@@ -6490,6 +6551,7 @@ func TestCov2_FlushHeader_SyncError_RealFile(t *testing.T) {
 	p := newPager(dbPath, 4096, 100, true)
 	p.inProcess = true
 	require.NoError(t, p.open())
+	defer p.close()
 
 	// Start a write transaction
 	maxFrame, slot, err := p.beginRead()
@@ -6896,23 +6958,23 @@ func TestPagerStressThenCommit(t *testing.T) {
 	require.NoError(t, err)
 	defer p.endRead(slot2)
 
-	rpg2, err := p.getPageAt(pg2no, mf2)
+	rpg2, err := p.getPageWriter(pg2no, mf2)
 	require.NoError(t, err)
 	assert.Equal(t, "page2-data", string(rpg2.data[100:110]),
 		"spilled page data should be readable after commit")
-	p.cache.release(rpg2)
+	p.writerCache.release(rpg2)
 
-	rpg3, err := p.getPageAt(pg3no, mf2)
+	rpg3, err := p.getPageWriter(pg3no, mf2)
 	require.NoError(t, err)
 	assert.Equal(t, "page3-data", string(rpg3.data[100:110]),
 		"normally committed page data should be readable")
-	p.cache.release(rpg3)
+	p.writerCache.release(rpg3)
 
-	rpg4, err := p.getPageAt(pg4no, mf2)
+	rpg4, err := p.getPageWriter(pg4no, mf2)
 	require.NoError(t, err)
 	assert.Equal(t, "page4-data", string(rpg4.data[100:110]),
 		"normally committed page data should be readable")
-	p.cache.release(rpg4)
+	p.writerCache.release(rpg4)
 }
 
 func TestPagerStressThenRollback(t *testing.T) {
@@ -6975,11 +7037,11 @@ func TestPagerStressThenRollback(t *testing.T) {
 	require.NoError(t, err)
 	defer p.endRead(slot3)
 
-	rpg2, err := p.getPageAt(pg2no, mf3)
+	rpg2, err := p.getPageWriter(pg2no, mf3)
 	require.NoError(t, err)
 	assert.Equal(t, "original!!", string(rpg2.data[100:110]),
 		"page should have original data after rollback of spilled transaction")
-	p.cache.release(rpg2)
+	p.writerCache.release(rpg2)
 }
 
 func TestPagerStressThenSavepointRollback(t *testing.T) {
@@ -7056,17 +7118,17 @@ func TestPagerStressThenSavepointRollback(t *testing.T) {
 	require.NoError(t, err)
 	defer p.endRead(slot2)
 
-	rpg2, err := p.getPageAt(pg2no, mf2)
+	rpg2, err := p.getPageWriter(pg2no, mf2)
 	require.NoError(t, err)
 	assert.Equal(t, "before-sp!", string(rpg2.data[100:110]),
 		"committed data should reflect pre-savepoint state")
-	p.cache.release(rpg2)
+	p.writerCache.release(rpg2)
 
-	rpg3, err := p.getPageAt(pg3no, mf2)
+	rpg3, err := p.getPageWriter(pg3no, mf2)
 	require.NoError(t, err)
 	assert.Equal(t, "pg3-init!!", string(rpg3.data[100:110]),
 		"page 3 data should be committed correctly")
-	p.cache.release(rpg3)
+	p.writerCache.release(rpg3)
 }
 
 // TestSavepointRollbackReDirtiesSpilledPages verifies that pages made clean
@@ -7124,11 +7186,11 @@ func TestSavepointRollbackReDirtiesSpilledPages(t *testing.T) {
 	require.NoError(t, err)
 	defer p.endRead(slot2)
 
-	rpg2, err := p.getPageAt(pg2no, mf2)
+	rpg2, err := p.getPageWriter(pg2no, mf2)
 	require.NoError(t, err)
 	assert.Equal(t, "pre-save!!", string(rpg2.data[100:110]),
 		"pre-savepoint data must survive commit after spill + savepoint rollback")
-	p.cache.release(rpg2)
+	p.writerCache.release(rpg2)
 }
 
 // ============================================================
@@ -7166,9 +7228,7 @@ func TestLargeTransactionBoundedMemory(t *testing.T) {
 	// Verify cache size stayed near the limit (with some tolerance for
 	// pinned pages and page 1). The key assertion: cache did NOT grow to
 	// numPages, proving that spilling occurred.
-	p.cache.mu.Lock()
-	cachedCount := len(p.cache.pages)
-	p.cache.mu.Unlock()
+	cachedCount := len(p.writerCache.pages)
 	assert.Less(t, cachedCount, numPages,
 		"cache should NOT contain all pages — spilling should have occurred")
 	// The cache should be near maxPages (some tolerance for overhead pages)
@@ -7186,12 +7246,12 @@ func TestLargeTransactionBoundedMemory(t *testing.T) {
 	defer p.endRead(slot2)
 
 	for i, pgno := range pageNos {
-		pg, err := p.getPageAt(pgno, mf2)
+		pg, err := p.getPageWriter(pgno, mf2)
 		require.NoError(t, err, "failed to read page %d (pgno=%d)", i, pgno)
 		expected := fmt.Sprintf("page-%04d", i)
 		assert.Equal(t, expected, string(pg.data[100:109]),
 			"page %d data mismatch after commit with spilling", i)
-		p.cache.release(pg)
+		p.writerCache.release(pg)
 	}
 }
 
@@ -7236,12 +7296,12 @@ func TestSpillThenCheckpoint(t *testing.T) {
 	defer p.endRead(slot2)
 
 	for i, pgno := range pageNos {
-		pg, err := p.getPageAt(pgno, mf2)
+		pg, err := p.getPageWriter(pgno, mf2)
 		require.NoError(t, err, "failed to read page %d after checkpoint", pgno)
 		expected := fmt.Sprintf("ckpt-%04d", i)
 		assert.Equal(t, expected, string(pg.data[100:109]),
 			"page %d data mismatch after checkpoint", pgno)
-		p.cache.release(pg)
+		p.writerCache.release(pg)
 	}
 }
 
@@ -7293,12 +7353,12 @@ func TestSpillMultipleRounds(t *testing.T) {
 	defer p.endRead(slot2)
 
 	for i, pgno := range pageNos {
-		pg, err := p.getPageAt(pgno, mf2)
+		pg, err := p.getPageWriter(pgno, mf2)
 		require.NoError(t, err)
 		expected := fmt.Sprintf("wave-%04d", i)
 		assert.Equal(t, expected, string(pg.data[100:109]),
 			"page %d data mismatch after multi-round spill commit", i)
-		p.cache.release(pg)
+		p.writerCache.release(pg)
 	}
 }
 
@@ -7362,17 +7422,17 @@ func TestConcurrentReaderDuringSpill(t *testing.T) {
 	}
 
 	// Reader should still see the original committed data, not spilled data
-	rpg2, err := p.getPageAt(pg2no, readerMf)
+	rpg2, err := p.getPageWriter(pg2no, readerMf)
 	require.NoError(t, err)
 	assert.Equal(t, "baseline!!", string(rpg2.data[100:110]),
 		"reader should see pre-spill committed data for page 2")
-	p.cache.release(rpg2)
+	p.writerCache.release(rpg2)
 
-	rpg3, err := p.getPageAt(pg3no, readerMf)
+	rpg3, err := p.getPageWriter(pg3no, readerMf)
 	require.NoError(t, err)
 	assert.Equal(t, "base-pg3!!", string(rpg3.data[100:110]),
 		"reader should see original data for unmodified page 3")
-	p.cache.release(rpg3)
+	p.writerCache.release(rpg3)
 
 	// End reader
 	p.endRead(readerSlot)
@@ -7387,11 +7447,11 @@ func TestConcurrentReaderDuringSpill(t *testing.T) {
 	require.NoError(t, err)
 	defer p.endRead(slot3)
 
-	rpg2new, err := p.getPageAt(pg2no, mf3)
+	rpg2new, err := p.getPageWriter(pg2no, mf3)
 	require.NoError(t, err)
 	assert.Equal(t, "modified!!", string(rpg2new.data[100:110]),
 		"new reader should see committed modified data")
-	p.cache.release(rpg2new)
+	p.writerCache.release(rpg2new)
 }
 
 // TestSpillInMemoryMode verifies that the writeFramesMem path handles spill
@@ -7438,11 +7498,11 @@ func TestSpillInMemoryMode(t *testing.T) {
 	defer p.endRead(slot2)
 
 	for i, pgno := range pageNos {
-		pg, err := p.getPageAt(pgno, mf2)
+		pg, err := p.getPageWriter(pgno, mf2)
 		require.NoError(t, err, "failed to read page %d in InMemory mode", pgno)
 		expected := fmt.Sprintf("mem-%05d", i)
 		assert.Equal(t, expected, string(pg.data[100:109]),
 			"InMemory page %d data mismatch after spill+commit", i)
-		p.cache.release(pg)
+		p.writerCache.release(pg)
 	}
 }

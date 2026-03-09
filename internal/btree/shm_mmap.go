@@ -31,11 +31,25 @@ const shmDMSOffset = 120 + int64(lockSlotCount) // right after the per-slot lock
 
 // mmapShm implements the shm interface using mmap on a .shm file.
 // This enables multi-process access to the WAL index, matching SQLite's approach.
+//
+// In-process lock tracking: POSIX fcntl advisory locks are per-(process, inode),
+// NOT per-file-descriptor or per-goroutine. Within a single process, a shared
+// lock from one goroutine does not block an exclusive lock from another goroutine
+// on the same file — fcntl silently "upgrades" the lock. This breaks checkpoint's
+// reader-detection logic: the checkpoint acquires exclusive locks on reader slots
+// to check if readers are active, but within the same process these locks always
+// succeed regardless of active readers.
+//
+// To fix this, mmapShm maintains in-process lock counters (like SQLite's
+// unixInodeInfo.aLock[] in os_unix.c) that track per-goroutine shared/exclusive
+// state. The in-process layer provides correct intra-process lock semantics,
+// while fcntl provides inter-process coordination.
 type mmapShm struct {
 	mu      sync.Mutex
 	file    fileHandle
 	path    string
 	regions [][]byte // mmap'd regions
+	locks   [lockSlotCount]int // in-process lock state: 0=unlocked, >0=shared count, -1=exclusive
 }
 
 // newPlatformShm creates a new mmap-backed shm.
@@ -104,29 +118,94 @@ func (s *mmapShm) region(index int, create bool) ([]byte, error) {
 	return data, nil
 }
 
-// lock acquires a POSIX advisory lock on the shm file for the given slot.
-// Each slot corresponds to a 1-byte range in the file (matching SQLite's approach).
-// The lock range starts at byte offset 120 (after the WAL index header area).
+// lock acquires a lock on the given slot. It first checks the in-process lock
+// counters (for intra-process correctness), then acquires the fcntl lock (for
+// inter-process coordination). If the in-process check fails, fcntl is not called.
+//
+// This matches SQLite's unixShmLock() (os_unix.c) which checks the
+// unixInodeInfo.aLock[] counters before calling fcntl.
 func (s *mmapShm) lock(slot int, lockType int) error {
 	if slot < 0 || slot >= lockSlotCount {
 		return fmt.Errorf("btree: invalid lock slot %d", slot)
 	}
 
-	lt := syscall.F_RDLCK
-	if lockType == lockExclusive {
-		lt = syscall.F_WRLCK
+	s.mu.Lock()
+	current := s.locks[slot]
+
+	switch lockType {
+	case lockShared:
+		if current < 0 {
+			// Exclusive lock held in-process — cannot acquire shared.
+			s.mu.Unlock()
+			return ErrBusy
+		}
+		// Only call fcntl when transitioning from unlocked to shared (first
+		// shared holder). Subsequent same-process shared locks are tracked
+		// purely in-process — fcntl already holds the shared lock from the
+		// first acquisition. This matches SQLite's unixShmLock optimization:
+		// "p->sharedMask |= mask" without calling fcntl when the OS lock is
+		// already held.
+		if current == 0 {
+			if err := s.fcntlLock(syscall.F_RDLCK, shmLockOffset(slot)); err != nil {
+				s.mu.Unlock()
+				return err
+			}
+		}
+		s.locks[slot] = current + 1
+
+	case lockExclusive:
+		if current != 0 {
+			// Any lock held in-process — cannot acquire exclusive.
+			s.mu.Unlock()
+			return ErrBusy
+		}
+		if err := s.fcntlLock(syscall.F_WRLCK, shmLockOffset(slot)); err != nil {
+			s.mu.Unlock()
+			return err
+		}
+		s.locks[slot] = -1
 	}
 
-	return s.fcntlLock(lt, shmLockOffset(slot))
+	s.mu.Unlock()
+	return nil
 }
 
-// unlock releases the POSIX advisory lock on the given slot.
+// unlock releases the lock on the given slot. It updates the in-process lock
+// counters and calls fcntl only when the last holder releases.
 func (s *mmapShm) unlock(slot int, lockType int) error {
 	if slot < 0 || slot >= lockSlotCount {
 		return fmt.Errorf("btree: invalid lock slot %d", slot)
 	}
-	_ = lockType // unlock is the same regardless of type
-	return s.fcntlLock(syscall.F_UNLCK, shmLockOffset(slot))
+
+	s.mu.Lock()
+	current := s.locks[slot]
+
+	switch lockType {
+	case lockShared:
+		if current > 0 {
+			// Only release fcntl lock when last shared holder releases.
+			// Update the counter AFTER fcntl succeeds to keep in-process
+			// state consistent on failure (matches SQLite's unixShmLock).
+			if current == 1 {
+				if err := s.fcntlLock(syscall.F_UNLCK, shmLockOffset(slot)); err != nil {
+					s.mu.Unlock()
+					return err
+				}
+			}
+			s.locks[slot] = current - 1
+		}
+	case lockExclusive:
+		if current == -1 {
+			if err := s.fcntlLock(syscall.F_UNLCK, shmLockOffset(slot)); err != nil {
+				s.mu.Unlock()
+				return err
+			}
+			s.locks[slot] = 0
+		}
+	}
+
+	s.mu.Unlock()
+	return nil
 }
 
 // shmLockOffset returns the byte offset in the shm file for the given lock slot.

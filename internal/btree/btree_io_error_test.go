@@ -483,7 +483,7 @@ func TestIO_WriteOverflowChain_NotWriter(t *testing.T) {
 	require.ErrorIs(t, err, ErrReadOnly)
 }
 
-// --- pager.go L1375-1377: readOverflowChainInternal max iteration exceeded ---
+// --- pager.go L1375-1377: readOverflowChainAt max iteration exceeded ---
 // Create a circular overflow chain to trigger max iteration check.
 
 func TestIO_ReadOverflowChain_MaxIteration(t *testing.T) {
@@ -855,7 +855,7 @@ func TestIO_AppendValue_OverflowVarintError(t *testing.T) {
 	require.NoError(t, rtx.Rollback())
 }
 
-// --- pager.go L1375-1377: readOverflowChainInternal with out-of-bounds page ---
+// --- pager.go L1375-1377: readOverflowChainAt with out-of-bounds page ---
 
 func TestIO_ReadOverflowChain_OutOfBoundsPage(t *testing.T) {
 	dir := t.TempDir()
@@ -1257,7 +1257,7 @@ func TestIO_FreePage_NotWriter(t *testing.T) {
 	require.ErrorIs(t, err, ErrReadOnly)
 }
 
-// --- pager.go readOverflowChainInternal with pgno < 2 (L1369-1371) ---
+// --- pager.go readOverflowChainAt with pgno < 2 (L1369-1371) ---
 
 func TestIO_ReadOverflowChain_InvalidStartPage(t *testing.T) {
 	db := tempDB(t)

@@ -24,9 +24,10 @@ func TestPcacheFetchAndMakeDirty_Clean(t *testing.T) {
 	assert.Equal(t, 1, pc.nClean)
 	assert.False(t, pg.dirty)
 
-	// fetchAndMakeDirty should fetch it, mark dirty, remove from LRU
-	p := pc.fetchAndMakeDirty(1)
+	// fetch + makeDirty should fetch it, mark dirty, remove from LRU
+	p := pc.fetch(1)
 	require.NotNil(t, p)
+	pc.makeDirty(p)
 	assert.True(t, p.dirty)
 	assert.Equal(t, 0, pc.nClean)
 	assert.Equal(t, 1, pc.nDirty)
@@ -41,9 +42,10 @@ func TestPcacheFetchAndMakeDirty_AlreadyDirty(t *testing.T) {
 	assert.True(t, pg.dirty)
 	assert.Equal(t, 1, pc.nDirty)
 
-	// fetchAndMakeDirty on already-dirty page should just pin it
-	p := pc.fetchAndMakeDirty(1)
+	// fetch + makeDirty on already-dirty page should just pin it
+	p := pc.fetch(1)
 	require.NotNil(t, p)
+	pc.makeDirty(p) // no-op since already dirty
 	assert.True(t, p.dirty)
 	assert.Equal(t, 1, pc.nDirty) // no double-count
 }
@@ -51,8 +53,8 @@ func TestPcacheFetchAndMakeDirty_AlreadyDirty(t *testing.T) {
 func TestPcacheFetchAndMakeDirty_NotFound(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	// fetchAndMakeDirty on non-existent page should return nil
-	p := pc.fetchAndMakeDirty(999)
+	// fetch on non-existent page should return nil
+	p := pc.fetch(999)
 	assert.Nil(t, p)
 }
 
@@ -65,11 +67,13 @@ func TestPcacheFetchAndMakeDirty_MultipleDirty(t *testing.T) {
 	pg2 := pc.create(2)
 	pc.release(pg2)
 
-	// fetchAndMakeDirty both — second should chain in front of first
-	p1 := pc.fetchAndMakeDirty(1)
+	// fetch + makeDirty both — second should chain in front of first
+	p1 := pc.fetch(1)
 	require.NotNil(t, p1)
-	p2 := pc.fetchAndMakeDirty(2)
+	pc.makeDirty(p1)
+	p2 := pc.fetch(2)
 	require.NotNil(t, p2)
+	pc.makeDirty(p2)
 
 	assert.Equal(t, 2, pc.nDirty)
 	// dirtyHead should be p2 (last inserted)
@@ -101,9 +105,7 @@ func TestPcacheEvictOne_EmptyLRU(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
 	// Manually call evictOne on empty LRU — should be no-op
-	pc.mu.Lock()
 	pc.evictOne() // lruHead == nil path
-	pc.mu.Unlock()
 	assert.Nil(t, pc.lruHead)
 }
 
@@ -117,9 +119,7 @@ func TestPcacheLruRemove_NotInLRU(t *testing.T) {
 	assert.Equal(t, 0, pc.nClean)
 
 	// lruRemove on a page not in LRU should be a no-op
-	pc.mu.Lock()
 	pc.lruRemove(pg)
-	pc.mu.Unlock()
 	assert.Equal(t, 0, pc.nClean)
 }
 
@@ -136,9 +136,7 @@ func TestPcacheLruRemove_Head(t *testing.T) {
 	assert.Equal(t, 3, pc.nClean)
 
 	// Remove head
-	pc.mu.Lock()
 	pc.lruRemove(pg1)
-	pc.mu.Unlock()
 	assert.Equal(t, 2, pc.nClean)
 	assert.Equal(t, pg2, pc.lruHead)
 	assert.Equal(t, pg3, pc.lruTail)
@@ -155,9 +153,7 @@ func TestPcacheLruRemove_Tail(t *testing.T) {
 	assert.Equal(t, 2, pc.nClean)
 
 	// Remove tail
-	pc.mu.Lock()
 	pc.lruRemove(pg2)
-	pc.mu.Unlock()
 	assert.Equal(t, 1, pc.nClean)
 	assert.Equal(t, pg1, pc.lruHead)
 	assert.Equal(t, pg1, pc.lruTail)
@@ -177,9 +173,7 @@ func TestPcacheLruRemove_Middle(t *testing.T) {
 	assert.Equal(t, 3, pc.nClean)
 
 	// Remove the middle page
-	pc.mu.Lock()
 	pc.lruRemove(pgs[1])
-	pc.mu.Unlock()
 	assert.Equal(t, 2, pc.nClean)
 	assert.Equal(t, pgs[0], pc.lruHead)
 	assert.Equal(t, pgs[2], pc.lruTail)
@@ -211,37 +205,36 @@ func TestPcacheAppendDirtyPages(t *testing.T) {
 	assert.Len(t, result, 2)
 }
 
-func TestPcacheFetchPinned_Clean(t *testing.T) {
+func TestPcacheFetch_Clean(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
 	pg := pc.create(1)
 	pc.release(pg)
 
-	// fetchPinned on a clean page: wasDirty=false
-	p, wasDirty := pc.fetchPinned(1)
+	// fetch on a clean page: dirty=false
+	p := pc.fetch(1)
 	require.NotNil(t, p)
-	assert.False(t, wasDirty)
+	assert.False(t, p.dirty)
 }
 
-func TestPcacheFetchPinned_Dirty(t *testing.T) {
+func TestPcacheFetch_Dirty(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
 	pg := pc.create(1)
 	pc.makeDirty(pg)
 	pc.release(pg)
 
-	// fetchPinned on a dirty page: wasDirty=true
-	p, wasDirty := pc.fetchPinned(1)
+	// fetch on a dirty page: dirty=true
+	p := pc.fetch(1)
 	require.NotNil(t, p)
-	assert.True(t, wasDirty)
+	assert.True(t, p.dirty)
 }
 
-func TestPcacheFetchPinned_NotFound(t *testing.T) {
+func TestPcacheFetch_NotFound(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	p, wasDirty := pc.fetchPinned(999)
+	p := pc.fetch(999)
 	assert.Nil(t, p)
-	assert.False(t, wasDirty)
 }
 
 func TestPcacheCreateExistingDirty(t *testing.T) {
@@ -756,11 +749,18 @@ func TestMmapShm_FcntlLockError(t *testing.T) {
 	_ = savedFile.Close()
 	ms.file = savedFile // fd is now invalid
 
-	// lock should fail with bad fd
+	// lock should fail with bad fd — fcntl called because in-process counter is 0
 	err = ms.lock(0, lockShared)
 	assert.Error(t, err)
 
-	// unlock should also fail
+	// unlock is a no-op: the lock above failed so the in-process counter
+	// was never incremented. No fcntl call is made, so no error.
+	err = ms.unlock(0, lockShared)
+	assert.NoError(t, err)
+
+	// Verify fcntl error propagates through unlock: manually set the
+	// counter to simulate a held lock, then unlock triggers fcntl on bad fd.
+	ms.locks[0] = 1
 	err = ms.unlock(0, lockShared)
 	assert.Error(t, err)
 
@@ -899,7 +899,7 @@ func TestIntegrityCheck_CorruptFreelistLeafCount(t *testing.T) {
 	trunkPgno := db.pager.header.FirstFreelistPg
 	maxFrame, slot, rerr := db.pager.beginRead()
 	require.NoError(t, rerr)
-	trunkPg, rerr := db.pager.getPageAt(trunkPgno, maxFrame)
+	trunkPg, rerr := db.pager.getPageWriter(trunkPgno, maxFrame)
 	require.NoError(t, rerr)
 	origLeafCount := binary.BigEndian.Uint32(trunkPg.data[4:8])
 	db.pager.releasePage(trunkPg)
@@ -994,7 +994,7 @@ func TestIntegrityCheck_CorruptFreeblockSize(t *testing.T) {
 
 	// Read page to check if it has freeblocks
 	maxFrame, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, maxFrame)
+	pg, _ := db.pager.getPageWriter(rootPage, maxFrame)
 	hasFreeBlk := pg.header.firstFreeBlk != 0
 	db.pager.releasePage(pg)
 	db.pager.endRead(slot)
@@ -1569,7 +1569,7 @@ func TestIntegrityCheck_FreeblockChainUnordered(t *testing.T) {
 
 	// Check if root page has a freeblock chain
 	maxFrame, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, maxFrame)
+	pg, _ := db.pager.getPageWriter(rootPage, maxFrame)
 	firstFb := pg.header.firstFreeBlk
 	db.pager.releasePage(pg)
 	db.pager.endRead(slot)
@@ -1627,7 +1627,7 @@ func TestIntegrityCheck_FreeblockExtendsOffPage(t *testing.T) {
 	rootPage := ns.rootPage
 
 	maxFrame, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, maxFrame)
+	pg, _ := db.pager.getPageWriter(rootPage, maxFrame)
 	firstFb := pg.header.firstFreeBlk
 	db.pager.releasePage(pg)
 	db.pager.endRead(slot)
@@ -1887,7 +1887,7 @@ func TestIntegrityCheck_TooManyErrors_CheckTreePage(t *testing.T) {
 
 	// Find the root page and verify it's interior
 	maxFrame, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, maxFrame)
+	pg, _ := db.pager.getPageWriter(rootPage, maxFrame)
 	isInterior := pg.header.isInterior()
 	nCells := int(pg.header.cellCount)
 	var firstChildPage uint32
@@ -1953,7 +1953,7 @@ func TestIntegrityCheck_FreeblockSizeTooSmall_Deterministic(t *testing.T) {
 
 	// Find the root page and check if it has freeblocks
 	maxFrame, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, maxFrame)
+	pg, _ := db.pager.getPageWriter(rootPage, maxFrame)
 	firstFb := pg.header.firstFreeBlk
 	db.pager.releasePage(pg)
 	db.pager.endRead(slot)
@@ -1975,7 +1975,7 @@ func TestIntegrityCheck_FreeblockSizeTooSmall_Deterministic(t *testing.T) {
 		require.NoError(t, tx.Commit())
 
 		maxFrame, slot, _ = db.pager.beginRead()
-		pg, _ = db.pager.getPageAt(rootPage, maxFrame)
+		pg, _ = db.pager.getPageWriter(rootPage, maxFrame)
 		firstFb = pg.header.firstFreeBlk
 		db.pager.releasePage(pg)
 		db.pager.endRead(slot)
@@ -2208,7 +2208,7 @@ func TestIntegrityCheck_InteriorCellExtendsOffPage(t *testing.T) {
 
 	// Verify root is interior
 	mf, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, mf)
+	pg, _ := db.pager.getPageWriter(rootPage, mf)
 	require.True(t, pg.header.isInterior(), "root must be interior")
 	require.True(t, pg.header.cellCount >= 1, "need cells")
 	origCellOff := int(pg.getCellOffset(0))
@@ -2317,7 +2317,7 @@ func TestIntegrityCheck_InteriorCorruptKey(t *testing.T) {
 
 	// Verify root is interior
 	mf, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, mf)
+	pg, _ := db.pager.getPageWriter(rootPage, mf)
 	require.True(t, pg.header.isInterior())
 	require.True(t, pg.header.cellCount >= 1)
 	// Get a valid cell to use as template
@@ -2404,7 +2404,7 @@ func TestIntegrityCheck_ChildDepthDiffers_RightChild(t *testing.T) {
 	rootPage := ns.rootPage
 
 	maxFrame, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, maxFrame)
+	pg, _ := db.pager.getPageWriter(rootPage, maxFrame)
 	isInterior := pg.header.isInterior()
 	nCells := int(pg.header.cellCount)
 	rightChild := pg.header.rightChild
@@ -2420,7 +2420,7 @@ func TestIntegrityCheck_ChildDepthDiffers_RightChild(t *testing.T) {
 	var leafPage uint32
 	maxFrame, slot, _ = db.pager.beginRead()
 	for pgno := uint32(2); pgno < 20; pgno++ {
-		p, e := db.pager.getPageAt(pgno, maxFrame)
+		p, e := db.pager.getPageWriter(pgno, maxFrame)
 		if e == nil && p.header.isLeaf() {
 			leafPage = pgno
 			db.pager.releasePage(p)
@@ -2479,7 +2479,7 @@ func TestIntegrityCheck_InteriorNoCells(t *testing.T) {
 	rootPage := ns.rootPage
 
 	maxFrame, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, maxFrame)
+	pg, _ := db.pager.getPageWriter(rootPage, maxFrame)
 	isInterior := pg.header.isInterior()
 	db.pager.releasePage(pg)
 	db.pager.endRead(slot)
@@ -2856,7 +2856,7 @@ func TestIntegrityCheck_OverflowChainWrongLength(t *testing.T) {
 
 	// Find the overflow page number
 	maxFrame, slot, _ := db.pager.beginRead()
-	pg, _ := db.pager.getPageAt(rootPage, maxFrame)
+	pg, _ := db.pager.getPageWriter(rootPage, maxFrame)
 	cellOff := int(pg.getCellOffset(0))
 	cell, _, cerr := parseLeafCellWithSize(pg.data, cellOff, 512)
 	db.pager.releasePage(pg)
@@ -3199,4 +3199,636 @@ func TestCov2_FcntlLock_OtherError(t *testing.T) {
 	assert.NotErrorIs(t, err, ErrBusy)
 
 	s.file = nil
+}
+
+// ===== page.cache backpointer coverage =====
+
+func TestPageCacheBackpointer_SetOnCreate(t *testing.T) {
+	pc := newPcache(4096, 100, true)
+
+	// Creating a page should set pg.cache to the owning pcache.
+	pg := pc.create(1)
+	assert.Equal(t, pc, pg.cache, "page.cache should point to owning pcache after create")
+	assert.Equal(t, uint32(1), pg.pgno)
+	assert.Equal(t, 1, pg.pinCount)
+}
+
+func TestPageCacheBackpointer_PreservedOnFetch(t *testing.T) {
+	pc := newPcache(4096, 100, true)
+
+	pg := pc.create(1)
+	pc.release(pg)
+
+	// Fetching should preserve the cache backpointer.
+	fetched := pc.fetch(1)
+	require.NotNil(t, fetched)
+	assert.Equal(t, pc, fetched.cache, "page.cache should be preserved after fetch")
+}
+
+func TestPageCacheBackpointer_ReleaseRoutesViaCache(t *testing.T) {
+	pc := newPcache(4096, 100, true)
+
+	pg := pc.create(1)
+	assert.Equal(t, pc, pg.cache)
+
+	// Release via the page's cache backpointer (simulating releasePage routing).
+	pg.cache.release(pg)
+	assert.Equal(t, 0, pg.pinCount)
+	assert.Equal(t, 1, pc.nClean, "page should be on LRU after release")
+}
+
+func TestPageCacheBackpointer_ClearedOnRecycle(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Create a page with a cache set, simulating a cached page being recycled.
+	pg := &page{
+		data:     make([]byte, 4096),
+		cache:    &pcache{},
+		uncached: true,
+		pgno:     42,
+	}
+
+	// recycleTempPage should clear pg.cache.
+	db.pager.recycleTempPage(pg)
+	assert.Nil(t, pg.cache, "page.cache should be nil after recycleTempPage")
+	assert.Equal(t, uint32(0), pg.pgno, "pgno should be zeroed")
+	assert.False(t, pg.uncached, "uncached should be false")
+}
+
+func TestPageCacheBackpointer_DifferentCaches(t *testing.T) {
+	pc1 := newPcache(4096, 100, true)
+	pc2 := newPcache(4096, 100, true)
+
+	pg1 := pc1.create(1)
+	pg2 := pc2.create(1)
+
+	assert.Equal(t, pc1, pg1.cache, "pg1 should point to pc1")
+	assert.Equal(t, pc2, pg2.cache, "pg2 should point to pc2")
+	assert.True(t, pg1.cache != pg2.cache, "different caches should have different backpointers")
+
+	// Releasing each page should route to the correct cache.
+	pg1.cache.release(pg1)
+	assert.Equal(t, 1, pc1.nClean)
+	assert.Equal(t, 0, pc2.nClean)
+
+	pg2.cache.release(pg2)
+	assert.Equal(t, 1, pc1.nClean)
+	assert.Equal(t, 1, pc2.nClean)
+}
+
+// ===== masterStore coverage =====
+
+func TestMasterStore_ReadWriteBasic(t *testing.T) {
+	ms := &masterStore{pages: make(map[uint32][]byte)}
+
+	// Write a page
+	src := make([]byte, 4096)
+	copy(src, "hello masterStore")
+	ms.writePage(1, src)
+
+	// Read it back
+	dst := make([]byte, 4096)
+	found := ms.readPageInto(1, dst)
+	assert.True(t, found)
+	assert.Equal(t, src, dst)
+}
+
+func TestMasterStore_ReadNotFound(t *testing.T) {
+	ms := &masterStore{pages: make(map[uint32][]byte)}
+
+	dst := make([]byte, 4096)
+	found := ms.readPageInto(42, dst)
+	assert.False(t, found)
+}
+
+func TestMasterStore_OverwriteExisting(t *testing.T) {
+	ms := &masterStore{pages: make(map[uint32][]byte)}
+
+	src1 := make([]byte, 4096)
+	copy(src1, "version 1")
+	ms.writePage(1, src1)
+
+	src2 := make([]byte, 4096)
+	copy(src2, "version 2")
+	ms.writePage(1, src2)
+
+	dst := make([]byte, 4096)
+	found := ms.readPageInto(1, dst)
+	assert.True(t, found)
+	assert.Equal(t, src2, dst, "should have version 2 data")
+}
+
+func TestMasterStore_IsolatesFromSource(t *testing.T) {
+	ms := &masterStore{pages: make(map[uint32][]byte)}
+
+	src := make([]byte, 4096)
+	copy(src, "original")
+	ms.writePage(1, src)
+
+	// Modify the source buffer after writing
+	copy(src, "modified")
+
+	// masterStore should have a copy, not the original buffer
+	dst := make([]byte, 4096)
+	ms.readPageInto(1, dst)
+	assert.Equal(t, byte('o'), dst[0], "masterStore should hold a copy, not a reference")
+}
+
+func TestMasterStore_MultiplePages(t *testing.T) {
+	ms := &masterStore{pages: make(map[uint32][]byte)}
+
+	for pgno := uint32(1); pgno <= 10; pgno++ {
+		src := make([]byte, 4096)
+		binary.BigEndian.PutUint32(src, pgno)
+		ms.writePage(pgno, src)
+	}
+
+	// Verify each page
+	for pgno := uint32(1); pgno <= 10; pgno++ {
+		dst := make([]byte, 4096)
+		found := ms.readPageInto(pgno, dst)
+		assert.True(t, found, "page %d should exist", pgno)
+		assert.Equal(t, pgno, binary.BigEndian.Uint32(dst), "page %d should have correct data", pgno)
+	}
+}
+
+func TestMasterStore_InMemoryCheckpointBackfill(t *testing.T) {
+	// Full integration test: InMemory DB writes data, checkpoints, and reads back via masterStore.
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.InMemory = true
+	db, err := Open(filepath.Join(dir, "test.db"), opts)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Verify masterStore was created
+	require.NotNil(t, db.pager.master)
+
+	// Write some data
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("key1"), []byte("val1")))
+	require.NoError(t, tx.Commit())
+
+	// Read it back (verifies WAL read path works)
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	val, err := rtx.Get(ns, []byte("key1"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("val1"), val)
+	require.NoError(t, rtx.Rollback())
+
+	// Force a checkpoint to flush WAL to masterStore
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+
+	// Read again after checkpoint (reads from masterStore, not WAL)
+	rtx2, err := db.BeginRead()
+	require.NoError(t, err)
+	val2, err := rtx2.Get(ns, []byte("key1"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("val1"), val2)
+	require.NoError(t, rtx2.Rollback())
+}
+
+// ===== getPageReader and readOverflowChainReader coverage =====
+
+func TestGetPageReader_CacheHit(t *testing.T) {
+	db, err := Open("", Options{PageSize: 4096, InMemory: true})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write some data so there's content to read.
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	cache := newPcache(4096, 50, true)
+
+	// First read: cache miss, reads from WAL/disk.
+	maxFrame, slot, err := db.pager.beginRead()
+	require.NoError(t, err)
+	defer db.pager.endRead(slot)
+
+	pg1, err := db.pager.getPageReader(1, maxFrame, cache)
+	require.NoError(t, err)
+	assert.NotNil(t, pg1)
+	assert.Equal(t, uint32(1), pg1.pgno)
+	assert.Equal(t, cache, pg1.cache, "page should belong to reader cache")
+	db.pager.releasePage(pg1)
+
+	// Second read: cache hit.
+	pg2, err := db.pager.getPageReader(1, maxFrame, cache)
+	require.NoError(t, err)
+	assert.NotNil(t, pg2)
+	assert.Equal(t, pg1, pg2, "should return same page from cache")
+	db.pager.releasePage(pg2)
+}
+
+func TestGetPageReader_CacheMiss(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write data to create page 2.
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("key1"), []byte("val1")))
+	require.NoError(t, tx.Commit())
+
+	cache := newPcache(4096, 50, true)
+
+	maxFrame, slot, err := db.pager.beginRead()
+	require.NoError(t, err)
+	defer db.pager.endRead(slot)
+
+	// Read pages 1 and 2 - both should be cache misses initially.
+	pg1, err := db.pager.getPageReader(1, maxFrame, cache)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(1), pg1.pgno)
+	db.pager.releasePage(pg1)
+
+	// Page 2 should also be readable.
+	pg2, err := db.pager.getPageReader(2, maxFrame, cache)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(2), pg2.pgno)
+	db.pager.releasePage(pg2)
+
+	// Verify cache now has both pages.
+	assert.NotNil(t, cache.fetch(1))
+	cache.release(cache.fetch(1)) // double release to balance
+	assert.NotNil(t, cache.fetch(2))
+	cache.release(cache.fetch(2))
+}
+
+func TestGetPageReader_NilCacheFallback(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer db.Close()
+
+	maxFrame, slot, err := db.pager.beginRead()
+	require.NoError(t, err)
+	defer db.pager.endRead(slot)
+
+	// With nil cache, should fall back to the writer cache path.
+	pg, err := db.pager.getPageReader(1, maxFrame, nil)
+	require.NoError(t, err)
+	assert.NotNil(t, pg, "with nil cache, should still return a page")
+	assert.Equal(t, uint32(1), pg.pgno)
+	db.pager.releasePage(pg)
+}
+
+func TestGetPageReader_InvalidPage(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer db.Close()
+
+	cache := newPcache(4096, 50, true)
+
+	_, err = db.pager.getPageReader(0, 0, cache)
+	assert.ErrorIs(t, err, ErrInvalidPage)
+}
+
+func TestGetPageReader_InMemoryFallback(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.InMemory = true
+	db, err := Open(filepath.Join(dir, "test.db"), opts)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write data
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("key"), []byte("val")))
+	require.NoError(t, tx.Commit())
+
+	// Force checkpoint so data is in masterStore
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+
+	cache := newPcache(4096, 50, true)
+
+	maxFrame, slot, err := db.pager.beginRead()
+	require.NoError(t, err)
+	defer db.pager.endRead(slot)
+
+	// Should read from masterStore on cache miss
+	pg, err := db.pager.getPageReader(1, maxFrame, cache)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(1), pg.pgno)
+	assert.Equal(t, cache, pg.cache)
+	db.pager.releasePage(pg)
+}
+
+func TestGetPageReader_StaleEviction(t *testing.T) {
+	db, err := Open("", Options{PageSize: 4096, InMemory: true})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write initial data
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("key1"), []byte("val1")))
+	require.NoError(t, tx.Commit())
+
+	cache := newPcache(4096, 50, true)
+
+	// Read page 1 into cache
+	maxFrame1, slot1, err := db.pager.beginRead()
+	require.NoError(t, err)
+	pg1, err := db.pager.getPageReader(1, maxFrame1, cache)
+	require.NoError(t, err)
+	pg1Ptr := pg1
+	db.pager.releasePage(pg1)
+	db.pager.endRead(slot1)
+
+	// Verify page is cached
+	cached := cache.fetch(1)
+	require.NotNil(t, cached, "page should be in cache")
+	assert.Equal(t, pg1Ptr, cached, "should be same page object from cache")
+	cache.release(cached)
+
+	// Clear the cache (simulating pool recycling)
+	cache.clear()
+
+	// Verify page was evicted
+	assert.Nil(t, cache.fetch(1), "page should be gone after clear")
+
+	// Read again - should allocate a new page object
+	maxFrame2, slot2, err := db.pager.beginRead()
+	require.NoError(t, err)
+	defer db.pager.endRead(slot2)
+
+	pg2, err := db.pager.getPageReader(1, maxFrame2, cache)
+	require.NoError(t, err)
+	assert.NotEqual(t, pg1Ptr, pg2, "after clear, should get new page object")
+	assert.Equal(t, uint32(1), pg2.pgno)
+	db.pager.releasePage(pg2)
+}
+
+func TestReadOverflowChainReader(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 512})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write a large value that triggers overflow
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	largeVal := make([]byte, 2000) // will overflow with 512-byte pages
+	for i := range largeVal {
+		largeVal[i] = byte(i % 256)
+	}
+	require.NoError(t, tx.Put(ns, []byte("bigkey"), largeVal))
+	require.NoError(t, tx.Commit())
+
+	// Read the value back using a reader cache
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+
+	val, err := rtx.Get(ns, []byte("bigkey"))
+	require.NoError(t, err)
+	assert.Equal(t, largeVal, val, "should read back the large overflow value")
+}
+
+func TestReaderCachePool_Lifecycle(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 500})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Verify readerCacheSize is computed correctly: max(500/10, 50) = 50
+	assert.Equal(t, 50, db.readerCacheSize)
+}
+
+func TestReaderCachePool_SmallCacheSize(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 100})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// max(100/10, 50) = 50
+	assert.Equal(t, 50, db.readerCacheSize)
+}
+
+func TestReaderCachePool_LargeCacheSize(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 10000})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// max(10000/10, 50) = 1000
+	assert.Equal(t, 1000, db.readerCacheSize)
+}
+
+// ===== Task 5: Wire readers to private caches =====
+
+func TestConcurrentReadersIndependentCaches(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write some data
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("test")
+	require.NoError(t, err)
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("key-%04d", i)
+		val := fmt.Sprintf("value-%04d", i)
+		require.NoError(t, wtx.Put(ns, []byte(key), []byte(val)))
+	}
+	require.NoError(t, wtx.Commit())
+
+	// Start two readers concurrently — each should get its own cache
+	rtx1, err := db.BeginRead()
+	require.NoError(t, err)
+	rtx2, err := db.BeginRead()
+	require.NoError(t, err)
+
+	// Verify each reader has its own cache
+	require.NotNil(t, rtx1.cache)
+	require.NotNil(t, rtx2.cache)
+	assert.True(t, rtx1.cache != rtx2.cache, "readers should have distinct cache instances")
+
+	// Read from both — each should populate its own cache
+	ns1, err := rtx1.GetNamespace("test")
+	require.NoError(t, err)
+	ns2, err := rtx2.GetNamespace("test")
+	require.NoError(t, err)
+
+	v1, err := rtx1.Get(ns1, []byte("key-0050"))
+	require.NoError(t, err)
+	assert.Equal(t, "value-0050", string(v1))
+
+	v2, err := rtx2.Get(ns2, []byte("key-0050"))
+	require.NoError(t, err)
+	assert.Equal(t, "value-0050", string(v2))
+
+	// Rollback both
+	require.NoError(t, rtx1.Rollback())
+	require.NoError(t, rtx2.Rollback())
+}
+
+func TestReaderCacheStalenessAfterCommit(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write initial data
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns, []byte("key1"), []byte("v1")))
+	require.NoError(t, wtx.Commit())
+
+	// Start a reader — caches pages
+	rtx1, err := db.BeginRead()
+	require.NoError(t, err)
+	ns1, err := rtx1.GetNamespace("test")
+	require.NoError(t, err)
+	v, err := rtx1.Get(ns1, []byte("key1"))
+	require.NoError(t, err)
+	assert.Equal(t, "v1", string(v))
+
+	// Writer commits new data
+	wtx, err = db.BeginWrite()
+	require.NoError(t, err)
+	ns2, err := wtx.GetNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns2, []byte("key1"), []byte("v2")))
+	require.NoError(t, wtx.Commit())
+
+	// The old reader should still see the old value (snapshot isolation)
+	v, err = rtx1.Get(ns1, []byte("key1"))
+	require.NoError(t, err)
+	assert.Equal(t, "v1", string(v))
+	require.NoError(t, rtx1.Rollback())
+
+	// A new reader should see the new value
+	rtx2, err := db.BeginRead()
+	require.NoError(t, err)
+	ns3, err := rtx2.GetNamespace("test")
+	require.NoError(t, err)
+	v, err = rtx2.Get(ns3, []byte("key1"))
+	require.NoError(t, err)
+	assert.Equal(t, "v2", string(v))
+	require.NoError(t, rtx2.Rollback())
+}
+
+func TestReaderCacheRecycledOnRollback(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write data
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns, []byte("key1"), []byte("val1")))
+	require.NoError(t, wtx.Commit())
+
+	// Reader 1: allocates cache, populates it, rollback clears + recycles
+	rtx1, err := db.BeginRead()
+	require.NoError(t, err)
+	require.NotNil(t, rtx1.cache)
+	ns1, err := rtx1.GetNamespace("test")
+	require.NoError(t, err)
+	_, err = rtx1.Get(ns1, []byte("key1"))
+	require.NoError(t, err)
+	require.NoError(t, rtx1.Rollback())
+
+	// After rollback, cache field should be nil on the tx
+	assert.Nil(t, rtx1.cache, "cache should be nil after rollback")
+
+	// Reader 2: gets a cache (from pool or new) and it works correctly
+	rtx2, err := db.BeginRead()
+	require.NoError(t, err)
+	require.NotNil(t, rtx2.cache, "new reader should always get a cache")
+	ns2, err := rtx2.GetNamespace("test")
+	require.NoError(t, err)
+	v, err := rtx2.Get(ns2, []byte("key1"))
+	require.NoError(t, err)
+	assert.Equal(t, "val1", string(v))
+	require.NoError(t, rtx2.Rollback())
+}
+
+func TestWriterDoesNotGetReaderCache(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Writer should have nil cache (uses shared pcache)
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	assert.Nil(t, wtx.ReadTx.cache, "writer should not have a reader cache")
+	require.NoError(t, wtx.Rollback())
+}
+
+func TestCursorWithReaderCache(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write data
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("test")
+	require.NoError(t, err)
+	for i := 0; i < 50; i++ {
+		key := fmt.Sprintf("key-%04d", i)
+		val := fmt.Sprintf("value-%04d", i)
+		require.NoError(t, wtx.Put(ns, []byte(key), []byte(val)))
+	}
+	require.NoError(t, wtx.Commit())
+
+	// Read with cursor using reader cache
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	ns2, err := rtx.GetNamespace("test")
+	require.NoError(t, err)
+
+	cursor := rtx.NewCursor(ns2)
+	require.NoError(t, cursor.First())
+
+	count := 0
+	for cursor.Valid() {
+		k, kerr := cursor.Key()
+		require.NoError(t, kerr)
+		v, verr := cursor.Value()
+		require.NoError(t, verr)
+		expected := fmt.Sprintf("key-%04d", count)
+		assert.Equal(t, expected, string(k))
+		assert.Equal(t, fmt.Sprintf("value-%04d", count), string(v))
+		count++
+		require.NoError(t, cursor.Next())
+	}
+	assert.Equal(t, 50, count)
+	cursor.Close()
+	require.NoError(t, rtx.Rollback())
 }

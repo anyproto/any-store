@@ -52,6 +52,11 @@ var (
 	// that is no longer supported. The database must be recreated.
 	ErrOldFormat = errors.New("btree: unsupported old schema format (requires version 5+)")
 
+	// ErrBusySnapshot indicates another process committed since this connection's
+	// last read, so the write transaction cannot proceed with stale state.
+	// Equivalent to SQLite's SQLITE_BUSY_SNAPSHOT (wal.c:3714).
+	ErrBusySnapshot = errors.New("btree: busy snapshot")
+
 	// ErrProtocol indicates the WAL retry protocol was exhausted.
 	ErrProtocol = errors.New("btree: WAL protocol retry limit exhausted")
 

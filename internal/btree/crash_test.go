@@ -35,7 +35,7 @@ func rawClose(db *DB) {
 			db.pager.wal.file = nil
 		}
 	}
-	db.pager.cache.clear()
+	db.pager.writerCache.clear()
 	if db.pager.file != nil {
 		_ = db.pager.file.Close()
 		db.pager.file = nil

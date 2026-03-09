@@ -1715,7 +1715,7 @@ func TestDeepCov_SeekExact_KeyError(t *testing.T) {
 	if err != nil {
 		t.Skip("cannot begin read:", err)
 	}
-	ns2, err := db2.getNamespaceAt("ns1", rtx.walMaxFrame)
+	ns2, err := db2.getNamespaceAt("ns1", rtx.walMaxFrame, nil)
 	if err != nil {
 		rtx.Rollback()
 		t.Skip("cannot get namespace:", err)
@@ -1806,7 +1806,7 @@ func TestDeepCov_CursorPrevious_RightChildPath(t *testing.T) {
 	// Read the last few entries, then go Previous
 	rtx, err := db.BeginRead()
 	require.NoError(t, err)
-	ns2, err := db.getNamespaceAt("ns1", rtx.walMaxFrame)
+	ns2, err := db.getNamespaceAt("ns1", rtx.walMaxFrame, nil)
 	require.NoError(t, err)
 	c := rtx.NewCursor(ns2)
 
@@ -1830,7 +1830,7 @@ func TestDeepCov_CursorPrevious_RightChildPath(t *testing.T) {
 	// Walk forward then backward at specific interior boundaries
 	rtx2, err := db.BeginRead()
 	require.NoError(t, err)
-	ns3, err := db.getNamespaceAt("ns1", rtx2.walMaxFrame)
+	ns3, err := db.getNamespaceAt("ns1", rtx2.walMaxFrame, nil)
 	require.NoError(t, err)
 	c2 := rtx2.NewCursor(ns3)
 
@@ -1979,7 +1979,7 @@ func TestDeepCov_DB_AppendValue_OverflowReadError(t *testing.T) {
 	if err != nil {
 		t.Skip("cannot begin read")
 	}
-	ns2, err := db2.getNamespaceAt("ns1", rtx.walMaxFrame)
+	ns2, err := db2.getNamespaceAt("ns1", rtx.walMaxFrame, nil)
 	if err != nil {
 		rtx.Rollback()
 		t.Skip("cannot get namespace:", err)

@@ -87,7 +87,7 @@ func TestDebugMVCC(t *testing.T) {
 	t.Logf("Namespace t1 rootPage (re-fetched): %d", ns.rootPage)
 	
 	// Test reading pages manually
-	rootPg, err := db.pager.getPageAt(ns.rootPage, rtx2.walMaxFrame)
+	rootPg, err := db.pager.getPageWriter(ns.rootPage, rtx2.walMaxFrame)
 	if err != nil {
 		t.Logf("Error reading root page at walMaxFrame %d: %v", rtx2.walMaxFrame, err)
 	} else {
@@ -114,21 +114,21 @@ func TestDebugMVCC(t *testing.T) {
 	}
 	t.Logf("Reader rtx2 sees %d rows (expected 5)", count2)
 
-	// Also check: what does readPageUncached get for the root page?
-	rootPg2, err := db.pager.readPageUncached(ns.rootPage, rtx2.walMaxFrame)
+	// Also check: what does getPageReader get for the root page?
+	rootPg2, err := db.pager.getPageReader(ns.rootPage, rtx2.walMaxFrame, nil)
 	if err != nil {
-		t.Logf("readPageUncached error: %v", err)
+		t.Logf("getPageReader error: %v", err)
 	} else {
-		t.Logf("readPageUncached root page: type=%d cellCount=%d", 
+		t.Logf("getPageReader root page: type=%d cellCount=%d",
 			rootPg2.header.pageType, rootPg2.header.cellCount)
 	}
-	
+
 	// And check page 1
-	pg1, err := db.pager.readPageUncached(1, rtx2.walMaxFrame)
+	pg1, err := db.pager.getPageReader(1, rtx2.walMaxFrame, nil)
 	if err != nil {
-		t.Logf("readPageUncached page 1 error: %v", err)
+		t.Logf("getPageReader page 1 error: %v", err)
 	} else {
-		t.Logf("readPageUncached page 1: type=%d cellCount=%d", pg1.header.pageType, pg1.header.cellCount)
+		t.Logf("getPageReader page 1: type=%d cellCount=%d", pg1.header.pageType, pg1.header.cellCount)
 		// Check if we can find t1 namespace
 		idx, found, _ := searchLeafPage(pg1, []byte("t1"))
 		t.Logf("  t1 found=%v at idx=%d", found, idx)
