@@ -710,18 +710,23 @@ func (wi *walIndex) reset() {
 //
 // The dual-copy + barrier design allows readers to detect torn writes
 // by comparing both copies.
-func (wi *walIndex) writeHeader(maxFrame, maxPage, nBackfill uint32) error {
+func (wi *walIndex) writeHeader(maxFrame, maxPage, nBackfill uint32, frameCksum, salt [2]uint32) error {
 	region, err := wi.shm.region(0, true)
 	if err != nil {
 		return err
 	}
 
-	// Populate the header struct
+	// Populate the header struct.
+	// DRIFT from SQLite: SQLite's walIndexWriteHdr (wal.c:942-954) copies
+	// pWal->hdr directly to SHM — no parameters. We pass explicit values
+	// because walIndex.hdr and wal fields are separate structs.
 	wi.hdr.isInit = 1
 	wi.hdr.iVersion = walVersion
 	wi.hdr.mxFrame = maxFrame
 	wi.hdr.nPage = maxPage
 	wi.hdr.iChange = wi.iChange
+	wi.hdr.aFrameCksum = frameCksum
+	wi.hdr.aSalt = salt
 
 	// Compute the header checksum over bytes 0..39 (all fields except aCksum)
 	wi.hdr.computeCksum()
@@ -1022,6 +1027,15 @@ type wal struct {
 	// If nil, lock failures return ErrBusy immediately (issue 1.7).
 	busyHandler BusyHandler
 
+	// readSnapshot is the SHM header snapshot saved during beginRead (multi-process only).
+	// Used by beginWrite for BUSY_SNAPSHOT comparison.
+	// DRIFT from SQLite: SQLite uses pWal->hdr for both snapshot comparison and
+	// checksum chaining in walEncodeFrame. We keep them separate (readSnapshot for
+	// snapshot, wal.cksum1/cksum2 for chaining) because our checksum fields are
+	// separate from the SHM header struct.
+	// Only accessed by writer goroutine, no synchronization needed.
+	readSnapshot WalIndexHdr
+
 	// memFrames stores page data in memory for InMemory mode,
 	// eliminating per-commit file I/O. Frames are flushed to pcache on checkpoint.
 	memFrames []memFrame
@@ -1129,8 +1143,10 @@ func (w *wal) initHeaderState() {
 	w.headerOnDisk = false
 	w.index.reset()
 
-	// Update shm header
-	_ = w.index.writeHeader(0, 0, 0)
+	// Update shm header with initial checksums and salts
+	_ = w.index.writeHeader(0, 0, 0,
+		[2]uint32{w.cksum1, w.cksum2},
+		[2]uint32{w.header.salt1, w.header.salt2})
 }
 
 // flushHeader writes the already-initialized in-memory header to disk.
@@ -1181,7 +1197,9 @@ func (w *wal) writeHeader() error {
 	w.index.reset()
 
 	// Update shm header
-	return w.index.writeHeader(0, 0, 0)
+	return w.index.writeHeader(0, 0, 0,
+		[2]uint32{w.cksum1, w.cksum2},
+		[2]uint32{w.header.salt1, w.header.salt2})
 }
 
 // recover reads the WAL file and rebuilds the in-memory index from committed frames.
@@ -1300,7 +1318,9 @@ func (w *wal) recover() error {
 	}
 
 	// Update shm header with recovered state (use mxCommitFrame for reader visibility)
-	return w.index.writeHeader(w.index.mxCommitFrame.Load(), w.index.maxPage.Load(), 0)
+	return w.index.writeHeader(w.index.mxCommitFrame.Load(), w.index.maxPage.Load(), 0,
+		[2]uint32{w.cksum1, w.cksum2},
+		[2]uint32{w.header.salt1, w.header.salt2})
 }
 
 // writeFrames appends frames to the WAL. If commit is true, the last frame
@@ -1410,7 +1430,9 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		// after fdatasync.
 		w.index.mxCommitFrame.Store(w.index.maxFrame.Load())
 		if !w.inProcess {
-			return w.index.writeHeader(w.index.mxCommitFrame.Load(), w.index.maxPage.Load(), w.index.nBackfill.Load())
+			return w.index.writeHeader(w.index.mxCommitFrame.Load(), w.index.maxPage.Load(), w.index.nBackfill.Load(),
+				[2]uint32{w.cksum1, w.cksum2},
+				[2]uint32{w.header.salt1, w.header.salt2})
 		}
 	}
 
@@ -1545,6 +1567,22 @@ func (w *wal) beginRead() (maxFrame uint32, slot int, err error) {
 // max frame number. Returns errWALRetry if the WAL state changed between
 // reading metadata and acquiring the lock, signaling the caller to retry.
 func (w *wal) tryBeginRead() (maxFrame uint32, slot int, err error) {
+	// For multi-process mode, read mxFrame and nBackfill from SHM instead of
+	// stale process-local atomics. Matches SQLite's walTryBeginRead which calls
+	// walIndexReadHdr → walIndexTryHdr to populate pWal->hdr from SHM.
+	// NOTE: readSnapshot is NOT set here because tryBeginRead is called from
+	// both reader and writer goroutines. The snapshot is saved separately by
+	// the writer in DB.BeginWrite (under writeMu) to avoid a data race.
+	if !w.inProcess && !w.inMemory {
+		if hdr, valid := w.index.readHeader(); valid {
+			// Sync process-local atomics so walIndex.get() shmHashGet fallback works
+			w.index.mxCommitFrame.Store(hdr.mxFrame)
+			w.index.maxPage.Store(hdr.nPage)
+		}
+		// Also read nBackfill from SHM for multi-process checkpoint visibility
+		w.index.shmReadCkptInfo()
+	}
+
 	// Use mxCommitFrame (not maxFrame) so readers only see committed frames.
 	// This prevents spilled but uncommitted frames from being visible.
 	mxFrame := w.index.mxCommitFrame.Load()
@@ -1619,6 +1657,18 @@ func (w *wal) tryBeginRead() (maxFrame uint32, slot int, err error) {
 	return mxFrame, 0, nil
 }
 
+// saveReadSnapshot saves the current SHM header as the read snapshot for
+// the BUSY_SNAPSHOT check in beginWrite. Must be called by the writer
+// goroutine only (under writeMu), NOT from concurrent reader goroutines.
+func (w *wal) saveReadSnapshot() {
+	if w.inProcess || w.inMemory {
+		return
+	}
+	if hdr, valid := w.index.readHeader(); valid {
+		w.readSnapshot = hdr
+	}
+}
+
 // endRead releases the reader lock for the given slot.
 func (w *wal) endRead(slot int) {
 	_ = w.index.unlock(lockRead0+slot, lockShared)
@@ -1626,8 +1676,61 @@ func (w *wal) endRead(slot int) {
 
 // beginWrite acquires the exclusive write lock.
 // Uses the busy handler for retry/backoff if configured (issue 1.7).
-func (w *wal) beginWrite() error {
-	return walBusyLock(w.index, w.busyHandler, lockWrite, lockExclusive)
+//
+// For multi-process mode, performs a BUSY_SNAPSHOT check after acquiring the
+// lock: compares the saved SHM header snapshot (from tryBeginRead) against the
+// current SHM header. If they differ, another process committed since our last
+// read, so we reject the write to prevent stale-state corruption.
+// Matches sqlite3WalBeginWriteTransaction (wal.c:3700-3714).
+//
+// Returns stateChanged=true if the WAL state was re-synced from SHM (indicating
+// another process committed or checkpointed since the last local write).
+// Callers should invalidate any stale page caches when stateChanged is true.
+func (w *wal) beginWrite() (stateChanged bool, err error) {
+	if err := walBusyLock(w.index, w.busyHandler, lockWrite, lockExclusive); err != nil {
+		return false, err
+	}
+	if w.inProcess || w.inMemory {
+		return false, nil
+	}
+
+	// BUSY_SNAPSHOT: compare saved snapshot against current SHM header.
+	// Matches sqlite3WalBeginWriteTransaction (wal.c:3712):
+	//   memcmp(&pWal->hdr, walIndexHdr(pWal), sizeof(WalIndexHdr))
+	// Only check if readSnapshot was populated (isInit==1 from saveReadSnapshot);
+	// raw wal.beginWrite() callers that skip saveReadSnapshot get isInit==0.
+	hdr, valid := w.index.readHeader()
+	if valid && w.readSnapshot.isInit != 0 && hdr != w.readSnapshot {
+		_ = w.index.unlock(lockWrite, lockExclusive)
+		return false, ErrBusySnapshot
+	}
+
+	// Re-sync WAL state from SHM header for writeFrames correctness.
+	// DRIFT from SQLite: SQLite doesn't re-sync in beginWriteTransaction —
+	// if headers match, pWal->hdr is already correct (because walIndexTryHdr
+	// populated it). We re-sync because our WAL state (nFrame, cksum1/2,
+	// salts) is separate from the SHM header struct. When BUSY_SNAPSHOT
+	// passes (headers match), this is a no-op in practice.
+	if valid {
+		// Detect if another process changed state since our last write
+		if hdr.iChange != w.index.hdr.iChange || hdr.mxFrame != w.nFrame.Load() ||
+			hdr.aSalt[0] != w.header.salt1 || hdr.aSalt[1] != w.header.salt2 {
+			stateChanged = true
+		}
+		// If WAL was reset (mxFrame==0) or salts changed, force WAL header rewrite
+		if hdr.mxFrame == 0 || hdr.aSalt[0] != w.header.salt1 || hdr.aSalt[1] != w.header.salt2 {
+			w.headerOnDisk = false
+		}
+		w.nFrame.Store(hdr.mxFrame)
+		w.cksum1 = hdr.aFrameCksum[0]
+		w.cksum2 = hdr.aFrameCksum[1]
+		w.header.salt1 = hdr.aSalt[0]
+		w.header.salt2 = hdr.aSalt[1]
+		w.index.mxCommitFrame.Store(hdr.mxFrame)
+		w.index.maxPage.Store(hdr.nPage)
+	}
+
+	return stateChanged, nil
 }
 
 // endWrite releases the exclusive write lock.

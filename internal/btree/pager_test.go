@@ -1404,7 +1404,7 @@ func TestWalIndex_WriteHeader_InProcess(t *testing.T) {
 	require.NoError(t, err)
 	defer idx.close()
 
-	require.NoError(t, idx.writeHeader(10, 20, 5))
+	require.NoError(t, idx.writeHeader(10, 20, 5, [2]uint32{}, [2]uint32{}))
 	assert.Equal(t, uint32(10), idx.hdr.mxFrame)
 	assert.Equal(t, uint32(20), idx.hdr.nPage)
 }
@@ -1419,7 +1419,7 @@ func TestWalIndex_ReadHeader_Valid(t *testing.T) {
 	require.NoError(t, err)
 	defer idx.close()
 
-	require.NoError(t, idx.writeHeader(5, 10, 0))
+	require.NoError(t, idx.writeHeader(5, 10, 0, [2]uint32{}, [2]uint32{}))
 	hdr, valid := idx.readHeader()
 	assert.True(t, valid)
 	assert.Equal(t, uint32(5), hdr.mxFrame)
@@ -1460,7 +1460,7 @@ func TestWalIndex_ReadHeader_MismatchedCopies(t *testing.T) {
 	defer idx.close()
 
 	// Write valid header
-	require.NoError(t, idx.writeHeader(5, 10, 0))
+	require.NoError(t, idx.writeHeader(5, 10, 0, [2]uint32{}, [2]uint32{}))
 
 	// Corrupt copy 2 to mismatch copy 1
 	region, err := idx.shm.region(0, false)
@@ -1477,7 +1477,7 @@ func TestWalIndex_ReadHeader_BadChecksum(t *testing.T) {
 	require.NoError(t, err)
 	defer idx.close()
 
-	require.NoError(t, idx.writeHeader(5, 10, 0))
+	require.NoError(t, idx.writeHeader(5, 10, 0, [2]uint32{}, [2]uint32{}))
 
 	// Corrupt checksum in both copies (aCksum at offset 40)
 	region, err := idx.shm.region(0, false)
@@ -1573,7 +1573,8 @@ func TestWALFlushHeader(t *testing.T) {
 	assert.False(t, w.headerOnDisk)
 
 	// Write frames triggers flushHeader
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -1616,7 +1617,8 @@ func TestWALRecover_CorruptFrame(t *testing.T) {
 	w := newWal(path, 4096)
 	require.NoError(t, w.open())
 	defer w.close()
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	copy(pg.data, "valid data")
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
@@ -1624,7 +1626,8 @@ func TestWALRecover_CorruptFrame(t *testing.T) {
 
 	// Write an extra uncommitted frame with corrupt salt
 	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
-	require.NoError(t, w.beginWrite())
+	_, bwErr = w.beginWrite()
+	require.NoError(t, bwErr)
 	require.NoError(t, w.writeFrames([]*page{pg2}, false, 2))
 	w.endWrite()
 
@@ -1660,7 +1663,8 @@ func TestWriteFrames_NoCommitSync(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -1676,7 +1680,8 @@ func TestWriteFrames_NotInProcess(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -1694,7 +1699,8 @@ func TestWriteFramesMem_LargeArenaRealloc(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 
 	// Write enough pages to trigger arena reallocation
 	pages := make([]*page, 300)
@@ -1718,7 +1724,8 @@ func TestReadFrame_InMemoryCorrupt(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -1747,7 +1754,8 @@ func TestWALBeginRead_AllSlotsBusy(t *testing.T) {
 	defer w.close()
 
 	// Write data so maxFrame > 0 and nBackfill != maxFrame
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -1781,7 +1789,8 @@ func TestWALBeginRead_BestSlotLockFails(t *testing.T) {
 	defer w.close()
 
 	// Write data
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -1988,7 +1997,8 @@ func TestCheckpointPost_IncompleteBackfill(t *testing.T) {
 	defer w.close()
 
 	// Write frames
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -2013,7 +2023,8 @@ func TestTryResetWALWithBusy_AllSlotsAvailable(t *testing.T) {
 	defer w.close()
 
 	// Write and checkpoint
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -2033,7 +2044,8 @@ func TestTryResetWALWithBusy_Truncate(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -2057,7 +2069,8 @@ func TestTryResetWALWithBusy_SlotsBusy(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -2082,7 +2095,8 @@ func TestTryResetWALWithBusy_PartialLockFail(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -2109,7 +2123,8 @@ func TestDoResetWAL_InMemory(t *testing.T) {
 	defer w.close()
 
 	// Write frames
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -2132,7 +2147,8 @@ func TestDoResetWAL_Truncate(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -2157,7 +2173,8 @@ func TestDoResetWAL_NoTruncate(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -2495,7 +2512,8 @@ func TestWALRecover_NoCommittedFrames(t *testing.T) {
 	w := newWal(path, 4096)
 	require.NoError(t, w.open())
 	defer w.close()
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, false, 1))
 	w.endWrite()
@@ -2519,7 +2537,8 @@ func TestCheckpointWithMode_InMemory(t *testing.T) {
 	defer w.close()
 
 	// Write frames
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	copy(pg.data, "in-memory data")
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
@@ -2547,7 +2566,7 @@ func TestWalIndex_ReadWriteHeader_NotInProcess(t *testing.T) {
 	require.NoError(t, err)
 	defer idx.close()
 
-	require.NoError(t, idx.writeHeader(5, 10, 0))
+	require.NoError(t, idx.writeHeader(5, 10, 0, [2]uint32{}, [2]uint32{}))
 
 	hdr, valid := idx.readHeader()
 	assert.True(t, valid)
@@ -2758,7 +2777,8 @@ func TestReadFrame_InMemoryOutOfRange(t *testing.T) {
 	require.NoError(t, w.open())
 	defer w.close()
 
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
@@ -3044,7 +3064,8 @@ func TestCheckpointWithMode_InMemoryPage1(t *testing.T) {
 	defer w.close()
 
 	// Write frame for page 1 (tests the pgno==1 offset path in InMemory checkpoint)
-	require.NoError(t, w.beginWrite())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	// Set page type at dbHeaderSize offset (for page 1)
 	pg.data[dbHeaderSize] = pageTypeLeafIdx
@@ -3052,7 +3073,8 @@ func TestCheckpointWithMode_InMemoryPage1(t *testing.T) {
 	w.endWrite()
 
 	// Also write non-page-1 frame
-	require.NoError(t, w.beginWrite())
+	_, bwErr = w.beginWrite()
+	require.NoError(t, bwErr)
 	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
 	pg2.data[0] = pageTypeLeafIdx
 	require.NoError(t, w.writeFrames([]*page{pg2}, true, 2))
@@ -4051,7 +4073,7 @@ func TestWalIndex_WriteHeader_RegionError(t *testing.T) {
 	// For heap shm, region with grow=true always succeeds.
 	// To trigger an error, we'd need a custom shm impl.
 	// Let's just verify writeHeader works normally
-	err = wi.writeHeader(10, 5, 0)
+	err = wi.writeHeader(10, 5, 0, [2]uint32{}, [2]uint32{})
 	assert.NoError(t, err)
 }
 
@@ -4062,7 +4084,7 @@ func TestWalIndex_ReadHeader_ValidRoundtrip(t *testing.T) {
 	defer wi.close()
 
 	// Write a valid header and read it back
-	err = wi.writeHeader(5, 3, 0)
+	err = wi.writeHeader(5, 3, 0, [2]uint32{}, [2]uint32{})
 	require.NoError(t, err)
 	hdr, ok := wi.readHeader()
 	assert.True(t, ok)
@@ -5561,7 +5583,7 @@ func TestWalIndex_WriteHeader_RegionError_Injected(t *testing.T) {
 		regionErr:  os.ErrClosed,
 	}
 
-	err := w.index.writeHeader(10, 5, 0)
+	err := w.index.writeHeader(10, 5, 0, [2]uint32{}, [2]uint32{})
 	assert.ErrorIs(t, err, os.ErrClosed)
 }
 

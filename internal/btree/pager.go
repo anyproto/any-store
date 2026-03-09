@@ -377,8 +377,19 @@ func (p *pager) endRead(slot int) {
 
 // beginWrite starts a write transaction (must hold a read transaction first).
 func (p *pager) beginWrite() error {
-	if err := p.wal.beginWrite(); err != nil {
+	// Save SHM header snapshot for BUSY_SNAPSHOT check in wal.beginWrite.
+	// Called here (single writer goroutine context) rather than in tryBeginRead
+	// which is also called by concurrent reader goroutines.
+	p.wal.saveReadSnapshot()
+
+	stateChanged, err := p.wal.beginWrite()
+	if err != nil {
 		return err
+	}
+	// If another process changed WAL state (committed or checkpointed),
+	// our writerCache has stale pages and must be cleared.
+	if stateChanged {
+		p.writerCache.clear()
 	}
 	p.state.Store(int32(pagerWriter))
 	// Save a snapshot of the database header so rollback can restore it (fix 5.2).

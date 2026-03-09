@@ -301,6 +301,13 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 // BeginWrite starts a read-write transaction. Only one write transaction
 // can be active at a time (single-writer semantics). Blocks until any
 // existing write transaction completes.
+//
+// For multi-process mode, if another process committed since our last read
+// (ErrBusySnapshot), we automatically retry with a fresh SHM snapshot.
+// DRIFT from SQLite: SQLite returns SQLITE_BUSY_SNAPSHOT to the caller,
+// requiring it to retry. We retry internally for ergonomic API (max 5 attempts).
+const maxBusySnapshotRetries = 5
+
 func (db *DB) BeginWrite() (*WriteTx, error) {
 	if db.closing.Load() {
 		return nil, ErrClosed
@@ -317,32 +324,45 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 		return nil, ErrClosed
 	}
 
-	maxFrame, slot, err := db.pager.beginRead()
-	if err != nil {
-		db.mu.RUnlock()
-		db.writeMu.Unlock()
-		return nil, err
-	}
+	var maxFrame uint32
+	var slot int
+	var fcc, sc uint32
 
-	// Read on-disk counters for staleness detection.
-	fcc, sc, err := db.pager.readHeaderCounters(maxFrame)
-	if err != nil {
+	for attempt := 0; ; attempt++ {
+		var err error
+		maxFrame, slot, err = db.pager.beginRead()
+		if err != nil {
+			db.mu.RUnlock()
+			db.writeMu.Unlock()
+			return nil, err
+		}
+
+		// Read on-disk counters for staleness detection.
+		fcc, sc, err = db.pager.readHeaderCounters(maxFrame)
+		if err != nil {
+			db.pager.endRead(slot)
+			db.mu.RUnlock()
+			db.writeMu.Unlock()
+			return nil, err
+		}
+
+		// Store WAL slot on pager BEFORE beginWrite() so that Close can
+		// read it after observing pagerWriter via the atomic state store
+		// inside beginWrite() (happens-before guarantee).
+		db.pager.writerWalSlot = slot
+
+		err = db.pager.beginWrite()
+		if err == nil {
+			break
+		}
 		db.pager.endRead(slot)
-		db.mu.RUnlock()
-		db.writeMu.Unlock()
-		return nil, err
-	}
-
-	// Store WAL slot on pager BEFORE beginWrite() so that Close can
-	// read it after observing pagerWriter via the atomic state store
-	// inside beginWrite() (happens-before guarantee).
-	db.pager.writerWalSlot = slot
-
-	if err := db.pager.beginWrite(); err != nil {
-		db.pager.endRead(slot)
-		db.mu.RUnlock()
-		db.writeMu.Unlock()
-		return nil, err
+		if !errors.Is(err, ErrBusySnapshot) || attempt >= maxBusySnapshotRetries {
+			db.mu.RUnlock()
+			db.writeMu.Unlock()
+			return nil, err
+		}
+		// Clear writerCache: another process committed, our cached pages are stale
+		db.pager.writerCache.clear()
 	}
 
 	// Reset the cleanup guard for this write transaction.
