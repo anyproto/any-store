@@ -101,12 +101,12 @@ SQLite ref: `pcache1.c:222-236` (pcache1_g struct), `pcache1.c:271-291` (sqlite3
 ### Task 4: Per-cache bulk allocation (pFree)
 **Depends on: Task 3 (global slab). Pre-allocate ~100 page objects per cache on first use, drawing buffers from global slab.**
 SQLite ref: `pcache1.c:201` (pFree field), `pcache1.c:297-330` (pcache1InitBulk), `pcache1.c:434-438` (pcache1AllocPage tries pFree first).
-- [ ] add `pFree []*page` and `bulkInit bool` fields to pcache struct in `pcache.go:13-40`
-- [ ] implement `initBulk()` method: `nBulk = min(maxPages, 100)`, allocate page structs with `data` from `globalPageSlab.Get()`, set `page.cache = pc`, push onto `pFree` (matches `pcache1.c:304-327`)
-- [ ] modify `create()` in `pcache.go:108-115`: try `pFree` first → if empty and `!bulkInit` call `initBulk()` → else allocate with `globalPageSlab.Get()`
-- [ ] write test: first create() triggers initBulk, subsequent creates use pFree without slab calls
-- [ ] write test: after pFree exhausted, pages allocated from slab directly
-- [ ] run tests — must pass before next task
+- [x] add `pFree []*page` and `bulkInit bool` fields to pcache struct in `pcache.go:13-40`
+- [x] implement `initBulk()` method: `nBulk = min(maxPages, 100)`, allocate page structs with `data` from `globalPageSlab.Get()`, set `page.cache = pc`, push onto `pFree` (matches `pcache1.c:304-327`)
+- [x] modify `create()` in `pcache.go:108-115`: try `pFree` first → if empty and `!bulkInit` call `initBulk()` → else allocate with `globalPageSlab.Get()`
+- [x] write test: first create() triggers initBulk, subsequent creates use pFree without slab calls
+- [x] write test: after pFree exhausted, pages allocated from slab directly
+- [x] run tests — must pass before next task
 
 ### Task 5: Buffer recycling on eviction
 **Depends on: Task 1 (evictOne returns `*page`), Task 3 (slab). Reuse evicted page's `[]byte` buffer for the new page instead of GC + alloc.**

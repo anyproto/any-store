@@ -104,6 +104,19 @@ func (s *pageSlab) UnderPressure() bool {
 	return s.underPressure.Load()
 }
 
+// Initialized returns true if the slab has been initialized with the given
+// page size. If pageSize is 0, it only checks whether the slab is initialized
+// at all. This is used by pcache.initBulk() and create() to avoid pulling
+// buffers of the wrong size from a slab initialized for a different page size.
+func (s *pageSlab) Initialized(pageSize int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.initialized {
+		return false
+	}
+	return pageSize == 0 || s.pageSize == pageSize
+}
+
 // Reset clears the slab state. Used only in tests.
 func (s *pageSlab) Reset() {
 	s.mu.Lock()

@@ -481,3 +481,119 @@ func TestPcacheFindSpillVictimOldestFirst(t *testing.T) {
 	require.NotNil(t, victim)
 	assert.Equal(t, uint32(3), victim.pgno, "C should be the spill victim (oldest at back)")
 }
+
+func TestPcacheBulkAlloc_InitBulkOnFirstCreate(t *testing.T) {
+	// Initialize a local slab for this test to avoid polluting globalPageSlab.
+	globalPageSlab.Reset()
+	globalPageSlab.Init(4096, 500)
+	defer globalPageSlab.Reset()
+
+	pc := newPcache(4096, 50, true)
+
+	// Before any create(), bulkInit should be false and pFree empty
+	assert.False(t, pc.bulkInit)
+	assert.Empty(t, pc.pFree)
+
+	// First create() should trigger initBulk (nBulk = min(50, 100) = 50)
+	pg1 := pc.create(1)
+	require.NotNil(t, pg1)
+	assert.True(t, pc.bulkInit, "bulkInit should be true after first create")
+	// pFree should have 49 remaining (50 allocated, 1 used for pg1)
+	assert.Len(t, pc.pFree, 49)
+	assert.Len(t, pg1.data, 4096)
+
+	// Second create() should use pFree without calling initBulk again
+	pg2 := pc.create(2)
+	require.NotNil(t, pg2)
+	assert.Len(t, pc.pFree, 48, "pFree should have 48 after second create")
+	assert.Len(t, pg2.data, 4096)
+
+	// Verify slab was consumed: 50 buffers taken from slab during initBulk
+	globalPageSlab.mu.Lock()
+	freeCount := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+	assert.Equal(t, 450, freeCount, "slab should have 500-50=450 free buffers")
+
+	pc.release(pg1)
+	pc.release(pg2)
+}
+
+func TestPcacheBulkAlloc_FallbackToSlabAfterPFreeExhausted(t *testing.T) {
+	globalPageSlab.Reset()
+	globalPageSlab.Init(4096, 500)
+	defer globalPageSlab.Reset()
+
+	// Use maxPages=5 so initBulk allocates only 5 pages
+	pc := newPcache(4096, 5, true)
+
+	// Create 5 pages — first triggers initBulk (nBulk = min(5, 100) = 5),
+	// uses all 5 from pFree
+	pgs := make([]*page, 5)
+	for i := uint32(1); i <= 5; i++ {
+		pgs[i-1] = pc.create(i)
+	}
+	assert.True(t, pc.bulkInit)
+	assert.Empty(t, pc.pFree, "pFree should be exhausted after 5 creates")
+
+	// Release all so cache isn't full
+	for _, pg := range pgs {
+		pc.release(pg)
+	}
+
+	// Now evict some to make room
+	for i := uint32(1); i <= 3; i++ {
+		pc.evictOne()
+	}
+
+	// Record slab free count before next create
+	globalPageSlab.mu.Lock()
+	freeCountBefore := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+
+	// Create a new page — should allocate directly from slab (pFree is empty,
+	// bulkInit already done)
+	pg6 := pc.create(6)
+	require.NotNil(t, pg6)
+	assert.Len(t, pg6.data, 4096)
+
+	// Slab should have one fewer buffer
+	globalPageSlab.mu.Lock()
+	freeCountAfter := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+	assert.Equal(t, freeCountBefore-1, freeCountAfter,
+		"slab should have one fewer buffer after direct allocation")
+
+	pc.release(pg6)
+}
+
+func TestPcacheBulkAlloc_MaxBulk100(t *testing.T) {
+	// Verify initBulk caps at 100 even for large maxPages
+	globalPageSlab.Reset()
+	globalPageSlab.Init(4096, 500)
+	defer globalPageSlab.Reset()
+
+	pc := newPcache(4096, 5000, true)
+
+	// Trigger initBulk via first create
+	pg := pc.create(1)
+	require.NotNil(t, pg)
+	// nBulk = min(5000, 100) = 100; 1 used for pg, 99 remain
+	assert.Len(t, pc.pFree, 99, "pFree should have 99 (100 bulk - 1 used)")
+
+	pc.release(pg)
+}
+
+func TestPcacheBulkAlloc_NoSlabFallsBackToMake(t *testing.T) {
+	// When slab is not initialized, create() should still work via make()
+	globalPageSlab.Reset()
+	defer globalPageSlab.Reset()
+
+	pc := newPcache(4096, 100, true)
+	pg := pc.create(1)
+	require.NotNil(t, pg)
+	assert.Len(t, pg.data, 4096)
+	assert.True(t, pc.bulkInit, "bulkInit should be set even without slab")
+	assert.Empty(t, pc.pFree, "pFree should be empty when slab not initialized")
+
+	pc.release(pg)
+}

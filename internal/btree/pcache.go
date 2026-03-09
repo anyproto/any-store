@@ -29,6 +29,13 @@ type pcache struct {
 	dirtyHead *page
 	nDirty    int
 
+	// pFree is a per-cache bulk pre-allocated list of page structs.
+	// On first use, initBulk() allocates up to 100 page structs with data
+	// buffers drawn from the global slab. Matches SQLite pcache1.c:201 (pFree),
+	// pcache1.c:297-330 (pcache1InitBulk), pcache1.c:434-438 (tries pFree first).
+	pFree    []*page
+	bulkInit bool // true after initBulk() has been called
+
 	// xStress is invoked when the cache is full and all clean pages are
 	// exhausted. It should write the dirty page to WAL and call makeClean.
 	// Modeled after SQLite's xStress in pcache.c.
@@ -61,6 +68,31 @@ func (pc *pcache) fetch(pgno uint32) *page {
 		}
 	}
 	return p
+}
+
+// initBulk pre-allocates page structs with data buffers from the global slab.
+// Called once on first create(). Matches SQLite pcache1.c:297-330 (pcache1InitBulk).
+// If the global slab is not initialized (e.g. unit tests using newPcache directly),
+// this is a no-op and create() falls back to make([]byte, pageSize).
+func (pc *pcache) initBulk() {
+	pc.bulkInit = true
+	if !globalPageSlab.Initialized(pc.pageSize) {
+		return
+	}
+	nBulk := pc.maxPages
+	if nBulk > 100 {
+		nBulk = 100
+	}
+	if nBulk <= 0 {
+		return
+	}
+	pc.pFree = make([]*page, nBulk)
+	for i := range nBulk {
+		pc.pFree[i] = &page{
+			data:  globalPageSlab.Get(),
+			cache: pc,
+		}
+	}
 }
 
 // create allocates a new page in the cache and returns it pinned.
@@ -105,11 +137,52 @@ func (pc *pcache) create(pgno uint32) *page {
 		}
 	}
 
-	p := &page{
-		pgno:     pgno,
-		data:     make([]byte, pc.pageSize),
-		cache:    pc,
-		pinCount: 1,
+	// Allocate a page struct: try pFree first, then bulk init, then slab directly.
+	// Matches SQLite pcache1.c:434-438 (pcache1AllocPage tries pFree first).
+	var p *page
+	if n := len(pc.pFree); n > 0 {
+		p = pc.pFree[n-1]
+		pc.pFree = pc.pFree[:n-1]
+		// Reset fields for the new page
+		clear(p.data)
+		p.pgno = pgno
+		p.pinCount = 1
+		p.dirty = false
+		p.uncached = false
+		p.next = nil
+		p.prev = nil
+		p.header = pageHeader{}
+	} else {
+		if !pc.bulkInit {
+			pc.initBulk()
+			// Retry from pFree after bulk init
+			if n := len(pc.pFree); n > 0 {
+				p = pc.pFree[n-1]
+				pc.pFree = pc.pFree[:n-1]
+				clear(p.data)
+				p.pgno = pgno
+				p.pinCount = 1
+				p.dirty = false
+				p.uncached = false
+				p.next = nil
+				p.prev = nil
+				p.header = pageHeader{}
+			}
+		}
+		if p == nil {
+			var data []byte
+			if globalPageSlab.Initialized(pc.pageSize) {
+				data = globalPageSlab.Get()
+			} else {
+				data = make([]byte, pc.pageSize)
+			}
+			p = &page{
+				pgno:     pgno,
+				data:     data,
+				cache:    pc,
+				pinCount: 1,
+			}
+		}
 	}
 	pc.pages[pgno] = p
 	return p
