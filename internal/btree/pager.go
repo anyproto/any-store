@@ -91,6 +91,13 @@ type pager struct {
 	// snapshotBufPool recycles page-sized byte buffers used by ReadTx snapshot
 	// cache entries to reduce per-transaction allocations.
 	snapshotBufPool sync.Pool
+	// readSnapCache stores immutable page snapshots for MVCC readers.
+	// It is separate from mutable pcache/write pages, so readers never touch
+	// buffers that writers may mutate.
+	readSnapMu    sync.Mutex
+	readSnapCache map[readSnapKey]readSnapEntry
+	readSnapTick  uint64
+	readSnapMax   int
 
 	// inProcess uses heap-backed shm (faster, single-process only)
 	inProcess bool
@@ -101,6 +108,19 @@ type pager struct {
 	// inMemory keeps the entire database in memory with no files on disk
 	inMemory bool
 }
+
+type readSnapKey struct {
+	pgno  uint32
+	frame uint32
+}
+
+type readSnapEntry struct {
+	data []byte
+	hdr  pageHeader
+	tick uint64
+}
+
+const defaultReadSnapCachePages = 4096
 
 // savepointState captures the state needed to rollback to a savepoint.
 type savepointState struct {
@@ -115,9 +135,11 @@ type savepointState struct {
 // purgeable controls whether the page cache can evict pages (false for InMemory databases).
 func newPager(path string, pageSize uint32, cacheSize int, purgeable bool) *pager {
 	return &pager{
-		path:     path,
-		pageSize: pageSize,
-		cache:    newPcache(int(pageSize), cacheSize, purgeable),
+		path:          path,
+		pageSize:      pageSize,
+		cache:         newPcache(int(pageSize), cacheSize, purgeable),
+		readSnapCache: make(map[readSnapKey]readSnapEntry, 256),
+		readSnapMax:   defaultReadSnapCachePages,
 	}
 }
 
@@ -489,7 +511,29 @@ func (p *pager) readPageMVCC(pgno, walMaxFrame uint32) (*page, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
 	}
-	return p.readPageUncached(pgno, walMaxFrame)
+	// Key snapshots by reader walMaxFrame, not by per-page latest frame lookup.
+	// This avoids mismatches when concurrent checkpoint activity changes page->frame
+	// mapping between cache key computation and actual page read path.
+	frame := walMaxFrame
+	pg := p.acquireTempPage()
+	pg.pgno = pgno
+	pg.pinCount = 1
+	pg.uncached = true
+	if hdr, ok := p.readSnapCopy(pgno, frame, pg.data); ok {
+		pg.header = hdr
+		return pg, nil
+	}
+
+	readPg, err := p.readPageUncached(pgno, walMaxFrame)
+	if err != nil {
+		p.recycleTempPage(pg)
+		return nil, err
+	}
+	copy(pg.data, readPg.data)
+	pg.header = readPg.header
+	p.readSnapPut(pgno, frame, readPg.data, readPg.header)
+	p.releasePage(readPg)
+	return pg, nil
 }
 
 // getPageNoContent returns a page without reading from disk/WAL (fix 5.4).
@@ -867,6 +911,86 @@ func (p *pager) releaseSnapshotBuf(buf []byte) {
 	p.snapshotBufPool.Put(buf[:int(p.pageSize)])
 }
 
+func (p *pager) readSnapCopy(pgno, frame uint32, dst []byte) (pageHeader, bool) {
+	p.readSnapMu.Lock()
+	ent, ok := p.readSnapCache[readSnapKey{pgno: pgno, frame: frame}]
+	if !ok {
+		p.readSnapMu.Unlock()
+		return pageHeader{}, false
+	}
+	p.readSnapTick++
+	ent.tick = p.readSnapTick
+	p.readSnapCache[readSnapKey{pgno: pgno, frame: frame}] = ent
+	copy(dst, ent.data)
+	p.readSnapMu.Unlock()
+	return ent.hdr, true
+}
+
+func (p *pager) readSnapPut(pgno, frame uint32, data []byte, hdr pageHeader) {
+	if p.readSnapMax <= 0 {
+		return
+	}
+	key := readSnapKey{pgno: pgno, frame: frame}
+	p.readSnapMu.Lock()
+	p.readSnapTick++
+	if old, ok := p.readSnapCache[key]; ok {
+		oldData := old.data
+		copied := p.acquireSnapshotBuf()
+		copy(copied, data)
+		p.readSnapCache[key] = readSnapEntry{data: copied, hdr: hdr, tick: p.readSnapTick}
+		p.readSnapMu.Unlock()
+		if oldData != nil {
+			p.releaseSnapshotBuf(oldData)
+		}
+		return
+	}
+	var evicted []byte
+	if len(p.readSnapCache) >= p.readSnapMax {
+		var oldestK readSnapKey
+		var oldestTick uint64
+		first := true
+		for k, v := range p.readSnapCache {
+			if first || v.tick < oldestTick {
+				first = false
+				oldestK = k
+				oldestTick = v.tick
+			}
+		}
+		if old, ok := p.readSnapCache[oldestK]; ok {
+			evicted = old.data
+		}
+		delete(p.readSnapCache, oldestK)
+	}
+	copied := p.acquireSnapshotBuf()
+	copy(copied, data)
+	p.readSnapCache[key] = readSnapEntry{data: copied, hdr: hdr, tick: p.readSnapTick}
+	p.readSnapMu.Unlock()
+	if evicted != nil {
+		p.releaseSnapshotBuf(evicted)
+	}
+}
+
+func (p *pager) clearReadSnapCache() {
+	p.readSnapMu.Lock()
+	if len(p.readSnapCache) == 0 {
+		p.readSnapTick = 0
+		p.readSnapMu.Unlock()
+		return
+	}
+	toRelease := make([][]byte, 0, len(p.readSnapCache))
+	for _, ent := range p.readSnapCache {
+		if ent.data != nil {
+			toRelease = append(toRelease, ent.data)
+		}
+	}
+	clear(p.readSnapCache)
+	p.readSnapTick = 0
+	p.readSnapMu.Unlock()
+	for _, b := range toRelease {
+		p.releaseSnapshotBuf(b)
+	}
+}
+
 // recycleTempPage returns an uncached page to the pool for reuse.
 func (p *pager) recycleTempPage(pg *page) {
 	pg.pgno = 0
@@ -1163,6 +1287,8 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	for _, pg := range p.dirtyBuf {
 		p.cache.makeClean(pg)
 	}
+	// Committed pages have new versions; drop immutable read snapshots.
+	p.clearReadSnapCache()
 
 	p.savepoints = p.savepoints[:0]
 	clear(p.writePages)
@@ -1219,6 +1345,7 @@ func (p *pager) pagerError() {
 		p.cache.discard(pg.pgno)
 	}
 	p.cache.clear()
+	p.clearReadSnapCache()
 
 	// Restore the database header to pre-transaction state.
 	p.header = p.savedHeader
@@ -1380,7 +1507,11 @@ func (p *pager) releaseSavepoint(id int) error {
 // The WAL's busy handler is used for FULL/RESTART/TRUNCATE modes to wait
 // for readers that block progress, matching SQLite's behavior.
 func (p *pager) checkpointWithMode(mode CheckpointMode) error {
-	return p.wal.checkpointWithMode(p.file, p.cache, mode, p.wal.busyHandler)
+	err := p.wal.checkpointWithMode(p.file, p.cache, mode, p.wal.busyHandler)
+	if err == nil {
+		p.clearReadSnapCache()
+	}
+	return err
 }
 
 // tryCheckpoint attempts a passive checkpoint for auto-checkpoint.
@@ -1391,12 +1522,16 @@ func (p *pager) tryCheckpoint() error {
 	if err := p.wal.checkpointPassive(p.file, p.cache); err != nil {
 		return err
 	}
+	// Checkpoint may move page versions between WAL/DB; invalidate read snapshots.
+	p.clearReadSnapCache()
 
 	// If all frames are backfilled, try a best-effort RESTART to recycle WAL
 	// frame numbers and prevent unbounded WAL growth. With xBusy=nil this does
 	// not wait for readers; it simply skips reset when locks are busy.
 	if p.wal.index.nBackfill.Load() >= p.wal.nFrame.Load() {
-		_ = p.wal.checkpointWithMode(p.file, p.cache, CheckpointRestart, nil)
+		if err := p.wal.checkpointWithMode(p.file, p.cache, CheckpointRestart, nil); err == nil {
+			p.clearReadSnapCache()
+		}
 	}
 	return nil
 }
@@ -1583,10 +1718,11 @@ func (p *pager) close() error {
 				p.wal.truncateFile()
 			}
 		}
-		_ = p.wal.close()
+			_ = p.wal.close()
 	}
 
 	p.cache.clear()
+	p.clearReadSnapCache()
 
 	if p.file != nil {
 		err := p.file.Close()

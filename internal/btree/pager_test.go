@@ -142,6 +142,81 @@ func TestReadPageMVCC_ValidPage(t *testing.T) {
 	p.endRead(slot2)
 }
 
+func TestReadPageMVCC_ReadSnapCacheHit(t *testing.T) {
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	// Create committed content first.
+	mf0, slot0, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf0)
+	require.NoError(t, p.beginWrite())
+	pg, err := p.getWritablePage(1)
+	require.NoError(t, err)
+	p.releasePage(pg)
+	_, _, _, err = p.commit(true, false)
+	require.NoError(t, err)
+	p.endRead(slot0)
+
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	defer p.endRead(slot)
+
+	// First read: cache miss path.
+	pg1, err := p.readPageMVCC(1, mf)
+	require.NoError(t, err)
+	assert.True(t, pg1.uncached)
+	assert.False(t, pg1.borrowed)
+	p.releasePage(pg1)
+
+	// Second read in same snapshot: should hit immutable snapshot cache.
+	pg2, err := p.readPageMVCC(1, mf)
+	require.NoError(t, err)
+	assert.True(t, pg2.uncached)
+	assert.False(t, pg2.borrowed)
+	p.releasePage(pg2)
+}
+
+func TestCommit_ClearsReadSnapCache(t *testing.T) {
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	// Warm immutable read snapshot cache.
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	pg, err := p.readPageMVCC(1, mf)
+	require.NoError(t, err)
+	p.releasePage(pg)
+	p.endRead(slot)
+
+	p.readSnapMu.Lock()
+	nonEmpty := len(p.readSnapCache) > 0
+	p.readSnapMu.Unlock()
+	require.True(t, nonEmpty)
+
+	// Commit a write transaction and verify snapshot cache is invalidated.
+	mf2, slot2, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf2)
+	require.NoError(t, p.beginWrite())
+	pgW, err := p.getWritablePage(1)
+	require.NoError(t, err)
+	p.releasePage(pgW)
+	_, _, _, err = p.commit(true, false)
+	require.NoError(t, err)
+	p.endRead(slot2)
+
+	p.readSnapMu.Lock()
+	defer p.readSnapMu.Unlock()
+	assert.Equal(t, 0, len(p.readSnapCache))
+}
+
 // ============================================================
 // beginRead — pagerError state path (73.3% coverage)
 // ============================================================
