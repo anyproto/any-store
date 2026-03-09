@@ -428,23 +428,11 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 		return nil, ErrInvalidPage
 	}
 
-	// Check writer cache first.
+	// Check writer cache first. SQLite returns cached pages directly without
+	// any WAL lookup (pager.c:5568-5573 getPageNormal). The writer cache is
+	// only accessed by the writer goroutine, so cached pages are always valid
+	// for the writer's snapshot. Cache is cleared on checkpoint/WAL restart.
 	if pg := p.writerCache.fetch(pgno); pg != nil {
-		// For clean pages, verify the cached version is within our snapshot.
-		// Dirty pages are returned as-is: the caller is responsible for
-		// MVCC dirty-page handling at a higher level.
-		if !pg.dirty {
-			latestFrame := p.wal.index.getLatest(pgno)
-			if latestFrame == 0 || latestFrame <= walMaxFrame {
-				return pg, nil
-			}
-			// Stale clean page — release and read a fresh uncached copy.
-			// We don't discard from cache here because another reference
-			// might exist (e.g., in writePages after a spill). The stale
-			// page will eventually be evicted from LRU.
-			p.writerCache.release(pg)
-			return p.readTempPage(pgno, walMaxFrame)
-		}
 		return pg, nil
 	}
 
