@@ -975,6 +975,7 @@ guarantee.
 | 17. Auto-vacuum | Missing | Medium | Not implemented |
 | 18. Table B-trees | Structural | High | Not implemented; index B-trees only |
 | 19. Atomic dbSize | Divergent | Low | Go memory model requires atomics for shared pager field |
+| 20. WAL shared state | Structural + Divergent | Medium | SHM direct reads, split writerHdr, no pChanged |
 
 ---
 
@@ -1233,3 +1234,160 @@ These SQLite features are intentionally absent:
 - **Multi-database transactions** -- single database per connection
 - **WAL2 mode** -- standard WAL only
 - **Database file locking (RESERVED/PENDING/EXCLUSIVE)** -- WAL mode uses SHM locks
+
+---
+
+## 20. WAL Shared State -- Per-Connection Isolation vs Shared Struct
+
+### Problem
+
+SQLite gives each database connection its own `Wal` struct (wal.c:511). The `Wal`
+struct contains `pWal->hdr` — a private copy of the SHM header (`WalIndexHdr`),
+populated by `walIndexTryHdr()` from shared memory. Each connection reads SHM into
+its own copy. Checkpoint info (`nBackfill`, `aReadMark`) is accessed directly
+through a `volatile WalCkptInfo*` pointer into the mmap'd region — never copied
+into per-connection storage.
+
+Our Go code has a single `wal` struct shared by all goroutines (readers, writer,
+checkpoint) within one `DB`. This created two bugs when multiple goroutines called
+`tryBeginRead()` concurrently in multi-process mode:
+
+1. **mxCommitFrame clobbering**: Readers called `shmReadCkptInfo()` which bulk-copied
+   SHM values into shared `mxCommitFrame` atomic. A reader with a stale-but-valid SHM
+   header would overwrite the writer's latest value, causing other readers to see an
+   older snapshot.
+
+2. **aReadMark clobbering**: `shmReadCkptInfo()` also overwrote `aReadMark[0..4]` with
+   SHM values. During checkpoint, the checkpoint goroutine reads readmarks to determine
+   active reader positions. A concurrent reader calling `shmReadCkptInfo()` could write
+   `READMARK_NOT_USED` over a valid mark, causing checkpoint to misjudge reader positions
+   and checkpoint past active readers.
+
+### Fix
+
+Split `tryBeginRead` into `tryBeginReadInProcess` (uses process-local atomics, no SHM
+races) and `tryBeginReadMultiProcess` (matches SQLite's `walTryBeginRead` step by step).
+
+The multi-process path:
+- Reads SHM header into a function-local variable (not shared state)
+- Reads `nBackfill` and `aReadMark` directly from SHM via `shmNBackfill()` / `shmReadMark()`
+- Re-validates after lock by comparing live SHM header against local copy
+- Syncs `nBackfill` to process-local atomic only at the end (for `walIndex.get()`)
+- Never calls `shmReadCkptInfo()` from concurrent reader paths
+
+### Drift 1: SHM Access Pattern — volatile pointer vs explicit reads
+
+**SQLite**: Uses `volatile WalCkptInfo *pInfo = walCkptInfo(pWal)` — a pointer cast
+into the mmap'd SHM region (wal.c:820-824). Every `AtomicLoad(pInfo->aReadMark+i)` or
+`AtomicLoad(&pInfo->nBackfill)` is a zero-overhead dereference directly into shared
+memory.
+
+**Go**: Can't do `volatile` pointer casts into `[]byte` mmap'd slices. Instead uses
+`shmNBackfill()`, `shmReadMark(i)`, `shmWriteReadMark(i, val)` which call
+`shm.region(0, false)` (mutex-protected region lookup) + `binary.LittleEndian.Uint32`.
+
+**Impact**: Semantically identical. Performance cost is small — called a few times per
+`tryBeginRead` / checkpoint, not on hot paths.
+
+**Classification: Structural** — Go language limitation (no volatile pointers).
+
+### Drift 2: Process-local `mxCommitFrame` atomic
+
+**SQLite**: No process-local `mxCommitFrame`. The writer updates `pWal->hdr.mxFrame`
+(per-connection), then writes to SHM via `walIndexWriteHdr`. Readers get `mxFrame` from
+`pWal->hdr` (populated from SHM by `walIndexTryHdr`).
+
+**Go**: `walIndex.mxCommitFrame` is a process-local `atomic.Uint32`. In-process mode
+uses it directly (fast path). Multi-process mode reads from SHM header via
+`readHeader()` instead. The writer updates both: process-local (`mxCommitFrame.Store`)
+and SHM (`writeHeader`).
+
+**Impact**: Low. The dual-write is necessary because in-process mode skips SHM. Multi-
+process readers read from SHM, so the process-local value is only authoritative for
+in-process readers and as a fallback when SHM is invalid.
+
+**Classification: Structural** — consequence of dual in-process/multi-process modes.
+
+### Drift 3: Process-local `nBackfill` / `aReadMark` atomics
+
+**SQLite**: No process-local copies. `nBackfill` and `aReadMark` live only in
+`WalCkptInfo` inside the mmap'd SHM region, accessed via `volatile` pointer.
+
+**Go**: Maintains process-local `atomic.Uint32` copies. After the fix:
+- `tryBeginReadMultiProcess`: reads from SHM, syncs `nBackfill` to process-local at end
+  (for `walIndex.get()` which uses `nBackfill.Load()+1` as `minFrame`)
+- `tryBeginReadInProcess`: uses process-local atomics exclusively
+- Checkpoint: reads from SHM in multi-process mode (via `shmReadMark`, `shmNBackfill`),
+  writes to both SHM and process-local
+
+**Impact**: Medium. The dual state (SHM + process-local) is the main structural
+difference. Safe as long as sync discipline holds: read from SHM first, sync to
+process-local before consuming.
+
+**Classification: Structural** — `walIndex.get()` uses `nBackfill.Load()` and is shared
+between in-process and multi-process code paths; can't easily switch to SHM-only reads.
+
+### Drift 4: `writerHdr` + `readSnapshot` vs unified `pWal->hdr`
+
+**SQLite**: `pWal->hdr` serves three purposes:
+1. Reader snapshot (populated by `walIndexTryHdr` in `walTryBeginRead`)
+2. Writer BUSY_SNAPSHOT check (compared in `sqlite3WalBeginWriteTransaction`, wal.c:3712)
+3. Writer state after commit (updated in `walFrames`, wal.c:4229)
+
+**Go**: Split into:
+- Function-local `hdr` variable in `tryBeginReadMultiProcess()` — reader snapshot
+- `wal.readSnapshot` — BUSY_SNAPSHOT comparison
+- `wal.writerHdr` — writer state detection and commit tracking
+
+**Impact**: Low. Same semantics, clearer ownership. The split avoids the problem of
+concurrent reader goroutines writing to a shared `pWal->hdr` equivalent.
+
+**Classification: Divergent** — deliberate split for goroutine safety.
+
+### Drift 5: No `pChanged` signal for reader cache invalidation
+
+**SQLite**: `walIndexReadHdr` sets `*pChanged=1` when the SHM header changes
+(wal.c:2611), triggering `sqlite3PagerClearCache` upstream — invalidating the
+connection's page cache. This is necessary because SQLite's per-connection page
+cache persists across transactions.
+
+**Go**: Per-reader caches are allocated fresh (from `sync.Pool`, cleared) per
+`BeginRead` transaction and scoped to a single `walMaxFrame` snapshot. They're
+cleared and recycled on `Rollback`. There's nothing stale to invalidate, so no
+`pChanged` signal is needed.
+
+Writer cache (`writerCache`) does persist across transactions and IS invalidated
+via `beginWrite()` returning `stateChanged=true` → `writerCache.clear()`.
+
+**Impact**: None. Different mechanism, same correctness guarantee. SQLite invalidates
+long-lived per-connection caches on header change. We use short-lived per-transaction
+caches that start empty.
+
+**Classification: Structural** — per-transaction reader caches eliminate the need.
+
+### Drift 6: `shmReadCkptInfo` bulk-copy function (latent risk)
+
+**SQLite**: No equivalent — there is no "bulk copy SHM to local" function. Every
+access goes through the `volatile WalCkptInfo*` pointer.
+
+**Go**: `shmReadCkptInfo()` bulk-copies all of `nBackfill`, `aReadMark[0..4]`,
+`nBackfillAttempted` from SHM into process-local atomics. After the fix, it is no
+longer called from any concurrent reader path (only tests and single-goroutine
+contexts). But it remains in the codebase.
+
+**Impact**: Latent risk. If someone calls it from a concurrent reader path, the
+original clobbering bug would reappear. The function has a warning comment.
+
+**Classification: Divergent** — retained for test convenience; not used in production
+concurrent paths.
+
+### Drift Summary
+
+| Drift | Classification | Severity | Tested |
+|-------|---------------|----------|--------|
+| 1. SHM access (volatile ptr vs explicit reads) | Structural | Low | `TestShmDirectAccess_*` |
+| 2. Process-local `mxCommitFrame` | Structural | Low | `TestWriterCacheStaleAfterWALReset` |
+| 3. Process-local `nBackfill`/`aReadMark` | Structural | Medium | `TestWriterCacheStaleAfterWALReset`, `TestShmDirectAccess_*` |
+| 4. Split `writerHdr`/`readSnapshot` vs `pWal->hdr` | Divergent | Low | `TestMultiProcessWALCorruption` |
+| 5. No `pChanged` for reader cache | Structural | None | Per-transaction cache lifecycle tests |
+| 6. `shmReadCkptInfo` latent risk | Divergent | Latent | Warning comment in source |

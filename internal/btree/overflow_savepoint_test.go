@@ -7,6 +7,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	mrand "math/rand"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,13 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+// writeHistEntry tracks a single committed value for a key.
+type writeHistEntry struct {
+	txIdx int
+	val   []byte
+	op    string // "put" or "delete"
+}
 
 // TestOverflowSavepointCorruption exercises savepoint rollback/release with
 // overflow-sized values to reproduce Bug 9: zero-content overflow pages
@@ -169,6 +177,21 @@ func testOverflowSavepointConcurrent(t *testing.T, seed int64) {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
+	// On failure, copy DB to /tmp for post-mortem analysis
+	defer func() {
+		if t.Failed() {
+			dest := fmt.Sprintf("/tmp/corrupt-seed%d", seed)
+			os.MkdirAll(dest, 0o755)
+			for _, name := range []string{"test.db", "test.db-wal", "test.db-shm"} {
+				src := filepath.Join(dir, name)
+				data, err := os.ReadFile(src)
+				if err == nil {
+					os.WriteFile(filepath.Join(dest, name), data, 0o644)
+				}
+			}
+			t.Logf("DB preserved at %s", dest)
+		}
+	}()
 	db, err := Open(dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
@@ -185,6 +208,9 @@ func testOverflowSavepointConcurrent(t *testing.T, seed int64) {
 	rng := mrand.New(mrand.NewSource(seed))
 	expected := make(map[string][]byte)
 	maxDocs := 30
+
+	// Write history: tracks all committed values per key with tx index
+	writeHistory := make(map[string][]writeHistEntry)
 
 	// Background readers
 	var stop atomic.Bool
@@ -293,7 +319,15 @@ func testOverflowSavepointConcurrent(t *testing.T, seed int64) {
 			require.NoError(t, tx.Commit())
 		}
 
-		verifyOverflowData(t, db, expected, txIdx)
+		// Record committed state in write history
+		for k, v := range expected {
+			hist := writeHistory[k]
+			if len(hist) == 0 || !bytes.Equal(hist[len(hist)-1].val, v) {
+				writeHistory[k] = append(hist, writeHistEntry{txIdx: txIdx, val: v, op: "put"})
+			}
+		}
+
+		verifyOverflowDataWithHistory(t, db, expected, txIdx, writeHistory)
 	}
 
 	stop.Store(true)
@@ -495,18 +529,132 @@ func testOverflowSavepointWithSeed(t *testing.T, seed int64) {
 	require.NoError(t, db.IntegrityCheck())
 }
 
-// verifyOverflowData reads all data in the DB and compares with expected.
-func verifyOverflowData(t *testing.T, db *DB, expected map[string][]byte, txIdx int) {
+// verifyOverflowDataWithHistory reads all data and on mismatch reports which
+// historical version was found. This helps identify WHEN the stale write happened.
+func verifyOverflowDataWithHistory(t *testing.T, db *DB, expected map[string][]byte, txIdx int, history map[string][]writeHistEntry) {
 	t.Helper()
-
-	ns, err := db.getNamespaceLocked("docs")
-	if err != nil {
-		return
-	}
 
 	rtx, err := db.BeginRead()
 	require.NoError(t, err)
 	defer func() { _ = rtx.Rollback() }()
+
+	ns, err := rtx.GetNamespace("docs")
+	if err != nil {
+		return
+	}
+
+	found := make(map[string]bool)
+	cursor := rtx.NewCursor(ns)
+	if err := cursor.First(); err != nil {
+		cursor.Close()
+		return
+	}
+
+	for cursor.Valid() {
+		key, kErr := cursor.Key()
+		if kErr != nil {
+			cursor.Close()
+			t.Fatalf("tx %d verify: Key() error: %v", txIdx, kErr)
+		}
+		val, vErr := cursor.Value()
+		if vErr != nil {
+			cursor.Close()
+			t.Fatalf("tx %d verify: Value() error at key=%s: %v", txIdx, string(key), vErr)
+		}
+
+		keyStr := string(key)
+		found[keyStr] = true
+
+		expectedVal, exists := expected[keyStr]
+		if !exists {
+			cursor.Close()
+			t.Fatalf("tx %d verify: unexpected key %s in DB", txIdx, keyStr)
+		}
+
+		if !bytes.Equal(val, expectedVal) {
+			cursor.Close()
+			// Search history to find which version we got
+			matchTx := -1
+			hist := history[keyStr]
+			for i, h := range hist {
+				if bytes.Equal(val, h.val) {
+					matchTx = h.txIdx
+					_ = i
+					break
+				}
+			}
+
+			// Dump WAL state
+			nFrame := db.pager.wal.nFrame.Load()
+			nBackfill := db.pager.wal.index.nBackfill.Load()
+			mxCommit := db.pager.wal.index.mxCommitFrame.Load()
+			readerMaxFrame := rtx.walMaxFrame
+
+			// Re-read with a fresh transaction to check if the DB itself is consistent
+			rtx2, _ := db.BeginRead()
+			var freshVal []byte
+			var freshLen int
+			if rtx2 != nil {
+				ns2, _ := rtx2.GetNamespace("docs")
+				if ns2 != nil {
+					v, err := rtx2.Get(ns2, []byte(keyStr))
+					if err == nil {
+						freshVal = v
+						freshLen = len(v)
+					}
+				}
+				_ = rtx2.Rollback()
+			}
+			freshMatch := bytes.Equal(freshVal, expectedVal)
+
+			matchInfo := "NOT FOUND in history"
+			if matchTx >= 0 {
+				matchInfo = fmt.Sprintf("matches tx %d", matchTx)
+			}
+
+			t.Fatalf("tx %d verify: key %s value mismatch (%s)\n"+
+				"  got len=%d, want len=%d\n"+
+				"  WAL: nFrame=%d nBackfill=%d mxCommitFrame=%d readerMaxFrame=%d\n"+
+				"  History: %d entries for this key\n"+
+				"  Fresh re-read: len=%d matchesExpected=%v\n"+
+				"  Got first 32: %s\n"+
+				"  Want first 32: %s",
+				txIdx, keyStr, matchInfo,
+				len(val), len(expectedVal),
+				nFrame, nBackfill, mxCommit, readerMaxFrame,
+				len(hist),
+				freshLen, freshMatch,
+				hex.EncodeToString(val[:min(32, len(val))]),
+				hex.EncodeToString(expectedVal[:min(32, len(expectedVal))]))
+
+		}
+
+		if err := cursor.Next(); err != nil {
+			cursor.Close()
+			t.Fatalf("tx %d verify: Next() error: %v", txIdx, err)
+		}
+	}
+	cursor.Close()
+
+	for key := range expected {
+		if !found[key] {
+			t.Fatalf("tx %d verify: expected key %s not found in DB", txIdx, key)
+		}
+	}
+}
+
+// verifyOverflowData reads all data in the DB and compares with expected.
+func verifyOverflowData(t *testing.T, db *DB, expected map[string][]byte, txIdx int) {
+	t.Helper()
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	ns, err := rtx.GetNamespace("docs")
+	if err != nil {
+		return
+	}
 
 	found := make(map[string]bool)
 	cursor := rtx.NewCursor(ns)

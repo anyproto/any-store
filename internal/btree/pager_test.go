@@ -1548,6 +1548,210 @@ func TestShmReadCkptInfo_NoRegion(t *testing.T) {
 }
 
 // ============================================================
+// SHM direct-access helpers (NOTES.md §20, drift 1)
+// shmNBackfill, shmReadMark, shmWriteReadMark
+// ============================================================
+
+func TestShmDirectAccess_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
+	require.NoError(t, err)
+	defer idx.close()
+
+	// Create region 0
+	_, err = idx.shm.region(0, true)
+	require.NoError(t, err)
+
+	// Write via shmWriteReadMark, read via shmReadMark
+	idx.shmWriteReadMark(0, 0)
+	idx.shmWriteReadMark(1, 42)
+	idx.shmWriteReadMark(2, 100)
+	idx.shmWriteReadMark(3, readMarkNotUsed)
+	idx.shmWriteReadMark(4, readMarkNotUsed)
+
+	assert.Equal(t, uint32(0), idx.shmReadMark(0))
+	assert.Equal(t, uint32(42), idx.shmReadMark(1))
+	assert.Equal(t, uint32(100), idx.shmReadMark(2))
+	assert.Equal(t, readMarkNotUsed, idx.shmReadMark(3))
+	assert.Equal(t, readMarkNotUsed, idx.shmReadMark(4))
+
+	// Write nBackfill via process-local + shmWriteCkptInfo, read via shmNBackfill
+	idx.nBackfill.Store(77)
+	idx.shmWriteCkptInfo()
+	assert.Equal(t, uint32(77), idx.shmNBackfill())
+
+	// Verify shmWriteReadMark and shmReadCkptInfo are consistent
+	idx.shmWriteReadMark(1, 200)
+	idx.shmReadCkptInfo()
+	assert.Equal(t, uint32(200), idx.aReadMark[1].Load())
+}
+
+func TestShmDirectAccess_NoRegion(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
+	require.NoError(t, err)
+	defer idx.close()
+
+	// Don't create region 0 — all direct-access helpers must handle gracefully
+
+	// shmNBackfill returns 0 on error
+	assert.Equal(t, uint32(0), idx.shmNBackfill())
+
+	// shmReadMark returns readMarkNotUsed on error
+	assert.Equal(t, readMarkNotUsed, idx.shmReadMark(0))
+	assert.Equal(t, readMarkNotUsed, idx.shmReadMark(1))
+
+	// shmWriteReadMark is a no-op on error (must not panic)
+	idx.shmWriteReadMark(0, 42) // should not panic
+}
+
+// ============================================================
+// tryBeginReadInProcess — all-slots-busy fallback to slot 0
+// ============================================================
+
+func TestTryBeginReadInProcess_AllSlotsBusy(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	db, err := Open(dbPath, Options{PageSize: 4096, InProcess: true})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write some data so WAL has frames
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("k"), []byte("v")))
+	require.NoError(t, tx.Commit())
+
+	w := db.pager.wal
+
+	// Set nBackfill to 0 so mxFrame != nBackfill, forcing the "find best slot" path
+	w.index.nBackfill.Store(0)
+
+	// Lock all reader slots 1-4 exclusively to force the fallback to slot 0
+	for i := 1; i <= 4; i++ {
+		err := w.index.lock(lockRead0+i, lockExclusive)
+		require.NoError(t, err)
+	}
+	defer func() {
+		for i := 1; i <= 4; i++ {
+			_ = w.index.unlock(lockRead0+i, lockExclusive)
+		}
+	}()
+
+	// tryBeginReadInProcess should fall back to slot 0
+	maxFrame, slot, err := w.tryBeginReadInProcess()
+	require.NoError(t, err)
+	assert.Equal(t, 0, slot, "should fall back to slot 0")
+	assert.True(t, maxFrame > 0)
+	_ = w.index.unlock(lockRead0+slot, lockShared)
+}
+
+func TestTryBeginReadInProcess_BestSlotAndClaimSlot(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	db, err := Open(dbPath, Options{PageSize: 4096, InProcess: true})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write data so WAL has frames
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("k"), []byte("v")))
+	require.NoError(t, tx.Commit())
+
+	w := db.pager.wal
+	mxFrame := w.index.mxCommitFrame.Load()
+	require.True(t, mxFrame > 0)
+
+	// Prevent the slot 0 fast path by ensuring nBackfill < mxFrame
+	w.index.nBackfill.Store(0)
+
+	// Set readmark on slot 1 to mxFrame so the "best slot" path is taken
+	w.index.aReadMark[1].Store(mxFrame)
+
+	maxFrame, slot, err := w.tryBeginReadInProcess()
+	require.NoError(t, err)
+	assert.Equal(t, 1, slot, "should pick slot 1 (best mark)")
+	assert.Equal(t, mxFrame, maxFrame)
+	_ = w.index.unlock(lockRead0+slot, lockShared)
+
+	// Now lock slot 1 so it can't be reused, clear all readmarks to force "claim unused slot"
+	err = w.index.lock(lockRead0+1, lockExclusive)
+	require.NoError(t, err)
+	for i := 1; i <= 4; i++ {
+		w.index.aReadMark[i].Store(readMarkNotUsed)
+	}
+
+	maxFrame2, slot2, err := w.tryBeginReadInProcess()
+	require.NoError(t, err)
+	assert.True(t, slot2 >= 2 && slot2 <= 4, "should claim unused slot 2-4, got %d", slot2)
+	assert.Equal(t, mxFrame, maxFrame2)
+	assert.Equal(t, mxFrame, w.index.aReadMark[slot2].Load(), "readmark should be set to mxFrame")
+	_ = w.index.unlock(lockRead0+slot2, lockShared)
+	_ = w.index.unlock(lockRead0+1, lockExclusive)
+}
+
+func TestTryBeginReadInProcess_Slot0FastPath_LockError(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	db, err := Open(dbPath, Options{PageSize: 4096, InProcess: true})
+	require.NoError(t, err)
+	defer db.Close()
+
+	w := db.pager.wal
+
+	// mxFrame == 0 means nBackfill == mxFrame, taking the slot 0 fast path.
+	// Lock slot 0 exclusively to force the error return.
+	err = w.index.lock(lockRead0, lockExclusive)
+	require.NoError(t, err)
+	defer func() { _ = w.index.unlock(lockRead0, lockExclusive) }()
+
+	_, _, err = w.tryBeginReadInProcess()
+	assert.ErrorIs(t, err, ErrBusy)
+}
+
+func TestTryBeginReadInProcess_AllSlotsBusy_Slot0Error(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	db, err := Open(dbPath, Options{PageSize: 4096, InProcess: true})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Write some data
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("k"), []byte("v")))
+	require.NoError(t, tx.Commit())
+
+	w := db.pager.wal
+
+	// Set nBackfill to 0 so mxFrame != nBackfill, forcing the "find best slot" path
+	// instead of the slot 0 fast path.
+	w.index.nBackfill.Store(0)
+
+	// Lock ALL reader slots (0-4) exclusively to force error on fallback to slot 0
+	for i := 0; i <= 4; i++ {
+		err := w.index.lock(lockRead0+i, lockExclusive)
+		require.NoError(t, err)
+	}
+	defer func() {
+		for i := 0; i <= 4; i++ {
+			_ = w.index.unlock(lockRead0+i, lockExclusive)
+		}
+	}()
+
+	// tryBeginReadInProcess should fail when slot 0 is also locked
+	_, _, err = w.tryBeginReadInProcess()
+	assert.Error(t, err)
+}
+
+// ============================================================
 // WAL open — branches (81.8%)
 // ============================================================
 
