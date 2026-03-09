@@ -124,45 +124,48 @@ func TestPcacheLruRemove_NotInLRU(t *testing.T) {
 }
 
 func TestPcacheLruRemove_Head(t *testing.T) {
-	// Test removing the head of a multi-element LRU list
+	// Test removing the head of a multi-element LRU list.
+	// With lruPrepend, most recently released is at HEAD.
 	pc := newPcache(4096, 100, true)
 
 	pg1 := pc.create(1)
 	pg2 := pc.create(2)
 	pg3 := pc.create(3)
-	pc.release(pg1) // LRU: pg1
-	pc.release(pg2) // LRU: pg1 -> pg2
-	pc.release(pg3) // LRU: pg1 -> pg2 -> pg3
+	pc.release(pg1) // LRU: HEAD -> pg1 -> TAIL
+	pc.release(pg2) // LRU: HEAD -> pg2 -> pg1 -> TAIL
+	pc.release(pg3) // LRU: HEAD -> pg3 -> pg2 -> pg1 -> TAIL
 	assert.Equal(t, 3, pc.nClean)
 
-	// Remove head
-	pc.lruRemove(pg1)
+	// Remove head (pg3, most recently released)
+	pc.lruRemove(pg3)
 	assert.Equal(t, 2, pc.nClean)
 	assert.Equal(t, pg2, pc.lruHead)
-	assert.Equal(t, pg3, pc.lruTail)
+	assert.Equal(t, pg1, pc.lruTail)
 }
 
 func TestPcacheLruRemove_Tail(t *testing.T) {
-	// Test removing the tail of a multi-element LRU list
+	// Test removing the tail of a multi-element LRU list.
+	// With lruPrepend: release(pg1) then release(pg2) gives HEAD -> pg2 -> pg1 -> TAIL
 	pc := newPcache(4096, 100, true)
 
 	pg1 := pc.create(1)
 	pg2 := pc.create(2)
-	pc.release(pg1) // LRU: pg1
-	pc.release(pg2) // LRU: pg1 -> pg2
+	pc.release(pg1) // LRU: HEAD -> pg1 -> TAIL
+	pc.release(pg2) // LRU: HEAD -> pg2 -> pg1 -> TAIL
 	assert.Equal(t, 2, pc.nClean)
 
-	// Remove tail
-	pc.lruRemove(pg2)
+	// Remove tail (pg1, least recently released)
+	pc.lruRemove(pg1)
 	assert.Equal(t, 1, pc.nClean)
-	assert.Equal(t, pg1, pc.lruHead)
-	assert.Equal(t, pg1, pc.lruTail)
+	assert.Equal(t, pg2, pc.lruHead)
+	assert.Equal(t, pg2, pc.lruTail)
 }
 
 func TestPcacheLruRemove_Middle(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
 	// Create 3 pages and release them — all go to LRU
+	// With lruPrepend: HEAD -> pgs[2] -> pgs[1] -> pgs[0] -> TAIL
 	pgs := make([]*page, 3)
 	for i := range pgs {
 		pgs[i] = pc.create(uint32(i + 1))
@@ -172,11 +175,11 @@ func TestPcacheLruRemove_Middle(t *testing.T) {
 	}
 	assert.Equal(t, 3, pc.nClean)
 
-	// Remove the middle page
+	// Remove the middle page (pgs[1])
 	pc.lruRemove(pgs[1])
 	assert.Equal(t, 2, pc.nClean)
-	assert.Equal(t, pgs[0], pc.lruHead)
-	assert.Equal(t, pgs[2], pc.lruTail)
+	assert.Equal(t, pgs[2], pc.lruHead)
+	assert.Equal(t, pgs[0], pc.lruTail)
 }
 
 func TestPcacheNonPurgeable(t *testing.T) {

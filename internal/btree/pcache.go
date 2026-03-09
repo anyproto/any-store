@@ -126,7 +126,7 @@ func (pc *pcache) release(p *page) {
 		// "ghost" pages to the LRU would cause evictOne to loop without
 		// reducing len(pages).
 		if !p.dirty && pc.pages[p.pgno] == p {
-			pc.lruAppend(p)
+			pc.lruPrepend(p)
 		}
 	}
 }
@@ -163,7 +163,7 @@ func (pc *pcache) makeClean(p *page) {
 		p.prev = nil
 		pc.nDirty--
 		if p.pinCount == 0 {
-			pc.lruAppend(p)
+			pc.lruPrepend(p)
 		}
 	}
 }
@@ -240,15 +240,18 @@ func (pc *pcache) truncate(maxPage uint32) {
 	}
 }
 
-func (pc *pcache) lruAppend(p *page) {
-	p.next = nil
-	p.prev = pc.lruTail
-	if pc.lruTail != nil {
-		pc.lruTail.next = p
+// lruPrepend inserts a page at the HEAD of the LRU list (MRU position).
+// Eviction happens from the TAIL (LRU position).
+// Matches SQLite pcache1.c:1098-1101 (unpin inserts at pGroup->lru.pLruNext — HEAD).
+func (pc *pcache) lruPrepend(p *page) {
+	p.prev = nil
+	p.next = pc.lruHead
+	if pc.lruHead != nil {
+		pc.lruHead.prev = p
 	} else {
-		pc.lruHead = p
+		pc.lruTail = p
 	}
-	pc.lruTail = p
+	pc.lruHead = p
 	pc.nClean++
 }
 
@@ -272,21 +275,25 @@ func (pc *pcache) lruRemove(p *page) {
 	pc.nClean--
 }
 
-func (pc *pcache) evictOne() {
-	if pc.lruHead == nil {
-		return
+// evictOne removes the page at the TAIL of the LRU list (least recently used)
+// and returns it. Returns nil if the LRU list is empty.
+// Matches SQLite pcache1.c:623-624 (evicts from pGroup->lru.pLruPrev — TAIL).
+func (pc *pcache) evictOne() *page {
+	if pc.lruTail == nil {
+		return nil
 	}
-	p := pc.lruHead
-	pc.lruHead = p.next
-	if pc.lruHead != nil {
-		pc.lruHead.prev = nil
+	p := pc.lruTail
+	pc.lruTail = p.prev
+	if pc.lruTail != nil {
+		pc.lruTail.next = nil
 	} else {
-		pc.lruTail = nil
+		pc.lruHead = nil
 	}
 	p.next = nil
 	p.prev = nil
 	pc.nClean--
 	delete(pc.pages, p.pgno)
+	return p
 }
 
 // findSpillVictim walks the dirty list and returns the first page with

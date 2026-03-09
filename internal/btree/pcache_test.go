@@ -336,6 +336,69 @@ func TestPcacheNoStressWhenCleanPagesAvailable(t *testing.T) {
 	pc.release(pg4)
 }
 
+func TestPcacheLRUEvictionOrder(t *testing.T) {
+	// Pin pages 1-5, release in order 5,4,3,2,1.
+	// LRU list should be: HEAD(MRU) -> 1 -> 2 -> 3 -> 4 -> 5 -> TAIL(LRU)
+	// Eviction should pop from TAIL: 5, 4, 3, 2, 1.
+	pc := newPcache(4096, 5, true)
+
+	pgs := make([]*page, 5)
+	for i := uint32(1); i <= 5; i++ {
+		pgs[i-1] = pc.create(i)
+	}
+	// Release in reverse order: 5, 4, 3, 2, 1
+	for i := 4; i >= 0; i-- {
+		pc.release(pgs[i])
+	}
+	assert.Equal(t, 5, pc.nClean)
+
+	// Eviction order should be 5, 4, 3, 2, 1 (least recently released first = TAIL)
+	expectedEviction := []uint32{5, 4, 3, 2, 1}
+	for _, expectedPgno := range expectedEviction {
+		evicted := pc.evictOne()
+		require.NotNil(t, evicted, "expected to evict page %d", expectedPgno)
+		assert.Equal(t, expectedPgno, evicted.pgno)
+	}
+	assert.Equal(t, 0, pc.nClean)
+	assert.Nil(t, pc.lruHead)
+	assert.Nil(t, pc.lruTail)
+}
+
+func TestPcacheLRURefetchMovesMRU(t *testing.T) {
+	// Release page A, fetch it again, release it — A should be at MRU (HEAD),
+	// not evicted first.
+	pc := newPcache(4096, 5, true)
+
+	pgA := pc.create(1)
+	pgB := pc.create(2)
+	pgC := pc.create(3)
+
+	// Release A, B, C in order
+	pc.release(pgA) // LRU: HEAD -> A -> TAIL
+	pc.release(pgB) // LRU: HEAD -> B -> A -> TAIL
+	pc.release(pgC) // LRU: HEAD -> C -> B -> A -> TAIL
+
+	// Re-fetch A (removes from LRU), then release again (goes to HEAD/MRU)
+	pgA = pc.fetch(1)
+	require.NotNil(t, pgA)
+	assert.Equal(t, 2, pc.nClean) // B and C still in LRU
+	pc.release(pgA)               // LRU: HEAD -> A -> C -> B -> TAIL
+	assert.Equal(t, 3, pc.nClean)
+
+	// Eviction order should be B (tail/LRU), C, A (head/MRU)
+	evicted := pc.evictOne()
+	require.NotNil(t, evicted)
+	assert.Equal(t, uint32(2), evicted.pgno, "B should be evicted first (LRU)")
+
+	evicted = pc.evictOne()
+	require.NotNil(t, evicted)
+	assert.Equal(t, uint32(3), evicted.pgno, "C should be evicted second")
+
+	evicted = pc.evictOne()
+	require.NotNil(t, evicted)
+	assert.Equal(t, uint32(1), evicted.pgno, "A should be evicted last (MRU)")
+}
+
 func TestPcacheStressDisabledForInMemory(t *testing.T) {
 	pc := newPcache(4096, 3, false) // non-purgeable (InMemory)
 
