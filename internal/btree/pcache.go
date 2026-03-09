@@ -116,6 +116,8 @@ func (pc *pcache) create(pgno uint32) *page {
 }
 
 // release unpins a page. If the page is clean, it goes to the LRU list.
+// If the page is dirty, it moves to the front of the dirty list (MRU position).
+// Matches SQLite pcache.c:558 (pcacheManageDirtyList PCACHE_DIRTYLIST_FRONT on unpin).
 func (pc *pcache) release(p *page) {
 	p.pinCount--
 	if p.pinCount <= 0 {
@@ -125,7 +127,9 @@ func (pc *pcache) release(p *page) {
 		// by pager.writePages but is no longer in pcache.pages. Adding such
 		// "ghost" pages to the LRU would cause evictOne to loop without
 		// reducing len(pages).
-		if !p.dirty && pc.pages[p.pgno] == p {
+		if p.dirty {
+			pc.dirtyMoveToFront(p)
+		} else if pc.pages[p.pgno] == p {
 			pc.lruPrepend(p)
 		}
 	}
@@ -166,6 +170,30 @@ func (pc *pcache) makeClean(p *page) {
 			pc.lruPrepend(p)
 		}
 	}
+}
+
+// dirtyMoveToFront moves a dirty page to the front of the dirty list.
+// Called when an unpinned dirty page is released, so recently-released dirty
+// pages are at the front and oldest dirty pages are at the back (spill victims).
+// Matches SQLite pcache.c:558 (PCACHE_DIRTYLIST_FRONT).
+func (pc *pcache) dirtyMoveToFront(p *page) {
+	if !p.dirty || pc.dirtyHead == p {
+		return
+	}
+	// Unlink from current position
+	if p.prev != nil {
+		p.prev.next = p.next
+	}
+	if p.next != nil {
+		p.next.prev = p.prev
+	}
+	// Insert at head
+	p.prev = nil
+	p.next = pc.dirtyHead
+	if pc.dirtyHead != nil {
+		pc.dirtyHead.prev = p
+	}
+	pc.dirtyHead = p
 }
 
 // dirtyPages returns all dirty pages using the provided slice to avoid allocations.
@@ -296,13 +324,16 @@ func (pc *pcache) evictOne() *page {
 	return p
 }
 
-// findSpillVictim walks the dirty list and returns the first page with
-// pinCount == 0, or nil if all dirty pages are pinned.
+// findSpillVictim walks the dirty list and returns the oldest unpinned page
+// (last match walking from head = back of the list), or nil if all dirty
+// pages are pinned. Combined with dirtyMoveToFront on release, this ensures
+// recently-released dirty pages are preserved while stale ones are spilled.
 func (pc *pcache) findSpillVictim() *page {
+	var victim *page
 	for p := pc.dirtyHead; p != nil; p = p.next {
 		if p.pinCount == 0 {
-			return p
+			victim = p
 		}
 	}
-	return nil
+	return victim
 }

@@ -423,3 +423,61 @@ func TestPcacheStressDisabledForInMemory(t *testing.T) {
 	assert.Len(t, pc.pages, 4)       // cache grows beyond maxPages
 	pc.release(pg4)
 }
+
+func TestPcacheDirtyMoveToFrontOnRelease(t *testing.T) {
+	// Dirty pages A(1), B(2), C(3). Release C then A.
+	// After makeDirty order (most recent at head): C → B → A
+	// Release C → move to front (already there): C → B → A
+	// Release A → move to front: A → C → B
+	pc := newPcache(4096, 100, true)
+
+	pgA := pc.create(1)
+	pgB := pc.create(2)
+	pgC := pc.create(3)
+
+	pc.makeDirty(pgA)
+	pc.makeDirty(pgB)
+	pc.makeDirty(pgC)
+
+	// Dirty list after makeDirty: C(head) → B → A
+	assert.Equal(t, uint32(3), pc.dirtyHead.pgno)
+
+	// Release C (already at front, no change), then A (moves to front)
+	pc.release(pgC)
+	pc.release(pgA)
+
+	// Expected dirty list: A → C → B (most recently released at front)
+	assert.Equal(t, uint32(1), pc.dirtyHead.pgno, "A should be at front")
+	assert.Equal(t, uint32(3), pc.dirtyHead.next.pgno, "C should be second")
+	assert.Equal(t, uint32(2), pc.dirtyHead.next.next.pgno, "B should be last")
+	assert.Nil(t, pc.dirtyHead.next.next.next, "list should end after B")
+
+	pc.release(pgB)
+}
+
+func TestPcacheFindSpillVictimOldestFirst(t *testing.T) {
+	// After dirty move-to-front, findSpillVictim should return the oldest
+	// dirty page (at the back of the list), not the most recently released.
+	pc := newPcache(4096, 100, true)
+
+	pgA := pc.create(1)
+	pgB := pc.create(2)
+	pgC := pc.create(3)
+
+	pc.makeDirty(pgA)
+	pc.makeDirty(pgB)
+	pc.makeDirty(pgC)
+
+	// Release C then A — dirty list becomes: A → C → B
+	pc.release(pgC)
+	pc.release(pgA)
+	// B is still pinned (pinCount=1), release it last
+	pc.release(pgB)
+	// Before B release: A → C → B. Release B → move to front: B → A → C
+	// All have pinCount 0.
+
+	// findSpillVictim should return C (oldest, at back)
+	victim := pc.findSpillVictim()
+	require.NotNil(t, victim)
+	assert.Equal(t, uint32(3), victim.pgno, "C should be the spill victim (oldest at back)")
+}

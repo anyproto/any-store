@@ -75,11 +75,11 @@ SQLite ref: `pcache1.c:1098-1101` (unpin inserts at `pGroup->lru.pLruNext` — H
 ### Task 2: Dirty page move-to-front on release
 **Bug fix — SQLite moves dirty pages to front of dirty list when unpinned.**
 SQLite ref: `pcache.c:558` (`pcacheManageDirtyList(p, PCACHE_DIRTYLIST_FRONT)` on nRef==0 + dirty). Constants: `pcache.c:185-187`.
-- [ ] add `dirtyMoveToFront(p *page)` method to pcache — unlinks from current position, inserts at `pc.dirtyHead`
-- [ ] modify `release()` in `pcache.go:119-132`: when `pinCount` reaches 0 and page is dirty, call `dirtyMoveToFront(p)`
-- [ ] write test: dirty pages A, B, C; release C then A; verify dirty list order is A, C, B (most recently released at front)
-- [ ] write test: `findSpillVictim` returns B (oldest, at back) not A (most recently released)
-- [ ] run tests — must pass before next task
+- [x] add `dirtyMoveToFront(p *page)` method to pcache — unlinks from current position, inserts at `pc.dirtyHead`
+- [x] modify `release()` in `pcache.go:119-132`: when `pinCount` reaches 0 and page is dirty, call `dirtyMoveToFront(p)`
+- [x] write test: dirty pages A, B, C; release C then A; verify dirty list order is A, C, B (most recently released at front)
+- [x] write test: `findSpillVictim` returns B (oldest, at back) not A (most recently released)
+- [x] run tests — must pass before next task
 
 ### Task 3: Global slab allocator
 **New file `page_slab.go`. Process-global pre-allocated pool for `[]byte` page buffers.**
