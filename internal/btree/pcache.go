@@ -140,7 +140,10 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	}
 
 	// Step 3: Admission control — refuse soft creates when thrashing or under
-	// memory pressure. Matches SQLite pcache1.c:881-892 (step 3 guards).
+	// memory pressure. Implements two of SQLite's three step-3 guards
+	// (pcache1.c:886-891): nPinned >= n90pct (per-cache thrashing) and
+	// underPressure with nRecyclable < nPinned (global memory pressure).
+	// Omitted: nPinned >= mxPinned (PGroup-level cap) — no PGroup (drift #1).
 	// createFlag==1 (soft, readers): may return nil.
 	// createFlag==2 (hard, writers/stress): always proceeds.
 	if createFlag == 1 && pc.purgeable {
@@ -154,18 +157,27 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	}
 
 	// Step 4: Evict clean pages if cache is full (skip for non-purgeable / InMemory caches).
-	// Matches SQLite pcache1.c:897-914 (step 4 — reuses LRU victim's buffer).
-	// NOTE: evicted page buffers are NOT returned to the slab here because the
-	// pager's writePages map may still reference evicted page structs (after spill).
-	// Buffers are returned to the slab in clear() and discard() instead, where the
-	// pager has already cleaned up writePages references.
+	// Adapted from SQLite pcache1.c:897-914 (step 4 — SQLite reuses victim's buffer).
+	//
+	// Reader caches (xStress == nil) return evicted buffers to the slab immediately
+	// because readers have no writePages map. Writer caches cannot do this because
+	// pager.writePages may still reference the evicted page struct after spill;
+	// writer buffers are returned in clear()/discard()/truncate() instead.
+	slabOk := globalPageSlab.Initialized(pc.pageSize)
 	if pc.purgeable {
 		for len(pc.pages) >= pc.maxPages && pc.nRecyclable > 0 {
-			pc.evictOne()
+			evicted := pc.evictOne()
+			if evicted != nil && pc.xStress == nil && slabOk {
+				globalPageSlab.Put(evicted.data)
+				evicted.data = nil
+			}
 		}
 
 		// If still full and stress callback available, try to spill a dirty page.
-		// Modeled after sqlite3PcacheFetchStress() in pcache.c.
+		// Merges SQLite's two-phase sqlite3PcacheFetch + sqlite3PcacheFetchStress
+		// (pcache.c:403-490) into a single call. Admission control (step 3),
+		// eviction (step 4), stress callback, and allocation (step 5) are all
+		// handled inline. See "Known Drifts in Page Cache" in NOTES.md.
 		spill := pc.szSpill
 		if spill == 0 {
 			spill = pc.maxPages
@@ -180,6 +192,8 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 				// pager to error state, so the error is not silently lost.
 				pc.xStress(victim)
 				// After stress callback, victim should be clean. Retry eviction.
+				// Writer cache: evicted buffers are NOT returned to slab here
+				// (writePages aliasing concern — see comment above).
 				for len(pc.pages) >= pc.maxPages && pc.nRecyclable > 0 {
 					pc.evictOne()
 				}
@@ -241,7 +255,9 @@ func (pc *pcache) resetPage(p *page, pgno uint32) {
 //
 // When the cache is overfull (len(pages) > maxPages) and the global slab is under
 // memory pressure, clean pages are immediately evicted instead of being added to
-// the LRU. Matches SQLite pcache1.c:1094-1095 (pcache1Unpin — nPurgeable > nMaxPage).
+// the LRU. Inspired by SQLite pcache1.c:1094 (pcache1Unpin). Our condition is
+// stricter: requires both global slab pressure AND per-cache overfull, whereas
+// SQLite uses an OR with reuseUnlikely || nPurgeable > nMaxPage at PGroup level.
 func (pc *pcache) release(p *page) {
 	p.pinCount--
 	if p.pinCount <= 0 {

@@ -584,14 +584,16 @@ func TestPcacheBulkAlloc_MaxBulk100(t *testing.T) {
 }
 
 func TestPcacheBufferRecycling_EvictionFromPFreeOrSlab(t *testing.T) {
-	// Fill cache to maxPages, create one more page. The evicted page's buffer
-	// is NOT recycled inline (pager.writePages may still alias the evicted page),
-	// so the new page is allocated from pFree or slab. Verify eviction works.
+	// Fill cache to maxPages, create one more page. For writer caches (xStress
+	// set), evicted page buffers are NOT returned to slab because writePages may
+	// alias the evicted page. The new page is allocated from pFree or slab.
 	globalPageSlab.Reset()
 	globalPageSlab.Init(4096, 500)
 	defer globalPageSlab.Reset()
 
 	pc := newPcache(4096, 5, true)
+	// Set xStress to simulate writer cache (writePages aliasing concern)
+	pc.xStress = func(p *page) error { return nil }
 
 	// Create and release 5 pages (fills cache)
 	pgs := make([]*page, 5)
@@ -614,6 +616,49 @@ func TestPcacheBufferRecycling_EvictionFromPFreeOrSlab(t *testing.T) {
 	assert.Len(t, pc.pages, 5, "cache should still have 5 pages after eviction+create")
 
 	pc.release(pg6)
+}
+
+func TestPcacheBufferRecycling_ReaderEvictionReturnsSlab(t *testing.T) {
+	// Reader caches (xStress == nil) should return evicted page buffers to the
+	// slab immediately. Unlike writer caches, readers have no writePages map,
+	// so evicted buffers are safe to recycle.
+	globalPageSlab.Reset()
+	globalPageSlab.Init(4096, 500)
+	defer globalPageSlab.Reset()
+
+	pc := newPcache(4096, 5, true) // no xStress = reader cache
+
+	// Create and release 5 pages (fills cache)
+	for i := uint32(1); i <= 5; i++ {
+		pg := pc.create(i, 2)
+		pc.release(pg)
+	}
+	assert.Equal(t, 5, pc.nRecyclable)
+	assert.Len(t, pc.pages, 5)
+
+	// Record slab free count before eviction
+	globalPageSlab.mu.Lock()
+	freeCountBefore := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+
+	// Create page 6 — should evict page 1 and return its buffer to slab
+	pg6 := pc.create(6, 2)
+	require.NotNil(t, pg6)
+
+	assert.Nil(t, pc.pages[1], "page 1 should have been evicted")
+	assert.Len(t, pc.pages, 5)
+
+	// Slab should have received the evicted buffer back
+	globalPageSlab.mu.Lock()
+	freeCountAfter := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+
+	// The evicted page's buffer was returned to slab (+1), but the new page
+	// may have allocated from pFree (no slab change) or from slab (-1).
+	// Net: if from pFree, slab has +1. If from slab, net 0.
+	// Either way, slab should not have FEWER buffers than before.
+	assert.GreaterOrEqual(t, freeCountAfter, freeCountBefore,
+		"reader eviction should return buffer to slab; slab should not shrink")
 }
 
 func TestPcacheBufferRecycling_ClearReturnsSlab(t *testing.T) {

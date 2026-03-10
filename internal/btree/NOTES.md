@@ -512,7 +512,9 @@ drawn from the global slab that enforces a process-wide soft cap.
 
 | Aspect | SQLite | Go |
 |--------|--------|-----|
-| Architecture | Two-layer (pluggable pcache2 interface) | Single-layer (no vtable) |
+| Architecture | Two-layer (pluggable `pcache2` interface) | Single-layer (no vtable, drift #6) |
+| Page struct | Two structs: `PgHdr` (generic) + `PgHdr1` (pcache1-specific) | Single `page` struct (drift #5) |
+| Spill victim search | `pSynced` + `pDirtyTail` two-pass (prefers non-`NEED_SYNC`) | `dirtyTail` single-pass; no `pSynced` in WAL-only (drift #19) |
 | Slab allocator | Contiguous `void*` buffer, pointer arithmetic (`pcache1.c:283-288`) | `[][]byte` slice, Go-idiomatic (drift #7) |
 | Slab buffer return | Range check `SQLITE_WITHIN` (`pcache1.c:381`) | Accepts all buffers (drift #8) |
 | Slab init | Library init `pcache1Init` (`pcache1.c:695-741`) | Lazy init on first `Open()` or explicit `ConfigPageCache()` (drift #9) |
@@ -1232,13 +1234,27 @@ No SQLite equivalent — our addition for the many-open-databases scenario.
 
 **Known Drifts in Page Cache:**
 - Buffer reuse on eviction: SQLite step 4 (`pcache1.c:897-914`) reuses the
-  evicted victim's buffer in-place. We drop evicted buffers because
-  `pager.writePages` may still alias evicted page structs after spill.
-  Buffers are returned to slab in `clear()`/`discard()`/`truncate()`.
+  evicted victim's buffer in-place. Writer caches drop evicted buffers because
+  `pager.writePages` may still alias evicted page structs after spill; those
+  buffers are returned to slab in `clear()`/`discard()`/`truncate()`. Reader
+  caches (no `xStress`, no `writePages`) return evicted buffers to the slab
+  immediately in `create()`.
 - No `reuseUnlikely` on unpin: SQLite's `pcache1Unpin` accepts a
   `reuseUnlikely` flag (`pcache1.c:1094-1095`); when true, pages are
   immediately freed. Our `release()` only uses overfull+pressure for
   immediate eviction. `sqlite3PcacheDrop` maps to our `discard()` method.
+- Merged Fetch+FetchStress: SQLite splits page acquisition into
+  `sqlite3PcacheFetch` (soft create, may return NULL) and
+  `sqlite3PcacheFetchStress` (spill + hard retry) as separate calls from the
+  pager (`pcache.c:403-490`). Our `create()` merges both into a single
+  function with inline stress handling.
+- No `eCreate` state machine: SQLite's `PCache.eCreate` toggles between 1
+  (soft, when dirty list non-empty) and 2 (hard, when dirty list empty) so
+  that `createFlag & eCreate` auto-selects the allocation strategy
+  (`pcache.c:50,216-228,423`). Our `create()` takes `createFlag` directly —
+  readers always use 1 (soft), writers always use 2 (hard). The `eCreate`
+  optimization avoids a futile stress callback when there are no dirty pages
+  to spill; our merged `create()` handles this inline via `findSpillVictim`.
 - No `xRekey`: page renumbering (`pcache1.c:1111-1152`) is absent because
   auto-vacuum is not implemented (see "Not Implemented" section).
 - No `xShrink`: `pcache1Shrink` (`pcache1.c:837-847`) frees all unpinned
