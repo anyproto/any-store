@@ -1182,7 +1182,7 @@ Key components:
 - `pageSlab.Get()`: pops from free list; falls back to `make()` overflow
 - `pageSlab.Put()`: returns buffer to free list
 - `pageSlab.UnderPressure()`: atomic bool, true when `len(freeList) < nReserve`
-  (`nReserve = nPages/10 + 1`, matching `pcache1.c:279`)
+  (`nReserve`: if nPages > 90 then 10 else nPages/10 + 1, matching `pcache1.c:279`)
 - All page buffer allocations (pcache create, bulk alloc, temp pages) go through
   the slab; all deallocations (clear, discard, truncate, recycle temp page)
   return buffers to the slab
@@ -1224,10 +1224,35 @@ memory from persistent reader caches. `closeCh` channel unblocks goroutines
 waiting on the semaphore when `DB.Close()` or `DB.SetClosing()` is called.
 No SQLite equivalent — our addition for the many-open-databases scenario.
 
+**Implemented Optimizations:**
+- `dirtyTail` pointer for O(1) spill victim search — walks backward from tail
+  to find the oldest unpinned dirty page, matching SQLite's `pDirtyTail`
+  search direction (`pcache.c:463-469`). No `pSynced` pointer needed because
+  `PGHDR_NEED_SYNC` is irrelevant in WAL-only mode.
+
+**Known Drifts in Page Cache:**
+- Buffer reuse on eviction: SQLite step 4 (`pcache1.c:897-914`) reuses the
+  evicted victim's buffer in-place. We drop evicted buffers because
+  `pager.writePages` may still alias evicted page structs after spill.
+  Buffers are returned to slab in `clear()`/`discard()`/`truncate()`.
+- No `reuseUnlikely` on unpin: SQLite's `pcache1Unpin` accepts a
+  `reuseUnlikely` flag (`pcache1.c:1094-1095`); when true, pages are
+  immediately freed. Our `release()` only uses overfull+pressure for
+  immediate eviction. `sqlite3PcacheDrop` maps to our `discard()` method.
+- No `xRekey`: page renumbering (`pcache1.c:1111-1152`) is absent because
+  auto-vacuum is not implemented (see "Not Implemented" section).
+- No `xShrink`: `pcache1Shrink` (`pcache1.c:837-847`) frees all unpinned
+  pages on demand. No external memory pressure API exists yet.
+- Non-purgeable caches skip LRU: SQLite's `pcacheUnpin` (`pcache.c:265-271`)
+  is a no-op for non-purgeable caches. Our `release()` matches this by
+  guarding LRU operations with `pc.purgeable`.
+- `Initialized()` is lock-free: uses `atomic.Bool` for the `initialized` flag.
+  `pageSize` is immutable after Init, read without mutex via acquire semantics
+  from the atomic load. Matches SQLite's mutex-free reads of `pcache1.isInit`
+  and `pcache1.szSlot` (`pcache1.c:220-222`).
+
 **Future Improvements:**
 - Shrink API (`sqlite3PcacheShrink` equivalent) for external memory pressure
-- `pSynced` optimization pointer in dirty list for faster spill victim search
-  (matches `pcache.c:463-467`)
 - Slab telemetry: expose nTotal, nOverflow, underPressure via metrics
 
 ### B-tree Operations

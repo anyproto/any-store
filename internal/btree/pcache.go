@@ -12,6 +12,7 @@ package btree
 //   - No PGroup: no cross-cache page stealing; each cache isolated (drift #1)
 //   - No hash table: Go map[uint32]*page instead of apHash[] (drift #2)
 //   - No circular LRU: doubly-linked list with head/tail pointers (drift #3)
+//   - dirtyTail pointer for O(1) spill victim (replaces pSynced, drift #19)
 //   - No PgHdr/PgHdr1 split: single page struct (drift #5)
 //   - No pcache2 plugin interface: direct implementation (drift #6)
 //   - createFlag=0 dropped: fetch() handles lookup-only (drift #13)
@@ -36,8 +37,9 @@ type pcache struct {
 	lruTail      *page
 	nRecyclable  int // unpinned clean pages in LRU; matches SQLite pcache1.c:197 nRecyclable
 
-	// Dirty page list
+	// Dirty page list (doubly-linked, head = MRU, tail = LRU for spill)
 	dirtyHead *page
+	dirtyTail *page // oldest dirty page; spill victim search starts here
 	nDirty    int
 
 	// dataVersion and walMaxFrame together identify the DB snapshot for which
@@ -191,30 +193,12 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	if n := len(pc.pFree); n > 0 {
 		p = pc.pFree[n-1]
 		pc.pFree = pc.pFree[:n-1]
-		// Reset fields for the new page
-		clear(p.data)
-		p.pgno = pgno
-		p.pinCount = 1
-		p.dirty = false
-		p.uncached = false
-		p.next = nil
-		p.prev = nil
-		p.header = pageHeader{}
 	} else {
 		if !pc.bulkInit {
 			pc.initBulk()
-			// Retry from pFree after bulk init
 			if n := len(pc.pFree); n > 0 {
 				p = pc.pFree[n-1]
 				pc.pFree = pc.pFree[:n-1]
-				clear(p.data)
-				p.pgno = pgno
-				p.pinCount = 1
-				p.dirty = false
-				p.uncached = false
-				p.next = nil
-				p.prev = nil
-				p.header = pageHeader{}
 			}
 		}
 		if p == nil {
@@ -225,15 +209,30 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 				data = make([]byte, pc.pageSize)
 			}
 			p = &page{
-				pgno:     pgno,
-				data:     data,
-				cache:    pc,
-				pinCount: 1,
+				data:  data,
+				cache: pc,
 			}
 		}
 	}
+	pc.resetPage(p, pgno)
 	pc.pages[pgno] = p
 	return p
+}
+
+// resetPage initializes a page for use with the given pgno.
+// Clears data buffer and resets all fields. Called from create() after
+// obtaining a page struct from pFree, initBulk, or heap allocation.
+// Consolidates the page initialization that was previously duplicated
+// in three code paths within create().
+func (pc *pcache) resetPage(p *page, pgno uint32) {
+	clear(p.data)
+	p.pgno = pgno
+	p.pinCount = 1
+	p.dirty = false
+	p.uncached = false
+	p.next = nil
+	p.prev = nil
+	p.header = pageHeader{}
 }
 
 // release unpins a page. If the page is clean, it goes to the LRU list.
@@ -254,10 +253,14 @@ func (pc *pcache) release(p *page) {
 		// reducing len(pages).
 		if p.dirty {
 			pc.dirtyMoveToFront(p)
-		} else if pc.pages[p.pgno] == p {
+		} else if pc.purgeable && pc.pages[p.pgno] == p {
+			// Non-purgeable caches (InMemory) skip LRU entirely — pages are
+			// never evicted. Matches SQLite pcache.c:265-271 (pcacheUnpin is
+			// a no-op for non-purgeable caches).
+			//
 			// If cache is overfull and slab is under pressure, immediately
 			// evict instead of adding to LRU (matches pcache1Unpin).
-			if pc.purgeable && globalPageSlab.UnderPressure() && len(pc.pages) > pc.maxPages {
+			if globalPageSlab.UnderPressure() && len(pc.pages) > pc.maxPages {
 				delete(pc.pages, p.pgno)
 				if globalPageSlab.Initialized(pc.pageSize) {
 					globalPageSlab.Put(p.data)
@@ -278,6 +281,8 @@ func (pc *pcache) makeDirty(p *page) {
 		p.prev = nil
 		if pc.dirtyHead != nil {
 			pc.dirtyHead.prev = p
+		} else {
+			pc.dirtyTail = p
 		}
 		pc.dirtyHead = p
 		pc.nDirty++
@@ -296,6 +301,8 @@ func (pc *pcache) makeClean(p *page) {
 		}
 		if p.next != nil {
 			p.next.prev = p.prev
+		} else {
+			pc.dirtyTail = p.prev
 		}
 		p.next = nil
 		p.prev = nil
@@ -320,6 +327,8 @@ func (pc *pcache) dirtyMoveToFront(p *page) {
 	}
 	if p.next != nil {
 		p.next.prev = p.prev
+	} else {
+		pc.dirtyTail = p.prev
 	}
 	// Insert at head
 	p.prev = nil
@@ -330,14 +339,9 @@ func (pc *pcache) dirtyMoveToFront(p *page) {
 	pc.dirtyHead = p
 }
 
-// dirtyPages returns all dirty pages using the provided slice to avoid allocations.
-// The returned slice may be a sub-slice of buf or a new allocation if buf is too small.
+// dirtyPages returns all dirty pages in a new slice.
 func (pc *pcache) dirtyPages() []*page {
-	result := make([]*page, 0, pc.nDirty)
-	for p := pc.dirtyHead; p != nil; p = p.next {
-		result = append(result, p)
-	}
-	return result
+	return pc.appendDirtyPages(make([]*page, 0, pc.nDirty))
 }
 
 // appendDirtyPages appends all dirty pages to the provided slice and returns it.
@@ -371,6 +375,7 @@ func (pc *pcache) clear() {
 	pc.lruHead = nil
 	pc.lruTail = nil
 	pc.dirtyHead = nil
+	pc.dirtyTail = nil
 	pc.nRecyclable = 0
 	pc.nDirty = 0
 }
@@ -390,6 +395,8 @@ func (pc *pcache) discard(pgno uint32) {
 		}
 		if p.next != nil {
 			p.next.prev = p.prev
+		} else {
+			pc.dirtyTail = p.prev
 		}
 		pc.nDirty--
 	} else {
@@ -415,6 +422,8 @@ func (pc *pcache) truncate(maxPage uint32) {
 				}
 				if p.next != nil {
 					p.next.prev = p.prev
+				} else {
+					pc.dirtyTail = p.prev
 				}
 				pc.nDirty--
 			} else {
@@ -484,16 +493,15 @@ func (pc *pcache) evictOne() *page {
 	return p
 }
 
-// findSpillVictim walks the dirty list and returns the oldest unpinned page
-// (last match walking from head = back of the list), or nil if all dirty
-// pages are pinned. Combined with dirtyMoveToFront on release, this ensures
-// recently-released dirty pages are preserved while stale ones are spilled.
+// findSpillVictim returns the oldest unpinned dirty page, or nil if all dirty
+// pages are pinned. Walks backward from dirtyTail for O(1) typical case
+// (the oldest dirty page is usually unpinned).
+// Matches SQLite pcache.c:463-469 (pDirtyTail search direction).
 func (pc *pcache) findSpillVictim() *page {
-	var victim *page
-	for p := pc.dirtyHead; p != nil; p = p.next {
+	for p := pc.dirtyTail; p != nil; p = p.prev {
 		if p.pinCount == 0 {
-			victim = p
+			return p
 		}
 	}
-	return victim
+	return nil
 }

@@ -34,8 +34,8 @@ type pageSlab struct {
 	nOverflow     int         // number of overflow (heap) allocations
 	nReserve      int         // pressure threshold: len(freeList) < nReserve => under pressure
 	underPressure atomic.Bool // true when free list is below reserve
-	pageSize      int
-	initialized   bool
+	pageSize      int         // immutable after Init; safe to read after initialized.Load() == true
+	initialized   atomic.Bool // set last in Init(); acts as release barrier for pageSize
 }
 
 // globalPageSlab is the process-global singleton.
@@ -45,21 +45,31 @@ var globalPageSlab pageSlab
 // If already initialized, this is a no-op.
 // Matches sqlite3PCacheBufferSetup (pcache1.c:271-291).
 func (s *pageSlab) Init(pageSize, nPages int) {
+	if s.initialized.Load() {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.initialized {
+	if s.initialized.Load() {
 		return
 	}
 	s.pageSize = pageSize
 	s.nSlab = nPages
 	s.nTotal = nPages
-	s.nReserve = nPages/10 + 1 // matches pcache1.c:279
+	// Matches pcache1.c:279: pcache1.nReserve = n>90 ? 10 : (n/10 + 1)
+	if nPages > 90 {
+		s.nReserve = 10
+	} else {
+		s.nReserve = nPages/10 + 1
+	}
 	s.freeList = make([][]byte, nPages)
 	for i := range nPages {
 		s.freeList[i] = make([]byte, pageSize)
 	}
 	s.underPressure.Store(false)
-	s.initialized = true
+	// Store last: acts as release barrier so pageSize is visible to
+	// concurrent Initialized() readers (acquire via atomic.Bool.Load).
+	s.initialized.Store(true)
 }
 
 // Get returns a page buffer from the slab. If the free list is empty,
@@ -108,12 +118,15 @@ func (s *pageSlab) UnderPressure() bool {
 // page size. If pageSize is 0, it only checks whether the slab is initialized
 // at all. This is used by pcache.initBulk() and create() to avoid pulling
 // buffers of the wrong size from a slab initialized for a different page size.
+// Lock-free: initialized is an atomic.Bool; pageSize is immutable after Init.
+// DRIFT from SQLite: SQLite's pcache1.isInit and pcache1.szSlot are also
+// read without mutex (pcache1.c:220-222 "do not require mutex protection").
 func (s *pageSlab) Initialized(pageSize int) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.initialized {
+	if !s.initialized.Load() {
 		return false
 	}
+	// pageSize is immutable after Init; safe to read after initialized.Load()
+	// returns true (atomic acquire guarantees visibility).
 	return pageSize == 0 || s.pageSize == pageSize
 }
 
@@ -121,6 +134,9 @@ func (s *pageSlab) Initialized(pageSize int) bool {
 func (s *pageSlab) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Store initialized false FIRST (under lock) to prevent concurrent
+	// Initialized() from reading stale pageSize during reset.
+	s.initialized.Store(false)
 	s.freeList = nil
 	s.nTotal = 0
 	s.nSlab = 0
@@ -128,7 +144,6 @@ func (s *pageSlab) Reset() {
 	s.nReserve = 0
 	s.underPressure.Store(false)
 	s.pageSize = 0
-	s.initialized = false
 }
 
 // ConfigPageCache initializes the global page slab with the given page size
