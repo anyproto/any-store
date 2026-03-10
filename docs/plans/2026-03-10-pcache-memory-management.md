@@ -176,12 +176,12 @@ No SQLite equivalent — our addition for memory management with many open DBs.
 - [x] run tests — must pass before next task
 
 ### Task 11: Verify acceptance criteria
-- [ ] verify all 7 goals from Overview are implemented (slab cap, persistent cache, reader limit, slab allocator, bulk alloc, LRU fix, buffer recycling)
-- [ ] verify edge cases: InMemory databases (`purgeable=false`) still work correctly with slab
-- [ ] verify writer cache draws from slab (writerCache.create uses slab via pcache.create)
-- [ ] run full test suite: `go test ./internal/btree/ -count=1 -race`
-- [ ] run full test suite: `go test ./... -count=1 -short`
-- [ ] verify test coverage for new code (pcache.go, page_slab.go, db.go changes)
+- [x] verify all 7 goals from Overview are implemented (slab cap, persistent cache, reader limit, slab allocator, bulk alloc, LRU fix, buffer recycling)
+- [x] verify edge cases: InMemory databases (`purgeable=false`) still work correctly with slab
+- [x] verify writer cache draws from slab (writerCache.create uses slab via pcache.create)
+- [x] run full test suite: `go test ./internal/btree/ -count=1 -race`
+- [x] run full test suite: `go test ./... -count=1 -short`
+- [x] verify test coverage for new code (pcache.go, page_slab.go, db.go changes)
 
 ### Task 12: [Final] Update documentation
 - [ ] update `docs/NOTES.md` or relevant docs with pcache memory management design
