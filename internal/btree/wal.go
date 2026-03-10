@@ -1428,9 +1428,18 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		// see committed frames once they are durable on disk. This matches
 		// SQLite where walIndexWriteHdr (which publishes mxFrame) is called
 		// after fdatasync.
-		w.index.mxCommitFrame.Store(w.index.maxFrame.Load())
+		mxCommit := w.index.maxFrame.Load()
+		w.index.mxCommitFrame.Store(mxCommit)
 		if !w.inProcess {
-			return w.index.writeHeader(w.index.mxCommitFrame.Load(), w.index.maxPage.Load(), w.index.nBackfill.Load(),
+			// Use dbSize directly instead of maxPage.Load() because a
+			// concurrent reader's tryBeginRead may have overwritten maxPage
+			// with a stale value from the SHM header (race between the
+			// Store above and this writeHeader call).
+			nPage := dbSize
+			if nPage == 0 {
+				nPage = w.index.maxPage.Load()
+			}
+			return w.index.writeHeader(mxCommit, nPage, w.index.nBackfill.Load(),
 				[2]uint32{w.cksum1, w.cksum2},
 				[2]uint32{w.header.salt1, w.header.salt2})
 		}
@@ -1577,7 +1586,18 @@ func (w *wal) tryBeginRead() (maxFrame uint32, slot int, err error) {
 		if hdr, valid := w.index.readHeader(); valid {
 			// Sync process-local atomics so walIndex.get() shmHashGet fallback works
 			w.index.mxCommitFrame.Store(hdr.mxFrame)
-			w.index.maxPage.Store(hdr.nPage)
+			// Monotonic update: only increase maxPage, never decrease it.
+			// A concurrent writer's commit may have already stored a higher
+			// maxPage via writeFrames before the SHM header was updated.
+			// Without this guard, the reader overwrites the correct atomic
+			// value with the stale SHM value, causing IntegrityCheck to see
+			// a database size that's too small.
+			for {
+				old := w.index.maxPage.Load()
+				if hdr.nPage <= old || w.index.maxPage.CompareAndSwap(old, hdr.nPage) {
+					break
+				}
+			}
 		}
 		// Also read nBackfill from SHM for multi-process checkpoint visibility
 		w.index.shmReadCkptInfo()
@@ -1727,7 +1747,14 @@ func (w *wal) beginWrite() (stateChanged bool, err error) {
 		w.header.salt1 = hdr.aSalt[0]
 		w.header.salt2 = hdr.aSalt[1]
 		w.index.mxCommitFrame.Store(hdr.mxFrame)
-		w.index.maxPage.Store(hdr.nPage)
+		// Monotonic update: same guard as tryBeginRead — prevent concurrent
+		// reader from racing with the previous commit's writeHeader.
+		for {
+			old := w.index.maxPage.Load()
+			if hdr.nPage <= old || w.index.maxPage.CompareAndSwap(old, hdr.nPage) {
+				break
+			}
+		}
 	}
 
 	return stateChanged, nil

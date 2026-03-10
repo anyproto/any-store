@@ -232,11 +232,11 @@ func testOverflowSavepointConcurrent(t *testing.T, seed int64) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		modes := []CheckpointMode{CheckpointPassive, CheckpointFull, CheckpointRestart}
 		localRng := mrand.New(mrand.NewSource(seed + 999))
 		for !stop.Load() {
+			time.Sleep(time.Duration(5+localRng.Intn(10)) * time.Millisecond)
+			modes := []CheckpointMode{CheckpointPassive, CheckpointFull, CheckpointRestart}
 			_ = db.Checkpoint(modes[localRng.Intn(len(modes))])
-			time.Sleep(time.Millisecond)
 		}
 	}()
 
