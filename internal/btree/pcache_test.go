@@ -583,6 +583,137 @@ func TestPcacheBulkAlloc_MaxBulk100(t *testing.T) {
 	pc.release(pg)
 }
 
+func TestPcacheBufferRecycling_EvictionFromPFreeOrSlab(t *testing.T) {
+	// Fill cache to maxPages, create one more page. The evicted page's buffer
+	// is NOT recycled inline (pager.writePages may still alias the evicted page),
+	// so the new page is allocated from pFree or slab. Verify eviction works.
+	globalPageSlab.Reset()
+	globalPageSlab.Init(4096, 500)
+	defer globalPageSlab.Reset()
+
+	pc := newPcache(4096, 5, true)
+
+	// Create and release 5 pages (fills cache)
+	pgs := make([]*page, 5)
+	for i := uint32(1); i <= 5; i++ {
+		pgs[i-1] = pc.create(i)
+	}
+	for _, pg := range pgs {
+		pc.release(pg)
+	}
+	assert.Equal(t, 5, pc.nClean)
+	assert.Len(t, pc.pages, 5)
+
+	// Create page 6 — should evict page 1 (LRU tail) and allocate from pFree/slab
+	pg6 := pc.create(6)
+	require.NotNil(t, pg6)
+
+	// Verify the eviction happened correctly
+	assert.Nil(t, pc.pages[1], "page 1 should have been evicted")
+	assert.NotNil(t, pc.pages[6], "page 6 should exist")
+	assert.Len(t, pc.pages, 5, "cache should still have 5 pages after eviction+create")
+
+	pc.release(pg6)
+}
+
+func TestPcacheBufferRecycling_ClearReturnsSlab(t *testing.T) {
+	// clear() should return all page buffers (in-use + pFree) to the slab.
+	globalPageSlab.Reset()
+	globalPageSlab.Init(4096, 500)
+	defer globalPageSlab.Reset()
+
+	pc := newPcache(4096, 50, true)
+
+	// Create 10 pages (triggers initBulk with 50 pages from slab)
+	for i := uint32(1); i <= 10; i++ {
+		pg := pc.create(i)
+		pc.release(pg)
+	}
+
+	// pFree should have 40 remaining (50 bulk - 10 used)
+	assert.Len(t, pc.pFree, 40)
+	assert.Len(t, pc.pages, 10)
+
+	// Record slab free count before clear
+	globalPageSlab.mu.Lock()
+	freeCountBefore := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+
+	pc.clear()
+
+	// After clear: 10 in-use page buffers + 40 pFree buffers = 50 returned to slab
+	globalPageSlab.mu.Lock()
+	freeCountAfter := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+
+	assert.Equal(t, freeCountBefore+50, freeCountAfter,
+		"clear() should return all 50 buffers (10 pages + 40 pFree) to slab")
+
+	// Cache should be empty
+	assert.Empty(t, pc.pages)
+	assert.Equal(t, 0, pc.nClean)
+	assert.Equal(t, 0, pc.nDirty)
+	assert.Empty(t, pc.pFree)
+	assert.False(t, pc.bulkInit, "bulkInit should be reset after clear")
+}
+
+func TestPcacheBufferRecycling_DiscardReturnsSlab(t *testing.T) {
+	// discard() should return the evicted page's buffer to the slab.
+	globalPageSlab.Reset()
+	globalPageSlab.Init(4096, 500)
+	defer globalPageSlab.Reset()
+
+	pc := newPcache(4096, 100, true)
+
+	pg := pc.create(1)
+	pc.release(pg)
+
+	// Record slab free count before discard
+	globalPageSlab.mu.Lock()
+	freeCountBefore := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+
+	pc.discard(1)
+
+	// Buffer should be returned to slab
+	globalPageSlab.mu.Lock()
+	freeCountAfter := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+
+	assert.Equal(t, freeCountBefore+1, freeCountAfter,
+		"discard() should return 1 buffer to slab")
+}
+
+func TestPcacheBufferRecycling_TruncateReturnsSlab(t *testing.T) {
+	// truncate() should return evicted page buffers to the slab.
+	globalPageSlab.Reset()
+	globalPageSlab.Init(4096, 500)
+	defer globalPageSlab.Reset()
+
+	pc := newPcache(4096, 100, true)
+
+	for i := uint32(1); i <= 10; i++ {
+		pg := pc.create(i)
+		pc.release(pg)
+	}
+
+	// Record slab free count before truncate
+	globalPageSlab.mu.Lock()
+	freeCountBefore := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+
+	pc.truncate(5) // remove pages 6-10
+
+	// 5 buffers should be returned to slab
+	globalPageSlab.mu.Lock()
+	freeCountAfter := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+
+	assert.Equal(t, freeCountBefore+5, freeCountAfter,
+		"truncate() should return 5 buffers to slab")
+	assert.Len(t, pc.pages, 5)
+}
+
 func TestPcacheBulkAlloc_NoSlabFallsBackToMake(t *testing.T) {
 	// When slab is not initialized, create() should still work via make()
 	globalPageSlab.Reset()

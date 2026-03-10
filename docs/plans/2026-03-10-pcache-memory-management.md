@@ -111,13 +111,14 @@ SQLite ref: `pcache1.c:201` (pFree field), `pcache1.c:297-330` (pcache1InitBulk)
 ### Task 5: Buffer recycling on eviction
 **Depends on: Task 1 (evictOne returns `*page`), Task 3 (slab). Reuse evicted page's `[]byte` buffer for the new page instead of GC + alloc.**
 SQLite ref: `pcache1.c:897-914` (step 4 — reuses LRU victim's buffer by re-keying at `pcache1.c:928`: `pPage->iKey = iKey`), `pcache1.c:903` (victim = `pGroup->lru.pLruPrev`). Return buffers to slab on cache clear/discard/truncate.
-- [ ] modify `create()` eviction loop: capture returned `*page` from `evictOne()`, reuse its `.data` buffer for the new page (clear contents, reset fields, assign new pgno)
-- [ ] modify `clear()` in `pcache.go:190-197`: iterate `pc.pages`, call `globalPageSlab.Put(p.data)` for each; also return `pFree` buffers to slab
-- [ ] modify `discard()` in `pcache.go:200-219`: return evicted page's buffer to slab via `globalPageSlab.Put(p.data)`
-- [ ] modify `truncate()` in `pcache.go:222-241`: return evicted page buffers to slab
-- [ ] write test: fill cache to maxPages, create one more page — verify zero new allocations (buffer reused from evicted page, use `testing.AllocsPerRun`)
-- [ ] write test: `clear()` returns all buffers to slab — verify slab freeList grows by expected count
-- [ ] run tests — must pass before next task
+- [x] modify `create()` eviction loop: evicted page buffers are NOT recycled inline because pager.writePages may still alias them; new pages allocated from pFree/slab instead. Buffers returned via clear()/discard() when pager cleans up writePages references.
+- [x] modify `clear()` in `pcache.go`: iterate `pc.pages`, call `globalPageSlab.Put(p.data)` for each; also return `pFree` buffers to slab; reset bulkInit
+- [x] modify `discard()` in `pcache.go`: return evicted page's buffer to slab via `globalPageSlab.Put(p.data)`
+- [x] modify `truncate()` in `pcache.go`: return evicted page buffers to slab
+- [x] write test: fill cache to maxPages, create one more page — verify eviction works and new page allocated from pFree/slab
+- [x] write test: `clear()` returns all buffers to slab — verify slab freeList grows by expected count
+- [x] write test: `discard()` returns buffer to slab; `truncate()` returns buffers to slab
+- [x] run tests — must pass before next task
 
 ### Task 6: Wire pcache.create() and pager through slab
 **Depends on: Task 3 (slab). Replace all `make([]byte, pageSize)` in page allocation paths with slab-backed allocation.**

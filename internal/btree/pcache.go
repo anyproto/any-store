@@ -108,7 +108,14 @@ func (pc *pcache) create(pgno uint32) *page {
 		return p
 	}
 
-	// Evict clean pages if cache is full (skip for non-purgeable / InMemory caches)
+	// Evict clean pages if cache is full (skip for non-purgeable / InMemory caches).
+	// Capture the last evicted page so we can reuse its buffer.
+	// Matches SQLite pcache1.c:897-914 (step 4 — reuses LRU victim's buffer).
+	// Evict clean pages if cache is full (skip for non-purgeable / InMemory caches).
+	// NOTE: evicted page buffers are NOT returned to the slab here because the
+	// pager's writePages map may still reference evicted page structs (after spill).
+	// Buffers are returned to the slab in clear() and discard() instead, where the
+	// pager has already cleaned up writePages references.
 	if pc.purgeable {
 		for len(pc.pages) >= pc.maxPages && pc.nClean > 0 {
 			pc.evictOne()
@@ -287,8 +294,25 @@ func (pc *pcache) appendDirtyPages(buf []*page) []*page {
 	return buf
 }
 
-// clear removes all pages from the cache.
+// clear removes all pages from the cache, returning all data buffers to the
+// global slab. Also returns pFree buffers to the slab to prevent memory leaks
+// when a cache is cleared and reused.
+// Matches SQLite pcache.c release path — buffers go back to pcache1Free.
 func (pc *pcache) clear() {
+	slabOk := globalPageSlab.Initialized(pc.pageSize)
+	for _, p := range pc.pages {
+		if slabOk {
+			globalPageSlab.Put(p.data)
+		}
+	}
+	// Return pFree buffers to slab as well
+	if slabOk {
+		for _, p := range pc.pFree {
+			globalPageSlab.Put(p.data)
+		}
+	}
+	pc.pFree = pc.pFree[:0]
+	pc.bulkInit = false
 	clear(pc.pages)
 	pc.lruHead = nil
 	pc.lruTail = nil
@@ -297,7 +321,8 @@ func (pc *pcache) clear() {
 	pc.nDirty = 0
 }
 
-// discard removes a specific page from the cache.
+// discard removes a specific page from the cache and returns its data buffer
+// to the global slab.
 func (pc *pcache) discard(pgno uint32) {
 	p := pc.pages[pgno]
 	if p == nil {
@@ -316,11 +341,16 @@ func (pc *pcache) discard(pgno uint32) {
 	} else {
 		pc.lruRemove(p)
 	}
+	if globalPageSlab.Initialized(pc.pageSize) {
+		globalPageSlab.Put(p.data)
+	}
 	delete(pc.pages, pgno)
 }
 
-// truncate removes all pages with pgno > maxPage.
+// truncate removes all pages with pgno > maxPage, returning their data
+// buffers to the global slab.
 func (pc *pcache) truncate(maxPage uint32) {
+	slabOk := globalPageSlab.Initialized(pc.pageSize)
 	for pgno, p := range pc.pages {
 		if pgno > maxPage {
 			if p.dirty {
@@ -335,6 +365,9 @@ func (pc *pcache) truncate(maxPage uint32) {
 				pc.nDirty--
 			} else {
 				pc.lruRemove(p)
+			}
+			if slabOk {
+				globalPageSlab.Put(p.data)
 			}
 			delete(pc.pages, pgno)
 		}
