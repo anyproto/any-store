@@ -436,8 +436,8 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 		return pg, nil
 	}
 
-	// Cache miss: create a new cached page.
-	pg := p.writerCache.create(pgno)
+	// Cache miss: create a new cached page (hard create — writer always succeeds).
+	pg := p.writerCache.create(pgno, 2)
 
 	// Try to read from WAL first
 	if walMaxFrame > 0 {
@@ -568,9 +568,15 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 		return pg, nil
 	}
 
-	// Cache miss: create a page in the reader cache.
-	// Reader caches have no xStress callback, so create() won't trigger stress.
-	pg := cache.create(pgno)
+	// Cache miss: create a page in the reader cache (soft create — may be
+	// refused under memory pressure). Reader caches have no xStress callback.
+	// Matches SQLite pcache.c:486 — readers use createFlag=1.
+	pg := cache.create(pgno, 1)
+	if pg == nil {
+		// Admission control refused the allocation. Fall back to an uncached
+		// temporary page read so the query still succeeds.
+		return p.readTempPage(pgno, walMaxFrame)
+	}
 
 	// Try to read from WAL first.
 	if walMaxFrame > 0 {
@@ -633,8 +639,8 @@ func (p *pager) getPageNoContent(pgno uint32) (*page, error) {
 	if pg := p.writerCache.fetch(pgno); pg != nil {
 		return pg, nil
 	}
-	// Cache miss: create a blank page without any disk/WAL read
-	pg := p.writerCache.create(pgno)
+	// Cache miss: create a blank page without any disk/WAL read (hard create — writer).
+	pg := p.writerCache.create(pgno, 2)
 	clear(pg.data)
 	pg.header = pageHeader{}
 	return pg, nil
@@ -843,7 +849,7 @@ func (p *pager) freePage(pgno uint32) error {
 		if debugTrace {
 			trace("freePage: getWritablePage(%d) failed: %v — using cache.create (no savepoints)", pgno, err)
 		}
-		newTrunkPg = p.writerCache.create(pgno)
+		newTrunkPg = p.writerCache.create(pgno, 2)
 		p.writerCache.makeDirty(newTrunkPg)
 		p.writePages[pgno] = newTrunkPg
 	} else {

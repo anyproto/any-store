@@ -19,9 +19,9 @@ func TestPcacheFetchAndMakeDirty_Clean(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
 	// Create a clean page and release it (goes to LRU)
-	pg := pc.create(1)
+	pg := pc.create(1, 2)
 	pc.release(pg)
-	assert.Equal(t, 1, pc.nClean)
+	assert.Equal(t, 1, pc.nRecyclable)
 	assert.False(t, pg.dirty)
 
 	// fetch + makeDirty should fetch it, mark dirty, remove from LRU
@@ -29,7 +29,7 @@ func TestPcacheFetchAndMakeDirty_Clean(t *testing.T) {
 	require.NotNil(t, p)
 	pc.makeDirty(p)
 	assert.True(t, p.dirty)
-	assert.Equal(t, 0, pc.nClean)
+	assert.Equal(t, 0, pc.nRecyclable)
 	assert.Equal(t, 1, pc.nDirty)
 	assert.Equal(t, p, pc.dirtyHead)
 }
@@ -37,7 +37,7 @@ func TestPcacheFetchAndMakeDirty_Clean(t *testing.T) {
 func TestPcacheFetchAndMakeDirty_AlreadyDirty(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1)
+	pg := pc.create(1, 2)
 	pc.makeDirty(pg)
 	assert.True(t, pg.dirty)
 	assert.Equal(t, 1, pc.nDirty)
@@ -62,9 +62,9 @@ func TestPcacheFetchAndMakeDirty_MultipleDirty(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
 	// Create two clean pages
-	pg1 := pc.create(1)
+	pg1 := pc.create(1, 2)
 	pc.release(pg1)
-	pg2 := pc.create(2)
+	pg2 := pc.create(2, 2)
 	pc.release(pg2)
 
 	// fetch + makeDirty both — second should chain in front of first
@@ -85,19 +85,19 @@ func TestPcacheEvictOne_SingleElement(t *testing.T) {
 	pc := newPcache(4096, 1, true) // max 1 page
 
 	// Create and release one clean page
-	pg := pc.create(1)
+	pg := pc.create(1, 2)
 	pc.release(pg)
-	assert.Equal(t, 1, pc.nClean)
+	assert.Equal(t, 1, pc.nRecyclable)
 	assert.NotNil(t, pc.lruHead)
 	assert.NotNil(t, pc.lruTail)
 
 	// Creating a second page should evict the first (single element eviction)
-	pg2 := pc.create(2)
+	pg2 := pc.create(2, 2)
 	require.NotNil(t, pg2)
 	assert.Nil(t, pc.pages[1])       // page 1 evicted
 	assert.Nil(t, pc.lruHead)         // LRU list empty
 	assert.Nil(t, pc.lruTail)         // LRU list empty
-	assert.Equal(t, 0, pc.nClean)
+	assert.Equal(t, 0, pc.nRecyclable)
 	pc.release(pg2)
 }
 
@@ -111,16 +111,16 @@ func TestPcacheEvictOne_EmptyLRU(t *testing.T) {
 
 func TestPcacheLruRemove_NotInLRU(t *testing.T) {
 	// Test lruRemove on a page that is NOT in the LRU list.
-	// Should be a no-op: nClean stays at 0.
+	// Should be a no-op: nRecyclable stays at 0.
 	pc := newPcache(4096, 100, true)
 
 	// Create a page that is pinned (never released, so not in LRU)
-	pg := pc.create(1)
-	assert.Equal(t, 0, pc.nClean)
+	pg := pc.create(1, 2)
+	assert.Equal(t, 0, pc.nRecyclable)
 
 	// lruRemove on a page not in LRU should be a no-op
 	pc.lruRemove(pg)
-	assert.Equal(t, 0, pc.nClean)
+	assert.Equal(t, 0, pc.nRecyclable)
 }
 
 func TestPcacheLruRemove_Head(t *testing.T) {
@@ -128,17 +128,17 @@ func TestPcacheLruRemove_Head(t *testing.T) {
 	// With lruPrepend, most recently released is at HEAD.
 	pc := newPcache(4096, 100, true)
 
-	pg1 := pc.create(1)
-	pg2 := pc.create(2)
-	pg3 := pc.create(3)
+	pg1 := pc.create(1, 2)
+	pg2 := pc.create(2, 2)
+	pg3 := pc.create(3, 2)
 	pc.release(pg1) // LRU: HEAD -> pg1 -> TAIL
 	pc.release(pg2) // LRU: HEAD -> pg2 -> pg1 -> TAIL
 	pc.release(pg3) // LRU: HEAD -> pg3 -> pg2 -> pg1 -> TAIL
-	assert.Equal(t, 3, pc.nClean)
+	assert.Equal(t, 3, pc.nRecyclable)
 
 	// Remove head (pg3, most recently released)
 	pc.lruRemove(pg3)
-	assert.Equal(t, 2, pc.nClean)
+	assert.Equal(t, 2, pc.nRecyclable)
 	assert.Equal(t, pg2, pc.lruHead)
 	assert.Equal(t, pg1, pc.lruTail)
 }
@@ -148,15 +148,15 @@ func TestPcacheLruRemove_Tail(t *testing.T) {
 	// With lruPrepend: release(pg1) then release(pg2) gives HEAD -> pg2 -> pg1 -> TAIL
 	pc := newPcache(4096, 100, true)
 
-	pg1 := pc.create(1)
-	pg2 := pc.create(2)
+	pg1 := pc.create(1, 2)
+	pg2 := pc.create(2, 2)
 	pc.release(pg1) // LRU: HEAD -> pg1 -> TAIL
 	pc.release(pg2) // LRU: HEAD -> pg2 -> pg1 -> TAIL
-	assert.Equal(t, 2, pc.nClean)
+	assert.Equal(t, 2, pc.nRecyclable)
 
 	// Remove tail (pg1, least recently released)
 	pc.lruRemove(pg1)
-	assert.Equal(t, 1, pc.nClean)
+	assert.Equal(t, 1, pc.nRecyclable)
 	assert.Equal(t, pg2, pc.lruHead)
 	assert.Equal(t, pg2, pc.lruTail)
 }
@@ -168,16 +168,16 @@ func TestPcacheLruRemove_Middle(t *testing.T) {
 	// With lruPrepend: HEAD -> pgs[2] -> pgs[1] -> pgs[0] -> TAIL
 	pgs := make([]*page, 3)
 	for i := range pgs {
-		pgs[i] = pc.create(uint32(i + 1))
+		pgs[i] = pc.create(uint32(i+1), 2)
 	}
 	for _, p := range pgs {
 		pc.release(p)
 	}
-	assert.Equal(t, 3, pc.nClean)
+	assert.Equal(t, 3, pc.nRecyclable)
 
 	// Remove the middle page (pgs[1])
 	pc.lruRemove(pgs[1])
-	assert.Equal(t, 2, pc.nClean)
+	assert.Equal(t, 2, pc.nRecyclable)
 	assert.Equal(t, pgs[2], pc.lruHead)
 	assert.Equal(t, pgs[0], pc.lruTail)
 }
@@ -187,7 +187,7 @@ func TestPcacheNonPurgeable(t *testing.T) {
 	pc := newPcache(4096, 2, false) // max 2 pages, not purgeable
 
 	for i := uint32(1); i <= 5; i++ {
-		pg := pc.create(i)
+		pg := pc.create(i, 2)
 		pc.release(pg)
 	}
 
@@ -198,8 +198,8 @@ func TestPcacheNonPurgeable(t *testing.T) {
 func TestPcacheAppendDirtyPages(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg1 := pc.create(1)
-	pg2 := pc.create(2)
+	pg1 := pc.create(1, 2)
+	pg2 := pc.create(2, 2)
 	pc.makeDirty(pg1)
 	pc.makeDirty(pg2)
 
@@ -211,7 +211,7 @@ func TestPcacheAppendDirtyPages(t *testing.T) {
 func TestPcacheFetch_Clean(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1)
+	pg := pc.create(1, 2)
 	pc.release(pg)
 
 	// fetch on a clean page: dirty=false
@@ -223,7 +223,7 @@ func TestPcacheFetch_Clean(t *testing.T) {
 func TestPcacheFetch_Dirty(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1)
+	pg := pc.create(1, 2)
 	pc.makeDirty(pg)
 	pc.release(pg)
 
@@ -243,11 +243,11 @@ func TestPcacheFetch_NotFound(t *testing.T) {
 func TestPcacheCreateExistingDirty(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1)
+	pg := pc.create(1, 2)
 	pc.makeDirty(pg)
 
 	// create(1) again should return the same dirty page
-	pg2 := pc.create(1)
+	pg2 := pc.create(1, 2)
 	assert.Equal(t, pg, pg2)
 	assert.True(t, pg2.dirty)
 }
@@ -3210,7 +3210,7 @@ func TestPageCacheBackpointer_SetOnCreate(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
 	// Creating a page should set pg.cache to the owning pcache.
-	pg := pc.create(1)
+	pg := pc.create(1, 2)
 	assert.Equal(t, pc, pg.cache, "page.cache should point to owning pcache after create")
 	assert.Equal(t, uint32(1), pg.pgno)
 	assert.Equal(t, 1, pg.pinCount)
@@ -3219,7 +3219,7 @@ func TestPageCacheBackpointer_SetOnCreate(t *testing.T) {
 func TestPageCacheBackpointer_PreservedOnFetch(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1)
+	pg := pc.create(1, 2)
 	pc.release(pg)
 
 	// Fetching should preserve the cache backpointer.
@@ -3231,13 +3231,13 @@ func TestPageCacheBackpointer_PreservedOnFetch(t *testing.T) {
 func TestPageCacheBackpointer_ReleaseRoutesViaCache(t *testing.T) {
 	pc := newPcache(4096, 100, true)
 
-	pg := pc.create(1)
+	pg := pc.create(1, 2)
 	assert.Equal(t, pc, pg.cache)
 
 	// Release via the page's cache backpointer (simulating releasePage routing).
 	pg.cache.release(pg)
 	assert.Equal(t, 0, pg.pinCount)
-	assert.Equal(t, 1, pc.nClean, "page should be on LRU after release")
+	assert.Equal(t, 1, pc.nRecyclable, "page should be on LRU after release")
 }
 
 func TestPageCacheBackpointer_ClearedOnRecycle(t *testing.T) {
@@ -3265,8 +3265,8 @@ func TestPageCacheBackpointer_DifferentCaches(t *testing.T) {
 	pc1 := newPcache(4096, 100, true)
 	pc2 := newPcache(4096, 100, true)
 
-	pg1 := pc1.create(1)
-	pg2 := pc2.create(1)
+	pg1 := pc1.create(1, 2)
+	pg2 := pc2.create(1, 2)
 
 	assert.Equal(t, pc1, pg1.cache, "pg1 should point to pc1")
 	assert.Equal(t, pc2, pg2.cache, "pg2 should point to pc2")
@@ -3274,12 +3274,12 @@ func TestPageCacheBackpointer_DifferentCaches(t *testing.T) {
 
 	// Releasing each page should route to the correct cache.
 	pg1.cache.release(pg1)
-	assert.Equal(t, 1, pc1.nClean)
-	assert.Equal(t, 0, pc2.nClean)
+	assert.Equal(t, 1, pc1.nRecyclable)
+	assert.Equal(t, 0, pc2.nRecyclable)
 
 	pg2.cache.release(pg2)
-	assert.Equal(t, 1, pc1.nClean)
-	assert.Equal(t, 1, pc2.nClean)
+	assert.Equal(t, 1, pc1.nRecyclable)
+	assert.Equal(t, 1, pc2.nRecyclable)
 }
 
 // ===== masterStore coverage =====

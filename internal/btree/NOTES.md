@@ -999,7 +999,7 @@ Key components:
   until commit so cross-process readers cannot see uncommitted spilled frames
 - `walIndex.rollbackToFrame()`: cleans up `pageMap` entries and restores
   `maxFrame` on rollback of transactions with spilled frames
-- `pcache.xStress`: callback invoked when cache is full and `nClean == 0`;
+- `pcache.xStress`: callback invoked when cache is full and `nRecyclable == 0`;
   finds an unpinned dirty victim page for spilling
 - `pager.pagerStress()`: the stress callback implementation — saves savepoint
   data if needed, writes the page to WAL with `commit=false`, marks it clean

@@ -132,15 +132,15 @@ SQLite ref: `pcache1.c:897-914` (step 4 — reuses LRU victim's buffer by re-key
 ### Task 7: Admission control (createFlag)
 **Depends on: Task 3 (slab pressure). Refuse cache growth when thrashing or under memory pressure.**
 SQLite ref: `pcache1.c:881-892` (step 3 guards), `pcache1.c:197` (nRecyclable), `pcache1.c:589` (decrement), `pcache1.c:1102` (increment), `pcache1.c:886-891` (90% pinned, pressure + recyclable checks).
-- [ ] add `nRecyclable int` field to pcache struct — tracks unpinned clean pages in LRU
-- [ ] increment `nRecyclable` in `lruPrepend`, decrement in `lruRemove` and `evictOne` (replaces `nClean` or coexists — verify semantics match)
-- [ ] change `create()` signature to `create(pgno uint32, createFlag int) *page` — createFlag 1=soft, 2=hard
-- [ ] add step-3 guard in `create()` when `createFlag == 1`: return nil if `nPinned >= maxPages*9/10` OR `(globalPageSlab.UnderPressure() && nRecyclable < nPinned)` (matches `pcache1.c:886-891`)
-- [ ] update callers: `getPageReader` → `createFlag=1`; `getPageWriter` → `createFlag=2`; stress retry → `createFlag=2` (matches `pcache.c:486`)
-- [ ] handle nil return from `create()` in `getPageReader` — fall back to uncached `readTempPage()`
-- [ ] write test: pin 95% of maxPages, soft create returns nil; hard create succeeds
-- [ ] write test: slab under pressure + low recyclable ratio → soft create returns nil
-- [ ] run tests — must pass before next task
+- [x] add `nRecyclable int` field to pcache struct — tracks unpinned clean pages in LRU
+- [x] increment `nRecyclable` in `lruPrepend`, decrement in `lruRemove` and `evictOne` (replaces `nClean` or coexists — verify semantics match)
+- [x] change `create()` signature to `create(pgno uint32, createFlag int) *page` — createFlag 1=soft, 2=hard
+- [x] add step-3 guard in `create()` when `createFlag == 1`: return nil if `nPinned >= maxPages*9/10` OR `(globalPageSlab.UnderPressure() && nRecyclable < nPinned)` (matches `pcache1.c:886-891`)
+- [x] update callers: `getPageReader` → `createFlag=1`; `getPageWriter` → `createFlag=2`; stress retry → `createFlag=2` (matches `pcache.c:486`)
+- [x] handle nil return from `create()` in `getPageReader` — fall back to uncached `readTempPage()`
+- [x] write test: pin 95% of maxPages, soft create returns nil; hard create succeeds
+- [x] write test: slab under pressure + low recyclable ratio → soft create returns nil
+- [x] run tests — must pass before next task
 
 ### Task 8: Enforce max page on unpin
 **Depends on: Task 3 (slab pressure), Task 7 (nRecyclable). Immediately evict instead of adding to LRU when cache is overfull and slab is under pressure.**

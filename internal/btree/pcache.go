@@ -21,9 +21,9 @@ type pcache struct {
 	purgeable bool
 
 	// LRU list for clean pages (dirty pages are not evicted)
-	lruHead *page
-	lruTail *page
-	nClean  int
+	lruHead      *page
+	lruTail      *page
+	nRecyclable  int // unpinned clean pages in LRU; matches SQLite pcache1.c:197 nRecyclable
 
 	// Dirty page list
 	dirtyHead *page
@@ -96,10 +96,12 @@ func (pc *pcache) initBulk() {
 }
 
 // create allocates a new page in the cache and returns it pinned.
+// createFlag controls admission: 1=soft (may return nil under pressure),
+// 2=hard (always allocates). Matches SQLite pcache1.c:881-892 step 3.
 // If the cache is full, it evicts clean pages first. If no clean pages
 // are available and xStress is set, invokes the stress callback to spill
 // a dirty page, making it clean and evictable.
-func (pc *pcache) create(pgno uint32) *page {
+func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	if p := pc.pages[pgno]; p != nil {
 		p.pinCount++
 		if !p.dirty {
@@ -108,16 +110,28 @@ func (pc *pcache) create(pgno uint32) *page {
 		return p
 	}
 
-	// Evict clean pages if cache is full (skip for non-purgeable / InMemory caches).
-	// Capture the last evicted page so we can reuse its buffer.
+	// Step 3: Admission control — refuse soft creates when thrashing or under
+	// memory pressure. Matches SQLite pcache1.c:881-892 (step 3 guards).
+	// createFlag==1 (soft, readers): may return nil.
+	// createFlag==2 (hard, writers/stress): always proceeds.
+	if createFlag == 1 && pc.purgeable {
+		nPinned := len(pc.pages) - pc.nRecyclable
+		if nPinned >= pc.maxPages*9/10 {
+			return nil
+		}
+		if globalPageSlab.UnderPressure() && pc.nRecyclable < nPinned {
+			return nil
+		}
+	}
+
+	// Step 4: Evict clean pages if cache is full (skip for non-purgeable / InMemory caches).
 	// Matches SQLite pcache1.c:897-914 (step 4 — reuses LRU victim's buffer).
-	// Evict clean pages if cache is full (skip for non-purgeable / InMemory caches).
 	// NOTE: evicted page buffers are NOT returned to the slab here because the
 	// pager's writePages map may still reference evicted page structs (after spill).
 	// Buffers are returned to the slab in clear() and discard() instead, where the
 	// pager has already cleaned up writePages references.
 	if pc.purgeable {
-		for len(pc.pages) >= pc.maxPages && pc.nClean > 0 {
+		for len(pc.pages) >= pc.maxPages && pc.nRecyclable > 0 {
 			pc.evictOne()
 		}
 
@@ -137,7 +151,7 @@ func (pc *pcache) create(pgno uint32) *page {
 				// pager to error state, so the error is not silently lost.
 				pc.xStress(victim)
 				// After stress callback, victim should be clean. Retry eviction.
-				for len(pc.pages) >= pc.maxPages && pc.nClean > 0 {
+				for len(pc.pages) >= pc.maxPages && pc.nRecyclable > 0 {
 					pc.evictOne()
 				}
 			}
@@ -317,7 +331,7 @@ func (pc *pcache) clear() {
 	pc.lruHead = nil
 	pc.lruTail = nil
 	pc.dirtyHead = nil
-	pc.nClean = 0
+	pc.nRecyclable = 0
 	pc.nDirty = 0
 }
 
@@ -386,7 +400,7 @@ func (pc *pcache) lruPrepend(p *page) {
 		pc.lruTail = p
 	}
 	pc.lruHead = p
-	pc.nClean++
+	pc.nRecyclable++
 }
 
 func (pc *pcache) lruRemove(p *page) {
@@ -406,7 +420,7 @@ func (pc *pcache) lruRemove(p *page) {
 	}
 	p.next = nil
 	p.prev = nil
-	pc.nClean--
+	pc.nRecyclable--
 }
 
 // evictOne removes the page at the TAIL of the LRU list (least recently used)
@@ -425,7 +439,7 @@ func (pc *pcache) evictOne() *page {
 	}
 	p.next = nil
 	p.prev = nil
-	pc.nClean--
+	pc.nRecyclable--
 	delete(pc.pages, p.pgno)
 	return p
 }
