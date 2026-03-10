@@ -212,6 +212,10 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 // release unpins a page. If the page is clean, it goes to the LRU list.
 // If the page is dirty, it moves to the front of the dirty list (MRU position).
 // Matches SQLite pcache.c:558 (pcacheManageDirtyList PCACHE_DIRTYLIST_FRONT on unpin).
+//
+// When the cache is overfull (len(pages) > maxPages) and the global slab is under
+// memory pressure, clean pages are immediately evicted instead of being added to
+// the LRU. Matches SQLite pcache1.c:1094-1095 (pcache1Unpin — nPurgeable > nMaxPage).
 func (pc *pcache) release(p *page) {
 	p.pinCount--
 	if p.pinCount <= 0 {
@@ -224,7 +228,16 @@ func (pc *pcache) release(p *page) {
 		if p.dirty {
 			pc.dirtyMoveToFront(p)
 		} else if pc.pages[p.pgno] == p {
-			pc.lruPrepend(p)
+			// If cache is overfull and slab is under pressure, immediately
+			// evict instead of adding to LRU (matches pcache1Unpin).
+			if pc.purgeable && globalPageSlab.UnderPressure() && len(pc.pages) > pc.maxPages {
+				delete(pc.pages, p.pgno)
+				if globalPageSlab.Initialized(pc.pageSize) {
+					globalPageSlab.Put(p.data)
+				}
+			} else {
+				pc.lruPrepend(p)
+			}
 		}
 	}
 }

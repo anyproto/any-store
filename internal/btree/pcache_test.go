@@ -835,3 +835,84 @@ func TestPcacheAdmissionControl_NonPurgeableIgnoresCreateFlag(t *testing.T) {
 		pc.release(pg)
 	}
 }
+
+func TestPcacheUnpin_OverfullPressureEvictsImmediately(t *testing.T) {
+	// When cache is overfull (len(pages) > maxPages) and slab is under pressure,
+	// releasing a clean page should immediately evict it instead of adding to LRU.
+	// Matches SQLite pcache1.c:1094-1095 (pcache1Unpin).
+	globalPageSlab.Reset()
+	globalPageSlab.Init(4096, 10) // small slab to easily create pressure
+	defer globalPageSlab.Reset()
+
+	pc := newPcache(4096, 5, true)
+
+	// Create 6 pages with hard create (cache grows beyond maxPages=5)
+	pgs := make([]*page, 6)
+	for i := uint32(1); i <= 6; i++ {
+		pgs[i-1] = pc.create(i, 2)
+	}
+	assert.Len(t, pc.pages, 6) // overfull: 6 > maxPages=5
+
+	// Drain the slab to create pressure
+	drained := make([][]byte, 0)
+	for !globalPageSlab.UnderPressure() {
+		drained = append(drained, globalPageSlab.Get())
+	}
+	assert.True(t, globalPageSlab.UnderPressure())
+
+	// Record slab free count before release
+	globalPageSlab.mu.Lock()
+	freeCountBefore := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+
+	// Release page 6 (clean) — should be immediately evicted, not added to LRU
+	pc.release(pgs[5])
+	assert.Nil(t, pc.pages[6], "page 6 should be immediately evicted on release")
+	assert.Len(t, pc.pages, 5, "cache should shrink to maxPages")
+	assert.Equal(t, 0, pc.nRecyclable, "page should NOT go to LRU")
+
+	// Buffer should be returned to slab
+	globalPageSlab.mu.Lock()
+	freeCountAfter := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+	assert.Equal(t, freeCountBefore+1, freeCountAfter,
+		"released page's buffer should be returned to slab")
+
+	// Return drained buffers
+	for _, buf := range drained {
+		globalPageSlab.Put(buf)
+	}
+	// Cleanup remaining pinned pages
+	for i := 0; i < 5; i++ {
+		pc.release(pgs[i])
+	}
+}
+
+func TestPcacheUnpin_OverfullNoPressureGoesToLRU(t *testing.T) {
+	// When cache is overfull but slab is NOT under pressure, released page
+	// should go to LRU normally (not immediately evicted).
+	globalPageSlab.Reset()
+	globalPageSlab.Init(4096, 500) // large slab, no pressure
+	defer globalPageSlab.Reset()
+
+	pc := newPcache(4096, 5, true)
+
+	// Create 6 pages with hard create (cache grows beyond maxPages=5)
+	pgs := make([]*page, 6)
+	for i := uint32(1); i <= 6; i++ {
+		pgs[i-1] = pc.create(i, 2)
+	}
+	assert.Len(t, pc.pages, 6) // overfull
+	assert.False(t, globalPageSlab.UnderPressure(), "slab should NOT be under pressure")
+
+	// Release page 6 — should go to LRU normally
+	pc.release(pgs[5])
+	assert.NotNil(t, pc.pages[6], "page 6 should still be in cache")
+	assert.Equal(t, 1, pc.nRecyclable, "page should be in LRU")
+	assert.Len(t, pc.pages, 6, "cache should remain overfull without pressure")
+
+	// Cleanup
+	for i := 0; i < 5; i++ {
+		pc.release(pgs[i])
+	}
+}

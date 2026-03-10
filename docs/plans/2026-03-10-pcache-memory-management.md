@@ -145,10 +145,10 @@ SQLite ref: `pcache1.c:881-892` (step 3 guards), `pcache1.c:197` (nRecyclable), 
 ### Task 8: Enforce max page on unpin
 **Depends on: Task 3 (slab pressure), Task 7 (nRecyclable). Immediately evict instead of adding to LRU when cache is overfull and slab is under pressure.**
 SQLite ref: `pcache1.c:1094-1095` (pcache1Unpin — `reuseUnlikely || nPurgeable > nMaxPage` → remove from hash + free).
-- [ ] modify `release()` in `pcache.go:119-132`: after `pinCount` reaches 0, if `pc.purgeable && globalPageSlab.UnderPressure() && len(pc.pages) > pc.maxPages` → delete from `pc.pages`, return buffer to slab (don't add to LRU)
-- [ ] write test: overfull cache + slab pressure → released page is immediately evicted, slab gets buffer back
-- [ ] write test: overfull cache without pressure → page goes to LRU normally
-- [ ] run tests — must pass before next task
+- [x] modify `release()` in `pcache.go:119-132`: after `pinCount` reaches 0, if `pc.purgeable && globalPageSlab.UnderPressure() && len(pc.pages) > pc.maxPages` → delete from `pc.pages`, return buffer to slab (don't add to LRU)
+- [x] write test: overfull cache + slab pressure → released page is immediately evicted, slab gets buffer back
+- [x] write test: overfull cache without pressure → page goes to LRU normally
+- [x] run tests — must pass before next task
 
 ### Task 9: Persistent reader cache across transactions
 **Depends on: Task 5 (clear returns buffers to slab). Keep reader cache pages between transactions; nuke only when walMaxFrame changes.**
