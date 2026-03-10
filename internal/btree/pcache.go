@@ -276,10 +276,18 @@ func (pc *pcache) release(p *page) {
 			//
 			// If cache is overfull and slab is under pressure, immediately
 			// evict instead of adding to LRU (matches pcache1Unpin).
-			if globalPageSlab.UnderPressure() && len(pc.pages) > pc.maxPages {
+			// Skip for writer caches (xStress != nil) because pager.writePages
+			// may still reference the evicted page struct after spill. Returning
+			// the buffer to slab while writePages holds a reference would allow
+			// another cache to reuse the buffer, causing data corruption when
+			// the writer re-accesses the page via getWritablePage.
+			// Writer pages are evicted through create() step 4 or stress callback;
+			// their buffers are returned to slab at commit/rollback time.
+			if pc.xStress == nil && globalPageSlab.UnderPressure() && len(pc.pages) > pc.maxPages {
 				delete(pc.pages, p.pgno)
 				if globalPageSlab.Initialized(pc.pageSize) {
 					globalPageSlab.Put(p.data)
+					p.data = nil
 				}
 			} else {
 				pc.lruPrepend(p)
@@ -377,12 +385,14 @@ func (pc *pcache) clear() {
 	for _, p := range pc.pages {
 		if slabOk {
 			globalPageSlab.Put(p.data)
+			p.data = nil
 		}
 	}
 	// Return pFree buffers to slab as well
 	if slabOk {
 		for _, p := range pc.pFree {
 			globalPageSlab.Put(p.data)
+			p.data = nil
 		}
 	}
 	pc.pFree = pc.pFree[:0]
@@ -420,6 +430,7 @@ func (pc *pcache) discard(pgno uint32) {
 	}
 	if globalPageSlab.Initialized(pc.pageSize) {
 		globalPageSlab.Put(p.data)
+		p.data = nil
 	}
 	delete(pc.pages, pgno)
 }
@@ -447,6 +458,7 @@ func (pc *pcache) truncate(maxPage uint32) {
 			}
 			if slabOk {
 				globalPageSlab.Put(p.data)
+				p.data = nil
 			}
 			delete(pc.pages, pgno)
 		}

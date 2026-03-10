@@ -1367,6 +1367,22 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	}
 
 	p.savepoints = p.savepoints[:0]
+
+	// Return slab buffers for pages evicted from cache during stress spill.
+	// These pages were removed from writerCache.pages by evictOne() but still
+	// referenced by writePages. discard()/clear()/truncate() only handle pages
+	// in writerCache.pages, so evicted page buffers must be returned here.
+	// Pages still in cache have data==nil (set by makeClean->clear path) or
+	// are still tracked in writerCache.pages — we skip those.
+	if slabOk := globalPageSlab.Initialized(p.writerCache.pageSize); slabOk {
+		for _, pg := range p.writePages {
+			if pg != nil && pg.data != nil && p.writerCache.pages[pg.pgno] != pg {
+				globalPageSlab.Put(pg.data)
+				pg.data = nil
+			}
+		}
+	}
+
 	clear(p.writePages)
 	clear(p.dontWritePages)
 	clear(p.hasContent)
@@ -1402,8 +1418,18 @@ func (p *pager) rollbackLocked() error {
 	// Discard spilled (clean) pages from cache. Spilled pages were written
 	// to WAL mid-transaction and marked clean by pagerStress, so they won't
 	// appear in dirtyPages. Their cached content is stale after rollback.
-	for pgno := range p.writePages {
-		p.writerCache.discard(pgno)
+	// Also return slab buffers for pages evicted from cache during stress
+	// spill — discard() can't find them in writerCache.pages, so their
+	// buffers must be returned here. After discard(), data is nil for
+	// discarded pages; non-nil data on a page not in cache means evicted.
+	slabOk := globalPageSlab.Initialized(p.writerCache.pageSize)
+	for pgno, pg := range p.writePages {
+		if p.writerCache.pages[pgno] != nil {
+			p.writerCache.discard(pgno)
+		} else if pg != nil && pg.data != nil && slabOk {
+			globalPageSlab.Put(pg.data)
+			pg.data = nil
+		}
 	}
 
 	// Roll back spilled frames in the WAL index. Spilled frames in the WAL
@@ -1526,6 +1552,20 @@ func (p *pager) pagerError() {
 	p.dbSize.Store(p.header.DatabaseSize)
 
 	p.savepoints = p.savepoints[:0]
+
+	// Return slab buffers for pages evicted from cache during stress spill.
+	// After discard()+clear() above, in-cache pages have data==nil; non-nil
+	// data on a writePages entry means the page was evicted and its buffer
+	// was never returned to the slab.
+	if slabOk := globalPageSlab.Initialized(p.writerCache.pageSize); slabOk {
+		for _, pg := range p.writePages {
+			if pg != nil && pg.data != nil {
+				globalPageSlab.Put(pg.data)
+				pg.data = nil
+			}
+		}
+	}
+
 	clear(p.writePages)
 	clear(p.dontWritePages)
 	clear(p.hasContent)
