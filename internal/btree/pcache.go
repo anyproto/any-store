@@ -277,7 +277,9 @@ func (pc *pcache) release(p *page) {
 		// "ghost" pages to the LRU would cause evictOne to loop without
 		// reducing len(pages).
 		if p.dirty {
-			pc.dirtyMoveToFront(p)
+			if pc.pages[p.pgno] == p {
+				pc.dirtyMoveToFront(p)
+			}
 		} else if pc.purgeable && pc.pages[p.pgno] == p {
 			// Non-purgeable caches (InMemory) skip LRU entirely — pages are
 			// never evicted. Matches SQLite pcache.c:265-271 (pcacheUnpin is
@@ -404,7 +406,7 @@ func (pc *pcache) clear() {
 			p.data = nil
 		}
 	}
-	pc.pFree = pc.pFree[:0]
+	pc.pFree = nil
 	pc.bulkInit = false
 	clear(pc.pages)
 	pc.lruHead = nil
@@ -433,6 +435,8 @@ func (pc *pcache) discard(pgno uint32) {
 		} else {
 			pc.dirtyTail = p.prev
 		}
+		p.next = nil
+		p.prev = nil
 		pc.nDirty--
 	} else {
 		pc.lruRemove(p)
@@ -461,6 +465,8 @@ func (pc *pcache) truncate(maxPage uint32) {
 				} else {
 					pc.dirtyTail = p.prev
 				}
+				p.next = nil
+				p.prev = nil
 				pc.nDirty--
 			} else {
 				pc.lruRemove(p)
