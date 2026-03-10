@@ -967,21 +967,23 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 	if err != nil {
 		return buf, err
 	}
-	defer bt.pager.releasePage(pg)
 
 	usableSize := bt.usablePageSize()
 	for {
 		if pg.header.isLeaf() {
 			idx, found, serr := searchLeafWithOverflow(pg, key, usableSize, bt.pager, maxFrame, bt.cache)
 			if serr != nil {
+				bt.pager.releasePage(pg)
 				return buf, serr
 			}
 			if !found {
+				bt.pager.releasePage(pg)
 				return buf, ErrKeyNotFound
 			}
 			off := pg.getCellOffset(idx)
 			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
 			if cerr != nil {
+				bt.pager.releasePage(pg)
 				return buf, cerr
 			}
 			if cell.overflowPg != 0 {
@@ -989,11 +991,13 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 				pos := int(off)
 				keyLen, kn, verr := getVarintSafe(pg.data[pos:])
 				if verr != nil {
+					bt.pager.releasePage(pg)
 					return buf, ErrCorrupt
 				}
 				pos += kn
 				valLen, _, verr := getVarintSafe(pg.data[pos:])
 				if verr != nil {
+					bt.pager.releasePage(pg)
 					return buf, ErrCorrupt
 				}
 
@@ -1020,6 +1024,7 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 						err = bt.pager.readOverflowChainAt(cell.overflowPg, overflowBuf, maxFrame)
 					}
 					if err != nil {
+						bt.pager.releasePage(pg)
 						return buf[:start], err
 					}
 					valOverflow := int(valLen) - localValBytes
@@ -1027,8 +1032,10 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 						copy(fullVal[localValBytes:], overflowBuf[keyOverflow:])
 					}
 				}
+				bt.pager.releasePage(pg)
 				return buf, nil
 			}
+			bt.pager.releasePage(pg)
 			return append(buf, cell.value...), nil
 		}
 
@@ -1924,7 +1931,11 @@ func (bt *btree) insertIntoParent(leftPg *page, key []byte, rightPgno uint32) er
 	}
 	// Use the separator key to navigate to the parent of leftPg.
 	for pg.header.isInterior() {
-		childPgno, _, _ := bt.searchInterior(pg, key)
+		childPgno, _, serr := bt.searchInterior(pg, key)
+		if serr != nil {
+			bt.pager.releasePage(pg)
+			return serr
+		}
 		if childPgno == leftPg.pgno {
 			// Found: pg is the parent of leftPg
 			path = append(path, pg.pgno)

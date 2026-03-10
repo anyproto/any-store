@@ -106,7 +106,9 @@ type pager struct {
 
 	// savedWalFrame is the WAL frame count at beginWrite() time.
 	// Used to roll back spilled frames on transaction rollback.
-	savedWalFrame uint32
+	// Atomic because rollbackForClose reads it without the writer lock
+	// while beginWrite may be writing it concurrently.
+	savedWalFrame atomic.Uint32
 
 	// savedWalCksum1/2 are the WAL cumulative checksums at beginWrite() time.
 	// Must be restored on rollback so the next transaction's frames have
@@ -396,7 +398,7 @@ func (p *pager) beginWrite() error {
 	p.savedHeader = p.header
 	// Save WAL frame count and checksums so rollback can clean up spilled frames
 	// and restore the checksum chain for the next transaction.
-	p.savedWalFrame = p.wal.nFrame.Load()
+	p.savedWalFrame.Store(p.wal.nFrame.Load())
 	p.savedWalCksum1 = p.wal.cksum1
 	p.savedWalCksum2 = p.wal.cksum2
 	if p.writePages == nil {
@@ -1316,7 +1318,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	// The nFrame check catches transactions where all dirty pages were spilled
 	// (making dirtyBuf empty) but a commit frame is still needed.
 	hasRealChanges := len(p.dirtyBuf) > 0 || p.header != p.savedHeader ||
-		p.writePages[1] != nil || p.wal.nFrame.Load() > p.savedWalFrame
+		p.writePages[1] != nil || p.wal.nFrame.Load() > p.savedWalFrame.Load()
 
 	if !hasRealChanges {
 		// Empty transaction — counters not incremented.
@@ -1434,11 +1436,11 @@ func (p *pager) rollbackLocked() error {
 	// Roll back spilled frames in the WAL index. Spilled frames in the WAL
 	// file are harmless (no commit marker), but pageMap entries and maxFrame
 	// must be restored to the pre-transaction state.
-	p.wal.index.rollbackToFrame(p.savedWalFrame)
+	p.wal.index.rollbackToFrame(p.savedWalFrame.Load())
 	// Restore nFrame so the next transaction overwrites the dead spill frames
 	// instead of writing past them. Also restore cumulative checksums so the
 	// checksum chain is correct when frames are overwritten.
-	p.wal.nFrame.Store(p.savedWalFrame)
+	p.wal.nFrame.Store(p.savedWalFrame.Load())
 	p.wal.cksum1 = p.savedWalCksum1
 	p.wal.cksum2 = p.savedWalCksum2
 
@@ -1447,7 +1449,7 @@ func (p *pager) rollbackLocked() error {
 	// memFrames[N-1] which points to rolled-back data instead of new data.
 	if p.wal.inMemory {
 		p.wal.mu.Lock()
-		p.wal.memFrames = p.wal.memFrames[:p.savedWalFrame]
+		p.wal.memFrames = p.wal.memFrames[:p.savedWalFrame.Load()]
 		p.wal.mu.Unlock()
 	}
 
@@ -1482,12 +1484,12 @@ func (p *pager) rollbackForClose() {
 
 	// Roll back spilled frames in the WAL index.
 	// index.rollbackToFrame and nFrame are safe (own locking / atomic).
-	p.wal.index.rollbackToFrame(p.savedWalFrame)
-	p.wal.nFrame.Store(p.savedWalFrame)
+	p.wal.index.rollbackToFrame(p.savedWalFrame.Load())
+	p.wal.nFrame.Store(p.savedWalFrame.Load())
 
 	if p.wal.inMemory {
 		p.wal.mu.Lock()
-		p.wal.memFrames = p.wal.memFrames[:p.savedWalFrame]
+		p.wal.memFrames = p.wal.memFrames[:p.savedWalFrame.Load()]
 		p.wal.mu.Unlock()
 	}
 
@@ -1528,8 +1530,8 @@ func (p *pager) pagerError() {
 	// Roll back spilled frames in the WAL index and restore nFrame/checksums.
 	// Without this, pageMap and nFrame remain inflated after error recovery,
 	// causing checkpoint to copy uncommitted spill data to the database.
-	p.wal.index.rollbackToFrame(p.savedWalFrame)
-	p.wal.nFrame.Store(p.savedWalFrame)
+	p.wal.index.rollbackToFrame(p.savedWalFrame.Load())
+	p.wal.nFrame.Store(p.savedWalFrame.Load())
 	p.wal.cksum1 = p.savedWalCksum1
 	p.wal.cksum2 = p.savedWalCksum2
 
@@ -1537,12 +1539,12 @@ func (p *pager) pagerError() {
 	// writeHeader (wal.go), so a writeHeader failure leaves mxCommitFrame
 	// ahead of the rolled-back WAL state. At beginWrite() time,
 	// mxCommitFrame == nFrame == savedWalFrame, so restore to that value.
-	p.wal.index.mxCommitFrame.Store(p.savedWalFrame)
+	p.wal.index.mxCommitFrame.Store(p.savedWalFrame.Load())
 
 	// Truncate in-memory WAL frames to match restored nFrame.
 	if p.wal.inMemory {
 		p.wal.mu.Lock()
-		p.wal.memFrames = p.wal.memFrames[:p.savedWalFrame]
+		p.wal.memFrames = p.wal.memFrames[:p.savedWalFrame.Load()]
 		p.wal.mu.Unlock()
 	}
 
