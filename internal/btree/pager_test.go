@@ -7506,3 +7506,135 @@ func TestSpillInMemoryMode(t *testing.T) {
 		p.writerCache.release(pg)
 	}
 }
+
+// TestPagerSlabIntegration verifies that read and write transactions route
+// all page buffer allocations through the global slab allocator. After
+// transactions complete, buffers are returned to the slab via cache clear
+// and temp page recycling.
+func TestPagerSlabIntegration(t *testing.T) {
+	globalPageSlab.Reset()
+	globalPageSlab.Init(4096, 500)
+	defer globalPageSlab.Reset()
+
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	freeBeforeWrite := len(globalPageSlab.freeList)
+
+	// --- Write transaction: allocate and dirty several pages ---
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf)
+	require.NoError(t, p.beginWrite())
+
+	var pageNos []uint32
+	for i := 0; i < 5; i++ {
+		pg, err := p.allocatePage()
+		require.NoError(t, err)
+		copy(pg.data[100:], fmt.Sprintf("slab-%03d", i))
+		pageNos = append(pageNos, pg.pgno)
+		p.releasePage(pg)
+	}
+
+	// Slab should have allocated buffers (free list smaller than before)
+	freeAfterAlloc := len(globalPageSlab.freeList)
+	assert.Less(t, freeAfterAlloc, freeBeforeWrite,
+		"slab free list should shrink after page allocations")
+
+	// Commit
+	_, _, _, err = p.commit(true, false)
+	require.NoError(t, err)
+	p.endRead(slot)
+
+	// Clear the writer cache to return buffers
+	freeBeforeClear := len(globalPageSlab.freeList)
+	p.writerCache.clear()
+	freeAfterClear := len(globalPageSlab.freeList)
+	assert.Greater(t, freeAfterClear, freeBeforeClear,
+		"clearing writer cache should return buffers to slab")
+
+	// --- Read transaction: pages go through getPageReader -> pcache.create ---
+	mf2, slot2, err := p.beginRead()
+	require.NoError(t, err)
+	defer p.endRead(slot2)
+
+	readerCache := newPcache(4096, 50, true)
+
+	freeBeforeRead := len(globalPageSlab.freeList)
+	for _, pgno := range pageNos {
+		pg, err := p.getPageReader(pgno, mf2, readerCache)
+		require.NoError(t, err)
+		assert.NotNil(t, pg.data, "reader page should have data from slab")
+		readerCache.release(pg)
+	}
+	freeAfterRead := len(globalPageSlab.freeList)
+	assert.Less(t, freeAfterRead, freeBeforeRead,
+		"reading pages should consume slab buffers")
+
+	// Clear reader cache — should return all buffers
+	readerCache.clear()
+	freeAfterReaderClear := len(globalPageSlab.freeList)
+	assert.Greater(t, freeAfterReaderClear, freeAfterRead,
+		"clearing reader cache should return buffers to slab")
+
+	// --- Temp page (readTempPage) path: acquireTempPage uses slab ---
+	mf3, slot3, err := p.beginRead()
+	require.NoError(t, err)
+	defer p.endRead(slot3)
+
+	freeBeforeTemp := len(globalPageSlab.freeList)
+	tmpPg, err := p.readTempPage(pageNos[0], mf3)
+	require.NoError(t, err)
+	assert.NotNil(t, tmpPg.data)
+	freeAfterTemp := len(globalPageSlab.freeList)
+	assert.Less(t, freeAfterTemp, freeBeforeTemp,
+		"acquireTempPage should draw from slab")
+
+	// Recycle temp page — buffer goes back to slab
+	p.recycleTempPage(tmpPg)
+	freeAfterRecycle := len(globalPageSlab.freeList)
+	assert.Greater(t, freeAfterRecycle, freeAfterTemp,
+		"recycleTempPage should return buffer to slab")
+
+	// Verify no overflow allocations occurred (everything came from slab)
+	assert.Equal(t, 0, globalPageSlab.nOverflow,
+		"all allocations should come from slab, not overflow")
+}
+
+// TestPagerTempPageSlabRoundtrip verifies that acquireTempPage and
+// recycleTempPage correctly interact with the slab when pages are reused
+// through the sync.Pool.
+func TestPagerTempPageSlabRoundtrip(t *testing.T) {
+	globalPageSlab.Reset()
+	globalPageSlab.Init(4096, 100)
+	defer globalPageSlab.Reset()
+
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 50, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	// Acquire, recycle, acquire again — second acquire should get a pooled
+	// page struct with a fresh slab buffer.
+	pg1 := p.acquireTempPage()
+	assert.NotNil(t, pg1.data)
+	assert.Equal(t, 4096, len(pg1.data))
+	copy(pg1.data, "hello")
+
+	freeBefore := len(globalPageSlab.freeList)
+	p.recycleTempPage(pg1)
+	freeAfter := len(globalPageSlab.freeList)
+	assert.Equal(t, freeBefore+1, freeAfter,
+		"recycleTempPage should return buffer to slab")
+	assert.Nil(t, pg1.data, "recycled page data should be nil")
+
+	// Re-acquire (may come from pool with nil data)
+	pg2 := p.acquireTempPage()
+	assert.NotNil(t, pg2.data, "re-acquired page should have fresh slab buffer")
+	assert.Equal(t, 4096, len(pg2.data))
+	p.recycleTempPage(pg2)
+}

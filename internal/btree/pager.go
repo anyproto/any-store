@@ -990,18 +990,41 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 }
 
 // acquireTempPage returns a page from the pool or allocates a new one.
-// The returned page has a valid data buffer but all other fields are unset.
+// The returned page has a valid data buffer from the global slab (if initialized)
+// or a fresh allocation. All other fields are unset.
 func (p *pager) acquireTempPage() *page {
 	if v := p.pagePool.Get(); v != nil {
-		return v.(*page)
+		pg := v.(*page)
+		// Pooled pages may have had their data buffer returned to slab.
+		if pg.data == nil {
+			if globalPageSlab.Initialized(int(p.pageSize)) {
+				pg.data = globalPageSlab.Get()
+			} else {
+				pg.data = make([]byte, p.pageSize)
+			}
+		}
+		return pg
+	}
+	var data []byte
+	if globalPageSlab.Initialized(int(p.pageSize)) {
+		data = globalPageSlab.Get()
+	} else {
+		data = make([]byte, p.pageSize)
 	}
 	return &page{
-		data: make([]byte, p.pageSize),
+		data: data,
 	}
 }
 
 // recycleTempPage returns an uncached page to the pool for reuse.
+// The page's data buffer is returned to the global slab (if initialized)
+// and a fresh slab buffer will be allocated on next acquireTempPage.
 func (p *pager) recycleTempPage(pg *page) {
+	// Return data buffer to slab before pooling the page struct.
+	if globalPageSlab.Initialized(len(pg.data)) {
+		globalPageSlab.Put(pg.data)
+		pg.data = nil
+	}
 	pg.pgno = 0
 	pg.dirty = false
 	pg.uncached = false

@@ -122,12 +122,12 @@ SQLite ref: `pcache1.c:897-914` (step 4 — reuses LRU victim's buffer by re-key
 
 ### Task 6: Wire pcache.create() and pager through slab
 **Depends on: Task 3 (slab). Replace all `make([]byte, pageSize)` in page allocation paths with slab-backed allocation.**
-- [ ] update `acquireTempPage()` in `pager.go:994-1001` to use `globalPageSlab.Get()` for `page.data`
-- [ ] update `recycleTempPage()` in `pager.go:1004-1014` to use `globalPageSlab.Put(pg.data)` (return buffer to slab, keep page struct in pagePool)
-- [ ] verify `getPageWriter` and `getPageReader` allocate pages through `pcache.create()` which now uses slab — no direct `make([]byte)` in hot paths
-- [ ] audit for remaining `make([]byte, pageSize)` in pager.go that should use slab (header reads, savepoint copies are OK to keep as-is — they're transient)
-- [ ] write test: open DB, run read+write transactions, verify slab tracks all allocations (nTotal matches expected)
-- [ ] run tests — must pass before next task
+- [x] update `acquireTempPage()` in `pager.go:994-1001` to use `globalPageSlab.Get()` for `page.data`
+- [x] update `recycleTempPage()` in `pager.go:1004-1014` to use `globalPageSlab.Put(pg.data)` (return buffer to slab, keep page struct in pagePool)
+- [x] verify `getPageWriter` and `getPageReader` allocate pages through `pcache.create()` which now uses slab — no direct `make([]byte)` in hot paths
+- [x] audit for remaining `make([]byte, pageSize)` in pager.go that should use slab (header reads, savepoint copies are OK to keep as-is — they're transient)
+- [x] write test: open DB, run read+write transactions, verify slab tracks all allocations (nTotal matches expected)
+- [x] run tests — must pass before next task
 
 ### Task 7: Admission control (createFlag)
 **Depends on: Task 3 (slab pressure). Refuse cache growth when thrashing or under memory pressure.**
