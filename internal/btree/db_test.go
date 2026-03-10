@@ -3252,6 +3252,136 @@ func TestPersistentReaderCache_ClearReturnsBuffersToSlab(t *testing.T) {
 	require.NoError(t, rtx2.Rollback())
 }
 
+// === Max concurrent readers limiter (Task 10) ===
+
+func TestMaxReaders_ConcurrentBeginReadSucceeds(t *testing.T) {
+	// MaxReaders concurrent BeginRead calls should all succeed;
+	// the MaxReaders+1 call should block until one Rollback frees a slot.
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{MaxReaders: 2})
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	// Open MaxReaders (2) read transactions — both should succeed.
+	tx1, err := db.BeginRead()
+	require.NoError(t, err)
+	tx2, err := db.BeginRead()
+	require.NoError(t, err)
+
+	// Third reader should block. Launch it in a goroutine.
+	blocked := make(chan struct{})
+	unblocked := make(chan *ReadTx)
+	go func() {
+		close(blocked)
+		tx3, err2 := db.BeginRead()
+		if err2 != nil {
+			unblocked <- nil
+			return
+		}
+		unblocked <- tx3
+	}()
+
+	<-blocked
+	// Give the goroutine time to actually block on the semaphore.
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify nothing came through yet.
+	select {
+	case <-unblocked:
+		t.Fatal("third reader should have been blocked")
+	default:
+	}
+
+	// Release one reader — the blocked goroutine should unblock.
+	require.NoError(t, tx1.Rollback())
+
+	select {
+	case tx3 := <-unblocked:
+		require.NotNil(t, tx3, "third reader should have succeeded after Rollback")
+		require.NoError(t, tx3.Rollback())
+	case <-time.After(2 * time.Second):
+		t.Fatal("third reader did not unblock after Rollback")
+	}
+
+	require.NoError(t, tx2.Rollback())
+}
+
+func TestMaxReaders_CloseUnblocksWaitingReaders(t *testing.T) {
+	// DB.Close should unblock goroutines waiting on the reader semaphore.
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{MaxReaders: 1})
+	require.NoError(t, err)
+
+	// Saturate the single reader slot.
+	tx1, err := db.BeginRead()
+	require.NoError(t, err)
+
+	// Second reader will block.
+	errCh := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_, err2 := db.BeginRead()
+		errCh <- err2
+	}()
+
+	<-started
+	time.Sleep(50 * time.Millisecond)
+
+	// Close the DB — should unblock the waiting reader.
+	// First rollback the active reader so Close can acquire mu.Lock.
+	require.NoError(t, tx1.Rollback())
+	require.NoError(t, db.Close())
+
+	select {
+	case err2 := <-errCh:
+		assert.ErrorIs(t, err2, ErrClosed, "blocked reader should get ErrClosed after Close")
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked reader was not unblocked by Close")
+	}
+}
+
+func TestMaxReaders_DefaultValue(t *testing.T) {
+	// With default options, MaxReaders should be defaultMaxReaders (4).
+	db := tempDB(t)
+	assert.Equal(t, defaultMaxReaders, cap(db.readerSem))
+}
+
+func TestMaxReaders_SetClosingUnblocksWaitingReaders(t *testing.T) {
+	// SetClosing should also unblock goroutines waiting on the reader semaphore.
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{MaxReaders: 1})
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	// Saturate the single reader slot.
+	tx1, err := db.BeginRead()
+	require.NoError(t, err)
+
+	errCh := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_, err2 := db.BeginRead()
+		errCh <- err2
+	}()
+
+	<-started
+	time.Sleep(50 * time.Millisecond)
+
+	// SetClosing should unblock the waiting reader.
+	db.SetClosing()
+
+	select {
+	case err2 := <-errCh:
+		assert.ErrorIs(t, err2, ErrClosed)
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked reader was not unblocked by SetClosing")
+	}
+
+	require.NoError(t, tx1.Rollback())
+}
+
 func TestPersistentReaderCache_ConcurrentReadersDoNotCorrupt(t *testing.T) {
 	// Reproduces the scenario from TestOverflowSavepointConcurrent:
 	// concurrent readers + writers + checkpoints with persistent caches.

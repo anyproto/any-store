@@ -165,15 +165,15 @@ SQLite ref: `pager.c:3246-3267` (pagerBeginReadTransaction — `pager_reset` onl
 ### Task 10: Max concurrent readers limiter
 **Depends on: Task 9 (persistent cache). Configurable semaphore to bound the number of concurrent read transactions per DB.**
 No SQLite equivalent — our addition for memory management with many open DBs.
-- [ ] add `MaxReaders int` to `Options` struct in `db.go` (default 4)
-- [ ] add `readerSem chan struct{}` field to `DB` struct in `db.go:70-99`
-- [ ] initialize `readerSem` as buffered channel with capacity `MaxReaders` in `Open()`
-- [ ] acquire semaphore (`db.readerSem <- struct{}{}`) at start of `BeginRead()` before `mu.RLock()`
-- [ ] release semaphore (`<-db.readerSem`) at end of `ReadTx.Rollback()` after pool.Put
-- [ ] handle `db.closing` — don't block forever on semaphore if DB is closing (use select with closing check)
-- [ ] write test: `MaxReaders` concurrent BeginRead succeed; `MaxReaders+1` blocks until one Rollback
-- [ ] write test: DB.Close unblocks waiting readers
-- [ ] run tests — must pass before next task
+- [x] add `MaxReaders int` to `Options` struct in `db.go` (default 4)
+- [x] add `readerSem chan struct{}` field to `DB` struct in `db.go:70-99`
+- [x] initialize `readerSem` as buffered channel with capacity `MaxReaders` in `Open()`
+- [x] acquire semaphore (`db.readerSem <- struct{}{}`) at start of `BeginRead()` before `mu.RLock()`
+- [x] release semaphore (`<-db.readerSem`) at end of `ReadTx.Rollback()` after pool.Put
+- [x] handle `db.closing` — don't block forever on semaphore if DB is closing (use select with closing check)
+- [x] write test: `MaxReaders` concurrent BeginRead succeed; `MaxReaders+1` blocks until one Rollback
+- [x] write test: DB.Close unblocks waiting readers
+- [x] run tests — must pass before next task
 
 ### Task 11: Verify acceptance criteria
 - [ ] verify all 7 goals from Overview are implemented (slab cap, persistent cache, reader limit, slab allocator, bulk alloc, LRU fix, buffer recycling)

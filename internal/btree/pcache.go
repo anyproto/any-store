@@ -8,6 +8,7 @@ package btree
 // so no mutex is needed. This matches SQLite's per-connection page cache model.
 
 const defaultCacheSize = 5000
+const defaultMaxReaders = 4
 
 // pcache is the page cache.
 type pcache struct {

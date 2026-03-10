@@ -56,6 +56,10 @@ type Options struct {
 	// automatically (heap SHM, no fsync — both meaningless for in-memory).
 	// The path argument to Open is ignored and can be any string.
 	InMemory bool
+
+	// MaxReaders is the maximum number of concurrent read transactions per DB.
+	// Limits memory growth from persistent reader caches. Default: 4.
+	MaxReaders int
 }
 
 // DefaultOptions returns default database options.
@@ -103,6 +107,14 @@ type DB struct {
 	// Each reader gets a private cache to avoid per-page allocations.
 	readerCachePool sync.Pool
 	readerCacheSize int // max(CacheSize/10, 50)
+
+	// readerSem limits the number of concurrent read transactions.
+	// Buffered channel with capacity MaxReaders; BeginRead sends, Rollback receives.
+	readerSem chan struct{}
+	// closeCh is closed when the DB is shutting down, unblocking any
+	// goroutines waiting on readerSem in BeginRead.
+	closeCh   chan struct{}
+	closeOnce sync.Once // guards closing closeCh
 }
 
 // Open opens or creates a database at the given path.
@@ -177,6 +189,11 @@ func Open(path string, opts Options) (*DB, error) {
 		readerCacheSize = 50
 	}
 
+	maxReaders := opts.MaxReaders
+	if maxReaders <= 0 {
+		maxReaders = defaultMaxReaders
+	}
+
 	db := &DB{
 		pager: p,
 		path:  path,
@@ -186,6 +203,8 @@ func Open(path string, opts Options) (*DB, error) {
 			rootPage: 1,
 		},
 		readerCacheSize: readerCacheSize,
+		readerSem:       make(chan struct{}, maxReaders),
+		closeCh:         make(chan struct{}),
 	}
 
 	// Initialize local counters from the on-disk state (reading through WAL).
@@ -216,6 +235,7 @@ func (db *DB) Close() error {
 		return ErrClosed
 	}
 	db.closing.Store(true)
+	db.closeOnce.Do(func() { close(db.closeCh) })
 
 	if !db.writeMu.TryLock() {
 		// Writer holds writeMu. Force-rollback the abandoned/in-flight tx.
@@ -252,8 +272,10 @@ func (db *DB) Close() error {
 }
 
 // SetClosing marks the database as closing, causing new transactions to fail.
+// Also unblocks any goroutines waiting on the reader semaphore in BeginRead.
 func (db *DB) SetClosing() {
 	db.closing.Store(true)
+	db.closeOnce.Do(func() { close(db.closeCh) })
 }
 
 // Path returns the database file path.
@@ -266,15 +288,26 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 	if db.closing.Load() {
 		return nil, ErrClosed
 	}
+
+	// Acquire reader semaphore — limits concurrent read transactions.
+	// Uses closeCh to unblock if the DB is closing while we wait.
+	select {
+	case db.readerSem <- struct{}{}:
+	case <-db.closeCh:
+		return nil, ErrClosed
+	}
+
 	db.mu.RLock()
 	if db.closing.Load() {
 		db.mu.RUnlock()
+		<-db.readerSem
 		return nil, ErrClosed
 	}
 
 	maxFrame, slot, err := db.pager.beginRead()
 	if err != nil {
 		db.mu.RUnlock()
+		<-db.readerSem
 		return nil, err
 	}
 
@@ -283,6 +316,7 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 	if err != nil {
 		db.pager.endRead(slot)
 		db.mu.RUnlock()
+		<-db.readerSem
 		return nil, err
 	}
 
@@ -942,6 +976,9 @@ func (tx *ReadTx) Rollback() error {
 	tx.pager.endRead(tx.walSlot)
 	db := tx.db
 	db.mu.RUnlock()
+	// Release reader semaphore after all other cleanup so that a new
+	// BeginRead can proceed immediately.
+	<-db.readerSem
 	db.putReadTx(tx)
 	return nil
 }
