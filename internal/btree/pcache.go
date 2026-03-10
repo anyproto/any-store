@@ -159,6 +159,15 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	// Step 4: Evict clean pages if cache is full (skip for non-purgeable / InMemory caches).
 	// Adapted from SQLite pcache1.c:897-914 (step 4 — SQLite reuses victim's buffer).
 	//
+	// DRIFT from SQLite: SQLite's step 4 (pcache1.c:900) also evicts under global
+	// memory pressure via pcache1UnderMemoryPressure. This works in SQLite because
+	// the PGroup LRU spans ALL caches, so step 4 can steal pages from OTHER caches
+	// and reuse their buffers for the requesting cache (zero-alloc transfer). In our
+	// isolated model (no PGroup, drift #1), we can only evict from our own cache.
+	// Evicting our own page to allocate a new one is a net-zero for memory and wastes
+	// a cached page. Global pressure is handled by step 3 (admission control, readers)
+	// and release() immediate eviction instead.
+	//
 	// Reader caches (xStress == nil) return evicted buffers to the slab immediately
 	// because readers have no writePages map. Writer caches cannot do this because
 	// pager.writePages may still reference the evicted page struct after spill;

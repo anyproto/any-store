@@ -181,6 +181,71 @@ func TestPageSlab_InitIdempotent(t *testing.T) {
 	s.mu.Unlock()
 }
 
+func TestPageSlab_OverflowBuffersCapped(t *testing.T) {
+	var s pageSlab
+	defer s.Reset()
+	s.Init(4096, 5) // nSlab=5, nReserve=5/10+1=1
+
+	// Drain all slab buffers
+	slabBufs := make([][]byte, 5)
+	for i := range slabBufs {
+		slabBufs[i] = s.Get()
+	}
+
+	// Get 3 overflow buffers
+	overflowBufs := make([][]byte, 3)
+	for i := range overflowBufs {
+		overflowBufs[i] = s.Get()
+	}
+
+	s.mu.Lock()
+	if s.nOverflow != 3 {
+		t.Fatalf("nOverflow: got %d, want 3", s.nOverflow)
+	}
+	s.mu.Unlock()
+
+	// Return all 8 buffers (5 slab + 3 overflow)
+	for _, b := range slabBufs {
+		s.Put(b)
+	}
+	for _, b := range overflowBufs {
+		s.Put(b)
+	}
+
+	// Free list should be capped at nSlab=5 (overflow buffers discarded)
+	s.mu.Lock()
+	freeCount := len(s.freeList)
+	s.mu.Unlock()
+	if freeCount != 5 {
+		t.Fatalf("freeList should be capped at nSlab=5, got %d", freeCount)
+	}
+
+	// Pressure should be cleared (5 >= nReserve=1)
+	if s.UnderPressure() {
+		t.Fatal("should not be under pressure after returning slab buffers")
+	}
+}
+
+func TestPageSlab_PutNilIsNoOp(t *testing.T) {
+	var s pageSlab
+	defer s.Reset()
+	s.Init(4096, 5)
+
+	s.mu.Lock()
+	before := len(s.freeList)
+	s.mu.Unlock()
+
+	s.Put(nil) // should be a no-op
+
+	s.mu.Lock()
+	after := len(s.freeList)
+	s.mu.Unlock()
+
+	if before != after {
+		t.Fatalf("Put(nil) changed freeList length: before=%d, after=%d", before, after)
+	}
+}
+
 func TestPageSlab_PressureEdgeCases(t *testing.T) {
 	// Test with nPages=1 => nReserve = 1/10 + 1 = 1
 	var s pageSlab

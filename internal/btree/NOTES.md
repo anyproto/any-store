@@ -516,7 +516,7 @@ drawn from the global slab that enforces a process-wide soft cap.
 | Page struct | Two structs: `PgHdr` (generic) + `PgHdr1` (pcache1-specific) | Single `page` struct (drift #5) |
 | Spill victim search | `pSynced` + `pDirtyTail` two-pass (prefers non-`NEED_SYNC`) | `dirtyTail` single-pass; no `pSynced` in WAL-only (drift #19) |
 | Slab allocator | Contiguous `void*` buffer, pointer arithmetic (`pcache1.c:283-288`) | `[][]byte` slice, Go-idiomatic (drift #7) |
-| Slab buffer return | Range check `SQLITE_WITHIN` (`pcache1.c:381`) | Accepts all buffers (drift #8) |
+| Slab buffer return | Range check `SQLITE_WITHIN` (`pcache1.c:381`) | Caps free list at `nSlab`; overflow buffers are GC'd (drift #8) |
 | Slab init | Library init `pcache1Init` (`pcache1.c:695-741`) | Lazy init on first `Open()` or explicit `ConfigPageCache()` (drift #9) |
 | Bulk alloc | Contiguous `pBulk` carved into slots (`pcache1.c:312-327`) | Individual page structs with slab buffers (drift #10) |
 | Page flags | Bitmask on each page | Separate maps (`dontWritePages`, `hasContent`) |

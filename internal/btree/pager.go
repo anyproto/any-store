@@ -1372,8 +1372,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	// These pages were removed from writerCache.pages by evictOne() but still
 	// referenced by writePages. discard()/clear()/truncate() only handle pages
 	// in writerCache.pages, so evicted page buffers must be returned here.
-	// Pages still in cache have data==nil (set by makeClean->clear path) or
-	// are still tracked in writerCache.pages — we skip those.
+	// Pages still in cache are tracked by writerCache.pages — we skip those.
 	if slabOk := globalPageSlab.Initialized(p.writerCache.pageSize); slabOk {
 		for _, pg := range p.writePages {
 			if pg != nil && pg.data != nil && p.writerCache.pages[pg.pgno] != pg {

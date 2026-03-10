@@ -13,7 +13,7 @@ package btree
 //
 // Drift from SQLite:
 //   - Uses [][]byte slice, not contiguous void* buffer (drift #7)
-//   - Accepts all buffers back, no SQLITE_WITHIN range check (drift #8)
+//   - Caps free list at nSlab; overflow buffers are GC'd (drift #8)
 //   - Lazy init, not library init (drift #9)
 
 import (
@@ -98,9 +98,23 @@ func (s *pageSlab) Get() []byte {
 
 // Put returns a buffer to the slab's free list.
 // Matches pcache1Free (pcache1.c:379-406).
+//
+// Like SQLite's SQLITE_WITHIN check (pcache1.c:381), only slab-origin buffers
+// are retained. Overflow buffers (heap-allocated when slab is exhausted) are
+// discarded so the GC can collect them. This prevents unbounded free list
+// growth and keeps underPressure semantics accurate: the flag only clears
+// when actual slab buffers are returned, not when overflow buffers inflate
+// the list.
 func (s *pageSlab) Put(buf []byte) {
+	if buf == nil {
+		return
+	}
 	s.mu.Lock()
-	s.freeList = append(s.freeList, buf)
+	// Cap the free list at the original slab size. Buffers beyond nSlab are
+	// overflow allocations — let them be GC'd instead of hoarding.
+	if len(s.freeList) < s.nSlab {
+		s.freeList = append(s.freeList, buf)
+	}
 	// Update pressure: pcache1.c:389 — clear if freeList refills above reserve
 	if len(s.freeList) >= s.nReserve {
 		s.underPressure.Store(false)
