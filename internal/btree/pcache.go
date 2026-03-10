@@ -1,11 +1,21 @@
 package btree
 
-// pcache implements a simple page cache with LRU eviction, modeled after
-// SQLite's pcache1.c. It maps page numbers to in-memory page objects and
-// manages dirty page tracking.
+// pcache implements a page cache with LRU eviction, modeled after SQLite's
+// pcache1.c. It maps page numbers to in-memory page objects and manages
+// dirty page tracking, admission control, and buffer recycling through the
+// global slab allocator (page_slab.go).
 //
 // Each pcache instance is owned by a single goroutine (writer or reader),
 // so no mutex is needed. This matches SQLite's per-connection page cache model.
+//
+// Drifts from SQLite (see NOTES.md section 9 for full table):
+//   - No PGroup: no cross-cache page stealing; each cache isolated (drift #1)
+//   - No hash table: Go map[uint32]*page instead of apHash[] (drift #2)
+//   - No circular LRU: doubly-linked list with head/tail pointers (drift #3)
+//   - No PgHdr/PgHdr1 split: single page struct (drift #5)
+//   - No pcache2 plugin interface: direct implementation (drift #6)
+//   - createFlag=0 dropped: fetch() handles lookup-only (drift #13)
+//   - Max page check per-cache + global slab pressure (drift #14)
 
 const defaultCacheSize = 5000
 const defaultMaxReaders = 4

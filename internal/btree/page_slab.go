@@ -134,7 +134,15 @@ func (s *pageSlab) Reset() {
 // ConfigPageCache initializes the global page slab with the given page size
 // and number of pages. This mirrors sqlite3_config(SQLITE_CONFIG_PAGECACHE).
 // Must be called before opening any databases, or the slab will be lazily
-// initialized with defaults on the first Open() call.
+// initialized with defaults (2000 pages) on the first Open() call.
+//
+// The slab provides a soft cap on total page cache memory across all open
+// databases: nPages * pageSize bytes of pre-allocated buffers. When the slab
+// is exhausted, overflow allocations use make() but the UnderPressure flag
+// triggers admission control (readers get nil from soft creates) and
+// immediate eviction on unpin (see pcache.release and pcache.create).
+//
+// Example: ConfigPageCache(4096, 5000) pre-allocates ~20MB of page buffers.
 func ConfigPageCache(pageSize, nPages int) {
 	globalPageSlab.Init(pageSize, nPages)
 }

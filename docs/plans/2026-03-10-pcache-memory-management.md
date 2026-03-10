@@ -184,9 +184,9 @@ No SQLite equivalent — our addition for memory management with many open DBs.
 - [x] verify test coverage for new code (pcache.go, page_slab.go, db.go changes)
 
 ### Task 12: [Final] Update documentation
-- [ ] update `docs/NOTES.md` or relevant docs with pcache memory management design
-- [ ] document `ConfigPageCache()` API and `MaxReaders` option
-- [ ] document allowed drifts from SQLite in code comments
+- [x] update `docs/NOTES.md` or relevant docs with pcache memory management design
+- [x] document `ConfigPageCache()` API and `MaxReaders` option
+- [x] document allowed drifts from SQLite in code comments
 
 ## Technical Details
 

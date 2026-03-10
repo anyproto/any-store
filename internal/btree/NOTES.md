@@ -441,7 +441,7 @@ sub-journaling for savepoints.
 
 ---
 
-## 9. Page Cache
+## 9. Page Cache and Memory Management
 
 ### SQLite (pcache.c / pcache1.c)
 
@@ -449,36 +449,90 @@ sub-journaling for savepoints.
 - LRU eviction with configurable maximum cache size
 - Reference counting with pinning
 - `purgeable` flag to disable eviction
-- Page recycling via free-list within fixed-size page groups
-- Global mutex for multi-threaded access
-- Separate dirty/clean lists
+- Global slab allocator (`pcache1_g`) pre-allocates page buffers at init time
+  (`sqlite3PCacheBufferSetup`, `pcache1.c:271-291`)
+- Per-cache bulk allocation (`pFree` list, `pcache1InitBulk`, `pcache1.c:297-330`)
+- `underPressure` flag when slab free list drops below reserve (`pcache1.c:350,389`)
+- Admission control via `createFlag` (0=lookup, 1=soft, 2=hard; `pcache1.c:881-892`)
+- `nRecyclable` count of unpinned clean pages in LRU (`pcache1.c:197`)
+- Immediate eviction on unpin when overfull (`pcache1Unpin`, `pcache1.c:1094-1095`)
+- LRU insert at HEAD (MRU), evict from TAIL (LRU) (`pcache1.c:1098-1101`, `623-624`)
+- Dirty page move-to-front on unpin (`pcache.c:558`, `PCACHE_DIRTYLIST_FRONT`)
+- Persistent cache across transactions (`pagerBeginReadTransaction`, `pager.c:3246-3267`)
 - `PGHDR_DONT_WRITE`, `PGHDR_NEED_SYNC`, `PGHDR_MMAP`, `PGHDR_WAL_APPEND` flags
 - Supports shared cache mode (multiple connections sharing one BtShared)
 
-### Go (pcache.go)
+### Go (pcache.go, page_slab.go, db.go)
 
 - Single-layer design, no mutex (each cache is single-goroutine owned)
-- Per-connection caches matching SQLite's model: writer has `writerCache`,
-  each reader gets a private cache from a `sync.Pool`
-- LRU eviction using doubly-linked list (head = oldest = evict first)
+- Per-connection caches: writer has `writerCache`, each reader gets a private
+  cache from `sync.Pool` (`readerCachePool`)
+- **Global slab allocator** (`page_slab.go`): process-global `pageSlab` singleton
+  pre-allocates `[]byte` page buffers. `Get()` pops from free list, falls back to
+  `make()` overflow. `Put()` returns buffers. `UnderPressure()` atomic flag when
+  free list drops below `nReserve` (10% + 1 of slab size)
+- **Per-cache bulk allocation** (`pcache.initBulk`): first `create()` call
+  pre-allocates up to 100 page structs with data buffers from the global slab
+- **LRU**: insert at HEAD (`lruPrepend`), evict from TAIL (`evictOne`). Correct
+  LRU semantics — most recently released at head, least recently used at tail
+- **Dirty list move-to-front**: `dirtyMoveToFront()` on unpin ensures recently
+  released dirty pages are preserved while stale ones are spilled
+- **Admission control**: `create(pgno, createFlag)` — soft creates (readers,
+  `createFlag=1`) return nil when 90% of cache is pinned or when slab is under
+  pressure with low recyclable ratio. Hard creates (writers, `createFlag=2`)
+  always proceed
+- **`nRecyclable`**: count of unpinned clean pages in LRU, incremented in
+  `lruPrepend`, decremented in `lruRemove`/`evictOne`
+- **Immediate eviction on unpin**: when cache is overfull and slab is under
+  pressure, clean pages are evicted on `release()` instead of entering LRU
+- **Buffer lifecycle**: `clear()`, `discard()`, `truncate()` return data buffers
+  to the global slab. `pFree` buffers also returned to slab on `clear()`
+- **Persistent reader cache**: reader caches are returned to `readerCachePool`
+  on `Rollback()` with pages intact. On next `BeginRead()`, cache is cleared
+  only if `dataVersion` or `walMaxFrame` changed (dual-check to avoid ABA from
+  checkpoint restart and TOCTOU race)
+- **Max concurrent readers**: `readerSem` channel with capacity `MaxReaders`
+  (default 4) limits concurrent read transactions per DB. Bounds memory from
+  persistent reader caches. `closeCh` unblocks waiters on DB close
 - Pin counting (similar to SQLite's reference counting)
 - `purgeable` flag matching SQLite's `pcache1.bPurgeable`
-- Separate dirty list (singly-linked via `next`/`prev`)
 - `page.cache` backpointer for routing releases to the correct cache
+- `ConfigPageCache(pageSize, nPages)` public API to pre-initialize the global
+  slab (mirrors `sqlite3_config(SQLITE_CONFIG_PAGECACHE)`)
+
+### Memory Bound
+
+Per-DB reader cache memory: `MaxReaders × readerCacheSize × pageSize`.
+Example: 4 readers × 50 pages × 4096 bytes = 800KB per DB.
+With 200 open DBs: 200 × 800KB = ~156MB reader cache total.
+Writer caches (1 per DB): bounded by `CacheSize × pageSize` per DB, with buffers
+drawn from the global slab that enforces a process-wide soft cap.
 
 ### Drift
 
 | Aspect | SQLite | Go |
 |--------|--------|-----|
-| Architecture | Two-layer (pluggable) | Single-layer |
+| Architecture | Two-layer (pluggable pcache2 interface) | Single-layer (no vtable) |
+| Slab allocator | Contiguous `void*` buffer, pointer arithmetic (`pcache1.c:283-288`) | `[][]byte` slice, Go-idiomatic (drift #7) |
+| Slab buffer return | Range check `SQLITE_WITHIN` (`pcache1.c:381`) | Accepts all buffers (drift #8) |
+| Slab init | Library init `pcache1Init` (`pcache1.c:695-741`) | Lazy init on first `Open()` or explicit `ConfigPageCache()` (drift #9) |
+| Bulk alloc | Contiguous `pBulk` carved into slots (`pcache1.c:312-327`) | Individual page structs with slab buffers (drift #10) |
 | Page flags | Bitmask on each page | Separate maps (`dontWritePages`, `hasContent`) |
 | Cache ownership | Per-connection (private) | Per-connection (private) — matches SQLite |
-| Page groups | Fixed-size groups with internal free-list | Individual `make([]byte, pageSize)` |
 | Thread safety | Per-connection (no mutex needed) | Per-connection (no mutex needed) — matches SQLite |
+| PGroup cross-cache stealing | Enabled in single-thread mode (`pcache1.c:718-719`) | No PGroup; each cache isolated (drift #1) |
+| Hash table | `apHash[]` with chaining (`pcache1.c:199-200`) | Go `map[uint32]*page` (drift #2) |
+| LRU structure | Circular list with anchor node (`pcache1.c:112-115`) | Doubly-linked list with head/tail pointers (drift #3) |
+| `createFlag=0` | Lookup only, no create | Dropped; `fetch()` handles lookup-only (drift #13) |
+| Max page check | PGroup-level (`pcache1.c:1094`) | Per-cache + global slab pressure (drift #14) |
+| Persistent cache staleness | File change counter read from DB file (`pager.c:5410-5418`) | `dataVersion` counter + `walMaxFrame` dual check (drift #11) |
+| Max concurrent readers | N/A | `readerSem` channel (Go-specific addition) |
+| pcache struct recycling | `malloc`/`free` | `sync.Pool` (drift #12) |
 
-**Classification: Structural** -- The Go pcache is simpler (no pluggable backend) but
-matches SQLite's per-connection ownership model. No mutex needed since each cache is
-accessed by a single goroutine.
+**Classification: Structural** -- The Go pcache now closely mirrors SQLite's pcache1.c
+memory management model (slab allocator, bulk alloc, LRU ordering, admission control,
+buffer recycling) while keeping Go-idiomatic data structures. The persistent reader
+cache and max-readers limiter are additions for the many-open-databases scenario.
 
 ---
 
@@ -964,7 +1018,7 @@ guarantee.
 | 6. Schema format | Intentional | Low | Format 5 is Go-specific |
 | 7. WAL | Intentional + Divergent | Medium | Different magic/version; Go map for lookups |
 | 8. Pager | Structural | High | WAL-only; no rollback journal; simplified states |
-| 9. Page cache | Structural | Medium | Simpler; adds MVCC features |
+| 9. Page cache | Structural | Low | Slab allocator, bulk alloc, LRU, admission control, persistent cache, reader limiter |
 | 10. Freelist | Intentional | None | Same format; different tracking structures |
 | 11. Overflow chains | Divergent | Medium | MVCC-aware reads; no overflow cache |
 | 12. MVCC | Divergent | High | Explicit uncached reads for goroutine safety |
@@ -1113,6 +1167,68 @@ integrity validation.
 
 `tryCheckpoint()` errors are discarded. Acceptable for PASSIVE-like semantics
 but inconsistent with FULL checkpoint behavior.
+
+### Page Cache Memory Management (page_slab.go, pcache.go, db.go)
+
+**Global Slab Allocator** -- Severity: N/A (implemented)
+
+Process-global `pageSlab` singleton pre-allocates `[]byte` page buffers at init.
+Configured via `ConfigPageCache(pageSize, nPages)` before opening any databases,
+or lazily initialized with defaults (2000 buffers) on first `Open()` call.
+Matches SQLite's `sqlite3_config(SQLITE_CONFIG_PAGECACHE)` /
+`sqlite3PCacheBufferSetup` (`pcache1.c:271-291`).
+
+Key components:
+- `pageSlab.Get()`: pops from free list; falls back to `make()` overflow
+- `pageSlab.Put()`: returns buffer to free list
+- `pageSlab.UnderPressure()`: atomic bool, true when `len(freeList) < nReserve`
+  (`nReserve = nPages/10 + 1`, matching `pcache1.c:279`)
+- All page buffer allocations (pcache create, bulk alloc, temp pages) go through
+  the slab; all deallocations (clear, discard, truncate, recycle temp page)
+  return buffers to the slab
+
+**Per-Cache Bulk Allocation** -- Severity: N/A (implemented)
+
+`pcache.initBulk()` pre-allocates up to 100 page structs with data buffers from
+the global slab on first `create()` call. Subsequent creates pop from the `pFree`
+list without touching the slab. Matches SQLite `pcache1InitBulk`
+(`pcache1.c:297-330`).
+
+**Admission Control (createFlag)** -- Severity: N/A (implemented)
+
+`pcache.create(pgno, createFlag)` with createFlag 1 (soft, readers) or 2 (hard,
+writers). Soft creates return nil when:
+- 90% of `maxPages` are pinned (thrashing), or
+- Global slab is under pressure AND `nRecyclable < nPinned` (low recycling ratio)
+
+Readers fall back to uncached `readTempPage()` when soft create returns nil.
+Matches SQLite `pcache1.c:881-892` (step 3 guards).
+
+**Persistent Reader Cache** -- Severity: N/A (implemented)
+
+Reader caches are returned to `readerCachePool` on `Rollback()` with pages
+intact. On next `BeginRead()`, the cache is cleared only if:
+- `dataVersion` differs (monotonic counter incremented on every write commit), OR
+- `walMaxFrame` differs
+
+The dual check avoids two failure modes: `walMaxFrame` alone suffers ABA after
+checkpoint restart; `dataVersion` alone has a TOCTOU race (WAL mxFrame updated
+before dataVersion increment). Matches SQLite `pager.c:3246-3267`
+(`pagerBeginReadTransaction` — `pager_reset` only if change-counter changed).
+
+**Max Concurrent Readers** -- Severity: N/A (implemented)
+
+`Options.MaxReaders` (default 4) configures a buffered channel semaphore
+(`readerSem`) that limits concurrent read transactions per DB. Bounds total
+memory from persistent reader caches. `closeCh` channel unblocks goroutines
+waiting on the semaphore when `DB.Close()` or `DB.SetClosing()` is called.
+No SQLite equivalent — our addition for the many-open-databases scenario.
+
+**Future Improvements:**
+- Shrink API (`sqlite3PcacheShrink` equivalent) for external memory pressure
+- `pSynced` optimization pointer in dirty list for faster spill victim search
+  (matches `pcache.c:463-467`)
+- Slab telemetry: expose nTotal, nOverflow, underPressure via metrics
 
 ### B-tree Operations
 
