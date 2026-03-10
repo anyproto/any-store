@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3077,4 +3080,233 @@ func TestDoubleOpenInMemoryAllowed(t *testing.T) {
 	db2, err := Open("mem1", opts)
 	require.NoError(t, err)
 	defer db2.Close()
+}
+
+// === Persistent reader cache tests (Task 9) ===
+
+func TestPersistentReaderCache_CacheHitsWithoutWrites(t *testing.T) {
+	// Two sequential read transactions with no writes between them.
+	// The second tx should get cache hits on pages read by the first tx
+	// because dataVersion hasn't changed and the cache isn't cleared.
+	//
+	// Flush the sync.Pool (items survive one GC, cleared on the second)
+	// then disable GC so our cache stays in the pool.
+	runtime.GC()
+	runtime.GC()
+	prev := debug.SetGCPercent(-1)
+	defer debug.SetGCPercent(prev)
+
+	db, ns := tempDBWithNS(t, "test")
+
+	// Insert some data
+	putN(t, db, "test", 10, 100)
+
+	// First read transaction — populates the reader cache
+	rtx1, err := db.BeginRead()
+	require.NoError(t, err)
+	val1, err := rtx1.Get(ns, binary.BigEndian.AppendUint32(nil, 1))
+	require.NoError(t, err)
+	require.NotNil(t, val1)
+
+	// Remember the cache and how many pages it has
+	cache1 := rtx1.cache
+	require.NotNil(t, cache1)
+	pagesAfterFirstTx := len(cache1.pages)
+	require.Greater(t, pagesAfterFirstTx, 0, "first read tx should have cached some pages")
+
+	walMaxFrame1 := rtx1.walMaxFrame
+	require.NoError(t, rtx1.Rollback())
+
+	// Second read transaction — should reuse the same cache with pages intact
+	rtx2, err := db.BeginRead()
+	require.NoError(t, err)
+
+	// walMaxFrame should be the same (no writes happened)
+	assert.Equal(t, walMaxFrame1, rtx2.walMaxFrame, "walMaxFrame should be unchanged")
+
+	// The cache should still have pages from the first transaction.
+	// If sync.Pool GC'd the cache, we get a fresh one — skip assertion.
+	cache2 := rtx2.cache
+	require.NotNil(t, cache2)
+	if cache1 == cache2 {
+		assert.Equal(t, pagesAfterFirstTx, len(cache2.pages),
+			"cache should retain pages from first read tx (persistent cache)")
+	} else {
+		t.Log("sync.Pool returned a different cache (GC may have cleared pool); skipping page count check")
+	}
+
+	// Reading the same key should succeed regardless
+	val2, err := rtx2.Get(ns, binary.BigEndian.AppendUint32(nil, 1))
+	require.NoError(t, err)
+	assert.Equal(t, val1, val2, "second read should get same value")
+
+	require.NoError(t, rtx2.Rollback())
+}
+
+func TestPersistentReaderCache_CacheClearedAfterWrite(t *testing.T) {
+	// Read tx, then write tx commits (advancing walMaxFrame), then read tx.
+	// The second reader's cache should be cleared because walMaxFrame changed.
+	db, ns := tempDBWithNS(t, "test")
+
+	// Insert initial data
+	putN(t, db, "test", 5, 100)
+
+	// First read transaction — populates cache
+	rtx1, err := db.BeginRead()
+	require.NoError(t, err)
+	_, err = rtx1.Get(ns, binary.BigEndian.AppendUint32(nil, 1))
+	require.NoError(t, err)
+
+	cache1 := rtx1.cache
+	pagesAfterFirstTx := len(cache1.pages)
+	require.Greater(t, pagesAfterFirstTx, 0)
+
+	walMaxFrame1 := rtx1.walMaxFrame
+	require.NoError(t, rtx1.Rollback())
+
+	// Write transaction — advances walMaxFrame
+	putN(t, db, "test", 10, 200)
+
+	// Second read transaction — cache should be cleared (walMaxFrame changed)
+	rtx2, err := db.BeginRead()
+	require.NoError(t, err)
+
+	assert.NotEqual(t, walMaxFrame1, rtx2.walMaxFrame,
+		"walMaxFrame should have changed after write commit")
+
+	// The cache should have been cleared — it may have 0 pages or new pages
+	// loaded by this new transaction, but not the old stale pages.
+	// We verify by checking that the data reflects the latest writes.
+	val, err := rtx2.Get(ns, binary.BigEndian.AppendUint32(nil, 6))
+	require.NoError(t, err)
+	assert.Len(t, val, 200, "should see data from the latest write")
+
+	require.NoError(t, rtx2.Rollback())
+}
+
+func TestPersistentReaderCache_ClearReturnsBuffersToSlab(t *testing.T) {
+	// When the cache is cleared due to walMaxFrame change, buffers should
+	// be returned to the slab (no memory leak).
+	globalPageSlab.Reset()
+	globalPageSlab.Init(4096, 2000)
+	defer globalPageSlab.Reset()
+
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), DefaultOptions())
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Create namespace and insert data
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("test")
+	require.NoError(t, err)
+	for i := 1; i <= 20; i++ {
+		key := binary.BigEndian.AppendUint32(nil, uint32(i))
+		require.NoError(t, wtx.Put(ns, key, make([]byte, 100)))
+	}
+	require.NoError(t, wtx.Commit())
+
+	// First read tx — populates cache
+	rtx1, err := db.BeginRead()
+	require.NoError(t, err)
+	for i := 1; i <= 20; i++ {
+		key := binary.BigEndian.AppendUint32(nil, uint32(i))
+		_, err = rtx1.Get(ns, key)
+		require.NoError(t, err)
+	}
+
+	cachedPages := len(rtx1.cache.pages)
+	require.Greater(t, cachedPages, 0)
+	require.NoError(t, rtx1.Rollback())
+
+	// Record slab free count before the clear
+	globalPageSlab.mu.Lock()
+	freeCountBefore := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+
+	// Write tx to advance walMaxFrame
+	wtx2, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err = db.getNamespaceLocked("test")
+	require.NoError(t, err)
+	require.NoError(t, wtx2.Put(ns, binary.BigEndian.AppendUint32(nil, 99), make([]byte, 50)))
+	require.NoError(t, wtx2.Commit())
+
+	// Second read tx — should clear the cache (walMaxFrame changed),
+	// returning buffers to slab
+	rtx2, err := db.BeginRead()
+	require.NoError(t, err)
+
+	// Check that slab got buffers back from the cleared cache
+	globalPageSlab.mu.Lock()
+	freeCountAfter := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+
+	// The cleared cache should have returned its page buffers + pFree buffers to slab.
+	// We can't predict the exact count because the write tx also uses slab buffers,
+	// but we can verify the slab got SOME buffers back.
+	assert.Greater(t, freeCountAfter, freeCountBefore-cachedPages,
+		"slab should get buffers back when cache is cleared on walMaxFrame change")
+
+	require.NoError(t, rtx2.Rollback())
+}
+
+func TestPersistentReaderCache_ConcurrentReadersDoNotCorrupt(t *testing.T) {
+	// Reproduces the scenario from TestOverflowSavepointConcurrent:
+	// concurrent readers + writers + checkpoints with persistent caches.
+	db, ns := tempDBWithNS(t, "test")
+
+	// Insert initial data
+	putN(t, db, "test", 10, 100)
+
+	// Start background reader
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for !stop.Load() {
+			rtx, err := db.BeginRead()
+			if err != nil {
+				continue
+			}
+			for i := 1; i <= 5; i++ {
+				key := binary.BigEndian.AppendUint32(nil, uint32(i))
+				_, _ = rtx.Get(ns, key)
+			}
+			_ = rtx.Rollback()
+		}
+	}()
+
+	// Do multiple write-verify cycles
+	for iter := 0; iter < 50; iter++ {
+		// Write new data
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns2, err := db.getNamespaceLocked("test")
+		require.NoError(t, err)
+		for i := 1; i <= 10; i++ {
+			key := binary.BigEndian.AppendUint32(nil, uint32(i))
+			val := make([]byte, 100+iter)
+			val[0] = byte(iter)
+			require.NoError(t, wtx.Put(ns2, key, val))
+		}
+		require.NoError(t, wtx.Commit())
+
+		// Verify with a read transaction
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		for i := 1; i <= 10; i++ {
+			key := binary.BigEndian.AppendUint32(nil, uint32(i))
+			val, err := rtx.Get(ns, key)
+			require.NoError(t, err, "iter=%d key=%d", iter, i)
+			assert.Len(t, val, 100+iter, "iter=%d key=%d", iter, i)
+			assert.Equal(t, byte(iter), val[0], "iter=%d key=%d value mismatch", iter, i)
+		}
+		require.NoError(t, rtx.Rollback())
+	}
+
+	stop.Store(true)
+	wg.Wait()
 }

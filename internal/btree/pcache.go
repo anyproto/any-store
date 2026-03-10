@@ -29,6 +29,22 @@ type pcache struct {
 	dirtyHead *page
 	nDirty    int
 
+	// dataVersion and walMaxFrame together identify the DB snapshot for which
+	// this cache's pages are valid. On reuse from the pool, if EITHER value
+	// differs from the current transaction, the cache is cleared.
+	//
+	// walMaxFrame alone is insufficient because it can wrap after checkpoint
+	// restart (ABA problem). dataVersion alone is insufficient because of a
+	// TOCTOU race: the WAL mxFrame is updated inside pager.commit() but
+	// dataVersion is incremented afterward. A reader starting between these
+	// two points would see the new walMaxFrame but old dataVersion, matching
+	// a stale cache. Checking both eliminates both failure modes.
+	//
+	// Matches SQLite pager.c:3246-3267 (pagerBeginReadTransaction — pager_reset
+	// only if change-counter changed) and pPager->iDataVersion (pager.c:1776).
+	dataVersion  uint64
+	walMaxFrame  uint32
+
 	// pFree is a per-cache bulk pre-allocated list of page structs.
 	// On first use, initBulk() allocates up to 100 page structs with data
 	// buffers drawn from the global slab. Matches SQLite pcache1.c:201 (pFree),

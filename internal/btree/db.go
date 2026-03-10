@@ -89,6 +89,13 @@ type DB struct {
 	localFileChangeCounter atomic.Uint32
 	localSchemaCookie      atomic.Uint32
 
+	// dataVersion is a monotonically increasing counter incremented on every
+	// write commit. Used by persistent reader caches to detect staleness:
+	// when a cache's dataVersion differs from the current DB value, the cache
+	// is cleared. Unlike walMaxFrame, this counter never wraps around after
+	// checkpoint restart. Matches SQLite's pPager->iDataVersion (pager.c:1776).
+	dataVersion atomic.Uint64
+
 	readTxPool  sync.Pool
 	writeTxPool sync.Pool
 
@@ -280,11 +287,24 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 	}
 
 	// Allocate reader cache from pool for per-connection page caching.
+	// Persistent cache: keep cached pages only if the DB snapshot hasn't
+	// changed. We check dataVersion (monotonic, never wraps) to detect
+	// writes. walMaxFrame alone suffers ABA after checkpoint restart.
+	// Matches SQLite pager.c:3246-3267 (pagerBeginReadTransaction —
+	// pager_reset only if change-counter changed).
+	curDV := db.dataVersion.Load()
 	var cache *pcache
 	if c, ok := db.readerCachePool.Get().(*pcache); ok {
 		cache = c
+		if cache.dataVersion != curDV || cache.walMaxFrame != maxFrame {
+			cache.clear()
+			cache.dataVersion = curDV
+			cache.walMaxFrame = maxFrame
+		}
 	} else {
 		cache = newPcache(int(db.pager.pageSize), db.readerCacheSize, true)
+		cache.dataVersion = curDV
+		cache.walMaxFrame = maxFrame
 	}
 
 	tx := db.getReadTx()
@@ -910,9 +930,12 @@ func (tx *ReadTx) Rollback() error {
 		return ErrTxClosed
 	}
 	tx.closed = true
-	// Clear and recycle the reader cache back to the pool.
+	// Return the reader cache to the pool for reuse. Pages are kept intact
+	// (persistent cache): the next BeginRead() will check dataVersion and
+	// clear the cache only if a write committed since this transaction.
+	// Matches SQLite pager.c:3246-3267 — cache is cleared only when the
+	// change-counter (our dataVersion) differs.
 	if tx.cache != nil {
-		tx.cache.clear()
 		tx.db.readerCachePool.Put(tx.cache)
 		tx.cache = nil
 	}
@@ -983,6 +1006,9 @@ func (tx *WriteTx) Commit() error {
 	if err == nil {
 		tx.db.localFileChangeCounter.Store(newFCC)
 		tx.db.localSchemaCookie.Store(newSC)
+		// Increment dataVersion so persistent reader caches detect staleness.
+		// Unlike walMaxFrame, this counter never wraps after checkpoint restart.
+		tx.db.dataVersion.Add(1)
 	}
 	threshold := tx.db.opts.AutoCheckpointAfter
 	needCheckpoint := threshold > 0 && int(nFrame) >= threshold

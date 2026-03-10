@@ -153,14 +153,14 @@ SQLite ref: `pcache1.c:1094-1095` (pcache1Unpin — `reuseUnlikely || nPurgeable
 ### Task 9: Persistent reader cache across transactions
 **Depends on: Task 5 (clear returns buffers to slab). Keep reader cache pages between transactions; nuke only when walMaxFrame changes.**
 SQLite ref: `pager.c:3246-3267` (pagerBeginReadTransaction — `pager_reset` only if changed), `pager.c:3261` (`if( rc!=SQLITE_OK || changed ){ pager_reset(pPager); }`), `pager.c:1772-1776` (pager_reset clears cache + increments iDataVersion), `wal.c:2610-2611` (walIndexTryHdr sets `*pChanged = 1` via memcmp of WalIndexHdr).
-- [ ] add `walMaxFrame uint32` field to pcache struct in `pcache.go`
-- [ ] modify `BeginRead()` in `db.go:255-299`: after getting cache from pool, compare `cache.walMaxFrame` with new `maxFrame`; if different → `cache.clear()` (returns buffers to slab); if same → keep pages; set `cache.walMaxFrame = maxFrame`
-- [ ] modify `ReadTx.Rollback()` in `db.go:905-921`: remove `tx.cache.clear()` call; just `db.readerCachePool.Put(tx.cache)` (cache may be reused with pages intact)
-- [ ] note: no cross-goroutine notification needed — when a write tx commits, walMaxFrame advances; reader caches taken from the pool after this point will see the new walMaxFrame and clear themselves automatically
-- [ ] write test: two sequential read transactions with no writes between — second tx gets cache hits on pages read by first tx
-- [ ] write test: read tx, then write tx commits, then read tx — second reader's cache is cleared (walMaxFrame changed)
-- [ ] write test: verify cleared cache returns buffers to slab (no memory leak)
-- [ ] run tests — must pass before next task
+- [x] add `walMaxFrame uint32` field to pcache struct in `pcache.go`
+- [x] modify `BeginRead()` in `db.go:255-299`: after getting cache from pool, compare `cache.walMaxFrame` with new `maxFrame`; if different → `cache.clear()` (returns buffers to slab); if same → keep pages; set `cache.walMaxFrame = maxFrame`
+- [x] modify `ReadTx.Rollback()` in `db.go:905-921`: remove `tx.cache.clear()` call; just `db.readerCachePool.Put(tx.cache)` (cache may be reused with pages intact)
+- [x] note: no cross-goroutine notification needed — when a write tx commits, walMaxFrame advances; reader caches taken from the pool after this point will see the new walMaxFrame and clear themselves automatically
+- [x] write test: two sequential read transactions with no writes between — second tx gets cache hits on pages read by first tx
+- [x] write test: read tx, then write tx commits, then read tx — second reader's cache is cleared (walMaxFrame changed)
+- [x] write test: verify cleared cache returns buffers to slab (no memory leak)
+- [x] run tests — must pass before next task
 
 ### Task 10: Max concurrent readers limiter
 **Depends on: Task 9 (persistent cache). Configurable semaphore to bound the number of concurrent read transactions per DB.**
