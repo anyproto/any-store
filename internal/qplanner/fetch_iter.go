@@ -2,6 +2,7 @@ package qplanner
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/anyproto/any-store/internal/btree"
 	"github.com/anyproto/any-store/syncpool"
@@ -11,36 +12,61 @@ import (
 // and performs point-lookups in the data namespace to fetch full documents.
 // It parses and caches the result in Plan.DocParsed to avoid double-fetch/double-parse.
 type FetchIter struct {
-	Source     Iterator
-	Data       *CursorSource
-	Buf        *syncpool.DocBuffer
-	Plan       *Plan // set by BuildPlan for doc value caching
-	dataCursor *btree.Cursor
+	Source Iterator
+	Data   *CursorSource
+	Buf    *syncpool.DocBuffer
+	Plan   *Plan // set by BuildPlan for doc value caching
 }
 
 func (it *FetchIter) Next() (key []byte, docId []byte, err error) {
-	if it.dataCursor == nil {
-		it.dataCursor = it.Data.NewCursor()
+	perf := perfCountersEnabled()
+	var start time.Time
+	if perf {
+		start = time.Now()
+		qpPerf.fetchNextCalls.Add(1)
 	}
+	defer func() {
+		if perf {
+			qpPerf.fetchNextNs.Add(uint64(time.Since(start).Nanoseconds()))
+			if docId != nil {
+				qpPerf.fetchYields.Add(1)
+			}
+		}
+	}()
+
 	for {
 		key, docId, err = it.Source.Next()
 		if err != nil || docId == nil {
 			return nil, nil, err
 		}
 
-		if serr := it.dataCursor.SeekExact(docId); serr != nil {
-			// doc may have been deleted from data but still in index; skip
-			continue
+		// Cursor-free point lookup: avoids Cursor struct allocation and stack growth.
+		var lookupStart time.Time
+		if perf {
+			lookupStart = time.Now()
 		}
-		val, verr := it.dataCursor.Value()
-		if verr != nil {
-			return nil, nil, verr
+		it.Buf.DocBuf, err = it.Data.AppendValue(docId, it.Buf.DocBuf[:0])
+		if perf {
+			qpPerf.fetchLookupNs.Add(uint64(time.Since(lookupStart).Nanoseconds()))
 		}
-		it.Buf.DocBuf = append(it.Buf.DocBuf[:0], val...)
+		if err != nil {
+			if err == btree.ErrKeyNotFound {
+				// doc may have been deleted from data but still in index; skip
+				continue
+			}
+			return nil, nil, err
+		}
 
 		// Parse and cache the value to avoid re-fetching and re-parsing later
 		if it.Plan != nil {
+			var parseStart time.Time
+			if perf {
+				parseStart = time.Now()
+			}
 			doc, perr := it.Buf.Parser.Parse(it.Buf.DocBuf)
+			if perf {
+				qpPerf.fetchParseNs.Add(uint64(time.Since(parseStart).Nanoseconds()))
+			}
 			if perr != nil {
 				return nil, nil, perr
 			}
@@ -53,9 +79,6 @@ func (it *FetchIter) Next() (key []byte, docId []byte, err error) {
 
 // Close releases resources by closing the source iterator.
 func (it *FetchIter) Close() {
-	if it.dataCursor != nil {
-		it.dataCursor.Close()
-	}
 	if it.Source != nil {
 		it.Source.Close()
 	}

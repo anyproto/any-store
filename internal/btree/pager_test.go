@@ -94,6 +94,9 @@ func TestTryCheckpoint(t *testing.T) {
 	// Now call tryCheckpoint
 	err = p.tryCheckpoint()
 	require.NoError(t, err)
+
+	// Auto-checkpoint should backfill and then restart WAL when possible.
+	assert.Equal(t, uint32(0), p.wal.nFrame.Load())
 }
 
 // ============================================================

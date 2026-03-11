@@ -107,11 +107,86 @@ var boundTestData = []boundTestCase{
 
 func TestBounds_Append(t *testing.T) {
 	for _, tc := range boundTestData {
-		var bs Bounds
-		for _, b := range tc.unmerged {
-			bs = bs.Append(b)
-		}
-		bs = bs.Merge()
-		assert.Equal(t, tc.expected, bs.String())
+		t.Run(tc.expected, func(t *testing.T) {
+			var bs Bounds
+			for _, b := range tc.unmerged {
+				bs = bs.Append(b)
+			}
+			assert.Equal(t, tc.expected, bs.String())
+		})
 	}
+}
+
+func TestBounds_SortAndMerge(t *testing.T) {
+	for _, tc := range boundTestData {
+		t.Run(tc.expected, func(t *testing.T) {
+			bs := make(Bounds, len(tc.unmerged))
+			copy(bs, tc.unmerged)
+			bs = bs.SortAndMerge()
+			assert.Equal(t, tc.expected, bs.String())
+		})
+	}
+}
+
+func TestBounds_Append_NoAliasing(t *testing.T) {
+	// Verify Append doesn't corrupt prior data through shared backing array
+	original := Bounds{
+		{Start: newBoundKey(1), End: newBoundKey(2), StartInclude: true, EndInclude: true},
+		{Start: newBoundKey(5), End: newBoundKey(6), StartInclude: true, EndInclude: true},
+	}
+	// Save a copy of original[0] for later comparison
+	origStart := make([]byte, len(original[0].Start))
+	copy(origStart, original[0].Start)
+
+	// Append a non-overlapping bound
+	result := original.Append(Bound{
+		Start: newBoundKey(10), End: newBoundKey(11),
+		StartInclude: true, EndInclude: true,
+	})
+
+	assert.Len(t, result, 3)
+	// Original should be untouched
+	assert.Equal(t, origStart, []byte(original[0].Start))
+	assert.Len(t, original, 2)
+}
+
+func BenchmarkBounds_Append(b *testing.B) {
+	benchAppend := func(b *testing.B, n int) {
+		points := make(Bounds, n)
+		for i := range points {
+			k := newBoundKey(i * 2) // non-overlapping
+			points[i] = Bound{Start: k, End: k, StartInclude: true, EndInclude: true}
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			var bs Bounds
+			for _, p := range points {
+				bs = bs.Append(p)
+			}
+		}
+	}
+	b.Run("10_points", func(b *testing.B) { benchAppend(b, 10) })
+	b.Run("100_points", func(b *testing.B) { benchAppend(b, 100) })
+	b.Run("500_points", func(b *testing.B) { benchAppend(b, 500) })
+}
+
+func BenchmarkBounds_SortAndMerge(b *testing.B) {
+	benchSAM := func(b *testing.B, n int) {
+		points := make(Bounds, n)
+		for i := range points {
+			k := newBoundKey(i * 2) // non-overlapping
+			points[i] = Bound{Start: k, End: k, StartInclude: true, EndInclude: true}
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			bs := make(Bounds, n)
+			copy(bs, points)
+			bs.SortAndMerge()
+		}
+	}
+	b.Run("10_points", func(b *testing.B) { benchSAM(b, 10) })
+	b.Run("100_points", func(b *testing.B) { benchSAM(b, 100) })
+	b.Run("500_points", func(b *testing.B) { benchSAM(b, 500) })
 }

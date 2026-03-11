@@ -26,10 +26,11 @@ type SyncPool struct {
 }
 
 type DocBuffer struct {
-	SmallBuf []byte
-	DocBuf   []byte
-	Arena    *anyenc.Arena
-	Parser   *anyenc.Parser
+	SmallBuf   []byte
+	DocBuf     []byte
+	ScratchBuf []byte
+	Arena      *anyenc.Arena
+	Parser     *anyenc.Parser
 }
 
 func (sp *SyncPool) GetDocBuf() *DocBuffer {
@@ -44,7 +45,7 @@ func (sp *SyncPool) GetDocBuf() *DocBuffer {
 }
 
 func (sp *SyncPool) ReleaseDocBuf(b *DocBuffer) {
-	if sp.sizeLimit > 0 && cap(b.DocBuf)+cap(b.SmallBuf)+b.Arena.ApproxSize()+b.Parser.ApproxSize() > sp.sizeLimit {
+	if sp.sizeLimit > 0 && cap(b.DocBuf)+cap(b.SmallBuf)+cap(b.ScratchBuf)+b.Arena.ApproxSize()+b.Parser.ApproxSize() > sp.sizeLimit {
 		return
 	}
 	sp.pool.Put(b)

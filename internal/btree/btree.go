@@ -1430,7 +1430,7 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []uin
 // are freed (since the caller will rebuild the page with new overflow chains).
 func (bt *btree) collectLeafCells(pg *page) []cellData {
 	n := int(pg.header.cellCount)
-	cells := make([]cellData, n)
+	cells := make([]cellData, n, n+1) // +1 cap: callers insert one more cell after collecting
 	usableSize := bt.usablePageSize()
 	// Estimate actual content size from page header to avoid over-allocation.
 	// Validate contentOff to avoid negative capacity from corrupted headers.
@@ -1520,6 +1520,18 @@ func (bt *btree) collectInteriorCells(pg *page) []cellData {
 	cells := make([]cellData, n)
 	usable := bt.usablePageSize()
 	maxLocal := maxLocalPayload(usable)
+
+	// Estimate content size for non-overflow keys to use a single contiguous buffer.
+	contentOff, coErr := pg.contentAreaOffset(usable)
+	if coErr != nil {
+		contentOff = usable
+	}
+	contentSize := usable - contentOff
+	if contentSize < 0 {
+		contentSize = 0
+	}
+	buf := make([]byte, 0, contentSize)
+
 	for i := range n {
 		off := pg.getCellOffset(i)
 		cells[i], _, _ = parseInteriorCell(pg.data, int(off), usable)
@@ -1542,7 +1554,10 @@ func (bt *btree) collectInteriorCells(pg *page) []cellData {
 			cells[i].key = fullKey
 			cells[i].overflowPg = 0
 		} else {
-			cells[i].key = bytes.Clone(cells[i].key)
+			// Copy key into contiguous buffer instead of individual bytes.Clone per key
+			kStart := len(buf)
+			buf = append(buf, cells[i].key...)
+			cells[i].key = buf[kStart:len(buf)]
 		}
 		_ = maxLocal
 	}
@@ -1671,8 +1686,15 @@ func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint
 func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte, path []uint32) error {
 	cells := bt.collectLeafCells(pg)
 
-	newCell := cellData{key: bytes.Clone(key), value: bytes.Clone(value)}
-	cells = append(cells[:idx], append([]cellData{newCell}, cells[idx:]...)...)
+	// Clone key+value into a single allocation.
+	combined := make([]byte, len(key)+len(value))
+	copy(combined, key)
+	copy(combined[len(key):], value)
+	newCell := cellData{key: combined[:len(key)], value: combined[len(key):]}
+	// Insert newCell at idx with a single grow + shift instead of two intermediate slices.
+	cells = append(cells, cellData{})
+	copy(cells[idx+1:], cells[idx:len(cells)-1])
+	cells[idx] = newCell
 
 	// Find split point targeting ~2/3 fill on the left page (SQLite-style).
 	mid := leafSplitPoint(cells, bt.usablePageSize())
@@ -1880,9 +1902,16 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 func (bt *btree) splitLeafAndInsert(pg *page, idx int, key, value []byte) error {
 	cells := bt.collectLeafCells(pg)
 
-	// Insert the new cell at the correct position
-	newCell := cellData{key: bytes.Clone(key), value: bytes.Clone(value)}
-	cells = append(cells[:idx], append([]cellData{newCell}, cells[idx:]...)...)
+	// Insert the new cell at the correct position.
+	// Clone key+value into a single allocation.
+	combined := make([]byte, len(key)+len(value))
+	copy(combined, key)
+	copy(combined[len(key):], value)
+	newCell := cellData{key: combined[:len(key)], value: combined[len(key):]}
+	// Single grow + shift instead of two intermediate slices.
+	cells = append(cells, cellData{})
+	copy(cells[idx+1:], cells[idx:len(cells)-1])
+	cells[idx] = newCell
 
 	// Find split point targeting ~2/3 fill on the left page (SQLite-style).
 	mid := leafSplitPoint(cells, bt.usablePageSize())
@@ -2440,9 +2469,10 @@ func (bt *btree) countPage(pgno uint32) (int, error) {
 		return count, nil
 	}
 
-	// Interior page: count all children
+	// Interior page: recurse into children directly from page data
+	// to avoid allocating a slice of child page numbers.
 	n := int(pg.header.cellCount)
-	children := make([]uint32, 0, n+1)
+	total := 0
 	cpOff := pg.cellPointerOffset()
 	dataLen := len(pg.data)
 	for i := range n {
@@ -2457,19 +2487,21 @@ func (bt *btree) countPage(pgno uint32) (int, error) {
 			return 0, ErrCorrupt
 		}
 		childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
-		children = append(children, childPgno)
-	}
-	children = append(children, pg.header.rightChild)
-	bt.pager.releasePage(pg)
-
-	total := 0
-	for _, child := range children {
-		c, err := bt.countPage(child)
-		if err != nil {
-			return 0, err
+		c, cerr := bt.countPage(childPgno)
+		if cerr != nil {
+			bt.pager.releasePage(pg)
+			return 0, cerr
 		}
 		total += c
 	}
+	rightChild := pg.header.rightChild
+	bt.pager.releasePage(pg)
+
+	c, err := bt.countPage(rightChild)
+	if err != nil {
+		return 0, err
+	}
+	total += c
 	return total, nil
 }
 
@@ -2485,9 +2517,11 @@ const btCursorMaxDepth = 20
 // frames release their pages after extracting child pointers. Close()
 // must be called when the cursor is no longer needed.
 type Cursor struct {
-	bt    *btree
-	stack []cursorFrame
-	valid bool
+	bt       *btree
+	btData   btree // embedded btree data to avoid separate heap allocation
+	stack    []cursorFrame
+	stackBuf [8]cursorFrame // pre-allocated stack to avoid growth allocs for typical tree depths
+	valid    bool
 }
 
 type cursorFrame struct {
@@ -2720,11 +2754,13 @@ func (c *Cursor) SeekNear(key []byte) error {
 			if n > 0 {
 				firstKey, err := leafKeyAt(leaf.pg, 0)
 				if err != nil {
-					return err
+					// leafKeyAt cannot reconstruct overflow keys. Fall back to full seek.
+					return c.Seek(key)
 				}
 				lastKey, err := leafKeyAt(leaf.pg, n-1)
 				if err != nil {
-					return err
+					// leafKeyAt cannot reconstruct overflow keys. Fall back to full seek.
+					return c.Seek(key)
 				}
 				if bytes.Compare(key, firstKey) >= 0 && bytes.Compare(key, lastKey) <= 0 {
 					idx, _, serr := c.bt.searchLeaf(leaf.pg, key)
@@ -2755,14 +2791,73 @@ func (c *Cursor) SeekExact(key []byte) error {
 	if !c.valid {
 		return ErrKeyNotFound
 	}
-	k, err := c.Key()
+	eq, err := c.currentKeyEqual(key)
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(k, key) {
+	if !eq {
 		return ErrKeyNotFound
 	}
 	return nil
+}
+
+// AppendValueByKey seeks an exact key and appends its value bytes into buf.
+// It combines seek, exact-match check, and value extraction in one path,
+// allowing cursor-based callers to avoid extra key/value parsing work.
+func (c *Cursor) AppendValueByKey(key []byte, buf []byte) ([]byte, error) {
+	if err := c.SeekNear(key); err != nil {
+		return buf, err
+	}
+	if !c.valid {
+		return buf, ErrKeyNotFound
+	}
+	eq, err := c.currentKeyEqual(key)
+	if err != nil {
+		return buf, err
+	}
+	if !eq {
+		return buf, ErrKeyNotFound
+	}
+
+	frame := &c.stack[len(c.stack)-1]
+	if frame.pg == nil {
+		return buf, ErrCorrupt
+	}
+	usableSize := c.bt.usablePageSize()
+	off, oerr := frame.pg.getCellOffsetSafe(frame.cellIdx)
+	if oerr != nil {
+		return buf, oerr
+	}
+	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), usableSize)
+	if cerr != nil {
+		return buf, cerr
+	}
+	if cell.overflowPg != 0 {
+		// Fall back to full value reconstruction for overflow payloads.
+		v, verr := c.Value()
+		if verr != nil {
+			return buf, verr
+		}
+		return append(buf, v...), nil
+	}
+	return append(buf, cell.value...), nil
+}
+
+// currentKeyEqual checks whether the cursor's current key is equal to key.
+// Fast path uses in-page key extraction; overflow keys fall back to Key().
+func (c *Cursor) currentKeyEqual(key []byte) (bool, error) {
+	frame := &c.stack[len(c.stack)-1]
+	if frame.pg == nil {
+		return false, ErrCorrupt
+	}
+	if k, err := leafKeyAt(frame.pg, frame.cellIdx); err == nil {
+		return bytes.Equal(k, key), nil
+	}
+	k, err := c.Key()
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(k, key), nil
 }
 
 // Key returns the current key.
@@ -3059,7 +3154,85 @@ func (c *Cursor) Valid() bool {
 	return c.valid
 }
 
+// CountUntil counts entries from the current position until the end key,
+// using page-level batch counting to avoid per-entry key extraction.
+// The cursor must be positioned at or after the start of the range.
+// After this call, the cursor is positioned past the end key (or invalid).
+func (c *Cursor) CountUntil(endKey []byte, endInclusive bool) (int, error) {
+	count := 0
+	usableSize := c.bt.usablePageSize()
+
+	for c.valid {
+		frame := &c.stack[len(c.stack)-1]
+		if frame.pg == nil {
+			return count, ErrCorrupt
+		}
+
+		cellCount := int(frame.pg.header.cellCount)
+		if frame.cellIdx >= cellCount {
+			// Shouldn't happen for valid cursor, advance
+			if err := c.Next(); err != nil {
+				return count, err
+			}
+			continue
+		}
+
+		remaining := cellCount - frame.cellIdx
+
+		if len(endKey) > 0 && remaining > 1 {
+			// Batch optimization: check last entry on page against end bound.
+			// If it's within bounds, count all remaining entries at once.
+			lastIdx := cellCount - 1
+			lastOff, oerr := frame.pg.getCellOffsetSafe(lastIdx)
+			if oerr != nil {
+				return count, oerr
+			}
+			lastCell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(lastOff), usableSize)
+			if cerr != nil {
+				return count, cerr
+			}
+
+			if lastCell.overflowPg == 0 {
+				cmp := bytes.Compare(lastCell.key, endKey)
+				if cmp < 0 || (cmp == 0 && endInclusive) {
+					// All remaining entries on this page are within bounds
+					count += remaining
+					// Advance past this page
+					frame.cellIdx = cellCount - 1
+					if err := c.Next(); err != nil {
+						return count, err
+					}
+					continue
+				}
+			}
+		}
+
+		// End bound is on this page (or single entry left, or overflow key)
+		// Fall back to per-entry counting
+		k, kerr := c.Key()
+		if kerr != nil {
+			return count, kerr
+		}
+		if len(endKey) > 0 {
+			cmp := bytes.Compare(k, endKey)
+			if cmp > 0 || (cmp == 0 && !endInclusive) {
+				c.valid = false
+				return count, nil
+			}
+		}
+		count++
+		if err := c.Next(); err != nil {
+			return count, err
+		}
+	}
+	return count, nil
+}
+
 // NewCursor creates a new cursor for the B-tree.
+// The btree data is copied into the Cursor to avoid a separate heap allocation.
 func (bt *btree) NewCursor() *Cursor {
-	return &Cursor{bt: bt}
+	c := &Cursor{btData: *bt}
+	c.bt = &c.btData
+	c.stack = c.stackBuf[:0]
+	return c
 }

@@ -1779,6 +1779,42 @@ func TestSeekNearFastPath(t *testing.T) {
 	assert.Equal(t, []byte("key-0005"), k)
 }
 
+func TestSeekNearFallbackOnOverflowBoundaryKey(t *testing.T) {
+	db := tempDBWithPageSize(t, 512)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace("t1")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	tx2, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := db.getNamespaceLocked("t1")
+	require.NoError(t, err)
+	k1 := bytes.Repeat([]byte("a"), 220) // forces overflow key on 512-byte pages
+	k2 := []byte("zzzz")
+	require.NoError(t, tx2.Put(ns, k1, []byte("v1")))
+	require.NoError(t, tx2.Put(ns, k2, []byte("v2")))
+	require.NoError(t, tx2.Commit())
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	ns2, err := db.getNamespaceLocked("t1")
+	require.NoError(t, err)
+	cur := rtx.NewCursor(ns2)
+
+	require.NoError(t, cur.First())
+	require.True(t, cur.Valid())
+
+	// Fast path boundary key extraction cannot decode overflow keys and must fall back.
+	require.NoError(t, cur.SeekNear(k2))
+	require.True(t, cur.Valid())
+	got, err := cur.Key()
+	require.NoError(t, err)
+	assert.Equal(t, k2, got)
+}
+
 // =============================================================================
 // SeekExact — not found because cursor invalid
 // =============================================================================
@@ -4231,7 +4267,9 @@ func TestCov_SeekNearFirstKeyError(t *testing.T) {
 	err = cur.SeekNear([]byte("abc"))
 	assert.Error(t, err)
 	// Cleanup: avoid double-release
-	cur.stack[len(cur.stack)-1].pg = nil
+	if len(cur.stack) > 0 {
+		cur.stack[len(cur.stack)-1].pg = nil
+	}
 	_ = off
 }
 
@@ -4256,7 +4294,9 @@ func TestCov_SeekNearLastKeyError(t *testing.T) {
 
 	err = cur.SeekNear([]byte("mmm"))
 	assert.Error(t, err)
-	cur.stack[len(cur.stack)-1].pg = nil
+	if len(cur.stack) > 0 {
+		cur.stack[len(cur.stack)-1].pg = nil
+	}
 }
 
 func TestCov_SeekNearSearchLeafError(t *testing.T) {
@@ -4282,7 +4322,9 @@ func TestCov_SeekNearSearchLeafError(t *testing.T) {
 
 	err = cur.SeekNear([]byte("bbb"))
 	assert.Error(t, err)
-	cur.stack[len(cur.stack)-1].pg = nil
+	if len(cur.stack) > 0 {
+		cur.stack[len(cur.stack)-1].pg = nil
+	}
 }
 
 func TestCov_SeekNearNextBranch(t *testing.T) {
@@ -4367,7 +4409,9 @@ func TestCov_CursorKeyCellOffsetError(t *testing.T) {
 
 	_, kerr := cur.Key()
 	assert.Error(t, kerr)
-	cur.stack[len(cur.stack)-1].pg = nil
+	if len(cur.stack) > 0 {
+		cur.stack[len(cur.stack)-1].pg = nil
+	}
 	p.releasePage(pg)
 }
 
@@ -4385,7 +4429,9 @@ func TestCov_CursorValueCellOffsetError(t *testing.T) {
 
 	_, verr := cur.Value()
 	assert.Error(t, verr)
-	cur.stack[len(cur.stack)-1].pg = nil
+	if len(cur.stack) > 0 {
+		cur.stack[len(cur.stack)-1].pg = nil
+	}
 	p.releasePage(pg)
 }
 

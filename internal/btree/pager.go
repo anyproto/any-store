@@ -147,7 +147,6 @@ type pager struct {
 	// (MVCC snapshot) pages, avoiding per-read-transaction heap allocations.
 	// Inspired by SQLite's pcache1 free-list recycling (pcache1.c:429-465).
 	pagePool sync.Pool
-
 	// inProcess uses heap-backed shm (faster, single-process only)
 	inProcess bool
 
@@ -1755,7 +1754,19 @@ func (p *pager) checkpointWithMode(mode CheckpointMode) error {
 // tryCheckpoint attempts a passive checkpoint for auto-checkpoint.
 // Uses PASSIVE mode to avoid blocking writers or readers, matching SQLite.
 func (p *pager) tryCheckpoint() error {
-	return p.wal.checkpointPassive(p.file, p.master)
+	// First run a non-blocking backfill (PASSIVE), matching SQLite's
+	// auto-checkpoint behavior.
+	if err := p.wal.checkpointPassive(p.file, p.master); err != nil {
+		return err
+	}
+
+	// If all frames are backfilled, try a best-effort RESTART to recycle WAL
+	// frame numbers and prevent unbounded WAL growth. With xBusy=nil this does
+	// not wait for readers; it simply skips reset when locks are busy.
+	if p.wal.index.nBackfill.Load() >= p.wal.index.mxCommitFrame.Load() {
+		_ = p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil)
+	}
+	return nil
 }
 
 // writeOverflowChain writes data to a chain of overflow pages and returns

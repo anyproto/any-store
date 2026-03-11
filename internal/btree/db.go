@@ -287,8 +287,10 @@ func (db *DB) Path() string {
 	return db.path
 }
 
-// BeginRead starts a read-only transaction.
-func (db *DB) BeginRead() (*ReadTx, error) {
+// beginRead starts a read-only transaction.
+// When readCounters is false, disk counters are initialized from local counters
+// without reading page-1 metadata, which is useful for hot point-lookups.
+func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 	if db.closing.Load() {
 		return nil, ErrClosed
 	}
@@ -315,13 +317,19 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 		return nil, err
 	}
 
-	// Read on-disk counters for staleness detection.
-	fcc, sc, err := db.pager.readHeaderCounters(maxFrame)
-	if err != nil {
-		db.pager.endRead(slot)
-		db.mu.RUnlock()
-		<-db.readerSem
-		return nil, err
+	localFCC := db.localFileChangeCounter.Load()
+	localSC := db.localSchemaCookie.Load()
+	fcc := localFCC
+	sc := localSC
+	if readCounters {
+		// Read on-disk counters for staleness detection.
+		fcc, sc, err = db.pager.readHeaderCounters(maxFrame)
+		if err != nil {
+			db.pager.endRead(slot)
+			db.mu.RUnlock()
+			<-db.readerSem
+			return nil, err
+		}
 	}
 
 	// Allocate reader cache from pool for per-connection page caching.
@@ -350,13 +358,25 @@ func (db *DB) BeginRead() (*ReadTx, error) {
 	tx.pager = db.pager
 	tx.cache = cache
 	tx.closed = false
+	tx.writable = false
 	tx.walMaxFrame = maxFrame
 	tx.walSlot = slot
 	tx.diskFileChangeCounter = fcc
 	tx.diskSchemaCookie = sc
-	tx.localFileChangeCounter = db.localFileChangeCounter.Load()
-	tx.localSchemaCookie = db.localSchemaCookie.Load()
+	tx.localFileChangeCounter = localFCC
+	tx.localSchemaCookie = localSC
 	return tx, nil
+}
+
+// BeginRead starts a read-only transaction.
+func (db *DB) BeginRead() (*ReadTx, error) {
+	return db.beginRead(true)
+}
+
+// BeginReadFast starts a read-only transaction without reading page-1 counters.
+// It preserves snapshot isolation for data access, but skips staleness metadata.
+func (db *DB) BeginReadFast() (*ReadTx, error) {
+	return db.beginRead(false)
 }
 
 // BeginWrite starts a read-write transaction. Only one write transaction
@@ -784,6 +804,7 @@ type ReadTx struct {
 	writable               bool // true when embedded in a WriteTx (MVCC: allows seeing dirty pages)
 }
 
+
 // txGetPage fetches a page respecting MVCC snapshot isolation.
 // For write transactions, dirty pages from writePages are returned directly.
 // For read transactions, getPageReader uses a private cache for snapshot isolation.
@@ -916,10 +937,177 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 	return true, nil
 }
 
+// SeekKey finds the first key >= prefix in ns and returns it.
+// Convenience wrapper around AppendSeekKey with a nil buffer.
+// Returns ErrKeyNotFound if no key >= prefix exists.
+func (tx *ReadTx) SeekKey(ns *Namespace, prefix []byte) ([]byte, error) {
+	return tx.AppendSeekKey(ns, prefix, nil)
+}
+
+// AppendSeekKey finds the first key >= prefix in ns and appends it to buf.
+// This is a single-shot traversal without cursor allocation, modeled after
+// AppendValue but returning the key at the seek position instead of the value.
+// Returns ErrKeyNotFound if no key >= prefix exists.
+func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byte, error) {
+	if tx.closed {
+		return buf, ErrTxClosed
+	}
+	pg, err := tx.txGetPage(ns.rootPage)
+	if err != nil {
+		return buf, err
+	}
+
+	usableSize := tx.pager.usableSize()
+	cache := tx.cache // nil for writers, per-connection pcache for readers
+	rightmost := true // tracks if we're on the rightmost path through the tree
+
+	// When we take a non-rightChild branch at an interior page, we save that
+	// page number and cell index. If the leaf search overshoots (idx >= n),
+	// we re-read this interior page and descend into the next sibling subtree
+	// to find its leftmost key — no cursor allocation needed.
+	var fallbackPgno uint32
+	var fallbackIdx int
+
+	for {
+		if pg.header.isLeaf() {
+			idx, _, serr := searchLeafWithOverflow(pg, prefix, usableSize, tx.pager, tx.walMaxFrame, cache)
+			if serr != nil {
+				tx.pager.releasePage(pg)
+				return buf, serr
+			}
+			n := int(pg.header.cellCount)
+			if idx >= n {
+				tx.pager.releasePage(pg)
+				if rightmost {
+					// On the rightmost leaf with prefix > all keys:
+					// no key >= prefix exists anywhere in the tree.
+					return buf, ErrKeyNotFound
+				}
+				// Non-rightmost leaf: navigate to the leftmost key of
+				// the next sibling subtree (saved during descent).
+				return tx.leftmostKeyAfter(fallbackPgno, fallbackIdx, buf)
+			}
+			off := pg.getCellOffset(idx)
+			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			if cerr != nil {
+				tx.pager.releasePage(pg)
+				return buf, cerr
+			}
+			if cell.overflowPg != 0 {
+				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walMaxFrame, cache)
+				tx.pager.releasePage(pg)
+				if kerr != nil {
+					return buf, kerr
+				}
+				return append(buf, fullKey...), nil
+			}
+			buf = append(buf, cell.key...)
+			tx.pager.releasePage(pg)
+			return buf, nil
+		}
+		childPgno, cellIdx, serr := searchInteriorWithOverflow(pg, prefix, usableSize, tx.pager, tx.walMaxFrame, cache)
+		if serr != nil {
+			tx.pager.releasePage(pg)
+			return buf, serr
+		}
+		// Track the deepest non-rightChild branch for cross-page navigation.
+		if childPgno != pg.header.rightChild {
+			rightmost = false
+			fallbackPgno = pg.pgno
+			fallbackIdx = cellIdx
+		}
+		tx.pager.releasePage(pg)
+		pg, err = tx.txGetPage(childPgno)
+		if err != nil {
+			return buf, err
+		}
+	}
+}
+
+// leftmostKeyAfter navigates to the first key in the subtree immediately
+// following cell[cellIdx].leftChild on interior page interiorPgno.
+// Used when a leaf search overshoots and needs the next sibling's first key.
+func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte) ([]byte, error) {
+	pg, err := tx.txGetPage(interiorPgno)
+	if err != nil {
+		return buf, err
+	}
+
+	// Find the next child pointer after cell[cellIdx].leftChild.
+	n := int(pg.header.cellCount)
+	var nextPgno uint32
+	if cellIdx+1 < n {
+		off, oerr := pg.getCellOffsetSafe(cellIdx + 1)
+		if oerr != nil {
+			tx.pager.releasePage(pg)
+			return buf, oerr
+		}
+		if int(off)+4 > len(pg.data) {
+			tx.pager.releasePage(pg)
+			return buf, ErrCorrupt
+		}
+		nextPgno = binary.BigEndian.Uint32(pg.data[off : off+4])
+	} else {
+		nextPgno = pg.header.rightChild
+	}
+	tx.pager.releasePage(pg)
+
+	// Descend to the leftmost key of this subtree.
+	usableSize := tx.pager.usableSize()
+	cache := tx.cache // nil for writers, per-connection pcache for readers
+	pg, err = tx.txGetPage(nextPgno)
+	if err != nil {
+		return buf, err
+	}
+	for {
+		if pg.header.isLeaf() {
+			if pg.header.cellCount == 0 {
+				tx.pager.releasePage(pg)
+				return buf, ErrKeyNotFound
+			}
+			off := pg.getCellOffset(0)
+			cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+			if cerr != nil {
+				tx.pager.releasePage(pg)
+				return buf, cerr
+			}
+			if cell.overflowPg != 0 {
+				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walMaxFrame, cache)
+				tx.pager.releasePage(pg)
+				if kerr != nil {
+					return buf, kerr
+				}
+				return append(buf, fullKey...), nil
+			}
+			buf = append(buf, cell.key...)
+			tx.pager.releasePage(pg)
+			return buf, nil
+		}
+		// Interior page: descend to cell[0].leftChild.
+		off, oerr := pg.getCellOffsetSafe(0)
+		if oerr != nil {
+			tx.pager.releasePage(pg)
+			return buf, oerr
+		}
+		if int(off)+4 > len(pg.data) {
+			tx.pager.releasePage(pg)
+			return buf, ErrCorrupt
+		}
+		childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
+		tx.pager.releasePage(pg)
+		pg, err = tx.txGetPage(childPgno)
+		if err != nil {
+			return buf, err
+		}
+	}
+}
+
 // NewCursor creates a cursor for iterating over the namespace.
 func (tx *ReadTx) NewCursor(ns *Namespace) *Cursor {
-	bt := &btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
-	return bt.NewCursor()
+	c := &Cursor{}
+	c.btData = btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
+	c.bt = &c.btData
+	return c
 }
 
 // Count returns the total number of key-value pairs in the namespace.

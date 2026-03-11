@@ -214,6 +214,133 @@ func BenchmarkFullScanLookup_10k(b *testing.B) {
 	}
 }
 
+// --- Unique vs Non-Unique Index Benchmarks ---
+
+// setupBenchUniqueCollection creates a collection with n documents having unique "uid" field.
+func setupBenchUniqueCollection(b *testing.B, n int, indexes ...IndexInfo) Collection {
+	b.Helper()
+	fx := newFixture(b)
+	coll, err := fx.CreateCollection(ctx, "bench")
+	require.NoError(b, err)
+	for _, idx := range indexes {
+		require.NoError(b, coll.EnsureIndex(ctx, idx))
+	}
+
+	batchSize := 500
+	for start := 0; start < n; start += batchSize {
+		end := start + batchSize
+		if end > n {
+			end = n
+		}
+		var docs []*anyenc.Value
+		for i := start; i < end; i++ {
+			docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(
+				`{"id":%d,"uid":%d,"val":%d}`,
+				i, i, i*7%1000,
+			)))
+		}
+		require.NoError(b, coll.Insert(ctx, docs...))
+	}
+	return coll
+}
+
+func BenchmarkFind_UniqueIndex_10k(b *testing.B) {
+	coll := setupBenchUniqueCollection(b, 10000, IndexInfo{Fields: []string{"uid"}, Unique: true})
+	b.ResetTimer()
+	for range b.N {
+		_, err := coll.Find(`{"uid": 5000}`).Count(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkFind_NonUniqueIndex_10k(b *testing.B) {
+	coll := setupBenchUniqueCollection(b, 10000, IndexInfo{Fields: []string{"uid"}})
+	b.ResetTimer()
+	for range b.N {
+		_, err := coll.Find(`{"uid": 5000}`).Count(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkInsert_NoIndex_1k(b *testing.B) {
+	fx := newFixture(b)
+	docs := make([]*anyenc.Value, 1000)
+	for i := range 1000 {
+		docs[i] = anyenc.MustParseJson(fmt.Sprintf(`{"id":"i_%d","uid":%d,"val":%d}`, i, i, i*7%1000))
+	}
+	b.ResetTimer()
+	for n := range b.N {
+		b.StopTimer()
+		name := fmt.Sprintf("bench_%d", n)
+		coll, err := fx.CreateCollection(ctx, name)
+		require.NoError(b, err)
+		b.StartTimer()
+		require.NoError(b, coll.Insert(ctx, docs...))
+	}
+}
+
+func BenchmarkInsert_UniqueIndex_1k(b *testing.B) {
+	fx := newFixture(b)
+	docs := make([]*anyenc.Value, 1000)
+	for i := range 1000 {
+		docs[i] = anyenc.MustParseJson(fmt.Sprintf(`{"id":"i_%d","uid":%d,"val":%d}`, i, i, i*7%1000))
+	}
+	b.ResetTimer()
+	for n := range b.N {
+		b.StopTimer()
+		name := fmt.Sprintf("bench_%d", n)
+		coll, err := fx.CreateCollection(ctx, name)
+		require.NoError(b, err)
+		require.NoError(b, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"uid"}, Unique: true}))
+		b.StartTimer()
+		require.NoError(b, coll.Insert(ctx, docs...))
+	}
+}
+
+func BenchmarkInsert_NonUniqueIndex_1k(b *testing.B) {
+	fx := newFixture(b)
+	docs := make([]*anyenc.Value, 1000)
+	for i := range 1000 {
+		docs[i] = anyenc.MustParseJson(fmt.Sprintf(`{"id":"i_%d","uid":%d,"val":%d}`, i, i, i*7%1000))
+	}
+	b.ResetTimer()
+	for n := range b.N {
+		b.StopTimer()
+		name := fmt.Sprintf("bench_%d", n)
+		coll, err := fx.CreateCollection(ctx, name)
+		require.NoError(b, err)
+		require.NoError(b, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"uid"}}))
+		b.StartTimer()
+		require.NoError(b, coll.Insert(ctx, docs...))
+	}
+}
+
+func BenchmarkUpdate_UniqueIndex_1k(b *testing.B) {
+	coll := setupBenchUniqueCollection(b, 1000, IndexInfo{Fields: []string{"uid"}, Unique: true})
+	b.ResetTimer()
+	for n := range b.N {
+		_, err := coll.Find(`{"uid": {"$lt": 100}}`).Update(ctx, fmt.Sprintf(`{"$set":{"val":%d}}`, n))
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkUpdate_NonUniqueIndex_1k(b *testing.B) {
+	coll := setupBenchUniqueCollection(b, 1000, IndexInfo{Fields: []string{"uid"}})
+	b.ResetTimer()
+	for n := range b.N {
+		_, err := coll.Find(`{"uid": {"$lt": 100}}`).Update(ctx, fmt.Sprintf(`{"$set":{"val":%d}}`, n))
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // --- Selectivity: High vs Low ---
 
 func BenchmarkHighSelectivity_Index_10k(b *testing.B) {

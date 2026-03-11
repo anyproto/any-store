@@ -21,6 +21,12 @@ type Iterator interface {
 	fmt.Stringer
 }
 
+// CountableIterator is an optional interface for iterators that support
+// efficient batch counting without extracting individual keys.
+type CountableIterator interface {
+	CountEntries() (int, error)
+}
+
 // CursorSource provides cursors and direct lookups for a btree namespace.
 type CursorSource struct {
 	Tx *btree.ReadTx
@@ -41,6 +47,12 @@ func (cs *CursorSource) Get(key []byte) ([]byte, error) {
 // Zero alloc when buf has sufficient capacity.
 func (cs *CursorSource) AppendValue(key, buf []byte) ([]byte, error) {
 	return cs.Tx.AppendValue(cs.Ns, key, buf)
+}
+
+// AppendSeekKey finds the first key >= prefix and appends it to buf.
+// Single-shot traversal without cursor allocation.
+func (cs *CursorSource) AppendSeekKey(prefix, buf []byte) ([]byte, error) {
+	return cs.Tx.AppendSeekKey(cs.Ns, prefix, buf)
 }
 
 // IndexInfo holds metadata about an index needed by the planner.

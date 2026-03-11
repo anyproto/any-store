@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"unsafe"
 
+	"github.com/klauspost/compress/s2"
 	"github.com/valyala/fastjson"
 )
 
@@ -293,6 +294,85 @@ func (v *Value) MarshalTo(dst []byte) []byte {
 		return append(dst, v.v...)
 	}
 	return dst
+}
+
+// CompressMinSize is the minimum marshaled object size (in bytes) for S2 compression.
+// Below this threshold, compression overhead exceeds savings.
+const CompressMinSize = 256
+
+// IsSizeBigger reports whether the marshaled size of v exceeds n bytes.
+// It walks the value tree counting bytes without allocating or marshaling.
+func (v *Value) IsSizeBigger(n int) bool {
+	return v.estimateSize(n) > n
+}
+
+// estimateSize returns the marshaled size of v, but stops early once it exceeds limit.
+func (v *Value) estimateSize(limit int) int {
+	if v == nil {
+		return 1 // TypeNull
+	}
+	switch v.t {
+	case TypeNull, TypeTrue, TypeFalse:
+		return 1
+	case TypeNumber:
+		return 9 // type byte + 8 bytes float64
+	case TypeString:
+		return 1 + len(v.v) + 1 // type + data + EOS
+	case TypeBinary:
+		return 1 + 4 + len(v.v) // type + length + data
+	case TypeArray:
+		size := 2 // type + EOS
+		for _, av := range v.a {
+			size += av.estimateSize(limit - size)
+			if size > limit {
+				return size
+			}
+		}
+		return size
+	case TypeObject:
+		size := 2 // type + EOS
+		for _, kv := range v.o.kvs {
+			if len(kv.key) == 0 {
+				size += 1 + 1 // emptyKey + EOS
+			} else {
+				size += len(kv.key) + 1 // key + EOS
+			}
+			size += kv.value.estimateSize(limit - size)
+			if size > limit {
+				return size
+			}
+		}
+		return size
+	default:
+		return 1
+	}
+}
+
+// MarshalCompressed marshals the value with S2 compression (objects only).
+// For non-object values or objects smaller than CompressMinSize, falls back to MarshalTo.
+// scratch is a reusable buffer for intermediate marshal; returns updated scratch for reuse.
+func (v *Value) MarshalCompressed(dst, scratch []byte) ([]byte, []byte) {
+	if v == nil || v.t != TypeObject || !v.IsSizeBigger(CompressMinSize) {
+		return v.MarshalTo(dst), scratch
+	}
+	// Marshal object into scratch
+	scratch = v.MarshalTo(scratch[:0])
+	headerStart := len(dst)
+	dst = append(dst, byte(TypeCompressedObjectS2))
+	dst = append(dst, 0, 0, 0, 0) // placeholder for compressed length
+	// Ensure dst has enough capacity for s2 output
+	maxComp := s2.MaxEncodedLen(len(scratch))
+	if needed := len(dst) + maxComp; cap(dst) < needed {
+		newDst := make([]byte, len(dst), needed)
+		copy(newDst, dst)
+		dst = newDst
+	}
+	// Encode directly into dst tail (s2 writes from position 0 of its dst arg)
+	compressed := s2.Encode(dst[len(dst):], scratch)
+	dst = dst[:len(dst)+len(compressed)]
+	compLen := uint32(len(compressed))
+	binary.BigEndian.PutUint32(dst[headerStart+1:], compLen)
+	return dst, scratch
 }
 
 func (v *Value) marshalObject(dst []byte) []byte {

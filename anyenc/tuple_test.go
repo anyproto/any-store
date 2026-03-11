@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func testTuple() (tp Tuple) {
@@ -32,5 +33,42 @@ func BenchmarkTuple_ReadBytes(b *testing.B) {
 		_ = tp.ReadBytes(func(b []byte) error {
 			return nil
 		})
+	}
+}
+
+func TestTuple_AppendInverted_OffsetAfter_Copy(t *testing.T) {
+	var regular Tuple
+	var inverted Tuple
+	val1 := MustParseJson(`"abc"`)
+	val2 := MustParseJson(`123`)
+
+	regular = regular.Append(val1)
+	regular = regular.Append(val2)
+
+	inverted = inverted.AppendInverted(val1)
+	inverted = inverted.AppendInverted(val2)
+	require.Len(t, inverted, len(regular))
+	for i := range regular {
+		assert.Equal(t, ^regular[i], inverted[i])
+	}
+
+	off0, err := regular.OffsetAfter(0)
+	require.NoError(t, err)
+	assert.Equal(t, 0, off0)
+
+	off1, err := regular.OffsetAfter(1)
+	require.NoError(t, err)
+	assert.Greater(t, off1, 0)
+	assert.Less(t, off1, len(regular))
+
+	offAll, err := regular.OffsetAfter(10)
+	require.NoError(t, err)
+	assert.Equal(t, len(regular), offAll)
+
+	clone := regular.Copy()
+	require.Equal(t, []byte(regular), []byte(clone))
+	if len(clone) > 0 {
+		clone[0] ^= 0xFF
+		assert.NotEqual(t, regular[0], clone[0])
 	}
 }

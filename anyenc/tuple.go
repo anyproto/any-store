@@ -52,6 +52,30 @@ func (t Tuple) ReadBytes(f func(b []byte) error) (err error) {
 	return nil
 }
 
+// OffsetAfter returns the byte offset right after the first n values in the tuple.
+// If n <= 0, it returns 0. If n is greater than the number of values, it returns
+// len(t). Returns an error if tuple encoding is corrupted.
+func (t Tuple) OffsetAfter(n int) (int, error) {
+	if n <= 0 {
+		return 0, nil
+	}
+	tail := t
+	off := 0
+	for i := 0; i < n && len(tail) > 0; i++ {
+		_, nextTail, err := parseValue(tail, nil)
+		if err != nil {
+			return 0, err
+		}
+		consumed := len(tail) - len(nextTail)
+		off += consumed
+		tail = nextTail
+	}
+	if off > len(t) {
+		off = len(t)
+	}
+	return off, nil
+}
+
 // String returns a string representation of the tuple.
 func (t Tuple) String() string {
 	var p = &Parser{}
