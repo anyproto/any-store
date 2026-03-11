@@ -468,6 +468,11 @@ func (db *DB) putWriteTx(tx *WriteTx) {
 	db.writeTxPool.Put(tx)
 }
 
+// WriterCacheLen returns the number of pages in the writer cache (test helper).
+func (db *DB) WriterCacheLen() int {
+	return len(db.pager.writerCache.pages)
+}
+
 // Checkpoint triggers a WAL checkpoint with the specified mode, writing
 // committed WAL frames back to the database file.
 func (db *DB) Checkpoint(mode CheckpointMode) error {
