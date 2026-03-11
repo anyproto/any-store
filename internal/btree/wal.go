@@ -468,6 +468,17 @@ type walIndex struct {
 	// must be accessed via Load/Store without holding mu. This matches
 	// SQLite's lock-free walTryBeginRead design. Do NOT add mu.RLock/Lock
 	// around atomic field accesses.
+	//
+	// DRIFT from SQLite (NOTES.md §20, drifts 2-3): SQLite has no process-local
+	// copies of mxCommitFrame, nBackfill, or aReadMark. These values live ONLY
+	// in the mmap'd SHM region (via volatile WalCkptInfo* pointer). We maintain
+	// process-local atomic.Uint32 copies alongside SHM because:
+	//   - In-process mode (heapShm) has no mmap'd region — process-local atomics
+	//     ARE the single source of truth.
+	//   - walIndex.get() reads nBackfill.Load()+1 as minFrame — this code path is
+	//     shared by in-process and multi-process modes.
+	//   - Multi-process tryBeginReadMultiProcess reads from SHM (shmNBackfill,
+	//     shmReadMark) then syncs nBackfill to process-local at the end for get().
 	mu      sync.RWMutex
 	shm     shm               // platform-specific shared memory
 	pageMap map[uint32][]uint32 // pgno -> sorted list of frame indices (1-based)
@@ -976,7 +987,14 @@ func (wi *walIndex) shmWriteCkptInfo() {
 }
 
 // shmReadCkptInfo reads checkpoint info (nBackfill, aReadMark, nBackfillAttempted)
-// from shm region 0.
+// from shm region 0 into process-local atomics.
+//
+// WARNING: This function bulk-copies SHM values into shared process-local atomics.
+// It must NOT be called from concurrent reader goroutines — multiple goroutines
+// calling this concurrently will clobber each other's values, causing stale
+// snapshot reads. Use shmNBackfill/shmReadMark for per-call SHM reads instead.
+// This function is retained for use in tests and single-goroutine contexts only.
+// See NOTES.md §20, drift 6.
 func (wi *walIndex) shmReadCkptInfo() {
 	region, err := wi.shm.region(0, false)
 	if err != nil {
@@ -988,6 +1006,37 @@ func (wi *walIndex) shmReadCkptInfo() {
 	}
 	// Read nBackfillAttempted at offset 128 (issue 7.7)
 	wi.nBackfillAttempted.Store(binary.LittleEndian.Uint32(region[htNBackfillAttemptedOff:]))
+}
+
+// shmNBackfill reads nBackfill directly from SHM region 0 without updating
+// process-local atomics. Matches SQLite's AtomicLoad(&pInfo->nBackfill) pattern
+// where nBackfill is always read from shared memory, not from a per-connection copy.
+func (wi *walIndex) shmNBackfill() uint32 {
+	region, err := wi.shm.region(0, false)
+	if err != nil {
+		return 0
+	}
+	return binary.LittleEndian.Uint32(region[htCkptOff:])
+}
+
+// shmReadMark reads a single aReadMark[i] directly from SHM region 0 without
+// updating process-local atomics. Matches SQLite's AtomicLoad(pInfo->aReadMark+i).
+func (wi *walIndex) shmReadMark(i int) uint32 {
+	region, err := wi.shm.region(0, false)
+	if err != nil {
+		return readMarkNotUsed
+	}
+	return binary.LittleEndian.Uint32(region[htReadMarkOff+i*4:])
+}
+
+// shmWriteReadMark writes a single aReadMark[i] directly to SHM region 0.
+// Matches SQLite's AtomicStore(pInfo->aReadMark+i, mxFrame).
+func (wi *walIndex) shmWriteReadMark(i int, val uint32) {
+	region, err := wi.shm.region(0, false)
+	if err != nil {
+		return
+	}
+	binary.LittleEndian.PutUint32(region[htReadMarkOff+i*4:], val)
 }
 
 // wal manages the Write-Ahead Log.
@@ -1035,6 +1084,15 @@ type wal struct {
 	// separate from the SHM header struct.
 	// Only accessed by writer goroutine, no synchronization needed.
 	readSnapshot WalIndexHdr
+
+	// writerHdr is the writer's private copy of the SHM header, updated after
+	// each successful commit (writeFrames) and after re-sync in beginWrite().
+	// Used to detect external state changes: if the live SHM header differs from
+	// writerHdr, another process committed or checkpointed since our last write.
+	// DRIFT from SQLite: SQLite stores this in pWal->hdr (shared with readers).
+	// We keep it separate because our readers use per-connection pcache isolation
+	// and never share pWal->hdr with the writer.
+	writerHdr WalIndexHdr
 
 	// memFrames stores page data in memory for InMemory mode,
 	// eliminating per-commit file I/O. Frames are flushed to pcache on checkpoint.
@@ -1439,9 +1497,15 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 			if nPage == 0 {
 				nPage = w.index.maxPage.Load()
 			}
-			return w.index.writeHeader(mxCommit, nPage, w.index.nBackfill.Load(),
+			if err := w.index.writeHeader(mxCommit, nPage, w.index.nBackfill.Load(),
 				[2]uint32{w.cksum1, w.cksum2},
-				[2]uint32{w.header.salt1, w.header.salt2})
+				[2]uint32{w.header.salt1, w.header.salt2}); err != nil {
+				return err
+			}
+			// Snapshot the header we just wrote so beginWrite can detect
+			// external state changes without false positives from our own
+			// commits (53f68eb fix).
+			w.writerHdr = w.index.hdr
 		}
 	}
 
@@ -1554,12 +1618,14 @@ func (w *wal) beginRead() (maxFrame uint32, slot int, err error) {
 	// Retry loop matching SQLite's WAL_RETRY protocol (wal.c:3239-3245).
 	// If a checkpoint resets the WAL between our metadata read and lock
 	// acquisition, tryBeginRead returns errWALRetry and we try again.
-	// The minFrame filter in walIndex.get() provides defense-in-depth for
-	// concurrent checkpoint advances, but cannot detect a full WAL reset
-	// where frame numbers restart from 1 (nBackfill drops to 0, new-epoch
-	// frames would pass the filter with stale maxFrame). The retry detects
-	// this by comparing maxFrame/nBackfill before and after lock acquisition.
-	const retryLimit = 100
+	// DRIFT from SQLite (NOTES.md §20, drift 5): SQLite does not use a
+	// *pChanged output signal — pWal->hdr already reflects the current SHM
+	// state after walIndexReadHdr(). Our per-connection caches are invalidated
+	// via dataVersion in DB.beginRead(), not via a signal from tryBeginRead.
+	// SQLite uses an unbounded retry loop. We use a generous limit to
+	// detect true bugs while tolerating heavy contention (e.g., concurrent
+	// readers + checkpoint cycling in multi-process mode).
+	const retryLimit = 5000
 	for i := 0; i < retryLimit; i++ {
 		maxFrame, slot, err = w.tryBeginRead()
 		if !errors.Is(err, errWALRetry) {
@@ -1576,58 +1642,32 @@ func (w *wal) beginRead() (maxFrame uint32, slot int, err error) {
 // max frame number. Returns errWALRetry if the WAL state changed between
 // reading metadata and acquiring the lock, signaling the caller to retry.
 func (w *wal) tryBeginRead() (maxFrame uint32, slot int, err error) {
-	// For multi-process mode, read mxFrame and nBackfill from SHM instead of
-	// stale process-local atomics. Matches SQLite's walTryBeginRead which calls
-	// walIndexReadHdr → walIndexTryHdr to populate pWal->hdr from SHM.
-	// NOTE: readSnapshot is NOT set here because tryBeginRead is called from
-	// both reader and writer goroutines. The snapshot is saved separately by
-	// the writer in DB.BeginWrite (under writeMu) to avoid a data race.
-	if !w.inProcess && !w.inMemory {
-		if hdr, valid := w.index.readHeader(); valid {
-			// Sync process-local atomics so walIndex.get() shmHashGet fallback works
-			w.index.mxCommitFrame.Store(hdr.mxFrame)
-			// Monotonic update: only increase maxPage, never decrease it.
-			// A concurrent writer's commit may have already stored a higher
-			// maxPage via writeFrames before the SHM header was updated.
-			// Without this guard, the reader overwrites the correct atomic
-			// value with the stale SHM value, causing IntegrityCheck to see
-			// a database size that's too small.
-			for {
-				old := w.index.maxPage.Load()
-				if hdr.nPage <= old || w.index.maxPage.CompareAndSwap(old, hdr.nPage) {
-					break
-				}
-			}
-		}
-		// Also read nBackfill from SHM for multi-process checkpoint visibility
-		w.index.shmReadCkptInfo()
+	if w.inProcess || w.inMemory {
+		return w.tryBeginReadInProcess()
 	}
+	return w.tryBeginReadMultiProcess()
+}
 
-	// Use mxCommitFrame (not maxFrame) so readers only see committed frames.
-	// This prevents spilled but uncommitted frames from being visible.
+// tryBeginReadInProcess handles the in-process/in-memory path where all
+// state is in process-local atomics and there are no cross-goroutine SHM races.
+// No re-validation needed because writes go through process-local atomics
+// (mxCommitFrame, nBackfill, aReadMark) which are always consistent within
+// a single process. No WAL_RETRY — the in-process path never races with
+// external checkpoint or writer state changes.
+func (w *wal) tryBeginReadInProcess() (maxFrame uint32, slot int, err error) {
 	mxFrame := w.index.mxCommitFrame.Load()
 	nBackfill := w.index.nBackfill.Load()
 
 	if mxFrame == 0 || nBackfill == mxFrame {
-		// All frames are checkpointed. Use slot 0 (read from DB, skip WAL).
 		if err := w.index.lock(lockRead0, lockShared); err != nil {
 			return 0, 0, err
-		}
-		// Re-validate: detect WAL reset between metadata read and lock.
-		if w.index.mxCommitFrame.Load() != mxFrame || w.index.nBackfill.Load() != nBackfill {
-			_ = w.index.unlock(lockRead0, lockShared)
-			return 0, 0, errWALRetry
 		}
 		w.index.aReadMark[0].Store(mxFrame)
 		return mxFrame, 0, nil
 	}
 
-	// Find the best reader slot (1-4).
-	// Best slot = one with largest readmark <= mxFrame.
-	// If none has a valid mark, find an unused slot.
 	bestSlot := -1
 	bestMark := uint32(0)
-
 	for i := 1; i <= 4; i++ {
 		mark := w.index.aReadMark[i].Load()
 		if mark != readMarkNotUsed && mark <= mxFrame && mark > bestMark {
@@ -1637,44 +1677,128 @@ func (w *wal) tryBeginRead() (maxFrame uint32, slot int, err error) {
 	}
 
 	if bestSlot != -1 {
-		// Try to acquire the best slot
 		lockSlot := lockRead0 + bestSlot
 		if err := w.index.lock(lockSlot, lockShared); err == nil {
-			// Re-validate: detect WAL reset between metadata read and lock.
-			if w.index.mxCommitFrame.Load() != mxFrame || w.index.nBackfill.Load() != nBackfill {
-				_ = w.index.unlock(lockSlot, lockShared)
-				return 0, 0, errWALRetry
-			}
 			return mxFrame, bestSlot, nil
 		}
-		// If lock fails, fall through to find an unused slot
 	}
 
-	// Find an unused slot and set its mark to mxFrame
 	for i := 1; i <= 4; i++ {
 		lockSlot := lockRead0 + i
 		if err := w.index.lock(lockSlot, lockShared); err == nil {
-			// Re-validate: detect WAL reset between metadata read and lock.
-			if w.index.mxCommitFrame.Load() != mxFrame || w.index.nBackfill.Load() != nBackfill {
-				_ = w.index.unlock(lockSlot, lockShared)
-				return 0, 0, errWALRetry
-			}
 			w.index.aReadMark[i].Store(mxFrame)
 			return mxFrame, i, nil
 		}
 	}
 
-	// All slots busy -- fall back to slot 0
 	if err := w.index.lock(lockRead0, lockShared); err != nil {
 		return 0, 0, err
 	}
-	// Re-validate: detect WAL reset between metadata read and lock.
-	if w.index.mxCommitFrame.Load() != mxFrame || w.index.nBackfill.Load() != nBackfill {
-		_ = w.index.unlock(lockRead0, lockShared)
-		return 0, 0, errWALRetry
-	}
 	w.index.aReadMark[0].Store(mxFrame)
 	return mxFrame, 0, nil
+}
+
+// tryBeginReadMultiProcess handles the multi-process path, matching SQLite's
+// walTryBeginRead() (wal.c:3000-3252) step by step:
+//
+//  1. Read SHM header into a local copy (SQLite: walIndexReadHdr → walIndexTryHdr
+//     copies SHM into pWal->hdr). We use a function-scoped local variable instead
+//     of a persistent per-connection field. (NOTES.md §20, drift 4)
+//  2. Read nBackfill and aReadMark directly from SHM each time (SQLite: volatile
+//     WalCkptInfo *pInfo = walCkptInfo(pWal), then AtomicLoad). We use shmNBackfill()
+//     and shmReadMark() helper functions. (NOTES.md §20, drift 1)
+//  3. Claim a reader slot using exclusive lock → write readmark → unlock → shared lock.
+//     Matches SQLite wal.c:3170-3185 exactly.
+//  4. Re-validate after acquiring shared lock: compare live SHM header against local
+//     copy AND live readmark against saved value. If either changed → WAL_RETRY.
+//     Matches SQLite wal.c:3239-3249 (memcmp + AtomicLoad re-check).
+//  5. Sync nBackfill to process-local atomic for walIndex.get() minFrame filter.
+//     (NOTES.md §20, drift 3 — SQLite doesn't need this sync step because it reads
+//     nBackfill directly from SHM via pInfo pointer everywhere)
+func (w *wal) tryBeginReadMultiProcess() (maxFrame uint32, slot int, err error) {
+	// Step 1: Read SHM header into local copy (SQLite: walIndexReadHdr → walIndexTryHdr)
+	hdr, valid := w.index.readHeader()
+	if !valid {
+		// Can't read a valid SHM header — fall back to process-local mxCommitFrame.
+		// This happens when the SHM hasn't been initialized yet.
+		hdr.mxFrame = w.index.mxCommitFrame.Load()
+	}
+	mxFrame := hdr.mxFrame
+
+	// Step 2: Read nBackfill directly from SHM (SQLite: AtomicLoad(&pInfo->nBackfill))
+	nBackfill := w.index.shmNBackfill()
+
+	// Step 3: Slot 0 path — WAL fully checkpointed (SQLite wal.c:3114-3147)
+	if mxFrame == 0 || nBackfill == mxFrame {
+		if err := w.index.lock(lockRead0, lockShared); err != nil {
+			return 0, 0, err
+		}
+		walShmBarrier()
+		// Re-validate: compare live SHM header against our local copy
+		// (SQLite wal.c:3125: memcmp(walIndexHdr(pWal), &pWal->hdr, sizeof(WalIndexHdr)))
+		if liveHdr, ok := w.index.readHeader(); ok && liveHdr != hdr {
+			_ = w.index.unlock(lockRead0, lockShared)
+			return 0, 0, errWALRetry
+		}
+		w.index.shmWriteReadMark(0, mxFrame)
+		w.index.aReadMark[0].Store(mxFrame) // keep process-local in sync
+		return mxFrame, 0, nil
+	}
+
+	// Step 4: Find best reader slot 1-4 (SQLite wal.c:3154-3169)
+	// Read aReadMark directly from SHM (SQLite: AtomicLoad(pInfo->aReadMark+i))
+	bestSlot := -1
+	bestMark := uint32(0)
+	for i := 1; i <= 4; i++ {
+		mark := w.index.shmReadMark(i)
+		if mark != readMarkNotUsed && mark <= mxFrame && mark > bestMark {
+			bestSlot = i
+			bestMark = mark
+		}
+	}
+
+	// Step 5: If no good slot or bestMark < mxFrame, try to claim an unused slot
+	// and set its readmark to mxFrame (SQLite wal.c:3170-3185)
+	if bestSlot == -1 || bestMark < mxFrame {
+		for i := 1; i <= 4; i++ {
+			lockSlot := lockRead0 + i
+			if err := w.index.lock(lockSlot, lockExclusive); err == nil {
+				w.index.shmWriteReadMark(i, mxFrame)
+				w.index.aReadMark[i].Store(mxFrame) // keep process-local in sync
+				bestMark = mxFrame
+				bestSlot = i
+				_ = w.index.unlock(lockSlot, lockExclusive)
+				break
+			}
+		}
+	}
+
+	if bestSlot == -1 {
+		return 0, 0, ErrBusy
+	}
+
+	// Step 6: Acquire shared lock on the chosen slot (SQLite wal.c:3192)
+	lockSlot := lockRead0 + bestSlot
+	if err := w.index.lock(lockSlot, lockShared); err != nil {
+		return 0, 0, errWALRetry
+	}
+
+	// Step 7: Re-validate after lock (SQLite wal.c:3239-3249)
+	// Read minFrame (nBackfill+1) from SHM, then barrier, then check header + readmark
+	nBackfill = w.index.shmNBackfill()
+	walShmBarrier()
+
+	liveMark := w.index.shmReadMark(bestSlot)
+	liveHdr, liveValid := w.index.readHeader()
+	if liveMark != bestMark || (liveValid && liveHdr != hdr) {
+		_ = w.index.unlock(lockSlot, lockShared)
+		return 0, 0, errWALRetry
+	}
+
+	// Sync nBackfill to process-local for walIndex.get() minFrame filter
+	w.index.nBackfill.Store(nBackfill)
+
+	return mxFrame, bestSlot, nil
 }
 
 // saveReadSnapshot saves the current SHM header as the read snapshot for
@@ -1732,13 +1856,20 @@ func (w *wal) beginWrite() (stateChanged bool, err error) {
 	// salts) is separate from the SHM header struct. When BUSY_SNAPSHOT
 	// passes (headers match), this is a no-op in practice.
 	if valid {
-		// Detect if another process changed state since our last write
-		if hdr.iChange != w.index.hdr.iChange || hdr.mxFrame != w.nFrame.Load() ||
-			hdr.aSalt[0] != w.header.salt1 || hdr.aSalt[1] != w.header.salt2 {
+		// Detect external state change: compare current SHM header against
+		// the snapshot saved after our last writeFrames commit. writerHdr
+		// reflects what WE wrote, so any difference means another process
+		// committed or checkpointed since then (53f68eb fix).
+		// When writerHdr.isInit==0 (first write or after restart), treat as
+		// state-changed to force a full re-sync.
+		if w.writerHdr.isInit != 0 && hdr != w.writerHdr {
+			stateChanged = true
+		} else if w.writerHdr.isInit == 0 {
 			stateChanged = true
 		}
-		// If WAL was reset (mxFrame==0) or salts changed, force WAL header rewrite
-		if hdr.mxFrame == 0 || hdr.aSalt[0] != w.header.salt1 || hdr.aSalt[1] != w.header.salt2 {
+		// If WAL was reset (mxFrame==0) or state changed externally, force
+		// WAL header rewrite
+		if hdr.mxFrame == 0 || stateChanged {
 			w.headerOnDisk = false
 		}
 		w.nFrame.Store(hdr.mxFrame)
@@ -1755,6 +1886,9 @@ func (w *wal) beginWrite() (stateChanged bool, err error) {
 				break
 			}
 		}
+		// Snapshot the re-synced header so future beginWrite calls can
+		// detect external changes relative to this baseline (53f68eb fix).
+		w.writerHdr = hdr
 	}
 
 	return stateChanged, nil
@@ -1864,8 +1998,14 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	// This matches SQLite's walCheckpoint() reader-lock loop (issue 6.3).
 	mxSafeFrame := nf
 
+	multiProcess := !w.inProcess && !w.inMemory
 	for i := 1; i < 5; i++ {
-		mark := w.index.aReadMark[i].Load()
+		var mark uint32
+		if multiProcess {
+			mark = w.index.shmReadMark(i)
+		} else {
+			mark = w.index.aReadMark[i].Load()
+		}
 
 		if mark == readMarkNotUsed || mark >= mxSafeFrame {
 			continue
@@ -1881,8 +2021,14 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 			// This matches SQLite: "iMark = (i==1 ? mxSafeFrame : READMARK_NOT_USED)"
 			if i == 1 {
 				w.index.aReadMark[i].Store(mxSafeFrame)
+				if multiProcess {
+					w.index.shmWriteReadMark(i, mxSafeFrame)
+				}
 			} else {
 				w.index.aReadMark[i].Store(readMarkNotUsed)
+				if multiProcess {
+					w.index.shmWriteReadMark(i, readMarkNotUsed)
+				}
 			}
 			_ = w.index.unlock(lockSlot, lockExclusive)
 		} else if rc == ErrBusy {
@@ -1898,7 +2044,12 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	}
 
 	// nBackfill is the number of frames already copied to DB
-	nBackfill := w.index.nBackfill.Load()
+	var nBackfill uint32
+	if multiProcess {
+		nBackfill = w.index.shmNBackfill()
+	} else {
+		nBackfill = w.index.nBackfill.Load()
+	}
 
 	if mxSafeFrame <= nBackfill {
 		// Nothing new to checkpoint.
