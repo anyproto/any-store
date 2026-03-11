@@ -313,7 +313,7 @@ func (p *pager) initNewDB() error {
 		if _, err := p.file.WriteAt(buf, 0); err != nil {
 			return err
 		}
-		if err := p.file.Sync(); err != nil {
+		if err := fdatasync(p.file); err != nil {
 			return err
 		}
 	}

@@ -10,8 +10,7 @@ var (
 	defaultOpenFile = func(name string, flag int, perm os.FileMode) (File, error) {
 		return os.OpenFile(name, flag, perm)
 	}
-	defaultRemove    = os.Remove
-	defaultFdatasync = func(f File) error { return f.Sync() }
+	defaultRemove = os.Remove
 
 	osOpenFile = defaultOpenFile
 	osRemove   = defaultRemove
