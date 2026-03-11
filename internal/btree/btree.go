@@ -1116,7 +1116,9 @@ func (bt *btree) Put(key, value []byte) error {
 	if err != nil {
 		return err
 	}
-	return bt.insertIntoLeafWithPath(wpg, key, value, path)
+	err = bt.insertIntoLeafWithPath(wpg, key, value, path)
+	bt.pager.releasePage(wpg)
+	return err
 }
 
 // insertIntoPage recursively inserts a key-value pair, splitting pages as needed.
