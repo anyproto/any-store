@@ -3283,7 +3283,9 @@ func TestPersistentReaderCache_ClearKeepsBuffersLocal(t *testing.T) {
 	defer globalPageSlab.Reset()
 
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), DefaultOptions())
+	opts := DefaultOptions()
+	opts.UsePageSlab = true
+	db, err := Open(filepath.Join(dir, "test.db"), opts)
 	require.NoError(t, err)
 	defer db.Close()
 

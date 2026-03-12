@@ -151,6 +151,10 @@ type pager struct {
 	// inMemory keeps the entire database in memory with no files on disk
 	inMemory bool
 
+	// useSlab is set once by btree.Open from Options.SlabPages.
+	// Local bool — no atomic/global reads on hot path.
+	useSlab bool
+
 	// writerWalSlot is the writer's WAL reader slot number, stored here
 	// so Close can release it when force-rolling back an abandoned WriteTx.
 	// Written by BeginWrite before pager.beginWrite() (which stores
@@ -177,6 +181,7 @@ func newPager(path string, pageSize uint32, cacheSize int, purgeable bool) *page
 	p := &pager{
 		path:     path,
 		pageSize: pageSize,
+		// useSlab defaults to false; set by btree.Open from Options.SlabPages.
 		writerCache: newPcache(int(pageSize), cacheSize, purgeable),
 	}
 	p.writerCache.xStress = p.pagerStress
@@ -230,6 +235,7 @@ func (p *pager) open() error {
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
 	p.dbSize.Store(p.header.DatabaseSize)
 	p.writerCache = newPcache(int(p.pageSize), p.writerCache.maxPages, p.writerCache.purgeable)
+	p.writerCache.useSlab = p.useSlab
 	p.writerCache.xStress = p.pagerStress
 
 	// Open WAL
@@ -315,6 +321,7 @@ func (p *pager) initNewDB() error {
 
 	p.dbSize.Store(1)
 	p.writerCache = newPcache(int(p.pageSize), p.writerCache.maxPages, p.writerCache.purgeable)
+	p.writerCache.useSlab = p.useSlab
 	p.writerCache.xStress = p.pagerStress
 
 	// For inMemory mode, pre-populate page 1 in masterStore so reads find it
@@ -970,41 +977,28 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 }
 
 // acquireTempPage returns a page from the pool or allocates a new one.
-// The returned page has a valid data buffer from the global slab (if initialized)
-// or a fresh allocation. All other fields are unset.
+// The returned page has a valid data buffer from the slab/pool.
 func (p *pager) acquireTempPage() *page {
 	if v := p.pagePool.Get(); v != nil {
 		pg := v.(*page)
-		// Pooled pages may have had their data buffer returned to slab.
+		// Pooled pages may have had their data buffer returned to slab/pool.
 		if pg.data == nil {
-			if globalPageSlab.Initialized(int(p.pageSize)) {
-				pg.data = globalPageSlab.Get()
-			} else {
-				pg.data = make([]byte, p.pageSize)
-			}
+			pg.data = allocPageBuffer(int(p.pageSize), p.useSlab)
 		}
 		return pg
 	}
-	var data []byte
-	if globalPageSlab.Initialized(int(p.pageSize)) {
-		data = globalPageSlab.Get()
-	} else {
-		data = make([]byte, p.pageSize)
-	}
 	return &page{
-		data: data,
+		data: allocPageBuffer(int(p.pageSize), p.useSlab),
 	}
 }
 
 // recycleTempPage returns an uncached page to the pool for reuse.
-// The page's data buffer is returned to the global slab (if initialized)
-// and a fresh slab buffer will be allocated on next acquireTempPage.
+// The page's data buffer is returned to the slab/pool and a fresh buffer
+// will be allocated on next acquireTempPage.
 func (p *pager) recycleTempPage(pg *page) {
-	// Return data buffer to slab before pooling the page struct.
-	if globalPageSlab.Initialized(len(pg.data)) {
-		globalPageSlab.Put(pg.data)
-		pg.data = nil
-	}
+	// Return data buffer to slab/pool before pooling the page struct.
+	freePageBuffer(pg.data, p.useSlab)
+	pg.data = nil
 	pg.pgno = 0
 	pg.dirty = false
 	pg.uncached = false

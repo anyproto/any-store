@@ -119,10 +119,14 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		InMemory:              config.InMemory,
 		DisableAutoCheckpoint: config.DisableAutoCheckpoint,
 		AutoCheckpointAfter:   config.AutoCheckpointAfter,
+		UsePageSlab:           config.UseGlobalPageBuffer,
 	}
 
 	var err error
 	if ds.btreeDB, err = btree.Open(path, opts); err != nil {
+		if errors.Is(err, btree.ErrPageSlabNotInitialized) {
+			return nil, ErrPageBufferNotInitialized
+		}
 		return nil, err
 	}
 

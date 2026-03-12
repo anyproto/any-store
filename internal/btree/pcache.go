@@ -26,6 +26,7 @@ type pcache struct {
 	pages    map[uint32]*page // pgno -> page
 	maxPages int              // maximum number of cached pages
 	pageSize int              // size of each page in bytes
+	useSlab  bool             // resolved once at creation; true when slab allocator is active
 
 	// purgeable controls whether the cache can evict pages.
 	// When false (InMemory databases), pages are never evicted and the
@@ -84,6 +85,8 @@ func newPcache(pageSize, maxPages int, purgeable bool) *pcache {
 		maxPages:  maxPages,
 		pageSize:  pageSize,
 		purgeable: purgeable,
+		// useSlab defaults to false (sync.Pool mode). Callers that want slab
+		// mode (btree.Open with SlabPages > 0) override this after creation.
 	}
 }
 
@@ -99,15 +102,11 @@ func (pc *pcache) fetch(pgno uint32) *page {
 	return p
 }
 
-// initBulk pre-allocates page structs with data buffers from the global slab.
+// initBulk pre-allocates page structs with data buffers.
 // Called once on first create(). Matches SQLite pcache1.c:297-330 (pcache1InitBulk).
-// If the global slab is not initialized (e.g. unit tests using newPcache directly),
-// this is a no-op and create() falls back to make([]byte, pageSize).
+// Buffers come from the slab (if configured) or sync.Pool/make.
 func (pc *pcache) initBulk() {
 	pc.bulkInit = true
-	if !globalPageSlab.Initialized(pc.pageSize) {
-		return
-	}
 	nBulk := pc.maxPages
 	if nBulk > 100 {
 		nBulk = 100
@@ -118,7 +117,7 @@ func (pc *pcache) initBulk() {
 	pc.pFree = make([]*page, nBulk)
 	for i := range nBulk {
 		pc.pFree[i] = &page{
-			data:  globalPageSlab.Get(),
+			data:  allocPageBuffer(pc.pageSize, pc.useSlab),
 			cache: pc,
 		}
 	}
@@ -172,7 +171,6 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	// step 4 (pcache1.c:900-906) which reuses the victim's PgHdr1 + buffer
 	// directly for the new page. Intermediate evictions (rare: only when multiple
 	// pages must be evicted) return buffers to slab.
-	slabOk := globalPageSlab.Initialized(pc.pageSize)
 	var recycled *page
 	if pc.purgeable {
 		for len(pc.pages) >= pc.maxPages && pc.nRecyclable > 0 {
@@ -180,9 +178,9 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 			if evicted != nil {
 				// Keep last evicted page for direct reuse (SQLite step 4:
 				// pcache1.c:900 reuses victim's PgHdr1 + buffer directly).
-				// Return intermediate evictions to slab.
-				if recycled != nil && slabOk {
-					globalPageSlab.Put(recycled.data)
+				// Return intermediate evictions to slab/pool.
+				if recycled != nil {
+					freePageBuffer(recycled.data, pc.useSlab)
 					recycled.data = nil
 				}
 				recycled = evicted
@@ -212,8 +210,8 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 					evicted := pc.evictOne()
 					if evicted != nil && recycled == nil {
 						recycled = evicted
-					} else if evicted != nil && slabOk {
-						globalPageSlab.Put(evicted.data)
+					} else if evicted != nil {
+						freePageBuffer(evicted.data, pc.useSlab)
 						evicted.data = nil
 					}
 				}
@@ -222,7 +220,7 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	}
 
 	// Allocate a page struct: try recycled (direct reuse from step 4), then
-	// pFree, then bulk init, then slab directly.
+	// pFree, then bulk init, then allocPageBuffer (slab or sync.Pool).
 	// Matches SQLite pcache1.c:434-438 (pcache1AllocPage tries pFree first)
 	// and pcache1.c:900-914 (step 4 reuses evicted page directly).
 	var p *page
@@ -240,14 +238,8 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 			}
 		}
 		if p == nil {
-			var data []byte
-			if globalPageSlab.Initialized(pc.pageSize) {
-				data = globalPageSlab.Get()
-			} else {
-				data = make([]byte, pc.pageSize)
-			}
 			p = &page{
-				data:  data,
+				data:  allocPageBuffer(pc.pageSize, pc.useSlab),
 				cache: pc,
 			}
 		}
@@ -301,7 +293,7 @@ func (pc *pcache) release(p *page) {
 			//
 			// If cache is overfull and slab is under pressure, immediately
 			// evict instead of adding to LRU (matches pcache1Unpin).
-			if globalPageSlab.UnderPressure() && len(pc.pages) > pc.maxPages {
+			if pc.useSlab && globalPageSlab.UnderPressure() && len(pc.pages) > pc.maxPages {
 				delete(pc.pages, p.pgno)
 				// Add to pFree for direct reuse by create() instead of returning
 				// buffer to slab (which would drop it — slab is full under
@@ -421,22 +413,17 @@ func (pc *pcache) clear() {
 	pc.nDirty = 0
 }
 
-// destroy removes all pages and returns all data buffers to the global slab.
+// destroy removes all pages and returns all data buffers to the slab/pool.
 // Used when the cache will not be reused: temporary caches (getNamespace,
 // listNamespaces, integrity check) and pager close/error paths.
 func (pc *pcache) destroy() {
-	slabOk := globalPageSlab.Initialized(pc.pageSize)
 	for _, p := range pc.pages {
-		if slabOk {
-			globalPageSlab.Put(p.data)
-			p.data = nil
-		}
+		freePageBuffer(p.data, pc.useSlab)
+		p.data = nil
 	}
-	if slabOk {
-		for _, p := range pc.pFree {
-			globalPageSlab.Put(p.data)
-			p.data = nil
-		}
+	for _, p := range pc.pFree {
+		freePageBuffer(p.data, pc.useSlab)
+		p.data = nil
 	}
 	pc.pFree = nil
 	pc.bulkInit = false
@@ -473,17 +460,14 @@ func (pc *pcache) discard(pgno uint32) {
 	} else {
 		pc.lruRemove(p)
 	}
-	if globalPageSlab.Initialized(pc.pageSize) {
-		globalPageSlab.Put(p.data)
-		p.data = nil
-	}
+	freePageBuffer(p.data, pc.useSlab)
+	p.data = nil
 	delete(pc.pages, pgno)
 }
 
 // truncate removes all pages with pgno > maxPage, returning their data
-// buffers to the global slab.
+// buffers to the slab/pool.
 func (pc *pcache) truncate(maxPage uint32) {
-	slabOk := globalPageSlab.Initialized(pc.pageSize)
 	for pgno, p := range pc.pages {
 		if pgno > maxPage {
 			if p.dirty {
@@ -503,10 +487,8 @@ func (pc *pcache) truncate(maxPage uint32) {
 			} else {
 				pc.lruRemove(p)
 			}
-			if slabOk {
-				globalPageSlab.Put(p.data)
-				p.data = nil
-			}
+			freePageBuffer(p.data, pc.useSlab)
+			p.data = nil
 			delete(pc.pages, pgno)
 		}
 	}

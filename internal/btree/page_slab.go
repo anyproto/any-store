@@ -1,29 +1,25 @@
 package btree
 
-// pageSlab is a process-global pre-allocated pool for []byte page buffers.
-// Modeled after SQLite's pcache1.c slab allocator (pcache1_g struct,
-// pcache1Alloc, pcache1Free, pcache1UnderMemoryPressure).
+// Page buffer allocation has two modes:
 //
-// The slab pre-allocates a fixed number of page-sized buffers at Init time.
-// Get() pops from the free list; when exhausted, it falls back to make()
-// (overflow allocation). Put() returns buffers to the free list.
+// 1. Default (no slab): Uses sync.Pool for page-sized []byte buffers, matching
+//    SQLite's default malloc-based page cache allocation. Buffers are GC'd when
+//    not in use. No memory pressure tracking.
 //
-// underPressure is set when the free list drops below nReserve (10% + 1
-// of the initial slab size), matching pcache1.c:350,389 bUnderPressure.
+// 2. Slab mode (opt-in via SlabPages option or ConfigPageCache): Pre-allocates
+//    a fixed number of page-sized buffers. Modeled after SQLite's pcache1.c slab
+//    allocator (pcache1_g struct, pcache1Alloc, pcache1Free,
+//    pcache1UnderMemoryPressure). When the slab is exhausted, falls back to
+//    make() (overflow). UnderPressure triggers admission control and immediate
+//    eviction.
 //
-// Drift from SQLite:
-//   - Uses [][]byte slice, not contiguous void* buffer (drift #7)
-//   - Caps free list at nSlab; overflow buffers are GC'd (drift #8)
-//   - Lazy init, not library init (drift #9)
+// All page buffer allocation should go through allocPageBuffer/freePageBuffer,
+// which dispatch to the appropriate mode.
 
 import (
 	"sync"
 	"sync/atomic"
 )
-
-// defaultSlabPages is the default number of page buffers to pre-allocate
-// when the slab is lazily initialized on first Open() call.
-const defaultSlabPages = 2000
 
 // pageSlab manages a pool of reusable []byte page buffers.
 type pageSlab struct {
@@ -38,8 +34,39 @@ type pageSlab struct {
 	initialized   atomic.Bool // set last in Init(); acts as release barrier for pageSize
 }
 
-// globalPageSlab is the process-global singleton.
+// globalPageSlab is the process-global singleton. Only initialized when slab
+// mode is explicitly enabled via SlabPages option or ConfigPageCache.
 var globalPageSlab pageSlab
+
+// pageBufferPool is a sync.Pool for page-sized []byte buffers. Used as the
+// default allocator when the slab is not configured.
+var pageBufferPool sync.Pool
+
+// allocPageBuffer returns a page-sized buffer. useSlab is a local bool
+// resolved once at pcache/pager creation time — no global reads on hot path.
+func allocPageBuffer(pageSize int, useSlab bool) []byte {
+	if useSlab {
+		return globalPageSlab.Get()
+	}
+	if v := pageBufferPool.Get(); v != nil {
+		if buf, ok := v.([]byte); ok && len(buf) == pageSize {
+			return buf
+		}
+	}
+	return make([]byte, pageSize)
+}
+
+// freePageBuffer returns a buffer to the slab or sync.Pool.
+func freePageBuffer(buf []byte, useSlab bool) {
+	if buf == nil {
+		return
+	}
+	if useSlab {
+		globalPageSlab.Put(buf)
+		return
+	}
+	pageBufferPool.Put(buf)
+}
 
 // Init pre-allocates nPages buffers of the given pageSize.
 // If already initialized, this is a no-op.
@@ -67,8 +94,6 @@ func (s *pageSlab) Init(pageSize, nPages int) {
 		s.freeList[i] = make([]byte, pageSize)
 	}
 	s.underPressure.Store(false)
-	// Store last: acts as release barrier so pageSize is visible to
-	// concurrent Initialized() readers (acquire via atomic.Bool.Load).
 	s.initialized.Store(true)
 }
 
@@ -162,14 +187,13 @@ func (s *pageSlab) Reset() {
 
 // ConfigPageCache initializes the global page slab with the given page size
 // and number of pages. This mirrors sqlite3_config(SQLITE_CONFIG_PAGECACHE).
-// Must be called before opening any databases, or the slab will be lazily
-// initialized with defaults (2000 pages) on the first Open() call.
+// Must be called before opening any databases.
 //
-// The slab provides a soft cap on total page cache memory across all open
-// databases: nPages * pageSize bytes of pre-allocated buffers. When the slab
-// is exhausted, overflow allocations use make() but the UnderPressure flag
-// triggers admission control (readers get nil from soft creates) and
-// immediate eviction on unpin (see pcache.release and pcache.create).
+// By default (without calling this or setting SlabPages), page buffers are
+// allocated via sync.Pool (like SQLite's default malloc mode). Calling this
+// enables slab mode: a soft cap on total page cache memory across all open
+// databases. When the slab is exhausted, overflow allocations use make() but
+// the UnderPressure flag triggers admission control and immediate eviction.
 //
 // Example: ConfigPageCache(4096, 5000) pre-allocates ~20MB of page buffers.
 func ConfigPageCache(pageSize, nPages int) {

@@ -64,6 +64,12 @@ type Options struct {
 	// MaxReaders * readerCacheSize * PageSize.
 	// Default: 4. No SQLite equivalent — our addition for memory management.
 	MaxReaders int
+
+	// UsePageSlab opts this DB into the global pre-allocated page buffer slab.
+	// The slab must be initialized beforehand via ConfigPageCache (btree) or
+	// InitPageBuffer (anystore). When false (default), page buffers use
+	// sync.Pool, matching SQLite's default malloc-based allocation.
+	UsePageSlab bool
 }
 
 // DefaultOptions returns default database options.
@@ -152,8 +158,9 @@ func Open(path string, opts Options) (*DB, error) {
 		opts.InProcess = true
 	}
 
-	// Lazy-init global page slab if not already configured via ConfigPageCache.
-	globalPageSlab.Init(int(opts.PageSize), defaultSlabPages)
+	if opts.UsePageSlab && !globalPageSlab.initialized.Load() {
+		return nil, ErrPageSlabNotInitialized
+	}
 
 	// Prevent double-open of the same database file.
 	var canonicalPath string
@@ -175,6 +182,8 @@ func Open(path string, opts Options) (*DB, error) {
 	}()
 
 	p := newPager(path, opts.PageSize, opts.CacheSize, !opts.InMemory)
+	p.useSlab = opts.UsePageSlab
+	p.writerCache.useSlab = opts.UsePageSlab
 	p.inProcess = opts.InProcess
 	p.noCommitSync = opts.NoCommitSync
 	p.inMemory = opts.InMemory
@@ -363,6 +372,7 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 		}
 	default:
 		cache = newPcache(int(db.pager.pageSize), db.readerCacheSize, true)
+		cache.useSlab = db.pager.useSlab
 		cache.dataVersion = curDV
 		cache.walMaxFrame = maxFrame
 	}
@@ -671,6 +681,7 @@ func (db *DB) GetNamespace(name string) (*Namespace, error) {
 	defer db.pager.endRead(slot)
 
 	cache := newPcache(int(db.pager.pageSize), 200, true)
+	cache.useSlab = db.pager.useSlab
 	defer cache.destroy()
 
 	return db.getNamespaceAt(name, maxFrame, cache)
@@ -759,6 +770,7 @@ func (db *DB) ListNamespaces() ([]string, error) {
 	defer db.pager.endRead(slot)
 
 	cache := newPcache(int(db.pager.pageSize), 200, true)
+	cache.useSlab = db.pager.useSlab
 	defer cache.destroy()
 
 	bt := &btree{pager: db.pager, cache: cache, rootPage: 1, walMaxFrame: maxFrame, writable: false}
