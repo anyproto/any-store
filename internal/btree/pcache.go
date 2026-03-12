@@ -159,26 +159,29 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	// Step 4: Evict clean pages if cache is full (skip for non-purgeable / InMemory caches).
 	// Adapted from SQLite pcache1.c:897-914 (step 4 — SQLite reuses victim's buffer).
 	//
-	// DRIFT from SQLite: SQLite's step 4 (pcache1.c:900) also evicts under global
-	// memory pressure via pcache1UnderMemoryPressure. This works in SQLite because
-	// the PGroup LRU spans ALL caches, so step 4 can steal pages from OTHER caches
-	// and reuse their buffers for the requesting cache (zero-alloc transfer). In our
-	// isolated model (no PGroup, drift #1), we can only evict from our own cache.
-	// Evicting our own page to allocate a new one is a net-zero for memory and wastes
-	// a cached page. Global pressure is handled by step 3 (admission control, readers)
-	// and release() immediate eviction instead.
+	// Reader caches (xStress == nil): the last evicted page is kept for direct
+	// buffer reuse by the allocation step below, eliminating the Put→Get slab
+	// round-trip. This matches SQLite's step 4 (pcache1.c:900) which reuses the
+	// victim's PgHdr1 + buffer directly for the new page. Intermediate evictions
+	// (rare: only when multiple pages must be evicted) return buffers to slab.
 	//
-	// Reader caches (xStress == nil) return evicted buffers to the slab immediately
-	// because readers have no writePages map. Writer caches cannot do this because
+	// Writer caches (xStress != nil): evicted buffers are NOT touched because
 	// pager.writePages may still reference the evicted page struct after spill;
 	// writer buffers are returned in clear()/discard()/truncate() instead.
 	slabOk := globalPageSlab.Initialized(pc.pageSize)
+	var recycled *page
 	if pc.purgeable {
 		for len(pc.pages) >= pc.maxPages && pc.nRecyclable > 0 {
 			evicted := pc.evictOne()
-			if evicted != nil && pc.xStress == nil && slabOk {
-				globalPageSlab.Put(evicted.data)
-				evicted.data = nil
+			if evicted != nil && pc.xStress == nil {
+				// Keep last evicted page for direct reuse (SQLite step 4:
+				// pcache1.c:900 reuses victim's PgHdr1 + buffer directly).
+				// Return intermediate evictions to slab.
+				if recycled != nil && slabOk {
+					globalPageSlab.Put(recycled.data)
+					recycled.data = nil
+				}
+				recycled = evicted
 			}
 		}
 
@@ -210,10 +213,14 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 		}
 	}
 
-	// Allocate a page struct: try pFree first, then bulk init, then slab directly.
-	// Matches SQLite pcache1.c:434-438 (pcache1AllocPage tries pFree first).
+	// Allocate a page struct: try recycled (direct reuse from step 4), then
+	// pFree, then bulk init, then slab directly.
+	// Matches SQLite pcache1.c:434-438 (pcache1AllocPage tries pFree first)
+	// and pcache1.c:900-914 (step 4 reuses evicted page directly).
 	var p *page
-	if n := len(pc.pFree); n > 0 {
+	if recycled != nil {
+		p = recycled
+	} else if n := len(pc.pFree); n > 0 {
 		p = pc.pFree[n-1]
 		pc.pFree = pc.pFree[:n-1]
 	} else {
@@ -296,10 +303,11 @@ func (pc *pcache) release(p *page) {
 			// their buffers are returned to slab at commit/rollback time.
 			if pc.xStress == nil && globalPageSlab.UnderPressure() && len(pc.pages) > pc.maxPages {
 				delete(pc.pages, p.pgno)
-				if globalPageSlab.Initialized(pc.pageSize) {
-					globalPageSlab.Put(p.data)
-					p.data = nil
-				}
+				// Add to pFree for direct reuse by create() instead of returning
+				// buffer to slab (which would drop it — slab is full under
+				// pressure). Matches SQLite pcache1FreePage: bulk-local pages
+				// go to pCache->pFree (pcache1.c:475-477).
+				pc.pFree = append(pc.pFree, p)
 			} else {
 				pc.lruPrepend(p)
 			}

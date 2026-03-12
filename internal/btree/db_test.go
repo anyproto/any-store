@@ -3418,7 +3418,11 @@ func TestMaxReaders_CloseUnblocksWaitingReaders(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// Close the DB — should unblock the waiting reader.
-	// First rollback the active reader so Close can acquire mu.Lock.
+	// Mark closing BEFORE releasing the reader slot, so the goroutine
+	// sees closing=true when it wakes up and enters BeginRead.
+	// Without this, the goroutine can race through BeginRead successfully
+	// (seeing closing=false), hold mu.RLock forever, and deadlock Close.
+	db.SetClosing()
 	require.NoError(t, tx1.Rollback())
 	require.NoError(t, db.Close())
 

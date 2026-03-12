@@ -618,10 +618,10 @@ func TestPcacheBufferRecycling_EvictionFromPFreeOrSlab(t *testing.T) {
 	pc.release(pg6)
 }
 
-func TestPcacheBufferRecycling_ReaderEvictionReturnsSlab(t *testing.T) {
-	// Reader caches (xStress == nil) should return evicted page buffers to the
-	// slab immediately. Unlike writer caches, readers have no writePages map,
-	// so evicted buffers are safe to recycle.
+func TestPcacheBufferRecycling_ReaderEvictionRecyclesDirect(t *testing.T) {
+	// Reader caches (xStress == nil) should directly reuse the evicted page's
+	// buffer for the new page, bypassing the Put→Get slab round-trip.
+	// Matches SQLite pcache1.c:900 (step 4 reuses victim's buffer directly).
 	globalPageSlab.Reset()
 	globalPageSlab.Init(4096, 500)
 	defer globalPageSlab.Reset()
@@ -641,24 +641,23 @@ func TestPcacheBufferRecycling_ReaderEvictionReturnsSlab(t *testing.T) {
 	freeCountBefore := len(globalPageSlab.freeList)
 	globalPageSlab.mu.Unlock()
 
-	// Create page 6 — should evict page 1 and return its buffer to slab
+	// Create page 6 — should evict page 1 and reuse its buffer directly
 	pg6 := pc.create(6, 2)
 	require.NotNil(t, pg6)
 
 	assert.Nil(t, pc.pages[1], "page 1 should have been evicted")
 	assert.Len(t, pc.pages, 5)
 
-	// Slab should have received the evicted buffer back
+	// Slab free count should be unchanged — no Put (evicted buffer reused
+	// directly) and no Get (recycled page used instead of slab allocation).
 	globalPageSlab.mu.Lock()
 	freeCountAfter := len(globalPageSlab.freeList)
 	globalPageSlab.mu.Unlock()
 
-	// The evicted page's buffer was returned to slab (+1), but the new page
-	// may have allocated from pFree (no slab change) or from slab (-1).
-	// Net: if from pFree, slab has +1. If from slab, net 0.
-	// Either way, slab should not have FEWER buffers than before.
-	assert.GreaterOrEqual(t, freeCountAfter, freeCountBefore,
-		"reader eviction should return buffer to slab; slab should not shrink")
+	assert.Equal(t, freeCountBefore, freeCountAfter,
+		"direct recycling should not touch slab at all")
+
+	pc.release(pg6)
 }
 
 func TestPcacheBufferRecycling_ClearReturnsSlab(t *testing.T) {
@@ -884,7 +883,9 @@ func TestPcacheAdmissionControl_NonPurgeableIgnoresCreateFlag(t *testing.T) {
 func TestPcacheUnpin_OverfullPressureEvictsImmediately(t *testing.T) {
 	// When cache is overfull (len(pages) > maxPages) and slab is under pressure,
 	// releasing a clean page should immediately evict it instead of adding to LRU.
-	// Matches SQLite pcache1.c:1094-1095 (pcache1Unpin).
+	// The evicted page goes to pFree for direct reuse by create(), not to slab.
+	// Matches SQLite pcache1.c:1094-1095 (pcache1Unpin) and pcache1FreePage
+	// (pcache1.c:475-477 — bulk-local pages go to pCache->pFree).
 	globalPageSlab.Reset()
 	globalPageSlab.Init(4096, 10) // small slab to easily create pressure
 	defer globalPageSlab.Reset()
@@ -905,10 +906,7 @@ func TestPcacheUnpin_OverfullPressureEvictsImmediately(t *testing.T) {
 	}
 	assert.True(t, globalPageSlab.UnderPressure())
 
-	// Record slab free count before release
-	globalPageSlab.mu.Lock()
-	freeCountBefore := len(globalPageSlab.freeList)
-	globalPageSlab.mu.Unlock()
+	pFreeBefore := len(pc.pFree)
 
 	// Release page 6 (clean) — should be immediately evicted, not added to LRU
 	pc.release(pgs[5])
@@ -916,12 +914,11 @@ func TestPcacheUnpin_OverfullPressureEvictsImmediately(t *testing.T) {
 	assert.Len(t, pc.pages, 5, "cache should shrink to maxPages")
 	assert.Equal(t, 0, pc.nRecyclable, "page should NOT go to LRU")
 
-	// Buffer should be returned to slab
-	globalPageSlab.mu.Lock()
-	freeCountAfter := len(globalPageSlab.freeList)
-	globalPageSlab.mu.Unlock()
-	assert.Equal(t, freeCountBefore+1, freeCountAfter,
-		"released page's buffer should be returned to slab")
+	// Page should be added to pFree for reuse, not returned to slab
+	assert.Equal(t, pFreeBefore+1, len(pc.pFree),
+		"released page should be added to pFree for direct reuse")
+	assert.NotNil(t, pc.pFree[len(pc.pFree)-1].data,
+		"pFree page should retain its data buffer")
 
 	// Return drained buffers
 	for _, buf := range drained {
