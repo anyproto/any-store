@@ -729,17 +729,25 @@ type seekBatch struct {
 
 // buildIndexSeekChain constructs the iterator chain for an index seek plan.
 func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort bool) Iterator {
-	// Adjust bounds for non-unique indexes (deferred from buildCBOIndexesInto
-	// to avoid allocation overhead for indexes that aren't chosen by CBO).
-	if !idx.Info.Unique && len(idx.Bounds) > 0 {
+	// Adjust End bounds so IndexIter range scans capture all key suffixes.
+	// For non-unique indexes, keys include a docId suffix after the index fields.
+	// For unique indexes with partial prefix bounds (BoundFields < len(FieldNames)),
+	// keys include trailing field values beyond the bound prefix.
+	// In both cases, appending 0xff to End extends the range to cover all suffixes.
+	needBoundsAdjust := len(idx.Bounds) > 0 &&
+		(!idx.Info.Unique || idx.BoundFields < len(idx.Info.FieldNames))
+	if needBoundsAdjust {
 		idx.Bounds = AdjustBoundsForNonUnique(idx.Bounds)
 	}
 
 	// Determine reverse scan direction
 	reverse := shouldReverse(params.Sorter, idx)
 
-	// Check for unique index point lookup (CoverIter shortcut)
-	if idx.Info.Unique && idx.PointLookup {
+	// Check for unique index point lookup (CoverIter shortcut).
+	// Only safe when ALL index fields are covered by equality bounds;
+	// a partial prefix (BoundFields < len(FieldNames)) can match multiple
+	// entries with different trailing fields, so a range scan is needed.
+	if idx.Info.Unique && idx.PointLookup && idx.BoundFields == len(idx.Info.FieldNames) {
 		var root Iterator = &CoverIter{
 			Source: &CursorSource{
 				Tx: params.Tx,

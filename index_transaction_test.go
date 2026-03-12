@@ -947,3 +947,63 @@ func TestIndex_Transaction_FindUpdateInTx(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, count)
 }
+
+// TestIndex_Transaction_CompoundUniquePrefixQuery verifies that querying a
+// compound unique index by prefix (first field only) returns all matching
+// entries. Regression test for a bug where CoverIter was incorrectly used
+// for partial-prefix queries on unique compound indexes, returning only 1
+// result instead of all matches.
+func TestIndex_Transaction_CompoundUniquePrefixQuery(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "changes")
+	require.NoError(t, err)
+
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Fields: []string{"t", "o"},
+		Unique: true,
+	}))
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Fields: []string{"_q"},
+	}))
+
+	// Outer WriteTx — inserts via coll.Insert create savepoints
+	outerTx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+
+	arena := &anyenc.Arena{}
+
+	// Insert root
+	root := arena.NewObject()
+	root.Set("id", arena.NewString("myroot"))
+	root.Set("t", arena.NewString("mytree"))
+	root.Set("o", arena.NewString("A"))
+	root.Set("sc", arena.NewNumberInt(1))
+	root.Set("r", arena.NewBinary(make([]byte, 300)))
+	require.NoError(t, coll.Insert(outerTx.Context(), root))
+	arena.Reset()
+
+	// Insert 5 changes
+	for i := 0; i < 5; i++ {
+		obj := arena.NewObject()
+		obj.Set("id", arena.NewString(fmt.Sprintf("ch%d", i)))
+		obj.Set("t", arena.NewString("mytree"))
+		obj.Set("o", arena.NewString(fmt.Sprintf("B%d", i)))
+		obj.Set("sc", arena.NewNumberInt(1))
+		obj.Set("_q", arena.NewNumberInt(i+1))
+		obj.Set("r", arena.NewBinary(make([]byte, 200)))
+		require.NoError(t, coll.Insert(outerTx.Context(), obj))
+		arena.Reset()
+	}
+
+	require.NoError(t, outerTx.Commit())
+
+	// Full scan should find all 6 docs
+	fullCount, err := coll.Find(nil).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 6, fullCount)
+
+	// Prefix query on first field of compound unique index should return all 6
+	filtCount, err := coll.Find(`{"t":"mytree"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 6, filtCount)
+}
