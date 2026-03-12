@@ -1117,7 +1117,7 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 		if p.inProcess {
 			frame = p.wal.index.get(1, effectiveMaxFrame)
 		} else {
-			frame = p.wal.index.shmHashGet(1, effectiveMaxFrame)
+			frame = p.wal.index.shmHashGet(1, effectiveMaxFrame, p.wal.index.nBackfill.Load()+1)
 		}
 		if frame > 0 {
 			var buf [dbHeaderSize]byte

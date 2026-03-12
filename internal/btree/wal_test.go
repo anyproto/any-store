@@ -678,7 +678,7 @@ func TestWriteFramesCommitFalseDoesNotWriteShmHash(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg1}, true, 1))
 
 	// Verify committed page 1 is in SHM hash
-	frame := w.index.shmHashGet(1, 10)
+	frame := w.index.shmHashGet(1, 10, 1)
 	assert.Equal(t, uint32(1), frame, "committed page should be in SHM hash")
 
 	// Now spill pages 2 and 3 (commit=false)
@@ -689,9 +689,9 @@ func TestWriteFramesCommitFalseDoesNotWriteShmHash(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg2, pg3}, false, 0))
 
 	// Spilled pages should NOT be in SHM hash
-	frame = w.index.shmHashGet(2, 10)
+	frame = w.index.shmHashGet(2, 10, 1)
 	assert.Equal(t, uint32(0), frame, "spilled page 2 should not be in SHM hash")
-	frame = w.index.shmHashGet(3, 10)
+	frame = w.index.shmHashGet(3, 10, 1)
 	assert.Equal(t, uint32(0), frame, "spilled page 3 should not be in SHM hash")
 
 	// But writer can still find them via pageMap
@@ -849,8 +849,8 @@ func TestCrossProcessReaderDoesNotSeeSpilledFrames(t *testing.T) {
 	assert.Equal(t, uint32(2), hdr1.nPage, "SHM header nPage should be 2 after commit")
 
 	// Verify committed pages are in SHM hash
-	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10), "committed page 1 should be in SHM hash")
-	assert.Equal(t, uint32(2), w.index.shmHashGet(2, 10), "committed page 2 should be in SHM hash")
+	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10, 1), "committed page 1 should be in SHM hash")
+	assert.Equal(t, uint32(2), w.index.shmHashGet(2, 10, 1), "committed page 2 should be in SHM hash")
 
 	// Spill pages 3 and 4 (commit=false)
 	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
@@ -871,12 +871,12 @@ func TestCrossProcessReaderDoesNotSeeSpilledFrames(t *testing.T) {
 	assert.Equal(t, uint32(4), w.index.maxFrame.Load(), "maxFrame should include spilled frames")
 
 	// Spilled pages should NOT be in SHM hash
-	assert.Equal(t, uint32(0), w.index.shmHashGet(3, 10), "spilled page 3 must not be in SHM hash")
-	assert.Equal(t, uint32(0), w.index.shmHashGet(4, 10), "spilled page 4 must not be in SHM hash")
+	assert.Equal(t, uint32(0), w.index.shmHashGet(3, 10, 1), "spilled page 3 must not be in SHM hash")
+	assert.Equal(t, uint32(0), w.index.shmHashGet(4, 10, 1), "spilled page 4 must not be in SHM hash")
 
 	// Committed pages still accessible via SHM hash
-	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10), "committed page 1 still in SHM hash")
-	assert.Equal(t, uint32(2), w.index.shmHashGet(2, 10), "committed page 2 still in SHM hash")
+	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10, 1), "committed page 1 still in SHM hash")
+	assert.Equal(t, uint32(2), w.index.shmHashGet(2, 10, 1), "committed page 2 still in SHM hash")
 
 	// A cross-process reader using getLatest (with empty pageMap) should not see spilled pages
 	// Simulate by creating a fresh walIndex pointing to same SHM
@@ -995,8 +995,8 @@ func TestWriteFramesCommitFlushesToShm(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg1, pg2}, false, 0))
 
 	// Verify NOT in SHM hash yet
-	assert.Equal(t, uint32(0), w.index.shmHashGet(1, 10))
-	assert.Equal(t, uint32(0), w.index.shmHashGet(2, 10))
+	assert.Equal(t, uint32(0), w.index.shmHashGet(1, 10, 1))
+	assert.Equal(t, uint32(0), w.index.shmHashGet(2, 10, 1))
 
 	// Now commit page 3
 	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
@@ -1004,11 +1004,11 @@ func TestWriteFramesCommitFlushesToShm(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg3}, true, 3))
 
 	// All frames should now be in SHM hash (pending flushed + commit batch)
-	frame := w.index.shmHashGet(1, 10)
+	frame := w.index.shmHashGet(1, 10, 1)
 	assert.Equal(t, uint32(1), frame, "spilled page 1 should be in SHM hash after commit")
-	frame = w.index.shmHashGet(2, 10)
+	frame = w.index.shmHashGet(2, 10, 1)
 	assert.Equal(t, uint32(2), frame, "spilled page 2 should be in SHM hash after commit")
-	frame = w.index.shmHashGet(3, 10)
+	frame = w.index.shmHashGet(3, 10, 1)
 	assert.Equal(t, uint32(3), frame, "committed page 3 should be in SHM hash after commit")
 
 	// Pending SHM frames should be cleared

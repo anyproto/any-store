@@ -19,16 +19,16 @@ func TestShmHashTableBasic(t *testing.T) {
 	wi.shmHashWrite(30, 3)
 
 	// Look them up via shm
-	assert.Equal(t, uint32(1), wi.shmHashGet(10, 10))
-	assert.Equal(t, uint32(2), wi.shmHashGet(20, 10))
-	assert.Equal(t, uint32(3), wi.shmHashGet(30, 10))
+	assert.Equal(t, uint32(1), wi.shmHashGet(10, 10, 1))
+	assert.Equal(t, uint32(2), wi.shmHashGet(20, 10, 1))
+	assert.Equal(t, uint32(3), wi.shmHashGet(30, 10, 1))
 
 	// Non-existent page
-	assert.Equal(t, uint32(0), wi.shmHashGet(99, 10))
+	assert.Equal(t, uint32(0), wi.shmHashGet(99, 10, 1))
 
 	// maxFrame limit: frame 3 is invisible when maxFrame=2
-	assert.Equal(t, uint32(0), wi.shmHashGet(30, 2))
-	assert.Equal(t, uint32(2), wi.shmHashGet(20, 2))
+	assert.Equal(t, uint32(0), wi.shmHashGet(30, 2, 1))
+	assert.Equal(t, uint32(2), wi.shmHashGet(20, 2, 1))
 }
 
 func TestShmHashTableOverwrite(t *testing.T) {
@@ -41,10 +41,10 @@ func TestShmHashTableOverwrite(t *testing.T) {
 	wi.shmHashWrite(10, 5)
 
 	// Should find the latest frame
-	assert.Equal(t, uint32(5), wi.shmHashGet(10, 10))
+	assert.Equal(t, uint32(5), wi.shmHashGet(10, 10, 1))
 
 	// With maxFrame=3, should find frame 1
-	assert.Equal(t, uint32(1), wi.shmHashGet(10, 3))
+	assert.Equal(t, uint32(1), wi.shmHashGet(10, 3, 1))
 }
 
 func TestShmHashTableCollision(t *testing.T) {
@@ -59,7 +59,7 @@ func TestShmHashTableCollision(t *testing.T) {
 
 	// All should be findable
 	for i := uint32(1); i <= 1000; i++ {
-		got := wi.shmHashGet(i*100, 1000)
+		got := wi.shmHashGet(i*100, 1000, 1)
 		assert.Equal(t, i, got, "page %d", i*100)
 	}
 }
@@ -80,14 +80,14 @@ func TestShmHashTableMultiSegment(t *testing.T) {
 	// Verify all lookups work
 	for f := uint32(1); f <= totalFrames; f++ {
 		pgno := f + 100
-		got := wi.shmHashGet(pgno, totalFrames)
+		got := wi.shmHashGet(pgno, totalFrames, 1)
 		assert.Equal(t, f, got, "frame for page %d", pgno)
 	}
 
 	// Verify maxFrame boundary at segment edge
-	assert.Equal(t, uint32(4062), wi.shmHashGet(4062+100, 4062))
-	assert.Equal(t, uint32(4063), wi.shmHashGet(4063+100, totalFrames))
-	assert.Equal(t, uint32(0), wi.shmHashGet(4063+100, 4062)) // beyond maxFrame
+	assert.Equal(t, uint32(4062), wi.shmHashGet(4062+100, 4062, 1))
+	assert.Equal(t, uint32(4063), wi.shmHashGet(4063+100, totalFrames, 1))
+	assert.Equal(t, uint32(0), wi.shmHashGet(4063+100, 4062, 1)) // beyond maxFrame
 }
 
 func TestShmHashTableClear(t *testing.T) {
@@ -99,13 +99,13 @@ func TestShmHashTableClear(t *testing.T) {
 	for f := uint32(1); f <= 100; f++ {
 		wi.shmHashWrite(f, f)
 	}
-	assert.Equal(t, uint32(50), wi.shmHashGet(50, 100))
+	assert.Equal(t, uint32(50), wi.shmHashGet(50, 100, 1))
 
 	// Clear
 	wi.shmClearHash()
 
 	// Should not find anything
-	assert.Equal(t, uint32(0), wi.shmHashGet(50, 100))
+	assert.Equal(t, uint32(0), wi.shmHashGet(50, 100, 1))
 }
 
 func TestShmCkptInfo(t *testing.T) {
@@ -163,7 +163,7 @@ func TestShmHashIntegrationWithSetBatch(t *testing.T) {
 			continue
 		}
 		latestFrame := frames[len(frames)-1]
-		shmFrame := wi.shmHashGet(pgno, maxFrame)
+		shmFrame := wi.shmHashGet(pgno, maxFrame, 1)
 		assert.Equal(t, latestFrame, shmFrame, "page %d: map latest=%d shm=%d", pgno, latestFrame, shmFrame)
 	}
 	wi.mu.RUnlock()
@@ -193,7 +193,7 @@ func TestShmHashAfterCheckpoint(t *testing.T) {
 
 	// If WAL was reset, maxFrame should be 0 and lookups return 0
 	if maxFrame == 0 {
-		assert.Equal(t, uint32(0), wi.shmHashGet(1, 100))
+		assert.Equal(t, uint32(0), wi.shmHashGet(1, 100, 1))
 	}
 
 	// Data should still be readable from DB

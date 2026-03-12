@@ -657,7 +657,7 @@ func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
 	// single-process mode. Another process may have written frames
 	// that are not in our pageMap.
 	if !wi.inProcess {
-		if frame := wi.shmHashGet(pgno, maxFrame); frame >= minFrame {
+		if frame := wi.shmHashGet(pgno, maxFrame, minFrame); frame > 0 {
 			return frame
 		}
 	}
@@ -688,8 +688,11 @@ func (wi *walIndex) getLatest(pgno uint32) uint32 {
 	// Cross-process fallback: check SHM hash tables.
 	// Use mxCommitFrame so spilled uncommitted frames (which are not
 	// written to SHM hash during spill) are bounded correctly.
+	// getLatest is used for cache invalidation, not snapshot reads,
+	// so minFrame=1 (search all non-checkpointed segments).
 	if !wi.inProcess {
-		return wi.shmHashGet(pgno, wi.mxCommitFrame.Load())
+		minFrame := wi.nBackfill.Load() + 1
+		return wi.shmHashGet(pgno, wi.mxCommitFrame.Load(), minFrame)
 	}
 
 	return 0
@@ -911,14 +914,24 @@ func (wi *walIndex) shmHashWrite(pgno, frame uint32) {
 // shmHashGet looks up the latest frame for pgno from shm hash tables.
 // Returns 0 if not found. Only frames <= maxFrame are considered.
 // This is the cross-process read path; same-process readers use the Go map.
-func (wi *walIndex) shmHashGet(pgno, maxFrame uint32) uint32 {
+// shmHashGet searches SHM hash tables for the latest frame of pgno within
+// [minFrame, maxFrame]. This is the cross-process fallback when pageMap
+// doesn't contain the page — another process may have written WAL frames.
+//
+// Matches SQLite's walFindFrame (wal.c:3554-3581): only scan hash segments
+// that could contain frames in [minFrame, maxFrame], searching backwards
+// from the newest segment. This avoids scanning already-checkpointed
+// segments, which is critical for performance on large WALs.
+func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) uint32 {
 	if maxFrame == 0 {
 		return 0
 	}
 
 	lastSeg, _ := htFrameSegIdx(maxFrame)
+	// Match SQLite wal.c:3554 — skip segments before minFrame.
+	minSeg, _ := htFrameSegIdx(minFrame)
 
-	for seg := lastSeg; seg >= 0; seg-- {
+	for seg := lastSeg; seg >= minSeg; seg-- {
 		region, err := wi.shm.region(seg, false)
 		if err != nil {
 			continue
@@ -939,7 +952,7 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame uint32) uint32 {
 				storedPgno := binary.LittleEndian.Uint32(region[pgnoBase+idx*4:])
 				if storedPgno == pgno {
 					frame := iZero + uint32(idx) + 1
-					if frame <= maxFrame && frame > bestFrame {
+					if frame <= maxFrame && frame >= minFrame && frame > bestFrame {
 						bestFrame = frame
 					}
 				}
@@ -1602,6 +1615,9 @@ func (w *wal) readFrame(frame uint32, buf []byte) error {
 	}
 	// File path: no lock needed. WAL frames are immutable once written,
 	// and nFrame was already validated atomically above.
+	if w.file == nil {
+		return ErrWALCorrupt
+	}
 	frameSize := int64(walFrameSize) + int64(w.pageSize)
 	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
 	_, err := w.file.ReadAt(buf[:w.pageSize], offset)

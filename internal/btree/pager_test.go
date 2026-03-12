@@ -2222,18 +2222,18 @@ func TestShmHashWriteGet_CrossSegment(t *testing.T) {
 	}
 
 	// Look up some entries
-	frame := idx.shmHashGet(1, 5000)
+	frame := idx.shmHashGet(1, 5000, 1)
 	assert.Equal(t, uint32(1), frame)
 
-	frame = idx.shmHashGet(4070, 5000)
+	frame = idx.shmHashGet(4070, 5000, 1)
 	assert.Equal(t, uint32(4070), frame)
 
 	// Look up non-existent
-	frame = idx.shmHashGet(9999, 5000)
+	frame = idx.shmHashGet(9999, 5000, 1)
 	assert.Equal(t, uint32(0), frame)
 
 	// maxFrame=0 returns 0
-	frame = idx.shmHashGet(1, 0)
+	frame = idx.shmHashGet(1, 0, 1)
 	assert.Equal(t, uint32(0), frame)
 }
 
@@ -3019,7 +3019,7 @@ func TestShmHashGet_RegionError(t *testing.T) {
 	defer idx.close()
 
 	// Query when no regions have data -> should return 0
-	frame := idx.shmHashGet(1, 100)
+	frame := idx.shmHashGet(1, 100, 1)
 	assert.Equal(t, uint32(0), frame)
 }
 
