@@ -3620,8 +3620,8 @@ func TestReaderCachePool_Lifecycle(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	// Verify readerCacheSize is computed correctly: max(500/10, 50) = 50
-	assert.Equal(t, 50, db.readerCacheSize)
+	// Reader cache uses same size as writer cache (matches SQLite)
+	assert.Equal(t, 500, db.readerCacheSize)
 }
 
 func TestReaderCachePool_SmallCacheSize(t *testing.T) {
@@ -3630,8 +3630,7 @@ func TestReaderCachePool_SmallCacheSize(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	// max(100/10, 50) = 50
-	assert.Equal(t, 50, db.readerCacheSize)
+	assert.Equal(t, 100, db.readerCacheSize)
 }
 
 func TestReaderCachePool_LargeCacheSize(t *testing.T) {
@@ -3640,8 +3639,7 @@ func TestReaderCachePool_LargeCacheSize(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	// max(10000/10, 50) = 1000
-	assert.Equal(t, 1000, db.readerCacheSize)
+	assert.Equal(t, 10000, db.readerCacheSize)
 }
 
 // ===== Task 5: Wire readers to private caches =====

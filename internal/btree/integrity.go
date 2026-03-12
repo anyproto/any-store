@@ -444,6 +444,7 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 
 	// Use a private reader cache to avoid racing with the writer's cache.
 	cache := newPcache(int(db.pager.pageSize), 200, true)
+	cache.useSlab = db.pager.useSlab
 	defer cache.destroy()
 
 	// Read page 1 to get the current header

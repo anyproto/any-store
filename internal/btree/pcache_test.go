@@ -489,6 +489,7 @@ func TestPcacheBulkAlloc_InitBulkOnFirstCreate(t *testing.T) {
 	defer globalPageSlab.Reset()
 
 	pc := newPcache(4096, 50, true)
+	pc.useSlab = true
 
 	// Before any create(), bulkInit should be false and pFree empty
 	assert.False(t, pc.bulkInit)
@@ -525,6 +526,7 @@ func TestPcacheBulkAlloc_FallbackToSlabAfterPFreeExhausted(t *testing.T) {
 
 	// Use maxPages=5 so initBulk allocates only 5 pages
 	pc := newPcache(4096, 5, true)
+	pc.useSlab = true
 
 	// Create 5 pages — first triggers initBulk (nBulk = min(5, 100) = 5),
 	// uses all 5 from pFree
@@ -573,6 +575,7 @@ func TestPcacheBulkAlloc_MaxBulk100(t *testing.T) {
 	defer globalPageSlab.Reset()
 
 	pc := newPcache(4096, 5000, true)
+	pc.useSlab = true
 
 	// Trigger initBulk via first create
 	pg := pc.create(1, 2)
@@ -592,6 +595,7 @@ func TestPcacheBufferRecycling_EvictionFromPFreeOrSlab(t *testing.T) {
 	defer globalPageSlab.Reset()
 
 	pc := newPcache(4096, 5, true)
+	pc.useSlab = true
 	// Set xStress to simulate writer cache (writerCache aliasing concern)
 	pc.xStress = func(p *page) error { return nil }
 
@@ -627,6 +631,7 @@ func TestPcacheBufferRecycling_ReaderEvictionRecyclesDirect(t *testing.T) {
 	defer globalPageSlab.Reset()
 
 	pc := newPcache(4096, 5, true) // no xStress = reader cache
+	pc.useSlab = true
 
 	// Create and release 5 pages (fills cache)
 	for i := uint32(1); i <= 5; i++ {
@@ -668,6 +673,7 @@ func TestPcacheBufferRecycling_ClearReturnsSlab(t *testing.T) {
 	defer globalPageSlab.Reset()
 
 	pc := newPcache(4096, 50, true)
+	pc.useSlab = true
 
 	// Create 10 pages (triggers initBulk with 50 pages from slab)
 	for i := uint32(1); i <= 10; i++ {
@@ -719,6 +725,7 @@ func TestPcacheBufferRecycling_DiscardReturnsSlab(t *testing.T) {
 	defer globalPageSlab.Reset()
 
 	pc := newPcache(4096, 100, true)
+	pc.useSlab = true
 
 	pg := pc.create(1, 2)
 	pc.release(pg)
@@ -746,6 +753,7 @@ func TestPcacheBufferRecycling_TruncateReturnsSlab(t *testing.T) {
 	defer globalPageSlab.Reset()
 
 	pc := newPcache(4096, 100, true)
+	pc.useSlab = true
 
 	for i := uint32(1); i <= 10; i++ {
 		pg := pc.create(i, 2)
@@ -769,8 +777,9 @@ func TestPcacheBufferRecycling_TruncateReturnsSlab(t *testing.T) {
 	assert.Len(t, pc.pages, 5)
 }
 
-func TestPcacheBulkAlloc_NoSlabFallsBackToMake(t *testing.T) {
-	// When slab is not initialized, create() should still work via make()
+func TestPcacheBulkAlloc_NoSlabFallsBackToSyncPool(t *testing.T) {
+	// When slab is not initialized, create() should still work via sync.Pool/make.
+	// initBulk pre-allocates page structs with buffers from sync.Pool.
 	globalPageSlab.Reset()
 	defer globalPageSlab.Reset()
 
@@ -779,7 +788,9 @@ func TestPcacheBulkAlloc_NoSlabFallsBackToMake(t *testing.T) {
 	require.NotNil(t, pg)
 	assert.Len(t, pg.data, 4096)
 	assert.True(t, pc.bulkInit, "bulkInit should be set even without slab")
-	assert.Empty(t, pc.pFree, "pFree should be empty when slab not initialized")
+	// pFree is populated by initBulk (pre-allocated from sync.Pool/make),
+	// minus the one page consumed by create(). initBulk allocates min(maxPages, 100) = 100.
+	assert.Len(t, pc.pFree, 99, "pFree should have 99 pages (100 bulk - 1 consumed by create)")
 
 	pc.release(pg)
 }
@@ -841,6 +852,7 @@ func TestPcacheAdmissionControl_SlabPressureLowRecyclable(t *testing.T) {
 	defer globalPageSlab.Reset()
 
 	pc := newPcache(4096, 100, true)
+	pc.useSlab = true
 
 	// Drain the slab to create pressure
 	drained := make([][]byte, 0)
@@ -902,6 +914,7 @@ func TestPcacheUnpin_OverfullPressureEvictsImmediately(t *testing.T) {
 	defer globalPageSlab.Reset()
 
 	pc := newPcache(4096, 5, true)
+	pc.useSlab = true
 
 	// Create 6 pages with hard create (cache grows beyond maxPages=5)
 	pgs := make([]*page, 6)
@@ -949,6 +962,7 @@ func TestPcacheUnpin_OverfullNoPressureGoesToLRU(t *testing.T) {
 	defer globalPageSlab.Reset()
 
 	pc := newPcache(4096, 5, true)
+	pc.useSlab = true
 
 	// Create 6 pages with hard create (cache grows beyond maxPages=5)
 	pgs := make([]*page, 6)

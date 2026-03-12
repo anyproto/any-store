@@ -7520,6 +7520,8 @@ func TestPagerSlabIntegration(t *testing.T) {
 
 	dir := t.TempDir()
 	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+	p.useSlab = true
+	p.writerCache.useSlab = true
 	p.inProcess = true
 	require.NoError(t, p.open())
 	defer p.close()
@@ -7564,6 +7566,7 @@ func TestPagerSlabIntegration(t *testing.T) {
 	defer p.endRead(slot2)
 
 	readerCache := newPcache(4096, 50, true)
+	readerCache.useSlab = true
 
 	freeBeforeRead := len(globalPageSlab.freeList)
 	for _, pgno := range pageNos {
@@ -7616,6 +7619,8 @@ func TestPagerTempPageSlabRoundtrip(t *testing.T) {
 
 	dir := t.TempDir()
 	p := newPager(filepath.Join(dir, "test.db"), 4096, 50, true)
+	p.useSlab = true
+	p.writerCache.useSlab = true
 	p.inProcess = true
 	require.NoError(t, p.open())
 	defer p.close()

@@ -62,4 +62,8 @@ var (
 
 	// ErrDatabaseOpen indicates the database file is already open in this process.
 	ErrDatabaseOpen = errors.New("btree: database already open in this process")
+
+	// ErrPageSlabNotInitialized indicates UsePageSlab was set but the global
+	// page slab was not initialized via ConfigPageCache.
+	ErrPageSlabNotInitialized = errors.New("btree: page slab not initialized (call ConfigPageCache first)")
 )

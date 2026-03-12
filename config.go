@@ -3,8 +3,18 @@ package anystore
 import (
 	"time"
 
+	"github.com/anyproto/any-store/internal/btree"
 	"github.com/anyproto/any-store/internal/durability"
 )
+
+// InitPageBuffer pre-allocates a global pool of nPages page-sized buffers.
+// Must be called before opening any databases that use UseGlobalPageBuffer.
+// Mirrors sqlite3_config(SQLITE_CONFIG_PAGECACHE). Call once at process startup.
+//
+// Example: InitPageBuffer(4096, 5000) pre-allocates ~20MB of page buffers.
+func InitPageBuffer(pageSize, nPages int) {
+	btree.ConfigPageCache(pageSize, nPages)
+}
 
 // Config provides the configuration options for the database.
 type Config struct {
@@ -34,6 +44,12 @@ type Config struct {
 	// DisableCompression disables S2 compression for document values.
 	// By default, objects larger than 256 bytes are compressed with S2.
 	DisableCompression bool
+
+	// UseGlobalPageBuffer opts this DB into the global pre-allocated page
+	// buffer pool. The pool must be initialized beforehand via InitPageBuffer.
+	// When false (default), page buffers use sync.Pool (GC-managed, like
+	// SQLite's default malloc mode).
+	UseGlobalPageBuffer bool
 
 	// DurabilityConfig provides configuration for crash recovery and idle auto-flush
 	Durability DurabilityConfig

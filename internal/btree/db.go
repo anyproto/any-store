@@ -58,12 +58,18 @@ type Options struct {
 	InMemory bool
 
 	// MaxReaders is the maximum number of concurrent read transactions per DB.
-	// Limits memory growth from persistent reader caches: each reader holds a
-	// private pcache with up to CacheSize/10 (min 50) pages that persist across
-	// transactions. Total reader cache memory per DB is bounded by
-	// MaxReaders * readerCacheSize * PageSize.
-	// Default: 4. No SQLite equivalent — our addition for memory management.
+	// Each reader holds a private pcache with up to CacheSize pages that
+	// persist across transactions (matching SQLite's per-connection cache).
+	// Total reader cache memory per DB is bounded by
+	// MaxReaders * CacheSize * PageSize.
+	// Default: 4.
 	MaxReaders int
+
+	// UsePageSlab opts this DB into the global pre-allocated page buffer slab.
+	// The slab must be initialized beforehand via ConfigPageCache (btree) or
+	// InitPageBuffer (anystore). When false (default), page buffers use
+	// sync.Pool, matching SQLite's default malloc-based allocation.
+	UsePageSlab bool
 }
 
 // DefaultOptions returns default database options.
@@ -152,8 +158,9 @@ func Open(path string, opts Options) (*DB, error) {
 		opts.InProcess = true
 	}
 
-	// Lazy-init global page slab if not already configured via ConfigPageCache.
-	globalPageSlab.Init(int(opts.PageSize), defaultSlabPages)
+	if opts.UsePageSlab && !globalPageSlab.initialized.Load() {
+		return nil, ErrPageSlabNotInitialized
+	}
 
 	// Prevent double-open of the same database file.
 	var canonicalPath string
@@ -175,6 +182,8 @@ func Open(path string, opts Options) (*DB, error) {
 	}()
 
 	p := newPager(path, opts.PageSize, opts.CacheSize, !opts.InMemory)
+	p.useSlab = opts.UsePageSlab
+	p.writerCache.useSlab = opts.UsePageSlab
 	p.inProcess = opts.InProcess
 	p.noCommitSync = opts.NoCommitSync
 	p.inMemory = opts.InMemory
@@ -191,10 +200,7 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, ErrOldFormat
 	}
 
-	readerCacheSize := opts.CacheSize / 10
-	if readerCacheSize < 50 {
-		readerCacheSize = 50
-	}
+	readerCacheSize := opts.CacheSize
 
 	maxReaders := opts.MaxReaders
 	if maxReaders <= 0 {
@@ -363,6 +369,7 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 		}
 	default:
 		cache = newPcache(int(db.pager.pageSize), db.readerCacheSize, true)
+		cache.useSlab = db.pager.useSlab
 		cache.dataVersion = curDV
 		cache.walMaxFrame = maxFrame
 	}
@@ -671,6 +678,7 @@ func (db *DB) GetNamespace(name string) (*Namespace, error) {
 	defer db.pager.endRead(slot)
 
 	cache := newPcache(int(db.pager.pageSize), 200, true)
+	cache.useSlab = db.pager.useSlab
 	defer cache.destroy()
 
 	return db.getNamespaceAt(name, maxFrame, cache)
@@ -759,6 +767,7 @@ func (db *DB) ListNamespaces() ([]string, error) {
 	defer db.pager.endRead(slot)
 
 	cache := newPcache(int(db.pager.pageSize), 200, true)
+	cache.useSlab = db.pager.useSlab
 	defer cache.destroy()
 
 	bt := &btree{pager: db.pager, cache: cache, rootPage: 1, walMaxFrame: maxFrame, writable: false}

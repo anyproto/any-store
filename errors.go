@@ -50,4 +50,8 @@ var (
 
 	ErrDBIsNotOpened       = errors.New("any-store: database is not opened")
 	ErrIncompatibleVersion = errors.New("any-store: incompatible version")
+
+	// ErrPageBufferNotInitialized is returned when UseGlobalPageBuffer is set
+	// but InitPageBuffer was not called before opening the database.
+	ErrPageBufferNotInitialized = errors.New("any-store: global page buffer not initialized (call InitPageBuffer first)")
 )
