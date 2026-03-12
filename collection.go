@@ -113,6 +113,8 @@ type collection struct {
 	db      *db
 	ns      *btree.Namespace
 
+	compression Compression // 0 = use db default
+
 	closed atomic.Bool
 	mu     sync.Mutex
 }
@@ -129,6 +131,13 @@ func (c *collection) init(ctx context.Context) error {
 	c.ns = ns
 
 	return c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
+		// Load per-collection config
+		cfg, err := c.db.loadCollConfig(tx, c.name)
+		if err != nil {
+			return err
+		}
+		c.compression = cfg.Compression
+
 		idxInfos, err := c.db.getIndexInfos(tx, c.name)
 		if err != nil {
 			return err
@@ -155,6 +164,20 @@ func (c *collection) Name() string {
 	defer c.mu.Unlock()
 	return c.name
 }
+
+// compressionDisabled returns whether compression is disabled for this collection.
+// Per-collection setting takes priority; falls back to db-wide config.
+func (c *collection) compressionDisabled() bool {
+	switch c.compression {
+	case NoCompression:
+		return true
+	case S2:
+		return false
+	default:
+		return c.db.config.DisableCompression
+	}
+}
+
 
 func (c *collection) FindId(ctx context.Context, docId any) (doc Doc, err error) {
 	return c.FindIdWithParser(ctx, &anyenc.Parser{}, docId)
@@ -235,7 +258,7 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 
 func (c *collection) insertItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, it item) (err error) {
 	buf.SmallBuf = it.appendId(buf.SmallBuf[:0])
-	if c.db.config.DisableCompression {
+	if c.compressionDisabled() {
 		buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
 	} else {
 		buf.DocBuf, buf.ScratchBuf = it.Value().MarshalCompressed(buf.DocBuf[:0], buf.ScratchBuf)
@@ -389,7 +412,7 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 		}
 	}
 
-	if c.db.config.DisableCompression {
+	if c.compressionDisabled() {
 		buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
 	} else {
 		buf.DocBuf, buf.ScratchBuf = it.Value().MarshalCompressed(buf.DocBuf[:0], buf.ScratchBuf)

@@ -102,3 +102,20 @@ func (c *Config) setDefaults() {
 func (m FlushMode) toRecoveryFlushMode() durability.FlushMode {
 	return durability.FlushMode(m)
 }
+
+// Compression specifies the compression algorithm for document values.
+type Compression int
+
+const (
+	// S2 enables S2 compression for objects larger than 256 bytes (default).
+	S2 Compression = 1
+	// NoCompression disables compression entirely.
+	NoCompression Compression = 2
+)
+
+// CollectionOptions configures per-collection settings at creation time.
+type CollectionOptions struct {
+	// Compression overrides the database-wide compression setting for this collection.
+	// Zero value inherits the database default.
+	Compression Compression
+}

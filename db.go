@@ -2,7 +2,6 @@ package anystore
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -12,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/btree"
 	"github.com/anyproto/any-store/internal/durability"
 	"github.com/anyproto/any-store/internal/durability/sentinel"
@@ -27,7 +27,7 @@ type DB interface {
 	// Returns the created Collection or an error if the collection already exists.
 	// Possible errors:
 	// - ErrCollectionExists: if the collection already exists.
-	CreateCollection(ctx context.Context, collectionName string) (Collection, error)
+	CreateCollection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error)
 
 	// OpenCollection opens an existing collection with the specified name.
 	// Returns the opened Collection or an error if the collection does not exist.
@@ -38,7 +38,7 @@ type DB interface {
 	// Collection is a convenience method to get or create a collection.
 	// It first attempts to open the collection, and if it does not exist, it creates the collection.
 	// Returns the Collection or an error if there is an issue creating or opening the collection.
-	Collection(ctx context.Context, collectionName string) (Collection, error)
+	Collection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error)
 
 	// GetCollectionNames returns a list of all collection names in the database.
 	// Returns a slice of collection names or an error if there is an issue retrieving the names.
@@ -186,12 +186,12 @@ func collKey(name string) []byte {
 	return []byte("coll:" + name)
 }
 
-type indexMeta struct {
-	Name       string   `json:"name"`
-	Fields     []string `json:"fields"`
-	Sparse     bool     `json:"sparse"`
-	Unique     bool     `json:"unique"`
-	SketchSize int      `json:"sketchSize,omitempty"`
+func collConfigKey(name string) []byte {
+	return []byte("collcfg:" + name)
+}
+
+type collConfig struct {
+	Compression Compression
 }
 
 func indexKey(collName, indexName string) []byte {
@@ -287,13 +287,24 @@ func (db *db) reloadSketches(tx *btree.ReadTx) {
 	}
 }
 
-func (db *db) CreateCollection(ctx context.Context, collectionName string) (Collection, error) {
+func mergeCollOpts(opts []CollectionOptions) CollectionOptions {
+	var merged CollectionOptions
+	for _, o := range opts {
+		if o.Compression != 0 {
+			merged.Compression = o.Compression
+		}
+	}
+	return merged
+}
+
+func (db *db) CreateCollection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error) {
 	db.mu.Lock()
 	if _, ok := db.openedCollections[collectionName]; ok {
 		db.mu.Unlock()
 		return nil, ErrCollectionExists
 	}
 	db.mu.Unlock()
+	merged := mergeCollOpts(opts)
 	var coll Collection
 	err := db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
 		db.mu.Lock()
@@ -321,6 +332,16 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string) (Coll
 		// Register in system namespace
 		if err = tx.Put(db.systemNS, key, []byte("1")); err != nil {
 			return err
+		}
+
+		// Persist per-collection config if non-default
+		if merged.Compression != 0 {
+			var a anyenc.Arena
+			obj := a.NewObject()
+			obj.Set("compression", a.NewNumberInt(int(merged.Compression)))
+			if err = tx.Put(db.systemNS, collConfigKey(collectionName), obj.MarshalTo(nil)); err != nil {
+				return err
+			}
 		}
 
 		if coll, err = newCollection(ctx, db, collectionName); err != nil {
@@ -371,7 +392,7 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 	return coll, nil
 }
 
-func (db *db) Collection(ctx context.Context, collectionName string) (Collection, error) {
+func (db *db) Collection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error) {
 	coll, err := db.OpenCollection(ctx, collectionName)
 	if err == nil {
 		return coll, nil
@@ -379,7 +400,7 @@ func (db *db) Collection(ctx context.Context, collectionName string) (Collection
 	if !errors.Is(err, ErrCollectionNotFound) {
 		return nil, err
 	}
-	coll, err = db.CreateCollection(ctx, collectionName)
+	coll, err = db.CreateCollection(ctx, collectionName, opts...)
 	if err == nil {
 		return coll, nil
 	}
@@ -665,7 +686,10 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 	if err := cursor.Seek([]byte(prefix)); err != nil {
 		return nil, nil
 	}
-	var result []IndexInfo
+	var (
+		result []IndexInfo
+		p      anyenc.Parser
+	)
 	for cursor.Valid() {
 		key, err := cursor.Key()
 		if err != nil {
@@ -678,16 +702,19 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 		if err != nil {
 			return nil, err
 		}
-		var meta indexMeta
-		if err := json.Unmarshal(val, &meta); err != nil {
+		v, err := p.Parse(val)
+		if err != nil {
 			return nil, err
 		}
-		result = append(result, IndexInfo{
-			Name:   meta.Name,
-			Fields: meta.Fields,
-			Sparse: meta.Sparse,
-			Unique: meta.Unique,
-		})
+		info := IndexInfo{
+			Name:   v.GetString("name"),
+			Sparse: v.GetBool("sparse"),
+			Unique: v.GetBool("unique"),
+		}
+		for _, fv := range v.GetArray("fields") {
+			info.Fields = append(info.Fields, string(fv.GetStringBytes()))
+		}
+		result = append(result, info)
 		if err := cursor.Next(); err != nil {
 			return nil, err
 		}
@@ -702,17 +729,21 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 	if _, err := tx.Get(db.systemNS, key); err == nil {
 		return ErrIndexExists
 	}
-	meta := indexMeta{
-		Name:   info.Name,
-		Fields: info.Fields,
-		Sparse: info.Sparse,
-		Unique: info.Unique,
+	var a anyenc.Arena
+	obj := a.NewObject()
+	obj.Set("name", a.NewString(info.Name))
+	fields := a.NewArray()
+	for i, f := range info.Fields {
+		fields.SetArrayItem(i, a.NewString(f))
 	}
-	data, err := json.Marshal(meta)
-	if err != nil {
-		return err
+	obj.Set("fields", fields)
+	if info.Sparse {
+		obj.Set("sparse", a.NewTrue())
 	}
-	return tx.Put(db.systemNS, key, data)
+	if info.Unique {
+		obj.Set("unique", a.NewTrue())
+	}
+	return tx.Put(db.systemNS, key, obj.MarshalTo(nil))
 }
 
 // removeIndex removes index metadata from the system namespace
@@ -753,6 +784,8 @@ func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 			return err
 		}
 	}
+	// Remove collection config
+	_ = tx.Delete(db.systemNS, collConfigKey(collName))
 	return nil
 }
 
@@ -766,6 +799,12 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 		return err
 	}
 
+	// Rename collection config
+	if cfgData, err := tx.AppendValue(db.systemNS, collConfigKey(oldName), nil); err == nil {
+		_ = tx.Delete(db.systemNS, collConfigKey(oldName))
+		_ = tx.Put(db.systemNS, collConfigKey(newName), cfgData)
+	}
+
 	// Rename index keys
 	oldPrefix := indexKeyPrefix(oldName)
 	cursor := tx.NewCursor(db.systemNS)
@@ -775,9 +814,11 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 	}
 	type kv struct {
 		oldKey []byte
-		meta   indexMeta
+		name   string
+		val    []byte
 	}
 	var entries []kv
+	var p anyenc.Parser
 	for cursor.Valid() {
 		key, err := cursor.Key()
 		if err != nil {
@@ -790,11 +831,15 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 		if err != nil {
 			return err
 		}
-		var meta indexMeta
-		if err := json.Unmarshal(val, &meta); err != nil {
+		v, err := p.Parse(val)
+		if err != nil {
 			return err
 		}
-		entries = append(entries, kv{oldKey: append([]byte(nil), key...), meta: meta})
+		entries = append(entries, kv{
+			oldKey: append([]byte(nil), key...),
+			name:   v.GetString("name"),
+			val:    append([]byte(nil), val...),
+		})
 		if err := cursor.Next(); err != nil {
 			return err
 		}
@@ -803,16 +848,30 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 		if err := tx.Delete(db.systemNS, e.oldKey); err != nil {
 			return err
 		}
-		newKey := indexKey(newName, e.meta.Name)
-		data, err := json.Marshal(e.meta)
-		if err != nil {
-			return err
-		}
-		if err := tx.Put(db.systemNS, newKey, data); err != nil {
+		if err := tx.Put(db.systemNS, indexKey(newName, e.name), e.val); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// loadCollConfig loads per-collection config from the system namespace.
+func (db *db) loadCollConfig(tx *btree.ReadTx, collName string) (collConfig, error) {
+	var cfg collConfig
+	data, err := tx.AppendValue(db.systemNS, collConfigKey(collName), nil)
+	if err != nil {
+		if errors.Is(err, btree.ErrKeyNotFound) {
+			return cfg, nil // no config stored — use defaults
+		}
+		return cfg, err
+	}
+	var p anyenc.Parser
+	val, err := p.Parse(data)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.Compression = Compression(val.GetInt("compression"))
+	return cfg, nil
 }
 
 // listCollectionNames returns sorted collection names from system namespace
