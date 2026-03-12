@@ -3572,15 +3572,17 @@ func TestGetPageReader_StaleEviction(t *testing.T) {
 	// Verify page was evicted
 	assert.Nil(t, cache.fetch(1), "page should be gone after clear")
 
-	// Read again - should allocate a new page object
+	// Read again — page struct may be recycled from pFree (same pointer)
+	// but data should be freshly loaded from disk.
 	maxFrame2, slot2, err := db.pager.beginRead()
 	require.NoError(t, err)
 	defer db.pager.endRead(slot2)
 
 	pg2, err := db.pager.getPageReader(1, maxFrame2, cache)
 	require.NoError(t, err)
-	assert.NotEqual(t, pg1Ptr, pg2, "after clear, should get new page object")
 	assert.Equal(t, uint32(1), pg2.pgno)
+	// Page must have valid data (header deserialized from disk)
+	assert.NotZero(t, pg2.header, "page should have been read from disk after clear")
 	db.pager.releasePage(pg2)
 }
 

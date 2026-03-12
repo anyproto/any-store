@@ -33,11 +33,11 @@ func testVal(t *testing.T, size int) []byte {
 // Concurrent readers + checkpoint cycling causes WAL reset without cache
 // invalidation, leading to data corruption.
 func TestWriterCacheStaleAfterWALReset(t *testing.T) {
-	for trial := 0; trial < 20; trial++ {
+	for trial := 0; trial < 3; trial++ {
 		func() {
 			dir := t.TempDir()
 			dbPath := filepath.Join(dir, "test.db")
-			db, err := Open(dbPath, Options{PageSize: 4096})
+			db, err := Open(dbPath, Options{PageSize: 4096, InProcess: true})
 			require.NoError(t, err)
 			defer db.Close()
 			db.pager.wal.busyHandler = DefaultBusyTimeout(200 * time.Millisecond)

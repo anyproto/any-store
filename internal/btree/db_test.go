@@ -3273,9 +3273,11 @@ func TestPersistentReaderCache_CacheClearedAfterWrite(t *testing.T) {
 	require.NoError(t, rtx2.Rollback())
 }
 
-func TestPersistentReaderCache_ClearReturnsBuffersToSlab(t *testing.T) {
+func TestPersistentReaderCache_ClearKeepsBuffersLocal(t *testing.T) {
 	// When the cache is cleared due to walMaxFrame change, buffers should
-	// be returned to the slab (no memory leak).
+	// be kept in pFree for reuse (not returned to slab where they might be
+	// dropped). This matches SQLite pcache1FreePage: bulk-local pages go to
+	// pCache->pFree, surviving cache clears.
 	globalPageSlab.Reset()
 	globalPageSlab.Init(4096, 2000)
 	defer globalPageSlab.Reset()
@@ -3309,12 +3311,7 @@ func TestPersistentReaderCache_ClearReturnsBuffersToSlab(t *testing.T) {
 	require.Greater(t, cachedPages, 0)
 	require.NoError(t, rtx1.Rollback())
 
-	// Record slab free count before the clear
-	globalPageSlab.mu.Lock()
-	freeCountBefore := len(globalPageSlab.freeList)
-	globalPageSlab.mu.Unlock()
-
-	// Write tx to advance walMaxFrame
+	// Write tx to advance dataVersion
 	wtx2, err := db.BeginWrite()
 	require.NoError(t, err)
 	ns, err = db.getNamespaceLocked("test")
@@ -3322,21 +3319,15 @@ func TestPersistentReaderCache_ClearReturnsBuffersToSlab(t *testing.T) {
 	require.NoError(t, wtx2.Put(ns, binary.BigEndian.AppendUint32(nil, 99), make([]byte, 50)))
 	require.NoError(t, wtx2.Commit())
 
-	// Second read tx — should clear the cache (walMaxFrame changed),
-	// returning buffers to slab
+	// Second read tx — should clear the cache (dataVersion changed),
+	// keeping buffers in pFree for reuse
 	rtx2, err := db.BeginRead()
 	require.NoError(t, err)
 
-	// Check that slab got buffers back from the cleared cache
-	globalPageSlab.mu.Lock()
-	freeCountAfter := len(globalPageSlab.freeList)
-	globalPageSlab.mu.Unlock()
-
-	// The cleared cache should have returned its page buffers + pFree buffers to slab.
-	// We can't predict the exact count because the write tx also uses slab buffers,
-	// but we can verify the slab got SOME buffers back.
-	assert.Greater(t, freeCountAfter, freeCountBefore-cachedPages,
-		"slab should get buffers back when cache is cleared on walMaxFrame change")
+	// After clear: pages map should be empty, pFree should have the buffers
+	assert.Empty(t, rtx2.cache.pages, "cache should be empty after clear")
+	assert.Greater(t, len(rtx2.cache.pFree), 0,
+		"pFree should retain buffers after clear for reuse")
 
 	require.NoError(t, rtx2.Rollback())
 }

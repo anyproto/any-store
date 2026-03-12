@@ -7552,12 +7552,12 @@ func TestPagerSlabIntegration(t *testing.T) {
 	require.NoError(t, err)
 	p.endRead(slot)
 
-	// Clear the writer cache to return buffers
+	// Destroy the writer cache to return buffers to slab
 	freeBeforeClear := len(globalPageSlab.freeList)
-	p.writerCache.clear()
+	p.writerCache.destroy()
 	freeAfterClear := len(globalPageSlab.freeList)
 	assert.Greater(t, freeAfterClear, freeBeforeClear,
-		"clearing writer cache should return buffers to slab")
+		"destroying writer cache should return buffers to slab")
 
 	// --- Read transaction: pages go through getPageReader -> pcache.create ---
 	mf2, slot2, err := p.beginRead()
@@ -7577,11 +7577,11 @@ func TestPagerSlabIntegration(t *testing.T) {
 	assert.Less(t, freeAfterRead, freeBeforeRead,
 		"reading pages should consume slab buffers")
 
-	// Clear reader cache — should return all buffers
-	readerCache.clear()
+	// Destroy reader cache — should return all buffers to slab
+	readerCache.destroy()
 	freeAfterReaderClear := len(globalPageSlab.freeList)
 	assert.Greater(t, freeAfterReaderClear, freeAfterRead,
-		"clearing reader cache should return buffers to slab")
+		"destroying reader cache should return buffers to slab")
 
 	// --- Temp page (readTempPage) path: acquireTempPage uses slab ---
 	mf3, slot3, err := p.beginRead()

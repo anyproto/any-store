@@ -661,7 +661,8 @@ func TestPcacheBufferRecycling_ReaderEvictionRecyclesDirect(t *testing.T) {
 }
 
 func TestPcacheBufferRecycling_ClearReturnsSlab(t *testing.T) {
-	// clear() should return all page buffers (in-use + pFree) to the slab.
+	// clear() should move all page buffers to pFree for reuse (not slab).
+	// destroy() should return all buffers to slab.
 	globalPageSlab.Reset()
 	globalPageSlab.Init(4096, 500)
 	defer globalPageSlab.Reset()
@@ -678,27 +679,37 @@ func TestPcacheBufferRecycling_ClearReturnsSlab(t *testing.T) {
 	assert.Len(t, pc.pFree, 40)
 	assert.Len(t, pc.pages, 10)
 
-	// Record slab free count before clear
+	// clear() moves pages to pFree — slab should NOT change
 	globalPageSlab.mu.Lock()
 	freeCountBefore := len(globalPageSlab.freeList)
 	globalPageSlab.mu.Unlock()
 
 	pc.clear()
 
-	// After clear: 10 in-use page buffers + 40 pFree buffers = 50 returned to slab
 	globalPageSlab.mu.Lock()
-	freeCountAfter := len(globalPageSlab.freeList)
+	freeCountAfterClear := len(globalPageSlab.freeList)
 	globalPageSlab.mu.Unlock()
 
-	assert.Equal(t, freeCountBefore+50, freeCountAfter,
-		"clear() should return all 50 buffers (10 pages + 40 pFree) to slab")
-
-	// Cache should be empty
+	assert.Equal(t, freeCountBefore, freeCountAfterClear,
+		"clear() should not touch slab — buffers stay in pFree")
 	assert.Empty(t, pc.pages)
 	assert.Equal(t, 0, pc.nRecyclable)
 	assert.Equal(t, 0, pc.nDirty)
+	// pFree should have 40 (original) + 10 (moved from pages) = 50
+	assert.Len(t, pc.pFree, 50,
+		"clear() should move all 10 pages to pFree (total 50)")
+
+	// destroy() should return all 50 pFree buffers to slab
+	pc.destroy()
+
+	globalPageSlab.mu.Lock()
+	freeCountAfterDestroy := len(globalPageSlab.freeList)
+	globalPageSlab.mu.Unlock()
+
+	assert.Equal(t, freeCountBefore+50, freeCountAfterDestroy,
+		"destroy() should return all 50 buffers to slab")
 	assert.Empty(t, pc.pFree)
-	assert.False(t, pc.bulkInit, "bulkInit should be reset after clear")
+	assert.False(t, pc.bulkInit, "bulkInit should be reset after destroy")
 }
 
 func TestPcacheBufferRecycling_DiscardReturnsSlab(t *testing.T) {

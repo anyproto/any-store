@@ -70,6 +70,14 @@ type pcache struct {
 	// Modeled after SQLite's xStress in pcache.c.
 	xStress func(p *page) error
 
+	// onEvict is called when a clean page is evicted from the cache.
+	// For writer caches, the pager sets this to delete the page from
+	// writePages, breaking the stale reference so the page struct can be
+	// safely recycled for a different pgno. This matches SQLite's model
+	// where pcache1RemoveFromHash (pcache1.c:905) is the only reference
+	// removal needed — SQLite has no writePages map.
+	onEvict func(pgno uint32)
+
 	// szSpill is the spill threshold: xStress fires when page count exceeds
 	// szSpill. 0 means use maxPages as the threshold.
 	szSpill int
@@ -167,21 +175,22 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	// Step 4: Evict clean pages if cache is full (skip for non-purgeable / InMemory caches).
 	// Adapted from SQLite pcache1.c:897-914 (step 4 — SQLite reuses victim's buffer).
 	//
-	// Reader caches (xStress == nil): the last evicted page is kept for direct
-	// buffer reuse by the allocation step below, eliminating the Put→Get slab
-	// round-trip. This matches SQLite's step 4 (pcache1.c:900) which reuses the
-	// victim's PgHdr1 + buffer directly for the new page. Intermediate evictions
-	// (rare: only when multiple pages must be evicted) return buffers to slab.
+	// The last evicted page is kept for direct buffer reuse by the allocation
+	// step below, eliminating the slab Put→Get round-trip. This matches SQLite's
+	// step 4 (pcache1.c:900-906) which reuses the victim's PgHdr1 + buffer
+	// directly for the new page. Intermediate evictions (rare: only when multiple
+	// pages must be evicted) return buffers to slab.
 	//
-	// Writer caches (xStress != nil): evicted buffers are NOT touched because
-	// pager.writePages may still reference the evicted page struct after spill;
-	// writer buffers are returned in clear()/discard()/truncate() instead.
+	// For writer caches, evictOne() calls onEvict to remove the stale reference
+	// from pager.writePages, so the page struct can safely be re-keyed for a
+	// new pgno without aliasing. This matches SQLite where pcache1RemoveFromHash
+	// (pcache1.c:905) is the only cleanup needed — SQLite has no writePages map.
 	slabOk := globalPageSlab.Initialized(pc.pageSize)
 	var recycled *page
 	if pc.purgeable {
 		for len(pc.pages) >= pc.maxPages && pc.nRecyclable > 0 {
 			evicted := pc.evictOne()
-			if evicted != nil && pc.xStress == nil {
+			if evicted != nil {
 				// Keep last evicted page for direct reuse (SQLite step 4:
 				// pcache1.c:900 reuses victim's PgHdr1 + buffer directly).
 				// Return intermediate evictions to slab.
@@ -212,10 +221,14 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 				// pager to error state, so the error is not silently lost.
 				pc.xStress(victim)
 				// After stress callback, victim should be clean. Retry eviction.
-				// Writer cache: evicted buffers are NOT returned to slab here
-				// (writePages aliasing concern — see comment above).
 				for len(pc.pages) >= pc.maxPages && pc.nRecyclable > 0 {
-					pc.evictOne()
+					evicted := pc.evictOne()
+					if evicted != nil && recycled == nil {
+						recycled = evicted
+					} else if evicted != nil && slabOk {
+						globalPageSlab.Put(evicted.data)
+						evicted.data = nil
+					}
 				}
 			}
 		}
@@ -403,11 +416,36 @@ func (pc *pcache) appendDirtyPages(buf []*page) []*page {
 	return buf
 }
 
-// clear removes all pages from the cache, returning all data buffers to the
-// global slab. Also returns pFree buffers to the slab to prevent memory leaks
-// when a cache is cleared and reused.
-// Matches SQLite pcache.c release path — buffers go back to pcache1Free.
+// clear invalidates all cached pages but keeps their data buffers locally
+// in pFree for reuse by future create() calls. This avoids returning buffers
+// to the global slab (where they may be dropped when the slab is full) and
+// re-allocating on the next cache fill cycle.
+//
+// Matches SQLite pcache1FreePage (pcache1.c:476-477): bulk-local pages go
+// to pCache->pFree (local to the PCache instance), surviving cache clears.
+// We treat ALL pages as bulk-local since our slab has a fixed cap (unlike
+// SQLite's uncapped global free list) and would drop excess buffers.
+//
+// Used when the cache snapshot is invalidated but the cache object will be
+// reused (e.g. from sync.Pool with changed dataVersion, or writer cache
+// stale detection). For final disposal use destroy().
 func (pc *pcache) clear() {
+	for _, p := range pc.pages {
+		pc.pFree = append(pc.pFree, p)
+	}
+	clear(pc.pages)
+	pc.lruHead = nil
+	pc.lruTail = nil
+	pc.dirtyHead = nil
+	pc.dirtyTail = nil
+	pc.nRecyclable = 0
+	pc.nDirty = 0
+}
+
+// destroy removes all pages and returns all data buffers to the global slab.
+// Used when the cache will not be reused: temporary caches (getNamespace,
+// listNamespaces, integrity check) and pager close/error paths.
+func (pc *pcache) destroy() {
 	slabOk := globalPageSlab.Initialized(pc.pageSize)
 	for _, p := range pc.pages {
 		if slabOk {
@@ -415,7 +453,6 @@ func (pc *pcache) clear() {
 			p.data = nil
 		}
 	}
-	// Return pFree buffers to slab as well
 	if slabOk {
 		for _, p := range pc.pFree {
 			globalPageSlab.Put(p.data)
@@ -549,6 +586,13 @@ func (pc *pcache) evictOne() *page {
 	p.prev = nil
 	pc.nRecyclable--
 	delete(pc.pages, p.pgno)
+	// Notify pager to remove stale writePages reference (if any).
+	// This breaks the aliasing that previously prevented page recycling
+	// for writer caches. Matches SQLite pcache1.c:905
+	// (pcache1RemoveFromHash is the only cleanup needed — no writePages map).
+	if pc.onEvict != nil {
+		pc.onEvict(p.pgno)
+	}
 	return p
 }
 

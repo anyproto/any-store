@@ -107,9 +107,12 @@ type DB struct {
 	readTxPool  sync.Pool
 	writeTxPool sync.Pool
 
-	// readerCachePool recycles per-reader pcache instances.
-	// Each reader gets a private cache to avoid per-page allocations.
-	readerCachePool sync.Pool
+	// readerCaches is a GC-stable pool of per-reader pcache instances.
+	// Unlike sync.Pool, this channel survives GC cycles, so reader caches
+	// (including their pFree buffers) persist across transactions. This
+	// matches SQLite's model where PCache persists for the pager's lifetime.
+	// Capacity is MaxReaders (same as readerSem).
+	readerCaches    chan *pcache
 	readerCacheSize int // max(CacheSize/10, 50)
 
 	// readerSem limits the number of concurrent read transactions.
@@ -207,6 +210,7 @@ func Open(path string, opts Options) (*DB, error) {
 			rootPage: 1,
 		},
 		readerCacheSize: readerCacheSize,
+		readerCaches:    make(chan *pcache, maxReaders),
 		readerSem:       make(chan struct{}, maxReaders),
 		closeCh:         make(chan struct{}),
 	}
@@ -267,6 +271,16 @@ func (db *DB) Close() error {
 	// Wait for all active readers to finish
 	db.mu.Lock()
 	db.mu.Unlock()
+	// Drain reader cache pool — return buffers to slab.
+	for {
+		select {
+		case c := <-db.readerCaches:
+			c.destroy()
+		default:
+			goto drained
+		}
+	}
+drained:
 	err := db.pager.close()
 	// Remove from open registry after full cleanup
 	if !db.opts.InMemory {
@@ -340,14 +354,14 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 	// pager_reset only if change-counter changed).
 	curDV := db.dataVersion.Load()
 	var cache *pcache
-	if c, ok := db.readerCachePool.Get().(*pcache); ok {
-		cache = c
+	select {
+	case cache = <-db.readerCaches:
 		if cache.dataVersion != curDV || cache.walMaxFrame != maxFrame {
 			cache.clear()
 			cache.dataVersion = curDV
 			cache.walMaxFrame = maxFrame
 		}
-	} else {
+	default:
 		cache = newPcache(int(db.pager.pageSize), db.readerCacheSize, true)
 		cache.dataVersion = curDV
 		cache.walMaxFrame = maxFrame
@@ -657,7 +671,7 @@ func (db *DB) GetNamespace(name string) (*Namespace, error) {
 	defer db.pager.endRead(slot)
 
 	cache := newPcache(int(db.pager.pageSize), 200, true)
-	defer cache.clear()
+	defer cache.destroy()
 
 	return db.getNamespaceAt(name, maxFrame, cache)
 }
@@ -746,7 +760,7 @@ func (db *DB) ListNamespaces() ([]string, error) {
 	defer db.pager.endRead(slot)
 
 	cache := newPcache(int(db.pager.pageSize), 200, true)
-	defer cache.clear()
+	defer cache.destroy()
 
 	bt := &btree{pager: db.pager, cache: cache, rootPage: 1, walMaxFrame: maxFrame, writable: false}
 	cursor := bt.NewCursor()
@@ -810,11 +824,13 @@ type ReadTx struct {
 // For read transactions, getPageReader uses a private cache for snapshot isolation.
 func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 	if tx.writable {
-		if pg := tx.pager.writePages[pgno]; pg != nil {
-			pg.pinCount++
-			return pg, nil
-		}
-		return tx.pager.getPageWriter(pgno, tx.walMaxFrame)
+		// Use pager.getPage which checks writePages first, then falls back
+		// to getPageWriter with wal.nFrame (not the frozen tx.walMaxFrame).
+		// The writer must see its own spilled pages, which exist at WAL frames
+		// beyond walMaxFrame. Before onEvict recycling, writePages always
+		// caught spilled pages; now evicted pages may be missing from writePages
+		// and must be found via WAL lookup with the current nFrame.
+		return tx.pager.getPage(pgno)
 	}
 	return tx.pager.getPageReader(pgno, tx.walMaxFrame, tx.cache)
 }
@@ -1161,13 +1177,17 @@ func (tx *ReadTx) Rollback() error {
 		return ErrTxClosed
 	}
 	tx.closed = true
-	// Return the reader cache to the pool for reuse. Pages are kept intact
-	// (persistent cache): the next BeginRead() will check dataVersion and
-	// clear the cache only if a write committed since this transaction.
-	// Matches SQLite pager.c:3246-3267 — cache is cleared only when the
-	// change-counter (our dataVersion) differs.
+	// Return the reader cache to the channel pool for reuse. Pages are kept
+	// intact (persistent cache): the next BeginRead() will check dataVersion
+	// and clear the cache only if a write committed since this transaction.
+	// Uses a channel instead of sync.Pool so caches survive GC cycles.
 	if tx.cache != nil {
-		tx.db.readerCachePool.Put(tx.cache)
+		select {
+		case tx.db.readerCaches <- tx.cache:
+		default:
+			// Pool full (shouldn't happen — capacity matches MaxReaders).
+			tx.cache.destroy()
+		}
 		tx.cache = nil
 	}
 	tx.pager.endRead(tx.walSlot)

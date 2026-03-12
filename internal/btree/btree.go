@@ -38,15 +38,11 @@ type btree struct {
 // getPage returns a page using this btree's walMaxFrame for snapshot isolation.
 func (bt *btree) getPage(pgno uint32) (*page, error) {
 	if bt.writable {
-		// Writer fast path: return own dirty pages directly.
-		// writePages is only accessed by the single writer goroutine.
-		if pg := bt.pager.writePages[pgno]; pg != nil {
-			pg.pinCount++
-			return pg, nil
-		}
-		if bt.walMaxFrame > 0 {
-			return bt.pager.getPageWriter(pgno, bt.walMaxFrame)
-		}
+		// Use pager.getPage which checks writePages first, then falls back
+		// to getPageWriter with wal.nFrame (not the frozen bt.walMaxFrame).
+		// The writer must see its own spilled pages at WAL frames beyond
+		// the snapshot walMaxFrame. With onEvict recycling, evicted spilled
+		// pages are removed from writePages and must be re-read from WAL.
 		return bt.pager.getPage(pgno)
 	}
 	// Reader: use private cache for snapshot isolation. Falls back to
