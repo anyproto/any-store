@@ -584,10 +584,16 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 		// buildIndexSeekChain, which only adjusts the CHOSEN index.
 		// This avoids allocation overhead for indexes that aren't selected.
 
-		// Compute equality prefix: number of leading index fields pinned by equality
+		// Compute equality prefix: count leading index fields with equality bounds.
+		// This handles compound indexes like (t,o) with t=eq, o=range correctly,
+		// allowing IndexSortMatch to recognize sort coverage after equality prefix.
 		equalityPrefix := 0
-		if pointLookup && chainLen > 0 {
-			equalityPrefix = chainLen
+		for _, field := range info.FieldNames {
+			bounds, fixed, found := br.Lookup(field)
+			if !found || len(bounds) == 0 || !fixed {
+				break
+			}
+			equalityPrefix++
 		}
 
 		// Check sort coverage (accounting for equality-pinned prefix)

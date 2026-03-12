@@ -475,7 +475,9 @@ func TestIndex_PlannerSelection_ExplainPlanString(t *testing.T) {
 	})
 
 	t.Run("no sort plan with filter+limit", func(t *testing.T) {
-		explain, err := coll.Find(`{"a":{"$gte":10}}`).Limit(3).Explain(ctx)
+		// With equality filter (selectivity ~1%) and small limit,
+		// IndexSeek is cheaper than FullScan+Limit.
+		explain, err := coll.Find(`{"a":5}`).Limit(3).Explain(ctx)
 		require.NoError(t, err)
 		t.Log("Plan:", explain.Sql)
 		assert.Contains(t, explain.Sql, "IndexScan(a)")

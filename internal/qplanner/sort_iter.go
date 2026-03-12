@@ -11,12 +11,15 @@ import (
 
 // SortIter collects all results from the source iterator, fetches documents,
 // computes sort keys, sorts in memory, then yields results in sorted order.
+// When TopK > 0, uses a max-heap of size TopK to keep only the smallest K entries,
+// reducing sort from O(N log N) to O(N log K) and memory from O(N) to O(K) entries.
 type SortIter struct {
 	Source  Iterator
 	Data    *CursorSource
 	Sorter  query.Sort
 	Buf     *syncpool.DocBuffer
 	Plan    *Plan
+	TopK    int // if > 0, keep only the top K entries (limit + offset)
 	arena   []byte
 	entries []sortEntry
 	idx     int
@@ -77,6 +80,12 @@ func (it *SortIter) growArena(need int) {
 }
 
 func (it *SortIter) collectAndSort() error {
+	cmp := func(a, b sortEntry) int {
+		ak := it.arena[a.off : a.off+uint32(a.keyLen)]
+		bk := it.arena[b.off : b.off+uint32(b.keyLen)]
+		return bytes.Compare(ak, bk)
+	}
+
 	for {
 		_, docId, err := it.Source.Next()
 		if err != nil {
@@ -107,18 +116,66 @@ func (it *SortIter) collectAndSort() error {
 		it.arena = it.Sorter.AppendKey(it.arena, doc)
 		it.arena = append(it.arena, docId...)
 		keyLen := uint16(len(it.arena) - int(off))
-		it.entries = append(it.entries, sortEntry{
-			off: off, keyLen: keyLen, docLen: uint16(len(docId)),
-		})
+		e := sortEntry{off: off, keyLen: keyLen, docLen: uint16(len(docId))}
+
+		if it.TopK > 0 {
+			// Max-heap of size TopK: keep only the smallest K entries.
+			if len(it.entries) < it.TopK {
+				it.entries = append(it.entries, e)
+				it.heapUp(len(it.entries) - 1)
+			} else if cmp(e, it.entries[0]) < 0 {
+				// New entry is smaller than the heap max — replace root.
+				it.entries[0] = e
+				it.heapDown(0)
+			}
+		} else {
+			it.entries = append(it.entries, e)
+		}
 	}
 
-	slices.SortFunc(it.entries, func(a, b sortEntry) int {
-		ak := it.arena[a.off : a.off+uint32(a.keyLen)]
-		bk := it.arena[b.off : b.off+uint32(b.keyLen)]
-		return bytes.Compare(ak, bk)
-	})
-
+	slices.SortFunc(it.entries, cmp)
 	return nil
+}
+
+// heapUp restores the max-heap property by moving entries[i] up.
+func (it *SortIter) heapUp(i int) {
+	for i > 0 {
+		p := (i - 1) / 2
+		if it.heapLess(p, i) {
+			it.entries[p], it.entries[i] = it.entries[i], it.entries[p]
+			i = p
+		} else {
+			break
+		}
+	}
+}
+
+// heapDown restores the max-heap property by moving entries[i] down.
+func (it *SortIter) heapDown(i int) {
+	n := len(it.entries)
+	for {
+		largest := i
+		l, r := 2*i+1, 2*i+2
+		if l < n && it.heapLess(largest, l) {
+			largest = l
+		}
+		if r < n && it.heapLess(largest, r) {
+			largest = r
+		}
+		if largest == i {
+			break
+		}
+		it.entries[i], it.entries[largest] = it.entries[largest], it.entries[i]
+		i = largest
+	}
+}
+
+// heapLess returns true if entries[i] < entries[j] (for max-heap, parent should be largest).
+func (it *SortIter) heapLess(i, j int) bool {
+	a, b := it.entries[i], it.entries[j]
+	ak := it.arena[a.off : a.off+uint32(a.keyLen)]
+	bk := it.arena[b.off : b.off+uint32(b.keyLen)]
+	return bytes.Compare(ak, bk) < 0
 }
 
 // Close releases resources by closing the source iterator.
@@ -129,5 +186,8 @@ func (it *SortIter) Close() {
 }
 
 func (it *SortIter) String() string {
+	if it.TopK > 0 {
+		return fmt.Sprintf("%s -> TopK(%d)", it.Source, it.TopK)
+	}
 	return fmt.Sprintf("%s -> Sort", it.Source)
 }

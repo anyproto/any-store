@@ -248,14 +248,36 @@ func BuildPlan(params *PlanParams) *Plan {
 			estimatedYield = fullScanDocs
 		}
 	}
-	fullScanCost := computeFullScanCost(fullScanDocs, estimatedYield, needSort, idBoundsSeek)
+	// FullScan naturally reads in ID order, so sorting by "id" is free.
+	fullScanNeedSort := needSort
+	if needSort {
+		fields := params.Sorter.Fields()
+		if len(fields) == 1 && fields[0].Field == "id" {
+			fullScanNeedSort = false
+		}
+	}
+	// When FullScan provides id-order (no sort needed) and there's a LIMIT,
+	// we only need to scan enough docs to find `limit` matching rows.
+	fullScanEffective := fullScanDocs
+	if !fullScanNeedSort && (params.Limit > 0 || params.Offset > 0) {
+		needed := float64(params.Limit + params.Offset)
+		if pTotal > 0 && pTotal < 1.0 {
+			// Scan needed/selectivity docs on average to find enough matches
+			needed = needed / pTotal
+		}
+		if needed < fullScanDocs {
+			fullScanEffective = needed
+		}
+	}
+	fullScanCost := computeFullScanCost(fullScanEffective, estimatedYield, fullScanNeedSort, idBoundsSeek)
 
 	if collectExplain {
+		fse := fullScanEffective
 		candidates = append(candidates, CandidatePlan{
 			Name:    "FullScan",
 			Cost:    fullScanCost,
-			EstRows: fullScanDocs,
-			details: func() string { return formatFullScanDetails(fullScanDocs, estimatedYield, needSort, idBoundsSeek) },
+			EstRows: fse,
+			details: func() string { return formatFullScanDetails(fse, estimatedYield, fullScanNeedSort, idBoundsSeek) },
 		})
 	}
 
@@ -335,6 +357,26 @@ func BuildPlan(params *PlanParams) *Plan {
 			seekCost = (nSeeks * CostIndexSeek) + (e * CostSeqRead)
 		}
 
+		// When the index covers the sort and we have a LIMIT, we only need to
+		// scan limit/scanSel docs through the index (same logic as Plan C).
+		if needSort && idx.ExactSort && params.Limit > 0 && !isCovering {
+			scanSel := pTotal / idxSel
+			if scanSel > 1.0 {
+				scanSel = 1.0
+			}
+			if scanSel <= 0 {
+				scanSel = 0.0001
+			}
+			s := float64(params.Limit+params.Offset) / scanSel
+			if s > e {
+				s = e
+			}
+			if s < 1 {
+				s = 1
+			}
+			seekCost = (nSeeks * CostIndexSeek) + (s * fetchCost) + (s * CostFilter)
+		}
+
 		seekSortCost := 0.0
 		if needSort && !idx.ExactSort {
 			seekSortCost = sortCost(filteredYield)
@@ -380,20 +422,45 @@ func BuildPlan(params *PlanParams) *Plan {
 			}
 
 			fetchCost := indexFetchCost(totalDocs)
+
+			// When the index has bounds (e.g. compound index with equality prefix),
+			// the scan only visits entries matching those bounds. The selectivity
+			// of the remaining filter within the bounded range is higher.
+			idxSel := selectivityForIndex(idx, totalDocs)
+			// Effective selectivity within the index range
+			scanSel := pTotal / idxSel
+			if scanSel > 1.0 {
+				scanSel = 1.0
+			}
+			if scanSel <= 0 {
+				scanSel = 0.0001
+			}
+			// Population to scan: bounded by index selectivity
+			scanPopulation := totalDocs
+			if len(idx.Bounds) > 0 {
+				scanPopulation = totalDocs * idxSel
+				if scanPopulation < 1 {
+					scanPopulation = 1
+				}
+			}
+
 			var scanCost float64
+			var scanRows float64
 			if params.Limit > 0 {
-				// With LIMIT: expected docs to scan = LIMIT / P_total, capped at TotalDocs
-				s := float64(params.Limit+params.Offset) / pTotal
-				if s > totalDocs {
-					s = totalDocs
+				// With LIMIT: expected docs to scan = LIMIT / scanSel, capped at scanPopulation
+				s := float64(params.Limit+params.Offset) / scanSel
+				if s > scanPopulation {
+					s = scanPopulation
 				}
 				if s < 1 {
 					s = 1
 				}
+				scanRows = s
 				scanCost = (s * CostIndexSeek) + (s * fetchCost) + (s * CostFilter)
 			} else {
-				// Without LIMIT: scan all docs via index (no sort penalty)
-				scanCost = (totalDocs * CostIndexSeek) + (totalDocs * fetchCost) + (totalDocs * CostFilter)
+				// Without LIMIT: scan all docs in the index range (no sort penalty)
+				scanRows = scanPopulation
+				scanCost = (scanPopulation * CostIndexSeek) + (scanPopulation * fetchCost) + (scanPopulation * CostFilter)
 			}
 			// No sort penalty since index provides order
 
@@ -402,15 +469,6 @@ func BuildPlan(params *PlanParams) *Plan {
 				scanCost -= float64(boost)
 			}
 
-			var scanRows float64
-			if params.Limit > 0 {
-				scanRows = float64(params.Limit+params.Offset) / pTotal
-				if scanRows > totalDocs {
-					scanRows = totalDocs
-				}
-			} else {
-				scanRows = totalDocs
-			}
 			if collectExplain {
 				scanSR, scanFC, scanHL := scanRows, fetchCost, params.Limit > 0
 				candidates = append(candidates, CandidatePlan{
@@ -499,13 +557,10 @@ func computeFullScanCost(totalDocs, estimatedYield float64, needSort, idBoundsSe
 }
 
 // indexFetchCost returns the per-doc cost for random B-tree point lookups.
-// For large collections (>500 docs), deeper B-trees make each random lookup
-// more expensive due to additional tree level traversals (index + data trees).
+// Random lookups cost more than sequential reads, but internal B-tree nodes
+// are typically cached, so the penalty is moderate regardless of collection size.
 func indexFetchCost(totalDocs float64) float64 {
-	if totalDocs <= 500 {
-		return CostDocFetch
-	}
-	return CostDocFetch * math.Log10(totalDocs)
+	return CostDocFetch
 }
 
 // sortCost computes the sort cost using n*log2(n)*CostSortSwap.
@@ -666,7 +721,12 @@ func estimateIndexDocsWithFieldSel(idx *CBOIndex, totalDocs float64, fieldSel []
 		}
 	}
 
-	return totalDocs * DefaultRangeSelectivity
+	// Fallback: multiply DefaultRangeSelectivity per bound field
+	sel := 1.0
+	for range idx.BoundFields {
+		sel *= DefaultRangeSelectivity
+	}
+	return totalDocs * sel
 }
 
 // buildFullScanChain constructs the iterator chain for a full collection scan.
@@ -674,7 +734,7 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 	var root Iterator
 
 	idSorted := false
-	if needSort && !needFilter {
+	if needSort {
 		fields := params.Sorter.Fields()
 		if len(fields) == 1 && fields[0].Field == "id" {
 			idSorted = true
@@ -683,6 +743,7 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 					Tx: params.Tx,
 					Ns: params.DataNs,
 				},
+				Filter:   params.Filter,
 				IDBounds: params.IDBounds,
 				Buf:      params.Buf,
 				Reverse:  fields[0].Reverse,
@@ -711,6 +772,7 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 			},
 			Sorter: params.Sorter,
 			Buf:    params.Buf,
+			TopK:   params.Limit + params.Offset,
 		}
 	}
 
@@ -778,6 +840,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 				},
 				Sorter: params.Sorter,
 				Buf:    params.Buf,
+				TopK:   params.Limit + params.Offset,
 			}
 		}
 
@@ -843,6 +906,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 			},
 			Sorter:          params.Sorter,
 			Buf:             params.Buf,
+			TopK:            params.Limit + params.Offset,
 			PartiallySorted: idx.PartialSort,
 		}
 	}

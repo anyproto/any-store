@@ -22,10 +22,11 @@ Constants defined in `cost.go`:
 
 | Constant | Value | Description |
 |---|---|---|
-| `CostIndexSeek` | 0.0 | Cost of a B-tree traversal (negligible for embedded DB) |
-| `CostDocFetch` | 2.0 | Cost of a point lookup in the data B-tree |
+| `CostIndexSeek` | 0.5 | Cost of a B-tree traversal to find a key (per bound/seek) |
+| `CostDocFetch` | 3.0 | Cost of a random point lookup in the data B-tree (index → data) |
+| `CostSeqRead` | 0.1 | Cost of a sequential cursor read per doc (full scan) |
 | `CostFilter` | 0.5 | Cost of in-memory predicate evaluation |
-| `CostSortSwap` | 0.5 | Cost of an in-memory sort swap |
+| `CostSortSwap` | 0.25 | Cost of an in-memory sort swap (includes re-fetch overhead) |
 | `DefaultRangeSelectivity` | 0.5 | Default fraction for range queries |
 
 #### Selectivity Estimation
@@ -38,16 +39,32 @@ Constants defined in `cost.go`:
 
 **Plan A: Full Collection Scan**
 ```
-Cost = (TotalDocs × CostDocFetch) + (TotalDocs × CostFilter) + sortCost(EstimatedYield)
+Cost = (EffectiveDocs × CostSeqRead) + (EffectiveDocs × CostFilter) + sortCost(EstimatedYield)
 ```
-When idBounds are present (point lookups on `id`), `TotalDocs` is replaced with `len(idBounds)`.
+When idBounds are present (point lookups on `id`), `EffectiveDocs` is replaced with `len(idBounds)`.
+
+**id-sort optimization**: Sorting by `id` (asc or desc) is free — FullScan naturally reads in id order. When the sort is `id`-only, `fullScanNeedSort` is false and no SortIter is created. The `Reverse` flag on FullScanIter handles descending order. This works with or without a filter.
+
+**Limit-aware FullScan**: When the plan is FullScan with id-sort (no sort needed) and a LIMIT is present:
+```
+EffectiveDocs = min(TotalDocs, (LIMIT + OFFSET) / selectivity)
+```
+This accounts for early termination — e.g. `Find({"a":5}).Sort("id").Limit(10)` with 1% selectivity only needs to scan ~1000 docs, not the full collection.
 
 **Plan B: Index Seek (Filtering Priority)**
 ```
 E = sketch.Estimate(value)  // estimated matching docs
-Cost = CostIndexSeek + (E × CostDocFetch) + (E × CostFilter) + sortCost(FilteredYield)
+Cost = nSeeks × CostIndexSeek + (E × CostDocFetch) + (E × CostFilter) + sortCost(FilteredYield)
 ```
 Sort cost is zero if the index covers the sort order.
+
+**Limit-aware IndexSeek**: When the index covers the sort order (`ExactSort`) and a LIMIT is present:
+```
+scanSel = P_total / idxSel   // fraction of index-matched docs that pass remaining filters
+S = min(E, (LIMIT + OFFSET) / scanSel)
+Cost = nSeeks × CostIndexSeek + (S × CostDocFetch) + (S × CostFilter)
+```
+This avoids charging for fetching all E docs when only a few are needed.
 
 **Plan C: Index Scan (Sorting Priority)**
 ```
@@ -71,7 +88,7 @@ Source (leaf) → Transform → Transform → ... → Root
 
 | Iterator | Description |
 |---|---|
-| `FullScanIter` | Scans the data namespace sequentially. Optionally filters inline. |
+| `FullScanIter` | Scans the data namespace sequentially. Optionally filters inline. Supports `Reverse` for descending id-order. |
 | `IndexIter` | Scans an index namespace within bounds. Returns `(indexKey, docId)` pairs. |
 | `CoverIter` | Point-lookups on a **unique** index. Each bound produces at most one result. |
 
@@ -81,12 +98,24 @@ Source (leaf) → Transform → Transform → ... → Root
 |---|---|
 | `FetchIter` | Wraps an index iterator, fetches full documents by docId from data namespace. |
 | `FilterIter` | Evaluates a `query.Filter` predicate on fetched documents. |
-| `SortIter` | Buffers all upstream results, sorts them in memory. |
+| `SortIter` | Collects upstream results and sorts in memory. When `TopK > 0`, uses a max-heap of size K to keep only the smallest K entries — O(N log K) instead of O(N log N), with O(K) entry memory instead of O(N). |
 | `LimitIter` | Skips `Offset` results, returns at most `Limit` results. |
+
+#### TopK Sort Optimization
+
+When a query has both Sort and Limit (e.g. `.Sort("name").Limit(10).Offset(5)`), SortIter receives `TopK = Limit + Offset = 15`. Instead of collecting all N entries and sorting them:
+
+1. Fill a max-heap with the first K entries
+2. For each remaining entry: if smaller than heap max, replace and sift down; otherwise discard
+3. After scanning all N docs, sort only the K heap entries
+
+This reduces the final sort from O(N log N) to O(K log K) and keeps the entries slice at O(K) instead of O(N).
 
 #### Plan Chains
 
-**Full Scan**: `FullScanIter → [SortIter] → [LimitIter]`
+**Full Scan**: `FullScanIter(filter) → [SortIter] → [LimitIter]`
+
+**Full Scan (id-sort)**: `FullScanIter(filter, reverse?) → [LimitIter]` — no SortIter needed
 
 **Index Seek (unique point lookup)**: `CoverIter → [FilterIter] → [SortIter] → [LimitIter]`
 
