@@ -58,11 +58,11 @@ type Options struct {
 	InMemory bool
 
 	// MaxReaders is the maximum number of concurrent read transactions per DB.
-	// Limits memory growth from persistent reader caches: each reader holds a
-	// private pcache with up to CacheSize/10 (min 50) pages that persist across
-	// transactions. Total reader cache memory per DB is bounded by
-	// MaxReaders * readerCacheSize * PageSize.
-	// Default: 4. No SQLite equivalent — our addition for memory management.
+	// Each reader holds a private pcache with up to CacheSize pages that
+	// persist across transactions (matching SQLite's per-connection cache).
+	// Total reader cache memory per DB is bounded by
+	// MaxReaders * CacheSize * PageSize.
+	// Default: 4.
 	MaxReaders int
 
 	// UsePageSlab opts this DB into the global pre-allocated page buffer slab.
@@ -200,10 +200,7 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, ErrOldFormat
 	}
 
-	readerCacheSize := opts.CacheSize / 10
-	if readerCacheSize < 50 {
-		readerCacheSize = 50
-	}
+	readerCacheSize := opts.CacheSize
 
 	maxReaders := opts.MaxReaders
 	if maxReaders <= 0 {
