@@ -444,6 +444,12 @@ func BuildPlan(params *PlanParams) *Plan {
 				}
 			}
 
+			// Check if non-bound index fields cover filter conditions.
+			// When they do, IndexFilterIter can check values from the key tuple
+			// and only fetch documents for matching entries.
+			coverFilters := coveringFilterFields(idx, params.FieldBounds)
+			coverSel := coveringFilterSelectivity(coverFilters, idx, fieldSelectivity)
+
 			var scanCost float64
 			var scanRows float64
 			if params.Limit > 0 {
@@ -456,11 +462,21 @@ func BuildPlan(params *PlanParams) *Plan {
 					s = 1
 				}
 				scanRows = s
-				scanCost = (s * CostIndexSeek) + (s * fetchCost) + (s * CostFilter)
+				if len(coverFilters) > 0 {
+					// Covering filter: sequential index reads + fetch only matching docs
+					scanCost = (s * CostSeqRead) + (s * coverSel * fetchCost) + (s * CostFilter)
+				} else {
+					scanCost = (s * CostIndexSeek) + (s * fetchCost) + (s * CostFilter)
+				}
 			} else {
 				// Without LIMIT: scan all docs in the index range (no sort penalty)
 				scanRows = scanPopulation
-				scanCost = (scanPopulation * CostIndexSeek) + (scanPopulation * fetchCost) + (scanPopulation * CostFilter)
+				if len(coverFilters) > 0 {
+					// Covering filter: sequential index reads + fetch only matching docs
+					scanCost = (scanPopulation * CostSeqRead) + (scanPopulation * coverSel * fetchCost) + (scanPopulation * CostFilter)
+				} else {
+					scanCost = (scanPopulation * CostIndexSeek) + (scanPopulation * fetchCost) + (scanPopulation * CostFilter)
+				}
 			}
 			// No sort penalty since index provides order
 
@@ -933,6 +949,16 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 		Reverse: reverse,
 	}
 
+	// Insert IndexFilterIter when compound index fields cover filter conditions.
+	// This filters non-matching entries using the index key tuple before fetching docs.
+	coverFilters := coveringFilterFields(idx, params.FieldBounds)
+	if len(coverFilters) > 0 {
+		root = &IndexFilterIter{
+			Source:  root,
+			Filters: coverFilters,
+		}
+	}
+
 	// Fetch documents by docId — share CursorSource between FetchIter and FilterIter
 	scanDataSrc := &CursorSource{
 		Tx: params.Tx,
@@ -988,6 +1014,8 @@ func setPlanRef(it Iterator, plan *Plan) {
 		// don't recurse — FullScanIter is a leaf
 	case *SortIter:
 		v.Plan = plan
+		setPlanRef(v.Source, plan)
+	case *IndexFilterIter:
 		setPlanRef(v.Source, plan)
 	case *LimitIter:
 		setPlanRef(v.Source, plan)
@@ -1384,4 +1412,63 @@ func IndexSortMatch(idx *IndexInfo, sortFields []query.SortField, equalityPrefix
 		return true, false
 	}
 	return false, true
+}
+
+// coveringFilterFields identifies non-bound index fields that have equality
+// filter conditions, allowing IndexFilterIter to check them from the key tuple.
+func coveringFilterFields(idx *CBOIndex, fieldBounds *BoundsResult) []IndexFieldFilter {
+	if fieldBounds == nil || len(idx.Info.FieldNames) <= idx.BoundFields {
+		return nil
+	}
+
+	var filters []IndexFieldFilter
+	for fi := idx.BoundFields; fi < len(idx.Info.FieldNames); fi++ {
+		fieldName := idx.Info.FieldNames[fi]
+		bounds, fixed, found := fieldBounds.Lookup(fieldName)
+		if !found || !fixed || len(bounds) != 1 {
+			continue
+		}
+
+		matchValue := bounds[0].Start
+		// For reverse fields, invert the match value to compare against stored bytes
+		if fi < len(idx.Info.Reverse) && idx.Info.Reverse[fi] {
+			inv := make([]byte, len(matchValue))
+			for j, b := range matchValue {
+				inv[j] = ^b
+			}
+			matchValue = inv
+		}
+
+		filters = append(filters, IndexFieldFilter{
+			FieldIdx:   fi,
+			MatchValue: matchValue,
+		})
+	}
+
+	return filters
+}
+
+// coveringFilterSelectivity returns the combined selectivity of the fields
+// that will be checked by IndexFilterIter. Used to adjust CBO cost: only
+// entries passing the index-level filter need a document fetch.
+func coveringFilterSelectivity(filters []IndexFieldFilter, idx *CBOIndex, fieldSel []fieldSelEntry) float64 {
+	if len(filters) == 0 {
+		return 1.0
+	}
+	sel := 1.0
+	for _, f := range filters {
+		fieldName := idx.Info.FieldNames[f.FieldIdx]
+		found := false
+		for j := range fieldSel {
+			if fieldSel[j].field == fieldName {
+				sel *= fieldSel[j].sel
+				found = true
+				break
+			}
+		}
+		if !found {
+			sel *= DefaultRangeSelectivity
+		}
+	}
+	return sel
 }

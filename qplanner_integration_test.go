@@ -2,6 +2,7 @@ package anystore
 
 import (
 	"fmt"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -476,4 +477,76 @@ func TestQPlanner_UpdateWithIndex(t *testing.T) {
 	count, err = coll.Find(`{"a": 5}`).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 0, count)
+}
+
+func TestQPlanner_IndexScanCoveringFilter(t *testing.T) {
+	// Compound index (a, b) with filter on b and sort by a.
+	// IndexScan(a,b) with IndexFilterIter should filter b from the key
+	// without fetching documents for non-matching entries.
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}}))
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"b"}}))
+
+	for i := range 1000 {
+		doc := anyenc.MustParseJson(fmt.Sprintf(
+			`{"id":%d,"a":%d,"b":%d}`, i, i%100, i%50,
+		))
+		require.NoError(t, coll.Insert(ctx, doc))
+	}
+
+	t.Run("covering filter correctness", func(t *testing.T) {
+		// Force IndexScan(a,b) with covering filter via IndexHint
+		q := coll.Find(`{"b": 25}`).Sort("a").IndexHint(
+			IndexHint{IndexName: "a,b", Boost: 1000000},
+		)
+		vals := collectField(t, q, "b")
+		assert.Equal(t, 20, len(vals)) // 1000/50
+		for _, v := range vals {
+			assert.Equal(t, "25", v)
+		}
+	})
+
+	t.Run("covering filter sorted order", func(t *testing.T) {
+		q := coll.Find(`{"b": 25}`).Sort("a").IndexHint(
+			IndexHint{IndexName: "a,b", Boost: 1000000},
+		)
+		aVals := collectField(t, q, "a")
+		for i := 1; i < len(aVals); i++ {
+			prev, _ := strconv.Atoi(aVals[i-1])
+			cur, _ := strconv.Atoi(aVals[i])
+			assert.True(t, prev <= cur, "not sorted: a[%d]=%d > a[%d]=%d", i-1, prev, i, cur)
+		}
+	})
+
+	t.Run("covering filter with limit", func(t *testing.T) {
+		q := coll.Find(`{"b": 25}`).Sort("a").Limit(5).IndexHint(
+			IndexHint{IndexName: "a,b", Boost: 1000000},
+		)
+		vals := collectField(t, q, "b")
+		assert.Equal(t, 5, len(vals))
+		for _, v := range vals {
+			assert.Equal(t, "25", v)
+		}
+	})
+
+	t.Run("same results as default plan", func(t *testing.T) {
+		// Default plan (IndexSeek(b) + Sort) and forced plan should return same results
+		defaultDocs := collectDocs(t, coll.Find(`{"b": 25}`).Sort("a"))
+		forcedDocs := collectDocs(t, coll.Find(`{"b": 25}`).Sort("a").IndexHint(
+			IndexHint{IndexName: "a,b", Boost: 1000000},
+		))
+		assert.Equal(t, defaultDocs, forcedDocs)
+	})
+
+	t.Run("explain shows IndexFilter", func(t *testing.T) {
+		explain, err := coll.Find(`{"b": 25}`).Sort("a").IndexHint(
+			IndexHint{IndexName: "a,b", Boost: 1000000},
+		).Explain(ctx)
+		require.NoError(t, err)
+		t.Log("Plan:", explain.Sql)
+		assert.Contains(t, explain.Sql, "IndexFilter")
+	})
 }

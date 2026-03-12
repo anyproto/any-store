@@ -76,6 +76,26 @@ func (t Tuple) OffsetAfter(n int) (int, error) {
 	return off, nil
 }
 
+// FieldBytes returns the raw encoded bytes of the nth field (0-based).
+// Single pass through the tuple up to field n.
+func (t Tuple) FieldBytes(n int) ([]byte, error) {
+	tail := []byte(t)
+	for i := 0; i <= n; i++ {
+		if len(tail) == 0 {
+			return nil, fmt.Errorf("tuple: field %d out of range", n)
+		}
+		_, nextTail, err := parseValue(tail, nil)
+		if err != nil {
+			return nil, err
+		}
+		if i == n {
+			return tail[:len(tail)-len(nextTail)], nil
+		}
+		tail = nextTail
+	}
+	return nil, fmt.Errorf("tuple: field %d out of range", n)
+}
+
 // String returns a string representation of the tuple.
 func (t Tuple) String() string {
 	var p = &Parser{}

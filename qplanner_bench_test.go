@@ -359,3 +359,68 @@ func BenchmarkLowSelectivity_FullScan_10k(b *testing.B) {
 	coll := setupBenchCollection(b, 10000)
 	benchCount(b, coll, `{"c": 5}`)
 }
+
+// --- FilterSort/SortNonPrefix: IndexSeek(b)+Sort vs IndexScan(a,b) with covering filter ---
+
+func BenchmarkFilterSort_SortNonPrefix_500k(b *testing.B) {
+	// Setup: 500k docs, compound index (a, b), single-field index (b).
+	// Query: Find({"b": 25}).Sort("a")
+	// b = i%50, so ~10k docs match (2% selectivity).
+	n := 500000
+	coll := setupBenchCollection(b, n,
+		IndexInfo{Fields: []string{"a", "b"}},
+		IndexInfo{Fields: []string{"b"}},
+	)
+
+	// Sub-benchmarks: default plan vs forced IndexScan with covering filter
+	b.Run("Default", func(b *testing.B) {
+		// CBO picks: IndexSeek(b) + Sort
+		benchIter(b, coll.Find(`{"b": 25}`).Sort("a"))
+	})
+
+	b.Run("IndexScan_CoverFilter", func(b *testing.B) {
+		// Force: IndexScan(a,b) with covering filter on b
+		benchIter(b, coll.Find(`{"b": 25}`).Sort("a").IndexHint(
+			IndexHint{IndexName: "a,b", Boost: 1000000},
+		))
+	})
+}
+
+func BenchmarkFilterSort_SortNonPrefix_10k(b *testing.B) {
+	// Smaller dataset for quick iteration
+	coll := setupBenchCollection(b, 10000,
+		IndexInfo{Fields: []string{"a", "b"}},
+		IndexInfo{Fields: []string{"b"}},
+	)
+
+	b.Run("Default", func(b *testing.B) {
+		benchIter(b, coll.Find(`{"b": 25}`).Sort("a"))
+	})
+
+	b.Run("IndexScan_CoverFilter", func(b *testing.B) {
+		benchIter(b, coll.Find(`{"b": 25}`).Sort("a").IndexHint(
+			IndexHint{IndexName: "a,b", Boost: 1000000},
+		))
+	})
+}
+
+func BenchmarkFilterSort_SortNonPrefix_Limit_500k(b *testing.B) {
+	// LIMIT query: Find({"b": 25}).Sort("a").Limit(10) with 500k docs.
+	// This is where covering filter + sorted index scan should shine:
+	// scan ~500 index entries to find 10 matches vs fetch+sort 10k docs.
+	n := 500000
+	coll := setupBenchCollection(b, n,
+		IndexInfo{Fields: []string{"a", "b"}},
+		IndexInfo{Fields: []string{"b"}},
+	)
+
+	b.Run("Default", func(b *testing.B) {
+		benchIter(b, coll.Find(`{"b": 25}`).Sort("a").Limit(10))
+	})
+
+	b.Run("IndexScan_CoverFilter", func(b *testing.B) {
+		benchIter(b, coll.Find(`{"b": 25}`).Sort("a").Limit(10).IndexHint(
+			IndexHint{IndexName: "a,b", Boost: 1000000},
+		))
+	})
+}
