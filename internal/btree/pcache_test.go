@@ -820,7 +820,11 @@ func TestPcacheAdmissionControl_SoftCreateAllowedBelow90Percent(t *testing.T) {
 }
 
 func TestPcacheAdmissionControl_SlabPressureLowRecyclable(t *testing.T) {
-	// Slab under pressure + low recyclable ratio → soft create returns nil.
+	// Slab under pressure + low recyclable ratio → soft create should still
+	// succeed. The per-cache slab-pressure guard was removed because in our
+	// isolated model (no PGroup), it fires when even 1 page is pinned,
+	// preventing the reader cache from filling at all and pushing every page
+	// through readTempPage (which allocates from slab anyway).
 	globalPageSlab.Reset()
 	globalPageSlab.Init(4096, 10) // small slab to easily create pressure
 	defer globalPageSlab.Reset()
@@ -839,15 +843,11 @@ func TestPcacheAdmissionControl_SlabPressureLowRecyclable(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		pinned[i] = pc.create(uint32(i+1), 2) // hard create always works
 	}
-	// nPinned=10, nRecyclable=0: 0 < 10 → condition met
-	// Under pressure + nRecyclable < nPinned → soft create refused
+	// nPinned=10, nRecyclable=0 — previously this would refuse soft creates
+	// under slab pressure. Now soft creates succeed (bounded by maxPages).
 	softPg := pc.create(200, 1)
-	assert.Nil(t, softPg, "soft create should be refused under slab pressure with low recyclable")
-
-	// Hard create should still succeed
-	hardPg := pc.create(200, 2)
-	assert.NotNil(t, hardPg, "hard create should succeed even under pressure")
-	pc.release(hardPg)
+	assert.NotNil(t, softPg, "soft create should succeed under slab pressure (no per-cache pressure guard)")
+	pc.release(softPg)
 
 	// Return drained buffers to slab
 	for _, buf := range drained {

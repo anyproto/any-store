@@ -139,19 +139,27 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 		return p
 	}
 
-	// Step 3: Admission control — refuse soft creates when thrashing or under
-	// memory pressure. Implements two of SQLite's three step-3 guards
-	// (pcache1.c:886-891): nPinned >= n90pct (per-cache thrashing) and
-	// underPressure with nRecyclable < nPinned (global memory pressure).
-	// Omitted: nPinned >= mxPinned (PGroup-level cap) — no PGroup (drift #1).
+	// Step 3: Admission control — refuse soft creates when thrashing.
+	// Implements one of SQLite's three step-3 guards (pcache1.c:886-891):
+	// nPinned >= n90pct (per-cache thrashing).
+	//
+	// DRIFT from SQLite: the global slab-pressure guard
+	// (pcache1UnderMemoryPressure + nRecyclable < nPinned, pcache1.c:889-891)
+	// is intentionally omitted. SQLite's check uses PGroup-level nPurgeable
+	// (pages across ALL caches), so a single cache with low recyclable doesn't
+	// trigger it. In our isolated model (no PGroup, drift #1), each cache's
+	// nRecyclable is checked independently — causing the condition to fire when
+	// even 1 page is pinned. This prevents the reader cache from filling at
+	// all, pushing every page through readTempPage → acquireTempPage →
+	// globalPageSlab.Get() → overflow allocation. The reader cache is already
+	// bounded by maxPages; once full, step 4 evicts before creating (net zero
+	// memory), so per-cache admission control via the 90% guard is sufficient.
+	//
 	// createFlag==1 (soft, readers): may return nil.
 	// createFlag==2 (hard, writers/stress): always proceeds.
 	if createFlag == 1 && pc.purgeable {
 		nPinned := len(pc.pages) - pc.nRecyclable
 		if nPinned >= pc.maxPages*9/10 {
-			return nil
-		}
-		if globalPageSlab.UnderPressure() && pc.nRecyclable < nPinned {
 			return nil
 		}
 	}
