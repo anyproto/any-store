@@ -432,7 +432,7 @@ const (
 | Page size changes | `sqlite3BtreeSetPageSize()` | Fixed at open time |
 | Deferred durability | `PRAGMA synchronous=NORMAL` | `NoCommitSync` option |
 | In-memory databases | `:memory:` or `PRAGMA journal_mode=MEMORY` | `InMemory` option with `memFrames` WAL |
-| Write-transaction page map | Pages in cache with `PGHDR_DIRTY` | Separate `writePages` map |
+| Write-transaction page map | Pages in cache with `PGHDR_DIRTY` | Writer uses `writerCache` dirty list — matches SQLite |
 
 **Classification: Structural** -- The Go pager is WAL-only and significantly simpler.
 The main missing features are: rollback journal (DELETE/TRUNCATE/PERSIST modes),
@@ -640,8 +640,8 @@ The Go implementation uses per-connection page caches matching SQLite's model:
    pages are cached across lookups within the transaction and recycled on rollback
 3. **`getPageReader()`**: Checks reader cache, validates against WAL index, reads from
    WAL/disk/masterStore on miss, populates cache for subsequent accesses
-4. **Writer fast path**: `writePages` map allows the writer to see its own dirty pages
-   without going through the cache
+4. **Writer cache**: Writer uses `writerCache.fetch()` directly to see its own dirty
+   pages — same as SQLite's per-connection PCache approach
 5. **Cache staleness check**: When a cached page has been updated beyond the reader's
    snapshot (`latestFrame > walMaxFrame`), the reader evicts the stale entry and
    re-reads from WAL/disk
@@ -658,14 +658,14 @@ Each goroutine accesses only its own cache — no mutex needed.
 |--------|--------|-----|
 | Isolation mechanism | WAL frame lookup bounded by `mxFrame` | WAL frame lookup bounded by `walMaxFrame` — matches SQLite |
 | Cache ownership | Per-connection private caches | Per-connection private caches — matches SQLite |
-| Writer dirty pages | In-cache with `PGHDR_DIRTY` flag | Separate `writePages` map |
+| Writer dirty pages | In-cache with `PGHDR_DIRTY` flag | In `writerCache` dirty list via `writerCache.fetch()` — matches SQLite |
 | Overflow reads | Per-connection cache | Per-connection reader cache — matches SQLite |
 | Concurrent readers | Multiple readers, each with own `mxFrame` | Same, each with own `walMaxFrame` and private cache |
 
 **Classification: Structural** -- The Go implementation now matches SQLite's per-connection
 cache model. Each reader has its own private cache, and the writer has its own cache.
 No mutex is needed on the page cache since each cache is accessed by a single goroutine.
-The remaining difference is the `writePages` map for the writer's dirty-page fast path.
+The writer uses `writerCache` directly for dirty-page access, matching SQLite's PCache approach.
 
 ---
 
@@ -1235,10 +1235,10 @@ No SQLite equivalent — our addition for the many-open-databases scenario.
 **Known Drifts in Page Cache:**
 - Buffer reuse on eviction: SQLite step 4 (`pcache1.c:897-914`) reuses the
   evicted victim's buffer in-place. Writer caches drop evicted buffers because
-  `pager.writePages` may still alias evicted page structs after spill; those
+  evicted page structs may still be referenced elsewhere after spill; those
   buffers are returned to slab in `clear()`/`discard()`/`truncate()`. Reader
-  caches (no `xStress`, no `writePages`) return evicted buffers to the slab
-  immediately in `create()`.
+  caches (no `xStress`) return evicted buffers to the slab immediately in
+  `create()`.
 - No `reuseUnlikely` on unpin: SQLite's `pcache1Unpin` accepts a
   `reuseUnlikely` flag (`pcache1.c:1094-1095`); when true, pages are
   immediately freed. Our `release()` only uses overfull+pressure for

@@ -277,7 +277,7 @@ func TestGap_Pager_FreePage_CacheCreateFallback(t *testing.T) {
 
 	// Free the last allocated page - this exercises the freePage path
 	// where the freed page becomes a new trunk.
-	// The page may or may not be in writePages, but freePage should work.
+	// The page may or may not be in writerCache, but freePage should work.
 	lastPgno := pages[len(pages)-1].pgno
 	err = p.freePage(lastPgno)
 	require.NoError(t, err)

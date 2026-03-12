@@ -70,14 +70,6 @@ type pcache struct {
 	// Modeled after SQLite's xStress in pcache.c.
 	xStress func(p *page) error
 
-	// onEvict is called when a clean page is evicted from the cache.
-	// For writer caches, the pager sets this to delete the page from
-	// writePages, breaking the stale reference so the page struct can be
-	// safely recycled for a different pgno. This matches SQLite's model
-	// where pcache1RemoveFromHash (pcache1.c:905) is the only reference
-	// removal needed — SQLite has no writePages map.
-	onEvict func(pgno uint32)
-
 	// szSpill is the spill threshold: xStress fires when page count exceeds
 	// szSpill. 0 means use maxPages as the threshold.
 	szSpill int
@@ -180,11 +172,6 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	// step 4 (pcache1.c:900-906) which reuses the victim's PgHdr1 + buffer
 	// directly for the new page. Intermediate evictions (rare: only when multiple
 	// pages must be evicted) return buffers to slab.
-	//
-	// For writer caches, evictOne() calls onEvict to remove the stale reference
-	// from pager.writePages, so the page struct can safely be re-keyed for a
-	// new pgno without aliasing. This matches SQLite where pcache1RemoveFromHash
-	// (pcache1.c:905) is the only cleanup needed — SQLite has no writePages map.
 	slabOk := globalPageSlab.Initialized(pc.pageSize)
 	var recycled *page
 	if pc.purgeable {
@@ -300,10 +287,9 @@ func (pc *pcache) release(p *page) {
 	if p.pinCount <= 0 {
 		p.pinCount = 0
 		// Only add to LRU if the page is still tracked in pcache.pages.
-		// After a stress spill + eviction, the page may still be referenced
-		// by pager.writePages but is no longer in pcache.pages. Adding such
-		// "ghost" pages to the LRU would cause evictOne to loop without
-		// reducing len(pages).
+		// After a stress spill + eviction, the page may no longer be in
+		// pcache.pages. Adding such "ghost" pages to the LRU would cause
+		// evictOne to loop without reducing len(pages).
 		if p.dirty {
 			if pc.pages[p.pgno] == p {
 				pc.dirtyMoveToFront(p)
@@ -315,14 +301,7 @@ func (pc *pcache) release(p *page) {
 			//
 			// If cache is overfull and slab is under pressure, immediately
 			// evict instead of adding to LRU (matches pcache1Unpin).
-			// Skip for writer caches (xStress != nil) because pager.writePages
-			// may still reference the evicted page struct after spill. Returning
-			// the buffer to slab while writePages holds a reference would allow
-			// another cache to reuse the buffer, causing data corruption when
-			// the writer re-accesses the page via getWritablePage.
-			// Writer pages are evicted through create() step 4 or stress callback;
-			// their buffers are returned to slab at commit/rollback time.
-			if pc.xStress == nil && globalPageSlab.UnderPressure() && len(pc.pages) > pc.maxPages {
+			if globalPageSlab.UnderPressure() && len(pc.pages) > pc.maxPages {
 				delete(pc.pages, p.pgno)
 				// Add to pFree for direct reuse by create() instead of returning
 				// buffer to slab (which would drop it — slab is full under
@@ -586,13 +565,6 @@ func (pc *pcache) evictOne() *page {
 	p.prev = nil
 	pc.nRecyclable--
 	delete(pc.pages, p.pgno)
-	// Notify pager to remove stale writePages reference (if any).
-	// This breaks the aliasing that previously prevented page recycling
-	// for writer caches. Matches SQLite pcache1.c:905
-	// (pcache1RemoveFromHash is the only cleanup needed — no writePages map).
-	if pc.onEvict != nil {
-		pc.onEvict(p.pgno)
-	}
 	return p
 }
 

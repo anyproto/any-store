@@ -889,10 +889,10 @@ func TestTxGetPage_WritableDirtyPage(t *testing.T) {
 	ns, err := tx.CreateNamespace("data")
 	require.NoError(t, err)
 
-	// Write a value — this creates dirty pages in writePages
+	// Write a value — this creates dirty pages in writerCache
 	require.NoError(t, tx.Put(ns, []byte("k1"), []byte("v1")))
 
-	// Read back — this exercises the writePages lookup in txGetPage
+	// Read back — this exercises the writerCache lookup in txGetPage
 	val, err := tx.Get(ns, []byte("k1"))
 	require.NoError(t, err)
 	assert.Equal(t, []byte("v1"), val)
@@ -1622,7 +1622,7 @@ func TestFreeTreePages_InteriorAndOverflow(t *testing.T) {
 }
 
 // === Cover txGetPage writable getPageAt path (line 612) ===
-// When a write tx accesses a page that is NOT in writePages, it falls through
+// When a write tx accesses a page that is NOT in writerCache, it falls through
 // to getPageAt. This happens when reading from a pre-existing namespace's
 // btree pages that the current write tx didn't modify.
 
@@ -1638,11 +1638,11 @@ func TestTxGetPage_WritableGetPageAt(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// Start a NEW write tx. The pages from "existing" namespace are on disk,
-	// not in writePages. Reading them exercises line 612 (getPageAt).
+	// not in writerCache. Reading them exercises line 612 (getPageAt).
 	tx2, err := db.BeginWrite()
 	require.NoError(t, err)
 
-	// Read from pre-existing namespace — pages are NOT dirty (not in writePages)
+	// Read from pre-existing namespace — pages are NOT dirty (not in writerCache)
 	ns2, err := tx2.GetNamespace("existing")
 	require.NoError(t, err)
 	val, err := tx2.Get(ns2, []byte("k1"))
@@ -1865,17 +1865,17 @@ func TestResolveNamespace_CorruptCell(t *testing.T) {
 	require.NoError(t, tx.Commit())
 
 	// Now corrupt cell data in page 1 by overwriting cell pointer to invalid offset.
-	// Start a write tx so we can get page 1 from writePages.
+	// Start a write tx so we can get page 1 from writerCache.
 	tx2, err := db.BeginWrite()
 	require.NoError(t, err)
 
 	// Get page 1 (master btree root)
-	pg := db.pager.writePages[1]
+	pg := db.pager.writerCache.pages[1]
 	if pg == nil {
 		// Need to dirty page 1 first
 		_, err = tx2.CreateNamespace("temp")
 		require.NoError(t, err)
-		pg = db.pager.writePages[1]
+		pg = db.pager.writerCache.pages[1]
 	}
 	require.NotNil(t, pg)
 
@@ -2064,13 +2064,13 @@ func TestAppendValue_CorruptCellPointers(t *testing.T) {
 	tx2, err := db.BeginWrite()
 	require.NoError(t, err)
 
-	// Touch the page to get it into writePages
+	// Touch the page to get it into writerCache
 	ns2, err := tx2.GetNamespace("data")
 	require.NoError(t, err)
 	require.NoError(t, tx2.Put(ns2, []byte("key2"), []byte("val2")))
 
 	// Now corrupt the root page's cell pointer
-	pg := db.pager.writePages[rootPg]
+	pg := db.pager.writerCache.pages[rootPg]
 	if pg != nil && pg.header.cellCount > 0 {
 		cpOff := pg.cellPointerOffset()
 		// Point cell pointer beyond usable size
@@ -2701,14 +2701,14 @@ func TestFreeTreePages_CorruptOverflowChain(t *testing.T) {
 	tx2, err := db.BeginWrite()
 	require.NoError(t, err)
 
-	// Force the root page into writePages by writing a small key
+	// Force the root page into writerCache by writing a small key
 	ns2, err := tx2.GetNamespace("overflow_ns")
 	require.NoError(t, err)
 	require.NoError(t, tx2.Put(ns2, []byte("extra"), []byte("v")))
 
 	// Now directly corrupt the overflow pointer in the dirty page.
-	// The root page should be in writePages.
-	pg := db.pager.writePages[rootPg]
+	// The root page should be in writerCache.
+	pg := db.pager.writerCache.pages[rootPg]
 	if pg != nil && pg.header.isLeaf() && pg.header.cellCount > 0 {
 		usableSize := db.pager.usableSize()
 		off := pg.getCellOffset(0)
@@ -2735,7 +2735,7 @@ func TestFreeTreePages_CorruptOverflowChain(t *testing.T) {
 	// Force root page to be dirty
 	require.NoError(t, tx3.Put(ns3, []byte("force"), []byte("dirty")))
 
-	pg = db.pager.writePages[rootPg]
+	pg = db.pager.writerCache.pages[rootPg]
 	if pg != nil && pg.header.isLeaf() && pg.header.cellCount > 0 {
 		usableSize := db.pager.usableSize()
 		// Find the first cell with an overflow page and corrupt it
@@ -2762,7 +2762,7 @@ func TestFreeTreePages_CorruptOverflowChain(t *testing.T) {
 
 	// If root page changed (due to split from Put), re-corrupt the new root
 	if currentRootPg != rootPg {
-		pg = db.pager.writePages[currentRootPg]
+		pg = db.pager.writerCache.pages[currentRootPg]
 		if pg != nil && pg.header.isLeaf() && pg.header.cellCount > 0 {
 			usableSize := db.pager.usableSize()
 			for ci := 0; ci < int(pg.header.cellCount); ci++ {

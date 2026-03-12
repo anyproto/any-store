@@ -38,11 +38,8 @@ type btree struct {
 // getPage returns a page using this btree's walMaxFrame for snapshot isolation.
 func (bt *btree) getPage(pgno uint32) (*page, error) {
 	if bt.writable {
-		// Use pager.getPage which checks writePages first, then falls back
-		// to getPageWriter with wal.nFrame (not the frozen bt.walMaxFrame).
-		// The writer must see its own spilled pages at WAL frames beyond
-		// the snapshot walMaxFrame. With onEvict recycling, evicted spilled
-		// pages are removed from writePages and must be re-read from WAL.
+		// Use pager.getPage which uses wal.nFrame (not the frozen
+		// bt.walMaxFrame) so the writer sees its own spilled pages.
 		return bt.pager.getPage(pgno)
 	}
 	// Reader: use private cache for snapshot isolation. Falls back to
@@ -951,9 +948,8 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 		}
 	}
 
-	// For writable btrees, use bt.getPage which checks writePages first
-	// to find pages that were spilled and evicted from pcache.
-	// For readers, use getPageReader with the reader's private cache.
+	// For writable btrees, use bt.getPage which uses wal.nFrame to find
+	// spilled pages. For readers, use getPageReader with private cache.
 	var pg *page
 	if bt.writable {
 		pg, err = bt.getPage(bt.rootPage)

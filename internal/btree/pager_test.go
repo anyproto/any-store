@@ -58,8 +58,8 @@ func TestPagerError(t *testing.T) {
 	// State should be back to open (pagerError transitions to open)
 	assert.Equal(t, int32(pagerOpen), p.state.Load())
 
-	// writePages should be cleared
-	assert.Empty(t, p.writePages)
+	// writerCache dirty pages should be cleared
+	assert.Equal(t, 0, p.writerCache.nDirty)
 	assert.Empty(t, p.savepoints)
 
 	p.endRead(slot)
@@ -162,7 +162,7 @@ func TestBeginRead_PagerErrorState(t *testing.T) {
 }
 
 // ============================================================
-// beginWrite — writePages nil initialization (85.7%)
+// beginWrite — writerCache initialization (85.7%)
 // ============================================================
 
 func TestBeginWrite_InitializesWritePages(t *testing.T) {
@@ -176,10 +176,9 @@ func TestBeginWrite_InitializesWritePages(t *testing.T) {
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
 
-	// writePages is nil initially
-	p.writePages = nil
+	// writerCache is initialized after beginWrite
 	require.NoError(t, p.beginWrite())
-	assert.NotNil(t, p.writePages)
+	assert.NotNil(t, p.writerCache)
 
 	require.NoError(t, p.rollback())
 	p.endRead(slot)
@@ -295,7 +294,7 @@ func TestFreePage_CorruptLeafCount(t *testing.T) {
 	require.NoError(t, p.freePage(pg4.pgno))
 
 	// Corrupt the trunk page's leaf count
-	trunkPg := p.writePages[pg4.pgno]
+	trunkPg := p.writerCache.pages[pg4.pgno]
 	if trunkPg != nil {
 		binary.BigEndian.PutUint32(trunkPg.data[4:8], uint32(99999)) // corrupt leaf count
 	}
@@ -434,7 +433,7 @@ func TestAllocateFromFreelist_CorruptLeafCount(t *testing.T) {
 	require.NoError(t, p.freePage(pg2.pgno))
 
 	// Corrupt leaf count on trunk
-	trunkPg := p.writePages[p.header.FirstFreelistPg]
+	trunkPg := p.writerCache.pages[p.header.FirstFreelistPg]
 	if trunkPg != nil {
 		binary.BigEndian.PutUint32(trunkPg.data[4:8], uint32(99999))
 	}
@@ -470,7 +469,7 @@ func TestAllocateFromFreelist_CorruptLeafPgno(t *testing.T) {
 
 	// Corrupt the leaf pgno in trunk
 	trunkPgno := p.header.FirstFreelistPg
-	trunkPg := p.writePages[trunkPgno]
+	trunkPg := p.writerCache.pages[trunkPgno]
 	if trunkPg != nil {
 		leafCount := binary.BigEndian.Uint32(trunkPg.data[4:8])
 		if leafCount > 0 {
@@ -505,7 +504,7 @@ func TestAllocateFromFreelist_CorruptNextTrunk(t *testing.T) {
 	require.NoError(t, p.freePage(pg2.pgno))
 
 	// Corrupt next trunk pointer
-	trunkPg := p.writePages[p.header.FirstFreelistPg]
+	trunkPg := p.writerCache.pages[p.header.FirstFreelistPg]
 	if trunkPg != nil {
 		binary.BigEndian.PutUint32(trunkPg.data[0:4], 999) // bad next trunk
 	}
@@ -3775,7 +3774,7 @@ func TestFreePage_NewTrunkWithSavepoints(t *testing.T) {
 	p.savepoint()
 
 	// No trunk exists, freeing page should make it a new trunk
-	// getWritablePage(pgno) should succeed since the page is in writePages
+	// getWritablePage(pgno) should succeed since the page is in writerCache
 	p.header.FirstFreelistPg = 0 // No existing trunk
 	err = p.freePage(pgno)
 	require.NoError(t, err)
@@ -4011,7 +4010,7 @@ func TestFreeOverflowChain_GetPageError(t *testing.T) {
 	p.file = nil
 
 	// freeOverflowChain(5) - pgno=5 passes bounds check (>=2, <=5)
-	// but getPage(5) should fail since it's not in cache or writePages
+	// but getPage(5) should fail since it's not in cache or writerCache
 	// and file is nil (non-InMemory mode)
 	// Actually with file=nil and non-InMemory, getPageAt will try file.ReadAt
 	// which will panic. Let's use InMemory mode instead.
@@ -5135,7 +5134,7 @@ func TestFreePage_TrunkCorruptLeafCount(t *testing.T) {
 	p.releasePage(pg3)
 
 	require.NoError(t, p.freePage(pg2.pgno)) // pg2 becomes trunk
-	trunkPg := p.writePages[pg2.pgno]
+	trunkPg := p.writerCache.pages[pg2.pgno]
 	require.NotNil(t, trunkPg)
 	binary.BigEndian.PutUint32(trunkPg.data[4:8], uint32(p.freelistMaxLeaves()+1))
 

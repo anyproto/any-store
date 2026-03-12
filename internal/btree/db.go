@@ -677,8 +677,8 @@ func (db *DB) GetNamespace(name string) (*Namespace, error) {
 }
 
 // getNamespaceLocked returns a Namespace handle (caller must hold read lock).
-// Uses pager.getPage which reads from writePages — safe only when called from
-// the writer goroutine (e.g. WriteTx.CreateNamespace after modifying page 1).
+// Uses pager.getPage which reads from the writer cache — safe only when called
+// from the writer goroutine (e.g. WriteTx.CreateNamespace after modifying page 1).
 func (db *DB) getNamespaceLocked(name string) (*Namespace, error) {
 	bt := &btree{pager: db.pager, rootPage: 1, writable: true}
 	return db.resolveNamespace(name, bt)
@@ -687,8 +687,7 @@ func (db *DB) getNamespaceLocked(name string) (*Namespace, error) {
 // getNamespaceAt returns a Namespace handle using snapshot isolation.
 // When cache is non-nil, pages are cached in the reader's private cache.
 // When cache is nil, falls back to uncached reads.
-// Safe to call from any goroutine (readers or writer) because
-// it does not access pager.writePages.
+// Safe to call from any goroutine (readers or writer).
 func (db *DB) getNamespaceAt(name string, walMaxFrame uint32, cache *pcache) (*Namespace, error) {
 	bt := &btree{pager: db.pager, cache: cache, rootPage: 1, walMaxFrame: walMaxFrame, writable: false}
 	return db.resolveNamespace(name, bt)
@@ -820,16 +819,12 @@ type ReadTx struct {
 
 
 // txGetPage fetches a page respecting MVCC snapshot isolation.
-// For write transactions, dirty pages from writePages are returned directly.
+// For write transactions, pages are fetched from the writer cache or WAL.
 // For read transactions, getPageReader uses a private cache for snapshot isolation.
 func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 	if tx.writable {
-		// Use pager.getPage which checks writePages first, then falls back
-		// to getPageWriter with wal.nFrame (not the frozen tx.walMaxFrame).
-		// The writer must see its own spilled pages, which exist at WAL frames
-		// beyond walMaxFrame. Before onEvict recycling, writePages always
-		// caught spilled pages; now evicted pages may be missing from writePages
-		// and must be found via WAL lookup with the current nFrame.
+		// Use pager.getPage which uses wal.nFrame (not the frozen
+		// tx.walMaxFrame) so the writer sees its own spilled pages.
 		return tx.pager.getPage(pgno)
 	}
 	return tx.pager.getPageReader(pgno, tx.walMaxFrame, tx.cache)

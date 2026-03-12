@@ -163,7 +163,7 @@ func TestSharedCache_ReaderCacheHitDuringWriterSpill(t *testing.T) {
 //
 // Page spilled (made clean), evicted from pcache, reader creates new
 // cache entry for same pgno. Writer calls getWritablePage → should use
-// its own writePages entry, not the reader's cache entry.
+// its own writerCache entry, not the reader's cache entry.
 // -------------------------------------------------------------------
 
 func TestSharedCache_WriterGetWritablePageAfterSpillEvict(t *testing.T) {

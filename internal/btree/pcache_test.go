@@ -585,14 +585,14 @@ func TestPcacheBulkAlloc_MaxBulk100(t *testing.T) {
 
 func TestPcacheBufferRecycling_EvictionFromPFreeOrSlab(t *testing.T) {
 	// Fill cache to maxPages, create one more page. For writer caches (xStress
-	// set), evicted page buffers are NOT returned to slab because writePages may
+	// set), evicted page buffers are NOT returned to slab because writerCache may
 	// alias the evicted page. The new page is allocated from pFree or slab.
 	globalPageSlab.Reset()
 	globalPageSlab.Init(4096, 500)
 	defer globalPageSlab.Reset()
 
 	pc := newPcache(4096, 5, true)
-	// Set xStress to simulate writer cache (writePages aliasing concern)
+	// Set xStress to simulate writer cache (writerCache aliasing concern)
 	pc.xStress = func(p *page) error { return nil }
 
 	// Create and release 5 pages (fills cache)

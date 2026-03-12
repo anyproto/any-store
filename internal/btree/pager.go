@@ -99,11 +99,6 @@ type pager struct {
 	// Readers use per-tx walMaxFrame instead.
 	walMaxFrame atomic.Uint32
 
-	// Write-transaction page map: tracks all pages dirtied by the writer.
-	// Only accessed by the single writer goroutine — readers use their own
-	// private caches via getPageReader.
-	writePages map[uint32]*page
-
 	// savedWalFrame is the WAL frame count at beginWrite() time.
 	// Used to roll back spilled frames on transaction rollback.
 	// Atomic because rollbackForClose reads it without the writer lock
@@ -185,9 +180,6 @@ func newPager(path string, pageSize uint32, cacheSize int, purgeable bool) *page
 		writerCache: newPcache(int(pageSize), cacheSize, purgeable),
 	}
 	p.writerCache.xStress = p.pagerStress
-	p.writerCache.onEvict = func(pgno uint32) {
-		delete(p.writePages, pgno)
-	}
 	return p
 }
 
@@ -239,9 +231,6 @@ func (p *pager) open() error {
 	p.dbSize.Store(p.header.DatabaseSize)
 	p.writerCache = newPcache(int(p.pageSize), p.writerCache.maxPages, p.writerCache.purgeable)
 	p.writerCache.xStress = p.pagerStress
-	p.writerCache.onEvict = func(pgno uint32) {
-		delete(p.writePages, pgno)
-	}
 
 	// Open WAL
 	p.wal = newWal(p.path+"-wal", p.pageSize)
@@ -327,9 +316,6 @@ func (p *pager) initNewDB() error {
 	p.dbSize.Store(1)
 	p.writerCache = newPcache(int(p.pageSize), p.writerCache.maxPages, p.writerCache.purgeable)
 	p.writerCache.xStress = p.pagerStress
-	p.writerCache.onEvict = func(pgno uint32) {
-		delete(p.writePages, pgno)
-	}
 
 	// For inMemory mode, pre-populate page 1 in masterStore so reads find it
 	if p.inMemory && p.master != nil {
@@ -365,8 +351,6 @@ func (p *pager) beginRead() (maxFrame uint32, slot int, err error) {
 	}
 	// Update pager's walMaxFrame monotonically: never decrease, since a reader
 	// with an older snapshot must not overwrite a newer value set by the writer.
-	// The writer's getWritablePage → getPage uses p.walMaxFrame.Load() for pages
-	// not yet in writePages; a stale value would read an old page version.
 	for {
 		old := p.walMaxFrame.Load()
 		if maxFrame <= old {
@@ -409,28 +393,13 @@ func (p *pager) beginWrite() error {
 	p.savedWalFrame.Store(p.wal.nFrame.Load())
 	p.savedWalCksum1 = p.wal.cksum1
 	p.savedWalCksum2 = p.wal.cksum2
-	if p.writePages == nil {
-		p.writePages = make(map[uint32]*page, 64)
-	}
 	return nil
 }
 
 // getPage returns the page with the given page number, reading from WAL or disk as needed.
 // Uses the current WAL nFrame (not walMaxFrame) so that spilled pages written
 // to WAL beyond walMaxFrame during this write transaction are visible.
-// This matches SQLite's getPageNormal which uses a single shared cache — spilled
-// pages stay in cache or are re-read from WAL using the full frame range.
 func (p *pager) getPage(pgno uint32) (*page, error) {
-	// Fast path for writer: return its own dirty pages directly.
-	// writePages is only populated during a write transaction and is
-	// only accessed by the single writer goroutine, so no lock is needed.
-	if pg := p.writePages[pgno]; pg != nil {
-		pg.pinCount++
-		return pg, nil
-	}
-	// Use wal.nFrame (current frame count including spills) instead of
-	// walMaxFrame (snapshot at beginWrite). Spilled pages are at frames
-	// beyond walMaxFrame but within nFrame.
 	return p.getPageWriter(pgno, p.wal.nFrame.Load())
 }
 
@@ -666,18 +635,15 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 		return nil, ErrReadOnly
 	}
 
-	// Fast path: check write-transaction page map (no lock needed)
-	if pg := p.writePages[pgno]; pg != nil {
+	// Check writer cache first. Spilled pages (clean but still cached)
+	// are re-dirtied here. Evicted pages fall through to getPage().
+	if pg := p.writerCache.fetch(pgno); pg != nil {
 		// Clear dontWrite flag: the page is being re-acquired for writing,
 		// so its content is meaningful again (fix 5.4). Matches SQLite's
 		// pcache.c:596-597 where PGHDR_DONT_WRITE is cleared by makeDirty.
 		delete(p.dontWritePages, pgno)
 		// Re-dirty pages that were made clean by pagerStress (spill).
-		// Without this, post-spill modifications would be lost at commit
-		// because appendDirtyPages only collects dirty pages.
 		if !pg.dirty {
-			// Re-register in cache if evicted after spill, then mark dirty.
-			p.writerCache.pages[pgno] = pg
 			p.writerCache.makeDirty(pg)
 		}
 		// Save copy for savepoint rollback if needed (lazy copy-on-write)
@@ -689,7 +655,6 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 				sp.pages[pgno] = dataCopy
 			}
 		}
-		pg.pinCount++
 		return pg, nil
 	}
 
@@ -729,7 +694,6 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 	}
 
 	p.writerCache.makeDirty(pg)
-	p.writePages[pgno] = pg
 	return pg, nil
 }
 
@@ -759,7 +723,6 @@ func (p *pager) allocatePage() (*page, error) {
 	}
 	clear(pg.data)
 	p.writerCache.makeDirty(pg)
-	p.writePages[pgno] = pg
 	return pg, nil
 }
 
@@ -830,7 +793,7 @@ func (p *pager) freePage(pgno uint32) error {
 			// Only done when adding as leaf to trunk, NOT when becoming a trunk
 			// (trunk page content is meaningful -- it holds freelist structure).
 			// Matches SQLite's freePage2() (btree.c:6920).
-			if p.writePages[pgno] != nil {
+			if p.writerCache.pages[pgno] != nil {
 				p.dontWrite(pgno)
 			}
 			// Track that this page had content before being freed, so that if
@@ -864,7 +827,6 @@ func (p *pager) freePage(pgno uint32) error {
 		}
 		newTrunkPg = p.writerCache.create(pgno, 2)
 		p.writerCache.makeDirty(newTrunkPg)
-		p.writePages[pgno] = newTrunkPg
 	} else {
 		if debugTrace {
 			trace("freePage: pg=%d becomes new trunk (old trunk=%d), savepoint copy saved via getWritablePage", pgno, trunkPgno)
@@ -980,7 +942,6 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 		clear(pg.data)
 		pg.header = pageHeader{}
 		p.writerCache.makeDirty(pg)
-		p.writePages[leafPgno] = pg
 		// Clear dontWrite flag: when a page is freed and then re-allocated
 		// within the same transaction, the freePage() call may have marked it
 		// dontWrite. Now that it's being reused, its content is meaningful
@@ -1290,8 +1251,8 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	}
 
 	if debugTrace {
-		trace("commit: dbSize=%d savepoints=%d writePages=%d dontWritePages=%d hasContent=%d",
-			p.dbSize.Load(), len(p.savepoints), len(p.writePages), len(p.dontWritePages), len(p.hasContent))
+		trace("commit: dbSize=%d savepoints=%d dirtyPages=%d dontWritePages=%d hasContent=%d",
+			p.dbSize.Load(), len(p.savepoints), p.writerCache.nDirty, len(p.dontWritePages), len(p.hasContent))
 	}
 
 	// Update the in-memory header with current database size.
@@ -1329,13 +1290,12 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	// The nFrame check catches transactions where all dirty pages were spilled
 	// (making dirtyBuf empty) but a commit frame is still needed.
 	hasRealChanges := len(p.dirtyBuf) > 0 || p.header != p.savedHeader ||
-		p.writePages[1] != nil || p.wal.nFrame.Load() > p.savedWalFrame.Load()
+		p.wal.nFrame.Load() > p.savedWalFrame.Load()
 
 	if !hasRealChanges {
 		// Empty transaction — counters not incremented.
 		p.state.Store(int32(pagerOpen))
 		p.savepoints = p.savepoints[:0]
-		clear(p.writePages)
 		clear(p.hasContent)
 		p.wal.endWrite()
 		return 0, p.header.FileChangeCount, p.header.SchemaCookie, nil
@@ -1380,22 +1340,6 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	}
 
 	p.savepoints = p.savepoints[:0]
-
-	// Return slab buffers for pages evicted from cache during stress spill.
-	// These pages were removed from writerCache.pages by evictOne() but still
-	// referenced by writePages. discard()/clear()/truncate() only handle pages
-	// in writerCache.pages, so evicted page buffers must be returned here.
-	// Pages still in cache are tracked by writerCache.pages — we skip those.
-	if slabOk := globalPageSlab.Initialized(p.writerCache.pageSize); slabOk {
-		for _, pg := range p.writePages {
-			if pg != nil && pg.data != nil && p.writerCache.pages[pg.pgno] != pg {
-				globalPageSlab.Put(pg.data)
-				pg.data = nil
-			}
-		}
-	}
-
-	clear(p.writePages)
 	clear(p.dontWritePages)
 	clear(p.hasContent)
 	p.state.Store(int32(pagerOpen))
@@ -1427,22 +1371,10 @@ func (p *pager) rollbackLocked() error {
 		p.writerCache.discard(pg.pgno)
 	}
 
-	// Discard spilled (clean) pages from cache. Spilled pages were written
-	// to WAL mid-transaction and marked clean by pagerStress, so they won't
-	// appear in dirtyPages. Their cached content is stale after rollback.
-	// Also return slab buffers for pages evicted from cache during stress
-	// spill — discard() can't find them in writerCache.pages, so their
-	// buffers must be returned here. After discard(), data is nil for
-	// discarded pages; non-nil data on a page not in cache means evicted.
-	slabOk := globalPageSlab.Initialized(p.writerCache.pageSize)
-	for pgno, pg := range p.writePages {
-		if p.writerCache.pages[pgno] != nil {
-			p.writerCache.discard(pgno)
-		} else if pg != nil && pg.data != nil && slabOk {
-			globalPageSlab.Put(pg.data)
-			pg.data = nil
-		}
-	}
+	// Discard all dirty pages and spilled (clean) pages from cache.
+	// Their cached content is stale after rollback. clear() keeps buffers
+	// in pFree for reuse.
+	p.writerCache.clear()
 
 	// Roll back spilled frames in the WAL index. Spilled frames in the WAL
 	// file are harmless (no commit marker), but pageMap entries and maxFrame
@@ -1472,7 +1404,6 @@ func (p *pager) rollbackLocked() error {
 
 	p.doNotSpill &^= spillFlagRollback
 	p.savepoints = p.savepoints[:0]
-	clear(p.writePages)
 	clear(p.dontWritePages)
 	clear(p.hasContent)
 	p.state.Store(int32(pagerOpen))
@@ -1482,10 +1413,10 @@ func (p *pager) rollbackLocked() error {
 
 // rollbackForClose is a variant of rollbackLocked for use by DB.Close().
 // It only performs WAL-level rollback and lock release — all writer-owned
-// state (writePages, dontWritePages, hasContent, header, savepoints, WAL
-// checksums) is deliberately left untouched because the writer goroutine
-// may still be in a B-tree operation accessing those structures, and pcache
-// has no mutex. Since the database is closing, that state will be GC'd.
+// state (dontWritePages, hasContent, header, savepoints, WAL checksums)
+// is deliberately left untouched because the writer goroutine may still be
+// in a B-tree operation accessing those structures, and pcache has no mutex.
+// Since the database is closing, that state will be GC'd.
 // Caller must hold writerOpMu.
 func (p *pager) rollbackForClose() {
 	st := pagerState(p.state.Load())
@@ -1504,11 +1435,10 @@ func (p *pager) rollbackForClose() {
 		p.wal.mu.Unlock()
 	}
 
-	// Skip writePages, dontWritePages, hasContent, header, savepoints,
-	// and WAL checksum restoration — all are writer-owned, non-atomic
-	// state that the writer goroutine may be reading concurrently.
-	// Touching them here would be a data race (concurrent map access on
-	// writePages can panic). None of it matters after Close().
+	// Skip dontWritePages, hasContent, header, savepoints, and WAL
+	// checksum restoration — all are writer-owned, non-atomic state that
+	// the writer goroutine may be reading concurrently. Touching them
+	// here would be a data race. None of it matters after Close().
 
 	p.state.Store(int32(pagerOpen))
 	p.wal.endWrite()
@@ -1565,20 +1495,6 @@ func (p *pager) pagerError() {
 
 	p.savepoints = p.savepoints[:0]
 
-	// Return slab buffers for pages evicted from cache during stress spill.
-	// After discard()+clear() above, in-cache pages have data==nil; non-nil
-	// data on a writePages entry means the page was evicted and its buffer
-	// was never returned to the slab.
-	if slabOk := globalPageSlab.Initialized(p.writerCache.pageSize); slabOk {
-		for _, pg := range p.writePages {
-			if pg != nil && pg.data != nil {
-				globalPageSlab.Put(pg.data)
-				pg.data = nil
-			}
-		}
-	}
-
-	clear(p.writePages)
 	clear(p.dontWritePages)
 	clear(p.hasContent)
 
@@ -1602,8 +1518,8 @@ func (p *pager) savepoint() (int, error) {
 	dbSz := p.dbSize.Load()
 	walFr := p.wal.nFrame.Load()
 	if debugTrace {
-		trace("savepoint: creating id=%d dbSize=%d walFrame=%d writePages=%d dontWritePages=%d hasContent=%d",
-			id, dbSz, walFr, len(p.writePages), len(p.dontWritePages), len(p.hasContent))
+		trace("savepoint: creating id=%d dbSize=%d walFrame=%d dirtyPages=%d dontWritePages=%d hasContent=%d",
+			id, dbSz, walFr, p.writerCache.nDirty, len(p.dontWritePages), len(p.hasContent))
 	}
 	p.savepoints = append(p.savepoints, savepointState{
 		id:        id,
@@ -1629,28 +1545,14 @@ func (p *pager) rollbackToSavepoint(id int) error {
 	sp := &p.savepoints[id]
 
 	if debugTrace {
-		trace("rollbackToSavepoint: id=%d spDbSize=%d currentDbSize=%d numSavepoints=%d writePages=%d",
-			id, sp.dbSize, p.dbSize.Load(), len(p.savepoints), len(p.writePages))
+		trace("rollbackToSavepoint: id=%d spDbSize=%d currentDbSize=%d numSavepoints=%d cachedPages=%d",
+			id, sp.dbSize, p.dbSize.Load(), len(p.savepoints), len(p.writerCache.pages))
 	}
 
 	// Suppress spills during savepoint rollback (SQLite pager.c:2457).
 	p.doNotSpill |= spillFlagRollback
 
 	// Discard pages allocated after the savepoint.
-	// Must scan both writePages AND the writer cache: with onEvict recycling,
-	// a spilled+evicted page may have been removed from writePages but could
-	// still be present in the cache (if re-fetched for a later operation).
-	for pgno := range p.writePages {
-		if pgno > sp.dbSize {
-			if debugTrace {
-				trace("rollbackToSavepoint: discard pg=%d (> spDbSize=%d)", pgno, sp.dbSize)
-			}
-			p.writerCache.discard(pgno)
-			delete(p.writePages, pgno)
-		}
-	}
-	// Truncate writer cache: remove any pages > sp.dbSize that were evicted
-	// from writePages (by onEvict) but are still cached.
 	p.writerCache.truncate(sp.dbSize)
 
 	// Roll back spilled frames in the WAL index to the savepoint's WAL position.
@@ -1679,23 +1581,10 @@ func (p *pager) rollbackToSavepoint(id int) error {
 			trace("rollbackToSavepoint: restoring sp[%d] pages (%d entries)", i, len(p.savepoints[i].pages))
 		}
 		for pgno, data := range p.savepoints[i].pages {
-			// Find the page: check writePages, then cache, then create new.
-			// With onEvict recycling, a spilled+evicted page may be missing
-			// from both writePages and the cache. We must still restore it.
-			var pg *page
-			if wp := p.writePages[pgno]; wp != nil {
-				// Re-register in cache if evicted after spill.
-				p.writerCache.pages[pgno] = wp
-				pg = wp
-				pg.pinCount++
-			} else {
-				pg = p.writerCache.fetch(pgno)
-			}
+			// Find the page in cache, or create a new one if evicted.
+			pg := p.writerCache.fetch(pgno)
 			if pg == nil {
-				// Page was evicted from both writePages and cache.
-				// Create a new page to hold the restored savepoint data.
 				pg = p.writerCache.create(pgno, 2)
-				p.writePages[pgno] = pg
 			}
 			{
 				copy(pg.data, data)
