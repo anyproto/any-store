@@ -208,11 +208,11 @@ func (it *FullScanIter) checkFilter() (ok bool, err error) {
 	if it.Filter == nil {
 		return true, nil
 	}
-	val, err := it.cursor.Value()
+	it.Buf.DocBuf, err = it.cursor.AppendValue(it.Buf.DocBuf[:0])
 	if err != nil {
 		return false, err
 	}
-	doc, err := it.Buf.Parser.Parse(val)
+	doc, err := it.Buf.Parser.Parse(it.Buf.DocBuf)
 	if err != nil {
 		return false, err
 	}
@@ -249,14 +249,20 @@ func (it *FullScanIter) String() string {
 
 // DocValue fetches and parses the document value at the current cursor position.
 func (it *FullScanIter) DocValue() (*anyenc.Value, error) {
-	val, err := it.cursor.Value()
+	var err error
+	it.Buf.DocBuf, err = it.cursor.AppendValue(it.Buf.DocBuf[:0])
 	if err != nil {
 		return nil, err
 	}
-	return it.Buf.Parser.Parse(val)
+	return it.Buf.Parser.Parse(it.Buf.DocBuf)
 }
 
 // RawValue returns the raw bytes of the value at the current cursor position.
 func (it *FullScanIter) RawValue() ([]byte, error) {
-	return it.cursor.Value()
+	var err error
+	it.Buf.DocBuf, err = it.cursor.AppendValue(it.Buf.DocBuf[:0])
+	if err != nil {
+		return nil, err
+	}
+	return it.Buf.DocBuf, nil
 }

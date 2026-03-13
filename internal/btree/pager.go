@@ -1804,6 +1804,83 @@ func (p *pager) readOverflowChainReader(firstPgno uint32, buf []byte, walMaxFram
 	return nil
 }
 
+// readOverflowAt reads amt bytes from an overflow chain starting at byte offset
+// skip into the chain payload. Copies directly into dst. Matches SQLite's
+// accessPayload() offset logic — skips overflow pages that fall before skip,
+// then copies from the first relevant page onward.
+func (p *pager) readOverflowAt(firstPgno uint32, skip, amt int, dst []byte, walMaxFrame uint32, cache *pcache) error {
+	usable := overflowPageUsable(p.usableSize())
+	pgno := firstPgno
+	off := 0 // current byte offset in chain payload
+
+	maxIter := (skip+amt)/usable + 2
+	if maxIter < 10 {
+		maxIter = 10
+	}
+	iter := 0
+	dbSize := p.dbSize.Load()
+	written := 0
+
+	for pgno != 0 && written < amt {
+		if pgno < 2 || pgno > dbSize {
+			return ErrCorrupt
+		}
+		iter++
+		if iter > maxIter {
+			return ErrCorrupt
+		}
+
+		end := off + usable // byte range [off, end) in this page
+		if end <= skip {
+			// Entire page falls before our region — just follow the pointer.
+			// Read page only to get the next-page pointer.
+			var pg *page
+			var err error
+			if cache != nil {
+				pg, err = p.getPageReader(pgno, walMaxFrame, cache)
+			} else {
+				pg, err = p.getPage(pgno)
+			}
+			if err != nil {
+				return err
+			}
+			pgno = binary.BigEndian.Uint32(pg.data[0:4])
+			p.releasePage(pg)
+			off = end
+			continue
+		}
+
+		// This page overlaps our region.
+		var pg *page
+		var err error
+		if cache != nil {
+			pg, err = p.getPageReader(pgno, walMaxFrame, cache)
+		} else {
+			pg, err = p.getPage(pgno)
+		}
+		if err != nil {
+			return err
+		}
+
+		// Compute which bytes of this page's data [0, usable) to copy.
+		srcStart := 0
+		if skip > off {
+			srcStart = skip - off
+		}
+		srcEnd := usable
+		if written+(srcEnd-srcStart) > amt {
+			srcEnd = srcStart + (amt - written)
+		}
+		copy(dst[written:], pg.data[4+srcStart:4+srcEnd])
+		written += srcEnd - srcStart
+
+		pgno = binary.BigEndian.Uint32(pg.data[0:4])
+		p.releasePage(pg)
+		off = end
+	}
+	return nil
+}
+
 // freeOverflowChain frees all pages in an overflow chain.
 func (p *pager) freeOverflowChain(firstPgno uint32) error {
 	if debugTrace {

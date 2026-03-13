@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"slices"
 	"sync/atomic"
 )
 
@@ -2953,6 +2954,76 @@ func (c *Cursor) Value() ([]byte, error) {
 	}
 
 	return cell.value, nil
+}
+
+// AppendValue appends the current value to buf and returns the extended buffer.
+// For non-overflow values, appends the on-page bytes (one copy into buf).
+// For overflow values, reads directly into buf with no intermediate allocation,
+// matching SQLite's accessPayload() offset approach.
+func (c *Cursor) AppendValue(buf []byte) ([]byte, error) {
+	if !c.valid {
+		return buf, ErrKeyNotFound
+	}
+
+	frame := &c.stack[len(c.stack)-1]
+	if frame.pg == nil {
+		return buf, ErrCorrupt
+	}
+
+	usableSize := c.bt.usablePageSize()
+	off, oerr := frame.pg.getCellOffsetSafe(frame.cellIdx)
+	if oerr != nil {
+		return buf, oerr
+	}
+	cell, _, cerr := parseLeafCellWithSize(frame.pg.data, int(off), usableSize)
+	if cerr != nil {
+		return buf, cerr
+	}
+
+	if cell.overflowPg != 0 {
+		pos := int(off)
+		keyLen, kn, verr := getVarintSafe(frame.pg.data[pos:])
+		if verr != nil {
+			return buf, ErrCorrupt
+		}
+		pos += kn
+		valLen, vn, verr := getVarintSafe(frame.pg.data[pos:])
+		if verr != nil {
+			return buf, ErrCorrupt
+		}
+		_ = vn
+
+		totalPayload := int(keyLen) + int(valLen)
+		nLocal := localPayloadSize(totalPayload, usableSize)
+		localKeyBytes := min(nLocal, int(keyLen))
+		localValBytes := nLocal - localKeyBytes
+		keyOverflow := int(keyLen) - localKeyBytes
+		valOverflow := int(valLen) - localValBytes
+
+		// Grow buf to hold the full value
+		start := len(buf)
+		buf = slices.Grow(buf, int(valLen))[:start+int(valLen)]
+		fullVal := buf[start:]
+
+		// Copy local value portion from the page
+		if localValBytes > 0 {
+			copy(fullVal, cell.value)
+		}
+
+		// Read overflow value bytes directly into destination, skipping key overflow
+		if valOverflow > 0 {
+			err := c.bt.pager.readOverflowAt(
+				cell.overflowPg, keyOverflow, valOverflow,
+				fullVal[localValBytes:], c.bt.walMaxFrame, c.bt.cache,
+			)
+			if err != nil {
+				return buf[:start], err
+			}
+		}
+		return buf, nil
+	}
+
+	return append(buf, cell.value...), nil
 }
 
 // Next advances the cursor to the next key in order.
