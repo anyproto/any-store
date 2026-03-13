@@ -673,9 +673,11 @@ func (db *db) onCollectionClose(name string) {
 func (db *db) persistAllDirtySketches(tx *btree.WriteTx) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	buf := db.syncPool.GetDocBuf()
+	defer db.syncPool.ReleaseDocBuf(buf)
 	for _, coll := range db.openedCollections {
 		c := coll.(*collection)
-		if err := c.persistSketches(tx); err != nil {
+		if err := c.persistSketches(tx, buf); err != nil {
 			return err
 		}
 	}

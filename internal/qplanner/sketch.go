@@ -2,6 +2,7 @@ package qplanner
 
 import (
 	"encoding/binary"
+	"slices"
 	"sync/atomic"
 
 	"github.com/cespare/xxhash/v2"
@@ -81,15 +82,16 @@ func (s *IndexSketch) GetDocCount() uint64 {
 	return s.docCount.Load()
 }
 
-// MarshalBinary serializes the sketch to a byte slice.
+// MarshalBinary serializes the sketch into dst, reusing its capacity when possible.
 // Format: [buckets (8*size bytes)] [docCount (8 bytes)]
-func (s *IndexSketch) MarshalBinary() []byte {
-	data := make([]byte, 8*s.Size+8)
+func (s *IndexSketch) MarshalBinary(dst []byte) []byte {
+	need := 8*s.Size + 8
+	dst = slices.Grow(dst[:0], need)[:need]
 	for i := range s.Size {
-		binary.LittleEndian.PutUint64(data[i*8:], atomic.LoadUint64(&s.Buckets[i]))
+		binary.LittleEndian.PutUint64(dst[i*8:], atomic.LoadUint64(&s.Buckets[i]))
 	}
-	binary.LittleEndian.PutUint64(data[8*s.Size:], s.docCount.Load())
-	return data
+	binary.LittleEndian.PutUint64(dst[8*s.Size:], s.docCount.Load())
+	return dst
 }
 
 // UnmarshalBinary deserializes the sketch from a byte slice.
