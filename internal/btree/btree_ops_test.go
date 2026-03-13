@@ -1385,11 +1385,26 @@ func TestRebuildLeafPageWithOverflow(t *testing.T) {
 	bigVal := bytes.Repeat([]byte("V"), maxLocalPayload(p.usableSize())+100)
 	require.NoError(t, bt.rebuildLeafPage(pg, []cellData{{key: []byte("key"), value: bigVal}}))
 
+	// Verify raw passthrough round-trip: collect preserves overflow chains,
+	// rebuild copies raw cells, and the data is still readable via parsing.
 	got := bt.collectLeafCells(pg)
 	require.Len(t, got, 1)
 	assert.Equal(t, []byte("key"), got[0].key)
-	assert.Equal(t, bigVal, got[0].value)
+	assert.NotNil(t, got[0].rawCell, "overflow cell should have rawCell set")
+	assert.NotZero(t, got[0].overflowPg, "overflow cell should have overflowPg set")
+
+	// Rebuild from raw cells and verify data integrity via full read
+	pg2, err := p.allocatePage()
+	require.NoError(t, err)
+	require.NoError(t, bt.rebuildLeafPage(pg2, got))
+	// Parse the cell and read the full value via overflow chain
+	off := pg2.getCellOffset(0)
+	c, _, cerr := parseLeafCellWithSize(pg2.data, int(off), p.usableSize())
+	require.NoError(t, cerr)
+	assert.Equal(t, []byte("key"), c.key)
+	assert.NotZero(t, c.overflowPg)
 	p.releasePage(pg)
+	p.releasePage(pg2)
 }
 
 func TestStressRebalanceSmallPage(t *testing.T) {

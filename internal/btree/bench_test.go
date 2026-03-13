@@ -289,3 +289,130 @@ func BenchmarkWriterWithReaders(b *testing.B) {
 	close(stop)
 	wg.Wait()
 }
+
+// BenchmarkPutOverflow measures insert throughput with overflow-sized values.
+// This exercises collectLeafCells + rebuildLeafPage during splits.
+// With raw cell passthrough, splits skip overflow I/O and allocation entirely.
+func BenchmarkPutOverflow(b *testing.B) {
+	db := benchDB(b)
+	tx, err := db.BeginWrite()
+	if err != nil {
+		b.Fatal(err)
+	}
+	ns, err := tx.CreateNamespace("bench")
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+
+	// Value larger than maxLocal to trigger overflow on every cell
+	usable := 4096
+	maxLocal := maxLocalPayload(usable)
+	valSize := maxLocal + 100
+	val := make([]byte, valSize)
+	for i := range val {
+		val[i] = byte(i)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	// Batch inserts to trigger many splits per commit
+	const batchSize = 50
+	for i := 0; i < b.N; i++ {
+		tx, err := db.BeginWrite()
+		if err != nil {
+			b.Fatal(err)
+		}
+		for j := 0; j < batchSize; j++ {
+			key := binary.BigEndian.AppendUint32(nil, uint32(i*batchSize+j))
+			if err := tx.Put(ns, key, val); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkCollectRebuildOverflow directly benchmarks collectLeafCells + rebuildLeafPage
+// on a page full of overflow cells. This isolates the allocation improvement.
+func BenchmarkCollectRebuildOverflow(b *testing.B) {
+	db := benchDB(b)
+
+	tx, err := db.BeginWrite()
+	if err != nil {
+		b.Fatal(err)
+	}
+	ns, err := tx.CreateNamespace("bench")
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+
+	usable := 4096
+	maxLocal := maxLocalPayload(usable)
+	valSize := maxLocal + 100
+	val := make([]byte, valSize)
+
+	// Insert enough keys to have several full pages with overflow cells
+	tx, err = db.BeginWrite()
+	if err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < 200; i++ {
+		key := binary.BigEndian.AppendUint32(nil, uint32(i))
+		if err := tx.Put(ns, key, val); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+
+	// Benchmark collect+rebuild on a leaf page with overflow cells
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		txw, err := db.BeginWrite()
+		if err != nil {
+			b.Fatal(err)
+		}
+		bt := &btree{pager: txw.pager, rootPage: ns.rootPage, walMaxFrame: txw.walMaxFrame, writable: true}
+		pg, err := bt.getPage(bt.rootPage)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		// Walk to a leaf page
+		for pg.header.isInterior() {
+			childOff := pg.getCellOffset(0)
+			childPgno := binary.BigEndian.Uint32(pg.data[childOff:])
+			bt.pager.releasePage(pg)
+			pg, err = bt.getPage(childPgno)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+
+		wpg, err := bt.pager.getWritablePage(pg.pgno)
+		bt.pager.releasePage(pg)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		cells := bt.collectLeafCells(wpg)
+		_ = bt.rebuildLeafPage(wpg, cells)
+		bt.pager.releasePage(wpg)
+
+		if err := txw.Rollback(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

@@ -59,6 +59,7 @@ type cellData struct {
 	value      []byte
 	leftChild  uint32 // only for interior pages
 	overflowPg uint32 // overflow page number (0 = no overflow)
+	rawCell    []byte // raw on-page cell bytes for passthrough during splits
 }
 
 // parseLeafCell parses a leaf cell at the given offset in page data.
@@ -226,12 +227,17 @@ func leafSplitPoint(cells []cellData, usableSize int) int {
 	bestIdx := len(cells) / 2 // fallback to 50/50
 
 	for i, c := range cells {
+		var cellSz int
+		if c.rawCell != nil {
+			cellSz = len(c.rawCell) + 2 // +2 for cell pointer
+		} else {
+			cellSz = leafCellSizeWithOverflow(c.key, c.value, usableSize) + 2
+		}
 		if i == 0 {
 			// always put at least 1 cell on left
-			cumSize += leafCellSizeWithOverflow(c.key, c.value, usableSize) + 2
+			cumSize += cellSz
 			continue
 		}
-		cellSz := leafCellSizeWithOverflow(c.key, c.value, usableSize) + 2
 		if cumSize+cellSz > target {
 			bestIdx = i
 			break
@@ -1369,10 +1375,13 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []uin
 	}
 
 	// Slow path: new cell doesn't fit or too much fragmentation.
-	// collectLeafCells frees all overflow chains (including old ones),
-	// so we must NOT free old overflow above when taking this path.
+	// collectLeafCells preserves overflow chains (raw passthrough).
+	// Free overflow only for the cell being replaced.
 	cells := bt.collectLeafCells(pg)
-	cells[idx] = cellData{key: key, value: value}
+	if cells[idx].overflowPg != 0 {
+		_ = bt.pager.freeOverflowChain(cells[idx].overflowPg)
+	}
+	cells[idx] = cellData{key: key, value: value} // rawCell=nil → will be encoded fresh
 
 	// Check if all cells still fit on one page after replacement.
 	// This mirrors SQLite's insertCellFast (btree.c ~line 7433): if the new
@@ -1385,7 +1394,11 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []uin
 	hdrSize := hdrOff + 8 + len(cells)*2 // page header + cell pointers
 	totalContent := 0
 	for _, c := range cells {
-		totalContent += leafCellSizeWithOverflow(c.key, c.value, pageUsable)
+		if c.rawCell != nil {
+			totalContent += len(c.rawCell)
+		} else {
+			totalContent += leafCellSizeWithOverflow(c.key, c.value, pageUsable)
+		}
 	}
 
 	if hdrSize+totalContent <= pageUsable {
@@ -1397,7 +1410,13 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []uin
 	mid := leafSplitPoint(cells, pageUsable)
 	leftCells := cells[:mid]
 	rightCells := cells[mid:]
-	sepKey := bytes.Clone(rightCells[0].key)
+
+	// Get full separator key (handles rare case where key itself overflows).
+	sepKey, serr := bt.cellFullKey(&rightCells[0])
+	if serr != nil {
+		return serr
+	}
+	sepKey = bytes.Clone(sepKey)
 
 	rightPg, err := bt.pager.allocatePage()
 	if err != nil {
@@ -1419,8 +1438,10 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []uin
 
 // collectLeafCells reads all cells from a leaf page.
 // Cell data is copied into a single contiguous buffer to avoid per-cell allocations.
-// Overflow values are fully read from overflow pages, and the old overflow chains
-// are freed (since the caller will rebuild the page with new overflow chains).
+// Overflow chains are preserved: raw cell bytes (including the 4-byte overflow pointer)
+// are copied into the buffer and stored in rawCell for passthrough during rebuildLeafPage.
+// This matches SQLite's balance_nonroot which never reads or frees overflow data during
+// rebalancing — overflow chains are only created/destroyed when cell content actually changes.
 func (bt *btree) collectLeafCells(pg *page) []cellData {
 	n := int(pg.header.cellCount)
 	cells := make([]cellData, n, n+1) // +1 cap: callers insert one more cell after collecting
@@ -1441,59 +1462,27 @@ func (bt *btree) collectLeafCells(pg *page) []cellData {
 		off := pg.getCellOffset(i)
 		cells[i], _, _ = parseLeafCellWithSize(pg.data, int(off), usableSize)
 
+		// Compute the raw cell size (bytes consumed on page by parseLeafCellWithSize).
+		// Re-parse to get bytesRead since parseLeafCellWithSize already returned it.
+		_, bytesRead, _ := parseLeafCellWithSize(pg.data, int(off), usableSize)
+
+		// Copy raw cell bytes into contiguous buffer for passthrough.
+		rcStart := len(buf)
+		buf = append(buf, pg.data[int(off):int(off)+bytesRead]...)
+		cells[i].rawCell = buf[rcStart : rcStart+bytesRead]
+
 		if cells[i].overflowPg != 0 {
-			// Read keyLen and valLen from cell header (new format: both varints first)
-			pos := int(off)
-			keyLen, kn := getVarint(pg.data[pos:])
-			pos += kn
-			valLen, vn := getVarint(pg.data[pos:])
-			pos += vn
-
-			totalPayload := int(keyLen) + int(valLen)
-			nLocal := localPayloadSize(totalPayload, usableSize)
-			localKeyBytes := min(nLocal, int(keyLen))
-			localValBytes := nLocal - localKeyBytes
-
-			// Read entire overflow chain
-			overflowSize := totalPayload - nLocal
-			overflowBuf := make([]byte, overflowSize)
-			if err := bt.pager.readOverflowChainAt(cells[i].overflowPg, overflowBuf, bt.walMaxFrame); err != nil {
-				if debugTrace {
-					trace("collectLeafCells: readOverflowChainAt FAILED pg=%d walMaxFrame=%d err=%v leafPage=%d cell=%d key=%q",
-						cells[i].overflowPg, bt.walMaxFrame, err, pg.pgno, i, cells[i].key)
-				}
-				if debugOverflowReadErrors.Load() != 0 {
-					panic(fmt.Sprintf("collectLeafCells: readOverflowChainAt(pg=%d, walMaxFrame=%d) failed: %v",
-						cells[i].overflowPg, bt.walMaxFrame, err))
-				}
-			} else if debugTrace {
-				trace("collectLeafCells: read overflow pg=%d size=%d leafPage=%d cell=%d", cells[i].overflowPg, overflowSize, pg.pgno, i)
-			}
-
-			// Reconstruct full key
-			fullKey := make([]byte, int(keyLen))
-			copy(fullKey, pg.data[pos:pos+localKeyBytes])
-			keyOverflow := int(keyLen) - localKeyBytes
-			if keyOverflow > 0 {
-				copy(fullKey[localKeyBytes:], overflowBuf[:keyOverflow])
-			}
-
-			// Reconstruct full value
-			fullVal := make([]byte, int(valLen))
-			if localValBytes > 0 {
-				copy(fullVal, pg.data[pos+localKeyBytes:pos+localKeyBytes+localValBytes])
-			}
-			valOverflow := int(valLen) - localValBytes
-			if valOverflow > 0 {
-				copy(fullVal[localValBytes:], overflowBuf[keyOverflow:])
-			}
-
-			// Free the old overflow chain — rebuildLeafPage will create new ones.
-			_ = bt.pager.freeOverflowChain(cells[i].overflowPg)
-			cells[i].key = fullKey
-			cells[i].value = fullVal
-			cells[i].overflowPg = 0 // full key/value now in memory
+			// For overflow cells, parse the full key for separator extraction.
+			// The local key portion is already in cells[i].key (from parseLeafCellWithSize),
+			// but it points into pg.data. Copy it into buf so it survives page rebuild.
+			kStart := len(buf)
+			buf = append(buf, cells[i].key...)
+			cells[i].key = buf[kStart:len(buf)]
+			// value is only the local portion; not needed for separator extraction
+			cells[i].value = nil
 		} else {
+			// Non-overflow: key and value are fully on-page.
+			// Copy into buf so they survive page rebuild.
 			kStart := len(buf)
 			buf = append(buf, cells[i].key...)
 			vStart := len(buf)
@@ -1503,6 +1492,38 @@ func (bt *btree) collectLeafCells(pg *page) []cellData {
 		}
 	}
 	return cells
+}
+
+// cellFullKey returns the full key for a cell collected by collectLeafCells.
+// For non-overflow cells, c.key is already the full key.
+// For overflow cells where the key fits locally (only value overflows), c.key is full.
+// For the rare case where the key itself overflows, read the remainder from overflow pages.
+func (bt *btree) cellFullKey(c *cellData) ([]byte, error) {
+	if c.rawCell == nil || c.overflowPg == 0 {
+		return c.key, nil // already full
+	}
+	// Parse keyLen from rawCell varints
+	keyLen, kn := getVarint(c.rawCell)
+	if int(keyLen) == len(c.key) {
+		return c.key, nil // key fits locally
+	}
+	// Key overflows — read the full key from overflow pages.
+	// The overflow chain contains (keyRemainder || valueRemainder).
+	usableSize := bt.usablePageSize()
+	valLen, _ := getVarint(c.rawCell[kn:])
+	totalPayload := int(keyLen) + int(valLen)
+	nLocal := localPayloadSize(totalPayload, usableSize)
+	localKeyBytes := min(nLocal, int(keyLen))
+	keyOverflow := int(keyLen) - localKeyBytes
+
+	fullKey := make([]byte, int(keyLen))
+	copy(fullKey, c.key[:localKeyBytes])
+	overflowBuf := make([]byte, keyOverflow)
+	if err := bt.pager.readOverflowChainAt(c.overflowPg, overflowBuf, bt.walMaxFrame); err != nil {
+		return nil, err
+	}
+	copy(fullKey[localKeyBytes:], overflowBuf)
+	return fullKey, nil
 }
 
 // collectInteriorCells reads all cells from an interior page.
@@ -1581,30 +1602,37 @@ func (bt *btree) rebuildLeafPage(pg *page, cells []cellData) error {
 	maxLocal := maxLocalPayload(pageUsable)
 	contentOff := pageUsable
 	for i, c := range cells {
-		totalPayload := len(c.key) + len(c.value)
-
-		if totalPayload > maxLocal {
-			// Need overflow. Unified payload: (key||value).
-			nLocal := localPayloadSize(totalPayload, pageUsable)
-			localKeyBytes := min(nLocal, len(c.key))
-			localValBytes := nLocal - localKeyBytes
-			overflowData := make([]byte, 0, totalPayload-nLocal)
-			if localKeyBytes < len(c.key) {
-				overflowData = append(overflowData, c.key[localKeyBytes:]...)
-			}
-			overflowData = append(overflowData, c.value[localValBytes:]...)
-			overflowPgno, err := bt.pager.writeOverflowChain(overflowData)
-			if err != nil {
-				return err
-			}
-			hdr := varintSize(uint64(len(c.key))) + varintSize(uint64(len(c.value)))
-			size := hdr + nLocal + overflowPtrSize
+		if c.rawCell != nil {
+			// Raw passthrough: copy cell bytes directly, preserving overflow pointer.
+			size := len(c.rawCell)
 			contentOff -= size
-			writeLeafCellOverflow(pg.data[contentOff:], c.key, c.value, nLocal, overflowPgno)
+			copy(pg.data[contentOff:], c.rawCell)
 		} else {
-			size := leafCellSize(c.key, c.value)
-			contentOff -= size
-			writeLeafCell(pg.data[contentOff:], c.key, c.value)
+			totalPayload := len(c.key) + len(c.value)
+
+			if totalPayload > maxLocal {
+				// Need overflow. Unified payload: (key||value).
+				nLocal := localPayloadSize(totalPayload, pageUsable)
+				localKeyBytes := min(nLocal, len(c.key))
+				localValBytes := nLocal - localKeyBytes
+				overflowData := make([]byte, 0, totalPayload-nLocal)
+				if localKeyBytes < len(c.key) {
+					overflowData = append(overflowData, c.key[localKeyBytes:]...)
+				}
+				overflowData = append(overflowData, c.value[localValBytes:]...)
+				overflowPgno, err := bt.pager.writeOverflowChain(overflowData)
+				if err != nil {
+					return err
+				}
+				hdr := varintSize(uint64(len(c.key))) + varintSize(uint64(len(c.value)))
+				size := hdr + nLocal + overflowPtrSize
+				contentOff -= size
+				writeLeafCellOverflow(pg.data[contentOff:], c.key, c.value, nLocal, overflowPgno)
+			} else {
+				size := leafCellSize(c.key, c.value)
+				contentOff -= size
+				writeLeafCell(pg.data[contentOff:], c.key, c.value)
+			}
 		}
 		// Write cell pointer
 		ptrOff := hdrOff + pg.header.headerSize() + i*2
@@ -1694,7 +1722,12 @@ func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte
 	leftCells := cells[:mid]
 	rightCells := cells[mid:]
 
-	sepKey := bytes.Clone(rightCells[0].key)
+	// Get full separator key (handles rare case where key itself overflows).
+	sepKey, serr := bt.cellFullKey(&rightCells[0])
+	if serr != nil {
+		return serr
+	}
+	sepKey = bytes.Clone(sepKey)
 
 	rightPg, err := bt.pager.allocatePage()
 	if err != nil {
@@ -1911,8 +1944,12 @@ func (bt *btree) splitLeafAndInsert(pg *page, idx int, key, value []byte) error 
 	leftCells := cells[:mid]
 	rightCells := cells[mid:]
 
-	// The separator key is the first key of the right page
-	sepKey := bytes.Clone(rightCells[0].key)
+	// Get full separator key (handles rare case where key itself overflows).
+	sepKey, serr := bt.cellFullKey(&rightCells[0])
+	if serr != nil {
+		return serr
+	}
+	sepKey = bytes.Clone(sepKey)
 
 	// Allocate new right page
 	rightPg, err := bt.pager.allocatePage()
@@ -2139,9 +2176,15 @@ func (bt *btree) Delete(key []byte) error {
 	}
 
 	if needsRebuild {
-		// Fall back to full rebuild — collectLeafCells frees all overflow chains
-		// (including the deleted cell's), so we must NOT free them above.
+		// Fall back to full rebuild. collectLeafCells preserves overflow chains,
+		// so we must explicitly free the deleted cell's overflow chain.
 		cells := bt.collectLeafCells(wpg)
+		if cells[idx].overflowPg != 0 {
+			if err := bt.pager.freeOverflowChain(cells[idx].overflowPg); err != nil {
+				bt.pager.releasePage(wpg)
+				return err
+			}
+		}
 		cells = append(cells[:idx], cells[idx+1:]...)
 		if err := bt.rebuildLeafPage(wpg, cells); err != nil {
 			bt.pager.releasePage(wpg)
@@ -2268,11 +2311,9 @@ func (bt *btree) tryMergeLeaf(leafPgno uint32, path []uint32) error {
 		return err
 	}
 
-	// Check if merged content fits BEFORE calling collectLeafCells.
-	// collectLeafCells frees overflow chains as a side effect; if the merge
-	// won't proceed, freeing overflow chains corrupts the pages (the cells
-	// still reference the now-freed overflow pages). Compute size from raw
-	// page data using only the varint key/value lengths.
+	// Check if merged content fits before collecting cells.
+	// collectLeafCells now preserves overflow chains (no side effects),
+	// but this check is still a useful optimization to avoid unnecessary work.
 	usableSize := bt.usablePageSize()
 	totalSize := 8 // leaf header
 	for _, pg := range []*page{leafPg, sibPg} {
@@ -2287,10 +2328,10 @@ func (bt *btree) tryMergeLeaf(leafPgno uint32, path []uint32) error {
 	if totalSize > usableSize {
 		bt.pager.releasePage(leafPg)
 		bt.pager.releasePage(sibPg)
-		return nil // doesn't fit — no side effects
+		return nil // doesn't fit
 	}
 
-	// Merge will proceed. Collect cells (reads overflow data, frees old chains).
+	// Merge will proceed. Collect cells (overflow chains are preserved via raw passthrough).
 	leafCells := bt.collectLeafCells(leafPg)
 	sibCells := bt.collectLeafCells(sibPg)
 	bt.pager.releasePage(leafPg)
