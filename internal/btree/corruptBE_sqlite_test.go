@@ -66,7 +66,7 @@ func setupCorruptBSmall(t *testing.T) (string, []byte, uint32, int) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -107,7 +107,7 @@ func setupCorruptBLarge(t *testing.T) (string, []byte, uint32, int) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -545,7 +545,7 @@ func TestSqlite_CorruptC_2_13(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 
 	// Insert a row so page 1 has some content
@@ -570,7 +570,7 @@ func TestSqlite_CorruptC_2_13(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// Reopen and attempt write operation
-	db, err = Open(path, DefaultOptions())
+	db, err = testOpen(t, path, DefaultOptions())
 	if err != nil {
 		// Open failure is acceptable for corrupted page 1
 		return
@@ -601,7 +601,7 @@ func TestSqlite_CorruptC_2_14(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -633,7 +633,7 @@ func TestSqlite_CorruptC_2_14(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// Reopen
-	db, err = Open(path, DefaultOptions())
+	db, err = testOpen(t, path, DefaultOptions())
 	if err != nil {
 		return
 	}
@@ -666,7 +666,7 @@ func TestSqlite_CorruptC_3_ByteFuzz(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 
 	// Create a small multi-page DB for fuzzing
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -708,7 +708,7 @@ func TestSqlite_CorruptC_3_ByteFuzz(t *testing.T) {
 		_ = os.Remove(path + "-shm")
 
 		// Attempt Open
-		db, err := Open(path, Options{PageSize: 1024})
+		db, err := testOpen(t, path, Options{PageSize: 1024})
 		if err != nil {
 			continue // Open failure is acceptable
 		}
@@ -770,7 +770,7 @@ func TestSqlite_CorruptD_1_1_1(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -817,7 +817,7 @@ func TestSqlite_CorruptD_1_1_1(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// Reopen and run integrity check
-	db, err = Open(path, Options{PageSize: 1024})
+	db, err = testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		return
 	}
@@ -840,7 +840,7 @@ func TestSqlite_CorruptD_1_1_2(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -886,7 +886,7 @@ func TestSqlite_CorruptD_1_1_2(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// Reopen and attempt scan -- should detect corruption, not crash
-	db, err = Open(path, Options{PageSize: 1024})
+	db, err = testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		return
 	}
@@ -921,7 +921,7 @@ func TestSqlite_CorruptE_3_KeyOrderingVectors(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	// Insert sequential keys to create multiple leaf pages
@@ -1067,7 +1067,7 @@ func TestSqlite_CorruptE_3_KeyOrderingVectors(t *testing.T) {
 			_ = os.Remove(path + "-wal")
 			_ = os.Remove(path + "-shm")
 
-			db, err := Open(path, Options{PageSize: 1024})
+			db, err := testOpen(t, path, Options{PageSize: 1024})
 			if err != nil {
 				return
 			}

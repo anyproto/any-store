@@ -83,7 +83,7 @@ func TestCheckpoint_ClosingDoubleCheck(t *testing.T) {
 func TestOpen_PageSizeNotPowerOf2(t *testing.T) {
 	dir := t.TempDir()
 	// 3072 is between min and max but not power of 2
-	_, err := Open(filepath.Join(dir, "t.db"), Options{PageSize: 3072})
+	_, err := testOpen(t, filepath.Join(dir, "t.db"), Options{PageSize: 3072})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "power of 2")
 }
@@ -93,7 +93,7 @@ func TestOpen_OldSchemaFormat(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 
 	// Write something so there are pages on disk
@@ -112,19 +112,19 @@ func TestOpen_OldSchemaFormat(t *testing.T) {
 	binary.BigEndian.PutUint32(data[44:48], 4) // Set to old format < 5
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	_, err = Open(path, DefaultOptions())
+	_, err = testOpen(t, path, DefaultOptions())
 	assert.ErrorIs(t, err, ErrOldFormat)
 }
 
 func TestOpen_InvalidPath(t *testing.T) {
 	// Try opening a db at a non-existent directory
-	_, err := Open("/nonexistent/path/to/db.file", DefaultOptions())
+	_, err := testOpen(t, "/nonexistent/path/to/db.file", DefaultOptions())
 	assert.Error(t, err)
 }
 
 func TestOpen_CacheSizeDefault(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "t.db"), Options{CacheSize: -1})
+	db, err := testOpen(t, filepath.Join(dir, "t.db"), Options{CacheSize: -1})
 	require.NoError(t, err)
 	defer db.Close()
 	// Should use default cache size
@@ -132,7 +132,7 @@ func TestOpen_CacheSizeDefault(t *testing.T) {
 
 func TestOpen_AutoCheckpointDisabled(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "t.db"), Options{DisableAutoCheckpoint: true})
+	db, err := testOpen(t, filepath.Join(dir, "t.db"), Options{DisableAutoCheckpoint: true})
 	require.NoError(t, err)
 	defer db.Close()
 	assert.Equal(t, 0, db.opts.AutoCheckpointAfter)
@@ -549,7 +549,7 @@ func TestCommit_AutoCheckpoint(t *testing.T) {
 	opts := DefaultOptions()
 	opts.AutoCheckpointAfter = 5 // Very low threshold to trigger auto-checkpoint
 	opts.InProcess = true
-	db, err := Open(filepath.Join(dir, "test.db"), opts)
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), opts)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -589,7 +589,7 @@ func TestCommit_AutoCheckpoint_LongReader_WALRecyclesAfterRelease(t *testing.T) 
 	opts := DefaultOptions()
 	opts.AutoCheckpointAfter = 8
 	opts.InProcess = true
-	db, err := Open(filepath.Join(dir, "test.db"), opts)
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), opts)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -907,7 +907,7 @@ func TestAppendValue_OverflowAfterCheckpoint(t *testing.T) {
 	opts := DefaultOptions()
 	opts.DisableAutoCheckpoint = true
 	opts.InProcess = true
-	db, err := Open(filepath.Join(dir, "test.db"), opts)
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), opts)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -941,28 +941,28 @@ func TestAppendValue_OverflowAfterCheckpoint(t *testing.T) {
 
 func TestOpen_MinPageSize(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "t.db"), Options{PageSize: MinPageSize})
+	db, err := testOpen(t, filepath.Join(dir, "t.db"), Options{PageSize: MinPageSize})
 	require.NoError(t, err)
 	defer db.Close()
 }
 
 func TestOpen_MaxPageSize(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "t.db"), Options{PageSize: MaxPageSize})
+	db, err := testOpen(t, filepath.Join(dir, "t.db"), Options{PageSize: MaxPageSize})
 	require.NoError(t, err)
 	defer db.Close()
 }
 
 func TestOpen_PageSizeTooSmall(t *testing.T) {
 	dir := t.TempDir()
-	_, err := Open(filepath.Join(dir, "t.db"), Options{PageSize: MinPageSize / 2})
+	_, err := testOpen(t, filepath.Join(dir, "t.db"), Options{PageSize: MinPageSize / 2})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid page size")
 }
 
 func TestOpen_PageSizeTooLarge(t *testing.T) {
 	dir := t.TempDir()
-	_, err := Open(filepath.Join(dir, "t.db"), Options{PageSize: MaxPageSize * 2})
+	_, err := testOpen(t, filepath.Join(dir, "t.db"), Options{PageSize: MaxPageSize * 2})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid page size")
 }
@@ -1296,7 +1296,7 @@ func TestBeginRead_HeaderCountersError(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
 	opts.DisableAutoCheckpoint = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	// Write and checkpoint to establish on-disk state
@@ -1312,7 +1312,7 @@ func TestBeginRead_HeaderCountersError(t *testing.T) {
 	require.NoError(t, os.Truncate(path, 10))
 
 	// Reopen — Open itself tries readHeaderCounters, which should fail
-	_, err = Open(path, opts)
+	_, err = testOpen(t, path, opts)
 	assert.Error(t, err)
 }
 
@@ -1322,7 +1322,7 @@ func TestBeginWrite_BeginWriteError(t *testing.T) {
 	dir := t.TempDir()
 	opts := DefaultOptions()
 	opts.InProcess = true
-	db, err := Open(filepath.Join(dir, "test.db"), opts)
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), opts)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1355,7 +1355,7 @@ func TestBeginWrite_ReadHeaderCountersError(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
 	opts.DisableAutoCheckpoint = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	// Write and checkpoint
@@ -1368,7 +1368,7 @@ func TestBeginWrite_ReadHeaderCountersError(t *testing.T) {
 	require.NoError(t, db.Close())
 
 	// Reopen
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	// Now truncate the db file — readHeaderCounters reads page 1 from disk
@@ -1451,7 +1451,7 @@ func TestOpen_InitBeginReadError(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
 
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	// Write data and keep WAL frames (no checkpoint)
@@ -1476,7 +1476,7 @@ func TestOpen_InitBeginReadError(t *testing.T) {
 
 	// Open should fail because beginRead or readHeaderCounters encounters corrupt WAL
 	// (This may or may not fail depending on how the WAL recovery handles corruption)
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	if err != nil {
 		// Expected: Open failed due to corrupt WAL
 		assert.Error(t, err)
@@ -1708,7 +1708,7 @@ func TestBeginWrite_PagerBeginWriteError(t *testing.T) {
 	dir := t.TempDir()
 	opts := DefaultOptions()
 	opts.InProcess = true
-	db, err := Open(filepath.Join(dir, "test.db"), opts)
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), opts)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1736,7 +1736,7 @@ func TestOpen_InitBeginReadError2(t *testing.T) {
 	opts := DefaultOptions()
 	opts.DisableAutoCheckpoint = true
 
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	// Write data and checkpoint
@@ -1753,7 +1753,7 @@ func TestOpen_InitBeginReadError2(t *testing.T) {
 	require.NoError(t, os.Truncate(path, 32))
 
 	// Re-open should fail
-	_, err = Open(path, opts)
+	_, err = testOpen(t, path, opts)
 	assert.Error(t, err)
 }
 
@@ -1768,7 +1768,7 @@ func TestOpen_InitReadHeaderCountersError(t *testing.T) {
 	opts := DefaultOptions()
 	opts.InProcess = true
 
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	// Write data
@@ -1794,7 +1794,7 @@ func TestOpen_InitReadHeaderCountersError(t *testing.T) {
 
 	// Re-open — this may or may not fail depending on WAL recovery.
 	// Either way we exercise the error path or the success path.
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	if err != nil {
 		assert.Error(t, err) // exercises lines 140-143 or 146-149
 	} else {
@@ -1941,7 +1941,7 @@ func TestListNamespaces_CursorKeyError(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
 	opts.DisableAutoCheckpoint = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	// Create a namespace
@@ -1978,7 +1978,7 @@ func TestListNamespaces_CursorKeyError(t *testing.T) {
 	os.Remove(path + "-wal-shm")
 
 	// Reopen — if it succeeds, ListNamespaces should fail at cursor operations
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	if err != nil {
 		// Open itself failed due to corruption — still covers some error path
 		return
@@ -1999,7 +1999,7 @@ func TestListNamespaces_CursorNextError(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
 	opts.DisableAutoCheckpoint = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	// Create 2 namespaces
@@ -2028,7 +2028,7 @@ func TestListNamespaces_CursorNextError(t *testing.T) {
 	os.Remove(path + "-wal")
 	os.Remove(path + "-wal-shm")
 
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	if err != nil {
 		return
 	}
@@ -2096,7 +2096,7 @@ func TestAppendValue_CorruptInteriorPage(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
 	opts.DisableAutoCheckpoint = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -2140,7 +2140,7 @@ func TestAppendValue_CorruptInteriorPage(t *testing.T) {
 	os.Remove(path + "-wal")
 	os.Remove(path + "-wal-shm")
 
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	if err != nil {
 		return // Open failed
 	}
@@ -2170,7 +2170,7 @@ func TestAppendValue_ChildPageError(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
 	opts.DisableAutoCheckpoint = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -2215,7 +2215,7 @@ func TestAppendValue_ChildPageError(t *testing.T) {
 	os.Remove(path + "-wal")
 	os.Remove(path + "-wal-shm")
 
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	if err != nil {
 		return
 	}
@@ -2244,7 +2244,7 @@ func TestOpen_InitBeginReadErrorCorruptFile(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 
 	// Create a valid database
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -2274,7 +2274,7 @@ func TestOpen_InitBeginReadErrorCorruptFile(t *testing.T) {
 
 	// Open should succeed (pager.open checks the db header, not page content),
 	// but the init phase reads page 1 for counters. This may error.
-	db2, err := Open(path, DefaultOptions())
+	db2, err := testOpen(t, path, DefaultOptions())
 	if err != nil {
 		// Good — exercises init error path
 		assert.Error(t, err)
@@ -2291,7 +2291,7 @@ func TestAppendValue_CorruptLeafCell(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
 	opts.DisableAutoCheckpoint = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -2336,7 +2336,7 @@ func TestAppendValue_CorruptLeafCell(t *testing.T) {
 	os.Remove(path + "-wal")
 	os.Remove(path + "-wal-shm")
 
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	if err != nil {
 		return
 	}
@@ -2365,7 +2365,7 @@ func TestResolveNamespace_InteriorSearchError(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
 	opts.DisableAutoCheckpoint = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	// Create many namespaces so master btree has interior pages
@@ -2399,7 +2399,7 @@ func TestResolveNamespace_InteriorSearchError(t *testing.T) {
 	os.Remove(path + "-wal")
 	os.Remove(path + "-wal-shm")
 
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	if err != nil {
 		return // Open failed — still OK
 	}
@@ -2476,7 +2476,7 @@ func TestFreeTreePages_CorruptLeafCells(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
 	opts.DisableAutoCheckpoint = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -2522,7 +2522,7 @@ func TestFreeTreePages_CorruptLeafCells(t *testing.T) {
 	os.Remove(path + "-wal")
 	os.Remove(path + "-wal-shm")
 
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	if err != nil {
 		return
 	}
@@ -2550,7 +2550,7 @@ func TestResolveNamespace_ParseLeafCellError(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
 	opts.DisableAutoCheckpoint = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	// Create a namespace
@@ -2590,7 +2590,7 @@ func TestResolveNamespace_ParseLeafCellError(t *testing.T) {
 	os.Remove(path + "-wal")
 	os.Remove(path + "-wal-shm")
 
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	if err != nil {
 		return
 	}
@@ -2612,7 +2612,7 @@ func TestFreeTreePages_CorruptChildPointer(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
 	opts.DisableAutoCheckpoint = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -2655,7 +2655,7 @@ func TestFreeTreePages_CorruptChildPointer(t *testing.T) {
 	os.Remove(path + "-wal")
 	os.Remove(path + "-wal-shm")
 
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	if err != nil {
 		return
 	}
@@ -2794,7 +2794,7 @@ func TestFreeTreePages_CorruptOverflowChain(t *testing.T) {
 // validates the cell size before returning. These are defensive dead code.
 
 func TestOpen_InMemory(t *testing.T) {
-	db, err := Open("", Options{InMemory: true})
+	db, err := testOpen(t, "", Options{InMemory: true})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -2833,7 +2833,7 @@ func TestCov2_Open_HasMmapShm(t *testing.T) {
 func TestCov2_Open_BeginReadError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -2849,7 +2849,7 @@ func TestCov2_Open_BeginReadError(t *testing.T) {
 
 	// Create a directory instead of the shm file to cause WAL open to fail
 	require.NoError(t, os.MkdirAll(shmPath, 0755))
-	_, err = Open(path, Options{PageSize: DefaultPageSize, CacheSize: 100})
+	_, err = testOpen(t, path, Options{PageSize: DefaultPageSize, CacheSize: 100})
 	assert.Error(t, err)
 }
 
@@ -2872,7 +2872,7 @@ func TestCov2_FreeTreePages_RegetPageError(t *testing.T) {
 func TestCov2_ResolveNamespace_ParseLeafCellError2(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -2891,7 +2891,7 @@ func TestCov2_ResolveNamespace_ParseLeafCellError2(t *testing.T) {
 	data[cellOff+1] = 0xFF
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db2, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	if err != nil {
 		return
 	}
@@ -2906,7 +2906,7 @@ func TestCov2_ResolveNamespace_ParseLeafCellError2(t *testing.T) {
 func TestCov2_ListNamespaces_CursorFirstError2(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	require.NoError(t, err)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -2930,7 +2930,7 @@ func TestCov2_ListNamespaces_CursorFirstError2(t *testing.T) {
 	binary.BigEndian.PutUint16(data[cpBase:], 0xFFFF) // offset beyond page
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db2, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	if err != nil {
 		return
 	}
@@ -2948,7 +2948,7 @@ func TestCov2_ListNamespaces_CursorFirstError2(t *testing.T) {
 func TestCov2_ListNamespaces_NextError2(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 512, InProcess: true})
+	db, err := testOpen(t, path, Options{PageSize: 512, InProcess: true})
 	require.NoError(t, err)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -2982,7 +2982,7 @@ func TestCov2_ListNamespaces_NextError2(t *testing.T) {
 		}
 		require.NoError(t, os.WriteFile(path, data, 0644))
 
-		db2, err := Open(path, Options{PageSize: 512, InProcess: true})
+		db2, err := testOpen(t, path, Options{PageSize: 512, InProcess: true})
 		if err != nil {
 			return
 		}
@@ -3003,7 +3003,7 @@ func TestCov2_ListNamespaces_NextError2(t *testing.T) {
 func TestCov2_AppendValue_ParseCellError2(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	require.NoError(t, err)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -3038,7 +3038,7 @@ func TestCov2_AppendValue_ParseCellError2(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db2, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	if err != nil {
 		return
 	}
@@ -3068,7 +3068,7 @@ func TestWriteTxAbandonedDoesNotDeadlockClose(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3100,7 +3100,7 @@ func TestWriteTxAbandonedThenNewWriteTxWorks(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3134,12 +3134,12 @@ func TestDoubleOpenReturnsError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db1, err := Open(path, DefaultOptions())
+	db1, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db1.Close()
 
 	// Second open of same file should fail
-	_, err = Open(path, DefaultOptions())
+	_, err = testOpen(t, path, DefaultOptions())
 	assert.ErrorIs(t, err, ErrDatabaseOpen)
 }
 
@@ -3147,12 +3147,12 @@ func TestDoubleOpenAllowedAfterClose(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db1, err := Open(path, DefaultOptions())
+	db1, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	require.NoError(t, db1.Close())
 
 	// After close, re-open should work
-	db2, err := Open(path, DefaultOptions())
+	db2, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db2.Close()
 }
@@ -3161,12 +3161,12 @@ func TestDoubleOpenInMemoryAllowed(t *testing.T) {
 	opts := DefaultOptions()
 	opts.InMemory = true
 
-	db1, err := Open("mem1", opts)
+	db1, err := testOpen(t, "mem1", opts)
 	require.NoError(t, err)
 	defer db1.Close()
 
 	// In-memory DBs should allow "double open" (they're independent)
-	db2, err := Open("mem1", opts)
+	db2, err := testOpen(t, "mem1", opts)
 	require.NoError(t, err)
 	defer db2.Close()
 }
@@ -3285,7 +3285,7 @@ func TestPersistentReaderCache_ClearKeepsBuffersLocal(t *testing.T) {
 	dir := t.TempDir()
 	opts := DefaultOptions()
 	opts.UsePageSlab = true
-	db, err := Open(filepath.Join(dir, "test.db"), opts)
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), opts)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3340,7 +3340,7 @@ func TestMaxReaders_ConcurrentBeginReadSucceeds(t *testing.T) {
 	// MaxReaders concurrent BeginRead calls should all succeed;
 	// the MaxReaders+1 call should block until one Rollback frees a slot.
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{MaxReaders: 2})
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{MaxReaders: 2})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -3391,7 +3391,7 @@ func TestMaxReaders_ConcurrentBeginReadSucceeds(t *testing.T) {
 func TestMaxReaders_CloseUnblocksWaitingReaders(t *testing.T) {
 	// DB.Close should unblock goroutines waiting on the reader semaphore.
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{MaxReaders: 1})
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{MaxReaders: 1})
 	require.NoError(t, err)
 
 	// Saturate the single reader slot.
@@ -3436,7 +3436,7 @@ func TestMaxReaders_DefaultValue(t *testing.T) {
 func TestMaxReaders_SetClosingUnblocksWaitingReaders(t *testing.T) {
 	// SetClosing should also unblock goroutines waiting on the reader semaphore.
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{MaxReaders: 1})
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{MaxReaders: 1})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -3559,7 +3559,7 @@ func TestSlabHeapBound_MultiDB(t *testing.T) {
 		opts.AutoCheckpointAfter = 100
 
 		dbPath := filepath.Join(dir, fmt.Sprintf("db_%03d.db", i))
-		db, err := Open(dbPath, opts)
+		db, err := testOpen(t, dbPath, opts)
 		require.NoError(t, err, "open db %d", i)
 		dbs[i] = db
 

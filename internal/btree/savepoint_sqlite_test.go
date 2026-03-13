@@ -87,7 +87,7 @@ func TestSqlite_Savepoint_1(t *testing.T) {
 	// that rollback succeeds after creating a savepoint without releasing it.
 	t.Run("1.3", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "test.db")
-		db, err := Open(path, DefaultOptions())
+		db, err := testOpen(t, path, DefaultOptions())
 		require.NoError(t, err)
 		tx, err := db.BeginWrite()
 		require.NoError(t, err)

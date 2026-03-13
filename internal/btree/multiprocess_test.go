@@ -46,7 +46,7 @@ func TestMultiProcessWALCorruption(t *testing.T) {
 	}
 
 	// Step 1: Open DB, write initial data
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -88,7 +88,7 @@ func TestMultiProcessWALCorruption(t *testing.T) {
 	require.NoError(t, db.Close())
 
 	// Step 4: Reopen and verify ALL data survives
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer db2.Close()
 
@@ -127,7 +127,7 @@ func multiProcessChild(t *testing.T, dbPath string) {
 		DisableAutoCheckpoint: true,
 	}
 
-	db, err := Open(dbPath, opts)
+	db, err := testOpen(t, dbPath, opts)
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()

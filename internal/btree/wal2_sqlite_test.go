@@ -66,7 +66,7 @@ func TestSqlite_WAL2_7(t *testing.T) {
 	// --- wal2-7.1.1 (lines 791-799) ---
 	// Original: Open db, PRAGMA page_size=4096, PRAGMA journal_mode=WAL,
 	// CREATE TABLE t1(a,b). Verify file size = 4096.
-	db, err := Open(dbPath, Options{PageSize: 4096})
+	db, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -117,7 +117,7 @@ func TestSqlite_WAL2_7(t *testing.T) {
 	// Original: Open test2.db, checkpoint, SELECT * FROM sqlite_master -> empty result.
 	// The corrupted frame (CREATE TABLE) should be skipped during recovery,
 	// so the database should appear empty (no tables/namespaces with data).
-	db2, err := Open(db2Path, Options{PageSize: 4096})
+	db2, err := testOpen(t, db2Path, Options{PageSize: 4096})
 	if err != nil {
 		// If Open fails due to WAL corruption, that's an acceptable outcome
 		t.Logf("Open returned error (acceptable): %v", err)
@@ -181,7 +181,7 @@ func TestSqlite_WAL2_8(t *testing.T) {
 	// DEVIATION: Instead of one row with zeroblob(8188*1020) = 8,351,760 bytes,
 	// we insert 8188 rows with 1020-byte zero values. This achieves the same
 	// effect of consuming ~8188 pages (each 1024 bytes).
-	db, err := Open(dbPath, Options{PageSize: 1024})
+	db, err := testOpen(t, dbPath, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	// CREATE TABLE t1(x)
@@ -292,7 +292,7 @@ func TestSqlite_WAL2_8(t *testing.T) {
 	// DEVIATION: Instead of opening a second connection, we close and reopen.
 	require.NoError(t, db.Close())
 
-	db2, err := Open(dbPath, Options{PageSize: 1024})
+	db2, err := testOpen(t, dbPath, Options{PageSize: 1024})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 

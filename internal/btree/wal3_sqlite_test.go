@@ -93,7 +93,7 @@ func TestSqlite_WAL3_1(t *testing.T) {
 	walPath := dbPath + "-wal"
 
 	// Open with page_size=1024 and auto-checkpoint disabled
-	db, err := Open(dbPath, Options{
+	db, err := testOpen(t, dbPath, Options{
 		PageSize:              1024,
 		DisableAutoCheckpoint: true,
 	})
@@ -168,7 +168,7 @@ func TestSqlite_WAL3_1(t *testing.T) {
 			// verify updated value of row $i, integrity check on db2.
 			// DEVIATION: Simulate second connection by closing and reopening.
 			require.NoError(t, db.Close())
-			db2, err := Open(dbPath, Options{
+			db2, err := testOpen(t, dbPath, Options{
 				PageSize:              1024,
 				DisableAutoCheckpoint: true,
 			})
@@ -204,7 +204,7 @@ func TestSqlite_WAL3_1(t *testing.T) {
 			// Also copy WAL index if present
 			wal3CopyFile(t, dbPath+"-wal-index", copyDBPath+"-wal-index")
 
-			db3, err := Open(copyDBPath, Options{
+			db3, err := testOpen(t, copyDBPath, Options{
 				PageSize:              1024,
 				DisableAutoCheckpoint: true,
 			})
@@ -230,7 +230,7 @@ func TestSqlite_WAL3_1(t *testing.T) {
 			require.NoError(t, db3.Close())
 
 			// Reopen original for next iteration
-			db, err = Open(dbPath, Options{
+			db, err = testOpen(t, dbPath, Options{
 				PageSize:              1024,
 				DisableAutoCheckpoint: true,
 			})

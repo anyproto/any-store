@@ -162,6 +162,10 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, ErrPageSlabNotInitialized
 	}
 
+	if err := initPageBufferPool(opts.PageSize); err != nil {
+		return nil, err
+	}
+
 	// Prevent double-open of the same database file.
 	var canonicalPath string
 	if !opts.InMemory {

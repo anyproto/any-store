@@ -51,7 +51,7 @@ func TestGap_DB_Open_ReadHeaderCountersError(t *testing.T) {
 func TestGap_DB_DeleteNamespace_BtDeleteError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	require.NoError(t, err)
 
 	// Create namespace
@@ -77,7 +77,7 @@ func TestGap_DB_DeleteNamespace_BtDeleteError(t *testing.T) {
 	binary.BigEndian.PutUint16(data[dbHeaderSize+3:], 0)
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db2, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	if err != nil {
 		// If open itself fails due to corruption, that's fine
 		return
@@ -111,7 +111,7 @@ func TestGap_DB_FreeTreePages_RegetPageError(t *testing.T) {
 func TestGap_DB_ResolveNamespace_ParseCellError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -137,7 +137,7 @@ func TestGap_DB_ResolveNamespace_ParseCellError(t *testing.T) {
 	data[cellOff+2] = 0xFF
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db2, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	if err != nil {
 		return
 	}
@@ -153,7 +153,7 @@ func TestGap_DB_ResolveNamespace_ParseCellError(t *testing.T) {
 func TestGap_DB_AppendValue_ParseCellError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -192,7 +192,7 @@ func TestGap_DB_AppendValue_ParseCellError(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db2, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	if err != nil {
 		return
 	}
@@ -520,7 +520,7 @@ func TestGap_WAL_Checkpoint_FdatasyncDbError(t *testing.T) {
 func TestGap_Integrity_CheckList_GetPageError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	require.NoError(t, err)
 
 	// Create a namespace and delete it to generate freelist pages
@@ -565,7 +565,7 @@ func TestGap_Integrity_CheckList_GetPageError(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db2, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	if err != nil {
 		return
 	}
@@ -593,7 +593,7 @@ func TestGap_Integrity_CheckTreePage_TooManyErrors(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 	pageSize := 512
 
-	db, err := Open(path, Options{PageSize: uint32(pageSize), InProcess: true})
+	db, err := testOpen(t, path, Options{PageSize: uint32(pageSize), InProcess: true})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -647,7 +647,7 @@ func TestGap_Integrity_CheckTreePage_TooManyErrors(t *testing.T) {
 
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: uint32(pageSize), InProcess: true})
+	db2, err := testOpen(t, path, Options{PageSize: uint32(pageSize), InProcess: true})
 	if err != nil {
 		t.Log("Could not reopen corrupted DB:", err)
 		return
@@ -728,7 +728,7 @@ func TestGap_ShmMmap_FcntlLock_BadFd(t *testing.T) {
 func TestGap_FreelistCorruptionIntegrityCheck(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	require.NoError(t, err)
 
 	// Create data to generate multiple pages
@@ -774,7 +774,7 @@ func TestGap_FreelistCorruptionIntegrityCheck(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db2, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	if err != nil {
 		return
 	}
@@ -789,7 +789,7 @@ func TestGap_FreelistCorruptionIntegrityCheck(t *testing.T) {
 func TestGap_IntegrityCheck_MasterPageCellLoop(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	require.NoError(t, err)
 
 	// Create several namespaces
@@ -825,7 +825,7 @@ func TestGap_IntegrityCheck_MasterPageCellLoop(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096, InProcess: true})
+	db2, err := testOpen(t, path, Options{PageSize: 4096, InProcess: true})
 	if err != nil {
 		return
 	}
@@ -843,7 +843,7 @@ func TestGap_WAL_Recover_WithCommittedFrames(t *testing.T) {
 	dbPath := filepath.Join(dir, "test.db")
 
 	// Create a database with committed data in WAL
-	db, err := Open(dbPath, Options{PageSize: 4096, InProcess: true})
+	db, err := testOpen(t, dbPath, Options{PageSize: 4096, InProcess: true})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -857,7 +857,7 @@ func TestGap_WAL_Recover_WithCommittedFrames(t *testing.T) {
 	require.NoError(t, db.Close())
 
 	// Reopen - this triggers WAL recovery which exercises the rebuild path
-	db2, err := Open(dbPath, Options{PageSize: 4096, InProcess: true})
+	db2, err := testOpen(t, dbPath, Options{PageSize: 4096, InProcess: true})
 	require.NoError(t, err)
 	defer db2.Close()
 
@@ -880,7 +880,7 @@ func TestGap_WAL_Recover_WithUncommittedFrames(t *testing.T) {
 	walPath := dbPath + "-wal"
 
 	// Create a database with committed data
-	db, err := Open(dbPath, Options{PageSize: 4096, InProcess: true})
+	db, err := testOpen(t, dbPath, Options{PageSize: 4096, InProcess: true})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -902,7 +902,7 @@ func TestGap_WAL_Recover_WithUncommittedFrames(t *testing.T) {
 	}
 
 	// Reopen - recovery should ignore the garbage frames
-	db2, err := Open(dbPath, Options{PageSize: 4096, InProcess: true})
+	db2, err := testOpen(t, dbPath, Options{PageSize: 4096, InProcess: true})
 	require.NoError(t, err)
 	defer db2.Close()
 
@@ -997,7 +997,7 @@ func TestGap_Pager_AllocateFromFreelist_WithSavepoint(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
-	db, err := Open(dbPath, Options{PageSize: 4096, InProcess: true})
+	db, err := testOpen(t, dbPath, Options{PageSize: 4096, InProcess: true})
 	require.NoError(t, err)
 	defer db.Close()
 

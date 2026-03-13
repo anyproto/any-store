@@ -899,7 +899,7 @@ func TestSqlite_InsertDelete_BoundaryConditions(t *testing.T) {
 	t.Run("JustOverflowValue", func(t *testing.T) {
 		// With page size 1024, a 1000-byte value forces overflow
 		dir := t.TempDir()
-		db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 1024})
+		db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{PageSize: 1024})
 		require.NoError(t, err)
 		defer db.Close()
 

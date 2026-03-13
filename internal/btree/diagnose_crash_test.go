@@ -47,7 +47,7 @@ func TestDiagnoseCrashCorruption(t *testing.T) {
 		hdr.FileChangeCount, hdr.SchemaCookie)
 
 	// Open the DB
-	db, err := Open(dbPath, Options{})
+	db, err := testOpen(t, dbPath, Options{})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

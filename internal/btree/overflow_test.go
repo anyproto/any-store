@@ -171,7 +171,7 @@ func TestOverflowPersistence(t *testing.T) {
 	bigValue := bytes.Repeat([]byte("PERSIST"), 2000) // 14KB
 
 	// Write and checkpoint
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -183,7 +183,7 @@ func TestOverflowPersistence(t *testing.T) {
 	require.NoError(t, db.Close())
 
 	// Reopen and verify
-	db2, err := Open(path, DefaultOptions())
+	db2, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db2.Close()
 	rtx, err := db2.BeginRead()
@@ -471,7 +471,7 @@ func TestGetPageAtCacheCoherencyBug(t *testing.T) {
 		InProcess:             true,
 		DisableAutoCheckpoint: true, // prevent WAL reset
 	}
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -563,7 +563,7 @@ func TestGetPageAtWriterCorruption(t *testing.T) {
 		InProcess:             true,
 		DisableAutoCheckpoint: true,
 	}
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer db.Close()
 

@@ -545,7 +545,11 @@ func newWalIndex(shmPath string, inProcess bool) (*walIndex, error) {
 // set records a page at a given frame position.
 func (wi *walIndex) set(pgno, frame uint32) {
 	wi.mu.Lock()
-	wi.pageMap[pgno] = append(wi.pageMap[pgno], frame)
+	frames := wi.pageMap[pgno]
+	if frames == nil {
+		frames = make([]uint32, 0, 4)
+	}
+	wi.pageMap[pgno] = append(frames, frame)
 	wi.mu.Unlock()
 	if frame > wi.maxFrame.Load() {
 		wi.maxFrame.Store(frame)
@@ -561,7 +565,11 @@ func (wi *walIndex) setBatch(pages []*page, startFrame uint32, commit bool) {
 	wi.mu.Lock()
 	for i, p := range pages {
 		frame := startFrame + uint32(i)
-		wi.pageMap[p.pgno] = append(wi.pageMap[p.pgno], frame)
+		frames := wi.pageMap[p.pgno]
+		if frames == nil {
+			frames = make([]uint32, 0, 4)
+		}
+		wi.pageMap[p.pgno] = append(frames, frame)
 	}
 	wi.mu.Unlock()
 	if f := startFrame + uint32(len(pages)) - 1; f > wi.maxFrame.Load() {
@@ -633,9 +641,6 @@ func (wi *walIndex) rollbackToFrame(target uint32) {
 // get returns the frame containing the latest version of pgno that is
 // within the given maxFrame snapshot, or 0 if not in WAL.
 // The maxFrame parameter limits which frames are visible (for snapshot isolation).
-//
-// This uses the in-process Go map (pageMap) rather than SHM hash tables.
-// See the package-level comment on issue 7.9 for why this is acceptable.
 func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
 	wi.mu.RLock()
 	// Skip frames that have been checkpointed back to the DB.

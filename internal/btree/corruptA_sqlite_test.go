@@ -37,7 +37,7 @@ func setupCorruptTestDB(t *testing.T) (string, []byte) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 
 	// CREATE TABLE t1 -> CreateNamespace, INSERT INTO t1(x) VALUES(1)
@@ -69,7 +69,7 @@ func TestSqlite_CorruptA_1_1(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 
 	// CREATE TABLE t1(x) -> CreateNamespace "t1"
@@ -112,7 +112,7 @@ func TestSqlite_CorruptA_2_1(t *testing.T) {
 		_ = os.Remove(path + "-shm")
 
 		// Attempt to open -> expect error
-		_, err := Open(path, DefaultOptions())
+		_, err := testOpen(t, path, DefaultOptions())
 		assert.Error(t, err, "expected error when magic byte 0 is corrupted")
 	})
 
@@ -130,7 +130,7 @@ func TestSqlite_CorruptA_2_1(t *testing.T) {
 
 		// Our impl does NOT validate ReadVersion, so Open may succeed.
 		// DEVIATION: SQLite would return "file is not a database" here.
-		db, err := Open(path, DefaultOptions())
+		db, err := testOpen(t, path, DefaultOptions())
 		if err == nil {
 			_ = db.Close()
 		}
@@ -154,7 +154,7 @@ func TestSqlite_CorruptA_2_2(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// Attempt to open -> expect error
-	_, err := Open(path, DefaultOptions())
+	_, err := testOpen(t, path, DefaultOptions())
 	assert.Error(t, err, "expected error when magic byte 5 is corrupted")
 }
 
@@ -174,7 +174,7 @@ func TestSqlite_CorruptA_2_3(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// Attempt to open -> expect error
-	_, err := Open(path, DefaultOptions())
+	_, err := testOpen(t, path, DefaultOptions())
 	assert.Error(t, err, "expected error when magic byte 10 is corrupted")
 }
 
@@ -194,6 +194,6 @@ func TestSqlite_CorruptA_2_4(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// Attempt to open -> expect error
-	_, err := Open(path, DefaultOptions())
+	_, err := testOpen(t, path, DefaultOptions())
 	assert.Error(t, err, "expected error when magic byte 14 is corrupted")
 }

@@ -55,7 +55,7 @@ func TestSqlite_WAL9(t *testing.T) {
 	// Original: PRAGMA page_size=1024; PRAGMA journal_mode=WAL;
 	//           PRAGMA wal_autocheckpoint=0; CREATE TABLE t(x);
 	// DEVIATION: DisableAutoCheckpoint=true replaces PRAGMA wal_autocheckpoint=0
-	db, err := Open(dbPath, Options{
+	db, err := testOpen(t, dbPath, Options{
 		PageSize:              1024,
 		DisableAutoCheckpoint: true,
 	})
@@ -180,7 +180,7 @@ func TestSqlite_WAL64k_2_1(t *testing.T) {
 	dbPath := filepath.Join(dir, "test.db")
 
 	// PRAGMA page_size=512; PRAGMA journal_mode=WAL;
-	db, err := Open(dbPath, Options{PageSize: 512})
+	db, err := testOpen(t, dbPath, Options{PageSize: 512})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 

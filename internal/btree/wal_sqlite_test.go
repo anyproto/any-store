@@ -110,7 +110,7 @@ func copyFile(t *testing.T, src, dst string) {
 func TestSqlite_WAL_1(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	db, err := Open(dbPath, Options{PageSize: 1024})
+	db, err := testOpen(t, dbPath, Options{PageSize: 1024})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -196,7 +196,7 @@ func TestSqlite_WAL_1(t *testing.T) {
 func TestSqlite_WAL_2(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	db, err := Open(dbPath, Options{PageSize: 1024})
+	db, err := testOpen(t, dbPath, Options{PageSize: 1024})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -324,7 +324,7 @@ func TestSqlite_WAL_2(t *testing.T) {
 func TestSqlite_WAL_3(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	db, err := Open(dbPath, Options{PageSize: 1024})
+	db, err := testOpen(t, dbPath, Options{PageSize: 1024})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -406,7 +406,7 @@ func TestSqlite_WAL_3(t *testing.T) {
 func TestSqlite_WAL_4_1to3(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	db, err := Open(dbPath, Options{PageSize: 1024})
+	db, err := testOpen(t, dbPath, Options{PageSize: 1024})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -522,7 +522,7 @@ func TestSqlite_WAL_4_4(t *testing.T) {
 	walPath := dbPath + "-wal"
 
 	// Set up state from wal-4.3: namespace "t1" with entry ("a","b")
-	db, err := Open(dbPath, Options{PageSize: 1024})
+	db, err := testOpen(t, dbPath, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	{
@@ -541,7 +541,7 @@ func TestSqlite_WAL_4_4(t *testing.T) {
 	t.Run("wal-4.4.1", func(t *testing.T) {
 		require.NoError(t, db.Close())
 
-		db2, err := Open(dbPath, Options{PageSize: 1024})
+		db2, err := testOpen(t, dbPath, Options{PageSize: 1024})
 		require.NoError(t, err)
 
 		// DEVIATION: Our system is always WAL mode. Key behavior: data persists.
@@ -566,7 +566,7 @@ func TestSqlite_WAL_4_4(t *testing.T) {
 		require.NoError(t, db2.Close())
 
 		// Reopen for subsequent tests
-		db, err = Open(dbPath, Options{PageSize: 1024})
+		db, err = testOpen(t, dbPath, Options{PageSize: 1024})
 		require.NoError(t, err)
 	})
 
@@ -671,7 +671,7 @@ func TestSqlite_WAL_4_4(t *testing.T) {
 		// Also copy WAL index if present
 		copyFile(t, dbPath+"-wal-index", db2Path+"-wal-index")
 
-		db2, err := Open(db2Path, Options{PageSize: 1024})
+		db2, err := testOpen(t, db2Path, Options{PageSize: 1024})
 		require.NoError(t, err)
 
 		rtx, err := db2.BeginRead()
@@ -697,7 +697,7 @@ func TestSqlite_WAL_4_4(t *testing.T) {
 	// Original: Integrity check on the copied database.
 	t.Run("wal-4.4.7", func(t *testing.T) {
 		db2Path := filepath.Join(dir, "test2.db")
-		db2, err := Open(db2Path, Options{PageSize: 1024})
+		db2, err := testOpen(t, db2Path, Options{PageSize: 1024})
 		require.NoError(t, err)
 		require.NoError(t, db2.IntegrityCheck())
 		require.NoError(t, db2.Close())
@@ -719,7 +719,7 @@ func TestSqlite_WAL_4_5(t *testing.T) {
 	// --- wal-4.5.1 (lines 226-237) ---
 	// Original: Reopen db (clean slate), create t1, insert ('a','b'),
 	// close, reopen, verify data, WAL file gone.
-	db, err := Open(dbPath, Options{PageSize: 1024})
+	db, err := testOpen(t, dbPath, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	t.Run("wal-4.5.1", func(t *testing.T) {
@@ -735,7 +735,7 @@ func TestSqlite_WAL_4_5(t *testing.T) {
 		// Close and reopen
 		require.NoError(t, db.Close())
 
-		db, err = Open(dbPath, Options{PageSize: 1024})
+		db, err = testOpen(t, dbPath, Options{PageSize: 1024})
 		require.NoError(t, err)
 
 		rtx, err := db.BeginRead()
@@ -856,7 +856,7 @@ func TestSqlite_WAL_4_5(t *testing.T) {
 		copyFile(t, walPath, db2Path+"-wal")
 		copyFile(t, dbPath+"-wal-index", db2Path+"-wal-index")
 
-		db2, err := Open(db2Path, Options{PageSize: 1024})
+		db2, err := testOpen(t, db2Path, Options{PageSize: 1024})
 		require.NoError(t, err)
 
 		rtx, err := db2.BeginRead()
@@ -882,7 +882,7 @@ func TestSqlite_WAL_4_5(t *testing.T) {
 	// Original: Integrity check on copy.
 	t.Run("wal-4.5.7", func(t *testing.T) {
 		db2Path := filepath.Join(dir, "test2.db")
-		db2, err := Open(db2Path, Options{PageSize: 1024})
+		db2, err := testOpen(t, db2Path, Options{PageSize: 1024})
 		require.NoError(t, err)
 		require.NoError(t, db2.IntegrityCheck())
 		require.NoError(t, db2.Close())
@@ -898,7 +898,7 @@ func TestSqlite_WAL_4_5(t *testing.T) {
 func TestSqlite_WAL_4_6(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	db, err := Open(dbPath, Options{PageSize: 1024})
+	db, err := testOpen(t, dbPath, Options{PageSize: 1024})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -989,7 +989,7 @@ func TestSqlite_WAL_6_PageSizes(t *testing.T) {
 
 			// --- wal-6.$sector.$pgsz.1 ---
 			// Original: Create DB, create table, insert row, close.
-			db, err := Open(dbPath, Options{PageSize: pgsz})
+			db, err := testOpen(t, dbPath, Options{PageSize: pgsz})
 			require.NoError(t, err)
 
 			tx, err := db.BeginWrite()
@@ -1024,7 +1024,7 @@ func TestSqlite_WAL_6_PageSizes(t *testing.T) {
 			// err != nil (not found) is also acceptable
 
 			// Reopen and verify data persisted
-			db2, err := Open(dbPath, Options{PageSize: pgsz})
+			db2, err := testOpen(t, dbPath, Options{PageSize: pgsz})
 			require.NoError(t, err)
 
 			rtx, err := db2.BeginRead()

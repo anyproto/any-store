@@ -16,7 +16,7 @@ import (
 // so tests can manually control close/reopen behavior.
 func openDBNoCleanup(t *testing.T, path string) *DB {
 	t.Helper()
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	return db
 }

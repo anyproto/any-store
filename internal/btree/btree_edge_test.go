@@ -1007,7 +1007,7 @@ func TestRemaining_InitBtreeTraceFile(t *testing.T) {
 func TestRemaining_IntegrityCheckCorruptPageType(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	// Create namespace with data
@@ -1032,7 +1032,7 @@ func TestRemaining_IntegrityCheckCorruptPageType(t *testing.T) {
 	data[4096] = 0xFF // invalid page type
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -1045,7 +1045,7 @@ func TestRemaining_IntegrityCheckCorruptPageType(t *testing.T) {
 func TestRemaining_IntegrityCheckCorruptContentOffset(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -1068,7 +1068,7 @@ func TestRemaining_IntegrityCheckCorruptContentOffset(t *testing.T) {
 	data[4096+6] = 0
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -1766,7 +1766,7 @@ func TestTargeted_IntegrityCheckTreePage_GetPageAtError(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 
 	// Create DB with a multi-page tree
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -1797,7 +1797,7 @@ func TestTargeted_IntegrityCheckTreePage_GetPageAtError(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, truncatedData, 0644))
 
 	// Reopen — Open reads page 1 which is still intact.
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	if err != nil {
 		t.Logf("Open failed: %v (expected if truncation broke critical pages)", err)
 		return
@@ -1819,7 +1819,7 @@ func TestTargeted_IntegrityCheckList_GetPageAtError(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 
 	// Create DB, add data, then delete to create freelist
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -1868,7 +1868,7 @@ func TestTargeted_IntegrityCheckList_GetPageAtError(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data[:truncTo], 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	if err != nil {
 		t.Logf("Open failed: %v", err)
 		return

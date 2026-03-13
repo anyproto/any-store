@@ -69,7 +69,7 @@ func testOverflowDeepNesting(t *testing.T, seed int64) {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	db, err := Open(dbPath, Options{PageSize: 4096})
+	db, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -169,7 +169,7 @@ func testOverflowSavepointConcurrent(t *testing.T, seed int64) {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	db, err := Open(dbPath, Options{PageSize: 4096})
+	db, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 	// Use short busy timeout so checkpoint doesn't block writer for 5s per attempt
@@ -334,7 +334,7 @@ func testOverflowSavepointWithSeed(t *testing.T, seed int64) {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	db, err := Open(dbPath, Options{PageSize: 4096})
+	db, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 

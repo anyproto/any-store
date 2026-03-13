@@ -37,7 +37,7 @@ func TestWriterCacheStaleAfterWALReset(t *testing.T) {
 		func() {
 			dir := t.TempDir()
 			dbPath := filepath.Join(dir, "test.db")
-			db, err := Open(dbPath, Options{PageSize: 4096, InProcess: true})
+			db, err := testOpen(t, dbPath, Options{PageSize: 4096, InProcess: true})
 			require.NoError(t, err)
 			defer db.Close()
 			db.pager.wal.busyHandler = DefaultBusyTimeout(200 * time.Millisecond)

@@ -114,7 +114,7 @@ func TestIntegrityCheckAfterCheckpoint(t *testing.T) {
 func TestIntegrityCheckCorruptPageType(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -156,7 +156,7 @@ func TestIntegrityCheckCorruptPageType(t *testing.T) {
 func TestIntegrityCheckCorruptCellPointer(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -198,7 +198,7 @@ func TestIntegrityCheckCorruptCellPointer(t *testing.T) {
 func TestIntegrityCheckCorruptFreelist(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -250,7 +250,7 @@ func TestIntegrityCheckCorruptFreelist(t *testing.T) {
 func TestIntegrityCheckOrphanPage(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -292,7 +292,7 @@ func TestIntegrityCheckOrphanPage(t *testing.T) {
 func TestIntegrityCheckKeyOrder(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -339,7 +339,7 @@ func TestIntegrityCheckReopen(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -352,7 +352,7 @@ func TestIntegrityCheckReopen(t *testing.T) {
 	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
-	db2, err := Open(path, DefaultOptions())
+	db2, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db2.Close()
 	require.NoError(t, db2.IntegrityCheck())

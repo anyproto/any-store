@@ -73,7 +73,7 @@ func setupCorrupt29DB(t *testing.T) (string, []byte, uint32) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -185,7 +185,7 @@ func TestSqlite_Corrupt3_OverflowSelfLoop(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// corrupt3-1.7: Attempt to read -- may or may not error
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		return
 	}
@@ -237,7 +237,7 @@ func TestSqlite_Corrupt3_OverflowInvalidPage(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// corrupt3-1.9: Read should fail
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		return
 	}
@@ -285,7 +285,7 @@ func TestSqlite_Corrupt3_OverflowZeroed(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// corrupt3-1.11: Read should fail
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		return
 	}
@@ -322,7 +322,7 @@ func setupCorrupt7DB(t *testing.T) (string, []byte, uint32) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -482,7 +482,7 @@ func TestSqlite_Corrupt2_1_2(t *testing.T) {
 	_ = os.Remove(path + "-wal")
 	_ = os.Remove(path + "-shm")
 
-	_, err := Open(path, DefaultOptions())
+	_, err := testOpen(t, path, DefaultOptions())
 	assert.Error(t, err, "expected error when magic string is corrupted at offset 8")
 }
 
@@ -498,7 +498,7 @@ func TestSqlite_Corrupt2_1_3(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -523,7 +523,7 @@ func TestSqlite_Corrupt2_1_3(t *testing.T) {
 	// Try to open with the same page size that was used to create the DB.
 	// The corrupted header page size (0x00FF = 255) differs from the actual
 	// page size (1024). Our implementation may or may not detect this at Open.
-	db, err = Open(path, Options{PageSize: 1024})
+	db, err = testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		// Open detected the corruption -- test passes
 		return
@@ -559,7 +559,7 @@ func TestSqlite_Corrupt2_1_4(t *testing.T) {
 	_ = os.Remove(path + "-wal")
 	_ = os.Remove(path + "-shm")
 
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	if err != nil {
 		// Open failure on corrupted header is acceptable
 		return
@@ -581,7 +581,7 @@ func TestSqlite_Corrupt2_1_5(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -609,7 +609,7 @@ func TestSqlite_Corrupt2_1_5(t *testing.T) {
 	_ = os.Remove(path + "-wal")
 	_ = os.Remove(path + "-shm")
 
-	db, err = Open(path, Options{PageSize: 1024})
+	db, err = testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		return
 	}
@@ -630,7 +630,7 @@ func TestSqlite_Corrupt2_5_1(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -713,7 +713,7 @@ func TestSqlite_Corrupt2_7_1a(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -780,7 +780,7 @@ func TestSqlite_Corrupt2_7_1b(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -846,7 +846,7 @@ func TestSqlite_Corrupt2_8_1(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -907,7 +907,7 @@ func TestSqlite_Corrupt2_14_2(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	// Create data with overflow pages
@@ -947,7 +947,7 @@ func TestSqlite_Corrupt2_14_2(t *testing.T) {
 	_ = os.Remove(path + "-wal")
 	_ = os.Remove(path + "-shm")
 
-	db, err = Open(path, Options{PageSize: 1024})
+	db, err = testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		return
 	}
@@ -974,7 +974,7 @@ func setupCorrupt6DB(t *testing.T) (string, []byte, uint32) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -1070,7 +1070,7 @@ func TestSqlite_Corrupt6_1_8_1(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// Attempt read -- should detect corruption
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		return
 	}
@@ -1116,7 +1116,7 @@ func TestSqlite_Corrupt6_1_8_2(t *testing.T) {
 	_ = os.Remove(path + "-wal")
 	_ = os.Remove(path + "-shm")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		return
 	}
@@ -1145,7 +1145,7 @@ func TestSqlite_Corrupt6_1_8_3_Restore(t *testing.T) {
 	_ = os.Remove(path + "-wal")
 	_ = os.Remove(path + "-shm")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -1184,7 +1184,7 @@ func TestSqlite_Corrupt6_1_9_1(t *testing.T) {
 	_ = os.Remove(path + "-wal")
 	_ = os.Remove(path + "-shm")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		return
 	}
@@ -1229,7 +1229,7 @@ func TestSqlite_Corrupt6_1_9_2(t *testing.T) {
 	_ = os.Remove(path + "-wal")
 	_ = os.Remove(path + "-shm")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		return
 	}
@@ -1257,7 +1257,7 @@ func TestSqlite_Corrupt6_1_9_3_Restore(t *testing.T) {
 	_ = os.Remove(path + "-wal")
 	_ = os.Remove(path + "-shm")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -1317,7 +1317,7 @@ func TestSqlite_Corrupt6_1_10_OversizedVarint(t *testing.T) {
 			_ = os.Remove(path + "-wal")
 			_ = os.Remove(path + "-shm")
 
-			db, err := Open(path, Options{PageSize: 1024})
+			db, err := testOpen(t, path, Options{PageSize: 1024})
 			if err != nil {
 				return
 			}
@@ -1351,7 +1351,7 @@ func setupCorrupt4DB(t *testing.T) (string, []byte) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -1422,7 +1422,7 @@ func TestSqlite_Corrupt4_1_4(t *testing.T) {
 	_ = os.Remove(path + "-wal")
 	_ = os.Remove(path + "-shm")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		return
 	}
@@ -1453,7 +1453,7 @@ func setupCorrupt9DB(t *testing.T) (string, []byte) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()

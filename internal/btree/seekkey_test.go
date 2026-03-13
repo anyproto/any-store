@@ -385,7 +385,7 @@ func TestSeekKey_WriteTx(t *testing.T) {
 // per group spill across leaf boundaries, making the gap hit certain.
 func TestSeekKey_CursorFallbackSmallPage(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(dir+"/test.db", Options{PageSize: 512})
+	db, err := testOpen(t, dir+"/test.db", Options{PageSize: 512})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -440,7 +440,7 @@ func TestSeekKey_CursorFallbackSmallPage(t *testing.T) {
 // Uses 3 groups with a gap after the last non-rightChild cell.
 func TestSeekKey_LeftmostKeyAfterRightChild(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(dir+"/test.db", Options{PageSize: 512})
+	db, err := testOpen(t, dir+"/test.db", Options{PageSize: 512})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -494,7 +494,7 @@ func TestSeekKey_LeftmostKeyAfterRightChild(t *testing.T) {
 // overflow, so leftmostKeyAfter must read overflow pages to reconstruct it.
 func TestSeekKey_LeftmostKeyAfterOverflow(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(dir+"/test.db", Options{PageSize: 512})
+	db, err := testOpen(t, dir+"/test.db", Options{PageSize: 512})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -547,7 +547,7 @@ func TestSeekKey_LeftmostKeyAfterOverflow(t *testing.T) {
 func TestSeekKey_LeftmostKeyAfterDeepTree(t *testing.T) {
 	dir := t.TempDir()
 	// 512-byte pages force a deep tree with relatively few keys.
-	db, err := Open(dir+"/test.db", Options{PageSize: 512})
+	db, err := testOpen(t, dir+"/test.db", Options{PageSize: 512})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -597,7 +597,7 @@ func TestSeekKey_LeftmostKeyAfterDeepTree(t *testing.T) {
 // possible inter-key gap, including leaf boundary crossings.
 func TestSeekKey_MatchesCursorExhaustive(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(dir+"/test.db", Options{PageSize: 512})
+	db, err := testOpen(t, dir+"/test.db", Options{PageSize: 512})
 	require.NoError(t, err)
 	defer db.Close()
 

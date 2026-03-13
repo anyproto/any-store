@@ -384,7 +384,7 @@ func TestSqlite_Walcrash_7(t *testing.T) {
 			dir := t.TempDir()
 			path := filepath.Join(dir, "test.db")
 
-			db, err := Open(path, Options{PageSize: pgsz})
+			db, err := testOpen(t, path, Options{PageSize: pgsz})
 			require.NoError(t, err)
 
 			// Create namespace, insert initial data
@@ -413,7 +413,7 @@ func TestSqlite_Walcrash_7(t *testing.T) {
 			rawClose(db)
 
 			// Reopen and verify
-			db2, err := Open(path, Options{PageSize: pgsz})
+			db2, err := testOpen(t, path, Options{PageSize: pgsz})
 			require.NoError(t, err)
 			defer func() { _ = db2.Close() }()
 
@@ -453,7 +453,7 @@ func TestSqlite_Pager1_20_3(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 
 	// Open with small cache to trigger spill
-	db, err := Open(path, Options{PageSize: DefaultPageSize, CacheSize: 10})
+	db, err := testOpen(t, path, Options{PageSize: DefaultPageSize, CacheSize: 10})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -525,7 +525,7 @@ func TestSqlite_Pager1_25_1(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -560,7 +560,7 @@ func TestSqlite_Pager1_25_2(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 
@@ -600,7 +600,7 @@ func TestSqlite_Pager1_38(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("hello world\n"), 0644))
 
 	// Attempt to open -- should fail or succeed with errors on operations
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	if err != nil {
 		// Open failure is the expected behavior
 		t.Logf("Open correctly failed on garbage file: %v", err)
@@ -641,7 +641,7 @@ func TestSqlite_Wal6_2_MVCC(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 

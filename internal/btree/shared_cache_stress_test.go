@@ -24,7 +24,7 @@ import (
 func tempDBWithCacheSize(t *testing.T, cacheSize int) *DB {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{
 		PageSize:              4096,
 		CacheSize:             cacheSize,
 		DisableAutoCheckpoint: true, // avoid checkpoint interference
@@ -38,7 +38,7 @@ func tempDBWithCacheSize(t *testing.T, cacheSize int) *DB {
 func tempDBWithCacheSizeInMem(t *testing.T, cacheSize int) *DB {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{
 		PageSize:              4096,
 		CacheSize:             cacheSize,
 		InMemory:              true,

@@ -6630,7 +6630,7 @@ func TestCorruptPageSizeZero(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 
 	// Create a valid database
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -6642,7 +6642,7 @@ func TestCorruptPageSizeZero(t *testing.T) {
 	require.NoError(t, f.Close())
 
 	// Opening should return ErrCorrupt, not panic
-	_, err = Open(path, DefaultOptions())
+	_, err = testOpen(t, path, DefaultOptions())
 	require.Error(t, err, "expected error opening DB with page_size=0")
 	require.ErrorIs(t, err, ErrCorrupt)
 }
@@ -6651,7 +6651,7 @@ func TestCorruptPageSizeNonPowerOfTwo(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -6664,7 +6664,7 @@ func TestCorruptPageSizeNonPowerOfTwo(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
-	_, err = Open(path, DefaultOptions())
+	_, err = testOpen(t, path, DefaultOptions())
 	require.Error(t, err, "expected error opening DB with non-power-of-2 page_size")
 	require.ErrorIs(t, err, ErrCorrupt)
 }

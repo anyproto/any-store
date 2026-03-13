@@ -17,7 +17,7 @@ func TestInMemory_OpenClose(t *testing.T) {
 
 	opts := DefaultOptions()
 	opts.InMemory = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	// Verify no files created on disk
@@ -37,7 +37,7 @@ func TestInMemory_WriteAndRead(t *testing.T) {
 
 	opts := DefaultOptions()
 	opts.InMemory = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -71,7 +71,7 @@ func TestInMemory_Checkpoint(t *testing.T) {
 	opts := DefaultOptions()
 	opts.InMemory = true
 	opts.DisableAutoCheckpoint = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -110,7 +110,7 @@ func TestInMemory_ConcurrentReadWrite(t *testing.T) {
 
 	opts := DefaultOptions()
 	opts.InMemory = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -218,7 +218,7 @@ func TestInMemory_ForcesFlags(t *testing.T) {
 		InMemory: true,
 		// Don't set InProcess or NoCommitSync — they should be forced
 	}
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -236,7 +236,7 @@ func TestInProcess_NoCommitSync_WritesToDisk(t *testing.T) {
 	opts.InProcess = true
 	opts.NoCommitSync = true
 	opts.DisableAutoCheckpoint = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	// Write data
@@ -261,7 +261,7 @@ func TestInMemory_MultipleNamespaces(t *testing.T) {
 
 	opts := DefaultOptions()
 	opts.InMemory = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -298,7 +298,7 @@ func TestInMemory_LargeData(t *testing.T) {
 
 	opts := DefaultOptions()
 	opts.InMemory = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -345,7 +345,7 @@ func TestInMemory_Savepoints(t *testing.T) {
 
 	opts := DefaultOptions()
 	opts.InMemory = true
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer db.Close()
 

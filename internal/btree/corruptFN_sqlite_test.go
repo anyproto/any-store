@@ -62,7 +62,7 @@ func TestSqlite_CorruptI_4(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 
 	// Open with page_size=65536
-	db, err := Open(path, Options{PageSize: 65536})
+	db, err := testOpen(t, path, Options{PageSize: 65536})
 	require.NoError(t, err)
 
 	// Create namespace and insert two keys
@@ -115,7 +115,7 @@ func TestSqlite_CorruptI_4(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// Reopen and attempt delete
-	db, err = Open(path, Options{PageSize: 65536})
+	db, err = testOpen(t, path, Options{PageSize: 65536})
 	if err != nil {
 		// Open failure on corrupted DB is acceptable
 		t.Logf("Open failed (acceptable): %v", err)
@@ -149,7 +149,7 @@ func TestSqlite_CorruptI_6(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 
 	// Open with page_size=512
-	db, err := Open(path, Options{PageSize: 512})
+	db, err := testOpen(t, path, Options{PageSize: 512})
 	require.NoError(t, err)
 
 	// Create namespace and insert two keys
@@ -182,7 +182,7 @@ func TestSqlite_CorruptI_6(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// Reopen and attempt delete
-	db, err = Open(path, Options{PageSize: 512})
+	db, err = testOpen(t, path, Options{PageSize: 512})
 	if err != nil {
 		// Open failure on corrupted DB is acceptable
 		t.Logf("Open failed (acceptable): %v", err)
@@ -218,7 +218,7 @@ func TestSqlite_CorruptI_8(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 
 	// Open with page_size=1024
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	// Create namespace
@@ -270,7 +270,7 @@ func TestSqlite_CorruptI_8(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// Reopen and attempt to delete all keys
-	db, err = Open(path, Options{PageSize: 1024})
+	db, err = testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		t.Logf("Open failed (acceptable): %v", err)
 		return
@@ -293,7 +293,7 @@ func TestSqlite_CorruptI_8(t *testing.T) {
 	_ = db.Close()
 
 	// Reopen and IntegrityCheck -- should detect corruption
-	db2, err := Open(path, Options{PageSize: 1024})
+	db2, err := testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		t.Logf("Reopen for IntegrityCheck failed (acceptable): %v", err)
 		return
@@ -322,7 +322,7 @@ func TestSqlite_CorruptJ_1(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 
 	// Open with page_size=1024
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	// Create namespace and insert 10 rows of 700 zero bytes
@@ -370,7 +370,7 @@ func TestSqlite_CorruptJ_1(t *testing.T) {
 	_ = scanErr
 
 	// Also try DeleteNamespace with a timeout
-	db2, err := Open(path, Options{PageSize: 1024})
+	db2, err := testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		t.Logf("Open failed (acceptable): %v", err)
 		return
@@ -400,7 +400,7 @@ func TestSqlite_CorruptL_17(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 
 	// Create large DB with 512 rows
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -447,7 +447,7 @@ func TestSqlite_CorruptL_17(t *testing.T) {
 	assert.Equal(t, int64(2048), dbInfo.Size())
 
 	// Reopen -- may fail or succeed depending on WAL replay behavior
-	db2, err := Open(path, DefaultOptions())
+	db2, err := testOpen(t, path, DefaultOptions())
 	if err != nil {
 		// Open failure is acceptable -- the DB is truncated
 		t.Logf("Open failed on truncated DB (acceptable): %v", err)

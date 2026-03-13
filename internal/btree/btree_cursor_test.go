@@ -18,7 +18,7 @@ func setupCorruptDBForDelCur(t *testing.T, pageSize uint32, populate func(db *DB
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: pageSize})
+	db, err := testOpen(t, path, Options{PageSize: pageSize})
 	require.NoError(t, err)
 	populate(db)
 	require.NoError(t, db.Checkpoint(CheckpointFull))
@@ -171,7 +171,7 @@ func TestDelCurCov_DeleteParseLeafCellError(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -234,7 +234,7 @@ func TestDelCurCov_DeleteInteriorDescentGetPageError(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -508,7 +508,7 @@ func TestDelCurCov_CountPageCorruptCellPointer(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -644,7 +644,7 @@ func TestDelCurCov_SeekExactKeyError(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -714,7 +714,7 @@ func TestDelCurCov_ValueOverflowCorruptVarint(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 512})
+	db2, err := testOpen(t, path, Options{PageSize: 512})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -791,7 +791,7 @@ func TestDelCurCov_ValueOverflowCorruptValLenVarint(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 512})
+	db2, err := testOpen(t, path, Options{PageSize: 512})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -869,7 +869,7 @@ func TestDelCurCov_ValueOverflowReadChainError(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 512})
+	db2, err := testOpen(t, path, Options{PageSize: 512})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -927,7 +927,7 @@ func TestDelCurCov_PreviousDescentCellCountZero(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 512})
+	db2, err := testOpen(t, path, Options{PageSize: 512})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -992,7 +992,7 @@ func TestDelCurCov_NextDescentCellCountZero(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 512})
+	db2, err := testOpen(t, path, Options{PageSize: 512})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -1064,7 +1064,7 @@ func TestDelCurCov_PreviousRightChildDescentN0(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 512})
+	db2, err := testOpen(t, path, Options{PageSize: 512})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 

@@ -24,7 +24,7 @@ func TestIO_IntegrityCheckList_GetPageError(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 
 	// Create DB with some data so we have pages, then delete to create freelist
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -62,7 +62,7 @@ func TestIO_IntegrityCheckList_GetPageError(t *testing.T) {
 	binary.BigEndian.PutUint32(data[32:36], dbSize+100) // point beyond DB
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -88,7 +88,7 @@ func TestIO_IntegrityCheckTreePage_GetPageError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -134,7 +134,7 @@ func TestIO_IntegrityCheckTreePage_GetPageError(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -150,7 +150,7 @@ func TestIO_IntegrityCheckN_Page1HeaderCorrupt(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -168,7 +168,7 @@ func TestIO_IntegrityCheckN_Page1HeaderCorrupt(t *testing.T) {
 	copy(data[0:16], []byte("INVALID_MAGIC!!"))
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	if err != nil {
 		// Open itself might fail due to corrupt header
 		t.Logf("Open failed (expected): %v", err)
@@ -188,7 +188,7 @@ func TestIO_IntegrityCheckN_Page1InvalidPageType(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -207,7 +207,7 @@ func TestIO_IntegrityCheckN_Page1InvalidPageType(t *testing.T) {
 	data[dbHeaderSize] = 7
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -222,7 +222,7 @@ func TestIO_IntegrityCheckN_Page1InvalidContentOffset(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -242,7 +242,7 @@ func TestIO_IntegrityCheckN_Page1InvalidContentOffset(t *testing.T) {
 	data[dbHeaderSize+6] = 0
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -267,7 +267,7 @@ func TestIO_FreePageTrunkReadError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	// Create a namespace and add data to create pages
@@ -316,7 +316,7 @@ func TestIO_AllocateFromFreelist_TrunkCorrupt(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	// Build up some freelist pages
@@ -362,7 +362,7 @@ func TestIO_AllocateFromFreelist_LeafCorrupt(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	// Insert data then delete to create freelist entries
@@ -421,7 +421,7 @@ func TestIO_AllocateFromFreelist_NextTrunkCorrupt(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 512})
+	db, err := testOpen(t, path, Options{PageSize: 512})
 	require.NoError(t, err)
 
 	// With 512 page size, freelist trunk holds (512-8)/4 = 126 leaves.
@@ -490,7 +490,7 @@ func TestIO_ReadOverflowChain_MaxIteration(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	// Write a large value that creates an overflow chain
@@ -555,7 +555,7 @@ func TestIO_FreeOverflowChain_BoundsError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	// Write overflow data
@@ -631,7 +631,7 @@ func TestIO_FreePage_WithSavepointsGetWritablePageFallback(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -697,7 +697,7 @@ func TestIO_DeleteNamespace_MasterTableDeleteError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	// Create two namespaces
@@ -734,7 +734,7 @@ func TestIO_ResolveNamespace_CellParseError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -769,7 +769,7 @@ func TestIO_ResolveNamespace_CellParseError(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -786,7 +786,7 @@ func TestIO_AppendValue_OverflowVarintError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	// Write a large value to trigger overflow
@@ -833,7 +833,7 @@ func TestIO_AppendValue_OverflowVarintError(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -861,7 +861,7 @@ func TestIO_ReadOverflowChain_OutOfBoundsPage(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	// Write overflow data
@@ -925,7 +925,7 @@ func TestIO_WalIndexReadHeader_ShortRegion(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 
 	// Create a normal DB, checkpoint, close
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -943,7 +943,7 @@ func TestIO_WalIndexReadHeader_ShortRegion(t *testing.T) {
 	}
 
 	// Reopen - the WAL recovery should handle the short/missing SHM
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	if err != nil {
 		t.Logf("Open with short SHM: %v (may be expected)", err)
 		return
@@ -962,7 +962,7 @@ func TestIO_FreePage_TrunkLeafCountCorrupt(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	// Create data and free some to get a freelist
@@ -1015,7 +1015,7 @@ func TestIO_AllocateFromFreelist_LeafCountCorrupt(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	// Build a freelist
@@ -1068,7 +1068,7 @@ func TestIO_FreeTreePages_WithOverflow(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	// Create namespace with overflow values
@@ -1118,7 +1118,7 @@ func TestIO_WalRecover_ReadErrors(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 
 	// Create a DB with auto-checkpoint disabled to keep WAL data on close
-	db, err := Open(path, Options{PageSize: 4096, DisableAutoCheckpoint: true})
+	db, err := testOpen(t, path, Options{PageSize: 4096, DisableAutoCheckpoint: true})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -1161,7 +1161,7 @@ func TestIO_WalRecover_ReadErrors(t *testing.T) {
 
 	// Reopen - recovery should handle corrupt WAL (header deserialization fails,
 	// WAL is truncated and a new header is written)
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	if err != nil {
 		t.Logf("Open with corrupt WAL: %v (may be expected)", err)
 		return
@@ -1179,7 +1179,7 @@ func TestIO_WalRecover_FrameReReadError(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 
 	// Create a DB with enough data in WAL
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -1211,7 +1211,7 @@ func TestIO_WalRecover_FrameReReadError(t *testing.T) {
 	}
 
 	// Reopen - recovery should handle partial frames
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	if err != nil {
 		t.Logf("Open with truncated WAL: %v (may be expected)", err)
 		return
@@ -1300,7 +1300,7 @@ func TestIO_IntegrityCheck_InteriorMasterBtree(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	// Create many namespaces to force page 1 to split into interior node
@@ -1333,7 +1333,7 @@ func TestIO_IntegrityCheck_InteriorMasterBtree(t *testing.T) {
 // --- InMemory mode coverage for various paths ---
 
 func TestIO_InMemoryDB_OverflowReadWrite(t *testing.T) {
-	db, err := Open("", Options{PageSize: 4096, InMemory: true})
+	db, err := testOpen(t, "", Options{PageSize: 4096, InMemory: true})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 

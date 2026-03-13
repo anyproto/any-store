@@ -46,7 +46,7 @@ func TestSqlite_PageSize_2(t *testing.T) {
 			rng := rand.New(rand.NewSource(int64(pgsz)))
 
 			// Step 1: Open DB with specific page size
-			db, err := Open(dbPath, Options{PageSize: pgsz})
+			db, err := testOpen(t, dbPath, Options{PageSize: pgsz})
 			require.NoError(t, err)
 
 			// Step 2: Create namespace "t1"
@@ -97,7 +97,7 @@ func TestSqlite_PageSize_2(t *testing.T) {
 
 			// Step 8: Close and reopen DB — verify page size persists and data survives
 			require.NoError(t, db.Close())
-			db, err = Open(dbPath, Options{PageSize: pgsz})
+			db, err = testOpen(t, dbPath, Options{PageSize: pgsz})
 			require.NoError(t, err)
 
 			// Step 9: Verify data survived reopen

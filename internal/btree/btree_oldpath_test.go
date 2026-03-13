@@ -13,6 +13,7 @@ import (
 // tempPagerWithPageSize creates a pager with a custom page size and an active write tx.
 func tempPagerWithPageSize(t *testing.T, pageSize uint32) *pager {
 	t.Helper()
+	resetPageBufferPool()
 	p := newPager(filepath.Join(t.TempDir(), "t.db"), pageSize, 200, true)
 	require.NoError(t, p.open())
 	_, slot, err := p.beginRead()

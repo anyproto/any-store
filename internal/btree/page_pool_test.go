@@ -169,7 +169,7 @@ func TestPagePoolWithConcurrentWrites(t *testing.T) {
 // With page pooling, allocations should be near zero for the page data buffers.
 func BenchmarkReadTxPageAllocs(b *testing.B) {
 	dir := b.TempDir()
-	db, err := Open(dir+"/bench.db", DefaultOptions())
+	db, err := testOpen(b, dir+"/bench.db", DefaultOptions())
 	require.NoError(b, err)
 	defer db.Close()
 

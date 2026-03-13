@@ -97,7 +97,7 @@ func TestSqlite_WALOverwrite(t *testing.T) {
 			//           CREATE INDEX i1y ON t1(y); -- SKIPPED (no secondary indexes)
 			//           INSERT INTO t1 20 rows with randomblob(800)
 			{
-				db, err := Open(dbPath, Options{PageSize: 1024})
+				db, err := testOpen(t, dbPath, Options{PageSize: 1024})
 				require.NoError(t, err)
 
 				tx, err := db.BeginWrite()
@@ -138,7 +138,7 @@ func TestSqlite_WALOverwrite(t *testing.T) {
 			//           PRAGMA cache_size=5; execsql $xtra;
 			//           Transaction: loop 5x over all 20 rows, UPDATE each to randomblob(799)
 			//           Check WAL frame count between 40 and 60
-			db, err := Open(dbPath, Options{PageSize: 1024, CacheSize: 5})
+			db, err := testOpen(t, dbPath, Options{PageSize: 1024, CacheSize: 5})
 			require.NoError(t, err)
 
 			// Execute $xtra for tn=2: UPDATE t1 SET y=randomblob(799) WHERE x=4
@@ -194,7 +194,7 @@ func TestSqlite_WALOverwrite(t *testing.T) {
 				_ = os.Remove(db2Path + "-wal")
 				_ = os.Remove(db2Path + "-wal-index")
 
-				db2, err := Open(db2Path, Options{PageSize: 1024})
+				db2, err := testOpen(t, db2Path, Options{PageSize: 1024})
 				require.NoError(t, err)
 
 				total := sumValueLengths(t, db2, "t1")
@@ -215,7 +215,7 @@ func TestSqlite_WALOverwrite(t *testing.T) {
 				copyFile(t, walPath, db2Path+"-wal")
 				copyFile(t, dbPath+"-wal-index", db2Path+"-wal-index")
 
-				db2, err := Open(db2Path, Options{PageSize: 1024})
+				db2, err := testOpen(t, db2Path, Options{PageSize: 1024})
 				require.NoError(t, err)
 
 				total := sumValueLengths(t, db2, "t1")
@@ -296,7 +296,7 @@ func TestSqlite_WALOverwrite(t *testing.T) {
 				_ = os.Remove(db2Path + "-wal")
 				_ = os.Remove(db2Path + "-wal-index")
 
-				db2, err := Open(db2Path, Options{PageSize: 1024})
+				db2, err := testOpen(t, db2Path, Options{PageSize: 1024})
 				require.NoError(t, err)
 
 				total := sumValueLengths(t, db2, "t1")
@@ -320,7 +320,7 @@ func TestSqlite_WALOverwrite(t *testing.T) {
 				copyFile(t, walPath, db2Path+"-wal")
 				copyFile(t, dbPath+"-wal-index", db2Path+"-wal-index")
 
-				db2, err := Open(db2Path, Options{PageSize: 1024})
+				db2, err := testOpen(t, db2Path, Options{PageSize: 1024})
 				require.NoError(t, err)
 
 				total := sumValueLengths(t, db2, "t1")

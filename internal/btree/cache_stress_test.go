@@ -21,7 +21,7 @@ func TestCacheStressConcurrentReaderAndSpillingWriter(t *testing.T) {
 		CacheSize: 10,
 		PageSize:  4096,
 	}
-	db, err := Open(t.TempDir()+"/stress.db", opts)
+	db, err := testOpen(t, t.TempDir()+"/stress.db", opts)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -156,7 +156,7 @@ func TestCacheStressSavepointRollbackAndEviction(t *testing.T) {
 		CacheSize: 5, // Extremely small
 		PageSize:  4096,
 	}
-	db, err := Open(t.TempDir()+"/savepoint_stress.db", opts)
+	db, err := testOpen(t, t.TempDir()+"/savepoint_stress.db", opts)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -212,7 +212,7 @@ func TestCacheStressOverflowChains(t *testing.T) {
 		CacheSize: 10,
 		PageSize:  4096,
 	}
-	db, err := Open(t.TempDir()+"/overflow_stress.db", opts)
+	db, err := testOpen(t, t.TempDir()+"/overflow_stress.db", opts)
 	require.NoError(t, err)
 	defer db.Close()
 

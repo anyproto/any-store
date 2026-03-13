@@ -66,4 +66,9 @@ var (
 	// ErrPageSlabNotInitialized indicates UsePageSlab was set but the global
 	// page slab was not initialized via ConfigPageCache.
 	ErrPageSlabNotInitialized = errors.New("btree: page slab not initialized (call ConfigPageCache first)")
+
+	// ErrPageBufferPoolSizeMismatch indicates a database was opened with a page
+	// size that differs from the page buffer pool's initialized size. All
+	// databases in a process must use the same page size.
+	ErrPageBufferPoolSizeMismatch = errors.New("btree: page buffer pool already initialized with a different page size")
 )

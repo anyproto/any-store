@@ -12,11 +12,20 @@ import (
 // tempDBWithPageSize creates a temp DB with a custom page size and registers cleanup.
 func tempDBWithPageSize(t *testing.T, pageSize uint32) *DB {
 	t.Helper()
+	resetPageBufferPool()
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: pageSize})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+// testOpen resets the page buffer pool and opens a database. Use in tests that
+// call Open directly instead of tempDBWithPageSize.
+func testOpen(t testing.TB, path string, opts Options) (*DB, error) {
+	t.Helper()
+	resetPageBufferPool()
+	return Open(path, opts)
 }
 
 // putN inserts rows 1..n with 4-byte big-endian keys and zero-filled values of valSize.

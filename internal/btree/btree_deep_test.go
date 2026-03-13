@@ -407,6 +407,7 @@ func TestDeep_InsertIntoParentViaInsertIntoPage(t *testing.T) {
 // TestDeep_InsertIntoParentSmallPage exercises insertIntoParent with a small
 // page size to force more frequent splits and deeper trees.
 func TestDeep_InsertIntoParentSmallPage(t *testing.T) {
+	resetPageBufferPool()
 	dir := t.TempDir()
 	p := newPager(filepath.Join(dir, "t.db"), 512, 200, true)
 	require.NoError(t, p.open())
@@ -1661,7 +1662,7 @@ func TestDeepCov_CursorPrevious_EmptyInteriorBreak(t *testing.T) {
 func TestDeepCov_SeekExact_KeyError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 512, InProcess: true})
+	db, err := testOpen(t, path, Options{PageSize: 512, InProcess: true})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -1705,7 +1706,7 @@ func TestDeepCov_SeekExact_KeyError(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 512, InProcess: true})
+	db2, err := testOpen(t, path, Options{PageSize: 512, InProcess: true})
 	if err != nil {
 		t.Skip("cannot reopen corrupted DB:", err)
 	}
@@ -1787,7 +1788,7 @@ func TestDeepCov_IntegrityCheck_DeserializeViaWAL(t *testing.T) {
 func TestDeepCov_CursorPrevious_RightChildPath(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 512, InProcess: true})
+	db, err := testOpen(t, path, Options{PageSize: 512, InProcess: true})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -1912,7 +1913,7 @@ func TestDeepCov_DB_AppendValue_OverflowReadError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 	pageSize := 512
-	db, err := Open(path, Options{PageSize: uint32(pageSize), InProcess: true})
+	db, err := testOpen(t, path, Options{PageSize: uint32(pageSize), InProcess: true})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -1969,7 +1970,7 @@ func TestDeepCov_DB_AppendValue_OverflowReadError(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: uint32(pageSize), InProcess: true})
+	db2, err := testOpen(t, path, Options{PageSize: uint32(pageSize), InProcess: true})
 	if err != nil {
 		t.Skip("cannot reopen")
 	}

@@ -12,7 +12,7 @@ import (
 func TestDebugMVCC(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
-	db, err := Open(dbPath, Options{PageSize: 1024})
+	db, err := testOpen(t, dbPath, Options{PageSize: 1024})
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 

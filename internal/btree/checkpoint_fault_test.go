@@ -97,7 +97,7 @@ func openDBWithFault(t *testing.T, dir string, opts Options) (*DB, *faultFile) {
 	})
 	t.Cleanup(ResetVFS)
 
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	require.NotNil(t, dbFF, "DB file should have been opened")
 	return db, dbFF
@@ -191,7 +191,7 @@ func TestCheckpointBackfill_WriteAtFailure_NormalCloseReopen(t *testing.T) {
 	// Phase 4: reopen without fault injection and verify all data
 	ResetVFS()
 	path := filepath.Join(dir, "test.db")
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -239,7 +239,7 @@ func TestCheckpointBackfill_WriteAtFailure_CloseWithFault(t *testing.T) {
 	// Reopen: WAL recovery should replay all frames
 	ResetVFS()
 	path := filepath.Join(dir, "test.db")
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -308,7 +308,7 @@ func TestCheckpointBackfill_WriteAtFailure_PartialThenSuccessful(t *testing.T) {
 
 	ResetVFS()
 	path := filepath.Join(dir, "test.db")
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -369,7 +369,7 @@ func TestCheckpointBackfill_WriteAtFailure_MultipleRounds(t *testing.T) {
 	// Reopen and verify
 	ResetVFS()
 	path := filepath.Join(dir, "test.db")
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -435,7 +435,7 @@ func TestCheckpointBackfill_WriteAtFailure_LargeValues(t *testing.T) {
 	// Reopen and verify all documents including large values
 	ResetVFS()
 	path := filepath.Join(dir, "test.db")
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -494,7 +494,7 @@ func TestCheckpointBackfill_SilentCorruption_WriteAtGarbles(t *testing.T) {
 	})
 	t.Cleanup(ResetVFS)
 
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -540,7 +540,7 @@ func TestCheckpointBackfill_SilentCorruption_WriteAtGarbles(t *testing.T) {
 	}
 
 	ResetVFS()
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	if err != nil {
 		// Expected: garbled page 1 makes the DB unreadable
 		t.Logf("CONFIRMED: Open fails after garbled checkpoint+WAL truncate: %v", err)
@@ -622,7 +622,7 @@ func TestCheckpointBackfill_FdatasyncFailure_NoTruncate(t *testing.T) {
 	})
 	t.Cleanup(ResetVFS)
 
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -651,7 +651,7 @@ func TestCheckpointBackfill_FdatasyncFailure_NoTruncate(t *testing.T) {
 	// Close and reopen
 	require.NoError(t, db.Close())
 
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -740,7 +740,7 @@ func TestCheckpointBackfill_CrashAfterPartialCheckpoint(t *testing.T) {
 	// Open from snapshot — simulates recovery after crash
 	ResetVFS()
 	snapPath := filepath.Join(snapDir, "test.db")
-	db2, err := Open(snapPath, opts)
+	db2, err := testOpen(t, snapPath, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -777,7 +777,7 @@ func TestCheckpointBackfill_CrashDuringFdatasync(t *testing.T) {
 	})
 	t.Cleanup(ResetVFS)
 
-	db, err := Open(dbPath, opts)
+	db, err := testOpen(t, dbPath, opts)
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -804,7 +804,7 @@ func TestCheckpointBackfill_CrashDuringFdatasync(t *testing.T) {
 
 	ResetVFS()
 	snapPath := filepath.Join(snapDir, "test.db")
-	db2, err := Open(snapPath, opts)
+	db2, err := testOpen(t, snapPath, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -862,7 +862,7 @@ func TestCheckpointBackfill_StressAutoCheckpointWithFaults(t *testing.T) {
 
 	// Test 1: clean close + reopen
 	ResetVFS()
-	db2, err := Open(dbPath, opts)
+	db2, err := testOpen(t, dbPath, opts)
 	require.NoError(t, err)
 	verifyDocuments(t, db2, "data", totalDocs)
 	require.NoError(t, db2.Close())
@@ -870,7 +870,7 @@ func TestCheckpointBackfill_StressAutoCheckpointWithFaults(t *testing.T) {
 	// Test 2: crash simulation from snapshot
 	_ = os.Remove(filepath.Join(snapDir, "test.db-shm"))
 	snapPath := filepath.Join(snapDir, "test.db")
-	db3, err := Open(snapPath, opts)
+	db3, err := testOpen(t, snapPath, opts)
 	require.NoError(t, err)
 	defer func() { _ = db3.Close() }()
 	verifyDocuments(t, db3, "data", totalDocs)
@@ -927,7 +927,7 @@ func TestMinFrameFilter_ReadAfterSuccessfulCheckpoint(t *testing.T) {
 	require.NoError(t, db.Close())
 	ResetVFS()
 	path := filepath.Join(dir, "test.db")
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -975,7 +975,7 @@ func TestMinFrameFilter_PartialCheckpointThenRead(t *testing.T) {
 	require.NoError(t, db.Close())
 	ResetVFS()
 	path := filepath.Join(dir, "test.db")
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 	verifyDocuments(t, db2, "data", 50)
@@ -1040,7 +1040,7 @@ func TestMinFrameFilter_SuccessThenFailThenRead(t *testing.T) {
 	require.NoError(t, db.Close())
 	ResetVFS()
 	path := filepath.Join(dir, "test.db")
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 	verifyDocuments(t, db2, "data", 60)
@@ -1096,7 +1096,7 @@ func TestMinFrameFilter_MultipleCheckpointCycles(t *testing.T) {
 	require.NoError(t, db.Close())
 	ResetVFS()
 	path := filepath.Join(dir, "test.db")
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 	verifyDocuments(t, db2, "data", totalDocs)
@@ -1125,7 +1125,7 @@ func TestMinFrameFilter_FdatasyncNoop_CrashAfterTruncate(t *testing.T) {
 	})
 	t.Cleanup(ResetVFS)
 
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -1167,7 +1167,7 @@ func TestMinFrameFilter_FdatasyncNoop_CrashAfterTruncate(t *testing.T) {
 	_ = os.Remove(filepath.Join(snapDir, "test.db-shm"))
 	ResetVFS()
 	snapPath := filepath.Join(snapDir, "test.db")
-	db2, err := Open(snapPath, opts)
+	db2, err := testOpen(t, snapPath, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -1263,7 +1263,7 @@ func TestMinFrameFilter_OverwriteCheckpointedPages(t *testing.T) {
 	require.NoError(t, db.Close())
 	ResetVFS()
 	path := filepath.Join(dir, "test.db")
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -1319,7 +1319,7 @@ func TestMinFrameFilter_NonInProcess(t *testing.T) {
 	require.NoError(t, db.Close())
 	ResetVFS()
 	path := filepath.Join(dir, "test.db")
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 	verifyDocuments(t, db2, "data", 50)
@@ -1388,7 +1388,7 @@ func openDBWithShortWrite(t *testing.T, dir string, opts Options) (*DB, *shortWr
 	})
 	t.Cleanup(ResetVFS)
 
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	require.NotNil(t, dbSWF, "DB file should have been opened")
 	return db, dbSWF
@@ -1463,7 +1463,7 @@ func TestCheckpointBackfill_ShortWrite_NoError(t *testing.T) {
 
 	ResetVFS()
 	path := filepath.Join(dir, "test.db")
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -1516,7 +1516,7 @@ func TestCheckpointBackfill_ShortWrite_InlineRead(t *testing.T) {
 	// checkpointed pages, exposing the corruption.
 	ResetVFS()
 	path := filepath.Join(dir, "test.db")
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -1524,7 +1524,7 @@ func TestCheckpointBackfill_ShortWrite_InlineRead(t *testing.T) {
 
 	// Also close original and reopen
 	require.NoError(t, db.Close())
-	db3, err := Open(path, opts)
+	db3, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer func() { _ = db3.Close() }()
 	verifyDocuments(t, db3, "data", 80)
@@ -1585,7 +1585,7 @@ func TestRegression_Bug11_CloseUnconditionallyTruncatesWAL(t *testing.T) {
 
 	// Reopen: WAL recovery should replay all frames
 	ResetVFS()
-	db2, err := Open(dbPath, opts)
+	db2, err := testOpen(t, dbPath, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -1636,7 +1636,7 @@ func TestRegression_Bug11_Simulation(t *testing.T) {
 	// Try to open from the corrupted snapshot
 	ResetVFS()
 	snapPath := filepath.Join(snapDir, "test.db")
-	db2, err := Open(snapPath, opts)
+	db2, err := testOpen(t, snapPath, opts)
 	if err != nil {
 		t.Logf("CONFIRMED Bug 11 data loss: Open fails: %v", err)
 		// The DB file has partial data from checkpoint + stale data.

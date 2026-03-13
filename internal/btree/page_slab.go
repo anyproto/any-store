@@ -42,6 +42,37 @@ var globalPageSlab pageSlab
 // default allocator when the slab is not configured.
 var pageBufferPool sync.Pool
 
+// pageBufferPoolSize tracks the page size that pageBufferPool is initialized for.
+// 0 means uninitialized. Set via initPageBufferPool on first db.Open.
+var pageBufferPoolSize atomic.Uint32
+
+// initPageBufferPool sets the page buffer pool's page size. Returns an error
+// if the pool was already initialized with a different size. All databases in
+// a process must use the same page size. Call resetPageBufferPool() first if
+// you need to switch page sizes (e.g., between tests).
+func initPageBufferPool(pageSize uint32) error {
+	for {
+		cur := pageBufferPoolSize.Load()
+		if cur == pageSize {
+			return nil
+		}
+		if cur != 0 {
+			return ErrPageBufferPoolSizeMismatch
+		}
+		if pageBufferPoolSize.CompareAndSwap(0, pageSize) {
+			return nil
+		}
+	}
+}
+
+// resetPageBufferPool clears the page buffer pool and its size tracking.
+// This allows re-initialization with a different page size.
+// Must only be called when no databases are open (used in tests).
+func resetPageBufferPool() {
+	pageBufferPool = sync.Pool{}
+	pageBufferPoolSize.Store(0)
+}
+
 // allocPageBuffer returns a page-sized buffer. useSlab is a local bool
 // resolved once at pcache/pager creation time — no global reads on hot path.
 func allocPageBuffer(pageSize int, useSlab bool) []byte {

@@ -55,7 +55,7 @@ func setupCorruptDB(t *testing.T) (string, []byte) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestSqlite_Corrupt_2_GarbageOverwrite(t *testing.T) {
 			_ = os.Remove(path + "-shm")
 
 			// Attempt Open — may fail, that's ok
-			db, err := Open(path, DefaultOptions())
+			db, err := testOpen(t, path, DefaultOptions())
 			if err != nil {
 				// Open failed — that's a valid response to corruption
 				return
@@ -260,7 +260,7 @@ func TestSqlite_Corrupt_6_FreeblockSize(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 
 	// Open with page_size=1024
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +337,7 @@ func TestSqlite_Corrupt_6_FreeblockSize(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// Reopen DB
-	db, err = Open(path, Options{PageSize: 1024})
+	db, err = testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		// Open failure on corrupted DB is acceptable
 		return
@@ -388,7 +388,7 @@ func TestSqlite_Corrupt_7_CellOffsetArray(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 
 	// Open with page_size=1024
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -482,7 +482,7 @@ func TestSqlite_Corrupt_7_CellOffsetArray(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// Reopen DB
-	db, err = Open(path, Options{PageSize: 1024})
+	db, err = testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		return
 	}
@@ -533,7 +533,7 @@ func TestSqlite_Corrupt_8_1_OverflowPointer(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -616,7 +616,7 @@ func TestSqlite_Corrupt_8_1_OverflowPointer(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// Reopen
-	db, err = Open(path, Options{PageSize: 1024})
+	db, err = testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		// Open failure acceptable
 		return
@@ -659,7 +659,7 @@ func TestSqlite_Corrupt_8_2_CellAreaCorrupt(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
-	db, err := Open(path, Options{PageSize: 1024})
+	db, err := testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -725,7 +725,7 @@ func TestSqlite_Corrupt_8_2_CellAreaCorrupt(t *testing.T) {
 	_ = os.Remove(path + "-shm")
 
 	// Reopen
-	db, err = Open(path, Options{PageSize: 1024})
+	db, err = testOpen(t, path, Options{PageSize: 1024})
 	if err != nil {
 		// Open failure acceptable
 		return

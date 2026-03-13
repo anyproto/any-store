@@ -185,7 +185,7 @@ func TestSqlite_WALCksum_1(t *testing.T) {
 	// Original: Create DB, insert data, switch to WAL, insert more, copy, verify sizes.
 	// Adapted: Create DB (always WAL), insert data, rawClose, verify WAL exists.
 	t.Run("walcksum-1.1", func(t *testing.T) {
-		db, err := Open(dbPath, Options{PageSize: 1024})
+		db, err := testOpen(t, dbPath, Options{PageSize: 1024})
 		require.NoError(t, err)
 
 		// CREATE TABLE t1(a PRIMARY KEY, b)
@@ -250,7 +250,7 @@ func TestSqlite_WALCksum_1(t *testing.T) {
 	// FULL checkpoint preserves the WAL (no reset), so all frames remain valid.
 	t.Run("walcksum-1.8", func(t *testing.T) {
 		// Reopen DB (recovers from WAL)
-		db, err := Open(dbPath, Options{PageSize: 1024})
+		db, err := testOpen(t, dbPath, Options{PageSize: 1024})
 		require.NoError(t, err)
 
 		// PRAGMA wal_checkpoint (FULL mode preserves WAL)
@@ -306,7 +306,7 @@ func TestSqlite_WALCksum_2_1(t *testing.T) {
 	dbPath := filepath.Join(dir, "test.db")
 
 	// Open DB with page_size=1024
-	db, err := Open(dbPath, Options{PageSize: 1024})
+	db, err := testOpen(t, dbPath, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	// CREATE TABLE t1(x PRIMARY KEY)
@@ -397,7 +397,7 @@ func TestSqlite_WALCksum_2_1(t *testing.T) {
 	rawClose(db)
 
 	// Reopen (triggers recovery from WAL)
-	db2, err := Open(dbPath, Options{PageSize: 1024})
+	db2, err := testOpen(t, dbPath, Options{PageSize: 1024})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -421,7 +421,7 @@ func TestSqlite_WALCksum_3(t *testing.T) {
 
 	// --- walcksum-3.0 (lines 342-351) ---
 	// Original: Create DB, create table, checkpoint, insert row 1.
-	db, err := Open(dbPath, Options{PageSize: 1024})
+	db, err := testOpen(t, dbPath, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -536,7 +536,7 @@ func TestSqlite_WALCksum_3(t *testing.T) {
 	t.Run("walcksum-3.recovery", func(t *testing.T) {
 		rawClose(db)
 
-		db2, err := Open(dbPath, Options{PageSize: 1024})
+		db2, err := testOpen(t, dbPath, Options{PageSize: 1024})
 		require.NoError(t, err)
 		defer func() { _ = db2.Close() }()
 
@@ -571,7 +571,7 @@ func TestSqlite_WALCksum_4(t *testing.T) {
 
 	// --- walcksum-4.0 (lines 390-399) ---
 	// Original: Create DB, create table, checkpoint, insert row 1.
-	db, err := Open(dbPath, Options{PageSize: 1024})
+	db, err := testOpen(t, dbPath, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -687,7 +687,7 @@ func TestSqlite_WALCksum_4(t *testing.T) {
 	t.Run("walcksum-4.3", func(t *testing.T) {
 		rawClose(db)
 
-		db2, err := Open(dbPath, Options{PageSize: 1024})
+		db2, err := testOpen(t, dbPath, Options{PageSize: 1024})
 		require.NoError(t, err)
 		defer func() { _ = db2.Close() }()
 
@@ -720,7 +720,7 @@ func TestSqlite_WALCksum_5(t *testing.T) {
 
 	// --- walcksum-5.0 (lines 440-451) ---
 	// Original: Create DB, insert 3 rows, checkpoint.
-	db, err := Open(dbPath, Options{PageSize: 1024})
+	db, err := testOpen(t, dbPath, Options{PageSize: 1024})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -820,7 +820,7 @@ func TestSqlite_WALCksum_5(t *testing.T) {
 	t.Run("walcksum-5.2", func(t *testing.T) {
 		rawClose(db)
 
-		db2, err := Open(dbPath, Options{PageSize: 1024})
+		db2, err := testOpen(t, dbPath, Options{PageSize: 1024})
 		require.NoError(t, err)
 		defer func() { _ = db2.Close() }()
 

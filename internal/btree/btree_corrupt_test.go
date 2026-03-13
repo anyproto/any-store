@@ -20,7 +20,7 @@ import (
 func TestCorruptCov_SearchInteriorPageCellCountOverflow(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -65,7 +65,7 @@ func TestCorruptCov_SearchInteriorPageCellCountOverflow(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -81,7 +81,7 @@ func TestCorruptCov_SearchInteriorPageCellCountOverflow(t *testing.T) {
 func TestCorruptCov_SearchInteriorCellKeyError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -124,7 +124,7 @@ func TestCorruptCov_SearchInteriorCellKeyError(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -149,7 +149,7 @@ func TestCorruptCov_SearchInteriorCellKeyError(t *testing.T) {
 func TestCorruptCov_SearchLeafVarintCorruption(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 4096})
+	db, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -214,7 +214,7 @@ func TestCorruptCov_SearchLeafVarintCorruption(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 4096})
+	db2, err := testOpen(t, path, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
@@ -236,7 +236,7 @@ func TestCorruptCov_SearchLeafVarintCorruption(t *testing.T) {
 func TestCorruptCov_LeafFullKeyBoundsCheck(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, Options{PageSize: 512})
+	db, err := testOpen(t, path, Options{PageSize: 512})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -292,7 +292,7 @@ func TestCorruptCov_LeafFullKeyBoundsCheck(t *testing.T) {
 	}
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	db2, err := Open(path, Options{PageSize: 512})
+	db2, err := testOpen(t, path, Options{PageSize: 512})
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 

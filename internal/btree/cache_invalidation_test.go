@@ -50,13 +50,13 @@ func TestCacheInvalidation_MultiProcess_DetectsExternalWrite(t *testing.T) {
 	dbPath := filepath.Join(dir, "test.db")
 
 	// Open first DB handle
-	db1, err := Open(dbPath, Options{PageSize: 4096})
+	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db1.Close()
 
 	// Open second DB handle (simulates another process)
 	allowDoubleOpen(dbPath)
-	db2, err := Open(dbPath, Options{PageSize: 4096})
+	db2, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db2.Close()
 
@@ -101,12 +101,12 @@ func TestCacheInvalidation_SchemaCookie(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
-	db1, err := Open(dbPath, Options{PageSize: 4096})
+	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db1.Close()
 
 	allowDoubleOpen(dbPath)
-	db2, err := Open(dbPath, Options{PageSize: 4096})
+	db2, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db2.Close()
 
@@ -140,12 +140,12 @@ func TestCacheInvalidation_NoMarks_CountersUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
-	db1, err := Open(dbPath, Options{PageSize: 4096})
+	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db1.Close()
 
 	allowDoubleOpen(dbPath)
-	db2, err := Open(dbPath, Options{PageSize: 4096})
+	db2, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db2.Close()
 
@@ -181,12 +181,12 @@ func TestCacheInvalidation_UpdateLocalCounters(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
-	db1, err := Open(dbPath, Options{PageSize: 4096})
+	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db1.Close()
 
 	allowDoubleOpen(dbPath)
-	db2, err := Open(dbPath, Options{PageSize: 4096})
+	db2, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db2.Close()
 
@@ -227,7 +227,7 @@ func TestCacheInvalidation_Rollback_NoCounterChange(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
-	db1, err := Open(dbPath, Options{PageSize: 4096})
+	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db1.Close()
 
@@ -293,12 +293,12 @@ func TestCacheInvalidation_WriteTx_StaleCheck(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
-	db1, err := Open(dbPath, Options{PageSize: 4096})
+	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db1.Close()
 
 	allowDoubleOpen(dbPath)
-	db2, err := Open(dbPath, Options{PageSize: 4096})
+	db2, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db2.Close()
 
@@ -350,12 +350,12 @@ func TestCacheInvalidation_DataOnly_SchemaUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
-	db1, err := Open(dbPath, Options{PageSize: 4096})
+	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db1.Close()
 
 	allowDoubleOpen(dbPath)
-	db2, err := Open(dbPath, Options{PageSize: 4096})
+	db2, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db2.Close()
 
@@ -383,7 +383,7 @@ func TestCacheInvalidation_FileReopened(t *testing.T) {
 	dbPath := filepath.Join(dir, "test.db")
 
 	// Write some data and bump counters
-	db1, err := Open(dbPath, Options{PageSize: 4096})
+	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 
 	wtx, err := db1.BeginWrite()
@@ -407,7 +407,7 @@ func TestCacheInvalidation_FileReopened(t *testing.T) {
 	require.NoError(t, db1.Close())
 
 	// Reopen and verify counters are preserved
-	db2, err := Open(dbPath, Options{PageSize: 4096})
+	db2, err := testOpen(t, dbPath, Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db2.Close()
 
@@ -453,7 +453,7 @@ func TestCacheInvalidation_InProcessMode(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
-	db, err := Open(dbPath, Options{PageSize: 4096, InProcess: true})
+	db, err := testOpen(t, dbPath, Options{PageSize: 4096, InProcess: true})
 	require.NoError(t, err)
 	defer db.Close()
 

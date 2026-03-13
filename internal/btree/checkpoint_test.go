@@ -277,7 +277,7 @@ func TestCheckpointWithWriterAndReaders(t *testing.T) {
 	dir := t.TempDir()
 	opts := DefaultOptions()
 	opts.InProcess = true
-	db, err := Open(filepath.Join(dir, "test.db"), opts)
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), opts)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	wtx, err := db.BeginWrite()

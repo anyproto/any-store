@@ -14,7 +14,7 @@ func tempDB(t *testing.T) *DB {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	return db
@@ -36,7 +36,7 @@ func tempDBWithNS(t *testing.T, nsName string) (*DB, *Namespace) {
 func TestOpenClose(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 	_, err = os.Stat(path)
@@ -45,9 +45,9 @@ func TestOpenClose(t *testing.T) {
 
 func TestOpenInvalidPageSize(t *testing.T) {
 	dir := t.TempDir()
-	_, err := Open(filepath.Join(dir, "t.db"), Options{PageSize: 100})
+	_, err := testOpen(t, filepath.Join(dir, "t.db"), Options{PageSize: 100})
 	assert.Error(t, err)
-	_, err = Open(filepath.Join(dir, "t.db"), Options{PageSize: 3000})
+	_, err = testOpen(t, filepath.Join(dir, "t.db"), Options{PageSize: 3000})
 	assert.Error(t, err)
 }
 
@@ -66,7 +66,7 @@ func TestCloseDouble(t *testing.T) {
 func TestDBPath(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	assert.Equal(t, path, db.Path())
 	db.Close()
@@ -77,7 +77,7 @@ func TestDBPath(t *testing.T) {
 func TestReopenDB(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -88,7 +88,7 @@ func TestReopenDB(t *testing.T) {
 	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
-	db2, err := Open(path, DefaultOptions())
+	db2, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db2.Close()
 	rtx, err := db2.BeginRead()
@@ -104,7 +104,7 @@ func TestReopenDB(t *testing.T) {
 func TestReopenMultipleNamespaces(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -118,7 +118,7 @@ func TestReopenMultipleNamespaces(t *testing.T) {
 	require.NoError(t, db.Checkpoint(CheckpointFull))
 	require.NoError(t, db.Close())
 
-	db2, err := Open(path, DefaultOptions())
+	db2, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db2.Close()
 	names, err := db2.ListNamespaces()
@@ -1211,6 +1211,7 @@ func TestCursorNextOnInvalid(t *testing.T) {
 // Returns pager and cleanup function that properly ends transactions.
 func tempPager(t *testing.T) *pager {
 	t.Helper()
+	resetPageBufferPool()
 	p := newPager(filepath.Join(t.TempDir(), "t.db"), 4096, 100, true)
 	require.NoError(t, p.open())
 	_, slot, err := p.beginRead()

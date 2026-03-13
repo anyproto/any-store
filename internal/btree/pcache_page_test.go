@@ -814,7 +814,7 @@ func TestIntegrityCheckN_Zero(t *testing.T) {
 func TestIntegrityCheckN_LimitErrors(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -875,7 +875,7 @@ func TestIntegrityCheck_FreelistWithCorrectCount(t *testing.T) {
 func TestIntegrityCheck_CorruptFreelistLeafCount(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -928,7 +928,7 @@ func TestIntegrityCheck_CorruptFreelistLeafCount(t *testing.T) {
 func TestIntegrityCheck_CorruptFreeblockOffset(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -971,7 +971,7 @@ func TestIntegrityCheck_CorruptFreeblockOffset(t *testing.T) {
 func TestIntegrityCheck_CorruptFreeblockSize(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1032,7 +1032,7 @@ func TestIntegrityCheck_CorruptFreeblockSize(t *testing.T) {
 func TestIntegrityCheck_CorruptFragmentation(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1074,7 +1074,7 @@ func TestIntegrityCheck_CorruptFragmentation(t *testing.T) {
 func TestIntegrityCheck_CorruptContentOffset(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1155,7 +1155,7 @@ func TestIntegrityCheck_FreelistHeaderZeroTrunk(t *testing.T) {
 	// Edge case: header says freelist pages > 0 but FirstFreelistPg == 0
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1195,7 +1195,7 @@ func TestIntegrityCheck_CellExtendsOffPage(t *testing.T) {
 	// Create a DB and corrupt a cell to extend past the page boundary
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1230,7 +1230,7 @@ func TestIntegrityCheck_CellExtendsOffPage(t *testing.T) {
 func TestIntegrityCheck_MasterPageCorruptType(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1267,7 +1267,7 @@ func TestIntegrityCheck_MasterPageCorruptType(t *testing.T) {
 func TestIntegrityCheck_MasterPageCorruptContentOffset(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1306,7 +1306,7 @@ func TestIntegrityCheck_MasterPageCorruptContentOffset(t *testing.T) {
 func TestIntegrityCheck_MasterPageCellOutOfRange(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1343,7 +1343,7 @@ func TestIntegrityCheck_MasterPageCellOutOfRange(t *testing.T) {
 func TestIntegrityCheck_MasterCellCorruptData(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1379,7 +1379,7 @@ func TestIntegrityCheck_MasterCellCorruptData(t *testing.T) {
 func TestIntegrityCheck_MasterCellExtendsOffPage(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1408,7 +1408,7 @@ func TestIntegrityCheck_MasterCellExtendsOffPage(t *testing.T) {
 func TestIntegrityCheck_MasterKeyOutOfOrder(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1451,7 +1451,7 @@ func TestIntegrityCheck_MasterKeyOutOfOrder(t *testing.T) {
 func TestIntegrityCheck_NamespaceRootOutOfRange(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1547,7 +1547,7 @@ func TestHeapInsertPull_Duplicates(t *testing.T) {
 func TestIntegrityCheck_FreeblockChainUnordered(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1607,7 +1607,7 @@ func TestIntegrityCheck_FreeblockChainUnordered(t *testing.T) {
 func TestIntegrityCheck_FreeblockExtendsOffPage(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1666,7 +1666,7 @@ func TestIntegrityCheck_FreeblockExtendsOffPage(t *testing.T) {
 func TestIntegrityCheck_MultipleBytesUse(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1731,7 +1731,7 @@ func TestIntegrityCheck_OverflowOnInteriorPage(t *testing.T) {
 func TestIntegrityCheck_DatabaseSizeZero(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1752,7 +1752,7 @@ func TestIntegrityCheck_DatabaseSizeZero(t *testing.T) {
 func TestIntegrityCheck_DoubleReference(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -1930,7 +1930,7 @@ func TestIntegrityCheck_FreeblockSizeTooSmall_Deterministic(t *testing.T) {
 	// and deleting specific keys.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -2035,7 +2035,7 @@ func TestIntegrityCheck_FreeblockSizeTooSmall_Deterministic(t *testing.T) {
 func TestIntegrityCheck_FreeblockExtendsOffPage_Deterministic(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -2084,7 +2084,7 @@ func TestIntegrityCheck_FreeblockExtendsOffPage_Deterministic(t *testing.T) {
 func TestIntegrityCheck_FreeblockChainUnordered_Deterministic(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -2145,7 +2145,7 @@ func TestIntegrityCheck_ValidFreeblockChain(t *testing.T) {
 	// freeblock loop path (fb = nextFb at line 196).
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -2194,7 +2194,7 @@ func TestIntegrityCheck_InteriorCellExtendsOffPage(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
 	opts.PageSize = 512
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -2285,7 +2285,7 @@ func TestIntegrityCheck_InteriorCellExtendsOffPage(t *testing.T) {
 	os.Remove(path + "-wal")
 	os.Remove(path + "-shm")
 
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer db2.Close()
 
@@ -2303,7 +2303,7 @@ func TestIntegrityCheck_InteriorCorruptKey(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
 	opts.PageSize = 512
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -2381,7 +2381,7 @@ func TestIntegrityCheck_InteriorCorruptKey(t *testing.T) {
 	os.Remove(path + "-wal")
 	os.Remove(path + "-shm")
 
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer db2.Close()
 
@@ -2514,7 +2514,7 @@ func TestIntegrityCheck_LeafCellExtendsOffPage(t *testing.T) {
 	// craft cells that work with reduced usableSize, reopen and check.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -2605,7 +2605,7 @@ func TestIntegrityCheck_LeafCellExtendsOffPage(t *testing.T) {
 	os.Remove(path + "-shm")
 
 	// Reopen and run integrity check
-	db2, err := Open(path, DefaultOptions())
+	db2, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db2.Close()
 
@@ -2620,7 +2620,7 @@ func TestIntegrityCheck_DatabaseSizeZero_Header(t *testing.T) {
 	// corrupt page 1 data directly after the last write.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -2673,7 +2673,7 @@ func TestIntegrityCheck_MasterCellExtendsOffPage_Deterministic(t *testing.T) {
 	// the master cell near usableSize boundary so it extends past.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -2717,7 +2717,7 @@ func TestIntegrityCheck_MasterCellExtendsOffPage_Deterministic(t *testing.T) {
 	os.Remove(path + "-wal")
 	os.Remove(path + "-shm")
 
-	db2, err := Open(path, DefaultOptions())
+	db2, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db2.Close()
 
@@ -2732,7 +2732,7 @@ func TestIntegrityCheck_TooManyErrors_FreelisLeaves(t *testing.T) {
 	// errors that hit maxErrors during leaf enumeration.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
-	db, err := Open(path, DefaultOptions())
+	db, err := testOpen(t, path, DefaultOptions())
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -2785,7 +2785,7 @@ func TestIntegrityCheck_TooManyErrors_CheckListLoop(t *testing.T) {
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
 	opts.PageSize = 512
-	db, err := Open(path, opts)
+	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
 	// Create enough data to use many pages
@@ -2829,7 +2829,7 @@ func TestIntegrityCheck_TooManyErrors_CheckListLoop(t *testing.T) {
 	os.Remove(path + "-wal")
 	os.Remove(path + "-shm")
 
-	db2, err := Open(path, opts)
+	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer db2.Close()
 
@@ -3073,7 +3073,7 @@ func TestCov2_Integrity_CheckTreePage_TooManyErrors(t *testing.T) {
 	pageSize := 512
 
 	// Use small page size to force a multi-level tree with fewer entries
-	db, err := Open(path, Options{PageSize: uint32(pageSize), InProcess: true})
+	db, err := testOpen(t, path, Options{PageSize: uint32(pageSize), InProcess: true})
 	require.NoError(t, err)
 
 	tx, err := db.BeginWrite()
@@ -3121,7 +3121,7 @@ func TestCov2_Integrity_CheckTreePage_TooManyErrors(t *testing.T) {
 
 		require.NoError(t, os.WriteFile(path, data, 0644))
 
-		db2, err := Open(path, Options{PageSize: uint32(pageSize), InProcess: true})
+		db2, err := testOpen(t, path, Options{PageSize: uint32(pageSize), InProcess: true})
 		if err != nil {
 			t.Log("Could not reopen corrupted DB:", err)
 			return
@@ -3242,7 +3242,7 @@ func TestPageCacheBackpointer_ReleaseRoutesViaCache(t *testing.T) {
 
 func TestPageCacheBackpointer_ClearedOnRecycle(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3363,7 +3363,7 @@ func TestMasterStore_InMemoryCheckpointBackfill(t *testing.T) {
 	dir := t.TempDir()
 	opts := DefaultOptions()
 	opts.InMemory = true
-	db, err := Open(filepath.Join(dir, "test.db"), opts)
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), opts)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3401,7 +3401,7 @@ func TestMasterStore_InMemoryCheckpointBackfill(t *testing.T) {
 // ===== getPageReader and readOverflowChainReader coverage =====
 
 func TestGetPageReader_CacheHit(t *testing.T) {
-	db, err := Open("", Options{PageSize: 4096, InMemory: true})
+	db, err := testOpen(t, "", Options{PageSize: 4096, InMemory: true})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3436,7 +3436,7 @@ func TestGetPageReader_CacheHit(t *testing.T) {
 
 func TestGetPageReader_CacheMiss(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3475,7 +3475,7 @@ func TestGetPageReader_CacheMiss(t *testing.T) {
 
 func TestGetPageReader_NilCacheFallback(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3493,7 +3493,7 @@ func TestGetPageReader_NilCacheFallback(t *testing.T) {
 
 func TestGetPageReader_InvalidPage(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{PageSize: 4096})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3507,7 +3507,7 @@ func TestGetPageReader_InMemoryFallback(t *testing.T) {
 	dir := t.TempDir()
 	opts := DefaultOptions()
 	opts.InMemory = true
-	db, err := Open(filepath.Join(dir, "test.db"), opts)
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), opts)
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3537,7 +3537,7 @@ func TestGetPageReader_InMemoryFallback(t *testing.T) {
 }
 
 func TestGetPageReader_StaleEviction(t *testing.T) {
-	db, err := Open("", Options{PageSize: 4096, InMemory: true})
+	db, err := testOpen(t, "", Options{PageSize: 4096, InMemory: true})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3588,7 +3588,7 @@ func TestGetPageReader_StaleEviction(t *testing.T) {
 
 func TestReadOverflowChainReader(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 512})
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{PageSize: 512})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3616,7 +3616,7 @@ func TestReadOverflowChainReader(t *testing.T) {
 
 func TestReaderCachePool_Lifecycle(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 500})
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 500})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3626,7 +3626,7 @@ func TestReaderCachePool_Lifecycle(t *testing.T) {
 
 func TestReaderCachePool_SmallCacheSize(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 100})
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 100})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3635,7 +3635,7 @@ func TestReaderCachePool_SmallCacheSize(t *testing.T) {
 
 func TestReaderCachePool_LargeCacheSize(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 10000})
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 10000})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3646,7 +3646,7 @@ func TestReaderCachePool_LargeCacheSize(t *testing.T) {
 
 func TestConcurrentReadersIndependentCaches(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3694,7 +3694,7 @@ func TestConcurrentReadersIndependentCaches(t *testing.T) {
 
 func TestReaderCacheStalenessAfterCommit(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3742,7 +3742,7 @@ func TestReaderCacheStalenessAfterCommit(t *testing.T) {
 
 func TestReaderCacheRecycledOnRollback(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3781,7 +3781,7 @@ func TestReaderCacheRecycledOnRollback(t *testing.T) {
 
 func TestWriterDoesNotGetReaderCache(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
 	require.NoError(t, err)
 	defer db.Close()
 
@@ -3794,7 +3794,7 @@ func TestWriterDoesNotGetReaderCache(t *testing.T) {
 
 func TestCursorWithReaderCache(t *testing.T) {
 	dir := t.TempDir()
-	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{PageSize: 4096, CacheSize: 200})
 	require.NoError(t, err)
 	defer db.Close()
 
