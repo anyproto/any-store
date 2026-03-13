@@ -657,7 +657,7 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 		if len(p.savepoints) > 0 {
 			sp := &p.savepoints[len(p.savepoints)-1]
 			if _, exists := sp.pages[pgno]; !exists {
-				dataCopy := make([]byte, len(pg.data))
+				dataCopy := allocPageBuffer(int(p.pageSize), false)
 				copy(dataCopy, pg.data)
 				sp.pages[pgno] = dataCopy
 			}
@@ -694,7 +694,7 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 	if len(p.savepoints) > 0 && !pg.dirty {
 		sp := &p.savepoints[len(p.savepoints)-1]
 		if _, exists := sp.pages[pgno]; !exists {
-			dataCopy := make([]byte, len(pg.data))
+			dataCopy := allocPageBuffer(int(p.pageSize), false)
 			copy(dataCopy, pg.data)
 			sp.pages[pgno] = dataCopy
 		}
@@ -1212,7 +1212,7 @@ func (p *pager) pagerStress(pg *page) error {
 	if len(p.savepoints) > 0 {
 		sp := &p.savepoints[len(p.savepoints)-1]
 		if _, exists := sp.pages[pg.pgno]; !exists {
-			dataCopy := make([]byte, len(pg.data))
+			dataCopy := allocPageBuffer(int(p.pageSize), false)
 			copy(dataCopy, pg.data)
 			sp.pages[pg.pgno] = dataCopy
 		}
@@ -1289,6 +1289,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	if !hasRealChanges {
 		// Empty transaction — counters not incremented.
 		p.state.Store(int32(pagerOpen))
+		p.freeSavepointPageBuffers(0, len(p.savepoints))
 		p.savepoints = p.savepoints[:0]
 		clear(p.hasContent)
 		p.wal.endWrite()
@@ -1333,6 +1334,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 		p.writerCache.makeClean(pg)
 	}
 
+	p.freeSavepointPageBuffers(0, len(p.savepoints))
 	p.savepoints = p.savepoints[:0]
 	clear(p.dontWritePages)
 	clear(p.hasContent)
@@ -1397,6 +1399,7 @@ func (p *pager) rollbackLocked() error {
 	p.dbSize.Store(p.header.DatabaseSize)
 
 	p.doNotSpill &^= spillFlagRollback
+	p.freeSavepointPageBuffers(0, len(p.savepoints))
 	p.savepoints = p.savepoints[:0]
 	clear(p.dontWritePages)
 	clear(p.hasContent)
@@ -1487,6 +1490,7 @@ func (p *pager) pagerError() {
 	p.header = p.savedHeader
 	p.dbSize.Store(p.header.DatabaseSize)
 
+	p.freeSavepointPageBuffers(0, len(p.savepoints))
 	p.savepoints = p.savepoints[:0]
 
 	clear(p.dontWritePages)
@@ -1499,6 +1503,17 @@ func (p *pager) pagerError() {
 	// This mirrors SQLite's pager_unlock() which transitions from
 	// PAGER_ERROR -> PAGER_OPEN after clearing the error.
 	p.state.Store(int32(pagerOpen))
+}
+
+// freeSavepointPageBuffers returns page copy buffers from savepoints[from:to]
+// to the page buffer pool. Must be called before truncating the savepoints slice.
+func (p *pager) freeSavepointPageBuffers(from, to int) {
+	for i := from; i < to; i++ {
+		for _, data := range p.savepoints[i].pages {
+			freePageBuffer(data, false)
+		}
+		clear(p.savepoints[i].pages)
+	}
 }
 
 // savepoint creates a new savepoint and returns its ID.
@@ -1614,6 +1629,10 @@ func (p *pager) rollbackToSavepoint(id int) error {
 
 	p.doNotSpill &^= spillFlagRollback
 
+	// Free page buffers from discarded savepoints (above target).
+	// Savepoint[id] is kept active — its page copies remain for future rollback.
+	p.freeSavepointPageBuffers(id+1, len(p.savepoints))
+
 	// Remove savepoints above the target but keep the target itself.
 	// This matches SQLite's behavior (pager.c:7025): ROLLBACK TO keeps the
 	// savepoint active so it can be released or rolled back again later.
@@ -1641,10 +1660,16 @@ func (p *pager) releaseSavepoint(id int) error {
 		for i := id; i < len(p.savepoints); i++ {
 			for pgno, data := range p.savepoints[i].pages {
 				if _, exists := parent.pages[pgno]; !exists {
-					parent.pages[pgno] = data
+					parent.pages[pgno] = data // transfer ownership to parent
+				} else {
+					freePageBuffer(data, false) // parent already has a copy
 				}
 			}
+			clear(p.savepoints[i].pages)
 		}
+	} else {
+		// No parent — free all page buffers from all savepoints.
+		p.freeSavepointPageBuffers(0, len(p.savepoints))
 	}
 
 	p.savepoints = p.savepoints[:id]
