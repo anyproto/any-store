@@ -48,10 +48,8 @@ func allocPageBuffer(pageSize int, useSlab bool) []byte {
 	if useSlab {
 		return globalPageSlab.Get()
 	}
-	if v := pageBufferPool.Get(); v != nil {
-		if buf, ok := v.([]byte); ok && len(buf) == pageSize {
-			return buf
-		}
+	if buf, ok := pageBufferPool.Get().([]byte); ok {
+		return buf
 	}
 	return make([]byte, pageSize)
 }
@@ -113,11 +111,16 @@ func (s *pageSlab) Get() []byte {
 		s.mu.Unlock()
 		return buf
 	}
-	// Overflow: allocate from heap
+	// Overflow: try sync.Pool first, then heap. sync.Pool lets the GC
+	// reclaim overflow buffers in batches and reuse them across cycles,
+	// reducing allocation pressure during sustained slab exhaustion.
 	s.nOverflow++
 	s.nTotal++
 	pageSize := s.pageSize
 	s.mu.Unlock()
+	if buf, ok := pageBufferPool.Get().([]byte); ok {
+		return buf
+	}
 	return make([]byte, pageSize)
 }
 
@@ -136,9 +139,13 @@ func (s *pageSlab) Put(buf []byte) {
 	}
 	s.mu.Lock()
 	// Cap the free list at the original slab size. Buffers beyond nSlab are
-	// overflow allocations — let them be GC'd instead of hoarding.
+	// overflow allocations — route them to sync.Pool for reuse instead of
+	// dropping them for GC. This reduces allocation pressure when the slab
+	// is persistently exhausted (many DBs, heavy writes).
 	if len(s.freeList) < s.nSlab {
 		s.freeList = append(s.freeList, buf)
+	} else {
+		pageBufferPool.Put(buf)
 	}
 	// Update pressure: pcache1.c:389 — clear if freeList refills above reserve
 	if len(s.freeList) >= s.nReserve {
