@@ -59,10 +59,13 @@ type pcache struct {
 	dataVersion  uint64
 	walMaxFrame  uint32
 
-	// pFree is a per-cache bulk pre-allocated list of page structs.
-	// On first use, initBulk() allocates up to 100 page structs with data
-	// buffers drawn from the global slab. Matches SQLite pcache1.c:201 (pFree),
-	// pcache1.c:297-330 (pcache1InitBulk), pcache1.c:434-438 (tries pFree first).
+	// pFree is a per-cache list of reusable page structs with data buffers.
+	// In non-slab mode, initBulk() pre-allocates up to 20 pages from the heap
+	// (marked isBulkLocal=true). In slab mode, initBulk is a no-op (SQLite
+	// disables bulk init when SQLITE_CONFIG_PAGECACHE is set). Pages also
+	// accumulate in pFree during clear() for reuse across transactions.
+	// Matches SQLite pcache1.c:201 (pFree), pcache1.c:297-330 (pcache1InitBulk),
+	// pcache1.c:434-438 (tries pFree first), pcache1.c:470-475 (isBulkLocal→pFree).
 	pFree    []*page
 	bulkInit bool // true after initBulk() has been called
 
@@ -102,23 +105,44 @@ func (pc *pcache) fetch(pgno uint32) *page {
 	return p
 }
 
-// initBulk pre-allocates page structs with data buffers.
+// initBulk pre-allocates page structs with data buffers from the heap.
 // Called once on first create(). Matches SQLite pcache1.c:297-330 (pcache1InitBulk).
-// Buffers come from the slab (if configured) or sync.Pool/make.
+//
+// SQLite disables bulk init when a slab (SQLITE_CONFIG_PAGECACHE) is configured:
+// pcache1Init sets nInitPage=0 when pPage!=0 (pcache1.c:730-737). In slab mode,
+// all allocations go through pcache1Alloc (slab→heap fallback) instead.
+//
+// In non-slab mode, bulk allocation uses the heap (sync.Pool), matching SQLite's
+// sqlite3Malloc call. Pages are marked isBulkLocal=true so that pcache1FreePage
+// routes them to pCache->pFree (local reuse) rather than pcache1Free (slab/heap).
+// The default nInitPage is SQLITE_DEFAULT_PCACHE_INITSZ=20, capped at nMax
+// (pcache1.c:304-310).
 func (pc *pcache) initBulk() {
 	pc.bulkInit = true
-	nBulk := pc.maxPages
-	if nBulk > 100 {
-		nBulk = 100
+	// SQLite disables bulk init when a slab is configured (pcache1.c:730-737:
+	// nInitPage=0 when pPage!=0). All page buffers come from the slab instead.
+	if pc.useSlab {
+		return
 	}
-	if nBulk <= 0 {
+	nBulk := pc.maxPages
+	// Match SQLITE_DEFAULT_PCACHE_INITSZ (20) and nMax cap (pcache1.c:309-310).
+	if nBulk > 20 {
+		nBulk = 20
+	}
+	// SQLite: "Do not bother with a bulk allocation if the cache size very small"
+	// (pcache1.c:302). nMax < 3 → skip.
+	if nBulk < 3 {
 		return
 	}
 	pc.pFree = make([]*page, nBulk)
 	for i := range nBulk {
 		pc.pFree[i] = &page{
-			data:  allocPageBuffer(pc.pageSize, pc.useSlab),
-			cache: pc,
+			// Heap allocation (useSlab=false), matching SQLite's sqlite3Malloc
+			// in pcache1InitBulk. The slab is reserved for individual allocations
+			// in create() step 5 (pcache1AllocPage → pcache1Alloc).
+			data:        allocPageBuffer(pc.pageSize, false),
+			cache:       pc,
+			isBulkLocal: true, // matches SQLite pX->isBulkLocal = 1 (pcache1.c:321)
 		}
 	}
 }
@@ -139,20 +163,12 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	}
 
 	// Step 3: Admission control — refuse soft creates when thrashing.
-	// Implements one of SQLite's three step-3 guards (pcache1.c:886-891):
-	// nPinned >= n90pct (per-cache thrashing).
-	//
-	// DRIFT from SQLite: the global slab-pressure guard
-	// (pcache1UnderMemoryPressure + nRecyclable < nPinned, pcache1.c:889-891)
-	// is intentionally omitted. SQLite's check uses PGroup-level nPurgeable
-	// (pages across ALL caches), so a single cache with low recyclable doesn't
-	// trigger it. In our isolated model (no PGroup, drift #1), each cache's
-	// nRecyclable is checked independently — causing the condition to fire when
-	// even 1 page is pinned. This prevents the reader cache from filling at
-	// all, pushing every page through readTempPage → acquireTempPage →
-	// globalPageSlab.Get() → overflow allocation. The reader cache is already
-	// bounded by maxPages; once full, step 4 evicts before creating (net zero
-	// memory), so per-cache admission control via the 90% guard is sufficient.
+	// Matches SQLite pcache1.c:886-891 (Mode 1 / separateCache):
+	//   - nPinned >= n90pct: per-cache thrashing guard
+	//   - underMemoryPressure && nRecyclable < nPinned: slab exhausted and
+	//     most pages are actively pinned — adding more would overflow the slab
+	//     with little chance of recycling. In Mode 1, both checks are per-cache
+	//     (private PGroup), which is exactly our model.
 	//
 	// createFlag==1 (soft, readers): may return nil.
 	// createFlag==2 (hard, writers/stress): always proceeds.
@@ -161,30 +177,35 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 		if nPinned >= pc.maxPages*9/10 {
 			return nil
 		}
+		if pc.useSlab && globalPageSlab.UnderPressure() && pc.nRecyclable < nPinned {
+			return nil
+		}
 	}
 
-	// Step 4: Evict clean pages if cache is full (skip for non-purgeable / InMemory caches).
-	// Adapted from SQLite pcache1.c:897-914 (step 4 — SQLite reuses victim's buffer).
-	//
-	// The last evicted page is kept for direct buffer reuse by the allocation
-	// step below, eliminating the slab Put→Get round-trip. This matches SQLite's
-	// step 4 (pcache1.c:900-906) which reuses the victim's PgHdr1 + buffer
-	// directly for the new page. Intermediate evictions (rare: only when multiple
-	// pages must be evicted) return buffers to slab.
+	// Step 4: Recycle LRU pages if cache is full OR slab is under pressure.
+	// Matches SQLite pcache1.c:898-900 (Mode 1):
+	//   (pCache->nPage+1>=pCache->nMax) || pcache1UnderMemoryPressure(pCache)
+	// Under slab pressure, recycle even when the cache isn't full — this is
+	// how SQLite bounds total memory across many caches sharing a single slab.
+	// The evicted page's buffer is reused directly (net-zero slab allocation).
 	var recycled *page
 	if pc.purgeable {
+		// First, if cache is over maxPages, evict down to maxPages.
 		for len(pc.pages) >= pc.maxPages && pc.nRecyclable > 0 {
 			evicted := pc.evictOne()
 			if evicted != nil {
-				// Keep last evicted page for direct reuse (SQLite step 4:
-				// pcache1.c:900 reuses victim's PgHdr1 + buffer directly).
-				// Return intermediate evictions to slab/pool.
 				if recycled != nil {
-					freePageBuffer(recycled.data, pc.useSlab)
-					recycled.data = nil
+					pc.returnPageBuffer(recycled)
 				}
 				recycled = evicted
 			}
+		}
+		// Under slab pressure, recycle one more LRU page for buffer reuse
+		// even if cache is below maxPages. Matches SQLite step 4 (pcache1.c:900):
+		//   (nPage+1>=nMax) || pcache1UnderMemoryPressure
+		// This prevents overflow allocations when many caches share a slab.
+		if recycled == nil && pc.useSlab && globalPageSlab.UnderPressure() && pc.nRecyclable > 0 {
+			recycled = pc.evictOne()
 		}
 
 		// If still full and stress callback available, try to spill a dirty page.
@@ -211,8 +232,7 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 					if evicted != nil && recycled == nil {
 						recycled = evicted
 					} else if evicted != nil {
-						freePageBuffer(evicted.data, pc.useSlab)
-						evicted.data = nil
+						pc.returnPageBuffer(evicted)
 					}
 				}
 			}
@@ -291,18 +311,12 @@ func (pc *pcache) release(p *page) {
 			// never evicted. Matches SQLite pcache.c:265-271 (pcacheUnpin is
 			// a no-op for non-purgeable caches).
 			//
-			// If cache is overfull and slab is under pressure, immediately
-			// evict instead of adding to LRU (matches pcache1Unpin).
-			if pc.useSlab && globalPageSlab.UnderPressure() && len(pc.pages) > pc.maxPages {
-				delete(pc.pages, p.pgno)
-				// Add to pFree for direct reuse by create() instead of returning
-				// buffer to slab (which would drop it — slab is full under
-				// pressure). Matches SQLite pcache1FreePage: bulk-local pages
-				// go to pCache->pFree (pcache1.c:475-477).
-				pc.pFree = append(pc.pFree, p)
-			} else {
-				pc.lruPrepend(p)
-			}
+			// Matches SQLite Mode 1 (separateCache) pcache1Unpin: just add
+			// to LRU. Eviction happens in create() step 4, not here.
+			// In Mode 1, pGroup->nPurgeable > pGroup->nMaxPage is a per-cache
+			// check that only fires if create() let nPage exceed nMax (shouldn't
+			// happen with proper step 4 gating).
+			pc.lruPrepend(p)
 		}
 	}
 }
@@ -387,22 +401,48 @@ func (pc *pcache) appendDirtyPages(buf []*page) []*page {
 	return buf
 }
 
-// clear invalidates all cached pages but keeps their data buffers locally
-// in pFree for reuse by future create() calls. This avoids returning buffers
-// to the global slab (where they may be dropped when the slab is full) and
-// re-allocating on the next cache fill cycle.
+// clear invalidates all cached pages. Clean pages that fit in the local
+// pFree list are kept for buffer reuse by future create() calls. Excess
+// buffers are returned via freePageBuffer so the GC can reclaim them.
 //
-// Matches SQLite pcache1FreePage (pcache1.c:476-477): bulk-local pages go
-// to pCache->pFree (local to the PCache instance), surviving cache clears.
-// We treat ALL pages as bulk-local since our slab has a fixed cap (unlike
-// SQLite's uncapped global free list) and would drop excess buffers.
+// When the global slab is under pressure, ALL buffers are returned to
+// the slab/pool instead of being hoarded locally. This prevents N caches
+// from each holding maxPages buffers in pFree (N * maxPages * pageSize
+// total), which would far exceed the slab budget. SQLite avoids this
+// via PGroup-level recycling (Mode 2) or per-cache nMax gating (Mode 1);
+// we use the slab pressure flag as the equivalent cross-cache signal.
 //
 // Used when the cache snapshot is invalidated but the cache object will be
-// reused (e.g. from sync.Pool with changed dataVersion, or writer cache
-// stale detection). For final disposal use destroy().
+// reused (e.g. persistent reader cache with changed dataVersion, or writer
+// cache stale detection). For final disposal use destroy().
 func (pc *pcache) clear() {
+	// Under slab pressure, return ALL existing pFree buffers to the pool
+	// before adding new ones. This releases hoarded buffers from prior
+	// clear() calls that accumulated when pressure wasn't active yet.
+	if pc.useSlab && globalPageSlab.UnderPressure() {
+		for _, p := range pc.pFree {
+			freePageBuffer(p.data, pc.useSlab)
+			p.data = nil
+		}
+		pc.pFree = pc.pFree[:0]
+	}
+
 	for _, p := range pc.pages {
-		pc.pFree = append(pc.pFree, p)
+		if pc.useSlab && globalPageSlab.UnderPressure() {
+			// Slab mode under pressure: return all buffers to slab.
+			// No isBulkLocal pages exist in slab mode (initBulk is skipped).
+			freePageBuffer(p.data, pc.useSlab)
+			p.data = nil
+		} else if p.isBulkLocal {
+			// Bulk-local pages always go to pFree (matches SQLite pcache1FreePage).
+			// They were heap-allocated in initBulk and are never returned to slab/pool.
+			pc.pFree = append(pc.pFree, p)
+		} else if len(pc.pFree) < pc.maxPages {
+			pc.pFree = append(pc.pFree, p)
+		} else {
+			freePageBuffer(p.data, pc.useSlab)
+			p.data = nil
+		}
 	}
 	clear(pc.pages)
 	pc.lruHead = nil
@@ -414,6 +454,9 @@ func (pc *pcache) clear() {
 }
 
 // destroy removes all pages and returns all data buffers to the slab/pool.
+// Matches SQLite pcache1Destroy (pcache1.c:1169-1185): truncates all pages
+// via pcache1FreePage, then frees the pBulk blocks via sqlite3_free.
+// In Go, returning buffers to sync.Pool (non-slab) or slab achieves the same.
 // Used when the cache will not be reused: temporary caches (getNamespace,
 // listNamespaces, integrity check) and pager close/error paths.
 func (pc *pcache) destroy() {
@@ -436,8 +479,9 @@ func (pc *pcache) destroy() {
 	pc.nDirty = 0
 }
 
-// discard removes a specific page from the cache and returns its data buffer
-// to the global slab.
+// discard removes a specific page from the cache. Bulk-local pages go to
+// pFree for local reuse; non-bulk pages return to the slab/pool.
+// Matches SQLite pcache1FreePage (pcache1.c:470-482).
 func (pc *pcache) discard(pgno uint32) {
 	p := pc.pages[pgno]
 	if p == nil {
@@ -460,13 +504,12 @@ func (pc *pcache) discard(pgno uint32) {
 	} else {
 		pc.lruRemove(p)
 	}
-	freePageBuffer(p.data, pc.useSlab)
-	p.data = nil
 	delete(pc.pages, pgno)
+	pc.returnPageBuffer(p)
 }
 
-// truncate removes all pages with pgno > maxPage, returning their data
-// buffers to the slab/pool.
+// truncate removes all pages with pgno > maxPage. Bulk-local pages go to
+// pFree; non-bulk pages return to the slab/pool.
 func (pc *pcache) truncate(maxPage uint32) {
 	for pgno, p := range pc.pages {
 		if pgno > maxPage {
@@ -487,9 +530,8 @@ func (pc *pcache) truncate(maxPage uint32) {
 			} else {
 				pc.lruRemove(p)
 			}
-			freePageBuffer(p.data, pc.useSlab)
-			p.data = nil
 			delete(pc.pages, pgno)
+			pc.returnPageBuffer(p)
 		}
 	}
 }
@@ -548,6 +590,19 @@ func (pc *pcache) evictOne() *page {
 	pc.nRecyclable--
 	delete(pc.pages, p.pgno)
 	return p
+}
+
+// returnPageBuffer routes a freed page based on its allocation origin.
+// Matches SQLite pcache1FreePage (pcache1.c:470-482):
+//   - isBulkLocal pages go to pCache->pFree (local reuse, never to slab/pool)
+//   - non-bulk pages go through pcache1Free (slab or sqlite3_free)
+func (pc *pcache) returnPageBuffer(p *page) {
+	if p.isBulkLocal {
+		pc.pFree = append(pc.pFree, p)
+	} else {
+		freePageBuffer(p.data, pc.useSlab)
+		p.data = nil
+	}
 }
 
 // findSpillVictim returns the oldest unpinned dirty page, or nil if all dirty

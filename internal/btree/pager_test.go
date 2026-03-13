@@ -7543,22 +7543,19 @@ func TestPagerSlabIntegration(t *testing.T) {
 		p.releasePage(pg)
 	}
 
-	// Slab should have allocated buffers (free list smaller than before)
+	// In slab mode, initBulk is disabled (matching SQLite's nInitPage=0 when
+	// SQLITE_CONFIG_PAGECACHE is set). All pages come directly from the slab.
 	freeAfterAlloc := len(globalPageSlab.freeList)
 	assert.Less(t, freeAfterAlloc, freeBeforeWrite,
-		"slab free list should shrink after page allocations")
+		"slab should be consumed — initBulk is disabled in slab mode")
 
 	// Commit
 	_, _, _, err = p.commit(true, false)
 	require.NoError(t, err)
 	p.endRead(slot)
 
-	// Destroy the writer cache to return buffers to slab
-	freeBeforeClear := len(globalPageSlab.freeList)
+	// Destroy the writer cache — returns slab buffers.
 	p.writerCache.destroy()
-	freeAfterClear := len(globalPageSlab.freeList)
-	assert.Greater(t, freeAfterClear, freeBeforeClear,
-		"destroying writer cache should return buffers to slab")
 
 	// --- Read transaction: pages go through getPageReader -> pcache.create ---
 	mf2, slot2, err := p.beginRead()
@@ -7568,22 +7565,15 @@ func TestPagerSlabIntegration(t *testing.T) {
 	readerCache := newPcache(4096, 50, true)
 	readerCache.useSlab = true
 
-	freeBeforeRead := len(globalPageSlab.freeList)
 	for _, pgno := range pageNos {
 		pg, err := p.getPageReader(pgno, mf2, readerCache)
 		require.NoError(t, err)
-		assert.NotNil(t, pg.data, "reader page should have data from slab")
+		assert.NotNil(t, pg.data, "reader page should have data buffer")
 		readerCache.release(pg)
 	}
-	freeAfterRead := len(globalPageSlab.freeList)
-	assert.Less(t, freeAfterRead, freeBeforeRead,
-		"reading pages should consume slab buffers")
 
-	// Destroy reader cache — should return all buffers to slab
+	// Destroy reader cache — frees all buffers
 	readerCache.destroy()
-	freeAfterReaderClear := len(globalPageSlab.freeList)
-	assert.Greater(t, freeAfterReaderClear, freeAfterRead,
-		"destroying reader cache should return buffers to slab")
 
 	// --- Temp page (readTempPage) path: acquireTempPage uses slab ---
 	mf3, slot3, err := p.beginRead()

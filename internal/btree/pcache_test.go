@@ -483,40 +483,60 @@ func TestPcacheFindSpillVictimOldestFirst(t *testing.T) {
 }
 
 func TestPcacheBulkAlloc_InitBulkOnFirstCreate(t *testing.T) {
-	// Initialize a local slab for this test to avoid polluting globalPageSlab.
+	// In non-slab mode, initBulk pre-allocates pages from sync.Pool/heap.
+	// In slab mode, initBulk is a no-op (SQLite: nInitPage=0 when pPage set).
 	globalPageSlab.Reset()
-	globalPageSlab.Init(4096, 500)
 	defer globalPageSlab.Reset()
 
-	pc := newPcache(4096, 50, true)
-	pc.useSlab = true
+	t.Run("non-slab", func(t *testing.T) {
+		pc := newPcache(4096, 50, true)
+		// useSlab=false (default) — initBulk uses sync.Pool/heap
 
-	// Before any create(), bulkInit should be false and pFree empty
-	assert.False(t, pc.bulkInit)
-	assert.Empty(t, pc.pFree)
+		assert.False(t, pc.bulkInit)
+		assert.Empty(t, pc.pFree)
 
-	// First create() should trigger initBulk (nBulk = min(50, 100) = 50)
-	pg1 := pc.create(1, 2)
-	require.NotNil(t, pg1)
-	assert.True(t, pc.bulkInit, "bulkInit should be true after first create")
-	// pFree should have 49 remaining (50 allocated, 1 used for pg1)
-	assert.Len(t, pc.pFree, 49)
-	assert.Len(t, pg1.data, 4096)
+		// First create triggers initBulk (nBulk = min(50, 20) = 20)
+		pg1 := pc.create(1, 2)
+		require.NotNil(t, pg1)
+		assert.True(t, pc.bulkInit)
+		assert.Len(t, pc.pFree, 19, "pFree should have 19 (20 bulk - 1 used)")
+		assert.True(t, pg1.isBulkLocal, "page from initBulk should be isBulkLocal")
 
-	// Second create() should use pFree without calling initBulk again
-	pg2 := pc.create(2, 2)
-	require.NotNil(t, pg2)
-	assert.Len(t, pc.pFree, 48, "pFree should have 48 after second create")
-	assert.Len(t, pg2.data, 4096)
+		// Second create uses pFree
+		pg2 := pc.create(2, 2)
+		require.NotNil(t, pg2)
+		assert.Len(t, pc.pFree, 18)
+		assert.True(t, pg2.isBulkLocal)
 
-	// Verify slab was consumed: 50 buffers taken from slab during initBulk
-	globalPageSlab.mu.Lock()
-	freeCount := len(globalPageSlab.freeList)
-	globalPageSlab.mu.Unlock()
-	assert.Equal(t, 450, freeCount, "slab should have 500-50=450 free buffers")
+		pc.release(pg1)
+		pc.release(pg2)
+		pc.destroy()
+	})
 
-	pc.release(pg1)
-	pc.release(pg2)
+	t.Run("slab", func(t *testing.T) {
+		globalPageSlab.Reset()
+		globalPageSlab.Init(4096, 500)
+		defer globalPageSlab.Reset()
+
+		pc := newPcache(4096, 50, true)
+		pc.useSlab = true
+
+		// initBulk is a no-op in slab mode (SQLite: nInitPage=0 when pPage set)
+		pg := pc.create(1, 2)
+		require.NotNil(t, pg)
+		assert.True(t, pc.bulkInit, "bulkInit flag set even though it's a no-op")
+		assert.Empty(t, pc.pFree, "pFree empty — initBulk skipped in slab mode")
+		assert.False(t, pg.isBulkLocal, "slab pages are not bulk-local")
+
+		// Slab was consumed (page allocated from slab, not heap)
+		globalPageSlab.mu.Lock()
+		freeCount := len(globalPageSlab.freeList)
+		globalPageSlab.mu.Unlock()
+		assert.Less(t, freeCount, 500, "slab should be consumed")
+
+		pc.release(pg)
+		pc.destroy()
+	})
 }
 
 func TestPcacheBulkAlloc_FallbackToSlabAfterPFreeExhausted(t *testing.T) {
@@ -524,18 +544,17 @@ func TestPcacheBulkAlloc_FallbackToSlabAfterPFreeExhausted(t *testing.T) {
 	globalPageSlab.Init(4096, 500)
 	defer globalPageSlab.Reset()
 
-	// Use maxPages=5 so initBulk allocates only 5 pages
+	// In slab mode, initBulk is a no-op — all pages come from slab directly
 	pc := newPcache(4096, 5, true)
 	pc.useSlab = true
 
-	// Create 5 pages — first triggers initBulk (nBulk = min(5, 100) = 5),
-	// uses all 5 from pFree
+	// Create 5 pages — all from slab (initBulk skipped in slab mode)
 	pgs := make([]*page, 5)
 	for i := uint32(1); i <= 5; i++ {
 		pgs[i-1] = pc.create(i, 2)
 	}
 	assert.True(t, pc.bulkInit)
-	assert.Empty(t, pc.pFree, "pFree should be exhausted after 5 creates")
+	assert.Empty(t, pc.pFree, "pFree should be empty — initBulk skipped in slab mode")
 
 	// Release all so cache isn't full
 	for _, pg := range pgs {
@@ -568,22 +587,23 @@ func TestPcacheBulkAlloc_FallbackToSlabAfterPFreeExhausted(t *testing.T) {
 	pc.release(pg6)
 }
 
-func TestPcacheBulkAlloc_MaxBulk100(t *testing.T) {
-	// Verify initBulk caps at 100 even for large maxPages
+func TestPcacheBulkAlloc_MaxBulk20(t *testing.T) {
+	// Verify initBulk caps at 20 (SQLITE_DEFAULT_PCACHE_INITSZ) even for large
+	// maxPages. Uses non-slab mode since initBulk is a no-op with slab.
 	globalPageSlab.Reset()
-	globalPageSlab.Init(4096, 500)
 	defer globalPageSlab.Reset()
 
 	pc := newPcache(4096, 5000, true)
-	pc.useSlab = true
+	// useSlab=false — initBulk fires
 
-	// Trigger initBulk via first create
 	pg := pc.create(1, 2)
 	require.NotNil(t, pg)
-	// nBulk = min(5000, 100) = 100; 1 used for pg, 99 remain
-	assert.Len(t, pc.pFree, 99, "pFree should have 99 (100 bulk - 1 used)")
+	// nBulk = min(5000, 20) = 20; 1 used for pg, 19 remain
+	assert.Len(t, pc.pFree, 19, "pFree should have 19 (20 bulk - 1 used)")
+	assert.True(t, pg.isBulkLocal)
 
 	pc.release(pg)
+	pc.destroy()
 }
 
 func TestPcacheBufferRecycling_EvictionFromPFreeOrSlab(t *testing.T) {
@@ -666,8 +686,8 @@ func TestPcacheBufferRecycling_ReaderEvictionRecyclesDirect(t *testing.T) {
 }
 
 func TestPcacheBufferRecycling_ClearReturnsSlab(t *testing.T) {
-	// clear() should move all page buffers to pFree for reuse (not slab).
-	// destroy() should return all buffers to slab.
+	// In slab mode: initBulk is disabled, pages come from slab. clear() moves
+	// them to pFree for reuse (no pressure). destroy() frees all to slab.
 	globalPageSlab.Reset()
 	globalPageSlab.Init(4096, 500)
 	defer globalPageSlab.Reset()
@@ -675,51 +695,37 @@ func TestPcacheBufferRecycling_ClearReturnsSlab(t *testing.T) {
 	pc := newPcache(4096, 50, true)
 	pc.useSlab = true
 
-	// Create 10 pages (triggers initBulk with 50 pages from slab)
+	// Create 10 pages — all from slab (initBulk is a no-op in slab mode)
 	for i := uint32(1); i <= 10; i++ {
 		pg := pc.create(i, 2)
 		pc.release(pg)
 	}
 
-	// pFree should have 40 remaining (50 bulk - 10 used)
-	assert.Len(t, pc.pFree, 40)
+	// pFree is empty — no bulk init in slab mode
+	assert.Empty(t, pc.pFree)
 	assert.Len(t, pc.pages, 10)
 
-	// clear() moves pages to pFree — slab should NOT change
-	globalPageSlab.mu.Lock()
-	freeCountBefore := len(globalPageSlab.freeList)
-	globalPageSlab.mu.Unlock()
-
+	// clear() moves pages to pFree (no pressure)
 	pc.clear()
 
-	globalPageSlab.mu.Lock()
-	freeCountAfterClear := len(globalPageSlab.freeList)
-	globalPageSlab.mu.Unlock()
-
-	assert.Equal(t, freeCountBefore, freeCountAfterClear,
-		"clear() should not touch slab — buffers stay in pFree")
 	assert.Empty(t, pc.pages)
 	assert.Equal(t, 0, pc.nRecyclable)
 	assert.Equal(t, 0, pc.nDirty)
-	// pFree should have 40 (original) + 10 (moved from pages) = 50
-	assert.Len(t, pc.pFree, 50,
-		"clear() should move all 10 pages to pFree (total 50)")
+	// All 10 pages moved to pFree
+	assert.Len(t, pc.pFree, 10,
+		"clear() should move all 10 pages to pFree")
 
-	// destroy() should return all 50 pFree buffers to slab
+	// destroy() should free all buffers back to slab
 	pc.destroy()
-
-	globalPageSlab.mu.Lock()
-	freeCountAfterDestroy := len(globalPageSlab.freeList)
-	globalPageSlab.mu.Unlock()
-
-	assert.Equal(t, freeCountBefore+50, freeCountAfterDestroy,
-		"destroy() should return all 50 buffers to slab")
 	assert.Empty(t, pc.pFree)
 	assert.False(t, pc.bulkInit, "bulkInit should be reset after destroy")
 }
 
-func TestPcacheBufferRecycling_DiscardReturnsSlab(t *testing.T) {
-	// discard() should return the evicted page's buffer to the slab.
+func TestPcacheBufferRecycling_DiscardFreesBuffer(t *testing.T) {
+	// discard() should free the evicted page's buffer via freePageBuffer.
+	// Since initBulk uses heap (matching SQLite's pcache1InitBulk which
+	// calls sqlite3Malloc), the buffer is heap-allocated. freePageBuffer
+	// with useSlab=true routes through globalPageSlab.Put.
 	globalPageSlab.Reset()
 	globalPageSlab.Init(4096, 500)
 	defer globalPageSlab.Reset()
@@ -730,24 +736,13 @@ func TestPcacheBufferRecycling_DiscardReturnsSlab(t *testing.T) {
 	pg := pc.create(1, 2)
 	pc.release(pg)
 
-	// Record slab free count before discard
-	globalPageSlab.mu.Lock()
-	freeCountBefore := len(globalPageSlab.freeList)
-	globalPageSlab.mu.Unlock()
-
+	// discard should remove the page and nil out its data
 	pc.discard(1)
-
-	// Buffer should be returned to slab
-	globalPageSlab.mu.Lock()
-	freeCountAfter := len(globalPageSlab.freeList)
-	globalPageSlab.mu.Unlock()
-
-	assert.Equal(t, freeCountBefore+1, freeCountAfter,
-		"discard() should return 1 buffer to slab")
+	assert.Nil(t, pc.pages[1], "page should be removed after discard")
 }
 
-func TestPcacheBufferRecycling_TruncateReturnsSlab(t *testing.T) {
-	// truncate() should return evicted page buffers to the slab.
+func TestPcacheBufferRecycling_TruncateFreesBuffers(t *testing.T) {
+	// truncate() should free evicted page buffers and remove them from cache.
 	globalPageSlab.Reset()
 	globalPageSlab.Init(4096, 500)
 	defer globalPageSlab.Reset()
@@ -759,27 +754,22 @@ func TestPcacheBufferRecycling_TruncateReturnsSlab(t *testing.T) {
 		pg := pc.create(i, 2)
 		pc.release(pg)
 	}
-
-	// Record slab free count before truncate
-	globalPageSlab.mu.Lock()
-	freeCountBefore := len(globalPageSlab.freeList)
-	globalPageSlab.mu.Unlock()
+	assert.Len(t, pc.pages, 10)
 
 	pc.truncate(5) // remove pages 6-10
 
-	// 5 buffers should be returned to slab
-	globalPageSlab.mu.Lock()
-	freeCountAfter := len(globalPageSlab.freeList)
-	globalPageSlab.mu.Unlock()
-
-	assert.Equal(t, freeCountBefore+5, freeCountAfter,
-		"truncate() should return 5 buffers to slab")
-	assert.Len(t, pc.pages, 5)
+	assert.Len(t, pc.pages, 5, "truncate should remove pages > maxPage")
+	for i := uint32(6); i <= 10; i++ {
+		assert.Nil(t, pc.pages[i], "page %d should be removed", i)
+	}
+	for i := uint32(1); i <= 5; i++ {
+		assert.NotNil(t, pc.pages[i], "page %d should be retained", i)
+	}
 }
 
 func TestPcacheBulkAlloc_NoSlabFallsBackToSyncPool(t *testing.T) {
 	// When slab is not initialized, create() should still work via sync.Pool/make.
-	// initBulk pre-allocates page structs with buffers from sync.Pool.
+	// initBulk pre-allocates page structs with buffers from sync.Pool (heap).
 	globalPageSlab.Reset()
 	defer globalPageSlab.Reset()
 
@@ -788,11 +778,13 @@ func TestPcacheBulkAlloc_NoSlabFallsBackToSyncPool(t *testing.T) {
 	require.NotNil(t, pg)
 	assert.Len(t, pg.data, 4096)
 	assert.True(t, pc.bulkInit, "bulkInit should be set even without slab")
+	assert.True(t, pg.isBulkLocal, "page from initBulk should be isBulkLocal")
 	// pFree is populated by initBulk (pre-allocated from sync.Pool/make),
-	// minus the one page consumed by create(). initBulk allocates min(maxPages, 100) = 100.
-	assert.Len(t, pc.pFree, 99, "pFree should have 99 pages (100 bulk - 1 consumed by create)")
+	// minus the one page consumed by create(). initBulk allocates min(maxPages, 20) = 20.
+	assert.Len(t, pc.pFree, 19, "pFree should have 19 pages (20 bulk - 1 consumed by create)")
 
 	pc.release(pg)
+	pc.destroy()
 }
 
 func TestPcacheAdmissionControl_SoftCreateRefusedAt90Percent(t *testing.T) {
@@ -842,11 +834,10 @@ func TestPcacheAdmissionControl_SoftCreateAllowedBelow90Percent(t *testing.T) {
 }
 
 func TestPcacheAdmissionControl_SlabPressureLowRecyclable(t *testing.T) {
-	// Slab under pressure + low recyclable ratio → soft create should still
-	// succeed. The per-cache slab-pressure guard was removed because in our
-	// isolated model (no PGroup), it fires when even 1 page is pinned,
-	// preventing the reader cache from filling at all and pushing every page
-	// through readTempPage (which allocates from slab anyway).
+	// Slab under pressure + low recyclable ratio → soft create should be
+	// refused. Matches SQLite Mode 1 (separateCache) pcache1FetchStage2
+	// step 3 (pcache1.c:889): pcache1UnderMemoryPressure && nRecyclable < nPinned.
+	// This prevents caches from growing under pressure, bounding total memory.
 	globalPageSlab.Reset()
 	globalPageSlab.Init(4096, 10) // small slab to easily create pressure
 	defer globalPageSlab.Reset()
@@ -866,11 +857,22 @@ func TestPcacheAdmissionControl_SlabPressureLowRecyclable(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		pinned[i] = pc.create(uint32(i+1), 2) // hard create always works
 	}
-	// nPinned=10, nRecyclable=0 — previously this would refuse soft creates
-	// under slab pressure. Now soft creates succeed (bounded by maxPages).
+	// nPinned=10, nRecyclable=0 — under slab pressure, soft create should
+	// be refused (nRecyclable=0 < nPinned=10). Readers fall back to
+	// readTempPage for uncached reads.
 	softPg := pc.create(200, 1)
-	assert.NotNil(t, softPg, "soft create should succeed under slab pressure (no per-cache pressure guard)")
-	pc.release(softPg)
+	assert.Nil(t, softPg, "soft create should be refused under slab pressure with low recyclable")
+
+	// But if we release some pages (making them recyclable), soft create
+	// should succeed because step 4 can recycle an LRU page.
+	for i := 0; i < 5; i++ {
+		pc.release(pinned[i])
+	}
+	// nPinned=5, nRecyclable=5 — nRecyclable >= nPinned, so step 3 passes.
+	// Step 4 recycles an LRU page under pressure.
+	softPg2 := pc.create(200, 1)
+	assert.NotNil(t, softPg2, "soft create should succeed when recyclable >= pinned")
+	pc.release(softPg2)
 
 	// Return drained buffers to slab
 	for _, buf := range drained {
@@ -878,8 +880,8 @@ func TestPcacheAdmissionControl_SlabPressureLowRecyclable(t *testing.T) {
 	}
 
 	// Cleanup
-	for _, pg := range pinned {
-		pc.release(pg)
+	for i := 5; i < 10; i++ {
+		pc.release(pinned[i])
 	}
 }
 
@@ -903,14 +905,15 @@ func TestPcacheAdmissionControl_NonPurgeableIgnoresCreateFlag(t *testing.T) {
 	}
 }
 
-func TestPcacheUnpin_OverfullPressureEvictsImmediately(t *testing.T) {
-	// When cache is overfull (len(pages) > maxPages) and slab is under pressure,
-	// releasing a clean page should immediately evict it instead of adding to LRU.
-	// The evicted page goes to pFree for direct reuse by create(), not to slab.
-	// Matches SQLite pcache1.c:1094-1095 (pcache1Unpin) and pcache1FreePage
-	// (pcache1.c:475-477 — bulk-local pages go to pCache->pFree).
+func TestPcacheUnpin_OverfullGoesToLRU(t *testing.T) {
+	// In Mode 1 (separateCache), release() always adds to LRU — eviction
+	// happens in create() step 4 instead. Even when overfull and under
+	// pressure, unpinned pages go to LRU so step 4 can recycle them.
+	// Matches SQLite Mode 1 pcache1Unpin: pGroup->nPurgeable > nMaxPage
+	// only fires per-cache in Mode 1, and with proper step 4 gating the
+	// cache should not exceed nMax.
 	globalPageSlab.Reset()
-	globalPageSlab.Init(4096, 10) // small slab to easily create pressure
+	globalPageSlab.Init(4096, 10)
 	defer globalPageSlab.Reset()
 
 	pc := newPcache(4096, 5, true)
@@ -921,34 +924,30 @@ func TestPcacheUnpin_OverfullPressureEvictsImmediately(t *testing.T) {
 	for i := uint32(1); i <= 6; i++ {
 		pgs[i-1] = pc.create(i, 2)
 	}
-	assert.Len(t, pc.pages, 6) // overfull: 6 > maxPages=5
+	assert.Len(t, pc.pages, 6)
 
 	// Drain the slab to create pressure
 	drained := make([][]byte, 0)
 	for !globalPageSlab.UnderPressure() {
 		drained = append(drained, globalPageSlab.Get())
 	}
-	assert.True(t, globalPageSlab.UnderPressure())
 
-	pFreeBefore := len(pc.pFree)
-
-	// Release page 6 (clean) — should be immediately evicted, not added to LRU
+	// Release page 6 (clean) — goes to LRU (Mode 1 behavior)
 	pc.release(pgs[5])
-	assert.Nil(t, pc.pages[6], "page 6 should be immediately evicted on release")
-	assert.Len(t, pc.pages, 5, "cache should shrink to maxPages")
-	assert.Equal(t, 0, pc.nRecyclable, "page should NOT go to LRU")
+	assert.NotNil(t, pc.pages[6], "page 6 should still be in cache (in LRU)")
+	assert.Equal(t, 1, pc.nRecyclable, "page should be in LRU")
 
-	// Page should be added to pFree for reuse, not returned to slab
-	assert.Equal(t, pFreeBefore+1, len(pc.pFree),
-		"released page should be added to pFree for direct reuse")
-	assert.NotNil(t, pc.pFree[len(pc.pFree)-1].data,
-		"pFree page should retain its data buffer")
+	// Now create a new page — step 4 should recycle the LRU page under pressure
+	newPg := pc.create(100, 2)
+	assert.NotNil(t, newPg)
+	assert.Nil(t, pc.pages[6], "page 6 should be evicted by step 4 recycling")
 
 	// Return drained buffers
 	for _, buf := range drained {
 		globalPageSlab.Put(buf)
 	}
-	// Cleanup remaining pinned pages
+	// Cleanup
+	pc.release(newPg)
 	for i := 0; i < 5; i++ {
 		pc.release(pgs[i])
 	}

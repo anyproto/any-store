@@ -310,15 +310,16 @@ func (ph *pageHeader) deserialize(buf []byte) {
 
 // page represents an in-memory database page.
 type page struct {
-	data     []byte     // raw page data
-	next     *page      // page cache linked list
-	prev     *page      // page cache linked list
-	cache    *pcache    // owning page cache (nil for uncached/temp pages)
-	pinCount int        // reference count
-	header   pageHeader // parsed page header
-	pgno     uint32     // page number (1-based)
-	dirty    bool       // true if page has been modified
-	uncached bool       // true if page is not in the shared cache (MVCC snapshot copy)
+	data        []byte     // raw page data
+	next        *page      // page cache linked list
+	prev        *page      // page cache linked list
+	cache       *pcache    // owning page cache (nil for uncached/temp pages)
+	pinCount    int        // reference count
+	header      pageHeader // parsed page header
+	pgno        uint32     // page number (1-based)
+	dirty       bool       // true if page has been modified
+	uncached    bool       // true if page is not in the shared cache (MVCC snapshot copy)
+	isBulkLocal bool       // true for pages from initBulk (heap-allocated); matches SQLite pcache1.c:184
 }
 
 // usableSize returns the usable size of the page (total minus reserved).

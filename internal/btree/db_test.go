@@ -3526,3 +3526,141 @@ func TestPersistentReaderCache_ConcurrentReadersDoNotCorrupt(t *testing.T) {
 	stop.Store(true)
 	wg.Wait()
 }
+
+// TestSlabHeapBound_MultiDB opens 100 databases with UsePageSlab=true and a
+// fixed slab budget, then performs heavy inserts across all of them. The heap
+// should stay bounded by the slab size — overflow allocations must be reclaimed
+// by GC, not hoarded.
+func TestSlabHeapBound_MultiDB(t *testing.T) {
+	const (
+		numDBs       = 100
+		slabPages    = 5000 // 5000 * 4096 = 20MB slab budget
+		pageSize     = 4096
+		insertsPerDB = 500
+		valueSize    = 200
+	)
+
+	globalPageSlab.Reset()
+	globalPageSlab.Init(pageSize, slabPages)
+	defer globalPageSlab.Reset()
+
+	dir := t.TempDir()
+
+	// Open 100 databases, all sharing the global slab
+	dbs := make([]*DB, numDBs)
+	namespaces := make([]*Namespace, numDBs)
+	for i := range numDBs {
+		opts := DefaultOptions()
+		opts.UsePageSlab = true
+		opts.CacheSize = 200 // small cache per DB to force eviction
+		opts.MaxReaders = 2
+		opts.InProcess = true
+		opts.NoCommitSync = true
+		opts.AutoCheckpointAfter = 100
+
+		dbPath := filepath.Join(dir, fmt.Sprintf("db_%03d.db", i))
+		db, err := Open(dbPath, opts)
+		require.NoError(t, err, "open db %d", i)
+		dbs[i] = db
+
+		// Create a namespace in each DB
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns, err := wtx.CreateNamespace("data")
+		require.NoError(t, err)
+		require.NoError(t, wtx.Commit())
+		namespaces[i] = ns
+	}
+	defer func() {
+		for _, db := range dbs {
+			if db != nil {
+				_ = db.Close()
+			}
+		}
+	}()
+
+	// Force GC to establish baseline
+	runtime.GC()
+	debug.FreeOSMemory()
+	var memBefore runtime.MemStats
+	runtime.ReadMemStats(&memBefore)
+
+	// Heavy inserts across all databases
+	val := make([]byte, valueSize)
+	for round := 0; round < insertsPerDB; round++ {
+		for i, db := range dbs {
+			wtx, err := db.BeginWrite()
+			require.NoError(t, err, "begin write db=%d round=%d", i, round)
+			key := binary.BigEndian.AppendUint32(nil, uint32(round))
+			require.NoError(t, wtx.Put(namespaces[i], key, val), "put db=%d round=%d", i, round)
+			require.NoError(t, wtx.Commit(), "commit db=%d round=%d", i, round)
+		}
+		// Periodically force GC to reclaim overflow buffers
+		if round%100 == 99 {
+			runtime.GC()
+		}
+	}
+
+	// Also do some reads to exercise reader caches
+	for i, db := range dbs {
+		rtx, err := db.BeginRead()
+		require.NoError(t, err, "begin read db=%d", i)
+		for j := 0; j < 50; j++ {
+			key := binary.BigEndian.AppendUint32(nil, uint32(j))
+			_, _ = rtx.Get(namespaces[i], key)
+		}
+		require.NoError(t, rtx.Rollback())
+	}
+
+	// Force GC and measure heap
+	runtime.GC()
+	debug.FreeOSMemory()
+	var memAfter runtime.MemStats
+	runtime.ReadMemStats(&memAfter)
+
+	slabBytes := uint64(slabPages) * uint64(pageSize) // 20MB
+	heapInUse := memAfter.HeapInuse - memBefore.HeapInuse
+
+	// Count pages held across all caches
+	var totalWriterPages, totalWriterPFree, totalWriterRecyclable int
+	var totalReaderPages, totalReaderPFree int
+	for _, db := range dbs {
+		totalWriterPages += len(db.pager.writerCache.pages)
+		totalWriterPFree += len(db.pager.writerCache.pFree)
+		totalWriterRecyclable += db.pager.writerCache.nRecyclable
+	drainLoop:
+		for {
+			select {
+			case c := <-db.readerCaches:
+				totalReaderPages += len(c.pages)
+				totalReaderPFree += len(c.pFree)
+				db.readerCaches <- c
+				break drainLoop
+			default:
+				break drainLoop
+			}
+		}
+	}
+
+	t.Logf("slab budget: %d MB", slabBytes/(1<<20))
+	t.Logf("heap in-use delta: %d MB (before=%d MB, after=%d MB)",
+		heapInUse/(1<<20), memBefore.HeapInuse/(1<<20), memAfter.HeapInuse/(1<<20))
+	t.Logf("slab overflow count: %d", globalPageSlab.nOverflow)
+	t.Logf("slab free list: %d / %d", len(globalPageSlab.freeList), globalPageSlab.nSlab)
+	t.Logf("slab under pressure: %v", globalPageSlab.UnderPressure())
+	t.Logf("writer caches: pages=%d pFree=%d recyclable=%d",
+		totalWriterPages, totalWriterPFree, totalWriterRecyclable)
+	t.Logf("reader caches: pages=%d pFree=%d",
+		totalReaderPages, totalReaderPFree)
+
+	// Heap growth should not exceed 2x the slab budget.
+	// The slab is 20MB; with 100 DBs and proper eviction, overflow buffers
+	// should be GC'd. Allow 2x headroom for Go runtime overhead, stack,
+	// map buckets, page structs, etc.
+	maxAllowed := slabBytes * 2
+	if heapInUse > maxAllowed {
+		t.Errorf("heap grew by %d MB, exceeds 2x slab budget (%d MB); "+
+			"overflow buffers may not be reclaimed",
+			heapInUse/(1<<20), maxAllowed/(1<<20))
+	}
+}
