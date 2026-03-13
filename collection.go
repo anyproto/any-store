@@ -574,11 +574,7 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 
 	// Persist the sketch
 	skKey := sketchKey(c.name, info.Name)
-	buf := c.db.syncPool.GetDocBuf()
-	buf.DocBuf = idx.sketch.MarshalBinary(buf.DocBuf)
-	err = tx.Put(c.db.systemNS, skKey, buf.DocBuf)
-	c.db.syncPool.ReleaseDocBuf(buf)
-	if err != nil {
+	if err = tx.Put(c.db.systemNS, skKey, idx.sketch.MarshalBinary(nil)); err != nil {
 		return nil, err
 	}
 	idx.sketchModified = false
@@ -749,12 +745,12 @@ func (c *collection) loadSketch(tx *btree.ReadTx, idx *index) {
 }
 
 // persistSketches writes all modified sketches to the _system namespace.
-func (c *collection) persistSketches(tx *btree.WriteTx, buf *syncpool.DocBuffer) error {
+func (c *collection) persistSketches(tx *btree.WriteTx) error {
 	for _, idx := range c.indexes {
 		if idx.sketchModified {
 			key := sketchKey(c.name, idx.info.Name)
-			buf.DocBuf = idx.sketch.MarshalBinary(buf.DocBuf)
-			if err := tx.Put(c.db.systemNS, key, buf.DocBuf); err != nil {
+			idx.sketchBuf = idx.sketch.MarshalBinary(idx.sketchBuf)
+			if err := tx.Put(c.db.systemNS, key, idx.sketchBuf); err != nil {
 				return err
 			}
 			idx.sketchModified = false

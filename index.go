@@ -66,6 +66,7 @@ type index struct {
 	reverse    []bool
 
 	sketch         *qplanner.IndexSketch
+	sketchBuf      []byte
 	sketchModified bool
 
 	cboInfo *qplanner.IndexInfo // cached CBO index info, built once during init
