@@ -1741,6 +1741,13 @@ func (p *pager) tryCheckpoint() error {
 // writeOverflowChain writes data to a chain of overflow pages and returns
 // the first page number in the chain.
 func (p *pager) writeOverflowChain(data []byte) (uint32, error) {
+	return p.writeOverflowChainMulti(data)
+}
+
+// writeOverflowChainMulti writes multiple data segments to a chain of overflow
+// pages without assembling them into a contiguous intermediate buffer.
+// This matches SQLite's fillInCell streaming pattern (btree.c:7158-7239).
+func (p *pager) writeOverflowChainMulti(segments ...[]byte) (uint32, error) {
 	if pagerState(p.state.Load()) != pagerWriter {
 		return 0, ErrReadOnly
 	}
@@ -1748,37 +1755,49 @@ func (p *pager) writeOverflowChain(data []byte) (uint32, error) {
 	usable := overflowPageUsable(p.usableSize())
 	var firstPgno uint32
 	var prevPg *page
-	origDataLen := len(data)
+	var totalLen int
 
-	for len(data) > 0 {
-		pg, err := p.allocatePage()
-		if err != nil {
-			return 0, err
-		}
-		if firstPgno == 0 {
-			firstPgno = pg.pgno
-		}
-		if prevPg != nil {
-			// Set next pointer on previous page
-			binary.BigEndian.PutUint32(prevPg.data[0:4], pg.pgno)
-			p.releasePage(prevPg)
-		}
+	// Current page write position
+	var pg *page
+	spaceLeft := 0
 
-		// Write next pointer (0 = last page for now) and data
-		binary.BigEndian.PutUint32(pg.data[0:4], 0)
-		chunk := usable
-		if chunk > len(data) {
-			chunk = len(data)
+	for _, seg := range segments {
+		totalLen += len(seg)
+		for len(seg) > 0 {
+			if spaceLeft == 0 {
+				// Allocate a new overflow page
+				var err error
+				newPg, err := p.allocatePage()
+				if err != nil {
+					return 0, err
+				}
+				if firstPgno == 0 {
+					firstPgno = newPg.pgno
+				}
+				if prevPg != nil {
+					binary.BigEndian.PutUint32(prevPg.data[0:4], newPg.pgno)
+					p.releasePage(prevPg)
+				}
+				binary.BigEndian.PutUint32(newPg.data[0:4], 0)
+				pg = newPg
+				prevPg = pg
+				spaceLeft = usable
+			}
+
+			n := len(seg)
+			if n > spaceLeft {
+				n = spaceLeft
+			}
+			copy(pg.data[4+usable-spaceLeft:], seg[:n])
+			seg = seg[n:]
+			spaceLeft -= n
 		}
-		copy(pg.data[4:4+chunk], data[:chunk])
-		data = data[chunk:]
-		prevPg = pg
 	}
 	if prevPg != nil {
 		p.releasePage(prevPg)
 	}
 	if debugTrace {
-		trace("writeOverflowChain: firstPg=%d totalDataLen=%d", firstPgno, origDataLen)
+		trace("writeOverflowChain: firstPg=%d totalDataLen=%d", firstPgno, totalLen)
 	}
 	return firstPgno, nil
 }

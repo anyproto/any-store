@@ -1242,14 +1242,12 @@ func (bt *btree) insertLeafCellAt(pg *page, idx int, key, value []byte) error {
 		nLocal := localPayloadSize(totalPayload, pageUsable)
 		localKeyBytes := min(nLocal, len(key))
 		localValBytes := nLocal - localKeyBytes
-		// Build overflow data: key remainder (if any) + value remainder
-		overflowData := make([]byte, 0, totalPayload-nLocal)
-		if localKeyBytes < len(key) {
-			overflowData = append(overflowData, key[localKeyBytes:]...)
-		}
-		overflowData = append(overflowData, value[localValBytes:]...)
+		// Stream key remainder + value remainder directly to overflow pages
+		// without intermediate buffer (matches SQLite fillInCell pattern).
 		var err error
-		overflowPgno, err = bt.pager.writeOverflowChain(overflowData)
+		overflowPgno, err = bt.pager.writeOverflowChainMulti(
+			key[localKeyBytes:], value[localValBytes:],
+		)
 		if err != nil {
 			return err
 		}
@@ -1340,12 +1338,9 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []uin
 			nLocal := localPayloadSize(totalPayload, usableSize)
 			localKeyBytes := min(nLocal, len(key))
 			localValBytes := nLocal - localKeyBytes
-			overflowData := make([]byte, 0, totalPayload-nLocal)
-			if localKeyBytes < len(key) {
-				overflowData = append(overflowData, key[localKeyBytes:]...)
-			}
-			overflowData = append(overflowData, value[localValBytes:]...)
-			overflowPgno, err := bt.pager.writeOverflowChain(overflowData)
+			overflowPgno, err := bt.pager.writeOverflowChainMulti(
+				key[localKeyBytes:], value[localValBytes:],
+			)
 			if err != nil {
 				return err
 			}
@@ -1644,12 +1639,9 @@ func (bt *btree) rebuildLeafPage(pg *page, cells []cellData) error {
 				nLocal := localPayloadSize(totalPayload, pageUsable)
 				localKeyBytes := min(nLocal, len(c.key))
 				localValBytes := nLocal - localKeyBytes
-				overflowData := make([]byte, 0, totalPayload-nLocal)
-				if localKeyBytes < len(c.key) {
-					overflowData = append(overflowData, c.key[localKeyBytes:]...)
-				}
-				overflowData = append(overflowData, c.value[localValBytes:]...)
-				overflowPgno, err := bt.pager.writeOverflowChain(overflowData)
+				overflowPgno, err := bt.pager.writeOverflowChainMulti(
+					c.key[localKeyBytes:], c.value[localValBytes:],
+				)
 				if err != nil {
 					return err
 				}
