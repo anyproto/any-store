@@ -1169,8 +1169,10 @@ func (bt *btree) insertIntoLeafWithPath(pg *page, key, value []byte, path []uint
 	// when the gap is insufficient but total free space is enough.
 	totalFree := gapSpace + int(pg.header.fragBytes)
 	if cellSize+2 <= totalFree {
-		cells := bt.collectLeafCells(pg)
-		if err := bt.rebuildLeafPage(pg, cells); err != nil {
+		cells, cellBuf := bt.collectLeafCells(pg)
+		err := bt.rebuildLeafPage(pg, cells)
+		bt.pager.recycleCellBuf(cellBuf)
+		if err != nil {
 			return err
 		}
 		return bt.insertLeafCellAt(pg, idx, key, value)
@@ -1212,8 +1214,10 @@ func (bt *btree) insertIntoLeaf(pg *page, key, value []byte) error {
 	// Check if defragmentation would free enough space
 	totalFree := gapSpace + int(pg.header.fragBytes)
 	if cellSize+2 <= totalFree {
-		cells := bt.collectLeafCells(pg)
-		if err := bt.rebuildLeafPage(pg, cells); err != nil {
+		cells, cellBuf := bt.collectLeafCells(pg)
+		err := bt.rebuildLeafPage(pg, cells)
+		bt.pager.recycleCellBuf(cellBuf)
+		if err != nil {
 			return err
 		}
 		return bt.insertLeafCellAt(pg, idx, key, value)
@@ -1377,7 +1381,8 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []uin
 	// Slow path: new cell doesn't fit or too much fragmentation.
 	// collectLeafCells preserves overflow chains (raw passthrough).
 	// Free overflow only for the cell being replaced.
-	cells := bt.collectLeafCells(pg)
+	cells, cellBuf := bt.collectLeafCells(pg)
+	defer bt.pager.recycleCellBuf(cellBuf)
 	if cells[idx].overflowPg != 0 {
 		_ = bt.pager.freeOverflowChain(cells[idx].overflowPg)
 	}
@@ -1442,10 +1447,17 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []uin
 // are copied into the buffer and stored in rawCell for passthrough during rebuildLeafPage.
 // This matches SQLite's balance_nonroot which never reads or frees overflow data during
 // rebalancing — overflow chains are only created/destroyed when cell content actually changes.
-func (bt *btree) collectLeafCells(pg *page) []cellData {
+//
+// Uses pager.cellBuf as reusable scratch space, modeled after SQLite's
+// Pager.pTmpSpace (pager.c). The buffer is "taken" from the pager on each call
+// and "returned" by the caller via pager.recycleCellBuf after the cells are
+// consumed. The take-and-nil pattern handles the merge path (two overlapping
+// calls) — the second call finds nil and allocates fresh.
+func (bt *btree) collectLeafCells(pg *page) ([]cellData, []byte) {
 	n := int(pg.header.cellCount)
 	cells := make([]cellData, n, n+1) // +1 cap: callers insert one more cell after collecting
 	usableSize := bt.usablePageSize()
+
 	// Estimate actual content size from page header to avoid over-allocation.
 	// Validate contentOff to avoid negative capacity from corrupted headers.
 	// Matches SQLite's allocateSpace() validation (btree.c lines 1843-1853).
@@ -1457,14 +1469,19 @@ func (bt *btree) collectLeafCells(pg *page) []cellData {
 	if contentSize < 0 {
 		contentSize = 0
 	}
-	buf := make([]byte, 0, contentSize)
+
+	// Take pager's reusable buffer if available (set to nil so overlapping
+	// calls like the merge path each get their own buffer). Callers return
+	// the buffer via bt.pager.recycleCellBuf after consuming the cells.
+	buf := bt.pager.takeCellBuf(contentSize)
+	if buf == nil {
+		buf = make([]byte, 0, contentSize)
+	}
+
 	for i := range n {
 		off := pg.getCellOffset(i)
-		cells[i], _, _ = parseLeafCellWithSize(pg.data, int(off), usableSize)
-
-		// Compute the raw cell size (bytes consumed on page by parseLeafCellWithSize).
-		// Re-parse to get bytesRead since parseLeafCellWithSize already returned it.
-		_, bytesRead, _ := parseLeafCellWithSize(pg.data, int(off), usableSize)
+		var bytesRead int
+		cells[i], bytesRead, _ = parseLeafCellWithSize(pg.data, int(off), usableSize)
 
 		// Copy raw cell bytes into contiguous buffer for passthrough.
 		rcStart := len(buf)
@@ -1491,7 +1508,7 @@ func (bt *btree) collectLeafCells(pg *page) []cellData {
 			cells[i].value = buf[vStart:len(buf)]
 		}
 	}
-	return cells
+	return cells, buf
 }
 
 // cellFullKey returns the full key for a cell collected by collectLeafCells.
@@ -1529,6 +1546,10 @@ func (bt *btree) cellFullKey(c *cellData) ([]byte, error) {
 // collectInteriorCells reads all cells from an interior page.
 // For cells with overflow keys, the full key is read from overflow pages
 // and the overflow chain is freed (since the caller will rebuild the page).
+//
+// Uses pager.cellBuf as reusable scratch space (same buffer as collectLeafCells;
+// callers never interleave leaf and interior collection). Self-recycles the
+// buffer back to the pager at the end since interior collection never overlaps.
 func (bt *btree) collectInteriorCells(pg *page) []cellData {
 	n := int(pg.header.cellCount)
 	cells := make([]cellData, n)
@@ -1544,7 +1565,12 @@ func (bt *btree) collectInteriorCells(pg *page) []cellData {
 	if contentSize < 0 {
 		contentSize = 0
 	}
-	buf := make([]byte, 0, contentSize)
+
+	// Take pager's reusable buffer.
+	buf := bt.pager.takeCellBuf(contentSize)
+	if buf == nil {
+		buf = make([]byte, 0, contentSize)
+	}
 
 	for i := range n {
 		off := pg.getCellOffset(i)
@@ -1575,6 +1601,9 @@ func (bt *btree) collectInteriorCells(pg *page) []cellData {
 		}
 		_ = maxLocal
 	}
+
+	// Return buffer to pager for reuse.
+	bt.pager.recycleCellBuf(buf)
 	return cells
 }
 
@@ -1705,7 +1734,7 @@ func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint
 
 // splitLeafAndInsertWithPath splits a leaf page using the path for parent propagation.
 func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte, path []uint32) error {
-	cells := bt.collectLeafCells(pg)
+	cells, cellBuf := bt.collectLeafCells(pg)
 
 	// Clone key+value into a single allocation.
 	combined := make([]byte, len(key)+len(value))
@@ -1735,11 +1764,14 @@ func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte
 	}
 
 	if err := bt.rebuildLeafPage(pg, leftCells); err != nil {
+		bt.pager.recycleCellBuf(cellBuf)
 		return err
 	}
 	if err := bt.rebuildLeafPage(rightPg, rightCells); err != nil {
+		bt.pager.recycleCellBuf(cellBuf)
 		return err
 	}
+	bt.pager.recycleCellBuf(cellBuf)
 	bt.pager.releasePage(rightPg)
 
 	return bt.insertIntoParentWithPath(pg, sepKey, rightPg.pgno, path)
@@ -1926,7 +1958,7 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 
 // splitLeafAndInsert splits a leaf page and inserts the new key-value pair.
 func (bt *btree) splitLeafAndInsert(pg *page, idx int, key, value []byte) error {
-	cells := bt.collectLeafCells(pg)
+	cells, cellBuf := bt.collectLeafCells(pg)
 
 	// Insert the new cell at the correct position.
 	// Clone key+value into a single allocation.
@@ -1959,13 +1991,16 @@ func (bt *btree) splitLeafAndInsert(pg *page, idx int, key, value []byte) error 
 
 	// Rebuild left page (reuse current page)
 	if err := bt.rebuildLeafPage(pg, leftCells); err != nil {
+		bt.pager.recycleCellBuf(cellBuf)
 		return err
 	}
 
 	// Build right page
 	if err := bt.rebuildLeafPage(rightPg, rightCells); err != nil {
+		bt.pager.recycleCellBuf(cellBuf)
 		return err
 	}
+	bt.pager.recycleCellBuf(cellBuf)
 
 	bt.pager.releasePage(rightPg)
 
@@ -2039,9 +2074,11 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 	// appropriate collect/rebuild path so we don't misinterpret cell formats.
 	if oldRoot.header.isLeaf() {
 		// Leaf root: collect leaf cells and rebuild as leaf in the new page.
-		cells := bt.collectLeafCells(oldRoot)
+		cells, cellBuf := bt.collectLeafCells(oldRoot)
 		newLeftPg.header = oldRoot.header
-		if err := bt.rebuildLeafPage(newLeftPg, cells); err != nil {
+		err := bt.rebuildLeafPage(newLeftPg, cells)
+		bt.pager.recycleCellBuf(cellBuf)
+		if err != nil {
 			return err
 		}
 	} else {
@@ -2178,15 +2215,18 @@ func (bt *btree) Delete(key []byte) error {
 	if needsRebuild {
 		// Fall back to full rebuild. collectLeafCells preserves overflow chains,
 		// so we must explicitly free the deleted cell's overflow chain.
-		cells := bt.collectLeafCells(wpg)
+		cells, cellBuf := bt.collectLeafCells(wpg)
 		if cells[idx].overflowPg != 0 {
 			if err := bt.pager.freeOverflowChain(cells[idx].overflowPg); err != nil {
+				bt.pager.recycleCellBuf(cellBuf)
 				bt.pager.releasePage(wpg)
 				return err
 			}
 		}
 		cells = append(cells[:idx], cells[idx+1:]...)
-		if err := bt.rebuildLeafPage(wpg, cells); err != nil {
+		err := bt.rebuildLeafPage(wpg, cells)
+		bt.pager.recycleCellBuf(cellBuf)
+		if err != nil {
 			bt.pager.releasePage(wpg)
 			return err
 		}
@@ -2332,8 +2372,8 @@ func (bt *btree) tryMergeLeaf(leafPgno uint32, path []uint32) error {
 	}
 
 	// Merge will proceed. Collect cells (overflow chains are preserved via raw passthrough).
-	leafCells := bt.collectLeafCells(leafPg)
-	sibCells := bt.collectLeafCells(sibPg)
+	leafCells, leafCellBuf := bt.collectLeafCells(leafPg)
+	sibCells, sibCellBuf := bt.collectLeafCells(sibPg)
 	bt.pager.releasePage(leafPg)
 	bt.pager.releasePage(sibPg)
 
@@ -2358,11 +2398,16 @@ func (bt *btree) tryMergeLeaf(leafPgno uint32, path []uint32) error {
 
 	keepPg, err := bt.pager.getWritablePage(keepPgno)
 	if err != nil {
+		bt.pager.recycleCellBuf(leafCellBuf)
+		bt.pager.recycleCellBuf(sibCellBuf)
 		return err
 	}
-	if err := bt.rebuildLeafPage(keepPg, allCells); err != nil {
+	rebuildErr := bt.rebuildLeafPage(keepPg, allCells)
+	bt.pager.recycleCellBuf(leafCellBuf)
+	bt.pager.recycleCellBuf(sibCellBuf)
+	if rebuildErr != nil {
 		bt.pager.releasePage(keepPg)
-		return err
+		return rebuildErr
 	}
 	bt.pager.releasePage(keepPg)
 

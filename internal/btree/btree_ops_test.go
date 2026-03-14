@@ -1387,7 +1387,7 @@ func TestRebuildLeafPageWithOverflow(t *testing.T) {
 
 	// Verify raw passthrough round-trip: collect preserves overflow chains,
 	// rebuild copies raw cells, and the data is still readable via parsing.
-	got := bt.collectLeafCells(pg)
+	got, _ := bt.collectLeafCells(pg)
 	require.Len(t, got, 1)
 	assert.Equal(t, []byte("key"), got[0].key)
 	assert.NotNil(t, got[0].rawCell, "overflow cell should have rawCell set")
@@ -1579,7 +1579,7 @@ func TestCollectLeafCellsCorruptContentOff(t *testing.T) {
 		hdr = dbHeaderSize
 	}
 	pg.header.serialize(pg.data[hdr:])
-	got := bt.collectLeafCells(pg)
+	got, _ := bt.collectLeafCells(pg)
 	assert.Len(t, got, 2)
 	p.releasePage(pg)
 }
@@ -4744,7 +4744,7 @@ func TestCov_CollectLeafCellsContentSizeNeg(t *testing.T) {
 	}
 	pg.header.serialize(pg.data[hdr:])
 
-	cells := bt.collectLeafCells(pg)
+	cells, _ := bt.collectLeafCells(pg)
 	assert.Len(t, cells, 1)
 	p.releasePage(pg)
 }
@@ -4830,7 +4830,7 @@ func TestCov_CollectLeafCellsOverflowReadError(t *testing.T) {
 	}
 
 	// Now collectLeafCells should handle the error
-	cells := bt.collectLeafCells(pg)
+	cells, _ := bt.collectLeafCells(pg)
 	assert.Len(t, cells, 1)
 	bt.pager.releasePage(pg)
 	require.NoError(t, tx3.Rollback())

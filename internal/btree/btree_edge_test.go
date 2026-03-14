@@ -126,7 +126,7 @@ func TestFinal_CollectLeafCellsContentAreaError(t *testing.T) {
 	// Set cellContentOff to 0 (invalid - less than header size)
 	pg.header.cellContentOff = 0
 	// Don't serialize to page data since collectLeafCells reads pg.header directly
-	cells := bt.collectLeafCells(pg)
+	cells, _ := bt.collectLeafCells(pg)
 	p.releasePage(pg)
 	// Should not panic; contentOff fallback to usableSize
 	_ = cells
@@ -151,7 +151,7 @@ func TestFinal_CollectLeafCellsNegativeContentSize(t *testing.T) {
 	pg, err := p.getWritablePage(bt.rootPage)
 	require.NoError(t, err)
 	pg.header.cellContentOff = uint16(p.usableSize() + 10) // beyond usable → offset error → fallback
-	cells := bt.collectLeafCells(pg)
+	cells, _ := bt.collectLeafCells(pg)
 	p.releasePage(pg)
 	_ = cells
 }

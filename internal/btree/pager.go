@@ -118,6 +118,12 @@ type pager struct {
 	// Reusable slice for collecting dirty pages during commit
 	dirtyBuf []*page
 
+	// cellBuf is a reusable temp buffer for collectLeafCells / collectInteriorCells,
+	// matching SQLite's Pager.pTmpSpace (pager.c). Pre-allocated once at pager init
+	// and reused across defragment / balance / rebuild calls. Since writes are
+	// single-threaded, one buffer per pager is safe.
+	cellBuf []byte
+
 	// dontWritePages tracks pages that were dirtied but whose content doesn't
 	// need to be persisted (e.g., freed leaf pages added to a freelist trunk).
 	// Matches SQLite's PGHDR_DONT_WRITE flag (pager.c:6283). We use a map
@@ -188,6 +194,26 @@ func newPager(path string, pageSize uint32, cacheSize int, purgeable bool) *page
 	return p
 }
 
+// takeCellBuf returns the pager's reusable cell buffer if its capacity is >= minCap,
+// setting p.cellBuf to nil (take-and-nil pattern). Returns nil if no buffer is
+// available or it's too small. The caller owns the returned slice.
+func (p *pager) takeCellBuf(minCap int) []byte {
+	if p.cellBuf != nil && cap(p.cellBuf) >= minCap {
+		buf := p.cellBuf[:0]
+		p.cellBuf = nil
+		return buf
+	}
+	return nil
+}
+
+// recycleCellBuf returns a byte buffer to the pager for reuse. Keeps the larger
+// of the existing and returned buffers.
+func (p *pager) recycleCellBuf(buf []byte) {
+	if cap(buf) > cap(p.cellBuf) {
+		p.cellBuf = buf[:0]
+	}
+}
+
 // open opens the database file, initializes the WAL, and recovers if needed.
 func (p *pager) open() error {
 	p.mu.Lock()
@@ -234,6 +260,7 @@ func (p *pager) open() error {
 	p.pageSize = p.header.PageSize
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
 	p.dbSize.Store(p.header.DatabaseSize)
+	p.cellBuf = make([]byte, 0, p.usableSize_)
 	p.writerCache = newPcache(int(p.pageSize), p.writerCache.maxPages, p.writerCache.purgeable)
 	p.writerCache.useSlab = p.useSlab
 	p.writerCache.xStress = p.pagerStress
@@ -290,6 +317,7 @@ func (p *pager) initNewDB() error {
 		TextEncoding:     1, // UTF-8
 	}
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
+	p.cellBuf = make([]byte, 0, p.usableSize_)
 
 	// Create page 1 with the database header and an empty leaf table page
 	buf := make([]byte, p.pageSize)
