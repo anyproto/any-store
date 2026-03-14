@@ -1362,6 +1362,14 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 		p.writerCache.makeClean(pg)
 	}
 
+	// Truncate the cache to the current database size. Pages beyond dbSize
+	// are stale (freed during the transaction, e.g. from freelist growth or
+	// page consolidation) and must not accumulate across transactions.
+	// Matches SQLite pager_end_transaction (pager.c:2134):
+	//   sqlite3PcacheTruncate(pPager->pPCache, pPager->dbSize);
+	// which is called from sqlite3PagerCommitPhaseTwo (pager.c:6738).
+	p.writerCache.truncate(p.dbSize.Load())
+
 	p.freeSavepointPageBuffers(0, len(p.savepoints))
 	p.savepoints = p.savepoints[:0]
 	clear(p.dontWritePages)

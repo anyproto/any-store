@@ -289,11 +289,18 @@ func (pc *pcache) resetPage(p *page, pgno uint32) {
 // If the page is dirty, it moves to the front of the dirty list (MRU position).
 // Matches SQLite pcache.c:558 (pcacheManageDirtyList PCACHE_DIRTYLIST_FRONT on unpin).
 //
-// When the cache is overfull (len(pages) > maxPages) and the global slab is under
-// memory pressure, clean pages are immediately evicted instead of being added to
-// the LRU. Inspired by SQLite pcache1.c:1094 (pcache1Unpin). Our condition is
-// stricter: requires both global slab pressure AND per-cache overfull, whereas
-// SQLite uses an OR with reuseUnlikely || nPurgeable > nMaxPage at PGroup level.
+// When the cache is overfull (len(pages) > maxPages), clean pages are
+// immediately discarded instead of going to the LRU. Matches SQLite
+// pcache1Unpin (pcache1.c:1094-1095, Mode 1 separateCache):
+//
+//	if( reuseUnlikely || pGroup->nPurgeable>pGroup->nMaxPage ){
+//	    pcache1RemoveFromHash(pPage, 1);
+//	}
+//
+// In Mode 1, pGroup is per-cache, so nPurgeable>nMaxPage is equivalent
+// to nPage>nMax. This fires when createFlag=2 (hard create) lets the
+// cache grow beyond nMax during a transaction — the excess pages are
+// shed on release instead of accumulating in the LRU.
 func (pc *pcache) release(p *page) {
 	p.pinCount--
 	if p.pinCount <= 0 {
@@ -311,12 +318,16 @@ func (pc *pcache) release(p *page) {
 			// never evicted. Matches SQLite pcache.c:265-271 (pcacheUnpin is
 			// a no-op for non-purgeable caches).
 			//
-			// Matches SQLite Mode 1 (separateCache) pcache1Unpin: just add
-			// to LRU. Eviction happens in create() step 4, not here.
-			// In Mode 1, pGroup->nPurgeable > pGroup->nMaxPage is a per-cache
-			// check that only fires if create() let nPage exceed nMax (shouldn't
-			// happen with proper step 4 gating).
-			pc.lruPrepend(p)
+			// Overfull check: if cache grew beyond maxPages (e.g. from hard
+			// creates during a transaction), discard the page immediately
+			// rather than adding to LRU. Matches SQLite pcache1Unpin
+			// (pcache1.c:1094): pGroup->nPurgeable > pGroup->nMaxPage.
+			if len(pc.pages) > pc.maxPages {
+				delete(pc.pages, p.pgno)
+				pc.returnPageBuffer(p)
+			} else {
+				pc.lruPrepend(p)
+			}
 		}
 	}
 }

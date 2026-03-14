@@ -905,63 +905,17 @@ func TestPcacheAdmissionControl_NonPurgeableIgnoresCreateFlag(t *testing.T) {
 	}
 }
 
-func TestPcacheUnpin_OverfullGoesToLRU(t *testing.T) {
-	// In Mode 1 (separateCache), release() always adds to LRU — eviction
-	// happens in create() step 4 instead. Even when overfull and under
-	// pressure, unpinned pages go to LRU so step 4 can recycle them.
-	// Matches SQLite Mode 1 pcache1Unpin: pGroup->nPurgeable > nMaxPage
-	// only fires per-cache in Mode 1, and with proper step 4 gating the
-	// cache should not exceed nMax.
-	globalPageSlab.Reset()
-	globalPageSlab.Init(4096, 10)
-	defer globalPageSlab.Reset()
-
+func TestPcacheUnpin_OverfullDiscardsImmediately(t *testing.T) {
+	// When cache is overfull (len(pages) > maxPages), releasing a clean page
+	// discards it immediately instead of adding to LRU. Matches SQLite
+	// pcache1Unpin (pcache1.c:1094-1095):
+	//   if( reuseUnlikely || pGroup->nPurgeable>pGroup->nMaxPage ){
+	//       pcache1RemoveFromHash(pPage, 1);
+	//   }
+	// In Mode 1 (separateCache), pGroup is per-cache, so this is a per-cache
+	// overfull check. This prevents pages from accumulating in the LRU after
+	// transactions that grew the cache beyond maxPages via hard creates.
 	pc := newPcache(4096, 5, true)
-	pc.useSlab = true
-
-	// Create 6 pages with hard create (cache grows beyond maxPages=5)
-	pgs := make([]*page, 6)
-	for i := uint32(1); i <= 6; i++ {
-		pgs[i-1] = pc.create(i, 2)
-	}
-	assert.Len(t, pc.pages, 6)
-
-	// Drain the slab to create pressure
-	drained := make([][]byte, 0)
-	for !globalPageSlab.UnderPressure() {
-		drained = append(drained, globalPageSlab.Get())
-	}
-
-	// Release page 6 (clean) — goes to LRU (Mode 1 behavior)
-	pc.release(pgs[5])
-	assert.NotNil(t, pc.pages[6], "page 6 should still be in cache (in LRU)")
-	assert.Equal(t, 1, pc.nRecyclable, "page should be in LRU")
-
-	// Now create a new page — step 4 should recycle the LRU page under pressure
-	newPg := pc.create(100, 2)
-	assert.NotNil(t, newPg)
-	assert.Nil(t, pc.pages[6], "page 6 should be evicted by step 4 recycling")
-
-	// Return drained buffers
-	for _, buf := range drained {
-		globalPageSlab.Put(buf)
-	}
-	// Cleanup
-	pc.release(newPg)
-	for i := 0; i < 5; i++ {
-		pc.release(pgs[i])
-	}
-}
-
-func TestPcacheUnpin_OverfullNoPressureGoesToLRU(t *testing.T) {
-	// When cache is overfull but slab is NOT under pressure, released page
-	// should go to LRU normally (not immediately evicted).
-	globalPageSlab.Reset()
-	globalPageSlab.Init(4096, 500) // large slab, no pressure
-	defer globalPageSlab.Reset()
-
-	pc := newPcache(4096, 5, true)
-	pc.useSlab = true
 
 	// Create 6 pages with hard create (cache grows beyond maxPages=5)
 	pgs := make([]*page, 6)
@@ -969,16 +923,20 @@ func TestPcacheUnpin_OverfullNoPressureGoesToLRU(t *testing.T) {
 		pgs[i-1] = pc.create(i, 2)
 	}
 	assert.Len(t, pc.pages, 6) // overfull
-	assert.False(t, globalPageSlab.UnderPressure(), "slab should NOT be under pressure")
 
-	// Release page 6 — should go to LRU normally
+	// Release page 6 (clean) — should be discarded immediately (overfull)
 	pc.release(pgs[5])
-	assert.NotNil(t, pc.pages[6], "page 6 should still be in cache")
+	assert.Nil(t, pc.pages[6], "page 6 should be discarded when cache is overfull")
+	assert.Equal(t, 0, pc.nRecyclable, "page should NOT be in LRU")
+	assert.Len(t, pc.pages, 5, "cache should shrink back to maxPages")
+
+	// Release page 5 — cache is now at maxPages, should go to LRU normally
+	pc.release(pgs[4])
+	assert.NotNil(t, pc.pages[5], "page 5 should remain in cache (at maxPages)")
 	assert.Equal(t, 1, pc.nRecyclable, "page should be in LRU")
-	assert.Len(t, pc.pages, 6, "cache should remain overfull without pressure")
 
 	// Cleanup
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 4; i++ {
 		pc.release(pgs[i])
 	}
 }

@@ -1074,6 +1074,12 @@ type wal struct {
 	// Reusable write buffer to avoid per-commit allocations
 	writeBuf []byte
 
+	// ckptBuf is a reusable page-sized buffer for reading WAL frames during
+	// checkpoint backfill. Allocated lazily on first checkpoint. Matches
+	// SQLite's use of pTmpSpace in walCheckpoint (wal.c:2285-2304), though
+	// SQLite passes pTmpSpace from the pager rather than storing it on the WAL.
+	ckptBuf []byte
+
 	// headerOnDisk is false when the WAL file is empty (0 bytes) and the
 	// header has not yet been written to disk. The header is written lazily
 	// on the first writeFrames call. This matches SQLite's behavior where
@@ -2142,7 +2148,13 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 		frameSize := int64(walFrameSize) + int64(w.pageSize)
 		var frame walFrame
 		frameBuf := make([]byte, walFrameSize)
-		pageData := make([]byte, w.pageSize) // reused across iterations
+		// Reuse w.ckptBuf for page data reads, avoiding per-checkpoint allocations.
+		// Matches SQLite's walCheckpoint (wal.c:2285-2304) which reuses the
+		// pager's pTmpSpace buffer across the entire backfill loop.
+		if w.ckptBuf == nil {
+			w.ckptBuf = make([]byte, w.pageSize)
+		}
+		pageData := w.ckptBuf
 
 		for i := nBackfill; i < mxSafeFrame; i++ {
 			off := int64(walHeaderSize) + int64(i)*frameSize

@@ -483,8 +483,9 @@ sub-journaling for savepoints.
   always proceed
 - **`nRecyclable`**: count of unpinned clean pages in LRU, incremented in
   `lruPrepend`, decremented in `lruRemove`/`evictOne`
-- **Immediate eviction on unpin**: when cache is overfull and slab is under
-  pressure, clean pages are evicted on `release()` instead of entering LRU
+- **Immediate eviction on unpin**: when cache is overfull (`len(pages) > maxPages`),
+  clean pages are discarded on `release()` instead of entering LRU. Matches
+  SQLite `pcache1Unpin` (`pcache1.c:1094`): `pGroup->nPurgeable > pGroup->nMaxPage`
 - **Buffer lifecycle**: `clear()`, `discard()`, `truncate()` return data buffers
   to the global slab. `pFree` buffers also returned to slab on `clear()`
 - **Persistent reader cache**: reader caches are returned to `readerCachePool`
@@ -1240,9 +1241,10 @@ No SQLite equivalent — our addition for the many-open-databases scenario.
   caches (no `xStress`) return evicted buffers to the slab immediately in
   `create()`.
 - No `reuseUnlikely` on unpin: SQLite's `pcache1Unpin` accepts a
-  `reuseUnlikely` flag (`pcache1.c:1094-1095`); when true, pages are
-  immediately freed. Our `release()` only uses overfull+pressure for
-  immediate eviction. `sqlite3PcacheDrop` maps to our `discard()` method.
+  `reuseUnlikely` flag (`pcache1.c:1079`); when true, pages are immediately
+  freed. Our `release()` does not have this hint. Overfull eviction
+  (`len(pages) > maxPages`) matches SQLite's `pGroup->nPurgeable > nMaxPage`
+  check (`pcache1.c:1094`). `sqlite3PcacheDrop` maps to our `discard()` method.
 - Merged Fetch+FetchStress: SQLite splits page acquisition into
   `sqlite3PcacheFetch` (soft create, may return NULL) and
   `sqlite3PcacheFetchStress` (spill + hard retry) as separate calls from the
