@@ -472,7 +472,7 @@ sub-journaling for savepoints.
   `make()` overflow. `Put()` returns buffers. `UnderPressure()` atomic flag when
   free list drops below `nReserve` (10% + 1 of slab size)
 - **Per-cache bulk allocation** (`pcache.initBulk`): first `create()` call
-  pre-allocates up to 100 page structs with data buffers from the global slab
+  pre-allocates up to 20 page structs with data buffers from the heap
 - **LRU**: insert at HEAD (`lruPrepend`), evict from TAIL (`evictOne`). Correct
   LRU semantics — most recently released at head, least recently used at tail
 - **Dirty list move-to-front**: `dirtyMoveToFront()` on unpin ensures recently
@@ -1122,10 +1122,11 @@ If a page was modified 10 times in the WAL, all 10 versions are copied during
 checkpoint (last write wins). SQLite's `WalIterator` writes only the latest
 version per page. Correct but wasteful -- O(WAL frames) instead of O(unique pages).
 
-**Checkpoint Per-Frame Buffer Allocation** -- Severity: Minor
+**Checkpoint Buffer Allocation** -- Severity: Minor (fixed)
 
-`make([]byte, pageSize)` allocated per frame during checkpoint. Causes GC
-pressure for large checkpoints. Should reuse a single buffer.
+The checkpoint backfill loop now reuses `wal.ckptBuf`, a page-sized buffer
+lazily allocated on first checkpoint. Matches SQLite's `walCheckpoint`
+(wal.c:2285-2304) which reuses `pTmpSpace` from the pager.
 
 **WAL Header Version Not Validated** -- Severity: Minor
 
@@ -1192,9 +1193,11 @@ Key components:
 
 **Per-Cache Bulk Allocation** -- Severity: N/A (implemented)
 
-`pcache.initBulk()` pre-allocates up to 100 page structs with data buffers from
-the global slab on first `create()` call. Subsequent creates pop from the `pFree`
-list without touching the slab. Matches SQLite `pcache1InitBulk`
+`pcache.initBulk()` pre-allocates up to 20 page structs (matching
+`SQLITE_DEFAULT_PCACHE_INITSZ`) with data buffers from the heap on first
+`create()` call. In slab mode, initBulk is skipped (SQLite disables bulk init
+when `SQLITE_CONFIG_PAGECACHE` is set, `pcache1.c:730-737`). Subsequent creates
+pop from the `pFree` list. Matches SQLite `pcache1InitBulk`
 (`pcache1.c:297-330`).
 
 **Admission Control (createFlag)** -- Severity: N/A (implemented)
