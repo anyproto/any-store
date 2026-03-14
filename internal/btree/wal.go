@@ -1071,9 +1071,6 @@ type wal struct {
 	cksum1 uint32
 	cksum2 uint32
 
-	// Reusable write buffer to avoid per-commit allocations
-	writeBuf []byte
-
 	// ckptBuf is a reusable page-sized buffer for reading WAL frames during
 	// checkpoint backfill. Allocated lazily on first checkpoint. Matches
 	// SQLite's use of pTmpSpace in walCheckpoint (wal.c:2285-2304), though
@@ -1439,49 +1436,40 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	nf := w.nFrame.Load()
 	offset := int64(walHeaderSize) + int64(nf)*int64(frameSize)
 
-	// Reuse write buffer to avoid per-commit allocations
-	needSize := len(pages) * frameSize
-	if cap(w.writeBuf) >= needSize {
-		w.writeBuf = w.writeBuf[:needSize]
-	} else {
-		w.writeBuf = make([]byte, needSize)
-	}
-	buf := w.writeBuf
-
 	s1, s2 := w.cksum1, w.cksum2
 	startFrame := nf + 1
 
-	for i, p := range pages {
-		pos := i * frameSize
-		frameBuf := buf[pos : pos+walFrameSize]
+	// Per-frame writes matching SQLite's walWriteOneFrame pattern:
+	// 24-byte stack header + direct page data write — zero heap allocation.
+	var frameHdr [walFrameSize]byte
 
-		binary.BigEndian.PutUint32(frameBuf[0:4], p.pgno)
+	for i, p := range pages {
+		off := offset + int64(i)*int64(frameSize)
+
+		binary.BigEndian.PutUint32(frameHdr[0:4], p.pgno)
 		var dbSizeField uint32
 		if commit && i == len(pages)-1 {
 			dbSizeField = dbSize
 		}
-		binary.BigEndian.PutUint32(frameBuf[4:8], dbSizeField)
-		binary.BigEndian.PutUint32(frameBuf[8:12], w.header.salt1)
-		binary.BigEndian.PutUint32(frameBuf[12:16], w.header.salt2)
+		binary.BigEndian.PutUint32(frameHdr[4:8], dbSizeField)
+		binary.BigEndian.PutUint32(frameHdr[8:12], w.header.salt1)
+		binary.BigEndian.PutUint32(frameHdr[12:16], w.header.salt2)
 
 		// Compute checksum over frame header (first 8 bytes) + page data
-		s1, s2 = walChecksum(frameBuf[0:8], s1, s2)
+		s1, s2 = walChecksum(frameHdr[0:8], s1, s2)
 		s1, s2 = walChecksum(p.data, s1, s2)
 
-		binary.BigEndian.PutUint32(frameBuf[16:20], s1)
-		binary.BigEndian.PutUint32(frameBuf[20:24], s2)
+		binary.BigEndian.PutUint32(frameHdr[16:20], s1)
+		binary.BigEndian.PutUint32(frameHdr[20:24], s2)
 
-		// Copy page data into buffer
-		copy(buf[pos+walFrameSize:pos+frameSize], p.data)
-	}
-
-	// Single write call for all frames
-	n, err := w.file.WriteAt(buf, offset)
-	if err != nil {
-		return err
-	}
-	if n != len(buf) {
-		return io.ErrShortWrite
+		// Write frame header
+		if _, err := w.file.WriteAt(frameHdr[:], off); err != nil {
+			return err
+		}
+		// Write page data directly — no copy into intermediate buffer
+		if _, err := w.file.WriteAt(p.data, off+walFrameSize); err != nil {
+			return err
+		}
 	}
 
 	// Only advance nFrame and checksums after successful write. If WriteAt
