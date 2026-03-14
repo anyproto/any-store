@@ -124,6 +124,13 @@ type pager struct {
 	// single-threaded, one buffer per pager is safe.
 	cellBuf []byte
 
+	// cellSlice is a reusable []cellData for collectLeafCells, avoiding
+	// per-call allocation of the cells slice. Same take-and-nil pattern as
+	// cellBuf: taken by collectLeafCells, returned by callers via
+	// recycleCellSlice. Second concurrent call (merge path) finds nil and
+	// allocates fresh.
+	cellSlice []cellData
+
 	// dontWritePages tracks pages that were dirtied but whose content doesn't
 	// need to be persisted (e.g., freed leaf pages added to a freelist trunk).
 	// Matches SQLite's PGHDR_DONT_WRITE flag (pager.c:6283). We use a map
@@ -211,6 +218,29 @@ func (p *pager) takeCellBuf(minCap int) []byte {
 func (p *pager) recycleCellBuf(buf []byte) {
 	if cap(buf) > cap(p.cellBuf) {
 		p.cellBuf = buf[:0]
+	}
+}
+
+// takeCellSlice returns the pager's reusable cellData slice if its capacity
+// is >= minCap, setting p.cellSlice to nil (take-and-nil pattern). Returns nil
+// if no slice is available or it's too small.
+func (p *pager) takeCellSlice(minCap int) []cellData {
+	if p.cellSlice != nil && cap(p.cellSlice) >= minCap {
+		s := p.cellSlice[:0]
+		p.cellSlice = nil
+		return s
+	}
+	return nil
+}
+
+// recycleCellSlice returns a cellData slice to the pager for reuse. Keeps the
+// larger of the existing and returned slices. Clears all entries in the
+// returned slice to release references to cellBuf data, preventing stale
+// slice headers from pinning old buffers in the GC.
+func (p *pager) recycleCellSlice(s []cellData) {
+	if cap(s) > cap(p.cellSlice) {
+		clear(s[:cap(s)])
+		p.cellSlice = s[:0]
 	}
 }
 

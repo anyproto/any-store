@@ -1171,6 +1171,7 @@ func (bt *btree) insertIntoLeafWithPath(pg *page, key, value []byte, path []uint
 	if cellSize+2 <= totalFree {
 		cells, cellBuf := bt.collectLeafCells(pg)
 		err := bt.rebuildLeafPage(pg, cells)
+		bt.pager.recycleCellSlice(cells)
 		bt.pager.recycleCellBuf(cellBuf)
 		if err != nil {
 			return err
@@ -1216,6 +1217,7 @@ func (bt *btree) insertIntoLeaf(pg *page, key, value []byte) error {
 	if cellSize+2 <= totalFree {
 		cells, cellBuf := bt.collectLeafCells(pg)
 		err := bt.rebuildLeafPage(pg, cells)
+		bt.pager.recycleCellSlice(cells)
 		bt.pager.recycleCellBuf(cellBuf)
 		if err != nil {
 			return err
@@ -1377,6 +1379,7 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []uin
 	// collectLeafCells preserves overflow chains (raw passthrough).
 	// Free overflow only for the cell being replaced.
 	cells, cellBuf := bt.collectLeafCells(pg)
+	defer bt.pager.recycleCellSlice(cells)
 	defer bt.pager.recycleCellBuf(cellBuf)
 	if cells[idx].overflowPg != 0 {
 		_ = bt.pager.freeOverflowChain(cells[idx].overflowPg)
@@ -1450,7 +1453,15 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []uin
 // calls) — the second call finds nil and allocates fresh.
 func (bt *btree) collectLeafCells(pg *page) ([]cellData, []byte) {
 	n := int(pg.header.cellCount)
-	cells := make([]cellData, n, n+1) // +1 cap: callers insert one more cell after collecting
+
+	// Reuse pager's pooled cellData slice to avoid per-call allocation.
+	// +1 cap so split callers can append one cell without re-allocating.
+	cells := bt.pager.takeCellSlice(n + 1)
+	if cells != nil {
+		cells = cells[:n]
+	} else {
+		cells = make([]cellData, n, n+1)
+	}
 	usableSize := bt.usablePageSize()
 
 	// Estimate actual content size from page header to avoid over-allocation.
@@ -1756,13 +1767,16 @@ func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte
 	}
 
 	if err := bt.rebuildLeafPage(pg, leftCells); err != nil {
+		bt.pager.recycleCellSlice(cells)
 		bt.pager.recycleCellBuf(cellBuf)
 		return err
 	}
 	if err := bt.rebuildLeafPage(rightPg, rightCells); err != nil {
+		bt.pager.recycleCellSlice(cells)
 		bt.pager.recycleCellBuf(cellBuf)
 		return err
 	}
+	bt.pager.recycleCellSlice(cells)
 	bt.pager.recycleCellBuf(cellBuf)
 	bt.pager.releasePage(rightPg)
 
@@ -1983,15 +1997,18 @@ func (bt *btree) splitLeafAndInsert(pg *page, idx int, key, value []byte) error 
 
 	// Rebuild left page (reuse current page)
 	if err := bt.rebuildLeafPage(pg, leftCells); err != nil {
+		bt.pager.recycleCellSlice(cells)
 		bt.pager.recycleCellBuf(cellBuf)
 		return err
 	}
 
 	// Build right page
 	if err := bt.rebuildLeafPage(rightPg, rightCells); err != nil {
+		bt.pager.recycleCellSlice(cells)
 		bt.pager.recycleCellBuf(cellBuf)
 		return err
 	}
+	bt.pager.recycleCellSlice(cells)
 	bt.pager.recycleCellBuf(cellBuf)
 
 	bt.pager.releasePage(rightPg)
@@ -2069,6 +2086,7 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 		cells, cellBuf := bt.collectLeafCells(oldRoot)
 		newLeftPg.header = oldRoot.header
 		err := bt.rebuildLeafPage(newLeftPg, cells)
+		bt.pager.recycleCellSlice(cells)
 		bt.pager.recycleCellBuf(cellBuf)
 		if err != nil {
 			return err
@@ -2210,6 +2228,7 @@ func (bt *btree) Delete(key []byte) error {
 		cells, cellBuf := bt.collectLeafCells(wpg)
 		if cells[idx].overflowPg != 0 {
 			if err := bt.pager.freeOverflowChain(cells[idx].overflowPg); err != nil {
+				bt.pager.recycleCellSlice(cells)
 				bt.pager.recycleCellBuf(cellBuf)
 				bt.pager.releasePage(wpg)
 				return err
@@ -2217,6 +2236,7 @@ func (bt *btree) Delete(key []byte) error {
 		}
 		cells = append(cells[:idx], cells[idx+1:]...)
 		err := bt.rebuildLeafPage(wpg, cells)
+		bt.pager.recycleCellSlice(cells)
 		bt.pager.recycleCellBuf(cellBuf)
 		if err != nil {
 			bt.pager.releasePage(wpg)
@@ -2390,11 +2410,15 @@ func (bt *btree) tryMergeLeaf(leafPgno uint32, path []uint32) error {
 
 	keepPg, err := bt.pager.getWritablePage(keepPgno)
 	if err != nil {
+		bt.pager.recycleCellSlice(leafCells)
+		bt.pager.recycleCellSlice(sibCells)
 		bt.pager.recycleCellBuf(leafCellBuf)
 		bt.pager.recycleCellBuf(sibCellBuf)
 		return err
 	}
 	rebuildErr := bt.rebuildLeafPage(keepPg, allCells)
+	bt.pager.recycleCellSlice(leafCells)
+	bt.pager.recycleCellSlice(sibCells)
 	bt.pager.recycleCellBuf(leafCellBuf)
 	bt.pager.recycleCellBuf(sibCellBuf)
 	if rebuildErr != nil {
