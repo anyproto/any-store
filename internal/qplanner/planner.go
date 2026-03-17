@@ -520,10 +520,14 @@ func BuildPlan(params *PlanParams) *Plan {
 
 	// Apply limit/offset
 	if params.Limit > 0 || params.Offset > 0 {
+		offset := params.Offset
+		if fsi, ok := root.(*FullScanIter); ok && fsi.Offset > 0 {
+			offset = 0 // FullScanIter handles offset via cursor-level batch skip
+		}
 		root = &LimitIter{
 			Source: root,
 			Limit:  params.Limit,
-			Offset: params.Offset,
+			Offset: offset,
 		}
 	}
 
@@ -754,7 +758,7 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 		fields := params.Sorter.Fields()
 		if len(fields) == 1 && fields[0].Field == "id" {
 			idSorted = true
-			root = &FullScanIter{
+			fsi := &FullScanIter{
 				Source: &CursorSource{
 					Tx: params.Tx,
 					Ns: params.DataNs,
@@ -764,6 +768,11 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 				Buf:      params.Buf,
 				Reverse:  fields[0].Reverse,
 			}
+			// Absorb offset into cursor-level batch skip when no filter.
+			if !needFilter && params.Offset > 0 {
+				fsi.Offset = params.Offset
+			}
+			root = fsi
 		}
 	}
 

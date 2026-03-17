@@ -3314,6 +3314,61 @@ func (c *Cursor) Previous() error {
 	return nil
 }
 
+// Skip advances the cursor forward by n positions.
+// Within a leaf page, this is an O(1) cellIdx bump. Page transitions
+// only happen at leaf boundaries, so skipping N entries costs
+// O(N / entries_per_page) page transitions instead of O(N) Next() calls.
+func (c *Cursor) Skip(n int) error {
+	for n > 0 && c.valid {
+		frame := &c.stack[len(c.stack)-1]
+		if frame.pg == nil {
+			return ErrCorrupt
+		}
+
+		cellCount := int(frame.pg.header.cellCount)
+		remaining := cellCount - frame.cellIdx - 1 // entries after current on this page
+
+		if remaining >= n {
+			frame.cellIdx += n
+			return nil
+		}
+
+		// Skip all remaining on this page, then cross to next leaf via Next().
+		n -= remaining + 1 // +1 for the current entry
+		frame.cellIdx = cellCount - 1
+		if err := c.Next(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SkipBackward moves the cursor backward by n positions.
+// Mirror of Skip for reverse traversal.
+func (c *Cursor) SkipBackward(n int) error {
+	for n > 0 && c.valid {
+		frame := &c.stack[len(c.stack)-1]
+		if frame.pg == nil {
+			return ErrCorrupt
+		}
+
+		canRewind := frame.cellIdx // entries before current on this page
+
+		if canRewind >= n {
+			frame.cellIdx -= n
+			return nil
+		}
+
+		// Skip all remaining on this page, then cross to prev leaf via Previous().
+		n -= canRewind + 1 // +1 for the current entry
+		frame.cellIdx = 0
+		if err := c.Previous(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Valid returns true if the cursor is positioned at a valid entry.
 func (c *Cursor) Valid() bool {
 	return c.valid

@@ -20,6 +20,7 @@ type FullScanIter struct {
 	cursor   *btree.Cursor
 	IDBounds query.Bounds
 	boundIdx int
+	Offset   int // batch-skip offset (only when Filter == nil)
 	Reverse  bool
 	started  bool
 }
@@ -50,6 +51,28 @@ func (it *FullScanIter) nextNoBounds() (key []byte, docId []byte, err error) {
 				if err = it.cursor.First(); err != nil {
 					return nil, nil, err
 				}
+			}
+			// Batch-skip offset entries at the cursor level.
+			// Offset is only set by the planner when there's no meaningful filter.
+			if it.Offset > 0 && it.cursor.Valid() {
+				if it.Reverse {
+					err = it.cursor.SkipBackward(it.Offset)
+				} else {
+					err = it.cursor.Skip(it.Offset)
+				}
+				it.Offset = 0
+				if err != nil {
+					return nil, nil, err
+				}
+				if !it.cursor.Valid() {
+					return nil, nil, nil
+				}
+				// Fall through to return the entry at the new position.
+				k, err := it.cursor.Key()
+				if err != nil {
+					return nil, nil, err
+				}
+				return k, k, nil
 			}
 		} else {
 			if it.Reverse {
@@ -240,6 +263,9 @@ func (it *FullScanIter) String() string {
 	}
 	if len(it.IDBounds) > 0 {
 		s += fmt.Sprintf("[idBounds=%s]", it.IDBounds.String())
+	}
+	if it.Offset > 0 {
+		s += fmt.Sprintf("[skip=%d]", it.Offset)
 	}
 	if it.Filter != nil {
 		s += "(filtered)"

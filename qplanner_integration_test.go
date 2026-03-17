@@ -550,3 +550,53 @@ func TestQPlanner_IndexScanCoveringFilter(t *testing.T) {
 		assert.Contains(t, explain.Sql, "IndexFilter")
 	})
 }
+
+func TestQPlanner_IdSortOffsetSkip(t *testing.T) {
+	coll := setupTestCollection(t, 200)
+
+	// Collect all IDs sorted ascending for reference.
+	allAsc := collectField(t, coll.Find(nil).Sort("id"), "id")
+	require.Equal(t, 200, len(allAsc))
+	// Collect all IDs sorted descending for reference.
+	allDesc := collectField(t, coll.Find(nil).Sort("-id"), "id")
+	require.Equal(t, 200, len(allDesc))
+
+	t.Run("forward offset+limit", func(t *testing.T) {
+		got := collectField(t, coll.Find(nil).Sort("id").Limit(10).Offset(50), "id")
+		require.Equal(t, allAsc[50:60], got)
+	})
+
+	t.Run("reverse offset+limit", func(t *testing.T) {
+		got := collectField(t, coll.Find(nil).Sort("-id").Limit(10).Offset(50), "id")
+		require.Equal(t, allDesc[50:60], got)
+	})
+
+	t.Run("offset past end", func(t *testing.T) {
+		got := collectField(t, coll.Find(nil).Sort("id").Limit(10).Offset(300), "id")
+		require.Empty(t, got)
+	})
+
+	t.Run("offset near end partial results", func(t *testing.T) {
+		got := collectField(t, coll.Find(nil).Sort("id").Limit(10).Offset(195), "id")
+		require.Equal(t, allAsc[195:200], got)
+	})
+
+	t.Run("filter+offset uses slow path correctly", func(t *testing.T) {
+		// With a filter, offset must not be batch-skipped.
+		allFiltered := collectField(t, coll.Find(`{"a": 3}`).Sort("id"), "id")
+		got := collectField(t, coll.Find(`{"a": 3}`).Sort("id").Limit(5).Offset(5), "id")
+		require.Equal(t, allFiltered[5:10], got)
+	})
+
+	t.Run("explain shows skip", func(t *testing.T) {
+		explain, err := coll.Find(nil).Sort("id").Limit(10).Offset(100).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, explain.Sql, "skip=100")
+	})
+
+	t.Run("explain no skip with filter", func(t *testing.T) {
+		explain, err := coll.Find(`{"a": 3}`).Sort("id").Limit(10).Offset(100).Explain(ctx)
+		require.NoError(t, err)
+		assert.NotContains(t, explain.Sql, "skip=")
+	})
+}
