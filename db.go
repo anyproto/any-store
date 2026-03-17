@@ -213,7 +213,7 @@ func indexKeyPrefix(collName string) string {
 func (db *db) init(ctx context.Context) error {
 	return db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
 		// Ensure system namespace exists
-		ns, err := db.btreeDB.GetNamespace(systemNamespace)
+		ns, err := tx.GetNamespace(systemNamespace)
 		if err != nil {
 			if errors.Is(err, btree.ErrNamespaceNotFound) {
 				ns, err = tx.CreateNamespace(systemNamespace)
@@ -348,7 +348,7 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 			}
 		}
 
-		if coll, err = newCollection(ctx, db, collectionName); err != nil {
+		if coll, err = newCollection(ctx, db, collectionName, tx); err != nil {
 			return err
 		}
 		db.openedCollections[collectionName] = coll

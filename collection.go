@@ -96,12 +96,19 @@ type Collection interface {
 	Close() error
 }
 
-func newCollection(ctx context.Context, db *db, name string) (Collection, error) {
+// newCollection creates and initializes a collection. When called from within
+// a write transaction (e.g. CreateCollection), pass the WriteTx so that
+// namespace resolution can see uncommitted pages. Pass nil otherwise.
+func newCollection(ctx context.Context, db *db, name string, wtx ...*btree.WriteTx) (Collection, error) {
 	coll := &collection{
 		name: name,
 		db:   db,
 	}
-	if err := coll.init(ctx); err != nil {
+	var tx *btree.WriteTx
+	if len(wtx) > 0 {
+		tx = wtx[0]
+	}
+	if err := coll.init(ctx, tx); err != nil {
 		return nil, err
 	}
 	return coll, nil
@@ -119,12 +126,23 @@ type collection struct {
 	mu     sync.Mutex
 }
 
-func (c *collection) init(ctx context.Context) error {
+// init initializes the collection, loading namespace handles and index metadata.
+// When wtx is non-nil (called from within a write transaction), namespace resolution
+// uses the writer path to see uncommitted pages.
+func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// getNamespace resolves a namespace, using the writer path when available.
+	getNamespace := func(name string) (*btree.Namespace, error) {
+		if wtx != nil {
+			return wtx.GetNamespace(name)
+		}
+		return c.db.btreeDB.GetNamespace(name)
+	}
+
 	// Get the namespace for this collection
-	ns, err := c.db.btreeDB.GetNamespace(c.name)
+	ns, err := getNamespace(c.name)
 	if err != nil {
 		return err
 	}
@@ -144,7 +162,7 @@ func (c *collection) init(ctx context.Context) error {
 		}
 		for _, info := range idxInfos {
 			nsName := indexNsName(c.name, info.Name)
-			ns, nsErr := c.db.btreeDB.GetNamespace(nsName)
+			ns, nsErr := getNamespace(nsName)
 			if nsErr != nil {
 				return nsErr
 			}
