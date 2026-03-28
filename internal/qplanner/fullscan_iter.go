@@ -235,7 +235,7 @@ func (it *FullScanIter) checkFilter() (ok bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	doc, err := it.Buf.Parser.Parse(it.Buf.DocBuf)
+	doc, err := it.Buf.Parser.ParseOwned(it.Buf.DocBuf)
 	if err != nil {
 		return false, err
 	}
@@ -280,7 +280,7 @@ func (it *FullScanIter) DocValue() (*anyenc.Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	return it.Buf.Parser.Parse(it.Buf.DocBuf)
+	return it.Buf.Parser.ParseOwned(it.Buf.DocBuf)
 }
 
 // RawValue returns the raw bytes of the value at the current cursor position.

@@ -63,7 +63,7 @@ func (it *FetchIter) Next() (key []byte, docId []byte, err error) {
 			if perf {
 				parseStart = time.Now()
 			}
-			doc, perr := it.Buf.Parser.Parse(it.Buf.DocBuf)
+			doc, perr := it.Buf.Parser.ParseOwned(it.Buf.DocBuf)
 			if perf {
 				qpPerf.fetchParseNs.Add(uint64(time.Since(parseStart).Nanoseconds()))
 			}

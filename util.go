@@ -9,7 +9,8 @@ import (
 )
 
 func copyItem(buf *syncpool.DocBuffer, it item) item {
-	res, _ := buf.Parser.Parse(it.val.MarshalTo(buf.DocBuf[:0]))
+	buf.DocBuf = it.val.MarshalTo(buf.DocBuf[:0])
+	res, _ := buf.Parser.ParseOwned(buf.DocBuf)
 	return item{val: res}
 }
 

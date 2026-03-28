@@ -60,7 +60,7 @@ func (it *FilterIter) Next() (key []byte, docId []byte, err error) {
 			}
 
 			var perr error
-			doc, perr = it.Buf.Parser.Parse(it.Buf.DocBuf)
+			doc, perr = it.Buf.Parser.ParseOwned(it.Buf.DocBuf)
 			if perr != nil {
 				return nil, nil, perr
 			}

@@ -236,7 +236,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 			err = getErr
 			return
 		}
-		doc, parseErr := buf.Parser.Parse(buf.DocBuf)
+		doc, parseErr := buf.Parser.ParseOwned(buf.DocBuf)
 		if parseErr != nil {
 			err = parseErr
 			return

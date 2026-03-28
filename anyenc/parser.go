@@ -62,7 +62,7 @@ type Parser struct {
 	c cache
 }
 
-// Parse parses encoded bytes
+// Parse parses encoded bytes, copying them into an internal buffer.
 //
 // The returned value is valid until the next call to Parse*.
 func (p *Parser) Parse(b []byte) (v *Value, err error) {
@@ -71,6 +71,25 @@ func (p *Parser) Parse(b []byte) (v *Value, err error) {
 	copy(p.b, b)
 	var tail []byte
 	v, tail, err = parseValue(p.b, &p.c)
+	if len(tail) != 0 {
+		return nil, fmt.Errorf("unexpected tail")
+	}
+	return
+}
+
+// ParseOwned parses encoded bytes without copying them. The caller must
+// guarantee that b will not be modified until the returned Value is no
+// longer used. This avoids the allocation and copy overhead of Parse.
+//
+// The returned value is valid until the next call to Parse*/ParseOwned,
+// or until b is modified — whichever comes first.
+func (p *Parser) ParseOwned(b []byte) (v *Value, err error) {
+	p.c.reset()
+	var tail []byte
+	v, tail, err = parseValue(b, &p.c)
+	if err != nil {
+		return nil, err
+	}
 	if len(tail) != 0 {
 		return nil, fmt.Errorf("unexpected tail")
 	}

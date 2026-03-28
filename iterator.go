@@ -100,7 +100,7 @@ func (pi *planIterator) Doc() (Doc, error) {
 			parseStart = time.Now()
 		}
 		var perr error
-		doc, perr = pi.buf.Parser.Parse(pi.buf.DocBuf)
+		doc, perr = pi.buf.Parser.ParseOwned(pi.buf.DocBuf)
 		if perf {
 			pipePerf.docFallbackParseNs.Add(perfSinceNs(parseStart))
 		}
