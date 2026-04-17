@@ -120,6 +120,10 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		DisableAutoCheckpoint: config.DisableAutoCheckpoint,
 		AutoCheckpointAfter:   config.AutoCheckpointAfter,
 		UsePageSlab:           config.UseGlobalPageBuffer,
+		Key:                   config.Encryption.Passphrase,
+		KDFIterations:         config.Encryption.KDFIterations,
+		CipherType:            config.Encryption.CipherType,
+		Codec:                 config.Encryption.Codec,
 	}
 
 	var err error

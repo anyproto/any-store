@@ -53,6 +53,67 @@ type Config struct {
 
 	// DurabilityConfig provides configuration for crash recovery and idle auto-flush
 	Durability DurabilityConfig
+
+	// Encryption, when non-empty, enables page-level AES-256-GCM encryption
+	// of the on-disk database file. Zero value means no encryption.
+	Encryption EncryptionConfig
+}
+
+// EncryptionConfig enables page-level encryption of the database file.
+//
+// Three ways to enable encryption, in increasing order of control:
+//
+//  1. Passphrase (common case):
+//     cfg.Encryption.Passphrase = []byte("my-pass")
+//     Default cipher is AES-256-GCM. Set CipherType to pick a different
+//     built-in (ChaCha20-Poly1305 / XChaCha20-Poly1305).
+//
+//  2. Passphrase + CipherType (pick cipher, keep passphrase KDF):
+//     cfg.Encryption.Passphrase = []byte("my-pass")
+//     cfg.Encryption.CipherType = anystore.CipherChaCha20Poly1305
+//
+//  3. Bring-your-own Codec (HSM, external KMS, custom AEAD):
+//     cfg.Encryption.Codec = myCodec  // must implement anystore.Codec
+//     Passphrase / CipherType / KDFIterations are ignored in this mode.
+//
+// Passphrase treatment (modes 1 and 2):
+//   - Exactly 32 bytes → raw key, no KDF.
+//   - Any other length → PBKDF2-HMAC-SHA256 stretches it to 32 bytes
+//     against the 16-byte salt stored in the database header.
+//
+// An empty (length 0) non-nil Passphrase is rejected with an error; use
+// nil Passphrase to disable encryption.
+//
+// Once a database is created with encryption, it must always be opened
+// with matching Encryption config. Reopening without the passphrase (or
+// with the wrong one) returns an error. There is no in-place rekey in
+// v1; changing a passphrase requires exporting to a freshly-opened
+// database.
+//
+// InMemory databases ignore Encryption (there is no at-rest artifact
+// to protect).
+type EncryptionConfig struct {
+	// Passphrase is the user-supplied secret. Nil = no encryption.
+	Passphrase []byte
+
+	// KDFIterations overrides the PBKDF2 cost. Zero means 256,000 (the
+	// SQLCipher v4 default). Ignored when Passphrase is exactly 32 bytes
+	// (raw-key path). Use lower values only in tests.
+	KDFIterations int
+
+	// CipherType selects the built-in AEAD when Passphrase is set.
+	// Zero value (CipherAES256GCM) is the default.
+	CipherType CipherType
+
+	// Codec, when non-nil, bypasses Passphrase / KDFIterations / CipherType
+	// and is used verbatim. Use this for HSM-backed or other externally-
+	// keyed codecs.
+	Codec Codec
+}
+
+// Enabled reports whether this config will install a codec on Open.
+func (e EncryptionConfig) Enabled() bool {
+	return e.Passphrase != nil || e.Codec != nil
 }
 
 // FlushMode controls checkpoint behavior during flush, matching SQLite's
