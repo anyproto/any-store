@@ -3029,28 +3029,24 @@ func (c *Cursor) Value() ([]byte, error) {
 		localKeyBytes := min(nLocal, int(keyLen))
 		localValBytes := nLocal - localKeyBytes
 		keyOverflow := int(keyLen) - localKeyBytes
+		valOverflow := int(valLen) - localValBytes
 
-		// Read entire overflow chain
-		overflowSize := totalPayload - nLocal
-		overflowBuf := make([]byte, overflowSize)
-		var err error
-		if c.bt.cache != nil {
-			err = c.bt.pager.readOverflowChainReader(cell.overflowPg, overflowBuf, c.bt.walMaxFrame, c.bt.cache)
-		} else {
-			err = c.bt.pager.readOverflowChainAt(cell.overflowPg, overflowBuf, c.bt.walMaxFrame)
-		}
-		if err != nil {
-			return nil, err
-		}
-
-		// Reconstruct full value: local portion + overflow portion (after key overflow)
+		// Allocate full value buffer and copy local portion
 		fullVal := make([]byte, int(valLen))
 		if localValBytes > 0 {
-			copy(fullVal, cell.value) // cell.value holds local value bytes
+			copy(fullVal, cell.value)
 		}
-		valOverflow := int(valLen) - localValBytes
+
+		// Read overflow value bytes directly into destination,
+		// skipping key overflow bytes. No intermediate buffer needed.
 		if valOverflow > 0 {
-			copy(fullVal[localValBytes:], overflowBuf[keyOverflow:])
+			err := c.bt.pager.readOverflowAt(
+				cell.overflowPg, keyOverflow, valOverflow,
+				fullVal[localValBytes:], c.bt.walMaxFrame, c.bt.cache,
+			)
+			if err != nil {
+				return nil, err
+			}
 		}
 		return fullVal, nil
 	}

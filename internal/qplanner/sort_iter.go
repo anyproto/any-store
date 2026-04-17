@@ -105,7 +105,7 @@ func (it *SortIter) collectAndSort() error {
 				continue
 			}
 			var perr error
-			doc, perr = it.Buf.Parser.Parse(it.Buf.DocBuf)
+			doc, perr = it.Buf.Parser.ParseOwned(it.Buf.DocBuf)
 			if perr != nil {
 				return perr
 			}

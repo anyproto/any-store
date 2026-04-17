@@ -62,7 +62,7 @@ type Parser struct {
 	c cache
 }
 
-// Parse parses encoded bytes
+// Parse parses encoded bytes, copying them into an internal buffer.
 //
 // The returned value is valid until the next call to Parse*.
 func (p *Parser) Parse(b []byte) (v *Value, err error) {
@@ -77,9 +77,30 @@ func (p *Parser) Parse(b []byte) (v *Value, err error) {
 	return
 }
 
-// ApproxSize returns approximate size of parser cache
+// ParseOwned parses encoded bytes without copying them. The caller must
+// guarantee that b will not be modified until the returned Value is no
+// longer used. This avoids the allocation and copy overhead of Parse.
+//
+// The returned value is valid until the next call to Parse*/ParseOwned,
+// or until b is modified — whichever comes first.
+func (p *Parser) ParseOwned(b []byte) (v *Value, err error) {
+	p.c.reset()
+	var tail []byte
+	v, tail, err = parseValue(b, &p.c)
+	if err != nil {
+		return nil, err
+	}
+	if len(tail) != 0 {
+		return nil, fmt.Errorf("unexpected tail")
+	}
+	return
+}
+
+// ApproxSize returns approximate size of parser cache.
+// Excludes reusable scratch buffers (decompBuf, input copy) that are
+// deliberately kept to avoid re-allocation on subsequent calls.
 func (p *Parser) ApproxSize() int {
-	return p.c.approxSize()
+	return p.c.approxSizeValues()
 }
 
 func parseValue(b []byte, c *cache) (v *Value, tail []byte, err error) {
@@ -228,10 +249,17 @@ func (c *cache) getValue() *Value {
 }
 
 func (c *cache) approxSize() (size int) {
+	size = c.approxSizeValues()
+	size += cap(c.decompBuf)
+	return
+}
+
+// approxSizeValues returns approximate size of cached Value structs only,
+// excluding reusable scratch buffers (decompBuf).
+func (c *cache) approxSizeValues() (size int) {
 	for _, v := range c.vs[:cap(c.vs)] {
 		size += len(v.v) + int(valueSize)
 	}
-	size += cap(c.decompBuf)
 	return
 }
 

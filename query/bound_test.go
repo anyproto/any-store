@@ -190,3 +190,61 @@ func BenchmarkBounds_SortAndMerge(b *testing.B) {
 	b.Run("100_points", func(b *testing.B) { benchSAM(b, 100) })
 	b.Run("500_points", func(b *testing.B) { benchSAM(b, 500) })
 }
+
+func TestBounds_Contains(t *testing.T) {
+	mk := func(start, end string, si, ei bool) Bound {
+		return Bound{Start: []byte(start), End: []byte(end), StartInclude: si, EndInclude: ei}
+	}
+
+	t.Run("point bound", func(t *testing.T) {
+		bs := Bounds{mk("a", "a", true, true)}
+		assert.True(t, bs.Contains([]byte("a")))
+		assert.False(t, bs.Contains([]byte("b")))
+	})
+
+	t.Run("disjoint ranges", func(t *testing.T) {
+		bs := Bounds{mk("a", "a", true, true), mk("c", "c", true, true)}
+		assert.True(t, bs.Contains([]byte("a")))
+		assert.True(t, bs.Contains([]byte("c")))
+		assert.False(t, bs.Contains([]byte("b")))
+	})
+
+	t.Run("exclusive open range", func(t *testing.T) {
+		bs := Bounds{mk("a", "c", false, false)}
+		assert.False(t, bs.Contains([]byte("a")))
+		assert.True(t, bs.Contains([]byte("b")))
+		assert.False(t, bs.Contains([]byte("c")))
+	})
+
+	t.Run("unbounded end", func(t *testing.T) {
+		bs := Bounds{{Start: []byte("a"), StartInclude: true}}
+		assert.True(t, bs.Contains([]byte("z")))
+		assert.False(t, bs.Contains([]byte{}))
+	})
+
+	t.Run("unbounded start", func(t *testing.T) {
+		bs := Bounds{{End: []byte("m"), EndInclude: true}}
+		assert.True(t, bs.Contains([]byte("a")))
+		assert.True(t, bs.Contains([]byte("m")))
+		assert.False(t, bs.Contains([]byte("z")))
+	})
+}
+
+// --- Coverage tests from bound_coverage_test.go ---
+
+// TestBounds_Contains_Coverage_EmptyBounds asserts that an empty Bounds{}
+// reports Contains=false for any value. Covers query/bound.go:192-198.
+// The loop body never executes, so the method returns false.
+func TestBounds_Contains_Coverage_EmptyBounds(t *testing.T) {
+	var empty Bounds
+	assert.False(t, empty.Contains([]byte("a")),
+		"empty Bounds{} must not contain any value")
+	assert.False(t, empty.Contains(nil),
+		"empty Bounds{} must not contain nil")
+	assert.False(t, empty.Contains([]byte{}),
+		"empty Bounds{} must not contain empty byte slice")
+
+	// Explicit zero-length literal behaves identically.
+	assert.False(t, Bounds{}.Contains([]byte("a")),
+		"Bounds{} literal must not contain any value")
+}

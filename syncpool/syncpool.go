@@ -45,6 +45,9 @@ func (sp *SyncPool) GetDocBuf() *DocBuffer {
 }
 
 func (sp *SyncPool) ReleaseDocBuf(b *DocBuffer) {
+	// Size check excludes reusable scratch buffers inside Parser (decompBuf,
+	// input copy buffer) — those are kept deliberately to avoid re-allocation
+	// on subsequent large-document operations.
 	if sp.sizeLimit > 0 && cap(b.DocBuf)+cap(b.SmallBuf)+cap(b.ScratchBuf)+b.Arena.ApproxSize()+b.Parser.ApproxSize() > sp.sizeLimit {
 		return
 	}

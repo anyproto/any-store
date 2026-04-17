@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -241,4 +242,52 @@ func assertQueryCount(t testing.TB, q Query, expected int) {
 	count, err := q.Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, expected, count)
+}
+
+// --- Coverage tests from query_matchall_coverage_test.go ---
+
+// TestQuery_Coverage_MatchAllBaseline verifies the match-all baseline: both
+// Find(nil) and Find("{}") return every document in the collection (N), and
+// both route through the FullScan plan when no index is available.
+//
+// Gap item 70: Find(nil) or Find({}) — match-all baseline.
+func TestQuery_Coverage_MatchAllBaseline(t *testing.T) {
+	const N = 100
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+
+	docs := make([]*anyenc.Value, N)
+	for i := 0; i < N; i++ {
+		docs[i] = anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%10))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+
+	t.Run("nil filter", func(t *testing.T) {
+		assertQueryCount(t, coll.Find(nil), N)
+
+		explain, err := coll.Find(nil).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, explain.Sql, "FullScan",
+			"Find(nil) with no index must route through FullScan")
+	})
+
+	t.Run("empty object filter", func(t *testing.T) {
+		assertQueryCount(t, coll.Find(`{}`), N)
+
+		explain, err := coll.Find(`{}`).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, explain.Sql, "FullScan",
+			"Find({}) with no index must route through FullScan")
+	})
+
+	t.Run("nil and empty produce same count", func(t *testing.T) {
+		nilCount, err := coll.Find(nil).Count(ctx)
+		require.NoError(t, err)
+		emptyCount, err := coll.Find(`{}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, nilCount, emptyCount,
+			"Find(nil) and Find({}) must return the same number of docs")
+		assert.Equal(t, N, nilCount)
+	})
 }

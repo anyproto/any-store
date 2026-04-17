@@ -185,3 +185,31 @@ func (bs Bounds) Less(i, j int) bool {
 func (bs Bounds) Swap(i, j int) {
 	bs[i], bs[j] = bs[j], bs[i]
 }
+
+// Contains reports whether val lies within any range in bs.
+// val is a raw anyenc-encoded tuple component (e.g. the field-value
+// prefix of an index key, with docId suffix stripped).
+func (bs Bounds) Contains(val []byte) bool {
+	for _, b := range bs {
+		if b.contains(val) {
+			return true
+		}
+	}
+	return false
+}
+
+func (b Bound) contains(val []byte) bool {
+	if len(b.Start) > 0 {
+		cmp := bytes.Compare(val, b.Start)
+		if cmp < 0 || (cmp == 0 && !b.StartInclude) {
+			return false
+		}
+	}
+	if len(b.End) > 0 {
+		cmp := bytes.Compare(val, b.End)
+		if cmp > 0 || (cmp == 0 && !b.EndInclude) {
+			return false
+		}
+	}
+	return true
+}

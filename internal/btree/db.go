@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 )
@@ -1090,23 +1091,28 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 				localKeyBytes := min(nLocal, int(keyLen))
 				localValBytes := nLocal - localKeyBytes
 				keyOverflow := int(keyLen) - localKeyBytes
-				overflowSize := totalPayload - nLocal
+				valOverflow := int(valLen) - localValBytes
 
+				// Grow buf to hold the full value — no intermediate allocations.
 				start := len(buf)
-				buf = append(buf, make([]byte, int(valLen))...)
+				buf = slices.Grow(buf, int(valLen))[:start+int(valLen)]
 				fullVal := buf[start:]
+
+				// Copy local value portion from the page
 				if localValBytes > 0 {
 					copy(fullVal, cell.value)
 				}
-				if overflowSize > 0 {
-					overflowBuf := make([]byte, overflowSize)
-					if err := tx.readOverflow(cell.overflowPg, overflowBuf); err != nil {
+
+				// Read overflow value bytes directly into destination,
+				// skipping key overflow. Uses readOverflowAt to avoid
+				// allocating an intermediate overflow buffer.
+				if valOverflow > 0 {
+					if err := tx.pager.readOverflowAt(
+						cell.overflowPg, keyOverflow, valOverflow,
+						fullVal[localValBytes:], tx.walMaxFrame, tx.cache,
+					); err != nil {
 						tx.pager.releasePage(pg)
 						return buf[:start], err
-					}
-					valOverflow := int(valLen) - localValBytes
-					if valOverflow > 0 {
-						copy(fullVal[localValBytes:], overflowBuf[keyOverflow:])
 					}
 				}
 				tx.pager.releasePage(pg)

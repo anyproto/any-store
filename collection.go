@@ -450,7 +450,7 @@ func (c *collection) loadById(tx *btree.WriteTx, buf *syncpool.DocBuffer, id any
 		}
 		return
 	}
-	doc, err := buf.Parser.Parse(buf.DocBuf)
+	doc, err := buf.Parser.ParseOwned(buf.DocBuf)
 	if err != nil {
 		return
 	}
@@ -730,7 +730,7 @@ func (c *collection) buildIndex(tx *btree.WriteTx, idx *index) error {
 			return err
 		}
 		buf.DocBuf = append(buf.DocBuf[:0], val...)
-		doc, err := buf.Parser.Parse(buf.DocBuf)
+		doc, err := buf.Parser.ParseOwned(buf.DocBuf)
 		if err != nil {
 			return err
 		}
@@ -786,7 +786,7 @@ func (c *collection) loadByIdRead(tx *btree.ReadTx, buf *syncpool.DocBuffer, id 
 		}
 		return
 	}
-	doc, err := buf.Parser.Parse(buf.DocBuf)
+	doc, err := buf.Parser.ParseOwned(buf.DocBuf)
 	if err != nil {
 		return
 	}

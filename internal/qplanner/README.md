@@ -100,6 +100,34 @@ Source (leaf) → Transform → Transform → ... → Root
 | `FilterIter` | Evaluates a `query.Filter` predicate on fetched documents. |
 | `SortIter` | Collects upstream results and sorts in memory. When `TopK > 0`, uses a max-heap of size K to keep only the smallest K entries — O(N log K) instead of O(N log N), with O(K) entry memory instead of O(N). |
 | `LimitIter` | Skips `Offset` results, returns at most `Limit` results. |
+| `CanonicalKeyDedupIter` | Removes duplicate hits from single-field multi-key indexes by emitting each doc only at its canonical (min/max) in-bound array value. O(1) memory, streaming. |
+| `SeenSetDedupIter` | Removes duplicate docId hits via a hash-set. O(distinct_results) memory. Used for compound multi-key indexes where canonical-key selection across compound tuples is non-trivial. |
+
+#### Multi-Key Index Deduplication
+
+Array-valued (multi-key) indexes store one entry per array element per document.
+A `$in` or range query that matches multiple elements of the same document
+therefore yields multiple `(key, docId)` hits for that document. Without dedup,
+`Iter()` would surface duplicates and `Count()` would inflate.
+
+The planner picks a dedup strategy by index shape:
+
+| Index shape | Iterator | Memory | Notes |
+|---|---|---|---|
+| Single-field (`Fields[]` length 1) | `CanonicalKeyDedupIter` | O(1), streaming | Canonical = min/max of doc's in-bound array values. Reverse scan uses max. |
+| Compound (`Fields[]` length ≥ 2) | `SeenSetDedupIter` | O(distinct results) | `map[string]struct{}` of emitted docIds. |
+| Scalar-only fields | no wrap | O(0) | No duplicates possible. |
+
+Dedup is wired regardless of bound presence — a bound-less index scan
+(pure `Sort("tags")` with no filter) still dupes on multi-key fields.
+`CanonicalKeyDedupIter` treats empty bounds as "every element qualifies."
+
+For `Count`, the covering-index fast path (direct entry count on the btree
+cursor) is disabled whenever `len(idx.Bounds) > 1`, which is the universal
+trigger for multi-key duplicate hits under point-lookup bounds.
+Single-bound point counts remain safe because within-doc array dedup in
+`index.go:insertKeys` guarantees at most one index entry per distinct value
+per doc.
 
 #### TopK Sort Optimization
 
@@ -119,9 +147,11 @@ This reduces the final sort from O(N log N) to O(K log K) and keeps the entries 
 
 **Index Seek (unique point lookup)**: `CoverIter → [FilterIter] → [SortIter] → [LimitIter]`
 
-**Index Seek (general)**: `IndexIter → FetchIter → [FilterIter] → [SortIter] → [LimitIter]`
+**Index Seek (general)**: `IndexIter → FetchIter → [FilterIter] → [DedupIter] → [SortIter] → [LimitIter]`
 
-**Index Scan (sort covered)**: `IndexIter → FetchIter → [FilterIter] → [LimitIter]`
+**Index Scan (sort covered)**: `IndexIter → FetchIter → [FilterIter] → [DedupIter] → [LimitIter]`
+
+`DedupIter` is one of `CanonicalKeyDedupIter` (single-field) or `SeenSetDedupIter` (compound); see the Multi-Key Index Deduplication section above.
 
 ---
 

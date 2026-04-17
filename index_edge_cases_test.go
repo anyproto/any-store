@@ -437,3 +437,50 @@ func TestDropRecreateIndexCorruption(t *testing.T) {
 	}
 	t.Log("All cycles passed - bug not triggered with this seed")
 }
+
+// --- Coverage tests from index_field_validation_coverage_test.go ---
+
+// TestIndex_Coverage_UnderscorePrefixedFieldAllowed verifies that a user
+// field named with a leading underscore (e.g. "_internal") is a valid index
+// target. MongoDB reserves only "_id"; any other underscore-prefixed name is
+// user namespace.
+//
+// Gap item 65: Index on an underscore-prefixed field name.
+func TestIndex_Coverage_UnderscorePrefixedFieldAllowed(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{Fields: []string{"_internal"}}),
+		"CreateIndex on '_internal' must succeed")
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"_internal":"alpha"}`),
+		anyenc.MustParseJson(`{"id":2,"_internal":"beta"}`),
+		anyenc.MustParseJson(`{"id":3,"_internal":"gamma"}`),
+	))
+
+	vals := collectField(t, coll.Find(`{"_internal":"beta"}`), "id")
+	assert.Equal(t, []string{"2"}, vals,
+		"query by _internal must find exactly the one matching doc")
+}
+
+// TestIndex_Coverage_EmptySegmentInPathRejected verifies that CreateIndex
+// rejects malformed path specifications with empty segments: a double dot
+// ("a..b"), a leading dot (".a"), or a trailing dot ("a.").
+//
+// Gap item 66: Index path with empty segment.
+func TestIndex_Coverage_EmptySegmentInPathRejected(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+
+	cases := []string{"a..b", ".a", "a."}
+	for _, field := range cases {
+		t.Run(field, func(t *testing.T) {
+			err := coll.CreateIndex(ctx, IndexInfo{Fields: []string{field}})
+			assert.Error(t, err,
+				"CreateIndex with empty path segment %q must return a validation error", field)
+		})
+	}
+}
