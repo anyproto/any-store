@@ -70,3 +70,39 @@ func decryptWith(c Codec, dst, src []byte, pgno uint32) ([]byte, error) {
 	}
 	return c.Decrypt(dst, src, pgno)
 }
+
+// encryptPageWithCodec is a package-level variant of pager.encryptPage that
+// applies the same page-1 plaintext-prefix rule (first dbHeaderSize bytes
+// stay plaintext for pgno==1, rest encrypted). Used from wal.go, which
+// doesn't hold a pager reference. dst must have len >= len(src) and must
+// not alias src. Returns src unchanged when c is nil.
+func encryptPageWithCodec(c Codec, dst, src []byte, pgno uint32) ([]byte, error) {
+	if c == nil {
+		return src, nil
+	}
+	plainPrefix := 0
+	if pgno == 1 {
+		plainPrefix = dbHeaderSize
+	}
+	copy(dst[:plainPrefix], src[:plainPrefix])
+	if _, err := c.Encrypt(dst[plainPrefix:], src[plainPrefix:], pgno); err != nil {
+		return nil, err
+	}
+	return dst[:len(src)], nil
+}
+
+// decryptPageWithCodec is the decrypt-path counterpart.
+func decryptPageWithCodec(c Codec, dst, src []byte, pgno uint32) ([]byte, error) {
+	if c == nil {
+		return src, nil
+	}
+	plainPrefix := 0
+	if pgno == 1 {
+		plainPrefix = dbHeaderSize
+	}
+	copy(dst[:plainPrefix], src[:plainPrefix])
+	if _, err := c.Decrypt(dst[plainPrefix:], src[plainPrefix:], pgno); err != nil {
+		return nil, err
+	}
+	return dst[:len(src)], nil
+}

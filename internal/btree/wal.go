@@ -1123,6 +1123,13 @@ type wal struct {
 	// per-frame allocations and reduce GC pressure.
 	memArena    []byte
 	memArenaOff int
+
+	// BEGIN ENCRYPTION
+	// codec, when non-nil, encrypts frame payloads on write and decrypts
+	// them on read. Propagated from the pager after wal creation via
+	// p.wal.codec = p.codec; see pager.open / pager.initNewDB.
+	codec Codec
+	// END ENCRYPTION
 }
 
 // memFrame stores a single WAL frame's page data in memory.
@@ -1455,21 +1462,53 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		binary.BigEndian.PutUint32(frameHdr[8:12], w.header.salt1)
 		binary.BigEndian.PutUint32(frameHdr[12:16], w.header.salt2)
 
+		// BEGIN ENCRYPTION
+		// Encrypt page payload before checksum (per spec-fit.md §4.3: the
+		// WAL checksum covers ciphertext). When no codec is installed this
+		// is a zero-cost pass-through — payload := p.data.
+		payload := p.data
+		var payloadScratch []byte
+		if w.codec != nil {
+			payloadScratch = allocPageBuffer(int(w.pageSize), false)
+			ct, eerr := encryptPageWithCodec(w.codec, payloadScratch, p.data, p.pgno)
+			if eerr != nil {
+				freePageBuffer(payloadScratch, false)
+				return eerr
+			}
+			payload = ct
+		}
+		// END ENCRYPTION
+
 		// Compute checksum over frame header (first 8 bytes) + page data
 		s1, s2 = walChecksum(frameHdr[0:8], s1, s2)
-		s1, s2 = walChecksum(p.data, s1, s2)
+		s1, s2 = walChecksum(payload, s1, s2)
 
 		binary.BigEndian.PutUint32(frameHdr[16:20], s1)
 		binary.BigEndian.PutUint32(frameHdr[20:24], s2)
 
 		// Write frame header
 		if _, err := w.file.WriteAt(frameHdr[:], off); err != nil {
+			// BEGIN ENCRYPTION
+			if payloadScratch != nil {
+				freePageBuffer(payloadScratch, false)
+			}
+			// END ENCRYPTION
 			return err
 		}
-		// Write page data directly — no copy into intermediate buffer
-		if _, err := w.file.WriteAt(p.data, off+walFrameSize); err != nil {
+		// Write page data (plaintext or ciphertext depending on codec).
+		if _, err := w.file.WriteAt(payload, off+walFrameSize); err != nil {
+			// BEGIN ENCRYPTION
+			if payloadScratch != nil {
+				freePageBuffer(payloadScratch, false)
+			}
+			// END ENCRYPTION
 			return err
 		}
+		// BEGIN ENCRYPTION
+		if payloadScratch != nil {
+			freePageBuffer(payloadScratch, false)
+		}
+		// END ENCRYPTION
 	}
 
 	// Only advance nFrame and checksums after successful write. If WriteAt

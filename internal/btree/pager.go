@@ -308,6 +308,11 @@ func (p *pager) open() error {
 	p.wal.noCommitSync = p.noCommitSync
 	p.wal.inMemory = p.inMemory
 	p.wal.busyHandler = DefaultBusyTimeout(5 * time.Second)
+	// BEGIN ENCRYPTION
+	// Propagate codec to the WAL so frame writes/reads use the same
+	// cipher as the DB file.
+	p.wal.codec = p.codec
+	// END ENCRYPTION
 	if err := p.wal.open(); err != nil {
 		return err
 	}
@@ -363,36 +368,14 @@ func (p *pager) installCodec(c Codec) {
 // This is the any-store equivalent of SQLCipher's CODEC2 macro
 // (pager.c:412), unified into one function.
 func (p *pager) encryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
-	if p.codec == nil {
-		return src, nil
-	}
-	plainPrefix := 0
-	if pgno == 1 {
-		plainPrefix = dbHeaderSize
-	}
-	copy(scratch[:plainPrefix], src[:plainPrefix])
-	if _, err := p.codec.Encrypt(scratch[plainPrefix:], src[plainPrefix:], pgno); err != nil {
-		return nil, err
-	}
-	return scratch[:len(src)], nil
+	return encryptPageWithCodec(p.codec, scratch, src, pgno)
 }
 
 // decryptPage is the inverse. Returns src unchanged when no codec is
 // installed; otherwise decrypts into scratch and returns the plaintext
 // slice. On AEAD verification failure returns ErrCodecTamper.
 func (p *pager) decryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
-	if p.codec == nil {
-		return src, nil
-	}
-	plainPrefix := 0
-	if pgno == 1 {
-		plainPrefix = dbHeaderSize
-	}
-	copy(scratch[:plainPrefix], src[:plainPrefix])
-	if _, err := p.codec.Decrypt(scratch[plainPrefix:], src[plainPrefix:], pgno); err != nil {
-		return nil, err
-	}
-	return scratch[:len(src)], nil
+	return decryptPageWithCodec(p.codec, scratch, src, pgno)
 }
 
 // END ENCRYPTION
@@ -491,6 +474,11 @@ func (p *pager) initNewDB() error {
 	p.wal.noCommitSync = p.noCommitSync
 	p.wal.inMemory = p.inMemory
 	p.wal.busyHandler = DefaultBusyTimeout(5 * time.Second)
+	// BEGIN ENCRYPTION
+	// Propagate codec to the WAL so frame writes/reads use the same
+	// cipher as the DB file.
+	p.wal.codec = p.codec
+	// END ENCRYPTION
 	if err := p.wal.open(); err != nil {
 		return err
 	}
