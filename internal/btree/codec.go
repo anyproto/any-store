@@ -1,9 +1,6 @@
 package btree
 
-import (
-	"crypto/rand"
-	"sync"
-)
+import "crypto/rand"
 
 // Codec is the pluggable page-encryption interface. When a non-nil Codec is
 // installed on the pager, every file/WAL I/O site routes through it.
@@ -122,11 +119,15 @@ func decryptPageWithCodec(c Codec, dst, src []byte, pgno uint32) ([]byte, error)
 const noncePoolSize = 4096
 
 // noncePool batches crypto/rand.Read syscalls behind a userspace buffer.
-// Safe for concurrent use.
+//
+// NOT safe for concurrent use. any-store's Codec is only invoked for
+// nonce-drawing Encrypt calls by the writer goroutine (writeMu-serialized
+// at the DB level); readers never call Encrypt. If a future refactor
+// lets multiple goroutines share a codec for encryption, wrap Draw in
+// external synchronization or add a lock here.
 type noncePool struct {
-	mu  sync.Mutex
 	buf [noncePoolSize]byte
-	off int // position to read from; must start == len(buf) for first-call refill
+	off int // position to read from; starts == len(buf) so first call triggers a refill
 }
 
 // newNoncePool constructs a pool whose initial state is "exhausted",
@@ -139,8 +140,6 @@ func newNoncePool() *noncePool {
 // Draw fills out with fresh randomness. Refills the internal buffer
 // from crypto/rand.Read when exhausted.
 func (p *noncePool) Draw(out []byte) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	for len(out) > 0 {
 		if p.off >= noncePoolSize {
 			if _, err := rand.Read(p.buf[:]); err != nil {
