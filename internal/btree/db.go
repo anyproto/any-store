@@ -4,9 +4,13 @@ package btree
 // It manages namespaces, transactions, and the underlying pager/WAL.
 
 import (
+	// BEGIN ENCRYPTION
+	"crypto/rand"
+	// END ENCRYPTION
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -70,6 +74,29 @@ type Options struct {
 	// InitPageBuffer (anystore). When false (default), page buffers use
 	// sync.Pool, matching SQLite's default malloc-based allocation.
 	UsePageSlab bool
+
+	// BEGIN ENCRYPTION
+	// Key enables page-level AES-256-GCM encryption when non-nil.
+	// Accepted forms:
+	//   - len 32: raw AES-256 key, used directly (no KDF).
+	//   - any other len: treated as a passphrase; PBKDF2-HMAC-SHA256 derives
+	//     a 32-byte key using the file's salt and KDFIterations rounds.
+	// An empty slice (len 0) is rejected with an error; use nil for "no
+	// encryption".
+	Key []byte
+
+	// KDFIterations controls PBKDF2 cost. Ignored when Key is a raw
+	// 32-byte key. Zero means DefaultKDFIterations (256,000). Use lower
+	// values only in tests.
+	KDFIterations int
+
+	// Codec, when non-nil, replaces the built-in AES-256-GCM codec with
+	// a caller-provided implementation (e.g. HSM-backed or ChaCha20-Poly1305).
+	// When both Key and Codec are set, Codec wins and Key is ignored.
+	// Callers own the codec's lifetime and must supply an implementation
+	// safe for concurrent use.
+	Codec Codec
+	// END ENCRYPTION
 }
 
 // DefaultOptions returns default database options.
@@ -80,6 +107,68 @@ func DefaultOptions() Options {
 		AutoCheckpointAfter: AutoCheckpointThreshold,
 	}
 }
+
+// BEGIN ENCRYPTION
+
+// buildCodec constructs the Codec from Options. Returns (nil, nil) when no
+// encryption is configured. Input modes:
+//   - Options.Codec set: used as-is.
+//   - Options.Key set with len == KeyLen: raw AES-256 key, used directly.
+//   - Options.Key set with any other non-zero length: treated as a passphrase,
+//     derived via PBKDF2 using the supplied salt and KDFIterations.
+//   - Options.Key set with length 0: rejected.
+func buildCodec(opts Options, salt []byte) (Codec, error) {
+	if opts.Codec != nil {
+		return opts.Codec, nil
+	}
+	if opts.Key == nil {
+		return nil, nil
+	}
+	if len(opts.Key) == 0 {
+		return nil, fmt.Errorf("btree: Options.Key is empty (use nil for no encryption)")
+	}
+	var raw []byte
+	if len(opts.Key) == KeyLen {
+		raw = opts.Key
+	} else {
+		raw = DeriveKey(opts.Key, salt, opts.KDFIterations)
+	}
+	return NewAESCodec(raw)
+}
+
+// readInitialHeader opens the file at path and reads the database header.
+// Returns ErrNotExist if the file doesn't exist (distinguished by callers).
+// Returns ErrCorrupt if the file exists but is shorter than dbHeaderSize.
+func readInitialHeader(path string) (dbHeader, error) {
+	var h dbHeader
+	f, err := osOpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return h, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return h, err
+	}
+	if info.Size() == 0 {
+		return h, errEmptyFile
+	}
+	buf := make([]byte, dbHeaderSize)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		return h, err
+	}
+	if err := h.deserialize(buf); err != nil {
+		return h, err
+	}
+	return h, nil
+}
+
+// errEmptyFile signals that the target path exists but is a freshly-created
+// (zero-byte) file. Not exported — used only as a control-flow signal inside
+// Open.
+var errEmptyFile = errors.New("btree: empty file")
+
+// END ENCRYPTION
 
 // DB represents an open database.
 type DB struct {
@@ -191,6 +280,45 @@ func Open(path string, opts Options) (*DB, error) {
 	p.inProcess = opts.InProcess
 	p.noCommitSync = opts.NoCommitSync
 	p.inMemory = opts.InMemory
+
+	// BEGIN ENCRYPTION
+	// Build and install codec before p.open(). For an existing file we read
+	// the header first to discover the salt; for a new file we generate a
+	// fresh salt. InMemory databases skip encryption entirely (spec-fit §7).
+	wantEncryption := opts.Key != nil || opts.Codec != nil
+	if wantEncryption && !opts.InMemory {
+		existingHeader, herr := readInitialHeader(path)
+		fileExists := herr == nil
+		switch {
+		case herr != nil && !errors.Is(herr, os.ErrNotExist) && !errors.Is(herr, errEmptyFile):
+			return nil, fmt.Errorf("btree: read header: %w", herr)
+		case fileExists && existingHeader.ReservedSpace == 0:
+			return nil, fmt.Errorf("btree: database file is not encrypted, remove Options.Key/Codec")
+		}
+		var salt [SaltLen]byte
+		if fileExists {
+			salt = existingHeader.Salt
+		} else {
+			if _, err := rand.Read(salt[:]); err != nil {
+				return nil, fmt.Errorf("btree: generate salt: %w", err)
+			}
+		}
+		codec, cerr := buildCodec(opts, salt[:])
+		if cerr != nil {
+			return nil, cerr
+		}
+		p.header.Salt = salt
+		p.installCodec(codec)
+	} else if !wantEncryption && !opts.InMemory {
+		// No key provided, but file may still be encrypted. Detect and
+		// reject with a clear error.
+		existingHeader, herr := readInitialHeader(path)
+		if herr == nil && existingHeader.ReservedSpace > 0 {
+			return nil, fmt.Errorf("btree: database file is encrypted, Options.Key or Options.Codec required")
+		}
+	}
+	// END ENCRYPTION
+
 	if err := p.open(); err != nil {
 		return nil, err
 	}
