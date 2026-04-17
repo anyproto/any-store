@@ -679,3 +679,57 @@ func BenchmarkFilter_Ok(b *testing.B) {
 		bench(b, `{"b":{"$all":[1,3]}}`)
 	})
 }
+
+// --- Coverage tests from filter_size_coverage_test.go ---
+
+// TestSize_Coverage_IndexBoundsComposition verifies that $size contributes
+// no bounds of its own when composed with another indexed-field predicate
+// in an $and. The other field (id) must still drive IndexBounds as if $size
+// were absent, and the filter's Ok() must agree with a naive evaluation.
+// Covers query/filter.go:553-554 (Size.IndexBounds identity return).
+func TestSize_Coverage_IndexBoundsComposition(t *testing.T) {
+	// {$and: [{arr: {$size: 2}}, {id: {$gt: 10}}]}
+	f, err := ParseCondition(`{"$and": [{"arr": {"$size": 2}}, {"id": {"$gt": 10}}]}`)
+	require.NoError(t, err)
+
+	t.Run("bounds on id include the id range", func(t *testing.T) {
+		bs := f.IndexBounds("id", nil)
+		// id > 10 → one open-ended Bound with Start set, no End.
+		require.Len(t, bs, 1, "id > 10 must contribute exactly one Bound")
+		assert.NotEmpty(t, bs[0].Start, "id > 10 Bound must have a Start value")
+		assert.False(t, bs[0].StartInclude, "$gt is exclusive — StartInclude must be false")
+		assert.Empty(t, bs[0].End, "id > 10 Bound must be open-ended (no End)")
+	})
+
+	t.Run("bounds on arr do not include the $size term", func(t *testing.T) {
+		// $size.IndexBounds returns the input bounds unchanged; the AND
+		// evaluation therefore yields nil for field "arr".
+		bs := f.IndexBounds("arr", nil)
+		assert.Empty(t, bs,
+			"$size must contribute no bounds — IndexBounds('arr', nil) must stay empty")
+	})
+
+	t.Run("Ok matches naive filter over arr + id", func(t *testing.T) {
+		// Docs: naive filter = len(arr) == 2 AND id > 10.
+		cases := []struct {
+			json string
+			want bool
+		}{
+			{`{"id": 15, "arr": [1, 2]}`, true},      // size ok, id>10 ok
+			{`{"id": 5, "arr": [1, 2]}`, false},      // size ok, id fails
+			{`{"id": 15, "arr": [1]}`, false},        // size fails
+			{`{"id": 15, "arr": [1, 2, 3]}`, false},  // size fails
+			{`{"id": 15}`, false},                    // arr missing
+			{`{"id": 15, "arr": []}`, false},         // size == 0
+			{`{"id": 11, "arr": ["a", "b"]}`, true},  // exactly id>10
+			{`{"id": 10, "arr": ["a", "b"]}`, false}, // id == 10 not > 10
+			{`{"id": 100, "arr": ["x", "y"]}`, true}, // big id, size 2
+			{`{"id": 100, "arr": ["x"]}`, false},     // big id, size 1
+		}
+		for _, c := range cases {
+			doc := anyenc.MustParseJson(c.json)
+			got := f.Ok(doc, nil)
+			assert.Equal(t, c.want, got, "doc=%s", c.json)
+		}
+	})
+}

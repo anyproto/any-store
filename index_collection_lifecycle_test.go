@@ -252,3 +252,52 @@ func TestIndex_CollLifecycle_RenameUpdatesMetadata(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
 }
+
+// --- Coverage tests from collection_backfill_coverage_test.go ---
+
+// TestCollection_Backfill_Coverage_IndexAfterInsert verifies that when
+// EnsureIndex is called after 1K docs have been inserted, every existing
+// doc is backfilled into the new index and queries using the new index
+// return all pre-existing rows.
+func TestCollection_Backfill_Coverage_IndexAfterInsert(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+
+	const n = 1000
+	// Insert first, without any index on "a".
+	docs := make([]*anyenc.Value, n)
+	for i := 0; i < n; i++ {
+		docs[i] = anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+	assertCollCount(t, coll, n)
+
+	// No index yet.
+	require.Len(t, coll.GetIndexes(), 0)
+
+	// Create the index AFTER the data is already present.
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.Len(t, coll.GetIndexes(), 1)
+
+	// The new index must be fully populated.
+	assertIndexLen(t, coll.GetIndexes()[0], n)
+
+	// Every pre-existing document must be findable via an index-driven query.
+	for _, probe := range []int{0, 1, 42, 500, 999} {
+		count, err := coll.Find(fmt.Sprintf(`{"a":%d}`, probe)).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1, count, "a=%d should be found via the new index", probe)
+	}
+
+	// And the planner should actually pick the new index for a point lookup
+	// on this field — otherwise the backfill would be silently dead weight.
+	explain, err := coll.Find(`{"a":500}`).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explain.Sql, "Index", "planner should use the backfilled index")
+
+	// Range query across the full backfilled range returns exactly n docs.
+	count, err := coll.Find(fmt.Sprintf(`{"a":{"$gte":0,"$lt":%d}}`, n)).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, n, count, "full range should hit every backfilled entry")
+}

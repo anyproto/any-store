@@ -229,3 +229,22 @@ func TestBounds_Contains(t *testing.T) {
 		assert.False(t, bs.Contains([]byte("z")))
 	})
 }
+
+// --- Coverage tests from bound_coverage_test.go ---
+
+// TestBounds_Contains_Coverage_EmptyBounds asserts that an empty Bounds{}
+// reports Contains=false for any value. Covers query/bound.go:192-198.
+// The loop body never executes, so the method returns false.
+func TestBounds_Contains_Coverage_EmptyBounds(t *testing.T) {
+	var empty Bounds
+	assert.False(t, empty.Contains([]byte("a")),
+		"empty Bounds{} must not contain any value")
+	assert.False(t, empty.Contains(nil),
+		"empty Bounds{} must not contain nil")
+	assert.False(t, empty.Contains([]byte{}),
+		"empty Bounds{} must not contain empty byte slice")
+
+	// Explicit zero-length literal behaves identically.
+	assert.False(t, Bounds{}.Contains([]byte("a")),
+		"Bounds{} literal must not contain any value")
+}

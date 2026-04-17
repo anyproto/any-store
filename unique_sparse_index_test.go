@@ -358,3 +358,182 @@ func TestIndex_UniqueSparse_SparseNullField(t *testing.T) {
 	// Only doc with a=10 is indexed
 	assertIndexLen(t, coll.GetIndexes()[0], 1)
 }
+
+// --- Coverage tests from unique_array_coverage_test.go ---
+
+// TestIndex_UniqueArray_Coverage_WithinDocDuplicates verifies that a single
+// document containing duplicate values inside an array (e.g. x:["a","b","a"])
+// does not produce a self-collision under a unique index. The within-doc
+// dedup path in isUnique() should collapse duplicates before writing, leaving
+// one index entry per distinct value.
+func TestIndex_UniqueArray_Coverage_WithinDocDuplicates(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Fields: []string{"x"},
+		Unique: true,
+	}))
+
+	// Single doc with duplicate "a" inside the array — must not self-conflict.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"x":["a","b","a"]}`)))
+
+	assertCollCount(t, coll, 1)
+	idx := coll.GetIndexes()[0]
+
+	// Expect exactly 3 entries on a 1-field index for an array of 3 elements
+	// after within-doc dedup: "a", "b", and the array itself (serialized).
+	// The array-as-a-whole entry is emitted as a canonical key by fillKeysBuf.
+	// We only care that there's no unique violation AND that distinct scalar
+	// values show up exactly once each.
+	count, err := coll.Find(`{"x":"a"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count, "x=a should match exactly one doc")
+
+	count, err = coll.Find(`{"x":"b"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count, "x=b should match exactly one doc")
+
+	// And the index length should not blow past what a dedup'd array produces.
+	n, err := idx.Len(ctx)
+	require.NoError(t, err)
+	// Two distinct scalar keys ("a","b") plus the array-as-a-whole canonical key.
+	assert.Equal(t, 3, n, "expected 3 unique index entries after within-doc dedup")
+}
+
+// TestIndex_UniqueArray_Coverage_ScalarVsArrayCollision verifies MongoDB
+// semantics: a unique index applies to every indexed key, so a scalar doc
+// with x:"a" and an array doc with x:["a","b"] both produce a key "a"
+// and must collide on the second insert.
+func TestIndex_UniqueArray_Coverage_ScalarVsArrayCollision(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Fields: []string{"x"},
+		Unique: true,
+	}))
+
+	// Scalar insert: key "a" is written.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"d1","x":"a"}`)))
+
+	// Array insert whose elements include "a" — must fail on key "a".
+	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":"d2","x":["a","b"]}`))
+	require.ErrorIs(t, err, ErrUniqueConstraint)
+
+	// Only d1 is in the collection.
+	assertCollCount(t, coll, 1)
+
+	// And symmetric: array first, scalar second.
+	coll2, err := fx.CreateCollection(ctx, "test2")
+	require.NoError(t, err)
+	require.NoError(t, coll2.EnsureIndex(ctx, IndexInfo{
+		Fields: []string{"x"},
+		Unique: true,
+	}))
+	require.NoError(t, coll2.Insert(ctx, anyenc.MustParseJson(`{"id":"d1","x":["a","b"]}`)))
+	err = coll2.Insert(ctx, anyenc.MustParseJson(`{"id":"d2","x":"b"}`))
+	require.ErrorIs(t, err, ErrUniqueConstraint)
+	assertCollCount(t, coll2, 1)
+}
+
+// TestIndex_UniqueArray_Coverage_CompoundTrailingField verifies that a
+// compound unique index on (a,b) respects the full tuple. Docs that share
+// the first field but differ in the second must both be accepted; a
+// re-insertion of an exact tuple must then fail.
+func TestIndex_UniqueArray_Coverage_CompoundTrailingField(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Fields: []string{"a", "b"},
+		Unique: true,
+	}))
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":1,"b":2}`)))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":1,"b":3}`)))
+
+	// Different id, but exact same (a,b) tuple as id:1 — must fail.
+	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":1,"b":2}`))
+	require.ErrorIs(t, err, ErrUniqueConstraint)
+
+	assertCollCount(t, coll, 2)
+	assertIndexLen(t, coll.GetIndexes()[0], 2)
+}
+
+// TestIndex_UniqueArray_Coverage_BooleanField verifies that a unique index
+// on a boolean field distinguishes TypeTrue from TypeFalse. Two docs with
+// active:true must collide; one true + one false are both accepted.
+func TestIndex_UniqueArray_Coverage_BooleanField(t *testing.T) {
+	fx := newFixture(t)
+
+	t.Run("two trues collide", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "test_bool_collision")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+			Fields: []string{"active"},
+			Unique: true,
+		}))
+
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"active":true}`)))
+		err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"active":true}`))
+		require.ErrorIs(t, err, ErrUniqueConstraint)
+
+		assertCollCount(t, coll, 1)
+	})
+
+	t.Run("true and false both accepted", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "test_bool_mix")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+			Fields: []string{"active"},
+			Unique: true,
+		}))
+
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"active":true}`)))
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"active":false}`)))
+
+		assertCollCount(t, coll, 2)
+		assertIndexLen(t, coll.GetIndexes()[0], 2)
+	})
+}
+
+// --- Coverage tests from sparse_nested_coverage_test.go ---
+
+// TestIndex_SparseNested_Coverage_MissingIntermediate verifies that when the
+// intermediate path (meta) is null, a sparse index on meta.tags.name produces
+// no index entries.
+func TestIndex_SparseNested_Coverage_MissingIntermediate(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Fields: []string{"meta.tags.name"},
+		Sparse: true,
+	}))
+
+	// Intermediate path "meta" is null — entire leaf "meta.tags.name" is absent.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"p1","meta":null}`)))
+
+	// Also try a document where the whole "meta" key is missing.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"p2"}`)))
+
+	// And one where meta exists but tags is missing.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"p3","meta":{"x":1}}`)))
+
+	// And one where tags is an array of objects but none have a "name" field.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"p4","meta":{"tags":[{"other":1}]}}`)))
+
+	// A real hit so we also confirm the index otherwise works.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"p5","meta":{"tags":{"name":"go"}}}`)))
+
+	assertCollCount(t, coll, 5)
+
+	idx := coll.GetIndexes()[0]
+	// Only p5's "go" entry should be in the index; p1..p4 all miss the leaf.
+	// Note: p4's tags is an array of objects with only {"other":1} — the leaf
+	// path "meta.tags.name" still resolves to nil, which sparse skips.
+	n, err := idx.Len(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n, "only p5 should have an index entry under sparse meta.tags.name")
+}

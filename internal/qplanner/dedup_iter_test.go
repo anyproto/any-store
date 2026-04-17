@@ -1,6 +1,7 @@
 package qplanner
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -310,4 +311,285 @@ func TestSeenSetDedupIter_RemovesDuplicates(t *testing.T) {
 		got = append(got, string(docId))
 	}
 	assert.Equal(t, []string{"p1", "p2"}, got)
+}
+
+// --- Coverage tests from dedup_iter_coverage_test.go ---
+
+// TestCanonicalKeyDedupIter_Coverage_NilPlanPassthrough verifies that when
+// Plan is nil (no access to DocParsed) the iterator passes upstream hits
+// through unchanged. Covers the defensive nil-Plan branch at
+// internal/qplanner/dedup_iter.go:59-61.
+func TestCanonicalKeyDedupIter_Coverage_NilPlanPassthrough(t *testing.T) {
+	a := &anyenc.Arena{}
+
+	// Three arbitrary hits on two docs, no Plan/DocParsed available.
+	upstream := &fakeIter{
+		hits: []fakeHit{
+			{key: encodeKey(a.NewString("a"), "p1"), docId: []byte("p1"), doc: nil},
+			{key: encodeKey(a.NewString("b"), "p2"), docId: []byte("p2"), doc: nil},
+			{key: encodeKey(a.NewString("c"), "p1"), docId: []byte("p1"), doc: nil},
+		},
+	}
+
+	it := &CanonicalKeyDedupIter{
+		Source:    upstream,
+		Plan:      nil, // the scenario under test
+		FieldPath: []string{"tags"},
+	}
+
+	var got []string
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		got = append(got, string(docId))
+	}
+	assert.Equal(t, []string{"p1", "p2", "p1"}, got,
+		"nil Plan: every upstream hit must pass through unchanged")
+}
+
+// TestCanonicalKeyDedupIter_Coverage_NilDocParsedPassthrough verifies the
+// defensive branch when Plan is non-nil but Plan.DocParsed is nil — the
+// iterator cannot see the array, so it passes through.
+func TestCanonicalKeyDedupIter_Coverage_NilDocParsedPassthrough(t *testing.T) {
+	a := &anyenc.Arena{}
+
+	// fakeIter populates Plan.DocParsed from hit.doc — here we set doc=nil
+	// so that DocParsed remains nil after the upstream call.
+	plan := &Plan{}
+	upstream := &fakeIter{
+		plan: plan,
+		hits: []fakeHit{
+			{key: encodeKey(a.NewString("a"), "p1"), docId: []byte("p1"), doc: nil},
+			{key: encodeKey(a.NewString("b"), "p2"), docId: []byte("p2"), doc: nil},
+		},
+	}
+
+	it := &CanonicalKeyDedupIter{
+		Source:    upstream,
+		Plan:      plan,
+		FieldPath: []string{"tags"},
+	}
+
+	var got []string
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		got = append(got, string(docId))
+	}
+	assert.Equal(t, []string{"p1", "p2"}, got,
+		"nil DocParsed: every upstream hit must pass through unchanged")
+}
+
+// TestCanonicalKeyDedupIter_Coverage_EmptyArrayWithBounds verifies the
+// length-0 array combined with non-empty bounds branch at
+// internal/qplanner/dedup_iter.go:68-88.
+// When the array is [] and bounds are non-empty, no element can match;
+// the iterator must pass through conservatively (it.best stays empty).
+func TestCanonicalKeyDedupIter_Coverage_EmptyArrayWithBounds(t *testing.T) {
+	a := &anyenc.Arena{}
+
+	// Build doc: {"id":"p1","tags":[]}
+	arr := a.NewArray()
+	doc := a.NewObject()
+	doc.Set("id", a.NewString("p1"))
+	doc.Set("tags", arr)
+
+	// bounds: tags $in ["a"]
+	bs := query.Bounds{
+		{
+			Start:        a.NewString("a").MarshalTo(nil),
+			End:          a.NewString("a").MarshalTo(nil),
+			StartInclude: true, EndInclude: true,
+		},
+	}
+
+	plan := &Plan{}
+	// Upstream emits one hit (as a real btree would not — but tests the
+	// defensive path). Key prefix = "a", docId = "p1".
+	upstream := &fakeIter{
+		plan: plan,
+		hits: []fakeHit{
+			{key: encodeKey(a.NewString("a"), "p1"), docId: []byte("p1"), doc: doc},
+		},
+	}
+
+	it := &CanonicalKeyDedupIter{
+		Source:    upstream,
+		Plan:      plan,
+		Bounds:    bs,
+		FieldPath: []string{"tags"},
+	}
+
+	// Per dedup_iter.go:85-88, when no array element hits the bounds the
+	// iterator passes through conservatively (best stays empty).
+	_, docId, err := it.Next()
+	require.NoError(t, err)
+	assert.Equal(t, []byte("p1"), docId,
+		"empty array vs non-empty bounds: conservative passthrough")
+
+	// Ensure drained.
+	_, docId2, err := it.Next()
+	require.NoError(t, err)
+	assert.Nil(t, docId2)
+}
+
+// TestCanonicalKeyDedupIter_Coverage_ArrayAllOutsideBounds verifies graceful
+// handling when the upstream emits a doc whose array values all fall outside
+// the query bounds. Covers the "no element in bounds" path at
+// internal/qplanner/dedup_iter.go:69-88.
+func TestCanonicalKeyDedupIter_Coverage_ArrayAllOutsideBounds(t *testing.T) {
+	a := &anyenc.Arena{}
+
+	// Doc tags = ["a","b","c"], bounds $in ["x","y"] — no overlap.
+	arr := a.NewArray()
+	arr.SetArrayItem(0, a.NewString("a"))
+	arr.SetArrayItem(1, a.NewString("b"))
+	arr.SetArrayItem(2, a.NewString("c"))
+	doc := a.NewObject()
+	doc.Set("id", a.NewString("p1"))
+	doc.Set("tags", arr)
+
+	bs := query.Bounds{
+		{Start: a.NewString("x").MarshalTo(nil), End: a.NewString("x").MarshalTo(nil), StartInclude: true, EndInclude: true},
+		{Start: a.NewString("y").MarshalTo(nil), End: a.NewString("y").MarshalTo(nil), StartInclude: true, EndInclude: true},
+	}
+
+	plan := &Plan{}
+	// Stage a hit whose fieldVal differs from any bound entry.
+	upstream := &fakeIter{
+		plan: plan,
+		hits: []fakeHit{
+			{key: encodeKey(a.NewString("a"), "p1"), docId: []byte("p1"), doc: doc},
+		},
+	}
+
+	it := &CanonicalKeyDedupIter{
+		Source:    upstream,
+		Plan:      plan,
+		Bounds:    bs,
+		FieldPath: []string{"tags"},
+	}
+
+	// Conservative passthrough: emit the hit even though the doc's array
+	// has no in-bounds element.
+	_, docId, err := it.Next()
+	require.NoError(t, err)
+	assert.Equal(t, []byte("p1"), docId,
+		"all array values outside bounds: conservative passthrough")
+
+	_, docId2, err := it.Next()
+	require.NoError(t, err)
+	assert.Nil(t, docId2)
+}
+
+// TestCanonicalKeyDedupIter_Coverage_ReverseExclusiveBounds verifies that
+// reverse-scan with exclusive bounds (tags $gt "a" $lt "z") emits exactly
+// the maximum in-bounds element and suppresses duplicates.
+// Covers internal/qplanner/dedup_iter.go:80-83.
+func TestCanonicalKeyDedupIter_Coverage_ReverseExclusiveBounds(t *testing.T) {
+	a := &anyenc.Arena{}
+
+	// Doc tags include an element strictly below "a", two in-range, and
+	// one strictly at the excluded end "z".
+	arr := a.NewArray()
+	arr.SetArrayItem(0, a.NewString("a")) // excluded by $gt
+	arr.SetArrayItem(1, a.NewString("b")) // included
+	arr.SetArrayItem(2, a.NewString("y")) // included (canonical max in reverse)
+	arr.SetArrayItem(3, a.NewString("z")) // excluded by $lt
+	doc := a.NewObject()
+	doc.Set("id", a.NewString("p1"))
+	doc.Set("tags", arr)
+
+	// tags $gt "a" $lt "z": exclusive on both ends.
+	bs := query.Bounds{
+		{
+			Start:        a.NewString("a").MarshalTo(nil),
+			End:          a.NewString("z").MarshalTo(nil),
+			StartInclude: false,
+			EndInclude:   false,
+		},
+	}
+
+	plan := &Plan{}
+	// Reverse scan order: btree yields keys in descending order, so for a
+	// single doc with tags b,y the cursor sees y first, then b.
+	upstream := &fakeIter{
+		plan: plan,
+		hits: []fakeHit{
+			{key: encodeKey(a.NewString("y"), "p1"), docId: []byte("p1"), doc: doc},
+			{key: encodeKey(a.NewString("b"), "p1"), docId: []byte("p1"), doc: doc},
+		},
+	}
+
+	it := &CanonicalKeyDedupIter{
+		Source:    upstream,
+		Plan:      plan,
+		Bounds:    bs,
+		FieldPath: []string{"tags"},
+		Reverse:   true,
+	}
+
+	// Emit at the canonical (max-in-bounds) hit, skip the rest.
+	k1, docId, err := it.Next()
+	require.NoError(t, err)
+	require.Equal(t, []byte("p1"), docId)
+	// The emitted key must be the "y" hit (canonical maximum under reverse).
+	expectedKey := encodeKey(a.NewString("y"), "p1")
+	assert.Equal(t, expectedKey, k1,
+		"reverse + exclusive bounds: emit at canonical max ('y'), skip 'b'")
+
+	_, docId2, err := it.Next()
+	require.NoError(t, err)
+	assert.Nil(t, docId2, "'b' must be skipped as non-canonical in reverse")
+}
+
+// TestSeenSetDedupIter_Coverage_HashSetStress exercises the SeenSet with
+// enough hits and distinct keys to trigger map growth and hash collisions.
+// Covers internal/qplanner/dedup_iter.go:119-133.
+func TestSeenSetDedupIter_Coverage_HashSetStress(t *testing.T) {
+	a := &anyenc.Arena{}
+
+	const distinctDocs = 100
+	const hitsPerDoc = 15 // 1500 total hits, 100 distinct docIds
+
+	hits := make([]fakeHit, 0, distinctDocs*hitsPerDoc)
+	for r := 0; r < hitsPerDoc; r++ {
+		for d := 0; d < distinctDocs; d++ {
+			docId := fmt.Sprintf("doc%03d", d)
+			// Ensure each hit has a different key so it isn't trivially deduped
+			// on key identity (SeenSet dedups on docId).
+			keyStr := fmt.Sprintf("r%02d_%s", r, docId)
+			obj := a.NewObject()
+			obj.Set("id", a.NewString(docId))
+			hits = append(hits, fakeHit{
+				key:   encodeKey(a.NewString(keyStr), docId),
+				docId: []byte(docId),
+				doc:   obj,
+			})
+		}
+	}
+
+	upstream := &fakeIter{hits: hits}
+	it := &SeenSetDedupIter{Source: upstream}
+
+	seen := make(map[string]int)
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		seen[string(docId)]++
+	}
+
+	require.Len(t, seen, distinctDocs, "must yield exactly 100 distinct docIds")
+	for docId, count := range seen {
+		require.Equal(t, 1, count, "docId %q must be emitted exactly once (got %d)", docId, count)
+	}
 }

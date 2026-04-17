@@ -325,3 +325,58 @@ func iterIds(t *testing.T, _ Collection, q Query) ([]string, error) {
 	sort.Strings(out)
 	return out, nil
 }
+
+// --- Coverage tests from multikey_dedup_coverage_test.go ---
+
+// TestMultiKeyDedup_Coverage_PureSortNoBounds exercises buildIndexScanChain
+// on a multi-key index with a pure Sort() and no filter (noBounds==true).
+// Covers internal/qplanner/planner.go:1017-1029 — the dedup wrap must still
+// run even when bounds are empty. Each doc must appear exactly once despite
+// multiple index entries per array element.
+func TestMultiKeyDedup_Coverage_PureSortNoBounds(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "posts")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "tags", Fields: []string{"tags"}}))
+
+	// Each doc has multiple tags → multiple index entries per doc.
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"p1","tags":["a","b","c","d","e"]}`),
+		anyenc.MustParseJson(`{"id":"p2","tags":["b","c","f"]}`),
+		anyenc.MustParseJson(`{"id":"p3","tags":["x"]}`),
+		anyenc.MustParseJson(`{"id":"p4","tags":["a","z"]}`),
+	))
+
+	// Pure sort on the multi-key indexed field with no filter.
+	q := coll.Find(`{}`).Sort("tags")
+
+	it, err := q.Iter(ctx)
+	require.NoError(t, err)
+	defer it.Close()
+
+	counts := map[string]int{}
+	var order []string
+	for it.Next() {
+		d, err := it.Doc()
+		require.NoError(t, err)
+		id := string(d.Value().GetStringBytes("id"))
+		counts[id]++
+		order = append(order, id)
+	}
+	require.NoError(t, it.Err())
+
+	// Each doc must appear exactly once (dedup must run over empty bounds).
+	for _, id := range []string{"p1", "p2", "p3", "p4"} {
+		assert.Equal(t, 1, counts[id],
+			"doc %q must appear exactly once under Sort('tags')+no filter", id)
+	}
+	sorted := append([]string{}, order...)
+	sort.Strings(sorted)
+	assert.ElementsMatch(t, []string{"p1", "p2", "p3", "p4"}, sorted)
+
+	// Count() must also dedup correctly (not return 11 entries).
+	n, err := coll.Find(`{}`).Sort("tags").Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 4, n,
+		"Count on sort-only multi-key must match distinct-doc count")
+}

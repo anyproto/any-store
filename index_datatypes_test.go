@@ -127,3 +127,32 @@ func TestIndex_DataTypes_UnicodeStrings(t *testing.T) {
 
 	assertIndexLen(t, coll.GetIndexes()[0], 5)
 }
+
+// --- Coverage tests from anyenc_nul_coverage_test.go ---
+
+// TestAnyenc_Coverage_EmbeddedNulPreservesSeparation verifies that inserting
+// two documents whose name field differs only by an embedded NUL byte
+// ({id:"d1", name:"a\x00b"} and {id:"d2", name:"a"}) remain independently
+// queryable. Each of the two equality queries must match exactly one doc.
+//
+// Gap item 47: String with embedded NUL byte ("a\x00b").
+func TestAnyenc_Coverage_EmbeddedNulPreservesSeparation(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+
+	// JSON \u0000 produces a literal NUL byte in the resulting string.
+	d1 := anyenc.MustParseJson(`{"id":"d1","name":"a\u0000b"}`)
+	d2 := anyenc.MustParseJson(`{"id":"d2","name":"a"}`)
+	require.NoError(t, coll.Insert(ctx, d1, d2))
+
+	// Query by name = "a\x00b" — must return exactly d1.
+	got1 := collectField(t, coll.Find(`{"name":"a\u0000b"}`), "id")
+	assert.Equal(t, []string{`"d1"`}, got1,
+		"query by name=\"a\\x00b\" must match only d1")
+
+	// Query by name = "a" — must return exactly d2.
+	got2 := collectField(t, coll.Find(`{"name":"a"}`), "id")
+	assert.Equal(t, []string{`"d2"`}, got2,
+		"query by name=\"a\" must match only d2")
+}
