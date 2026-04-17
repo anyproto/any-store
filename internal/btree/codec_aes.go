@@ -60,7 +60,7 @@ func (c *aesCodec) Overhead() int { return aesCodecOverhead }
 // both have length pageSize; dst must not alias src. The first
 // (pageSize - Overhead()) bytes of src are the page body to encrypt; the
 // trailing Overhead() bytes of src are ignored.
-func (c *aesCodec) Encrypt(dst, src []byte, pgno uint32) ([]byte, error) {
+func (c *aesCodec) Encrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte, error) {
 	if len(dst) < len(src) {
 		return nil, fmt.Errorf("btree: aesCodec.Encrypt: dst too small (%d < %d)", len(dst), len(src))
 	}
@@ -69,25 +69,28 @@ func (c *aesCodec) Encrypt(dst, src []byte, pgno uint32) ([]byte, error) {
 		return nil, fmt.Errorf("btree: aesCodec.Encrypt: page too small (%d < overhead %d)", len(src), aesCodecOverhead)
 	}
 
+	// Nonce and AAD buffers come from the caller-owned scratch so they
+	// don't escape to the heap on every call through the aead interface.
+	nonce := s.nonce[:aesNonceLen]
+	aad := s.aad[:4]
+
 	// Draw a fresh random nonce from the userspace pool (amortizes
 	// crypto/rand.Read across many calls).
-	var nonce [aesNonceLen]byte
-	if err := c.nonces.Draw(nonce[:]); err != nil {
+	if err := c.nonces.Draw(nonce); err != nil {
 		return nil, fmt.Errorf("btree: aesCodec.Encrypt: nonce draw: %w", err)
 	}
 
 	// AAD = page number as little-endian uint32. Binds the page location
 	// into the MAC so pages cannot be shuffled between file positions.
-	var aad [4]byte
-	binary.LittleEndian.PutUint32(aad[:], pgno)
+	binary.LittleEndian.PutUint32(aad, pgno)
 
 	// Seal(dst[:0], nonce, plaintext, aad) appends ct||tag to dst[:0],
 	// producing dst[0 : bodyLen+aesTagLen].
-	_ = c.aead.Seal(dst[:0], nonce[:], src[:bodyLen], aad[:])
+	_ = c.aead.Seal(dst[:0], nonce, src[:bodyLen], aad)
 
 	// Write nonce after the tag: dst[bodyLen+16 : bodyLen+28].
 	noncePos := bodyLen + aesTagLen
-	copy(dst[noncePos:noncePos+aesNonceLen], nonce[:])
+	copy(dst[noncePos:noncePos+aesNonceLen], nonce)
 
 	// Zero any trailing padding between the nonce and end-of-page.
 	for i := noncePos + aesNonceLen; i < len(src); i++ {
@@ -99,7 +102,7 @@ func (c *aesCodec) Encrypt(dst, src []byte, pgno uint32) ([]byte, error) {
 // Decrypt is the inverse of Encrypt. Returns ErrCodecTamper on any
 // authentication failure (wrong key, corruption, or pgno mismatch).
 // dst must not alias src.
-func (c *aesCodec) Decrypt(dst, src []byte, pgno uint32) ([]byte, error) {
+func (c *aesCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte, error) {
 	if len(dst) < len(src) {
 		return nil, fmt.Errorf("btree: aesCodec.Decrypt: dst too small (%d < %d)", len(dst), len(src))
 	}
@@ -113,12 +116,12 @@ func (c *aesCodec) Decrypt(dst, src []byte, pgno uint32) ([]byte, error) {
 	noncePos := bodyLen + aesTagLen
 	nonce := src[noncePos : noncePos+aesNonceLen]
 
-	var aad [4]byte
-	binary.LittleEndian.PutUint32(aad[:], pgno)
+	aad := s.aad[:4]
+	binary.LittleEndian.PutUint32(aad, pgno)
 
 	// Open(dst[:0], nonce, ct||tag, aad) writes plaintext to dst[0:bodyLen].
 	// dst and src are separate buffers — no aliasing.
-	pt, err := c.aead.Open(dst[:0], nonce, ctAndTag, aad[:])
+	pt, err := c.aead.Open(dst[:0], nonce, ctAndTag, aad)
 	if err != nil {
 		return nil, ErrCodecTamper
 	}

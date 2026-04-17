@@ -69,7 +69,7 @@ func NewXChaCha20Poly1305Codec(key []byte) (Codec, error) {
 func (c *chachaCodec) Overhead() int { return c.overhead }
 
 // Encrypt follows the same [ct][tag][nonce][pad] layout as aesCodec.
-func (c *chachaCodec) Encrypt(dst, src []byte, pgno uint32) ([]byte, error) {
+func (c *chachaCodec) Encrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte, error) {
 	if len(dst) < len(src) {
 		return nil, fmt.Errorf("btree: chachaCodec.Encrypt: dst too small (%d < %d)", len(dst), len(src))
 	}
@@ -78,15 +78,15 @@ func (c *chachaCodec) Encrypt(dst, src []byte, pgno uint32) ([]byte, error) {
 		return nil, fmt.Errorf("btree: chachaCodec.Encrypt: page too small (%d < overhead %d)", len(src), c.overhead)
 	}
 
-	nonce := make([]byte, c.nonceLen)
+	nonce := s.nonce[:c.nonceLen]
+	aad := s.aad[:4]
+
 	if err := c.nonces.Draw(nonce); err != nil {
 		return nil, fmt.Errorf("btree: chachaCodec.Encrypt: nonce draw: %w", err)
 	}
+	binary.LittleEndian.PutUint32(aad, pgno)
 
-	var aad [4]byte
-	binary.LittleEndian.PutUint32(aad[:], pgno)
-
-	_ = c.aead.Seal(dst[:0], nonce, src[:bodyLen], aad[:])
+	_ = c.aead.Seal(dst[:0], nonce, src[:bodyLen], aad)
 	// Layout: [ct(bodyLen)][tag(16)] are at dst[0:bodyLen+16]; now place
 	// nonce after the tag, then zero any remaining padding.
 	noncePos := bodyLen + chachaTagLen
@@ -97,7 +97,7 @@ func (c *chachaCodec) Encrypt(dst, src []byte, pgno uint32) ([]byte, error) {
 	return dst[:len(src)], nil
 }
 
-func (c *chachaCodec) Decrypt(dst, src []byte, pgno uint32) ([]byte, error) {
+func (c *chachaCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte, error) {
 	if len(dst) < len(src) {
 		return nil, fmt.Errorf("btree: chachaCodec.Decrypt: dst too small (%d < %d)", len(dst), len(src))
 	}
@@ -110,10 +110,10 @@ func (c *chachaCodec) Decrypt(dst, src []byte, pgno uint32) ([]byte, error) {
 	noncePos := bodyLen + chachaTagLen
 	nonce := src[noncePos : noncePos+c.nonceLen]
 
-	var aad [4]byte
-	binary.LittleEndian.PutUint32(aad[:], pgno)
+	aad := s.aad[:4]
+	binary.LittleEndian.PutUint32(aad, pgno)
 
-	pt, err := c.aead.Open(dst[:0], nonce, ctAndTag, aad[:])
+	pt, err := c.aead.Open(dst[:0], nonce, ctAndTag, aad)
 	if err != nil {
 		return nil, ErrCodecTamper
 	}

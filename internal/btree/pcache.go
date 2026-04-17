@@ -77,6 +77,20 @@ type pcache struct {
 	// szSpill is the spill threshold: xStress fires when page count exceeds
 	// szSpill. 0 means use maxPages as the threshold.
 	szSpill int
+
+	// codecScratch is a page-sized scratch buffer used by the reader path
+	// (pager.getPageReader + wal.readFrame via getPageReader) to hold
+	// plaintext while the encrypted page is decrypted. Allocated lazily on
+	// first use when a codec is installed. Safe as a single shared buffer
+	// per cache because read transactions are single-goroutine: one tx
+	// owns one pcache and issues reads sequentially.
+	codecScratch []byte
+	// codecAEAD holds the nonce/AAD scratch for reader-side codec calls.
+	// Same threading rules as codecScratch (per-tx pcache is
+	// single-goroutine). Embedded by value so the slice headers returned
+	// by aad[:]/nonce[:] point at heap memory owned by the pcache,
+	// avoiding per-call escape into the cipher.AEAD interface.
+	codecAEAD aeadScratch
 }
 
 func newPcache(pageSize, maxPages int, purgeable bool) *pcache {

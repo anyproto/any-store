@@ -333,7 +333,7 @@ func Open(path string, opts Options) (*DB, error) {
 	// BEGIN ENCRYPTION
 	// Build and install codec before p.open(). For an existing file we read
 	// the header first to discover the salt; for a new file we generate a
-	// fresh salt. InMemory databases skip encryption entirely (spec-fit §7).
+	// fresh salt. InMemory databases skip encryption entirely (encryption.md §7).
 	//
 	// The encryption marker on disk is a non-zero Salt field (bytes 72-87
 	// of page 1). ReservedSpace alone is NOT the marker, because the same

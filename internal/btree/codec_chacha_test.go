@@ -38,7 +38,7 @@ func testChachaRoundTrip(t *testing.T, c Codec) {
 	srcCopy := make([]byte, pageSize)
 	copy(srcCopy, src)
 	dst := make([]byte, pageSize)
-	ct, err := c.Encrypt(dst, src, 7)
+	ct, err := c.Encrypt(dst, src, 7, &aeadScratch{})
 	if err != nil {
 		t.Fatalf("Encrypt: %v", err)
 	}
@@ -46,7 +46,7 @@ func testChachaRoundTrip(t *testing.T, c Codec) {
 		t.Fatalf("ciphertext length = %d, want %d", len(ct), pageSize)
 	}
 	pt := make([]byte, pageSize)
-	out, err := c.Decrypt(pt, ct, 7)
+	out, err := c.Decrypt(pt, ct, 7, &aeadScratch{})
 	if err != nil {
 		t.Fatalf("Decrypt: %v", err)
 	}
@@ -75,10 +75,10 @@ func testChachaTamperDetected(t *testing.T, c Codec) {
 	pageSize := 4096
 	src := make([]byte, pageSize)
 	dst := make([]byte, pageSize)
-	ct, _ := c.Encrypt(dst, src, 1)
+	ct, _ := c.Encrypt(dst, src, 1, &aeadScratch{})
 	ct[100] ^= 0x01
 	pt := make([]byte, pageSize)
-	if _, err := c.Decrypt(pt, ct, 1); err != ErrCodecTamper {
+	if _, err := c.Decrypt(pt, ct, 1, &aeadScratch{}); err != ErrCodecTamper {
 		t.Fatalf("flipped-bit decrypt: got err=%v, want ErrCodecTamper", err)
 	}
 }
@@ -98,9 +98,9 @@ func TestChaCha20Poly1305Codec_PageNumberBound(t *testing.T) {
 	pageSize := 4096
 	src := make([]byte, pageSize)
 	dst := make([]byte, pageSize)
-	ct, _ := c.Encrypt(dst, src, 5)
+	ct, _ := c.Encrypt(dst, src, 5, &aeadScratch{})
 	pt := make([]byte, pageSize)
-	if _, err := c.Decrypt(pt, ct, 6); err != ErrCodecTamper {
+	if _, err := c.Decrypt(pt, ct, 6, &aeadScratch{}); err != ErrCodecTamper {
 		t.Fatalf("wrong-pgno decrypt: got err=%v, want ErrCodecTamper", err)
 	}
 }

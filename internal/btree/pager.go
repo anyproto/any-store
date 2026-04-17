@@ -181,6 +181,19 @@ type pager struct {
 	// decrypts them after reads. Installed once at Open and immutable
 	// thereafter. Safe for concurrent use across the writer and readers.
 	codec Codec
+	// codecScratch is a reusable page-sized scratch buffer used on the
+	// writer side (initNewDB, getPageWriter, wal.writeFrame) to hold
+	// ciphertext while the source plaintext stays live in the pcache.
+	// Allocated once in installCodec; reused for the pager's lifetime.
+	// Safe to share because all three users are writer-serialized
+	// (single-writer invariant). Reader paths cannot use this buffer
+	// because multiple read transactions may run concurrently.
+	// Modeled after SQLCipher's codec_ctx->buffer (crypto_impl.c).
+	codecScratch []byte
+	// codecAEAD holds the nonce/AAD scratch for writer-side codec calls.
+	// Heap-allocated as part of the pager struct; passed by pointer so
+	// the crypto/cipher.AEAD interface calls don't force per-call escape.
+	codecAEAD aeadScratch
 	// END ENCRYPTION
 }
 
@@ -325,7 +338,7 @@ func (p *pager) open() error {
 		frame := p.wal.index.get(1, p.wal.index.maxFrame.Load())
 		if frame > 0 {
 			walBuf := make([]byte, p.pageSize)
-			if err := p.wal.readFrame(frame, walBuf); err == nil {
+			if err := p.wal.readFrame(frame, walBuf, nil, nil); err == nil {
 				p.header.deserialize(walBuf[:dbHeaderSize])
 			}
 		}
@@ -354,6 +367,11 @@ func (p *pager) installCodec(c Codec) {
 	p.codec = c
 	p.header.ReservedSpace = uint8(c.Overhead())
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
+	// Pre-allocate one writer-side scratch buffer. Reused by all writer
+	// paths (single-writer invariant); avoids per-call allocPageBuffer /
+	// freePageBuffer churn that turned sync.Pool.Put's eface box into a
+	// hot allocation site under encryption.
+	p.codecScratch = make([]byte, p.pageSize)
 }
 
 // encryptPage transforms plaintext page bytes for writing to disk or WAL.
@@ -368,14 +386,17 @@ func (p *pager) installCodec(c Codec) {
 // This is the any-store equivalent of SQLCipher's CODEC2 macro
 // (pager.c:412), unified into one function.
 func (p *pager) encryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
-	return encryptPageWithCodec(p.codec, scratch, src, pgno)
+	return encryptPageWithCodec(p.codec, scratch, src, pgno, &p.codecAEAD)
 }
 
 // decryptPage is the inverse. Returns src unchanged when no codec is
 // installed; otherwise decrypts into scratch and returns the plaintext
 // slice. On AEAD verification failure returns ErrCodecTamper.
+// decryptPage uses the pager's writer-side AEAD scratch. Reader-path
+// callers must NOT go through this; they should call
+// decryptPageWithCodec directly with their own *aeadScratch.
 func (p *pager) decryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
-	return decryptPageWithCodec(p.codec, scratch, src, pgno)
+	return decryptPageWithCodec(p.codec, scratch, src, pgno, &p.codecAEAD)
 }
 
 // END ENCRYPTION
@@ -439,9 +460,7 @@ func (p *pager) initNewDB() error {
 		// by encryptPage; only bytes >= dbHeaderSize are encrypted.
 		writeBuf := buf
 		if p.codec != nil {
-			scratch := allocPageBuffer(int(p.pageSize), false)
-			defer freePageBuffer(scratch, false)
-			ct, err := p.encryptPage(scratch, buf, 1)
+			ct, err := p.encryptPage(p.codecScratch, buf, 1)
 			if err != nil {
 				return err
 			}
@@ -463,7 +482,7 @@ func (p *pager) initNewDB() error {
 
 	// For inMemory mode, pre-populate page 1 in masterStore so reads find it.
 	// Note: masterStore stores plaintext (encryption is a file-at-rest concern
-	// per spec-fit.md §7; InMemory has no "at rest").
+	// per encryption.md §7; InMemory has no "at rest").
 	if p.inMemory && p.master != nil {
 		p.master.writePage(1, buf)
 	}
@@ -576,7 +595,7 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 	if walMaxFrame > 0 {
 		frame := p.wal.index.get(pgno, walMaxFrame)
 		if frame > 0 {
-			if err := p.wal.readFrame(frame, pg.data); err == nil {
+			if err := p.wal.readFrame(frame, pg.data, p.codecScratch, &p.codecAEAD); err == nil {
 				// Parse page header
 				off := 0
 				if pgno == 1 {
@@ -607,15 +626,12 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 		} else {
 			// BEGIN ENCRYPTION
 			if p.codec != nil {
-				scratch := allocPageBuffer(int(p.pageSize), false)
-				plain, derr := p.decryptPage(scratch, pg.data, pgno)
+				plain, derr := p.decryptPage(p.codecScratch, pg.data, pgno)
 				if derr != nil {
-					freePageBuffer(scratch, false)
 					p.writerCache.discard(pg.pgno)
 					return nil, fmt.Errorf("btree: decrypt page %d: %w", pgno, derr)
 				}
 				copy(pg.data, plain)
-				freePageBuffer(scratch, false)
 			}
 			// END ENCRYPTION
 		}
@@ -654,7 +670,7 @@ func (p *pager) readTempPage(pgno, walMaxFrame uint32) (*page, error) {
 	if walMaxFrame > 0 {
 		frame := p.wal.index.get(pgno, walMaxFrame)
 		if frame > 0 {
-			if err := p.wal.readFrame(frame, pg.data); err == nil {
+			if err := p.wal.readFrame(frame, pg.data, nil, nil); err == nil {
 				off := 0
 				if pgno == 1 {
 					off = dbHeaderSize
@@ -743,7 +759,10 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 	if walMaxFrame > 0 {
 		frame := p.wal.index.get(pgno, walMaxFrame)
 		if frame > 0 {
-			if err := p.wal.readFrame(frame, pg.data); err == nil {
+			if p.codec != nil && cache.codecScratch == nil {
+				cache.codecScratch = make([]byte, p.pageSize)
+			}
+			if err := p.wal.readFrame(frame, pg.data, cache.codecScratch, &cache.codecAEAD); err == nil {
 				off := 0
 				if pgno == 1 {
 					off = dbHeaderSize
@@ -768,15 +787,15 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 		} else {
 			// BEGIN ENCRYPTION
 			if p.codec != nil {
-				scratch := allocPageBuffer(int(p.pageSize), false)
-				plain, derr := p.decryptPage(scratch, pg.data, pgno)
+				if cache.codecScratch == nil {
+					cache.codecScratch = make([]byte, p.pageSize)
+				}
+				plain, derr := decryptPageWithCodec(p.codec, cache.codecScratch, pg.data, pgno, &cache.codecAEAD)
 				if derr != nil {
-					freePageBuffer(scratch, false)
 					cache.discard(pg.pgno)
 					return nil, fmt.Errorf("btree: decrypt page %d: %w", pgno, derr)
 				}
 				copy(pg.data, plain)
-				freePageBuffer(scratch, false)
 			}
 			// END ENCRYPTION
 		}

@@ -1130,6 +1130,14 @@ type wal struct {
 	// them on read. Propagated from the pager after wal creation via
 	// p.wal.codec = p.codec; see pager.open / pager.initNewDB.
 	codec Codec
+	// codecScratch is a page-sized scratch used by writeFrame to hold
+	// ciphertext. Allocated lazily on first use. Writes are
+	// single-writer-serialized, so one buffer is safe.
+	codecScratch []byte
+	// codecAEAD is the nonce/AAD scratch for writeFrame's codec call.
+	// Embedded by value so nonce/aad slices live on the wal's heap
+	// allocation rather than escaping per-call.
+	codecAEAD aeadScratch
 	// END ENCRYPTION
 }
 
@@ -1464,16 +1472,16 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		binary.BigEndian.PutUint32(frameHdr[12:16], w.header.salt2)
 
 		// BEGIN ENCRYPTION
-		// Encrypt page payload before checksum (per spec-fit.md §4.3: the
+		// Encrypt page payload before checksum (per encryption.md §4.3: the
 		// WAL checksum covers ciphertext). When no codec is installed this
 		// is a zero-cost pass-through — payload := p.data.
 		payload := p.data
-		var payloadScratch []byte
 		if w.codec != nil {
-			payloadScratch = allocPageBuffer(int(w.pageSize), false)
-			ct, eerr := encryptPageWithCodec(w.codec, payloadScratch, p.data, p.pgno)
+			if w.codecScratch == nil {
+				w.codecScratch = make([]byte, w.pageSize)
+			}
+			ct, eerr := encryptPageWithCodec(w.codec, w.codecScratch, p.data, p.pgno, &w.codecAEAD)
 			if eerr != nil {
-				freePageBuffer(payloadScratch, false)
 				return eerr
 			}
 			payload = ct
@@ -1489,27 +1497,12 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 
 		// Write frame header
 		if _, err := w.file.WriteAt(frameHdr[:], off); err != nil {
-			// BEGIN ENCRYPTION
-			if payloadScratch != nil {
-				freePageBuffer(payloadScratch, false)
-			}
-			// END ENCRYPTION
 			return err
 		}
 		// Write page data (plaintext or ciphertext depending on codec).
 		if _, err := w.file.WriteAt(payload, off+walFrameSize); err != nil {
-			// BEGIN ENCRYPTION
-			if payloadScratch != nil {
-				freePageBuffer(payloadScratch, false)
-			}
-			// END ENCRYPTION
 			return err
 		}
-		// BEGIN ENCRYPTION
-		if payloadScratch != nil {
-			freePageBuffer(payloadScratch, false)
-		}
-		// END ENCRYPTION
 	}
 
 	// Only advance nFrame and checksums after successful write. If WriteAt
@@ -1571,7 +1564,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 // only see the new nFrame after the memFrames data is visible.
 //
 // BEGIN ENCRYPTION
-// InMemory mode skips encryption per spec-fit.md §7: encryption protects
+// InMemory mode skips encryption per encryption.md §7: encryption protects
 // data at rest, and an InMemory DB has no on-disk file to protect. The WAL
 // memory arena stays plaintext, readFrame's in-memory branch returns
 // plaintext, and checkpoint to masterStore is also plaintext. If a codec
@@ -1643,7 +1636,13 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 // For the file-based path, only an atomic load of nFrame is needed (WAL frames
 // on disk are immutable once written). For the memFrames path, RLock protects
 // the slice from concurrent append by writeFramesMem.
-func (w *wal) readFrame(frame uint32, buf []byte) error {
+// readFrame reads a WAL frame into buf. When the codec is installed,
+// scratchBuf (if non-nil) is used as the decryption scratch to avoid a
+// per-call allocPageBuffer/freePageBuffer round-trip. scratchBuf must be
+// at least w.pageSize bytes and must not alias buf. aeadScratchBuf (if
+// non-nil) holds the nonce/AAD buffers to keep them off-heap. Callers
+// that pass nil for either get a per-call alloc (rare paths).
+func (w *wal) readFrame(frame uint32, buf, scratchBuf []byte, aeadScratchBuf *aeadScratch) error {
 	nf := w.nFrame.Load()
 	if frame == 0 || frame > nf {
 		return ErrWALCorrupt
@@ -1681,14 +1680,27 @@ func (w *wal) readFrame(frame uint32, buf []byte) error {
 		if perr != nil {
 			return perr
 		}
-		scratch := allocPageBuffer(int(w.pageSize), false)
-		plain, derr := decryptPageWithCodec(w.codec, scratch, buf[:w.pageSize], pgno)
+		scratch := scratchBuf
+		ownScratch := false
+		if scratch == nil {
+			scratch = allocPageBuffer(int(w.pageSize), false)
+			ownScratch = true
+		}
+		aeadS := aeadScratchBuf
+		if aeadS == nil {
+			aeadS = new(aeadScratch)
+		}
+		plain, derr := decryptPageWithCodec(w.codec, scratch, buf[:w.pageSize], pgno, aeadS)
 		if derr != nil {
-			freePageBuffer(scratch, false)
+			if ownScratch {
+				freePageBuffer(scratch, false)
+			}
 			return fmt.Errorf("btree: WAL decrypt frame %d (pgno %d): %w", frame, pgno, derr)
 		}
 		copy(buf[:w.pageSize], plain)
-		freePageBuffer(scratch, false)
+		if ownScratch {
+			freePageBuffer(scratch, false)
+		}
 	}
 	// END ENCRYPTION
 	return nil

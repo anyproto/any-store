@@ -149,8 +149,8 @@ If you want to use this as a work plan, tackle in this order:
 4. **Reserve size wiring** — set `dbHeader.ReservedSpace` at new-DB init; verify `usableSize()` flows through cell math. (No SQLCipher equivalent — any-store-specific.)
 5. **CODEC1/CODEC2 equivalents** at the three file-read sites and the one file-write site in `pager.go`. (Maps to `pager.c:412` + scattered call sites.)
 6. **WAL hook** — `wal.go` equivalent of `wal.c:3963, 4152`. Encrypt before `file.WriteAt`, decrypt after `file.ReadAt`, covers spill + commit + checkpoint.
-7. **Checksum vs tag decision** — move `walChecksum` call to post-encryption (§4 of spec-fit.md).
-8. **Page 1 layout** — reserve 16 bytes inside the 100-byte dbHeader for the salt; encrypt from offset 100 onward (§3 of spec-fit.md).
+7. **Checksum vs tag decision** — move `walChecksum` call to post-encryption (§4 of encryption.md).
+8. **Page 1 layout** — reserve 16 bytes inside the 100-byte dbHeader for the salt; encrypt from offset 100 onward (§3 of encryption.md).
 9. **Backup page-size guard** — if/when backup API is added; `backup.c:280` equivalent.
 10. **Tests** — property-based tamper test (fuzz the decrypt path); commit/spill/savepoint matrix; WAL checkpoint round-trip; wrong-key open returns a clean error, not garbage.
 

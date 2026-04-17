@@ -16,7 +16,7 @@ func TestCodec_EncryptPlainNil(t *testing.T) {
 	var c Codec
 	src := []byte("hello world")
 	dst := make([]byte, 0, len(src))
-	out, err := encryptWith(c, dst, src, 42)
+	out, err := encryptWith(c, dst, src, 42, &aeadScratch{})
 	if err != nil {
 		t.Fatalf("encryptWith(nil) error: %v", err)
 	}
@@ -29,7 +29,7 @@ func TestCodec_DecryptPlainNil(t *testing.T) {
 	var c Codec
 	src := []byte("hello world")
 	dst := make([]byte, 0, len(src))
-	out, err := decryptWith(c, dst, src, 42)
+	out, err := decryptWith(c, dst, src, 42, &aeadScratch{})
 	if err != nil {
 		t.Fatalf("decryptWith(nil) error: %v", err)
 	}

@@ -156,11 +156,11 @@ func TestWALWriteReadFrames(t *testing.T) {
 
 	// Read frame 1
 	buf := make([]byte, 4096)
-	require.NoError(t, w.readFrame(1, buf))
+	require.NoError(t, w.readFrame(1, buf, nil, nil))
 	assert.Equal(t, pg1.data, buf)
 
 	// Read frame 2
-	require.NoError(t, w.readFrame(2, buf))
+	require.NoError(t, w.readFrame(2, buf, nil, nil))
 	assert.Equal(t, pg2.data, buf)
 
 	w.endWrite()
@@ -174,8 +174,8 @@ func TestWALReadFrameInvalid(t *testing.T) {
 	require.NoError(t, w.open())
 
 	buf := make([]byte, 4096)
-	assert.ErrorIs(t, w.readFrame(0, buf), ErrWALCorrupt)
-	assert.ErrorIs(t, w.readFrame(999, buf), ErrWALCorrupt)
+	assert.ErrorIs(t, w.readFrame(0, buf, nil, nil), ErrWALCorrupt)
+	assert.ErrorIs(t, w.readFrame(999, buf, nil, nil), ErrWALCorrupt)
 
 	require.NoError(t, w.close())
 }
@@ -244,7 +244,7 @@ func TestWALRecoveryCommitted(t *testing.T) {
 
 	// Verify we can read the recovered frame
 	buf := make([]byte, 4096)
-	require.NoError(t, w2.readFrame(1, buf))
+	require.NoError(t, w2.readFrame(1, buf, nil, nil))
 	assert.Equal(t, pg.data, buf)
 
 	require.NoError(t, w2.close())
@@ -457,7 +457,7 @@ func TestWALMultipleCommits(t *testing.T) {
 
 	// Read latest frame
 	buf := make([]byte, 4096)
-	require.NoError(t, w.readFrame(2, buf))
+	require.NoError(t, w.readFrame(2, buf, nil, nil))
 	assert.Equal(t, pg2.data, buf)
 
 	require.NoError(t, w.close())
@@ -539,10 +539,10 @@ func TestWALRecoveryMultipleCommits(t *testing.T) {
 	assert.Equal(t, uint32(2), w2.index.maxPage.Load())
 
 	buf := make([]byte, 4096)
-	require.NoError(t, w2.readFrame(1, buf))
+	require.NoError(t, w2.readFrame(1, buf, nil, nil))
 	assert.Equal(t, pg1.data, buf)
 
-	require.NoError(t, w2.readFrame(2, buf))
+	require.NoError(t, w2.readFrame(2, buf, nil, nil))
 	assert.Equal(t, pg2.data, buf)
 
 	require.NoError(t, w2.close())
@@ -960,11 +960,11 @@ func TestRecoveryIgnoresSpilledFrames(t *testing.T) {
 
 	// Verify data integrity of committed frames
 	buf := make([]byte, 4096)
-	require.NoError(t, w2.readFrame(1, buf))
+	require.NoError(t, w2.readFrame(1, buf, nil, nil))
 	assert.Equal(t, pg1.data, buf, "recovery: page 1 data should be committed version")
-	require.NoError(t, w2.readFrame(2, buf))
+	require.NoError(t, w2.readFrame(2, buf, nil, nil))
 	assert.Equal(t, pg2.data, buf, "recovery: page 2 data intact")
-	require.NoError(t, w2.readFrame(3, buf))
+	require.NoError(t, w2.readFrame(3, buf, nil, nil))
 	assert.Equal(t, pg3.data, buf, "recovery: page 3 data intact")
 
 	// SHM header should reflect committed state

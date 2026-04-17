@@ -85,6 +85,30 @@ This is a *better* situation than SQLCipher's. WAL-only + in-cache pre-images me
 
 SQLCipher has `read_ctx` and `write_ctx` inside the codec context so rekey can run with a "new write key" while reads still decrypt under the old key (`sqlcipher.c:159–192`, rekey at `sqlcipher.c:3549–3632`). Without rekey, this split is unnecessary. any-store has no rekey, so a single key material struct on the pager suffices. If rekey is added later, introduce the split then.
 
+### 2.6 Codec scratch buffers: per-caller, not pooled
+
+Every codec call needs two transient buffers alongside the key:
+
+1. A page-sized buffer for the transformed bytes — `AEAD.Seal`/`Open` don't support `dst==src` aliasing, so encrypt-in-place is off the table.
+2. A small nonce + AAD scratch to pass into `Seal`/`Open`.
+
+**Placement:** both live as fields on whichever struct drives the call, not in a `sync.Pool`:
+
+- `pager.codecScratch` + `pager.codecAEAD` — writer path (`initNewDB`, `getPageWriter`). Safe as a single instance (single-writer invariant).
+- `pcache.codecScratch` + `pcache.codecAEAD` — reader path (`getPageReader` including its WAL read-through). Each reader tx owns its own `pcache`, so one scratch per in-flight reader, no locking.
+- `wal.codecScratch` + `wal.codecAEAD` — WAL `writeFrame`. Writer-only.
+
+**Why not `sync.Pool`:**
+
+1. `pool.Put([]byte)` heap-allocates a 24-byte eface box every call — a slice header (ptr+len+cap) doesn't fit the interface data word. Per-page Put during a scan turns this into the top allocation site (staticcheck SA6002). A caller-owned field bypasses the pool entirely.
+2. `var nonce [12]byte; aead.Seal(..., nonce[:], ...)` heap-allocates `nonce` on every call — `cipher.AEAD.Seal` is an interface method and Go's escape analysis is conservative. Embedding nonce/AAD as fields on a heap-allocated parent struct (pager/pcache/wal) makes `&parent.aeadScratch.nonce[:]` point at existing heap memory, so nothing escapes per call.
+
+**Mapping to SQLCipher.** SQLCipher's `codec_ctx->buffer` (page-sized scratch) and `cipher_ctx->iv` (IV scratch) live **per connection**. Each `sqlite3_open()` produces an independent `Btree` / `Pager` / `codec_ctx`, and SQLite's concurrent-reader story is "use multiple connections." So SQLCipher's single buffer inside one codec_ctx is safe because nothing else shares that ctx.
+
+any-store's concurrency model is structurally different: one `pager` is shared across all reader goroutines, with per-tx `pcache` snapshots. Our **`pcache` plays the role of "connection"** — each read tx has its own, and the scratch lives there for the same reason SQLCipher's lives on `codec_ctx`. Same pattern, different partitioning unit (goroutine+tx vs. connection), because Go's concurrency primitive is the goroutine not the process connection.
+
+**Rekey implication.** If online rekey is ever added (§2.5), SQLCipher's `read_ctx`/`write_ctx` split would need its own scratch pair per ctx — same pattern, twice.
+
 ---
 
 ## 3. The page 1 problem
