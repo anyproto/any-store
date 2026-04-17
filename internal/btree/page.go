@@ -169,6 +169,12 @@ type dbHeader struct {
 	UserVersion      uint32
 	AppID            uint32
 	VersionValidFor  uint32
+	// BEGIN ENCRYPTION
+	// Salt is the PBKDF2 salt for key derivation. Stored plaintext at
+	// bytes 72-87 of page 1 (within the "reserved for expansion" range
+	// unused by SQLite). Zero-valued for unencrypted databases.
+	Salt [16]byte
+	// END ENCRYPTION
 }
 
 // serialize writes the database header to the first 100 bytes of buf.
@@ -209,8 +215,11 @@ func (h *dbHeader) serialize(buf []byte) {
 
 	binary.BigEndian.PutUint32(buf[68:72], h.AppID)
 
-	// Reserved for expansion
-	clear(buf[72:92])
+	// BEGIN ENCRYPTION
+	// Bytes 72-87: KDF salt (16 bytes). Bytes 88-91 remain reserved.
+	copy(buf[72:88], h.Salt[:])
+	clear(buf[88:92])
+	// END ENCRYPTION
 
 	binary.BigEndian.PutUint32(buf[92:96], h.VersionValidFor)
 
@@ -251,6 +260,9 @@ func (h *dbHeader) deserialize(buf []byte) error {
 	h.TextEncoding = binary.BigEndian.Uint32(buf[56:60])
 	h.UserVersion = binary.BigEndian.Uint32(buf[60:64])
 	h.AppID = binary.BigEndian.Uint32(buf[68:72])
+	// BEGIN ENCRYPTION
+	copy(h.Salt[:], buf[72:88])
+	// END ENCRYPTION
 	h.VersionValidFor = binary.BigEndian.Uint32(buf[92:96])
 
 	return nil

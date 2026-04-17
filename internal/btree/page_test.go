@@ -79,6 +79,41 @@ func TestDBHeaderNotSQLiteCompatible(t *testing.T) {
 	assert.NotEqual(t, "SQLite format 3\000", dbMagic)
 }
 
+func TestDBHeaderSaltRoundTrip(t *testing.T) {
+	h := dbHeader{
+		PageSize:     4096,
+		WriteVersion: 2,
+		ReadVersion:  2,
+		DatabaseSize: 1,
+	}
+	for i := range h.Salt {
+		h.Salt[i] = byte(i ^ 0xAA)
+	}
+
+	buf := make([]byte, dbHeaderSize)
+	h.serialize(buf)
+
+	var got dbHeader
+	require.NoError(t, got.deserialize(buf))
+	assert.Equal(t, h.Salt, got.Salt)
+
+	// The salt lives at bytes 72-87; verify it was serialized there.
+	assert.Equal(t, h.Salt[:], buf[72:88])
+	// Bytes 88-91 remain zero (reserved-for-expansion tail).
+	assert.Equal(t, []byte{0, 0, 0, 0}, buf[88:92])
+}
+
+func TestDBHeaderDefaultSaltZero(t *testing.T) {
+	// An unencrypted DB has a zeroed Salt field.
+	h := dbHeader{PageSize: 4096, WriteVersion: 2, ReadVersion: 2}
+	buf := make([]byte, dbHeaderSize)
+	h.serialize(buf)
+	var got dbHeader
+	require.NoError(t, got.deserialize(buf))
+	var zero [16]byte
+	assert.Equal(t, zero, got.Salt)
+}
+
 func TestPageHeaderSerializeDeserialize(t *testing.T) {
 	tests := []pageHeader{
 		{pageType: pageTypeLeafTbl, cellCount: 5, cellContentOff: 3000, fragBytes: 2},
