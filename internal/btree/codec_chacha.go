@@ -1,7 +1,6 @@
 package btree
 
 import (
-	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 
@@ -16,12 +15,13 @@ import (
 // Total overhead is rounded up to a multiple of 16 for AES-block-aligned
 // reserved-area semantics inherited from SQLCipher conventions.
 type chachaCodec struct {
-	aead     interface {
+	aead interface {
 		Seal(dst, nonce, plaintext, additionalData []byte) []byte
 		Open(dst, nonce, ciphertext, additionalData []byte) ([]byte, error)
 		NonceSize() int
 		Overhead() int
 	}
+	nonces   *noncePool
 	nonceLen int
 	overhead int
 }
@@ -48,7 +48,7 @@ func NewChaCha20Poly1305Codec(key []byte) (Codec, error) {
 	if err != nil {
 		return nil, fmt.Errorf("btree: chacha20poly1305.New: %w", err)
 	}
-	return &chachaCodec{aead: aead, nonceLen: chacha20NonceLen, overhead: chacha20Overhead}, nil
+	return &chachaCodec{aead: aead, nonces: newNoncePool(), nonceLen: chacha20NonceLen, overhead: chacha20Overhead}, nil
 }
 
 // NewXChaCha20Poly1305Codec constructs an XChaCha20-Poly1305 codec with a
@@ -63,7 +63,7 @@ func NewXChaCha20Poly1305Codec(key []byte) (Codec, error) {
 	if err != nil {
 		return nil, fmt.Errorf("btree: chacha20poly1305.NewX: %w", err)
 	}
-	return &chachaCodec{aead: aead, nonceLen: xChaCha20NonceLen, overhead: xChaCha20Overhead}, nil
+	return &chachaCodec{aead: aead, nonces: newNoncePool(), nonceLen: xChaCha20NonceLen, overhead: xChaCha20Overhead}, nil
 }
 
 func (c *chachaCodec) Overhead() int { return c.overhead }
@@ -79,8 +79,8 @@ func (c *chachaCodec) Encrypt(dst, src []byte, pgno uint32) ([]byte, error) {
 	}
 
 	nonce := make([]byte, c.nonceLen)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, fmt.Errorf("btree: chachaCodec.Encrypt: rand.Read: %w", err)
+	if err := c.nonces.Draw(nonce); err != nil {
+		return nil, fmt.Errorf("btree: chachaCodec.Encrypt: nonce draw: %w", err)
 	}
 
 	var aad [4]byte

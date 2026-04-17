@@ -3,7 +3,6 @@ package btree
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 )
@@ -33,7 +32,8 @@ const aesTagLen = 16
 // Padding at the tail keeps the total overhead a multiple of 16 (AES
 // block size), which is the SQLCipher convention for reserve areas.
 type aesCodec struct {
-	aead cipher.AEAD
+	aead   cipher.AEAD
+	nonces *noncePool
 }
 
 // NewAESCodec constructs the default codec. key must be exactly 32 bytes
@@ -51,7 +51,7 @@ func NewAESCodec(key []byte) (Codec, error) {
 	if err != nil {
 		return nil, fmt.Errorf("btree: cipher.NewGCM: %w", err)
 	}
-	return &aesCodec{aead: aead}, nil
+	return &aesCodec{aead: aead, nonces: newNoncePool()}, nil
 }
 
 func (c *aesCodec) Overhead() int { return aesCodecOverhead }
@@ -69,10 +69,11 @@ func (c *aesCodec) Encrypt(dst, src []byte, pgno uint32) ([]byte, error) {
 		return nil, fmt.Errorf("btree: aesCodec.Encrypt: page too small (%d < overhead %d)", len(src), aesCodecOverhead)
 	}
 
-	// Draw a fresh random nonce into a local array (not aliased with dst).
+	// Draw a fresh random nonce from the userspace pool (amortizes
+	// crypto/rand.Read across many calls).
 	var nonce [aesNonceLen]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return nil, fmt.Errorf("btree: aesCodec.Encrypt: rand.Read: %w", err)
+	if err := c.nonces.Draw(nonce[:]); err != nil {
+		return nil, fmt.Errorf("btree: aesCodec.Encrypt: nonce draw: %w", err)
 	}
 
 	// AAD = page number as little-endian uint32. Binds the page location

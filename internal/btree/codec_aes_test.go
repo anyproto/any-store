@@ -127,3 +127,58 @@ func TestAESCodec_InvalidKeyLength(t *testing.T) {
 		t.Fatalf("nil key accepted, want error")
 	}
 }
+
+// Micro-benchmark: single Encrypt call with nonce pool.
+// Run with: go test -bench BenchmarkCodec_Encrypt -run '^$' -benchtime=3s
+func BenchmarkCodec_Encrypt_AES256GCM(b *testing.B) {
+	benchCodecEncrypt(b, mustAES(b))
+}
+
+func BenchmarkCodec_Encrypt_ChaCha20Poly1305(b *testing.B) {
+	benchCodecEncrypt(b, mustChaCha(b))
+}
+
+func BenchmarkCodec_Encrypt_XChaCha20Poly1305(b *testing.B) {
+	benchCodecEncrypt(b, mustXChaCha(b))
+}
+
+func benchCodecEncrypt(b *testing.B, c Codec) {
+	b.Helper()
+	const pageSize = 4096
+	src := make([]byte, pageSize)
+	dst := make([]byte, pageSize)
+	b.SetBytes(pageSize)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := c.Encrypt(dst, src, uint32(i+1)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func mustAES(b *testing.B) Codec {
+	b.Helper()
+	c, err := NewAESCodec(make([]byte, 32))
+	if err != nil {
+		b.Fatal(err)
+	}
+	return c
+}
+
+func mustChaCha(b *testing.B) Codec {
+	b.Helper()
+	c, err := NewChaCha20Poly1305Codec(make([]byte, 32))
+	if err != nil {
+		b.Fatal(err)
+	}
+	return c
+}
+
+func mustXChaCha(b *testing.B) Codec {
+	b.Helper()
+	c, err := NewXChaCha20Poly1305Codec(make([]byte, 32))
+	if err != nil {
+		b.Fatal(err)
+	}
+	return c
+}

@@ -1,5 +1,10 @@
 package btree
 
+import (
+	"crypto/rand"
+	"sync"
+)
+
 // Codec is the pluggable page-encryption interface. When a non-nil Codec is
 // installed on the pager, every file/WAL I/O site routes through it.
 // Implementations must be safe for concurrent use: the pager shares one Codec
@@ -105,4 +110,47 @@ func decryptPageWithCodec(c Codec, dst, src []byte, pgno uint32) ([]byte, error)
 		return nil, err
 	}
 	return dst[:len(src)], nil
+}
+
+// noncePoolSize is the buffer size for batched nonce generation. At
+// 4 KB, one crypto/rand.Read syscall (~500-1000ns on Linux via
+// getrandom) amortizes over ~340 12-byte nonces or ~170 24-byte nonces
+// — eliminating the per-page syscall bottleneck observed in benchmarks.
+//
+// Analogous to OpenSSL's internal RAND_bytes buffer that SQLCipher
+// relies on for per-page IV generation.
+const noncePoolSize = 4096
+
+// noncePool batches crypto/rand.Read syscalls behind a userspace buffer.
+// Safe for concurrent use.
+type noncePool struct {
+	mu  sync.Mutex
+	buf [noncePoolSize]byte
+	off int // position to read from; must start == len(buf) for first-call refill
+}
+
+// newNoncePool constructs a pool whose initial state is "exhausted",
+// so the first Draw triggers a fill. Using the zero value would leak
+// 4 KB of constant zeros as "nonces", which is catastrophic for AEAD.
+func newNoncePool() *noncePool {
+	return &noncePool{off: noncePoolSize}
+}
+
+// Draw fills out with fresh randomness. Refills the internal buffer
+// from crypto/rand.Read when exhausted.
+func (p *noncePool) Draw(out []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for len(out) > 0 {
+		if p.off >= noncePoolSize {
+			if _, err := rand.Read(p.buf[:]); err != nil {
+				return err
+			}
+			p.off = 0
+		}
+		n := copy(out, p.buf[p.off:])
+		p.off += n
+		out = out[n:]
+	}
+	return nil
 }
