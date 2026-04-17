@@ -922,6 +922,26 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 		root = &b.filterIter
 	}
 
+	// Dedup wrap for multi-key safety.
+	// Single-field indexes use canonical-key dedup (O(1) memory, streaming).
+	// Compound indexes use the hash-set fallback because canonical-key
+	// selection across compound tuples is non-trivial and deliberately
+	// out of scope here — see docs/plans/2026-04-17-multikey-index-dedup.md.
+	// Both branches wrap even when Bounds is empty: a bound-less
+	// IndexScan (pure Sort("tags")) still produces one hit per array
+	// element of every doc.
+	switch {
+	case len(idx.Info.FieldPaths) == 1:
+		root = &CanonicalKeyDedupIter{
+			Source:    root,
+			Bounds:    idx.Bounds,
+			FieldPath: idx.Info.FieldPaths[0],
+			Reverse:   reverse,
+		}
+	case len(idx.Info.FieldPaths) > 1:
+		root = &SeenSetDedupIter{Source: root}
+	}
+
 	if needSort && !idx.ExactSort {
 		root = &SortIter{
 			Source: root,
@@ -988,6 +1008,19 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 		}
 	}
 
+	// Dedup wrap — see buildIndexSeekChain for rationale.
+	switch {
+	case len(idx.Info.FieldPaths) == 1:
+		root = &CanonicalKeyDedupIter{
+			Source:    root,
+			Bounds:    idx.Bounds,
+			FieldPath: idx.Info.FieldPaths[0],
+			Reverse:   reverse,
+		}
+	case len(idx.Info.FieldPaths) > 1:
+		root = &SeenSetDedupIter{Source: root}
+	}
+
 	// No sort needed — index provides the order
 	return root
 }
@@ -1027,6 +1060,11 @@ func setPlanRef(it Iterator, plan *Plan) {
 	case *IndexFilterIter:
 		setPlanRef(v.Source, plan)
 	case *LimitIter:
+		setPlanRef(v.Source, plan)
+	case *CanonicalKeyDedupIter:
+		v.Plan = plan
+		setPlanRef(v.Source, plan)
+	case *SeenSetDedupIter:
 		setPlanRef(v.Source, plan)
 	}
 }
