@@ -353,20 +353,46 @@ func (p *pager) installCodec(c Codec) {
 
 // encryptPage transforms plaintext page bytes for writing to disk or WAL.
 // When no codec is installed, returns src unchanged (pass-through). When
-// a codec is installed, encrypts into scratch (len must be >= len(src))
-// and returns the encrypted slice. scratch must not alias src.
+// a codec is installed, encrypts into scratch and returns the ciphertext
+// slice. scratch must have len >= len(src) and must not alias src.
+//
+// Page 1 is special: the first dbHeaderSize (100) bytes are the database
+// header, which includes the KDF salt and must remain plaintext so Open
+// can read it without the key. Pages > 1 are encrypted in full.
 //
 // This is the any-store equivalent of SQLCipher's CODEC2 macro
 // (pager.c:412), unified into one function.
 func (p *pager) encryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
-	return encryptWith(p.codec, scratch, src, pgno)
+	if p.codec == nil {
+		return src, nil
+	}
+	plainPrefix := 0
+	if pgno == 1 {
+		plainPrefix = dbHeaderSize
+	}
+	copy(scratch[:plainPrefix], src[:plainPrefix])
+	if _, err := p.codec.Encrypt(scratch[plainPrefix:], src[plainPrefix:], pgno); err != nil {
+		return nil, err
+	}
+	return scratch[:len(src)], nil
 }
 
 // decryptPage is the inverse. Returns src unchanged when no codec is
 // installed; otherwise decrypts into scratch and returns the plaintext
 // slice. On AEAD verification failure returns ErrCodecTamper.
 func (p *pager) decryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
-	return decryptWith(p.codec, scratch, src, pgno)
+	if p.codec == nil {
+		return src, nil
+	}
+	plainPrefix := 0
+	if pgno == 1 {
+		plainPrefix = dbHeaderSize
+	}
+	copy(scratch[:plainPrefix], src[:plainPrefix])
+	if _, err := p.codec.Decrypt(scratch[plainPrefix:], src[plainPrefix:], pgno); err != nil {
+		return nil, err
+	}
+	return scratch[:len(src)], nil
 }
 
 // END ENCRYPTION
@@ -424,9 +450,24 @@ func (p *pager) initNewDB() error {
 	buf[hdrOff+7] = 0                 // fragmented free bytes
 
 	if p.file != nil {
-		if _, err := p.file.WriteAt(buf, 0); err != nil {
+		// BEGIN ENCRYPTION
+		// When a codec is installed, encrypt page 1 before writing to disk.
+		// The plaintext 100-byte dbHeader (carrying the salt) is preserved
+		// by encryptPage; only bytes >= dbHeaderSize are encrypted.
+		writeBuf := buf
+		if p.codec != nil {
+			scratch := allocPageBuffer(int(p.pageSize), false)
+			defer freePageBuffer(scratch, false)
+			ct, err := p.encryptPage(scratch, buf, 1)
+			if err != nil {
+				return err
+			}
+			writeBuf = ct
+		}
+		if _, err := p.file.WriteAt(writeBuf, 0); err != nil {
 			return err
 		}
+		// END ENCRYPTION
 		if err := fdatasync(p.file); err != nil {
 			return err
 		}
@@ -437,7 +478,9 @@ func (p *pager) initNewDB() error {
 	p.writerCache.useSlab = p.useSlab
 	p.writerCache.xStress = p.pagerStress
 
-	// For inMemory mode, pre-populate page 1 in masterStore so reads find it
+	// For inMemory mode, pre-populate page 1 in masterStore so reads find it.
+	// Note: masterStore stores plaintext (encryption is a file-at-rest concern
+	// per spec-fit.md §7; InMemory has no "at rest").
 	if p.inMemory && p.master != nil {
 		p.master.writePage(1, buf)
 	}
@@ -573,6 +616,20 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 			}
 			// Zero-fill new pages
 			clear(pg.data)
+		} else {
+			// BEGIN ENCRYPTION
+			if p.codec != nil {
+				scratch := allocPageBuffer(int(p.pageSize), false)
+				plain, derr := p.decryptPage(scratch, pg.data, pgno)
+				if derr != nil {
+					freePageBuffer(scratch, false)
+					p.writerCache.discard(pg.pgno)
+					return nil, fmt.Errorf("btree: decrypt page %d: %w", pgno, derr)
+				}
+				copy(pg.data, plain)
+				freePageBuffer(scratch, false)
+			}
+			// END ENCRYPTION
 		}
 	} else if p.master != nil {
 		// InMemory: read from masterStore (replaces the DB file)
@@ -630,6 +687,20 @@ func (p *pager) readTempPage(pgno, walMaxFrame uint32) (*page, error) {
 				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 			}
 			clear(pg.data)
+		} else {
+			// BEGIN ENCRYPTION
+			if p.codec != nil {
+				scratch := allocPageBuffer(int(p.pageSize), false)
+				plain, derr := p.decryptPage(scratch, pg.data, pgno)
+				if derr != nil {
+					freePageBuffer(scratch, false)
+					p.recycleTempPage(pg)
+					return nil, fmt.Errorf("btree: decrypt page %d: %w", pgno, derr)
+				}
+				copy(pg.data, plain)
+				freePageBuffer(scratch, false)
+			}
+			// END ENCRYPTION
 		}
 	} else if p.master != nil {
 		if !p.master.readPageInto(pgno, pg.data) {
@@ -706,6 +777,20 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 			}
 			clear(pg.data)
+		} else {
+			// BEGIN ENCRYPTION
+			if p.codec != nil {
+				scratch := allocPageBuffer(int(p.pageSize), false)
+				plain, derr := p.decryptPage(scratch, pg.data, pgno)
+				if derr != nil {
+					freePageBuffer(scratch, false)
+					cache.discard(pg.pgno)
+					return nil, fmt.Errorf("btree: decrypt page %d: %w", pgno, derr)
+				}
+				copy(pg.data, plain)
+				freePageBuffer(scratch, false)
+			}
+			// END ENCRYPTION
 		}
 	} else if p.master != nil {
 		// InMemory: read from masterStore.
