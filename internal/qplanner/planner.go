@@ -890,7 +890,14 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	// Equality bounds are precise: each index entry in the range matches the filter.
 	// Range/exclusive bounds are NOT safe because non-unique index key suffixes
 	// can cause incorrect inclusive/exclusive comparisons.
-	if params.CountOnly && idx.PointLookup && indexCoversFilter(idx, params.Filter) {
+	//
+	// Multi-range PointLookup (e.g. $in over many values) may yield multiple
+	// index entries per doc on multi-key indexes, inflating the entry-count.
+	// Fall through to the full pipeline (Fetch → Filter → Dedup) whenever
+	// len(Bounds) > 1. Single-bound PointLookup is always safe: within-doc
+	// dedup in insertKeys means at most one index entry per distinct value
+	// per doc, scalar or compound.
+	if params.CountOnly && idx.PointLookup && indexCoversFilter(idx, params.Filter) && len(idx.Bounds) <= 1 {
 		return root
 	}
 
