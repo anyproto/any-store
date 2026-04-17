@@ -285,6 +285,13 @@ func Open(path string, opts Options) (*DB, error) {
 	// Build and install codec before p.open(). For an existing file we read
 	// the header first to discover the salt; for a new file we generate a
 	// fresh salt. InMemory databases skip encryption entirely (spec-fit §7).
+	//
+	// Note: there is a TOCTOU window between readInitialHeader (which
+	// opens/reads/closes the file) and p.open() (which reopens and locks).
+	// An external process swapping the file in that window would surface
+	// as a decrypt error on the first page read — not silent corruption.
+	// openDBs above blocks same-process double-open. A future hardening
+	// could hold a shared lock across readInitialHeader and p.open().
 	wantEncryption := opts.Key != nil || opts.Codec != nil
 	if wantEncryption && !opts.InMemory {
 		existingHeader, herr := readInitialHeader(path)
