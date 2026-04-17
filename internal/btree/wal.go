@@ -1569,6 +1569,16 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 // Acquires w.mu to synchronize with readFrame which reads w.memFrames.
 // nFrame is updated atomically after the slice is populated, ensuring readers
 // only see the new nFrame after the memFrames data is visible.
+//
+// BEGIN ENCRYPTION
+// InMemory mode skips encryption per spec-fit.md §7: encryption protects
+// data at rest, and an InMemory DB has no on-disk file to protect. The WAL
+// memory arena stays plaintext, readFrame's in-memory branch returns
+// plaintext, and checkpoint to masterStore is also plaintext. If a codec
+// is installed with an InMemory DB, ReservedSpace still accounts for
+// per-page overhead (so page format stays consistent with a future
+// serialization) but the codec itself is not invoked on this fast path.
+// END ENCRYPTION
 func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	w.mu.Lock()
 
