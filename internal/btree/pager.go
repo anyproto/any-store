@@ -657,10 +657,17 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 }
 
 // readTempPage reads a page into a standalone temporary page object that is
-// NOT stored in any cache. Used by getPageWriter when the writer cache holds
-// a stale clean page — the temp page avoids disturbing the cache while
-// returning the correct snapshot data.
-func (p *pager) readTempPage(pgno, walMaxFrame uint32) (*page, error) {
+// NOT stored in any cache. Used by getPageReader when no reader cache is
+// available or admission control refused a cache slot.
+//
+// codecBuf / codecAEAD are caller-owned scratch buffers for the codec's
+// decrypt call; when non-nil they avoid a per-page allocPageBuffer round-
+// trip (which boxes the []byte into an eface on sync.Pool.Put) and a per-
+// call aad/nonce escape. Callers that have a reader pcache should pass
+// cache.codecScratch / &cache.codecAEAD. Pass nil/nil for the rare nil-
+// cache path (admission-control refusal, integrity checks); the codec
+// falls back to allocPageBuffer in that case.
+func (p *pager) readTempPage(pgno, walMaxFrame uint32, codecBuf []byte, codecAEAD *aeadScratch) (*page, error) {
 	pg := p.acquireTempPage()
 	pg.pgno = pgno
 	pg.pinCount = 1
@@ -670,7 +677,7 @@ func (p *pager) readTempPage(pgno, walMaxFrame uint32) (*page, error) {
 	if walMaxFrame > 0 {
 		frame := p.wal.index.get(pgno, walMaxFrame)
 		if frame > 0 {
-			if err := p.wal.readFrame(frame, pg.data, nil, nil); err == nil {
+			if err := p.wal.readFrame(frame, pg.data, codecBuf, codecAEAD); err == nil {
 				off := 0
 				if pgno == 1 {
 					off = dbHeaderSize
@@ -694,15 +701,28 @@ func (p *pager) readTempPage(pgno, walMaxFrame uint32) (*page, error) {
 		} else {
 			// BEGIN ENCRYPTION
 			if p.codec != nil {
-				scratch := allocPageBuffer(int(p.pageSize), false)
-				plain, derr := p.decryptPage(scratch, pg.data, pgno)
+				scratch := codecBuf
+				ownScratch := false
+				if scratch == nil {
+					scratch = allocPageBuffer(int(p.pageSize), false)
+					ownScratch = true
+				}
+				aeadS := codecAEAD
+				if aeadS == nil {
+					aeadS = new(aeadScratch)
+				}
+				plain, derr := decryptPageWithCodec(p.codec, scratch, pg.data, pgno, aeadS)
 				if derr != nil {
-					freePageBuffer(scratch, false)
+					if ownScratch {
+						freePageBuffer(scratch, false)
+					}
 					p.recycleTempPage(pg)
 					return nil, fmt.Errorf("btree: decrypt page %d: %w", pgno, derr)
 				}
 				copy(pg.data, plain)
-				freePageBuffer(scratch, false)
+				if ownScratch {
+					freePageBuffer(scratch, false)
+				}
 			}
 			// END ENCRYPTION
 		}
@@ -737,7 +757,7 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 	// If no reader cache provided, read an uncached temporary page.
 	// Never fall back to writerCache — that would race with the writer goroutine.
 	if cache == nil {
-		return p.readTempPage(pgno, walMaxFrame)
+		return p.readTempPage(pgno, walMaxFrame, nil, nil)
 	}
 
 	// Check reader cache.
@@ -751,8 +771,13 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 	pg := cache.create(pgno, 1)
 	if pg == nil {
 		// Admission control refused the allocation. Fall back to an uncached
-		// temporary page read so the query still succeeds.
-		return p.readTempPage(pgno, walMaxFrame)
+		// temporary page read so the query still succeeds. We still have the
+		// cache struct — hand its scratch buffers down so repeated fallbacks
+		// don't allocate per call.
+		if p.codec != nil && cache.codecScratch == nil {
+			cache.codecScratch = make([]byte, p.pageSize)
+		}
+		return p.readTempPage(pgno, walMaxFrame, cache.codecScratch, &cache.codecAEAD)
 	}
 
 	// Try to read from WAL first.

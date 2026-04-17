@@ -7581,7 +7581,7 @@ func TestPagerSlabIntegration(t *testing.T) {
 	defer p.endRead(slot3)
 
 	freeBeforeTemp := len(globalPageSlab.freeList)
-	tmpPg, err := p.readTempPage(pageNos[0], mf3)
+	tmpPg, err := p.readTempPage(pageNos[0], mf3, nil, nil)
 	require.NoError(t, err)
 	assert.NotNil(t, tmpPg.data)
 	freeAfterTemp := len(globalPageSlab.freeList)
