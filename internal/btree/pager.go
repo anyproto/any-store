@@ -351,6 +351,24 @@ func (p *pager) installCodec(c Codec) {
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
 }
 
+// encryptPage transforms plaintext page bytes for writing to disk or WAL.
+// When no codec is installed, returns src unchanged (pass-through). When
+// a codec is installed, encrypts into scratch (len must be >= len(src))
+// and returns the encrypted slice. scratch must not alias src.
+//
+// This is the any-store equivalent of SQLCipher's CODEC2 macro
+// (pager.c:412), unified into one function.
+func (p *pager) encryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
+	return encryptWith(p.codec, scratch, src, pgno)
+}
+
+// decryptPage is the inverse. Returns src unchanged when no codec is
+// installed; otherwise decrypts into scratch and returns the plaintext
+// slice. On AEAD verification failure returns ErrCodecTamper.
+func (p *pager) decryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
+	return decryptWith(p.codec, scratch, src, pgno)
+}
+
 // END ENCRYPTION
 
 // initNewDB initializes a brand new database file.
