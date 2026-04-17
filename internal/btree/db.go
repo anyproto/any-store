@@ -286,6 +286,11 @@ func Open(path string, opts Options) (*DB, error) {
 	// the header first to discover the salt; for a new file we generate a
 	// fresh salt. InMemory databases skip encryption entirely (spec-fit §7).
 	//
+	// The encryption marker on disk is a non-zero Salt field (bytes 72-87
+	// of page 1). ReservedSpace alone is NOT the marker, because the same
+	// byte is used by SQLite-compat tests that exercise reserve-related
+	// code paths on plaintext databases.
+	//
 	// Note: there is a TOCTOU window between readInitialHeader (which
 	// opens/reads/closes the file) and p.open() (which reopens and locks).
 	// An external process swapping the file in that window would surface
@@ -293,13 +298,14 @@ func Open(path string, opts Options) (*DB, error) {
 	// openDBs above blocks same-process double-open. A future hardening
 	// could hold a shared lock across readInitialHeader and p.open().
 	wantEncryption := opts.Key != nil || opts.Codec != nil
+	var zeroSalt [SaltLen]byte
 	if wantEncryption && !opts.InMemory {
 		existingHeader, herr := readInitialHeader(path)
 		fileExists := herr == nil
 		switch {
 		case herr != nil && !errors.Is(herr, os.ErrNotExist) && !errors.Is(herr, errEmptyFile):
 			return nil, fmt.Errorf("btree: read header: %w", herr)
-		case fileExists && existingHeader.ReservedSpace == 0:
+		case fileExists && existingHeader.Salt == zeroSalt:
 			return nil, fmt.Errorf("btree: database file is not encrypted, remove Options.Key/Codec")
 		}
 		var salt [SaltLen]byte
@@ -317,10 +323,10 @@ func Open(path string, opts Options) (*DB, error) {
 		p.header.Salt = salt
 		p.installCodec(codec)
 	} else if !wantEncryption && !opts.InMemory {
-		// No key provided, but file may still be encrypted. Detect and
-		// reject with a clear error.
+		// No key provided, but file may still be encrypted. Detect via a
+		// non-zero salt and reject with a clear error.
 		existingHeader, herr := readInitialHeader(path)
-		if herr == nil && existingHeader.ReservedSpace > 0 {
+		if herr == nil && existingHeader.Salt != zeroSalt {
 			return nil, fmt.Errorf("btree: database file is encrypted, Options.Key or Options.Codec required")
 		}
 	}
