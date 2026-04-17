@@ -175,6 +175,13 @@ type pager struct {
 	// pagerWriter via state.Load() (Go memory model: sequenced-before →
 	// happens-before the atomic store, synchronized-with the atomic load).
 	writerWalSlot int
+
+	// BEGIN ENCRYPTION
+	// codec, when non-nil, encrypts pages before file/WAL writes and
+	// decrypts them after reads. Installed once at Open and immutable
+	// thereafter. Safe for concurrent use across the writer and readers.
+	codec Codec
+	// END ENCRYPTION
 }
 
 // savepointState captures the state needed to rollback to a savepoint.
@@ -329,11 +336,35 @@ func (p *pager) open() error {
 	return nil
 }
 
+// BEGIN ENCRYPTION
+
+// installCodec attaches a page codec to the pager. Must be called before
+// any I/O. Sets the on-disk ReservedSpace header byte and the in-memory
+// usableSize_ so the btree cell code respects the codec's per-page
+// overhead. Calling with nil is a no-op (unencrypted mode).
+func (p *pager) installCodec(c Codec) {
+	if c == nil {
+		return
+	}
+	p.codec = c
+	p.header.ReservedSpace = uint8(c.Overhead())
+	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
+}
+
+// END ENCRYPTION
+
 // initNewDB initializes a brand new database file.
 func (p *pager) initNewDB() error {
 	if p.pageSize == 0 {
 		p.pageSize = DefaultPageSize
 	}
+
+	// BEGIN ENCRYPTION
+	// Preserve salt and ReservedSpace that may have been set by installCodec
+	// before initNewDB was called.
+	savedSalt := p.header.Salt
+	savedReserve := p.header.ReservedSpace
+	// END ENCRYPTION
 
 	p.header = dbHeader{
 		PageSize:         p.pageSize,
@@ -346,6 +377,12 @@ func (p *pager) initNewDB() error {
 		DefaultCacheSize: defaultCacheSize,
 		TextEncoding:     1, // UTF-8
 	}
+	// BEGIN ENCRYPTION
+	if p.codec != nil {
+		p.header.ReservedSpace = savedReserve
+		p.header.Salt = savedSalt
+	}
+	// END ENCRYPTION
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
 	p.cellBuf = make([]byte, 0, p.usableSize_)
 

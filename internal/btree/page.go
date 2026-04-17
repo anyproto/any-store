@@ -25,7 +25,8 @@ package btree
 //	60      4     User version
 //	64      4     Incremental vacuum mode
 //	68      4     Application ID
-//	72      20    Reserved for expansion (must be zero)
+//	72      16    KDF salt (zero for unencrypted databases)
+//	88      4     Reserved for expansion (must be zero)
 //	92      4     Version-valid-for number
 //	96      4     SQLite version number
 //
