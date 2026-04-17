@@ -230,14 +230,90 @@ func TestEncryption_SpillCheckpointReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 10,000 keys × (4-byte key + 200-byte value) ≈ 2 MB of payload. At
+	// 4 KB pages with a 50-page cache (~200 KB), pagerStress spill is
+	// unavoidable — the test exercises encrypted-WAL spill plus encrypted
+	// checkpoint plus reopen-and-decrypt.
 	for i := 0; i < n; i++ {
 		k := []byte{byte(i), byte(i >> 8), byte(i >> 16), byte(i >> 24)}
 		v, err := rtx.Get(ns2, k)
 		if err != nil {
 			t.Fatalf("Get key %x: %v", k, err)
 		}
-		if len(v) != 200 || v[0] != byte(i) {
-			t.Fatalf("wrong value for key %x: len=%d v[0]=%d", k, len(v), v[0])
+		want := bytes.Repeat([]byte{byte(i)}, 200)
+		if !bytes.Equal(v, want) {
+			t.Fatalf("wrong value for key %x: len=%d first-mismatch-at=%d",
+				k, len(v), firstDiff(v, want))
+		}
+	}
+}
+
+func firstDiff(a, b []byte) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return n
+}
+
+func BenchmarkCommit_Plain(b *testing.B) {
+	benchCommit(b, nil)
+}
+
+func BenchmarkCommit_Encrypted(b *testing.B) {
+	benchCommit(b, []byte("benchmark-passphrase-used-for-pbkdf2"))
+}
+
+func benchCommit(b *testing.B, key []byte) {
+	path := filepath.Join(b.TempDir(), "bench.db")
+	opts := DefaultOptions()
+	opts.NoCommitSync = true // measure CPU, not fsync
+	opts.InProcess = true
+	if key != nil {
+		opts.Key = key
+		opts.KDFIterations = 1000
+	}
+	db, err := Open(path, opts)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	// Seed the namespace once so each iteration just Puts values.
+	seed, err := db.BeginWrite()
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := seed.CreateNamespace("ns"); err != nil {
+		b.Fatal(err)
+	}
+	if err := seed.Commit(); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tx, err := db.BeginWrite()
+		if err != nil {
+			b.Fatal(err)
+		}
+		nsTx, err := tx.GetNamespace("ns")
+		if err != nil {
+			b.Fatal(err)
+		}
+		for j := 0; j < 100; j++ {
+			k := []byte{byte(i), byte(j), byte(j >> 8)}
+			if err := tx.Put(nsTx, k, bytes.Repeat([]byte{byte(j)}, 500)); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			b.Fatal(err)
 		}
 	}
 }
