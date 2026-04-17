@@ -275,14 +275,22 @@ func firstDiff(a, b []byte) int {
 }
 
 func BenchmarkCommit_Plain(b *testing.B) {
-	benchCommit(b, nil)
+	benchCommit(b, nil, "")
 }
 
-func BenchmarkCommit_Encrypted(b *testing.B) {
-	benchCommit(b, []byte("benchmark-passphrase-used-for-pbkdf2"))
+func BenchmarkCommit_AES256GCM(b *testing.B) {
+	benchCommit(b, []byte("benchmark-passphrase-used-for-pbkdf2"), CipherAES256GCM)
 }
 
-func benchCommit(b *testing.B, key []byte) {
+func BenchmarkCommit_ChaCha20Poly1305(b *testing.B) {
+	benchCommit(b, []byte("benchmark-passphrase-used-for-pbkdf2"), CipherChaCha20Poly1305)
+}
+
+func BenchmarkCommit_XChaCha20Poly1305(b *testing.B) {
+	benchCommit(b, []byte("benchmark-passphrase-used-for-pbkdf2"), CipherXChaCha20Poly1305)
+}
+
+func benchCommit(b *testing.B, key []byte, cipher CipherType) {
 	encTestSetup(b)
 	path := filepath.Join(b.TempDir(), "bench.db")
 	opts := DefaultOptions()
@@ -291,6 +299,7 @@ func benchCommit(b *testing.B, key []byte) {
 	if key != nil {
 		opts.Key = key
 		opts.KDFIterations = 1000
+		opts.CipherType = cipher
 	}
 	db, err := Open(path, opts)
 	if err != nil {
