@@ -2167,6 +2167,18 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 				break
 			}
 
+			// BEGIN ENCRYPTION
+			// Checkpoint uses copy-verbatim: if a codec is installed, the WAL
+			// frame payload is already ciphertext produced by the same codec,
+			// with the same per-page-1 plaintext-prefix handling as the DB
+			// file expects. Writing the bytes unchanged to the DB file
+			// produces a valid encrypted DB page. No decrypt-then-re-encrypt
+			// roundtrip is needed because (a) nonce reuse is safe here — each
+			// (key, pgno) pair only sees a given plaintext once per frame,
+			// since each new modification gets a fresh WAL frame with a fresh
+			// nonce — and (b) WAL ciphertext and DB-file ciphertext share
+			// codec, key, and layout. See encryption-plan.md Task 8.
+			// END ENCRYPTION
 			pageOffset := int64(frame.pgno-1) * pageSz
 			n, err = dbFile.WriteAt(pageData, pageOffset)
 			if err != nil {
