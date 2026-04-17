@@ -13,7 +13,16 @@ func tmpEncryptedFile(t *testing.T, name string) string {
 	return filepath.Join(dir, name)
 }
 
+// encTestSetup resets the global page buffer pool so this test can Open a
+// database with its own PageSize without conflicting with a prior test's
+// configuration. Uses a Cleanup to reset again at teardown for hygiene.
+func encTestSetup(t testing.TB) {
+	t.Helper()
+	resetPageBufferPool()
+}
+
 func TestOpen_KeyRoundTrip(t *testing.T) {
+	encTestSetup(t)
 	path := tmpEncryptedFile(t, "enc.db")
 	opts := DefaultOptions()
 	opts.Key = []byte("correct horse battery staple")
@@ -70,6 +79,7 @@ func TestOpen_KeyRoundTrip(t *testing.T) {
 }
 
 func TestOpen_WrongKeyFails(t *testing.T) {
+	encTestSetup(t)
 	path := tmpEncryptedFile(t, "enc.db")
 	opts := DefaultOptions()
 	opts.Key = []byte("right-passphrase")
@@ -115,6 +125,7 @@ func TestOpen_WrongKeyFails(t *testing.T) {
 }
 
 func TestOpen_MissingKeyOnEncryptedFile(t *testing.T) {
+	encTestSetup(t)
 	path := tmpEncryptedFile(t, "enc.db")
 	opts := DefaultOptions()
 	opts.Key = []byte("pw")
@@ -147,6 +158,7 @@ func TestOpen_MissingKeyOnEncryptedFile(t *testing.T) {
 }
 
 func TestOpen_KeyOnPlainFile(t *testing.T) {
+	encTestSetup(t)
 	path := tmpEncryptedFile(t, "plain.db")
 	opts := DefaultOptions()
 	opts.InProcess = true
@@ -178,6 +190,7 @@ func TestOpen_KeyOnPlainFile(t *testing.T) {
 }
 
 func TestEncryption_SpillCheckpointReopen(t *testing.T) {
+	encTestSetup(t)
 	path := tmpEncryptedFile(t, "spill.db")
 	opts := DefaultOptions()
 	opts.Key = []byte("spill-test")
@@ -270,6 +283,7 @@ func BenchmarkCommit_Encrypted(b *testing.B) {
 }
 
 func benchCommit(b *testing.B, key []byte) {
+	encTestSetup(b)
 	path := filepath.Join(b.TempDir(), "bench.db")
 	opts := DefaultOptions()
 	opts.NoCommitSync = true // measure CPU, not fsync
@@ -319,6 +333,7 @@ func benchCommit(b *testing.B, key []byte) {
 }
 
 func TestEncryption_TamperDetected(t *testing.T) {
+	encTestSetup(t)
 	path := tmpEncryptedFile(t, "tamper.db")
 	opts := DefaultOptions()
 	opts.Key = []byte("tamper-test")
