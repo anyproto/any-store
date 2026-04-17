@@ -63,6 +63,7 @@ package btree
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"math/bits"
@@ -1658,9 +1659,47 @@ func (w *wal) readFrame(frame uint32, buf []byte) error {
 	}
 	frameSize := int64(walFrameSize) + int64(w.pageSize)
 	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
-	_, err := w.file.ReadAt(buf[:w.pageSize], offset)
-	return err
+	if _, err := w.file.ReadAt(buf[:w.pageSize], offset); err != nil {
+		return err
+	}
+	// BEGIN ENCRYPTION
+	// Decrypt frame payload if a codec is installed. The caller needs the
+	// frame's page number to bind into AAD; we extract it from the frame
+	// header which lives at offset - walFrameSize.
+	if w.codec != nil {
+		pgno, perr := w.readFramePgno(frame)
+		if perr != nil {
+			return perr
+		}
+		scratch := allocPageBuffer(int(w.pageSize), false)
+		plain, derr := decryptPageWithCodec(w.codec, scratch, buf[:w.pageSize], pgno)
+		if derr != nil {
+			freePageBuffer(scratch, false)
+			return fmt.Errorf("btree: WAL decrypt frame %d (pgno %d): %w", frame, pgno, derr)
+		}
+		copy(buf[:w.pageSize], plain)
+		freePageBuffer(scratch, false)
+	}
+	// END ENCRYPTION
+	return nil
 }
+
+// BEGIN ENCRYPTION
+
+// readFramePgno returns the page number encoded in the frame header at
+// position (frame-1). Only called on the file-backed path; the caller
+// must have validated frame >= 1 and frame <= nFrame.
+func (w *wal) readFramePgno(frame uint32) (uint32, error) {
+	frameSize := int64(walFrameSize) + int64(w.pageSize)
+	headerOffset := int64(walHeaderSize) + int64(frame-1)*frameSize
+	var hdr [4]byte
+	if _, err := w.file.ReadAt(hdr[:], headerOffset); err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint32(hdr[:4]), nil
+}
+
+// END ENCRYPTION
 
 // beginRead acquires a shared read lock on a reader slot and returns the
 // current max frame number for snapshot isolation plus the slot number.
