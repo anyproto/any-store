@@ -242,5 +242,85 @@ func TestEncryption_SpillCheckpointReopen(t *testing.T) {
 	}
 }
 
-// Make sure os is used even if the rest of the test file does not reference it.
-var _ = os.Open
+func TestEncryption_TamperDetected(t *testing.T) {
+	path := tmpEncryptedFile(t, "tamper.db")
+	opts := DefaultOptions()
+	opts.Key = []byte("tamper-test")
+	opts.KDFIterations = 1000
+	opts.InProcess = true
+
+	db, err := Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wtx, err := db.BeginWrite()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns, err := wtx.CreateNamespace("x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		k := []byte{byte(i)}
+		v := bytes.Repeat([]byte{byte(i)}, 100)
+		if err := wtx.Put(ns, k, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := wtx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Checkpoint(CheckpointFull); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Flip a byte well past the plaintext header (>= 200) so the tampered
+	// region is ciphertext.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) < int(opts.PageSize)+200 {
+		t.Fatalf("file too small: %d bytes", len(data))
+	}
+	// Tamper inside page 2's ciphertext body.
+	off := int(opts.PageSize) + 200
+	data[off] ^= 0x01
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen and try to read. The codec MUST surface an error — no crash,
+	// no silent corruption. We don't constrain where the error surfaces
+	// (open, begin-read, or the first Get touching the tampered page).
+	db2, err := Open(path, opts)
+	if err != nil {
+		return // clean failure at Open is acceptable
+	}
+	defer db2.Close()
+
+	rtx, err := db2.BeginRead()
+	if err != nil {
+		return
+	}
+	defer rtx.Rollback()
+
+	ns2, err := db2.GetNamespace("x")
+	if err != nil {
+		return
+	}
+	sawError := false
+	for i := 0; i < 50; i++ {
+		k := []byte{byte(i)}
+		if _, err := rtx.Get(ns2, k); err != nil {
+			sawError = true
+		}
+	}
+	if !sawError {
+		t.Fatalf("no error observed after tampering page 2 body")
+	}
+}
