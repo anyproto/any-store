@@ -90,14 +90,62 @@ type Options struct {
 	// values only in tests.
 	KDFIterations int
 
-	// Codec, when non-nil, replaces the built-in AES-256-GCM codec with
-	// a caller-provided implementation (e.g. HSM-backed or ChaCha20-Poly1305).
-	// When both Key and Codec are set, Codec wins and Key is ignored.
-	// Callers own the codec's lifetime and must supply an implementation
-	// safe for concurrent use.
+	// CipherType selects the built-in cipher when Key is set. Zero value
+	// (CipherAES256GCM) is the default. See CipherType constants for the
+	// available options.
+	CipherType CipherType
+
+	// Codec, when non-nil, replaces the built-in cipher with a caller-
+	// provided implementation (e.g. HSM-backed). When both Key and Codec
+	// are set, Codec wins and Key/CipherType are ignored. Callers own the
+	// codec's lifetime and must supply an implementation safe for
+	// concurrent use.
 	Codec Codec
 	// END ENCRYPTION
 }
+
+// BEGIN ENCRYPTION
+
+// CipherType selects a built-in AEAD for page encryption.
+type CipherType string
+
+const (
+	// CipherAES256GCM is AES-256 in Galois/Counter Mode. Hardware-accelerated
+	// on modern amd64/arm64 via AES-NI (~5 GB/s). Per-page overhead: 32 bytes
+	// (12-byte nonce + 16-byte tag, rounded to 32 for block alignment).
+	// Default choice for disk-backed databases.
+	CipherAES256GCM CipherType = ""
+
+	// CipherChaCha20Poly1305 is ChaCha20 with Poly1305 authentication.
+	// Constant-time in pure software without requiring hardware support.
+	// Per-page overhead: 32 bytes. Competitive with AES-GCM on non-AES-NI
+	// hardware; slightly slower on AES-NI hardware.
+	CipherChaCha20Poly1305 CipherType = "chacha20-poly1305"
+
+	// CipherXChaCha20Poly1305 is the extended-nonce variant of ChaCha20-
+	// Poly1305. Uses a 24-byte nonce which makes random-nonce collision
+	// vanishingly improbable even at astronomical write rates. Per-page
+	// overhead: 48 bytes. Recommended only for workloads exceeding ~2^32
+	// page writes per key.
+	CipherXChaCha20Poly1305 CipherType = "xchacha20-poly1305"
+)
+
+// newCodecFromType constructs a codec of the selected type from a 32-byte key.
+// CipherAES256GCM is the zero value (""), so no-CipherType-set == AES-GCM.
+func newCodecFromType(ct CipherType, key []byte) (Codec, error) {
+	switch ct {
+	case CipherAES256GCM:
+		return NewAESCodec(key)
+	case CipherChaCha20Poly1305:
+		return NewChaCha20Poly1305Codec(key)
+	case CipherXChaCha20Poly1305:
+		return NewXChaCha20Poly1305Codec(key)
+	default:
+		return nil, fmt.Errorf("btree: unknown CipherType %q", ct)
+	}
+}
+
+// END ENCRYPTION
 
 // DefaultOptions returns default database options.
 func DefaultOptions() Options {
@@ -133,7 +181,7 @@ func buildCodec(opts Options, salt []byte) (Codec, error) {
 	} else {
 		raw = DeriveKey(opts.Key, salt, opts.KDFIterations)
 	}
-	return NewAESCodec(raw)
+	return newCodecFromType(opts.CipherType, raw)
 }
 
 // readInitialHeader opens the file at path and reads the database header.
