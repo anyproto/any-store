@@ -282,3 +282,32 @@ func TestCanonicalKeyDedupIter_MultipleDocs(t *testing.T) {
 	}
 	assert.Equal(t, []string{"p1", "p2"}, got)
 }
+
+func TestSeenSetDedupIter_RemovesDuplicates(t *testing.T) {
+	a := &anyenc.Arena{}
+	p1 := a.NewObject()
+	p1.Set("id", a.NewString("p1"))
+	p2 := a.NewObject()
+	p2.Set("id", a.NewString("p2"))
+
+	plan := &Plan{}
+	upstream := &fakeIter{plan: plan, hits: []fakeHit{
+		{key: []byte("k1"), docId: []byte("p1"), doc: p1},
+		{key: []byte("k2"), docId: []byte("p2"), doc: p2},
+		{key: []byte("k3"), docId: []byte("p1"), doc: p1}, // dup
+		{key: []byte("k4"), docId: []byte("p2"), doc: p2}, // dup
+	}}
+
+	it := &SeenSetDedupIter{Source: upstream}
+
+	var got []string
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		got = append(got, string(docId))
+	}
+	assert.Equal(t, []string{"p1", "p2"}, got)
+}

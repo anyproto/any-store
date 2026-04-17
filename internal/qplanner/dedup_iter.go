@@ -103,3 +103,42 @@ func (it *CanonicalKeyDedupIter) Close() {
 func (it *CanonicalKeyDedupIter) String() string {
 	return fmt.Sprintf("%s -> Dedup(canonical)", it.Source)
 }
+
+// SeenSetDedupIter removes duplicate document emissions by tracking
+// emitted docIds in a hash set. O(distinct_results) memory.
+//
+// Used for compound multi-key indexes where canonical-key selection
+// across compound tuples is non-trivial. Correct for any upstream
+// iterator that emits (key, docId) tuples, at the cost of a small
+// per-query map allocation.
+type SeenSetDedupIter struct {
+	Source Iterator
+	seen   map[string]struct{}
+}
+
+func (it *SeenSetDedupIter) Next() (key []byte, docId []byte, err error) {
+	if it.seen == nil {
+		it.seen = make(map[string]struct{}, 16)
+	}
+	for {
+		key, docId, err = it.Source.Next()
+		if err != nil || docId == nil {
+			return nil, nil, err
+		}
+		if _, dup := it.seen[string(docId)]; dup {
+			continue
+		}
+		it.seen[string(docId)] = struct{}{}
+		return key, docId, nil
+	}
+}
+
+func (it *SeenSetDedupIter) Close() {
+	if it.Source != nil {
+		it.Source.Close()
+	}
+}
+
+func (it *SeenSetDedupIter) String() string {
+	return fmt.Sprintf("%s -> Dedup(seenSet)", it.Source)
+}
