@@ -177,5 +177,70 @@ func TestOpen_KeyOnPlainFile(t *testing.T) {
 	}
 }
 
+func TestEncryption_SpillCheckpointReopen(t *testing.T) {
+	path := tmpEncryptedFile(t, "spill.db")
+	opts := DefaultOptions()
+	opts.Key = []byte("spill-test")
+	opts.KDFIterations = 1000
+	opts.CacheSize = 50 // tiny cache to force spill
+	opts.InProcess = true
+
+	db, err := Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 10_000
+	wtx, err := db.BeginWrite()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns, err := wtx.CreateNamespace("ns")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		k := []byte{byte(i), byte(i >> 8), byte(i >> 16), byte(i >> 24)}
+		v := bytes.Repeat([]byte{byte(i)}, 200)
+		if err := wtx.Put(ns, k, v); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+	if err := wtx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := db.Checkpoint(CheckpointFull); err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db, err = Open(path, opts)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rtx.Rollback()
+	ns2, err := db.GetNamespace("ns")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		k := []byte{byte(i), byte(i >> 8), byte(i >> 16), byte(i >> 24)}
+		v, err := rtx.Get(ns2, k)
+		if err != nil {
+			t.Fatalf("Get key %x: %v", k, err)
+		}
+		if len(v) != 200 || v[0] != byte(i) {
+			t.Fatalf("wrong value for key %x: len=%d v[0]=%d", k, len(v), v[0])
+		}
+	}
+}
+
 // Make sure os is used even if the rest of the test file does not reference it.
 var _ = os.Open
