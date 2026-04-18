@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/internal/btree"
 	"github.com/anyproto/any-store/query"
 )
 
@@ -1218,15 +1219,19 @@ func TestBuildPlan_IndexScan_NonUniqueBoundsAdjusted(t *testing.T) {
 			continue
 		case *IndexIter:
 			// Walked to the leaf. If plan.Name is IndexScan, bounds must carry
-			// the 0xff suffix now.
+			// the 0xff suffix now. We fail (not skip) on a CBO choice change so
+			// regressions in cost model surface rather than hide the test.
 			if plan.Name != "IndexScan" {
-				t.Skipf("BuildPlan chose %s instead of IndexScan — skipping bound-adjust check", plan.Name)
+				t.Fatalf("BuildPlan chose %s; expected IndexScan to exercise bounds adjust", plan.Name)
 			}
-			// End should have 0xff appended.
+			// Full slice equality: {0x10} stays as Start; {0x20} becomes {0x20, 0xff}.
 			bounds := r.Bounds
 			if assert.Equal(t, 1, len(bounds)) {
-				assert.Equal(t, byte(0xff), bounds[0].End[len(bounds[0].End)-1],
+				assert.Equal(t, []byte{0x10}, []byte(bounds[0].Start))
+				assert.Equal(t, []byte{0x20, 0xff}, []byte(bounds[0].End),
 					"non-unique IndexScan bounds must have 0xff appended to End")
+				assert.True(t, bounds[0].StartInclude, "StartInclude must be preserved")
+				assert.True(t, bounds[0].EndInclude, "EndInclude must be preserved")
 			}
 			return
 		default:
@@ -1255,7 +1260,10 @@ func TestBuildPlan_IndexScan_MultiFieldPathsUsesSeenSetDedup(t *testing.T) {
 		}},
 	})
 	if plan.Name != "IndexScan" {
-		t.Skipf("BuildPlan chose %s — Plan-C multi-field dedup branch not exercised", plan.Name)
+		// Skipping masks CBO cost regressions. If this ever trips, the
+		// multi-field dedup branch at planner.go:1027 is no longer reached
+		// — investigate rather than relax the assertion.
+		t.Fatalf("BuildPlan chose %s; expected IndexScan to exercise SeenSetDedupIter", plan.Name)
 	}
 	// Walk to the topmost dedup wrapper.
 	root := plan.Root
@@ -1393,6 +1401,110 @@ func TestBuildVerifyChain_NoUncoveredFields_ReturnsNil(t *testing.T) {
 	tr := &closeTrackingIter{}
 	got := buildVerifyChain(params, idx, tr)
 	assert.Nil(t, got, "no uncovered fields → buildVerifyChain must return nil")
+}
+
+// TestBuildVerifyChain_UncoveredNoFieldBounds pins the nil return at
+// planner.go:1191-1193 when an uncovered field has NO entry in FieldBounds
+// (Lookup returns found=false).
+func TestBuildVerifyChain_UncoveredNoFieldBounds(t *testing.T) {
+	// Primary index covers "a"; filter also references uncovered "b".
+	// params.FieldBounds has no "b" entry → Lookup returns found=false
+	// → buildVerifyChain returns nil.
+	idx := &CBOIndex{
+		Info:        &IndexInfo{FieldNames: []string{"a"}},
+		BoundFields: 1,
+	}
+	params := &PlanParams{
+		Filter:      query.MustParseCondition(`{"a": 1, "b": 2}`),
+		FieldBounds: &BoundsResult{}, // intentionally empty; no "b" entry
+	}
+	tr := &closeTrackingIter{}
+	got := buildVerifyChain(params, idx, tr)
+	assert.Nil(t, got, "missing FieldBounds for uncovered field → nil")
+}
+
+// TestBuildVerifyChain_NoVerifyIndex pins the nil return at planner.go:1204-1206
+// when an uncovered field has fixed bounds but no matching non-unique
+// single-field index exists to verify against.
+func TestBuildVerifyChain_NoVerifyIndex(t *testing.T) {
+	filter := query.MustParseCondition(`{"a": 1, "b": 2}`)
+	br := &BoundsResult{}
+	br.Build([]*IndexInfo{{FieldNames: []string{"a"}}, {FieldNames: []string{"b"}}}, filter)
+
+	idx := &CBOIndex{
+		Info:        &IndexInfo{FieldNames: []string{"a"}},
+		BoundFields: 1,
+	}
+	params := &PlanParams{
+		Filter:      filter,
+		FieldBounds: br,
+		Indexes: []CBOIndex{
+			// Only the primary index exists; no separate index for "b".
+			*idx,
+		},
+	}
+	tr := &closeTrackingIter{}
+	got := buildVerifyChain(params, idx, tr)
+	assert.Nil(t, got, "no non-unique single-field index for uncovered field → nil")
+}
+
+// TestBuildVerifyChain_BuildsVerifyIter pins the non-nil VerifyIter construction
+// at planner.go:1208-1213 when every uncovered field has both a fixed bound
+// AND a matching non-unique single-field index with a non-nil Namespace.
+func TestBuildVerifyChain_BuildsVerifyIter(t *testing.T) {
+	// Open a real (but minimal) btree to get a non-nil Namespace for the
+	// verify target. buildVerifyChain requires info.Ns != nil.
+	_, _, _, _ = plannerTestDB(t) // seed planner test db infra (no-op if idempotent)
+	// Use the helper already in planner_test.go to open a small btree.
+	_, _, verifyNs := openBtreeForVerify(t, "verify_b", func(tx *btree.WriteTx, ns *btree.Namespace) {})
+
+	filter := query.MustParseCondition(`{"a": 1, "b": 2}`)
+	br := &BoundsResult{}
+	br.Build([]*IndexInfo{{FieldNames: []string{"a"}}, {FieldNames: []string{"b"}}}, filter)
+
+	primary := &CBOIndex{
+		Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}, Unique: false},
+		BoundFields: 1,
+	}
+	verifyTarget := &CBOIndex{
+		Info: &IndexInfo{Name: "b_idx", FieldNames: []string{"b"}, Unique: false, Ns: verifyNs},
+	}
+	params := &PlanParams{
+		Filter:      filter,
+		FieldBounds: br,
+		Indexes:     []CBOIndex{*primary, *verifyTarget},
+	}
+	tr := &closeTrackingIter{}
+	got := buildVerifyChain(params, primary, tr)
+	if assert.NotNil(t, got, "uncovered field with matching non-unique index → VerifyIter") {
+		_, ok := got.(*VerifyIter)
+		assert.True(t, ok, "result must be a *VerifyIter; got %T", got)
+	}
+}
+
+// TestBuildVerifyChain_RangeBoundSkipsVerify pins the nil return at
+// planner.go:1191-1193 when an uncovered field has bounds but they are NOT
+// fixed (i.e., a range), so verification is unsafe.
+func TestBuildVerifyChain_RangeBoundSkipsVerify(t *testing.T) {
+	filter := query.MustParseCondition(`{"a": 1, "b": {"$gt": 2}}`)
+	br := &BoundsResult{}
+	br.Build([]*IndexInfo{{FieldNames: []string{"a"}}, {FieldNames: []string{"b"}}}, filter)
+
+	primary := &CBOIndex{
+		Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}, Unique: false},
+		BoundFields: 1,
+	}
+	verifyTarget := &CBOIndex{
+		Info: &IndexInfo{Name: "b_idx", FieldNames: []string{"b"}, Unique: false},
+	}
+	params := &PlanParams{
+		Filter:      filter,
+		FieldBounds: br,
+		Indexes:     []CBOIndex{*primary, *verifyTarget},
+	}
+	tr := &closeTrackingIter{}
+	got := buildVerifyChain(params, primary, tr)
+	assert.Nil(t, got, "range bound on uncovered field → verification unsafe, return nil")
 }
 
 // TestFilterFieldsCoveredBy_PointerAndBranch is expected to FAIL:
