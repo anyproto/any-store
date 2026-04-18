@@ -340,8 +340,12 @@ func walChecksum(data []byte, s1, s2 uint32) (uint32, uint32) {
 // readMarkNotUsed is the sentinel value for an unused read mark slot.
 const readMarkNotUsed = uint32(0xFFFFFFFF)
 
-// errWALRetry is an internal sentinel signaling that beginRead should retry.
-// It is never returned to callers; the retry loop in beginRead handles it.
+// errWALRetry is an internal sentinel signaling that the caller should retry.
+// Used by (a) tryBeginRead when SHM state changed between metadata read and
+// lock acquisition (beginRead's 5000-attempt loop consumes it), and (b) the
+// ensureHeaderInitialized helper when a peer holds a blocking lock and the
+// operation must be re-attempted. Callers outside beginRead must implement
+// their own retry loop or propagate as BUSY-equivalent.
 var errWALRetry = errors.New("btree: WAL retry")
 
 // walIndexHdrSize is the size of one WalIndexHdr in the SHM (48 bytes),
@@ -1292,11 +1296,21 @@ func (w *wal) ensureHeaderInitialized() error {
 	}
 
 	// Header still bad → run recovery. Acquire CKPT + RECOVER exclusive too.
+	// Normalize ErrBusy → errWALRetry so callers have a single retry signal
+	// (happens when a peer is concurrently checkpointing or initializing;
+	// checkpointWithMode uses C→W order while we use W→C→R so under contention
+	// the loser observes ErrBusy via non-blocking F_SETLK — no deadlock).
 	if err := w.index.lock(lockCheckpoint, lockExclusive); err != nil {
+		if err == ErrBusy {
+			return errWALRetry
+		}
 		return err
 	}
 	defer func() { _ = w.index.unlock(lockCheckpoint, lockExclusive) }()
 	if err := w.index.lock(lockRecover, lockExclusive); err != nil {
+		if err == ErrBusy {
+			return errWALRetry
+		}
 		return err
 	}
 	defer func() { _ = w.index.unlock(lockRecover, lockExclusive) }()
@@ -1346,7 +1360,9 @@ func (w *wal) ensureHeaderInitializedInProcess() error {
 
 // syncFromSHMLocked reads the published SHM header and copies the relevant
 // fields into w.header, w.cksum1/2, w.nFrame, w.index.*, w.writerHdr.
-// Caller must hold w.mu.
+// Caller must hold w.mu and must have observed a valid SHM header on the
+// calling path. The defensive !valid early-return remains for safety but
+// all current callers pre-check.
 func (w *wal) syncFromSHMLocked() {
 	hdr, valid := w.index.readHeader()
 	if !valid {
@@ -1360,10 +1376,11 @@ func (w *wal) syncFromSHMLocked() {
 	w.cksum1 = hdr.aFrameCksum[0]
 	w.cksum2 = hdr.aFrameCksum[1]
 	w.nFrame.Store(hdr.mxFrame)
-	if w.file != nil {
-		if info, err := w.file.Stat(); err == nil && info.Size() >= walHeaderSize {
-			w.headerOnDisk = true
-		}
+	// Publishing frames via the WAL implies flushHeader already wrote the
+	// on-disk WAL header (flushHeader precedes any frame write). Avoids a
+	// per-call fstat syscall on the hot read path.
+	if !w.headerOnDisk && hdr.mxFrame > 0 {
+		w.headerOnDisk = true
 	}
 	w.index.maxFrame.Store(hdr.mxFrame)
 	w.index.mxCommitFrame.Store(hdr.mxFrame)
