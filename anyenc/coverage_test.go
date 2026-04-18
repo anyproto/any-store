@@ -128,6 +128,133 @@ func TestTuple_FieldBytes(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestAppendAnyValue_BytesAndPanic covers the `case []byte` arm at any.go:18-21
+// and the `default: panic(...)` arm at any.go:67 for unsupported types.
+func TestAppendAnyValue_BytesAndPanic(t *testing.T) {
+	// []byte takes the TypeString encoding.
+	b := AppendAnyValue(nil, []byte("hi"))
+	assert.Equal(t, byte(TypeString), b[0])
+	// EOS terminator at the end.
+	assert.Equal(t, EOS, b[len(b)-1])
+
+	// Unsupported type → panic.
+	assert.Panics(t, func() {
+		_ = AppendAnyValue(nil, struct{ X int }{X: 1})
+	})
+}
+
+// TestParse_ErrorPaths hits the many error branches inside parseValue,
+// parseObject, parseArray, parseBinary when input is truncated/malformed.
+func TestParse_ErrorPaths(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []byte
+	}{
+		{"empty", []byte{}},
+		{"invalid_type_byte", []byte{0xfe}},
+		{"string_missing_eos", []byte{byte(TypeString), 'x'}}, // no EOS
+		{"truncated_number", []byte{byte(TypeNumber), 0x01}},  // need 8 bytes
+		{"truncated_binary_lenhdr", []byte{byte(TypeBinary), 0x00}},
+		{"object_missing_eos_on_key", []byte{byte(TypeObject), 'k'}}, // no EOS after key
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(tc.in)
+			assert.Error(t, err, "parse must reject %x", tc.in)
+		})
+	}
+}
+
+// TestTuple_ReadValues_ErrorPaths covers tuple.go ReadValues error branches:
+// parse failure, callback error propagation.
+func TestTuple_ReadValues_ErrorPaths(t *testing.T) {
+	a := &Arena{}
+	var tuple Tuple
+	tuple = tuple.Append(a.NewString("a"))
+	tuple = tuple.Append(a.NewString("b"))
+
+	t.Run("callback_error_propagates", func(t *testing.T) {
+		sentinel := assertCustomErr{"stop"}
+		err := tuple.ReadValues(&Parser{}, func(v *Value) error {
+			return sentinel
+		})
+		require.ErrorIs(t, err, sentinel)
+	})
+	t.Run("parse_failure", func(t *testing.T) {
+		// Tuple with garbage.
+		bad := Tuple{0xff, 0xff, 0xff}
+		err := bad.ReadValues(&Parser{}, func(v *Value) error { return nil })
+		require.Error(t, err)
+	})
+}
+
+// TestTuple_ReadBytes_ErrorPaths covers tuple.go ReadBytes error branches.
+func TestTuple_ReadBytes_ErrorPaths(t *testing.T) {
+	a := &Arena{}
+	var tuple Tuple
+	tuple = tuple.Append(a.NewString("a"))
+
+	t.Run("callback_error_propagates", func(t *testing.T) {
+		sentinel := assertCustomErr{"rb-stop"}
+		err := tuple.ReadBytes(func(b []byte) error { return sentinel })
+		require.ErrorIs(t, err, sentinel)
+	})
+	t.Run("parse_failure", func(t *testing.T) {
+		bad := Tuple{0xff, 0xff}
+		err := bad.ReadBytes(func(b []byte) error { return nil })
+		require.Error(t, err)
+	})
+}
+
+// TestTuple_OffsetAfter covers all branches: n<=0, n in range, n beyond
+// field count (clamps to len(t)), and parse failure propagation.
+func TestTuple_OffsetAfter(t *testing.T) {
+	a := &Arena{}
+	var tuple Tuple
+	tuple = tuple.Append(a.NewString("a"))
+	tuple = tuple.Append(a.NewString("b"))
+
+	t.Run("n_zero", func(t *testing.T) {
+		off, err := tuple.OffsetAfter(0)
+		require.NoError(t, err)
+		assert.Equal(t, 0, off)
+	})
+	t.Run("n_negative", func(t *testing.T) {
+		off, err := tuple.OffsetAfter(-1)
+		require.NoError(t, err)
+		assert.Equal(t, 0, off)
+	})
+	t.Run("n_in_range", func(t *testing.T) {
+		off, err := tuple.OffsetAfter(1)
+		require.NoError(t, err)
+		assert.Greater(t, off, 0)
+		assert.Less(t, off, len(tuple))
+	})
+	t.Run("n_beyond_len_clamped", func(t *testing.T) {
+		off, err := tuple.OffsetAfter(99)
+		require.NoError(t, err)
+		assert.Equal(t, len(tuple), off, "n past the end must clamp to len(tuple)")
+	})
+	t.Run("parse_failure", func(t *testing.T) {
+		bad := Tuple{0xff, 0xff, 0xff}
+		_, err := bad.OffsetAfter(1)
+		require.Error(t, err)
+	})
+}
+
+// assertCustomErr is a sentinel error type for checking callback propagation.
+type assertCustomErr struct{ msg string }
+
+func (e assertCustomErr) Error() string { return e.msg }
+
+// TestType_String covers the remaining Type.String cases not hit by
+// existing tests: binary, compressed-object-s2, and the default unknown path.
+func TestType_String(t *testing.T) {
+	assert.Equal(t, "binary", TypeBinary.String())
+	assert.Equal(t, "compressedObjectS2", TypeCompressedObjectS2.String())
+	assert.Contains(t, Type(99).String(), "unknown type")
+}
+
 // TestValue_GoType covers Value.GoType for every supported type plus the
 // default-panic branch (unreachable via the public API but handled here for
 // robustness).
