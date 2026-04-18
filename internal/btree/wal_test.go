@@ -2,6 +2,7 @@ package btree
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -1019,4 +1020,34 @@ func TestWriteFramesCommitFlushesToShm(t *testing.T) {
 
 	w.endWrite()
 	require.NoError(t, w.close())
+}
+
+// BenchmarkWalOpen_CleanReopen measures per-reopen cost after a clean close
+// with 50 pre-existing WAL frames. Baseline for the wal.open SQLite-alignment
+// refactor: current code eagerly touches SHM on open (either initHeaderState
+// or adoptSHMState + recover). Post-refactor target: <20% of current time,
+// matching SQLite's sqlite3WalOpen which never touches SHM on open.
+func BenchmarkWalOpen_CleanReopen(b *testing.B) {
+	dir := b.TempDir()
+	path := filepath.Join(dir, "test.db")
+	db, err := testOpen(b, path, Options{PageSize: 4096, DisableAutoCheckpoint: true})
+	require.NoError(b, err)
+	tx, err := db.BeginWrite()
+	require.NoError(b, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(b, err)
+	for i := 0; i < 50; i++ {
+		require.NoError(b, tx.Put(ns, []byte(fmt.Sprintf("k%04d", i)), make([]byte, 512)))
+	}
+	require.NoError(b, tx.Commit())
+	require.NoError(b, db.Close())
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		db2, err := testOpen(b, path, Options{PageSize: 4096, DisableAutoCheckpoint: true})
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = db2.Close()
+	}
 }
