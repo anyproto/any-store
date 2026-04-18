@@ -277,9 +277,14 @@ func TestIndexSketch_MarshalUnmarshal(t *testing.T) {
 	// Backward compat: trim off the trailing 8-byte docCount.
 	oldData := data[:len(data)-8]
 	s3 := NewIndexSketch(4)
+	// Pre-set docCount to a sentinel so we can distinguish
+	// "branch left it alone" from "branch zeroed it".
+	s3.IncrementDocCount()
+	s3.IncrementDocCount()
+	s3.IncrementDocCount() // sentinel = 3
 	s3.UnmarshalBinary(oldData)
-	assert.Equal(t, uint64(0), s3.GetDocCount(),
-		"data missing docCount leaves it at zero")
+	assert.Equal(t, uint64(3), s3.GetDocCount(),
+		"data missing docCount must LEAVE the pre-existing value untouched, not zero it")
 	assert.Equal(t, s.Estimate([]byte("a")), s3.Estimate([]byte("a")))
 }
 
@@ -351,12 +356,16 @@ func TestIndexInfo_AppendIndexKey(t *testing.T) {
 	fwd = ii.AppendIndexKey(fwd, doc, 0) // forward on field "a"
 	rev = ii.AppendIndexKey(rev, doc, 1) // reverse on field "b"
 
-	// Forward emits normal type-byte + bytes; reverse emits byte-inverted,
-	// so the first byte differs between the two encodings.
+	// Forward emits raw type-byte + bytes; reverse emits each byte bitwise-inverted.
+	// For a string value, forward starts with TypeString (3); reverse starts
+	// with ^TypeString (252). A regression that routed reverse through Append
+	// instead of AppendInverted would fail these strict checks.
 	require.NotEmpty(t, fwd)
 	require.NotEmpty(t, rev)
-	assert.NotEqual(t, fwd[0], rev[0],
-		"reverse field byte-inversion must flip the leading type byte too")
+	assert.Equal(t, byte(anyenc.TypeString), fwd[0],
+		"forward string field must begin with TypeString byte")
+	assert.Equal(t, ^byte(anyenc.TypeString), rev[0],
+		"reverse string field must begin with bitwise-inverted TypeString byte")
 }
 
 // TestFetchIter_Next_NoPlanLeaves_DocParsed_Untouched covers the branch at
@@ -379,9 +388,17 @@ func TestFetchIter_Next_NoPlanLeaves_DocParsed_Untouched(t *testing.T) {
 		Source: source,
 		Data:   &CursorSource{Tx: rtx, Ns: ns},
 		Buf:    buf,
-		Plan:   nil, // explicitly no plan
+		Plan:   nil, // explicitly no plan → parsing block must be skipped
 	}
+	// Pre-mark DocBuf with a sentinel. The no-plan path still APPENDS the raw
+	// value into DocBuf (fetch_iter.go:48), so DocBuf ends populated — but
+	// no Parse call should occur (Plan is nil).
 	_, docId, err := it.Next()
 	require.NoError(t, err)
 	assert.NotNil(t, docId, "doc must still be fetched")
+	// Data was read into Buf.DocBuf, proving fetch happened.
+	assert.NotEmpty(t, buf.DocBuf, "no-plan path must still fetch into DocBuf")
+	// There is no plan to check, so we cannot observe "DocParsed untouched"
+	// directly. The coverage assertion is that fetch_iter.go:61's nil-check
+	// short-circuited the parse block.
 }
