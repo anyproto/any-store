@@ -311,6 +311,7 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 	merged := mergeCollOpts(opts)
 	var coll Collection
 	err := db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+		tx.MarkSchemaChanged()
 		db.mu.Lock()
 		defer db.mu.Unlock()
 
@@ -758,6 +759,7 @@ func (db *db) removeIndex(tx *btree.WriteTx, collName, indexName string) error {
 
 // removeCollection removes collection metadata from the system namespace
 func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
+	tx.MarkSchemaChanged()
 	// Remove collection key
 	if err := tx.Delete(db.systemNS, collKey(collName)); err != nil {
 		return err
@@ -795,6 +797,7 @@ func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 
 // renameCollection renames collection metadata in the system namespace
 func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error {
+	tx.MarkSchemaChanged()
 	// Remove old collection key, add new one
 	if err := tx.Delete(db.systemNS, collKey(oldName)); err != nil {
 		return err

@@ -556,6 +556,7 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 }
 
 func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info IndexInfo) (idx *index, err error) {
+	tx.MarkSchemaChanged()
 	if info.Name == "" {
 		info.Name = info.createName()
 	}
@@ -602,6 +603,7 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 
 func (c *collection) DropIndex(ctx context.Context, indexName string) (err error) {
 	return c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (txErr error) {
+		tx.MarkSchemaChanged()
 		// Check index exists
 		found := false
 		c.mu.Lock()

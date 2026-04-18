@@ -446,9 +446,19 @@ func (p *pager) beginWrite() error {
 		return err
 	}
 	// If another process changed WAL state (committed or checkpointed),
-	// our writerCache has stale pages and must be cleared.
+	// our writerCache has stale pages and must be cleared. We must also
+	// refresh p.header and p.dbSize from the new page 1 — without this,
+	// commit() would serialize our stale header back into page 1
+	// (corrupting the freelist / DatabaseSize) and allocatePage would
+	// hand out pgno slots the other process already wrote to.
+	//
+	// Mirrors SQLite's sqlite3PagerSharedLock pattern: on state change,
+	// reset cache and re-read page 1 (pager.c:5390-5449). Uses the same
+	// lookup pattern as readHeaderCounters so cross-process SHM hash
+	// tables are consulted in multi-process mode.
 	if stateChanged {
 		p.writerCache.clear()
+		p.refreshHeaderFromPage1()
 	}
 	p.state.Store(int32(pagerWriter))
 	// Save a snapshot of the database header so rollback can restore it (fix 5.2).
@@ -1130,6 +1140,50 @@ func (p *pager) setHasContent(pgno uint32) {
 // Matches SQLite's btreeGetHasContent() (btree.c:673-676).
 func (p *pager) getHasContent(pgno uint32) bool {
 	return p.hasContent[pgno]
+}
+
+// refreshHeaderFromPage1 refreshes p.header and p.dbSize from the latest
+// page 1 bytes, consulting WAL first (via SHM hash tables in multi-process
+// mode) and falling back to the database file. Called from beginWrite when
+// another process's commit has been detected.
+func (p *pager) refreshHeaderFromPage1() {
+	// Determine effective max frame, same logic as readHeaderCounters.
+	effectiveMaxFrame := p.wal.nFrame.Load()
+	if p.inProcess {
+		if mf := p.wal.index.mxCommitFrame.Load(); mf > effectiveMaxFrame {
+			effectiveMaxFrame = mf
+		}
+	} else if hdr, valid := p.wal.index.readHeader(); valid && hdr.mxFrame > effectiveMaxFrame {
+		effectiveMaxFrame = hdr.mxFrame
+	}
+
+	// Try WAL first.
+	if effectiveMaxFrame > 0 {
+		var frame uint32
+		if p.inProcess {
+			frame = p.wal.index.get(1, effectiveMaxFrame)
+		} else {
+			frame = p.wal.index.shmHashGet(1, effectiveMaxFrame, p.wal.index.nBackfill.Load()+1)
+		}
+		if frame > 0 {
+			var buf [dbHeaderSize]byte
+			if err := p.readWalFrameData(frame, buf[:]); err == nil {
+				_ = p.header.deserialize(buf[:])
+				p.dbSize.Store(p.header.DatabaseSize)
+				return
+			}
+		}
+	}
+
+	// WAL didn't have page 1 (or the read failed) — fall back to the DB file.
+	if p.file != nil {
+		var buf [dbHeaderSize]byte
+		if _, err := p.file.ReadAt(buf[:], 0); err == nil {
+			_ = p.header.deserialize(buf[:])
+			p.dbSize.Store(p.header.DatabaseSize)
+			return
+		}
+	}
 }
 
 // readHeaderCounters reads the FileChangeCount and SchemaCookie from page 1.
