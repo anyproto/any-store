@@ -92,6 +92,21 @@ that are structurally identical to comma-spelled `{"a":1,"b":2}` filters.
   in principle but would require scripted heap states that bypass the
   SortIter public API; limited coverage value.
 
+- `internal/qplanner/dedup_iter.go:54-55` — `if len(key) < len(docId)` defensive
+  arm in `CanonicalKeyDedupIter.Next`. The comment itself labels it "defensive;
+  shouldn't happen" — IndexIter always emits keys of form (field..., docId)
+  where len(key) ≥ len(docId) by construction.
+
+- `internal/qplanner/sort_iter.go:141-150` — `heapUp` else-break: reached
+  only when the heap property is already satisfied at every upward step.
+  Can happen but requires a scripted heap sequence; partial coverage is
+  acceptable since the successful swap path is already tested.
+
+- `internal/qplanner/cover_iter.go:45` — `Close` is an empty function
+  (comment at line 44 notes "no cursor to close"). go-cover registers it
+  as 0% statements because there are no statements to execute. Not a real
+  coverage gap.
+
 - `internal/qplanner/cover_iter.go:32-33` — `AppendSeekKey` error branch
   (continues the loop). Requires btree read error; no injection seam.
 
