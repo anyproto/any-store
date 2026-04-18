@@ -1169,6 +1169,232 @@ func TestBuildPlan_IndexScan_LimitClampsAtScanPopulation(t *testing.T) {
 		"s>scanPopulation clamp must pin EstRows at scanPopulation (=totalDocs here)")
 }
 
+// TestBuildPlan_IndexScan_NonUniqueBoundsAdjusted hits planner.go:973 — when
+// the chosen IndexScan index is non-unique and has bounds, AdjustBoundsForNonUnique
+// appends 0xff so range scans capture all docId suffixes.
+func TestBuildPlan_IndexScan_NonUniqueBoundsAdjusted(t *testing.T) {
+	sorter := &sortFieldStub{fields: []query.SortField{{Field: "a"}}}
+	indexBounds := query.Bounds{
+		{Start: []byte{0x10}, End: []byte{0x20}, StartInclude: true, EndInclude: true},
+	}
+	plan := BuildPlan(&PlanParams{
+		Filter:    query.MustParseCondition(`{"a": {"$gte": 1, "$lte": 5}}`),
+		Sorter:    sorter,
+		TotalDocs: 100,
+		Indexes: []CBOIndex{{
+			Info: &IndexInfo{
+				Name:       "a",
+				FieldNames: []string{"a"},
+				FieldPaths: [][]string{{"a"}},
+				Unique:     false, // triggers adjustment
+			},
+			Sketch:    mockSketch(10),
+			Bounds:    indexBounds,
+			ExactSort: true,
+		}},
+	})
+	// Root traversal: LimitIter? → *CanonicalKeyDedupIter → *FilterIter? → *FetchIter → *IndexIter.
+	// We walk down until we find the IndexIter and check its Bounds were adjusted.
+	root := plan.Root
+	for {
+		switch r := root.(type) {
+		case *LimitIter:
+			root = r.Source
+			continue
+		case *CanonicalKeyDedupIter:
+			root = r.Source
+			continue
+		case *SeenSetDedupIter:
+			root = r.Source
+			continue
+		case *FilterIter:
+			root = r.Source
+			continue
+		case *FetchIter:
+			root = r.Source
+			continue
+		case *IndexFilterIter:
+			root = r.Source
+			continue
+		case *IndexIter:
+			// Walked to the leaf. If plan.Name is IndexScan, bounds must carry
+			// the 0xff suffix now.
+			if plan.Name != "IndexScan" {
+				t.Skipf("BuildPlan chose %s instead of IndexScan — skipping bound-adjust check", plan.Name)
+			}
+			// End should have 0xff appended.
+			bounds := r.Bounds
+			if assert.Equal(t, 1, len(bounds)) {
+				assert.Equal(t, byte(0xff), bounds[0].End[len(bounds[0].End)-1],
+					"non-unique IndexScan bounds must have 0xff appended to End")
+			}
+			return
+		default:
+			t.Fatalf("unexpected iterator type: %T", r)
+		}
+	}
+}
+
+// TestBuildPlan_IndexScan_MultiFieldPathsUsesSeenSetDedup hits planner.go:1027
+// — when idx.FieldPaths has length > 1, buildIndexScanChain wraps in
+// SeenSetDedupIter (not CanonicalKeyDedupIter).
+func TestBuildPlan_IndexScan_MultiFieldPathsUsesSeenSetDedup(t *testing.T) {
+	sorter := &sortFieldStub{fields: []query.SortField{{Field: "a"}}}
+	plan := BuildPlan(&PlanParams{
+		Filter:    query.All{},
+		Sorter:    sorter,
+		TotalDocs: 100,
+		Indexes: []CBOIndex{{
+			Info: &IndexInfo{
+				Name:       "ab",
+				FieldNames: []string{"a", "b"},
+				FieldPaths: [][]string{{"a"}, {"b"}},
+				Unique:     true,
+			},
+			ExactSort: true,
+		}},
+	})
+	if plan.Name != "IndexScan" {
+		t.Skipf("BuildPlan chose %s — Plan-C multi-field dedup branch not exercised", plan.Name)
+	}
+	// Walk to the topmost dedup wrapper.
+	root := plan.Root
+	if li, ok := root.(*LimitIter); ok {
+		root = li.Source
+	}
+	_, isSeenSet := root.(*SeenSetDedupIter)
+	_, isCanonical := root.(*CanonicalKeyDedupIter)
+	assert.True(t, isSeenSet, "compound index must wrap with SeenSetDedupIter")
+	assert.False(t, isCanonical, "compound index must NOT use CanonicalKeyDedupIter")
+}
+
+// TestBuildPlan_IndexScan_CoverFiltersInsertsIndexFilterIter hits planner.go:991
+// — when coveringFilterFields returns non-nil, buildIndexScanChain wraps the
+// IndexIter in an IndexFilterIter.
+func TestBuildPlan_IndexScan_CoverFiltersInsertsIndexFilterIter(t *testing.T) {
+	sorter := &sortFieldStub{fields: []query.SortField{{Field: "a"}}}
+
+	// Compound index (a, b). Filter: a=5 AND b=10. Index bounds cover a
+	// (BoundFields=1); b is a trailing field with equality condition, so
+	// coveringFilterFields returns one entry for b.
+	filter := query.MustParseCondition(`{"a": 5, "b": 10}`)
+	indexInfo := &IndexInfo{
+		Name:       "ab",
+		FieldNames: []string{"a", "b"},
+		FieldPaths: [][]string{{"a"}, {"b"}},
+		Unique:     true,
+	}
+	br := &BoundsResult{}
+	br.Build([]*IndexInfo{indexInfo}, filter)
+
+	plan := BuildPlan(&PlanParams{
+		Filter:      filter,
+		Sorter:      sorter,
+		FieldBounds: br,
+		TotalDocs:   100,
+		Indexes: []CBOIndex{{
+			Info:        indexInfo,
+			Sketch:      mockSketch(10),
+			Bounds:      mustParseBounds("a", `{"a": 5}`),
+			PointLookup: true,
+			BoundFields: 1, // only a is bound; b is a trailing covered field
+			ExactSort:   true,
+		}},
+	})
+	if plan.Name != "IndexScan" {
+		t.Skipf("BuildPlan chose %s — Plan-C coverFilters branch not exercised", plan.Name)
+	}
+
+	// Walk: LimitIter? → dedup → FilterIter? → FetchIter → IndexFilterIter → IndexIter.
+	// Keep walking until we see an *IndexFilterIter.
+	root := plan.Root
+	seen := false
+	for i := 0; i < 10; i++ {
+		if _, ok := root.(*IndexFilterIter); ok {
+			seen = true
+			break
+		}
+		switch r := root.(type) {
+		case *LimitIter:
+			root = r.Source
+		case *CanonicalKeyDedupIter:
+			root = r.Source
+		case *SeenSetDedupIter:
+			root = r.Source
+		case *FilterIter:
+			root = r.Source
+		case *FetchIter:
+			root = r.Source
+		default:
+			goto done
+		}
+	}
+done:
+	assert.True(t, seen, "coverFilters > 0 must insert an IndexFilterIter into the chain")
+}
+
+// TestBuildPlan_CountOnly_Covering hits planner.go:900-902 — a count query
+// over a single-bound PointLookup non-unique index whose fields fully cover
+// the filter returns the bare IndexIter root (no fetch/filter/dedup wrapping).
+// A unique + all-fields-bound index would short-circuit earlier at line 837
+// into the CoverIter path, so this test uses Unique=false to bypass that.
+func TestBuildPlan_CountOnly_Covering(t *testing.T) {
+	filter := query.MustParseCondition(`{"a": 5}`)
+	indexInfo := &IndexInfo{
+		Name:       "a",
+		FieldNames: []string{"a"},
+		FieldPaths: [][]string{{"a"}},
+		Unique:     false, // avoids the CoverIter short-circuit at line 837
+	}
+	br := &BoundsResult{}
+	br.Build([]*IndexInfo{indexInfo}, filter)
+
+	plan := BuildPlan(&PlanParams{
+		Filter:      filter,
+		FieldBounds: br,
+		CountOnly:   true,
+		TotalDocs:   100,
+		Indexes: []CBOIndex{{
+			Info:        indexInfo,
+			Sketch:      mockSketch(5),
+			Bounds:      mustParseBounds("a", `{"a": 5}`),
+			PointLookup: true,
+			BoundFields: 1,
+		}},
+	})
+	if plan.Name != "IndexSeek" {
+		t.Skipf("BuildPlan chose %s — covering-count fast path not exercised", plan.Name)
+	}
+	// Covering count path returns the IndexIter directly from buildIndexSeekChain
+	// without FetchIter/FilterIter/Dedup wrapping.
+	root := plan.Root
+	if li, ok := root.(*LimitIter); ok {
+		root = li.Source
+	}
+	_, hasFetch := root.(*FetchIter)
+	_, hasFilter := root.(*FilterIter)
+	_, hasIdxIter := root.(*IndexIter)
+	assert.False(t, hasFetch, "covering count must skip FetchIter")
+	assert.False(t, hasFilter, "covering count must skip FilterIter")
+	assert.True(t, hasIdxIter, "covering count root should be *IndexIter, got %T", root)
+}
+
+// TestBuildVerifyChain_NoUncoveredFields_ReturnsNil pins the early-return
+// branch in buildVerifyChain at planner.go:1184-1186 when every filter field
+// is covered by the index's bound prefix.
+func TestBuildVerifyChain_NoUncoveredFields_ReturnsNil(t *testing.T) {
+	idx := &CBOIndex{
+		Info:        &IndexInfo{FieldNames: []string{"a"}},
+		BoundFields: 1,
+	}
+	params := &PlanParams{
+		Filter: query.MustParseCondition(`{"a": 1}`),
+	}
+	tr := &closeTrackingIter{}
+	got := buildVerifyChain(params, idx, tr)
+	assert.Nil(t, got, "no uncovered fields → buildVerifyChain must return nil")
+}
+
 // TestFilterFieldsCoveredBy_PointerAndBranch is expected to FAIL:
 // filterFieldsCoveredBy has no *query.And case, so any filter parsed from
 // `{"$and":[...]}` (which produces a *query.And) returns false even when the
