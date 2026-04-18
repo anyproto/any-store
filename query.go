@@ -547,6 +547,12 @@ func isIDOnlyFilterNode(f query.Filter) bool {
 			}
 		}
 		return len(ft) > 0
+	case *query.And:
+		// query.MustParseCondition produces *query.And for `{"$and":[...]}`
+		// (see query/cond_parse.go:103). Delegate to the value arm so $and
+		// JSON syntax enjoys the same id-only fast path as comma-spelled
+		// filters like `{"a":1,"b":2}` (which parse to value query.And).
+		return isIDOnlyFilterNode(*ft)
 	default:
 		return false
 	}
