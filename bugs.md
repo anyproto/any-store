@@ -41,6 +41,20 @@ that are structurally identical to comma-spelled `{"a":1,"b":2}` filters.
 
 ## ERROR-INJECTION-ONLY
 
+- `iterator.go:48-51` — `if err != nil { pi.err = err; return false }` in
+  `planIterator.Next`. Requires the underlying plan iterator's `Next` to
+  surface a btree error (corrupt WAL, IO failure). No public seam to inject.
+
+- `iterator.go:93-96` — `val, err := pi.dataCursor.Value(); if err != nil`
+  in the Doc() fallback. Requires `btree.Cursor.Value` to fail after a
+  successful `SeekExact`. No public seam to inject.
+
+- `iterator.go:107-109` — `if perr != nil { return nil, perr }` in the Doc()
+  fallback. Requires `Parser.ParseOwned` to fail on a document stored via
+  the normal write path. No public seam to inject.
+
+
+
 These branches are reachable only by injecting errors into the `btree.WriteTx`
 interface, which has no public mocking seam. Testing them would require
 modifying production code to accept a swappable tx, which is out of scope
