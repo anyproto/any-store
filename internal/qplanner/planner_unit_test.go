@@ -1007,6 +1007,168 @@ func TestComputeIndexBounds_OpenEndedBound(t *testing.T) {
 	})
 }
 
+// TestBuildPlan_SortById_FullScanNoExtraSort hits the `len(fields) == 1 &&
+// fields[0].Field == "id"` branch in BuildPlan where sorting by "id" is free
+// (FullScanIter naturally reads in id order).
+func TestBuildPlan_SortById_FullScanNoExtraSort(t *testing.T) {
+	sorter := &sortFieldStub{fields: []query.SortField{{Field: "id"}}}
+	plan := BuildPlan(&PlanParams{
+		Filter:    query.All{},
+		Sorter:    sorter,
+		TotalDocs: 100,
+	})
+	assert.Equal(t, "FullScan", plan.Name)
+	// Root should be a bare FullScanIter, NOT wrapped in SortIter (id-sort is free).
+	_, isSortIter := plan.Root.(*SortIter)
+	assert.False(t, isSortIter, "sort-by-id must not wrap FullScanIter in SortIter")
+	// With Limit=0 and no filter, BuildPlan's wrapping at planner.go:522 skips
+	// LimitIter, so Root is a bare *FullScanIter today. If this test breaks
+	// later because of extra wrapping, expand the cast then.
+	fsi, _ := plan.Root.(*FullScanIter)
+	assert.NotNil(t, fsi, "plan root must be *FullScanIter for sort-by-id")
+}
+
+// TestBuildPlan_LimitScalesByPTotal hits the `if pTotal > 0 && pTotal < 1.0`
+// scaling branch and the `if needed < fullScanDocs` branch where LIMIT is
+// effective at reducing scanned rows.
+func TestBuildPlan_LimitScalesByPTotal(t *testing.T) {
+	// No indexes → pure FullScan. With a selective filter and small LIMIT,
+	// needed = limit / pTotal < totalDocs triggers the effective-scan clamp.
+	plan := BuildPlan(&PlanParams{
+		Filter:    query.MustParseCondition(`{"x": 1}`), // selective
+		TotalDocs: 10_000,
+		Limit:     10,
+	})
+	assert.Equal(t, "FullScan", plan.Name)
+
+	// Find the FullScan candidate and assert EstRows < TotalDocs.
+	var fsCand *CandidatePlan
+	for i := range plan.Explain.Candidates {
+		if plan.Explain.Candidates[i].Name == "FullScan" {
+			fsCand = &plan.Explain.Candidates[i]
+			break
+		}
+	}
+	if assert.NotNil(t, fsCand, "FullScan candidate must be present") {
+		// With no indexed field for "x", calculateSelectivity falls through
+		// to DefaultRangeSelectivity. needed = Limit / DefaultRangeSelectivity
+		// triggers both the `pTotal > 0 && pTotal < 1.0` scaling (planner.go:264)
+		// and the `needed < fullScanDocs` clamp (planner.go:268).
+		expected := 10.0 / DefaultRangeSelectivity
+		assert.InDelta(t, expected, fsCand.EstRows, 0.01,
+			"fullScanEffective must equal Limit/pTotal")
+	}
+}
+
+// TestBuildPlan_IndexSeek_ClampE1 hits the `if e < 1 { e = 1 }` clamp in the
+// Plan-B loop. A sketch returning 0 estimates 0 docs, which gets clamped.
+func TestBuildPlan_IndexSeek_ClampE1(t *testing.T) {
+	plan := BuildPlan(&PlanParams{
+		Filter:    query.MustParseCondition(`{"a": 42}`),
+		TotalDocs: 1000,
+		Indexes: []CBOIndex{{
+			Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+			Sketch:      mockSketch(0), // forces e=0 → clamp to 1
+			Bounds:      mustParseBounds("a", `{"a": 42}`),
+			PointLookup: true,
+			BoundFields: 1,
+		}},
+	})
+	// Either IndexSeek or FullScan can win depending on cost math, but either
+	// way the IndexSeek candidate must have EstRows >= 1 (the clamp).
+	var seek *CandidatePlan
+	for i := range plan.Explain.Candidates {
+		if strings.HasPrefix(plan.Explain.Candidates[i].Name, "IndexSeek") {
+			seek = &plan.Explain.Candidates[i]
+			break
+		}
+	}
+	if assert.NotNil(t, seek, "IndexSeek candidate required") {
+		// sketch(0) forces `e=0` out of estimateIndexDocsWithFieldSel, which is
+		// then clamped at exactly 1.0 at planner.go:329-331. The clamp must
+		// produce the floor value, not any value >= 1 — otherwise a missing
+		// clamp returning (say) 0.0001 could silently pass a weaker >=1 check.
+		assert.Equal(t, 1.0, seek.EstRows,
+			"e<1 clamp must produce exactly 1.0")
+	}
+}
+
+// TestBuildPlan_ExactSort_LimitCovers hits the `needSort && idx.ExactSort &&
+// params.Limit > 0 && !isCovering` branch and pins the re-computation of
+// seekCost using the scanSel-based `s` formula at planner.go:370-377.
+func TestBuildPlan_ExactSort_LimitCovers(t *testing.T) {
+	sorter := &sortFieldStub{fields: []query.SortField{{Field: "a"}}}
+	plan := BuildPlan(&PlanParams{
+		Filter:    query.MustParseCondition(`{"a": 5}`),
+		Sorter:    sorter,
+		Limit:     10,
+		TotalDocs: 1000,
+		Indexes: []CBOIndex{{
+			Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+			Sketch:      mockSketch(2),
+			Bounds:      mustParseBounds("a", `{"a": 5}`),
+			PointLookup: true,
+			BoundFields: 1,
+			ExactSort:   true,
+		}},
+	})
+
+	// Find the IndexSeek candidate — must exist since the index has bounds.
+	var seek *CandidatePlan
+	for i := range plan.Explain.Candidates {
+		if strings.HasPrefix(plan.Explain.Candidates[i].Name, "IndexSeek") {
+			seek = &plan.Explain.Candidates[i]
+			break
+		}
+	}
+	if seek == nil {
+		t.Fatal("IndexSeek candidate required to exercise ExactSort+Limit branch")
+	}
+	// e = sketch(2) at BoundFields=1 → estimateIndexDocsWithFieldSel returns 2.
+	// Then planner.go:370: s = (Limit+Offset) / scanSel. scanSel = pTotal/idxSel.
+	// With a single-field equality index + sketch, pTotal ≈ idxSel ≈ 2/1000,
+	// so scanSel ≈ 1.0 (clamped at line 364). s = 10 / 1.0 = 10, clamped to e=2
+	// at planner.go:371-373. So EstRows must equal the e value (2.0).
+	assert.Equal(t, 2.0, seek.EstRows,
+		"IndexSeek EstRows must equal sketch-derived e (2), proving the clamp fired")
+}
+
+// TestBuildPlan_IndexScan_LimitClampsAtScanPopulation hits the `s > scanPopulation`
+// clamp and the `s < 1` clamp in the Plan-C (IndexScan) loop.
+func TestBuildPlan_IndexScan_LimitClampsAtScanPopulation(t *testing.T) {
+	sorter := &sortFieldStub{fields: []query.SortField{{Field: "a"}}}
+	// Very restrictive selectivity but huge LIMIT → s = (limit/scanSel) > scanPopulation
+	// → clamped at scanPopulation.
+	plan := BuildPlan(&PlanParams{
+		Filter:    query.MustParseCondition(`{"a": 1}`),
+		Sorter:    sorter,
+		Limit:     100_000, // absurdly large
+		TotalDocs: 100,
+		Indexes: []CBOIndex{{
+			Info:      &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+			Sketch:    mockSketch(1),
+			ExactSort: true, // must be true for Plan-C consideration
+		}},
+	})
+	// Find the IndexScan candidate — MUST exist since the only index is ExactSort.
+	var scan *CandidatePlan
+	for i := range plan.Explain.Candidates {
+		if strings.HasPrefix(plan.Explain.Candidates[i].Name, "IndexScan") {
+			scan = &plan.Explain.Candidates[i]
+			break
+		}
+	}
+	if scan == nil {
+		t.Fatal("IndexScan candidate required — sort on ExactSort index must generate one")
+	}
+	// Without the `s > scanPopulation` clamp, s ≈ Limit/scanSel ≈ 100_000/sketch(1)*100
+	// which would be millions. The clamp at planner.go:458-460 forces s to
+	// scanPopulation (= totalDocs = 100 when idx.Bounds is empty). Assert
+	// exact equality so removing the clamp cannot silently pass.
+	assert.Equal(t, 100.0, scan.EstRows,
+		"s>scanPopulation clamp must pin EstRows at scanPopulation (=totalDocs here)")
+}
+
 // TestFilterFieldsCoveredBy_PointerAndBranch is expected to FAIL:
 // filterFieldsCoveredBy has no *query.And case, so any filter parsed from
 // `{"$and":[...]}` (which produces a *query.And) returns false even when the
