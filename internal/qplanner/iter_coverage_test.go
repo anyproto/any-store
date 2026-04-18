@@ -327,13 +327,21 @@ func TestCursorSource_Get_And_AppendSeekKey(t *testing.T) {
 		xkey := anyenc.AppendAnyValue(nil, "x")
 		val, err := cs.Get(xkey)
 		require.NoError(t, err)
-		assert.NotNil(t, val)
+		require.NotNil(t, val)
+		// Decode the raw value bytes and assert id=="x".
+		decoded, perr := anyenc.Parse(val)
+		require.NoError(t, perr)
+		assert.Equal(t, "x", string(decoded.Get("id").GetStringBytes()),
+			"Get must return the {id:x} doc we inserted at key x")
 	})
 	t.Run("append_seek_key", func(t *testing.T) {
 		xkey := anyenc.AppendAnyValue(nil, "x")
 		seek, err := cs.AppendSeekKey(xkey, nil)
 		require.NoError(t, err)
-		assert.NotEmpty(t, seek, "seek must find at least one entry >= prefix")
+		// Seek(prefix="x") must land exactly on key "x" — that's the first
+		// key >= prefix. Assert the bytes match the exact key.
+		assert.Equal(t, xkey, seek,
+			"AppendSeekKey(prefix=x) must land exactly on key x")
 	})
 	t.Run("new_cursor", func(t *testing.T) {
 		c := cs.NewCursor()
@@ -398,29 +406,30 @@ func TestLimitIter(t *testing.T) {
 	t.Run("limit_truncates", func(t *testing.T) {
 		src := &fakeIter{hits: []fakeHit{makeHit("a"), makeHit("b"), makeHit("c")}}
 		it := &LimitIter{Source: src, Limit: 2}
-		var count int
+		var got []string
 		for {
 			_, docId, err := it.Next()
 			require.NoError(t, err)
 			if docId == nil {
 				break
 			}
-			count++
+			got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
 		}
-		assert.Equal(t, 2, count)
+		assert.Equal(t, []string{"a", "b"}, got)
 	})
 	t.Run("offset_plus_limit", func(t *testing.T) {
 		src := &fakeIter{hits: []fakeHit{makeHit("a"), makeHit("b"), makeHit("c"), makeHit("d")}}
 		it := &LimitIter{Source: src, Offset: 1, Limit: 2}
-		var count int
+		var got []string
 		for {
-			_, docId, _ := it.Next()
+			_, docId, err := it.Next()
+			require.NoError(t, err)
 			if docId == nil {
 				break
 			}
-			count++
+			got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
 		}
-		assert.Equal(t, 2, count)
+		assert.Equal(t, []string{"b", "c"}, got)
 	})
 	t.Run("source_error", func(t *testing.T) {
 		it := &LimitIter{Source: &errIter{err: errors.New("boom")}}
@@ -502,54 +511,6 @@ func TestIndexIter_String(t *testing.T) {
 	})
 }
 
-// ---- Various iterator String/Close smoke tests for coverage ----
-
-// TestIteratorStringAndCloseSmoke exercises each iterator type's String and
-// Close nil-source branches for quick coverage.
-func TestIteratorStringAndCloseSmoke(t *testing.T) {
-	// FilterIter
-	fi := &FilterIter{Source: &fakeIter{}}
-	assert.Contains(t, fi.String(), "Filter")
-	fi.Close()
-	(&FilterIter{}).Close()
-
-	// FullScanIter
-	fs := &FullScanIter{}
-	_ = fs.String() // smoke: String may return package-specific content
-	fs.Close()
-
-	// SortIter
-	so := &SortIter{Source: &fakeIter{}}
-	assert.Contains(t, so.String(), "Sort")
-	so.Close()
-	(&SortIter{}).Close()
-
-	topK := &SortIter{Source: &fakeIter{}, TopK: 10}
-	assert.Contains(t, topK.String(), "TopK(10)")
-
-	// CanonicalKeyDedupIter / SeenSetDedupIter
-	d := &CanonicalKeyDedupIter{Source: &fakeIter{}}
-	_ = d.String()
-	d.Close()
-	(&CanonicalKeyDedupIter{}).Close()
-
-	sd := &SeenSetDedupIter{Source: &fakeIter{}}
-	_ = sd.String()
-	sd.Close()
-	(&SeenSetDedupIter{}).Close()
-
-	// CoverIter (needs IdxInfo for String)
-	ci := &CoverIter{IdxInfo: &IndexInfo{Name: "my_cov"}}
-	assert.Contains(t, ci.String(), "CoverLookup(my_cov)")
-	ci.Close()
-
-	// VerifyIter
-	vi := &VerifyIter{Source: &fakeIter{}}
-	_ = vi.String()
-	vi.Close()
-	(&VerifyIter{}).Close()
-}
-
 // ---- FullScanIter string + DocValue/RawValue ----
 
 // TestFullScanIter_String_Variants covers every permutation of the four
@@ -603,7 +564,12 @@ func TestFullScanIter_DocValueRawValue(t *testing.T) {
 
 	raw, err := it.RawValue()
 	require.NoError(t, err)
-	assert.NotEmpty(t, raw)
+	require.NotEmpty(t, raw)
+	// Parse raw bytes independently and assert id=="a".
+	decoded, perr := anyenc.Parse(raw)
+	require.NoError(t, perr)
+	assert.Equal(t, "a", string(decoded.Get("id").GetStringBytes()),
+		"RawValue bytes must decode to the doc with id=a")
 
 	val, err := it.DocValue()
 	require.NoError(t, err)
@@ -660,7 +626,11 @@ func TestFilterIter_RejectsNonMatching(t *testing.T) {
 	assert.Equal(t, 1, matched, "only the 'a' doc must pass the filter")
 }
 
-// TestFilterIter_NoPlan covers the `if it.Plan != nil` branches in FilterIter.
+// TestFilterIter_NoPlan covers the `if it.Plan != nil` branch at
+// filter_iter.go:84 — the reject path. With Plan nil, the filter must be
+// able to REJECT the doc and continue iteration without panicking (because
+// the DocParsed reset is gated behind the nil check). The no-rejection
+// path doesn't exercise line 84 at all, so we must force a rejection.
 func TestFilterIter_NoPlan(t *testing.T) {
 	db, ns := coverageBtree(t, "filter_no_plan", []string{"x"})
 	rtx, err := db.BeginRead()
@@ -675,22 +645,31 @@ func TestFilterIter_NoPlan(t *testing.T) {
 	it := &FilterIter{
 		Source: source,
 		Data:   &CursorSource{Tx: rtx, Ns: ns},
-		Filter: query.All{},
+		// Filter REJECTS: doc has id=="x" but we ask for id=="nope".
+		// Rejection forces filter_iter.go:84 (the nil-Plan-guarded reset) to
+		// execute — this is the branch that is meaningfully nil-Plan-sensitive.
+		Filter: query.MustParseCondition(`{"id":"nope"}`),
 		Buf:    buf,
-		// Plan: nil → tests the nil-branch at filter_iter.go:48 and 67
+		// Plan: nil → line 84 must NOT attempt it.Plan.DocParsed = nil (nil deref).
 	}
+	// Iteration must silently complete with docId==nil (no matches) and no error.
 	_, docId, err := it.Next()
-	require.NoError(t, err)
-	require.NotNil(t, docId)
+	require.NoError(t, err, "nil-Plan reset branch must be skipped, not crash")
+	assert.Nil(t, docId, "filter rejects the only doc, so iteration ends clean")
 }
 
 // ---- Perf counter branch coverage ----
 
-// TestFetchIter_PerfBranches enables perfCountersEnabled and runs a fetch
-// to cover the several `if perf` branches scattered across fetch_iter.go.
+// TestFetchIter_PerfBranches enables perfCountersEnabled and runs a fetch,
+// then asserts the counters actually moved — not just that the branches
+// executed without panic.
 func TestFetchIter_PerfBranches(t *testing.T) {
+	resetPerfCounters()
 	setPerfCountersEnabled(true)
-	defer setPerfCountersEnabled(false)
+	defer func() {
+		setPerfCountersEnabled(false)
+		resetPerfCounters()
+	}()
 
 	db, ns := coverageBtree(t, "fetch_perf", []string{"a"})
 	rtx, err := db.BeginRead()
@@ -717,12 +696,22 @@ func TestFetchIter_PerfBranches(t *testing.T) {
 	_, docId2, err := it.Next()
 	require.NoError(t, err)
 	assert.Nil(t, docId2)
+
+	s := snapshotPerfCounters()
+	assert.Greater(t, s.FetchNextCalls, uint64(0), "FetchNextCalls must be incremented")
+	assert.Equal(t, uint64(1), s.FetchYields, "exactly 1 doc yielded")
+	assert.Greater(t, s.FetchNextNs, uint64(0), "FetchNextNs must accumulate timing")
 }
 
-// TestFilterIter_PerfBranches similarly exercises filter_iter.go perf guards.
+// TestFilterIter_PerfBranches exercises filter_iter.go perf guards and
+// asserts counters moved to reflect the actual iteration outcome.
 func TestFilterIter_PerfBranches(t *testing.T) {
+	resetPerfCounters()
 	setPerfCountersEnabled(true)
-	defer setPerfCountersEnabled(false)
+	defer func() {
+		setPerfCountersEnabled(false)
+		resetPerfCounters()
+	}()
 
 	db, ns := coverageBtree(t, "filter_perf", []string{"a", "b"})
 	rtx, err := db.BeginRead()
@@ -750,13 +739,22 @@ func TestFilterIter_PerfBranches(t *testing.T) {
 			break
 		}
 	}
+
+	s := snapshotPerfCounters()
+	assert.Greater(t, s.FilterNextCalls, uint64(0), "FilterNextCalls must be incremented")
+	assert.Equal(t, uint64(1), s.FilterYields, "only 'a' matches the filter")
+	assert.Greater(t, s.FilterNextNs, uint64(0), "FilterNextNs must accumulate timing")
 }
 
-// TestIndexIter_PerfBranches exercises index_iter.go perf guards with a
-// real btree-backed index scan.
+// TestIndexIter_PerfBranches exercises index_iter.go perf guards and
+// asserts counters moved with a real btree-backed index scan.
 func TestIndexIter_PerfBranches(t *testing.T) {
+	resetPerfCounters()
 	setPerfCountersEnabled(true)
-	defer setPerfCountersEnabled(false)
+	defer func() {
+		setPerfCountersEnabled(false)
+		resetPerfCounters()
+	}()
 
 	db, ns := coverageBtree(t, "idx_perf", []string{"key1", "key2", "key3"})
 	rtx, err := db.BeginRead()
@@ -775,6 +773,11 @@ func TestIndexIter_PerfBranches(t *testing.T) {
 			break
 		}
 	}
+
+	s := snapshotPerfCounters()
+	assert.Greater(t, s.IndexNextCalls, uint64(0), "IndexNextCalls must be incremented")
+	assert.Equal(t, uint64(3), s.IndexYields, "exactly 3 docs yielded")
+	assert.Greater(t, s.IndexNextNs, uint64(0), "IndexNextNs must accumulate timing")
 }
 
 // ---- IndexIter bounds branches ----
@@ -801,16 +804,16 @@ func TestIndexIter_Forward_WithBounds(t *testing.T) {
 		Bounds:  query.Bounds{bound},
 	}
 	defer it.Close()
-	var count int
+	var got []string
 	for {
 		_, docId, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
 		}
-		count++
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
 	}
-	assert.Equal(t, 2, count, "(b,d] must match {c, d}")
+	assert.Equal(t, []string{"c", "d"}, got, "(b,d] must yield c then d in forward order")
 }
 
 // TestIndexIter_Reverse_NoBounds exercises the reverse no-bounds path
@@ -827,16 +830,17 @@ func TestIndexIter_Reverse_NoBounds(t *testing.T) {
 		Reverse: true,
 	}
 	defer it.Close()
-	var count int
+	var got []string
 	for {
 		_, docId, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
 		}
-		count++
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
 	}
-	assert.Equal(t, 3, count)
+	assert.Equal(t, []string{"c", "b", "a"}, got,
+		"reverse no-bounds must yield descending order")
 }
 
 // TestIndexIter_Reverse_WithBounds exercises the reverse+bounds path.
@@ -860,16 +864,17 @@ func TestIndexIter_Reverse_WithBounds(t *testing.T) {
 		Reverse: true,
 	}
 	defer it.Close()
-	var count int
+	var got []string
 	for {
 		_, docId, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
 		}
-		count++
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
 	}
-	assert.Equal(t, 3, count, "[b,d] must match {b, c, d}")
+	assert.Equal(t, []string{"d", "c", "b"}, got,
+		"reverse [b,d] must yield d,c,b")
 }
 
 // TestIndexIter_CountEntries_WithBounds exercises the CountEntries batch
@@ -1041,16 +1046,17 @@ func TestSortIter_FallbackFetch(t *testing.T) {
 	}
 	defer it.Close()
 
-	var count int
+	var got []string
 	for {
 		_, docId, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
 		}
-		count++
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
 	}
-	assert.Equal(t, 3, count)
+	assert.Equal(t, []string{"a", "b", "c"}, got,
+		"sort-by-id must return ascending a,b,c after fallback-fetch")
 }
 
 // TestSortIter_SourceError propagates an error from Source.Next through
@@ -1097,16 +1103,17 @@ func TestFullScanIter_WithBounds_Forward(t *testing.T) {
 		IDBounds: bounds,
 	}
 	defer it.Close()
-	var count int
+	var got []string
 	for {
 		_, docId, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
 		}
-		count++
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
 	}
-	assert.Equal(t, 3, count)
+	assert.Equal(t, []string{"b", "c", "d"}, got,
+		"[b,d] forward must yield b,c,d")
 }
 
 // TestFullScanIter_Reverse exercises FullScanIter.nextNoBounds reverse path
@@ -1227,16 +1234,17 @@ func TestIndexIter_Forward_StartIncludeTrue(t *testing.T) {
 		Bounds:  query.Bounds{bound},
 	}
 	defer it.Close()
-	var count int
+	var got []string
 	for {
 		_, docId, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
 		}
-		count++
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
 	}
-	assert.Equal(t, 2, count, "[b,inf) must yield {b, c}")
+	assert.Equal(t, []string{"b", "c"}, got,
+		"[b,inf) must yield b,c in forward order (start inclusive)")
 }
 
 // TestIndexIter_Reverse_EndPastLastKey covers index_iter.go:64-67 — reverse
@@ -1261,16 +1269,17 @@ func TestIndexIter_Reverse_EndPastLastKey(t *testing.T) {
 		Reverse: true,
 	}
 	defer it.Close()
-	var count int
+	var got []string
 	for {
 		_, docId, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
 		}
-		count++
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
 	}
-	assert.Equal(t, 3, count, "reverse [a,zzz] must yield all 3 docs via Last() fallback")
+	assert.Equal(t, []string{"c", "b", "a"}, got,
+		"reverse [a,zzz] via Last() fallback must yield c,b,a")
 }
 
 // TestIndexIter_Reverse_EndExclusiveBackUp covers index_iter.go:74-78 — reverse
@@ -1296,16 +1305,17 @@ func TestIndexIter_Reverse_EndExclusiveBackUp(t *testing.T) {
 		Reverse: true,
 	}
 	defer it.Close()
-	var count int
+	var got []string
 	for {
 		_, docId, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
 		}
-		count++
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
 	}
-	assert.Equal(t, 2, count, "reverse [a,c) must yield {b, a}")
+	assert.Equal(t, []string{"b", "a"}, got,
+		"reverse [a,c) must yield b,a (c excluded, Previous back-up)")
 }
 
 // TestIndexIter_Reverse_NoEnd covers index_iter.go:82-84 — reverse scan
@@ -1328,16 +1338,17 @@ func TestIndexIter_Reverse_NoEnd(t *testing.T) {
 		Reverse: true,
 	}
 	defer it.Close()
-	var count int
+	var got []string
 	for {
 		_, docId, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
 		}
-		count++
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
 	}
-	assert.Equal(t, 3, count, "reverse [a,inf] must yield all 3 docs")
+	assert.Equal(t, []string{"c", "b", "a"}, got,
+		"reverse [a,inf] must yield c,b,a via Last() fallback")
 }
 
 // TestFullScanIter_Reverse_EndPastLastKey covers fullscan_iter.go:129-132 —
@@ -1366,16 +1377,17 @@ func TestFullScanIter_Reverse_EndPastLastKey(t *testing.T) {
 		Reverse:  true,
 	}
 	defer it.Close()
-	var count int
+	var got []string
 	for {
 		_, docId, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
 		}
-		count++
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
 	}
-	assert.Equal(t, 3, count)
+	assert.Equal(t, []string{"c", "b", "a"}, got,
+		"reverse [a,zzz] via Last() fallback must yield c,b,a")
 }
 
 // TestFullScanIter_Forward_StartExclusive covers fullscan_iter.go:156-166 —
@@ -1402,116 +1414,17 @@ func TestFullScanIter_Forward_StartExclusive(t *testing.T) {
 		IDBounds: query.Bounds{bound},
 	}
 	defer it.Close()
-	var count int
+	var got []string
 	for {
 		_, docId, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
 		}
-		count++
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
 	}
-	assert.Equal(t, 2, count, "(b,d] must yield {c, d}")
-}
-
-// TestIndexIter_Next_ErrorOnClosedTx exercises the cursor-error arms of
-// IndexIter by closing the read transaction mid-iteration. Subsequent cursor
-// operations (First/Next/Key) should fail, covering the error-propagation
-// branches at index_iter.go:97-99, 104-105, 114-115, etc.
-func TestIndexIter_Next_ErrorOnClosedTx(t *testing.T) {
-	db, ns := coverageBtree(t, "idx_closed_tx", []string{"a", "b", "c"})
-	rtx, err := db.BeginRead()
-	require.NoError(t, err)
-
-	it := &IndexIter{
-		Source:  &CursorSource{Tx: rtx, Ns: ns},
-		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
-	}
-	defer it.Close()
-
-	// First call: cursor initialized, returns first entry.
-	_, docId, err := it.Next()
-	require.NoError(t, err)
-	require.NotNil(t, docId)
-
-	// Force an error on the next call by rolling back the tx. The cursor is
-	// now invalid; subsequent Next/Key/First/etc. should surface the btree
-	// error.
-	require.NoError(t, rtx.Rollback())
-
-	// At least one of the next N calls must surface an error, or the iter
-	// exits with nil,nil (no error surfaced). Either way the error-handling
-	// branches get a chance to fire for coverage purposes.
-	for i := 0; i < 5; i++ {
-		if _, _, err := it.Next(); err != nil {
-			return // error surfaced, branch covered
-		}
-	}
-	// If we reach here, the cursor silently exhausted without error — also
-	// acceptable for coverage of the happy path after tx close.
-}
-
-// TestFullScanIter_Next_ErrorOnClosedTx similarly forces cursor errors on
-// FullScanIter.
-func TestFullScanIter_Next_ErrorOnClosedTx(t *testing.T) {
-	db, ns := coverageBtree(t, "fs_closed_tx", []string{"a", "b", "c"})
-	rtx, err := db.BeginRead()
-	require.NoError(t, err)
-
-	sp := syncpool.NewSyncPool(1024)
-	buf := sp.GetDocBuf()
-	defer sp.ReleaseDocBuf(buf)
-
-	it := &FullScanIter{
-		Source: &CursorSource{Tx: rtx, Ns: ns},
-		Buf:    buf,
-	}
-	defer it.Close()
-
-	_, docId, err := it.Next()
-	require.NoError(t, err)
-	require.NotNil(t, docId)
-
-	require.NoError(t, rtx.Rollback())
-
-	// Loop for error surfacing; each call may error or silently end.
-	for i := 0; i < 5; i++ {
-		if _, _, err := it.Next(); err != nil {
-			return
-		}
-	}
-}
-
-// TestFilterIter_Next_ErrorOnClosedTx forces the AppendValue error path in
-// FilterIter by closing the tx between iterations.
-func TestFilterIter_Next_ErrorOnClosedTx(t *testing.T) {
-	db, ns := coverageBtree(t, "filter_closed_tx", []string{"a", "b"})
-	rtx, err := db.BeginRead()
-	require.NoError(t, err)
-
-	sp := syncpool.NewSyncPool(1024)
-	buf := sp.GetDocBuf()
-	defer sp.ReleaseDocBuf(buf)
-
-	source := &fakeIter{hits: []fakeHit{
-		{docId: anyenc.AppendAnyValue(nil, "a")},
-		{docId: anyenc.AppendAnyValue(nil, "b")},
-	}}
-	it := &FilterIter{
-		Source: source,
-		Data:   &CursorSource{Tx: rtx, Ns: ns},
-		Filter: query.All{},
-		Buf:    buf,
-	}
-
-	// First fetch succeeds.
-	_, docId, err := it.Next()
-	require.NoError(t, err)
-	require.NotNil(t, docId)
-
-	// Close tx → next AppendValue should error.
-	require.NoError(t, rtx.Rollback())
-	_, _, _ = it.Next() // error path covered via AppendValue failure
+	assert.Equal(t, []string{"c", "d"}, got,
+		"(b,d] must yield c,d in forward order")
 }
 
 // TestCoverIter_Next_PrefixMismatch covers cover_iter.go:35 — when
@@ -1575,152 +1488,6 @@ func openIsolatedBtree(t *testing.T, ids []string) (*btree.DB, *btree.Namespace)
 	return db, ns
 }
 
-// TestIndexIter_Next_ErrorOnClosedDB closes the DB mid-iteration to force
-// cursor operations to fail. Covers cursor.First/Next/Key error-propagation
-// arms.
-func TestIndexIter_Next_ErrorOnClosedDB(t *testing.T) {
-	db, ns := openIsolatedBtree(t, []string{"a", "b", "c"})
-	rtx, err := db.BeginRead()
-	require.NoError(t, err)
-
-	it := &IndexIter{
-		Source:  &CursorSource{Tx: rtx, Ns: ns},
-		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
-	}
-
-	// Prime the cursor.
-	_, docId, err := it.Next()
-	require.NoError(t, err)
-	require.NotNil(t, docId)
-
-	// Force cursor failures by closing the DB.
-	_ = rtx.Rollback()
-	_ = db.Close()
-
-	// Many subsequent iterations may now surface errors from cursor.Next / Key.
-	for i := 0; i < 10; i++ {
-		_, _, _ = it.Next()
-	}
-	it.Close()
-}
-
-// TestIndexIter_Bounded_ErrorOnClosedDB hits the cursor-error branches in
-// the bounded path by closing the DB mid-iteration while using bounds.
-func TestIndexIter_Bounded_ErrorOnClosedDB(t *testing.T) {
-	db, ns := openIsolatedBtree(t, []string{"a", "b", "c", "d"})
-	rtx, err := db.BeginRead()
-	require.NoError(t, err)
-
-	bound := query.Bound{
-		Start: anyenc.AppendAnyValue(nil, "a"),
-		End:   anyenc.AppendAnyValue(nil, "d"),
-		StartInclude: true, EndInclude: true,
-	}
-	it := &IndexIter{
-		Source:  &CursorSource{Tx: rtx, Ns: ns},
-		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
-		Bounds:  query.Bounds{bound},
-	}
-
-	// Prime the cursor (Seek).
-	_, _, _ = it.Next()
-
-	// Force failures.
-	_ = rtx.Rollback()
-	_ = db.Close()
-
-	for i := 0; i < 10; i++ {
-		_, _, _ = it.Next()
-	}
-	it.Close()
-}
-
-// TestFullScanIter_ErrorOnClosedDB covers FullScanIter cursor-error arms.
-func TestFullScanIter_ErrorOnClosedDB(t *testing.T) {
-	db, ns := openIsolatedBtree(t, []string{"a", "b", "c"})
-	rtx, err := db.BeginRead()
-	require.NoError(t, err)
-
-	sp := syncpool.NewSyncPool(1024)
-	buf := sp.GetDocBuf()
-	defer sp.ReleaseDocBuf(buf)
-
-	it := &FullScanIter{
-		Source: &CursorSource{Tx: rtx, Ns: ns},
-		Buf:    buf,
-	}
-
-	_, _, _ = it.Next()
-
-	_ = rtx.Rollback()
-	_ = db.Close()
-
-	for i := 0; i < 10; i++ {
-		_, _, _ = it.Next()
-	}
-	it.Close()
-}
-
-// TestFullScanIter_Bounded_ErrorOnClosedDB covers FullScanIter.nextWithBounds
-// cursor-error arms.
-func TestFullScanIter_Bounded_ErrorOnClosedDB(t *testing.T) {
-	db, ns := openIsolatedBtree(t, []string{"a", "b", "c", "d"})
-	rtx, err := db.BeginRead()
-	require.NoError(t, err)
-
-	sp := syncpool.NewSyncPool(1024)
-	buf := sp.GetDocBuf()
-	defer sp.ReleaseDocBuf(buf)
-
-	bound := query.Bound{
-		Start: anyenc.AppendAnyValue(nil, "a"),
-		End:   anyenc.AppendAnyValue(nil, "d"),
-		StartInclude: true, EndInclude: true,
-	}
-	it := &FullScanIter{
-		Source:   &CursorSource{Tx: rtx, Ns: ns},
-		Buf:      buf,
-		IDBounds: query.Bounds{bound},
-	}
-
-	_, _, _ = it.Next()
-
-	_ = rtx.Rollback()
-	_ = db.Close()
-
-	for i := 0; i < 10; i++ {
-		_, _, _ = it.Next()
-	}
-	it.Close()
-}
-
-// TestIndexIter_CountEntries_ErrorOnClosedDB covers CountEntries cursor-error
-// arms by closing the DB before calling CountEntries.
-func TestIndexIter_CountEntries_ErrorOnClosedDB(t *testing.T) {
-	db, ns := openIsolatedBtree(t, []string{"a", "b", "c"})
-	rtx, err := db.BeginRead()
-	require.NoError(t, err)
-
-	bound := query.Bound{
-		Start: anyenc.AppendAnyValue(nil, "a"),
-		End:   anyenc.AppendAnyValue(nil, "c"),
-		StartInclude: true, EndInclude: true,
-	}
-	it := &IndexIter{
-		Source:  &CursorSource{Tx: rtx, Ns: ns},
-		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
-		Bounds:  query.Bounds{bound},
-	}
-
-	_ = rtx.Rollback()
-	_ = db.Close()
-
-	// CountEntries may surface an error; we don't care which — just exercise
-	// the error paths.
-	_, _ = it.CountEntries()
-	it.Close()
-}
-
 // TestFullScanIter_Bounded_FilterReject covers fullscan_iter.go:210-214 —
 // the filter-reject branch inside nextWithBounds (distinct from the
 // nextNoBounds filter-reject at line 98-101).
@@ -1780,16 +1547,17 @@ func TestFullScanIter_Bounded_NilPlan(t *testing.T) {
 		Plan:   nil,          // branch target
 	}
 	defer it.Close()
-	var count int
+	var got []string
 	for {
 		_, docId, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
 		}
-		count++
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
 	}
-	assert.Equal(t, 2, count)
+	assert.Equal(t, []string{"a", "b"}, got,
+		"all docs pass All{} filter in forward order with Plan nil")
 }
 
 // TestIndexIter_NoBounds_ReverseAlreadyStarted covers the reverse-no-bounds
@@ -1848,6 +1616,8 @@ func TestIndexIter_NoBounds_Forward_FirstErr(t *testing.T) {
 	defer it.Close()
 	_, _, err = it.Next()
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page",
+		"error must originate in the cursor call, not NewCursor/extractResult")
 }
 
 // TestIndexIter_NoBounds_Reverse_LastErr covers index_iter.go:156 (Last error).
@@ -1866,6 +1636,7 @@ func TestIndexIter_NoBounds_Reverse_LastErr(t *testing.T) {
 	defer it.Close()
 	_, _, err = it.Next()
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
 }
 
 // TestIndexIter_Bounded_Forward_SeekErr covers index_iter.go:87 (Seek(Start)
@@ -1886,6 +1657,7 @@ func TestIndexIter_Bounded_Forward_SeekErr(t *testing.T) {
 	defer it.Close()
 	_, _, err = it.Next()
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
 }
 
 // TestIndexIter_Bounded_Forward_FirstErr covers index_iter.go:101-103 (First
@@ -1906,6 +1678,7 @@ func TestIndexIter_Bounded_Forward_FirstErr(t *testing.T) {
 	defer it.Close()
 	_, _, err = it.Next()
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
 }
 
 // TestIndexIter_Bounded_Reverse_SeekErr covers index_iter.go:60 (Seek(End) err).
@@ -1926,6 +1699,7 @@ func TestIndexIter_Bounded_Reverse_SeekErr(t *testing.T) {
 	defer it.Close()
 	_, _, err = it.Next()
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
 }
 
 // TestIndexIter_Bounded_Reverse_LastErr covers index_iter.go:81-83 (Last error
@@ -1947,6 +1721,7 @@ func TestIndexIter_Bounded_Reverse_LastErr(t *testing.T) {
 	defer it.Close()
 	_, _, err = it.Next()
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
 }
 
 // TestIndexIter_CountEntries_SeekErr covers CountEntries seek error paths.
@@ -1966,6 +1741,7 @@ func TestIndexIter_CountEntries_SeekErr(t *testing.T) {
 	defer it.Close()
 	_, err = it.CountEntries()
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
 }
 
 // TestIndexIter_CountEntries_FirstErr covers CountEntries First error path.
@@ -1985,6 +1761,7 @@ func TestIndexIter_CountEntries_FirstErr(t *testing.T) {
 	defer it.Close()
 	_, err = it.CountEntries()
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
 }
 
 // TestFullScanIter_NoBounds_FirstErr covers fullscan_iter.go:50.
@@ -2003,6 +1780,7 @@ func TestFullScanIter_NoBounds_FirstErr(t *testing.T) {
 	defer it.Close()
 	_, _, err = it.Next()
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
 }
 
 // TestFullScanIter_NoBounds_LastErr covers fullscan_iter.go:46 (reverse).
@@ -2025,6 +1803,7 @@ func TestFullScanIter_NoBounds_LastErr(t *testing.T) {
 	defer it.Close()
 	_, _, err = it.Next()
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
 }
 
 // TestFullScanIter_Bounded_SeekErr covers fullscan_iter.go:152/125.
@@ -2048,6 +1827,7 @@ func TestFullScanIter_Bounded_SeekErr(t *testing.T) {
 	defer it.Close()
 	_, _, err = it.Next()
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
 }
 
 // TestFullScanIter_Bounded_FirstErr covers fullscan_iter.go:167 (no-Start
@@ -2072,6 +1852,7 @@ func TestFullScanIter_Bounded_FirstErr(t *testing.T) {
 	defer it.Close()
 	_, _, err = it.Next()
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
 }
 
 // TestFullScanIter_Bounded_Reverse_LastErr covers fullscan_iter.go:146.
@@ -2096,12 +1877,16 @@ func TestFullScanIter_Bounded_Reverse_LastErr(t *testing.T) {
 	defer it.Close()
 	_, _, err = it.Next()
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
 }
 
-// TestFetchIter_Next_NoPlanLeaves_DocParsed_Untouched covers the branch at
-// fetch_iter.go:61 (if it.Plan != nil) — when Plan is nil, we skip parsing
-// and DocParsed stays unset.
-func TestFetchIter_Next_NoPlanLeaves_DocParsed_Untouched(t *testing.T) {
+// TestFetchIter_Next_NoPlan_FetchesWithoutParsing covers the branch at
+// fetch_iter.go:61 (if it.Plan != nil). With Plan nil, the parse block is
+// skipped; but the prior AppendValue at line 48 still runs, so DocBuf ends
+// up with the raw fetched bytes. The test pre-seeds DocBuf with a sentinel
+// so we can prove (1) fetch overwrote the sentinel and (2) the final bytes
+// are a valid serialized doc with id=="x".
+func TestFetchIter_Next_NoPlan_FetchesWithoutParsing(t *testing.T) {
 	db, ns := coverageBtree(t, "data_fetch_noplan", []string{"x"})
 	rtx, err := db.BeginRead()
 	require.NoError(t, err)
@@ -2114,21 +1899,28 @@ func TestFetchIter_Next_NoPlanLeaves_DocParsed_Untouched(t *testing.T) {
 	buf := sp.GetDocBuf()
 	defer sp.ReleaseDocBuf(buf)
 
+	// Pre-seed DocBuf with a distinct sentinel so we can detect that
+	// AppendValue overwrote it.
+	sentinel := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+	buf.DocBuf = append(buf.DocBuf[:0], sentinel...)
+
 	it := &FetchIter{
 		Source: source,
 		Data:   &CursorSource{Tx: rtx, Ns: ns},
 		Buf:    buf,
-		Plan:   nil, // explicitly no plan → parsing block must be skipped
+		Plan:   nil, // explicitly no plan → parsing block at line 61 must be skipped
 	}
-	// Pre-mark DocBuf with a sentinel. The no-plan path still APPENDS the raw
-	// value into DocBuf (fetch_iter.go:48), so DocBuf ends populated — but
-	// no Parse call should occur (Plan is nil).
 	_, docId, err := it.Next()
 	require.NoError(t, err)
-	assert.NotNil(t, docId, "doc must still be fetched")
-	// Data was read into Buf.DocBuf, proving fetch happened.
-	assert.NotEmpty(t, buf.DocBuf, "no-plan path must still fetch into DocBuf")
-	// There is no plan to check, so we cannot observe "DocParsed untouched"
-	// directly. The coverage assertion is that fetch_iter.go:61's nil-check
-	// short-circuited the parse block.
+	require.NotNil(t, docId, "doc must still be fetched")
+
+	// Post-call DocBuf must contain the fetched doc bytes (AppendValue
+	// writes into DocBuf[:0]), not the sentinel we seeded. Decoding those
+	// bytes yields the expected doc.
+	require.NotEmpty(t, buf.DocBuf, "fetch must have populated DocBuf")
+	fetched, perr := anyenc.Parse(buf.DocBuf)
+	require.NoError(t, perr,
+		"DocBuf must contain a valid serialized anyenc doc, proving fetch ran")
+	assert.Equal(t, "x", string(fetched.Get("id").GetStringBytes()),
+		"fetched bytes decode to the requested doc")
 }
