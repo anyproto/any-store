@@ -77,8 +77,12 @@ that are structurally identical to comma-spelled `{"a":1,"b":2}` filters.
 
 - `internal/qplanner/fullscan_iter.go` — cursor-error arms
   (`cursor.First/Last/Next/Previous/Seek` returning errors, `cursor.Key`
-  errors). The happy paths and bound-clamping are all covered; the error
-  returns require a btree cursor failure that has no public injection seam.
+  errors). Empirically verified (via a throwaway debug test): closing the
+  btree DB or rolling back the read transaction does NOT cause subsequent
+  cursor operations to return errors — the cursor retains pinned pages
+  and continues to function. The only way to force these errors is to
+  inject failures at the btree layer, which requires production-code
+  modifications (a mock Cursor interface). Out of scope for tests-only work.
 
 - `internal/qplanner/index_iter.go` — same as above for IndexIter's cursor
   error arms across seek/forward/reverse variants.
