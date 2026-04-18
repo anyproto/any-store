@@ -1943,6 +1943,174 @@ func TestBuildPlan_PlanC_CoverFiltersWithLimit(t *testing.T) {
 	assert.NotEmpty(t, plan.Explain.Candidates)
 }
 
+// TestBuildPlan_PlanB_DetailsClosureFires pins planner.go:397 — the details
+// closure on an IndexSeek CandidatePlan is actually invoked (rather than
+// simply created) when the chosen plan is IndexSeek and ExplainString is
+// called. This also keeps the closure body in coverage.
+func TestBuildPlan_PlanB_DetailsClosureFires(t *testing.T) {
+	filter := query.MustParseCondition(`{"a": 42}`)
+	plan := BuildPlan(&PlanParams{
+		Filter:    filter,
+		TotalDocs: 1000,
+		Indexes: []CBOIndex{{
+			Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}, Unique: false},
+			Sketch:      mockSketch(2),
+			Bounds:      mustParseBounds("a", `{"a": 42}`),
+			PointLookup: true,
+			BoundFields: 1,
+		}},
+	})
+	if plan.Name != "IndexSeek" {
+		t.Fatalf("IndexSeek must win to trigger Plan-B details closure, got %s", plan.Name)
+	}
+	out := plan.ExplainString()
+	assert.Contains(t, out, "Cost breakdown:")
+	assert.Contains(t, out, "seek(") // formatSeekDetails includes "×seek("
+}
+
+// TestBuildPlan_PlanB_FilteredYieldClampLow hits planner.go:336-338 by
+// constructing inputs where e×(pTotal/idxSel) < 1. Using two-index setup
+// where the second index has no sketch (idxSel = DefaultRangeSelectivity)
+// but the first's sketch makes pTotal much smaller: pTotal/idxSel < 1
+// and e*small < 1 after the e-clamp to 1.
+func TestBuildPlan_PlanB_FilteredYieldClampLow(t *testing.T) {
+	filter := query.MustParseCondition(`{"a": 1}`)
+	idxA := CBOIndex{
+		Info:        &IndexInfo{Name: "idxA", FieldNames: []string{"a"}},
+		Sketch:      mockSketch(1), // p = 1/100000 = 0.00001
+		Bounds:      mustParseBounds("a", `{"a": 1}`),
+		PointLookup: true,
+		BoundFields: 1,
+	}
+	// idxB: iterates Plan-B loop with no sketch.
+	idxB := CBOIndex{
+		Info:        &IndexInfo{Name: "idxB", FieldNames: []string{"a"}, Unique: false},
+		Bounds:      mustParseBounds("a", `{"a": 1}`),
+		PointLookup: false,
+		BoundFields: 1,
+	}
+	plan := BuildPlan(&PlanParams{
+		Filter:    filter,
+		TotalDocs: 100_000,
+		Indexes:   []CBOIndex{idxA, idxB},
+	})
+	// We assert both IndexSeek candidates were generated; coverage records
+	// the filteredYield<1 clamp hit for idxB's iteration.
+	names := make(map[string]bool)
+	for i := range plan.Explain.Candidates {
+		names[plan.Explain.Candidates[i].Name] = true
+	}
+	assert.True(t, names["IndexSeek(idxA)"], "idxA seek candidate must be generated")
+	assert.True(t, names["IndexSeek(idxB)"], "idxB seek candidate must be generated")
+}
+
+// TestBuildPlan_PlanB_TieBreaking_SeekUniqueBeatsSeekNonUnique hits
+// planner.go:405-406 tie-breaking: when the best plan is already an IndexSeek
+// on a non-unique index, a unique index seek with the same cost wins.
+func TestBuildPlan_PlanB_TieBreaking_SeekUniqueBeatsSeekNonUnique(t *testing.T) {
+	// Construct two indexes with identical selectivity & bounds; first is
+	// non-unique (becomes best), second is unique with identical cost → wins.
+	filter := query.MustParseCondition(`{"a": 1}`)
+	idxNonUniq := CBOIndex{
+		Info:        &IndexInfo{Name: "nu", FieldNames: []string{"a"}, Unique: false},
+		Sketch:      mockSketch(5),
+		Bounds:      mustParseBounds("a", `{"a": 1}`),
+		PointLookup: true,
+		BoundFields: 1,
+	}
+	idxUniq := CBOIndex{
+		Info:        &IndexInfo{Name: "u", FieldNames: []string{"a"}, Unique: true},
+		Sketch:      mockSketch(5),
+		Bounds:      mustParseBounds("a", `{"a": 1}`),
+		PointLookup: true,
+		BoundFields: 1,
+	}
+	plan := BuildPlan(&PlanParams{
+		Filter:    filter,
+		TotalDocs: 100,
+		Indexes:   []CBOIndex{idxNonUniq, idxUniq},
+	})
+	assert.Equal(t, "IndexSeek", plan.Name)
+	// Unique index should win the tie-break.
+	assert.Equal(t, "u", plan.IndexName, "unique index must win tie-break over non-unique")
+}
+
+// TestBuildPlan_Seek_CoverIter_NeedSortWraps hits planner.go:858-869 — the
+// CoverIter fast-path wraps in SortIter when needSort && !idx.ExactSort.
+// Construction: Unique + PointLookup + BoundFields==len(FieldNames) triggers
+// CoverIter; sort on a different field forces ExactSort=false.
+func TestBuildPlan_Seek_CoverIter_NeedSortWraps(t *testing.T) {
+	sorter := &sortFieldStub{fields: []query.SortField{{Field: "other"}}}
+	filter := query.MustParseCondition(`{"a": 1}`)
+	plan := BuildPlan(&PlanParams{
+		Filter:    filter,
+		Sorter:    sorter,
+		TotalDocs: 100,
+		Indexes: []CBOIndex{{
+			Info: &IndexInfo{
+				Name: "a", FieldNames: []string{"a"},
+				FieldPaths: [][]string{{"a"}}, Unique: true,
+			},
+			Sketch:      mockSketch(3),
+			Bounds:      mustParseBounds("a", `{"a": 1}`),
+			PointLookup: true,
+			BoundFields: 1,
+			ExactSort:   false,
+		}},
+	})
+	if plan.Name != "IndexSeek" {
+		t.Fatalf("IndexSeek must win to trigger CoverIter+Sort path, got %s", plan.Name)
+	}
+	root := plan.Root
+	if li, ok := root.(*LimitIter); ok {
+		root = li.Source
+	}
+	so, ok := root.(*SortIter)
+	if assert.True(t, ok, "CoverIter+Sort root should be *SortIter, got %T", root) {
+		// CoverIter is nested under FilterIter (needFilter=true) when filter
+		// is non-All. Walk once more.
+		inner := so.Source
+		if fi, isFilter := inner.(*FilterIter); isFilter {
+			inner = fi.Source
+		}
+		_, innerIsCover := inner.(*CoverIter)
+		assert.True(t, innerIsCover, "inner iterator should be *CoverIter, got %T", inner)
+	}
+}
+
+// TestBuildPlan_Seek_MultiFieldPathsUsesSeenSetDedup hits planner.go:948-949
+// in buildIndexSeekChain — compound FieldPaths wrap in SeenSetDedupIter
+// (not CanonicalKeyDedupIter). Forces the main seek path (not CoverIter) by
+// using Unique=false.
+func TestBuildPlan_Seek_MultiFieldPathsUsesSeenSetDedup(t *testing.T) {
+	filter := query.MustParseCondition(`{"a": 1}`)
+	plan := BuildPlan(&PlanParams{
+		Filter:    filter,
+		TotalDocs: 100,
+		Indexes: []CBOIndex{{
+			Info: &IndexInfo{
+				Name:       "ab",
+				FieldNames: []string{"a", "b"},
+				FieldPaths: [][]string{{"a"}, {"b"}},
+				Unique:     false,
+			},
+			Sketch:      mockSketch(3),
+			Bounds:      mustParseBounds("a", `{"a": 1}`),
+			PointLookup: true,
+			BoundFields: 1,
+		}},
+	})
+	if plan.Name != "IndexSeek" {
+		t.Fatalf("IndexSeek must win to reach compound-seek dedup path, got %s", plan.Name)
+	}
+	root := plan.Root
+	if li, ok := root.(*LimitIter); ok {
+		root = li.Source
+	}
+	_, isSeenSet := root.(*SeenSetDedupIter)
+	assert.True(t, isSeenSet, "compound seek with Unique=false must wrap in SeenSetDedupIter, got %T", root)
+}
+
 // TestFilterFieldsCoveredBy_PointerAndBranch is expected to FAIL:
 // filterFieldsCoveredBy has no *query.And case, so any filter parsed from
 // `{"$and":[...]}` (which produces a *query.And) returns false even when the
