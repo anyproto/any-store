@@ -3,12 +3,14 @@ package qplanner
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/internal/btree"
 	"github.com/anyproto/any-store/query"
 	"github.com/anyproto/any-store/syncpool"
 )
@@ -1545,6 +1547,178 @@ func TestSortIter_GrowArena_LargeNeed(t *testing.T) {
 	it.growArena(need)
 	assert.GreaterOrEqual(t, cap(it.arena), need,
 		"growArena must accommodate a very large need")
+}
+
+// ---- Cursor error forcing via closed DB ----
+
+// openIsolatedBtree creates a minimal btree DB that the test can explicitly
+// close to force cursor errors. Similar to coverageBtree but without the
+// automatic t.Cleanup close — the test owns the lifecycle.
+func openIsolatedBtree(t *testing.T, ids []string) (*btree.DB, *btree.Namespace) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "isolated.db")
+	db, err := btree.Open(path, btree.Options{PageSize: 4096, CacheSize: 128, InMemory: true})
+	require.NoError(t, err)
+
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("data")
+	require.NoError(t, err)
+	for _, id := range ids {
+		k := anyenc.AppendAnyValue(nil, id)
+		a := &anyenc.Arena{}
+		obj := a.NewObject()
+		obj.Set("id", a.NewString(id))
+		require.NoError(t, wtx.Put(ns, k, obj.MarshalTo(nil)))
+	}
+	require.NoError(t, wtx.Commit())
+	return db, ns
+}
+
+// TestIndexIter_Next_ErrorOnClosedDB closes the DB mid-iteration to force
+// cursor operations to fail. Covers cursor.First/Next/Key error-propagation
+// arms.
+func TestIndexIter_Next_ErrorOnClosedDB(t *testing.T) {
+	db, ns := openIsolatedBtree(t, []string{"a", "b", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+	}
+
+	// Prime the cursor.
+	_, docId, err := it.Next()
+	require.NoError(t, err)
+	require.NotNil(t, docId)
+
+	// Force cursor failures by closing the DB.
+	_ = rtx.Rollback()
+	_ = db.Close()
+
+	// Many subsequent iterations may now surface errors from cursor.Next / Key.
+	for i := 0; i < 10; i++ {
+		_, _, _ = it.Next()
+	}
+	it.Close()
+}
+
+// TestIndexIter_Bounded_ErrorOnClosedDB hits the cursor-error branches in
+// the bounded path by closing the DB mid-iteration while using bounds.
+func TestIndexIter_Bounded_ErrorOnClosedDB(t *testing.T) {
+	db, ns := openIsolatedBtree(t, []string{"a", "b", "c", "d"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+
+	bound := query.Bound{
+		Start: anyenc.AppendAnyValue(nil, "a"),
+		End:   anyenc.AppendAnyValue(nil, "d"),
+		StartInclude: true, EndInclude: true,
+	}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+	}
+
+	// Prime the cursor (Seek).
+	_, _, _ = it.Next()
+
+	// Force failures.
+	_ = rtx.Rollback()
+	_ = db.Close()
+
+	for i := 0; i < 10; i++ {
+		_, _, _ = it.Next()
+	}
+	it.Close()
+}
+
+// TestFullScanIter_ErrorOnClosedDB covers FullScanIter cursor-error arms.
+func TestFullScanIter_ErrorOnClosedDB(t *testing.T) {
+	db, ns := openIsolatedBtree(t, []string{"a", "b", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	it := &FullScanIter{
+		Source: &CursorSource{Tx: rtx, Ns: ns},
+		Buf:    buf,
+	}
+
+	_, _, _ = it.Next()
+
+	_ = rtx.Rollback()
+	_ = db.Close()
+
+	for i := 0; i < 10; i++ {
+		_, _, _ = it.Next()
+	}
+	it.Close()
+}
+
+// TestFullScanIter_Bounded_ErrorOnClosedDB covers FullScanIter.nextWithBounds
+// cursor-error arms.
+func TestFullScanIter_Bounded_ErrorOnClosedDB(t *testing.T) {
+	db, ns := openIsolatedBtree(t, []string{"a", "b", "c", "d"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	bound := query.Bound{
+		Start: anyenc.AppendAnyValue(nil, "a"),
+		End:   anyenc.AppendAnyValue(nil, "d"),
+		StartInclude: true, EndInclude: true,
+	}
+	it := &FullScanIter{
+		Source:   &CursorSource{Tx: rtx, Ns: ns},
+		Buf:      buf,
+		IDBounds: query.Bounds{bound},
+	}
+
+	_, _, _ = it.Next()
+
+	_ = rtx.Rollback()
+	_ = db.Close()
+
+	for i := 0; i < 10; i++ {
+		_, _, _ = it.Next()
+	}
+	it.Close()
+}
+
+// TestIndexIter_CountEntries_ErrorOnClosedDB covers CountEntries cursor-error
+// arms by closing the DB before calling CountEntries.
+func TestIndexIter_CountEntries_ErrorOnClosedDB(t *testing.T) {
+	db, ns := openIsolatedBtree(t, []string{"a", "b", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+
+	bound := query.Bound{
+		Start: anyenc.AppendAnyValue(nil, "a"),
+		End:   anyenc.AppendAnyValue(nil, "c"),
+		StartInclude: true, EndInclude: true,
+	}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+	}
+
+	_ = rtx.Rollback()
+	_ = db.Close()
+
+	// CountEntries may surface an error; we don't care which — just exercise
+	// the error paths.
+	_, _ = it.CountEntries()
+	it.Close()
 }
 
 // TestFetchIter_Next_NoPlanLeaves_DocParsed_Untouched covers the branch at
