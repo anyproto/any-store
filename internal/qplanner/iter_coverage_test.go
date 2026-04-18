@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/query"
 	"github.com/anyproto/any-store/syncpool"
 )
 
@@ -366,6 +367,185 @@ func TestIndexInfo_AppendIndexKey(t *testing.T) {
 		"forward string field must begin with TypeString byte")
 	assert.Equal(t, ^byte(anyenc.TypeString), rev[0],
 		"reverse string field must begin with bitwise-inverted TypeString byte")
+}
+
+// ---- LimitIter ----
+
+// TestLimitIter covers all branches: offset skipping, limit truncation, and
+// error propagation from the source.
+func TestLimitIter(t *testing.T) {
+	a := &anyenc.Arena{}
+	makeHit := func(id string) fakeHit {
+		return fakeHit{docId: anyenc.AppendAnyValue(nil, id), doc: a.NewObject()}
+	}
+
+	t.Run("offset_skips", func(t *testing.T) {
+		src := &fakeIter{hits: []fakeHit{makeHit("a"), makeHit("b"), makeHit("c")}}
+		it := &LimitIter{Source: src, Offset: 2, Limit: 0}
+		var seen []string
+		for {
+			_, docId, err := it.Next()
+			require.NoError(t, err)
+			if docId == nil {
+				break
+			}
+			seen = append(seen, string(anyenc.MustParse(docId).GetStringBytes()))
+		}
+		assert.Equal(t, []string{"c"}, seen, "first 2 skipped by Offset")
+	})
+	t.Run("limit_truncates", func(t *testing.T) {
+		src := &fakeIter{hits: []fakeHit{makeHit("a"), makeHit("b"), makeHit("c")}}
+		it := &LimitIter{Source: src, Limit: 2}
+		var count int
+		for {
+			_, docId, err := it.Next()
+			require.NoError(t, err)
+			if docId == nil {
+				break
+			}
+			count++
+		}
+		assert.Equal(t, 2, count)
+	})
+	t.Run("offset_plus_limit", func(t *testing.T) {
+		src := &fakeIter{hits: []fakeHit{makeHit("a"), makeHit("b"), makeHit("c"), makeHit("d")}}
+		it := &LimitIter{Source: src, Offset: 1, Limit: 2}
+		var count int
+		for {
+			_, docId, _ := it.Next()
+			if docId == nil {
+				break
+			}
+			count++
+		}
+		assert.Equal(t, 2, count)
+	})
+	t.Run("source_error", func(t *testing.T) {
+		it := &LimitIter{Source: &errIter{err: errors.New("boom")}}
+		_, _, err := it.Next()
+		require.ErrorContains(t, err, "boom")
+	})
+	t.Run("close_propagates_and_nil", func(t *testing.T) {
+		tr := &closeTrackingIter{}
+		it := &LimitIter{Source: tr}
+		it.Close()
+		assert.Equal(t, 1, tr.closed)
+
+		(&LimitIter{}).Close() // nil source — no panic
+	})
+	t.Run("string_variants", func(t *testing.T) {
+		src := &fakeIter{}
+		lim := &LimitIter{Source: src, Limit: 5}
+		assert.Contains(t, lim.String(), "Limit(5)")
+		off := &LimitIter{Source: src, Offset: 3}
+		assert.Contains(t, off.String(), "offset=3")
+		both := &LimitIter{Source: src, Offset: 3, Limit: 7}
+		s := both.String()
+		assert.Contains(t, s, "offset=3")
+		assert.Contains(t, s, "limit=7")
+	})
+}
+
+// ---- IndexIter.extractDocId helper ----
+
+// TestExtractDocId covers the corrupt-tuple fallback at index_iter.go:259-263
+// and the normal extraction path.
+func TestExtractDocId(t *testing.T) {
+	a := &anyenc.Arena{}
+
+	t.Run("normal_extraction", func(t *testing.T) {
+		var tuple anyenc.Tuple
+		tuple = tuple.Append(a.NewString("field0"))
+		tuple = tuple.Append(a.NewString("field1"))
+		docIdBytes := []byte("doc-42")
+		key := append(append([]byte{}, tuple...), docIdBytes...)
+		got := extractDocId(anyenc.Tuple(key), 2)
+		assert.Equal(t, docIdBytes, []byte(got))
+	})
+	t.Run("corrupt_tuple_returns_key", func(t *testing.T) {
+		// OffsetAfter on a garbage tuple returns error; extractDocId should
+		// return the original key as fallback (index_iter.go:261-263).
+		bad := anyenc.Tuple([]byte{0xff, 0xff, 0xff})
+		got := extractDocId(bad, 2)
+		assert.Equal(t, []byte(bad), []byte(got),
+			"corrupt tuple must return the original key as fallback")
+	})
+	t.Run("offset_equals_len_returns_key", func(t *testing.T) {
+		// Tuple with exactly N fields and no trailing docId suffix:
+		// offset == len(key), so the else branch at index_iter.go:268 fires.
+		var tuple anyenc.Tuple
+		tuple = tuple.Append(a.NewString("only-field"))
+		got := extractDocId(tuple, 1)
+		assert.Equal(t, []byte(tuple), []byte(got))
+	})
+}
+
+// TestIndexIter_String covers IndexIter.String with both forward/reverse and
+// with/without bounds.
+func TestIndexIter_String(t *testing.T) {
+	info := &IndexInfo{Name: "my_idx"}
+	t.Run("forward_no_bounds", func(t *testing.T) {
+		it := &IndexIter{IdxInfo: info}
+		s := it.String()
+		assert.Contains(t, s, "IndexScan(my_idx)")
+		assert.NotContains(t, s, "reverse")
+		assert.NotContains(t, s, "bounds=")
+	})
+	t.Run("reverse_with_bounds", func(t *testing.T) {
+		b := query.Bound{Start: []byte{1}, End: []byte{2}, StartInclude: true, EndInclude: true}
+		it := &IndexIter{IdxInfo: info, Reverse: true, Bounds: query.Bounds{b}}
+		s := it.String()
+		assert.Contains(t, s, "(reverse)")
+		assert.Contains(t, s, "bounds=")
+	})
+}
+
+// ---- Various iterator String/Close smoke tests for coverage ----
+
+// TestIteratorStringAndCloseSmoke exercises each iterator type's String and
+// Close nil-source branches for quick coverage.
+func TestIteratorStringAndCloseSmoke(t *testing.T) {
+	// FilterIter
+	fi := &FilterIter{Source: &fakeIter{}}
+	assert.Contains(t, fi.String(), "Filter")
+	fi.Close()
+	(&FilterIter{}).Close()
+
+	// FullScanIter
+	fs := &FullScanIter{}
+	_ = fs.String() // smoke: String may return package-specific content
+	fs.Close()
+
+	// SortIter
+	so := &SortIter{Source: &fakeIter{}}
+	assert.Contains(t, so.String(), "Sort")
+	so.Close()
+	(&SortIter{}).Close()
+
+	topK := &SortIter{Source: &fakeIter{}, TopK: 10}
+	assert.Contains(t, topK.String(), "TopK(10)")
+
+	// CanonicalKeyDedupIter / SeenSetDedupIter
+	d := &CanonicalKeyDedupIter{Source: &fakeIter{}}
+	_ = d.String()
+	d.Close()
+	(&CanonicalKeyDedupIter{}).Close()
+
+	sd := &SeenSetDedupIter{Source: &fakeIter{}}
+	_ = sd.String()
+	sd.Close()
+	(&SeenSetDedupIter{}).Close()
+
+	// CoverIter (needs IdxInfo for String)
+	ci := &CoverIter{IdxInfo: &IndexInfo{Name: "my_cov"}}
+	assert.Contains(t, ci.String(), "CoverLookup(my_cov)")
+	ci.Close()
+
+	// VerifyIter
+	vi := &VerifyIter{Source: &fakeIter{}}
+	_ = vi.String()
+	vi.Close()
+	(&VerifyIter{}).Close()
 }
 
 // TestFetchIter_Next_NoPlanLeaves_DocParsed_Untouched covers the branch at
