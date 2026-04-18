@@ -23,6 +23,22 @@ point) bounds" — which is not strictly satisfied when a field has no bounds.
 no user-visible regression, but the contract mismatch should be addressed
 before any caller relies on it.
 
+## filterFieldsCoveredBy / indexCoversFilter — missing `*query.And` case
+
+- **File**: `internal/qplanner/planner.go:1116` (`filterFieldsCoveredBy`) and
+  transitively `internal/qplanner/planner.go:1102` (`indexCoversFilter`).
+- **Test**: `internal/qplanner/planner_unit_test.go` → `TestFilterFieldsCoveredBy_PointerAndBranch` (skipped with `FAIL:` prefix).
+
+`filterFieldsCoveredBy` has `case query.And` (value) but no `case *query.And`
+(pointer). The sibling function `collectUncoveredFilterFields` (planner.go:1142)
+has BOTH value and pointer cases.
+
+`query.MustParseCondition` produces `*query.And` for `{"$and":[...]}` JSON
+syntax (see `query/cond_parse.go:103`), so `indexCoversFilter` returns false
+for any filter built that way, even when the index fully covers the filter
+fields. This disables the covering-count fast path for `$and`-spelled filters
+that are structurally identical to comma-spelled `{"a":1,"b":2}` filters.
+
 ## UNREACHABLE
 
 _(None identified yet.)_

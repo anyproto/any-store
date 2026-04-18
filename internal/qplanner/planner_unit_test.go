@@ -184,6 +184,274 @@ func TestBoundsResult_Build_DedupsRepeatedFields(t *testing.T) {
 	assert.Empty(t, cBounds, "c has no filter → no bounds")
 }
 
+// TestCandidatePlan_Details covers both branches of CandidatePlan.Details:
+// nil lazy formatter returns "", non-nil formatter invokes and returns the value.
+func TestCandidatePlan_Details(t *testing.T) {
+	t.Run("nil_formatter", func(t *testing.T) {
+		c := &CandidatePlan{}
+		assert.Equal(t, "", c.Details())
+	})
+	t.Run("eager_call", func(t *testing.T) {
+		var calls int
+		c := &CandidatePlan{
+			details: func() string {
+				calls++
+				return "formula"
+			},
+		}
+		assert.Equal(t, "formula", c.Details())
+		assert.Equal(t, 1, calls)
+	})
+}
+
+// TestFilterFieldsCoveredBy covers all three cases of filterFieldsCoveredBy:
+// a Key whose field is covered, a Key whose field is NOT covered, an And
+// composition, and the default (unsupported filter type) fall-through.
+func TestFilterFieldsCoveredBy(t *testing.T) {
+	t.Run("key_covered", func(t *testing.T) {
+		f := query.MustParseCondition(`{"a": 1}`) // parses to query.Key
+		has := false
+		ok := filterFieldsCoveredBy(f, []string{"a", "b"}, &has)
+		assert.True(t, ok)
+		assert.True(t, has)
+	})
+	t.Run("key_not_covered", func(t *testing.T) {
+		f := query.MustParseCondition(`{"z": 1}`)
+		has := false
+		ok := filterFieldsCoveredBy(f, []string{"a", "b"}, &has)
+		assert.False(t, ok)
+		assert.False(t, has)
+	})
+	t.Run("and_all_covered", func(t *testing.T) {
+		// Construct an And directly so we get query.And (not pointer).
+		inner1 := query.MustParseCondition(`{"a": 1}`)
+		inner2 := query.MustParseCondition(`{"b": 2}`)
+		f := query.And{inner1, inner2}
+		has := false
+		ok := filterFieldsCoveredBy(f, []string{"a", "b"}, &has)
+		assert.True(t, ok)
+		assert.True(t, has)
+	})
+	t.Run("and_with_missing_child", func(t *testing.T) {
+		inner1 := query.MustParseCondition(`{"a": 1}`)
+		inner2 := query.MustParseCondition(`{"z": 2}`)
+		f := query.And{inner1, inner2}
+		has := false
+		ok := filterFieldsCoveredBy(f, []string{"a", "b"}, &has)
+		assert.False(t, ok, "And must short-circuit on first uncovered child")
+		// The first child matched before the short-circuit, so `has` is true.
+		// Pin the current behavior so a future refactor can't silently drop it.
+		assert.True(t, has, "hasFields must retain its value from the matched first child")
+	})
+	t.Run("pointer_and_falls_through_default", func(t *testing.T) {
+		// filterFieldsCoveredBy has no `case *query.And`, so a pointer-And
+		// hits the default branch and returns false. This pins the current
+		// behavior; the asymmetry with collectUncoveredFilterFields is
+		// documented in bugs.md.
+		inner := query.And{query.MustParseCondition(`{"a": 1}`)}
+		has := false
+		ok := filterFieldsCoveredBy(&inner, []string{"a"}, &has)
+		assert.False(t, ok)
+		assert.False(t, has, "default branch must not set hasFields")
+	})
+	t.Run("default_unsupported", func(t *testing.T) {
+		// Or is unsupported by filterFieldsCoveredBy → default branch returns false.
+		f := query.Or{
+			query.MustParseCondition(`{"a": 1}`),
+			query.MustParseCondition(`{"b": 2}`),
+		}
+		has := false
+		ok := filterFieldsCoveredBy(f, []string{"a", "b"}, &has)
+		assert.False(t, ok)
+		assert.False(t, has, "default branch must not set hasFields")
+	})
+}
+
+// TestCollectUncoveredFilterFields covers Key (covered/uncovered), And (value
+// receiver), *And (pointer receiver), nested uncovered-propagation, and the
+// default (unsupported) branch returning nil.
+func TestCollectUncoveredFilterFields(t *testing.T) {
+	t.Run("key_covered", func(t *testing.T) {
+		f := query.MustParseCondition(`{"a": 1}`)
+		got := collectUncoveredFilterFields(f, []string{"a"})
+		assert.Equal(t, []string{}, got)
+	})
+	t.Run("key_uncovered", func(t *testing.T) {
+		f := query.MustParseCondition(`{"z": 1}`)
+		got := collectUncoveredFilterFields(f, []string{"a"})
+		assert.Equal(t, []string{"z"}, got)
+	})
+	t.Run("and_mixed", func(t *testing.T) {
+		f := query.And{
+			query.MustParseCondition(`{"a": 1}`), // covered
+			query.MustParseCondition(`{"z": 2}`), // uncovered → should be returned
+		}
+		got := collectUncoveredFilterFields(f, []string{"a"})
+		assert.Equal(t, []string{"z"}, got)
+	})
+	t.Run("and_pointer", func(t *testing.T) {
+		// Pointer variant of And exercises the `*query.And` case.
+		a := query.And{query.MustParseCondition(`{"q": 1}`)}
+		got := collectUncoveredFilterFields(&a, []string{"a"})
+		assert.Equal(t, []string{"q"}, got)
+	})
+	t.Run("and_propagates_nil", func(t *testing.T) {
+		// A complex child (Or) makes collectUncoveredFilterFields return nil,
+		// which the And branch must propagate up.
+		f := query.And{
+			query.MustParseCondition(`{"a": 1}`),
+			query.Or{
+				query.MustParseCondition(`{"b": 1}`),
+				query.MustParseCondition(`{"c": 1}`),
+			},
+		}
+		got := collectUncoveredFilterFields(f, []string{"a"})
+		assert.Nil(t, got, "nil must propagate out of And when any child returns nil")
+	})
+	t.Run("and_pointer_propagates_nil", func(t *testing.T) {
+		inner := query.And{
+			query.MustParseCondition(`{"a": 1}`),
+			query.Or{
+				query.MustParseCondition(`{"b": 1}`),
+				query.MustParseCondition(`{"c": 1}`),
+			},
+		}
+		got := collectUncoveredFilterFields(&inner, []string{"a"})
+		assert.Nil(t, got)
+	})
+	t.Run("default_unsupported", func(t *testing.T) {
+		f := query.Or{query.MustParseCondition(`{"a": 1}`)}
+		got := collectUncoveredFilterFields(f, []string{"a"})
+		assert.Nil(t, got)
+	})
+}
+
+// TestIndexCoversFilter covers all four branches of indexCoversFilter:
+// nil filter, empty bounds, filter not fully covered, filter fully covered.
+func TestIndexCoversFilter(t *testing.T) {
+	t.Run("nil_filter", func(t *testing.T) {
+		idx := &CBOIndex{
+			Info:   &IndexInfo{FieldNames: []string{"a"}},
+			Bounds: query.Bounds{{Start: []byte{1}, End: []byte{1}}},
+		}
+		assert.False(t, indexCoversFilter(idx, nil))
+	})
+	t.Run("empty_bounds", func(t *testing.T) {
+		idx := &CBOIndex{Info: &IndexInfo{FieldNames: []string{"a"}}}
+		f := query.MustParseCondition(`{"a": 1}`)
+		assert.False(t, indexCoversFilter(idx, f))
+	})
+	t.Run("filter_fields_not_in_index", func(t *testing.T) {
+		idx := &CBOIndex{
+			Info:   &IndexInfo{FieldNames: []string{"a"}},
+			Bounds: query.Bounds{{Start: []byte{1}, End: []byte{1}}},
+		}
+		f := query.MustParseCondition(`{"z": 1}`)
+		assert.False(t, indexCoversFilter(idx, f))
+	})
+	t.Run("covered", func(t *testing.T) {
+		idx := &CBOIndex{
+			Info:   &IndexInfo{FieldNames: []string{"a", "b"}},
+			Bounds: query.Bounds{{Start: []byte{1}, End: []byte{1}}},
+		}
+		f := query.MustParseCondition(`{"a": 1}`)
+		assert.True(t, indexCoversFilter(idx, f))
+	})
+}
+
+// TestCoveringFilterFields covers coveringFilterFields:
+// nil fieldBounds returns nil; all-bound-fields (no trailing) returns nil;
+// a non-bound field with a fixed single bound produces a filter; and the
+// reverse-field branch inverts the match value bytewise.
+func TestCoveringFilterFields(t *testing.T) {
+	t.Run("nil_field_bounds", func(t *testing.T) {
+		idx := &CBOIndex{
+			Info:        &IndexInfo{FieldNames: []string{"a", "b"}},
+			BoundFields: 1,
+		}
+		assert.Nil(t, coveringFilterFields(idx, nil))
+	})
+	t.Run("no_trailing_fields", func(t *testing.T) {
+		idx := &CBOIndex{
+			Info:        &IndexInfo{FieldNames: []string{"a"}},
+			BoundFields: 1,
+		}
+		br := &BoundsResult{}
+		assert.Nil(t, coveringFilterFields(idx, br))
+	})
+	t.Run("non_fixed_trailing_skipped", func(t *testing.T) {
+		idx := &CBOIndex{
+			Info:        &IndexInfo{FieldNames: []string{"a", "b"}},
+			BoundFields: 1,
+		}
+		br := &BoundsResult{
+			Fields: []FieldBounds{{
+				Field: "b", Start: 0, Count: 1, Fixed: false, // range, not fixed
+			}},
+			Bounds: []query.Bound{{Start: []byte{1}, End: []byte{2}}},
+		}
+		// Production returns nil (no appends), not an empty slice, so we
+		// lock in that zero-allocation behavior.
+		assert.Nil(t, coveringFilterFields(idx, br))
+	})
+	t.Run("forward_field", func(t *testing.T) {
+		idx := &CBOIndex{
+			Info:        &IndexInfo{FieldNames: []string{"a", "b"}},
+			BoundFields: 1,
+		}
+		br := &BoundsResult{
+			Fields: []FieldBounds{{
+				Field: "b", Start: 0, Count: 1, Fixed: true,
+			}},
+			Bounds: []query.Bound{{Start: []byte{0x11, 0x22}, End: []byte{0x11, 0x22}}},
+		}
+		got := coveringFilterFields(idx, br)
+		if assert.Len(t, got, 1) {
+			assert.Equal(t, 1, got[0].FieldIdx)
+			assert.Equal(t, []byte{0x11, 0x22}, got[0].MatchValue)
+		}
+	})
+	t.Run("reverse_field_inverted", func(t *testing.T) {
+		idx := &CBOIndex{
+			Info: &IndexInfo{
+				FieldNames: []string{"a", "b"},
+				Reverse:    []bool{false, true},
+			},
+			BoundFields: 1,
+		}
+		br := &BoundsResult{
+			Fields: []FieldBounds{{
+				Field: "b", Start: 0, Count: 1, Fixed: true,
+			}},
+			Bounds: []query.Bound{{Start: []byte{0x00, 0xff, 0x11}, End: []byte{0x00, 0xff, 0x11}}},
+		}
+		got := coveringFilterFields(idx, br)
+		if assert.Len(t, got, 1) {
+			assert.Equal(t, 1, got[0].FieldIdx)
+			// Each byte should be bitwise-NOT of the source.
+			assert.Equal(t, []byte{0xff, 0x00, 0xee}, got[0].MatchValue,
+				"reverse field must be bitwise-inverted")
+		}
+	})
+}
+
+// TestFilterFieldsCoveredBy_PointerAndBranch is expected to FAIL:
+// filterFieldsCoveredBy has no *query.And case, so any filter parsed from
+// `{"$and":[...]}` (which produces a *query.And) returns false even when the
+// index fully covers the filter. See bugs.md.
+func TestFilterFieldsCoveredBy_PointerAndBranch(t *testing.T) {
+	t.Skip("FAIL: filterFieldsCoveredBy missing *query.And case — see bugs.md")
+
+	// MustParseCondition(`{"$and":[{"a":1}]}`) returns *query.And.
+	f := query.MustParseCondition(`{"$and":[{"a":1}]}`)
+	has := false
+	ok := filterFieldsCoveredBy(f, []string{"a"}, &has)
+	// Expectation: the function should recurse into the underlying And slice
+	// exactly like the value-receiver case and report covered=true.
+	assert.True(t, ok, "pointer-And with covered field should report covered")
+	assert.True(t, has)
+}
+
 // TestBoundsResult_AllFixed_ZeroBoundsField is expected to FAIL:
 // AllFixed returns true when every field has zero bounds, even though there
 // are no equality constraints at all. See bugs.md.
