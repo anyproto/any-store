@@ -247,6 +247,62 @@ type assertCustomErr struct{ msg string }
 
 func (e assertCustomErr) Error() string { return e.msg }
 
+// TestValue_NilGuards covers the nil-receiver and invalid-state guards on
+// Set, Del, Get, SetArrayItem. All return silently for invalid inputs.
+func TestValue_NilGuards(t *testing.T) {
+	a := &Arena{}
+
+	// Nil receivers must not panic.
+	var nilV *Value
+	nilV.Set("k", a.NewString("v"))
+	nilV.Del("k")
+	nilV.SetArrayItem(0, a.NewString("v"))
+	assert.Nil(t, nilV.Get("k"))
+
+	// Set/Del on a scalar value (not object/array) is a silent no-op.
+	scalar := a.NewString("just a string")
+	scalar.Set("k", a.NewString("x"))
+	scalar.Del("k")
+
+	// Set on an array with non-integer key → silent no-op.
+	arr := a.NewArray()
+	arr.Set("not-a-number", a.NewString("x"))
+	arr.Set("-1", a.NewString("x")) // negative index
+	items, _ := arr.Array()
+	assert.Equal(t, 0, len(items))
+
+	// Del on array with non-integer / negative index → silent no-op.
+	arr.SetArrayItem(0, a.NewString("v0"))
+	arr.Del("not-a-number")
+	arr.Del("-1")
+	arr.Del("99") // beyond bounds
+	items, _ = arr.Array()
+	assert.Equal(t, 1, len(items))
+
+	// Get on array with non-integer / negative / out-of-range index → nil.
+	assert.Nil(t, arr.Get("not-a-number"))
+	assert.Nil(t, arr.Get("-1"))
+	assert.Nil(t, arr.Get("99"))
+
+	// Get through a scalar as a mid-path node → nil (the scalar branch).
+	obj := a.NewObject()
+	obj.Set("a", a.NewString("leaf"))
+	// Get "a.b" traverses a scalar at key "a", falls into else-nil branch.
+	assert.Nil(t, obj.Get("a", "b"))
+
+	// SetArrayItem on a non-array value — silent no-op.
+	obj.SetArrayItem(0, a.NewString("x")) // obj is not array
+}
+
+// TestValue_AppendBytes_ErrorPath covers v.AppendBytes when the value is not
+// binary — it must propagate the Bytes() error at value.go:149-151.
+func TestValue_AppendBytes_ErrorPath(t *testing.T) {
+	a := &Arena{}
+	str := a.NewString("not binary")
+	_, err := str.AppendBytes(nil)
+	require.Error(t, err, "AppendBytes on non-binary value must surface Bytes() error")
+}
+
 // TestType_String covers the remaining Type.String cases not hit by
 // existing tests: binary, compressed-object-s2, and the default unknown path.
 func TestType_String(t *testing.T) {
