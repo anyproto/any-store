@@ -682,6 +682,220 @@ func TestFilterIter_NoPlan(t *testing.T) {
 	require.NotNil(t, docId)
 }
 
+// ---- Perf counter branch coverage ----
+
+// TestFetchIter_PerfBranches enables perfCountersEnabled and runs a fetch
+// to cover the several `if perf` branches scattered across fetch_iter.go.
+func TestFetchIter_PerfBranches(t *testing.T) {
+	setPerfCountersEnabled(true)
+	defer setPerfCountersEnabled(false)
+
+	db, ns := coverageBtree(t, "fetch_perf", []string{"a"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	source := &fakeIter{hits: []fakeHit{{docId: anyenc.AppendAnyValue(nil, "a")}}}
+	plan := &Plan{}
+	it := &FetchIter{
+		Source: source,
+		Data:   &CursorSource{Tx: rtx, Ns: ns},
+		Buf:    buf,
+		Plan:   plan,
+	}
+	_, docId, err := it.Next()
+	require.NoError(t, err)
+	require.NotNil(t, docId)
+
+	// Drain to end to also exercise the perf defer cleanup on docId==nil.
+	_, docId2, err := it.Next()
+	require.NoError(t, err)
+	assert.Nil(t, docId2)
+}
+
+// TestFilterIter_PerfBranches similarly exercises filter_iter.go perf guards.
+func TestFilterIter_PerfBranches(t *testing.T) {
+	setPerfCountersEnabled(true)
+	defer setPerfCountersEnabled(false)
+
+	db, ns := coverageBtree(t, "filter_perf", []string{"a", "b"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	source := &fakeIter{hits: []fakeHit{
+		{docId: anyenc.AppendAnyValue(nil, "a")},
+		{docId: anyenc.AppendAnyValue(nil, "b")},
+	}}
+	it := &FilterIter{
+		Source: source,
+		Data:   &CursorSource{Tx: rtx, Ns: ns},
+		Filter: query.MustParseCondition(`{"id":"a"}`),
+		Buf:    buf,
+	}
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+	}
+}
+
+// TestIndexIter_PerfBranches exercises index_iter.go perf guards with a
+// real btree-backed index scan.
+func TestIndexIter_PerfBranches(t *testing.T) {
+	setPerfCountersEnabled(true)
+	defer setPerfCountersEnabled(false)
+
+	db, ns := coverageBtree(t, "idx_perf", []string{"key1", "key2", "key3"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx_perf", FieldNames: []string{"id"}},
+	}
+	defer it.Close()
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+	}
+}
+
+// ---- IndexIter bounds branches ----
+
+// TestIndexIter_Forward_WithBounds exercises index_iter.go:86-107
+// (forward path with start bound and cursor.Next when StartInclude=false).
+func TestIndexIter_Forward_WithBounds(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_fwd_bounds",
+		[]string{"a", "b", "c", "d", "e"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	// Bounds: (b, d]  — exclusive start, inclusive end
+	bound := query.Bound{
+		Start:        anyenc.AppendAnyValue(nil, "b"),
+		End:          anyenc.AppendAnyValue(nil, "d"),
+		StartInclude: false,
+		EndInclude:   true,
+	}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx_range", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+	}
+	defer it.Close()
+	var count int
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		count++
+	}
+	assert.Equal(t, 2, count, "(b,d] must match {c, d}")
+}
+
+// TestIndexIter_Reverse_NoBounds exercises the reverse no-bounds path
+// (index_iter.go:155-164).
+func TestIndexIter_Reverse_NoBounds(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_rev_nobounds", []string{"a", "b", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx_rev", FieldNames: []string{"id"}},
+		Reverse: true,
+	}
+	defer it.Close()
+	var count int
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		count++
+	}
+	assert.Equal(t, 3, count)
+}
+
+// TestIndexIter_Reverse_WithBounds exercises the reverse+bounds path.
+func TestIndexIter_Reverse_WithBounds(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_rev_bounds",
+		[]string{"a", "b", "c", "d", "e"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{
+		Start:        anyenc.AppendAnyValue(nil, "b"),
+		End:          anyenc.AppendAnyValue(nil, "d"),
+		StartInclude: true,
+		EndInclude:   true,
+	}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx_rev_range", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+		Reverse: true,
+	}
+	defer it.Close()
+	var count int
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		count++
+	}
+	assert.Equal(t, 3, count, "[b,d] must match {b, c, d}")
+}
+
+// TestIndexIter_CountEntries_WithBounds exercises the CountEntries batch
+// counter with bounds including exclusive-start.
+func TestIndexIter_CountEntries_WithBounds(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_count",
+		[]string{"a", "b", "c", "d", "e"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{
+		Start:        anyenc.AppendAnyValue(nil, "b"),
+		End:          anyenc.AppendAnyValue(nil, "d"),
+		StartInclude: false, // exercises the Next-past-start branch
+		EndInclude:   true,
+	}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx_count", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+	}
+	defer it.Close()
+	n, err := it.CountEntries()
+	require.NoError(t, err)
+	assert.Equal(t, 2, n, "(b,d] must count {c, d}")
+}
+
 // TestFetchIter_Next_NoPlanLeaves_DocParsed_Untouched covers the branch at
 // fetch_iter.go:61 (if it.Plan != nil) — when Plan is nil, we skip parsing
 // and DocParsed stays unset.
