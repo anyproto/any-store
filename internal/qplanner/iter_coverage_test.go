@@ -1512,6 +1512,41 @@ func TestFilterIter_Next_ErrorOnClosedTx(t *testing.T) {
 	_, _, _ = it.Next() // error path covered via AppendValue failure
 }
 
+// TestCoverIter_Next_PrefixMismatch covers cover_iter.go:35 — when
+// AppendSeekKey succeeds but the returned key does NOT have the requested
+// prefix (Seek lands on the next-greater key). Construction: db has "a"
+// and "z"; Start="b". Seek("b") returns "z" which lacks prefix "b".
+func TestCoverIter_Next_PrefixMismatch(t *testing.T) {
+	db, ns := coverageBtree(t, "cover_prefix_miss", []string{"a", "z"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	startB := anyenc.AppendAnyValue(nil, "b")
+	it := &CoverIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ci", FieldNames: []string{"id"}},
+		Bounds: query.Bounds{
+			{Start: startB},
+		},
+	}
+	_, docId, err := it.Next()
+	require.NoError(t, err)
+	assert.Nil(t, docId, "seek finds 'z' which lacks prefix 'b' → skip")
+}
+
+// TestSortIter_GrowArena_LargeNeed covers sort_iter.go:76-78 (the
+// `grow < need` path) where the needed bytes exceed the tiered growth step.
+func TestSortIter_GrowArena_LargeNeed(t *testing.T) {
+	// Directly exercise growArena with a need larger than any tier step.
+	// This keeps the test independent of the iteration machinery.
+	it := &SortIter{}
+	need := 2 << 20 // 2MB — exceeds the 100KB "grow" step
+	it.growArena(need)
+	assert.GreaterOrEqual(t, cap(it.arena), need,
+		"growArena must accommodate a very large need")
+}
+
 // TestFetchIter_Next_NoPlanLeaves_DocParsed_Untouched covers the branch at
 // fetch_iter.go:61 (if it.Plan != nil) — when Plan is nil, we skip parsing
 // and DocParsed stays unset.
