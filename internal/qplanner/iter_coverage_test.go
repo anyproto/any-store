@@ -1821,6 +1821,283 @@ func TestIndexIter_NoBounds_ReverseAlreadyStarted(t *testing.T) {
 	assert.Equal(t, []string{"c", "b", "a"}, got)
 }
 
+// ---- Cursor error forcing via invalid namespace (rootPage=0) ----
+//
+// A zero-value *btree.Namespace has rootPage=0, which is the header page
+// and not a valid btree root. Cursor operations against it return
+// "btree: invalid page number" errors — perfect for covering the
+// cursor-error arms that are otherwise unreachable.
+
+// invalidNamespace returns a zero-value Namespace whose rootPage points at
+// the header page. Cursor ops against it fail with "invalid page number".
+func invalidNamespace() *btree.Namespace { return &btree.Namespace{} }
+
+// TestIndexIter_NoBounds_Forward_FirstErr covers index_iter.go:160 (First
+// error) via an invalid namespace.
+func TestIndexIter_NoBounds_Forward_FirstErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+	}
+	defer it.Close()
+	_, _, err = it.Next()
+	require.Error(t, err)
+}
+
+// TestIndexIter_NoBounds_Reverse_LastErr covers index_iter.go:156 (Last error).
+func TestIndexIter_NoBounds_Reverse_LastErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Reverse: true,
+	}
+	defer it.Close()
+	_, _, err = it.Next()
+	require.Error(t, err)
+}
+
+// TestIndexIter_Bounded_Forward_SeekErr covers index_iter.go:87 (Seek(Start)
+// error).
+func TestIndexIter_Bounded_Forward_SeekErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{Start: anyenc.AppendAnyValue(nil, "a"), StartInclude: true}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+	}
+	defer it.Close()
+	_, _, err = it.Next()
+	require.Error(t, err)
+}
+
+// TestIndexIter_Bounded_Forward_FirstErr covers index_iter.go:101-103 (First
+// error when Start is empty).
+func TestIndexIter_Bounded_Forward_FirstErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{End: anyenc.AppendAnyValue(nil, "z"), EndInclude: true}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+	}
+	defer it.Close()
+	_, _, err = it.Next()
+	require.Error(t, err)
+}
+
+// TestIndexIter_Bounded_Reverse_SeekErr covers index_iter.go:60 (Seek(End) err).
+func TestIndexIter_Bounded_Reverse_SeekErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{End: anyenc.AppendAnyValue(nil, "z"), EndInclude: true}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+		Reverse: true,
+	}
+	defer it.Close()
+	_, _, err = it.Next()
+	require.Error(t, err)
+}
+
+// TestIndexIter_Bounded_Reverse_LastErr covers index_iter.go:81-83 (Last error
+// when End is empty in reverse).
+func TestIndexIter_Bounded_Reverse_LastErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{Start: anyenc.AppendAnyValue(nil, "a"), StartInclude: true}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+		Reverse: true,
+	}
+	defer it.Close()
+	_, _, err = it.Next()
+	require.Error(t, err)
+}
+
+// TestIndexIter_CountEntries_SeekErr covers CountEntries seek error paths.
+func TestIndexIter_CountEntries_SeekErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{Start: anyenc.AppendAnyValue(nil, "a"), StartInclude: true}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+	}
+	defer it.Close()
+	_, err = it.CountEntries()
+	require.Error(t, err)
+}
+
+// TestIndexIter_CountEntries_FirstErr covers CountEntries First error path.
+func TestIndexIter_CountEntries_FirstErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{End: anyenc.AppendAnyValue(nil, "z"), EndInclude: true}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+	}
+	defer it.Close()
+	_, err = it.CountEntries()
+	require.Error(t, err)
+}
+
+// TestFullScanIter_NoBounds_FirstErr covers fullscan_iter.go:50.
+func TestFullScanIter_NoBounds_FirstErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	it := &FullScanIter{Source: &CursorSource{Tx: rtx, Ns: invalidNamespace()}, Buf: buf}
+	defer it.Close()
+	_, _, err = it.Next()
+	require.Error(t, err)
+}
+
+// TestFullScanIter_NoBounds_LastErr covers fullscan_iter.go:46 (reverse).
+func TestFullScanIter_NoBounds_LastErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	it := &FullScanIter{
+		Source:  &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		Buf:     buf,
+		Reverse: true,
+	}
+	defer it.Close()
+	_, _, err = it.Next()
+	require.Error(t, err)
+}
+
+// TestFullScanIter_Bounded_SeekErr covers fullscan_iter.go:152/125.
+func TestFullScanIter_Bounded_SeekErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	bound := query.Bound{Start: anyenc.AppendAnyValue(nil, "a"), StartInclude: true}
+	it := &FullScanIter{
+		Source:   &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		Buf:      buf,
+		IDBounds: query.Bounds{bound},
+	}
+	defer it.Close()
+	_, _, err = it.Next()
+	require.Error(t, err)
+}
+
+// TestFullScanIter_Bounded_FirstErr covers fullscan_iter.go:167 (no-Start
+// forward → cursor.First error).
+func TestFullScanIter_Bounded_FirstErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	bound := query.Bound{End: anyenc.AppendAnyValue(nil, "z"), EndInclude: true}
+	it := &FullScanIter{
+		Source:   &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		Buf:      buf,
+		IDBounds: query.Bounds{bound},
+	}
+	defer it.Close()
+	_, _, err = it.Next()
+	require.Error(t, err)
+}
+
+// TestFullScanIter_Bounded_Reverse_LastErr covers fullscan_iter.go:146.
+func TestFullScanIter_Bounded_Reverse_LastErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	bound := query.Bound{Start: anyenc.AppendAnyValue(nil, "a"), StartInclude: true}
+	it := &FullScanIter{
+		Source:   &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		Buf:      buf,
+		IDBounds: query.Bounds{bound},
+		Reverse:  true,
+	}
+	defer it.Close()
+	_, _, err = it.Next()
+	require.Error(t, err)
+}
+
 // TestFetchIter_Next_NoPlanLeaves_DocParsed_Untouched covers the branch at
 // fetch_iter.go:61 (if it.Plan != nil) — when Plan is nil, we skip parsing
 // and DocParsed stays unset.
