@@ -23,6 +23,21 @@ point) bounds" — which is not strictly satisfied when a field has no bounds.
 no user-visible regression, but the contract mismatch should be addressed
 before any caller relies on it.
 
+## isIDOnlyFilterNode — missing `*query.And` case
+
+- **File**: `query.go:538`
+- **Test**: `query_unit_test.go` → `TestQuery_IsIDOnlyFilterNode_PointerAnd_FAIL` (skipped with `FAIL:` prefix).
+
+`isIDOnlyFilterNode` at query.go:538-552 has `case query.And` (value receiver)
+but no `case *query.And` (pointer). `query.MustParseCondition` produces
+`*query.And` for `{"$and":[...]}` JSON (same as in qplanner's
+`filterFieldsCoveredBy` — same latent asymmetry).
+
+This means `Count({"$and":[{"id":"a"},{"id":"b"}]})` misses the ID-only
+fast path at query.go:382 and takes the CBO route instead. Behavior is
+correct (just slower), but the fast path was not disabled intentionally
+for `$and` JSON syntax — it's an oversight.
+
 ## filterFieldsCoveredBy / indexCoversFilter — missing `*query.And` case
 
 - **File**: `internal/qplanner/planner.go:1116` (`filterFieldsCoveredBy`) and
@@ -52,6 +67,32 @@ that are structurally identical to comma-spelled `{"a":1,"b":2}` filters.
 - `iterator.go:107-109` — `if perr != nil { return nil, perr }` in the Doc()
   fallback. Requires `Parser.ParseOwned` to fail on a document stored via
   the normal write path. No public seam to inject.
+
+- `query.go:117-120, 122-126` — error propagation in `Iter`: `q.makeQuery`
+  failure and `getReadTx` failure. The first is covered via filter-parse
+  error; the second requires tx-open failure (e.g. already-closed DB).
+
+- `query.go:167-170, 171-177` — WriteTx failure and commit/rollback
+  branches in `Update`. Requires concurrent tx conflict or write failure.
+
+- `query.go:206-210, 235-238, 240-243, 246-249, 253-256, 264-266, 267-269` —
+  mid-iteration error branches in `Update` (plan.Root.Next error,
+  AppendValue error, ParseOwned error, newItem error, Modifier.Modify
+  error, modified-newItem error, update error). All require error
+  injection during the update loop.
+
+- `query.go:285-289, 313-315, 326-328, 332-334` — corresponding
+  error-injection branches in `Delete`.
+
+- `query.go:389-390` — `else if gerr != btree.ErrKeyNotFound` in Count's
+  ID-only fast path (tx.Get returning a non-ErrKeyNotFound error).
+
+- `query.go:423-426` — CountableIterator fast path error branch.
+
+- `query.go:432-434` — plan.Root.Next error during Count's iteration loop.
+
+- `query.go:473-480` — selected-index mark logic in Explain's loop only
+  partially exercised. Already at 95%.
 
 
 
