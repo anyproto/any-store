@@ -75,39 +75,21 @@ that are structurally identical to comma-spelled `{"a":1,"b":2}` filters.
   input; requires knowledge of s2 framing which is out of scope for a
   pure-Go test suite that consumes its own encoder's output.
 
-- `internal/qplanner/fullscan_iter.go` cursor-error arms (verified
-  empirically unreachable from tests — closing the btree DB or rolling
-  back the tx leaves the cursor operating on pinned pages without error).
-  Specific uncovered lines:
-  46, 50, 63, 71, 78, 82 (nextNoBounds cursor.First/Last/Next/Previous +
-  Key error paths);
-  125, 129, 135, 140, 146, 152, 157, 161, 167, 174, 178 (nextWithBounds
-  cursor.Seek/Last/First/Key/Previous/Next error paths);
-  234, 238 (checkFilter AppendValue + ParseOwned errors);
-  279, 289 (DocValue + RawValue AppendValue errors).
-  Line 59 (`} else {`) and 145/166 (`} else {`) are the structural else
-  arms of `if it.Reverse` — unreachable because the covered siblings
-  already exhaust the binary choice; they don't contain distinct
-  executable statements from the coverage tool's perspective.
-  Line 97 (`if ok, ferr := it.checkFilter(); ferr != nil`) and line 210
-  (same in bounded path) are only reachable when checkFilter surfaces
-  an error, which requires an AppendValue or ParseOwned failure — same
-  cursor-error family.
-  Line 66 (`!it.cursor.Valid()` after reverse Seek) is reachable in
-  principle but would require constructing IDBounds with End past the
-  last key AND then having the cursor return invalid without Last()
-  finding anything — practically impossible since the covered Last()
-  fallback at the sibling line handles that case.
-  Line 244 (`if it.Plan != nil`) is an opposite-branch of the covered
-  cache-write arm; covered by TestFullScanIter_Bounded_NilPlan.
+- `internal/qplanner/fullscan_iter.go` remaining uncovered lines: 59, 63,
+  66, 71, 78, 82, 97, 125, 129, 135, 140, 157, 161, 174, 178, 210, 234,
+  238, 244, 279, 289. These are:
+  - cursor-op errors that happen on the SECOND call (Next/Previous after
+    a successful First/Last) — the invalidNamespace trick errors on the
+    FIRST op, so these paths remain unreachable via tests;
+  - checkFilter AppendValue/ParseOwned errors, DocValue/RawValue errors
+    (require corrupt stored data at the cursor's current position);
+  - structural `} else {` arms at 59/145/166 that have no distinct
+    executable statements from go-cover's perspective.
 
-- `internal/qplanner/index_iter.go` cursor-error arms. Specific uncovered
-  lines: 60, 64, 70, 75, 81, 87, 92, 96, 101, 109, 113, 156, 160, 166, 170
-  (Next/nextNoBounds cursor operation error paths); 196, 201, 205, 210,
-  222 (CountEntries cursor operation error paths). Same unreachable
-  rationale as fullscan_iter above.
-  Lines 102 and 211 are `} else {` structural arms with no distinct
-  statements.
+- `internal/qplanner/index_iter.go` remaining uncovered lines: 64, 70, 75,
+  92, 96, 109, 113, 166, 170, 201, 205, 222. Same categories as above
+  — second-call cursor errors, cursor.Key() errors after valid cursor,
+  and CountEntries' inner loop cursor errors.
 
 - `internal/qplanner/filter_iter.go:96-102` — `Parser.ParseOwned` error
   branch and cursor-level AppendValue failures other than ErrKeyNotFound.
