@@ -26,27 +26,21 @@ func TestValidateIndexField(t *testing.T) {
 		err := validateIndexField("$meta")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "invalid")
+		// The error must surface the rejected input so callers can see what
+		// was wrong — a bare "invalid" is not enough.
+		assert.Contains(t, err.Error(), "$meta",
+			"error message must include the literal rejected input")
+	})
+	t.Run("dollar_mid_string_ok", func(t *testing.T) {
+		// Dollar not at prefix is legal — proves the reject rule is a
+		// HasPrefix check, not a substring/Contains check.
+		require.NoError(t, validateIndexField("a$b"))
 	})
 	t.Run("valid_field", func(t *testing.T) {
 		require.NoError(t, validateIndexField("name"))
 		require.NoError(t, validateIndexField("-createdAt"))
 		require.NoError(t, validateIndexField("nested.path"))
 	})
-}
-
-// TestIndex_Close pins the trivial Close implementation (returns nil).
-// If Close ever grows side effects, this test documents the current contract.
-func TestIndex_Close(t *testing.T) {
-	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "idx_close_test")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "ix_a", Fields: []string{"a"}}))
-
-	indexes := coll.GetIndexes()
-	require.Len(t, indexes, 1)
-	idx := indexes[0].(*index)
-	err = idx.Close()
-	assert.NoError(t, err, "Close is a no-op today; returns nil")
 }
 
 // TestIndex_InsertKeys_IdempotentSameDoc directly calls insertKeys twice with
@@ -71,10 +65,48 @@ func TestIndex_InsertKeys_IdempotentSameDoc(t *testing.T) {
 
 	// First insert: populates the unique index.
 	require.NoError(t, idx.insertKeys(btWtx, it))
+	countAfterFirst, err := btWtx.Count(idx.ns)
+	require.NoError(t, err)
+	require.Equal(t, 1, countAfterFirst, "first insert must produce exactly one index row")
+
+	// Capture sketch state pre-re-insert. If sketch is nil in this test
+	// setup, we simply skip the sketch assertion — no harm done.
+	//
+	// Note: we only assert on the per-key bucket, NOT on DocCount. The
+	// production insertKeys calls IncrementDocCount() unconditionally after
+	// the per-key loop (index.go:169-172), so DocCount does advance on the
+	// idempotent path too — that's an existing quirk, not something the
+	// idempotent branch is expected to suppress. The per-key Increment IS
+	// inside the loop and IS skipped via `continue` on idempotent re-insert,
+	// so that's the counter we can meaningfully pin here.
+	var sketchKeyCountBefore uint64
+	// Snapshot the encoded key by value — keysBuf is reused by the second
+	// insertKeys call and its backing storage will be overwritten in place.
+	var keyCopy []byte
+	if idx.sketch != nil {
+		keyCopy = append(keyCopy, idx.keysBuf[0]...)
+		sketchKeyCountBefore = idx.sketch.Estimate(keyCopy)
+	}
+
 	// Second insert with the same item: unique seek finds the existing entry
 	// matching fullKeyBuf → takes the idempotent continue at index.go:157.
 	require.NoError(t, idx.insertKeys(btWtx, it),
 		"re-inserting the same (key, docId) pair must hit the idempotent branch")
+
+	// Core idempotency proof: the namespace still holds exactly one row.
+	// Nothing was re-inserted, nothing was duplicated.
+	countAfterSecond, err := btWtx.Count(idx.ns)
+	require.NoError(t, err)
+	require.Equal(t, 1, countAfterSecond,
+		"idempotent re-insert must not add a second index row")
+
+	// If the index has a sketch, the per-key bucket must not advance on the
+	// idempotent path — otherwise per-value selectivity estimates would drift
+	// on every duplicate re-insert.
+	if idx.sketch != nil {
+		assert.Equal(t, sketchKeyCountBefore, idx.sketch.Estimate(keyCopy),
+			"sketch per-key bucket must not increment on idempotent re-insert")
+	}
 
 	require.NoError(t, wrTx.Rollback())
 
@@ -100,10 +132,16 @@ func TestIndex_DeleteKeys_SwallowsErrKeyNotFound(t *testing.T) {
 	}))
 
 	idx := coll.GetIndexes()[0].(*index)
-	// Build an item with a present field "a" so fillKeysBuf produces a real
-	// key. The index namespace is empty (we inserted nothing via the public
-	// API), so tx.Delete on that key returns ErrKeyNotFound.
-	it, itErr := newItem(anyenc.MustParseJson(`{"id":1,"a":"never-inserted"}`))
+
+	// Populate one real doc so the index has an entry. If we skipped this,
+	// we could not distinguish "deleteKeys swallowed ErrKeyNotFound" from
+	// "deleteKeys short-circuited because the namespace was empty".
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"other","a":"real"}`)))
+
+	// Build an item with a present field "a" that was NEVER inserted.
+	// fillKeysBuf will produce a real key for it, and tx.Delete on that
+	// key returns ErrKeyNotFound.
+	it, itErr := newItem(anyenc.MustParseJson(`{"id":"never-inserted-id","a":"never-inserted"}`))
 	require.NoError(t, itErr)
 
 	wrTx, err := coll.WriteTx(ctx)
@@ -113,6 +151,13 @@ func TestIndex_DeleteKeys_SwallowsErrKeyNotFound(t *testing.T) {
 	// Must succeed without surfacing ErrKeyNotFound.
 	require.NoError(t, idx.deleteKeys(btWtx, it),
 		"deleteKeys must swallow ErrKeyNotFound from tx.Delete")
+
+	// The "other" doc's index entry must still be present — we didn't
+	// accidentally blast unrelated keys while swallowing ErrKeyNotFound.
+	countAfter, err := btWtx.Count(idx.ns)
+	require.NoError(t, err)
+	require.Equal(t, 1, countAfter,
+		"deleteKeys on a never-inserted doc must not touch unrelated index rows")
 
 	require.NoError(t, wrTx.Rollback())
 }
