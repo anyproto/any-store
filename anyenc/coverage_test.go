@@ -247,6 +247,51 @@ type assertCustomErr struct{ msg string }
 
 func (e assertCustomErr) Error() string { return e.msg }
 
+// TestParse_MalformedInputs_Extra targets the remaining error branches in
+// parseObject, parseArray, parseBinary, parseCompressedObjectS2.
+func TestParse_MalformedInputs_Extra(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []byte
+	}{
+		// parseObject: truncated after reading the key EOS
+		{"object_no_value_after_key", []byte{byte(TypeObject), 'k', EOS}},
+		// parseArray: length byte but nothing to parse
+		{"array_truncated", []byte{byte(TypeArray)}},
+		// parseBinary: length says 10 bytes but only 2 supplied
+		{"binary_length_overflow", append(
+			[]byte{byte(TypeBinary), 0x00, 0x00, 0x00, 0x0a},
+			0x01, 0x02)},
+		// parseBinary: total input shorter than length-header
+		{"binary_short_header", []byte{byte(TypeBinary), 0x00, 0x00}},
+		// parseCompressedObjectS2: too short for 5-byte header
+		{"compressed_too_short", []byte{byte(TypeCompressedObjectS2), 0x01}},
+		// parseCompressedObjectS2: header says 1000 bytes but payload is empty
+		{"compressed_length_overflow", []byte{
+			byte(TypeCompressedObjectS2),
+			0x00, 0x00, 0x03, 0xe8, // 1000
+		}},
+		// Object with an inner value parse failure.
+		{"object_bad_inner_value", []byte{byte(TypeObject), 'k', EOS, 0xfe}},
+		// Tail bytes after a valid value — rejected by Parse.
+		{"trailing_bytes", append(
+			MustParseJson(`"x"`).MarshalTo(nil),
+			0x00)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(tc.in)
+			assert.Error(t, err, "input %x must fail to parse", tc.in)
+		})
+	}
+}
+
+// TestParseJson_Error covers ParseJson error path when input is invalid JSON.
+func TestParseJson_Error(t *testing.T) {
+	_, err := ParseJson(`{invalid json`)
+	require.Error(t, err)
+}
+
 // TestValue_NilGuards covers the nil-receiver and invalid-state guards on
 // Set, Del, Get, SetArrayItem. All return silently for invalid inputs.
 func TestValue_NilGuards(t *testing.T) {
