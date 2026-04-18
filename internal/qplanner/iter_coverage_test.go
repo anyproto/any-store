@@ -1721,6 +1721,106 @@ func TestIndexIter_CountEntries_ErrorOnClosedDB(t *testing.T) {
 	it.Close()
 }
 
+// TestFullScanIter_Bounded_FilterReject covers fullscan_iter.go:210-214 —
+// the filter-reject branch inside nextWithBounds (distinct from the
+// nextNoBounds filter-reject at line 98-101).
+func TestFullScanIter_Bounded_FilterReject(t *testing.T) {
+	db, ns := coverageBtree(t, "fs_bounded_filter", []string{"a", "b", "c", "d"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	bounds := query.Bounds{
+		{Start: anyenc.AppendAnyValue(nil, "a"),
+			End:          anyenc.AppendAnyValue(nil, "d"),
+			StartInclude: true, EndInclude: true},
+	}
+	// Filter rejects a, b, d — only c passes.
+	it := &FullScanIter{
+		Source:   &CursorSource{Tx: rtx, Ns: ns},
+		Buf:      buf,
+		IDBounds: bounds,
+		Filter:   query.MustParseCondition(`{"id":"c"}`),
+	}
+	defer it.Close()
+	var got []string
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
+	}
+	assert.Equal(t, []string{"c"}, got,
+		"bounded+filter must reject a/b/d and yield only c")
+}
+
+// TestFullScanIter_Bounded_NilPlan covers fullscan_iter.go:244 — `if Plan != nil`
+// inside checkFilter's cache arm. With Plan nil, the DocParsed assignment
+// is skipped.
+func TestFullScanIter_Bounded_NilPlan(t *testing.T) {
+	db, ns := coverageBtree(t, "fs_nil_plan", []string{"a", "b"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	it := &FullScanIter{
+		Source: &CursorSource{Tx: rtx, Ns: ns},
+		Buf:    buf,
+		Filter: query.All{}, // passes everything
+		Plan:   nil,          // branch target
+	}
+	defer it.Close()
+	var count int
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		count++
+	}
+	assert.Equal(t, 2, count)
+}
+
+// TestIndexIter_NoBounds_ReverseAlreadyStarted covers the reverse-no-bounds
+// `else { Previous }` branch (index_iter.go:166-175) by iterating multiple
+// times to reach the started=true loop branch.
+func TestIndexIter_NoBounds_ReverseAlreadyStarted(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_rev_multistep", []string{"a", "b", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Reverse: true,
+	}
+	defer it.Close()
+
+	// Consume all entries to ensure the "started → Previous" branch fires.
+	var got []string
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
+	}
+	assert.Equal(t, []string{"c", "b", "a"}, got)
+}
+
 // TestFetchIter_Next_NoPlanLeaves_DocParsed_Untouched covers the branch at
 // fetch_iter.go:61 (if it.Plan != nil) — when Plan is nil, we skip parsing
 // and DocParsed stays unset.
