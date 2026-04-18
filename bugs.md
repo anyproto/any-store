@@ -39,6 +39,29 @@ for any filter built that way, even when the index fully covers the filter
 fields. This disables the covering-count fast path for `$and`-spelled filters
 that are structurally identical to comma-spelled `{"a":1,"b":2}` filters.
 
+## ERROR-INJECTION-ONLY
+
+These branches are reachable only by injecting errors into the `btree.WriteTx`
+interface, which has no public mocking seam. Testing them would require
+modifying production code to accept a swappable tx, which is out of scope
+for a tests-only coverage pass.
+
+- `index.go:161-163` — `if err := tx.Put(...); err != nil { return err }`
+  in `insertKeys`. The `err != nil` arm requires `btree.WriteTx.Put` to
+  fail (e.g., a corrupt WAL or IO error). Unreachable from the public API
+  in normal test conditions.
+
+- `index.go:185-187` — `if !errors.Is(err, btree.ErrKeyNotFound) { return err }`
+  in `deleteKeys`. The non-swallow arm requires `btree.WriteTx.Delete` to
+  return an error OTHER than `btree.ErrKeyNotFound`. Same rationale as above.
+
+- `index.go:157` — `continue // same doc, idempotent` in `insertKeys`.
+  Reached only when a unique-index entry for the *same* doc is found during
+  re-insertion. The public API always deletes existing index entries before
+  inserting (see `collection.go:425-428` update flow and `collection.go:285-300`
+  insert flow which rejects duplicate doc IDs). This branch is defensive
+  for out-of-sequence callers that don't exist in current code.
+
 ## UNREACHABLE
 
 - `internal/qplanner/planner.go:1355` — `if !chain[i-1].fixed { break }`
