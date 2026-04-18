@@ -945,11 +945,13 @@ func TestCoverIter_Next(t *testing.T) {
 // ---- SortIter TopK ----
 
 // TestSortIter_TopK_Heap exercises the heap path (TopK > 0) in SortIter
-// including the replace-root branch when a new entry is smaller than the
-// current max-heap root.
+// including the replace-root branch at sort_iter.go:126-130 when a new entry
+// is smaller than the current max-heap root. Input order 05,04,03,02,01
+// ensures the heap fills with the three largest first (05,04,03), then both
+// 02 and 01 trigger the replace-root branch.
 func TestSortIter_TopK_Heap(t *testing.T) {
 	db, ns := coverageBtree(t, "sort_topk",
-		[]string{"03", "01", "02", "05", "04"})
+		[]string{"05", "04", "03", "02", "01"})
 	rtx, err := db.BeginRead()
 	require.NoError(t, err)
 	defer func() { _ = rtx.Rollback() }()
@@ -969,7 +971,7 @@ func TestSortIter_TopK_Heap(t *testing.T) {
 	}
 	source := &fakeIter{
 		plan: plan,
-		hits: []fakeHit{makeHit("03"), makeHit("01"), makeHit("02"), makeHit("05"), makeHit("04")},
+		hits: []fakeHit{makeHit("05"), makeHit("04"), makeHit("03"), makeHit("02"), makeHit("01")},
 	}
 
 	sort, err := query.ParseSort("id")
@@ -1105,7 +1107,8 @@ func TestFullScanIter_WithBounds_Forward(t *testing.T) {
 	assert.Equal(t, 3, count)
 }
 
-// TestFullScanIter_Reverse exercises FullScanIter.nextNoBounds reverse path.
+// TestFullScanIter_Reverse exercises FullScanIter.nextNoBounds reverse path
+// and verifies the order is genuinely reversed, not just that 3 docs visited.
 func TestFullScanIter_Reverse(t *testing.T) {
 	db, ns := coverageBtree(t, "fs_rev", []string{"a", "b", "c"})
 	rtx, err := db.BeginRead()
@@ -1122,16 +1125,17 @@ func TestFullScanIter_Reverse(t *testing.T) {
 		Reverse: true,
 	}
 	defer it.Close()
-	var count int
+	var got []string
 	for {
 		_, docId, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
 		}
-		count++
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
 	}
-	assert.Equal(t, 3, count)
+	assert.Equal(t, []string{"c", "b", "a"}, got,
+		"reverse scan must yield descending key order, not just 3 docs")
 }
 
 // TestFetchIter_Next_NoPlanLeaves_DocParsed_Untouched covers the branch at
