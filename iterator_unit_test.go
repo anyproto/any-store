@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/internal/btree"
 )
 
 // TestIterator_String covers planIterator.String at iterator.go:144-146.
@@ -28,7 +29,8 @@ func TestIterator_String(t *testing.T) {
 	require.True(t, ok, "public Iterator should be a *planIterator")
 
 	s := pi.String()
-	assert.NotEmpty(t, s, "planIterator.String must return plan.String()")
+	assert.Equal(t, pi.plan.String(), s,
+		"planIterator.String must return plan.String() verbatim (no wrapping/composition)")
 }
 
 // TestIterator_Err_HidesEOF pins iterator.go:114-118 — when pi.err is io.EOF
@@ -61,15 +63,22 @@ func TestIterator_NextAfterClose(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "iter_next_close")
 	require.NoError(t, err)
+	// Insert ≥2 docs so post-Close Next()==false can't be explained by
+	// accidental cursor exhaustion (only 1 doc would be ambiguous).
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2}`)))
 
 	it, err := coll.Find(nil).Iter(ctx)
 	require.NoError(t, err)
-	// First Next should see one doc.
+	// First Next should see a doc.
 	assert.True(t, it.Next())
 	require.NoError(t, it.Close())
 	// After Close, Next must report done.
 	assert.False(t, it.Next(), "Next after Close must return false")
+	// And no use-after-close error should leak through pi.err.
+	pi, ok := it.(*planIterator)
+	require.True(t, ok)
+	assert.Nil(t, pi.err, "post-Close Next must not set pi.err")
 }
 
 // TestIterator_NextAfterError pins iterator.go:43-45 — a sticky pi.err
@@ -126,11 +135,19 @@ func TestIterator_Doc_PerfCountersPath(t *testing.T) {
 	_, err = it.Doc()
 	require.NoError(t, err)
 
-	// Verify the perf counters actually recorded our calls.
+	// Verify the perf counters actually recorded our calls — exactly two
+	// Doc() invocations, one hit, one fallback. Tight equality so a
+	// reimplementation that double-counted would fail.
 	snap := snapshotPipelinePerfCounters()
-	assert.GreaterOrEqual(t, snap.DocCalls, uint64(2))
-	assert.GreaterOrEqual(t, snap.DocParsedHits, uint64(1))
-	assert.GreaterOrEqual(t, snap.DocFallbacks, uint64(1))
+	assert.Equal(t, uint64(2), snap.DocCalls)
+	assert.Equal(t, uint64(1), snap.DocParsedHits)
+	assert.Equal(t, uint64(1), snap.DocFallbacks)
+	// The fallback path must have fired both timing branches
+	// (iterator.go:84-86 seek timing and 99-101 parse timing).
+	assert.Greater(t, snap.DocFallbackSeekNs, uint64(0),
+		"fallback seek-timing branch (iterator.go:84-86) did not fire")
+	assert.Greater(t, snap.DocFallbackParseNs, uint64(0),
+		"fallback parse-timing branch (iterator.go:99-101) did not fire")
 }
 
 // TestIterator_Doc_ErrorPropagates pins iterator.go:67-69 — when pi.err is
@@ -172,7 +189,8 @@ func TestIterator_Doc_Fallback_SeekErr(t *testing.T) {
 	pi.plan.DocParsed = nil
 
 	_, err = it.Doc()
-	require.Error(t, err, "fallback with missing docId must surface btree error")
+	require.ErrorIs(t, err, btree.ErrKeyNotFound,
+		"fallback with missing docId must surface the specific btree.ErrKeyNotFound sentinel")
 }
 
 // TestIterator_Doc_FallbackPath forces the Doc() fallback branch
