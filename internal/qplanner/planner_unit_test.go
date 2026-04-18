@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/query"
 )
 
@@ -431,6 +432,577 @@ func TestCoveringFilterFields(t *testing.T) {
 			// Each byte should be bitwise-NOT of the source.
 			assert.Equal(t, []byte{0xff, 0x00, 0xee}, got[0].MatchValue,
 				"reverse field must be bitwise-inverted")
+		}
+	})
+}
+
+// sortFieldStub is a minimal query.Sort implementation for unit-testing
+// shouldReverse and IndexSortMatch without depending on parsing internals.
+type sortFieldStub struct {
+	fields []query.SortField
+}
+
+func (s *sortFieldStub) Fields() []query.SortField { return s.fields }
+func (s *sortFieldStub) AppendKey(k anyenc.Tuple, _ *anyenc.Value) anyenc.Tuple {
+	return k
+}
+
+// TestShouldReverse covers all branches: nil sorter, empty fields, and the
+// fields[0].Reverse read-through (both forward and reverse).
+func TestShouldReverse(t *testing.T) {
+	t.Run("nil_sorter", func(t *testing.T) {
+		assert.False(t, shouldReverse(nil, nil))
+	})
+	t.Run("empty_fields", func(t *testing.T) {
+		s := &sortFieldStub{fields: nil}
+		assert.False(t, shouldReverse(s, &CBOIndex{}))
+	})
+	t.Run("forward", func(t *testing.T) {
+		s := &sortFieldStub{fields: []query.SortField{{Field: "a", Reverse: false}}}
+		assert.False(t, shouldReverse(s, &CBOIndex{}))
+	})
+	t.Run("reverse", func(t *testing.T) {
+		s := &sortFieldStub{fields: []query.SortField{{Field: "a", Reverse: true}}}
+		assert.True(t, shouldReverse(s, &CBOIndex{}))
+	})
+}
+
+// TestSetPlanRef covers all 8 switch arms of setPlanRef by constructing each
+// iterator wrapper around a downstream fakeIter and asserting that
+// (a) the outer Plan field is populated on iterators that carry one, and
+// (b) the recursion reaches into Source.
+func TestSetPlanRef(t *testing.T) {
+	plan := &Plan{}
+
+	// --- FilterIter ---
+	t.Run("FilterIter_sets_plan_and_recurses", func(t *testing.T) {
+		inner := &FilterIter{}
+		outer := &FilterIter{Source: inner}
+		setPlanRef(outer, plan)
+		assert.Same(t, plan, outer.Plan)
+		assert.Same(t, plan, inner.Plan)
+	})
+	// --- FetchIter ---
+	t.Run("FetchIter_sets_plan_and_recurses", func(t *testing.T) {
+		innerFilter := &FilterIter{}
+		fi := &FetchIter{Source: innerFilter}
+		setPlanRef(fi, plan)
+		assert.Same(t, plan, fi.Plan)
+		assert.Same(t, plan, innerFilter.Plan)
+	})
+	// --- FullScanIter ---
+	t.Run("FullScanIter_sets_plan_and_no_recurse", func(t *testing.T) {
+		fs := &FullScanIter{}
+		setPlanRef(fs, plan)
+		assert.Same(t, plan, fs.Plan)
+	})
+	// --- SortIter ---
+	t.Run("SortIter_sets_plan_and_recurses", func(t *testing.T) {
+		inner := &FilterIter{}
+		so := &SortIter{Source: inner}
+		setPlanRef(so, plan)
+		assert.Same(t, plan, so.Plan)
+		assert.Same(t, plan, inner.Plan)
+	})
+	// --- IndexFilterIter (no Plan field) ---
+	t.Run("IndexFilterIter_recurses_no_plan_field", func(t *testing.T) {
+		inner := &FilterIter{}
+		ifi := &IndexFilterIter{Source: inner}
+		setPlanRef(ifi, plan)
+		assert.Same(t, plan, inner.Plan, "recursion should populate inner")
+	})
+	// --- LimitIter (no Plan field) ---
+	t.Run("LimitIter_recurses_no_plan_field", func(t *testing.T) {
+		inner := &FilterIter{}
+		li := &LimitIter{Source: inner}
+		setPlanRef(li, plan)
+		assert.Same(t, plan, inner.Plan)
+	})
+	// --- CanonicalKeyDedupIter ---
+	t.Run("CanonicalKeyDedupIter_sets_plan_and_recurses", func(t *testing.T) {
+		inner := &FilterIter{}
+		d := &CanonicalKeyDedupIter{Source: inner}
+		setPlanRef(d, plan)
+		assert.Same(t, plan, d.Plan)
+		assert.Same(t, plan, inner.Plan)
+	})
+	// --- SeenSetDedupIter (no Plan field) ---
+	t.Run("SeenSetDedupIter_recurses_no_plan_field", func(t *testing.T) {
+		inner := &FilterIter{}
+		d := &SeenSetDedupIter{Source: inner}
+		setPlanRef(d, plan)
+		assert.Same(t, plan, inner.Plan)
+	})
+	// --- Default branch: unknown iterator ---
+	t.Run("Unknown_noop", func(t *testing.T) {
+		tr := &closeTrackingIter{}
+		setPlanRef(tr, plan) // must not panic, and trackingIter has no Plan field
+	})
+}
+
+// TestIndexSortMatch covers all outcomes: no sort fields / no index fields,
+// zero match, exact match, partial match, and equalityPrefix-shifted match
+// (where the prefix beats the start-of-index match).
+func TestIndexSortMatch(t *testing.T) {
+	t.Run("empty_sort", func(t *testing.T) {
+		ex, pa := IndexSortMatch(&IndexInfo{FieldNames: []string{"a"}}, nil, 0)
+		assert.False(t, ex)
+		assert.False(t, pa)
+	})
+	t.Run("empty_index", func(t *testing.T) {
+		ex, pa := IndexSortMatch(&IndexInfo{}, []query.SortField{{Field: "a"}}, 0)
+		assert.False(t, ex)
+		assert.False(t, pa)
+	})
+	t.Run("no_match", func(t *testing.T) {
+		ex, pa := IndexSortMatch(
+			&IndexInfo{FieldNames: []string{"a"}},
+			[]query.SortField{{Field: "z"}},
+			0,
+		)
+		assert.False(t, ex)
+		assert.False(t, pa)
+	})
+	t.Run("exact_match", func(t *testing.T) {
+		ex, pa := IndexSortMatch(
+			&IndexInfo{FieldNames: []string{"a", "b"}},
+			[]query.SortField{{Field: "a"}, {Field: "b"}},
+			0,
+		)
+		assert.True(t, ex)
+		assert.False(t, pa)
+	})
+	t.Run("partial_match", func(t *testing.T) {
+		// 3-field sort, index has only first 2. match=2 != 3 → partial.
+		ex, pa := IndexSortMatch(
+			&IndexInfo{FieldNames: []string{"a", "b"}},
+			[]query.SortField{{Field: "a"}, {Field: "b"}, {Field: "c"}},
+			0,
+		)
+		assert.False(t, ex)
+		assert.True(t, pa)
+	})
+	t.Run("equality_prefix_wins", func(t *testing.T) {
+		// Index is (a, b). Equality on a (prefix=1). Sort by b.
+		// matchAt(0) fails (b != a). matchAt(1) succeeds (idx[1]==b). Exact.
+		ex, pa := IndexSortMatch(
+			&IndexInfo{FieldNames: []string{"a", "b"}},
+			[]query.SortField{{Field: "b"}},
+			1,
+		)
+		assert.True(t, ex)
+		assert.False(t, pa)
+	})
+	t.Run("equality_prefix_ignored_when_out_of_range", func(t *testing.T) {
+		// equalityPrefix >= len(FieldNames): matchAt returns 0.
+		ex, pa := IndexSortMatch(
+			&IndexInfo{FieldNames: []string{"a"}},
+			[]query.SortField{{Field: "a"}},
+			5,
+		)
+		assert.True(t, ex, "matchAt(0) still finds a")
+		assert.False(t, pa)
+	})
+	t.Run("direction_mismatch_breaks", func(t *testing.T) {
+		// First field matches with sameMode=true (both forward).
+		// Second field also sameMode? idxRev=false, sortRev=true → curSame=false.
+		// This is inconsistent with first → loop breaks at 1, match=1 partial.
+		ex, pa := IndexSortMatch(
+			&IndexInfo{FieldNames: []string{"a", "b"}, Reverse: []bool{false, false}},
+			[]query.SortField{{Field: "a", Reverse: false}, {Field: "b", Reverse: true}},
+			0,
+		)
+		assert.False(t, ex)
+		assert.True(t, pa)
+	})
+}
+
+// TestComputeIndexBounds covers: no lookup (empty chain → nil, 0), single
+// field index (cached return), compound index (tuple concat), and the
+// non-fixed short-circuit where a trailing non-fixed field stops the chain.
+func TestComputeIndexBounds(t *testing.T) {
+	t.Run("no_fields_in_filter", func(t *testing.T) {
+		idx := &IndexInfo{FieldNames: []string{"x"}}
+		br := &BoundsResult{} // no Fields, Lookup misses
+		bounds, n := ComputeIndexBounds(idx, br)
+		assert.Nil(t, bounds)
+		assert.Equal(t, 0, n)
+	})
+	t.Run("empty_bounds_list", func(t *testing.T) {
+		// Lookup hits but returns zero bounds → chain stays empty.
+		idx := &IndexInfo{FieldNames: []string{"a"}}
+		br := &BoundsResult{
+			Fields: []FieldBounds{{Field: "a", Start: 0, Count: 0, Fixed: true}},
+			Bounds: nil,
+		}
+		bounds, n := ComputeIndexBounds(idx, br)
+		assert.Nil(t, bounds)
+		assert.Equal(t, 0, n)
+	})
+	t.Run("single_field", func(t *testing.T) {
+		idx := &IndexInfo{FieldNames: []string{"a"}}
+		br := &BoundsResult{
+			Fields: []FieldBounds{{Field: "a", Start: 0, Count: 1, Fixed: true}},
+			Bounds: []query.Bound{{Start: []byte{1}, End: []byte{1}}},
+		}
+		bounds, n := ComputeIndexBounds(idx, br)
+		assert.Equal(t, 1, n)
+		assert.Equal(t, 1, len(bounds))
+		assert.Equal(t, []byte{1}, []byte(bounds[0].Start))
+		assert.Equal(t, []byte{1}, []byte(bounds[0].End))
+	})
+	t.Run("compound_index_all_fixed", func(t *testing.T) {
+		idx := &IndexInfo{FieldNames: []string{"a", "b"}}
+		br := &BoundsResult{
+			Fields: []FieldBounds{
+				{Field: "a", Start: 0, Count: 1, Fixed: true},
+				{Field: "b", Start: 1, Count: 1, Fixed: true},
+			},
+			Bounds: []query.Bound{
+				{Start: []byte{0xaa}, End: []byte{0xaa}, StartInclude: true, EndInclude: true},
+				{Start: []byte{0xbb}, End: []byte{0xbb}, StartInclude: true, EndInclude: true},
+			},
+		}
+		bounds, n := ComputeIndexBounds(idx, br)
+		assert.Equal(t, 2, n)
+		if assert.Equal(t, 1, len(bounds)) {
+			// concat is aa + bb
+			assert.Equal(t, []byte{0xaa, 0xbb}, []byte(bounds[0].Start))
+			assert.Equal(t, []byte{0xaa, 0xbb}, []byte(bounds[0].End))
+		}
+	})
+	t.Run("stops_at_non_fixed_field", func(t *testing.T) {
+		// First field (a) has a range bound → chain captures a, then breaks.
+		idx := &IndexInfo{FieldNames: []string{"a", "b"}}
+		br := &BoundsResult{
+			Fields: []FieldBounds{
+				{Field: "a", Start: 0, Count: 1, Fixed: false},
+				{Field: "b", Start: 1, Count: 1, Fixed: true},
+			},
+			Bounds: []query.Bound{
+				{Start: []byte{0x10}, End: []byte{0x20}},
+				{Start: []byte{0xbb}, End: []byte{0xbb}},
+			},
+		}
+		bounds, n := ComputeIndexBounds(idx, br)
+		assert.Equal(t, 1, n, "chain should contain only field a, not b")
+		assert.Equal(t, []byte{0x10}, []byte(bounds[0].Start))
+		assert.Equal(t, []byte{0x20}, []byte(bounds[0].End))
+	})
+}
+
+// TestFormatFullScanDetails covers all branches of formatFullScanDetails:
+// small-table fetch label, large-table seq label (totalDocs > 500), needSort
+// toggle, and idBoundsSeek override (large but still uses fetch).
+func TestFormatFullScanDetails(t *testing.T) {
+	t.Run("small_no_sort", func(t *testing.T) {
+		s := formatFullScanDetails(100, 50, false, false)
+		assert.Contains(t, s, fmt.Sprintf("100×fetch(%.1f)", CostDocFetch))
+		assert.NotContains(t, s, "× sort")
+		total := 100*CostDocFetch + 100*CostFilter
+		assert.True(t, strings.HasSuffix(s, fmt.Sprintf("= %.1f", total)),
+			"unexpected total in %q", s)
+	})
+	t.Run("large_seq_label", func(t *testing.T) {
+		s := formatFullScanDetails(1000, 1000, false, false)
+		assert.Contains(t, s, fmt.Sprintf("1000×seq(%.1f)", CostSeqRead))
+		total := 1000*CostSeqRead + 1000*CostFilter
+		assert.True(t, strings.HasSuffix(s, fmt.Sprintf("= %.1f", total)))
+	})
+	t.Run("large_with_idBoundsSeek_keeps_fetch", func(t *testing.T) {
+		s := formatFullScanDetails(1000, 1000, false, true)
+		assert.Contains(t, s, fmt.Sprintf("1000×fetch(%.1f)", CostDocFetch),
+			"idBoundsSeek=true must override large-table seq label")
+	})
+	t.Run("with_sort", func(t *testing.T) {
+		s := formatFullScanDetails(100, 50, true, false)
+		assert.Contains(t, s, fmt.Sprintf("sort(%.0f)=%.1f", 50.0, sortCost(50)))
+		total := 100*CostDocFetch + 100*CostFilter + sortCost(50)
+		assert.True(t, strings.HasSuffix(s, fmt.Sprintf("= %.1f", total)))
+	})
+}
+
+// TestExplainString_WithIndexName covers the `p.IndexName != ""` branch and
+// the `d := c.Details(); d != ""` branch of ExplainString by building a plan
+// with a non-empty IndexName and a matched candidate that carries lazy details.
+func TestExplainString_WithIndexName(t *testing.T) {
+	plan := &Plan{
+		Name:      "IndexSeek",
+		Cost:      123.4,
+		IndexName: "idx_a",
+		Explain: ExplainInfo{
+			TotalDocs:   1000,
+			Selectivity: 0.05,
+			Candidates: []CandidatePlan{
+				{Name: "IndexSeek(a)", Cost: 123.4, EstRows: 50,
+					details: func() string { return "formula-goes-here" }},
+				{Name: "FullScan", Cost: 999.9, EstRows: 1000},
+			},
+		},
+	}
+	out := plan.ExplainString()
+	assert.Contains(t, out, "Plan: IndexSeek")
+	assert.Contains(t, out, "Index: idx_a")
+	assert.Contains(t, out, "Cost: 123.4")
+	assert.Contains(t, out, "Selectivity: 0.05 (50 of 1000 docs)")
+	assert.Contains(t, out, "Iterator: NoPlan") // Root is nil in this fixture
+	assert.Contains(t, out, "Cost breakdown: formula-goes-here")
+	assert.Contains(t, out, "IndexSeek(a)")
+	assert.Contains(t, out, "[chosen]")
+}
+
+// TestCalculateSelectivity covers the all/nil filter short-circuit, the sketch
+// path for single-field equality, the compound-equality fallback, the range
+// fallback, the no-indexed-fields branch (nUsed == 0), and the p <= 0 clamp.
+func TestCalculateSelectivity(t *testing.T) {
+	t.Run("nil_filter", func(t *testing.T) {
+		assert.Equal(t, 1.0, calculateSelectivity(nil, nil, 100, nil))
+	})
+	t.Run("all_filter", func(t *testing.T) {
+		assert.Equal(t, 1.0, calculateSelectivity(query.All{}, nil, 100, nil))
+	})
+	t.Run("no_indexed_fields_match", func(t *testing.T) {
+		// Filter references "x" but only an index on "a" exists → nUsed stays 0
+		// → pTotal falls back to DefaultRangeSelectivity.
+		f := query.MustParseCondition(`{"x": 1}`)
+		idx := CBOIndex{Info: &IndexInfo{Name: "a", FieldNames: []string{"a"}}}
+		br := &BoundsResult{}
+		br.Build([]*IndexInfo{idx.Info}, f)
+		sel := calculateSelectivity(f, []CBOIndex{idx}, 100, br)
+		assert.Equal(t, DefaultRangeSelectivity, sel)
+	})
+	t.Run("sketch_single_field_equality", func(t *testing.T) {
+		f := query.MustParseCondition(`{"a": 42}`)
+		sketch := mockSketch(5)
+		idx := CBOIndex{
+			Info:   &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+			Sketch: sketch,
+		}
+		br := &BoundsResult{}
+		br.Build([]*IndexInfo{idx.Info}, f)
+		sel := calculateSelectivity(f, []CBOIndex{idx}, 1000, br)
+		assert.InDelta(t, 0.005, sel, 1e-9, "5/1000 = 0.005")
+	})
+	t.Run("sketch_p_clamp_high", func(t *testing.T) {
+		// est == totalDocs*2 → raw p=2.0 → clamped to 1.0.
+		f := query.MustParseCondition(`{"a": 42}`)
+		sketch := mockSketch(200)
+		idx := CBOIndex{
+			Info:   &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+			Sketch: sketch,
+		}
+		br := &BoundsResult{}
+		br.Build([]*IndexInfo{idx.Info}, f)
+		sel := calculateSelectivity(f, []CBOIndex{idx}, 100, br)
+		assert.Equal(t, 1.0, sel, "raw p > 1 must clamp to 1.0")
+	})
+	t.Run("sketch_p_clamp_zero_uses_min", func(t *testing.T) {
+		// sketch returns 0 → p=0 → clamped up to 0.0001.
+		f := query.MustParseCondition(`{"a": 42}`)
+		idx := CBOIndex{
+			Info:   &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+			Sketch: mockSketch(0),
+		}
+		br := &BoundsResult{}
+		br.Build([]*IndexInfo{idx.Info}, f)
+		sel := calculateSelectivity(f, []CBOIndex{idx}, 1000, br)
+		assert.Equal(t, 0.0001, sel)
+	})
+	t.Run("compound_equality_uses_default_range", func(t *testing.T) {
+		// Compound index (a, b) with equality on a only → first field fi=0
+		// but len(FieldNames) != 1 → compound-equality branch.
+		f := query.MustParseCondition(`{"a": 1}`)
+		idx := CBOIndex{
+			Info:   &IndexInfo{Name: "ab", FieldNames: []string{"a", "b"}},
+			Sketch: mockSketch(10),
+		}
+		br := &BoundsResult{}
+		br.Build([]*IndexInfo{idx.Info}, f)
+		sel := calculateSelectivity(f, []CBOIndex{idx}, 100, br)
+		// sel = DefaultRangeSelectivity (compound branch on a, no bounds for b → continues)
+		assert.Equal(t, DefaultRangeSelectivity, sel)
+	})
+	t.Run("range_predicate", func(t *testing.T) {
+		f := query.MustParseCondition(`{"a": {"$gt": 5}}`)
+		idx := CBOIndex{Info: &IndexInfo{Name: "a", FieldNames: []string{"a"}}}
+		br := &BoundsResult{}
+		br.Build([]*IndexInfo{idx.Info}, f)
+		sel := calculateSelectivity(f, []CBOIndex{idx}, 100, br)
+		assert.Equal(t, DefaultRangeSelectivity, sel)
+	})
+	t.Run("nil_br_uses_filter_direct", func(t *testing.T) {
+		// Pass br=nil to force the filter.IndexBounds path.
+		f := query.MustParseCondition(`{"a": 7}`)
+		idx := CBOIndex{
+			Info:   &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+			Sketch: mockSketch(2),
+		}
+		sel := calculateSelectivity(f, []CBOIndex{idx}, 100, nil)
+		// 2/100 = 0.02 (no clamp); sketch branch is taken when br=nil too.
+		assert.InDelta(t, 0.02, sel, 1e-9)
+	})
+}
+
+// TestSelectivityForIndex covers all branches: empty bounds returns 1.0,
+// full-sketch coverage returns est/totalDocs with both clamps (low and high),
+// and the fallback to DefaultRangeSelectivity.
+func TestSelectivityForIndex(t *testing.T) {
+	t.Run("empty_bounds", func(t *testing.T) {
+		idx := &CBOIndex{Info: &IndexInfo{FieldNames: []string{"a"}}}
+		assert.Equal(t, 1.0, selectivityForIndex(idx, 100))
+	})
+	t.Run("sketch_full_coverage", func(t *testing.T) {
+		idx := &CBOIndex{
+			Info:        &IndexInfo{FieldNames: []string{"a"}},
+			Bounds:      query.Bounds{{Start: []byte{1}, End: []byte{1}}},
+			Sketch:      mockSketch(25),
+			PointLookup: true,
+			BoundFields: 1,
+		}
+		assert.InDelta(t, 0.25, selectivityForIndex(idx, 100), 1e-9)
+	})
+	t.Run("sketch_clamp_low", func(t *testing.T) {
+		idx := &CBOIndex{
+			Info:        &IndexInfo{FieldNames: []string{"a"}},
+			Bounds:      query.Bounds{{Start: []byte{1}, End: []byte{1}}},
+			Sketch:      mockSketch(0),
+			PointLookup: true,
+			BoundFields: 1,
+		}
+		assert.Equal(t, 0.0001, selectivityForIndex(idx, 100))
+	})
+	t.Run("sketch_clamp_high", func(t *testing.T) {
+		idx := &CBOIndex{
+			Info:        &IndexInfo{FieldNames: []string{"a"}},
+			Bounds:      query.Bounds{{Start: []byte{1}, End: []byte{1}}},
+			Sketch:      mockSketch(200),
+			PointLookup: true,
+			BoundFields: 1,
+		}
+		assert.Equal(t, 1.0, selectivityForIndex(idx, 100))
+	})
+	t.Run("no_sketch_falls_back", func(t *testing.T) {
+		idx := &CBOIndex{
+			Info:   &IndexInfo{FieldNames: []string{"a"}},
+			Bounds: query.Bounds{{Start: []byte{1}, End: []byte{5}}},
+		}
+		assert.Equal(t, DefaultRangeSelectivity, selectivityForIndex(idx, 100))
+	})
+	t.Run("partial_bounds_falls_back", func(t *testing.T) {
+		// PointLookup=false or BoundFields != len(FieldNames) → fallback.
+		idx := &CBOIndex{
+			Info:        &IndexInfo{FieldNames: []string{"a", "b"}},
+			Bounds:      query.Bounds{{Start: []byte{1}, End: []byte{1}}},
+			Sketch:      mockSketch(10),
+			PointLookup: true,
+			BoundFields: 1, // only a bound, b is not bounded
+		}
+		assert.Equal(t, DefaultRangeSelectivity, selectivityForIndex(idx, 100))
+	})
+}
+
+// TestEstimateIndexDocsWithFieldSel covers: empty bounds returns totalDocs,
+// full-sketch coverage sums estimates, partial bounds with matching fieldSel
+// multiplies per-field selectivity (with fallback when a field has no sketch),
+// and the bottom fallback multiplies DefaultRangeSelectivity per bound field.
+func TestEstimateIndexDocsWithFieldSel(t *testing.T) {
+	t.Run("empty_bounds", func(t *testing.T) {
+		idx := &CBOIndex{Info: &IndexInfo{FieldNames: []string{"a"}}}
+		assert.Equal(t, 123.0, estimateIndexDocsWithFieldSel(idx, 123, nil))
+	})
+	t.Run("full_sketch_sums", func(t *testing.T) {
+		idx := &CBOIndex{
+			Info:        &IndexInfo{FieldNames: []string{"a"}},
+			Bounds:      query.Bounds{{Start: []byte{1}}, {Start: []byte{2}}},
+			Sketch:      mockSketch(7),
+			PointLookup: true,
+			BoundFields: 1,
+		}
+		// Two bounds × 7 each.
+		assert.Equal(t, 14.0, estimateIndexDocsWithFieldSel(idx, 100, nil))
+	})
+	t.Run("partial_bounds_with_matching_fieldsel", func(t *testing.T) {
+		idx := &CBOIndex{
+			Info:        &IndexInfo{FieldNames: []string{"a", "b"}},
+			Bounds:      query.Bounds{{Start: []byte{1}, End: []byte{1}}},
+			BoundFields: 1,
+		}
+		fieldSel := []fieldSelEntry{{field: "a", sel: 0.1}}
+		got := estimateIndexDocsWithFieldSel(idx, 1000, fieldSel)
+		assert.InDelta(t, 100.0, got, 1e-6)
+	})
+	t.Run("partial_bounds_with_missing_fieldsel_fallback", func(t *testing.T) {
+		// BoundFields=2, fieldSel covers only "a". The "b" lookup misses and
+		// falls back to DefaultRangeSelectivity.
+		idx := &CBOIndex{
+			Info:        &IndexInfo{FieldNames: []string{"a", "b"}},
+			Bounds:      query.Bounds{{Start: []byte{1}, End: []byte{1}}},
+			BoundFields: 2,
+		}
+		fieldSel := []fieldSelEntry{{field: "a", sel: 0.1}}
+		got := estimateIndexDocsWithFieldSel(idx, 1000, fieldSel)
+		expected := 1000 * 0.1 * DefaultRangeSelectivity
+		assert.InDelta(t, expected, got, 1e-6)
+	})
+	t.Run("bottom_fallback_no_fieldsel", func(t *testing.T) {
+		idx := &CBOIndex{
+			Info:        &IndexInfo{FieldNames: []string{"a", "b"}},
+			Bounds:      query.Bounds{{Start: []byte{1}, End: []byte{5}}},
+			BoundFields: 2,
+		}
+		got := estimateIndexDocsWithFieldSel(idx, 1000, nil)
+		expected := 1000 * DefaultRangeSelectivity * DefaultRangeSelectivity
+		assert.InDelta(t, expected, got, 1e-6)
+	})
+}
+
+// TestComputeIndexBounds_OpenEndedBound covers the else branches at
+// planner.go:1373-1380 (empty cur.Start) and 1388-1395 (empty cur.End) by
+// passing a compound index with an open-ended bound on the second field.
+func TestComputeIndexBounds_OpenEndedBound(t *testing.T) {
+	t.Run("open_start", func(t *testing.T) {
+		idx := &IndexInfo{FieldNames: []string{"a", "b"}}
+		br := &BoundsResult{
+			Fields: []FieldBounds{
+				{Field: "a", Start: 0, Count: 1, Fixed: true},
+				{Field: "b", Start: 1, Count: 1, Fixed: false},
+			},
+			Bounds: []query.Bound{
+				{Start: []byte{0xaa}, End: []byte{0xaa}, StartInclude: true, EndInclude: true},
+				{Start: nil, End: []byte{0xbb}}, // open start on b
+			},
+		}
+		bounds, n := ComputeIndexBounds(idx, br)
+		assert.Equal(t, 2, n)
+		if assert.Equal(t, 1, len(bounds)) {
+			// Open start on b: eb.Start is just prev.Start (a) with trailing cap.
+			assert.Equal(t, []byte{0xaa}, []byte(bounds[0].Start))
+			assert.True(t, bounds[0].StartInclude,
+				"open start branch must force StartInclude=true")
+			// End is concat of a+b.
+			assert.Equal(t, []byte{0xaa, 0xbb}, []byte(bounds[0].End))
+		}
+	})
+	t.Run("open_end", func(t *testing.T) {
+		idx := &IndexInfo{FieldNames: []string{"a", "b"}}
+		br := &BoundsResult{
+			Fields: []FieldBounds{
+				{Field: "a", Start: 0, Count: 1, Fixed: true},
+				{Field: "b", Start: 1, Count: 1, Fixed: false},
+			},
+			Bounds: []query.Bound{
+				{Start: []byte{0xaa}, End: []byte{0xaa}, StartInclude: true, EndInclude: true},
+				{Start: []byte{0xbb}, End: nil}, // open end on b
+			},
+		}
+		bounds, n := ComputeIndexBounds(idx, br)
+		assert.Equal(t, 2, n)
+		if assert.Equal(t, 1, len(bounds)) {
+			assert.Equal(t, []byte{0xaa, 0xbb}, []byte(bounds[0].Start))
+			// Open end: eb.End is prev.End + 0xff, EndInclude=true.
+			assert.Equal(t, []byte{0xaa, 0xff}, []byte(bounds[0].End))
+			assert.True(t, bounds[0].EndInclude,
+				"open end branch must force EndInclude=true")
 		}
 	})
 }

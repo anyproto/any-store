@@ -41,4 +41,14 @@ that are structurally identical to comma-spelled `{"a":1,"b":2}` filters.
 
 ## UNREACHABLE
 
-_(None identified yet.)_
+- `internal/qplanner/planner.go:1355` — `if !chain[i-1].fixed { break }`
+  inside the compound-index loop of `ComputeIndexBounds`. The outer loop at
+  planner.go:1319-1329 already breaks after appending the first non-fixed
+  field, so `chain[0..len-2]` are always fixed and `chain[i-1].fixed`
+  (with `i >= 1 && i < len(chain)`) is always true. Defensive dead code.
+
+- `internal/qplanner/planner.go:1425` — `if start < 0 || start >= len(idx.FieldNames)`
+  inside `matchAt` in `IndexSortMatch`. `matchAt` is called with `0`
+  (always safe) and `equalityPrefix` (gated at planner.go:1456 by
+  `equalityPrefix > 0 && equalityPrefix < len(idx.FieldNames)`). A negative
+  `equalityPrefix` is never produced by the planner. Defensive dead code.
