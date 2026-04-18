@@ -548,6 +548,140 @@ func TestIteratorStringAndCloseSmoke(t *testing.T) {
 	(&VerifyIter{}).Close()
 }
 
+// ---- FullScanIter string + DocValue/RawValue ----
+
+// TestFullScanIter_String_Variants covers every permutation of the four
+// descriptor arms: base, reverse, idBounds, offset, filter.
+func TestFullScanIter_String_Variants(t *testing.T) {
+	t.Run("base", func(t *testing.T) {
+		it := &FullScanIter{}
+		assert.Equal(t, "FullScan", it.String())
+	})
+	t.Run("reverse", func(t *testing.T) {
+		it := &FullScanIter{Reverse: true}
+		assert.Contains(t, it.String(), "(reverse)")
+	})
+	t.Run("with_bounds", func(t *testing.T) {
+		b := query.Bound{Start: []byte{1}, End: []byte{2}}
+		it := &FullScanIter{IDBounds: query.Bounds{b}}
+		assert.Contains(t, it.String(), "idBounds=")
+	})
+	t.Run("with_offset", func(t *testing.T) {
+		it := &FullScanIter{Offset: 7}
+		assert.Contains(t, it.String(), "skip=7")
+	})
+	t.Run("with_filter", func(t *testing.T) {
+		it := &FullScanIter{Filter: query.All{}}
+		assert.Contains(t, it.String(), "(filtered)")
+	})
+}
+
+// TestFullScanIter_DocValueRawValue pins FullScanIter.DocValue and
+// FullScanIter.RawValue under a real cursor.
+func TestFullScanIter_DocValueRawValue(t *testing.T) {
+	db, ns := coverageBtree(t, "fs_docvalue", []string{"a"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	it := &FullScanIter{
+		Source: &CursorSource{Tx: rtx, Ns: ns},
+		Buf:    buf,
+	}
+	defer it.Close()
+
+	// Advance the cursor by calling Next once.
+	_, docId, err := it.Next()
+	require.NoError(t, err)
+	require.NotNil(t, docId)
+
+	raw, err := it.RawValue()
+	require.NoError(t, err)
+	assert.NotEmpty(t, raw)
+
+	val, err := it.DocValue()
+	require.NoError(t, err)
+	assert.Equal(t, []byte("a"), val.Get("id").GetStringBytes())
+}
+
+// ---- FilterIter filtered-doc branch ----
+
+// TestFilterIter_RejectsNonMatching covers filter_iter.go:80-86 — when
+// Filter.Ok returns false, the iterator advances without yielding and clears
+// DocParsed cache. Also covers the ErrKeyNotFound swallow at 55-57.
+func TestFilterIter_RejectsNonMatching(t *testing.T) {
+	db, ns := coverageBtree(t, "filter_reject", []string{"a", "b", "missing", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	// Feed IDs a, b, nonexistent, c. "nonexistent" hits the ErrKeyNotFound
+	// swallow; the filter {"id":"a"} rejects b and c.
+	//
+	// In production, an upstream FetchIter populates Plan.DocParsed per-iteration,
+	// so FilterIter's reuse branch at filter_iter.go:48 is safe. Here we pass
+	// nil Plan to force a fresh fetch on every iteration — this exercises the
+	// non-reuse branch at filter_iter.go:51-68 and the ErrKeyNotFound swallow.
+	source := &fakeIter{
+		hits: []fakeHit{
+			{docId: anyenc.AppendAnyValue(nil, "a")},
+			{docId: anyenc.AppendAnyValue(nil, "b")},
+			{docId: anyenc.AppendAnyValue(nil, "nonexistent")},
+			{docId: anyenc.AppendAnyValue(nil, "c")},
+		},
+	}
+	it := &FilterIter{
+		Source: source,
+		Data:   &CursorSource{Tx: rtx, Ns: ns},
+		Filter: query.MustParseCondition(`{"id":"a"}`),
+		Buf:    buf,
+		// Plan: nil → filter-reject branch must NOT try to cache DocParsed
+	}
+
+	var matched int
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		matched++
+	}
+	assert.Equal(t, 1, matched, "only the 'a' doc must pass the filter")
+}
+
+// TestFilterIter_NoPlan covers the `if it.Plan != nil` branches in FilterIter.
+func TestFilterIter_NoPlan(t *testing.T) {
+	db, ns := coverageBtree(t, "filter_no_plan", []string{"x"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	source := &fakeIter{hits: []fakeHit{{docId: anyenc.AppendAnyValue(nil, "x")}}}
+	it := &FilterIter{
+		Source: source,
+		Data:   &CursorSource{Tx: rtx, Ns: ns},
+		Filter: query.All{},
+		Buf:    buf,
+		// Plan: nil → tests the nil-branch at filter_iter.go:48 and 67
+	}
+	_, docId, err := it.Next()
+	require.NoError(t, err)
+	require.NotNil(t, docId)
+}
+
 // TestFetchIter_Next_NoPlanLeaves_DocParsed_Untouched covers the branch at
 // fetch_iter.go:61 (if it.Plan != nil) — when Plan is nil, we skip parsing
 // and DocParsed stays unset.
