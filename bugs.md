@@ -64,6 +64,17 @@ that are structurally identical to comma-spelled `{"a":1,"b":2}` filters.
   in the Doc() fallback. Requires `btree.Cursor.Value` to fail after a
   successful `SeekExact`. No public seam to inject.
 
+- `anyenc/tuple.go:100-117` — error branches in `Tuple.String` (Parse error,
+  ReadValues error). Reachable only with a pre-corrupted tuple; the string
+  representation of corrupted tuples is not exercised by the rest of the
+  codebase (error is returned internally and a sentinel string is emitted).
+
+- `anyenc/parser.go:266-295 misc branches` — specific error sub-branches
+  inside `parseCompressedObjectS2` (bad inner value after decompression,
+  s2 decode error). Reachable only with handcrafted malformed compressed
+  input; requires knowledge of s2 framing which is out of scope for a
+  pure-Go test suite that consumes its own encoder's output.
+
 - `iterator.go:107-109` — `if perr != nil { return nil, perr }` in the Doc()
   fallback. Requires `Parser.ParseOwned` to fail on a document stored via
   the normal write path. No public seam to inject.
@@ -184,6 +195,11 @@ for a tests-only coverage pass.
   line 85). The `for i := 0; i <= n` condition means `i` reaches `n` before
   the loop check ever fails, so control never falls through the closing
   brace. Defensive dead code.
+
+- `anyenc/tuple.go:73-75` — `if off > len(t) { off = len(t) }` in `OffsetAfter`.
+  `off` accumulates `consumed = len(tail) - len(nextTail)` per iteration and
+  `tail` always shrinks monotonically, so `off` never exceeds the initial
+  tuple length. Defensive clamp.
 
 - `anyenc/value.go:460-462` — `default: panic(...)` in `Value.GoType`.
   Reachable only by constructing a `Value` with a `Type` not in the 8
