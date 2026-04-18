@@ -7,19 +7,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestArena_ApproxSize pins Arena.ApproxSize — returns a non-negative
-// approximation of the arena's value cache.
+// TestArena_ApproxSize pins Arena.ApproxSize — an empty arena reports a
+// baseline size (possibly 0 depending on initial cap), and allocating a
+// non-empty value strictly grows the reported size.
 func TestArena_ApproxSize(t *testing.T) {
 	a := &Arena{}
-	// Empty arena — may still have some cap overhead, but must be non-negative.
 	emptySize := a.ApproxSize()
 	assert.GreaterOrEqual(t, emptySize, 0)
 
-	// Allocate a value with content; size must grow.
-	s := a.NewStringBytes([]byte("hello world"))
-	_ = s
+	// Allocate an 11-byte string. The cache stores a Value with len(v.v)==11,
+	// plus valueSize overhead. A broken implementation that returns a constant
+	// would fail the strict `>` assertion.
+	_ = a.NewStringBytes([]byte("hello world"))
 	after := a.ApproxSize()
-	assert.GreaterOrEqual(t, after, emptySize)
+	assert.Greater(t, after, emptySize,
+		"ApproxSize must strictly grow after allocating a non-empty value")
 }
 
 // TestMustParse_AndParseOwned pins the MustParse wrapper and Parser.ParseOwned,
@@ -62,15 +64,29 @@ func TestParser_ApproxSize(t *testing.T) {
 	assert.GreaterOrEqual(t, p.ApproxSize(), s0)
 }
 
-// TestParserPool_GetPut pins the sync.Pool wrappers for Parser.
+// TestParserPool_GetPut pins the sync.Pool wrappers for Parser and proves the
+// retrieved parser is functional (can Parse encoded bytes) — not just non-nil.
 func TestParserPool_GetPut(t *testing.T) {
 	pp := &ParserPool{}
 	p := pp.Get()
 	require.NotNil(t, p, "empty pool returns a fresh Parser")
+
+	// Prove the fresh parser actually works.
+	encoded := MustParseJson(`"hello"`).MarshalTo(nil)
+	v, err := p.Parse(encoded)
+	require.NoError(t, err)
+	assert.Equal(t, "hello", string(v.GetStringBytes()))
+
 	pp.Put(p)
+
+	// After Put, Get must return a usable Parser. sync.Pool is
+	// non-deterministic, but either branch (pooled or fresh fallback) must
+	// produce a working Parser.
 	p2 := pp.Get()
-	// After Put, Get must return a non-nil Parser (possibly the same one).
 	require.NotNil(t, p2)
+	v2, err := p2.Parse(encoded)
+	require.NoError(t, err)
+	assert.Equal(t, "hello", string(v2.GetStringBytes()))
 }
 
 // TestArenaPool_GetPut pins the sync.Pool wrappers for Arena. Put calls

@@ -49,56 +49,70 @@ func TestIndex_Close(t *testing.T) {
 	assert.NoError(t, err, "Close is a no-op today; returns nil")
 }
 
-// TestIndex_Insert_Unique_IdempotentSameDoc covers the "same doc, idempotent"
-// branch in insertKeys at index.go:157 — re-inserting the same (docId, key)
-// pair does not trigger ErrUniqueConstraint.
-func TestIndex_Insert_Unique_IdempotentSameDoc(t *testing.T) {
+// TestIndex_InsertKeys_IdempotentSameDoc directly calls insertKeys twice with
+// the same item in the same transaction to exercise the "same doc, idempotent"
+// branch at index.go:157. This branch is not reachable via UpsertOne because
+// collection.update short-circuits on anyencutil.Equal before insertKeys runs.
+func TestIndex_InsertKeys_IdempotentSameDoc(t *testing.T) {
 	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "idx_idempotent")
+	coll, err := fx.CreateCollection(ctx, "idx_idempotent_direct")
 	require.NoError(t, err)
 	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
-		Name: "ix_a_unique", Fields: []string{"a"}, Unique: true,
+		Name: "ix_uq", Fields: []string{"a"}, Unique: true,
 	}))
 
-	// Insert once
-	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":42}`)))
-	// Re-upsert the SAME doc with the SAME value via UpsertOne — this exercises
-	// the "same doc, idempotent" branch in insertKeys (index.go:157) because
-	// the unique seek finds the existing key and matches the doc's full key.
-	require.NoError(t, coll.UpsertOne(ctx, anyenc.MustParseJson(`{"id":1,"a":42}`)),
-		"upserting same doc with same value must be idempotent")
+	idx := coll.GetIndexes()[0].(*index)
+	it, itErr := newItem(anyenc.MustParseJson(`{"id":1,"a":42}`))
+	require.NoError(t, itErr)
 
-	// Update to a different value — removes old key, adds new.
-	require.NoError(t, coll.UpsertOne(ctx, anyenc.MustParseJson(`{"id":1,"a":99}`)))
+	wrTx, err := coll.WriteTx(ctx)
+	require.NoError(t, err)
+	btWtx := wrTx.btreeWriteTx()
 
-	// Cross-doc collision remains an error.
-	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":100}`)))
+	// First insert: populates the unique index.
+	require.NoError(t, idx.insertKeys(btWtx, it))
+	// Second insert with the same item: unique seek finds the existing entry
+	// matching fullKeyBuf → takes the idempotent continue at index.go:157.
+	require.NoError(t, idx.insertKeys(btWtx, it),
+		"re-inserting the same (key, docId) pair must hit the idempotent branch")
+
+	require.NoError(t, wrTx.Rollback())
+
+	// Cross-doc collision via the public API still rejects.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":99}`)))
 	require.ErrorIs(t,
 		coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":99}`)),
 		ErrUniqueConstraint,
-		"cross-doc duplicate must still be rejected")
+		"cross-doc duplicate must be rejected through the full pipeline")
 }
 
-// TestIndex_Delete_NonExistentKey_Swallowed covers deleteKeys at
-// index.go:184-188 — a Delete that returns ErrKeyNotFound is silently
-// swallowed rather than propagated. Exercised by deleting a document whose
-// index entries were manipulated out-of-band (simulated via sparse index
-// where some docs have no index entry).
-func TestIndex_Delete_NonExistentKey_Swallowed(t *testing.T) {
+// TestIndex_DeleteKeys_SwallowsErrKeyNotFound directly calls deleteKeys on an
+// item whose index entry was never inserted, so tx.Delete returns
+// btree.ErrKeyNotFound. The function must swallow that error (index.go:184-187).
+// This branch is not reachable via the public update path because the sparse
+// code path produces an empty keysBuf and skips the Delete call entirely.
+func TestIndex_DeleteKeys_SwallowsErrKeyNotFound(t *testing.T) {
 	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "idx_delete_missing")
+	coll, err := fx.CreateCollection(ctx, "idx_delete_missing_direct")
 	require.NoError(t, err)
-	// Sparse index on field "a": docs without "a" have no index entry.
 	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
-		Name: "ix_a_sparse", Fields: []string{"a"}, Sparse: true,
+		Name: "ix_a", Fields: []string{"a"},
 	}))
 
-	// Insert a doc that doesn't have field "a" — no index entry is created.
-	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"b":"x"}`)))
-	assertIndexLen(t, coll.GetIndexes()[0], 0)
+	idx := coll.GetIndexes()[0].(*index)
+	// Build an item with a present field "a" so fillKeysBuf produces a real
+	// key. The index namespace is empty (we inserted nothing via the public
+	// API), so tx.Delete on that key returns ErrKeyNotFound.
+	it, itErr := newItem(anyenc.MustParseJson(`{"id":1,"a":"never-inserted"}`))
+	require.NoError(t, itErr)
 
-	// Update the doc to still lack "a" — deleteKeys tries to remove a key
-	// that never existed; deleteKeys' ErrKeyNotFound swallow keeps this valid.
-	require.NoError(t, coll.UpsertOne(ctx, anyenc.MustParseJson(`{"id":1,"b":"y"}`)),
-		"update of sparse-index doc without the field must succeed")
+	wrTx, err := coll.WriteTx(ctx)
+	require.NoError(t, err)
+	btWtx := wrTx.btreeWriteTx()
+
+	// Must succeed without surfacing ErrKeyNotFound.
+	require.NoError(t, idx.deleteKeys(btWtx, it),
+		"deleteKeys must swallow ErrKeyNotFound from tx.Delete")
+
+	require.NoError(t, wrTx.Rollback())
 }

@@ -177,6 +177,20 @@ for a tests-only coverage pass.
   in (0, 1] can only shrink the product. The outer >1.0 check cannot be
   reached. Defensive dead code.
 
+- `anyenc/tuple.go:96` — `return nil, fmt.Errorf("tuple: field %d out of range", n)`
+  post-loop return in `Tuple.FieldBytes`. The only way to exit the loop is
+  the `return tail[:...]` inside the `i == n` branch (success) or the
+  `return nil, ...` inside the `len(tail) == 0` branch (early error at
+  line 85). The `for i := 0; i <= n` condition means `i` reaches `n` before
+  the loop check ever fails, so control never falls through the closing
+  brace. Defensive dead code.
+
+- `anyenc/value.go:460-462` — `default: panic(...)` in `Value.GoType`.
+  Reachable only by constructing a `Value` with a `Type` not in the 8
+  supported values. All public constructors produce a valid Type; `Type` is
+  a byte with unexported semantics and no exported conversion. Defensive
+  dead code that cannot be triggered without modifying production.
+
 - `internal/qplanner/planner.go:1425` — `if start < 0 || start >= len(idx.FieldNames)`
   inside `matchAt` in `IndexSortMatch`. `matchAt` is called with `0`
   (always safe) and `equalityPrefix` (gated at planner.go:1456 by

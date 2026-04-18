@@ -39,9 +39,14 @@ func TestQuery_Count_IDOnlyFastPath(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 2, n)
 	})
-	t.Run("and_of_id_filters", func(t *testing.T) {
-		// And-of-id-only still takes the fast path (isIDOnlyFilterNode recurses).
-		// {"$and":[{"id":"a"},{"id":"a"}]} is a tautology that matches one doc.
+	t.Run("and_single_child_unwraps", func(t *testing.T) {
+		// Documenting reality: parseAndArray at query/cond_parse.go:91 only
+		// allocates a query.And when len(arr) > 1. A single-element $and
+		// returns the bare child — so this input parses as query.Key{id},
+		// NOT query.And. It still takes the fast path via the Key branch of
+		// isIDOnlyFilterNode. The value-And branch of isIDOnlyFilterNode is
+		// effectively unreachable from JSON and is covered directly by
+		// TestQuery_IsIDOnlyFilterNode_And_Direct.
 		n, err := coll.Find(anyenc.MustParseJson(`{"$and":[{"id":"a"}]}`)).Count(ctx)
 		require.NoError(t, err)
 		assert.Equal(t, 1, n)
