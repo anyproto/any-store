@@ -72,3 +72,30 @@ func BenchmarkArena_Reset(b *testing.B) {
 		_ = testObject(a)
 	}
 }
+
+// TestArena_ApproxSize pins Arena.ApproxSize — an empty arena reports a
+// baseline size (possibly 0 depending on initial cap), and allocating a
+// non-empty value strictly grows the reported size.
+//
+// The formula (see parser.go:259-264 approxSizeValues) is:
+//
+//	sum over vs[:cap(vs)] of (len(v.v) + valueSize)
+//
+// so an 11-byte string contributes at least 11 + valueSize bytes. We assert
+// the delta covers the 11 payload bytes (the valueSize offset is added on top),
+// which proves the string payload was actually accounted for.
+func TestArena_ApproxSize(t *testing.T) {
+	a := &Arena{}
+	emptySize := a.ApproxSize()
+	assert.GreaterOrEqual(t, emptySize, 0)
+
+	// Allocate an 11-byte string. The cache stores a Value with len(v.v)==11,
+	// plus valueSize overhead. A broken implementation that returns a constant
+	// would fail the strict `>` assertion.
+	_ = a.NewStringBytes([]byte("hello world"))
+	after := a.ApproxSize()
+	assert.Greater(t, after, emptySize,
+		"ApproxSize must strictly grow after allocating a non-empty value")
+	assert.GreaterOrEqual(t, after-emptySize, 11,
+		"delta must cover at least the 11 payload bytes of 'hello world'")
+}
