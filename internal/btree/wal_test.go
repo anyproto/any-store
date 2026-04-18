@@ -1051,3 +1051,110 @@ func BenchmarkWalOpen_CleanReopen(b *testing.B) {
 		_ = db2.Close()
 	}
 }
+
+func TestEnsureHeaderInitialized_FreshSHM(t *testing.T) {
+	dir := t.TempDir()
+	w := newWal(filepath.Join(dir, "t.db-wal"), 4096)
+	w.inProcess = false
+	require.NoError(t, w.open())
+	defer w.close()
+
+	// Simulate cold-open: clear SHM header bytes so readHeader returns !valid.
+	region, err := w.index.shm.region(0, true)
+	require.NoError(t, err)
+	clear(region[:walIndexHdrSize*2])
+
+	// ensureHeaderInitialized must leave SHM in a valid state with isInit==1.
+	require.NoError(t, w.ensureHeaderInitialized())
+	hdr, valid := w.index.readHeader()
+	require.True(t, valid)
+	require.Equal(t, uint8(1), hdr.isInit)
+	require.Equal(t, uint32(0), hdr.mxFrame)
+	require.Equal(t, w.header.salt1, hdr.aSalt[0])
+	require.Equal(t, w.header.salt2, hdr.aSalt[1])
+}
+
+func TestEnsureHeaderInitialized_AdoptsValidSHM(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "t.db")
+
+	// Process A: create DB, commit 10 frames, rawClose to keep WAL+SHM intact
+	// (normal DB.Close would checkpoint, truncate WAL and remove -shm).
+	db1, err := testOpen(t, dbPath, Options{PageSize: 4096, DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	tx, err := db1.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	for i := 0; i < 10; i++ {
+		require.NoError(t, tx.Put(ns, []byte(fmt.Sprintf("k%d", i)), []byte("v")))
+	}
+	require.NoError(t, tx.Commit())
+	saltsA := [2]uint32{db1.pager.wal.header.salt1, db1.pager.wal.header.salt2}
+	// 10 Puts with tiny values pack into a single commit batch — capture the
+	// real frame count rather than hard-coding a per-row assumption.
+	expectedFrames := db1.pager.wal.nFrame.Load()
+	require.Greater(t, expectedFrames, uint32(0), "test must seed at least one frame")
+	rawClose(db1)
+
+	// Open a raw wal against the existing -wal file. rawClose deletes -shm
+	// (last-connection DMS upgrade succeeds), so w2 gets a fresh SHM mapped
+	// and the current eager wal.open will run recoverLocked to rebuild it
+	// from the on-disk WAL header. ensureHeaderInitialized must be a no-op
+	// idempotent follow-up that keeps the adopted state intact.
+	w2 := newWal(dbPath+"-wal", 4096)
+	w2.inProcess = false
+	require.NoError(t, w2.open())
+	defer w2.close()
+	require.NoError(t, w2.ensureHeaderInitialized())
+
+	require.Equal(t, saltsA[0], w2.header.salt1, "must adopt salts, not generate new ones")
+	require.Equal(t, saltsA[1], w2.header.salt2)
+	require.Equal(t, expectedFrames, w2.index.maxFrame.Load(), "mxFrame must reflect recovered frames")
+	require.Equal(t, expectedFrames, w2.nFrame.Load(), "nFrame must reflect recovered frames")
+}
+
+func TestEnsureHeaderInitialized_TriggersRecoveryWhenSHMInvalid(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "t.db")
+
+	// Seed a DB with frames and rawClose to keep the WAL file intact
+	// (normal DB.Close would truncate via checkpoint).
+	db, err := testOpen(t, dbPath, Options{PageSize: 4096, DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	for i := 0; i < 5; i++ {
+		require.NoError(t, tx.Put(ns, []byte(fmt.Sprintf("k%d", i)), []byte("v")))
+	}
+	require.NoError(t, tx.Commit())
+	expectedFrames := db.pager.wal.nFrame.Load()
+	require.Greater(t, expectedFrames, uint32(0), "test must seed at least one frame")
+	rawClose(db)
+
+	// rawClose removed -shm; w2 creates a new SHM mapping. The current eager
+	// wal.open already recovers from the WAL file into SHM — so to exercise
+	// ensureHeaderInitialized's recovery path we clear the SHM header after
+	// open and then invoke the helper explicitly.
+	w2 := newWal(dbPath+"-wal", 4096)
+	w2.inProcess = false
+	require.NoError(t, w2.open())
+	defer w2.close()
+
+	// Clear the SHM header to force ensureHeaderInitialized into the slow path.
+	region, err := w2.index.shm.region(0, true)
+	require.NoError(t, err)
+	clear(region[:walIndexHdrSize*2])
+
+	_, validBefore := w2.index.readHeader()
+	require.False(t, validBefore, "SHM should be invalid after manual clear")
+
+	require.NoError(t, w2.ensureHeaderInitialized())
+
+	// After, SHM must be valid and mxFrame must match recovered frames.
+	hdr, validAfter := w2.index.readHeader()
+	require.True(t, validAfter)
+	require.Equal(t, expectedFrames, hdr.mxFrame)
+}
