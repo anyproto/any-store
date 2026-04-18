@@ -219,6 +219,146 @@ func TestFetchIter_Next_PropagatesSourceError(t *testing.T) {
 	require.ErrorContains(t, err, "upstream")
 }
 
+// ---- IndexSketch ----
+
+// TestIndexSketch_Increment_DecrementEstimate covers Increment, Decrement,
+// Estimate, and the Decrement underflow-clamp (returning early when old==0).
+func TestIndexSketch_Increment_DecrementEstimate(t *testing.T) {
+	s := NewIndexSketch(DefaultSketchSize)
+	k := []byte("key-a")
+
+	assert.Equal(t, uint64(0), s.Estimate(k))
+	s.Increment(k)
+	s.Increment(k)
+	assert.Equal(t, uint64(2), s.Estimate(k))
+
+	s.Decrement(k)
+	assert.Equal(t, uint64(1), s.Estimate(k))
+	// Two more decrements drain the bucket; a third is a no-op (clamped at 0).
+	s.Decrement(k)
+	s.Decrement(k) // hits the `if old == 0 { return }` early exit
+	assert.Equal(t, uint64(0), s.Estimate(k))
+}
+
+// TestIndexSketch_DocCount covers Increment/DecrementDocCount + GetDocCount
+// including the underflow-clamp at old==0.
+func TestIndexSketch_DocCount(t *testing.T) {
+	s := NewIndexSketch(DefaultSketchSize)
+	assert.Equal(t, uint64(0), s.GetDocCount())
+	s.IncrementDocCount()
+	s.IncrementDocCount()
+	assert.Equal(t, uint64(2), s.GetDocCount())
+	s.DecrementDocCount()
+	assert.Equal(t, uint64(1), s.GetDocCount())
+	s.DecrementDocCount()
+	s.DecrementDocCount() // underflow → clamped
+	assert.Equal(t, uint64(0), s.GetDocCount())
+}
+
+// TestIndexSketch_MarshalUnmarshal covers MarshalBinary / UnmarshalBinary
+// round-trip and the backward-compat branch (data WITHOUT trailing docCount).
+func TestIndexSketch_MarshalUnmarshal(t *testing.T) {
+	s := NewIndexSketch(4)
+	s.Increment([]byte("a"))
+	s.Increment([]byte("b"))
+	s.Increment([]byte("b"))
+	s.IncrementDocCount()
+	s.IncrementDocCount()
+
+	data := s.MarshalBinary(nil)
+
+	// Round-trip into a fresh sketch.
+	s2 := NewIndexSketch(4)
+	s2.UnmarshalBinary(data)
+	assert.Equal(t, s.Estimate([]byte("a")), s2.Estimate([]byte("a")))
+	assert.Equal(t, s.Estimate([]byte("b")), s2.Estimate([]byte("b")))
+	assert.Equal(t, uint64(2), s2.GetDocCount())
+
+	// Backward compat: trim off the trailing 8-byte docCount.
+	oldData := data[:len(data)-8]
+	s3 := NewIndexSketch(4)
+	s3.UnmarshalBinary(oldData)
+	assert.Equal(t, uint64(0), s3.GetDocCount(),
+		"data missing docCount leaves it at zero")
+	assert.Equal(t, s.Estimate([]byte("a")), s3.Estimate([]byte("a")))
+}
+
+// TestIndexSketch_Reset pins Reset — all buckets and docCount go to zero.
+func TestIndexSketch_Reset(t *testing.T) {
+	s := NewIndexSketch(8)
+	s.Increment([]byte("a"))
+	s.IncrementDocCount()
+	s.Reset()
+	assert.Equal(t, uint64(0), s.Estimate([]byte("a")))
+	assert.Equal(t, uint64(0), s.GetDocCount())
+}
+
+// TestNewIndexSketch_DefaultsBadSize covers the `if size <= 0` branch at
+// sketch.go:23-25 — non-positive sizes fall back to DefaultSketchSize.
+func TestNewIndexSketch_DefaultsBadSize(t *testing.T) {
+	s := NewIndexSketch(0)
+	assert.Equal(t, DefaultSketchSize, s.Size)
+	s2 := NewIndexSketch(-5)
+	assert.Equal(t, DefaultSketchSize, s2.Size)
+}
+
+// ---- CursorSource / IndexInfo helpers ----
+
+// TestCursorSource_Get_And_AppendSeekKey covers the helper methods on
+// CursorSource (iterator.go:42-56) that weren't exercised by direct unit
+// tests before.
+func TestCursorSource_Get_And_AppendSeekKey(t *testing.T) {
+	db, ns := coverageBtree(t, "cs_methods", []string{"x", "y"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	cs := &CursorSource{Tx: rtx, Ns: ns}
+
+	t.Run("get_hit", func(t *testing.T) {
+		xkey := anyenc.AppendAnyValue(nil, "x")
+		val, err := cs.Get(xkey)
+		require.NoError(t, err)
+		assert.NotNil(t, val)
+	})
+	t.Run("append_seek_key", func(t *testing.T) {
+		xkey := anyenc.AppendAnyValue(nil, "x")
+		seek, err := cs.AppendSeekKey(xkey, nil)
+		require.NoError(t, err)
+		assert.NotEmpty(t, seek, "seek must find at least one entry >= prefix")
+	})
+	t.Run("new_cursor", func(t *testing.T) {
+		c := cs.NewCursor()
+		require.NotNil(t, c)
+		c.Close()
+	})
+}
+
+// TestIndexInfo_AppendIndexKey covers AppendIndexKey's reverse and forward
+// branches (iterator.go:71-77).
+func TestIndexInfo_AppendIndexKey(t *testing.T) {
+	a := &anyenc.Arena{}
+	doc := a.NewObject()
+	doc.Set("a", a.NewString("hello"))
+	doc.Set("b", a.NewString("world"))
+
+	ii := &IndexInfo{
+		FieldNames: []string{"a", "b"},
+		FieldPaths: [][]string{{"a"}, {"b"}},
+		Reverse:    []bool{false, true},
+	}
+	var fwd, rev anyenc.Tuple
+	fwd = ii.AppendIndexKey(fwd, doc, 0) // forward on field "a"
+	rev = ii.AppendIndexKey(rev, doc, 1) // reverse on field "b"
+
+	// Forward emits normal type-byte + bytes; reverse emits byte-inverted,
+	// so the first byte differs between the two encodings.
+	require.NotEmpty(t, fwd)
+	require.NotEmpty(t, rev)
+	assert.NotEqual(t, fwd[0], rev[0],
+		"reverse field byte-inversion must flip the leading type byte too")
+}
+
 // TestFetchIter_Next_NoPlanLeaves_DocParsed_Untouched covers the branch at
 // fetch_iter.go:61 (if it.Plan != nil) — when Plan is nil, we skip parsing
 // and DocParsed stays unset.
