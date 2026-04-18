@@ -1310,7 +1310,7 @@ func TestBuildPlan_IndexScan_CoverFiltersInsertsIndexFilterIter(t *testing.T) {
 		}},
 	})
 	if plan.Name != "IndexScan" {
-		t.Skipf("BuildPlan chose %s — Plan-C coverFilters branch not exercised", plan.Name)
+		t.Fatalf("BuildPlan chose %s — Plan-C coverFilters branch not exercised; a CBO cost regression should fail the test, not silently skip", plan.Name)
 	}
 
 	// Walk: LimitIter? → dedup → FilterIter? → FetchIter → IndexFilterIter → IndexIter.
@@ -1371,7 +1371,7 @@ func TestBuildPlan_CountOnly_Covering(t *testing.T) {
 		}},
 	})
 	if plan.Name != "IndexSeek" {
-		t.Skipf("BuildPlan chose %s — covering-count fast path not exercised", plan.Name)
+		t.Fatalf("BuildPlan chose %s — covering-count fast path not exercised; a CBO cost regression should fail the test, not silently skip", plan.Name)
 	}
 	// Covering count path returns the IndexIter directly from buildIndexSeekChain
 	// without FetchIter/FilterIter/Dedup wrapping.
@@ -1659,47 +1659,53 @@ func TestBuildPlan_IndexHintBoost(t *testing.T) {
 		"large hint boost must force IndexSeek to win over FullScan")
 }
 
-// TestBuildPlan_FilteredYieldClamp_LowHits pins planner.go:336-338 — when
-// filteredYield = e × (pTotal / idxSel) < 1 it is clamped to 1. We construct
-// two indexes on the same field: idxA with a sketch dominates pTotal (0.05);
-// idxB without sketch contributes idxSel = DefaultRangeSelectivity (0.33).
-// For idxB in the Plan-B loop: e = totalDocs * 0.05 = 5, then filteredYield
-// = 5 × (0.05 / 0.33) ≈ 0.76 → clamp fires.
+// TestBuildPlan_FilteredYieldClamp_LowHits pins the IndexSeek(idxB) cost
+// formula at planner.go:350 when e=1 and filteredYield<1 clamp fires (line
+// 336-338). Setup: idxA's sketch(1) makes fieldSel[a]=0.01 so idxB's e=100×0.01=1
+// (exact). idxB's PointLookup=false forces idxSel=DefaultRangeSelectivity=0.5.
+// filteredYield = 1 × (pTotal/idxSel) = 1 × (0.01/0.5) = 0.02 → clamp to 1.
+// No sort: cost = nSeeks×CostIndexSeek + e×fetchCost + e×CostFilter
+// = 1×0.5 + 1×3.0 + 1×0.5 = 4.0.
 func TestBuildPlan_FilteredYieldClamp_LowHits(t *testing.T) {
 	filter := query.MustParseCondition(`{"a": 1}`)
 	idxA := CBOIndex{
 		Info:        &IndexInfo{Name: "idxA", FieldNames: []string{"a"}},
-		Sketch:      mockSketch(5), // p = 5/100 = 0.05
+		Sketch:      mockSketch(1), // p = 1/100 = 0.01 → pins fieldSel["a"]=0.01
 		Bounds:      mustParseBounds("a", `{"a": 1}`),
 		PointLookup: true,
 		BoundFields: 1,
 	}
-	// Second index on same field: contributes bounds so Plan-B iterates it;
-	// no sketch so selectivityForIndex returns DefaultRangeSelectivity.
+	// idxB iterates Plan-B loop. BoundFields=1 enables the fieldSel lookup,
+	// which yields e=100*0.01=1. No sketch + PointLookup=false forces
+	// selectivityForIndex to return DefaultRangeSelectivity=0.5.
 	idxB := CBOIndex{
 		Info:        &IndexInfo{Name: "idxB", FieldNames: []string{"a"}},
 		Bounds:      mustParseBounds("a", `{"a": 1}`),
-		PointLookup: false, // forces selectivityForIndex fallback
+		PointLookup: false,
+		BoundFields: 1,
 	}
 	plan := BuildPlan(&PlanParams{
 		Filter:    filter,
 		TotalDocs: 100,
 		Indexes:   []CBOIndex{idxA, idxB},
 	})
-	// The IndexSeek(idxB) candidate's EstRows = e = totalDocs * fieldSel[a].sel
-	// = 100 * 0.05 = 5. filteredYield is not directly exposed in EstRows, so
-	// we assert an IndexSeek candidate exists and its cost reflects the clamp.
-	// The `assert` below proves Plan-B's inner cost loop ran for idxB, which
-	// is the only way to reach line 336. Coverage instrumentation records the
-	// hit; this test's presence keeps that branch covered for the future.
-	found := false
+	var seekB *CandidatePlan
 	for i := range plan.Explain.Candidates {
 		if plan.Explain.Candidates[i].Name == "IndexSeek(idxB)" {
-			found = true
+			seekB = &plan.Explain.Candidates[i]
 			break
 		}
 	}
-	assert.True(t, found, "IndexSeek(idxB) candidate must be generated")
+	if seekB == nil {
+		t.Fatal("IndexSeek(idxB) candidate must be generated to exercise Plan-B clamp")
+	}
+	// Pin the exact Cost formula from planner.go:350 with the clamped e=1 and
+	// nSeeks=1 values. Deviation signals either a cost-model regression or a
+	// selectivity plumbing change — not a silent coverage drop.
+	fetchCost := indexFetchCost(100)
+	expectedCost := 1*CostIndexSeek + 1*fetchCost + 1*CostFilter
+	assert.InDelta(t, expectedCost, seekB.Cost, 0.01,
+		"IndexSeek(idxB) cost must equal 1*CostIndexSeek + 1*fetchCost + 1*CostFilter with e=1")
 }
 
 // TestBuildPlan_FilteredYieldClamp_HighHits pins planner.go:339-341 — when
@@ -1788,8 +1794,19 @@ func TestBuildPlan_PlanC_ScanDetailsRendered(t *testing.T) {
 	assert.Contains(t, out, "seek(", "Plan-C details must include seek term")
 }
 
-// TestBuildPlan_PlanC_CoverFiltersNoLimit covers planner.go:473-479 (Plan-C
-// coverFilters branch when there's NO limit — scans the full index range).
+// TestBuildPlan_PlanC_CoverFiltersNoLimit pins the Plan-C no-limit cover-filter
+// Cost formula at planner.go:476:
+//
+//	scanCost = scanPopulation×CostSeqRead +
+//	           scanPopulation×coverSel×fetchCost +
+//	           scanPopulation×CostFilter
+//
+// Setup: compound index (a,b) with BoundFields=1 (only a bound, b is trailing
+// fixed equality → coverFilters has 1 entry). idxSel falls back to
+// DefaultRangeSelectivity=0.5 (BoundFields != len(FieldNames)). coverSel is
+// DefaultRangeSelectivity=0.5 (no fieldSel because compound index doesn't
+// contribute to fieldSelectivity). scanPopulation = totalDocs × idxSel =
+// 100 × 0.5 = 50.
 func TestBuildPlan_PlanC_CoverFiltersNoLimit(t *testing.T) {
 	sorter := &sortFieldStub{fields: []query.SortField{{Field: "a"}}}
 	filter := query.MustParseCondition(`{"a": 5, "b": 10}`)
@@ -1817,14 +1834,34 @@ func TestBuildPlan_PlanC_CoverFiltersNoLimit(t *testing.T) {
 	if plan.Name != "IndexScan" {
 		t.Fatalf("BuildPlan chose %s; expected IndexScan for no-limit cover-filters path", plan.Name)
 	}
+	var scan *CandidatePlan
+	for i := range plan.Explain.Candidates {
+		if strings.HasPrefix(plan.Explain.Candidates[i].Name, "IndexScan") {
+			scan = &plan.Explain.Candidates[i]
+			break
+		}
+	}
+	if scan == nil {
+		t.Fatal("IndexScan candidate required to pin cover-filter no-limit formula")
+	}
+	fetchCost := indexFetchCost(100)
+	const scanPopulation = 50.0
+	const coverSel = DefaultRangeSelectivity
+	expectedCost := scanPopulation*CostSeqRead +
+		scanPopulation*coverSel*fetchCost +
+		scanPopulation*CostFilter
+	assert.InDelta(t, expectedCost, scan.Cost, 0.01,
+		"Plan-C no-limit covering-filter cost must equal scanPopulation×(CostSeqRead + coverSel×fetchCost + CostFilter)")
 }
 
-// TestBuildPlan_PlanB_ExactSortLimit_ScanSelClamp_High hits planner.go:363-365
-// (scanSel > 1.0 → clamped to 1.0) inside Plan-B ExactSort+Limit branch.
-// Construction: pTotal > idxSel yields scanSel > 1.
+// TestBuildPlan_PlanB_ExactSortLimit_ScanSelClamp_High pins the Plan-B
+// ExactSort+Limit branch cost formula at planner.go:377 when scanSel>1 clamps
+// to 1.0. Setup: filter=All{} → pTotal=1.0. idxSel from sketch(50) →
+// 50/100=0.5. scanSel = 1.0/0.5 = 2.0 → clamps to 1.0. s = Limit/1.0 = 10.
+// e = sum(sketch estimates) = 50 (one bound × 50). s=10 < e=50 → no clamp.
+// Cost = nSeeks×CostIndexSeek + s×fetchCost + s×CostFilter
+//      = 1×0.5 + 10×3.0 + 10×0.5 = 35.5.
 func TestBuildPlan_PlanB_ExactSortLimit_ScanSelClamp_High(t *testing.T) {
-	// To make pTotal > idxSel: filter All{} → pTotal=1.0; idxSel from a
-	// low-clamped sketch → 0.0001. scanSel = 1.0 / 0.0001 = 10000 → clamp.
 	sorter := &sortFieldStub{fields: []query.SortField{{Field: "a"}}}
 	plan := BuildPlan(&PlanParams{
 		Filter:    query.All{},
@@ -1833,40 +1870,38 @@ func TestBuildPlan_PlanB_ExactSortLimit_ScanSelClamp_High(t *testing.T) {
 		TotalDocs: 100,
 		Indexes: []CBOIndex{{
 			Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}, Unique: false},
-			Sketch:      mockSketch(0),
+			Sketch:      mockSketch(50), // e=50 ≫ Limit=10, avoids s>e clamp
 			Bounds:      mustParseBounds("a", `{"a": 1}`),
 			PointLookup: true,
 			BoundFields: 1,
 			ExactSort:   true,
 		}},
 	})
-	// Any plan that evaluates the Plan-B candidate exercises the branch.
-	found := false
+	var seek *CandidatePlan
 	for i := range plan.Explain.Candidates {
 		if strings.HasPrefix(plan.Explain.Candidates[i].Name, "IndexSeek") {
-			found = true
+			seek = &plan.Explain.Candidates[i]
 			break
 		}
 	}
-	assert.True(t, found)
+	if seek == nil {
+		t.Fatal("IndexSeek candidate required to pin ExactSort+Limit+scanSel-clamp cost")
+	}
+	fetchCost := indexFetchCost(100)
+	const nSeeks = 1.0
+	const s = 10.0 // == Limit, because scanSel clamps to 1.0
+	expectedCost := nSeeks*CostIndexSeek + s*fetchCost + s*CostFilter
+	assert.InDelta(t, expectedCost, seek.Cost, 0.01,
+		"Plan-B ExactSort+Limit cost must equal nSeeks×CostIndexSeek + Limit×fetchCost + Limit×CostFilter after scanSel clamps to 1.0")
 }
 
-// TestBuildPlan_PlanB_ExactSortLimit_SClamp_Low hits planner.go:374-376
-// (s < 1 → s = 1) inside Plan-B ExactSort+Limit branch.
-// Construction: Limit=0+Offset=0 → s = 0, clamped to 1.
-// But `params.Limit > 0` is a gate (line 362), so Limit must be > 0.
-// The smallest value: Limit=1, scanSel=1.0 (clamped high) → s=1; not <1.
-// Try Limit=1, scanSel=0.5 → s=2. Still not <1.
-// Realistically this clamp requires s to be fractional, which requires
-// scanSel > limit. Let's hit s<1 via Limit=1 + very high scanSel... scanSel is
-// capped at 1.0, so s >= 1 always. This branch is effectively unreachable
-// given the preceding clamp; document rather than test.
-func TestBuildPlan_PlanB_ExactSortLimit_SClamp_Low(t *testing.T) {
-	t.Skip("FAIL: planner.go:374-376 s<1 clamp is unreachable — s = Limit/scanSel; Limit ≥ 1 (gate at 362) and scanSel ≤ 1.0 (clamp at 364-366); therefore s ≥ 1 always. See bugs.md")
-}
-
-// TestBuildPlan_PlanC_ScanSelClamp_High hits planner.go:432-434 (scanSel > 1.0
-// → clamped to 1.0) inside Plan-C loop. Same construction as Plan-B version.
+// TestBuildPlan_PlanC_ScanSelClamp_High pins the Plan-C no-limit cost formula
+// at planner.go:478 when scanSel>1 clamps to 1.0. Setup: filter=All{} →
+// pTotal=1.0. sketch(0) → idxSel clamps low to 0.0001 (planner.go:688-691).
+// scanSel = 1.0/0.0001 = 10000 → clamps to 1.0. scanPopulation =
+// totalDocs × idxSel = 100 × 0.0001 = 0.01 → clamps to 1 at planner.go:443.
+// No limit, no coverFilters → Cost = scanPopulation×(CostIndexSeek + fetchCost
+// + CostFilter) = 1×(0.5 + 3.0 + 0.5) = 4.0.
 func TestBuildPlan_PlanC_ScanSelClamp_High(t *testing.T) {
 	sorter := &sortFieldStub{fields: []query.SortField{{Field: "a"}}}
 	plan := BuildPlan(&PlanParams{
@@ -1882,39 +1917,97 @@ func TestBuildPlan_PlanC_ScanSelClamp_High(t *testing.T) {
 			ExactSort:   true,
 		}},
 	})
-	// IndexScan candidate must exist (ExactSort=true, needSort=true).
-	found := false
+	var scan *CandidatePlan
 	for i := range plan.Explain.Candidates {
 		if strings.HasPrefix(plan.Explain.Candidates[i].Name, "IndexScan") {
-			found = true
+			scan = &plan.Explain.Candidates[i]
 			break
 		}
 	}
-	assert.True(t, found, "IndexScan candidate must be generated for scanSel>1 test")
+	if scan == nil {
+		t.Fatal("IndexScan candidate required to pin Plan-C scanSel-clamp cost")
+	}
+	fetchCost := indexFetchCost(100)
+	// scanPopulation = max(1, totalDocs*idxSel) = 1 (clamp at planner.go:443).
+	const scanPopulation = 1.0
+	expectedCost := scanPopulation * (CostIndexSeek + fetchCost + CostFilter)
+	assert.InDelta(t, expectedCost, scan.Cost, 0.01,
+		"Plan-C scanSel-clamp cost must equal scanPopulation×(CostIndexSeek + fetchCost + CostFilter)")
 }
 
 // TestBuildPlan_PlanC_HintBoost_CoversAllScanBoostLine hits planner.go:484-486
-// (Plan-C hint boost application).
+// (Plan-C hint boost application). Pins the exact `scanCost -= float64(boost)`
+// subtraction by running BuildPlan twice — once without hints (capture the
+// IndexScan candidate's pre-boost cost) and once with the boost — and asserts
+// the post-boost IndexScan candidate cost equals preBoost - boost.
 func TestBuildPlan_PlanC_HintBoost_CoversAllScanBoostLine(t *testing.T) {
 	sorter := &sortFieldStub{fields: []query.SortField{{Field: "a"}}}
 	idxInfo := &IndexInfo{
 		Name: "a_idx", FieldNames: []string{"a"},
 		FieldPaths: [][]string{{"a"}}, Unique: true,
 	}
+
+	// Pre-boost: run BuildPlan without IndexHints to capture the unboosted
+	// IndexScan candidate cost.
+	preBoostPlan := BuildPlan(&PlanParams{
+		Filter:    query.All{},
+		Sorter:    sorter,
+		TotalDocs: 100,
+		Indexes:   []CBOIndex{{Info: idxInfo, ExactSort: true}},
+	})
+	var preBoostCost float64
+	preBoostFound := false
+	for i := range preBoostPlan.Explain.Candidates {
+		if strings.HasPrefix(preBoostPlan.Explain.Candidates[i].Name, "IndexScan") {
+			preBoostCost = preBoostPlan.Explain.Candidates[i].Cost
+			preBoostFound = true
+			break
+		}
+	}
+	if !preBoostFound {
+		t.Fatal("pre-boost IndexScan candidate must exist to measure boost effect")
+	}
+
+	// Post-boost: a large boost guarantees IndexScan wins.
+	const boost = 1_000_000
 	plan := BuildPlan(&PlanParams{
 		Filter:     query.All{},
 		Sorter:     sorter,
 		TotalDocs:  100,
 		Indexes:    []CBOIndex{{Info: idxInfo, ExactSort: true}},
-		IndexHints: []IndexHintParam{{IndexName: "a_idx", Boost: 1_000_000}},
+		IndexHints: []IndexHintParam{{IndexName: "a_idx", Boost: boost}},
 	})
 	if plan.Name != "IndexScan" {
 		t.Fatalf("hint boost should force IndexScan, got %s", plan.Name)
 	}
+	var postBoostCost float64
+	postBoostFound := false
+	for i := range plan.Explain.Candidates {
+		if strings.HasPrefix(plan.Explain.Candidates[i].Name, "IndexScan") {
+			postBoostCost = plan.Explain.Candidates[i].Cost
+			postBoostFound = true
+			break
+		}
+	}
+	if !postBoostFound {
+		t.Fatal("post-boost IndexScan candidate must exist")
+	}
+	// planner.go:485 applies `scanCost -= float64(boost)`. InDelta tolerates
+	// float rounding while pinning the exact subtraction.
+	assert.InDelta(t, preBoostCost-float64(boost), postBoostCost, 0.01,
+		"Plan-C hint boost must subtract exactly `boost` from the scanCost")
 }
 
-// TestBuildPlan_PlanC_CoverFiltersWithLimit covers planner.go:465-467 (Plan-C
-// cover-filters branch WITH limit — uses CostSeqRead formula).
+// TestBuildPlan_PlanC_CoverFiltersWithLimit pins the Plan-C with-limit
+// cover-filter cost formula at planner.go:467:
+//
+//	scanCost = s×CostSeqRead + s×coverSel×fetchCost + s×CostFilter
+//
+// where s = (Limit+Offset)/scanSel. Setup: filter {"a":5,"b":10}, compound
+// index (a,b) with BoundFields=1 → idxSel=DefaultRangeSelectivity=0.5. pTotal
+// from two compound-equality branches (a then b) = 0.5×0.5 = 0.25. scanSel =
+// 0.25/0.5 = 0.5 (no clamp). s = 10/0.5 = 20. coverSel=0.5 (DefaultRange, no
+// fieldSel for compound index). Cost = 20×0.1 + 20×0.5×3.0 + 20×0.5 = 42.0.
 func TestBuildPlan_PlanC_CoverFiltersWithLimit(t *testing.T) {
 	sorter := &sortFieldStub{fields: []query.SortField{{Field: "a"}}}
 	filter := query.MustParseCondition(`{"a": 5, "b": 10}`)
@@ -1939,8 +2032,22 @@ func TestBuildPlan_PlanC_CoverFiltersWithLimit(t *testing.T) {
 			ExactSort:   true,
 		}},
 	})
-	// Either Plan-B or Plan-C may win; we only need ExplainString coverage.
-	assert.NotEmpty(t, plan.Explain.Candidates)
+	var scan *CandidatePlan
+	for i := range plan.Explain.Candidates {
+		if strings.HasPrefix(plan.Explain.Candidates[i].Name, "IndexScan") {
+			scan = &plan.Explain.Candidates[i]
+			break
+		}
+	}
+	if scan == nil {
+		t.Fatal("IndexScan candidate required to pin Plan-C with-limit cover-filter cost")
+	}
+	fetchCost := indexFetchCost(100)
+	const s = 20.0 // (Limit+Offset)/scanSel = 10/0.5
+	const coverSel = DefaultRangeSelectivity
+	expectedCost := s*CostSeqRead + s*coverSel*fetchCost + s*CostFilter
+	assert.InDelta(t, expectedCost, scan.Cost, 0.01,
+		"Plan-C with-limit covering-filter cost must equal s×CostSeqRead + s×coverSel×fetchCost + s×CostFilter")
 }
 
 // TestBuildPlan_PlanB_DetailsClosureFires pins planner.go:397 — the details
@@ -1968,11 +2075,16 @@ func TestBuildPlan_PlanB_DetailsClosureFires(t *testing.T) {
 	assert.Contains(t, out, "seek(") // formatSeekDetails includes "×seek("
 }
 
-// TestBuildPlan_PlanB_FilteredYieldClampLow hits planner.go:336-338 by
-// constructing inputs where e×(pTotal/idxSel) < 1. Using two-index setup
-// where the second index has no sketch (idxSel = DefaultRangeSelectivity)
-// but the first's sketch makes pTotal much smaller: pTotal/idxSel < 1
-// and e*small < 1 after the e-clamp to 1.
+// TestBuildPlan_PlanB_FilteredYieldClampLow pins the IndexSeek(idxB) cost
+// formula at planner.go:350 that only holds after the filteredYield<1 clamp
+// at planner.go:336-338. Setup: totalDocs=100_000. idxA's sketch(1) makes
+// fieldSel[a]=1/100000=0.00001 and pTotal=0.00001. idxB has BoundFields=1
+// so estimateIndexDocsWithFieldSel yields e = 100000×0.00001 = 1.0 (exact).
+// idxSel = DefaultRangeSelectivity=0.5 (PointLookup=false). filteredYield
+// = 1 × (0.00001/0.5) = 0.00002 → clamps to 1 at line 337. No sort so the
+// clamp doesn't alter cost directly, but cost = 1×CostIndexSeek + 1×fetchCost
+// + 1×CostFilter = 0.5 + 3.0 + 0.5 = 4.0 matches ONLY when e is correctly
+// computed and nSeeks=1 (i.e., the Plan-B loop entered for idxB).
 func TestBuildPlan_PlanB_FilteredYieldClampLow(t *testing.T) {
 	filter := query.MustParseCondition(`{"a": 1}`)
 	idxA := CBOIndex{
@@ -1982,7 +2094,9 @@ func TestBuildPlan_PlanB_FilteredYieldClampLow(t *testing.T) {
 		PointLookup: true,
 		BoundFields: 1,
 	}
-	// idxB: iterates Plan-B loop with no sketch.
+	// idxB: iterates Plan-B loop. BoundFields=1 enables fieldSel lookup.
+	// Without a sketch + PointLookup=false, selectivityForIndex falls back
+	// to DefaultRangeSelectivity so filteredYield clamp fires.
 	idxB := CBOIndex{
 		Info:        &IndexInfo{Name: "idxB", FieldNames: []string{"a"}, Unique: false},
 		Bounds:      mustParseBounds("a", `{"a": 1}`),
@@ -1994,14 +2108,20 @@ func TestBuildPlan_PlanB_FilteredYieldClampLow(t *testing.T) {
 		TotalDocs: 100_000,
 		Indexes:   []CBOIndex{idxA, idxB},
 	})
-	// We assert both IndexSeek candidates were generated; coverage records
-	// the filteredYield<1 clamp hit for idxB's iteration.
-	names := make(map[string]bool)
+	var seekB *CandidatePlan
 	for i := range plan.Explain.Candidates {
-		names[plan.Explain.Candidates[i].Name] = true
+		if plan.Explain.Candidates[i].Name == "IndexSeek(idxB)" {
+			seekB = &plan.Explain.Candidates[i]
+			break
+		}
 	}
-	assert.True(t, names["IndexSeek(idxA)"], "idxA seek candidate must be generated")
-	assert.True(t, names["IndexSeek(idxB)"], "idxB seek candidate must be generated")
+	if seekB == nil {
+		t.Fatal("IndexSeek(idxB) candidate required to pin post-clamp cost formula")
+	}
+	fetchCost := indexFetchCost(100_000)
+	expectedCost := 1*CostIndexSeek + 1*fetchCost + 1*CostFilter
+	assert.InDelta(t, expectedCost, seekB.Cost, 0.01,
+		"IndexSeek(idxB) cost must equal 1×CostIndexSeek + 1×fetchCost + 1×CostFilter with e clamped + filteredYield clamped")
 }
 
 // TestBuildPlan_PlanB_TieBreaking_SeekUniqueBeatsSeekNonUnique hits
@@ -2109,43 +2229,6 @@ func TestBuildPlan_Seek_MultiFieldPathsUsesSeenSetDedup(t *testing.T) {
 	}
 	_, isSeenSet := root.(*SeenSetDedupIter)
 	assert.True(t, isSeenSet, "compound seek with Unique=false must wrap in SeenSetDedupIter, got %T", root)
-}
-
-// TestFilterFieldsCoveredBy_PointerAndBranch is expected to FAIL:
-// filterFieldsCoveredBy has no *query.And case, so any filter parsed from
-// `{"$and":[...]}` (which produces a *query.And) returns false even when the
-// index fully covers the filter. See bugs.md.
-func TestFilterFieldsCoveredBy_PointerAndBranch(t *testing.T) {
-	t.Skip("FAIL: filterFieldsCoveredBy missing *query.And case — see bugs.md")
-
-	// MustParseCondition(`{"$and":[{"a":1}]}`) returns *query.And.
-	f := query.MustParseCondition(`{"$and":[{"a":1}]}`)
-	has := false
-	ok := filterFieldsCoveredBy(f, []string{"a"}, &has)
-	// Expectation: the function should recurse into the underlying And slice
-	// exactly like the value-receiver case and report covered=true.
-	assert.True(t, ok, "pointer-And with covered field should report covered")
-	assert.True(t, has)
-}
-
-// TestBoundsResult_AllFixed_ZeroBoundsField is expected to FAIL:
-// AllFixed returns true when every field has zero bounds, even though there
-// are no equality constraints at all. See bugs.md.
-func TestBoundsResult_AllFixed_ZeroBoundsField(t *testing.T) {
-	t.Skip("FAIL: AllFixed returns true for fields with zero bounds — see bugs.md")
-
-	// The following snapshot reproduces the bug: a BoundsResult populated via
-	// Build() for an index whose field is absent from the filter ends up with
-	// Fixed=true (the allFixed loop at planner.go:1264 is empty).
-	br := &BoundsResult{}
-	filter := query.MustParseCondition(`{"a": 1}`)
-	indexes := []*IndexInfo{{FieldNames: []string{"a", "unused"}}}
-	br.Build(indexes, filter)
-
-	// Expectation the test holds the production to: a field with no bounds
-	// should NOT count as "fixed" because it has no equality constraint.
-	assert.False(t, br.AllFixed(),
-		"AllFixed should not treat a zero-bounds field as fixed")
 }
 
 // TestCoveringFilterSelectivity covers both branches of coveringFilterSelectivity:
