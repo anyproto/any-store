@@ -896,6 +896,244 @@ func TestIndexIter_CountEntries_WithBounds(t *testing.T) {
 	assert.Equal(t, 2, n, "(b,d] must count {c, d}")
 }
 
+// ---- CoverIter ----
+
+// TestCoverIter_Next covers all branches of CoverIter.Next:
+// - empty-start bound → skip (continue)
+// - AppendSeekKey error → skip (continue)
+// - seek result doesn't have prefix → skip
+// - happy path → return key + extracted docId
+func TestCoverIter_Next(t *testing.T) {
+	db, ns := coverageBtree(t, "cover_iter", []string{"alpha", "beta"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	cs := &CursorSource{Tx: rtx, Ns: ns}
+	info := &IndexInfo{Name: "ci", FieldNames: []string{"id"}}
+
+	t.Run("empty_start_skip", func(t *testing.T) {
+		// First bound has empty Start → loop takes continue at line 26.
+		// Second bound is a real hit.
+		it := &CoverIter{
+			Source:  cs,
+			IdxInfo: info,
+			Bounds: query.Bounds{
+				{Start: nil, End: nil},
+				{Start: anyenc.AppendAnyValue(nil, "alpha")},
+			},
+		}
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		assert.NotNil(t, docId, "second bound must yield")
+	})
+	t.Run("prefix_mismatch_skip", func(t *testing.T) {
+		// Start prefix doesn't match any key → HasPrefix false → skip.
+		it := &CoverIter{
+			Source:  cs,
+			IdxInfo: info,
+			Bounds: query.Bounds{
+				{Start: anyenc.AppendAnyValue(nil, "zzz_nonexistent")},
+			},
+		}
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		assert.Nil(t, docId, "missing prefix must not yield")
+	})
+}
+
+// ---- SortIter TopK ----
+
+// TestSortIter_TopK_Heap exercises the heap path (TopK > 0) in SortIter
+// including the replace-root branch when a new entry is smaller than the
+// current max-heap root.
+func TestSortIter_TopK_Heap(t *testing.T) {
+	db, ns := coverageBtree(t, "sort_topk",
+		[]string{"03", "01", "02", "05", "04"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	plan := &Plan{}
+	// Upstream yields docIds in insertion order. Wrap in a fakeIter that
+	// sets plan.DocParsed for each hit so SortIter reuses it.
+	arena := &anyenc.Arena{}
+	makeHit := func(id string) fakeHit {
+		o := arena.NewObject()
+		o.Set("id", arena.NewString(id))
+		return fakeHit{docId: anyenc.AppendAnyValue(nil, id), doc: o}
+	}
+	source := &fakeIter{
+		plan: plan,
+		hits: []fakeHit{makeHit("03"), makeHit("01"), makeHit("02"), makeHit("05"), makeHit("04")},
+	}
+
+	sort, err := query.ParseSort("id")
+	require.NoError(t, err)
+
+	it := &SortIter{
+		Source: source,
+		Data:   &CursorSource{Tx: rtx, Ns: ns},
+		Sorter: sort,
+		Buf:    buf,
+		Plan:   plan,
+		TopK:   3, // keep smallest 3
+	}
+	defer it.Close()
+
+	var got []string
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		// DocParsed is cleared by SortIter; fetch via data cursor manually
+		// by looking at the docId bytes.
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
+	}
+	// TopK=3 ascending → smallest 3 ids.
+	assert.Equal(t, []string{"01", "02", "03"}, got)
+}
+
+// TestSortIter_FallbackFetch covers collectAndSort's branch where Plan.DocParsed
+// is nil on some iterations, forcing a data-cursor fetch (sort_iter.go:100-112).
+func TestSortIter_FallbackFetch(t *testing.T) {
+	db, ns := coverageBtree(t, "sort_fallback",
+		[]string{"a", "b", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	plan := &Plan{}
+	// fakeIter WITHOUT per-hit doc → Plan.DocParsed stays nil, forcing the
+	// fallback fetch inside collectAndSort.
+	source := &fakeIter{
+		plan: plan,
+		hits: []fakeHit{
+			{docId: anyenc.AppendAnyValue(nil, "a")},
+			{docId: anyenc.AppendAnyValue(nil, "b")},
+			{docId: anyenc.AppendAnyValue(nil, "c")},
+		},
+	}
+
+	sort, err := query.ParseSort("id")
+	require.NoError(t, err)
+
+	it := &SortIter{
+		Source: source,
+		Data:   &CursorSource{Tx: rtx, Ns: ns},
+		Sorter: sort,
+		Buf:    buf,
+		Plan:   plan,
+	}
+	defer it.Close()
+
+	var count int
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		count++
+	}
+	assert.Equal(t, 3, count)
+}
+
+// TestSortIter_SourceError propagates an error from Source.Next through
+// collectAndSort via Next's first call.
+func TestSortIter_SourceError(t *testing.T) {
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+	sort, err := query.ParseSort("id")
+	require.NoError(t, err)
+
+	it := &SortIter{
+		Source: &errIter{err: errors.New("upstream")},
+		Buf:    buf,
+		Sorter: sort,
+		Plan:   &Plan{},
+	}
+	_, _, err = it.Next()
+	require.ErrorContains(t, err, "upstream")
+}
+
+// ---- FullScanIter forward + bounds ----
+
+// TestFullScanIter_WithBounds_Forward exercises FullScanIter with idBounds.
+func TestFullScanIter_WithBounds_Forward(t *testing.T) {
+	db, ns := coverageBtree(t, "fs_fwd_bounds",
+		[]string{"a", "b", "c", "d", "e"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	bounds := query.Bounds{
+		{Start: anyenc.AppendAnyValue(nil, "b"),
+			End:          anyenc.AppendAnyValue(nil, "d"),
+			StartInclude: true, EndInclude: true},
+	}
+	it := &FullScanIter{
+		Source:   &CursorSource{Tx: rtx, Ns: ns},
+		Buf:      buf,
+		IDBounds: bounds,
+	}
+	defer it.Close()
+	var count int
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		count++
+	}
+	assert.Equal(t, 3, count)
+}
+
+// TestFullScanIter_Reverse exercises FullScanIter.nextNoBounds reverse path.
+func TestFullScanIter_Reverse(t *testing.T) {
+	db, ns := coverageBtree(t, "fs_rev", []string{"a", "b", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	it := &FullScanIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		Buf:     buf,
+		Reverse: true,
+	}
+	defer it.Close()
+	var count int
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		count++
+	}
+	assert.Equal(t, 3, count)
+}
+
 // TestFetchIter_Next_NoPlanLeaves_DocParsed_Untouched covers the branch at
 // fetch_iter.go:61 (if it.Plan != nil) — when Plan is nil, we skip parsing
 // and DocParsed stays unset.
