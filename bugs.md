@@ -55,6 +55,27 @@ that are structurally identical to comma-spelled `{"a":1,"b":2}` filters.
   There is no combination that makes the running product `<= 0` at the outer
   check. Defensive dead code.
 
+- `internal/qplanner/planner.go:374-376` — `if s < 1 { s = 1 }` in Plan-B
+  ExactSort+Limit branch. `s = float64(params.Limit+params.Offset) / scanSel`.
+  The Plan-B branch is gated on `params.Limit > 0` (line 362), so
+  `params.Limit+params.Offset ≥ 1`. `scanSel` is clamped to ≤ 1.0 by the
+  preceding block (line 364-366). Therefore `s = (≥1) / (≤1) ≥ 1` always.
+  Defensive dead code.
+
+- `internal/qplanner/planner.go:461-463` — `if s < 1 { s = 1 }` in Plan-C
+  LIMIT branch. Same reasoning as above: `s = (params.Limit+params.Offset) / scanSel`
+  with `params.Limit > 0` (outer gate at line 455) and `scanSel ≤ 1.0` (clamp
+  at 432-434). Defensive dead code.
+
+- `internal/qplanner/planner.go:442-444` — `if scanPopulation < 1 { scanPopulation = 1 }`
+  in Plan-C. `scanPopulation = totalDocs * idxSel`. `totalDocs` is clamped up
+  to 1 at line 224-226, and `idxSel` from `selectivityForIndex` has a low
+  clamp at 0.0001. Product ≥ 0.0001; it CAN drop below 1 when totalDocs is
+  small (e.g. totalDocs=1, idxSel=0.0001 → scanPopulation=0.0001). This
+  branch IS reachable in principle, but requires pathological inputs that
+  the planner is unlikely to receive in practice; unit tests to force the
+  combination are fragile — see planner_test.go integration tests.
+
 - `internal/qplanner/planner.go:347-348` — `if nSeeks < 1 { nSeeks = 1 }` in the
   Plan-B loop. The outer `if len(idx.Bounds) == 0 { continue }` at line 323
   already skips indexes with no bounds, so `len(idx.Bounds) >= 1` and
