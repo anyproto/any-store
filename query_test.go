@@ -435,14 +435,12 @@ func TestQuery_IsIDOnlyFilterNode_And_Direct(t *testing.T) {
 	assert.False(t, isIDOnlyFilterNode(query.And{}), "empty And is not id-only")
 }
 
-// TestQuery_IsIDOnlyFilterNode_PointerAnd_FAIL is expected to fail: the
-// isIDOnlyFilterNode switch only handles the value receiver query.And,
-// not the pointer *query.And that query.ParseCondition produces for
-// `{"$and": [...]}` JSON. This is the same asymmetry documented in bugs.md
-// for qplanner's filterFieldsCoveredBy.
-func TestQuery_IsIDOnlyFilterNode_PointerAnd_FAIL(t *testing.T) {
-	t.Skip("FAIL: isIDOnlyFilterNode missing *query.And case — see bugs.md")
-
+// TestQuery_IsIDOnlyFilterNode_PointerAnd verifies the *query.And pointer-arm
+// added to isIDOnlyFilterNode: query.MustParseCondition produces *query.And
+// for `{"$and": [...]}` JSON, and that filter should hit the id-only fast
+// path just like the value-receiver query.And emitted for comma-spelled
+// filters. Sister test to planner.go's filterFieldsCoveredBy pointer arm.
+func TestQuery_IsIDOnlyFilterNode_PointerAnd(t *testing.T) {
 	// MustParseCondition produces *query.And for $and JSON.
 	f := query.MustParseCondition(`{"$and":[{"id":"a"},{"id":"b"}]}`)
 	assert.True(t, isIDOnlyFilterNode(f), "pointer-And with id-only children should match")

@@ -1131,6 +1131,17 @@ func filterFieldsCoveredBy(f query.Filter, idxFields []string, hasFields *bool) 
 			}
 		}
 		return true
+	case *query.And:
+		// Symmetric with collectUncoveredFilterFields's pointer arm.
+		// query.MustParseCondition produces *query.And for `{"$and":[...]}`
+		// (see query/cond_parse.go:103), so without this case the covering-
+		// count fast path is silently disabled for $and-spelled filters.
+		for _, sub := range *ft {
+			if !filterFieldsCoveredBy(sub, idxFields, hasFields) {
+				return false
+			}
+		}
+		return true
 	default:
 		return false
 	}
@@ -1266,6 +1277,12 @@ func (br *BoundsResult) Build(indexInfos []*IndexInfo, filter query.Filter) {
 					allFixed = false
 					break
 				}
+			}
+			// A field with zero bounds has no equality constraint and must not
+			// be reported as "fixed" (see AllFixed's godoc). Without this guard
+			// the loop above is skipped and allFixed stays true.
+			if count == 0 {
+				allFixed = false
 			}
 			br.Fields = append(br.Fields, FieldBounds{
 				Field: field,

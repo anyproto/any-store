@@ -1788,16 +1788,22 @@ func TestFilterFieldsCoveredBy(t *testing.T) {
 		// Pin the current behavior so a future refactor can't silently drop it.
 		assert.True(t, has, "hasFields must retain its value from the matched first child")
 	})
-	t.Run("pointer_and_falls_through_default", func(t *testing.T) {
-		// filterFieldsCoveredBy has no `case *query.And`, so a pointer-And
-		// hits the default branch and returns false. This pins the current
-		// behavior; the asymmetry with collectUncoveredFilterFields is
-		// documented in bugs.md.
+	t.Run("pointer_and_recurses", func(t *testing.T) {
+		// filterFieldsCoveredBy now handles `case *query.And` (symmetric with
+		// collectUncoveredFilterFields) so $and-spelled filters that parse to
+		// *query.And enjoy the covering-count fast path too.
 		inner := query.And{query.MustParseCondition(`{"a": 1}`)}
 		has := false
 		ok := filterFieldsCoveredBy(&inner, []string{"a"}, &has)
+		assert.True(t, ok, "pointer-And with covered child should report covered")
+		assert.True(t, has)
+	})
+	t.Run("pointer_and_uncovered", func(t *testing.T) {
+		// Pointer-And with an uncovered child must short-circuit to false.
+		inner := query.And{query.MustParseCondition(`{"z": 1}`)}
+		has := false
+		ok := filterFieldsCoveredBy(&inner, []string{"a"}, &has)
 		assert.False(t, ok)
-		assert.False(t, has, "default branch must not set hasFields")
 	})
 	t.Run("default_unsupported", func(t *testing.T) {
 		// Or is unsupported by filterFieldsCoveredBy → default branch returns false.
@@ -3834,4 +3840,37 @@ func TestIdBoundsPreferred(t *testing.T) {
 		b := query.Bound{Start: []byte{1, 2, 3}, End: []byte{1, 2, 3}}
 		assert.True(t, idBoundsPreferred(query.Bounds{b}))
 	})
+}
+
+// TestFilterFieldsCoveredBy_PointerAndBranch covers the *query.And arm of
+// filterFieldsCoveredBy. query.MustParseCondition produces *query.And for
+// `{"$and":[...]}` JSON syntax; without the pointer arm the covering-count
+// fast path was silently disabled for any such filter.
+func TestFilterFieldsCoveredBy_PointerAndBranch(t *testing.T) {
+	// MustParseCondition(`{"$and":[{"a":1}]}`) returns *query.And.
+	f := query.MustParseCondition(`{"$and":[{"a":1}]}`)
+	has := false
+	ok := filterFieldsCoveredBy(f, []string{"a"}, &has)
+	// The function should recurse into the underlying And slice exactly like
+	// the value-receiver case and report covered=true.
+	assert.True(t, ok, "pointer-And with covered field should report covered")
+	assert.True(t, has)
+}
+
+// TestBoundsResult_AllFixed_ZeroBoundsField verifies AllFixed no longer
+// reports "fixed" for a field that has zero bounds. The previous behaviour
+// contradicted AllFixed's godoc ("all fields have equality bounds") because
+// the allFixed-computation loop was skipped for zero-count fields.
+func TestBoundsResult_AllFixed_ZeroBoundsField(t *testing.T) {
+	// A BoundsResult populated via Build() for an index whose second field
+	// ("unused") is absent from the filter must not count that field as fixed.
+	br := &BoundsResult{}
+	filter := query.MustParseCondition(`{"a": 1}`)
+	indexes := []*IndexInfo{{FieldNames: []string{"a", "unused"}}}
+	br.Build(indexes, filter)
+
+	// A field with no bounds should NOT count as "fixed" — no equality
+	// constraint is present.
+	assert.False(t, br.AllFixed(),
+		"AllFixed should not treat a zero-bounds field as fixed")
 }
