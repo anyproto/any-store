@@ -1237,6 +1237,181 @@ func TestIndexIter_Forward_StartIncludeTrue(t *testing.T) {
 	assert.Equal(t, 2, count, "[b,inf) must yield {b, c}")
 }
 
+// TestIndexIter_Reverse_EndPastLastKey covers index_iter.go:64-67 — reverse
+// scan where Seek(End) lands past the last key, triggering cursor.Last() fallback.
+func TestIndexIter_Reverse_EndPastLastKey(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_rev_past_end", []string{"a", "b", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	// End = "z" — past every key. Seek("z") → invalid cursor → Last().
+	bound := query.Bound{
+		Start:        anyenc.AppendAnyValue(nil, "a"),
+		End:          anyenc.AppendAnyValue(nil, "zzz"),
+		StartInclude: true,
+		EndInclude:   true,
+	}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+		Reverse: true,
+	}
+	defer it.Close()
+	var count int
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		count++
+	}
+	assert.Equal(t, 3, count, "reverse [a,zzz] must yield all 3 docs via Last() fallback")
+}
+
+// TestIndexIter_Reverse_EndExclusiveBackUp covers index_iter.go:74-78 — reverse
+// scan where Seek(End) lands exactly on End but EndInclude=false, so we
+// call Previous to back up.
+func TestIndexIter_Reverse_EndExclusiveBackUp(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_rev_excl_end", []string{"a", "b", "c", "d"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	// End = "c", EndInclude=false. Seek("c") lands on "c" (cmp==0), backs up.
+	bound := query.Bound{
+		Start:        anyenc.AppendAnyValue(nil, "a"),
+		End:          anyenc.AppendAnyValue(nil, "c"),
+		StartInclude: true,
+		EndInclude:   false,
+	}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+		Reverse: true,
+	}
+	defer it.Close()
+	var count int
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		count++
+	}
+	assert.Equal(t, 2, count, "reverse [a,c) must yield {b, a}")
+}
+
+// TestIndexIter_Reverse_NoEnd covers index_iter.go:82-84 — reverse scan
+// with empty End, falls through to cursor.Last().
+func TestIndexIter_Reverse_NoEnd(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_rev_no_end", []string{"a", "b", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{
+		Start:        anyenc.AppendAnyValue(nil, "a"),
+		End:          nil, // no upper bound
+		StartInclude: true,
+	}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+		Reverse: true,
+	}
+	defer it.Close()
+	var count int
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		count++
+	}
+	assert.Equal(t, 3, count, "reverse [a,inf] must yield all 3 docs")
+}
+
+// TestFullScanIter_Reverse_EndPastLastKey covers fullscan_iter.go:129-132 —
+// reverse scan, IDBounds with End past the last key → invalid cursor → Last()
+// fallback.
+func TestFullScanIter_Reverse_EndPastLastKey(t *testing.T) {
+	db, ns := coverageBtree(t, "fs_rev_past_end", []string{"a", "b", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	bound := query.Bound{
+		Start:        anyenc.AppendAnyValue(nil, "a"),
+		End:          anyenc.AppendAnyValue(nil, "zzz"),
+		StartInclude: true,
+		EndInclude:   true,
+	}
+	it := &FullScanIter{
+		Source:   &CursorSource{Tx: rtx, Ns: ns},
+		Buf:      buf,
+		IDBounds: query.Bounds{bound},
+		Reverse:  true,
+	}
+	defer it.Close()
+	var count int
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		count++
+	}
+	assert.Equal(t, 3, count)
+}
+
+// TestFullScanIter_Forward_StartExclusive covers fullscan_iter.go:156-166 —
+// forward with Start + StartInclude=false.
+func TestFullScanIter_Forward_StartExclusive(t *testing.T) {
+	db, ns := coverageBtree(t, "fs_fwd_excl_start", []string{"a", "b", "c", "d"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	bound := query.Bound{
+		Start:        anyenc.AppendAnyValue(nil, "b"),
+		End:          anyenc.AppendAnyValue(nil, "d"),
+		StartInclude: false,
+		EndInclude:   true,
+	}
+	it := &FullScanIter{
+		Source:   &CursorSource{Tx: rtx, Ns: ns},
+		Buf:      buf,
+		IDBounds: query.Bounds{bound},
+	}
+	defer it.Close()
+	var count int
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		count++
+	}
+	assert.Equal(t, 2, count, "(b,d] must yield {c, d}")
+}
+
 // TestFetchIter_Next_NoPlanLeaves_DocParsed_Untouched covers the branch at
 // fetch_iter.go:61 (if it.Plan != nil) — when Plan is nil, we skip parsing
 // and DocParsed stays unset.
