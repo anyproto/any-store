@@ -75,6 +75,26 @@ that are structurally identical to comma-spelled `{"a":1,"b":2}` filters.
   input; requires knowledge of s2 framing which is out of scope for a
   pure-Go test suite that consumes its own encoder's output.
 
+- `internal/qplanner/fullscan_iter.go` — cursor-error arms
+  (`cursor.First/Last/Next/Previous/Seek` returning errors, `cursor.Key`
+  errors). The happy paths and bound-clamping are all covered; the error
+  returns require a btree cursor failure that has no public injection seam.
+
+- `internal/qplanner/index_iter.go` — same as above for IndexIter's cursor
+  error arms across seek/forward/reverse variants.
+
+- `internal/qplanner/filter_iter.go:96-102` — `Parser.ParseOwned` error
+  branch and cursor-level AppendValue failures other than ErrKeyNotFound.
+  Require corrupted stored docs; no injection seam.
+
+- `internal/qplanner/sort_iter.go:141-150` — `heapUp` else-break branch
+  occurs only when heapLess is false at every step of ascent. Reachable
+  in principle but would require scripted heap states that bypass the
+  SortIter public API; limited coverage value.
+
+- `internal/qplanner/cover_iter.go:32-33` — `AppendSeekKey` error branch
+  (continues the loop). Requires btree read error; no injection seam.
+
 - `iterator.go:107-109` — `if perr != nil { return nil, perr }` in the Doc()
   fallback. Requires `Parser.ParseOwned` to fail on a document stored via
   the normal write path. No public seam to inject.
