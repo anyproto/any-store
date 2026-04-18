@@ -1138,6 +1138,105 @@ func TestFullScanIter_Reverse(t *testing.T) {
 		"reverse scan must yield descending key order, not just 3 docs")
 }
 
+// TestFullScanIter_WithFilter exercises FullScanIter.nextNoBounds with a
+// filter that accepts some docs and rejects others.
+func TestFullScanIter_WithFilter(t *testing.T) {
+	db, ns := coverageBtree(t, "fs_with_filter", []string{"a", "b", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	it := &FullScanIter{
+		Source: &CursorSource{Tx: rtx, Ns: ns},
+		Buf:    buf,
+		Filter: query.MustParseCondition(`{"id":"b"}`),
+	}
+	defer it.Close()
+	var got []string
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
+	}
+	assert.Equal(t, []string{"b"}, got,
+		"filter must reject a and c, yield only b")
+}
+
+// TestFullScanIter_Reverse_WithBounds exercises the reverse-with-bounds path.
+func TestFullScanIter_Reverse_WithBounds(t *testing.T) {
+	db, ns := coverageBtree(t, "fs_rev_bounds",
+		[]string{"a", "b", "c", "d", "e"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	sp := syncpool.NewSyncPool(1024)
+	buf := sp.GetDocBuf()
+	defer sp.ReleaseDocBuf(buf)
+
+	bounds := query.Bounds{
+		{Start: anyenc.AppendAnyValue(nil, "b"),
+			End:          anyenc.AppendAnyValue(nil, "d"),
+			StartInclude: true, EndInclude: true},
+	}
+	it := &FullScanIter{
+		Source:   &CursorSource{Tx: rtx, Ns: ns},
+		Buf:      buf,
+		IDBounds: bounds,
+		Reverse:  true,
+	}
+	defer it.Close()
+	var got []string
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
+	}
+	assert.Equal(t, []string{"d", "c", "b"}, got,
+		"[b,d] reverse must yield d,c,b")
+}
+
+// TestIndexIter_Forward_StartIncludeTrue covers the branch where the seek
+// lands exactly on Start AND StartInclude=true, so the no-skip path at
+// index_iter.go:91-96 short-circuits without calling cursor.Next.
+func TestIndexIter_Forward_StartIncludeTrue(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_start_incl", []string{"b", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{
+		Start:        anyenc.AppendAnyValue(nil, "b"),
+		StartInclude: true,
+	}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+	}
+	defer it.Close()
+	var count int
+	for {
+		_, docId, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		count++
+	}
+	assert.Equal(t, 2, count, "[b,inf) must yield {b, c}")
+}
+
 // TestFetchIter_Next_NoPlanLeaves_DocParsed_Untouched covers the branch at
 // fetch_iter.go:61 (if it.Plan != nil) — when Plan is nil, we skip parsing
 // and DocParsed stays unset.
