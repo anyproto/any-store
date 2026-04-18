@@ -1507,44 +1507,25 @@ func TestBuildVerifyChain_RangeBoundSkipsVerify(t *testing.T) {
 	assert.Nil(t, got, "range bound on uncovered field → verification unsafe, return nil")
 }
 
-// TestCalculateSelectivity_PTotalClamps exercises the two outer clamps at
-// planner.go:669 (p<=0 → p=0.0001) and planner.go:672 (p>1.0 → p=1.0) in
-// calculateSelectivity. The first is reached when a sketch causes a zero
-// probability to propagate; the second when the running product exceeds 1.0
-// (impossible with typical inputs but the clamp still exists as a guard).
-func TestCalculateSelectivity_PTotalClamps(t *testing.T) {
-	// `pTotal <= 0` clamp: sketch with est=0 on a single-field index causes
-	// p=0, which is then clamped to 0.0001.
-	t.Run("p_clamped_high_by_index_sketch", func(t *testing.T) {
-		// Stack two equality predicates where each product stays <= 1.
-		f := query.MustParseCondition(`{"a": 1}`)
-		idx := CBOIndex{
-			Info:   &IndexInfo{Name: "a", FieldNames: []string{"a"}},
-			Sketch: mockSketch(50), // p = 50/100 = 0.5
-		}
-		br := &BoundsResult{}
-		br.Build([]*IndexInfo{idx.Info}, f)
-		// Not >1 here; just sanity check no clamp regression.
-		sel := calculateSelectivity(f, []CBOIndex{idx}, 100, br)
-		assert.InDelta(t, 0.5, sel, 1e-9)
-	})
-	t.Run("p_clamped_low_when_product_zero", func(t *testing.T) {
-		// Two independent fields, one with sketch(0), one without sketch:
-		// pTotal = 0 * DefaultRangeSelectivity = 0 → clamped to 0.0001.
-		f := query.MustParseCondition(`{"a": 1, "b": 2}`)
-		idxA := CBOIndex{
-			Info:   &IndexInfo{Name: "a", FieldNames: []string{"a"}},
-			Sketch: mockSketch(0), // p=0 → clamped inside the sketch branch
-		}
-		idxB := CBOIndex{Info: &IndexInfo{Name: "b", FieldNames: []string{"b"}}}
-		br := &BoundsResult{}
-		br.Build([]*IndexInfo{idxA.Info, idxB.Info}, f)
-		sel := calculateSelectivity(f, []CBOIndex{idxA, idxB}, 1000, br)
-		// Each field contributes: a -> 0.0001 (inside sketch clamp);
-		// b -> DefaultRangeSelectivity.
-		// Product passes the >0, <1 upper clamp unchanged.
-		assert.InDelta(t, 0.0001*DefaultRangeSelectivity, sel, 1e-9)
-	})
+// TestCalculateSelectivity_InnerSketchClampPropagates pins the cumulative
+// effect of the inner per-field sketch clamp (planner.go:648-650) multiplied
+// by a subsequent DefaultRangeSelectivity contribution. The outer
+// `pTotal <= 0` and `pTotal > 1.0` clamps at planner.go:669-675 appear to be
+// unreachable from calculateSelectivity itself (see bugs.md UNREACHABLE).
+func TestCalculateSelectivity_InnerSketchClampPropagates(t *testing.T) {
+	// Two independent equality predicates. a has sketch(0) → inner clamp
+	// yields 0.0001; b has no sketch → compound-equality branch contributes
+	// DefaultRangeSelectivity. Product is 0.0001 * DefaultRangeSelectivity.
+	f := query.MustParseCondition(`{"a": 1, "b": 2}`)
+	idxA := CBOIndex{
+		Info:   &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+		Sketch: mockSketch(0),
+	}
+	idxB := CBOIndex{Info: &IndexInfo{Name: "b", FieldNames: []string{"b"}}}
+	br := &BoundsResult{}
+	br.Build([]*IndexInfo{idxA.Info, idxB.Info}, f)
+	sel := calculateSelectivity(f, []CBOIndex{idxA, idxB}, 1000, br)
+	assert.InDelta(t, 0.0001*DefaultRangeSelectivity, sel, 1e-9)
 }
 
 // TestBuildPlan_CountOnly_NonCoveringWithVerifyChain exercises the path at
@@ -1552,8 +1533,10 @@ func TestCalculateSelectivity_PTotalClamps(t *testing.T) {
 // building a plan that enters buildIndexSeekChain and takes the verify-chain
 // branch (returns non-nil VerifyIter root).
 func TestBuildPlan_CountOnly_NonCoveringWithVerifyChain(t *testing.T) {
-	// Open a btree namespace to use as verify target.
-	_, _, verifyNs := openBtreeForVerify(t, "verify_chain_bp", func(tx *btree.WriteTx, ns *btree.Namespace) {})
+	// buildVerifyChain only stores info.Ns as a pointer into VerifyIter.VerifyNs;
+	// no btree I/O happens during BuildPlan. A zero-value *btree.Namespace
+	// satisfies the non-nil check without the cost of opening a real DB.
+	verifyNs := &btree.Namespace{}
 
 	filter := query.MustParseCondition(`{"a": 1, "b": 2}`)
 	primaryInfo := &IndexInfo{
@@ -1616,18 +1599,16 @@ func TestBuildPlan_FullScanOffsetAbsorbed(t *testing.T) {
 	}
 }
 
-// TestBuildPlan_IndexSeek_NonExactSort_WrapsSort covers planner.go:951-960
-// (SortIter wrapping when the chosen seek index does NOT provide the sort
-// order). It also exercises planner.go:858 (CoverIter needSort branch) when
-// the CoverIter fast-path applies.
+// TestBuildPlan_IndexSeek_NonExactSort_WrapsSort exercises the SortIter
+// wrapping in buildIndexSeekChain's general path (planner.go:951-963),
+// bypassing the CoverIter fast-path at planner.go:837 by using a non-unique
+// index (Unique=false defeats the CoverIter condition).
 func TestBuildPlan_IndexSeek_NonExactSort_WrapsSort(t *testing.T) {
-	// Unique single-field index: triggers CoverIter at planner.go:837.
-	// Sort is on field "b" (not the index field), so idx.ExactSort=false →
-	// SortIter wrap path.
 	sorter := &sortFieldStub{fields: []query.SortField{{Field: "b"}}}
 	filter := query.MustParseCondition(`{"a": 1}`)
 	idxInfo := &IndexInfo{
-		Name: "a", FieldNames: []string{"a"}, FieldPaths: [][]string{{"a"}}, Unique: true,
+		Name: "a", FieldNames: []string{"a"}, FieldPaths: [][]string{{"a"}},
+		Unique: false, // must NOT be Unique → skips CoverIter fast-path
 	}
 	plan := BuildPlan(&PlanParams{
 		Filter:    filter,
@@ -1645,7 +1626,7 @@ func TestBuildPlan_IndexSeek_NonExactSort_WrapsSort(t *testing.T) {
 	if plan.Name != "IndexSeek" {
 		t.Fatalf("BuildPlan chose %s; expected IndexSeek", plan.Name)
 	}
-	// Walk to find a SortIter somewhere in the chain.
+	// Walk past LimitIter to the first non-wrapper node.
 	root := plan.Root
 	if li, ok := root.(*LimitIter); ok {
 		root = li.Source
@@ -1654,31 +1635,28 @@ func TestBuildPlan_IndexSeek_NonExactSort_WrapsSort(t *testing.T) {
 	assert.True(t, isSortIter, "seek chain with non-exact sort must wrap in SortIter, got %T", root)
 }
 
-// TestBuildPlan_TieBreakingPrefersSeek covers planner.go:402-412 tie-breaking:
-// when seekCost equals bestCost from FullScan, seek wins. Construct inputs so
-// both candidates produce the same cost (tight control requires exact sketch
-// math; we use a balanced setup).
-func TestBuildPlan_TieBreakingPrefersSeek(t *testing.T) {
-	// The tie-breaking condition is `bestPlanName == "FullScan"`, so a seek
-	// with cost == fullScanCost should win. Use a zero-doc collection: both
-	// costs collapse to similar small values.
+// TestBuildPlan_IndexHintBoost covers planner.go:388-390 (seek cost reduced
+// by hint boost) and planner.go:483-486 (scan cost reduced by hint boost).
+// A large boost forces the hinted index to win over cheaper alternatives.
+func TestBuildPlan_IndexHintBoost(t *testing.T) {
+	// FullScan on 100 docs is cheap. Apply a large negative-cost boost to
+	// the index seek so it wins the CBO.
 	filter := query.MustParseCondition(`{"a": 1}`)
 	idx := CBOIndex{
 		Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}, Unique: false},
-		Sketch:      mockSketch(1),
+		Sketch:      mockSketch(50),
 		Bounds:      mustParseBounds("a", `{"a": 1}`),
 		PointLookup: true,
 		BoundFields: 1,
 	}
 	plan := BuildPlan(&PlanParams{
-		Filter:    filter,
-		TotalDocs: 1,
-		Indexes:   []CBOIndex{idx},
+		Filter:     filter,
+		TotalDocs:  100,
+		Indexes:    []CBOIndex{idx},
+		IndexHints: []IndexHintParam{{IndexName: "a", Boost: 1_000_000}},
 	})
-	// With totalDocs=1, both FullScan and IndexSeek are trivially cheap.
-	// IndexSeek should still win due to tie-breaking OR natural cost advantage.
-	assert.Contains(t, []string{"IndexSeek", "FullScan"}, plan.Name,
-		"plan must be one of the basic kinds for a trivial setup")
+	assert.Equal(t, "IndexSeek", plan.Name,
+		"large hint boost must force IndexSeek to win over FullScan")
 }
 
 // TestFilterFieldsCoveredBy_PointerAndBranch is expected to FAIL:
