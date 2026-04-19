@@ -1346,7 +1346,8 @@ thanks to three mechanisms:
 
 **Internal retry in `DB.BeginWrite`**: When `ErrBusySnapshot` is returned, the
 retry loop ends the stale read, clears `writerCache`, and re-calls
-`pager.beginRead` to get a fresh snapshot (max 5 attempts).
+`pager.beginRead` to get a fresh snapshot (max `maxBusySnapshotRetries` = 1000
+attempts; see `db.go`).
 
 **`writeHeader` parameterization**: `walIndex.writeHeader` now accepts explicit
 `frameCksum` and `salt` parameters so the SHM header always contains the correct
@@ -1375,8 +1376,8 @@ writes to the same database file concurrently with the parent.
    this differently).
 
 4. **Internal retry**: SQLite returns `SQLITE_BUSY_SNAPSHOT` to the application,
-   requiring it to retry. We retry internally in `DB.BeginWrite` (max 5 attempts)
-   for ergonomic API.
+   requiring it to retry. We retry internally in `DB.BeginWrite`
+   (`maxBusySnapshotRetries` = 1000) for ergonomic API.
 
 5. **readSnapshot saved in pager.beginWrite**: SQLite saves `pWal->hdr` in
    `walTryBeginRead` (called from any connection). We save `readSnapshot` in
@@ -1409,12 +1410,14 @@ below for why cold-open was attempted and reverted.
    non-blocking `F_SETLK`; under contention with `checkpointWithMode` (which
    uses `CKPT → WRITE` order) the loser observes `ErrBusy` — no deadlock.
 
-2. **`errBusyRecovery` vs `errWALRetry`**: SQLite returns
-   `SQLITE_BUSY_RECOVERY` when another process is actively recovering (wal.c:
-   3089-3094 via `walLockShared` probe). Our helper distinguishes the two:
-   `errBusyRecovery` = peer is recovering (warrant backoff); `errWALRetry` =
-   transient race (immediate retry). Current callers (test-only) don't use
-   the distinction.
+2. **Collapsed retry signaling**: SQLite returns `SQLITE_BUSY_RECOVERY` when
+   another process is actively recovering (wal.c:3089-3094 via `walLockShared`
+   probe) and distinguishes it from a transient race. Our helper collapses
+   both outcomes to `errWALRetry` — callers simply retry and rely on the
+   busy handler / BUSY backoff further up. A dedicated `errBusyRecovery`
+   sentinel could be added if a caller ever needs to distinguish "peer
+   recovering (backoff)" from "transient race (immediate retry)"; no
+   current call site uses the distinction.
 
 3. **`headerOnDisk` shortcut in `syncFromSHMLocked`**: we infer "on-disk WAL
    header exists" from `hdr.mxFrame > 0` rather than `fstat`-ing, relying on
@@ -1495,6 +1498,41 @@ checkpoint start. Matches SQLite's `walCheckpoint` which reads
 `pWal->hdr.mxFrame` populated by `walIndexTryHdr`.
 
 Reliability: 100/100 on the 100-run multi-process index harness.
+
+**Follow-up: same bug class in sibling sites.** A drift review flagged
+two more call sites with identical process-local reads:
+`checkpointPassive`'s completeness probe
+(`nBackfill >= mxCommitFrame.Load()` — controls whether `pager.close`
+truncates) and `checkpointPost`'s reset gate
+(`backfill < mxCommitFrame.Load()` — controls `tryResetWAL`). Stale
+local `mxCommitFrame` would falsely report "complete" / "ready to
+reset" after only backfilling our own frames.
+
+Fix: extracted helper `(w *wal) authoritativeMxFrame()` that reads SHM
+hdr in multi-process mode, falls back to `mxCommitFrame.Load()`
+otherwise. `checkpointWithMode`, `checkpointPassive`, and
+`checkpointPost` all use the helper. Mirrors SQLite's
+`pWal->hdr.mxFrame` usage throughout `walCheckpoint` (wal.c:2216,
+2227, 2309, 2341). Reader-path call sites (`shmHashGet`,
+`tryBeginReadInProcess`) intentionally retain the local read — those
+are per-tx snapshots that must not observe frames we haven't sync'd.
+
+### pager.close lockWrite gate
+
+Close-time checkpoint+truncate must hold `lockWrite` exclusive across
+both operations so a peer's in-flight `writeFrames` cannot race the
+truncate. Earlier code called `walBusyLock(lockWrite)` but discarded
+the error: on 5s timeout we proceeded without the lock, racing the
+peer and corrupting the WAL. The unconditional `unlock` at the end
+also released a slot we never acquired.
+
+Fix: track acquisition with a `lockedWrite bool`; truncate only when
+`lockedWrite || inProcess`; unlock only when we hold it. If lock
+acquisition fails, `checkpointPassive` still runs (it doesn't need
+the write lock) but truncate is skipped — WAL stays intact for the
+next opener. Mirrors SQLite's `sqlite3WalClose` which only calls
+`walLimitSize` inside the `SQLITE_OK==sqlite3OsLock(EXCLUSIVE)` arm
+(wal.c:2508-2536).
 
 ### Not Implemented (by design)
 

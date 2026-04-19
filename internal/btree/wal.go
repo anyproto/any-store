@@ -2195,6 +2195,27 @@ func (w *wal) endWrite() {
 	_ = w.index.unlock(lockWrite, lockExclusive)
 }
 
+// authoritativeMxFrame returns the highest committed WAL frame from the most
+// authoritative source available. In multi-process mode it reads the SHM header
+// (written under lockWrite by any process on commit); in single-process or
+// in-memory mode it uses the in-process atomic. Falls back to the atomic if the
+// SHM read yields a torn/invalid header.
+//
+// Callers should prefer this over w.index.mxCommitFrame.Load() whenever the
+// result influences truncate or WAL-reset decisions: a stale process-local
+// value that undercounts a peer's committed frames can make us reset or
+// truncate the WAL while those frames are still only in the WAL file,
+// destroying the peer's data. Mirrors SQLite's use of pWal->hdr.mxFrame after
+// walIndexReadHdr throughout wal.c (see walCheckpoint, wal.c:2166).
+func (w *wal) authoritativeMxFrame() uint32 {
+	if !w.inProcess && !w.inMemory {
+		if hdr, valid := w.index.readHeader(); valid {
+			return hdr.mxFrame
+		}
+	}
+	return w.index.mxCommitFrame.Load()
+}
+
 // checkpoint writes WAL frames back to the database file.
 // For InMemory databases, master is used to store checkpointed pages instead of dbFile.
 func (w *wal) checkpoint(dbFile fileHandle, master *masterStore) error {
@@ -2216,7 +2237,13 @@ func (w *wal) checkpointPassive(dbFile fileHandle, master *masterStore) error {
 	// some frames remain only in the WAL and must not be discarded.
 	// Use mxCommitFrame (not maxFrame) so spilled uncommitted frames don't
 	// prevent WAL reset. During active spill maxFrame > mxCommitFrame.
-	complete := w.index.nBackfill.Load() >= w.index.mxCommitFrame.Load()
+	//
+	// Source mxCommitFrame from SHM in multi-process mode: a stale
+	// process-local value would falsely report "complete" when a peer has
+	// committed frames we haven't backfilled. Callers (notably pager.close)
+	// then truncate the WAL and destroy the peer's data. See
+	// authoritativeMxFrame for rationale.
+	complete := w.index.nBackfill.Load() >= w.authoritativeMxFrame()
 	if !complete {
 		return ErrBusy
 	}
@@ -2236,6 +2263,13 @@ func (w *wal) checkpointPassive(dbFile fileHandle, master *masterStore) error {
 //
 // The busy handler (issue 1.7 + 6.3) is invoked when waiting for reader locks
 // in FULL/RESTART/TRUNCATE modes. In PASSIVE mode it is never called.
+//
+// mxFrame source (multi-process): `nf` is read via authoritativeMxFrame,
+// which consults the SHM header under lockCheckpoint. This mirrors SQLite's
+// walCheckpoint using pWal->hdr.mxFrame. Reading the process-local
+// mxCommitFrame would undercount committed frames written by peer
+// processes, causing a close-time checkpoint to only backfill our own
+// frames before truncate — losing the peer's data (commit 9023f5b).
 func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode CheckpointMode, xBusy BusyHandler) error {
 	// Acquire checkpoint lock -- serialize concurrent checkpoints.
 	// The busy handler is NOT used for the checkpoint lock itself, matching
@@ -2279,22 +2313,13 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	// SQLite's walCheckpoint uses pWal->hdr.mxFrame which is only updated
 	// at commit time via walIndexWriteHdr.
 	//
-	// In multi-process mode, read mxFrame from the SHM header, not the
-	// process-local mxCommitFrame. A sibling process may have committed
-	// frames we haven't synced — without this, our close-time checkpoint
-	// would only backfill our own frames, then truncate the WAL and lose
-	// the sibling's data (measured as the residual ~4% failure in
-	// TestMultiProcessIndex_ConcurrentSketchUpdates).
-	var nf uint32
-	if !w.inProcess && !w.inMemory {
-		if hdr, valid := w.index.readHeader(); valid {
-			nf = hdr.mxFrame
-		} else {
-			nf = w.index.mxCommitFrame.Load()
-		}
-	} else {
-		nf = w.index.mxCommitFrame.Load()
-	}
+	// In multi-process mode, read mxFrame from the SHM header via
+	// authoritativeMxFrame, not the process-local mxCommitFrame. A sibling
+	// process may have committed frames we haven't synced — without this,
+	// our close-time checkpoint would only backfill our own frames, then
+	// truncate the WAL and lose the sibling's data (measured as the
+	// residual ~4% failure in TestMultiProcessIndex_ConcurrentSketchUpdates).
+	nf := w.authoritativeMxFrame()
 	if nf == 0 {
 		return nil
 	}
@@ -2507,7 +2532,12 @@ func (w *wal) checkpointPost(mode CheckpointMode, xBusy BusyHandler) error {
 
 	// Use mxCommitFrame (not nFrame) so spilled uncommitted frames don't
 	// prevent WAL reset when all committed frames are checkpointed.
-	if backfill < w.index.mxCommitFrame.Load() {
+	//
+	// Source mxCommitFrame from SHM in multi-process mode: see
+	// authoritativeMxFrame. A stale process-local value could make us
+	// proceed to tryResetWAL after only backfilling our own frames, wiping
+	// a peer's committed frames that we never saw.
+	if backfill < w.authoritativeMxFrame() {
 		// Not everything was checkpointed. Can't reset the WAL.
 		return nil
 	}

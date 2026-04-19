@@ -183,8 +183,15 @@ type savepointState struct {
 	dbSize uint32
 	pages  map[uint32][]byte // pgno -> copy of page data before modification
 	// walHdr captures the WAL frame count + cumulative checksums at savepoint
-	// time. mxFrame, aFrameCksum[0], aFrameCksum[1] are the rollback-critical
-	// fields; other fields match the enclosing transaction's hdr.
+	// time. Only three fields of the hdr are consulted on rollback:
+	//   - mxFrame: truncate-back target for spill frames
+	//   - aFrameCksum[0], aFrameCksum[1]: running checksum chain restoration
+	// The remaining fields (nPage, salt, aCksum, isInit, ...) match the
+	// enclosing transaction's hdr and are stored for completeness/debugging
+	// only; rollbackToSavepoint does not read them. This widening from the
+	// earlier scalar `walFrame/walCksum1/walCksum2` triplet keeps the
+	// savepoint's WAL snapshot a peer of the tx-level walHdr — see
+	// rollbackToSavepoint in pager.go.
 	walHdr WalIndexHdr
 	header dbHeader // snapshot of database header at savepoint time (fix 9.3)
 }
@@ -2115,14 +2122,20 @@ func (p *pager) close() error {
 			// process cannot be mid-writeFrames. Without this gate, P1's
 			// truncateFile races with P2's WriteAt: the WAL file gets
 			// a zero header at offset 0 while P2's frames land at a high
-			// offset, making parent reopen unable to recover P2's data
-			// (residual ~5% failure mode in
-			// TestMultiProcessIndex_ConcurrentSketchUpdates).
+			// offset, making parent reopen unable to recover P2's data.
+			//
+			// If we cannot acquire the lock (peer actively writing after
+			// 5s busy handler), skip truncate entirely — matches SQLite's
+			// sqlite3WalClose which only calls walLimitSize when it obtains
+			// exclusive access. The WAL stays intact for the next opener.
+			lockedWrite := false
 			if !p.inProcess && !p.inMemory {
-				_ = walBusyLock(p.wal.index, p.wal.busyHandler, lockWrite, lockExclusive)
+				if err := walBusyLock(p.wal.index, p.wal.busyHandler, lockWrite, lockExclusive); err == nil {
+					lockedWrite = true
+				}
 			}
 			if debugTrace {
-				trace("close: starting passive checkpoint before WAL truncation, dbSize=%d", p.dbSize.Load())
+				trace("close: starting passive checkpoint before WAL truncation, dbSize=%d lockedWrite=%v", p.dbSize.Load(), lockedWrite)
 			}
 			cpErr := p.wal.checkpointPassive(p.file, p.master)
 			if cpErr != nil {
@@ -2130,10 +2143,13 @@ func (p *pager) close() error {
 					trace("close: checkpointPassive incomplete or failed: %v", cpErr)
 				}
 			}
-			if cpErr == nil {
+			// Only truncate when we hold lockWrite (or are single-process).
+			// Without the lock, a peer's in-flight writeFrames could be
+			// appending frames; truncating destroys them.
+			if cpErr == nil && (p.inProcess || lockedWrite) {
 				p.wal.truncateFile()
 			}
-			if !p.inProcess && !p.inMemory {
+			if lockedWrite {
 				_ = p.wal.index.unlock(lockWrite, lockExclusive)
 			}
 		}
