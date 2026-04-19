@@ -385,11 +385,9 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 	tx.cache = cache
 	tx.closed = false
 	tx.writable = false
+	// Dual-write during per-connection-hdr migration. Step 5 will remove
+	// walMaxFrame; until then, tests still read it directly.
 	tx.walMaxFrame = maxFrame
-	// Populate walHdr in parallel (hdr is read-only; multi-process path reads
-	// from SHM, in-process sets isInit=0 marker so WalMaxFrame() still works
-	// via mxFrame=0 when hdr-init not yet wired end-to-end). See
-	// docs/superpowers/specs/2026-04-18-per-connection-hdr-design.md.
 	tx.walHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
 	tx.walSlot = slot
 	tx.diskFileChangeCounter = fcc
@@ -584,7 +582,7 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 	var rootPgBuf [4]byte
 	binary.BigEndian.PutUint32(rootPgBuf[:], rootPg.pgno)
 
-	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walMaxFrame, writable: true}
+	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
 	return bt.Put([]byte(name), rootPgBuf[:])
 }
 
@@ -605,7 +603,7 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 	rootPage := ns.rootPage
 
 	// Delete namespace entry from master table
-	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walMaxFrame, writable: true}
+	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
 	if err := bt.Delete([]byte(name)); err != nil {
 		return err
 	}
@@ -851,10 +849,10 @@ func (tx *ReadTx) WalMaxFrame() uint32 { return tx.walHdr.mxFrame }
 func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 	if tx.writable {
 		// Use pager.getPage which uses wal.nFrame (not the frozen
-		// tx.walMaxFrame) so the writer sees its own spilled pages.
+		// tx.walHdr.mxFrame) so the writer sees its own spilled pages.
 		return tx.pager.getPage(pgno)
 	}
-	return tx.pager.getPageReader(pgno, tx.walMaxFrame, tx.cache)
+	return tx.pager.getPageReader(pgno, tx.walHdr.mxFrame, tx.cache)
 }
 
 // readOverflow reads overflow chain data using the correct isolation level.
@@ -863,9 +861,9 @@ func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 // that the writer could later read, causing on-disk corruption.
 func (tx *ReadTx) readOverflow(firstPgno uint32, buf []byte) error {
 	if tx.writable {
-		return tx.pager.readOverflowChainAt(firstPgno, buf, tx.walMaxFrame)
+		return tx.pager.readOverflowChainAt(firstPgno, buf, tx.walHdr.mxFrame)
 	}
-	return tx.pager.readOverflowChainReader(firstPgno, buf, tx.walMaxFrame, tx.cache)
+	return tx.pager.readOverflowChainReader(firstPgno, buf, tx.walHdr.mxFrame, tx.cache)
 }
 
 // AppendValue retrieves a value by key from the given namespace, appending it to buf.
@@ -883,7 +881,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 	usableSize := tx.pager.usableSize()
 	for {
 		if pg.header.isLeaf() {
-			idx, found, serr := searchLeafWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame, tx.cache)
+			idx, found, serr := searchLeafWithOverflow(pg, key, usableSize, tx.pager, tx.walHdr.mxFrame, tx.cache)
 			if serr != nil {
 				tx.pager.releasePage(pg)
 				return buf, serr
@@ -936,7 +934,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 				if valOverflow > 0 {
 					if err := tx.pager.readOverflowAt(
 						cell.overflowPg, keyOverflow, valOverflow,
-						fullVal[localValBytes:], tx.walMaxFrame, tx.cache,
+						fullVal[localValBytes:], tx.walHdr.mxFrame, tx.cache,
 					); err != nil {
 						tx.pager.releasePage(pg)
 						return buf[:start], err
@@ -949,7 +947,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 			tx.pager.releasePage(pg)
 			return buf, nil
 		}
-		childPgno, _, serr := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame, tx.cache)
+		childPgno, _, serr := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walHdr.mxFrame, tx.cache)
 		if serr != nil {
 			tx.pager.releasePage(pg)
 			return buf, serr
@@ -1013,7 +1011,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 
 	for {
 		if pg.header.isLeaf() {
-			idx, _, serr := searchLeafWithOverflow(pg, prefix, usableSize, tx.pager, tx.walMaxFrame, cache)
+			idx, _, serr := searchLeafWithOverflow(pg, prefix, usableSize, tx.pager, tx.walHdr.mxFrame, cache)
 			if serr != nil {
 				tx.pager.releasePage(pg)
 				return buf, serr
@@ -1037,7 +1035,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 				return buf, cerr
 			}
 			if cell.overflowPg != 0 {
-				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walMaxFrame, cache)
+				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walHdr.mxFrame, cache)
 				tx.pager.releasePage(pg)
 				if kerr != nil {
 					return buf, kerr
@@ -1048,7 +1046,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 			tx.pager.releasePage(pg)
 			return buf, nil
 		}
-		childPgno, cellIdx, serr := searchInteriorWithOverflow(pg, prefix, usableSize, tx.pager, tx.walMaxFrame, cache)
+		childPgno, cellIdx, serr := searchInteriorWithOverflow(pg, prefix, usableSize, tx.pager, tx.walHdr.mxFrame, cache)
 		if serr != nil {
 			tx.pager.releasePage(pg)
 			return buf, serr
@@ -1115,7 +1113,7 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 				return buf, cerr
 			}
 			if cell.overflowPg != 0 {
-				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walMaxFrame, cache)
+				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walHdr.mxFrame, cache)
 				tx.pager.releasePage(pg)
 				if kerr != nil {
 					return buf, kerr
@@ -1148,7 +1146,7 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 // NewCursor creates a cursor for iterating over the namespace.
 func (tx *ReadTx) NewCursor(ns *Namespace) *Cursor {
 	c := &Cursor{}
-	c.btData = btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
+	c.btData = btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: tx.writable}
 	c.bt = &c.btData
 	return c
 }
@@ -1159,7 +1157,7 @@ func (tx *ReadTx) Count(ns *Namespace) (int, error) {
 	if tx.closed {
 		return 0, ErrTxClosed
 	}
-	bt := &btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
+	bt := &btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: tx.writable}
 	return bt.Count()
 }
 
@@ -1170,7 +1168,7 @@ func (tx *ReadTx) GetNamespace(name string) (*Namespace, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
 	}
-	return tx.db.getNamespaceAt(name, tx.walMaxFrame, tx.cache)
+	return tx.db.getNamespaceAt(name, tx.walHdr.mxFrame, tx.cache)
 }
 
 // IsDataStale returns true if the on-disk FileChangeCount differs from the
@@ -1260,7 +1258,7 @@ func (tx *WriteTx) Put(ns *Namespace, key, value []byte) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: true}
+	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: true}
 	return bt.Put(key, value)
 }
 
@@ -1269,7 +1267,7 @@ func (tx *WriteTx) Delete(ns *Namespace, key []byte) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: true}
+	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: true}
 	return bt.Delete(key)
 }
 
