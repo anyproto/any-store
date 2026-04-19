@@ -51,6 +51,14 @@ type DB interface {
 	// QuickCheck performs a quick integrity check. If result not ok returns error.
 	QuickCheck(ctx context.Context) (err error)
 
+	// IntegrityCheck runs the full structural btree integrity check:
+	// reachable-page coverage, orphan detection, freelist consistency,
+	// overflow-chain validation, key ordering, and master-page consistency.
+	// Returns nil if the database is structurally consistent, or an error
+	// aggregating up to 100 issues found. More expensive than QuickCheck —
+	// intended for stress tests and offline diagnostics, not normal opens.
+	IntegrityCheck(ctx context.Context) (err error)
+
 	// Flush perform checkpoint on the btree database
 	// When waitIdleDuration > 0, wait for waitIdleTime since the last write tx got released
 	Flush(ctx context.Context, waitIdleDuration time.Duration, mode FlushMode) error
@@ -502,6 +510,13 @@ func (db *db) QuickCheck(ctx context.Context) (err error) {
 		}
 		return nil
 	})
+}
+
+func (db *db) IntegrityCheck(ctx context.Context) (err error) {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return db.btreeDB.IntegrityCheck()
 }
 
 func (db *db) Backup(ctx context.Context, path string) (err error) {
