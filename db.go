@@ -320,8 +320,6 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 	var coll Collection
 	err := db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
 		tx.MarkSchemaChanged()
-		db.mu.Lock()
-		defer db.mu.Unlock()
 
 		// Check if collection already exists in system namespace
 		key := collKey(collectionName)
@@ -360,6 +358,9 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 		if coll, err = newCollection(ctx, db, collectionName, tx); err != nil {
 			return err
 		}
+
+		db.mu.Lock()
+		defer db.mu.Unlock()
 		db.openedCollections[collectionName] = coll
 
 		return nil
@@ -372,15 +373,21 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 
 func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collection, error) {
 	db.mu.Lock()
-	defer db.mu.Unlock()
+	if coll, ok := db.openedCollections[collectionName]; ok {
+		db.mu.Unlock()
+		return coll, nil
+	}
+	db.mu.Unlock()
 	return db.openCollection(ctx, collectionName)
 }
 
 func (db *db) openCollection(ctx context.Context, collectionName string) (Collection, error) {
-	coll, ok := db.openedCollections[collectionName]
-	if ok {
+	db.mu.Lock()
+	if coll, ok := db.openedCollections[collectionName]; ok {
+		db.mu.Unlock()
 		return coll, nil
 	}
+	db.mu.Unlock()
 
 	err := db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		key := collKey(collectionName)
@@ -397,9 +404,15 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 		return nil, err
 	}
 
-	coll, err = newCollection(ctx, db, collectionName)
+	coll, err := newCollection(ctx, db, collectionName)
 	if err != nil {
 		return nil, err
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if existing, ok := db.openedCollections[collectionName]; ok {
+		return existing, nil
 	}
 	db.openedCollections[collectionName] = coll
 	return coll, nil
