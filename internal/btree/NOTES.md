@@ -1420,51 +1420,64 @@ below for why cold-open was attempted and reverted.
    header exists" from `hdr.mxFrame > 0` rather than `fstat`-ing, relying on
    the invariant that `flushHeader` precedes every frame write.
 
-### SQLite-alignment blocker: cold `wal.open` (2026-04-18)
+### Per-connection `walHdr` — resolved (2026-04-18)
 
-A T3 attempt to make `wal.open` cold (no SHM locks, no header read, no
-recovery — matching `sqlite3WalOpen` at wal.c:1641-1739) regressed the
-multi-process reliability harness (`TestMultiProcessIndex_ConcurrentSketch‐
-Updates`) from ~87% to 0-27% across three independent implementations
-(commits `60f2050` reverted, a stashed retry, `3e10dc9`+follow-ups
-reverted).
+**Historical:** Earlier attempts to make `wal.open` cold (match SQLite's
+`sqlite3WalOpen` at wal.c:1641-1739) regressed multi-process reliability
+from ~87% to 0-27% because a lazy SHM-header-init from any reader path
+mutated the writer's in-flight state. SQLite's `Wal*` is per-connection;
+any-store multiplexes many goroutines on one `*wal`.
 
-Root cause is architectural, not implementation. SQLite's `Wal*` lives per
-connection with exclusive caller semantics; `pWal->hdr` is the connection's
-private snapshot. any-store multiplexes many goroutines (concurrent readers
-+ single writer) onto one `*wal` struct. Fields like `w.nFrame`,
-`w.cksum1/2`, `w.header.salt1/2`, `w.writerHdr` are process-global. A lazy
-header-init from any reader path mutates the writer's view mid-spill.
+**Resolved by per-tx `walHdr` migration** (commits `f11bc5c` → `9c53a02`,
+7 steps; see
+`any-store-tests/docs/superpowers/specs/2026-04-18-per-connection-hdr-design.md`
+for the design). Summary:
 
-Three candidate fixes were evaluated:
+- `ReadTx.walHdr WalIndexHdr` holds the reader's SHM snapshot captured at
+  BeginRead time (inherited by `WriteTx`). Replaces the shared
+  `wal.readSnapshot` field.
+- `ensureHeaderInitialized()` returns `(WalIndexHdr, error)` so callers
+  stamp the hdr onto their tx rather than depending on a helper that
+  mutates process-global state.
+- Reader callsites route through `tx.walHdr.mxFrame` instead of
+  `tx.walMaxFrame` (both populated during migration; step 5 narrowed the
+  field semantics).
+- `BUSY_SNAPSHOT` in `wal.beginWriteWithSnapshot` now compares live SHM
+  hdr against the caller-supplied `readSnap` (from `tx.walHdr`) rather
+  than `w.readSnapshot`. `saveReadSnapshot` deleted.
+- `syncFromSHMLocked` narrowed to only update shared `walIndex` atomics
+  (`maxFrame`, `mxCommitFrame`, `maxPage` via CAS-monotonic, `nBackfill`)
+  plus `w.nFrame` (shared append cursor). Writer-private fields
+  (`w.header.salt*`, `w.cksum1/2`, `w.writerHdr`) stay owned by
+  `wal.beginWriteWithSnapshot`'s inline sync under `lockWrite`.
+- Savepoint state widened: scalar `walFrame/walCksum1/walCksum2` →
+  `walHdr WalIndexHdr`.
+- Legacy zero-arg `wal.beginWrite()` + `pager.beginWrite()` wrappers kept
+  for raw-wal tests; pass `WalIndexHdr{}` which skips BUSY_SNAPSHOT
+  (acceptable — tests don't exercise multi-process race).
 
-1. **Per-tx `walHdr` on `ReadTx`**: widen `ReadTx.walMaxFrame uint32` to a
-   full `WalIndexHdr` field, route reader/writer lookups through
-   `tx.walHdr.mxFrame`. Research found this is the cleanest mapping of
-   SQLite's "single owner per hdr" invariant into any-store's tx model.
-   Blocked: the writer path in `writeFrames` requires `w.nFrame` (physical
-   append cursor) + `w.cksum1/2` (checksum chain) in `*wal`. Splitting
-   these out cascaded through ~20 test files with subtle semantic gaps;
-   reliability still regressed.
+**Known preserved drifts:**
+- In-process mode skips SHM hdr updates on commit (`writeFrames`
+  `!w.inProcess` guard). `db.BeginRead`/`BeginWrite` synthesize a minimal
+  `walHdr{isInit:1, mxFrame:maxFrame}` in that mode so read paths
+  consuming `tx.walHdr.mxFrame` see the correct frame ceiling.
+- Raw `wal.beginWrite()` zero-arg form passes empty hdr → BUSY_SNAPSHOT
+  skipped. Used only by tests that don't run multi-process scenarios.
 
-2. **Shared `readSnapshot` moved to `tryBeginReadMultiProcess`**: populate
-   at every `BeginRead` so `BUSY_SNAPSHOT` has a meaningful pre-write
-   baseline. Blocked: still a single shared field; concurrent readers
-   clobber each other's snapshots, and the 500ms sleep between open and
-   write tx in the failing test means the writer's own `beginRead`
-   captures post-sleep state regardless.
+**Reliability impact:** `TestMultiProcessIndex_ConcurrentSketchUpdates`
+30-run samples at each step:
 
-3. **Skip WAL truncate in multi-process close**: tested after trace logs
-   showed P1's close-time `truncateFile` can race with P2's mid-flight
-   `writeFrames`. Fix made things worse — without truncate, salt
-   inconsistency across subprocess writes surfaces different corruption.
+| Step | 30-run |
+|------|--------|
+| Baseline (step 0) | 28/30 |
+| Step 1 (walHdr field) | 27/30 |
+| Step 3 (reader routing) | 30/30 |
+| Step 4 (BUSY_SNAPSHOT rewire) | 29/30 |
+| Step 5 (delete readSnapshot) | 28/30 |
+| Step 6 (savepoint widen) | 30/30 |
 
-**Decision**: eager `wal.open` stays. A full SQLite alignment at this layer
-requires introducing per-connection `hdr` state (mirror of `pWal->hdr`) and
-propagating it through readers, writers, savepoints, commit paths —
-tracked as a separate multi-week refactor. See
-`docs/superpowers/plans/2026-04-18-wal-open-sqlite-alignment.md` for the
-full T3 analysis and the three failed implementation attempts.
+Post-migration reliability sits in the ~93-100% band per 30-run sample,
+up from the ~77-95% pre-migration band.
 
 ### Not Implemented (by design)
 
