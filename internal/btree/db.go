@@ -386,6 +386,11 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 	tx.closed = false
 	tx.writable = false
 	tx.walMaxFrame = maxFrame
+	// Populate walHdr in parallel (hdr is read-only; multi-process path reads
+	// from SHM, in-process sets isInit=0 marker so WalMaxFrame() still works
+	// via mxFrame=0 when hdr-init not yet wired end-to-end). See
+	// docs/superpowers/specs/2026-04-18-per-connection-hdr-design.md.
+	tx.walHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
 	tx.walSlot = slot
 	tx.diskFileChangeCounter = fcc
 	tx.diskSchemaCookie = sc
@@ -481,6 +486,7 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	tx.ReadTx.cache = nil // writer uses shared pcache, not a reader cache
 	tx.ReadTx.closed = false
 	tx.ReadTx.walMaxFrame = maxFrame
+	tx.ReadTx.walHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
 	tx.ReadTx.walSlot = slot
 	tx.ReadTx.writable = true
 	tx.ReadTx.diskFileChangeCounter = fcc
@@ -817,7 +823,12 @@ type ReadTx struct {
 	pager       *pager
 	cache       *pcache // per-reader private page cache (nil for write transactions)
 	walSlot     int     // reader slot number (for endRead)
-	walMaxFrame uint32  // WAL snapshot for this transaction
+	walMaxFrame uint32  // WAL snapshot for this transaction (TODO: migrate to walHdr.mxFrame)
+	// walHdr is the full SHM header snapshot captured at BeginRead time.
+	// Populated in parallel with walMaxFrame during the per-connection-hdr
+	// migration (see docs/superpowers/specs/2026-04-18-per-connection-hdr-design.md).
+	// Not yet consumed by production code.
+	walHdr WalIndexHdr
 
 	// Disk counters from page 1 at transaction start (for staleness detection).
 	diskFileChangeCounter  uint32
@@ -827,6 +838,11 @@ type ReadTx struct {
 	closed                 bool
 	writable               bool // true when embedded in a WriteTx (MVCC: allows seeing dirty pages)
 }
+
+// WalMaxFrame returns the reader's snapshot mxFrame. Prefer this over
+// direct walMaxFrame field access — the field is being migrated to
+// walHdr.mxFrame per the per-connection-hdr spec.
+func (tx *ReadTx) WalMaxFrame() uint32 { return tx.walHdr.mxFrame }
 
 
 // txGetPage fetches a page respecting MVCC snapshot isolation.
