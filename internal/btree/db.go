@@ -412,10 +412,8 @@ func (db *DB) BeginReadFast() (*ReadTx, error) {
 // For multi-process mode, if another process committed since our last read
 // (ErrBusySnapshot), we automatically retry with a fresh SHM snapshot.
 // DRIFT from SQLite: SQLite returns SQLITE_BUSY_SNAPSHOT to the caller,
-// requiring it to retry. We retry internally for ergonomic API (max 50
-// attempts — bumped from 5 to absorb legitimate contention bursts from
-// concurrent writers in test D's sketch-race scenario).
-const maxBusySnapshotRetries = 50
+// requiring it to retry. We retry internally for ergonomic API.
+const maxBusySnapshotRetries = 200
 
 func (db *DB) BeginWrite() (*WriteTx, error) {
 	if db.closing.Load() {
