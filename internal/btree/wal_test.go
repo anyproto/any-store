@@ -549,6 +549,37 @@ func TestWALRecoveryMultipleCommits(t *testing.T) {
 	require.NoError(t, w2.close())
 }
 
+func TestWALReadFrameAllowsPeerCommittedFrameBeyondLocalNFrame(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+
+	// Open a second WAL handle before the first writer commits so its local
+	// nFrame remains stale. This simulates another process discovering a newer
+	// frame via SHM/page lookup and then reading the frame data from disk.
+	wWriter := newWal(path, 4096)
+	wWriter.inProcess = false
+	require.NoError(t, wWriter.open())
+	defer wWriter.close()
+
+	wReader := newWal(path, 4096)
+	wReader.inProcess = false
+	require.NoError(t, wReader.open())
+	defer wReader.close()
+
+	_, bwErr := wWriter.beginWrite()
+	require.NoError(t, bwErr)
+	pg := &page{pgno: 1, data: make([]byte, 4096)}
+	copy(pg.data, "peer-committed-page")
+	require.NoError(t, wWriter.writeFrames([]*page{pg}, true, 1))
+	wWriter.endWrite()
+
+	require.Equal(t, uint32(0), wReader.nFrame.Load(), "reader handle should still have stale local nFrame")
+
+	buf := make([]byte, 4096)
+	require.NoError(t, wReader.readFrame(1, buf), "reader should read peer frame directly from file even with stale local nFrame")
+	assert.Equal(t, pg.data, buf)
+}
+
 func TestWalIndexGetCrossProcessFallback(t *testing.T) {
 	// Use a heap SHM but with inProcess=false to test the fallback logic.
 	// This simulates a second process whose pageMap is empty for frames
@@ -660,52 +691,6 @@ func TestGetLatestIgnoresSpilledFrames(t *testing.T) {
 	assert.Equal(t, uint32(2), frame, "getLatest should see frame after mxCommitFrame advances")
 }
 
-func TestWriteFramesCommitFalseDoesNotWriteShmHash(t *testing.T) {
-	// Spill frames (commit=false) should NOT write to SHM hash tables.
-	// Cross-process readers use SHM hash to find pages, so deferred writes
-	// prevent them from seeing uncommitted spilled frames.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.wal")
-	w := newWal(path, 4096)
-	// Use non-inProcess mode to exercise SHM hash path
-	w.inProcess = false
-	require.NoError(t, w.open())
-	_, bwErr := w.beginWrite()
-	require.NoError(t, bwErr)
-
-	// First commit page 1 so we have a baseline
-	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
-	copy(pg1.data, "committed page 1")
-	require.NoError(t, w.writeFrames([]*page{pg1}, true, 1))
-
-	// Verify committed page 1 is in SHM hash
-	frame := w.index.shmHashGet(1, 10, 1)
-	assert.Equal(t, uint32(1), frame, "committed page should be in SHM hash")
-
-	// Now spill pages 2 and 3 (commit=false)
-	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
-	copy(pg2.data, "spilled page 2")
-	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
-	copy(pg3.data, "spilled page 3")
-	require.NoError(t, w.writeFrames([]*page{pg2, pg3}, false, 0))
-
-	// Spilled pages should NOT be in SHM hash
-	frame = w.index.shmHashGet(2, 10, 1)
-	assert.Equal(t, uint32(0), frame, "spilled page 2 should not be in SHM hash")
-	frame = w.index.shmHashGet(3, 10, 1)
-	assert.Equal(t, uint32(0), frame, "spilled page 3 should not be in SHM hash")
-
-	// But writer can still find them via pageMap
-	assert.Equal(t, uint32(2), w.index.get(2, 3))
-	assert.Equal(t, uint32(3), w.index.get(3, 3))
-
-	// Verify pending SHM frames were accumulated
-	assert.Len(t, w.index.pendingShmFrames, 2, "should have 2 pending SHM frames")
-
-	w.endWrite()
-	require.NoError(t, w.close())
-}
-
 func TestRollbackCleansUpSpilledFrames(t *testing.T) {
 	// After spilling frames (commit=false), rollbackToFrame should remove
 	// pageMap entries for spilled frames and restore maxFrame.
@@ -759,9 +744,6 @@ func TestRollbackCleansUpSpilledFrames(t *testing.T) {
 	// Committed pages should still be visible
 	assert.Equal(t, uint32(1), w.index.get(1, 10))
 	assert.Equal(t, uint32(2), w.index.get(2, 10))
-
-	// pendingShmFrames should be cleared
-	assert.Len(t, w.index.pendingShmFrames, 0)
 
 	w.endWrite()
 	require.NoError(t, w.close())
@@ -817,9 +799,6 @@ func TestRollbackToSavepointWithSpilledFrames(t *testing.T) {
 	assert.Equal(t, uint32(1), w.index.get(1, 10))
 	assert.Equal(t, uint32(2), w.index.get(2, 10))
 
-	// pendingShmFrames should be cleared
-	assert.Len(t, w.index.pendingShmFrames, 0)
-
 	w.endWrite()
 	require.NoError(t, w.close())
 }
@@ -871,16 +850,13 @@ func TestCrossProcessReaderDoesNotSeeSpilledFrames(t *testing.T) {
 	// maxFrame (writer-internal) should be 4
 	assert.Equal(t, uint32(4), w.index.maxFrame.Load(), "maxFrame should include spilled frames")
 
-	// Spilled pages should NOT be in SHM hash
-	assert.Equal(t, uint32(0), w.index.shmHashGet(3, 10, 1), "spilled page 3 must not be in SHM hash")
-	assert.Equal(t, uint32(0), w.index.shmHashGet(4, 10, 1), "spilled page 4 must not be in SHM hash")
-
 	// Committed pages still accessible via SHM hash
 	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10, 1), "committed page 1 still in SHM hash")
 	assert.Equal(t, uint32(2), w.index.shmHashGet(2, 10, 1), "committed page 2 still in SHM hash")
 
-	// A cross-process reader using getLatest (with empty pageMap) should not see spilled pages
-	// Simulate by creating a fresh walIndex pointing to same SHM
+	// A cross-process reader gated by mxCommitFrame must not see spilled pages:
+	// SHM hash is written eagerly (SQLite-aligned), but readers bound by
+	// mxCommitFrame in getLatest cannot reach frames > mxCommitFrame.
 	reader := &walIndex{
 		shm:       w.index.shm,
 		pageMap:   make(map[uint32][]uint32),
@@ -892,7 +868,7 @@ func TestCrossProcessReaderDoesNotSeeSpilledFrames(t *testing.T) {
 	// Reader should see committed pages via SHM hash
 	assert.Equal(t, uint32(1), reader.getLatest(1), "cross-process reader sees committed page 1")
 	assert.Equal(t, uint32(2), reader.getLatest(2), "cross-process reader sees committed page 2")
-	// Reader should NOT see spilled pages
+	// Reader should NOT see spilled pages (frame > mxCommitFrame)
 	assert.Equal(t, uint32(0), reader.getLatest(3), "cross-process reader must not see spilled page 3")
 	assert.Equal(t, uint32(0), reader.getLatest(4), "cross-process reader must not see spilled page 4")
 
@@ -978,8 +954,9 @@ func TestRecoveryIgnoresSpilledFrames(t *testing.T) {
 }
 
 func TestWriteFramesCommitFlushesToShm(t *testing.T) {
-	// After spill + commit, all frames (spilled and committed) should be
-	// visible in SHM hash tables.
+	// SHM hash is populated eagerly (SQLite-aligned): every frame writes SHM
+	// hash immediately regardless of commit. Readers are gated via mxCommitFrame,
+	// not via the presence of the SHM hash entry itself.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.wal")
 	w := newWal(path, 4096)
@@ -995,25 +972,22 @@ func TestWriteFramesCommitFlushesToShm(t *testing.T) {
 	copy(pg2.data, "spilled page 2")
 	require.NoError(t, w.writeFrames([]*page{pg1, pg2}, false, 0))
 
-	// Verify NOT in SHM hash yet
-	assert.Equal(t, uint32(0), w.index.shmHashGet(1, 10, 1))
-	assert.Equal(t, uint32(0), w.index.shmHashGet(2, 10, 1))
+	// SHM hash holds entries eagerly (invisible to peer readers via mxCommitFrame)
+	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10, 1))
+	assert.Equal(t, uint32(2), w.index.shmHashGet(2, 10, 1))
 
 	// Now commit page 3
 	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
 	copy(pg3.data, "committed page 3")
 	require.NoError(t, w.writeFrames([]*page{pg3}, true, 3))
 
-	// All frames should now be in SHM hash (pending flushed + commit batch)
+	// All frames visible in SHM hash
 	frame := w.index.shmHashGet(1, 10, 1)
-	assert.Equal(t, uint32(1), frame, "spilled page 1 should be in SHM hash after commit")
+	assert.Equal(t, uint32(1), frame, "page 1 in SHM hash")
 	frame = w.index.shmHashGet(2, 10, 1)
-	assert.Equal(t, uint32(2), frame, "spilled page 2 should be in SHM hash after commit")
+	assert.Equal(t, uint32(2), frame, "page 2 in SHM hash")
 	frame = w.index.shmHashGet(3, 10, 1)
-	assert.Equal(t, uint32(3), frame, "committed page 3 should be in SHM hash after commit")
-
-	// Pending SHM frames should be cleared
-	assert.Len(t, w.index.pendingShmFrames, 0, "pending SHM frames should be empty after commit")
+	assert.Equal(t, uint32(3), frame, "page 3 in SHM hash")
 
 	// mxCommitFrame should include all frames
 	assert.Equal(t, uint32(3), w.index.mxCommitFrame.Load())
@@ -1161,4 +1135,69 @@ func TestEnsureHeaderInitialized_TriggersRecoveryWhenSHMInvalid(t *testing.T) {
 	hdr, validAfter := w2.index.readHeader()
 	require.True(t, validAfter)
 	require.Equal(t, expectedFrames, hdr.mxFrame)
+}
+
+func TestTryBeginReadMultiProcessHdrFloorsBackwardHeaderToWriterHdr(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := newWalIndex(filepath.Join(dir, "test.db-shm"), false)
+	require.NoError(t, err)
+	defer idx.close()
+
+	require.NoError(t, idx.writeHeader(158, 61, 0, [2]uint32{11, 22}, [2]uint32{101, 202}))
+
+	writerHdr := WalIndexHdr{
+		isInit:      1,
+		iVersion:    walVersion,
+		szPage:      4096,
+		mxFrame:     167,
+		nPage:       61,
+		aFrameCksum: [2]uint32{33, 44},
+		aSalt:       [2]uint32{101, 202},
+	}
+	w := &wal{
+		index:     idx,
+		pageSize:  4096,
+		writerHdr: writerHdr,
+	}
+	w.nFrame.Store(writerHdr.mxFrame)
+
+	hdr, maxFrame, slot, err := w.tryBeginReadMultiProcessHdr()
+	require.NoError(t, err)
+	require.Equal(t, writerHdr, hdr)
+	require.Equal(t, writerHdr.mxFrame, maxFrame)
+	require.NotEqual(t, 0, slot, "reader should claim a WAL-backed slot")
+	require.Equal(t, writerHdr.mxFrame, idx.shmReadMark(slot))
+	w.endRead(slot)
+}
+
+func TestBeginWriteWithSnapshotFloorsBackwardHeaderToWriterHdr(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := newWalIndex(filepath.Join(dir, "test.db-shm"), false)
+	require.NoError(t, err)
+	defer idx.close()
+
+	require.NoError(t, idx.writeHeader(158, 61, 0, [2]uint32{11, 22}, [2]uint32{101, 202}))
+
+	writerHdr := WalIndexHdr{
+		isInit:      1,
+		iVersion:    walVersion,
+		szPage:      4096,
+		mxFrame:     167,
+		nPage:       61,
+		aFrameCksum: [2]uint32{33, 44},
+		aSalt:       [2]uint32{101, 202},
+	}
+	w := &wal{
+		index:     idx,
+		pageSize:  4096,
+		writerHdr: writerHdr,
+	}
+
+	stateChanged, err := w.beginWriteWithSnapshot(writerHdr)
+	require.NoError(t, err)
+	require.False(t, stateChanged, "same-process backward SHM read should not look like external state change")
+	require.Equal(t, writerHdr.mxFrame, w.nFrame.Load())
+	require.Equal(t, writerHdr.aFrameCksum[0], w.cksum1)
+	require.Equal(t, writerHdr.aFrameCksum[1], w.cksum2)
+	w.endWrite()
 }

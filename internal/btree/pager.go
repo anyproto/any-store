@@ -70,23 +70,23 @@ func (ms *masterStore) writePage(pgno uint32, src []byte) {
 
 // pager manages database pages, cache, and WAL interaction.
 type pager struct {
-	mu       sync.RWMutex
-	file     fileHandle
-	wal      *wal
+	mu          sync.RWMutex
+	file        fileHandle
+	wal         *wal
 	writerCache *pcache
 
 	// writerOpMu serializes pager write operations (commit, rollback) so
 	// that DB.Close can safely force-rollback an abandoned transaction
 	// without racing with a concurrent commit. Per-connection pcache has
 	// no mutex, so this pager-level lock is the serialization point.
-	writerOpMu sync.Mutex
-	master   *masterStore // InMemory "disk" — holds checkpointed page data
-	header       dbHeader
-	path         string
-	pageSize     uint32
-	usableSize_  int // pageSize - ReservedSpace; immutable after open, safe for concurrent reads
-	dbSize   atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
-	state    atomic.Int32 // pagerState
+	writerOpMu  sync.Mutex
+	master      *masterStore // InMemory "disk" — holds checkpointed page data
+	header      dbHeader
+	path        string
+	pageSize    uint32
+	usableSize_ int           // pageSize - ReservedSpace; immutable after open, safe for concurrent reads
+	dbSize      atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
+	state       atomic.Int32  // pagerState
 
 	// Savepoint support: snapshots of dirty pages at savepoint boundaries
 	savepoints []savepointState
@@ -412,15 +412,23 @@ func (p *pager) initNewDB() error {
 // beginRead starts a read transaction, taking a WAL snapshot.
 // Returns the WAL max frame for snapshot isolation and the reader slot number.
 func (p *pager) beginRead() (maxFrame uint32, slot int, err error) {
+	_, maxFrame, slot, err = p.beginReadHdr()
+	return maxFrame, slot, err
+}
+
+// beginReadHdr is beginRead plus the exact WAL header snapshot used to claim
+// the reader slot. Callers that may escalate to a write transaction should use
+// this so BUSY_SNAPSHOT compares against the same snapshot the read lock used.
+func (p *pager) beginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err error) {
 	p.mu.RLock()
 	if pagerState(p.state.Load()) == pagerError {
 		p.mu.RUnlock()
-		return 0, 0, ErrCorrupt
+		return WalIndexHdr{}, 0, 0, ErrCorrupt
 	}
-	maxFrame, slot, err = p.wal.beginRead()
+	hdr, maxFrame, slot, err = p.wal.beginReadHdr()
 	if err != nil {
 		p.mu.RUnlock()
-		return 0, 0, err
+		return WalIndexHdr{}, 0, 0, err
 	}
 	// Update pager's walMaxFrame monotonically: never decrease, since a reader
 	// with an older snapshot must not overwrite a newer value set by the writer.
@@ -433,7 +441,7 @@ func (p *pager) beginRead() (maxFrame uint32, slot int, err error) {
 			break
 		}
 	}
-	return maxFrame, slot, nil
+	return hdr, maxFrame, slot, nil
 }
 
 // endRead ends a read transaction for the given reader slot.
@@ -1171,17 +1179,17 @@ func (p *pager) refreshHeaderFromPage1() {
 
 	// Try WAL first.
 	if effectiveMaxFrame > 0 {
-		var frame uint32
-		if p.inProcess {
-			frame = p.wal.index.get(1, effectiveMaxFrame)
-		} else {
-			frame = p.wal.index.shmHashGet(1, effectiveMaxFrame, p.wal.index.nBackfill.Load()+1)
-		}
+		frame := p.wal.index.get(1, effectiveMaxFrame)
 		if frame > 0 {
 			var buf [dbHeaderSize]byte
 			if err := p.readWalFrameData(frame, buf[:]); err == nil {
 				_ = p.header.deserialize(buf[:])
 				p.dbSize.Store(p.header.DatabaseSize)
+				if debugTrace {
+					trace("refreshHeaderFromPage1: source=wal frame=%d maxFrame=%d nBackfill=%d dbSize=%d firstFree=%d totalFree=%d",
+						frame, effectiveMaxFrame, p.wal.index.nBackfill.Load(),
+						p.header.DatabaseSize, p.header.FirstFreelistPg, p.header.TotalFreelistPgs)
+				}
 				return
 			}
 		}
@@ -1193,6 +1201,11 @@ func (p *pager) refreshHeaderFromPage1() {
 		if _, err := p.file.ReadAt(buf[:], 0); err == nil {
 			_ = p.header.deserialize(buf[:])
 			p.dbSize.Store(p.header.DatabaseSize)
+			if debugTrace {
+				trace("refreshHeaderFromPage1: source=db maxFrame=%d nBackfill=%d dbSize=%d firstFree=%d totalFree=%d",
+					effectiveMaxFrame, p.wal.index.nBackfill.Load(),
+					p.header.DatabaseSize, p.header.FirstFreelistPg, p.header.TotalFreelistPgs)
+			}
 			return
 		}
 	}
@@ -1227,16 +1240,11 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 	}
 
 	// Look up page 1's latest frame.
-	// For inProcess mode, use the Go map (walIndex.get) which is protected by
-	// a RWMutex, avoiding data races on the unsynchronized SHM byte regions.
-	// For multi-process mode, use shmHashGet which reads the cross-process SHM.
+	// walIndex.get() merges the local page map with SHM, preferring newer SHM
+	// frames. After an external state change, beginWrite rebuilds the local page
+	// map from the WAL so page-1 refreshes do not depend solely on SHM hashes.
 	if effectiveMaxFrame > 0 {
-		var frame uint32
-		if p.inProcess {
-			frame = p.wal.index.get(1, effectiveMaxFrame)
-		} else {
-			frame = p.wal.index.shmHashGet(1, effectiveMaxFrame, p.wal.index.nBackfill.Load()+1)
-		}
+		frame := p.wal.index.get(1, effectiveMaxFrame)
 		if frame > 0 {
 			var buf [dbHeaderSize]byte
 			if err := p.readWalFrameData(frame, buf[:]); err == nil {
@@ -1435,13 +1443,22 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 		return 0, 0, 0, err
 	}
 	p.header.serialize(pg1.data[:dbHeaderSize])
+	if debugTrace {
+		trace("commit: page1 dbSize=%d firstFree=%d totalFree=%d fcc=%d sc=%d",
+			p.header.DatabaseSize, p.header.FirstFreelistPg, p.header.TotalFreelistPgs,
+			p.header.FileChangeCount, p.header.SchemaCookie)
+	}
 	p.releasePage(pg1)
 
 	// Re-collect dirty pages since page 1 may be newly dirty.
 	p.dirtyBuf = p.writerCache.appendDirtyPages(p.dirtyBuf[:0])
 
 	if debugTrace {
-		trace("commit: writing %d dirty pages to WAL", len(p.dirtyBuf))
+		dirtyPgnos := make([]uint32, 0, len(p.dirtyBuf))
+		for _, pg := range p.dirtyBuf {
+			dirtyPgnos = append(dirtyPgnos, pg.pgno)
+		}
+		trace("commit: writing %d dirty pages to WAL %v", len(p.dirtyBuf), dirtyPgnos)
 	}
 
 	// Write all dirty pages to WAL
@@ -2145,7 +2162,9 @@ func (p *pager) close() error {
 			}
 			// Only truncate when we hold lockWrite (or are single-process).
 			// Without the lock, a peer's in-flight writeFrames could be
-			// appending frames; truncating destroys them.
+			// appending frames; truncating destroys them. Matches SQLite's
+			// sqlite3WalClose (wal.c:2487-2551) gating truncate on an
+			// exclusive-DB-lock attempt (wal.c:2509).
 			if cpErr == nil && (p.inProcess || lockedWrite) {
 				p.wal.truncateFile()
 			}

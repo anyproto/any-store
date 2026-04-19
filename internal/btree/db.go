@@ -335,7 +335,7 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 		return nil, ErrClosed
 	}
 
-	maxFrame, slot, err := db.pager.beginRead()
+	hdr, maxFrame, slot, err := db.pager.beginReadHdr()
 	if err != nil {
 		db.mu.RUnlock()
 		<-db.readerSem
@@ -388,13 +388,11 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 	// Dual-write during per-connection-hdr migration. Step 5 will remove
 	// walMaxFrame; until then, tests still read it directly.
 	tx.walMaxFrame = maxFrame
-	// Readers only consume walHdr.mxFrame (via WalMaxFrame() and read paths).
-	// The full hdr (salts, cksums) is only needed by BeginWrite's BUSY_SNAPSHOT
-	// — avoid the SHM readHeader call on the read hot path (measured ~1µs
-	// overhead per BeginRead, visible as +20% on microsecond-scale IdEq
-	// queries). The maxFrame we already have from pager.beginRead is
-	// sufficient. Writers capture the full hdr in BeginWrite before lockWrite.
-	tx.walHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
+	if hdr.isInit != 0 {
+		tx.walHdr = hdr
+	} else {
+		tx.walHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
+	}
 	tx.walSlot = slot
 	tx.diskFileChangeCounter = fcc
 	tx.diskSchemaCookie = sc
@@ -447,7 +445,7 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 
 	for attempt := 0; ; attempt++ {
 		var err error
-		maxFrame, slot, err = db.pager.beginRead()
+		readSnap, maxFrame, slot, err = db.pager.beginReadHdr()
 		if err != nil {
 			db.mu.RUnlock()
 			db.writeMu.Unlock()
@@ -468,15 +466,6 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 		// inside beginWrite() (happens-before guarantee).
 		db.pager.writerWalSlot = slot
 
-		// Read the full live SHM hdr for BUSY_SNAPSHOT. This is the snapshot
-		// captured between pager.beginRead and lockWrite acquisition. In-
-		// process mode may have no valid SHM hdr; zero-init skips the check.
-		readSnap = WalIndexHdr{}
-		if !db.pager.inProcess && !db.pager.inMemory {
-			if hdr, valid := db.pager.wal.index.readHeader(); valid {
-				readSnap = hdr
-			}
-		}
 		err = db.pager.beginWriteWithSnapshot(readSnap)
 		if err == nil {
 			break
