@@ -1479,6 +1479,23 @@ for the design). Summary:
 Post-migration reliability sits in the ~93-100% band per 30-run sample,
 up from the ~77-95% pre-migration band.
 
+### Checkpoint mxFrame source fix (commit `9023f5b`)
+
+A ~4-5% residual failure persisted through all per-tx walHdr work
+because none of those steps touched `checkpointWithMode`'s mxFrame
+source. Root cause: `wal.go:checkpointWithMode` used
+`nf := w.index.mxCommitFrame.Load()` which is process-local. In
+multi-process mode, a sibling's committed frames appear in the SHM
+header but NOT in this process's local `mxCommitFrame`. Close-time
+`checkpointPassive` only backfilled THIS process's own frames, then
+`truncateFile` wiped the WAL — destroying sibling's uncopied frames.
+
+Fix: in multi-process mode, read `nf` from the live SHM hdr at
+checkpoint start. Matches SQLite's `walCheckpoint` which reads
+`pWal->hdr.mxFrame` populated by `walIndexTryHdr`.
+
+Reliability: 100/100 on the 100-run multi-process index harness.
+
 ### Not Implemented (by design)
 
 These SQLite features are intentionally absent:
