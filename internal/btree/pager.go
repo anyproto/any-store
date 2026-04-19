@@ -179,13 +179,14 @@ type pager struct {
 
 // savepointState captures the state needed to rollback to a savepoint.
 type savepointState struct {
-	id       int
-	dbSize   uint32
-	pages    map[uint32][]byte // pgno -> copy of page data before modification
-	walFrame   uint32            // WAL frame count at savepoint time
-	walCksum1  uint32            // WAL cumulative checksum-1 at savepoint time
-	walCksum2  uint32            // WAL cumulative checksum-2 at savepoint time
-	header     dbHeader          // snapshot of database header at savepoint time (fix 9.3)
+	id     int
+	dbSize uint32
+	pages  map[uint32][]byte // pgno -> copy of page data before modification
+	// walHdr captures the WAL frame count + cumulative checksums at savepoint
+	// time. mxFrame, aFrameCksum[0], aFrameCksum[1] are the rollback-critical
+	// fields; other fields match the enclosing transaction's hdr.
+	walHdr WalIndexHdr
+	header dbHeader // snapshot of database header at savepoint time (fix 9.3)
 }
 
 // newPager creates a new pager for the given database path.
@@ -1655,13 +1656,15 @@ func (p *pager) savepoint() (int, error) {
 			id, dbSz, walFr, p.writerCache.nDirty, len(p.dontWritePages), len(p.hasContent))
 	}
 	p.savepoints = append(p.savepoints, savepointState{
-		id:        id,
-		dbSize:    dbSz,
-		pages:     make(map[uint32][]byte),
-		walFrame:  walFr,
-		walCksum1: p.wal.cksum1,
-		walCksum2: p.wal.cksum2,
-		header:    p.header, // snapshot header for rollback (fix 9.3)
+		id:     id,
+		dbSize: dbSz,
+		pages:  make(map[uint32][]byte),
+		walHdr: WalIndexHdr{
+			isInit:      1,
+			mxFrame:     walFr,
+			aFrameCksum: [2]uint32{p.wal.cksum1, p.wal.cksum2},
+		},
+		header: p.header, // snapshot header for rollback (fix 9.3)
 	})
 	return id, nil
 }
@@ -1689,17 +1692,17 @@ func (p *pager) rollbackToSavepoint(id int) error {
 	p.writerCache.truncate(sp.dbSize)
 
 	// Roll back spilled frames in the WAL index to the savepoint's WAL position.
-	p.wal.index.rollbackToFrame(sp.walFrame)
+	p.wal.index.rollbackToFrame(sp.walHdr.mxFrame)
 	// Restore nFrame and cumulative checksums so the next write overwrites
 	// the dead spill frames with a correct checksum chain.
-	p.wal.nFrame.Store(sp.walFrame)
-	p.wal.cksum1 = sp.walCksum1
-	p.wal.cksum2 = sp.walCksum2
+	p.wal.nFrame.Store(sp.walHdr.mxFrame)
+	p.wal.cksum1 = sp.walHdr.aFrameCksum[0]
+	p.wal.cksum2 = sp.walHdr.aFrameCksum[1]
 
 	// Truncate in-memory WAL frames to match restored nFrame.
 	if p.wal.inMemory {
 		p.wal.mu.Lock()
-		p.wal.memFrames = p.wal.memFrames[:sp.walFrame]
+		p.wal.memFrames = p.wal.memFrames[:sp.walHdr.mxFrame]
 		p.wal.mu.Unlock()
 	}
 
