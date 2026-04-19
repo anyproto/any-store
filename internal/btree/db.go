@@ -388,7 +388,19 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 	// Dual-write during per-connection-hdr migration. Step 5 will remove
 	// walMaxFrame; until then, tests still read it directly.
 	tx.walMaxFrame = maxFrame
-	tx.walHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
+	// Populate walHdr with the full SHM hdr in multi-process mode (so
+	// BUSY_SNAPSHOT has salts, cksums, etc.). In-process mode skips SHM
+	// header updates on commit (wal.go writeFrames `!w.inProcess` guard),
+	// so its SHM hdr mxFrame is stale; synthesize walHdr from maxFrame.
+	if !db.pager.inProcess && !db.pager.inMemory {
+		if hdr, valid := db.pager.wal.index.readHeader(); valid {
+			tx.walHdr = hdr
+		} else {
+			tx.walHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
+		}
+	} else {
+		tx.walHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
+	}
 	tx.walSlot = slot
 	tx.diskFileChangeCounter = fcc
 	tx.diskSchemaCookie = sc
@@ -437,6 +449,7 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	var maxFrame uint32
 	var slot int
 	var fcc, sc uint32
+	var readSnap WalIndexHdr
 
 	for attempt := 0; ; attempt++ {
 		var err error
@@ -461,7 +474,16 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 		// inside beginWrite() (happens-before guarantee).
 		db.pager.writerWalSlot = slot
 
-		err = db.pager.beginWrite()
+		// Read the full live SHM hdr for BUSY_SNAPSHOT. This is the snapshot
+		// captured between pager.beginRead and lockWrite acquisition. In-
+		// process mode may have no valid SHM hdr; zero-init skips the check.
+		readSnap = WalIndexHdr{}
+		if !db.pager.inProcess && !db.pager.inMemory {
+			if hdr, valid := db.pager.wal.index.readHeader(); valid {
+				readSnap = hdr
+			}
+		}
+		err = db.pager.beginWriteWithSnapshot(readSnap)
 		if err == nil {
 			break
 		}
@@ -484,7 +506,14 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	tx.ReadTx.cache = nil // writer uses shared pcache, not a reader cache
 	tx.ReadTx.closed = false
 	tx.ReadTx.walMaxFrame = maxFrame
-	tx.ReadTx.walHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
+	// Reuse the readSnap hdr captured above for BUSY_SNAPSHOT. In-process
+	// mode has readSnap=zero; synthesize minimal hdr so read paths consuming
+	// walHdr.mxFrame see the correct frame ceiling.
+	if readSnap.isInit != 0 {
+		tx.ReadTx.walHdr = readSnap
+	} else {
+		tx.ReadTx.walHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
+	}
 	tx.ReadTx.walSlot = slot
 	tx.ReadTx.writable = true
 	tx.ReadTx.diskFileChangeCounter = fcc

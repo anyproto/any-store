@@ -2126,15 +2126,24 @@ func (w *wal) endRead(slot int) {
 // Uses the busy handler for retry/backoff if configured (issue 1.7).
 //
 // For multi-process mode, performs a BUSY_SNAPSHOT check after acquiring the
-// lock: compares the saved SHM header snapshot (from tryBeginRead) against the
-// current SHM header. If they differ, another process committed since our last
-// read, so we reject the write to prevent stale-state corruption.
-// Matches sqlite3WalBeginWriteTransaction (wal.c:3700-3714).
+// lock: compares the caller's read snapshot (tx.walHdr, captured at BeginRead
+// time) against the current SHM header. If they differ, another process
+// committed since our last read, so we reject the write to prevent stale-state
+// corruption. Matches sqlite3WalBeginWriteTransaction (wal.c:3700-3714).
+//
+// `readSnap` is the reader's snapshot. Pass zero-value hdr (isInit=0) to skip
+// the BUSY_SNAPSHOT check — used by raw tests that don't hold a tx.
 //
 // Returns stateChanged=true if the WAL state was re-synced from SHM (indicating
 // another process committed or checkpointed since the last local write).
 // Callers should invalidate any stale page caches when stateChanged is true.
 func (w *wal) beginWrite() (stateChanged bool, err error) {
+	return w.beginWriteWithSnapshot(w.readSnapshot)
+}
+
+// beginWriteWithSnapshot is the generalized form: caller supplies the
+// read snapshot for the BUSY_SNAPSHOT check. See beginWrite for semantics.
+func (w *wal) beginWriteWithSnapshot(readSnap WalIndexHdr) (stateChanged bool, err error) {
 	if err := walBusyLock(w.index, w.busyHandler, lockWrite, lockExclusive); err != nil {
 		return false, err
 	}
@@ -2142,13 +2151,10 @@ func (w *wal) beginWrite() (stateChanged bool, err error) {
 		return false, nil
 	}
 
-	// BUSY_SNAPSHOT: compare saved snapshot against current SHM header.
-	// Matches sqlite3WalBeginWriteTransaction (wal.c:3712):
-	//   memcmp(&pWal->hdr, walIndexHdr(pWal), sizeof(WalIndexHdr))
-	// Only check if readSnapshot was populated (isInit==1 from saveReadSnapshot);
-	// raw wal.beginWrite() callers that skip saveReadSnapshot get isInit==0.
+	// BUSY_SNAPSHOT: compare caller's snapshot against current SHM header.
+	// Only check if readSnap is populated (isInit==1); zero hdr skips.
 	hdr, valid := w.index.readHeader()
-	if valid && w.readSnapshot.isInit != 0 && hdr != w.readSnapshot {
+	if valid && readSnap.isInit != 0 && hdr != readSnap {
 		_ = w.index.unlock(lockWrite, lockExclusive)
 		return false, ErrBusySnapshot
 	}

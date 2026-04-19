@@ -435,13 +435,17 @@ func (p *pager) endRead(slot int) {
 }
 
 // beginWrite starts a write transaction (must hold a read transaction first).
+// Kept for backward compat with tests that don't thread a tx. Uses zero
+// snapshot → skips BUSY_SNAPSHOT check (acceptable for single-process tests).
 func (p *pager) beginWrite() error {
-	// Save SHM header snapshot for BUSY_SNAPSHOT check in wal.beginWrite.
-	// Called here (single writer goroutine context) rather than in tryBeginRead
-	// which is also called by concurrent reader goroutines.
-	p.wal.saveReadSnapshot()
+	return p.beginWriteWithSnapshot(WalIndexHdr{})
+}
 
-	stateChanged, err := p.wal.beginWrite()
+// beginWriteWithSnapshot is the production entry point. readSnap is the
+// caller's WAL hdr from BeginRead (per-tx walHdr). BUSY_SNAPSHOT compares
+// it against live SHM inside wal.beginWriteWithSnapshot.
+func (p *pager) beginWriteWithSnapshot(readSnap WalIndexHdr) error {
+	stateChanged, err := p.wal.beginWriteWithSnapshot(readSnap)
 	if err != nil {
 		return err
 	}
