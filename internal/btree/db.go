@@ -388,19 +388,13 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 	// Dual-write during per-connection-hdr migration. Step 5 will remove
 	// walMaxFrame; until then, tests still read it directly.
 	tx.walMaxFrame = maxFrame
-	// Populate walHdr with the full SHM hdr in multi-process mode (so
-	// BUSY_SNAPSHOT has salts, cksums, etc.). In-process mode skips SHM
-	// header updates on commit (wal.go writeFrames `!w.inProcess` guard),
-	// so its SHM hdr mxFrame is stale; synthesize walHdr from maxFrame.
-	if !db.pager.inProcess && !db.pager.inMemory {
-		if hdr, valid := db.pager.wal.index.readHeader(); valid {
-			tx.walHdr = hdr
-		} else {
-			tx.walHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
-		}
-	} else {
-		tx.walHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
-	}
+	// Readers only consume walHdr.mxFrame (via WalMaxFrame() and read paths).
+	// The full hdr (salts, cksums) is only needed by BeginWrite's BUSY_SNAPSHOT
+	// — avoid the SHM readHeader call on the read hot path (measured ~1µs
+	// overhead per BeginRead, visible as +20% on microsecond-scale IdEq
+	// queries). The maxFrame we already have from pager.beginRead is
+	// sufficient. Writers capture the full hdr in BeginWrite before lockWrite.
+	tx.walHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
 	tx.walSlot = slot
 	tx.diskFileChangeCounter = fcc
 	tx.diskSchemaCookie = sc
