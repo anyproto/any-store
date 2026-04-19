@@ -2103,6 +2103,17 @@ func (p *pager) close() error {
 			// in that case would destroy uncopied frames and corrupt the DB.
 			// Matches SQLite's sqlite3WalClose(): walLimitSize only called
 			// when rc==SQLITE_OK.
+			//
+			// Hold WAL_WRITE_LOCK across checkpoint+truncate so a peer
+			// process cannot be mid-writeFrames. Without this gate, P1's
+			// truncateFile races with P2's WriteAt: the WAL file gets
+			// a zero header at offset 0 while P2's frames land at a high
+			// offset, making parent reopen unable to recover P2's data
+			// (residual ~5% failure mode in
+			// TestMultiProcessIndex_ConcurrentSketchUpdates).
+			if !p.inProcess && !p.inMemory {
+				_ = walBusyLock(p.wal.index, p.wal.busyHandler, lockWrite, lockExclusive)
+			}
 			if debugTrace {
 				trace("close: starting passive checkpoint before WAL truncation, dbSize=%d", p.dbSize.Load())
 			}
@@ -2114,6 +2125,9 @@ func (p *pager) close() error {
 			}
 			if cpErr == nil {
 				p.wal.truncateFile()
+			}
+			if !p.inProcess && !p.inMemory {
+				_ = p.wal.index.unlock(lockWrite, lockExclusive)
 			}
 		}
 		_ = p.wal.close()
