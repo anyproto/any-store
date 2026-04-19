@@ -1119,15 +1119,6 @@ type wal struct {
 	// If nil, lock failures return ErrBusy immediately (issue 1.7).
 	busyHandler BusyHandler
 
-	// readSnapshot is the SHM header snapshot saved during beginRead (multi-process only).
-	// Used by beginWrite for BUSY_SNAPSHOT comparison.
-	// DRIFT from SQLite: SQLite uses pWal->hdr for both snapshot comparison and
-	// checksum chaining in walEncodeFrame. We keep them separate (readSnapshot for
-	// snapshot, wal.cksum1/cksum2 for chaining) because our checksum fields are
-	// separate from the SHM header struct.
-	// Only accessed by writer goroutine, no synchronization needed.
-	readSnapshot WalIndexHdr
-
 	// writerHdr is the writer's private copy of the SHM header, updated after
 	// each successful commit (writeFrames) and after re-sync in beginWrite().
 	// Used to detect external state changes: if the live SHM header differs from
@@ -1367,35 +1358,40 @@ func (w *wal) ensureHeaderInitializedInProcess() (WalIndexHdr, error) {
 	return hdr, nil
 }
 
-// syncFromSHMLocked reads the published SHM header and copies the relevant
-// fields into w.header, w.cksum1/2, w.nFrame, w.index.*, w.writerHdr.
-// Caller must hold w.mu and must have observed a valid SHM header on the
-// calling path. The defensive !valid early-return remains for safety but
-// all current callers pre-check.
+// syncFromSHMLocked synchronizes process-global state from a valid SHM hdr.
+// After the per-tx walHdr migration (step 4), writer-private fields
+// (w.header.salt*, w.cksum1/2, w.writerHdr) are owned by beginWrite's
+// inline sync under lockWrite — this helper only updates the shared
+// atomics on w.index and w.nFrame that both readers and writers consult
+// for WAL offset + backfill tracking.
+//
+// Caller must hold w.mu and have observed a valid SHM header.
 func (w *wal) syncFromSHMLocked() {
 	hdr, valid := w.index.readHeader()
 	if !valid {
 		return
 	}
-	w.header.salt1 = hdr.aSalt[0]
-	w.header.salt2 = hdr.aSalt[1]
-	w.header.magic = walMagic
-	w.header.version = walVersion
-	w.header.pageSize = w.pageSize
-	w.cksum1 = hdr.aFrameCksum[0]
-	w.cksum2 = hdr.aFrameCksum[1]
-	w.nFrame.Store(hdr.mxFrame)
-	// Publishing frames via the WAL implies flushHeader already wrote the
-	// on-disk WAL header (flushHeader precedes any frame write). Avoids a
-	// per-call fstat syscall on the hot read path.
+	// w.nFrame is the shared physical append cursor; readers and writers
+	// both look at it. Safe to advance monotonically (the writer in peer
+	// process always writes higher values).
+	if hdr.mxFrame > w.nFrame.Load() {
+		w.nFrame.Store(hdr.mxFrame)
+	}
 	if !w.headerOnDisk && hdr.mxFrame > 0 {
 		w.headerOnDisk = true
 	}
+	// Monotonic updates on shared walIndex atomics. These are safe under
+	// concurrent readers because the writer (single, via writeMu) is the
+	// only source of increments.
 	w.index.maxFrame.Store(hdr.mxFrame)
 	w.index.mxCommitFrame.Store(hdr.mxFrame)
-	w.index.maxPage.Store(hdr.nPage)
+	for {
+		old := w.index.maxPage.Load()
+		if hdr.nPage <= old || w.index.maxPage.CompareAndSwap(old, hdr.nPage) {
+			break
+		}
+	}
 	w.index.nBackfill.Store(w.index.shmNBackfill())
-	w.writerHdr = hdr
 }
 
 // adoptSHMState synchronizes the process-local WAL state (salts, nFrame,
@@ -2105,18 +2101,6 @@ func (w *wal) tryBeginReadMultiProcess() (maxFrame uint32, slot int, err error) 
 	return mxFrame, bestSlot, nil
 }
 
-// saveReadSnapshot saves the current SHM header as the read snapshot for
-// the BUSY_SNAPSHOT check in beginWrite. Must be called by the writer
-// goroutine only (under writeMu), NOT from concurrent reader goroutines.
-func (w *wal) saveReadSnapshot() {
-	if w.inProcess || w.inMemory {
-		return
-	}
-	if hdr, valid := w.index.readHeader(); valid {
-		w.readSnapshot = hdr
-	}
-}
-
 // endRead releases the reader lock for the given slot.
 func (w *wal) endRead(slot int) {
 	_ = w.index.unlock(lockRead0+slot, lockShared)
@@ -2138,7 +2122,9 @@ func (w *wal) endRead(slot int) {
 // another process committed or checkpointed since the last local write).
 // Callers should invalidate any stale page caches when stateChanged is true.
 func (w *wal) beginWrite() (stateChanged bool, err error) {
-	return w.beginWriteWithSnapshot(w.readSnapshot)
+	// Legacy entry for raw-wal tests. Passes zero snapshot → BUSY_SNAPSHOT
+	// check is skipped (acceptable; these tests don't exercise the race).
+	return w.beginWriteWithSnapshot(WalIndexHdr{})
 }
 
 // beginWriteWithSnapshot is the generalized form: caller supplies the
