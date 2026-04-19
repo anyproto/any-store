@@ -1064,8 +1064,10 @@ func TestEnsureHeaderInitialized_FreshSHM(t *testing.T) {
 	require.NoError(t, err)
 	clear(region[:walIndexHdrSize*2])
 
-	// ensureHeaderInitialized must leave SHM in a valid state with isInit==1.
-	require.NoError(t, w.ensureHeaderInitialized())
+	// ensureHeaderInitialized must leave SHM in a valid state with isInit==1
+	// and return the published hdr.
+	_, err = w.ensureHeaderInitialized()
+	require.NoError(t, err)
 	hdr, valid := w.index.readHeader()
 	require.True(t, valid)
 	require.Equal(t, uint8(1), hdr.isInit)
@@ -1106,7 +1108,8 @@ func TestEnsureHeaderInitialized_AdoptsValidSHM(t *testing.T) {
 	w2.inProcess = false
 	require.NoError(t, w2.open())
 	defer w2.close()
-	require.NoError(t, w2.ensureHeaderInitialized())
+	_, err = w2.ensureHeaderInitialized()
+	require.NoError(t, err)
 
 	require.Equal(t, saltsA[0], w2.header.salt1, "must adopt salts, not generate new ones")
 	require.Equal(t, saltsA[1], w2.header.salt2)
@@ -1151,7 +1154,8 @@ func TestEnsureHeaderInitialized_TriggersRecoveryWhenSHMInvalid(t *testing.T) {
 	_, validBefore := w2.index.readHeader()
 	require.False(t, validBefore, "SHM should be invalid after manual clear")
 
-	require.NoError(t, w2.ensureHeaderInitialized())
+	_, err = w2.ensureHeaderInitialized()
+	require.NoError(t, err)
 
 	// After, SHM must be valid and mxFrame must match recovered frames.
 	hdr, validAfter := w2.index.readHeader()

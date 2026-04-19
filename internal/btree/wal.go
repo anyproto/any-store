@@ -1254,64 +1254,68 @@ func (w *wal) open() error {
 // alone. We additionally take WAL_CKPT_LOCK + WAL_RECOVER_LOCK so a reader
 // triggering recovery fences peers via the same barrier that our Item-1
 // reader handshake uses.
-func (w *wal) ensureHeaderInitialized() error {
+// ensureHeaderInitialized guarantees the SHM header is published and returns
+// a snapshot of it so callers can stamp it onto their per-tx walHdr. During
+// the per-connection-hdr migration (spec:
+// docs/superpowers/specs/2026-04-18-per-connection-hdr-design.md), the helper
+// still calls syncFromSHMLocked to update process-global writer state
+// (w.header.salt*, w.cksum1/2, w.nFrame, w.writerHdr). Later steps will
+// narrow that to writer paths only.
+//
+// The returned hdr is the live SHM header value at the moment of observation.
+// On error, the zero hdr is returned and the error signals the retry class.
+func (w *wal) ensureHeaderInitialized() (WalIndexHdr, error) {
 	if w.inProcess || w.inMemory {
 		return w.ensureHeaderInitializedInProcess()
 	}
 
 	// Fast path: a peer (or we) already published a valid header.
-	if _, valid := w.index.readHeader(); valid {
+	if hdr, valid := w.index.readHeader(); valid {
 		w.mu.Lock()
 		w.syncFromSHMLocked()
 		w.mu.Unlock()
-		return nil
+		return hdr, nil
 	}
 
 	// Slow path: acquire WAL_WRITE_LOCK exclusive, retry, then recover if still bad.
 	if err := w.index.lock(lockWrite, lockExclusive); err != nil {
 		if err == ErrBusy {
-			// A peer holds WAL_WRITE_LOCK; take the Item-1 RECOVER_LOCK shared
-			// fence as a "wait for them" barrier, then re-check.
 			if e := w.index.lock(lockRecover, lockShared); e == nil {
 				_ = w.index.unlock(lockRecover, lockShared)
 			}
-			if _, valid := w.index.readHeader(); valid {
+			if hdr, valid := w.index.readHeader(); valid {
 				w.mu.Lock()
 				w.syncFromSHMLocked()
 				w.mu.Unlock()
-				return nil
+				return hdr, nil
 			}
-			return errWALRetry
+			return WalIndexHdr{}, errWALRetry
 		}
-		return err
+		return WalIndexHdr{}, err
 	}
 	defer func() { _ = w.index.unlock(lockWrite, lockExclusive) }()
 
 	// Re-check under WAL_WRITE_LOCK: a peer may have just published.
-	if _, valid := w.index.readHeader(); valid {
+	if hdr, valid := w.index.readHeader(); valid {
 		w.mu.Lock()
 		w.syncFromSHMLocked()
 		w.mu.Unlock()
-		return nil
+		return hdr, nil
 	}
 
 	// Header still bad → run recovery. Acquire CKPT + RECOVER exclusive too.
-	// Normalize ErrBusy → errWALRetry so callers have a single retry signal
-	// (happens when a peer is concurrently checkpointing or initializing;
-	// checkpointWithMode uses C→W order while we use W→C→R so under contention
-	// the loser observes ErrBusy via non-blocking F_SETLK — no deadlock).
 	if err := w.index.lock(lockCheckpoint, lockExclusive); err != nil {
 		if err == ErrBusy {
-			return errWALRetry
+			return WalIndexHdr{}, errWALRetry
 		}
-		return err
+		return WalIndexHdr{}, err
 	}
 	defer func() { _ = w.index.unlock(lockCheckpoint, lockExclusive) }()
 	if err := w.index.lock(lockRecover, lockExclusive); err != nil {
 		if err == ErrBusy {
-			return errWALRetry
+			return WalIndexHdr{}, errWALRetry
 		}
-		return err
+		return WalIndexHdr{}, err
 	}
 	defer func() { _ = w.index.unlock(lockRecover, lockExclusive) }()
 
@@ -1319,43 +1323,48 @@ func (w *wal) ensureHeaderInitialized() error {
 	defer w.mu.Unlock()
 
 	// Final race check under all three locks.
-	if _, valid := w.index.readHeader(); valid {
+	if hdr, valid := w.index.readHeader(); valid {
 		w.syncFromSHMLocked()
-		return nil
+		return hdr, nil
 	}
 
 	info, err := w.file.Stat()
 	if err != nil {
-		return err
+		return WalIndexHdr{}, err
 	}
 	if info.Size() >= walHeaderSize {
-		return w.recoverLocked()
+		if err := w.recoverLocked(); err != nil {
+			return WalIndexHdr{}, err
+		}
+	} else {
+		w.initHeaderStateLocked()
 	}
-	w.initHeaderStateLocked()
-	return nil
+	hdr, _ := w.index.readHeader()
+	return hdr, nil
 }
 
 // ensureHeaderInitializedInProcess is the in-process analog. Heap SHM is
 // zero-initialized per process, so on first call we always run initHeaderState.
-func (w *wal) ensureHeaderInitializedInProcess() error {
+func (w *wal) ensureHeaderInitializedInProcess() (WalIndexHdr, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.inProcessInit {
-		return nil
-	}
-	if !w.inMemory && w.file != nil {
-		info, err := w.file.Stat()
-		if err == nil && info.Size() >= walHeaderSize {
-			if err := w.recoverLocked(); err != nil {
-				return err
+	if !w.inProcessInit {
+		if !w.inMemory && w.file != nil {
+			info, err := w.file.Stat()
+			if err == nil && info.Size() >= walHeaderSize {
+				if err := w.recoverLocked(); err != nil {
+					return WalIndexHdr{}, err
+				}
+				w.inProcessInit = true
+				hdr, _ := w.index.readHeader()
+				return hdr, nil
 			}
-			w.inProcessInit = true
-			return nil
 		}
+		w.initHeaderStateLocked()
+		w.inProcessInit = true
 	}
-	w.initHeaderStateLocked()
-	w.inProcessInit = true
-	return nil
+	hdr, _ := w.index.readHeader()
+	return hdr, nil
 }
 
 // syncFromSHMLocked reads the published SHM header and copies the relevant
