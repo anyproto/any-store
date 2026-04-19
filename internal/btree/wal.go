@@ -2278,7 +2278,23 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	// excluded. nFrame may be ahead of mxCommitFrame during an active spill.
 	// SQLite's walCheckpoint uses pWal->hdr.mxFrame which is only updated
 	// at commit time via walIndexWriteHdr.
-	nf := w.index.mxCommitFrame.Load()
+	//
+	// In multi-process mode, read mxFrame from the SHM header, not the
+	// process-local mxCommitFrame. A sibling process may have committed
+	// frames we haven't synced — without this, our close-time checkpoint
+	// would only backfill our own frames, then truncate the WAL and lose
+	// the sibling's data (measured as the residual ~4% failure in
+	// TestMultiProcessIndex_ConcurrentSketchUpdates).
+	var nf uint32
+	if !w.inProcess && !w.inMemory {
+		if hdr, valid := w.index.readHeader(); valid {
+			nf = hdr.mxFrame
+		} else {
+			nf = w.index.mxCommitFrame.Load()
+		}
+	} else {
+		nf = w.index.mxCommitFrame.Load()
+	}
 	if nf == 0 {
 		return nil
 	}
