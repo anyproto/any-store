@@ -1383,6 +1383,89 @@ writes to the same database file concurrently with the parent.
    `pager.beginWrite` (writer-only context) to avoid data races with concurrent
    reader goroutines calling `tryBeginRead`.
 
+### Lazy `ensureHeaderInitialized` helper (commits 2026-04-18)
+
+`wal.go:ensureHeaderInitialized` is an experimental lazy counterpart to
+`walIndexReadHdr` (wal.c:2640-2745). Structure matches SQLite:
+
+- Fast path: `readHeader()` → if valid, return.
+- Slow path: `walLockExclusive(WAL_WRITE_LOCK)` → retry `readHeader` → if still
+  invalid, recover.
+- Busy-path fence: `walLockShared(WAL_RECOVER_LOCK)` then release, matching
+  wal.c:3089.
+
+Currently the helper is invoked defensively from 3 targeted tests
+(`TestEnsureHeaderInitialized_*`) but NOT from production code. Production
+code continues to use eager SHM init via `wal.open` + `adoptSHMState` /
+`recoverLocked` / `initHeaderStateLocked`. See "SQLite-alignment blocker"
+below for why cold-open was attempted and reverted.
+
+**Drifts from SQLite's `walIndexReadHdr` preserved:**
+
+1. **Triple-lock recovery gate**: SQLite `walIndexRecover` takes
+   `WAL_ALL_BUT_WRITE..READ_LOCK(0)` exclusive (wal.c:1400-1401). Our
+   `recoverLocked` requires callers to hold `lockCheckpoint + lockRecover`
+   exclusive. The helper takes `lockWrite → lockCheckpoint → lockRecover` under
+   non-blocking `F_SETLK`; under contention with `checkpointWithMode` (which
+   uses `CKPT → WRITE` order) the loser observes `ErrBusy` — no deadlock.
+
+2. **`errBusyRecovery` vs `errWALRetry`**: SQLite returns
+   `SQLITE_BUSY_RECOVERY` when another process is actively recovering (wal.c:
+   3089-3094 via `walLockShared` probe). Our helper distinguishes the two:
+   `errBusyRecovery` = peer is recovering (warrant backoff); `errWALRetry` =
+   transient race (immediate retry). Current callers (test-only) don't use
+   the distinction.
+
+3. **`headerOnDisk` shortcut in `syncFromSHMLocked`**: we infer "on-disk WAL
+   header exists" from `hdr.mxFrame > 0` rather than `fstat`-ing, relying on
+   the invariant that `flushHeader` precedes every frame write.
+
+### SQLite-alignment blocker: cold `wal.open` (2026-04-18)
+
+A T3 attempt to make `wal.open` cold (no SHM locks, no header read, no
+recovery — matching `sqlite3WalOpen` at wal.c:1641-1739) regressed the
+multi-process reliability harness (`TestMultiProcessIndex_ConcurrentSketch‐
+Updates`) from ~87% to 0-27% across three independent implementations
+(commits `60f2050` reverted, a stashed retry, `3e10dc9`+follow-ups
+reverted).
+
+Root cause is architectural, not implementation. SQLite's `Wal*` lives per
+connection with exclusive caller semantics; `pWal->hdr` is the connection's
+private snapshot. any-store multiplexes many goroutines (concurrent readers
++ single writer) onto one `*wal` struct. Fields like `w.nFrame`,
+`w.cksum1/2`, `w.header.salt1/2`, `w.writerHdr` are process-global. A lazy
+header-init from any reader path mutates the writer's view mid-spill.
+
+Three candidate fixes were evaluated:
+
+1. **Per-tx `walHdr` on `ReadTx`**: widen `ReadTx.walMaxFrame uint32` to a
+   full `WalIndexHdr` field, route reader/writer lookups through
+   `tx.walHdr.mxFrame`. Research found this is the cleanest mapping of
+   SQLite's "single owner per hdr" invariant into any-store's tx model.
+   Blocked: the writer path in `writeFrames` requires `w.nFrame` (physical
+   append cursor) + `w.cksum1/2` (checksum chain) in `*wal`. Splitting
+   these out cascaded through ~20 test files with subtle semantic gaps;
+   reliability still regressed.
+
+2. **Shared `readSnapshot` moved to `tryBeginReadMultiProcess`**: populate
+   at every `BeginRead` so `BUSY_SNAPSHOT` has a meaningful pre-write
+   baseline. Blocked: still a single shared field; concurrent readers
+   clobber each other's snapshots, and the 500ms sleep between open and
+   write tx in the failing test means the writer's own `beginRead`
+   captures post-sleep state regardless.
+
+3. **Skip WAL truncate in multi-process close**: tested after trace logs
+   showed P1's close-time `truncateFile` can race with P2's mid-flight
+   `writeFrames`. Fix made things worse — without truncate, salt
+   inconsistency across subprocess writes surfaces different corruption.
+
+**Decision**: eager `wal.open` stays. A full SQLite alignment at this layer
+requires introducing per-connection `hdr` state (mirror of `pWal->hdr`) and
+propagating it through readers, writers, savepoints, commit paths —
+tracked as a separate multi-week refactor. See
+`docs/superpowers/plans/2026-04-18-wal-open-sqlite-alignment.md` for the
+full T3 analysis and the three failed implementation attempts.
+
 ### Not Implemented (by design)
 
 These SQLite features are intentionally absent:
