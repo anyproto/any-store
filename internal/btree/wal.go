@@ -740,24 +740,6 @@ func (wi *walIndex) reset() {
 	wi.shmWriteCkptInfo()
 }
 
-func atomicStoreBytes32(dst, src []byte) {
-	for i := 0; i < len(src); i += 4 {
-		atomic.StoreUint32(
-			(*uint32)(unsafe.Pointer(&dst[i])),
-			binary.LittleEndian.Uint32(src[i:i+4]),
-		)
-	}
-}
-
-func atomicLoadBytes32(src, dst []byte) {
-	for i := 0; i < len(dst); i += 4 {
-		binary.LittleEndian.PutUint32(
-			dst[i:i+4],
-			atomic.LoadUint32((*uint32)(unsafe.Pointer(&src[i]))),
-		)
-	}
-}
-
 // writeHeader writes the WAL index header to region 0 of the shm.
 // Matches SQLite's walIndexWriteHdr():
 //   - Computes aCksum over the header fields
@@ -803,9 +785,15 @@ func (wi *walIndex) writeHeader(maxFrame, maxPage, nBackfill uint32, frameCksum,
 		walShmBarrier()
 	}
 
-	// Write copy 2 first (offset walIndexHdrSize = 48), then barrier, then copy 1
-	// This matches SQLite's write order: copy 2 first, barrier, copy 1.
-	atomicStoreBytes32(region[walIndexHdrSize:walIndexHdrSize*2], buf[:])
+	// Write copy 2 first (offset walIndexHdrSize = 48), then barrier, then
+	// copy 1. Matches SQLite's walIndexWriteHdr (wal.c:942-954) which uses
+	// a plain memcpy per copy under WAL_WRITE_LOCK: the dual-copy + memcmp
+	// in readers + the aCksum covered by writers both guard against torn
+	// reads. Per-word atomic stores are unnecessary here (the writer holds
+	// an exclusive lock) and subtly wrong — a reader's atomic load could
+	// observe mixed-version u32s whose checksum happens to match both
+	// generations at the interleave.
+	copy(region[walIndexHdrSize:walIndexHdrSize*2], buf[:])
 
 	// Memory barrier between the two copies (7.2 + 7.5).
 	// For mmap'd shared memory, this ensures that the second copy is fully
@@ -814,7 +802,7 @@ func (wi *walIndex) writeHeader(maxFrame, maxPage, nBackfill uint32, frameCksum,
 		walShmBarrier()
 	}
 
-	atomicStoreBytes32(region[0:walIndexHdrSize], buf[:])
+	copy(region[0:walIndexHdrSize], buf[:])
 
 	return nil
 }
@@ -833,10 +821,13 @@ func (wi *walIndex) readHeader() (WalIndexHdr, bool) {
 		return WalIndexHdr{}, false
 	}
 
-	// Read copy 1 (offset 0)
+	// Read copy 1 (offset 0). Plain copy under readHeader's dual-copy +
+	// memcmp protocol, matching walIndexTryHdr (wal.c:2570-2620). The
+	// subsequent memcmp against copy 2 is the torn-read detector; per-word
+	// atomic loads add no safety and defeat the design.
 	var hdr1 WalIndexHdr
 	var buf1 [walIndexHdrSize]byte
-	atomicLoadBytes32(region[0:walIndexHdrSize], buf1[:])
+	copy(buf1[:], region[0:walIndexHdrSize])
 	hdr1.deserialize(buf1[:])
 
 	// Memory barrier before reading copy 2
@@ -847,7 +838,7 @@ func (wi *walIndex) readHeader() (WalIndexHdr, bool) {
 	// Read copy 2 (offset walIndexHdrSize = 48)
 	var hdr2 WalIndexHdr
 	var buf2 [walIndexHdrSize]byte
-	atomicLoadBytes32(region[walIndexHdrSize:walIndexHdrSize*2], buf2[:])
+	copy(buf2[:], region[walIndexHdrSize:walIndexHdrSize*2])
 	hdr2.deserialize(buf2[:])
 
 	// Both copies must match
