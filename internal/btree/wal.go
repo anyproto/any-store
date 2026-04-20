@@ -1432,24 +1432,6 @@ func (w *wal) syncFromSHMLocked() {
 	w.index.nBackfill.Store(w.index.shmNBackfill())
 }
 
-// floorLiveHdr keeps a process's view of the WAL header monotonic when SHM
-// briefly appears to move backward under unchanged salts. A committed WAL
-// header must never regress without a reset (which changes salts), so when
-// we have already published a newer writerHdr for the same WAL generation,
-// prefer it over the older SHM snapshot.
-func (w *wal) floorLiveHdr(hdr WalIndexHdr) WalIndexHdr {
-	if hdr.isInit == 0 || w.writerHdr.isInit == 0 {
-		return hdr
-	}
-	if hdr.aSalt != w.writerHdr.aSalt {
-		return hdr
-	}
-	if hdr.mxFrame >= w.writerHdr.mxFrame {
-		return hdr
-	}
-	return w.writerHdr
-}
-
 // adoptSHMState synchronizes the process-local WAL state (salts, nFrame,
 // checksums, header-on-disk flag) from an already-initialized SHM header.
 // Called from wal.open when another process has already written SHM.
@@ -2165,7 +2147,6 @@ func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame uint32, s
 		}
 		return WalIndexHdr{}, 0, 0, errWALRetry
 	}
-	hdr = w.floorLiveHdr(hdr)
 	mxFrame := hdr.mxFrame
 
 	// Step 2: Read nBackfill directly from SHM (SQLite: AtomicLoad(&pInfo->nBackfill))
@@ -2179,12 +2160,9 @@ func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame uint32, s
 		walShmBarrier()
 		// Re-validate: compare live SHM header against our local copy
 		// (SQLite wal.c:3125: memcmp(walIndexHdr(pWal), &pWal->hdr, sizeof(WalIndexHdr)))
-		if liveHdr, ok := w.index.readHeader(); ok {
-			liveHdr = w.floorLiveHdr(liveHdr)
-			if liveHdr != hdr {
-				_ = w.index.unlock(lockRead0, lockShared)
-				return WalIndexHdr{}, 0, 0, errWALRetry
-			}
+		if liveHdr, ok := w.index.readHeader(); ok && liveHdr != hdr {
+			_ = w.index.unlock(lockRead0, lockShared)
+			return WalIndexHdr{}, 0, 0, errWALRetry
 		}
 		w.index.shmWriteReadMark(0, mxFrame)
 		w.index.aReadMark[0].Store(mxFrame) // keep process-local in sync
@@ -2236,9 +2214,6 @@ func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame uint32, s
 
 	liveMark := w.index.shmReadMark(bestSlot)
 	liveHdr, liveValid := w.index.readHeader()
-	if liveValid {
-		liveHdr = w.floorLiveHdr(liveHdr)
-	}
 	if liveMark != bestMark || (liveValid && liveHdr != hdr) {
 		_ = w.index.unlock(lockSlot, lockShared)
 		return WalIndexHdr{}, 0, 0, errWALRetry
@@ -2289,9 +2264,6 @@ func (w *wal) beginWriteWithSnapshot(readSnap WalIndexHdr) (stateChanged bool, e
 	// BUSY_SNAPSHOT: compare caller's snapshot against current SHM header.
 	// Only check if readSnap is populated (isInit==1); zero hdr skips.
 	hdr, valid := w.index.readHeader()
-	if valid {
-		hdr = w.floorLiveHdr(hdr)
-	}
 	if debugTrace {
 		trace("beginWriteWithSnapshot: valid=%v readSnap.init=%d readSnap.mx=%d live.mx=%d writerHdr.init=%d writerHdr.mx=%d",
 			valid, readSnap.isInit, readSnap.mxFrame, hdr.mxFrame, w.writerHdr.isInit, w.writerHdr.mxFrame)
