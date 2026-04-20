@@ -387,6 +387,58 @@ Both support: PASSIVE, FULL, RESTART, TRUNCATE with identical semantics.
 | Go map for same-process reads | **Divergent** -- O(1) map vs hash table scan |
 | Heap SHM fallback | **Divergent** -- enables non-mmap platforms |
 | WAL undo (`sqlite3WalUndo`) | **Missing** -- Go uses pager-level rollback instead |
+| First-opener `ftruncate(shm, 3)` marker | **Missing** -- see §SHM open/close protocol below |
+| Orphan-inode handling on open race | **Divergent** -- inode-verify retry vs. SQLite's BUSY-+-caller-retry |
+
+### SHM open/close protocol drift
+
+`shm_mmap.go:newPlatformShm` (line 68) and `mmapShm.close` (line 299) implement
+the POSIX dead-man-switch (DMS) fcntl protocol that anchors multi-process SHM
+lifecycle. The protocol matches SQLite in intent (one owner at a time, last
+client unlinks the file) but differs in two mechanical details:
+
+1. **Orphan-inode race handling.** `newPlatformShm` does `osOpenFile(O_CREATE)`
+   then `fcntlLock(F_RDLCK, DMS)` in two syscalls. A peer in
+   `mmapShm.close` (holding exclusive DMS) can unlink the file between those
+   two steps, leaving us latched onto an orphaned inode while the next opener
+   `O_CREATE`s a fresh one — split-brain SHM.
+
+   **SQLite's mitigation** (`os_unix.c:4872-4907`, `unixLockSharedMemory`):
+   probe DMS via `F_GETLK` first. If another process holds `F_WRLCK` (i.e. is
+   mid-truncate/unlink), return `SQLITE_BUSY`. The caller then retries the
+   **entire open path** from scratch; the second `open(O_CREATE)` picks up the
+   fresh inode the peer created after unlink.
+
+   **Our mitigation** (`shm_mmap.go:68-124`): after acquiring shared DMS,
+   `fstat(fd)` vs `stat(path)` and retry in-place up to 50× on inode mismatch
+   (or path-ENOENT, or `ErrBusy`). Equivalent correctness; the retry is local
+   to `newPlatformShm` instead of bubbled to the caller.
+
+2. **`robust_ftruncate(hShm, 3)` marker — missing.** SQLite's first-opener
+   (who upgraded DMS from `F_UNLCK` to `F_WRLCK`) truncates the shm file to 3
+   bytes (`os_unix.c:4902`). This size is deliberately chosen to be smaller
+   than `walIndexHdrSize` (48 bytes), so any subsequent opener that mmaps a
+   3-byte file can detect "the shm was just initialized and has no content
+   yet" — a legitimate blank-slate signal that's distinguishable from a
+   corrupted header.
+
+   We do **not** emit this marker. Instead our first-opener flow goes straight
+   to `initHeaderState()` which zeroes the header in memory, and subsequent
+   readers validate via the dual-copy + checksum handshake. The downside: a
+   power-loss or crash between "DMS upgraded to exclusive" and "first
+   `writeHeader`" leaves a non-zero-size shm file whose header is all zeros;
+   our checksum check catches this (checksum of zeros != valid), but the
+   "known-fresh" marker would make the cause diagnosable.
+
+   **Follow-up:** consider adopting the 3-byte marker. Low-risk addition
+   (write-path only) and gives us a debugging hook without changing any
+   checksum semantics.
+
+3. **Close ordering — aligned with SQLite.** Both implementations unlink
+   before closing the fd so exclusive DMS is still held through the unlink,
+   preventing a peer from acquiring shared DMS and attaching to an
+   about-to-be-unlinked inode (SQLite: `os_unix.c:5538-5541`; ours:
+   `shm_mmap.go:299-340`).
 
 ---
 
