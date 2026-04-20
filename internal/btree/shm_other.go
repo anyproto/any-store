@@ -98,6 +98,11 @@ func (s *heapShm) unlock(slot int, lockType int) error {
 	return nil
 }
 
+func (s *heapShm) tryExclusive() bool {
+	// Heap-backed SHM is single-process by construction.
+	return true
+}
+
 func (s *heapShm) close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

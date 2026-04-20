@@ -52,6 +52,11 @@ type shmLock struct {
 	state int // 0=unlocked, >0=shared count, -1=exclusive
 }
 
+func (s *inProcessShm) tryExclusive() bool {
+	// Heap-backed SHM is single-process by construction.
+	return true
+}
+
 func (s *inProcessShm) region(index int, create bool) ([]byte, error) {
 	s.regMu.Lock()
 	defer s.regMu.Unlock()
@@ -135,6 +140,15 @@ type shm interface {
 
 	// close releases all resources.
 	close() error
+
+	// tryExclusive attempts to acquire proof that this connection is the
+	// only process attached to the SHM. For mmap-backed SHM, upgrades the
+	// shared DMS (dead-man-switch) fcntl lock to exclusive and reports
+	// whether it succeeded. Does not release the lock — caller is expected
+	// to close soon after (matching SQLite's sqlite3WalClose which holds
+	// the exclusive DB lock through close; wal.c:2509).
+	// For heap-backed SHM (single process by definition), returns true.
+	tryExclusive() bool
 }
 
 // Lock types for shm.lock/unlock.

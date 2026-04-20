@@ -77,6 +77,20 @@ func newPlatformShm(path string) (shm, error) {
 	return s, nil
 }
 
+// tryExclusive attempts to upgrade the shared DMS fcntl lock to exclusive,
+// proving this process is the only connection currently attached to the SHM.
+// Matches the exclusive-DB-lock check SQLite does in sqlite3WalClose
+// (wal.c:2509) before walLimitSize / isDelete. If the upgrade fails, a peer
+// process still has the SHM open and caller must not destructively mutate
+// shared state (e.g. truncate the WAL). The upgraded lock is retained —
+// caller is expected to close shortly after.
+func (s *mmapShm) tryExclusive() bool {
+	if s.file == nil {
+		return false
+	}
+	return s.fcntlLock(syscall.F_WRLCK, shmDMSOffset) == nil
+}
+
 func (s *mmapShm) region(index int, create bool) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -607,11 +607,20 @@ func (wi *walIndex) rollbackToFrame(target uint32) {
 }
 
 // shmCleanupFromFrame zeros out SHM hash entries for frames in (target, maxFrame].
-// For each affected segment, the aPgno slots beyond the cutoff are zeroed, and
-// the aHash array is rebuilt from the surviving aPgno entries — this preserves
-// linear-probe chain integrity so subsequent shmHashGet lookups remain correct.
-// Matches SQLite's walCleanupHash (wal.c:1247-1282); extended across segments
-// because any-store spill may cross segment boundaries within one transaction.
+// Caller must hold lockWrite exclusively so no peer can read or write SHM hash
+// concurrently — this matches SQLite's walCleanupHash invariant (wal.c:1236,
+// "assert( pWal->writeLock )").
+//
+// For the segment containing target+1: SQLite's selective approach —
+// `if aHash[i] > iLimit then aHash[i] = 0`, then `memset(&aPgno[iLimit], 0, …)`
+// (wal.c:1258-1271). This preserves linear-probe chains for the idx <= iLimit
+// entries that remain valid.
+//
+// For strictly-later segments: zero the full region body (aPgno + aHash).
+// SQLite does not need this step because `walIndexAppend` zero-inits a new
+// segment on its first write (wal.c:1315-1319). any-store's setBatch does not
+// have that zero-init step, so trailing segments would retain dangling entries
+// from the rolled-back writes without this cleanup.
 func (wi *walIndex) shmCleanupFromFrame(target, maxFrame uint32) {
 	if maxFrame <= target {
 		return
@@ -624,37 +633,28 @@ func (wi *walIndex) shmCleanupFromFrame(target, maxFrame uint32) {
 			continue
 		}
 		pgnoBase, nEntry, iZero := htSegmentInfo(seg)
-		// Keep aPgno entries for frames <= target; zero the rest in this segment.
-		// keepIdx is the highest aPgno index we keep (inclusive); -1 means keep none.
-		keepIdx := -1
-		if target > iZero {
-			k := int(target-iZero) - 1
-			if k >= nEntry {
-				k = nEntry - 1
+		if target <= iZero {
+			// Trailing segment: every frame indexed here is > target. Zero both
+			// aPgno and aHash wholesale. The preceding `target == iZero` case
+			// means this segment's aPgno[0] == frame (iZero+1) > target.
+			for i := 0; i < nEntry; i++ {
+				binary.LittleEndian.PutUint32(region[pgnoBase+i*4:], 0)
 			}
-			keepIdx = k
+			clear(region[htHashArrayOff : htHashArrayOff+htNSlot*2])
+			continue
 		}
-		for i := keepIdx + 1; i < nEntry; i++ {
+		// SQLite's walCleanupHash: selectively zero slots whose indexed frame
+		// is beyond iLimit, then memset the tail of aPgno.
+		iLimit := uint16(target - iZero) // target's idx within this segment, 1-based
+		for h := 0; h < htNSlot; h++ {
+			slotOff := htHashArrayOff + h*2
+			v := binary.LittleEndian.Uint16(region[slotOff:])
+			if v > iLimit {
+				binary.LittleEndian.PutUint16(region[slotOff:], 0)
+			}
+		}
+		for i := int(iLimit); i < nEntry; i++ {
 			binary.LittleEndian.PutUint32(region[pgnoBase+i*4:], 0)
-		}
-		// Rebuild aHash from surviving aPgno entries: zero the whole hash array
-		// and re-insert each non-zero aPgno entry. Linear probing requires an
-		// intact chain, so selective slot-zeroing would leave dangling chains.
-		clear(region[htHashArrayOff : htHashArrayOff+htNSlot*2])
-		for idx := 0; idx <= keepIdx; idx++ {
-			pgno := binary.LittleEndian.Uint32(region[pgnoBase+idx*4:])
-			if pgno == 0 {
-				continue
-			}
-			h := int(pgno*htHash1) & (htNSlot - 1)
-			for range htNSlot {
-				slotOff := htHashArrayOff + h*2
-				if binary.LittleEndian.Uint16(region[slotOff:]) == 0 {
-					binary.LittleEndian.PutUint16(region[slotOff:], uint16(idx+1))
-					break
-				}
-				h = (h + 1) & (htNSlot - 1)
-			}
 		}
 	}
 }
@@ -1485,11 +1485,11 @@ func (w *wal) adoptSHMState(hdr WalIndexHdr, walHasHeader bool) {
 // populates SHM directly. any-store's pageMap provides a fast same-process
 // lookup path; this rebuild is its analog of walIndexRecover for the local map.
 //
-// If the WAL file is shorter than expected for maxFrame (a peer truncated it
-// after checkpoint+close without resetting SHM), this function stops at the
-// last fully-available frame rather than erroring — the caller will still see
-// a consistent pageMap for whatever frames are physically present, and the
-// next writer will regenerate WAL contents behind a fresh header.
+// If the WAL file is shorter than the claimed maxFrame, returns ErrWALCorrupt:
+// that is SHM/WAL divergence and must not be silently masked (silently dropping
+// frames from the local map causes get() → 0 → stale DB reads → corruption).
+// With pager.close's tryExclusive gate, divergence is not reachable via the
+// normal close path; if it occurs, it indicates a crash or bug.
 func (w *wal) rebuildLocalPageMapFromWAL(maxFrame uint32) error {
 	newMap := make(map[uint32][]uint32)
 	if maxFrame == 0 {
@@ -1506,17 +1506,13 @@ func (w *wal) rebuildLocalPageMapFromWAL(maxFrame uint32) error {
 		return err
 	}
 	frameSize := int64(walFrameSize) + int64(w.pageSize)
-	fileFrames := uint32(0)
-	if info.Size() >= int64(walHeaderSize)+frameSize {
-		fileFrames = uint32((info.Size() - int64(walHeaderSize)) / frameSize)
-	}
-	limit := maxFrame
-	if fileFrames < limit {
-		limit = fileFrames
+	needed := int64(walHeaderSize) + int64(maxFrame)*frameSize
+	if info.Size() < needed {
+		return ErrWALCorrupt
 	}
 	frameBuf := make([]byte, walFrameSize)
 	var frameHdr walFrame
-	for frame := uint32(1); frame <= limit; frame++ {
+	for frame := uint32(1); frame <= maxFrame; frame++ {
 		off := int64(walHeaderSize) + int64(frame-1)*frameSize
 		n, err := w.file.ReadAt(frameBuf, off)
 		if err != nil {

@@ -2140,11 +2140,6 @@ func (p *pager) close() error {
 			// truncateFile races with P2's WriteAt: the WAL file gets
 			// a zero header at offset 0 while P2's frames land at a high
 			// offset, making parent reopen unable to recover P2's data.
-			//
-			// If we cannot acquire the lock (peer actively writing after
-			// 5s busy handler), skip truncate entirely — matches SQLite's
-			// sqlite3WalClose which only calls walLimitSize when it obtains
-			// exclusive access. The WAL stays intact for the next opener.
 			lockedWrite := false
 			if !p.inProcess && !p.inMemory {
 				if err := walBusyLock(p.wal.index, p.wal.busyHandler, lockWrite, lockExclusive); err == nil {
@@ -2160,12 +2155,14 @@ func (p *pager) close() error {
 					trace("close: checkpointPassive incomplete or failed: %v", cpErr)
 				}
 			}
-			// Only truncate when we hold lockWrite (or are single-process).
-			// Without the lock, a peer's in-flight writeFrames could be
-			// appending frames; truncating destroys them. Matches SQLite's
-			// sqlite3WalClose (wal.c:2487-2551) gating truncate on an
-			// exclusive-DB-lock attempt (wal.c:2509).
-			if cpErr == nil && (p.inProcess || lockedWrite) {
+			// Truncate gating: matches SQLite's sqlite3WalClose (wal.c:2487-2551)
+			// which calls walLimitSize (wal.c:2534) only after obtaining an
+			// exclusive DB lock (wal.c:2509) — i.e. proof this is the only
+			// connection to the database. Any-store's analog is
+			// wal.index.shm.tryExclusive (upgrades the shared DMS fcntl lock).
+			// Without that proof we must leave the WAL intact so peer readers
+			// bounded by the old hdr.mxFrame can still find frames in the file.
+			if cpErr == nil && (p.inProcess || p.wal.index.shm.tryExclusive()) {
 				p.wal.truncateFile()
 			}
 			if lockedWrite {

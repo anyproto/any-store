@@ -1201,3 +1201,110 @@ func TestBeginWriteWithSnapshotFloorsBackwardHeaderToWriterHdr(t *testing.T) {
 	require.Equal(t, writerHdr.aFrameCksum[1], w.cksum2)
 	w.endWrite()
 }
+
+// TestRollbackCleanupZerosShmHashEntries exercises shmCleanupFromFrame: a
+// cross-process reader consulting shmHashGet directly (bypassing the
+// mxCommitFrame gate on getLatest) must find zero entries for frames that
+// were rolled back. Matches SQLite's walCleanupHash invariant (wal.c:1247-1282):
+// after savepoint rollback, the SHM hash slots pointing at frames > hdr.mxFrame
+// are observably zeroed — not just invisible via mxCommitFrame.
+func TestRollbackCleanupZerosShmHashEntries(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	w := newWal(path, 4096)
+	w.inProcess = false
+	require.NoError(t, w.open())
+	defer w.close()
+
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
+
+	// Commit one frame to establish a stable baseline.
+	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
+	copy(pg1.data, "committed page 1")
+	require.NoError(t, w.writeFrames([]*page{pg1}, true, 1))
+	committedFrame := w.nFrame.Load()
+
+	// Verify SHM hash has frame 1 for page 1.
+	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10, 1),
+		"committed frame 1 should be in SHM hash")
+
+	// Spill two more pages (commit=false). With eager SHM writes, they land
+	// in the hash tables immediately.
+	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
+	copy(pg2.data, "spilled page 2")
+	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
+	copy(pg3.data, "spilled page 3")
+	require.NoError(t, w.writeFrames([]*page{pg2, pg3}, false, 0))
+
+	// Pre-rollback: spilled frames are in SHM hash (caller must use
+	// mxCommitFrame to gate visibility).
+	assert.Equal(t, uint32(2), w.index.shmHashGet(2, 10, 1),
+		"spilled frame 2 should be present in SHM hash (eager)")
+	assert.Equal(t, uint32(3), w.index.shmHashGet(3, 10, 1),
+		"spilled frame 3 should be present in SHM hash (eager)")
+
+	// Rollback to the commit boundary — this must invoke shmCleanupFromFrame.
+	w.index.rollbackToFrame(committedFrame)
+
+	// Post-rollback: shmHashGet with maxFrame=10 (large enough to see spilled
+	// if they remained) must now return 0 for pages 2 and 3. A reader
+	// unaware of mxCommitFrame (e.g. a fresh peer process scanning SHM
+	// after the writer died) must NOT find dangling entries for rolled-back
+	// frames.
+	assert.Equal(t, uint32(0), w.index.shmHashGet(2, 10, 1),
+		"frame 2 hash entry must be zeroed by rollback cleanup")
+	assert.Equal(t, uint32(0), w.index.shmHashGet(3, 10, 1),
+		"frame 3 hash entry must be zeroed by rollback cleanup")
+
+	// Committed frame must still be reachable — cleanup preserves the
+	// probe chain for idx <= iLimit (wal.c:1258-1264).
+	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10, 1),
+		"committed frame 1 must remain reachable after rollback cleanup")
+}
+
+// TestRollbackCleanupAcrossSegments verifies shmCleanupFromFrame handles the
+// case where spilled frames cross a segment boundary. any-store-specific
+// extension over SQLite's walCleanupHash (which only touches the segment of
+// hdr.mxFrame because walIndexAppend zero-inits new segments at idx==1).
+// Our setBatch has no zero-init, so a trailing segment's aHash must be
+// fully cleared by rollback.
+func TestRollbackCleanupAcrossSegments(t *testing.T) {
+	wi := &walIndex{
+		shm:       newHeapShm(),
+		pageMap:   make(map[uint32][]uint32),
+		inProcess: false,
+	}
+	// Force entries into segment 0 and segment 1 by writing at indices
+	// around htNPageOne. Commit up through frame htNPageOne, spill the
+	// next frame (which lands in segment 1), then roll back.
+	committed := uint32(htNPageOne)
+	wi.shmHashWrite(100, committed-1)
+	wi.shmHashWrite(200, committed)
+	wi.maxFrame.Store(committed)
+
+	// Spill two frames into segment 1.
+	spill1 := committed + 1
+	spill2 := committed + 2
+	wi.shmHashWrite(300, spill1)
+	wi.shmHashWrite(400, spill2)
+	wi.maxFrame.Store(spill2)
+
+	// Pre-rollback: segment-1 entries are present.
+	assert.NotZero(t, wi.shmHashGet(300, spill2, 1), "spill frame 300 in SHM")
+	assert.NotZero(t, wi.shmHashGet(400, spill2, 1), "spill frame 400 in SHM")
+
+	wi.rollbackToFrame(committed)
+
+	// Post-rollback: segment-1 hash entries zeroed.
+	assert.Equal(t, uint32(0), wi.shmHashGet(300, spill2, 1),
+		"trailing-segment frame 300 hash must be zeroed")
+	assert.Equal(t, uint32(0), wi.shmHashGet(400, spill2, 1),
+		"trailing-segment frame 400 hash must be zeroed")
+
+	// Pre-boundary committed frames in segment 0 must remain.
+	assert.Equal(t, committed-1, wi.shmHashGet(100, committed, 1),
+		"segment-0 frame 100 must still be reachable")
+	assert.Equal(t, committed, wi.shmHashGet(200, committed, 1),
+		"segment-0 frame 200 must still be reachable")
+}
