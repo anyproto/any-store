@@ -414,9 +414,9 @@ client unlinks the file) but differs in two mechanical details:
    (or path-ENOENT, or `ErrBusy`).
 
    **Why inode-verify instead of pure F_GETLK-BUSY-caller-retry?** A refactor
-   to SQLite's approach was attempted and reverted. The scenario it misses is
-   a 3-way race where the orphaned inode has *no* lock held at the moment of
-   probe:
+   to SQLite's shm-DMS approach was attempted and reverted. The scenario it
+   misses is a 3-way race where the orphaned inode has *no* lock held at the
+   moment of probe:
 
    ```
    T=0: peer A holds F_WRLCK on inode X (mid-close, about to unlink).
@@ -430,14 +430,31 @@ client unlinks the file) but differs in two mechanical details:
         disagrees with C's Y → split-brain.
    ```
 
-   SQLite accepts this race as rare-in-practice; our CL-4 stress scenario
-   (200 close/open cycles per worker × 2 workers) exercises it often enough
-   to fail ~50% of the time with pure F_GETLK-BUSY-retry. The inode check at
-   T=6 catches this: `fdStat.Ino` (X) != `pathStat.Ino` (Y, or ENOENT) → retry.
+   In our CL-4 stress scenario (200 close/open cycles × 2 workers) this race
+   fires ~50% of runs. The inode check at T=6 catches it: `fdStat.Ino` (X)
+   != `pathStat.Ino` (Y, or ENOENT) → retry.
 
-   Net: our approach is strictly stronger than SQLite's on this axis. We pay
-   two extra syscalls per open (fstat + stat) for defense against a race
-   that's only academically relevant to SQLite's workload mix.
+   **How SQLite avoids this race — and why we can't use SQLite's mechanism
+   directly.** SQLite's real safety isn't at the shm DMS level; it's at the
+   *database-file* lock level. `sqlite3WalClose` (`wal.c:2508-2509`) takes an
+   **EXCLUSIVE** fcntl lock on the database file before deciding to unlink
+   the shm, and holds that exclusive lock through `walIndexClose →
+   unixShmUnmap → osUnlink`. Any new opener of the same DB must first take a
+   SHARED lock on the DB file, which blocks/BUSYs against the closer's
+   exclusive. So in SQLite the orphan-inode window never exists: a new
+   opener literally cannot reach `open(shmPath)` while a closer is mid-
+   unlink.
+
+   any-store's `pager.close` path does not currently hold an equivalent
+   exclusive DB-file lock through the shm unlink, so we can't rely on that
+   invariant. Adopting it would be a larger refactor of `pager.close` and
+   the corresponding DB-open lock-acquisition order. Until that lands, the
+   inode verification in `newPlatformShm` is load-bearing: it substitutes a
+   cheap per-open check for SQLite's deeper lock-ordering invariant.
+
+   **Follow-up:** adopt SQLite's exclusive-DB-lock-around-unlink pattern in
+   `pager.close`. Once that holds, `newPlatformShm` could drop the inode
+   verification and rely solely on F_GETLK-BUSY-caller-retry like SQLite.
 
 2. **`robust_ftruncate(hShm, 3)` marker — missing.** SQLite's first-opener
    (who upgraded DMS from `F_UNLCK` to `F_WRLCK`) truncates the shm file to 3
