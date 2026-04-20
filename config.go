@@ -35,6 +35,11 @@ type Config struct {
 	// Only used when DisableAutoCheckpoint is false. 0 means use default.
 	AutoCheckpointAfter int
 
+	// CacheSize overrides the default per-DB page cache size (in pages,
+	// default 5000). Primarily for tests that need to force pagerStress /
+	// cache-spill behavior at low data volumes. Zero means use the default.
+	CacheSize int
+
 	// InMemory keeps the entire database in memory with no files on disk.
 	// The database does not survive process crashes. When true, InProcess
 	// and CommitSync=false are forced on automatically.

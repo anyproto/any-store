@@ -119,9 +119,13 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	var quickCheckNeeded bool
 	ds.recoveryController, quickCheckNeeded = ds.createRecoveryController(ctx, path)
 
+	cacheSize := config.CacheSize
+	if cacheSize <= 0 {
+		cacheSize = 5000
+	}
 	opts := btree.Options{
 		PageSize:              4096,
-		CacheSize:             5000,
+		CacheSize:             cacheSize,
 		InProcess:             false,
 		NoCommitSync:          !config.CommitSync,
 		InMemory:              config.InMemory,
