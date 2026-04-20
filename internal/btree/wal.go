@@ -1231,24 +1231,47 @@ func (w *wal) open() error {
 	}
 	w.index = idx
 
-	// Lock acquisition order: write → checkpoint → recover. Matches SQLite's
-	// walIndexRecover (wal.c:1395-1401 `assert( pWal->writeLock )`) which
-	// requires WAL_WRITE_LOCK to be held before acquiring the recover lock,
-	// and matches the order used by ensureHeaderInitialized's slow path so
-	// the two open-class code paths cannot deadlock against each other.
+	// Fast path: optimistic lock-free readHeader. The dual-copy + memcmp +
+	// checksum protocol (walIndexTryHdr wal.c:2570-2620) detects torn reads
+	// without requiring a write lock. If a valid SHM hdr exists we adopt it
+	// and return — no reason to serialize with peer writers in the common
+	// case, and acquiring lockWrite here under RESTART-checkpoint load
+	// starves openers (wait for lockWrite → BUSY → open retries).
 	//
-	// Rationale for lockWrite in wal.open: a peer's in-flight writeHeader
-	// can produce a torn readHeader for us (dual-copy memcmp mismatch →
-	// valid=false). Without lockWrite, we'd fall through to recoverLocked,
-	// scan a WAL file the peer is still appending to, derive a stale
-	// lastCommitFrame, and publish it via writeHeader — regressing the live
-	// mxFrame and orphaning the peer's just-committed frames. Observed as
-	// tail-of-one-writer whole-tx rowloss in the stress harness.
+	// Multi-process mode: pageMap is unused — get()/getLatest() consult
+	// SHM hash exclusively (matches walFindFrame at wal.c:3554-3582).
+	// No per-process rebuild is needed; peer writes land directly in SHM.
+	if !w.inProcess {
+		if hdr, valid := w.index.readHeader(); valid {
+			info, err := f.Stat()
+			if err != nil {
+				return err
+			}
+			w.adoptSHMState(hdr, info.Size() >= walHeaderSize)
+			return nil
+		}
+	}
+
+	// Slow path: SHM hdr was invalid (torn read OR no peer has initialized
+	// it yet). We must take lockWrite before falling through to recoverLocked
+	// so a peer's in-flight writeHeader cannot produce a stale lastCommitFrame
+	// scan that orphans the peer's just-committed frames (tail-of-one-writer
+	// rowloss regression, fixed at 8138a22).
+	//
+	// Lock order write → checkpoint → recover matches SQLite's
+	// walIndexRecover (wal.c:1395-1401 `assert( pWal->writeLock )`) and
+	// any-store's ensureHeaderInitialized slow path — the two open-class
+	// paths cannot deadlock against each other.
 	//
 	// In-process mode: no SHM coordination needed; w.mu serializes all
 	// writers in the same process and heap SHM has no cross-process races.
 	if !w.inProcess {
-		if err := w.index.lock(lockWrite, lockExclusive); err != nil {
+		// Use walBusyLock (with the configured busy handler) so an opener
+		// that lands here during an in-progress peer checkpoint-restart
+		// waits briefly instead of failing immediately — matches SQLite's
+		// walIndexRecover caller (sqlite3WalBeginReadTransaction) which
+		// retries under the busy handler on WAL_RETRY.
+		if err := walBusyLock(w.index, w.busyHandler, lockWrite, lockExclusive); err != nil {
 			return err
 		}
 		defer func() { _ = w.index.unlock(lockWrite, lockExclusive) }()
@@ -1269,22 +1292,12 @@ func (w *wal) open() error {
 		return err
 	}
 
-	// If a sibling process has already initialized this SHM, adopt its state
-	// instead of clobbering it. Without this, two concurrent openers both
-	// call initHeaderState (wal.go:1207) with fresh random salts — the second
-	// overwrites the first's SHM header, leaving the first process with
-	// stale in-memory salts while the other holds lockRecover exclusive.
-	//
-	// SQLite's sqlite3WalOpen (wal.c end ~1737) never touches SHM on open;
-	// the first operation that reads SHM via walIndexReadHdr decides whether
-	// recovery is needed. We narrow this to: "only run init/recover when no
-	// valid SHM header exists to adopt."
+	// Re-check SHM hdr under locks in case a peer completed writeHeader
+	// while we were contending for lockWrite. Adopting it here is strictly
+	// safer than falling through to recoverLocked.
 	if !w.inProcess {
 		if hdr, valid := w.index.readHeader(); valid {
 			w.adoptSHMState(hdr, info.Size() >= walHeaderSize)
-			// Multi-process mode: pageMap is unused — get()/getLatest() consult
-			// SHM hash exclusively (matches walFindFrame at wal.c:3554-3582).
-			// No per-process rebuild needed; peer writes land directly in SHM.
 			return nil
 		}
 	}
@@ -2287,6 +2300,24 @@ func (w *wal) beginWriteWithSnapshot(readSnap WalIndexHdr) (stateChanged bool, e
 		w.header.salt1 = hdr.aSalt[0]
 		w.header.salt2 = hdr.aSalt[1]
 		w.index.mxCommitFrame.Store(hdr.mxFrame)
+		// Re-sync maxFrame from the authoritative SHM hdr. Without this, a
+		// peer's CheckpointRestart (doResetWAL — wal.go:2712, matching
+		// SQLite's walRestartLog at wal.c:3852-3884) that drops mxFrame back
+		// to 0 leaves our local maxFrame stale at the pre-reset high-water
+		// mark. setBatch's monotonic guard `if f > maxFrame.Load()` then
+		// never lowers it, and writeFrames (line 1849) publishes the stale
+		// value to SHM as the new commit's mxFrame — larger than the frames
+		// actually written, producing ghost frame references for peer
+		// readers and the "row count mismatch: got 606/602/320" signatures.
+		w.index.maxFrame.Store(hdr.mxFrame)
+		// Re-sync nBackfill + nBackfillAttempted + aReadMark[] from SHM so
+		// the process-local ckpt snapshot mirrors a peer's RESTART or
+		// checkpoint. Same rationale as adoptSHMState (wal.go:1488) —
+		// without this, walIndex.get's minFrame filter (uses nBackfill)
+		// and any future checkpoint-path reads that consult the local
+		// atomics instead of shmNBackfill()/shmReadCkptInfo() would see
+		// stale pre-reset values.
+		w.index.shmReadCkptInfo()
 		// Monotonic update: same guard as tryBeginRead — prevent concurrent
 		// reader from racing with the previous commit's writeHeader.
 		for {
