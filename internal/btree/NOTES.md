@@ -411,8 +411,33 @@ client unlinks the file) but differs in two mechanical details:
 
    **Our mitigation** (`shm_mmap.go:68-124`): after acquiring shared DMS,
    `fstat(fd)` vs `stat(path)` and retry in-place up to 50× on inode mismatch
-   (or path-ENOENT, or `ErrBusy`). Equivalent correctness; the retry is local
-   to `newPlatformShm` instead of bubbled to the caller.
+   (or path-ENOENT, or `ErrBusy`).
+
+   **Why inode-verify instead of pure F_GETLK-BUSY-caller-retry?** A refactor
+   to SQLite's approach was attempted and reverted. The scenario it misses is
+   a 3-way race where the orphaned inode has *no* lock held at the moment of
+   probe:
+
+   ```
+   T=0: peer A holds F_WRLCK on inode X (mid-close, about to unlink).
+   T=1: we open(path) → fd on inode X.
+   T=2: A unlinks path.
+   T=3: peer C opens(O_CREATE) path → creates new inode Y.
+   T=4: C probes Y → F_UNLCK → C becomes first-opener on Y.
+   T=5: A closes its fd → F_WRLCK on X is released.
+   T=6: we probe X → F_UNLCK (X is orphan, no holders). We take F_WRLCK
+        on X thinking we're first-opener on the "file", but our inode
+        disagrees with C's Y → split-brain.
+   ```
+
+   SQLite accepts this race as rare-in-practice; our CL-4 stress scenario
+   (200 close/open cycles per worker × 2 workers) exercises it often enough
+   to fail ~50% of the time with pure F_GETLK-BUSY-retry. The inode check at
+   T=6 catches this: `fdStat.Ino` (X) != `pathStat.Ino` (Y, or ENOENT) → retry.
+
+   Net: our approach is strictly stronger than SQLite's on this axis. We pay
+   two extra syscalls per open (fstat + stat) for defense against a race
+   that's only academically relevant to SQLite's workload mix.
 
 2. **`robust_ftruncate(hShm, 3)` marker — missing.** SQLite's first-opener
    (who upgraded DMS from `F_UNLCK` to `F_WRLCK`) truncates the shm file to 3
