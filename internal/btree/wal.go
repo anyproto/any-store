@@ -538,14 +538,21 @@ func newWalIndex(shmPath string, inProcess bool) (*walIndex, error) {
 }
 
 // set records a page at a given frame position.
+// In-process mode writes the process-local pageMap (which is the sole source
+// of truth when there is no multi-process SHM to consult). Multi-process mode
+// relies on the SHM hash written below — matching SQLite's walFrames →
+// walIndexAppend (wal.c:2900, 1295-1338) where SHM hash is the authoritative
+// page→frame index.
 func (wi *walIndex) set(pgno, frame uint32) {
-	wi.mu.Lock()
-	frames := wi.pageMap[pgno]
-	if frames == nil {
-		frames = make([]uint32, 0, 4)
+	if wi.inProcess {
+		wi.mu.Lock()
+		frames := wi.pageMap[pgno]
+		if frames == nil {
+			frames = make([]uint32, 0, 4)
+		}
+		wi.pageMap[pgno] = append(frames, frame)
+		wi.mu.Unlock()
 	}
-	wi.pageMap[pgno] = append(frames, frame)
-	wi.mu.Unlock()
 	if frame > wi.maxFrame.Load() {
 		wi.maxFrame.Store(frame)
 	}
@@ -561,16 +568,18 @@ func (wi *walIndex) set(pgno, frame uint32) {
 // walCleanupHash, wal.c:1247-1282) to zero out dangling hash entries.
 func (wi *walIndex) setBatch(pages []*page, startFrame uint32, commit bool) {
 	_ = commit
-	wi.mu.Lock()
-	for i, p := range pages {
-		frame := startFrame + uint32(i)
-		frames := wi.pageMap[p.pgno]
-		if frames == nil {
-			frames = make([]uint32, 0, 4)
+	if wi.inProcess {
+		wi.mu.Lock()
+		for i, p := range pages {
+			frame := startFrame + uint32(i)
+			frames := wi.pageMap[p.pgno]
+			if frames == nil {
+				frames = make([]uint32, 0, 4)
+			}
+			wi.pageMap[p.pgno] = append(frames, frame)
 		}
-		wi.pageMap[p.pgno] = append(frames, frame)
+		wi.mu.Unlock()
 	}
-	wi.mu.Unlock()
 	if f := startFrame + uint32(len(pages)) - 1; f > wi.maxFrame.Load() {
 		wi.maxFrame.Store(f)
 	}
@@ -586,20 +595,22 @@ func (wi *walIndex) setBatch(pages []*page, startFrame uint32, commit bool) {
 // Called under w.index exclusive write lock.
 func (wi *walIndex) rollbackToFrame(target uint32) {
 	oldMax := wi.maxFrame.Load()
-	wi.mu.Lock()
-	for pgno, frames := range wi.pageMap {
-		// Find cutoff: keep only frames <= target
-		n := len(frames)
-		for n > 0 && frames[n-1] > target {
-			n--
+	if wi.inProcess {
+		wi.mu.Lock()
+		for pgno, frames := range wi.pageMap {
+			// Find cutoff: keep only frames <= target
+			n := len(frames)
+			for n > 0 && frames[n-1] > target {
+				n--
+			}
+			if n == 0 {
+				delete(wi.pageMap, pgno)
+			} else if n < len(frames) {
+				wi.pageMap[pgno] = frames[:n]
+			}
 		}
-		if n == 0 {
-			delete(wi.pageMap, pgno)
-		} else if n < len(frames) {
-			wi.pageMap[pgno] = frames[:n]
-		}
+		wi.mu.Unlock()
 	}
-	wi.mu.Unlock()
 	wi.maxFrame.Store(target)
 	if oldMax > target {
 		wi.shmCleanupFromFrame(target, oldMax)
@@ -663,31 +674,28 @@ func (wi *walIndex) shmCleanupFromFrame(target, maxFrame uint32) {
 // within the given maxFrame snapshot, or 0 if not in WAL.
 // The maxFrame parameter limits which frames are visible (for snapshot isolation).
 func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
-	wi.mu.RLock()
-	// Skip frames that have been checkpointed back to the DB.
-	// Matches SQLite's minFrame filter (wal.c:3571) and prevents
-	// readers from seeing stale WAL frames after a checkpoint + truncate.
-	minFrame := wi.nBackfill.Load() + 1
-	frames := wi.pageMap[pgno]
-	wi.mu.RUnlock()
-
-	// Frames are appended in order, so the list is sorted ascending.
-	// Search backwards for the highest frame in [minFrame, maxFrame].
-	for i := len(frames) - 1; i >= 0; i-- {
-		if frames[i] <= maxFrame && frames[i] >= minFrame {
-			return frames[i]
+	if wi.inProcess {
+		// In-process: no SHM to consult; pageMap is the sole source of truth.
+		// minFrame filters out frames already checkpointed back to the DB
+		// (SQLite wal.c:3571).
+		minFrame := wi.nBackfill.Load() + 1
+		wi.mu.RLock()
+		frames := wi.pageMap[pgno]
+		wi.mu.RUnlock()
+		for i := len(frames) - 1; i >= 0; i-- {
+			if frames[i] <= maxFrame && frames[i] >= minFrame {
+				return frames[i]
+			}
 		}
+		return 0
 	}
-
-	// Cross-process fallback: read from SHM hash tables when not in
-	// single-process mode. Another process may have written frames
-	// that are not in our pageMap.
-	if !wi.inProcess {
-		if frame := wi.shmHashGet(pgno, maxFrame, minFrame); frame > 0 {
-			return frame
-		}
-	}
-	return 0
+	// Multi-process: SHM hash tables are the sole source of truth, matching
+	// SQLite's walFindFrame (wal.c:3554-3582). nBackfill lives in SHM
+	// (wal.c:3114, 3571) since a peer checkpoint may advance it without
+	// touching our process-local copy — use shmNBackfill() rather than
+	// the cached atomic.
+	minFrame := wi.shmNBackfill() + 1
+	return wi.shmHashGet(pgno, maxFrame, minFrame)
 }
 
 // getLatest returns the latest WAL frame for pgno, or 0 if the page is not
@@ -696,30 +704,24 @@ func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
 // walMaxFrame (which is bounded by mxCommitFrame from beginRead) to decide
 // whether the cached page is still valid.
 //
-// Note: We now use per-connection page caches matching SQLite's model, but
-// we still share one pageMap across all goroutines. Spill frames are visible
-// to getLatest, causing transient cache misses during active spill when
-// latestFrame > walMaxFrame. Each reader's private cache absorbs repeated
-// misses within a transaction. This is correct and short-lived.
+// In multi-process mode this consults SHM hash exclusively (the SQLite-
+// aligned source of truth per walFindFrame). In in-process mode it walks
+// pageMap — there is no SHM to query in that mode.
 func (wi *walIndex) getLatest(pgno uint32) uint32 {
-	wi.mu.RLock()
-	frames := wi.pageMap[pgno]
-	wi.mu.RUnlock()
-
-	if len(frames) > 0 {
-		return frames[len(frames)-1]
+	if wi.inProcess {
+		wi.mu.RLock()
+		frames := wi.pageMap[pgno]
+		wi.mu.RUnlock()
+		if len(frames) > 0 {
+			return frames[len(frames)-1]
+		}
+		return 0
 	}
-
-	// Cross-process fallback: check SHM hash tables.
-	// Use mxCommitFrame so spilled uncommitted frames (which are not
-	// written to SHM hash during spill) are bounded correctly.
-	// getLatest is used for cache invalidation, not snapshot reads,
-	// so minFrame=1 (search all non-checkpointed segments).
-	if !wi.inProcess {
-		minFrame := wi.nBackfill.Load() + 1
-		return wi.shmHashGet(pgno, wi.mxCommitFrame.Load(), minFrame)
-	}
-	return 0
+	// Multi-process: SHM hash only. Use mxCommitFrame as upper bound so
+	// cross-process readers never observe uncommitted spill frames (readers
+	// gate on hdr.mxFrame / mxCommitFrame, not raw hash entries).
+	minFrame := wi.shmNBackfill() + 1
+	return wi.shmHashGet(pgno, wi.mxCommitFrame.Load(), minFrame)
 }
 
 // reset clears the WAL index (after a checkpoint + WAL truncate).
@@ -941,7 +943,11 @@ func htSegmentInfo(seg int) (pgnoBase int, nEntry int, iZero uint32) {
 }
 
 // shmHashWrite records a page->frame mapping in the shm hash table.
-// Best-effort: errors are ignored since the Go map is authoritative for same-process reads.
+// Matches SQLite's walIndexAppend (wal.c:1295-1338): writes aPgno[idx],
+// barriers, then publishes the aHash[h] slot. Protected by WAL_WRITE_LOCK
+// (any-store's lockWrite) so linear probing does not race another writer.
+// The write ordering + barrier guarantees cross-process readers either see
+// a fully-populated entry or none at all.
 func (wi *walIndex) shmHashWrite(pgno, frame uint32) {
 	seg, idx := htFrameSegIdx(frame)
 
@@ -950,11 +956,19 @@ func (wi *walIndex) shmHashWrite(pgno, frame uint32) {
 		return
 	}
 
-	// Write pgno to aPgno[idx]
+	// Write pgno to aPgno[idx] first (SQLite wal.c:1337). u32-aligned.
 	pgnoOff := htPgnoOffset(seg, idx)
-	binary.LittleEndian.PutUint32(region[pgnoOff:], pgno)
+	atomic.StoreUint32((*uint32)(unsafe.Pointer(&region[pgnoOff])), pgno)
 
-	// Insert into hash table (linear probing)
+	// Release barrier between aPgno and the hash slot publish, matching
+	// the implicit release on SQLite's AtomicStore(aHash, idx) at wal.c:1338.
+	if !wi.inProcess {
+		walShmBarrier()
+	}
+
+	// Insert into hash table (linear probing). aHash entries are u16; we
+	// publish via a plain store here because writes are serialized under
+	// lockWrite and the preceding barrier ordered aPgno before us.
 	h := int(pgno*htHash1) & (htNSlot - 1)
 	for range htNSlot {
 		slotOff := htHashArrayOff + h*2
@@ -987,7 +1001,16 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) uint32 {
 	minSeg, _ := htFrameSegIdx(minFrame)
 
 	for seg := lastSeg; seg >= minSeg; seg-- {
-		region, err := wi.shm.region(seg, false)
+		// Map segment on demand (create=true). A peer writer may have just
+		// extended SHM with a new segment containing frames <= maxFrame that
+		// this reader hasn't yet mapped. SQLite's walFindFrame (wal.c:3562)
+		// always calls walHashGet → walIndexPage → sqlite3OsShmMap, which
+		// maps/extends the wal-index page — it never silently skips a
+		// segment. Skipping here was the root cause of cross-process
+		// row-loss: hdr.mxFrame advertised frames in a segment we hadn't
+		// mapped, shmHashGet returned 0, and the read path fell through to
+		// the DB file which still held the pre-commit page.
+		region, err := wi.shm.region(seg, true)
 		if err != nil {
 			continue
 		}
@@ -1249,9 +1272,9 @@ func (w *wal) open() error {
 	if !w.inProcess {
 		if hdr, valid := w.index.readHeader(); valid {
 			w.adoptSHMState(hdr, info.Size() >= walHeaderSize)
-			if err := w.rebuildLocalPageMapFromWAL(hdr.mxFrame); err != nil {
-				return err
-			}
+			// Multi-process mode: pageMap is unused — get()/getLatest() consult
+			// SHM hash exclusively (matches walFindFrame at wal.c:3554-3582).
+			// No per-process rebuild needed; peer writes land directly in SHM.
 			return nil
 		}
 	}
@@ -1456,60 +1479,6 @@ func (w *wal) adoptSHMState(hdr WalIndexHdr, walHasHeader bool) {
 	// Adopt the snapshot so the first beginWrite's stateChanged logic
 	// compares apples to apples.
 	w.writerHdr = hdr
-}
-
-// rebuildLocalPageMapFromWAL rebuilds the process-local page map for frames
-// [1, maxFrame] directly from the WAL file. Gives a fresh process (or a writer
-// that just detected external commits) a complete local view of page mappings.
-//
-// DRIFT from SQLite: SQLite does not have per-process page maps — its SHM hash
-// tables are the sole source of truth, and walIndexRecover (wal.c:1384-1611)
-// populates SHM directly. any-store's pageMap provides a fast same-process
-// lookup path; this rebuild is its analog of walIndexRecover for the local map.
-//
-// If the WAL file is shorter than the claimed maxFrame, returns ErrWALCorrupt:
-// that is SHM/WAL divergence and must not be silently masked (silently dropping
-// frames from the local map causes get() → 0 → stale DB reads → corruption).
-// With pager.close's tryExclusive gate, divergence is not reachable via the
-// normal close path; if it occurs, it indicates a crash or bug.
-func (w *wal) rebuildLocalPageMapFromWAL(maxFrame uint32) error {
-	newMap := make(map[uint32][]uint32)
-	if maxFrame == 0 {
-		w.index.mu.Lock()
-		w.index.pageMap = newMap
-		w.index.mu.Unlock()
-		return nil
-	}
-	if w.file == nil {
-		return errors.New("btree: WAL file closed")
-	}
-	info, err := w.file.Stat()
-	if err != nil {
-		return err
-	}
-	frameSize := int64(walFrameSize) + int64(w.pageSize)
-	needed := int64(walHeaderSize) + int64(maxFrame)*frameSize
-	if info.Size() < needed {
-		return ErrWALCorrupt
-	}
-	frameBuf := make([]byte, walFrameSize)
-	var frameHdr walFrame
-	for frame := uint32(1); frame <= maxFrame; frame++ {
-		off := int64(walHeaderSize) + int64(frame-1)*frameSize
-		n, err := w.file.ReadAt(frameBuf, off)
-		if err != nil {
-			return err
-		}
-		if n != len(frameBuf) {
-			return io.ErrUnexpectedEOF
-		}
-		frameHdr.deserialize(frameBuf)
-		newMap[frameHdr.pgno] = append(newMap[frameHdr.pgno], frame)
-	}
-	w.index.mu.Lock()
-	w.index.pageMap = newMap
-	w.index.mu.Unlock()
-	return nil
 }
 
 // initHeaderStateLocked initializes the in-memory WAL header state without
@@ -2317,14 +2286,12 @@ func (w *wal) beginWriteWithSnapshot(readSnap WalIndexHdr) (stateChanged bool, e
 			}
 		}
 		// Snapshot the re-synced header so future beginWrite calls can
-		// detect external changes relative to this baseline (53f68eb fix).
+		// detect external changes relative to this baseline. With pageMap
+		// removed from the multi-process read path, stateChanged no longer
+		// triggers a pageMap rebuild — pager-layer invalidation of the
+		// writerCache / cached page 1 is handled by the caller via the
+		// returned stateChanged flag.
 		w.writerHdr = hdr
-		if stateChanged {
-			if err := w.rebuildLocalPageMapFromWAL(hdr.mxFrame); err != nil {
-				_ = w.index.unlock(lockWrite, lockExclusive)
-				return false, err
-			}
-		}
 	}
 
 	return stateChanged, nil
