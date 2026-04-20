@@ -1231,10 +1231,29 @@ func (w *wal) open() error {
 	}
 	w.index = idx
 
-	// Acquire exclusive locks on all lock slots except WAL_WRITE_LOCK (slot 0)
-	// and WAL_READ_LOCK(0) (slot 3), matching SQLite's walIndexRecover().
-	// This means locking WAL_CKPT_LOCK (1) and WAL_RECOVER_LOCK (2) exclusively,
-	// which prevents concurrent checkpoints and other recoveries.
+	// Lock acquisition order: write → checkpoint → recover. Matches SQLite's
+	// walIndexRecover (wal.c:1395-1401 `assert( pWal->writeLock )`) which
+	// requires WAL_WRITE_LOCK to be held before acquiring the recover lock,
+	// and matches the order used by ensureHeaderInitialized's slow path so
+	// the two open-class code paths cannot deadlock against each other.
+	//
+	// Rationale for lockWrite in wal.open: a peer's in-flight writeHeader
+	// can produce a torn readHeader for us (dual-copy memcmp mismatch →
+	// valid=false). Without lockWrite, we'd fall through to recoverLocked,
+	// scan a WAL file the peer is still appending to, derive a stale
+	// lastCommitFrame, and publish it via writeHeader — regressing the live
+	// mxFrame and orphaning the peer's just-committed frames. Observed as
+	// tail-of-one-writer whole-tx rowloss in the stress harness.
+	//
+	// In-process mode: no SHM coordination needed; w.mu serializes all
+	// writers in the same process and heap SHM has no cross-process races.
+	if !w.inProcess {
+		if err := w.index.lock(lockWrite, lockExclusive); err != nil {
+			return err
+		}
+		defer func() { _ = w.index.unlock(lockWrite, lockExclusive) }()
+	}
+
 	if err := w.index.lock(lockCheckpoint, lockExclusive); err != nil {
 		return err
 	}
