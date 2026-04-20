@@ -54,27 +54,70 @@ type mmapShm struct {
 
 // newPlatformShm creates a new mmap-backed shm.
 // Acquires a shared DMS lock to track that this connection is using the SHM file.
+//
+// Race-avoidance: the window between osOpenFile and fcntlLock(F_RDLCK, DMS) is
+// open — a peer in mmapShm.close holding exclusive DMS can unlink the file and
+// close its fd during that window, leaving our fd pointing at an orphaned
+// inode. A subsequent opener would then create a NEW file at `path` (O_CREATE
+// after unlink), yielding split-brain SHM state that manifests as lost rows /
+// IntegrityCheck failures in high-turnover close/open cycles (any-store-tests
+// CL-4 CloseRaceCycle). To detect this, after acquiring shared DMS we stat
+// `path` and compare its inode to our fd's inode; on mismatch we retry from
+// scratch. Loop-bounded by a simple sanity cap. Matches SQLite's unixShmOpen
+// inode-verification idiom (os_unix.c).
 func newPlatformShm(path string) (shm, error) {
-	f, err := osOpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
-	if err != nil {
-		return nil, fmt.Errorf("btree: open shm file: %w", err)
-	}
+	for attempt := 0; attempt < 50; attempt++ {
+		f, err := osOpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
+		if err != nil {
+			return nil, fmt.Errorf("btree: open shm file: %w", err)
+		}
 
-	s := &mmapShm{
-		file:    f,
-		path:    path,
-		regions: make([][]byte, 0, shmMaxRegions),
-	}
+		s := &mmapShm{
+			file:    f,
+			path:    path,
+			regions: make([][]byte, 0, shmMaxRegions),
+		}
 
-	// Acquire a shared DMS lock. All open connections hold this lock.
-	// On close, we try to upgrade to exclusive: if successful, we're the last
-	// connection and can safely delete the SHM file.
-	if err := s.fcntlLock(syscall.F_RDLCK, shmDMSOffset); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("btree: acquire DMS lock: %w", err)
-	}
+		// Acquire a shared DMS lock. All open connections hold this lock.
+		// On close, we try to upgrade to exclusive: if successful, we're the last
+		// connection and can safely delete the SHM file.
+		if err := s.fcntlLock(syscall.F_RDLCK, shmDMSOffset); err != nil {
+			_ = f.Close()
+			if err == ErrBusy {
+				// A peer holds exclusive DMS (mid-close, about to unlink).
+				// Retry — the peer will release shortly and either unlink
+				// (next iteration creates a fresh inode) or let us proceed.
+				continue
+			}
+			return nil, fmt.Errorf("btree: acquire DMS lock: %w", err)
+		}
 
-	return s, nil
+		// Verify the path still resolves to the inode we opened. If the peer
+		// unlinked between our open and our F_RDLCK, path now resolves to a
+		// different (freshly-created by someone else) inode — or to nothing.
+		// Either way our fd is orphaned; close and retry.
+		var fdStat, pathStat syscall.Stat_t
+		if err := syscall.Fstat(int(f.Fd()), &fdStat); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("btree: fstat shm: %w", err)
+		}
+		if err := syscall.Stat(path, &pathStat); err != nil {
+			// ENOENT → unlinked after we opened; retry.
+			_ = f.Close()
+			if err == syscall.ENOENT {
+				continue
+			}
+			return nil, fmt.Errorf("btree: stat shm: %w", err)
+		}
+		if fdStat.Ino != pathStat.Ino {
+			// Our fd points at an orphaned inode; retry with a fresh open.
+			_ = f.Close()
+			continue
+		}
+
+		return s, nil
+	}
+	return nil, fmt.Errorf("btree: acquire DMS lock: retries exhausted")
 }
 
 // tryExclusive attempts to upgrade the shared DMS fcntl lock to exclusive,
@@ -270,12 +313,28 @@ func (s *mmapShm) close() error {
 	//
 	// We must do this BEFORE closing the file descriptor, since closing the fd
 	// releases all our fcntl locks.
+	//
+	// CRITICAL ordering: unlink MUST happen BEFORE closing the fd. Otherwise
+	// a peer process can call newPlatformShm on the same path between our
+	// f.Close() (which releases the exclusive DMS fcntl lock) and osRemove,
+	// opening the *same inode* by name and acquiring a shared DMS lock. That
+	// peer would then read our stale SHM header (e.g. mxFrame=N) even though
+	// close-time WAL truncation already zeroed the WAL file, causing it to
+	// believe there are N frames in a now-empty WAL — split-brain that
+	// manifests as lost rows or IntegrityCheck failures in back-to-back
+	// close/open cycles (any-store-tests CL-4 CloseRaceCycle). Unlinking
+	// first guarantees any concurrent opener instead creates a fresh SHM
+	// file (O_CREATE) with zeroed contents, which is the correct match for
+	// the truncated WAL.
 	deleteFile := false
 	if s.file != nil {
 		// Try to upgrade our shared DMS lock to exclusive.
 		if err := s.fcntlLock(syscall.F_WRLCK, shmDMSOffset); err == nil {
 			deleteFile = true
 		}
+	}
+	if deleteFile {
+		_ = osRemove(s.path)
 	}
 
 	var err error
@@ -284,8 +343,5 @@ func (s *mmapShm) close() error {
 		s.file = nil
 	}
 
-	if deleteFile {
-		_ = osRemove(s.path)
-	}
 	return err
 }
