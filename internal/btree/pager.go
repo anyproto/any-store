@@ -11,6 +11,7 @@ package btree
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -269,6 +270,34 @@ func (p *pager) open() error {
 		return err
 	}
 	p.file = f
+
+	// Acquire a shared flock on the DB file. Held for the lifetime of
+	// this pager. Any closer attempting to upgrade to exclusive will
+	// BUSY-retry while we hold this — serializing shm unlink against
+	// new-opener races. Matches SQLite's sqlite3PagerSharedLock + the
+	// wal.c:2508 EXCLUSIVE-for-close invariant.
+	//
+	// Only applies to multi-process mode; in-process skips it (in-memory
+	// already returned above).
+	if !p.inProcess {
+		for attempt := 0; attempt < 100; attempt++ {
+			lockErr := acquireSharedDBLock(f)
+			if lockErr == nil {
+				break
+			}
+			if !errors.Is(lockErr, ErrBusy) {
+				_ = f.Close()
+				p.file = nil
+				return fmt.Errorf("btree: acquire DB-file shared lock: %w", lockErr)
+			}
+			if attempt == 99 {
+				_ = f.Close()
+				p.file = nil
+				return fmt.Errorf("btree: DB-file lock still busy after retries (peer mid-close?)")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 
 	info, err := f.Stat()
 	if err != nil {
