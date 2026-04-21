@@ -28,7 +28,7 @@ func rawClose(db *DB) {
 	db.closed.Store(true)
 	if db.pager.wal != nil {
 		if db.pager.wal.index != nil {
-			_ = db.pager.wal.index.close()
+			_ = db.pager.wal.index.close(false)
 		}
 		if db.pager.wal.file != nil {
 			_ = db.pager.wal.file.Close()

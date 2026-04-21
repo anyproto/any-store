@@ -103,7 +103,8 @@ func (s *heapShm) tryExclusive() bool {
 	return true
 }
 
-func (s *heapShm) close() error {
+func (s *heapShm) close(isLastClient bool) error {
+	_ = isLastClient
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.regions = nil

@@ -615,7 +615,7 @@ func TestInProcessShm_Close(t *testing.T) {
 	_, err := s.region(0, true)
 	require.NoError(t, err)
 
-	require.NoError(t, s.close())
+	require.NoError(t, s.close(false))
 	assert.Nil(t, s.regions)
 }
 
@@ -628,7 +628,7 @@ func TestMmapShm_NewPlatformShm(t *testing.T) {
 	s, err := newPlatformShm(path)
 	require.NoError(t, err)
 	require.NotNil(t, s)
-	require.NoError(t, s.close())
+	require.NoError(t, s.close(false))
 }
 
 func TestMmapShm_NewPlatformShm_BadPath(t *testing.T) {
@@ -643,7 +643,7 @@ func TestMmapShm_RegionCreateAndAccess(t *testing.T) {
 
 	s, err := newPlatformShm(path)
 	require.NoError(t, err)
-	defer s.close()
+	defer s.close(false)
 
 	// Create region 0
 	r0, err := s.region(0, true)
@@ -667,7 +667,7 @@ func TestMmapShm_RegionNoCreate(t *testing.T) {
 
 	s, err := newPlatformShm(path)
 	require.NoError(t, err)
-	defer s.close()
+	defer s.close(false)
 
 	// Getting non-existent region without create should fail
 	_, err = s.region(0, false)
@@ -680,7 +680,7 @@ func TestMmapShm_LockUnlock(t *testing.T) {
 
 	s, err := newPlatformShm(path)
 	require.NoError(t, err)
-	defer s.close()
+	defer s.close(false)
 
 	// Shared lock and unlock
 	require.NoError(t, s.lock(0, lockShared))
@@ -697,7 +697,7 @@ func TestMmapShm_LockInvalidSlot(t *testing.T) {
 
 	s, err := newPlatformShm(path)
 	require.NoError(t, err)
-	defer s.close()
+	defer s.close(false)
 
 	err = s.lock(-1, lockShared)
 	assert.Error(t, err)
@@ -712,7 +712,7 @@ func TestMmapShm_UnlockInvalidSlot(t *testing.T) {
 
 	s, err := newPlatformShm(path)
 	require.NoError(t, err)
-	defer s.close()
+	defer s.close(false)
 
 	err = s.unlock(-1, lockShared)
 	assert.Error(t, err)
@@ -727,7 +727,7 @@ func TestMmapShm_LockAllSlots(t *testing.T) {
 
 	s, err := newPlatformShm(path)
 	require.NoError(t, err)
-	defer s.close()
+	defer s.close(false)
 
 	// Lock and unlock all valid slots with both types
 	for slot := 0; slot < lockSlotCount; slot++ {
@@ -785,8 +785,8 @@ func TestMmapShm_CloseDeletesFile(t *testing.T) {
 	_, err = os.Stat(path)
 	require.NoError(t, err)
 
-	// Close — since this is the only connection, it should delete the file
-	require.NoError(t, s.close())
+	// Close with isLastClient=true — should delete the file.
+	require.NoError(t, s.close(true))
 
 	// File should be deleted
 	_, err = os.Stat(path)

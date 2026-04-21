@@ -1327,7 +1327,7 @@ func TestWalBusyLock_NilHandler(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	// Lock slot
 	require.NoError(t, idx.lock(0, lockExclusive))
@@ -1343,7 +1343,7 @@ func TestWalBusyLock_HandlerReturnsFalse(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	require.NoError(t, idx.lock(0, lockExclusive))
 
@@ -1393,7 +1393,7 @@ func TestNewWalIndex_PlatformShm(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), false)
 	require.NoError(t, err)
-	require.NoError(t, idx.close())
+	require.NoError(t, idx.close(false))
 }
 
 // ============================================================
@@ -1404,7 +1404,7 @@ func TestWalIndex_WriteHeader_InProcess(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	require.NoError(t, idx.writeHeader(10, 20, 5, [2]uint32{}, [2]uint32{}))
 	assert.Equal(t, uint32(10), idx.hdr.mxFrame)
@@ -1419,7 +1419,7 @@ func TestWalIndex_ReadHeader_Valid(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	require.NoError(t, idx.writeHeader(5, 10, 0, [2]uint32{}, [2]uint32{}))
 	hdr, valid := idx.readHeader()
@@ -1431,7 +1431,7 @@ func TestWalIndex_ReadHeader_RegionTooSmall(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	// Region 0 doesn't exist yet (no writeHeader called) — should get error
 	// Actually with heap shm, region(0, false) errors if not created
@@ -1443,7 +1443,7 @@ func TestWalIndex_ReadHeader_NotInit(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	// Create region but write zero header (isInit=0)
 	region, err := idx.shm.region(0, true)
@@ -1459,7 +1459,7 @@ func TestWalIndex_ReadHeader_MismatchedCopies(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	// Write valid header
 	require.NoError(t, idx.writeHeader(5, 10, 0, [2]uint32{}, [2]uint32{}))
@@ -1477,7 +1477,7 @@ func TestWalIndex_ReadHeader_BadChecksum(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	require.NoError(t, idx.writeHeader(5, 10, 0, [2]uint32{}, [2]uint32{}))
 
@@ -1499,7 +1499,7 @@ func TestWalIndex_ReadHeader_BadChecksum(t *testing.T) {
 
 func TestWalIndex_Close_NilShm(t *testing.T) {
 	wi := &walIndex{shm: nil}
-	assert.NoError(t, wi.close())
+	assert.NoError(t, wi.close(false))
 }
 
 // ============================================================
@@ -1510,7 +1510,7 @@ func TestShmCkptInfo_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	// Need to create region 0 first
 	_, err = idx.shm.region(0, true)
@@ -1543,7 +1543,7 @@ func TestShmReadCkptInfo_NoRegion(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	// Don't create region -> shmReadCkptInfo should handle error gracefully
 	idx.shmReadCkptInfo() // should not panic
@@ -1558,7 +1558,7 @@ func TestWALOpen_InMemory(t *testing.T) {
 	w.inMemory = true
 	require.NoError(t, w.open())
 	assert.NotNil(t, w.memFrames)
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 // ============================================================
@@ -1570,7 +1570,7 @@ func TestWALFlushHeader(t *testing.T) {
 	path := filepath.Join(dir, "test.wal")
 	w := newWal(path, 4096)
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	assert.False(t, w.headerOnDisk)
 
@@ -1604,7 +1604,7 @@ func TestWALWriteHeader_Fresh(t *testing.T) {
 	assert.Equal(t, uint32(0), w.nFrame.Load())
 	assert.True(t, w.headerOnDisk)
 
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 // ============================================================
@@ -1618,7 +1618,7 @@ func TestWALRecover_CorruptFrame(t *testing.T) {
 	// Write some valid data
 	w := newWal(path, 4096)
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 	_, bwErr := w.beginWrite()
 	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
@@ -1644,13 +1644,13 @@ func TestWALRecover_CorruptFrame(t *testing.T) {
 		require.NoError(t, os.WriteFile(path, walData, 0666))
 	}
 
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 
 	// Reopen — recovery should skip corrupt frame
 	w2 := newWal(path, 4096)
 	require.NoError(t, w2.open())
 	assert.Equal(t, uint32(1), w2.nFrame.Load())
-	require.NoError(t, w2.close())
+	require.NoError(t, w2.close(false))
 }
 
 // ============================================================
@@ -1663,7 +1663,7 @@ func TestWriteFrames_NoCommitSync(t *testing.T) {
 	w := newWal(path, 4096)
 	w.noCommitSync = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	_, bwErr := w.beginWrite()
 	require.NoError(t, bwErr)
@@ -1671,7 +1671,7 @@ func TestWriteFrames_NoCommitSync(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
 
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 func TestWriteFrames_NotInProcess(t *testing.T) {
@@ -1680,7 +1680,7 @@ func TestWriteFrames_NotInProcess(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = false
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	_, bwErr := w.beginWrite()
 	require.NoError(t, bwErr)
@@ -1688,7 +1688,7 @@ func TestWriteFrames_NotInProcess(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
 
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 // ============================================================
@@ -1699,7 +1699,7 @@ func TestWriteFramesMem_LargeArenaRealloc(t *testing.T) {
 	w := newWal("/tmp/inmem", 4096)
 	w.inMemory = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	_, bwErr := w.beginWrite()
 	require.NoError(t, bwErr)
@@ -1713,7 +1713,7 @@ func TestWriteFramesMem_LargeArenaRealloc(t *testing.T) {
 	w.endWrite()
 
 	assert.Equal(t, uint32(300), w.nFrame.Load())
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 // ============================================================
@@ -1724,7 +1724,7 @@ func TestReadFrame_InMemoryCorrupt(t *testing.T) {
 	w := newWal("/tmp/inmem", 4096)
 	w.inMemory = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	_, bwErr := w.beginWrite()
 	require.NoError(t, bwErr)
@@ -1740,7 +1740,7 @@ func TestReadFrame_InMemoryCorrupt(t *testing.T) {
 	// Frame 0 is invalid
 	assert.Error(t, w.readFrame(0, buf))
 
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 // ============================================================
@@ -1753,7 +1753,7 @@ func TestWALBeginRead_AllSlotsBusy(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Write data so maxFrame > 0 and nBackfill != maxFrame
 	_, bwErr := w.beginWrite()
@@ -1779,7 +1779,7 @@ func TestWALBeginRead_AllSlotsBusy(t *testing.T) {
 		_ = w.index.unlock(lockRead0+i, lockExclusive)
 	}
 
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 func TestWALBeginRead_BestSlotLockFails(t *testing.T) {
@@ -1788,7 +1788,7 @@ func TestWALBeginRead_BestSlotLockFails(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Write data
 	_, bwErr := w.beginWrite()
@@ -1812,7 +1812,7 @@ func TestWALBeginRead_BestSlotLockFails(t *testing.T) {
 	_ = maxFrame
 
 	_ = w.index.unlock(lockRead0+1, lockExclusive)
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 // ============================================================
@@ -1996,7 +1996,7 @@ func TestCheckpointPost_IncompleteBackfill(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Write frames
 	_, bwErr := w.beginWrite()
@@ -2022,7 +2022,7 @@ func TestTryResetWALWithBusy_AllSlotsAvailable(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Write and checkpoint
 	_, bwErr := w.beginWrite()
@@ -2044,7 +2044,7 @@ func TestTryResetWALWithBusy_Truncate(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	_, bwErr := w.beginWrite()
 	require.NoError(t, bwErr)
@@ -2069,7 +2069,7 @@ func TestTryResetWALWithBusy_SlotsBusy(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	_, bwErr := w.beginWrite()
 	require.NoError(t, bwErr)
@@ -2095,7 +2095,7 @@ func TestTryResetWALWithBusy_PartialLockFail(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	_, bwErr := w.beginWrite()
 	require.NoError(t, bwErr)
@@ -2122,7 +2122,7 @@ func TestDoResetWAL_InMemory(t *testing.T) {
 	w := newWal("/tmp/inmem", 4096)
 	w.inMemory = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Write frames
 	_, bwErr := w.beginWrite()
@@ -2147,7 +2147,7 @@ func TestDoResetWAL_Truncate(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	_, bwErr := w.beginWrite()
 	require.NoError(t, bwErr)
@@ -2173,7 +2173,7 @@ func TestDoResetWAL_NoTruncate(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	_, bwErr := w.beginWrite()
 	require.NoError(t, bwErr)
@@ -2194,7 +2194,7 @@ func TestDoResetWAL_NoTruncate(t *testing.T) {
 
 func TestWALClose_NilIndex(t *testing.T) {
 	w := &wal{}
-	assert.NoError(t, w.close())
+	assert.NoError(t, w.close(false))
 }
 
 func TestWALClose_NilFile(t *testing.T) {
@@ -2202,7 +2202,7 @@ func TestWALClose_NilFile(t *testing.T) {
 	idx, err := newWalIndex("/tmp/test-close-shm", true)
 	require.NoError(t, err)
 	w.index = idx
-	assert.NoError(t, w.close())
+	assert.NoError(t, w.close(false))
 }
 
 // ============================================================
@@ -2213,7 +2213,7 @@ func TestShmHashWriteGet_CrossSegment(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	// Write entries that span multiple segments
 	// Region 0 holds htNPageOne = 4062 entries
@@ -2513,19 +2513,19 @@ func TestWALRecover_NoCommittedFrames(t *testing.T) {
 	// Write uncommitted frames only
 	w := newWal(path, 4096)
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 	_, bwErr := w.beginWrite()
 	require.NoError(t, bwErr)
 	pg := &page{pgno: 1, data: make([]byte, 4096)}
 	require.NoError(t, w.writeFrames([]*page{pg}, false, 1))
 	w.endWrite()
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 
 	// Reopen — recovery should find no committed frames
 	w2 := newWal(path, 4096)
 	require.NoError(t, w2.open())
 	assert.Equal(t, uint32(0), w2.nFrame.Load())
-	require.NoError(t, w2.close())
+	require.NoError(t, w2.close(false))
 }
 
 // ============================================================
@@ -2536,7 +2536,7 @@ func TestCheckpointWithMode_InMemory(t *testing.T) {
 	w := newWal("/tmp/inmem-wal-ckpt", 4096)
 	w.inMemory = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Write frames
 	_, bwErr := w.beginWrite()
@@ -2566,7 +2566,7 @@ func TestWalIndex_ReadWriteHeader_NotInProcess(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), false) // not inProcess
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	require.NoError(t, idx.writeHeader(5, 10, 0, [2]uint32{}, [2]uint32{}))
 
@@ -2777,7 +2777,7 @@ func TestReadFrame_InMemoryOutOfRange(t *testing.T) {
 	w := newWal("/tmp/inmem-rf", 4096)
 	w.inMemory = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	_, bwErr := w.beginWrite()
 	require.NoError(t, bwErr)
@@ -2980,7 +2980,7 @@ func TestNewWalIndex_InProcessTrue(t *testing.T) {
 	idx, err := newWalIndex("", true) // empty path ok for heap shm
 	require.NoError(t, err)
 	assert.True(t, idx.inProcess)
-	require.NoError(t, idx.close())
+	require.NoError(t, idx.close(false))
 }
 
 // ============================================================
@@ -3005,7 +3005,7 @@ func TestWALWriteHeader_SyncWorks(t *testing.T) {
 	assert.Equal(t, uint32(0), w.nFrame.Load())
 	assert.Equal(t, uint32(walMagic), w.header.magic)
 
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 // ============================================================
@@ -3016,7 +3016,7 @@ func TestShmHashGet_RegionError(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	// Query when no regions have data -> should return 0
 	frame := idx.shmHashGet(1, 100, 1)
@@ -3063,7 +3063,7 @@ func TestCheckpointWithMode_InMemoryPage1(t *testing.T) {
 	w := newWal("/tmp/inmem-ckpt-pg1", 4096)
 	w.inMemory = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Write frame for page 1 (tests the pgno==1 offset path in InMemory checkpoint)
 	_, bwErr := w.beginWrite()
@@ -3104,10 +3104,10 @@ func TestWALClose_DoubleClose(t *testing.T) {
 	require.NoError(t, w.open())
 
 	// First close should succeed
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 
 	// Second close should also succeed (nil checks)
-	err := w.close()
+	err := w.close(false)
 	require.NoError(t, err)
 }
 
@@ -3268,7 +3268,7 @@ func TestShmWriteCkptInfo_NoRegion(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	// shmWriteCkptInfo when no region exists should not panic
 	idx.shmWriteCkptInfo()
@@ -3297,7 +3297,7 @@ func TestWALFlushHeader_WriteError(t *testing.T) {
 
 	// Restore for clean close
 	w.file = nil
-	_ = w.close()
+	_ = w.close(false)
 }
 
 // ============================================================
@@ -3310,7 +3310,7 @@ func TestShmHashWrite_RegionError(t *testing.T) {
 	require.NoError(t, err)
 
 	// Close shm to cause region errors
-	idx.close()
+	idx.close(false)
 
 	// shmHashWrite should handle error gracefully (no panic)
 	idx.shmHashWrite(1, 1)
@@ -3324,7 +3324,7 @@ func TestWalBusyLock_InvalidSlot(t *testing.T) {
 	dir := t.TempDir()
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	// Invalid slot should return a non-ErrBusy error
 	err = walBusyLock(idx, nil, -1, lockExclusive)
@@ -3356,7 +3356,7 @@ func TestWALWriteHeader_WriteError(t *testing.T) {
 	assert.Error(t, err)
 
 	w.file = nil
-	_ = w.close()
+	_ = w.close(false)
 }
 
 // ============================================================
@@ -3478,7 +3478,7 @@ func TestWALClose_FileAlreadyClosed(t *testing.T) {
 	w.file = nil
 
 	// wal.close() should handle nil file gracefully
-	err := w.close()
+	err := w.close(false)
 	assert.NoError(t, err)
 }
 
@@ -4067,10 +4067,10 @@ func TestNewWalIndex_ShmError(t *testing.T) {
 func TestWalIndex_WriteHeader_RegionError(t *testing.T) {
 	wi, err := newWalIndex("", true) // inProcess heap shm
 	require.NoError(t, err)
-	defer wi.close()
+	defer wi.close(false)
 
 	// Close the shm to cause region errors
-	wi.shm.close()
+	wi.shm.close(false)
 	// The inProcessShm close sets all regions to nil - but region() will allocate on demand
 	// For heap shm, region with grow=true always succeeds.
 	// To trigger an error, we'd need a custom shm impl.
@@ -4083,7 +4083,7 @@ func TestWalIndex_WriteHeader_RegionError(t *testing.T) {
 func TestWalIndex_ReadHeader_ValidRoundtrip(t *testing.T) {
 	wi, err := newWalIndex("", true)
 	require.NoError(t, err)
-	defer wi.close()
+	defer wi.close(false)
 
 	// Write a valid header and read it back
 	err = wi.writeHeader(5, 3, 0, [2]uint32{}, [2]uint32{})
@@ -4148,7 +4148,7 @@ func TestWALOpen_FileStatError(t *testing.T) {
 	// Just verify normal open works
 	err = w.open()
 	assert.NoError(t, err)
-	w.close()
+	w.close(false)
 }
 
 // --- wal.go:1034-1036 flushHeader() sync error ---
@@ -4167,7 +4167,7 @@ func TestWALFlushHeader_SyncError(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, w.headerOnDisk)
 
-	w.close()
+	w.close(false)
 }
 
 // --- wal.go:1058-1060 wal.writeHeader() sync error ---
@@ -4177,7 +4177,7 @@ func TestWALWriteHeader_SyncError(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Close the file to cause write + sync errors
 	w.file.Close()
@@ -4190,7 +4190,7 @@ func TestWALWriteHeader_SyncError(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, w.headerOnDisk)
 
-	w.close()
+	w.close(false)
 }
 
 // --- wal.go:1081-1088 recover() WAL header invalid → truncate + writeHeader ---
@@ -4212,7 +4212,7 @@ func TestWALRecover_InvalidHeader(t *testing.T) {
 	assert.True(t, w.headerOnDisk)
 	assert.Equal(t, uint32(0), w.nFrame.Load())
 
-	w.close()
+	w.close(false)
 }
 
 // --- wal.go:1105-1107 recover() stat error ---
@@ -4227,7 +4227,7 @@ func TestWALRecover_PartialFrame(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Write a valid header
 	require.NoError(t, w.writeHeader())
@@ -4237,7 +4237,7 @@ func TestWALRecover_PartialFrame(t *testing.T) {
 	_, err := w.file.WriteAt(partialFrame, walHeaderSize)
 	require.NoError(t, err)
 
-	w.close()
+	w.close(false)
 
 	// Re-open - recover should handle the partial frame gracefully
 	w2 := newWal(path, 4096)
@@ -4246,7 +4246,7 @@ func TestWALRecover_PartialFrame(t *testing.T) {
 	require.NoError(t, err)
 	// No committed frames should be found
 	assert.Equal(t, uint32(0), w2.nFrame.Load())
-	w2.close()
+	w2.close(false)
 }
 
 // --- wal.go:1161-1163 recover() readAt error in committed frame rebuild ---
@@ -4291,7 +4291,7 @@ func TestWALWriteFrames_FlushHeaderError(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// headerOnDisk is false after open with empty WAL
 	assert.False(t, w.headerOnDisk)
@@ -4308,7 +4308,7 @@ func TestWALWriteFrames_FlushHeaderError(t *testing.T) {
 	err = w.writeFrames([]*page{pg}, true, 1)
 	assert.Error(t, err) // flushHeader should fail
 
-	w.close()
+	w.close(false)
 }
 
 // --- wal.go:1261-1263 writeFrames() writeAt error ---
@@ -4318,7 +4318,7 @@ func TestWALWriteFrames_WriteAtError(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Flush header first so the flushHeader path is skipped
 	require.NoError(t, w.flushHeader())
@@ -4333,7 +4333,7 @@ func TestWALWriteFrames_WriteAtError(t *testing.T) {
 	err = w.writeFrames([]*page{pg}, true, 1)
 	assert.Error(t, err)
 
-	w.close()
+	w.close(false)
 }
 
 // --- wal.go:1275-1277 writeFrames() fdatasync error ---
@@ -4344,7 +4344,7 @@ func TestWALWriteFrames_FdatasyncError(t *testing.T) {
 	w.inProcess = true
 	w.noCommitSync = false
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Flush header
 	require.NoError(t, w.flushHeader())
@@ -4357,7 +4357,7 @@ func TestWALWriteFrames_FdatasyncError(t *testing.T) {
 
 	// Now close and reopen as writable but with a different fd to test sync failure
 	// This is hard to do reliably without a mock. Skip detailed error injection.
-	w.close()
+	w.close(false)
 }
 
 // --- wal.go:1438-1440 beginRead() lock error on fallback slot 0 ---
@@ -4370,7 +4370,7 @@ func TestCheckpointWithMode_LockCheckpointError(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Hold the checkpoint lock exclusively first
 	require.NoError(t, w.index.lock(lockCheckpoint, lockExclusive))
@@ -4380,7 +4380,7 @@ func TestCheckpointWithMode_LockCheckpointError(t *testing.T) {
 	assert.ErrorIs(t, err, ErrBusy)
 
 	_ = w.index.unlock(lockCheckpoint, lockExclusive)
-	w.close()
+	w.close(false)
 }
 
 // --- wal.go:1526-1528 checkpointWithMode() FULL walBusyLock non-busy error ---
@@ -4458,7 +4458,7 @@ func TestCheckpointWithMode_BackfillErrors(t *testing.T) {
 	assert.Error(t, err) // dbFile.WriteAt should fail
 
 	p.file = nil // prevent double-close
-	p.wal.close()
+	p.wal.close(false)
 }
 
 // --- wal.go:1702-1705 checkpointWithMode() fdatasync dbFile error ---
@@ -4515,7 +4515,7 @@ func TestTryResetWALWithBusy_NonBusyError(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Write some frames
 	pg := &page{pgno: 2, data: make([]byte, 4096)}
@@ -4530,7 +4530,7 @@ func TestTryResetWALWithBusy_NonBusyError(t *testing.T) {
 	assert.NoError(t, err)
 
 	_ = w.index.unlock(lockRead0+1, lockExclusive)
-	w.close()
+	w.close(false)
 }
 
 // --- wal.go:1785-1787 doResetWAL() truncate error ---
@@ -4540,7 +4540,7 @@ func TestDoResetWAL_TruncateError(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Close the file to make truncate fail
 	w.file.Close()
@@ -4555,7 +4555,7 @@ func TestDoResetWAL_TruncateError(t *testing.T) {
 
 	w.file.Close()
 	w.file = nil
-	w.close()
+	w.close(false)
 }
 
 // --- wal.go:1824-1826 wal.close() index.close error ---
@@ -4773,7 +4773,7 @@ func TestWALRecover_UncommittedTrailingFrames(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Write a committed frame
 	pg1 := &page{pgno: 2, data: make([]byte, 4096)}
@@ -4785,7 +4785,7 @@ func TestWALRecover_UncommittedTrailingFrames(t *testing.T) {
 	copy(pg2.data[4:], "uncommitted page")
 	require.NoError(t, w.writeFrames([]*page{pg2}, false, 0))
 
-	w.close()
+	w.close(false)
 
 	// Re-open: recovery should only find 1 committed frame
 	w2 := newWal(path, 4096)
@@ -4795,7 +4795,7 @@ func TestWALRecover_UncommittedTrailingFrames(t *testing.T) {
 	assert.Equal(t, uint32(1), w2.nFrame.Load())
 	assert.Equal(t, uint32(1), w2.index.maxFrame.Load())
 
-	w2.close()
+	w2.close(false)
 }
 
 // --- Test beginRead all slots busy ---
@@ -4805,7 +4805,7 @@ func TestBeginRead_AllSlotsBusy(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Write a frame so maxFrame > 0 and nBackfill != maxFrame
 	pg := &page{pgno: 2, data: make([]byte, 4096)}
@@ -4827,7 +4827,7 @@ func TestBeginRead_AllSlotsBusy(t *testing.T) {
 	for i := 1; i <= 4; i++ {
 		_ = w.index.unlock(lockRead0+i, lockExclusive)
 	}
-	w.close()
+	w.close(false)
 }
 
 // --- Test checkpointPost with partial checkpoint + RESTART mode ---
@@ -4895,7 +4895,7 @@ func TestBeginRead_BestSlotLockFails(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Write frames
 	pg := &page{pgno: 2, data: make([]byte, 4096)}
@@ -4916,7 +4916,7 @@ func TestBeginRead_BestSlotLockFails(t *testing.T) {
 
 	w.endRead(slot)
 	_ = w.index.unlock(lockRead0+1, lockExclusive)
-	w.close()
+	w.close(false)
 }
 
 // Test checkpointWithMode TRUNCATE path
@@ -5219,14 +5219,14 @@ func TestWALWriteFrames_NonInProcess_CommitShmHeader(t *testing.T) {
 	w.inProcess = false
 	w.noCommitSync = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	pg := &page{pgno: 2, data: make([]byte, 4096)}
 	copy(pg.data[4:], "test commit non-inprocess")
 	err := w.writeFrames([]*page{pg}, true, 2)
 	require.NoError(t, err)
 
-	w.close()
+	w.close(false)
 }
 
 // --- Test recover with bad salt ---
@@ -5236,7 +5236,7 @@ func TestWALRecover_BadSalt(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	pg := &page{pgno: 2, data: make([]byte, 4096)}
 	copy(pg.data[4:], "good frame")
@@ -5251,13 +5251,13 @@ func TestWALRecover_BadSalt(t *testing.T) {
 	_, err := w.file.WriteAt(badFrame, offset)
 	require.NoError(t, err)
 
-	w.close()
+	w.close(false)
 
 	w2 := newWal(path, 4096)
 	w2.inProcess = true
 	require.NoError(t, w2.open())
 	assert.Equal(t, uint32(1), w2.nFrame.Load())
-	w2.close()
+	w2.close(false)
 }
 
 // --- Test recover with bad checksum ---
@@ -5267,7 +5267,7 @@ func TestWALRecover_BadChecksum(t *testing.T) {
 	w := newWal(path, 4096)
 	w.inProcess = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	pg := &page{pgno: 2, data: make([]byte, 4096)}
 	copy(pg.data[4:], "good frame for cksum test")
@@ -5279,13 +5279,13 @@ func TestWALRecover_BadChecksum(t *testing.T) {
 	_, err := w.file.WriteAt(corruptBuf, pageDataOff+10)
 	require.NoError(t, err)
 
-	w.close()
+	w.close(false)
 
 	w2 := newWal(path, 4096)
 	w2.inProcess = true
 	require.NoError(t, w2.open())
 	assert.Equal(t, uint32(0), w2.nFrame.Load())
-	w2.close()
+	w2.close(false)
 }
 
 // ============================================================
@@ -5363,7 +5363,7 @@ func TestCheckpointWithMode_FileReadPageDataError(t *testing.T) {
 	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
 	assert.Error(t, err)
 
-	p.wal.close()
+	p.wal.close(false)
 	if p.file != nil {
 		p.file.Close()
 	}
@@ -5443,7 +5443,7 @@ func TestWalBeginRead_AllSlotsBusy_FallbackSlot0(t *testing.T) {
 	w.inProcess = true
 	w.inMemory = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Set maxFrame > 0 and nBackfill < maxFrame so we don't take the
 	// early-return path at beginRead:1390.
@@ -5477,7 +5477,7 @@ func TestWalBeginRead_AllSlotsBusy_Slot0AlsoLocked(t *testing.T) {
 	w.inProcess = true
 	w.inMemory = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	w.index.maxFrame.Store(10)
 	w.index.mxCommitFrame.Store(10) // beginRead uses mxCommitFrame for reader visibility
@@ -5504,7 +5504,7 @@ func TestWalBeginRead_BestSlotLockFails_FindUnused(t *testing.T) {
 	w.inProcess = true
 	w.inMemory = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	w.index.maxFrame.Store(10)
 	w.index.mxCommitFrame.Store(10) // beginRead uses mxCommitFrame for reader visibility
@@ -5534,8 +5534,8 @@ type errorCloseShm struct {
 	closeErr error
 }
 
-func (s *errorCloseShm) close() error {
-	_ = s.shm.close()
+func (s *errorCloseShm) close(isLastClient bool) error {
+	_ = s.shm.close(isLastClient)
 	return s.closeErr
 }
 
@@ -5552,7 +5552,7 @@ func TestWalClose_IndexCloseError(t *testing.T) {
 		closeErr: os.ErrClosed,
 	}
 
-	err := w.close()
+	err := w.close(false)
 	assert.ErrorIs(t, err, os.ErrClosed)
 }
 
@@ -5576,7 +5576,7 @@ func TestWalIndex_WriteHeader_RegionError_Injected(t *testing.T) {
 	w.inProcess = true
 	w.inMemory = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Replace shm with one that errors on region 0.
 	w.index.shm = &errorRegionShm{
@@ -5596,7 +5596,7 @@ func TestWalIndex_ReadHeader_RegionError(t *testing.T) {
 	w.inProcess = true
 	w.inMemory = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// Replace shm with one that errors on region 0.
 	w.index.shm = &errorRegionShm{
@@ -5616,7 +5616,7 @@ func TestWalIndex_ShmHashWrite_RegionError(t *testing.T) {
 	w.inProcess = true
 	w.inMemory = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	// First write to region 0 should work (it's the header region).
 	// shmHashWrite for frame 1 accesses region via htFrameSegIdx.
@@ -5645,7 +5645,7 @@ func TestWalIndex_ShmWriteCkptInfo_RegionError(t *testing.T) {
 	w.inProcess = true
 	w.inMemory = true
 	require.NoError(t, w.open())
-	defer w.close()
+	defer w.close(false)
 
 	w.index.shm = &errorRegionShm{
 		shm:        w.index.shm,
@@ -5937,13 +5937,13 @@ func TestWalOpen_LockCheckpointError(t *testing.T) {
 
 	// First, do a normal open to create the file, then close.
 	require.NoError(t, w.open())
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 
 	// Re-create with a custom shm that errors on lockCheckpoint.
 	w2 := newWal(filepath.Join(dir, "test.db"), 4096)
 	w2.inProcess = true
 	require.NoError(t, w2.open())
-	defer w2.close()
+	defer w2.close(false)
 
 	// Lock checkpoint exclusively to block next open.
 	require.NoError(t, w2.index.lock(lockCheckpoint, lockExclusive))
@@ -5952,7 +5952,7 @@ func TestWalOpen_LockCheckpointError(t *testing.T) {
 	// But since we're using heap shm (not shared), we need a different approach.
 	// Instead, close w2, create a new wal, replace its index shm to fail on lockCheckpoint.
 	require.NoError(t, w2.index.unlock(lockCheckpoint, lockExclusive))
-	require.NoError(t, w2.close())
+	require.NoError(t, w2.close(false))
 
 	// Create a valid WAL file so recovery path is exercised.
 	w3 := newWal(filepath.Join(dir, "test.db"), 4096)
@@ -5961,7 +5961,7 @@ func TestWalOpen_LockCheckpointError(t *testing.T) {
 	// Open normally first...
 	require.NoError(t, w3.open())
 	// Now close, and re-open with a modified shm that rejects lockCheckpoint.
-	require.NoError(t, w3.close())
+	require.NoError(t, w3.close(false))
 
 	// Write a valid WAL header so the file is >= walHeaderSize.
 	hdr := walHeader{magic: walMagic, version: 1000000, pageSize: 4096, salt1: 42, salt2: 43}
@@ -6028,7 +6028,7 @@ func TestWalRecover_TruncatedFrameHeader(t *testing.T) {
 	w.inProcess = true
 	err := w.open()
 	require.NoError(t, err) // recover ignores bad frames, just doesn't index them
-	w.close()
+	w.close(false)
 }
 
 // --- Recover with valid first frame but truncated second frame page data ---
@@ -6098,7 +6098,7 @@ func TestWalRecover_TruncatedSecondFramePageData(t *testing.T) {
 	require.NoError(t, err)
 	// Frame was not a commit frame, so nFrame is stored but lastCommitFrame = 0.
 	assert.Equal(t, uint32(0), w.nFrame.Load())
-	w.close()
+	w.close(false)
 }
 
 // --- Recover with committed frames (covers wal.go:1155+ rebuild path) ---
@@ -6163,7 +6163,7 @@ func TestWalRecover_WithCommittedFrames(t *testing.T) {
 	// Only the committed frame (frame 1) should be indexed.
 	assert.Equal(t, uint32(1), w.nFrame.Load())
 	assert.Equal(t, uint32(3), w.index.maxPage.Load())
-	w.close()
+	w.close(false)
 }
 
 // --- wal.go:1081-1088 recover ReadAt + deserialize fail -> truncate + writeHeader ---
@@ -6184,7 +6184,7 @@ func TestWalRecover_InvalidHeaderTruncateAndRewrite(t *testing.T) {
 	// Should have truncated and rewritten header.
 	assert.Equal(t, uint32(walMagic), w.header.magic)
 	assert.Equal(t, uint32(0), w.nFrame.Load())
-	w.close()
+	w.close(false)
 }
 
 // ============================================================
@@ -6339,7 +6339,7 @@ func TestCov2_WalOpen_LockRecoverError(t *testing.T) {
 	// Skip as it requires mmap shm concurrency.
 
 	_ = idx.unlock(lockRecover, lockExclusive)
-	idx.close()
+	idx.close(false)
 	t.Skip("BUG: L976-978 requires lock conflict which only works with mmap shm")
 }
 
@@ -6382,7 +6382,7 @@ func TestCov2_WalRecover_ReadAtError(t *testing.T) {
 	err := w.open()
 	require.NoError(t, err) // Should succeed with 0 frames
 	assert.Equal(t, uint32(0), w.nFrame.Load())
-	w.close()
+	w.close(false)
 }
 
 // --- wal.go L1086-1088: truncate after bad header deserialize in recover ---
@@ -6430,7 +6430,7 @@ func TestCov2_WalRecover_FrameHeaderReadError(t *testing.T) {
 	// Should succeed but with 0 recovered frames (partial frame ignored)
 	require.NoError(t, err)
 	assert.Equal(t, uint32(0), w.nFrame.Load())
-	w.close()
+	w.close(false)
 }
 
 // --- wal.go L1121-1122: ReadAt page data error in recover ---
@@ -6478,7 +6478,7 @@ func TestCov2_WalRecover_PageDataReadError(t *testing.T) {
 	// Should succeed: the truncated frame will be skipped during recovery
 	require.NoError(t, err)
 	assert.Equal(t, uint32(0), w.nFrame.Load())
-	w.close()
+	w.close(false)
 }
 
 // --- wal.go L1161-1163: ReadAt during rebuild in recover ---
@@ -6618,7 +6618,7 @@ func TestCov2_WriteHeader_FileError(t *testing.T) {
 	}
 	// Restore permissions for cleanup
 	_ = os.Chmod(walPath, 0666)
-	_ = w.close()
+	_ = w.close(false)
 }
 
 // ============================================================

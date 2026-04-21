@@ -116,7 +116,8 @@ func (s *inProcessShm) unlock(slot int, lockType int) error {
 	return nil
 }
 
-func (s *inProcessShm) close() error {
+func (s *inProcessShm) close(isLastClient bool) error {
+	_ = isLastClient
 	s.regMu.Lock()
 	s.regions = nil
 	s.regMu.Unlock()
@@ -138,17 +139,11 @@ type shm interface {
 	// unlock releases the lock on the given lock slot.
 	unlock(slot int, lockType int) error
 
-	// close releases all resources.
-	close() error
-
-	// tryExclusive attempts to acquire proof that this connection is the
-	// only process attached to the SHM. For mmap-backed SHM, upgrades the
-	// shared DMS (dead-man-switch) fcntl lock to exclusive and reports
-	// whether it succeeded. Does not release the lock — caller is expected
-	// to close soon after (matching SQLite's sqlite3WalClose which holds
-	// the exclusive DB lock through close; wal.c:2509).
-	// For heap-backed SHM (single process by definition), returns true.
-	tryExclusive() bool
+	// close releases all resources. If isLastClient is true, the backing
+	// shm file (if any) is unlinked. The caller determines last-client
+	// status via the DB-file exclusive lock upgrade (see pager.close) —
+	// shm no longer does its own DMS-based check.
+	close(isLastClient bool) error
 }
 
 // Lock types for shm.lock/unlock.

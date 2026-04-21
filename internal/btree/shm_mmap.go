@@ -296,7 +296,7 @@ func (s *mmapShm) fcntlLock(lockType int, offset int64) error {
 	return nil
 }
 
-func (s *mmapShm) close() error {
+func (s *mmapShm) close(isLastClient bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -307,33 +307,17 @@ func (s *mmapShm) close() error {
 		}
 	}
 
-	// Determine if we're the last connection by trying to acquire an exclusive
-	// DMS lock. If successful, no other process holds the SHM file open, so we
-	// can safely delete it. This matches SQLite's unixShmUnmap() behavior.
+	// Unlink the shm file iff the caller (pager.close) tells us we are the
+	// last client. The decision is made at the DB-file lock level — pager.close
+	// upgraded its shared flock to exclusive, which guarantees no peer can be
+	// mid-open against this DB.
 	//
-	// We must do this BEFORE closing the file descriptor, since closing the fd
-	// releases all our fcntl locks.
-	//
-	// CRITICAL ordering: unlink MUST happen BEFORE closing the fd. Otherwise
-	// a peer process can call newPlatformShm on the same path between our
-	// f.Close() (which releases the exclusive DMS fcntl lock) and osRemove,
-	// opening the *same inode* by name and acquiring a shared DMS lock. That
-	// peer would then read our stale SHM header (e.g. mxFrame=N) even though
-	// close-time WAL truncation already zeroed the WAL file, causing it to
-	// believe there are N frames in a now-empty WAL — split-brain that
-	// manifests as lost rows or IntegrityCheck failures in back-to-back
-	// close/open cycles (any-store-tests CL-4 CloseRaceCycle). Unlinking
-	// first guarantees any concurrent opener instead creates a fresh SHM
-	// file (O_CREATE) with zeroed contents, which is the correct match for
-	// the truncated WAL.
-	deleteFile := false
-	if s.file != nil {
-		// Try to upgrade our shared DMS lock to exclusive.
-		if err := s.fcntlLock(syscall.F_WRLCK, shmDMSOffset); err == nil {
-			deleteFile = true
-		}
-	}
-	if deleteFile {
+	// CRITICAL ordering: unlink BEFORE closing the fd. A new opener that got
+	// as far as osOpenFile before our unlink will still reach its
+	// acquireSharedDBLock call and BUSY-retry there, never touching a stale
+	// inode. (We also still hold the DB-file exclusive flock until pager.close's
+	// Close() returns, providing the outer serialization.)
+	if isLastClient && s.file != nil {
 		_ = osRemove(s.path)
 	}
 

@@ -886,10 +886,10 @@ func (wi *walIndex) unlock(slot int, lockType int) error {
 	return wi.shm.unlock(slot, lockType)
 }
 
-// close closes the shm.
-func (wi *walIndex) close() error {
+// close closes the shm. If isLastClient is true the backing shm file is unlinked.
+func (wi *walIndex) close(isLastClient bool) error {
 	if wi.shm != nil {
-		return wi.shm.close()
+		return wi.shm.close(isLastClient)
 	}
 	return nil
 }
@@ -2784,14 +2784,15 @@ func (w *wal) truncateFile() {
 	w.mu.Unlock()
 }
 
-// close closes the WAL file and shared memory.
-func (w *wal) close() error {
+// close closes the WAL file and shared memory. If isLastClient is true, the
+// shm backing file is unlinked (see shm.close).
+func (w *wal) close(isLastClient bool) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	var firstErr error
 	if w.index != nil {
-		if err := w.index.close(); err != nil && firstErr == nil {
+		if err := w.index.close(isLastClient); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
