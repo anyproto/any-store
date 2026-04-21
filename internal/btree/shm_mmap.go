@@ -52,86 +52,34 @@ type mmapShm struct {
 	locks   [lockSlotCount]int // in-process lock state: 0=unlocked, >0=shared count, -1=exclusive
 }
 
-// newPlatformShm creates a new mmap-backed shm.
-// Acquires a shared DMS lock to track that this connection is using the SHM file.
+// newPlatformShm creates a new mmap-backed shm and acquires a shared DMS
+// fcntl lock (kept for intra-process lock-slot coordination via the fcntl
+// layer). Single-shot — no retries, no inode verify.
 //
-// Race-avoidance: the window between osOpenFile and fcntlLock(F_RDLCK, DMS) is
-// open — a peer in mmapShm.close holding exclusive DMS can unlink the file and
-// close its fd during that window, leaving our fd pointing at an orphaned
-// inode. A subsequent opener would then create a NEW file at `path` (O_CREATE
-// after unlink), yielding split-brain SHM state that manifests as lost rows /
-// IntegrityCheck failures in high-turnover close/open cycles (any-store-tests
-// CL-4 CloseRaceCycle). To detect this, after acquiring shared DMS we stat
-// `path` and compare its inode to our fd's inode; on mismatch we retry from
-// scratch. Loop-bounded by a simple sanity cap. Matches SQLite's unixShmOpen
-// inode-verification idiom (os_unix.c).
+// The pager.open caller holds a SHARED flock on the DB file before we are
+// invoked. That flock is what serializes "last-client-unlink" vs. "new-
+// opener-attach": any closer that could unlink our shm file must hold DB-file
+// EXCLUSIVE, which means our pager's SHARED acquisition must have completed
+// before that closer ever unlinked — so by the time we are here, the shm
+// path→inode mapping is either fresh (closer already unlinked and we/peer
+// created a new one) or stably attached. Either way the old inode-verify
+// retry loop is obsolete — see any-store/internal/btree/NOTES.md §SHM open/
+// close protocol drift.
 func newPlatformShm(path string) (shm, error) {
-	for attempt := 0; attempt < 50; attempt++ {
-		f, err := osOpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
-		if err != nil {
-			return nil, fmt.Errorf("btree: open shm file: %w", err)
-		}
-
-		s := &mmapShm{
-			file:    f,
-			path:    path,
-			regions: make([][]byte, 0, shmMaxRegions),
-		}
-
-		// Acquire a shared DMS lock. All open connections hold this lock.
-		// On close, we try to upgrade to exclusive: if successful, we're the last
-		// connection and can safely delete the SHM file.
-		if err := s.fcntlLock(syscall.F_RDLCK, shmDMSOffset); err != nil {
-			_ = f.Close()
-			if err == ErrBusy {
-				// A peer holds exclusive DMS (mid-close, about to unlink).
-				// Retry — the peer will release shortly and either unlink
-				// (next iteration creates a fresh inode) or let us proceed.
-				continue
-			}
-			return nil, fmt.Errorf("btree: acquire DMS lock: %w", err)
-		}
-
-		// Verify the path still resolves to the inode we opened. If the peer
-		// unlinked between our open and our F_RDLCK, path now resolves to a
-		// different (freshly-created by someone else) inode — or to nothing.
-		// Either way our fd is orphaned; close and retry.
-		var fdStat, pathStat syscall.Stat_t
-		if err := syscall.Fstat(int(f.Fd()), &fdStat); err != nil {
-			_ = f.Close()
-			return nil, fmt.Errorf("btree: fstat shm: %w", err)
-		}
-		if err := syscall.Stat(path, &pathStat); err != nil {
-			// ENOENT → unlinked after we opened; retry.
-			_ = f.Close()
-			if err == syscall.ENOENT {
-				continue
-			}
-			return nil, fmt.Errorf("btree: stat shm: %w", err)
-		}
-		if fdStat.Ino != pathStat.Ino {
-			// Our fd points at an orphaned inode; retry with a fresh open.
-			_ = f.Close()
-			continue
-		}
-
-		return s, nil
+	f, err := osOpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
+	if err != nil {
+		return nil, fmt.Errorf("btree: open shm file: %w", err)
 	}
-	return nil, fmt.Errorf("btree: acquire DMS lock: retries exhausted")
-}
-
-// tryExclusive attempts to upgrade the shared DMS fcntl lock to exclusive,
-// proving this process is the only connection currently attached to the SHM.
-// Matches the exclusive-DB-lock check SQLite does in sqlite3WalClose
-// (wal.c:2509) before walLimitSize / isDelete. If the upgrade fails, a peer
-// process still has the SHM open and caller must not destructively mutate
-// shared state (e.g. truncate the WAL). The upgraded lock is retained —
-// caller is expected to close shortly after.
-func (s *mmapShm) tryExclusive() bool {
-	if s.file == nil {
-		return false
+	s := &mmapShm{
+		file:    f,
+		path:    path,
+		regions: make([][]byte, 0, shmMaxRegions),
 	}
-	return s.fcntlLock(syscall.F_WRLCK, shmDMSOffset) == nil
+	if err := s.fcntlLock(syscall.F_RDLCK, shmDMSOffset); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("btree: acquire DMS shared lock: %w", err)
+	}
+	return s, nil
 }
 
 func (s *mmapShm) region(index int, create bool) ([]byte, error) {

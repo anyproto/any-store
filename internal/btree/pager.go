@@ -2186,22 +2186,14 @@ func (p *pager) close() error {
 					trace("close: checkpointPassive incomplete or failed: %v", cpErr)
 				}
 			}
-			// Truncate gating: matches SQLite's sqlite3WalClose (wal.c:2487-2551)
+			// Truncate gating: matches SQLite's sqlite3WalClose (wal.c:2487-2551),
 			// which calls walLimitSize (wal.c:2534) only after obtaining an
-			// exclusive DB lock (wal.c:2509) — i.e. proof this is the only
-			// connection to the database. Any-store's analog is
-			// wal.index.shm.tryExclusive (upgrades the shared DMS fcntl lock).
-			// Without that proof we must leave the WAL intact so peer readers
-			// bounded by the old hdr.mxFrame can still find frames in the file.
-			// Determine "am I the last client?" via DB-file exclusive upgrade,
-			// matching SQLite's sqlite3WalClose (wal.c:2508). Success blocks
-			// new openers (they'd need shared on the DB file) until we finish
-			// the unlink + truncate sequence below. Failure means a peer is
-			// still attached, so we leave the WAL intact.
-			//
-			// We feed this result to wal.close → shm.close as the single
-			// source of truth for "last client" — the DB file — replacing the
-			// old shm.tryExclusive (DMS-based) check.
+			// exclusive DB-file lock (wal.c:2509) — proof this is the only
+			// connection. We use a DB-file flock upgrade as the analog, and
+			// plumb the result through wal.close → shm.close as the single
+			// source of truth for "last client". Failure means a peer is still
+			// attached; we leave the WAL intact so peer readers can still find
+			// frames in the file.
 			if p.inProcess {
 				isLastClient = true
 			} else if p.file != nil {

@@ -52,11 +52,6 @@ type shmLock struct {
 	state int // 0=unlocked, >0=shared count, -1=exclusive
 }
 
-func (s *inProcessShm) tryExclusive() bool {
-	// Heap-backed SHM is single-process by construction.
-	return true
-}
-
 func (s *inProcessShm) region(index int, create bool) ([]byte, error) {
 	s.regMu.Lock()
 	defer s.regMu.Unlock()
