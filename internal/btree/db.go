@@ -466,7 +466,7 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 		// inside beginWrite() (happens-before guarantee).
 		db.pager.writerWalSlot = slot
 
-		err = db.pager.beginWriteWithSnapshot(readSnap)
+		err = db.pager.beginWrite(readSnap)
 		if err == nil {
 			break
 		}

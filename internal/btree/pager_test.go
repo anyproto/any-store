@@ -45,7 +45,7 @@ func TestPagerError(t *testing.T) {
 	maxFrame, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(maxFrame)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Dirty a page
 	pg, err := p.getWritablePage(1)
@@ -80,7 +80,7 @@ func TestTryCheckpoint(t *testing.T) {
 	maxFrame, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(maxFrame)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
@@ -125,7 +125,7 @@ func TestReadPageMVCC_ValidPage(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -177,7 +177,7 @@ func TestBeginWrite_InitializesWritePages(t *testing.T) {
 	p.walMaxFrame.Store(mf)
 
 	// writerCache is initialized after beginWrite
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	assert.NotNil(t, p.writerCache)
 
 	require.NoError(t, p.rollback())
@@ -198,7 +198,7 @@ func TestFreePage_InvalidPageZero(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	assert.ErrorIs(t, p.freePage(0), ErrInvalidPage)
 	assert.ErrorIs(t, p.freePage(1), ErrInvalidPage)
@@ -217,7 +217,7 @@ func TestFreePage_OutOfBounds(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Page beyond db size
 	assert.ErrorIs(t, p.freePage(999), ErrCorrupt)
@@ -246,7 +246,7 @@ func TestFreePage_CorruptTrunkPage(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate pages so we have something to free
 	pg2, err := p.allocatePage()
@@ -278,7 +278,7 @@ func TestFreePage_CorruptLeafCount(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate and free some pages to create a trunk
 	pg2, err := p.allocatePage()
@@ -316,7 +316,7 @@ func TestFreePage_BecomesNewTrunk(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate pages
 	pg2, err := p.allocatePage()
@@ -342,7 +342,7 @@ func TestFreePage_TrunkFullNewTrunk(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate many pages (enough to fill a trunk)
 	maxLeaves := p.freelistMaxLeaves()
@@ -385,7 +385,7 @@ func TestAllocateFromFreelist_EmptyFreelist(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	_, err = p.allocateFromFreelist()
 	assert.ErrorIs(t, err, ErrInvalidPage)
@@ -404,7 +404,7 @@ func TestAllocateFromFreelist_CorruptTrunk(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	p.header.FirstFreelistPg = 999 // out of bounds
 	_, err = p.allocateFromFreelist()
@@ -424,7 +424,7 @@ func TestAllocateFromFreelist_CorruptLeafCount(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate and free to create freelist
 	pg2, err := p.allocatePage()
@@ -455,7 +455,7 @@ func TestAllocateFromFreelist_CorruptLeafPgno(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Create freelist: trunk with one leaf
 	pg2, err := p.allocatePage()
@@ -495,7 +495,7 @@ func TestAllocateFromFreelist_CorruptNextTrunk(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Create trunk with no leaves
 	pg2, err := p.allocatePage()
@@ -526,7 +526,7 @@ func TestAllocateFromFreelist_PopLeafWithHasContent(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate pages
 	pg2, err := p.allocatePage()
@@ -563,7 +563,7 @@ func TestAllocateFromFreelist_PopLeafWithSavepoint(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate and free pages to create freelist
 	pg2, err := p.allocatePage()
@@ -601,7 +601,7 @@ func TestAllocateFromFreelist_UseTrunkItself(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate and free one page (becomes trunk with 0 leaves)
 	pg2, err := p.allocatePage()
@@ -768,7 +768,7 @@ func TestCommit_EmptyTransaction(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Commit with no changes
 	nFrame, fcc, sc, err := p.commit(false, false)
@@ -790,7 +790,7 @@ func TestCommit_WithDontWritePages(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate pages, free one (which marks it dontWrite)
 	pg2, err := p.allocatePage()
@@ -819,7 +819,7 @@ func TestPagerCommit_SchemaChanged(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Make a change
 	pg, err := p.getWritablePage(1)
@@ -858,7 +858,7 @@ func TestRollback_FromErrorState(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Set error state directly
 	p.state.Store(int32(pagerError))
@@ -908,7 +908,7 @@ func TestRollbackToSavepoint_InvalidID(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	err = p.rollbackToSavepoint(-1)
 	assert.ErrorIs(t, err, ErrInvalidSavepoint)
@@ -944,7 +944,7 @@ func TestReleaseSavepoint_InvalidID(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	err = p.releaseSavepoint(-1)
 	assert.ErrorIs(t, err, ErrInvalidSavepoint)
@@ -965,7 +965,7 @@ func TestReleaseSavepoint_MergeToParent(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Create two savepoints
 	sp0, err := p.savepoint()
@@ -1047,7 +1047,7 @@ func TestReadOverflowChainMVCC(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Write an overflow chain
 	data := make([]byte, 5000) // bigger than page
@@ -1085,7 +1085,7 @@ func TestFreeOverflowChain_CorruptPageNumbers(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// pgno < 2 should return ErrCorrupt
 	err = p.freeOverflowChain(0)
@@ -1157,7 +1157,7 @@ func TestReadHeaderCounters_WithWALFrames(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -1191,7 +1191,7 @@ func TestReadWalFrameData_InMemory(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -1249,7 +1249,7 @@ func TestGetWritablePage_ReAcquireClears_dontWrite(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate pages
 	pg2, err := p.allocatePage()
@@ -1830,7 +1830,7 @@ func TestCheckpointPassive_PartialCheckpoint(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -1847,7 +1847,7 @@ func TestCheckpointPassive_PartialCheckpoint(t *testing.T) {
 	mf3, slot3, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf3)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg2, err := p.allocatePage()
 	require.NoError(t, err)
 	p.releasePage(pg2)
@@ -1878,7 +1878,7 @@ func TestCheckpointWithMode_Restart(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -1902,7 +1902,7 @@ func TestCheckpointWithMode_Truncate(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -1931,7 +1931,7 @@ func TestCheckpointWithMode_PassiveNoBusyHandler(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -1955,7 +1955,7 @@ func TestCheckpointWithMode_FullWithBusyHandler(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -2254,7 +2254,7 @@ func TestPagerOpen_ExistingDBWithWALRecovery(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
@@ -2315,7 +2315,7 @@ func TestPagerBeginRead_CASLoopMonotonic(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -2348,7 +2348,7 @@ func TestGetPageAt_CacheHitDirtyPage(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Make page 1 dirty
 	pg, err := p.getWritablePage(1)
@@ -2376,7 +2376,7 @@ func TestGetPageAt_CacheHitNewerVersion(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -2388,7 +2388,7 @@ func TestGetPageAt_CacheHitNewerVersion(t *testing.T) {
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf2)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg2, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg2)
@@ -2421,7 +2421,7 @@ func TestGetWritablePage_WithSavepoint(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	_, err = p.savepoint()
 	require.NoError(t, err)
@@ -2470,7 +2470,7 @@ func TestCheckpointWithMode_ReadersBlockSafeFrame(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -2487,7 +2487,7 @@ func TestCheckpointWithMode_ReadersBlockSafeFrame(t *testing.T) {
 	mf3, slot3, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf3)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg2, err := p.allocatePage()
 	require.NoError(t, err)
 	p.releasePage(pg2)
@@ -2591,7 +2591,7 @@ func TestReadHeaderCounters_NonInProcess_WithWAL(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -2637,7 +2637,7 @@ func TestCheckpointWithMode_Read0LockBusy(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -2670,7 +2670,7 @@ func TestPagerClose_IncompleteCheckpoint(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -2687,7 +2687,7 @@ func TestPagerClose_IncompleteCheckpoint(t *testing.T) {
 	mf3, slot3, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf3)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg2, err := p.allocatePage()
 	require.NoError(t, err)
 	p.releasePage(pg2)
@@ -2717,7 +2717,7 @@ func TestCheckpointWithMode_DowngradeToPassive(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -2748,7 +2748,7 @@ func TestFreePage_WithSavepoints(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate pages
 	pg2, err := p.allocatePage()
@@ -2814,7 +2814,7 @@ func TestGetPageAt_InMemory_CacheMiss(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg2, err := p.allocatePage()
 	require.NoError(t, err)
 	copy(pg2.data[4:], "page2content")
@@ -2846,7 +2846,7 @@ func TestGetPageAt_ReadFromWAL(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -2881,7 +2881,7 @@ func TestReadPageUncached_FromWAL(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	copy(pg.data[dbHeaderSize:], "wal data test")
@@ -2947,7 +2947,7 @@ func TestCommit_WithZeroContentPages(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate a page and leave it zero-content
 	pg2, err := p.allocatePage()
@@ -3038,7 +3038,7 @@ func TestCheckpointWithMode_ReaderLockLoopBusyThenOK(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -3125,7 +3125,7 @@ func TestFreeOverflowChain_InvalidNextPgno(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate a page and make it point to page 1 (invalid for overflow)
 	pg2, err := p.allocatePage()
@@ -3138,7 +3138,7 @@ func TestFreeOverflowChain_InvalidNextPgno(t *testing.T) {
 
 	// Also test pgno > dbSize
 	require.NoError(t, p.rollback())
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg3, err := p.allocatePage()
 	require.NoError(t, err)
@@ -3166,7 +3166,7 @@ func TestReadOverflowChain_InvalidPgno(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate a page and make it point to page 0 (invalid, < 2)
 	pg2, err := p.allocatePage()
@@ -3207,7 +3207,7 @@ func TestReadOverflowChain_MVCCPath(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Write an overflow chain
 	data := make([]byte, 5000)
@@ -3246,7 +3246,7 @@ func TestAllocatePage_AllocateFromFreelistFails(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Set corrupted freelist header so allocateFromFreelist fails
 	p.header.FirstFreelistPg = 999
@@ -3375,7 +3375,7 @@ func TestReadHeaderCounters_InMemory_FromPcache(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -3405,7 +3405,7 @@ func TestGetPageAt_ReadFromFile(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg2, err := p.allocatePage()
 	require.NoError(t, err)
 	pg2.data[0] = pageTypeLeafIdx
@@ -3444,7 +3444,7 @@ func TestCheckpointWithMode_FullFallbackToPassive(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	p.releasePage(pg)
@@ -3587,7 +3587,7 @@ func TestGetPageAt_WALReadFrameError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate and write a page
 	pg, err := p.allocatePage()
@@ -3630,7 +3630,7 @@ func TestGetPageAt_InMemory_ZeroFill(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Grow the database to have page 3
 	p.dbSize.Store(3)
@@ -3667,7 +3667,7 @@ func TestGetWritablePage_GetPageError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Try to get a writable page 0 (invalid) - should error
 	_, err = p.getWritablePage(0)
@@ -3689,7 +3689,7 @@ func TestAllocatePage_GetPageNoContentError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Set dbSize to maxUint32-1 to cause overflow
 	p.dbSize.Store(^uint32(0) - 1)
@@ -3731,7 +3731,7 @@ func TestFreePage_TrunkReadError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Set up a freelist pointing to an invalid page
 	p.header.FirstFreelistPg = 999 // Beyond dbSize
@@ -3761,7 +3761,7 @@ func TestFreePage_NewTrunkWithSavepoints(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate a page (it becomes page 2)
 	pg, err := p.allocatePage()
@@ -3797,7 +3797,7 @@ func TestAllocateFromFreelist_TrunkGetError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Point freelist to a trunk page beyond dbSize (invalid)
 	p.header.FirstFreelistPg = p.dbSize.Load() + 100
@@ -3888,7 +3888,7 @@ func TestPagerCommit_WriteFramesError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate and write a page to create real changes
 	pg, err := p.allocatePage()
@@ -3942,7 +3942,7 @@ func TestReadOverflowChain_MaxIterExceeded(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg2, err := p.allocatePage()
 	require.NoError(t, err)
@@ -3973,7 +3973,7 @@ func TestFreeOverflowChain_MaxIterExceeded(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg2, err := p.allocatePage()
 	require.NoError(t, err)
@@ -4000,7 +4000,7 @@ func TestFreeOverflowChain_GetPageError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Grow dbSize to make page 5 "valid" for bounds check
 	p.dbSize.Store(5)
@@ -4036,7 +4036,7 @@ func TestFreeOverflowChain_FreePageError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate a single-page chain (next=0)
 	pg, err := p.allocatePage()
@@ -4263,7 +4263,7 @@ func TestWALRecover_RebuildReadError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -4405,7 +4405,7 @@ func TestCheckpointWithMode_FdatasyncWALError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -4439,7 +4439,7 @@ func TestCheckpointWithMode_BackfillErrors(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -4474,7 +4474,7 @@ func TestCheckpointWithMode_FdatasyncDbFileError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -4577,7 +4577,7 @@ func TestPagerCommit_BothChangedFlags(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -4608,7 +4608,7 @@ func TestPagerCommit_EmptyTransaction(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Don't make any changes
 	nf, fcc, sc, err := p.commit(false, false)
@@ -4632,7 +4632,7 @@ func TestFreePage_NewTrunkNoSavepoints(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate pages 2, 3
 	pg2, err := p.allocatePage()
@@ -4668,7 +4668,7 @@ func TestGetPageAt_CleanPageStaleSnapshot(t *testing.T) {
 	mf1, slot1, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf1)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -4690,7 +4690,7 @@ func TestGetPageAt_CleanPageStaleSnapshot(t *testing.T) {
 	p.releasePage(cachedPg)
 
 	// Second write: update page 2
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	wpg, err := p.getWritablePage(pgno)
 	require.NoError(t, err)
 	copy(wpg.data[4:], "version 2")
@@ -4726,7 +4726,7 @@ func TestCheckpointWithMode_ReaderBlocksMxSafeFrame(t *testing.T) {
 	mf1, slot1, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf1)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -4745,7 +4745,7 @@ func TestCheckpointWithMode_ReaderBlocksMxSafeFrame(t *testing.T) {
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf2)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg2, err := p.allocatePage()
 	require.NoError(t, err)
@@ -4843,7 +4843,7 @@ func TestCheckpointPost_PartialCheckpoint(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -4872,7 +4872,7 @@ func TestCheckpointWithMode_InMemory_PcachePath(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -4932,7 +4932,7 @@ func TestCheckpointWithMode_Truncate_Full(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -4967,7 +4967,7 @@ func TestCheckpointWithMode_FullNoReset(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -5001,7 +5001,7 @@ func TestWriteOverflowChain_MultiPage(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Create data larger than one overflow page
 	usable := overflowPageUsable(p.usableSize())
@@ -5036,7 +5036,7 @@ func TestAllocateFromFreelist_HasContent(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Create a savepoint
 	p.savepoint()
@@ -5080,7 +5080,7 @@ func TestAllocateFromFreelist_WithSavepoints(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate and free a page to populate freelist
 	pg1, err := p.allocatePage()
@@ -5123,7 +5123,7 @@ func TestFreePage_TrunkCorruptLeafCount(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg2, err := p.allocatePage()
 	require.NoError(t, err)
@@ -5157,7 +5157,7 @@ func TestCheckpointWithMode_InMemory_DiskWritePath(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -5190,7 +5190,7 @@ func TestCheckpointWithMode_DbFileWriteError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -5304,7 +5304,7 @@ func TestCheckpointWithMode_InMemory_DiskWriteError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -5336,7 +5336,7 @@ func TestCheckpointWithMode_FileReadPageDataError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -5381,7 +5381,7 @@ func TestCheckpointWithMode_FdatasyncDbFileError_Precise(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg, err := p.allocatePage()
 	require.NoError(t, err)
@@ -5669,7 +5669,7 @@ func TestWalWriteFrames_FdatasyncError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	p.endRead(slot)
 
 	// Write a page to create a frame.
@@ -5728,7 +5728,7 @@ func TestCheckpointWithMode_WriteLockNonBusyError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	p.endRead(slot)
 	pg, err := p.getWritablePage(2)
 	require.NoError(t, err)
@@ -5765,7 +5765,7 @@ func TestCheckpointWithMode_ReaderLockNonBusyError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	p.endRead(slot)
 	pg, err := p.getWritablePage(2)
 	require.NoError(t, err)
@@ -5804,7 +5804,7 @@ func TestCheckpointWithMode_BackfillLockNonBusyError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	p.endRead(slot)
 	pg, err := p.getWritablePage(2)
 	require.NoError(t, err)
@@ -5857,7 +5857,7 @@ func TestTryResetWAL_NonBusyReaderLockError(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	p.endRead(slot)
 	pg, err := p.getWritablePage(2)
 	require.NoError(t, err)
@@ -5900,7 +5900,7 @@ func TestCheckpointWithMode_FdatasyncDbFileError_RO(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	p.endRead(slot)
 	pg, err := p.getWritablePage(2)
 	require.NoError(t, err)
@@ -6559,7 +6559,7 @@ func TestCov2_FlushHeader_SyncError_RealFile(t *testing.T) {
 	maxFrame, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(maxFrame)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Dirty page 1
 	pg, err := p.getWritablePage(1)
@@ -6682,7 +6682,7 @@ func TestReadHeaderCountersIgnoresSpilledFrames(t *testing.T) {
 	maxFrame, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(maxFrame)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Write page 1 with known FileChangeCount=100, SchemaCookie=200 and COMMIT
 	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
@@ -6733,7 +6733,7 @@ func TestPagerStressSpillsDirtyPage(t *testing.T) {
 	maxFrame, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(maxFrame)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	defer func() {
 		p.wal.endWrite()
 		p.endRead(slot)
@@ -6779,7 +6779,7 @@ func TestPagerStressSpillFlagOff(t *testing.T) {
 	maxFrame, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(maxFrame)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	defer func() {
 		p.doNotSpill &^= spillFlagOff
 		p.wal.endWrite()
@@ -6816,7 +6816,7 @@ func TestPagerStressSpillFlagRollback(t *testing.T) {
 	maxFrame, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(maxFrame)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	defer func() {
 		p.doNotSpill &^= spillFlagRollback
 		p.wal.endWrite()
@@ -6853,7 +6853,7 @@ func TestPagerStressWithSavepoint(t *testing.T) {
 	maxFrame, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(maxFrame)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	defer func() {
 		p.wal.endWrite()
 		p.endRead(slot)
@@ -6916,7 +6916,7 @@ func TestPagerStressThenCommit(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate pages with known data
 	pg2, err := p.allocatePage()
@@ -6990,7 +6990,7 @@ func TestPagerStressThenRollback(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg2, err := p.allocatePage()
 	require.NoError(t, err)
@@ -7009,7 +7009,7 @@ func TestPagerStressThenRollback(t *testing.T) {
 	mf2, slot2, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf2)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg2w, err := p.getWritablePage(pg2no)
 	require.NoError(t, err)
@@ -7057,7 +7057,7 @@ func TestPagerStressThenSavepointRollback(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg2, err := p.allocatePage()
 	require.NoError(t, err)
@@ -7148,7 +7148,7 @@ func TestSavepointRollbackReDirtiesSpilledPages(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg2, err := p.allocatePage()
 	require.NoError(t, err)
@@ -7213,7 +7213,7 @@ func TestLargeTransactionBoundedMemory(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate many pages — well beyond cacheSize to trigger spilling
 	numPages := cacheSize * 5 // 100 pages vs cache of 20
@@ -7270,7 +7270,7 @@ func TestSpillThenCheckpoint(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate pages exceeding cache to trigger spill
 	numPages := 30
@@ -7320,7 +7320,7 @@ func TestSpillMultipleRounds(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Write 3 waves, each exceeding cache size to force multiple spill rounds
 	totalPages := cacheSize * 3
@@ -7377,7 +7377,7 @@ func TestConcurrentReaderDuringSpill(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	pg2, err := p.allocatePage()
 	require.NoError(t, err)
@@ -7403,7 +7403,7 @@ func TestConcurrentReaderDuringSpill(t *testing.T) {
 	mf2, writerSlot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf2)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Modify page 2 and force it to spill
 	pg2w, err := p.getWritablePage(pg2no)
@@ -7472,7 +7472,7 @@ func TestSpillInMemoryMode(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate pages exceeding cache to trigger spill via writeFramesMem
 	numPages := cacheSize * 3
@@ -7532,7 +7532,7 @@ func TestPagerSlabIntegration(t *testing.T) {
 	mf, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(mf)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	var pageNos []uint32
 	for i := 0; i < 5; i++ {

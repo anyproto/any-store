@@ -260,7 +260,7 @@ func TestGap_Pager_FreePage_CacheCreateFallback(t *testing.T) {
 	maxFrame, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(maxFrame)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Allocate several pages to grow the DB
 	var pages []*page
@@ -426,7 +426,7 @@ func TestGap_WAL_WriteFrames_FdatasyncError(t *testing.T) {
 	maxFrame, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(maxFrame)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Dirty page 1
 	pg, err := p.getWritablePage(1)
@@ -477,7 +477,7 @@ func TestGap_WAL_Checkpoint_FdatasyncDbError(t *testing.T) {
 	maxFrame, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(maxFrame)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	pg, err := p.getWritablePage(1)
 	require.NoError(t, err)
 	copy(pg.data[dbHeaderSize:], "checkpoint test")
@@ -963,7 +963,7 @@ func TestGap_Pager_FreePage_ActiveSavepoint(t *testing.T) {
 	maxFrame, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(maxFrame)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Create a savepoint
 	spID, err := p.savepoint()
@@ -1059,7 +1059,7 @@ func TestGap_Pager_GetPageAt_FileBeyondDbSize(t *testing.T) {
 	maxFrame, slot, err := p.beginRead()
 	require.NoError(t, err)
 	p.walMaxFrame.Store(maxFrame)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	// Manually bump dbSize beyond what's on disk
 	p.dbSize.Store(100) // claim 100 pages exist

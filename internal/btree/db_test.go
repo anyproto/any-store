@@ -1337,7 +1337,7 @@ func TestBeginWrite_BeginWriteError(t *testing.T) {
 	// Call pager methods directly to cover the beginWrite error path.
 	maxFrame, slot, err := db.pager.beginRead()
 	require.NoError(t, err)
-	err = db.pager.beginWrite()
+	err = db.pager.beginWrite(WalIndexHdr{})
 	assert.ErrorIs(t, err, ErrBusy) // Fails because WAL write lock is held
 	db.pager.endRead(slot)
 	_ = maxFrame

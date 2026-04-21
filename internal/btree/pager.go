@@ -479,17 +479,14 @@ func (p *pager) endRead(slot int) {
 	p.mu.RUnlock()
 }
 
-// beginWrite starts a write transaction (must hold a read transaction first).
-// Kept for backward compat with tests that don't thread a tx. Uses zero
-// snapshot → skips BUSY_SNAPSHOT check (acceptable for single-process tests).
-func (p *pager) beginWrite() error {
-	return p.beginWriteWithSnapshot(WalIndexHdr{})
-}
-
-// beginWriteWithSnapshot is the production entry point. readSnap is the
-// caller's WAL hdr from BeginRead (per-tx walHdr). BUSY_SNAPSHOT compares
-// it against live SHM inside wal.beginWriteWithSnapshot.
-func (p *pager) beginWriteWithSnapshot(readSnap WalIndexHdr) error {
+// beginWrite starts a write transaction (must hold a read transaction
+// first). readSnap is the caller's WAL hdr from BeginRead (per-tx
+// walHdr); BUSY_SNAPSHOT compares it against live SHM inside
+// wal.beginWriteWithSnapshot. The snapshot is required — there is
+// deliberately no zero-arg form, because a WalIndexHdr{} snapshot
+// silently disables the BUSY_SNAPSHOT check and is a multi-process
+// correctness hazard (NOTES.md P0.2 drift, resolved).
+func (p *pager) beginWrite(readSnap WalIndexHdr) error {
 	stateChanged, err := p.wal.beginWriteWithSnapshot(readSnap)
 	if err != nil {
 		return err
