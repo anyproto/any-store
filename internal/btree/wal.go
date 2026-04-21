@@ -1364,7 +1364,7 @@ func (w *wal) ensureHeaderInitialized() (WalIndexHdr, error) {
 				w.mu.Unlock()
 				return hdr, nil
 			}
-			return WalIndexHdr{}, errWALRetry
+			return WalIndexHdr{}, ErrBusyRecovery
 		}
 		return WalIndexHdr{}, err
 	}
@@ -1381,14 +1381,14 @@ func (w *wal) ensureHeaderInitialized() (WalIndexHdr, error) {
 	// Header still bad → run recovery. Acquire CKPT + RECOVER exclusive too.
 	if err := w.index.lock(lockCheckpoint, lockExclusive); err != nil {
 		if err == ErrBusy {
-			return WalIndexHdr{}, errWALRetry
+			return WalIndexHdr{}, ErrBusyRecovery
 		}
 		return WalIndexHdr{}, err
 	}
 	defer func() { _ = w.index.unlock(lockCheckpoint, lockExclusive) }()
 	if err := w.index.lock(lockRecover, lockExclusive); err != nil {
 		if err == ErrBusy {
-			return WalIndexHdr{}, errWALRetry
+			return WalIndexHdr{}, ErrBusyRecovery
 		}
 		return WalIndexHdr{}, err
 	}
