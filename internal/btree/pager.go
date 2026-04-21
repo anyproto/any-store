@@ -2154,8 +2154,10 @@ func (p *pager) close() error {
 	defer p.mu.Unlock()
 
 	if p.wal != nil {
+		isLastClient := false
 		if p.inMemory {
-			// InMemory: just reset WAL state, nothing to checkpoint to disk
+			// InMemory: no peers, always last.
+			isLastClient = true
 		} else {
 			// Checkpoint before closing. Only truncate WAL if all frames
 			// were copied to the database file. A partial PASSIVE checkpoint
@@ -2191,14 +2193,35 @@ func (p *pager) close() error {
 			// wal.index.shm.tryExclusive (upgrades the shared DMS fcntl lock).
 			// Without that proof we must leave the WAL intact so peer readers
 			// bounded by the old hdr.mxFrame can still find frames in the file.
-			if cpErr == nil && (p.inProcess || p.wal.index.shm.tryExclusive()) {
+			// Determine "am I the last client?" via DB-file exclusive upgrade,
+			// matching SQLite's sqlite3WalClose (wal.c:2508). Success blocks
+			// new openers (they'd need shared on the DB file) until we finish
+			// the unlink + truncate sequence below. Failure means a peer is
+			// still attached, so we leave the WAL intact.
+			//
+			// We feed this result to wal.close → shm.close as the single
+			// source of truth for "last client" — the DB file — replacing the
+			// old shm.tryExclusive (DMS-based) check.
+			if p.inProcess {
+				isLastClient = true
+			} else if p.file != nil {
+				ok, err := tryUpgradeDBLockExclusive(p.file)
+				if err != nil {
+					if debugTrace {
+						trace("close: DB-file exclusive upgrade error: %v", err)
+					}
+				} else {
+					isLastClient = ok
+				}
+			}
+			if cpErr == nil && isLastClient {
 				p.wal.truncateFile()
 			}
 			if lockedWrite {
 				_ = p.wal.index.unlock(lockWrite, lockExclusive)
 			}
 		}
-		_ = p.wal.close()
+		_ = p.wal.close(isLastClient)
 	}
 
 	p.writerCache.destroy()
