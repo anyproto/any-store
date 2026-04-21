@@ -388,99 +388,49 @@ Both support: PASSIVE, FULL, RESTART, TRUNCATE with identical semantics.
 | Heap SHM fallback | **Divergent** -- enables non-mmap platforms |
 | WAL undo (`sqlite3WalUndo`) | **Missing** -- Go uses pager-level rollback instead |
 | First-opener `ftruncate(shm, 3)` marker | **Missing** -- see §SHM open/close protocol below |
-| Orphan-inode handling on open race | **Divergent** -- inode-verify retry vs. SQLite's BUSY-+-caller-retry |
+| Orphan-inode handling on open race | **Aligned** -- DB-file flock serializes last-client-unlink (see §SHM open/close protocol drift) |
 
-### SHM open/close protocol drift
+### SHM open/close protocol drift (resolved 2026-04-21)
 
-`shm_mmap.go:newPlatformShm` (line 68) and `mmapShm.close` (line 299) implement
-the POSIX dead-man-switch (DMS) fcntl protocol that anchors multi-process SHM
-lifecycle. The protocol matches SQLite in intent (one owner at a time, last
-client unlinks the file) but differs in two mechanical details:
+`shm_mmap.go:newPlatformShm` and `mmapShm.close` implement the POSIX
+dead-man-switch (DMS) fcntl protocol for shm-file lifecycle. They used to
+diverge from SQLite on three points; two are now aligned, one remains
+intentional.
 
-1. **Orphan-inode race handling.** `newPlatformShm` does `osOpenFile(O_CREATE)`
-   then `fcntlLock(F_RDLCK, DMS)` in two syscalls. A peer in
-   `mmapShm.close` (holding exclusive DMS) can unlink the file between those
-   two steps, leaving us latched onto an orphaned inode while the next opener
-   `O_CREATE`s a fresh one — split-brain SHM.
+1. **Last-client-unlink serialization — now aligned with SQLite.** Previously
+   we used a 50× inode-verify retry loop in `newPlatformShm` as a local
+   substitute for SQLite's DB-file-lock invariant. We now adopt the SQLite
+   approach: `pager.open` takes a shared `flock` on the DB file (held for
+   the pager's lifetime); `pager.close` upgrades to exclusive to prove "last
+   client" and passes that result to `shm.close(isLastClient)`. Any new
+   opener blocks on shared DB-file acquisition while a closer holds
+   exclusive — serializing shm unlink against new opens exactly as SQLite
+   does in `wal.c:2487-2551` (`sqlite3WalClose`).
 
-   **SQLite's mitigation** (`os_unix.c:4872-4907`, `unixLockSharedMemory`):
-   probe DMS via `F_GETLK` first. If another process holds `F_WRLCK` (i.e. is
-   mid-truncate/unlink), return `SQLITE_BUSY`. The caller then retries the
-   **entire open path** from scratch; the second `open(O_CREATE)` picks up the
-   fresh inode the peer created after unlink.
+   See `internal/btree/dbfile_lock.go` for the flock wrappers. The
+   inode-verify retry loop in `newPlatformShm` is gone — a single-shot
+   `osOpenFile` + `F_RDLCK(DMS)` now suffices.
 
-   **Our mitigation** (`shm_mmap.go:68-124`): after acquiring shared DMS,
-   `fstat(fd)` vs `stat(path)` and retry in-place up to 50× on inode mismatch
-   (or path-ENOENT, or `ErrBusy`).
+   **Simplification vs. SQLite:** SQLite uses byte-range fcntl locks with a
+   5-state protocol (NO/SHARED/RESERVED/PENDING/EXCLUSIVE) because it must
+   also support rollback-journal mode. We only support WAL mode, so we use
+   the 3-state subset we actually need (none / shared / exclusive) and BSD
+   whole-file `flock` instead of fcntl byte-range locks — `flock` is
+   per-file-description, dodging POSIX fcntl's "close any fd releases all
+   inode locks" gotcha when multiple goroutines open the same DB path in a
+   single process.
 
-   **Why inode-verify instead of pure F_GETLK-BUSY-caller-retry?** A refactor
-   to SQLite's shm-DMS approach was attempted and reverted. The scenario it
-   misses is a 3-way race where the orphaned inode has *no* lock held at the
-   moment of probe:
-
-   ```
-   T=0: peer A holds F_WRLCK on inode X (mid-close, about to unlink).
-   T=1: we open(path) → fd on inode X.
-   T=2: A unlinks path.
-   T=3: peer C opens(O_CREATE) path → creates new inode Y.
-   T=4: C probes Y → F_UNLCK → C becomes first-opener on Y.
-   T=5: A closes its fd → F_WRLCK on X is released.
-   T=6: we probe X → F_UNLCK (X is orphan, no holders). We take F_WRLCK
-        on X thinking we're first-opener on the "file", but our inode
-        disagrees with C's Y → split-brain.
-   ```
-
-   In our CL-4 stress scenario (200 close/open cycles × 2 workers) this race
-   fires ~50% of runs. The inode check at T=6 catches it: `fdStat.Ino` (X)
-   != `pathStat.Ino` (Y, or ENOENT) → retry.
-
-   **How SQLite avoids this race — and why we can't use SQLite's mechanism
-   directly.** SQLite's real safety isn't at the shm DMS level; it's at the
-   *database-file* lock level. `sqlite3WalClose` (`wal.c:2508-2509`) takes an
-   **EXCLUSIVE** fcntl lock on the database file before deciding to unlink
-   the shm, and holds that exclusive lock through `walIndexClose →
-   unixShmUnmap → osUnlink`. Any new opener of the same DB must first take a
-   SHARED lock on the DB file, which blocks/BUSYs against the closer's
-   exclusive. So in SQLite the orphan-inode window never exists: a new
-   opener literally cannot reach `open(shmPath)` while a closer is mid-
-   unlink.
-
-   any-store's `pager.close` path does not currently hold an equivalent
-   exclusive DB-file lock through the shm unlink, so we can't rely on that
-   invariant. Adopting it would be a larger refactor of `pager.close` and
-   the corresponding DB-open lock-acquisition order. Until that lands, the
-   inode verification in `newPlatformShm` is load-bearing: it substitutes a
-   cheap per-open check for SQLite's deeper lock-ordering invariant.
-
-   **Follow-up:** adopt SQLite's exclusive-DB-lock-around-unlink pattern in
-   `pager.close`. Once that holds, `newPlatformShm` could drop the inode
-   verification and rely solely on F_GETLK-BUSY-caller-retry like SQLite.
-
-2. **`robust_ftruncate(hShm, 3)` marker — missing.** SQLite's first-opener
-   (who upgraded DMS from `F_UNLCK` to `F_WRLCK`) truncates the shm file to 3
-   bytes (`os_unix.c:4902`). This size is deliberately chosen to be smaller
-   than `walIndexHdrSize` (48 bytes), so any subsequent opener that mmaps a
-   3-byte file can detect "the shm was just initialized and has no content
-   yet" — a legitimate blank-slate signal that's distinguishable from a
-   corrupted header.
-
-   We do **not** emit this marker. Instead our first-opener flow goes straight
-   to `initHeaderState()` which zeroes the header in memory, and subsequent
-   readers validate via the dual-copy + checksum handshake. The downside: a
-   power-loss or crash between "DMS upgraded to exclusive" and "first
-   `writeHeader`" leaves a non-zero-size shm file whose header is all zeros;
-   our checksum check catches this (checksum of zeros != valid), but the
-   "known-fresh" marker would make the cause diagnosable.
-
-   **Follow-up:** consider adopting the 3-byte marker. Low-risk addition
-   (write-path only) and gives us a debugging hook without changing any
-   checksum semantics.
+2. **`robust_ftruncate(hShm, 3)` marker — still missing.** SQLite's
+   first-opener truncates the shm file to 3 bytes (`os_unix.c:4902`) as a
+   "known-fresh" diagnostic marker. We don't; our header checksum catches
+   corruption, but the 3-byte marker would make "power-loss mid-init"
+   diagnosable. Low-priority follow-up.
 
 3. **Close ordering — aligned with SQLite.** Both implementations unlink
-   before closing the fd so exclusive DMS is still held through the unlink,
-   preventing a peer from acquiring shared DMS and attaching to an
-   about-to-be-unlinked inode (SQLite: `os_unix.c:5538-5541`; ours:
-   `shm_mmap.go:299-340`).
+   before closing the shm fd (SQLite: `os_unix.c:5538-5541`; ours:
+   `shm_mmap.go` `mmapShm.close`). With the DB-file lock now serializing
+   at the outer layer (item 1), this is belt-and-suspenders rather than
+   load-bearing.
 
 ---
 
