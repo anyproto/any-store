@@ -2182,59 +2182,43 @@ func (p *pager) close() error {
 			// InMemory: no peers, always last.
 			isLastClient = true
 		} else {
-			// Checkpoint before closing. Only truncate WAL if all frames
-			// were copied to the database file. A partial PASSIVE checkpoint
-			// (due to active readers) returns ErrBusy; truncating the WAL
-			// in that case would destroy uncopied frames and corrupt the DB.
-			// Matches SQLite's sqlite3WalClose(): walLimitSize only called
-			// when rc==SQLITE_OK.
-			//
 			// Hold WAL_WRITE_LOCK across checkpoint+truncate so a peer
-			// process cannot be mid-writeFrames. Without this gate, P1's
-			// truncateFile races with P2's WriteAt: the WAL file gets
-			// a zero header at offset 0 while P2's frames land at a high
-			// offset, making parent reopen unable to recover P2's data.
-			lockedWrite := false
-			if !p.inProcess && !p.inMemory {
-				if err := walBusyLock(p.wal.index, p.wal.busyHandler, lockWrite, lockExclusive); err == nil {
-					lockedWrite = true
-				}
-			}
-			if debugTrace {
-				trace("close: starting passive checkpoint before WAL truncation, dbSize=%d lockedWrite=%v", p.dbSize.Load(), lockedWrite)
-			}
-			cpErr := p.wal.checkpointPassive(p.file, p.master)
-			if cpErr != nil {
+			// process cannot be mid-writeFrames. withWriteLock defers the
+			// unlock, so any early-return / panic inside the closure cannot
+			// leak the lock. Matches SQLite's sqlite3WalClose which guards
+			// walLimitSize with an exclusive DB-file lock (wal.c:2509-2534).
+			_ = p.withWriteLock(func(lockedWrite bool) error {
 				if debugTrace {
-					trace("close: checkpointPassive incomplete or failed: %v", cpErr)
+					trace("close: starting passive checkpoint before WAL truncation, dbSize=%d lockedWrite=%v", p.dbSize.Load(), lockedWrite)
 				}
-			}
-			// Truncate gating: matches SQLite's sqlite3WalClose (wal.c:2487-2551),
-			// which calls walLimitSize (wal.c:2534) only after obtaining an
-			// exclusive DB-file lock (wal.c:2509) — proof this is the only
-			// connection. We use a DB-file flock upgrade as the analog, and
-			// plumb the result through wal.close → shm.close as the single
-			// source of truth for "last client". Failure means a peer is still
-			// attached; we leave the WAL intact so peer readers can still find
-			// frames in the file.
-			if p.inProcess {
-				isLastClient = true
-			} else if p.file != nil {
-				ok, err := tryUpgradeDBLockExclusive(p.file)
-				if err != nil {
+				cpErr := p.wal.checkpointPassive(p.file, p.master)
+				if cpErr != nil {
 					if debugTrace {
-						trace("close: DB-file exclusive upgrade error: %v", err)
+						trace("close: checkpointPassive incomplete or failed: %v", cpErr)
 					}
-				} else {
-					isLastClient = ok
 				}
-			}
-			if cpErr == nil && isLastClient {
-				p.wal.truncateFile()
-			}
-			if lockedWrite {
-				_ = p.wal.index.unlock(lockWrite, lockExclusive)
-			}
+				// Truncate gating: matches SQLite's sqlite3WalClose (wal.c:2487-2551),
+				// which calls walLimitSize (wal.c:2534) only after obtaining an
+				// exclusive DB-file lock (wal.c:2509). We use a DB-file flock
+				// upgrade as the analog; failure leaves the WAL intact so peer
+				// readers can still find frames in the file.
+				if p.inProcess {
+					isLastClient = true
+				} else if p.file != nil {
+					ok, err := tryUpgradeDBLockExclusive(p.file)
+					if err != nil {
+						if debugTrace {
+							trace("close: DB-file exclusive upgrade error: %v", err)
+						}
+					} else {
+						isLastClient = ok
+					}
+				}
+				if cpErr == nil && isLastClient {
+					p.wal.truncateFile()
+				}
+				return nil
+			})
 		}
 		_ = p.wal.close(isLastClient)
 	}
