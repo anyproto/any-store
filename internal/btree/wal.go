@@ -255,6 +255,22 @@ func (wh *walHeader) deserialize(buf []byte) error {
 	if c1 != wh.checksum1 || c2 != wh.checksum2 {
 		return ErrWALCorrupt
 	}
+
+	// Validate version — matches SQLite walIndexRecover (wal.c:1406-1410).
+	// A mismatch means the WAL was written by an incompatible any-store
+	// version; continuing would replay frames we don't know how to read.
+	if wh.version != walVersion {
+		return ErrWALCorrupt
+	}
+
+	// Validate page size — matches SQLite walIndexRecover (wal.c:1414-1419).
+	// Must be a power of two within [MinPageSize, MaxPageSize]. A corrupted
+	// value would mislead recovery's frame-size arithmetic and could cause
+	// out-of-bounds allocation.
+	if wh.pageSize < MinPageSize || wh.pageSize > MaxPageSize || wh.pageSize&(wh.pageSize-1) != 0 {
+		return ErrWALCorrupt
+	}
+
 	return nil
 }
 
