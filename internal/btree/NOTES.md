@@ -1172,16 +1172,14 @@ The checkpoint backfill loop now reuses `wal.ckptBuf`, a page-sized buffer
 lazily allocated on first checkpoint. Matches SQLite's `walCheckpoint`
 (wal.c:2285-2304) which reuses `pTmpSpace` from the pager.
 
-**WAL Header Version Not Validated** -- Severity: Minor
+**WAL Header Version + Page Size Validation** -- Resolved 2026-04-22
 
-The version field in the WAL header is read but never checked against a maximum
-supported version.
-
-**Page Size Not Validated During WAL Recovery** -- Severity: Minor
-
-Recovery trusts the WAL header's page size without bounds or power-of-2
-validation. The database header validation covers the main open path, but a
-corrupted WAL header could cause issues during recovery.
+`walHeader.deserialize` now rejects WAL files whose `version` field does
+not equal `walVersion` (1000000), or whose `pageSize` is not a power of
+two in `[MinPageSize, MaxPageSize]`. Matches SQLite's `walIndexRecover`
+validation (`sqlitec/src/wal.c:1406-1419`). Covered by
+`TestWalHeaderDeserialize_RejectsBadVersion` and
+`TestWalHeaderDeserialize_RejectsBadPageSize`.
 
 **In-Memory WAL Mode Skips Checksums** -- Severity: Minor (accepted)
 
