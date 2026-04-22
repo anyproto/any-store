@@ -129,6 +129,32 @@ type DB struct {
 	// goroutines waiting on readerSem in BeginRead.
 	closeCh   chan struct{}
 	closeOnce sync.Once // guards closing closeCh
+
+	// lastAutoCheckpointErr stores the most recent non-nil error from
+	// tx.pager.tryCheckpoint() during auto-checkpoint. Allows monitoring
+	// code to detect silent failures (disk full, permissions, etc.) that
+	// the auto-checkpoint path otherwise swallows. Reads/writes are
+	// atomic via atomic.Value. Nil means "no error seen since open".
+	lastAutoCheckpointErr atomic.Value
+}
+
+// autoCheckpointResult wraps the result of an auto-checkpoint attempt
+// so atomic.Value can hold a nil error without tripping its typed-nil
+// panic.
+type autoCheckpointResult struct{ err error }
+
+// LastAutoCheckpointError returns the error from the most recent
+// auto-checkpoint attempt, or nil if the last attempt succeeded (or
+// auto-checkpoint has never run since this DB was opened). Use this
+// for monitoring / health checks — the auto-checkpoint itself is
+// best-effort and its errors are otherwise not surfaced to callers.
+func (db *DB) LastAutoCheckpointError() error {
+	v := db.lastAutoCheckpointErr.Load()
+	if v == nil {
+		return nil
+	}
+	r, _ := v.(autoCheckpointResult)
+	return r.err
 }
 
 // Open opens or creates a database at the given path.
@@ -1332,8 +1358,12 @@ func (tx *WriteTx) Commit() error {
 
 		// Auto-checkpoint before releasing db.mu.RLock to avoid deadlock with Close().
 		// Checkpoint does NOT block readers — it only blocks new writers.
+		// Errors are stored on db.lastAutoCheckpointErr instead of silently
+		// discarded so monitoring code can observe them via
+		// LastAutoCheckpointError().
 		if err == nil && needCheckpoint {
-			_ = tx.pager.tryCheckpoint()
+			cpErr := tx.pager.tryCheckpoint()
+			db.lastAutoCheckpointErr.Store(autoCheckpointResult{err: cpErr})
 		}
 		db.mu.RUnlock()
 		db.writeMu.Unlock()
