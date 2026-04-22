@@ -2148,6 +2148,27 @@ func (p *pager) freeOverflowChain(firstPgno uint32) error {
 	return nil
 }
 
+// withWriteLock acquires WAL_WRITE_LOCK exclusive via the configured busy
+// handler (in multi-process mode) and holds it through fn. In-process and
+// in-memory modes skip the lock entirely and pass locked=false.
+//
+// The unlock is deferred in one place — callers cannot leak the lock on
+// early-return or panic. SQLite's equivalent is the explicit unlock pair
+// inside sqlite3WalClose (wal.c:2530-2545); we pick the defer idiom
+// because our close body has multiple exits.
+//
+// Must be called with p.mu held (same contract as pager.close).
+func (p *pager) withWriteLock(fn func(locked bool) error) error {
+	locked := false
+	if !p.inProcess && !p.inMemory {
+		if err := walBusyLock(p.wal.index, p.wal.busyHandler, lockWrite, lockExclusive); err == nil {
+			locked = true
+			defer func() { _ = p.wal.index.unlock(lockWrite, lockExclusive) }()
+		}
+	}
+	return fn(locked)
+}
+
 // close closes the pager, WAL, and database file.
 // Matches SQLite's sqlite3PagerClose() -> sqlite3WalClose(): checkpoint the WAL,
 // then truncate the WAL file to zero bytes before closing.
