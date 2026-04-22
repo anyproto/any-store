@@ -348,7 +348,7 @@ func TestIO_AllocateFromFreelist_TrunkCorrupt(t *testing.T) {
 	db.pager.header.FirstFreelistPg = db.pager.dbSize.Load() + 1000
 
 	// allocateFromFreelist should fail with corrupt trunk
-	_, err = db.pager.allocateFromFreelist()
+	_, err = db.pager.allocateFromFreelist(0)
 	require.Error(t, err)
 	t.Logf("allocateFromFreelist error: %v", err)
 
@@ -402,7 +402,7 @@ func TestIO_AllocateFromFreelist_LeafCorrupt(t *testing.T) {
 				db.pager.releasePage(trunkPg)
 
 				// Now allocateFromFreelist should fail on leaf validation
-				_, err = db.pager.allocateFromFreelist()
+				_, err = db.pager.allocateFromFreelist(0)
 				require.Error(t, err)
 				t.Logf("allocateFromFreelist leaf error: %v", err)
 			} else {
@@ -463,7 +463,7 @@ func TestIO_AllocateFromFreelist_NextTrunkCorrupt(t *testing.T) {
 			db.pager.releasePage(trunkPg)
 
 			// allocateFromFreelist should fail on next trunk validation
-			_, err = db.pager.allocateFromFreelist()
+			_, err = db.pager.allocateFromFreelist(0)
 			require.Error(t, err)
 			t.Logf("allocateFromFreelist next trunk error: %v", err)
 		}
@@ -1050,7 +1050,7 @@ func TestIO_AllocateFromFreelist_LeafCountCorrupt(t *testing.T) {
 			binary.BigEndian.PutUint32(trunkPg.data[4:8], 999999)
 			db.pager.releasePage(trunkPg)
 
-			_, err = db.pager.allocateFromFreelist()
+			_, err = db.pager.allocateFromFreelist(0)
 			require.Error(t, err)
 			t.Logf("allocateFromFreelist with corrupt leaf count: %v", err)
 		}

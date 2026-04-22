@@ -388,7 +388,7 @@ func TestAllocateFromFreelist_EmptyFreelist(t *testing.T) {
 	p.walMaxFrame.Store(mf)
 	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
-	_, err = p.allocateFromFreelist()
+	_, err = p.allocateFromFreelist(0)
 	assert.ErrorIs(t, err, ErrInvalidPage)
 
 	require.NoError(t, p.rollback())
@@ -408,7 +408,7 @@ func TestAllocateFromFreelist_CorruptTrunk(t *testing.T) {
 	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
 	p.header.FirstFreelistPg = 999 // out of bounds
-	_, err = p.allocateFromFreelist()
+	_, err = p.allocateFromFreelist(0)
 	assert.ErrorIs(t, err, ErrCorrupt)
 
 	require.NoError(t, p.rollback())
@@ -439,7 +439,7 @@ func TestAllocateFromFreelist_CorruptLeafCount(t *testing.T) {
 		binary.BigEndian.PutUint32(trunkPg.data[4:8], uint32(99999))
 	}
 
-	_, err = p.allocateFromFreelist()
+	_, err = p.allocateFromFreelist(0)
 	assert.ErrorIs(t, err, ErrCorrupt)
 
 	require.NoError(t, p.rollback())
@@ -479,7 +479,7 @@ func TestAllocateFromFreelist_CorruptLeafPgno(t *testing.T) {
 		}
 	}
 
-	_, err = p.allocateFromFreelist()
+	_, err = p.allocateFromFreelist(0)
 	assert.ErrorIs(t, err, ErrCorrupt)
 
 	require.NoError(t, p.rollback())
@@ -510,7 +510,7 @@ func TestAllocateFromFreelist_CorruptNextTrunk(t *testing.T) {
 		binary.BigEndian.PutUint32(trunkPg.data[0:4], 999) // bad next trunk
 	}
 
-	_, err = p.allocateFromFreelist()
+	_, err = p.allocateFromFreelist(0)
 	assert.ErrorIs(t, err, ErrCorrupt)
 
 	require.NoError(t, p.rollback())
@@ -545,7 +545,7 @@ func TestAllocateFromFreelist_PopLeafWithHasContent(t *testing.T) {
 	assert.True(t, p.getHasContent(pg3.pgno))
 
 	// Allocate from freelist: should use getWritablePage for hasContent pages
-	allocated, err := p.allocateFromFreelist()
+	allocated, err := p.allocateFromFreelist(0)
 	require.NoError(t, err)
 	assert.Equal(t, pg3.pgno, allocated.pgno)
 	p.releasePage(allocated)
@@ -584,7 +584,7 @@ func TestAllocateFromFreelist_PopLeafWithSavepoint(t *testing.T) {
 	require.NoError(t, err)
 
 	// Allocate from freelist with active savepoint
-	allocated, err := p.allocateFromFreelist()
+	allocated, err := p.allocateFromFreelist(0)
 	require.NoError(t, err)
 	p.releasePage(allocated)
 
@@ -612,7 +612,7 @@ func TestAllocateFromFreelist_UseTrunkItself(t *testing.T) {
 	assert.Equal(t, pg2.pgno, p.header.FirstFreelistPg)
 
 	// Allocate from freelist: should use the trunk page itself
-	allocated, err := p.allocateFromFreelist()
+	allocated, err := p.allocateFromFreelist(0)
 	require.NoError(t, err)
 	assert.Equal(t, pg2.pgno, allocated.pgno)
 	p.releasePage(allocated)
@@ -3802,7 +3802,7 @@ func TestAllocateFromFreelist_TrunkGetError(t *testing.T) {
 
 	// Point freelist to a trunk page beyond dbSize (invalid)
 	p.header.FirstFreelistPg = p.dbSize.Load() + 100
-	_, err = p.allocateFromFreelist()
+	_, err = p.allocateFromFreelist(0)
 	assert.ErrorIs(t, err, ErrCorrupt)
 
 	require.NoError(t, p.rollback())

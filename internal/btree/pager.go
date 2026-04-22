@@ -877,20 +877,35 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 	return pg, nil
 }
 
-// allocatePage allocates a new page and returns it.
-// It first checks the freelist for reusable pages before growing the database.
+// allocatePage allocates a new page and returns it. Equivalent to
+// allocatePageNear(0) — no locality hint. Most callers (btree splits,
+// root allocation) don't have a meaningful hint and use this form.
 func (p *pager) allocatePage() (*page, error) {
+	return p.allocatePageNear(0)
+}
+
+// allocatePageNear allocates a new page, preferring one close to the
+// given pgno when possible. Nearby == 0 disables the hint (same as
+// allocatePage). Matches SQLite's `allocateBtreePage(pBt, ..., nearby,
+// BTALLOC_ANY)` at btree.c:6499-6505 — used for overflow chains to
+// keep the chain pages contiguous on disk (btree.c:7197 fillInCell).
+//
+// Hint semantics: within the freelist trunk selected, the leaf with
+// minimum |leafPgno - nearby| is popped. If the freelist is empty we
+// fall through to growing the DB file; grow is always monotonic and
+// a hint has no meaning there.
+func (p *pager) allocatePageNear(nearby uint32) (*page, error) {
 	if pagerState(p.state.Load()) != pagerWriter {
 		return nil, ErrReadOnly
 	}
 
-	// Check freelist first
+	// Check freelist first.
 	if p.header.FirstFreelistPg != 0 {
-		pg, err := p.allocateFromFreelist()
+		pg, err := p.allocateFromFreelist(nearby)
 		if err == nil {
 			return pg, nil
 		}
-		// Fall through to grow database if freelist read fails
+		// Fall through to grow database if freelist read fails.
 	}
 
 	pgno := p.dbSize.Add(1)
@@ -1024,7 +1039,10 @@ func (p *pager) freePage(pgno uint32) error {
 }
 
 // allocateFromFreelist pops a page from the freelist and returns it.
-func (p *pager) allocateFromFreelist() (*page, error) {
+// If nearby > 0, the leaf with minimum |leafPgno - nearby| is selected
+// instead of the last leaf — matches SQLite btree.c:6678-6699 in
+// BTALLOC_ANY mode. Callers that don't care about locality pass 0.
+func (p *pager) allocateFromFreelist(nearby uint32) (*page, error) {
 	trunkPgno := p.header.FirstFreelistPg
 	if trunkPgno == 0 {
 		return nil, ErrInvalidPage
@@ -1049,8 +1067,29 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 	}
 
 	if leafCount > 0 {
-		// Pop the last leaf page number
-		leafPgno := binary.BigEndian.Uint32(trunkPg.data[8+(leafCount-1)*4:])
+		// Pick the leaf index to allocate. When nearby == 0, pop the
+		// last leaf (legacy behavior: O(1), cheap). When nearby > 0,
+		// walk the leaves and pick the one with minimum absolute
+		// distance to nearby — matches SQLite btree.c:6678-6699 in
+		// BTALLOC_ANY mode. O(leafCount) per allocation; for a 4 KiB
+		// page trunk holds ~1018 leaves → sub-µs scan on modern CPUs,
+		// dominated by page I/O anyway.
+		pickIdx := leafCount - 1
+		if nearby > 0 {
+			bestDist := int64(-1)
+			for i := 0; i < leafCount; i++ {
+				lp := binary.BigEndian.Uint32(trunkPg.data[8+i*4:])
+				d := int64(lp) - int64(nearby)
+				if d < 0 {
+					d = -d
+				}
+				if bestDist < 0 || d < bestDist {
+					bestDist = d
+					pickIdx = i
+				}
+			}
+		}
+		leafPgno := binary.BigEndian.Uint32(trunkPg.data[8+pickIdx*4:])
 
 		// Validate leaf page number (fix 5.1).
 		if leafPgno < 2 || leafPgno > p.dbSize.Load() {
@@ -1058,6 +1097,13 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 			return nil, ErrCorrupt
 		}
 
+		// Compact: move the last leaf into the picked slot, then shrink.
+		// When pickIdx == leafCount-1 (legacy last-leaf case), the copy is
+		// a self-copy and degenerates into just the decrement.
+		if pickIdx != leafCount-1 {
+			lastLeaf := binary.BigEndian.Uint32(trunkPg.data[8+(leafCount-1)*4:])
+			binary.BigEndian.PutUint32(trunkPg.data[8+pickIdx*4:], lastLeaf)
+		}
 		binary.BigEndian.PutUint32(trunkPg.data[4:8], uint32(leafCount-1))
 		p.releasePage(trunkPg)
 
