@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/internal/btree"
 	"github.com/anyproto/any-store/internal/objectid"
 	"github.com/anyproto/any-store/query"
 )
@@ -676,4 +677,79 @@ func BenchmarkWAL_RepeatedDirtyWithinTx(b *testing.B) {
 	if info, err := os.Stat(dbPath + "-wal"); err == nil {
 		b.ReportMetric(float64(info.Size()), "wal_bytes")
 	}
+}
+
+// BenchmarkWAL_SpillHeavyRepeatedDirty forces page-cache spills via a
+// tiny CacheSize so the same dirty pages repeatedly hit writeFrames
+// within one tx — exactly the scenario where SQLite's frame-reuse
+// optimization (wal.c:4117-4156) eliminates WAL bloat. Without
+// reuse, each spill of pgno X appends a new frame; with reuse, the
+// existing in-tx frame is overwritten in place.
+//
+// Workload: enough distinct large docs to spread dirty pages well
+// past the cache (working set ≫ cache), then re-update every doc
+// inside a single tx so each spilled page must be re-spilled.
+//
+// Run BOTH variants to A/B-compare reuse savings:
+//
+//	go test -run=^$ -bench=BenchmarkWAL_SpillHeavyRepeatedDirty -benchtime=2x
+func BenchmarkWAL_SpillHeavyRepeatedDirty_NoReuse(b *testing.B) {
+	btree.DiagDisableReuse.Store(true)
+	b.Cleanup(func() { btree.DiagDisableReuse.Store(false) })
+	benchSpillHeavyRepeatedDirty(b)
+}
+
+func BenchmarkWAL_SpillHeavyRepeatedDirty(b *testing.B) {
+	btree.DiagDisableReuse.Store(false)
+	benchSpillHeavyRepeatedDirty(b)
+}
+
+func benchSpillHeavyRepeatedDirty(b *testing.B) {
+	const (
+		nDocs    = 1000
+		nUpdates = 5
+	)
+
+	tmpDir, err := os.MkdirTemp("", "bench-spill-*")
+	require.NoError(b, err)
+	b.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+	dbPath := filepath.Join(tmpDir, "bench.db")
+
+	// CacheSize=4: tiny cache → constant spills as each upsert
+	// dirties pages exceeding capacity.
+	cfg := &Config{DisableAutoCheckpoint: true, CacheSize: 4}
+	db, err := Open(ctx, dbPath, cfg)
+	require.NoError(b, err)
+	b.Cleanup(func() { _ = db.Close() })
+	coll, err := db.CreateCollection(ctx, "docs")
+	require.NoError(b, err)
+
+	for i := range nDocs {
+		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"v":0,"payload":"%s"}`, i, strings.Repeat("x", 2000)))
+		require.NoError(b, coll.Insert(ctx, doc))
+	}
+
+	reuseStart := btree.DiagReuseFrames.Load()
+	appendStart := btree.DiagAppendFrames.Load()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		tx, err := coll.WriteTx(ctx)
+		require.NoError(b, err)
+		for u := range nUpdates {
+			for i := range nDocs {
+				doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"v":%d,"payload":"%s"}`, i, u, strings.Repeat("x", 2000)))
+				require.NoError(b, coll.UpsertOne(tx.Context(), doc))
+			}
+		}
+		require.NoError(b, tx.Commit())
+	}
+	b.StopTimer()
+
+	if info, err := os.Stat(dbPath + "-wal"); err == nil {
+		b.ReportMetric(float64(info.Size()), "wal_bytes")
+	}
+	b.ReportMetric(float64(btree.DiagReuseFrames.Load()-reuseStart), "reuse")
+	b.ReportMetric(float64(btree.DiagAppendFrames.Load()-appendStart), "append")
 }

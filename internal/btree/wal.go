@@ -76,6 +76,19 @@ import (
 	"unsafe"
 )
 
+// DiagReuseFrames and DiagAppendFrames are diagnostic counters incremented
+// from writeFrames. Used by benchmarks to verify the in-tx frame-reuse path
+// fires under a given workload. Cheap atomic adds; lifetime totals.
+//
+// DiagDisableReuse, when true, skips the in-tx frame-reuse branch in
+// writeFrames so benchmarks can A/B-compare against the no-reuse baseline
+// without checking out a separate revision.
+var (
+	DiagReuseFrames  atomic.Uint64
+	DiagAppendFrames atomic.Uint64
+	DiagDisableReuse atomic.Bool
+)
+
 const (
 	walHeaderSize = 32
 	walFrameSize  = 24 // frame header only, page data follows
@@ -1913,7 +1926,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		// Reuse check — mirrors SQLite wal.c:4124-4140. Only allowed
 		// for non-last-of-commit pages; the last commit frame must
 		// be a fresh append carrying the dbSize commit marker.
-		if !(commit && isLast) && iFirst > 0 {
+		if !(commit && isLast) && iFirst > 0 && !DiagDisableReuse.Load() {
 			iWrite := w.index.getInTxRange(p.pgno, nf+nAppended, iFirst)
 			if iWrite > 0 {
 				// Overwrite the page data at frame iWrite. The frame
@@ -1929,12 +1942,14 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 				if w.iReCksum == 0 || iWrite < w.iReCksum {
 					w.iReCksum = iWrite
 				}
+				DiagReuseFrames.Add(1)
 				// SHM hash entry already points at iWrite — unchanged.
 				continue
 			}
 		}
 
 		// Fresh append — original path.
+		DiagAppendFrames.Add(1)
 		off := offset + int64(nAppended)*int64(frameSize)
 
 		binary.BigEndian.PutUint32(frameHdr[0:4], p.pgno)
