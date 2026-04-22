@@ -638,6 +638,15 @@ func (wi *walIndex) rollbackToFrame(target uint32) {
 	}
 }
 
+// resetIReCksumIfPast clears w.iReCksum if it refers to a frame that
+// has been rolled back past newMxFrame. Mirrors SQLite wal.c:3832-3834
+// in sqlite3WalSavepointUndo.
+func (w *wal) resetIReCksumIfPast(newMxFrame uint32) {
+	if w.iReCksum > newMxFrame {
+		w.iReCksum = 0
+	}
+}
+
 // shmCleanupFromFrame zeros out SHM hash entries for frames in (target, maxFrame].
 // Caller must hold lockWrite exclusively so no peer can read or write SHM hash
 // concurrently — this matches SQLite's walCleanupHash invariant (wal.c:1236,
@@ -1212,6 +1221,15 @@ type wal struct {
 	// We keep it separate because our readers use per-connection pcache isolation
 	// and never share pWal->hdr with the writer.
 	writerHdr WalIndexHdr
+
+	// iReCksum is the earliest WAL frame overwritten by the current
+	// write transaction via frame-reuse. Zero when no overwrites are
+	// pending. On commit, if non-zero, rewriteChecksums re-reads
+	// frames [iReCksum..iLast] and rewrites their headers to restore
+	// the cumulative checksum chain. Reset after successful commit,
+	// on recovery, on endWrite, and on savepoint rollback past the
+	// overwrite. Mirrors SQLite's Wal.iReCksum (wal.c:533).
+	iReCksum uint32
 
 	// memFrames stores page data in memory for InMemory mode,
 	// eliminating per-commit file I/O. Frames are flushed to pcache on checkpoint.
@@ -1797,6 +1815,11 @@ func (w *wal) recoverLocked() error {
 		return err
 	}
 	w.index.shmWriteCkptInfo()
+
+	// Recovery reestablishes the canonical WAL state; no overwrites
+	// are pending. Matches SQLite wal.c:3733 walIndexTryHdr, which
+	// implicitly resets via the memcmp-fresh hdr copy.
+	w.iReCksum = 0
 	return nil
 }
 
