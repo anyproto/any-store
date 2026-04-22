@@ -1388,10 +1388,15 @@ thanks to three mechanisms:
    and `nBackfill` from SHM instead of stale process-local atomics, so readers
    see the latest committed state from other processes.
 
-**Internal retry in `DB.BeginWrite`**: When `ErrBusySnapshot` is returned, the
-retry loop ends the stale read, clears `writerCache`, and re-calls
-`pager.beginRead` to get a fresh snapshot (max `maxBusySnapshotRetries` = 1000
-attempts; see `db.go`).
+**Internal retry in `DB.BeginWrite`** (resolved 2026-04-22): When `ErrBusySnapshot`
+is returned, the retry loop ends the stale read, clears `writerCache`, and
+re-calls `pager.beginRead` to get a fresh snapshot. Previously the loop had
+a hidden cap of 1000 attempts with no backoff. Now the loop tight-retries at
+most `busySnapshotInnerRetries` (= 3) times, then delegates to the configured
+`BusyHandler` for delays[]-table backoff (matching `sqliteDefaultBusyCallback`
+in `sqlitec/src/main.c:1717`), and finally surfaces `ErrBusySnapshot` to the
+caller — matching SQLite's `SQLITE_BUSY_SNAPSHOT` caller contract
+(`sqlitec/src/wal.c:3714`).
 
 **`writeHeader` parameterization**: `walIndex.writeHeader` now accepts explicit
 `frameCksum` and `salt` parameters so the SHM header always contains the correct
@@ -1419,9 +1424,12 @@ writes to the same database file concurrently with the parent.
    `writerCache` when state changed (SQLite's pager cache invalidation handles
    this differently).
 
-4. **Internal retry**: SQLite returns `SQLITE_BUSY_SNAPSHOT` to the application,
-   requiring it to retry. We retry internally in `DB.BeginWrite`
-   (`maxBusySnapshotRetries` = 1000) for ergonomic API.
+4. **Internal retry — resolved 2026-04-22**: `DB.BeginWrite` now tight-retries
+   at most `busySnapshotInnerRetries` (= 3) times, then routes through the
+   configured `BusyHandler` for delays[]-table backoff (matching
+   `sqliteDefaultBusyCallback` in `sqlitec/src/main.c:1717`), then surfaces
+   `ErrBusySnapshot` to the caller — matching SQLite's caller contract
+   (`sqlitec/src/wal.c:3714`). The 1000-attempt hidden loop is gone.
 
 5. **readSnapshot saved in pager.beginWrite**: SQLite saves `pWal->hdr` in
    `walTryBeginRead` (called from any connection). We save `readSnapshot` in
@@ -1454,14 +1462,14 @@ below for why cold-open was attempted and reverted.
    non-blocking `F_SETLK`; under contention with `checkpointWithMode` (which
    uses `CKPT → WRITE` order) the loser observes `ErrBusy` — no deadlock.
 
-2. **Collapsed retry signaling**: SQLite returns `SQLITE_BUSY_RECOVERY` when
-   another process is actively recovering (wal.c:3089-3094 via `walLockShared`
-   probe) and distinguishes it from a transient race. Our helper collapses
-   both outcomes to `errWALRetry` — callers simply retry and rely on the
-   busy handler / BUSY backoff further up. A dedicated `errBusyRecovery`
-   sentinel could be added if a caller ever needs to distinguish "peer
-   recovering (backoff)" from "transient race (immediate retry)"; no
-   current call site uses the distinction.
+2. **BUSY_RECOVERY signal — resolved 2026-04-22.** The three contended
+   branches in `ensureHeaderInitialized` now return `ErrBusyRecovery`
+   (distinct from the generic `errWALRetry`) when a peer holds the
+   RECOVER / CKPT exclusive locks — matching SQLite's
+   `SQLITE_BUSY_RECOVERY` (`sqlitec/src/wal.c:3063-3090`, probe at
+   `sqlitec/src/os_unix.c:4872-4907`). Upstream `DB.BeginWrite` routes
+   `ErrBusyRecovery` through the configured `BusyHandler` for proper
+   backoff instead of spinning.
 
 3. **`headerOnDisk` shortcut in `syncFromSHMLocked`**: we infer "on-disk WAL
    header exists" from `hdr.mxFrame > 0` rather than `fstat`-ing, relying on
@@ -1499,17 +1507,20 @@ for the design). Summary:
   `wal.beginWriteWithSnapshot`'s inline sync under `lockWrite`.
 - Savepoint state widened: scalar `walFrame/walCksum1/walCksum2` →
   `walHdr WalIndexHdr`.
-- Legacy zero-arg `wal.beginWrite()` + `pager.beginWrite()` wrappers kept
-  for raw-wal tests; pass `WalIndexHdr{}` which skips BUSY_SNAPSHOT
-  (acceptable — tests don't exercise multi-process race).
+- Zero-arg `pager.beginWrite()` escape hatch — **resolved 2026-04-22.**
+  The zero-arg form has been deleted; `pager.beginWrite(readSnap WalIndexHdr)`
+  is now the single canonical entry point, making BUSY_SNAPSHOT bypass a
+  compile-error rather than a code-path footgun. Tests that don't run
+  multi-process scenarios pass `WalIndexHdr{}` explicitly — the compiler
+  now forces an affirmative decision.
 
 **Known preserved drifts:**
 - In-process mode skips SHM hdr updates on commit (`writeFrames`
   `!w.inProcess` guard). `db.BeginRead`/`BeginWrite` synthesize a minimal
   `walHdr{isInit:1, mxFrame:maxFrame}` in that mode so read paths
   consuming `tx.walHdr.mxFrame` see the correct frame ceiling.
-- Raw `wal.beginWrite()` zero-arg form passes empty hdr → BUSY_SNAPSHOT
-  skipped. Used only by tests that don't run multi-process scenarios.
+- (Resolved 2026-04-22: the zero-arg `pager.beginWrite` escape hatch was
+  deleted — see above.)
 
 **Reliability impact:** `TestMultiProcessIndex_ConcurrentSketchUpdates`
 30-run samples at each step:
