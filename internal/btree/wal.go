@@ -700,6 +700,29 @@ func (wi *walIndex) shmCleanupFromFrame(target, maxFrame uint32) {
 	}
 }
 
+// getInTxRange returns the frame for pgno within [minFrame, maxFrame],
+// or 0 if none exists. Used by the frame-reuse path in writeFrames to
+// locate an existing frame from the current transaction's range. Direct
+// analog of SQLite's walFindFrame with a caller-supplied minFrame
+// (wal.c:3554 uses pWal->minFrame; we let the caller pass iFirst).
+//
+// In-process mode walks pageMap; multi-process mode consults the SHM
+// hash via shmHashGet.
+func (wi *walIndex) getInTxRange(pgno, maxFrame, minFrame uint32) uint32 {
+	if wi.inProcess {
+		wi.mu.RLock()
+		frames := wi.pageMap[pgno]
+		wi.mu.RUnlock()
+		for i := len(frames) - 1; i >= 0; i-- {
+			if frames[i] <= maxFrame && frames[i] >= minFrame {
+				return frames[i]
+			}
+		}
+		return 0
+	}
+	return wi.shmHashGet(pgno, maxFrame, minFrame)
+}
+
 // get returns the frame containing the latest version of pgno that is
 // within the given maxFrame snapshot, or 0 if not in WAL.
 // The maxFrame parameter limits which frames are visible (for snapshot isolation).
@@ -1860,16 +1883,63 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	s1, s2 := w.cksum1, w.cksum2
 	startFrame := nf + 1
 
+	// Compute iFirst — the first frame written by the current tx.
+	// Frames at iFirst or later are candidates for in-place reuse;
+	// earlier frames (<= last-committed mxFrame) are visible to other
+	// readers/processes and must not be touched. Matches SQLite
+	// wal.c:4048-4051 (iFirst = pLive->mxFrame+1).
+	//
+	// We use mxCommitFrame rather than writerHdr.mxFrame because
+	// writerHdr is only maintained in multi-process mode (gated by
+	// !w.inProcess in the commit path); mxCommitFrame is updated in
+	// both modes on every commit and therefore always reflects the
+	// last-committed state at tx begin. Within a tx, spills don't
+	// update mxCommitFrame (commit=false skips the Store), so iFirst
+	// stays stable across spills.
+	iFirst := w.index.mxCommitFrame.LoadLocal() + 1
+
+	// Track appended frames separately from the input slice index.
+	// Reused pages don't advance the append cursor nor the checksum
+	// chain.
+	var nAppended uint32
+
 	// Per-frame writes matching SQLite's walWriteOneFrame pattern:
 	// 24-byte stack header + direct page data write — zero heap allocation.
 	var frameHdr [walFrameSize]byte
 
 	for i, p := range pages {
-		off := offset + int64(i)*int64(frameSize)
+		isLast := i == len(pages)-1
+
+		// Reuse check — mirrors SQLite wal.c:4124-4140. Only allowed
+		// for non-last-of-commit pages; the last commit frame must
+		// be a fresh append carrying the dbSize commit marker.
+		if !(commit && isLast) && iFirst > 0 {
+			iWrite := w.index.getInTxRange(p.pgno, nf+nAppended, iFirst)
+			if iWrite > 0 {
+				// Overwrite the page data at frame iWrite. The frame
+				// header (pgno, dbSize, salts, checksums) is NOT
+				// rewritten here — rewriteChecksums on commit
+				// recomputes the chain. The pgno/salts are still
+				// valid; only cksum1/cksum2 become stale and must
+				// be fixed before the tx is visible.
+				dataOff := int64(walHeaderSize) + int64(iWrite-1)*int64(frameSize) + int64(walFrameSize)
+				if _, err := w.file.WriteAt(p.data, dataOff); err != nil {
+					return err
+				}
+				if w.iReCksum == 0 || iWrite < w.iReCksum {
+					w.iReCksum = iWrite
+				}
+				// SHM hash entry already points at iWrite — unchanged.
+				continue
+			}
+		}
+
+		// Fresh append — original path.
+		off := offset + int64(nAppended)*int64(frameSize)
 
 		binary.BigEndian.PutUint32(frameHdr[0:4], p.pgno)
 		var dbSizeField uint32
-		if commit && i == len(pages)-1 {
+		if commit && isLast {
 			dbSizeField = dbSize
 		}
 		binary.BigEndian.PutUint32(frameHdr[4:8], dbSizeField)
@@ -1891,21 +1961,56 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		if _, err := w.file.WriteAt(p.data, off+walFrameSize); err != nil {
 			return err
 		}
+		nAppended++
 	}
 
-	// Only advance nFrame and checksums after successful write. If WriteAt
-	// fails (disk full, I/O error), the WAL state remains at the pre-write
-	// position so subsequent writes use the correct offset and checksum chain.
-	w.nFrame.Store(nf + uint32(len(pages)))
+	// Only advance nFrame and checksums after successful write. If
+	// WriteAt fails (disk full, I/O error), the WAL state remains at
+	// the pre-write position so subsequent writes use the correct
+	// offset and checksum chain.
+	//
+	// Use nAppended, not len(pages): reused frames don't advance the
+	// append cursor. The running checksums (s1, s2) already reflect
+	// only appended frames because the reuse branch skipped the
+	// accumulation via `continue`.
+	w.nFrame.Store(nf + nAppended)
 	w.cksum1 = s1
 	w.cksum2 = s2
 
-	// Batch update walIndex under a single lock. SHM hash writes happen
-	// immediately for every frame (spill or commit), matching SQLite's
-	// walFrames loop calling walIndexAppend for every frame.
-	w.index.setBatch(pages, startFrame, commit)
+	// Batch update walIndex for APPENDED frames only — reused frames
+	// already have their hash entries at the reused index (setBatch
+	// would overwrite with the wrong frame number otherwise).
+	if nAppended > 0 {
+		appended := pages
+		if nAppended != uint32(len(pages)) {
+			// At least one reuse fired. Rebuild the slice with only
+			// newly-appended pages. A reused page has a frame in
+			// [iFirst..nf] (strictly before this call's appends);
+			// identify these by re-querying getInTxRange with the
+			// pre-call upper bound nf.
+			appended = make([]*page, 0, nAppended)
+			for _, p := range pages {
+				iWrite := w.index.getInTxRange(p.pgno, nf, iFirst)
+				if iWrite > 0 {
+					continue
+				}
+				appended = append(appended, p)
+			}
+		}
+		w.index.setBatch(appended, startFrame, commit)
+	}
 
 	if commit {
+		// Rewrite checksum chain if any frame was overwritten by in-tx
+		// reuse. Must happen BEFORE fdatasync so the durable state has
+		// a consistent chain — matches SQLite wal.c:4152-4156 where
+		// walRewriteChecksums is called before the commit-time sync.
+		if w.iReCksum > 0 {
+			if err := w.rewriteChecksums(nf + nAppended); err != nil {
+				return err
+			}
+		}
+
 		if dbSize > 0 {
 			w.index.maxPage.Store(dbSize)
 		}
