@@ -1859,6 +1859,11 @@ func (p *pager) rollbackToSavepoint(id int) error {
 	p.wal.cksum1 = sp.walHdr.aFrameCksum[0]
 	p.wal.cksum2 = sp.walHdr.aFrameCksum[1]
 
+	// If an in-tx frame-reuse overwrote a frame past the savepoint's
+	// position, drop the pending checksum rewrite — that frame is
+	// now discarded. Mirrors SQLite wal.c:3832-3834.
+	p.wal.resetIReCksumIfPast(sp.walHdr.mxFrame)
+
 	// Truncate in-memory WAL frames to match restored nFrame.
 	if p.wal.inMemory {
 		p.wal.mu.Lock()
