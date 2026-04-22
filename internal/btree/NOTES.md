@@ -1535,6 +1535,35 @@ for the design). Summary:
 Post-migration reliability sits in the ~93-100% band per 30-run sample,
 up from the ~77-95% pre-migration band.
 
+### Checkpoint latest-frame-per-page (resolved 2026-04-22)
+
+**Previously:** the backfill loop in `checkpointWithMode` wrote every
+frame's page to the DB file — a page rewritten N times in the WAL got
+written N times, most of them overwritten by later frames.
+
+**Now:** two-phase backfill — (1) `buildBackfillMap(lo, hi)` scans
+frame headers `[lo, hi)` and returns `map[pgno]frameIdx` keeping the
+latest frame per pgno; (2) iterate pgnos ascending for sequential
+DB-file write locality, writing each page exactly once. Matches
+SQLite's `walIteratorNext` (`sqlitec/src/wal.c:1758-1786`).
+
+**Invariants preserved:** `nBackfill` is still a frame-index cursor
+(crash recovery works unchanged); `nBackfillAttempted` is set before
+the write phase (partial-write detection still correct); in-memory
+mode uses the same dedup logic on `w.memFrames`.
+
+**Measured delta** (see
+`any-store-tests/results/session_perf/benchstat_ckpt_dedup.txt`): sec/op
+geomean -2.30%, B/op geomean +1.10%, allocs geomean -0.42%. Mixed
+signal: the two-phase dedup adds a small per-checkpoint map + sort
+allocation, visible as +8.89% allocs and +15.40% B/op on
+`Crud/BatchUpdate`. This is faithful to SQLite: `walIteratorFree`
+(`sqlitec/src/wal.c:1929-1933`) calls `sqlite3_free` per checkpoint —
+SQLite doesn't pool the iterator either. The Go benchstat exposes an
+allocation cost that is present (but invisible in the C allocator
+stats) in SQLite too. A future optimization could pool the map /
+pgnos slice on the `wal` struct.
+
 ### Checkpoint mxFrame source fix (commit `9023f5b`)
 
 A ~4-5% residual failure persisted through all per-tx walHdr work
