@@ -80,9 +80,14 @@ type Options struct {
 	// via the OS unified page cache. Matches SQLite's PRAGMA mmap_size
 	// (sqlitec/src/os_unix.c:4240 SQLITE_FCNTL_MMAP_SIZE).
 	//
-	// Recommended: 64 << 20 (64 MiB) to 512 << 20 (512 MiB) on workloads
-	// with frequent large-blob or repeat-page reads. Linux/darwin +
-	// amd64/arm64 only; no-op on other platforms.
+	// Linux/darwin + amd64/arm64 only; no-op on other platforms.
+	//
+	// SAFETY: enabling trades a small perf win for SIGBUS-crash tail
+	// risk on file-shrink / device-removal events (USB unplug, iCloud
+	// eviction, NFS timeout). Go cannot recover from SIGBUS; the whole
+	// process dies. Only enable on stable local storage. Do NOT enable
+	// on mobile / networked filesystems / cloud sync paths. See
+	// anystore.Config.MmapSize for the full rationale.
 	MmapSize int64
 }
 

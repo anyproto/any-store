@@ -57,10 +57,42 @@ type Config struct {
 	UseGlobalPageBuffer bool
 
 	// MmapSize enables mmap-backed reads of the database file up to the
-	// given byte limit. Zero disables mmap (reads use pread via ReadAt).
-	// Matches SQLite's PRAGMA mmap_size. Recommended 64-512 MiB for
-	// large-blob read workloads. Linux/darwin + amd64/arm64 only; no-op
-	// on other platforms.
+	// given byte limit. Zero (default) disables mmap — reads use pread
+	// via ReadAt, same behavior as before this feature existed.
+	// Matches SQLite's PRAGMA mmap_size. Linux/darwin + amd64/arm64
+	// only; no-op on other platforms.
+	//
+	// SAFETY WARNINGS — read before enabling:
+	//
+	//   - SIGBUS on unreachable storage: if the DB file becomes
+	//     truncated, unlinked, or the storage device is removed while
+	//     a mapping is live (USB unplug, iCloud eviction of a
+	//     "dataless" file, NFS server timeout, external process
+	//     truncate), accessing the mapped bytes generates SIGBUS. Go's
+	//     runtime translates SIGBUS to an uncatchable "unexpected
+	//     fault address" crash — the whole process dies. The pread
+	//     path (MmapSize=0) returns a normal error for all of these
+	//     scenarios. Only enable on paths you control: local disk,
+	//     stable filesystem, single-device. Do NOT enable for DBs
+	//     stored in iCloud Drive, OneDrive, Dropbox, or any network
+	//     mount.
+	//
+	//   - Mobile / iOS: mmap'd bytes count against the per-process
+	//     memory limit and can trip iOS's "jetsam" reaper on older
+	//     devices. iOS may also silently purge mmap pages under
+	//     memory pressure; re-faulting succeeds for local files but
+	//     fails (SIGBUS) if the backing file has become unavailable
+	//     (permission revocation, iCloud eviction). Recommend leaving
+	//     at zero on iOS/iPadOS unless you have a measured need.
+	//
+	//   - Network filesystems: mmap coherence over NFS/SMB is weaker
+	//     than over local disks; concurrent writes from peers may be
+	//     invisible to the mapping, and reads may observe torn state.
+	//     pread does not have this issue.
+	//
+	// Recommended when it IS safe: 64-512 MiB on workloads with
+	// frequent large-blob or repeat-page reads, on stable local
+	// storage, desktop/server deployments.
 	MmapSize int64
 
 	// DurabilityConfig provides configuration for crash recovery and idle auto-flush
