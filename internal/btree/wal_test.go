@@ -1363,3 +1363,149 @@ func TestWalHeaderDeserialize_RejectsBadPageSize(t *testing.T) {
 		})
 	}
 }
+
+// TestWriteFrames_ReuseOnRedirtied writes the same pgno twice in one
+// write transaction and asserts that the second write OVERWRITES the
+// first frame instead of appending a new one.
+// Reference: SQLite wal.c:4117-4140 (walFrames reuse branch).
+func TestWriteFrames_ReuseOnRedirtied(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	w := newWal(path, 4096)
+	require.NoError(t, w.open())
+	t.Cleanup(func() { _ = w.close(false) })
+
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
+	t.Cleanup(w.endWrite)
+
+	// First spill: pgno 5, data V1. Not a commit.
+	pg1 := &page{pgno: 5, data: make([]byte, 4096)}
+	pg1.data[0] = 0xA1
+	require.NoError(t, w.writeFrames([]*page{pg1}, false, 0))
+	assert.Equal(t, uint32(1), w.nFrame.Load(), "first spill should append one frame")
+
+	// Second spill: same pgno 5, data V1'. Not a commit. Reuse must fire.
+	pg1b := &page{pgno: 5, data: make([]byte, 4096)}
+	pg1b.data[0] = 0xA2
+	require.NoError(t, w.writeFrames([]*page{pg1b}, false, 0))
+
+	// Frame count must NOT have advanced — pgno 5's frame was overwritten.
+	assert.Equal(t, uint32(1), w.nFrame.Load(), "second write should reuse the existing frame, not append")
+	assert.Equal(t, uint32(1), w.iReCksum, "iReCksum should point at the overwritten frame")
+}
+
+// TestWriteFrames_CommitLastFrameNotReused — commit's LAST page is
+// always appended fresh even when reuse-eligible, so it carries the
+// dbSize commit marker. Reference: SQLite wal.c:4124 guard.
+func TestWriteFrames_CommitLastFrameNotReused(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	w := newWal(path, 4096)
+	require.NoError(t, w.open())
+	t.Cleanup(func() { _ = w.close(false) })
+
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
+
+	// Spill pgno 7 → frame 1.
+	pg7a := &page{pgno: 7, data: make([]byte, 4096)}
+	require.NoError(t, w.writeFrames([]*page{pg7a}, false, 0))
+	require.Equal(t, uint32(1), w.nFrame.Load())
+
+	// Commit with pgno 7 again as the only (and therefore last) page.
+	// Must append fresh (frame 2) carrying dbSize.
+	pg7b := &page{pgno: 7, data: make([]byte, 4096)}
+	pg7b.data[0] = 0xFF
+	require.NoError(t, w.writeFrames([]*page{pg7b}, true, 7))
+
+	assert.Equal(t, uint32(2), w.nFrame.Load(), "commit's last frame must be a fresh append with dbSize marker")
+
+	w.endWrite()
+}
+
+// TestWriteFrames_ChecksumChainConsistentAfterRewrite forces a reuse
+// followed by an append commit, then reopens to trigger recovery and
+// verifies the latest data is read. Recovery would reject the WAL on
+// a broken checksum chain.
+func TestWriteFrames_ChecksumChainConsistentAfterRewrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	w := newWal(path, 4096)
+	require.NoError(t, w.open())
+
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
+
+	// Spill: pgno 3 (V1), pgno 5.
+	pg3a := &page{pgno: 3, data: make([]byte, 4096)}
+	pg3a.data[0] = 0x33
+	pg5 := &page{pgno: 5, data: make([]byte, 4096)}
+	pg5.data[0] = 0x55
+	require.NoError(t, w.writeFrames([]*page{pg3a, pg5}, false, 0))
+
+	// Commit: pgno 3 again (V1' → triggers reuse on frame 1) + pgno 9
+	// as the last (fresh-appended commit-marker bearer).
+	pg3b := &page{pgno: 3, data: make([]byte, 4096)}
+	pg3b.data[0] = 0x77
+	pg9 := &page{pgno: 9, data: make([]byte, 4096)}
+	pg9.data[0] = 0x99
+	require.NoError(t, w.writeFrames([]*page{pg3b, pg9}, true, 9))
+	w.endWrite()
+	require.NoError(t, w.close(false))
+
+	// Reopen → recoverLocked validates the checksum chain across all
+	// surviving frames including the one whose data was overwritten.
+	w2 := newWal(path, 4096)
+	require.NoError(t, w2.open())
+	t.Cleanup(func() { _ = w2.close(false) })
+
+	// Latest frame for pgno 3 should be the overwritten one (frame 1)
+	// with V1' = 0x77 in its data.
+	frame := w2.index.get(3, w2.index.maxFrame.Load())
+	require.NotZero(t, frame, "pgno 3 should have a frame after recovery")
+	buf := make([]byte, 4096)
+	require.NoError(t, w2.readFrame(frame, buf))
+	assert.Equal(t, byte(0x77), buf[0], "recovery should yield the overwritten data, not the original")
+}
+
+// TestWriteFrames_SavepointRollbackResetsIReCksum confirms that
+// rolling back past iReCksum clears it. Mirrors SQLite wal.c:3832.
+func TestWriteFrames_SavepointRollbackResetsIReCksum(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	w := newWal(path, 4096)
+	require.NoError(t, w.open())
+	t.Cleanup(func() { _ = w.close(false) })
+
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
+	t.Cleanup(w.endWrite)
+
+	// Spill pgno 2 → frame 1.
+	pg2a := &page{pgno: 2, data: make([]byte, 4096)}
+	require.NoError(t, w.writeFrames([]*page{pg2a}, false, 0))
+	savedMxFrame := w.nFrame.Load() // would be a savepoint
+
+	// Spill pgno 3 + reuse pgno 2.
+	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
+	pg2b := &page{pgno: 2, data: make([]byte, 4096)}
+	pg2b.data[0] = 0xEE
+	require.NoError(t, w.writeFrames([]*page{pg3, pg2b}, false, 0))
+
+	require.Equal(t, uint32(2), w.nFrame.Load(), "frame 2 appended (pgno 3); pgno 2 reused frame 1")
+	require.Equal(t, uint32(1), w.iReCksum, "iReCksum should point at overwritten frame 1")
+
+	// Savepoint rollback to savedMxFrame=1: iReCksum (1) is NOT past
+	// the new mxFrame, so it stays set.
+	w.index.rollbackToFrame(savedMxFrame)
+	w.nFrame.Store(savedMxFrame)
+	w.resetIReCksumIfPast(savedMxFrame)
+	assert.Equal(t, uint32(1), w.iReCksum, "rollback NOT past iReCksum should preserve it")
+
+	// Rollback to mxFrame=0 (past iReCksum): should clear it.
+	w.index.rollbackToFrame(0)
+	w.nFrame.Store(0)
+	w.resetIReCksumIfPast(0)
+	assert.Equal(t, uint32(0), w.iReCksum, "rollback past iReCksum should clear it")
+}
