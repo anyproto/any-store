@@ -1194,31 +1194,51 @@ Default threshold is 10,000 frames vs SQLite's 1,000. Auto-checkpoint runs as
 PASSIVE (`tryCheckpoint()` -> `checkpointPassive()`), matching SQLite's default
 auto-checkpoint behavior. PASSIVE mode does not block writers or readers.
 
-**No Frame-Reuse Within a Transaction (`walRewriteChecksums`)** -- Divergent, Intentional
+**Frame-Reuse Within a Transaction (`walRewriteChecksums`)** -- Resolved 2026-04-22
 
-SQLite's `walRewriteChecksums` (`sqlitec/src/wal.c:3966-4009`) supports
-overwriting an earlier WAL frame when a page is re-dirtied within the
-same transaction, instead of appending a new frame. `pWal->iReCksum`
-tracks the earliest overwritten frame; on commit SQLite re-reads frames
-`iReCksum..mxFrame`, recomputes the running checksum chain starting
-from the preceding frame's checksums, and rewrites the frame headers
-so the chain stays consistent.
+SQLite's `walRewriteChecksums` (`sqlitec/src/wal.c:3966-4009`) overwrites
+an earlier WAL frame when a page is re-dirtied within the same
+transaction, instead of appending a new frame. `pWal->iReCksum`
+(`sqlitec/src/wal.c:533`) tracks the earliest overwritten frame; on
+commit SQLite re-reads frames `iReCksum..mxFrame`, recomputes the
+running checksum chain starting from the preceding frame's checksums,
+and rewrites frame headers so the chain stays consistent.
 
-any-store always appends: the same page dirtied twice in one tx
-produces two WAL frames. Correctness is unaffected — checkpoint
-collapses to a single DB-page write regardless. The trade-off:
-- Us: simpler code (no `iReCksum` tracking, no checksum rewrite path,
-  no recovery edge case for partially-rewritten-chain crashes).
-- SQLite: smaller WAL files during long dirty-heavy transactions.
+any-store now ports this. The reuse branch in `writeFrames`
+(internal/btree/wal.go) mirrors `walFrames` (`wal.c:4117-4156`):
 
-**When it would matter:** a workload that repeatedly dirties the same
-page within one transaction (e.g. incremental blob write via
-`sqlite3_blob_write`, which any-store does not expose). For normal
-commit-per-doc-change patterns this never fires.
+- `iFirst = mxCommitFrame.LoadLocal() + 1` is the first frame in the
+  current tx eligible for in-place overwrite. We use `mxCommitFrame`
+  rather than `writerHdr.mxFrame` because `writerHdr` is only
+  maintained in multi-process mode; `mxCommitFrame` is updated in both
+  modes on every commit.
+- A spilled page is overwritten in place when `getInTxRange` finds a
+  prior frame for the same `pgno` in `[iFirst..nf]`. The SHM hash
+  entry is unchanged (still points at the reused frame).
+- `iReCksum` advances backward to the earliest overwritten frame.
+  `rewriteChecksums(iLast)` (analog of `wal.c:3966-4009`) rewrites
+  frame headers `iReCksum..iLast` on commit, before fdatasync.
+- The final commit frame is always a fresh append (it carries the
+  `dbSize` marker — `wal.c:4124-4140`).
+- Savepoint rollback resets `iReCksum` if it now points past the
+  rolled-back frontier (`wal.c:3832` analog in
+  `pager.rollbackToSavepoint`).
+- `writeFramesMem` overwrites the in-memory `memFrames` slot for the
+  InMemory mode equivalent — no checksum chain to rewrite.
 
-**Revisit if:** WAL file size during a long transaction becomes a
-concern for a specific workload. No current evidence; leaving
-divergent by design.
+**Bench evidence** (`BenchmarkWAL_SpillHeavyRepeatedDirty`, 1000 docs ×
+2KB, CacheSize=4, nUpdates=5):
+
+  variant   appends  reuses  wal_bytes
+  -------   -------  ------  ---------
+  NoReuse       581       0  10,843,872
+  Reuse         130     451   8,969,272   -1.87 MB / -17%
+
+78% of writeFrames calls hit the in-place overwrite path under
+spill-heavy load. Production motivation: WAL bloat observed on real
+Anytype workloads with long write transactions. The page cache dedups
+naturally for small working sets; reuse only fires when the cache
+spills mid-tx (working set > CacheSize).
 
 **mmap for Database File Reads** -- Resolved 2026-04-22
 
