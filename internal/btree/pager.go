@@ -2021,9 +2021,19 @@ func (p *pager) writeOverflowChainMulti(segments ...[]byte) (uint32, error) {
 		totalLen += len(seg)
 		for len(seg) > 0 {
 			if spaceLeft == 0 {
-				// Allocate a new overflow page
-				var err error
-				newPg, err := p.allocatePage()
+				// Allocate a new overflow page. Pass the previous
+				// overflow page's pgno as the locality hint so the
+				// freelist picks a physically nearby leaf — matches
+				// SQLite fillInCell (btree.c:7197 `allocateBtreePage(
+				// pBt, &pOvfl, &pgnoOvfl, pgnoOvfl, 0)`). For the
+				// first overflow page in a chain prevPg is nil and we
+				// pass 0 (no hint) — matches btree.c:7131
+				// `pgnoOvfl = 0`.
+				var nearby uint32
+				if prevPg != nil {
+					nearby = prevPg.pgno
+				}
+				newPg, err := p.allocatePageNear(nearby)
 				if err != nil {
 					return 0, err
 				}
