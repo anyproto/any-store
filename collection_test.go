@@ -3,6 +3,8 @@ package anystore
 import (
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -569,5 +571,60 @@ func BenchmarkOverflow_SizeSweep_FindId(b *testing.B) {
 				_ = d.Value()
 			}
 		})
+	}
+}
+
+// BenchmarkOverflow10MB_FindIdCold measures FindId on a 10MB blob
+// with per-iteration DB reopen. Reopening drops in-process caches
+// (pcache, mmap region) — what remains is whatever the OS page
+// cache serves. Exposes sequential-read layout wins that the
+// warm-cache variant hides.
+//
+// NOTE: fully evicting the OS page cache would require root +
+// platform-specific calls; this bench does not. Both before/after
+// see the same OS-cache conditions, so the comparison is fair for
+// measuring chain layout cost vs constant OS-cache overhead.
+func BenchmarkOverflow10MB_FindIdCold(b *testing.B) {
+	const sz = 10 << 20
+
+	tmpDir, err := os.MkdirTemp("", "bench-cold-*")
+	require.NoError(b, err)
+	b.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+	dbPath := filepath.Join(tmpDir, "bench.db")
+
+	// One-time setup: open, insert blob, checkpoint, close.
+	setupDB, err := Open(ctx, dbPath, nil)
+	require.NoError(b, err)
+	coll, err := setupDB.CreateCollection(ctx, "blob")
+	require.NoError(b, err)
+	raw := make([]byte, sz/2)
+	for i := range raw {
+		raw[i] = byte(i * 17)
+	}
+	payload := fmt.Sprintf("%x", raw)
+	doc := anyenc.MustParseJson(fmt.Sprintf(`{"id": 1, "payload": "%s"}`, payload))
+	require.NoError(b, coll.Insert(ctx, doc))
+	require.NoError(b, setupDB.Flush(ctx, 0*time.Second, FlushModeCheckpointFull))
+	require.NoError(b, setupDB.Close())
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		b.StopTimer()
+		db2, err := Open(ctx, dbPath, nil)
+		require.NoError(b, err)
+		coll2, err := db2.OpenCollection(ctx, "blob")
+		require.NoError(b, err)
+		b.StartTimer()
+
+		d, err := coll2.FindId(ctx, 1)
+		if err != nil {
+			b.Fatalf("FindId: %v", err)
+		}
+		_ = d.Value()
+
+		b.StopTimer()
+		require.NoError(b, db2.Close())
+		b.StartTimer()
 	}
 }
