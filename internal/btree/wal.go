@@ -2512,6 +2512,93 @@ func (w *wal) buildBackfillMap(lo, hi uint32) (map[uint32]uint32, error) {
 	return w.ckptLatest, nil
 }
 
+// rewriteChecksums re-reads frames [w.iReCksum..iLast] and rewrites
+// each frame header with a freshly computed checksum chain. Called
+// from writeFrames on commit when w.iReCksum > 0.
+//
+// Mirrors SQLite's walRewriteChecksums (wal.c:3966-4009):
+//   - iReCksum == 1: seed chain from the WAL-header checksums at
+//     file offset 24 (bytes 24..31 of walHeader).
+//   - iReCksum >  1: seed from frame (iReCksum-1)'s header at offset
+//     walFrameOffset(iReCksum-1)+16 (the cksum1/cksum2 fields).
+//
+// Then for each frame i in [iReCksum..iLast]: read existing frame
+// header (preserves pgno/dbSize/salts; its cksum fields are stale),
+// read the page data (current — possibly overwritten), recompute
+// (cksum1, cksum2) over (frameHdr[0:8] + pageData), write the 24-byte
+// frame header back with updated cksum1/cksum2 at bytes 16..23.
+//
+// On success, sets w.iReCksum = 0. On I/O error, w.iReCksum is left
+// unchanged; the caller should surface the error as commit failure.
+//
+// Caller must hold w.mu.
+func (w *wal) rewriteChecksums(iLast uint32) error {
+	if w.iReCksum == 0 {
+		return nil
+	}
+	if w.file == nil {
+		return errors.New("btree: WAL file closed")
+	}
+	frameSize := int64(walFrameSize) + int64(w.pageSize)
+
+	// Seed the checksum chain. SQLite wal.c:3982-3990.
+	var s1, s2 uint32
+	if w.iReCksum == 1 {
+		// Read cksum1/cksum2 from the WAL header (bytes 24..31 of the
+		// 32-byte walHeader).
+		var hdrCksumBuf [8]byte
+		if _, err := w.file.ReadAt(hdrCksumBuf[:], 24); err != nil {
+			return err
+		}
+		s1 = binary.BigEndian.Uint32(hdrCksumBuf[0:4])
+		s2 = binary.BigEndian.Uint32(hdrCksumBuf[4:8])
+	} else {
+		// Read cksum1/cksum2 from the previous frame's header at bytes
+		// 16..23 of the 24-byte walFrame struct.
+		prevOff := int64(walHeaderSize) + int64(w.iReCksum-2)*frameSize
+		var prevCksumBuf [8]byte
+		if _, err := w.file.ReadAt(prevCksumBuf[:], prevOff+16); err != nil {
+			return err
+		}
+		s1 = binary.BigEndian.Uint32(prevCksumBuf[0:4])
+		s2 = binary.BigEndian.Uint32(prevCksumBuf[4:8])
+	}
+
+	// Scratch buffers: frame header + page data.
+	var frameHdr [walFrameSize]byte
+	pageData := make([]byte, w.pageSize)
+
+	// Walk frames iReCksum..iLast (inclusive). SQLite wal.c:3992-4005.
+	for i := w.iReCksum; i <= iLast; i++ {
+		off := int64(walHeaderSize) + int64(i-1)*frameSize
+
+		// Read the existing frame header + page data.
+		if _, err := w.file.ReadAt(frameHdr[:], off); err != nil {
+			return err
+		}
+		if _, err := w.file.ReadAt(pageData, off+walFrameSize); err != nil {
+			return err
+		}
+
+		// Recompute checksums over (header-first-8 + page data).
+		s1, s2 = walChecksum(frameHdr[0:8], s1, s2)
+		s1, s2 = walChecksum(pageData, s1, s2)
+
+		// Rewrite the cksum fields in the header at bytes [16..24].
+		binary.BigEndian.PutUint32(frameHdr[16:20], s1)
+		binary.BigEndian.PutUint32(frameHdr[20:24], s2)
+
+		// Write back the 24-byte header only (page data unchanged).
+		if _, err := w.file.WriteAt(frameHdr[:], off); err != nil {
+			return err
+		}
+	}
+
+	// Success — reset for next transaction. SQLite wal.c:3993.
+	w.iReCksum = 0
+	return nil
+}
+
 // mxFrame source (multi-process): `nf` is read via authoritativeMxFrame,
 // which consults the SHM header under lockCheckpoint. This mirrors SQLite's
 // walCheckpoint using pWal->hdr.mxFrame. Reading the process-local
