@@ -1194,7 +1194,31 @@ Default threshold is 10,000 frames vs SQLite's 1,000. Auto-checkpoint runs as
 PASSIVE (`tryCheckpoint()` -> `checkpointPassive()`), matching SQLite's default
 auto-checkpoint behavior. PASSIVE mode does not block writers or readers.
 
-### Pager / Cache
+**No Frame-Reuse Within a Transaction (`walRewriteChecksums`)** -- Divergent, Intentional
+
+SQLite's `walRewriteChecksums` (`sqlitec/src/wal.c:3966-4009`) supports
+overwriting an earlier WAL frame when a page is re-dirtied within the
+same transaction, instead of appending a new frame. `pWal->iReCksum`
+tracks the earliest overwritten frame; on commit SQLite re-reads frames
+`iReCksum..mxFrame`, recomputes the running checksum chain starting
+from the preceding frame's checksums, and rewrites the frame headers
+so the chain stays consistent.
+
+any-store always appends: the same page dirtied twice in one tx
+produces two WAL frames. Correctness is unaffected — checkpoint
+collapses to a single DB-page write regardless. The trade-off:
+- Us: simpler code (no `iReCksum` tracking, no checksum rewrite path,
+  no recovery edge case for partially-rewritten-chain crashes).
+- SQLite: smaller WAL files during long dirty-heavy transactions.
+
+**When it would matter:** a workload that repeatedly dirties the same
+page within one transaction (e.g. incremental blob write via
+`sqlite3_blob_write`, which any-store does not expose). For normal
+commit-per-doc-change patterns this never fires.
+
+**Revisit if:** WAL file size during a long transaction becomes a
+concern for a specific workload. No current evidence; leaving
+divergent by design.
 
 **mmap for Database File Reads** -- Resolved 2026-04-22
 
