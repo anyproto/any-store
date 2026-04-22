@@ -4,7 +4,9 @@ package btree
 
 import (
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -83,6 +85,68 @@ func TestDBMmap_GrowRemapsAndReadsCorrect(t *testing.T) {
 	tx2, err := db.BeginRead()
 	require.NoError(t, err)
 	require.NoError(t, tx2.Rollback())
+}
+
+// TestDBMmap_ConcurrentReadVsRemap runs N readers hitting readAt while
+// another goroutine forces miss-then-remap via a tiny-cap mapping that
+// must grow on every few accesses. Pre-fix, this raced between fetch's
+// slice return and remap's Munmap. Post-fix, readAt copies under the
+// RLock so Munmap cannot overlap. Guard against re-introducing the bug.
+//
+// Run with: go test -race -run TestDBMmap_ConcurrentReadVsRemap
+func TestDBMmap_ConcurrentReadVsRemap(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "t.db")
+	// Small cap to force remaps as pages are added.
+	db, err := Open(dbPath, Options{MmapSize: 32 << 10}) // 32 KiB
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Seed a few pages.
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	for i := 0; i < 20; i++ {
+		name := []byte{'n', byte('a' + (i % 26)), byte('0' + (i / 26))}
+		_, _ = tx.CreateNamespace(string(name))
+	}
+	require.NoError(t, tx.Commit())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+
+	// Hammer readAt from multiple goroutines while another goroutine
+	// periodically forces a remap to a larger size. If the fix is in
+	// place, `go test -race` reports no hazards. Each goroutine gets
+	// its own buf so the race detector catches only mmap-layer races,
+	// not shared-buffer test-harness noise.
+	var wg sync.WaitGroup
+	stopCh := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, db.pager.pageSize)
+			for {
+				select {
+				case <-stopCh:
+					return
+				default:
+					_ = db.pager.dbMmap.readAt(buf, 0)
+				}
+			}
+		}()
+	}
+	// Remap churn goroutine.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 1; i <= 8; i++ {
+			_ = db.pager.dbMmap.remap(int64(i) * (32 << 10))
+		}
+	}()
+
+	// Let it run briefly, then stop.
+	time.Sleep(100 * time.Millisecond)
+	close(stopCh)
+	wg.Wait()
 }
 
 // TestDBMmap_CloseUnmapsCleanly verifies Close tears down the mapping

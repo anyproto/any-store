@@ -248,18 +248,20 @@ func (p *pager) readDBPage(pgno uint32, buf []byte) error {
 	offset := int64(pgno-1) * int64(p.pageSize)
 
 	if p.dbMmap.enabled() {
-		if src, ok := p.dbMmap.fetch(offset, len(buf)); ok {
-			copy(buf, src)
+		if p.dbMmap.readAt(buf, offset) {
 			return nil
 		}
 		// Miss: mapping not yet created or offset beyond current
-		// window. Try a remap to cover this page, then retry fetch.
+		// window. Try a remap to cover this page, then retry.
 		need := offset + int64(len(buf))
 		if err := p.dbMmap.remap(need); err == nil {
-			if src, ok := p.dbMmap.fetch(offset, len(buf)); ok {
-				copy(buf, src)
+			if p.dbMmap.readAt(buf, offset) {
 				return nil
 			}
+		} else if debugTrace {
+			// Silent mmap failure loses the fast path in production;
+			// log it under debug so operators can diagnose.
+			trace("readDBPage: dbMmap.remap(%d) failed: %v", need, err)
 		}
 		// Still a miss (mapping cap reached or mmap failed). Fall
 		// through to ReadAt — matches SQLite's "continue accessing

@@ -38,28 +38,32 @@ func newDBMmap(file fileHandle, maxSize int64) *dbMmap {
 	return &dbMmap{file: file, maxSize: maxSize}
 }
 
-// fetch returns a slice pointing into the mapping that covers
-// [off, off+n), or nil if mmap is disabled / the range isn't mapped.
-// The returned slice is valid until the next remap() or unmap(); the
-// caller MUST copy out of it before releasing the read lock.
+// readAt copies [off, off+len(dst)) from the mapping into dst, returning
+// ok=true on success. The copy happens WHILE the read lock is held, so
+// a concurrent remap()/unmap() cannot munmap the backing memory out from
+// under us. Returns ok=false on: disabled, mapping not yet created, or
+// offset outside current window — caller falls back to ReadAt.
 //
-// Mirrors SQLite's unixFetch (os_unix.c:5714-5738) modulo the
-// reference counting — we return the slice under an RLock, the caller
-// copies, then releases. No outstanding-reference tracking needed.
-func (m *dbMmap) fetch(off int64, n int) (buf []byte, ok bool) {
+// Mirrors SQLite's unixFetch (os_unix.c:5714-5738) but eliminates the
+// nFetchOut reference counting (which SQLite needs for its zero-copy
+// contract — pointer into the mapping returned to the caller): we
+// memcpy inside the critical section so there is never an outstanding
+// pointer into the mapping past the lock release.
+func (m *dbMmap) readAt(dst []byte, off int64) (ok bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if m.maxSize == 0 || m.region == nil {
-		return nil, false
+		return false
 	}
-	if off < 0 || n < 0 {
-		return nil, false
+	if off < 0 {
+		return false
 	}
-	end := off + int64(n)
+	end := off + int64(len(dst))
 	if end > int64(len(m.region)) {
-		return nil, false
+		return false
 	}
-	return m.region[off:end], true
+	copy(dst, m.region[off:end])
+	return true
 }
 
 // remap resizes the mapping to cover at least [0, need) bytes, capped
