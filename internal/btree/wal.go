@@ -487,7 +487,11 @@ type walIndex struct {
 	shm           shm                 // platform-specific shared memory
 	pageMap       map[uint32][]uint32 // pgno -> sorted list of frame indices (1-based)
 	maxFrame      atomic.Uint32       // highest valid frame (committed + spilled)
-	mxCommitFrame atomic.Uint32       // highest COMMITTED frame — visible to readers
+	// mxCommitFrame is the process-local commit-frame cursor. Do NOT read
+	// via bare .Load — the compiler blocks that. For local reads use
+	// mxCommitFrame.LoadLocal(); for cross-process authoritative reads
+	// use (*wal).authoritativeMxFrame(). See mxframe.go for rationale.
+	mxCommitFrame commitFrameCounter
 	maxPage       atomic.Uint32       // database size at last commit
 	nBackfill     atomic.Uint32       // frames already checkpointed
 
@@ -721,7 +725,7 @@ func (wi *walIndex) getLatest(pgno uint32) uint32 {
 	// cross-process readers never observe uncommitted spill frames (readers
 	// gate on hdr.mxFrame / mxCommitFrame, not raw hash entries).
 	minFrame := wi.shmNBackfill() + 1
-	return wi.shmHashGet(pgno, wi.mxCommitFrame.Load(), minFrame)
+	return wi.shmHashGet(pgno, wi.mxCommitFrame.LoadLocal(), minFrame)
 }
 
 // reset clears the WAL index (after a checkpoint + WAL truncate).
@@ -2066,7 +2070,7 @@ func (w *wal) tryBeginReadInProcess() (maxFrame uint32, slot int, err error) {
 }
 
 func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err error) {
-	mxFrame := w.index.mxCommitFrame.Load()
+	mxFrame := w.index.mxCommitFrame.LoadLocal()
 	nBackfill := w.index.nBackfill.Load()
 	hdr = WalIndexHdr{isInit: 1, mxFrame: mxFrame}
 
@@ -2362,7 +2366,7 @@ func (w *wal) endWrite() {
 // in-memory mode it uses the in-process atomic. Falls back to the atomic if the
 // SHM read yields a torn/invalid header.
 //
-// Callers should prefer this over w.index.mxCommitFrame.Load() whenever the
+// Callers should prefer this over w.index.mxCommitFrame.LoadLocal() whenever the
 // result influences truncate or WAL-reset decisions: a stale process-local
 // value that undercounts a peer's committed frames can make us reset or
 // truncate the WAL while those frames are still only in the WAL file,
@@ -2374,7 +2378,7 @@ func (w *wal) authoritativeMxFrame() uint32 {
 			return hdr.mxFrame
 		}
 	}
-	return w.index.mxCommitFrame.Load()
+	return w.index.mxCommitFrame.LoadLocal()
 }
 
 // checkpoint writes WAL frames back to the database file.

@@ -1196,7 +1196,7 @@ func (p *pager) refreshHeaderFromPage1() {
 	// Determine effective max frame, same logic as readHeaderCounters.
 	effectiveMaxFrame := p.wal.nFrame.Load()
 	if p.inProcess {
-		if mf := p.wal.index.mxCommitFrame.Load(); mf > effectiveMaxFrame {
+		if mf := p.wal.index.mxCommitFrame.LoadLocal(); mf > effectiveMaxFrame {
 			effectiveMaxFrame = mf
 		}
 	} else if hdr, valid := p.wal.index.readHeader(); valid && hdr.mxFrame > effectiveMaxFrame {
@@ -1258,7 +1258,7 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 	effectiveMaxFrame := walMaxFrame
 	if p.inProcess {
 		// Use mxCommitFrame (not maxFrame) so spilled uncommitted frames are invisible to readers.
-		if mf := p.wal.index.mxCommitFrame.Load(); mf > effectiveMaxFrame {
+		if mf := p.wal.index.mxCommitFrame.LoadLocal(); mf > effectiveMaxFrame {
 			effectiveMaxFrame = mf
 		}
 	} else if hdr, valid := p.wal.index.readHeader(); valid && hdr.mxFrame > effectiveMaxFrame {
@@ -1873,7 +1873,12 @@ func (p *pager) tryCheckpoint() error {
 	// If all frames are backfilled, try a best-effort RESTART to recycle WAL
 	// frame numbers and prevent unbounded WAL growth. With xBusy=nil this does
 	// not wait for readers; it simply skips reset when locks are busy.
-	if p.wal.index.nBackfill.Load() >= p.wal.index.mxCommitFrame.Load() {
+	//
+	// Authoritative read: in multi-process mode the process-local cursor can
+	// trail a peer's recent commit; comparing nBackfill against a stale local
+	// cursor can return true prematurely and schedule a RESTART that races
+	// the peer's fresh frames. See NOTES.md §"Checkpoint mxFrame source fix".
+	if p.wal.index.nBackfill.Load() >= p.wal.authoritativeMxFrame() {
 		_ = p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil)
 	}
 	return nil

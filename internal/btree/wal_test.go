@@ -626,7 +626,7 @@ func TestWriteFramesCommitFalseDoesNotAdvanceMxCommitFrame(t *testing.T) {
 	copy(pg1.data, "committed page 1")
 	require.NoError(t, w.writeFrames([]*page{pg1}, true, 1))
 	assert.Equal(t, uint32(1), w.index.maxFrame.Load())
-	assert.Equal(t, uint32(1), w.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(1), w.index.mxCommitFrame.LoadLocal())
 
 	// Now write frames WITHOUT commit (simulating spill)
 	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
@@ -638,7 +638,7 @@ func TestWriteFramesCommitFalseDoesNotAdvanceMxCommitFrame(t *testing.T) {
 	// maxFrame should advance to 3 (writer sees all frames)
 	assert.Equal(t, uint32(3), w.index.maxFrame.Load())
 	// mxCommitFrame should still be 1 (readers only see committed)
-	assert.Equal(t, uint32(1), w.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(1), w.index.mxCommitFrame.LoadLocal())
 
 	// Writer can find spilled pages via pageMap
 	assert.Equal(t, uint32(2), w.index.get(2, 3))
@@ -649,7 +649,7 @@ func TestWriteFramesCommitFalseDoesNotAdvanceMxCommitFrame(t *testing.T) {
 	copy(pg4.data, "committed page 4")
 	require.NoError(t, w.writeFrames([]*page{pg4}, true, 4))
 	assert.Equal(t, uint32(4), w.index.maxFrame.Load())
-	assert.Equal(t, uint32(4), w.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(4), w.index.mxCommitFrame.LoadLocal())
 
 	w.endWrite()
 	require.NoError(t, w.close(false))
@@ -713,7 +713,7 @@ func TestRollbackCleansUpSpilledFrames(t *testing.T) {
 	savedFrame := w.nFrame.Load()
 	assert.Equal(t, uint32(2), savedFrame)
 	assert.Equal(t, uint32(2), w.index.maxFrame.Load())
-	assert.Equal(t, uint32(2), w.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(2), w.index.mxCommitFrame.LoadLocal())
 
 	// Spill pages 3 and 4 (frames 3 and 4, commit=false)
 	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
@@ -724,7 +724,7 @@ func TestRollbackCleansUpSpilledFrames(t *testing.T) {
 
 	// Verify spilled state: maxFrame advanced but mxCommitFrame did not
 	assert.Equal(t, uint32(4), w.index.maxFrame.Load())
-	assert.Equal(t, uint32(2), w.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(2), w.index.mxCommitFrame.LoadLocal())
 	assert.Equal(t, uint32(4), w.nFrame.Load())
 
 	// Writer can see spilled frames in pageMap
@@ -783,7 +783,7 @@ func TestRollbackToSavepointWithSpilledFrames(t *testing.T) {
 
 	// Verify state before rollback
 	assert.Equal(t, uint32(4), w.index.maxFrame.Load())
-	assert.Equal(t, uint32(3), w.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(3), w.index.mxCommitFrame.LoadLocal())
 
 	// Rollback to savepoint (frame 2)
 	w.index.rollbackToFrame(savepointFrame)
@@ -846,7 +846,7 @@ func TestCrossProcessReaderDoesNotSeeSpilledFrames(t *testing.T) {
 	assert.Equal(t, uint32(2), hdr2.nPage, "SHM header nPage must not change on spill")
 
 	// mxCommitFrame should still be 2
-	assert.Equal(t, uint32(2), w.index.mxCommitFrame.Load(), "mxCommitFrame must not advance on spill")
+	assert.Equal(t, uint32(2), w.index.mxCommitFrame.LoadLocal(), "mxCommitFrame must not advance on spill")
 	// maxFrame (writer-internal) should be 4
 	assert.Equal(t, uint32(4), w.index.maxFrame.Load(), "maxFrame should include spilled frames")
 
@@ -862,7 +862,7 @@ func TestCrossProcessReaderDoesNotSeeSpilledFrames(t *testing.T) {
 		pageMap:   make(map[uint32][]uint32),
 		inProcess: false,
 	}
-	reader.mxCommitFrame.Store(w.index.mxCommitFrame.Load())
+	reader.mxCommitFrame.Store(w.index.mxCommitFrame.LoadLocal())
 	reader.nBackfill.Store(0)
 
 	// Reader should see committed pages via SHM hash
@@ -908,7 +908,7 @@ func TestRecoveryIgnoresSpilledFrames(t *testing.T) {
 	// Verify pre-close state: 6 total frames, only 3 committed
 	assert.Equal(t, uint32(6), w.nFrame.Load())
 	assert.Equal(t, uint32(6), w.index.maxFrame.Load())
-	assert.Equal(t, uint32(3), w.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(3), w.index.mxCommitFrame.LoadLocal())
 
 	w.endWrite()
 	require.NoError(t, w.close(false))
@@ -920,7 +920,7 @@ func TestRecoveryIgnoresSpilledFrames(t *testing.T) {
 	// nFrame should be 3 (only committed frames)
 	assert.Equal(t, uint32(3), w2.nFrame.Load(), "recovery: nFrame should be 3")
 	assert.Equal(t, uint32(3), w2.index.maxFrame.Load(), "recovery: maxFrame should be 3")
-	assert.Equal(t, uint32(3), w2.index.mxCommitFrame.Load(), "recovery: mxCommitFrame should be 3")
+	assert.Equal(t, uint32(3), w2.index.mxCommitFrame.LoadLocal(), "recovery: mxCommitFrame should be 3")
 	assert.Equal(t, uint32(3), w2.index.maxPage.Load(), "recovery: maxPage should be 3")
 
 	// Committed pages should be in index
@@ -990,7 +990,7 @@ func TestWriteFramesCommitFlushesToShm(t *testing.T) {
 	assert.Equal(t, uint32(3), frame, "page 3 in SHM hash")
 
 	// mxCommitFrame should include all frames
-	assert.Equal(t, uint32(3), w.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(3), w.index.mxCommitFrame.LoadLocal())
 
 	w.endWrite()
 	require.NoError(t, w.close(false))

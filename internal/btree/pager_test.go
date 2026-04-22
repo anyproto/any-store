@@ -6691,7 +6691,7 @@ func TestReadHeaderCountersIgnoresSpilledFrames(t *testing.T) {
 	require.NoError(t, p.wal.writeFrames([]*page{pg1}, true, 1))
 
 	// Verify mxCommitFrame is now 1
-	assert.Equal(t, uint32(1), p.wal.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(1), p.wal.index.mxCommitFrame.LoadLocal())
 
 	// readHeaderCounters should see FileChangeCount=100, SchemaCookie=200
 	fcc, sc, err := p.readHeaderCounters(0)
@@ -6707,7 +6707,7 @@ func TestReadHeaderCountersIgnoresSpilledFrames(t *testing.T) {
 
 	// maxFrame advanced but mxCommitFrame did NOT
 	assert.Equal(t, uint32(2), p.wal.index.maxFrame.Load())
-	assert.Equal(t, uint32(1), p.wal.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(1), p.wal.index.mxCommitFrame.LoadLocal())
 
 	// readHeaderCounters should still see the COMMITTED values (100, 200)
 	// because inProcess mode uses mxCommitFrame to bound WAL lookups.
@@ -6748,7 +6748,7 @@ func TestPagerStressSpillsDirtyPage(t *testing.T) {
 
 	// Capture WAL frame count before stress
 	nFrameBefore := p.wal.nFrame.Load()
-	mxCommitBefore := p.wal.index.mxCommitFrame.Load()
+	mxCommitBefore := p.wal.index.mxCommitFrame.LoadLocal()
 
 	// Call pagerStress directly on the unpinned dirty page
 	err = p.pagerStress(pg2)
@@ -6758,7 +6758,7 @@ func TestPagerStressSpillsDirtyPage(t *testing.T) {
 	assert.Equal(t, nFrameBefore+1, p.wal.nFrame.Load(), "nFrame should advance by 1")
 
 	// Verify: mxCommitFrame NOT advanced (spill, not commit)
-	assert.Equal(t, mxCommitBefore, p.wal.index.mxCommitFrame.Load(), "mxCommitFrame should not advance")
+	assert.Equal(t, mxCommitBefore, p.wal.index.mxCommitFrame.LoadLocal(), "mxCommitFrame should not advance")
 
 	// Verify: page is now clean
 	assert.False(t, pg2.dirty, "page should be clean after stress")
@@ -6942,7 +6942,7 @@ func TestPagerStressThenCommit(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, pg2.dirty, "spilled page should be clean")
 
-	mxCommitBefore := p.wal.index.mxCommitFrame.Load()
+	mxCommitBefore := p.wal.index.mxCommitFrame.LoadLocal()
 	assert.Equal(t, uint32(0), mxCommitBefore, "mxCommitFrame should not advance after spill")
 
 	// Commit remaining dirty pages (pg3, pg4, pg1 header)
@@ -6951,7 +6951,7 @@ func TestPagerStressThenCommit(t *testing.T) {
 	p.endRead(slot)
 
 	// Verify mxCommitFrame advanced to include spilled + committed frames
-	mxCommitAfter := p.wal.index.mxCommitFrame.Load()
+	mxCommitAfter := p.wal.index.mxCommitFrame.LoadLocal()
 	assert.Equal(t, p.wal.nFrame.Load(), mxCommitAfter,
 		"mxCommitFrame should equal nFrame after commit")
 
@@ -7003,7 +7003,7 @@ func TestPagerStressThenRollback(t *testing.T) {
 	p.endRead(slot)
 
 	savedMaxFrame := p.wal.nFrame.Load()
-	savedMxCommit := p.wal.index.mxCommitFrame.Load()
+	savedMxCommit := p.wal.index.mxCommitFrame.LoadLocal()
 
 	// Second transaction: modify page 2, spill it, then rollback
 	mf2, slot2, err := p.beginRead()
@@ -7023,7 +7023,7 @@ func TestPagerStressThenRollback(t *testing.T) {
 	// nFrame advanced but mxCommitFrame didn't
 	assert.Greater(t, p.wal.nFrame.Load(), savedMaxFrame,
 		"nFrame should advance after spill")
-	assert.Equal(t, savedMxCommit, p.wal.index.mxCommitFrame.Load(),
+	assert.Equal(t, savedMxCommit, p.wal.index.mxCommitFrame.LoadLocal(),
 		"mxCommitFrame should not advance after spill")
 
 	// Rollback
@@ -7337,7 +7337,7 @@ func TestSpillMultipleRounds(t *testing.T) {
 	// but mxCommitFrame should still be 0 (no commit yet)
 	assert.Greater(t, p.wal.nFrame.Load(), uint32(0),
 		"frames should have been written via spill")
-	assert.Equal(t, uint32(0), p.wal.index.mxCommitFrame.Load(),
+	assert.Equal(t, uint32(0), p.wal.index.mxCommitFrame.LoadLocal(),
 		"mxCommitFrame should be 0 before commit")
 
 	// Commit
@@ -7346,7 +7346,7 @@ func TestSpillMultipleRounds(t *testing.T) {
 	p.endRead(slot)
 
 	// After commit, mxCommitFrame should include all spilled + committed frames
-	assert.Equal(t, p.wal.nFrame.Load(), p.wal.index.mxCommitFrame.Load(),
+	assert.Equal(t, p.wal.nFrame.Load(), p.wal.index.mxCommitFrame.LoadLocal(),
 		"mxCommitFrame should match nFrame after commit")
 
 	// Verify all data
