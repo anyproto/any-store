@@ -232,6 +232,44 @@ func (p *pager) takeCellBuf(minCap int) []byte {
 	return nil
 }
 
+// readDBPage fills buf with the contents of pgno from the DB file.
+// Tries the mmap fetcher first; on miss (disabled, or offset outside
+// the current window), falls back to ReadAt. Matches SQLite's
+// getPageMMap → getPageNormal gate (pager.c:5670-5710).
+//
+// Callers preserve the legacy ReadAt error semantics: short reads
+// past EOF return the underlying io.ErrUnexpectedEOF / fs error from
+// ReadAt; the mmap path returns nil on success because the slice is
+// exactly len(buf) (checked in dbMmap.fetch).
+func (p *pager) readDBPage(pgno uint32, buf []byte) error {
+	if p.file == nil {
+		return fmt.Errorf("btree: db file closed")
+	}
+	offset := int64(pgno-1) * int64(p.pageSize)
+
+	if p.dbMmap.enabled() {
+		if src, ok := p.dbMmap.fetch(offset, len(buf)); ok {
+			copy(buf, src)
+			return nil
+		}
+		// Miss: mapping not yet created or offset beyond current
+		// window. Try a remap to cover this page, then retry fetch.
+		need := offset + int64(len(buf))
+		if err := p.dbMmap.remap(need); err == nil {
+			if src, ok := p.dbMmap.fetch(offset, len(buf)); ok {
+				copy(buf, src)
+				return nil
+			}
+		}
+		// Still a miss (mapping cap reached or mmap failed). Fall
+		// through to ReadAt — matches SQLite's "continue accessing
+		// using xRead()" pattern (os_unix.c:5579-5582).
+	}
+
+	_, err := p.file.ReadAt(buf, offset)
+	return err
+}
+
 // recycleCellBuf returns a byte buffer to the pager for reuse. Keeps the larger
 // of the existing and returned buffers.
 func (p *pager) recycleCellBuf(buf []byte) {
@@ -589,9 +627,7 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 
 	// Read from database file
 	if p.file != nil {
-		offset := int64(pgno-1) * int64(p.pageSize)
-		_, err := p.file.ReadAt(pg.data, offset)
-		if err != nil {
+		if err := p.readDBPage(pgno, pg.data); err != nil {
 			// If page is beyond current file but within dbSize, it's a new page
 			if pgno <= p.dbSize.Load() {
 				p.writerCache.discard(pg.pgno)
@@ -648,9 +684,7 @@ func (p *pager) readTempPage(pgno, walMaxFrame uint32) (*page, error) {
 
 	// Read from database file.
 	if p.file != nil {
-		offset := int64(pgno-1) * int64(p.pageSize)
-		_, err := p.file.ReadAt(pg.data, offset)
-		if err != nil {
+		if err := p.readDBPage(pgno, pg.data); err != nil {
 			if pgno <= p.dbSize.Load() {
 				p.recycleTempPage(pg)
 				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
@@ -724,9 +758,7 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 
 	// Read from database file.
 	if p.file != nil {
-		offset := int64(pgno-1) * int64(p.pageSize)
-		_, err := p.file.ReadAt(pg.data, offset)
-		if err != nil {
+		if err := p.readDBPage(pgno, pg.data); err != nil {
 			if pgno <= p.dbSize.Load() {
 				cache.discard(pg.pgno)
 				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
