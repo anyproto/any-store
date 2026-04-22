@@ -2061,7 +2061,13 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	startFrame := nf + 1
 	pageSz := int(w.pageSize)
 
-	// Ensure arena has enough space for all pages in this batch
+	// iFirst — first frame written by the current tx. Same logic as
+	// disk-mode writeFrames; reuse only allowed for frames in this tx.
+	iFirst := w.index.mxCommitFrame.LoadLocal() + 1
+
+	// Ensure arena has enough space for all pages in this batch (worst
+	// case: no reuse). We may over-reserve when reuse fires; that's fine
+	// — the arena recycles across txs.
 	needed := len(pages) * pageSz
 	if w.memArenaOff+needed > len(w.memArena) {
 		// Allocate new arena: at least 1MB or enough for 256 pages
@@ -2073,14 +2079,28 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 		w.memArenaOff = 0
 	}
 
-	for _, p := range pages {
-		// Slice page data from the arena (no individual allocation)
+	var nAppended uint32
+	for i, p := range pages {
+		isLast := i == len(pages)-1
+
+		// Reuse check — same semantics as disk-mode writeFrames.
+		if !(commit && isLast) && iFirst > 0 {
+			iWrite := w.index.getInTxRange(p.pgno, nf+nAppended, iFirst)
+			if iWrite > 0 {
+				// Overwrite the existing memFrame slot in place.
+				// memFrames is 0-indexed; frames are 1-indexed.
+				copy(w.memFrames[iWrite-1].data, p.data)
+				continue
+			}
+		}
+
+		// Fresh append — slice page data from the arena.
 		dataCopy := w.memArena[w.memArenaOff : w.memArenaOff+pageSz]
 		w.memArenaOff += pageSz
 		copy(dataCopy, p.data)
 
 		var dbSizeField uint32
-		if commit && p == pages[len(pages)-1] {
+		if commit && isLast {
 			dbSizeField = dbSize
 		}
 
@@ -2089,16 +2109,29 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 			dbSize: dbSizeField,
 			data:   dataCopy,
 		})
-		nf++
+		nAppended++
 	}
 
 	// Store nFrame while still holding the lock so readers see consistent
 	// memFrames slice + nFrame via their RLock.
-	w.nFrame.Store(nf)
+	w.nFrame.Store(nf + nAppended)
 	w.mu.Unlock()
 
-	// Batch update walIndex (has its own lock). SHM hash writes are immediate.
-	w.index.setBatch(pages, startFrame, commit)
+	// Batch update walIndex for APPENDED frames only.
+	if nAppended > 0 {
+		appended := pages
+		if nAppended != uint32(len(pages)) {
+			appended = make([]*page, 0, nAppended)
+			for _, p := range pages {
+				iWrite := w.index.getInTxRange(p.pgno, nf, iFirst)
+				if iWrite > 0 {
+					continue
+				}
+				appended = append(appended, p)
+			}
+		}
+		w.index.setBatch(appended, startFrame, commit)
+	}
 
 	if commit {
 		// Advance mxCommitFrame so readers can see the committed frames.
