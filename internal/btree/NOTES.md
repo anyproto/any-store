@@ -1564,13 +1564,22 @@ local `mxCommitFrame` would falsely report "complete" / "ready to
 reset" after only backfilling our own frames.
 
 Fix: extracted helper `(w *wal) authoritativeMxFrame()` that reads SHM
-hdr in multi-process mode, falls back to `mxCommitFrame.Load()`
+hdr in multi-process mode, falls back to `mxCommitFrame.LoadLocal()`
 otherwise. `checkpointWithMode`, `checkpointPassive`, and
 `checkpointPost` all use the helper. Mirrors SQLite's
 `pWal->hdr.mxFrame` usage throughout `walCheckpoint` (wal.c:2216,
 2227, 2309, 2341). Reader-path call sites (`shmHashGet`,
 `tryBeginReadInProcess`) intentionally retain the local read — those
 are per-tx snapshots that must not observe frames we haven't sync'd.
+
+**Compile-time guard added 2026-04-22.** `walIndex.mxCommitFrame` is
+now a `commitFrameCounter` (see `mxframe.go`) whose only reader is
+`LoadLocal()`; there is no plain `Load()`. Callers that want the
+cross-process authoritative value must go through
+`authoritativeMxFrame()`. A regressing commit that reads
+`mxCommitFrame.Load()` directly no longer compiles. The one production
+site still reading the local cursor in multi-process mode
+(`tryCheckpoint` in `pager.go`) now uses the authoritative accessor.
 
 ### pager.close lockWrite gate
 
@@ -1588,6 +1597,16 @@ the write lock) but truncate is skipped — WAL stays intact for the
 next opener. Mirrors SQLite's `sqlite3WalClose` which only calls
 `walLimitSize` inside the `SQLITE_OK==sqlite3OsLock(EXCLUSIVE)` arm
 (wal.c:2508-2536).
+
+**Structural guard added 2026-04-22.** The manual `lockedWrite bool` +
+trailing manual unlock has been replaced by
+`(*pager).withWriteLock(fn func(locked bool) error) error`, which
+acquires (or skips) the lock in one place and releases via `defer`. A
+future early-return or panic inside the closure cannot leak the lock.
+The close body is now the closure; correctness of the truncate gate
+no longer depends on the code path walking past the unlock line.
+Regression test: `TestWithWriteLock_AlwaysReleases` covers clean /
+error / panic return paths.
 
 ### Not Implemented (by design)
 
