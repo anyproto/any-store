@@ -69,6 +69,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -2445,6 +2446,35 @@ func (w *wal) checkpointPassive(dbFile fileHandle, master *masterStore) error {
 // The busy handler (issue 1.7 + 6.3) is invoked when waiting for reader locks
 // in FULL/RESTART/TRUNCATE modes. In PASSIVE mode it is never called.
 //
+// buildBackfillMap scans WAL frame headers in the range [lo, hi) and
+// returns a map of pgno → latest frame index in that range. Disk-mode
+// WAL only. The caller uses this map to write each page exactly once
+// during checkpoint, matching SQLite's walIteratorNext (wal.c:1758-1786).
+// Complexity: O((hi-lo) * walFrameSize) I/O.
+func (w *wal) buildBackfillMap(lo, hi uint32) (map[uint32]uint32, error) {
+	if hi <= lo {
+		return map[uint32]uint32{}, nil
+	}
+	frameSize := int64(walFrameSize) + int64(w.pageSize)
+	latest := make(map[uint32]uint32, hi-lo)
+	frameBuf := make([]byte, walFrameSize)
+	var frame walFrame
+	for i := lo; i < hi; i++ {
+		off := int64(walHeaderSize) + int64(i)*frameSize
+		n, err := w.file.ReadAt(frameBuf, off)
+		if err != nil {
+			return nil, err
+		}
+		if n != len(frameBuf) {
+			return nil, io.ErrUnexpectedEOF
+		}
+		frame.deserialize(frameBuf)
+		// Overwrite keeps the latest frame, since i increases monotonically.
+		latest[frame.pgno] = i
+	}
+	return latest, nil
+}
+
 // mxFrame source (multi-process): `nf` is read via authoritativeMxFrame,
 // which consults the SHM header under lockCheckpoint. This mirrors SQLite's
 // walCheckpoint using pWal->hdr.mxFrame. Reading the process-local
@@ -2637,8 +2667,6 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 			return errors.New("btree: WAL file closed")
 		}
 		frameSize := int64(walFrameSize) + int64(w.pageSize)
-		var frame walFrame
-		frameBuf := make([]byte, walFrameSize)
 		// Reuse w.ckptBuf for page data reads, avoiding per-checkpoint allocations.
 		// Matches SQLite's walCheckpoint (wal.c:2285-2304) which reuses the
 		// pager's pTmpSpace buffer across the entire backfill loop.
@@ -2647,38 +2675,45 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 		}
 		pageData := w.ckptBuf
 
-		for i := nBackfill; i < mxSafeFrame; i++ {
-			off := int64(walHeaderSize) + int64(i)*frameSize
-			n, err := w.file.ReadAt(frameBuf, off)
-			if err != nil {
-				backfillErr = err
-				break
+		// Phase 1: scan frames (nBackfill..mxSafeFrame), keep the latest
+		// frame per pgno. Matches SQLite walIteratorNext semantics
+		// (wal.c:1758-1786) — a page that appears multiple times in the
+		// WAL only needs its last version written to the DB file.
+		latest, err := w.buildBackfillMap(nBackfill, mxSafeFrame)
+		if err != nil {
+			backfillErr = err
+		} else {
+			// Phase 2: iterate pgnos in ascending order for sequential
+			// DB-file write locality (matches SQLite walIteratorNext which
+			// sorts per-segment and emits in pgno asc).
+			pgnos := make([]uint32, 0, len(latest))
+			for pgno := range latest {
+				pgnos = append(pgnos, pgno)
 			}
-			if n != len(frameBuf) {
-				backfillErr = io.ErrUnexpectedEOF
-				break
-			}
-			frame.deserialize(frameBuf)
+			sort.Slice(pgnos, func(a, b int) bool { return pgnos[a] < pgnos[b] })
 
-			n, err = w.file.ReadAt(pageData, off+walFrameSize)
-			if err != nil {
-				backfillErr = err
-				break
-			}
-			if n != len(pageData) {
-				backfillErr = io.ErrUnexpectedEOF
-				break
-			}
-
-			pageOffset := int64(frame.pgno-1) * pageSz
-			n, err = dbFile.WriteAt(pageData, pageOffset)
-			if err != nil {
-				backfillErr = err
-				break
-			}
-			if n != len(pageData) {
-				backfillErr = io.ErrShortWrite
-				break
+			for _, pgno := range pgnos {
+				frameIdx := latest[pgno]
+				off := int64(walHeaderSize) + int64(frameIdx)*frameSize
+				n, err := w.file.ReadAt(pageData, off+walFrameSize)
+				if err != nil {
+					backfillErr = err
+					break
+				}
+				if n != len(pageData) {
+					backfillErr = io.ErrUnexpectedEOF
+					break
+				}
+				pageOffset := int64(pgno-1) * pageSz
+				n, err = dbFile.WriteAt(pageData, pageOffset)
+				if err != nil {
+					backfillErr = err
+					break
+				}
+				if n != len(pageData) {
+					backfillErr = io.ErrShortWrite
+					break
+				}
 			}
 		}
 	}
