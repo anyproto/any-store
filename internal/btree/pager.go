@@ -324,6 +324,16 @@ func (p *pager) open() error {
 		return err
 	}
 
+	// VersionValidFor integrity sentinel: when non-zero, must equal
+	// FileChangeCount — a divergence means a writer crashed mid-update
+	// and the header on disk is half-new / half-old. Treat
+	// VersionValidFor==0 as "not initialized by this writer" (legacy
+	// DBs, pre-P3.3 test fixtures) and skip the check rather than
+	// reject. Matches SQLite's defensive-read-only interpretation.
+	if p.header.VersionValidFor != 0 && p.header.VersionValidFor != p.header.FileChangeCount {
+		return fmt.Errorf("%w: VersionValidFor=%d FileChangeCount=%d", ErrCorrupt, p.header.VersionValidFor, p.header.FileChangeCount)
+	}
+
 	p.pageSize = p.header.PageSize
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
 	p.dbSize.Store(p.header.DatabaseSize)
@@ -1461,6 +1471,11 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	if schemaChanged {
 		p.header.SchemaCookie++
 	}
+	// Keep VersionValidFor in lockstep with FileChangeCount. pager.open
+	// asserts they match; a writer that advances FileChangeCount must
+	// also update VersionValidFor or the next opener will reject the
+	// DB as corrupt.
+	p.header.VersionValidFor = p.header.FileChangeCount
 
 	// Ensure page 1 is always written with the updated header (fix 5.3).
 	pg1, err := p.getWritablePage(1)
