@@ -1162,6 +1162,14 @@ type wal struct {
 	// SQLite passes pTmpSpace from the pager rather than storing it on the WAL.
 	ckptBuf []byte
 
+	// ckptLatest and ckptPgnos are scratch for the checkpoint dedup pass
+	// (buildBackfillMap + pgno-sorted iterate). Reused across checkpoints
+	// because only one checkpoint runs at a time (lockCheckpoint exclusive).
+	// Clear-and-reuse avoids the per-checkpoint map/slice allocation that
+	// otherwise shows up in BatchUpdate benches.
+	ckptLatest map[uint32]uint32
+	ckptPgnos  []uint32
+
 	// headerOnDisk is false when the WAL file is empty (0 bytes) and the
 	// header has not yet been written to disk. The header is written lazily
 	// on the first writeFrames call. This matches SQLite's behavior where
@@ -2447,16 +2455,22 @@ func (w *wal) checkpointPassive(dbFile fileHandle, master *masterStore) error {
 // in FULL/RESTART/TRUNCATE modes. In PASSIVE mode it is never called.
 //
 // buildBackfillMap scans WAL frame headers in the range [lo, hi) and
-// returns a map of pgno → latest frame index in that range. Disk-mode
-// WAL only. The caller uses this map to write each page exactly once
-// during checkpoint, matching SQLite's walIteratorNext (wal.c:1758-1786).
+// populates w.ckptLatest with pgno → latest frame index. Reuses the
+// scratch map across checkpoints — safe because lockCheckpoint is held
+// exclusive while buildBackfillMap runs. Disk-mode WAL only.
+// Matches SQLite's walIteratorNext (wal.c:1758-1786).
 // Complexity: O((hi-lo) * walFrameSize) I/O.
 func (w *wal) buildBackfillMap(lo, hi uint32) (map[uint32]uint32, error) {
+	if w.ckptLatest == nil {
+		// First checkpoint: allocate with a capacity hint.
+		w.ckptLatest = make(map[uint32]uint32, hi-lo)
+	} else {
+		clear(w.ckptLatest)
+	}
 	if hi <= lo {
-		return map[uint32]uint32{}, nil
+		return w.ckptLatest, nil
 	}
 	frameSize := int64(walFrameSize) + int64(w.pageSize)
-	latest := make(map[uint32]uint32, hi-lo)
 	frameBuf := make([]byte, walFrameSize)
 	var frame walFrame
 	for i := lo; i < hi; i++ {
@@ -2470,9 +2484,9 @@ func (w *wal) buildBackfillMap(lo, hi uint32) (map[uint32]uint32, error) {
 		}
 		frame.deserialize(frameBuf)
 		// Overwrite keeps the latest frame, since i increases monotonically.
-		latest[frame.pgno] = i
+		w.ckptLatest[frame.pgno] = i
 	}
-	return latest, nil
+	return w.ckptLatest, nil
 }
 
 // mxFrame source (multi-process): `nf` is read via authoritativeMxFrame,
@@ -2643,17 +2657,28 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 
 	if w.inMemory {
 		// Phase 1: latest frame per pgno. Same reasoning as disk mode
-		// (see SQLite walIteratorNext wal.c:1758-1786).
-		latest := make(map[uint32]uint32, mxSafeFrame-nBackfill)
+		// (see SQLite walIteratorNext wal.c:1758-1786). Reuse the same
+		// w.ckptLatest / w.ckptPgnos scratch the disk path uses —
+		// lockCheckpoint serializes this caller.
+		if w.ckptLatest == nil {
+			w.ckptLatest = make(map[uint32]uint32, mxSafeFrame-nBackfill)
+		} else {
+			clear(w.ckptLatest)
+		}
+		latest := w.ckptLatest
 		for i := nBackfill; i < mxSafeFrame; i++ {
 			latest[w.memFrames[i].pgno] = i
 		}
 
 		// Phase 2: pgno-sorted iteration for write locality.
-		pgnos := make([]uint32, 0, len(latest))
+		pgnos := w.ckptPgnos[:0]
+		if cap(pgnos) < len(latest) {
+			pgnos = make([]uint32, 0, len(latest))
+		}
 		for pgno := range latest {
 			pgnos = append(pgnos, pgno)
 		}
+		w.ckptPgnos = pgnos
 		sort.Slice(pgnos, func(a, b int) bool { return pgnos[a] < pgnos[b] })
 
 		for _, pgno := range pgnos {
@@ -2697,11 +2722,16 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 		} else {
 			// Phase 2: iterate pgnos in ascending order for sequential
 			// DB-file write locality (matches SQLite walIteratorNext which
-			// sorts per-segment and emits in pgno asc).
-			pgnos := make([]uint32, 0, len(latest))
+			// sorts per-segment and emits in pgno asc). Reuse w.ckptPgnos
+			// scratch — lockCheckpoint serializes this caller.
+			pgnos := w.ckptPgnos[:0]
+			if cap(pgnos) < len(latest) {
+				pgnos = make([]uint32, 0, len(latest))
+			}
 			for pgno := range latest {
 				pgnos = append(pgnos, pgno)
 			}
+			w.ckptPgnos = pgnos
 			sort.Slice(pgnos, func(a, b int) bool { return pgnos[a] < pgnos[b] })
 
 			for _, pgno := range pgnos {
