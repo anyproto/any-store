@@ -79,6 +79,21 @@ func newPlatformShm(path string) (shm, error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("btree: acquire DMS shared lock: %w", err)
 	}
+
+	// If the file is freshly created (size == 0), truncate to 3 bytes as
+	// a "known-fresh" diagnostic marker — matches SQLite's unixOpenSharedMemory
+	// (os_unix.c:4902 robust_ftruncate(hShm, 3)). The marker size is
+	// deliberately smaller than walIndexHdrSize (48), so any subsequent
+	// opener that mmaps a 3-byte file knows it's a blank-slate shm and not
+	// a corruption. The first region() call will Truncate to shmRegionSize,
+	// so this 3-byte state is transient.
+	if info, err := f.Stat(); err == nil && info.Size() == 0 {
+		if err := f.Truncate(3); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("btree: ftruncate(shm, 3) marker: %w", err)
+		}
+	}
+
 	return s, nil
 }
 
