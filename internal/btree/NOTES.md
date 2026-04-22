@@ -1384,11 +1384,44 @@ The cursor path stores only page numbers, requiring re-fetching pages and
 re-scanning for insertion points on splits. SQLite caches page pointers + cell
 indices in the cursor stack (`apPage[]`/`aiIdx[]`).
 
-**No "Nearby" Allocation Hint for Overflow Pages** -- Severity: Minor
+**Nearby Allocation Hint for Overflow Pages** -- Resolved 2026-04-22
 
-SQLite passes the previous overflow page number as a locality hint to
-`allocateBtreePage()`. Our pages come from wherever the freelist yields them,
-potentially scattering overflow chains across the file.
+`pager.allocatePageNear(nearby)` accepts an optional locality hint
+(nearby == 0 keeps the legacy last-leaf pop). When nearby > 0 and a
+freelist trunk is selected, the leaf with minimum absolute distance
+to `nearby` is picked — matches SQLite `btree.c:6678-6699`
+(BTALLOC_ANY + nearby path).
+
+`writeOverflowChainMulti` threads the previous overflow page's pgno
+as the hint on each subsequent allocation, matching SQLite's
+`fillInCell` at `btree.c:7197` (`allocateBtreePage(pBt, &pOvfl,
+&pgnoOvfl, pgnoOvfl, 0)`) and the first-page zero-hint init at
+`btree.c:7131` (`pgnoOvfl = 0`). Result: overflow chains for a single
+cell allocated from scattered freelist leaves live in clustered
+runs on disk, improving sequential-read and OS-prefetch locality —
+relevant for large-blob workloads (10 MB payload = ~2560 overflow
+pages).
+
+Measured delta on `BenchmarkOverflow10MB_FindIdCold`: +2.9% trend
+(p=0.132, within noise). The bench uses a fresh DB where overflow
+chains are allocated via monotonic `dbSize` growth and are already
+contiguous — the hint only changes allocation order when the
+freelist has scattered leaves. Real workloads with document churn
+(update/delete/re-insert cycles) will see benefit; current bench
+doesn't model that. See
+`any-store-tests/results/session_perf/benchstat_nearby_overflow.txt`.
+
+Covered by `TestAllocateFromFreelist_NearbyHint`,
+`TestAllocateFromFreelist_NearbyZeroIsLegacyBehavior`, and
+`TestWriteOverflowChain_ContiguousOnFreshFreelist` (in
+`pager_test.go`).
+
+**Out of scope:** `BTALLOC_EXACT` and `BTALLOC_LE` modes (used in
+SQLite for auto-vacuum relocation; any-store has no auto-vacuum, see
+`btree.c:6515`). btree split / root allocation callers don't use
+the hint — a future optimization could pass the parent-page pgno as
+nearby on split (matches `btree.c:8666` style) but would require
+benchmark justification.
 
 ### Freelist
 
