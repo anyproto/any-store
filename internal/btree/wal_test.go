@@ -2,6 +2,7 @@ package btree
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1243,4 +1244,122 @@ func TestRollbackCleanupAcrossSegments(t *testing.T) {
 		"segment-0 frame 100 must still be reachable")
 	assert.Equal(t, committed, wi.shmHashGet(200, committed, 1),
 		"segment-0 frame 200 must still be reachable")
+}
+
+// clearHeaderForTest zeroes the shm header so the next reader's
+// readHeader() returns valid=false and ensureHeaderInitialized takes
+// the slow path. Test-only helper.
+func (wi *walIndex) clearHeaderForTest() error {
+	region, err := wi.shm.region(0, true)
+	if err != nil {
+		return err
+	}
+	for i := 0; i < walIndexHdrSize*2; i++ {
+		region[i] = 0
+	}
+	return nil
+}
+
+// TestEnsureHeaderInitialized_SurfacesBusyRecovery exercises the
+// slow-path in ensureHeaderInitialized where the RECOVER lock is held
+// exclusive (simulating "peer is mid-walIndexRecover"). The helper
+// must return ErrBusyRecovery (not the generic errWALRetry) so upstream
+// callers can back off via busyHandler instead of spinning.
+//
+// Uses a single wal instance: the in-process mmapShm.locks[] counters
+// serialize exclusive-vs-exclusive on the same slot even within the
+// same process, so preholding RECOVER exclusive is enough to trip the
+// helper's third branch.
+func TestEnsureHeaderInitialized_SurfacesBusyRecovery(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "t.db")
+
+	w := newWal(dbPath, 4096)
+	if err := w.open(); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = w.close(false) })
+
+	// Force slow path by zeroing the shm header.
+	if err := w.index.clearHeaderForTest(); err != nil {
+		t.Fatalf("clear shm header: %v", err)
+	}
+
+	// Prehold RECOVER exclusive — representing "peer is mid-recovery".
+	if err := w.index.lock(lockRecover, lockExclusive); err != nil {
+		t.Fatalf("acquire RECOVER exclusive: %v", err)
+	}
+	defer func() { _ = w.index.unlock(lockRecover, lockExclusive) }()
+
+	_, err := w.ensureHeaderInitialized()
+	if !errors.Is(err, ErrBusyRecovery) {
+		t.Fatalf("expected ErrBusyRecovery, got %v", err)
+	}
+}
+
+// buildWalHeader builds a serialized WAL header with configurable fields.
+// Callers override the defaults to craft malformed inputs.
+func buildWalHeader(t *testing.T, version, pageSize uint32) []byte {
+	t.Helper()
+	buf := make([]byte, walHeaderSize)
+	binary.BigEndian.PutUint32(buf[0:4], walMagic)
+	binary.BigEndian.PutUint32(buf[4:8], version)
+	binary.BigEndian.PutUint32(buf[8:12], pageSize)
+	binary.BigEndian.PutUint32(buf[12:16], 0)          // checkpoint
+	binary.BigEndian.PutUint32(buf[16:20], 0xdeadbeef) // salt1
+	binary.BigEndian.PutUint32(buf[20:24], 0xcafef00d) // salt2
+	c1, c2 := walChecksum(buf[0:24], 0, 0)
+	binary.BigEndian.PutUint32(buf[24:28], c1)
+	binary.BigEndian.PutUint32(buf[28:32], c2)
+	return buf
+}
+
+// TestWalHeaderDeserialize_GoodHeader sanity-checks the helper — a
+// well-formed header of the current version and default page size must
+// deserialize cleanly.
+func TestWalHeaderDeserialize_GoodHeader(t *testing.T) {
+	buf := buildWalHeader(t, walVersion, DefaultPageSize)
+	var h walHeader
+	if err := h.deserialize(buf); err != nil {
+		t.Fatalf("good header rejected: %v", err)
+	}
+	if h.version != walVersion || h.pageSize != DefaultPageSize {
+		t.Fatalf("fields mis-parsed: version=%d pageSize=%d", h.version, h.pageSize)
+	}
+}
+
+// TestWalHeaderDeserialize_RejectsBadVersion mirrors SQLite's
+// walIndexRecover rejection at wal.c:1406-1410.
+func TestWalHeaderDeserialize_RejectsBadVersion(t *testing.T) {
+	buf := buildWalHeader(t, walVersion+1, DefaultPageSize)
+	var h walHeader
+	err := h.deserialize(buf)
+	if !errors.Is(err, ErrWALCorrupt) {
+		t.Fatalf("bad version should be ErrWALCorrupt, got %v", err)
+	}
+}
+
+// TestWalHeaderDeserialize_RejectsBadPageSize mirrors SQLite's
+// walIndexRecover rejection at wal.c:1414-1419 (non-power-of-2, too
+// small, too large, zero).
+func TestWalHeaderDeserialize_RejectsBadPageSize(t *testing.T) {
+	cases := []struct {
+		name string
+		ps   uint32
+	}{
+		{"zero", 0},
+		{"non-power-of-2", 4097},
+		{"too small", MinPageSize / 2},
+		{"too large", MaxPageSize * 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := buildWalHeader(t, walVersion, tc.ps)
+			var h walHeader
+			err := h.deserialize(buf)
+			if !errors.Is(err, ErrWALCorrupt) {
+				t.Fatalf("bad pageSize %d should be ErrWALCorrupt, got %v", tc.ps, err)
+			}
+		})
+	}
 }

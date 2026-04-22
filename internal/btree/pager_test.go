@@ -2,6 +2,7 @@ package btree
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"os"
@@ -7634,4 +7635,92 @@ func TestPagerTempPageSlabRoundtrip(t *testing.T) {
 	assert.NotNil(t, pg2.data, "re-acquired page should have fresh slab buffer")
 	assert.Equal(t, 4096, len(pg2.data))
 	p.recycleTempPage(pg2)
+}
+
+// TestWithWriteLock_AlwaysReleases exercises every termination path of
+// the closure passed to pager.withWriteLock (clean return, error return,
+// panic) and asserts WAL_WRITE_LOCK is released in each case. A leak
+// would starve the next lockWrite attempt.
+func TestWithWriteLock_AlwaysReleases(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   func() error
+	}{
+		{"clean return", func() error { return nil }},
+		{"error return", func() error { return errors.New("boom") }},
+		{"panic", func() error { panic("boom") }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dbPath := filepath.Join(dir, "t.db")
+			db, err := Open(dbPath, Options{})
+			if err != nil {
+				t.Fatalf("open: %v", err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+
+			// pager.withWriteLock's contract is "must be called with p.mu
+			// held". Take it here to honor that contract.
+			db.pager.mu.Lock()
+			defer db.pager.mu.Unlock()
+
+			call := func() {
+				defer func() {
+					if r := recover(); r != nil {
+						// swallow the planned panic; the outer defer
+						// release is what the test observes.
+						_ = r
+					}
+				}()
+				_ = db.pager.withWriteLock(func(locked bool) error {
+					return tc.fn()
+				})
+			}
+			call()
+
+			// After the helper returns, we must be able to acquire
+			// WAL_WRITE_LOCK exclusive (same process — uses in-process
+			// counters). A leaked lock would surface as ErrBusy.
+			if err := db.pager.wal.index.lock(lockWrite, lockExclusive); err != nil {
+				t.Fatalf("lockWrite exclusive after withWriteLock: %v (lock leaked?)", err)
+			}
+			_ = db.pager.wal.index.unlock(lockWrite, lockExclusive)
+		})
+	}
+}
+
+// TestP3_3_VersionValidForMismatchRejected verifies that pager.open
+// refuses to open a DB where VersionValidFor != FileChangeCount AND
+// VersionValidFor != 0. The zero case is an escape hatch for legacy /
+// test fixtures that never wrote the field.
+func TestP3_3_VersionValidForMismatchRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tampered.db")
+
+	// Open, commit a write to advance FileChangeCount AND VersionValidFor
+	// in lockstep, close.
+	db, err := testOpen(t, path, DefaultOptions())
+	require.NoError(t, err)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace("ns")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+	require.NoError(t, db.Close())
+
+	// Tamper: set VersionValidFor (offset 92) to something that is
+	// both non-zero AND != the on-disk FileChangeCount.
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	binary.BigEndian.PutUint32(data[92:96], 0x42)
+	require.NoError(t, os.WriteFile(path, data, 0644))
+
+	// Reopen — must reject.
+	_, err = testOpen(t, path, DefaultOptions())
+	if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("expected ErrCorrupt on VersionValidFor mismatch, got %v", err)
+	}
 }

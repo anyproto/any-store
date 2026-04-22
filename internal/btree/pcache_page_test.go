@@ -3837,3 +3837,58 @@ func TestCursorWithReaderCache(t *testing.T) {
 	cursor.Close()
 	require.NoError(t, rtx.Rollback())
 }
+
+// TestP3_1_FreshShmMarkerTruncatesToThree verifies that a newly created
+// shm file is ftruncate'd to exactly 3 bytes before any region is
+// allocated. Matches SQLite's os_unix.c:4902.
+func TestP3_1_FreshShmMarkerTruncatesToThree(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fresh.shm")
+
+	s, err := newPlatformShm(path)
+	if err != nil {
+		t.Fatalf("newPlatformShm: %v", err)
+	}
+	defer s.close(false)
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Size() != 3 {
+		t.Fatalf("fresh shm size = %d, want 3 (SQLite os_unix.c:4902 marker)", info.Size())
+	}
+}
+
+// TestP3_1_ExistingShmNotTruncated verifies the 3-byte truncate does
+// NOT fire when opening an already-populated shm file (second opener).
+func TestP3_1_ExistingShmNotTruncated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "populated.shm")
+
+	sA, err := newPlatformShm(path)
+	if err != nil {
+		t.Fatalf("open A: %v", err)
+	}
+	if _, err := sA.region(0, true); err != nil {
+		t.Fatalf("region: %v", err)
+	}
+	grownInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat after grow: %v", err)
+	}
+	if grownInfo.Size() <= 3 {
+		t.Fatalf("after region(0, true), size should exceed 3, got %d", grownInfo.Size())
+	}
+
+	sB, err := newPlatformShm(path)
+	if err != nil {
+		t.Fatalf("open B: %v", err)
+	}
+	defer sB.close(false)
+	defer sA.close(false)
+	sizeB, _ := os.Stat(path)
+	if sizeB.Size() != grownInfo.Size() {
+		t.Fatalf("opener B changed shm size %d → %d; should leave it alone", grownInfo.Size(), sizeB.Size())
+	}
+}
