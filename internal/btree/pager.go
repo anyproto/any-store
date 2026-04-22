@@ -169,6 +169,16 @@ type pager struct {
 	// Local bool — no atomic/global reads on hot path.
 	useSlab bool
 
+	// mmapSize caps the DB-file mmap region. 0 disables. Populated
+	// from Options.MmapSize at open time; the dbMmap fetcher reads
+	// this via newDBMmap. See mmap_db.go.
+	mmapSize int64
+
+	// dbMmap is the optional mmap-backed DB-file reader. nil or
+	// disabled on platforms without mmap support / when mmapSize==0.
+	// See mmap_db.go.
+	dbMmap *dbMmap
+
 	// writerWalSlot is the writer's WAL reader slot number, stored here
 	// so Close can release it when force-rolling back an abandoned WriteTx.
 	// Written by BeginWrite before pager.beginWrite() (which stores
@@ -270,6 +280,11 @@ func (p *pager) open() error {
 		return err
 	}
 	p.file = f
+
+	// Initialize the optional mmap reader. No syscalls here — the
+	// underlying syscall.Mmap is deferred until the first fetch() to
+	// match SQLite's lazy initialization in unixFetch (os_unix.c:5727).
+	p.dbMmap = newDBMmap(f, p.mmapSize)
 
 	// Acquire a shared flock on the DB file. Held for the lifetime of
 	// this pager. Any closer attempting to upgrade to exclusive will
@@ -2239,6 +2254,14 @@ func (p *pager) close() error {
 	}
 
 	p.writerCache.destroy()
+
+	// Tear down the mmap reader before closing the file so the fd
+	// remains valid during munmap. Matches SQLite's unixUnmapfile
+	// ordering (os_unix.c:5562-5566, called before the fd close).
+	if p.dbMmap != nil {
+		_ = p.dbMmap.unmap()
+		p.dbMmap = nil
+	}
 
 	if p.file != nil {
 		err := p.file.Close()

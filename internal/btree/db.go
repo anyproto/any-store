@@ -231,6 +231,7 @@ func Open(path string, opts Options) (*DB, error) {
 	p.inProcess = opts.InProcess
 	p.noCommitSync = opts.NoCommitSync
 	p.inMemory = opts.InMemory
+	p.mmapSize = opts.MmapSize
 	if err := p.open(); err != nil {
 		return nil, err
 	}
