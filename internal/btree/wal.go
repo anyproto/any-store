@@ -2642,10 +2642,23 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	var backfillErr error
 
 	if w.inMemory {
+		// Phase 1: latest frame per pgno. Same reasoning as disk mode
+		// (see SQLite walIteratorNext wal.c:1758-1786).
+		latest := make(map[uint32]uint32, mxSafeFrame-nBackfill)
 		for i := nBackfill; i < mxSafeFrame; i++ {
-			mf := &w.memFrames[i]
+			latest[w.memFrames[i].pgno] = i
+		}
+
+		// Phase 2: pgno-sorted iteration for write locality.
+		pgnos := make([]uint32, 0, len(latest))
+		for pgno := range latest {
+			pgnos = append(pgnos, pgno)
+		}
+		sort.Slice(pgnos, func(a, b int) bool { return pgnos[a] < pgnos[b] })
+
+		for _, pgno := range pgnos {
+			mf := &w.memFrames[latest[pgno]]
 			if dbFile != nil {
-				// Disk mode: write to DB file
 				pageOffset := int64(mf.pgno-1) * pageSz
 				n, err := dbFile.WriteAt(mf.data, pageOffset)
 				if err != nil {
@@ -2657,7 +2670,6 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 					break
 				}
 			} else if master != nil {
-				// InMemory mode: write to masterStore
 				master.writePage(mf.pgno, mf.data)
 			}
 		}
