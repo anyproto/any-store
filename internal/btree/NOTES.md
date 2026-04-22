@@ -420,11 +420,13 @@ intentional.
    inode locks" gotcha when multiple goroutines open the same DB path in a
    single process.
 
-2. **`robust_ftruncate(hShm, 3)` marker — still missing.** SQLite's
-   first-opener truncates the shm file to 3 bytes (`os_unix.c:4902`) as a
-   "known-fresh" diagnostic marker. We don't; our header checksum catches
-   corruption, but the 3-byte marker would make "power-loss mid-init"
-   diagnosable. Low-priority follow-up.
+2. **`robust_ftruncate(hShm, 3)` marker — resolved 2026-04-22.**
+   `newPlatformShm` now truncates a freshly created shm file to 3 bytes
+   immediately after acquiring the DMS lock — matches SQLite's
+   `os_unix.c:4902`. The marker is smaller than `walIndexHdrSize`
+   (48 bytes), so subsequent openers that mmap a 3-byte file know it's
+   blank-slate. The first `region(0, true)` call grows the file to
+   `shmRegionSize`, so the marker state is transient.
 
 3. **Close ordering — aligned with SQLite.** Both implementations unlink
    before closing the shm fd (SQLite: `os_unix.c:5538-5541`; ours:
@@ -1204,15 +1206,21 @@ mmap-based reads on the database file. SHM mmap is correctly implemented.
 No validation that the WAL file's salt matches the database header's salt.
 Would detect stale or mismatched WAL files.
 
-**Missing VersionValidFor Usage** -- Severity: Minor
+**VersionValidFor Integrity Check** -- Resolved 2026-04-22
 
-The `VersionValidFor` field is stored in the database header but never used for
-integrity validation.
+`pager.open` compares `VersionValidFor` against `FileChangeCount`
+after deserializing the DB header and returns `ErrCorrupt` on a
+nonzero mismatch (zero is treated as "field not tracked" — legacy /
+test fixtures skip the check). Commit path now advances both fields
+in lockstep. Catches crash-mid-header-update corruption.
 
-**Auto-Checkpoint Errors Silently Swallowed** -- Severity: Minor
+**Auto-Checkpoint Errors Surfaced** -- Resolved 2026-04-22
 
-`tryCheckpoint()` errors are discarded. Acceptable for PASSIVE-like semantics
-but inconsistent with FULL checkpoint behavior.
+`tx.pager.tryCheckpoint()`'s result (error or nil) is stored on
+`DB.lastAutoCheckpointErr` and exposed via
+`DB.LastAutoCheckpointError() error`. Monitoring code can poll the
+accessor; the auto-checkpoint itself remains best-effort (returning
+the error to the commit caller would change the application contract).
 
 ### Page Cache Memory Management (page_slab.go, pcache.go, db.go)
 
