@@ -1196,10 +1196,45 @@ auto-checkpoint behavior. PASSIVE mode does not block writers or readers.
 
 ### Pager / Cache
 
-**No mmap for Database File Reads** -- Severity: Minor
+**mmap for Database File Reads** -- Resolved 2026-04-22
 
-All reads use `ReadAt` syscalls. SQLite supports `PRAGMA mmap_size` for
-mmap-based reads on the database file. SHM mmap is correctly implemented.
+Opt-in via `Config.MmapSize int64` (bytes, 0 disables — matches SQLite's
+`PRAGMA mmap_size` default). When enabled, DB-file page reads memcpy
+from an `mmap`-backed region instead of calling `ReadAt` per page.
+Writes remain `WriteAt` and are coherent via the OS unified page
+cache (linux/darwin).
+
+Model: SQLite's `unixFetch` / `unixUnfetch`
+(`sqlitec/src/os_unix.c:5714-5772`) simplified by dropping the
+zero-copy fetch pointer (we copy out) and the `nFetchOut` reference
+counting that goes with it. Mapping is lazy (first fetch calls
+`syscall.Mmap`, analog to `os_unix.c:5727`), remaps on miss for
+growth (`os_unix.c:5570-5640` analog via `munmap` + `mmap`), and
+unmaps on `pager.close` (`os_unix.c:5562-5566`). Read-path gate
+follows `getPageMMap → getPageNormal` shape at `pager.c:5670-5710`.
+
+Measured delta on `BenchmarkOverflow10MB_FindId` with
+`MmapSize=64 MiB` (warm-cache): sec/op -6.8% trend, p=0.093 — not
+statistically significant, but direction right. See
+`any-store-tests/results/session_perf/benchstat_mmap_reads.txt`.
+Larger wins expected on cold-cache first reads (not benched) and
+future partial-read APIs. Linux/darwin + amd64/arm64 only; no-op on
+other platforms.
+
+**Race safety:** `dbMmap.readAt(dst, off)` copies into `dst` inside
+its RLock so concurrent `remap`/`unmap` (under Lock) cannot munmap
+the backing memory mid-copy. Covered by
+`TestDBMmap_ConcurrentReadVsRemap` which fails under `-race` in the
+earlier `fetch(off, n) → slice` design and passes post-fix.
+
+**Known follow-ups:** (1) If VACUUM / DB-file shrink is ever added,
+`dbMmap.remap` must also shrink the mapping to avoid SIGBUS on the
+now-unbacked tail (SQLite handles this in `unixTruncate` at
+`os_unix.c:3999-4001`). (2) Dynamic resize via FCNTL is not
+supported — `MmapSize` is fixed at `Open`. (3) The copy-out model
+loses SQLite's zero-copy win; a follow-up could add a zero-copy path
+with `nFetchOut`-style refcounting if the memcpy cost becomes
+material (measurement shows it is secondary to syscall cost).
 
 **Missing Salt Cross-Check** -- Severity: Minor
 
