@@ -1349,21 +1349,22 @@ potentially scattering overflow chains across the file.
 
 ### Freelist
 
-**Freelist Formula Ignores Reserved Space** -- Severity: Minor
+**Freelist Formula Respects Reserved Space** -- Resolved (stale drift note)
 
-Uses `(pageSize - 8) / 4` instead of `(usableSize - 8) / 4` for max leaves
-per trunk. Correct while `ReservedSpace == 0`. Would cause corruption if
-reserved space were ever enabled.
+`freelistMaxLeaves()` uses `(p.usableSize() - 8) / 4` where `usableSize`
+is `pageSize - ReservedSpace`. Correct regardless of ReservedSpace
+value. See `pager.go:868-870`.
 
 **No BTALLOC_EXACT / BTALLOC_LE Modes** -- Severity: Minor
 
 Only `BTALLOC_ANY` allocation mode. `BTALLOC_EXACT` and `BTALLOC_LE` are only
 needed for auto-vacuum and locality hints.
 
-**Reserved Space Not Used in Overflow Computations** -- Severity: Minor
+**Reserved Space Used in Overflow Computations** -- Resolved (stale drift note)
 
-Overflow page usable size uses raw `pageSize - 4` instead of `usableSize - 4`.
-Dormant while `ReservedSpace == 0`.
+`overflowPageUsable(usableSize int)` takes `usableSize` as its parameter
+and all 7 callers pass `p.usableSize()` (which is
+`pageSize - ReservedSpace`). See `page.go:116-118`.
 
 ### Multi-Process WAL Write Safety -- FIXED
 
