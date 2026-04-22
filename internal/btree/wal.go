@@ -2699,7 +2699,15 @@ func (w *wal) rewriteChecksums(iLast uint32) error {
 		}
 	}
 
-	// Success — reset for next transaction. SQLite wal.c:3993.
+	// Success — propagate the final chain cksum to w.cksum1/cksum2 so
+	// the NEXT tx's first appended frame chains from the correct seed.
+	// Without this update, w.cksum1/cksum2 would still hold the stale
+	// in-memory accumulator that skipped reused frames, breaking the
+	// chain on the next tx (recovery would reject the next-tx frames).
+	w.cksum1 = s1
+	w.cksum2 = s2
+
+	// Reset for next transaction. SQLite wal.c:3993.
 	w.iReCksum = 0
 	return nil
 }
