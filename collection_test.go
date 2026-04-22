@@ -628,3 +628,52 @@ func BenchmarkOverflow10MB_FindIdCold(b *testing.B) {
 		b.StartTimer()
 	}
 }
+
+// BenchmarkWAL_RepeatedDirtyWithinTx measures WAL file growth under
+// a workload that repeatedly updates the same documents within a
+// single transaction. Without frame-reuse, each update appends a
+// new WAL frame. With frame-reuse, the existing frame is overwritten
+// in place. Reports per-op time AND the resulting WAL file size at
+// the end of the run via the `wal_bytes` custom metric.
+func BenchmarkWAL_RepeatedDirtyWithinTx(b *testing.B) {
+	const (
+		nDocs    = 10
+		nUpdates = 20
+	)
+
+	tmpDir, err := os.MkdirTemp("", "bench-reuse-*")
+	require.NoError(b, err)
+	b.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+	dbPath := filepath.Join(tmpDir, "bench.db")
+
+	db, err := Open(ctx, dbPath, &Config{DisableAutoCheckpoint: true})
+	require.NoError(b, err)
+	b.Cleanup(func() { _ = db.Close() })
+	coll, err := db.CreateCollection(ctx, "docs")
+	require.NoError(b, err)
+
+	// Seed.
+	for i := range nDocs {
+		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"v":0,"payload":"%s"}`, i, strings.Repeat("x", 500)))
+		require.NoError(b, coll.Insert(ctx, doc))
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		tx, err := coll.WriteTx(ctx)
+		require.NoError(b, err)
+		for u := range nUpdates {
+			for i := range nDocs {
+				doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"v":%d,"payload":"%s"}`, i, u, strings.Repeat("x", 500)))
+				require.NoError(b, coll.UpsertOne(tx.Context(), doc))
+			}
+		}
+		require.NoError(b, tx.Commit())
+	}
+	b.StopTimer()
+
+	if info, err := os.Stat(dbPath + "-wal"); err == nil {
+		b.ReportMetric(float64(info.Size()), "wal_bytes")
+	}
+}
