@@ -1168,9 +1168,12 @@ type wal struct {
 	// If nil, lock failures return ErrBusy immediately (issue 1.7).
 	busyHandler BusyHandler
 
-	// forceBusySnapshotForTest, when true, makes beginWriteWithSnapshot
-	// return ErrBusySnapshot unconditionally. Test hook only.
-	forceBusySnapshotForTest atomic.Bool
+	// Test hook — intentionally commented out to avoid a per-BeginWrite
+	// atomic.Load on the production hot path. Uncomment together with the
+	// matching check in beginWriteWithSnapshot to re-enable the two tests
+	// in busy_test.go (TestBeginWrite_SurfacesBusySnapshotAfterBoundedRetries,
+	// TestBeginWrite_BusySnapshotRoutesThroughBusyHandler).
+	// forceBusySnapshotForTest atomic.Bool
 
 	// writerHdr is the writer's private copy of the SHM header, updated after
 	// each successful commit (writeFrames) and after re-sync in beginWrite().
@@ -2250,9 +2253,12 @@ func (w *wal) beginWrite() (stateChanged bool, err error) {
 // beginWriteWithSnapshot is the generalized form: caller supplies the
 // read snapshot for the BUSY_SNAPSHOT check. See beginWrite for semantics.
 func (w *wal) beginWriteWithSnapshot(readSnap WalIndexHdr) (stateChanged bool, err error) {
-	if w.forceBusySnapshotForTest.Load() {
-		return false, ErrBusySnapshot
-	}
+	// Test hook — kept commented to avoid an atomic.Load on every BeginWrite.
+	// Uncomment with the matching field in the wal struct to run the two
+	// ErrBusySnapshot tests in busy_test.go.
+	// if w.forceBusySnapshotForTest.Load() {
+	// 	return false, ErrBusySnapshot
+	// }
 	if err := walBusyLock(w.index, w.busyHandler, lockWrite, lockExclusive); err != nil {
 		return false, err
 	}
