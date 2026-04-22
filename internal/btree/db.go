@@ -71,6 +71,19 @@ type Options struct {
 	// InitPageBuffer (anystore). When false (default), page buffers use
 	// sync.Pool, matching SQLite's default malloc-based allocation.
 	UsePageSlab bool
+
+	// MmapSize enables mmap-backed reads of the database file up to the
+	// given byte limit. Zero disables mmap (reads use pread via ReadAt).
+	// Values > 0 allocate a shared mapping of min(DBsize, MmapSize)
+	// bytes; reads falling within the mapping memcpy from it instead of
+	// issuing pread. Writes still go through WriteAt and are coherent
+	// via the OS unified page cache. Matches SQLite's PRAGMA mmap_size
+	// (sqlitec/src/os_unix.c:4240 SQLITE_FCNTL_MMAP_SIZE).
+	//
+	// Recommended: 64 << 20 (64 MiB) to 512 << 20 (512 MiB) on workloads
+	// with frequent large-blob or repeat-page reads. Linux/darwin +
+	// amd64/arm64 only; no-op on other platforms.
+	MmapSize int64
 }
 
 // DefaultOptions returns default database options.

@@ -132,6 +132,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		DisableAutoCheckpoint: config.DisableAutoCheckpoint,
 		AutoCheckpointAfter:   config.AutoCheckpointAfter,
 		UsePageSlab:           config.UseGlobalPageBuffer,
+		MmapSize:              config.MmapSize,
 	}
 
 	var err error

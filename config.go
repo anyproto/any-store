@@ -56,6 +56,13 @@ type Config struct {
 	// SQLite's default malloc mode).
 	UseGlobalPageBuffer bool
 
+	// MmapSize enables mmap-backed reads of the database file up to the
+	// given byte limit. Zero disables mmap (reads use pread via ReadAt).
+	// Matches SQLite's PRAGMA mmap_size. Recommended 64-512 MiB for
+	// large-blob read workloads. Linux/darwin + amd64/arm64 only; no-op
+	// on other platforms.
+	MmapSize int64
+
 	// DurabilityConfig provides configuration for crash recovery and idle auto-flush
 	Durability DurabilityConfig
 }
