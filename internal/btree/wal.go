@@ -2543,6 +2543,12 @@ func (w *wal) beginWriteWithSnapshot(readSnap WalIndexHdr) (stateChanged bool, e
 
 // endWrite releases the exclusive write lock.
 func (w *wal) endWrite() {
+	// Tx boundary: any pending in-tx frame rewrite is moot. Either
+	// the tx committed (rewrite happened in writeFrames and iReCksum
+	// is already 0) or it rolled back (no commit will ever consume
+	// the pending rewrite). Reset unconditionally so a future write
+	// tx starts with a clean slate.
+	w.iReCksum = 0
 	_ = w.index.unlock(lockWrite, lockExclusive)
 }
 
