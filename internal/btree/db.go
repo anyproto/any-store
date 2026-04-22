@@ -416,11 +416,15 @@ func (db *DB) BeginReadFast() (*ReadTx, error) {
 // can be active at a time (single-writer semantics). Blocks until any
 // existing write transaction completes.
 //
-// For multi-process mode, if another process committed since our last read
-// (ErrBusySnapshot), we automatically retry with a fresh SHM snapshot.
-// DRIFT from SQLite: SQLite returns SQLITE_BUSY_SNAPSHOT to the caller,
-// requiring it to retry. We retry internally for ergonomic API.
-const maxBusySnapshotRetries = 1000
+// busySnapshotInnerRetries is the tight-loop budget inside BeginWrite
+// for the BUSY_SNAPSHOT race (wal.c:3714 SQLITE_BUSY_SNAPSHOT). Most
+// races resolve in 1-2 attempts (another writer just committed, we
+// re-read and proceed). If we exceed this budget, we hand off to the
+// wal busyHandler for the standard delays[]/totals[] backoff
+// (DefaultBusyTimeout, matching SQLite's sqliteDefaultBusyCallback in
+// main.c:1717). After busyHandler exhausts its budget, ErrBusySnapshot
+// surfaces to the caller — matching SQLite's caller contract.
+const busySnapshotInnerRetries = 3
 
 func (db *DB) BeginWrite() (*WriteTx, error) {
 	if db.closing.Load() {
@@ -447,6 +451,12 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 		var err error
 		readSnap, maxFrame, slot, err = db.pager.beginReadHdr()
 		if err != nil {
+			if errors.Is(err, ErrBusyRecovery) {
+				xBusy := db.pager.wal.busyHandler
+				if xBusy != nil && xBusy(attempt) {
+					continue
+				}
+			}
 			db.mu.RUnlock()
 			db.writeMu.Unlock()
 			return nil, err
@@ -471,13 +481,24 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 			break
 		}
 		db.pager.endRead(slot)
-		if !errors.Is(err, ErrBusySnapshot) || attempt >= maxBusySnapshotRetries {
+		if !errors.Is(err, ErrBusySnapshot) {
 			db.mu.RUnlock()
 			db.writeMu.Unlock()
 			return nil, err
 		}
 		// Clear writerCache: another process committed, our cached pages are stale
 		db.pager.writerCache.clear()
+		// After a small tight-retry budget, route through the busy handler so
+		// we back off instead of spinning. When busyHandler returns false
+		// (budget exhausted) or is nil, surface ErrBusySnapshot to the caller.
+		if attempt >= busySnapshotInnerRetries {
+			xBusy := db.pager.wal.busyHandler
+			if xBusy == nil || !xBusy(attempt-busySnapshotInnerRetries) {
+				db.mu.RUnlock()
+				db.writeMu.Unlock()
+				return nil, ErrBusySnapshot
+			}
+		}
 	}
 
 	// Reset the cleanup guard for this write transaction.
