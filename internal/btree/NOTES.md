@@ -1553,16 +1553,16 @@ the write phase (partial-write detection still correct); in-memory
 mode uses the same dedup logic on `w.memFrames`.
 
 **Measured delta** (see
-`any-store-tests/results/session_perf/benchstat_ckpt_dedup.txt`): sec/op
-geomean -2.30%, B/op geomean +1.10%, allocs geomean -0.42%. Mixed
-signal: the two-phase dedup adds a small per-checkpoint map + sort
-allocation, visible as +8.89% allocs and +15.40% B/op on
-`Crud/BatchUpdate`. This is faithful to SQLite: `walIteratorFree`
-(`sqlitec/src/wal.c:1929-1933`) calls `sqlite3_free` per checkpoint —
-SQLite doesn't pool the iterator either. The Go benchstat exposes an
-allocation cost that is present (but invisible in the C allocator
-stats) in SQLite too. A future optimization could pool the map /
-pgnos slice on the `wal` struct.
+`any-store-tests/results/session_perf/benchstat_ckpt_dedup_scratch.txt`):
+`Crud/BatchUpdate` sec/op **-7.97%** (p=0.022), alloc-neutral. Geomean
+flat (most benches don't stress checkpoint). The original dedup commit
+introduced a per-checkpoint map/slice allocation (naively matching
+SQLite's `walIteratorInit` + `walIteratorFree` at
+`sqlitec/src/wal.c:1929-1933` / `:1948` which also `malloc`s/`free`s
+per checkpoint). We can do better than SQLite here: any-store's
+single-writer invariant (`lockCheckpoint` held exclusive) lets us
+reuse `w.ckptLatest` + `w.ckptPgnos` scratch across checkpoints,
+erasing the allocation cost entirely.
 
 ### Checkpoint mxFrame source fix (commit `9023f5b`)
 
