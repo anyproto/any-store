@@ -312,6 +312,22 @@ func (db *DB) Path() string {
 	return db.path
 }
 
+// PageSize returns the fixed page size in bytes for this database.
+// ~ sqlite3BtreeGetPageSize (btree.c). Unlike SQLite, our page size is
+// immutable after Open — set from Options.PageSize or read from the header.
+func (db *DB) PageSize() uint32 {
+	return db.pager.pageSize
+}
+
+// DatabaseSize returns the current number of pages in the database,
+// including page 1 (the header page). ~ sqlite3BtreeLastPage (btree.c).
+// Reads the atomic pager.dbSize directly; safe under any concurrent
+// transaction state because dbSize is monotonic within the current
+// WAL snapshot visible to the caller.
+func (db *DB) DatabaseSize() uint32 {
+	return db.pager.dbSize.Load()
+}
+
 // beginRead starts a read-only transaction.
 // When readCounters is false, disk counters are initialized from local counters
 // without reading page-1 metadata, which is useful for hot point-lookups.

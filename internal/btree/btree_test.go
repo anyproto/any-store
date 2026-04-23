@@ -1407,3 +1407,28 @@ func TestPagerCommitWithoutWriteTx(t *testing.T) {
 	_, _, _, err := db.pager.commit(false, false)
 	assert.ErrorIs(t, err, ErrReadOnly)
 }
+
+func TestDB_PageSizeAndDatabaseSize(t *testing.T) {
+	db, ns := tempDBWithNS(t, "data")
+
+	if ps := db.PageSize(); ps != DefaultPageSize {
+		t.Fatalf("PageSize = %d, want %d", ps, DefaultPageSize)
+	}
+	if sz := db.DatabaseSize(); sz < 2 {
+		t.Fatalf("DatabaseSize = %d, want >= 2", sz)
+	}
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	// Use fat values to guarantee the leaf splits and allocates new pages,
+	// forcing dbSize to grow beyond the initial header+root layout.
+	fat := make([]byte, 512)
+	for i := 0; i < 200; i++ {
+		k := fmt.Appendf(nil, "key-%04d", i)
+		require.NoError(t, tx.Put(ns, k, fat))
+	}
+	require.NoError(t, tx.Commit())
+	if sz := db.DatabaseSize(); sz < 3 {
+		t.Fatalf("DatabaseSize after inserts = %d, want >= 3", sz)
+	}
+}
