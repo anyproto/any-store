@@ -1449,7 +1449,7 @@ func TestDeepCov_InsertSepIntoInterior_ContentAreaOffsetError(t *testing.T) {
 	intPg.header.serialize(intPg.data[0:])
 
 	// Call insertSepIntoInterior directly — should hit contentAreaOffset error at L1754-1758
-	err = bt.insertSepIntoInterior(intPg, bt.rootPage, []byte("sep"), 999, nil)
+	err = bt.insertSepIntoInterior(intPg, bt.rootPage, []byte("sep"), 999, 0, nil)
 	assert.ErrorIs(t, err, ErrCorrupt)
 	// Note: insertSepIntoInterior releases parentPg on error
 }

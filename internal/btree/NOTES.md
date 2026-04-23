@@ -1414,6 +1414,50 @@ redistributes them targeting ~67% fill across all siblings. Our implementation
 uses a 2-way split targeting 2/3 fill on the left page. This captures most of
 the benefit without the complexity of multi-sibling redistribution.
 
+**Rightmost-Append Fast Path (balance_quick port)** -- Resolved 2026-04-23
+
+SQLite's `balance_quick` (`btree.c:7992-8086`, dispatched at
+`btree.c:9169-9192`) handles the "rightmost append into the rightmost
+leaf of a non-root parent" case without redistributing cells: it
+allocates a fresh right sibling, puts only the new cell there, leaves
+the old page 100% full, and adds a divider to the parent.
+
+Any-store's port lives in `splitLeafRightmostAppend` with dispatch at
+the top of `splitLeafAndInsertWithPath`. Four of SQLite's five
+preconditions (`btree.c:9170-9174`) map directly:
+
+    idx == pg.header.cellCount
+    len(path) > 0
+    path[len-1].cellIdx == path[len-1].nCell  (reached via rightChild)
+    path[len-1].pgno != bt.rootPage           (SQLite: pParent->pgno != 1)
+
+SQLite's fifth precondition `pPage->intKeyLeaf` is intkey-specific and
+does not apply to any-store's index-btree semantics. Any-store's interior
+search (`btree.go searchInterior`) invariant is "left child keys `<`
+separator, right child keys `>=` separator" whereas intkey tables use
+"left child keys `<=` separator". The consequence is that any-store's
+divider must be the *first* key of the new right sibling — the new key
+itself — rather than the largest key of pPage (which SQLite uses per
+`btree.c:8066-8070`). This semantic adaptation is documented in
+`splitLeafRightmostAppend`'s function comment.
+
+Measured on 5000 monotonic appends at pageSize=1024, valSize=80:
+
+    leaves:          714 → 488  (−31.6%; +56.9% overhead → +7.3%)
+    avg leaf fill:  60.7% → 88.7%
+    median fill:    60.6% → 95.3%
+
+Guarded by `TestBalanceQuick_AppendFillFactor` (the former diagnostic,
+now asserting `avgFill >= 0.85` on the monotonic case) and the
+`TestBalanceQuick_*` matrix in `btree_balance_quick_test.go`
+(HappyPath, RootIsParent, CascadeToParentSplit, InterleavedInserts,
+OverflowBearingCell, SavepointRollback, ConcurrentReader,
+AllocFreelistCorruptResilience).
+
+Benchmark: `BenchmarkBalanceQuick_MonotonicAppend` reports rows/sec,
+final leaf count, and leaves/row. At pageSize=4096, valSize=128,
+10000 rows: 474 leaves (≈0.047 leaves/row, near the ideal packing).
+
 **No Full Freeblock Chain** -- Severity: Important (partially addressed)
 
 SQLite maintains a sorted linked list of free blocks within each page for
@@ -1422,11 +1466,24 @@ old cell size), in-place delete (with fragmentation tracking), and
 defragmentation-before-split. Our approach tracks fragmentation in `fragBytes`
 and triggers a full rebuild when it exceeds 60 bytes.
 
-**Path Tracking Stores Only Page Numbers** -- Severity: Minor
+**Path Tracking Stores Only Page Numbers** -- Resolved 2026-04-23
 
-The cursor path stores only page numbers, requiring re-fetching pages and
-re-scanning for insertion points on splits. SQLite caches page pointers + cell
-indices in the cursor stack (`apPage[]`/`aiIdx[]`).
+The cursor path used to store only page numbers. The descent path is now
+`[]pathEntry{pgno, cellIdx, nCell}`, mirroring SQLite's `apPage[]`/`aiIdx[]`
+cursor stack (`btreeInt.h:553-556`). `cellIdx` is populated from
+`searchInterior`'s second return value (which was previously discarded).
+
+Commit 2 (`insertSepIntoInterior`): takes `insertIdx` directly, mirroring
+SQLite's `balance_nonroot(iIdx=...)` at `btree.c:8230, 9213`. The O(nCell)
+linear parent re-scan before inserting a divider is gone.
+`BenchmarkInsertSepIntoInterior_DeepTree` pins the win.
+
+Commit 3 (`tryMergeLeaf` / `removeChildFromParent`): use
+`path[len-1].cellIdx` directly to locate the child slot, replacing the
+linear scans. Defensive bounds-checks on `cellIdx` guard against
+path-builder drift. `tryMergeLeaf` adjusts the `cellIdx` it hands to
+`removeChildFromParent` to account for merge direction (right-merge
+frees the sibling at `childIdx+1`; left-merge frees the leaf itself).
 
 **Nearby Allocation Hint for Overflow Pages** -- Resolved 2026-04-22
 
@@ -1755,6 +1812,71 @@ The close body is now the closure; correctness of the truncate gate
 no longer depends on the code path walking past the unlock line.
 Regression test: `TestWithWriteLock_AlwaysReleases` covers clean /
 error / panic return paths.
+
+### Race fixes evaluated and not ported
+
+#### SQLite `fe57e14b49` — checkpointer vs. writer WAL wrap (evaluated 2026-04-22, not applicable)
+
+Upstream SQLite commit `fe57e14b49` (2026-03-03, "Avoid an obscure race
+condition between a checkpointer and a writer wrapping around to the
+start of the wal file") adds a salt-revalidation check in
+`walCheckpoint()` right after acquiring `WAL_READ_LOCK(0)` exclusive:
+
+```c
+WalIndexHdr *pLive = (WalIndexHdr*)walIndexHdr(pWal);
+if( 0==memcmp(pLive->aSalt, pWal->hdr.aSalt, sizeof(pWal->hdr.aSalt)) ){
+    /* ... proceed with backfill ... */
+}
+```
+
+**The race in SQLite:**
+1. Checkpointer C snapshots `pWal->hdr.mxFrame=N, aSalt=S` via
+   `walIndexReadHdr`.
+2. C reads `pInfo->nBackfill` live (not snapshotted).
+3. Writer W runs `sqlite3WalBeginWriteTransaction → walRestartLog`,
+   briefly grabs `WAL_READ_LOCK(0)` exclusive, writes new salts `S'`,
+   sets `pInfo->nBackfill=0`, releases.
+4. C's `walBusyLock(WAL_READ_LOCK(0))` now succeeds (W released).
+5. Without the fix, C sees `nBackfill(0) < hdr.mxFrame(N)`, proceeds
+   to iterate frames 1..N using its stale snapshot, reads whatever W
+   has begun writing at those offsets, copies to wrong DB pages.
+
+**Key enabler in SQLite:** writers wrap the WAL without holding
+`CHECKPOINT_LOCK`.
+
+**Why the race cannot occur in any-store:**
+
+Salt regeneration (`rand.Uint32()`) happens at exactly two call sites:
+- `initHeaderStateLocked` (wal.go:1608-1609)
+- `writeHeader` (wal.go:1653-1654)
+
+All callers are either first-time open/recovery paths (no concurrent
+checkpointer yet exists) or `doResetWAL`. `doResetWAL` is reachable
+only via `tryResetWALWithBusy → checkpointPost → checkpointWithMode`,
+and `checkpointWithMode` holds `lockCheckpoint` exclusive throughout
+(wal.go:2780 + deferred unlock covering the entire body including
+`checkpointPost`). `lockCheckpoint` is fcntl-backed (shm_mmap.go:147),
+so it's genuinely cross-process exclusive.
+
+Writers never regenerate salts: `beginWriteWithSnapshot` copies
+existing salts from SHM (wal.go:2518-2519), `writeFrames` rewrites
+the SHM header preserving the existing `w.header.salt1/salt2`
+(wal.go:2054).
+
+Therefore: while any checkpointer is inside `checkpointWithMode`, no
+other actor — writer or checkpointer — can mutate salts. The
+snapshot-vs-backfill window SQLite's fix protects cannot observe a
+salt change in any-store.
+
+**Architectural difference:** SQLite permits writer-initiated wrap
+via `walRestartLog` inside `beginWriteTransaction` when
+`nBackfill == mxFrame`; any-store only wraps via
+`CheckpointRestart/Truncate` modes, which require `lockCheckpoint`.
+
+**Consequence:** fe57e14b49 is a no-op in any-store. If a future
+change introduces a writer-wrap path (e.g. auto-wrap in
+`beginWriteWithSnapshot` when `nBackfill == mxFrame`), that change
+must re-evaluate this invariant and include the salt-revalidation.
 
 ### Not Implemented (by design)
 

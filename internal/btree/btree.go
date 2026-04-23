@@ -27,6 +27,33 @@ func SetDebugOverflowReadErrors(enabled bool) {
 	}
 }
 
+// pathEntry records one level of the root-to-leaf descent performed by
+// Put/Delete/insertIntoParent. It mirrors SQLite's cursor stack pair
+// (apPage[i], aiIdx[i]) at btreeInt.h:553-556.
+//
+//   pgno    — page number of the interior node at this level.
+//   cellIdx — index within that page that we descended through:
+//               0..nCell-1  -> the i-th cell's leftChild was followed;
+//               == nCell    -> descended via the page's rightChild.
+//             This is exactly searchInterior's second return value
+//             (see below), which was discarded at the call sites prior
+//             to this refactor.
+//   nCell   — pg.header.cellCount at descent time. Carried so that the
+//             rightmost-child check (cellIdx == nCell) is O(1) without
+//             re-reading the parent. Required by the balance_quick
+//             dispatch guard in splitLeafAndInsertWithPath.
+//
+// Invariant: each cellIdx is consumed at most once, during upward
+// propagation at its own level. After a divider is inserted into
+// `pgno`, the cellIdx for `pgno` is never consulted again; higher-level
+// cellIdx values remain valid because a lower split changes a parent's
+// *contents* but not which pgno the grandparent points to.
+type pathEntry struct {
+	pgno    uint32
+	cellIdx uint16
+	nCell   uint16
+}
+
 // btree represents a single B-tree (one namespace).
 type btree struct {
 	pager       *pager
@@ -1098,15 +1125,18 @@ func (bt *btree) Put(key, value []byte) error {
 
 	// Build path from root to leaf for potential split propagation.
 	// Use stack-allocated array for common case (tree depth ≤ 8).
-	var pathBuf [8]uint32
+	// Each entry records (pgno, cellIdx, nCell) — see pathEntry type
+	// and btreeInt.h:553-556 for the SQLite analogue.
+	var pathBuf [8]pathEntry
 	path := pathBuf[:0]
 	for pg.header.isInterior() {
-		path = append(path, pg.pgno)
-		childPgno, _, serr := bt.searchInterior(pg, key)
+		nCell := pg.header.cellCount
+		childPgno, cellIdx, serr := bt.searchInterior(pg, key)
 		if serr != nil {
 			bt.pager.releasePage(pg)
 			return serr
 		}
+		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: uint16(cellIdx), nCell: nCell})
 		bt.pager.releasePage(pg)
 		pg, err = bt.getPage(childPgno)
 		if err != nil {
@@ -1137,7 +1167,7 @@ func (bt *btree) insertIntoPage(pg *page, key, value []byte) error {
 }
 
 // insertIntoLeafWithPath inserts into a leaf page, using path for split propagation.
-func (bt *btree) insertIntoLeafWithPath(pg *page, key, value []byte, path []uint32) error {
+func (bt *btree) insertIntoLeafWithPath(pg *page, key, value []byte, path []pathEntry) error {
 	idx, found, serr := bt.searchLeaf(pg, key)
 	if serr != nil {
 		return serr
@@ -1308,7 +1338,7 @@ func (bt *btree) insertLeafCellAt(pg *page, idx int, key, value []byte) error {
 // using the path for parent propagation. This mirrors SQLite's approach in
 // sqlite3BtreeInsert (btree.c): dropCell + insertCell, then balance() if the
 // page overflows.
-func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []uint32) error {
+func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []pathEntry) error {
 	usableSize := bt.usablePageSize()
 
 	// Parse old cell to get its size and overflow info
@@ -1735,8 +1765,80 @@ func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint
 	return nil
 }
 
+// splitLeafRightmostAppend implements the rightmost-append fast path,
+// porting SQLite's balance_quick (btree.c:7992-8086).
+//
+// Pre-conditions, checked by the caller at the top of
+// splitLeafAndInsertWithPath — mirror btree.c:9170-9174:
+//   - idx == pg.header.cellCount      — new cell is rightmost on pg
+//   - len(path) > 0                   — pg is not the btree root
+//   - path[len-1].cellIdx == path[len-1].nCell
+//                                     — pg was reached via parent's rightChild
+//   - path[len-1].pgno != bt.rootPage — parent is not the btree root
+//                                     (SQLite: pParent->pgno != 1)
+//
+// Semantic adaptation from SQLite (btree.c:8066-8070): SQLite's intkey
+// tables use the largest key of pPage as divider because their separator
+// invariant is "left child keys <= separator"; any-store's interior
+// search (btree.go searchInterior) uses "left child keys < separator,
+// right child keys >= separator", so the divider is the *first* key of
+// the new right sibling — the new key itself.
+//
+// Post-condition: pg retains all its pre-insert cells unchanged (no
+// write to pg happens on this path — the whole point of the
+// optimization). rightPg contains exactly (key, value). The parent has
+// gained a new rightmost cell {leftChild=pg.pgno, key=divider} and its
+// rightChild now points to rightPg. Parent overflow cascades through
+// the standard path (insertIntoParentWithPath → insertSepIntoInterior),
+// matching SQLite's balance() do-loop (btree.c:9123).
+func (bt *btree) splitLeafRightmostAppend(pg *page, key, value []byte, path []pathEntry) error {
+	// Allocate new right sibling. Equiv. btree.c:8010 (allocateBtreePage).
+	rightPg, err := bt.pager.allocatePage()
+	if err != nil {
+		return err
+	}
+
+	// Initialize rightPg as a leaf holding just the new cell.
+	// rebuildLeafPage does zeroPage (btree.c:8022), writes the cell, and
+	// handles overflow allocation for oversized payloads — equivalent
+	// to btree.c:8030's rebuildPage with nCell=1. any-store has no
+	// ptrmap so btree.c:8046-8050 has no counterpart.
+	newCell := cellData{key: key, value: value}
+	if err := bt.rebuildLeafPage(rightPg, []cellData{newCell}); err != nil {
+		bt.pager.releasePage(rightPg)
+		return err
+	}
+	rightPgno := rightPg.pgno
+	bt.pager.releasePage(rightPg)
+
+	// Divider = the new key itself. See function doc for the separator-
+	// invariant divergence from SQLite's btree.c:8066-8070.
+	divider := bytes.Clone(key)
+
+	// Delegate to the standard parent-insert path. Because cellIdx ==
+	// nCell (fast-path precondition), insertSepIntoInterior's existing
+	// branch at btree.go:1889-1896 takes effect: divider is written at
+	// the end slot with leftChild=pg.pgno, and parent.rightChild is
+	// repointed to rightPgno. Equivalent to SQLite's btree.c:8074
+	// (insertCell) + btree.c:8079 (put4byte rightChild).
+	bt.pager.balanceQuickDispatchCount.Add(1)
+	return bt.insertIntoParentWithPath(pg, divider, rightPgno, path)
+}
+
 // splitLeafAndInsertWithPath splits a leaf page using the path for parent propagation.
-func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte, path []uint32) error {
+func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte, path []pathEntry) error {
+	// Rightmost-append fast path. Port of SQLite balance_quick dispatch
+	// at btree.c:9169-9192. The intKeyLeaf precondition (btree.c:9170)
+	// is intkey-specific and has no any-store equivalent; we compensate
+	// with the divider adaptation inside splitLeafRightmostAppend. The
+	// remaining four preconditions map directly.
+	if idx == int(pg.header.cellCount) && len(path) > 0 {
+		parent := path[len(path)-1]
+		if parent.pgno != bt.rootPage && parent.cellIdx == parent.nCell {
+			return bt.splitLeafRightmostAppend(pg, key, value, path)
+		}
+	}
+
 	cells, cellBuf := bt.collectLeafCells(pg)
 
 	// Clone key+value into a single allocation.
@@ -1784,13 +1886,14 @@ func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte
 }
 
 // insertIntoParentWithPath inserts a separator key into the parent using the tracked path.
-func (bt *btree) insertIntoParentWithPath(leftPg *page, key []byte, rightPgno uint32, path []uint32) error {
+func (bt *btree) insertIntoParentWithPath(leftPg *page, key []byte, rightPgno uint32, path []pathEntry) error {
 	if leftPg.pgno == bt.rootPage || len(path) == 0 {
 		return bt.splitRoot(leftPg, key, rightPgno)
 	}
 
 	// Get the parent page (last element of path) as writable
-	parentPgno := path[len(path)-1]
+	parentEntry := path[len(path)-1]
+	parentPgno := parentEntry.pgno
 	parentPath := path[:len(path)-1]
 
 	parentPg, err := bt.pager.getWritablePage(parentPgno)
@@ -1798,13 +1901,16 @@ func (bt *btree) insertIntoParentWithPath(leftPg *page, key []byte, rightPgno ui
 		return err
 	}
 
-	return bt.insertSepIntoInterior(parentPg, leftPg.pgno, key, rightPgno, parentPath)
+	// path[len-1].cellIdx is the slot in parentPg where the new separator
+	// goes — the same position the descent went through. Mirrors SQLite's
+	// balance_nonroot(pParent, iIdx, ...) dispatch at btree.c:9213.
+	return bt.insertSepIntoInterior(parentPg, leftPg.pgno, key, rightPgno, int(parentEntry.cellIdx), parentPath)
 }
 
 // insertSepIntoAncestor inserts a separator key into an ancestor page identified
 // by leftPgno. Unlike insertIntoParentWithPath, this takes a page number instead
 // of a page pointer, avoiding use-after-release issues during recursive splits.
-func (bt *btree) insertSepIntoAncestor(leftPgno uint32, key []byte, rightPgno uint32, path []uint32) error {
+func (bt *btree) insertSepIntoAncestor(leftPgno uint32, key []byte, rightPgno uint32, path []pathEntry) error {
 	if leftPgno == bt.rootPage || len(path) == 0 {
 		// Need to split the root. Re-acquire as writable.
 		wpg, err := bt.pager.getWritablePage(leftPgno)
@@ -1817,7 +1923,8 @@ func (bt *btree) insertSepIntoAncestor(leftPgno uint32, key []byte, rightPgno ui
 	}
 
 	// Get the parent page (last element of path) as writable
-	parentPgno := path[len(path)-1]
+	parentEntry := path[len(path)-1]
+	parentPgno := parentEntry.pgno
 	parentPath := path[:len(path)-1]
 
 	parentPg, err := bt.pager.getWritablePage(parentPgno)
@@ -1825,29 +1932,35 @@ func (bt *btree) insertSepIntoAncestor(leftPgno uint32, key []byte, rightPgno ui
 		return err
 	}
 
-	return bt.insertSepIntoInterior(parentPg, leftPgno, key, rightPgno, parentPath)
+	return bt.insertSepIntoInterior(parentPg, leftPgno, key, rightPgno, int(parentEntry.cellIdx), parentPath)
 }
 
 // insertSepIntoInterior inserts a separator key into an interior page.
 // This is the core logic shared by insertIntoParentWithPath and insertSepIntoAncestor.
-func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []byte, rightPgno uint32, parentPath []uint32) error {
+//
+// insertIdx is the position in parentPg where the new separator is
+// inserted. It is path[len-1].cellIdx from the caller — the same slot
+// in the parent the descent went through to reach the child that just
+// split. Mirrors SQLite's balance_nonroot signature (btree.c:8230),
+// which takes iIdx as a parameter populated from
+// pCur->aiIdx[iPage-1] (btree.c:9162).
+//
+// Invariant: 0 <= insertIdx <= parentPg.header.cellCount. When
+// insertIdx == cellCount we descended via rightChild; when less, we
+// descended via the cell at that index.
+func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []byte, rightPgno uint32, insertIdx int, parentPath []pathEntry) error {
 	// Insert separator into parent interior page
 	n := int(parentPg.header.cellCount)
 	cpOff := parentPg.cellPointerOffset()
-	data := parentPg.data
 
-	// Find insertion point in parent
-	pageUsable := bt.usablePageSize()
-	insertIdx := n
-	for i := range n {
-		off := int(binary.BigEndian.Uint16(data[cpOff+i*2:]))
-		cellKey, _, _ := bt.interiorCellFullKey(data, off, pageUsable)
-		if bytes.Compare(cellKey, key) >= 0 {
-			insertIdx = i
-			break
-		}
+	// Defensive: guard against path staleness (should never fire in
+	// correct code but surfaces drift during development).
+	if insertIdx < 0 || insertIdx > n {
+		bt.pager.releasePage(parentPg)
+		return ErrCorrupt
 	}
 
+	pageUsable := bt.usablePageSize()
 	cellSize := interiorCellSizeWithOverflow(key, pageUsable)
 	hdrSize := cpOff + (n+1)*2
 	// Validate cellContentOff before using as slice index.
@@ -2028,7 +2141,7 @@ func (bt *btree) insertIntoParent(leftPg *page, key []byte, rightPgno uint32) er
 	// Build path from root to leftPg's parent by traversing the tree.
 	// We need the path so that if the parent itself needs to split,
 	// we can propagate upward.
-	var pathBuf [8]uint32
+	var pathBuf [8]pathEntry
 	path := pathBuf[:0]
 	pg, err := bt.getPage(bt.rootPage)
 	if err != nil {
@@ -2036,24 +2149,25 @@ func (bt *btree) insertIntoParent(leftPg *page, key []byte, rightPgno uint32) er
 	}
 	// Use the separator key to navigate to the parent of leftPg.
 	for pg.header.isInterior() {
-		childPgno, _, serr := bt.searchInterior(pg, key)
+		nCell := pg.header.cellCount
+		childPgno, cellIdx, serr := bt.searchInterior(pg, key)
 		if serr != nil {
 			bt.pager.releasePage(pg)
 			return serr
 		}
 		if childPgno == leftPg.pgno {
-			// Found: pg is the parent of leftPg
-			path = append(path, pg.pgno)
+			// Found: pg is the parent of leftPg, reached via cellIdx.
+			path = append(path, pathEntry{pgno: pg.pgno, cellIdx: uint16(cellIdx), nCell: nCell})
 			bt.pager.releasePage(pg)
 			return bt.insertIntoParentWithPath(leftPg, key, rightPgno, path)
 		}
-		// Check if leftPg is the rightChild
+		// Check if leftPg is the rightChild. In that case cellIdx == nCell.
 		if pg.header.rightChild == leftPg.pgno {
-			path = append(path, pg.pgno)
+			path = append(path, pathEntry{pgno: pg.pgno, cellIdx: nCell, nCell: nCell})
 			bt.pager.releasePage(pg)
 			return bt.insertIntoParentWithPath(leftPg, key, rightPgno, path)
 		}
-		path = append(path, pg.pgno)
+		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: uint16(cellIdx), nCell: nCell})
 		bt.pager.releasePage(pg)
 		pg, err = bt.getPage(childPgno)
 		if err != nil {
@@ -2155,15 +2269,16 @@ func (bt *btree) Delete(key []byte) error {
 		return err
 	}
 
-	var pathBuf [8]uint32
+	var pathBuf [8]pathEntry
 	path := pathBuf[:0]
 	for pg.header.isInterior() {
-		path = append(path, pg.pgno)
-		childPgno, _, serr := bt.searchInterior(pg, key)
+		nCell := pg.header.cellCount
+		childPgno, cellIdx, serr := bt.searchInterior(pg, key)
 		if serr != nil {
 			bt.pager.releasePage(pg)
 			return serr
 		}
+		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: uint16(cellIdx), nCell: nCell})
 		bt.pager.releasePage(pg)
 		pg, err = bt.getPage(childPgno)
 		if err != nil {
@@ -2294,39 +2409,48 @@ func (bt *btree) leafUsedSpace(pg *page) int {
 
 // tryMergeLeaf attempts to merge a leaf page with a sibling.
 // Only merges if both pages' content fits in a single page.
-func (bt *btree) tryMergeLeaf(leafPgno uint32, path []uint32) error {
+func (bt *btree) tryMergeLeaf(leafPgno uint32, path []pathEntry) error {
 	if len(path) == 0 {
 		return nil
 	}
 
-	parentPgno := path[len(path)-1]
+	parentPgno := path[len(path)-1].pgno
 	parentPg, err := bt.getPage(parentPgno)
 	if err != nil {
 		return err
 	}
 
-	// Find which child slot this leaf is in
+	// Find which child slot this leaf is in. path[len-1].cellIdx is the
+	// slot we descended through to reach leafPgno, so the linear scan is
+	// unnecessary. SQLite's delete-rebalance path uses pCur->aiIdx[iPage-1]
+	// analogously.
 	n := int(parentPg.header.cellCount)
 	if n < 1 {
 		bt.pager.releasePage(parentPg)
 		return nil // need at least 2 children to merge
 	}
 	cpOff := parentPg.cellPointerOffset()
-	childIdx := -1
-	for i := range n {
-		off := int(binary.BigEndian.Uint16(parentPg.data[cpOff+i*2:]))
-		lc := binary.BigEndian.Uint32(parentPg.data[off : off+4])
-		if lc == leafPgno {
-			childIdx = i
-			break
-		}
-	}
-	if childIdx == -1 && parentPg.header.rightChild == leafPgno {
-		childIdx = n // rightChild position
-	}
-	if childIdx == -1 {
+	childIdx := int(path[len(path)-1].cellIdx)
+
+	// Defensive: confirm the path points at the expected leaf. Drift here
+	// means the path was built incorrectly — caller bug.
+	if childIdx < 0 || childIdx > n {
 		bt.pager.releasePage(parentPg)
-		return nil
+		return ErrCorrupt
+	}
+	if childIdx < n {
+		off := int(binary.BigEndian.Uint16(parentPg.data[cpOff+childIdx*2:]))
+		lc := binary.BigEndian.Uint32(parentPg.data[off : off+4])
+		if lc != leafPgno {
+			bt.pager.releasePage(parentPg)
+			return ErrCorrupt
+		}
+	} else {
+		// childIdx == n: path says we reached leafPgno via rightChild.
+		if parentPg.header.rightChild != leafPgno {
+			bt.pager.releasePage(parentPg)
+			return ErrCorrupt
+		}
 	}
 
 	// Pick a sibling. Try right first, then left.
@@ -2430,16 +2554,30 @@ func (bt *btree) tryMergeLeaf(leafPgno uint32, path []uint32) error {
 	if err := bt.pager.freePage(freePgno); err != nil {
 		return err
 	}
-	return bt.removeChildFromParent(freePgno, path)
+
+	// path[len-1].cellIdx is the parent slot of leafPgno; freePgno lives at
+	// a different slot depending on the merge direction. Adjust in place
+	// before handing off to removeChildFromParent.
+	// mergeRight: sibling (= freePgno) was at childIdx+1 (possibly == n = rightChild).
+	// !mergeRight (mergeLeft): freePgno == leafPgno, still at childIdx.
+	adjustedPath := path
+	if mergeRight {
+		freeIdx := childIdx + 1
+		// Copy to avoid mutating the caller's slice element.
+		adjustedPath = make([]pathEntry, len(path))
+		copy(adjustedPath, path)
+		adjustedPath[len(adjustedPath)-1].cellIdx = uint16(freeIdx)
+	}
+	return bt.removeChildFromParent(freePgno, adjustedPath)
 }
 
 // removeChildFromParent removes a child page reference from its parent interior page.
-func (bt *btree) removeChildFromParent(childPgno uint32, path []uint32) error {
+func (bt *btree) removeChildFromParent(childPgno uint32, path []pathEntry) error {
 	if len(path) == 0 {
 		return nil
 	}
 
-	parentPgno := path[len(path)-1]
+	parentPgno := path[len(path)-1].pgno
 
 	parentPg, err := bt.pager.getWritablePage(parentPgno)
 	if err != nil {
@@ -2449,30 +2587,34 @@ func (bt *btree) removeChildFromParent(childPgno uint32, path []uint32) error {
 	cells := bt.collectInteriorCells(parentPg)
 	rightChild := parentPg.header.rightChild
 
-	// Find which cell or rightChild references this child
-	found := false
-	for i, c := range cells {
-		if c.leftChild == childPgno {
-			// Remove this cell; the previous cell (or parent structure) absorbs
-			cells = append(cells[:i], cells[i+1:]...)
-			found = true
-			break
-		}
-	}
+	// Use path[len-1].cellIdx to locate the child slot directly.
+	// SQLite's delete-rebalance uses pCur->aiIdx[iPage-1] analogously.
+	childIdx := int(path[len(path)-1].cellIdx)
 
-	if !found && rightChild == childPgno {
-		// rightChild is being removed
+	// Defensive: confirm the path points at the expected child.
+	if childIdx < 0 || childIdx > len(cells) {
+		bt.pager.releasePage(parentPg)
+		return ErrCorrupt
+	}
+	if childIdx < len(cells) {
+		if cells[childIdx].leftChild != childPgno {
+			bt.pager.releasePage(parentPg)
+			return ErrCorrupt
+		}
+		// Remove this cell.
+		cells = append(cells[:childIdx], cells[childIdx+1:]...)
+	} else {
+		// childIdx == len(cells): path says we reached childPgno via rightChild.
+		if rightChild != childPgno {
+			bt.pager.releasePage(parentPg)
+			return ErrCorrupt
+		}
+		// rightChild is being removed. If there are cells, last cell's
+		// leftChild becomes the new rightChild.
 		if len(cells) > 0 {
-			// Last cell's leftChild becomes new rightChild
 			rightChild = cells[len(cells)-1].leftChild
 			cells = cells[:len(cells)-1]
 		}
-		found = true
-	}
-
-	if !found {
-		bt.pager.releasePage(parentPg)
-		return nil
 	}
 
 	// If parent is now empty interior page (0 cells) and not root,
