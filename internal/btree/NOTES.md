@@ -1422,21 +1422,24 @@ old cell size), in-place delete (with fragmentation tracking), and
 defragmentation-before-split. Our approach tracks fragmentation in `fragBytes`
 and triggers a full rebuild when it exceeds 60 bytes.
 
-**Path Tracking Stores Only Page Numbers** -- Severity: Minor (partially addressed)
+**Path Tracking Stores Only Page Numbers** -- Resolved 2026-04-23
 
-The cursor path used to store only page numbers. As of commit 1 of the
-balance_quick port, the descent path is `[]pathEntry{pgno, cellIdx, nCell}`,
-mirroring SQLite's `apPage[]`/`aiIdx[]` cursor stack (`btreeInt.h:553-556`).
-`cellIdx` is populated from `searchInterior`'s second return value (which was
-previously discarded).
+The cursor path used to store only page numbers. The descent path is now
+`[]pathEntry{pgno, cellIdx, nCell}`, mirroring SQLite's `apPage[]`/`aiIdx[]`
+cursor stack (`btreeInt.h:553-556`). `cellIdx` is populated from
+`searchInterior`'s second return value (which was previously discarded).
 
-Commit 2 consumption: `insertSepIntoInterior` now takes `insertIdx` directly
-(mirrors SQLite's `balance_nonroot(iIdx=...)` at `btree.c:8230,9213`). The
-O(nCell) linear parent re-scan that used to run before inserting a divider
-is gone. `BenchmarkInsertSepIntoInterior_DeepTree` pins the win.
+Commit 2 (`insertSepIntoInterior`): takes `insertIdx` directly, mirroring
+SQLite's `balance_nonroot(iIdx=...)` at `btree.c:8230, 9213`. The O(nCell)
+linear parent re-scan before inserting a divider is gone.
+`BenchmarkInsertSepIntoInterior_DeepTree` pins the win.
 
-Delete-side consumption (`tryMergeLeaf` / `removeChildFromParent`) arrives
-in commit 3.
+Commit 3 (`tryMergeLeaf` / `removeChildFromParent`): use
+`path[len-1].cellIdx` directly to locate the child slot, replacing the
+linear scans. Defensive bounds-checks on `cellIdx` guard against
+path-builder drift. `tryMergeLeaf` adjusts the `cellIdx` it hands to
+`removeChildFromParent` to account for merge direction (right-merge
+frees the sibling at `childIdx+1`; left-merge frees the leaf itself).
 
 **Nearby Allocation Hint for Overflow Pages** -- Resolved 2026-04-22
 

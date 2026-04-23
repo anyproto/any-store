@@ -2348,28 +2348,37 @@ func (bt *btree) tryMergeLeaf(leafPgno uint32, path []pathEntry) error {
 		return err
 	}
 
-	// Find which child slot this leaf is in
+	// Find which child slot this leaf is in. path[len-1].cellIdx is the
+	// slot we descended through to reach leafPgno, so the linear scan is
+	// unnecessary. SQLite's delete-rebalance path uses pCur->aiIdx[iPage-1]
+	// analogously.
 	n := int(parentPg.header.cellCount)
 	if n < 1 {
 		bt.pager.releasePage(parentPg)
 		return nil // need at least 2 children to merge
 	}
 	cpOff := parentPg.cellPointerOffset()
-	childIdx := -1
-	for i := range n {
-		off := int(binary.BigEndian.Uint16(parentPg.data[cpOff+i*2:]))
-		lc := binary.BigEndian.Uint32(parentPg.data[off : off+4])
-		if lc == leafPgno {
-			childIdx = i
-			break
-		}
-	}
-	if childIdx == -1 && parentPg.header.rightChild == leafPgno {
-		childIdx = n // rightChild position
-	}
-	if childIdx == -1 {
+	childIdx := int(path[len(path)-1].cellIdx)
+
+	// Defensive: confirm the path points at the expected leaf. Drift here
+	// means the path was built incorrectly — caller bug.
+	if childIdx < 0 || childIdx > n {
 		bt.pager.releasePage(parentPg)
-		return nil
+		return ErrCorrupt
+	}
+	if childIdx < n {
+		off := int(binary.BigEndian.Uint16(parentPg.data[cpOff+childIdx*2:]))
+		lc := binary.BigEndian.Uint32(parentPg.data[off : off+4])
+		if lc != leafPgno {
+			bt.pager.releasePage(parentPg)
+			return ErrCorrupt
+		}
+	} else {
+		// childIdx == n: path says we reached leafPgno via rightChild.
+		if parentPg.header.rightChild != leafPgno {
+			bt.pager.releasePage(parentPg)
+			return ErrCorrupt
+		}
 	}
 
 	// Pick a sibling. Try right first, then left.
@@ -2473,7 +2482,21 @@ func (bt *btree) tryMergeLeaf(leafPgno uint32, path []pathEntry) error {
 	if err := bt.pager.freePage(freePgno); err != nil {
 		return err
 	}
-	return bt.removeChildFromParent(freePgno, path)
+
+	// path[len-1].cellIdx is the parent slot of leafPgno; freePgno lives at
+	// a different slot depending on the merge direction. Adjust in place
+	// before handing off to removeChildFromParent.
+	// mergeRight: sibling (= freePgno) was at childIdx+1 (possibly == n = rightChild).
+	// !mergeRight (mergeLeft): freePgno == leafPgno, still at childIdx.
+	adjustedPath := path
+	if mergeRight {
+		freeIdx := childIdx + 1
+		// Copy to avoid mutating the caller's slice element.
+		adjustedPath = make([]pathEntry, len(path))
+		copy(adjustedPath, path)
+		adjustedPath[len(adjustedPath)-1].cellIdx = uint16(freeIdx)
+	}
+	return bt.removeChildFromParent(freePgno, adjustedPath)
 }
 
 // removeChildFromParent removes a child page reference from its parent interior page.
@@ -2492,30 +2515,34 @@ func (bt *btree) removeChildFromParent(childPgno uint32, path []pathEntry) error
 	cells := bt.collectInteriorCells(parentPg)
 	rightChild := parentPg.header.rightChild
 
-	// Find which cell or rightChild references this child
-	found := false
-	for i, c := range cells {
-		if c.leftChild == childPgno {
-			// Remove this cell; the previous cell (or parent structure) absorbs
-			cells = append(cells[:i], cells[i+1:]...)
-			found = true
-			break
-		}
-	}
+	// Use path[len-1].cellIdx to locate the child slot directly.
+	// SQLite's delete-rebalance uses pCur->aiIdx[iPage-1] analogously.
+	childIdx := int(path[len(path)-1].cellIdx)
 
-	if !found && rightChild == childPgno {
-		// rightChild is being removed
+	// Defensive: confirm the path points at the expected child.
+	if childIdx < 0 || childIdx > len(cells) {
+		bt.pager.releasePage(parentPg)
+		return ErrCorrupt
+	}
+	if childIdx < len(cells) {
+		if cells[childIdx].leftChild != childPgno {
+			bt.pager.releasePage(parentPg)
+			return ErrCorrupt
+		}
+		// Remove this cell.
+		cells = append(cells[:childIdx], cells[childIdx+1:]...)
+	} else {
+		// childIdx == len(cells): path says we reached childPgno via rightChild.
+		if rightChild != childPgno {
+			bt.pager.releasePage(parentPg)
+			return ErrCorrupt
+		}
+		// rightChild is being removed. If there are cells, last cell's
+		// leftChild becomes the new rightChild.
 		if len(cells) > 0 {
-			// Last cell's leftChild becomes new rightChild
 			rightChild = cells[len(cells)-1].leftChild
 			cells = cells[:len(cells)-1]
 		}
-		found = true
-	}
-
-	if !found {
-		bt.pager.releasePage(parentPg)
-		return nil
 	}
 
 	// If parent is now empty interior page (0 cells) and not root,

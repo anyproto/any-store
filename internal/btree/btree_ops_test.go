@@ -2561,9 +2561,14 @@ func TestTryMergeLeafChildNotInParent(t *testing.T) {
 	bt.rebuildLeafPage(rootPg, []cellData{{key: []byte("a"), value: []byte("1")}})
 	p.releasePage(rootPg)
 
-	// tryMergeLeaf with a non-existent leaf pgno in path
+	// tryMergeLeaf with a non-existent leaf pgno — path points at slot 0
+	// of a leaf page (leafPgno=999 isn't actually at that slot).
+	// As of commit 3 of the balance_quick port, this is a defensive
+	// path-drift error rather than a silent no-op: the path is
+	// supposed to match the actual parent contents, and mismatch
+	// indicates a caller bug.
 	err = bt.tryMergeLeaf(999, []pathEntry{{pgno: rootPg.pgno}})
-	assert.NoError(t, err) // should return nil (childIdx == -1)
+	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
 // =============================================================================
@@ -2607,9 +2612,12 @@ func TestRemoveChildFromParentNotFound(t *testing.T) {
 	p.releasePage(rootPg)
 	p.releasePage(childPg)
 
-	// Remove a child that doesn't exist in parent
+	// Remove a child that doesn't exist in parent.
+	// As of commit 3 of the balance_quick port, this is a defensive
+	// path-drift error (path cellIdx=0 points to cell[0] whose leftChild
+	// is childPg, not 999) rather than a silent no-op.
 	err = bt.removeChildFromParent(999, []pathEntry{{pgno: rootPg.pgno}})
-	assert.NoError(t, err)
+	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
 // =============================================================================
