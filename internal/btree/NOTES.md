@@ -1449,7 +1449,7 @@ Measured on 5000 monotonic appends at pageSize=1024, valSize=80:
 
 Guarded by `TestBalanceQuick_AppendFillFactor` (the former diagnostic,
 now asserting `avgFill >= 0.85` on the monotonic case) and the
-`TestBalanceQuick_*` matrix in `btree_balance_quick_rgrd_test.go`
+`TestBalanceQuick_*` matrix in `btree_balance_quick_test.go`
 (HappyPath, RootIsParent, CascadeToParentSplit, InterleavedInserts,
 OverflowBearingCell, SavepointRollback, ConcurrentReader,
 AllocFreelistCorruptResilience).

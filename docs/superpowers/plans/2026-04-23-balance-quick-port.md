@@ -25,8 +25,11 @@
 - `internal/btree/NOTES.md` — document `pathEntry` (commit 1), update "Path Tracking Stores Only Page Numbers" status, and add a new "Rightmost-Append Fast Path (balance_quick port)" subsection (commit 4).
 
 **Created:**
-- `internal/btree/btree_path_test.go` — tests for path `cellIdx` correctness (commit 1).
-- `internal/btree/btree_balance_quick_rgrd_test.go` — regression-guard tests for the fast path (commit 4). (Name suffix `_rgrd` to avoid collision with the existing diagnostic file.)
+- Regression-guard tests for the fast path added to the existing
+  `internal/btree/btree_balance_quick_test.go` alongside the diagnostic
+  (commit 4).
+- Path `cellIdx` correctness tests added to
+  `internal/btree/btree_ops_test.go` (commit 1).
 
 **Promoted:**
 - `internal/btree/btree_balance_quick_test.go` — existing diagnostic gains lower-bound fill-factor assertions on the monotonic case in commit 4.
@@ -443,7 +446,7 @@ Expected: PASS.
 ### Task 1.7: Add `TestPath_CellIdxRightmost`
 
 **Files:**
-- Create: `internal/btree/btree_path_test.go`
+- Create: `internal/btree/btree_ops_test.go`
 
 - [ ] **Step 1: Write the new test file**
 
@@ -647,14 +650,14 @@ previously discarded). Consumers still re-scan parents to locate the child slot
 ```bash
 git -C /home/dev/work/any-store add \
   internal/btree/btree.go \
-  internal/btree/btree_path_test.go \
+  internal/btree/btree_ops_test.go \
   internal/btree/NOTES.md
 ```
 
 - [ ] **Step 2: Show the diff summary**
 
 Run: `git -C /home/dev/work/any-store diff --cached --stat`
-Expected: three files with modest line changes in btree.go, new file btree_path_test.go, small NOTES.md change.
+Expected: three files with modest line changes in btree.go, new file btree_ops_test.go, small NOTES.md change.
 
 - [ ] **Step 3: Commit**
 
@@ -1268,7 +1271,7 @@ Expected: exit 0.
 ### Task 4.2: Write the failing happy-path test
 
 **Files:**
-- Create: `internal/btree/btree_balance_quick_rgrd_test.go`
+- Create: `internal/btree/btree_balance_quick_test.go`
 
 - [ ] **Step 1: Create the regression-guard file**
 
@@ -1488,7 +1491,7 @@ If anything fails here, the dispatch guard is likely firing in a case it shouldn
 ### Task 4.6: Write `TestBalanceQuick_RootIsParent`
 
 **Files:**
-- Modify: `internal/btree/btree_balance_quick_rgrd_test.go` (append)
+- Modify: `internal/btree/btree_balance_quick_test.go` (append)
 
 - [ ] **Step 1: Append the test**
 
@@ -1934,7 +1937,7 @@ Expected: `TestIO_IntegrityCheckList_GetPageError` showing the
 create-data → checkpoint → close → corrupt-byte-via-os.ReadFile →
 reopen → trigger pattern.
 
-- [ ] **Step 2: Append the test to `btree_balance_quick_rgrd_test.go`**
+- [ ] **Step 2: Append the test to `btree_balance_quick_test.go`**
 
 ```go
 // TestBalanceQuick_AllocErrorCleanRollback forces allocatePage to fail
@@ -2250,7 +2253,7 @@ Measured on 5000 monotonic appends at pageSize=1024, valSize=80:
 leaves 714 → ~455 (+56.9% overhead eliminated), avg leaf fill 60.7%
 → ~99%. Guarded by `TestBalanceQuick_AppendFillFactor` (the former
 diagnostic, now asserting `avgFill >= 0.90`) and the
-`TestBalanceQuick_*` matrix in `btree_balance_quick_rgrd_test.go`.
+`TestBalanceQuick_*` matrix in `btree_balance_quick_test.go`.
 ```
 
 ### Task 4.16: Capture bench numbers for the commit message
@@ -2289,7 +2292,7 @@ git -C /home/dev/work/any-store add \
   internal/btree/btree.go \
   internal/btree/pager.go \
   internal/btree/btree_balance_quick_test.go \
-  internal/btree/btree_balance_quick_rgrd_test.go \
+  internal/btree/btree_balance_quick_test.go \
   internal/btree/bench_test.go \
   internal/btree/NOTES.md
 ```
@@ -2310,7 +2313,7 @@ keys >= sep", see btree.go:883) makes the new key itself the correct
 divider, unlike SQLite's intkey case which uses the largest key on
 pPage (btree.c:8066-8070).
 
-Regression-guard matrix in btree_balance_quick_rgrd_test.go:
+Regression-guard matrix in btree_balance_quick_test.go:
   - HappyPath: 1000 monotonic appends → avg leaf fill ≥ 87%, dispatch >0
   - RootIsParent: parent == rootPage → dispatch == 0
     (mirrors btree.c:9173 pParent->pgno != 1)
