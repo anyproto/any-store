@@ -263,6 +263,33 @@ func TestBackup_RestartOnCheckpointRestart(t *testing.T) {
 	_ = b.Finish()
 }
 
+func TestBackup_FinishTwiceIsError(t *testing.T) {
+	src, dst := backupPair(t)
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+
+	// Drain Step until done.
+	for {
+		err := b.Step(-1)
+		if err == ErrBackupDone {
+			break
+		}
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, b.Finish())
+	// DRIFT from backup.c:577 (tolerates NULL) — explicit error.
+	require.ErrorIs(t, b.Finish(), ErrBackupFinished)
+}
+
+func TestBackup_StepAfterFinishIsError(t *testing.T) {
+	src, dst := backupPair(t)
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+	require.NoError(t, b.Finish())
+	require.ErrorIs(t, b.Step(10), ErrBackupFinished)
+}
+
 // Note: direct unit-test of ErrBackupPageSizeMismatch would require
 // two DBs with different page sizes open simultaneously, which is
 // impossible in any-store (pageBufferPool is a process-global singleton,

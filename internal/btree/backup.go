@@ -176,6 +176,9 @@ func (b *Backup) Step(nPage int) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	if b.finished {
+		return ErrBackupFinished
+	}
 	if b.rc != nil && b.rc != ErrBackupDone {
 		return b.rc // ~ isFatalError check at backup.c:329
 	}
@@ -309,6 +312,11 @@ func (b *Backup) restart() {
 func (b *Backup) Finish() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if b.finished {
+		return ErrBackupFinished
+	}
+	b.finished = true
 
 	if b.isAttached {
 		b.src.pager.detachBackup(b)
