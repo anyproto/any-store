@@ -138,6 +138,12 @@ type pager struct {
 	// because we cannot modify the page struct in page.go.
 	dontWritePages map[uint32]bool
 
+	// backups is the list of in-flight online backups reading from this
+	// pager. ~ Pager.pBackup (singly-linked list head in SQLite). Go slice
+	// is simpler since we never insert from callback context.
+	backups   []*Backup
+	backupsMu sync.Mutex
+
 	// hasContent tracks pages that were freed as freelist leaf pages during
 	// the current write transaction. When such a page is re-allocated from
 	// the freelist, it must NOT use the NOCONTENT optimization because the
@@ -1606,6 +1612,11 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	// Capture nFrame atomically for checkpoint threshold decision.
 	nFrame = p.wal.nFrame.Load()
 
+	// Notify online backups that these pages have new committed content.
+	// ~ sqlite3BackupUpdate dispatch (backup.c:687). Must happen here,
+	// AFTER the WAL frames are durable, so dst sees committed data only.
+	p.dispatchBackupUpdate(p.dirtyBuf)
+
 	// Mark all pages as clean
 	for _, pg := range p.dirtyBuf {
 		p.writerCache.makeClean(pg)
@@ -1973,7 +1984,13 @@ func (p *pager) releaseSavepoint(id int) error {
 // The WAL's busy handler is used for FULL/RESTART/TRUNCATE modes to wait
 // for readers that block progress, matching SQLite's behavior.
 func (p *pager) checkpointWithMode(mode CheckpointMode) error {
-	return p.wal.checkpointWithMode(p.file, p.master, mode, p.wal.busyHandler)
+	err := p.wal.checkpointWithMode(p.file, p.master, mode, p.wal.busyHandler)
+	if err == nil && (mode == CheckpointRestart || mode == CheckpointTruncate) {
+		// ~ sqlite3BackupRestart (backup.c:701-707). WAL frame numbering
+		// has reset, so any in-flight backup must start over.
+		p.dispatchBackupRestart()
+	}
+	return err
 }
 
 // tryCheckpoint attempts a passive checkpoint for auto-checkpoint.
@@ -1994,7 +2011,11 @@ func (p *pager) tryCheckpoint() error {
 	// cursor can return true prematurely and schedule a RESTART that races
 	// the peer's fresh frames. See NOTES.md §"Checkpoint mxFrame source fix".
 	if p.wal.index.nBackfill.Load() >= p.wal.authoritativeMxFrame() {
-		_ = p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil)
+		if err := p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil); err == nil {
+			// ~ sqlite3BackupRestart (backup.c:701-707) also applies to
+			// auto-checkpoint's best-effort restart.
+			p.dispatchBackupRestart()
+		}
 	}
 	return nil
 }
@@ -2271,6 +2292,89 @@ func (p *pager) freeOverflowChain(firstPgno uint32) error {
 		pgno = nextPgno
 	}
 	return nil
+}
+
+// truncateTo shrinks the database to the given page count. Matches
+// SQLite's sqlite3PagerTruncateImage (pager.c). Discards writerCache
+// entries above the new size (via pcache.truncate) and updates the
+// atomic dbSize so subsequent writes see the new bound. Physical file
+// truncation happens at the next checkpoint.
+func (p *pager) truncateTo(newDbSize uint32) error {
+	if pagerState(p.state.Load()) != pagerWriter {
+		return ErrReadOnly
+	}
+	if newDbSize == 0 {
+		return errors.New("btree: cannot truncate to zero pages")
+	}
+	cur := p.dbSize.Load()
+	if newDbSize >= cur {
+		return nil
+	}
+	p.writerCache.truncate(newDbSize)
+	p.dbSize.Store(newDbSize)
+	p.header.DatabaseSize = newDbSize
+	return nil
+}
+
+// attachBackup registers a Backup object to receive update/restart
+// callbacks. ~ attachBackupObject (backup.c:302–309).
+func (p *pager) attachBackup(b *Backup) {
+	p.backupsMu.Lock()
+	p.backups = append(p.backups, b)
+	p.backupsMu.Unlock()
+}
+
+// detachBackup removes a Backup from the list. ~ inverse of
+// attachBackupObject; called by Backup.Finish (~ backup.c:589–597).
+func (p *pager) detachBackup(b *Backup) {
+	p.backupsMu.Lock()
+	defer p.backupsMu.Unlock()
+	for i, x := range p.backups {
+		if x == b {
+			p.backups = append(p.backups[:i], p.backups[i+1:]...)
+			return
+		}
+	}
+}
+
+// dispatchBackupUpdate notifies every registered Backup that the given
+// dirty pages have been committed to this pager's WAL. Called from
+// pager.commit just after wal.writeFrames succeeds, so the page data
+// we hand to each backup is the authoritative post-commit version.
+// ~ sqlite3BackupUpdate dispatch (backup.c:687–688).
+func (p *pager) dispatchBackupUpdate(dirty []*page) {
+	p.backupsMu.Lock()
+	if len(p.backups) == 0 {
+		p.backupsMu.Unlock()
+		return
+	}
+	// Copy the slice so callbacks can run outside the lock without
+	// nesting b.mu under backupsMu.
+	bs := make([]*Backup, len(p.backups))
+	copy(bs, p.backups)
+	p.backupsMu.Unlock()
+
+	for _, pg := range dirty {
+		for _, b := range bs {
+			b.update(pg.pgno, pg.data)
+		}
+	}
+}
+
+// dispatchBackupRestart notifies every registered Backup to restart
+// from page 1. ~ sqlite3BackupRestart (backup.c:701–707).
+func (p *pager) dispatchBackupRestart() {
+	p.backupsMu.Lock()
+	if len(p.backups) == 0 {
+		p.backupsMu.Unlock()
+		return
+	}
+	bs := make([]*Backup, len(p.backups))
+	copy(bs, p.backups)
+	p.backupsMu.Unlock()
+	for _, b := range bs {
+		b.restart()
+	}
 }
 
 // withWriteLock acquires WAL_WRITE_LOCK exclusive via the configured busy

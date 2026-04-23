@@ -538,19 +538,52 @@ func (db *db) IntegrityCheck(ctx context.Context) (err error) {
 }
 
 func (db *db) Backup(ctx context.Context, path string) (err error) {
-	// Read the source file and copy it
-	srcPath := db.btreeDB.Path()
+	// ~ SQLite's recommended online-backup pattern (see backup.c header
+	// comment at lines 11-13 and the sqlite3_backup_init/step/finish
+	// sequence). We open a fresh destination DB at `path` with
+	// identical Options to the source so page sizes match.
+	dstOpts := db.btreeDB.Options()
+	dstOpts.InMemory = false // destination is always a file (user gave us a path)
 
-	// Checkpoint first to ensure all WAL data is in the main file
-	if err = db.btreeDB.Checkpoint(btree.CheckpointFull); err != nil {
-		return err
+	dstDB, err := btree.Open(path, dstOpts)
+	if err != nil {
+		return fmt.Errorf("open backup destination: %w", err)
 	}
+	defer func() {
+		if cerr := dstDB.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+		if err != nil {
+			_ = osRemove(path)
+		}
+	}()
 
-	srcData, err := osReadFile(srcPath)
+	b, err := dstDB.BackupInit(db.btreeDB)
 	if err != nil {
 		return err
 	}
-	return osWriteFile(path, srcData, 0644)
+	defer func() {
+		if ferr := b.Finish(); ferr != nil && err == nil && !errors.Is(ferr, btree.ErrBackupFinished) {
+			err = ferr
+		}
+	}()
+
+	// Copy in bounded batches so ctx cancellation is responsive.
+	// SQLite's sqlite3BtreeCopyFile (backup.c:751) uses 0x7FFFFFFF in one
+	// shot; we prefer yielding.
+	const batch = 256
+	for {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		serr := b.Step(batch)
+		if errors.Is(serr, btree.ErrBackupDone) {
+			return nil
+		}
+		if serr != nil {
+			return serr
+		}
+	}
 }
 
 func (db *db) WriteTx(ctx context.Context) (tx WriteTx, err error) {

@@ -1768,3 +1768,38 @@ These SQLite features are intentionally absent:
 - **Multi-database transactions** -- single database per connection
 - **WAL2 mode** -- standard WAL only
 - **Database file locking (RESERVED/PENDING/EXCLUSIVE)** -- WAL mode uses SHM locks
+
+---
+
+## Online Backup (backup.go)
+
+Port of SQLite's `sqlite3_backup_*` API from `sqlite/src/backup.c`. See
+`docs/plans/2026-04-22-sqlite-backup-port.md` for the full drift
+register and C↔Go coverage table. Key entry points:
+
+- `(*DB).BackupInit(src *DB) (*Backup, error)` -- ~ `sqlite3_backup_init`
+- `(*Backup).Step(n int) error` -- ~ `sqlite3_backup_step`
+- `(*Backup).Finish() error` -- ~ `sqlite3_backup_finish`
+- `(*Backup).Remaining() uint32` -- ~ `sqlite3_backup_remaining`
+- `(*Backup).PageCount() uint32` -- ~ `sqlite3_backup_pagecount`
+
+Hooks in `pager.commit()` (post-`wal.writeFrames`) and
+`pager.checkpointWithMode()` (Restart/Truncate modes) dispatch the C
+equivalents of `sqlite3BackupUpdate` and `sqlite3BackupRestart`
+respectively. See `pager.dispatchBackupUpdate` /
+`pager.dispatchBackupRestart`. External-process writes are detected at
+each Step's read tx via the page-1 `FileChangeCounter` and trigger the
+same restart.
+
+Anystore-level `(*db).Backup(ctx, path)` drives the engine by opening
+a fresh destination DB at `path` with matching options.
+
+**Key intentional simplifications** (full list in the plan document):
+- Always same-page-size: any-store is WAL-only, so `backup.c:378-383`'s
+  `SQLITE_READONLY` for WAL+size-mismatch is our `ErrBackupPageSizeMismatch`
+  at init. The cross-size packing path at `backup.c:449-528` is
+  therefore unreachable.
+- No `PENDING_BYTE_PAGE` handling -- any-store has no 1GB lock byte.
+- No attached-db name resolution (`findBtree`) -- one b-tree per DB.
+- No `nBackup` counter on source -- nothing for it to block (no
+  VACUUM, immutable page size).

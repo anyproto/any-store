@@ -10,6 +10,7 @@ var (
 	osStat      = os.Stat
 	osReadFile  = os.ReadFile
 	osWriteFile = os.WriteFile
+	osRemove    = os.Remove
 )
 
 // File and VFS are always available for type-checking.

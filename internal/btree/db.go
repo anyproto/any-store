@@ -357,6 +357,41 @@ func (db *DB) Path() string {
 	return db.path
 }
 
+// PageSize returns the fixed page size in bytes for this database.
+// ~ sqlite3BtreeGetPageSize (btree.c). Unlike SQLite, our page size is
+// immutable after Open — set from Options.PageSize or read from the header.
+func (db *DB) PageSize() uint32 {
+	return db.pager.pageSize
+}
+
+// DatabaseSize returns the current number of pages in the database,
+// including page 1 (the header page). ~ sqlite3BtreeLastPage (btree.c).
+// Reads the atomic pager.dbSize directly; safe under any concurrent
+// transaction state because dbSize is monotonic within the current
+// WAL snapshot visible to the caller.
+func (db *DB) DatabaseSize() uint32 {
+	return db.pager.dbSize.Load()
+}
+
+// HasOpenTransaction returns true if the DB has an active read or write
+// transaction. Write state is tracked on the pager; reader state lives
+// on the DB's readerSem (pager.state only transitions for writers).
+// ~ sqlite3BtreeTxnState != SQLITE_TXN_NONE (backup.c:125).
+func (db *DB) HasOpenTransaction() bool {
+	if pagerState(db.pager.state.Load()) != pagerOpen {
+		return true
+	}
+	return len(db.readerSem) > 0
+}
+
+// Options returns a copy of the options this DB was opened with. Used
+// by high-level callers (e.g. anystore.Backup) to open a destination
+// DB with matching page size. No direct SQLite counterpart — SQLite
+// uses attached-db paths to imply options.
+func (db *DB) Options() Options {
+	return db.opts
+}
+
 // beginRead starts a read-only transaction.
 // When readCounters is false, disk counters are initialized from local counters
 // without reading page-1 metadata, which is useful for hot point-lookups.
