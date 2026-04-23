@@ -137,6 +137,12 @@ type pager struct {
 	// because we cannot modify the page struct in page.go.
 	dontWritePages map[uint32]bool
 
+	// backups is the list of in-flight online backups reading from this
+	// pager. ~ Pager.pBackup (singly-linked list head in SQLite). Go slice
+	// is simpler since we never insert from callback context.
+	backups   []*Backup
+	backupsMu sync.Mutex
+
 	// hasContent tracks pages that were freed as freelist leaf pages during
 	// the current write transaction. When such a page is re-allocated from
 	// the freelist, it must NOT use the NOCONTENT optimization because the
@@ -2030,6 +2036,27 @@ func (p *pager) freeOverflowChain(firstPgno uint32) error {
 		pgno = nextPgno
 	}
 	return nil
+}
+
+// attachBackup registers a Backup object to receive update/restart
+// callbacks. ~ attachBackupObject (backup.c:302–309).
+func (p *pager) attachBackup(b *Backup) {
+	p.backupsMu.Lock()
+	p.backups = append(p.backups, b)
+	p.backupsMu.Unlock()
+}
+
+// detachBackup removes a Backup from the list. ~ inverse of
+// attachBackupObject; called by Backup.Finish (~ backup.c:589–597).
+func (p *pager) detachBackup(b *Backup) {
+	p.backupsMu.Lock()
+	defer p.backupsMu.Unlock()
+	for i, x := range p.backups {
+		if x == b {
+			p.backups = append(p.backups[:i], p.backups[i+1:]...)
+			return
+		}
+	}
 }
 
 // close closes the pager, WAL, and database file.

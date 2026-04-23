@@ -89,6 +89,81 @@ func TestBackup_OnePage_CopiesPageDataAndClearsMemPageFlag(t *testing.T) {
 	require.Equal(t, srcPg1.data[32:], dstPg1.data[32:], "dst page 1 bytes [32:] must match src")
 }
 
+func TestBackup_Step_OfflineCopy(t *testing.T) {
+	src, dst := backupPair(t)
+
+	// Populate src with 500 records to exercise multi-page copies.
+	ns, _ := src.GetNamespace("data")
+	stx, err := src.BeginWrite()
+	require.NoError(t, err)
+	fat := make([]byte, 200)
+	for i := 0; i < 500; i++ {
+		k := fmt.Appendf(nil, "key-%04d", i)
+		require.NoError(t, stx.Put(ns, k, fat))
+	}
+	require.NoError(t, stx.Commit())
+	require.NoError(t, src.Checkpoint(CheckpointFull))
+
+	srcPageCount := src.DatabaseSize()
+	require.Greater(t, srcPageCount, uint32(2), "need multi-page src for realistic test")
+
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+
+	// Copy everything in one step — nPage < 0 means "all remaining".
+	// ~ sqlite3_backup_step (backup.c:314); nPage=-1 means unlimited.
+	err = b.Step(-1)
+	require.ErrorIs(t, err, ErrBackupDone, "Step must signal completion with ErrBackupDone ~ SQLITE_DONE (backup.c:406)")
+
+	require.Equal(t, srcPageCount, b.PageCount())
+	require.Equal(t, uint32(0), b.Remaining())
+
+	require.NoError(t, b.Finish())
+
+	// Reopen dst and verify data.
+	dstPath := dst.Path()
+	_ = dst.Close()
+	d2, err := Open(dstPath, DefaultOptions())
+	require.NoError(t, err)
+	defer d2.Close()
+	rtx, err := d2.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	ns2, err := d2.GetNamespace("data")
+	require.NoError(t, err, "namespace 'data' must exist in backup")
+	got, err := rtx.Get(ns2, []byte("key-0042"))
+	require.NoError(t, err)
+	require.Len(t, got, len(fat))
+}
+
+func TestBackup_Step_BatchedCopy(t *testing.T) {
+	src, dst := backupPair(t)
+
+	ns, _ := src.GetNamespace("data")
+	stx, err := src.BeginWrite()
+	require.NoError(t, err)
+	fat := make([]byte, 200)
+	for i := 0; i < 300; i++ {
+		require.NoError(t, stx.Put(ns, fmt.Appendf(nil, "k-%04d", i), fat))
+	}
+	require.NoError(t, stx.Commit())
+	require.NoError(t, src.Checkpoint(CheckpointFull))
+
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+
+	// Batched: each Step copies exactly 2 pages. Keep looping until done.
+	for {
+		err := b.Step(2)
+		if err == ErrBackupDone {
+			break
+		}
+		require.NoError(t, err, "Step should return nil while pages remain")
+		require.Greater(t, b.PageCount(), uint32(0))
+	}
+	require.NoError(t, b.Finish())
+}
+
 // Note: direct unit-test of ErrBackupPageSizeMismatch would require
 // two DBs with different page sizes open simultaneously, which is
 // impossible in any-store (pageBufferPool is a process-global singleton,

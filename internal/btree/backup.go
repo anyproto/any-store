@@ -164,3 +164,137 @@ func putUint32BE(buf []byte, v uint32) {
 	buf[2] = byte(v >> 8)
 	buf[3] = byte(v)
 }
+
+// Step copies up to nPage pages from the source to the destination.
+// nPage < 0 means "copy all remaining pages in one call". Returns
+// ErrBackupDone when every source page has been copied; returns nil
+// when more work remains. Any other error is sticky — recorded in b.rc
+// and re-returned by future calls (~ backup.c:329 + backup.c:558).
+//
+// ~ sqlite3_backup_step (backup.c:314–566).
+func (b *Backup) Step(nPage int) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.rc != nil && b.rc != ErrBackupDone {
+		return b.rc // ~ isFatalError check at backup.c:329
+	}
+
+	// Open a read transaction on source for this Step. ~ backup.c:346–353.
+	// DRIFT: SQLite conditionally opens a tx only if none exists, to
+	// support explicit sqlite3_backup_step-inside-a-user-tx patterns.
+	// any-store doesn't expose that; we always open+close our own.
+	rtx, err := b.src.BeginRead()
+	if err != nil {
+		b.rc = err
+		return err
+	}
+	defer rtx.Rollback()
+
+	// Lock destination (exclusive/write tx) on first Step.
+	// ~ backup.c:366–371: sqlite3BtreeBeginTrans(p->pDest, 2, &iDestSchema).
+	if !b.dstLocked {
+		wtx, err := b.dst.BeginWrite()
+		if err != nil {
+			b.rc = err
+			return err
+		}
+		b.dstWriteTx = wtx
+		b.iDstSchema = b.dst.localSchemaCookie.Load() // ~ iDestSchema capture
+		b.dstLocked = true
+	}
+
+	nSrcPage := b.src.DatabaseSize() // ~ backup.c:388
+	srcPgsz := b.src.PageSize()
+
+	// Main copy loop. ~ backup.c:390–401.
+	for ii := 0; (nPage < 0 || ii < nPage) && b.iNext <= nSrcPage; ii++ {
+		iSrcPg := b.iNext
+		// DRIFT #1 skips PENDING_BYTE_PAGE check at backup.c:392.
+
+		srcPg, err := b.src.pager.getPageReader(iSrcPg, rtx.walMaxFrame, rtx.cache)
+		if err != nil {
+			b.rc = err
+			return err
+		}
+		// No explicit releasePage on reader cache — tx.Rollback handles it.
+
+		if err := b.onePage(iSrcPg, srcPg.data[:srcPgsz], false); err != nil {
+			b.rc = err
+			return err
+		}
+		b.iNext++
+	}
+
+	// ~ backup.c:402–410.
+	b.nPagecount = nSrcPage
+	if b.iNext > nSrcPage {
+		b.nRemaining = 0
+	} else {
+		b.nRemaining = nSrcPage + 1 - b.iNext
+	}
+
+	if b.iNext > nSrcPage {
+		// All pages copied. Finalization (backup.c:417–541) — schema bump
+		// and truncate — lands in Task 9. For this task, we simply mark
+		// done; the dst write tx stays open until Finish commits it.
+		b.rc = ErrBackupDone
+		return ErrBackupDone
+	}
+
+	// Still pages to go — attach for update hooks (Task 5). No-op here.
+	if !b.isAttached {
+		b.src.pager.attachBackup(b)
+		b.isAttached = true
+	}
+	return nil
+}
+
+// Remaining returns the number of pages still to be backed up as of
+// the most recent Step call. ~ sqlite3_backup_remaining (backup.c:625–633).
+func (b *Backup) Remaining() uint32 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.nRemaining
+}
+
+// PageCount returns the total number of pages in the source as of the
+// most recent Step call. ~ sqlite3_backup_pagecount (backup.c:639–647).
+func (b *Backup) PageCount() uint32 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.nPagecount
+}
+
+// Finish releases all resources associated with a Backup and commits
+// or rolls back the destination write transaction based on b.rc.
+// ~ sqlite3_backup_finish (backup.c:571–619).
+func (b *Backup) Finish() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.isAttached {
+		b.src.pager.detachBackup(b)
+		b.isAttached = false
+	}
+
+	// ~ backup.c:600: if a dst tx is still open, commit on success, else rollback.
+	var finishErr error
+	if b.dstWriteTx != nil {
+		if b.rc == ErrBackupDone {
+			finishErr = b.dstWriteTx.Commit()
+		} else {
+			finishErr = b.dstWriteTx.Rollback()
+		}
+		b.dstWriteTx = nil
+	}
+
+	// ~ backup.c:603: return rc translated to OK on DONE.
+	if b.rc == ErrBackupDone {
+		if finishErr != nil {
+			return finishErr
+		}
+		return nil
+	}
+	return b.rc
+}
