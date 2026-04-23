@@ -11,6 +11,7 @@ package btree
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -2050,6 +2051,28 @@ func (p *pager) freeOverflowChain(firstPgno uint32) error {
 		}
 		pgno = nextPgno
 	}
+	return nil
+}
+
+// truncateTo shrinks the database to the given page count. Matches
+// SQLite's sqlite3PagerTruncateImage (pager.c). Discards writerCache
+// entries above the new size (via pcache.truncate) and updates the
+// atomic dbSize so subsequent writes see the new bound. Physical file
+// truncation happens at the next checkpoint.
+func (p *pager) truncateTo(newDbSize uint32) error {
+	if pagerState(p.state.Load()) != pagerWriter {
+		return ErrReadOnly
+	}
+	if newDbSize == 0 {
+		return errors.New("btree: cannot truncate to zero pages")
+	}
+	cur := p.dbSize.Load()
+	if newDbSize >= cur {
+		return nil
+	}
+	p.writerCache.truncate(newDbSize)
+	p.dbSize.Store(newDbSize)
+	p.header.DatabaseSize = newDbSize
 	return nil
 }
 

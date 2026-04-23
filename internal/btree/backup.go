@@ -245,9 +245,12 @@ func (b *Backup) Step(nPage int) error {
 	}
 
 	if b.iNext > nSrcPage {
-		// All pages copied. Finalization (backup.c:417–541) — schema bump
-		// and truncate — lands in Task 9. For this task, we simply mark
-		// done; the dst write tx stays open until Finish commits it.
+		// All pages copied. ~ backup.c:417-541 finalization: schema bump
+		// and truncate dst to nSrcPage. Finish commits the write tx.
+		if err := b.finalize(nSrcPage); err != nil {
+			b.rc = err
+			return err
+		}
 		b.rc = ErrBackupDone
 		return ErrBackupDone
 	}
@@ -274,6 +277,35 @@ func (b *Backup) PageCount() uint32 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.nPagecount
+}
+
+// finalize performs the pre-commit housekeeping that backup.c does at
+// the end of its final Step iteration (backup.c:417–541):
+//   - ~ backup.c:423: sqlite3BtreeUpdateMeta(p->pDest, 1, p->iDestSchema+1)
+//   - ~ backup.c:530: sqlite3PagerTruncateImage(pDestPager, nDestTruncate)
+//
+// Both mutate the destination; Finish then commits the result.
+// Caller holds b.mu.
+func (b *Backup) finalize(nSrcPage uint32) error {
+	// 1. Bump dst schema cookie. ~ sqlite3BtreeUpdateMeta writes meta
+	// value #1 (the schema cookie) to the header at offset 40. Our page 1
+	// has the source's header bytes copied in; we overwrite offset 40
+	// with iDstSchema+1 so readers on dst observe a different cookie
+	// than they did pre-backup, invalidating any cached schema parses.
+	dstPg1, err := b.dst.pager.getWritablePage(1)
+	if err != nil {
+		return err
+	}
+	newCookie := b.iDstSchema + 1
+	putUint32BE(dstPg1.data[40:44], newCookie)
+	// Keep the in-memory header in sync so commit's page-1 serialize
+	// (pager.commit:1371) doesn't clobber our write.
+	b.dst.pager.header.SchemaCookie = newCookie
+	b.dst.pager.releasePage(dstPg1)
+
+	// 2. Truncate dst to nSrcPage. ~ sqlite3PagerTruncateImage
+	// (backup.c:530). Shrinks dst.dbSize; file shrinks at next checkpoint.
+	return b.dst.pager.truncateTo(nSrcPage)
 }
 
 // update is called by the source pager right after a committed page is

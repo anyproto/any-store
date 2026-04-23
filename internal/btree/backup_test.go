@@ -313,6 +313,79 @@ func TestBackupInit_RejectsDstWithOpenWriteTx(t *testing.T) {
 	require.ErrorIs(t, err, ErrBackupDstBusy)
 }
 
+func TestBackup_TruncatesLargerDst(t *testing.T) {
+	src, dst := backupPair(t)
+
+	// Populate dst with MORE data than src. backupPair creates "data" on
+	// src but not on dst, so create it here first.
+	dtx0, err := dst.BeginWrite()
+	require.NoError(t, err)
+	_, err = dtx0.CreateNamespace("data")
+	require.NoError(t, err)
+	require.NoError(t, dtx0.Commit())
+
+	dns, _ := dst.GetNamespace("data")
+	dtx, err := dst.BeginWrite()
+	require.NoError(t, err)
+	fat := make([]byte, 256)
+	for i := 0; i < 500; i++ {
+		require.NoError(t, dtx.Put(dns, fmt.Appendf(nil, "dst-%04d", i), fat))
+	}
+	require.NoError(t, dtx.Commit())
+	dstOrigSize := dst.DatabaseSize()
+
+	// src has only a tiny amount.
+	sns, _ := src.GetNamespace("data")
+	stx, err := src.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, stx.Put(sns, []byte("small"), []byte("v")))
+	require.NoError(t, stx.Commit())
+	srcSize := src.DatabaseSize()
+	require.Less(t, srcSize, dstOrigSize, "test setup: dst must be larger than src")
+
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+	for {
+		err := b.Step(-1)
+		if err == ErrBackupDone {
+			break
+		}
+		require.NoError(t, err)
+	}
+	require.NoError(t, b.Finish())
+
+	// ~ backup.c:530 — dst must be truncated to srcSize.
+	require.Equal(t, srcSize, dst.DatabaseSize(),
+		"post-backup dst size should equal src size (backup.c:530 truncate)")
+}
+
+func TestBackup_BumpsDstSchemaCookie(t *testing.T) {
+	src, dst := backupPair(t)
+
+	rtx0, err := dst.BeginRead()
+	require.NoError(t, err)
+	dstCookieBefore := rtx0.DiskSchemaCookie()
+	require.NoError(t, rtx0.Rollback())
+
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+	for {
+		err := b.Step(-1)
+		if err == ErrBackupDone {
+			break
+		}
+		require.NoError(t, err)
+	}
+	require.NoError(t, b.Finish())
+
+	// ~ backup.c:423 — schema cookie must have been bumped.
+	rtx1, err := dst.BeginRead()
+	require.NoError(t, err)
+	defer rtx1.Rollback()
+	require.NotEqual(t, dstCookieBefore, rtx1.DiskSchemaCookie(),
+		"post-backup dst schema cookie must differ from pre-backup (backup.c:423 bump)")
+}
+
 // Note: direct unit-test of ErrBackupPageSizeMismatch would require
 // two DBs with different page sizes open simultaneously, which is
 // impossible in any-store (pageBufferPool is a process-global singleton,
