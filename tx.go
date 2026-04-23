@@ -121,6 +121,7 @@ func (w writeTx) Commit() error {
 	if w.commonTx.version.CompareAndSwap(w.version, 0) {
 		defer txPool.Put(w.commonTx)
 		if w.modified {
+			w.writeTx.MarkDataChanged()
 			if err := w.db.persistAllDirtySketches(w.writeTx); err != nil {
 				_ = w.writeTx.Rollback()
 				return err

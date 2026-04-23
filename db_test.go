@@ -114,9 +114,6 @@ func TestDb_Flush(t *testing.T) {
 }
 
 func TestDb_Backup(t *testing.T) {
-	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
-		t.Skip("Backup reads DB file from disk")
-	}
 	fx := newFixture(t)
 	coll, err := fx.Collection(ctx, "coll")
 	require.NoError(t, err)
@@ -133,6 +130,40 @@ func TestDb_Backup(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, coll2.GetIndexes(), 1)
 	assertCollCount(t, coll2, 2)
+}
+
+func TestDb_Backup_OnlineDuringWrites(t *testing.T) {
+	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
+		t.Skip("concurrent-writer test; file backend only")
+	}
+	fx := newFixture(t)
+	coll, err := fx.Collection(ctx, "coll")
+	require.NoError(t, err)
+
+	// Seed 500 docs.
+	for i := 0; i < 500; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d, "val":"seed"}`, i))))
+	}
+
+	tmpDir, err := os.MkdirTemp("", "any-store-backup-online-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+	backupPath := filepath.Join(tmpDir, "any-store-test.db")
+
+	// Start backup and a concurrent writer.
+	done := make(chan error, 1)
+	go func() { done <- fx.Backup(ctx, backupPath) }()
+
+	for i := 0; i < 50; i++ {
+		_ = coll.UpsertOne(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d, "val":"updated"}`, i)))
+	}
+
+	require.NoError(t, <-done)
+
+	fx2 := newFixturePath(t, tmpDir)
+	coll2, err := fx2.Collection(ctx, "coll")
+	require.NoError(t, err)
+	assertCollCount(t, coll2, 500)
 }
 
 func TestDb_Close(t *testing.T) {

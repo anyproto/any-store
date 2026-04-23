@@ -413,7 +413,7 @@ func TestDeep_InsertIntoParentSmallPage(t *testing.T) {
 	require.NoError(t, p.open())
 	_, slot, err := p.beginRead()
 	require.NoError(t, err)
-	require.NoError(t, p.beginWrite())
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 	t.Cleanup(func() {
 		_ = p.rollback()
 		p.endRead(slot)

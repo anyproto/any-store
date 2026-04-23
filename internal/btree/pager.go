@@ -11,6 +11,7 @@ package btree
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -70,23 +71,23 @@ func (ms *masterStore) writePage(pgno uint32, src []byte) {
 
 // pager manages database pages, cache, and WAL interaction.
 type pager struct {
-	mu       sync.RWMutex
-	file     fileHandle
-	wal      *wal
+	mu          sync.RWMutex
+	file        fileHandle
+	wal         *wal
 	writerCache *pcache
 
 	// writerOpMu serializes pager write operations (commit, rollback) so
 	// that DB.Close can safely force-rollback an abandoned transaction
 	// without racing with a concurrent commit. Per-connection pcache has
 	// no mutex, so this pager-level lock is the serialization point.
-	writerOpMu sync.Mutex
-	master   *masterStore // InMemory "disk" — holds checkpointed page data
-	header       dbHeader
-	path         string
-	pageSize     uint32
-	usableSize_  int // pageSize - ReservedSpace; immutable after open, safe for concurrent reads
-	dbSize   atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
-	state    atomic.Int32 // pagerState
+	writerOpMu  sync.Mutex
+	master      *masterStore // InMemory "disk" — holds checkpointed page data
+	header      dbHeader
+	path        string
+	pageSize    uint32
+	usableSize_ int           // pageSize - ReservedSpace; immutable after open, safe for concurrent reads
+	dbSize      atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
+	state       atomic.Int32  // pagerState
 
 	// Savepoint support: snapshots of dirty pages at savepoint boundaries
 	savepoints []savepointState
@@ -137,6 +138,12 @@ type pager struct {
 	// because we cannot modify the page struct in page.go.
 	dontWritePages map[uint32]bool
 
+	// backups is the list of in-flight online backups reading from this
+	// pager. ~ Pager.pBackup (singly-linked list head in SQLite). Go slice
+	// is simpler since we never insert from callback context.
+	backups   []*Backup
+	backupsMu sync.Mutex
+
 	// hasContent tracks pages that were freed as freelist leaf pages during
 	// the current write transaction. When such a page is re-allocated from
 	// the freelist, it must NOT use the NOCONTENT optimization because the
@@ -167,6 +174,16 @@ type pager struct {
 	// useSlab is set once by btree.Open from Options.SlabPages.
 	// Local bool — no atomic/global reads on hot path.
 	useSlab bool
+
+	// mmapSize caps the DB-file mmap region. 0 disables. Populated
+	// from Options.MmapSize at open time; the dbMmap fetcher reads
+	// this via newDBMmap. See mmap_db.go.
+	mmapSize int64
+
+	// dbMmap is the optional mmap-backed DB-file reader. nil or
+	// disabled on platforms without mmap support / when mmapSize==0.
+	// See mmap_db.go.
+	dbMmap *dbMmap
 
 	// writerWalSlot is the writer's WAL reader slot number, stored here
 	// so Close can release it when force-rolling back an abandoned WriteTx.
@@ -199,13 +216,21 @@ type pager struct {
 
 // savepointState captures the state needed to rollback to a savepoint.
 type savepointState struct {
-	id       int
-	dbSize   uint32
-	pages    map[uint32][]byte // pgno -> copy of page data before modification
-	walFrame   uint32            // WAL frame count at savepoint time
-	walCksum1  uint32            // WAL cumulative checksum-1 at savepoint time
-	walCksum2  uint32            // WAL cumulative checksum-2 at savepoint time
-	header     dbHeader          // snapshot of database header at savepoint time (fix 9.3)
+	id     int
+	dbSize uint32
+	pages  map[uint32][]byte // pgno -> copy of page data before modification
+	// walHdr captures the WAL frame count + cumulative checksums at savepoint
+	// time. Only three fields of the hdr are consulted on rollback:
+	//   - mxFrame: truncate-back target for spill frames
+	//   - aFrameCksum[0], aFrameCksum[1]: running checksum chain restoration
+	// The remaining fields (nPage, salt, aCksum, isInit, ...) match the
+	// enclosing transaction's hdr and are stored for completeness/debugging
+	// only; rollbackToSavepoint does not read them. This widening from the
+	// earlier scalar `walFrame/walCksum1/walCksum2` triplet keeps the
+	// savepoint's WAL snapshot a peer of the tx-level walHdr — see
+	// rollbackToSavepoint in pager.go.
+	walHdr WalIndexHdr
+	header dbHeader // snapshot of database header at savepoint time (fix 9.3)
 }
 
 // newPager creates a new pager for the given database path.
@@ -231,6 +256,46 @@ func (p *pager) takeCellBuf(minCap int) []byte {
 		return buf
 	}
 	return nil
+}
+
+// readDBPage fills buf with the contents of pgno from the DB file.
+// Tries the mmap fetcher first; on miss (disabled, or offset outside
+// the current window), falls back to ReadAt. Matches SQLite's
+// getPageMMap → getPageNormal gate (pager.c:5670-5710).
+//
+// Callers preserve the legacy ReadAt error semantics: short reads
+// past EOF return the underlying io.ErrUnexpectedEOF / fs error from
+// ReadAt; the mmap path returns nil on success because the slice is
+// exactly len(buf) (checked in dbMmap.fetch).
+func (p *pager) readDBPage(pgno uint32, buf []byte) error {
+	if p.file == nil {
+		return fmt.Errorf("btree: db file closed")
+	}
+	offset := int64(pgno-1) * int64(p.pageSize)
+
+	if p.dbMmap.enabled() {
+		if p.dbMmap.readAt(buf, offset) {
+			return nil
+		}
+		// Miss: mapping not yet created or offset beyond current
+		// window. Try a remap to cover this page, then retry.
+		need := offset + int64(len(buf))
+		if err := p.dbMmap.remap(need); err == nil {
+			if p.dbMmap.readAt(buf, offset) {
+				return nil
+			}
+		} else if debugTrace {
+			// Silent mmap failure loses the fast path in production;
+			// log it under debug so operators can diagnose.
+			trace("readDBPage: dbMmap.remap(%d) failed: %v", need, err)
+		}
+		// Still a miss (mapping cap reached or mmap failed). Fall
+		// through to ReadAt — matches SQLite's "continue accessing
+		// using xRead()" pattern (os_unix.c:5579-5582).
+	}
+
+	_, err := p.file.ReadAt(buf, offset)
+	return err
 }
 
 // recycleCellBuf returns a byte buffer to the pager for reuse. Keeps the larger
@@ -282,6 +347,39 @@ func (p *pager) open() error {
 	}
 	p.file = f
 
+	// Initialize the optional mmap reader. No syscalls here — the
+	// underlying syscall.Mmap is deferred until the first fetch() to
+	// match SQLite's lazy initialization in unixFetch (os_unix.c:5727).
+	p.dbMmap = newDBMmap(f, p.mmapSize)
+
+	// Acquire a shared flock on the DB file. Held for the lifetime of
+	// this pager. Any closer attempting to upgrade to exclusive will
+	// BUSY-retry while we hold this — serializing shm unlink against
+	// new-opener races. Matches SQLite's sqlite3PagerSharedLock + the
+	// wal.c:2508 EXCLUSIVE-for-close invariant.
+	//
+	// Only applies to multi-process mode; in-process skips it (in-memory
+	// already returned above).
+	if !p.inProcess {
+		for attempt := 0; attempt < 100; attempt++ {
+			lockErr := acquireSharedDBLock(f)
+			if lockErr == nil {
+				break
+			}
+			if !errors.Is(lockErr, ErrBusy) {
+				_ = f.Close()
+				p.file = nil
+				return fmt.Errorf("btree: acquire DB-file shared lock: %w", lockErr)
+			}
+			if attempt == 99 {
+				_ = f.Close()
+				p.file = nil
+				return fmt.Errorf("btree: DB-file lock still busy after retries (peer mid-close?)")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
 	info, err := f.Stat()
 	if err != nil {
 		return err
@@ -305,6 +403,16 @@ func (p *pager) open() error {
 
 	if err := p.header.deserialize(buf[:dbHeaderSize]); err != nil {
 		return err
+	}
+
+	// VersionValidFor integrity sentinel: when non-zero, must equal
+	// FileChangeCount — a divergence means a writer crashed mid-update
+	// and the header on disk is half-new / half-old. Treat
+	// VersionValidFor==0 as "not initialized by this writer" (legacy
+	// DBs, pre-P3.3 test fixtures) and skip the check rather than
+	// reject. Matches SQLite's defensive-read-only interpretation.
+	if p.header.VersionValidFor != 0 && p.header.VersionValidFor != p.header.FileChangeCount {
+		return fmt.Errorf("%w: VersionValidFor=%d FileChangeCount=%d", ErrCorrupt, p.header.VersionValidFor, p.header.FileChangeCount)
 	}
 
 	p.pageSize = p.header.PageSize
@@ -509,15 +617,23 @@ func (p *pager) initNewDB() error {
 // beginRead starts a read transaction, taking a WAL snapshot.
 // Returns the WAL max frame for snapshot isolation and the reader slot number.
 func (p *pager) beginRead() (maxFrame uint32, slot int, err error) {
+	_, maxFrame, slot, err = p.beginReadHdr()
+	return maxFrame, slot, err
+}
+
+// beginReadHdr is beginRead plus the exact WAL header snapshot used to claim
+// the reader slot. Callers that may escalate to a write transaction should use
+// this so BUSY_SNAPSHOT compares against the same snapshot the read lock used.
+func (p *pager) beginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err error) {
 	p.mu.RLock()
 	if pagerState(p.state.Load()) == pagerError {
 		p.mu.RUnlock()
-		return 0, 0, ErrCorrupt
+		return WalIndexHdr{}, 0, 0, ErrCorrupt
 	}
-	maxFrame, slot, err = p.wal.beginRead()
+	hdr, maxFrame, slot, err = p.wal.beginReadHdr()
 	if err != nil {
 		p.mu.RUnlock()
-		return 0, 0, err
+		return WalIndexHdr{}, 0, 0, err
 	}
 	// Update pager's walMaxFrame monotonically: never decrease, since a reader
 	// with an older snapshot must not overwrite a newer value set by the writer.
@@ -530,7 +646,7 @@ func (p *pager) beginRead() (maxFrame uint32, slot int, err error) {
 			break
 		}
 	}
-	return maxFrame, slot, nil
+	return hdr, maxFrame, slot, nil
 }
 
 // endRead ends a read transaction for the given reader slot.
@@ -539,21 +655,32 @@ func (p *pager) endRead(slot int) {
 	p.mu.RUnlock()
 }
 
-// beginWrite starts a write transaction (must hold a read transaction first).
-func (p *pager) beginWrite() error {
-	// Save SHM header snapshot for BUSY_SNAPSHOT check in wal.beginWrite.
-	// Called here (single writer goroutine context) rather than in tryBeginRead
-	// which is also called by concurrent reader goroutines.
-	p.wal.saveReadSnapshot()
-
-	stateChanged, err := p.wal.beginWrite()
+// beginWrite starts a write transaction (must hold a read transaction
+// first). readSnap is the caller's WAL hdr from BeginRead (per-tx
+// walHdr); BUSY_SNAPSHOT compares it against live SHM inside
+// wal.beginWriteWithSnapshot. The snapshot is required — there is
+// deliberately no zero-arg form, because a WalIndexHdr{} snapshot
+// silently disables the BUSY_SNAPSHOT check and is a multi-process
+// correctness hazard (NOTES.md P0.2 drift, resolved).
+func (p *pager) beginWrite(readSnap WalIndexHdr) error {
+	stateChanged, err := p.wal.beginWriteWithSnapshot(readSnap)
 	if err != nil {
 		return err
 	}
 	// If another process changed WAL state (committed or checkpointed),
-	// our writerCache has stale pages and must be cleared.
+	// our writerCache has stale pages and must be cleared. We must also
+	// refresh p.header and p.dbSize from the new page 1 — without this,
+	// commit() would serialize our stale header back into page 1
+	// (corrupting the freelist / DatabaseSize) and allocatePage would
+	// hand out pgno slots the other process already wrote to.
+	//
+	// Mirrors SQLite's sqlite3PagerSharedLock pattern: on state change,
+	// reset cache and re-read page 1 (pager.c:5390-5449). Uses the same
+	// lookup pattern as readHeaderCounters so cross-process SHM hash
+	// tables are consulted in multi-process mode.
 	if stateChanged {
 		p.writerCache.clear()
+		p.refreshHeaderFromPage1()
 	}
 	p.state.Store(int32(pagerWriter))
 	// Save a snapshot of the database header so rollback can restore it (fix 5.2).
@@ -613,9 +740,7 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 
 	// Read from database file
 	if p.file != nil {
-		offset := int64(pgno-1) * int64(p.pageSize)
-		_, err := p.file.ReadAt(pg.data, offset)
-		if err != nil {
+		if err := p.readDBPage(pgno, pg.data); err != nil {
 			// If page is beyond current file but within dbSize, it's a new page
 			if pgno <= p.dbSize.Load() {
 				p.writerCache.discard(pg.pgno)
@@ -690,9 +815,7 @@ func (p *pager) readTempPage(pgno, walMaxFrame uint32, codecBuf []byte, codecAEA
 
 	// Read from database file.
 	if p.file != nil {
-		offset := int64(pgno-1) * int64(p.pageSize)
-		_, err := p.file.ReadAt(pg.data, offset)
-		if err != nil {
+		if err := p.readDBPage(pgno, pg.data); err != nil {
 			if pgno <= p.dbSize.Load() {
 				p.recycleTempPage(pg)
 				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
@@ -801,9 +924,7 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 
 	// Read from database file.
 	if p.file != nil {
-		offset := int64(pgno-1) * int64(p.pageSize)
-		_, err := p.file.ReadAt(pg.data, offset)
-		if err != nil {
+		if err := p.readDBPage(pgno, pg.data); err != nil {
 			if pgno <= p.dbSize.Load() {
 				cache.discard(pg.pgno)
 				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
@@ -934,20 +1055,35 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 	return pg, nil
 }
 
-// allocatePage allocates a new page and returns it.
-// It first checks the freelist for reusable pages before growing the database.
+// allocatePage allocates a new page and returns it. Equivalent to
+// allocatePageNear(0) — no locality hint. Most callers (btree splits,
+// root allocation) don't have a meaningful hint and use this form.
 func (p *pager) allocatePage() (*page, error) {
+	return p.allocatePageNear(0)
+}
+
+// allocatePageNear allocates a new page, preferring one close to the
+// given pgno when possible. Nearby == 0 disables the hint (same as
+// allocatePage). Matches SQLite's `allocateBtreePage(pBt, ..., nearby,
+// BTALLOC_ANY)` at btree.c:6499-6505 — used for overflow chains to
+// keep the chain pages contiguous on disk (btree.c:7197 fillInCell).
+//
+// Hint semantics: within the freelist trunk selected, the leaf with
+// minimum |leafPgno - nearby| is popped. If the freelist is empty we
+// fall through to growing the DB file; grow is always monotonic and
+// a hint has no meaning there.
+func (p *pager) allocatePageNear(nearby uint32) (*page, error) {
 	if pagerState(p.state.Load()) != pagerWriter {
 		return nil, ErrReadOnly
 	}
 
-	// Check freelist first
+	// Check freelist first.
 	if p.header.FirstFreelistPg != 0 {
-		pg, err := p.allocateFromFreelist()
+		pg, err := p.allocateFromFreelist(nearby)
 		if err == nil {
 			return pg, nil
 		}
-		// Fall through to grow database if freelist read fails
+		// Fall through to grow database if freelist read fails.
 	}
 
 	pgno := p.dbSize.Add(1)
@@ -1081,7 +1217,10 @@ func (p *pager) freePage(pgno uint32) error {
 }
 
 // allocateFromFreelist pops a page from the freelist and returns it.
-func (p *pager) allocateFromFreelist() (*page, error) {
+// If nearby > 0, the leaf with minimum |leafPgno - nearby| is selected
+// instead of the last leaf — matches SQLite btree.c:6678-6699 in
+// BTALLOC_ANY mode. Callers that don't care about locality pass 0.
+func (p *pager) allocateFromFreelist(nearby uint32) (*page, error) {
 	trunkPgno := p.header.FirstFreelistPg
 	if trunkPgno == 0 {
 		return nil, ErrInvalidPage
@@ -1106,8 +1245,29 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 	}
 
 	if leafCount > 0 {
-		// Pop the last leaf page number
-		leafPgno := binary.BigEndian.Uint32(trunkPg.data[8+(leafCount-1)*4:])
+		// Pick the leaf index to allocate. When nearby == 0, pop the
+		// last leaf (legacy behavior: O(1), cheap). When nearby > 0,
+		// walk the leaves and pick the one with minimum absolute
+		// distance to nearby — matches SQLite btree.c:6678-6699 in
+		// BTALLOC_ANY mode. O(leafCount) per allocation; for a 4 KiB
+		// page trunk holds ~1018 leaves → sub-µs scan on modern CPUs,
+		// dominated by page I/O anyway.
+		pickIdx := leafCount - 1
+		if nearby > 0 {
+			bestDist := int64(-1)
+			for i := 0; i < leafCount; i++ {
+				lp := binary.BigEndian.Uint32(trunkPg.data[8+i*4:])
+				d := int64(lp) - int64(nearby)
+				if d < 0 {
+					d = -d
+				}
+				if bestDist < 0 || d < bestDist {
+					bestDist = d
+					pickIdx = i
+				}
+			}
+		}
+		leafPgno := binary.BigEndian.Uint32(trunkPg.data[8+pickIdx*4:])
 
 		// Validate leaf page number (fix 5.1).
 		if leafPgno < 2 || leafPgno > p.dbSize.Load() {
@@ -1115,6 +1275,13 @@ func (p *pager) allocateFromFreelist() (*page, error) {
 			return nil, ErrCorrupt
 		}
 
+		// Compact: move the last leaf into the picked slot, then shrink.
+		// When pickIdx == leafCount-1 (legacy last-leaf case), the copy is
+		// a self-copy and degenerates into just the decrement.
+		if pickIdx != leafCount-1 {
+			lastLeaf := binary.BigEndian.Uint32(trunkPg.data[8+(leafCount-1)*4:])
+			binary.BigEndian.PutUint32(trunkPg.data[8+pickIdx*4:], lastLeaf)
+		}
 		binary.BigEndian.PutUint32(trunkPg.data[4:8], uint32(leafCount-1))
 		p.releasePage(trunkPg)
 
@@ -1304,6 +1471,55 @@ func (p *pager) getHasContent(pgno uint32) bool {
 	return p.hasContent[pgno]
 }
 
+// refreshHeaderFromPage1 refreshes p.header and p.dbSize from the latest
+// page 1 bytes, consulting WAL first (via SHM hash tables in multi-process
+// mode) and falling back to the database file. Called from beginWrite when
+// another process's commit has been detected.
+func (p *pager) refreshHeaderFromPage1() {
+	// Determine effective max frame, same logic as readHeaderCounters.
+	effectiveMaxFrame := p.wal.nFrame.Load()
+	if p.inProcess {
+		if mf := p.wal.index.mxCommitFrame.LoadLocal(); mf > effectiveMaxFrame {
+			effectiveMaxFrame = mf
+		}
+	} else if hdr, valid := p.wal.index.readHeader(); valid && hdr.mxFrame > effectiveMaxFrame {
+		effectiveMaxFrame = hdr.mxFrame
+	}
+
+	// Try WAL first.
+	if effectiveMaxFrame > 0 {
+		frame := p.wal.index.get(1, effectiveMaxFrame)
+		if frame > 0 {
+			var buf [dbHeaderSize]byte
+			if err := p.readWalFrameData(frame, buf[:]); err == nil {
+				_ = p.header.deserialize(buf[:])
+				p.dbSize.Store(p.header.DatabaseSize)
+				if debugTrace {
+					trace("refreshHeaderFromPage1: source=wal frame=%d maxFrame=%d nBackfill=%d dbSize=%d firstFree=%d totalFree=%d",
+						frame, effectiveMaxFrame, p.wal.index.nBackfill.Load(),
+						p.header.DatabaseSize, p.header.FirstFreelistPg, p.header.TotalFreelistPgs)
+				}
+				return
+			}
+		}
+	}
+
+	// WAL didn't have page 1 (or the read failed) — fall back to the DB file.
+	if p.file != nil {
+		var buf [dbHeaderSize]byte
+		if _, err := p.file.ReadAt(buf[:], 0); err == nil {
+			_ = p.header.deserialize(buf[:])
+			p.dbSize.Store(p.header.DatabaseSize)
+			if debugTrace {
+				trace("refreshHeaderFromPage1: source=db maxFrame=%d nBackfill=%d dbSize=%d firstFree=%d totalFree=%d",
+					effectiveMaxFrame, p.wal.index.nBackfill.Load(),
+					p.header.DatabaseSize, p.header.FirstFreelistPg, p.header.TotalFreelistPgs)
+			}
+			return
+		}
+	}
+}
+
 // readHeaderCounters reads the FileChangeCount and SchemaCookie from page 1.
 // It checks the SHM header to discover the true WAL state (including frames
 // written by other processes), then uses shmHashGet + direct WAL file read to
@@ -1325,7 +1541,7 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 	effectiveMaxFrame := walMaxFrame
 	if p.inProcess {
 		// Use mxCommitFrame (not maxFrame) so spilled uncommitted frames are invisible to readers.
-		if mf := p.wal.index.mxCommitFrame.Load(); mf > effectiveMaxFrame {
+		if mf := p.wal.index.mxCommitFrame.LoadLocal(); mf > effectiveMaxFrame {
 			effectiveMaxFrame = mf
 		}
 	} else if hdr, valid := p.wal.index.readHeader(); valid && hdr.mxFrame > effectiveMaxFrame {
@@ -1333,16 +1549,11 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 	}
 
 	// Look up page 1's latest frame.
-	// For inProcess mode, use the Go map (walIndex.get) which is protected by
-	// a RWMutex, avoiding data races on the unsynchronized SHM byte regions.
-	// For multi-process mode, use shmHashGet which reads the cross-process SHM.
+	// walIndex.get() merges the local page map with SHM, preferring newer SHM
+	// frames. After an external state change, beginWrite rebuilds the local page
+	// map from the WAL so page-1 refreshes do not depend solely on SHM hashes.
 	if effectiveMaxFrame > 0 {
-		var frame uint32
-		if p.inProcess {
-			frame = p.wal.index.get(1, effectiveMaxFrame)
-		} else {
-			frame = p.wal.index.shmHashGet(1, effectiveMaxFrame, p.wal.index.nBackfill.Load()+1)
-		}
+		frame := p.wal.index.get(1, effectiveMaxFrame)
 		if frame > 0 {
 			var buf [dbHeaderSize]byte
 			if err := p.readWalFrameData(frame, buf[:]); err == nil {
@@ -1533,6 +1744,11 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	if schemaChanged {
 		p.header.SchemaCookie++
 	}
+	// Keep VersionValidFor in lockstep with FileChangeCount. pager.open
+	// asserts they match; a writer that advances FileChangeCount must
+	// also update VersionValidFor or the next opener will reject the
+	// DB as corrupt.
+	p.header.VersionValidFor = p.header.FileChangeCount
 
 	// Ensure page 1 is always written with the updated header (fix 5.3).
 	pg1, err := p.getWritablePage(1)
@@ -1541,13 +1757,22 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 		return 0, 0, 0, err
 	}
 	p.header.serialize(pg1.data[:dbHeaderSize])
+	if debugTrace {
+		trace("commit: page1 dbSize=%d firstFree=%d totalFree=%d fcc=%d sc=%d",
+			p.header.DatabaseSize, p.header.FirstFreelistPg, p.header.TotalFreelistPgs,
+			p.header.FileChangeCount, p.header.SchemaCookie)
+	}
 	p.releasePage(pg1)
 
 	// Re-collect dirty pages since page 1 may be newly dirty.
 	p.dirtyBuf = p.writerCache.appendDirtyPages(p.dirtyBuf[:0])
 
 	if debugTrace {
-		trace("commit: writing %d dirty pages to WAL", len(p.dirtyBuf))
+		dirtyPgnos := make([]uint32, 0, len(p.dirtyBuf))
+		for _, pg := range p.dirtyBuf {
+			dirtyPgnos = append(dirtyPgnos, pg.pgno)
+		}
+		trace("commit: writing %d dirty pages to WAL %v", len(p.dirtyBuf), dirtyPgnos)
 	}
 
 	// Write all dirty pages to WAL
@@ -1558,6 +1783,11 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 
 	// Capture nFrame atomically for checkpoint threshold decision.
 	nFrame = p.wal.nFrame.Load()
+
+	// Notify online backups that these pages have new committed content.
+	// ~ sqlite3BackupUpdate dispatch (backup.c:687). Must happen here,
+	// AFTER the WAL frames are durable, so dst sees committed data only.
+	p.dispatchBackupUpdate(p.dirtyBuf)
 
 	// Mark all pages as clean
 	for _, pg := range p.dirtyBuf {
@@ -1769,13 +1999,15 @@ func (p *pager) savepoint() (int, error) {
 			id, dbSz, walFr, p.writerCache.nDirty, len(p.dontWritePages), len(p.hasContent))
 	}
 	p.savepoints = append(p.savepoints, savepointState{
-		id:        id,
-		dbSize:    dbSz,
-		pages:     make(map[uint32][]byte),
-		walFrame:  walFr,
-		walCksum1: p.wal.cksum1,
-		walCksum2: p.wal.cksum2,
-		header:    p.header, // snapshot header for rollback (fix 9.3)
+		id:     id,
+		dbSize: dbSz,
+		pages:  make(map[uint32][]byte),
+		walHdr: WalIndexHdr{
+			isInit:      1,
+			mxFrame:     walFr,
+			aFrameCksum: [2]uint32{p.wal.cksum1, p.wal.cksum2},
+		},
+		header: p.header, // snapshot header for rollback (fix 9.3)
 	})
 	return id, nil
 }
@@ -1803,17 +2035,22 @@ func (p *pager) rollbackToSavepoint(id int) error {
 	p.writerCache.truncate(sp.dbSize)
 
 	// Roll back spilled frames in the WAL index to the savepoint's WAL position.
-	p.wal.index.rollbackToFrame(sp.walFrame)
+	p.wal.index.rollbackToFrame(sp.walHdr.mxFrame)
 	// Restore nFrame and cumulative checksums so the next write overwrites
 	// the dead spill frames with a correct checksum chain.
-	p.wal.nFrame.Store(sp.walFrame)
-	p.wal.cksum1 = sp.walCksum1
-	p.wal.cksum2 = sp.walCksum2
+	p.wal.nFrame.Store(sp.walHdr.mxFrame)
+	p.wal.cksum1 = sp.walHdr.aFrameCksum[0]
+	p.wal.cksum2 = sp.walHdr.aFrameCksum[1]
+
+	// If an in-tx frame-reuse overwrote a frame past the savepoint's
+	// position, drop the pending checksum rewrite — that frame is
+	// now discarded. Mirrors SQLite wal.c:3832-3834.
+	p.wal.resetIReCksumIfPast(sp.walHdr.mxFrame)
 
 	// Truncate in-memory WAL frames to match restored nFrame.
 	if p.wal.inMemory {
 		p.wal.mu.Lock()
-		p.wal.memFrames = p.wal.memFrames[:sp.walFrame]
+		p.wal.memFrames = p.wal.memFrames[:sp.walHdr.mxFrame]
 		p.wal.mu.Unlock()
 	}
 
@@ -1919,7 +2156,13 @@ func (p *pager) releaseSavepoint(id int) error {
 // The WAL's busy handler is used for FULL/RESTART/TRUNCATE modes to wait
 // for readers that block progress, matching SQLite's behavior.
 func (p *pager) checkpointWithMode(mode CheckpointMode) error {
-	return p.wal.checkpointWithMode(p.file, p.master, mode, p.wal.busyHandler)
+	err := p.wal.checkpointWithMode(p.file, p.master, mode, p.wal.busyHandler)
+	if err == nil && (mode == CheckpointRestart || mode == CheckpointTruncate) {
+		// ~ sqlite3BackupRestart (backup.c:701-707). WAL frame numbering
+		// has reset, so any in-flight backup must start over.
+		p.dispatchBackupRestart()
+	}
+	return err
 }
 
 // tryCheckpoint attempts a passive checkpoint for auto-checkpoint.
@@ -1934,8 +2177,17 @@ func (p *pager) tryCheckpoint() error {
 	// If all frames are backfilled, try a best-effort RESTART to recycle WAL
 	// frame numbers and prevent unbounded WAL growth. With xBusy=nil this does
 	// not wait for readers; it simply skips reset when locks are busy.
-	if p.wal.index.nBackfill.Load() >= p.wal.index.mxCommitFrame.Load() {
-		_ = p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil)
+	//
+	// Authoritative read: in multi-process mode the process-local cursor can
+	// trail a peer's recent commit; comparing nBackfill against a stale local
+	// cursor can return true prematurely and schedule a RESTART that races
+	// the peer's fresh frames. See NOTES.md §"Checkpoint mxFrame source fix".
+	if p.wal.index.nBackfill.Load() >= p.wal.authoritativeMxFrame() {
+		if err := p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil); err == nil {
+			// ~ sqlite3BackupRestart (backup.c:701-707) also applies to
+			// auto-checkpoint's best-effort restart.
+			p.dispatchBackupRestart()
+		}
 	}
 	return nil
 }
@@ -1967,9 +2219,19 @@ func (p *pager) writeOverflowChainMulti(segments ...[]byte) (uint32, error) {
 		totalLen += len(seg)
 		for len(seg) > 0 {
 			if spaceLeft == 0 {
-				// Allocate a new overflow page
-				var err error
-				newPg, err := p.allocatePage()
+				// Allocate a new overflow page. Pass the previous
+				// overflow page's pgno as the locality hint so the
+				// freelist picks a physically nearby leaf — matches
+				// SQLite fillInCell (btree.c:7197 `allocateBtreePage(
+				// pBt, &pOvfl, &pgnoOvfl, pgnoOvfl, 0)`). For the
+				// first overflow page in a chain prevPg is nil and we
+				// pass 0 (no hint) — matches btree.c:7131
+				// `pgnoOvfl = 0`.
+				var nearby uint32
+				if prevPg != nil {
+					nearby = prevPg.pgno
+				}
+				newPg, err := p.allocatePageNear(nearby)
 				if err != nil {
 					return 0, err
 				}
@@ -2204,6 +2466,110 @@ func (p *pager) freeOverflowChain(firstPgno uint32) error {
 	return nil
 }
 
+// truncateTo shrinks the database to the given page count. Matches
+// SQLite's sqlite3PagerTruncateImage (pager.c). Discards writerCache
+// entries above the new size (via pcache.truncate) and updates the
+// atomic dbSize so subsequent writes see the new bound. Physical file
+// truncation happens at the next checkpoint.
+func (p *pager) truncateTo(newDbSize uint32) error {
+	if pagerState(p.state.Load()) != pagerWriter {
+		return ErrReadOnly
+	}
+	if newDbSize == 0 {
+		return errors.New("btree: cannot truncate to zero pages")
+	}
+	cur := p.dbSize.Load()
+	if newDbSize >= cur {
+		return nil
+	}
+	p.writerCache.truncate(newDbSize)
+	p.dbSize.Store(newDbSize)
+	p.header.DatabaseSize = newDbSize
+	return nil
+}
+
+// attachBackup registers a Backup object to receive update/restart
+// callbacks. ~ attachBackupObject (backup.c:302–309).
+func (p *pager) attachBackup(b *Backup) {
+	p.backupsMu.Lock()
+	p.backups = append(p.backups, b)
+	p.backupsMu.Unlock()
+}
+
+// detachBackup removes a Backup from the list. ~ inverse of
+// attachBackupObject; called by Backup.Finish (~ backup.c:589–597).
+func (p *pager) detachBackup(b *Backup) {
+	p.backupsMu.Lock()
+	defer p.backupsMu.Unlock()
+	for i, x := range p.backups {
+		if x == b {
+			p.backups = append(p.backups[:i], p.backups[i+1:]...)
+			return
+		}
+	}
+}
+
+// dispatchBackupUpdate notifies every registered Backup that the given
+// dirty pages have been committed to this pager's WAL. Called from
+// pager.commit just after wal.writeFrames succeeds, so the page data
+// we hand to each backup is the authoritative post-commit version.
+// ~ sqlite3BackupUpdate dispatch (backup.c:687–688).
+func (p *pager) dispatchBackupUpdate(dirty []*page) {
+	p.backupsMu.Lock()
+	if len(p.backups) == 0 {
+		p.backupsMu.Unlock()
+		return
+	}
+	// Copy the slice so callbacks can run outside the lock without
+	// nesting b.mu under backupsMu.
+	bs := make([]*Backup, len(p.backups))
+	copy(bs, p.backups)
+	p.backupsMu.Unlock()
+
+	for _, pg := range dirty {
+		for _, b := range bs {
+			b.update(pg.pgno, pg.data)
+		}
+	}
+}
+
+// dispatchBackupRestart notifies every registered Backup to restart
+// from page 1. ~ sqlite3BackupRestart (backup.c:701–707).
+func (p *pager) dispatchBackupRestart() {
+	p.backupsMu.Lock()
+	if len(p.backups) == 0 {
+		p.backupsMu.Unlock()
+		return
+	}
+	bs := make([]*Backup, len(p.backups))
+	copy(bs, p.backups)
+	p.backupsMu.Unlock()
+	for _, b := range bs {
+		b.restart()
+	}
+}
+
+// withWriteLock acquires WAL_WRITE_LOCK exclusive via the configured busy
+// handler (in multi-process mode) and holds it through fn. In-process and
+// in-memory modes skip the lock entirely and pass locked=false.
+//
+// The unlock is deferred in one place — callers cannot leak the lock on
+// early-return or panic. SQLite's equivalent is the explicit unlock pair
+// inside sqlite3WalClose (wal.c:2530-2545); we pick the defer idiom
+// because our close body has multiple exits.
+//
+// Must be called with p.mu held (same contract as pager.close).
+func (p *pager) withWriteLock(fn func(locked bool) error) error {
+	locked := false
+	if !p.inProcess && !p.inMemory {
+		if err := walBusyLock(p.wal.index, p.wal.busyHandler, lockWrite, lockExclusive); err == nil {
+			locked = true
+			defer func() { _ = p.wal.index.unlock(lockWrite, lockExclusive) }()
+		}
+	}
+	return fn(locked)
+}
+
 // close closes the pager, WAL, and database file.
 // Matches SQLite's sqlite3PagerClose() -> sqlite3WalClose(): checkpoint the WAL,
 // then truncate the WAL file to zero bytes before closing.
@@ -2212,32 +2578,61 @@ func (p *pager) close() error {
 	defer p.mu.Unlock()
 
 	if p.wal != nil {
+		isLastClient := false
 		if p.inMemory {
-			// InMemory: just reset WAL state, nothing to checkpoint to disk
+			// InMemory: no peers, always last.
+			isLastClient = true
 		} else {
-			// Checkpoint before closing. Only truncate WAL if all frames
-			// were copied to the database file. A partial PASSIVE checkpoint
-			// (due to active readers) returns ErrBusy; truncating the WAL
-			// in that case would destroy uncopied frames and corrupt the DB.
-			// Matches SQLite's sqlite3WalClose(): walLimitSize only called
-			// when rc==SQLITE_OK.
-			if debugTrace {
-				trace("close: starting passive checkpoint before WAL truncation, dbSize=%d", p.dbSize.Load())
-			}
-			cpErr := p.wal.checkpointPassive(p.file, p.master)
-			if cpErr != nil {
+			// Hold WAL_WRITE_LOCK across checkpoint+truncate so a peer
+			// process cannot be mid-writeFrames. withWriteLock defers the
+			// unlock, so any early-return / panic inside the closure cannot
+			// leak the lock. Matches SQLite's sqlite3WalClose which guards
+			// walLimitSize with an exclusive DB-file lock (wal.c:2509-2534).
+			_ = p.withWriteLock(func(lockedWrite bool) error {
 				if debugTrace {
-					trace("close: checkpointPassive incomplete or failed: %v", cpErr)
+					trace("close: starting passive checkpoint before WAL truncation, dbSize=%d lockedWrite=%v", p.dbSize.Load(), lockedWrite)
 				}
-			}
-			if cpErr == nil {
-				p.wal.truncateFile()
-			}
+				cpErr := p.wal.checkpointPassive(p.file, p.master)
+				if cpErr != nil {
+					if debugTrace {
+						trace("close: checkpointPassive incomplete or failed: %v", cpErr)
+					}
+				}
+				// Truncate gating: matches SQLite's sqlite3WalClose (wal.c:2487-2551),
+				// which calls walLimitSize (wal.c:2534) only after obtaining an
+				// exclusive DB-file lock (wal.c:2509). We use a DB-file flock
+				// upgrade as the analog; failure leaves the WAL intact so peer
+				// readers can still find frames in the file.
+				if p.inProcess {
+					isLastClient = true
+				} else if p.file != nil {
+					ok, err := tryUpgradeDBLockExclusive(p.file)
+					if err != nil {
+						if debugTrace {
+							trace("close: DB-file exclusive upgrade error: %v", err)
+						}
+					} else {
+						isLastClient = ok
+					}
+				}
+				if cpErr == nil && isLastClient {
+					p.wal.truncateFile()
+				}
+				return nil
+			})
 		}
-		_ = p.wal.close()
+		_ = p.wal.close(isLastClient)
 	}
 
 	p.writerCache.destroy()
+
+	// Tear down the mmap reader before closing the file so the fd
+	// remains valid during munmap. Matches SQLite's unixUnmapfile
+	// ordering (os_unix.c:5562-5566, called before the fd close).
+	if p.dbMmap != nil {
+		_ = p.dbMmap.unmap()
+		p.dbMmap = nil
+	}
 
 	if p.file != nil {
 		err := p.file.Close()

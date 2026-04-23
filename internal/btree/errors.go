@@ -52,10 +52,21 @@ var (
 	// that is no longer supported. The database must be recreated.
 	ErrOldFormat = errors.New("btree: unsupported old schema format (requires version 5+)")
 
-	// ErrBusySnapshot indicates another process committed since this connection's
-	// last read, so the write transaction cannot proceed with stale state.
-	// Equivalent to SQLite's SQLITE_BUSY_SNAPSHOT (wal.c:3714).
+	// ErrBusySnapshot indicates another connection committed since this
+	// transaction's snapshot was taken, so proceeding would violate
+	// snapshot isolation. Equivalent to SQLite's SQLITE_BUSY_SNAPSHOT
+	// (wal.c:3714). Surfaced to the caller after a short bounded in-line
+	// retry (see db.go busySnapshotInnerRetries) and a BusyHandler backoff
+	// pass. Callers should retry the whole transaction (BeginWrite → ... →
+	// Commit), optionally with their own backoff.
 	ErrBusySnapshot = errors.New("btree: busy snapshot")
+
+	// ErrBusyRecovery indicates another connection is currently executing
+	// WAL recovery (walIndexRecover). Equivalent to SQLite's
+	// SQLITE_BUSY_RECOVERY (wal.c:3063-3090). Callers should back off
+	// before retrying — recovery can take seconds on a large WAL and
+	// tight-spinning just burns CPU and amplifies lock contention.
+	ErrBusyRecovery = errors.New("btree: busy recovery")
 
 	// ErrProtocol indicates the WAL retry protocol was exhausted.
 	ErrProtocol = errors.New("btree: WAL protocol retry limit exhausted")

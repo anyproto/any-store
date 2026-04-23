@@ -52,26 +52,46 @@ type mmapShm struct {
 	locks   [lockSlotCount]int // in-process lock state: 0=unlocked, >0=shared count, -1=exclusive
 }
 
-// newPlatformShm creates a new mmap-backed shm.
-// Acquires a shared DMS lock to track that this connection is using the SHM file.
+// newPlatformShm creates a new mmap-backed shm and acquires a shared DMS
+// fcntl lock (kept for intra-process lock-slot coordination via the fcntl
+// layer). Single-shot — no retries, no inode verify.
+//
+// The pager.open caller holds a SHARED flock on the DB file before we are
+// invoked. That flock is what serializes "last-client-unlink" vs. "new-
+// opener-attach": any closer that could unlink our shm file must hold DB-file
+// EXCLUSIVE, which means our pager's SHARED acquisition must have completed
+// before that closer ever unlinked — so by the time we are here, the shm
+// path→inode mapping is either fresh (closer already unlinked and we/peer
+// created a new one) or stably attached. Either way the old inode-verify
+// retry loop is obsolete — see any-store/internal/btree/NOTES.md §SHM open/
+// close protocol drift.
 func newPlatformShm(path string) (shm, error) {
 	f, err := osOpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		return nil, fmt.Errorf("btree: open shm file: %w", err)
 	}
-
 	s := &mmapShm{
 		file:    f,
 		path:    path,
 		regions: make([][]byte, 0, shmMaxRegions),
 	}
-
-	// Acquire a shared DMS lock. All open connections hold this lock.
-	// On close, we try to upgrade to exclusive: if successful, we're the last
-	// connection and can safely delete the SHM file.
 	if err := s.fcntlLock(syscall.F_RDLCK, shmDMSOffset); err != nil {
 		_ = f.Close()
-		return nil, fmt.Errorf("btree: acquire DMS lock: %w", err)
+		return nil, fmt.Errorf("btree: acquire DMS shared lock: %w", err)
+	}
+
+	// If the file is freshly created (size == 0), truncate to 3 bytes as
+	// a "known-fresh" diagnostic marker — matches SQLite's unixOpenSharedMemory
+	// (os_unix.c:4902 robust_ftruncate(hShm, 3)). The marker size is
+	// deliberately smaller than walIndexHdrSize (48), so any subsequent
+	// opener that mmaps a 3-byte file knows it's a blank-slate shm and not
+	// a corruption. The first region() call will Truncate to shmRegionSize,
+	// so this 3-byte state is transient.
+	if info, err := f.Stat(); err == nil && info.Size() == 0 {
+		if err := f.Truncate(3); err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("btree: ftruncate(shm, 3) marker: %w", err)
+		}
 	}
 
 	return s, nil
@@ -239,7 +259,7 @@ func (s *mmapShm) fcntlLock(lockType int, offset int64) error {
 	return nil
 }
 
-func (s *mmapShm) close() error {
+func (s *mmapShm) close(isLastClient bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -250,18 +270,18 @@ func (s *mmapShm) close() error {
 		}
 	}
 
-	// Determine if we're the last connection by trying to acquire an exclusive
-	// DMS lock. If successful, no other process holds the SHM file open, so we
-	// can safely delete it. This matches SQLite's unixShmUnmap() behavior.
+	// Unlink the shm file iff the caller (pager.close) tells us we are the
+	// last client. The decision is made at the DB-file lock level — pager.close
+	// upgraded its shared flock to exclusive, which guarantees no peer can be
+	// mid-open against this DB.
 	//
-	// We must do this BEFORE closing the file descriptor, since closing the fd
-	// releases all our fcntl locks.
-	deleteFile := false
-	if s.file != nil {
-		// Try to upgrade our shared DMS lock to exclusive.
-		if err := s.fcntlLock(syscall.F_WRLCK, shmDMSOffset); err == nil {
-			deleteFile = true
-		}
+	// CRITICAL ordering: unlink BEFORE closing the fd. A new opener that got
+	// as far as osOpenFile before our unlink will still reach its
+	// acquireSharedDBLock call and BUSY-retry there, never touching a stale
+	// inode. (We also still hold the DB-file exclusive flock until pager.close's
+	// Close() returns, providing the outer serialization.)
+	if isLastClient && s.file != nil {
+		_ = osRemove(s.path)
 	}
 
 	var err error
@@ -270,8 +290,5 @@ func (s *mmapShm) close() error {
 		s.file = nil
 	}
 
-	if deleteFile {
-		_ = osRemove(s.path)
-	}
 	return err
 }

@@ -387,6 +387,52 @@ Both support: PASSIVE, FULL, RESTART, TRUNCATE with identical semantics.
 | Go map for same-process reads | **Divergent** -- O(1) map vs hash table scan |
 | Heap SHM fallback | **Divergent** -- enables non-mmap platforms |
 | WAL undo (`sqlite3WalUndo`) | **Missing** -- Go uses pager-level rollback instead |
+| First-opener `ftruncate(shm, 3)` marker | **Missing** -- see §SHM open/close protocol below |
+| Orphan-inode handling on open race | **Aligned** -- DB-file flock serializes last-client-unlink (see §SHM open/close protocol drift) |
+
+### SHM open/close protocol drift (resolved 2026-04-21)
+
+`shm_mmap.go:newPlatformShm` and `mmapShm.close` implement the POSIX
+dead-man-switch (DMS) fcntl protocol for shm-file lifecycle. They used to
+diverge from SQLite on three points; two are now aligned, one remains
+intentional.
+
+1. **Last-client-unlink serialization — now aligned with SQLite.** Previously
+   we used a 50× inode-verify retry loop in `newPlatformShm` as a local
+   substitute for SQLite's DB-file-lock invariant. We now adopt the SQLite
+   approach: `pager.open` takes a shared `flock` on the DB file (held for
+   the pager's lifetime); `pager.close` upgrades to exclusive to prove "last
+   client" and passes that result to `shm.close(isLastClient)`. Any new
+   opener blocks on shared DB-file acquisition while a closer holds
+   exclusive — serializing shm unlink against new opens exactly as SQLite
+   does in `wal.c:2487-2551` (`sqlite3WalClose`).
+
+   See `internal/btree/dbfile_lock.go` for the flock wrappers. The
+   inode-verify retry loop in `newPlatformShm` is gone — a single-shot
+   `osOpenFile` + `F_RDLCK(DMS)` now suffices.
+
+   **Simplification vs. SQLite:** SQLite uses byte-range fcntl locks with a
+   5-state protocol (NO/SHARED/RESERVED/PENDING/EXCLUSIVE) because it must
+   also support rollback-journal mode. We only support WAL mode, so we use
+   the 3-state subset we actually need (none / shared / exclusive) and BSD
+   whole-file `flock` instead of fcntl byte-range locks — `flock` is
+   per-file-description, dodging POSIX fcntl's "close any fd releases all
+   inode locks" gotcha when multiple goroutines open the same DB path in a
+   single process.
+
+2. **`robust_ftruncate(hShm, 3)` marker — resolved 2026-04-22.**
+   `newPlatformShm` now truncates a freshly created shm file to 3 bytes
+   immediately after acquiring the DMS lock — matches SQLite's
+   `os_unix.c:4902`. The marker is smaller than `walIndexHdrSize`
+   (48 bytes), so subsequent openers that mmap a 3-byte file know it's
+   blank-slate. The first `region(0, true)` call grows the file to
+   `shmRegionSize`, so the marker state is transient.
+
+3. **Close ordering — aligned with SQLite.** Both implementations unlink
+   before closing the shm fd (SQLite: `os_unix.c:5538-5541`; ours:
+   `shm_mmap.go` `mmapShm.close`). With the DB-file lock now serializing
+   at the outer layer (item 1), this is belt-and-suspenders rather than
+   load-bearing.
 
 ---
 
@@ -1128,16 +1174,14 @@ The checkpoint backfill loop now reuses `wal.ckptBuf`, a page-sized buffer
 lazily allocated on first checkpoint. Matches SQLite's `walCheckpoint`
 (wal.c:2285-2304) which reuses `pTmpSpace` from the pager.
 
-**WAL Header Version Not Validated** -- Severity: Minor
+**WAL Header Version + Page Size Validation** -- Resolved 2026-04-22
 
-The version field in the WAL header is read but never checked against a maximum
-supported version.
-
-**Page Size Not Validated During WAL Recovery** -- Severity: Minor
-
-Recovery trusts the WAL header's page size without bounds or power-of-2
-validation. The database header validation covers the main open path, but a
-corrupted WAL header could cause issues during recovery.
+`walHeader.deserialize` now rejects WAL files whose `version` field does
+not equal `walVersion` (1000000), or whose `pageSize` is not a power of
+two in `[MinPageSize, MaxPageSize]`. Matches SQLite's `walIndexRecover`
+validation (`sqlitec/src/wal.c:1406-1419`). Covered by
+`TestWalHeaderDeserialize_RejectsBadVersion` and
+`TestWalHeaderDeserialize_RejectsBadPageSize`.
 
 **In-Memory WAL Mode Skips Checksums** -- Severity: Minor (accepted)
 
@@ -1150,27 +1194,112 @@ Default threshold is 10,000 frames vs SQLite's 1,000. Auto-checkpoint runs as
 PASSIVE (`tryCheckpoint()` -> `checkpointPassive()`), matching SQLite's default
 auto-checkpoint behavior. PASSIVE mode does not block writers or readers.
 
-### Pager / Cache
+**Frame-Reuse Within a Transaction (`walRewriteChecksums`)** -- Resolved 2026-04-22
 
-**No mmap for Database File Reads** -- Severity: Minor
+SQLite's `walRewriteChecksums` (`sqlitec/src/wal.c:3966-4009`) overwrites
+an earlier WAL frame when a page is re-dirtied within the same
+transaction, instead of appending a new frame. `pWal->iReCksum`
+(`sqlitec/src/wal.c:533`) tracks the earliest overwritten frame; on
+commit SQLite re-reads frames `iReCksum..mxFrame`, recomputes the
+running checksum chain starting from the preceding frame's checksums,
+and rewrites frame headers so the chain stays consistent.
 
-All reads use `ReadAt` syscalls. SQLite supports `PRAGMA mmap_size` for
-mmap-based reads on the database file. SHM mmap is correctly implemented.
+any-store now ports this. The reuse branch in `writeFrames`
+(internal/btree/wal.go) mirrors `walFrames` (`wal.c:4117-4156`):
+
+- `iFirst = mxCommitFrame.LoadLocal() + 1` is the first frame in the
+  current tx eligible for in-place overwrite. We use `mxCommitFrame`
+  rather than `writerHdr.mxFrame` because `writerHdr` is only
+  maintained in multi-process mode; `mxCommitFrame` is updated in both
+  modes on every commit.
+- A spilled page is overwritten in place when `getInTxRange` finds a
+  prior frame for the same `pgno` in `[iFirst..nf]`. The SHM hash
+  entry is unchanged (still points at the reused frame).
+- `iReCksum` advances backward to the earliest overwritten frame.
+  `rewriteChecksums(iLast)` (analog of `wal.c:3966-4009`) rewrites
+  frame headers `iReCksum..iLast` on commit, before fdatasync.
+- The final commit frame is always a fresh append (it carries the
+  `dbSize` marker — `wal.c:4124-4140`).
+- Savepoint rollback resets `iReCksum` if it now points past the
+  rolled-back frontier (`wal.c:3832` analog in
+  `pager.rollbackToSavepoint`).
+- `writeFramesMem` overwrites the in-memory `memFrames` slot for the
+  InMemory mode equivalent — no checksum chain to rewrite.
+
+**Bench evidence** (`BenchmarkWAL_SpillHeavyRepeatedDirty`, 1000 docs ×
+2KB, CacheSize=4, nUpdates=5):
+
+  variant   appends  reuses  wal_bytes
+  -------   -------  ------  ---------
+  NoReuse       581       0  10,843,872
+  Reuse         130     451   8,969,272   -1.87 MB / -17%
+
+78% of writeFrames calls hit the in-place overwrite path under
+spill-heavy load. Production motivation: WAL bloat observed on real
+Anytype workloads with long write transactions. The page cache dedups
+naturally for small working sets; reuse only fires when the cache
+spills mid-tx (working set > CacheSize).
+
+**mmap for Database File Reads** -- Resolved 2026-04-22
+
+Opt-in via `Config.MmapSize int64` (bytes, 0 disables — matches SQLite's
+`PRAGMA mmap_size` default). When enabled, DB-file page reads memcpy
+from an `mmap`-backed region instead of calling `ReadAt` per page.
+Writes remain `WriteAt` and are coherent via the OS unified page
+cache (linux/darwin).
+
+Model: SQLite's `unixFetch` / `unixUnfetch`
+(`sqlitec/src/os_unix.c:5714-5772`) simplified by dropping the
+zero-copy fetch pointer (we copy out) and the `nFetchOut` reference
+counting that goes with it. Mapping is lazy (first fetch calls
+`syscall.Mmap`, analog to `os_unix.c:5727`), remaps on miss for
+growth (`os_unix.c:5570-5640` analog via `munmap` + `mmap`), and
+unmaps on `pager.close` (`os_unix.c:5562-5566`). Read-path gate
+follows `getPageMMap → getPageNormal` shape at `pager.c:5670-5710`.
+
+Measured delta on `BenchmarkOverflow10MB_FindId` with
+`MmapSize=64 MiB` (warm-cache): sec/op -6.8% trend, p=0.093 — not
+statistically significant, but direction right. See
+`any-store-tests/results/session_perf/benchstat_mmap_reads.txt`.
+Larger wins expected on cold-cache first reads (not benched) and
+future partial-read APIs. Linux/darwin + amd64/arm64 only; no-op on
+other platforms.
+
+**Race safety:** `dbMmap.readAt(dst, off)` copies into `dst` inside
+its RLock so concurrent `remap`/`unmap` (under Lock) cannot munmap
+the backing memory mid-copy. Covered by
+`TestDBMmap_ConcurrentReadVsRemap` which fails under `-race` in the
+earlier `fetch(off, n) → slice` design and passes post-fix.
+
+**Known follow-ups:** (1) If VACUUM / DB-file shrink is ever added,
+`dbMmap.remap` must also shrink the mapping to avoid SIGBUS on the
+now-unbacked tail (SQLite handles this in `unixTruncate` at
+`os_unix.c:3999-4001`). (2) Dynamic resize via FCNTL is not
+supported — `MmapSize` is fixed at `Open`. (3) The copy-out model
+loses SQLite's zero-copy win; a follow-up could add a zero-copy path
+with `nFetchOut`-style refcounting if the memcpy cost becomes
+material (measurement shows it is secondary to syscall cost).
 
 **Missing Salt Cross-Check** -- Severity: Minor
 
 No validation that the WAL file's salt matches the database header's salt.
 Would detect stale or mismatched WAL files.
 
-**Missing VersionValidFor Usage** -- Severity: Minor
+**VersionValidFor Integrity Check** -- Resolved 2026-04-22
 
-The `VersionValidFor` field is stored in the database header but never used for
-integrity validation.
+`pager.open` compares `VersionValidFor` against `FileChangeCount`
+after deserializing the DB header and returns `ErrCorrupt` on a
+nonzero mismatch (zero is treated as "field not tracked" — legacy /
+test fixtures skip the check). Commit path now advances both fields
+in lockstep. Catches crash-mid-header-update corruption.
 
-**Auto-Checkpoint Errors Silently Swallowed** -- Severity: Minor
+**Auto-Checkpoint Errors Surfaced** -- Resolved 2026-04-22
 
-`tryCheckpoint()` errors are discarded. Acceptable for PASSIVE-like semantics
-but inconsistent with FULL checkpoint behavior.
+`tx.pager.tryCheckpoint()`'s result (error or nil) is stored on
+`DB.lastAutoCheckpointErr` and exposed via
+`DB.LastAutoCheckpointError() error`. Monitoring code can poll the
+accessor; the auto-checkpoint itself remains best-effort (returning
+the error to the commit caller would change the application contract).
 
 ### Page Cache Memory Management (page_slab.go, pcache.go, db.go)
 
@@ -1299,29 +1428,63 @@ The cursor path stores only page numbers, requiring re-fetching pages and
 re-scanning for insertion points on splits. SQLite caches page pointers + cell
 indices in the cursor stack (`apPage[]`/`aiIdx[]`).
 
-**No "Nearby" Allocation Hint for Overflow Pages** -- Severity: Minor
+**Nearby Allocation Hint for Overflow Pages** -- Resolved 2026-04-22
 
-SQLite passes the previous overflow page number as a locality hint to
-`allocateBtreePage()`. Our pages come from wherever the freelist yields them,
-potentially scattering overflow chains across the file.
+`pager.allocatePageNear(nearby)` accepts an optional locality hint
+(nearby == 0 keeps the legacy last-leaf pop). When nearby > 0 and a
+freelist trunk is selected, the leaf with minimum absolute distance
+to `nearby` is picked — matches SQLite `btree.c:6678-6699`
+(BTALLOC_ANY + nearby path).
+
+`writeOverflowChainMulti` threads the previous overflow page's pgno
+as the hint on each subsequent allocation, matching SQLite's
+`fillInCell` at `btree.c:7197` (`allocateBtreePage(pBt, &pOvfl,
+&pgnoOvfl, pgnoOvfl, 0)`) and the first-page zero-hint init at
+`btree.c:7131` (`pgnoOvfl = 0`). Result: overflow chains for a single
+cell allocated from scattered freelist leaves live in clustered
+runs on disk, improving sequential-read and OS-prefetch locality —
+relevant for large-blob workloads (10 MB payload = ~2560 overflow
+pages).
+
+Measured delta on `BenchmarkOverflow10MB_FindIdCold`: +2.9% trend
+(p=0.132, within noise). The bench uses a fresh DB where overflow
+chains are allocated via monotonic `dbSize` growth and are already
+contiguous — the hint only changes allocation order when the
+freelist has scattered leaves. Real workloads with document churn
+(update/delete/re-insert cycles) will see benefit; current bench
+doesn't model that. See
+`any-store-tests/results/session_perf/benchstat_nearby_overflow.txt`.
+
+Covered by `TestAllocateFromFreelist_NearbyHint`,
+`TestAllocateFromFreelist_NearbyZeroIsLegacyBehavior`, and
+`TestWriteOverflowChain_ContiguousOnFreshFreelist` (in
+`pager_test.go`).
+
+**Out of scope:** `BTALLOC_EXACT` and `BTALLOC_LE` modes (used in
+SQLite for auto-vacuum relocation; any-store has no auto-vacuum, see
+`btree.c:6515`). btree split / root allocation callers don't use
+the hint — a future optimization could pass the parent-page pgno as
+nearby on split (matches `btree.c:8666` style) but would require
+benchmark justification.
 
 ### Freelist
 
-**Freelist Formula Ignores Reserved Space** -- Severity: Minor
+**Freelist Formula Respects Reserved Space** -- Resolved (stale drift note)
 
-Uses `(pageSize - 8) / 4` instead of `(usableSize - 8) / 4` for max leaves
-per trunk. Correct while `ReservedSpace == 0`. Would cause corruption if
-reserved space were ever enabled.
+`freelistMaxLeaves()` uses `(p.usableSize() - 8) / 4` where `usableSize`
+is `pageSize - ReservedSpace`. Correct regardless of ReservedSpace
+value. See `pager.go:868-870`.
 
 **No BTALLOC_EXACT / BTALLOC_LE Modes** -- Severity: Minor
 
 Only `BTALLOC_ANY` allocation mode. `BTALLOC_EXACT` and `BTALLOC_LE` are only
 needed for auto-vacuum and locality hints.
 
-**Reserved Space Not Used in Overflow Computations** -- Severity: Minor
+**Reserved Space Used in Overflow Computations** -- Resolved (stale drift note)
 
-Overflow page usable size uses raw `pageSize - 4` instead of `usableSize - 4`.
-Dormant while `ReservedSpace == 0`.
+`overflowPageUsable(usableSize int)` takes `usableSize` as its parameter
+and all 7 callers pass `p.usableSize()` (which is
+`pageSize - ReservedSpace`). See `page.go:116-118`.
 
 ### Multi-Process WAL Write Safety -- FIXED
 
@@ -1344,9 +1507,15 @@ thanks to three mechanisms:
    and `nBackfill` from SHM instead of stale process-local atomics, so readers
    see the latest committed state from other processes.
 
-**Internal retry in `DB.BeginWrite`**: When `ErrBusySnapshot` is returned, the
-retry loop ends the stale read, clears `writerCache`, and re-calls
-`pager.beginRead` to get a fresh snapshot (max 5 attempts).
+**Internal retry in `DB.BeginWrite`** (resolved 2026-04-22): When `ErrBusySnapshot`
+is returned, the retry loop ends the stale read, clears `writerCache`, and
+re-calls `pager.beginRead` to get a fresh snapshot. Previously the loop had
+a hidden cap of 1000 attempts with no backoff. Now the loop tight-retries at
+most `busySnapshotInnerRetries` (= 3) times, then delegates to the configured
+`BusyHandler` for delays[]-table backoff (matching `sqliteDefaultBusyCallback`
+in `sqlitec/src/main.c:1717`), and finally surfaces `ErrBusySnapshot` to the
+caller — matching SQLite's `SQLITE_BUSY_SNAPSHOT` caller contract
+(`sqlitec/src/wal.c:3714`).
 
 **`writeHeader` parameterization**: `walIndex.writeHeader` now accepts explicit
 `frameCksum` and `salt` parameters so the SHM header always contains the correct
@@ -1374,14 +1543,218 @@ writes to the same database file concurrently with the parent.
    `writerCache` when state changed (SQLite's pager cache invalidation handles
    this differently).
 
-4. **Internal retry**: SQLite returns `SQLITE_BUSY_SNAPSHOT` to the application,
-   requiring it to retry. We retry internally in `DB.BeginWrite` (max 5 attempts)
-   for ergonomic API.
+4. **Internal retry — resolved 2026-04-22**: `DB.BeginWrite` now tight-retries
+   at most `busySnapshotInnerRetries` (= 3) times, then routes through the
+   configured `BusyHandler` for delays[]-table backoff (matching
+   `sqliteDefaultBusyCallback` in `sqlitec/src/main.c:1717`), then surfaces
+   `ErrBusySnapshot` to the caller — matching SQLite's caller contract
+   (`sqlitec/src/wal.c:3714`). The 1000-attempt hidden loop is gone.
 
 5. **readSnapshot saved in pager.beginWrite**: SQLite saves `pWal->hdr` in
    `walTryBeginRead` (called from any connection). We save `readSnapshot` in
    `pager.beginWrite` (writer-only context) to avoid data races with concurrent
    reader goroutines calling `tryBeginRead`.
+
+### Lazy `ensureHeaderInitialized` helper (commits 2026-04-18)
+
+`wal.go:ensureHeaderInitialized` is an experimental lazy counterpart to
+`walIndexReadHdr` (wal.c:2640-2745). Structure matches SQLite:
+
+- Fast path: `readHeader()` → if valid, return.
+- Slow path: `walLockExclusive(WAL_WRITE_LOCK)` → retry `readHeader` → if still
+  invalid, recover.
+- Busy-path fence: `walLockShared(WAL_RECOVER_LOCK)` then release, matching
+  wal.c:3089.
+
+Currently the helper is invoked defensively from 3 targeted tests
+(`TestEnsureHeaderInitialized_*`) but NOT from production code. Production
+code continues to use eager SHM init via `wal.open` + `adoptSHMState` /
+`recoverLocked` / `initHeaderStateLocked`. See "SQLite-alignment blocker"
+below for why cold-open was attempted and reverted.
+
+**Drifts from SQLite's `walIndexReadHdr` preserved:**
+
+1. **Triple-lock recovery gate**: SQLite `walIndexRecover` takes
+   `WAL_ALL_BUT_WRITE..READ_LOCK(0)` exclusive (wal.c:1400-1401). Our
+   `recoverLocked` requires callers to hold `lockCheckpoint + lockRecover`
+   exclusive. The helper takes `lockWrite → lockCheckpoint → lockRecover` under
+   non-blocking `F_SETLK`; under contention with `checkpointWithMode` (which
+   uses `CKPT → WRITE` order) the loser observes `ErrBusy` — no deadlock.
+
+2. **BUSY_RECOVERY signal — resolved 2026-04-22.** The three contended
+   branches in `ensureHeaderInitialized` now return `ErrBusyRecovery`
+   (distinct from the generic `errWALRetry`) when a peer holds the
+   RECOVER / CKPT exclusive locks — matching SQLite's
+   `SQLITE_BUSY_RECOVERY` (`sqlitec/src/wal.c:3063-3090`, probe at
+   `sqlitec/src/os_unix.c:4872-4907`). Upstream `DB.BeginWrite` routes
+   `ErrBusyRecovery` through the configured `BusyHandler` for proper
+   backoff instead of spinning.
+
+3. **`headerOnDisk` shortcut in `syncFromSHMLocked`**: we infer "on-disk WAL
+   header exists" from `hdr.mxFrame > 0` rather than `fstat`-ing, relying on
+   the invariant that `flushHeader` precedes every frame write.
+
+### Per-connection `walHdr` — resolved (2026-04-18)
+
+**Historical:** Earlier attempts to make `wal.open` cold (match SQLite's
+`sqlite3WalOpen` at wal.c:1641-1739) regressed multi-process reliability
+from ~87% to 0-27% because a lazy SHM-header-init from any reader path
+mutated the writer's in-flight state. SQLite's `Wal*` is per-connection;
+any-store multiplexes many goroutines on one `*wal`.
+
+**Resolved by per-tx `walHdr` migration** (commits `f11bc5c` → `9c53a02`,
+7 steps; see
+`any-store-tests/docs/superpowers/specs/2026-04-18-per-connection-hdr-design.md`
+for the design). Summary:
+
+- `ReadTx.walHdr WalIndexHdr` holds the reader's SHM snapshot captured at
+  BeginRead time (inherited by `WriteTx`). Replaces the shared
+  `wal.readSnapshot` field.
+- `ensureHeaderInitialized()` returns `(WalIndexHdr, error)` so callers
+  stamp the hdr onto their tx rather than depending on a helper that
+  mutates process-global state.
+- Reader callsites route through `tx.walHdr.mxFrame` instead of
+  `tx.walMaxFrame` (both populated during migration; step 5 narrowed the
+  field semantics).
+- `BUSY_SNAPSHOT` in `wal.beginWriteWithSnapshot` now compares live SHM
+  hdr against the caller-supplied `readSnap` (from `tx.walHdr`) rather
+  than `w.readSnapshot`. `saveReadSnapshot` deleted.
+- `syncFromSHMLocked` narrowed to only update shared `walIndex` atomics
+  (`maxFrame`, `mxCommitFrame`, `maxPage` via CAS-monotonic, `nBackfill`)
+  plus `w.nFrame` (shared append cursor). Writer-private fields
+  (`w.header.salt*`, `w.cksum1/2`, `w.writerHdr`) stay owned by
+  `wal.beginWriteWithSnapshot`'s inline sync under `lockWrite`.
+- Savepoint state widened: scalar `walFrame/walCksum1/walCksum2` →
+  `walHdr WalIndexHdr`.
+- Zero-arg `pager.beginWrite()` escape hatch — **resolved 2026-04-22.**
+  The zero-arg form has been deleted; `pager.beginWrite(readSnap WalIndexHdr)`
+  is now the single canonical entry point, making BUSY_SNAPSHOT bypass a
+  compile-error rather than a code-path footgun. Tests that don't run
+  multi-process scenarios pass `WalIndexHdr{}` explicitly — the compiler
+  now forces an affirmative decision.
+
+**Known preserved drifts:**
+- In-process mode skips SHM hdr updates on commit (`writeFrames`
+  `!w.inProcess` guard). `db.BeginRead`/`BeginWrite` synthesize a minimal
+  `walHdr{isInit:1, mxFrame:maxFrame}` in that mode so read paths
+  consuming `tx.walHdr.mxFrame` see the correct frame ceiling.
+- (Resolved 2026-04-22: the zero-arg `pager.beginWrite` escape hatch was
+  deleted — see above.)
+
+**Reliability impact:** `TestMultiProcessIndex_ConcurrentSketchUpdates`
+30-run samples at each step:
+
+| Step | 30-run |
+|------|--------|
+| Baseline (step 0) | 28/30 |
+| Step 1 (walHdr field) | 27/30 |
+| Step 3 (reader routing) | 30/30 |
+| Step 4 (BUSY_SNAPSHOT rewire) | 29/30 |
+| Step 5 (delete readSnapshot) | 28/30 |
+| Step 6 (savepoint widen) | 30/30 |
+
+Post-migration reliability sits in the ~93-100% band per 30-run sample,
+up from the ~77-95% pre-migration band.
+
+### Checkpoint latest-frame-per-page (resolved 2026-04-22)
+
+**Previously:** the backfill loop in `checkpointWithMode` wrote every
+frame's page to the DB file — a page rewritten N times in the WAL got
+written N times, most of them overwritten by later frames.
+
+**Now:** two-phase backfill — (1) `buildBackfillMap(lo, hi)` scans
+frame headers `[lo, hi)` and returns `map[pgno]frameIdx` keeping the
+latest frame per pgno; (2) iterate pgnos ascending for sequential
+DB-file write locality, writing each page exactly once. Matches
+SQLite's `walIteratorNext` (`sqlitec/src/wal.c:1758-1786`).
+
+**Invariants preserved:** `nBackfill` is still a frame-index cursor
+(crash recovery works unchanged); `nBackfillAttempted` is set before
+the write phase (partial-write detection still correct); in-memory
+mode uses the same dedup logic on `w.memFrames`.
+
+**Measured delta** (see
+`any-store-tests/results/session_perf/benchstat_ckpt_dedup_scratch.txt`):
+`Crud/BatchUpdate` sec/op **-7.97%** (p=0.022), alloc-neutral. Geomean
+flat (most benches don't stress checkpoint). The original dedup commit
+introduced a per-checkpoint map/slice allocation (naively matching
+SQLite's `walIteratorInit` + `walIteratorFree` at
+`sqlitec/src/wal.c:1929-1933` / `:1948` which also `malloc`s/`free`s
+per checkpoint). We can do better than SQLite here: any-store's
+single-writer invariant (`lockCheckpoint` held exclusive) lets us
+reuse `w.ckptLatest` + `w.ckptPgnos` scratch across checkpoints,
+erasing the allocation cost entirely.
+
+### Checkpoint mxFrame source fix (commit `9023f5b`)
+
+A ~4-5% residual failure persisted through all per-tx walHdr work
+because none of those steps touched `checkpointWithMode`'s mxFrame
+source. Root cause: `wal.go:checkpointWithMode` used
+`nf := w.index.mxCommitFrame.Load()` which is process-local. In
+multi-process mode, a sibling's committed frames appear in the SHM
+header but NOT in this process's local `mxCommitFrame`. Close-time
+`checkpointPassive` only backfilled THIS process's own frames, then
+`truncateFile` wiped the WAL — destroying sibling's uncopied frames.
+
+Fix: in multi-process mode, read `nf` from the live SHM hdr at
+checkpoint start. Matches SQLite's `walCheckpoint` which reads
+`pWal->hdr.mxFrame` populated by `walIndexTryHdr`.
+
+Reliability: 100/100 on the 100-run multi-process index harness.
+
+**Follow-up: same bug class in sibling sites.** A drift review flagged
+two more call sites with identical process-local reads:
+`checkpointPassive`'s completeness probe
+(`nBackfill >= mxCommitFrame.Load()` — controls whether `pager.close`
+truncates) and `checkpointPost`'s reset gate
+(`backfill < mxCommitFrame.Load()` — controls `tryResetWAL`). Stale
+local `mxCommitFrame` would falsely report "complete" / "ready to
+reset" after only backfilling our own frames.
+
+Fix: extracted helper `(w *wal) authoritativeMxFrame()` that reads SHM
+hdr in multi-process mode, falls back to `mxCommitFrame.LoadLocal()`
+otherwise. `checkpointWithMode`, `checkpointPassive`, and
+`checkpointPost` all use the helper. Mirrors SQLite's
+`pWal->hdr.mxFrame` usage throughout `walCheckpoint` (wal.c:2216,
+2227, 2309, 2341). Reader-path call sites (`shmHashGet`,
+`tryBeginReadInProcess`) intentionally retain the local read — those
+are per-tx snapshots that must not observe frames we haven't sync'd.
+
+**Compile-time guard added 2026-04-22.** `walIndex.mxCommitFrame` is
+now a `commitFrameCounter` (see `mxframe.go`) whose only reader is
+`LoadLocal()`; there is no plain `Load()`. Callers that want the
+cross-process authoritative value must go through
+`authoritativeMxFrame()`. A regressing commit that reads
+`mxCommitFrame.Load()` directly no longer compiles. The one production
+site still reading the local cursor in multi-process mode
+(`tryCheckpoint` in `pager.go`) now uses the authoritative accessor.
+
+### pager.close lockWrite gate
+
+Close-time checkpoint+truncate must hold `lockWrite` exclusive across
+both operations so a peer's in-flight `writeFrames` cannot race the
+truncate. Earlier code called `walBusyLock(lockWrite)` but discarded
+the error: on 5s timeout we proceeded without the lock, racing the
+peer and corrupting the WAL. The unconditional `unlock` at the end
+also released a slot we never acquired.
+
+Fix: track acquisition with a `lockedWrite bool`; truncate only when
+`lockedWrite || inProcess`; unlock only when we hold it. If lock
+acquisition fails, `checkpointPassive` still runs (it doesn't need
+the write lock) but truncate is skipped — WAL stays intact for the
+next opener. Mirrors SQLite's `sqlite3WalClose` which only calls
+`walLimitSize` inside the `SQLITE_OK==sqlite3OsLock(EXCLUSIVE)` arm
+(wal.c:2508-2536).
+
+**Structural guard added 2026-04-22.** The manual `lockedWrite bool` +
+trailing manual unlock has been replaced by
+`(*pager).withWriteLock(fn func(locked bool) error) error`, which
+acquires (or skips) the lock in one place and releases via `defer`. A
+future early-return or panic inside the closure cannot leak the lock.
+The close body is now the closure; correctness of the truncate gate
+no longer depends on the code path walking past the unlock line.
+Regression test: `TestWithWriteLock_AlwaysReleases` covers clean /
+error / panic return paths.
 
 ### Not Implemented (by design)
 
@@ -1395,3 +1768,38 @@ These SQLite features are intentionally absent:
 - **Multi-database transactions** -- single database per connection
 - **WAL2 mode** -- standard WAL only
 - **Database file locking (RESERVED/PENDING/EXCLUSIVE)** -- WAL mode uses SHM locks
+
+---
+
+## Online Backup (backup.go)
+
+Port of SQLite's `sqlite3_backup_*` API from `sqlite/src/backup.c`. See
+`docs/plans/2026-04-22-sqlite-backup-port.md` for the full drift
+register and C↔Go coverage table. Key entry points:
+
+- `(*DB).BackupInit(src *DB) (*Backup, error)` -- ~ `sqlite3_backup_init`
+- `(*Backup).Step(n int) error` -- ~ `sqlite3_backup_step`
+- `(*Backup).Finish() error` -- ~ `sqlite3_backup_finish`
+- `(*Backup).Remaining() uint32` -- ~ `sqlite3_backup_remaining`
+- `(*Backup).PageCount() uint32` -- ~ `sqlite3_backup_pagecount`
+
+Hooks in `pager.commit()` (post-`wal.writeFrames`) and
+`pager.checkpointWithMode()` (Restart/Truncate modes) dispatch the C
+equivalents of `sqlite3BackupUpdate` and `sqlite3BackupRestart`
+respectively. See `pager.dispatchBackupUpdate` /
+`pager.dispatchBackupRestart`. External-process writes are detected at
+each Step's read tx via the page-1 `FileChangeCounter` and trigger the
+same restart.
+
+Anystore-level `(*db).Backup(ctx, path)` drives the engine by opening
+a fresh destination DB at `path` with matching options.
+
+**Key intentional simplifications** (full list in the plan document):
+- Always same-page-size: any-store is WAL-only, so `backup.c:378-383`'s
+  `SQLITE_READONLY` for WAL+size-mismatch is our `ErrBackupPageSizeMismatch`
+  at init. The cross-size packing path at `backup.c:449-528` is
+  therefore unreachable.
+- No `PENDING_BYTE_PAGE` handling -- any-store has no 1GB lock byte.
+- No attached-db name resolution (`findBtree`) -- one b-tree per DB.
+- No `nBackup` counter on source -- nothing for it to block (no
+  VACUUM, immutable page size).

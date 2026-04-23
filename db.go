@@ -51,6 +51,14 @@ type DB interface {
 	// QuickCheck performs a quick integrity check. If result not ok returns error.
 	QuickCheck(ctx context.Context) (err error)
 
+	// IntegrityCheck runs the full structural btree integrity check:
+	// reachable-page coverage, orphan detection, freelist consistency,
+	// overflow-chain validation, key ordering, and master-page consistency.
+	// Returns nil if the database is structurally consistent, or an error
+	// aggregating up to 100 issues found. More expensive than QuickCheck —
+	// intended for stress tests and offline diagnostics, not normal opens.
+	IntegrityCheck(ctx context.Context) (err error)
+
 	// Flush perform checkpoint on the btree database
 	// When waitIdleDuration > 0, wait for waitIdleTime since the last write tx got released
 	Flush(ctx context.Context, waitIdleDuration time.Duration, mode FlushMode) error
@@ -111,9 +119,13 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	var quickCheckNeeded bool
 	ds.recoveryController, quickCheckNeeded = ds.createRecoveryController(ctx, path)
 
+	cacheSize := config.CacheSize
+	if cacheSize <= 0 {
+		cacheSize = 5000
+	}
 	opts := btree.Options{
 		PageSize:              4096,
-		CacheSize:             5000,
+		CacheSize:             cacheSize,
 		InProcess:             false,
 		NoCommitSync:          !config.CommitSync,
 		InMemory:              config.InMemory,
@@ -124,6 +136,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		KDFIterations:         config.Encryption.KDFIterations,
 		CipherType:            config.Encryption.CipherType,
 		Codec:                 config.Encryption.Codec,
+		MmapSize:              config.MmapSize,
 	}
 
 	var err error
@@ -315,8 +328,7 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 	merged := mergeCollOpts(opts)
 	var coll Collection
 	err := db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
-		db.mu.Lock()
-		defer db.mu.Unlock()
+		tx.MarkSchemaChanged()
 
 		// Check if collection already exists in system namespace
 		key := collKey(collectionName)
@@ -355,6 +367,9 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 		if coll, err = newCollection(ctx, db, collectionName, tx); err != nil {
 			return err
 		}
+
+		db.mu.Lock()
+		defer db.mu.Unlock()
 		db.openedCollections[collectionName] = coll
 
 		return nil
@@ -367,15 +382,21 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 
 func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collection, error) {
 	db.mu.Lock()
-	defer db.mu.Unlock()
+	if coll, ok := db.openedCollections[collectionName]; ok {
+		db.mu.Unlock()
+		return coll, nil
+	}
+	db.mu.Unlock()
 	return db.openCollection(ctx, collectionName)
 }
 
 func (db *db) openCollection(ctx context.Context, collectionName string) (Collection, error) {
-	coll, ok := db.openedCollections[collectionName]
-	if ok {
+	db.mu.Lock()
+	if coll, ok := db.openedCollections[collectionName]; ok {
+		db.mu.Unlock()
 		return coll, nil
 	}
+	db.mu.Unlock()
 
 	err := db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		key := collKey(collectionName)
@@ -392,9 +413,15 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 		return nil, err
 	}
 
-	coll, err = newCollection(ctx, db, collectionName)
+	coll, err := newCollection(ctx, db, collectionName)
 	if err != nil {
 		return nil, err
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if existing, ok := db.openedCollections[collectionName]; ok {
+		return existing, nil
 	}
 	db.openedCollections[collectionName] = coll
 	return coll, nil
@@ -507,20 +534,60 @@ func (db *db) QuickCheck(ctx context.Context) (err error) {
 	})
 }
 
-func (db *db) Backup(ctx context.Context, path string) (err error) {
-	// Read the source file and copy it
-	srcPath := db.btreeDB.Path()
-
-	// Checkpoint first to ensure all WAL data is in the main file
-	if err = db.btreeDB.Checkpoint(btree.CheckpointFull); err != nil {
-		return err
+func (db *db) IntegrityCheck(ctx context.Context) (err error) {
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
+	return db.btreeDB.IntegrityCheck()
+}
 
-	srcData, err := osReadFile(srcPath)
+func (db *db) Backup(ctx context.Context, path string) (err error) {
+	// ~ SQLite's recommended online-backup pattern (see backup.c header
+	// comment at lines 11-13 and the sqlite3_backup_init/step/finish
+	// sequence). We open a fresh destination DB at `path` with
+	// identical Options to the source so page sizes match.
+	dstOpts := db.btreeDB.Options()
+	dstOpts.InMemory = false // destination is always a file (user gave us a path)
+
+	dstDB, err := btree.Open(path, dstOpts)
+	if err != nil {
+		return fmt.Errorf("open backup destination: %w", err)
+	}
+	defer func() {
+		if cerr := dstDB.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+		if err != nil {
+			_ = osRemove(path)
+		}
+	}()
+
+	b, err := dstDB.BackupInit(db.btreeDB)
 	if err != nil {
 		return err
 	}
-	return osWriteFile(path, srcData, 0644)
+	defer func() {
+		if ferr := b.Finish(); ferr != nil && err == nil && !errors.Is(ferr, btree.ErrBackupFinished) {
+			err = ferr
+		}
+	}()
+
+	// Copy in bounded batches so ctx cancellation is responsive.
+	// SQLite's sqlite3BtreeCopyFile (backup.c:751) uses 0x7FFFFFFF in one
+	// shot; we prefer yielding.
+	const batch = 256
+	for {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		serr := b.Step(batch)
+		if errors.Is(serr, btree.ErrBackupDone) {
+			return nil
+		}
+		if serr != nil {
+			return serr
+		}
+	}
 }
 
 func (db *db) WriteTx(ctx context.Context) (tx WriteTx, err error) {
@@ -762,6 +829,7 @@ func (db *db) removeIndex(tx *btree.WriteTx, collName, indexName string) error {
 
 // removeCollection removes collection metadata from the system namespace
 func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
+	tx.MarkSchemaChanged()
 	// Remove collection key
 	if err := tx.Delete(db.systemNS, collKey(collName)); err != nil {
 		return err
@@ -799,6 +867,7 @@ func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 
 // renameCollection renames collection metadata in the system namespace
 func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error {
+	tx.MarkSchemaChanged()
 	// Remove old collection key, add new one
 	if err := tx.Delete(db.systemNS, collKey(oldName)); err != nil {
 		return err

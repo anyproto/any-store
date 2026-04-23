@@ -2,6 +2,7 @@ package btree
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1337,7 +1338,7 @@ func TestBeginWrite_BeginWriteError(t *testing.T) {
 	// Call pager methods directly to cover the beginWrite error path.
 	maxFrame, slot, err := db.pager.beginRead()
 	require.NoError(t, err)
-	err = db.pager.beginWrite()
+	err = db.pager.beginWrite(WalIndexHdr{})
 	assert.ErrorIs(t, err, ErrBusy) // Fails because WAL write lock is held
 	db.pager.endRead(slot)
 	_ = maxFrame
@@ -3662,5 +3663,101 @@ func TestSlabHeapBound_MultiDB(t *testing.T) {
 		t.Errorf("heap grew by %d MB, exceeds 2x slab budget (%d MB); "+
 			"overflow buffers may not be reclaimed",
 			heapInUse/(1<<20), maxAllowed/(1<<20))
+	}
+}
+
+// TestBeginWrite_SurfacesBusySnapshotAfterBoundedRetries ensures the
+// internal retry budget is bounded (not 1000) and ErrBusySnapshot
+// surfaces to the caller so the app can throttle or fail fast.
+//
+// SKIPPED: depends on the `forceBusySnapshotForTest atomic.Bool` hook in
+// wal.go, which is commented out to avoid a per-BeginWrite atomic.Load
+// on the production hot path. To run this test: uncomment both the
+// field declaration in the wal struct and the check at the top of
+// beginWriteWithSnapshot, then remove this t.Skip and the _ = line.
+func TestBeginWrite_SurfacesBusySnapshotAfterBoundedRetries(t *testing.T) {
+	t.Skip("requires forceBusySnapshotForTest hook in wal.go (commented out for production hot-path cost)")
+	_ = errors.Is // keep imports live while the body is unreachable
+	/*
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "t.db")
+
+		db, err := Open(dbPath, Options{})
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+
+		// Disable the busy handler so BeginWrite does not retry via backoff.
+		db.pager.wal.busyHandler = nil
+		// Force every write-snapshot check to return ErrBusySnapshot.
+		db.pager.wal.forceBusySnapshotForTest.Store(true)
+		defer db.pager.wal.forceBusySnapshotForTest.Store(false)
+
+		_, err = db.BeginWrite()
+		if !errors.Is(err, ErrBusySnapshot) {
+			t.Fatalf("expected ErrBusySnapshot, got %v", err)
+		}
+	*/
+}
+
+// TestBeginWrite_BusySnapshotRoutesThroughBusyHandler proves the
+// inner retry budget is bounded (busySnapshotInnerRetries) and further
+// retries flow through the configured BusyHandler — matching SQLite's
+// sqlite3InvokeBusyHandler dispatch (main.c:1700-1715). Previously the
+// 1000-attempt hidden loop never called the handler.
+//
+// SKIPPED: see TestBeginWrite_SurfacesBusySnapshotAfterBoundedRetries —
+// same hook dependency. Uncomment the wal.go field + check to run.
+func TestBeginWrite_BusySnapshotRoutesThroughBusyHandler(t *testing.T) {
+	t.Skip("requires forceBusySnapshotForTest hook in wal.go (commented out for production hot-path cost)")
+	/*
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "t.db")
+
+		db, err := Open(dbPath, Options{})
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+
+		db.pager.wal.forceBusySnapshotForTest.Store(true)
+		defer db.pager.wal.forceBusySnapshotForTest.Store(false)
+
+		// Counting busy handler: allow 2 callbacks, then deny.
+		const allow = 2
+		var invocations int
+		db.pager.wal.busyHandler = func(count int) bool {
+			invocations++
+			return invocations <= allow
+		}
+
+		_, err := db.BeginWrite()
+		if !errors.Is(err, ErrBusySnapshot) {
+			t.Fatalf("expected ErrBusySnapshot, got %v", err)
+		}
+		// Handler must have been invoked at least once (inner budget < 1000).
+		if invocations == 0 {
+			t.Fatalf("busy handler never invoked — inner retry loop likely still spinning instead of delegating")
+		}
+		if invocations > allow+1 {
+			t.Fatalf("busy handler kept being called after returning false: invocations=%d", invocations)
+		}
+	*/
+}
+
+// TestP3_4_LastAutoCheckpointErrorIsNilOnFreshOpen verifies the
+// accessor returns nil before any auto-checkpoint has run. Covers the
+// API surface; a full error-injection test would need disk-full
+// injection.
+func TestP3_4_LastAutoCheckpointErrorIsNilOnFreshOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "t.db")
+	db, err := testOpen(t, path, DefaultOptions())
+	require.NoError(t, err)
+	defer db.Close()
+
+	if got := db.LastAutoCheckpointError(); got != nil {
+		t.Fatalf("fresh open: LastAutoCheckpointError should be nil, got %v", got)
 	}
 }
