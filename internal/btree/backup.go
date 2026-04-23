@@ -85,6 +85,13 @@ func (dst *DB) BackupInit(src *DB) (*Backup, error) {
 		return nil, ErrBackupSameDB
 	}
 
+	// ~ checkReadTransaction (backup.c:124-130): reject if dst already
+	// has an open tx. We fast-fail here instead of letting BeginWrite
+	// block in the first Step — matches SQLite's observable behavior.
+	if dst.HasOpenTransaction() {
+		return nil, ErrBackupDstBusy
+	}
+
 	// Faithful port of backup.c:378-383 for WAL destinations: we are
 	// always WAL, so a size mismatch is always SQLITE_READONLY-equivalent.
 	if dst.PageSize() != src.PageSize() {

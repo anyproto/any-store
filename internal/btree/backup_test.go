@@ -290,6 +290,29 @@ func TestBackup_StepAfterFinishIsError(t *testing.T) {
 	require.ErrorIs(t, b.Step(10), ErrBackupFinished)
 }
 
+func TestBackupInit_RejectsDstWithOpenReadTx(t *testing.T) {
+	src, dst := backupPair(t)
+
+	rtx, err := dst.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+
+	// ~ backup.c:124-130 ("destination database is in use").
+	_, err = dst.BackupInit(src)
+	require.ErrorIs(t, err, ErrBackupDstBusy)
+}
+
+func TestBackupInit_RejectsDstWithOpenWriteTx(t *testing.T) {
+	src, dst := backupPair(t)
+
+	wtx, err := dst.BeginWrite()
+	require.NoError(t, err)
+	defer wtx.Rollback()
+
+	_, err = dst.BackupInit(src)
+	require.ErrorIs(t, err, ErrBackupDstBusy)
+}
+
 // Note: direct unit-test of ErrBackupPageSizeMismatch would require
 // two DBs with different page sizes open simultaneously, which is
 // impossible in any-store (pageBufferPool is a process-global singleton,

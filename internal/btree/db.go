@@ -328,6 +328,17 @@ func (db *DB) DatabaseSize() uint32 {
 	return db.pager.dbSize.Load()
 }
 
+// HasOpenTransaction returns true if the DB has an active read or write
+// transaction. Write state is tracked on the pager; reader state lives
+// on the DB's readerSem (pager.state only transitions for writers).
+// ~ sqlite3BtreeTxnState != SQLITE_TXN_NONE (backup.c:125).
+func (db *DB) HasOpenTransaction() bool {
+	if pagerState(db.pager.state.Load()) != pagerOpen {
+		return true
+	}
+	return len(db.readerSem) > 0
+}
+
 // beginRead starts a read-only transaction.
 // When readCounters is false, disk counters are initialized from local counters
 // without reading page-1 metadata, which is useful for hot point-lookups.
