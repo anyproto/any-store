@@ -266,6 +266,43 @@ func (b *Backup) PageCount() uint32 {
 	return b.nPagecount
 }
 
+// update is called by the source pager right after a committed page is
+// written to the WAL. If the page has already been copied into the
+// destination (iPage < b.iNext), re-copy it so the destination stays
+// current. ~ backupUpdate (backup.c:661–685).
+//
+// Caller holds the source pager's backups list lock momentarily — see
+// pager.dispatchBackupUpdate — but the callback runs outside that lock
+// to avoid nesting b.mu under backupsMu.
+func (b *Backup) update(iPage uint32, data []byte) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// ~ backup.c:669 — skip if fatal error or page not yet copied.
+	if b.rc != nil && b.rc != ErrBackupDone {
+		return
+	}
+	if iPage >= b.iNext {
+		return
+	}
+
+	// bUpdate=true suppresses the page-1 DatabaseSize patch, which would
+	// be wrong to redo mid-backup.
+	if err := b.onePage(iPage, data, true); err != nil {
+		b.rc = err
+	}
+}
+
+// restart resets the backup to start copying from page 1 again. Called
+// by the source pager when the page cache is invalidated in a way that
+// makes "already copied" tracking meaningless (e.g. WAL reset).
+// ~ sqlite3BackupRestart (backup.c:701–707).
+func (b *Backup) restart() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.iNext = 1
+}
+
 // Finish releases all resources associated with a Backup and commits
 // or rolls back the destination write transaction based on b.rc.
 // ~ sqlite3_backup_finish (backup.c:571–619).

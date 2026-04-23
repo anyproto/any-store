@@ -1393,6 +1393,11 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	// Capture nFrame atomically for checkpoint threshold decision.
 	nFrame = p.wal.nFrame.Load()
 
+	// Notify online backups that these pages have new committed content.
+	// ~ sqlite3BackupUpdate dispatch (backup.c:687). Must happen here,
+	// AFTER the WAL frames are durable, so dst sees committed data only.
+	p.dispatchBackupUpdate(p.dirtyBuf)
+
 	// Mark all pages as clean
 	for _, pg := range p.dirtyBuf {
 		p.writerCache.makeClean(pg)
@@ -2056,6 +2061,46 @@ func (p *pager) detachBackup(b *Backup) {
 			p.backups = append(p.backups[:i], p.backups[i+1:]...)
 			return
 		}
+	}
+}
+
+// dispatchBackupUpdate notifies every registered Backup that the given
+// dirty pages have been committed to this pager's WAL. Called from
+// pager.commit just after wal.writeFrames succeeds, so the page data
+// we hand to each backup is the authoritative post-commit version.
+// ~ sqlite3BackupUpdate dispatch (backup.c:687–688).
+func (p *pager) dispatchBackupUpdate(dirty []*page) {
+	p.backupsMu.Lock()
+	if len(p.backups) == 0 {
+		p.backupsMu.Unlock()
+		return
+	}
+	// Copy the slice so callbacks can run outside the lock without
+	// nesting b.mu under backupsMu.
+	bs := make([]*Backup, len(p.backups))
+	copy(bs, p.backups)
+	p.backupsMu.Unlock()
+
+	for _, pg := range dirty {
+		for _, b := range bs {
+			b.update(pg.pgno, pg.data)
+		}
+	}
+}
+
+// dispatchBackupRestart notifies every registered Backup to restart
+// from page 1. ~ sqlite3BackupRestart (backup.c:701–707).
+func (p *pager) dispatchBackupRestart() {
+	p.backupsMu.Lock()
+	if len(p.backups) == 0 {
+		p.backupsMu.Unlock()
+		return
+	}
+	bs := make([]*Backup, len(p.backups))
+	copy(bs, p.backups)
+	p.backupsMu.Unlock()
+	for _, b := range bs {
+		b.restart()
 	}
 }
 
