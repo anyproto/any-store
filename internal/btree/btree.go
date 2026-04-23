@@ -1820,7 +1820,8 @@ func (bt *btree) insertIntoParentWithPath(leftPg *page, key []byte, rightPgno ui
 	}
 
 	// Get the parent page (last element of path) as writable
-	parentPgno := path[len(path)-1].pgno
+	parentEntry := path[len(path)-1]
+	parentPgno := parentEntry.pgno
 	parentPath := path[:len(path)-1]
 
 	parentPg, err := bt.pager.getWritablePage(parentPgno)
@@ -1828,7 +1829,10 @@ func (bt *btree) insertIntoParentWithPath(leftPg *page, key []byte, rightPgno ui
 		return err
 	}
 
-	return bt.insertSepIntoInterior(parentPg, leftPg.pgno, key, rightPgno, parentPath)
+	// path[len-1].cellIdx is the slot in parentPg where the new separator
+	// goes — the same position the descent went through. Mirrors SQLite's
+	// balance_nonroot(pParent, iIdx, ...) dispatch at btree.c:9213.
+	return bt.insertSepIntoInterior(parentPg, leftPg.pgno, key, rightPgno, int(parentEntry.cellIdx), parentPath)
 }
 
 // insertSepIntoAncestor inserts a separator key into an ancestor page identified
@@ -1847,7 +1851,8 @@ func (bt *btree) insertSepIntoAncestor(leftPgno uint32, key []byte, rightPgno ui
 	}
 
 	// Get the parent page (last element of path) as writable
-	parentPgno := path[len(path)-1].pgno
+	parentEntry := path[len(path)-1]
+	parentPgno := parentEntry.pgno
 	parentPath := path[:len(path)-1]
 
 	parentPg, err := bt.pager.getWritablePage(parentPgno)
@@ -1855,29 +1860,35 @@ func (bt *btree) insertSepIntoAncestor(leftPgno uint32, key []byte, rightPgno ui
 		return err
 	}
 
-	return bt.insertSepIntoInterior(parentPg, leftPgno, key, rightPgno, parentPath)
+	return bt.insertSepIntoInterior(parentPg, leftPgno, key, rightPgno, int(parentEntry.cellIdx), parentPath)
 }
 
 // insertSepIntoInterior inserts a separator key into an interior page.
 // This is the core logic shared by insertIntoParentWithPath and insertSepIntoAncestor.
-func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []byte, rightPgno uint32, parentPath []pathEntry) error {
+//
+// insertIdx is the position in parentPg where the new separator is
+// inserted. It is path[len-1].cellIdx from the caller — the same slot
+// in the parent the descent went through to reach the child that just
+// split. Mirrors SQLite's balance_nonroot signature (btree.c:8230),
+// which takes iIdx as a parameter populated from
+// pCur->aiIdx[iPage-1] (btree.c:9162).
+//
+// Invariant: 0 <= insertIdx <= parentPg.header.cellCount. When
+// insertIdx == cellCount we descended via rightChild; when less, we
+// descended via the cell at that index.
+func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []byte, rightPgno uint32, insertIdx int, parentPath []pathEntry) error {
 	// Insert separator into parent interior page
 	n := int(parentPg.header.cellCount)
 	cpOff := parentPg.cellPointerOffset()
-	data := parentPg.data
 
-	// Find insertion point in parent
-	pageUsable := bt.usablePageSize()
-	insertIdx := n
-	for i := range n {
-		off := int(binary.BigEndian.Uint16(data[cpOff+i*2:]))
-		cellKey, _, _ := bt.interiorCellFullKey(data, off, pageUsable)
-		if bytes.Compare(cellKey, key) >= 0 {
-			insertIdx = i
-			break
-		}
+	// Defensive: guard against path staleness (should never fire in
+	// correct code but surfaces drift during development).
+	if insertIdx < 0 || insertIdx > n {
+		bt.pager.releasePage(parentPg)
+		return ErrCorrupt
 	}
 
+	pageUsable := bt.usablePageSize()
 	cellSize := interiorCellSizeWithOverflow(key, pageUsable)
 	hdrSize := cpOff + (n+1)*2
 	// Validate cellContentOff before using as slice index.

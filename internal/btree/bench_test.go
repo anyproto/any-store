@@ -417,3 +417,74 @@ func BenchmarkCollectRebuildOverflow(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkInsertSepIntoInterior_DeepTree measures the cost of
+// inserting a divider into an interior page. Before commit 2 of the
+// balance_quick port, insertSepIntoInterior re-scanned the parent
+// linearly (O(nCell)) to locate the insertion slot. With cellIdx
+// threaded through pathEntry, the scan is eliminated; the improvement
+// is proportional to parent fan-out.
+//
+// SQLite's equivalent: balance_nonroot takes iIdx as a parameter
+// (btree.c:8230, 9213), populated from the cursor stack.
+func BenchmarkInsertSepIntoInterior_DeepTree(b *testing.B) {
+	resetPageBufferPool()
+	dir := b.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	tx, err := db.BeginWrite()
+	if err != nil {
+		b.Fatal(err)
+	}
+	_, err = tx.CreateNamespace("t1")
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+
+	tx, err = db.BeginWrite()
+	if err != nil {
+		b.Fatal(err)
+	}
+	ns, err := db.getNamespaceLocked("t1")
+	if err != nil {
+		b.Fatal(err)
+	}
+	val := make([]byte, 64)
+	for i := 1; i <= 200_000; i++ {
+		key := binary.BigEndian.AppendUint32(nil, uint32(i))
+		if err := tx.Put(ns, key, val); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		tx, err := db.BeginWrite()
+		if err != nil {
+			b.Fatal(err)
+		}
+		ns, err := db.getNamespaceLocked("t1")
+		if err != nil {
+			b.Fatal(err)
+		}
+		key := binary.BigEndian.AppendUint32(nil, uint32(200_001+i))
+		if err := tx.Put(ns, key, val); err != nil {
+			b.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

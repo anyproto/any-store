@@ -1428,9 +1428,15 @@ The cursor path used to store only page numbers. As of commit 1 of the
 balance_quick port, the descent path is `[]pathEntry{pgno, cellIdx, nCell}`,
 mirroring SQLite's `apPage[]`/`aiIdx[]` cursor stack (`btreeInt.h:553-556`).
 `cellIdx` is populated from `searchInterior`'s second return value (which was
-previously discarded). Consumers still re-scan parents to locate the child slot
-— that consumption happens in commits 2 (`insertSepIntoInterior`) and 3
-(`tryMergeLeaf` / `removeChildFromParent`).
+previously discarded).
+
+Commit 2 consumption: `insertSepIntoInterior` now takes `insertIdx` directly
+(mirrors SQLite's `balance_nonroot(iIdx=...)` at `btree.c:8230,9213`). The
+O(nCell) linear parent re-scan that used to run before inserting a divider
+is gone. `BenchmarkInsertSepIntoInterior_DeepTree` pins the win.
+
+Delete-side consumption (`tryMergeLeaf` / `removeChildFromParent`) arrives
+in commit 3.
 
 **Nearby Allocation Hint for Overflow Pages** -- Resolved 2026-04-22
 
