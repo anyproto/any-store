@@ -51,6 +51,44 @@ func TestBackupInit_RejectsSameDB(t *testing.T) {
 	require.ErrorIs(t, err, ErrBackupSameDB)
 }
 
+func TestBackup_OnePage_CopiesPageDataAndClearsMemPageFlag(t *testing.T) {
+	src, dst := backupPair(t)
+
+	// Insert data into src so page 1 is non-trivial and we have a page 2.
+	stx, err := src.BeginWrite()
+	require.NoError(t, err)
+	ns, _ := src.GetNamespace("data")
+	require.NoError(t, stx.Put(ns, []byte("k1"), []byte("v1")))
+	require.NoError(t, stx.Commit())
+
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+
+	// Manually open a dst write tx and a src read tx to mimic what Step does.
+	dtx, err := dst.BeginWrite()
+	require.NoError(t, err)
+	defer dtx.Rollback()
+	b.dstWriteTx = dtx
+	b.dstLocked = true // normally set by Step after BeginWrite
+
+	rtx, err := src.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+
+	srcPg1, err := src.pager.getPageReader(1, rtx.walMaxFrame, rtx.cache)
+	require.NoError(t, err)
+
+	// ~ backup.c:226–279 — copy one page.
+	require.NoError(t, b.onePage(1, srcPg1.data, false))
+
+	// Verify dst page 1 equals src page 1 byte-for-byte (modulo the
+	// DatabaseSize patch at offset 28–31 that onePage applies).
+	dstPg1, err := dst.pager.getPageWriter(1, dst.pager.wal.nFrame.Load())
+	require.NoError(t, err)
+	require.Equal(t, srcPg1.data[:28], dstPg1.data[:28], "dst page 1 bytes [0:28] must match src")
+	require.Equal(t, srcPg1.data[32:], dstPg1.data[32:], "dst page 1 bytes [32:] must match src")
+}
+
 // Note: direct unit-test of ErrBackupPageSizeMismatch would require
 // two DBs with different page sizes open simultaneously, which is
 // impossible in any-store (pageBufferPool is a process-global singleton,
