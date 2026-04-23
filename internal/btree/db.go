@@ -339,6 +339,14 @@ func (db *DB) HasOpenTransaction() bool {
 	return len(db.readerSem) > 0
 }
 
+// Options returns a copy of the options this DB was opened with. Used
+// by high-level callers (e.g. anystore.Backup) to open a destination
+// DB with matching page size. No direct SQLite counterpart — SQLite
+// uses attached-db paths to imply options.
+func (db *DB) Options() Options {
+	return db.opts
+}
+
 // beginRead starts a read-only transaction.
 // When readCounters is false, disk counters are initialized from local counters
 // without reading page-1 metadata, which is useful for hot point-lookups.
