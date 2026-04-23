@@ -1758,7 +1758,13 @@ func (p *pager) releaseSavepoint(id int) error {
 // The WAL's busy handler is used for FULL/RESTART/TRUNCATE modes to wait
 // for readers that block progress, matching SQLite's behavior.
 func (p *pager) checkpointWithMode(mode CheckpointMode) error {
-	return p.wal.checkpointWithMode(p.file, p.master, mode, p.wal.busyHandler)
+	err := p.wal.checkpointWithMode(p.file, p.master, mode, p.wal.busyHandler)
+	if err == nil && (mode == CheckpointRestart || mode == CheckpointTruncate) {
+		// ~ sqlite3BackupRestart (backup.c:701-707). WAL frame numbering
+		// has reset, so any in-flight backup must start over.
+		p.dispatchBackupRestart()
+	}
+	return err
 }
 
 // tryCheckpoint attempts a passive checkpoint for auto-checkpoint.
@@ -1774,7 +1780,11 @@ func (p *pager) tryCheckpoint() error {
 	// frame numbers and prevent unbounded WAL growth. With xBusy=nil this does
 	// not wait for readers; it simply skips reset when locks are busy.
 	if p.wal.index.nBackfill.Load() >= p.wal.index.mxCommitFrame.Load() {
-		_ = p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil)
+		if err := p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil); err == nil {
+			// ~ sqlite3BackupRestart (backup.c:701-707) also applies to
+			// auto-checkpoint's best-effort restart.
+			p.dispatchBackupRestart()
+		}
 	}
 	return nil
 }

@@ -164,6 +164,105 @@ func TestBackup_Step_BatchedCopy(t *testing.T) {
 	require.NoError(t, b.Finish())
 }
 
+func TestBackup_OnlineWriteBetweenSteps(t *testing.T) {
+	src, dst := backupPair(t)
+	ns, _ := src.GetNamespace("data")
+
+	// Seed: insert records with fat values to force multi-page.
+	stx, err := src.BeginWrite()
+	require.NoError(t, err)
+	fat := make([]byte, 300)
+	for i := 0; i < 200; i++ {
+		require.NoError(t, stx.Put(ns, fmt.Appendf(nil, "k-%04d", i), fat))
+	}
+	require.NoError(t, stx.Commit())
+	require.NoError(t, src.Checkpoint(CheckpointFull))
+
+	nSrc := src.DatabaseSize()
+	require.Greater(t, nSrc, uint32(4), "need enough pages to copy most then modify an already-copied page")
+
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+
+	// Copy all but the last page. After this, iNext == nSrc, meaning every
+	// page except pgno=nSrc has been copied. Any subsequent modification to
+	// a page <nSrc is an "already copied" case that must go through the
+	// update hook (backup.c:669 "iPage < iNext").
+	err = b.Step(int(nSrc - 1))
+	require.NoError(t, err, "Step should leave 1 page to copy")
+	require.Equal(t, uint32(1), b.Remaining())
+
+	// Concurrent write to src on an early key. The btree stores keys
+	// sorted, so "k-0000" lives on the leftmost leaf — almost certainly
+	// a page that's already been copied (iPage < iNext).
+	updated := []byte("updated-online")
+	stx2, err := src.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, stx2.Put(ns, []byte("k-0000"), updated))
+	require.NoError(t, stx2.Commit())
+
+	// Drain the rest.
+	for {
+		err := b.Step(-1)
+		if err == ErrBackupDone {
+			break
+		}
+		require.NoError(t, err)
+	}
+	require.NoError(t, b.Finish())
+
+	// Reopen dst and verify k-0000 is the updated value.
+	dstPath := dst.Path()
+	_ = dst.Close()
+	d2, err := Open(dstPath, DefaultOptions())
+	require.NoError(t, err)
+	defer d2.Close()
+	rtx, err := d2.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	ns2, _ := d2.GetNamespace("data")
+	got, err := rtx.Get(ns2, []byte("k-0000"))
+	require.NoError(t, err)
+	require.Equal(t, string(updated), string(got),
+		"update hook (backup.c:661-688) must re-copy pages modified after they were copied")
+}
+
+func TestBackup_RestartOnCheckpointRestart(t *testing.T) {
+	src, dst := backupPair(t)
+	ns, _ := src.GetNamespace("data")
+
+	// Seed with enough data to exceed 2 pages.
+	stx, err := src.BeginWrite()
+	require.NoError(t, err)
+	fat := make([]byte, 200)
+	for i := 0; i < 100; i++ {
+		require.NoError(t, stx.Put(ns, fmt.Appendf(nil, "k-%04d", i), fat))
+	}
+	require.NoError(t, stx.Commit())
+
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+	require.NoError(t, b.Step(2)) // partial: iNext advances past 1
+	require.Greater(t, src.DatabaseSize(), uint32(2))
+
+	// Observe iNext under lock (race-safe).
+	b.mu.Lock()
+	iNextBefore := b.iNext
+	b.mu.Unlock()
+	require.NotEqual(t, uint32(1), iNextBefore, "Step(2) should have advanced iNext past 1")
+
+	// CheckpointRestart resets WAL. ~ backup.c:701 trigger.
+	require.NoError(t, src.Checkpoint(CheckpointRestart))
+
+	b.mu.Lock()
+	iNextAfter := b.iNext
+	b.mu.Unlock()
+	require.Equal(t, uint32(1), iNextAfter, "CheckpointRestart must trigger Backup.restart (backup.c:701-707)")
+
+	// Clean up so Finish doesn't leave the write tx hanging.
+	_ = b.Finish()
+}
+
 // Note: direct unit-test of ErrBackupPageSizeMismatch would require
 // two DBs with different page sizes open simultaneously, which is
 // impossible in any-store (pageBufferPool is a process-global singleton,
