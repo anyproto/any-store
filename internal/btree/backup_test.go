@@ -2,6 +2,8 @@ package btree
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -384,6 +386,126 @@ func TestBackup_BumpsDstSchemaCookie(t *testing.T) {
 	defer rtx1.Rollback()
 	require.NotEqual(t, dstCookieBefore, rtx1.DiskSchemaCookie(),
 		"post-backup dst schema cookie must differ from pre-backup (backup.c:423 bump)")
+}
+
+// multiProcessBackupChild is invoked in a subprocess via exec.Command.
+// It opens the src db, writes an updated value for "k-0000", commits,
+// and exits. Called by TestBackup_RestartsOnExternalProcessWrite.
+func multiProcessBackupChild(t *testing.T, dbPath string) {
+	opts := Options{
+		PageSize:              4096,
+		CacheSize:             100,
+		InProcess:             false,
+		DisableAutoCheckpoint: true,
+	}
+	db, err := Open(dbPath, opts)
+	require.NoError(t, err)
+	defer db.Close()
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.GetNamespace("data")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("k-0000"), []byte("updated-externally")))
+	tx.MarkDataChanged()
+	require.NoError(t, tx.Commit())
+}
+
+func TestBackup_RestartsOnExternalProcessWrite(t *testing.T) {
+	dbPath := os.Getenv("TEST_BACKUP_MP_DB_PATH")
+	if dbPath != "" {
+		multiProcessBackupChild(t, dbPath)
+		return
+	}
+	if testing.Short() {
+		t.Skip("spawns subprocess; excluded in -short")
+	}
+
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "src.db")
+	dstPath := filepath.Join(dir, "dst.db")
+	opts := Options{
+		PageSize:              4096,
+		CacheSize:             100,
+		InProcess:             false,
+		DisableAutoCheckpoint: true,
+	}
+
+	// Seed src.
+	{
+		s, err := Open(srcPath, opts)
+		require.NoError(t, err)
+		stx, err := s.BeginWrite()
+		require.NoError(t, err)
+		ns, err := stx.CreateNamespace("data")
+		require.NoError(t, err)
+		fat := make([]byte, 200)
+		for i := 0; i < 100; i++ {
+			require.NoError(t, stx.Put(ns, fmt.Appendf(nil, "k-%04d", i), fat))
+		}
+		stx.MarkDataChanged()
+		require.NoError(t, stx.Commit())
+		require.NoError(t, s.Close())
+	}
+
+	src, err := Open(srcPath, opts)
+	require.NoError(t, err)
+	defer src.Close()
+	dst, err := Open(dstPath, opts)
+	require.NoError(t, err)
+	defer dst.Close()
+
+	nSrc := src.DatabaseSize()
+	require.Greater(t, nSrc, uint32(3))
+
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+	// Copy all but the last page so that k-0000's page (low-numbered,
+	// leftmost leaf) is already in "already copied" territory.
+	require.NoError(t, b.Step(int(nSrc-1)))
+	b.mu.Lock()
+	iNextBefore := b.iNext
+	b.mu.Unlock()
+	require.Equal(t, nSrc, iNextBefore)
+
+	// Spawn subprocess to write k-0000 to src.
+	cmd := exec.Command(os.Args[0],
+		"-test.run=^TestBackup_RestartsOnExternalProcessWrite$",
+		"-test.v",
+		"-test.timeout=30s",
+	)
+	cmd.Env = append(os.Environ(), "TEST_BACKUP_MP_DB_PATH="+srcPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	require.NoError(t, cmd.Run(), "child subprocess failed")
+
+	// The next Step must observe the changed FileChangeCounter and
+	// restart from page 1. Without the restart, iNext is already at
+	// (nSrc_old), so we'd either skip the last page entirely or mis-
+	// copy it, and the early page containing k-0000 stays stale.
+	for {
+		err := b.Step(-1)
+		if err == ErrBackupDone {
+			break
+		}
+		require.NoError(t, err)
+	}
+	require.NoError(t, b.Finish())
+
+	// Reopen dst and verify the externally-written update is reflected.
+	require.NoError(t, dst.Close())
+	d2, err := Open(dstPath, opts)
+	require.NoError(t, err)
+	defer d2.Close()
+	rtx, err := d2.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	ns, err := d2.GetNamespace("data")
+	require.NoError(t, err)
+	got, err := rtx.Get(ns, []byte("k-0000"))
+	require.NoError(t, err)
+	require.Equal(t, "updated-externally", string(got),
+		"external-process write mid-backup must be reflected in dst")
 }
 
 // Note: direct unit-test of ErrBackupPageSizeMismatch would require

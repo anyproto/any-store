@@ -64,6 +64,13 @@ type Backup struct {
 	// src pager's backups list and receives update/restart callbacks.
 	isAttached bool
 
+	// lastFCC is the FileChangeCounter observed at the previous Step's
+	// read-tx open. A jump between Steps signals an external-process
+	// commit: the in-process dispatchBackupUpdate hook can't observe
+	// cross-process writes, so we restart per backup.c:701-707.
+	// 0 = "no prior Step" (init state).
+	lastFCC uint32
+
 	// finished is set by Finish. DRIFT from backup.c:577 which tolerates
 	// NULL; we want explicit double-close detection.
 	finished bool
@@ -200,6 +207,16 @@ func (b *Backup) Step(nPage int) error {
 		return err
 	}
 	defer rtx.Rollback()
+
+	// ~ sqlite3BackupRestart (backup.c:701-707) external-trigger path.
+	// Page-1 FileChangeCounter changes on every write commit, including
+	// from other processes. The in-process dispatchBackupUpdate hook
+	// only fires for same-process commits (same DB handle), so this
+	// detects the rest. Inline the iNext reset to avoid re-acquiring b.mu.
+	if b.lastFCC != 0 && rtx.diskFileChangeCounter != b.lastFCC {
+		b.iNext = 1
+	}
+	b.lastFCC = rtx.diskFileChangeCounter
 
 	// Lock destination (exclusive/write tx) on first Step.
 	// ~ backup.c:366–371: sqlite3BtreeBeginTrans(p->pDest, 2, &iDestSchema).
