@@ -1414,6 +1414,50 @@ redistributes them targeting ~67% fill across all siblings. Our implementation
 uses a 2-way split targeting 2/3 fill on the left page. This captures most of
 the benefit without the complexity of multi-sibling redistribution.
 
+**Rightmost-Append Fast Path (balance_quick port)** -- Resolved 2026-04-23
+
+SQLite's `balance_quick` (`btree.c:7992-8086`, dispatched at
+`btree.c:9169-9192`) handles the "rightmost append into the rightmost
+leaf of a non-root parent" case without redistributing cells: it
+allocates a fresh right sibling, puts only the new cell there, leaves
+the old page 100% full, and adds a divider to the parent.
+
+Any-store's port lives in `splitLeafRightmostAppend` with dispatch at
+the top of `splitLeafAndInsertWithPath`. Four of SQLite's five
+preconditions (`btree.c:9170-9174`) map directly:
+
+    idx == pg.header.cellCount
+    len(path) > 0
+    path[len-1].cellIdx == path[len-1].nCell  (reached via rightChild)
+    path[len-1].pgno != bt.rootPage           (SQLite: pParent->pgno != 1)
+
+SQLite's fifth precondition `pPage->intKeyLeaf` is intkey-specific and
+does not apply to any-store's index-btree semantics. Any-store's interior
+search (`btree.go searchInterior`) invariant is "left child keys `<`
+separator, right child keys `>=` separator" whereas intkey tables use
+"left child keys `<=` separator". The consequence is that any-store's
+divider must be the *first* key of the new right sibling — the new key
+itself — rather than the largest key of pPage (which SQLite uses per
+`btree.c:8066-8070`). This semantic adaptation is documented in
+`splitLeafRightmostAppend`'s function comment.
+
+Measured on 5000 monotonic appends at pageSize=1024, valSize=80:
+
+    leaves:          714 → 488  (−31.6%; +56.9% overhead → +7.3%)
+    avg leaf fill:  60.7% → 88.7%
+    median fill:    60.6% → 95.3%
+
+Guarded by `TestBalanceQuick_AppendFillFactor` (the former diagnostic,
+now asserting `avgFill >= 0.85` on the monotonic case) and the
+`TestBalanceQuick_*` matrix in `btree_balance_quick_rgrd_test.go`
+(HappyPath, RootIsParent, CascadeToParentSplit, InterleavedInserts,
+OverflowBearingCell, SavepointRollback, ConcurrentReader,
+AllocFreelistCorruptResilience).
+
+Benchmark: `BenchmarkBalanceQuick_MonotonicAppend` reports rows/sec,
+final leaf count, and leaves/row. At pageSize=4096, valSize=128,
+10000 rows: 474 leaves (≈0.047 leaves/row, near the ideal packing).
+
 **No Full Freeblock Chain** -- Severity: Important (partially addressed)
 
 SQLite maintains a sorted linked list of free blocks within each page for

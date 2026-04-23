@@ -488,3 +488,98 @@ func BenchmarkInsertSepIntoInterior_DeepTree(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkBalanceQuick_MonotonicAppend measures per-row throughput of
+// monotonic ObjectID-style appends — any-store's dominant write pattern.
+// Before the balance_quick port, each overflow triggered a 2-way split
+// copying ~1/3 of the page to a new sibling; after the port, rightmost
+// appends leave the left page untouched and put one cell on the new
+// sibling. Both leaf count and bytes-written-per-insert should drop.
+func BenchmarkBalanceQuick_MonotonicAppend(b *testing.B) {
+	resetPageBufferPool()
+	dir := b.TempDir()
+	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	tx, err := db.BeginWrite()
+	if err != nil {
+		b.Fatal(err)
+	}
+	_, err = tx.CreateNamespace("t1")
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+
+	val := make([]byte, 128)
+	tx, err = db.BeginWrite()
+	if err != nil {
+		b.Fatal(err)
+	}
+	ns, err := db.getNamespaceLocked("t1")
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		key := binary.BigEndian.AppendUint32(nil, uint32(i+1))
+		if err := tx.Put(ns, key, val); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.StopTimer()
+	if err := tx.Commit(); err != nil {
+		b.Fatal(err)
+	}
+
+	rtx, err := db.BeginRead()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = rtx.Rollback() }()
+	ns2, err := db.getNamespaceLocked("t1")
+	if err != nil {
+		b.Fatal(err)
+	}
+	bt := &btree{pager: db.pager, rootPage: ns2.rootPage, walMaxFrame: rtx.walMaxFrame}
+	leafCount := 0
+	walkForLeaves(bt, bt.rootPage, &leafCount)
+	b.ReportMetric(float64(leafCount), "leaves")
+	if b.N > 0 {
+		b.ReportMetric(float64(leafCount)/float64(b.N), "leaves/row")
+	}
+}
+
+// walkForLeaves counts leaves in a btree without parsing cells.
+func walkForLeaves(bt *btree, pgno uint32, count *int) {
+	pg, err := bt.getPage(pgno)
+	if err != nil {
+		return
+	}
+	if pg.header.isLeaf() {
+		*count++
+		bt.pager.releasePage(pg)
+		return
+	}
+	n := int(pg.header.cellCount)
+	cpOff := pg.cellPointerOffset()
+	children := make([]uint32, 0, n+1)
+	for i := 0; i < n; i++ {
+		off := int(binary.BigEndian.Uint16(pg.data[cpOff+i*2:]))
+		children = append(children, binary.BigEndian.Uint32(pg.data[off:off+4]))
+	}
+	children = append(children, pg.header.rightChild)
+	bt.pager.releasePage(pg)
+	for _, c := range children {
+		walkForLeaves(bt, c, count)
+	}
+}

@@ -1765,8 +1765,80 @@ func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint
 	return nil
 }
 
+// splitLeafRightmostAppend implements the rightmost-append fast path,
+// porting SQLite's balance_quick (btree.c:7992-8086).
+//
+// Pre-conditions, checked by the caller at the top of
+// splitLeafAndInsertWithPath — mirror btree.c:9170-9174:
+//   - idx == pg.header.cellCount      — new cell is rightmost on pg
+//   - len(path) > 0                   — pg is not the btree root
+//   - path[len-1].cellIdx == path[len-1].nCell
+//                                     — pg was reached via parent's rightChild
+//   - path[len-1].pgno != bt.rootPage — parent is not the btree root
+//                                     (SQLite: pParent->pgno != 1)
+//
+// Semantic adaptation from SQLite (btree.c:8066-8070): SQLite's intkey
+// tables use the largest key of pPage as divider because their separator
+// invariant is "left child keys <= separator"; any-store's interior
+// search (btree.go searchInterior) uses "left child keys < separator,
+// right child keys >= separator", so the divider is the *first* key of
+// the new right sibling — the new key itself.
+//
+// Post-condition: pg retains all its pre-insert cells unchanged (no
+// write to pg happens on this path — the whole point of the
+// optimization). rightPg contains exactly (key, value). The parent has
+// gained a new rightmost cell {leftChild=pg.pgno, key=divider} and its
+// rightChild now points to rightPg. Parent overflow cascades through
+// the standard path (insertIntoParentWithPath → insertSepIntoInterior),
+// matching SQLite's balance() do-loop (btree.c:9123).
+func (bt *btree) splitLeafRightmostAppend(pg *page, key, value []byte, path []pathEntry) error {
+	// Allocate new right sibling. Equiv. btree.c:8010 (allocateBtreePage).
+	rightPg, err := bt.pager.allocatePage()
+	if err != nil {
+		return err
+	}
+
+	// Initialize rightPg as a leaf holding just the new cell.
+	// rebuildLeafPage does zeroPage (btree.c:8022), writes the cell, and
+	// handles overflow allocation for oversized payloads — equivalent
+	// to btree.c:8030's rebuildPage with nCell=1. any-store has no
+	// ptrmap so btree.c:8046-8050 has no counterpart.
+	newCell := cellData{key: key, value: value}
+	if err := bt.rebuildLeafPage(rightPg, []cellData{newCell}); err != nil {
+		bt.pager.releasePage(rightPg)
+		return err
+	}
+	rightPgno := rightPg.pgno
+	bt.pager.releasePage(rightPg)
+
+	// Divider = the new key itself. See function doc for the separator-
+	// invariant divergence from SQLite's btree.c:8066-8070.
+	divider := bytes.Clone(key)
+
+	// Delegate to the standard parent-insert path. Because cellIdx ==
+	// nCell (fast-path precondition), insertSepIntoInterior's existing
+	// branch at btree.go:1889-1896 takes effect: divider is written at
+	// the end slot with leftChild=pg.pgno, and parent.rightChild is
+	// repointed to rightPgno. Equivalent to SQLite's btree.c:8074
+	// (insertCell) + btree.c:8079 (put4byte rightChild).
+	bt.pager.balanceQuickDispatchCount.Add(1)
+	return bt.insertIntoParentWithPath(pg, divider, rightPgno, path)
+}
+
 // splitLeafAndInsertWithPath splits a leaf page using the path for parent propagation.
 func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte, path []pathEntry) error {
+	// Rightmost-append fast path. Port of SQLite balance_quick dispatch
+	// at btree.c:9169-9192. The intKeyLeaf precondition (btree.c:9170)
+	// is intkey-specific and has no any-store equivalent; we compensate
+	// with the divider adaptation inside splitLeafRightmostAppend. The
+	// remaining four preconditions map directly.
+	if idx == int(pg.header.cellCount) && len(path) > 0 {
+		parent := path[len(path)-1]
+		if parent.pgno != bt.rootPage && parent.cellIdx == parent.nCell {
+			return bt.splitLeafRightmostAppend(pg, key, value, path)
+		}
+	}
+
 	cells, cellBuf := bt.collectLeafCells(pg)
 
 	// Clone key+value into a single allocation.

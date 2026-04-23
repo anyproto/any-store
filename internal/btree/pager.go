@@ -89,6 +89,11 @@ type pager struct {
 	dbSize      atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
 	state       atomic.Int32  // pagerState
 
+	// balanceQuickDispatchCount counts dispatches into splitLeafRightmostAppend.
+	// Test-only: production code never reads it (atomic load is ~ns). Used to
+	// verify the dispatch guard exercises both branches in the test matrix.
+	balanceQuickDispatchCount atomic.Int64
+
 	// Savepoint support: snapshots of dirty pages at savepoint boundaries
 	savepoints []savepointState
 

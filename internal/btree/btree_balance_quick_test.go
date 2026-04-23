@@ -110,6 +110,22 @@ func TestBalanceQuick_AppendFillFactor(t *testing.T) {
 			usable := bt.usablePageSize()
 
 			reportFillStats(t, tc.name, stats, usable, nRows)
+
+			// Regression guard for the balance_quick fast path
+			// (splitLeafRightmostAppend / dispatch in
+			// splitLeafAndInsertWithPath). Monotonic appends must
+			// produce near-full leaves; a regression where
+			// leafSplitPoint ran on rightmost appends would drop
+			// avg fill back toward 60%.
+			if tc.name == "monotonic_append" {
+				const leafHeaderSize = 8
+				leafCapacity := usable - leafHeaderSize
+				used := stats.totalUsed()
+				avgFill := float64(used) / float64(stats.leafCount*leafCapacity)
+				require.GreaterOrEqual(t, avgFill, 0.85,
+					"monotonic-append avg leaf fill regressed below 85%%: %.1f%% across %d leaves",
+					avgFill*100, stats.leafCount)
+			}
 		})
 	}
 }
