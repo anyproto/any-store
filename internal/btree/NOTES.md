@@ -1422,11 +1422,15 @@ old cell size), in-place delete (with fragmentation tracking), and
 defragmentation-before-split. Our approach tracks fragmentation in `fragBytes`
 and triggers a full rebuild when it exceeds 60 bytes.
 
-**Path Tracking Stores Only Page Numbers** -- Severity: Minor
+**Path Tracking Stores Only Page Numbers** -- Severity: Minor (partially addressed)
 
-The cursor path stores only page numbers, requiring re-fetching pages and
-re-scanning for insertion points on splits. SQLite caches page pointers + cell
-indices in the cursor stack (`apPage[]`/`aiIdx[]`).
+The cursor path used to store only page numbers. As of commit 1 of the
+balance_quick port, the descent path is `[]pathEntry{pgno, cellIdx, nCell}`,
+mirroring SQLite's `apPage[]`/`aiIdx[]` cursor stack (`btreeInt.h:553-556`).
+`cellIdx` is populated from `searchInterior`'s second return value (which was
+previously discarded). Consumers still re-scan parents to locate the child slot
+— that consumption happens in commits 2 (`insertSepIntoInterior`) and 3
+(`tryMergeLeaf` / `removeChildFromParent`).
 
 **Nearby Allocation Hint for Overflow Pages** -- Resolved 2026-04-22
 

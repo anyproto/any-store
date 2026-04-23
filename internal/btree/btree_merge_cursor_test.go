@@ -61,10 +61,11 @@ func TestMergeCursor_TryMergeLeafLeftDirection(t *testing.T) {
 	pg, err := bt.getPage(bt.rootPage)
 	require.NoError(t, err)
 
-	var pathBuf [8]uint32
+	var pathBuf [8]pathEntry
 	path := pathBuf[:0]
 	for pg.header.isInterior() {
-		path = append(path, pg.pgno)
+		nCell := pg.header.cellCount
+		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: nCell, nCell: nCell})
 		rightChild := pg.header.rightChild
 		bt.pager.releasePage(pg)
 		pg, err = bt.getPage(rightChild)
@@ -77,7 +78,7 @@ func TestMergeCursor_TryMergeLeafLeftDirection(t *testing.T) {
 
 	// Verify this leaf IS the rightChild of its parent
 	if len(path) > 0 {
-		parentPgno := path[len(path)-1]
+		parentPgno := path[len(path)-1].pgno
 		parentPg, perr := bt.getPage(parentPgno)
 		require.NoError(t, perr)
 		assert.Equal(t, leafPgno, parentPg.header.rightChild,
@@ -132,10 +133,11 @@ func TestMergeCursor_TryMergeLeafLeftDirectionSmallPage(t *testing.T) {
 
 	pg, err := bt.getPage(bt.rootPage)
 	require.NoError(t, err)
-	var pathBuf [8]uint32
+	var pathBuf [8]pathEntry
 	path := pathBuf[:0]
 	for pg.header.isInterior() {
-		path = append(path, pg.pgno)
+		nCell := pg.header.cellCount
+		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: nCell, nCell: nCell})
 		rc := pg.header.rightChild
 		bt.pager.releasePage(pg)
 		pg, err = bt.getPage(rc)
@@ -683,10 +685,11 @@ func TestMergeCursor_MergeLeftThenCursorTraversal(t *testing.T) {
 
 	pg, err := bt.getPage(bt.rootPage)
 	require.NoError(t, err)
-	var pathBuf [8]uint32
+	var pathBuf [8]pathEntry
 	path := pathBuf[:0]
 	for pg.header.isInterior() {
-		path = append(path, pg.pgno)
+		nCell := pg.header.cellCount
+		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: nCell, nCell: nCell})
 		rc := pg.header.rightChild
 		bt.pager.releasePage(pg)
 		pg, err = bt.getPage(rc)

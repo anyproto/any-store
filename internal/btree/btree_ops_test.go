@@ -251,13 +251,14 @@ func TestTryMergeLeaf(t *testing.T) {
 
 	pg, err := bt.getPage(bt.rootPage)
 	require.NoError(t, err)
-	var pathBuf [8]uint32
+	var pathBuf [8]pathEntry
 	path := pathBuf[:0]
 	searchKey := binary.BigEndian.AppendUint32(nil, uint32(3))
 
 	for pg.header.isInterior() {
-		path = append(path, pg.pgno)
-		childPgno, _, _ := bt.searchInterior(pg, searchKey)
+		nCell := pg.header.cellCount
+		childPgno, cellIdx, _ := bt.searchInterior(pg, searchKey)
+		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: uint16(cellIdx), nCell: nCell})
 		bt.pager.releasePage(pg)
 		pg, err = bt.getPage(childPgno)
 		require.NoError(t, err)
@@ -333,11 +334,12 @@ func TestTryMergeLeafNoFit(t *testing.T) {
 	searchKey := binary.BigEndian.AppendUint32(nil, 2)
 	pg, err := bt.getPage(bt.rootPage)
 	require.NoError(t, err)
-	var pathBuf [8]uint32
+	var pathBuf [8]pathEntry
 	path := pathBuf[:0]
 	for pg.header.isInterior() {
-		path = append(path, pg.pgno)
-		childPgno, _, _ := bt.searchInterior(pg, searchKey)
+		nCell := pg.header.cellCount
+		childPgno, cellIdx, _ := bt.searchInterior(pg, searchKey)
+		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: uint16(cellIdx), nCell: nCell})
 		bt.pager.releasePage(pg)
 		pg, err = bt.getPage(childPgno)
 		require.NoError(t, err)
@@ -383,12 +385,13 @@ func TestTryMergeLeafRightChild(t *testing.T) {
 
 	pg, err := bt.getPage(bt.rootPage)
 	require.NoError(t, err)
-	var pathBuf [8]uint32
+	var pathBuf [8]pathEntry
 	path := pathBuf[:0]
 	searchKey := binary.BigEndian.AppendUint32(nil, uint32(29))
 	for pg.header.isInterior() {
-		path = append(path, pg.pgno)
-		childPgno, _, _ := bt.searchInterior(pg, searchKey)
+		nCell := pg.header.cellCount
+		childPgno, cellIdx, _ := bt.searchInterior(pg, searchKey)
+		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: uint16(cellIdx), nCell: nCell})
 		bt.pager.releasePage(pg)
 		pg, err = bt.getPage(childPgno)
 		require.NoError(t, err)
@@ -2559,7 +2562,7 @@ func TestTryMergeLeafChildNotInParent(t *testing.T) {
 	p.releasePage(rootPg)
 
 	// tryMergeLeaf with a non-existent leaf pgno in path
-	err = bt.tryMergeLeaf(999, []uint32{rootPg.pgno})
+	err = bt.tryMergeLeaf(999, []pathEntry{{pgno: rootPg.pgno}})
 	assert.NoError(t, err) // should return nil (childIdx == -1)
 }
 
@@ -2582,7 +2585,8 @@ func TestTryMergeLeafSingleChild(t *testing.T) {
 	p.releasePage(childPg)
 
 	// tryMergeLeaf with rightChild=0 will have siblingPgno=0
-	err = bt.tryMergeLeaf(childPg.pgno, []uint32{rootPg.pgno})
+	// childPg is at cellIdx=0 in root; nCell=1.
+	err = bt.tryMergeLeaf(childPg.pgno, []pathEntry{{pgno: rootPg.pgno, cellIdx: 0, nCell: 1}})
 	assert.NoError(t, err)
 }
 
@@ -2604,7 +2608,7 @@ func TestRemoveChildFromParentNotFound(t *testing.T) {
 	p.releasePage(childPg)
 
 	// Remove a child that doesn't exist in parent
-	err = bt.removeChildFromParent(999, []uint32{rootPg.pgno})
+	err = bt.removeChildFromParent(999, []pathEntry{{pgno: rootPg.pgno}})
 	assert.NoError(t, err)
 }
 
@@ -5003,7 +5007,7 @@ func TestCov_TryMergeLeafParentWithSingleChild(t *testing.T) {
 	p.releasePage(rootPg)
 	p.releasePage(childPg)
 
-	err = bt.tryMergeLeaf(childPg.pgno, []uint32{rootPg.pgno})
+	err = bt.tryMergeLeaf(childPg.pgno, []pathEntry{{pgno: rootPg.pgno}})
 	assert.NoError(t, err) // should return nil (n < 1)
 }
 
@@ -5116,7 +5120,7 @@ func TestCov_TryMergeLeafGetParentPageError(t *testing.T) {
 	bt.rebuildLeafPage(pg, nil)
 	p.releasePage(pg)
 
-	err = bt.tryMergeLeaf(pg.pgno, []uint32{0})
+	err = bt.tryMergeLeaf(pg.pgno, []pathEntry{{pgno: 0}})
 	assert.Error(t, err)
 }
 
