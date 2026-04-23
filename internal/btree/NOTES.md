@@ -1756,6 +1756,71 @@ no longer depends on the code path walking past the unlock line.
 Regression test: `TestWithWriteLock_AlwaysReleases` covers clean /
 error / panic return paths.
 
+### Race fixes evaluated and not ported
+
+#### SQLite `fe57e14b49` — checkpointer vs. writer WAL wrap (evaluated 2026-04-22, not applicable)
+
+Upstream SQLite commit `fe57e14b49` (2026-03-03, "Avoid an obscure race
+condition between a checkpointer and a writer wrapping around to the
+start of the wal file") adds a salt-revalidation check in
+`walCheckpoint()` right after acquiring `WAL_READ_LOCK(0)` exclusive:
+
+```c
+WalIndexHdr *pLive = (WalIndexHdr*)walIndexHdr(pWal);
+if( 0==memcmp(pLive->aSalt, pWal->hdr.aSalt, sizeof(pWal->hdr.aSalt)) ){
+    /* ... proceed with backfill ... */
+}
+```
+
+**The race in SQLite:**
+1. Checkpointer C snapshots `pWal->hdr.mxFrame=N, aSalt=S` via
+   `walIndexReadHdr`.
+2. C reads `pInfo->nBackfill` live (not snapshotted).
+3. Writer W runs `sqlite3WalBeginWriteTransaction → walRestartLog`,
+   briefly grabs `WAL_READ_LOCK(0)` exclusive, writes new salts `S'`,
+   sets `pInfo->nBackfill=0`, releases.
+4. C's `walBusyLock(WAL_READ_LOCK(0))` now succeeds (W released).
+5. Without the fix, C sees `nBackfill(0) < hdr.mxFrame(N)`, proceeds
+   to iterate frames 1..N using its stale snapshot, reads whatever W
+   has begun writing at those offsets, copies to wrong DB pages.
+
+**Key enabler in SQLite:** writers wrap the WAL without holding
+`CHECKPOINT_LOCK`.
+
+**Why the race cannot occur in any-store:**
+
+Salt regeneration (`rand.Uint32()`) happens at exactly two call sites:
+- `initHeaderStateLocked` (wal.go:1608-1609)
+- `writeHeader` (wal.go:1653-1654)
+
+All callers are either first-time open/recovery paths (no concurrent
+checkpointer yet exists) or `doResetWAL`. `doResetWAL` is reachable
+only via `tryResetWALWithBusy → checkpointPost → checkpointWithMode`,
+and `checkpointWithMode` holds `lockCheckpoint` exclusive throughout
+(wal.go:2780 + deferred unlock covering the entire body including
+`checkpointPost`). `lockCheckpoint` is fcntl-backed (shm_mmap.go:147),
+so it's genuinely cross-process exclusive.
+
+Writers never regenerate salts: `beginWriteWithSnapshot` copies
+existing salts from SHM (wal.go:2518-2519), `writeFrames` rewrites
+the SHM header preserving the existing `w.header.salt1/salt2`
+(wal.go:2054).
+
+Therefore: while any checkpointer is inside `checkpointWithMode`, no
+other actor — writer or checkpointer — can mutate salts. The
+snapshot-vs-backfill window SQLite's fix protects cannot observe a
+salt change in any-store.
+
+**Architectural difference:** SQLite permits writer-initiated wrap
+via `walRestartLog` inside `beginWriteTransaction` when
+`nBackfill == mxFrame`; any-store only wraps via
+`CheckpointRestart/Truncate` modes, which require `lockCheckpoint`.
+
+**Consequence:** fe57e14b49 is a no-op in any-store. If a future
+change introduces a writer-wrap path (e.g. auto-wrap in
+`beginWriteWithSnapshot` when `nBackfill == mxFrame`), that change
+must re-evaluate this invariant and include the salt-revalidation.
+
 ### Not Implemented (by design)
 
 These SQLite features are intentionally absent:
