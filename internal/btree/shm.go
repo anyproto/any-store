@@ -111,7 +111,8 @@ func (s *inProcessShm) unlock(slot int, lockType int) error {
 	return nil
 }
 
-func (s *inProcessShm) close() error {
+func (s *inProcessShm) close(isLastClient bool) error {
+	_ = isLastClient
 	s.regMu.Lock()
 	s.regions = nil
 	s.regMu.Unlock()
@@ -133,8 +134,11 @@ type shm interface {
 	// unlock releases the lock on the given lock slot.
 	unlock(slot int, lockType int) error
 
-	// close releases all resources.
-	close() error
+	// close releases all resources. If isLastClient is true, the backing
+	// shm file (if any) is unlinked. The caller determines last-client
+	// status via the DB-file exclusive lock upgrade (see pager.close) —
+	// shm no longer does its own DMS-based check.
+	close(isLastClient bool) error
 }
 
 // Lock types for shm.lock/unlock.

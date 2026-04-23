@@ -35,6 +35,11 @@ type Config struct {
 	// Only used when DisableAutoCheckpoint is false. 0 means use default.
 	AutoCheckpointAfter int
 
+	// CacheSize overrides the default per-DB page cache size (in pages,
+	// default 5000). Primarily for tests that need to force pagerStress /
+	// cache-spill behavior at low data volumes. Zero means use the default.
+	CacheSize int
+
 	// InMemory keeps the entire database in memory with no files on disk.
 	// The database does not survive process crashes. When true, InProcess
 	// and CommitSync=false are forced on automatically.
@@ -50,6 +55,45 @@ type Config struct {
 	// When false (default), page buffers use sync.Pool (GC-managed, like
 	// SQLite's default malloc mode).
 	UseGlobalPageBuffer bool
+
+	// MmapSize enables mmap-backed reads of the database file up to the
+	// given byte limit. Zero (default) disables mmap — reads use pread
+	// via ReadAt, same behavior as before this feature existed.
+	// Matches SQLite's PRAGMA mmap_size. Linux/darwin + amd64/arm64
+	// only; no-op on other platforms.
+	//
+	// SAFETY WARNINGS — read before enabling:
+	//
+	//   - SIGBUS on unreachable storage: if the DB file becomes
+	//     truncated, unlinked, or the storage device is removed while
+	//     a mapping is live (USB unplug, iCloud eviction of a
+	//     "dataless" file, NFS server timeout, external process
+	//     truncate), accessing the mapped bytes generates SIGBUS. Go's
+	//     runtime translates SIGBUS to an uncatchable "unexpected
+	//     fault address" crash — the whole process dies. The pread
+	//     path (MmapSize=0) returns a normal error for all of these
+	//     scenarios. Only enable on paths you control: local disk,
+	//     stable filesystem, single-device. Do NOT enable for DBs
+	//     stored in iCloud Drive, OneDrive, Dropbox, or any network
+	//     mount.
+	//
+	//   - Mobile / iOS: mmap'd bytes count against the per-process
+	//     memory limit and can trip iOS's "jetsam" reaper on older
+	//     devices. iOS may also silently purge mmap pages under
+	//     memory pressure; re-faulting succeeds for local files but
+	//     fails (SIGBUS) if the backing file has become unavailable
+	//     (permission revocation, iCloud eviction). Recommend leaving
+	//     at zero on iOS/iPadOS unless you have a measured need.
+	//
+	//   - Network filesystems: mmap coherence over NFS/SMB is weaker
+	//     than over local disks; concurrent writes from peers may be
+	//     invisible to the mapping, and reads may observe torn state.
+	//     pread does not have this issue.
+	//
+	// Recommended when it IS safe: 64-512 MiB on workloads with
+	// frequent large-blob or repeat-page reads, on stable local
+	// storage, desktop/server deployments.
+	MmapSize int64
 
 	// DurabilityConfig provides configuration for crash recovery and idle auto-flush
 	Durability DurabilityConfig

@@ -98,7 +98,8 @@ func (s *heapShm) unlock(slot int, lockType int) error {
 	return nil
 }
 
-func (s *heapShm) close() error {
+func (s *heapShm) close(isLastClient bool) error {
+	_ = isLastClient
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.regions = nil

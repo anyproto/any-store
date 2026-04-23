@@ -2,6 +2,8 @@ package btree
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -126,7 +128,7 @@ func TestWALOpenClose(t *testing.T) {
 	path := filepath.Join(dir, "test.wal")
 	w := newWal(path, 4096)
 	require.NoError(t, w.open())
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 
 	// WAL file should exist
 	_, err := os.Stat(path)
@@ -164,7 +166,7 @@ func TestWALWriteReadFrames(t *testing.T) {
 	assert.Equal(t, pg2.data, buf)
 
 	w.endWrite()
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 func TestWALReadFrameInvalid(t *testing.T) {
@@ -177,7 +179,7 @@ func TestWALReadFrameInvalid(t *testing.T) {
 	assert.ErrorIs(t, w.readFrame(0, buf), ErrWALCorrupt)
 	assert.ErrorIs(t, w.readFrame(999, buf), ErrWALCorrupt)
 
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 func TestWALWriteNoCommit(t *testing.T) {
@@ -200,7 +202,7 @@ func TestWALWriteNoCommit(t *testing.T) {
 	assert.Equal(t, uint32(1), w.index.maxFrame.Load())
 
 	w.endWrite()
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 func TestWALWriteEmptyFrames(t *testing.T) {
@@ -215,7 +217,7 @@ func TestWALWriteEmptyFrames(t *testing.T) {
 	assert.Equal(t, uint32(0), w.nFrame.Load())
 
 	w.endWrite()
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 func TestWALRecoveryCommitted(t *testing.T) {
@@ -233,7 +235,7 @@ func TestWALRecoveryCommitted(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 5))
 
 	w.endWrite()
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 
 	// Reopen and verify recovery
 	w2 := newWal(path, 4096)
@@ -247,7 +249,7 @@ func TestWALRecoveryCommitted(t *testing.T) {
 	require.NoError(t, w2.readFrame(1, buf))
 	assert.Equal(t, pg.data, buf)
 
-	require.NoError(t, w2.close())
+	require.NoError(t, w2.close(false))
 }
 
 func TestWALRecoveryUncommittedTruncated(t *testing.T) {
@@ -269,7 +271,7 @@ func TestWALRecoveryUncommittedTruncated(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg2}, false, 2))
 
 	w.endWrite()
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 
 	// Reopen - recovery should only see committed frame
 	w2 := newWal(path, 4096)
@@ -282,7 +284,7 @@ func TestWALRecoveryUncommittedTruncated(t *testing.T) {
 	frame := w2.index.get(2, w2.nFrame.Load())
 	assert.Equal(t, uint32(0), frame)
 
-	require.NoError(t, w2.close())
+	require.NoError(t, w2.close(false))
 }
 
 func TestWALRecoveryCorruptHeader(t *testing.T) {
@@ -296,7 +298,7 @@ func TestWALRecoveryCorruptHeader(t *testing.T) {
 	require.NoError(t, w.open()) // Should handle gracefully by resetting
 
 	assert.Equal(t, uint32(0), w.nFrame.Load())
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 func TestWALIndexSetGet(t *testing.T) {
@@ -304,7 +306,7 @@ func TestWALIndexSetGet(t *testing.T) {
 	shmPath := filepath.Join(dir, "test.shm")
 	idx, err := newWalIndex(shmPath, false)
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	idx.set(1, 1)
 	idx.set(2, 2)
@@ -332,7 +334,7 @@ func TestWALIndexReset(t *testing.T) {
 	shmPath := filepath.Join(dir, "test.shm")
 	idx, err := newWalIndex(shmPath, false)
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	idx.set(1, 1)
 	idx.set(2, 2)
@@ -349,7 +351,7 @@ func TestWALIndexWriteHeader(t *testing.T) {
 	shmPath := filepath.Join(dir, "test.shm")
 	idx, err := newWalIndex(shmPath, false)
 	require.NoError(t, err)
-	defer idx.close()
+	defer idx.close(false)
 
 	idx.nBackfill.Store(5)
 	require.NoError(t, idx.writeHeader(10, 20, 5, [2]uint32{}, [2]uint32{}))
@@ -385,7 +387,7 @@ func TestWALCheckpointEmpty(t *testing.T) {
 	// Checkpoint with no frames should be no-op
 	require.NoError(t, w.checkpoint(dbFile, nil))
 
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 func TestWALCheckpointWritesBack(t *testing.T) {
@@ -424,7 +426,7 @@ func TestWALCheckpointWritesBack(t *testing.T) {
 	assert.Equal(t, pg.data, readBuf)
 
 	dbFile.Close()
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 func TestWALMultipleCommits(t *testing.T) {
@@ -460,7 +462,7 @@ func TestWALMultipleCommits(t *testing.T) {
 	require.NoError(t, w.readFrame(2, buf))
 	assert.Equal(t, pg2.data, buf)
 
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 func TestWALBeginReadEndRead(t *testing.T) {
@@ -486,7 +488,7 @@ func TestWALBeginReadEndRead(t *testing.T) {
 	assert.Equal(t, uint32(1), maxFrame)
 	w.endRead(slot)
 
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 func TestWALFrameChecksum(t *testing.T) {
@@ -529,7 +531,7 @@ func TestWALRecoveryMultipleCommits(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg2}, true, 2))
 	w.endWrite()
 
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 
 	// Reopen and recover
 	w2 := newWal(path, 4096)
@@ -545,7 +547,38 @@ func TestWALRecoveryMultipleCommits(t *testing.T) {
 	require.NoError(t, w2.readFrame(2, buf))
 	assert.Equal(t, pg2.data, buf)
 
-	require.NoError(t, w2.close())
+	require.NoError(t, w2.close(false))
+}
+
+func TestWALReadFrameAllowsPeerCommittedFrameBeyondLocalNFrame(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+
+	// Open a second WAL handle before the first writer commits so its local
+	// nFrame remains stale. This simulates another process discovering a newer
+	// frame via SHM/page lookup and then reading the frame data from disk.
+	wWriter := newWal(path, 4096)
+	wWriter.inProcess = false
+	require.NoError(t, wWriter.open())
+	defer wWriter.close(false)
+
+	wReader := newWal(path, 4096)
+	wReader.inProcess = false
+	require.NoError(t, wReader.open())
+	defer wReader.close(false)
+
+	_, bwErr := wWriter.beginWrite()
+	require.NoError(t, bwErr)
+	pg := &page{pgno: 1, data: make([]byte, 4096)}
+	copy(pg.data, "peer-committed-page")
+	require.NoError(t, wWriter.writeFrames([]*page{pg}, true, 1))
+	wWriter.endWrite()
+
+	require.Equal(t, uint32(0), wReader.nFrame.Load(), "reader handle should still have stale local nFrame")
+
+	buf := make([]byte, 4096)
+	require.NoError(t, wReader.readFrame(1, buf), "reader should read peer frame directly from file even with stale local nFrame")
+	assert.Equal(t, pg.data, buf)
 }
 
 func TestWalIndexGetCrossProcessFallback(t *testing.T) {
@@ -594,7 +627,7 @@ func TestWriteFramesCommitFalseDoesNotAdvanceMxCommitFrame(t *testing.T) {
 	copy(pg1.data, "committed page 1")
 	require.NoError(t, w.writeFrames([]*page{pg1}, true, 1))
 	assert.Equal(t, uint32(1), w.index.maxFrame.Load())
-	assert.Equal(t, uint32(1), w.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(1), w.index.mxCommitFrame.LoadLocal())
 
 	// Now write frames WITHOUT commit (simulating spill)
 	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
@@ -606,7 +639,7 @@ func TestWriteFramesCommitFalseDoesNotAdvanceMxCommitFrame(t *testing.T) {
 	// maxFrame should advance to 3 (writer sees all frames)
 	assert.Equal(t, uint32(3), w.index.maxFrame.Load())
 	// mxCommitFrame should still be 1 (readers only see committed)
-	assert.Equal(t, uint32(1), w.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(1), w.index.mxCommitFrame.LoadLocal())
 
 	// Writer can find spilled pages via pageMap
 	assert.Equal(t, uint32(2), w.index.get(2, 3))
@@ -617,10 +650,10 @@ func TestWriteFramesCommitFalseDoesNotAdvanceMxCommitFrame(t *testing.T) {
 	copy(pg4.data, "committed page 4")
 	require.NoError(t, w.writeFrames([]*page{pg4}, true, 4))
 	assert.Equal(t, uint32(4), w.index.maxFrame.Load())
-	assert.Equal(t, uint32(4), w.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(4), w.index.mxCommitFrame.LoadLocal())
 
 	w.endWrite()
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 func TestGetLatestIgnoresSpilledFrames(t *testing.T) {
@@ -659,52 +692,6 @@ func TestGetLatestIgnoresSpilledFrames(t *testing.T) {
 	assert.Equal(t, uint32(2), frame, "getLatest should see frame after mxCommitFrame advances")
 }
 
-func TestWriteFramesCommitFalseDoesNotWriteShmHash(t *testing.T) {
-	// Spill frames (commit=false) should NOT write to SHM hash tables.
-	// Cross-process readers use SHM hash to find pages, so deferred writes
-	// prevent them from seeing uncommitted spilled frames.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "test.wal")
-	w := newWal(path, 4096)
-	// Use non-inProcess mode to exercise SHM hash path
-	w.inProcess = false
-	require.NoError(t, w.open())
-	_, bwErr := w.beginWrite()
-	require.NoError(t, bwErr)
-
-	// First commit page 1 so we have a baseline
-	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
-	copy(pg1.data, "committed page 1")
-	require.NoError(t, w.writeFrames([]*page{pg1}, true, 1))
-
-	// Verify committed page 1 is in SHM hash
-	frame := w.index.shmHashGet(1, 10, 1)
-	assert.Equal(t, uint32(1), frame, "committed page should be in SHM hash")
-
-	// Now spill pages 2 and 3 (commit=false)
-	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
-	copy(pg2.data, "spilled page 2")
-	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
-	copy(pg3.data, "spilled page 3")
-	require.NoError(t, w.writeFrames([]*page{pg2, pg3}, false, 0))
-
-	// Spilled pages should NOT be in SHM hash
-	frame = w.index.shmHashGet(2, 10, 1)
-	assert.Equal(t, uint32(0), frame, "spilled page 2 should not be in SHM hash")
-	frame = w.index.shmHashGet(3, 10, 1)
-	assert.Equal(t, uint32(0), frame, "spilled page 3 should not be in SHM hash")
-
-	// But writer can still find them via pageMap
-	assert.Equal(t, uint32(2), w.index.get(2, 3))
-	assert.Equal(t, uint32(3), w.index.get(3, 3))
-
-	// Verify pending SHM frames were accumulated
-	assert.Len(t, w.index.pendingShmFrames, 2, "should have 2 pending SHM frames")
-
-	w.endWrite()
-	require.NoError(t, w.close())
-}
-
 func TestRollbackCleansUpSpilledFrames(t *testing.T) {
 	// After spilling frames (commit=false), rollbackToFrame should remove
 	// pageMap entries for spilled frames and restore maxFrame.
@@ -727,7 +714,7 @@ func TestRollbackCleansUpSpilledFrames(t *testing.T) {
 	savedFrame := w.nFrame.Load()
 	assert.Equal(t, uint32(2), savedFrame)
 	assert.Equal(t, uint32(2), w.index.maxFrame.Load())
-	assert.Equal(t, uint32(2), w.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(2), w.index.mxCommitFrame.LoadLocal())
 
 	// Spill pages 3 and 4 (frames 3 and 4, commit=false)
 	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
@@ -738,7 +725,7 @@ func TestRollbackCleansUpSpilledFrames(t *testing.T) {
 
 	// Verify spilled state: maxFrame advanced but mxCommitFrame did not
 	assert.Equal(t, uint32(4), w.index.maxFrame.Load())
-	assert.Equal(t, uint32(2), w.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(2), w.index.mxCommitFrame.LoadLocal())
 	assert.Equal(t, uint32(4), w.nFrame.Load())
 
 	// Writer can see spilled frames in pageMap
@@ -759,11 +746,8 @@ func TestRollbackCleansUpSpilledFrames(t *testing.T) {
 	assert.Equal(t, uint32(1), w.index.get(1, 10))
 	assert.Equal(t, uint32(2), w.index.get(2, 10))
 
-	// pendingShmFrames should be cleared
-	assert.Len(t, w.index.pendingShmFrames, 0)
-
 	w.endWrite()
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 func TestRollbackToSavepointWithSpilledFrames(t *testing.T) {
@@ -800,7 +784,7 @@ func TestRollbackToSavepointWithSpilledFrames(t *testing.T) {
 
 	// Verify state before rollback
 	assert.Equal(t, uint32(4), w.index.maxFrame.Load())
-	assert.Equal(t, uint32(3), w.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(3), w.index.mxCommitFrame.LoadLocal())
 
 	// Rollback to savepoint (frame 2)
 	w.index.rollbackToFrame(savepointFrame)
@@ -816,11 +800,8 @@ func TestRollbackToSavepointWithSpilledFrames(t *testing.T) {
 	assert.Equal(t, uint32(1), w.index.get(1, 10))
 	assert.Equal(t, uint32(2), w.index.get(2, 10))
 
-	// pendingShmFrames should be cleared
-	assert.Len(t, w.index.pendingShmFrames, 0)
-
 	w.endWrite()
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 func TestCrossProcessReaderDoesNotSeeSpilledFrames(t *testing.T) {
@@ -866,37 +847,34 @@ func TestCrossProcessReaderDoesNotSeeSpilledFrames(t *testing.T) {
 	assert.Equal(t, uint32(2), hdr2.nPage, "SHM header nPage must not change on spill")
 
 	// mxCommitFrame should still be 2
-	assert.Equal(t, uint32(2), w.index.mxCommitFrame.Load(), "mxCommitFrame must not advance on spill")
+	assert.Equal(t, uint32(2), w.index.mxCommitFrame.LoadLocal(), "mxCommitFrame must not advance on spill")
 	// maxFrame (writer-internal) should be 4
 	assert.Equal(t, uint32(4), w.index.maxFrame.Load(), "maxFrame should include spilled frames")
-
-	// Spilled pages should NOT be in SHM hash
-	assert.Equal(t, uint32(0), w.index.shmHashGet(3, 10, 1), "spilled page 3 must not be in SHM hash")
-	assert.Equal(t, uint32(0), w.index.shmHashGet(4, 10, 1), "spilled page 4 must not be in SHM hash")
 
 	// Committed pages still accessible via SHM hash
 	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10, 1), "committed page 1 still in SHM hash")
 	assert.Equal(t, uint32(2), w.index.shmHashGet(2, 10, 1), "committed page 2 still in SHM hash")
 
-	// A cross-process reader using getLatest (with empty pageMap) should not see spilled pages
-	// Simulate by creating a fresh walIndex pointing to same SHM
+	// A cross-process reader gated by mxCommitFrame must not see spilled pages:
+	// SHM hash is written eagerly (SQLite-aligned), but readers bound by
+	// mxCommitFrame in getLatest cannot reach frames > mxCommitFrame.
 	reader := &walIndex{
 		shm:       w.index.shm,
 		pageMap:   make(map[uint32][]uint32),
 		inProcess: false,
 	}
-	reader.mxCommitFrame.Store(w.index.mxCommitFrame.Load())
+	reader.mxCommitFrame.Store(w.index.mxCommitFrame.LoadLocal())
 	reader.nBackfill.Store(0)
 
 	// Reader should see committed pages via SHM hash
 	assert.Equal(t, uint32(1), reader.getLatest(1), "cross-process reader sees committed page 1")
 	assert.Equal(t, uint32(2), reader.getLatest(2), "cross-process reader sees committed page 2")
-	// Reader should NOT see spilled pages
+	// Reader should NOT see spilled pages (frame > mxCommitFrame)
 	assert.Equal(t, uint32(0), reader.getLatest(3), "cross-process reader must not see spilled page 3")
 	assert.Equal(t, uint32(0), reader.getLatest(4), "cross-process reader must not see spilled page 4")
 
 	w.endWrite()
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 }
 
 func TestRecoveryIgnoresSpilledFrames(t *testing.T) {
@@ -931,10 +909,10 @@ func TestRecoveryIgnoresSpilledFrames(t *testing.T) {
 	// Verify pre-close state: 6 total frames, only 3 committed
 	assert.Equal(t, uint32(6), w.nFrame.Load())
 	assert.Equal(t, uint32(6), w.index.maxFrame.Load())
-	assert.Equal(t, uint32(3), w.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(3), w.index.mxCommitFrame.LoadLocal())
 
 	w.endWrite()
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
 
 	// Reopen — recovery should only see committed frames 1-3
 	w2 := newWal(path, 4096)
@@ -943,7 +921,7 @@ func TestRecoveryIgnoresSpilledFrames(t *testing.T) {
 	// nFrame should be 3 (only committed frames)
 	assert.Equal(t, uint32(3), w2.nFrame.Load(), "recovery: nFrame should be 3")
 	assert.Equal(t, uint32(3), w2.index.maxFrame.Load(), "recovery: maxFrame should be 3")
-	assert.Equal(t, uint32(3), w2.index.mxCommitFrame.Load(), "recovery: mxCommitFrame should be 3")
+	assert.Equal(t, uint32(3), w2.index.mxCommitFrame.LoadLocal(), "recovery: mxCommitFrame should be 3")
 	assert.Equal(t, uint32(3), w2.index.maxPage.Load(), "recovery: maxPage should be 3")
 
 	// Committed pages should be in index
@@ -973,12 +951,13 @@ func TestRecoveryIgnoresSpilledFrames(t *testing.T) {
 	assert.Equal(t, uint32(3), hdr.mxFrame, "recovery: SHM header mxFrame should be 3")
 	assert.Equal(t, uint32(3), hdr.nPage, "recovery: SHM header nPage should be 3")
 
-	require.NoError(t, w2.close())
+	require.NoError(t, w2.close(false))
 }
 
 func TestWriteFramesCommitFlushesToShm(t *testing.T) {
-	// After spill + commit, all frames (spilled and committed) should be
-	// visible in SHM hash tables.
+	// SHM hash is populated eagerly (SQLite-aligned): every frame writes SHM
+	// hash immediately regardless of commit. Readers are gated via mxCommitFrame,
+	// not via the presence of the SHM hash entry itself.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.wal")
 	w := newWal(path, 4096)
@@ -994,29 +973,539 @@ func TestWriteFramesCommitFlushesToShm(t *testing.T) {
 	copy(pg2.data, "spilled page 2")
 	require.NoError(t, w.writeFrames([]*page{pg1, pg2}, false, 0))
 
-	// Verify NOT in SHM hash yet
-	assert.Equal(t, uint32(0), w.index.shmHashGet(1, 10, 1))
-	assert.Equal(t, uint32(0), w.index.shmHashGet(2, 10, 1))
+	// SHM hash holds entries eagerly (invisible to peer readers via mxCommitFrame)
+	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10, 1))
+	assert.Equal(t, uint32(2), w.index.shmHashGet(2, 10, 1))
 
 	// Now commit page 3
 	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
 	copy(pg3.data, "committed page 3")
 	require.NoError(t, w.writeFrames([]*page{pg3}, true, 3))
 
-	// All frames should now be in SHM hash (pending flushed + commit batch)
+	// All frames visible in SHM hash
 	frame := w.index.shmHashGet(1, 10, 1)
-	assert.Equal(t, uint32(1), frame, "spilled page 1 should be in SHM hash after commit")
+	assert.Equal(t, uint32(1), frame, "page 1 in SHM hash")
 	frame = w.index.shmHashGet(2, 10, 1)
-	assert.Equal(t, uint32(2), frame, "spilled page 2 should be in SHM hash after commit")
+	assert.Equal(t, uint32(2), frame, "page 2 in SHM hash")
 	frame = w.index.shmHashGet(3, 10, 1)
-	assert.Equal(t, uint32(3), frame, "committed page 3 should be in SHM hash after commit")
-
-	// Pending SHM frames should be cleared
-	assert.Len(t, w.index.pendingShmFrames, 0, "pending SHM frames should be empty after commit")
+	assert.Equal(t, uint32(3), frame, "page 3 in SHM hash")
 
 	// mxCommitFrame should include all frames
-	assert.Equal(t, uint32(3), w.index.mxCommitFrame.Load())
+	assert.Equal(t, uint32(3), w.index.mxCommitFrame.LoadLocal())
 
 	w.endWrite()
-	require.NoError(t, w.close())
+	require.NoError(t, w.close(false))
+}
+
+// BenchmarkWalOpen_CleanReopen measures per-reopen cost after a clean close
+// with 50 pre-existing WAL frames. Baseline for the wal.open SQLite-alignment
+// refactor: current code eagerly touches SHM on open (either initHeaderState
+// or adoptSHMState + recover). Post-refactor target: <20% of current time,
+// matching SQLite's sqlite3WalOpen which never touches SHM on open.
+func BenchmarkWalOpen_CleanReopen(b *testing.B) {
+	dir := b.TempDir()
+	path := filepath.Join(dir, "test.db")
+	db, err := testOpen(b, path, Options{PageSize: 4096, DisableAutoCheckpoint: true})
+	require.NoError(b, err)
+	tx, err := db.BeginWrite()
+	require.NoError(b, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(b, err)
+	for i := 0; i < 50; i++ {
+		require.NoError(b, tx.Put(ns, []byte(fmt.Sprintf("k%04d", i)), make([]byte, 512)))
+	}
+	require.NoError(b, tx.Commit())
+	require.NoError(b, db.Close())
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		db2, err := testOpen(b, path, Options{PageSize: 4096, DisableAutoCheckpoint: true})
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = db2.Close()
+	}
+}
+
+func TestEnsureHeaderInitialized_FreshSHM(t *testing.T) {
+	dir := t.TempDir()
+	w := newWal(filepath.Join(dir, "t.db-wal"), 4096)
+	w.inProcess = false
+	require.NoError(t, w.open())
+	defer w.close(false)
+
+	// Simulate cold-open: clear SHM header bytes so readHeader returns !valid.
+	region, err := w.index.shm.region(0, true)
+	require.NoError(t, err)
+	clear(region[:walIndexHdrSize*2])
+
+	// ensureHeaderInitialized must leave SHM in a valid state with isInit==1
+	// and return the published hdr.
+	_, err = w.ensureHeaderInitialized()
+	require.NoError(t, err)
+	hdr, valid := w.index.readHeader()
+	require.True(t, valid)
+	require.Equal(t, uint8(1), hdr.isInit)
+	require.Equal(t, uint32(0), hdr.mxFrame)
+	require.Equal(t, w.header.salt1, hdr.aSalt[0])
+	require.Equal(t, w.header.salt2, hdr.aSalt[1])
+}
+
+func TestEnsureHeaderInitialized_AdoptsValidSHM(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "t.db")
+
+	// Process A: create DB, commit 10 frames, rawClose to keep WAL+SHM intact
+	// (normal DB.Close would checkpoint, truncate WAL and remove -shm).
+	db1, err := testOpen(t, dbPath, Options{PageSize: 4096, DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	tx, err := db1.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	for i := 0; i < 10; i++ {
+		require.NoError(t, tx.Put(ns, []byte(fmt.Sprintf("k%d", i)), []byte("v")))
+	}
+	require.NoError(t, tx.Commit())
+	saltsA := [2]uint32{db1.pager.wal.header.salt1, db1.pager.wal.header.salt2}
+	// 10 Puts with tiny values pack into a single commit batch — capture the
+	// real frame count rather than hard-coding a per-row assumption.
+	expectedFrames := db1.pager.wal.nFrame.Load()
+	require.Greater(t, expectedFrames, uint32(0), "test must seed at least one frame")
+	rawClose(db1)
+
+	// Open a raw wal against the existing -wal file. rawClose deletes -shm
+	// (last-connection DMS upgrade succeeds), so w2 gets a fresh SHM mapped
+	// and the current eager wal.open will run recoverLocked to rebuild it
+	// from the on-disk WAL header. ensureHeaderInitialized must be a no-op
+	// idempotent follow-up that keeps the adopted state intact.
+	w2 := newWal(dbPath+"-wal", 4096)
+	w2.inProcess = false
+	require.NoError(t, w2.open())
+	defer w2.close(false)
+	_, err = w2.ensureHeaderInitialized()
+	require.NoError(t, err)
+
+	require.Equal(t, saltsA[0], w2.header.salt1, "must adopt salts, not generate new ones")
+	require.Equal(t, saltsA[1], w2.header.salt2)
+	require.Equal(t, expectedFrames, w2.index.maxFrame.Load(), "mxFrame must reflect recovered frames")
+	require.Equal(t, expectedFrames, w2.nFrame.Load(), "nFrame must reflect recovered frames")
+}
+
+func TestEnsureHeaderInitialized_TriggersRecoveryWhenSHMInvalid(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "t.db")
+
+	// Seed a DB with frames and rawClose to keep the WAL file intact
+	// (normal DB.Close would truncate via checkpoint).
+	db, err := testOpen(t, dbPath, Options{PageSize: 4096, DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	for i := 0; i < 5; i++ {
+		require.NoError(t, tx.Put(ns, []byte(fmt.Sprintf("k%d", i)), []byte("v")))
+	}
+	require.NoError(t, tx.Commit())
+	expectedFrames := db.pager.wal.nFrame.Load()
+	require.Greater(t, expectedFrames, uint32(0), "test must seed at least one frame")
+	rawClose(db)
+
+	// rawClose removed -shm; w2 creates a new SHM mapping. The current eager
+	// wal.open already recovers from the WAL file into SHM — so to exercise
+	// ensureHeaderInitialized's recovery path we clear the SHM header after
+	// open and then invoke the helper explicitly.
+	w2 := newWal(dbPath+"-wal", 4096)
+	w2.inProcess = false
+	require.NoError(t, w2.open())
+	defer w2.close(false)
+
+	// Clear the SHM header to force ensureHeaderInitialized into the slow path.
+	region, err := w2.index.shm.region(0, true)
+	require.NoError(t, err)
+	clear(region[:walIndexHdrSize*2])
+
+	_, validBefore := w2.index.readHeader()
+	require.False(t, validBefore, "SHM should be invalid after manual clear")
+
+	_, err = w2.ensureHeaderInitialized()
+	require.NoError(t, err)
+
+	// After, SHM must be valid and mxFrame must match recovered frames.
+	hdr, validAfter := w2.index.readHeader()
+	require.True(t, validAfter)
+	require.Equal(t, expectedFrames, hdr.mxFrame)
+}
+
+
+// TestRollbackCleanupZerosShmHashEntries exercises shmCleanupFromFrame: a
+// cross-process reader consulting shmHashGet directly (bypassing the
+// mxCommitFrame gate on getLatest) must find zero entries for frames that
+// were rolled back. Matches SQLite's walCleanupHash invariant (wal.c:1247-1282):
+// after savepoint rollback, the SHM hash slots pointing at frames > hdr.mxFrame
+// are observably zeroed — not just invisible via mxCommitFrame.
+func TestRollbackCleanupZerosShmHashEntries(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	w := newWal(path, 4096)
+	w.inProcess = false
+	require.NoError(t, w.open())
+	defer w.close(false)
+
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
+
+	// Commit one frame to establish a stable baseline.
+	pg1 := &page{pgno: 1, data: make([]byte, 4096)}
+	copy(pg1.data, "committed page 1")
+	require.NoError(t, w.writeFrames([]*page{pg1}, true, 1))
+	committedFrame := w.nFrame.Load()
+
+	// Verify SHM hash has frame 1 for page 1.
+	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10, 1),
+		"committed frame 1 should be in SHM hash")
+
+	// Spill two more pages (commit=false). With eager SHM writes, they land
+	// in the hash tables immediately.
+	pg2 := &page{pgno: 2, data: make([]byte, 4096)}
+	copy(pg2.data, "spilled page 2")
+	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
+	copy(pg3.data, "spilled page 3")
+	require.NoError(t, w.writeFrames([]*page{pg2, pg3}, false, 0))
+
+	// Pre-rollback: spilled frames are in SHM hash (caller must use
+	// mxCommitFrame to gate visibility).
+	assert.Equal(t, uint32(2), w.index.shmHashGet(2, 10, 1),
+		"spilled frame 2 should be present in SHM hash (eager)")
+	assert.Equal(t, uint32(3), w.index.shmHashGet(3, 10, 1),
+		"spilled frame 3 should be present in SHM hash (eager)")
+
+	// Rollback to the commit boundary — this must invoke shmCleanupFromFrame.
+	w.index.rollbackToFrame(committedFrame)
+
+	// Post-rollback: shmHashGet with maxFrame=10 (large enough to see spilled
+	// if they remained) must now return 0 for pages 2 and 3. A reader
+	// unaware of mxCommitFrame (e.g. a fresh peer process scanning SHM
+	// after the writer died) must NOT find dangling entries for rolled-back
+	// frames.
+	assert.Equal(t, uint32(0), w.index.shmHashGet(2, 10, 1),
+		"frame 2 hash entry must be zeroed by rollback cleanup")
+	assert.Equal(t, uint32(0), w.index.shmHashGet(3, 10, 1),
+		"frame 3 hash entry must be zeroed by rollback cleanup")
+
+	// Committed frame must still be reachable — cleanup preserves the
+	// probe chain for idx <= iLimit (wal.c:1258-1264).
+	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10, 1),
+		"committed frame 1 must remain reachable after rollback cleanup")
+}
+
+// TestRollbackCleanupAcrossSegments verifies shmCleanupFromFrame handles the
+// case where spilled frames cross a segment boundary. any-store-specific
+// extension over SQLite's walCleanupHash (which only touches the segment of
+// hdr.mxFrame because walIndexAppend zero-inits new segments at idx==1).
+// Our setBatch has no zero-init, so a trailing segment's aHash must be
+// fully cleared by rollback.
+func TestRollbackCleanupAcrossSegments(t *testing.T) {
+	wi := &walIndex{
+		shm:       newHeapShm(),
+		pageMap:   make(map[uint32][]uint32),
+		inProcess: false,
+	}
+	// Force entries into segment 0 and segment 1 by writing at indices
+	// around htNPageOne. Commit up through frame htNPageOne, spill the
+	// next frame (which lands in segment 1), then roll back.
+	committed := uint32(htNPageOne)
+	wi.shmHashWrite(100, committed-1)
+	wi.shmHashWrite(200, committed)
+	wi.maxFrame.Store(committed)
+
+	// Spill two frames into segment 1.
+	spill1 := committed + 1
+	spill2 := committed + 2
+	wi.shmHashWrite(300, spill1)
+	wi.shmHashWrite(400, spill2)
+	wi.maxFrame.Store(spill2)
+
+	// Pre-rollback: segment-1 entries are present.
+	assert.NotZero(t, wi.shmHashGet(300, spill2, 1), "spill frame 300 in SHM")
+	assert.NotZero(t, wi.shmHashGet(400, spill2, 1), "spill frame 400 in SHM")
+
+	wi.rollbackToFrame(committed)
+
+	// Post-rollback: segment-1 hash entries zeroed.
+	assert.Equal(t, uint32(0), wi.shmHashGet(300, spill2, 1),
+		"trailing-segment frame 300 hash must be zeroed")
+	assert.Equal(t, uint32(0), wi.shmHashGet(400, spill2, 1),
+		"trailing-segment frame 400 hash must be zeroed")
+
+	// Pre-boundary committed frames in segment 0 must remain.
+	assert.Equal(t, committed-1, wi.shmHashGet(100, committed, 1),
+		"segment-0 frame 100 must still be reachable")
+	assert.Equal(t, committed, wi.shmHashGet(200, committed, 1),
+		"segment-0 frame 200 must still be reachable")
+}
+
+// clearHeaderForTest zeroes the shm header so the next reader's
+// readHeader() returns valid=false and ensureHeaderInitialized takes
+// the slow path. Test-only helper.
+func (wi *walIndex) clearHeaderForTest() error {
+	region, err := wi.shm.region(0, true)
+	if err != nil {
+		return err
+	}
+	for i := 0; i < walIndexHdrSize*2; i++ {
+		region[i] = 0
+	}
+	return nil
+}
+
+// TestEnsureHeaderInitialized_SurfacesBusyRecovery exercises the
+// slow-path in ensureHeaderInitialized where the RECOVER lock is held
+// exclusive (simulating "peer is mid-walIndexRecover"). The helper
+// must return ErrBusyRecovery (not the generic errWALRetry) so upstream
+// callers can back off via busyHandler instead of spinning.
+//
+// Uses a single wal instance: the in-process mmapShm.locks[] counters
+// serialize exclusive-vs-exclusive on the same slot even within the
+// same process, so preholding RECOVER exclusive is enough to trip the
+// helper's third branch.
+func TestEnsureHeaderInitialized_SurfacesBusyRecovery(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "t.db")
+
+	w := newWal(dbPath, 4096)
+	if err := w.open(); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = w.close(false) })
+
+	// Force slow path by zeroing the shm header.
+	if err := w.index.clearHeaderForTest(); err != nil {
+		t.Fatalf("clear shm header: %v", err)
+	}
+
+	// Prehold RECOVER exclusive — representing "peer is mid-recovery".
+	if err := w.index.lock(lockRecover, lockExclusive); err != nil {
+		t.Fatalf("acquire RECOVER exclusive: %v", err)
+	}
+	defer func() { _ = w.index.unlock(lockRecover, lockExclusive) }()
+
+	_, err := w.ensureHeaderInitialized()
+	if !errors.Is(err, ErrBusyRecovery) {
+		t.Fatalf("expected ErrBusyRecovery, got %v", err)
+	}
+}
+
+// buildWalHeader builds a serialized WAL header with configurable fields.
+// Callers override the defaults to craft malformed inputs.
+func buildWalHeader(t *testing.T, version, pageSize uint32) []byte {
+	t.Helper()
+	buf := make([]byte, walHeaderSize)
+	binary.BigEndian.PutUint32(buf[0:4], walMagic)
+	binary.BigEndian.PutUint32(buf[4:8], version)
+	binary.BigEndian.PutUint32(buf[8:12], pageSize)
+	binary.BigEndian.PutUint32(buf[12:16], 0)          // checkpoint
+	binary.BigEndian.PutUint32(buf[16:20], 0xdeadbeef) // salt1
+	binary.BigEndian.PutUint32(buf[20:24], 0xcafef00d) // salt2
+	c1, c2 := walChecksum(buf[0:24], 0, 0)
+	binary.BigEndian.PutUint32(buf[24:28], c1)
+	binary.BigEndian.PutUint32(buf[28:32], c2)
+	return buf
+}
+
+// TestWalHeaderDeserialize_GoodHeader sanity-checks the helper — a
+// well-formed header of the current version and default page size must
+// deserialize cleanly.
+func TestWalHeaderDeserialize_GoodHeader(t *testing.T) {
+	buf := buildWalHeader(t, walVersion, DefaultPageSize)
+	var h walHeader
+	if err := h.deserialize(buf); err != nil {
+		t.Fatalf("good header rejected: %v", err)
+	}
+	if h.version != walVersion || h.pageSize != DefaultPageSize {
+		t.Fatalf("fields mis-parsed: version=%d pageSize=%d", h.version, h.pageSize)
+	}
+}
+
+// TestWalHeaderDeserialize_RejectsBadVersion mirrors SQLite's
+// walIndexRecover rejection at wal.c:1406-1410.
+func TestWalHeaderDeserialize_RejectsBadVersion(t *testing.T) {
+	buf := buildWalHeader(t, walVersion+1, DefaultPageSize)
+	var h walHeader
+	err := h.deserialize(buf)
+	if !errors.Is(err, ErrWALCorrupt) {
+		t.Fatalf("bad version should be ErrWALCorrupt, got %v", err)
+	}
+}
+
+// TestWalHeaderDeserialize_RejectsBadPageSize mirrors SQLite's
+// walIndexRecover rejection at wal.c:1414-1419 (non-power-of-2, too
+// small, too large, zero).
+func TestWalHeaderDeserialize_RejectsBadPageSize(t *testing.T) {
+	cases := []struct {
+		name string
+		ps   uint32
+	}{
+		{"zero", 0},
+		{"non-power-of-2", 4097},
+		{"too small", MinPageSize / 2},
+		{"too large", MaxPageSize * 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := buildWalHeader(t, walVersion, tc.ps)
+			var h walHeader
+			err := h.deserialize(buf)
+			if !errors.Is(err, ErrWALCorrupt) {
+				t.Fatalf("bad pageSize %d should be ErrWALCorrupt, got %v", tc.ps, err)
+			}
+		})
+	}
+}
+
+// TestWriteFrames_ReuseOnRedirtied writes the same pgno twice in one
+// write transaction and asserts that the second write OVERWRITES the
+// first frame instead of appending a new one.
+// Reference: SQLite wal.c:4117-4140 (walFrames reuse branch).
+func TestWriteFrames_ReuseOnRedirtied(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	w := newWal(path, 4096)
+	require.NoError(t, w.open())
+	t.Cleanup(func() { _ = w.close(false) })
+
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
+	t.Cleanup(w.endWrite)
+
+	// First spill: pgno 5, data V1. Not a commit.
+	pg1 := &page{pgno: 5, data: make([]byte, 4096)}
+	pg1.data[0] = 0xA1
+	require.NoError(t, w.writeFrames([]*page{pg1}, false, 0))
+	assert.Equal(t, uint32(1), w.nFrame.Load(), "first spill should append one frame")
+
+	// Second spill: same pgno 5, data V1'. Not a commit. Reuse must fire.
+	pg1b := &page{pgno: 5, data: make([]byte, 4096)}
+	pg1b.data[0] = 0xA2
+	require.NoError(t, w.writeFrames([]*page{pg1b}, false, 0))
+
+	// Frame count must NOT have advanced — pgno 5's frame was overwritten.
+	assert.Equal(t, uint32(1), w.nFrame.Load(), "second write should reuse the existing frame, not append")
+	assert.Equal(t, uint32(1), w.iReCksum, "iReCksum should point at the overwritten frame")
+}
+
+// TestWriteFrames_CommitLastFrameNotReused — commit's LAST page is
+// always appended fresh even when reuse-eligible, so it carries the
+// dbSize commit marker. Reference: SQLite wal.c:4124 guard.
+func TestWriteFrames_CommitLastFrameNotReused(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	w := newWal(path, 4096)
+	require.NoError(t, w.open())
+	t.Cleanup(func() { _ = w.close(false) })
+
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
+
+	// Spill pgno 7 → frame 1.
+	pg7a := &page{pgno: 7, data: make([]byte, 4096)}
+	require.NoError(t, w.writeFrames([]*page{pg7a}, false, 0))
+	require.Equal(t, uint32(1), w.nFrame.Load())
+
+	// Commit with pgno 7 again as the only (and therefore last) page.
+	// Must append fresh (frame 2) carrying dbSize.
+	pg7b := &page{pgno: 7, data: make([]byte, 4096)}
+	pg7b.data[0] = 0xFF
+	require.NoError(t, w.writeFrames([]*page{pg7b}, true, 7))
+
+	assert.Equal(t, uint32(2), w.nFrame.Load(), "commit's last frame must be a fresh append with dbSize marker")
+
+	w.endWrite()
+}
+
+// TestWriteFrames_ChecksumChainConsistentAfterRewrite forces a reuse
+// followed by an append commit, then reopens to trigger recovery and
+// verifies the latest data is read. Recovery would reject the WAL on
+// a broken checksum chain.
+func TestWriteFrames_ChecksumChainConsistentAfterRewrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	w := newWal(path, 4096)
+	require.NoError(t, w.open())
+
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
+
+	// Spill: pgno 3 (V1), pgno 5.
+	pg3a := &page{pgno: 3, data: make([]byte, 4096)}
+	pg3a.data[0] = 0x33
+	pg5 := &page{pgno: 5, data: make([]byte, 4096)}
+	pg5.data[0] = 0x55
+	require.NoError(t, w.writeFrames([]*page{pg3a, pg5}, false, 0))
+
+	// Commit: pgno 3 again (V1' → triggers reuse on frame 1) + pgno 9
+	// as the last (fresh-appended commit-marker bearer).
+	pg3b := &page{pgno: 3, data: make([]byte, 4096)}
+	pg3b.data[0] = 0x77
+	pg9 := &page{pgno: 9, data: make([]byte, 4096)}
+	pg9.data[0] = 0x99
+	require.NoError(t, w.writeFrames([]*page{pg3b, pg9}, true, 9))
+	w.endWrite()
+	require.NoError(t, w.close(false))
+
+	// Reopen → recoverLocked validates the checksum chain across all
+	// surviving frames including the one whose data was overwritten.
+	w2 := newWal(path, 4096)
+	require.NoError(t, w2.open())
+	t.Cleanup(func() { _ = w2.close(false) })
+
+	// Latest frame for pgno 3 should be the overwritten one (frame 1)
+	// with V1' = 0x77 in its data.
+	frame := w2.index.get(3, w2.index.maxFrame.Load())
+	require.NotZero(t, frame, "pgno 3 should have a frame after recovery")
+	buf := make([]byte, 4096)
+	require.NoError(t, w2.readFrame(frame, buf))
+	assert.Equal(t, byte(0x77), buf[0], "recovery should yield the overwritten data, not the original")
+}
+
+// TestWriteFrames_SavepointRollbackResetsIReCksum confirms that
+// rolling back past iReCksum clears it. Mirrors SQLite wal.c:3832.
+func TestWriteFrames_SavepointRollbackResetsIReCksum(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+	w := newWal(path, 4096)
+	require.NoError(t, w.open())
+	t.Cleanup(func() { _ = w.close(false) })
+
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
+	t.Cleanup(w.endWrite)
+
+	// Spill pgno 2 → frame 1.
+	pg2a := &page{pgno: 2, data: make([]byte, 4096)}
+	require.NoError(t, w.writeFrames([]*page{pg2a}, false, 0))
+	savedMxFrame := w.nFrame.Load() // would be a savepoint
+
+	// Spill pgno 3 + reuse pgno 2.
+	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
+	pg2b := &page{pgno: 2, data: make([]byte, 4096)}
+	pg2b.data[0] = 0xEE
+	require.NoError(t, w.writeFrames([]*page{pg3, pg2b}, false, 0))
+
+	require.Equal(t, uint32(2), w.nFrame.Load(), "frame 2 appended (pgno 3); pgno 2 reused frame 1")
+	require.Equal(t, uint32(1), w.iReCksum, "iReCksum should point at overwritten frame 1")
+
+	// Savepoint rollback to savedMxFrame=1: iReCksum (1) is NOT past
+	// the new mxFrame, so it stays set.
+	w.index.rollbackToFrame(savedMxFrame)
+	w.nFrame.Store(savedMxFrame)
+	w.resetIReCksumIfPast(savedMxFrame)
+	assert.Equal(t, uint32(1), w.iReCksum, "rollback NOT past iReCksum should preserve it")
+
+	// Rollback to mxFrame=0 (past iReCksum): should clear it.
+	w.index.rollbackToFrame(0)
+	w.nFrame.Store(0)
+	w.resetIReCksumIfPast(0)
+	assert.Equal(t, uint32(0), w.iReCksum, "rollback past iReCksum should clear it")
 }

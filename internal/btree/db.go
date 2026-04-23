@@ -71,6 +71,24 @@ type Options struct {
 	// InitPageBuffer (anystore). When false (default), page buffers use
 	// sync.Pool, matching SQLite's default malloc-based allocation.
 	UsePageSlab bool
+
+	// MmapSize enables mmap-backed reads of the database file up to the
+	// given byte limit. Zero disables mmap (reads use pread via ReadAt).
+	// Values > 0 allocate a shared mapping of min(DBsize, MmapSize)
+	// bytes; reads falling within the mapping memcpy from it instead of
+	// issuing pread. Writes still go through WriteAt and are coherent
+	// via the OS unified page cache. Matches SQLite's PRAGMA mmap_size
+	// (sqlitec/src/os_unix.c:4240 SQLITE_FCNTL_MMAP_SIZE).
+	//
+	// Linux/darwin + amd64/arm64 only; no-op on other platforms.
+	//
+	// SAFETY: enabling trades a small perf win for SIGBUS-crash tail
+	// risk on file-shrink / device-removal events (USB unplug, iCloud
+	// eviction, NFS timeout). Go cannot recover from SIGBUS; the whole
+	// process dies. Only enable on stable local storage. Do NOT enable
+	// on mobile / networked filesystems / cloud sync paths. See
+	// anystore.Config.MmapSize for the full rationale.
+	MmapSize int64
 }
 
 // DefaultOptions returns default database options.
@@ -129,6 +147,32 @@ type DB struct {
 	// goroutines waiting on readerSem in BeginRead.
 	closeCh   chan struct{}
 	closeOnce sync.Once // guards closing closeCh
+
+	// lastAutoCheckpointErr stores the most recent non-nil error from
+	// tx.pager.tryCheckpoint() during auto-checkpoint. Allows monitoring
+	// code to detect silent failures (disk full, permissions, etc.) that
+	// the auto-checkpoint path otherwise swallows. Reads/writes are
+	// atomic via atomic.Value. Nil means "no error seen since open".
+	lastAutoCheckpointErr atomic.Value
+}
+
+// autoCheckpointResult wraps the result of an auto-checkpoint attempt
+// so atomic.Value can hold a nil error without tripping its typed-nil
+// panic.
+type autoCheckpointResult struct{ err error }
+
+// LastAutoCheckpointError returns the error from the most recent
+// auto-checkpoint attempt, or nil if the last attempt succeeded (or
+// auto-checkpoint has never run since this DB was opened). Use this
+// for monitoring / health checks — the auto-checkpoint itself is
+// best-effort and its errors are otherwise not surfaced to callers.
+func (db *DB) LastAutoCheckpointError() error {
+	v := db.lastAutoCheckpointErr.Load()
+	if v == nil {
+		return nil
+	}
+	r, _ := v.(autoCheckpointResult)
+	return r.err
 }
 
 // Open opens or creates a database at the given path.
@@ -192,6 +236,7 @@ func Open(path string, opts Options) (*DB, error) {
 	p.inProcess = opts.InProcess
 	p.noCommitSync = opts.NoCommitSync
 	p.inMemory = opts.InMemory
+	p.mmapSize = opts.MmapSize
 	if err := p.open(); err != nil {
 		return nil, err
 	}
@@ -370,7 +415,7 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 		return nil, ErrClosed
 	}
 
-	maxFrame, slot, err := db.pager.beginRead()
+	hdr, maxFrame, slot, err := db.pager.beginReadHdr()
 	if err != nil {
 		db.mu.RUnlock()
 		<-db.readerSem
@@ -420,7 +465,14 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 	tx.cache = cache
 	tx.closed = false
 	tx.writable = false
+	// Dual-write during per-connection-hdr migration. Step 5 will remove
+	// walMaxFrame; until then, tests still read it directly.
 	tx.walMaxFrame = maxFrame
+	if hdr.isInit != 0 {
+		tx.walHdr = hdr
+	} else {
+		tx.walHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
+	}
 	tx.walSlot = slot
 	tx.diskFileChangeCounter = fcc
 	tx.diskSchemaCookie = sc
@@ -444,11 +496,15 @@ func (db *DB) BeginReadFast() (*ReadTx, error) {
 // can be active at a time (single-writer semantics). Blocks until any
 // existing write transaction completes.
 //
-// For multi-process mode, if another process committed since our last read
-// (ErrBusySnapshot), we automatically retry with a fresh SHM snapshot.
-// DRIFT from SQLite: SQLite returns SQLITE_BUSY_SNAPSHOT to the caller,
-// requiring it to retry. We retry internally for ergonomic API (max 5 attempts).
-const maxBusySnapshotRetries = 5
+// busySnapshotInnerRetries is the tight-loop budget inside BeginWrite
+// for the BUSY_SNAPSHOT race (wal.c:3714 SQLITE_BUSY_SNAPSHOT). Most
+// races resolve in 1-2 attempts (another writer just committed, we
+// re-read and proceed). If we exceed this budget, we hand off to the
+// wal busyHandler for the standard delays[]/totals[] backoff
+// (DefaultBusyTimeout, matching SQLite's sqliteDefaultBusyCallback in
+// main.c:1717). After busyHandler exhausts its budget, ErrBusySnapshot
+// surfaces to the caller — matching SQLite's caller contract.
+const busySnapshotInnerRetries = 3
 
 func (db *DB) BeginWrite() (*WriteTx, error) {
 	if db.closing.Load() {
@@ -469,11 +525,18 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	var maxFrame uint32
 	var slot int
 	var fcc, sc uint32
+	var readSnap WalIndexHdr
 
 	for attempt := 0; ; attempt++ {
 		var err error
-		maxFrame, slot, err = db.pager.beginRead()
+		readSnap, maxFrame, slot, err = db.pager.beginReadHdr()
 		if err != nil {
+			if errors.Is(err, ErrBusyRecovery) {
+				xBusy := db.pager.wal.busyHandler
+				if xBusy != nil && xBusy(attempt) {
+					continue
+				}
+			}
 			db.mu.RUnlock()
 			db.writeMu.Unlock()
 			return nil, err
@@ -493,18 +556,29 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 		// inside beginWrite() (happens-before guarantee).
 		db.pager.writerWalSlot = slot
 
-		err = db.pager.beginWrite()
+		err = db.pager.beginWrite(readSnap)
 		if err == nil {
 			break
 		}
 		db.pager.endRead(slot)
-		if !errors.Is(err, ErrBusySnapshot) || attempt >= maxBusySnapshotRetries {
+		if !errors.Is(err, ErrBusySnapshot) {
 			db.mu.RUnlock()
 			db.writeMu.Unlock()
 			return nil, err
 		}
 		// Clear writerCache: another process committed, our cached pages are stale
 		db.pager.writerCache.clear()
+		// After a small tight-retry budget, route through the busy handler so
+		// we back off instead of spinning. When busyHandler returns false
+		// (budget exhausted) or is nil, surface ErrBusySnapshot to the caller.
+		if attempt >= busySnapshotInnerRetries {
+			xBusy := db.pager.wal.busyHandler
+			if xBusy == nil || !xBusy(attempt-busySnapshotInnerRetries) {
+				db.mu.RUnlock()
+				db.writeMu.Unlock()
+				return nil, ErrBusySnapshot
+			}
+		}
 	}
 
 	// Reset the cleanup guard for this write transaction.
@@ -516,6 +590,14 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	tx.ReadTx.cache = nil // writer uses shared pcache, not a reader cache
 	tx.ReadTx.closed = false
 	tx.ReadTx.walMaxFrame = maxFrame
+	// Reuse the readSnap hdr captured above for BUSY_SNAPSHOT. In-process
+	// mode has readSnap=zero; synthesize minimal hdr so read paths consuming
+	// walHdr.mxFrame see the correct frame ceiling.
+	if readSnap.isInit != 0 {
+		tx.ReadTx.walHdr = readSnap
+	} else {
+		tx.ReadTx.walHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
+	}
 	tx.ReadTx.walSlot = slot
 	tx.ReadTx.writable = true
 	tx.ReadTx.diskFileChangeCounter = fcc
@@ -613,7 +695,7 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 	var rootPgBuf [4]byte
 	binary.BigEndian.PutUint32(rootPgBuf[:], rootPg.pgno)
 
-	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walMaxFrame, writable: true}
+	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
 	return bt.Put([]byte(name), rootPgBuf[:])
 }
 
@@ -634,7 +716,7 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 	rootPage := ns.rootPage
 
 	// Delete namespace entry from master table
-	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walMaxFrame, writable: true}
+	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
 	if err := bt.Delete([]byte(name)); err != nil {
 		return err
 	}
@@ -852,7 +934,12 @@ type ReadTx struct {
 	pager       *pager
 	cache       *pcache // per-reader private page cache (nil for write transactions)
 	walSlot     int     // reader slot number (for endRead)
-	walMaxFrame uint32  // WAL snapshot for this transaction
+	walMaxFrame uint32  // WAL snapshot for this transaction (TODO: migrate to walHdr.mxFrame)
+	// walHdr is the full SHM header snapshot captured at BeginRead time.
+	// Populated in parallel with walMaxFrame during the per-connection-hdr
+	// migration (see docs/superpowers/specs/2026-04-18-per-connection-hdr-design.md).
+	// Not yet consumed by production code.
+	walHdr WalIndexHdr
 
 	// Disk counters from page 1 at transaction start (for staleness detection).
 	diskFileChangeCounter  uint32
@@ -863,6 +950,11 @@ type ReadTx struct {
 	writable               bool // true when embedded in a WriteTx (MVCC: allows seeing dirty pages)
 }
 
+// WalMaxFrame returns the reader's snapshot mxFrame. Prefer this over
+// direct walMaxFrame field access — the field is being migrated to
+// walHdr.mxFrame per the per-connection-hdr spec.
+func (tx *ReadTx) WalMaxFrame() uint32 { return tx.walHdr.mxFrame }
+
 
 // txGetPage fetches a page respecting MVCC snapshot isolation.
 // For write transactions, pages are fetched from the writer cache or WAL.
@@ -870,10 +962,10 @@ type ReadTx struct {
 func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 	if tx.writable {
 		// Use pager.getPage which uses wal.nFrame (not the frozen
-		// tx.walMaxFrame) so the writer sees its own spilled pages.
+		// tx.walHdr.mxFrame) so the writer sees its own spilled pages.
 		return tx.pager.getPage(pgno)
 	}
-	return tx.pager.getPageReader(pgno, tx.walMaxFrame, tx.cache)
+	return tx.pager.getPageReader(pgno, tx.walHdr.mxFrame, tx.cache)
 }
 
 // readOverflow reads overflow chain data using the correct isolation level.
@@ -882,9 +974,9 @@ func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 // that the writer could later read, causing on-disk corruption.
 func (tx *ReadTx) readOverflow(firstPgno uint32, buf []byte) error {
 	if tx.writable {
-		return tx.pager.readOverflowChainAt(firstPgno, buf, tx.walMaxFrame)
+		return tx.pager.readOverflowChainAt(firstPgno, buf, tx.walHdr.mxFrame)
 	}
-	return tx.pager.readOverflowChainReader(firstPgno, buf, tx.walMaxFrame, tx.cache)
+	return tx.pager.readOverflowChainReader(firstPgno, buf, tx.walHdr.mxFrame, tx.cache)
 }
 
 // AppendValue retrieves a value by key from the given namespace, appending it to buf.
@@ -902,7 +994,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 	usableSize := tx.pager.usableSize()
 	for {
 		if pg.header.isLeaf() {
-			idx, found, serr := searchLeafWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame, tx.cache)
+			idx, found, serr := searchLeafWithOverflow(pg, key, usableSize, tx.pager, tx.walHdr.mxFrame, tx.cache)
 			if serr != nil {
 				tx.pager.releasePage(pg)
 				return buf, serr
@@ -955,7 +1047,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 				if valOverflow > 0 {
 					if err := tx.pager.readOverflowAt(
 						cell.overflowPg, keyOverflow, valOverflow,
-						fullVal[localValBytes:], tx.walMaxFrame, tx.cache,
+						fullVal[localValBytes:], tx.walHdr.mxFrame, tx.cache,
 					); err != nil {
 						tx.pager.releasePage(pg)
 						return buf[:start], err
@@ -968,7 +1060,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 			tx.pager.releasePage(pg)
 			return buf, nil
 		}
-		childPgno, _, serr := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walMaxFrame, tx.cache)
+		childPgno, _, serr := searchInteriorWithOverflow(pg, key, usableSize, tx.pager, tx.walHdr.mxFrame, tx.cache)
 		if serr != nil {
 			tx.pager.releasePage(pg)
 			return buf, serr
@@ -1032,7 +1124,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 
 	for {
 		if pg.header.isLeaf() {
-			idx, _, serr := searchLeafWithOverflow(pg, prefix, usableSize, tx.pager, tx.walMaxFrame, cache)
+			idx, _, serr := searchLeafWithOverflow(pg, prefix, usableSize, tx.pager, tx.walHdr.mxFrame, cache)
 			if serr != nil {
 				tx.pager.releasePage(pg)
 				return buf, serr
@@ -1056,7 +1148,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 				return buf, cerr
 			}
 			if cell.overflowPg != 0 {
-				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walMaxFrame, cache)
+				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walHdr.mxFrame, cache)
 				tx.pager.releasePage(pg)
 				if kerr != nil {
 					return buf, kerr
@@ -1067,7 +1159,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 			tx.pager.releasePage(pg)
 			return buf, nil
 		}
-		childPgno, cellIdx, serr := searchInteriorWithOverflow(pg, prefix, usableSize, tx.pager, tx.walMaxFrame, cache)
+		childPgno, cellIdx, serr := searchInteriorWithOverflow(pg, prefix, usableSize, tx.pager, tx.walHdr.mxFrame, cache)
 		if serr != nil {
 			tx.pager.releasePage(pg)
 			return buf, serr
@@ -1134,7 +1226,7 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 				return buf, cerr
 			}
 			if cell.overflowPg != 0 {
-				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walMaxFrame, cache)
+				fullKey, kerr := leafFullKey(pg.data, int(off), usableSize, tx.pager, tx.walHdr.mxFrame, cache)
 				tx.pager.releasePage(pg)
 				if kerr != nil {
 					return buf, kerr
@@ -1167,7 +1259,7 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 // NewCursor creates a cursor for iterating over the namespace.
 func (tx *ReadTx) NewCursor(ns *Namespace) *Cursor {
 	c := &Cursor{}
-	c.btData = btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
+	c.btData = btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: tx.writable}
 	c.bt = &c.btData
 	return c
 }
@@ -1178,7 +1270,7 @@ func (tx *ReadTx) Count(ns *Namespace) (int, error) {
 	if tx.closed {
 		return 0, ErrTxClosed
 	}
-	bt := &btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: tx.writable}
+	bt := &btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: tx.writable}
 	return bt.Count()
 }
 
@@ -1189,7 +1281,7 @@ func (tx *ReadTx) GetNamespace(name string) (*Namespace, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
 	}
-	return tx.db.getNamespaceAt(name, tx.walMaxFrame, tx.cache)
+	return tx.db.getNamespaceAt(name, tx.walHdr.mxFrame, tx.cache)
 }
 
 // IsDataStale returns true if the on-disk FileChangeCount differs from the
@@ -1279,7 +1371,7 @@ func (tx *WriteTx) Put(ns *Namespace, key, value []byte) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: true}
+	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: true}
 	return bt.Put(key, value)
 }
 
@@ -1288,7 +1380,7 @@ func (tx *WriteTx) Delete(ns *Namespace, key []byte) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
-	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: true}
+	bt := &btree{pager: tx.pager, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: true}
 	return bt.Delete(key)
 }
 
@@ -1320,8 +1412,12 @@ func (tx *WriteTx) Commit() error {
 
 		// Auto-checkpoint before releasing db.mu.RLock to avoid deadlock with Close().
 		// Checkpoint does NOT block readers — it only blocks new writers.
+		// Errors are stored on db.lastAutoCheckpointErr instead of silently
+		// discarded so monitoring code can observe them via
+		// LastAutoCheckpointError().
 		if err == nil && needCheckpoint {
-			_ = tx.pager.tryCheckpoint()
+			cpErr := tx.pager.tryCheckpoint()
+			db.lastAutoCheckpointErr.Store(autoCheckpointResult{err: cpErr})
 		}
 		db.mu.RUnlock()
 		db.writeMu.Unlock()

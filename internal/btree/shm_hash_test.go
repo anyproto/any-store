@@ -11,7 +11,7 @@ import (
 func TestShmHashTableBasic(t *testing.T) {
 	wi, err := newWalIndex("", true) // in-process shm
 	require.NoError(t, err)
-	defer wi.close()
+	defer wi.close(false)
 
 	// Write some page→frame mappings
 	wi.shmHashWrite(10, 1)
@@ -34,7 +34,7 @@ func TestShmHashTableBasic(t *testing.T) {
 func TestShmHashTableOverwrite(t *testing.T) {
 	wi, err := newWalIndex("", true)
 	require.NoError(t, err)
-	defer wi.close()
+	defer wi.close(false)
 
 	// Page 10 written at frame 1, then overwritten at frame 5
 	wi.shmHashWrite(10, 1)
@@ -50,7 +50,7 @@ func TestShmHashTableOverwrite(t *testing.T) {
 func TestShmHashTableCollision(t *testing.T) {
 	wi, err := newWalIndex("", true)
 	require.NoError(t, err)
-	defer wi.close()
+	defer wi.close(false)
 
 	// Insert many pages to force hash collisions
 	for i := uint32(1); i <= 1000; i++ {
@@ -67,7 +67,7 @@ func TestShmHashTableCollision(t *testing.T) {
 func TestShmHashTableMultiSegment(t *testing.T) {
 	wi, err := newWalIndex("", true)
 	require.NoError(t, err)
-	defer wi.close()
+	defer wi.close(false)
 
 	// Write enough frames to span multiple segments.
 	// Segment 0 holds frames 1..4062, segment 1 holds 4063..8158.
@@ -93,7 +93,7 @@ func TestShmHashTableMultiSegment(t *testing.T) {
 func TestShmHashTableClear(t *testing.T) {
 	wi, err := newWalIndex("", true)
 	require.NoError(t, err)
-	defer wi.close()
+	defer wi.close(false)
 
 	// Populate
 	for f := uint32(1); f <= 100; f++ {
@@ -111,7 +111,7 @@ func TestShmHashTableClear(t *testing.T) {
 func TestShmCkptInfo(t *testing.T) {
 	wi, err := newWalIndex("", true)
 	require.NoError(t, err)
-	defer wi.close()
+	defer wi.close(false)
 
 	// Set some values
 	wi.nBackfill.Store(42)
