@@ -2219,25 +2219,37 @@ func (w *wal) beginRead() (maxFrame uint32, slot int, err error) {
 // the reader slot. The caller can thread this hdr into BUSY_SNAPSHOT checks so
 // beginWrite compares against the same snapshot that beginRead actually used.
 func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err error) {
-	// Retry loop matching SQLite's WAL_RETRY protocol (wal.c:3239-3245).
-	// If a checkpoint resets the WAL between our metadata read and lock
-	// acquisition, tryBeginRead returns errWALRetry and we try again.
+	// Retry loop matching SQLite's WAL_RETRY protocol (wal.c:3022-3056,
+	// 3391-3393). After 5 retries we begin sleeping; from the 10th retry
+	// onward the delay grows quadratically up to ~10s total before
+	// returning ErrProtocol at WAL_RETRY_PROTOCOL_LIMIT iterations.
+	//
+	// Constants match SQLite literally:
+	//   WAL_RETRY_PROTOCOL_LIMIT = 100  (wal.c:2943)
+	//   first 5 retries:           Gosched only
+	//   retries 6..9:              1 µs sleep
+	//   retries 10..100:           (cnt-9)² × 39 µs (≈ 323 ms at cnt=100)
+	//
 	// DRIFT from SQLite (NOTES.md §20, drift 5): SQLite does not use a
 	// *pChanged output signal — pWal->hdr already reflects the current SHM
 	// state after walIndexReadHdr(). Our per-connection caches are invalidated
 	// via dataVersion in DB.beginRead(), not via a signal from tryBeginRead.
-	// SQLite uses an unbounded retry loop. We use a generous limit to
-	// detect true bugs while tolerating heavy contention (e.g., concurrent
-	// readers + checkpoint cycling in multi-process mode).
-	const retryLimit = 5000
-	for i := 0; i < retryLimit; i++ {
+	const protocolLimit = 100
+	for cnt := 0; cnt <= protocolLimit; cnt++ {
 		hdr, maxFrame, slot, err = w.tryBeginReadHdr()
 		if !errors.Is(err, errWALRetry) {
 			return hdr, maxFrame, slot, err
 		}
-		if i >= 5 {
+		if cnt < 5 {
 			runtime.Gosched()
+			continue
 		}
+		nDelay := time.Microsecond // 1 µs base (retries 6..9)
+		if cnt >= 10 {
+			d := cnt - 9
+			nDelay = time.Duration(d*d*39) * time.Microsecond
+		}
+		time.Sleep(nDelay)
 	}
 	return WalIndexHdr{}, 0, 0, ErrProtocol
 }
