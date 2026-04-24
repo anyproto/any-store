@@ -2321,6 +2321,14 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame uint32, slot
 	}
 
 	if err := w.index.lock(lockRead0, lockShared); err != nil {
+		// Slot 0 fallback also busy: every slot 1..4 was busy AND slot 0
+		// is busy too. Convert to errWALRetry so beginReadHdr loops.
+		// Mirrors the multi-process site's SQLite wal.c:3186-3188
+		// conversion. In InProcess mode this is rare (process-local
+		// locks rarely race) but kept symmetric.
+		if errors.Is(err, ErrBusy) {
+			return WalIndexHdr{}, 0, 0, errWALRetry
+		}
 		return WalIndexHdr{}, 0, 0, err
 	}
 	w.index.aReadMark[0].Store(mxFrame)
