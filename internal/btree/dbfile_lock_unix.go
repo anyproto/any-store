@@ -1,9 +1,10 @@
+//go:build unix
+
 package btree
 
 import (
 	"errors"
 	"fmt"
-	"os"
 	"syscall"
 )
 
@@ -30,7 +31,7 @@ import (
 
 // acquireSharedDBLock takes a non-blocking shared flock on fd. Returns
 // ErrBusy if another process holds exclusive on the same file.
-func acquireSharedDBLock(fd *os.File) error {
+func acquireSharedDBLock(fd fileHandle) error {
 	return flockNB(fd, syscall.LOCK_SH)
 }
 
@@ -39,7 +40,7 @@ func acquireSharedDBLock(fd *os.File) error {
 // the only holder, safe to unlink shm / truncate WAL). Returns (false, nil)
 // if another holder prevents the upgrade. Returns (false, err) on OS
 // errors other than EWOULDBLOCK.
-func tryUpgradeDBLockExclusive(fd *os.File) (bool, error) {
+func tryUpgradeDBLockExclusive(fd fileHandle) (bool, error) {
 	err := flockNB(fd, syscall.LOCK_EX)
 	switch {
 	case err == nil:
@@ -52,13 +53,13 @@ func tryUpgradeDBLockExclusive(fd *os.File) (bool, error) {
 }
 
 // downgradeDBLockToShared converts an exclusive lock back to shared.
-func downgradeDBLockToShared(fd *os.File) error {
+func downgradeDBLockToShared(fd fileHandle) error {
 	return flockNB(fd, syscall.LOCK_SH)
 }
 
 // flockNB is a thin wrapper that maps EWOULDBLOCK/EAGAIN to ErrBusy so
 // callers share the same BUSY handling they use for shm fcntl locks.
-func flockNB(fd *os.File, how int) error {
+func flockNB(fd fileHandle, how int) error {
 	if fd == nil {
 		return fmt.Errorf("btree: dbfile lock: nil fd")
 	}
