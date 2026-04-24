@@ -2402,7 +2402,18 @@ func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame uint32, s
 	}
 
 	if bestSlot == -1 {
-		return WalIndexHdr{}, 0, 0, ErrBusy
+		// No reader slot could be claimed — every slot 1..4 is held shared
+		// by a peer reader, so step 5's exclusive lock attempts all
+		// returned ErrBusy. Convert to errWALRetry so the outer
+		// beginReadHdr loop can spin until a slot frees up.
+		// Matches SQLite wal.c:3186-3188:
+		//   if( mxI==0 ){
+		//     assert( rc==SQLITE_BUSY || (pWal->readOnly & WAL_SHM_RDONLY)!=0 );
+		//     return rc==SQLITE_BUSY ? WAL_RETRY : SQLITE_READONLY_CANTINIT;
+		//   }
+		// any-store has no read-only-shm mode, so the conversion is
+		// unconditional.
+		return WalIndexHdr{}, 0, 0, errWALRetry
 	}
 
 	// Step 6: Acquire shared lock on the chosen slot (SQLite wal.c:3192)
