@@ -5489,9 +5489,14 @@ func TestWalBeginRead_AllSlotsBusy_Slot0AlsoLocked(t *testing.T) {
 		require.NoError(t, w.index.lock(lockRead0+i, lockExclusive))
 	}
 
-	// beginRead should fail because even slot 0 is locked.
-	_, _, err := w.beginRead()
-	assert.Equal(t, ErrBusy, err)
+	// tryBeginReadInProcessHdr should return errWALRetry (not ErrBusy):
+	// matches SQLite walTryBeginRead's BUSY→WAL_RETRY conversion at
+	// wal.c:3186-3188. The outer beginReadHdr loop would consume the
+	// retry and eventually surface ErrProtocol after ~10s of back-off,
+	// but that's a retry-exhaustion contract, not a slot-lock contract —
+	// test the inner conversion directly to keep the test fast and focused.
+	_, _, _, err := w.tryBeginReadInProcessHdr()
+	assert.ErrorIs(t, err, errWALRetry)
 
 	for i := 0; i <= 4; i++ {
 		_ = w.index.unlock(lockRead0+i, lockExclusive)

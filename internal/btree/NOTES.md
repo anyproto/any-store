@@ -1524,6 +1524,47 @@ the hint — a future optimization could pass the parent-page pgno as
 nearby on split (matches `btree.c:8666` style) but would require
 benchmark justification.
 
+**Reader-Begin BUSY Conversion (SQLite walTryBeginRead)** -- Resolved 2026-04-23
+
+SQLite's `walTryBeginRead` (`sqlitec/src/wal.c:3000-3252`) never surfaces
+`SQLITE_BUSY` to its caller from the reader-slot claim path. Three
+conversion sites turn BUSY into the internal sentinel `WAL_RETRY`
+(`#define WAL_RETRY (-1)` at wal.c:2626):
+
+  - slot-0 fast path BUSY (wal.c:3144-3146): falls through to slot-1..4
+  - all slots 1..4 busy (wal.c:3186-3188): explicit `rc==SQLITE_BUSY ? WAL_RETRY : ...`
+  - final shared-acquire BUSY (wal.c:3203): same conversion
+
+The caller `walBeginReadTransaction` (wal.c:3391-3393) consumes WAL_RETRY
+in an unbounded `do { ... } while(rc==WAL_RETRY)` with internal back-off
+(wal.c:3022-3056): first 5 retries Gosched-equivalent, then 1 µs sleep,
+then quadratic ramp `(cnt-9)² × 39 µs` capped at WAL_RETRY_PROTOCOL_LIMIT
+= 100 (wal.c:2943) for ~10 s total budget before returning
+`SQLITE_PROTOCOL`.
+
+any-store previously surfaced `ErrBusy` from two of the three sites
+(`wal.tryBeginReadMultiProcessHdr`'s slot-0 lock fail and no-slot-claim
+fallback) and ran a flat 5000-iteration `runtime.Gosched()`-only retry
+loop. Under concurrent readers + checkpoints,
+`TestRapidCheckpointDuringOverflowWrites` produced ~130k transient
+ErrBusy returns per run despite the database being fully consistent
+(`QuickCheck` clean); an additional 2–16 residual `ErrProtocol` returns
+came from retry-budget exhaustion because 5000 Gosch'd iterations
+completed before peer readers could release their slot locks.
+
+All three SQLite conversions are now ported plus the SQLite back-off
+ramp. The same ErrBusy→errWALRetry conversion applies symmetrically to
+the in-process path's slot-0 fallback (`tryBeginReadInProcessHdr`) for
+consistency.
+
+**Test evidence:** `TestRapidCheckpointDuringOverflowWrites` 10/10 PASS
+after fix vs ~130k read errors before. Full any-store unit suite + the
+storetest stress slice (`TestStressSavepoint`, `TestStressReaderWriter`,
+`TestStressCheckpoint`) remain green.
+
+**Covered by:** `TestTryBeginReadMultiProcessHdr_AllSlotsBusyReturnsRetry`
+(internal/btree/wal_reader_retry_test.go).
+
 ### Freelist
 
 **Freelist Formula Respects Reserved Space** -- Resolved (stale drift note)
