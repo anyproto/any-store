@@ -17,8 +17,10 @@ var (
 type File = btree.File
 type VFS = btree.VFS
 
-// SetVFS replaces OS-level operations. Panics unless built with -tags vfs.
+// SetVFS replaces OS-level operations. Panics unless built with -tags vfs
+// or GOOS=js GOARCH=wasm.
 func SetVFS(vfs VFS) { btree.SetVFS(vfs) }
 
-// ResetVFS restores defaults. Panics unless built with -tags vfs.
+// ResetVFS restores defaults. Panics unless built with -tags vfs
+// or GOOS=js GOARCH=wasm.
 func ResetVFS() { btree.ResetVFS() }

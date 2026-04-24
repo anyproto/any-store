@@ -1,4 +1,4 @@
-//go:build vfs && !linux
+//go:build (vfs || (js && wasm)) && !linux
 
 package btree
 

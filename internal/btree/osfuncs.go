@@ -1,4 +1,4 @@
-//go:build !vfs
+//go:build !vfs && !(js && wasm)
 
 package btree
 
@@ -13,12 +13,14 @@ func osOpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
 
 var osRemove = os.Remove
 
-// SetVFS replaces OS-level operations. Panics unless built with -tags vfs.
+// SetVFS replaces OS-level operations. Panics unless built with -tags vfs
+// or GOOS=js GOARCH=wasm.
 func SetVFS(_ VFS) {
-	panic("btree: SetVFS requires building with -tags vfs")
+	panic("btree: SetVFS requires building with -tags vfs or GOOS=js GOARCH=wasm")
 }
 
-// ResetVFS restores defaults. Panics unless built with -tags vfs.
+// ResetVFS restores defaults. Panics unless built with -tags vfs
+// or GOOS=js GOARCH=wasm.
 func ResetVFS() {
-	panic("btree: ResetVFS requires building with -tags vfs")
+	panic("btree: ResetVFS requires building with -tags vfs or GOOS=js GOARCH=wasm")
 }

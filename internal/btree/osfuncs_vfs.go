@@ -1,4 +1,4 @@
-//go:build vfs
+//go:build vfs || (js && wasm)
 
 package btree
 
