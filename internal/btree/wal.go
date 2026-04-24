@@ -2356,21 +2356,33 @@ func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame uint32, s
 	// Step 2: Read nBackfill directly from SHM (SQLite: AtomicLoad(&pInfo->nBackfill))
 	nBackfill := w.index.shmNBackfill()
 
-	// Step 3: Slot 0 path — WAL fully checkpointed (SQLite wal.c:3114-3147)
+	// Step 3: Slot 0 path — WAL fully checkpointed (SQLite wal.c:3114-3147).
+	// On BUSY, fall through to the slot-1..4 selection path matching
+	// SQLite wal.c:3144-3146:
+	//   }else if( rc!=SQLITE_BUSY ){
+	//     return rc;
+	//   }
+	// SQLite intentionally lets BUSY here flow into the read-mark loop, so
+	// a reader doesn't bail out just because a checkpointer briefly holds
+	// slot 0 exclusive.
 	if mxFrame == 0 || nBackfill == mxFrame {
-		if err := w.index.lock(lockRead0, lockShared); err != nil {
+		err := w.index.lock(lockRead0, lockShared)
+		if err == nil {
+			walShmBarrier()
+			// Re-validate: compare live SHM header against our local copy
+			// (SQLite wal.c:3125: memcmp(walIndexHdr(pWal), &pWal->hdr, sizeof(WalIndexHdr)))
+			if liveHdr, ok := w.index.readHeader(); ok && liveHdr != hdr {
+				_ = w.index.unlock(lockRead0, lockShared)
+				return WalIndexHdr{}, 0, 0, errWALRetry
+			}
+			w.index.shmWriteReadMark(0, mxFrame)
+			w.index.aReadMark[0].Store(mxFrame) // keep process-local in sync
+			return hdr, mxFrame, 0, nil
+		}
+		if !errors.Is(err, ErrBusy) {
 			return WalIndexHdr{}, 0, 0, err
 		}
-		walShmBarrier()
-		// Re-validate: compare live SHM header against our local copy
-		// (SQLite wal.c:3125: memcmp(walIndexHdr(pWal), &pWal->hdr, sizeof(WalIndexHdr)))
-		if liveHdr, ok := w.index.readHeader(); ok && liveHdr != hdr {
-			_ = w.index.unlock(lockRead0, lockShared)
-			return WalIndexHdr{}, 0, 0, errWALRetry
-		}
-		w.index.shmWriteReadMark(0, mxFrame)
-		w.index.aReadMark[0].Store(mxFrame) // keep process-local in sync
-		return hdr, mxFrame, 0, nil
+		// BUSY: fall through to slot 1..4 selection below.
 	}
 
 	// Step 4: Find best reader slot 1-4 (SQLite wal.c:3154-3169)
