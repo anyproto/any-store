@@ -24,6 +24,7 @@ type chachaCodec struct {
 	nonces   *noncePool
 	nonceLen int
 	overhead int
+	onErrorField
 }
 
 const (
@@ -115,6 +116,7 @@ func (c *chachaCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]b
 
 	pt, err := c.aead.Open(dst[:0], nonce, ctAndTag, aad)
 	if err != nil {
+		c.fire(pgno, err)
 		return nil, ErrCodecTamper
 	}
 	if len(pt) != bodyLen {

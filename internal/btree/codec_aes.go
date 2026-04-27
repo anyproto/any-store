@@ -34,6 +34,7 @@ const aesTagLen = 16
 type aesCodec struct {
 	aead   cipher.AEAD
 	nonces *noncePool
+	onErrorField
 }
 
 // NewAESCodec constructs the default codec. key must be exactly 32 bytes
@@ -123,6 +124,7 @@ func (c *aesCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte
 	// dst and src are separate buffers — no aliasing.
 	pt, err := c.aead.Open(dst[:0], nonce, ctAndTag, aad)
 	if err != nil {
+		c.fire(pgno, err)
 		return nil, ErrCodecTamper
 	}
 	if len(pt) != bodyLen {

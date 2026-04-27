@@ -35,9 +35,8 @@ type cksumCodec struct {
 	// page bytes instead of ErrCodecTamper. Mirrors PRAGMA
 	// checksum_verification.
 	verify atomic.Uint32
-	// onError, if non-nil, is invoked on every mismatch regardless of
-	// verify state. atomic.Pointer so callers can swap atomically.
-	onError atomic.Pointer[func(uint32, error)]
+	// onErrorField provides SetOnError + fire. Shared across all codecs.
+	onErrorField
 }
 
 // newCksumCodec returns a cksumCodec with verify-on-read enabled.
@@ -61,23 +60,6 @@ func (c *cksumCodec) SetVerify(on bool) {
 
 // VerifyOn reports the current verify-on-read state.
 func (c *cksumCodec) VerifyOn() bool { return c.verify.Load() == 1 }
-
-// SetOnError installs a callback fired on every checksum mismatch.
-// Pass nil to clear. The callback runs on the I/O goroutine and must
-// not block; route through a buffered channel + drainer for retention.
-func (c *cksumCodec) SetOnError(fn func(pgno uint32, inner error)) {
-	if fn == nil {
-		c.onError.Store(nil)
-		return
-	}
-	c.onError.Store(&fn)
-}
-
-func (c *cksumCodec) fireOnError(pgno uint32, inner error) {
-	if cb := c.onError.Load(); cb != nil {
-		(*cb)(pgno, inner)
-	}
-}
 
 // Encrypt copies src→dst and writes the XXH3-128 of dst[:len(src)-16]
 // into the trailing 16 bytes of dst.
@@ -111,7 +93,7 @@ func (c *cksumCodec) Decrypt(dst, src []byte, pgno uint32, _ *aeadScratch) ([]by
 	got.Lo = binary.LittleEndian.Uint64(src[bodyEnd : bodyEnd+8])
 	got.Hi = binary.LittleEndian.Uint64(src[bodyEnd+8 : bodyEnd+16])
 	if want != got {
-		c.fireOnError(pgno, ErrCodecTamper)
+		c.fire(pgno, ErrCodecTamper)
 		if c.VerifyOn() {
 			return nil, ErrCodecTamper
 		}

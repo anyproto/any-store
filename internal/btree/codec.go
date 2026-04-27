@@ -1,6 +1,9 @@
 package btree
 
-import "crypto/rand"
+import (
+	"crypto/rand"
+	"sync/atomic"
+)
 
 // Codec is the pluggable page-encryption interface. When a non-nil Codec is
 // installed on the pager, every file/WAL I/O site routes through it.
@@ -54,6 +57,38 @@ type aeadScratch struct {
 // modified in a way the codec cannot authenticate (wrong key, corruption,
 // or tampering).
 var ErrCodecTamper = codecError("encryption: page authentication failed")
+
+// OnErrorSink is implemented by codecs that support a per-page mismatch
+// callback. cksumCodec, aesCodec, and chachaCodec all implement it.
+// The callback fires whenever a page integrity check fails (XXH3-128
+// mismatch for cksum, AEAD auth fail for aes/chacha) and runs on the
+// I/O goroutine; it must not block.
+type OnErrorSink interface {
+	SetOnError(func(pgno uint32, inner error))
+}
+
+// onErrorField is the shared atomic-pointer field used by all codecs that
+// implement OnErrorSink. Embed it; do not duplicate the storage. Safe for
+// concurrent reads from any goroutine; SetOnError swaps atomically.
+type onErrorField struct {
+	cb atomic.Pointer[func(uint32, error)]
+}
+
+// SetOnError installs the callback. Pass nil to clear.
+func (f *onErrorField) SetOnError(fn func(pgno uint32, inner error)) {
+	if fn == nil {
+		f.cb.Store(nil)
+		return
+	}
+	f.cb.Store(&fn)
+}
+
+// fire invokes the callback if installed. No-op when none is set.
+func (f *onErrorField) fire(pgno uint32, inner error) {
+	if p := f.cb.Load(); p != nil {
+		(*p)(pgno, inner)
+	}
+}
 
 // codecError is a stdlib-free sentinel error type.
 type codecError string
