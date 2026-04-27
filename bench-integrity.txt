@@ -2,18 +2,53 @@ goos: darwin
 goarch: arm64
 pkg: github.com/anyproto/any-store
 cpu: Apple M2
+benchtime: 2s, count=2
 
-BenchmarkIntegrity_Insert_Plain-8       41227 ns/op
-BenchmarkIntegrity_Insert_Plain-8       41612 ns/op
-BenchmarkIntegrity_Insert_Cksum-8       43207 ns/op
-BenchmarkIntegrity_Insert_Cksum-8       39782 ns/op
-BenchmarkIntegrity_Insert_AES-8         43249 ns/op
-BenchmarkIntegrity_Insert_AES-8         55704 ns/op
-BenchmarkIntegrity_Insert_ChaCha-8      56736 ns/op
-BenchmarkIntegrity_Insert_ChaCha-8      61082 ns/op
+INSERTS (one 100-byte upsert per op, fresh DB)
+  BenchmarkIntegrity_Insert_Plain-8       38747 ns/op
+  BenchmarkIntegrity_Insert_Plain-8       38525 ns/op
+  BenchmarkIntegrity_Insert_Cksum-8       39001 ns/op
+  BenchmarkIntegrity_Insert_Cksum-8       38974 ns/op
+  BenchmarkIntegrity_Insert_AES-8         46378 ns/op
+  BenchmarkIntegrity_Insert_AES-8         40634 ns/op
+  BenchmarkIntegrity_Insert_ChaCha-8      49161 ns/op
+  BenchmarkIntegrity_Insert_ChaCha-8      50146 ns/op
 
-Summary (avg of 2 iters, single insert ~100 byte doc, fresh DB per bench):
-  Plain    41.4 µs/op   1.00x
-  Cksum    41.5 µs/op   1.00x   XXH3-128 effectively free
-  AES      49.5 µs/op   1.20x   AES-256-GCM (AES-NI on M2)
-  ChaCha   58.9 µs/op   1.42x   ChaCha20-Poly1305 (no asm hot-path on arm64 Go)
+  Mode      ns/op (avg)   relative   notes
+  Plain     38636         1.00x      baseline
+  Cksum     38988         1.01x      XXH3-128 within noise
+  AES       43506         1.13x      AES-256-GCM (AES-NI hardware path)
+  ChaCha    49654         1.29x      ChaCha20-Poly1305
+
+READS (full-table scan over 5000 rows, ns/op = one entire scan)
+  BenchmarkIntegrity_Read_Plain-8         470979 ns/op  10.62 Mrows/s
+  BenchmarkIntegrity_Read_Plain-8         479975 ns/op  10.42 Mrows/s
+  BenchmarkIntegrity_Read_Cksum-8         471006 ns/op  10.62 Mrows/s
+  BenchmarkIntegrity_Read_Cksum-8         474108 ns/op  10.55 Mrows/s
+  BenchmarkIntegrity_Read_AES-8           492291 ns/op  10.16 Mrows/s
+  BenchmarkIntegrity_Read_AES-8           504944 ns/op   9.90 Mrows/s
+  BenchmarkIntegrity_Read_ChaCha-8        475968 ns/op  10.50 Mrows/s
+  BenchmarkIntegrity_Read_ChaCha-8        512732 ns/op   9.75 Mrows/s
+
+  Mode      ns/op (avg)   Mrows/s   relative   notes
+  Plain     475477        10.52     1.00x      baseline
+  Cksum     472557        10.59     0.99x      effectively free
+  AES       498618        10.03     1.05x      ~5% scan overhead
+  ChaCha    494350        10.13     1.04x      ~4% scan overhead
+
+Methodology notes
+- Read bench seeds 5000 docs, closes the DB, reopens, then iterates the
+  entire collection per op. After the first iteration the per-connection
+  pcache is warm, so subsequent ops measure mostly cache-hit reads (codec
+  cost is paid on initial cache-fill, not per row). This reflects steady-
+  state behavior of a long-running DB.
+- Insert bench uses a fresh DB per b.N=1 dispatch; codec runs on every
+  page write that flushes through to WAL.
+- ChaCha20-Poly1305 has no AES-NI; on amd64/arm64 it goes through Go's
+  pure-software path. AES-GCM uses the AES-NI / ARMv8 crypto extensions.
+
+Bottom line
+- IntegrityChecksum is the right default for paranoid users: zero
+  measurable cost on reads, ~1% on writes, full corruption detection.
+- AEAD modes give cryptographic guarantees with a 5-30% perf cost
+  depending on operation mix and cipher choice.
