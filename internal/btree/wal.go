@@ -2202,6 +2202,50 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	return nil
 }
 
+// readFrameRaw reads frame `frame` into buf without invoking the codec.
+// For file-backed WALs that means the on-disk ciphertext-with-trailer
+// bytes; for in-memory WALs the bytes are already plaintext (no codec
+// is invoked on the in-memory write path either — see writeFramesMem).
+//
+// Used by the VerifyIntegrity sweep, which needs the post-Encrypt bytes
+// to verify the trailer (cksum) or attempt decrypt (AEAD). Concurrency
+// contract matches readFrame.
+func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
+	if frame == 0 {
+		return ErrWALCorrupt
+	}
+	nf := w.nFrame.Load()
+	if w.inMemory {
+		if frame > nf {
+			return ErrWALCorrupt
+		}
+		w.mu.RLock()
+		idx := frame - 1
+		if idx < uint32(len(w.memFrames)) {
+			copy(buf[:w.pageSize], w.memFrames[idx].data)
+			w.mu.RUnlock()
+			return nil
+		}
+		w.mu.RUnlock()
+		return ErrWALCorrupt
+	}
+	if w.inProcess && frame > nf {
+		return ErrWALCorrupt
+	}
+	if w.file == nil {
+		return ErrWALCorrupt
+	}
+	frameSize := int64(walFrameSize) + int64(w.pageSize)
+	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
+	if _, err := w.file.ReadAt(buf[:w.pageSize], offset); err != nil {
+		if frame > nf {
+			return ErrWALCorrupt
+		}
+		return err
+	}
+	return nil
+}
+
 // readFrame reads the page data for a given frame number.
 // For the file-based path, only an atomic load of nFrame is needed (WAL frames
 // on disk are immutable once written). For the memFrames path, RLock protects

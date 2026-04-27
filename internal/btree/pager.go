@@ -991,6 +991,44 @@ func (p *pager) getPageNoContent(pgno uint32) (*page, error) {
 	return pg, nil
 }
 
+// readRawPage returns the raw on-disk bytes of pgno without invoking the
+// codec. Used by the VerifyIntegrity sweep, which needs the post-codec-Encrypt
+// bytes to verify the trailer (cksum) or attempt decrypt (AEAD).
+//
+// Reads from the WAL when a frame for pgno exists at or below walMaxFrame,
+// otherwise from the main DB file. For the master-store (InMemory mode)
+// returns the raw stored bytes. Returns a fresh page-sized buffer; caller
+// owns it.
+//
+// Caller must hold a read lock (read transaction or equivalent) — same
+// concurrency contract as getPage.
+func (p *pager) readRawPage(pgno, walMaxFrame uint32) ([]byte, error) {
+	if pgno == 0 {
+		return nil, ErrInvalidPage
+	}
+	buf := make([]byte, p.pageSize)
+	if walMaxFrame > 0 && p.wal != nil {
+		if frame := p.wal.index.get(pgno, walMaxFrame); frame > 0 {
+			if err := p.wal.readFrameRaw(frame, buf); err == nil {
+				return buf, nil
+			}
+		}
+	}
+	if p.file != nil {
+		if err := p.readDBPage(pgno, buf); err != nil {
+			return nil, fmt.Errorf("btree: readRawPage: page %d: %w", pgno, err)
+		}
+		return buf, nil
+	}
+	if p.master != nil {
+		if !p.master.readPageInto(pgno, buf) {
+			return nil, fmt.Errorf("btree: readRawPage: page %d not in masterStore", pgno)
+		}
+		return buf, nil
+	}
+	return nil, fmt.Errorf("btree: readRawPage: no backing storage for page %d", pgno)
+}
+
 // getWritablePage returns a page ready for writing. It marks the page as dirty
 // and saves a copy for savepoint rollback if needed.
 func (p *pager) getWritablePage(pgno uint32) (*page, error) {
