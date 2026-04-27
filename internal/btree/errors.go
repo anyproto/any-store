@@ -82,4 +82,11 @@ var (
 	// size that differs from the page buffer pool's initialized size. All
 	// databases in a process must use the same page size.
 	ErrPageBufferPoolSizeMismatch = errors.New("btree: page buffer pool already initialized with a different page size")
+
+	// ErrIntegrityModeMismatch indicates Open was invoked with an integrity
+	// mode (Options.Checksum) that does not match the on-disk database
+	// state. Either the file uses page checksums and Options.Checksum was
+	// not set, or vice versa. Existing databases cannot have their integrity
+	// mode toggled in place — the file must be recreated.
+	ErrIntegrityModeMismatch = errors.New("btree: database integrity mode mismatch")
 )
