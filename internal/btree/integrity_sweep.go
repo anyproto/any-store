@@ -107,6 +107,11 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 		switch mode {
 		case IntegrityChecksum:
 			if e := verifyCksumPage(db.pager, pgno, maxFrame); e != nil {
+				// Fire the codec's OnError hook so subscribers see sweep
+				// mismatches the same way they see read-path mismatches.
+				if c := db.CksumCodec(); c != nil {
+					c.fire(pgno, ErrCodecTamper)
+				}
 				res.Errors = append(res.Errors, *e)
 			}
 		case IntegrityAEAD:

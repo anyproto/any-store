@@ -78,6 +78,28 @@ type DB interface {
 	// Close closes the database connection.
 	// Returns an error if there is an issue closing the connection.
 	Close() error
+
+	// IntegrityMode reports the page-level integrity mode of this database
+	// (none / checksum / AEAD).
+	IntegrityMode() IntegrityMode
+
+	// VerifyIntegrity walks every page and verifies its per-page integrity
+	// tag (XXH3-128 trailer for cksum mode, AEAD auth tag for encrypted mode).
+	// Plain DBs return IntegrityNone with zero pages scanned. Mismatches are
+	// returned in IntegrityReport.Errors; the function only errors on I/O or
+	// context cancellation. See IntegrityConfig.
+	VerifyIntegrity(ctx context.Context) (IntegrityReport, error)
+
+	// VerifyOnRead reports whether read-path integrity verification is
+	// currently enabled. Always true for AEAD-encrypted DBs (cannot be
+	// disabled). Always true for plain DBs (no-op).
+	VerifyOnRead() bool
+
+	// SetVerifyOnRead toggles read-path integrity verification at runtime.
+	// Mirror of SQLite's PRAGMA checksum_verification. Returns
+	// ErrAEADIntegrityVerifyMandatory if called with on=false on an
+	// AEAD-encrypted DB; returns ErrIntegrityVerifyUnsupported on plain DBs.
+	SetVerifyOnRead(on bool) error
 }
 
 // DBStats represents the statistics of the database.
@@ -137,6 +159,13 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		CipherType:            config.Encryption.CipherType,
 		Codec:                 config.Encryption.Codec,
 		MmapSize:              config.MmapSize,
+		Checksum:              config.Integrity.PageChecksums,
+	}
+	if cb := config.Integrity.OnError; cb != nil {
+		mode := integrityModeFromConfig(config)
+		opts.OnIntegrityError = func(pgno uint32, inner error) {
+			cb(integrityErrorFromInner(mode, pgno, inner))
+		}
 	}
 
 	var err error
@@ -145,6 +174,11 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 			return nil, ErrPageBufferNotInitialized
 		}
 		return nil, err
+	}
+	if config.Integrity.PageChecksums && config.Integrity.DisableVerifyOnRead {
+		if c := ds.btreeDB.CksumCodec(); c != nil {
+			c.SetVerify(false)
+		}
 	}
 
 	if err = ds.init(ctx); err != nil {
