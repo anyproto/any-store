@@ -7,43 +7,17 @@ import (
 	"github.com/anyproto/any-store/internal/btree"
 )
 
-// IntegrityConfig configures page-level integrity protection.
+// Page-level integrity is enabled automatically for non-encrypted databases:
+// every page carries an XXH3-128 trailer (16 bytes) that is verified on read.
+// Encrypted databases derive integrity from the cipher's AEAD authentication
+// tag instead. There is no opt-out — the cost is <1% on writes and effectively
+// zero on reads (see bench-integrity.txt).
 //
-// Two opt-in modes are supported, mutually exclusive with EncryptionConfig:
-//   - Plain (zero value): no integrity protection.
-//   - Checksum (PageChecksums=true): XXH3-128 trailer per page.
-//
-// When Encryption is enabled, page integrity is automatically provided by
-// the cipher's AEAD authentication tag (cryptographically authenticated).
-// The OnError callback below works in both checksum and encryption modes.
-//
-// Conceptually mirrors SQLite's cksumvfs extension
+// File state is authoritative on reopen: existing plain databases stay plain,
+// existing checksum databases auto-install the codec regardless of caller
+// configuration. Conceptually mirrors SQLite's cksumvfs extension
 // (https://sqlite.org/cksumvfs.html), generalized to also surface AEAD
-// authentication failures.
-type IntegrityConfig struct {
-	// PageChecksums enables the no-encryption checksum codec at Open
-	// time. Once a database is created with PageChecksums=true,
-	// subsequent opens must also set true (and vice versa). Mutually
-	// exclusive with EncryptionConfig.
-	PageChecksums bool
-
-	// OnError is invoked from the read path on every per-page integrity
-	// failure, regardless of which mode is active. Runs on the I/O
-	// goroutine; must not block. Use a buffered channel + drainer if
-	// you need retention.
-	OnError func(IntegrityError)
-
-	// DisableVerifyOnRead suppresses ErrCodecTamper on checksum
-	// mismatches at read time. Honored ONLY in PageChecksums mode.
-	// OnError still fires; the read just doesn't return an error.
-	// In Encryption mode this field is ignored — disabling AEAD
-	// verification would return attacker-controlled plaintext.
-	// Mirror of PRAGMA checksum_verification = OFF.
-	DisableVerifyOnRead bool
-}
-
-// Enabled reports whether this config will install a non-encryption codec.
-func (c IntegrityConfig) Enabled() bool { return c.PageChecksums }
+// authentication failures via VerifyIntegrity / IntegrityMode.
 
 // IntegrityErrorKind discriminates per-page failure types.
 type IntegrityErrorKind int
@@ -92,8 +66,8 @@ func VerifyPageChecksum(page []byte) bool {
 }
 
 // StampPageChecksumForTest writes a valid XXH3-128 trailer into the last
-// 16 bytes of `page`. Test/migration helper; production code goes through
-// Open with IntegrityConfig.PageChecksums = true.
+// 16 bytes of `page`. Test/migration helper; production code never calls
+// this directly — codec.Encrypt does it during normal page writes.
 func StampPageChecksumForTest(page []byte) {
 	btree.StampPageChecksum(page)
 }
@@ -105,34 +79,7 @@ var ErrAEADIntegrityVerifyMandatory = fmt.Errorf("anystore: cannot disable verif
 
 // ErrIntegrityVerifyUnsupported is returned by SetVerifyOnRead on a plain
 // database (no integrity mode installed).
-var ErrIntegrityVerifyUnsupported = fmt.Errorf("anystore: SetVerifyOnRead requires Integrity.PageChecksums=true or Encryption.Passphrase")
-
-// integrityErrorFromInner builds an IntegrityError from a btree-level
-// callback inner error and the current IntegrityMode. Used as the bridge
-// between btree's untyped callback signature and the public typed event.
-func integrityErrorFromInner(mode IntegrityMode, pgno uint32, inner error) IntegrityError {
-	kind := IntegrityKindUnknown
-	switch mode {
-	case IntegrityChecksum:
-		kind = IntegrityChecksumMismatch
-	case IntegrityAEAD:
-		kind = IntegrityAEADAuthFail
-	}
-	return IntegrityError{PageNo: pgno, Kind: kind, Inner: inner}
-}
-
-// integrityModeFromConfig returns the mode the codec will install given
-// the supplied config. Used at Open to size the kind discriminator on
-// the OnError adapter without inspecting the codec.
-func integrityModeFromConfig(cfg *Config) IntegrityMode {
-	if cfg.Encryption.Enabled() {
-		return IntegrityAEAD
-	}
-	if cfg.Integrity.PageChecksums {
-		return IntegrityChecksum
-	}
-	return IntegrityNone
-}
+var ErrIntegrityVerifyUnsupported = fmt.Errorf("anystore: SetVerifyOnRead requires checksum or encryption mode")
 
 // VerifyIntegrity walks every page in the database and verifies its
 // per-page integrity tag. For checksum-mode DBs this re-hashes the trailer;
@@ -145,7 +92,7 @@ func integrityModeFromConfig(cfg *Config) IntegrityMode {
 //	  FROM sqlite_dbpage
 //	 GROUP BY 2;
 //
-// against a cksumvfs-protected SQLite database, but works on AEAD-encrypted
+// against a cksumvfs-protected SQLite database, and works on AEAD-encrypted
 // databases too.
 //
 // Returns an error only on I/O failures or context cancellation. Per-page

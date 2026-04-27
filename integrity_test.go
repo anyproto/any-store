@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/anyproto/any-store/anyenc"
 )
@@ -65,11 +63,13 @@ func writeAndCloseIntegrityDB(t *testing.T, path string, cfg *Config) {
 	}
 }
 
-func TestIntegrity_Cksum_VerifyIntegrity_AllGood(t *testing.T) {
+// TestIntegrity_Default_IsChecksum verifies that anystore.Open with a
+// default config installs the cksum codec automatically (the user-level
+// expectation: "checksums are on, you don't need to ask").
+func TestIntegrity_Default_IsChecksum(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "db")
 	cfg := &Config{}
-	cfg.Integrity.PageChecksums = true
 	writeAndCloseIntegrityDB(t, path, cfg)
 
 	db, err := Open(context.Background(), path, cfg)
@@ -77,12 +77,12 @@ func TestIntegrity_Cksum_VerifyIntegrity_AllGood(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if db.IntegrityMode() != IntegrityChecksum {
+		t.Fatalf("Mode = %v, want IntegrityChecksum (default)", db.IntegrityMode())
+	}
 	rep, err := db.VerifyIntegrity(context.Background())
 	if err != nil {
 		t.Fatal(err)
-	}
-	if rep.Mode != IntegrityChecksum {
-		t.Fatalf("Mode = %v, want IntegrityChecksum", rep.Mode)
 	}
 	if rep.Pages == 0 {
 		t.Fatal("Pages = 0")
@@ -117,30 +117,9 @@ func TestIntegrity_AEAD_VerifyIntegrity_AllGood(t *testing.T) {
 	}
 }
 
-func TestIntegrity_Plain_VerifyIntegrity_NoMode(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "db")
-	cfg := &Config{}
-	writeAndCloseIntegrityDB(t, path, cfg)
-
-	db, err := Open(context.Background(), path, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	rep, err := db.VerifyIntegrity(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rep.Mode != IntegrityNone {
-		t.Fatalf("Mode = %v, want IntegrityNone", rep.Mode)
-	}
-}
-
 func TestIntegrity_SetVerifyOnRead_Cksum(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &Config{}
-	cfg.Integrity.PageChecksums = true
 	db, err := Open(context.Background(), filepath.Join(dir, "db"), cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -176,14 +155,16 @@ func TestIntegrity_SetVerifyOnRead_AEAD_Rejected(t *testing.T) {
 	}
 }
 
-func TestIntegrity_OnError_Cksum_FiresOnRead(t *testing.T) {
+// TestIntegrity_VerifyIntegrity_DetectsCorruption_Cksum: the sweep is the
+// public detection mechanism for cksum mode (no OnError config exposed at
+// the anystore level — users either call VerifyIntegrity periodically or
+// see ErrCodecTamper bubbling up from regular reads).
+func TestIntegrity_VerifyIntegrity_DetectsCorruption_Cksum(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "db")
 	cfg := &Config{}
-	cfg.Integrity.PageChecksums = true
 	writeAndCloseIntegrityDB(t, path, cfg)
 
-	// Corrupt page 2 on disk.
 	pageSize := int64(4096)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -194,54 +175,31 @@ func TestIntegrity_OnError_Cksum_FiresOnRead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var fired atomic.Uint32
-	cfg2 := &Config{}
-	cfg2.Integrity.PageChecksums = true
-	cfg2.Integrity.OnError = func(IntegrityError) { fired.Add(1) }
-
-	db, err := Open(context.Background(), path, cfg2)
+	db, err := Open(context.Background(), path, cfg)
 	if err != nil {
-		// Open may already trip the codec depending on what page-1 lookup
-		// triggers; that's fine — the callback fired.
-		if fired.Load() == 0 {
-			t.Fatalf("Open failed without firing OnError: %v", err)
-		}
-		return
+		t.Fatal(err)
 	}
 	defer db.Close()
-
-	// Sweep — fires OnError per-mismatch via the codec hook because the
-	// codec read path is what verifies on-disk pages.
 	rep, err := db.VerifyIntegrity(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(rep.Errors) == 0 {
-		t.Fatal("expected at least one mismatch")
+		t.Fatal("expected at least one cksum mismatch")
 	}
-	// OnError fires from cksumCodec.Decrypt at read time, not from the
-	// sweep's direct trailer recomputation. Trigger a normal read of the
-	// corrupted page so the codec hook fires.
-	rtx, err := db.ReadTx(context.Background())
-	if err != nil {
-		// rolling forward to a read may itself trip the codec; if it did,
-		// the callback fired.
-		if fired.Load() > 0 {
-			return
+	saw := false
+	for _, e := range rep.Errors {
+		if e.Kind == IntegrityChecksumMismatch && e.PageNo == 2 {
+			saw = true
+			break
 		}
-		t.Fatalf("ReadTx: %v", err)
 	}
-	_ = rtx.Commit()
-	// Some implementations only fire on actual data reads; do a brief
-	// sleep to let any pending callbacks settle (callbacks are sync
-	// in our impl, so this is just defensive).
-	time.Sleep(10 * time.Millisecond)
-	if fired.Load() == 0 {
-		t.Fatal("OnError did not fire for cksum mismatch")
+	if !saw {
+		t.Fatalf("want IntegrityChecksumMismatch on page 2; got %+v", rep.Errors)
 	}
 }
 
-func TestIntegrity_OnError_AEAD_FiresOnRead(t *testing.T) {
+func TestIntegrity_VerifyIntegrity_DetectsCorruption_AEAD(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "db")
 	cfg := &Config{}
@@ -259,23 +217,11 @@ func TestIntegrity_OnError_AEAD_FiresOnRead(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var fired atomic.Uint32
-	cfg2 := &Config{}
-	cfg2.Encryption.Passphrase = []byte("p")
-	cfg2.Encryption.KDFIterations = 1000
-	cfg2.Integrity.OnError = func(IntegrityError) { fired.Add(1) }
-
-	db, err := Open(context.Background(), path, cfg2)
+	db, err := Open(context.Background(), path, cfg)
 	if err != nil {
-		if fired.Load() == 0 {
-			t.Fatalf("Open failed without firing OnError: %v", err)
-		}
-		return
+		t.Fatal(err)
 	}
 	defer db.Close()
-
-	// VerifyIntegrity on AEAD goes through decryptPageWithCodec which
-	// fires OnError before returning ErrCodecTamper.
 	rep, err := db.VerifyIntegrity(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -283,7 +229,14 @@ func TestIntegrity_OnError_AEAD_FiresOnRead(t *testing.T) {
 	if len(rep.Errors) == 0 {
 		t.Fatal("expected at least one AEAD auth fail")
 	}
-	if fired.Load() == 0 {
-		t.Fatal("OnError did not fire for AEAD failure")
+	saw := false
+	for _, e := range rep.Errors {
+		if e.Kind == IntegrityAEADAuthFail && e.PageNo == 2 {
+			saw = true
+			break
+		}
+	}
+	if !saw {
+		t.Fatalf("want IntegrityAEADAuthFail on page 2; got %+v", rep.Errors)
 	}
 }

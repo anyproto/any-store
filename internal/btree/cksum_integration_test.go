@@ -2,7 +2,6 @@ package btree
 
 import (
 	"bytes"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,30 +27,51 @@ func TestCksum_OpenCreate_SetsReservedSpace(t *testing.T) {
 	_ = db.Close()
 }
 
-func TestCksum_Reopen_DetectsModeMismatch(t *testing.T) {
+// TestCksum_Reopen_FileStateAuthoritative verifies the simplified Open
+// contract: the file's on-disk state determines codec mode regardless of
+// Options.Checksum at reopen. A cksum DB always reopens with the codec
+// installed; a plain DB always reopens plain. No "mismatch" errors —
+// callers can't accidentally upgrade or downgrade an existing DB via
+// config drift.
+func TestCksum_Reopen_FileStateAuthoritative(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "db")
+	cksPath := filepath.Join(dir, "cksum.db")
+	plainPath := filepath.Join(dir, "plain.db")
 
 	opts := DefaultOptions()
 	opts.Checksum = true
-	db, err := Open(path,opts)
+	db, err := Open(cksPath, opts)
 	if err != nil {
-		t.Fatalf("Open create: %v", err)
+		t.Fatalf("Open cksum create: %v", err)
 	}
 	_ = db.Close()
 
-	plainOpts := DefaultOptions()
-	if _, err := Open(path,plainOpts); err == nil {
-		t.Fatal("expected error reopening checksum DB without Checksum=true")
-	} else if !errors.Is(err, ErrIntegrityModeMismatch) {
-		t.Fatalf("want ErrIntegrityModeMismatch, got %v", err)
-	}
-
-	db2, err := Open(path,opts)
+	// Reopen cksum DB without Options.Checksum — codec must auto-install.
+	db2, err := Open(cksPath, DefaultOptions())
 	if err != nil {
-		t.Fatalf("Open reopen: %v", err)
+		t.Fatalf("reopen cksum without Checksum: %v", err)
+	}
+	if db2.IntegrityMode() != IntegrityChecksum {
+		t.Fatalf("auto-detect failed: mode = %v, want IntegrityChecksum", db2.IntegrityMode())
 	}
 	_ = db2.Close()
+
+	// Plain DB.
+	db3, err := Open(plainPath, DefaultOptions())
+	if err != nil {
+		t.Fatalf("Open plain: %v", err)
+	}
+	_ = db3.Close()
+
+	// Reopen plain with Options.Checksum=true — must NOT upgrade; stays plain.
+	db4, err := Open(plainPath, opts)
+	if err != nil {
+		t.Fatalf("reopen plain with Checksum: %v", err)
+	}
+	if db4.IntegrityMode() != IntegrityNone {
+		t.Fatalf("should not upgrade plain DB: mode = %v, want IntegrityNone", db4.IntegrityMode())
+	}
+	_ = db4.Close()
 }
 
 func TestCksum_CannotCombineWithEncryption(t *testing.T) {
@@ -60,31 +80,10 @@ func TestCksum_CannotCombineWithEncryption(t *testing.T) {
 	opts := DefaultOptions()
 	opts.Checksum = true
 	opts.Key = []byte("passphrase")
-	if _, err := Open(path,opts); err == nil {
+	if _, err := Open(path, opts); err == nil {
 		t.Fatal("expected error: Checksum + Key both set")
 	} else if !strings.Contains(err.Error(), "cannot be combined") {
 		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestCksum_CannotEnableOnExistingPlainDB(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "db")
-	plain := DefaultOptions()
-	db, err := Open(path,plain)
-	if err != nil {
-		t.Fatalf("create plain: %v", err)
-	}
-	_ = db.Close()
-
-	cksOpts := DefaultOptions()
-	cksOpts.Checksum = true
-	_, err = Open(path, cksOpts)
-	if err == nil {
-		t.Fatal("expected ErrIntegrityModeMismatch enabling cksum on existing plain DB")
-	}
-	if !errors.Is(err, ErrIntegrityModeMismatch) {
-		t.Fatalf("want ErrIntegrityModeMismatch, got %v", err)
 	}
 }
 

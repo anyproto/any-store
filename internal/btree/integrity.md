@@ -79,27 +79,46 @@ ignores those.
 
 ## Activation & migration
 
-- New DB created with `Options.Checksum = true`: trailer-bearing
-  layout from page 1 onward.
-- Existing plain DB → reopened with `Options.Checksum = true`:
-  rejected with `ErrIntegrityModeMismatch`. Reserve-bytes can only be
-  increased on a freshly-created file (same constraint cksumvfs has;
-  cksumvfs's solution is `VACUUM`, which any-store doesn't have).
-- Existing checksum DB → reopened without `Checksum=true`: rejected.
+The btree level still exposes `Options.Checksum` as a boolean knob (used
+for tests and direct callers); the **anystore wrapper sets it
+automatically** for every new non-encrypted DB. There is no opt-out at
+the public API level.
+
+File state is authoritative on reopen:
+
+- New DB + `Options.Checksum = true`: trailer-bearing layout, codec
+  installed.
+- New DB + `Options.Checksum = false`: plain (only reachable via the
+  btree API, not anystore).
+- Existing checksum DB (file has `ReservedSpace=16`): codec
+  auto-installed regardless of `Options.Checksum`.
+- Existing plain DB (file has `ReservedSpace=0`): plain regardless of
+  `Options.Checksum`. No upgrade-on-reopen.
 - Combining `Checksum + Key` / `Checksum + Codec`: rejected at
   `buildCodec` (mutually exclusive with encryption).
+
+This file-state-authoritative contract is what lets us turn checksums
+on by default without breaking existing databases or requiring a
+migration step. Cksumvfs's `VACUUM` workaround is unnecessary here —
+plain DBs simply stay plain.
 
 ## Runtime API mapping
 
 | SQLite cksumvfs | any-store equivalent |
 |---|---|
-| `PRAGMA file_control reserve_bytes 8; VACUUM` | `Config.Integrity.PageChecksums = true` at create |
+| `PRAGMA file_control reserve_bytes 8; VACUUM` | (none — automatic on every new non-encrypted DB) |
 | `PRAGMA checksum_verification` (query) | `(*DB).VerifyOnRead() bool` |
 | `PRAGMA checksum_verification = ON/OFF` | `(*DB).SetVerifyOnRead(bool) error` |
 | `SELECT count(*), verify_checksum(data) FROM sqlite_dbpage GROUP BY 2` | `(*DB).VerifyIntegrity(ctx) (IntegrityReport, error)` |
 | `verify_checksum(BLOB)` SQL function | `anystore.VerifyPageChecksum([]byte) bool` |
 | auto-enable on open with reserve_bytes==8 | automatic: `IntegrityMode()` reports state, verify is on by default |
-| `SQLITE_IOERR_DATA` on read | `ErrCodecTamper` returned + `IntegrityConfig.OnError` callback |
+| `SQLITE_IOERR_DATA` on read | `ErrCodecTamper` returned to the caller of the failed read |
+
+Direct btree callers can still subscribe to per-page failures via
+`btree.Options.OnIntegrityError` (a uniform hook fired by all codecs
+that implement `OnErrorSink`). It's not exposed at the anystore level
+to keep the public surface minimal — the sweep API and read-path errors
+cover the common observability needs.
 
 ## Why `SetVerifyOnRead(false)` is rejected on AEAD
 

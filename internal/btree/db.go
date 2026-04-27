@@ -196,15 +196,19 @@ func DefaultOptions() Options {
 //   - Options.Key set with any other non-zero length: treated as a passphrase,
 //     derived via PBKDF2 using the supplied salt and KDFIterations.
 //   - Options.Key set with length 0: rejected.
-func buildCodec(opts Options, salt []byte) (Codec, error) {
+// buildCodec constructs the Codec for the resolved mode. `useCksum` is the
+// caller's effective checksum decision (file-state-authoritative on reopen,
+// opts.Checksum on new DBs). buildCodec rejects combining checksum mode with
+// explicit AEAD configuration, but is otherwise mechanical.
+func buildCodec(opts Options, salt []byte, useCksum bool) (Codec, error) {
 	if opts.Codec != nil {
-		if opts.Checksum {
+		if useCksum {
 			return nil, fmt.Errorf("btree: Options.Checksum cannot be combined with Options.Codec")
 		}
 		return opts.Codec, nil
 	}
 	if opts.Key != nil {
-		if opts.Checksum {
+		if useCksum {
 			return nil, fmt.Errorf("btree: Options.Checksum cannot be combined with Options.Key")
 		}
 		if len(opts.Key) == 0 {
@@ -218,7 +222,7 @@ func buildCodec(opts Options, salt []byte) (Codec, error) {
 		}
 		return newCodecFromType(opts.CipherType, raw)
 	}
-	if opts.Checksum {
+	if useCksum {
 		return newCksumCodec(), nil
 	}
 	return nil, nil
@@ -413,8 +417,13 @@ func Open(path string, opts Options) (*DB, error) {
 	// openDBs above blocks same-process double-open. A future hardening
 	// could hold a shared lock across readInitialHeader and p.open().
 	wantEncryption := opts.Key != nil || opts.Codec != nil
-	wantCodec := wantEncryption || opts.Checksum
 	var zeroSalt [SaltLen]byte
+	// Resolve effective codec mode. Encryption is opt-in (errors if it
+	// doesn't match the file). Checksum is auto-detected from the file's
+	// ReservedSpace marker on existing DBs and honored from Options.Checksum
+	// on new DBs — file state is authoritative on reopen, so users can't
+	// accidentally upgrade or downgrade a live database via config drift.
+	useCksum := false
 	if !opts.InMemory {
 		existingHeader, herr := readInitialHeader(path)
 		fileExists := herr == nil
@@ -424,21 +433,20 @@ func Open(path string, opts Options) (*DB, error) {
 		if fileExists {
 			fileEncrypted := existingHeader.Salt != zeroSalt
 			// Checksum-mode marker: zero salt + ReservedSpace == cksumOverhead (16).
-			// Any other non-zero ReservedSpace is left to higher-level integrity
-			// validation (e.g. tests that synthesize off-page cells via custom
-			// reserved-space values). Open does not attempt to interpret it.
+			// Any other non-zero ReservedSpace is left to higher-level
+			// integrity validation (e.g. tests synthesizing off-page cells).
 			fileCksum := !fileEncrypted && existingHeader.ReservedSpace == cksumOverhead
 			switch {
 			case fileEncrypted && !wantEncryption:
 				return nil, fmt.Errorf("btree: database file is encrypted, Options.Key or Options.Codec required")
 			case !fileEncrypted && wantEncryption:
 				return nil, fmt.Errorf("btree: database file is not encrypted, remove Options.Key/Codec")
-			case fileCksum && !opts.Checksum:
-				return nil, fmt.Errorf("%w: file uses page checksums, Options.Checksum=true required", ErrIntegrityModeMismatch)
-			case !fileCksum && opts.Checksum && !fileEncrypted:
-				return nil, fmt.Errorf("%w: file is plain (no checksums), cannot enable Options.Checksum on existing DB without rewrite", ErrIntegrityModeMismatch)
 			}
+			useCksum = fileCksum
+		} else {
+			useCksum = opts.Checksum
 		}
+		wantCodec := wantEncryption || useCksum
 		if wantCodec {
 			var salt [SaltLen]byte
 			if fileExists {
@@ -448,7 +456,7 @@ func Open(path string, opts Options) (*DB, error) {
 					return nil, fmt.Errorf("btree: generate salt: %w", err)
 				}
 			}
-			codec, cerr := buildCodec(opts, salt[:])
+			codec, cerr := buildCodec(opts, salt[:], useCksum)
 			if cerr != nil {
 				return nil, cerr
 			}
@@ -458,10 +466,10 @@ func Open(path string, opts Options) (*DB, error) {
 			p.header.Salt = salt
 			p.installCodec(codec)
 		}
-	} else if opts.InMemory && wantCodec {
+	} else if opts.InMemory && (wantEncryption || opts.Checksum) {
 		// InMemory: build codec from zero salt; no on-disk marker.
 		var salt [SaltLen]byte
-		codec, cerr := buildCodec(opts, salt[:])
+		codec, cerr := buildCodec(opts, salt[:], opts.Checksum)
 		if cerr != nil {
 			return nil, cerr
 		}

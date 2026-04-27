@@ -101,12 +101,6 @@ type Config struct {
 	// Encryption, when non-empty, enables page-level AES-256-GCM encryption
 	// of the on-disk database file. Zero value means no encryption.
 	Encryption EncryptionConfig
-
-	// Integrity configures page-level integrity verification. Mutually
-	// exclusive with Encryption (encrypted DBs already AEAD-authenticate
-	// every page; the OnError callback below works for both modes).
-	// See IntegrityConfig.
-	Integrity IntegrityConfig
 }
 
 // EncryptionConfig enables page-level encryption of the database file.

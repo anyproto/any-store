@@ -115,29 +115,33 @@ db.Flush(ctx, 100*time.Millisecond, anystore.FlushModeCheckpointPassive)
 
 ## Integrity
 
-Any Store can stamp a per-page hash trailer on every page (XXH3-128, 16 bytes) and verify it on read — analogous to SQLite's
-[`cksumvfs`](https://sqlite.org/cksumvfs.html). Mutually exclusive with `Encryption` (AEAD modes already authenticate every page; the
-same `OnError` callback fires for both).
+Every non-encrypted Any Store database carries an XXH3-128 page-trailer
+checksum (16 bytes/page) by default — corruption is caught on read.
+There is no opt-out; the cost is <1% on writes and effectively zero on
+reads (see [`bench-integrity.txt`](bench-integrity.txt)). Encrypted
+databases derive integrity from the cipher's AEAD authentication tag
+instead. File state is authoritative on reopen — existing plain
+databases stay plain, existing checksum databases auto-install the
+codec regardless of caller config.
+
+Conceptually mirrors SQLite's [`cksumvfs`](https://sqlite.org/cksumvfs.html),
+generalized to also surface AEAD failures via the same API.
 
 ```go
-db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
-    Integrity: anystore.IntegrityConfig{
-        PageChecksums: true,                // stamp + verify XXH3-128 per page
-        OnError: func(e anystore.IntegrityError) {
-            log.Printf("integrity: page %d %v: %v", e.PageNo, e.Kind, e.Inner)
-        },
-    },
-})
+db, _ := anystore.Open(ctx, "data.db", nil)
+// db now has IntegrityChecksum mode automatically.
 
 // Walk every page and report mismatches (works in encrypted mode too).
 rep, _ := db.VerifyIntegrity(ctx)
 fmt.Printf("scanned %d pages, %d errors\n", rep.Pages, len(rep.Errors))
 
-// Forensic mode: stop erroring on read mismatches but keep firing OnError.
+// Forensic mode: stop erroring on read mismatches (cksum mode only).
 _ = db.SetVerifyOnRead(false) // returns ErrAEADIntegrityVerifyMandatory in AEAD mode
 ```
 
-Page-1 DB header (first 100 bytes) is not covered by the per-page hash; SQLite-format invariants there are validated separately at open. See [internal/btree/integrity.md](internal/btree/integrity.md) for the full design.
+Page-1 DB header (first 100 bytes) is not covered by the per-page hash;
+SQLite-format invariants there are validated separately at open.
+See [internal/btree/integrity.md](internal/btree/integrity.md) for the full design.
 
 
 ## Contributing

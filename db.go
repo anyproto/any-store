@@ -145,6 +145,12 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	if cacheSize <= 0 {
 		cacheSize = 5000
 	}
+	// Page-level integrity is on by default for non-encrypted databases.
+	// XXH3-128 trailer per page costs <1% on writes and is invisible on
+	// reads (see bench-integrity.txt). Encrypted databases get stronger
+	// integrity from the cipher's AEAD tag, so the cksum codec is skipped
+	// there. File-state is authoritative on reopen — existing plain DBs
+	// stay plain regardless of this default.
 	opts := btree.Options{
 		PageSize:              4096,
 		CacheSize:             cacheSize,
@@ -159,13 +165,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		CipherType:            config.Encryption.CipherType,
 		Codec:                 config.Encryption.Codec,
 		MmapSize:              config.MmapSize,
-		Checksum:              config.Integrity.PageChecksums,
-	}
-	if cb := config.Integrity.OnError; cb != nil {
-		mode := integrityModeFromConfig(config)
-		opts.OnIntegrityError = func(pgno uint32, inner error) {
-			cb(integrityErrorFromInner(mode, pgno, inner))
-		}
+		Checksum:              !config.Encryption.Enabled() && !config.InMemory,
 	}
 
 	var err error
@@ -174,11 +174,6 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 			return nil, ErrPageBufferNotInitialized
 		}
 		return nil, err
-	}
-	if config.Integrity.PageChecksums && config.Integrity.DisableVerifyOnRead {
-		if c := ds.btreeDB.CksumCodec(); c != nil {
-			c.SetVerify(false)
-		}
 	}
 
 	if err = ds.init(ctx); err != nil {

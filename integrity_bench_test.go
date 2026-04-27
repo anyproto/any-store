@@ -34,20 +34,15 @@ func benchInsert(b *testing.B, cfg *Config) {
 	}
 }
 
-// BenchmarkIntegrity_Insert_Plain   — baseline, no codec.
-// BenchmarkIntegrity_Insert_Cksum   — XXH3-128 trailer per page.
-// BenchmarkIntegrity_Insert_AES     — AES-256-GCM (existing).
-// BenchmarkIntegrity_Insert_ChaCha  — ChaCha20-Poly1305 (existing).
+// BenchmarkIntegrity_Insert_Default — &Config{} → XXH3-128 trailer per page
+//                                     (the default since checksums are on
+//                                     for non-encrypted DBs).
+// BenchmarkIntegrity_Insert_AES     — AES-256-GCM.
+// BenchmarkIntegrity_Insert_ChaCha  — ChaCha20-Poly1305.
 //
 // Run with: go test -bench BenchmarkIntegrity_Insert_ -benchtime=2s -count=3 .
-func BenchmarkIntegrity_Insert_Plain(b *testing.B) {
+func BenchmarkIntegrity_Insert_Default(b *testing.B) {
 	benchInsert(b, &Config{})
-}
-
-func BenchmarkIntegrity_Insert_Cksum(b *testing.B) {
-	cfg := &Config{}
-	cfg.Integrity.PageChecksums = true
-	benchInsert(b, cfg)
 }
 
 func BenchmarkIntegrity_Insert_AES(b *testing.B) {
@@ -128,14 +123,8 @@ func benchRead(b *testing.B, cfg *Config) {
 
 // BenchmarkIntegrity_Read_*: full-table scans over a pre-loaded fixture DB.
 // Run with: go test -bench BenchmarkIntegrity_Read_ -benchtime=2s -count=3 .
-func BenchmarkIntegrity_Read_Plain(b *testing.B) {
+func BenchmarkIntegrity_Read_Default(b *testing.B) {
 	benchRead(b, &Config{})
-}
-
-func BenchmarkIntegrity_Read_Cksum(b *testing.B) {
-	cfg := &Config{}
-	cfg.Integrity.PageChecksums = true
-	benchRead(b, cfg)
 }
 
 func BenchmarkIntegrity_Read_AES(b *testing.B) {
