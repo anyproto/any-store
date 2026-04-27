@@ -1,7 +1,9 @@
 package btree
 
 import (
+	"bytes"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -77,11 +79,95 @@ func TestCksum_CannotEnableOnExistingPlainDB(t *testing.T) {
 
 	cksOpts := DefaultOptions()
 	cksOpts.Checksum = true
-	_, err = Open(path,cksOpts)
+	_, err = Open(path, cksOpts)
 	if err == nil {
 		t.Fatal("expected ErrIntegrityModeMismatch enabling cksum on existing plain DB")
 	}
 	if !errors.Is(err, ErrIntegrityModeMismatch) {
 		t.Fatalf("want ErrIntegrityModeMismatch, got %v", err)
+	}
+}
+
+// TestCksum_TamperDetected mirrors TestEncryption_TamperDetected: write data,
+// close, flip a body byte on disk, reopen and read — checksum mismatch must
+// surface as an error. Modeled on encryption_integration_test.go:344-426.
+func TestCksum_TamperDetected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tamper.db")
+	opts := DefaultOptions()
+	opts.Checksum = true
+	opts.InProcess = true
+
+	db, err := Open(path, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wtx, err := db.BeginWrite()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns, err := wtx.CreateNamespace("x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		k := []byte{byte(i)}
+		v := bytes.Repeat([]byte{byte(i)}, 100)
+		if err := wtx.Put(ns, k, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := wtx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Checkpoint(CheckpointFull); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Flip a byte well past the page-1 plaintext header.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) < int(opts.PageSize)+200 {
+		t.Fatalf("file too small: %d bytes", len(data))
+	}
+	off := int(opts.PageSize) + 200 // somewhere in page 2's body
+	data[off] ^= 0x01
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen and read. The codec MUST surface an error on the page that
+	// was tampered. We don't constrain where exactly — open, begin-read,
+	// or the first Get touching page 2 are all acceptable.
+	db2, err := Open(path, opts)
+	if err != nil {
+		return
+	}
+	defer db2.Close()
+
+	rtx, err := db2.BeginRead()
+	if err != nil {
+		return
+	}
+	defer rtx.Rollback()
+
+	ns2, err := db2.GetNamespace("x")
+	if err != nil {
+		return
+	}
+	sawError := false
+	for i := 0; i < 50; i++ {
+		k := []byte{byte(i)}
+		if _, err := rtx.Get(ns2, k); err != nil {
+			sawError = true
+		}
+	}
+	if !sawError {
+		t.Fatal("no error observed after tampering page 2 body")
 	}
 }
