@@ -113,6 +113,33 @@ db.Flush(ctx, 100*time.Millisecond, anystore.FlushModeCheckpointPassive)
 **Sentinel:** When enabled, creates a `.lock` file to detect not explicitly persisted writes and run integrity check on open.
 
 
+## Integrity
+
+Any Store can stamp a per-page hash trailer on every page (XXH3-128, 16 bytes) and verify it on read — analogous to SQLite's
+[`cksumvfs`](https://sqlite.org/cksumvfs.html). Mutually exclusive with `Encryption` (AEAD modes already authenticate every page; the
+same `OnError` callback fires for both).
+
+```go
+db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
+    Integrity: anystore.IntegrityConfig{
+        PageChecksums: true,                // stamp + verify XXH3-128 per page
+        OnError: func(e anystore.IntegrityError) {
+            log.Printf("integrity: page %d %v: %v", e.PageNo, e.Kind, e.Inner)
+        },
+    },
+})
+
+// Walk every page and report mismatches (works in encrypted mode too).
+rep, _ := db.VerifyIntegrity(ctx)
+fmt.Printf("scanned %d pages, %d errors\n", rep.Pages, len(rep.Errors))
+
+// Forensic mode: stop erroring on read mismatches but keep firing OnError.
+_ = db.SetVerifyOnRead(false) // returns ErrAEADIntegrityVerifyMandatory in AEAD mode
+```
+
+Page-1 DB header (first 100 bytes) is not covered by the per-page hash; SQLite-format invariants there are validated separately at open. See [internal/btree/integrity.md](internal/btree/integrity.md) for the full design.
+
+
 ## Contributing
 
 1. Fork & clone
