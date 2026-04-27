@@ -1,0 +1,19 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/anyproto/any-store
+cpu: Apple M2
+
+BenchmarkIntegrity_Insert_Plain-8       41227 ns/op
+BenchmarkIntegrity_Insert_Plain-8       41612 ns/op
+BenchmarkIntegrity_Insert_Cksum-8       43207 ns/op
+BenchmarkIntegrity_Insert_Cksum-8       39782 ns/op
+BenchmarkIntegrity_Insert_AES-8         43249 ns/op
+BenchmarkIntegrity_Insert_AES-8         55704 ns/op
+BenchmarkIntegrity_Insert_ChaCha-8      56736 ns/op
+BenchmarkIntegrity_Insert_ChaCha-8      61082 ns/op
+
+Summary (avg of 2 iters, single insert ~100 byte doc, fresh DB per bench):
+  Plain    41.4 µs/op   1.00x
+  Cksum    41.5 µs/op   1.00x   XXH3-128 effectively free
+  AES      49.5 µs/op   1.20x   AES-256-GCM (AES-NI on M2)
+  ChaCha   58.9 µs/op   1.42x   ChaCha20-Poly1305 (no asm hot-path on arm64 Go)
