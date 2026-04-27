@@ -167,6 +167,19 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		MmapSize:              config.MmapSize,
 		Checksum:              !config.Encryption.Enabled() && !config.InMemory,
 	}
+	if cb := config.OnIntegrityError; cb != nil {
+		// Determine the kind discriminator at Open time. The actual codec
+		// won't have been installed yet, so we compute mode from config:
+		// encrypted → AEAD, otherwise → checksum (the cksum codec is the
+		// only non-AEAD codec we install). InMemory has no on-disk codec.
+		kind := IntegrityChecksumMismatch
+		if config.Encryption.Enabled() {
+			kind = IntegrityAEADAuthFail
+		}
+		opts.OnIntegrityError = func(pgno uint32, inner error) {
+			cb(IntegrityError{PageNo: pgno, Kind: kind, Inner: inner})
+		}
+	}
 
 	var err error
 	if ds.btreeDB, err = btree.Open(path, opts); err != nil {

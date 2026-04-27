@@ -128,7 +128,13 @@ Conceptually mirrors SQLite's [`cksumvfs`](https://sqlite.org/cksumvfs.html),
 generalized to also surface AEAD failures via the same API.
 
 ```go
-db, _ := anystore.Open(ctx, "data.db", nil)
+db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
+    // Wire monitoring at Open time so failures during the first page-1
+    // read (which happens inside Open) are observable.
+    OnIntegrityError: func(e anystore.IntegrityError) {
+        log.Printf("integrity: page %d %v: %v", e.PageNo, e.Kind, e.Inner)
+    },
+})
 // db now has IntegrityChecksum mode automatically.
 
 // Walk every page and report mismatches (works in encrypted mode too).

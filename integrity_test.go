@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/anyproto/any-store/anyenc"
@@ -152,6 +153,100 @@ func TestIntegrity_SetVerifyOnRead_AEAD_Rejected(t *testing.T) {
 	}
 	if err != ErrAEADIntegrityVerifyMandatory {
 		t.Fatalf("want ErrAEADIntegrityVerifyMandatory, got %v", err)
+	}
+}
+
+// TestIntegrity_OnIntegrityError_Cksum_FiresOnSweep verifies that a
+// callback wired at Config.OnIntegrityError observes integrity failures
+// discovered by VerifyIntegrity. Mirrors the production wiring path:
+// callers configure the hook at Open time, never afterward.
+func TestIntegrity_OnIntegrityError_Cksum_FiresOnSweep(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "db")
+	writeAndCloseIntegrityDB(t, path, &Config{})
+
+	pageSize := int64(4096)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[pageSize+200] ^= 0x01
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var fired atomic.Uint32
+	var lastPgno atomic.Uint32
+	var lastKind atomic.Int32
+	cfg := &Config{
+		OnIntegrityError: func(e IntegrityError) {
+			fired.Add(1)
+			lastPgno.Store(e.PageNo)
+			lastKind.Store(int32(e.Kind))
+		},
+	}
+	db, err := Open(context.Background(), path, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.VerifyIntegrity(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fired.Load() == 0 {
+		t.Fatal("OnIntegrityError did not fire on cksum mismatch")
+	}
+	if lastPgno.Load() != 2 {
+		t.Fatalf("lastPgno = %d, want 2", lastPgno.Load())
+	}
+	if IntegrityErrorKind(lastKind.Load()) != IntegrityChecksumMismatch {
+		t.Fatalf("lastKind = %v, want IntegrityChecksumMismatch", lastKind.Load())
+	}
+}
+
+// TestIntegrity_OnIntegrityError_AEAD_FiresOnSweep verifies the same wiring
+// works for AEAD-encrypted databases — kind discriminator is set correctly
+// based on config.
+func TestIntegrity_OnIntegrityError_AEAD_FiresOnSweep(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "db")
+	encCfg := &Config{}
+	encCfg.Encryption.Passphrase = []byte("p")
+	encCfg.Encryption.KDFIterations = 1000
+	writeAndCloseIntegrityDB(t, path, encCfg)
+
+	pageSize := int64(4096)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[pageSize+200] ^= 0x01
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	var fired atomic.Uint32
+	var lastKind atomic.Int32
+	cfg := &Config{}
+	cfg.Encryption.Passphrase = []byte("p")
+	cfg.Encryption.KDFIterations = 1000
+	cfg.OnIntegrityError = func(e IntegrityError) {
+		fired.Add(1)
+		lastKind.Store(int32(e.Kind))
+	}
+	db, err := Open(context.Background(), path, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.VerifyIntegrity(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fired.Load() == 0 {
+		t.Fatal("OnIntegrityError did not fire on AEAD failure")
+	}
+	if IntegrityErrorKind(lastKind.Load()) != IntegrityAEADAuthFail {
+		t.Fatalf("lastKind = %v, want IntegrityAEADAuthFail", lastKind.Load())
 	}
 }
 

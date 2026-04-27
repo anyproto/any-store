@@ -101,6 +101,21 @@ type Config struct {
 	// Encryption, when non-empty, enables page-level AES-256-GCM encryption
 	// of the on-disk database file. Zero value means no encryption.
 	Encryption EncryptionConfig
+
+	// OnIntegrityError, when non-nil, is invoked from the read path on
+	// every per-page integrity failure (XXH3 trailer mismatch in cksum
+	// mode, AEAD auth-tag failure in encryption mode). Plain databases
+	// never fire it.
+	//
+	// The callback runs synchronously on the I/O goroutine and must not
+	// block. Push to a buffered channel + drain elsewhere if you need
+	// retention or cross-thread delivery.
+	//
+	// Set this at Open time so failures discovered during the first
+	// page-1 read (which happens inside Open) are observable. There is
+	// no post-Open setter — the codebase favors config-at-Open over
+	// runtime mutation.
+	OnIntegrityError func(IntegrityError)
 }
 
 // EncryptionConfig enables page-level encryption of the database file.
