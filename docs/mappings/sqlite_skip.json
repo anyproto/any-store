@@ -1,0 +1,1818 @@
+[
+  {
+    "group": "shared_cache",
+    "category": "feature-not-ported",
+    "reason": "any-store has no shared-cache mode; WAL + per-connection pcache provide multi-reader concurrency without BtShared locking, sharing-list bookkeeping, or the enable_shared_cache global.",
+    "funcs": [
+      {
+        "file": "btree.c",
+        "func": "clearAllSharedCacheTableLocks"
+      },
+      {
+        "file": "btree.c",
+        "func": "cursorHoldsMutex",
+        "reason": "shared-cache mutex assertion helper; any-store serializes via writerOpMu + per-connection caches, so the invariant is trivially satisfied."
+      },
+      {
+        "file": "btree.c",
+        "func": "cursorOwnsBtShared",
+        "reason": "shared-cache mutex assertion; any-store has no BtShared mutex so the check is vacuous."
+      },
+      {
+        "file": "btree.c",
+        "func": "downgradeAllSharedCacheTableLocks"
+      },
+      {
+        "file": "btree.c",
+        "func": "hasSharedCacheTableLock"
+      },
+      {
+        "file": "btree.c",
+        "func": "querySharedCacheTableLock"
+      },
+      {
+        "file": "btree.c",
+        "func": "removeFromSharingList"
+      },
+      {
+        "file": "btree.c",
+        "func": "setSharedCacheTableLock"
+      },
+      {
+        "file": "btree.c",
+        "func": "sharedLockTrace"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeLockTable"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeSharable"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3_enable_shared_cache"
+      }
+    ]
+  },
+  {
+    "group": "auto_vacuum_ptrmap",
+    "category": "feature-not-ported",
+    "reason": "any-store does not implement auto-vacuum or incremental-vacuum; there is no ptrmap page, no page relocation, and no vacuum driver.",
+    "funcs": [
+      {
+        "file": "btree.c",
+        "func": "autoVacuumCommit"
+      },
+      {
+        "file": "btree.c",
+        "func": "checkPtrmap"
+      },
+      {
+        "file": "btree.c",
+        "func": "finalDbSize"
+      },
+      {
+        "file": "btree.c",
+        "func": "incrVacuumStep"
+      },
+      {
+        "file": "btree.c",
+        "func": "modifyPagePointer"
+      },
+      {
+        "file": "btree.c",
+        "func": "ptrmapCheckPages"
+      },
+      {
+        "file": "btree.c",
+        "func": "ptrmapGet"
+      },
+      {
+        "file": "btree.c",
+        "func": "ptrmapPageno"
+      },
+      {
+        "file": "btree.c",
+        "func": "ptrmapPut"
+      },
+      {
+        "file": "btree.c",
+        "func": "ptrmapPutOvflPtr"
+      },
+      {
+        "file": "btree.c",
+        "func": "relocatePage"
+      },
+      {
+        "file": "btree.c",
+        "func": "setChildPtrmaps"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeGetAutoVacuum"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeIncrVacuum"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeSetAutoVacuum"
+      }
+    ]
+  },
+  {
+    "group": "incrblob_only",
+    "category": "feature-not-ported",
+    "reason": "any-store exposes no incremental BLOB I/O API (sqlite3_blob_open/read/write/close); the BtCursor overflow cache and incrblob-cursor invalidation bookkeeping are unneeded. Note: online backup IS ported — see internal/btree/backup.go and docs/plans/2026-04-22-sqlite-backup-port.md.",
+    "funcs": [
+      {
+        "file": "btree.c",
+        "func": "invalidateAllOverflowCache",
+        "reason": "overflow page cache on BtCursor exists only to accelerate incrblob random access; any-store cursors stream payload without a persistent overflow index."
+      },
+      {
+        "file": "btree.c",
+        "func": "invalidateIncrblobCursors"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeIncrblobCursor"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreePutData"
+      }
+    ]
+  },
+  {
+    "group": "table_btree_variants",
+    "category": "feature-not-ported",
+    "reason": "any-store uses only index-style btrees keyed by opaque byte strings; rowid/table-btree integer-key cell variants and their moveto/transfer helpers are not used.",
+    "funcs": [
+      {
+        "file": "btree.c",
+        "func": "btreeParseCellPtr"
+      },
+      {
+        "file": "btree.c",
+        "func": "btreeParseCellPtrNoPayload"
+      },
+      {
+        "file": "btree.c",
+        "func": "cellSizePtrNoPayload"
+      },
+      {
+        "file": "btree.c",
+        "func": "cellSizePtrTableLeaf"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeIntegerKey"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeTableMoveto"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeTransferRow"
+      }
+    ]
+  },
+  {
+    "group": "debug_assert",
+    "category": "debug-only",
+    "reason": "SQLITE_DEBUG / integrity-check-only assertions and progress callbacks; any-store relies on Go's race detector and test coverage instead of compile-gated invariants.",
+    "funcs": [
+      {
+        "file": "btree.c",
+        "func": "assertCellInfo"
+      },
+      {
+        "file": "btree.c",
+        "func": "assertParentIndex"
+      },
+      {
+        "file": "btree.c",
+        "func": "btreeCellSizeCheck",
+        "reason": "SQLITE_NOINLINE slow-path used only when CELLSIZE_PRAGMA debug assertions fire."
+      },
+      {
+        "file": "btree.c",
+        "func": "cellInfoEqual"
+      },
+      {
+        "file": "btree.c",
+        "func": "checkOom"
+      },
+      {
+        "file": "btree.c",
+        "func": "checkProgress"
+      },
+      {
+        "file": "btree.c",
+        "func": "corruptPageError",
+        "reason": "wraps SQLITE_CORRUPT with a __LINE__ trace for debug builds; any-store returns typed corruption errors directly."
+      },
+      {
+        "file": "btree.c",
+        "func": "cursorIsAtLastEntry"
+      },
+      {
+        "file": "btree.c",
+        "func": "cursorOnLastPage"
+      },
+      {
+        "file": "pager.c",
+        "func": "assertTruncateConstraint"
+      },
+      {
+        "file": "pager.c",
+        "func": "assertTruncateConstraintCb"
+      },
+      {
+        "file": "pager.c",
+        "func": "assert_pager_state"
+      },
+      {
+        "file": "pager.c",
+        "func": "checkPage"
+      },
+      {
+        "file": "pager.c",
+        "func": "disable_simulated_io_errors"
+      },
+      {
+        "file": "pager.c",
+        "func": "enable_simulated_io_errors"
+      },
+      {
+        "file": "pager.c",
+        "func": "pager_datahash"
+      },
+      {
+        "file": "pager.c",
+        "func": "pager_pagehash"
+      },
+      {
+        "file": "pager.c",
+        "func": "pager_set_pagehash"
+      },
+      {
+        "file": "pager.c",
+        "func": "print_pager_state"
+      },
+      {
+        "file": "pcache.c",
+        "func": "numberOfCachePages",
+        "reason": "resolves the szCache sign convention (negative = KB budget, positive = page count) from PRAGMA cache_size; any-store's cache capacity is a plain page count with no KB fallback, so the helper has no caller."
+      },
+      {
+        "file": "pcache.c",
+        "func": "pcacheDump"
+      },
+      {
+        "file": "pcache.c",
+        "func": "pcachePageTrace"
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcachePageSanity"
+      }
+    ]
+  },
+  {
+    "group": "cursor_save_restore",
+    "category": "divergent",
+    "reason": "any-store cursors do not survive concurrent writes; MVCC snapshots plus re-seek replace SQLite's saveCursorPosition / restore / pin / hint / trip machinery.",
+    "funcs": [
+      {
+        "file": "btree.c",
+        "func": "anotherValidCursor"
+      },
+      {
+        "file": "btree.c",
+        "func": "btreeRestoreCursorPosition"
+      },
+      {
+        "file": "btree.c",
+        "func": "countValidCursors"
+      },
+      {
+        "file": "btree.c",
+        "func": "hasReadConflicts"
+      },
+      {
+        "file": "btree.c",
+        "func": "saveAllCursors"
+      },
+      {
+        "file": "btree.c",
+        "func": "saveCursorKey"
+      },
+      {
+        "file": "btree.c",
+        "func": "saveCursorPosition"
+      },
+      {
+        "file": "btree.c",
+        "func": "saveCursorsOnList"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeClearCursor"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeClosesWithCursor"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeCursorHasHint"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeCursorHasMoved"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeCursorHint"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeCursorHintFlags"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeCursorPin"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeCursorRestore"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeCursorSize"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeCursorUnpin"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeCursorZero"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeFakeValidCursor"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeTripAllCursors"
+      }
+    ]
+  },
+  {
+    "group": "config_surface",
+    "category": "config-surface",
+    "reason": "tuning/config setters SQLite exposes via PRAGMA; any-store hardcodes these knobs (page size, sync flags, mmap, spill, cache size, reserve bytes, secure-delete) and does not expose runtime reconfiguration.",
+    "funcs": [
+      {
+        "file": "btree.c",
+        "func": "setDefaultSyncFlag"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeClearCache"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeConnectionCount"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeGetJournalname"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeGetRequestedReserve"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeGetReserveNoMutex"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeIsReadonly"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeMaxPageCount"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeMaxRecordSize"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeSecureDelete"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeSetCacheSize"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeSetMmapLimit"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeSetPageSize"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeSetPagerFlags"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeSetSpillSize"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeSetVersion"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerCacheStat"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerClearCache"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerDirectReadOk"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerMaxPageCount"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerMemUsed"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerSetCachesize"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerSetFlags"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerSetPagesize"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerSetSpillsize"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerShrink"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerStats"
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PCacheIsDirty"
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PCachePercentDirty"
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcacheGetCachesize"
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcachePagecount"
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcacheRefCount"
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcacheSetCachesize"
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcacheSetPageSize"
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcacheSetSpillsize"
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcacheShrink"
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcacheSize",
+        "reason": "returns sizeof(PCache) so the pager can allocate the header inline; Go allocates pcache structs directly via new()."
+      },
+      {
+        "file": "pcache1.c",
+        "func": "pcache1Cachesize"
+      },
+      {
+        "file": "pcache1.c",
+        "func": "sqlite3HeaderSizePcache1"
+      },
+      {
+        "file": "pcache1.c",
+        "func": "sqlite3PCacheSetDefault"
+      }
+    ]
+  },
+  {
+    "group": "inlined_helpers",
+    "category": "inlined",
+    "reason": "logic lives inside an already-cited Go caller (folded into its parent function for clarity in Go), so the C helper has no 1:1 Go twin.",
+    "funcs": [
+      {
+        "file": "btree.c",
+        "func": "accessPayloadChecked"
+      },
+      {
+        "file": "btree.c",
+        "func": "btreeCursorWithLock",
+        "reason": "thin wrapper that acquires BtShared mutex before delegating to the real cursor constructor; any-store has no BtShared mutex so only the inner body is ported."
+      },
+      {
+        "file": "btree.c",
+        "func": "btreeEndTransaction"
+      },
+      {
+        "file": "btree.c",
+        "func": "btreeMoveto"
+      },
+      {
+        "file": "btree.c",
+        "func": "btreeOverwriteContent"
+      },
+      {
+        "file": "btree.c",
+        "func": "btreeOverwriteOverflowCell"
+      },
+      {
+        "file": "btree.c",
+        "func": "btreePageFromDbPage"
+      },
+      {
+        "file": "btree.c",
+        "func": "btreePageLookup"
+      },
+      {
+        "file": "btree.c",
+        "func": "btreePagecount"
+      },
+      {
+        "file": "btree.c",
+        "func": "btreeParseCellAdjustSizeForOverflow"
+      },
+      {
+        "file": "btree.c",
+        "func": "btreeSetNPage"
+      },
+      {
+        "file": "btree.c",
+        "func": "cellSize"
+      },
+      {
+        "file": "btree.c",
+        "func": "copyPayload"
+      },
+      {
+        "file": "btree.c",
+        "func": "editPage"
+      },
+      {
+        "file": "btree.c",
+        "func": "getCellInfo"
+      },
+      {
+        "file": "btree.c",
+        "func": "moveToParent"
+      },
+      {
+        "file": "btree.c",
+        "func": "pageReinit"
+      },
+      {
+        "file": "btree.c",
+        "func": "releasePageOne",
+        "reason": "page-1 release specialization; any-store uses a single releasePage path since there is no separate unref rule for page 1."
+      },
+      {
+        "file": "btree.c",
+        "func": "unlockBtreeIfUnused",
+        "reason": "releases BtShared when cursor count drops to zero; any-store has no BtShared reference-counting, so the caller just closes directly."
+      },
+      {
+        "file": "pager.c",
+        "func": "databaseIsUnmoved",
+        "reason": "detects file rename via VFS fileControl; any-store does not detect file-moves at close."
+      },
+      {
+        "file": "pager.c",
+        "func": "getPageError",
+        "reason": "stub getter installed after a fatal pager error; any-store surfaces errors directly from getPage* without a sticky error-mode getter."
+      },
+      {
+        "file": "pager.c",
+        "func": "pagerOpentemp",
+        "reason": "opens a unique unnamed temp file via VFS; any-store handles temp/in-memory storage via masterStore without temp-file creation."
+      },
+      {
+        "file": "pager.c",
+        "func": "pagerPagecount",
+        "reason": "reads file size and divides by pageSize; any-store keeps dbSize as an atomic.Uint32 updated on allocate/truncate."
+      },
+      {
+        "file": "pager.c",
+        "func": "read32bits",
+        "reason": "one-liner wrapping OsRead + get4byte; any-store uses binary.BigEndian.Uint32 inline."
+      },
+      {
+        "file": "pager.c",
+        "func": "setGetterMethod",
+        "reason": "swaps the pager's getPage function pointer between Normal/Error/MMap; any-store dispatches statically via getPageReader / getPageWriter."
+      },
+      {
+        "file": "pager.c",
+        "func": "write32bits",
+        "reason": "one-liner wrapping put4byte + OsWrite; any-store uses binary.BigEndian.PutUint32 inline."
+      },
+      {
+        "file": "wal.c",
+        "func": "walBeginShmUnreliable",
+        "reason": "fallback BeginRead path for VFSes without reliable shm (heap-memory mode); any-store always uses file-backed shm so the branch is inlined into tryBeginRead."
+      },
+      {
+        "file": "wal.c",
+        "func": "walCkptInfo",
+        "reason": "one-line accessor that returns a pointer into the wal-index header; any-store reads the checkpoint-info fields directly off the shm struct."
+      },
+      {
+        "file": "wal.c",
+        "func": "walFramePgno",
+        "reason": "single-line helper that indexes into the hash-table page; folded into the Go frame-walk loops."
+      },
+      {
+        "file": "wal.c",
+        "func": "walIndexHdr",
+        "reason": "pointer-arithmetic accessor for the in-memory wal-index header; any-store uses the Go struct field directly."
+      },
+      {
+        "file": "wal.c",
+        "func": "walIndexPage",
+        "reason": "fast-path check plus delegation to walIndexPageRealloc; inlined into Go shm-page lookup."
+      },
+      {
+        "file": "wal.c",
+        "func": "walIndexPageRealloc",
+        "reason": "SQLITE_NOINLINE slow-path that maps/allocates a missing shm page; merged into the Go shm growth routine."
+      },
+      {
+        "file": "wal.c",
+        "func": "walPagesize",
+        "reason": "returns pWal-\u003ehdr.szPage or a default; any-store reads the header field inline."
+      },
+      {
+        "file": "wal.c",
+        "func": "walRewriteChecksums",
+        "reason": "rewrites checksums when a transaction is partially rolled back after savepoint; folded into the Go savepoint-rollback path."
+      }
+    ]
+  },
+  {
+    "group": "cell_array_edit",
+    "category": "divergent",
+    "reason": "SQLite edits pages in place via a cached cell-pointer array; any-store rebuilds pages wholesale during balance, so the cached-size / free-array / insert-array scaffolding has no Go counterpart.",
+    "funcs": [
+      {
+        "file": "btree.c",
+        "func": "cachedCellSize"
+      },
+      {
+        "file": "btree.c",
+        "func": "computeCellSize"
+      },
+      {
+        "file": "btree.c",
+        "func": "pageFreeArray"
+      },
+      {
+        "file": "btree.c",
+        "func": "pageInsertArray"
+      },
+      {
+        "file": "btree.c",
+        "func": "populateCellCache"
+      }
+    ]
+  },
+  {
+    "group": "freeblock_fragmentation",
+    "category": "divergent",
+    "reason": "any-store tracks fragBytes and rebuilds pages rather than walking SQLite's on-page freeblock chain, so freeblock allocation/defrag helpers do not map.",
+    "funcs": [
+      {
+        "file": "btree.c",
+        "func": "btreeClearHasContent",
+        "reason": "clears the pager has-content bitmap used during secure-delete / auto-vacuum; any-store does neither."
+      },
+      {
+        "file": "btree.c",
+        "func": "btreeComputeFreeSpace"
+      },
+      {
+        "file": "btree.c",
+        "func": "freeSpace"
+      },
+      {
+        "file": "btree.c",
+        "func": "pageFindSlot"
+      }
+    ]
+  },
+  {
+    "group": "legacy_meta",
+    "category": "legacy",
+    "reason": "schema-cookie / version-counter / header-size surface used by SQLite's VDBE; any-store stores schema metadata at the anystore layer instead of in btree meta slots.",
+    "funcs": [
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeGetMeta"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeNewDb",
+        "reason": "flags the next commit to (re)create a database file; any-store handles fresh-file creation in the pager open path."
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeSchema"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeSchemaLocked"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3HeaderSizeBtree"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerDataVersion"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerMovepage"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerReadFileheader"
+      }
+    ]
+  },
+  {
+    "group": "unused_public_api",
+    "category": "feature-not-ported",
+    "reason": "public sqlite3Btree* accessors whose use cases (VDBE rowid/payload fetch, cost estimates, DROP TABLE, transaction-state probe) have no counterpart in any-store's index-only btree API.",
+    "funcs": [
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeClearTable"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeClearTableOfCursor"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeIsEmpty"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeIsInBackup",
+        "reason": "used by ATTACH DATABASE (attach.c:314) and main.c:1238 to refuse operations while a backup is running on the btree; any-store has no ATTACH DATABASE surface and no public IsInBackup probe — backup.go tracks in-flight backups via pager.backups internally."
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeLastPage"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeOffset",
+        "reason": "returns byte offset of a rowid record for sqlite_offset(); any-store has no rowid."
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreePager",
+        "reason": "exposes underlying Pager* to VDBE; any-store keeps the pager encapsulated."
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreePayloadChecked"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreePayloadFetch",
+        "reason": "zero-copy payload pointer for local cells; any-store cursors copy into a caller buffer."
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreePayloadSize"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeRowCountEst"
+      },
+      {
+        "file": "btree.c",
+        "func": "sqlite3BtreeSeekCount",
+        "reason": "debug counter for seek-vs-skip heuristics in the query planner; not a VDBE feature any-store needs."
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerFile"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerFlush"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerGetExtra"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerIsMemdb"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerIsreadonly"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerIswriteable"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerLookup"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerPageRefcount"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerPagenumber"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerRef"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerRefcount"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerRekey",
+        "reason": "used by btree page-move for auto-vacuum to rewrite a page's pgno in the cache; any-store has no auto-vacuum and no cache-level rekey."
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerTempSpace"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerUnrefNotNull"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerUnrefPageOne"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerVfs"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3_database_file_object",
+        "reason": "global name-to-file-object lookup used by sqlite3_file_control extensions; any-store has no VFS file-object registry."
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3HeaderSizePcache",
+        "reason": "returns ROUND8(sizeof(PgHdr)) so the pager can sum memory-manager overhead across subsystems; any-store does not aggregate per-subsystem header sizes."
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcacheFetchFinish",
+        "reason": "second half of SQLite's two-phase Fetch/FetchFinish protocol that lazily initialises a freshly allocated PgHdr; any-store's getPageReader/getPageWriter return a fully initialised Page in one call."
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcacheMove",
+        "reason": "re-keys a cached page to a new pgno during savepoint rollback of auto-vacuum page relocations; any-store has no auto-vacuum, so no page ever changes pgno while cached."
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcachePageRefcount",
+        "reason": "exposes the nRef counter for VDBE diagnostics; any-store has no equivalent diagnostic hook."
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcacheRef",
+        "reason": "adds an extra reference to a pinned PgHdr for the pager's overflow/child-page bookkeeping; any-store's cache entries are owned by the current tx and not externally refcounted."
+      },
+      {
+        "file": "wal.c",
+        "func": "sqlite3WalCallback",
+        "reason": "reports frames-since-last-commit for the wal_hook busy callback; any-store has no wal_hook."
+      },
+      {
+        "file": "wal.c",
+        "func": "sqlite3WalDb",
+        "reason": "attaches a sqlite3* handle to the Wal for error reporting; any-store threads errors through Go return values, not a DB handle."
+      },
+      {
+        "file": "wal.c",
+        "func": "sqlite3WalDbsize",
+        "reason": "returns the db size recorded in the WAL header for VDBE PRAGMA page_count; any-store reads dbSize from the pager directly."
+      },
+      {
+        "file": "wal.c",
+        "func": "sqlite3WalFile",
+        "reason": "exposes the WAL sqlite3_file* to test shims; any-store keeps the WAL file private to the pager."
+      },
+      {
+        "file": "wal.c",
+        "func": "sqlite3WalFindFrame",
+        "reason": "public wrapper around walIndexHash lookups; any-store's reader calls the hash lookup directly with its cache."
+      },
+      {
+        "file": "wal.c",
+        "func": "sqlite3WalFramesize",
+        "reason": "returns header szPage for VDBE's sqlite3_stmt_status frame accounting; not surfaced."
+      },
+      {
+        "file": "wal.c",
+        "func": "sqlite3WalLimit",
+        "reason": "PRAGMA journal_size_limit setter for the WAL; any-store auto-truncates on checkpoint and exposes no limit knob."
+      },
+      {
+        "file": "wal.c",
+        "func": "sqlite3WalSystemErrno",
+        "reason": "VFS-errno passthrough for SQLITE_IOERR classification; any-store wraps OS errors via Go's os package."
+      },
+      {
+        "file": "wal.c",
+        "func": "sqlite3WalUndo",
+        "reason": "rewinds mxFrame for statement-level rollback after VDBE OP_Halt; any-store rolls back via savepoint truncation instead."
+      },
+      {
+        "file": "wal.c",
+        "func": "sqlite3WalWriteLock",
+        "reason": "advisory WRITE-lock toggle used by PRAGMA wal_checkpoint(RESTART); any-store checkpoint flow acquires the writer lock internally."
+      }
+    ]
+  },
+  {
+    "group": "memdb_vfs",
+    "category": "feature-not-ported",
+    "reason": "any-store's InMemory mode uses pager.masterStore (sync.RWMutex-protected page map) under the existing pager, not a separate VFS layer like SQLite's memdb. All memdb VFS methods, the memdb detection/init entry points, and the serialize/deserialize API (which rely on the memdb VFS) are entirely replaced by this pager-level approach.",
+    "funcs": [
+      {
+        "file": "memdb.c",
+        "func": "memdbAccess"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbCheckReservedLock"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbClose"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbCurrentTime"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbCurrentTimeInt64"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbDeviceCharacteristics"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbDlClose"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbDlError"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbDlOpen"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbEnlarge"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbEnter"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbFetch"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbFileControl"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbFileSize"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbFromDbSchema"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbFullPathname"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbGetLastError"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbLeave"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbLock"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbOpen"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbRandomness"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbRead"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbSectorSize"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbSleep"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbSync"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbTruncate"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbUnfetch"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbUnlock"
+      },
+      {
+        "file": "memdb.c",
+        "func": "memdbWrite"
+      },
+      {
+        "file": "memdb.c",
+        "func": "sqlite3IsMemdb"
+      },
+      {
+        "file": "memdb.c",
+        "func": "sqlite3MemdbInit"
+      },
+      {
+        "file": "memdb.c",
+        "func": "sqlite3_deserialize"
+      },
+      {
+        "file": "memdb.c",
+        "func": "sqlite3_serialize"
+      }
+    ]
+  },
+  {
+    "group": "unix_shm_helpers",
+    "category": "feature-not-ported",
+    "reason": "Ancillary helpers around SQLite's unixShmNode multi-FD sharing/refcount bookkeeping and mmap sizing. any-store's shm implementation (internal/btree/shm*.go) is a simpler single-process mmap/hash design without unixShmNode linked-list refcounting, cross-FD sharing detection, page-size-dependent region-per-map math, or diagnostic JSON dumps, so these helpers have no counterpart.",
+    "funcs": [
+      {
+        "file": "os_unix.c",
+        "func": "unixDescribeShm",
+        "reason": "Debug-only JSON dump of unixShm state gated on SQLITE_DEBUG/SQLITE_ENABLE_FILESTAT; any-store has no equivalent diagnostic serializer."
+      },
+      {
+        "file": "os_unix.c",
+        "func": "unixIsSharingShmNode",
+        "reason": "F_GETLK-based probe to detect whether another process/FD shares the same shm node before unlinking -wal/-shm; any-store's shm is not multi-FD refcounted so sharing detection is unnecessary."
+      },
+      {
+        "file": "os_unix.c",
+        "func": "unixShmPurge",
+        "reason": "Frees unixShmNode (munmap regions, close hShm, free mutexes) when its refcount drops to zero; any-store shm lifecycle is owned by the pager/DB without a separate refcounted node pool."
+      },
+      {
+        "file": "os_unix.c",
+        "func": "unixShmRegionPerMap",
+        "reason": "Computes how many 32KB shm regions fit per mmap when system page size exceeds region size; any-store maps shm regions directly without this packing heuristic."
+      }
+    ]
+  },
+  {
+    "group": "windows_shm_backend",
+    "category": "feature-not-ported",
+    "reason": "any-store has no Windows-specific SHM backend; Windows falls back to the in-process heap shm (shm_other.go)",
+    "funcs": [
+      {
+        "file": "os_win.c",
+        "func": "winShmBarrier"
+      },
+      {
+        "file": "os_win.c",
+        "func": "winShmEnterMutex"
+      },
+      {
+        "file": "os_win.c",
+        "func": "winShmLeaveMutex"
+      },
+      {
+        "file": "os_win.c",
+        "func": "winShmLock"
+      },
+      {
+        "file": "os_win.c",
+        "func": "winShmMap"
+      },
+      {
+        "file": "os_win.c",
+        "func": "winShmMutexHeld"
+      },
+      {
+        "file": "os_win.c",
+        "func": "winShmPurge"
+      },
+      {
+        "file": "os_win.c",
+        "func": "winShmUnmap"
+      }
+    ]
+  },
+  {
+    "group": "rollback_journal",
+    "category": "legacy",
+    "reason": "any-store is WAL-only; rollback-journal mode (super-journal, sub-journal, hot-journal recovery, playback, change-counter writes, journal headers) is not implemented.",
+    "funcs": [
+      {
+        "file": "pager.c",
+        "func": "addToSavepointBitvecs"
+      },
+      {
+        "file": "pager.c",
+        "func": "hasHotJournal"
+      },
+      {
+        "file": "pager.c",
+        "func": "journalHdrOffset"
+      },
+      {
+        "file": "pager.c",
+        "func": "jrnlBufferSize"
+      },
+      {
+        "file": "pager.c",
+        "func": "openSubJournal"
+      },
+      {
+        "file": "pager.c",
+        "func": "pageInJournal"
+      },
+      {
+        "file": "pager.c",
+        "func": "pagerAddPageToRollbackJournal"
+      },
+      {
+        "file": "pager.c",
+        "func": "pagerFlushOnCommit"
+      },
+      {
+        "file": "pager.c",
+        "func": "pagerSyncHotJournal"
+      },
+      {
+        "file": "pager.c",
+        "func": "pagerUndoCallback"
+      },
+      {
+        "file": "pager.c",
+        "func": "pagerWriteLargeSector"
+      },
+      {
+        "file": "pager.c",
+        "func": "pager_cksum"
+      },
+      {
+        "file": "pager.c",
+        "func": "pager_delsuper"
+      },
+      {
+        "file": "pager.c",
+        "func": "pager_incr_changecounter"
+      },
+      {
+        "file": "pager.c",
+        "func": "pager_open_journal"
+      },
+      {
+        "file": "pager.c",
+        "func": "pager_playback"
+      },
+      {
+        "file": "pager.c",
+        "func": "pager_playback_one_page"
+      },
+      {
+        "file": "pager.c",
+        "func": "pager_reset",
+        "reason": "drops in-memory page cache and resets journal-mode state on unlock; any-store evicts via pcache directly with no journal-mode switching."
+      },
+      {
+        "file": "pager.c",
+        "func": "pager_truncate"
+      },
+      {
+        "file": "pager.c",
+        "func": "pager_write_changecounter"
+      },
+      {
+        "file": "pager.c",
+        "func": "pager_write_pagelist"
+      },
+      {
+        "file": "pager.c",
+        "func": "readJournalHdr"
+      },
+      {
+        "file": "pager.c",
+        "func": "readSuperJournal"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerGetJournalMode"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerJournalSizeLimit"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerJournalname"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerJrnlFile"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerOkToChangeJournalMode"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerSetJournalMode"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerSync",
+        "reason": "fsyncs the main DB file before rollback-journal commit; in WAL mode it is effectively a no-op and any-store's WAL-only commit path fsyncs the WAL directly."
+      },
+      {
+        "file": "pager.c",
+        "func": "subjRequiresPage"
+      },
+      {
+        "file": "pager.c",
+        "func": "subjournalPage"
+      },
+      {
+        "file": "pager.c",
+        "func": "subjournalPageIfRequired"
+      },
+      {
+        "file": "pager.c",
+        "func": "syncJournal"
+      },
+      {
+        "file": "pager.c",
+        "func": "writeJournalHdr"
+      },
+      {
+        "file": "pager.c",
+        "func": "writeSuperJournal"
+      },
+      {
+        "file": "pager.c",
+        "func": "zeroJournalHdr"
+      }
+    ]
+  },
+  {
+    "group": "pager_lock_state_machine",
+    "category": "feature-not-ported",
+    "reason": "any-store has no OS-level file-lock promotion ladder (SHARED/RESERVED/PENDING/EXCLUSIVE) or busy-handler retry loop; WAL + writerOpMu + readerCaches channel provide concurrency without lock upgrades.",
+    "funcs": [
+      {
+        "file": "pager.c",
+        "func": "pagerExclusiveLock"
+      },
+      {
+        "file": "pager.c",
+        "func": "pagerLockDb"
+      },
+      {
+        "file": "pager.c",
+        "func": "pagerUnlockDb"
+      },
+      {
+        "file": "pager.c",
+        "func": "pagerUnlockIfUnused"
+      },
+      {
+        "file": "pager.c",
+        "func": "pager_unlock"
+      },
+      {
+        "file": "pager.c",
+        "func": "pager_wait_on_lock"
+      },
+      {
+        "file": "pager.c",
+        "func": "setSectorSize",
+        "reason": "probes sqlite3_file sector-size VFS method to size journal records; any-store uses fixed page size and has no sector-size-aware journaling."
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerExclusiveLock"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerLockingMode"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerSetBusyHandler"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3SectorSize",
+        "reason": "VFS sector-size probe used only by journal sync path; any-store writes fixed page boundaries without sector alignment logic."
+      }
+    ]
+  },
+  {
+    "group": "mmap_io",
+    "category": "feature-not-ported",
+    "reason": "any-store reads via os.File.ReadAt without memory-mapping; the mmap getter, map-header pool, and mmap-limit setter have no Go counterpart.",
+    "funcs": [
+      {
+        "file": "pager.c",
+        "func": "getPageMMap"
+      },
+      {
+        "file": "pager.c",
+        "func": "pagerAcquireMapPage"
+      },
+      {
+        "file": "pager.c",
+        "func": "pagerFixMaplimit"
+      },
+      {
+        "file": "pager.c",
+        "func": "pagerFreeMapHdrs"
+      },
+      {
+        "file": "pager.c",
+        "func": "pagerReleaseMapPage"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerSetMmapLimit"
+      }
+    ]
+  },
+  {
+    "group": "wal_integration",
+    "category": "inlined",
+    "reason": "WAL open/close/probe helpers that SQLite threads through Pager are folded into any-store's pager.openWAL / DB.Close paths — there is no separate Wal* handle exposed to callers.",
+    "funcs": [
+      {
+        "file": "pager.c",
+        "func": "pagerOpenWal"
+      },
+      {
+        "file": "pager.c",
+        "func": "pagerOpenWalIfPresent"
+      },
+      {
+        "file": "pager.c",
+        "func": "pagerRollbackWal"
+      },
+      {
+        "file": "pager.c",
+        "func": "pagerWalFrames"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerCloseWal"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerOpenWal"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerWalCallback"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerWalDb"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerWalFramesize"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerWalSupported"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerWalSystemErrno"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerWalWriteLock"
+      }
+    ]
+  },
+  {
+    "group": "snapshot_api",
+    "category": "feature-not-ported",
+    "reason": "sqlite3_snapshot_* is a SQLite-specific API for pinning and restoring WAL read-points across connections; any-store exposes no equivalent snapshot handle.",
+    "funcs": [
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerSnapshotCheck"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerSnapshotGet"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerSnapshotOpen"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerSnapshotRecover"
+      },
+      {
+        "file": "pager.c",
+        "func": "sqlite3PagerSnapshotUnlock"
+      },
+      {
+        "file": "wal.c",
+        "func": "sqlite3WalSnapshotCheck"
+      },
+      {
+        "file": "wal.c",
+        "func": "sqlite3WalSnapshotGet"
+      },
+      {
+        "file": "wal.c",
+        "func": "sqlite3WalSnapshotOpen"
+      },
+      {
+        "file": "wal.c",
+        "func": "sqlite3WalSnapshotRecover"
+      },
+      {
+        "file": "wal.c",
+        "func": "sqlite3WalSnapshotUnlock"
+      },
+      {
+        "file": "wal.c",
+        "func": "sqlite3_snapshot_cmp"
+      },
+      {
+        "file": "wal.c",
+        "func": "walSnapshotRecover",
+        "reason": "static worker for sqlite3WalSnapshotRecover; has no caller once the snapshot API is dropped."
+      }
+    ]
+  },
+  {
+    "group": "pcache_lifecycle",
+    "category": "feature-not-ported",
+    "reason": "SQLite's pluggable pcache2 module system has process-wide Initialize / Shutdown hooks and a per-cache Open constructor wired through sqlite3GlobalConfig.pcache2; any-store hardcodes a single per-connection pcache implementation with no init/shutdown surface and no xCreate indirection.",
+    "funcs": [
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcacheInitialize"
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcacheOpen",
+        "reason": "constructor that zeroes the caller-allocated PCache and wires the pluggable pcache2 backend; the Go pcache is built by its own New() with no backend indirection."
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcacheShutdown"
+      }
+    ]
+  },
+  {
+    "group": "dirty_list_mgmt",
+    "category": "inlined",
+    "reason": "SQLite keeps a doubly-linked dirty list and sync-flag bitmap on every PCache so the pager can walk dirty pages in write order; any-store's writerCache enumerates dirty pages via map iteration + sort inside pager.commit, so the dirty-list insert/remove/iterate/sort helpers fold into already-cited callers and have no standalone Go twin.",
+    "funcs": [
+      {
+        "file": "pcache.c",
+        "func": "pageNotOnDirtyList",
+        "reason": "SQLITE_EXPENSIVE_ASSERT invariant for dirty-list linkage; any-store tracks dirty pages in a map with no linkage invariant to verify."
+      },
+      {
+        "file": "pcache.c",
+        "func": "pageOnDirtyList",
+        "reason": "SQLITE_EXPENSIVE_ASSERT invariant for dirty-list linkage; see pageNotOnDirtyList."
+      },
+      {
+        "file": "pcache.c",
+        "func": "pcacheMergeDirtyList"
+      },
+      {
+        "file": "pcache.c",
+        "func": "pcacheSortDirtyList"
+      },
+      {
+        "file": "pcache.c",
+        "func": "pcacheUnpin",
+        "reason": "wrapper around the pluggable pcache2 xUnpin method used to signal reclaimability to a purgeable backend; any-store manages eviction via the onEvict callback inside writerCache, so there is no xUnpin indirection."
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcacheCleanAll"
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcacheClearSyncFlags"
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcacheClearWritable"
+      },
+      {
+        "file": "pcache.c",
+        "func": "sqlite3PcacheIterateDirty"
+      }
+    ]
+  },
+  {
+    "group": "pcache1_mutex",
+    "category": "feature-not-ported",
+    "reason": "any-store's pcache is per-connection (writer has a single writerCache, readers pull private caches from a GC-stable channel pool), so there is no shared cache requiring a global PGroup mutex. SQLite's sqlite3Pcache1Mutex exposes that global mutex for the shared-cache/memory-management subsystem; it has no counterpart in any-store.",
+    "funcs": [
+      {
+        "file": "pcache1.c",
+        "func": "sqlite3Pcache1Mutex"
+      }
+    ]
+  },
+  {
+    "group": "pcache1_lifecycle",
+    "category": "inlined",
+    "reason": "SQLite's pcache1 module has an explicit init/shutdown lifecycle and a page allocator (sqlite3PageMalloc/Free) wired through sqlite3_initialize / sqlite3_shutdown. any-store's pcache.go has no global init/shutdown hook — page buffers come from page_slab.go's sync.Pool-backed slab and are obtained/released via clear()/destroy(), not standalone Malloc/Free entry points.",
+    "funcs": [
+      {
+        "file": "pcache1.c",
+        "func": "pcache1Init"
+      },
+      {
+        "file": "pcache1.c",
+        "func": "pcache1Shutdown"
+      },
+      {
+        "file": "pcache1.c",
+        "func": "sqlite3PageFree"
+      },
+      {
+        "file": "pcache1.c",
+        "func": "sqlite3PageMalloc"
+      }
+    ]
+  },
+  {
+    "group": "pcache1_mmap_pool",
+    "category": "feature-not-ported",
+    "reason": "SQLite's pcache1 supports a fixed-size memory pool (SQLITE_CONFIG_PAGECACHE) with PGroup-mutex-protected fetch paths, per-page memory accounting, and release-memory callbacks used under memory pressure. any-store allocates page buffers from a per-page-size slab (page_slab.go) with no shared pool, no mutexed fetch variants, no MemSize accounting, and no release-on-pressure hook.",
+    "funcs": [
+      {
+        "file": "pcache1.c",
+        "func": "pcache1AllocPage"
+      },
+      {
+        "file": "pcache1.c",
+        "func": "pcache1FetchNoMutex"
+      },
+      {
+        "file": "pcache1.c",
+        "func": "pcache1FetchWithMutex"
+      },
+      {
+        "file": "pcache1.c",
+        "func": "pcache1MemSize"
+      },
+      {
+        "file": "pcache1.c",
+        "func": "sqlite3PcacheReleaseMemory"
+      }
+    ]
+  },
+  {
+    "group": "pcache1_stats",
+    "category": "debug-only",
+    "reason": "Debug/introspection helpers: SQLite exposes cache page counts, hash-table maintenance (Rekey/RemoveFromHash/ResizeHash), an explicit Shrink trim, and an aggregate PcacheStats dumper — all for test harnesses and SQLITE_DEBUG status output. any-store's pcache uses a plain Go map keyed by page number with no rekey/hash-resize machinery and no corresponding stats surface.",
+    "funcs": [
+      {
+        "file": "pcache1.c",
+        "func": "pcache1Pagecount"
+      },
+      {
+        "file": "pcache1.c",
+        "func": "pcache1Rekey"
+      },
+      {
+        "file": "pcache1.c",
+        "func": "pcache1RemoveFromHash"
+      },
+      {
+        "file": "pcache1.c",
+        "func": "pcache1ResizeHash"
+      },
+      {
+        "file": "pcache1.c",
+        "func": "pcache1Shrink"
+      },
+      {
+        "file": "pcache1.c",
+        "func": "sqlite3PcacheStats"
+      }
+    ]
+  },
+  {
+    "group": "wal_blocking_locks",
+    "category": "feature-not-ported",
+    "reason": "SQLITE_ENABLE_SETLK_TIMEOUT blocking-lock support and the Windows SEH fault-injection wrappers are not ported; any-store uses Go sync primitives plus fileLock with no timed-wait hook.",
+    "funcs": [
+      {
+        "file": "wal.c",
+        "func": "sehExceptionFilter"
+      },
+      {
+        "file": "wal.c",
+        "func": "sehInjectFault"
+      },
+      {
+        "file": "wal.c",
+        "func": "walDisableBlocking"
+      },
+      {
+        "file": "wal.c",
+        "func": "walEnableBlocking"
+      },
+      {
+        "file": "wal.c",
+        "func": "walEnableBlockingMs"
+      },
+      {
+        "file": "wal.c",
+        "func": "walHandleException"
+      }
+    ]
+  },
+  {
+    "group": "wal_exclusive_mode",
+    "category": "config-surface",
+    "reason": "PRAGMA locking_mode=EXCLUSIVE and heap-memory journal-mode toggles are not exposed; any-store always runs in shared WAL mode with file-backed shm.",
+    "funcs": [
+      {
+        "file": "wal.c",
+        "func": "sqlite3WalExclusiveMode"
+      },
+      {
+        "file": "wal.c",
+        "func": "sqlite3WalHeapMemory"
+      }
+    ]
+  },
+  {
+    "group": "wal_lock_primitives",
+    "category": "inlined",
+    "reason": "thin wrappers around OsShmLock / file-write primitives; any-store calls the equivalent Go lock/write helpers directly at the cited call sites rather than factoring out the SQLite helper.",
+    "funcs": [
+      {
+        "file": "wal.c",
+        "func": "walAssertLockmask",
+        "reason": "SQLITE_DEBUG-only lockmask invariant check; relies on assert()-gated state any-store does not track."
+      },
+      {
+        "file": "wal.c",
+        "func": "walLockExclusive"
+      },
+      {
+        "file": "wal.c",
+        "func": "walLockName",
+        "reason": "debug-only lock-name stringifier used in trace output; any-store logs lock indices numerically."
+      },
+      {
+        "file": "wal.c",
+        "func": "walLockShared"
+      },
+      {
+        "file": "wal.c",
+        "func": "walMerge",
+        "reason": "inner merge step of walMergesort; inlined into the Go iterator's merge loop (walMergesort itself was cited earlier this session)."
+      },
+      {
+        "file": "wal.c",
+        "func": "walUnlockExclusive"
+      },
+      {
+        "file": "wal.c",
+        "func": "walUnlockShared"
+      },
+      {
+        "file": "wal.c",
+        "func": "walWriteToLog",
+        "reason": "two-part pwrite that straddles the WAL-wrap boundary; folded into the Go frame writer at its single caller."
+      }
+    ]
+  },
+  {
+    "group": "wal_iterator",
+    "category": "inlined",
+    "reason": "WalIterator construction and teardown are folded into the Go checkpoint routine (walIteratorInit/Next/Mergesort were mapped earlier this session); the free helper lives inline with its sole caller.",
+    "funcs": [
+      {
+        "file": "wal.c",
+        "func": "walIteratorFree"
+      }
+    ]
+  }
+]
