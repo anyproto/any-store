@@ -118,41 +118,45 @@ func TestIntegrity_AEAD_VerifyIntegrity_AllGood(t *testing.T) {
 	}
 }
 
-func TestIntegrity_SetVerifyOnRead_Cksum(t *testing.T) {
+// TestIntegrity_ContinueOnIntegrityError_Cksum verifies that the flag
+// suppresses the read-path ErrCodecTamper but still fires the callback.
+// Models the forensic-dump use case: read past corruption, log every hit.
+func TestIntegrity_ContinueOnIntegrityError_Cksum(t *testing.T) {
 	dir := t.TempDir()
-	cfg := &Config{}
-	db, err := Open(context.Background(), filepath.Join(dir, "db"), cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	if !db.VerifyOnRead() {
-		t.Fatal("default VerifyOnRead = false, want true")
-	}
-	if err := db.SetVerifyOnRead(false); err != nil {
-		t.Fatalf("SetVerifyOnRead(false): %v", err)
-	}
-	if db.VerifyOnRead() {
-		t.Fatal("after SetVerifyOnRead(false), still true")
-	}
-}
+	path := filepath.Join(dir, "db")
+	writeAndCloseIntegrityDB(t, path, &Config{})
 
-func TestIntegrity_SetVerifyOnRead_AEAD_Rejected(t *testing.T) {
-	dir := t.TempDir()
-	cfg := &Config{}
-	cfg.Encryption.Passphrase = []byte("p")
-	cfg.Encryption.KDFIterations = 1000
-	db, err := Open(context.Background(), filepath.Join(dir, "db"), cfg)
+	pageSize := int64(4096)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
-	err = db.SetVerifyOnRead(false)
-	if err == nil {
-		t.Fatal("SetVerifyOnRead(false) on AEAD must error")
+	data[pageSize+200] ^= 0x01
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatal(err)
 	}
-	if err != ErrAEADIntegrityVerifyMandatory {
-		t.Fatalf("want ErrAEADIntegrityVerifyMandatory, got %v", err)
+
+	var fired atomic.Uint32
+	cfg := &Config{
+		ContinueOnIntegrityError: true,
+		OnIntegrityError:         func(IntegrityError) { fired.Add(1) },
+	}
+	db, err := Open(context.Background(), path, cfg)
+	if err != nil {
+		t.Fatalf("Open with ContinueOnIntegrityError=true should succeed even with corrupt page: %v", err)
+	}
+	defer db.Close()
+
+	// Sweep — reads pass through the codec without erroring; callback fires.
+	rep, err := db.VerifyIntegrity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Errors) == 0 {
+		t.Fatal("expected at least one mismatch in report")
+	}
+	if fired.Load() == 0 {
+		t.Fatal("OnIntegrityError did not fire")
 	}
 }
 

@@ -2,7 +2,6 @@ package anystore
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/anyproto/any-store/internal/btree"
 )
@@ -72,15 +71,6 @@ func StampPageChecksumForTest(page []byte) {
 	btree.StampPageChecksum(page)
 }
 
-// ErrAEADIntegrityVerifyMandatory is returned by SetVerifyOnRead(false) on
-// AEAD-encrypted databases. Disabling AEAD verification would return
-// attacker-controlled plaintext, defeating the cipher.
-var ErrAEADIntegrityVerifyMandatory = fmt.Errorf("anystore: cannot disable verify-on-read for AEAD-encrypted databases")
-
-// ErrIntegrityVerifyUnsupported is returned by SetVerifyOnRead on a plain
-// database (no integrity mode installed).
-var ErrIntegrityVerifyUnsupported = fmt.Errorf("anystore: SetVerifyOnRead requires checksum or encryption mode")
-
 // VerifyIntegrity walks every page in the database and verifies its
 // per-page integrity tag. For checksum-mode DBs this re-hashes the trailer;
 // for AEAD-mode DBs it attempts decryption (the AEAD tag IS the integrity
@@ -116,44 +106,4 @@ func (db *db) VerifyIntegrity(ctx context.Context) (IntegrityReport, error) {
 // IntegrityMode reports the codec currently installed on the DB.
 func (db *db) IntegrityMode() IntegrityMode {
 	return IntegrityMode(db.btreeDB.IntegrityMode())
-}
-
-// VerifyOnRead reports whether read-path verification is currently enabled.
-// Always true for AEAD-encrypted DBs (AEAD verification cannot be disabled).
-// Always true for plain DBs (no-op).
-func (db *db) VerifyOnRead() bool {
-	switch db.IntegrityMode() {
-	case IntegrityChecksum:
-		c := db.btreeDB.CksumCodec()
-		return c == nil || c.VerifyOn()
-	default:
-		return true
-	}
-}
-
-// SetVerifyOnRead toggles read-path verification at runtime. Mirrors
-// SQLite's PRAGMA checksum_verification.
-//
-// Returns ErrAEADIntegrityVerifyMandatory if called with on=false on an
-// AEAD-encrypted DB; returns ErrIntegrityVerifyUnsupported on plain DBs.
-// Calls with on=true are accepted (no-op) in any mode.
-func (db *db) SetVerifyOnRead(on bool) error {
-	switch db.IntegrityMode() {
-	case IntegrityChecksum:
-		if c := db.btreeDB.CksumCodec(); c != nil {
-			c.SetVerify(on)
-			return nil
-		}
-		return ErrIntegrityVerifyUnsupported
-	case IntegrityAEAD:
-		if !on {
-			return ErrAEADIntegrityVerifyMandatory
-		}
-		return nil
-	default:
-		if on {
-			return nil // benign no-op
-		}
-		return ErrIntegrityVerifyUnsupported
-	}
 }

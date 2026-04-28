@@ -134,15 +134,16 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
     OnIntegrityError: func(e anystore.IntegrityError) {
         log.Printf("integrity: page %d %v: %v", e.PageNo, e.Kind, e.Inner)
     },
+    // Default false: corrupt pages cause reads to fail. Flip to true
+    // for forensic dumps where you'd rather read garbage than lose
+    // access to the rest of the data.
+    ContinueOnIntegrityError: false,
 })
 // db now has IntegrityChecksum mode automatically.
 
 // Walk every page and report mismatches (works in encrypted mode too).
 rep, _ := db.VerifyIntegrity(ctx)
 fmt.Printf("scanned %d pages, %d errors\n", rep.Pages, len(rep.Errors))
-
-// Forensic mode: stop erroring on read mismatches (cksum mode only).
-_ = db.SetVerifyOnRead(false) // returns ErrAEADIntegrityVerifyMandatory in AEAD mode
 ```
 
 Page-1 DB header (first 100 bytes) is not covered by the per-page hash;

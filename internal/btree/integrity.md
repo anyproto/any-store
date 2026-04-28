@@ -107,18 +107,20 @@ plain DBs simply stay plain.
 | SQLite cksumvfs | any-store equivalent |
 |---|---|
 | `PRAGMA file_control reserve_bytes 8; VACUUM` | (none — automatic on every new non-encrypted DB) |
-| `PRAGMA checksum_verification` (query) | `(*DB).VerifyOnRead() bool` |
-| `PRAGMA checksum_verification = ON/OFF` | `(*DB).SetVerifyOnRead(bool) error` |
+| `PRAGMA checksum_verification = ON` (default) | default — corrupt reads fail with `ErrCodecTamper` |
+| `PRAGMA checksum_verification = OFF` (forensic) | `Config.ContinueOnIntegrityError = true` (cksum mode only) |
 | `SELECT count(*), verify_checksum(data) FROM sqlite_dbpage GROUP BY 2` | `(*DB).VerifyIntegrity(ctx) (IntegrityReport, error)` |
 | `verify_checksum(BLOB)` SQL function | `anystore.VerifyPageChecksum([]byte) bool` |
-| auto-enable on open with reserve_bytes==8 | automatic: `IntegrityMode()` reports state, verify is on by default |
-| `SQLITE_IOERR_DATA` on read | `ErrCodecTamper` returned to the caller of the failed read |
+| auto-enable on open with reserve_bytes==8 | automatic: `IntegrityMode()` reports state |
+| `SQLITE_IOERR_DATA` on read | `ErrCodecTamper` returned + `OnIntegrityError` callback fires |
 
-Direct btree callers can still subscribe to per-page failures via
+`ContinueOnIntegrityError` is honored only in cksum mode. AEAD mode
+ignores it because disabling AEAD verification would return attacker-
+controlled plaintext.
+
+Direct btree callers can subscribe to per-page failures via
 `btree.Options.OnIntegrityError` (a uniform hook fired by all codecs
-that implement `OnErrorSink`). It's not exposed at the anystore level
-to keep the public surface minimal — the sweep API and read-path errors
-cover the common observability needs.
+that implement `OnErrorSink`).
 
 ## Why `SetVerifyOnRead(false)` is rejected on AEAD
 

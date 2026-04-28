@@ -116,6 +116,22 @@ type Config struct {
 	// no post-Open setter — the codebase favors config-at-Open over
 	// runtime mutation.
 	OnIntegrityError func(IntegrityError)
+
+	// ContinueOnIntegrityError, when true, lets reads of corrupt pages
+	// return their (potentially garbage) bytes instead of erroring with
+	// btree.ErrCodecTamper. The OnIntegrityError callback still fires —
+	// only the error-return is suppressed. Mirror of cksumvfs's
+	// `PRAGMA checksum_verification = OFF`.
+	//
+	// Default (false) is the safe choice: corrupt pages cause reads to
+	// fail, callers see the error, app halts or recovers. Enable only
+	// for forensic dumps where you'd rather read garbage than not be
+	// able to read at all.
+	//
+	// Honored only in checksum mode. AEAD-encrypted databases ignore
+	// this flag (disabling AEAD verification would return attacker-
+	// controlled plaintext, defeating the cipher).
+	ContinueOnIntegrityError bool
 }
 
 // EncryptionConfig enables page-level encryption of the database file.

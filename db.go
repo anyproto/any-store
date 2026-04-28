@@ -90,16 +90,6 @@ type DB interface {
 	// context cancellation. See IntegrityConfig.
 	VerifyIntegrity(ctx context.Context) (IntegrityReport, error)
 
-	// VerifyOnRead reports whether read-path integrity verification is
-	// currently enabled. Always true for AEAD-encrypted DBs (cannot be
-	// disabled). Always true for plain DBs (no-op).
-	VerifyOnRead() bool
-
-	// SetVerifyOnRead toggles read-path integrity verification at runtime.
-	// Mirror of SQLite's PRAGMA checksum_verification. Returns
-	// ErrAEADIntegrityVerifyMandatory if called with on=false on an
-	// AEAD-encrypted DB; returns ErrIntegrityVerifyUnsupported on plain DBs.
-	SetVerifyOnRead(on bool) error
 }
 
 // DBStats represents the statistics of the database.
@@ -187,6 +177,14 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 			return nil, ErrPageBufferNotInitialized
 		}
 		return nil, err
+	}
+	// ContinueOnIntegrityError only applies to checksum mode. AEAD mode
+	// ignores it by design (disabling AEAD verification would return
+	// attacker-controlled plaintext); plain mode has nothing to verify.
+	if config.ContinueOnIntegrityError {
+		if c := ds.btreeDB.CksumCodec(); c != nil {
+			c.SetVerify(false)
+		}
 	}
 
 	if err = ds.init(ctx); err != nil {
