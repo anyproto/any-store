@@ -87,12 +87,14 @@ func allocPageBuffer(pageSize int, useSlab bool) []byte {
 
 // freePageBuffer returns a buffer to the slab or sync.Pool.
 //
+// BEGIN ENCRYPTION
 // Note: pageBufferPool stores []byte directly, which causes a 24-byte eface
 // box on every Put (SA6002). We accept this cost: the alternative (*[]byte)
 // requires every caller to track a handle and changes the whole API.
 // Hot paths that run codec encrypt/decrypt should use a caller-owned scratch
 // (p.codecScratch, pcache.codecScratch, etc.) instead of this pool to bypass
 // the box entirely.
+// END ENCRYPTION
 func freePageBuffer(buf []byte, useSlab bool) {
 	if buf == nil {
 		return

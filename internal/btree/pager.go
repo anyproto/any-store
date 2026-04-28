@@ -902,9 +902,11 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 		// temporary page read so the query still succeeds. We still have the
 		// cache struct — hand its scratch buffers down so repeated fallbacks
 		// don't allocate per call.
+		// BEGIN ENCRYPTION
 		if p.codec != nil && cache.codecScratch == nil {
 			cache.codecScratch = make([]byte, p.pageSize)
 		}
+		// END ENCRYPTION
 		return p.readTempPage(pgno, walMaxFrame, cache.codecScratch, &cache.codecAEAD)
 	}
 
@@ -912,9 +914,11 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 	if walMaxFrame > 0 {
 		frame := p.wal.index.get(pgno, walMaxFrame)
 		if frame > 0 {
+			// BEGIN ENCRYPTION
 			if p.codec != nil && cache.codecScratch == nil {
 				cache.codecScratch = make([]byte, p.pageSize)
 			}
+			// END ENCRYPTION
 			if err := p.wal.readFrame(frame, pg.data, cache.codecScratch, &cache.codecAEAD); err == nil {
 				off := 0
 				if pgno == 1 {
@@ -991,6 +995,8 @@ func (p *pager) getPageNoContent(pgno uint32) (*page, error) {
 	return pg, nil
 }
 
+// BEGIN ENCRYPTION
+
 // readRawPage returns the raw on-disk bytes of pgno without invoking the
 // codec. Used by the VerifyIntegrity sweep, which needs the post-codec-Encrypt
 // bytes to verify the trailer (cksum) or attempt decrypt (AEAD).
@@ -1028,6 +1034,8 @@ func (p *pager) readRawPage(pgno, walMaxFrame uint32) ([]byte, error) {
 	}
 	return nil, fmt.Errorf("btree: readRawPage: no backing storage for page %d", pgno)
 }
+
+// END ENCRYPTION
 
 // getWritablePage returns a page ready for writing. It marks the page as dirty
 // and saves a copy for savepoint rollback if needed.

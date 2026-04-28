@@ -2202,6 +2202,8 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	return nil
 }
 
+// BEGIN ENCRYPTION
+
 // readFrameRaw reads frame `frame` into buf without invoking the codec.
 // For file-backed WALs that means the on-disk ciphertext-with-trailer
 // bytes; for in-memory WALs the bytes are already plaintext (no codec
@@ -2245,6 +2247,8 @@ func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 	}
 	return nil
 }
+
+// END ENCRYPTION
 
 // readFrame reads the page data for a given frame number.
 // For the file-based path, only an atomic load of nFrame is needed (WAL frames

@@ -78,6 +78,7 @@ type pcache struct {
 	// szSpill. 0 means use maxPages as the threshold.
 	szSpill int
 
+	// BEGIN ENCRYPTION
 	// codecScratch is a page-sized scratch buffer used by the reader path
 	// (pager.getPageReader + wal.readFrame via getPageReader) to hold
 	// plaintext while the encrypted page is decrypted. Allocated lazily on
@@ -91,6 +92,7 @@ type pcache struct {
 	// by aad[:]/nonce[:] point at heap memory owned by the pcache,
 	// avoiding per-call escape into the cipher.AEAD interface.
 	codecAEAD aeadScratch
+	// END ENCRYPTION
 }
 
 func newPcache(pageSize, maxPages int, purgeable bool) *pcache {
