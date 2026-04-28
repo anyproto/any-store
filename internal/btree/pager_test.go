@@ -1735,11 +1735,11 @@ func TestReadFrame_InMemoryCorrupt(t *testing.T) {
 
 	buf := make([]byte, 4096)
 	// Valid read
-	require.NoError(t, w.readFrame(1, buf))
+	require.NoError(t, w.readFrame(1, buf, nil, nil))
 
 	// Corrupt: manually set nFrame high but don't add frames
 	// Frame 0 is invalid
-	assert.Error(t, w.readFrame(0, buf))
+	assert.Error(t, w.readFrame(0, buf, nil, nil))
 
 	require.NoError(t, w.close(false))
 }
@@ -2791,7 +2791,7 @@ func TestReadFrame_InMemoryOutOfRange(t *testing.T) {
 
 	buf := make([]byte, 4096)
 	// Frame 3 passes nFrame check (3 <= 5) but idx=2 >= len(memFrames)=1
-	err := w.readFrame(3, buf)
+	err := w.readFrame(3, buf, nil, nil)
 	assert.ErrorIs(t, err, ErrWALCorrupt)
 
 	// Restore
@@ -7587,7 +7587,7 @@ func TestPagerSlabIntegration(t *testing.T) {
 	defer p.endRead(slot3)
 
 	freeBeforeTemp := len(globalPageSlab.freeList)
-	tmpPg, err := p.readTempPage(pageNos[0], mf3)
+	tmpPg, err := p.readTempPage(pageNos[0], mf3, nil, nil)
 	require.NoError(t, err)
 	assert.NotNil(t, tmpPg.data)
 	freeAfterTemp := len(globalPageSlab.freeList)

@@ -78,6 +78,18 @@ type DB interface {
 	// Close closes the database connection.
 	// Returns an error if there is an issue closing the connection.
 	Close() error
+
+	// IntegrityMode reports the page-level integrity mode of this database
+	// (none / checksum / AEAD).
+	IntegrityMode() IntegrityMode
+
+	// VerifyIntegrity walks every page and verifies its per-page integrity
+	// tag (XXH3-128 trailer for cksum mode, AEAD auth tag for encrypted mode).
+	// Plain DBs return IntegrityNone with zero pages scanned. Mismatches are
+	// returned in IntegrityReport.Errors; the function only errors on I/O or
+	// context cancellation. See IntegrityConfig.
+	VerifyIntegrity(ctx context.Context) (IntegrityReport, error)
+
 }
 
 // DBStats represents the statistics of the database.
@@ -123,6 +135,12 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	if cacheSize <= 0 {
 		cacheSize = 5000
 	}
+	// Page-level integrity is on by default for non-encrypted databases.
+	// XXH3-128 trailer per page costs <1% on writes and is invisible on
+	// reads (see bench-integrity.txt). Encrypted databases get stronger
+	// integrity from the cipher's AEAD tag, so the cksum codec is skipped
+	// there. File-state is authoritative on reopen — existing plain DBs
+	// stay plain regardless of this default.
 	opts := btree.Options{
 		PageSize:              4096,
 		CacheSize:             cacheSize,
@@ -132,7 +150,25 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		DisableAutoCheckpoint: config.DisableAutoCheckpoint,
 		AutoCheckpointAfter:   config.AutoCheckpointAfter,
 		UsePageSlab:           config.UseGlobalPageBuffer,
+		Key:                   config.Encryption.Passphrase,
+		KDFIterations:         config.Encryption.KDFIterations,
+		CipherType:            config.Encryption.CipherType,
+		Codec:                 config.Encryption.Codec,
 		MmapSize:              config.MmapSize,
+		Checksum:              !config.Encryption.Enabled() && !config.InMemory,
+	}
+	if cb := config.OnIntegrityError; cb != nil {
+		// Determine the kind discriminator at Open time. The actual codec
+		// won't have been installed yet, so we compute mode from config:
+		// encrypted → AEAD, otherwise → checksum (the cksum codec is the
+		// only non-AEAD codec we install). InMemory has no on-disk codec.
+		kind := IntegrityChecksumMismatch
+		if config.Encryption.Enabled() {
+			kind = IntegrityAEADAuthFail
+		}
+		opts.OnIntegrityError = func(pgno uint32, inner error) {
+			cb(IntegrityError{PageNo: pgno, Kind: kind, Inner: inner})
+		}
 	}
 
 	var err error
@@ -141,6 +177,14 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 			return nil, ErrPageBufferNotInitialized
 		}
 		return nil, err
+	}
+	// ContinueOnIntegrityError only applies to checksum mode. AEAD mode
+	// ignores it by design (disabling AEAD verification would return
+	// attacker-controlled plaintext); plain mode has nothing to verify.
+	if config.ContinueOnIntegrityError {
+		if c := ds.btreeDB.CksumCodec(); c != nil {
+			c.SetVerify(false)
+		}
 	}
 
 	if err = ds.init(ctx); err != nil {

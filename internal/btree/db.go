@@ -4,9 +4,13 @@ package btree
 // It manages namespaces, transactions, and the underlying pager/WAL.
 
 import (
+	// BEGIN ENCRYPTION
+	"crypto/rand"
+	// END ENCRYPTION
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -72,6 +76,46 @@ type Options struct {
 	// sync.Pool, matching SQLite's default malloc-based allocation.
 	UsePageSlab bool
 
+	// BEGIN ENCRYPTION
+	// Key enables page-level AES-256-GCM encryption when non-nil.
+	// Accepted forms:
+	//   - len 32: raw AES-256 key, used directly (no KDF).
+	//   - any other len: treated as a passphrase; PBKDF2-HMAC-SHA256 derives
+	//     a 32-byte key using the file's salt and KDFIterations rounds.
+	// An empty slice (len 0) is rejected with an error; use nil for "no
+	// encryption".
+	Key []byte
+
+	// KDFIterations controls PBKDF2 cost. Ignored when Key is a raw
+	// 32-byte key. Zero means DefaultKDFIterations (256,000). Use lower
+	// values only in tests.
+	KDFIterations int
+
+	// CipherType selects the built-in cipher when Key is set. Zero value
+	// (CipherAES256GCM) is the default. See CipherType constants for the
+	// available options.
+	CipherType CipherType
+
+	// Codec, when non-nil, replaces the built-in cipher with a caller-
+	// provided implementation (e.g. HSM-backed). When both Key and Codec
+	// are set, Codec wins and Key/CipherType are ignored. Callers own the
+	// codec's lifetime and must supply an implementation safe for
+	// concurrent use.
+	Codec Codec
+
+	// Checksum, when true, installs a no-encryption page-checksum codec
+	// (XXH3-128 trailer, 16 bytes per page). Mutually exclusive with
+	// Key and Codec — combining them returns an error from Open.
+	// Conceptually mirrors SQLite's cksumvfs extension. See
+	// docs/plans/2026-04-27-cksumvfs-port.md.
+	Checksum bool
+
+	// OnIntegrityError, if non-nil, is fired by the installed codec
+	// (cksum or AEAD) on every per-page integrity failure. Same hook
+	// for both modes. Runs on the I/O goroutine; must not block.
+	OnIntegrityError func(pgno uint32, inner error)
+	// END ENCRYPTION
+
 	// MmapSize enables mmap-backed reads of the database file up to the
 	// given byte limit. Zero disables mmap (reads use pread via ReadAt).
 	// Values > 0 allocate a shared mapping of min(DBsize, MmapSize)
@@ -91,6 +135,49 @@ type Options struct {
 	MmapSize int64
 }
 
+// BEGIN ENCRYPTION
+
+// CipherType selects a built-in AEAD for page encryption.
+type CipherType string
+
+const (
+	// CipherAES256GCM is AES-256 in Galois/Counter Mode. Hardware-accelerated
+	// on modern amd64/arm64 via AES-NI (~5 GB/s). Per-page overhead: 32 bytes
+	// (12-byte nonce + 16-byte tag, rounded to 32 for block alignment).
+	// Default choice for disk-backed databases.
+	CipherAES256GCM CipherType = ""
+
+	// CipherChaCha20Poly1305 is ChaCha20 with Poly1305 authentication.
+	// Constant-time in pure software without requiring hardware support.
+	// Per-page overhead: 32 bytes. Competitive with AES-GCM on non-AES-NI
+	// hardware; slightly slower on AES-NI hardware.
+	CipherChaCha20Poly1305 CipherType = "chacha20-poly1305"
+
+	// CipherXChaCha20Poly1305 is the extended-nonce variant of ChaCha20-
+	// Poly1305. Uses a 24-byte nonce which makes random-nonce collision
+	// vanishingly improbable even at astronomical write rates. Per-page
+	// overhead: 48 bytes. Recommended only for workloads exceeding ~2^32
+	// page writes per key.
+	CipherXChaCha20Poly1305 CipherType = "xchacha20-poly1305"
+)
+
+// newCodecFromType constructs a codec of the selected type from a 32-byte key.
+// CipherAES256GCM is the zero value (""), so no-CipherType-set == AES-GCM.
+func newCodecFromType(ct CipherType, key []byte) (Codec, error) {
+	switch ct {
+	case CipherAES256GCM:
+		return NewAESCodec(key)
+	case CipherChaCha20Poly1305:
+		return NewChaCha20Poly1305Codec(key)
+	case CipherXChaCha20Poly1305:
+		return NewXChaCha20Poly1305Codec(key)
+	default:
+		return nil, fmt.Errorf("btree: unknown CipherType %q", ct)
+	}
+}
+
+// END ENCRYPTION
+
 // DefaultOptions returns default database options.
 func DefaultOptions() Options {
 	return Options{
@@ -99,6 +186,81 @@ func DefaultOptions() Options {
 		AutoCheckpointAfter: AutoCheckpointThreshold,
 	}
 }
+
+// BEGIN ENCRYPTION
+
+// buildCodec constructs the Codec from Options. Returns (nil, nil) when no
+// encryption is configured. Input modes:
+//   - Options.Codec set: used as-is.
+//   - Options.Key set with len == KeyLen: raw AES-256 key, used directly.
+//   - Options.Key set with any other non-zero length: treated as a passphrase,
+//     derived via PBKDF2 using the supplied salt and KDFIterations.
+//   - Options.Key set with length 0: rejected.
+// buildCodec constructs the Codec for the resolved mode. `useCksum` is the
+// caller's effective checksum decision (file-state-authoritative on reopen,
+// opts.Checksum on new DBs). buildCodec rejects combining checksum mode with
+// explicit AEAD configuration, but is otherwise mechanical.
+func buildCodec(opts Options, salt []byte, useCksum bool) (Codec, error) {
+	if opts.Codec != nil {
+		if useCksum {
+			return nil, fmt.Errorf("btree: Options.Checksum cannot be combined with Options.Codec")
+		}
+		return opts.Codec, nil
+	}
+	if opts.Key != nil {
+		if useCksum {
+			return nil, fmt.Errorf("btree: Options.Checksum cannot be combined with Options.Key")
+		}
+		if len(opts.Key) == 0 {
+			return nil, fmt.Errorf("btree: Options.Key is empty (use nil for no encryption)")
+		}
+		var raw []byte
+		if len(opts.Key) == KeyLen {
+			raw = opts.Key
+		} else {
+			raw = DeriveKey(opts.Key, salt, opts.KDFIterations)
+		}
+		return newCodecFromType(opts.CipherType, raw)
+	}
+	if useCksum {
+		return newCksumCodec(), nil
+	}
+	return nil, nil
+}
+
+// readInitialHeader opens the file at path and reads the database header.
+// Returns ErrNotExist if the file doesn't exist (distinguished by callers).
+// Returns ErrCorrupt if the file exists but is shorter than dbHeaderSize.
+func readInitialHeader(path string) (dbHeader, error) {
+	var h dbHeader
+	f, err := osOpenFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return h, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return h, err
+	}
+	if info.Size() == 0 {
+		return h, errEmptyFile
+	}
+	buf := make([]byte, dbHeaderSize)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		return h, err
+	}
+	if err := h.deserialize(buf); err != nil {
+		return h, err
+	}
+	return h, nil
+}
+
+// errEmptyFile signals that the target path exists but is a freshly-created
+// (zero-byte) file. Not exported — used only as a control-flow signal inside
+// Open.
+var errEmptyFile = errors.New("btree: empty file")
+
+// END ENCRYPTION
 
 // DB represents an open database.
 type DB struct {
@@ -237,6 +399,87 @@ func Open(path string, opts Options) (*DB, error) {
 	p.noCommitSync = opts.NoCommitSync
 	p.inMemory = opts.InMemory
 	p.mmapSize = opts.MmapSize
+
+	// BEGIN ENCRYPTION
+	// Build and install codec before p.open(). For an existing file we read
+	// the header first to discover the salt; for a new file we generate a
+	// fresh salt. InMemory databases skip encryption entirely (encryption.md §7).
+	//
+	// The encryption marker on disk is a non-zero Salt field (bytes 72-87
+	// of page 1). ReservedSpace alone is NOT the marker, because the same
+	// byte is used by SQLite-compat tests that exercise reserve-related
+	// code paths on plaintext databases.
+	//
+	// Note: there is a TOCTOU window between readInitialHeader (which
+	// opens/reads/closes the file) and p.open() (which reopens and locks).
+	// An external process swapping the file in that window would surface
+	// as a decrypt error on the first page read — not silent corruption.
+	// openDBs above blocks same-process double-open. A future hardening
+	// could hold a shared lock across readInitialHeader and p.open().
+	wantEncryption := opts.Key != nil || opts.Codec != nil
+	var zeroSalt [SaltLen]byte
+	// Resolve effective codec mode. Encryption is opt-in (errors if it
+	// doesn't match the file). Checksum is auto-detected from the file's
+	// ReservedSpace marker on existing DBs and honored from Options.Checksum
+	// on new DBs — file state is authoritative on reopen, so users can't
+	// accidentally upgrade or downgrade a live database via config drift.
+	useCksum := false
+	if !opts.InMemory {
+		existingHeader, herr := readInitialHeader(path)
+		fileExists := herr == nil
+		if herr != nil && !errors.Is(herr, os.ErrNotExist) && !errors.Is(herr, errEmptyFile) {
+			return nil, fmt.Errorf("btree: read header: %w", herr)
+		}
+		if fileExists {
+			fileEncrypted := existingHeader.Salt != zeroSalt
+			// Checksum-mode marker: zero salt + ReservedSpace == cksumOverhead (16).
+			// Any other non-zero ReservedSpace is left to higher-level
+			// integrity validation (e.g. tests synthesizing off-page cells).
+			fileCksum := !fileEncrypted && existingHeader.ReservedSpace == cksumOverhead
+			switch {
+			case fileEncrypted && !wantEncryption:
+				return nil, fmt.Errorf("btree: database file is encrypted, Options.Key or Options.Codec required")
+			case !fileEncrypted && wantEncryption:
+				return nil, fmt.Errorf("btree: database file is not encrypted, remove Options.Key/Codec")
+			}
+			useCksum = fileCksum
+		} else {
+			useCksum = opts.Checksum
+		}
+		wantCodec := wantEncryption || useCksum
+		if wantCodec {
+			var salt [SaltLen]byte
+			if fileExists {
+				salt = existingHeader.Salt
+			} else if wantEncryption {
+				if _, err := rand.Read(salt[:]); err != nil {
+					return nil, fmt.Errorf("btree: generate salt: %w", err)
+				}
+			}
+			codec, cerr := buildCodec(opts, salt[:], useCksum)
+			if cerr != nil {
+				return nil, cerr
+			}
+			if sink, ok := codec.(OnErrorSink); ok && opts.OnIntegrityError != nil {
+				sink.SetOnError(opts.OnIntegrityError)
+			}
+			p.header.Salt = salt
+			p.installCodec(codec)
+		}
+	} else if opts.InMemory && (wantEncryption || opts.Checksum) {
+		// InMemory: build codec from zero salt; no on-disk marker.
+		var salt [SaltLen]byte
+		codec, cerr := buildCodec(opts, salt[:], opts.Checksum)
+		if cerr != nil {
+			return nil, cerr
+		}
+		if sink, ok := codec.(OnErrorSink); ok && opts.OnIntegrityError != nil {
+			sink.SetOnError(opts.OnIntegrityError)
+		}
+		p.installCodec(codec)
+	}
+	// END ENCRYPTION
+
 	if err := p.open(); err != nil {
 		return nil, err
 	}

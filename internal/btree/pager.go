@@ -197,6 +197,26 @@ type pager struct {
 	// pagerWriter via state.Load() (Go memory model: sequenced-before →
 	// happens-before the atomic store, synchronized-with the atomic load).
 	writerWalSlot int
+
+	// BEGIN ENCRYPTION
+	// codec, when non-nil, encrypts pages before file/WAL writes and
+	// decrypts them after reads. Installed once at Open and immutable
+	// thereafter. Safe for concurrent use across the writer and readers.
+	codec Codec
+	// codecScratch is a reusable page-sized scratch buffer used on the
+	// writer side (initNewDB, getPageWriter, wal.writeFrame) to hold
+	// ciphertext while the source plaintext stays live in the pcache.
+	// Allocated once in installCodec; reused for the pager's lifetime.
+	// Safe to share because all three users are writer-serialized
+	// (single-writer invariant). Reader paths cannot use this buffer
+	// because multiple read transactions may run concurrently.
+	// Modeled after SQLCipher's codec_ctx->buffer (crypto_impl.c).
+	codecScratch []byte
+	// codecAEAD holds the nonce/AAD scratch for writer-side codec calls.
+	// Heap-allocated as part of the pager struct; passed by pointer so
+	// the crypto/cipher.AEAD interface calls don't force per-call escape.
+	codecAEAD aeadScratch
+	// END ENCRYPTION
 }
 
 // savepointState captures the state needed to rollback to a savepoint.
@@ -414,6 +434,11 @@ func (p *pager) open() error {
 	p.wal.noCommitSync = p.noCommitSync
 	p.wal.inMemory = p.inMemory
 	p.wal.busyHandler = DefaultBusyTimeout(5 * time.Second)
+	// BEGIN ENCRYPTION
+	// Propagate codec to the WAL so frame writes/reads use the same
+	// cipher as the DB file.
+	p.wal.codec = p.codec
+	// END ENCRYPTION
 	if err := p.wal.open(); err != nil {
 		return err
 	}
@@ -426,7 +451,7 @@ func (p *pager) open() error {
 		frame := p.wal.index.get(1, p.wal.index.maxFrame.Load())
 		if frame > 0 {
 			walBuf := make([]byte, p.pageSize)
-			if err := p.wal.readFrame(frame, walBuf); err == nil {
+			if err := p.wal.readFrame(frame, walBuf, nil, nil); err == nil {
 				p.header.deserialize(walBuf[:dbHeaderSize])
 			}
 		}
@@ -442,11 +467,65 @@ func (p *pager) open() error {
 	return nil
 }
 
+// BEGIN ENCRYPTION
+
+// installCodec attaches a page codec to the pager. Must be called before
+// any I/O. Sets the on-disk ReservedSpace header byte and the in-memory
+// usableSize_ so the btree cell code respects the codec's per-page
+// overhead. Calling with nil is a no-op (unencrypted mode).
+func (p *pager) installCodec(c Codec) {
+	if c == nil {
+		return
+	}
+	p.codec = c
+	p.header.ReservedSpace = uint8(c.Overhead())
+	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
+	// Pre-allocate one writer-side scratch buffer. Reused by all writer
+	// paths (single-writer invariant); avoids per-call allocPageBuffer /
+	// freePageBuffer churn that turned sync.Pool.Put's eface box into a
+	// hot allocation site under encryption.
+	p.codecScratch = make([]byte, p.pageSize)
+}
+
+// encryptPage transforms plaintext page bytes for writing to disk or WAL.
+// When no codec is installed, returns src unchanged (pass-through). When
+// a codec is installed, encrypts into scratch and returns the ciphertext
+// slice. scratch must have len >= len(src) and must not alias src.
+//
+// Page 1 is special: the first dbHeaderSize (100) bytes are the database
+// header, which includes the KDF salt and must remain plaintext so Open
+// can read it without the key. Pages > 1 are encrypted in full.
+//
+// This is the any-store equivalent of SQLCipher's CODEC2 macro
+// (pager.c:412), unified into one function.
+func (p *pager) encryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
+	return encryptPageWithCodec(p.codec, scratch, src, pgno, &p.codecAEAD)
+}
+
+// decryptPage is the inverse. Returns src unchanged when no codec is
+// installed; otherwise decrypts into scratch and returns the plaintext
+// slice. On AEAD verification failure returns ErrCodecTamper.
+// decryptPage uses the pager's writer-side AEAD scratch. Reader-path
+// callers must NOT go through this; they should call
+// decryptPageWithCodec directly with their own *aeadScratch.
+func (p *pager) decryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
+	return decryptPageWithCodec(p.codec, scratch, src, pgno, &p.codecAEAD)
+}
+
+// END ENCRYPTION
+
 // initNewDB initializes a brand new database file.
 func (p *pager) initNewDB() error {
 	if p.pageSize == 0 {
 		p.pageSize = DefaultPageSize
 	}
+
+	// BEGIN ENCRYPTION
+	// Preserve salt and ReservedSpace that may have been set by installCodec
+	// before initNewDB was called.
+	savedSalt := p.header.Salt
+	savedReserve := p.header.ReservedSpace
+	// END ENCRYPTION
 
 	p.header = dbHeader{
 		PageSize:         p.pageSize,
@@ -459,6 +538,12 @@ func (p *pager) initNewDB() error {
 		DefaultCacheSize: defaultCacheSize,
 		TextEncoding:     1, // UTF-8
 	}
+	// BEGIN ENCRYPTION
+	if p.codec != nil {
+		p.header.ReservedSpace = savedReserve
+		p.header.Salt = savedSalt
+	}
+	// END ENCRYPTION
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
 	p.cellBuf = make([]byte, 0, p.usableSize_)
 
@@ -482,9 +567,22 @@ func (p *pager) initNewDB() error {
 	buf[hdrOff+7] = 0                 // fragmented free bytes
 
 	if p.file != nil {
-		if _, err := p.file.WriteAt(buf, 0); err != nil {
+		// BEGIN ENCRYPTION
+		// When a codec is installed, encrypt page 1 before writing to disk.
+		// The plaintext 100-byte dbHeader (carrying the salt) is preserved
+		// by encryptPage; only bytes >= dbHeaderSize are encrypted.
+		writeBuf := buf
+		if p.codec != nil {
+			ct, err := p.encryptPage(p.codecScratch, buf, 1)
+			if err != nil {
+				return err
+			}
+			writeBuf = ct
+		}
+		if _, err := p.file.WriteAt(writeBuf, 0); err != nil {
 			return err
 		}
+		// END ENCRYPTION
 		if err := fdatasync(p.file); err != nil {
 			return err
 		}
@@ -495,7 +593,9 @@ func (p *pager) initNewDB() error {
 	p.writerCache.useSlab = p.useSlab
 	p.writerCache.xStress = p.pagerStress
 
-	// For inMemory mode, pre-populate page 1 in masterStore so reads find it
+	// For inMemory mode, pre-populate page 1 in masterStore so reads find it.
+	// Note: masterStore stores plaintext (encryption is a file-at-rest concern
+	// per encryption.md §7; InMemory has no "at rest").
 	if p.inMemory && p.master != nil {
 		p.master.writePage(1, buf)
 	}
@@ -506,6 +606,11 @@ func (p *pager) initNewDB() error {
 	p.wal.noCommitSync = p.noCommitSync
 	p.wal.inMemory = p.inMemory
 	p.wal.busyHandler = DefaultBusyTimeout(5 * time.Second)
+	// BEGIN ENCRYPTION
+	// Propagate codec to the WAL so frame writes/reads use the same
+	// cipher as the DB file.
+	p.wal.codec = p.codec
+	// END ENCRYPTION
 	if err := p.wal.open(); err != nil {
 		return err
 	}
@@ -622,7 +727,7 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 	if walMaxFrame > 0 {
 		frame := p.wal.index.get(pgno, walMaxFrame)
 		if frame > 0 {
-			if err := p.wal.readFrame(frame, pg.data); err == nil {
+			if err := p.wal.readFrame(frame, pg.data, p.codecScratch, &p.codecAEAD); err == nil {
 				// Parse page header
 				off := 0
 				if pgno == 1 {
@@ -648,6 +753,17 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 			}
 			// Zero-fill new pages
 			clear(pg.data)
+		} else {
+			// BEGIN ENCRYPTION
+			if p.codec != nil {
+				plain, derr := p.decryptPage(p.codecScratch, pg.data, pgno)
+				if derr != nil {
+					p.writerCache.discard(pg.pgno)
+					return nil, fmt.Errorf("btree: decrypt page %d: %w", pgno, derr)
+				}
+				copy(pg.data, plain)
+			}
+			// END ENCRYPTION
 		}
 	} else if p.master != nil {
 		// InMemory: read from masterStore (replaces the DB file)
@@ -671,10 +787,17 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 }
 
 // readTempPage reads a page into a standalone temporary page object that is
-// NOT stored in any cache. Used by getPageWriter when the writer cache holds
-// a stale clean page — the temp page avoids disturbing the cache while
-// returning the correct snapshot data.
-func (p *pager) readTempPage(pgno, walMaxFrame uint32) (*page, error) {
+// NOT stored in any cache. Used by getPageReader when no reader cache is
+// available or admission control refused a cache slot.
+//
+// codecBuf / codecAEAD are caller-owned scratch buffers for the codec's
+// decrypt call; when non-nil they avoid a per-page allocPageBuffer round-
+// trip (which boxes the []byte into an eface on sync.Pool.Put) and a per-
+// call aad/nonce escape. Callers that have a reader pcache should pass
+// cache.codecScratch / &cache.codecAEAD. Pass nil/nil for the rare nil-
+// cache path (admission-control refusal, integrity checks); the codec
+// falls back to allocPageBuffer in that case.
+func (p *pager) readTempPage(pgno, walMaxFrame uint32, codecBuf []byte, codecAEAD *aeadScratch) (*page, error) {
 	pg := p.acquireTempPage()
 	pg.pgno = pgno
 	pg.pinCount = 1
@@ -684,7 +807,7 @@ func (p *pager) readTempPage(pgno, walMaxFrame uint32) (*page, error) {
 	if walMaxFrame > 0 {
 		frame := p.wal.index.get(pgno, walMaxFrame)
 		if frame > 0 {
-			if err := p.wal.readFrame(frame, pg.data); err == nil {
+			if err := p.wal.readFrame(frame, pg.data, codecBuf, codecAEAD); err == nil {
 				off := 0
 				if pgno == 1 {
 					off = dbHeaderSize
@@ -703,6 +826,33 @@ func (p *pager) readTempPage(pgno, walMaxFrame uint32) (*page, error) {
 				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 			}
 			clear(pg.data)
+		} else {
+			// BEGIN ENCRYPTION
+			if p.codec != nil {
+				scratch := codecBuf
+				ownScratch := false
+				if scratch == nil {
+					scratch = allocPageBuffer(int(p.pageSize), false)
+					ownScratch = true
+				}
+				aeadS := codecAEAD
+				if aeadS == nil {
+					aeadS = new(aeadScratch)
+				}
+				plain, derr := decryptPageWithCodec(p.codec, scratch, pg.data, pgno, aeadS)
+				if derr != nil {
+					if ownScratch {
+						freePageBuffer(scratch, false)
+					}
+					p.recycleTempPage(pg)
+					return nil, fmt.Errorf("btree: decrypt page %d: %w", pgno, derr)
+				}
+				copy(pg.data, plain)
+				if ownScratch {
+					freePageBuffer(scratch, false)
+				}
+			}
+			// END ENCRYPTION
 		}
 	} else if p.master != nil {
 		if !p.master.readPageInto(pgno, pg.data) {
@@ -735,7 +885,7 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 	// If no reader cache provided, read an uncached temporary page.
 	// Never fall back to writerCache — that would race with the writer goroutine.
 	if cache == nil {
-		return p.readTempPage(pgno, walMaxFrame)
+		return p.readTempPage(pgno, walMaxFrame, nil, nil)
 	}
 
 	// Check reader cache.
@@ -749,15 +899,27 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 	pg := cache.create(pgno, 1)
 	if pg == nil {
 		// Admission control refused the allocation. Fall back to an uncached
-		// temporary page read so the query still succeeds.
-		return p.readTempPage(pgno, walMaxFrame)
+		// temporary page read so the query still succeeds. We still have the
+		// cache struct — hand its scratch buffers down so repeated fallbacks
+		// don't allocate per call.
+		// BEGIN ENCRYPTION
+		if p.codec != nil && cache.codecScratch == nil {
+			cache.codecScratch = make([]byte, p.pageSize)
+		}
+		// END ENCRYPTION
+		return p.readTempPage(pgno, walMaxFrame, cache.codecScratch, &cache.codecAEAD)
 	}
 
 	// Try to read from WAL first.
 	if walMaxFrame > 0 {
 		frame := p.wal.index.get(pgno, walMaxFrame)
 		if frame > 0 {
-			if err := p.wal.readFrame(frame, pg.data); err == nil {
+			// BEGIN ENCRYPTION
+			if p.codec != nil && cache.codecScratch == nil {
+				cache.codecScratch = make([]byte, p.pageSize)
+			}
+			// END ENCRYPTION
+			if err := p.wal.readFrame(frame, pg.data, cache.codecScratch, &cache.codecAEAD); err == nil {
 				off := 0
 				if pgno == 1 {
 					off = dbHeaderSize
@@ -777,6 +939,20 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 			}
 			clear(pg.data)
+		} else {
+			// BEGIN ENCRYPTION
+			if p.codec != nil {
+				if cache.codecScratch == nil {
+					cache.codecScratch = make([]byte, p.pageSize)
+				}
+				plain, derr := decryptPageWithCodec(p.codec, cache.codecScratch, pg.data, pgno, &cache.codecAEAD)
+				if derr != nil {
+					cache.discard(pg.pgno)
+					return nil, fmt.Errorf("btree: decrypt page %d: %w", pgno, derr)
+				}
+				copy(pg.data, plain)
+			}
+			// END ENCRYPTION
 		}
 	} else if p.master != nil {
 		// InMemory: read from masterStore.
@@ -818,6 +994,48 @@ func (p *pager) getPageNoContent(pgno uint32) (*page, error) {
 	pg.header = pageHeader{}
 	return pg, nil
 }
+
+// BEGIN ENCRYPTION
+
+// readRawPage returns the raw on-disk bytes of pgno without invoking the
+// codec. Used by the VerifyIntegrity sweep, which needs the post-codec-Encrypt
+// bytes to verify the trailer (cksum) or attempt decrypt (AEAD).
+//
+// Reads from the WAL when a frame for pgno exists at or below walMaxFrame,
+// otherwise from the main DB file. For the master-store (InMemory mode)
+// returns the raw stored bytes. Returns a fresh page-sized buffer; caller
+// owns it.
+//
+// Caller must hold a read lock (read transaction or equivalent) — same
+// concurrency contract as getPage.
+func (p *pager) readRawPage(pgno, walMaxFrame uint32) ([]byte, error) {
+	if pgno == 0 {
+		return nil, ErrInvalidPage
+	}
+	buf := make([]byte, p.pageSize)
+	if walMaxFrame > 0 && p.wal != nil {
+		if frame := p.wal.index.get(pgno, walMaxFrame); frame > 0 {
+			if err := p.wal.readFrameRaw(frame, buf); err == nil {
+				return buf, nil
+			}
+		}
+	}
+	if p.file != nil {
+		if err := p.readDBPage(pgno, buf); err != nil {
+			return nil, fmt.Errorf("btree: readRawPage: page %d: %w", pgno, err)
+		}
+		return buf, nil
+	}
+	if p.master != nil {
+		if !p.master.readPageInto(pgno, buf) {
+			return nil, fmt.Errorf("btree: readRawPage: page %d not in masterStore", pgno)
+		}
+		return buf, nil
+	}
+	return nil, fmt.Errorf("btree: readRawPage: no backing storage for page %d", pgno)
+}
+
+// END ENCRYPTION
 
 // getWritablePage returns a page ready for writing. It marks the page as dirty
 // and saves a copy for savepoint rollback if needed.

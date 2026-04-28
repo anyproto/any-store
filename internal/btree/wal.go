@@ -63,6 +63,7 @@ package btree
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"math/bits"
@@ -1275,6 +1276,21 @@ type wal struct {
 	// per-frame allocations and reduce GC pressure.
 	memArena    []byte
 	memArenaOff int
+
+	// BEGIN ENCRYPTION
+	// codec, when non-nil, encrypts frame payloads on write and decrypts
+	// them on read. Propagated from the pager after wal creation via
+	// p.wal.codec = p.codec; see pager.open / pager.initNewDB.
+	codec Codec
+	// codecScratch is a page-sized scratch used by writeFrame to hold
+	// ciphertext. Allocated lazily on first use. Writes are
+	// single-writer-serialized, so one buffer is safe.
+	codecScratch []byte
+	// codecAEAD is the nonce/AAD scratch for writeFrame's codec call.
+	// Embedded by value so nonce/aad slices live on the wal's heap
+	// allocation rather than escaping per-call.
+	codecAEAD aeadScratch
+	// END ENCRYPTION
 }
 
 // memFrame stores a single WAL frame's page data in memory.
@@ -1961,9 +1977,26 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		binary.BigEndian.PutUint32(frameHdr[8:12], w.header.salt1)
 		binary.BigEndian.PutUint32(frameHdr[12:16], w.header.salt2)
 
+		// BEGIN ENCRYPTION
+		// Encrypt page payload before checksum (per encryption.md §4.3: the
+		// WAL checksum covers ciphertext). When no codec is installed this
+		// is a zero-cost pass-through — payload := p.data.
+		payload := p.data
+		if w.codec != nil {
+			if w.codecScratch == nil {
+				w.codecScratch = make([]byte, w.pageSize)
+			}
+			ct, eerr := encryptPageWithCodec(w.codec, w.codecScratch, p.data, p.pgno, &w.codecAEAD)
+			if eerr != nil {
+				return eerr
+			}
+			payload = ct
+		}
+		// END ENCRYPTION
+
 		// Compute checksum over frame header (first 8 bytes) + page data
 		s1, s2 = walChecksum(frameHdr[0:8], s1, s2)
-		s1, s2 = walChecksum(p.data, s1, s2)
+		s1, s2 = walChecksum(payload, s1, s2)
 
 		binary.BigEndian.PutUint32(frameHdr[16:20], s1)
 		binary.BigEndian.PutUint32(frameHdr[20:24], s2)
@@ -1972,8 +2005,8 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		if _, err := w.file.WriteAt(frameHdr[:], off); err != nil {
 			return err
 		}
-		// Write page data directly — no copy into intermediate buffer
-		if _, err := w.file.WriteAt(p.data, off+walFrameSize); err != nil {
+		// Write page data (plaintext or ciphertext depending on codec).
+		if _, err := w.file.WriteAt(payload, off+walFrameSize); err != nil {
 			return err
 		}
 		nAppended++
@@ -2069,6 +2102,16 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 // Acquires w.mu to synchronize with readFrame which reads w.memFrames.
 // nFrame is updated atomically after the slice is populated, ensuring readers
 // only see the new nFrame after the memFrames data is visible.
+//
+// BEGIN ENCRYPTION
+// InMemory mode skips encryption per encryption.md §7: encryption protects
+// data at rest, and an InMemory DB has no on-disk file to protect. The WAL
+// memory arena stays plaintext, readFrame's in-memory branch returns
+// plaintext, and checkpoint to masterStore is also plaintext. If a codec
+// is installed with an InMemory DB, ReservedSpace still accounts for
+// per-page overhead (so page format stays consistent with a future
+// serialization) but the codec itself is not invoked on this fast path.
+// END ENCRYPTION
 func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	w.mu.Lock()
 
@@ -2159,11 +2202,66 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	return nil
 }
 
+// BEGIN ENCRYPTION
+
+// readFrameRaw reads frame `frame` into buf without invoking the codec.
+// For file-backed WALs that means the on-disk ciphertext-with-trailer
+// bytes; for in-memory WALs the bytes are already plaintext (no codec
+// is invoked on the in-memory write path either — see writeFramesMem).
+//
+// Used by the VerifyIntegrity sweep, which needs the post-Encrypt bytes
+// to verify the trailer (cksum) or attempt decrypt (AEAD). Concurrency
+// contract matches readFrame.
+func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
+	if frame == 0 {
+		return ErrWALCorrupt
+	}
+	nf := w.nFrame.Load()
+	if w.inMemory {
+		if frame > nf {
+			return ErrWALCorrupt
+		}
+		w.mu.RLock()
+		idx := frame - 1
+		if idx < uint32(len(w.memFrames)) {
+			copy(buf[:w.pageSize], w.memFrames[idx].data)
+			w.mu.RUnlock()
+			return nil
+		}
+		w.mu.RUnlock()
+		return ErrWALCorrupt
+	}
+	if w.inProcess && frame > nf {
+		return ErrWALCorrupt
+	}
+	if w.file == nil {
+		return ErrWALCorrupt
+	}
+	frameSize := int64(walFrameSize) + int64(w.pageSize)
+	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
+	if _, err := w.file.ReadAt(buf[:w.pageSize], offset); err != nil {
+		if frame > nf {
+			return ErrWALCorrupt
+		}
+		return err
+	}
+	return nil
+}
+
+// END ENCRYPTION
+
 // readFrame reads the page data for a given frame number.
 // For the file-based path, only an atomic load of nFrame is needed (WAL frames
 // on disk are immutable once written). For the memFrames path, RLock protects
 // the slice from concurrent append by writeFramesMem.
-func (w *wal) readFrame(frame uint32, buf []byte) error {
+//
+// When the codec is installed, scratchBuf (if non-nil) is used as the
+// decryption scratch to avoid a per-call allocPageBuffer/freePageBuffer
+// round-trip. scratchBuf must be at least w.pageSize bytes and must not
+// alias buf. aeadScratchBuf (if non-nil) holds the nonce/AAD buffers to
+// keep them off-heap. Callers that pass nil for either get a per-call
+// alloc (rare paths).
+func (w *wal) readFrame(frame uint32, buf, scratchBuf []byte, aeadScratchBuf *aeadScratch) error {
 	if frame == 0 {
 		return ErrWALCorrupt
 	}
@@ -2197,12 +2295,66 @@ func (w *wal) readFrame(frame uint32, buf []byte) error {
 	}
 	frameSize := int64(walFrameSize) + int64(w.pageSize)
 	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
-	_, err := w.file.ReadAt(buf[:w.pageSize], offset)
-	if err != nil && frame > nf {
-		return ErrWALCorrupt
+	if _, err := w.file.ReadAt(buf[:w.pageSize], offset); err != nil {
+		// Multi-process: a stale nFrame view may have let us try to read
+		// past the peer's actual WAL tail. Treat that as corruption
+		// rather than leaking the raw I/O error.
+		if frame > nf {
+			return ErrWALCorrupt
+		}
+		return err
 	}
-	return err
+	// BEGIN ENCRYPTION
+	// Decrypt frame payload if a codec is installed. The caller needs the
+	// frame's page number to bind into AAD; we extract it from the frame
+	// header which lives at offset - walFrameSize.
+	if w.codec != nil {
+		pgno, perr := w.readFramePgno(frame)
+		if perr != nil {
+			return perr
+		}
+		scratch := scratchBuf
+		ownScratch := false
+		if scratch == nil {
+			scratch = allocPageBuffer(int(w.pageSize), false)
+			ownScratch = true
+		}
+		aeadS := aeadScratchBuf
+		if aeadS == nil {
+			aeadS = new(aeadScratch)
+		}
+		plain, derr := decryptPageWithCodec(w.codec, scratch, buf[:w.pageSize], pgno, aeadS)
+		if derr != nil {
+			if ownScratch {
+				freePageBuffer(scratch, false)
+			}
+			return fmt.Errorf("btree: WAL decrypt frame %d (pgno %d): %w", frame, pgno, derr)
+		}
+		copy(buf[:w.pageSize], plain)
+		if ownScratch {
+			freePageBuffer(scratch, false)
+		}
+	}
+	// END ENCRYPTION
+	return nil
 }
+
+// BEGIN ENCRYPTION
+
+// readFramePgno returns the page number encoded in the frame header at
+// position (frame-1). Only called on the file-backed path; the caller
+// must have validated frame >= 1 and frame <= nFrame.
+func (w *wal) readFramePgno(frame uint32) (uint32, error) {
+	frameSize := int64(walFrameSize) + int64(w.pageSize)
+	headerOffset := int64(walHeaderSize) + int64(frame-1)*frameSize
+	var hdr [4]byte
+	if _, err := w.file.ReadAt(hdr[:], headerOffset); err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint32(hdr[:4]), nil
+}
+
+// END ENCRYPTION
 
 // beginRead acquires a shared read lock on a reader slot and returns the
 // current max frame number for snapshot isolation plus the slot number.
@@ -3054,6 +3206,20 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 			w.ckptPgnos = pgnos
 			sort.Slice(pgnos, func(a, b int) bool { return pgnos[a] < pgnos[b] })
 
+			// BEGIN ENCRYPTION
+			// Checkpoint uses copy-verbatim: if a codec is installed, the WAL
+			// frame payload is already ciphertext produced by the same codec,
+			// with the same per-page-1 plaintext-prefix handling as the DB
+			// file expects. Writing the bytes unchanged to the DB file
+			// produces a valid encrypted DB page. No decrypt-then-re-encrypt
+			// roundtrip is needed because (a) nonce reuse is safe here — each
+			// (key, pgno) pair only sees a given plaintext once per frame,
+			// since each new modification gets a fresh WAL frame with a fresh
+			// nonce — and (b) WAL ciphertext and DB-file ciphertext share
+			// codec, key, and layout. See encryption-plan.md Task 8.
+			// Matches SQLCipher wal.c:2309-2315 (OsRead → OsWrite with no
+			// codec hook between them).
+			// END ENCRYPTION
 			for _, pgno := range pgnos {
 				frameIdx := latest[pgno]
 				off := int64(walHeaderSize) + int64(frameIdx)*frameSize
