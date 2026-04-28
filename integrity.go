@@ -10,7 +10,7 @@ import (
 // every page carries an XXH3-128 trailer (16 bytes) that is verified on read.
 // Encrypted databases derive integrity from the cipher's AEAD authentication
 // tag instead. There is no opt-out — the cost is <1% on writes and effectively
-// zero on reads (see bench-integrity.txt).
+// zero on reads.
 //
 // File state is authoritative on reopen: existing plain databases stay plain,
 // existing checksum databases auto-install the codec regardless of caller

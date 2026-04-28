@@ -137,10 +137,10 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	}
 	// Page-level integrity is on by default for non-encrypted databases.
 	// XXH3-128 trailer per page costs <1% on writes and is invisible on
-	// reads (see bench-integrity.txt). Encrypted databases get stronger
-	// integrity from the cipher's AEAD tag, so the cksum codec is skipped
-	// there. File-state is authoritative on reopen — existing plain DBs
-	// stay plain regardless of this default.
+	// reads. Encrypted databases get stronger integrity from the
+	// cipher's AEAD tag, so the cksum codec is skipped there. File-state
+	// is authoritative on reopen — existing plain DBs stay plain
+	// regardless of this default.
 	opts := btree.Options{
 		PageSize:              4096,
 		CacheSize:             cacheSize,

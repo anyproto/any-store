@@ -118,11 +118,10 @@ db.Flush(ctx, 100*time.Millisecond, anystore.FlushModeCheckpointPassive)
 Every non-encrypted Any Store database carries an XXH3-128 page-trailer
 checksum (16 bytes/page) by default — corruption is caught on read.
 There is no opt-out; the cost is <1% on writes and effectively zero on
-reads (see [`bench-integrity.txt`](bench-integrity.txt)). Encrypted
-databases derive integrity from the cipher's AEAD authentication tag
-instead. File state is authoritative on reopen — existing plain
-databases stay plain, existing checksum databases auto-install the
-codec regardless of caller config.
+reads. Encrypted databases derive integrity from the cipher's AEAD
+authentication tag instead. File state is authoritative on reopen —
+existing plain databases stay plain, existing checksum databases
+auto-install the codec regardless of caller config.
 
 Conceptually mirrors SQLite's [`cksumvfs`](https://sqlite.org/cksumvfs.html),
 generalized to also surface AEAD failures via the same API.
