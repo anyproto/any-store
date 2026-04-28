@@ -1952,7 +1952,28 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 				// valid; only cksum1/cksum2 become stale and must
 				// be fixed before the tx is visible.
 				dataOff := int64(walHeaderSize) + int64(iWrite-1)*int64(frameSize) + int64(walFrameSize)
-				if _, err := w.file.WriteAt(p.data, dataOff); err != nil {
+
+				// BEGIN ENCRYPTION
+				// Run the codec on the reused payload exactly like the
+				// fresh-append branch below — otherwise plaintext lands
+				// in a frame the reader will try to decrypt, and the
+				// cksum codec's trailer (or AEAD tag) will not match.
+				// Mirrors SQLCipher wal.c:4152-4156, which gates the
+				// reuse-path WriteAt on sqlcipherPagerCodec(p).
+				payload := p.data
+				if w.codec != nil {
+					if w.codecScratch == nil {
+						w.codecScratch = make([]byte, w.pageSize)
+					}
+					ct, eerr := encryptPageWithCodec(w.codec, w.codecScratch, p.data, p.pgno, &w.codecAEAD)
+					if eerr != nil {
+						return eerr
+					}
+					payload = ct
+				}
+				// END ENCRYPTION
+
+				if _, err := w.file.WriteAt(payload, dataOff); err != nil {
 					return err
 				}
 				if w.iReCksum == 0 || iWrite < w.iReCksum {
