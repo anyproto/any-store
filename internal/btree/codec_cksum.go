@@ -32,7 +32,7 @@ const cksumOverhead = 16
 type cksumCodec struct {
 	// verify is 1 when verify-on-read is on. When 0, mismatches are
 	// detected (and OnError still fires) but the read returns the
-	// page bytes instead of ErrCodecTamper. Mirrors PRAGMA
+	// page bytes instead of an error. Mirrors PRAGMA
 	// checksum_verification.
 	verify atomic.Uint32
 	// onErrorField provides SetOnError + fire. Shared across all codecs.
@@ -78,8 +78,9 @@ func (c *cksumCodec) Encrypt(dst, src []byte, pgno uint32, _ *aeadScratch) ([]by
 }
 
 // Decrypt verifies the trailer hash. On mismatch fires OnError; if
-// verify-on is enabled, returns ErrCodecTamper. dst receives src verbatim
-// (this codec doesn't transform plaintext).
+// verify-on is enabled, returns errCksumMismatch (which wraps
+// ErrPageIntegrity). dst receives src verbatim (this codec doesn't
+// transform plaintext).
 func (c *cksumCodec) Decrypt(dst, src []byte, pgno uint32, _ *aeadScratch) ([]byte, error) {
 	if len(dst) < len(src) {
 		panic("btree: cksumCodec.Decrypt: dst too short")
@@ -93,9 +94,9 @@ func (c *cksumCodec) Decrypt(dst, src []byte, pgno uint32, _ *aeadScratch) ([]by
 	got.Lo = binary.LittleEndian.Uint64(src[bodyEnd : bodyEnd+8])
 	got.Hi = binary.LittleEndian.Uint64(src[bodyEnd+8 : bodyEnd+16])
 	if want != got {
-		c.fire(pgno, ErrCodecTamper)
+		c.fire(pgno, errCksumMismatch)
 		if c.VerifyOn() {
-			return nil, ErrCodecTamper
+			return nil, errCksumMismatch
 		}
 	}
 	copy(dst, src)

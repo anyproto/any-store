@@ -117,7 +117,7 @@ func (c *chachaCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]b
 	pt, err := c.aead.Open(dst[:0], nonce, ctAndTag, aad)
 	if err != nil {
 		c.fire(pgno, err)
-		return nil, ErrCodecTamper
+		return nil, errAEADAuthFail
 	}
 	if len(pt) != bodyLen {
 		return nil, fmt.Errorf("btree: chachaCodec.Decrypt: unexpected plaintext length %d", len(pt))

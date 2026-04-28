@@ -3,6 +3,7 @@ package btree
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"testing"
 )
 
@@ -69,8 +70,8 @@ func TestAESCodec_TamperDetected(t *testing.T) {
 	// Flip a bit somewhere in the encrypted body.
 	ct[100] ^= 0x01
 	pt := make([]byte, pageSize)
-	if _, err := c.Decrypt(pt, ct, 1, &aeadScratch{}); err != ErrCodecTamper {
-		t.Fatalf("flipped-bit decrypt: got err=%v, want ErrCodecTamper", err)
+	if _, err := c.Decrypt(pt, ct, 1, &aeadScratch{}); !errors.Is(err, ErrPageIntegrity) {
+		t.Fatalf("flipped-bit decrypt: got err=%v, want ErrPageIntegrity", err)
 	}
 }
 
@@ -83,8 +84,8 @@ func TestAESCodec_PageNumberBound(t *testing.T) {
 	ct, _ := c.Encrypt(dst, src, 5, &aeadScratch{})
 	// Decrypting with the wrong page number must fail.
 	pt := make([]byte, pageSize)
-	if _, err := c.Decrypt(pt, ct, 6, &aeadScratch{}); err != ErrCodecTamper {
-		t.Fatalf("wrong-pgno decrypt: got err=%v, want ErrCodecTamper", err)
+	if _, err := c.Decrypt(pt, ct, 6, &aeadScratch{}); !errors.Is(err, ErrPageIntegrity) {
+		t.Fatalf("wrong-pgno decrypt: got err=%v, want ErrPageIntegrity", err)
 	}
 }
 
@@ -114,8 +115,8 @@ func TestAESCodec_WrongKeyRejected(t *testing.T) {
 	dst := make([]byte, pageSize)
 	ct, _ := c1.Encrypt(dst, src, 1, &aeadScratch{})
 	pt := make([]byte, pageSize)
-	if _, err := c2.Decrypt(pt, ct, 1, &aeadScratch{}); err != ErrCodecTamper {
-		t.Fatalf("wrong-key decrypt: got err=%v, want ErrCodecTamper", err)
+	if _, err := c2.Decrypt(pt, ct, 1, &aeadScratch{}); !errors.Is(err, ErrPageIntegrity) {
+		t.Fatalf("wrong-key decrypt: got err=%v, want ErrPageIntegrity", err)
 	}
 }
 

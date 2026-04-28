@@ -3,6 +3,7 @@ package btree
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"testing"
 )
 
@@ -78,8 +79,8 @@ func testChachaTamperDetected(t *testing.T, c Codec) {
 	ct, _ := c.Encrypt(dst, src, 1, &aeadScratch{})
 	ct[100] ^= 0x01
 	pt := make([]byte, pageSize)
-	if _, err := c.Decrypt(pt, ct, 1, &aeadScratch{}); err != ErrCodecTamper {
-		t.Fatalf("flipped-bit decrypt: got err=%v, want ErrCodecTamper", err)
+	if _, err := c.Decrypt(pt, ct, 1, &aeadScratch{}); !errors.Is(err, ErrPageIntegrity) {
+		t.Fatalf("flipped-bit decrypt: got err=%v, want ErrPageIntegrity", err)
 	}
 }
 
@@ -100,8 +101,8 @@ func TestChaCha20Poly1305Codec_PageNumberBound(t *testing.T) {
 	dst := make([]byte, pageSize)
 	ct, _ := c.Encrypt(dst, src, 5, &aeadScratch{})
 	pt := make([]byte, pageSize)
-	if _, err := c.Decrypt(pt, ct, 6, &aeadScratch{}); err != ErrCodecTamper {
-		t.Fatalf("wrong-pgno decrypt: got err=%v, want ErrCodecTamper", err)
+	if _, err := c.Decrypt(pt, ct, 6, &aeadScratch{}); !errors.Is(err, ErrPageIntegrity) {
+		t.Fatalf("wrong-pgno decrypt: got err=%v, want ErrPageIntegrity", err)
 	}
 }
 

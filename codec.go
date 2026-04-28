@@ -39,9 +39,18 @@ const CipherChaCha20Poly1305 = btree.CipherChaCha20Poly1305
 // is a concern.
 const CipherXChaCha20Poly1305 = btree.CipherXChaCha20Poly1305
 
-// ErrCodecTamper is returned by a Codec's Decrypt when authentication
-// fails (wrong key, corrupted ciphertext, or tampered bytes).
-var ErrCodecTamper = btree.ErrCodecTamper
+// ErrPageIntegrity is the umbrella error returned (wrapped) by every
+// codec when a page fails its on-disk integrity check, regardless of
+// mode. Callers match it with errors.Is to handle both the cksum-only
+// and AEAD modes uniformly:
+//
+//	if errors.Is(err, anystore.ErrPageIntegrity) { ... }
+//
+// The wrapped inner detail carries the mode-specific message
+// ("checksum mismatch" or "AEAD authentication failed"); callers that
+// need a programmatic discriminator should use SweepError.Kind from
+// VerifyIntegrity instead of parsing strings.
+var ErrPageIntegrity = btree.ErrPageIntegrity
 
 // NewAESCodec constructs a codec using AES-256-GCM with a raw 32-byte key.
 // Prefer EncryptionConfig.Passphrase for the common passphrase-based case;

@@ -504,10 +504,11 @@ func (p *pager) encryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
 
 // decryptPage is the inverse. Returns src unchanged when no codec is
 // installed; otherwise decrypts into scratch and returns the plaintext
-// slice. On AEAD verification failure returns ErrCodecTamper.
-// decryptPage uses the pager's writer-side AEAD scratch. Reader-path
-// callers must NOT go through this; they should call
-// decryptPageWithCodec directly with their own *aeadScratch.
+// slice. On integrity failure returns an error wrapping
+// ErrPageIntegrity (the inner detail distinguishes cksum mismatch vs
+// AEAD auth fail). decryptPage uses the pager's writer-side AEAD
+// scratch. Reader-path callers must NOT go through this; they should
+// call decryptPageWithCodec directly with their own *aeadScratch.
 func (p *pager) decryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
 	return decryptPageWithCodec(p.codec, scratch, src, pgno, &p.codecAEAD)
 }
@@ -759,7 +760,7 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 				plain, derr := p.decryptPage(p.codecScratch, pg.data, pgno)
 				if derr != nil {
 					p.writerCache.discard(pg.pgno)
-					return nil, fmt.Errorf("btree: decrypt page %d: %w", pgno, derr)
+					return nil, fmt.Errorf("btree: page %d: %w", pgno, derr)
 				}
 				copy(pg.data, plain)
 			}
@@ -845,7 +846,7 @@ func (p *pager) readTempPage(pgno, walMaxFrame uint32, codecBuf []byte, codecAEA
 						freePageBuffer(scratch, false)
 					}
 					p.recycleTempPage(pg)
-					return nil, fmt.Errorf("btree: decrypt page %d: %w", pgno, derr)
+					return nil, fmt.Errorf("btree: page %d: %w", pgno, derr)
 				}
 				copy(pg.data, plain)
 				if ownScratch {
@@ -948,7 +949,7 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 				plain, derr := decryptPageWithCodec(p.codec, cache.codecScratch, pg.data, pgno, &cache.codecAEAD)
 				if derr != nil {
 					cache.discard(pg.pgno)
-					return nil, fmt.Errorf("btree: decrypt page %d: %w", pgno, derr)
+					return nil, fmt.Errorf("btree: page %d: %w", pgno, derr)
 				}
 				copy(pg.data, plain)
 			}

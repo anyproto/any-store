@@ -110,7 +110,7 @@ func (db *DB) VerifyIntegrity(ctx context.Context) (SweepResult, error) {
 				// Fire the codec's OnError hook so subscribers see sweep
 				// mismatches the same way they see read-path mismatches.
 				if c := db.CksumCodec(); c != nil {
-					c.fire(pgno, ErrCodecTamper)
+					c.fire(pgno, errCksumMismatch)
 				}
 				res.Errors = append(res.Errors, *e)
 			}

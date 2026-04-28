@@ -119,7 +119,7 @@ func TestIntegrity_AEAD_VerifyIntegrity_AllGood(t *testing.T) {
 }
 
 // TestIntegrity_ContinueOnIntegrityError_Cksum verifies that the flag
-// suppresses the read-path ErrCodecTamper but still fires the callback.
+// suppresses the read-path ErrPageIntegrity but still fires the callback.
 // Models the forensic-dump use case: read past corruption, log every hit.
 func TestIntegrity_ContinueOnIntegrityError_Cksum(t *testing.T) {
 	dir := t.TempDir()
@@ -257,7 +257,7 @@ func TestIntegrity_OnIntegrityError_AEAD_FiresOnSweep(t *testing.T) {
 // TestIntegrity_VerifyIntegrity_DetectsCorruption_Cksum: the sweep is the
 // public detection mechanism for cksum mode (no OnError config exposed at
 // the anystore level — users either call VerifyIntegrity periodically or
-// see ErrCodecTamper bubbling up from regular reads).
+// see ErrPageIntegrity bubbling up from regular reads).
 func TestIntegrity_VerifyIntegrity_DetectsCorruption_Cksum(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "db")

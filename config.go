@@ -119,7 +119,7 @@ type Config struct {
 
 	// ContinueOnIntegrityError, when true, lets reads of corrupt pages
 	// return their (potentially garbage) bytes instead of erroring with
-	// btree.ErrCodecTamper. The OnIntegrityError callback still fires —
+	// ErrPageIntegrity. The OnIntegrityError callback still fires —
 	// only the error-return is suppressed. Mirror of cksumvfs's
 	// `PRAGMA checksum_verification = OFF`.
 	//

@@ -100,9 +100,9 @@ func (c *aesCodec) Encrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte
 	return dst[:len(src)], nil
 }
 
-// Decrypt is the inverse of Encrypt. Returns ErrCodecTamper on any
-// authentication failure (wrong key, corruption, or pgno mismatch).
-// dst must not alias src.
+// Decrypt is the inverse of Encrypt. Returns errAEADAuthFail (wrapping
+// ErrPageIntegrity) on any authentication failure (wrong key, corruption,
+// or pgno mismatch). dst must not alias src.
 func (c *aesCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte, error) {
 	if len(dst) < len(src) {
 		return nil, fmt.Errorf("btree: aesCodec.Decrypt: dst too small (%d < %d)", len(dst), len(src))
@@ -125,7 +125,7 @@ func (c *aesCodec) Decrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte
 	pt, err := c.aead.Open(dst[:0], nonce, ctAndTag, aad)
 	if err != nil {
 		c.fire(pgno, err)
-		return nil, ErrCodecTamper
+		return nil, errAEADAuthFail
 	}
 	if len(pt) != bodyLen {
 		return nil, fmt.Errorf("btree: aesCodec.Decrypt: unexpected plaintext length %d", len(pt))

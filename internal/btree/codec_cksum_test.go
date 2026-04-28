@@ -60,8 +60,8 @@ func TestCksumCodec_TamperReturnsErr(t *testing.T) {
 	out, _ := c.Encrypt(dst, src, 2, &s)
 	out[100] ^= 0x01
 	dst2 := make([]byte, pageSize)
-	if _, err := c.Decrypt(dst2, out, 2, &s); !errors.Is(err, ErrCodecTamper) {
-		t.Fatalf("Decrypt: want ErrCodecTamper, got %v", err)
+	if _, err := c.Decrypt(dst2, out, 2, &s); !errors.Is(err, ErrPageIntegrity) {
+		t.Fatalf("Decrypt: want ErrPageIntegrity, got %v", err)
 	}
 }
 

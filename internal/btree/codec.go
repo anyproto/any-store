@@ -2,6 +2,8 @@ package btree
 
 import (
 	"crypto/rand"
+	"errors"
+	"fmt"
 	"sync/atomic"
 )
 
@@ -33,8 +35,8 @@ type Codec interface {
 	Encrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte, error)
 
 	// Decrypt is the inverse of Encrypt. On tag verification failure it
-	// returns ErrCodecTamper without modifying dst past any intermediate
-	// state. Callers must not use dst on error.
+	// returns an error that wraps ErrPageIntegrity (without modifying dst
+	// past any intermediate state). Callers must not use dst on error.
 	Decrypt(dst, src []byte, pgno uint32, s *aeadScratch) ([]byte, error)
 }
 
@@ -53,10 +55,29 @@ type aeadScratch struct {
 	nonce [24]byte
 }
 
-// ErrCodecTamper indicates the AEAD tag failed to verify. The page has been
-// modified in a way the codec cannot authenticate (wrong key, corruption,
-// or tampering).
-var ErrCodecTamper = codecError("encryption: page authentication failed")
+// ErrPageIntegrity is the umbrella sentinel returned (wrapped) by every
+// codec when a page fails its on-disk integrity check. Both modes report
+// the same outer sentinel so callers can match a single value:
+//
+//	if errors.Is(err, btree.ErrPageIntegrity) { ... }
+//
+// The wrapped inner detail distinguishes the failure mode:
+//
+//	"checksum mismatch"            — cksumCodec (XXH3-128 trailer)
+//	"AEAD authentication failed"   — aesCodec / chachaCodec (Poly1305 / GCM tag)
+//
+// Callers that need to switch on the kind without parsing strings can use
+// SweepError.Kind from VerifyIntegrity instead.
+var ErrPageIntegrity = errors.New("btree: page integrity check failed")
+
+// errCksumMismatch / errAEADAuthFail wrap ErrPageIntegrity at package init
+// so the codec hot paths return a constant value with no per-call
+// allocation. Unexported on purpose — external matching is via
+// errors.Is(err, ErrPageIntegrity).
+var (
+	errCksumMismatch = fmt.Errorf("%w: checksum mismatch", ErrPageIntegrity)
+	errAEADAuthFail  = fmt.Errorf("%w: AEAD authentication failed", ErrPageIntegrity)
+)
 
 // OnErrorSink is implemented by codecs that support a per-page mismatch
 // callback. cksumCodec, aesCodec, and chachaCodec all implement it.
@@ -89,11 +110,6 @@ func (f *onErrorField) fire(pgno uint32, inner error) {
 		(*p)(pgno, inner)
 	}
 }
-
-// codecError is a stdlib-free sentinel error type.
-type codecError string
-
-func (e codecError) Error() string { return string(e) }
 
 // overheadOrZero returns c.Overhead() or 0 if c is nil. Used by the pager
 // to compute ReservedSpace without branching at every call site.
