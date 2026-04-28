@@ -666,7 +666,7 @@ func (p *pager) endRead(slot int) {
 // wal.beginWriteWithSnapshot. The snapshot is required — there is
 // deliberately no zero-arg form, because a WalIndexHdr{} snapshot
 // silently disables the BUSY_SNAPSHOT check and is a multi-process
-// correctness hazard (NOTES.md P0.2 drift, resolved).
+// correctness hazard (docs/btree/NOTES.md P0.2 drift, resolved).
 func (p *pager) beginWrite(readSnap WalIndexHdr) error {
 	stateChanged, err := p.wal.beginWriteWithSnapshot(readSnap)
 	if err != nil {
@@ -2232,7 +2232,7 @@ func (p *pager) tryCheckpoint() error {
 	// Authoritative read: in multi-process mode the process-local cursor can
 	// trail a peer's recent commit; comparing nBackfill against a stale local
 	// cursor can return true prematurely and schedule a RESTART that races
-	// the peer's fresh frames. See NOTES.md §"Checkpoint mxFrame source fix".
+	// the peer's fresh frames. See docs/btree/NOTES.md §"Checkpoint mxFrame source fix".
 	if p.wal.index.nBackfill.Load() >= p.wal.authoritativeMxFrame() {
 		if err := p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil); err == nil {
 			// ~ sqlite3BackupRestart (backup.c:701-707) also applies to

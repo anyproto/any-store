@@ -8,7 +8,7 @@ package btree
 // Each pcache instance is owned by a single goroutine (writer or reader),
 // so no mutex is needed. This matches SQLite's per-connection page cache model.
 //
-// Drifts from SQLite (see NOTES.md section 9 for full table):
+// Drifts from SQLite (see docs/btree/NOTES.md section 9 for full table):
 //   - No PGroup: no cross-cache page stealing; each cache isolated (drift #1)
 //   - No hash table: Go map[uint32]*page instead of apHash[] (drift #2)
 //   - No circular LRU: doubly-linked list with head/tail pointers (drift #3)
@@ -228,7 +228,7 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 		// Merges SQLite's two-phase sqlite3PcacheFetch + sqlite3PcacheFetchStress
 		// (pcache.c:403-490) into a single call. Admission control (step 3),
 		// eviction (step 4), stress callback, and allocation (step 5) are all
-		// handled inline. See "Known Drifts in Page Cache" in NOTES.md.
+		// handled inline. See "Known Drifts in Page Cache" in docs/btree/NOTES.md.
 		spill := pc.szSpill
 		if spill == 0 {
 			spill = pc.maxPages

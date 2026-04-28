@@ -9,7 +9,7 @@ Bump this file when re-syncing against a newer upstream.
 - **Source:** https://sqlite.org/src/
 - **Tracks:** core pager, WAL format, B-tree balance/split, integrity-check,
   SHM index, busy/recovery semantics, and the cksumvfs algorithm shape (we
-  diverge on hash algorithm — see `integrity.md`).
+  diverge on hash algorithm — see `specs/integrity.md`).
 
 Most ported sites in this package cite SQLite source filenames inline
 (e.g. `wal.c:3022-3056`, `pager.c:5507`). When updating to a newer SQLite

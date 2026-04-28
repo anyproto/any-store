@@ -504,7 +504,7 @@ type walIndex struct {
 	// SQLite's lock-free walTryBeginRead design. Do NOT add mu.RLock/Lock
 	// around atomic field accesses.
 	//
-	// DRIFT from SQLite (NOTES.md §20, drifts 2-3): SQLite has no process-local
+	// DRIFT from SQLite (docs/btree/NOTES.md §20, drifts 2-3): SQLite has no process-local
 	// copies of mxCommitFrame, nBackfill, or aReadMark. These values live ONLY
 	// in the mmap'd SHM region (via volatile WalCkptInfo* pointer). We maintain
 	// process-local atomic.Uint32 copies alongside SHM because:
@@ -1143,7 +1143,7 @@ func (wi *walIndex) shmWriteCkptInfo() {
 // calling this concurrently will clobber each other's values, causing stale
 // snapshot reads. Use shmNBackfill/shmReadMark for per-call SHM reads instead.
 // This function is retained for use in tests and single-goroutine contexts only.
-// See NOTES.md §20, drift 6.
+// See docs/btree/NOTES.md §20, drift 6.
 func (wi *walIndex) shmReadCkptInfo() {
 	region, err := wi.shm.region(0, false)
 	if err != nil {
@@ -1431,7 +1431,7 @@ func (w *wal) open() error {
 //     WAL_CKPT_LOCK + WAL_RECOVER_LOCK exclusive to serialize against siblings
 //     that may be trying to initialize concurrently (wal.c:1400-1404).
 //
-// DRIFT from SQLite (NOTES.md): SQLite's walIndexReadHdr uses WAL_WRITE_LOCK
+// DRIFT from SQLite (docs/btree/NOTES.md): SQLite's walIndexReadHdr uses WAL_WRITE_LOCK
 // alone. We additionally take WAL_CKPT_LOCK + WAL_RECOVER_LOCK so a reader
 // triggering recovery fences peers via the same barrier that our Item-1
 // reader handshake uses.
@@ -2382,7 +2382,7 @@ func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err er
 	//   retries 6..9:              1 µs sleep
 	//   retries 10..100:           (cnt-9)² × 39 µs (≈ 323 ms at cnt=100)
 	//
-	// DRIFT from SQLite (NOTES.md §20, drift 5): SQLite does not use a
+	// DRIFT from SQLite (docs/btree/NOTES.md §20, drift 5): SQLite does not use a
 	// *pChanged output signal — pWal->hdr already reflects the current SHM
 	// state after walIndexReadHdr(). Our per-connection caches are invalidated
 	// via dataVersion in DB.beginRead(), not via a signal from tryBeginRead.
@@ -2492,17 +2492,17 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame uint32, slot
 //
 //  1. Read SHM header into a local copy (SQLite: walIndexReadHdr → walIndexTryHdr
 //     copies SHM into pWal->hdr). We use a function-scoped local variable instead
-//     of a persistent per-connection field. (NOTES.md §20, drift 4)
+//     of a persistent per-connection field. (docs/btree/NOTES.md §20, drift 4)
 //  2. Read nBackfill and aReadMark directly from SHM each time (SQLite: volatile
 //     WalCkptInfo *pInfo = walCkptInfo(pWal), then AtomicLoad). We use shmNBackfill()
-//     and shmReadMark() helper functions. (NOTES.md §20, drift 1)
+//     and shmReadMark() helper functions. (docs/btree/NOTES.md §20, drift 1)
 //  3. Claim a reader slot using exclusive lock → write readmark → unlock → shared lock.
 //     Matches SQLite wal.c:3170-3185 exactly.
 //  4. Re-validate after acquiring shared lock: compare live SHM header against local
 //     copy AND live readmark against saved value. If either changed → WAL_RETRY.
 //     Matches SQLite wal.c:3239-3249 (memcmp + AtomicLoad re-check).
 //  5. Sync nBackfill to process-local atomic for walIndex.get() minFrame filter.
-//     (NOTES.md §20, drift 3 — SQLite doesn't need this sync step because it reads
+//     (docs/btree/NOTES.md §20, drift 3 — SQLite doesn't need this sync step because it reads
 //     nBackfill directly from SHM via pInfo pointer everywhere)
 func (w *wal) tryBeginReadMultiProcess() (maxFrame uint32, slot int, err error) {
 	_, maxFrame, slot, err = w.tryBeginReadMultiProcessHdr()
@@ -3216,7 +3216,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 			// (key, pgno) pair only sees a given plaintext once per frame,
 			// since each new modification gets a fresh WAL frame with a fresh
 			// nonce — and (b) WAL ciphertext and DB-file ciphertext share
-			// codec, key, and layout. See encryption-plan.md Task 8.
+			// codec, key, and layout. See docs/btree/plans/encryption-plan.md Task 8.
 			// Matches SQLCipher wal.c:2309-2315 (OsRead → OsWrite with no
 			// codec hook between them).
 			// END ENCRYPTION

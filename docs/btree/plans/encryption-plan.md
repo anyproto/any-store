@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add optional page-level authenticated encryption to the any-store btree engine, following the SQLCipher integration map in `SQLCipher_todo.md`, using Go stdlib crypto primitives, with a pluggable codec interface so callers can bring their own AEAD.
+**Goal:** Add optional page-level authenticated encryption to the any-store btree engine, following the SQLCipher integration map in `../specs/sqlcipher-todo.md`, using Go stdlib crypto primitives, with a pluggable codec interface so callers can bring their own AEAD.
 
 **Architecture:** One new abstraction (`Codec` interface) with a default stdlib `AES-256-GCM` implementation. Encryption is installed on the pager at `Open` time when `Options.Key != nil` (or `Options.Codec != nil` for custom AEADs). All encryption touch-points in existing files are bracketed with `// BEGIN ENCRYPTION` / `// END ENCRYPTION` comment markers so they can be grep-located later, mirroring SQLCipher's `/* BEGIN SQLCIPHER */` convention. When no codec is installed, every hot-path site is a single nil-pointer branch (invisible under CPU branch prediction) — zero meaningful overhead for the unencrypted path.
 
@@ -30,24 +30,24 @@ Rules:
 
 ---
 
-## Drift from SQLCipher_todo.md
+## Drift from ../specs/sqlcipher-todo.md
 
-The plan deviates from SQLCipher_todo.md in these places, with justification:
+The plan deviates from ../specs/sqlcipher-todo.md in these places, with justification:
 
 | Deviation | Justification |
 |---|---|
-| **AES-256-GCM instead of AES-256-CBC+HMAC-SHA512.** | Covered in `encryption.md` §4.4 and §13.1. GCM is a single-pass AEAD, ~6× faster on AES-NI hardware, smaller reserve (32 B vs 80 B), one key instead of two, stdlib native. No reason to inherit SQLCipher's pre-AEAD-era design choices in 2026. |
-| **One crypto file, not three.** | `SQLCipher_todo.md` §A lists three backend files (`crypto_openssl.c`, `crypto_cc.c`, `crypto_libtomcrypt.c`) explicitly marked "Skip in any-store". Go stdlib `crypto/cipher` replaces all three. |
-| **No PRAGMA surface.** | `SQLCipher_todo.md` §D (pragma.c items) marked "skip — no SQL". any-store has no SQL; configuration flows through `Options`. |
-| **No ATTACH / VACUUM handling.** | `SQLCipher_todo.md` §E (attach.c, vacuum.c) — any-store has neither feature. |
-| **No shell / TCL / URI-param integration.** | `SQLCipher_todo.md` §G, §H, and part of §C. any-store has no CLI shell or test harness written in TCL. |
-| **No rollback/statement journal encryption.** | `SQLCipher_todo.md` entries `pager.c:2504, 2580, 4676` — any-store is WAL-only with no rollback or statement journal. |
-| **Page 1 layout differs.** | `encryption.md` §3 — any-store's dbHeader is 100 bytes vs SQLCipher's 16. Salt is stored in the currently-unused reserved-for-expansion bytes 72-87; plaintext prefix is 100 bytes; encryption begins at byte 100. |
-| **Single Key field, not PRAGMA key flow.** | `encryption.md` §8 and §13.10. Go idiom: struct fields at Open, not a post-open command. |
+| **AES-256-GCM instead of AES-256-CBC+HMAC-SHA512.** | Covered in `../specs/encryption.md` §4.4 and §13.1. GCM is a single-pass AEAD, ~6× faster on AES-NI hardware, smaller reserve (32 B vs 80 B), one key instead of two, stdlib native. No reason to inherit SQLCipher's pre-AEAD-era design choices in 2026. |
+| **One crypto file, not three.** | `../specs/sqlcipher-todo.md` §A lists three backend files (`crypto_openssl.c`, `crypto_cc.c`, `crypto_libtomcrypt.c`) explicitly marked "Skip in any-store". Go stdlib `crypto/cipher` replaces all three. |
+| **No PRAGMA surface.** | `../specs/sqlcipher-todo.md` §D (pragma.c items) marked "skip — no SQL". any-store has no SQL; configuration flows through `Options`. |
+| **No ATTACH / VACUUM handling.** | `../specs/sqlcipher-todo.md` §E (attach.c, vacuum.c) — any-store has neither feature. |
+| **No shell / TCL / URI-param integration.** | `../specs/sqlcipher-todo.md` §G, §H, and part of §C. any-store has no CLI shell or test harness written in TCL. |
+| **No rollback/statement journal encryption.** | `../specs/sqlcipher-todo.md` entries `pager.c:2504, 2580, 4676` — any-store is WAL-only with no rollback or statement journal. |
+| **Page 1 layout differs.** | `../specs/encryption.md` §3 — any-store's dbHeader is 100 bytes vs SQLCipher's 16. Salt is stored in the currently-unused reserved-for-expansion bytes 72-87; plaintext prefix is 100 bytes; encryption begins at byte 100. |
+| **Single Key field, not PRAGMA key flow.** | `../specs/encryption.md` §8 and §13.10. Go idiom: struct fields at Open, not a post-open command. |
 | **Pluggable via `Options.Codec`.** | The user asked for pluggability; we expose the interface as a public extension point. SQLCipher exposes `sqlcipher_register_provider`; this is the Go equivalent and strictly more ergonomic. |
 | **Bump `go.mod` from 1.23 → 1.24.** | Needed for stdlib `crypto/pbkdf2`. Tiny risk — the toolchain pin is already 1.24.1. Alternative is `golang.org/x/crypto/pbkdf2`, but "use stdlib when possible" (user instruction) prefers the stdlib path. |
 
-All skipped items from `SQLCipher_todo.md` remain skipped in this plan with the same justification.
+All skipped items from `../specs/sqlcipher-todo.md` remain skipped in this plan with the same justification.
 
 ---
 
@@ -1060,7 +1060,7 @@ git -c commit.gpgsign=false commit -m "btree: add pager encrypt/decrypt helpers 
 
 ## Task 7: Pager — hook helpers at file read sites
 
-**Goal:** Route every file-level page read through `decryptPage`. Three sites: `getPageWriter`, `getPageReader`, `readTempPage`. Also applies to the `masterStore` read path for InMemory mode — per `encryption.md` §7 we skip masterStore encryption, so no change there.
+**Goal:** Route every file-level page read through `decryptPage`. Three sites: `getPageWriter`, `getPageReader`, `readTempPage`. Also applies to the `masterStore` read path for InMemory mode — per `../specs/encryption.md` §7 we skip masterStore encryption, so no change there.
 
 **Files:**
 - Modify: `internal/btree/pager.go`
@@ -1196,7 +1196,7 @@ git -c commit.gpgsign=false commit -m "btree: hook codec at checkpoint file-writ
 
 ## Task 9: WAL — encrypt on frame write
 
-**Goal:** Every frame written to the WAL file carries an encrypted payload. The frame header (24 bytes: pgno, dbSize, salt1, salt2, checksum1, checksum2) stays plaintext per `encryption.md` §4.
+**Goal:** Every frame written to the WAL file carries an encrypted payload. The frame header (24 bytes: pgno, dbSize, salt1, salt2, checksum1, checksum2) stays plaintext per `../specs/encryption.md` §4.
 
 **Files:**
 - Modify: `internal/btree/wal.go`
@@ -1320,7 +1320,7 @@ git -c commit.gpgsign=false commit -m "btree: decrypt WAL frame payloads on read
 **Files:**
 - Modify: `internal/btree/wal.go`
 
-**Drift note:** This task departs slightly from `encryption.md` §7's recommendation to skip encryption in InMemory mode. The rationale: *masterStore* (InMemory mode's disk replacement) skips encryption, but *WAL frames in memory* are a transient buffer between commits; keeping the codec path uniform reduces branch complexity and the cost is zero when no codec is installed. If benchmarks show it hurts InMemory-mode throughput, revisit.
+**Drift note:** This task departs slightly from `../specs/encryption.md` §7's recommendation to skip encryption in InMemory mode. The rationale: *masterStore* (InMemory mode's disk replacement) skips encryption, but *WAL frames in memory* are a transient buffer between commits; keeping the codec path uniform reduces branch complexity and the cost is zero when no codec is installed. If benchmarks show it hurts InMemory-mode throughput, revisit.
 
 - [ ] **Step 11.1: Locate `writeFramesMem` and its in-memory read path**
 
@@ -1976,11 +1976,11 @@ git -c commit.gpgsign=false commit -am "btree: final cleanup after encryption-la
 
 ## Out-of-scope (deferred for later PRs)
 
-- **Rekey** (`sqlite3_rekey` equivalent) — walks every page to re-encrypt with a new key. Requires a full write transaction and two codec contexts. See `encryption.md` §7.7 for the flow. Defer until a concrete use case arises.
-- **Backup API** (`SQLCipher_todo.md` §E `backup.c:800`) — any-store has no backup API yet; add codec-aware backup when backup is introduced.
+- **Rekey** (`sqlite3_rekey` equivalent) — walks every page to re-encrypt with a new key. Requires a full write transaction and two codec contexts. See `../specs/encryption.md` §7.7 for the flow. Defer until a concrete use case arises.
+- **Backup API** (`../specs/sqlcipher-todo.md` §E `backup.c:800`) — any-store has no backup API yet; add codec-aware backup when backup is introduced.
 - **`cipher_migrate` equivalent** — any-store has one format version; not needed until v2 format ships.
-- **Memory-security allocator** (`SQLCipher_todo.md` §F `malloc.c:172`) — plan uses `defer clear()` on sensitive buffers inline. A global zeroing allocator can come later if a threat model demands it.
-- **Per-transaction nonce batching** — mentioned as potential optimisation in `encryption.md` §9.4. Revisit only if benchmarks in Task 15 show `crypto/rand` as a hotspot.
+- **Memory-security allocator** (`../specs/sqlcipher-todo.md` §F `malloc.c:172`) — plan uses `defer clear()` on sensitive buffers inline. A global zeroing allocator can come later if a threat model demands it.
+- **Per-transaction nonce batching** — mentioned as potential optimisation in `../specs/encryption.md` §9.4. Revisit only if benchmarks in Task 15 show `crypto/rand` as a hotspot.
 - **ChaCha20-Poly1305 codec** — easy to add via `Options.Codec`; no need to ship one out of the box.
 
 These are all additive — nothing in this plan blocks them, and nothing here depends on them.

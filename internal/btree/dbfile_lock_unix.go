@@ -18,7 +18,7 @@ import (
 // attach" at the DB-file lock level.
 //
 // any-store used to handle this via SHM dead-man-switch (DMS) alone, which
-// left a narrow orphan-inode window (see NOTES.md §SHM open/close protocol
+// left a narrow orphan-inode window (see docs/btree/NOTES.md §SHM open/close protocol
 // drift). This file adopts SQLite's approach — adapted to use BSD flock
 // (whole-file, per-file-description) instead of byte-range fcntl. flock
 // semantics dodge POSIX fcntl's "close any fd releases all locks on inode"

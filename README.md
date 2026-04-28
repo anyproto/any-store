@@ -147,7 +147,7 @@ fmt.Printf("scanned %d pages, %d errors\n", rep.Pages, len(rep.Errors))
 
 Page-1 DB header (first 100 bytes) is not covered by the per-page hash;
 SQLite-format invariants there are validated separately at open.
-See [internal/btree/integrity.md](internal/btree/integrity.md) for the full design.
+See [docs/btree/specs/integrity.md](docs/btree/specs/integrity.md) for the full design.
 
 
 ## Contributing

@@ -63,7 +63,7 @@ type mmapShm struct {
 // before that closer ever unlinked — so by the time we are here, the shm
 // path→inode mapping is either fresh (closer already unlinked and we/peer
 // created a new one) or stably attached. Either way the old inode-verify
-// retry loop is obsolete — see any-store/internal/btree/NOTES.md §SHM open/
+// retry loop is obsolete — see docs/btree/NOTES.md §SHM open/
 // close protocol drift.
 func newPlatformShm(path string) (shm, error) {
 	f, err := osOpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
