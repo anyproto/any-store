@@ -21,9 +21,9 @@ Generated (`*.gen.json`, gitignored — never edit):
 ## Regenerate
 
 ```sh
-go run ./docs/mappings/scripts/extract_funcs    # rescan Go + C sources
-go run ./docs/mappings/scripts/mappings_diff    # triage report (optional)
-go run ./docs/mappings/scripts/build_mappings   # rebuild reverse map + unmapped list
+go run ./docs/btree/mappings/scripts/extract_funcs    # rescan Go + C sources
+go run ./docs/btree/mappings/scripts/mappings_diff    # triage report (optional)
+go run ./docs/btree/mappings/scripts/build_mappings   # rebuild reverse map + unmapped list
 ```
 
 `mappings_diff` reports four buckets — new Go funcs needing rows, orphan rows for removed Go funcs, new SQLite funcs needing a map-or-skip decision, and stale cites/skip entries for removed SQLite funcs — plus a count of untriaged stub rows. Always exits 0 (triage, not gating).

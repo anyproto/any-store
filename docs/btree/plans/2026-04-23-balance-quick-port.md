@@ -8,7 +8,7 @@
 
 **Tech Stack:** Go 1.24+, any-store's internal btree package (`internal/btree/`), testify, stdlib `testing`. All changes are package-internal; no public API surface changes.
 
-**Spec:** [`docs/superpowers/specs/2026-04-23-balance-quick-port-design.md`](../specs/2026-04-23-balance-quick-port-design.md)
+**Spec:** [`docs/btree/specs/2026-04-23-balance-quick-port-design.md`](../specs/2026-04-23-balance-quick-port-design.md)
 
 **SQLite source:** `/home/dev/work/sqlitec/src/` (referenced as `btree.c:NNNN`, `btree.h:NNNN`, `btreeInt.h:NNNN` throughout).
 
@@ -73,7 +73,7 @@ monotonic within a process, so every collection.Insert is a rightmost
 append — this pattern dominates any-store writes.
 
 Diagnostic only; no assertions. Commit 4 of the balance_quick port
-(docs/superpowers/plans/2026-04-23-balance-quick-port.md) promotes
+(docs/btree/plans/2026-04-23-balance-quick-port.md) promotes
 this into a regression guard with explicit fill-factor bounds.
 EOF
 )"
@@ -467,7 +467,7 @@ import (
 // rightChild pointer (cellIdx == nCell).
 //
 // This is the structural precondition for the balance_quick fast path
-// (docs/superpowers/specs/2026-04-23-balance-quick-port-design.md §4-5).
+// (docs/btree/specs/2026-04-23-balance-quick-port-design.md §4-5).
 func TestPath_CellIdxRightmost(t *testing.T) {
 	resetPageBufferPool()
 	dir := t.TempDir()

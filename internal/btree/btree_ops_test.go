@@ -5901,7 +5901,7 @@ func TestCov_CountPageInteriorRightChildGetPageError(t *testing.T) {
 // rightChild pointer (cellIdx == nCell).
 //
 // This is the structural precondition for the balance_quick fast path
-// (docs/superpowers/specs/2026-04-23-balance-quick-port-design.md §4-5).
+// (docs/btree/specs/2026-04-23-balance-quick-port-design.md §4-5).
 func TestPath_CellIdxRightmost(t *testing.T) {
 	resetPageBufferPool()
 	dir := t.TempDir()

@@ -1,12 +1,12 @@
 // Rebuilds the derived mapping artifacts from go_to_sqlite.json.
 //
-// Inputs (all under docs/mappings/):
+// Inputs (all under docs/btree/mappings/):
 //
 //	go_to_sqlite.json         — authoritative forward map, keyed by "<go_file>:<func>"
 //	any_store_funcs.gen.json  — canonical Go-func list
 //	sqlite_funcs.gen.json     — canonical SQLite-func allowlist
 //
-// Outputs (all under docs/mappings/):
+// Outputs (all under docs/btree/mappings/):
 //
 //	sqlite_to_go.gen.json           — reverse map, keyed by "<sqlite_file>:<func>", value is
 //	                                  the list of Go citers (empty list when uncited)
@@ -16,7 +16,7 @@
 // any_store_funcs.gen.json) and sorted cite lists.
 // Run from the repo root:
 //
-//	go run ./docs/mappings/scripts/build_mappings
+//	go run ./docs/btree/mappings/scripts/build_mappings
 package main
 
 import (
@@ -42,7 +42,7 @@ type FuncEntry struct {
 
 func main() {
 	var (
-		dir = flag.String("dir", "docs/mappings", "directory holding all mapping files (inputs and outputs)")
+		dir = flag.String("dir", "docs/btree/mappings", "directory holding all mapping files (inputs and outputs)")
 	)
 	flag.Parse()
 

@@ -5,4 +5,4 @@
 .ralphex/progress/
 
 # generated mapping artifacts — produced by scripts/extract_funcs and scripts/build_mappings
-docs/mappings/*.gen.json
+docs/btree/mappings/*.gen.json

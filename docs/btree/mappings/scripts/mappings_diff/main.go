@@ -5,9 +5,9 @@
 //
 // Run from the repo root, after extract_funcs:
 //
-//	go run ./docs/mappings/scripts/extract_funcs
-//	go run ./docs/mappings/scripts/mappings_diff
-//	go run ./docs/mappings/scripts/build_mappings
+//	go run ./docs/btree/mappings/scripts/extract_funcs
+//	go run ./docs/btree/mappings/scripts/mappings_diff
+//	go run ./docs/btree/mappings/scripts/build_mappings
 //
 // Reports four buckets:
 //
@@ -45,7 +45,7 @@ type SkipGroup struct {
 }
 
 func main() {
-	dir := flag.String("dir", "docs/mappings", "directory holding all mapping files")
+	dir := flag.String("dir", "docs/btree/mappings", "directory holding all mapping files")
 	flag.Parse()
 
 	goActual := loadFuncSet(filepath.Join(*dir, "any_store_funcs.gen.json"))

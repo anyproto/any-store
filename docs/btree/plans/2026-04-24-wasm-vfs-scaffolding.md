@@ -8,7 +8,7 @@
 
 **Tech Stack:** Go 1.23+ with `syscall/js`, Go build tags, Make, plain JavaScript (ES modules). No bundler, no TypeScript.
 
-**Spec:** `docs/superpowers/specs/2026-04-24-wasm-vfs-scaffolding-design.md`
+**Spec:** `docs/btree/specs/2026-04-24-wasm-vfs-scaffolding-design.md`
 
 **Reference to port from:** `/home/dev/work/any-crdt-sdk/wasm/`
 

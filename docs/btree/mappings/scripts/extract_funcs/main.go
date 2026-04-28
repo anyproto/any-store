@@ -1,15 +1,15 @@
 // Extracts function lists from two sources and writes them to JSON files:
 //
-//	docs/mappings/sqlite_funcs.gen.json     — functions from SQLite C sources (btree/wal/pager/pcache/os_unix shm bits)
-//	docs/mappings/any_store_funcs.gen.json  — functions from internal/btree Go sources
+//	docs/btree/mappings/sqlite_funcs.gen.json     — functions from SQLite C sources (btree/wal/pager/pcache/os_unix shm bits)
+//	docs/btree/mappings/any_store_funcs.gen.json  — functions from internal/btree Go sources
 //
 // Run from the repo root:
 //
-//	go run ./docs/mappings/scripts/extract_funcs \
+//	go run ./docs/btree/mappings/scripts/extract_funcs \
 //	    -c   ../sqlitec/src \
 //	    -go  ./internal/btree \
-//	    -out-c  docs/mappings/sqlite_funcs.gen.json \
-//	    -out-go docs/mappings/any_store_funcs.gen.json
+//	    -out-c  docs/btree/mappings/sqlite_funcs.gen.json \
+//	    -out-go docs/btree/mappings/any_store_funcs.gen.json
 package main
 
 import (
@@ -35,8 +35,8 @@ func main() {
 	var (
 		cDir    = flag.String("c", "../sqlitec/src", "directory with SQLite C sources")
 		goDir   = flag.String("go", "./internal/btree", "directory with Go sources")
-		outC    = flag.String("out-c", "docs/mappings/sqlite_funcs.gen.json", "output JSON for C")
-		outGo   = flag.String("out-go", "docs/mappings/any_store_funcs.gen.json", "output JSON for Go")
+		outC    = flag.String("out-c", "docs/btree/mappings/sqlite_funcs.gen.json", "output JSON for C")
+		outGo   = flag.String("out-go", "docs/btree/mappings/any_store_funcs.gen.json", "output JSON for Go")
 		cFiles  = flag.String("c-files", "btree.c,btree.h,btreeInt.h,wal.c,wal.h,pager.c,pager.h,pcache.c,pcache.h,pcache1.c,memdb.c,backup.c,util.c,os_unix.c,os_win.c", "comma-separated C files to scan (relative to -c)")
 		shmOnly = flag.Bool("shm-filter-os", true, "for os_unix.c/os_win.c, keep only shm-related functions")
 	)
