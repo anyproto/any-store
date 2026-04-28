@@ -21,8 +21,8 @@ Generated (`*.gen.json`, gitignored — never edit):
 ## Regenerate
 
 ```sh
-go run ./scripts/extract_funcs    # rescan Go + C sources
-go run ./scripts/build_mappings   # rebuild reverse map + unmapped list
+go run ./docs/mappings/scripts/extract_funcs    # rescan Go + C sources
+go run ./docs/mappings/scripts/build_mappings   # rebuild reverse map + unmapped list
 ```
 
 `build_mappings` also reformats `go_to_sqlite.json` in place (deterministic key order, sorted cites) and fails if any cite isn't in the SQLite allowlist or any Go func is missing a row.

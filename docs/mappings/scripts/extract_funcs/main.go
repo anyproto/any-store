@@ -3,9 +3,9 @@
 //	docs/mappings/sqlite_funcs.gen.json     — functions from SQLite C sources (btree/wal/pager/pcache/os_unix shm bits)
 //	docs/mappings/any_store_funcs.gen.json  — functions from internal/btree Go sources
 //
-// Run:
+// Run from the repo root:
 //
-//	go run ./scripts/extract_funcs \
+//	go run ./docs/mappings/scripts/extract_funcs \
 //	    -c   ../sqlitec/src \
 //	    -go  ./internal/btree \
 //	    -out-c  docs/mappings/sqlite_funcs.gen.json \

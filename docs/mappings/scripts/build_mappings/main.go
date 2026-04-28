@@ -14,9 +14,9 @@
 //
 // go_to_sqlite.json is rewritten in place with deterministic key ordering (the order of
 // any_store_funcs.gen.json) and sorted cite lists.
-// Run:
+// Run from the repo root:
 //
-//	go run ./scripts/build_mappings
+//	go run ./docs/mappings/scripts/build_mappings
 package main
 
 import (
