@@ -198,11 +198,14 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	})
 
 	// Collect all matching docIds into a contiguous buffer to avoid
-	// per-ID allocations and cursor invalidation during updates.
+	// per-ID allocations and cursor invalidation during updates. Dedup
+	// multi-key entries so an UpdateMany over an array-indexed $in
+	// query doesn't apply the modifier twice to the same doc.
 	var idBuf []byte       // contiguous buffer for all IDs
 	var idOffsets []uint32 // start offsets of each ID in idBuf
+	var dedup qplanner.DocDedup
 	for {
-		_, docId, _, iterErr := plan.Root.Next()
+		_, docId, mk, iterErr := plan.Root.Next()
 		if iterErr != nil {
 			plan.Close()
 			err = iterErr
@@ -210,6 +213,9 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		}
 		if docId == nil {
 			break
+		}
+		if !dedup.Accept(docId, mk) {
+			continue
 		}
 		idOffsets = append(idOffsets, uint32(len(idBuf)))
 		idBuf = append(idBuf, docId...)
@@ -316,10 +322,13 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	})
 
 	// Collect IDs to delete into a contiguous buffer (can't modify while iterating).
+	// Dedup multi-key entries so a doc matched on multiple array values
+	// isn't deleted twice / counted twice in the affected count.
 	var idBuf []byte
 	var idOffsets []uint32
+	var dedup qplanner.DocDedup
 	for {
-		_, docId, _, iterErr := plan.Root.Next()
+		_, docId, mk, iterErr := plan.Root.Next()
 		if iterErr != nil {
 			plan.Close()
 			err = iterErr
@@ -327,6 +336,9 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 		}
 		if docId == nil {
 			break
+		}
+		if !dedup.Accept(docId, mk) {
+			continue
 		}
 		idOffsets = append(idOffsets, uint32(len(idBuf)))
 		idBuf = append(idBuf, docId...)
@@ -418,7 +430,10 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 			FieldBounds: &br,
 		})
 
-		// Use batch counting if the root iterator supports it (covering index count)
+		// Use batch counting if the root iterator supports it (covering index
+		// count). IndexIter.CountEntries handles the multi-bound + multi-key
+		// dedup internally via the per-entry value byte; consumers don't need
+		// to layer another dedup on top.
 		if ci, ok := plan.Root.(qplanner.CountableIterator); ok {
 			n, cerr := ci.CountEntries()
 			if cerr != nil {
@@ -427,15 +442,20 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 			count = n
 			return nil
 		}
+		// Generic Next-loop count: dedup multi-key entries so a doc whose
+		// array values match multiple bounds is counted once.
+		var dedup qplanner.DocDedup
 		for {
-			_, docId, _, iterErr := plan.Root.Next()
+			_, docId, mk, iterErr := plan.Root.Next()
 			if iterErr != nil {
 				return iterErr
 			}
 			if docId == nil {
 				break
 			}
-			count++
+			if dedup.Accept(docId, mk) {
+				count++
+			}
 		}
 		return nil
 	})

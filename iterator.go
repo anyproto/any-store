@@ -37,26 +37,36 @@ type planIterator struct {
 	dataCursor *btree.Cursor
 	docId      []byte
 	closed     bool
+	dedup      qplanner.DocDedup // lazy-allocated when upstream emits multiKey=true
 }
 
 func (pi *planIterator) Next() bool {
 	if pi.err != nil || pi.closed {
 		return false
 	}
-	pi.plan.DocParsed = nil
-	_, docId, _, err := pi.plan.Root.Next()
-	if err != nil {
-		pi.err = err
-		return false
+	for {
+		pi.plan.DocParsed = nil
+		_, docId, mk, err := pi.plan.Root.Next()
+		if err != nil {
+			pi.err = err
+			return false
+		}
+		if docId == nil {
+			return false
+		}
+		// Skip duplicates emitted by multi-key sources (e.g. an
+		// $in over an array index where a doc matches multiple bounds).
+		// multiKey=false is a hard guarantee from upstream; the helper
+		// bypasses the seen-set entirely in that case.
+		if !pi.dedup.Accept(docId, mk) {
+			continue
+		}
+		if pi.plan.DocParsed == nil {
+			// Only copy docId when we'll need it in Doc() fallback
+			pi.docId = append(pi.docId[:0], docId...)
+		}
+		return true
 	}
-	if docId == nil {
-		return false
-	}
-	if pi.plan.DocParsed == nil {
-		// Only copy docId when we'll need it in Doc() fallback
-		pi.docId = append(pi.docId[:0], docId...)
-	}
-	return true
 }
 
 func (pi *planIterator) Doc() (Doc, error) {
