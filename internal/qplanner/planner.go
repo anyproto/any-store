@@ -886,18 +886,18 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	var root Iterator = &b.indexIter
 
 	// Covering index count: when only counting and the index has exact equality
-	// bounds (PointLookup) that cover all filter fields, skip FetchIter and FilterIter.
-	// Equality bounds are precise: each index entry in the range matches the filter.
-	// Range/exclusive bounds are NOT safe because non-unique index key suffixes
-	// can cause incorrect inclusive/exclusive comparisons.
+	// bounds (PointLookup) that cover all filter fields, skip FetchIter and
+	// FilterIter and return the raw IndexIter. Count() short-circuits via
+	// IndexIter.CountEntries.
 	//
-	// Multi-range PointLookup (e.g. $in over many values) may yield multiple
-	// index entries per doc on multi-key indexes, inflating the entry-count.
-	// Fall through to the full pipeline (Fetch → Filter → Dedup) whenever
-	// len(Bounds) > 1. Single-bound PointLookup is always safe: within-doc
-	// dedup in insertKeys means at most one index entry per distinct value
-	// per doc, scalar or compound.
-	if params.CountOnly && idx.PointLookup && indexCoversFilter(idx, params.Filter) && len(idx.Bounds) <= 1 {
+	// Multi-bound safety: IndexIter.CountEntries inspects each entry's
+	// per-entry value byte (see qplanner.IndexEntryFlagMultiKey) and
+	// applies a lazy seen-set only for multi-key (or legacy) entries.
+	// Scalar entries stream-count without dedup overhead. So a multi-bound
+	// $in over a multi-key array index is correctly deduped without a
+	// Fetch/Filter wrap, and over a scalar field stays as fast as a
+	// single-bound count.
+	if params.CountOnly && idx.PointLookup && indexCoversFilter(idx, params.Filter) {
 		return root
 	}
 
@@ -930,23 +930,26 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	}
 
 	// Dedup wrap for multi-key safety.
-	// Single-field indexes use canonical-key dedup (O(1) memory, streaming).
-	// Compound indexes use the hash-set fallback because canonical-key
-	// selection across compound tuples is non-trivial and deliberately
-	// out of scope here — see docs/plans/2026-04-17-multikey-index-dedup.md.
-	// Both branches wrap even when Bounds is empty: a bound-less
-	// IndexScan (pure Sort("tags")) still produces one hit per array
-	// element of every doc.
-	switch {
-	case len(idx.Info.FieldPaths) == 1:
+	//
+	// Single-field indexes use canonical-key dedup (O(1) memory, streaming)
+	// to filter duplicates upstream of the sort/fetch chain — useful when
+	// the result set is huge and the consumer's seen-set would balloon.
+	//
+	// Compound indexes have no equivalent O(1) dedup (canonical-key
+	// selection across compound tuples is non-trivial — see
+	// docs/plans/2026-04-17-multikey-index-dedup.md). For them we rely on
+	// the consumer-side DocDedup helper threaded via Iterator.multiKey:
+	// IndexIter sets multiKey based on the per-entry value byte, every
+	// iterator passes it through, and planIterator.Next /
+	// query.go consumers dedup at the boundary. No per-query map is
+	// allocated for fully-scalar streams.
+	if len(idx.Info.FieldPaths) == 1 {
 		root = &CanonicalKeyDedupIter{
 			Source:    root,
 			Bounds:    idx.Bounds,
 			FieldPath: idx.Info.FieldPaths[0],
 			Reverse:   reverse,
 		}
-	case len(idx.Info.FieldPaths) > 1:
-		root = &SeenSetDedupIter{Source: root}
 	}
 
 	if needSort && !idx.ExactSort {
@@ -1015,17 +1018,17 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 		}
 	}
 
-	// Dedup wrap — see buildIndexSeekChain for rationale.
-	switch {
-	case len(idx.Info.FieldPaths) == 1:
+	// Dedup wrap — see buildIndexSeekChain for rationale. Single-field gets
+	// the streaming canonical-key dedup; compound multi-key relies on
+	// consumer-side DocDedup via the multiKey flag flowing through the
+	// chain from IndexIter's per-entry value byte.
+	if len(idx.Info.FieldPaths) == 1 {
 		root = &CanonicalKeyDedupIter{
 			Source:    root,
 			Bounds:    idx.Bounds,
 			FieldPath: idx.Info.FieldPaths[0],
 			Reverse:   reverse,
 		}
-	case len(idx.Info.FieldPaths) > 1:
-		root = &SeenSetDedupIter{Source: root}
 	}
 
 	// No sort needed — index provides the order
@@ -1070,8 +1073,6 @@ func setPlanRef(it Iterator, plan *Plan) {
 		setPlanRef(v.Source, plan)
 	case *CanonicalKeyDedupIter:
 		v.Plan = plan
-		setPlanRef(v.Source, plan)
-	case *SeenSetDedupIter:
 		setPlanRef(v.Source, plan)
 	}
 }

@@ -648,32 +648,10 @@ func TestSetPlanRef_Coverage_DedupChainPropagation(t *testing.T) {
 	assert.Same(t, plan, fetch.Plan, "FetchIter.Plan must be set")
 }
 
-// TestSetPlanRef_Coverage_SeenSetDedupChainPropagation asserts the same
-// propagation for SeenSetDedupIter-wrapped chains (compound multi-key case).
-// SeenSetDedupIter itself has no Plan field, but the setPlanRef case for
-// it must still recurse into Source so downstream FilterIter/FetchIter
-// receive the Plan reference.
-func TestSetPlanRef_Coverage_SeenSetDedupChainPropagation(t *testing.T) {
-	leaf := &IndexIter{
-		IdxInfo: &IndexInfo{Name: "compound", FieldNames: []string{"a", "b"}},
-	}
-	fetch := &FetchIter{
-		Source: leaf,
-		Buf:    &syncpool.DocBuffer{},
-	}
-	filter := &FilterIter{
-		Source: fetch,
-		Filter: query.MustParseCondition(`{"a": 1}`),
-		Buf:    &syncpool.DocBuffer{},
-	}
-	dedup := &SeenSetDedupIter{Source: filter}
-
-	plan := &Plan{}
-	setPlanRef(dedup, plan)
-
-	assert.Same(t, plan, filter.Plan, "FilterIter.Plan must be set through SeenSetDedupIter")
-	assert.Same(t, plan, fetch.Plan, "FetchIter.Plan must be set through SeenSetDedupIter")
-}
+// (TestSetPlanRef_Coverage_SeenSetDedupChainPropagation removed: the
+// compound multi-key dedup wrap was dropped from the planner pipeline.
+// Plan-ref propagation through the remaining chain is covered by the
+// CanonicalKey variant above and by the case branches in setPlanRef.)
 
 // --- Coverage tests from limit_iter_coverage_test.go ---
 
@@ -1407,10 +1385,22 @@ func TestBuildPlan_Coverage_CountOnly_MultiRangeInDisablesFastPath(t *testing.T)
 	require.NotNil(t, plan.Root)
 
 	chain := plan.Root.String()
-	// Fast-path would yield a bare IndexScan (no Fetch/Dedup). Multi-range
-	// $in must route through the full pipeline with a Dedup wrap.
-	assert.Contains(t, chain, "Dedup", "multi-range $in must use the dedup pipeline")
-	assert.Contains(t, chain, "Fetch", "multi-range $in must fetch docs for filtering/dedup")
+	// Multi-range $in on a covering index now uses the optimised fast path:
+	// raw IndexIter, with multi-bound dedup handled internally by
+	// IndexIter.CountEntries (per-entry value byte). No Fetch / Filter /
+	// Dedup wrap.
+	assert.NotContains(t, chain, "Fetch",
+		"multi-range $in covering count must bypass FetchIter (fast path with internal dedup)")
+	assert.NotContains(t, chain, "Filter",
+		"multi-range $in covering count must bypass FilterIter")
+	assert.NotContains(t, chain, "Dedup",
+		"multi-range $in covering count handles dedup inside IndexIter.CountEntries, not via a wrapping iterator")
+
+	// CountableIterator implementation must be present so collQuery.Count
+	// short-circuits through the batch path.
+	_, isCountable := plan.Root.(CountableIterator)
+	assert.True(t, isCountable,
+		"plan root must satisfy CountableIterator for collQuery.Count fast path")
 }
 
 // TestBuildPlan_Coverage_CountOnly_SingleBoundAllowsFastPath is the positive
@@ -2076,13 +2066,7 @@ func TestSetPlanRef(t *testing.T) {
 		assert.Same(t, plan, d.Plan)
 		assert.Same(t, plan, inner.Plan)
 	})
-	// --- SeenSetDedupIter (no Plan field) ---
-	t.Run("SeenSetDedupIter_recurses_no_plan_field", func(t *testing.T) {
-		inner := &FilterIter{}
-		d := &SeenSetDedupIter{Source: inner}
-		setPlanRef(d, plan)
-		assert.Same(t, plan, inner.Plan)
-	})
+	// (SeenSetDedupIter dropped: compound multi-key dedup is now consumer-side.)
 	// --- Default branch: unknown iterator ---
 	t.Run("Unknown_noop", func(t *testing.T) {
 		tr := &closeTrackingIter{}
@@ -2754,9 +2738,6 @@ func TestBuildPlan_IndexScan_NonUniqueBoundsAdjusted(t *testing.T) {
 		case *CanonicalKeyDedupIter:
 			root = r.Source
 			continue
-		case *SeenSetDedupIter:
-			root = r.Source
-			continue
 		case *FilterIter:
 			root = r.Source
 			continue
@@ -2789,10 +2770,12 @@ func TestBuildPlan_IndexScan_NonUniqueBoundsAdjusted(t *testing.T) {
 	}
 }
 
-// TestBuildPlan_IndexScan_MultiFieldPathsUsesSeenSetDedup hits planner.go:1027
-// — when idx.FieldPaths has length > 1, buildIndexScanChain wraps in
-// SeenSetDedupIter (not CanonicalKeyDedupIter).
-func TestBuildPlan_IndexScan_MultiFieldPathsUsesSeenSetDedup(t *testing.T) {
+// TestBuildPlan_IndexScan_MultiFieldPathsNoDedupWrap pins that compound
+// indexes are NOT wrapped with a dedup iterator at the planner level —
+// dedup happens consumer-side via the multiKey flag flowing through
+// IndexIter → planIterator.Next/DocDedup. This replaces the previous
+// SeenSetDedupIter assertion (the wrapper was dropped in this commit).
+func TestBuildPlan_IndexScan_MultiFieldPathsNoDedupWrap(t *testing.T) {
 	sorter := &sortFieldStub{fields: []query.SortField{{Field: "a"}}}
 	plan := BuildPlan(&PlanParams{
 		Filter:    query.All{},
@@ -2809,20 +2792,15 @@ func TestBuildPlan_IndexScan_MultiFieldPathsUsesSeenSetDedup(t *testing.T) {
 		}},
 	})
 	if plan.Name != "IndexScan" {
-		// Skipping masks CBO cost regressions. If this ever trips, the
-		// multi-field dedup branch at planner.go:1027 is no longer reached
-		// — investigate rather than relax the assertion.
-		t.Fatalf("BuildPlan chose %s; expected IndexScan to exercise SeenSetDedupIter", plan.Name)
+		t.Fatalf("BuildPlan chose %s; expected IndexScan", plan.Name)
 	}
-	// Walk to the topmost dedup wrapper.
 	root := plan.Root
 	if li, ok := root.(*LimitIter); ok {
 		root = li.Source
 	}
-	_, isSeenSet := root.(*SeenSetDedupIter)
 	_, isCanonical := root.(*CanonicalKeyDedupIter)
-	assert.True(t, isSeenSet, "compound index must wrap with SeenSetDedupIter")
-	assert.False(t, isCanonical, "compound index must NOT use CanonicalKeyDedupIter")
+	assert.False(t, isCanonical,
+		"compound index must NOT use CanonicalKeyDedupIter (it's only for single-field)")
 }
 
 // TestBuildPlan_IndexScan_CoverFiltersInsertsIndexFilterIter hits planner.go:991
@@ -2875,8 +2853,6 @@ func TestBuildPlan_IndexScan_CoverFiltersInsertsIndexFilterIter(t *testing.T) {
 		case *LimitIter:
 			root = r.Source
 		case *CanonicalKeyDedupIter:
-			root = r.Source
-		case *SeenSetDedupIter:
 			root = r.Source
 		case *FilterIter:
 			root = r.Source
@@ -3747,11 +3723,12 @@ func TestBuildPlan_Seek_CoverIter_NeedSortWraps(t *testing.T) {
 	}
 }
 
-// TestBuildPlan_Seek_MultiFieldPathsUsesSeenSetDedup hits planner.go:948-949
-// in buildIndexSeekChain — compound FieldPaths wrap in SeenSetDedupIter
-// (not CanonicalKeyDedupIter). Forces the main seek path (not CoverIter) by
-// using Unique=false.
-func TestBuildPlan_Seek_MultiFieldPathsUsesSeenSetDedup(t *testing.T) {
+// TestBuildPlan_Seek_MultiFieldPathsNoDedupWrap pins that compound
+// indexes are NOT wrapped with a planner-level dedup iterator on the
+// seek path either. Replaces the previous SeenSetDedupIter assertion.
+// Compound multi-key dedup runs at the consumer via DocDedup, threaded
+// through the multiKey return value of Iterator.Next.
+func TestBuildPlan_Seek_MultiFieldPathsNoDedupWrap(t *testing.T) {
 	filter := query.MustParseCondition(`{"a": 1}`)
 	plan := BuildPlan(&PlanParams{
 		Filter:    filter,
@@ -3770,14 +3747,15 @@ func TestBuildPlan_Seek_MultiFieldPathsUsesSeenSetDedup(t *testing.T) {
 		}},
 	})
 	if plan.Name != "IndexSeek" {
-		t.Fatalf("IndexSeek must win to reach compound-seek dedup path, got %s", plan.Name)
+		t.Fatalf("IndexSeek must win, got %s", plan.Name)
 	}
 	root := plan.Root
 	if li, ok := root.(*LimitIter); ok {
 		root = li.Source
 	}
-	_, isSeenSet := root.(*SeenSetDedupIter)
-	assert.True(t, isSeenSet, "compound seek with Unique=false must wrap in SeenSetDedupIter, got %T", root)
+	_, isCanonical := root.(*CanonicalKeyDedupIter)
+	assert.False(t, isCanonical,
+		"compound seek must NOT use CanonicalKeyDedupIter (single-field only)")
 }
 
 // TestCoveringFilterSelectivity covers both branches of coveringFilterSelectivity:

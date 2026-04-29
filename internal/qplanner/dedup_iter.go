@@ -31,7 +31,9 @@ import (
 //   - Correct only for single-field indexes. Compound indexes must not
 //     be wrapped with this iterator — the caller (planner) is
 //     responsible for gating by len(IndexInfo.FieldPaths) == 1. For
-//     compound cases, SeenSetDedupIter is the drop-in alternative.
+//     compound cases the planner emits no dedup wrap and consumers
+//     dedup at the boundary via DocDedup driven by the multiKey return
+//     value of Iterator.Next.
 type CanonicalKeyDedupIter struct {
 	Source    Iterator
 	Plan      *Plan
@@ -109,43 +111,9 @@ func (it *CanonicalKeyDedupIter) String() string {
 	return fmt.Sprintf("%s -> Dedup(canonical)", it.Source)
 }
 
-// SeenSetDedupIter removes duplicate document emissions by tracking
-// emitted docIds in a hash set. O(distinct_results) memory.
-//
-// Used for compound multi-key indexes where canonical-key selection
-// across compound tuples is non-trivial. Correct for any upstream
-// iterator that emits (key, docId) tuples, at the cost of a small
-// per-query map allocation.
-type SeenSetDedupIter struct {
-	Source Iterator
-	seen   map[string]struct{}
-}
-
-func (it *SeenSetDedupIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
-	if it.seen == nil {
-		it.seen = make(map[string]struct{}, 16)
-	}
-	for {
-		// Drop upstream's multiKey: SeenSetDedupIter guarantees the emitted
-		// stream is unique-by-docId, so always return false to the consumer.
-		key, docId, _, err = it.Source.Next()
-		if err != nil || docId == nil {
-			return nil, nil, false, err
-		}
-		if _, dup := it.seen[string(docId)]; dup {
-			continue
-		}
-		it.seen[string(docId)] = struct{}{}
-		return key, docId, false, nil
-	}
-}
-
-func (it *SeenSetDedupIter) Close() {
-	if it.Source != nil {
-		it.Source.Close()
-	}
-}
-
-func (it *SeenSetDedupIter) String() string {
-	return fmt.Sprintf("%s -> Dedup(seenSet)", it.Source)
-}
+// SeenSetDedupIter was removed in favour of consumer-side DocDedup
+// threaded through the iterator chain via the multiKey return value of
+// Iterator.Next. Compound multi-key indexes are now deduped at the
+// boundary (planIterator.Next, query.go count/Update/Delete loops)
+// without an extra pipeline stage. See
+// docs/plans/2026-04-29-multikey-bit-and-dedup-pipeline.md.

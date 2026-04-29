@@ -287,29 +287,31 @@ func TestCanonicalKeyDedupIter_MultipleDocs(t *testing.T) {
 	assert.Equal(t, []string{"p1", "p2"}, got)
 }
 
-func TestSeenSetDedupIter_RemovesDuplicates(t *testing.T) {
-	a := &anyenc.Arena{}
-	p1 := a.NewObject()
-	p1.Set("id", a.NewString("p1"))
-	p2 := a.NewObject()
-	p2.Set("id", a.NewString("p2"))
-
-	plan := &Plan{}
-	upstream := &fakeIter{plan: plan, hits: []fakeHit{
-		{key: []byte("k1"), docId: []byte("p1"), doc: p1},
-		{key: []byte("k2"), docId: []byte("p2"), doc: p2},
-		{key: []byte("k3"), docId: []byte("p1"), doc: p1}, // dup
-		{key: []byte("k4"), docId: []byte("p2"), doc: p2}, // dup
+// TestDocDedup_ConsumerSideForCompoundMultiKey replaces the dropped
+// SeenSetDedupIter test. Compound multi-key dedup now happens at the
+// consumer side via DocDedup applied to the multiKey flag emitted by
+// upstream iterators. This pins the same end-to-end behaviour: a stream
+// containing duplicate docIds (multiKey=true) collapses to one emission
+// per docId; multiKey=false entries pass through unconditionally.
+func TestDocDedup_ConsumerSideForCompoundMultiKey(t *testing.T) {
+	upstream := &fakeIter{hits: []fakeHit{
+		{key: []byte("k1"), docId: []byte("p1")},
+		{key: []byte("k2"), docId: []byte("p2")},
+		{key: []byte("k3"), docId: []byte("p1")}, // dup
+		{key: []byte("k4"), docId: []byte("p2")}, // dup
 	}}
-
-	it := &SeenSetDedupIter{Source: upstream}
-
+	// fakeIter returns multiKey=true (simulating IndexIter on a multi-key
+	// compound index), so DocDedup must collapse the duplicates.
+	var dedup DocDedup
 	var got []string
 	for {
-		_, docId, _, err := it.Next()
+		_, docId, mk, err := upstream.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
+		}
+		if !dedup.Accept(docId, mk) {
+			continue
 		}
 		got = append(got, string(docId))
 	}
@@ -552,10 +554,11 @@ func TestCanonicalKeyDedupIter_Coverage_ReverseExclusiveBounds(t *testing.T) {
 	assert.Nil(t, docId2, "'b' must be skipped as non-canonical in reverse")
 }
 
-// TestSeenSetDedupIter_Coverage_HashSetStress exercises the SeenSet with
-// enough hits and distinct keys to trigger map growth and hash collisions.
-// Covers internal/qplanner/dedup_iter.go:119-133.
-func TestSeenSetDedupIter_Coverage_HashSetStress(t *testing.T) {
+// TestDocDedup_HashSetStress exercises the consumer-side DocDedup helper
+// with enough hits and distinct keys to trigger map growth. Replaces the
+// previous SeenSetDedupIter stress test now that compound multi-key
+// dedup runs at the consumer.
+func TestDocDedup_HashSetStress(t *testing.T) {
 	a := &anyenc.Arena{}
 
 	const distinctDocs = 100
@@ -565,8 +568,6 @@ func TestSeenSetDedupIter_Coverage_HashSetStress(t *testing.T) {
 	for r := 0; r < hitsPerDoc; r++ {
 		for d := 0; d < distinctDocs; d++ {
 			docId := fmt.Sprintf("doc%03d", d)
-			// Ensure each hit has a different key so it isn't trivially deduped
-			// on key identity (SeenSet dedups on docId).
 			keyStr := fmt.Sprintf("r%02d_%s", r, docId)
 			obj := a.NewObject()
 			obj.Set("id", a.NewString(docId))
@@ -578,15 +579,19 @@ func TestSeenSetDedupIter_Coverage_HashSetStress(t *testing.T) {
 		}
 	}
 
+	// fakeIter returns multiKey=true so DocDedup is forced to engage.
 	upstream := &fakeIter{hits: hits}
-	it := &SeenSetDedupIter{Source: upstream}
 
+	var dedup DocDedup
 	seen := make(map[string]int)
 	for {
-		_, docId, _, err := it.Next()
+		_, docId, mk, err := upstream.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
+		}
+		if !dedup.Accept(docId, mk) {
+			continue
 		}
 		seen[string(docId)]++
 	}
