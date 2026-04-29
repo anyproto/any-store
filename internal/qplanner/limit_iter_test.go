@@ -23,7 +23,7 @@ func TestLimitIter(t *testing.T) {
 		it := &LimitIter{Source: src, Offset: 2, Limit: 0}
 		var seen []string
 		for {
-			_, docId, err := it.Next()
+			_, docId, _, err := it.Next()
 			require.NoError(t, err)
 			if docId == nil {
 				break
@@ -37,7 +37,7 @@ func TestLimitIter(t *testing.T) {
 		it := &LimitIter{Source: src, Limit: 2}
 		var got []string
 		for {
-			_, docId, err := it.Next()
+			_, docId, _, err := it.Next()
 			require.NoError(t, err)
 			if docId == nil {
 				break
@@ -51,7 +51,7 @@ func TestLimitIter(t *testing.T) {
 		it := &LimitIter{Source: src, Offset: 1, Limit: 2}
 		var got []string
 		for {
-			_, docId, err := it.Next()
+			_, docId, _, err := it.Next()
 			require.NoError(t, err)
 			if docId == nil {
 				break
@@ -62,7 +62,7 @@ func TestLimitIter(t *testing.T) {
 	})
 	t.Run("source_error", func(t *testing.T) {
 		it := &LimitIter{Source: &errIter{err: errors.New("boom")}}
-		_, _, err := it.Next()
+		_, _, _, err := it.Next()
 		require.ErrorContains(t, err, "boom")
 	})
 	t.Run("close_propagates_and_nil", func(t *testing.T) {

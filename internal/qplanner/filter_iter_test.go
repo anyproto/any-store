@@ -49,7 +49,7 @@ func TestFilterIter_RejectsNonMatching(t *testing.T) {
 
 	var matched int
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -86,7 +86,7 @@ func TestFilterIter_NoPlan(t *testing.T) {
 		// Plan: nil → line 84 must NOT attempt it.Plan.DocParsed = nil (nil deref).
 	}
 	// Iteration must silently complete with docId==nil (no matches) and no error.
-	_, docId, err := it.Next()
+	_, docId, _, err := it.Next()
 	require.NoError(t, err, "nil-Plan reset branch must be skipped, not crash")
 	assert.Nil(t, docId, "filter rejects the only doc, so iteration ends clean")
 }
@@ -121,7 +121,7 @@ func TestFilterIter_PerfBranches(t *testing.T) {
 		Buf:    buf,
 	}
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break

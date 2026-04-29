@@ -51,7 +51,7 @@ func TestFetchIter_Next_SkipsMissingDocId(t *testing.T) {
 
 	var gotIds []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -84,7 +84,7 @@ func TestFetchIter_Close_AndString(t *testing.T) {
 // TestFetchIter_Next_PropagatesSourceError covers fetch_iter.go:39-41.
 func TestFetchIter_Next_PropagatesSourceError(t *testing.T) {
 	it := &FetchIter{Source: &errIter{err: errors.New("upstream")}}
-	_, _, err := it.Next()
+	_, _, _, err := it.Next()
 	require.ErrorContains(t, err, "upstream")
 }
 
@@ -116,12 +116,12 @@ func TestFetchIter_PerfBranches(t *testing.T) {
 		Buf:    buf,
 		Plan:   plan,
 	}
-	_, docId, err := it.Next()
+	_, docId, _, err := it.Next()
 	require.NoError(t, err)
 	require.NotNil(t, docId)
 
 	// Drain to end to also exercise the perf defer cleanup on docId==nil.
-	_, docId2, err := it.Next()
+	_, docId2, _, err := it.Next()
 	require.NoError(t, err)
 	assert.Nil(t, docId2)
 
@@ -161,7 +161,7 @@ func TestFetchIter_Next_NoPlan_FetchesWithoutParsing(t *testing.T) {
 		Buf:    buf,
 		Plan:   nil, // explicitly no plan → parsing block at line 61 must be skipped
 	}
-	_, docId, err := it.Next()
+	_, docId, _, err := it.Next()
 	require.NoError(t, err)
 	require.NotNil(t, docId, "doc must still be fetched")
 

@@ -56,7 +56,7 @@ func TestFullScanIter_DocValueRawValue(t *testing.T) {
 	defer it.Close()
 
 	// Advance the cursor by calling Next once.
-	_, docId, err := it.Next()
+	_, docId, _, err := it.Next()
 	require.NoError(t, err)
 	require.NotNil(t, docId)
 
@@ -99,7 +99,7 @@ func TestFullScanIter_WithBounds_Forward(t *testing.T) {
 	defer it.Close()
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -130,7 +130,7 @@ func TestFullScanIter_Reverse(t *testing.T) {
 	defer it.Close()
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -161,7 +161,7 @@ func TestFullScanIter_WithFilter(t *testing.T) {
 	defer it.Close()
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -198,7 +198,7 @@ func TestFullScanIter_Reverse_WithBounds(t *testing.T) {
 	defer it.Close()
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -237,7 +237,7 @@ func TestFullScanIter_Reverse_EndPastLastKey(t *testing.T) {
 	defer it.Close()
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -274,7 +274,7 @@ func TestFullScanIter_Forward_StartExclusive(t *testing.T) {
 	defer it.Close()
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -313,7 +313,7 @@ func TestFullScanIter_Bounded_FilterReject(t *testing.T) {
 	defer it.Close()
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -346,7 +346,7 @@ func TestFullScanIter_Bounded_NilPlan(t *testing.T) {
 	defer it.Close()
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -371,7 +371,7 @@ func TestFullScanIter_NoBounds_FirstErr(t *testing.T) {
 
 	it := &FullScanIter{Source: &CursorSource{Tx: rtx, Ns: invalidNamespace()}, Buf: buf}
 	defer it.Close()
-	_, _, err = it.Next()
+	_, _, _, err = it.Next()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid page")
 }
@@ -394,7 +394,7 @@ func TestFullScanIter_NoBounds_LastErr(t *testing.T) {
 		Reverse: true,
 	}
 	defer it.Close()
-	_, _, err = it.Next()
+	_, _, _, err = it.Next()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid page")
 }
@@ -418,7 +418,7 @@ func TestFullScanIter_Bounded_SeekErr(t *testing.T) {
 		IDBounds: query.Bounds{bound},
 	}
 	defer it.Close()
-	_, _, err = it.Next()
+	_, _, _, err = it.Next()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid page")
 }
@@ -443,7 +443,7 @@ func TestFullScanIter_Bounded_FirstErr(t *testing.T) {
 		IDBounds: query.Bounds{bound},
 	}
 	defer it.Close()
-	_, _, err = it.Next()
+	_, _, _, err = it.Next()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid page")
 }
@@ -468,7 +468,7 @@ func TestFullScanIter_Bounded_Reverse_LastErr(t *testing.T) {
 		Reverse:  true,
 	}
 	defer it.Close()
-	_, _, err = it.Next()
+	_, _, _, err = it.Next()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid page")
 }

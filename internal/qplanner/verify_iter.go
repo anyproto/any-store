@@ -19,18 +19,18 @@ type VerifyIter struct {
 	keyBuf   []byte // reusable buffer for verification key construction
 }
 
-func (it *VerifyIter) Next() (key []byte, docId []byte, err error) {
+func (it *VerifyIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
 	for {
-		key, docId, err = it.Source.Next()
+		key, docId, multiKey, err = it.Source.Next()
 		if err != nil || docId == nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		// Build verification key: prefix + docId
 		it.keyBuf = append(it.keyBuf[:0], it.Prefix...)
 		it.keyBuf = append(it.keyBuf, docId...)
 		_, gerr := it.Tx.Get(it.VerifyNs, it.keyBuf)
 		if gerr == nil {
-			return key, docId, nil // verified!
+			return key, docId, multiKey, nil // verified!
 		}
 		// Not found in verification index → skip this candidate
 	}

@@ -22,7 +22,7 @@ type FilterIter struct {
 	Plan   *Plan // set by BuildPlan to cache fetched doc values
 }
 
-func (it *FilterIter) Next() (key []byte, docId []byte, err error) {
+func (it *FilterIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
 	perf := perfCountersEnabled()
 	var start time.Time
 	if perf {
@@ -39,9 +39,9 @@ func (it *FilterIter) Next() (key []byte, docId []byte, err error) {
 	}()
 
 	for {
-		key, docId, err = it.Source.Next()
+		key, docId, multiKey, err = it.Source.Next()
 		if err != nil || docId == nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 
 		var doc *anyenc.Value
@@ -56,13 +56,13 @@ func (it *FilterIter) Next() (key []byte, docId []byte, err error) {
 					// doc may have been deleted from data but still in index; skip
 					continue
 				}
-				return nil, nil, err
+				return nil, nil, false, err
 			}
 
 			var perr error
 			doc, perr = it.Buf.Parser.ParseOwned(it.Buf.DocBuf)
 			if perr != nil {
-				return nil, nil, perr
+				return nil, nil, false, perr
 			}
 			if it.Plan != nil {
 				it.Plan.DocParsed = doc
@@ -78,7 +78,7 @@ func (it *FilterIter) Next() (key []byte, docId []byte, err error) {
 			qpPerf.filterEvalNs.Add(uint64(time.Since(evalStart).Nanoseconds()))
 		}
 		if ok {
-			return key, docId, nil
+			return key, docId, multiKey, nil
 		}
 		// Reset cached value on rejection — next iteration will get a new one
 		if it.Plan != nil {

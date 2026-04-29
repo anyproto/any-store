@@ -22,7 +22,7 @@ type IndexIter struct {
 	started  bool
 }
 
-func (it *IndexIter) Next() (key []byte, docId []byte, err error) {
+func (it *IndexIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
 	perf := perfCountersEnabled()
 	var start time.Time
 	if perf {
@@ -49,7 +49,7 @@ func (it *IndexIter) Next() (key []byte, docId []byte, err error) {
 
 	for {
 		if it.boundIdx >= len(it.Bounds) {
-			return nil, nil, nil
+			return nil, nil, false, nil
 		}
 
 		b := it.Bounds[it.boundIdx]
@@ -59,60 +59,60 @@ func (it *IndexIter) Next() (key []byte, docId []byte, err error) {
 			if it.Reverse {
 				if len(b.End) > 0 {
 					if err = it.cursor.Seek(b.End); err != nil {
-						return nil, nil, err
+						return nil, nil, false, err
 					}
 					if !it.cursor.Valid() {
 						if err = it.cursor.Last(); err != nil {
-							return nil, nil, err
+							return nil, nil, false, err
 						}
 					} else {
 						// Check if we need to back up (Seek finds >=)
 						k, kerr := it.cursor.Key()
 						if kerr != nil {
-							return nil, nil, kerr
+							return nil, nil, false, kerr
 						}
 						cmp := bytes.Compare(k, b.End)
 						if cmp > 0 || (cmp == 0 && !b.EndInclude) {
 							if err = it.cursor.Previous(); err != nil {
-								return nil, nil, err
+								return nil, nil, false, err
 							}
 						}
 					}
 				} else {
 					if err = it.cursor.Last(); err != nil {
-						return nil, nil, err
+						return nil, nil, false, err
 					}
 				}
 			} else {
 				if len(b.Start) > 0 {
 					if err = it.cursor.Seek(b.Start); err != nil {
-						return nil, nil, err
+						return nil, nil, false, err
 					}
 					if it.cursor.Valid() && !b.StartInclude {
 						k, kerr := it.cursor.Key()
 						if kerr != nil {
-							return nil, nil, kerr
+							return nil, nil, false, kerr
 						}
 						if bytes.Equal(k, b.Start) {
 							if err = it.cursor.Next(); err != nil {
-								return nil, nil, err
+								return nil, nil, false, err
 							}
 						}
 					}
 				} else {
 					if err = it.cursor.First(); err != nil {
-						return nil, nil, err
+						return nil, nil, false, err
 					}
 				}
 			}
 		} else {
 			if it.Reverse {
 				if err = it.cursor.Previous(); err != nil {
-					return nil, nil, err
+					return nil, nil, false, err
 				}
 			} else {
 				if err = it.cursor.Next(); err != nil {
-					return nil, nil, err
+					return nil, nil, false, err
 				}
 			}
 		}
@@ -125,7 +125,7 @@ func (it *IndexIter) Next() (key []byte, docId []byte, err error) {
 
 		k, err := it.cursor.Key()
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 
 		// Check bounds
@@ -150,35 +150,35 @@ func (it *IndexIter) Next() (key []byte, docId []byte, err error) {
 	}
 }
 
-func (it *IndexIter) nextNoBounds() (key []byte, docId []byte, err error) {
+func (it *IndexIter) nextNoBounds() (key []byte, docId []byte, multiKey bool, err error) {
 	if !it.started {
 		it.started = true
 		if it.Reverse {
 			if err = it.cursor.Last(); err != nil {
-				return nil, nil, err
+				return nil, nil, false, err
 			}
 		} else {
 			if err = it.cursor.First(); err != nil {
-				return nil, nil, err
+				return nil, nil, false, err
 			}
 		}
 	} else {
 		if it.Reverse {
 			if err = it.cursor.Previous(); err != nil {
-				return nil, nil, err
+				return nil, nil, false, err
 			}
 		} else {
 			if err = it.cursor.Next(); err != nil {
-				return nil, nil, err
+				return nil, nil, false, err
 			}
 		}
 	}
 	if !it.cursor.Valid() {
-		return nil, nil, nil
+		return nil, nil, false, nil
 	}
 	k, err := it.cursor.Key()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	return it.extractResult(k)
 }
@@ -236,10 +236,15 @@ func (it *IndexIter) Close() {
 	}
 }
 
-func (it *IndexIter) extractResult(k []byte) (key []byte, docId []byte, err error) {
-	// Both unique and non-unique: key = indexFields + docId
+func (it *IndexIter) extractResult(k []byte) (key []byte, docId []byte, multiKey bool, err error) {
+	// Both unique and non-unique: key = indexFields + docId.
+	//
+	// multiKey: until the per-entry value byte lands in a follow-up
+	// commit, return true conservatively so consumers continue to dedup.
+	// Same correctness as before this commit; perf will improve once the
+	// bit is wired up.
 	docID := extractDocId(k, len(it.IdxInfo.FieldNames))
-	return k, docID, nil
+	return k, docID, true, nil
 }
 
 func (it *IndexIter) String() string {

@@ -18,7 +18,7 @@ type FetchIter struct {
 	Plan   *Plan // set by BuildPlan for doc value caching
 }
 
-func (it *FetchIter) Next() (key []byte, docId []byte, err error) {
+func (it *FetchIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
 	perf := perfCountersEnabled()
 	var start time.Time
 	if perf {
@@ -35,9 +35,9 @@ func (it *FetchIter) Next() (key []byte, docId []byte, err error) {
 	}()
 
 	for {
-		key, docId, err = it.Source.Next()
+		key, docId, multiKey, err = it.Source.Next()
 		if err != nil || docId == nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 
 		// Cursor-free point lookup: avoids Cursor struct allocation and stack growth.
@@ -54,7 +54,7 @@ func (it *FetchIter) Next() (key []byte, docId []byte, err error) {
 				// doc may have been deleted from data but still in index; skip
 				continue
 			}
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 
 		// Parse and cache the value to avoid re-fetching and re-parsing later
@@ -68,12 +68,12 @@ func (it *FetchIter) Next() (key []byte, docId []byte, err error) {
 				qpPerf.fetchParseNs.Add(uint64(time.Since(parseStart).Nanoseconds()))
 			}
 			if perr != nil {
-				return nil, nil, perr
+				return nil, nil, false, perr
 			}
 			it.Plan.DocParsed = doc
 		}
 
-		return key, docId, nil
+		return key, docId, multiKey, nil
 	}
 }
 

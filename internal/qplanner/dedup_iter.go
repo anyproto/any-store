@@ -43,26 +43,31 @@ type CanonicalKeyDedupIter struct {
 	best   []byte // reusable buffer for the canonical element
 }
 
-func (it *CanonicalKeyDedupIter) Next() (key []byte, docId []byte, err error) {
+func (it *CanonicalKeyDedupIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
 	for {
-		key, docId, err = it.Source.Next()
+		// Read upstream's multiKey but don't propagate it: this iterator's
+		// contract is that emitted entries are unique-by-docId, so we
+		// always return multiKey=false. Upstream may flag entries
+		// multiKey=true (e.g. IndexIter on a multi-key index); we filter
+		// the duplicates so the consumer sees a clean unique stream.
+		key, docId, _, err = it.Source.Next()
 		if err != nil || docId == nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 
 		// Strip docId suffix to get the field-value portion of the key.
 		if len(key) < len(docId) {
-			return key, docId, nil // defensive; shouldn't happen
+			return key, docId, false, nil // defensive; shouldn't happen
 		}
 		fieldVal := key[:len(key)-len(docId)]
 
 		if it.Plan == nil || it.Plan.DocParsed == nil {
-			return key, docId, nil // no doc available; can't dedup — pass through
+			return key, docId, false, nil // no doc available; can't dedup — pass through
 		}
 		v := it.Plan.DocParsed.Get(it.FieldPath...)
 		if v == nil || v.Type() != anyenc.TypeArray {
 			// Scalar field — only one entry per doc, no dedup needed.
-			return key, docId, nil
+			return key, docId, false, nil
 		}
 
 		items, _ := v.Array()
@@ -85,10 +90,10 @@ func (it *CanonicalKeyDedupIter) Next() (key []byte, docId []byte, err error) {
 		if len(it.best) == 0 {
 			// No array element hits the bounds — upstream shouldn't have
 			// emitted this doc, but pass through conservatively.
-			return key, docId, nil
+			return key, docId, false, nil
 		}
 		if bytes.Equal(fieldVal, it.best) {
-			return key, docId, nil
+			return key, docId, false, nil
 		}
 		// Not the canonical hit — skip.
 	}
@@ -116,20 +121,22 @@ type SeenSetDedupIter struct {
 	seen   map[string]struct{}
 }
 
-func (it *SeenSetDedupIter) Next() (key []byte, docId []byte, err error) {
+func (it *SeenSetDedupIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
 	if it.seen == nil {
 		it.seen = make(map[string]struct{}, 16)
 	}
 	for {
-		key, docId, err = it.Source.Next()
+		// Drop upstream's multiKey: SeenSetDedupIter guarantees the emitted
+		// stream is unique-by-docId, so always return false to the consumer.
+		key, docId, _, err = it.Source.Next()
 		if err != nil || docId == nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		if _, dup := it.seen[string(docId)]; dup {
 			continue
 		}
 		it.seen[string(docId)] = struct{}{}
-		return key, docId, nil
+		return key, docId, false, nil
 	}
 }
 

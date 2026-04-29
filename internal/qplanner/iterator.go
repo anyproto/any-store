@@ -8,11 +8,22 @@ import (
 )
 
 // Iterator is the public interface for all query plan iterators.
-// Iterators form a chain: each iterator produces (key, docId) pairs
-// that the next iterator in the chain consumes.
+// Iterators form a chain: each iterator produces (key, docId, multiKey)
+// triples that the next iterator in the chain consumes.
 type Iterator interface {
-	// Next advances to the next result. Returns false when exhausted or on error.
-	Next() (key []byte, docId []byte, err error)
+	// Next advances to the next result.
+	//
+	// multiKey signals that another entry with the same docId may appear
+	// later in this iteration (typically because the source index is
+	// multi-key — an array-valued field — and a single document
+	// contributes more than one index entry). Consumers that
+	// count/yield by docId must dedup multiKey=true entries (see
+	// DocDedup helper). multiKey=false is a hard guarantee of
+	// uniqueness across the entire remaining stream — consumers can
+	// skip dedup entirely.
+	//
+	// At end of iteration: returns (nil, nil, false, nil).
+	Next() (key []byte, docId []byte, multiKey bool, err error)
 
 	// Close releases any resources held by this iterator (e.g. btree cursors).
 	Close()

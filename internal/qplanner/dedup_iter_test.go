@@ -25,16 +25,19 @@ type fakeHit struct {
 	doc   *anyenc.Value
 }
 
-func (f *fakeIter) Next() ([]byte, []byte, error) {
+func (f *fakeIter) Next() ([]byte, []byte, bool, error) {
 	if f.i >= len(f.hits) {
-		return nil, nil, nil
+		return nil, nil, false, nil
 	}
 	h := f.hits[f.i]
 	f.i++
 	if f.plan != nil {
 		f.plan.DocParsed = h.doc
 	}
-	return h.key, h.docId, nil
+	// Simulate IndexIter behaviour: most CanonicalKeyDedupIter test inputs
+	// represent multi-key index entries, so return multiKey=true. Tests
+	// that need multiKey=false can swap in a fakeIter variant.
+	return h.key, h.docId, true, nil
 }
 
 func (f *fakeIter) Close()         {}
@@ -84,7 +87,7 @@ func TestCanonicalKeyDedupIter_SingleDocMultipleMatches(t *testing.T) {
 
 	var got [][]byte
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -129,7 +132,7 @@ func TestCanonicalKeyDedupIter_ReverseScan(t *testing.T) {
 
 	var got [][]byte
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -156,11 +159,11 @@ func TestCanonicalKeyDedupIter_ScalarPassthrough(t *testing.T) {
 		FieldPath: []string{"status"},
 	}
 
-	_, docId, err := it.Next()
+	_, docId, _, err := it.Next()
 	require.NoError(t, err)
 	assert.Equal(t, []byte("p1"), docId, "scalar field: always emit")
 
-	_, docId2, err := it.Next()
+	_, docId2, _, err := it.Next()
 	require.NoError(t, err)
 	assert.Nil(t, docId2)
 }
@@ -192,7 +195,7 @@ func TestCanonicalKeyDedupIter_RangeBounds(t *testing.T) {
 
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -225,7 +228,7 @@ func TestCanonicalKeyDedupIter_NoBounds(t *testing.T) {
 
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -274,7 +277,7 @@ func TestCanonicalKeyDedupIter_MultipleDocs(t *testing.T) {
 
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -303,7 +306,7 @@ func TestSeenSetDedupIter_RemovesDuplicates(t *testing.T) {
 
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -339,7 +342,7 @@ func TestCanonicalKeyDedupIter_Coverage_NilPlanPassthrough(t *testing.T) {
 
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -375,7 +378,7 @@ func TestCanonicalKeyDedupIter_Coverage_NilDocParsedPassthrough(t *testing.T) {
 
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -428,13 +431,13 @@ func TestCanonicalKeyDedupIter_Coverage_EmptyArrayWithBounds(t *testing.T) {
 
 	// Per dedup_iter.go:85-88, when no array element hits the bounds the
 	// iterator passes through conservatively (best stays empty).
-	_, docId, err := it.Next()
+	_, docId, _, err := it.Next()
 	require.NoError(t, err)
 	assert.Equal(t, []byte("p1"), docId,
 		"empty array vs non-empty bounds: conservative passthrough")
 
 	// Ensure drained.
-	_, docId2, err := it.Next()
+	_, docId2, _, err := it.Next()
 	require.NoError(t, err)
 	assert.Nil(t, docId2)
 }
@@ -478,12 +481,12 @@ func TestCanonicalKeyDedupIter_Coverage_ArrayAllOutsideBounds(t *testing.T) {
 
 	// Conservative passthrough: emit the hit even though the doc's array
 	// has no in-bounds element.
-	_, docId, err := it.Next()
+	_, docId, _, err := it.Next()
 	require.NoError(t, err)
 	assert.Equal(t, []byte("p1"), docId,
 		"all array values outside bounds: conservative passthrough")
 
-	_, docId2, err := it.Next()
+	_, docId2, _, err := it.Next()
 	require.NoError(t, err)
 	assert.Nil(t, docId2)
 }
@@ -536,7 +539,7 @@ func TestCanonicalKeyDedupIter_Coverage_ReverseExclusiveBounds(t *testing.T) {
 	}
 
 	// Emit at the canonical (max-in-bounds) hit, skip the rest.
-	k1, docId, err := it.Next()
+	k1, docId, _, err := it.Next()
 	require.NoError(t, err)
 	require.Equal(t, []byte("p1"), docId)
 	// The emitted key must be the "y" hit (canonical maximum under reverse).
@@ -544,7 +547,7 @@ func TestCanonicalKeyDedupIter_Coverage_ReverseExclusiveBounds(t *testing.T) {
 	assert.Equal(t, expectedKey, k1,
 		"reverse + exclusive bounds: emit at canonical max ('y'), skip 'b'")
 
-	_, docId2, err := it.Next()
+	_, docId2, _, err := it.Next()
 	require.NoError(t, err)
 	assert.Nil(t, docId2, "'b' must be skipped as non-canonical in reverse")
 }
@@ -580,7 +583,7 @@ func TestSeenSetDedupIter_Coverage_HashSetStress(t *testing.T) {
 
 	seen := make(map[string]int)
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break

@@ -21,14 +21,14 @@ type IndexFilterIter struct {
 	Filters []IndexFieldFilter
 }
 
-func (it *IndexFilterIter) Next() (key []byte, docId []byte, err error) {
+func (it *IndexFilterIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
 	for {
-		key, docId, err = it.Source.Next()
+		key, docId, multiKey, err = it.Source.Next()
 		if err != nil || docId == nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		if it.matchesKey(anyenc.Tuple(key)) {
-			return key, docId, nil
+			return key, docId, multiKey, nil
 		}
 	}
 }

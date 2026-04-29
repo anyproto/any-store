@@ -15,14 +15,14 @@ type closeTrackingIter struct {
 	closed int
 }
 
-func (c *closeTrackingIter) Next() ([]byte, []byte, error) { return nil, nil, nil }
+func (c *closeTrackingIter) Next() ([]byte, []byte, bool, error) { return nil, nil, false, nil }
 func (c *closeTrackingIter) Close()                        { c.closed++ }
 func (c *closeTrackingIter) String() string                { return "track" }
 
 // errIter is an Iterator that always returns an error from Next.
 type errIter struct{ err error }
 
-func (e *errIter) Next() ([]byte, []byte, error) { return nil, nil, e.err }
+func (e *errIter) Next() ([]byte, []byte, bool, error) { return nil, nil, false, e.err }
 func (e *errIter) Close()                        {}
 func (e *errIter) String() string                { return "err" }
 

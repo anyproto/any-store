@@ -28,21 +28,23 @@ type SortIter struct {
 }
 
 type sortEntry struct {
-	off    uint32 // offset into arena
-	keyLen uint16 // total length (sort key + docId suffix)
-	docLen uint16 // docId length (trailing portion)
+	off      uint32 // offset into arena
+	keyLen   uint16 // total length (sort key + docId suffix)
+	docLen   uint16 // docId length (trailing portion)
+	multiKey uint8  // 1 = upstream marked this entry multiKey; 0 = unique. Forwarded as-is on emit so consumer-side DocDedup can skip the seen-set for unique streams.
+	_        [3]uint8 // explicit padding so the struct size stays predictable across archs
 }
 
-func (it *SortIter) Next() (key []byte, docId []byte, err error) {
+func (it *SortIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
 	if !it.inited {
 		it.inited = true
 		if err := it.collectAndSort(); err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 	}
 
 	if it.idx >= len(it.entries) {
-		return nil, nil, nil
+		return nil, nil, false, nil
 	}
 
 	e := it.entries[it.idx]
@@ -56,7 +58,7 @@ func (it *SortIter) Next() (key []byte, docId []byte, err error) {
 		it.Plan.DocParsed = nil
 	}
 
-	return docId, docId, nil
+	return docId, docId, e.multiKey == 1, nil
 }
 
 // growArena ensures the arena has at least need bytes of free capacity,
@@ -87,7 +89,7 @@ func (it *SortIter) collectAndSort() error {
 	}
 
 	for {
-		_, docId, err := it.Source.Next()
+		_, docId, mk, err := it.Source.Next()
 		if err != nil {
 			return err
 		}
@@ -116,7 +118,11 @@ func (it *SortIter) collectAndSort() error {
 		it.arena = it.Sorter.AppendKey(it.arena, doc)
 		it.arena = append(it.arena, docId...)
 		keyLen := uint16(len(it.arena) - int(off))
-		e := sortEntry{off: off, keyLen: keyLen, docLen: uint16(len(docId))}
+		var mkByte uint8
+		if mk {
+			mkByte = 1
+		}
+		e := sortEntry{off: off, keyLen: keyLen, docLen: uint16(len(docId)), multiKey: mkByte}
 
 		if it.TopK > 0 {
 			// Max-heap of size TopK: keep only the smallest K entries.

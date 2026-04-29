@@ -25,7 +25,7 @@ type FullScanIter struct {
 	started  bool
 }
 
-func (it *FullScanIter) Next() (key []byte, docId []byte, err error) {
+func (it *FullScanIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
 	if it.cursor == nil {
 		it.cursor = it.Source.NewCursor()
 		if it.Reverse && len(it.IDBounds) > 0 {
@@ -39,17 +39,17 @@ func (it *FullScanIter) Next() (key []byte, docId []byte, err error) {
 	return it.nextWithBounds()
 }
 
-func (it *FullScanIter) nextNoBounds() (key []byte, docId []byte, err error) {
+func (it *FullScanIter) nextNoBounds() (key []byte, docId []byte, multiKey bool, err error) {
 	for {
 		if !it.started {
 			it.started = true
 			if it.Reverse {
 				if err = it.cursor.Last(); err != nil {
-					return nil, nil, err
+					return nil, nil, false, err
 				}
 			} else {
 				if err = it.cursor.First(); err != nil {
-					return nil, nil, err
+					return nil, nil, false, err
 				}
 			}
 			// Batch-skip offset entries at the cursor level.
@@ -62,58 +62,59 @@ func (it *FullScanIter) nextNoBounds() (key []byte, docId []byte, err error) {
 				}
 				it.Offset = 0
 				if err != nil {
-					return nil, nil, err
+					return nil, nil, false, err
 				}
 				if !it.cursor.Valid() {
-					return nil, nil, nil
+					return nil, nil, false, nil
 				}
 				// Fall through to return the entry at the new position.
 				k, err := it.cursor.Key()
 				if err != nil {
-					return nil, nil, err
+					return nil, nil, false, err
 				}
-				return k, k, nil
+				// FullScan walks the data namespace; docId is the primary key — unique by construction.
+			return k, k, false, nil
 			}
 		} else {
 			if it.Reverse {
 				if err = it.cursor.Previous(); err != nil {
-					return nil, nil, err
+					return nil, nil, false, err
 				}
 			} else {
 				if err = it.cursor.Next(); err != nil {
-					return nil, nil, err
+					return nil, nil, false, err
 				}
 			}
 		}
 
 		if !it.cursor.Valid() {
-			return nil, nil, nil
+			return nil, nil, false, nil
 		}
 
 		k, err := it.cursor.Key()
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 
 		if ok, ferr := it.checkFilter(); ferr != nil {
-			return nil, nil, ferr
+			return nil, nil, false, ferr
 		} else if !ok {
 			continue
 		}
 
-		return k, k, nil
+		return k, k, false, nil
 	}
 }
 
-func (it *FullScanIter) nextWithBounds() (key []byte, docId []byte, err error) {
+func (it *FullScanIter) nextWithBounds() (key []byte, docId []byte, multiKey bool, err error) {
 	for {
 		if it.Reverse {
 			if it.boundIdx < 0 {
-				return nil, nil, nil
+				return nil, nil, false, nil
 			}
 		} else {
 			if it.boundIdx >= len(it.IDBounds) {
-				return nil, nil, nil
+				return nil, nil, false, nil
 			}
 		}
 
@@ -124,60 +125,60 @@ func (it *FullScanIter) nextWithBounds() (key []byte, docId []byte, err error) {
 			if it.Reverse {
 				if len(b.End) > 0 {
 					if err = it.cursor.Seek(b.End); err != nil {
-						return nil, nil, err
+						return nil, nil, false, err
 					}
 					if !it.cursor.Valid() {
 						if err = it.cursor.Last(); err != nil {
-							return nil, nil, err
+							return nil, nil, false, err
 						}
 					} else {
 						// Seek finds >=, so if past End or at End without include, back up
 						k, kerr := it.cursor.Key()
 						if kerr != nil {
-							return nil, nil, kerr
+							return nil, nil, false, kerr
 						}
 						cmp := bytes.Compare(k, b.End)
 						if cmp > 0 || (cmp == 0 && !b.EndInclude) {
 							if err = it.cursor.Previous(); err != nil {
-								return nil, nil, err
+								return nil, nil, false, err
 							}
 						}
 					}
 				} else {
 					if err = it.cursor.Last(); err != nil {
-						return nil, nil, err
+						return nil, nil, false, err
 					}
 				}
 			} else {
 				if len(b.Start) > 0 {
 					if err = it.cursor.Seek(b.Start); err != nil {
-						return nil, nil, err
+						return nil, nil, false, err
 					}
 					if it.cursor.Valid() && !b.StartInclude {
 						k, kerr := it.cursor.Key()
 						if kerr != nil {
-							return nil, nil, kerr
+							return nil, nil, false, kerr
 						}
 						if bytes.Equal(k, b.Start) {
 							if err = it.cursor.Next(); err != nil {
-								return nil, nil, err
+								return nil, nil, false, err
 							}
 						}
 					}
 				} else {
 					if err = it.cursor.First(); err != nil {
-						return nil, nil, err
+						return nil, nil, false, err
 					}
 				}
 			}
 		} else {
 			if it.Reverse {
 				if err = it.cursor.Previous(); err != nil {
-					return nil, nil, err
+					return nil, nil, false, err
 				}
 			} else {
 				if err = it.cursor.Next(); err != nil {
-					return nil, nil, err
+					return nil, nil, false, err
 				}
 			}
 		}
@@ -189,7 +190,7 @@ func (it *FullScanIter) nextWithBounds() (key []byte, docId []byte, err error) {
 
 		k, err := it.cursor.Key()
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 
 		// Check if past current bound
@@ -209,12 +210,12 @@ func (it *FullScanIter) nextWithBounds() (key []byte, docId []byte, err error) {
 		}
 
 		if ok, ferr := it.checkFilter(); ferr != nil {
-			return nil, nil, ferr
+			return nil, nil, false, ferr
 		} else if !ok {
 			continue
 		}
 
-		return k, k, nil
+		return k, k, false, nil
 	}
 }
 

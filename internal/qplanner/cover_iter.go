@@ -18,7 +18,7 @@ type CoverIter struct {
 	keyBuf []byte // reusable buffer for SeekKey results
 }
 
-func (it *CoverIter) Next() (key []byte, docId []byte, err error) {
+func (it *CoverIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
 	for it.idx < len(it.Bounds) {
 		b := it.Bounds[it.idx]
 		it.idx++
@@ -36,9 +36,10 @@ func (it *CoverIter) Next() (key []byte, docId []byte, err error) {
 			continue
 		}
 		docID := extractDocId(it.keyBuf, len(it.IdxInfo.FieldNames))
-		return it.keyBuf, docID, nil
+		// Unique-index point lookup: at most one entry per doc — never a duplicate.
+		return it.keyBuf, docID, false, nil
 	}
-	return nil, nil, nil
+	return nil, nil, false, nil
 }
 
 // Close releases resources (CoverIter uses single-shot lookups, no cursor to close).

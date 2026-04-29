@@ -84,7 +84,7 @@ func TestIndexFilterIter_Next_FiltersStream(t *testing.T) {
 
 	var produced []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -126,6 +126,6 @@ func TestIndexFilterIter_String(t *testing.T) {
 func TestIndexFilterIter_Next_PropagatesSourceError(t *testing.T) {
 	errSource := &errIter{err: errors.New("source failure")}
 	it := &IndexFilterIter{Source: errSource}
-	_, _, err := it.Next()
+	_, _, _, err := it.Next()
 	require.ErrorContains(t, err, "source failure")
 }

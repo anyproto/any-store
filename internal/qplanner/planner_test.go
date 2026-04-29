@@ -469,7 +469,7 @@ func TestFilterIter_Coverage_DocParsedResetAfterRejection(t *testing.T) {
 	// Collect accepted docIds.
 	var accepted []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -555,7 +555,7 @@ func TestVerifyIter_Coverage_EmptyVerifyNamespace(t *testing.T) {
 
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -593,7 +593,7 @@ func TestVerifyIter_Coverage_MissingEntriesSkipped(t *testing.T) {
 
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -686,14 +686,14 @@ type seqIter struct {
 	i   int
 }
 
-func (s *seqIter) Next() ([]byte, []byte, error) {
+func (s *seqIter) Next() ([]byte, []byte, bool, error) {
 	if s.i >= len(s.ids) {
-		return nil, nil, nil
+		return nil, nil, false, nil
 	}
 	id := s.ids[s.i]
 	s.i++
 	b := []byte(fmt.Sprintf("%d", id))
-	return b, b, nil
+	return b, b, false, nil
 }
 
 func (s *seqIter) Close()         {}
@@ -702,7 +702,7 @@ func (s *seqIter) String() string { return "seq" }
 func drain(it *LimitIter) []string {
 	var out []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		if err != nil || docId == nil {
 			break
 		}
@@ -760,13 +760,13 @@ func TestLimitIter_Coverage_OffsetExceedsSource(t *testing.T) {
 	}
 
 	// First Next must simply return (nil, nil, nil) after exhausting upstream.
-	key, docId, err := it.Next()
+	key, docId, _, err := it.Next()
 	require.NoError(t, err)
 	assert.Nil(t, key)
 	assert.Nil(t, docId)
 
 	// And stays exhausted on subsequent calls.
-	key, docId, err = it.Next()
+	key, docId, _, err = it.Next()
 	require.NoError(t, err)
 	assert.Nil(t, key)
 	assert.Nil(t, docId)
@@ -789,19 +789,19 @@ type docFeed struct {
 	doc   *anyenc.Value
 }
 
-func (f *docFeedIter) Next() ([]byte, []byte, error) {
+func (f *docFeedIter) Next() ([]byte, []byte, bool, error) {
 	if f.i >= len(f.feed) {
 		if f.plan != nil {
 			f.plan.DocParsed = nil
 		}
-		return nil, nil, nil
+		return nil, nil, false, nil
 	}
 	h := f.feed[f.i]
 	f.i++
 	if f.plan != nil {
 		f.plan.DocParsed = h.doc
 	}
-	return h.docId, h.docId, nil
+	return h.docId, h.docId, false, nil
 }
 
 func (f *docFeedIter) Close()         {}
@@ -833,7 +833,7 @@ func TestSortIter_Coverage_ExhaustedNextIsSafe(t *testing.T) {
 	// Drain.
 	var order []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -846,7 +846,7 @@ func TestSortIter_Coverage_ExhaustedNextIsSafe(t *testing.T) {
 	// Call Next() again: must remain safe and return nil.
 	require.NotPanics(t, func() {
 		for i := 0; i < 3; i++ {
-			key, docId, err := it.Next()
+			key, docId, _, err := it.Next()
 			require.NoError(t, err)
 			assert.Nil(t, key)
 			assert.Nil(t, docId)
@@ -889,7 +889,7 @@ func TestSortIter_Coverage_TopKZeroLargeCorpus(t *testing.T) {
 
 	var ids [][]byte
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -959,7 +959,7 @@ func drainFullScan(t *testing.T, it *FullScanIter) [][]byte {
 	t.Helper()
 	var out [][]byte
 	for {
-		k, _, err := it.Next()
+		k, _, _, err := it.Next()
 		require.NoError(t, err)
 		if k == nil {
 			break
@@ -1230,7 +1230,7 @@ func TestIndexIter_Coverage_DisjointBoundsTransition(t *testing.T) {
 
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -1322,7 +1322,7 @@ func TestCoverIter_Coverage_MixedEmptyAndNonEmptyStarts(t *testing.T) {
 
 	// First call: the empty-Start bound is silently skipped (idx++ then
 	// continue). The second bound drives the seek and returns the "a" entry.
-	_, docId, err := it.Next()
+	_, docId, _, err := it.Next()
 	require.NoError(t, err)
 	require.NotNil(t, docId, "the non-empty 'a' bound must contribute exactly one entry")
 
@@ -1332,7 +1332,7 @@ func TestCoverIter_Coverage_MixedEmptyAndNonEmptyStarts(t *testing.T) {
 		"only the second bound (Start='a') may contribute an entry")
 
 	// Exhausted: no more bounds.
-	_, docId2, err := it.Next()
+	_, docId2, _, err := it.Next()
 	require.NoError(t, err)
 	assert.Nil(t, docId2, "after the second bound is consumed, the iterator is drained")
 }

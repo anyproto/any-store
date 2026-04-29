@@ -12,11 +12,11 @@ type LimitIter struct {
 	count   int
 }
 
-func (it *LimitIter) Next() (key []byte, docId []byte, err error) {
+func (it *LimitIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
 	for {
-		key, docId, err = it.Source.Next()
+		key, docId, multiKey, err = it.Source.Next()
 		if err != nil || docId == nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 
 		if it.Offset > 0 && it.skipped < it.Offset {
@@ -25,10 +25,10 @@ func (it *LimitIter) Next() (key []byte, docId []byte, err error) {
 		}
 
 		if it.Limit > 0 && it.count >= it.Limit {
-			return nil, nil, nil
+			return nil, nil, false, nil
 		}
 		it.count++
-		return key, docId, nil
+		return key, docId, multiKey, nil
 	}
 }
 

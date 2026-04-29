@@ -57,7 +57,7 @@ func TestSortIter_TopK_Heap(t *testing.T) {
 
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -109,7 +109,7 @@ func TestSortIter_FallbackFetch(t *testing.T) {
 
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -135,7 +135,7 @@ func TestSortIter_SourceError(t *testing.T) {
 		Sorter: sort,
 		Plan:   &Plan{},
 	}
-	_, _, err = it.Next()
+	_, _, _, err = it.Next()
 	require.ErrorContains(t, err, "upstream")
 }
 

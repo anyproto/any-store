@@ -35,7 +35,7 @@ func TestCoverIter_Next(t *testing.T) {
 				{Start: anyenc.AppendAnyValue(nil, "alpha")},
 			},
 		}
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		assert.NotNil(t, docId, "second bound must yield")
 	})
@@ -48,7 +48,7 @@ func TestCoverIter_Next(t *testing.T) {
 				{Start: anyenc.AppendAnyValue(nil, "zzz_nonexistent")},
 			},
 		}
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		assert.Nil(t, docId, "missing prefix must not yield")
 	})
@@ -72,7 +72,7 @@ func TestCoverIter_Next_PrefixMismatch(t *testing.T) {
 			{Start: startB},
 		},
 	}
-	_, docId, err := it.Next()
+	_, docId, _, err := it.Next()
 	require.NoError(t, err)
 	assert.Nil(t, docId, "seek finds 'z' which lacks prefix 'b' → skip")
 }

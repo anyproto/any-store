@@ -44,7 +44,7 @@ func (pi *planIterator) Next() bool {
 		return false
 	}
 	pi.plan.DocParsed = nil
-	_, docId, err := pi.plan.Root.Next()
+	_, docId, _, err := pi.plan.Root.Next()
 	if err != nil {
 		pi.err = err
 		return false

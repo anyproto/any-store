@@ -202,7 +202,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	var idBuf []byte       // contiguous buffer for all IDs
 	var idOffsets []uint32 // start offsets of each ID in idBuf
 	for {
-		_, docId, iterErr := plan.Root.Next()
+		_, docId, _, iterErr := plan.Root.Next()
 		if iterErr != nil {
 			plan.Close()
 			err = iterErr
@@ -319,7 +319,7 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	var idBuf []byte
 	var idOffsets []uint32
 	for {
-		_, docId, iterErr := plan.Root.Next()
+		_, docId, _, iterErr := plan.Root.Next()
 		if iterErr != nil {
 			plan.Close()
 			err = iterErr
@@ -428,7 +428,7 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 			return nil
 		}
 		for {
-			_, docId, iterErr := plan.Root.Next()
+			_, docId, _, iterErr := plan.Root.Next()
 			if iterErr != nil {
 				return iterErr
 			}

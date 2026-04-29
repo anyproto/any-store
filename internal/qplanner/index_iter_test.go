@@ -83,7 +83,7 @@ func TestIndexIter_PerfBranches(t *testing.T) {
 	}
 	defer it.Close()
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -120,7 +120,7 @@ func TestIndexIter_Forward_WithBounds(t *testing.T) {
 	defer it.Close()
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -146,7 +146,7 @@ func TestIndexIter_Reverse_NoBounds(t *testing.T) {
 	defer it.Close()
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -180,7 +180,7 @@ func TestIndexIter_Reverse_WithBounds(t *testing.T) {
 	defer it.Close()
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -238,7 +238,7 @@ func TestIndexIter_Forward_StartIncludeTrue(t *testing.T) {
 	defer it.Close()
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -273,7 +273,7 @@ func TestIndexIter_Reverse_EndPastLastKey(t *testing.T) {
 	defer it.Close()
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -309,7 +309,7 @@ func TestIndexIter_Reverse_EndExclusiveBackUp(t *testing.T) {
 	defer it.Close()
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -342,7 +342,7 @@ func TestIndexIter_Reverse_NoEnd(t *testing.T) {
 	defer it.Close()
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -372,7 +372,7 @@ func TestIndexIter_NoBounds_ReverseAlreadyStarted(t *testing.T) {
 	// Consume all entries to ensure the "started → Previous" branch fires.
 	var got []string
 	for {
-		_, docId, err := it.Next()
+		_, docId, _, err := it.Next()
 		require.NoError(t, err)
 		if docId == nil {
 			break
@@ -403,7 +403,7 @@ func TestIndexIter_NoBounds_Forward_FirstErr(t *testing.T) {
 		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
 	}
 	defer it.Close()
-	_, _, err = it.Next()
+	_, _, _, err = it.Next()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid page",
 		"error must originate in the cursor call, not NewCursor/extractResult")
@@ -423,7 +423,7 @@ func TestIndexIter_NoBounds_Reverse_LastErr(t *testing.T) {
 		Reverse: true,
 	}
 	defer it.Close()
-	_, _, err = it.Next()
+	_, _, _, err = it.Next()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid page")
 }
@@ -444,7 +444,7 @@ func TestIndexIter_Bounded_Forward_SeekErr(t *testing.T) {
 		Bounds:  query.Bounds{bound},
 	}
 	defer it.Close()
-	_, _, err = it.Next()
+	_, _, _, err = it.Next()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid page")
 }
@@ -465,7 +465,7 @@ func TestIndexIter_Bounded_Forward_FirstErr(t *testing.T) {
 		Bounds:  query.Bounds{bound},
 	}
 	defer it.Close()
-	_, _, err = it.Next()
+	_, _, _, err = it.Next()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid page")
 }
@@ -486,7 +486,7 @@ func TestIndexIter_Bounded_Reverse_SeekErr(t *testing.T) {
 		Reverse: true,
 	}
 	defer it.Close()
-	_, _, err = it.Next()
+	_, _, _, err = it.Next()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid page")
 }
@@ -508,7 +508,7 @@ func TestIndexIter_Bounded_Reverse_LastErr(t *testing.T) {
 		Reverse: true,
 	}
 	defer it.Close()
-	_, _, err = it.Next()
+	_, _, _, err = it.Next()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid page")
 }
