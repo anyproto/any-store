@@ -1,12 +1,14 @@
 package qplanner
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/internal/btree"
 	"github.com/anyproto/any-store/query"
 )
 
@@ -551,4 +553,321 @@ func TestIndexIter_CountEntries_FirstErr(t *testing.T) {
 	_, err = it.CountEntries()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid page")
+}
+
+// indexEntryBtree opens an in-memory btree namespace and writes index-shaped
+// entries with explicit per-entry value bytes. Used to exercise the
+// EntryValueIsMultiKey decode path of IndexIter without depending on the
+// anystore package's insertKeys.
+func indexEntryBtree(t *testing.T, entries []indexEntry) (*btree.DB, *btree.Namespace) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ix.db")
+	db, err := btree.Open(path, btree.Options{PageSize: 4096, CacheSize: 128, InMemory: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("ix")
+	require.NoError(t, err)
+	for _, e := range entries {
+		key := append(append([]byte{}, anyenc.AppendAnyValue(nil, e.field)...), []byte(e.docId)...)
+		require.NoError(t, wtx.Put(ns, key, e.value))
+	}
+	require.NoError(t, wtx.Commit())
+	return db, ns
+}
+
+type indexEntry struct {
+	field string // single-field index: scalar field value
+	docId string
+	value []byte // per-entry value byte: nil (legacy), {0} scalar, {1} multi-key
+}
+
+// TestIndexIter_Next_DecodesMultiKeyBit_Scalar pins that an IndexIter walking
+// entries written with IndexValueScalar reports multiKey=false.
+func TestIndexIter_Next_DecodesMultiKeyBit_Scalar(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueScalar},
+		{field: "b", docId: "p2", value: IndexValueScalar},
+		{field: "c", docId: "p3", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	for i := 0; i < 3; i++ {
+		_, docId, mk, err := it.Next()
+		require.NoError(t, err)
+		require.NotNil(t, docId)
+		assert.False(t, mk, "scalar entry %d must report multiKey=false", i)
+	}
+}
+
+// TestIndexIter_Next_DecodesMultiKeyBit_MultiKey pins the multi-key decode.
+func TestIndexIter_Next_DecodesMultiKeyBit_MultiKey(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "tag-a", docId: "p1", value: IndexValueMultiKey},
+		{field: "tag-b", docId: "p1", value: IndexValueMultiKey},
+		{field: "tag-c", docId: "p1", value: IndexValueMultiKey},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	for i := 0; i < 3; i++ {
+		_, _, mk, err := it.Next()
+		require.NoError(t, err)
+		assert.True(t, mk, "multi-key entry %d must report multiKey=true", i)
+	}
+}
+
+// TestIndexIter_Next_DecodesMultiKeyBit_LegacyEmpty pins the safety
+// behaviour for entries written with empty values (pre-bit format): they
+// must report multiKey=true so the planner uses the dedup path.
+func TestIndexIter_Next_DecodesMultiKeyBit_LegacyEmpty(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: nil}, // legacy: nil value
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	_, _, mk, err := it.Next()
+	require.NoError(t, err)
+	assert.True(t, mk, "legacy entry (nil value) must report multiKey=true conservatively")
+}
+
+// TestEntryValueIsMultiKey covers the decode helper at every recognised
+// input shape: empty, scalar, multi-key, and a future-format byte with
+// reserved bits set.
+func TestEntryValueIsMultiKey(t *testing.T) {
+	cases := []struct {
+		name string
+		val  []byte
+		want bool
+	}{
+		{"empty", []byte{}, true},
+		{"nil", nil, true},
+		{"scalar", []byte{0x00}, false},
+		{"multikey", []byte{0x01}, true},
+		{"future_reserved_bits_only", []byte{0x02}, false}, // bit 0 clear → scalar
+		{"future_with_multikey", []byte{0x03}, true},       // bit 0 set
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			assert.Equal(t, c.want, EntryValueIsMultiKey(c.val))
+		})
+	}
+}
+
+// TestIndexIter_CountEntries_MultiBound_ScalarDocs pins the stream-count
+// path for multi-bound queries on indexes whose entries are all scalar
+// (no doc has more than one entry). No seen-set should be allocated; the
+// count equals the entry count.
+func TestIndexIter_CountEntries_MultiBound_ScalarDocs(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "x", docId: "p1", value: IndexValueScalar},
+		{field: "y", docId: "p2", value: IndexValueScalar},
+		{field: "z", docId: "p3", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	// Bounds use the standard non-unique adjustment: End gets a trailing
+	// 0xff so docId-suffixed entries within the value prefix are included.
+	// See AdjustBoundsForNonUnique.
+	mk := func(s string) []byte { return anyenc.AppendAnyValue(nil, s) }
+	mkEnd := func(s string) []byte { return append(anyenc.AppendAnyValue(nil, s), 0xff) }
+	_ = mkEnd
+	bounds := query.Bounds{
+		{Start: mk("x"), End: mkEnd("x"), StartInclude: true, EndInclude: true},
+		{Start: mk("y"), End: mkEnd("y"), StartInclude: true, EndInclude: true},
+		{Start: mk("z"), End: mkEnd("z"), StartInclude: true, EndInclude: true},
+	}
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Bounds:  bounds,
+	}
+	defer it.Close()
+
+	n, err := it.CountEntries()
+	require.NoError(t, err)
+	assert.Equal(t, 3, n, "3 distinct scalar docs across 3 bounds")
+}
+
+// TestIndexIter_CountEntries_MultiBound_MultiKeyDeduped pins that
+// overlapping multi-bound queries on a multi-key index dedup correctly:
+// a doc whose array values appear in multiple bounds is counted once.
+func TestIndexIter_CountEntries_MultiBound_MultiKeyDeduped(t *testing.T) {
+	// Doc p1 has array values "a" and "b" → 2 entries, both multi-key.
+	// Doc p2 has array values "b" and "c" → 2 entries, both multi-key.
+	// Query bounds {a, b, c} should count 2 distinct docs (p1, p2),
+	// not 4 entries.
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueMultiKey},
+		{field: "b", docId: "p1", value: IndexValueMultiKey},
+		{field: "b", docId: "p2", value: IndexValueMultiKey},
+		{field: "c", docId: "p2", value: IndexValueMultiKey},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	// Bounds use the standard non-unique adjustment: End gets a trailing
+	// 0xff so docId-suffixed entries within the value prefix are included.
+	// See AdjustBoundsForNonUnique.
+	mk := func(s string) []byte { return anyenc.AppendAnyValue(nil, s) }
+	mkEnd := func(s string) []byte { return append(anyenc.AppendAnyValue(nil, s), 0xff) }
+	_ = mkEnd
+	bounds := query.Bounds{
+		{Start: mk("a"), End: mkEnd("a"), StartInclude: true, EndInclude: true},
+		{Start: mk("b"), End: mkEnd("b"), StartInclude: true, EndInclude: true},
+		{Start: mk("c"), End: mkEnd("c"), StartInclude: true, EndInclude: true},
+	}
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Bounds:  bounds,
+	}
+	defer it.Close()
+
+	n, err := it.CountEntries()
+	require.NoError(t, err)
+	assert.Equal(t, 2, n, "p1 and p2 each counted once across overlapping bounds")
+}
+
+// TestIndexIter_CountEntries_MultiBound_Mixed pins the mixed case: some
+// docs have one entry (scalar bit), others multiple (multi-key bit). The
+// scalar entries stream-count without touching the seen-set; only the
+// multi-key entries dedup.
+func TestIndexIter_CountEntries_MultiBound_Mixed(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		// p1 has one scalar entry "a"
+		{field: "a", docId: "p1", value: IndexValueScalar},
+		// p2 has two multi-key entries "b" and "c"
+		{field: "b", docId: "p2", value: IndexValueMultiKey},
+		{field: "c", docId: "p2", value: IndexValueMultiKey},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	// Bounds use the standard non-unique adjustment: End gets a trailing
+	// 0xff so docId-suffixed entries within the value prefix are included.
+	// See AdjustBoundsForNonUnique.
+	mk := func(s string) []byte { return anyenc.AppendAnyValue(nil, s) }
+	mkEnd := func(s string) []byte { return append(anyenc.AppendAnyValue(nil, s), 0xff) }
+	_ = mkEnd
+	bounds := query.Bounds{
+		{Start: mk("a"), End: mkEnd("a"), StartInclude: true, EndInclude: true},
+		{Start: mk("b"), End: mkEnd("b"), StartInclude: true, EndInclude: true},
+		{Start: mk("c"), End: mkEnd("c"), StartInclude: true, EndInclude: true},
+	}
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Bounds:  bounds,
+	}
+	defer it.Close()
+
+	n, err := it.CountEntries()
+	require.NoError(t, err)
+	assert.Equal(t, 2, n, "p1 (scalar) + p2 (multi-key, deduped) = 2")
+}
+
+// TestIndexIter_CountEntries_MultiBound_LegacyEntries pins the
+// conservative path for legacy entries (nil value): treated as multi-key
+// and routed through the seen-set so a doc with multiple legacy entries
+// is counted once.
+func TestIndexIter_CountEntries_MultiBound_LegacyEntries(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: nil},
+		{field: "b", docId: "p1", value: nil},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	// Bounds use the standard non-unique adjustment: End gets a trailing
+	// 0xff so docId-suffixed entries within the value prefix are included.
+	// See AdjustBoundsForNonUnique.
+	mk := func(s string) []byte { return anyenc.AppendAnyValue(nil, s) }
+	mkEnd := func(s string) []byte { return append(anyenc.AppendAnyValue(nil, s), 0xff) }
+	_ = mkEnd
+	bounds := query.Bounds{
+		{Start: mk("a"), End: mkEnd("a"), StartInclude: true, EndInclude: true},
+		{Start: mk("b"), End: mkEnd("b"), StartInclude: true, EndInclude: true},
+	}
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Bounds:  bounds,
+	}
+	defer it.Close()
+
+	n, err := it.CountEntries()
+	require.NoError(t, err)
+	assert.Equal(t, 1, n,
+		"legacy entries are conservatively multi-key — p1's two entries dedup to 1")
+}
+
+// TestIndexIter_CountEntries_SingleBound_UsesBatchPath pins that the
+// single-bound count keeps the page-batch fast path (no value reads, no
+// seen-set). The multi-key bit is irrelevant here because within-doc
+// dedup ensures one entry per distinct value per doc.
+func TestIndexIter_CountEntries_SingleBound_UsesBatchPath(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "v", docId: "p1", value: IndexValueScalar},
+		{field: "v", docId: "p2", value: IndexValueScalar},
+		{field: "v", docId: "p3", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	// Bounds use the standard non-unique adjustment: End gets a trailing
+	// 0xff so docId-suffixed entries within the value prefix are included.
+	// See AdjustBoundsForNonUnique.
+	mk := func(s string) []byte { return anyenc.AppendAnyValue(nil, s) }
+	mkEnd := func(s string) []byte { return append(anyenc.AppendAnyValue(nil, s), 0xff) }
+	_ = mkEnd
+	bounds := query.Bounds{
+		{Start: mk("v"), End: mkEnd("v"), StartInclude: true, EndInclude: true},
+	}
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Bounds:  bounds,
+	}
+	defer it.Close()
+
+	n, err := it.CountEntries()
+	require.NoError(t, err)
+	assert.Equal(t, 3, n)
 }

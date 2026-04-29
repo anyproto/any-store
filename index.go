@@ -137,11 +137,25 @@ func (idx *index) Len(ctx context.Context) (count int, err error) {
 }
 
 // insertKeys inserts index entries for the given item into the index namespace.
-// Both unique and non-unique indexes use key=Tuple(fields..., docId), value=nil.
+// Both unique and non-unique indexes use key=Tuple(fields..., docId).
 // For unique indexes, a single-shot SeekKey + prefix check enforces the constraint.
+//
+// Per-entry value (1 byte bitmask, see qplanner.IndexEntryFlagMultiKey):
+//   - len(idx.keysBuf) > 1 → IndexValueMultiKey (this doc has >1 entries here)
+//   - len(idx.keysBuf) == 1 → IndexValueScalar  (this is this doc's only entry)
+//
+// Lets the multi-bound covering-count fast path stream-count scalar entries
+// without a hash set; only multi-key entries pay the dedup cost. Reversible
+// per-doc: an array shrinking from 3 elements to 1 next time round will see
+// its single new entry written with IndexValueScalar.
 func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 	idx.fillKeysBuf(it)
 	idKey := it.appendId(nil)
+
+	entryValue := qplanner.IndexValueScalar
+	if len(idx.keysBuf) > 1 {
+		entryValue = qplanner.IndexValueMultiKey
+	}
 
 	for _, key := range idx.keysBuf {
 		idx.fullKeyBuf = append(idx.fullKeyBuf[:0], key...)
@@ -158,7 +172,7 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 			}
 		}
 
-		if err := tx.Put(idx.ns, idx.fullKeyBuf, nil); err != nil {
+		if err := tx.Put(idx.ns, idx.fullKeyBuf, entryValue); err != nil {
 			return err
 		}
 		if idx.sketch != nil {

@@ -38,6 +38,50 @@ type CountableIterator interface {
 	CountEntries() (int, error)
 }
 
+// Index entry value encoding (bitmask, 1 byte per entry):
+//
+//	bit 0 — multi-key: the document that produced this entry has more
+//	        than one entry in this index (e.g. an array-valued field
+//	        contributed >1 keys for this doc).
+//	bits 1-7 — reserved; must be zero in this version.
+//
+// Read interpretation by IndexIter:
+//
+//	len(value) == 0           → legacy entry written before this byte
+//	                            existed; treat as multi-key (true) for
+//	                            safety, since pre-flag inserts may have
+//	                            been multi-key without recording it.
+//	len(value) >= 1 && bit 0  → confirmed multi-key.
+//	len(value) >= 1 && !bit 0 → confirmed scalar (this is this doc's
+//	                            only entry in this index).
+//
+// Sentinels are package-level []byte slices so callers can pass them to
+// tx.Put without per-call allocation.
+const IndexEntryFlagMultiKey byte = 0x01
+
+var (
+	// IndexValueScalar is the entry value written when a document
+	// produces exactly one index entry (scalar field, or a single-element
+	// array). Bit 0 cleared.
+	IndexValueScalar = []byte{0x00}
+
+	// IndexValueMultiKey is the entry value written when a document
+	// produces two or more index entries (multi-element array field, or
+	// compound index whose array dimension expanded to >1 keys). Bit 0
+	// set.
+	IndexValueMultiKey = []byte{IndexEntryFlagMultiKey}
+)
+
+// EntryValueIsMultiKey decodes the per-entry value byte. Pure, no allocs.
+// Defined alongside the sentinels so encoders and decoders agree on the
+// legacy-empty path.
+func EntryValueIsMultiKey(val []byte) bool {
+	if len(val) == 0 {
+		return true // legacy entries: assume multi-key for safety
+	}
+	return val[0]&IndexEntryFlagMultiKey != 0
+}
+
 // CursorSource provides cursors and direct lookups for a btree namespace.
 type CursorSource struct {
 	Tx *btree.ReadTx
