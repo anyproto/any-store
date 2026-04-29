@@ -250,41 +250,59 @@ func (it *IndexIter) countEntriesBatch() (int, error) {
 	return total, nil
 }
 
-// countEntriesWithDedup walks each entry per-bound, reads the per-entry
-// value byte, and applies docId-level dedup only for multi-key entries.
-// See CountEntries for the strategy split rationale.
+// countEntriesWithDedup walks each bound. If the bound's first entry is
+// scalar AND no multi-key entry has been seen across previous bounds,
+// the bound is counted via the page-batch fast path (cursor.CountUntil)
+// — same as the single-bound case. As soon as a multi-key (or legacy)
+// entry appears anywhere, we fall back to the per-entry walk for the
+// remainder of the iteration so docId-level dedup is applied.
+//
+// Rationale: in practice most indexes are entirely scalar OR entirely
+// multi-key for a given query (the field is either array-typed or not).
+// Mixed indexes are rare. The peek-then-batch shortcut means the common
+// scalar-only case pays only one extra value-read per bound (vs the
+// pure-batch path), recovering most of the alpha.2 SimpleIndex/In speed
+// while preserving correctness for multi-key.
 func (it *IndexIter) countEntriesWithDedup() (int, error) {
 	var seen map[string]struct{}
 	total := 0
+	stickyMulti := false // once any multi-key seen, never re-engage batch fast path
 
 	for _, b := range it.Bounds {
-		if len(b.Start) > 0 {
-			if err := it.cursor.Seek(b.Start); err != nil {
-				return 0, err
-			}
-			if it.cursor.Valid() && !b.StartInclude {
-				k, kerr := it.cursor.Key()
-				if kerr != nil {
-					return 0, kerr
-				}
-				if bytes.Equal(k, b.Start) {
-					if err := it.cursor.Next(); err != nil {
-						return 0, err
-					}
-				}
-			}
-		} else {
-			if err := it.cursor.First(); err != nil {
-				return 0, err
-			}
+		if err := it.seekBoundStart(b); err != nil {
+			return 0, err
+		}
+		if !it.cursor.Valid() {
+			continue
 		}
 
+		// Peek the first entry's value. If it's scalar AND we haven't yet
+		// seen a multi-key entry in this iteration, use batch counting:
+		// the within-doc dedup invariant still holds (each doc has ≤1
+		// entry per distinct value across the whole index, which means
+		// ≤1 entry in any value-range covered by a single bound).
+		if !stickyMulti {
+			val, verr := it.cursor.Value()
+			if verr != nil {
+				return 0, verr
+			}
+			if !EntryValueIsMultiKey(val) {
+				n, err := it.cursor.CountUntil(b.End, b.EndInclude)
+				if err != nil {
+					return 0, err
+				}
+				total += n
+				continue
+			}
+			stickyMulti = true
+		}
+
+		// Per-entry walk with seen-set dedup.
 		for it.cursor.Valid() {
 			k, kerr := it.cursor.Key()
 			if kerr != nil {
 				return 0, kerr
 			}
-			// End-of-bound check.
 			if len(b.End) > 0 {
 				cmp := bytes.Compare(k, b.End)
 				if cmp > 0 || (cmp == 0 && !b.EndInclude) {
@@ -315,6 +333,30 @@ func (it *IndexIter) countEntriesWithDedup() (int, error) {
 		}
 	}
 	return total, nil
+}
+
+// seekBoundStart positions the cursor at the first entry of the given
+// bound, accounting for StartInclude. Shared between
+// countEntriesWithDedup and the existing countEntriesBatch.
+func (it *IndexIter) seekBoundStart(b query.Bound) error {
+	if len(b.Start) > 0 {
+		if err := it.cursor.Seek(b.Start); err != nil {
+			return err
+		}
+		if it.cursor.Valid() && !b.StartInclude {
+			k, kerr := it.cursor.Key()
+			if kerr != nil {
+				return kerr
+			}
+			if bytes.Equal(k, b.Start) {
+				if err := it.cursor.Next(); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	return it.cursor.First()
 }
 
 // Close releases the underlying cursor resources.
