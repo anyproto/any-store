@@ -581,3 +581,242 @@ func TestQuery_Count_FilterParseError(t *testing.T) {
 		"error must originate from query/cond_parse.go parseAndArray")
 	assert.Equal(t, 0, count, "Count must return 0 on parse failure")
 }
+
+// --- Unsatisfiable filter fast path (audit 11 follow-up) ---
+
+// TestIsUnsatisfiable covers the helper directly: every recognised
+// shape of "this filter can never match" plus a handful of negative
+// cases that must NOT be reported as unsatisfiable.
+func TestIsUnsatisfiable(t *testing.T) {
+	emptyIn := query.MustParseCondition(`{"a":{"$in":[]}}`)
+	nonemptyIn := query.MustParseCondition(`{"a":{"$in":[1,2,3]}}`)
+	eq := query.MustParseCondition(`{"a":1}`)
+
+	t.Run("nil_filter", func(t *testing.T) {
+		assert.False(t, isUnsatisfiable(nil),
+			"nil filter is satisfiable (matches all)")
+	})
+
+	t.Run("All", func(t *testing.T) {
+		assert.False(t, isUnsatisfiable(query.All{}))
+	})
+
+	t.Run("empty_In_top_level_via_Key", func(t *testing.T) {
+		// {"a":{"$in":[]}} parses to query.Key{Path:["a"], Filter: In{Values: empty}}.
+		assert.True(t, isUnsatisfiable(emptyIn))
+	})
+
+	t.Run("nonempty_In_via_Key", func(t *testing.T) {
+		assert.False(t, isUnsatisfiable(nonemptyIn))
+	})
+
+	t.Run("equality_via_Key", func(t *testing.T) {
+		assert.False(t, isUnsatisfiable(eq))
+	})
+
+	t.Run("In_directly_empty", func(t *testing.T) {
+		assert.True(t, isUnsatisfiable(query.NewInValue()))
+	})
+
+	t.Run("And_with_empty_In_is_unsatisfiable", func(t *testing.T) {
+		// {"$and":[{"a":1},{"b":{"$in":[]}}]} — short-circuits on the empty In.
+		f := query.MustParseCondition(`{"$and":[{"a":1},{"b":{"$in":[]}}]}`)
+		assert.True(t, isUnsatisfiable(f))
+	})
+
+	t.Run("And_value_form_with_empty_In", func(t *testing.T) {
+		// `{"a":1, "b":{"$in":[]}}` parses to query.And (value, not pointer).
+		f := query.MustParseCondition(`{"a":1, "b":{"$in":[]}}`)
+		assert.True(t, isUnsatisfiable(f))
+	})
+
+	t.Run("Or_with_one_satisfiable_branch_is_satisfiable", func(t *testing.T) {
+		// {"$or":[{"a":1},{"b":{"$in":[]}}]} — empty In is unsatisfiable but
+		// the Or as a whole is satisfiable via the {"a":1} branch.
+		f := query.MustParseCondition(`{"$or":[{"a":1},{"b":{"$in":[]}}]}`)
+		assert.False(t, isUnsatisfiable(f))
+	})
+
+	t.Run("Or_all_branches_unsatisfiable_is_unsatisfiable", func(t *testing.T) {
+		f := query.MustParseCondition(`{"$or":[{"a":{"$in":[]}},{"b":{"$in":[]}}]}`)
+		assert.True(t, isUnsatisfiable(f))
+	})
+
+	t.Run("Not_on_unsatisfiable_inner_is_satisfiable", func(t *testing.T) {
+		// $not on always-false is always-true, NOT unsatisfiable. The
+		// helper is conservative and returns false here.
+		f := query.MustParseCondition(`{"a":{"$not":{"$in":[]}}}`)
+		assert.False(t, isUnsatisfiable(f))
+	})
+}
+
+// TestQuery_Unsatisfiable_Count_EmptyIn pins the fast path: Count with
+// {field: $in:[]} returns 0 with no error and (by construction in the
+// query.go fast path) does not open a read tx or build a plan.
+func TestQuery_Unsatisfiable_Count_EmptyIn(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "unsat_count")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":1}`),
+		anyenc.MustParseJson(`{"id":2,"a":2}`),
+	))
+
+	// Top-level empty $in.
+	n, err := coll.Find(`{"a":{"$in":[]}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, n)
+
+	// Empty $in inside $and — still unsatisfiable.
+	n, err = coll.Find(`{"$and":[{"a":1},{"b":{"$in":[]}}]}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, n)
+
+	// Empty $in inside $or with a satisfiable branch — NOT unsatisfiable.
+	// Should match doc 1 via {"a":1}.
+	n, err = coll.Find(`{"$or":[{"a":1},{"b":{"$in":[]}}]}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n,
+		"$or with at least one satisfiable branch must NOT take the unsat fast path")
+}
+
+// TestQuery_Unsatisfiable_Iter_EmptyIn pins that Iter on an empty $in
+// returns an iterator that yields nothing, with no error from open or
+// close. Verifies that Doc() on an exhausted unsat iterator returns
+// ErrDocNotFound (the chosen sentinel for the empty path).
+func TestQuery_Unsatisfiable_Iter_EmptyIn(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "unsat_iter")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":1}`),
+		anyenc.MustParseJson(`{"id":2,"a":2}`),
+	))
+
+	it, err := coll.Find(`{"a":{"$in":[]}}`).Iter(ctx)
+	require.NoError(t, err)
+
+	// Yields zero docs.
+	count := 0
+	for it.Next() {
+		count++
+	}
+	assert.Equal(t, 0, count, "empty $in iterator must yield zero docs")
+	require.NoError(t, it.Err())
+
+	// Close is idempotent in the success direction; second close errors
+	// (matches the planIterator contract).
+	require.NoError(t, it.Close())
+	assert.ErrorIs(t, it.Close(), ErrIterClosed)
+}
+
+// TestQuery_Unsatisfiable_Update_EmptyIn pins that UpdateMany with an
+// empty-$in filter parses the modifier (so a malformed modifier still
+// errors) but then short-circuits to ModifyResult{} with no write tx.
+func TestQuery_Unsatisfiable_Update_EmptyIn(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "unsat_update")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":1,"n":0}`),
+		anyenc.MustParseJson(`{"id":2,"a":2,"n":0}`),
+	))
+
+	// Valid modifier + unsatisfiable filter → zero result, no error.
+	res, err := coll.Find(`{"a":{"$in":[]}}`).Update(ctx, `{"$inc":{"n":1}}`)
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.Matched)
+	assert.Equal(t, 0, res.Modified)
+
+	// Verify no doc was modified.
+	for _, id := range []int{1, 2} {
+		doc, derr := coll.FindId(ctx, id)
+		require.NoError(t, derr)
+		assert.Equal(t, float64(0), doc.Value().Get("n").GetFloat64(),
+			"doc id=%d must not have been modified", id)
+	}
+
+	// Malformed modifier MUST still surface an error (the modifier is
+	// parsed BEFORE the unsat check, by design).
+	_, err = coll.Find(`{"a":{"$in":[]}}`).Update(ctx, `{"$badop":{"n":1}}`)
+	require.Error(t, err,
+		"malformed modifier must error even when the filter is unsatisfiable")
+}
+
+// TestQuery_Unsatisfiable_Delete_EmptyIn pins that DeleteMany with an
+// empty-$in filter returns a zero ModifyResult without opening a write
+// tx, and leaves the collection contents untouched.
+func TestQuery_Unsatisfiable_Delete_EmptyIn(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "unsat_delete")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":1}`),
+		anyenc.MustParseJson(`{"id":2,"a":2}`),
+	))
+
+	res, err := coll.Find(`{"a":{"$in":[]}}`).Delete(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, res.Matched)
+	assert.Equal(t, 0, res.Modified)
+
+	count, err := coll.Find(nil).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, count, "delete with empty $in must not remove any doc")
+}
+
+// TestQuery_Unsatisfiable_AllOpsConsistent runs Count/Iter/Update/Delete
+// against the SAME unsatisfiable filter shape and asserts they all agree
+// on "matches nothing" — guards against any one of the four wires
+// drifting away from the others.
+func TestQuery_Unsatisfiable_AllOpsConsistent(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "unsat_consistency")
+	require.NoError(t, err)
+
+	// Many docs to make any non-fast-path observably slower.
+	for i := range 200 {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+			fmt.Sprintf(`{"id":%d,"a":%d,"n":0}`, i, i),
+		)))
+	}
+
+	// Filter shapes that are all unsatisfiable.
+	for _, filter := range []string{
+		`{"a":{"$in":[]}}`,
+		`{"$and":[{"a":1},{"b":{"$in":[]}}]}`,
+		`{"a":1, "b":{"$in":[]}}`,
+		`{"$or":[{"a":{"$in":[]}},{"b":{"$in":[]}}]}`,
+	} {
+		t.Run(filter, func(t *testing.T) {
+			n, err := coll.Find(filter).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, 0, n, "Count")
+
+			it, err := coll.Find(filter).Iter(ctx)
+			require.NoError(t, err)
+			yielded := 0
+			for it.Next() {
+				yielded++
+			}
+			require.NoError(t, it.Err())
+			require.NoError(t, it.Close())
+			assert.Equal(t, 0, yielded, "Iter yield")
+
+			res, err := coll.Find(filter).Update(ctx, `{"$inc":{"n":1}}`)
+			require.NoError(t, err)
+			assert.Equal(t, 0, res.Matched, "Update Matched")
+			assert.Equal(t, 0, res.Modified, "Update Modified")
+
+			res, err = coll.Find(filter).Delete(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, 0, res.Matched, "Delete Matched")
+			assert.Equal(t, 0, res.Modified, "Delete Modified")
+		})
+	}
+
+	// Sanity: collection unchanged.
+	count, err := coll.Find(nil).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 200, count)
+}

@@ -154,3 +154,23 @@ func (pi *planIterator) Close() (err error) {
 func (pi *planIterator) String() string {
 	return pi.plan.String()
 }
+
+// emptyIter is the public Iterator returned by Find().Iter() when the
+// filter is provably empty (see isUnsatisfiable in query.go). It opens
+// no transaction, allocates no buffers, and yields nothing — Next is
+// always false. Used to short-circuit Iter on filters like $in:[]
+// without paying for plan construction or any I/O.
+type emptyIter struct{ closed bool }
+
+func (e *emptyIter) Next() bool { return false }
+func (e *emptyIter) Doc() (Doc, error) {
+	return nil, ErrDocNotFound
+}
+func (e *emptyIter) Err() error { return nil }
+func (e *emptyIter) Close() error {
+	if e.closed {
+		return ErrIterClosed
+	}
+	e.closed = true
+	return nil
+}

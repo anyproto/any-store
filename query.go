@@ -119,6 +119,13 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		return
 	}
 
+	// Fast path: filter provably matches no documents — return an empty
+	// iterator with no transaction, no plan construction, no I/O.
+	if isUnsatisfiable(q.cond) {
+		qb.Close()
+		return &emptyIter{}, nil
+	}
+
 	tx, err := q.c.db.getReadTx(ctx)
 	if err != nil {
 		qb.Close()
@@ -163,6 +170,14 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		return
 	}
 	defer qb.Close()
+
+	// Fast path: filter provably matches no documents — nothing to update,
+	// no write tx required. ModifyResult is the zero value (Matched=0,
+	// Modified=0); the modifier was already parsed above so a malformed
+	// modifier is still surfaced.
+	if isUnsatisfiable(q.cond) {
+		return
+	}
 
 	tx, err := q.c.db.WriteTx(ctx)
 	if err != nil {
@@ -288,6 +303,12 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	}
 	defer qb.Close()
 
+	// Fast path: filter provably matches no documents — nothing to delete,
+	// no write tx required.
+	if isUnsatisfiable(q.cond) {
+		return
+	}
+
 	tx, err := q.c.db.WriteTx(ctx)
 	if err != nil {
 		return
@@ -381,6 +402,13 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	}
 	if q.cond == nil {
 		q.cond = query.All{}
+	}
+
+	// Fast path: filter provably matches no documents (e.g. $in:[]). Skip
+	// the planner, the read tx, and the index walk entirely — the answer
+	// is unconditionally zero. See isUnsatisfiable.
+	if isUnsatisfiable(q.cond) {
+		return 0, nil
 	}
 
 	// Compute idBounds only if filter references "id" field
@@ -546,6 +574,56 @@ func (q *collQuery) docCount(tx interface {
 	}
 	count, _ := tx.Count(q.c.ns)
 	return count
+}
+
+// isUnsatisfiable reports whether the given filter provably matches no
+// documents. Used to short-circuit Count/Iter/Update/Delete before we
+// open a transaction, build a plan, or read any pages — the operation
+// degenerates into "the answer is zero / empty" with no I/O.
+//
+// Currently detects:
+//   - empty $in (query.In{Values: empty}) — never matches anything;
+//   - the same propagated through a Key filter ({field: {$in:[]}});
+//   - $and containing any unsatisfiable branch (short-circuit on first);
+//   - $or whose every branch is unsatisfiable (must be unanimous).
+//
+// Conservative: returns false for anything it can't prove. Notably,
+// $not on an unsatisfiable inner is NOT reported as unsatisfiable (the
+// outer would be always-true, not always-false).
+func isUnsatisfiable(f query.Filter) bool {
+	switch ft := f.(type) {
+	case nil:
+		return false
+	case query.In:
+		return len(ft.Values) == 0
+	case query.Key:
+		return isUnsatisfiable(ft.Filter)
+	case query.And:
+		for _, sub := range ft {
+			if isUnsatisfiable(sub) {
+				return true
+			}
+		}
+		return false
+	case *query.And:
+		for _, sub := range *ft {
+			if isUnsatisfiable(sub) {
+				return true
+			}
+		}
+		return false
+	case query.Or:
+		if len(ft) == 0 {
+			return false
+		}
+		for _, sub := range ft {
+			if !isUnsatisfiable(sub) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // isIDOnlyFilter returns true if the filter only references the "id" field
