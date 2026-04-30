@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -8,6 +9,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/internal/btree"
+	"github.com/anyproto/any-store/internal/qplanner"
 )
 
 func mustParseItem(t testing.TB, s string) item {
@@ -411,4 +414,155 @@ func TestIndex_DeleteKeys_SwallowsErrKeyNotFound(t *testing.T) {
 		"deleteKeys on a never-inserted doc must not touch unrelated index rows")
 
 	require.NoError(t, wrTx.Rollback())
+}
+
+// rawIndexEntry pairs an index key with its raw on-disk value byte(s).
+// Used by audit_*_test.go to assert the per-entry value byte (bit 0 =
+// multi-key) written by insertKeys.
+type rawIndexEntry struct {
+	Key   []byte
+	Value []byte
+}
+
+// readRawIndexEntries walks every entry of the named index in the named
+// collection and returns (key, value) pairs as-is. Test-only helper —
+// reaches into private collection/index fields and uses the btree
+// cursor directly so tests can assert what insertKeys actually wrote.
+func readRawIndexEntries(t *testing.T, anyDB DB, collName, indexName string) []rawIndexEntry {
+	t.Helper()
+	ctx := context.Background()
+	impl := anyDB.(*db)
+	coll, err := impl.Collection(ctx, collName)
+	require.NoError(t, err)
+	c := coll.(*collection)
+
+	var idx *index
+	c.mu.Lock()
+	for _, i := range c.indexes {
+		if i.info.Name == indexName {
+			idx = i
+			break
+		}
+	}
+	c.mu.Unlock()
+	require.NotNil(t, idx, "index %q not found in collection %q", indexName, collName)
+
+	var out []rawIndexEntry
+	require.NoError(t, impl.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		cur := tx.NewCursor(idx.ns)
+		defer cur.Close()
+		if err := cur.First(); err != nil {
+			return err
+		}
+		for cur.Valid() {
+			k, kerr := cur.Key()
+			if kerr != nil {
+				return kerr
+			}
+			v, verr := cur.Value()
+			if verr != nil {
+				return verr
+			}
+			kp := make([]byte, len(k))
+			copy(kp, k)
+			vp := make([]byte, len(v))
+			copy(vp, v)
+			out = append(out, rawIndexEntry{Key: kp, Value: vp})
+			if err := cur.Next(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+	return out
+}
+
+// TestAudit01_ValueByte_Scalar pins the scalar case: a document with a plain
+// scalar field on an indexed path produces exactly ONE index entry, and the
+// per-entry value byte must be IndexValueScalar (0x00).
+//
+// This is the baseline assertion for the multi-key bit pipeline. If this byte
+// is wrong at write time, the dedup fast path can't trust it at read time.
+func TestAudit01_ValueByte_Scalar(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit01_scalar")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_a",
+		Fields: []string{"a"},
+	}))
+
+	// Single scalar value → exactly one keysBuf entry → IndexValueScalar.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":5}`)))
+
+	entries := readRawIndexEntries(t, fx.DB, "audit01_scalar", "ix_a")
+	require.Len(t, entries, 1, "scalar field must produce exactly one index entry")
+	assert.Equal(t, qplanner.IndexValueScalar, entries[0].Value,
+		"scalar insert must write IndexValueScalar (0x00) per-entry value byte")
+	// Tighten the assertion: explicitly confirm bit 0 is cleared.
+	require.NotEmpty(t, entries[0].Value)
+	assert.Zero(t, entries[0].Value[0]&qplanner.IndexEntryFlagMultiKey,
+		"scalar entry must have multi-key flag bit cleared")
+}
+
+// TestAudit01_ValueByte_SingleElementArray pins the subtle single-element
+// array case. {tags: ["x"]} on an index over `tags` produces TWO index
+// entries:
+//
+//   - one for the element "x" (via the array loop in writeValues)
+//   - one for the whole array ["x"] (via the fall-through MarshalTo/writeValues)
+//
+// Because len(keysBuf) > 1 by the time insertKeys reads it, BOTH entries
+// must be tagged IndexValueMultiKey — even though the array contains only a
+// single element. This is the corner case future readers most easily get
+// wrong, hence pinning it explicitly.
+func TestAudit01_ValueByte_SingleElementArray(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit01_single_arr")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+	}))
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":["x"]}`)))
+
+	entries := readRawIndexEntries(t, fx.DB, "audit01_single_arr", "ix_tags")
+	require.Len(t, entries, 2,
+		"single-element array must produce 2 entries (element + whole-array)")
+	for i, e := range entries {
+		assert.Equalf(t, qplanner.IndexValueMultiKey, e.Value,
+			"entry %d: single-element-array insert must still write IndexValueMultiKey "+
+				"because keysBuf already contains 2 keys at insertKeys() time", i)
+		require.NotEmptyf(t, e.Value, "entry %d: value must not be empty", i)
+		assert.NotZerof(t, e.Value[0]&qplanner.IndexEntryFlagMultiKey,
+			"entry %d: multi-key flag bit must be set", i)
+	}
+}
+
+// TestAudit01_ValueByte_MultiElementArray covers the obvious multi-key case:
+// an array with several distinct elements. All entries (including the
+// whole-array entry) must be tagged IndexValueMultiKey.
+func TestAudit01_ValueByte_MultiElementArray(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit01_multi_arr")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+	}))
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":["a","b","c"]}`)))
+
+	entries := readRawIndexEntries(t, fx.DB, "audit01_multi_arr", "ix_tags")
+	// 3 distinct elements + 1 whole-array entry = 4 entries.
+	require.Len(t, entries, 4,
+		"3-element array must produce 4 entries (3 elements + whole-array)")
+	for i, e := range entries {
+		assert.Equalf(t, qplanner.IndexValueMultiKey, e.Value,
+			"entry %d: multi-element array must write IndexValueMultiKey for every entry", i)
+		require.NotEmptyf(t, e.Value, "entry %d: value must not be empty", i)
+		assert.NotZerof(t, e.Value[0]&qplanner.IndexEntryFlagMultiKey,
+			"entry %d: multi-key flag bit must be set", i)
+	}
 }

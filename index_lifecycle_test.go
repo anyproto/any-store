@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/internal/qplanner"
 )
 
 // --- from index_collection_lifecycle_test.go ---
@@ -743,4 +745,254 @@ func TestIndex_Persistence_DropIndexThenReopen(t *testing.T) {
 	// Dropping already-dropped index should fail
 	err = coll2.DropIndex(ctx, "a")
 	require.ErrorIs(t, err, ErrIndexNotFound)
+}
+
+// TestAudit09_EnsureIndexBackfill_* exercises the BACKFILL path of EnsureIndex
+// when called over an already-populated collection. createIndex
+// (collection.go ~L590) calls c.buildIndex(tx, idx), which iterates every
+// existing document and invokes idx.insertKeys(tx, item) per doc. The
+// per-entry value byte (IndexValueScalar vs IndexValueMultiKey) is set inside
+// insertKeys based on len(idx.keysBuf) at that time.
+//
+// This is the ONLY way the multi-key bit gets retroactively materialized on
+// pre-existing data — every other test inserts docs while the index already
+// exists. TestCollection_Backfill_Coverage_IndexAfterInsert in
+// index_lifecycle_test.go covers the scalar-only path; these tests pin the
+// multi-key, mixed, and drop-and-recreate variants.
+
+// TestAudit09_EnsureIndexBackfill_ScalarOnly: insert 5 scalar-tagged docs
+// before any index exists, then EnsureIndex on tags. Backfill must emit one
+// entry per doc, each tagged IndexValueScalar.
+func TestAudit09_EnsureIndexBackfill_ScalarOnly(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit09_scalar")
+	require.NoError(t, err)
+
+	// Insert 5 scalar-valued docs first; no index yet.
+	for i := 0; i < 5; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+			fmt.Sprintf(`{"id":"s%d","tags":"v%d"}`, i, i),
+		)))
+	}
+	require.Len(t, coll.GetIndexes(), 0)
+
+	// Backfill: build the index from the existing 5 docs.
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+	}))
+	require.Len(t, coll.GetIndexes(), 1)
+	assertIndexLen(t, coll.GetIndexes()[0], 5)
+
+	entries := readRawIndexEntries(t, fx.DB, "audit09_scalar", "ix_tags")
+	require.Len(t, entries, 5,
+		"5 scalar docs must produce exactly 5 backfilled index entries")
+	for i, e := range entries {
+		assert.Equalf(t, qplanner.IndexValueScalar, e.Value,
+			"entry %d: scalar-doc backfill must write IndexValueScalar (0x00)", i)
+		require.NotEmptyf(t, e.Value, "entry %d: value must not be empty", i)
+		assert.Zerof(t, e.Value[0]&qplanner.IndexEntryFlagMultiKey,
+			"entry %d: multi-key flag bit must be CLEARED for scalar entry", i)
+	}
+}
+
+// TestAudit09_EnsureIndexBackfill_MultiKeyOnly: insert 5 array-tagged docs
+// (3 elements each) before the index exists, then EnsureIndex on tags.
+// Backfill must emit one entry per element + one whole-array entry per doc
+// (= 4 entries per doc), each tagged IndexValueMultiKey.
+func TestAudit09_EnsureIndexBackfill_MultiKeyOnly(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit09_multi")
+	require.NoError(t, err)
+
+	// 5 docs × 3-element arrays; no index yet.
+	for i := 0; i < 5; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+			fmt.Sprintf(`{"id":"m%d","tags":["a%d","b%d","c%d"]}`, i, i, i, i),
+		)))
+	}
+	require.Len(t, coll.GetIndexes(), 0)
+
+	// Backfill: per-doc, writeValues emits 3 element keys + 1 whole-array
+	// key = 4 keys → len(keysBuf)>1 → IndexValueMultiKey for every entry.
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+	}))
+	require.Len(t, coll.GetIndexes(), 1)
+
+	// 5 docs × 4 keys = 20 backfilled entries.
+	const wantEntries = 20
+	assertIndexLen(t, coll.GetIndexes()[0], wantEntries)
+
+	entries := readRawIndexEntries(t, fx.DB, "audit09_multi", "ix_tags")
+	require.Len(t, entries, wantEntries,
+		"5 docs × (3 elements + 1 whole-array) = 20 backfilled entries")
+	for i, e := range entries {
+		assert.Truef(t, bytes.Equal(e.Value, qplanner.IndexValueMultiKey),
+			"entry %d: array-doc backfill must write IndexValueMultiKey, got %v",
+			i, e.Value)
+		require.NotEmptyf(t, e.Value, "entry %d: value must not be empty", i)
+		assert.NotZerof(t, e.Value[0]&qplanner.IndexEntryFlagMultiKey,
+			"entry %d: multi-key flag bit must be SET for array-doc entry", i)
+	}
+}
+
+// TestAudit09_EnsureIndexBackfill_Mixed: 3 scalar-tagged + 3 array-tagged
+// docs in the same collection. Backfill must classify per-doc — scalar docs
+// get IndexValueScalar, array docs get IndexValueMultiKey. The docId is
+// embedded in the trailing bytes of each index key (item.appendId), so we
+// distinguish scalar vs array origin by the docId prefix ("sx" vs "mx").
+func TestAudit09_EnsureIndexBackfill_Mixed(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit09_mixed")
+	require.NoError(t, err)
+
+	// 3 scalar docs (id: "sx0".."sx2", tags: "x0".."x2")
+	for i := 0; i < 3; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+			fmt.Sprintf(`{"id":"sx%d","tags":"x%d"}`, i, i),
+		)))
+	}
+	// 3 array docs (id: "mx0".."mx2", tags: ["a0","b0"]..)
+	for i := 0; i < 3; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+			fmt.Sprintf(`{"id":"mx%d","tags":["a%d","b%d"]}`, i, i, i),
+		)))
+	}
+	require.Len(t, coll.GetIndexes(), 0)
+
+	// Backfill in a single EnsureIndex call.
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+	}))
+	require.Len(t, coll.GetIndexes(), 1)
+
+	// 3 scalar (1 entry each) + 3 array × (2 element keys + 1 whole-array key)
+	// = 3 + 9 = 12 backfilled entries.
+	const wantEntries = 12
+	assertIndexLen(t, coll.GetIndexes()[0], wantEntries)
+
+	entries := readRawIndexEntries(t, fx.DB, "audit09_mixed", "ix_tags")
+	require.Len(t, entries, wantEntries,
+		"3 scalar (1 each) + 3 array (3 each) = 12 backfilled entries")
+
+	// Tally per-origin classification by inspecting the docId suffix in each key.
+	// docIds are short strings: "sx0".."sx2" or "mx0".."mx2". MarshalTo writes
+	// TypeString(0x03) + bytes + EOS(0x00), so the literal "sx" or "mx" bytes
+	// appear verbatim in the key tail — substring search is sufficient.
+	scalarSeen, multiKeySeen := 0, 0
+	for i, e := range entries {
+		fromScalarDoc := bytes.Contains(e.Key, []byte("sx"))
+		fromArrayDoc := bytes.Contains(e.Key, []byte("mx"))
+		require.Truef(t, fromScalarDoc != fromArrayDoc,
+			"entry %d: key must come from exactly one of scalar/array docs (key=%x)",
+			i, e.Key)
+
+		if fromScalarDoc {
+			scalarSeen++
+			assert.Equalf(t, qplanner.IndexValueScalar, e.Value,
+				"entry %d (scalar doc, key=%x): expected IndexValueScalar, got %v",
+				i, e.Key, e.Value)
+			require.NotEmptyf(t, e.Value, "entry %d: value must not be empty", i)
+			assert.Zerof(t, e.Value[0]&qplanner.IndexEntryFlagMultiKey,
+				"entry %d (scalar doc): multi-key flag must be CLEARED", i)
+		} else {
+			multiKeySeen++
+			assert.Truef(t, bytes.Equal(e.Value, qplanner.IndexValueMultiKey),
+				"entry %d (array doc, key=%x): expected IndexValueMultiKey, got %v",
+				i, e.Key, e.Value)
+			require.NotEmptyf(t, e.Value, "entry %d: value must not be empty", i)
+			assert.NotZerof(t, e.Value[0]&qplanner.IndexEntryFlagMultiKey,
+				"entry %d (array doc): multi-key flag must be SET", i)
+		}
+	}
+
+	// Cross-check totals: 3 scalar entries (1 per scalar doc) and 9 multi-key
+	// entries (3 per array doc).
+	assert.Equal(t, 3, scalarSeen, "scalar-doc entries must total 3")
+	assert.Equal(t, 9, multiKeySeen, "array-doc entries must total 9 (3 docs × 3 keys)")
+}
+
+// TestAudit09_EnsureIndexBackfill_DropAndRecreate: same data layout as the
+// Mixed test, but drops the freshly built index and re-creates it. Verifies
+// the second backfill rewrites every entry from a clean slate (no stale bits
+// from the dropped index leak through). DropIndex deletes the index
+// namespace, so the recreated index must repopulate every entry through the
+// same insertKeys path.
+func TestAudit09_EnsureIndexBackfill_DropAndRecreate(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit09_drop_recreate")
+	require.NoError(t, err)
+
+	// Same mixed data shape as the Mixed test.
+	for i := 0; i < 3; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+			fmt.Sprintf(`{"id":"sx%d","tags":"x%d"}`, i, i),
+		)))
+	}
+	for i := 0; i < 3; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+			fmt.Sprintf(`{"id":"mx%d","tags":["a%d","b%d"]}`, i, i, i),
+		)))
+	}
+
+	// First backfill.
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+	}))
+	require.Len(t, coll.GetIndexes(), 1)
+	assertIndexLen(t, coll.GetIndexes()[0], 12)
+
+	// Drop the index (deletes its namespace + sketch).
+	require.NoError(t, coll.DropIndex(ctx, "ix_tags"))
+	require.Len(t, coll.GetIndexes(), 0)
+
+	// Recreate from scratch — second backfill must replay through insertKeys
+	// and produce the exact same per-entry classification.
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+	}))
+	require.Len(t, coll.GetIndexes(), 1)
+	assertIndexLen(t, coll.GetIndexes()[0], 12)
+
+	entries := readRawIndexEntries(t, fx.DB, "audit09_drop_recreate", "ix_tags")
+	require.Len(t, entries, 12,
+		"recreated index must have the full 12 entries from the second backfill")
+
+	scalarSeen, multiKeySeen := 0, 0
+	for i, e := range entries {
+		fromScalarDoc := bytes.Contains(e.Key, []byte("sx"))
+		fromArrayDoc := bytes.Contains(e.Key, []byte("mx"))
+		require.Truef(t, fromScalarDoc != fromArrayDoc,
+			"entry %d: key must come from exactly one of scalar/array docs (key=%x)",
+			i, e.Key)
+
+		if fromScalarDoc {
+			scalarSeen++
+			assert.Equalf(t, qplanner.IndexValueScalar, e.Value,
+				"entry %d (scalar doc, recreated index, key=%x): expected IndexValueScalar, got %v",
+				i, e.Key, e.Value)
+			require.NotEmptyf(t, e.Value, "entry %d: value must not be empty", i)
+			assert.Zerof(t, e.Value[0]&qplanner.IndexEntryFlagMultiKey,
+				"entry %d (scalar doc, recreated index): multi-key flag must be CLEARED — "+
+					"recreation must not leak stale bits", i)
+		} else {
+			multiKeySeen++
+			assert.Truef(t, bytes.Equal(e.Value, qplanner.IndexValueMultiKey),
+				"entry %d (array doc, recreated index, key=%x): expected IndexValueMultiKey, got %v",
+				i, e.Key, e.Value)
+			require.NotEmptyf(t, e.Value, "entry %d: value must not be empty", i)
+			assert.NotZerof(t, e.Value[0]&qplanner.IndexEntryFlagMultiKey,
+				"entry %d (array doc, recreated index): multi-key flag must be SET", i)
+		}
+	}
+
+	assert.Equal(t, 3, scalarSeen,
+		"recreated index: scalar-doc entries must total 3 (no bits carried from old index)")
+	assert.Equal(t, 9, multiKeySeen,
+		"recreated index: array-doc entries must total 9 (3 docs × 3 keys)")
 }

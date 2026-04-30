@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"bytes"
 	"fmt"
 	"sort"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/internal/qplanner"
 )
 
 // --- from single_index_test.go ---
@@ -1334,4 +1336,251 @@ func TestIndex_ComplexFilter_ExistsWithSparseIndex(t *testing.T) {
 	idxLen, err := indexes[0].Len(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 50, idxLen, "sparse index should only contain docs with the field")
+}
+
+// TestAudit04_WithinDocDedup_* exercises the per-document key-set built by
+// index.go::writeValues for an array-valued field, focusing on what happens
+// when the array contains duplicates.
+//
+// Recap of the relevant control flow (index.go ~L207-L249):
+//
+//   - For each array element, isUnique() decides whether to emit a key for
+//     the per-element pass. Duplicate elements that have already been
+//     emitted in the same writeValues frame are skipped.
+//   - After the loop completes, writeValues falls through and ALWAYS emits
+//     one more key — `idx.keyBuf = v.MarshalTo(k); writeValues(d, i+1)` —
+//     keyed on the array as a whole (its full marshaled form).
+//
+// insertKeys (index.go ~L150) then writes IndexValueScalar when
+// len(keysBuf) == 1 and IndexValueMultiKey when len(keysBuf) > 1. So the
+// "single-element array" case is still classified as multi-key here,
+// because the per-element pass adds 1 key and the post-loop fall-through
+// adds 1 more, for 2 keys total.
+func TestAudit04_WithinDocDedup_AllDuplicates(t *testing.T) {
+	// {tags:["a","a","a"]} → isUnique collapses 3 elements to 1 emission,
+	// then the post-loop whole-array marshal adds 1 more = 2 keys total.
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "tags", Fields: []string{"tags"}}))
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":["a","a","a"]}`)))
+
+	entries := readRawIndexEntries(t, fx.DB, "test", "tags")
+	assert.Len(t, entries, 2,
+		"all-duplicate array: 1 deduped element + 1 whole-array marshal = 2 entries")
+
+	for i, e := range entries {
+		assert.True(t, bytes.Equal(e.Value, qplanner.IndexValueMultiKey),
+			"entry[%d] value=%v expected IndexValueMultiKey=%v",
+			i, e.Value, qplanner.IndexValueMultiKey)
+	}
+}
+
+func TestAudit04_WithinDocDedup_TwoUnique(t *testing.T) {
+	// {tags:["a","a","b"]} → "a","b" emitted by per-element pass + whole-array
+	// fall-through = 3 keys total.
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "tags", Fields: []string{"tags"}}))
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":["a","a","b"]}`)))
+
+	entries := readRawIndexEntries(t, fx.DB, "test", "tags")
+	assert.Len(t, entries, 3,
+		"['a','a','b']: 2 deduped elements + 1 whole-array marshal = 3 entries")
+
+	for i, e := range entries {
+		assert.True(t, bytes.Equal(e.Value, qplanner.IndexValueMultiKey),
+			"entry[%d] value=%v expected IndexValueMultiKey=%v",
+			i, e.Value, qplanner.IndexValueMultiKey)
+	}
+}
+
+func TestAudit04_WithinDocDedup_DupAtEnd(t *testing.T) {
+	// {tags:["a","b","c","a"]} — duplicate at the end. isUnique drops the
+	// trailing "a" because it was already emitted in this frame. 3 unique
+	// elements + 1 whole-array marshal = 4 keys.
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "tags", Fields: []string{"tags"}}))
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":["a","b","c","a"]}`)))
+
+	entries := readRawIndexEntries(t, fx.DB, "test", "tags")
+	assert.Len(t, entries, 4,
+		"['a','b','c','a']: 3 deduped elements ('a','b','c') + 1 whole-array marshal = 4 entries")
+
+	for i, e := range entries {
+		assert.True(t, bytes.Equal(e.Value, qplanner.IndexValueMultiKey),
+			"entry[%d] value=%v expected IndexValueMultiKey=%v",
+			i, e.Value, qplanner.IndexValueMultiKey)
+	}
+}
+
+func TestAudit04_WithinDocDedup_SingleElementArray(t *testing.T) {
+	// {tags:["a"]} — surprising case. The per-element pass emits 1 key
+	// ("a"), then the post-loop fall-through marshals the whole array as
+	// another key ([ "a" ] in encoded form). Total = 2 keys, so
+	// len(keysBuf) > 1 and insertKeys writes IndexValueMultiKey for BOTH
+	// entries — even though only one logical value exists in the array.
+	//
+	// This is "multi-key" by the strict len(keysBuf) > 1 definition, not by
+	// any user-facing notion of multi-valued field.
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "tags", Fields: []string{"tags"}}))
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":["a"]}`)))
+
+	entries := readRawIndexEntries(t, fx.DB, "test", "tags")
+	assert.Len(t, entries, 2,
+		"['a']: 1 element key + 1 whole-array marshal key = 2 entries (surprising but per spec)")
+
+	for i, e := range entries {
+		assert.True(t, bytes.Equal(e.Value, qplanner.IndexValueMultiKey),
+			"entry[%d] value=%v expected IndexValueMultiKey=%v "+
+				"(single-element array still classified multi-key because len(keysBuf)>1)",
+			i, e.Value, qplanner.IndexValueMultiKey)
+	}
+}
+
+// TestAudit08_CompoundArrayArray_BasicCartesian pins the worst-case fan-out
+// path through index.go::writeValues — a compound index where BOTH dimensions
+// are arrays. With doc {tags:["a","b"], cats:["x","y"]} and Fields:["tags","cats"]:
+//
+// writeValues recursion at i=0 (tags is array): emits one branch per element
+// "a","b" plus one fall-through branch for the whole array ["a","b"]. For each
+// of those 3 branches, recursion at i=1 (cats is array) again emits per-element
+// "x","y" plus one fall-through whole-array ["x","y"]. Total: 3 * 3 = 9 entries.
+//
+// Because len(idx.keysBuf) > 1 by the time insertKeys reads it, ALL 9 entries
+// must be tagged IndexValueMultiKey — including the whole-array entries.
+// Pinning both shape (count) and value byte for this entirely untested path.
+func TestAudit08_CompoundArrayArray_BasicCartesian(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit08_basic")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags_cats",
+		Fields: []string{"tags", "cats"},
+	}))
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+		`{"id":"d1","tags":["a","b"],"cats":["x","y"]}`,
+	)))
+
+	entries := readRawIndexEntries(t, fx.DB, "audit08_basic", "ix_tags_cats")
+
+	// Pin the actual count: writeValues recursion produces (N+1) * (M+1) entries
+	// where N=len(tags), M=len(cats). N=2, M=2 → 3 * 3 = 9 entries.
+	// Composition: 4 element-x-element (Cartesian) + 2 element-x-wholeArr +
+	// 2 wholeArr-x-element + 1 wholeArr-x-wholeArr = 9.
+	require.Lenf(t, entries, 9,
+		"compound array x array: writeValues fan-out is (N+1)*(M+1)=3*3=9 entries "+
+			"(4 Cartesian + 2+2 whole-array fall-throughs + 1 whole-x-whole)")
+
+	for i, e := range entries {
+		assert.Equalf(t, qplanner.IndexValueMultiKey, e.Value,
+			"entry %d: every entry must be IndexValueMultiKey since len(keysBuf)=9 > 1", i)
+		require.NotEmptyf(t, e.Value, "entry %d: value byte must not be empty", i)
+		assert.NotZerof(t, e.Value[0]&qplanner.IndexEntryFlagMultiKey,
+			"entry %d: multi-key flag bit must be set", i)
+	}
+}
+
+// TestAudit08_CompoundArrayArray_QueryCount verifies that despite emitting 9
+// raw index entries for a single doc, Count() correctly dedups and returns 1
+// when the query matches via element-x-element (the inner Cartesian path).
+func TestAudit08_CompoundArrayArray_QueryCount(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit08_count")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags_cats",
+		Fields: []string{"tags", "cats"},
+	}))
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+		`{"id":"d1","tags":["a","b"],"cats":["x","y"]}`,
+	)))
+
+	// {tags:"a", cats:"x"} matches the (a,x) Cartesian entry; doc must dedup to 1.
+	n, err := coll.Find(`{"tags":"a","cats":"x"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n, "single doc must dedup to 1 despite 9 raw entries")
+}
+
+// TestAudit08_CompoundArrayArray_QueryIter verifies Iter() yields the doc
+// exactly once for an element-x-element query, dedup notwithstanding the
+// 9-entry fan-out.
+func TestAudit08_CompoundArrayArray_QueryIter(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit08_iter")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags_cats",
+		Fields: []string{"tags", "cats"},
+	}))
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+		`{"id":"d1","tags":["a","b"],"cats":["x","y"]}`,
+	)))
+
+	it, err := coll.Find(`{"tags":"a","cats":"x"}`).Iter(ctx)
+	require.NoError(t, err)
+	defer it.Close()
+
+	var ids []string
+	for it.Next() {
+		d, err := it.Doc()
+		require.NoError(t, err)
+		ids = append(ids, string(d.Value().GetStringBytes("id")))
+	}
+	require.NoError(t, it.Err())
+	assert.Equal(t, []string{"d1"}, ids,
+		"compound array x array: Iter must yield d1 exactly once")
+}
+
+// TestAudit08_CompoundArrayArray_TwoDocsOverlap exercises dedup when two
+// documents share overlapping array elements. With $in over both array fields,
+// each doc's compound entries get visited multiple times — but Count and Iter
+// must still report each distinct document once.
+func TestAudit08_CompoundArrayArray_TwoDocsOverlap(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit08_overlap")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags_cats",
+		Fields: []string{"tags", "cats"},
+	}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"],"cats":["x","y"]}`),
+		anyenc.MustParseJson(`{"id":"d2","tags":["b","c"],"cats":["y","z"]}`),
+	))
+
+	// {tags:{$in:[b]}, cats:{$in:[y]}}: both d1 and d2 contain "b" in tags
+	// and "y" in cats. Each must appear exactly once.
+	n, err := coll.Find(`{"tags":{"$in":["b"]},"cats":{"$in":["y"]}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n, "both d1 and d2 match; Count must dedup to 2")
+
+	it, err := coll.Find(`{"tags":{"$in":["b"]},"cats":{"$in":["y"]}}`).Iter(ctx)
+	require.NoError(t, err)
+	defer it.Close()
+
+	var ids []string
+	for it.Next() {
+		d, err := it.Doc()
+		require.NoError(t, err)
+		ids = append(ids, string(d.Value().GetStringBytes("id")))
+	}
+	require.NoError(t, it.Err())
+	sort.Strings(ids)
+	assert.Equal(t, []string{"d1", "d2"}, ids,
+		"each doc must appear in Iter exactly once despite multiple matching index entries")
 }

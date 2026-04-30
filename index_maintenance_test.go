@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/internal/qplanner"
 	"github.com/anyproto/any-store/query"
 )
 
@@ -1217,4 +1218,202 @@ func TestIndex_UpsertMutation_UpsertIdWithIncrement(t *testing.T) {
 	count, err = coll.Find(`{"counter":1}`).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 0, count)
+}
+
+// TestAudit02_Reversibility_ArrayShrinksToSingleElement pins the per-doc
+// reversibility claim documented at index.go:148-150:
+//
+//	"Reversible per-doc: an array shrinking from 3 elements to 1 next time
+//	 round will see its single new entry written with IndexValueScalar."
+//
+// Setup: insert {tags:["a","b","c"]} → 4 entries (3 elements + whole-array),
+// all IndexValueMultiKey because len(keysBuf) > 1 at insertKeys time.
+//
+// Then update to {tags:["x"]} (a single-element array). The update path
+// (collection.update at collection.go:407) calls deleteKeys(prev) +
+// insertKeys(new). After the update, only entries derived from the new
+// value should remain.
+//
+// IMPORTANT — observed actual behaviour: a single-element array still
+// produces TWO keysBuf entries inside writeValues (one for the element "x",
+// one for the whole-array ["x"]). See audit_01 single-element-array case.
+// So len(keysBuf) == 2 at insertKeys time, which means the "shrunk" entries
+// are STILL written as IndexValueMultiKey. The doc claim's wording
+// ("array shrinking from 3 elements to 1") therefore only delivers
+// IndexValueScalar when the field type changes from array to scalar
+// (covered by the next subtest), not when the array merely shrinks to a
+// single element. Pinning the actually-observed behaviour here.
+func TestAudit02_Reversibility_ArrayShrinksToSingleElement(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit02_shrink")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+	}))
+
+	// Initial insert: 3-element array → 4 entries (elements + whole-array),
+	// every entry IndexValueMultiKey.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":["a","b","c"]}`)))
+
+	before := readRawIndexEntries(t, fx.DB, "audit02_shrink", "ix_tags")
+	require.Len(t, before, 4, "3-element array baseline must be 4 entries")
+	for i, e := range before {
+		require.NotEmptyf(t, e.Value, "before entry %d: value must not be empty", i)
+		assert.Equalf(t, qplanner.IndexValueMultiKey, e.Value,
+			"before entry %d: 3-element array must be multi-key", i)
+	}
+
+	// Update: array shrinks to a single element. The update path will
+	// deleteKeys(prev) — removing all 4 old entries — then insertKeys(new).
+	require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":1,"tags":["x"]}`)))
+
+	after := readRawIndexEntries(t, fx.DB, "audit02_shrink", "ix_tags")
+	// Observed: single-element array still emits 2 keysBuf entries
+	// (element "x" + whole-array ["x"]). All old entries for "a","b","c"
+	// + the old whole-array must be gone.
+	require.Len(t, after, 2,
+		"after shrink to single-element array: 2 entries (element + whole-array), "+
+			"old multi-element entries must be deleted")
+	for i, e := range after {
+		require.NotEmptyf(t, e.Value, "after entry %d: value must not be empty", i)
+		// Pinning observed behaviour: even though the array "shrunk", a
+		// single-element array still produces len(keysBuf) == 2, so each
+		// surviving entry is still tagged IndexValueMultiKey. The literal
+		// reading of the doc claim ("entry written with IndexValueScalar")
+		// therefore does NOT apply when shrinking to a 1-element array —
+		// only when shrinking to a scalar field. Surprising but consistent
+		// with audit_01_valuebyte_basic_test.go's single-element-array
+		// pin.
+		assert.Equalf(t, qplanner.IndexValueMultiKey, e.Value,
+			"after entry %d: single-element array still tagged multi-key "+
+				"(len(keysBuf)==2 at insertKeys time)", i)
+		assert.NotZerof(t, e.Value[0]&qplanner.IndexEntryFlagMultiKey,
+			"after entry %d: multi-key bit must be set", i)
+	}
+
+	// Additionally verify none of the old element keys ("a","b","c") are
+	// findable — proving deleteKeys ran cleanly.
+	for _, gone := range []string{"a", "b", "c"} {
+		count, qerr := coll.Find(`{"tags":"` + gone + `"}`).Count(ctx)
+		require.NoError(t, qerr)
+		assert.Equalf(t, 0, count, "old tag %q must be gone after update", gone)
+	}
+	count, qerr := coll.Find(`{"tags":"x"}`).Count(ctx)
+	require.NoError(t, qerr)
+	assert.Equal(t, 1, count, "new tag \"x\" must be findable")
+}
+
+// TestAudit02_Reversibility_ArrayShrinksToScalar exercises the actual
+// reversibility path that produces IndexValueScalar: the field type changes
+// from array (multi-key) to scalar (single key). This is the case the
+// index.go:148-150 doc claim is really about.
+//
+// Setup: insert {tags:["a","b","c"]} → 4 multi-key entries.
+// Update:  set tags to a plain scalar string "single".
+// After:   exactly ONE entry, tagged IndexValueScalar (bit 0 cleared).
+func TestAudit02_Reversibility_ArrayShrinksToScalar(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit02_to_scalar")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+	}))
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":["a","b","c"]}`)))
+
+	before := readRawIndexEntries(t, fx.DB, "audit02_to_scalar", "ix_tags")
+	require.Len(t, before, 4, "3-element array baseline must be 4 entries")
+	for i, e := range before {
+		require.NotEmptyf(t, e.Value, "before entry %d: value must not be empty", i)
+		assert.Equalf(t, qplanner.IndexValueMultiKey, e.Value,
+			"before entry %d: 3-element array must be multi-key", i)
+	}
+
+	// Update: tags becomes a scalar string, NOT an array. writeValues
+	// takes the non-array path → exactly one keysBuf entry → insertKeys
+	// records IndexValueScalar.
+	require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":1,"tags":"single"}`)))
+
+	after := readRawIndexEntries(t, fx.DB, "audit02_to_scalar", "ix_tags")
+	require.Len(t, after, 1,
+		"after shrink to scalar: exactly one entry must remain "+
+			"(per-doc reversibility — old 4 multi-key entries deleted, new scalar entry written)")
+	require.NotEmpty(t, after[0].Value, "surviving entry value must not be empty")
+	assert.Equal(t, qplanner.IndexValueScalar, after[0].Value,
+		"shrink-to-scalar must write IndexValueScalar (bit 0 cleared) — "+
+			"this is the per-doc reversibility claim at index.go:148-150")
+	assert.Zero(t, after[0].Value[0]&qplanner.IndexEntryFlagMultiKey,
+		"multi-key flag bit must be cleared on the new scalar entry")
+
+	// Old element keys gone, new scalar findable.
+	for _, gone := range []string{"a", "b", "c"} {
+		count, qerr := coll.Find(`{"tags":"` + gone + `"}`).Count(ctx)
+		require.NoError(t, qerr)
+		assert.Equalf(t, 0, count, "old tag %q must be gone after update", gone)
+	}
+	count, qerr := coll.Find(`{"tags":"single"}`).Count(ctx)
+	require.NoError(t, qerr)
+	assert.Equal(t, 1, count, "new scalar value \"single\" must be findable")
+}
+
+// TestAudit02_Reversibility_ScalarGrowsToArray covers the reverse direction
+// of reversibility: a doc that was originally scalar (one entry tagged
+// IndexValueScalar) gets updated to a multi-element array. The new entries
+// must all be tagged IndexValueMultiKey AND the original scalar entry must
+// be deleted (no stale entry left behind with the wrong bit).
+func TestAudit02_Reversibility_ScalarGrowsToArray(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit02_to_array")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+	}))
+
+	// Initial: scalar string → exactly one entry, IndexValueScalar.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":"x"}`)))
+
+	before := readRawIndexEntries(t, fx.DB, "audit02_to_array", "ix_tags")
+	require.Len(t, before, 1, "scalar baseline must be exactly 1 entry")
+	require.NotEmpty(t, before[0].Value)
+	assert.Equal(t, qplanner.IndexValueScalar, before[0].Value,
+		"scalar baseline entry must be tagged IndexValueScalar")
+	originalScalarKey := before[0].Key
+
+	// Update: scalar → 2-element array. New keysBuf will have 2 element
+	// entries + 1 whole-array entry = 3 entries, all IndexValueMultiKey.
+	require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":1,"tags":["a","b"]}`)))
+
+	after := readRawIndexEntries(t, fx.DB, "audit02_to_array", "ix_tags")
+	require.Len(t, after, 3,
+		"after scalar → 2-element array: 3 entries (2 elements + whole-array)")
+	for i, e := range after {
+		require.NotEmptyf(t, e.Value, "after entry %d: value must not be empty", i)
+		assert.Equalf(t, qplanner.IndexValueMultiKey, e.Value,
+			"after entry %d: every new array entry must be IndexValueMultiKey", i)
+		assert.NotZerof(t, e.Value[0]&qplanner.IndexEntryFlagMultiKey,
+			"after entry %d: multi-key bit must be set", i)
+	}
+
+	// Assert the original scalar entry's exact key is gone — proving
+	// deleteKeys cleaned up the prior shape before insertKeys ran.
+	for i, e := range after {
+		assert.NotEqualf(t, originalScalarKey, e.Key,
+			"after entry %d: original scalar entry key must have been deleted", i)
+	}
+
+	// Old scalar value "x" must no longer be findable except as part of
+	// the new array — but since we replaced "x" with ["a","b"], a query
+	// for tags:"x" should return 0.
+	count, qerr := coll.Find(`{"tags":"x"}`).Count(ctx)
+	require.NoError(t, qerr)
+	assert.Equal(t, 0, count, "old scalar value \"x\" must be gone after update")
+
+	for _, want := range []string{"a", "b"} {
+		count, qerr := coll.Find(`{"tags":"` + want + `"}`).Count(ctx)
+		require.NoError(t, qerr)
+		assert.Equalf(t, 1, count, "new tag %q must be findable", want)
+	}
 }

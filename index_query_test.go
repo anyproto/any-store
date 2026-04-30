@@ -2,6 +2,7 @@ package anystore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"path/filepath"
@@ -1242,4 +1243,574 @@ func TestIndex_Coverage_EmptySegmentInPathRejected(t *testing.T) {
 				"CreateIndex with empty path segment %q must return a validation error", field)
 		})
 	}
+}
+
+// TestAudit03_MultiBoundOverlap_* exercises the most important integration
+// invariant of the multi-key bit + dedup pipeline introduced on the `btree`
+// branch (see docs/plans/2026-04-29-multikey-bit-and-dedup-pipeline.md):
+//
+//	A `$in` filter that produces multiple bounds, executed against a
+//	multi-key (array-valued) index whose documents have OVERLAPPING values
+//	with those bounds, MUST surface each matching doc exactly once.
+//
+// Concretely: doc {id:"d1", tags:["a","b","c"]} with index on `tags` produces
+// 4 raw entries (per AUDIT01: 3 element entries + 1 whole-array entry, all
+// tagged IndexValueMultiKey). A query `{tags:{$in:["a","b"]}}` builds two
+// bounds — one over key "a", one over key "b" — and BOTH bounds match the
+// SAME doc. Without the per-entry value-byte + DocDedup pipeline, Count
+// would return 2 (one per matching bound) and Iter would yield d1 twice.
+//
+// This file is the black-box mirror of audit_01_valuebyte_basic_test.go: that
+// file pins the producer side (insertKeys writes the right value byte); this
+// file pins the consumer side (Count via IndexIter.CountEntries and
+// Iter via planIterator.Next consume that byte and dedup correctly).
+
+// TestAudit03_MultiBoundOverlap_SingleDocCount: the minimal regression. One
+// doc whose tags array overlaps two `$in` bounds — Count must be 1.
+func TestAudit03_MultiBoundOverlap_SingleDocCount(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit03_count_single")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "tags",
+		Fields: []string{"tags"},
+	}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b","c"]}`),
+	))
+
+	// $in builds 2 bounds: ["a","a"] and ["b","b"]. Both bounds match d1
+	// because d1.tags has both "a" and "b". The CountEntries multi-bound
+	// path must dedup the docId across bounds.
+	n, err := coll.Find(`{"tags":{"$in":["a","b"]}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n,
+		"single doc whose array overlaps two $in bounds must be counted once "+
+			"(Count=%d means the IndexIter.CountEntries multi-bound dedup is broken)", n)
+}
+
+// TestAudit03_MultiBoundOverlap_SingleDocIter: same data as the Count test —
+// Iter must yield d1 exactly once. Exercises planIterator.Next + DocDedup
+// (the consumer-side dedup that lives outside CountEntries).
+func TestAudit03_MultiBoundOverlap_SingleDocIter(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit03_iter_single")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "tags",
+		Fields: []string{"tags"},
+	}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b","c"]}`),
+	))
+
+	ids := collectField(t, coll.Find(`{"tags":{"$in":["a","b"]}}`), "id")
+	assert.Equal(t, []string{`"d1"`}, ids,
+		"Iter over $in:[a,b] on multi-key index with single overlapping doc "+
+			"must yield d1 exactly once (got %v)", ids)
+}
+
+// TestAudit03_MultiBoundOverlap_MultiDocCount: three docs with mixed overlap.
+// The expected count is the number of DISTINCT docs that match the union of
+// bounds, not the sum of (doc, bound) hits.
+//
+//	d1.tags = [a,b]   matches "a" and "b"  → 2 hits, dedup to 1
+//	d2.tags = [b,c]   matches "b" and "c"  → 2 hits, dedup to 1
+//	d3.tags = [x]     matches none         → 0 hits
+//
+// Without dedup the count would be 4. With correct dedup, it is 2.
+func TestAudit03_MultiBoundOverlap_MultiDocCount(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit03_count_multi")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "tags",
+		Fields: []string{"tags"},
+	}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"]}`),
+		anyenc.MustParseJson(`{"id":"d2","tags":["b","c"]}`),
+		anyenc.MustParseJson(`{"id":"d3","tags":["x"]}`),
+	))
+
+	n, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n,
+		"distinct match count must be 2 (d1+d2). A result of 4 would mean "+
+			"each (doc, bound) hit was counted separately — broken dedup. "+
+			"A result of 3 would mean only one bound dedup'd. Got %d.", n)
+}
+
+// TestAudit03_MultiBoundOverlap_MultiDocIter: same data as the Count test —
+// Iter must yield d1, d2 (and only those) with no duplicates, in some order.
+func TestAudit03_MultiBoundOverlap_MultiDocIter(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit03_iter_multi")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "tags",
+		Fields: []string{"tags"},
+	}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"]}`),
+		anyenc.MustParseJson(`{"id":"d2","tags":["b","c"]}`),
+		anyenc.MustParseJson(`{"id":"d3","tags":["x"]}`),
+	))
+
+	ids := collectField(t, coll.Find(`{"tags":{"$in":["a","b","c"]}}`), "id")
+	// Sort for stable comparison — the planner is free to choose any order.
+	sort.Strings(ids)
+	assert.Equal(t, []string{`"d1"`, `"d2"`}, ids,
+		"Iter must yield exactly d1 and d2 (no duplicates, no d3); got %v", ids)
+}
+
+// TestAudit03_MultiBoundOverlap_HeavyScale: 200 docs each with two tags —
+// a unique per-doc tag and the shared tag "shared". The query
+// `tags $in [shared, t5, t10]` exercises BOTH the cross-bound dedup
+// (d5 matches "shared" AND "t5"; d10 matches "shared" AND "t10") AND the
+// scale needed to ensure the planner actually picks IndexScan (so the
+// IndexIter.CountEntries multi-bound path is the one being exercised, not
+// FullScan).
+//
+// Expected: every doc matches "shared", so distinct doc count = 200.
+// Without dedup, the count would be 202 (d5 and d10 counted twice each).
+func TestAudit03_MultiBoundOverlap_HeavyScale(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit03_heavy")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "tags",
+		Fields: []string{"tags"},
+	}))
+
+	const N = 200
+	for i := 0; i < N; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+			fmt.Sprintf(`{"id":"d%d","tags":["t%d","shared"]}`, i, i),
+		)))
+	}
+
+	// Sanity: d5 and d10 each match the "shared" bound AND their per-doc
+	// bound — without dedup, the count would over-report by 2.
+	n, err := coll.Find(`{"tags":{"$in":["shared","t5","t10"]}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, N, n,
+		"every doc has the 'shared' tag, so distinct count = %d. "+
+			"d5 and d10 ALSO match their per-doc bounds — if dedup is broken, "+
+			"the count would be %d (or higher). Got %d.", N, N+2, n)
+}
+
+// TestAudit05_CompoundMultiKey_*
+//
+// Compound multi-key indexes (e.g. (tags, priority) where tags is an array
+// dimension) no longer carry a planner-side dedup wrap. The recent commit
+// series dropped SeenSetDedupIter; compound multi-key now relies on:
+//
+//   - IndexIter setting multiKey=true per entry based on the per-entry
+//     value byte that insertKeys writes for array-derived rows.
+//   - multiKey flowing through FetchIter / FilterIter / SortIter as a
+//     passthrough on Iterator.Next.
+//   - The consumer (planIterator.Next, plus the Count/Update/Delete loops
+//     in query.go) calling qplanner.DocDedup.Accept(docId, mk) to drop
+//     duplicate doc emissions.
+//
+// These tests are end-to-end black-box guards: a regression that drops the
+// multiKey propagation in any iterator (or removes the consumer-side
+// DocDedup) would let a compound multi-key query emit the same doc twice
+// (once per matching array element). Both Count and Iter paths are
+// exercised, since they go through different consumer code (query.go's
+// count loop vs. planIterator.Next).
+//
+// Index used in all four subtests: Fields:["tags", "priority"], where
+// "tags" is the array dimension. With $in:["a","b"] over tags, a doc whose
+// tags include both "a" and "b" produces two index entries — both with
+// priority=5 — and a regression would surface that as a Count of 2 or as
+// the same id appearing twice from Iter.
+
+// TestAudit05_CompoundMultiKey_Count_SingleDocSameArrayValues asserts that
+// Count on a compound multi-key query returns 1 (not 2) for a single doc
+// whose tags array matches both bounds of an $in.
+func TestAudit05_CompoundMultiKey_Count_SingleDocSameArrayValues(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags", "priority"}}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"],"priority":5}`),
+	))
+
+	// d1's tags array produces two index entries: (a,5,d1) and (b,5,d1),
+	// both flagged multiKey=true. The $in over tags hits both bounds, so
+	// without consumer-side DocDedup the count loop would tally 2.
+	count, err := coll.Find(`{"tags":{"$in":["a","b"]}, "priority":5}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count,
+		"compound multi-key: doc whose array matches multiple $in bounds must count once")
+}
+
+// TestAudit05_CompoundMultiKey_Iter_SingleDocSameArrayValues asserts that
+// Iter yields the doc exactly once over the same query — exercising the
+// planIterator.Next dedup path rather than the count loop.
+func TestAudit05_CompoundMultiKey_Iter_SingleDocSameArrayValues(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags", "priority"}}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"],"priority":5}`),
+	))
+
+	ids := collectField(t,
+		coll.Find(`{"tags":{"$in":["a","b"]}, "priority":5}`), "id")
+	assert.Equal(t, []string{`"d1"`}, ids,
+		"compound multi-key: Iter must emit the doc exactly once even though "+
+			"two index entries (a,5) and (b,5) match")
+}
+
+// TestAudit05_CompoundMultiKey_Count_TwoDocsOverlappingTags inserts two
+// docs whose tags arrays each match multiple $in bounds, with one bound
+// ("b") shared between them. Count must collapse each doc to one despite
+// emitting four raw matching index entries: (a,5,d1), (b,5,d1), (b,5,d2),
+// (c,5,d2).
+func TestAudit05_CompoundMultiKey_Count_TwoDocsOverlappingTags(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags", "priority"}}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"],"priority":5}`),
+		anyenc.MustParseJson(`{"id":"d2","tags":["b","c"],"priority":5}`),
+	))
+
+	count, err := coll.Find(`{"tags":{"$in":["a","b","c"]}, "priority":5}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, count,
+		"compound multi-key: two docs each matching multiple $in bounds must count as 2")
+}
+
+// TestAudit05_CompoundMultiKey_Iter_TwoDocsOverlappingTags is the Iter
+// counterpart of the previous case: each doc must appear exactly once,
+// no dupes, even though up to four raw index entries match.
+func TestAudit05_CompoundMultiKey_Iter_TwoDocsOverlappingTags(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags", "priority"}}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"],"priority":5}`),
+		anyenc.MustParseJson(`{"id":"d2","tags":["b","c"],"priority":5}`),
+	))
+
+	ids := collectField(t,
+		coll.Find(`{"tags":{"$in":["a","b","c"]}, "priority":5}`), "id")
+	require.Len(t, ids, 2,
+		"compound multi-key: Iter must yield 2 docs (no duplicates), got %v", ids)
+
+	// Order can vary depending on index traversal; sort for a stable assert.
+	sort.Strings(ids)
+	assert.Equal(t, []string{`"d1"`, `"d2"`}, ids,
+		"compound multi-key: Iter must emit d1 and d2 each exactly once")
+}
+
+// Audit 06: UpdateMany / DeleteMany over a multi-key $in query must apply
+// the modifier (or the delete) exactly once per matching document, not once
+// per matching index entry.
+//
+// Background: when the data field is an array (e.g. tags:["a","b","c"]),
+// the index emits one entry per array element. A query like
+// {"tags":{"$in":["a","b","c"]}} therefore visits the same docId multiple
+// times via different index entries. The query.go Update/Delete loops
+// guard against double-application by routing the iterator output through
+// qplanner.DocDedup, which dedups on (docId, multi-key bit). Without that
+// dedup, $inc would be applied N times per doc and Delete would either
+// double-count or fail trying to delete an already-removed key.
+
+// TestAudit06_UpdateOnce_OverlappingArray:
+// d1 has tags:["a","b","c"]. The $in:["a","b","c"] query visits d1 three
+// times via the array index. UpdateMany must $inc d1.n exactly once
+// (n == 1, not 3). Modified count must be 1, not 3.
+func TestAudit06_UpdateOnce_OverlappingArray(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags"}}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b","c"],"n":0}`),
+	))
+
+	res, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).
+		Update(ctx, `{"$inc":{"n":1}}`)
+	require.NoError(t, err)
+	assert.Equal(t, 1, res.Matched, "matched should be 1 (one doc), not the number of index hits")
+	assert.Equal(t, 1, res.Modified, "modified should be 1 (one doc), not the number of index hits")
+
+	doc, err := coll.FindId(ctx, "d1")
+	require.NoError(t, err)
+	got := doc.Value().Get("n").GetFloat64()
+	assert.Equal(t, float64(1), got,
+		"$inc:{n:1} must apply exactly once per doc; got n=%v (expected 1, NOT 3)", got)
+}
+
+// TestAudit06_UpdateOnce_TwoDocs:
+// d1 tags=[a,b], d2 tags=[b,c]. Both match $in:[a,b,c] via multiple
+// array entries each (d1 via "a" and "b"; d2 via "b" and "c"; "b"
+// matches a third bound for both). Update must hit each doc exactly
+// once: d1.n==1, d2.n==1, modified==2.
+func TestAudit06_UpdateOnce_TwoDocs(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags"}}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"],"n":0}`),
+		anyenc.MustParseJson(`{"id":"d2","tags":["b","c"],"n":0}`),
+	))
+
+	res, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).
+		Update(ctx, `{"$inc":{"n":1}}`)
+	require.NoError(t, err)
+	assert.Equal(t, 2, res.Matched, "matched should be 2 distinct docs")
+	assert.Equal(t, 2, res.Modified, "modified should be 2 distinct docs (NOT one per matching index entry)")
+
+	doc1, err := coll.FindId(ctx, "d1")
+	require.NoError(t, err)
+	assert.Equal(t, float64(1), doc1.Value().Get("n").GetFloat64(),
+		"d1.n must be incremented exactly once")
+
+	doc2, err := coll.FindId(ctx, "d2")
+	require.NoError(t, err)
+	assert.Equal(t, float64(1), doc2.Value().Get("n").GetFloat64(),
+		"d2.n must be incremented exactly once")
+}
+
+// TestAudit06_DeleteOnce_OverlappingArray:
+// d1 has tags:["a","b","c"]. $in:["a","b"] matches d1 via two index
+// entries. DeleteMany must remove d1 exactly once and report 1 deleted
+// (not 2, and not error from a double-delete attempt).
+func TestAudit06_DeleteOnce_OverlappingArray(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags"}}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b","c"]}`),
+	))
+
+	res, err := coll.Find(`{"tags":{"$in":["a","b"]}}`).Delete(ctx)
+	require.NoError(t, err, "Delete must not error from a double-delete attempt")
+	assert.Equal(t, 1, res.Matched, "matched should be 1 (one doc), not 2 index hits")
+	assert.Equal(t, 1, res.Modified, "deleted should be 1 (one doc), not 2 index hits")
+
+	_, err = coll.FindId(ctx, "d1")
+	assert.True(t, errors.Is(err, ErrDocNotFound), "d1 should be gone, got err=%v", err)
+
+	count, err := coll.Find(nil).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count, "collection should be empty")
+}
+
+// TestAudit06_DeleteOnce_TwoDocs:
+// d1 tags=[a,b], d2 tags=[b,c]. $in:[a,b,c] matches both, with multiple
+// matching entries for each. DeleteMany must remove each doc once,
+// report 2 deleted, and leave the collection empty.
+func TestAudit06_DeleteOnce_TwoDocs(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags"}}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"]}`),
+		anyenc.MustParseJson(`{"id":"d2","tags":["b","c"]}`),
+	))
+
+	res, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Delete(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, res.Matched, "matched should be 2 distinct docs")
+	assert.Equal(t, 2, res.Modified, "deleted should be 2 distinct docs (NOT one per matching index entry)")
+
+	_, err = coll.FindId(ctx, "d1")
+	assert.True(t, errors.Is(err, ErrDocNotFound), "d1 should be gone, got err=%v", err)
+	_, err = coll.FindId(ctx, "d2")
+	assert.True(t, errors.Is(err, ErrDocNotFound), "d2 should be gone, got err=%v", err)
+
+	count, err := coll.Find(nil).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count, "collection should be empty after deleting both docs")
+}
+
+// Audit 07: Sort + $in over a multi-key array index.
+//
+// When the index is on an array-valued field (e.g. tags), one index entry
+// exists per array element per document. A query like
+// {"tags":{"$in":[...]}} therefore visits the same docId multiple times
+// via different index entries. SortIter must propagate the multiKey flag
+// from upstream through the post-sort emission, and planIterator's
+// consumer-side DocDedup must collapse duplicates AFTER the sort is
+// applied — preserving the sort order on the deduplicated stream.
+//
+// The unit test TestSortIter_PreservesMultiKeyAcrossSort
+// (internal/qplanner/sort_iter_test.go) pins the propagation invariant
+// for SortIter alone. These tests pin the end-to-end invariant via the
+// public coll.Find(...).Sort(...).Iter() API, ensuring the wire-up between
+// the multi-key index, the sort, and the consumer-side dedup is correct.
+
+// collectIdsString collects the "id" field (string-typed) from a query.
+func collectIdsString(t testing.TB, q Query) []string {
+	t.Helper()
+	iter, err := q.Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+	var out []string
+	for iter.Next() {
+		doc, err := iter.Doc()
+		require.NoError(t, err)
+		out = append(out, string(doc.Value().GetStringBytes("id")))
+	}
+	require.NoError(t, iter.Err())
+	return out
+}
+
+// TestAudit07_SortMultiKey_OrderPreserved verifies that a sort over a
+// scalar field (priority) produces the docs in the correct ascending
+// order even when the source is a multi-key $in over an array index
+// (tags) that emits the same doc multiple times. The consumer-side
+// DocDedup must collapse the duplicates AFTER the sort.
+func TestAudit07_SortMultiKey_OrderPreserved(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags"}}))
+
+	// Each doc overlaps with the others on tags, so the $in scan will
+	// emit each docId at least twice via the multi-key index.
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"],"priority":30}`),
+		anyenc.MustParseJson(`{"id":"d2","tags":["b","c"],"priority":10}`),
+		anyenc.MustParseJson(`{"id":"d3","tags":["a","c"],"priority":20}`),
+	))
+
+	q := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Sort("priority")
+
+	ids := collectIdsString(t, q)
+	assert.Equal(t, []string{"d2", "d3", "d1"}, ids,
+		"docs must appear in ascending-priority order with no duplicates "+
+			"after sort + consumer-side multi-key dedup")
+}
+
+// TestAudit07_SortMultiKey_DescendingOrder is the descending-order
+// counterpart of OrderPreserved: the same data, but sorted by -priority.
+// The post-sort dedup must yield (d1, d3, d2).
+func TestAudit07_SortMultiKey_DescendingOrder(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags"}}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"],"priority":30}`),
+		anyenc.MustParseJson(`{"id":"d2","tags":["b","c"],"priority":10}`),
+		anyenc.MustParseJson(`{"id":"d3","tags":["a","c"],"priority":20}`),
+	))
+
+	q := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Sort("-priority")
+
+	ids := collectIdsString(t, q)
+	assert.Equal(t, []string{"d1", "d3", "d2"}, ids,
+		"docs must appear in descending-priority order with no duplicates")
+}
+
+// TestAudit07_SortMultiKey_WithLimit pins the (sort + $in over multi-key
+// + Limit) interaction. The limit must apply to the deduplicated, sorted
+// stream — not to the raw multi-key entry stream. With 3 distinct docs
+// and Limit(2) ascending, the result must be the two smallest-priority
+// docs (d2, d3), each appearing exactly once.
+func TestAudit07_SortMultiKey_WithLimit(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags"}}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"],"priority":30}`),
+		anyenc.MustParseJson(`{"id":"d2","tags":["b","c"],"priority":10}`),
+		anyenc.MustParseJson(`{"id":"d3","tags":["a","c"],"priority":20}`),
+	))
+
+	q := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Sort("priority").Limit(2)
+
+	ids := collectIdsString(t, q)
+	require.Len(t, ids, 2,
+		"Limit(2) must apply to the post-dedup stream; expected exactly 2 distinct docs")
+	assert.Equal(t, []string{"d2", "d3"}, ids,
+		"top-2 by ascending priority on the deduplicated multi-key stream")
+}
+
+// TestAudit07_SortMultiKey_DocAppearsExactlyOnce stress-tests the
+// invariant at scale: 50 docs each carry a "common" tag (so every doc
+// matches the $in) plus a "uniq"+i tag (so the multi-key index emits
+// every doc TWICE — once for "common", once for "uniqN"). The query
+// filters only on "common", which still hits every doc twice if
+// upstream uses the multi-key index entries (the whole-array entry +
+// the per-element entry both match a single-bound scan in this codec
+// — see audit 01). The consumer-side DocDedup must collapse these so
+// every doc appears exactly once in the sorted output.
+func TestAudit07_SortMultiKey_DocAppearsExactlyOnce(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags"}}))
+
+	for i := 0; i < 50; i++ {
+		doc := anyenc.MustParseJson(fmt.Sprintf(
+			`{"id":"d%d","tags":["common","uniq%d"],"priority":%d}`, i, i, i%5,
+		))
+		require.NoError(t, coll.Insert(ctx, doc))
+	}
+
+	q := coll.Find(`{"tags":{"$in":["common"]}}`).Sort("priority")
+
+	ids := collectIdsString(t, q)
+
+	// All 50 docs must appear, each exactly once.
+	require.Len(t, ids, 50,
+		"every doc must appear exactly once after sort + consumer-side dedup")
+
+	seen := make(map[string]int, 50)
+	for _, id := range ids {
+		seen[id]++
+	}
+	require.Len(t, seen, 50,
+		"set of returned docIds must contain 50 distinct values")
+	for id, n := range seen {
+		assert.Equalf(t, 1, n,
+			"doc %q must appear exactly once, saw it %d times", id, n)
+	}
+
+	// Also verify the sort order: priorities are i%5 ∈ [0,1,2,3,4],
+	// so the emitted sequence (when read in order) must be non-decreasing.
+	iter, err := q.Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+	var prev float64 = -1
+	for iter.Next() {
+		doc, err := iter.Doc()
+		require.NoError(t, err)
+		p := doc.Value().Get("priority").GetFloat64()
+		assert.GreaterOrEqual(t, p, prev,
+			"priority must be non-decreasing across the sorted+deduped stream")
+		prev = p
+	}
+	require.NoError(t, iter.Err())
 }
