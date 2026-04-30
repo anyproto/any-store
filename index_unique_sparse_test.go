@@ -559,21 +559,17 @@ func TestIndex_SparseNested_Coverage_MissingIntermediate(t *testing.T) {
 //	idx.keyBuf = v.MarshalTo(k)
 //	return idx.writeValues(d, i+1)
 //
-// The sparse guard ONLY skips for v==nil (missing field) or TypeNull. An
-// EMPTY array is neither — its Type() is TypeArray. So:
+// Sparse-index semantics (matches MongoDB): "skip docs where the
+// indexed field is MISSING or NULL". An empty array is neither — it
+// is a present, queryable value. So the guard correctly only skips
+// nil and TypeNull, and an empty array slips through to be indexed.
+// The whole-array marshalled key is written, which makes
+// Find({tags:[]}) work via the index.
 //
-//	1. The sparse guard does NOT skip the empty array.
-//	2. The array branch checks `len(arr) != 0` and skips the per-element
-//	   loop because the array is empty.
-//	3. Control falls through to `idx.keyBuf = v.MarshalTo(k)` — the empty
-//	   array is marshalled as a single key and ONE index entry is written.
-//
-// Hypothesis: a sparse index over `tags` with doc {id:1, tags:[]} STILL
-// writes one entry, violating the sparse-index expectation that
-// "missing/empty values are not indexed".
-//
-// These tests pin the observed behaviour. If subtest 3 produces a
-// non-zero entry count, that IS the suspected bug — documented inline.
+// These tests pin the (intentional) behaviour: 0 entries for missing
+// or null, exactly 1 entry for an empty array. If anybody changes the
+// sparse guard to also skip empty arrays, they'd silently break
+// Find({tags:[]}) queries against sparse indexes.
 
 // TestAudit12_SparseEmptyArray_NoFieldZeroEntries: doc with no `tags`
 // field at all. Sparse guard short-circuits on v == nil → 0 entries.
@@ -622,28 +618,14 @@ func TestAudit12_SparseEmptyArray_NullFieldZeroEntries(t *testing.T) {
 }
 
 // TestAudit12_SparseEmptyArray_EmptyArrayBehaviour: doc with `tags: []`
-// — empty array. This is the corner case the audit is pinning.
+// — empty array. Pins that an empty array IS indexed (sparse only
+// skips missing/null, not empty values), and confirms the entry uses
+// the whole-empty-array marshalled key with IndexValueScalar (because
+// len(keysBuf) == 1 at insertKeys time — no per-element entries since
+// the array has no elements).
 //
-// OBSERVED BEHAVIOUR (the suspected semantic bug):
-//
-//	A sparse index over `tags` with doc {id:1, tags:[]} writes ONE index
-//	entry — the empty-array marshalled as a single key. The sparse guard
-//	at index.go:227 only skips for v == nil || TypeNull, so an empty
-//	TypeArray slips through. The array branch sees len(arr) == 0 and
-//	skips the per-element loop. Control then falls through to the
-//	`idx.keyBuf = v.MarshalTo(k); writeValues(d, i+1)` line, which
-//	writes the whole-empty-array key.
-//
-// This violates the conventional sparse-index expectation that
-// "missing/empty values are not indexed". An empty array is morally
-// equivalent to "no values" yet still occupies one slot in the index.
-// Because keysBuf has exactly one entry at insertKeys time, the
-// per-entry value byte is IndexValueScalar (0x00), not multi-key.
-//
-// Pinning this so the next reader who tries to "fix" sparse semantics
-// has to decide deliberately: either change the guard at index.go:227
-// to also skip empty arrays, or accept that empty-array gets indexed
-// the same way as a 0-element scalar.
+// This makes Find({tags:[]}) work via the index — see
+// TestAudit12_SparseEmptyArray_EmptyArrayQueryable below.
 func TestAudit12_SparseEmptyArray_EmptyArrayBehaviour(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit12_empty_arr_sparse")
@@ -654,19 +636,17 @@ func TestAudit12_SparseEmptyArray_EmptyArrayBehaviour(t *testing.T) {
 		Sparse: true,
 	}))
 
-	// Doc with empty array — slips past the sparse guard.
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":[]}`)))
 
 	entries := readRawIndexEntries(t, fx.DB, "audit12_empty_arr_sparse", "ix_tags")
 
-	// SUSPECTED BUG / OBSERVED BEHAVIOUR: 1 entry, not 0. This is the
-	// fall-through write of the empty-array marshal. Sparse semantics
-	// would arguably want 0 entries here.
+	// Empty array IS indexed — exactly 1 entry, the whole-empty-array
+	// marshal. Matches MongoDB's sparse-index semantics: sparse skips
+	// missing/null only, empty arrays are present queryable values.
 	require.Len(t, entries, 1,
-		"empty array on sparse index produces 1 entry (whole-empty-array marshal "+
-			"falls through the sparse guard at index.go:227 — the guard only "+
-			"checks v == nil || TypeNull, not empty arrays). Violates "+
-			"sparse-index semantics; pinned as the observed behaviour.")
+		"empty array on sparse index produces exactly 1 entry — the "+
+			"whole-empty-array marshal. Sparse only skips missing/null per "+
+			"the guard at index.go:227, which is intended.")
 
 	// keysBuf had exactly one entry → IndexValueScalar (0x00).
 	require.NotEmpty(t, entries[0].Value)
@@ -675,16 +655,13 @@ func TestAudit12_SparseEmptyArray_EmptyArrayBehaviour(t *testing.T) {
 	assert.Zero(t, entries[0].Value[0]&qplanner.IndexEntryFlagMultiKey,
 		"multi-key flag bit must be cleared (single key in keysBuf)")
 
-	// Index Len() must agree with the raw-cursor walk.
 	assertIndexLen(t, coll.GetIndexes()[0], 1)
 }
 
 // TestAudit12_SparseEmptyArray_NonSparse: same empty-array doc, but on
-// a NON-sparse index. The sparse guard at index.go:227 is irrelevant
-// here, so the same fall-through logic applies and one entry is
-// written — confirming the empty-array fall-through is not unique to
-// sparse indexes (it's a property of writeValues itself). The sparse
-// flag merely fails to *additionally* protect against it.
+// a NON-sparse index. Behaviour matches the sparse case for this
+// input: 1 entry (the whole-array marshal). Confirms the empty-array
+// handling is a property of writeValues, not of the sparse flag.
 func TestAudit12_SparseEmptyArray_NonSparse(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit12_empty_arr_nonsparse")
@@ -692,23 +669,19 @@ func TestAudit12_SparseEmptyArray_NonSparse(t *testing.T) {
 	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
 		Name:   "ix_tags",
 		Fields: []string{"tags"},
-		// Sparse: false (default) — no early skip on null/missing.
+		// Sparse: false (default).
 	}))
 
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":[]}`)))
 
 	entries := readRawIndexEntries(t, fx.DB, "audit12_empty_arr_nonsparse", "ix_tags")
 
-	// Non-sparse index also writes exactly one entry for empty array
-	// (the whole-array marshal). No per-element entries because the
-	// array has no elements to iterate.
 	require.Len(t, entries, 1,
 		"non-sparse index + empty array also produces exactly 1 entry "+
-			"(whole-array marshal). Confirms the empty-array fall-through "+
-			"is independent of the sparse flag.")
+			"(whole-array marshal). Confirms empty-array indexing is "+
+			"independent of the sparse flag.")
 
 	require.NotEmpty(t, entries[0].Value)
-	// Single key in keysBuf at insertKeys time → IndexValueScalar.
 	assert.Equal(t, qplanner.IndexValueScalar, entries[0].Value,
 		"len(keysBuf)==1 → empty-array entry on non-sparse index also tagged IndexValueScalar")
 	assert.Zero(t, entries[0].Value[0]&qplanner.IndexEntryFlagMultiKey,
@@ -717,12 +690,11 @@ func TestAudit12_SparseEmptyArray_NonSparse(t *testing.T) {
 	assertIndexLen(t, coll.GetIndexes()[0], 1)
 }
 
-// TestAudit12_SparseEmptyArray_QueryReturnsZero: the user-visible side
-// of the suspected bug. Even though one index entry is written for
-// {tags: []}, that entry stores the whole-empty-array marshalled key
-// — NOT any element key. So Find({tags: "anything"}) cannot match it.
-// The empty-array doc occupies a slot in the index but contributes
-// nothing queryable to per-element lookups.
+// TestAudit12_SparseEmptyArray_QueryReturnsZero: per-element queries
+// against an empty-array doc return 0 — the stored entry is the
+// whole-empty-array key, not any element key. Find({tags:"anything"})
+// cannot match. To FIND the empty-array doc, query with the empty
+// array directly (Find({tags:[]})) — see the next test.
 func TestAudit12_SparseEmptyArray_QueryReturnsZero(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit12_empty_arr_query")
@@ -735,11 +707,8 @@ func TestAudit12_SparseEmptyArray_QueryReturnsZero(t *testing.T) {
 
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":[]}`)))
 
-	// Sanity: index has 1 entry from the fall-through write.
 	assertIndexLen(t, coll.GetIndexes()[0], 1)
 
-	// Querying for any element value must return 0 — the entry stored
-	// is the whole-empty-array key, not any element key.
 	for _, probe := range []string{`"anything"`, `"foo"`, `""`, `null`} {
 		count, qerr := coll.Find(`{"tags":` + probe + `}`).Count(ctx)
 		require.NoError(t, qerr, "probe %s", probe)
@@ -749,8 +718,46 @@ func TestAudit12_SparseEmptyArray_QueryReturnsZero(t *testing.T) {
 			probe)
 	}
 
-	// Collection still has the 1 doc.
 	assertCollCount(t, coll, 1)
+}
+
+// TestAudit12_SparseEmptyArray_EmptyArrayQueryable verifies the
+// positive direction of TestAudit12_SparseEmptyArray_QueryReturnsZero:
+// querying with the empty array literally (`Find({tags:[]})`) DOES
+// match the empty-array doc via the index entry. This is the
+// motivation for indexing empty arrays in the first place — without
+// it, this query would never use the index.
+func TestAudit12_SparseEmptyArray_EmptyArrayQueryable(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit12_empty_arr_findable")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+		Sparse: true,
+	}))
+
+	// Mix: one empty-array doc, one nonempty for contrast.
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"empty","tags":[]}`),
+		anyenc.MustParseJson(`{"id":"nonempty","tags":["a","b"]}`),
+	))
+
+	// Querying for the empty array literally hits the whole-empty-array
+	// index entry and returns the empty-array doc.
+	n, err := coll.Find(`{"tags":[]}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n,
+		"Find({tags:[]}) must find the empty-array doc via the index entry")
+
+	ids := collectField(t, coll.Find(`{"tags":[]}`), "id")
+	assert.Equal(t, []string{`"empty"`}, ids,
+		"Iter must yield the empty-array doc exactly once")
+
+	// Element queries still match the nonempty doc (sanity check).
+	na, err := coll.Find(`{"tags":"a"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, na, "element query for 'a' matches the nonempty doc")
 }
 
 // TestAudit13_UniqueCompoundArray_* — focused edge-case audit for the
