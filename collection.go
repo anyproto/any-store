@@ -751,14 +751,35 @@ func (c *collection) buildIndex(tx *btree.WriteTx, idx *index) error {
 }
 
 // loadSketch loads a sketch from the _system namespace for the given index.
-// If no sketch data exists, it creates a new empty sketch.
+//
+// Concurrency contract: this function is called both from createIndex
+// (before the new index is appended to c.indexes — readers can't see it
+// yet) and from reloadSketches via checkStale (under c.mu, but
+// concurrent readers may already hold pointers into c.indexes and read
+// idx.sketch without c.mu — see (*collQuery).docCount and the
+// CBOIndex.Sketch escape in buildCBOIndexesInto).
+//
+// To avoid a data race on the idx.sketch pointer field with those
+// readers, the existing sketch is updated in place via UnmarshalBinary
+// instead of being replaced. UnmarshalBinary writes Buckets and
+// docCount via atomic stores (see internal/qplanner/sketch.go), so
+// concurrent GetDocCount / Estimate readers see consistent values
+// without locking. Only the very first call (idx.sketch == nil)
+// allocates a new sketch — that path is reached only from createIndex
+// before the index is visible to readers, so the assignment is
+// unobservable.
 func (c *collection) loadSketch(tx *btree.ReadTx, idx *index) {
-	skSize := qplanner.DefaultSketchSize
-	idx.sketch = qplanner.NewIndexSketch(skSize)
+	if idx.sketch == nil {
+		idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
+	}
 	key := sketchKey(c.name, idx.info.Name)
 	data, err := tx.AppendValue(c.db.systemNS, key, nil)
 	if err != nil {
-		// No sketch data yet — start with empty sketch
+		// No persisted sketch data; keep current in-memory state. Used to
+		// reset to a fresh sketch here, which (a) raced with concurrent
+		// readers on the pointer field and (b) silently dropped any
+		// in-memory counter increments not yet persisted. Preserving
+		// state is the correct behaviour in both respects.
 		return
 	}
 	idx.sketch.UnmarshalBinary(data)

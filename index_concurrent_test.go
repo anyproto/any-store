@@ -1313,3 +1313,130 @@ func TestAudit15_ConcurrentReaderMultiKey_ConcurrentReaders(t *testing.T) {
 			"reader %d did not run a single observation", i)
 	}
 }
+
+// TestSketch_LoadDuringConcurrentReader is a focused -race regression
+// test for the data-race fix on collection.loadSketch
+// (collection.go::loadSketch). The previous implementation replaced
+// idx.sketch with a fresh NewIndexSketch on every checkStale invocation;
+// concurrent readers calling idx.sketch.GetDocCount() / Estimate without
+// holding c.mu would race on that pointer field. The fix updates the
+// existing sketch in place via UnmarshalBinary (which uses atomic
+// stores), so the pointer never changes after createIndex.
+//
+// This test forces hundreds of reload cycles by repeatedly opening write
+// txs (which bump the file change counter and cause checkStale to fire
+// reloadSketches on the next read tx) while concurrent goroutines hammer
+// the read path that touches idx.sketch.
+//
+// Without the fix, this test fails with -race ("WARNING: DATA RACE" at
+// collection.go:loadSketch / query.go:docCount). With the fix, it passes
+// cleanly.
+func TestSketch_LoadDuringConcurrentReader(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "sketch_race")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+
+	for i := range 50 {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+			fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%5))))
+	}
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	var wg sync.WaitGroup
+	var readerErrs atomic.Int32
+	var writerErrs atomic.Int32
+
+	// Writer: bumps the file change counter every commit, forcing the next
+	// read tx's checkStale to invoke reloadSketches → loadSketch.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		i := 100
+		for time.Now().Before(deadline) {
+			if err := coll.Insert(ctx, anyenc.MustParseJson(
+				fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%5))); err != nil {
+				writerErrs.Add(1)
+				return
+			}
+			if err := coll.DeleteId(ctx, i); err != nil {
+				writerErrs.Add(1)
+				return
+			}
+			i++
+		}
+	}()
+
+	// Readers: exercise both the docCount (q.c.indexes[*].sketch read) and
+	// the planner's Sketch field via Find().Count and Find().Iter.
+	const numReaders = 8
+	for r := 0; r < numReaders; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(deadline) {
+				if _, err := coll.Find(`{"a":3}`).Count(ctx); err != nil {
+					readerErrs.Add(1)
+					return
+				}
+				if _, err := coll.Find(nil).Count(ctx); err != nil {
+					readerErrs.Add(1)
+					return
+				}
+				it, err := coll.Find(`{"a":2}`).Iter(ctx)
+				if err != nil {
+					readerErrs.Add(1)
+					return
+				}
+				for it.Next() {
+				}
+				it.Close()
+			}
+		}()
+	}
+
+	wg.Wait()
+	assert.Zero(t, writerErrs.Load(), "writer should not error")
+	assert.Zero(t, readerErrs.Load(), "readers should not error")
+}
+
+// TestSketch_DocCountSurvivesReload pins the post-fix invariant that
+// in-memory sketch state (DocCount in particular) is preserved across a
+// reload triggered by checkStale. The previous implementation replaced
+// the sketch outright on every reload; if a reader had triggered reload
+// before the writer's persistSketches landed, the in-memory counter would
+// silently revert to whatever was last persisted (often zero on a
+// freshly-created index).
+//
+// With the in-place UnmarshalBinary fix, reload either applies persisted
+// state (consistent with the read snapshot) or — if no persisted data
+// exists — leaves the in-memory counter alone. This test asserts the
+// no-data branch: even after a forced reload, GetDocCount reflects every
+// inserted doc.
+func TestSketch_DocCountSurvivesReload(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "sketch_survives")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+
+	const N = 25
+	for i := range N {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+			fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))))
+	}
+
+	// Force a stale-detection by running a query that opens a fresh read
+	// tx after the writes committed.
+	count, err := coll.Find(nil).Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, N, count)
+
+	// Read DocCount via the same path the planner uses; it must reflect
+	// every insert, not regress to zero from a reload that dropped state.
+	c := coll.(*collection)
+	c.mu.Lock()
+	got := c.indexes[0].sketch.GetDocCount()
+	c.mu.Unlock()
+	assert.Equal(t, uint64(N), got,
+		"sketch DocCount must equal inserted-doc count after reload (%d), got %d", N, got)
+}

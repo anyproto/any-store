@@ -97,6 +97,13 @@ func (s *IndexSketch) MarshalBinary(dst []byte) []byte {
 // UnmarshalBinary deserializes the sketch from a byte slice.
 // Format: [buckets (8*size bytes)] [docCount (8 bytes)]
 // Backward compatible: if data has no trailing docCount, DocCount remains 0.
+//
+// Atomically stores into Buckets and docCount, so concurrent readers
+// (GetDocCount/Estimate) see consistent values without locking. Trailing
+// buckets beyond what data covers are zeroed atomically so that loading
+// a smaller-sized payload into a larger live sketch can't leak stale
+// counts (defends a future change where Size becomes configurable —
+// currently Size is the constant DefaultSketchSize across all calls).
 func (s *IndexSketch) UnmarshalBinary(data []byte) {
 	n := len(data) / 8
 	hasDocCount := n > s.Size
@@ -105,6 +112,10 @@ func (s *IndexSketch) UnmarshalBinary(data []byte) {
 	}
 	for i := range n {
 		atomic.StoreUint64(&s.Buckets[i], binary.LittleEndian.Uint64(data[i*8:]))
+	}
+	for i := n; i < s.Size; i++ {
+		// Defensively zero any trailing buckets the payload didn't cover.
+		atomic.StoreUint64(&s.Buckets[i], 0)
 	}
 	if hasDocCount && len(data) >= 8*s.Size+8 {
 		s.docCount.Store(binary.LittleEndian.Uint64(data[8*s.Size:]))
