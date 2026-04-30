@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/anyproto/any-store/anyenc"
 	"github.com/anyproto/any-store/internal/btree"
+	"github.com/anyproto/any-store/internal/qplanner"
 )
 
 // --- Category 1: Stale Index Entries ---
@@ -1666,4 +1668,447 @@ func TestIndex_Corruption_MultiIndexDropOneRecreate(t *testing.T) {
 	countB3, err := coll.Find(`{"b":2}`).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, countB, countB3)
+}
+
+// injectRawIndexEntry writes (key, value) directly into the index
+// namespace, bypassing insertKeys. Used to simulate legacy nil-value
+// entries (or any other raw entry shape) for backward-compat tests.
+//
+// Mirrors the pattern used in index_corruption_test.go (search for
+// "tx.Put(idx.ns") — same internals access via collection.indexes +
+// db.doWriteTx.
+func injectRawIndexEntry(t *testing.T, c *collection, idx *index, fullKey, value []byte) {
+	t.Helper()
+	require.NoError(t, c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+		return tx.Put(idx.ns, fullKey, value)
+	}))
+}
+
+// buildIndexFullKey returns a Tuple-encoded (idxFieldVal..., docId) key
+// suitable for direct injection into a non-unique index namespace. This
+// matches what insertKeys builds (key + idKey concatenation).
+func buildIndexFullKey(idxFieldValues []any, docId any) []byte {
+	idxKey := anyenc.Tuple(nil)
+	for _, v := range idxFieldValues {
+		idxKey = anyenc.AppendAnyValue(idxKey, v)
+	}
+	idKey := anyenc.Tuple(nil)
+	idKey = anyenc.AppendAnyValue(idKey, docId)
+	full := append(anyenc.Tuple(nil), idxKey...)
+	full = append(full, idKey...)
+	return full
+}
+
+// findIndex returns the named index pointer from a collection. Test-only
+// helper that mirrors the access pattern in readRawIndexEntries.
+func findIndex(t *testing.T, coll Collection, indexName string) (*collection, *index) {
+	t.Helper()
+	c := coll.(*collection)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, i := range c.indexes {
+		if i.info.Name == indexName {
+			return c, i
+		}
+	}
+	t.Fatalf("index %q not found", indexName)
+	return nil, nil
+}
+
+// --- Subtest 1: pure decoder pin ---
+
+// TestAudit14_LegacyNilValue_DecodeMultiKey pins the decoder behavior
+// of qplanner.EntryValueIsMultiKey for all four shapes of input:
+//
+//   - nil           → true  (legacy, conservative)
+//   - []byte{}      → true  (legacy, conservative)
+//   - []byte{0x00}  → false (new format, scalar)
+//   - []byte{0x01}  → true  (new format, multi-key)
+//
+// If this contract changes, the entire backward-compat story breaks:
+// queries on partially-migrated indexes would either over-count (miss
+// dedup on legacy entries) or skip valid scalar entries.
+func TestAudit14_LegacyNilValue_DecodeMultiKey(t *testing.T) {
+	assert.True(t, qplanner.EntryValueIsMultiKey(nil),
+		"nil value must be reported as multi-key (legacy/safe)")
+	assert.True(t, qplanner.EntryValueIsMultiKey([]byte{}),
+		"empty value must be reported as multi-key (legacy/safe)")
+	assert.False(t, qplanner.EntryValueIsMultiKey([]byte{0x00}),
+		"0x00 (IndexValueScalar) must be reported as scalar (not multi-key)")
+	assert.True(t, qplanner.EntryValueIsMultiKey([]byte{0x01}),
+		"0x01 (IndexValueMultiKey) must be reported as multi-key")
+
+	// Round-trip via the public sentinels too — guards against drift in
+	// the sentinel byte values themselves.
+	assert.False(t, qplanner.EntryValueIsMultiKey(qplanner.IndexValueScalar),
+		"qplanner.IndexValueScalar sentinel must decode as scalar")
+	assert.True(t, qplanner.EntryValueIsMultiKey(qplanner.IndexValueMultiKey),
+		"qplanner.IndexValueMultiKey sentinel must decode as multi-key")
+}
+
+// --- Subtest 2: real doc + injected legacy entry, query stays correct ---
+
+// TestAudit14_LegacyNilValue_QueryWithLegacyMix simulates a
+// partially-migrated index. We insert a real array doc via the public
+// API (gets new bit-set entries), then directly inject one nil-value
+// entry simulating a leftover legacy row pointing at the SAME doc.
+//
+// A query Find({tags:"a"}).Count must still return 1: the legacy entry
+// (decoded as multi-key) triggers conservative dedup, so the doc is not
+// over-counted across the matching bound.
+func TestAudit14_LegacyNilValue_QueryWithLegacyMix(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit14_mix")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "tags",
+		Fields: []string{"tags"},
+	}))
+
+	// Insert one doc with a 2-element array. Per AUDIT01 this produces
+	// 3 raw entries (2 element entries + 1 whole-array entry), each
+	// tagged IndexValueMultiKey (0x01).
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"]}`),
+	))
+
+	c, idx := findIndex(t, coll, "tags")
+
+	// Inject a nil-value entry simulating a leftover legacy row for the
+	// same doc on a different key value ("c"). This is what a pre-bit
+	// version of the writer would have produced for a single insert.
+	legacyKey := buildIndexFullKey([]any{"c"}, "d1")
+	injectRawIndexEntry(t, c, idx, legacyKey, nil)
+
+	// Index now has 4 entries: 3 bit-set (0x01) for "a"/"b" + whole-array
+	// + 1 nil-value (legacy) for "c".
+	entries := readRawIndexEntries(t, fx.DB, "audit14_mix", "tags")
+	require.Len(t, entries, 4,
+		"expected 3 new + 1 injected legacy entry, got %d", len(entries))
+
+	// Sanity: confirm at least one legacy (len==0) and one bit-set entry
+	// are present, exercising EntryValueIsMultiKey across both shapes.
+	var legacyCount, bitSetCount int
+	for _, e := range entries {
+		if len(e.Value) == 0 {
+			legacyCount++
+		} else {
+			bitSetCount++
+		}
+	}
+	assert.Equal(t, 1, legacyCount, "exactly one nil-value (legacy) entry expected")
+	assert.Equal(t, 3, bitSetCount, "three bit-set entries expected from the public-API insert")
+
+	// Query must still return 1 — the legacy entry on "c" doesn't match
+	// {"tags":"a"}, so this verifies the matching-bound case stays
+	// correct in the presence of legacy data on other keys.
+	n, err := coll.Find(`{"tags":"a"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n,
+		"Find({tags:a}).Count must be 1 (legacy entries elsewhere don't affect this match)")
+
+	// And cross-bound: Find({tags:{$in:["a","b"]}}) hits BOTH "a" and "b"
+	// bounds for d1. Without dedup the count would be 2; with dedup
+	// (which all entries route through because at least one is decoded
+	// as multi-key), it must be 1.
+	n, err = coll.Find(`{"tags":{"$in":["a","b"]}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n,
+		"$in over [a,b] on a single doc whose tags overlap both bounds must "+
+			"dedup to 1 (got %d) — legacy entries must not break dedup", n)
+}
+
+// --- Subtest 3: update via public API rewrites legacy → bit-set ---
+
+// TestAudit14_LegacyNilValue_OverwriteOnUpdate verifies that an update
+// via the public API REPLACES a legacy nil-value entry with a new
+// bit-set value. The mechanism: collection.update calls deleteKeys
+// (removes by key — value-byte irrelevant) followed by insertKeys
+// (writes the new bit-set value).
+//
+// We must change the doc value (not just rewrite identical content) —
+// collection.update has an early-out via anyencutil.Equal that skips
+// the deleteKeys/insertKeys cycle when the old and new values are
+// identical. So we insert {a:10}, inject a legacy entry at the same
+// key, then update to {a:20}: deleteKeys removes the old key (10,d1)
+// regardless of its value byte, and insertKeys writes (20,d1) with the
+// new bit-set value.
+//
+// This proves there's a natural migration path: any doc that gets
+// touched (with a real value change) will have its index entries
+// normalized to the new format.
+func TestAudit14_LegacyNilValue_OverwriteOnUpdate(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit14_update")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_a",
+		Fields: []string{"a"},
+	}))
+
+	// Insert a scalar doc — produces one entry tagged IndexValueScalar.
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","a":10}`),
+	))
+
+	c, idx := findIndex(t, coll, "ix_a")
+
+	// Replace that bit-set entry with a nil-value one to simulate a
+	// pre-upgrade write for the same (key, docId) pair. Direct overwrite
+	// at the same key is safe — it just changes the value.
+	legacyKey := buildIndexFullKey([]any{10}, "d1")
+	injectRawIndexEntry(t, c, idx, legacyKey, nil)
+
+	// Confirm the entry is now legacy (nil value).
+	entries := readRawIndexEntries(t, fx.DB, "audit14_update", "ix_a")
+	require.Len(t, entries, 1, "exactly one entry expected")
+	assert.Empty(t, entries[0].Value,
+		"after injection the entry value must be empty (legacy)")
+
+	// Update the doc via the public API. We MUST change the value (10→20)
+	// so collection.update doesn't early-out on the equality check. The
+	// deleteKeys call removes the old (10,d1) entry by key (value byte
+	// irrelevant), and insertKeys writes (20,d1) with the new bit-set
+	// value.
+	require.NoError(t, coll.UpdateOne(ctx,
+		anyenc.MustParseJson(`{"id":"d1","a":20}`)))
+
+	entries = readRawIndexEntries(t, fx.DB, "audit14_update", "ix_a")
+	require.Len(t, entries, 1, "still exactly one entry after update")
+	assert.Equal(t, qplanner.IndexValueScalar, entries[0].Value,
+		"after public-API update the legacy nil entry must be replaced "+
+			"with IndexValueScalar (0x00) — this is the migration path")
+
+	// Query still works for the new value.
+	n, err := coll.Find(`{"a":20}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	// And the old key is gone (no orphaned entry).
+	n, err = coll.Find(`{"a":10}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, n,
+		"after update the old key (a:10) must produce 0 hits — the legacy "+
+			"entry there must have been deleted by deleteKeys")
+}
+
+// --- Subtest 4: fully-pre-upgrade index, multi-bound $in still correct ---
+
+// TestAudit14_LegacyNilValue_AllNilSimulatesPreUpgrade simulates an
+// index where EVERY entry was written by old code (nil values). We
+// inject several nil-value entries directly (no public-API inserts on
+// this index), then run a multi-bound $in query.
+//
+// Because every entry decodes as multi-key (len==0), the consumer-side
+// DocDedup must collapse cross-bound duplicates. Without that, an $in
+// query with overlapping bounds would over-count.
+//
+// We use the trick of inserting docs into the data namespace via a
+// SECOND collection that doesn't share the indexed field, then we hand-
+// build the index entries. Simpler approach: insert minimal docs (with
+// no array), then inject ONLY legacy index entries for them.
+func TestAudit14_LegacyNilValue_AllNilSimulatesPreUpgrade(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit14_allnil")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "tags",
+		Fields: []string{"tags"},
+	}))
+
+	// Insert docs with NO "tags" field. The public-API insert path will
+	// not write any index entries for them (sparse-like behavior on a
+	// missing field path). Then we'll inject legacy entries by hand.
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1"}`),
+		anyenc.MustParseJson(`{"id":"d2"}`),
+	))
+
+	c, idx := findIndex(t, coll, "tags")
+
+	// Sanity: no entries from the public-API path (the docs don't have
+	// "tags", and the index is non-sparse but the field is missing —
+	// writeValues calls Get which returns a typeNull-ish value; the
+	// actual behavior depends on writeValues, but to be robust we verify
+	// the count rather than asserting zero).
+	pre := readRawIndexEntries(t, fx.DB, "audit14_allnil", "tags")
+	preLen := len(pre)
+
+	// Inject legacy entries: d1.tags = ["a","b"] and d2.tags = ["b","c"]
+	// — i.e. d1 matches {a,b}, d2 matches {b,c}, both overlap on "b".
+	// Mimics the per-element layout the old writer produced (without the
+	// whole-array entry — old code did the same expansion, this is fine
+	// for testing the value-byte semantics).
+	for _, kv := range []struct {
+		key string
+		doc string
+	}{
+		{"a", "d1"},
+		{"b", "d1"},
+		{"b", "d2"},
+		{"c", "d2"},
+	} {
+		full := buildIndexFullKey([]any{kv.key}, kv.doc)
+		injectRawIndexEntry(t, c, idx, full, nil)
+	}
+
+	post := readRawIndexEntries(t, fx.DB, "audit14_allnil", "tags")
+	require.Equal(t, preLen+4, len(post),
+		"expected %d (pre) + 4 (injected) entries, got %d", preLen, len(post))
+	for _, e := range post[preLen:] {
+		assert.Empty(t, e.Value,
+			"all injected entries must have empty (legacy) value")
+	}
+
+	// Multi-bound $in over [a,b,c]: d1 matches "a" and "b" (2 hits), d2
+	// matches "b" and "c" (2 hits). Without dedup, count = 4. With
+	// dedup (forced by every entry being decoded as multi-key via the
+	// legacy/empty path), count = 2.
+	n, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n,
+		"distinct doc count over fully-legacy index must be 2 (d1+d2). "+
+			"4 would mean dedup is broken on the legacy path; got %d", n)
+}
+
+// --- Subtest 5: rebuild via DropIndex + EnsureIndex normalizes everything ---
+
+// TestAudit14_LegacyNilValue_RebuildNormalizes injects a mix of legacy
+// (nil) and new (bit-set) entries, then drops and recreates the index.
+// The rebuild must walk the data namespace and rewrite EVERY entry with
+// the new bit-set format — no nil values must remain.
+//
+// This is the explicit migration knob: DropIndex + EnsureIndex has
+// always been the documented index-rebuild path; we pin that it also
+// upgrades the entry-value-byte format.
+func TestAudit14_LegacyNilValue_RebuildNormalizes(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit14_rebuild")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "tags",
+		Fields: []string{"tags"},
+	}))
+
+	// Insert two real docs via the public API → bit-set entries.
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"]}`),
+		anyenc.MustParseJson(`{"id":"d2","tags":["c"]}`),
+	))
+
+	c, idx := findIndex(t, coll, "tags")
+
+	// Now overwrite a couple of those entries with nil values to
+	// simulate leftover legacy data co-existing with new data.
+	overwrite := buildIndexFullKey([]any{"a"}, "d1")
+	injectRawIndexEntry(t, c, idx, overwrite, nil)
+	overwrite2 := buildIndexFullKey([]any{"c"}, "d2")
+	injectRawIndexEntry(t, c, idx, overwrite2, nil)
+
+	pre := readRawIndexEntries(t, fx.DB, "audit14_rebuild", "tags")
+	var preLegacy, preBitSet int
+	for _, e := range pre {
+		if len(e.Value) == 0 {
+			preLegacy++
+		} else {
+			preBitSet++
+		}
+	}
+	require.GreaterOrEqual(t, preLegacy, 2,
+		"setup expected at least 2 legacy entries before rebuild")
+	require.GreaterOrEqual(t, preBitSet, 1,
+		"setup expected at least 1 bit-set entry before rebuild")
+
+	// Drop + EnsureIndex — the documented rebuild path.
+	require.NoError(t, coll.DropIndex(ctx, "tags"))
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "tags",
+		Fields: []string{"tags"},
+	}))
+
+	// Every entry must now be bit-set. No nil values may remain.
+	post := readRawIndexEntries(t, fx.DB, "audit14_rebuild", "tags")
+	require.NotEmpty(t, post, "rebuild must produce some entries")
+	for i, e := range post {
+		require.NotEmptyf(t, e.Value,
+			"entry %d after rebuild must NOT have empty value (got %d entries total)",
+			i, len(post))
+	}
+
+	// Sanity: queries still work.
+	n, err := coll.Find(`{"tags":"a"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+}
+
+// --- Subtest 6: planner routes via SeenSet/DocDedup on legacy index ---
+
+// TestAudit14_LegacyNilValue_PlannerRoutesViaSeenSet pins the end-to-end
+// behavior: when the index is fully legacy (nil values), a multi-bound
+// $in query with OVERLAPPING bounds against the same doc must still
+// produce the correct distinct-doc count via Count AND yield each doc
+// exactly once via Iter.
+//
+// The mechanism: every legacy entry decodes as multi-key (true), so
+// DocDedup at the consumer side collapses repeated docIds across
+// bounds. Without that — if EntryValueIsMultiKey reported false on
+// nil — both Count and Iter would over-count.
+//
+// Setup: insert d1 WITH tags = [a,b,c] (so the data namespace has a
+// real, filter-matching doc). Then overwrite EVERY bit-set entry in
+// the index with a nil value, simulating an index that was written by
+// the old code but whose data was somehow up to date — i.e. a fully
+// pre-upgrade index that hasn't yet been touched (no inserts/updates
+// migrate it; no EnsureIndex rebuild).
+func TestAudit14_LegacyNilValue_PlannerRoutesViaSeenSet(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit14_seenset")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "tags",
+		Fields: []string{"tags"},
+	}))
+
+	// Insert a real doc with the array — the public-API path writes
+	// bit-set entries for each key (3 element entries + 1 whole-array).
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b","c"]}`),
+	))
+
+	c, idx := findIndex(t, coll, "tags")
+
+	// Now overwrite EVERY entry's value with nil to simulate a fully
+	// pre-upgrade index. The keys stay the same (so they still point at
+	// d1 correctly); only the value byte changes from 0x01 → empty.
+	pre := readRawIndexEntries(t, fx.DB, "audit14_seenset", "tags")
+	require.NotEmpty(t, pre, "public-API insert must produce some entries")
+	for _, e := range pre {
+		injectRawIndexEntry(t, c, idx, e.Key, nil)
+	}
+
+	// Verify all entries are now legacy (nil values).
+	post := readRawIndexEntries(t, fx.DB, "audit14_seenset", "tags")
+	require.Equal(t, len(pre), len(post),
+		"overwrite must keep entry count constant (same keys, different values)")
+	for i, e := range post {
+		require.Emptyf(t, e.Value,
+			"entry %d after overwrite must have empty (legacy) value, got %v",
+			i, e.Value)
+	}
+
+	// Count must dedup → 1. Without dedup (if nil decoded as scalar
+	// false) the count loop would tally each matching bound separately
+	// and report >1.
+	n, err := coll.Find(`{"tags":{"$in":["a","b"]}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n,
+		"distinct-doc Count over fully-legacy index with overlapping $in "+
+			"bounds must be 1 (got %d) — legacy path must route via DocDedup", n)
+
+	// Iter must yield d1 exactly once (in any order). Same dedup logic,
+	// different code path (planIterator.Next + DocDedup vs. Count's loop).
+	ids := collectField(t, coll.Find(`{"tags":{"$in":["a","b"]}}`), "id")
+	sort.Strings(ids)
+	assert.Equal(t, []string{`"d1"`}, ids,
+		"Iter over fully-legacy index with overlapping $in bounds must yield "+
+			"d1 exactly once (got %v)", ids)
 }

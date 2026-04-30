@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -841,4 +842,474 @@ func TestConcurrentReadersOverflowKeys(t *testing.T) {
 		t.Fatalf("QuickCheck: %v", err)
 	}
 	t.Logf("Concurrent overflow keys test passed (%d docs, 8 readers, 50 write rounds)", count)
+}
+
+// TestAudit15_ConcurrentReaderMultiKey_* — focused edge-case audit for MVCC
+// isolation of multi-key (array-valued) index entries under concurrent
+// read/write traffic.
+//
+// Background:
+//
+// any-store provides single-writer + multi-reader MVCC via WAL. A read tx
+// opened before a write commits sees the pre-write snapshot; a read tx
+// opened after sees the post-write snapshot. There is no torn state by
+// construction.
+//
+// The per-entry value byte (see AUDIT01–AUDIT03 / qplanner.IndexValueScalar
+// vs IndexValueMultiKey) introduces a NEW failure mode: if MVCC isolation
+// were to leak even a single byte, a reader could observe a multi-key entry
+// that has been partially rewritten as scalar (or vice versa). Symptoms:
+//
+//   - Count returns 2+ for a unique-id doc whose array overlaps multiple
+//     $in bounds (dedup pipeline inactive because the value byte read as
+//     scalar even though the entry was last written as multi-key).
+//   - Iter yields the same doc id twice in one pass.
+//
+// Existing concurrent tests (index_concurrent_test.go) only exercise scalar
+// fields, so the value-byte invariant under concurrency is unverified.
+// These tests pin it: each subtest spins a writer that flips the same
+// single doc's array tags in a tight loop while one or more readers
+// continuously query the multi-key index. Across every observation, the
+// count of distinct matching docs MUST be 0 or 1 — never 2 (which would
+// indicate the dedup pipeline broke), never an error (which would indicate
+// transient state was visible).
+//
+// The same doc id ("d1") is reused so the test exercises the
+// delete-old-keys + insert-new-keys path inside collection.update for every
+// flip — this is the operation most likely to expose a torn entry to a
+// concurrent reader if MVCC were broken.
+
+// audit15TestDuration bounds each subtest. Long enough to exercise many
+// flip cycles; short enough to keep the suite fast under -race.
+const audit15TestDuration = 200 * time.Millisecond
+
+// runAudit15Workload starts one writer goroutine and the supplied reader
+// goroutines, runs them for the configured duration via a deadline channel,
+// then waits for all of them to exit. The writer's loop body is provided
+// by writeStep (called repeatedly until done is closed). Each reader is
+// also a closure called repeatedly until done is closed.
+//
+// All goroutines must respect the done channel. If any goroutine returns
+// an error via writeErr / readerErrs, the test fails.
+func runAudit15Workload(
+	t *testing.T,
+	writeStep func() error,
+	readers []func() error,
+) {
+	t.Helper()
+	done := make(chan struct{})
+	deadline := time.After(audit15TestDuration)
+
+	var wg sync.WaitGroup
+	var writeErr atomic.Value
+	readerErrs := make([]atomic.Value, len(readers))
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			if err := writeStep(); err != nil {
+				writeErr.Store(err)
+				return
+			}
+		}
+	}()
+
+	for i, r := range readers {
+		wg.Add(1)
+		go func(idx int, fn func() error) {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				if err := fn(); err != nil {
+					readerErrs[idx].Store(err)
+					return
+				}
+			}
+		}(i, r)
+	}
+
+	<-deadline
+	close(done)
+	wg.Wait()
+
+	if v := writeErr.Load(); v != nil {
+		t.Fatalf("writer failed: %v", v)
+	}
+	for i := range readerErrs {
+		if v := readerErrs[i].Load(); v != nil {
+			t.Fatalf("reader %d failed: %v", i, v)
+		}
+	}
+}
+
+// audit15FlipDocs returns the two whole-doc shapes used by the
+// "flip between two array shapes" tests. d1 always has the same id; only
+// the tags array changes. Reusing the id forces collection.update to
+// delete-then-insert all index entries every flip.
+func audit15FlipDocs() (a, b *anyenc.Value) {
+	a = anyenc.MustParseJson(`{"id":"d1","tags":["a","b","c"]}`)
+	b = anyenc.MustParseJson(`{"id":"d1","tags":["x"]}`)
+	return
+}
+
+// TestAudit15_ConcurrentReaderMultiKey_StableSnapshotCount: writer flips
+// d1 between ["a","b","c"] and ["x"] in a loop. Reader runs Find({tags:"a"})
+// .Count for the same duration — every observation must be 0 or 1 (never 2,
+// never an error). 0 means the snapshot caught the ["x"] state; 1 means
+// the snapshot caught the ["a","b","c"] state. Anything else implies the
+// per-entry value byte (or dedup pipeline) saw torn state.
+func TestAudit15_ConcurrentReaderMultiKey_StableSnapshotCount(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit15_stable_count")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+	}))
+
+	docA, docX := audit15FlipDocs()
+	require.NoError(t, coll.UpsertOne(ctx, docA))
+
+	var violations atomic.Int64
+	var observations atomic.Int64
+	flip := false
+	writeStep := func() error {
+		flip = !flip
+		if flip {
+			return coll.UpsertOne(ctx, docX)
+		}
+		return coll.UpsertOne(ctx, docA)
+	}
+
+	reader := func() error {
+		n, err := coll.Find(`{"tags":"a"}`).Count(ctx)
+		if err != nil {
+			return fmt.Errorf("Count error: %w", err)
+		}
+		observations.Add(1)
+		if n != 0 && n != 1 {
+			violations.Add(1)
+			return fmt.Errorf("torn snapshot: Count returned %d (expected 0 or 1)", n)
+		}
+		return nil
+	}
+
+	runAudit15Workload(t, writeStep, []func() error{reader})
+
+	assert.Zero(t, violations.Load(),
+		"expected no torn-snapshot observations; got %d violation(s) over %d observation(s)",
+		violations.Load(), observations.Load())
+	require.Greater(t, observations.Load(), int64(0),
+		"reader did not run a single observation — workload too short or scheduling pathological")
+}
+
+// TestAudit15_ConcurrentReaderMultiKey_StableSnapshotIter: same flip
+// pattern as above, but the reader uses Iter and collects doc ids.
+// The result set per pass must contain at most {"d1"} (never d1 twice,
+// never an unexpected id). This catches a leak in planIterator.Next /
+// DocDedup that Count alone might miss because Count has its own dedup
+// pipeline (CountEntries / countEntriesWithDedup).
+func TestAudit15_ConcurrentReaderMultiKey_StableSnapshotIter(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit15_stable_iter")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+	}))
+
+	docA, docX := audit15FlipDocs()
+	require.NoError(t, coll.UpsertOne(ctx, docA))
+
+	var violations atomic.Int64
+	var observations atomic.Int64
+	flip := false
+	writeStep := func() error {
+		flip = !flip
+		if flip {
+			return coll.UpsertOne(ctx, docX)
+		}
+		return coll.UpsertOne(ctx, docA)
+	}
+
+	reader := func() error {
+		// Use $in to force the multi-bound code path (the one that needs
+		// the value byte to dedup). With a single bound on "a", a flip to
+		// ["x"] simply yields zero results — no dedup work happens. With
+		// $in: ["a","b","c"], the ["a","b","c"] state would yield d1
+		// across THREE bounds — DocDedup must collapse it to one.
+		iter, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Iter(ctx)
+		if err != nil {
+			return fmt.Errorf("Iter error: %w", err)
+		}
+		ids := map[string]int{}
+		var iterErr error
+		for iter.Next() {
+			doc, derr := iter.Doc()
+			if derr != nil {
+				iterErr = derr
+				break
+			}
+			id := doc.Value().GetStringBytes("id")
+			ids[string(id)]++
+		}
+		if iterErr == nil {
+			iterErr = iter.Err()
+		}
+		if cerr := iter.Close(); cerr != nil && iterErr == nil {
+			iterErr = cerr
+		}
+		if iterErr != nil {
+			return fmt.Errorf("iter error: %w", iterErr)
+		}
+		observations.Add(1)
+
+		// Allowed: empty result, or exactly one occurrence of "d1".
+		if len(ids) > 1 {
+			violations.Add(1)
+			return fmt.Errorf("torn snapshot: unexpected ids %v", ids)
+		}
+		if cnt, ok := ids["d1"]; ok && cnt != 1 {
+			violations.Add(1)
+			return fmt.Errorf("torn snapshot: d1 yielded %d times in one pass", cnt)
+		}
+		for id := range ids {
+			if id != "d1" {
+				violations.Add(1)
+				return fmt.Errorf("torn snapshot: unexpected id %q", id)
+			}
+		}
+		return nil
+	}
+
+	runAudit15Workload(t, writeStep, []func() error{reader})
+
+	assert.Zero(t, violations.Load(),
+		"expected no torn-snapshot observations; got %d violation(s) over %d observation(s)",
+		violations.Load(), observations.Load())
+	require.Greater(t, observations.Load(), int64(0),
+		"reader did not run a single observation — workload too short or scheduling pathological")
+}
+
+// TestAudit15_ConcurrentReaderMultiKey_AddDeleteCycle: writer inserts and
+// deletes the same doc with array tags in a tight loop. Reader runs
+// Count over a multi-bound $in. Every observation must be 0 (doc absent)
+// or 1 (doc present). Exercises a different code path from the flip test:
+// here the index entries are fully removed and re-created, not
+// delete-then-insert as part of an update.
+func TestAudit15_ConcurrentReaderMultiKey_AddDeleteCycle(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit15_add_delete")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+	}))
+
+	doc := anyenc.MustParseJson(`{"id":"d1","tags":["a","b","c"]}`)
+
+	// Start with the doc absent. The writer alternately inserts then
+	// deletes by id.
+	var violations atomic.Int64
+	var observations atomic.Int64
+	state := false // false = absent, true = present
+	writeStep := func() error {
+		if state {
+			state = false
+			err := coll.DeleteId(ctx, "d1")
+			// Tolerate races with our own state tracking — if the doc
+			// already vanished or never existed, we just resync.
+			if err != nil {
+				return fmt.Errorf("DeleteId: %w", err)
+			}
+			return nil
+		}
+		state = true
+		if err := coll.UpsertOne(ctx, doc); err != nil {
+			return fmt.Errorf("UpsertOne: %w", err)
+		}
+		return nil
+	}
+
+	reader := func() error {
+		n, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Count(ctx)
+		if err != nil {
+			return fmt.Errorf("Count error: %w", err)
+		}
+		observations.Add(1)
+		if n != 0 && n != 1 {
+			violations.Add(1)
+			return fmt.Errorf("torn snapshot: Count returned %d (expected 0 or 1)", n)
+		}
+		return nil
+	}
+
+	runAudit15Workload(t, writeStep, []func() error{reader})
+
+	assert.Zero(t, violations.Load(),
+		"expected no torn-snapshot observations; got %d violation(s) over %d observation(s)",
+		violations.Load(), observations.Load())
+	require.Greater(t, observations.Load(), int64(0),
+		"reader did not run a single observation — workload too short or scheduling pathological")
+}
+
+// TestAudit15_ConcurrentReaderMultiKey_MultiBoundOverlap: writer flips the
+// doc's array between three OVERLAPPING shapes (["a","b"], ["b","c"],
+// ["a","c"]). Reader runs $in:["a","b","c"].Count. The doc always matches
+// at least two bounds, so without correct dedup the count would be 2 or 3.
+// With correct dedup it must be exactly 1 (or 0 if the writer happens to
+// have no doc — but here the doc is always present).
+func TestAudit15_ConcurrentReaderMultiKey_MultiBoundOverlap(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit15_multibound")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+	}))
+
+	shapes := []*anyenc.Value{
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","b"]}`),
+		anyenc.MustParseJson(`{"id":"d1","tags":["b","c"]}`),
+		anyenc.MustParseJson(`{"id":"d1","tags":["a","c"]}`),
+	}
+	require.NoError(t, coll.UpsertOne(ctx, shapes[0]))
+
+	var violations atomic.Int64
+	var observations atomic.Int64
+	idx := 0
+	writeStep := func() error {
+		idx = (idx + 1) % len(shapes)
+		return coll.UpsertOne(ctx, shapes[idx])
+	}
+
+	reader := func() error {
+		n, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Count(ctx)
+		if err != nil {
+			return fmt.Errorf("Count error: %w", err)
+		}
+		observations.Add(1)
+		// All three shapes match at least two of the three $in bounds.
+		// Correct dedup → count == 1. Broken dedup → count >= 2.
+		// (Count == 0 should not happen here because the doc is always
+		// present, but we tolerate it defensively against snapshot
+		// timing oddities; the violation we hunt is count >= 2.)
+		if n != 0 && n != 1 {
+			violations.Add(1)
+			return fmt.Errorf("torn snapshot / broken dedup: Count returned %d (expected 0 or 1)", n)
+		}
+		return nil
+	}
+
+	runAudit15Workload(t, writeStep, []func() error{reader})
+
+	assert.Zero(t, violations.Load(),
+		"expected no broken-dedup observations; got %d violation(s) over %d observation(s)",
+		violations.Load(), observations.Load())
+	require.Greater(t, observations.Load(), int64(0),
+		"reader did not run a single observation — workload too short or scheduling pathological")
+}
+
+// TestAudit15_ConcurrentReaderMultiKey_ConcurrentReaders: 4 reader
+// goroutines + 1 writer goroutine, all hammering the same multi-key
+// index simultaneously. Every reader must see consistent counts; no
+// goroutine returns an error. This stresses the read-tx pool / WAL
+// snapshot machinery harder than the single-reader subtests.
+func TestAudit15_ConcurrentReaderMultiKey_ConcurrentReaders(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit15_many_readers")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+	}))
+
+	docA, docX := audit15FlipDocs()
+	require.NoError(t, coll.UpsertOne(ctx, docA))
+
+	const numReaders = 4
+	var violations atomic.Int64
+	observations := make([]atomic.Int64, numReaders)
+
+	flip := false
+	writeStep := func() error {
+		flip = !flip
+		if flip {
+			return coll.UpsertOne(ctx, docX)
+		}
+		return coll.UpsertOne(ctx, docA)
+	}
+
+	readers := make([]func() error, numReaders)
+	for i := range readers {
+		i := i
+		readers[i] = func() error {
+			// Mix Count and Iter across readers to exercise both paths.
+			if i%2 == 0 {
+				n, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Count(ctx)
+				if err != nil {
+					return fmt.Errorf("reader %d Count: %w", i, err)
+				}
+				observations[i].Add(1)
+				if n != 0 && n != 1 {
+					violations.Add(1)
+					return fmt.Errorf("reader %d torn snapshot: Count=%d", i, n)
+				}
+				return nil
+			}
+			iter, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Iter(ctx)
+			if err != nil {
+				return fmt.Errorf("reader %d Iter: %w", i, err)
+			}
+			seen := map[string]int{}
+			var iterErr error
+			for iter.Next() {
+				doc, derr := iter.Doc()
+				if derr != nil {
+					iterErr = derr
+					break
+				}
+				seen[string(doc.Value().GetStringBytes("id"))]++
+			}
+			if iterErr == nil {
+				iterErr = iter.Err()
+			}
+			if cerr := iter.Close(); cerr != nil && iterErr == nil {
+				iterErr = cerr
+			}
+			if iterErr != nil {
+				return fmt.Errorf("reader %d iter loop: %w", i, iterErr)
+			}
+			observations[i].Add(1)
+			if len(seen) > 1 {
+				violations.Add(1)
+				return fmt.Errorf("reader %d torn snapshot: ids=%v", i, seen)
+			}
+			if cnt, ok := seen["d1"]; ok && cnt != 1 {
+				violations.Add(1)
+				return fmt.Errorf("reader %d torn snapshot: d1 yielded %d times", i, cnt)
+			}
+			return nil
+		}
+	}
+
+	runAudit15Workload(t, writeStep, readers)
+
+	assert.Zero(t, violations.Load(),
+		"expected no torn-snapshot observations; got %d violation(s)",
+		violations.Load())
+	for i := range observations {
+		require.Greater(t, observations[i].Load(), int64(0),
+			"reader %d did not run a single observation", i)
+	}
 }

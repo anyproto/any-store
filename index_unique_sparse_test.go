@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/internal/qplanner"
 )
 
 func TestIndex_UniqueSparse_CompoundUnique(t *testing.T) {
@@ -536,4 +537,595 @@ func TestIndex_SparseNested_Coverage_MissingIntermediate(t *testing.T) {
 	n, err := idx.Len(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 1, n, "only p5 should have an index entry under sparse meta.tags.name")
+}
+
+// TestAudit12_SparseEmptyArray_* — focused edge-case audit for the
+// interaction between a SPARSE index and an EMPTY ARRAY (e.g. {tags: []}).
+//
+// Background — index.go::writeValues (around line 213/227):
+//
+//	v := d.Get(idx.fieldPaths[i]...)
+//	if idx.info.Sparse && (v == nil || v.Type() == anyenc.TypeNull) {
+//	    return false
+//	}
+//
+//	k := idx.keyBuf
+//	if v != nil && v.Type() == anyenc.TypeArray {
+//	    arr, _ := v.Array()
+//	    if len(arr) != 0 {
+//	        ... per-element loop ...
+//	    }
+//	}
+//	idx.keyBuf = v.MarshalTo(k)
+//	return idx.writeValues(d, i+1)
+//
+// The sparse guard ONLY skips for v==nil (missing field) or TypeNull. An
+// EMPTY array is neither — its Type() is TypeArray. So:
+//
+//	1. The sparse guard does NOT skip the empty array.
+//	2. The array branch checks `len(arr) != 0` and skips the per-element
+//	   loop because the array is empty.
+//	3. Control falls through to `idx.keyBuf = v.MarshalTo(k)` — the empty
+//	   array is marshalled as a single key and ONE index entry is written.
+//
+// Hypothesis: a sparse index over `tags` with doc {id:1, tags:[]} STILL
+// writes one entry, violating the sparse-index expectation that
+// "missing/empty values are not indexed".
+//
+// These tests pin the observed behaviour. If subtest 3 produces a
+// non-zero entry count, that IS the suspected bug — documented inline.
+
+// TestAudit12_SparseEmptyArray_NoFieldZeroEntries: doc with no `tags`
+// field at all. Sparse guard short-circuits on v == nil → 0 entries.
+// Baseline for what "sparse" is supposed to do.
+func TestAudit12_SparseEmptyArray_NoFieldZeroEntries(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit12_no_field")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+		Sparse: true,
+	}))
+
+	// Doc with NO `tags` field — sparse guard hits v == nil branch.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1}`)))
+
+	entries := readRawIndexEntries(t, fx.DB, "audit12_no_field", "ix_tags")
+	require.Empty(t, entries,
+		"sparse index over missing field must produce zero entries (v == nil branch)")
+
+	assertIndexLen(t, coll.GetIndexes()[0], 0)
+}
+
+// TestAudit12_SparseEmptyArray_NullFieldZeroEntries: doc with explicit
+// `tags: null`. Sparse guard short-circuits on TypeNull → 0 entries.
+// Baseline #2 — sparse semantics as documented.
+func TestAudit12_SparseEmptyArray_NullFieldZeroEntries(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit12_null_field")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+		Sparse: true,
+	}))
+
+	// Doc with explicit `tags: null` — sparse guard hits TypeNull branch.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":null}`)))
+
+	entries := readRawIndexEntries(t, fx.DB, "audit12_null_field", "ix_tags")
+	require.Empty(t, entries,
+		"sparse index over null field must produce zero entries (TypeNull branch)")
+
+	assertIndexLen(t, coll.GetIndexes()[0], 0)
+}
+
+// TestAudit12_SparseEmptyArray_EmptyArrayBehaviour: doc with `tags: []`
+// — empty array. This is the corner case the audit is pinning.
+//
+// OBSERVED BEHAVIOUR (the suspected semantic bug):
+//
+//	A sparse index over `tags` with doc {id:1, tags:[]} writes ONE index
+//	entry — the empty-array marshalled as a single key. The sparse guard
+//	at index.go:227 only skips for v == nil || TypeNull, so an empty
+//	TypeArray slips through. The array branch sees len(arr) == 0 and
+//	skips the per-element loop. Control then falls through to the
+//	`idx.keyBuf = v.MarshalTo(k); writeValues(d, i+1)` line, which
+//	writes the whole-empty-array key.
+//
+// This violates the conventional sparse-index expectation that
+// "missing/empty values are not indexed". An empty array is morally
+// equivalent to "no values" yet still occupies one slot in the index.
+// Because keysBuf has exactly one entry at insertKeys time, the
+// per-entry value byte is IndexValueScalar (0x00), not multi-key.
+//
+// Pinning this so the next reader who tries to "fix" sparse semantics
+// has to decide deliberately: either change the guard at index.go:227
+// to also skip empty arrays, or accept that empty-array gets indexed
+// the same way as a 0-element scalar.
+func TestAudit12_SparseEmptyArray_EmptyArrayBehaviour(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit12_empty_arr_sparse")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+		Sparse: true,
+	}))
+
+	// Doc with empty array — slips past the sparse guard.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":[]}`)))
+
+	entries := readRawIndexEntries(t, fx.DB, "audit12_empty_arr_sparse", "ix_tags")
+
+	// SUSPECTED BUG / OBSERVED BEHAVIOUR: 1 entry, not 0. This is the
+	// fall-through write of the empty-array marshal. Sparse semantics
+	// would arguably want 0 entries here.
+	require.Len(t, entries, 1,
+		"empty array on sparse index produces 1 entry (whole-empty-array marshal "+
+			"falls through the sparse guard at index.go:227 — the guard only "+
+			"checks v == nil || TypeNull, not empty arrays). Violates "+
+			"sparse-index semantics; pinned as the observed behaviour.")
+
+	// keysBuf had exactly one entry → IndexValueScalar (0x00).
+	require.NotEmpty(t, entries[0].Value)
+	assert.Equal(t, qplanner.IndexValueScalar, entries[0].Value,
+		"len(keysBuf)==1 at insertKeys time → empty-array entry tagged IndexValueScalar (0x00)")
+	assert.Zero(t, entries[0].Value[0]&qplanner.IndexEntryFlagMultiKey,
+		"multi-key flag bit must be cleared (single key in keysBuf)")
+
+	// Index Len() must agree with the raw-cursor walk.
+	assertIndexLen(t, coll.GetIndexes()[0], 1)
+}
+
+// TestAudit12_SparseEmptyArray_NonSparse: same empty-array doc, but on
+// a NON-sparse index. The sparse guard at index.go:227 is irrelevant
+// here, so the same fall-through logic applies and one entry is
+// written — confirming the empty-array fall-through is not unique to
+// sparse indexes (it's a property of writeValues itself). The sparse
+// flag merely fails to *additionally* protect against it.
+func TestAudit12_SparseEmptyArray_NonSparse(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit12_empty_arr_nonsparse")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+		// Sparse: false (default) — no early skip on null/missing.
+	}))
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":[]}`)))
+
+	entries := readRawIndexEntries(t, fx.DB, "audit12_empty_arr_nonsparse", "ix_tags")
+
+	// Non-sparse index also writes exactly one entry for empty array
+	// (the whole-array marshal). No per-element entries because the
+	// array has no elements to iterate.
+	require.Len(t, entries, 1,
+		"non-sparse index + empty array also produces exactly 1 entry "+
+			"(whole-array marshal). Confirms the empty-array fall-through "+
+			"is independent of the sparse flag.")
+
+	require.NotEmpty(t, entries[0].Value)
+	// Single key in keysBuf at insertKeys time → IndexValueScalar.
+	assert.Equal(t, qplanner.IndexValueScalar, entries[0].Value,
+		"len(keysBuf)==1 → empty-array entry on non-sparse index also tagged IndexValueScalar")
+	assert.Zero(t, entries[0].Value[0]&qplanner.IndexEntryFlagMultiKey,
+		"multi-key flag bit must be cleared (single key in keysBuf)")
+
+	assertIndexLen(t, coll.GetIndexes()[0], 1)
+}
+
+// TestAudit12_SparseEmptyArray_QueryReturnsZero: the user-visible side
+// of the suspected bug. Even though one index entry is written for
+// {tags: []}, that entry stores the whole-empty-array marshalled key
+// — NOT any element key. So Find({tags: "anything"}) cannot match it.
+// The empty-array doc occupies a slot in the index but contributes
+// nothing queryable to per-element lookups.
+func TestAudit12_SparseEmptyArray_QueryReturnsZero(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit12_empty_arr_query")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_tags",
+		Fields: []string{"tags"},
+		Sparse: true,
+	}))
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"tags":[]}`)))
+
+	// Sanity: index has 1 entry from the fall-through write.
+	assertIndexLen(t, coll.GetIndexes()[0], 1)
+
+	// Querying for any element value must return 0 — the entry stored
+	// is the whole-empty-array key, not any element key.
+	for _, probe := range []string{`"anything"`, `"foo"`, `""`, `null`} {
+		count, qerr := coll.Find(`{"tags":` + probe + `}`).Count(ctx)
+		require.NoError(t, qerr, "probe %s", probe)
+		assert.Equalf(t, 0, count,
+			"Find({tags: %s}).Count must be 0 — empty-array doc holds whole-array key, "+
+				"not element keys; no element lookup can match it.",
+			probe)
+	}
+
+	// Collection still has the 1 doc.
+	assertCollCount(t, coll, 1)
+}
+
+// TestAudit13_UniqueCompoundArray_* — focused edge-case audit for the
+// most complex insert path: UNIQUE constraint + COMPOUND index + ARRAY
+// dimension on the trailing field.
+//
+// Background — index.go::insertKeys around line 160:
+//
+//	for _, key := range idx.keysBuf {
+//	    idx.fullKeyBuf = append(idx.fullKeyBuf[:0], key...)
+//	    idx.fullKeyBuf = append(idx.fullKeyBuf, idKey...)
+//
+//	    if idx.info.Unique {
+//	        var err error
+//	        idx.seekBuf, err = tx.AppendSeekKey(idx.ns, key, idx.seekBuf[:0])
+//	        if err == nil && bytes.HasPrefix(idx.seekBuf, key) {
+//	            if !bytes.Equal(idx.seekBuf, idx.fullKeyBuf) {
+//	                return ErrUniqueConstraint
+//	            }
+//	            continue // same doc, idempotent
+//	        }
+//	    }
+//
+//	    if err := tx.Put(idx.ns, idx.fullKeyBuf, entryValue); err != nil {
+//	        return err
+//	    }
+//	    ...
+//	}
+//
+// With a compound index on `Fields:["category","tags"]` where `tags` is an
+// array, fillKeysBuf emits one key per array element PLUS a fall-through
+// "whole array" key. The unique check above fires per-emitted-key, so a
+// collision on ANY of the per-element compound tuples (e.g. (x,b)) rejects
+// the whole insert — and because txErr propagates up to db.doWriteTx, the
+// surrounding transaction rolls back, erasing any partial Put() from
+// earlier in the loop.
+//
+// These tests pin:
+//
+//  1. NoCollision: docs whose compound tuples don't share any (cat,tag)
+//     pair both insert. Every entry written must be IndexValueMultiKey
+//     because the array dimension expands keysBuf > 1.
+//  2. CollisionRejected: d2's per-element seek for (x,b) finds d1's
+//     existing (x,b,d1) row; the prefix check fires → ErrUniqueConstraint.
+//  3. CollisionRollsBack: d2's earlier successful Put for (x,b) — wait,
+//     d2 hits the conflict on (x,b) immediately, so its FIRST emitted key
+//     (x,b) is the one that errors. But d2 emits keys in array-iteration
+//     order: tags=["b","c"] → first key (x,b) collides BEFORE (x,c) is
+//     written. Either way, after rollback the namespace must contain ONLY
+//     d1's entries — no orphaned d2 partial writes.
+//  4. DifferentCategoriesNoCollide: same array element "b" but different
+//     leading category — the compound prefix differs so no conflict.
+//  5. IdempotentSelfReinsert: re-inserting the SAME (key, docId) tuple
+//     hits the `continue` branch (seekBuf == fullKeyBuf). The user-facing
+//     UpdateOne(d1) -> d1 short-circuits inside collection.update() via
+//     anyencutil.Equal and never reaches insertKeys at all, so we ALSO
+//     directly call insertKeys twice in a write-tx to truly exercise the
+//     `continue` branch.
+//  6. QueryFindByElement: confirms the unique compound + array index is
+//     queryable per-element via the standard Find pipeline.
+
+// TestAudit13_UniqueCompoundArray_NoCollision: d1 (x,[a,b]) + d2 (x,[c,d]).
+// No shared (category, tag) tuple. Both inserts succeed; verify entry counts
+// and that ALL entries carry IndexValueMultiKey (because each doc's keysBuf
+// has > 1 entries from the array expansion).
+func TestAudit13_UniqueCompoundArray_NoCollision(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit13_no_collision")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_cat_tags",
+		Fields: []string{"category", "tags"},
+		Unique: true,
+	}))
+
+	// d1: tags=["a","b"] → keysBuf entries (x,a), (x,b), (x,["a","b"]) = 3
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","category":"x","tags":["a","b"]}`)))
+	// d2: tags=["c","d"] → keysBuf entries (x,c), (x,d), (x,["c","d"]) = 3
+	// No shared (x,*) tuple with d1 → no unique conflict.
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d2","category":"x","tags":["c","d"]}`)))
+
+	assertCollCount(t, coll, 2)
+	idx := coll.GetIndexes()[0]
+	// 3 entries per doc * 2 docs = 6 entries.
+	assertIndexLen(t, idx, 6)
+
+	entries := readRawIndexEntries(t, fx.DB, "audit13_no_collision", "ix_cat_tags")
+	require.Len(t, entries, 6,
+		"compound + array: 2 docs * 3 keys/doc = 6 entries")
+
+	// Every entry must carry IndexValueMultiKey because each doc's keysBuf
+	// has 3 entries (>1) — the array dimension forces the multi-key tag on
+	// EVERY emitted key for that doc, including the whole-array fall-through.
+	for i, e := range entries {
+		assert.Equalf(t, qplanner.IndexValueMultiKey, e.Value,
+			"entry %d: compound + array insert must write IndexValueMultiKey "+
+				"because keysBuf > 1 from array expansion", i)
+		require.NotEmptyf(t, e.Value, "entry %d: value must not be empty", i)
+		assert.NotZerof(t, e.Value[0]&qplanner.IndexEntryFlagMultiKey,
+			"entry %d: multi-key flag bit must be set", i)
+	}
+}
+
+// TestAudit13_UniqueCompoundArray_CollisionRejected: d1 (x,[a,b]) succeeds;
+// d2 (x,[b,c]) must fail with ErrUniqueConstraint because d2's per-element
+// emit of (x,b,d2) collides with d1's existing (x,b,d1) row on the unique
+// (category,tags) tuple.
+func TestAudit13_UniqueCompoundArray_CollisionRejected(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit13_collision_rejected")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_cat_tags",
+		Fields: []string{"category", "tags"},
+		Unique: true,
+	}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","category":"x","tags":["a","b"]}`)))
+
+	// d2 emits (x,b,d2) — seek finds (x,b,d1), prefix matches, docIds
+	// differ → ErrUniqueConstraint.
+	err = coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d2","category":"x","tags":["b","c"]}`))
+	require.ErrorIs(t, err, ErrUniqueConstraint,
+		"compound (x,b) tuple must collide with d1 across docIds")
+}
+
+// TestAudit13_UniqueCompoundArray_CollisionRollsBack: after the failed d2
+// insert, the collection must contain only d1; assert via Count and via
+// raw-entry inspection (d2's partial entries — including any per-element
+// Put() that succeeded BEFORE the colliding one — must NOT linger).
+//
+// This is the critical rollback-safety assertion: insertKeys returns the
+// error to insertItem, which returns it to db.doWriteTx, which calls
+// tx.Rollback(). If the namespace ever shows a stray d2 entry post-rollback,
+// that's a bug in the transaction layer, not in insertKeys itself.
+func TestAudit13_UniqueCompoundArray_CollisionRollsBack(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit13_rollback")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_cat_tags",
+		Fields: []string{"category", "tags"},
+		Unique: true,
+	}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","category":"x","tags":["a","b"]}`)))
+
+	// Snapshot pre-collision: 3 entries for d1.
+	idx := coll.GetIndexes()[0]
+	assertIndexLen(t, idx, 3)
+	preEntries := readRawIndexEntries(t, fx.DB, "audit13_rollback", "ix_cat_tags")
+	require.Len(t, preEntries, 3,
+		"pre-collision baseline: d1 must have exactly 3 index entries (a, b, [a,b])")
+
+	// Trigger the collision. d2 emits (x,a) [no conflict] then (x,b)
+	// [conflict with d1] OR (x,b) [conflict immediately] depending on
+	// array iteration order — either way the whole tx must roll back.
+	err = coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d2","category":"x","tags":["b","c"]}`))
+	require.ErrorIs(t, err, ErrUniqueConstraint)
+
+	// Doc-level assertion: only d1 in the collection.
+	assertCollCount(t, coll, 1)
+
+	// Index-level assertion: still exactly 3 entries (d1's), no orphans.
+	assertIndexLen(t, idx, 3)
+	postEntries := readRawIndexEntries(t, fx.DB, "audit13_rollback", "ix_cat_tags")
+	require.Len(t, postEntries, 3,
+		"post-rollback: namespace must hold ONLY d1's 3 entries — "+
+			"any additional row would prove a partial d2 write leaked through rollback")
+
+	// Stronger check: the entry bytes must be identical to the pre-collision
+	// snapshot — same keys, same values. If d2 partially wrote anything, the
+	// post-set wouldn't equal the pre-set.
+	require.Equal(t, len(preEntries), len(postEntries),
+		"entry count must be unchanged across the rolled-back tx")
+	for i := range preEntries {
+		assert.Equalf(t, preEntries[i].Key, postEntries[i].Key,
+			"entry %d key changed after rolled-back collision", i)
+		assert.Equalf(t, preEntries[i].Value, postEntries[i].Value,
+			"entry %d value changed after rolled-back collision", i)
+	}
+
+	// Sanity: queries still find d1 by every original element of its array.
+	count, err := coll.Find(`{"category":"x","tags":"a"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count, "d1 must still match (category=x, tags=a)")
+	count, err = coll.Find(`{"category":"x","tags":"b"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count, "d1 must still match (category=x, tags=b)")
+
+	// And the colliding tag value "c" (which only d2 had) must NOT match
+	// anything — confirming d2 left no trace.
+	count, err = coll.Find(`{"category":"x","tags":"c"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count,
+		"tag 'c' belonged only to the rolled-back d2 — must match nothing")
+}
+
+// TestAudit13_UniqueCompoundArray_DifferentCategoriesNoCollide: d1 (x,[b])
+// + d2 (y,[b]). Different category → the compound prefix differs ((x,b) vs
+// (y,b)) so the unique seek for d2's (y,b) finds nothing matching the
+// (y,b) prefix → no conflict. Both succeed.
+func TestAudit13_UniqueCompoundArray_DifferentCategoriesNoCollide(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit13_diff_categories")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_cat_tags",
+		Fields: []string{"category", "tags"},
+		Unique: true,
+	}))
+
+	// d1: (x, ["b"]) → entries (x,b,d1), (x,["b"],d1) = 2
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","category":"x","tags":["b"]}`)))
+	// d2: (y, ["b"]) → entries (y,b,d2), (y,["b"],d2) = 2.
+	// Same tag value "b" but different leading "y" — unique tuple is the
+	// FULL compound (category, tag), so no conflict.
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d2","category":"y","tags":["b"]}`)))
+
+	assertCollCount(t, coll, 2)
+	idx := coll.GetIndexes()[0]
+	// 2 entries per doc * 2 docs = 4 entries.
+	assertIndexLen(t, idx, 4)
+
+	// Verify both docs are queryable by the shared tag value, distinguished
+	// by category.
+	count, err := coll.Find(`{"category":"x","tags":"b"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count, "(category=x, tags=b) must match only d1")
+	count, err = coll.Find(`{"category":"y","tags":"b"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count, "(category=y, tags=b) must match only d2")
+}
+
+// TestAudit13_UniqueCompoundArray_IdempotentSelfReinsert exercises the
+// `continue` branch in insertKeys (seekBuf == fullKeyBuf path).
+//
+// Two-pronged coverage:
+//
+//  1. User-facing UpdateOne(d1) -> d1 with same data. The collection.update
+//     fast-path short-circuits via anyencutil.Equal BEFORE insertKeys runs,
+//     so the operation is a no-op. We assert it succeeds and changes
+//     nothing — entry count unchanged, every entry still IndexValueMultiKey.
+//
+//  2. Direct double insertKeys() in a single write-tx. This is the only way
+//     to actually reach the `continue` branch — second invocation finds the
+//     existing entry whose (key, docId) matches fullKeyBuf bytewise and
+//     skips the Put without erroring.
+func TestAudit13_UniqueCompoundArray_IdempotentSelfReinsert(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit13_idempotent")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_cat_tags",
+		Fields: []string{"category", "tags"},
+		Unique: true,
+	}))
+
+	docJSON := `{"id":"d1","category":"x","tags":["a","b"]}`
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(docJSON)))
+
+	idx := coll.GetIndexes()[0]
+	// 3 entries: (x,a), (x,b), (x,["a","b"]).
+	assertIndexLen(t, idx, 3)
+
+	preEntries := readRawIndexEntries(t, fx.DB, "audit13_idempotent", "ix_cat_tags")
+	require.Len(t, preEntries, 3)
+	for i, e := range preEntries {
+		require.Equalf(t, qplanner.IndexValueMultiKey, e.Value,
+			"pre-update entry %d must already be IndexValueMultiKey "+
+				"(array dimension >1 keysBuf entries)", i)
+	}
+
+	// === Prong 1: UpdateOne to itself ===
+	// collection.update short-circuits on anyencutil.Equal BEFORE insertKeys,
+	// so this is effectively a no-op — but the public contract is that it
+	// MUST succeed without raising ErrUniqueConstraint.
+	require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(docJSON)),
+		"updating d1 to identical data must succeed (short-circuit, no error)")
+
+	// Entry count unchanged.
+	assertIndexLen(t, idx, 3)
+
+	postEntries := readRawIndexEntries(t, fx.DB, "audit13_idempotent", "ix_cat_tags")
+	require.Len(t, postEntries, 3,
+		"self-update must not alter the index entry count")
+
+	// Every post-update entry must still carry IndexValueMultiKey, and the
+	// raw bytes must match the pre-update snapshot exactly (no churn).
+	for i, e := range postEntries {
+		assert.Equalf(t, qplanner.IndexValueMultiKey, e.Value,
+			"post-update entry %d must still be IndexValueMultiKey", i)
+		assert.Equalf(t, preEntries[i].Key, e.Key,
+			"entry %d key changed across self-update", i)
+		assert.Equalf(t, preEntries[i].Value, e.Value,
+			"entry %d value changed across self-update", i)
+	}
+
+	// === Prong 2: Directly invoke insertKeys twice in one tx ===
+	// This actually exercises the `continue` branch. We re-fetch the index
+	// pointer because GetIndexes() returns the public Index interface; we
+	// need the concrete *index for insertKeys.
+	idxImpl := idx.(*index)
+	it, itErr := newItem(anyenc.MustParseJson(docJSON))
+	require.NoError(t, itErr)
+
+	wrTx, err := coll.WriteTx(ctx)
+	require.NoError(t, err)
+	btWtx := wrTx.btreeWriteTx()
+
+	// First call: would normally fail because the entries already exist
+	// — but the unique check sees seekBuf == fullKeyBuf for the SAME docId
+	// and takes `continue` instead of returning ErrUniqueConstraint.
+	require.NoError(t, idxImpl.insertKeys(btWtx, it),
+		"re-inserting the same (key, docId) tuples must hit `continue`, "+
+			"not raise ErrUniqueConstraint")
+
+	// Second consecutive call inside the same tx — still idempotent.
+	require.NoError(t, idxImpl.insertKeys(btWtx, it),
+		"second back-to-back insertKeys must also be a no-op via `continue`")
+
+	// Namespace count must still be exactly 3 — no duplicates were added.
+	count, err := btWtx.Count(idxImpl.ns)
+	require.NoError(t, err)
+	assert.Equal(t, 3, count,
+		"idempotent re-insert(s) must not add any duplicate index rows")
+
+	require.NoError(t, wrTx.Rollback())
+}
+
+// TestAudit13_UniqueCompoundArray_QueryFindByElement: insert d1, query
+// Find({category:"x", tags:"a"}) → 1 doc; Find({category:"x", tags:"b"}) →
+// 1 doc (same d1). Confirms the unique compound + array index is queryable
+// per-element via the standard Find pipeline.
+func TestAudit13_UniqueCompoundArray_QueryFindByElement(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "audit13_query")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "ix_cat_tags",
+		Fields: []string{"category", "tags"},
+		Unique: true,
+	}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"d1","category":"x","tags":["a","b"]}`)))
+
+	// Query by first array element.
+	count, err := coll.Find(`{"category":"x","tags":"a"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count,
+		"Find({category:x, tags:a}) must match d1 via the (x,a,d1) index entry")
+
+	// Query by second array element — must match the SAME d1.
+	count, err = coll.Find(`{"category":"x","tags":"b"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, count,
+		"Find({category:x, tags:b}) must match d1 via the (x,b,d1) index entry")
+
+	// Query by tag NOT present on d1 — must match nothing.
+	count, err = coll.Find(`{"category":"x","tags":"z"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count, "no doc has tags='z'")
+
+	// Query by present tag but wrong category — compound prefix mismatch.
+	count, err = coll.Find(`{"category":"y","tags":"a"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count,
+		"compound (category=y, tags=a) does not match d1's (x,a) tuple")
 }
