@@ -28,8 +28,14 @@ func (it *VerifyIter) Next() (key []byte, docId []byte, multiKey bool, err error
 		// Build verification key: prefix + docId
 		it.keyBuf = append(it.keyBuf[:0], it.Prefix...)
 		it.keyBuf = append(it.keyBuf, docId...)
-		_, gerr := it.Tx.Get(it.VerifyNs, it.keyBuf)
-		if gerr == nil {
+		// Use tx.Has — existence-only probe, no value-buffer allocation
+		// per successful match (vs. tx.Get, which copies cell.value into
+		// a fresh slice that we'd discard anyway).
+		found, gerr := it.Tx.Has(it.VerifyNs, it.keyBuf)
+		if gerr != nil {
+			return nil, nil, false, gerr
+		}
+		if found {
 			return key, docId, multiKey, nil // verified!
 		}
 		// Not found in verification index → skip this candidate

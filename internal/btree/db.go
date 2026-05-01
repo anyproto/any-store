@@ -1322,16 +1322,46 @@ func (tx *ReadTx) Get(ns *Namespace, key []byte) ([]byte, error) {
 	return tx.AppendValue(ns, key, nil)
 }
 
-// Has checks if a key exists in the given namespace.
+// Has reports whether key exists in ns. Equivalent to tx.Get(ns, key)
+// returning a non-ErrKeyNotFound result, but never reads the cell value
+// — no parseLeafCellWithSize, no value-buffer allocation. Mirrors
+// SQLite's sqlite3BtreeIndexMoveto + (*pRes==0) idiom (btree.c:6024),
+// minus the cursor: we use the same cursor-free per-call descent
+// established by AppendValue and AppendSeekKey.
 func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
-	_, err := tx.Get(ns, key)
+	if tx.closed {
+		return false, ErrTxClosed
+	}
+	pg, err := tx.txGetPage(ns.rootPage)
 	if err != nil {
-		if errors.Is(err, ErrKeyNotFound) {
-			return false, nil
-		}
 		return false, err
 	}
-	return true, nil
+
+	usableSize := tx.pager.usableSize()
+	for {
+		if pg.header.isLeaf() {
+			_, found, serr := searchLeafWithOverflow(
+				pg, key, usableSize, tx.pager, tx.walHdr.mxFrame, tx.cache,
+			)
+			tx.pager.releasePage(pg)
+			if serr != nil {
+				return false, serr
+			}
+			return found, nil
+		}
+		childPgno, _, serr := searchInteriorWithOverflow(
+			pg, key, usableSize, tx.pager, tx.walHdr.mxFrame, tx.cache,
+		)
+		if serr != nil {
+			tx.pager.releasePage(pg)
+			return false, serr
+		}
+		tx.pager.releasePage(pg)
+		pg, err = tx.txGetPage(childPgno)
+		if err != nil {
+			return false, err
+		}
+	}
 }
 
 // SeekKey finds the first key >= prefix in ns and returns it.

@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -325,6 +326,128 @@ func TestHas(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, has)
 	require.NoError(t, tx.Commit())
+}
+
+// TestReadTx_Has_NoValueAlloc pins the alloc-free guarantee of the
+// rewritten Has — a hot-cache existence probe must not allocate. If a
+// future change reintroduces a per-call alloc (e.g. wrapping Has in a
+// checksum-scratch layer that allocs a buffer), this test fails.
+func TestReadTx_Has_NoValueAlloc(t *testing.T) {
+	db := tempDB(t)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("data")
+	require.NoError(t, err)
+	for i := range 100 {
+		k := fmt.Appendf(nil, "key-%05d", i)
+		v := fmt.Appendf(nil, "val-%05d", i)
+		require.NoError(t, tx.Put(ns, k, v))
+	}
+	require.NoError(t, tx.Commit())
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+	ns2, _ := db.getNamespaceLocked("data")
+
+	probe := []byte("key-00050")
+	// Warm: load pages into pcache.
+	for range 10 {
+		_, err := rtx.Has(ns2, probe)
+		require.NoError(t, err)
+	}
+
+	allocs := testing.AllocsPerRun(100, func() {
+		_, _ = rtx.Has(ns2, probe)
+	})
+	assert.Zero(t, allocs, "tx.Has must not allocate on hot cache")
+}
+
+// TestReadTx_Has_NotFound pins (false, nil) for missing keys via ReadTx.
+func TestReadTx_Has_NotFound(t *testing.T) {
+	db, ns := tempDBWithNS(t, "data")
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns, []byte("a"), []byte("1")))
+	require.NoError(t, wtx.Put(ns, []byte("c"), []byte("3")))
+	require.NoError(t, wtx.Commit())
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+	ns2, _ := db.getNamespaceLocked("data")
+
+	has, err := rtx.Has(ns2, []byte("b"))
+	require.NoError(t, err)
+	assert.False(t, has)
+
+	has, err = rtx.Has(ns2, []byte("a"))
+	require.NoError(t, err)
+	assert.True(t, has)
+}
+
+// TestReadTx_Has_OverflowKey exercises the overflow-key compare path in
+// searchLeafWithOverflow — the same descent helper AppendValue uses for
+// overflow keys, now exercised through Has.
+func TestReadTx_Has_OverflowKey(t *testing.T) {
+	db := tempDBWithPageSize(t, 512)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("t1")
+	require.NoError(t, err)
+
+	bigKey := bytes.Repeat([]byte("k"), 200)
+	require.NoError(t, tx.Put(ns, bigKey, make([]byte, 400)))
+	require.NoError(t, tx.Commit())
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	has, err := rtx.Has(ns, bigKey)
+	require.NoError(t, err)
+	assert.True(t, has, "overflow key must be findable via Has")
+
+	// Different long key that doesn't exist.
+	otherBig := bytes.Repeat([]byte("z"), 200)
+	has, err = rtx.Has(ns, otherBig)
+	require.NoError(t, err)
+	assert.False(t, has)
+}
+
+// TestReadTx_Has_MultiLevelDescent exercises Has on a tree tall enough to
+// require interior-page descent (not just a single leaf). Pins that the
+// interior loop and page-release pairing are correct.
+func TestReadTx_Has_MultiLevelDescent(t *testing.T) {
+	db := tempDBWithPageSize(t, 512)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("data")
+	require.NoError(t, err)
+	// Enough keys to force at least one split. With 512-byte pages and
+	// ~30-byte values, ~50+ keys forces an interior page.
+	const n = 200
+	for i := range n {
+		k := fmt.Appendf(nil, "key-%05d", i)
+		v := bytes.Repeat([]byte{byte(i % 253)}, 30)
+		require.NoError(t, tx.Put(ns, k, v))
+	}
+	require.NoError(t, tx.Commit())
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+	ns2, _ := db.getNamespaceLocked("data")
+
+	for i := range n {
+		k := fmt.Appendf(nil, "key-%05d", i)
+		has, err := rtx.Has(ns2, k)
+		require.NoError(t, err)
+		assert.True(t, has, "key-%05d must exist", i)
+	}
+	has, err := rtx.Has(ns2, []byte("key-99999"))
+	require.NoError(t, err)
+	assert.False(t, has)
 }
 
 func TestMultipleKeys(t *testing.T) {
