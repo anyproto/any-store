@@ -3,7 +3,7 @@ package anystore
 import (
 	"os"
 
-	"github.com/anyproto/any-store/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
 var (

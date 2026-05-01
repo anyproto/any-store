@@ -13,10 +13,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/internal/btree"
-	"github.com/anyproto/any-store/internal/objectid"
-	"github.com/anyproto/any-store/query"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/objectid"
+	"github.com/anyproto/any-store/v2/query"
 )
 
 func TestCollection_Drop(t *testing.T) {

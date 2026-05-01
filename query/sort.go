@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 func MustParseSort(sorts ...any) Sort {

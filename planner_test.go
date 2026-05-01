@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 // --- from planner_selection_test.go ---

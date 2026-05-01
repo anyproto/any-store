@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"slices"
 
-	"github.com/anyproto/any-store/query"
-	"github.com/anyproto/any-store/syncpool"
+	"github.com/anyproto/any-store/v2/query"
+	"github.com/anyproto/any-store/v2/syncpool"
 )
 
 // SortIter collects all results from the source iterator, fetches documents,

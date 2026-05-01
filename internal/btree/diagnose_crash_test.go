@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 // TestDiagnoseCrashCorruption opens a corrupted DB and examines its structure.

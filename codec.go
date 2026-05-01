@@ -1,6 +1,6 @@
 package anystore
 
-import "github.com/anyproto/any-store/internal/btree"
+import "github.com/anyproto/any-store/v2/internal/btree"
 
 // Codec is the pluggable page-encryption interface. Implement this to
 // provide a custom AEAD (HSM-backed, external key management, or any

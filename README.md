@@ -1,11 +1,11 @@
 # Any Store
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/anyproto/any-store.svg)](https://pkg.go.dev/github.com/anyproto/any-store)
-[![Go Report Card](https://goreportcard.com/badge/github.com/anyproto/any-store)](https://goreportcard.com/report/github.com/anyproto/any-store)
+[![Go Reference](https://pkg.go.dev/badge/github.com/anyproto/any-store/v2.svg)](https://pkg.go.dev/github.com/anyproto/any-store/v2)
+[![Go Report Card](https://goreportcard.com/badge/github.com/anyproto/any-store/v2)](https://goreportcard.com/report/github.com/anyproto/any-store/v2)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A **document‑oriented database** with a MongoDB‑like query language, running on top of a single SQLite file.
-Any Store brings schema‑less flexibility, rich indexes and ACID transactions to embedded Go applications.
+A **document‑oriented database** with a MongoDB‑like query language, built on an embedded Go btree/pager/wal storage engine derived from SQLite (with intentional drifts — not a literal port, and the on-disk format is our own).
+Any Store brings schema‑less flexibility, rich indexes, ACID transactions, page-level integrity and optional encryption to embedded Go applications — pure Go, no CGO.
 
 > ⚠️ **Status:** pre‑1.0 – APIs may change. We actively dog‑food the library in production and welcome early adopters & contributors.
 
@@ -17,6 +17,7 @@ Any Store brings schema‑less flexibility, rich indexes and ACID transactions t
 * **ACID transactions** – explicit read / write transactions plus convenience helpers.
 * **Streaming iterators** – low‑memory scans with cursor API.
 * **Durability** – db flush and protections mechanisms in case of power-loss.
+* **Integrity & encryption** – per-page XXH3-128 checksums by default; optional AES-GCM or ChaCha20-Poly1305 (AEAD doubles as integrity).
 * **CLI** – quick inspection, import/export and interactive shell.
 * **Cross‑platform** – pure Go, no CGO, runs anywhere Go runs.
 
@@ -26,13 +27,13 @@ Any Store brings schema‑less flexibility, rich indexes and ACID transactions t
 ### Install library
 
 ```bash
-go get github.com/anyproto/any-store
+go get github.com/anyproto/any-store/v2
 ```
 
 ### Install CLI (optional)
 
 ```bash
-go install github.com/anyproto/any-store/cmd/any-store-cli@latest
+go install github.com/anyproto/any-store/v2/cmd/any-store-cli@latest
 ```
 
 ### Hello, Any Store
@@ -45,8 +46,8 @@ import (
     "fmt"
     "log"
 
-    anystore "github.com/anyproto/any-store"
-    "github.com/anyproto/any-store/anyenc"
+    anystore "github.com/anyproto/any-store/v2"
+    "github.com/anyproto/any-store/v2/anyenc"
 )
 
 func main() {
@@ -73,12 +74,12 @@ func main() {
 }
 ```
 
-The full end‑to‑end example lives in [`example/`](example) and in the [API docs](https://pkg.go.dev/github.com/anyproto/any-store).
+The full end‑to‑end example lives in [`example/`](example) and in the [API docs](https://pkg.go.dev/github.com/anyproto/any-store/v2).
 
 
 ## Documentation
 
-* **API reference** – [https://pkg.go.dev/github.com/anyproto/any-store](https://pkg.go.dev/github.com/anyproto/any-store)
+* **API reference** – [https://pkg.go.dev/github.com/anyproto/any-store/v2](https://pkg.go.dev/github.com/anyproto/any-store/v2)
 * **CLI manual** – `any-store-cli --help`
 
 
@@ -87,9 +88,9 @@ The full end‑to‑end example lives in [`example/`](example) and in the [API 
 | Layer               | Responsibility                                                             |
 | ------------------- | -------------------------------------------------------------------------- |
 | **Query builder**   | Parses Mongo‑like JSON filters and modifiers                               |
-| **Index engine**    | Generates composite SQLite indexes, picks optimal index via cost estimator |
+| **Index engine**    | Generates composite indexes, picks optimal index via cost estimator        |
 | **Encoding arena**  | Efficient [AnyEnc](anyenc) value arena to minimise GC churn                |
-| **Connection pool** | Separate read / write SQLite connections for concurrent workloads          |
+| **Connection pool** | Separate read / write engine handles for concurrent workloads              |
 
 
 ## Durability
@@ -146,7 +147,7 @@ fmt.Printf("scanned %d pages, %d errors\n", rep.Pages, len(rep.Errors))
 ```
 
 Page-1 DB header (first 100 bytes) is not covered by the per-page hash;
-SQLite-format invariants there are validated separately at open.
+header invariants there are validated separately at open.
 See [docs/btree/specs/integrity.md](docs/btree/specs/integrity.md) for the full design.
 
 

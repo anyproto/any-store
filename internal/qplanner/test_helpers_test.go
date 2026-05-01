@@ -6,8 +6,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/internal/btree"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
 // closeTrackingIter is a minimal Iterator whose Close call is observable.

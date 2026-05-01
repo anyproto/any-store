@@ -3,7 +3,7 @@ package anyencutil
 import (
 	"bytes"
 
-	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 type Value struct {

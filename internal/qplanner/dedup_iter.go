@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/query"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
 )
 
 // CanonicalKeyDedupIter removes duplicate document emissions that result

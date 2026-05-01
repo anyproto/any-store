@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 // IndexFieldFilter specifies a single field to check from the compound index key.

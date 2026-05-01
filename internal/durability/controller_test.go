@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/anyproto/any-store/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
 type mockTracker struct {

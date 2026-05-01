@@ -7,8 +7,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/query"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
 )
 
 // fakeIter is a minimal Iterator used to feed canned (key, docId) hits.

@@ -6,7 +6,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	anystore "github.com/anyproto/any-store"
+	anystore "github.com/anyproto/any-store/v2"
 )
 
 var ctx = context.Background()

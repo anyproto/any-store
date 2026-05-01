@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/anyproto/any-store/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
 // FlushMode represents how to flush data during idle periods

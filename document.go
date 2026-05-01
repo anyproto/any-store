@@ -1,7 +1,7 @@
 package anystore
 
 import (
-	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 // Doc represents a document in the collection.

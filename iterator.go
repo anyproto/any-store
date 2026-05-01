@@ -5,10 +5,10 @@ import (
 	"io"
 	"time"
 
-	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/internal/btree"
-	"github.com/anyproto/any-store/internal/qplanner"
-	"github.com/anyproto/any-store/syncpool"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/qplanner"
+	"github.com/anyproto/any-store/v2/syncpool"
 )
 
 // Iterator represents an iterator over query results.

@@ -11,7 +11,7 @@ import (
 	"syscall/js"
 	"time"
 
-	anystore "github.com/anyproto/any-store"
+	anystore "github.com/anyproto/any-store/v2"
 )
 
 // ---------------------------------------------------------------------------

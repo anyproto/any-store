@@ -8,8 +8,8 @@ import (
 
 	"github.com/valyala/fastjson"
 
-	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/syncpool"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/syncpool"
 )
 
 type Filter interface {

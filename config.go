@@ -3,8 +3,8 @@ package anystore
 import (
 	"time"
 
-	"github.com/anyproto/any-store/internal/btree"
-	"github.com/anyproto/any-store/internal/durability"
+	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/durability"
 )
 
 // InitPageBuffer pre-allocates a global pool of nPages page-sized buffers.

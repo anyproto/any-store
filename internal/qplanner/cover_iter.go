@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/anyproto/any-store/query"
+	"github.com/anyproto/any-store/v2/query"
 )
 
 // CoverIter handles fixed-point lookups where Start == End in bounds.

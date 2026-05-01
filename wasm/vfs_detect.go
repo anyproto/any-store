@@ -6,7 +6,7 @@ import (
 	"io/fs"
 	"syscall/js"
 
-	anystore "github.com/anyproto/any-store"
+	anystore "github.com/anyproto/any-store/v2"
 )
 
 // VFS backend name constants.

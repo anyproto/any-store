@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/anyproto/any-store/syncpool"
+	"github.com/anyproto/any-store/v2/syncpool"
 )
 
 func copyItem(buf *syncpool.DocBuffer, it item) item {

@@ -3,7 +3,7 @@ package anystore
 import (
 	"context"
 
-	"github.com/anyproto/any-store/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
 // Page-level integrity is enabled automatically for non-encrypted databases:

@@ -7,10 +7,10 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/internal/btree"
-	"github.com/anyproto/any-store/query"
-	"github.com/anyproto/any-store/syncpool"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/query"
+	"github.com/anyproto/any-store/v2/syncpool"
 )
 
 // fieldSelEntry holds per-field selectivity from single-field index sketches.

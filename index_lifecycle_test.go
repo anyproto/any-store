@@ -12,8 +12,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/internal/qplanner"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/qplanner"
 )
 
 // --- from index_collection_lifecycle_test.go ---

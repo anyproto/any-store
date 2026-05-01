@@ -11,12 +11,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/internal/btree"
-	"github.com/anyproto/any-store/internal/durability"
-	"github.com/anyproto/any-store/internal/durability/sentinel"
-	"github.com/anyproto/any-store/internal/objectid"
-	"github.com/anyproto/any-store/syncpool"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/durability"
+	"github.com/anyproto/any-store/v2/internal/durability/sentinel"
+	"github.com/anyproto/any-store/v2/internal/objectid"
+	"github.com/anyproto/any-store/v2/syncpool"
 )
 
 const systemNamespace = "_system"

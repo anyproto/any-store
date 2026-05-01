@@ -17,7 +17,7 @@ func printVersion() {
 	anyStoreVersion := "unknown"
 
 	for _, dep := range info.Deps {
-		if dep.Path == "github.com/anyproto/any-store" {
+		if dep.Path == "github.com/anyproto/any-store/v2" {
 			anyStoreVersion = dep.Version
 			if dep.Replace != nil {
 				if dep.Replace.Version != "" {

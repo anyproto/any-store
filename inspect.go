@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/anyproto/any-store/internal/btree"
-	"github.com/anyproto/any-store/internal/qplanner"
+	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/qplanner"
 )
 
 // IndexSketchInspector exposes decoded sketch state for diagnostic and test

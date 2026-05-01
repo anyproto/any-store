@@ -4,7 +4,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/anyproto/any-store/internal/qplanner"
+	"github.com/anyproto/any-store/v2/internal/qplanner"
 )
 
 // PipelinePerfCounters aggregates iterator and Doc() fallback profiling counters.

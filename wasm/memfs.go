@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	anystore "github.com/anyproto/any-store"
+	anystore "github.com/anyproto/any-store/v2"
 )
 
 // MemFS implements a purely in-memory filesystem.

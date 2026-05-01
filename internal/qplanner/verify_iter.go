@@ -3,7 +3,7 @@ package qplanner
 import (
 	"fmt"
 
-	"github.com/anyproto/any-store/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
 // VerifyIter wraps an index-yielding iterator and verifies each candidate docId
