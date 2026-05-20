@@ -36,3 +36,13 @@ func ResetVFS() {
 	osRemove = defaultRemove
 	fdatasync = defaultFdatasync
 }
+
+// ResetOpenRegistry clears the process-global registry of open databases.
+// Tests that simulate process crashes (where Close is intentionally skipped)
+// use this to allow a subsequent Open of the same file to succeed.
+func ResetOpenRegistry() {
+	openDBs.Range(func(k, _ any) bool {
+		openDBs.Delete(k)
+		return true
+	})
+}

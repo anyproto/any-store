@@ -24,3 +24,9 @@ func SetVFS(vfs VFS) { btree.SetVFS(vfs) }
 // ResetVFS restores defaults. Panics unless built with -tags vfs
 // or GOOS=js GOARCH=wasm.
 func ResetVFS() { btree.ResetVFS() }
+
+// ResetOpenRegistry clears the process-global registry of open databases.
+// Tests that simulate process crashes (where Close is intentionally skipped)
+// call this to allow a subsequent Open of the same file to succeed.
+// Panics unless built with -tags vfs or GOOS=js GOARCH=wasm.
+func ResetOpenRegistry() { btree.ResetOpenRegistry() }

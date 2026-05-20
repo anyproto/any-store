@@ -24,3 +24,9 @@ func SetVFS(_ VFS) {
 func ResetVFS() {
 	panic("btree: ResetVFS requires building with -tags vfs or GOOS=js GOARCH=wasm")
 }
+
+// ResetOpenRegistry clears the process-global registry of open databases.
+// Panics unless built with -tags vfs or GOOS=js GOARCH=wasm.
+func ResetOpenRegistry() {
+	panic("btree: ResetOpenRegistry requires building with -tags vfs or GOOS=js GOARCH=wasm")
+}
