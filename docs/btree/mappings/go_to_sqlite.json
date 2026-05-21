@@ -1162,6 +1162,10 @@
     "sqlite": [],
     "note": ""
   },
+  "osfuncs.go:ResetOpenRegistry": {
+    "sqlite": [],
+    "note": "any-store VFS build-tag stub"
+  },
   "osfuncs.go:ResetVFS": {
     "sqlite": [],
     "note": "any-store VFS build-tag stub"
@@ -1181,6 +1185,10 @@
   "osfuncs_sync_other.go:fdatasync": {
     "sqlite": [],
     "note": "non-Linux/non-vfs fallback wrapping os.File.Sync (portability shim, no direct SQLite origin)"
+  },
+  "osfuncs_vfs.go:ResetOpenRegistry": {
+    "sqlite": [],
+    "note": "any-store test hook to clear the process-global open-DB registry (crash-simulation tests skip Close)"
   },
   "osfuncs_vfs.go:ResetVFS": {
     "sqlite": [],
