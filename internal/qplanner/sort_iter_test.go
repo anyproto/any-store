@@ -1,7 +1,10 @@
 package qplanner
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
+	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -149,6 +152,207 @@ func TestSortIter_GrowArena_LargeNeed(t *testing.T) {
 	it.growArena(need)
 	assert.GreaterOrEqual(t, cap(it.arena), need,
 		"growArena must accommodate a very large need")
+}
+
+// sortKeyOf builds the exact composite key SortIter materializes for a doc:
+// the packed sort key (honoring asc/desc bit-inversion) followed by the docId
+// bytes as a tiebreaker. The reference oracle below sorts by this same key, so
+// the test validates the arena/heap/slot-reuse/compaction machinery rather than
+// the (shared) key encoding.
+func sortKeyOf(t *testing.T, srt query.Sort, doc *anyenc.Value, docId []byte) []byte {
+	t.Helper()
+	k := srt.AppendKey(nil, doc)
+	k = append(k, docId...)
+	return k
+}
+
+// runVarLenSort feeds specs (in the given upstream order) through SortIter with
+// the given TopK and sort, and returns the emitted docIds in order.
+func runVarLenSort(t *testing.T, srt query.Sort, topK int, ids []string, docs []*anyenc.Value, docIds [][]byte) [][]byte {
+	t.Helper()
+	plan := &Plan{}
+	hits := make([]fakeHit, len(ids))
+	for i := range ids {
+		hits[i] = fakeHit{key: docIds[i], docId: docIds[i], doc: docs[i]}
+	}
+	src := &fakeIter{plan: plan, hits: hits}
+	it := &SortIter{
+		Source: src,
+		Sorter: srt,
+		Plan:   plan,
+		TopK:   topK,
+	}
+	defer it.Close()
+	var got [][]byte
+	for {
+		_, docId, _, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		cp := make([]byte, len(docId))
+		copy(cp, docId)
+		got = append(got, cp)
+	}
+	return got
+}
+
+// referenceWindow computes the expected docId window: sort all specs by the
+// composite (packed-key, docId) ordering, then take [offset, offset+limit).
+// When limit<=0 it returns the full sorted order.
+func referenceWindow(t *testing.T, srt query.Sort, docs []*anyenc.Value, docIds [][]byte, offset, limit int) [][]byte {
+	t.Helper()
+	type kd struct {
+		key   []byte
+		docId []byte
+	}
+	all := make([]kd, len(docs))
+	for i := range docs {
+		all[i] = kd{key: sortKeyOf(t, srt, docs[i], docIds[i]), docId: docIds[i]}
+	}
+	sort.Slice(all, func(i, j int) bool { return bytes.Compare(all[i].key, all[j].key) < 0 })
+	var out [][]byte
+	end := len(all)
+	if limit > 0 && offset+limit < end {
+		end = offset + limit
+	}
+	for i := offset; i < end; i++ {
+		out = append(out, all[i].docId)
+	}
+	return out
+}
+
+// TestSortIter_TopK_ArenaBounding_VarLen is the core correctness test for the
+// arena-bounding fix. It drives SortIter with VARIABLE-LENGTH packed keys and
+// docIds across several adversarial upstream orders, and asserts the emitted
+// window matches an independent full-sort oracle. The variable lengths exercise
+// every new code path: exact-size free-slot reuse, append-on-miss, and (in the
+// strictly-descending all-distinct-length case at scale) the compaction guard.
+func TestSortIter_TopK_ArenaBounding_VarLen(t *testing.T) {
+	arena := &anyenc.Arena{}
+	// mkRow builds {"v": value-string} and an id-encoded docId. The sort field
+	// is "v"; docIds are derived from the row index so they are unique and of
+	// varying byte length.
+	mkRow := func(vlen, idx int) (*anyenc.Value, []byte) {
+		o := arena.NewObject()
+		// value string of length vlen, content derived from idx so distinct
+		// rows get distinct (and order-meaningful) keys.
+		vb := make([]byte, vlen)
+		for i := range vb {
+			vb[i] = byte('a' + (idx+i)%26)
+		}
+		o.Set("v", arena.NewStringBytes(vb))
+		docId := anyenc.AppendAnyValue(nil, fmt.Sprintf("doc-%d", idx))
+		return o, docId
+	}
+
+	ascSort := query.MustParseSort("v")
+	descSort := query.MustParseSort("-v")
+
+	type genMode int
+	const (
+		shuffled genMode = iota
+		descending
+		ascending
+		fixedLen
+	)
+
+	build := func(n int, mode genMode) (docs []*anyenc.Value, docIds [][]byte) {
+		docs = make([]*anyenc.Value, n)
+		docIds = make([][]byte, n)
+		for i := 0; i < n; i++ {
+			var vlen, idx int
+			switch mode {
+			case descending:
+				// strictly descending key with all-distinct lengths: forces
+				// free-list misses + appends + compaction at scale.
+				vlen = 4 + (n - i) // distinct lengths, decreasing content
+				idx = n - i
+			case ascending:
+				vlen = 4 + i
+				idx = i
+			case fixedLen:
+				// all-equal lengths: maximizes exact-size free-slot reuse.
+				vlen = 12
+				idx = (i * 7919) % n // pseudo-shuffle of content
+			default: // shuffled
+				vlen = 4 + (i*131)%40
+				idx = (i * 2654435761) % n
+			}
+			docs[i], docIds[i] = mkRow(vlen, idx)
+		}
+		return docs, docIds
+	}
+
+	cases := []struct {
+		name   string
+		n      int
+		offset int
+		limit  int
+		mode   genMode
+		sort   query.Sort
+	}{
+		{"asc_shuffled_lim100", 5000, 0, 100, shuffled, ascSort},
+		{"desc_shuffled_lim100", 5000, 0, 100, shuffled, descSort},
+		{"asc_limoff", 5000, 1000, 10, shuffled, ascSort},
+		{"desc_limoff", 5000, 1000, 10, shuffled, descSort},
+		{"fixedlen_reuse_lim50", 8000, 0, 50, fixedLen, ascSort},
+		// strictly descending, all-distinct lengths, large N + small K → the
+		// arena would balloon under append-only placement; this is the case
+		// the compaction guard is built for. Larger N to clear the 64KiB gate.
+		{"descending_compaction", 40000, 0, 20, descending, ascSort},
+		{"ascending_compaction", 40000, 0, 20, ascending, descSort},
+		// TopK larger than N → all rows retained, must equal full sort.
+		{"topk_gt_n", 50, 0, 200, shuffled, ascSort},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			docs, docIds := build(tc.n, tc.mode)
+			ids := make([]string, tc.n)
+			// The planner passes TopK = Limit+Offset; SortIter retains and emits
+			// exactly that many smallest entries (the downstream LimitIter applies
+			// the offset-skip + limit-cap). So the oracle is the first TopK of the
+			// full sort. This pins the "retain LIMIT+OFFSET, not just LIMIT" rule.
+			topK := tc.limit + tc.offset
+			got := runVarLenSort(t, tc.sort, topK, ids, docs, docIds)
+			want := referenceWindow(t, tc.sort, docs, docIds, 0, topK)
+			require.Equal(t, len(want), len(got), "result count")
+			for i := range want {
+				assert.Truef(t, bytes.Equal(want[i], got[i]),
+					"row %d mismatch: want %x got %x", i, want[i], got[i])
+			}
+		})
+	}
+}
+
+// TestSortIter_FullSort_NoLimit_Unchanged pins that the TopK<=0 path still
+// materializes and sorts ALL rows (behavior unchanged by the arena-bounding
+// fix), including with variable-length keys.
+func TestSortIter_FullSort_NoLimit_Unchanged(t *testing.T) {
+	arena := &anyenc.Arena{}
+	n := 2000
+	docs := make([]*anyenc.Value, n)
+	docIds := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		o := arena.NewObject()
+		vlen := 3 + (i*97)%50
+		vb := make([]byte, vlen)
+		for j := range vb {
+			vb[j] = byte('a' + (i+j)%26)
+		}
+		o.Set("v", arena.NewStringBytes(vb))
+		docs[i] = o
+		docIds[i] = anyenc.AppendAnyValue(nil, fmt.Sprintf("d%d", i))
+	}
+	srt := query.MustParseSort("v")
+	ids := make([]string, n)
+	got := runVarLenSort(t, srt, 0 /* full sort */, ids, docs, docIds)
+	want := referenceWindow(t, srt, docs, docIds, 0, 0)
+	require.Equal(t, len(want), len(got))
+	for i := range want {
+		assert.Truef(t, bytes.Equal(want[i], got[i]), "row %d mismatch", i)
+	}
 }
 
 // multikeyHit is a fakeHit-like struct for the multi-key sort test that

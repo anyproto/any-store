@@ -2,6 +2,7 @@ package qplanner
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"slices"
 
@@ -13,6 +14,20 @@ import (
 // computes sort keys, sorts in memory, then yields results in sorted order.
 // When TopK > 0, uses a max-heap of size TopK to keep only the smallest K entries,
 // reducing sort from O(N log N) to O(N log K) and memory from O(N) to O(K) entries.
+//
+// Arena bounding: a row's packed sort-key + docId is built in the arena's spare
+// tail capacity and kept ONLY when the row enters/stays in the top-K heap
+// (matching SQLite's pushOntoSorter in select.c, which inserts a record into the
+// sorter AFTER the LIMIT eviction so "loser" rows are never materialized;
+// vdbesort.c notes the sorter holds <= LIMIT+OFFSET records). A losing row
+// simply truncates the tail back — zero retained bytes, zero allocation. When a
+// smaller row evicts the heap root and the root's vacated slot is exactly the
+// new row's size, the row overwrites that slot in place (reuse, no growth);
+// otherwise the row stays at the tail and the root's bytes become dead, later
+// reclaimed by a compaction guard that rebuilds the arena from the live entries
+// when fragmentation grows large. This keeps the arena's high-water mark O(K)
+// without any per-eviction memmove. With TopK <= 0 (full sort) every row is
+// materialized, as before.
 type SortIter struct {
 	Source  Iterator
 	Data    *CursorSource
@@ -23,6 +38,11 @@ type SortIter struct {
 	arena   []byte
 	entries []sortEntry
 	idx     int
+	// liveBytes is the sum of keyLen over the entries currently in the heap.
+	// Used by the compaction guard to detect when arena waste (dead bytes left
+	// by evicted entries whose slot could not be reused in place) is large.
+	liveBytes int
+	order     []int // reusable scratch: live-entry indices sorted by arena offset (compaction)
 	PartiallySorted bool // leading index fields match sort order; pdqsort benefits automatically
 	inited          bool
 }
@@ -82,7 +102,7 @@ func (it *SortIter) growArena(need int) {
 }
 
 func (it *SortIter) collectAndSort() error {
-	cmp := func(a, b sortEntry) int {
+	cmpEntry := func(a, b sortEntry) int {
 		ak := it.arena[a.off : a.off+uint32(a.keyLen)]
 		bk := it.arena[b.off : b.off+uint32(b.keyLen)]
 		return bytes.Compare(ak, bk)
@@ -113,34 +133,114 @@ func (it *SortIter) collectAndSort() error {
 			}
 		}
 
-		it.growArena(256)
-		off := uint32(len(it.arena))
-		it.arena = it.Sorter.AppendKey(it.arena, doc)
-		it.arena = append(it.arena, docId...)
-		keyLen := uint16(len(it.arena) - int(off))
 		var mkByte uint8
 		if mk {
 			mkByte = 1
 		}
-		e := sortEntry{off: off, keyLen: keyLen, docLen: uint16(len(docId)), multiKey: mkByte}
 
-		if it.TopK > 0 {
-			// Max-heap of size TopK: keep only the smallest K entries.
-			if len(it.entries) < it.TopK {
-				it.entries = append(it.entries, e)
-				it.heapUp(len(it.entries) - 1)
-			} else if cmp(e, it.entries[0]) < 0 {
-				// New entry is smaller than the heap max — replace root.
-				it.entries[0] = e
-				it.heapDown(0)
+		if it.TopK <= 0 {
+			// Full sort: materialize every row (behavior unchanged).
+			it.growArena(256)
+			off := uint32(len(it.arena))
+			it.arena = it.Sorter.AppendKey(it.arena, doc)
+			it.arena = append(it.arena, docId...)
+			keyLen := uint16(len(it.arena) - int(off))
+			it.entries = append(it.entries, sortEntry{
+				off: off, keyLen: keyLen, docLen: uint16(len(docId)), multiKey: mkByte,
+			})
+			continue
+		}
+
+		// Max-heap of size TopK: keep only the smallest K entries. Build the
+		// candidate's packed key + docId at the arena TAIL (in spare capacity)
+		// WITHOUT committing it, so we can decide membership before deciding to
+		// keep the bytes. A "loser" row truncates the tail back and costs no
+		// retained memory and no allocation — mirroring SQLite's pushOntoSorter,
+		// which only inserts a record into the sorter AFTER it survives the LIMIT
+		// eviction (select.c), so the sorter holds <= LIMIT+OFFSET records.
+		base := uint32(len(it.arena))
+		it.growArena(256)
+		it.arena = it.Sorter.AppendKey(it.arena, doc)
+		it.arena = append(it.arena, docId...)
+		candLen := uint16(len(it.arena) - int(base))
+		candKey := it.arena[base:] // view of the candidate at the tail
+
+		switch {
+		case len(it.entries) < it.TopK:
+			// Heap not yet full: admit unconditionally, keeping the tail bytes.
+			it.entries = append(it.entries, sortEntry{
+				off: base, keyLen: candLen, docLen: uint16(len(docId)), multiKey: mkByte,
+			})
+			it.liveBytes += int(candLen)
+			it.heapUp(len(it.entries) - 1)
+		case bytes.Compare(candKey, it.arena[it.entries[0].off:it.entries[0].off+uint32(it.entries[0].keyLen)]) < 0:
+			// Candidate is smaller than the current heap max (the root): the root
+			// loses. If the root's vacated slot is exactly the candidate's size,
+			// overwrite it in place and drop the tail copy (reuse, no growth);
+			// the slot cannot overlap any live entry, so surviving entries stay
+			// byte-exact. Otherwise keep the candidate at the tail and let the
+			// root's bytes become dead, reclaimed by the next compaction. We
+			// deliberately do NOT memmove-compact the arena on every eviction —
+			// that would be O(N*K) copy churn.
+			root := it.entries[0]
+			it.liveBytes += int(candLen) - int(root.keyLen)
+			off := base
+			if root.keyLen == candLen {
+				copy(it.arena[root.off:root.off+uint32(candLen)], candKey)
+				it.arena = it.arena[:base] // uncommit tail; reuse root's slot
+				off = root.off
 			}
-		} else {
-			it.entries = append(it.entries, e)
+			it.entries[0] = sortEntry{
+				off: off, keyLen: candLen, docLen: uint16(len(docId)), multiKey: mkByte,
+			}
+			it.heapDown(0)
+			it.maybeCompact()
+		default:
+			// Loser: never materialized — discard the tail bytes.
+			it.arena = it.arena[:base]
 		}
 	}
 
-	slices.SortFunc(it.entries, cmp)
+	slices.SortFunc(it.entries, cmpEntry)
 	return nil
+}
+
+// maybeCompact rebuilds the arena from the live heap entries when fragmentation
+// (freed-but-unreused bytes) grows beyond live data, guaranteeing the arena
+// high-water mark stays O(K * keylen) even for adversarial key-length streams
+// (e.g. strictly decreasing keys of all-distinct lengths, where exact-size
+// reuse never hits). Compaction is O(K log K) and can only run after at least
+// liveBytes worth of appends have accumulated, so the amortized cost is O(1)
+// per row; it does NOT run per eviction.
+//
+// In-place safety: we visit live entries in ascending arena-offset order and
+// pack them toward offset 0. For the i-th entry in that order, the destination
+// dst (the sum of the lengths of all earlier entries) satisfies dst <= off,
+// because those earlier entries occupy disjoint regions that all lie below off.
+// Thus each copy moves bytes to a position at or before their source, and
+// destinations are strictly increasing and disjoint — so no entry's source is
+// clobbered before it is copied. it.entries stays in heap order; only each
+// entry's .off field is rewritten, so the heap invariant is preserved.
+func (it *SortIter) maybeCompact() {
+	const minWaste = 64 << 10 // don't bother compacting tiny arenas
+	if len(it.arena) <= it.liveBytes*2 || len(it.arena)-it.liveBytes < minWaste {
+		return
+	}
+	it.order = it.order[:0]
+	for i := range it.entries {
+		it.order = append(it.order, i)
+	}
+	slices.SortFunc(it.order, func(a, b int) int {
+		return cmp.Compare(it.entries[a].off, it.entries[b].off)
+	})
+	dst := uint32(0)
+	for _, i := range it.order {
+		e := &it.entries[i]
+		copy(it.arena[dst:dst+uint32(e.keyLen)], it.arena[e.off:e.off+uint32(e.keyLen)])
+		e.off = dst
+		dst += uint32(e.keyLen)
+	}
+	it.arena = it.arena[:dst]
 }
 
 // heapUp restores the max-heap property by moving entries[i] up.
