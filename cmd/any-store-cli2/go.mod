@@ -1,9 +1,9 @@
-module github.com/anyproto/any-store/v2/cmd/any-store-cli
+module github.com/anyproto/any-store/cmd/any-store-cli2/v2
 
 go 1.25.0
 
 require (
-	github.com/anyproto/any-store/v2 v2.0.0-00010101000000-000000000000
+	github.com/anyproto/any-store/v2 v2.0.0-alpha.3
 	github.com/fatih/color v1.18.0
 	github.com/peterh/liner v1.2.2
 	github.com/robertkrimen/otto v0.5.1
@@ -30,5 +30,3 @@ require (
 	gopkg.in/sourcemap.v1 v1.0.5 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/anyproto/any-store/v2 => ../../../any-store
