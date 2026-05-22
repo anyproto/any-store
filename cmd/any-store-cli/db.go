@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -43,6 +45,10 @@ type Conn struct {
 	autocompleteColl  []string
 	autocompleteQuery []string
 
+	// knownColls tracks which collections are currently registered in the JS
+	// context, so syncCollections can register/unregister only what changed.
+	knownColls map[string]struct{}
+
 	lastIter  anystore.Iterator
 	lastQuery Query
 }
@@ -54,23 +60,62 @@ func (c *Conn) closeLastIter() {
 	}
 }
 
+// jsIdentRe matches names usable directly as JS identifiers (db.name). Other
+// names must be reached via bracket notation, e.g. db["my-coll"].
+var jsIdentRe = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
+
+// collAccessor returns the JS expression used to reach a collection, falling
+// back to bracket notation for names that aren't valid JS identifiers.
+func collAccessor(name string) string {
+	if jsIdentRe.MatchString(name) {
+		return "db." + name
+	}
+	return "db[" + strconv.Quote(name) + "]"
+}
+
+var collCommands = []string{"insert", "find", "findOne", "findId", "deleteId", "update", "updateId", "upsert", "upsertId", "ensureIndex", "dropIndex", "getIndexes", "rename", "drop", "count"}
+
 func (c *Conn) makeAutocomplete() (err error) {
-	c.autocomplete = append(c.autocomplete[:0], "show collections", "show stats", "db.", "help", "it")
-	c.autocompleteDb = append(c.autocompleteDb[:0], "db.createCollection(", "db.backup(", "db.quickCheck()")
-	c.autocompleteQuery = append(c.autocompleteQuery[:0], "limit(", "offset(", "sort(", "hint(", "project(", "pretty()", "count()", "explain()", "delete()", "update(")
 	collNames, err := c.db.GetCollectionNames(mainCtx.Ctx())
 	if err != nil {
 		return
 	}
+	c.syncCollections(collNames)
+	c.autocomplete = append(c.autocomplete[:0], "show collections", "show stats", "db.", "help", "it")
+	c.autocompleteDb = append(c.autocompleteDb[:0], "db.createCollection(", "db.backup(", "db.quickCheck()")
+	c.autocompleteQuery = append(c.autocompleteQuery[:0], "limit(", "offset(", "sort(", "hint(", "project(", "pretty()", "count()", "explain()", "delete()", "update(")
 	c.autocompleteColl = c.autocompleteColl[:0]
 	for _, collName := range collNames {
-		c.autocompleteDb = append(c.autocompleteDb, "db."+collName+".")
-		for _, cmd := range []string{"insert", "find", "findOne", "findId", "deleteId", "update", "updateId", "upsert", "upsertId", "ensureIndex", "dropIndex", "getIndexes", "rename", "drop", "count"} {
-			c.autocompleteColl = append(c.autocompleteColl, "db."+collName+"."+cmd+"(")
+		accessor := collAccessor(collName)
+		c.autocompleteDb = append(c.autocompleteDb, accessor+".")
+		for _, cmd := range collCommands {
+			c.autocompleteColl = append(c.autocompleteColl, accessor+"."+cmd+"(")
 		}
-		c.js.RegisterCollection(collName)
 	}
 	return nil
+}
+
+// syncCollections registers collections newly visible in the JS context and
+// unregisters ones that disappeared, so collections created or dropped by
+// another client are picked up without restarting the CLI.
+func (c *Conn) syncCollections(names []string) {
+	if c.knownColls == nil {
+		c.knownColls = make(map[string]struct{})
+	}
+	nameSet := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		nameSet[name] = struct{}{}
+		if _, ok := c.knownColls[name]; !ok {
+			c.js.RegisterCollection(name)
+			c.knownColls[name] = struct{}{}
+		}
+	}
+	for name := range c.knownColls {
+		if _, ok := nameSet[name]; !ok {
+			c.js.UnregisterCollection(name)
+			delete(c.knownColls, name)
+		}
+	}
 }
 
 func (c *Conn) Exec(cmdLine string) (result string, err error) {
@@ -80,7 +125,10 @@ func (c *Conn) Exec(cmdLine string) (result string, err error) {
 		cmd.Path = strings.TrimSpace(strings.TrimPrefix(cmdLine, "help"))
 		return c.ExecCmd(cmd)
 	}
-	if strings.HasPrefix(cmdLine, "db.") {
+	if strings.HasPrefix(cmdLine, "db.") || strings.HasPrefix(cmdLine, "db[") {
+		// Refresh the collection registry first so collections created (or
+		// dropped) by another client are visible to the JS context.
+		_ = c.makeAutocomplete()
 		if cmd, err = c.js.GetQuery(cmdLine); err != nil {
 			return
 		}
@@ -245,6 +293,22 @@ func (c *Conn) Complete(line string) (result []string) {
 		}
 		return
 	}
+	// Bracket-notation collection access, e.g. db["my-coll"].find(. Names are
+	// case-sensitive quoted strings, so match against the original line.
+	if strings.HasPrefix(line, "db[") {
+		for _, cmd := range c.autocompleteDb {
+			if strings.HasPrefix(cmd, line) {
+				result = append(result, cmd)
+			}
+		}
+		for _, cmd := range c.autocompleteColl {
+			if strings.HasPrefix(cmd, line) {
+				result = append(result, cmd)
+			}
+		}
+		return
+	}
+
 	if !strings.HasPrefix(lowerLine, "db.") {
 		for _, cmd := range c.autocomplete {
 			if strings.HasPrefix(cmd, lowerLine) {
@@ -257,7 +321,7 @@ func (c *Conn) Complete(line string) (result []string) {
 	dotCount := strings.Count(lowerLine, ".")
 	if dotCount == 1 {
 		for _, cmd := range c.autocompleteDb {
-			if strings.HasPrefix(cmd, lowerLine) {
+			if strings.HasPrefix(strings.ToLower(cmd), lowerLine) {
 				result = append(result, cmd)
 			}
 		}
@@ -592,6 +656,7 @@ func (c *Conn) Drop(cmd Cmd) (result string, err error) {
 	if err = coll.Drop(mainCtx.Ctx()); err != nil {
 		return "", err
 	}
+	_ = c.makeAutocomplete()
 	return
 }
 

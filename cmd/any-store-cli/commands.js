@@ -41,6 +41,7 @@ function Query(name) {
 Query.prototype.reset = function () {
     this.query = {};
     this.cmd = "find";
+    delete this.documents;
 }
 
 Query.prototype.limit = function (limit) {
