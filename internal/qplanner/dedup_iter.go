@@ -101,6 +101,29 @@ func (it *CanonicalKeyDedupIter) Next() (key []byte, docId []byte, multiKey bool
 	}
 }
 
+// skipOffset delegates a cursor-level offset skip to the source. This is
+// correct precisely because the source (IndexIter, via FetchIter) only
+// fast-skips SCALAR index entries and stops at the first multi-key one:
+//
+//   - For a scalar entry, this iterator is pass-through (Next returns it
+//     immediately — see the non-array branch in Next). So every entry the
+//     source skipped would have flowed through this iterator 1:1; skipping
+//     it below us removes exactly the same logical rows we would have
+//     emitted. No dedup decision is bypassed.
+//
+//   - The instant the source meets a multi-key (array) entry it stops
+//     skipping and returns the remainder, leaving the cursor on that entry.
+//     From there normal Next() runs, and THIS iterator performs its
+//     canonical-key dedup over the array hits as usual; the remaining
+//     offset is then applied by LimitIter on the deduped (logical-row)
+//     stream. So multi-key dedup correctness is fully preserved.
+func (it *CanonicalKeyDedupIter) skipOffset(n int) (remaining int, err error) {
+	if src, ok := it.Source.(offsetSkipper); ok {
+		return src.skipOffset(n)
+	}
+	return n, nil
+}
+
 func (it *CanonicalKeyDedupIter) Close() {
 	if it.Source != nil {
 		it.Source.Close()

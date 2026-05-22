@@ -871,3 +871,256 @@ func TestIndexIter_CountEntries_SingleBound_UsesBatchPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 3, n)
 }
+
+// drainIndexDocIds drains an IndexIter to completion, returning the docId
+// strings and the multiKey flag observed for each emitted entry.
+func drainIndexDocIds(t *testing.T, it *IndexIter) (ids []string, multi []bool) {
+	t.Helper()
+	for {
+		_, docId, mk, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		ids = append(ids, string(docId))
+		multi = append(multi, mk)
+	}
+	return ids, multi
+}
+
+// TestIndexIter_SkipOffset_AllScalar verifies the cursor-level offset skip on
+// an unbounded single-field scalar index: skipOffset(k) absorbs exactly k
+// rows (remaining=0) and the subsequent Next() stream resumes at row k. This
+// is the fast path that streams OFFSET without fetching the skipped docs.
+func TestIndexIter_SkipOffset_AllScalar(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueScalar},
+		{field: "b", docId: "p2", value: IndexValueScalar},
+		{field: "c", docId: "p3", value: IndexValueScalar},
+		{field: "d", docId: "p4", value: IndexValueScalar},
+		{field: "e", docId: "p5", value: IndexValueScalar},
+		{field: "f", docId: "p6", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	remaining, err := it.skipOffset(3)
+	require.NoError(t, err)
+	assert.Equal(t, 0, remaining, "all 3 skipped entries are scalar → fully absorbed")
+
+	ids, _ := drainIndexDocIds(t, it)
+	assert.Equal(t, []string{"p4", "p5", "p6"}, ids,
+		"after skipping 3 scalar rows, the stream must resume at the 4th row")
+}
+
+// TestIndexIter_SkipOffset_PastEnd verifies that an offset beyond the entry
+// count skips everything and yields an empty stream, reporting the unskipped
+// remainder.
+func TestIndexIter_SkipOffset_PastEnd(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueScalar},
+		{field: "b", docId: "p2", value: IndexValueScalar},
+		{field: "c", docId: "p3", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	remaining, err := it.skipOffset(10)
+	require.NoError(t, err)
+	assert.Equal(t, 7, remaining, "only 3 scalar rows exist; 7 of the 10 are unskipped")
+
+	ids, _ := drainIndexDocIds(t, it)
+	assert.Empty(t, ids, "offset past the end yields nothing")
+}
+
+// TestIndexIter_SkipOffset_StopsAtMultiKey is the dangerous-case guard: when
+// the skip region contains a multi-key (array) entry, the fast skip MUST stop
+// at it, return the unskipped remainder, and leave the cursor ON that entry so
+// the dedup-aware path resolves the rest of the offset. Skipping multi-key
+// entries at the index level would mis-count logical rows.
+func TestIndexIter_SkipOffset_StopsAtMultiKey(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueScalar},   // skipped (scalar)
+		{field: "b", docId: "p2", value: IndexValueScalar},   // skipped (scalar)
+		{field: "m1", docId: "p3", value: IndexValueMultiKey}, // STOP here
+		{field: "m2", docId: "p3", value: IndexValueMultiKey},
+		{field: "z", docId: "p4", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	// Ask to skip 4. Two scalar entries are skipped, then the multi-key entry
+	// stops the fast skip: remaining = 4 - 2 = 2.
+	remaining, err := it.skipOffset(4)
+	require.NoError(t, err)
+	assert.Equal(t, 2, remaining, "stopped at the first multi-key entry after 2 scalar skips")
+
+	// The cursor must be left ON the multi-key entry, so Next() emits it first.
+	ids, multi := drainIndexDocIds(t, it)
+	assert.Equal(t, []string{"p3", "p3", "p4"}, ids,
+		"stream must resume exactly at the multi-key entry that stopped the skip")
+	assert.Equal(t, []bool{true, true, false}, multi,
+		"multiKey flags must be preserved through the handoff")
+}
+
+// TestIndexIter_SkipOffset_FirstEntryMultiKey verifies immediate bail when the
+// very first entry is multi-key: nothing is skipped and the full offset is
+// returned as remaining, with the cursor positioned at the first entry.
+func TestIndexIter_SkipOffset_FirstEntryMultiKey(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "m1", docId: "p1", value: IndexValueMultiKey},
+		{field: "m2", docId: "p1", value: IndexValueMultiKey},
+		{field: "z", docId: "p2", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	remaining, err := it.skipOffset(2)
+	require.NoError(t, err)
+	assert.Equal(t, 2, remaining, "first entry is multi-key → skip nothing")
+
+	ids, _ := drainIndexDocIds(t, it)
+	assert.Equal(t, []string{"p1", "p1", "p2"}, ids, "no entry consumed by the bailed skip")
+}
+
+// TestIndexIter_SkipOffset_LegacyEmptyBails verifies that a legacy empty value
+// byte (treated as multi-key for safety) stops the fast skip.
+func TestIndexIter_SkipOffset_LegacyEmptyBails(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueScalar},
+		{field: "b", docId: "p2", value: nil}, // legacy empty → multi-key for safety
+		{field: "c", docId: "p3", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	remaining, err := it.skipOffset(3)
+	require.NoError(t, err)
+	assert.Equal(t, 2, remaining, "1 scalar skipped, then legacy-empty entry stops the skip")
+
+	ids, _ := drainIndexDocIds(t, it)
+	assert.Equal(t, []string{"p2", "p3"}, ids)
+}
+
+// TestIndexIter_SkipOffset_Reverse verifies the cursor-level skip on a reverse
+// scan: it skips from the largest key backward.
+func TestIndexIter_SkipOffset_Reverse(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueScalar},
+		{field: "b", docId: "p2", value: IndexValueScalar},
+		{field: "c", docId: "p3", value: IndexValueScalar},
+		{field: "d", docId: "p4", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Reverse: true,
+	}
+	defer it.Close()
+
+	// Reverse order is d,c,b,a. Skip 2 → d,c skipped; resume at b,a.
+	remaining, err := it.skipOffset(2)
+	require.NoError(t, err)
+	assert.Equal(t, 0, remaining)
+
+	ids, _ := drainIndexDocIds(t, it)
+	assert.Equal(t, []string{"p2", "p1"}, ids, "reverse skip drops the 2 largest, resumes at b,a")
+}
+
+// TestIndexIter_SkipOffset_BoundedNoSkip verifies the conservative scope: a
+// bounded index scan does NOT fast-skip (returns the full offset), preserving
+// the safe fetch-then-skip path. The cursor is untouched, so a normal Next()
+// still walks the bounded range from the start.
+func TestIndexIter_SkipOffset_BoundedNoSkip(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueScalar},
+		{field: "b", docId: "p2", value: IndexValueScalar},
+		{field: "c", docId: "p3", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Bounds: query.Bounds{{
+			Start: anyenc.AppendAnyValue(nil, "a"), StartInclude: true,
+			End: append(anyenc.AppendAnyValue(nil, "c"), 0xff), EndInclude: true,
+		}},
+	}
+	defer it.Close()
+
+	remaining, err := it.skipOffset(2)
+	require.NoError(t, err)
+	assert.Equal(t, 2, remaining, "bounded scan must not fast-skip; returns full offset")
+
+	ids, _ := drainIndexDocIds(t, it)
+	assert.Equal(t, []string{"p1", "p2", "p3"}, ids, "Next() still walks the full bounded range")
+}
+
+// TestIndexIter_SkipOffset_ZeroAndNegative verifies the trivial guards.
+func TestIndexIter_SkipOffset_ZeroAndNegative(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	r0, err := it.skipOffset(0)
+	require.NoError(t, err)
+	assert.Equal(t, 0, r0)
+	rNeg, err := it.skipOffset(-5)
+	require.NoError(t, err)
+	assert.Equal(t, 0, rNeg)
+
+	// Cursor untouched: Next() still yields the single entry.
+	ids, _ := drainIndexDocIds(t, it)
+	assert.Equal(t, []string{"p1"}, ids)
+}

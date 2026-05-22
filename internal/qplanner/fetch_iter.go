@@ -77,6 +77,22 @@ func (it *FetchIter) Next() (key []byte, docId []byte, multiKey bool, err error)
 	}
 }
 
+// skipOffset delegates a cursor-level offset skip to the source so skipped
+// rows are never fetched/parsed (the whole point: avoid the data-namespace
+// point lookup + ParseOwned for offset rows). FetchIter maps 1:1 onto its
+// source for every index entry that has a corresponding data doc — which is
+// every entry in a consistent committed snapshot, since deleteItem removes a
+// doc's index entries and its data row in the same write transaction. (The
+// ErrKeyNotFound branch in Next is a defensive guard for corruption that
+// never occurs in a consistent snapshot; CountEntries likewise counts by
+// index entry, so the skip stays consistent with Count.)
+func (it *FetchIter) skipOffset(n int) (remaining int, err error) {
+	if src, ok := it.Source.(offsetSkipper); ok {
+		return src.skipOffset(n)
+	}
+	return n, nil
+}
+
 // Close releases resources by closing the source iterator.
 func (it *FetchIter) Close() {
 	if it.Source != nil {
