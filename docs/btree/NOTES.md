@@ -529,9 +529,14 @@ sub-journaling for savepoints.
   always proceed
 - **`nRecyclable`**: count of unpinned clean pages in LRU, incremented in
   `lruPrepend`, decremented in `lruRemove`/`evictOne`
-- **Immediate eviction on unpin**: when cache is overfull (`len(pages) > maxPages`),
+- **Immediate eviction on unpin**: when cache is overfull (`nPage > maxPages`),
   clean pages are discarded on `release()` instead of entering LRU. Matches
   SQLite `pcache1Unpin` (`pcache1.c:1094`): `pGroup->nPurgeable > pGroup->nMaxPage`
+- **Page-cache hash**: pages are found via a chained hash table (`apHash []*page`
+  + `page.hashNext`), a direct port of SQLite's `PCache1.apHash` (`pcache1.c:200`).
+  Membership is carried on the page (`page.inCache`), so `release()` gates the LRU
+  insert on a field read rather than a second hash probe (drift #2 resolved; see
+  below)
 - **Buffer lifecycle**: `clear()`, `discard()`, `truncate()` return data buffers
   to the global slab. `pFree` buffers also returned to slab on `clear()`
 - **Persistent reader cache**: reader caches are returned to `readerCachePool`
@@ -570,7 +575,7 @@ drawn from the global slab that enforces a process-wide soft cap.
 | Cache ownership | Per-connection (private) | Per-connection (private) — matches SQLite |
 | Thread safety | Per-connection (no mutex needed) | Per-connection (no mutex needed) — matches SQLite |
 | PGroup cross-cache stealing | Enabled in single-thread mode (`pcache1.c:718-719`) | No PGroup; each cache isolated (drift #1) |
-| Hash table | `apHash[]` with chaining (`pcache1.c:199-200`) | Go `map[uint32]*page` (drift #2) |
+| Hash table | `apHash[]` with chaining (`pcache1.c:199-200`) | `apHash []*page` with chaining via `page.hashNext` — matches SQLite (drift #2 resolved 2026-05-22; see "Page-Cache Hash Table" below) |
 | LRU structure | Circular list with anchor node (`pcache1.c:112-115`) | Doubly-linked list with head/tail pointers (drift #3) |
 | `createFlag=0` | Lookup only, no create | Dropped; `fetch()` handles lookup-only (drift #13) |
 | Max page check | PGroup-level (`pcache1.c:1094`) | Per-cache + global slab pressure (drift #14) |
@@ -1365,6 +1370,31 @@ No SQLite equivalent — our addition for the many-open-databases scenario.
   search direction (`pcache.c:463-469`). No `pSynced` pointer needed because
   `PGHDR_NEED_SYNC` is irrelevant in WAL-only mode.
 
+**Page-Cache Hash Table (apHash port)** -- Resolved 2026-05-22 (drift #2)
+
+The page→struct lookup was a Go `map[uint32]*page`. It is now a SQLite-`pcache1`-style
+chained hash (`pcache.apHash []*page` + `page.hashNext`), a direct port of
+`PCache1.apHash`/`PgHdr1.pNext` (`pcache1.c:200,122`):
+- `hashFind` is a single chained-bucket probe — `apHash[pgno & (nHash-1)]` walked
+  by `hashNext` — matching `pcache1FetchNoMutex` (`pcache1.c:1009-1010`). `nHash` is
+  always a power of two so the bucket index is a mask. `fetch`/`create` share it.
+- `hashInsert`/`hashRemove` link/unlink at the bucket head and maintain `nPage`,
+  matching `pcache1RemoveFromHash` (`pcache1.c:601-613`). `resizeHash` doubles and
+  rehashes at load factor 1.0 (`nPage >= nHash`), matching `pcache1ResizeHash`
+  (`pcache1.c:535-567`, floor 256).
+- **Ghost-page invariant:** unlike SQLite (whose invariants forbid removing a
+  pinned page from the hash), v2's `discard`/`truncate`/savepoint-rollback can
+  remove a page while a caller still holds it pinned. Membership is therefore
+  carried on the page via `page.inCache` (set by `hashInsert`, cleared by
+  `hashRemove`); `release` adds to the LRU only when `inCache` is true. This
+  replaces the former second Go-map lookup (the `pc.pages[p.pgno]==p` re-probe in
+  `release`) with a field read, and keeps `pcache1Unpin`'s hash-op-free release
+  path (`pcache1.c:1076-1103`).
+- Eliminates the two `runtime.mapaccess1_fast32` calls per page touched on every
+  fetch/release; measured ~50% faster `Fullscan/Count` (81µs → 40µs) and ~59%
+  faster `IterParse/FullScanCount` on the 10k-row `noIdxColl`, with no change to
+  B/op or allocs/op. No on-disk, WAL, dirty-list, or eviction-order change.
+
 **Known Drifts in Page Cache:**
 - Buffer reuse on eviction: SQLite step 4 (`pcache1.c:897-914`) reuses the
   evicted victim's buffer in-place. Writer caches drop evicted buffers because
@@ -1375,7 +1405,7 @@ No SQLite equivalent — our addition for the many-open-databases scenario.
 - No `reuseUnlikely` on unpin: SQLite's `pcache1Unpin` accepts a
   `reuseUnlikely` flag (`pcache1.c:1079`); when true, pages are immediately
   freed. Our `release()` does not have this hint. Overfull eviction
-  (`len(pages) > maxPages`) matches SQLite's `pGroup->nPurgeable > nMaxPage`
+  (`nPage > maxPages`) matches SQLite's `pGroup->nPurgeable > nMaxPage`
   check (`pcache1.c:1094`). `sqlite3PcacheDrop` maps to our `discard()` method.
 - Merged Fetch+FetchStress: SQLite splits page acquisition into
   `sqlite3PcacheFetch` (soft create, may return NULL) and

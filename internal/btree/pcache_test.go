@@ -110,16 +110,16 @@ func TestPcacheLRUEviction(t *testing.T) {
 		pg := pc.create(i, 2)
 		pc.release(pg)
 	}
-	assert.Len(t, pc.pages, 3)
+	assert.Equal(t, 3, pc.nPage)
 	assert.Equal(t, 3, pc.nRecyclable)
 
 	// Creating a 4th page should evict the oldest clean page (page 1)
 	pg4 := pc.create(4, 2)
 	assert.NotNil(t, pg4)
-	assert.Nil(t, pc.pages[1]) // page 1 should be evicted
-	assert.NotNil(t, pc.pages[2])
-	assert.NotNil(t, pc.pages[3])
-	assert.NotNil(t, pc.pages[4])
+	assert.Nil(t, pc.hashFind(1)) // page 1 should be evicted
+	assert.NotNil(t, pc.hashFind(2))
+	assert.NotNil(t, pc.hashFind(3))
+	assert.NotNil(t, pc.hashFind(4))
 	pc.release(pg4)
 }
 
@@ -138,8 +138,8 @@ func TestPcacheDirtyPagesNotEvicted(t *testing.T) {
 	pg3 := pc.create(3, 2)
 	assert.NotNil(t, pg3)
 	// All 3 should still be present (dirty pages can't be evicted)
-	assert.NotNil(t, pc.pages[1])
-	assert.NotNil(t, pc.pages[2])
+	assert.NotNil(t, pc.hashFind(1))
+	assert.NotNil(t, pc.hashFind(2))
 	pc.release(pg3)
 }
 
@@ -150,7 +150,7 @@ func TestPcacheDiscard(t *testing.T) {
 	pc.release(pg)
 
 	pc.discard(1)
-	assert.Nil(t, pc.pages[1])
+	assert.Nil(t, pc.hashFind(1))
 	assert.Nil(t, pc.fetch(1))
 
 	// Discard non-existent page should not panic
@@ -167,7 +167,7 @@ func TestPcacheDiscardDirty(t *testing.T) {
 	assert.Equal(t, 1, pc.nDirty)
 	pc.discard(1)
 	assert.Equal(t, 0, pc.nDirty)
-	assert.Nil(t, pc.pages[1])
+	assert.Nil(t, pc.hashFind(1))
 }
 
 func TestPcacheClear(t *testing.T) {
@@ -182,7 +182,7 @@ func TestPcacheClear(t *testing.T) {
 	}
 
 	pc.clear()
-	assert.Empty(t, pc.pages)
+	assert.Zero(t, pc.nPage)
 	assert.Equal(t, 0, pc.nRecyclable)
 	assert.Equal(t, 0, pc.nDirty)
 	assert.Nil(t, pc.lruHead)
@@ -199,12 +199,12 @@ func TestPcacheTruncate(t *testing.T) {
 	}
 
 	pc.truncate(5)
-	assert.Len(t, pc.pages, 5)
+	assert.Equal(t, 5, pc.nPage)
 	for i := uint32(1); i <= 5; i++ {
-		assert.NotNil(t, pc.pages[i])
+		assert.NotNil(t, pc.hashFind(i))
 	}
 	for i := uint32(6); i <= 10; i++ {
-		assert.Nil(t, pc.pages[i])
+		assert.Nil(t, pc.hashFind(i))
 	}
 }
 
@@ -219,9 +219,9 @@ func TestPcacheTruncateDirty(t *testing.T) {
 
 	pc.truncate(2)
 	assert.Equal(t, 2, pc.nDirty)
-	assert.NotNil(t, pc.pages[1])
-	assert.NotNil(t, pc.pages[2])
-	assert.Nil(t, pc.pages[3])
+	assert.NotNil(t, pc.hashFind(1))
+	assert.NotNil(t, pc.hashFind(2))
+	assert.Nil(t, pc.hashFind(3))
 }
 
 func TestPcacheFetchMovesFromLRU(t *testing.T) {
@@ -302,7 +302,7 @@ func TestPcacheStressOnlyUnreferenced(t *testing.T) {
 	pg4 := pc.create(4, 2)
 	require.NotNil(t, pg4)
 	assert.Equal(t, 0, stressCalled) // no victim found, no stress call
-	assert.Len(t, pc.pages, 4)       // cache grows beyond maxPages
+	assert.Equal(t, 4, pc.nPage)     // cache grows beyond maxPages
 
 	// Cleanup
 	pc.release(pg4)
@@ -332,7 +332,7 @@ func TestPcacheNoStressWhenCleanPagesAvailable(t *testing.T) {
 	pg4 := pc.create(4, 2)
 	require.NotNil(t, pg4)
 	assert.Equal(t, 0, stressCalled) // clean eviction worked, no stress needed
-	assert.Len(t, pc.pages, 3)       // one was evicted
+	assert.Equal(t, 3, pc.nPage)     // one was evicted
 	pc.release(pg4)
 }
 
@@ -382,7 +382,7 @@ func TestPcacheLRURefetchMovesMRU(t *testing.T) {
 	pgA = pc.fetch(1)
 	require.NotNil(t, pgA)
 	assert.Equal(t, 2, pc.nRecyclable) // B and C still in LRU
-	pc.release(pgA)               // LRU: HEAD -> A -> C -> B -> TAIL
+	pc.release(pgA)                    // LRU: HEAD -> A -> C -> B -> TAIL
 	assert.Equal(t, 3, pc.nRecyclable)
 
 	// Eviction order should be B (tail/LRU), C, A (head/MRU)
@@ -420,7 +420,7 @@ func TestPcacheStressDisabledForInMemory(t *testing.T) {
 	pg4 := pc.create(4, 2)
 	require.NotNil(t, pg4)
 	assert.Equal(t, 0, stressCalled) // non-purgeable skips stress entirely
-	assert.Len(t, pc.pages, 4)       // cache grows beyond maxPages
+	assert.Equal(t, 4, pc.nPage)     // cache grows beyond maxPages
 	pc.release(pg4)
 }
 
@@ -628,16 +628,16 @@ func TestPcacheBufferRecycling_EvictionFromPFreeOrSlab(t *testing.T) {
 		pc.release(pg)
 	}
 	assert.Equal(t, 5, pc.nRecyclable)
-	assert.Len(t, pc.pages, 5)
+	assert.Equal(t, 5, pc.nPage)
 
 	// Create page 6 — should evict page 1 (LRU tail) and allocate from pFree/slab
 	pg6 := pc.create(6, 2)
 	require.NotNil(t, pg6)
 
 	// Verify the eviction happened correctly
-	assert.Nil(t, pc.pages[1], "page 1 should have been evicted")
-	assert.NotNil(t, pc.pages[6], "page 6 should exist")
-	assert.Len(t, pc.pages, 5, "cache should still have 5 pages after eviction+create")
+	assert.Nil(t, pc.hashFind(1), "page 1 should have been evicted")
+	assert.NotNil(t, pc.hashFind(6), "page 6 should exist")
+	assert.Equal(t, 5, pc.nPage, "cache should still have 5 pages after eviction+create")
 
 	pc.release(pg6)
 }
@@ -659,7 +659,7 @@ func TestPcacheBufferRecycling_ReaderEvictionRecyclesDirect(t *testing.T) {
 		pc.release(pg)
 	}
 	assert.Equal(t, 5, pc.nRecyclable)
-	assert.Len(t, pc.pages, 5)
+	assert.Equal(t, 5, pc.nPage)
 
 	// Record slab free count before eviction
 	globalPageSlab.mu.Lock()
@@ -670,8 +670,8 @@ func TestPcacheBufferRecycling_ReaderEvictionRecyclesDirect(t *testing.T) {
 	pg6 := pc.create(6, 2)
 	require.NotNil(t, pg6)
 
-	assert.Nil(t, pc.pages[1], "page 1 should have been evicted")
-	assert.Len(t, pc.pages, 5)
+	assert.Nil(t, pc.hashFind(1), "page 1 should have been evicted")
+	assert.Equal(t, 5, pc.nPage)
 
 	// Slab free count should be unchanged — no Put (evicted buffer reused
 	// directly) and no Get (recycled page used instead of slab allocation).
@@ -703,12 +703,12 @@ func TestPcacheBufferRecycling_ClearReturnsSlab(t *testing.T) {
 
 	// pFree is empty — no bulk init in slab mode
 	assert.Empty(t, pc.pFree)
-	assert.Len(t, pc.pages, 10)
+	assert.Equal(t, 10, pc.nPage)
 
 	// clear() moves pages to pFree (no pressure)
 	pc.clear()
 
-	assert.Empty(t, pc.pages)
+	assert.Zero(t, pc.nPage)
 	assert.Equal(t, 0, pc.nRecyclable)
 	assert.Equal(t, 0, pc.nDirty)
 	// All 10 pages moved to pFree
@@ -738,7 +738,7 @@ func TestPcacheBufferRecycling_DiscardFreesBuffer(t *testing.T) {
 
 	// discard should remove the page and nil out its data
 	pc.discard(1)
-	assert.Nil(t, pc.pages[1], "page should be removed after discard")
+	assert.Nil(t, pc.hashFind(1), "page should be removed after discard")
 }
 
 func TestPcacheBufferRecycling_TruncateFreesBuffers(t *testing.T) {
@@ -754,16 +754,16 @@ func TestPcacheBufferRecycling_TruncateFreesBuffers(t *testing.T) {
 		pg := pc.create(i, 2)
 		pc.release(pg)
 	}
-	assert.Len(t, pc.pages, 10)
+	assert.Equal(t, 10, pc.nPage)
 
 	pc.truncate(5) // remove pages 6-10
 
-	assert.Len(t, pc.pages, 5, "truncate should remove pages > maxPage")
+	assert.Equal(t, 5, pc.nPage, "truncate should remove pages > maxPage")
 	for i := uint32(6); i <= 10; i++ {
-		assert.Nil(t, pc.pages[i], "page %d should be removed", i)
+		assert.Nil(t, pc.hashFind(i), "page %d should be removed", i)
 	}
 	for i := uint32(1); i <= 5; i++ {
-		assert.NotNil(t, pc.pages[i], "page %d should be retained", i)
+		assert.NotNil(t, pc.hashFind(i), "page %d should be retained", i)
 	}
 }
 
@@ -801,7 +801,7 @@ func TestPcacheAdmissionControl_SoftCreateRefusedAt90Percent(t *testing.T) {
 	// threshold = maxPages * 9 / 10 = 90
 	// 95 >= 90 → soft create should be refused
 	assert.Equal(t, 0, pc.nRecyclable)
-	assert.Equal(t, 95, len(pc.pages))
+	assert.Equal(t, 95, pc.nPage)
 
 	// Soft create should return nil
 	softPg := pc.create(200, 1)
@@ -922,17 +922,17 @@ func TestPcacheUnpin_OverfullDiscardsImmediately(t *testing.T) {
 	for i := uint32(1); i <= 6; i++ {
 		pgs[i-1] = pc.create(i, 2)
 	}
-	assert.Len(t, pc.pages, 6) // overfull
+	assert.Equal(t, 6, pc.nPage) // overfull
 
 	// Release page 6 (clean) — should be discarded immediately (overfull)
 	pc.release(pgs[5])
-	assert.Nil(t, pc.pages[6], "page 6 should be discarded when cache is overfull")
+	assert.Nil(t, pc.hashFind(6), "page 6 should be discarded when cache is overfull")
 	assert.Equal(t, 0, pc.nRecyclable, "page should NOT be in LRU")
-	assert.Len(t, pc.pages, 5, "cache should shrink back to maxPages")
+	assert.Equal(t, 5, pc.nPage, "cache should shrink back to maxPages")
 
 	// Release page 5 — cache is now at maxPages, should go to LRU normally
 	pc.release(pgs[4])
-	assert.NotNil(t, pc.pages[5], "page 5 should remain in cache (at maxPages)")
+	assert.NotNil(t, pc.hashFind(5), "page 5 should remain in cache (at maxPages)")
 	assert.Equal(t, 1, pc.nRecyclable, "page should be in LRU")
 
 	// Cleanup

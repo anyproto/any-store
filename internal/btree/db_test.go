@@ -1885,12 +1885,12 @@ func TestResolveNamespace_CorruptCell(t *testing.T) {
 	require.NoError(t, err)
 
 	// Get page 1 (master btree root)
-	pg := db.pager.writerCache.pages[1]
+	pg := db.pager.writerCache.hashFind(1)
 	if pg == nil {
 		// Need to dirty page 1 first
 		_, err = tx2.CreateNamespace("temp")
 		require.NoError(t, err)
-		pg = db.pager.writerCache.pages[1]
+		pg = db.pager.writerCache.hashFind(1)
 	}
 	require.NotNil(t, pg)
 
@@ -2085,7 +2085,7 @@ func TestAppendValue_CorruptCellPointers(t *testing.T) {
 	require.NoError(t, tx2.Put(ns2, []byte("key2"), []byte("val2")))
 
 	// Now corrupt the root page's cell pointer
-	pg := db.pager.writerCache.pages[rootPg]
+	pg := db.pager.writerCache.hashFind(rootPg)
 	if pg != nil && pg.header.cellCount > 0 {
 		cpOff := pg.cellPointerOffset()
 		// Point cell pointer beyond usable size
@@ -2723,7 +2723,7 @@ func TestFreeTreePages_CorruptOverflowChain(t *testing.T) {
 
 	// Now directly corrupt the overflow pointer in the dirty page.
 	// The root page should be in writerCache.
-	pg := db.pager.writerCache.pages[rootPg]
+	pg := db.pager.writerCache.hashFind(rootPg)
 	if pg != nil && pg.header.isLeaf() && pg.header.cellCount > 0 {
 		usableSize := db.pager.usableSize()
 		off := pg.getCellOffset(0)
@@ -2750,7 +2750,7 @@ func TestFreeTreePages_CorruptOverflowChain(t *testing.T) {
 	// Force root page to be dirty
 	require.NoError(t, tx3.Put(ns3, []byte("force"), []byte("dirty")))
 
-	pg = db.pager.writerCache.pages[rootPg]
+	pg = db.pager.writerCache.hashFind(rootPg)
 	if pg != nil && pg.header.isLeaf() && pg.header.cellCount > 0 {
 		usableSize := db.pager.usableSize()
 		// Find the first cell with an overflow page and corrupt it
@@ -2777,7 +2777,7 @@ func TestFreeTreePages_CorruptOverflowChain(t *testing.T) {
 
 	// If root page changed (due to split from Put), re-corrupt the new root
 	if currentRootPg != rootPg {
-		pg = db.pager.writerCache.pages[currentRootPg]
+		pg = db.pager.writerCache.hashFind(currentRootPg)
 		if pg != nil && pg.header.isLeaf() && pg.header.cellCount > 0 {
 			usableSize := db.pager.usableSize()
 			for ci := 0; ci < int(pg.header.cellCount); ci++ {
@@ -3215,7 +3215,7 @@ func TestPersistentReaderCache_CacheHitsWithoutWrites(t *testing.T) {
 	// Remember the cache and how many pages it has
 	cache1 := rtx1.cache
 	require.NotNil(t, cache1)
-	pagesAfterFirstTx := len(cache1.pages)
+	pagesAfterFirstTx := cache1.nPage
 	require.Greater(t, pagesAfterFirstTx, 0, "first read tx should have cached some pages")
 
 	walMaxFrame1 := rtx1.walMaxFrame
@@ -3233,7 +3233,7 @@ func TestPersistentReaderCache_CacheHitsWithoutWrites(t *testing.T) {
 	cache2 := rtx2.cache
 	require.NotNil(t, cache2)
 	if cache1 == cache2 {
-		assert.Equal(t, pagesAfterFirstTx, len(cache2.pages),
+		assert.Equal(t, pagesAfterFirstTx, cache2.nPage,
 			"cache should retain pages from first read tx (persistent cache)")
 	} else {
 		t.Log("sync.Pool returned a different cache (GC may have cleared pool); skipping page count check")
@@ -3262,7 +3262,7 @@ func TestPersistentReaderCache_CacheClearedAfterWrite(t *testing.T) {
 	require.NoError(t, err)
 
 	cache1 := rtx1.cache
-	pagesAfterFirstTx := len(cache1.pages)
+	pagesAfterFirstTx := cache1.nPage
 	require.Greater(t, pagesAfterFirstTx, 0)
 
 	walMaxFrame1 := rtx1.walMaxFrame
@@ -3324,7 +3324,7 @@ func TestPersistentReaderCache_ClearKeepsBuffersLocal(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	cachedPages := len(rtx1.cache.pages)
+	cachedPages := rtx1.cache.nPage
 	require.Greater(t, cachedPages, 0)
 	require.NoError(t, rtx1.Rollback())
 
@@ -3342,7 +3342,7 @@ func TestPersistentReaderCache_ClearKeepsBuffersLocal(t *testing.T) {
 	require.NoError(t, err)
 
 	// After clear: pages map should be empty, pFree should have the buffers
-	assert.Empty(t, rtx2.cache.pages, "cache should be empty after clear")
+	assert.Zero(t, rtx2.cache.nPage, "cache should be empty after clear")
 	assert.Greater(t, len(rtx2.cache.pFree), 0,
 		"pFree should retain buffers after clear for reuse")
 
@@ -3640,14 +3640,14 @@ func TestSlabHeapBound_MultiDB(t *testing.T) {
 	var totalWriterPages, totalWriterPFree, totalWriterRecyclable int
 	var totalReaderPages, totalReaderPFree int
 	for _, db := range dbs {
-		totalWriterPages += len(db.pager.writerCache.pages)
+		totalWriterPages += db.pager.writerCache.nPage
 		totalWriterPFree += len(db.pager.writerCache.pFree)
 		totalWriterRecyclable += db.pager.writerCache.nRecyclable
 	drainLoop:
 		for {
 			select {
 			case c := <-db.readerCaches:
-				totalReaderPages += len(c.pages)
+				totalReaderPages += c.nPage
 				totalReaderPFree += len(c.pFree)
 				db.readerCaches <- c
 				break drainLoop

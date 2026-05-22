@@ -196,6 +196,7 @@ func DefaultOptions() Options {
 //   - Options.Key set with any other non-zero length: treated as a passphrase,
 //     derived via PBKDF2 using the supplied salt and KDFIterations.
 //   - Options.Key set with length 0: rejected.
+//
 // buildCodec constructs the Codec for the resolved mode. `useCksum` is the
 // caller's effective checksum decision (file-state-authoritative on reopen,
 // opts.Checksum on new DBs). buildCodec rejects combining checksum mode with
@@ -264,14 +265,14 @@ var errEmptyFile = errors.New("btree: empty file")
 
 // DB represents an open database.
 type DB struct {
-	mu      sync.RWMutex
-	writeMu sync.Mutex // serializes write transactions
-	pager   *pager
-	path    string
-	opts    Options
-	closing          atomic.Bool // set to reject new transactions
-	closed           atomic.Bool // set when Close() is actually called
-	writerLocksDone  atomic.Bool // CAS guard: writer lock cleanup (endRead+RUnlock+Unlock) runs exactly once
+	mu              sync.RWMutex
+	writeMu         sync.Mutex // serializes write transactions
+	pager           *pager
+	path            string
+	opts            Options
+	closing         atomic.Bool // set to reject new transactions
+	closed          atomic.Bool // set when Close() is actually called
+	writerLocksDone atomic.Bool // CAS guard: writer lock cleanup (endRead+RUnlock+Unlock) runs exactly once
 
 	// Namespace root pages are stored in a master table on page 1.
 	// Format: each cell in the master B-tree maps namespace name -> root page number (4 bytes).
@@ -882,7 +883,7 @@ func (db *DB) putWriteTx(tx *WriteTx) {
 
 // WriterCacheLen returns the number of pages in the writer cache (test helper).
 func (db *DB) WriterCacheLen() int {
-	return len(db.pager.writerCache.pages)
+	return db.pager.writerCache.nPage
 }
 
 // Checkpoint triggers a WAL checkpoint with the specified mode, writing
@@ -1203,7 +1204,6 @@ type ReadTx struct {
 // direct walMaxFrame field access — the field is being migrated to
 // walHdr.mxFrame per the per-connection-hdr spec.
 func (tx *ReadTx) WalMaxFrame() uint32 { return tx.walHdr.mxFrame }
-
 
 // txGetPage fetches a page respecting MVCC snapshot isolation.
 // For write transactions, pages are fetched from the writer cache or WAL.

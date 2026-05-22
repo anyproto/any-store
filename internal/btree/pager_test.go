@@ -295,7 +295,7 @@ func TestFreePage_CorruptLeafCount(t *testing.T) {
 	require.NoError(t, p.freePage(pg4.pgno))
 
 	// Corrupt the trunk page's leaf count
-	trunkPg := p.writerCache.pages[pg4.pgno]
+	trunkPg := p.writerCache.hashFind(pg4.pgno)
 	if trunkPg != nil {
 		binary.BigEndian.PutUint32(trunkPg.data[4:8], uint32(99999)) // corrupt leaf count
 	}
@@ -434,7 +434,7 @@ func TestAllocateFromFreelist_CorruptLeafCount(t *testing.T) {
 	require.NoError(t, p.freePage(pg2.pgno))
 
 	// Corrupt leaf count on trunk
-	trunkPg := p.writerCache.pages[p.header.FirstFreelistPg]
+	trunkPg := p.writerCache.hashFind(p.header.FirstFreelistPg)
 	if trunkPg != nil {
 		binary.BigEndian.PutUint32(trunkPg.data[4:8], uint32(99999))
 	}
@@ -470,7 +470,7 @@ func TestAllocateFromFreelist_CorruptLeafPgno(t *testing.T) {
 
 	// Corrupt the leaf pgno in trunk
 	trunkPgno := p.header.FirstFreelistPg
-	trunkPg := p.writerCache.pages[trunkPgno]
+	trunkPg := p.writerCache.hashFind(trunkPgno)
 	if trunkPg != nil {
 		leafCount := binary.BigEndian.Uint32(trunkPg.data[4:8])
 		if leafCount > 0 {
@@ -505,7 +505,7 @@ func TestAllocateFromFreelist_CorruptNextTrunk(t *testing.T) {
 	require.NoError(t, p.freePage(pg2.pgno))
 
 	// Corrupt next trunk pointer
-	trunkPg := p.writerCache.pages[p.header.FirstFreelistPg]
+	trunkPg := p.writerCache.hashFind(p.header.FirstFreelistPg)
 	if trunkPg != nil {
 		binary.BigEndian.PutUint32(trunkPg.data[0:4], 999) // bad next trunk
 	}
@@ -2084,7 +2084,7 @@ func TestTryResetWALWithBusy_SlotsBusy(t *testing.T) {
 	w.mu.Lock()
 	err := w.tryResetWALWithBusy(nil, false) // nil handler -> ErrBusy -> returns nil
 	w.mu.Unlock()
-	require.NoError(t, err)                          // returns nil on ErrBusy
+	require.NoError(t, err)                     // returns nil on ErrBusy
 	assert.Equal(t, uint32(1), w.nFrame.Load()) // WAL was NOT reset
 
 	_ = w.index.unlock(lockRead0+1, lockShared)
@@ -5135,7 +5135,7 @@ func TestFreePage_TrunkCorruptLeafCount(t *testing.T) {
 	p.releasePage(pg3)
 
 	require.NoError(t, p.freePage(pg2.pgno)) // pg2 becomes trunk
-	trunkPg := p.writerCache.pages[pg2.pgno]
+	trunkPg := p.writerCache.hashFind(pg2.pgno)
 	require.NotNil(t, trunkPg)
 	binary.BigEndian.PutUint32(trunkPg.data[4:8], uint32(p.freelistMaxLeaves()+1))
 
@@ -6058,9 +6058,9 @@ func TestWalRecover_TruncatedSecondFramePageData(t *testing.T) {
 	pageData := make([]byte, pageSize)
 	copy(pageData, "frame 1 data")
 
-	binary.BigEndian.PutUint32(frameHeader[0:4], 2) // pgno = 2
-	binary.BigEndian.PutUint32(frameHeader[4:8], 0) // dbSize = 0 (not commit)
-	binary.BigEndian.PutUint32(frameHeader[8:12], 42) // salt1
+	binary.BigEndian.PutUint32(frameHeader[0:4], 2)    // pgno = 2
+	binary.BigEndian.PutUint32(frameHeader[4:8], 0)    // dbSize = 0 (not commit)
+	binary.BigEndian.PutUint32(frameHeader[8:12], 42)  // salt1
 	binary.BigEndian.PutUint32(frameHeader[12:16], 43) // salt2
 
 	// Compute checksum for frame.
@@ -7236,7 +7236,7 @@ func TestLargeTransactionBoundedMemory(t *testing.T) {
 	// Verify cache size stayed near the limit (with some tolerance for
 	// pinned pages and page 1). The key assertion: cache did NOT grow to
 	// numPages, proving that spilling occurred.
-	cachedCount := len(p.writerCache.pages)
+	cachedCount := p.writerCache.nPage
 	assert.Less(t, cachedCount, numPages,
 		"cache should NOT contain all pages — spilling should have occurred")
 	// The cache should be near maxPages (some tolerance for overhead pages)

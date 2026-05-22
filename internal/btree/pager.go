@@ -1085,12 +1085,16 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 		// Discard any stale cache entry before adopting the temp page.
 		// The stale page may still be on the LRU list (released at
 		// getPageWriter:434); without this, a later evictOne on the stale
-		// page would delete(pc.pages, pgno) and remove the NEW adopted
-		// page from the map, creating a ghost dirty-list entry.
-		if old := p.writerCache.pages[pgno]; old != nil {
+		// page would hashRemove(pgno) and unlink the NEW adopted page from
+		// the cache, creating a ghost dirty-list entry.
+		if old := p.writerCache.hashFind(pgno); old != nil {
 			p.writerCache.discard(pgno)
 		}
-		p.writerCache.pages[pgno] = pg
+		// Link the adopted (already-pinned) temp page directly into the hash.
+		// hashInsert sets pg.inCache so a later release routes through
+		// writerCache.release, and bumps nPage. The page did not pass through
+		// create(), so this is the analogue of the former pc.pages[pgno] = pg.
+		p.writerCache.hashInsert(pg)
 	}
 
 	// Save copy for savepoint rollback if we have active savepoints
@@ -1218,7 +1222,7 @@ func (p *pager) freePage(pgno uint32) error {
 			// Only done when adding as leaf to trunk, NOT when becoming a trunk
 			// (trunk page content is meaningful -- it holds freelist structure).
 			// Matches SQLite's freePage2() (btree.c:6920).
-			if p.writerCache.pages[pgno] != nil {
+			if p.writerCache.hashFind(pgno) != nil {
 				p.dontWrite(pgno)
 			}
 			// Track that this page had content before being freed, so that if
@@ -1456,6 +1460,12 @@ func (p *pager) recycleTempPage(pg *page) {
 	pg.header = pageHeader{}
 	pg.next = nil
 	pg.prev = nil
+	// Clear pcache hash-chain membership so a pooled page reused as a temp page
+	// (or adopted into the writer cache via getWritablePage) never carries a
+	// stale bucket link or inCache flag. Temp pages never enter apHash directly,
+	// but resetting here keeps the pagePool population disjoint from the cache.
+	pg.hashNext = nil
+	pg.inCache = false
 	p.pagePool.Put(pg)
 }
 
@@ -1776,7 +1786,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 				len(p.dontWritePages), p.writerCache.nDirty, len(p.savepoints))
 		}
 		for pgno := range p.dontWritePages {
-			if pg := p.writerCache.pages[pgno]; pg != nil {
+			if pg := p.writerCache.hashFind(pgno); pg != nil {
 				if debugTrace && pg.dirty {
 					trace("commit: dontWrite filtering pg=%d (skipping WAL write)", pgno)
 				}
@@ -2095,7 +2105,7 @@ func (p *pager) rollbackToSavepoint(id int) error {
 
 	if debugTrace {
 		trace("rollbackToSavepoint: id=%d spDbSize=%d currentDbSize=%d numSavepoints=%d cachedPages=%d",
-			id, sp.dbSize, p.dbSize.Load(), len(p.savepoints), len(p.writerCache.pages))
+			id, sp.dbSize, p.dbSize.Load(), len(p.savepoints), p.writerCache.nPage)
 	}
 
 	// Suppress spills during savepoint rollback (SQLite pager.c:2457).
