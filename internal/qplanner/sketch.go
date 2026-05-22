@@ -122,6 +122,80 @@ func (s *IndexSketch) UnmarshalBinary(data []byte) {
 	}
 }
 
+// SketchDistribution summarizes the frequency distribution held in a sketch's
+// bucket array. Because values are hashed into a fixed number of buckets, it
+// describes per-bucket load rather than exact per-value cardinality; it is
+// still a good indicator of skew and of how saturated the sketch is.
+type SketchDistribution struct {
+	// NonEmptyBuckets is the number of buckets with a count greater than zero.
+	NonEmptyBuckets int
+	// Fill is NonEmptyBuckets/Size — the sketch's saturation. A value near 1.0
+	// means distinct values far exceed Size and per-value estimates degrade.
+	Fill float64
+	// MinNonEmpty is the smallest non-zero bucket count.
+	MinNonEmpty uint64
+	// MaxBucket is the largest bucket count — the heaviest indexed value(s).
+	MaxBucket uint64
+	// MeanNonEmpty is the mean count over non-empty buckets.
+	MeanNonEmpty float64
+	// P50, P90 and P99 are percentile bucket counts over non-empty buckets.
+	P50 uint64
+	P90 uint64
+	P99 uint64
+	// Skew is MaxBucket/MeanNonEmpty — values well above 1 flag a hot value.
+	Skew float64
+}
+
+// Distribution computes a summary of the sketch's bucket frequency
+// distribution in a single atomic-load pass. An empty sketch yields the zero
+// value.
+func (s *IndexSketch) Distribution() SketchDistribution {
+	var d SketchDistribution
+	if s.Size == 0 {
+		return d
+	}
+	counts := make([]uint64, 0, s.Size)
+	var sum uint64
+	for i := range s.Size {
+		c := atomic.LoadUint64(&s.Buckets[i])
+		if c == 0 {
+			continue
+		}
+		counts = append(counts, c)
+		sum += c
+		if c > d.MaxBucket {
+			d.MaxBucket = c
+		}
+		if d.MinNonEmpty == 0 || c < d.MinNonEmpty {
+			d.MinNonEmpty = c
+		}
+	}
+	d.NonEmptyBuckets = len(counts)
+	d.Fill = float64(len(counts)) / float64(s.Size)
+	if len(counts) == 0 {
+		return d
+	}
+	d.MeanNonEmpty = float64(sum) / float64(len(counts))
+	if d.MeanNonEmpty > 0 {
+		d.Skew = float64(d.MaxBucket) / d.MeanNonEmpty
+	}
+	slices.Sort(counts)
+	d.P50 = percentile(counts, 0.50)
+	d.P90 = percentile(counts, 0.90)
+	d.P99 = percentile(counts, 0.99)
+	return d
+}
+
+// percentile returns the p-quantile of an ascending-sorted slice using the
+// nearest-rank method. sorted must be non-empty.
+func percentile(sorted []uint64, p float64) uint64 {
+	idx := int(p * float64(len(sorted)))
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
+}
+
 // Reset zeroes all buckets and the document count.
 func (s *IndexSketch) Reset() {
 	for i := range s.Buckets {

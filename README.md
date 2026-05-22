@@ -71,6 +71,11 @@ func main() {
         doc, _ := res.Doc()
         fmt.Println(doc.Value().String())
     }
+
+    // Inspect storage footprint: doc count, sizes, compression and per-index stats.
+    st, _ := users.Stats(ctx)
+    fmt.Printf("docs=%d total=%d bytes ratio=%.2fx\n",
+        st.DocCount, st.TotalSizeBytes, st.CompressionRatio)
 }
 ```
 

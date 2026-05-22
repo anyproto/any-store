@@ -73,7 +73,7 @@ func collAccessor(name string) string {
 	return "db[" + strconv.Quote(name) + "]"
 }
 
-var collCommands = []string{"insert", "find", "findOne", "findId", "deleteId", "update", "updateId", "upsert", "upsertId", "ensureIndex", "dropIndex", "getIndexes", "rename", "drop", "count"}
+var collCommands = []string{"insert", "find", "findOne", "findId", "deleteId", "update", "updateId", "upsert", "upsertId", "ensureIndex", "dropIndex", "getIndexes", "rename", "drop", "count", "stats"}
 
 func (c *Conn) makeAutocomplete() (err error) {
 	collNames, err := c.db.GetCollectionNames(mainCtx.Ctx())
@@ -167,6 +167,8 @@ func (c *Conn) ExecCmd(cmd Cmd) (result string, err error) {
 		return c.UpsertId(cmd)
 	case "count":
 		return c.Count(cmd)
+	case "stats":
+		return c.Stats(cmd)
 	case "find":
 		return c.Find(cmd)
 	case "findOne":
@@ -204,6 +206,7 @@ var helpData = map[string]string{
 	"upsert":           "Description: Upsert documents into a collection\nExample: db.collection.upsert({id: \"1\", name: \"test\"})",
 	"upsertId":         "Description: Upsert a document by ID with a modifier\nExample: db.collection.upsertId(\"1\", {$set: {name: \"new name\"}})",
 	"count":            "Description: Count documents in a collection\nExample: db.collection.count()",
+	"stats":            "Description: Show storage statistics for a collection (doc count, sizes, compression, per-index size and sketch distribution)\nExample: db.collection.stats()",
 	"find":             "Description: Find documents in a collection\nExample: db.collection.find({name: \"test\"}).limit(10)",
 	"findOne":          "Description: Find one document in a collection\nExample: db.collection.findOne({id: \"1\"})",
 	"findId":           "Description: Find documents by ID\nExample: db.collection.findId(\"1\", \"2\")",
@@ -253,6 +256,7 @@ func (c *Conn) Help(cmd Cmd) (string, error) {
 		sb.WriteString("      .updateId(id, mod)\n")
 		sb.WriteString("      .deleteId(id, ...)\n")
 		sb.WriteString("      .count()\n")
+		sb.WriteString("      .stats()\n")
 		sb.WriteString("      .ensureIndex(indexDef)\n")
 		sb.WriteString("      .dropIndex(name)\n")
 		sb.WriteString("      .getIndexes()\n")
@@ -547,6 +551,65 @@ func (c *Conn) Count(cmd Cmd) (result string, err error) {
 	}
 	result = fmt.Sprintf("%d", count)
 	return
+}
+
+func (c *Conn) Stats(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	st, err := coll.Stats(mainCtx.Ctx())
+	if err != nil {
+		return
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Collection:\t%s\n", st.Name)
+	fmt.Fprintf(&b, "Documents:\t%d\n", st.DocCount)
+	fmt.Fprintf(&b, "Stored docs:\t%s\n", formatKiB(st.StoredDocsBytes))
+	fmt.Fprintf(&b, "Uncompressed:\t%s\n", formatKiB(st.UncompressedDocsBytes))
+	if st.CompressionEnabled {
+		fmt.Fprintf(&b, "Compression:\tenabled (%.2fx)\n", st.CompressionRatio)
+	} else {
+		b.WriteString("Compression:\tdisabled\n")
+	}
+	fmt.Fprintf(&b, "Docs size:\t%s\n", formatKiB(st.DocsSizeBytes))
+	fmt.Fprintf(&b, "Indexes size:\t%s\n", formatKiB(st.IndexesSizeBytes))
+	fmt.Fprintf(&b, "Total size:\t%s\n", formatKiB(st.TotalSizeBytes))
+
+	if len(st.Indexes) > 0 {
+		b.WriteString("\nIndexes:\n")
+		for _, idx := range st.Indexes {
+			name := idx.Name
+			if name == "" {
+				name = strings.Join(idx.Fields, ",")
+			}
+			flags := ""
+			if idx.Unique {
+				flags += " unique"
+			}
+			if idx.Sparse {
+				flags += " sparse"
+			}
+			fmt.Fprintf(&b, "  %s [%s]%s\n", name, strings.Join(idx.Fields, ","), flags)
+			fmt.Fprintf(&b, "    entries=%d  size=%s\n", idx.EntryCount, formatKiB(idx.SizeBytes))
+			fill := 0.0
+			if idx.SketchSize > 0 {
+				fill = idx.SketchDistribution.Fill * 100
+			}
+			fmt.Fprintf(&b, "    sketch: docs=%d  buckets=%d/%d (%.0f%% fill)\n",
+				idx.SketchDocCount, idx.SketchDistribution.NonEmptyBuckets, idx.SketchSize, fill)
+			d := idx.SketchDistribution
+			fmt.Fprintf(&b, "    distribution: max=%d  mean=%.1f  p50=%d p90=%d p99=%d  skew=%.1fx\n",
+				d.MaxBucket, d.MeanNonEmpty, d.P50, d.P90, d.P99, d.Skew)
+		}
+	}
+	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+// formatKiB renders a byte count in KiB, matching the "show stats" command.
+func formatKiB(bytes int) string {
+	return fmt.Sprintf("%d KiB", bytes/1024)
 }
 
 func (c *Conn) EnsureIndex(cmd Cmd) (result string, err error) {

@@ -91,3 +91,48 @@ func TestNewIndexSketch_DefaultsBadSize(t *testing.T) {
 	s2 := NewIndexSketch(-5)
 	assert.Equal(t, DefaultSketchSize, s2.Size)
 }
+
+// TestIndexSketch_Distribution covers Distribution across the empty, uniform
+// and skewed cases plus the percentile helper.
+func TestIndexSketch_Distribution(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		s := NewIndexSketch(64)
+		d := s.Distribution()
+		assert.Equal(t, SketchDistribution{}, d)
+	})
+
+	t.Run("uniform", func(t *testing.T) {
+		// One increment into every bucket: fully filled, no skew.
+		s := NewIndexSketch(64)
+		for i := range s.Buckets {
+			s.Buckets[i] = 1
+		}
+		d := s.Distribution()
+		assert.Equal(t, 64, d.NonEmptyBuckets)
+		assert.Equal(t, 1.0, d.Fill)
+		assert.Equal(t, uint64(1), d.MinNonEmpty)
+		assert.Equal(t, uint64(1), d.MaxBucket)
+		assert.Equal(t, 1.0, d.MeanNonEmpty)
+		assert.Equal(t, uint64(1), d.P50)
+		assert.Equal(t, uint64(1), d.P99)
+		assert.Equal(t, 1.0, d.Skew)
+	})
+
+	t.Run("skewed", func(t *testing.T) {
+		// Many light buckets and one very hot bucket.
+		s := NewIndexSketch(100)
+		for i := 0; i < 50; i++ {
+			s.Buckets[i] = 2
+		}
+		s.Buckets[99] = 200
+		d := s.Distribution()
+		assert.Equal(t, 51, d.NonEmptyBuckets)
+		assert.InDelta(t, 0.51, d.Fill, 1e-9)
+		assert.Equal(t, uint64(2), d.MinNonEmpty)
+		assert.Equal(t, uint64(200), d.MaxBucket)
+		assert.Greater(t, d.Skew, 1.0)
+		assert.Equal(t, uint64(2), d.P50)
+		// The hot bucket sits in the top percentile.
+		assert.Equal(t, uint64(200), d.P99)
+	})
+}

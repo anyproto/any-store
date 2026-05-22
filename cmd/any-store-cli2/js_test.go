@@ -38,6 +38,12 @@ func Test_Js(t *testing.T) {
 			Collection: "coll",
 		})
 	})
+	t.Run("stats", func(t *testing.T) {
+		assertCmd(t, `db.coll.stats()`, Cmd{
+			Cmd:        "stats",
+			Collection: "coll",
+		})
+	})
 	t.Run("find", func(t *testing.T) {
 		assertCmd(t, `db.coll.find()`, Cmd{
 			Cmd:        "find",

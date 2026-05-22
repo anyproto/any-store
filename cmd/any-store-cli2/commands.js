@@ -165,6 +165,18 @@ Collection.prototype.count = function () {
     }
 }
 
+Collection.prototype.stats = function () {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "stats",
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
 Collection.prototype.getIndexes = function () {
     var res = JSON.stringify({
         collection: this.collection,

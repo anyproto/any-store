@@ -75,6 +75,11 @@ type Collection interface {
 	// GetIndexes returns a list of indexes on the collection.
 	GetIndexes() (indexes []Index)
 
+	// Stats returns the storage footprint of the collection: document count,
+	// stored and uncompressed sizes, compression ratio and per-index sizes.
+	// It scans the whole collection and is intended for diagnostics.
+	Stats(ctx context.Context) (CollectionStats, error)
+
 	// Rename renames the collection.
 	// Returns an error if the operation fails.
 	Rename(ctx context.Context, newName string) (err error)
