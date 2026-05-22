@@ -8,7 +8,9 @@ import (
 )
 
 func main() {
-	pflag.Parse()
+	if err := pflag.CommandLine.Parse(normalizeArgs(os.Args[1:])); err != nil {
+		os.Exit(2)
+	}
 	if *fHelp {
 		printUsage()
 		return
