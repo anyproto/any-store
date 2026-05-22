@@ -1,0 +1,9 @@
+go 1.25.0
+
+// Local development: builds the CLI against the in-tree library instead of
+// the pinned release in cmd/any-store-cli2/go.mod.
+// Ignored by `go install <module>@<version>`, which uses the pinned require.
+use (
+	.
+	./cmd/any-store-cli2
+)

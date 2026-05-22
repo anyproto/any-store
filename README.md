@@ -33,7 +33,7 @@ go get github.com/anyproto/any-store/v2
 ### Install CLI (optional)
 
 ```bash
-go install github.com/anyproto/any-store/v2/cmd/any-store-cli@latest
+go install github.com/anyproto/any-store/cmd/any-store-cli2/v2@latest
 ```
 
 ### Hello, Any Store
@@ -80,7 +80,7 @@ The full end‑to‑end example lives in [`example/`](example) and in the [API 
 ## Documentation
 
 * **API reference** – [https://pkg.go.dev/github.com/anyproto/any-store/v2](https://pkg.go.dev/github.com/anyproto/any-store/v2)
-* **CLI manual** – `any-store-cli --help`
+* **CLI manual** – `any-store-cli2 --help`
 
 
 ## Design highlights
