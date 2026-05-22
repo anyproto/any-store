@@ -1572,6 +1572,20 @@ func (p *pager) refreshHeaderFromPage1() {
 	}
 }
 
+// committedCounters returns the FileChangeCount and SchemaCookie from the
+// in-memory header. It is only valid to call while holding the writer
+// (BeginWrite holds db.writeMu and the pager is in pagerWriter state after
+// beginWrite, so p.header is owned exclusively by this writer — no data race
+// with concurrent readers). The values reflect the latest committed page 1:
+// beginWrite refreshes p.header via refreshHeaderFromPage1 on the stateChanged
+// edge that signals a peer commit/checkpoint, so this returns exactly what
+// readHeaderCounters would read from page 1 — without the per-tx WAL hash
+// lookup + frame read. Mirrors SQLite keeping the header in the in-memory
+// page-1 PgHdr rather than re-reading it from the WAL per statement.
+func (p *pager) committedCounters() (fileChangeCount, schemaCookie uint32) {
+	return p.header.FileChangeCount, p.header.SchemaCookie
+}
+
 // readHeaderCounters reads the FileChangeCount and SchemaCookie from page 1.
 // It checks the SHM header to discover the true WAL state (including frames
 // written by other processes), then uses shmHashGet + direct WAL file read to
@@ -1745,38 +1759,40 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	// Update the in-memory header with current database size.
 	p.header.DatabaseSize = p.dbSize.Load()
 
-	// Collect dirty pages first to determine if there are real changes.
-	p.dirtyBuf = p.writerCache.appendDirtyPages(p.dirtyBuf[:0])
-
-	// Filter out dontWrite pages before WAL write (fix 5.4).
-	// These are freed leaf pages whose content is irrelevant.
+	// Filter out dontWrite pages before WAL write (fix 5.4). These are freed
+	// leaf pages whose content is irrelevant. We clean them directly from the
+	// cache by iterating the dontWritePages map (no dirty-list collect): a
+	// dontWrite page is either dirty (makeClean removes it from the dirty
+	// list and decrements nDirty), already clean from a prior spill
+	// (makeClean is a no-op), or evicted (absent from the cache — nothing to
+	// do). This is equivalent to the previous dirty-list walk but avoids a
+	// redundant dirty-page collection. The authoritative dirty set is
+	// collected exactly once below, after page 1 is dirtied — mirroring
+	// SQLite's single sqlite3PcacheDirtyList in sqlite3PagerCommitPhaseOne
+	// (pager.c:6502).
 	if len(p.dontWritePages) > 0 {
 		if debugTrace {
-			trace("commit: filtering %d dontWrite pages from %d dirty pages savepoints=%d",
-				len(p.dontWritePages), len(p.dirtyBuf), len(p.savepoints))
+			trace("commit: filtering %d dontWrite pages (nDirty=%d) savepoints=%d",
+				len(p.dontWritePages), p.writerCache.nDirty, len(p.savepoints))
 		}
-		n := 0
-		for _, pg := range p.dirtyBuf {
-			if p.dontWritePages[pg.pgno] {
-				if debugTrace {
-					trace("commit: dontWrite filtering pg=%d (skipping WAL write)", pg.pgno)
+		for pgno := range p.dontWritePages {
+			if pg := p.writerCache.pages[pgno]; pg != nil {
+				if debugTrace && pg.dirty {
+					trace("commit: dontWrite filtering pg=%d (skipping WAL write)", pgno)
 				}
 				p.writerCache.makeClean(pg)
-			} else {
-				p.dirtyBuf[n] = pg
-				n++
 			}
 		}
-		p.dirtyBuf = p.dirtyBuf[:n]
 		clear(p.dontWritePages)
 	}
 
 	// Determine if there are real changes: dirty data pages, header
 	// modifications (freelist, dbSize changes), or spilled pages. Counter
 	// increments are deferred until we confirm there's something to commit.
+	// nDirty (post dontWrite-filter) counts the pages that would be collected.
 	// The nFrame check catches transactions where all dirty pages were spilled
-	// (making dirtyBuf empty) but a commit frame is still needed.
-	hasRealChanges := len(p.dirtyBuf) > 0 || p.header != p.savedHeader ||
+	// (making nDirty zero) but a commit frame is still needed.
+	hasRealChanges := p.writerCache.nDirty > 0 || p.header != p.savedHeader ||
 		p.wal.nFrame.Load() > p.savedWalFrame.Load()
 
 	if !hasRealChanges {
@@ -1816,7 +1832,9 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	}
 	p.releasePage(pg1)
 
-	// Re-collect dirty pages since page 1 may be newly dirty.
+	// Collect the authoritative dirty set once, now that page 1 has been
+	// dirtied. dontWrite pages were already cleaned above so they are not on
+	// the dirty list. Single collection mirrors SQLite (pager.c:6502).
 	p.dirtyBuf = p.writerCache.appendDirtyPages(p.dirtyBuf[:0])
 
 	if debugTrace {

@@ -1348,10 +1348,18 @@ func TestBeginWrite_BeginWriteError(t *testing.T) {
 }
 
 func TestBeginWrite_ReadHeaderCountersError(t *testing.T) {
-	// Cover lines 246-252: readHeaderCounters fails inside BeginWrite.
-	// We need to corrupt the db file between beginRead and readHeaderCounters.
-	// Achieve this by using a non-InProcess db where readHeaderCounters reads
-	// the file, then truncate the file after pager.beginRead succeeds.
+	// Reader-path corruption detection: readHeaderCounters reads page 1 from
+	// the db file when no WAL frame exists for it. Truncating the file makes
+	// that read fail, so BeginRead (which reads on-disk counters for staleness
+	// detection) errors.
+	//
+	// BeginWrite, by contrast, no longer re-reads page 1 from the WAL/file per
+	// transaction: it takes the staleness counters from the in-memory header,
+	// which beginWrite refreshes only on the stateChanged edge (peer
+	// commit/checkpoint), mirroring SQLite keeping the header in the in-memory
+	// page-1 PgHdr (pager.c). So BeginWrite succeeds on the truncated file —
+	// the corruption is instead caught when the writer first touches a page
+	// that must be read from the now-truncated file.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
@@ -1359,7 +1367,7 @@ func TestBeginWrite_ReadHeaderCountersError(t *testing.T) {
 	db, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 
-	// Write and checkpoint
+	// Write and checkpoint so page 1 lives in the db file (empty WAL).
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
 	_, err = tx.CreateNamespace("test")
@@ -1373,18 +1381,24 @@ func TestBeginWrite_ReadHeaderCountersError(t *testing.T) {
 	require.NoError(t, err)
 
 	// Now truncate the db file — readHeaderCounters reads page 1 from disk
-	// when no WAL frames exist for page 1
+	// when no WAL frames exist for page 1.
 	require.NoError(t, db2.pager.file.Truncate(10))
 
-	// BeginRead should fail at readHeaderCounters
+	// BeginRead should fail at readHeaderCounters (reads on-disk page 1).
 	_, err = db2.BeginRead()
 	assert.Error(t, err)
 
-	// Also test BeginWrite — need to restore file just enough for beginRead to succeed
-	// but readHeaderCounters to fail. Since truncation makes the file unreadable,
-	// BeginWrite will also fail.
-	_, err = db2.BeginWrite()
+	// BeginWrite no longer reads page 1 per-tx, so it succeeds: the staleness
+	// counters come from the in-memory header.
+	wtx, err := db2.BeginWrite()
+	require.NoError(t, err)
+
+	// The corruption is still caught: resolving a namespace forces a read of a
+	// page beyond the 10-byte truncation, which fails.
+	_, err = wtx.GetNamespace("test")
 	assert.Error(t, err)
+
+	_ = wtx.Rollback()
 
 	// Restore for cleanup
 	db2.pager.state.Store(int32(pagerOpen))

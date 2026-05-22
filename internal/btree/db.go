@@ -767,7 +767,6 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 
 	var maxFrame uint32
 	var slot int
-	var fcc, sc uint32
 	var readSnap WalIndexHdr
 
 	for attempt := 0; ; attempt++ {
@@ -780,15 +779,6 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 					continue
 				}
 			}
-			db.mu.RUnlock()
-			db.writeMu.Unlock()
-			return nil, err
-		}
-
-		// Read on-disk counters for staleness detection.
-		fcc, sc, err = db.pager.readHeaderCounters(maxFrame)
-		if err != nil {
-			db.pager.endRead(slot)
 			db.mu.RUnlock()
 			db.writeMu.Unlock()
 			return nil, err
@@ -823,6 +813,22 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 			}
 		}
 	}
+
+	// Read the committed page-1 counters for staleness detection from the
+	// in-memory header instead of re-reading page 1 from the WAL on every
+	// write tx. After beginWrite, p.header is authoritative: beginWrite
+	// invokes refreshHeaderFromPage1 on the exact stateChanged edge
+	// (wal.beginWriteWithSnapshot: live SHM hdr != writerHdr) that signals a
+	// peer process committed or checkpointed — the same WAL-index-change edge
+	// SQLite uses to pager_reset and re-read page 1 (pager.c:3246-3267
+	// pagerBeginReadTransaction). When stateChanged is false the SHM header
+	// equals what this process last wrote, so the on-disk counters are
+	// unchanged and p.header still matches. SQLite likewise keeps the header
+	// in the in-memory page-1 PgHdr and does not re-read it from the WAL per
+	// statement. The staleness signal (diskFileChangeCounter vs
+	// localFileChangeCounter, consumed by checkStale → IsDataStale) is
+	// therefore preserved on the identical invalidation edge.
+	fcc, sc := db.pager.committedCounters()
 
 	// Reset the cleanup guard for this write transaction.
 	db.writerLocksDone.Store(false)
