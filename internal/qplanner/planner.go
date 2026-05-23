@@ -753,12 +753,23 @@ func estimateIndexDocsWithFieldSel(idx *CBOIndex, totalDocs float64, fieldSel []
 func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator {
 	var root Iterator
 
-	idSorted := false
+	// Fetch the sort fields once and reuse them for both the id-sort fast-path
+	// check and projection wiring, avoiding repeated Sort.Fields() allocations.
+	var sortFields []query.SortField
 	if needSort {
-		fields := params.Sorter.Fields()
-		if len(fields) == 1 && fields[0].Field == "id" {
+		sortFields = params.Sorter.Fields()
+	}
+
+	// Whether a SortIter will wrap the FullScanIter (so a matched doc is
+	// re-parsed at emit and the leaf may cache a projected doc) is decided
+	// below; the id-sort fast path handles ordering at the cursor level and
+	// does NOT add a SortIter.
+	idSorted := false
+	var fsi *FullScanIter
+	if needSort {
+		if len(sortFields) == 1 && sortFields[0].Field == "id" {
 			idSorted = true
-			fsi := &FullScanIter{
+			fsi = &FullScanIter{
 				Source: &CursorSource{
 					Tx: params.Tx,
 					Ns: params.DataNs,
@@ -766,7 +777,7 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 				Filter:   params.Filter,
 				IDBounds: params.IDBounds,
 				Buf:      params.Buf,
-				Reverse:  fields[0].Reverse,
+				Reverse:  sortFields[0].Reverse,
 			}
 			// Absorb offset into cursor-level batch skip when no filter.
 			if !needFilter && params.Offset > 0 {
@@ -777,7 +788,7 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 	}
 
 	if root == nil {
-		root = &FullScanIter{
+		fsi = &FullScanIter{
 			Source: &CursorSource{
 				Tx: params.Tx,
 				Ns: params.DataNs,
@@ -786,10 +797,51 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 			IDBounds: params.IDBounds,
 			Buf:      params.Buf,
 		}
+		root = fsi
 	}
 
-	if needSort && !idSorted {
-		root = &SortIter{
+	sortWrapsLeaf := needSort && !idSorted
+
+	// Configure projected (lazy) decode on the leaf scan. The scanned doc is
+	// cached in Plan.DocParsed; it must contain every field a later consumer
+	// reads from that cached value:
+	//   - the filter itself (always, when present);
+	//   - the sort key, IFF a SortIter directly above reads the same cached doc
+	//     (sortWrapsLeaf) — the id-sort fast path orders at the cursor and does
+	//     not read the doc, so it's excluded.
+	// EmitFull is set when the cached doc is emitted whole with no intervening
+	// re-parse (no sort above, and not a count) — then a matched row is
+	// re-parsed in full before caching.
+	//
+	// Two cases set ProjectFields:
+	//   1. needFilter: project filter∪(sort if sortWrapsLeaf) to test the
+	//      filter cheaply; cache projected (or full if EmitFull) on match.
+	//   2. !needFilter && sortWrapsLeaf: there is no filter, but a SortIter
+	//      above needs the sort key. Project just the sort-key fields from the
+	//      cursor value and cache them, so the SortIter reuses the cached doc
+	//      instead of doing a per-row point-lookup re-fetch + full re-parse.
+	if fsi != nil {
+		if needFilter {
+			// Fill the leaf's inline projection buffer (no heap alloc when the
+			// filter∪sort root set fits projectBuf).
+			var foldSort []query.SortField
+			if sortWrapsLeaf {
+				foldSort = sortFields
+			}
+			if pf, ok := scanProjection(fsi.projectBuf[:0], params.Filter, foldSort); ok {
+				fsi.ProjectFields = pf
+				fsi.EmitFull = !params.CountOnly && !sortWrapsLeaf
+			}
+		} else if sortWrapsLeaf {
+			if sf, ok := sortRootsFromFields(fsi.projectBuf[:0], sortFields); ok && len(sf) > 0 {
+				fsi.ProjectFields = sf
+				fsi.EmitFull = false // SortIter re-parses the survivors in full on emit
+			}
+		}
+	}
+
+	if sortWrapsLeaf {
+		si := &SortIter{
 			Source: root,
 			Data: &CursorSource{
 				Tx: params.Tx,
@@ -799,6 +851,15 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 			Buf:    params.Buf,
 			TopK:   params.Limit + params.Offset,
 		}
+		// When the SortIter parses the doc itself (unfiltered scan => no cached
+		// DocParsed), decode only the sort-key fields. When the source is a
+		// filtered scan, the leaf already caches a doc projected over the
+		// filter∪sort union, so this is unused but harmless. Fill the inline
+		// buffer to avoid a per-query heap allocation.
+		if sf, ok := sortRootsFromFields(si.projectBuf[:0], sortFields); ok && len(sf) > 0 {
+			si.ProjectFields = sf
+		}
+		root = si
 	}
 
 	return root

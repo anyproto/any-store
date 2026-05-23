@@ -103,6 +103,156 @@ func (p *Parser) ApproxSize() int {
 	return p.c.approxSizeValues()
 }
 
+// ParseProjected parses an encoded top-level object, fully decoding only the
+// values whose key is in want and structurally skipping every other key's
+// value (no allocation, no Value materialized for it). It is the v2 analogue
+// of SQLite's OP_Column lazy single-column decode (sqlitec/src/vdbe.c): only
+// the referenced fields are materialized; the rest of the record is walked but
+// never built.
+//
+// b is NOT copied (like ParseOwned): the caller must guarantee b is not
+// modified until the returned Value is no longer used.
+//
+// For every key k in the top-level object:
+//   - if k ∈ want, its value subtree is decoded EXACTLY as ParseOwned would
+//     (byte-for-byte identical, including arrays and nested objects), so
+//     v.Get(k, ...) returns the same result as a full parse;
+//   - if k ∉ want, its value is skipped via the existing no-alloc structural
+//     walk (parseValue with a nil cache), so v.Get(k) returns nil.
+//
+// Keys not present in the document simply don't appear (same as ParseOwned).
+// want should be non-empty; an empty want decodes no fields (an empty object).
+//
+// Only the TOP-LEVEL object is projected. A wanted key whose value is itself a
+// nested object/array is fully decoded, so nested-path lookups (v.Get("a","b"))
+// remain correct as long as the ROOT key ("a") is in want.
+//
+// Fallback: if b is not a top-level object (or compressed object), ParseProjected
+// degrades to a full ParseOwned of the value — projection only applies to the
+// object case. Compressed top-level objects are decompressed (same cost as a
+// full parse) and then the inner object is projected.
+//
+// The returned value is valid until the next call to Parse*/ParseOwned/
+// ParseProjected, or until b is modified — whichever comes first.
+func (p *Parser) ParseProjected(b []byte, want []string) (v *Value, err error) {
+	p.c.reset()
+	if len(b) == 0 {
+		return nil, fmt.Errorf("expected value, but got 0 byte")
+	}
+	var tail []byte
+	switch Type(b[0]) {
+	case TypeObject:
+		v, tail, err = parseObjectProjected(b[1:], &p.c, want)
+	case TypeCompressedObjectS2:
+		// Decompressing already touches the whole payload, so there is no
+		// decode to skip; project the decompressed inner object instead.
+		v, tail, err = parseCompressedObjectProjected(b, &p.c, want)
+	default:
+		// Not an object: nothing to project. Fall back to a full owned parse.
+		v, tail, err = parseValue(b, &p.c)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(tail) != 0 {
+		return nil, fmt.Errorf("unexpected tail")
+	}
+	return v, nil
+}
+
+// wantKey reports whether key is in the want set. The set is tiny (1–3 fields
+// in practice — the union of filter and sort field roots), so a linear scan is
+// faster and allocation-free compared to a map.
+func wantKey(want []string, key string) bool {
+	for _, w := range want {
+		if w == key {
+			return true
+		}
+	}
+	return false
+}
+
+// parseObjectProjected mirrors parseObject, but only materializes a kvs entry
+// (and decodes its value) for keys in want; other keys' values are skipped via
+// the nil-cache structural walk. The byte layout consumed is identical to
+// parseObject, so the tail returned is the same and skipped values are walked
+// with full validation.
+func parseObjectProjected(b []byte, c *cache, want []string) (*Value, []byte, error) {
+	o := c.getValue()
+	o.t = TypeObject
+	o.o.kvs = o.o.kvs[:0]
+	var i int
+	var err error
+	for {
+		if len(b) == 0 {
+			return nil, nil, fmt.Errorf("parse object: unexpected end")
+		}
+		if b[0] == EOS {
+			return o, b[1:], nil
+		}
+		eosI := bytes.IndexByte(b, EOS)
+		if eosI < 0 {
+			return nil, nil, fmt.Errorf("parse object key: end of string not found")
+		}
+		var key string
+		if len(b[:eosI]) == 1 && b[0] == emptyKey {
+			key = ""
+		} else {
+			key = unsafe.String(unsafe.SliceData(b[:eosI]), len(b[:eosI]))
+		}
+		if wantKey(want, key) {
+			o.o.kvs = slices.Grow(o.o.kvs, 1)[:i+1]
+			o.o.kvs[i].key = key
+			if o.o.kvs[i].value, b, err = parseValue(b[eosI+1:], c); err != nil {
+				return nil, nil, err
+			}
+			i++
+		} else {
+			// Skip the value structurally (no alloc, full validation).
+			if _, b, err = parseValue(b[eosI+1:], nil); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+}
+
+// parseCompressedObjectProjected decompresses the S2 payload (reusing the
+// cache's decompBuf, like parseCompressedObjectS2) and projects the inner
+// value. The inner value is expected to be an object; if it is not, it is
+// fully decoded (projection is a no-op for non-objects).
+func parseCompressedObjectProjected(b []byte, c *cache, want []string) (*Value, []byte, error) {
+	if len(b) < 5 {
+		return nil, nil, fmt.Errorf("compressed object: expected at least 5 bytes, got %d", len(b))
+	}
+	compLen := binary.BigEndian.Uint32(b[1:5])
+	if uint32(len(b)-5) < compLen {
+		return nil, nil, fmt.Errorf("compressed object: expected %d compressed bytes, got %d", compLen, len(b)-5)
+	}
+	compressed := b[5 : 5+compLen]
+	tail := b[5+compLen:]
+
+	var err error
+	c.decompBuf, err = s2.Decode(c.decompBuf[:cap(c.decompBuf)], compressed)
+	if err != nil {
+		return nil, nil, fmt.Errorf("compressed object: s2 decode: %w", err)
+	}
+	decompressed := c.decompBuf
+
+	if len(decompressed) == 0 {
+		return nil, nil, fmt.Errorf("compressed object: empty inner value")
+	}
+	var v *Value
+	if Type(decompressed[0]) == TypeObject {
+		v, _, err = parseObjectProjected(decompressed[1:], c, want)
+	} else {
+		v, _, err = parseValue(decompressed, c)
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("compressed object: parse inner: %w", err)
+	}
+	return v, tail, nil
+}
+
 func parseValue(b []byte, c *cache) (v *Value, tail []byte, err error) {
 	if len(b) == 0 {
 		return nil, nil, fmt.Errorf("expected value, but got 0 byte")

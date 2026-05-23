@@ -45,6 +45,17 @@ type SortIter struct {
 	order     []int // reusable scratch: live-entry indices sorted by arena offset (compaction)
 	PartiallySorted bool // leading index fields match sort order; pdqsort benefits automatically
 	inited          bool
+
+	// ProjectFields, when non-nil, lists the top-level field roots the sort key
+	// references. When SortIter parses the doc itself (no upstream-cached
+	// DocParsed), only these fields are decoded to build the sort key; the rest
+	// of the record is skipped (anyenc OP_Column analogue). Sort survivors are
+	// re-fetched and fully re-parsed at emit time (Next clears DocParsed), so a
+	// projected collect-time parse never reaches the consumer. nil => full
+	// ParseOwned. It points into projectBuf when the field set fits, so
+	// configuring projection costs no heap allocation per query.
+	ProjectFields []string
+	projectBuf    [4]string
 }
 
 type sortEntry struct {
@@ -117,7 +128,10 @@ func (it *SortIter) collectAndSort() error {
 			break
 		}
 
-		// Prefer already-parsed doc from upstream (FullScanIter/FetchIter/FilterIter)
+		// Prefer already-parsed doc from upstream (FullScanIter/FetchIter/FilterIter).
+		// When upstream caches a doc it is guaranteed to contain the sort-key
+		// fields (the scan's projection set is the union of filter and sort
+		// roots — see scanProjection), so reusing it is correct.
 		doc := it.Plan.DocParsed
 		if doc == nil {
 			// Cursor-free point lookup: avoids Cursor allocation
@@ -127,7 +141,14 @@ func (it *SortIter) collectAndSort() error {
 				continue
 			}
 			var perr error
-			doc, perr = it.Buf.Parser.ParseOwned(it.Buf.DocBuf)
+			// Projected decode: only the sort-key fields are needed to build
+			// the key here; survivors are re-fetched + fully re-parsed on emit
+			// (Next clears DocParsed), so dropping the other fields is safe.
+			if it.ProjectFields != nil {
+				doc, perr = it.Buf.Parser.ParseProjected(it.Buf.DocBuf, it.ProjectFields)
+			} else {
+				doc, perr = it.Buf.Parser.ParseOwned(it.Buf.DocBuf)
+			}
 			if perr != nil {
 				return perr
 			}

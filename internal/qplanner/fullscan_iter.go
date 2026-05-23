@@ -23,6 +23,23 @@ type FullScanIter struct {
 	Offset   int // batch-skip offset (only when Filter == nil)
 	Reverse  bool
 	started  bool
+
+	// ProjectFields, when non-nil, is the set of top-level field roots the
+	// filter (and any sort fed from the same cached doc) references. checkFilter
+	// then decodes ONLY those fields to test the filter (anyenc OP_Column
+	// analogue), skipping the rest of the record. nil => full ParseOwned.
+	// It points into projectBuf when the field set fits, so configuring
+	// projection costs no heap allocation per query.
+	ProjectFields []string
+	projectBuf    [4]string
+
+	// EmitFull is true when a matched row's cached doc is emitted directly to
+	// the consumer (planIterator.Doc reads Plan.DocParsed with no intervening
+	// stage that re-parses). In that case a matched doc must be re-parsed in
+	// FULL before caching, since a projected doc would be missing fields the
+	// consumer expects. When false (CountOnly, or a SortIter above re-parses on
+	// emit), the projected doc is cached as-is.
+	EmitFull bool
 }
 
 func (it *FullScanIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
@@ -229,13 +246,65 @@ func (it *FullScanIter) advanceBound() {
 }
 
 func (it *FullScanIter) checkFilter() (ok bool, err error) {
+	// No filter: nothing to test. But when a downstream stage consumes the
+	// scanned doc from the cursor (a SortIter that extracts the sort key from
+	// Plan.DocParsed), decode the projected sort-key fields straight from the
+	// cursor value and cache them — this lets the SortIter skip a per-row
+	// point-lookup re-fetch + re-parse of the full document. ProjectFields is
+	// only set in this no-filter branch when such a sort sits above (see
+	// buildFullScanChain), and EmitFull is false there (the sort re-parses the
+	// survivors in full on emit, so caching a projected doc is safe).
 	if it.Filter == nil {
+		if it.ProjectFields == nil || it.Plan == nil {
+			return true, nil
+		}
+		it.Buf.DocBuf, err = it.cursor.AppendValue(it.Buf.DocBuf[:0])
+		if err != nil {
+			return false, err
+		}
+		doc, perr := it.Buf.Parser.ParseProjected(it.Buf.DocBuf, it.ProjectFields)
+		if perr != nil {
+			return false, perr
+		}
+		it.Plan.DocParsed = doc
 		return true, nil
 	}
+
 	it.Buf.DocBuf, err = it.cursor.AppendValue(it.Buf.DocBuf[:0])
 	if err != nil {
 		return false, err
 	}
+
+	// Lazy/projected decode: when the filter's (and any cache-sharing sort's)
+	// referenced field roots are statically known, decode only those fields to
+	// evaluate the filter and skip the rest of the record. Mirrors SQLite's
+	// OP_Column, which never materializes columns the query doesn't touch.
+	if it.ProjectFields != nil {
+		doc, perr := it.Buf.Parser.ParseProjected(it.Buf.DocBuf, it.ProjectFields)
+		if perr != nil {
+			return false, perr
+		}
+		if !it.Filter.Ok(doc, it.Buf) {
+			return false, nil
+		}
+		if it.Plan != nil {
+			if it.EmitFull {
+				// The matched doc will be emitted whole straight from the cache
+				// (no stage re-parses it), so it must be the COMPLETE document,
+				// not the projected subset. Re-parse in full from the same raw
+				// bytes before caching.
+				full, ferr := it.Buf.Parser.ParseOwned(it.Buf.DocBuf)
+				if ferr != nil {
+					return false, ferr
+				}
+				it.Plan.DocParsed = full
+			} else {
+				it.Plan.DocParsed = doc
+			}
+		}
+		return true, nil
+	}
+
 	doc, err := it.Buf.Parser.ParseOwned(it.Buf.DocBuf)
 	if err != nil {
 		return false, err
