@@ -936,11 +936,12 @@ func (wi *walIndex) readHeader() (WalIndexHdr, bool) {
 // This matches SQLite's walShmBarrier() / sqlite3OsShmBarrier().
 func walShmBarrier() {
 	// atomic.StoreUint32 on a dummy variable acts as both a compiler barrier
-	// and a memory fence (uses MFENCE on x86, DMB on ARM64).
+	// and a memory fence (uses MFENCE on x86, DMB on ARM64). This is the sole
+	// mechanism providing cross-process publish ordering, matching SQLite's
+	// sqlite3MemoryBarrier (mutex_unix.c:98-104) = pure __sync_synchronize(),
+	// which performs no scheduler yield.
 	var dummy uint32
 	atomic.StoreUint32(&dummy, 0)
-	// Also yield to help with cache coherency visibility across processes.
-	runtime.Gosched()
 }
 
 // lock acquires a shm lock.
