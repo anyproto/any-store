@@ -514,17 +514,17 @@ type walIndex struct {
 	//     shared by in-process and multi-process modes.
 	//   - Multi-process tryBeginReadMultiProcess reads from SHM (shmNBackfill,
 	//     shmReadMark) then syncs nBackfill to process-local at the end for get().
-	mu            sync.RWMutex
-	shm           shm                 // platform-specific shared memory
-	pageMap       map[uint32][]uint32 // pgno -> sorted list of frame indices (1-based)
-	maxFrame      atomic.Uint32       // highest valid frame (committed + spilled)
+	mu       sync.RWMutex
+	shm      shm                 // platform-specific shared memory
+	pageMap  map[uint32][]uint32 // pgno -> sorted list of frame indices (1-based)
+	maxFrame atomic.Uint32       // highest valid frame (committed + spilled)
 	// mxCommitFrame is the process-local commit-frame cursor. Do NOT read
 	// via bare .Load — the compiler blocks that. For local reads use
 	// mxCommitFrame.LoadLocal(); for cross-process authoritative reads
 	// use (*wal).authoritativeMxFrame(). See mxframe.go for rationale.
 	mxCommitFrame commitFrameCounter
-	maxPage       atomic.Uint32       // database size at last commit
-	nBackfill     atomic.Uint32       // frames already checkpointed
+	maxPage       atomic.Uint32 // database size at last commit
+	nBackfill     atomic.Uint32 // frames already checkpointed
 
 	// nBackfillAttempted is the highest frame that a checkpoint has attempted
 	// to copy back to the database. It is set BEFORE backfilling begins, so
@@ -1930,8 +1930,12 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 
 	// Track appended frames separately from the input slice index.
 	// Reused pages don't advance the append cursor nor the checksum
-	// chain.
+	// chain. `appended` records exactly the pages that were appended (in
+	// frame order) so setBatch registers the correct frame numbers and
+	// maxFrame — recording inline avoids re-deriving the reuse predicate
+	// (which previously dropped the force-appended commit frame).
 	var nAppended uint32
+	appended := make([]*page, 0, len(pages))
 
 	// Per-frame writes matching SQLite's walWriteOneFrame pattern:
 	// 24-byte stack header + direct page data write — zero heap allocation.
@@ -2031,6 +2035,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		if _, err := w.file.WriteAt(payload, off+walFrameSize); err != nil {
 			return err
 		}
+		appended = append(appended, p)
 		nAppended++
 	}
 
@@ -2051,23 +2056,17 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	// already have their hash entries at the reused index (setBatch
 	// would overwrite with the wrong frame number otherwise).
 	if nAppended > 0 {
-		appended := pages
-		if nAppended != uint32(len(pages)) {
-			// At least one reuse fired. Rebuild the slice with only
-			// newly-appended pages. A reused page has a frame in
-			// [iFirst..nf] (strictly before this call's appends);
-			// identify these by re-querying getInTxRange with the
-			// pre-call upper bound nf.
-			appended = make([]*page, 0, nAppended)
-			for _, p := range pages {
-				iWrite := w.index.getInTxRange(p.pgno, nf, iFirst)
-				if iWrite > 0 {
-					continue
-				}
-				appended = append(appended, p)
-			}
-		}
 		w.index.setBatch(appended, startFrame, commit)
+	}
+
+	// Invariant (defense-in-depth): every physically-appended frame must be
+	// registered in the wal-index. A shortfall means a frame — typically the
+	// force-appended commit frame — was dropped from the index batch, which
+	// desyncs mxCommitFrame and silently corrupts crash recovery (committed
+	// data lost). Fail the write loudly instead. registered maxFrame and the
+	// physical append cursor w.nFrame must agree after every writeFrames.
+	if mf := w.index.maxFrame.Load(); mf < w.nFrame.Load() {
+		return fmt.Errorf("btree: wal-index frame desync: registered maxFrame=%d < %d frames written (dropped frame)", mf, w.nFrame.Load())
 	}
 
 	if commit {
@@ -2160,6 +2159,7 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	}
 
 	var nAppended uint32
+	appended := make([]*page, 0, len(pages))
 	for i, p := range pages {
 		isLast := i == len(pages)-1
 
@@ -2189,6 +2189,7 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 			dbSize: dbSizeField,
 			data:   dataCopy,
 		})
+		appended = append(appended, p)
 		nAppended++
 	}
 
@@ -2197,20 +2198,18 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	w.nFrame.Store(nf + nAppended)
 	w.mu.Unlock()
 
-	// Batch update walIndex for APPENDED frames only.
+	// Batch update walIndex for APPENDED frames only — `appended` was
+	// recorded inline in the write loop above (never re-derived), so the
+	// force-appended commit frame is always present.
 	if nAppended > 0 {
-		appended := pages
-		if nAppended != uint32(len(pages)) {
-			appended = make([]*page, 0, nAppended)
-			for _, p := range pages {
-				iWrite := w.index.getInTxRange(p.pgno, nf, iFirst)
-				if iWrite > 0 {
-					continue
-				}
-				appended = append(appended, p)
-			}
-		}
 		w.index.setBatch(appended, startFrame, commit)
+	}
+
+	// Invariant (defense-in-depth): registered maxFrame must cover every
+	// physically-appended frame; a shortfall = a dropped (commit) frame =
+	// silent recovery corruption. See disk-path writeFrames for rationale.
+	if mf := w.index.maxFrame.Load(); mf < w.nFrame.Load() {
+		return fmt.Errorf("btree: wal-index frame desync (mem): registered maxFrame=%d < %d frames written (dropped frame)", mf, w.nFrame.Load())
 	}
 
 	if commit {

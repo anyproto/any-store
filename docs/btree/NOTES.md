@@ -1138,11 +1138,20 @@ comments in source):
    `pagerStress` calls `pagerError` on WAL write failure, which performs eager
    cleanup, so the dropped error is harmless.
 
-4. **Deferred SHM hash writes** (`wal.go:setBatch`): SQLite writes SHM hash entries
-   immediately in `walFrames()` via `walIndexAppend()`, then cleans them up with
-   `walCleanupHash()` on rollback. We defer SHM writes for spill frames into
-   `pendingShmFrames` and flush on commit, avoiding the need for post-rollback
-   cleanup of cross-process-visible state.
+4. **Batched wal-index update** (`wal.go:setBatch`): SQLite updates the wal-index
+   inline in `walFrames()` — the write loop tags each page `PGHDR_WAL_APPEND`
+   (set on append, cleared on in-place reuse), then a second loop replays the flag
+   via `walIndexAppend()` (`wal.c:4154/4166/4228-4233`); rollback uses
+   `walCleanupHash()`. We mirror this with one post-loop `setBatch` per
+   `writeFrames` call (a single `wi.mu` acquisition for the in-process `pageMap`,
+   then eager `shmHashWrite` — *not* deferred), plus a `walCleanupHash` analog on
+   rollback. **Invariant: the appended set handed to `setBatch` MUST be recorded
+   inline in the write loop (the `appended` slice ≡ `PGHDR_WAL_APPEND`), never
+   re-derived.** Re-deriving the reuse predicate after the loop dropped the
+   force-appended commit frame and silently corrupted recovery — see the
+   Frame-Reuse note below. A `maxFrame < nFrame` guard in
+   `writeFrames`/`writeFramesMem` now fails loudly if any appended frame is
+   unregistered.
 
 5. **dontWrite pages made clean without WAL write** (`pager.go:pagerStress`):
    SQLite's `pagerStress` in WAL mode writes `PGHDR_DONT_WRITE` pages to WAL
@@ -1230,6 +1239,27 @@ any-store now ports this. The reuse branch in `writeFrames`
   `pager.rollbackToSavepoint`).
 - `writeFramesMem` overwrites the in-memory `memFrames` slot for the
   InMemory mode equivalent — no checksum chain to rewrite.
+
+**Commit-frame registration bug (fixed 2026-05-24).** The wal-index update
+(`setBatch`) originally *re-derived* which pages had been appended by re-running
+the reuse predicate after the write loop — but without the `!(commit && isLast)`
+guard the write loop uses. When the commit frame's page had also been spilled
+earlier in the same tx (common — a hot B-tree interior/index page is touched all
+tx long and is often the last page flushed), the re-derivation misclassified the
+force-appended commit frame as reused and dropped it, so `setBatch` undercounted
+`maxFrame`/`mxCommitFrame` by one. The next tx then computed `iFirst =
+mxCommitFrame+1` over the prior tx's committed commit frame and rewound the append
+cursor onto it, overwriting it and re-seeding the checksum from the wrong base —
+breaking the WAL checksum chain there. Invisible in the live process (the page map
+self-heals as later writes re-register the hot page) but **fatal on crash
+recovery**: `recoverLocked`'s chain walk stops at the break, silently discarding
+every later committed transaction. Caught only under cache-spill pressure by
+`TestStressRecovery_CrashedWriterDuringOverflowAlloc` (R-5, `CacheSize=10`); the
+5000-page default rarely spills, which is why it stayed latent. **Fix:** record
+the appended set inline in the write loop (≡ SQLite's `PGHDR_WAL_APPEND`), never
+re-derive; plus the `maxFrame < nFrame` invariant guard above. This was a drift
+from SQLite's inline `walIndexAppend` (NOTES drift item 4) — SQLite records the
+decision per page and replays it, so it cannot desync.
 
 **Bench evidence** (`BenchmarkWAL_SpillHeavyRepeatedDirty`, 1000 docs ×
 2KB, CacheSize=4, nUpdates=5):
