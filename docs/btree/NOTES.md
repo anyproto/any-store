@@ -1996,3 +1996,58 @@ a fresh destination DB at `path` with matching options.
 - No attached-db name resolution (`findBtree`) -- one b-tree per DB.
 - No `nBackup` counter on source -- nothing for it to block (no
   VACUUM, immutable page size).
+
+---
+
+## Query Planner -- Index-for-ORDER-BY Matching (qplanner)
+
+The cost-based planner decides whether an index satisfies a query's sort
+order (so the index scan can stream rows in-order and stop at LIMIT,
+avoiding an in-memory sort). That decision mirrors SQLite's
+`wherePathSatisfiesOrderBy` (`sqlitec/src/where.c:5148`). The Go side lives
+in `internal/qplanner/planner.go`: `IndexSortMatch` (planner.go:1499) for
+*whether* an index covers the ORDER BY, and `shouldReverse` (planner.go:1101)
+for *which* direction to scan it.
+
+Two rules carry the equivalence:
+
+1. **Equality-prefix skip.** SQLite skips leading index columns that are
+   pinned by `==` / `IS` / `IN` constraints before matching ORDER BY terms --
+   the `if( (eOp & eqOpMask)!=0 ){ ... continue; }` arm over
+   `j < pLoop->u.btree.nEq` (`where.c:5314-5346`). Those columns are constant
+   within the scanned range, so a sort on the *following* columns is still
+   satisfied. `IndexSortMatch` takes an `equalityPrefix` count and tries the
+   ORDER BY match both at offset 0 and at `equalityPrefix` (`matchAt(0)` /
+   `matchAt(equalityPrefix)`, planner.go:1534-1539), keeping the longer match.
+
+2. **Consistent composite asc/desc direction.** SQLite fixes a composite
+   reverse flag on the *first* matched ORDER BY column --
+   `rev = revIdx ^ desc; revSet = 1` -- then requires every subsequent column
+   to satisfy `(rev ^ revIdx) == desc`, else it clears `isMatch` and stops
+   (`where.c:5412-5426`). I.e. the sort must be consistently in-order or
+   consistently reversed *relative to the index*; you cannot mix. `IndexSortMatch`
+   encodes the same rule with `curSame := idxRev == sf.Reverse` and a
+   `sameMode` latch: the first matched field sets `sameMode`, and any later
+   field with `curSame != sameMode` breaks the match (planner.go:1518-1530).
+   This is what lets `Sort("a","-b")` match the composite index `(a,-b)`
+   (both fields "same" -> exact match) while `Sort("a","b")` does not.
+
+Scan direction (SQLite's `*pRevMask |= MASKBIT(iLoop)` when `rev` is set,
+`where.c:5422`) maps to `shouldReverse`, which returns the leading sort
+field's `Reverse` to drive `IndexIter.Reverse` for the chosen index.
+
+A full ORDER BY coverage returns `exactSort` (no `SortIter` in the chain --
+see `BuildPlan` "Plan C: Index Scan", planner.go:415-504); a prefix-only
+match returns `partialSort`, which still feeds a `SortIter` but lets it
+exploit the partial ordering (`PartiallySorted`). This is verified by the
+benchmark `compound_rev/SortAscDesc` + `compound_rev/FilterSort` scenarios
+(any-store-tests), whose `Sort("a","-b")` now plans
+`IndexScan(a,-b) -> Fetch -> Limit` instead of `FullScan -> TopK`.
+
+**Classification: Aligned** -- the matching predicate (equality-prefix skip +
+single consistent composite direction) is a faithful port of SQLite's rule.
+any-store does not implement SQLite's `isOrderDistinct` / UNIQUE-NOT-NULL
+refinements (`where.c:5300,5363-5377`, tag-20210426-1) or the
+`WHERE_BIGNULL_SORT` NULLS-ordering handling -- they only affect whether
+*trailing* unconstrained columns can be elided or how NULLs sort, neither of
+which any-store's index/sort model exposes.
