@@ -31,17 +31,17 @@ func SetDebugOverflowReadErrors(enabled bool) {
 // Put/Delete/insertIntoParent. It mirrors SQLite's cursor stack pair
 // (apPage[i], aiIdx[i]) at btreeInt.h:553-556.
 //
-//   pgno    — page number of the interior node at this level.
-//   cellIdx — index within that page that we descended through:
-//               0..nCell-1  -> the i-th cell's leftChild was followed;
-//               == nCell    -> descended via the page's rightChild.
-//             This is exactly searchInterior's second return value
-//             (see below), which was discarded at the call sites prior
-//             to this refactor.
-//   nCell   — pg.header.cellCount at descent time. Carried so that the
-//             rightmost-child check (cellIdx == nCell) is O(1) without
-//             re-reading the parent. Required by the balance_quick
-//             dispatch guard in splitLeafAndInsertWithPath.
+//	pgno    — page number of the interior node at this level.
+//	cellIdx — index within that page that we descended through:
+//	            0..nCell-1  -> the i-th cell's leftChild was followed;
+//	            == nCell    -> descended via the page's rightChild.
+//	          This is exactly searchInterior's second return value
+//	          (see below), which was discarded at the call sites prior
+//	          to this refactor.
+//	nCell   — pg.header.cellCount at descent time. Carried so that the
+//	          rightmost-child check (cellIdx == nCell) is O(1) without
+//	          re-reading the parent. Required by the balance_quick
+//	          dispatch guard in splitLeafAndInsertWithPath.
 //
 // Invariant: each cellIdx is consumed at most once, during upward
 // propagation at its own level. After a divider is inserted into
@@ -1773,9 +1773,9 @@ func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint
 //   - idx == pg.header.cellCount      — new cell is rightmost on pg
 //   - len(path) > 0                   — pg is not the btree root
 //   - path[len-1].cellIdx == path[len-1].nCell
-//                                     — pg was reached via parent's rightChild
+//     — pg was reached via parent's rightChild
 //   - path[len-1].pgno != bt.rootPage — parent is not the btree root
-//                                     (SQLite: pParent->pgno != 1)
+//     (SQLite: pParent->pgno != 1)
 //
 // Semantic adaptation from SQLite (btree.c:8066-8070): SQLite's intkey
 // tables use the largest key of pPage as divider because their separator
@@ -1825,13 +1825,17 @@ func (bt *btree) splitLeafRightmostAppend(pg *page, key, value []byte, path []pa
 	return bt.insertIntoParentWithPath(pg, divider, rightPgno, path)
 }
 
-// splitLeafAndInsertWithPath splits a leaf page using the path for parent propagation.
+// splitLeafAndInsertWithPath rebalances an over-full leaf using the path for
+// parent propagation. Dispatches like SQLite's balance() (btree.c:9133-9256):
+// the balance_quick rightmost-append fast path first, then the general
+// balance_nonroot (3-sibling redistribution), then balance_deeper for a root
+// leaf with no parent.
 func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte, path []pathEntry) error {
 	// Rightmost-append fast path. Port of SQLite balance_quick dispatch
-	// at btree.c:9169-9192. The intKeyLeaf precondition (btree.c:9170)
+	// at btree.c:9187-9210. The intKeyLeaf precondition (btree.c:9188)
 	// is intkey-specific and has no any-store equivalent; we compensate
 	// with the divider adaptation inside splitLeafRightmostAppend. The
-	// remaining four preconditions map directly.
+	// remaining four preconditions map directly. KEEP — see plan "non-goals".
 	if idx == int(pg.header.cellCount) && len(path) > 0 {
 		parent := path[len(path)-1]
 		if parent.pgno != bt.rootPage && parent.cellIdx == parent.nCell {
@@ -1839,50 +1843,101 @@ func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte
 		}
 	}
 
+	// Root leaf with no parent: there is nowhere to gather siblings from. Push
+	// the leaf down one level with balance_deeper (splitRoot), exactly as SQLite
+	// routes a root overflow through balance_deeper first (btree.c:9152-9169);
+	// the next insert balances the new child via balance_nonroot. We materialise
+	// the over-full leaf into two pages here (the existing 2-way split is the
+	// any-store form of "the child created by balance_deeper is then balanced").
+	if len(path) == 0 || pg.pgno == bt.rootPage {
+		return bt.splitRootLeafAndInsert(pg, idx, key, value)
+	}
+
+	// General path: balance the over-full leaf against up to two siblings via
+	// the faithful balance_nonroot port (btree.c:8248-9030). The new cell is
+	// folded into the redistribution pool through injectedCell (any-store's
+	// analogue of the over-full page's overflow cell, btree.c:8466-8482) instead
+	// of writing an over-full page to disk. Replaces the former 2-way
+	// leafSplitPoint + 2×rebuildLeafPage + insertIntoParentWithPath block.
+	parentEntry := path[len(path)-1]
+	parentPg, err := bt.pager.getWritablePage(parentEntry.pgno)
+	if err != nil {
+		return err
+	}
+	// pg (the over-full target leaf) stays pinned by the caller. balanceNonroot
+	// re-acquires it via getWritablePage as a gathered sibling — the writer cache
+	// returns the same *page with pin 2, which it releases back to 1 before
+	// returning. This matches SQLite, where the over-full page legitimately has
+	// refcount 2 during balance_nonroot (cursor + gather; btree.c:8676).
+	balanceErr := bt.balanceNonroot(parentPg, int(parentEntry.cellIdx),
+		len(path) == 1, path[:len(path)-1],
+		injectedCell{
+			active:    true,
+			childSlot: int(parentEntry.cellIdx),
+			pos:       idx,
+			key:       key,
+			value:     value,
+		})
+	bt.pager.releasePage(parentPg)
+	return balanceErr
+}
+
+// splitRootLeafAndInsert handles an over-full LEAF that is the btree root (no
+// parent to gather siblings from). It is the any-store composition of SQLite's
+// balance_deeper (btree.c:9052-9097) followed by a balance of the new child:
+// the root's cells (plus the new cell) are split into two leaves and the root
+// is converted to an interior node pointing at them. Mirrors the previous
+// splitLeafAndInsertWithPath 2-way body, retained only for the root-leaf case.
+func (bt *btree) splitRootLeafAndInsert(pg *page, idx int, key, value []byte) error {
 	cells, cellBuf := bt.collectLeafCells(pg)
 
-	// Clone key+value into a single allocation.
 	combined := make([]byte, len(key)+len(value))
 	copy(combined, key)
 	copy(combined[len(key):], value)
 	newCell := cellData{key: combined[:len(key)], value: combined[len(key):]}
-	// Insert newCell at idx with a single grow + shift instead of two intermediate slices.
 	cells = append(cells, cellData{})
 	copy(cells[idx+1:], cells[idx:len(cells)-1])
 	cells[idx] = newCell
 
-	// Find split point targeting ~2/3 fill on the left page (SQLite-style).
 	mid := leafSplitPoint(cells, bt.usablePageSize())
 	leftCells := cells[:mid]
 	rightCells := cells[mid:]
 
-	// Get full separator key (handles rare case where key itself overflows).
 	sepKey, serr := bt.cellFullKey(&rightCells[0])
 	if serr != nil {
+		bt.pager.recycleCellSlice(cells)
+		bt.pager.recycleCellBuf(cellBuf)
 		return serr
 	}
 	sepKey = bytes.Clone(sepKey)
 
 	rightPg, err := bt.pager.allocatePage()
 	if err != nil {
+		bt.pager.recycleCellSlice(cells)
+		bt.pager.recycleCellBuf(cellBuf)
 		return err
 	}
 
 	if err := bt.rebuildLeafPage(pg, leftCells); err != nil {
 		bt.pager.recycleCellSlice(cells)
 		bt.pager.recycleCellBuf(cellBuf)
+		bt.pager.releasePage(rightPg)
 		return err
 	}
 	if err := bt.rebuildLeafPage(rightPg, rightCells); err != nil {
 		bt.pager.recycleCellSlice(cells)
 		bt.pager.recycleCellBuf(cellBuf)
+		bt.pager.releasePage(rightPg)
 		return err
 	}
 	bt.pager.recycleCellSlice(cells)
 	bt.pager.recycleCellBuf(cellBuf)
+	rightPgno := rightPg.pgno
 	bt.pager.releasePage(rightPg)
 
-	return bt.insertIntoParentWithPath(pg, sepKey, rightPg.pgno, path)
+	// pg is the root; splitRoot (balance_deeper) creates a new left child,
+	// copies pg's content there, and converts pg into an interior root.
+	return bt.splitRoot(pg, sepKey, rightPgno)
 }
 
 // insertIntoParentWithPath inserts a separator key into the parent using the tracked path.
@@ -2019,7 +2074,43 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 		return nil
 	}
 
-	// Parent is full — split it
+	// Parent interior page is full. The new divider splits the child at
+	// insertIdx into leftPgno/rightPgno. If parentPg has a grandparent, balance
+	// parentPg against its siblings via the faithful balance_nonroot port
+	// (3-sibling interior redistribution), injecting the new divider into the
+	// pool — this is the plan's step-13 interior cascade ("balance the interior
+	// page against its siblings instead of the interiorSplitPoint 2-way split").
+	// If parentPg IS the btree root (no grandparent), there is nowhere to gather
+	// siblings, so split it 2-way and grow a new root (balance_deeper) via
+	// splitRoot, exactly as SQLite routes a root overflow through balance_deeper
+	// first (btree.c:9152-9169).
+	if len(parentPath) > 0 && parentPg.pgno != bt.rootPage {
+		grandEntry := parentPath[len(parentPath)-1]
+		grandPg, gerr := bt.pager.getWritablePage(grandEntry.pgno)
+		if gerr != nil {
+			bt.pager.releasePage(parentPg)
+			return gerr
+		}
+		// parentPg is gathered as a sibling under grandPg; release our own pin so
+		// balanceNonroot's getWritablePage re-acquisition is the standard cursor
+		// + gather double-pin (SQLite btree.c:8676), released within.
+		bt.pager.releasePage(parentPg)
+		balanceErr := bt.balanceNonroot(grandPg, int(grandEntry.cellIdx),
+			len(parentPath) == 1, parentPath[:len(parentPath)-1],
+			injectedCell{
+				active:     true,
+				interior:   true,
+				childSlot:  int(grandEntry.cellIdx),
+				pos:        insertIdx,
+				key:        key,
+				key2child:  leftPgno,
+				rightChild: rightPgno,
+			})
+		bt.pager.releasePage(grandPg)
+		return balanceErr
+	}
+
+	// Root interior page overflow: 2-way split + balance_deeper (splitRoot).
 	cells := bt.collectInteriorCells(parentPg)
 	origRightChild := parentPg.header.rightChild
 	origCellCount := len(cells)

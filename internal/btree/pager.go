@@ -94,6 +94,20 @@ type pager struct {
 	// verify the dispatch guard exercises both branches in the test matrix.
 	balanceQuickDispatchCount atomic.Int64
 
+	// balanceNonrootDispatchCount counts dispatches into balanceNonroot (the
+	// general 3-sibling redistribution path, ported from SQLite balance_nonroot
+	// at btree.c:8248-9030). Test-only, mirrors balanceQuickDispatchCount: lets
+	// the fill-factor test prove the new path actually fired and was not
+	// silently swallowed by balance_quick.
+	balanceNonrootDispatchCount atomic.Int64
+
+	// lastBalanceNOld / lastBalanceNNew record the nOld / nNew of the most
+	// recent balanceNonroot call. Test-only (TestBalanceNonroot_SiblingGather):
+	// they pin the NB=3 sibling gather and the k ∈ {nOld-1, nOld, nOld+1}
+	// invariant. Production code never reads them.
+	lastBalanceNOld atomic.Int64
+	lastBalanceNNew atomic.Int64
+
 	// Savepoint support: snapshots of dirty pages at savepoint boundaries
 	savepoints []savepointState
 

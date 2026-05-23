@@ -280,8 +280,13 @@ func TestCheckpointBackfill_WriteAtFailure_PartialThenSuccessful(t *testing.T) {
 	t.Logf("nBackfill before faulty checkpoint: %d", nBackfillBefore)
 	t.Logf("maxFrame: %d", db.pager.wal.index.maxFrame.Load())
 
-	// Trigger checkpoint with fault: should fail mid-backfill
-	ff.enableFault(5) // Allow 5 page writes, then fail
+	// Trigger checkpoint with fault: should fail mid-backfill.
+	// Fault after 2 page writes so the checkpoint is genuinely partial even for
+	// the compact tree the index-btree balancer now produces (50 docs / 200B at
+	// pageSize 4096 fit in ~5 pages after balance_nonroot's tighter fill, down
+	// from 6). A higher threshold could exceed the page count and let the
+	// checkpoint complete, defeating the partial-checkpoint assertion.
+	ff.enableFault(2) // Allow 2 page writes, then fail
 	err = db.Checkpoint(CheckpointFull)
 	assert.Error(t, err, "checkpoint should fail due to WriteAt fault")
 	t.Logf("Faulty checkpoint error: %v", err)
@@ -958,8 +963,11 @@ func TestMinFrameFilter_PartialCheckpointThenRead(t *testing.T) {
 	t.Logf("Before checkpoint: nBackfill=%d maxFrame=%d",
 		nBackfillBefore, db.pager.wal.index.maxFrame.Load())
 
-	// Partial checkpoint — fail after writing some pages
-	ff.enableFault(5)
+	// Partial checkpoint — fail after writing some pages. Fault after 2 writes
+	// so the checkpoint stays partial for the compact tree the index-btree
+	// balancer now produces (~5 pages for 50 docs / 200B at pageSize 4096, down
+	// from 6); a higher threshold could exceed the page count and complete.
+	ff.enableFault(2)
 	err = db.Checkpoint(CheckpointFull)
 	assert.Error(t, err, "checkpoint should fail")
 	ff.disableFault()
