@@ -2646,20 +2646,96 @@ func (bt *btree) tryMergeLeaf(leafPgno uint32, path []pathEntry) error {
 		return err
 	}
 
-	// path[len-1].cellIdx is the parent slot of leafPgno; freePgno lives at
-	// a different slot depending on the merge direction. Adjust in place
-	// before handing off to removeChildFromParent.
-	// mergeRight: sibling (= freePgno) was at childIdx+1 (possibly == n = rightChild).
-	// !mergeRight (mergeLeft): freePgno == leafPgno, still at childIdx.
-	adjustedPath := path
+	// Update the parent to reflect the merge. The two directions need
+	// different parent edits because the divider that must be removed is the
+	// SEPARATOR between the kept and freed children — divider D_childIdx —
+	// in both cases, but its position relative to the freed page differs.
+	//
+	// Divider semantics (searchInterior, btree.go:910; splitLeaf doc,
+	// btree.go:1780-1816): divider D_i is the smallest key of the subtree at
+	// child i+1; keys < D_i route to child i, keys >= D_i route to child i+1.
+	// Child i therefore covers [D_{i-1}, D_i).
+	//
+	//   mergeRight: keep = leafPgno at slot childIdx, freed = sibling at slot
+	//     childIdx+1 (cells[childIdx+1].leftChild, or rightChild if
+	//     childIdx+1 == n). The kept page absorbs child childIdx+1's keys, so
+	//     it now spans [D_{childIdx-1}, D_{childIdx+1}). The separator
+	//     D_childIdx (= cells[childIdx].key) no longer bounds anything and
+	//     must be removed; the surviving entry to its right (which held the
+	//     freed page) must be repointed to keep. removeChildFromParent cannot
+	//     express this — it removes the cell whose leftChild == childPgno
+	//     (i.e. D_{childIdx+1}), leaving the stale D_childIdx in front of the
+	//     merged page and misrouting keys in [D_childIdx, D_{childIdx+1}).
+	//
+	//   mergeLeft: keep = sibling at slot n-1 (cells[n-1].leftChild), freed =
+	//     leafPgno == rightChild (childIdx == n). The separator is D_{n-1} =
+	//     cells[n-1].key. removeChildFromParent's rightChild branch removes
+	//     exactly cells[n-1] and promotes its leftChild (= keep) to rightChild
+	//     — already correct — so reuse it unchanged.
 	if mergeRight {
-		freeIdx := childIdx + 1
-		// Copy to avoid mutating the caller's slice element.
-		adjustedPath = make([]pathEntry, len(path))
-		copy(adjustedPath, path)
-		adjustedPath[len(adjustedPath)-1].cellIdx = uint16(freeIdx)
+		return bt.removeMergedRightSeparator(parentPgno, childIdx, keepPgno, freePgno)
 	}
-	return bt.removeChildFromParent(freePgno, adjustedPath)
+	return bt.removeChildFromParent(freePgno, path)
+}
+
+// removeMergedRightSeparator updates the parent interior page after a
+// right-merge collapses child slots childIdx and childIdx+1 into the single
+// kept page (keepPgno). It removes the separator divider D_childIdx
+// (cells[childIdx]) and repoints the entry that previously referenced the
+// freed page (freePgno) — which sits immediately to the right of the removed
+// separator — to keepPgno.
+//
+// Two right-neighbor positions are possible:
+//   - childIdx+1 < len(cells): the freed page is cells[childIdx+1].leftChild.
+//     Set cells[childIdx+1].leftChild = keepPgno, then drop cells[childIdx].
+//   - childIdx+1 == len(cells): the freed page is parentPg.rightChild.
+//     Set rightChild = keepPgno, then drop cells[childIdx] (= the last cell).
+//
+// After the splice the page may have zero cells (it had exactly one divider),
+// in which case finishParentRemoval performs the same root/non-root collapse
+// as removeChildFromParent.
+func (bt *btree) removeMergedRightSeparator(parentPgno uint32, childIdx int, keepPgno, freePgno uint32) error {
+	parentPg, err := bt.pager.getWritablePage(parentPgno)
+	if err != nil {
+		return err
+	}
+
+	cells := bt.collectInteriorCells(parentPg)
+	rightChild := parentPg.header.rightChild
+
+	// childIdx is the kept page's slot; it must address a real divider cell
+	// (the separator) — never the rightChild pseudo-slot, since mergeRight is
+	// only chosen when the kept page is a leftChild entry (childIdx < n).
+	if childIdx < 0 || childIdx >= len(cells) {
+		bt.pager.releasePage(parentPg)
+		return ErrCorrupt
+	}
+	// Defensive: the separator cell's leftChild must be the kept page.
+	if cells[childIdx].leftChild != keepPgno {
+		bt.pager.releasePage(parentPg)
+		return ErrCorrupt
+	}
+
+	if childIdx+1 < len(cells) {
+		// Freed page was the next cell's leftChild. Repoint it to keep, then
+		// drop the separator cell.
+		if cells[childIdx+1].leftChild != freePgno {
+			bt.pager.releasePage(parentPg)
+			return ErrCorrupt
+		}
+		cells[childIdx+1].leftChild = keepPgno
+	} else {
+		// Freed page was the rightChild. Promote keep to rightChild, then drop
+		// the (last) separator cell.
+		if rightChild != freePgno {
+			bt.pager.releasePage(parentPg)
+			return ErrCorrupt
+		}
+		rightChild = keepPgno
+	}
+	cells = append(cells[:childIdx], cells[childIdx+1:]...)
+
+	return bt.finishParentRemoval(parentPg, cells, rightChild)
 }
 
 // removeChildFromParent removes a child page reference from its parent interior page.
@@ -2708,6 +2784,25 @@ func (bt *btree) removeChildFromParent(childPgno uint32, path []pathEntry) error
 		}
 	}
 
+	return bt.finishParentRemoval(parentPg, cells, rightChild)
+}
+
+// finishParentRemoval writes the post-removal cell set back to the parent
+// interior page (parentPg, already pinned writable) and handles the
+// height-collapse cases when the removal left the page with zero cells. It is
+// the shared tail of removeChildFromParent (delete-rebalance, mergeLeft) and
+// removeMergedRightSeparator (mergeRight): both compute the surviving (cells,
+// rightChild) and hand off here. It always releases parentPg.
+//
+//   - 0 cells on the root: copy rightChild's content into the root and free
+//     rightChild, shortening the tree by one level. Page 1 needs special
+//     handling to preserve its 100-byte DB header (SQLite copyNodeContent,
+//     btree.c:8148).
+//   - 0 cells on a non-root interior: the page has a single child (rightChild);
+//     copy that child's content up and free it to avoid orphaning the subtree
+//     (SQLite balance_nonroot shallowing).
+//   - otherwise: rebuild the interior page in place.
+func (bt *btree) finishParentRemoval(parentPg *page, cells []cellData, rightChild uint32) error {
 	// If parent is now empty interior page (0 cells) and not root,
 	// collapse: make the rightChild the replacement and free this page.
 	if len(cells) == 0 && parentPg.pgno == bt.rootPage {
