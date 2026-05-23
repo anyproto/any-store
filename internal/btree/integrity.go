@@ -223,10 +223,56 @@ func (ic *integrityChecker) checkPageCoverage(pg *page, context string, h []uint
 	}
 }
 
+// keyInBounds verifies that key lies within the half-open divider range
+// [lower, upper) implied by the ancestor interior cells, and reports a
+// diagnostic naming the page, cell index, key, and violated bound otherwise.
+//
+// any-store's interior search (btree.go searchInterior / splitLeafRightmostAppend
+// doc, btree.go:1780-1816) uses "left child keys < divider, right child keys
+// >= divider", i.e. the divider equals the FIRST (smallest) key of its right
+// subtree. Therefore a child subtree reachable through a sequence of dividers
+// covers exactly the half-open interval [lower, upper):
+//
+//   - lower (inclusive, nil = -inf): the divider immediately to the child's
+//     left — every key in the subtree is >= lower because that divider routed
+//     keys >= it to the right (this child).
+//   - upper (exclusive, nil = +inf): the divider immediately to the child's
+//     right — every key in the subtree is strictly < upper because that
+//     divider routed keys >= it away to a later sibling.
+//
+// This is the any-store analogue of SQLite checkTreePage's keyCanBeEqual /
+// maxKey machinery (btree.c:10953-11029). SQLite's intkey divider equals the
+// LARGEST key of its left subtree, so SQLite tightens an inclusive upper bound
+// (maxKey) while walking cells right-to-left and only permits equality at the
+// boundary cell. any-store's divider equals the SMALLEST key of its right
+// subtree, so the symmetric statement is an inclusive lower / exclusive upper
+// bound — encoded directly here as [lower, upper).
+func (ic *integrityChecker) keyInBounds(key, lower, upper []byte, context string, cellIdx int) {
+	if lower != nil && bytes.Compare(key, lower) < 0 {
+		ic.report("%s cell %d: key %x below divider lower bound %x (key must be >= divider that routed it right)",
+			context, cellIdx, key, lower)
+	}
+	if upper != nil && bytes.Compare(key, upper) >= 0 {
+		ic.report("%s cell %d: key %x at/above divider upper bound %x (key must be < divider that routes later keys away)",
+			context, cellIdx, key, upper)
+	}
+}
+
 // checkTreePage recursively validates a B-tree page.
 // Returns the depth of the tree rooted at this page (1 for leaf).
 // Port of SQLite's checkTreePage() (btree.c:10840-11100).
-func (ic *integrityChecker) checkTreePage(pgno uint32) int {
+//
+// lower (inclusive, nil = -inf) and upper (exclusive, nil = +inf) are the
+// divider-derived key-range bounds threaded DOWN the recursion, mirroring
+// SQLite's piMinKey/maxKey arguments (btree.c:10858-10863). Every cell key on
+// this page — and, transitively, in every subtree below it — must lie in
+// [lower, upper). At each interior node the bounds are tightened per child:
+// child i gets [D_{i-1}, D_i), and the right child gets [D_{n-1}, upper),
+// where D_j is the j-th divider key on this page. Combined with the existing
+// strict cell ordering check this enforces
+//
+//	max(subtree[child i]) < D_i <= min(subtree[child i+1]).
+func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte) int {
 	if ic.tooManyErrors() {
 		return 0
 	}
@@ -253,6 +299,17 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 
 	nCells := int(pg.header.cellCount)
 	isLeaf := pg.header.isLeaf()
+
+	// prevDivider tracks the divider key to the LEFT of the next child to be
+	// recursed into (the inclusive lower bound for that child). It starts at
+	// this page's own lower bound and advances to each divider D_i as the loop
+	// progresses. The slices it holds point into pg.data (for non-overflow
+	// dividers) or are freshly allocated by interiorFullKey (for overflow
+	// dividers); pg stays pinned for the whole frame (deferred release above),
+	// so they remain valid across the child recursion and through the
+	// rightChild recursion below. No extra allocation beyond what overflow
+	// dividers already require.
+	prevDivider := lower
 
 	// contentOffset from the page header (start of cell content area).
 	// Validate against usableSize, matching SQLite's allocateSpace()
@@ -320,6 +377,9 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 				if prevKey != nil && bytes.Compare(prevKey, fullKey) >= 0 {
 					ic.report("%s cell %d: key out of order", context, i)
 				}
+				// Divider-range bound check: every leaf key must lie within
+				// the [lower, upper) range implied by the ancestor dividers.
+				ic.keyInBounds(fullKey, lower, upper, context, i)
 				prevKey = bytes.Clone(fullKey)
 			}
 
@@ -359,7 +419,8 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 				continue
 			}
 
-			// For key ordering, we need the full key (may require overflow read)
+			// For key ordering, we need the full key (may require overflow read).
+			// This is the divider key D_i for this interior cell.
 			fullKey, fkerr := interiorFullKey(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, ic.cache)
 			if fkerr != nil {
 				ic.report("%s cell %d: corrupt interior key", context, i)
@@ -367,6 +428,9 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 				if prevKey != nil && bytes.Compare(prevKey, fullKey) >= 0 {
 					ic.report("%s cell %d: key out of order", context, i)
 				}
+				// Divider-range bound check: D_i itself must lie within this
+				// page's [lower, upper) range inherited from ancestors.
+				ic.keyInBounds(fullKey, lower, upper, context, i)
 				prevKey = bytes.Clone(fullKey)
 			}
 
@@ -383,19 +447,38 @@ func (ic *integrityChecker) checkTreePage(pgno uint32) int {
 				}
 			}
 
-			// Recursively check child page
-			childDepth := ic.checkTreePage(cell.leftChild)
+			// Recursively check child page (cell.leftChild = child i), threading
+			// the tightened bound [prevDivider, D_i): keys in this child must be
+			// >= the divider to its left (prevDivider, inclusive) and strictly <
+			// D_i (this cell's divider, exclusive). When D_i failed to decode
+			// (fkerr != nil) we leave childUpper as prevDivider's successor would
+			// be unknown — pass the page's own upper bound so we don't emit
+			// false range violations against a key we couldn't read.
+			childUpper := upper
+			if fkerr == nil {
+				childUpper = fullKey
+			}
+			childDepth := ic.checkTreePage(cell.leftChild, prevDivider, childUpper)
 			if i == 0 {
 				depth = childDepth
 			} else if childDepth != depth {
 				ic.report("%s: child page depth differs (child %d depth %d vs expected %d)", context, cell.leftChild, childDepth, depth)
 			}
+			// Advance the lower bound for the NEXT child to this cell's divider.
+			// fullKey points into pg.data (non-overflow) or is a fresh allocation
+			// (overflow); pg is pinned for the whole frame, so this slice stays
+			// valid through the remaining children and the rightChild recursion.
+			if fkerr == nil {
+				prevDivider = fullKey
+			}
 		}
 	}
 
-	// For interior pages, check rightChild
+	// For interior pages, check rightChild. The right child holds keys
+	// >= D_{n-1} (the last divider, now in prevDivider) and < this page's
+	// upper bound — bound [prevDivider, upper).
 	if !isLeaf {
-		childDepth := ic.checkTreePage(pg.header.rightChild)
+		childDepth := ic.checkTreePage(pg.header.rightChild, prevDivider, upper)
 		if nCells > 0 && childDepth != depth {
 			ic.report("%s: child page depth differs (rightChild %d depth %d vs expected %d)", context, pg.header.rightChild, childDepth, depth)
 		}
@@ -575,7 +658,9 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 				rootPage := binary.BigEndian.Uint32(cell.value)
 				if rootPage >= 2 && rootPage <= nPages {
 					ic.treeName = string(cell.key)
-					ic.checkTreePage(rootPage)
+					// Each namespace tree is an independent B-tree; its root
+					// has no divider bounds (unbounded both ways).
+					ic.checkTreePage(rootPage, nil, nil)
 				} else if rootPage != 0 {
 					ic.report("tree master page 1 cell %d: namespace %q root page %d out of range", i, string(cell.key), rootPage)
 				}
