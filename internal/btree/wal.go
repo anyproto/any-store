@@ -39,26 +39,26 @@ package btree
 //   - Hash tables: mapping page numbers to WAL frame positions
 //   - Lock slots: coordinating readers, writer, and checkpoint
 //
-// Same-process reads (issue 7.9):
+// Frame lookup — in-process map vs. SHM hash (issue 7.9):
 //
-// walIndex.get() uses an in-process Go map (pageMap) rather than reading
-// the SHM hash tables. The SHM hash tables ARE written on every frame
-// (shmHashWrite) for cross-process visibility, but same-process readers
-// use the faster Go map. This is acceptable because:
+// walIndex.get()/getLatest() select their source of truth based on mode:
 //
-//  1. Our primary deployment is single-process (InProcess mode with heap shm).
-//     Multi-process access via mmap'd shm is a secondary feature.
-//  2. The Go map provides O(1) lookup without the linear-probing overhead of
-//     the hash table, giving better read performance.
-//  3. The SHM hash tables are still populated correctly, so if multi-process
-//     readers are added in the future, they can use shmHashGet() for recovery.
-//  4. In SQLite, walHashGet/walFramePage are only used during recovery and
-//     checkpoint iteration. Normal same-process reads also use in-memory state
-//     (the aSegment array in walIterator). Our pageMap serves the same role.
+//  1. InProcess mode (single-process, heap shm): the in-process Go map
+//     (pageMap) is the sole source of truth. There is no mmap'd SHM to
+//     consult, and the Go map gives O(1) lookup without the linear-probing
+//     overhead of the hash table.
+//  2. Multi-process mode (mmap'd shm): get()/getLatest() consult the SHM
+//     hash tables exclusively via shmHashGet(), matching SQLite's
+//     walFindFrame (wal.c:3554-3582). A peer process may have written WAL
+//     frames that never touched this process's pageMap, so the shared SHM
+//     hash — populated on every frame by shmHashWrite — is authoritative.
+//     nBackfill is likewise read from SHM (shmNBackfill) since a peer
+//     checkpoint may advance it without updating our process-local copy.
 //
-// If multi-process readers become a requirement, the get() method should be
-// updated to fall back to shmHashGet() when !inProcess and the pageMap is
-// empty (indicating a fresh process that hasn't done recovery yet).
+// In SQLite, walHashGet/walFramePage are used during recovery, checkpoint
+// iteration, AND normal cross-process reads (all frame lookups go through
+// the shared SHM). Our pageMap mirrors SQLite's in-memory state only for the
+// InProcess fast path; cross-process readers use the SHM hash directly.
 
 import (
 	"encoding/binary"
