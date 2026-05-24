@@ -108,6 +108,15 @@ type pager struct {
 	lastBalanceNOld atomic.Int64
 	lastBalanceNNew atomic.Int64
 
+	// deleteRebalanceDispatchCount counts dispatches into the delete-side merge
+	// driver (deleteRebalanceLeaf / deleteRebalanceInterior): the underfull page
+	// is funnelled through the same balanceNonroot port as the insert path but
+	// with inject.active==false — SQLite drives delete-merge through balance() →
+	// balance_nonroot() the same way (btree.c:10005-10010). Mirrors
+	// balanceNonrootDispatchCount; lets the fill-factor test prove the
+	// delete-rebalance path actually fired.
+	deleteRebalanceDispatchCount atomic.Int64
+
 	// Savepoint support: snapshots of dirty pages at savepoint boundaries
 	savepoints []savepointState
 
@@ -1392,14 +1401,32 @@ func (p *pager) allocateFromFreelist(nearby uint32) (*page, error) {
 		// reference it — causing corruption (Bug 9).
 		if len(p.savepoints) > 0 {
 			if debugTrace {
-				trace("allocateFromFreelist: leaf pg=%d hasContent=false but savepoints=%d → getWritablePage (savepoint safety)", leafPgno, len(p.savepoints))
+				trace("allocateFromFreelist: leaf pg=%d hasContent=false but savepoints=%d → getPageNoContent + savepoint copy", leafPgno, len(p.savepoints))
 			}
-			pg, err := p.getWritablePage(leafPgno)
+			// hasContent==false: the page has no meaningful on-disk content, and
+			// for a page near dbSize whose content was never materialised to the
+			// DB file (grown+freed within uncommitted/un-checkpointed churn) a real
+			// read would hit EOF. Use a NOCONTENT fetch (no disk read) — matching
+			// SQLite's `noContent = !btreeGetHasContent(...)` path (btree.c:6725) —
+			// then journal the no-content state into the innermost savepoint so a
+			// rollback restores the page consistently with the freelist header
+			// (Bug 9). The previous getWritablePage here READ the page and failed
+			// with EOF, leaking the already-popped leaf: the caller
+			// (allocatePageNear) swallows the error and grows instead, leaving the
+			// page neither on the freelist nor referenced ("page N: never used").
+			pg, err := p.getPageNoContent(leafPgno)
 			if err != nil {
 				return nil, err
 			}
+			sp := &p.savepoints[len(p.savepoints)-1]
+			if _, exists := sp.pages[leafPgno]; !exists {
+				dataCopy := allocPageBuffer(int(p.pageSize), false)
+				copy(dataCopy, pg.data)
+				sp.pages[leafPgno] = dataCopy
+			}
 			clear(pg.data)
 			pg.header = pageHeader{}
+			p.writerCache.makeDirty(pg)
 			delete(p.dontWritePages, leafPgno)
 			return pg, nil
 		}

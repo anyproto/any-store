@@ -180,10 +180,17 @@ type injectedCell struct {
 //	inject     — the new over-full cell to fold into the pool (see injectedCell);
 //	             inject.active==false for a re-balance with no new cell.
 //
-// On the insert path the pooled cell count only ever grows (one cell was just
+// On the INSERT path the pooled cell count only ever grows (one cell was just
 // added to the over-full child), so nNew ∈ {nOld, nOld+1} and the parent gains
-// at most one net cell. It never shrinks, so the parent cannot become under-full
-// here (delete-side merging is a separate path: tryMergeLeaf, btree.go:2412).
+// at most one net cell — it never shrinks, so the parent cannot become under-full
+// from an insert. On the DELETE/merge path the new cell is absent
+// (inject.active==false) so the pooled count only shrinks: nNew ∈ {nOld-1, nOld},
+// k=nOld-1 is a genuine merge that frees the surplus page (Step 11,
+// btree.c:9000-9004), and the parent loses a divider. The resulting parent
+// under-fullness/emptiness is completed by completeMergeUpward after this returns
+// (spec §4; see the rewriteParentAfterBalance OWNERSHIP note). This is exactly
+// SQLite's design: ONE balancer for insert-split and delete-merge (btree.c:10010
+// drives delete through the same balance() → balance_nonroot()).
 func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, parentPath []pathEntry, inject injectedCell) error {
 	bt.pager.balanceNonrootDispatchCount.Add(1)
 	usableSize := bt.usablePageSize()
@@ -682,12 +689,16 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 		}
 	}
 
-	// ---- Step 12 (balance-shallower, btree.c:8960-8985) is NOT reachable here:
-	// balanceNonroot is dispatched only from the insert / over-full paths
-	// (splitLeafAndInsertWithPath, insertSepIntoInterior), where the pooled cell
-	// count only grows, so nNew>=nOld and the parent never empties. Root collapse
-	// is a delete-side phenomenon handled by the reused tryMergeLeaf /
-	// removeChildFromParent (btree.go:2412 / 2575; out of scope per the plan).
+	// ---- Step 12 (balance-shallower, btree.c:8960-8985) is NOT done in-line
+	// here. When dispatched from the INSERT path the pooled cell count only grows
+	// (nNew>=nOld), so the parent never empties and Step 12 cannot apply. When
+	// dispatched from the DELETE/merge path (deleteRebalanceLeaf /
+	// deleteRebalanceInterior, inject.active=false) the parent CAN empty or
+	// under-fill, but that completion is driven AFTER this function returns by
+	// completeMergeUpward (btree.go) — which re-reads the parent fresh and reuses
+	// collapseSingleChild for the balance-shallower collapse (spec §4b). Keeping
+	// it out of balanceNonroot preserves the single pParent-pin borrow contract
+	// for both directions (see rewriteParentAfterBalance OWNERSHIP note).
 	//
 	// ---- Step 10: rewrite the parent dividers (btree.c:8759-8891) -----------
 	// Build the parent's new cell list by splicing the gathered child run with
@@ -746,6 +757,22 @@ func (bt *btree) freePageDeferred(pgno uint32) error {
 // (deviation 2). If the rewritten parent does not fit, it is split 2-way and
 // the middle divider cascades up via insertSepIntoAncestor (deviation 6), which
 // also handles the root-overflow case (splitRoot / balance_deeper).
+//
+// OWNERSHIP: the caller (balanceNonroot) retains parentPg's pin; this function
+// does NOT release it. The DELETE/merge-direction completion (empty-collapse and
+// underfull-parent cascade, spec §4) is therefore NOT done here — it is driven
+// after balanceNonroot returns and the caller has released parentPg, by
+// completeMergeUpward (btree.go), which re-reads the parent fresh. That keeps the
+// pin contract identical for the insert and delete paths and lets the cascade
+// release the parent's pin before re-acquiring it as a gathered sibling under its
+// grandparent (as SQLite does, btree.c:9251).
+//
+// On the INSERT direction nNew ∈ {nOld, nOld+1}, so the rewritten parent only
+// ever fits (nNew==nOld) or over-fills (nNew==nOld+1, the 2-way split below); it
+// never under-fills. On the DELETE direction nNew ∈ {nOld-1, nOld}; the merge
+// (nNew==nOld-1) removes a divider, so the parent always FITS here (fewer cells
+// than before) — the over-full split below is unreachable from delete — and any
+// resulting under-fullness/emptiness is handled by completeMergeUpward.
 //
 // Parent child/divider geometry (any-store <,>= invariant, searchInterior
 // btree.go:907): for an interior page with cells P_0..P_{nc-1} and rightChild,
@@ -831,7 +858,10 @@ func (bt *btree) rewriteParentAfterBalance(
 		used += interiorCellSizeWithOverflow(newCells[j].key, usableSize)
 	}
 	if used <= usableSize {
-		// Fits: rebuild the parent wholesale.
+		// Fits: rebuild the parent wholesale. The merge-direction completion
+		// (empty-collapse / underfull-cascade, spec §4) is handled by the caller
+		// via completeMergeUpward after parentPg is released — see the OWNERSHIP
+		// note above.
 		return bt.rebuildInteriorPage(parentPg, newCells, newRightChild)
 	}
 
