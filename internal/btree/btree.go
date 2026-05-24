@@ -2585,14 +2585,21 @@ func (bt *btree) completeMergeUpward(pgno uint32, parentPath []pathEntry) error 
 
 	nCell := int(pg.header.cellCount)
 
-	// (b) Empty parent → collapse one level. collapseSingleChild releases pg.
-	if nCell == 0 {
+	// (b) Balance-shallower — ROOT ONLY (SQLite gates on isRoot, btree.c:8960). A
+	// 0-cell root has a single child: absorb it, dropping a tree level (uniformly,
+	// so all leaves stay equidistant from the new root). A NON-root 0-cell interior
+	// must NOT be collapsed in place — collapseSingleChild copies the child's header
+	// (incl. type) into it, making its subtree one level shallower than its siblings
+	// (unequal leaf depth = corruption). It is underfull, so it falls through to the
+	// cascade below to be pooled with its siblings under the grandparent — exactly
+	// how SQLite carries a single-child parent up the balance() do-loop (btree.c:9133).
+	if nCell == 0 && len(parentPath) == 0 {
 		rightChild := pg.header.rightChild
 		return bt.collapseSingleChild(pg, rightChild)
 	}
 
-	// (a) Underfull non-root parent → cascade under the grandparent.
-	if len(parentPath) > 0 && bt.interiorUnderfull(pg) {
+	// (a) Underfull non-root parent (0-cell included) → cascade under the grandparent.
+	if len(parentPath) > 0 && (nCell == 0 || bt.interiorUnderfull(pg)) {
 		bt.pager.releasePage(pg)
 		return bt.deleteRebalanceInterior(pgno, parentPath)
 	}
@@ -2975,12 +2982,18 @@ func (bt *btree) removeChildFromParent(childPgno uint32, path []pathEntry) error
 //     (SQLite balance_nonroot shallowing).
 //   - otherwise: rebuild the interior page in place.
 func (bt *btree) finishParentRemoval(parentPg *page, cells []cellData, rightChild uint32) error {
-	// If parent is now empty interior page (0 cells), collapse: copy the single
-	// remaining child (rightChild) into this page and free the child, removing
-	// one tree level. This is the "balance-shallower" sub-algorithm
-	// (SQLite btree.c:8960-8985) for the root, and the non-root single-child
-	// absorption for an interior node.
-	if len(cells) == 0 {
+	// If parent is now an empty interior page (0 cells = single child), collapse —
+	// but ONLY at the root. Balance-shallower (SQLite btree.c:8960-8985) shortens
+	// all leaves uniformly only when applied at the root. Collapsing a NON-root
+	// single-child interior in place (collapseSingleChild copies the child's
+	// header, incl. type) makes this subtree one level shallower than its siblings
+	// — unequal leaf depth, which IntegrityCheck flags as "child page depth
+	// differs". For a non-root 0-cell parent, leave it as a valid degenerate
+	// interior (rightChild only, via rebuildInteriorPage below): it stays
+	// equidistant from the root and a later balance can absorb it (SQLite carries
+	// a single-child parent up the balance() do-loop). Mirrors the
+	// completeMergeUpward root gate.
+	if len(cells) == 0 && parentPg.pgno == bt.rootPage {
 		return bt.collapseSingleChild(parentPg, rightChild)
 	}
 
