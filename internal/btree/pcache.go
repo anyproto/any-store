@@ -10,7 +10,6 @@ package btree
 //
 // Drifts from SQLite (see docs/btree/NOTES.md section 9 for full table):
 //   - No PGroup: no cross-cache page stealing; each cache isolated (drift #1)
-//   - No hash table: Go map[uint32]*page instead of apHash[] (drift #2)
 //   - No circular LRU: doubly-linked list with head/tail pointers (drift #3)
 //   - dirtyTail pointer for O(1) spill victim (replaces pSynced, drift #19)
 //   - No PgHdr/PgHdr1 split: single page struct (drift #5)
@@ -23,10 +22,18 @@ const defaultMaxReaders = 4
 
 // pcache is the page cache.
 type pcache struct {
-	pages    map[uint32]*page // pgno -> page
-	maxPages int              // maximum number of cached pages
-	pageSize int              // size of each page in bytes
-	useSlab  bool             // resolved once at creation; true when slab allocator is active
+	// apHash is a chained hash table mapping pgno -> *page, ported from SQLite's
+	// PCache1.apHash (pcache1.c:200). A page is "in this cache" iff it is reachable
+	// from apHash[pgno & (len(apHash)-1)] via page.hashNext. len(apHash) is always a
+	// power of two so the bucket index is a mask, not a modulo. This replaces the
+	// former Go map[uint32]*page and the two hot-path Go-map lookups it cost per
+	// page touched (fetch + the release ghost-page re-probe). Closes NOTES.md §9
+	// drift #2.
+	apHash   []*page // hash buckets; head of each chain linked via page.hashNext
+	nPage    int     // number of pages currently in apHash (was len(pc.pages))
+	maxPages int     // maximum number of cached pages
+	pageSize int     // size of each page in bytes
+	useSlab  bool    // resolved once at creation; true when slab allocator is active
 
 	// purgeable controls whether the cache can evict pages.
 	// When false (InMemory databases), pages are never evicted and the
@@ -34,9 +41,9 @@ type pcache struct {
 	purgeable bool
 
 	// LRU list for clean pages (dirty pages are not evicted)
-	lruHead      *page
-	lruTail      *page
-	nRecyclable  int // unpinned clean pages in LRU; matches SQLite pcache1.c:197 nRecyclable
+	lruHead     *page
+	lruTail     *page
+	nRecyclable int // unpinned clean pages in LRU; matches SQLite pcache1.c:197 nRecyclable
 
 	// Dirty page list (doubly-linked, head = MRU, tail = LRU for spill)
 	dirtyHead *page
@@ -56,8 +63,8 @@ type pcache struct {
 	//
 	// Matches SQLite pager.c:3246-3267 (pagerBeginReadTransaction — pager_reset
 	// only if change-counter changed) and pPager->iDataVersion (pager.c:1776).
-	dataVersion  uint64
-	walMaxFrame  uint32
+	dataVersion uint64
+	walMaxFrame uint32
 
 	// pFree is a per-cache list of reusable page structs with data buffers.
 	// In non-slab mode, initBulk() pre-allocates up to 20 pages from the heap
@@ -100,7 +107,12 @@ func newPcache(pageSize, maxPages int, purgeable bool) *pcache {
 		maxPages = defaultCacheSize
 	}
 	return &pcache{
-		pages:     make(map[uint32]*page),
+		// Seed apHash from maxPages rounded up to a power of two (floor 256, the
+		// same floor pcache1ResizeHash uses, pcache1.c:543). Sizing the table to
+		// the configured cache up front avoids the early doublings a cache would
+		// otherwise pay while filling. The hash still grows via resizeHash if a
+		// hard-create burst pushes nPage past nHash (load factor 1.0).
+		apHash:    make([]*page, hashSizeFor(maxPages)),
 		maxPages:  maxPages,
 		pageSize:  pageSize,
 		purgeable: purgeable,
@@ -109,9 +121,94 @@ func newPcache(pageSize, maxPages int, purgeable bool) *pcache {
 	}
 }
 
+// minHashSize is the smallest apHash table size, matching SQLite's
+// pcache1ResizeHash floor (pcache1.c:543: "if( nNew<256 ) nNew = 256").
+const minHashSize = 256
+
+// hashSizeFor returns the smallest power of two >= n that is also >= minHashSize.
+// Used to seed apHash so pgno & (nHash-1) is a valid bucket mask.
+func hashSizeFor(n int) int {
+	sz := minHashSize
+	for sz < n {
+		sz <<= 1
+	}
+	return sz
+}
+
+// hashFind returns the cached page with the given pgno, or nil if not cached.
+// It is the read-only half of the bucket probe shared by fetch/create — a single
+// chained-bucket walk, with no LRU or pin side effects.
+// Matches SQLite pcache1FetchNoMutex step 1 (pcache1.c:1009-1010).
+func (pc *pcache) hashFind(pgno uint32) *page {
+	for p := pc.apHash[pgno&uint32(len(pc.apHash)-1)]; p != nil; p = p.hashNext {
+		if p.pgno == pgno {
+			return p
+		}
+	}
+	return nil
+}
+
+// hashInsert links p at the head of its bucket chain, marks it in-cache, and
+// bumps nPage. The caller must have established (via hashFind) that pgno is not
+// already present. Resizes the table first when the load factor would reach 1.0,
+// matching SQLite's pre-insert check (pcache1.c:894: "if( nPage>=nHash )
+// pcache1ResizeHash").
+func (pc *pcache) hashInsert(p *page) {
+	if pc.nPage >= len(pc.apHash) {
+		pc.resizeHash()
+	}
+	h := p.pgno & uint32(len(pc.apHash)-1)
+	p.hashNext = pc.apHash[h]
+	pc.apHash[h] = p
+	p.inCache = true
+	pc.nPage++
+}
+
+// hashRemove unlinks p from its bucket chain, clears its in-cache state, and
+// decrements nPage. After this returns p.inCache is false and p.hashNext is nil,
+// so a later release() will not re-add it to the LRU (the ghost-page guard).
+// Matches SQLite pcache1RemoveFromHash (pcache1.c:601-613).
+func (pc *pcache) hashRemove(p *page) {
+	h := p.pgno & uint32(len(pc.apHash)-1)
+	pp := &pc.apHash[h]
+	for *pp != p {
+		pp = &(*pp).hashNext
+	}
+	*pp = p.hashNext
+	p.hashNext = nil
+	p.inCache = false
+	pc.nPage--
+}
+
+// resizeHash doubles the bucket count and rehashes every page into the new
+// table. Triggered when nPage would reach nHash (load factor 1.0). Power-of-two
+// sizing keeps pgno & (nHash-1) a valid mask. Matches SQLite pcache1ResizeHash
+// (pcache1.c:535-567).
+func (pc *pcache) resizeHash() {
+	nNew := len(pc.apHash) * 2
+	if nNew < minHashSize {
+		nNew = minHashSize
+	}
+	apNew := make([]*page, nNew)
+	mask := uint32(nNew - 1)
+	for _, head := range pc.apHash {
+		for p := head; p != nil; {
+			next := p.hashNext
+			h := p.pgno & mask
+			p.hashNext = apNew[h]
+			apNew[h] = p
+			p = next
+		}
+	}
+	pc.apHash = apNew
+}
+
 // fetch retrieves a page from the cache, or returns nil if not cached.
+// The lookup is a single chained-bucket walk (no Go-map hash), matching
+// SQLite pcache1FetchNoMutex (pcache1.c:1009-1018): on a hit, pin the page
+// and, if it is clean, splice it out of the LRU (pcache1PinPage).
 func (pc *pcache) fetch(pgno uint32) *page {
-	p := pc.pages[pgno]
+	p := pc.hashFind(pgno)
 	if p != nil {
 		p.pinCount++
 		if !p.dirty {
@@ -170,7 +267,7 @@ func (pc *pcache) initBulk() {
 // are available and xStress is set, invokes the stress callback to spill
 // a dirty page, making it clean and evictable.
 func (pc *pcache) create(pgno uint32, createFlag int) *page {
-	if p := pc.pages[pgno]; p != nil {
+	if p := pc.hashFind(pgno); p != nil {
 		p.pinCount++
 		if !p.dirty {
 			pc.lruRemove(p)
@@ -189,7 +286,7 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	// createFlag==1 (soft, readers): may return nil.
 	// createFlag==2 (hard, writers/stress): always proceeds.
 	if createFlag == 1 && pc.purgeable {
-		nPinned := len(pc.pages) - pc.nRecyclable
+		nPinned := pc.nPage - pc.nRecyclable
 		if nPinned >= pc.maxPages*9/10 {
 			return nil
 		}
@@ -207,7 +304,7 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	var recycled *page
 	if pc.purgeable {
 		// First, if cache is over maxPages, evict down to maxPages.
-		for len(pc.pages) >= pc.maxPages && pc.nRecyclable > 0 {
+		for pc.nPage >= pc.maxPages && pc.nRecyclable > 0 {
 			evicted := pc.evictOne()
 			if evicted != nil {
 				if recycled != nil {
@@ -233,7 +330,7 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 		if spill == 0 {
 			spill = pc.maxPages
 		}
-		if len(pc.pages) >= spill && pc.xStress != nil {
+		if pc.nPage >= spill && pc.xStress != nil {
 			victim := pc.findSpillVictim()
 			if victim != nil {
 				// DRIFT from SQLite: we ignore the xStress error here because
@@ -243,7 +340,7 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 				// pager to error state, so the error is not silently lost.
 				pc.xStress(victim)
 				// After stress callback, victim should be clean. Retry eviction.
-				for len(pc.pages) >= pc.maxPages && pc.nRecyclable > 0 {
+				for pc.nPage >= pc.maxPages && pc.nRecyclable > 0 {
 					evicted := pc.evictOne()
 					if evicted != nil && recycled == nil {
 						recycled = evicted
@@ -281,7 +378,10 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 		}
 	}
 	pc.resetPage(p, pgno)
-	pc.pages[pgno] = p
+	// Link into the hash (sets p.inCache, bumps nPage, may resize). Replaces the
+	// former pc.pages[pgno] = p. Matches SQLite where a freshly allocated page is
+	// linked into apHash by pcache1FetchStage2 (pcache1.c).
+	pc.hashInsert(p)
 	return p
 }
 
@@ -298,6 +398,11 @@ func (pc *pcache) resetPage(p *page, pgno uint32) {
 	p.uncached = false
 	p.next = nil
 	p.prev = nil
+	// Reset hash-chain membership; hashInsert (called right after) re-establishes
+	// it. A page reused from pFree/evictOne already had these cleared by
+	// hashRemove, but reset defensively so a struct from any source is clean.
+	p.hashNext = nil
+	p.inCache = false
 	p.header = pageHeader{}
 }
 
@@ -321,15 +426,22 @@ func (pc *pcache) release(p *page) {
 	p.pinCount--
 	if p.pinCount <= 0 {
 		p.pinCount = 0
-		// Only add to LRU if the page is still tracked in pcache.pages.
-		// After a stress spill + eviction, the page may no longer be in
-		// pcache.pages. Adding such "ghost" pages to the LRU would cause
-		// evictOne to loop without reducing len(pages).
+		// Only manage the LRU/dirty list if the page is still in the cache.
+		// After a stress spill + eviction — or a discard/truncate that removed
+		// the page while a caller still held it pinned — the page is no longer
+		// in apHash and p.inCache is false. Adding such a "ghost" page to the
+		// LRU would make evictOne loop without reducing nPage (and leak the
+		// page's already-returned buffer). p.inCache replaces the former
+		// pc.pages[p.pgno]==p re-probe with a field read, so release does no
+		// hash work on the hot path. Matches SQLite pcache1Unpin (pcache1.c:1076),
+		// which adds to the LRU unconditionally because its invariants forbid
+		// removing a pinned page from the hash; v2 allows that, so we gate on
+		// inCache.
 		if p.dirty {
-			if pc.pages[p.pgno] == p {
+			if p.inCache {
 				pc.dirtyMoveToFront(p)
 			}
-		} else if pc.purgeable && pc.pages[p.pgno] == p {
+		} else if pc.purgeable && p.inCache {
 			// Non-purgeable caches (InMemory) skip LRU entirely — pages are
 			// never evicted. Matches SQLite pcache.c:265-271 (pcacheUnpin is
 			// a no-op for non-purgeable caches).
@@ -338,8 +450,8 @@ func (pc *pcache) release(p *page) {
 			// creates during a transaction), discard the page immediately
 			// rather than adding to LRU. Matches SQLite pcache1Unpin
 			// (pcache1.c:1094): pGroup->nPurgeable > pGroup->nMaxPage.
-			if len(pc.pages) > pc.maxPages {
-				delete(pc.pages, p.pgno)
+			if pc.nPage > pc.maxPages {
+				pc.hashRemove(p)
 				pc.returnPageBuffer(p)
 			} else {
 				pc.lruPrepend(p)
@@ -454,24 +566,35 @@ func (pc *pcache) clear() {
 		pc.pFree = pc.pFree[:0]
 	}
 
-	for _, p := range pc.pages {
-		if pc.useSlab && globalPageSlab.UnderPressure() {
-			// Slab mode under pressure: return all buffers to slab.
-			// No isBulkLocal pages exist in slab mode (initBulk is skipped).
-			freePageBuffer(p.data, pc.useSlab)
-			p.data = nil
-		} else if p.isBulkLocal {
-			// Bulk-local pages always go to pFree (matches SQLite pcache1FreePage).
-			// They were heap-allocated in initBulk and are never returned to slab/pool.
-			pc.pFree = append(pc.pFree, p)
-		} else if len(pc.pFree) < pc.maxPages {
-			pc.pFree = append(pc.pFree, p)
-		} else {
-			freePageBuffer(p.data, pc.useSlab)
-			p.data = nil
+	// Walk every bucket chain. hashRemove is not used here (we are tearing the
+	// whole table down); instead we clear membership on each page as we route it,
+	// then zero all buckets at the end. Save hashNext before clearing it because
+	// pages routed to pFree are reused.
+	for bi, head := range pc.apHash {
+		for p := head; p != nil; {
+			next := p.hashNext
+			p.hashNext = nil
+			p.inCache = false
+			if pc.useSlab && globalPageSlab.UnderPressure() {
+				// Slab mode under pressure: return all buffers to slab.
+				// No isBulkLocal pages exist in slab mode (initBulk is skipped).
+				freePageBuffer(p.data, pc.useSlab)
+				p.data = nil
+			} else if p.isBulkLocal {
+				// Bulk-local pages always go to pFree (matches SQLite pcache1FreePage).
+				// They were heap-allocated in initBulk and are never returned to slab/pool.
+				pc.pFree = append(pc.pFree, p)
+			} else if len(pc.pFree) < pc.maxPages {
+				pc.pFree = append(pc.pFree, p)
+			} else {
+				freePageBuffer(p.data, pc.useSlab)
+				p.data = nil
+			}
+			p = next
 		}
+		pc.apHash[bi] = nil
 	}
-	clear(pc.pages)
+	pc.nPage = 0
 	pc.lruHead = nil
 	pc.lruTail = nil
 	pc.dirtyHead = nil
@@ -487,9 +610,16 @@ func (pc *pcache) clear() {
 // Used when the cache will not be reused: temporary caches (getNamespace,
 // listNamespaces, integrity check) and pager close/error paths.
 func (pc *pcache) destroy() {
-	for _, p := range pc.pages {
-		freePageBuffer(p.data, pc.useSlab)
-		p.data = nil
+	for bi, head := range pc.apHash {
+		for p := head; p != nil; {
+			next := p.hashNext
+			p.hashNext = nil
+			p.inCache = false
+			freePageBuffer(p.data, pc.useSlab)
+			p.data = nil
+			p = next
+		}
+		pc.apHash[bi] = nil
 	}
 	for _, p := range pc.pFree {
 		freePageBuffer(p.data, pc.useSlab)
@@ -497,7 +627,7 @@ func (pc *pcache) destroy() {
 	}
 	pc.pFree = nil
 	pc.bulkInit = false
-	clear(pc.pages)
+	pc.nPage = 0
 	pc.lruHead = nil
 	pc.lruTail = nil
 	pc.dirtyHead = nil
@@ -510,7 +640,7 @@ func (pc *pcache) destroy() {
 // pFree for local reuse; non-bulk pages return to the slab/pool.
 // Matches SQLite pcache1FreePage (pcache1.c:470-482).
 func (pc *pcache) discard(pgno uint32) {
-	p := pc.pages[pgno]
+	p := pc.hashFind(pgno)
 	if p == nil {
 		return
 	}
@@ -531,34 +661,51 @@ func (pc *pcache) discard(pgno uint32) {
 	} else {
 		pc.lruRemove(p)
 	}
-	delete(pc.pages, pgno)
+	// hashRemove clears p.inCache, so if a caller still holds this page pinned
+	// (discard can run on a pinned page), the eventual release() sees inCache
+	// false and does not re-add the now-freed page to the LRU (ghost-page guard).
+	pc.hashRemove(p)
 	pc.returnPageBuffer(p)
 }
 
 // truncate removes all pages with pgno > maxPage. Bulk-local pages go to
-// pFree; non-bulk pages return to the slab/pool.
+// pFree; non-bulk pages return to the slab/pool. Pinned pages that match are
+// removed too (hashRemove clears inCache so a later release won't re-LRU them).
+// Walks each bucket chain in place via a pointer-to-link, mirroring SQLite
+// pcache1TruncateUnsafe (pcache1.c:644-687).
 func (pc *pcache) truncate(maxPage uint32) {
-	for pgno, p := range pc.pages {
-		if pgno > maxPage {
-			if p.dirty {
-				if p.prev != nil {
-					p.prev.next = p.next
+	for bi := range pc.apHash {
+		pp := &pc.apHash[bi]
+		for *pp != nil {
+			p := *pp
+			if p.pgno > maxPage {
+				// Unlink from the bucket chain in place (we already hold the
+				// link pointer, so don't call hashRemove which would re-walk).
+				*pp = p.hashNext
+				p.hashNext = nil
+				p.inCache = false
+				pc.nPage--
+				if p.dirty {
+					if p.prev != nil {
+						p.prev.next = p.next
+					} else {
+						pc.dirtyHead = p.next
+					}
+					if p.next != nil {
+						p.next.prev = p.prev
+					} else {
+						pc.dirtyTail = p.prev
+					}
+					p.next = nil
+					p.prev = nil
+					pc.nDirty--
 				} else {
-					pc.dirtyHead = p.next
+					pc.lruRemove(p)
 				}
-				if p.next != nil {
-					p.next.prev = p.prev
-				} else {
-					pc.dirtyTail = p.prev
-				}
-				p.next = nil
-				p.prev = nil
-				pc.nDirty--
+				pc.returnPageBuffer(p)
 			} else {
-				pc.lruRemove(p)
+				pp = &p.hashNext
 			}
-			delete(pc.pages, pgno)
-			pc.returnPageBuffer(p)
 		}
 	}
 }
@@ -615,7 +762,7 @@ func (pc *pcache) evictOne() *page {
 	p.next = nil
 	p.prev = nil
 	pc.nRecyclable--
-	delete(pc.pages, p.pgno)
+	pc.hashRemove(p)
 	return p
 }
 

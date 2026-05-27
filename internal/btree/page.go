@@ -323,9 +323,14 @@ func (ph *pageHeader) deserialize(buf []byte) {
 
 // page represents an in-memory database page.
 type page struct {
-	data        []byte     // raw page data
-	next        *page      // page cache linked list
-	prev        *page      // page cache linked list
+	data []byte // raw page data
+	next *page  // page cache linked list (LRU OR dirty list — mutually exclusive)
+	prev *page  // page cache linked list (LRU OR dirty list — mutually exclusive)
+	// hashNext links pages within one pcache hash bucket chain (apHash). It is
+	// independent of next/prev: a cached page is always in its hash chain AND
+	// simultaneously in either the LRU or the dirty list. Matches SQLite
+	// PgHdr1.pNext (pcache1.c:122).
+	hashNext    *page
 	cache       *pcache    // owning page cache (nil for uncached/temp pages)
 	pinCount    int        // reference count
 	header      pageHeader // parsed page header
@@ -333,6 +338,12 @@ type page struct {
 	dirty       bool       // true if page has been modified
 	uncached    bool       // true if page is not in the shared cache (MVCC snapshot copy)
 	isBulkLocal bool       // true for pages from initBulk (heap-allocated); matches SQLite pcache1.c:184
+	// inCache is true iff the page is currently linked in pc.apHash. Set by
+	// hashInsert, cleared by hashRemove. It lets release() gate the LRU insert
+	// with a field read instead of a second hash probe, and makes "ghost" pages
+	// (removed while pinned by discard/truncate) explicit. SQLite needs no such
+	// flag because its invariants forbid removing a pinned page from the hash.
+	inCache bool
 }
 
 // usableSize returns the usable size of the page (total minus reserved).

@@ -196,6 +196,7 @@ func DefaultOptions() Options {
 //   - Options.Key set with any other non-zero length: treated as a passphrase,
 //     derived via PBKDF2 using the supplied salt and KDFIterations.
 //   - Options.Key set with length 0: rejected.
+//
 // buildCodec constructs the Codec for the resolved mode. `useCksum` is the
 // caller's effective checksum decision (file-state-authoritative on reopen,
 // opts.Checksum on new DBs). buildCodec rejects combining checksum mode with
@@ -264,14 +265,14 @@ var errEmptyFile = errors.New("btree: empty file")
 
 // DB represents an open database.
 type DB struct {
-	mu      sync.RWMutex
-	writeMu sync.Mutex // serializes write transactions
-	pager   *pager
-	path    string
-	opts    Options
-	closing          atomic.Bool // set to reject new transactions
-	closed           atomic.Bool // set when Close() is actually called
-	writerLocksDone  atomic.Bool // CAS guard: writer lock cleanup (endRead+RUnlock+Unlock) runs exactly once
+	mu              sync.RWMutex
+	writeMu         sync.Mutex // serializes write transactions
+	pager           *pager
+	path            string
+	opts            Options
+	closing         atomic.Bool // set to reject new transactions
+	closed          atomic.Bool // set when Close() is actually called
+	writerLocksDone atomic.Bool // CAS guard: writer lock cleanup (endRead+RUnlock+Unlock) runs exactly once
 
 	// Namespace root pages are stored in a master table on page 1.
 	// Format: each cell in the master B-tree maps namespace name -> root page number (4 bytes).
@@ -767,7 +768,6 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 
 	var maxFrame uint32
 	var slot int
-	var fcc, sc uint32
 	var readSnap WalIndexHdr
 
 	for attempt := 0; ; attempt++ {
@@ -780,15 +780,6 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 					continue
 				}
 			}
-			db.mu.RUnlock()
-			db.writeMu.Unlock()
-			return nil, err
-		}
-
-		// Read on-disk counters for staleness detection.
-		fcc, sc, err = db.pager.readHeaderCounters(maxFrame)
-		if err != nil {
-			db.pager.endRead(slot)
 			db.mu.RUnlock()
 			db.writeMu.Unlock()
 			return nil, err
@@ -823,6 +814,22 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 			}
 		}
 	}
+
+	// Read the committed page-1 counters for staleness detection from the
+	// in-memory header instead of re-reading page 1 from the WAL on every
+	// write tx. After beginWrite, p.header is authoritative: beginWrite
+	// invokes refreshHeaderFromPage1 on the exact stateChanged edge
+	// (wal.beginWriteWithSnapshot: live SHM hdr != writerHdr) that signals a
+	// peer process committed or checkpointed — the same WAL-index-change edge
+	// SQLite uses to pager_reset and re-read page 1 (pager.c:3246-3267
+	// pagerBeginReadTransaction). When stateChanged is false the SHM header
+	// equals what this process last wrote, so the on-disk counters are
+	// unchanged and p.header still matches. SQLite likewise keeps the header
+	// in the in-memory page-1 PgHdr and does not re-read it from the WAL per
+	// statement. The staleness signal (diskFileChangeCounter vs
+	// localFileChangeCounter, consumed by checkStale → IsDataStale) is
+	// therefore preserved on the identical invalidation edge.
+	fcc, sc := db.pager.committedCounters()
 
 	// Reset the cleanup guard for this write transaction.
 	db.writerLocksDone.Store(false)
@@ -876,7 +883,7 @@ func (db *DB) putWriteTx(tx *WriteTx) {
 
 // WriterCacheLen returns the number of pages in the writer cache (test helper).
 func (db *DB) WriterCacheLen() int {
-	return len(db.pager.writerCache.pages)
+	return db.pager.writerCache.nPage
 }
 
 // Checkpoint triggers a WAL checkpoint with the specified mode, writing
@@ -1197,7 +1204,6 @@ type ReadTx struct {
 // direct walMaxFrame field access — the field is being migrated to
 // walHdr.mxFrame per the per-connection-hdr spec.
 func (tx *ReadTx) WalMaxFrame() uint32 { return tx.walHdr.mxFrame }
-
 
 // txGetPage fetches a page respecting MVCC snapshot isolation.
 // For write transactions, pages are fetched from the writer cache or WAL.

@@ -94,6 +94,29 @@ type pager struct {
 	// verify the dispatch guard exercises both branches in the test matrix.
 	balanceQuickDispatchCount atomic.Int64
 
+	// balanceNonrootDispatchCount counts dispatches into balanceNonroot (the
+	// general 3-sibling redistribution path, ported from SQLite balance_nonroot
+	// at btree.c:8248-9030). Test-only, mirrors balanceQuickDispatchCount: lets
+	// the fill-factor test prove the new path actually fired and was not
+	// silently swallowed by balance_quick.
+	balanceNonrootDispatchCount atomic.Int64
+
+	// lastBalanceNOld / lastBalanceNNew record the nOld / nNew of the most
+	// recent balanceNonroot call. Test-only (TestBalanceNonroot_SiblingGather):
+	// they pin the NB=3 sibling gather and the k ∈ {nOld-1, nOld, nOld+1}
+	// invariant. Production code never reads them.
+	lastBalanceNOld atomic.Int64
+	lastBalanceNNew atomic.Int64
+
+	// deleteRebalanceDispatchCount counts dispatches into the delete-side merge
+	// driver (deleteRebalanceLeaf / deleteRebalanceInterior): the underfull page
+	// is funnelled through the same balanceNonroot port as the insert path but
+	// with inject.active==false — SQLite drives delete-merge through balance() →
+	// balance_nonroot() the same way (btree.c:10005-10010). Mirrors
+	// balanceNonrootDispatchCount; lets the fill-factor test prove the
+	// delete-rebalance path actually fired.
+	deleteRebalanceDispatchCount atomic.Int64
+
 	// Savepoint support: snapshots of dirty pages at savepoint boundaries
 	savepoints []savepointState
 
@@ -1085,12 +1108,16 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 		// Discard any stale cache entry before adopting the temp page.
 		// The stale page may still be on the LRU list (released at
 		// getPageWriter:434); without this, a later evictOne on the stale
-		// page would delete(pc.pages, pgno) and remove the NEW adopted
-		// page from the map, creating a ghost dirty-list entry.
-		if old := p.writerCache.pages[pgno]; old != nil {
+		// page would hashRemove(pgno) and unlink the NEW adopted page from
+		// the cache, creating a ghost dirty-list entry.
+		if old := p.writerCache.hashFind(pgno); old != nil {
 			p.writerCache.discard(pgno)
 		}
-		p.writerCache.pages[pgno] = pg
+		// Link the adopted (already-pinned) temp page directly into the hash.
+		// hashInsert sets pg.inCache so a later release routes through
+		// writerCache.release, and bumps nPage. The page did not pass through
+		// create(), so this is the analogue of the former pc.pages[pgno] = pg.
+		p.writerCache.hashInsert(pg)
 	}
 
 	// Save copy for savepoint rollback if we have active savepoints
@@ -1218,7 +1245,7 @@ func (p *pager) freePage(pgno uint32) error {
 			// Only done when adding as leaf to trunk, NOT when becoming a trunk
 			// (trunk page content is meaningful -- it holds freelist structure).
 			// Matches SQLite's freePage2() (btree.c:6920).
-			if p.writerCache.pages[pgno] != nil {
+			if p.writerCache.hashFind(pgno) != nil {
 				p.dontWrite(pgno)
 			}
 			// Track that this page had content before being freed, so that if
@@ -1374,14 +1401,32 @@ func (p *pager) allocateFromFreelist(nearby uint32) (*page, error) {
 		// reference it — causing corruption (Bug 9).
 		if len(p.savepoints) > 0 {
 			if debugTrace {
-				trace("allocateFromFreelist: leaf pg=%d hasContent=false but savepoints=%d → getWritablePage (savepoint safety)", leafPgno, len(p.savepoints))
+				trace("allocateFromFreelist: leaf pg=%d hasContent=false but savepoints=%d → getPageNoContent + savepoint copy", leafPgno, len(p.savepoints))
 			}
-			pg, err := p.getWritablePage(leafPgno)
+			// hasContent==false: the page has no meaningful on-disk content, and
+			// for a page near dbSize whose content was never materialised to the
+			// DB file (grown+freed within uncommitted/un-checkpointed churn) a real
+			// read would hit EOF. Use a NOCONTENT fetch (no disk read) — matching
+			// SQLite's `noContent = !btreeGetHasContent(...)` path (btree.c:6725) —
+			// then journal the no-content state into the innermost savepoint so a
+			// rollback restores the page consistently with the freelist header
+			// (Bug 9). The previous getWritablePage here READ the page and failed
+			// with EOF, leaking the already-popped leaf: the caller
+			// (allocatePageNear) swallows the error and grows instead, leaving the
+			// page neither on the freelist nor referenced ("page N: never used").
+			pg, err := p.getPageNoContent(leafPgno)
 			if err != nil {
 				return nil, err
 			}
+			sp := &p.savepoints[len(p.savepoints)-1]
+			if _, exists := sp.pages[leafPgno]; !exists {
+				dataCopy := allocPageBuffer(int(p.pageSize), false)
+				copy(dataCopy, pg.data)
+				sp.pages[leafPgno] = dataCopy
+			}
 			clear(pg.data)
 			pg.header = pageHeader{}
+			p.writerCache.makeDirty(pg)
 			delete(p.dontWritePages, leafPgno)
 			return pg, nil
 		}
@@ -1456,6 +1501,12 @@ func (p *pager) recycleTempPage(pg *page) {
 	pg.header = pageHeader{}
 	pg.next = nil
 	pg.prev = nil
+	// Clear pcache hash-chain membership so a pooled page reused as a temp page
+	// (or adopted into the writer cache via getWritablePage) never carries a
+	// stale bucket link or inCache flag. Temp pages never enter apHash directly,
+	// but resetting here keeps the pagePool population disjoint from the cache.
+	pg.hashNext = nil
+	pg.inCache = false
 	p.pagePool.Put(pg)
 }
 
@@ -1570,6 +1621,20 @@ func (p *pager) refreshHeaderFromPage1() {
 			return
 		}
 	}
+}
+
+// committedCounters returns the FileChangeCount and SchemaCookie from the
+// in-memory header. It is only valid to call while holding the writer
+// (BeginWrite holds db.writeMu and the pager is in pagerWriter state after
+// beginWrite, so p.header is owned exclusively by this writer — no data race
+// with concurrent readers). The values reflect the latest committed page 1:
+// beginWrite refreshes p.header via refreshHeaderFromPage1 on the stateChanged
+// edge that signals a peer commit/checkpoint, so this returns exactly what
+// readHeaderCounters would read from page 1 — without the per-tx WAL hash
+// lookup + frame read. Mirrors SQLite keeping the header in the in-memory
+// page-1 PgHdr rather than re-reading it from the WAL per statement.
+func (p *pager) committedCounters() (fileChangeCount, schemaCookie uint32) {
+	return p.header.FileChangeCount, p.header.SchemaCookie
 }
 
 // readHeaderCounters reads the FileChangeCount and SchemaCookie from page 1.
@@ -1745,38 +1810,40 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	// Update the in-memory header with current database size.
 	p.header.DatabaseSize = p.dbSize.Load()
 
-	// Collect dirty pages first to determine if there are real changes.
-	p.dirtyBuf = p.writerCache.appendDirtyPages(p.dirtyBuf[:0])
-
-	// Filter out dontWrite pages before WAL write (fix 5.4).
-	// These are freed leaf pages whose content is irrelevant.
+	// Filter out dontWrite pages before WAL write (fix 5.4). These are freed
+	// leaf pages whose content is irrelevant. We clean them directly from the
+	// cache by iterating the dontWritePages map (no dirty-list collect): a
+	// dontWrite page is either dirty (makeClean removes it from the dirty
+	// list and decrements nDirty), already clean from a prior spill
+	// (makeClean is a no-op), or evicted (absent from the cache — nothing to
+	// do). This is equivalent to the previous dirty-list walk but avoids a
+	// redundant dirty-page collection. The authoritative dirty set is
+	// collected exactly once below, after page 1 is dirtied — mirroring
+	// SQLite's single sqlite3PcacheDirtyList in sqlite3PagerCommitPhaseOne
+	// (pager.c:6502).
 	if len(p.dontWritePages) > 0 {
 		if debugTrace {
-			trace("commit: filtering %d dontWrite pages from %d dirty pages savepoints=%d",
-				len(p.dontWritePages), len(p.dirtyBuf), len(p.savepoints))
+			trace("commit: filtering %d dontWrite pages (nDirty=%d) savepoints=%d",
+				len(p.dontWritePages), p.writerCache.nDirty, len(p.savepoints))
 		}
-		n := 0
-		for _, pg := range p.dirtyBuf {
-			if p.dontWritePages[pg.pgno] {
-				if debugTrace {
-					trace("commit: dontWrite filtering pg=%d (skipping WAL write)", pg.pgno)
+		for pgno := range p.dontWritePages {
+			if pg := p.writerCache.hashFind(pgno); pg != nil {
+				if debugTrace && pg.dirty {
+					trace("commit: dontWrite filtering pg=%d (skipping WAL write)", pgno)
 				}
 				p.writerCache.makeClean(pg)
-			} else {
-				p.dirtyBuf[n] = pg
-				n++
 			}
 		}
-		p.dirtyBuf = p.dirtyBuf[:n]
 		clear(p.dontWritePages)
 	}
 
 	// Determine if there are real changes: dirty data pages, header
 	// modifications (freelist, dbSize changes), or spilled pages. Counter
 	// increments are deferred until we confirm there's something to commit.
+	// nDirty (post dontWrite-filter) counts the pages that would be collected.
 	// The nFrame check catches transactions where all dirty pages were spilled
-	// (making dirtyBuf empty) but a commit frame is still needed.
-	hasRealChanges := len(p.dirtyBuf) > 0 || p.header != p.savedHeader ||
+	// (making nDirty zero) but a commit frame is still needed.
+	hasRealChanges := p.writerCache.nDirty > 0 || p.header != p.savedHeader ||
 		p.wal.nFrame.Load() > p.savedWalFrame.Load()
 
 	if !hasRealChanges {
@@ -1816,7 +1883,9 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	}
 	p.releasePage(pg1)
 
-	// Re-collect dirty pages since page 1 may be newly dirty.
+	// Collect the authoritative dirty set once, now that page 1 has been
+	// dirtied. dontWrite pages were already cleaned above so they are not on
+	// the dirty list. Single collection mirrors SQLite (pager.c:6502).
 	p.dirtyBuf = p.writerCache.appendDirtyPages(p.dirtyBuf[:0])
 
 	if debugTrace {
@@ -2077,7 +2146,7 @@ func (p *pager) rollbackToSavepoint(id int) error {
 
 	if debugTrace {
 		trace("rollbackToSavepoint: id=%d spDbSize=%d currentDbSize=%d numSavepoints=%d cachedPages=%d",
-			id, sp.dbSize, p.dbSize.Load(), len(p.savepoints), len(p.writerCache.pages))
+			id, sp.dbSize, p.dbSize.Load(), len(p.savepoints), p.writerCache.nPage)
 	}
 
 	// Suppress spills during savepoint rollback (SQLite pager.c:2457).

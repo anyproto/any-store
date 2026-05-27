@@ -20,6 +20,15 @@ type IndexIter struct {
 	boundIdx int
 	Reverse  bool
 	started  bool
+
+	// pendingCurrent is set by skipOffset after it positions the cursor
+	// directly on the first row to emit. When true, the next Next() call
+	// returns the entry at the current cursor position WITHOUT advancing
+	// first (it then clears the flag). This makes the handoff from a
+	// cursor-level offset skip to normal iteration off-by-one-safe across
+	// page boundaries: skipOffset leaves the cursor on the target entry
+	// rather than one-before it.
+	pendingCurrent bool
 }
 
 func (it *IndexIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
@@ -151,7 +160,13 @@ func (it *IndexIter) Next() (key []byte, docId []byte, multiKey bool, err error)
 }
 
 func (it *IndexIter) nextNoBounds() (key []byte, docId []byte, multiKey bool, err error) {
-	if !it.started {
+	switch {
+	case it.pendingCurrent:
+		// skipOffset positioned the cursor directly on the entry to emit;
+		// return it without advancing. Clear the flag so the following
+		// call advances normally.
+		it.pendingCurrent = false
+	case !it.started:
 		it.started = true
 		if it.Reverse {
 			if err = it.cursor.Last(); err != nil {
@@ -162,7 +177,7 @@ func (it *IndexIter) nextNoBounds() (key []byte, docId []byte, multiKey bool, er
 				return nil, nil, false, err
 			}
 		}
-	} else {
+	default:
 		if it.Reverse {
 			if err = it.cursor.Previous(); err != nil {
 				return nil, nil, false, err
@@ -181,6 +196,87 @@ func (it *IndexIter) nextNoBounds() (key []byte, docId []byte, multiKey bool, er
 		return nil, nil, false, err
 	}
 	return it.extractResult(k)
+}
+
+// skipOffset advances the index cursor past up to n logical result rows
+// WITHOUT fetching/parsing the skipped documents, implementing the
+// offsetSkipper contract. See offsetSkipper for the full contract.
+//
+// Scope (correctness): only the unbounded full-index scan is fast-skipped,
+// and only across entries the index records as scalar (multiKey==false —
+// the doc's single entry in this index). On the first multi-key/legacy
+// entry it stops and returns the unskipped remainder, leaving the cursor
+// on that entry so the normal Next() path (FetchIter → CanonicalKeyDedup →
+// LimitIter, or consumer-side DocDedup) resolves the offset correctly.
+//
+// For bounded scans it skips nothing (returns n): bounded index scans
+// either carry a residual filter (which blocks the delegation chain
+// upstream) or would require per-bound logical-row accounting that the
+// safe fetch-then-skip path already handles correctly.
+func (it *IndexIter) skipOffset(n int) (remaining int, err error) {
+	if n <= 0 {
+		return 0, nil
+	}
+	// Only the unbounded full-index scan is fast-skipped. With bounds we
+	// fall back to the safe fetch-then-skip path (return the full offset).
+	if len(it.Bounds) != 0 {
+		return n, nil
+	}
+	// skipOffset is only ever invoked before iteration starts (LimitIter
+	// calls it on its first Next, before pulling any row). Guard against a
+	// mid-stream call to avoid corrupting cursor position.
+	if it.started {
+		return n, nil
+	}
+	if it.cursor == nil {
+		it.cursor = it.Source.NewCursor()
+	}
+	it.started = true
+
+	// Position at the first entry in scan order.
+	if it.Reverse {
+		if err = it.cursor.Last(); err != nil {
+			return n, err
+		}
+	} else {
+		if err = it.cursor.First(); err != nil {
+			return n, err
+		}
+	}
+
+	skipped := 0
+	for skipped < n && it.cursor.Valid() {
+		val, verr := it.cursor.Value()
+		if verr != nil {
+			return n - skipped, verr
+		}
+		if EntryValueIsMultiKey(val) {
+			// A doc with >1 entries in this index (array/legacy). Entry
+			// count no longer equals logical-row count: stop here and let
+			// the dedup-aware path skip the remaining rows. Leave the
+			// cursor on this entry; the next Next() emits it.
+			it.pendingCurrent = true
+			return n - skipped, nil
+		}
+		// Scalar entry == exactly one distinct doc == one logical row.
+		skipped++
+		if it.Reverse {
+			if err = it.cursor.Previous(); err != nil {
+				return n - skipped, err
+			}
+		} else {
+			if err = it.cursor.Next(); err != nil {
+				return n - skipped, err
+			}
+		}
+	}
+
+	// The next Next() should emit the entry at the current position (the
+	// first un-skipped row), not advance past it. If the cursor ran out of
+	// entries (skipped < n), the flag is harmless: Next() sees an invalid
+	// cursor and returns end-of-stream.
+	it.pendingCurrent = true
+	return n - skipped, nil
 }
 
 // CountEntries counts distinct documents matching this index iterator's

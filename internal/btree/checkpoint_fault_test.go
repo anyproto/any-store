@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -279,8 +280,13 @@ func TestCheckpointBackfill_WriteAtFailure_PartialThenSuccessful(t *testing.T) {
 	t.Logf("nBackfill before faulty checkpoint: %d", nBackfillBefore)
 	t.Logf("maxFrame: %d", db.pager.wal.index.maxFrame.Load())
 
-	// Trigger checkpoint with fault: should fail mid-backfill
-	ff.enableFault(5) // Allow 5 page writes, then fail
+	// Trigger checkpoint with fault: should fail mid-backfill.
+	// Fault after 2 page writes so the checkpoint is genuinely partial even for
+	// the compact tree the index-btree balancer now produces (50 docs / 200B at
+	// pageSize 4096 fit in ~5 pages after balance_nonroot's tighter fill, down
+	// from 6). A higher threshold could exceed the page count and let the
+	// checkpoint complete, defeating the partial-checkpoint assertion.
+	ff.enableFault(2) // Allow 2 page writes, then fail
 	err = db.Checkpoint(CheckpointFull)
 	assert.Error(t, err, "checkpoint should fail due to WriteAt fault")
 	t.Logf("Faulty checkpoint error: %v", err)
@@ -957,8 +963,11 @@ func TestMinFrameFilter_PartialCheckpointThenRead(t *testing.T) {
 	t.Logf("Before checkpoint: nBackfill=%d maxFrame=%d",
 		nBackfillBefore, db.pager.wal.index.maxFrame.Load())
 
-	// Partial checkpoint — fail after writing some pages
-	ff.enableFault(5)
+	// Partial checkpoint — fail after writing some pages. Fault after 2 writes
+	// so the checkpoint stays partial for the compact tree the index-btree
+	// balancer now produces (~5 pages for 50 docs / 200B at pageSize 4096, down
+	// from 6); a higher threshold could exceed the page count and complete.
+	ff.enableFault(2)
 	err = db.Checkpoint(CheckpointFull)
 	assert.Error(t, err, "checkpoint should fail")
 	ff.disableFault()
@@ -1001,26 +1010,34 @@ func TestMinFrameFilter_SuccessThenFailThenRead(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 
-	// Phase 1: Write batch 1 and checkpoint successfully
-	writeDocuments(t, db, "data", 0, 30)
+	// Phase 1: Write batch 1 and checkpoint successfully.
+	writeDocuments(t, db, "data", 0, 100)
 	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	nBackfill1 := db.pager.wal.index.nBackfill.Load()
 	t.Logf("After successful checkpoint: nBackfill=%d maxFrame=%d",
 		nBackfill1, db.pager.wal.index.maxFrame.Load())
+	require.Positive(t, nBackfill1, "first checkpoint should advance nBackfill")
 
-	// Phase 2: Write batch 2 (creates new WAL frames above nBackfill)
-	writeDocuments(t, db, "data", 30, 30)
+	// Phase 2: Write batch 2 (creates new WAL frames above nBackfill).
+	writeDocuments(t, db, "data", 100, 100)
 
 	maxFrame2 := db.pager.wal.index.maxFrame.Load()
 	t.Logf("After batch 2: nBackfill=%d maxFrame=%d", nBackfill1, maxFrame2)
+	require.Greater(t, maxFrame2, nBackfill1, "batch 2 frames must be above nBackfill")
 
-	// Phase 3: Failed checkpoint — writes some frames to DB, fails mid-way
-	// The partial checkpoint writes new page versions to DB that
-	// overwrite the CORRECT data from the successful checkpoint.
-	ff.enableFault(8) // Allow 8 page writes, then fail
+	// Phase 3: Failed checkpoint — backfills several pages, then fails mid-way.
+	// The partial checkpoint writes new page versions to the DB that overwrite
+	// the CORRECT data from the successful checkpoint. With ~100 new docs the
+	// backfill writes >>2 distinct pages, so failing after 2 leaves a genuine
+	// partial state. (One WriteAt per distinct page — buildBackfillMap dedup,
+	// wal.go:2862; the per-frame thresholds the old test used no longer fire.)
+	ff.enableFault(2) // write 2 pages, then fail on the 3rd
 	err = db.Checkpoint(CheckpointFull)
-	assert.Error(t, err, "checkpoint should fail")
+	require.Error(t, err, "checkpoint should fail")
+	assert.ErrorIs(t, err, errInjectedIO)
+	require.Positive(t, ff.failedWriteAts.Load(), "the injected fault must have actually fired")
+	t.Logf("Failed checkpoint fired fault: err=%v failedWriteAts=%d", err, ff.failedWriteAts.Load())
 	ff.disableFault()
 
 	nBackfill2 := db.pager.wal.index.nBackfill.Load()
@@ -1034,7 +1051,7 @@ func TestMinFrameFilter_SuccessThenFailThenRead(t *testing.T) {
 	//   Reader reads these from DB. DB should have correct data from phase 1 checkpoint.
 	// Batch 2 docs: their WAL frames are ABOVE nBackfill (visible via minFrame).
 	//   Reader reads these from WAL.
-	verifyDocuments(t, db, "data", 60)
+	verifyDocuments(t, db, "data", 200)
 
 	// Phase 5: Close (with possible re-checkpoint) and reopen
 	require.NoError(t, db.Close())
@@ -1043,7 +1060,7 @@ func TestMinFrameFilter_SuccessThenFailThenRead(t *testing.T) {
 	db2, err := testOpen(t, path, opts)
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
-	verifyDocuments(t, db2, "data", 60)
+	verifyDocuments(t, db2, "data", 200)
 }
 
 // TestMinFrameFilter_MultipleCheckpointCycles tests many cycles of
@@ -1201,14 +1218,15 @@ func TestMinFrameFilter_OverwriteCheckpointedPages(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 
-	// Phase 1: Write docs 0-19 and checkpoint
-	writeDocuments(t, db, "data", 0, 20)
+	// Phase 1: Write docs 0-99 and checkpoint successfully.
+	writeDocuments(t, db, "data", 0, 100)
 	require.NoError(t, db.Checkpoint(CheckpointFull))
 	nBackfill1 := db.pager.wal.index.nBackfill.Load()
 	t.Logf("Phase 1: nBackfill=%d", nBackfill1)
+	require.Positive(t, nBackfill1)
 
-	// Phase 2: UPDATE docs 0-9 (overwrites same keys, creating new WAL frames)
-	for i := 0; i < 10; i++ {
+	// Phase 2: UPDATE docs 0-49 (overwrites same keys, creating new WAL frames).
+	for i := 0; i < 50; i++ {
 		tx, err := db.BeginWrite()
 		require.NoError(t, err)
 		ns, err := tx.GetNamespace("data")
@@ -1223,24 +1241,36 @@ func TestMinFrameFilter_OverwriteCheckpointedPages(t *testing.T) {
 
 	maxFrame2 := db.pager.wal.index.maxFrame.Load()
 	t.Logf("Phase 2: nBackfill=%d maxFrame=%d", nBackfill1, maxFrame2)
+	require.Greater(t, maxFrame2, nBackfill1)
 
-	// Phase 3: Failed checkpoint — writes some updated pages to DB
-	ff.enableFault(4)
+	// Phase 3: Failed checkpoint — writes some updated pages to the DB, then
+	// fails. Updating 50 docs dirties several distinct pages, so failing after
+	// 2 page-writes leaves a genuine partial overwrite. (One WriteAt per
+	// distinct page after the buildBackfillMap dedup at wal.go:2862; the old
+	// per-frame threshold of 4 no longer fires on a small DB.)
+	ff.enableFault(2)
 	err = db.Checkpoint(CheckpointFull)
-	assert.Error(t, err)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errInjectedIO)
+	require.Positive(t, ff.failedWriteAts.Load(), "the injected fault must have actually fired")
+	t.Logf("Phase 3: failed checkpoint fired fault, failedWriteAts=%d", ff.failedWriteAts.Load())
 	ff.disableFault()
 
 	nBackfill2 := db.pager.wal.index.nBackfill.Load()
 	t.Logf("Phase 3: nBackfill=%d (should equal phase 1)", nBackfill2)
+	assert.Equal(t, nBackfill1, nBackfill2,
+		"nBackfill must NOT advance after a failed checkpoint")
 
-	// Phase 4: Verify docs 0-9 have UPDATED values
-	// The minFrame filter should find the update frames in WAL (above nBackfill)
+	// Phase 4: Verify docs 0-49 have UPDATED values.
+	// nBackfill did not advance, so the update frames (above nBackfill) are
+	// found in the WAL by the minFrame filter — even though phase 3 wrote some
+	// of those updated pages into the DB file.
 	rtx, err := db.BeginRead()
 	require.NoError(t, err)
 	ns, err := rtx.GetNamespace("data")
 	require.NoError(t, err)
 
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 50; i++ {
 		key := binary.BigEndian.AppendUint32(nil, uint32(i))
 		val, err := rtx.Get(ns, key)
 		require.NoError(t, err)
@@ -1249,8 +1279,8 @@ func TestMinFrameFilter_OverwriteCheckpointedPages(t *testing.T) {
 			"doc %d should have updated value, got: %s", i, valStr[:min(40, len(valStr))])
 	}
 
-	// Docs 10-19 should still be readable (from DB via minFrame filter)
-	for i := 10; i < 20; i++ {
+	// Docs 50-99 (never updated) should still be readable from DB via the filter.
+	for i := 50; i < 100; i++ {
 		key := binary.BigEndian.AppendUint32(nil, uint32(i))
 		val, err := rtx.Get(ns, key)
 		require.NoError(t, err)
@@ -1267,18 +1297,24 @@ func TestMinFrameFilter_OverwriteCheckpointedPages(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = db2.Close() }()
 
-	// Verify updated docs survived
+	// Verify updated docs survived, and untouched docs are intact.
 	rtx2, err := db2.BeginRead()
 	require.NoError(t, err)
 	ns2, err := rtx2.GetNamespace("data")
 	require.NoError(t, err)
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 50; i++ {
 		key := binary.BigEndian.AppendUint32(nil, uint32(i))
 		val, err := rtx2.Get(ns2, key)
 		require.NoError(t, err)
 		valStr := string(val[4:])
 		assert.Contains(t, valStr, "UPDATED",
 			"doc %d should still have updated value after reopen", i)
+	}
+	for i := 50; i < 100; i++ {
+		key := binary.BigEndian.AppendUint32(nil, uint32(i))
+		val, err := rtx2.Get(ns2, key)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(i), binary.BigEndian.Uint32(val), "doc %d index mismatch after reopen", i)
 	}
 	_ = rtx2.Rollback()
 }
@@ -1472,17 +1508,36 @@ func TestCheckpointBackfill_ShortWrite_NoError(t *testing.T) {
 	verifyDocuments(t, db2, "data", 60)
 }
 
-// TestCheckpointBackfill_ShortWrite_InlineRead tests that even before close/reopen,
-// the short-write corruption is visible to readers via the minFrame filter.
-// After the short-write checkpoint advances nBackfill, readers skip WAL frames
-// below nBackfill and read from the corrupt DB.
+// TestCheckpointBackfill_ShortWrite_InlineRead verifies that a SHORT write
+// during checkpoint backfill (WriteAt returning n < len(b) with a nil error) is
+// detected and handled crash-safely, and that a fresh handle reading the same
+// files afterwards never observes the short-written page.
+//
+// The backfill loop checks the byte count of every page write and converts a
+// short write into io.ErrShortWrite (wal.go:3263-3266). That aborts the
+// backfill before nBackfill advances (the error path returns at wal.go:3271
+// ahead of the nBackfill.Store at wal.go:3285), so the WAL is preserved.
+//
+// We then exercise the inline-read-after-short-write path by reopening a FRESH
+// handle from an on-disk snapshot captured right after the short-write
+// checkpoint: the DB file holds one half-written page, but the intact WAL
+// shadows it. The reader sees every document correctly — batch-1 pages from the
+// DB (written in full by the successful phase-1 checkpoint) and batch-2 pages
+// from the WAL. Zero silent corruption.
+//
+// (Previously this test opened a second in-process handle to the same path
+// while the first was still open, which the Bug-16 double-open guard at
+// db.go:385 rejects. It is restructured to close the first handle and recover
+// from a snapshot.)
 func TestCheckpointBackfill_ShortWrite_InlineRead(t *testing.T) {
 	dir := t.TempDir()
+	snapDir := t.TempDir()
 	opts := DefaultOptions()
 	opts.DisableAutoCheckpoint = true
 	opts.InProcess = false // non-InProcess to exercise mmap SHM path
 
 	db, swf := openDBWithShortWrite(t, dir, opts)
+	dbPath := filepath.Join(dir, "test.db")
 
 	tx, err := db.BeginWrite()
 	require.NoError(t, err)
@@ -1490,44 +1545,65 @@ func TestCheckpointBackfill_ShortWrite_InlineRead(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 
-	// Write and checkpoint successfully
+	// Phase 1: write batch 1 and checkpoint successfully (these pages are fully
+	// and correctly written to the DB file).
 	writeDocuments(t, db, "data", 0, 40)
 	require.NoError(t, db.Checkpoint(CheckpointFull))
 
 	nBackfill := db.pager.wal.index.nBackfill.Load()
-	t.Logf("After checkpoint: nBackfill=%d", nBackfill)
+	t.Logf("After successful checkpoint: nBackfill=%d", nBackfill)
+	require.Positive(t, nBackfill)
 
-	// Write more, then checkpoint with short writes
+	// Phase 2: write batch 2 (new WAL frames above nBackfill).
 	writeDocuments(t, db, "data", 40, 40)
+	maxFrame := db.pager.wal.index.maxFrame.Load()
+	require.Greater(t, maxFrame, nBackfill)
 
+	// Phase 3: checkpoint while WriteAt silently truncates each page it writes.
+	// The first backfilled page triggers io.ErrShortWrite, aborting the backfill.
 	swf.enableShortWrite()
 	err = db.Checkpoint(CheckpointFull)
 	swf.disableShortWrite()
 
-	t.Logf("Short-write checkpoint: err=%v, shortWrites=%d",
-		err, swf.shortWrites.Load())
+	t.Logf("Short-write checkpoint: err=%v, shortWrites=%d", err, swf.shortWrites.Load())
+	require.Error(t, err, "a short write must surface as a checkpoint error")
+	assert.ErrorIs(t, err, io.ErrShortWrite, "short write should be reported as io.ErrShortWrite")
+	require.Positive(t, swf.shortWrites.Load(), "the short-write fault must have actually fired")
 
+	// nBackfill must NOT advance: the short write was caught before the store.
 	nBackfill2 := db.pager.wal.index.nBackfill.Load()
 	t.Logf("After short-write checkpoint: nBackfill=%d maxFrame=%d",
 		nBackfill2, db.pager.wal.index.maxFrame.Load())
+	assert.Equal(t, nBackfill, nBackfill2,
+		"nBackfill must not advance after a short-write checkpoint")
 
-	// Open a SECOND connection to the same DB file.
-	// This connection has a fresh page cache and will read from DB for
-	// checkpointed pages, exposing the corruption.
-	ResetVFS()
-	path := filepath.Join(dir, "test.db")
-	db2, err := testOpen(t, path, opts)
+	// Snapshot the on-disk state NOW: DB has a half-written page, WAL is intact.
+	snapshotDB(t, dbPath, snapDir)
+
+	// The WAL must still hold the committed frames (not truncated by the failure).
+	walInfo, err := os.Stat(filepath.Join(snapDir, "test.db-wal"))
 	require.NoError(t, err)
+	assert.Greater(t, walInfo.Size(), int64(0), "WAL must remain intact after the short write")
+
+	require.NoError(t, db.Close())
+
+	// Fresh handle / crash recovery from the snapshot. With the first handle
+	// closed and the registry cleared, opening the snapshot path is allowed.
+	_ = os.Remove(filepath.Join(snapDir, "test.db-shm"))
+	ResetVFS()
+	ResetOpenRegistry()
+
+	snapPath := filepath.Join(snapDir, "test.db")
+	db2, err := testOpen(t, snapPath, opts)
+	require.NoError(t, err, "snapshot must reopen despite the half-written DB page")
 	defer func() { _ = db2.Close() }()
 
-	verifyDocuments(t, db2, "data", 80)
+	t.Logf("After recovery: nBackfill=%d maxFrame=%d",
+		db2.pager.wal.index.nBackfill.Load(), db2.pager.wal.index.maxFrame.Load())
 
-	// Also close original and reopen
-	require.NoError(t, db.Close())
-	db3, err := testOpen(t, path, opts)
-	require.NoError(t, err)
-	defer func() { _ = db3.Close() }()
-	verifyDocuments(t, db3, "data", 80)
+	// Inline read after the short write: every doc is correct, including the
+	// page that was half-written to the DB (shadowed by the intact WAL).
+	verifyDocuments(t, db2, "data", 80)
 }
 
 // ==========================================================================
@@ -1592,9 +1668,31 @@ func TestRegression_Bug11_CloseUnconditionallyTruncatesWAL(t *testing.T) {
 	verifyDocuments(t, db2, "data", 50)
 }
 
-// TestRegression_Bug11_Simulation simulates what happens if the WAL IS
-// unconditionally truncated (the old buggy behavior). This confirms the
-// data loss that Bug 11 caused.
+// TestRegression_Bug11_Simulation is the regression test for the Bug 11 FIX
+// (pager.close truncate-gate at pager.go:2698; partial-checkpoint handling at
+// wal.go:2820-2840 and the backfill error path at wal.go:3271-3274).
+//
+// Bug 11 (old, buggy behavior) was: a checkpoint that failed PARTWAY through
+// backfill still let pager.close unconditionally truncate the WAL, discarding
+// the frames that had not yet been copied to the DB file → data loss on reopen.
+//
+// This test proves the bug stays fixed. It arranges a DB large enough that a
+// checkpoint backfills several distinct pages (~17 for 200 docs — see the
+// dedup in buildBackfillMap at wal.go:2862), injects a WriteAt fault that fires
+// after only 8 of those page-writes, and asserts the engine does the SAFE thing:
+//
+//   - the checkpoint returns the injected I/O error (backfill aborts);
+//   - nBackfill is NOT advanced past the safely-written prefix
+//     (it stays at its pre-checkpoint value — the backfill error path returns
+//     before the nBackfill.Store at wal.go:3285);
+//   - the WAL file is NOT truncated (it still holds every committed frame);
+//   - simulating a process crash at that exact point (reopen from an on-disk
+//     snapshot, no clean close) recovers ALL data with zero loss, because WAL
+//     recovery resets nBackfill to 0 (wal.go:1855) and replays every frame,
+//     shadowing the partially-written DB pages.
+//
+// NOTE: nBackfillAttempted IS expected to advance to mxSafeFrame (wal.go:3133):
+// it is only a crash-safety hint and never causes recovery to skip frames.
 func TestRegression_Bug11_Simulation(t *testing.T) {
 	dir := t.TempDir()
 	snapDir := t.TempDir()
@@ -1611,72 +1709,69 @@ func TestRegression_Bug11_Simulation(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit())
 
-	writeDocuments(t, db, "data", 0, 50)
+	// 200 docs → a CheckpointFull backfills ~17 distinct pages (frames dedup
+	// to pages via buildBackfillMap). Enough that failing after 8 page-writes
+	// leaves a genuine PARTIAL backfill (some pages written, some not).
+	writeDocuments(t, db, "data", 0, 200)
 
-	// Partial checkpoint: write some pages to DB, then fail
-	ff.enableFault(10) // First 10 page writes succeed
+	nBackfillBefore := db.pager.wal.index.nBackfill.Load()
+	maxFrame := db.pager.wal.index.maxFrame.Load()
+	require.Greater(t, maxFrame, uint32(0))
+	t.Logf("Before faulty checkpoint: nBackfill=%d maxFrame=%d", nBackfillBefore, maxFrame)
+
+	// Inject a fault that fails on the 9th WriteAt: 8 pages are written to the
+	// DB file, then the backfill aborts mid-stream — a real partial checkpoint.
+	ff.enableFault(8)
 	err = db.Checkpoint(CheckpointFull)
-	assert.Error(t, err)
-	t.Logf("Partial checkpoint wrote ~10 pages, then failed: %v", err)
-
+	require.Error(t, err, "partial checkpoint must surface the backfill error")
+	assert.ErrorIs(t, err, errInjectedIO, "error should be the injected I/O fault")
+	require.Positive(t, ff.failedWriteAts.Load(), "the injected fault must have actually fired")
+	t.Logf("Partial checkpoint fired fault: err=%v failedWriteAts=%d totalWriteAts=%d",
+		err, ff.failedWriteAts.Load(), ff.totalWriteAts.Load())
 	ff.disableFault()
 
-	// Snapshot the state BEFORE close
+	// SAFE behavior #1: nBackfill must NOT advance past the written prefix.
+	nBackfillAfter := db.pager.wal.index.nBackfill.Load()
+	assert.Equal(t, nBackfillBefore, nBackfillAfter,
+		"BUG 11 REGRESSION: nBackfill must not advance after a failed checkpoint")
+	t.Logf("After partial checkpoint: nBackfill=%d (unchanged), nBackfillAttempted=%d",
+		nBackfillAfter, db.pager.wal.index.nBackfillAttempted.Load())
+
+	// SAFE behavior #2: data is still fully readable on the live handle
+	// (readers see all frames in the WAL, none of which were discarded).
+	verifyDocuments(t, db, "data", 200)
+
+	// Snapshot the on-disk state RIGHT HERE — this is the crash point: a DB file
+	// with 8 of ~17 pages backfilled, plus an intact WAL.
 	snapshotDB(t, dbPath, snapDir)
+
+	// SAFE behavior #3: the WAL on disk was NOT truncated by the failed checkpoint.
+	walSnap := filepath.Join(snapDir, "test.db-wal")
+	walInfo, err := os.Stat(walSnap)
+	require.NoError(t, err)
+	assert.Greater(t, walInfo.Size(), int64(0),
+		"BUG 11 REGRESSION: WAL must remain intact after a failed checkpoint")
+	t.Logf("Crash-snapshot WAL size: %d bytes", walInfo.Size())
 
 	_ = db.Close()
 
-	// Now SIMULATE the old Bug 11: unconditionally truncate the WAL in the snapshot
-	walSnap := filepath.Join(snapDir, "test.db-wal")
-	require.NoError(t, os.Truncate(walSnap, 0))
+	// Simulate a crash: drop the volatile SHM and recover purely from the
+	// snapshot's DB + WAL (no clean-close checkpoint runs here).
 	_ = os.Remove(filepath.Join(snapDir, "test.db-shm"))
-
-	t.Log("Simulated Bug 11: WAL truncated to 0 despite partial checkpoint")
-
-	// Try to open from the corrupted snapshot
 	ResetVFS()
+	ResetOpenRegistry()
+
 	snapPath := filepath.Join(snapDir, "test.db")
 	db2, err := testOpen(t, snapPath, opts)
-	if err != nil {
-		t.Logf("CONFIRMED Bug 11 data loss: Open fails: %v", err)
-		// The DB file has partial data from checkpoint + stale data.
-		// WAL was truncated, so no recovery possible.
-		return
-	}
+	require.NoError(t, err, "DB must reopen after a partial-checkpoint crash")
 	defer func() { _ = db2.Close() }()
 
-	// Try to read — expect corruption
-	rtx, err := db2.BeginRead()
-	if err != nil {
-		t.Logf("CONFIRMED Bug 11 data loss: BeginRead fails: %v", err)
-		return
-	}
+	// Recovery resets nBackfill to 0 and rebuilds the page map from every frame.
+	t.Logf("After crash recovery: nBackfill=%d maxFrame=%d",
+		db2.pager.wal.index.nBackfill.Load(), db2.pager.wal.index.maxFrame.Load())
+	assert.Equal(t, uint32(0), db2.pager.wal.index.nBackfill.Load(),
+		"recovery should reset nBackfill so all WAL frames are replayed")
 
-	ns, err := rtx.GetNamespace("data")
-	if err != nil {
-		_ = rtx.Rollback()
-		t.Logf("CONFIRMED Bug 11 data loss: GetNamespace fails: %v", err)
-		return
-	}
-
-	// Count how many documents are corrupted/missing
-	corruptCount := 0
-	for i := 0; i < 50; i++ {
-		key := binary.BigEndian.AppendUint32(nil, uint32(i))
-		val, err := rtx.Get(ns, key)
-		if err != nil {
-			corruptCount++
-			if corruptCount <= 5 {
-				t.Logf("  doc %d: %v", i, err)
-			}
-			continue
-		}
-		if len(val) != 200 || binary.BigEndian.Uint32(val) != uint32(i) {
-			corruptCount++
-		}
-	}
-	_ = rtx.Rollback()
-	t.Logf("CONFIRMED Bug 11 data loss: %d/%d documents corrupted/missing", corruptCount, 50)
-	assert.Greater(t, corruptCount, 0,
-		"Simulation should show data loss when WAL is unconditionally truncated")
+	// SAFE behavior #4: ZERO data loss — every document survives the crash.
+	verifyDocuments(t, db2, "data", 200)
 }

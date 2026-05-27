@@ -85,3 +85,115 @@ func TestLimitIter(t *testing.T) {
 		assert.Contains(t, s, "limit=7")
 	})
 }
+
+// fakeSkipIter is a fakeIter that also implements offsetSkipper, recording how
+// many rows skipOffset was asked to skip and reporting a configurable
+// remainder (rows it could NOT skip). When skipOffset absorbs rows it advances
+// the underlying cursor index so the subsequent Next() stream reflects the
+// skip — mirroring IndexIter's cursor-level skip + handoff.
+type fakeSkipIter struct {
+	hits      []fakeHit
+	i         int
+	remainder int  // value skipOffset returns
+	skipCalls int  // number of times skipOffset was invoked
+	lastSkipN int  // last n passed to skipOffset
+}
+
+func (f *fakeSkipIter) Next() ([]byte, []byte, bool, error) {
+	if f.i >= len(f.hits) {
+		return nil, nil, false, nil
+	}
+	h := f.hits[f.i]
+	f.i++
+	return h.key, h.docId, false, nil
+}
+func (f *fakeSkipIter) Close()         {}
+func (f *fakeSkipIter) String() string { return "fakeSkip" }
+
+func (f *fakeSkipIter) skipOffset(n int) (int, error) {
+	f.skipCalls++
+	f.lastSkipN = n
+	absorbed := n - f.remainder
+	if absorbed < 0 {
+		absorbed = 0
+	}
+	// Advance the cursor past the absorbed rows, as IndexIter would.
+	f.i += absorbed
+	if f.i > len(f.hits) {
+		f.i = len(f.hits)
+	}
+	return f.remainder, nil
+}
+
+func limitDrain(t *testing.T, it *LimitIter) []string {
+	t.Helper()
+	var got []string
+	for {
+		_, docId, _, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
+	}
+	return got
+}
+
+// TestLimitIter_FastSkip_FullyAbsorbed verifies that when the source absorbs
+// the entire offset at the cursor level (remaining=0), LimitIter performs NO
+// per-row skip and streams from the post-skip position.
+func TestLimitIter_FastSkip_FullyAbsorbed(t *testing.T) {
+	a := &anyenc.Arena{}
+	mk := func(id string) fakeHit {
+		return fakeHit{docId: anyenc.AppendAnyValue(nil, id), doc: a.NewObject()}
+	}
+	src := &fakeSkipIter{
+		hits:      []fakeHit{mk("a"), mk("b"), mk("c"), mk("d"), mk("e")},
+		remainder: 0, // fully absorbs the offset
+	}
+	it := &LimitIter{Source: src, Offset: 2, Limit: 2}
+
+	got := limitDrain(t, it)
+	assert.Equal(t, 1, src.skipCalls, "skipOffset must be called exactly once")
+	assert.Equal(t, 2, src.lastSkipN, "skipOffset called with the full offset")
+	assert.Equal(t, []string{"c", "d"}, got,
+		"offset fully absorbed at cursor → limit window starts at row 2")
+}
+
+// TestLimitIter_FastSkip_PartialFallback verifies that when the source can
+// only absorb part of the offset (remaining>0, e.g. it stopped at a multi-key
+// entry), LimitIter applies the remaining offset via its per-row skip loop.
+func TestLimitIter_FastSkip_PartialFallback(t *testing.T) {
+	a := &anyenc.Arena{}
+	mk := func(id string) fakeHit {
+		return fakeHit{docId: anyenc.AppendAnyValue(nil, id), doc: a.NewObject()}
+	}
+	// Offset 3: source absorbs 1 (advances cursor to "b"), reports remaining=2.
+	// LimitIter must then per-row skip "b","c" and start the window at "d".
+	src := &fakeSkipIter{
+		hits:      []fakeHit{mk("a"), mk("b"), mk("c"), mk("d"), mk("e"), mk("f")},
+		remainder: 2,
+	}
+	it := &LimitIter{Source: src, Offset: 3, Limit: 2}
+
+	got := limitDrain(t, it)
+	assert.Equal(t, 1, src.skipCalls)
+	assert.Equal(t, []string{"d", "e"}, got,
+		"1 row absorbed at cursor + 2 skipped per-row = offset 3, window starts at row 3")
+}
+
+// TestLimitIter_NoFastSkip_PlainSource verifies that a source WITHOUT the
+// offsetSkipper interface falls back to the original per-row skip behaviour
+// unchanged (no skipOffset attempted).
+func TestLimitIter_NoFastSkip_PlainSource(t *testing.T) {
+	a := &anyenc.Arena{}
+	mk := func(id string) fakeHit {
+		return fakeHit{docId: anyenc.AppendAnyValue(nil, id), doc: a.NewObject()}
+	}
+	// fakeIter does NOT implement offsetSkipper.
+	src := &fakeIter{hits: []fakeHit{mk("a"), mk("b"), mk("c"), mk("d")}}
+	it := &LimitIter{Source: src, Offset: 1, Limit: 2}
+
+	got := limitDrain(t, it)
+	assert.Equal(t, []string{"b", "c"}, got, "plain source uses per-row offset skip")
+}

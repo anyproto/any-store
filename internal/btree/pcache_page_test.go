@@ -94,9 +94,9 @@ func TestPcacheEvictOne_SingleElement(t *testing.T) {
 	// Creating a second page should evict the first (single element eviction)
 	pg2 := pc.create(2, 2)
 	require.NotNil(t, pg2)
-	assert.Nil(t, pc.pages[1])       // page 1 evicted
-	assert.Nil(t, pc.lruHead)         // LRU list empty
-	assert.Nil(t, pc.lruTail)         // LRU list empty
+	assert.Nil(t, pc.hashFind(1)) // page 1 evicted
+	assert.Nil(t, pc.lruHead)     // LRU list empty
+	assert.Nil(t, pc.lruTail)     // LRU list empty
 	assert.Equal(t, 0, pc.nRecyclable)
 	pc.release(pg2)
 }
@@ -192,7 +192,7 @@ func TestPcacheNonPurgeable(t *testing.T) {
 	}
 
 	// All 5 pages should still be present since cache is not purgeable
-	assert.Len(t, pc.pages, 5)
+	assert.Equal(t, 5, pc.nPage)
 }
 
 func TestPcacheAppendDirtyPages(t *testing.T) {

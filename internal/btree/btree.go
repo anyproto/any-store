@@ -31,17 +31,17 @@ func SetDebugOverflowReadErrors(enabled bool) {
 // Put/Delete/insertIntoParent. It mirrors SQLite's cursor stack pair
 // (apPage[i], aiIdx[i]) at btreeInt.h:553-556.
 //
-//   pgno    — page number of the interior node at this level.
-//   cellIdx — index within that page that we descended through:
-//               0..nCell-1  -> the i-th cell's leftChild was followed;
-//               == nCell    -> descended via the page's rightChild.
-//             This is exactly searchInterior's second return value
-//             (see below), which was discarded at the call sites prior
-//             to this refactor.
-//   nCell   — pg.header.cellCount at descent time. Carried so that the
-//             rightmost-child check (cellIdx == nCell) is O(1) without
-//             re-reading the parent. Required by the balance_quick
-//             dispatch guard in splitLeafAndInsertWithPath.
+//	pgno    — page number of the interior node at this level.
+//	cellIdx — index within that page that we descended through:
+//	            0..nCell-1  -> the i-th cell's leftChild was followed;
+//	            == nCell    -> descended via the page's rightChild.
+//	          This is exactly searchInterior's second return value
+//	          (see below), which was discarded at the call sites prior
+//	          to this refactor.
+//	nCell   — pg.header.cellCount at descent time. Carried so that the
+//	          rightmost-child check (cellIdx == nCell) is O(1) without
+//	          re-reading the parent. Required by the balance_quick
+//	          dispatch guard in splitLeafAndInsertWithPath.
 //
 // Invariant: each cellIdx is consumed at most once, during upward
 // propagation at its own level. After a divider is inserted into
@@ -1773,9 +1773,9 @@ func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint
 //   - idx == pg.header.cellCount      — new cell is rightmost on pg
 //   - len(path) > 0                   — pg is not the btree root
 //   - path[len-1].cellIdx == path[len-1].nCell
-//                                     — pg was reached via parent's rightChild
+//     — pg was reached via parent's rightChild
 //   - path[len-1].pgno != bt.rootPage — parent is not the btree root
-//                                     (SQLite: pParent->pgno != 1)
+//     (SQLite: pParent->pgno != 1)
 //
 // Semantic adaptation from SQLite (btree.c:8066-8070): SQLite's intkey
 // tables use the largest key of pPage as divider because their separator
@@ -1825,13 +1825,17 @@ func (bt *btree) splitLeafRightmostAppend(pg *page, key, value []byte, path []pa
 	return bt.insertIntoParentWithPath(pg, divider, rightPgno, path)
 }
 
-// splitLeafAndInsertWithPath splits a leaf page using the path for parent propagation.
+// splitLeafAndInsertWithPath rebalances an over-full leaf using the path for
+// parent propagation. Dispatches like SQLite's balance() (btree.c:9133-9256):
+// the balance_quick rightmost-append fast path first, then the general
+// balance_nonroot (3-sibling redistribution), then balance_deeper for a root
+// leaf with no parent.
 func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte, path []pathEntry) error {
 	// Rightmost-append fast path. Port of SQLite balance_quick dispatch
-	// at btree.c:9169-9192. The intKeyLeaf precondition (btree.c:9170)
+	// at btree.c:9187-9210. The intKeyLeaf precondition (btree.c:9188)
 	// is intkey-specific and has no any-store equivalent; we compensate
 	// with the divider adaptation inside splitLeafRightmostAppend. The
-	// remaining four preconditions map directly.
+	// remaining four preconditions map directly. KEEP — see plan "non-goals".
 	if idx == int(pg.header.cellCount) && len(path) > 0 {
 		parent := path[len(path)-1]
 		if parent.pgno != bt.rootPage && parent.cellIdx == parent.nCell {
@@ -1839,50 +1843,101 @@ func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte
 		}
 	}
 
+	// Root leaf with no parent: there is nowhere to gather siblings from. Push
+	// the leaf down one level with balance_deeper (splitRoot), exactly as SQLite
+	// routes a root overflow through balance_deeper first (btree.c:9152-9169);
+	// the next insert balances the new child via balance_nonroot. We materialise
+	// the over-full leaf into two pages here (the existing 2-way split is the
+	// any-store form of "the child created by balance_deeper is then balanced").
+	if len(path) == 0 || pg.pgno == bt.rootPage {
+		return bt.splitRootLeafAndInsert(pg, idx, key, value)
+	}
+
+	// General path: balance the over-full leaf against up to two siblings via
+	// the faithful balance_nonroot port (btree.c:8248-9030). The new cell is
+	// folded into the redistribution pool through injectedCell (any-store's
+	// analogue of the over-full page's overflow cell, btree.c:8466-8482) instead
+	// of writing an over-full page to disk. Replaces the former 2-way
+	// leafSplitPoint + 2×rebuildLeafPage + insertIntoParentWithPath block.
+	parentEntry := path[len(path)-1]
+	parentPg, err := bt.pager.getWritablePage(parentEntry.pgno)
+	if err != nil {
+		return err
+	}
+	// pg (the over-full target leaf) stays pinned by the caller. balanceNonroot
+	// re-acquires it via getWritablePage as a gathered sibling — the writer cache
+	// returns the same *page with pin 2, which it releases back to 1 before
+	// returning. This matches SQLite, where the over-full page legitimately has
+	// refcount 2 during balance_nonroot (cursor + gather; btree.c:8676).
+	balanceErr := bt.balanceNonroot(parentPg, int(parentEntry.cellIdx),
+		len(path) == 1, path[:len(path)-1],
+		injectedCell{
+			active:    true,
+			childSlot: int(parentEntry.cellIdx),
+			pos:       idx,
+			key:       key,
+			value:     value,
+		})
+	bt.pager.releasePage(parentPg)
+	return balanceErr
+}
+
+// splitRootLeafAndInsert handles an over-full LEAF that is the btree root (no
+// parent to gather siblings from). It is the any-store composition of SQLite's
+// balance_deeper (btree.c:9052-9097) followed by a balance of the new child:
+// the root's cells (plus the new cell) are split into two leaves and the root
+// is converted to an interior node pointing at them. Mirrors the previous
+// splitLeafAndInsertWithPath 2-way body, retained only for the root-leaf case.
+func (bt *btree) splitRootLeafAndInsert(pg *page, idx int, key, value []byte) error {
 	cells, cellBuf := bt.collectLeafCells(pg)
 
-	// Clone key+value into a single allocation.
 	combined := make([]byte, len(key)+len(value))
 	copy(combined, key)
 	copy(combined[len(key):], value)
 	newCell := cellData{key: combined[:len(key)], value: combined[len(key):]}
-	// Insert newCell at idx with a single grow + shift instead of two intermediate slices.
 	cells = append(cells, cellData{})
 	copy(cells[idx+1:], cells[idx:len(cells)-1])
 	cells[idx] = newCell
 
-	// Find split point targeting ~2/3 fill on the left page (SQLite-style).
 	mid := leafSplitPoint(cells, bt.usablePageSize())
 	leftCells := cells[:mid]
 	rightCells := cells[mid:]
 
-	// Get full separator key (handles rare case where key itself overflows).
 	sepKey, serr := bt.cellFullKey(&rightCells[0])
 	if serr != nil {
+		bt.pager.recycleCellSlice(cells)
+		bt.pager.recycleCellBuf(cellBuf)
 		return serr
 	}
 	sepKey = bytes.Clone(sepKey)
 
 	rightPg, err := bt.pager.allocatePage()
 	if err != nil {
+		bt.pager.recycleCellSlice(cells)
+		bt.pager.recycleCellBuf(cellBuf)
 		return err
 	}
 
 	if err := bt.rebuildLeafPage(pg, leftCells); err != nil {
 		bt.pager.recycleCellSlice(cells)
 		bt.pager.recycleCellBuf(cellBuf)
+		bt.pager.releasePage(rightPg)
 		return err
 	}
 	if err := bt.rebuildLeafPage(rightPg, rightCells); err != nil {
 		bt.pager.recycleCellSlice(cells)
 		bt.pager.recycleCellBuf(cellBuf)
+		bt.pager.releasePage(rightPg)
 		return err
 	}
 	bt.pager.recycleCellSlice(cells)
 	bt.pager.recycleCellBuf(cellBuf)
+	rightPgno := rightPg.pgno
 	bt.pager.releasePage(rightPg)
 
-	return bt.insertIntoParentWithPath(pg, sepKey, rightPg.pgno, path)
+	// pg is the root; splitRoot (balance_deeper) creates a new left child,
+	// copies pg's content there, and converts pg into an interior root.
+	return bt.splitRoot(pg, sepKey, rightPgno)
 }
 
 // insertIntoParentWithPath inserts a separator key into the parent using the tracked path.
@@ -2019,7 +2074,43 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 		return nil
 	}
 
-	// Parent is full — split it
+	// Parent interior page is full. The new divider splits the child at
+	// insertIdx into leftPgno/rightPgno. If parentPg has a grandparent, balance
+	// parentPg against its siblings via the faithful balance_nonroot port
+	// (3-sibling interior redistribution), injecting the new divider into the
+	// pool — this is the plan's step-13 interior cascade ("balance the interior
+	// page against its siblings instead of the interiorSplitPoint 2-way split").
+	// If parentPg IS the btree root (no grandparent), there is nowhere to gather
+	// siblings, so split it 2-way and grow a new root (balance_deeper) via
+	// splitRoot, exactly as SQLite routes a root overflow through balance_deeper
+	// first (btree.c:9152-9169).
+	if len(parentPath) > 0 && parentPg.pgno != bt.rootPage {
+		grandEntry := parentPath[len(parentPath)-1]
+		grandPg, gerr := bt.pager.getWritablePage(grandEntry.pgno)
+		if gerr != nil {
+			bt.pager.releasePage(parentPg)
+			return gerr
+		}
+		// parentPg is gathered as a sibling under grandPg; release our own pin so
+		// balanceNonroot's getWritablePage re-acquisition is the standard cursor
+		// + gather double-pin (SQLite btree.c:8676), released within.
+		bt.pager.releasePage(parentPg)
+		balanceErr := bt.balanceNonroot(grandPg, int(grandEntry.cellIdx),
+			len(parentPath) == 1, parentPath[:len(parentPath)-1],
+			injectedCell{
+				active:     true,
+				interior:   true,
+				childSlot:  int(grandEntry.cellIdx),
+				pos:        insertIdx,
+				key:        key,
+				key2child:  leftPgno,
+				rightChild: rightPgno,
+			})
+		bt.pager.releasePage(grandPg)
+		return balanceErr
+	}
+
+	// Root interior page overflow: 2-way split + balance_deeper (splitRoot).
 	cells := bt.collectInteriorCells(parentPg)
 	origRightChild := parentPg.header.rightChild
 	origCellCount := len(cells)
@@ -2382,7 +2473,23 @@ func (bt *btree) Delete(key []byte) error {
 		wpg.header.serialize(wpg.data[hdrOff:])
 	}
 
-	// If page is empty and not the root, free it and remove from parent
+	// Delete-time rebalancing (spec §1, byte-exact mirror of SQLite's underfull
+	// gate at btree.c:10005). After dropping the cell, decide whether the leaf
+	// has fallen far enough below capacity to warrant pooling it with siblings.
+	//
+	//   nFree = usable - used; underfull iff nFree*3 > usable*2  (>2/3 free).
+	//
+	// any-store's leafUsedSpace counts fragBytes as used (it is reclaimed on the
+	// next rebuild), so nFree here is <= SQLite's nFree; the trigger therefore
+	// fires slightly LESS eagerly than SQLite, which is safe (an over-fragmented
+	// page that SQLite would rebalance, any-store leaves until the next mutation).
+	usable := bt.usablePageSize()
+	nFree := usable - bt.leafUsedSpace(wpg)
+	underfull := nFree*3 > usable*2
+
+	// Empty leaf (0 cells) on a non-root page: keep the existing free-empty-leaf
+	// fast path. This is the any-store equivalent of balance_nonroot freeing a
+	// 0-cell page as surplus (btree.c:9000-9004), reached without a gather.
 	if wpg.header.cellCount == 0 && wpg.pgno != bt.rootPage {
 		bt.pager.releasePage(wpg)
 		if err := bt.pager.freePage(leafPgno); err != nil {
@@ -2391,8 +2498,148 @@ func (bt *btree) Delete(key []byte) error {
 		return bt.removeChildFromParent(leafPgno, path)
 	}
 
+	// Underfull (but non-empty) non-root leaf: funnel it through the general
+	// balancer in its merge direction (inject.active=false). A root leaf is never
+	// balanced — SQLite's iPage==0 short-circuits balance() with no overflow
+	// (btree.c:9152). len(path)>0 means the leaf has a parent to gather from.
+	if underfull && len(path) > 0 {
+		bt.pager.releasePage(wpg)
+		return bt.deleteRebalanceLeaf(leafPgno, path)
+	}
+
+	// Not underfull (or the leaf is the root): SQLite's no-op branch
+	// (btree.c:10008). The fast in-place drop above is the whole operation.
 	bt.pager.releasePage(wpg)
 	return nil
+}
+
+// deleteRebalanceLeaf drives an underfull leaf through the general balancer in
+// its merge direction. It is the delete-side dual of splitLeafAndInsertWithPath
+// (btree.go:1856-1883): both acquire the parent writable and call balanceNonroot
+// with the target child slot, differing only in the injectedCell — insert passes
+// the new over-full cell (inject.active=true), delete passes none
+// (inject.active=false), so the pooled cell count only shrinks and the balancer
+// yields nNew ∈ {nOld-1, nOld}. SQLite uses the identical path: balance() →
+// balance_nonroot() (btree.c:10010 → 9133 → 8248), with the merge being just
+// k=nOld-1 emerging from the unchanged pack loop and the surplus page freed
+// (btree.c:8563-8605, 9000-9004). There is NO separate merge routine.
+//
+// The caller (Delete) has already released its pin on leafPgno, so balanceNonroot
+// re-acquires it as a gathered sibling via getWritablePage with the standard
+// single pin — mirroring the insert path, where the over-full leaf is likewise
+// released before balanceNonroot re-pins it (btree.go:1867-1871).
+//
+// After the leaf balance, the parent may itself be empty (single child) or
+// underfull — the merge removed a divider. completeMergeUpward handles that
+// cascade (spec §4); it runs AFTER parentPg is released so it can re-read the
+// parent fresh and, if needed, release it before pooling it under its
+// grandparent (the SQLite do-loop releases pPage before balancing the parent,
+// btree.c:9251).
+func (bt *btree) deleteRebalanceLeaf(leafPgno uint32, path []pathEntry) error {
+	bt.pager.deleteRebalanceDispatchCount.Add(1)
+
+	parentEntry := path[len(path)-1]
+	parentPg, err := bt.pager.getWritablePage(parentEntry.pgno)
+	if err != nil {
+		return err
+	}
+	balanceErr := bt.balanceNonroot(parentPg, int(parentEntry.cellIdx),
+		len(path) == 1, path[:len(path)-1],
+		injectedCell{active: false})
+	bt.pager.releasePage(parentPg)
+	if balanceErr != nil {
+		return balanceErr
+	}
+	// Cascade the parent's own under-fullness/emptiness upward (spec §4).
+	return bt.completeMergeUpward(parentEntry.pgno, path[:len(path)-1])
+}
+
+// completeMergeUpward finishes a delete-side merge by handling the parent's own
+// state after a divider was removed from it (spec §4). pgno is the just-balanced
+// parent (rebuilt in place by balanceNonroot, so its page number is stable);
+// parentPath is the ancestor chain strictly above it.
+//
+//	(b) Balance-shallower (btree.c:8960-8985): if the merge emptied the parent's
+//	    divider array it now has a single child. Collapse it — absorb the child
+//	    into this page and free the child, removing one tree level. This reuses
+//	    collapseSingleChild (the same operation finishParentRemoval performs for
+//	    the empty-leaf path), satisfying spec §4b. Checked FIRST: a 0-cell page is
+//	    "empty" (collapse), not merely "underfull" (cascade), mirroring SQLite
+//	    handling balance_shallower before the do-loop re-balances the parent.
+//	(a) Underfull-parent cascade (btree.c:10012-10020, 9250-9255): the parent is
+//	    non-empty but below 2/3 fill and has a grandparent. Pool it with its own
+//	    siblings under the grandparent via balanceNonroot(inject.active=false),
+//	    then recurse to complete THAT balance. SQLite re-enters balance() on the
+//	    parent in its do-loop; any-store recurses through the path — the same
+//	    "deviation 6" already accepted on the insert path (balance.go:65-68).
+//
+// A merge that neither empties nor under-fills the parent (the parent had ample
+// dividers) terminates here. The empty/underfull checks are evaluated against a
+// fresh read of the parent, so this never holds a pin across the recursive
+// balance.
+func (bt *btree) completeMergeUpward(pgno uint32, parentPath []pathEntry) error {
+	pg, err := bt.pager.getWritablePage(pgno)
+	if err != nil {
+		return err
+	}
+
+	nCell := int(pg.header.cellCount)
+
+	// (b) Balance-shallower — ROOT ONLY (SQLite gates on isRoot, btree.c:8960). A
+	// 0-cell root has a single child: absorb it, dropping a tree level (uniformly,
+	// so all leaves stay equidistant from the new root). A NON-root 0-cell interior
+	// must NOT be collapsed in place — collapseSingleChild copies the child's header
+	// (incl. type) into it, making its subtree one level shallower than its siblings
+	// (unequal leaf depth = corruption). It is underfull, so it falls through to the
+	// cascade below to be pooled with its siblings under the grandparent — exactly
+	// how SQLite carries a single-child parent up the balance() do-loop (btree.c:9133).
+	if nCell == 0 && len(parentPath) == 0 {
+		rightChild := pg.header.rightChild
+		return bt.collapseSingleChild(pg, rightChild)
+	}
+
+	// (a) Underfull non-root parent (0-cell included) → cascade under the grandparent.
+	if len(parentPath) > 0 && (nCell == 0 || bt.interiorUnderfull(pg)) {
+		bt.pager.releasePage(pg)
+		return bt.deleteRebalanceInterior(pgno, parentPath)
+	}
+
+	// Neither: the merge is complete at this level.
+	bt.pager.releasePage(pg)
+	return nil
+}
+
+// deleteRebalanceInterior is the interior analogue of deleteRebalanceLeaf, used
+// to cascade an underfull non-root interior parent upward after a merge removed a
+// divider from it (spec §4a). It reads the grandparent writable and drives
+// balanceNonroot on it with the underfull interior page as the target child and
+// inject.active=false. Interior pools are already fully handled by balanceNonroot
+// (balance.go:367-401, 614-628), so no balancer change is needed. After the
+// balance it recurses through completeMergeUpward to finish the grandparent's own
+// state, walking up to the root exactly as SQLite's balance() do-loop does
+// (btree.c:9250-9255).
+//
+// interiorPgno is the underfull child; path[len-1] is the grandparent slot the
+// child sits in. The caller has already released its pin on interiorPgno, so
+// balanceNonroot re-acquires it as a gathered sibling under the grandparent with
+// a single pin.
+func (bt *btree) deleteRebalanceInterior(interiorPgno uint32, path []pathEntry) error {
+	bt.pager.deleteRebalanceDispatchCount.Add(1)
+
+	parentEntry := path[len(path)-1]
+	grandPg, err := bt.pager.getWritablePage(parentEntry.pgno)
+	if err != nil {
+		return err
+	}
+	balanceErr := bt.balanceNonroot(grandPg, int(parentEntry.cellIdx),
+		len(path) == 1, path[:len(path)-1],
+		injectedCell{active: false})
+	bt.pager.releasePage(grandPg)
+	if balanceErr != nil {
+		return balanceErr
+	}
+	// Cascade the grandparent's own state upward.
+	return bt.completeMergeUpward(parentEntry.pgno, path[:len(path)-1])
 }
 
 // leafUsedSpace returns the approximate used space on a leaf page.
@@ -2405,6 +2652,29 @@ func (bt *btree) leafUsedSpace(pg *page) int {
 	}
 	cellPtrEnd := pg.cellPointerOffset() + int(pg.header.cellCount)*2
 	return cellPtrEnd + (usable - contentOff)
+}
+
+// interiorUnderfull reports whether an interior page has fallen below SQLite's
+// rebalance threshold — more than 2/3 of the usable space free, i.e.
+// nFree*3 > usable*2 (the same byte-exact gate as the leaf trigger in Delete,
+// negated from btree.c:10005). Used to decide the underfull-parent cascade after
+// a delete-side merge removed a divider (spec §4a).
+//
+// The used-space formula (cellPtrEnd + (usable - contentOff)) is shared with
+// leafUsedSpace; it is page-type-agnostic because cellPointerOffset() already
+// accounts for the 12-byte interior header (vs the 8-byte leaf header) and the
+// page-1 DB-header offset (page.go:354-361). A corrupt header yields used==usable
+// (nFree==0, not underfull), which is safe (no spurious cascade).
+func (bt *btree) interiorUnderfull(pg *page) bool {
+	usable := bt.usablePageSize()
+	contentOff, err := pg.contentAreaOffset(usable)
+	if err != nil {
+		return false // corrupt header: treat as full, do not cascade
+	}
+	cellPtrEnd := pg.cellPointerOffset() + int(pg.header.cellCount)*2
+	used := cellPtrEnd + (usable - contentOff)
+	nFree := usable - used
+	return nFree*3 > usable*2
 }
 
 // tryMergeLeaf attempts to merge a leaf page with a sibling.
@@ -2555,20 +2825,96 @@ func (bt *btree) tryMergeLeaf(leafPgno uint32, path []pathEntry) error {
 		return err
 	}
 
-	// path[len-1].cellIdx is the parent slot of leafPgno; freePgno lives at
-	// a different slot depending on the merge direction. Adjust in place
-	// before handing off to removeChildFromParent.
-	// mergeRight: sibling (= freePgno) was at childIdx+1 (possibly == n = rightChild).
-	// !mergeRight (mergeLeft): freePgno == leafPgno, still at childIdx.
-	adjustedPath := path
+	// Update the parent to reflect the merge. The two directions need
+	// different parent edits because the divider that must be removed is the
+	// SEPARATOR between the kept and freed children — divider D_childIdx —
+	// in both cases, but its position relative to the freed page differs.
+	//
+	// Divider semantics (searchInterior, btree.go:910; splitLeaf doc,
+	// btree.go:1780-1816): divider D_i is the smallest key of the subtree at
+	// child i+1; keys < D_i route to child i, keys >= D_i route to child i+1.
+	// Child i therefore covers [D_{i-1}, D_i).
+	//
+	//   mergeRight: keep = leafPgno at slot childIdx, freed = sibling at slot
+	//     childIdx+1 (cells[childIdx+1].leftChild, or rightChild if
+	//     childIdx+1 == n). The kept page absorbs child childIdx+1's keys, so
+	//     it now spans [D_{childIdx-1}, D_{childIdx+1}). The separator
+	//     D_childIdx (= cells[childIdx].key) no longer bounds anything and
+	//     must be removed; the surviving entry to its right (which held the
+	//     freed page) must be repointed to keep. removeChildFromParent cannot
+	//     express this — it removes the cell whose leftChild == childPgno
+	//     (i.e. D_{childIdx+1}), leaving the stale D_childIdx in front of the
+	//     merged page and misrouting keys in [D_childIdx, D_{childIdx+1}).
+	//
+	//   mergeLeft: keep = sibling at slot n-1 (cells[n-1].leftChild), freed =
+	//     leafPgno == rightChild (childIdx == n). The separator is D_{n-1} =
+	//     cells[n-1].key. removeChildFromParent's rightChild branch removes
+	//     exactly cells[n-1] and promotes its leftChild (= keep) to rightChild
+	//     — already correct — so reuse it unchanged.
 	if mergeRight {
-		freeIdx := childIdx + 1
-		// Copy to avoid mutating the caller's slice element.
-		adjustedPath = make([]pathEntry, len(path))
-		copy(adjustedPath, path)
-		adjustedPath[len(adjustedPath)-1].cellIdx = uint16(freeIdx)
+		return bt.removeMergedRightSeparator(parentPgno, childIdx, keepPgno, freePgno)
 	}
-	return bt.removeChildFromParent(freePgno, adjustedPath)
+	return bt.removeChildFromParent(freePgno, path)
+}
+
+// removeMergedRightSeparator updates the parent interior page after a
+// right-merge collapses child slots childIdx and childIdx+1 into the single
+// kept page (keepPgno). It removes the separator divider D_childIdx
+// (cells[childIdx]) and repoints the entry that previously referenced the
+// freed page (freePgno) — which sits immediately to the right of the removed
+// separator — to keepPgno.
+//
+// Two right-neighbor positions are possible:
+//   - childIdx+1 < len(cells): the freed page is cells[childIdx+1].leftChild.
+//     Set cells[childIdx+1].leftChild = keepPgno, then drop cells[childIdx].
+//   - childIdx+1 == len(cells): the freed page is parentPg.rightChild.
+//     Set rightChild = keepPgno, then drop cells[childIdx] (= the last cell).
+//
+// After the splice the page may have zero cells (it had exactly one divider),
+// in which case finishParentRemoval performs the same root/non-root collapse
+// as removeChildFromParent.
+func (bt *btree) removeMergedRightSeparator(parentPgno uint32, childIdx int, keepPgno, freePgno uint32) error {
+	parentPg, err := bt.pager.getWritablePage(parentPgno)
+	if err != nil {
+		return err
+	}
+
+	cells := bt.collectInteriorCells(parentPg)
+	rightChild := parentPg.header.rightChild
+
+	// childIdx is the kept page's slot; it must address a real divider cell
+	// (the separator) — never the rightChild pseudo-slot, since mergeRight is
+	// only chosen when the kept page is a leftChild entry (childIdx < n).
+	if childIdx < 0 || childIdx >= len(cells) {
+		bt.pager.releasePage(parentPg)
+		return ErrCorrupt
+	}
+	// Defensive: the separator cell's leftChild must be the kept page.
+	if cells[childIdx].leftChild != keepPgno {
+		bt.pager.releasePage(parentPg)
+		return ErrCorrupt
+	}
+
+	if childIdx+1 < len(cells) {
+		// Freed page was the next cell's leftChild. Repoint it to keep, then
+		// drop the separator cell.
+		if cells[childIdx+1].leftChild != freePgno {
+			bt.pager.releasePage(parentPg)
+			return ErrCorrupt
+		}
+		cells[childIdx+1].leftChild = keepPgno
+	} else {
+		// Freed page was the rightChild. Promote keep to rightChild, then drop
+		// the (last) separator cell.
+		if rightChild != freePgno {
+			bt.pager.releasePage(parentPg)
+			return ErrCorrupt
+		}
+		rightChild = keepPgno
+	}
+	cells = append(cells[:childIdx], cells[childIdx+1:]...)
+
+	return bt.finishParentRemoval(parentPg, cells, rightChild)
 }
 
 // removeChildFromParent removes a child page reference from its parent interior page.
@@ -2617,47 +2963,38 @@ func (bt *btree) removeChildFromParent(childPgno uint32, path []pathEntry) error
 		}
 	}
 
-	// If parent is now empty interior page (0 cells) and not root,
-	// collapse: make the rightChild the replacement and free this page.
+	return bt.finishParentRemoval(parentPg, cells, rightChild)
+}
+
+// finishParentRemoval writes the post-removal cell set back to the parent
+// interior page (parentPg, already pinned writable) and handles the
+// height-collapse cases when the removal left the page with zero cells. It is
+// the shared tail of removeChildFromParent (delete-rebalance, mergeLeft) and
+// removeMergedRightSeparator (mergeRight): both compute the surviving (cells,
+// rightChild) and hand off here. It always releases parentPg.
+//
+//   - 0 cells on the root: copy rightChild's content into the root and free
+//     rightChild, shortening the tree by one level. Page 1 needs special
+//     handling to preserve its 100-byte DB header (SQLite copyNodeContent,
+//     btree.c:8148).
+//   - 0 cells on a non-root interior: the page has a single child (rightChild);
+//     copy that child's content up and free it to avoid orphaning the subtree
+//     (SQLite balance_nonroot shallowing).
+//   - otherwise: rebuild the interior page in place.
+func (bt *btree) finishParentRemoval(parentPg *page, cells []cellData, rightChild uint32) error {
+	// If parent is now an empty interior page (0 cells = single child), collapse —
+	// but ONLY at the root. Balance-shallower (SQLite btree.c:8960-8985) shortens
+	// all leaves uniformly only when applied at the root. Collapsing a NON-root
+	// single-child interior in place (collapseSingleChild copies the child's
+	// header, incl. type) makes this subtree one level shallower than its siblings
+	// — unequal leaf depth, which IntegrityCheck flags as "child page depth
+	// differs". For a non-root 0-cell parent, leave it as a valid degenerate
+	// interior (rightChild only, via rebuildInteriorPage below): it stays
+	// equidistant from the root and a later balance can absorb it (SQLite carries
+	// a single-child parent up the balance() do-loop). Mirrors the
+	// completeMergeUpward root gate.
 	if len(cells) == 0 && parentPg.pgno == bt.rootPage {
-		// Root with 0 cells: collapse tree height by copying rightChild to root.
-		// Matches SQLite's copyNodeContent() (btree.c:8148).
-		childPg, err := bt.getPage(rightChild)
-		if err != nil {
-			bt.pager.releasePage(parentPg)
-			return err
-		}
-		if parentPg.pgno == 1 {
-			// Page 1 has a 100-byte DB header. Cell content uses absolute offsets,
-			// so content must stay at the same position. Only the page header and
-			// cell pointers are shifted from offset 0 (child) to offset 100 (page 1).
-			pageSize := bt.usablePageSize()
-			iData := int(binary.BigEndian.Uint16(childPg.data[5:7]))
-			if iData == 0 {
-				iData = pageSize
-			}
-
-			// Clear page 1 content area (preserve DB header).
-			clear(parentPg.data[dbHeaderSize:pageSize])
-
-			// Step 1: Copy cell content at the SAME absolute offset.
-			copy(parentPg.data[iData:pageSize], childPg.data[iData:pageSize])
-
-			// Step 2: Copy header + cell pointers with offset adjustment.
-			cpSize := childPg.header.headerSize() + int(childPg.header.cellCount)*2
-			copy(parentPg.data[dbHeaderSize:dbHeaderSize+cpSize], childPg.data[0:cpSize])
-		} else {
-			copy(parentPg.data, childPg.data)
-		}
-		parentPg.header = childPg.header
-		hdrOff := 0
-		if parentPg.pgno == 1 {
-			hdrOff = dbHeaderSize
-		}
-		parentPg.header.serialize(parentPg.data[hdrOff:])
-		bt.pager.releasePage(childPg)
-		bt.pager.releasePage(parentPg)
-		return bt.pager.freePage(rightChild)
+		return bt.collapseSingleChild(parentPg, rightChild)
 	}
 
 	if err := bt.rebuildInteriorPage(parentPg, cells, rightChild); err != nil {
@@ -2665,26 +3002,69 @@ func (bt *btree) removeChildFromParent(childPgno uint32, path []pathEntry) error
 		return err
 	}
 
-	if len(cells) == 0 && parentPg.pgno != bt.rootPage {
-		// Non-root interior with only one child (rightChild). Copy the child's
-		// content into this page and free the child — same collapse operation as
-		// root collapse but for non-root pages. This prevents orphaning the
-		// rightChild subtree. Matches SQLite's balance_nonroot shallowing logic.
-		childPg, err := bt.getPage(rightChild)
-		if err != nil {
-			bt.pager.releasePage(parentPg)
-			return err
-		}
-		copy(parentPg.data, childPg.data)
-		parentPg.header = childPg.header
-		parentPg.header.serialize(parentPg.data)
-		bt.pager.releasePage(childPg)
-		bt.pager.releasePage(parentPg)
-		return bt.pager.freePage(rightChild)
-	}
-
 	bt.pager.releasePage(parentPg)
 	return nil
+}
+
+// collapseSingleChild performs the "balance-shallower" collapse: parentPg is an
+// interior page that now has zero divider cells and therefore a single child
+// (childPgno == its rightChild). Copy the child's content into parentPg and free
+// the child, removing one level from the tree. parentPg keeps its page number, so
+// the grandparent's pointer to parentPg and the divider keys bounding it stay
+// valid (the collapsed node covers exactly the same key range, one level
+// shallower) — no ancestor edit is needed and the collapse is terminal.
+//
+// This is the shared body of finishParentRemoval's old 0-cell branches (the
+// empty-leaf-removal path) AND the delete-rebalance merge path
+// (rewriteParentAfterBalance), satisfying spec §4b ("reuse finishParentRemoval
+// for balance-shallower"). It is the any-store analogue of SQLite copyNodeContent
+// + freePage (btree.c:8984-8985 for the root, the do-loop grandparent gather for
+// a non-root). It always releases parentPg.
+//
+// Page 1 needs special handling: it carries the 100-byte DB header, so cell
+// content (which uses absolute offsets) must stay at the same position while the
+// page header + cell pointers shift from offset 0 (child) to offset 100 (page 1).
+// The child was just rebuilt by rebuildInteriorPage / rebuildLeafPage and is
+// therefore already defragmented (content packed at the top), so SQLite's
+// explicit defragmentPage(apNew[0]) before the copy (btree.c:8977) is
+// unnecessary — spec §4b adaptation.
+func (bt *btree) collapseSingleChild(parentPg *page, childPgno uint32) error {
+	childPg, err := bt.getPage(childPgno)
+	if err != nil {
+		bt.pager.releasePage(parentPg)
+		return err
+	}
+	if parentPg.pgno == 1 {
+		// Page 1 has a 100-byte DB header. Cell content uses absolute offsets,
+		// so content must stay at the same position. Only the page header and
+		// cell pointers are shifted from offset 0 (child) to offset 100 (page 1).
+		pageSize := bt.usablePageSize()
+		iData := int(binary.BigEndian.Uint16(childPg.data[5:7]))
+		if iData == 0 {
+			iData = pageSize
+		}
+
+		// Clear page 1 content area (preserve DB header).
+		clear(parentPg.data[dbHeaderSize:pageSize])
+
+		// Step 1: Copy cell content at the SAME absolute offset.
+		copy(parentPg.data[iData:pageSize], childPg.data[iData:pageSize])
+
+		// Step 2: Copy header + cell pointers with offset adjustment.
+		cpSize := childPg.header.headerSize() + int(childPg.header.cellCount)*2
+		copy(parentPg.data[dbHeaderSize:dbHeaderSize+cpSize], childPg.data[0:cpSize])
+	} else {
+		copy(parentPg.data, childPg.data)
+	}
+	parentPg.header = childPg.header
+	hdrOff := 0
+	if parentPg.pgno == 1 {
+		hdrOff = dbHeaderSize
+	}
+	parentPg.header.serialize(parentPg.data[hdrOff:])
+	bt.pager.releasePage(childPg)
+	bt.pager.releasePage(parentPg)
+	return bt.pager.freePage(childPgno)
 }
 
 // Count returns the total number of key-value pairs in the B-tree.

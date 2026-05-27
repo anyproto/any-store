@@ -1162,6 +1162,10 @@
     "sqlite": [],
     "note": ""
   },
+  "osfuncs.go:ResetOpenRegistry": {
+    "sqlite": [],
+    "note": "any-store VFS build-tag stub"
+  },
   "osfuncs.go:ResetVFS": {
     "sqlite": [],
     "note": "any-store VFS build-tag stub"
@@ -1181,6 +1185,10 @@
   "osfuncs_sync_other.go:fdatasync": {
     "sqlite": [],
     "note": "non-Linux/non-vfs fallback wrapping os.File.Sync (portability shim, no direct SQLite origin)"
+  },
+  "osfuncs_vfs.go:ResetOpenRegistry": {
+    "sqlite": [],
+    "note": "any-store test hook to clear the process-global open-DB registry (crash-simulation tests skip Close)"
   },
   "osfuncs_vfs.go:ResetVFS": {
     "sqlite": [],
@@ -1738,9 +1746,10 @@
       "pcache.c:sqlite3PcacheFetch",
       "pcache.c:sqlite3PcacheFetchStress",
       "pcache1.c:pcache1Fetch",
+      "pcache1.c:pcache1FetchNoMutex",
       "pcache1.c:pcache1FetchStage2"
     ],
-    "note": ""
+    "note": "initial 'already cached?' probe via hashFind (pcache1FetchNoMutex); on allocate, hashInsert links into apHash (was pc.pages[pgno]=p). nPage replaces len(pages)."
   },
   "pcache.go:*pcache.destroy": {
     "sqlite": [
@@ -1764,28 +1773,50 @@
   "pcache.go:*pcache.discard": {
     "sqlite": [
       "pcache.c:sqlite3PcacheDrop",
+      "pcache1.c:pcache1RemoveFromHash",
       "pcache1.c:pcache1FreePage"
     ],
-    "note": ""
+    "note": "lookup via hashFind; hashRemove (pcache1RemoveFromHash) clears page.inCache so a still-pinned discarded page is not re-LRU'd on release"
   },
   "pcache.go:*pcache.evictOne": {
     "sqlite": [
-      "pcache1.c:pcache1EnforceMaxPage"
+      "pcache1.c:pcache1EnforceMaxPage",
+      "pcache1.c:pcache1RemoveFromHash"
     ],
-    "note": ""
+    "note": "pops LRU tail then hashRemove (was delete(pc.pages, p.pgno))"
   },
   "pcache.go:*pcache.fetch": {
     "sqlite": [
       "pcache.c:sqlite3PcacheFetch",
-      "pcache1.c:pcache1Fetch"
+      "pcache1.c:pcache1Fetch",
+      "pcache1.c:pcache1FetchNoMutex"
     ],
-    "note": ""
+    "note": "lookup via hashFind (chained-bucket probe, pcache1FetchNoMutex step 1) then pin + lruRemove on a clean hit (pcache1PinPage)"
   },
   "pcache.go:*pcache.findSpillVictim": {
     "sqlite": [
       "pcache.c:sqlite3PcacheFetchStress"
     ],
     "note": ""
+  },
+  "pcache.go:*pcache.hashFind": {
+    "sqlite": [
+      "pcache1.c:pcache1FetchNoMutex"
+    ],
+    "note": "chained-bucket probe apHash[pgno&(nHash-1)] walked by hashNext, the read-only half of pcache1FetchNoMutex step 1 (pcache1.c:1009-1010); shared by fetch/create. Closes NOTES §9 drift #2."
+  },
+  "pcache.go:*pcache.hashInsert": {
+    "sqlite": [
+      "pcache1.c:pcache1FetchStage2",
+      "pcache1.c:pcache1ResizeHash"
+    ],
+    "note": "links page at bucket head, sets page.inCache, bumps nPage, resizes at load factor 1.0 (pcache1.c:894 nPage>=nHash → pcache1ResizeHash)"
+  },
+  "pcache.go:*pcache.hashRemove": {
+    "sqlite": [
+      "pcache1.c:pcache1RemoveFromHash"
+    ],
+    "note": "unlinks page from its bucket chain and clears page.inCache (pcache1.c:601-613); the inCache flag is a v2 addition for pages removed while pinned (no SQLite equivalent — SQLite forbids that)"
   },
   "pcache.go:*pcache.initBulk": {
     "sqlite": [
@@ -1820,15 +1851,22 @@
   "pcache.go:*pcache.release": {
     "sqlite": [
       "pcache.c:sqlite3PcacheRelease",
-      "pcache1.c:pcache1Unpin"
+      "pcache1.c:pcache1Unpin",
+      "pcache1.c:pcache1RemoveFromHash"
     ],
-    "note": ""
+    "note": "gates LRU insert on page.inCache (field read) instead of the former second map lookup (pc.pages[p.pgno]==p); overfull path calls hashRemove (pcache1RemoveFromHash). SQLite's pcache1Unpin adds to LRU unconditionally (its invariants forbid removing a pinned page); the inCache gate is the v2 ghost-page guard."
   },
   "pcache.go:*pcache.resetPage": {
     "sqlite": [
       "pcache.c:pcacheFetchFinishWithInit"
     ],
     "note": ""
+  },
+  "pcache.go:*pcache.resizeHash": {
+    "sqlite": [
+      "pcache1.c:pcache1ResizeHash"
+    ],
+    "note": "doubles apHash and rehashes at load factor 1.0; power-of-two sizing (floor 256) so pgno&(nHash-1) is a mask (pcache1.c:535-567)"
   },
   "pcache.go:*pcache.returnPageBuffer": {
     "sqlite": [
@@ -1846,9 +1884,10 @@
   },
   "pcache.go:newPcache": {
     "sqlite": [
-      "pcache1.c:pcache1Create"
+      "pcache1.c:pcache1Create",
+      "pcache1.c:pcache1ResizeHash"
     ],
-    "note": ""
+    "note": "seeds apHash to a power-of-two size (>= maxPages, floor 256), mirroring SQLite where pcache1Create's first fetch triggers pcache1ResizeHash"
   },
   "shm.go:*inProcessShm.close": {
     "sqlite": [

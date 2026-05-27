@@ -529,9 +529,14 @@ sub-journaling for savepoints.
   always proceed
 - **`nRecyclable`**: count of unpinned clean pages in LRU, incremented in
   `lruPrepend`, decremented in `lruRemove`/`evictOne`
-- **Immediate eviction on unpin**: when cache is overfull (`len(pages) > maxPages`),
+- **Immediate eviction on unpin**: when cache is overfull (`nPage > maxPages`),
   clean pages are discarded on `release()` instead of entering LRU. Matches
   SQLite `pcache1Unpin` (`pcache1.c:1094`): `pGroup->nPurgeable > pGroup->nMaxPage`
+- **Page-cache hash**: pages are found via a chained hash table (`apHash []*page`
+  + `page.hashNext`), a direct port of SQLite's `PCache1.apHash` (`pcache1.c:200`).
+  Membership is carried on the page (`page.inCache`), so `release()` gates the LRU
+  insert on a field read rather than a second hash probe (drift #2 resolved; see
+  below)
 - **Buffer lifecycle**: `clear()`, `discard()`, `truncate()` return data buffers
   to the global slab. `pFree` buffers also returned to slab on `clear()`
 - **Persistent reader cache**: reader caches are returned to `readerCachePool`
@@ -570,7 +575,7 @@ drawn from the global slab that enforces a process-wide soft cap.
 | Cache ownership | Per-connection (private) | Per-connection (private) — matches SQLite |
 | Thread safety | Per-connection (no mutex needed) | Per-connection (no mutex needed) — matches SQLite |
 | PGroup cross-cache stealing | Enabled in single-thread mode (`pcache1.c:718-719`) | No PGroup; each cache isolated (drift #1) |
-| Hash table | `apHash[]` with chaining (`pcache1.c:199-200`) | Go `map[uint32]*page` (drift #2) |
+| Hash table | `apHash[]` with chaining (`pcache1.c:199-200`) | `apHash []*page` with chaining via `page.hashNext` — matches SQLite (drift #2 resolved 2026-05-22; see "Page-Cache Hash Table" below) |
 | LRU structure | Circular list with anchor node (`pcache1.c:112-115`) | Doubly-linked list with head/tail pointers (drift #3) |
 | `createFlag=0` | Lookup only, no create | Dropped; `fetch()` handles lookup-only (drift #13) |
 | Max page check | PGroup-level (`pcache1.c:1094`) | Per-cache + global slab pressure (drift #14) |
@@ -1133,11 +1138,20 @@ comments in source):
    `pagerStress` calls `pagerError` on WAL write failure, which performs eager
    cleanup, so the dropped error is harmless.
 
-4. **Deferred SHM hash writes** (`wal.go:setBatch`): SQLite writes SHM hash entries
-   immediately in `walFrames()` via `walIndexAppend()`, then cleans them up with
-   `walCleanupHash()` on rollback. We defer SHM writes for spill frames into
-   `pendingShmFrames` and flush on commit, avoiding the need for post-rollback
-   cleanup of cross-process-visible state.
+4. **Batched wal-index update** (`wal.go:setBatch`): SQLite updates the wal-index
+   inline in `walFrames()` — the write loop tags each page `PGHDR_WAL_APPEND`
+   (set on append, cleared on in-place reuse), then a second loop replays the flag
+   via `walIndexAppend()` (`wal.c:4154/4166/4228-4233`); rollback uses
+   `walCleanupHash()`. We mirror this with one post-loop `setBatch` per
+   `writeFrames` call (a single `wi.mu` acquisition for the in-process `pageMap`,
+   then eager `shmHashWrite` — *not* deferred), plus a `walCleanupHash` analog on
+   rollback. **Invariant: the appended set handed to `setBatch` MUST be recorded
+   inline in the write loop (the `appended` slice ≡ `PGHDR_WAL_APPEND`), never
+   re-derived.** Re-deriving the reuse predicate after the loop dropped the
+   force-appended commit frame and silently corrupted recovery — see the
+   Frame-Reuse note below. A `maxFrame < nFrame` guard in
+   `writeFrames`/`writeFramesMem` now fails loudly if any appended frame is
+   unregistered.
 
 5. **dontWrite pages made clean without WAL write** (`pager.go:pagerStress`):
    SQLite's `pagerStress` in WAL mode writes `PGHDR_DONT_WRITE` pages to WAL
@@ -1225,6 +1239,27 @@ any-store now ports this. The reuse branch in `writeFrames`
   `pager.rollbackToSavepoint`).
 - `writeFramesMem` overwrites the in-memory `memFrames` slot for the
   InMemory mode equivalent — no checksum chain to rewrite.
+
+**Commit-frame registration bug (fixed 2026-05-24).** The wal-index update
+(`setBatch`) originally *re-derived* which pages had been appended by re-running
+the reuse predicate after the write loop — but without the `!(commit && isLast)`
+guard the write loop uses. When the commit frame's page had also been spilled
+earlier in the same tx (common — a hot B-tree interior/index page is touched all
+tx long and is often the last page flushed), the re-derivation misclassified the
+force-appended commit frame as reused and dropped it, so `setBatch` undercounted
+`maxFrame`/`mxCommitFrame` by one. The next tx then computed `iFirst =
+mxCommitFrame+1` over the prior tx's committed commit frame and rewound the append
+cursor onto it, overwriting it and re-seeding the checksum from the wrong base —
+breaking the WAL checksum chain there. Invisible in the live process (the page map
+self-heals as later writes re-register the hot page) but **fatal on crash
+recovery**: `recoverLocked`'s chain walk stops at the break, silently discarding
+every later committed transaction. Caught only under cache-spill pressure by
+`TestStressRecovery_CrashedWriterDuringOverflowAlloc` (R-5, `CacheSize=10`); the
+5000-page default rarely spills, which is why it stayed latent. **Fix:** record
+the appended set inline in the write loop (≡ SQLite's `PGHDR_WAL_APPEND`), never
+re-derive; plus the `maxFrame < nFrame` invariant guard above. This was a drift
+from SQLite's inline `walIndexAppend` (NOTES drift item 4) — SQLite records the
+decision per page and replays it, so it cannot desync.
 
 **Bench evidence** (`BenchmarkWAL_SpillHeavyRepeatedDirty`, 1000 docs ×
 2KB, CacheSize=4, nUpdates=5):
@@ -1365,6 +1400,31 @@ No SQLite equivalent — our addition for the many-open-databases scenario.
   search direction (`pcache.c:463-469`). No `pSynced` pointer needed because
   `PGHDR_NEED_SYNC` is irrelevant in WAL-only mode.
 
+**Page-Cache Hash Table (apHash port)** -- Resolved 2026-05-22 (drift #2)
+
+The page→struct lookup was a Go `map[uint32]*page`. It is now a SQLite-`pcache1`-style
+chained hash (`pcache.apHash []*page` + `page.hashNext`), a direct port of
+`PCache1.apHash`/`PgHdr1.pNext` (`pcache1.c:200,122`):
+- `hashFind` is a single chained-bucket probe — `apHash[pgno & (nHash-1)]` walked
+  by `hashNext` — matching `pcache1FetchNoMutex` (`pcache1.c:1009-1010`). `nHash` is
+  always a power of two so the bucket index is a mask. `fetch`/`create` share it.
+- `hashInsert`/`hashRemove` link/unlink at the bucket head and maintain `nPage`,
+  matching `pcache1RemoveFromHash` (`pcache1.c:601-613`). `resizeHash` doubles and
+  rehashes at load factor 1.0 (`nPage >= nHash`), matching `pcache1ResizeHash`
+  (`pcache1.c:535-567`, floor 256).
+- **Ghost-page invariant:** unlike SQLite (whose invariants forbid removing a
+  pinned page from the hash), v2's `discard`/`truncate`/savepoint-rollback can
+  remove a page while a caller still holds it pinned. Membership is therefore
+  carried on the page via `page.inCache` (set by `hashInsert`, cleared by
+  `hashRemove`); `release` adds to the LRU only when `inCache` is true. This
+  replaces the former second Go-map lookup (the `pc.pages[p.pgno]==p` re-probe in
+  `release`) with a field read, and keeps `pcache1Unpin`'s hash-op-free release
+  path (`pcache1.c:1076-1103`).
+- Eliminates the two `runtime.mapaccess1_fast32` calls per page touched on every
+  fetch/release; measured ~50% faster `Fullscan/Count` (81µs → 40µs) and ~59%
+  faster `IterParse/FullScanCount` on the 10k-row `noIdxColl`, with no change to
+  B/op or allocs/op. No on-disk, WAL, dirty-list, or eviction-order change.
+
 **Known Drifts in Page Cache:**
 - Buffer reuse on eviction: SQLite step 4 (`pcache1.c:897-914`) reuses the
   evicted victim's buffer in-place. Writer caches drop evicted buffers because
@@ -1375,7 +1435,7 @@ No SQLite equivalent — our addition for the many-open-databases scenario.
 - No `reuseUnlikely` on unpin: SQLite's `pcache1Unpin` accepts a
   `reuseUnlikely` flag (`pcache1.c:1079`); when true, pages are immediately
   freed. Our `release()` does not have this hint. Overfull eviction
-  (`len(pages) > maxPages`) matches SQLite's `pGroup->nPurgeable > nMaxPage`
+  (`nPage > maxPages`) matches SQLite's `pGroup->nPurgeable > nMaxPage`
   check (`pcache1.c:1094`). `sqlite3PcacheDrop` maps to our `discard()` method.
 - Merged Fetch+FetchStress: SQLite splits page acquisition into
   `sqlite3PcacheFetch` (soft create, may return NULL) and
@@ -1966,3 +2026,58 @@ a fresh destination DB at `path` with matching options.
 - No attached-db name resolution (`findBtree`) -- one b-tree per DB.
 - No `nBackup` counter on source -- nothing for it to block (no
   VACUUM, immutable page size).
+
+---
+
+## Query Planner -- Index-for-ORDER-BY Matching (qplanner)
+
+The cost-based planner decides whether an index satisfies a query's sort
+order (so the index scan can stream rows in-order and stop at LIMIT,
+avoiding an in-memory sort). That decision mirrors SQLite's
+`wherePathSatisfiesOrderBy` (`sqlitec/src/where.c:5148`). The Go side lives
+in `internal/qplanner/planner.go`: `IndexSortMatch` (planner.go:1499) for
+*whether* an index covers the ORDER BY, and `shouldReverse` (planner.go:1101)
+for *which* direction to scan it.
+
+Two rules carry the equivalence:
+
+1. **Equality-prefix skip.** SQLite skips leading index columns that are
+   pinned by `==` / `IS` / `IN` constraints before matching ORDER BY terms --
+   the `if( (eOp & eqOpMask)!=0 ){ ... continue; }` arm over
+   `j < pLoop->u.btree.nEq` (`where.c:5314-5346`). Those columns are constant
+   within the scanned range, so a sort on the *following* columns is still
+   satisfied. `IndexSortMatch` takes an `equalityPrefix` count and tries the
+   ORDER BY match both at offset 0 and at `equalityPrefix` (`matchAt(0)` /
+   `matchAt(equalityPrefix)`, planner.go:1534-1539), keeping the longer match.
+
+2. **Consistent composite asc/desc direction.** SQLite fixes a composite
+   reverse flag on the *first* matched ORDER BY column --
+   `rev = revIdx ^ desc; revSet = 1` -- then requires every subsequent column
+   to satisfy `(rev ^ revIdx) == desc`, else it clears `isMatch` and stops
+   (`where.c:5412-5426`). I.e. the sort must be consistently in-order or
+   consistently reversed *relative to the index*; you cannot mix. `IndexSortMatch`
+   encodes the same rule with `curSame := idxRev == sf.Reverse` and a
+   `sameMode` latch: the first matched field sets `sameMode`, and any later
+   field with `curSame != sameMode` breaks the match (planner.go:1518-1530).
+   This is what lets `Sort("a","-b")` match the composite index `(a,-b)`
+   (both fields "same" -> exact match) while `Sort("a","b")` does not.
+
+Scan direction (SQLite's `*pRevMask |= MASKBIT(iLoop)` when `rev` is set,
+`where.c:5422`) maps to `shouldReverse`, which returns the leading sort
+field's `Reverse` to drive `IndexIter.Reverse` for the chosen index.
+
+A full ORDER BY coverage returns `exactSort` (no `SortIter` in the chain --
+see `BuildPlan` "Plan C: Index Scan", planner.go:415-504); a prefix-only
+match returns `partialSort`, which still feeds a `SortIter` but lets it
+exploit the partial ordering (`PartiallySorted`). This is verified by the
+benchmark `compound_rev/SortAscDesc` + `compound_rev/FilterSort` scenarios
+(any-store-tests), whose `Sort("a","-b")` now plans
+`IndexScan(a,-b) -> Fetch -> Limit` instead of `FullScan -> TopK`.
+
+**Classification: Aligned** -- the matching predicate (equality-prefix skip +
+single consistent composite direction) is a faithful port of SQLite's rule.
+any-store does not implement SQLite's `isOrderDistinct` / UNIQUE-NOT-NULL
+refinements (`where.c:5300,5363-5377`, tag-20210426-1) or the
+`WHERE_BIGNULL_SORT` NULLS-ordering handling -- they only affect whether
+*trailing* unconstrained columns can be elided or how NULLs sort, neither of
+which any-store's index/sort model exposes.
