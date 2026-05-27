@@ -574,6 +574,10 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 		}
 	}
 
+	// Bound reader page/overflow reads against this snapshot's (capped) page
+	// count rather than the writer-only pager.dbSize. See pcache.dbSize.
+	cache.dbSize = nPages
+
 	ic := &integrityChecker{
 		pager:       db.pager,
 		cache:       cache,

@@ -821,7 +821,7 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 // cache.codecScratch / &cache.codecAEAD. Pass nil/nil for the rare nil-
 // cache path (admission-control refusal, integrity checks); the codec
 // falls back to allocPageBuffer in that case.
-func (p *pager) readTempPage(pgno, walMaxFrame uint32, codecBuf []byte, codecAEAD *aeadScratch) (*page, error) {
+func (p *pager) readTempPage(pgno, walMaxFrame, dbSizeBound uint32, codecBuf []byte, codecAEAD *aeadScratch) (*page, error) {
 	pg := p.acquireTempPage()
 	pg.pgno = pgno
 	pg.pinCount = 1
@@ -845,7 +845,10 @@ func (p *pager) readTempPage(pgno, walMaxFrame uint32, codecBuf []byte, codecAEA
 	// Read from database file.
 	if p.file != nil {
 		if err := p.readDBPage(pgno, pg.data); err != nil {
-			if pgno <= p.dbSize.Load() {
+			// dbSizeBound is the caller's snapshot page count (reader) or
+			// p.dbSize (writer/uncached); a page beyond it is a not-yet-
+			// materialized new page → zero-fill rather than error.
+			if pgno <= dbSizeBound {
 				p.recycleTempPage(pg)
 				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 			}
@@ -909,7 +912,7 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 	// If no reader cache provided, read an uncached temporary page.
 	// Never fall back to writerCache — that would race with the writer goroutine.
 	if cache == nil {
-		return p.readTempPage(pgno, walMaxFrame, nil, nil)
+		return p.readTempPage(pgno, walMaxFrame, p.readerDbSizeBound(nil), nil, nil)
 	}
 
 	// Check reader cache.
@@ -931,7 +934,7 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 			cache.codecScratch = make([]byte, p.pageSize)
 		}
 		// END ENCRYPTION
-		return p.readTempPage(pgno, walMaxFrame, cache.codecScratch, &cache.codecAEAD)
+		return p.readTempPage(pgno, walMaxFrame, p.readerDbSizeBound(cache), cache.codecScratch, &cache.codecAEAD)
 	}
 
 	// Try to read from WAL first.
@@ -958,7 +961,9 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 	// Read from database file.
 	if p.file != nil {
 		if err := p.readDBPage(pgno, pg.data); err != nil {
-			if pgno <= p.dbSize.Load() {
+			// Reader snapshot bound (cache is non-nil here): a page beyond it
+			// is a peer-allocated page not yet in the file → zero-fill.
+			if pgno <= p.readerDbSizeBound(cache) {
 				cache.discard(pg.pgno)
 				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 			}
@@ -1572,6 +1577,43 @@ func (p *pager) setHasContent(pgno uint32) {
 // Matches SQLite's btreeGetHasContent() (btree.c:673-676).
 func (p *pager) getHasContent(pgno uint32) bool {
 	return p.hasContent[pgno]
+}
+
+// effectiveReaderDbSize returns the database size in pages for a reader's
+// captured snapshot header. It returns hdr.nPage (the committed page count
+// recorded in the WAL-index header at the reader's snapshot, visible cross-
+// process via SHM), falling back to the process-local p.dbSize when the
+// header carries no committed size — hdr not initialized (in-process mode,
+// where writers don't publish the SHM header) or an empty/checkpointed WAL.
+//
+// Mirrors SQLite's sqlite3WalDbsize (wal.c:3672 — returns pWal->hdr.nPage)
+// plus pagerPagecount's fallback when WalDbsize returns 0 (pager.c:3292 call,
+// 3299-3305 fallback). SQLite falls back there to the file size; we fall back
+// to p.dbSize, which is equivalent: the WAL header lacks a committed size only
+// in in-process mode (writers don't publish the SHM header, and p.dbSize is the
+// authoritative same-process counter) or for a genuinely empty DB.
+// Readers must never bound-check against p.dbSize directly: that atomic is the
+// writer's allocation counter and is only refreshed on the write path
+// (beginWrite -> refreshHeaderFromPage1), so a pure reader would reject pages
+// a peer allocated after this process opened.
+func (p *pager) effectiveReaderDbSize(hdr WalIndexHdr) uint32 {
+	if hdr.isInit != 0 && hdr.nPage != 0 {
+		return hdr.nPage
+	}
+	return p.dbSize.Load()
+}
+
+// readerDbSizeBound returns the page-count upper bound to validate pgno
+// against on a read path: the snapshot bound carried on the reader cache
+// (pcache.dbSize), or the process-local p.dbSize when there is no reader
+// cache (writer / uncached paths) or the cache bound is unset (0). This is
+// the single reader-vs-writer rule for the page and overflow bound checks;
+// an unset cache bound degrades safely to the previous p.dbSize behavior.
+func (p *pager) readerDbSizeBound(cache *pcache) uint32 {
+	if cache != nil && cache.dbSize != 0 {
+		return cache.dbSize
+	}
+	return p.dbSize.Load()
 }
 
 // refreshHeaderFromPage1 refreshes p.header and p.dbSize from the latest
@@ -2443,7 +2485,9 @@ func (p *pager) readOverflowChainReader(firstPgno uint32, buf []byte, walMaxFram
 		maxIter = 10
 	}
 	iter := 0
-	dbSize := p.dbSize.Load()
+	// Reader snapshot bound: accept overflow pages a peer allocated after we
+	// opened (cache is non-nil here). See pcache.dbSize / readerDbSizeBound.
+	dbSize := p.readerDbSizeBound(cache)
 
 	for pgno != 0 && off < len(buf) {
 		if pgno < 2 || pgno > dbSize {
@@ -2483,7 +2527,9 @@ func (p *pager) readOverflowAt(firstPgno uint32, skip, amt int, dst []byte, walM
 		maxIter = 10
 	}
 	iter := 0
-	dbSize := p.dbSize.Load()
+	// Reader snapshot bound (falls back to p.dbSize when cache is nil — the
+	// writer/uncached path). See pcache.dbSize / readerDbSizeBound.
+	dbSize := p.readerDbSizeBound(cache)
 	written := 0
 
 	for pgno != 0 && written < amt {

@@ -66,6 +66,20 @@ type pcache struct {
 	dataVersion uint64
 	walMaxFrame uint32
 
+	// dbSize is the database size in pages for the snapshot this cache serves
+	// (WalIndexHdr.nPage, captured cross-process at BeginRead). Reader page/
+	// overflow bound checks use this instead of the process-global
+	// pager.dbSize — which only the writer refreshes — so a live reader
+	// accepts pages a peer allocated after this process opened. Set in
+	// lockstep with walMaxFrame at every snapshot-establish site.
+	//
+	// Mirrors SQLite's per-connection pPager->dbSize, recomputed each read
+	// transaction from sqlite3WalDbsize() == pWal->hdr.nPage (wal.c:3672,
+	// pager.c:5448 pagerPagecount). 0 means "fall back to pager.dbSize"
+	// (in-process mode / empty WAL — matching pagerPagecount's file-size
+	// fallback at pager.c:3300).
+	dbSize uint32
+
 	// pFree is a per-cache list of reusable page structs with data buffers.
 	// In non-slab mode, initBulk() pre-allocates up to 20 pages from the heap
 	// (marked isBulkLocal=true). In slab mode, initBulk is a no-op (SQLite
