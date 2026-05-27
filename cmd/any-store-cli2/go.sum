@@ -1,5 +1,5 @@
-github.com/anyproto/any-store/v2 v2.0.0-alpha.3 h1:PDU/ZMF1gPLYihTqjd5mAfO1rCxIH75QbDlsTAwSJt4=
-github.com/anyproto/any-store/v2 v2.0.0-alpha.3/go.mod h1:ZWYzw07hxnCN9sPovwb0GIAKmk9QBrOLGQ/TLa4D0+8=
+github.com/anyproto/any-store/v2 v2.0.0-alpha.6 h1:29/uLX9/U2313nLHRpXv4uPABX7deKjiE/wbNsfq0hE=
+github.com/anyproto/any-store/v2 v2.0.0-alpha.6/go.mod h1:ZWYzw07hxnCN9sPovwb0GIAKmk9QBrOLGQ/TLa4D0+8=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
