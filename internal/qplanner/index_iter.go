@@ -39,12 +39,22 @@ func init() {
 
 // SetKWayMergeMax overrides the merge dispatch upper bound for testing or
 // production tuning. Pass 0 to disable the merge entirely. Returns the
-// previous value.
+// previous value, suitable for the restore-on-defer idiom:
+//
+//	prev := SetKWayMergeMax(0); defer SetKWayMergeMax(prev)
+//
+// Process-global; takes effect immediately for all subsequent queries
+// (atomic swap). Internal/qplanner; downstream consumers should call
+// anystore.SetKWayMergeMax instead.
 func SetKWayMergeMax(n int) int {
 	return int(kWayMergeMax.Swap(int32(n)))
 }
 
-// SetKWayMergeMinEntries overrides the merge dispatch lower bound.
+// SetKWayMergeMinEntries overrides the merge dispatch lower bound on
+// sum-of-sketch-estimates across the query's bounds. Below this value
+// the dispatch picks the pre-sized seen-set walk instead of the merge.
+// Returns the previous value; same restore-on-defer pattern as
+// SetKWayMergeMax. Process-global, atomic, default 200.
 func SetKWayMergeMinEntries(n int) int {
 	return int(kWayMergeMinEntries.Swap(int32(n)))
 }
