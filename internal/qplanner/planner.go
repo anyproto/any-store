@@ -1043,16 +1043,24 @@ type mergeIterAdapter struct {
 	fieldCount int
 	merge      *kWayDocIdMergeIter
 	closed     bool
+	// initFailed sticks once lazyInit returned a non-nil error. Without
+	// it, a second Next call after init failure would see merge==nil &&
+	// !closed and retry lazyInit — opening k fresh cursors and re-trying
+	// each Seek. Real transient errors (e.g. snapshot eviction during
+	// the first read) would look like flaky retries instead of hard
+	// failures.
+	initFailed bool
 }
 
 func (a *mergeIterAdapter) Next() (key []byte, docId []byte, multiKey bool, err error) {
-	if a.merge == nil && !a.closed {
+	if a.closed || a.initFailed {
+		return nil, nil, false, nil
+	}
+	if a.merge == nil {
 		if err := a.lazyInit(); err != nil {
+			a.initFailed = true
 			return nil, nil, false, err
 		}
-	}
-	if a.closed {
-		return nil, nil, false, nil
 	}
 	id, ok, err := a.merge.Next()
 	if err != nil {
