@@ -104,7 +104,7 @@ func newKWayDocIdMergeIter(cursors []*btree.Cursor, bounds query.Bounds, fieldCo
 		states:     make([]cursorState, 0, len(cursors)),
 		fieldCount: fieldCount,
 	}
-	qpPerf.mergeDispatched.Add(1)
+	qpPerf.mergeDispatches.Add(1)
 	// Keep an out-of-band slot for cursors that immediately exhaust so
 	// Close still releases them; the heap only contains the active ones.
 	m.closedCursors = make([]*btree.Cursor, 0, len(cursors))

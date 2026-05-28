@@ -2130,6 +2130,6 @@ func TestAudit14_LegacyNilValue_PlannerRoutesViaMerge(t *testing.T) {
 	// Count + Iter = 2 merge dispatches. Pin that the merge route fired
 	// at least once (Iter via mergeIterAdapter; Count via
 	// IndexIter.countEntriesViaMerge — both bump the counter).
-	assert.GreaterOrEqual(t, snap.MergeDispatched, uint64(1),
+	assert.GreaterOrEqual(t, snap.MergeDispatches, uint64(1),
 		"merge route must have fired for the k=2 multi-key $in shape")
 }

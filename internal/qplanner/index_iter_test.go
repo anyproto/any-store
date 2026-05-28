@@ -1254,7 +1254,7 @@ func TestIndexIter_CountEntries_RoutesViaMerge(t *testing.T) {
 	n, err := it.CountEntries()
 	require.NoError(t, err)
 	require.Equal(t, 3, n) // d1, d2, d3
-	require.Equal(t, uint64(1), SnapshotPerfCounters().MergeDispatched,
+	require.Equal(t, uint64(1), SnapshotPerfCounters().MergeDispatches,
 		"must have routed through the merge")
 }
 
@@ -1292,7 +1292,7 @@ func TestIndexIter_CountEntries_FallsBackWhenKExceedsMax(t *testing.T) {
 	n, err := it.CountEntries()
 	require.NoError(t, err)
 	require.Equal(t, 65, n)
-	require.Equal(t, uint64(0), SnapshotPerfCounters().MergeDispatched,
+	require.Equal(t, uint64(0), SnapshotPerfCounters().MergeDispatches,
 		"k > kWayMergeMax must skip the merge")
 }
 
@@ -1320,7 +1320,7 @@ func TestIndexIter_CountEntries_FallsBackForCompoundIndex(t *testing.T) {
 	defer it.Close()
 	_, err = it.CountEntries()
 	require.NoError(t, err)
-	require.Equal(t, uint64(0), SnapshotPerfCounters().MergeDispatched,
+	require.Equal(t, uint64(0), SnapshotPerfCounters().MergeDispatches,
 		"compound index must skip the merge")
 }
 
@@ -1348,7 +1348,7 @@ func TestIndexIter_CountEntries_FallsBackForAllScalar(t *testing.T) {
 	defer it.Close()
 	_, err = it.CountEntries()
 	require.NoError(t, err)
-	require.Equal(t, uint64(0), SnapshotPerfCounters().MergeDispatched,
+	require.Equal(t, uint64(0), SnapshotPerfCounters().MergeDispatches,
 		"all-scalar bounds must skip the merge")
 }
 
@@ -1380,7 +1380,7 @@ func TestIndexIter_CountEntries_KillSwitch(t *testing.T) {
 	defer it.Close()
 	_, err = it.CountEntries()
 	require.NoError(t, err)
-	require.Equal(t, uint64(0), SnapshotPerfCounters().MergeDispatched,
+	require.Equal(t, uint64(0), SnapshotPerfCounters().MergeDispatches,
 		"kill switch must skip the merge")
 }
 

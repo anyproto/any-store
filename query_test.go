@@ -981,7 +981,7 @@ func TestQueryCount_MergeRoute_MinNGate_Respected(t *testing.T) {
 		n, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Count(ctx)
 		require.NoError(t, err)
 		assert.Equal(t, 3, n, "Count must return all 3 distinct docs")
-		assert.Equal(t, uint64(0), qplanner.SnapshotPerfCounters().MergeDispatched,
+		assert.Equal(t, uint64(0), qplanner.SnapshotPerfCounters().MergeDispatches,
 			"sketch sum << min-N gate must divert from merge to seen-set")
 	})
 
@@ -993,7 +993,7 @@ func TestQueryCount_MergeRoute_MinNGate_Respected(t *testing.T) {
 		n, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Count(ctx)
 		require.NoError(t, err)
 		assert.Equal(t, 3, n)
-		assert.GreaterOrEqual(t, qplanner.SnapshotPerfCounters().MergeDispatched, uint64(1),
+		assert.GreaterOrEqual(t, qplanner.SnapshotPerfCounters().MergeDispatches, uint64(1),
 			"lowered gate must route Count via merge")
 	})
 }

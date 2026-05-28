@@ -258,5 +258,5 @@ func TestKWayMerge_DispatchCounter(t *testing.T) {
 	m.Close()
 
 	snap := SnapshotPerfCounters()
-	require.Equal(t, uint64(1), snap.MergeDispatched)
+	require.Equal(t, uint64(1), snap.MergeDispatches)
 }

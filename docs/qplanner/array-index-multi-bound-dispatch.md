@@ -26,12 +26,12 @@ qplanner.ResetPerfCounters()
 // ... run the query ...
 
 snap := qplanner.SnapshotPerfCounters()
-fmt.Printf("merge dispatches: %d\n", snap.MergeDispatched)
+fmt.Printf("merge dispatches: %d\n", snap.MergeDispatches)
 fmt.Printf("index Next calls: %d (yields: %d)\n",
     snap.IndexNextCalls, snap.IndexYields)
 ```
 
-If `MergeDispatched == 0` for a query you expected to use the merge,
+If `MergeDispatches == 0` for a query you expected to use the merge,
 check (in order):
 
 1. `idx.PointLookup` — true iff every original bound was equality
