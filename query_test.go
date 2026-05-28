@@ -892,3 +892,53 @@ func TestQueryDeleteMany_MultiBoundMultiKey_NoDoubleDelete(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 2, res.Modified, "exactly 2 deletes — d1 (3-overlap) + d2 (1-overlap)")
 }
+
+// TestQuery_KnownIssueI04_AndConjunctionLostInCount is a regression-pin
+// for I-04 (see docs/known-issues.md). And.IndexBounds discards conjuncts
+// after the first one that grows the bound slice, and the CountOnly fast
+// path at planner.go:945 then returns the raw IndexIter — silently
+// returning a count for the FIRST conjunct's bounds only.
+//
+// The test is marked t.Skip until a fix lands. Remove the Skip when the
+// bug is fixed; the assertions encode the correct semantics already.
+//
+// Iter is correct for the same query (FilterIter still wraps), so this
+// test also pins the divergence: Count returns 2, Iter yields 0.
+func TestQuery_KnownIssueI04_AndConjunctionLostInCount(t *testing.T) {
+	t.Skip("known-issue I-04: And.IndexBounds + CountOnly fast path " +
+		"silently returns wrong answer for conjunctions of $in + range " +
+		"on the same field. See docs/known-issues.md I-04. Remove this " +
+		"Skip when fixed.")
+
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "i04")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":1}`), // matches $in only
+		anyenc.MustParseJson(`{"id":2,"a":2}`), // matches $in only
+		anyenc.MustParseJson(`{"id":3,"a":5}`), // matches $gte only
+		anyenc.MustParseJson(`{"id":4,"a":7}`), // matches $gte only
+	))
+	// a ∈ {1,2} AND a >= 5 = ∅
+	q := `{"a":{"$in":[1,2]},"$and":[{"a":{"$gte":5}}]}`
+
+	n, err := coll.Find(q).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, n, "Count must respect the $and conjunction (currently returns 2 — I-04)")
+
+	// Iter is correct for the same query (FilterIter still wraps).
+	it, err := coll.Find(q).Iter(ctx)
+	require.NoError(t, err)
+	defer it.Close()
+	iterCount := 0
+	for it.Next() {
+		iterCount++
+	}
+	assert.Equal(t, 0, iterCount, "Iter respects the conjunction (currently correct)")
+
+	// Same semantics, same-key inline form. Equally broken.
+	n2, err := coll.Find(`{"a":{"$in":[1,2],"$gte":5}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, n2, "inline {$in,$gte} also broken — I-04")
+}
