@@ -688,6 +688,10 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 	// Matches SQLite pager.c:3246-3267 (pagerBeginReadTransaction —
 	// pager_reset only if change-counter changed).
 	curDV := db.dataVersion.Load()
+	// Snapshot DB page count for this reader (hdr.nPage, fallback p.dbSize).
+	// Carried on the cache so reader bound checks accept pages a peer
+	// allocated after open. Set in lockstep with walMaxFrame.
+	snapDbSize := db.pager.effectiveReaderDbSize(hdr)
 	var cache *pcache
 	select {
 	case cache = <-db.readerCaches:
@@ -696,11 +700,13 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 			cache.dataVersion = curDV
 			cache.walMaxFrame = maxFrame
 		}
+		cache.dbSize = snapDbSize
 	default:
 		cache = newPcache(int(db.pager.pageSize), db.readerCacheSize, true)
 		cache.useSlab = db.pager.useSlab
 		cache.dataVersion = curDV
 		cache.walMaxFrame = maxFrame
+		cache.dbSize = snapDbSize
 	}
 
 	tx := db.getReadTx()
@@ -1040,7 +1046,7 @@ func (db *DB) freeTreePages(pgno uint32) error {
 // goroutine. To resolve namespaces from the writer goroutine (seeing dirty
 // pages), use getNamespaceLocked directly.
 func (db *DB) GetNamespace(name string) (*Namespace, error) {
-	maxFrame, slot, err := db.pager.beginRead()
+	hdr, maxFrame, slot, err := db.pager.beginReadHdr()
 	if err != nil {
 		return nil, err
 	}
@@ -1048,6 +1054,7 @@ func (db *DB) GetNamespace(name string) (*Namespace, error) {
 
 	cache := newPcache(int(db.pager.pageSize), 200, true)
 	cache.useSlab = db.pager.useSlab
+	cache.dbSize = db.pager.effectiveReaderDbSize(hdr)
 	defer cache.destroy()
 
 	return db.getNamespaceAt(name, maxFrame, cache)
@@ -1129,7 +1136,7 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 
 // ListNamespaces returns the names of all namespaces.
 func (db *DB) ListNamespaces() ([]string, error) {
-	maxFrame, slot, err := db.pager.beginRead()
+	hdr, maxFrame, slot, err := db.pager.beginReadHdr()
 	if err != nil {
 		return nil, err
 	}
@@ -1137,6 +1144,7 @@ func (db *DB) ListNamespaces() ([]string, error) {
 
 	cache := newPcache(int(db.pager.pageSize), 200, true)
 	cache.useSlab = db.pager.useSlab
+	cache.dbSize = db.pager.effectiveReaderDbSize(hdr)
 	defer cache.destroy()
 
 	bt := &btree{pager: db.pager, cache: cache, rootPage: 1, walMaxFrame: maxFrame, writable: false}
