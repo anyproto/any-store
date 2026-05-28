@@ -62,15 +62,22 @@ import (
 //     activeBuf holds the most recently EMITTED docId; the inactive
 //     buffer is scratch space for the next candidate.
 type kWayDocIdMergeIter struct {
-	states        []cursorState   // backing array; the heap is states[:nActive]
-	closedCursors []*btree.Cursor // cursors removed from the heap (exhausted or init-failed) but still owned for Close
-	nActive       int
-	buf0, buf1    []byte // two reusable buffers; one holds last-emitted, one is scratch
-	activeBuf     int    // 0 or 1 — index of the buffer currently holding last-emitted
-	haveEmitted   bool   // false until first emit
-	fieldCount    int    // index field count, for docId extraction
-	closed        bool
-	initErr       error // first error observed in construction (surfaced from first Next)
+	// allCursors owns every cursor passed at construction, regardless of
+	// whether it is still active in the heap. Close iterates this slice
+	// once. This is the single source of truth for cursor ownership and
+	// replaces the earlier two-slice scheme (heap states + a side
+	// "closed" list) — the previous design required carefully zeroing
+	// the heap slot on pop to prevent a stale duplicate in Close, which
+	// was fragile and made the ownership invariant non-obvious.
+	allCursors  []*btree.Cursor
+	states      []cursorState // backing array; the heap is states[:nActive]
+	nActive     int
+	buf0, buf1  []byte // two reusable buffers; one holds last-emitted, one is scratch
+	activeBuf   int    // 0 or 1 — index of the buffer currently holding last-emitted
+	haveEmitted bool   // false until first emit
+	fieldCount  int    // index field count, for docId extraction
+	closed      bool
+	initErr     error // first error observed in construction (surfaced from first Next)
 }
 
 // cursorState is one entry in the heap.
@@ -101,15 +108,13 @@ func newKWayDocIdMergeIter(cursors []*btree.Cursor, bounds query.Bounds, fieldCo
 		panic("kWayDocIdMergeIter: cursors and bounds length mismatch")
 	}
 	m := &kWayDocIdMergeIter{
+		allCursors: cursors, // retained for Close — see field doc
 		states:     make([]cursorState, 0, len(cursors)),
 		fieldCount: fieldCount,
 	}
 	if perfCountersEnabled() {
 		qpPerf.mergeDispatches.Add(1)
 	}
-	// Keep an out-of-band slot for cursors that immediately exhaust so
-	// Close still releases them; the heap only contains the active ones.
-	m.closedCursors = make([]*btree.Cursor, 0, len(cursors))
 	for i, c := range cursors {
 		st := cursorState{
 			cursor:       c,
@@ -124,11 +129,9 @@ func newKWayDocIdMergeIter(cursors []*btree.Cursor, bounds query.Bounds, fieldCo
 		}
 		if !st.exhausted {
 			m.states = append(m.states, st)
-		} else {
-			// Track the cursor so Close releases it even though it didn't
-			// enter the heap.
-			m.closedCursors = append(m.closedCursors, c)
 		}
+		// Exhausted cursors are NOT added to the heap; ownership for
+		// Close is preserved via allCursors above.
 	}
 	m.nActive = len(m.states)
 	// Floyd's heap construction, O(n).
@@ -175,13 +178,9 @@ func (m *kWayDocIdMergeIter) Next() ([]byte, bool, error) {
 			return nil, false, err
 		}
 		if top.exhausted {
-			// Track the now-exhausted cursor for Close. It is the slot at
-			// states[0]; we pop it by swapping with the tail.
-			m.closedCursors = append(m.closedCursors, top.cursor)
+			// Pop by swapping with the tail. No need to track the cursor
+			// separately for Close — m.allCursors already owns it.
 			m.states[0] = m.states[m.nActive-1]
-			// Zero out the trailing slot to drop the cursor reference so
-			// Close doesn't see a stale duplicate.
-			m.states[m.nActive-1] = cursorState{}
 			m.nActive--
 			if m.nActive > 0 {
 				m.siftDown(0)
@@ -220,16 +219,10 @@ func (m *kWayDocIdMergeIter) Close() {
 		return
 	}
 	m.closed = true
-	for i := range m.states[:m.nActive] {
-		if m.states[i].cursor != nil {
-			m.states[i].cursor.Close()
-			m.states[i].cursor = nil
-		}
-	}
-	for i, c := range m.closedCursors {
+	for i, c := range m.allCursors {
 		if c != nil {
 			c.Close()
-			m.closedCursors[i] = nil
+			m.allCursors[i] = nil
 		}
 	}
 	m.nActive = 0
