@@ -19,6 +19,12 @@ type PerfCounters struct {
 	FilterYields    uint64
 	FilterNextNs    uint64
 	FilterEvalNs    uint64
+
+	// MergeDispatched counts k-way docId-merge invocations (Task 4).
+	// Incremented once per kWayDocIdMergeIter construction. Tests pin
+	// path selection through this counter instead of inspecting internal
+	// state.
+	MergeDispatched uint64
 }
 
 var qpPerf struct {
@@ -38,6 +44,8 @@ var qpPerf struct {
 	filterYields    atomic.Uint64
 	filterNextNs    atomic.Uint64
 	filterEvalNs    atomic.Uint64
+
+	mergeDispatched atomic.Uint64
 }
 
 func setPerfCountersEnabled(enabled bool) {
@@ -61,6 +69,7 @@ func resetPerfCounters() {
 	qpPerf.filterYields.Store(0)
 	qpPerf.filterNextNs.Store(0)
 	qpPerf.filterEvalNs.Store(0)
+	qpPerf.mergeDispatched.Store(0)
 }
 
 func snapshotPerfCounters() PerfCounters {
@@ -79,5 +88,7 @@ func snapshotPerfCounters() PerfCounters {
 		FilterYields:    qpPerf.filterYields.Load(),
 		FilterNextNs:    qpPerf.filterNextNs.Load(),
 		FilterEvalNs:    qpPerf.filterEvalNs.Load(),
+
+		MergeDispatched: qpPerf.mergeDispatched.Load(),
 	}
 }
