@@ -12,9 +12,11 @@ import (
 )
 
 // boundForValue constructs a PointLookup bound for the given scalar value
-// (single-field index key shape). Same as how planner.go produces $in
-// bounds: Start = tuple(value), End = tuple(value) + 0xff (the post-
-// AdjustBoundsForNonUnique form).
+// in the shape produced by planner.go for $in over a non-unique
+// single-field index — i.e. the post-AdjustBoundsForNonUnique form:
+// Start = tuple(value), End = tuple(value) + 0xff (the trailing 0xff
+// captures every docId suffix that would otherwise sort past End).
+// Shared by both kway_merge_test.go and index_iter_test.go.
 func boundForValue(v string) query.Bound {
 	start := anyenc.AppendAnyValue(nil, v)
 	end := append(append([]byte{}, start...), 0xff)

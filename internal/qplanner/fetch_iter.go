@@ -40,6 +40,16 @@ func (it *FetchIter) Next() (key []byte, docId []byte, multiKey bool, err error)
 			return nil, nil, false, err
 		}
 
+		// LIFETIME CONTRACT: docId from Source.Next is consumed
+		// SYNCHRONOUSLY by the point lookup below and not retained.
+		// kWayDocIdMergeIter (via mergeIterAdapter) returns a docId
+		// that aliases an internal buffer and is invalidated on the
+		// next Next call on the same merge — relying on this synchronous
+		// consumption to avoid a per-emission copy. If FetchIter is
+		// ever refactored to retain docId across iterations (e.g. for
+		// batching, retry, or async lookup), the merge's no-copy
+		// contract MUST be revisited (see kway_merge.go).
+
 		// Cursor-free point lookup: avoids Cursor struct allocation and stack growth.
 		var lookupStart time.Time
 		if perf {

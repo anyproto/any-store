@@ -539,13 +539,19 @@ func (it *IndexIter) boundsAllScalar() (bool, error) {
 // it.cursor is reused for bound 0 to avoid one allocation.
 func (it *IndexIter) countEntriesViaMerge() (int, error) {
 	cursors := make([]*btree.Cursor, 0, len(it.Bounds))
-	closeOnErr := func() {
-		for _, c := range cursors {
-			if c != nil {
-				c.Close()
+	// Cleanup pattern: a deferred closure releases cursors unless ownership
+	// has been transferred to the merge. We flip ownedByMerge once
+	// newKWayDocIdMergeIter has taken the slice.
+	ownedByMerge := false
+	defer func() {
+		if !ownedByMerge {
+			for _, c := range cursors {
+				if c != nil {
+					c.Close()
+				}
 			}
 		}
-	}
+	}()
 	for i, b := range it.Bounds {
 		var c *btree.Cursor
 		if i == 0 {
@@ -556,24 +562,22 @@ func (it *IndexIter) countEntriesViaMerge() (int, error) {
 		}
 		cursors = append(cursors, c)
 		if err := c.Seek(b.Start); err != nil {
-			closeOnErr()
 			return 0, err
 		}
 		if c.Valid() && !b.StartInclude {
 			k, kerr := c.Key()
 			if kerr != nil {
-				closeOnErr()
 				return 0, kerr
 			}
 			if bytes.Equal(k, b.Start) {
 				if err := c.Next(); err != nil {
-					closeOnErr()
 					return 0, err
 				}
 			}
 		}
 	}
 	m := newKWayDocIdMergeIter(cursors, it.Bounds, len(it.IdxInfo.FieldNames))
+	ownedByMerge = true
 	defer m.Close()
 	count := 0
 	for {

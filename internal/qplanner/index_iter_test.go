@@ -1126,17 +1126,6 @@ func TestIndexIter_SkipOffset_ZeroAndNegative(t *testing.T) {
 	assert.Equal(t, []string{"p1"}, ids)
 }
 
-// pointLookupBoundForValue mirrors the post-AdjustBoundsForNonUnique shape
-// for a single-field equality bound: Start = tuple(value),
-// End = tuple(value) + 0xff (to capture the docId suffix appended by
-// non-unique index keys). This matches how planner.go produces bounds for
-// $in over a non-unique index after AdjustBoundsForNonUnique runs.
-func pointLookupBoundForValue(v string) query.Bound {
-	start := anyenc.AppendAnyValue(nil, v)
-	end := append(append([]byte{}, start...), 0xff)
-	return query.Bound{Start: start, End: end, StartInclude: true, EndInclude: true}
-}
-
 // TestIndexIter_CountEntries_PreSizedSeenSet_NoSketch pins that the
 // CountUntil pre-pass produces a correctly-sized seen-set in the
 // no-sketch case. Uses a real btree fixture populated with multi-key
@@ -1164,9 +1153,9 @@ func TestIndexIter_CountEntries_PreSizedSeenSet_NoSketch(t *testing.T) {
 		Source:  &CursorSource{Tx: rtx, Ns: ns},
 		IdxInfo: &IndexInfo{Name: "tags", FieldNames: []string{"f"}},
 		Bounds: query.Bounds{
-			pointLookupBoundForValue("a"),
-			pointLookupBoundForValue("b"),
-			pointLookupBoundForValue("c"),
+			boundForValue("a"),
+			boundForValue("b"),
+			boundForValue("c"),
 		},
 		PointLookup: true,
 		// Sketch deliberately nil — exercises the CountUntil pre-pass.
@@ -1205,9 +1194,9 @@ func TestIndexIter_CountEntries_PreSizedSeenSet_FlatAllocs(t *testing.T) {
 			Source:  &CursorSource{Tx: rtx, Ns: ns},
 			IdxInfo: &IndexInfo{Name: "tags", FieldNames: []string{"f"}},
 			Bounds: query.Bounds{
-				pointLookupBoundForValue("a"),
-				pointLookupBoundForValue("b"),
-				pointLookupBoundForValue("c"),
+				boundForValue("a"),
+				boundForValue("b"),
+				boundForValue("c"),
 			},
 			PointLookup: true,
 		}
@@ -1430,8 +1419,8 @@ func TestIndexIter_CountEntries_MergeAllocsBudget(t *testing.T) {
 // here.
 func TestPassesMergeMinNGate_SketchPaths(t *testing.T) {
 	bounds := query.Bounds{
-		pointLookupBoundForValue("a"),
-		pointLookupBoundForValue("b"),
+		boundForValue("a"),
+		boundForValue("b"),
 	}
 
 	t.Run("nil sketch passes trivially", func(t *testing.T) {
@@ -1500,8 +1489,8 @@ func TestPassesMergeMinNGate_SketchPaths(t *testing.T) {
 // indirectly through CountEntries / buildIndexSeekChain.
 func TestCanRunMergeStatic_GatesShape(t *testing.T) {
 	twoBounds := query.Bounds{
-		pointLookupBoundForValue("a"),
-		pointLookupBoundForValue("b"),
+		boundForValue("a"),
+		boundForValue("b"),
 	}
 	prev := SetKWayMergeMinEntries(0)
 	defer SetKWayMergeMinEntries(prev)
@@ -1516,7 +1505,7 @@ func TestCanRunMergeStatic_GatesShape(t *testing.T) {
 		require.False(t, canRunMergeStatic(twoBounds, []string{"f", "g"}, true, nil))
 	})
 	t.Run("k=1 fails (single bound)", func(t *testing.T) {
-		one := query.Bounds{pointLookupBoundForValue("a")}
+		one := query.Bounds{boundForValue("a")}
 		require.False(t, canRunMergeStatic(one, []string{"f"}, true, nil))
 	})
 	t.Run("k > kMax fails", func(t *testing.T) {
@@ -1556,7 +1545,7 @@ func TestBoundsAllScalar_EndCheck(t *testing.T) {
 	it := &IndexIter{
 		Source:      &CursorSource{Tx: rtx, Ns: ns},
 		IdxInfo:     &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
-		Bounds:      query.Bounds{pointLookupBoundForValue("a"), pointLookupBoundForValue("b")},
+		Bounds:      query.Bounds{boundForValue("a"), boundForValue("b")},
 		PointLookup: true,
 	}
 	defer it.Close()

@@ -1089,35 +1089,36 @@ func (a *mergeIterAdapter) String() string {
 
 func (a *mergeIterAdapter) lazyInit() error {
 	cursors := make([]*btree.Cursor, 0, len(a.bounds))
-	closeAll := func() {
-		for _, c := range cursors {
-			if c != nil {
-				c.Close()
+	ownedByMerge := false
+	defer func() {
+		if !ownedByMerge {
+			for _, c := range cursors {
+				if c != nil {
+					c.Close()
+				}
 			}
 		}
-	}
+	}()
 	for _, b := range a.bounds {
 		c := a.cs.NewCursor()
 		cursors = append(cursors, c)
 		if err := c.Seek(b.Start); err != nil {
-			closeAll()
 			return err
 		}
 		if c.Valid() && !b.StartInclude {
 			k, kerr := c.Key()
 			if kerr != nil {
-				closeAll()
 				return kerr
 			}
 			if bytes.Equal(k, b.Start) {
 				if err := c.Next(); err != nil {
-					closeAll()
 					return err
 				}
 			}
 		}
 	}
 	a.merge = newKWayDocIdMergeIter(cursors, a.bounds, a.fieldCount)
+	ownedByMerge = true
 	return nil
 }
 
