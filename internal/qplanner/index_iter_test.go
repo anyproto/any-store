@@ -1419,3 +1419,114 @@ func TestIndexIter_CountEntries_MergeAllocsBudget(t *testing.T) {
 	require.Less(t, allocs, float64(150),
 		"merge must hit the alloc target; got %.0f", allocs)
 }
+
+// TestPassesMergeMinNGate_SketchPaths covers the three branches of
+// passesMergeMinNGate that no other test exercises: (1) sketch nil →
+// gate trivially passes; (2) sketch present, sum >= min → passes;
+// (3) sketch present, sum < min → fails. The unit-test suite previously
+// only ran the nil-sketch branch (all qplanner unit tests build
+// IndexIter literals with Sketch:nil), so a regression in the
+// comparison sense (>= vs >) or in Estimate() lookup would not surface
+// here.
+func TestPassesMergeMinNGate_SketchPaths(t *testing.T) {
+	bounds := query.Bounds{
+		pointLookupBoundForValue("a"),
+		pointLookupBoundForValue("b"),
+	}
+
+	t.Run("nil sketch passes trivially", func(t *testing.T) {
+		require.True(t, passesMergeMinNGate(bounds, nil))
+	})
+
+	t.Run("sketch sum below gate fails", func(t *testing.T) {
+		prev := SetKWayMergeMinEntries(100)
+		defer SetKWayMergeMinEntries(prev)
+
+		s := NewIndexSketch(DefaultSketchSize)
+		// Increment each bound value once → Estimate per bound = 1.
+		// Sum = 2; gate is 100.
+		s.Increment(bounds[0].Start)
+		s.Increment(bounds[1].Start)
+		require.False(t, passesMergeMinNGate(bounds, s),
+			"sum=2 must NOT pass gate=100")
+	})
+
+	t.Run("sketch sum at gate boundary passes", func(t *testing.T) {
+		prev := SetKWayMergeMinEntries(2)
+		defer SetKWayMergeMinEntries(prev)
+
+		s := NewIndexSketch(DefaultSketchSize)
+		s.Increment(bounds[0].Start)
+		s.Increment(bounds[1].Start)
+		require.True(t, passesMergeMinNGate(bounds, s),
+			"sum=2 must pass gate=2 (>=, not >)")
+	})
+
+	t.Run("sketch sum above gate passes", func(t *testing.T) {
+		prev := SetKWayMergeMinEntries(2)
+		defer SetKWayMergeMinEntries(prev)
+
+		s := NewIndexSketch(DefaultSketchSize)
+		for i := 0; i < 10; i++ {
+			s.Increment(bounds[0].Start)
+			s.Increment(bounds[1].Start)
+		}
+		require.True(t, passesMergeMinNGate(bounds, s))
+	})
+
+	t.Run("sketch sum zero (cold sketch) fails any positive gate", func(t *testing.T) {
+		prev := SetKWayMergeMinEntries(1)
+		defer SetKWayMergeMinEntries(prev)
+
+		s := NewIndexSketch(DefaultSketchSize)
+		// Never incremented → Estimate returns 0 for every value.
+		require.False(t, passesMergeMinNGate(bounds, s))
+	})
+
+	t.Run("gate of zero passes everything", func(t *testing.T) {
+		prev := SetKWayMergeMinEntries(0)
+		defer SetKWayMergeMinEntries(prev)
+
+		s := NewIndexSketch(DefaultSketchSize)
+		require.True(t, passesMergeMinNGate(bounds, s),
+			"gate=0: sum>=0 always true (kill switch for gate)")
+	})
+}
+
+// TestCanRunMergeStatic_GatesShape pins every shape that
+// canRunMergeStatic decides. Without this, a regression that flips a
+// gate condition (e.g., dropping the FieldNames==1 check) would not
+// surface as a unit-test failure because the gates are exercised only
+// indirectly through CountEntries / buildIndexSeekChain.
+func TestCanRunMergeStatic_GatesShape(t *testing.T) {
+	twoBounds := query.Bounds{
+		pointLookupBoundForValue("a"),
+		pointLookupBoundForValue("b"),
+	}
+	prev := SetKWayMergeMinEntries(0)
+	defer SetKWayMergeMinEntries(prev)
+
+	t.Run("happy path passes", func(t *testing.T) {
+		require.True(t, canRunMergeStatic(twoBounds, []string{"f"}, true, nil))
+	})
+	t.Run("non-PointLookup fails", func(t *testing.T) {
+		require.False(t, canRunMergeStatic(twoBounds, []string{"f"}, false, nil))
+	})
+	t.Run("compound (2 fields) fails", func(t *testing.T) {
+		require.False(t, canRunMergeStatic(twoBounds, []string{"f", "g"}, true, nil))
+	})
+	t.Run("k=1 fails (single bound)", func(t *testing.T) {
+		one := query.Bounds{pointLookupBoundForValue("a")}
+		require.False(t, canRunMergeStatic(one, []string{"f"}, true, nil))
+	})
+	t.Run("k > kMax fails", func(t *testing.T) {
+		prevMax := SetKWayMergeMax(1) // anything >= 2 fails
+		defer SetKWayMergeMax(prevMax)
+		require.False(t, canRunMergeStatic(twoBounds, []string{"f"}, true, nil))
+	})
+	t.Run("kMax=0 disables (kill switch)", func(t *testing.T) {
+		prevMax := SetKWayMergeMax(0)
+		defer SetKWayMergeMax(prevMax)
+		require.False(t, canRunMergeStatic(twoBounds, []string{"f"}, true, nil))
+	})
+}
