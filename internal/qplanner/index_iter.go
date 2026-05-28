@@ -3,12 +3,51 @@ package qplanner
 import (
 	"bytes"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/query"
 )
+
+// kWayMergeMax is the upper bound on len(Bounds) for the k-way merge path
+// (Task 5). Above this, the dedup walk runs with a pre-sized seen-set.
+// Default 64; can be overridden via SetKWayMergeMax (test/operator escape
+// hatch). Setting to 0 disables the merge entirely (forces all multi-bound
+// multi-key counts through the pre-sized seen-set path).
+//
+// Justification for 64: per-bound cursor setup is ~1 µs cold-page (Seek +
+// first page fault). At k=64 that is ~64 µs of fixed setup against a merge
+// body that processes ~50 ns/entry — so the merge wins only when the entry
+// walk would otherwise be >>64 µs (entries >> 1k). The kWayMergeMinEntries
+// gate covers the small-N case independently.
+var kWayMergeMax atomic.Int32
+
+// kWayMergeMinEntries is the minimum sum-of-sketch-estimates across bounds
+// for which the merge is preferred. Below this, cursor setup cost dominates
+// and the pre-sized seen-set is faster. Default 200. Sketch reads here are
+// a COST HINT, not answer-determining — a wrong estimate produces a
+// suboptimal plan choice, still-correct answer (see docs/known-issues.md
+// I-03).
+var kWayMergeMinEntries atomic.Int32
+
+func init() {
+	kWayMergeMax.Store(64)
+	kWayMergeMinEntries.Store(200)
+}
+
+// SetKWayMergeMax overrides the merge dispatch upper bound for testing or
+// production tuning. Pass 0 to disable the merge entirely. Returns the
+// previous value.
+func SetKWayMergeMax(n int) int {
+	return int(kWayMergeMax.Swap(int32(n)))
+}
+
+// SetKWayMergeMinEntries overrides the merge dispatch lower bound.
+func SetKWayMergeMinEntries(n int) int {
+	return int(kWayMergeMinEntries.Swap(int32(n)))
+}
 
 // IndexIter iterates over an index namespace using bounds.
 // key = indexFields + docId for both unique and non-unique indexes.
@@ -20,6 +59,23 @@ type IndexIter struct {
 	boundIdx int
 	Reverse  bool
 	started  bool
+
+	// Sketch is the per-index frequency sketch. When non-nil, the pre-sized
+	// seen-set fallback (countEntriesViaPreSizedSeenSet) and the merge
+	// dispatch (Task 5) use Sketch.Estimate as a COST/CAPACITY hint —
+	// sketch-stale-under or sketch-stale-over only affects allocation
+	// efficiency and path choice, never the answer. May be nil for
+	// freshly-created indexes; the fallback then runs a per-bound
+	// CountUntil pre-pass to derive the capacity. See docs/known-issues.md
+	// I-03 for the rule (sketch reads must never determine answers).
+	Sketch *IndexSketch
+
+	// PointLookup mirrors CBOIndex.PointLookup at iter-construction time.
+	// It is true iff every bound was an equality (Start==End) before
+	// AdjustBoundsForNonUnique appended 0xff to End in place. The post-
+	// adjustment Start != End, so this flag is the ONLY reliable
+	// PointLookup signal for IndexIter consumers.
+	PointLookup bool
 
 	// pendingCurrent is set by skipOffset after it positions the cursor
 	// directly on the first row to emit. When true, the next Next() call
@@ -300,11 +356,12 @@ func (it *IndexIter) CountEntries() (int, error) {
 	if it.cursor == nil {
 		it.cursor = it.Source.NewCursor()
 	}
-
 	if len(it.Bounds) <= 1 {
 		return it.countEntriesBatch()
 	}
-	return it.countEntriesWithDedup()
+	// Task 5 will insert the merge dispatch here. For now: always go to
+	// the pre-sized dedup walk so S2 (capacity hint) ships independently.
+	return it.countEntriesViaPreSizedSeenSet()
 }
 
 // countEntriesBatch is the original page-batch fast path, used for
@@ -360,7 +417,15 @@ func (it *IndexIter) countEntriesBatch() (int, error) {
 // pure-batch path), recovering most of the alpha.2 SimpleIndex/In speed
 // while preserving correctness for multi-key.
 func (it *IndexIter) countEntriesWithDedup() (int, error) {
-	var seen map[string]struct{}
+	return it.countEntriesWithDedupUsingSeen(nil) // nil → lazy alloc on first multi-key
+}
+
+// countEntriesWithDedupUsingSeen is countEntriesWithDedup parameterized
+// over the seen-set so callers can pre-size it. seen may be nil — the
+// inner loop allocates on the first multi-key entry, matching the
+// existing lazy-allocation behavior. Pass a non-nil pre-sized map to
+// avoid map-growth doublings on workloads where every entry is multi-key.
+func (it *IndexIter) countEntriesWithDedupUsingSeen(seen map[string]struct{}) (int, error) {
 	total := 0
 	stickyMulti := false // once any multi-key seen, never re-engage batch fast path
 
@@ -429,6 +494,61 @@ func (it *IndexIter) countEntriesWithDedup() (int, error) {
 		}
 	}
 	return total, nil
+}
+
+// countEntriesViaPreSizedSeenSet is the dedup walk with the seen-set
+// pre-allocated from Sketch.Estimate (S2). Identical correctness to
+// countEntriesWithDedup; differs only in allocation profile (one map
+// alloc up-front, no rehashing).
+func (it *IndexIter) countEntriesViaPreSizedSeenSet() (int, error) {
+	capHint := it.seenSetCapacityHint()
+	seen := make(map[string]struct{}, capHint)
+	return it.countEntriesWithDedupUsingSeen(seen)
+}
+
+// seenSetCapacityHint returns an upper-bound estimate of the seen-set's
+// eventual size. Prefers Sketch.Estimate (no extra I/O); falls back to a
+// per-bound cursor.CountUntil pre-pass when the sketch is unavailable.
+// A wrong estimate only affects allocation efficiency, never the answer
+// (see docs/known-issues.md I-03).
+func (it *IndexIter) seenSetCapacityHint() int {
+	if it.Sketch != nil {
+		var sum uint64
+		for i := range it.Bounds {
+			// Only Equality bounds contribute a reliable estimate. Range
+			// bounds aren't pinned to a single sketch bucket.
+			if it.PointLookup && len(it.Bounds[i].Start) > 0 {
+				sum += it.Sketch.Estimate(it.Bounds[i].Start)
+			}
+		}
+		if sum > 1<<24 { // 16M cap — defensive against sketch over-estimate
+			return 1 << 24
+		}
+		if sum > 0 {
+			return int(sum)
+		}
+		// Sketch returned 0 (cold sketch or all-stale-zero). Fall through
+		// to CountUntil pre-pass below; we MUST NOT short-circuit on the
+		// zero sum per I-03.
+	}
+	var sum int
+	for _, b := range it.Bounds {
+		if err := it.seekBoundStart(b); err != nil {
+			return 64 // best-effort hint; caller still walks
+		}
+		if !it.cursor.Valid() {
+			continue
+		}
+		n, err := it.cursor.CountUntil(b.End, b.EndInclude)
+		if err != nil {
+			return 64
+		}
+		sum += n
+	}
+	if sum < 64 {
+		sum = 64 // floor matching today's default cap
+	}
+	return sum
 }
 
 // seekBoundStart positions the cursor at the first entry of the given

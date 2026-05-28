@@ -1,6 +1,7 @@
 package qplanner
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -1123,4 +1124,103 @@ func TestIndexIter_SkipOffset_ZeroAndNegative(t *testing.T) {
 	// Cursor untouched: Next() still yields the single entry.
 	ids, _ := drainIndexDocIds(t, it)
 	assert.Equal(t, []string{"p1"}, ids)
+}
+
+// pointLookupBoundForValue mirrors the post-AdjustBoundsForNonUnique shape
+// for a single-field equality bound: Start = tuple(value),
+// End = tuple(value) + 0xff (to capture the docId suffix appended by
+// non-unique index keys). This matches how planner.go produces bounds for
+// $in over a non-unique index after AdjustBoundsForNonUnique runs.
+func pointLookupBoundForValue(v string) query.Bound {
+	start := anyenc.AppendAnyValue(nil, v)
+	end := append(append([]byte{}, start...), 0xff)
+	return query.Bound{Start: start, End: end, StartInclude: true, EndInclude: true}
+}
+
+// TestIndexIter_CountEntries_PreSizedSeenSet_NoSketch pins that the
+// CountUntil pre-pass produces a correctly-sized seen-set in the
+// no-sketch case. Uses a real btree fixture populated with multi-key
+// entries (value byte = IndexValueMultiKey) across multiple bounds for
+// the same docs, so dedup is forced and the seen-set actually grows.
+func TestIndexIter_CountEntries_PreSizedSeenSet_NoSketch(t *testing.T) {
+	// 1000 docs, each contributing entries on 3 tag values. k=3 → forces
+	// multi-bound path. Confirm distinct count = 1000 with capacity hint.
+	entries := make([]indexEntry, 0, 3000)
+	for i := 0; i < 1000; i++ {
+		for _, tag := range []string{"a", "b", "c"} {
+			entries = append(entries, indexEntry{
+				field: tag,
+				docId: fmt.Sprintf("d%04d", i),
+				value: IndexValueMultiKey,
+			})
+		}
+	}
+	db, ns := indexEntryBtree(t, entries)
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "tags", FieldNames: []string{"f"}},
+		Bounds: query.Bounds{
+			pointLookupBoundForValue("a"),
+			pointLookupBoundForValue("b"),
+			pointLookupBoundForValue("c"),
+		},
+		PointLookup: true,
+		// Sketch deliberately nil — exercises the CountUntil pre-pass.
+	}
+	defer it.Close()
+
+	n, err := it.CountEntries()
+	require.NoError(t, err)
+	require.Equal(t, 1000, n)
+}
+
+// TestIndexIter_CountEntries_PreSizedSeenSet_FlatAllocs pins the alloc
+// profile after pre-sizing: the map should not grow during the walk.
+// Compares against the unsized baseline (lazy 64-cap doublings to ~1024).
+func TestIndexIter_CountEntries_PreSizedSeenSet_FlatAllocs(t *testing.T) {
+	// 1000 docs × 3 entries per doc = 3000 entries. Without pre-sizing,
+	// the map grows from cap 64 through 8 doublings to reach 1000-element
+	// capacity (~8 map-growth allocs). With pre-sizing: 1 alloc.
+	entries := make([]indexEntry, 0, 3000)
+	for i := 0; i < 1000; i++ {
+		for _, tag := range []string{"a", "b", "c"} {
+			entries = append(entries, indexEntry{
+				field: tag,
+				docId: fmt.Sprintf("d%04d", i),
+				value: IndexValueMultiKey,
+			})
+		}
+	}
+	db, ns := indexEntryBtree(t, entries)
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	mkIter := func() *IndexIter {
+		return &IndexIter{
+			Source:  &CursorSource{Tx: rtx, Ns: ns},
+			IdxInfo: &IndexInfo{Name: "tags", FieldNames: []string{"f"}},
+			Bounds: query.Bounds{
+				pointLookupBoundForValue("a"),
+				pointLookupBoundForValue("b"),
+				pointLookupBoundForValue("c"),
+			},
+			PointLookup: true,
+		}
+	}
+
+	allocs := testing.AllocsPerRun(3, func() {
+		it := mkIter()
+		defer it.Close()
+		_, _ = it.CountEntries()
+	})
+	// Per-entry string(docId) alloc count = 3000 (untouched until merge).
+	// Map-growth alloc count: lazy unsized → ~8 doublings; pre-sized → ~1.
+	// Use a budget that exercises the win without being noise-sensitive.
+	require.Less(t, allocs, float64(3050),
+		"pre-sized map must save ~8 doublings vs unsized; got %.0f allocs", allocs)
 }
