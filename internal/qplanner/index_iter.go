@@ -380,10 +380,40 @@ func (it *IndexIter) CountEntries() (int, error) {
 		return it.countEntriesWithDedup()
 	}
 
-	// PointLookup + single-field. Peek the first entry of each bound: if
-	// all are scalar, the existing peek-then-batch path is fastest
-	// (CountUntil never visits the seen-set, so pre-allocating it is
-	// pure waste — would regress SimpleIndex/In).
+	// Two-phase dispatch for PointLookup + single-field. Phase 1 checks
+	// the no-I/O gates (k bound, min-N sketch sum) and routes before
+	// paying any cursor cost. Phase 2 (boundsAllScalar peek) only runs
+	// when phase 1 leaves the merge as a candidate.
+	//
+	// Why phase ordering matters: the boundsAllScalar peek costs 1+ Seek;
+	// for queries whose sketch sum is below the min-N gate (e.g., absent-
+	// value $in like array_index/InEmpty), the merge is not the right
+	// path anyway. Peeking before checking min-N adds an unnecessary Seek
+	// to those queries; checking min-N first recovers alpha.6 baseline
+	// behavior for low-N shapes.
+	kMax := int(kWayMergeMax.Load())
+	if kMax <= 0 || len(it.Bounds) > kMax {
+		// k > kMax — too many bounds for the merge primitive. The
+		// pre-sized seen-set (S2 capacity hint) is worth its setup cost
+		// here because the walk is unbounded.
+		return it.countEntriesViaPreSizedSeenSet()
+	}
+	if !passesMergeMinNGate(it.Bounds, it.Sketch) {
+		// Sketch sum below kWayMergeMinEntries: the merge's k cursor
+		// opens + heap setup don't amortize against this few entries,
+		// and pre-sizing the seen-set is similarly wasteful (the lazy
+		// growth of the alpha.6 countEntriesWithDedup is the cheapest
+		// path). Skipping boundsAllScalar here is what fixes the
+		// array_index/InEmpty regression: an absent-value $in (sketch
+		// sum == 0) goes straight to countEntriesWithDedup with no
+		// pre-pass and no over-eager peek.
+		return it.countEntriesWithDedup()
+	}
+
+	// Merge is a viable candidate. Now peek to confirm there is at least
+	// one multi-key bound — otherwise the existing peek-then-batch path
+	// in countEntriesWithDedup is faster (CountUntil never visits the
+	// seen-set; pre-allocating one would regress SimpleIndex/In).
 	scalarOnly, err := it.boundsAllScalar()
 	if err != nil {
 		return 0, err
@@ -391,15 +421,7 @@ func (it *IndexIter) CountEntries() (int, error) {
 	if scalarOnly {
 		return it.countEntriesWithDedup()
 	}
-
-	// Multi-key. Merge when canRunMergeStatic passes (k<=kMax AND min-N
-	// gate); otherwise the pre-sized seen-set walk (S2). The static gate
-	// here is the same one buildIndexSeekChain uses (planner.go) so Count
-	// and Iter agree on path selection.
-	if canRunMergeStatic(it.Bounds, it.IdxInfo.FieldNames, it.PointLookup, it.Sketch) {
-		return it.countEntriesViaMerge()
-	}
-	return it.countEntriesViaPreSizedSeenSet()
+	return it.countEntriesViaMerge()
 }
 
 // passesMergeMinNGate decides whether the k-way merge is preferable to the
