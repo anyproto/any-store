@@ -1530,3 +1530,40 @@ func TestCanRunMergeStatic_GatesShape(t *testing.T) {
 		require.False(t, canRunMergeStatic(twoBounds, []string{"f"}, true, nil))
 	})
 }
+
+// TestBoundsAllScalar_EndCheck pins SHOULD-FIX 2 from the correctness
+// review. boundsAllScalar must verify the cursor landed inside the
+// bound after Seek; otherwise an empty bound's Seek lands on the next
+// existing key (foreign value) and its value byte is read incorrectly.
+//
+// Setup: index with one entry per bound's intended value, except one
+// bound has no entry — that bound's Seek lands on the next existing
+// key. Pre-fix: the function returns false (because the foreign entry
+// happens to be multi-key in our setup), routing to the merge. Post-
+// fix: the empty bound is skipped, foreign value not read, and the
+// function returns true (all real bounds are scalar).
+func TestBoundsAllScalar_EndCheck(t *testing.T) {
+	// "a" -> scalar entry; "b" missing entirely; "z" -> multi-key entry
+	// that would be the next-key target if we Seek("b").
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "d1", value: IndexValueScalar},
+		{field: "z", docId: "d2", value: IndexValueMultiKey},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:      &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo:     &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Bounds:      query.Bounds{pointLookupBoundForValue("a"), pointLookupBoundForValue("b")},
+		PointLookup: true,
+	}
+	defer it.Close()
+	it.cursor = it.Source.NewCursor()
+
+	scalarOnly, err := it.boundsAllScalar()
+	require.NoError(t, err)
+	require.True(t, scalarOnly,
+		"empty bound 'b' must be skipped (not read 'z's multi-key value byte)")
+}

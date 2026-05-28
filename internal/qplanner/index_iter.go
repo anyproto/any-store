@@ -487,6 +487,16 @@ func canRunMergeStatic(bounds query.Bounds, fieldNames []string, pointLookup boo
 // Reuses it.cursor — leaves it positioned arbitrarily; callers must
 // re-seek before use.
 //
+// Empty bounds (Seek lands past the bound's End) are treated as
+// neutral and skipped. Without the end-check, the cursor would land
+// on whatever next key exists in the btree — possibly an unrelated
+// value with its own value byte — and we'd classify the bound based on
+// foreign data. This isn't a wrong-answer bug (every downstream path
+// re-checks the bound's End during its own walk), but it would cause
+// suboptimal path selection: a query with one empty bound + one scalar
+// bound could read MULTI-key from the unrelated entry and engage the
+// merge unnecessarily.
+//
 // Performance note: this is a k-Seek + k-Value-read peek. At cold-cache
 // k=64 it can take ~50 µs which dominates the merge it gates. A future
 // optimization (Task 8) caches HasMultiKey on IndexSketch to short-
@@ -498,6 +508,20 @@ func (it *IndexIter) boundsAllScalar() (bool, error) {
 		}
 		if !it.cursor.Valid() {
 			continue
+		}
+		// Verify the cursor landed inside the bound. Seek positions the
+		// cursor at the smallest key >= Start; if no such key exists
+		// within (Start, End], the cursor is on an out-of-bound key for
+		// the next existing value.
+		if len(b.End) > 0 {
+			k, kerr := it.cursor.Key()
+			if kerr != nil {
+				return false, kerr
+			}
+			cmp := bytes.Compare(k, b.End)
+			if cmp > 0 || (cmp == 0 && !b.EndInclude) {
+				continue // empty bound — read no value byte
+			}
 		}
 		val, err := it.cursor.Value()
 		if err != nil {
