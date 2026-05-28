@@ -1224,3 +1224,198 @@ func TestIndexIter_CountEntries_PreSizedSeenSet_FlatAllocs(t *testing.T) {
 	require.Less(t, allocs, float64(3050),
 		"pre-sized map must save ~8 doublings vs unsized; got %.0f allocs", allocs)
 }
+
+func TestIndexIter_CountEntries_RoutesViaMerge(t *testing.T) {
+	EnablePerfCounters(true)
+	defer EnablePerfCounters(false)
+	ResetPerfCounters()
+
+	// 3 docs, each with two tags overlapping across bounds.
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "d1", value: IndexValueMultiKey},
+		{field: "b", docId: "d1", value: IndexValueMultiKey},
+		{field: "b", docId: "d2", value: IndexValueMultiKey},
+		{field: "c", docId: "d2", value: IndexValueMultiKey},
+		{field: "a", docId: "d3", value: IndexValueMultiKey},
+		{field: "c", docId: "d3", value: IndexValueMultiKey},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:      &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo:     &IndexInfo{Name: "tags", FieldNames: []string{"f"}},
+		Bounds:      query.Bounds{boundForValue("a"), boundForValue("b")},
+		PointLookup: true,
+	}
+	defer it.Close()
+
+	n, err := it.CountEntries()
+	require.NoError(t, err)
+	require.Equal(t, 3, n) // d1, d2, d3
+	require.Equal(t, uint64(1), SnapshotPerfCounters().MergeDispatched,
+		"must have routed through the merge")
+}
+
+func TestIndexIter_CountEntries_FallsBackWhenKExceedsMax(t *testing.T) {
+	EnablePerfCounters(true)
+	defer EnablePerfCounters(false)
+	ResetPerfCounters()
+
+	// 65 bounds > kWayMergeMax=64. Must use the pre-sized seen-set path.
+	var entries []indexEntry
+	for i := 0; i < 65; i++ {
+		entries = append(entries, indexEntry{
+			field: fmt.Sprintf("t%02d", i),
+			docId: fmt.Sprintf("d%02d", i),
+			value: IndexValueMultiKey,
+		})
+	}
+	db, ns := indexEntryBtree(t, entries)
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bounds := make(query.Bounds, 65)
+	for i := range bounds {
+		bounds[i] = boundForValue(fmt.Sprintf("t%02d", i))
+	}
+	it := &IndexIter{
+		Source:      &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo:     &IndexInfo{Name: "tags", FieldNames: []string{"f"}},
+		Bounds:      bounds,
+		PointLookup: true,
+	}
+	defer it.Close()
+
+	n, err := it.CountEntries()
+	require.NoError(t, err)
+	require.Equal(t, 65, n)
+	require.Equal(t, uint64(0), SnapshotPerfCounters().MergeDispatched,
+		"k > kWayMergeMax must skip the merge")
+}
+
+func TestIndexIter_CountEntries_FallsBackForCompoundIndex(t *testing.T) {
+	EnablePerfCounters(true)
+	defer EnablePerfCounters(false)
+	ResetPerfCounters()
+
+	// Compound (a, b) index → FieldNames has 2 elements; merge MUST NOT
+	// engage.
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a1", docId: "d1", value: IndexValueMultiKey},
+		{field: "a2", docId: "d2", value: IndexValueMultiKey},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:      &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo:     &IndexInfo{Name: "ab", FieldNames: []string{"a", "b"}}, // compound
+		Bounds:      query.Bounds{boundForValue("a1"), boundForValue("a2")},
+		PointLookup: true,
+	}
+	defer it.Close()
+	_, err = it.CountEntries()
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), SnapshotPerfCounters().MergeDispatched,
+		"compound index must skip the merge")
+}
+
+func TestIndexIter_CountEntries_FallsBackForAllScalar(t *testing.T) {
+	EnablePerfCounters(true)
+	defer EnablePerfCounters(false)
+	ResetPerfCounters()
+
+	// All-scalar entries — the existing peek-then-batch in
+	// countEntriesWithDedup is faster; merge MUST NOT engage.
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "d1", value: IndexValueScalar},
+		{field: "b", docId: "d2", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:      &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo:     &IndexInfo{Name: "f", FieldNames: []string{"f"}},
+		Bounds:      query.Bounds{boundForValue("a"), boundForValue("b")},
+		PointLookup: true,
+	}
+	defer it.Close()
+	_, err = it.CountEntries()
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), SnapshotPerfCounters().MergeDispatched,
+		"all-scalar bounds must skip the merge")
+}
+
+// TestIndexIter_CountEntries_KillSwitch pins that SetKWayMergeMax(0)
+// forces all multi-bound multi-key counts through the pre-sized
+// seen-set path — the runtime escape hatch.
+func TestIndexIter_CountEntries_KillSwitch(t *testing.T) {
+	EnablePerfCounters(true)
+	defer EnablePerfCounters(false)
+	ResetPerfCounters()
+
+	prev := SetKWayMergeMax(0)
+	defer SetKWayMergeMax(prev)
+
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "d1", value: IndexValueMultiKey},
+		{field: "b", docId: "d2", value: IndexValueMultiKey},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:      &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo:     &IndexInfo{Name: "tags", FieldNames: []string{"f"}},
+		Bounds:      query.Bounds{boundForValue("a"), boundForValue("b")},
+		PointLookup: true,
+	}
+	defer it.Close()
+	_, err = it.CountEntries()
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), SnapshotPerfCounters().MergeDispatched,
+		"kill switch must skip the merge")
+}
+
+// TestIndexIter_CountEntries_MergeAllocsBudget caps allocs to ~150 at
+// k=3 with substantial entries — the headline alloc-reduction claim.
+func TestIndexIter_CountEntries_MergeAllocsBudget(t *testing.T) {
+	// 200 docs × 3 entries (= 600 entries through the merge).
+	var entries []indexEntry
+	for i := 0; i < 200; i++ {
+		id := fmt.Sprintf("d%03d", i)
+		for _, tag := range []string{"a", "b", "c"} {
+			entries = append(entries, indexEntry{
+				field: tag, docId: id, value: IndexValueMultiKey,
+			})
+		}
+	}
+	db, ns := indexEntryBtree(t, entries)
+
+	allocs := testing.AllocsPerRun(5, func() {
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+
+		it := &IndexIter{
+			Source:      &CursorSource{Tx: rtx, Ns: ns},
+			IdxInfo:     &IndexInfo{Name: "tags", FieldNames: []string{"f"}},
+			Bounds:      query.Bounds{boundForValue("a"), boundForValue("b"), boundForValue("c")},
+			PointLookup: true,
+		}
+		defer it.Close()
+		_, _ = it.CountEntries()
+	})
+	// Budget: tx open + 3 cursor allocs + heap + two-buffer + counter.
+	// The seen-set walk for the same shape allocs ~600 docId strings +
+	// 8 map doublings ≈ ~608. The merge should land 6× under that.
+	require.Less(t, allocs, float64(150),
+		"merge must hit the alloc target; got %.0f", allocs)
+}

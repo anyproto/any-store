@@ -359,9 +359,141 @@ func (it *IndexIter) CountEntries() (int, error) {
 	if len(it.Bounds) <= 1 {
 		return it.countEntriesBatch()
 	}
-	// Task 5 will insert the merge dispatch here. For now: always go to
-	// the pre-sized dedup walk so S2 (capacity hint) ships independently.
+
+	// Shapes that can't ride the merge (compound multi-key, non-PointLookup,
+	// range bounds) keep the existing lazy-alloc countEntriesWithDedup. The
+	// pre-sized seen-set is only worth it for the PointLookup multi-key
+	// case where every entry needs dedup; for compound/range, the seen-set
+	// fills opportunistically and pre-sizing from sketch is unsound (range
+	// bounds aren't pinned to a single sketch bucket).
+	if !it.PointLookup || len(it.IdxInfo.FieldNames) != 1 {
+		return it.countEntriesWithDedup()
+	}
+
+	// PointLookup + single-field. Peek the first entry of each bound: if
+	// all are scalar, the existing peek-then-batch path is fastest
+	// (CountUntil never visits the seen-set, so pre-allocating it is
+	// pure waste — would regress SimpleIndex/In).
+	scalarOnly, err := it.boundsAllScalar()
+	if err != nil {
+		return 0, err
+	}
+	if scalarOnly {
+		return it.countEntriesWithDedup()
+	}
+
+	// Multi-key. Merge when within k bounds AND the min-N cost-hint gate
+	// passes; otherwise the pre-sized seen-set walk (S2) — sketch reads
+	// here are a COST/CAPACITY hint, never answer-determining
+	// (docs/known-issues.md I-03).
+	kMax := int(kWayMergeMax.Load())
+	if kMax > 0 && len(it.Bounds) <= kMax && it.passesMergeMinNGate() {
+		return it.countEntriesViaMerge()
+	}
 	return it.countEntriesViaPreSizedSeenSet()
+}
+
+// passesMergeMinNGate decides whether the k-way merge is preferable to the
+// pre-sized seen-set walk based on the sum of sketch estimates across
+// bounds. Sketch reads here are a COST HINT only — a stale sketch produces
+// a suboptimal path choice, still-correct answer (see docs/known-issues.md
+// I-03).
+//
+// When the sketch is nil, return true: there is no cheap estimate, so
+// committing to the merge avoids the CountUntil pre-pass that
+// seenSetCapacityHint would otherwise run.
+func (it *IndexIter) passesMergeMinNGate() bool {
+	if it.Sketch == nil {
+		return true
+	}
+	var sum uint64
+	for i := range it.Bounds {
+		sum += it.Sketch.Estimate(it.Bounds[i].Start)
+	}
+	return sum >= uint64(kWayMergeMinEntries.Load())
+}
+
+// boundsAllScalar returns true if every bound's first entry has the
+// IndexValueScalar value byte (i.e. confirmed not multi-key). Legacy
+// nil-value entries return false (treat conservatively as multi-key).
+// Reuses it.cursor — leaves it positioned arbitrarily; callers must
+// re-seek before use.
+//
+// Performance note: this is a k-Seek + k-Value-read peek. At cold-cache
+// k=64 it can take ~50 µs which dominates the merge it gates. A future
+// optimization (Task 8) caches HasMultiKey on IndexSketch to short-
+// circuit this peek.
+func (it *IndexIter) boundsAllScalar() (bool, error) {
+	for _, b := range it.Bounds {
+		if err := it.seekBoundStart(b); err != nil {
+			return false, err
+		}
+		if !it.cursor.Valid() {
+			continue
+		}
+		val, err := it.cursor.Value()
+		if err != nil {
+			return false, err
+		}
+		if EntryValueIsMultiKey(val) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// countEntriesViaMerge runs the k-way docId-merge and counts emissions.
+// Each bound gets a fresh cursor (the merge consumes them); the original
+// it.cursor is reused for bound 0 to avoid one allocation.
+func (it *IndexIter) countEntriesViaMerge() (int, error) {
+	cursors := make([]*btree.Cursor, 0, len(it.Bounds))
+	closeOnErr := func() {
+		for _, c := range cursors {
+			if c != nil {
+				c.Close()
+			}
+		}
+	}
+	for i, b := range it.Bounds {
+		var c *btree.Cursor
+		if i == 0 {
+			c = it.cursor
+			it.cursor = nil // ownership transferred to merge
+		} else {
+			c = it.Source.NewCursor()
+		}
+		cursors = append(cursors, c)
+		if err := c.Seek(b.Start); err != nil {
+			closeOnErr()
+			return 0, err
+		}
+		if c.Valid() && !b.StartInclude {
+			k, kerr := c.Key()
+			if kerr != nil {
+				closeOnErr()
+				return 0, kerr
+			}
+			if bytes.Equal(k, b.Start) {
+				if err := c.Next(); err != nil {
+					closeOnErr()
+					return 0, err
+				}
+			}
+		}
+	}
+	m := newKWayDocIdMergeIter(cursors, it.Bounds, len(it.IdxInfo.FieldNames))
+	defer m.Close()
+	count := 0
+	for {
+		_, ok, err := m.Next()
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			return count, nil
+		}
+		count++
+	}
 }
 
 // countEntriesBatch is the original page-batch fast path, used for
