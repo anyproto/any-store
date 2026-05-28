@@ -464,6 +464,7 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 		// to layer another dedup on top.
 		if ci, ok := plan.Root.(qplanner.CountableIterator); ok {
 			n, cerr := ci.CountEntries()
+			plan.Close() // release cursor resources held by CountEntries
 			if cerr != nil {
 				return cerr
 			}
