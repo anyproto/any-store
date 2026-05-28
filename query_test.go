@@ -820,3 +820,75 @@ func TestQuery_Unsatisfiable_AllOpsConsistent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 200, count)
 }
+
+func TestQueryIter_MultiBoundMultiKey_GloballyDocIdSorted(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "iter_merge_order")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "tags",
+		Fields: []string{"tags"},
+	}))
+	docs := []string{
+		`{"id":"d1","tags":["a","b"]}`,
+		`{"id":"d2","tags":["b","c"]}`,
+		`{"id":"d3","tags":["a","c"]}`,
+		`{"id":"d4","tags":["d"]}`,
+		`{"id":"d5","tags":["a","d"]}`,
+		`{"id":"d6","tags":["b","d"]}`,
+	}
+	for _, j := range docs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(j)))
+	}
+	it, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Iter(ctx)
+	require.NoError(t, err)
+	defer it.Close()
+	var ids []string
+	for it.Next() {
+		d, err := it.Doc()
+		require.NoError(t, err)
+		ids = append(ids, string(d.Value().GetStringBytes("id")))
+	}
+	require.NoError(t, it.Err())
+	// The merge emits docIds in bytes.Compare order — "d1" < "d2" < ...
+	// d4 doesn't match (only "d" tag). d5 matches via "a"; d6 via "b".
+	require.Equal(t, []string{"d1", "d2", "d3", "d5", "d6"}, ids,
+		"merge must emit docIds in ascending byte order")
+}
+
+func TestQueryUpdateMany_MultiBoundMultiKey_NoDoubleApply(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "update_merge_dedup")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "tags",
+		Fields: []string{"tags"},
+	}))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+		`{"id":"d1","tags":["a","b","c"],"v":0}`)))
+	// $in matches all three of this doc's tags. Without dedup the
+	// modifier would apply 3 times.
+	res, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Update(ctx, `{"$inc":{"v":1}}`)
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Modified, "modifier must apply exactly once per doc")
+	d, err := coll.FindId(ctx, "d1")
+	require.NoError(t, err)
+	require.Equal(t, float64(1), d.Value().GetFloat64("v"), "v incremented exactly once")
+}
+
+func TestQueryDeleteMany_MultiBoundMultiKey_NoDoubleDelete(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "delete_merge_dedup")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "tags",
+		Fields: []string{"tags"},
+	}))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+		`{"id":"d1","tags":["a","b","c"]}`)))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+		`{"id":"d2","tags":["a"]}`)))
+	res, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Delete(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 2, res.Modified, "exactly 2 deletes — d1 (3-overlap) + d2 (1-overlap)")
+}

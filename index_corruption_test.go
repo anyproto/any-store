@@ -2040,18 +2040,21 @@ func TestAudit14_LegacyNilValue_RebuildNormalizes(t *testing.T) {
 	assert.Equal(t, 1, n)
 }
 
-// --- Subtest 6: planner routes via SeenSet/DocDedup on legacy index ---
+// --- Subtest 6: planner routes via merge on legacy index ---
 
-// TestAudit14_LegacyNilValue_PlannerRoutesViaSeenSet pins the end-to-end
+// TestAudit14_LegacyNilValue_PlannerRoutesViaMerge pins the end-to-end
 // behavior: when the index is fully legacy (nil values), a multi-bound
 // $in query with OVERLAPPING bounds against the same doc must still
 // produce the correct distinct-doc count via Count AND yield each doc
 // exactly once via Iter.
 //
-// The mechanism: every legacy entry decodes as multi-key (true), so
-// DocDedup at the consumer side collapses repeated docIds across
-// bounds. Without that — if EntryValueIsMultiKey reported false on
-// nil — both Count and Iter would over-count.
+// The mechanism (post k-way merge — docs/plans/2026-05-28-array-index-
+// multi-bound-in-merge.md): the merge is type-byte-agnostic — it dedups
+// by docId regardless of whether each entry was written with the bit-set
+// value, scalar value, or legacy nil value. The previous DocDedup-via-
+// value-byte route still works for shapes the merge doesn't cover (e.g.
+// compound multi-key indexes); this test specifically pins the merge
+// route for the k=2 single-field PointLookup case.
 //
 // Setup: insert d1 WITH tags = [a,b,c] (so the data namespace has a
 // real, filter-matching doc). Then overwrite EVERY bit-set entry in
@@ -2059,9 +2062,20 @@ func TestAudit14_LegacyNilValue_RebuildNormalizes(t *testing.T) {
 // the old code but whose data was somehow up to date — i.e. a fully
 // pre-upgrade index that hasn't yet been touched (no inserts/updates
 // migrate it; no EnsureIndex rebuild).
-func TestAudit14_LegacyNilValue_PlannerRoutesViaSeenSet(t *testing.T) {
+func TestAudit14_LegacyNilValue_PlannerRoutesViaMerge(t *testing.T) {
+	qplanner.EnablePerfCounters(true)
+	defer qplanner.EnablePerfCounters(false)
+	qplanner.ResetPerfCounters()
+	// Override the min-N cost gate so a single-doc test deterministically
+	// takes the merge route. The gate normally diverts tiny queries to
+	// the pre-sized seen-set walk (cursor setup cost dominates for k×n
+	// entries below the gate); we want to specifically pin the merge's
+	// handling of legacy nil entries here.
+	prevMin := qplanner.SetKWayMergeMinEntries(0)
+	defer qplanner.SetKWayMergeMinEntries(prevMin)
+
 	fx := newFixture(t)
-	coll, err := fx.CreateCollection(ctx, "audit14_seenset")
+	coll, err := fx.CreateCollection(ctx, "audit14_merge")
 	require.NoError(t, err)
 	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
 		Name:   "tags",
@@ -2079,14 +2093,14 @@ func TestAudit14_LegacyNilValue_PlannerRoutesViaSeenSet(t *testing.T) {
 	// Now overwrite EVERY entry's value with nil to simulate a fully
 	// pre-upgrade index. The keys stay the same (so they still point at
 	// d1 correctly); only the value byte changes from 0x01 → empty.
-	pre := readRawIndexEntries(t, fx.DB, "audit14_seenset", "tags")
+	pre := readRawIndexEntries(t, fx.DB, "audit14_merge", "tags")
 	require.NotEmpty(t, pre, "public-API insert must produce some entries")
 	for _, e := range pre {
 		injectRawIndexEntry(t, c, idx, e.Key, nil)
 	}
 
 	// Verify all entries are now legacy (nil values).
-	post := readRawIndexEntries(t, fx.DB, "audit14_seenset", "tags")
+	post := readRawIndexEntries(t, fx.DB, "audit14_merge", "tags")
 	require.Equal(t, len(pre), len(post),
 		"overwrite must keep entry count constant (same keys, different values)")
 	for i, e := range post {
@@ -2095,20 +2109,27 @@ func TestAudit14_LegacyNilValue_PlannerRoutesViaSeenSet(t *testing.T) {
 			i, e.Value)
 	}
 
-	// Count must dedup → 1. Without dedup (if nil decoded as scalar
-	// false) the count loop would tally each matching bound separately
-	// and report >1.
+	// Count must dedup → 1. The merge dedups by docId regardless of the
+	// per-entry value byte, so legacy nil entries are handled correctly.
 	n, err := coll.Find(`{"tags":{"$in":["a","b"]}}`).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 1, n,
 		"distinct-doc Count over fully-legacy index with overlapping $in "+
-			"bounds must be 1 (got %d) — legacy path must route via DocDedup", n)
+			"bounds must be 1 (got %d) — merge must handle legacy nil entries", n)
 
 	// Iter must yield d1 exactly once (in any order). Same dedup logic,
-	// different code path (planIterator.Next + DocDedup vs. Count's loop).
+	// different code path (mergeIterAdapter → FetchIter vs. Count's
+	// IndexIter.CountEntries → countEntriesViaMerge).
 	ids := collectField(t, coll.Find(`{"tags":{"$in":["a","b"]}}`), "id")
 	sort.Strings(ids)
 	assert.Equal(t, []string{`"d1"`}, ids,
 		"Iter over fully-legacy index with overlapping $in bounds must yield "+
 			"d1 exactly once (got %v)", ids)
+
+	snap := qplanner.SnapshotPerfCounters()
+	// Count + Iter = 2 merge dispatches. Pin that the merge route fired
+	// at least once (Iter via mergeIterAdapter; Count via
+	// IndexIter.countEntriesViaMerge — both bump the counter).
+	assert.GreaterOrEqual(t, snap.MergeDispatched, uint64(1),
+		"merge route must have fired for the k=2 multi-key $in shape")
 }
