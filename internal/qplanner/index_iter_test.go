@@ -1567,3 +1567,102 @@ func TestBoundsAllScalar_EndCheck(t *testing.T) {
 	require.True(t, scalarOnly,
 		"empty bound 'b' must be skipped (not read 'z's multi-key value byte)")
 }
+
+// TestMergeIterAdapter_Sticky_AfterInitFailure confirms the post-fix
+// behavior: once lazyInit has failed, subsequent Next calls return a
+// clean (nil, nil, false, nil) terminal rather than re-running the
+// init and re-tryingthe failing operation. Closes H2 from the test-
+// coverage audit (Iter-layer error handling).
+//
+// We simulate the failure by setting initFailed directly. Reproducing
+// a real Seek error end-to-end requires injecting a faulty CursorSource
+// which would require expanding the interface; this test exercises the
+// state-machine guarantee in isolation.
+func TestMergeIterAdapter_Sticky_AfterInitFailure(t *testing.T) {
+	a := &mergeIterAdapter{
+		bounds:     query.Bounds{boundForValue("a")},
+		fieldCount: 1,
+		initFailed: true, // simulate prior lazyInit failure
+	}
+	for i := 0; i < 3; i++ {
+		key, docId, mk, err := a.Next()
+		require.NoError(t, err, "post-failure Next must terminate cleanly, not retry init")
+		require.Nil(t, key)
+		require.Nil(t, docId)
+		require.False(t, mk)
+	}
+}
+
+// TestIndexIter_CountEntries_K2_Boundary pins k=2 — the minimum k where
+// the merge engages. The existing dispatch tests exercise k=3 and k=65
+// but not k=2 specifically. Closes part of H4.
+func TestIndexIter_CountEntries_K2_Boundary(t *testing.T) {
+	EnablePerfCounters(true)
+	defer EnablePerfCounters(false)
+	prev := SetKWayMergeMinEntries(0)
+	defer SetKWayMergeMinEntries(prev)
+	ResetPerfCounters()
+
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "d1", value: IndexValueMultiKey},
+		{field: "b", docId: "d1", value: IndexValueMultiKey},
+		{field: "b", docId: "d2", value: IndexValueMultiKey},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:      &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo:     &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Bounds:      query.Bounds{boundForValue("a"), boundForValue("b")},
+		PointLookup: true,
+	}
+	defer it.Close()
+	n, err := it.CountEntries()
+	require.NoError(t, err)
+	require.Equal(t, 2, n, "k=2 must dedup correctly via merge")
+	require.Equal(t, uint64(1), SnapshotPerfCounters().MergeDispatches,
+		"k=2 multi-key must route via merge")
+}
+
+// TestIndexIter_CountEntries_KAtKMaxBoundary pins k = kWayMergeMax (the
+// inclusive upper edge). The existing test only covers k=65 (above
+// kMax). Closes part of H4.
+func TestIndexIter_CountEntries_KAtKMaxBoundary(t *testing.T) {
+	EnablePerfCounters(true)
+	defer EnablePerfCounters(false)
+	prev := SetKWayMergeMinEntries(0)
+	defer SetKWayMergeMinEntries(prev)
+	ResetPerfCounters()
+
+	k := int(kWayMergeMax.Load()) // 64 by default
+	var entries []indexEntry
+	bounds := make(query.Bounds, 0, k)
+	for i := 0; i < k; i++ {
+		field := fmt.Sprintf("t%02d", i)
+		entries = append(entries, indexEntry{
+			field: field,
+			docId: fmt.Sprintf("d%02d", i),
+			value: IndexValueMultiKey,
+		})
+		bounds = append(bounds, boundForValue(field))
+	}
+	db, ns := indexEntryBtree(t, entries)
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:      &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo:     &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Bounds:      bounds,
+		PointLookup: true,
+	}
+	defer it.Close()
+	n, err := it.CountEntries()
+	require.NoError(t, err)
+	require.Equal(t, k, n, "k = kMax must include the boundary")
+	require.Equal(t, uint64(1), SnapshotPerfCounters().MergeDispatches,
+		"k = kMax must engage the merge (inclusive upper bound)")
+}
