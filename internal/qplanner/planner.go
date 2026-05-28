@@ -876,24 +876,39 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	//   - !needSort (the merge emits in docId order, not bound-order)
 	//   - !needFilter (the chain would otherwise need a FilterIter wrap;
 	//     keep the simple gate and fall through)
-	//   - idx.PointLookup (the merge assumes equality bounds)
 	//   - !params.CountOnly (CountOnly path is the IndexIter CountableIterator
 	//     shortcut, which dispatches the merge internally — Task 5)
-	//   - 2 ≤ k ≤ kWayMergeMax
-	//   - single-field index
+	//   - canRunMergeStatic: PointLookup, single-field, 2 ≤ k ≤ kMax,
+	//     min-N gate passes (sketch sum ≥ kWayMergeMinEntries or sketch
+	//     nil). Same helper IndexIter.CountEntries uses — keeps Count and
+	//     Iter aligned.
 	//
-	// The dispatch is otherwise the same as IndexIter.CountEntries:
-	// boundsAllScalar / min-N gates are decided inside the adapter's
-	// lazyInit, so the predicate here mirrors the static structure only.
-	kMax := int(kWayMergeMax.Load())
+	// PRACTICAL REACHABILITY: needFilter is computed once at BuildPlan
+	// (planner.go:222) as `params.Filter != nil && !isAllFilter(filter)`.
+	// Any $in/$or/range query produces a non-nil non-All filter, so
+	// needFilter == true for every query that could produce ≥ 2 bounds.
+	// Net effect: this Iter-side useMerge predicate is effectively
+	// unreachable in production today. The merge does its headline work
+	// via IndexIter.CountEntries (the CountableIterator shortcut) on
+	// Count queries; Iter/UpdateMany/DeleteMany fall back to the
+	// IndexIter + CanonicalKeyDedupIter + FetchIter chain. Activating
+	// the Iter merge path would require either (a) a precise filter-vs-
+	// bounds coverage check that lets needFilter be false when bounds
+	// fully absorb the filter — entangled with the indexCoversFilter
+	// false-positive (see docs/known-issues.md I-04), or (b) accepting
+	// a FilterIter wrap above the merge for residual-predicate cases.
+	// Tracked separately; not in scope for this branch.
+	//
+	// Residual gap (if Iter merge ever becomes reachable): boundsAllScalar
+	// — the cursor peek used by Count to route all-scalar shapes to
+	// countEntriesWithDedup — is NOT applied here because it would
+	// require opening k cursors at plan-build time. The per-index
+	// IndexSketch.HasMultiKey flag (Task 8, deferred) would let the
+	// predicate divert all-scalar at zero cost.
 	useMerge := !needSort &&
 		!needFilter &&
-		idx.PointLookup &&
 		!params.CountOnly &&
-		len(idx.Bounds) >= 2 &&
-		kMax > 0 &&
-		len(idx.Bounds) <= kMax &&
-		len(idx.Info.FieldNames) == 1
+		canRunMergeStatic(idx.Bounds, idx.Info.FieldNames, idx.PointLookup, idx.Sketch)
 
 	if useMerge {
 		b := &seekBatch{}

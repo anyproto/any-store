@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/qplanner"
 	"github.com/anyproto/any-store/v2/query"
 )
 
@@ -941,4 +942,58 @@ func TestQuery_KnownIssueI04_AndConjunctionLostInCount(t *testing.T) {
 	n2, err := coll.Find(`{"a":{"$in":[1,2],"$gte":5}}`).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 0, n2, "inline {$in,$gte} also broken — I-04")
+}
+
+// TestQueryCount_MergeRoute_MinNGate_Respected pins that the Count path
+// respects the min-N sketch-sum gate. Before the dispatch centralization,
+// the same gate lived in IndexIter.passesMergeMinNGate but was duplicated
+// in planner.go's useMerge predicate. After centralization both call the
+// shared canRunMergeStatic helper. This test pins both sides of the gate.
+//
+// Note: this exercises the Count path because that is where the merge
+// actually fires in production. The Iter merge path (planner.go's
+// useMerge) is effectively unreachable today — needFilter is true for
+// any $in query, gating useMerge off. See the long comment on `useMerge`
+// in buildIndexSeekChain.
+func TestQueryCount_MergeRoute_MinNGate_Respected(t *testing.T) {
+	qplanner.EnablePerfCounters(true)
+	defer qplanner.EnablePerfCounters(false)
+
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "count_minn_gate")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "tags",
+		Fields: []string{"tags"},
+	}))
+	// 3 docs, multi-key tags. With the default min-N gate (200), sketch
+	// sum ≈ 6 << 200 → Count must divert to the pre-sized seen-set path.
+	for _, j := range []string{
+		`{"id":"d1","tags":["a","b"]}`,
+		`{"id":"d2","tags":["b","c"]}`,
+		`{"id":"d3","tags":["a","c"]}`,
+	} {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(j)))
+	}
+
+	t.Run("low-N below gate diverts merge", func(t *testing.T) {
+		qplanner.ResetPerfCounters()
+		n, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 3, n, "Count must return all 3 distinct docs")
+		assert.Equal(t, uint64(0), qplanner.SnapshotPerfCounters().MergeDispatched,
+			"sketch sum << min-N gate must divert from merge to seen-set")
+	})
+
+	t.Run("lowered gate engages merge", func(t *testing.T) {
+		prev := qplanner.SetKWayMergeMinEntries(1)
+		defer qplanner.SetKWayMergeMinEntries(prev)
+		qplanner.ResetPerfCounters()
+
+		n, err := coll.Find(`{"tags":{"$in":["a","b","c"]}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 3, n)
+		assert.GreaterOrEqual(t, qplanner.SnapshotPerfCounters().MergeDispatched, uint64(1),
+			"lowered gate must route Count via merge")
+	})
 }

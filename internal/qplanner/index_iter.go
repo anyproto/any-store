@@ -382,12 +382,11 @@ func (it *IndexIter) CountEntries() (int, error) {
 		return it.countEntriesWithDedup()
 	}
 
-	// Multi-key. Merge when within k bounds AND the min-N cost-hint gate
-	// passes; otherwise the pre-sized seen-set walk (S2) — sketch reads
-	// here are a COST/CAPACITY hint, never answer-determining
-	// (docs/known-issues.md I-03).
-	kMax := int(kWayMergeMax.Load())
-	if kMax > 0 && len(it.Bounds) <= kMax && it.passesMergeMinNGate() {
+	// Multi-key. Merge when canRunMergeStatic passes (k<=kMax AND min-N
+	// gate); otherwise the pre-sized seen-set walk (S2). The static gate
+	// here is the same one buildIndexSeekChain uses (planner.go) so Count
+	// and Iter agree on path selection.
+	if canRunMergeStatic(it.Bounds, it.IdxInfo.FieldNames, it.PointLookup, it.Sketch) {
 		return it.countEntriesViaMerge()
 	}
 	return it.countEntriesViaPreSizedSeenSet()
@@ -403,14 +402,42 @@ func (it *IndexIter) CountEntries() (int, error) {
 // committing to the merge avoids the CountUntil pre-pass that
 // seenSetCapacityHint would otherwise run.
 func (it *IndexIter) passesMergeMinNGate() bool {
-	if it.Sketch == nil {
+	return passesMergeMinNGate(it.Bounds, it.Sketch)
+}
+
+// passesMergeMinNGate is the bounds+sketch-only variant used by both
+// IndexIter.CountEntries and buildIndexSeekChain to keep their dispatch
+// decisions in sync. See IndexIter.passesMergeMinNGate for semantics.
+func passesMergeMinNGate(bounds query.Bounds, sketch *IndexSketch) bool {
+	if sketch == nil {
 		return true
 	}
 	var sum uint64
-	for i := range it.Bounds {
-		sum += it.Sketch.Estimate(it.Bounds[i].Start)
+	for i := range bounds {
+		sum += sketch.Estimate(bounds[i].Start)
 	}
 	return sum >= uint64(kWayMergeMinEntries.Load())
+}
+
+// canRunMergeStatic evaluates the static portion of the merge-dispatch
+// gate — everything decidable without opening a cursor. Returns true iff
+// PointLookup and single-field hold, the bound count is in [2, kMax], and
+// the min-N sketch sum gate passes (sketch nil counts as "passes").
+//
+// The boundsAllScalar peek is NOT included here: it requires opening
+// cursors and is therefore only practical inside CountEntries (which
+// already has a working cursor) or deferred to first-Next on the Iter
+// path. Today the Iter path ignores it — see the comment on the
+// `useMerge` predicate in planner.go for the residual cost.
+func canRunMergeStatic(bounds query.Bounds, fieldNames []string, pointLookup bool, sketch *IndexSketch) bool {
+	if !pointLookup || len(fieldNames) != 1 || len(bounds) < 2 {
+		return false
+	}
+	kMax := int(kWayMergeMax.Load())
+	if kMax <= 0 || len(bounds) > kMax {
+		return false
+	}
+	return passesMergeMinNGate(bounds, sketch)
 }
 
 // boundsAllScalar returns true if every bound's first entry has the
