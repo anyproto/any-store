@@ -997,3 +997,49 @@ func TestQueryCount_MergeRoute_MinNGate_Respected(t *testing.T) {
 			"lowered gate must route Count via merge")
 	})
 }
+
+// TestQuery_KnownIssueI05_ScalarFirstCrossBoundDedup pins I-05 (see
+// docs/known-issues.md). countEntriesWithDedup's peek-then-batch path
+// double-counts a doc whose multi-key entries straddle multiple bounds
+// when each bound's FIRST entry is scalar.
+//
+// The test is marked t.Skip until a fix lands. The assertions encode
+// the correct semantics already; removing the Skip line is the smoke
+// test that the fix worked.
+func TestQuery_KnownIssueI05_ScalarFirstCrossBoundDedup(t *testing.T) {
+	t.Skip("known-issue I-05: countEntriesWithDedup peek-then-batch " +
+		"double-counts cross-bound docs when bound-firsts are scalar. " +
+		"See docs/known-issues.md I-05. Remove this Skip when fixed.")
+
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "i05")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "x", Fields: []string{"x"}}))
+	// Filler docs (x=99) so the planner picks IndexSeek for {x:{$in:[5,10]}}.
+	for i := 0; i < 1000; i++ {
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(fmt.Sprintf(`{"id":"z%04d","x":99}`, i))))
+	}
+	// Scalar matches — produce SCALAR-byte entries at the bound's start.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"d1","x":5}`)))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"d2","x":10}`)))
+	// Array doc whose values straddle BOTH bounds — produces MULTI-KEY
+	// entries on each value plus a canonical-key entry.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"d3","x":[5,10]}`)))
+
+	// Distinct matching docs: d1, d2, d3 → Count must be 3 and Iter
+	// must yield 3 docs.
+	n, err := coll.Find(`{"x":{"$in":[5,10]}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 3, n, "Count must dedup d3 across bounds (currently returns 4 — I-05)")
+
+	it, err := coll.Find(`{"x":{"$in":[5,10]}}`).Iter(ctx)
+	require.NoError(t, err)
+	defer it.Close()
+	iterCount := 0
+	for it.Next() {
+		iterCount++
+	}
+	assert.Equal(t, 3, iterCount,
+		"Iter respects cross-bound dedup via CanonicalKeyDedupIter (currently correct)")
+}

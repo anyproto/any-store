@@ -133,3 +133,62 @@ Find({a:{$in:[1,2], $gte:5}}).Count(ctx)  // returns 2, true answer is 0
 3. **Conservative:** drop the CountOnly fast path at `planner.go:945` entirely; always wrap `FilterIter` when the filter has any conjunctive predicate not provably absorbed by `And.IndexBounds`. Loses the fast path for cases where it IS sound (single-predicate $in), but removes the wrong-answer surface entirely until (1)/(2) land.
 
 This issue is OUT OF SCOPE for `docs/plans/2026-05-28-array-index-multi-bound-in-merge.md`. It must be addressed in a dedicated follow-up plan.
+
+---
+
+## I-05: `countEntriesWithDedup` peek-then-batch double-counts cross-bound docs when bound-firsts are scalar
+
+**Discovered:** 2026-05-28, during the 4-agent review of `feat/array-index-multi-bound-in-merge`. Pre-existing on the `btree` baseline — not introduced by the merge feature.
+
+**Affected code:**
+- `/Users/roma/anytype/any-store/internal/qplanner/index_iter.go:656` — `countEntriesWithDedupUsingSeen`. The peek-then-batch shortcut at lines 673–687 reads the first entry's value byte and, if scalar, calls `cursor.CountUntil(b.End, ...)` to count ALL entries in the bound (including any multi-key entries that share docIds with other bounds). `stickyMulti` never latches because the peek saw scalar.
+
+**Trigger query:**
+```js
+// Single-field index on scalar field "x"
+Find({x:{$in:[5,10]}}).Count(ctx)
+```
+
+with docs:
+- `d1: x=5` (scalar — 1 entry, value byte = SCALAR)
+- `d2: x=10` (scalar — 1 entry, value byte = SCALAR)
+- `d3: x=[5,10]` (array — 2 entries on bound's values + 1 canonical-key, all MULTI-KEY)
+
+Bound "5": first entry `(5, d1)` SCALAR. Second entry `(5, d3)` MULTI-KEY.
+Bound "10": first entry `(10, d2)` SCALAR. Second entry `(10, d3)` MULTI-KEY.
+
+**True answer:** distinct docs matching `x ∈ {5, 10}` = `{d1, d2, d3}` = 3.
+
+**Computed:**
+- Bound 5: peek `(5, d1)` SCALAR → `stickyMulti=false` → `CountUntil("5", incl=true)` returns 2 (covers `(5, d1)` AND `(5, d3)`). `total = 2`. Continue.
+- Bound 10: peek `(10, d2)` SCALAR → `stickyMulti=false` → `CountUntil("10", incl=true)` returns 2. `total = 4`. Continue.
+
+Returned: 4. **Wrong answer** (d3 double-counted, once on bound 5 and once on bound 10).
+
+**Impact: CORRECTNESS (wrong answer).**
+
+- Count overcounts by N where N = number of docs that match multiple bounds via multi-key array values AND whose bound-firsts are scalar (i.e., a scalar-only doc happens to have a smaller docId than any multi-key match for the same value).
+- Iter is CORRECT for the same query (the chain `IndexIter → CanonicalKeyDedupIter → FetchIter` dedups via canonical-key). So `Find(q).Count()` and `len(Iter results)` disagree on this data shape — a discoverable artifact.
+- This branch (`feat/array-index-multi-bound-in-merge`) does NOT introduce the bug; it predates the merge. The merge branch makes the divergence newly observable on the merge route (which dedups correctly), but the Count code path that hosts the bug is the alpha.6 `countEntriesWithDedup`.
+
+**Why this is reachable only on specific data shapes:**
+
+For an array-only field (e.g., a `tags` field that is always an array), every doc has ≥2 entries in the index (one per array element + one canonical-key entry). So `len(idx.keysBuf) > 1` is always true at insert and every entry's value byte is `IndexValueMultiKey`. `boundsAllScalar` peek returns false, `stickyMulti` latches on the very first peek, and per-entry dedup correctly engages.
+
+For a scalar field with NO arrays, every doc has exactly 1 entry in the index. SCALAR is the only value byte; the peek-then-batch path is exact (each bound's CountUntil counts exactly one doc per value; cross-bound overlap is impossible because no doc has multiple values).
+
+The bug appears only when the SAME index field is sometimes scalar (1 entry, SCALAR byte) and sometimes an array (≥2 entries, MULTI-KEY byte) — a "mixed-array workload" (e.g., legacy single-value docs + new array-value docs).
+
+**Why the merge feature doesn't fix it:**
+
+The dispatch routes to `countEntriesWithDedup` (not the merge) when the sketch sum is below `kWayMergeMinEntries` — true at small N. At larger N where the merge engages, the bug doesn't trigger because the merge correctly dedups by docId. So a mixed-array workload at small N is the window of exposure. At larger N the bug becomes correct again — a confusing data-size-dependent artifact.
+
+**Reproducer:** `TestQuery_KnownIssueI05_ScalarFirstCrossBoundDedup` in `query_test.go` (marked `t.Skip` pending the fix plan). Sets up the trigger conditions, confirms Count=4 and Iter=3.
+
+**Fix sketch (graduated):**
+
+1. **Conservative:** in `countEntriesWithDedupUsingSeen`, when the peek is scalar AND `len(it.Bounds) > 1`, do not use `CountUntil`; instead per-entry walk the bound and lazily allocate the seen-set on the first multi-key entry. Eliminates the bug entirely at the cost of the peek-then-batch fast path for the scalar-only case. Quantify impact on SimpleIndex/In before landing.
+2. **Sketch-flag-gated:** when an `IndexSketch.HasMultiKey` flag (Task 8, deferred) is true, skip the peek-then-batch shortcut entirely and always per-entry walk multi-bound queries. The peek-then-batch path is preserved when the flag is false (index proven scalar-only).
+3. **Aggressive:** remove the peek-then-batch shortcut from `countEntriesWithDedup` entirely; rely on the merge for fast multi-bound counts. Bigger SimpleIndex/In regression but eliminates the bug surface.
+
+This issue is OUT OF SCOPE for `docs/plans/2026-05-28-array-index-multi-bound-in-merge.md` (it predates the merge feature). It must be addressed in a dedicated follow-up plan, likely co-scheduled with Task 8 (the `HasMultiKey` flag) — option 2 above is the lowest-cost fix that doesn't reintroduce a regression on pure-scalar indexes.
