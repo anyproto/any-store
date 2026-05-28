@@ -61,14 +61,17 @@ func SetKWayMergeMinEntries(n int) int {
 
 // IndexIter iterates over an index namespace using bounds.
 // key = indexFields + docId for both unique and non-unique indexes.
+//
+// Field layout note: pointers are packed first, then the slice header
+// (Bounds), then the int, then all bools at the end. Without this layout
+// the bools interleave with pointer fields and produce ~88 bytes after
+// alignment padding; the current layout is 72 bytes. Saves 16 B/op on
+// every query that builds an IndexIter (most index queries) because
+// seekBatch embeds IndexIter inline (planner.go).
 type IndexIter struct {
-	Source   *CursorSource
-	IdxInfo  *IndexInfo
-	cursor   *btree.Cursor
-	Bounds   query.Bounds
-	boundIdx int
-	Reverse  bool
-	started  bool
+	Source  *CursorSource
+	IdxInfo *IndexInfo
+	cursor  *btree.Cursor
 
 	// Sketch is the per-index frequency sketch. When non-nil, the pre-sized
 	// seen-set fallback (countEntriesViaPreSizedSeenSet) and the merge
@@ -79,6 +82,12 @@ type IndexIter struct {
 	// CountUntil pre-pass to derive the capacity. See docs/known-issues.md
 	// I-03 for the rule (sketch reads must never determine answers).
 	Sketch *IndexSketch
+
+	Bounds   query.Bounds
+	boundIdx int
+
+	Reverse bool
+	started bool
 
 	// PointLookup mirrors CBOIndex.PointLookup at iter-construction time.
 	// It is true iff every bound was an equality (Start==End) before
