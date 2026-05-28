@@ -872,6 +872,49 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 		return root
 	}
 
+	// k-way merge fast path. Conditions (must ALL hold):
+	//   - !needSort (the merge emits in docId order, not bound-order)
+	//   - !needFilter (the chain would otherwise need a FilterIter wrap;
+	//     keep the simple gate and fall through)
+	//   - idx.PointLookup (the merge assumes equality bounds)
+	//   - !params.CountOnly (CountOnly path is the IndexIter CountableIterator
+	//     shortcut, which dispatches the merge internally — Task 5)
+	//   - 2 ≤ k ≤ kWayMergeMax
+	//   - single-field index
+	//
+	// The dispatch is otherwise the same as IndexIter.CountEntries:
+	// boundsAllScalar / min-N gates are decided inside the adapter's
+	// lazyInit, so the predicate here mirrors the static structure only.
+	kMax := int(kWayMergeMax.Load())
+	useMerge := !needSort &&
+		!needFilter &&
+		idx.PointLookup &&
+		!params.CountOnly &&
+		len(idx.Bounds) >= 2 &&
+		kMax > 0 &&
+		len(idx.Bounds) <= kMax &&
+		len(idx.Info.FieldNames) == 1
+
+	if useMerge {
+		b := &seekBatch{}
+		b.indexCS = CursorSource{Tx: params.Tx, Ns: idx.Info.Ns}
+		b.dataCS = CursorSource{Tx: params.Tx, Ns: params.DataNs}
+		adapter := &mergeIterAdapter{
+			cs:         &b.indexCS,
+			bounds:     idx.Bounds,
+			fieldCount: len(idx.Info.FieldNames),
+		}
+		b.fetchIter = FetchIter{
+			Source: adapter,
+			Data:   &b.dataCS,
+			Buf:    params.Buf,
+		}
+		// No CanonicalKeyDedupIter wrap: the merge already emits distinct
+		// docIds. No SortIter wrap: needSort==false. No FilterIter wrap:
+		// needFilter==false (gated above).
+		return &b.fetchIter
+	}
+
 	// Use batched allocation for the common case: IndexIter + FetchIter + FilterIter.
 	// This replaces 5 separate heap allocations with 1.
 	b := &seekBatch{}
@@ -969,6 +1012,90 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	}
 
 	return root
+}
+
+// mergeIterAdapter wraps kWayDocIdMergeIter to fit the Iterator interface.
+// Iterator.Next is (key, docId, multiKey, err); the merge yields only
+// docId, so the adapter returns key=docId (the only thing downstream
+// consumers need: FetchIter point-looks-up by docId, and downstream
+// consumers see multiKey=false because the merge has already deduped).
+//
+// Lazy-builds the cursors on first Next so errors surface there
+// (buildIndexSeekChain does not return error today).
+type mergeIterAdapter struct {
+	cs         *CursorSource
+	bounds     query.Bounds
+	fieldCount int
+	merge      *kWayDocIdMergeIter
+	closed     bool
+}
+
+func (a *mergeIterAdapter) Next() (key []byte, docId []byte, multiKey bool, err error) {
+	if a.merge == nil && !a.closed {
+		if err := a.lazyInit(); err != nil {
+			return nil, nil, false, err
+		}
+	}
+	if a.closed {
+		return nil, nil, false, nil
+	}
+	id, ok, err := a.merge.Next()
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if !ok {
+		return nil, nil, false, nil
+	}
+	// The merge's returned slice is invalidated on next Next(); FetchIter
+	// uses docId only synchronously for the point lookup, then discards.
+	// So no copy needed here.
+	return id, id, false, nil
+}
+
+func (a *mergeIterAdapter) Close() {
+	a.closed = true
+	if a.merge != nil {
+		a.merge.Close()
+		a.merge = nil
+	}
+}
+
+func (a *mergeIterAdapter) String() string {
+	return fmt.Sprintf("kWayMerge(k=%d)", len(a.bounds))
+}
+
+func (a *mergeIterAdapter) lazyInit() error {
+	cursors := make([]*btree.Cursor, 0, len(a.bounds))
+	closeAll := func() {
+		for _, c := range cursors {
+			if c != nil {
+				c.Close()
+			}
+		}
+	}
+	for _, b := range a.bounds {
+		c := a.cs.NewCursor()
+		cursors = append(cursors, c)
+		if err := c.Seek(b.Start); err != nil {
+			closeAll()
+			return err
+		}
+		if c.Valid() && !b.StartInclude {
+			k, kerr := c.Key()
+			if kerr != nil {
+				closeAll()
+				return kerr
+			}
+			if bytes.Equal(k, b.Start) {
+				if err := c.Next(); err != nil {
+					closeAll()
+					return err
+				}
+			}
+		}
+	}
+	a.merge = newKWayDocIdMergeIter(cursors, a.bounds, a.fieldCount)
+	return nil
 }
 
 // buildIndexScanChain constructs the iterator chain for an index scan plan
