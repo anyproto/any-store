@@ -1,6 +1,7 @@
 package qplanner
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -671,6 +672,135 @@ func TestIndexProbeAnyMultiKey(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// boundForValue builds the adjusted point bound the planner hands to the count
+// path for a single $in value: [v, v] with the End widened by 0xff
+// (AdjustBoundsForNonUnique) so the docId-suffixed entries (v, docId) written
+// by indexEntryBtree fall inside it.
+func boundForValue(v string) query.Bound {
+	k := anyenc.AppendAnyValue(nil, v)
+	end := append(append([]byte{}, k...), 0xff)
+	return query.Bound{Start: k, End: end, StartInclude: true, EndInclude: true}
+}
+
+func sortDedupIter(rtx *btree.ReadTx, ns *btree.Namespace, bounds query.Bounds) *IndexIter {
+	return &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Bounds:  bounds,
+	}
+}
+
+// TestCountEntriesViaSortDedup_Disjoint: three docs each matching one bound,
+// no cross-bound overlap → distinct count == entry count.
+func TestCountEntriesViaSortDedup_Disjoint(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "d1", value: IndexValueScalar},
+		{field: "b", docId: "d2", value: IndexValueScalar},
+		{field: "c", docId: "d3", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := sortDedupIter(rtx, ns, query.Bounds{boundForValue("a"), boundForValue("b"), boundForValue("c")})
+	defer it.Close()
+	n, err := it.countEntriesViaSortDedup()
+	require.NoError(t, err)
+	assert.Equal(t, 3, n)
+}
+
+// TestCountEntriesViaSortDedup_Overlapping: doc d1 has array [a,b] so it
+// appears under both bounds; it must be counted once.
+func TestCountEntriesViaSortDedup_Overlapping(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "d1", value: IndexValueMultiKey},
+		{field: "b", docId: "d1", value: IndexValueMultiKey},
+		{field: "a", docId: "d2", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := sortDedupIter(rtx, ns, query.Bounds{boundForValue("a"), boundForValue("b")})
+	defer it.Close()
+	n, err := it.countEntriesViaSortDedup()
+	require.NoError(t, err)
+	assert.Equal(t, 2, n, "d1 (array [a,b]) counted once + d2")
+}
+
+// TestCountEntriesViaSortDedup_HeavyOverlap200: 200 docs each with array
+// [x,y]; every doc straddles both bounds → 200 distinct, not 400.
+func TestCountEntriesViaSortDedup_HeavyOverlap200(t *testing.T) {
+	entries := make([]indexEntry, 0, 400)
+	for i := 0; i < 200; i++ {
+		d := fmt.Sprintf("d%03d", i)
+		entries = append(entries,
+			indexEntry{field: "x", docId: d, value: IndexValueMultiKey},
+			indexEntry{field: "y", docId: d, value: IndexValueMultiKey},
+		)
+	}
+	db, ns := indexEntryBtree(t, entries)
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := sortDedupIter(rtx, ns, query.Bounds{boundForValue("x"), boundForValue("y")})
+	defer it.Close()
+	n, err := it.countEntriesViaSortDedup()
+	require.NoError(t, err)
+	assert.Equal(t, 200, n)
+}
+
+// TestCountEntriesViaSortDedup_LegacyNilValue: sort-dedup keys on docId only
+// and never reads the value byte, so legacy nil-value entries dedup correctly.
+func TestCountEntriesViaSortDedup_LegacyNilValue(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "d1", value: nil},
+		{field: "b", docId: "d1", value: nil},
+		{field: "a", docId: "d2", value: nil},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := sortDedupIter(rtx, ns, query.Bounds{boundForValue("a"), boundForValue("b")})
+	defer it.Close()
+	n, err := it.countEntriesViaSortDedup()
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+}
+
+// TestCountEntriesViaSortDedup_AllocsBudget pins the pooled arena's steady
+// state: with a warmed pool and a reused IndexIter the per-count allocation
+// is small and independent of the distinct-doc count.
+func TestCountEntriesViaSortDedup_AllocsBudget(t *testing.T) {
+	entries := make([]indexEntry, 0, 200)
+	for i := 0; i < 100; i++ {
+		d := fmt.Sprintf("d%03d", i)
+		entries = append(entries,
+			indexEntry{field: "x", docId: d, value: IndexValueMultiKey},
+			indexEntry{field: "y", docId: d, value: IndexValueMultiKey},
+		)
+	}
+	db, ns := indexEntryBtree(t, entries)
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := sortDedupIter(rtx, ns, query.Bounds{boundForValue("x"), boundForValue("y")})
+	defer it.Close()
+	// Warm the sync.Pool arena and the cursor.
+	n, err := it.countEntriesViaSortDedup()
+	require.NoError(t, err)
+	require.Equal(t, 100, n)
+
+	avg := testing.AllocsPerRun(20, func() {
+		_, _ = it.countEntriesViaSortDedup()
+	})
+	assert.LessOrEqual(t, avg, float64(30),
+		"pooled sort-dedup should be low-alloc with a warmed pool, got %.1f", avg)
 }
 
 // TestIndexIter_Next_DecodesMultiKeyBit_Scalar pins that an IndexIter walking
