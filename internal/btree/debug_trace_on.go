@@ -11,6 +11,7 @@ const debugTrace = true
 
 var debugTraceLog *log.Logger
 
+// DRIFT: build-tag-gated BTREE_TRACE debug-tracing subsystem undocumented See docs/btree/NOTES.md#drift-124-debug-tracing-subsystem-undocumented
 func init() {
 	v := os.Getenv("BTREE_TRACE")
 	if v == "" || v == "1" || v == "stderr" {

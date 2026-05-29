@@ -69,6 +69,7 @@ func (s *inProcessShm) region(index int, create bool) ([]byte, error) {
 	return s.regions[index], nil
 }
 
+// DRIFT: in-process/mmap shm collapse per-conn masks to one refcount; repeat shared not no-op See docs/btree/NOTES.md#drift-81-in-process-shm-lock-collapses-per-connection-masks-to-single
 func (s *inProcessShm) lock(slot int, lockType int) error {
 	if slot < 0 || slot >= lockSlotCount {
 		return fmt.Errorf("btree: invalid lock slot %d", slot)
@@ -111,6 +112,7 @@ func (s *inProcessShm) unlock(slot int, lockType int) error {
 	return nil
 }
 
+// DRIFT: inProcessShm.close non-terminal: regions cleared but object/lock-state reusable See docs/btree/NOTES.md#drift-80-inprocessshm-close-non-terminal-teardown
 func (s *inProcessShm) close(isLastClient bool) error {
 	_ = isLastClient
 	s.regMu.Lock()

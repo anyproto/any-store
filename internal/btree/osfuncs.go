@@ -15,18 +15,21 @@ var osRemove = os.Remove
 
 // SetVFS replaces OS-level operations. Panics unless built with -tags vfs
 // or GOOS=js GOARCH=wasm.
+// DRIFT: VFS injection (SetVFS/ResetVFS) + open-DB registry + wasm panic-stubs undocumented See docs/btree/NOTES.md#drift-119-vfs-injection-layer-and-open-registry-undocumented
 func SetVFS(_ VFS) {
 	panic("btree: SetVFS requires building with -tags vfs or GOOS=js GOARCH=wasm")
 }
 
 // ResetVFS restores defaults. Panics unless built with -tags vfs
 // or GOOS=js GOARCH=wasm.
+// DRIFT: VFS injection (SetVFS/ResetVFS) + open-DB registry + wasm panic-stubs undocumented See docs/btree/NOTES.md#drift-119-vfs-injection-layer-and-open-registry-undocumented
 func ResetVFS() {
 	panic("btree: ResetVFS requires building with -tags vfs or GOOS=js GOARCH=wasm")
 }
 
 // ResetOpenRegistry clears the process-global registry of open databases.
 // Panics unless built with -tags vfs or GOOS=js GOARCH=wasm.
+// DRIFT: VFS injection (SetVFS/ResetVFS) + open-DB registry + wasm panic-stubs undocumented See docs/btree/NOTES.md#drift-119-vfs-injection-layer-and-open-registry-undocumented
 func ResetOpenRegistry() {
 	panic("btree: ResetOpenRegistry requires building with -tags vfs or GOOS=js GOARCH=wasm")
 }

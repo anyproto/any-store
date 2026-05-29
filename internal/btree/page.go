@@ -229,6 +229,7 @@ func (h *dbHeader) serialize(buf []byte) {
 }
 
 // deserialize reads the database header from the first 100 bytes of buf.
+// DRIFT: open()/deserialize skip lockBtree page-1 validations (21-23, 18/19, usable>=480, flags) See docs/btree/NOTES.md#drift-66-page-1-header-validation-missing-in-open-and-deserialize
 func (h *dbHeader) deserialize(buf []byte) error {
 	if len(buf) < dbHeaderSize {
 		return ErrCorrupt
@@ -310,6 +311,7 @@ func (ph *pageHeader) serialize(buf []byte) {
 }
 
 // deserialize reads the page header from buf.
+// DRIFT: open()/deserialize skip lockBtree page-1 validations (21-23, 18/19, usable>=480, flags) See docs/btree/NOTES.md#drift-66-page-1-header-validation-missing-in-open-and-deserialize
 func (ph *pageHeader) deserialize(buf []byte) {
 	ph.pageType = buf[0]
 	ph.firstFreeBlk = binary.BigEndian.Uint16(buf[1:3])
@@ -380,6 +382,7 @@ func (p *page) getCellOffsetSafe(i int) (uint16, error) {
 // (btree.c lines 1843-1853): if cellContentOff is 0 and usableSize is 65536,
 // treat as 65536; if cellContentOff > usableSize, return ErrCorrupt; if
 // cellContentOff < gap (cell pointer array end), return ErrCorrupt.
+// DRIFT: contentAreaOffset treats cellContentOff==0 as valid on non-64K pages (corrupt in C) See docs/btree/NOTES.md#drift-67-contentareaoffset-accepts-zero-cell-content-offset-as-valid
 func (p *page) contentAreaOffset(usableSize int) (int, error) {
 	top := int(p.header.cellContentOff)
 	gap := p.cellPointerOffset() + int(p.header.cellCount)*2
@@ -554,6 +557,7 @@ func varintSize(v uint64) int {
 }
 
 // checksum computes a CRC32 checksum for data (used in WAL frames).
+// DRIFT: dead/non-protocol CRC32 helpers (checksum, walPageChecksum) mislabeled re WAL frames See docs/btree/NOTES.md#drift-125-dead-or-non-protocol-crc32-checksum-helpers
 func checksum(data []byte) uint32 {
 	return crc32.ChecksumIEEE(data)
 }

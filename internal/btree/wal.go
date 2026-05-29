@@ -208,6 +208,8 @@ func DefaultBusyTimeout(timeout time.Duration) BusyHandler {
 // the busy handler if the lock is busy.
 // If xBusy is nil, returns ErrBusy immediately on failure.
 // Modeled after SQLite's walBusyLock().
+// DRIFT: busy-handler retry count resets per walBusyLock call vs C per-connection nBusy See docs/btree/NOTES.md#drift-108-busy-handler-retry-count-resets-per-call
+// DRIFT: walBusyLock locks single slot; C locks n consecutive slots atomically See docs/btree/NOTES.md#drift-109-walbusylock-locks-single-slot-not-n-consecutive
 func walBusyLock(wi *walIndex, xBusy BusyHandler, slot int, lockType int) error {
 	var count int
 	for {
@@ -308,6 +310,7 @@ func (wf *walFrame) serialize(buf []byte) {
 	binary.BigEndian.PutUint32(buf[20:24], wf.checksum2)
 }
 
+// DRIFT: WAL recovery omits walDecodeFrame's pgno==0 frame-validity rejection See docs/btree/NOTES.md#drift-87-wal-recovery-omits-pgno-zero-frame-validity-check
 func (wf *walFrame) deserialize(buf []byte) {
 	wf.pgno = binary.BigEndian.Uint32(buf[0:4])
 	wf.dbSize = binary.BigEndian.Uint32(buf[4:8])
@@ -578,6 +581,7 @@ func newWalIndex(shmPath string, inProcess bool) (*walIndex, error) {
 // relies on the SHM hash written below — matching SQLite's walFrames →
 // walIndexAppend (wal.c:2900, 1295-1338) where SHM hash is the authoritative
 // page→frame index.
+// DRIFT: shmHash write/get drop walIndexAppend/walFindFrame nCollide CORRUPT + cleanup/zero-init See docs/btree/NOTES.md#drift-91-wal-index-hash-append-missing-collision-limit-corruption-det
 func (wi *walIndex) set(pgno, frame uint32) {
 	if wi.inProcess {
 		wi.mu.Lock()
@@ -601,6 +605,7 @@ func (wi *walIndex) set(pgno, frame uint32) {
 // advanced on commit via walIndexWriteHdr), so uncommitted hash entries are
 // present but unreachable. Rollback uses shmCleanupFromFrame (analog of
 // walCleanupHash, wal.c:1247-1282) to zero out dangling hash entries.
+// DRIFT: shmHash write/get drop walIndexAppend/walFindFrame nCollide CORRUPT + cleanup/zero-init See docs/btree/NOTES.md#drift-91-wal-index-hash-append-missing-collision-limit-corruption-det
 func (wi *walIndex) setBatch(pages []*page, startFrame uint32, commit bool) {
 	_ = commit
 	if wi.inProcess {
@@ -628,6 +633,7 @@ func (wi *walIndex) setBatch(pages []*page, startFrame uint32, commit bool) {
 // frames — matches SQLite's walCleanupHash (wal.c:1247-1282) invoked on
 // savepoint rollback from sqlite3WalSavepointUndo.
 // Called under w.index exclusive write lock.
+// DRIFT: shmCleanupFromFrame zeros all segments above target; C zeros only mxFrame's segment See docs/btree/NOTES.md#drift-95-shmcleanupfromframe-zeros-all-segments-above-target
 func (wi *walIndex) rollbackToFrame(target uint32) {
 	oldMax := wi.maxFrame.Load()
 	if wi.inProcess {
@@ -740,6 +746,7 @@ func (wi *walIndex) getInTxRange(pgno, maxFrame, minFrame uint32) uint32 {
 // get returns the frame containing the latest version of pgno that is
 // within the given maxFrame snapshot, or 0 if not in WAL.
 // The maxFrame parameter limits which frames are visible (for snapshot isolation).
+// DRIFT: WAL hash-probe full-chain (nCollide) CORRUPT signal dropped in get/shmHashGet See docs/btree/NOTES.md#drift-93-wal-hash-probe-full-chain-corruption-signal-dropped
 func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
 	if wi.inProcess {
 		// In-process: no SHM to consult; pageMap is the sole source of truth.
@@ -792,6 +799,7 @@ func (wi *walIndex) getLatest(pgno uint32) uint32 {
 }
 
 // reset clears the WAL index (after a checkpoint + WAL truncate).
+// DRIFT: reset() clobbers aReadMark[0]/[1] to NOT_USED + drops nCkpt/salt increments See docs/btree/NOTES.md#drift-99-wal-restart-read-mark-reset-diverges-from-walrestarthdr
 func (wi *walIndex) reset() {
 	wi.mu.Lock()
 	clear(wi.pageMap)
@@ -816,6 +824,7 @@ func (wi *walIndex) reset() {
 //
 // The dual-copy + barrier design allows readers to detect torn writes
 // by comparing both copies.
+// DRIFT: wal-index header iChange counter never incremented (always 0) See docs/btree/NOTES.md#drift-96-wal-index-change-counter-ichange-never-incremented
 func (wi *walIndex) writeHeader(maxFrame, maxPage, nBackfill uint32, frameCksum, salt [2]uint32) error {
 	region, err := wi.shm.region(0, true)
 	if err != nil {
@@ -878,6 +887,8 @@ func (wi *walIndex) writeHeader(maxFrame, maxPage, nBackfill uint32, frameCksum,
 // It compares both copies of the header to detect torn writes (7.3).
 // Returns the header and true if valid, or a zero header and false if
 // the header is corrupt or the two copies don't match.
+// DRIFT: wal-index header iVersion never validated (missing WALINDEX_MAX_VERSION gate) See docs/btree/NOTES.md#drift-89-wal-index-header-version-not-validated
+// DRIFT: wal-index szPage neither encoded nor decoded (szPage transform absent) See docs/btree/NOTES.md#drift-90-wal-index-szpage-field-not-encoded-or-decoded
 func (wi *walIndex) readHeader() (WalIndexHdr, bool) {
 	region, err := wi.shm.region(0, false)
 	if err != nil {
@@ -934,6 +945,7 @@ func (wi *walIndex) readHeader() (WalIndexHdr, bool) {
 // On x86/amd64, stores are already ordered (TSO), but we need a compiler barrier
 // to prevent the Go compiler from reordering. On ARM64, we need a full fence.
 // This matches SQLite's walShmBarrier() / sqlite3OsShmBarrier().
+// DRIFT: walShmBarrier store-release only on ARM64 (weaker than full fence) + no mutex fallback See docs/btree/NOTES.md#drift-86-walshmbarrier-emits-store-release-not-full-fence-on-arm64
 func walShmBarrier() {
 	// atomic.StoreUint32 on a dummy variable acts as both a compiler barrier
 	// and a memory fence (uses MFENCE on x86, DMB on ARM64). This is the sole
@@ -994,6 +1006,7 @@ func htPgnoOffset(seg, idx int) int {
 
 // htSegmentInfo returns the aPgno base offset, entry count, and iZero for a segment.
 // iZero is the frame number that maps to aPgno[0] minus 1 (so frame = iZero + idx + 1).
+// DRIFT: htSegmentInfo adds nEntry bound replacing C's index mask in hash lookup See docs/btree/NOTES.md#drift-94-htsegmentinfo-adds-nentry-bound-replacing-c-mask
 func htSegmentInfo(seg int) (pgnoBase int, nEntry int, iZero uint32) {
 	if seg == 0 {
 		return htPgnoOff0, int(htNPageOne), 0
@@ -1007,6 +1020,7 @@ func htSegmentInfo(seg int) (pgnoBase int, nEntry int, iZero uint32) {
 // (any-store's lockWrite) so linear probing does not race another writer.
 // The write ordering + barrier guarantees cross-process readers either see
 // a fully-populated entry or none at all.
+// DRIFT: shmHash write/get drop walIndexAppend/walFindFrame nCollide CORRUPT + cleanup/zero-init See docs/btree/NOTES.md#drift-91-wal-index-hash-append-missing-collision-limit-corruption-det
 func (wi *walIndex) shmHashWrite(pgno, frame uint32) {
 	seg, idx := htFrameSegIdx(frame)
 
@@ -1050,6 +1064,8 @@ func (wi *walIndex) shmHashWrite(pgno, frame uint32) {
 // that could contain frames in [minFrame, maxFrame], searching backwards
 // from the newest segment. This avoids scanning already-checkpointed
 // segments, which is critical for performance on large WALs.
+// DRIFT: shmHash write/get drop walIndexAppend/walFindFrame nCollide CORRUPT + cleanup/zero-init See docs/btree/NOTES.md#drift-91-wal-index-hash-append-missing-collision-limit-corruption-det
+// DRIFT: shmHashGet silently skips segment on SHM map/IO error vs C abort See docs/btree/NOTES.md#drift-92-shmhashget-skips-segment-on-map-io-error
 func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) uint32 {
 	if maxFrame == 0 {
 		return 0
@@ -1309,6 +1325,9 @@ func newWal(path string, pageSize uint32) *wal {
 }
 
 // open opens or creates the WAL file and recovers any committed frames.
+// DRIFT: padToSectorBoundary commit-frame sector padding not ported See docs/btree/NOTES.md#drift-104-padtosectorboundary-sector-padding-of-commit-frames-not-port
+// DRIFT: no read-only WAL fallback (readOnly=WAL_RDONLY) when open downgraded See docs/btree/NOTES.md#drift-106-wal-read-only-fallback-not-ported
+// DRIFT: syncHeader device-characteristic tuning not ported (always-on) See docs/btree/NOTES.md#drift-107-syncheader-device-characteristic-tuning-not-ported
 func (w *wal) open() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -1661,6 +1680,8 @@ func (w *wal) flushHeader() error {
 }
 
 // writeHeader writes a fresh WAL header to disk.
+// DRIFT: WAL restart randomizes both salts; C increments salt0 (+1), randomizes salt1 only See docs/btree/NOTES.md#drift-97-wal-restart-randomizes-both-salts-instead-of-incrementing-sa
+// DRIFT: WAL header checkpoint-seq nCkpt hardcoded 0, never incremented on restart See docs/btree/NOTES.md#drift-98-wal-checkpoint-sequence-number-nckpt-never-incremented
 func (w *wal) writeHeader() error {
 	w.header = walHeader{
 		magic:      walMagic,
@@ -1712,6 +1733,8 @@ func (w *wal) writeHeader() error {
 // any-store relies on recoverLocked only being invoked from wal.open (before
 // any peer reader/writer has attached) or from ensureHeaderInitialized
 // (which holds lockWrite + lockCheckpoint + lockRecover exclusive).
+// DRIFT: WAL recovery omits walDecodeFrame's pgno==0 frame-validity rejection See docs/btree/NOTES.md#drift-87-wal-recovery-omits-pgno-zero-frame-validity-check
+// DRIFT: recoverLocked sets all read-marks NOT_USED; C pre-seeds slot 1 to mxFrame See docs/btree/NOTES.md#drift-88-wal-recovery-does-not-pre-seed-read-mark-slot-1
 func (w *wal) recoverLocked() error {
 	w.headerOnDisk = true
 
@@ -1879,6 +1902,9 @@ func (w *wal) recoverLocked() error {
 // writeFrames appends frames to the WAL. If commit is true, the last frame
 // is marked as a commit frame with the given dbSize.
 // All frames are batched into a single write call for performance.
+// DRIFT: wal-index header iChange counter never incremented (always 0) See docs/btree/NOTES.md#drift-96-wal-index-change-counter-ichange-never-incremented
+// DRIFT: padToSectorBoundary commit-frame sector padding not ported See docs/btree/NOTES.md#drift-104-padtosectorboundary-sector-padding-of-commit-frames-not-port
+// DRIFT: journal_size_limit/mxWalSize WAL truncation unimplemented (truncateOnCommit/walLimitSize) See docs/btree/NOTES.md#drift-105-journal-size-limit-wal-truncation-feature-unimplemented
 func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	if len(pages) == 0 {
 		return nil
@@ -2383,6 +2409,8 @@ func (w *wal) readFramePgno(frame uint32) (uint32, error) {
 //   - Slot 0: used when nBackfill == maxFrame (read everything from DB, skip WAL)
 //   - Slots 1-4: used for readers that need WAL frames. Best slot is the one
 //     with the largest readmark <= current maxFrame.
+//
+// DRIFT: header-change re-validation skipped when SHM header invalid (C does unconditional memcmp) See docs/btree/NOTES.md#drift-103-re-validation-skips-header-change-check-when-shm-header-inva
 func (w *wal) beginRead() (maxFrame uint32, slot int, err error) {
 	_, maxFrame, slot, err = w.beginReadHdr()
 	return maxFrame, slot, err
@@ -2430,6 +2458,8 @@ func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err er
 // tryBeginRead attempts to acquire a reader slot and returns the current
 // max frame number. Returns errWALRetry if the WAL state changed between
 // reading metadata and acquiring the lock, signaling the caller to retry.
+// DRIFT: slot-0 read path writes mxFrame into aReadMark[0] (must stay 0) See docs/btree/NOTES.md#drift-100-slot-0-read-path-writes-mxframe-violating-areadmark0-invaria
+// DRIFT: header-change re-validation skipped when SHM header invalid (C does unconditional memcmp) See docs/btree/NOTES.md#drift-103-re-validation-skips-header-change-check-when-shm-header-inva
 func (w *wal) tryBeginRead() (maxFrame uint32, slot int, err error) {
 	_, maxFrame, slot, err = w.tryBeginReadHdr()
 	return maxFrame, slot, err
@@ -2450,6 +2480,7 @@ func (w *wal) tryBeginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err
 // (mxCommitFrame, nBackfill, aReadMark) which are always consistent within
 // a single process. No WAL_RETRY — the in-process path never races with
 // external checkpoint or writer state changes.
+// DRIFT: reused reader slot's read-mark not advanced to mxFrame when below it See docs/btree/NOTES.md#drift-101-reader-slot-mark-not-advanced-to-mxframe-on-reuse
 func (w *wal) tryBeginReadInProcess() (maxFrame uint32, slot int, err error) {
 	_, maxFrame, slot, err = w.tryBeginReadInProcessHdr()
 	return maxFrame, slot, err
@@ -2525,6 +2556,9 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame uint32, slot
 //  5. Sync nBackfill to process-local atomic for walIndex.get() minFrame filter.
 //     (docs/btree/NOTES.md §20, drift 3 — SQLite doesn't need this sync step because it reads
 //     nBackfill directly from SHM via pInfo pointer everywhere)
+//
+// DRIFT: reader-slot tie-break selects lowest slot; SQLite selects highest on equal marks See docs/btree/NOTES.md#drift-102-reader-slot-tie-break-selects-lowest-not-highest
+// DRIFT: header-change re-validation skipped when SHM header invalid (C does unconditional memcmp) See docs/btree/NOTES.md#drift-103-re-validation-skips-header-change-check-when-shm-header-inva
 func (w *wal) tryBeginReadMultiProcess() (maxFrame uint32, slot int, err error) {
 	_, maxFrame, slot, err = w.tryBeginReadMultiProcessHdr()
 	return maxFrame, slot, err
@@ -2665,6 +2699,7 @@ func (w *wal) endRead(slot int) {
 // Returns stateChanged=true if the WAL state was re-synced from SHM (indicating
 // another process committed or checkpointed since the last local write).
 // Callers should invalidate any stale page caches when stateChanged is true.
+// DRIFT: header-change re-validation skipped when SHM header invalid (C does unconditional memcmp) See docs/btree/NOTES.md#drift-103-re-validation-skips-header-change-check-when-shm-header-inva
 func (w *wal) beginWrite() (stateChanged bool, err error) {
 	// Legacy entry for raw-wal tests. Passes zero snapshot → BUSY_SNAPSHOT
 	// check is skipped (acceptable; these tests don't exercise the race).
@@ -2773,6 +2808,7 @@ func (w *wal) beginWriteWithSnapshot(readSnap WalIndexHdr) (stateChanged bool, e
 }
 
 // endWrite releases the exclusive write lock.
+// DRIFT: journal_size_limit/mxWalSize WAL truncation unimplemented (truncateOnCommit/walLimitSize) See docs/btree/NOTES.md#drift-105-journal-size-limit-wal-truncation-feature-unimplemented
 func (w *wal) endWrite() {
 	// Tx boundary: any pending in-tx frame rewrite is moot. Either
 	// the tx committed (rewrite happened in writeFrames and iReCksum
@@ -2806,6 +2842,9 @@ func (w *wal) authoritativeMxFrame() uint32 {
 
 // checkpoint writes WAL frames back to the database file.
 // For InMemory databases, master is used to store checkpointed pages instead of dbFile.
+// DRIFT: checkpoint never truncates DB file to committed nPage after full backfill See docs/btree/NOTES.md#drift-50-checkpoint-never-physically-truncates-db-file-after-full-bac
+// DRIFT: checkpoint backfill lacks iDbpage>mxPage (committed nPage) skip filter See docs/btree/NOTES.md#drift-51-checkpoint-backfill-missing-idbpage-greater-than-mxpage-filt
+// DRIFT: checkpoint omits page-size-mismatch and over-grow corruption guards See docs/btree/NOTES.md#drift-52-checkpoint-missing-page-size-mismatch-and-over-grow-corrupti
 func (w *wal) checkpoint(dbFile fileHandle, master *masterStore) error {
 	return w.checkpointWithMode(dbFile, master, CheckpointFull, nil)
 }
@@ -2816,6 +2855,7 @@ func (w *wal) checkpoint(dbFile fileHandle, master *masterStore) error {
 // matching SQLite's SQLITE_BUSY return from sqlite3WalCheckpoint in
 // PASSIVE mode when readers block progress. Callers must not truncate
 // the WAL when ErrBusy is returned.
+// DRIFT: checkpoint never truncates DB file to committed nPage after full backfill See docs/btree/NOTES.md#drift-50-checkpoint-never-physically-truncates-db-file-after-full-bac
 func (w *wal) checkpointPassive(dbFile fileHandle, master *masterStore) error {
 	err := w.checkpointWithMode(dbFile, master, CheckpointPassive, nil)
 	if err != nil {
@@ -2988,6 +3028,9 @@ func (w *wal) rewriteChecksums(iLast uint32) error {
 // mxCommitFrame would undercount committed frames written by peer
 // processes, causing a close-time checkpoint to only backfill our own
 // frames before truncate — losing the peer's data (commit 9023f5b).
+// DRIFT: FULL/RESTART/TRUNCATE checkpoint returns nil vs SQLITE_BUSY on incomplete backfill See docs/btree/NOTES.md#drift-49-non-passive-checkpoint-returns-success-instead-of-busy-on-in
+// DRIFT: checkpoint never truncates DB file to committed nPage after full backfill See docs/btree/NOTES.md#drift-50-checkpoint-never-physically-truncates-db-file-after-full-bac
+// DRIFT: checkpoint backfill lacks iDbpage>mxPage (committed nPage) skip filter See docs/btree/NOTES.md#drift-51-checkpoint-backfill-missing-idbpage-greater-than-mxpage-filt
 func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode CheckpointMode, xBusy BusyHandler) error {
 	// Acquire checkpoint lock -- serialize concurrent checkpoints.
 	// The busy handler is NOT used for the checkpoint lock itself, matching
@@ -3292,6 +3335,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 
 // checkpointPost handles post-backfill logic: WAL reset for modes that
 // completed a full checkpoint.
+// DRIFT: FULL/RESTART/TRUNCATE checkpoint returns nil vs SQLITE_BUSY on incomplete backfill See docs/btree/NOTES.md#drift-49-non-passive-checkpoint-returns-success-instead-of-busy-on-in
 func (w *wal) checkpointPost(mode CheckpointMode, xBusy BusyHandler) error {
 	backfill := w.index.nBackfill.Load()
 
@@ -3357,6 +3401,7 @@ func (w *wal) tryResetWALWithBusy(xBusy BusyHandler, truncate bool) error {
 // Must be called with w.mu held and all necessary locks acquired.
 // If truncate is true, the WAL file is truncated to zero bytes (CheckpointTruncate).
 // If false, the WAL is just restarted with a new header (CheckpointRestart).
+// DRIFT: WAL header checkpoint-seq nCkpt hardcoded 0, never incremented on restart See docs/btree/NOTES.md#drift-98-wal-checkpoint-sequence-number-nckpt-never-incremented
 func (w *wal) doResetWAL(truncate bool) error {
 	if debugTrace {
 		trace("doResetWAL: truncate=%v nFrame=%d maxFrame=%d nBackfill=%d",
@@ -3393,6 +3438,7 @@ func (w *wal) doResetWAL(truncate bool) error {
 }
 
 // truncateFile truncates the WAL file to zero bytes under the WAL mutex.
+// DRIFT: journal_size_limit/mxWalSize WAL truncation unimplemented (truncateOnCommit/walLimitSize) See docs/btree/NOTES.md#drift-105-journal-size-limit-wal-truncation-feature-unimplemented
 func (w *wal) truncateFile() {
 	w.mu.Lock()
 	if w.file != nil {

@@ -109,6 +109,7 @@ func freePageBuffer(buf []byte, useSlab bool) {
 // Init pre-allocates nPages buffers of the given pageSize.
 // If already initialized, this is a no-op.
 // Matches sqlite3PCacheBufferSetup (pcache1.c:271-291).
+// DRIFT: pageSlab.Init/ConfigPageCache idempotent & no-disable vs C re-configurable setup See docs/btree/NOTES.md#drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl
 func (s *pageSlab) Init(pageSize, nPages int) {
 	if s.initialized.Load() {
 		return
@@ -196,6 +197,7 @@ func (s *pageSlab) Put(buf []byte) {
 
 // UnderPressure returns true when the free list is below the reserve threshold.
 // Matches pcache1UnderMemoryPressure (pcache1.c:518-524).
+// DRIFT: UnderPressure drops C's sqlite3HeapNearlyFull() no-slab fallback branch See docs/btree/NOTES.md#drift-69-underpressure-drops-heap-nearly-full-fallback
 func (s *pageSlab) UnderPressure() bool {
 	return s.underPressure.Load()
 }
@@ -243,6 +245,7 @@ func (s *pageSlab) Reset() {
 // the UnderPressure flag triggers admission control and immediate eviction.
 //
 // Example: ConfigPageCache(4096, 5000) pre-allocates ~20MB of page buffers.
+// DRIFT: pageSlab.Init/ConfigPageCache idempotent & no-disable vs C re-configurable setup See docs/btree/NOTES.md#drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl
 func ConfigPageCache(pageSize, nPages int) {
 	globalPageSlab.Init(pageSize, nPages)
 }

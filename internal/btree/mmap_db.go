@@ -70,6 +70,7 @@ func (m *dbMmap) readAt(dst []byte, off int64) (ok bool) {
 // at maxSize. Called lazily on first fetch and after DB-file growth.
 // Matches SQLite's unixRemapfile (os_unix.c:5570-5640+). No-op when
 // disabled (maxSize == 0).
+// DRIFT: mmap reads raw OS fd, bypassing injected VFS/custom File.ReadAt See docs/btree/NOTES.md#drift-120-mmap-backed-reads-bypass-injected-vfs-file
 func (m *dbMmap) remap(need int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -129,6 +130,7 @@ func (m *dbMmap) enabled() bool {
 // fdFromFile extracts the OS fd from a fileHandle. On the default
 // build (fileHandle = *os.File) it's direct. On the vfs build
 // (fileHandle = File interface), Fd() is part of the File contract.
+// DRIFT: mmap reads raw OS fd, bypassing injected VFS/custom File.ReadAt See docs/btree/NOTES.md#drift-120-mmap-backed-reads-bypass-injected-vfs-file
 func fdFromFile(f fileHandle) (int, error) {
 	if f == nil {
 		return -1, os.ErrClosed

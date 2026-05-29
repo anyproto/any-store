@@ -97,6 +97,8 @@ func newPlatformShm(path string) (shm, error) {
 	return s, nil
 }
 
+// DRIFT: mmap SHM offset not page-aligned on 64KB pages; nShmPerMap grouping absent See docs/btree/NOTES.md#drift-83-mmap-shm-offset-not-page-aligned-and-region-grouping-absent
+// DRIFT: shm region extend uses sparse ftruncate (SIGBUS risk) vs C per-page byte-write See docs/btree/NOTES.md#drift-84-shm-region-extension-uses-sparse-ftruncate-reintroducing-sig
 func (s *mmapShm) region(index int, create bool) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -144,6 +146,7 @@ func (s *mmapShm) region(index int, create bool) ([]byte, error) {
 //
 // This matches SQLite's unixShmLock() (os_unix.c) which checks the
 // unixInodeInfo.aLock[] counters before calling fcntl.
+// DRIFT: in-process/mmap shm collapse per-conn masks to one refcount; repeat shared not no-op See docs/btree/NOTES.md#drift-81-in-process-shm-lock-collapses-per-connection-masks-to-single
 func (s *mmapShm) lock(slot int, lockType int) error {
 	if slot < 0 || slot >= lockSlotCount {
 		return fmt.Errorf("btree: invalid lock slot %d", slot)
@@ -192,6 +195,7 @@ func (s *mmapShm) lock(slot int, lockType int) error {
 
 // unlock releases the lock on the given slot. It updates the in-process lock
 // counters and calls fcntl only when the last holder releases.
+// DRIFT: shm unlock is single-slot & per-connection counter vs C n-span & process-wide aLock[] See docs/btree/NOTES.md#drift-85-shm-unlock-single-slot-and-per-connection-counter
 func (s *mmapShm) unlock(slot int, lockType int) error {
 	if slot < 0 || slot >= lockSlotCount {
 		return fmt.Errorf("btree: invalid lock slot %d", slot)
@@ -235,6 +239,7 @@ func shmLockOffset(slot int) int64 {
 }
 
 // fcntlLock performs a POSIX fcntl lock operation on a 1-byte range.
+// DRIFT: fcntlLock maps only EACCES/EAGAIN to ErrBusy; C maps all fcntl errors to BUSY See docs/btree/NOTES.md#drift-82-fcntllock-maps-only-eacces-eagain-to-busy
 func (s *mmapShm) fcntlLock(lockType int, offset int64) error {
 	if s.file == nil {
 		return fmt.Errorf("btree: shm file closed")

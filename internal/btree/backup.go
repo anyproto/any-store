@@ -120,6 +120,7 @@ func (dst *DB) BackupInit(src *DB) (*Backup, error) {
 // for-loop at backup.c:251–276 collapses to one iteration with no
 // offset arithmetic. DRIFT #1 removes the PENDING_BYTE_PAGE guard at
 // backup.c:243/254.
+// DRIFT: backup uses global pager dbSize for page count, not the read-tx snapshot See docs/btree/NOTES.md#drift-38-backup-step-page-count-from-global-dbsize-not-read-snapshot
 func (b *Backup) onePage(iSrcPg uint32, srcData []byte, bUpdate bool) error {
 	if b.dst.pager.pageSize != b.src.pager.pageSize {
 		// Defensive: caught at Init, but reopen-race could in theory
@@ -186,6 +187,8 @@ func putUint32BE(buf []byte, v uint32) {
 // and re-returned by future calls (~ backup.c:329 + backup.c:558).
 //
 // ~ sqlite3_backup_step (backup.c:314–566).
+// DRIFT: backup uses global pager dbSize for page count, not the read-tx snapshot See docs/btree/NOTES.md#drift-38-backup-step-page-count-from-global-dbsize-not-read-snapshot
+// DRIFT: backup empty-source (nSrcPage==0 -> NewDb) path missing; truncateTo(0) errors See docs/btree/NOTES.md#drift-41-backup-empty-source-finalization-path-missing
 func (b *Backup) Step(nPage int) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -303,6 +306,9 @@ func (b *Backup) PageCount() uint32 {
 //
 // Both mutate the destination; Finish then commits the result.
 // Caller holds b.mu.
+// DRIFT: backup dst page-1 header fields reverted at commit (only cookie+dbsize survive) See docs/btree/NOTES.md#drift-40-backup-page-1-header-fields-reverted-at-commit
+// DRIFT: backup empty-source (nSrcPage==0 -> NewDb) path missing; truncateTo(0) errors See docs/btree/NOTES.md#drift-41-backup-empty-source-finalization-path-missing
+// DRIFT: backup finalize omits SetVersion(2) for WAL dest (page-1 bytes 18/19) See docs/btree/NOTES.md#drift-42-backup-finalize-omits-setversion-for-wal-destination
 func (b *Backup) finalize(nSrcPage uint32) error {
 	// 1. Bump dst schema cookie. ~ sqlite3BtreeUpdateMeta writes meta
 	// value #1 (the schema cookie) to the header at offset 40. Our page 1
@@ -333,6 +339,7 @@ func (b *Backup) finalize(nSrcPage uint32) error {
 // Caller holds the source pager's backups list lock momentarily — see
 // pager.dispatchBackupUpdate — but the callback runs outside that lock
 // to avoid nesting b.mu under backupsMu.
+// DRIFT: backup re-copies pages after DONE (DONE not treated fatal); corrupts finalized dst See docs/btree/NOTES.md#drift-39-backup-treats-done-as-non-fatal-allowing-post-completion-re-
 func (b *Backup) update(iPage uint32, data []byte) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -365,6 +372,8 @@ func (b *Backup) restart() {
 // Finish releases all resources associated with a Backup and commits
 // or rolls back the destination write transaction based on b.rc.
 // ~ sqlite3_backup_finish (backup.c:571–619).
+// DRIFT: backup dst commit deferred Step->Finish; durability/error point moved See docs/btree/NOTES.md#drift-43-backup-commit-point-moved-from-step-to-finish
+// DRIFT: double/late backup Finish returns ErrBackupFinished vs C no-op OK See docs/btree/NOTES.md#drift-44-backup-finish-double-call-returns-error-not-no-op
 func (b *Backup) Finish() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()

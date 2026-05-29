@@ -116,6 +116,7 @@ type pcache struct {
 	// END ENCRYPTION
 }
 
+// DRIFT: newPcache pre-sizes hash to capacity; SQLite always seeds exactly 256 buckets See docs/btree/NOTES.md#drift-130-newpcache-hash-table-pre-sized-to-capacity
 func newPcache(pageSize, maxPages int, purgeable bool) *pcache {
 	if maxPages <= 0 {
 		maxPages = defaultCacheSize
@@ -280,6 +281,7 @@ func (pc *pcache) initBulk() {
 // If the cache is full, it evicts clean pages first. If no clean pages
 // are available and xStress is set, invokes the stress callback to spill
 // a dirty page, making it clean and evictable.
+// DRIFT: pcache recycle/spill thresholds off-by-one ('>=' vs C 'nPage+1>=nMax' / strict '>') See docs/btree/NOTES.md#drift-127-pcache-recycle-and-spill-thresholds-off-by-one
 func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	if p := pc.hashFind(pgno); p != nil {
 		p.pinCount++
@@ -404,6 +406,7 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 // obtaining a page struct from pFree, initBulk, or heap allocation.
 // Consolidates the page initialization that was previously duplicated
 // in three code paths within create().
+// DRIFT: resetPage zeroes page buffer on every creation; SQLite never zeroes at fetch/recycle See docs/btree/NOTES.md#drift-129-resetpage-zeroes-buffer-on-every-page-creation
 func (pc *pcache) resetPage(p *page, pgno uint32) {
 	clear(p.data)
 	p.pgno = pgno
@@ -492,6 +495,7 @@ func (pc *pcache) makeDirty(p *page) {
 }
 
 // makeClean marks a page as clean (after writing to disk).
+// DRIFT: makeClean LRU insert missing release()'s non-purgeable (pcacheUnpin) guard See docs/btree/NOTES.md#drift-128-makeclean-lru-insert-missing-non-purgeable-guard
 func (pc *pcache) makeClean(p *page) {
 	if p.dirty {
 		p.dirty = false
@@ -568,6 +572,7 @@ func (pc *pcache) appendDirtyPages(buf []*page) []*page {
 // Used when the cache snapshot is invalidated but the cache object will be
 // reused (e.g. persistent reader cache with changed dataVersion, or writer
 // cache stale detection). For final disposal use destroy().
+// DRIFT: pcache clear/truncate omit C's pgno==0 page-1 zero-and-retain (nRefSum>0) special case See docs/btree/NOTES.md#drift-126-pcache-truncate-and-clear-omit-page-1-zero-and-preserve-spec
 func (pc *pcache) clear() {
 	// Under slab pressure, return ALL existing pFree buffers to the pool
 	// before adding new ones. This releases hoarded buffers from prior
@@ -687,6 +692,7 @@ func (pc *pcache) discard(pgno uint32) {
 // removed too (hashRemove clears inCache so a later release won't re-LRU them).
 // Walks each bucket chain in place via a pointer-to-link, mirroring SQLite
 // pcache1TruncateUnsafe (pcache1.c:644-687).
+// DRIFT: pcache clear/truncate omit C's pgno==0 page-1 zero-and-retain (nRefSum>0) special case See docs/btree/NOTES.md#drift-126-pcache-truncate-and-clear-omit-page-1-zero-and-preserve-spec
 func (pc *pcache) truncate(maxPage uint32) {
 	for bi := range pc.apHash {
 		pp := &pc.apHash[bi]

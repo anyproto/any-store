@@ -339,6 +339,7 @@ func (db *DB) LastAutoCheckpointError() error {
 }
 
 // Open opens or creates a database at the given path.
+// DRIFT: Open doesn't validate opts.PageSize against existing file's on-disk page size See docs/btree/NOTES.md#drift-64-open-does-not-validate-pagesize-against-on-disk-page-size
 func Open(path string, opts Options) (*DB, error) {
 	if opts.PageSize == 0 {
 		opts.PageSize = DefaultPageSize
@@ -597,6 +598,7 @@ func (db *DB) SetClosing() {
 }
 
 // Path returns the database file path.
+// DRIFT: Path() returns raw string for in-memory DBs vs SQLite's empty string See docs/btree/NOTES.md#drift-57-path-returns-raw-string-for-in-memory-dbs
 func (db *DB) Path() string {
 	return db.path
 }
@@ -613,6 +615,7 @@ func (db *DB) PageSize() uint32 {
 // Reads the atomic pager.dbSize directly; safe under any concurrent
 // transaction state because dbSize is monotonic within the current
 // WAL snapshot visible to the caller.
+// DRIFT: DatabaseSize returns global p.dbSize, not per-connection read snapshot; no tx check See docs/btree/NOTES.md#drift-56-databasesize-returns-global-writer-counter-not-read-snapshot
 func (db *DB) DatabaseSize() uint32 {
 	return db.pager.dbSize.Load()
 }
@@ -732,12 +735,14 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 }
 
 // BeginRead starts a read-only transaction.
+// DRIFT: BeginReadFast skips page-1 counter read; staleness APIs return stale/false See docs/btree/NOTES.md#drift-45-beginreadfast-skips-page-1-staleness-counter-reads
 func (db *DB) BeginRead() (*ReadTx, error) {
 	return db.beginRead(true)
 }
 
 // BeginReadFast starts a read-only transaction without reading page-1 counters.
 // It preserves snapshot isolation for data access, but skips staleness metadata.
+// DRIFT: BeginReadFast skips page-1 counter read; staleness APIs return stale/false See docs/btree/NOTES.md#drift-45-beginreadfast-skips-page-1-staleness-counter-reads
 func (db *DB) BeginReadFast() (*ReadTx, error) {
 	return db.beginRead(false)
 }
@@ -894,6 +899,8 @@ func (db *DB) WriterCacheLen() int {
 
 // Checkpoint triggers a WAL checkpoint with the specified mode, writing
 // committed WAL frames back to the database file.
+// DRIFT: DB.Checkpoint omits SQLite's same-handle open-tx SQLITE_LOCKED guard See docs/btree/NOTES.md#drift-47-checkpoint-omits-open-transaction-guard
+// DRIFT: DB.Checkpoint drops pnLog/pnCkpt out-parameters See docs/btree/NOTES.md#drift-48-checkpoint-drops-frame-count-out-parameters
 func (db *DB) Checkpoint(mode CheckpointMode) error {
 	if db.closing.Load() {
 		return ErrClosed
@@ -957,6 +964,7 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 
 // DeleteNamespace deletes a namespace. Must be called within a write transaction.
 // All pages belonging to the namespace's B-tree are freed to the freelist.
+// DRIFT: freeTreePages lacks clearDatabasePage's page-count/init/refcount/cycle guards See docs/btree/NOTES.md#drift-18-freetreepages-missing-corruption-cycle-and-refcount-guards-o
 func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 	if tx.closed {
 		return ErrTxClosed
@@ -986,6 +994,8 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 
 // freeTreePages recursively frees all pages in a B-tree,
 // including any overflow page chains attached to leaf cells.
+// DRIFT: freeTreePages lacks clearDatabasePage's page-count/init/refcount/cycle guards See docs/btree/NOTES.md#drift-18-freetreepages-missing-corruption-cycle-and-refcount-guards-o
+// DRIFT: freeTreePages frees root (drop) vs clearDatabasePage retains root (clear) See docs/btree/NOTES.md#drift-20-freetreepages-frees-root-page-versus-cleardatabasepage-clear
 func (db *DB) freeTreePages(pgno uint32) error {
 	pg, err := db.pager.getPage(pgno)
 	if err != nil {
@@ -1216,6 +1226,7 @@ func (tx *ReadTx) WalMaxFrame() uint32 { return tx.walHdr.mxFrame }
 // txGetPage fetches a page respecting MVCC snapshot isolation.
 // For write transactions, pages are fetched from the writer cache or WAL.
 // For read transactions, getPageReader uses a private cache for snapshot isolation.
+// DRIFT: page getters lack getAndInitPage's upfront pgno>pagecount ErrCorrupt guard See docs/btree/NOTES.md#drift-3-missing-pgno-greater-than-pagecount-descent-corruption-guard
 func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 	if tx.writable {
 		// Use pager.getPage which uses wal.nFrame (not the frozen
@@ -1468,6 +1479,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 // leftmostKeyAfter navigates to the first key in the subtree immediately
 // following cell[cellIdx].leftChild on interior page interiorPgno.
 // Used when a leaf search overshoots and needs the next sibling's first key.
+// DRIFT: descent omits moveToChild's per-child nCell>=1 corruption guard See docs/btree/NOTES.md#drift-11-movetochild-child-page-ncell-greater-than-equal-one-descent-
 func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte) ([]byte, error) {
 	pg, err := tx.txGetPage(interiorPgno)
 	if err != nil {
@@ -1758,6 +1770,7 @@ func (tx *WriteTx) ReleaseSavepoint(id int) error {
 }
 
 // CreateNamespace creates a new namespace within this transaction.
+// DRIFT: CreateNamespace adds ErrNamespaceExists uniqueness pre-check not in C See docs/btree/NOTES.md#drift-59-createnamespace-uniqueness-pre-check-not-in-btreecreatetable
 func (tx *WriteTx) CreateNamespace(name string) (*Namespace, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
@@ -1769,6 +1782,8 @@ func (tx *WriteTx) CreateNamespace(name string) (*Namespace, error) {
 }
 
 // DeleteNamespace deletes a namespace within this transaction.
+// DRIFT: freeTreePages lacks clearDatabasePage's page-count/init/refcount/cycle guards See docs/btree/NOTES.md#drift-18-freetreepages-missing-corruption-cycle-and-refcount-guards-o
+// DRIFT: freeTreePages leaks overflow chains on interior divider cells See docs/btree/NOTES.md#drift-19-deletenamespace-leaks-overflow-chains-on-interior-divider-ce
 func (tx *WriteTx) DeleteNamespace(name string) error {
 	if tx.closed {
 		return ErrTxClosed

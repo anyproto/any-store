@@ -53,6 +53,7 @@ func (ic *integrityChecker) tooManyErrors() bool {
 	return ic.maxErrors > 0 && len(ic.errors) >= ic.maxErrors
 }
 
+// DRIFT: integrity report() inverts mxErr==0 budget and omits per-message progress/interrupt hook See docs/btree/NOTES.md#drift-114-integrity-report-inverts-zero-error-budget-and-omits-progres
 func (ic *integrityChecker) report(format string, args ...any) {
 	if ic.tooManyErrors() {
 		return
@@ -166,6 +167,7 @@ func (ic *integrityChecker) checkList(isFreeList bool, firstPgno uint32, expecte
 // An implied first entry covers everything up to contentOffset-1 (header + cell
 // pointer array + unallocated gap). Gaps between entries within the content area
 // [contentOffset, usableSize) are counted as fragmentation.
+// DRIFT: integrity freeblock walk: break-then-analyze, weaker ordering, extra runtime checks See docs/btree/NOTES.md#drift-113-integrity-freeblock-walk-and-coverage-diagnostics-diverge
 func (ic *integrityChecker) checkPageCoverage(pg *page, context string, h []uint32) {
 	// contentOffset is cellContentOff from the page header.
 	// This is the start of the cell content area, NOT the end of the cell pointer array.
@@ -511,12 +513,14 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte) int 
 // IntegrityCheck validates the internal consistency of the entire database.
 // Returns nil if the database is consistent, or an *IntegrityError with
 // all issues found.
+// DRIFT: IntegrityCheck treats master page 1 as flat leaf; false positives once it splits See docs/btree/NOTES.md#drift-112-integritycheck-treats-master-page-1-as-flat-leaf
 func (db *DB) IntegrityCheck() error {
 	return db.IntegrityCheckN(100)
 }
 
 // IntegrityCheckN is like IntegrityCheck but stops after maxErrors issues.
 // Pass 0 for unlimited.
+// DRIFT: IntegrityCheck treats master page 1 as flat leaf; false positives once it splits See docs/btree/NOTES.md#drift-112-integritycheck-treats-master-page-1-as-flat-leaf
 func (db *DB) IntegrityCheckN(maxErrors int) error {
 	// Start a read transaction
 	maxFrame, slot, err := db.pager.beginRead()

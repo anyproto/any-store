@@ -2141,3 +2141,2197 @@ refinements (`where.c:5300,5363-5377`, tag-20210426-1) or the
 `WHERE_BIGNULL_SORT` NULLS-ordering handling -- they only affect whether
 *trailing* unconstrained columns can be elided or how NULLs sort, neither of
 which any-store's index/sort model exposes.
+
+## Audit-Discovered Drifts (2026-05-29)
+
+The following drifts were found by an automated per-function C-vs-Go audit of the
+b-tree port against sqlitec and deduplicated by root cause (the encryption/sqlcipher
+codec is excluded here and tracked separately).
+
+<a id="drift-1-overflow-chain-premature-termination-silently-tolerated"></a>
+### Drift: Overflow Chain Premature Termination Silently Tolerated
+- **Category:** changed-logic  -  **Severity:** high
+- **Affected functions:** `btree.go:*Cursor.AppendValue` (`pager.go:2535 (loop condition pgno != 0 && written < amt); pager.go:2592 (return nil); reached from btree.go:3634-3643 (Cursor.AppendValue)`), `btree.go:*Cursor.Value` (`internal/btree/pager.go:2535-2592 (called from internal/btree/btree.go:3564-3573)`), `btree.go:*btree.AppendValue` (`internal/btree/pager.go:2469`), `btree.go:*btree.cellFullKey` (`internal/btree/btree.go:1575 (call) and internal/btree/pager.go:2447-2469 (readOverflowChainAt loop/return)`), `btree.go:interiorFullKey` (`internal/btree/pager.go:2447 (and 2492); invoked from internal/btree/btree.go:896-904`), `btree.go:leafFullKey` (`btree.go:847-857; pager.go:2447-2469 (readOverflowChainAt); pager.go:2492-2513 (readOverflowChainReader)`), `db.go:*ReadTx.AppendValue` (`internal/btree/pager.go:2535`), `pager.go:*pager.readOverflowAt` (`internal/btree/pager.go:2535-2592`), `pager.go:*pager.readOverflowChainAt` (`internal/btree/pager.go:2447-2469`), `pager.go:*pager.readOverflowChainReader` (`pager.go:2492-2514`).
+
+SQLite's `accessPayload` ends every overflow-chain walk with an explicit
+completeness check -- `if( rc==SQLITE_OK && amt>0 ) return SQLITE_CORRUPT_PAGE(pPage)`
+(`btree.c:5327-5330`, comment "Overflow chain ends prematurely") -- so a chain whose
+next-page pointer hits 0 before all requested payload bytes have been transferred is
+rejected as corruption. The Go overflow readers (`readOverflowAt` loops
+`for pgno != 0 && written < amt`; `readOverflowChainAt` / `readOverflowChainReader`
+loop `for pgno != 0 && off < len(buf)`) simply exit the loop on a zero terminator and
+unconditionally `return nil`, with no post-loop `written == amt` / `off == len(buf)`
+check anywhere. Because the destination buffers are freshly zero-allocated, a short or
+truncated chain is silently accepted with the missing tail left zero-filled. Every
+caller inherits this gap -- value reads (`Cursor.Value`, `Cursor.AppendValue`,
+`ReadTx.AppendValue`, `btree.AppendValue`) and full-key reconstruction
+(`cellFullKey`, `leafFullKey`, `interiorFullKey`) -- so corrupt overflow data is
+returned to the application as a valid, partly-zeroed payload or key rather than
+surfacing as `ErrCorrupt`.
+
+<a id="drift-2-collectleafcells-and-collectinteriorcells-swallow-overflow-e"></a>
+### Drift: collectLeafCells And collectInteriorCells Swallow Overflow Errors During Rebuild
+- **Category:** changed-logic  -  **Severity:** high
+- **Affected functions:** `btree.go` (`internal/btree/btree.go:1520, 1623-1631 (silent swallow); btree.go:18-28 (SetDebugOverflowReadErrors / debugOverflowReadErrors toggle)`).
+
+During rebuild/balance, `collectInteriorCells` (`btree.go:1623-1631`) and
+`collectLeafCells` (`btree.go:1520`) read the overflowing key tail via
+`readOverflowChainAt` but discard the returned read/parse error in production code,
+panicking only when the global `debugOverflowReadErrors` flag is set by the test-only
+`SetDebugOverflowReadErrors` toggle (`btree.go:18-28`). `collectInteriorCells` then
+unconditionally frees the overflow chain (`freeOverflowChain` at `btree.go:1629`) and
+writes the possibly-truncated key back into the rebuilt page. The consequence is that
+a corrupt or short overflow read is silently folded back into the tree during balance
+and its source chain freed, converting a detectable read error into permanent,
+undetectable on-disk corruption.
+
+<a id="drift-3-missing-pgno-greater-than-pagecount-descent-corruption-guard"></a>
+### Drift: Missing pgno Greater Than Pagecount Descent Corruption Guard
+- **Category:** changed-logic  -  **Severity:** high
+- **Affected functions:** `db.go:*ReadTx.txGetPage` (`internal/btree/db.go:1219`), `pager.go:*pager.getPage` (`pager.go:728-811 (getPage/getPageWriter); pager.go:962-970 (getPageReader read path)`), `pager.go:*pager.getPageReader` (`internal/btree/pager.go:962-993`), `pager.go:*pager.getPageWriter` (`internal/btree/pager.go:734-810`).
+
+C's `getAndInitPage` -- the getter used for every interior->child step during cursor
+descent (`moveToChild` at `btree.c:5475`, inlined seek at `btree.c:6252`) -- begins
+with an upfront corruption guard `if( pgno>btreePagecount(pBt) ){ *ppPage=0; return
+SQLITE_CORRUPT_BKPT; }` (`btree.c:2396-2399`) that rejects any requested page number
+greater than the snapshot logical page count BEFORE the pager touches disk. The Go
+page getters (`txGetPage`, `getPage`/`getPageWriter`, `getPageReader`) have no such
+upfront bound check on the requested pgno. As a result a wild or out-of-range child
+pointer is not rejected as corruption; instead it flows down the read path where (per
+drift-4) an above-file, above-`dbSize` page is silently zero-filled and accepted,
+allowing descent to continue on a fabricated zero page rather than failing fast with
+`ErrCorrupt`.
+
+<a id="drift-4-beyond-file-pages-silently-zero-filled-skipping-header-valid"></a>
+### Drift: Beyond File Pages Silently Zero Filled Skipping Header Validation
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `db.go:*ReadTx.txGetPage` (`internal/btree/pager.go:962`).
+
+When a requested pgno is beyond the physical file AND beyond the `dbSize` bound, the
+Go readers (`getPageReader` `pager.go:970`, `getPageWriter` `pager.go:778-779`,
+`readTempPage` `pager.go:855`) `clear(pg.data)` and return a zero page with no error;
+the subsequent header parse is gated on `pg.data[off] != 0` (`pager.go:806/896/999`),
+so the page is returned with an empty `pageHeader{}` (`pageType=0`) and no
+validation. C's `getAndInitPage` instead returns `SQLITE_CORRUPT_BKPT` for any
+`pgno > btreePagecount(pBt)` before fetching (`btree.c:2396-2399`). The consequence is
+an un-validated zero page entering the descent/read path in place of a corruption
+error; severity is low because it is the same root failure surfaced by drift-3 and is
+bounded by the per-snapshot `dbSize` check.
+
+<a id="drift-5-getpagewriter-reads-disk-before-checking-dbsize"></a>
+### Drift: getPageWriter Reads Disk Before Checking dbSize
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `pager.go:*pager.getPageWriter` (`internal/btree/pager.go:770-808`).
+
+SQLite's `getPageNormal` decides read-vs-zero up front -- `if( !isOpen(fd) ||
+pPager->dbSize<pgno || noContent )` => `memset(pData,0,pageSize)` (`pager.c:5590,5615`)
+-- and never touches disk or WAL for a page whose number exceeds the logical database
+size. Go's `getPageWriter` inverts this ordering: it consults the WAL
+(`pager.go:751-768`) and calls `readDBPage` (`pager.go:772`) FIRST, only afterward
+considering `dbSize`. The consequence is that for a page number above the current
+database size `getPageWriter` can return stale trailing on-disk page content instead
+of a clean zeroed page, where SQLite would have guaranteed zeros.
+
+<a id="drift-6-wal-frame-read-failure-falls-through-to-disk-read"></a>
+### Drift: WAL Frame Read Failure Falls Through To Disk Read
+- **Category:** changed-logic  -  **Severity:** high
+- **Affected functions:** `pager.go:*pager.getPageWriter` (`internal/btree/pager.go:751-768`), `pager.go:*pager.readTempPage` (`internal/btree/pager.go:831-846`).
+
+In C `readDbPage`, once `sqlite3WalFindFrame` resolves a WAL frame (`iFrame != 0`) the
+page's current version lives only in the WAL: it reads that frame via
+`sqlite3WalReadFrame` and returns the result directly, with the DB-file read placed in
+the `else` branch and therefore unreachable, so a WAL read failure propagates as the
+page-get error (`pager.c:3035-3045`). The Go getters (`getPageWriter`,
+`readTempPage`), after the WAL index reports a frame > 0, attempt `wal.readFrame` and
+return on success but on failure deliberately ignore the error and fall through to a
+stale DB-file read. The consequence is a correctness hazard: when the authoritative
+WAL copy of a page cannot be read, Go silently substitutes the older committed-DB-file
+version instead of surfacing the WAL error, which can return outdated page content as
+if it were current.
+
+<a id="drift-7-short-db-file-read-treated-as-hard-error"></a>
+### Drift: Short DB File Read Treated As Hard Error
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.readTempPage` (`internal/btree/pager.go:847-855`).
+
+C `readDbPage` explicitly maps a short read of an in-bounds DB page to success: after
+`sqlite3OsRead`, `if( rc==SQLITE_IOERR_SHORT_READ ){ rc = SQLITE_OK; }`
+(`pager.c:3042-3044`), and because the pcache buffer is pre-zeroed the page is returned
+zero-padded rather than as an error (`os_unix.c:3575-3577` zero-fills the unread tail).
+Go's `readTempPage` instead treats a short read of an in-bounds page (`pgno <= dbSize`)
+in a physically-short DB file as a hard error. The consequence is divergent error
+behavior for a physically-truncated-but-logically-valid file: Go fails where SQLite
+returns a partially-read, zero-padded page as success.
+
+<a id="drift-8-max-page-count-sqlite-full-enforcement-absent"></a>
+### Drift: Max Page Count SQLITE_FULL Enforcement Absent
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.getPage` (`pager.go:734-811 (getPageWriter, no mxPgno check); errors.go:37 (ErrFull defined but unused)`), `pager.go:*pager.getPageNoContent` (`internal/btree/pager.go:1012`), `pager.go:*pager.getPageReader` (`internal/btree/pager.go:962-993`), `pager.go:newPager` (`pager.go:266 (newPager, missing mxPgno init); enforcement gap at pager.go:1173 (allocatePageNear: p.dbSize.Add(1) with no bound check)`).
+
+SQLite initializes `pPager->mxPgno = SQLITE_MAX_PAGE_COUNT` (0xfffffffe) in
+`sqlite3PagerOpen` (`pager.c:5049`) and enforces it at page-acquire/grow time: a
+not-yet-cached page with `pgno > pPager->mxPgno` returns `SQLITE_FULL`, releasing the
+page if `pgno <= dbSize` (`pager.c:5591-5598`). This both caps database growth (PRAGMA
+`max_page_count`) and prevents the page number from overflowing the 32-bit pgno space.
+The Go pager has no `mxPgno`/`maxPageCount` concept at all: `newPager`
+(`pager.go:266-275`) initializes no such field, the getters (`getPageWriter`,
+`getPageReader`, `getPageNoContent`) perform no ceiling check, `allocatePageNear` grows
+via `p.dbSize.Add(1)` (`pager.go:1173`) with no bound, and the defined `ErrFull`
+(`errors.go:37`) is unused. The consequence is that database growth is never capped and
+the 32-bit pgno guard SQLite relies on is absent.
+
+<a id="drift-9-getpagenocontent-returns-cached-page-un-zeroed"></a>
+### Drift: getPageNoContent Returns Cached Page Un Zeroed
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.getPageNoContent` (`internal/btree/pager.go:1017`).
+
+In SQLite `getPageNormal` the early "return without further ado" path is gated on
+`pPg->pPager && !noContent` (`pager.c:5567`), so on the NOCONTENT path the cache-hit
+shortcut is bypassed and control always falls into the branch that re-executes
+`memset(pPg->pData, 0, pPager->pageSize)` (`pager.c:5618`) -- a NOCONTENT request
+always yields a freshly zeroed page, even on a cache hit. Go's `getPageNoContent`
+(`pager.go:1017`) can return a cached page without re-zeroing it. The consequence is
+that a NOCONTENT caller in Go may observe stale residual bytes from the page's previous
+life, whereas SQLite guarantees zeros.
+
+<a id="drift-10-missing-refcount-greater-than-one-in-use-page-corruption-det"></a>
+### Drift: Missing Refcount Greater Than One In Use Page Corruption Detection
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.getPageNoContent` (`internal/btree/pager.go:1017`).
+
+SQLite fetches freelist/grow pages through `btreeGetUnusedPage` (`btree.c:2459`), which
+after `getPageNormal` rejects any page whose pager refcount > 1 --
+`if( sqlite3PagerPageRefcount((*ppPage)->pDbPage)>1 ){ releasePage; return
+SQLITE_CORRUPT_BKPT; }` (`btree.c:2464-2469`) -- because a page pulled off the freelist
+or appended past EOF that already has another outstanding reference means the same page
+is simultaneously in use, i.e. corruption. The Go grow/freelist fetch path
+(`getPageNoContent`, `pager.go:1017`) has no equivalent in-use / refcount detection.
+The consequence is that a freelist or grow page that is corruptly aliased to an
+already-in-use page is accepted silently instead of being rejected as `ErrCorrupt`.
+
+<a id="drift-11-movetochild-child-page-ncell-greater-than-equal-one-descent-"></a>
+### Drift: moveToChild Child Page nCell Greater Than Equal One Descent Guard Missing
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `btree.go:*Cursor.First` (`internal/btree/btree.go:3196-3200 (and getPageReader pager.go:908-959 lacking nCell validation)`), `btree.go:*Cursor.Last` (`btree.go:3223-3237 (cf. First btree.go:3178-3200)`), `btree.go:*Cursor.Seek` (`btree.go:3260-3277 (descent loop; child load at 3273; n==0 interior handling at 939-948)`), `btree.go:*btree.searchInterior` (`internal/btree/btree.go:910-948`), `db.go:*ReadTx.leftmostKeyAfter` (`db.go:1527-1542`), `db.go:*ReadTx.leftmostKeyAfter` (`db.go:1505-1508`).
+
+C validates every child page entered during descent: `moveToChild` (and its inlined
+copies inside `sqlite3BtreeIndexMoveto` / the seek paths) returns `SQLITE_CORRUPT_PGNO`
+when a freshly loaded child has `pPage->nCell < 1` (or its `intKey` disagrees with the
+cursor) -- `btree.c:5477-5482`, inlined at `btree.c:6253-6258` -- so an empty or
+structurally garbage child page can never be descended into. The Go descent paths
+(`Cursor.First` `btree.go:3196`, `Cursor.Last` `btree.go:3223-3237`, `Cursor.Seek`
+`btree.go:3273`, `searchInterior` `btree.go:910-948`, `leftmostKeyAfter`
+`db.go:1505-1508,1527-1542`) load each child via `getPage`/`getPageReader` -- which
+deserialize only the header and never check `cellCount >= 1` -- and loop straight back
+without a per-child structural guard. The consequence is that a corrupt interior page
+with zero cells (or a wrong-type page) is silently accepted during descent rather than
+rejected; the Go `leftmostKeyAfter` even maps an empty reached leaf to `ErrKeyNotFound`
+(`db.go:1505-1508`) where SQLite would never have reached it.
+
+<a id="drift-12-b-tree-kind-consistency-check-omitted-on-descent"></a>
+### Drift: B Tree Kind Consistency Check Omitted On Descent
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:*Cursor.Seek` (`btree.go:3260 (for pg.header.isInterior()); page.go:296-298 (isInterior accepts both interior types)`).
+
+SQLite validates the b-tree KIND (intKey / page-type) of every page touched during a
+seek: `moveToRoot` rejects a root whose `intKey` flag disagrees with the cursor's
+expectation (`(pCur->pKeyInfo==0)!=pRoot->intKey` -> `SQLITE_CORRUPT_PAGE`,
+`btree.c:5615-5617`), and `moveToChild` rejects any child where `pPage->intKey !=
+pCur->curIntKey` (`btree.c:5478`, inlined at `btree.c:6254`). The Go `Cursor.Seek` path
+branches purely on `pg.header.isInterior()` (`btree.go:3260`), and `isInterior`
+(`page.go:296-298`) returns true for both `pageTypeIntIdx`(2) and `pageTypeIntTbl`(5)
+without ever checking that the page's kind matches the b-tree being searched. The
+consequence is that a page of the wrong b-tree kind (intKey vs index) encountered
+during a seek is accepted and traversed instead of being rejected as corruption.
+
+<a id="drift-13-empty-interior-root-treated-as-empty-btree-not-corruption"></a>
+### Drift: Empty Interior Root Treated As Empty Btree Not Corruption
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `btree.go:*Cursor.First` (`internal/btree/btree.go:3178-3182`), `btree.go:*Cursor.Last` (`btree.go:3223-3237`).
+
+SQLite's `moveToRoot` treats a 0-cell interior root as a benign "virtual root" only
+when `pRoot->pgno==1`, and otherwise returns `SQLITE_CORRUPT_BKPT`
+(`btree.c:5624-5635`): a non-page-1 interior root with zero cells is corruption. Go's
+`Cursor.First` descent loop, when it reaches a 0-cell interior page (root or deeper),
+does `releasePage(pg); return nil` and leaves the cursor invalid (`btree.go:3178-3182`),
+i.e. it silently reports an empty b-tree; `Cursor.Last` (`btree.go:3223-3237`) likewise
+has no `rootPage==1` guard. The consequence is that a corrupt zero-cell interior root is
+accepted as a benign empty cursor instead of being flagged `ErrCorrupt`, and First/Last
+are asymmetric on this case.
+
+<a id="drift-14-b-plus-tree-traversal-drops-interior-cell-keys-versus-sqlite"></a>
+### Drift: B Plus Tree Traversal Drops Interior Cell Keys Versus SQLite B Tree
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:*Cursor.Next` (`btree.go:3697-3728`), `btree.go:*btree.countPage` (`btree.go:3083-3087`), `db.go:*ReadTx.Count` (`btree.go:3083-3087 (leaf-only count) vs 3089-3122 (interior: recurse, no cellCount add)`).
+
+any-store is a B+tree: index keys live exclusively on leaves, so an interior cell is
+only a separator/router, never a stored entry. SQLite's index B-tree instead treats
+interior cells as first-class keys -- `btreeNext` returns `SQLITE_OK` positioned on the
+interior separator after walking up via `moveToParent` (`btree.c:6361-6385`), and
+`sqlite3BtreeCount` adds `pPage->nCell` on interior pages too because
+`pPage->leaf || !pPage->intKey` (`btree.c:10529-10531`). Go's `Cursor.Next`
+(`btree.go:3697-3728`) never pauses on interior positions and `countPage` adds
+`cellCount` only on leaf pages (`btree.go:3083-3087`), recursing through interior pages
+without counting them. The consequence is a structural design divergence that surfaces
+in traversal (no interior-key stops) and in counting (interior cells excluded); for the
+B+tree shape both results are correct, but they differ from SQLite's B-tree semantics.
+
+<a id="drift-15-countpage-unbounded-recursion-no-depth-or-cycle-guard"></a>
+### Drift: countPage Unbounded Recursion No Depth Or Cycle Guard
+- **Category:** changed-logic  -  **Severity:** high
+- **Affected functions:** `btree.go:*btree.Count` (`btree.go:3077-3123 (specifically the unbounded recursion at 3107 and 3117)`), `btree.go:*btree.countPage` (`btree.go:3107`), `db.go:*ReadTx.Count` (`btree.go:3077-3123 (esp. recursive calls at 3107 and 3117; no depth guard)`).
+
+SQLite walks the tree for `sqlite3BtreeCount` iteratively using a cursor whose descent
+goes through `moveToChild`, which returns `SQLITE_CORRUPT_BKPT` once `iPage` reaches
+`BTCURSOR_MAX_DEPTH-1` (==19) (`btree.c:5466-5468`), so a cyclic or over-deep page
+structure is turned into a clean corruption error. Go's `countPage`
+(`btree.go:3077-3123`) is plain recursion: it validates only per-page cell-pointer/offset
+bounds (`btree.go:3097-3104`) and recurses on child pgno at `btree.go:3107` and on
+rightChild at `btree.go:3117` with no depth counter, no visited-page set, and no
+`btCursorMaxDepth` guard. The consequence is that a corrupt child-pointer cycle drives
+unbounded recursion to stack overflow and a hard process crash instead of returning
+`ErrCorrupt` -- and notably every other Go traversal (First/Next/Seek) does enforce a
+depth bound, making `countPage` the lone unguarded walker.
+
+<a id="drift-16-count-traversal-missing-interrupt-cancellation-check"></a>
+### Drift: Count Traversal Missing Interrupt Cancellation Check
+- **Category:** platform-support  -  **Severity:** low
+- **Affected functions:** `btree.go:*btree.Count` (`btree.go:3077-3123`), `btree.go:*btree.countPage` (`btree.go:3077`), `db.go:*ReadTx.Count` (`btree.go:3077-3123`).
+
+SQLite's `sqlite3BtreeCount` gates its page-walk loop on
+`!AtomicLoad(&db->u1.isInterrupted)` (`btree.c:10520`), so a long count over a huge tree
+can be cancelled via `sqlite3_interrupt` mid-walk and returns the in-progress rc
+(allowing `SQLITE_INTERRUPT`). Go's `countPage` (`btree.go:3077-3123`) has no
+interrupt/context/cancellation hook and always runs to completion or to an error. The
+consequence is that a `Count()` over a very large tree cannot be aborted; this is a
+missing SQLite runtime feature with low correctness impact.
+
+<a id="drift-17-count-return-type-truncates-i64-entry-total-to-go-int"></a>
+### Drift: Count Return Type Truncates i64 Entry Total To Go int
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:*btree.countPage` (`btree.go:3073`).
+
+SQLite returns the entry count as `i64` via `*pnEntry` (`btree.c:10508,10547`),
+guaranteeing a 64-bit total regardless of platform. Go's `Count`/`countPage` declare and
+accumulate the total as a Go `int` (`btree.go:3073`, with `total += c`), whose width is
+platform-dependent. The consequence is that on a 64-bit target the behavior is
+practically equivalent, but on a 32-bit target the total is 32-bit and could overflow for
+a very large tree, whereas SQLite is always `i64`.
+
+<a id="drift-18-freetreepages-missing-corruption-cycle-and-refcount-guards-o"></a>
+### Drift: freeTreePages Missing Corruption Cycle And Refcount Guards Of clearDatabasePage
+- **Category:** changed-logic  -  **Severity:** high
+- **Affected functions:** `db.go:*DB.DeleteNamespace` (`db.go:989-1042`), `db.go:*DB.freeTreePages` (`db.go:990`), `db.go:*DB.freeTreePages` (`db.go:1001-1002`), `db.go:*DB.freeTreePages` (`db.go:989`), `db.go:*WriteTx.DeleteNamespace` (`db.go:989-1042 (freeTreePages: no refcount/visited/depth guard; recursion at db.go:1009-1013)`).
+
+SQLite's `clearDatabasePage` validates each page before clearing it: it rejects
+`pgno > btreePagecount` with `SQLITE_CORRUPT_PGNO` (`btree.c:10228-10230`), runs
+`getAndInitPage` to validate the page header/cell structure (`btree.c:10231`), and
+rejects a page whose pager refcount `!= (1 + (pgno==1))` with `SQLITE_CORRUPT_PAGE`
+(`btree.c:10233-10238`) -- that refcount check is precisely what stops a corrupt
+self-referencing or cyclic child pointer from being followed. Go's `freeTreePages`
+(`db.go:989-1042`) fetches pages via `db.pager.getPage` with no upper-bound page-count
+check, no page-init validation, and no refcount/visited/cycle guard, and on interior
+pages it reads each child pointer straight from raw bytes --
+`off := ...Uint16(pg.data[cpOff+i*2:])` then `...Uint32(pg.data[off:off+4])`
+(`db.go:1001-1002`) -- with no bounds check on the cell offset. The consequence is that a
+corrupt cell offset near the page end can index out of `pg.data` and panic, and a cyclic
+child pointer drives unbounded recursion, instead of either returning a clean
+`ErrCorrupt`.
+
+<a id="drift-19-deletenamespace-leaks-overflow-chains-on-interior-divider-ce"></a>
+### Drift: DeleteNamespace Leaks Overflow Chains On Interior Divider Cells
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `db.go:*WriteTx.DeleteNamespace` (`db.go:995-1013 (freeTreePages interior branch); leaf-only overflow free at db.go:1014-1037`).
+
+SQLite's `clearDatabasePage` frees the overflow chains of every cell on every page,
+interior dividers included. Go's `freeTreePages` only frees overflow chains for leaf
+cells (`db.go:1014-1037`, `freeOverflowChain` at `db.go:1027`); its interior-page branch
+(`db.go:995-1013`) merely collects child pointers plus rightChild and recurses, never
+calling `parseInteriorCell`/`freeOverflowChain`. The consequence is that any overflow
+chain hanging off an interior divider cell -- a large index key whose payload exceeds
+`maxLocal` -- is never returned to the freelist when the namespace is dropped, leaking
+those pages.
+
+<a id="drift-20-freetreepages-frees-root-page-versus-cleardatabasepage-clear"></a>
+### Drift: freeTreePages Frees Root Page Versus clearDatabasePage Clear Semantics
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `db.go:*DB.freeTreePages` (`db.go:1041`).
+
+The mapped C function `clearDatabasePage` is the engine behind
+`sqlite3BtreeClearTable`, invoked with `freePageFlag=0` for the table root
+(`btree.c:10296`): the root is not freed but zeroed and kept as an empty root page
+(`btree.c:10258-10262`), only its child pages being freed with `freePageFlag=1`. Go's
+`freeTreePages` (`db.go:989-1042`) ends unconditionally with
+`return db.pager.freePage(pgno)` (`db.go:1041`) for every page, including the root, with
+no `freePageFlag` distinction. The consequence is a behavioral mismatch with the named
+mapping: Go implements drop-table semantics (root freed) where the mapped
+`clearDatabasePage` implements clear-table semantics (root retained).
+
+<a id="drift-21-empty-page-delete-does-not-cascade-underfullness-upward"></a>
+### Drift: Empty Page Delete Does Not Cascade Underfullness Upward
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `btree.go:*btree.Delete` (`internal/btree/btree.go:2493-2499 (empty-leaf path) and btree.go:2984-3007 (finishParentRemoval, no completeMergeUpward)`), `btree.go:*btree.removeChildFromParent` (`internal/btree/btree.go:2996-3006 (finishParentRemoval returns without cascading a non-root 0-cell interior)`).
+
+When a delete empties a non-root leaf, Go takes a dedicated fast path
+(`btree.go:2493-2499`) that releases the leaf, calls `pager.freePage(leafPgno)`, then
+`removeChildFromParent -> finishParentRemoval` (`btree.go:2984-3007`), which removes the
+divider and rebuilds the parent in place. If that non-root parent drops to 0 cells,
+`finishParentRemoval` rebuilds it as a degenerate single-child interior
+(`rebuildInteriorPage`, `btree.go:3000`) and simply returns, with no upward cascade.
+SQLite instead runs a `balance()` do-loop (`btree.c:9250-9258`) that propagates a merge /
+under-fullness from the emptied page up through every ancestor to the root. The
+consequence is that Go can leave a chain of degenerate single-child or under-full
+interior pages along the deletion path that SQLite would have merged away, producing a
+structurally looser (taller, sparser) tree than SQLite.
+
+<a id="drift-22-removechildfromparent-rightchild-dangling-pointer-and-double"></a>
+### Drift: removeChildFromParent rightChild Dangling Pointer And Double Free
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `btree.go:*btree.removeChildFromParent` (`internal/btree/btree.go:2952-2964 (no-op when len(cells)==0); consequence at finishParentRemoval btree.go:2996-3005 and collapseSingleChild btree.go:3031-3067`).
+
+In `removeChildFromParent`'s rightChild-removal branch (`childIdx == len(cells)`), the
+code only repoints `rightChild` when `len(cells) > 0`:
+`if len(cells) > 0 { rightChild = cells[len-1].leftChild; cells = cells[:len-1] }`
+(`btree.go:2952-2964`). When `len(cells)==0` the branch is a no-op, so `rightChild` keeps
+pointing at `childPgno` -- the page the caller (`Delete`, `btree.go:2495`) already freed.
+The consequence is a dangling rightChild pointer into a freed page, which downstream
+(`finishParentRemoval` `btree.go:2996-3005`, `collapseSingleChild` `btree.go:3031-3067`)
+can turn into a double-free on the root, corrupting the freelist.
+
+<a id="drift-23-emptied-root-leaf-not-reset-to-pristine-empty-page"></a>
+### Drift: Emptied Root Leaf Not Reset To Pristine Empty Page
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:*btree.Delete` (`internal/btree/btree.go:2510-2513 (root-leaf 0-cell falls through to no-op return without header reset)`).
+
+When `dropCell` takes a page's `nCell` to 0, SQLite resets it to a pristine empty page:
+`memset(&data[hdr+1],0,4)` clears the freeblock pointer and fragmentation byte,
+`put2byte(&data[hdr+5], usableSize)` resets the cell-content offset, and `nFree` is reset
+to a full empty page (`btree.c:7301-7306`). Go's `Delete` resets a page on becoming empty
+only in the non-root fast path; an emptied root leaf falls through to a no-op return
+(`btree.go:2510-2513`) without this header reset. The consequence is that the emptied
+root leaf retains stale `cellContentOff`/`fragBytes` values rather than the pristine
+empty-page header SQLite guarantees.
+
+<a id="drift-24-delete-fast-path-validates-cell-bounds-against-full-page-not"></a>
+### Drift: Delete Fast Path Validates Cell Bounds Against Full Page Not usableSize
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:*btree.Delete` (`internal/btree/btree.go:2399-2405 (parseLeafCellWithSize bounds against dataLen=pageSize, not usableSize)`).
+
+SQLite's `dropCell` explicitly rejects a cell whose content runs past the usable region:
+`if( pc+sz > pPage->pBt->usableSize ) *pRC = SQLITE_CORRUPT_BKPT`
+(`btree.c:7291-7294`). Go's `Delete` fast path parses the deleted cell via
+`parseLeafCellWithSize` (`btree.go:2401`), whose bounds checks compare offsets against
+`dataLen = len(page.data)`, and the page buffer is always allocated at the full
+`pageSize` (not `usableSize`) (`btree.go:2399-2405`). The consequence is that Go validates
+against full page size and so drops SQLite's reserved-region corruption check: a cell that
+extends into the reserved tail (past `usableSize` but within `pageSize`) is accepted
+instead of being rejected as `ErrCorrupt`.
+
+<a id="drift-25-updateleafcell-in-place-overwrite-uses-255-byte-fragmentatio"></a>
+### Drift: updateLeafCell In Place Overwrite Uses 255 Byte Fragmentation Cap
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `btree.go:*btree.Put` (`btree.go:1388`), `btree.go:*btree.updateLeafCell` (`internal/btree/btree.go:1389`), `db.go:*WriteTx.Put` (`internal/btree/btree.go:1389`).
+
+On a same-key `Put` that shrinks a cell, the live update path (`*btree.Put` ->
+`insertIntoLeafWithPath` -> `updateLeafCell`) overwrites the new data in place and treats
+the leftover bytes (`waste = oldCellSize - newCellSize`) as page fragmentation, computing
+`newFrag := int(pg.header.fragBytes) + waste` and taking the in-place branch whenever
+`newFrag <= 255` (`btree.go:1386-1397`). That `255` is just the saturation point of the
+uint8 `fragBytes` header field, not SQLite's defragmentation trigger: SQLite forces a
+`defragmentPage` rebuild once fragmentation reaches roughly 57-60 bytes. The cap is also
+internally inconsistent with the Delete path, which uses a 60-byte threshold. The
+consequence is that Go lets a leaf page accumulate up to 255 bytes of dead space before
+ever compacting it, so repeated shrinking same-key updates leave pages far more fragmented
+(and free-space far more scattered) than SQLite would tolerate.
+
+<a id="drift-26-leaf-cell-size-missing-four-byte-minimum-clamp"></a>
+### Drift: Leaf Cell Size Missing Four Byte Minimum Clamp
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:leafCellSize` (`internal/btree/btree.go:230`), `btree.go:leafCellSizeFromLengths` (`btree.go:354`), `btree.go:leafCellSizeWithOverflow` (`btree.go:341`), `btree.go:parseLeafCellWithSize` (`internal/btree/btree.go:162-175`).
+
+SQLite's `cellSizePtrIdxLeaf` and the cell parsers (`btreeParseCellPtr` /
+`btreeParseCellPtrIndex`) clamp the computed non-overflow cell size up to a 4-byte minimum
+-- `if( nSize<4 ) nSize = 4;` (`btree.c:1486-1488`, `1350-1351`, `1389-1390`). This floor
+is a hard on-disk-format invariant: when such a cell is later freed it is converted into an
+intra-page freeblock, whose header needs at least 4 bytes (2-byte next-pointer + 2-byte
+size). Go's size and parse routines (`leafCellSize` `btree.go:230-232`,
+`leafCellSizeFromLengths`, `leafCellSizeWithOverflow`, and `parseLeafCellWithSize`) all
+omit this minimum-cell-size clamp, returning the raw `hdr + payload` with no lower bound.
+The consequence is that a degenerate tiny cell (sub-4-byte) would be sized below the
+freeblock minimum, so freeing it could not store a valid freeblock header -- a latent
+deviation from SQLite's free-space format guarantee, mitigated in practice only because
+real key/value cells comfortably exceed 4 bytes.
+
+<a id="drift-27-interior-cell-parser-missing-maxpayloadalloc-validation-and-"></a>
+### Drift: Interior Cell Parser Missing maxPayloadAlloc Validation And u32 Truncation
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:parseInteriorCell` (`btree.go:197-223`), `btree.go:parseInteriorCell` (`btree.go:197-201`).
+
+`parseInteriorCell` decodes `keyLen` via `getVarintSafe` as a full uncapped 64-bit varint
+(`btree.go:183-226`) and never validates it against `maxPayloadAlloc` (`1<<30`) the way the
+sibling leaf parsers do (`parseLeafCellWithSize` at `btree.go:132-138`, `leafCellPayloadLen`
+at `namespace_size.go:135`). Its overflow detection is gated on `us > 0`, so when
+`usableSize` is omitted/zero a corrupt 9-byte varint flows through unchecked and can panic.
+This also diverges from SQLite's `btreeParseCellPtrIndex`, which accumulates `nPayload` into
+a `u32` (`btree.c:1363,1369-1376`) and therefore silently truncates an oversized varint to
+its low 32 bits before clamping to the page (deliberately unlike the table-leaf parser's
+u64-plus-mask path). The consequence is that Go's interior parser neither caps nor truncates
+a corrupt key length, so a malformed interior cell can produce an out-of-range allocation or
+panic where SQLite would have bounded or silently wrapped the value.
+
+<a id="drift-28-searchleafpage-missing-overflow-cell-compare-guard"></a>
+### Drift: searchLeafPage Missing Overflow Cell Compare Guard
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:searchLeafPage` (`btree.go:457-507`).
+
+SQLite's `indexCellCompare` classifies an index cell by inspecting its payload-size varint
+into three cases (`btree.c:5980-5998`): a single-byte payload or a 2-byte varint whose
+`nCell <= maxLocal` may be compared against the cell's local bytes, but otherwise the record
+overflows the page and it returns `c=99` to skip the local-bytes fast path and force the
+full-key comparison. Go's `searchLeafPage` (`btree.go:457-507`) has no equivalent on-page
+vs. overflow guard in its fast path. The consequence is that for an index cell whose payload
+spills into an overflow chain, Go can compare against only the locally stored prefix as if it
+were the whole key, yielding a silent wrong-key comparison and a potentially incorrect search
+result.
+
+<a id="drift-29-root-interior-overflow-uses-2-way-split-not-balance-deeper-p"></a>
+### Drift: Root Interior Overflow Uses 2 Way Split Not balance_deeper plus balance_nonroot
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:*btree.insertIntoParent` (`internal/btree/btree.go:2113-2166`), `btree.go:*btree.insertIntoParent` (`internal/btree/btree.go:2268-2272`), `btree.go:*btree.insertSepIntoAncestor` (`btree.go:2113`), `btree.go:*btree.insertSepIntoAncestor` (`balance.go:874`).
+
+When a separator must be inserted into a full interior page that is the btree ROOT (no
+grandparent to gather siblings from), Go does not run SQLite's `balance_deeper` +
+`balance_nonroot` even-fill packing. Instead `insertSepIntoInterior` falls to a classic
+2-way median split (`btree.go:2113-2166`): collect the root's interior cells, splice in the
+new divider, pick a split via `interiorSplitPoint` (a ~2/3 left-fill target,
+`btree.go:295-329`), rebuild into two interior pages, and grow a new root through
+`splitRoot`. The same fill-factor deviation recurs in `rewriteParentAfterBalance`'s
+over-full fallback (`balance.go:874-877`) and in the legacy non-path `insertIntoParent`,
+which on a failed re-descent unconditionally calls `splitRoot` as a "safety net"
+(`btree.go:2268-2272`) rather than reporting corruption. The consequence is that root-level
+interior overflow produces a different (and looser) page-fill distribution than SQLite's
+balanced redistribution.
+
+<a id="drift-30-rebuildpage-missing-content-area-cell-pointer-collision-fit-"></a>
+### Drift: rebuildPage Missing Content Area Cell Pointer Collision Fit Check
+- **Category:** changed-logic  -  **Severity:** high
+- **Affected functions:** `btree.go:*btree.rebuildInteriorPage` (`btree.go:1737-1762`), `btree.go:*btree.rebuildLeafPage` (`internal/btree/btree.go:1669-1708`).
+
+C's `rebuildPage` defends against the descending content cursor colliding with the ascending
+cell-pointer array on every single cell: after `pData -= sz` and writing the pointer it does
+`if( pData < pCellptr ) return SQLITE_CORRUPT_BKPT;` (`btree.c:7691-7693`). This in-function
+guard catches the case where the accumulated cell content no longer fits on the page. Go's
+`rebuildLeafPage` (`btree.go:1669-1708`) and `rebuildInteriorPage` (`btree.go:1737-1762`)
+decrement `contentOff` and write each cell and pointer with no such lower-bound fit check.
+The consequence is that on a page-overflow condition Go panics (out-of-bounds slice) or
+silently overwrites the cell-pointer array, corrupting the page, instead of cleanly
+returning `ErrCorrupt` the way SQLite does.
+
+<a id="drift-31-rebuildinteriorpage-accepts-zero-cell-pages"></a>
+### Drift: rebuildInteriorPage Accepts Zero Cell Pages
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:*btree.rebuildInteriorPage` (`btree.go:1730-1762`).
+
+C's `rebuildPage` hard-asserts `nCell>0` (`btree.c:7666-7667`) and its only callers
+(`balance_quick`, the `editPage` fallback) guarantee at least one cell. Go's
+`rebuildInteriorPage` is instead deliberately invoked with zero cells -- e.g. the
+`removeChildFromParent` / collapse paths and `rebuildInteriorPage(rootPg, nil, ...)` -- and
+faithfully produces an interior page carrying only a `rightChild` with `cellCount=0`. The
+consequence is that Go's structural contract for interior pages is looser than SQLite's:
+degenerate single-child interior pages are a normal, accepted state rather than an asserted
+impossibility, which is the structural foundation that lets the underfullness-cascade drifts
+(see Drift 20/21) leave such pages in the tree.
+
+<a id="drift-32-missing-balance-quick-zero-cell-over-full-page-corruption-gu"></a>
+### Drift: Missing balance_quick Zero Cell Over Full Page Corruption Guard
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:*btree.splitLeafRightmostAppend` (`btree.go:1794-1826`).
+
+SQLite's `balance_quick` opens with `if( pPage->nCell==0 ) return SQLITE_CORRUPT_BKPT;`
+(`btree.c:8020`, added for `dbfuzz001.test`): an over-full page that nonetheless reports
+zero cells is corruption and is rejected before any allocation or parent mutation. Go's
+`splitLeafRightmostAppend` (the rightmost-append fast split, `btree.go:1794-1826`) has no
+analogous `cellCount==0` guard; its dispatch precondition is only
+`idx == int(pg.header.cellCount) && len(path) > 0`. The consequence is that a corrupt
+over-full-but-zero-cell page that SQLite would reject up front is instead processed by Go,
+allocating a page and mutating the parent on malformed input.
+
+<a id="drift-33-missing-balance-self-ancestor-refcount-corruption-guard"></a>
+### Drift: Missing balance Self Ancestor Refcount Corruption Guard
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:*btree.splitLeafAndInsertWithPath` (`btree.go:1839-1882`).
+
+On the non-root general-balance path, SQLite's `balance()` driver rejects a corrupt tree
+before redistributing cells: if the over-full non-root page being balanced has pager
+refcount > 1 it returns `SQLITE_CORRUPT_PAGE`, because the only way a non-root page can hold
+more than one reference at that point is if it is one of its own ancestor pages -- a cyclic
+tree (`btree.c:9173-9177`). Go's dispatcher `splitLeafAndInsertWithPath`
+(`btree.go:1839-1882`) has no refcount>1 / self-ancestor corruption guard. The consequence
+is that a cyclic (self-referential) tree that SQLite would detect and reject as corruption
+is instead followed by Go, which can loop or corrupt state while balancing.
+
+<a id="drift-34-splitroot-missing-anothervalidcursor-corruption-guard"></a>
+### Drift: splitRoot Missing anotherValidCursor Corruption Guard
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:*btree.splitRoot` (`btree.go:2279`).
+
+SQLite gates the `balance_deeper` (root-overflow) path on a corruption precondition: the
+root-overflow branch only proceeds when `anotherValidCursor(pCur)==SQLITE_OK`
+(`btree.c:9153`), where `anotherValidCursor` (`btree.c:9110-9121`) walks all other cursors on
+the same `BtShared` and returns `SQLITE_CORRUPT_PAGE` if any other cursor is `CURSOR_VALID`
+and positioned on the same page about to be deepened. Go's `splitRoot` (`btree.go:2279`)
+deepens the root with no equivalent check. The consequence is that a state SQLite treats as
+corruption -- another live cursor pinned to the page being restructured -- is allowed by Go,
+risking that the second cursor is left referencing a now-stale/repurposed root page.
+
+<a id="drift-35-legacy-superseded-insert-path-functions-undocumented"></a>
+### Drift: Legacy Superseded Insert Path Functions Undocumented
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `btree.go:*btree.splitLeafAndInsert` (`btree.go:2319-2342`).
+
+The live insert path is `Insert` -> `getWritablePage(leaf)` -> `insertIntoLeafWithPath`
+(`btree.go:1155`) -> `splitLeafAndInsertWithPath` -> `balanceNonroot`. A second, closed
+cluster -- `splitLeafAndInsert` (`btree.go:2170`), `insertIntoPage` (`btree.go:1162`),
+`insertIntoLeaf`, `insertIntoInterior` (`btree.go:2319`), and the non-path
+`insertIntoParent` (which falls back to `splitRoot`) -- forms a self-referential set with no
+production (non-test, non-`WithPath`) entry point. It is dead/legacy code superseded by the
+`WithPath` family. The consequence is purely a documentation/maintenance drift: unlike
+`tryMergeLeaf`, which is explicitly marked superseded, this legacy cluster is not annotated
+as dead code, so a reader may mistake it for a live, divergent insert path.
+
+<a id="drift-36-cursor-stack-not-cleared-on-close-enabling-use-after-close-r"></a>
+### Drift: Cursor Stack Not Cleared On Close Enabling Use After Close Repin
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `btree.go:*Cursor.releasePages` (`btree.go:3157`).
+
+SQLite's `btreeReleaseAllCursorPages` (`btree.c:700-709`) both releases every pinned page in
+the cursor's stack and sets `pCur->iPage = -1`; the `iPage=-1` reset is the load-bearing part
+that logically empties the stack, and SQLite's traversal/insert/delete code keys off
+`iPage<0` (e.g. the assert at `btree.c:9709`). Go's `releasePages` (`btree.go:3157-3164`)
+only nils each `frame.pg` to release the pinned pages but does not reset the stack to empty.
+The consequence is that after `Close()` the cursor still reports a non-empty stack, which
+defeats the `Next`/`Previous` emptiness guard and enables a use-after-close: a subsequent
+operation can re-pin a since-released (and possibly repurposed) page and misread it as an
+interior page.
+
+<a id="drift-37-delete-rebalance-underfull-trigger-counts-fragbytes-as-used"></a>
+### Drift: Delete Rebalance Underfull Trigger Counts fragBytes As Used
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `db.go:*WriteTx.Delete` (`btree.go:2486-2488`).
+
+SQLite gates post-delete rebalancing on the page's *true* free space: after `dropCell`,
+`balance()` is skipped iff `pCur->pPage->nFree*3 <= usableSize*2` (`btree.c:10005`), where
+`nFree` (maintained by `freeSpace`, `btree.c:2022`) counts *all* bytes reclaimed from the
+dropped cell as free, including non-coalescible fragmentation. Go's `WriteTx.Delete`
+computes its trigger as `nFree := usable - bt.leafUsedSpace(wpg)` then
+`underfull := nFree*3 > usable*2` (`btree.go:2486-2488`), but `leafUsedSpace`
+(`btree.go:2653-2654`) returns `cellPtrEnd + (usable - contentOff)`, i.e. it treats every
+byte in the unallocated/fragmented region as *used*. Because Go's `nFree` excludes the
+fragmentation bytes that SQLite's `nFree` includes, Go's underfull test fires *less* eagerly
+than SQLite's. The consequence is that some pages SQLite would rebalance after a delete are
+left under-occupied by the Go port, a benign space-utilization divergence rather than a
+correctness defect.
+
+<a id="drift-38-backup-step-page-count-from-global-dbsize-not-read-snapshot"></a>
+### Drift: Backup Step Page Count From Global dbSize Not Read Snapshot
+- **Category:** changed-logic  -  **Severity:** high
+- **Affected functions:** `backup.go:*Backup.Step` (`internal/btree/backup.go:234`),
+  `backup.go:*Backup.onePage` (`internal/btree/backup.go:152-154`, `db.go:616-617`,
+  `backup.go:204+234`).
+
+SQLite captures the source page count under the read transaction it opened for the copy:
+`nSrcPage = sqlite3BtreeLastPage(pSrc)` (`backup.c:394`) returns `pWal->hdr.nPage` as held
+consistent at read-lock time, i.e. the *snapshot's* page count, and `backupOnePage` patches
+destination page-1 offset 28 with the same read-lock-stable `sqlite3BtreeLastPage`
+(`backup.c:272`). The Go port opens a fresh read tx via `b.src.BeginRead()`
+(`backup.go:204`) but then derives both the copy-loop bound and the page-1 `DatabaseSize`
+patch from `b.src.DatabaseSize()` (`backup.go:234`, `backup.go:152-154`), which resolves to
+`db.pager.dbSize.Load()` (`db.go:616-617`) -- the single shared, global pager allocation
+counter, not the read snapshot. The consequence is that a concurrent writer advancing the
+global `dbSize` between snapshot acquisition and these reads can skew the copied page count
+and the size field written into the backup, producing a destination whose recorded size does
+not match the snapshot actually copied.
+
+<a id="drift-39-backup-treats-done-as-non-fatal-allowing-post-completion-re-"></a>
+### Drift: Backup Treats Done As Non Fatal Allowing Post Completion Re Copy Corruption
+- **Category:** changed-logic  -  **Severity:** high
+- **Affected functions:** `backup.go:*Backup.update` (`backup.go:341`),
+  `pager.go:*pager.dispatchBackupUpdate` (`backup.go:341`).
+
+SQLite's `backupUpdate` gates each per-page re-copy on
+`if( !isFatalError(p->rc) && iPage<p->iNext )` (`backup.c:675`), and `isFatalError`
+(`backup.c:217-219`) returns TRUE for `SQLITE_DONE` because DONE is neither OK, BUSY, nor
+LOCKED. Therefore once a backup has finished (`p->rc == SQLITE_DONE`, set at `backup.c:564`),
+`backupUpdate` does nothing for any further source-page write and the finalized destination
+is never touched again. Go's `update` guards instead with
+`if b.rc != nil && b.rc != ErrBackupDone { return }` (`backup.go:341`), explicitly treating
+`ErrBackupDone` as non-fatal so the update path *proceeds* after completion. The consequence
+is that source commits arriving after a backup completes re-copy pages into the
+already-finalized destination -- whose schema cookie has been bumped and which has been
+truncated -- corrupting it.
+
+<a id="drift-40-backup-page-1-header-fields-reverted-at-commit"></a>
+### Drift: Backup Page 1 Header Fields Reverted At Commit
+- **Category:** changed-logic  -  **Severity:** critical
+- **Affected functions:** `backup.go:*Backup.finalize` (`internal/btree/backup.go:306-326`,
+  `internal/btree/pager.go:1920`).
+
+In SQLite, `backupOnePage` copies the source page-1 bytes *verbatim* into the destination
+(only offset 28 patched to source `LastPage`), and `finalize` then patches only meta-1
+(cookie at offset 40) via `sqlite3BtreeUpdateMeta` plus the WAL version bytes; SQLite has no
+parsed in-memory db-header it re-serializes over page 1 at commit, so every other page-1
+field the backup copied survives unchanged. Go's `onePage` likewise copies the source
+page-1 bytes and patches offset 28, but the Go pager *does* hold a parsed `dbHeader` that it
+re-serializes over page 1 at commit (`pager.go:1920`), so any page-1 header field copied
+from the source is silently reverted to the destination's own header values -- only the
+`SchemaCookie` and `DatabaseSize` that Go explicitly re-applies in `finalize`
+(`backup.go:306-326`) survive. The consequence is that backup destinations can lose page-1
+header fields (page size, text encoding, user/application metadata, etc.) that SQLite would
+have faithfully carried over from the source, making this a critical fidelity divergence.
+
+<a id="drift-41-backup-empty-source-finalization-path-missing"></a>
+### Drift: Backup Empty Source Finalization Path Missing
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `backup.go:*Backup.Step` (`internal/btree/backup.go:264`),
+  `backup.go:*Backup.finalize` (`internal/btree/backup.go:264-272`, `backup.go:325`,
+  `pager.go:2645-2647`).
+
+On the final (DONE) iteration SQLite special-cases a zero-page source: inside the
+`rc==SQLITE_DONE` block it runs `if(nSrcPage==0){ rc=sqlite3BtreeNewDb(pDest); nSrcPage=1; }`
+(`backup.c:424-427`) -- rebuilding a fresh 1-page destination -- *before* bumping the schema
+cookie and truncating. Go's done-path (`b.iNext > nSrcPage`) calls `b.finalize(nSrcPage)`
+directly (`backup.go:264-272`) with no equivalent empty-source handling, so for
+`nSrcPage==0` it invokes `finalize(0)` whose `truncateTo(0)` returns
+`btree: cannot truncate to zero pages` (`pager.go:2645-2647`). The consequence is that
+backing up an empty source database -- a no-op success in SQLite -- errors out in the Go
+port instead of producing a valid 1-page destination.
+
+<a id="drift-42-backup-finalize-omits-setversion-for-wal-destination"></a>
+### Drift: Backup Finalize Omits SetVersion For WAL Destination
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `backup.go:*Backup.finalize` (`internal/btree/backup.go:306-326`).
+
+When the destination is in WAL mode, SQLite's `finalize` calls
+`sqlite3BtreeSetVersion(pDest,2)` to force page-1 file-format read/write version bytes 18/19
+to 2 (`backup.c:435-437`; `btree.c:11527-11528` writes `aData[18]=aData[19]=2`). Go's
+`finalize` (`backup.go:306-326`) performs only the schema-cookie bump and `DatabaseSize`
+re-application and omits this `SetVersion` step. For any-store this is benign by invariant:
+the engine is always WAL, so the source bytes copied into the destination are already 2 and
+the destination's in-memory header carries the WAL version regardless. The consequence is a
+latent divergence that would only matter if a non-WAL source were ever backed up to a WAL
+destination, which any-store's always-WAL design precludes.
+
+<a id="drift-43-backup-commit-point-moved-from-step-to-finish"></a>
+### Drift: Backup Commit Point Moved From Step To Finish
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `backup.go:*Backup.Finish` (`internal/btree/backup.go:264-272`,
+  `backup.go:384-391`).
+
+In SQLite the destination write transaction is committed *inside* `sqlite3_backup_step` on
+the final DONE iteration via `sqlite3BtreeCommitPhaseTwo(pDest,0)` (`backup.c:542`), after
+which `p->rc` becomes `SQLITE_DONE`; by the time `sqlite3_backup_finish` runs the destination
+is already committed and durable, and finish's only transaction action is a no-op rollback
+(`backup.c:606`). The Go port defers the destination commit to `Finish`
+(`backup.go:384-391`): `Step`'s done-path only finalizes in-memory state (`backup.go:264-272`)
+and the actual commit happens later. The consequence is that the durability boundary and the
+point at which a commit error surfaces both move from `Step` to `Finish`, so a caller who
+treats a successful final `Step` as "backup committed" can be wrong, and a commit failure is
+reported from a different call than in SQLite.
+
+<a id="drift-44-backup-finish-double-call-returns-error-not-no-op"></a>
+### Drift: Backup Finish Double Call Returns Error Not No Op
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `backup.go:*Backup.Finish` (`internal/btree/backup.go:372-375`).
+
+SQLite's `sqlite3_backup_finish(p)` is NULL-tolerant and idempotent: it returns `SQLITE_OK`
+immediately when `p==0` (`backup.c:583`) and treats a second finish on a freed handle as a
+benign no-op. The Go port adds an explicit `finished` flag (struct field, `backup.go:74-76`):
+`Finish` returns `ErrBackupFinished` on a second call (`backup.go:372-375`) and `Step`
+returns `ErrBackupFinished` after `Finish` (`backup.go:193-195`). The consequence is a
+stricter, non-SQLite contract -- repeated finalization is surfaced as an error rather than
+silently absorbed -- which can break callers (or wrappers) that rely on SQLite's idempotent
+finish semantics.
+
+<a id="drift-45-beginreadfast-skips-page-1-staleness-counter-reads"></a>
+### Drift: BeginReadFast Skips Page 1 Staleness Counter Reads
+- **Category:** new-feature  -  **Severity:** medium
+- **Affected functions:** `db.go:*DB.BeginRead` (`db.go:741`),
+  `db.go:*DB.BeginReadFast` (`internal/btree/db.go:741`, `db.go:669-682`, `db.go:727-730`,
+  `db.go:1577-1596`), `db.go` (`internal/btree/db.go:639-682`, `db.go:739-743`).
+
+Go parameterizes its read-transaction opener as `beginRead(readCounters bool)` (`db.go:642`)
+and adds a public `BeginReadFast()` that passes `readCounters=false` (`db.go:741-743`); on
+that fast path `pager.readHeaderCounters` is skipped and the transaction's
+`diskFileChangeCounter`/`diskSchemaCookie` are seeded from the process-local cached counters
+(`db.go:669-682`, `db.go:727-730`) rather than from on-disk page-1 metadata. Snapshot
+isolation for actual data reads is preserved -- the path still fixes the WAL `maxFrame`/reader
+slot and clears the per-connection reader cache on change-counter mismatch, matching SQLite's
+`pagerBeginReadTransaction` reset behavior -- so the divergence is purely in the staleness
+reporting layer, which has no SQLite analogue to begin with. The consequence is that on a
+fast read `IsDataStale`/`IsSchemaStale` always return false and
+`DiskFileChangeCounter`/`DiskSchemaCookie` return possibly-stale local values
+(`db.go:1577-1596`); this is an undocumented new API whose semantics a caller must understand
+to avoid mistaking a fast read's "not stale" for a verified cross-process check.
+
+<a id="drift-46-public-multi-process-staleness-api-diverges-from-sqlite-auto"></a>
+### Drift: Public Multi Process Staleness API Diverges From SQLite Auto Tracking
+- **Category:** new-feature  -  **Severity:** medium
+- **Affected functions:** `db.go` (`internal/btree/db.go:1577-1597`, `db.go:1646-1654`,
+  `db.go:913-916`, `db.go:1684-1690`).
+
+any-store exposes a caller-driven multi-process staleness protocol with no analogue in stock
+SQLite. SQLite *automatically* increments the page-1 File Change Counter (offset 24) and
+Schema Cookie (offset 40) inside the pager on every commit / schema change. any-store instead
+makes counter bumping opt-in: `WriteTx.MarkDataChanged()`/`MarkSchemaChanged()`
+(`db.go:1646-1654`) merely set `tx.dataChanged`/`tx.schemaChanged` flags, and `Commit` only
+increments the on-disk counters when those flags are set (`db.go:1684-1690`), with
+`UpdateLocalCounters` (`db.go:913-916`) and the `IsDataStale`/`IsSchemaStale`/
+`DiskFileChangeCounter`/`DiskSchemaCookie` accessors (`db.go:1577-1597`) forming the rest of
+the surface. The consequence is a fundamentally different contract from SQLite's automatic
+tracking: a caller who forgets to call `MarkDataChanged`/`MarkSchemaChanged` will leave the
+cross-process change counters unbumped, so other connections' staleness checks silently fail
+to observe the change.
+
+<a id="drift-47-checkpoint-omits-open-transaction-guard"></a>
+### Drift: Checkpoint Omits Open Transaction Guard
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `db.go:*DB.Checkpoint` (`db.go:897`).
+
+SQLite's `sqlite3BtreeCheckpoint` refuses to run if the *calling connection* has any
+transaction open: `if( pBt->inTransaction!=TRANS_NONE ){ rc = SQLITE_LOCKED; }`
+(`btree.c:11343-11344`), invoking `sqlite3PagerCheckpoint` only when `TRANS_NONE`. Go's
+`DB.Checkpoint` (`db.go:897-907`) has no equivalent guard -- it only checks `db.closing` and
+takes a `db.mu.RLock()` -- so it can proceed to checkpoint while the same handle holds an
+open read or write transaction. The consequence is that a self-deadlock/inconsistency case
+SQLite explicitly rejects with `SQLITE_LOCKED` is instead allowed by the Go port, letting a
+connection attempt to checkpoint against its own in-flight transaction state.
+
+<a id="drift-48-checkpoint-drops-frame-count-out-parameters"></a>
+### Drift: Checkpoint Drops Frame Count Out Parameters
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `db.go:*DB.Checkpoint` (`db.go:897`).
+
+SQLite's checkpoint API returns, via out-parameters, the final number of frames in the WAL
+(`pnLog`) and the number of frames checkpointed/backfilled (`pnCkpt`):
+`sqlite3PagerCheckpoint` forwards `pnLog`/`pnCkpt` into `sqlite3WalCheckpoint`
+(`pager.c:7510-7536`), where `*pnLog = pWal->hdr.mxFrame` and `*pnCkpt` is the backfill
+count; these are surfaced by `sqlite3_wal_checkpoint_v2` and let callers monitor checkpoint
+progress. Go's `DB.Checkpoint` signature (`db.go:897`) drops both out-parameters entirely.
+The consequence is a reduced observability surface: callers cannot inspect how much of the
+WAL existed or was backfilled by a checkpoint, a benign API-completeness divergence rather
+than a correctness defect.
+
+<a id="drift-49-non-passive-checkpoint-returns-success-instead-of-busy-on-in"></a>
+### Drift: Non Passive Checkpoint Returns Success Instead Of BUSY On Incomplete Backfill
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `pager.go:*pager.checkpointWithMode` (`pager.go:2321-2329` (wrapper);
+  `wal.go:3008-3012` and `wal.go:3340-3341` (suppression points)),
+  `wal.go:*wal.checkpointPost` (`internal/btree/wal.go:3305-3307`),
+  `wal.go:*wal.checkpointWithMode` (`wal.go:3295-3319` (checkpointPost;
+  backfill<authoritativeMxFrame -> return nil)).
+
+SQLite's `walCheckpoint` enforces the documented `sqlite3_wal_checkpoint_v2` contract for
+non-PASSIVE modes (FULL/RESTART/TRUNCATE): after the backfill phase it runs
+`if( pInfo->nBackfill < pWal->hdr.mxFrame ){ rc = SQLITE_BUSY; }` (`wal.c:2352-2356`), and its
+final return `return (rc==SQLITE_OK && eMode!=eMode2 ? SQLITE_BUSY : rc)` (`wal.c:4425`) also
+surfaces `SQLITE_BUSY` whenever the requested mode was silently downgraded to PASSIVE because
+the writer lock could not be obtained (`eMode2 = SQLITE_CHECKPOINT_PASSIVE`, `wal.c:4356`).
+Both signals tell the caller that active readers prevented the full WAL from being copied into
+the DB, so the requested mode did not fully succeed. The Go port suppresses both: a single
+incomplete-case gate in `checkpointPost` (`wal.go:3305-3307`) returns `nil` (success)
+regardless of mode when `backfill < w.authoritativeMxFrame()`, and the write-lock busy
+downgrade is likewise swallowed (`wal.go:3008-3012`, `wal.go:3340-3341`). The consequence is
+an error-signaling / API-contract drift: a caller requesting a FULL/RESTART/TRUNCATE
+checkpoint gets a false success and cannot tell that readers blocked the operation -- the data
+path stays consistent, so this is not corruption, but the BUSY-means-retry semantics SQLite
+guarantees are lost.
+
+<a id="drift-50-checkpoint-never-physically-truncates-db-file-after-full-bac"></a>
+### Drift: Checkpoint Never Physically Truncates DB File After Full Backfill
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `wal.go:*wal.checkpoint` (`internal/btree/wal.go:3275-3290`),
+  `wal.go:*wal.checkpointPassive` (`internal/btree/wal.go:3276-3290` (and the promise at
+  `pager.go:2636-2655`)), `wal.go:*wal.checkpointWithMode` (`wal.go:3270-3291` (post-backfill:
+  WriteAt + fdatasync, no dbFile.Truncate); `pager.go:2639-2640` (incorrect 'truncation at next
+  checkpoint' comment)).
+
+SQLite's `walCheckpoint` physically shrinks the database file once the entire WAL has been
+backfilled: when `mxSafeFrame==walIndexHdr(pWal)->mxFrame` it computes
+`szDb = pWal->hdr.nPage*szPage` and calls `sqlite3OsTruncate(pWal->pDbFd, szDb)` followed by an
+`sqlite3OsSync` (`wal.c:2321-2329`), and this runs for all non-error modes
+(PASSIVE/FULL/RESTART/TRUNCATE). This is how on-disk space is reclaimed after a committed
+transaction reduced the page count (e.g. `backup.go`'s `truncateTo`, or any future
+VACUUM/shrink). The Go `checkpointWithMode` only writes backfilled pages back via WriteAt +
+fdatasync (`wal.go:3270-3291`) and never reads `hdr.nPage` to call `dbFile.Truncate` down to
+the committed page count. The consequence is that trailing pages dropped by a shrinking commit
+remain physically allocated on disk indefinitely; the database file only grows, and the
+`pager.go:2639-2640` comment promising "truncation at next checkpoint" is incorrect.
+
+<a id="drift-51-checkpoint-backfill-missing-idbpage-greater-than-mxpage-filt"></a>
+### Drift: Checkpoint Backfill Missing iDbpage Greater Than mxPage Filter
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `wal.go:*wal.checkpoint` (`internal/btree/wal.go:3244-3266`),
+  `wal.go:*wal.checkpointWithMode` (`wal.go:2861-2888` (buildBackfillMap, no nPage bound) and
+  `wal.go:3244-3266` (write loop, no iDbpage>mxPage skip)).
+
+SQLite's `walCheckpoint` backfill loop skips any frame whose target page number exceeds the
+committed DB size: `if( iFrame<=nBackfill || iFrame>mxSafeFrame || iDbpage>mxPage ) continue;`
+where `mxPage = pWal->hdr.nPage` is the committed page count from the last commit frame
+(`wal.c:2228`, `wal.c:2306`). This prevents copying orphaned WAL frames for pages that lie
+beyond the final committed end of the database -- for example a page that was written and then
+logically dropped by a later shrinking commit. The Go path has no such bound:
+`buildBackfillMap` (`wal.go:2861-2888`) carries no `nPage` limit and the write loop
+(`wal.go:3244-3266`) has no `iDbpage>mxPage` skip. The consequence is that over-grown / orphan
+frames could be backfilled into the DB file past its committed size, writing stale pages that
+SQLite would have discarded.
+
+<a id="drift-52-checkpoint-missing-page-size-mismatch-and-over-grow-corrupti"></a>
+### Drift: Checkpoint Missing Page Size Mismatch And Over Grow Corruption Guards
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.checkpoint` (`internal/btree/wal.go:3040-3043`).
+
+SQLite's `sqlite3WalCheckpoint` carries two corruption guards the Go port omits: (1) a
+page-size sanity check `if( pWal->hdr.mxFrame && walPagesize(pWal)!=nBuf ) rc =
+SQLITE_CORRUPT_BKPT;` rejecting a checkpoint when the WAL's recorded page size disagrees with
+the configured page/buffer size (`wal.c:4386-4387`); and (2) inside `walCheckpoint`, an
+over-grow check `if( (nSize+65536+mxFrame*szPage)<nReq ) rc = SQLITE_CORRUPT_BKPT;` that flags
+corruption when the DB would need to grow implausibly far. The Go `checkpoint` path
+(`wal.go:3040-3043`) performs neither test. The consequence is that a corrupt WAL header (wrong
+page size) or an implausibly over-grown checkpoint that SQLite would refuse with
+`SQLITE_CORRUPT` is instead processed silently; the practical exposure is low because such
+states are themselves rare, but the defensive corruption detection is absent.
+
+<a id="drift-53-auto-checkpoint-escalates-to-wal-restart-beyond-passive"></a>
+### Drift: Auto Checkpoint Escalates To WAL Restart Beyond Passive
+- **Category:** new-feature  -  **Severity:** medium
+- **Affected functions:** `pager.go:*pager.tryCheckpoint` (`internal/btree/pager.go:2333-2356`).
+
+SQLite's auto-checkpoint is strictly PASSIVE: the default WAL hook
+(`sqlite3WalDefaultHook`, `main.c:2471-2483`) fires when `nFrame >= nAutoCheckpoint` and calls
+`sqlite3_wal_checkpoint(db, zDb)`, which uses `SQLITE_CHECKPOINT_PASSIVE` and flows through
+`sqlite3PagerCheckpoint` (`pager.c:7510-7539`) with no post-PASSIVE escalation. Go's
+`tryCheckpoint` (`pager.go:2333-2356`) first performs a pure PASSIVE backfill via
+`checkpointPassive` and then, when that backfill completed, escalates to a best-effort
+WAL-RESTART (`pager.go:2348-2354`) to reset the WAL. The consequence is a behavioral extension
+beyond SQLite: an automatic checkpoint can reset/restart the WAL rather than leaving it for a
+later explicit checkpoint, changing when the WAL is recycled relative to stock SQLite -- a new
+feature that callers tuning checkpoint behavior should be aware of.
+
+<a id="drift-54-close-time-checkpoint-runs-unconditionally-without-guards"></a>
+### Drift: Close Time Checkpoint Runs Unconditionally Without Guards
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `db.go:*DB.Close` (`internal/btree/pager.go:2758-2789`).
+
+SQLite's `sqlite3PagerClose` enables the close-time checkpoint (passing the non-NULL buffer
+`a=pTmp` to `sqlite3WalClose`) only when `db && 0==(db->flags & SQLITE_NoCkptOnClose) &&
+SQLITE_OK==databaseIsUnmoved(pPager)` (`pager.c:4189-4191`). `databaseIsUnmoved`
+(`pager.c:4142-4161`) issues `SQLITE_FCNTL_HAS_MOVED` and, if the DB file has been
+renamed/relinked out from under the open fd, returns `SQLITE_READONLY_DBMOVED` so the
+checkpoint is skipped -- avoiding checkpointing into a file that is no longer the real
+database, and honoring the `NoCkptOnClose` opt-out. The Go close-time checkpoint
+(`pager.c:2758-2789` in the port) runs unconditionally with no `databaseIsUnmoved` /
+`NoCkptOnClose` guard. The consequence is that closing a connection whose DB file was moved or
+unlinked underneath it will still attempt to checkpoint, and callers have no way to suppress
+the close-time checkpoint -- a behavior SQLite explicitly guards against.
+
+<a id="drift-55-wal-file-truncated-but-never-unlinked-on-last-client-close"></a>
+### Drift: WAL File Truncated But Never Unlinked On Last Client Close
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `db.go:*DB.Close` (`internal/btree/wal.go:3396-3402`),
+  `pager.go:*pager.close` (`pager.go:2785-2787` (truncate call) and `wal.go:3396-3402`
+  (truncateFile)).
+
+SQLite's `sqlite3WalClose`, after a successful checkpoint under the EXCLUSIVE DB-file lock,
+deletes the `-wal` file in its default non-persistent-WAL mode: it queries
+`SQLITE_FCNTL_PERSIST_WAL` and, if the result is not `1`, sets `isDelete = 1`
+(`wal.c:2536-2540`) and unlinks the file via `sqlite3OsDelete(pWal->pVfs, pWal->zWalName, 0)`
+(`wal.c:2553-2558`); only the persistent-WAL branch (`bPersist==1 && mxWalSize>=0`) instead
+truncates the WAL to zero via `walLimitSize`. The Go `pager.close` path
+(`pager.go:2785-2787`) calls `truncateFile` (`wal.go:3396-3402`), truncating the WAL to zero
+length but never unlinking it. The consequence is that after the last client closes, a
+zero-length `-wal` file is left behind on disk rather than being removed as stock SQLite would
+do; this is benign in operation but diverges from SQLite's default file-lifecycle cleanup.
+
+<a id="drift-56-databasesize-returns-global-writer-counter-not-read-snapshot"></a>
+### Drift: DatabaseSize Returns Global Writer Counter Not Read Snapshot
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `db.go:*DB.DatabaseSize` (`db.go:616-618`).
+
+SQLite's `sqlite3PagerPagecount` (`pager.c:3928`) returns `pPager->dbSize`, a *per-connection*
+value established at the calling connection's read-transaction start (set from
+`sqlite3WalDbsize() == pWal->hdr.nPage`), and it asserts a read transaction is open
+(`assert(pPager->eState>=PAGER_READER)` and `!=PAGER_WRITER_FINISHED`, `pager.c:3926-3927`)
+because that assertion is what makes the value a meaningful snapshot; the equivalent
+`sqlite3BtreeLastPage` returns the caller's snapshot `pBt->nPage`. The Go `DatabaseSize()`
+(`db.go:616-618`) instead returns `db.pager.dbSize.Load()` -- the *process-global writer*
+allocation counter bumped in `allocatePage` -- and has no read-transaction precondition,
+so it can be called with no transaction open at all. The consequence is that `DatabaseSize()`
+returns whatever the last writer left in the global counter rather than a stable per-reader
+snapshot, so concurrent readers can observe a size that does not match their own consistent
+view of the database.
+
+<a id="drift-57-path-returns-raw-string-for-in-memory-dbs"></a>
+### Drift: Path Returns Raw String For In Memory DBs
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `db.go:*DB.Path` (`db.go:600`).
+
+SQLite's `sqlite3BtreeGetFilename` calls `sqlite3PagerFilename(pPager, /*nullIfMemDb=*/1)`,
+which for in-memory / memdb (and TEMP) databases returns `&zFake[4]`, i.e. the empty string
+`""`, and only returns the real `pPager->zFilename` for genuine file-backed databases. The Go
+`*DB.Path()` (`db.go:600-602`) unconditionally returns `db.path`, which is the raw
+caller-supplied `path` argument (set at `db.go:506`, never canonicalized for in-memory since
+`filepath.Abs` is applied only when `!opts.InMemory`). The consequence is that for an
+in-memory database `Path()` returns the caller's literal string rather than the empty string
+SQLite reports, so callers using an empty path to detect an in-memory DB (the SQLite
+convention) will misclassify it.
+
+<a id="drift-58-wal-read-begin-backoff-off-by-one"></a>
+### Drift: WAL Read Begin Backoff Off By One
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `db.go:*DB.beginRead` (`internal/btree/wal.go:2421`).
+
+SQLite's `walTryBeginRead` increments its back-off counter `*pCnt` at the *top* of the function
+(`wal.c:3043` `(*pCnt)++;`), making it a 1-based invocation count, and gates its retry sleeps
+on that 1-based value (first sleep at `if( *pCnt>5 )`, quadratic ramp at `if( *pCnt>=10 )`).
+Go's `wal.beginReadHdr` -- driven by `db.beginRead` through `pager.beginReadHdr` -- increments
+or tests the counter at a different point, so the quadratic back-off ramp starts one retry
+later than SQLite (`wal.go:2421`). The consequence is a minor timing divergence in the
+read-transaction retry path: under contention the Go reader sleeps one iteration behind
+SQLite's schedule, which affects retry pacing only and not correctness.
+
+<a id="drift-59-createnamespace-uniqueness-pre-check-not-in-btreecreatetable"></a>
+### Drift: CreateNamespace Uniqueness Pre Check Not In btreeCreateTable
+- **Category:** new-feature  -  **Severity:** low
+- **Affected functions:** `db.go:*WriteTx.CreateNamespace` (`internal/btree/db.go:927-933`).
+
+Go's `*DB.CreateNamespace` (the worker invoked by `*WriteTx.CreateNamespace`) first calls
+`db.getNamespaceLocked(name)` and, before allocating a root page, returns `ErrNamespaceExists`
+if the namespace already exists (propagating any non-`ErrNamespaceNotFound` lookup error)
+(`db.go:927-933`). SQLite's `btreeCreateTable` performs no existence or uniqueness check at all
+-- it unconditionally allocates and zeroes a new root page, leaving uniqueness entirely to the
+higher schema layer. The consequence is an added, non-SQLite uniqueness contract at the btree
+layer: namespace creation is idempotently rejected rather than always allocating a fresh root,
+a new feature that changes the create semantics relative to stock SQLite.
+
+<a id="drift-60-savepoint-rollback-resurrects-pages-allocated-after-savepoin"></a>
+### Drift: Savepoint Rollback Resurrects Pages Allocated After Savepoint
+- **Category:** changed-logic  -  **Severity:** high
+- **Affected functions:** `db.go:*WriteTx.RollbackToSavepoint`
+  (`internal/btree/pager.go:2226`), `pager.go:*pager.getWritablePage`
+  (`/Users/roma/anytype/any-store/internal/btree/pager.go:1088-1095` (and `1129-1136`);
+  rollback restore at `pager.go:2226-2260`), `pager.go:*pager.rollbackToSavepoint`
+  (`pager.go:2230-2256` (restore loop, no pgno<=sp.dbSize guard); `pager.go:1088-1095` &
+  `1128-1136` (COW save, no guard)).
+
+SQLite only journals and replays a page for a savepoint when that page existed when the
+savepoint was opened, enforced by a two-fold guard on the original page count `nOrig`:
+`subjRequiresPage` requires `p->nOrig>=pgno` (`pager.c:1073`) so a page allocated after a
+savepoint is never sub-journaled into it, and `addToSavepointBitvecs` sets a page's bit only
+when `pgno<=p->nOrig` (`pager.c:1815`). On `ROLLBACK TO`, `pagerPlaybackSavepoint` first
+restores `pPager->dbSize = pSavepoint->nOrig` (`pager.c:3426`) and `pager_playback_one_page`
+skips any journaled page with `pgno>pPager->dbSize`, so pages allocated after the savepoint are
+simply discarded (`assertTruncateConstraintCb` even asserts no dirty page exists with
+`pgno>dbSize`). The Go port has neither guard: `getWritablePage` saves savepoint
+copy-on-write copies for pages allocated after the savepoint (`pager.go:1088-1095`,
+`1129-1136`), and `rollbackToSavepoint` restores them with no `pgno<=sp.dbSize` filter
+(`pager.go:2230-2256`). The consequence is that savepoint rollback resurrects pages that were
+allocated after the savepoint as dirty "ghost" pages above `dbSize`, violating the invariant
+SQLite explicitly asserts and risking corruption from dirty pages living beyond the logical end
+of the database.
+
+<a id="drift-61-out-of-range-savepoint-release-errors-instead-of-no-op"></a>
+### Drift: Out Of Range Savepoint Release Errors Instead Of No Op
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `db.go:*WriteTx.ReleaseSavepoint` (`internal/btree/pager.go:2288`),
+  `pager.go:*pager.releaseSavepoint` (`pager.go:2288`).
+
+SQLite's `sqlite3PagerSavepoint` guards its entire body with
+`if( rc==SQLITE_OK && iSavepoint<pPager->nSavepoint )` (`pager.c:7017`), and its header comment
+makes the contract explicit: "If iSavepoint is greater than (Pager.nSavepoint-1), then this
+function is a no-op." (`pager.c:6990-6991`) -- so a RELEASE with an index `>= nSavepoint` silently
+succeeds (returns `SQLITE_OK`), destroying nothing. Go's `releaseSavepoint`
+(`pager.go:2288-2290`) instead does `if id < 0 || id >= len(p.savepoints) { return
+ErrInvalidSavepoint }`, returning an error for an out-of-range savepoint id. The consequence is
+that any higher layer relying on the documented no-op behavior of releasing an already-gone or
+never-opened savepoint will hit a hard error in Go where SQLite would have quietly succeeded.
+
+<a id="drift-62-full-in-transaction-rollback-isavepoint-minus-one-unsupporte"></a>
+### Drift: Full In Transaction Rollback iSavepoint Minus One Unsupported
+- **Category:** new-feature  -  **Severity:** low
+- **Affected functions:** `db.go:*WriteTx.RollbackToSavepoint` (`internal/btree/pager.go:2183`).
+
+SQLite's `sqlite3BtreeSavepoint`/`sqlite3PagerSavepoint` explicitly accept `iSavepoint == -1`
+(`SAVEPOINT_ROLLBACK`) to mean "roll back the entire transaction contents but keep the transaction
+open and the locks held" -- `btree.c:4618-4622` documents that "no locks are released and the
+transaction remains open", `pager.c:7015` asserts `iSavepoint>=0 || op==ROLLBACK`, and the
+playback path at `pager.c:3426` uses `pPager->dbOrigSize` / `pagerRollbackWal` for this whole-txn
+case. Go's `RollbackToSavepoint` (`internal/btree/pager.go:2183`) has no support for this
+in-transaction full rollback: there is no `-1`/`SAVEPOINT_ROLLBACK` sentinel and no path that
+rewinds the transaction to its origin while keeping it open. The consequence is a missing SQLite
+capability -- callers cannot perform a full in-transaction rollback that preserves the open
+transaction and its locks, and must instead abort and re-begin.
+
+<a id="drift-63-new-db-page-1-written-directly-to-file-bypassing-wal"></a>
+### Drift: New DB Page 1 Written Directly To File Bypassing WAL
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `db.go:Open`
+  (`internal/btree/pager.go:606-612 (also initNewDB entry pager.go:416-418, 542)`),
+  `pager.go:*pager.initNewDB` (`internal/btree/pager.go:593-613`).
+
+SQLite defers page-1 creation to the first write transaction: `newDatabase` dirties page 1 via
+`sqlite3PagerWrite(pP1->pDbPage)` (`btree.c:3528`) and never touches the file directly, so the
+actual disk write of the new page 1 happens later through the normal commit path (a WAL frame or
+rollback-journal transaction) when the enclosing write transaction commits. Go's
+`Open` -> `p.open()` -> `initNewDB()` instead eagerly builds the page-1 image (DB header + empty
+leaf-index page) into a local buffer and writes it straight to the main DB file via
+`p.file.WriteAt(writeBuf, 0)` followed by `fdatasync(p.file)` (`pager.go:606-612`), all inside
+`Open()` before any transaction begins and entirely bypassing the WAL. The consequence is that
+initial database creation is not a transactional, WAL-mediated change as in SQLite -- the new
+page 1 is durably committed to the main file outside of any transaction, so a crash mid-creation
+or any reader/recovery logic that assumes page 1 first appears via the WAL sees a state SQLite
+would never produce.
+
+<a id="drift-64-open-does-not-validate-pagesize-against-on-disk-page-size"></a>
+### Drift: Open Does Not Validate PageSize Against On Disk Page Size
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `db.go:Open`
+  (`internal/btree/db.go:373,396 and internal/btree/pager.go:446 (no opts-vs-header page-size check); internal/btree/page_slab.go:78-86 (pool returns opts-sized buffer)`).
+
+`Open()` validates `opts.PageSize` only for self-consistency (`db.go:343-352`), then uses it to
+(1) key the process-global page buffer pool via `initPageBufferPool(opts.PageSize)` (`db.go:373`)
+and (2) construct the pager with `opts.PageSize` (`db.go:396`). When opening an EXISTING file,
+`p.open()` silently overwrites `p.pageSize` with the on-disk header value via
+`p.pageSize = p.header.PageSize` (`pager.go:446`) -- with no comparison against `opts.PageSize`
+and no error if they differ. The consequence is a buffer-pool size mismatch: the global page pool
+(`page_slab.go:78-86`) hands out buffers sized to `opts.PageSize` while the pager now operates on
+header-sized pages, so opening a file whose real page size differs from the caller's option yields
+mis-sized page buffers rather than the clean error SQLite would raise.
+
+<a id="drift-65-open-trusts-header-databasesize-without-reconciling-file-siz"></a>
+### Drift: Open Trusts Header DatabaseSize Without Reconciling File Size
+- **Category:** changed-logic  -  **Severity:** high
+- **Affected functions:** `page.go:*dbHeader.deserialize` (`internal/btree/pager.go:448`),
+  `pager.go:*pager.open` (`internal/btree/pager.go:448`).
+
+C's `lockBtree` cross-checks the header's page count against the actual file length: it reads
+`nPage=get4byte(28+aData)`, obtains the real file page count `nPageFile` via
+`sqlite3PagerPagecount`, falls back to `nPageFile` when the header counter is `0` or the
+change-counter sentinel looks stale (`btree.c:3304-3308`), and treats `nPage > nPageFile` as
+`SQLITE_CORRUPT_BKPT` (unless writable-schema), otherwise clamping `nPage=nPageFile`
+(`btree.c:3411-3418`) -- i.e. it refuses to trust a header claiming more pages than the file
+physically contains. Go's `deserialize` stores `DatabaseSize` verbatim and `open()` does
+`p.dbSize.Store(p.header.DatabaseSize)` straight from the header (`pager.go:448`), with the only
+later adjustment being a max-with-WAL bump (`if p.wal.index.maxPage.Load() > p.dbSize.Load()`);
+the lone `f.Stat()` call never reconciles the header against the file size. The consequence is
+that a corrupt or truncated header page count is trusted wholesale, so the pager can believe the
+database has more pages than the file actually holds -- reading past the real end of file rather
+than rejecting the file as corrupt the way SQLite does.
+
+<a id="drift-66-page-1-header-validation-missing-in-open-and-deserialize"></a>
+### Drift: Page 1 Header Validation Missing In Open And Deserialize
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `page.go:*dbHeader.deserialize` (`internal/btree/page.go:250-253`),
+  `page.go:*dbHeader.deserialize` (`internal/btree/page.go:250-251`),
+  `page.go:*dbHeader.deserialize` (`internal/btree/pager.go:447`),
+  `page.go:*pageHeader.deserialize` (`internal/btree/page.go:313-322`),
+  `page.go:*pageHeader.deserialize`
+  (`internal/btree/page.go:316 (and the read-path callers in pager.go:760/807/839/897/954/1000 that never validate cellCount)`),
+  `pager.go:*pager.open` (`internal/btree/pager.go:432`),
+  `pager.go:*pager.open` (`internal/btree/page.go:251`),
+  `pager.go:*pager.open` (`internal/btree/pager.go:447`).
+
+C's `lockBtree` rejects a malformed page 1 with `SQLITE_NOTADB` on a battery of checks the Go open
+path omits entirely: the embedded-payload-fraction bytes 21-23 must equal exactly `64/32/32`
+(`if( memcmp(&page1[21], "\100\040\040",3)!=0 ) goto page1_init_failed;`, `btree.c:3371`); the
+file-format version bytes are validated (`if(page1[18]>2)` marks `BTS_READ_ONLY` and
+`if(page1[19]>2) goto page1_init_failed`, with `page1[19]==2` routing into WAL mode,
+`btree.c:3332-3362`); and `usableSize` (pageSize minus the reserved-space byte) must be `>= 480`
+(`btree.c:3422`). Go's `dbHeader.deserialize` (`page.go:232-270`) reads `ReservedSpace`,
+`WriteVersion`, and `ReadVersion` but never checks bytes 21-23, never tests the version bytes
+anywhere in the open path, and computes `usableSize_` (`pager.go:447`) with no `>= 480` floor.
+Additionally, `pageHeader.deserialize` (`page.go:313-322`) copies the offset-0 flag byte
+(`ph.pageType = buf[0]`) and the offset-3 `nCell` with no validation, whereas SQLite's
+`btreeInitPage`/`decodeFlags` rejects any flag byte that isn't one of the four valid page types
+(`SQLITE_CORRUPT_PAGE`, `btree.c:2240-2241`) and rejects `nCell > MX_CELL(pBt) = (pageSize-8)/6`
+(`btree.c:2252-2256`) on every page init. The consequence is that corrupt or non-SQLite files
+that stock SQLite would reject up front as `SQLITE_NOTADB`/`SQLITE_CORRUPT` are instead accepted by
+Go and carried into the engine, producing degenerate geometry or out-of-bounds cell processing
+downstream rather than a clean rejection at open time.
+
+<a id="drift-67-contentareaoffset-accepts-zero-cell-content-offset-as-valid"></a>
+### Drift: contentAreaOffset Accepts Zero Cell Content Offset As Valid
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `page.go:*page.contentAreaOffset` (`page.go:386-393`).
+
+SQLite's `allocateSpace` treats a zero cell-content-offset (`top`) as the real `usableSize` value
+*only* for the exact 65536-byte special-case page; for every other page a stored `top` less than
+`gap` (which includes `top==0` on any non-65536 page) is `SQLITE_CORRUPT_PAGE`. Concretely C does
+`top=get2byte(&data[hdr+5]); if(gap>top){ if(top==0 && usableSize==65536){top=65536;} else
+{return CORRUPT;} }`. Go's `contentAreaOffset` (`page.go:386-393`) instead does
+`if top==0 { if usableSize==65536 {top=65536} else {top=usableSize} }` and only then bounds-checks
+`if top > usableSize || top < gap`, so a `top==0` on a non-65536 page is silently promoted to
+`usableSize` and accepted as a valid empty content area. The consequence is that a corrupt page
+with a zero content-offset, which SQLite would flag as corruption, is treated as a valid full-free
+page by Go, masking corruption that should have been detected.
+
+<a id="drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl"></a>
+### Drift: pageSlab And ConfigPageCache Idempotent Versus Reconfigurable Setup
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `page_slab.go:*pageSlab.Init` (`internal/btree/page_slab.go:112-136`),
+  `page_slab.go:ConfigPageCache`
+  (`internal/btree/page_slab.go:112-136 (guard at 113,118); wrapper page_slab.go:246-248`),
+  `page_slab.go:ConfigPageCache`
+  (`internal/btree/page_slab.go:121-130 (nReserve/freeList for nPages==0); Put logic page_slab.go:185-193`).
+
+C's `sqlite3PCacheBufferSetup` (`pcache1.c:271-291`) is fully reconfigurable: on every call while
+initialized it unconditionally overwrites the entire global slab config (`szSlot`,
+`nSlot`/`nFreeSlot`, `nReserve`, `pStart`, `pFree`, `bUnderPressure`, `pEnd`) and rebuilds the free
+list, and it has two explicit disable branches up front -- `if(pBuf==0) sz=n=0;` and `if(n==0)
+sz=0;` (`pcache1.c:274-275`) -- so passing `n==0` drives `szSlot` to 0 and effectively turns the
+static page cache OFF, routing all allocations to `sqlite3Malloc`. Go's `pageSlab.Init` (the
+worker behind `ConfigPageCache`) is permanently first-call-wins idempotent: a double-checked
+`s.initialized.Load()` guard (`page_slab.go:113,118`) makes every subsequent `Init` a silent no-op
+("If already initialized, this is a no-op."), so re-configuration with different parameters is
+ignored, and there is no disable path -- `nPages==0` still sets `initialized=true` and is treated
+as an initialized but empty slab rather than a disabled cache. The consequences are that the page
+cache cannot be reconfigured after first setup and cannot be turned off via a zero-size config the
+way SQLite allows; both diverge from SQLite's reconfigurable, disable-capable setup semantics.
+
+<a id="drift-69-underpressure-drops-heap-nearly-full-fallback"></a>
+### Drift: UnderPressure Drops Heap Nearly Full Fallback
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `page_slab.go:*pageSlab.UnderPressure` (`page_slab.go:199-201`).
+
+C's `pcache1UnderMemoryPressure` (`pcache1.c:517-523`) has two branches: when a slab is configured
+and the page fits a slot it returns the atomic `bUnderPressure` flag, but ELSE (no slab configured,
+or a page too big for a slot) it falls back to `sqlite3HeapNearlyFull()`, still reporting memory
+pressure from the global soft-heap-limit. Go's `UnderPressure()` (`page_slab.go:199-201`)
+implements only the first branch and drops the `sqlite3HeapNearlyFull()` fallback entirely. The
+consequence is that in the default no-slab configuration Go always reports no memory pressure,
+whereas SQLite would still surface heap-based pressure, so the cache never receives the
+pressure signal that would otherwise prompt it to shed pages.
+
+<a id="drift-70-missing-aggregate-freelist-count-corruption-guard"></a>
+### Drift: Missing Aggregate Freelist Count Corruption Guard
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `pager.go:*pager.allocateFromFreelist` (`pager.go:1307-1329`),
+  `pager.go:*pager.allocatePage` (`internal/btree/pager.go:1307-1330`).
+
+C's `allocateBtreePage` reads the total freelist page count from page-1 offset 36
+(`n = get4byte(&pPage1->aData[36])`) and, before touching any trunk page, rejects the whole
+allocation as `SQLITE_CORRUPT_BKPT` if `n >= mxPage` (`mxPage = btreePagecount(pBt)`,
+`btree.c:6538-6542`) -- i.e. if the freelist claims at least as many pages as the entire database
+file. Go's `allocateFromFreelist` (`pager.go:1307-1372`) performs only per-element bounds checks
+on individual trunk/leaf page numbers and has no upfront aggregate guard comparing the recorded
+freelist count (`header.TotalFreelistPgs`, page-1 offset 36) against the database page count. The
+consequence is that a corrupt freelist whose total count is impossibly large is not rejected at
+entry the way SQLite does; instead Go proceeds into the trunk walk, missing an early, cheap
+corruption signal that protects the rest of the allocation path.
+
+<a id="drift-71-allocatepagenear-swallows-freelist-errors-and-grows-db"></a>
+### Drift: allocatePageNear Swallows Freelist Errors And Grows DB
+- **Category:** changed-logic  -  **Severity:** high
+- **Affected functions:** `pager.go:*pager.allocatePage` (`internal/btree/pager.go:1165-1171`).
+
+In C, `allocateBtreePage`'s freelist branch (the `if(n>0)` block, `btree.c:6543-6757`) jumps to
+`end_allocate_page` and returns the error code on any failure -- `SQLITE_CORRUPT_BKPT` for a bad
+trunk/leaf page number or out-of-range leaf count, or an I/O/pager error -- so every caller stops
+and propagates the error rather than continuing. Go's allocation path (`pager.go:1165-1171`) does
+`pg, err := p.allocateFromFreelist(nearby); if err == nil { return pg, nil }` and then falls
+through with the comment "Fall through to grow database if freelist read fails", calling
+`p.dbSize.Add(1)` -- discarding `err` entirely, including `ErrCorrupt`. The consequence is that a
+corrupt freelist is not surfaced as an error but is silently papered over by growing the database
+file, so corruption SQLite would report as `SQLITE_CORRUPT` is converted into continued operation
+on a database whose freelist is known to be broken, risking further damage instead of failing
+loudly.
+
+<a id="drift-72-freeoverflowchain-omits-refcount-and-fixed-count-versus-term"></a>
+### Drift: freeOverflowChain Omits Refcount And Fixed Count Versus Terminator Walk
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.freeOverflowChain` (`pager.go:2622-2631`),
+  `pager.go:*pager.freeOverflowChain` (`pager.go:2600-2632`).
+
+C's `clearCellOverflow` computes the exact expected overflow-page count from parsed payload
+metadata -- `nOvfl = (nPayload - nLocal + ovflPageSize - 1)/ovflPageSize` (`btree.c:7004-7005`) --
+and frees exactly that many via a `while(nOvfl--)` loop, skipping `getOverflowPage` on the final
+iteration (guarded by `if( nOvfl )`, `btree.c:7018`) so it never reads the next-pointer of the last
+page; additionally, for each page already in the cache it checks
+`sqlite3PagerPageRefcount(pOvfl->pDbPage)!=1` and returns `SQLITE_CORRUPT_BKPT` instead of freeing
+a page with more than one outstanding reference (`btree.c:7023-7039`), detecting a mis-typed or
+shared "overflow" page still in use by a cursor. Go's `freeOverflowChain` (`pager.go:2600-2632`)
+instead walks next-pointers to a zero terminator and omits both the fixed expected-count derivation
+and the `refcount==1` outstanding-reference corruption check. The consequence is weaker corruption
+detection on the overflow-free path: Go will follow a corrupt next-pointer chain and free a page
+that is actually still referenced, where SQLite would have stopped with a corruption error.
+
+<a id="drift-73-freepage2-trunk-decision-and-page-invalidation-drifts"></a>
+### Drift: freePage2 Trunk Decision And Page Invalidation Drifts
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.freePage` (`internal/btree/pager.go:1221-1264`),
+  `pager.go:*pager.freePage` (`internal/btree/pager.go:1242-1262`).
+
+C's `freePage2` decides whether to append a freed page as a leaf of the existing first trunk or to
+start a new trunk by testing the page-1 free-page COUNT -- `if( nFree!=0 )` where
+`nFree = get4byte(&pPage1->aData[36])` (the total-freelist-pages counter at offset 36,
+`btree.c:6864,6884`). Go's `freePage` instead branches on the FIRST-TRUNK POINTER at offset 32,
+`trunkPgno := p.header.FirstFreelistPg` with `if trunkPgno != 0` (`pager.go:1221-1264`); the two
+predicates only coincide in a header that is consistent between offsets 32 and 36. Additionally, C
+always reaches `freepage_out:` and sets `pPage->isInit = 0` on the freed page for both the leaf and
+new-trunk cases (`btree.c:6965-6968`), invalidating any cached parse of that page, whereas Go's leaf
+path (`pager.go:1242-1262`) never fetches or touches the freed page object -- it only updates the
+trunk's leaf array and records `dontWrite`/`setHasContent` by page number. The consequence is that
+on an inconsistent header Go can pick the wrong free-list shape, and a stale cached header parse for
+a freed leaf page can survive where SQLite would have discarded it.
+
+<a id="drift-74-secure-delete-page-zeroing-on-free-unsupported"></a>
+### Drift: secure_delete Page Zeroing On Free Unsupported
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.freePage` (`internal/btree/pager.go:1209-1301`).
+
+C's `freePage2` honors `BTS_SECURE_DELETE`: when the pragma is enabled it fetches the freed page and
+`memset(pPage->aData, 0, pPage->pBt->pageSize)` to scrub the deleted data (`btree.c:6867-6877`), and
+it also suppresses the `PagerDontWrite` optimization in that mode so the zeroed page is actually
+persisted (`btree.c:6937`). Go's `freePage` has no secure-delete concept at all
+(`pager.go:1209-1301`): freed leaf-page contents are never zeroed and `dontWrite` is applied
+unconditionally. The consequence is that deleted row/cell data physically remains in freed pages
+on disk in Go where SQLite's secure_delete mode would have scrubbed it, and this gap is currently
+undocumented.
+
+<a id="drift-75-overflow-page-allocation-failure-leaks-held-pin"></a>
+### Drift: Overflow Page Allocation Failure Leaks Held Pin
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.writeOverflowChainMulti` (`internal/btree/pager.go:2397`).
+
+In the overflow-write loop, when the current overflow page is full (`spaceLeft==0`) and a new
+overflow page must be allocated, Go's `writeOverflowChainMulti` calls `allocatePageNear(nearby)` and
+on error does `return 0, err` immediately, WITHOUT releasing the previously-allocated/held overflow
+page `prevPg` (`pager.go:2397-2400`). The C original at the equivalent `allocateBtreePage` failure
+point does `releasePage(pToRelease); return rc;`, dropping the currently-held overflow page's pin
+before propagating the error. The consequence is a leaked page pin on the allocation-failure path:
+the held overflow page is never released, so its cache reference count stays elevated where SQLite
+would have cleanly released it.
+
+<a id="drift-76-beginwrite-re-reads-page-1-header-on-state-change"></a>
+### Drift: beginWrite Re Reads Page 1 Header On State Change
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `pager.go:*pager.beginWrite`
+  (`internal/btree/pager.go:712` and `refreshHeaderFromPage1` at `internal/btree/pager.go:1623-1666`).
+
+SQLite refreshes the page-1 header and `dbSize` on the READ path, not inside `sqlite3PagerBegin`. Go
+relocates that refresh into the write path: `pager.beginWrite` calls both `p.writerCache.clear()`
+and `p.refreshHeaderFromPage1()` when `wal.beginWriteWithSnapshot` reports `stateChanged=true`
+(`pager.go:710-713`). `refreshHeaderFromPage1` (`pager.go:1623-1666`) re-reads page 1 from WAL or
+disk and overwrites BOTH `p.header` and `p.dbSize` (`p.dbSize.Store(p.header.DatabaseSize)` at
+`pager.go:1641,1657`). The consequence is a structural divergence in when and where the cached
+header/size are reconciled with the on-disk image: Go performs this reconciliation lazily at the
+start of a write when the underlying WAL state changed, rather than during reads as SQLite does.
+
+<a id="drift-77-filechangecount-bumped-conditionally-not-unconditionally"></a>
+### Drift: FileChangeCount Bumped Conditionally Not Unconditionally
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `pager.go:*pager.commit` (`internal/btree/pager.go:1902-1912`).
+
+SQLite always advances the page-1 change counter (header offset 24, mirrored at offset 92) on a
+committing transaction that writes pages: `pager_write_changecounter` (`pager.c:3084`) is an
+unconditional update invoked from the commit machinery itself (`pagerWalFrames` at `pager.c:3218`
+via `if( pList->pgno==1 ) pager_write_changecounter(pList);`, and `pager_incr_changecounter` at
+`pager.c:6363`). Go's `commit` increments `p.header.FileChangeCount++` only `if dataChanged` (and
+`p.header.SchemaCookie++` only `if schemaChanged`), gating the bump on the caller-supplied flag
+rather than on the fact that data pages were written (`pager.go:1902-1907`). The consequence is that
+a committing transaction that writes pages without the caller setting `dataChanged=true` leaves the
+change counter unadvanced, so other connections relying on the counter to detect that the file
+changed may miss the modification, whereas SQLite would always have bumped it.
+
+<a id="drift-78-commit-does-not-prune-dirty-pages-above-dbsize-before-wal-wr"></a>
+### Drift: Commit Does Not Prune Dirty Pages Above dbSize Before WAL Write
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pager.go:*pager.commit`
+  (`internal/btree/pager.go:1931-1942`, and `wal.go:1944-2040` with no `pgno<=dbSize` filter).
+
+SQLite's `pagerWalFrames` explicitly removes pages whose `pgno > nTruncate` (the post-commit
+database size) from the dirty list before logging them, so no page beyond the database image is ever
+written to the WAL and the commit frame is guaranteed to belong to a page within the image
+(`pager.c:3199-3212`). Go's `commit` collects the entire dirty list unfiltered (`pager.go:1931`
+`appendDirtyPages`) and `writeFrames` (`wal.go:1944-2040`) applies no `pgno <= dbSize` filter before
+emitting frames, so there is no `nTruncate`-style pruning. The consequence is that a dirty page with
+`pgno > dbSize` -- e.g. one left over from a since-truncated region -- can still be logged to the
+WAL, and the commit (size-bearing) frame may end up attached to an over-size page rather than one
+within the database image, which SQLite structurally prevents.
+
+<a id="drift-79-truncateto-eager-dirty-page-drop-and-extra-guards"></a>
+### Drift: truncateTo Eager Dirty Page Drop And Extra Guards
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `pager.go:*pager.truncateTo` (`pager.go:2652`),
+  `pager.go:*pager.truncateTo` (`pager.go:2645`).
+
+C's `sqlite3PagerTruncateImage` is a one-line operation -- its entire body is
+`pPager->dbSize = nPage;` -- and it does NOT touch the page cache at all; the documentation states
+it is "only called right before committing a transaction" and that "it is not safe to call this
+function and then continue writing" (`pager.c:4018-4030`). Leaving above-size pages in the cache is
+deliberate: a rollback to a savepoint taken BEFORE the truncate (which restores the larger `dbSize`)
+still finds those pages intact. Go's `truncateTo` instead calls `p.writerCache.truncate(newDbSize)`
+(`pager.go:2652`), which eagerly removes ALL cached pages above `newDbSize` -- including DIRTY ones,
+unlinking them from the dirty list and decrementing `nDirty` (`pcache.go:702-715`) -- and adds two
+non-C guards: it rejects truncate-to-zero with an error (`pager.go:2645-2647`) and silently no-ops
+when `newDbSize >= cur` (`pager.go:2649-2651`), where C instead asserts
+`pPager->dbSize >= nPage || CORRUPT_DB` (`pager.c:4018`). The consequence is a savepoint-rollback
+hazard SQLite avoids: eagerly discarding dirty above-size pages means a later rollback to a
+pre-truncate savepoint can no longer restore them, plus the added guards diverge from C's documented
+shrink-only contract.
+
+<a id="drift-80-inprocessshm-close-non-terminal-teardown"></a>
+### Drift: inProcessShm close Non Terminal Teardown
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `shm.go:*inProcessShm.close` (`shm.go:114`).
+
+C's `unixShmUnmap` performs a true teardown: it removes the connection from `pShmNode->pFirst`, frees
+it, decrements `pShmNode->nRef`, and at `nRef==0` calls `unixShmPurge` which munmaps/frees every
+region, closes the shm fd, and nulls the node -- after which the shm structure is gone and cannot be
+used. Go's heap-fallback `inProcessShm.close` (`shm.go:114-120`) ignores the `isLastClient`
+argument (`_ = isLastClient`), has no refcount equivalent, simply sets `s.regions = nil` under
+`regMu`, and does NOT reset the per-slot lock state. The consequence is that close is a non-terminal,
+partial teardown: the object remains reusable with its mapped regions cleared but its lock state
+stale, diverging from SQLite's terminal connection-free/munmap-at-zero-refs semantics.
+
+<a id="drift-81-in-process-shm-lock-collapses-per-connection-masks-to-single"></a>
+### Drift: In Process Shm Lock Collapses Per Connection Masks To Single Refcount
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `shm.go:*inProcessShm.lock`
+  (`shm.go:72-92`, esp. `l.state++` at `shm.go:84`; counter defined `shm.go:50-53`),
+  `shm_mmap.go:*mmapShm.lock` (`internal/btree/shm_mmap.go:156`).
+
+SQLite's `unixShmLock` distinguishes two layers of state: per-connection bitmasks
+`p->sharedMask`/`p->exclMask` and a process-wide counter array `pShmNode->aLock[]`
+(`os_unix.c:5291-5301`). The "is there work to do" guard
+(`flags==(SQLITE_SHM_SHARED|SQLITE_SHM_LOCK) && 0==(p->sharedMask & mask)`, `os_unix.c:5351-5352`)
+uses the per-connection mask so that a SHARED lock re-requested by the SAME connection that already
+holds it is a NO-OP returning `SQLITE_OK` without touching `aLock[ofst]`. Go collapses both layers
+into a single refcount: `inProcessShm.lock` does `l.state++` (`shm.go:84`, counter at
+`shm.go:50-53`) and `mmapShm.lock` likewise increments without a per-connection sharedMask dedup
+check (`shm_mmap.go:156`). The consequence is non-idempotent re-locking: a same-connection repeat
+SHARED lock that SQLite treats as a free no-op instead bumps the shared refcount in Go, so the
+lock/unlock accounting can drift from SQLite's behavior when a connection re-requests a lock it
+already holds.
+
+<a id="drift-82-fcntllock-maps-only-eacces-eagain-to-busy"></a>
+### Drift: fcntlLock Maps Only EACCES EAGAIN To Busy
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `shm_mmap.go:*mmapShm.fcntlLock` (`internal/btree/shm_mmap.go:253-258`).
+
+C's `unixShmSystemLock` unconditionally treats ANY `fcntl` failure as retryable: it returns the
+fcntl result and `if(res==-1){ rc = SQLITE_BUSY; }` (`os_unix.c:4751-4758`) with no errno inspection
+at all, so `EINTR`, `ENOLCK`, `EDEADLK`, `EACCES`, and `EAGAIN` all collapse to `SQLITE_BUSY` that
+the WAL busy-handler loop then retries. Go's `fcntlLock` instead inspects errno and maps ONLY
+`syscall.EACCES`/`syscall.EAGAIN` to `ErrBusy`; every other errno returns a generic wrapped error
+`fmt.Errorf("btree: fcntl lock: %w", errno)` (`shm_mmap.go:253-258`). The consequence is that
+transient or otherwise-retryable lock failures (e.g. `EINTR`, `ENOLCK`) become hard, non-retryable
+errors in Go that abort the operation, where SQLite would have transparently retried them via the
+busy handler.
+
+<a id="drift-83-mmap-shm-offset-not-page-aligned-and-region-grouping-absent"></a>
+### Drift: mmap SHM Offset Not Page Aligned And Region Grouping Absent
+- **Category:** platform-support  -  **Severity:** high
+- **Affected functions:** `shm_mmap.go:*mmapShm.region` (`internal/btree/shm_mmap.go:126`).
+
+SQLite's `unixShmMap` groups regions per `mmap` call:
+`nShmPerMap = unixShmRegionPerMap() = (pgsz < 32KB ? 1 : pgsz/32KB)`, always maps at offset
+`szRegion*(i64)pShmNode->nRegion` (with `nRegion` advancing in steps of `nShmPerMap`) and maps
+`szRegion*nShmPerMap` bytes per call, so every `mmap` offset stays a multiple of the OS page size.
+Go's `region()` ignores the OS page size entirely: it maps exactly one region per call at
+`offset := int64(index) * int64(shmRegionSize)` with `shmRegionSize=32768` and no region grouping
+(`shm_mmap.go:126-128`, `shm.go:22`). The consequence is a platform-correctness failure on systems
+with a 64KB OS page size: odd region indices yield offsets (32768, 98304, ...) that are not
+page-aligned, which `mmap` rejects, so SHM mapping is broken on those platforms where SQLite's
+`nShmPerMap` grouping keeps every offset aligned.
+
+<a id="drift-84-shm-region-extension-uses-sparse-ftruncate-reintroducing-sig"></a>
+### Drift: SHM Region Extension Uses Sparse ftruncate Reintroducing SIGBUS Risk
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `shm_mmap.go:*mmapShm.region` (`internal/btree/shm_mmap.go:119`).
+
+When extending the shm file, SQLite deliberately does NOT rely on `ftruncate` alone: after finding
+the file too small (with `bExtend` true) it writes a single byte to the last byte of every newly
+allocated/extended OS page
+(`for(iPg=st_size/pgsz; iPg<nByte/pgsz; iPg++) seekAndWriteFd(... iPg*pgsz+pgsz-1, "", 1)`,
+`os_unix.c:5174-5188`), with an in-source comment explaining the rationale: backing the pages avoids
+a later `SIGBUS` when the mapped-but-unbacked region is touched. Go's `region` extends the shm file
+solely via `s.file.Truncate(requiredSize)` (`shm_mmap.go:119-123`), producing a sparse file with
+unbacked holes, then mmaps the region. The consequence is that Go reintroduces exactly the `SIGBUS`
+risk SQLite engineered around: if the filesystem cannot later allocate backing storage for a hole
+that is touched through the mapping, the process can take a `SIGBUS` rather than a clean error,
+whereas SQLite's pre-touch write surfaces the out-of-space condition up front.
+
+<a id="drift-85-shm-unlock-single-slot-and-per-connection-counter"></a>
+### Drift: SHM Unlock Single Slot And Per Connection Counter
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `shm_mmap.go:*mmapShm.unlock`
+  (`internal/btree/shm_mmap.go:195-229`, and `fcntlLock` `Len:1` at `shm_mmap.go:246`),
+  `shm_mmap.go:*mmapShm.unlock` (`internal/btree/shm_mmap.go:52,209-223`).
+
+C's `unixShmLock` releases a contiguous span of `n` lock slots in a SINGLE `fcntl` `F_UNLCK` call
+(`unixShmSystemLock(pDbFd, F_UNLCK, ofst+UNIX_SHM_BASE, n)` then `memset(&aLock[ofst], 0, sizeof(int)*n)`,
+`os_unix.c:5408-5412`), and SQLite genuinely uses `n>1` — e.g. `walUnlockExclusive(pWal, WAL_READ_LOCK(1), WAL_NREADER-1)`
+frees reader slots 1..4 in one range op (`wal.c:2380`). Go's `mmapShm.unlock(slot, lockType)` takes no
+count parameter and its `fcntlLock` hardcodes `Len: 1` (`shm_mmap.go:246`), so every release is exactly
+one byte/slot. The drift also spans scope: C's "last shared holder" decision reads/writes
+`pShmNode->aLock[ofst]`, which lives in `unixShmNode` and is shared by EVERY connection to the same inode
+within the process (only `sharedMask`/`exclMask` are per-connection), whereas Go collapses this to a
+per-`mmapShm` `s.locks[slot]` array (`shm_mmap.go:52`). The consequence is that Go diverges from SQLite on
+both span (single slot vs. contiguous range) and scope (per-connection vs. process-wide per-inode counter),
+so multi-slot range unlocks and cross-connection shared-lock accounting are not reproduced.
+
+<a id="drift-86-walshmbarrier-emits-store-release-not-full-fence-on-arm64"></a>
+### Drift: walShmBarrier Emits Store Release Not Full Fence On ARM64
+- **Category:** changed-logic  -  **Severity:** high
+- **Affected functions:** `wal.go:walShmBarrier` (`internal/btree/wal.go:937`, `internal/btree/wal.go:943`).
+
+C's `unixShmBarrier` (`os_unix.c:5484-5494`) does two things: it calls `sqlite3MemoryBarrier()`, which on
+GCC/clang compiles to `__sync_synchronize()` (`mutex_unix.c:98-104`) — a FULL bidirectional fence (`DMB ISH`
+on ARM64) whose documented contract is "All loads and stores begun before the barrier must complete before
+any load or store begun after the barrier" (`os_unix.c:5481-5482`) — and then issues a redundant
+`unixEnterMutex(); unixLeaveMutex();` belt-and-suspenders fence (comment "Also mutex, for redundancy",
+`os_unix.c:5488-5493`) for builds where the compiler barrier degrades to a no-op. Go's `walShmBarrier`
+(`wal.go:937-945`) emits only a store-release (`STLRW`) on ARM64 and omits the redundant mutex fallback
+fence entirely. The consequence is a strictly weaker barrier than SQLite's: a store-release orders prior
+accesses before the release store but does not block later loads from being reordered ahead of it, so the
+full bidirectional ordering SQLite relies on for SHM/wal-index visibility across CPUs is not guaranteed,
+risking subtle cross-process memory-ordering bugs on ARM64.
+
+<a id="drift-87-wal-recovery-omits-pgno-zero-frame-validity-check"></a>
+### Drift: WAL Recovery Omits pgno Zero Frame Validity Check
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `wal.go:*wal.recoverLocked`
+  (`/Users/roma/anytype/any-store/internal/btree/wal.go:1759-1768`),
+  `wal.go:*walFrame.deserialize` (`internal/btree/wal.go:1755-1776`).
+
+SQLite's `walDecodeFrame` declares a frame invalid if its page number is zero
+(`pgno = sqlite3Get4byte(&aFrame[0]); if(pgno==0){ return 0; }`, `wal.c:1019-1024`), a check placed AFTER
+the salt match but BEFORE the checksum comparison; `walIndexRecover` then breaks the recovery scan on the
+first invalid frame (`wal.c:1504-1505`, `if(!isValid) break;`), so a page-0 frame ends recovery and is never
+indexed. The Go port splits `walDecodeFrame`'s responsibilities across `walFrame.deserialize` and the
+`recoverLocked` scan loop, which validate only salt match and frame checksum and omit the `pgno!=0` test
+entirely. The consequence is that an end-of-log/corrupt frame carrying a zero page number that nonetheless
+satisfies the salt and checksum constraints would be accepted and indexed by Go rather than terminating
+recovery, diverging from SQLite's explicit page-0 rejection.
+
+<a id="drift-88-wal-recovery-does-not-pre-seed-read-mark-slot-1"></a>
+### Drift: WAL Recovery Does Not Pre Seed Read Mark Slot 1
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.recoverLocked`
+  (`/Users/roma/anytype/any-store/internal/btree/wal.go:1856-1859`).
+
+After recovery SQLite seeds read-mark slot 1 with the recovered `mxFrame` so the first reader can immediately
+reuse it: `for(i=1;i<WAL_NREADER;i++){ ... if(i==1 && pWal->hdr.mxFrame){ pInfo->aReadMark[i]=pWal->hdr.mxFrame; } else { pInfo->aReadMark[i]=READMARK_NOT_USED; } ... }` (`wal.c:1576-1583`). Go's `recoverLocked`
+instead stores `readMarkNotUsed` (`0xFFFFFFFF`) into every slot 1..4 and only sets `aReadMark[0]=0`
+(`wal.go:1856-1859`). The consequence is a missed optimization rather than a correctness bug: the first
+reader after recovery cannot reuse a pre-seeded slot at the recovered `mxFrame` and must instead carve out
+a fresh read-mark, diverging from SQLite's seeded fast path.
+
+<a id="drift-89-wal-index-header-version-not-validated"></a>
+### Drift: WAL Index Header Version Not Validated
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `wal.go:*walIndex.readHeader`
+  (`internal/btree/wal.go:919-930`; callers at `wal.go:1352-1358`, `wal.go:1455-1525`, `wal.go:1595-1612`
+  also omit it).
+
+After `walIndexTryHdr` succeeds, C's `walIndexReadHdr` enforces the wal-index format version:
+`if( badHdr==0 && pWal->hdr.iVersion!=WALINDEX_MAX_VERSION ) rc = SQLITE_CANTOPEN_BKPT;` (`wal.c:2740-2742`,
+with `WALINDEX_MAX_VERSION=3007000`), rejecting a SHM header written with an incompatible/future format
+version. This is distinct from the on-disk WAL file header version check. Go's `readHeader` validates the
+dual-copy match, `isInit==1`, and the `aCksum`, but never compares `iVersion`, and none of its callers add
+the check. The consequence is that a wal-index header bearing an unsupported future format version is
+silently accepted by Go where SQLite would refuse to open with `SQLITE_CANTOPEN`, removing a
+forward-compatibility guard.
+
+<a id="drift-90-wal-index-szpage-field-not-encoded-or-decoded"></a>
+### Drift: WAL Index szPage Field Not Encoded Or Decoded
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:*walIndex.readHeader`
+  (`internal/btree/wal.go:819-842` writeHeader never sets szPage; `wal.go:444` / `wal.go:881-931`
+  readHeader returns szPage undecoded).
+
+C's `walIndexTryHdr` decodes the page size from the SHM header on every successful read —
+`pWal->szPage = (pWal->hdr.szPage&0xfe00) + ((pWal->hdr.szPage&0x0001)<<16);` (`wal.c:2627`) — mapping the
+on-wire encoding (where 1 means 65536) back to the real page size. The raw 16-bit `szPage` field IS
+round-tripped by Go's serialize/deserialize/computeCksum (`wal.go:426,444,465`), but `writeHeader`
+(`wal.go:819-842`) never populates `hdr.szPage` (it stays zero) and `readHeader` never applies the decode
+transform. The consequence is that Go neither encodes a meaningful page size into the wal-index header on
+write nor reconstructs it on read; the field carries no usable page-size information, diverging from
+SQLite's per-read `szPage` decode (low impact because Go derives page size elsewhere).
+
+<a id="drift-91-wal-index-hash-append-missing-collision-limit-corruption-det"></a>
+### Drift: WAL Index Hash Append Missing Collision Limit Corruption Detection
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `wal.go:*walIndex.set`
+  (`internal/btree/wal.go:1031-1040` shmHashWrite probe loop; caller `wal.go:581-595`;
+  `wal.go:1010-1040` no idx==1 zero-init, no aPgno[idx] occupied check),
+  `wal.go:*walIndex.setBatch`
+  (`internal/btree/wal.go:621-623` setBatch loop; `wal.go:1031-1039` probe loop falls through),
+  `wal.go:*walIndex.shmHashGet` (`internal/btree/wal.go:1081-1098`),
+  `wal.go:*walIndex.shmHashWrite` (`internal/btree/wal.go:1031-1039`).
+
+C's `walIndexAppend` bounds the linear-probe insert with a corruption detector — `nCollide = idx;` then
+`for(iKey=walHash(iPage); aHash[iKey]; iKey=walNextHash(iKey)){ if((nCollide--)==0) return SQLITE_CORRUPT_BKPT; }`
+(`wal.c:1333-1336`) — and on read `walFindFrame` bounds the probe chain with `nCollide=HASHTABLE_NSLOT`
+returning `SQLITE_CORRUPT_BKPT` when exhausted; the rc propagates to the application. It also performs two
+protective steps Go omits: a first-entry zero-init `if(idx==1){ memset(aPgno, 0, ...); }` (`wal.c:1315-1319`)
+that re-clears reused wal-index space, and an inline crashed-writer cleanup
+`if(sLoc.aPgno[idx-1]){ walCleanupHash(pWal); }` (`wal.c:1321-1330`) that scrubs a peer writer's uncommitted
+SHM hash remnants before reusing a slot. Go's `shmHashWrite`/`setBatch` probe up to `htNSlot` iterations and,
+finding no free slot, simply fall out of the loop writing no entry and returning no error, while `shmHashGet`
+likewise lacks the bounded-chain corruption return; neither the `idx==1` zero-init nor the inline
+`walCleanupHash` is performed. The consequence is that on a full/over-probed or corrupt hash segment Go
+silently drops or skips frame mappings instead of surfacing `SQLITE_CORRUPT`, and stale remnants from a
+crashed writer or reused WAL generation can be left in place — turning detectable corruption into silent
+data loss or stale reads.
+
+<a id="drift-92-shmhashget-skips-segment-on-map-io-error"></a>
+### Drift: shmHashGet Skips Segment On Map IO Error
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:*walIndex.shmHashGet` (`internal/btree/wal.go:1072-1075`).
+
+C's `walFindFrame` aborts the entire frame lookup on any hash-segment map failure:
+`rc = walHashGet(pWal, iHash, &sLoc); if(rc!=SQLITE_OK){ return rc; }` (`wal.c:3576-3579`), so an SHM
+map/extend IO error (`walHashGet` -> `walIndexPage` -> `sqlite3OsShmMap`) propagates up to the reader. Go's
+`shmHashGet` instead does `region, err := wi.shm.region(seg, true); if err != nil { continue }`
+(`wal.go:1072-1075`), silently skipping that hash segment and continuing the scan. The consequence is that a
+genuine SHM mapping/IO error is swallowed rather than reported: the lookup proceeds over the remaining
+segments and may return a stale or missing-frame result where SQLite would have failed the read with the
+underlying error.
+
+<a id="drift-93-wal-hash-probe-full-chain-corruption-signal-dropped"></a>
+### Drift: WAL Hash Probe Full Chain Corruption Signal Dropped
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:*walIndex.get`
+  (`internal/btree/wal.go:1081` shmHashGet probe loop with no corruption return; reached from
+  `wal.go:765` multi-process get and `wal.go:743` get).
+
+SQLite's `walFindFrame` bounds each hash-table probe chain with an `nCollide` counter initialized to
+`HASHTABLE_NSLOT` (8192); if the inner while-loop walks that many non-zero slots without hitting a zero slot
+the table is full/corrupt and SQLite aborts the read with `*piRead = 0; return SQLITE_CORRUPT_BKPT;`
+(`wal.c:3592-3594`). Go's read path caps the probe with `for range htNSlot` (`wal.go:1081`,
+`htNSlot=8192=HASHTABLE_NSLOT`) but, on walking a full chain of non-zero slots, simply exits the loop and
+reports "not found" with no corruption return. The consequence is that the full-chain corruption signal
+SQLite raises is dropped: a corrupt wal-index hash segment yields a silent miss in Go rather than a propagated
+`SQLITE_CORRUPT`, hiding the underlying corruption.
+
+<a id="drift-94-htsegmentinfo-adds-nentry-bound-replacing-c-mask"></a>
+### Drift: htSegmentInfo Adds nEntry Bound Replacing C Mask
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:htSegmentInfo`
+  (`internal/btree/wal.go:997-1002` definition; `wal.go:1088` use in shmHashGet).
+
+C's `walHashGet` (`wal.c:1167`) returns only `aHash`, `aPgno` (base) and `iZero` — no entry count — and
+`walFindFrame`'s lookup indexes `sLoc.aPgno[(iH-1)&(HASHTABLE_NPAGE-1)]==pgno` (`wal.c:3589`) using a bitmask
+with no explicit upper bound, relying on the frame-range invariants for safety. Go's `htSegmentInfo`
+(`wal.go:997`) additionally returns `nEntry` (`htNPageOne=4062` for segment 0, `htNPage=4096` otherwise), and
+`shmHashGet` uses it as a defensive index bound: `idx := int(entry)-1; if idx < nEntry { storedPgno = region[pgnoBase+idx*4] }`
+(`wal.go:1088`). The consequence is a behavioral divergence in how the `aPgno` index is constrained: Go
+replaces SQLite's `(iH-1)&(HASHTABLE_NPAGE-1)` wraparound mask with a hard `nEntry` upper-bound check, so an
+index that C would wrap-and-read Go instead rejects/skips — a different (and stricter) handling of
+out-of-range hash entries.
+
+<a id="drift-95-shmcleanupfromframe-zeros-all-segments-above-target"></a>
+### Drift: shmCleanupFromFrame Zeros All Segments Above Target
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `wal.go:*walIndex.rollbackToFrame`
+  (`internal/btree/wal.go:679-715` shmCleanupFromFrame, called from rollbackToFrame `wal.go:651`;
+  missing zero-init in shmHashWrite `wal.go:1010-1040`).
+
+SQLite's `walCleanupHash` (`wal.c:1233-1288`) deliberately cleans up ONLY the single hash table that contains
+`pWal->hdr.mxFrame`: it calls `walHashGet(walFramePage(mxFrame))` (`wal.c:1252`) to obtain that one segment,
+then zeroes `aHash[i] > iLimit` and memsets `aPgno[iLimit..]` within just that segment — the header comment
+is explicit that "At most only the hash table containing `pWal->hdr.mxFrame` ..." needs cleaning, because the
+`idx==1` zero-init in `walIndexAppend` lazily clears higher segments on reuse. Go's `shmCleanupFromFrame`
+(`wal.go:679-715`) instead zeros ALL segments above the target frame, and (per drift 91) lacks the
+`walIndexAppend` first-entry zero-init that C relies on. The consequence is a compensating-but-divergent
+strategy: Go eagerly scrubs every higher segment on rollback to make up for the missing lazy zero-init,
+diverging from SQLite's single-segment cleanup contract and doing strictly more work, with correctness
+contingent on that eager scrub fully covering what C's `idx==1` reset would have handled.
+
+<a id="drift-96-wal-index-change-counter-ichange-never-incremented"></a>
+### Drift: WAL Index Change Counter iChange Never Incremented
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.writeFrames`
+  (`internal/btree/wal.go:833` writeHeader writes wi.iChange, never incremented; commit path
+  `wal.go:2106-2110`),
+  `wal.go:*walIndex.writeHeader` (`internal/btree/wal.go:833`; decl `wal.go:541`, read-only).
+
+SQLite's `walFrames` increments the wal-index header change counter once per committed transaction — inside
+`if(isCommit)` it executes `pWal->hdr.iChange++;` (`wal.c:4248`) just before `walIndexWriteHdr(pWal)`
+(`wal.c:4253`), so each commit publishes an incremented `iChange` into the SHM header. any-store reserves the
+same field (`WalIndexHdr.iChange uint32` at `wal.go:407,541`, serialized at bytes 8..11) and `writeHeader`
+copies it via `wi.hdr.iChange = wi.iChange` (`wal.go:833`), but `wi.iChange` is NEVER incremented anywhere in
+the package despite the declaration comment claiming it is "incremented on each write transaction"
+(`wal.go:540`). The consequence is that the wal-index change counter is always published as 0: the
+per-transaction monotonic counter SQLite uses (e.g. to let other connections cheaply detect that the schema
+or content changed) is effectively dead in the Go port, diverging from SQLite's per-commit increment.
+
+<a id="drift-97-wal-restart-randomizes-both-salts-instead-of-incrementing-sa"></a>
+### Drift: WAL Restart Randomizes Both Salts Instead Of Incrementing Salt0
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.writeHeader` (`internal/btree/wal.go:1670`).
+
+SQLite's `walRestartHdr` deterministically advances salt-1 by `aSalt[0] = 1 + aSalt[0]` and only randomizes
+salt-2, so each new WAL generation's salt-1 is a monotonic successor of the previous header's value. Go's
+`writeHeader` (reached from `doResetWAL`, the analog of `walRestartHdr`) instead regenerates BOTH salts as
+fresh independent random 32-bit values — `w.header.salt1 = rand.Uint32()` and `w.header.salt2 = rand.Uint32()`
+(`wal.go:1670-1671`) — with no relation to the prior generation's salt-1. The consequence is that the
+deterministic monotonic relationship SQLite maintains across WAL restarts is lost: any reasoning or tooling
+that relies on salt-1 incrementing by one per restart no longer holds, though correctness still rests on the
+salt pair simply differing from the previous generation.
+
+<a id="drift-98-wal-checkpoint-sequence-number-nckpt-never-incremented"></a>
+### Drift: WAL Checkpoint Sequence Number nCkpt Never Incremented
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.doResetWAL`
+  (`internal/btree/wal.go:1669` writeHeader sets `checkpoint:0`; doResetWAL `wal.go:3360-3392` calls
+  writeHeader; initHeaderStateLocked `wal.go:1624`),
+  `wal.go:*wal.writeHeader` (`internal/btree/wal.go:1669`).
+
+SQLite's `walRestartHdr` does `pWal->nCkpt++` on every WAL restart (`wal.c:2150`), making the on-disk WAL
+header "Checkpoint sequence number" field (offset 12) a monotonically increasing counter that advances on each
+RESTART/TRUNCATE checkpoint and each writer-initiated log wrap. The Go reset path always constructs the header
+with `checkpoint: 0` at both sites — `writeHeader` (`wal.go:1669`) and `initHeaderStateLocked` (`wal.go:1624`)
+— and `doResetWAL` (`wal.go:3360-3392`) invokes one of those on every reset, so the field is serialized at
+offset 12 (`wal.go:244`), deserialized (`wal.go:262`), but never fed back to re-increment. The consequence is
+that the checkpoint-sequence counter is always 0: SQLite's monotonic per-restart sequence number is dead in
+the port, so any cross-process logic keyed off an advancing nCkpt cannot distinguish WAL generations.
+
+<a id="drift-99-wal-restart-read-mark-reset-diverges-from-walrestarthdr"></a>
+### Drift: WAL Restart Read Mark Reset Diverges From walRestartHdr
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:*walIndex.reset`
+  (`internal/btree/wal.go:803-805` read-mark clobber; `internal/btree/wal.go:1669-1671` missing
+  nCkpt/salt increments).
+
+C's `walRestartHdr` treats slot-0's read-mark as a permanent invariant fixed at 0 (it never touches
+`aReadMark[0]` and asserts `aReadMark[0]==0`, `wal.c:2159`), explicitly sets `aReadMark[1]=0` (`wal.c:2157`),
+sets only `aReadMark[2..4]=READMARK_NOT_USED` (`wal.c:2158`), and additionally performs `pWal->nCkpt++`
+(`wal.c:2150`), `aSalt[0] = 1 + aSalt[0]` (`wal.c:2152`), and a fresh random `aSalt[1]` (`wal.c:2153`). Go's
+`reset()` instead clobbers ALL five slots — including slot 0 and slot 1 — to `readMarkNotUsed` (0xFFFFFFFF)
+via `for i := range wi.aReadMark { wi.aReadMark[i].Store(readMarkNotUsed) }` (`wal.go:803-805`), and the
+`doResetWAL`/`writeHeader` pair drops the nCkpt and salt-1 increments (`wal.go:1669-1671`). This is the same
+root as the restart counter/salt drifts (97, 98) surfacing on the read-mark/reset path: the consequence is
+that the `aReadMark[0]==0` invariant is broken on restart (a slot-0 reader normally views only the db file)
+and the deterministic restart sequence/salt advances are lost.
+
+<a id="drift-100-slot-0-read-path-writes-mxframe-violating-areadmark0-invaria"></a>
+### Drift: Slot 0 Read Path Writes mxFrame Violating aReadMark0 Invariant
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.tryBeginRead` (`internal/btree/wal.go:2571-2572`).
+
+SQLite treats `aReadMark[0]` as a hard invariant fixed at 0 (`assert(pInfo->aReadMark[0]==0)`, `wal.c:2159`;
+comment `wal.c:361`), because a slot-0 reader reads the entire db file with no WAL view (mxFrame view 0); its
+`walTryBeginRead` slot-0 fast path only takes the shared lock on `WAL_READ_LOCK(0)`, runs the header memcmp,
+sets `pWal->readLock=0`, and returns — it never writes `pInfo->aReadMark[0]`. Go's slot-0 read path instead
+writes the current `mxFrame` into slot 0 both in SHM and process-local — `w.index.shmWriteReadMark(0, mxFrame)`
+plus `w.index.aReadMark[0].Store(mxFrame)` (`wal.go:2571-2572`) — violating the `aReadMark[0]==0` invariant.
+The consequence is that slot 0 no longer reliably signals "reader views db file only": its read-mark now
+carries a frame value, so any cross-process code (including checkpoint logic) that assumes slot 0 is pinned at
+0 can misinterpret the lowest reader bound.
+
+<a id="drift-101-reader-slot-mark-not-advanced-to-mxframe-on-reuse"></a>
+### Drift: Reader Slot Mark Not Advanced To mxFrame On Reuse
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `wal.go:*wal.tryBeginReadInProcess`
+  (`internal/btree/wal.go:2481-2486`; contrast `wal.go:2488-2494` which only runs when `bestSlot==-1`).
+
+SQLite's `walTryBeginRead`, after picking the best existing read-mark slot, checks `if( mxReadMark<mxFrame ||
+mxI==0 )` (`wal.c:3184-3185`) and, when the chosen slot's mark is below the current `mxFrame`, claims a fresh
+slot 1..4 exclusively and stores `mxFrame` into its read-mark (`wal.c:3187-3198`), keeping the held slot's mark
+consistent with the snapshot the reader actually sees. Go's `tryBeginReadInProcessHdr` reuses an existing
+reader slot whenever `bestSlot != -1` (`wal.go:2481-2486`) with NO `bestMark < mxFrame` test and NO advance of
+that slot's read-mark to `mxFrame`, returning `maxFrame=mxFrame` (line 2484) while the held slot's stored mark
+stays below it. The consequence is that the published read-mark can lag the reader's actual snapshot frame, so
+a concurrent checkpointer reading that under-reported mark could reclaim/overwrite WAL frames the reader still
+needs — a real read-safety concern, hence the medium severity.
+
+<a id="drift-102-reader-slot-tie-break-selects-lowest-not-highest"></a>
+### Drift: Reader Slot Tie Break Selects Lowest Not Highest
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.tryBeginReadMultiProcess` (`internal/btree/wal.go:2583-2591`).
+
+SQLite's slot-selection loop initializes `mxReadMark=0, mxI=0` and uses a non-strict comparison `if(
+mxReadMark<=thisMark && thisMark<=mxFrame )` (`wal.c:3178`), so when two slots hold the SAME read-mark value the
+later (higher-index) slot overwrites `mxI` and SQLite ends up locking the highest-numbered tied slot. Go's port
+initializes `bestSlot=-1, bestMark=0` and selects with a strict comparison, so on equal marks it keeps the
+first (lowest-index) slot it found (`wal.go:2583-2591`). The consequence is a behavioral tie-break divergence:
+Go pins the lowest-numbered slot among equals where SQLite pins the highest. This does not affect read
+correctness but changes which physical slot is held, altering slot-occupancy patterns that other processes
+observe.
+
+<a id="drift-103-re-validation-skips-header-change-check-when-shm-header-inva"></a>
+### Drift: Re Validation Skips Header Change Check When SHM Header Invalid
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `wal.go:*wal.beginRead`
+  (`internal/btree/wal.go:2567` and `internal/btree/wal.go:2637`),
+  `wal.go:*wal.beginWrite` (`internal/btree/wal.go:2692-2711`),
+  `wal.go:*wal.tryBeginRead` (`internal/btree/wal.go:2567` and `internal/btree/wal.go:2636-2640`),
+  `wal.go:*wal.tryBeginReadMultiProcess`
+  (`internal/btree/wal.go:2567` slot-0 and `wal.go:2636-2640` final-slot re-validation).
+
+SQLite's `walTryBeginRead` and `sqlite3WalBeginWriteTransaction` re-validate after locking with an
+UNCONDITIONAL raw byte `memcmp` of the live SHM wal-index header against the reader's cached snapshot — slot-0
+path `wal.c:3139`, WAL-frames/final-slot path `wal.c:3256`, and write-tx guard `wal.c:3729` — and any
+difference, including a header a concurrent recoverer has zeroed/invalidated in place, forces `WAL_RETRY` /
+`SQLITE_BUSY_SNAPSHOT`. Go gates every one of these comparisons on the header first reading as VALID:
+`if liveHdr, ok := w.index.readHeader(); ok && liveHdr != hdr` (`wal.go:2567`), `if liveMark != bestMark ||
+(liveValid && liveHdr != hdr)` (`wal.go:2636-2640`), and the write path's `if valid && ...` / `if valid {`
+blocks (`wal.go:2692-2711`). The consequence is that when `readHeader()` reports invalid (`valid=false`) — the
+exact window in which a concurrent process is mid-recovery and has invalidated the SHM header — Go proceeds
+where SQLite would retry, weakening the recovery-race defense and risking a reader/writer continuing against a
+header that SQLite would have rejected.
+
+<a id="drift-104-padtosectorboundary-sector-padding-of-commit-frames-not-port"></a>
+### Drift: padToSectorBoundary Sector Padding Of Commit Frames Not Ported
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `wal.go:*wal.open` (`wal.go:1312`),
+  `wal.go:*wal.writeFrames` (`internal/btree/wal.go:2086-2090`, single fdatasync on commit; no padding loop).
+
+SQLite's `sqlite3WalOpen` sets `pRet->padToSectorBoundary = 1` (cleared only on POWERSAFE_OVERWRITE devices),
+and `walFrames` (`wal.c:4189-4208`) uses it on a synchronous commit to compute a sync point at the next disk
+sector boundary and repeatedly re-write the last frame (with its commit mark) up to that boundary before
+fsyncing only that region — so the durably-synced region never ends mid-sector / mid-frame. Go's `wal.open`
+has no `padToSectorBoundary` concept (`wal.go:1312`) and `writeFrames` performs a single `fdatasync(w.file)` on
+commit with no padding loop (`wal.go:2086-2090`); a package-wide search finds no sector / iSyncPoint / nExtra /
+powersafe logic anywhere. The consequence is that on devices where a torn write at the synced offset can
+corrupt an adjacent partially-written sector, the Go WAL lacks SQLite's defensive sector alignment, so a
+power-loss mid-write could leave the committed region straddling a sector that hardware partially overwrote.
+
+<a id="drift-105-journal-size-limit-wal-truncation-feature-unimplemented"></a>
+### Drift: journal_size_limit WAL Truncation Feature Unimplemented
+- **Category:** new-feature  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.endWrite` (`wal.go:2776`),
+  `wal.go:*wal.truncateFile` (`internal/btree/wal.go:3396`),
+  `wal.go:*wal.writeFrames`
+  (`internal/btree/wal.go:2072-2116`, commit block has no size-limit truncation).
+
+SQLite implements `PRAGMA journal_size_limit` via the `truncateOnCommit`/`mxWalSize` machinery: after the
+first transaction completing a WAL, `walFrames` does `if(isCommit && pWal->truncateOnCommit &&
+pWal->mxWalSize>=0)` to shrink the WAL toward the configured limit and then clears the flag (`wal.c:4214-4221`),
+and `sqlite3WalEndWriteTransaction` resets `truncateOnCommit=0` alongside `writeLock`/`iReCksum`
+(`wal.c:3747-3752`). The Go port omits the entire feature: `endWrite` resets only `w.iReCksum` and unlocks
+`lockWrite` with no `truncateOnCommit` field or reset (`wal.go:2776`); `writeFrames`' commit block does
+`rewriteChecksums` + `fdatasync` + header publish with no size-limit truncation (`wal.go:2072-2116`); and
+`truncateFile` ports only the close-time truncate, not the commit-time `walLimitSize` call site
+(`wal.go:3396`). The consequence is that any-store WAL files grow without the periodic commit-time shrink-back
+SQLite provides under `journal_size_limit`; the bound is enforced only by full checkpoint/reset rather than
+incremental truncation.
+
+<a id="drift-106-wal-read-only-fallback-not-ported"></a>
+### Drift: WAL Read Only Fallback Not Ported
+- **Category:** platform-support  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.open` (`wal.go:1328`).
+
+SQLite's `sqlite3WalOpen` opens the WAL with `SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE` and, if the VFS
+downgrades the open to `SQLITE_OPEN_READONLY`, records `pRet->readOnly = WAL_RDONLY` (`wal.c:1719-1723`) so the
+connection can still attach to a database sitting on read-only media. Go's `wal.open` always opens with
+`os.O_RDWR|os.O_CREATE` (`wal.go:1328`) and returns the OS error directly on failure with no read-only retry;
+the `wal` struct has no `readOnly`/RDONLY field anywhere. The consequence is that any-store cannot open a
+WAL-mode database on read-only storage at all, whereas SQLite degrades gracefully to a read-only attachment —
+a platform-support gap rather than a correctness bug on writable media.
+
+<a id="drift-107-syncheader-device-characteristic-tuning-not-ported"></a>
+### Drift: syncHeader Device Characteristic Tuning Not Ported
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.open` (`wal.go:1646-1660`).
+
+SQLite's `sqlite3WalOpen` sets `syncHeader = 1` and then clears it when the device reports
+`SQLITE_IOCAP_SEQUENTIAL` (`wal.c:1714`, `wal.c:1731`); `syncHeader` gates the explicit header fsync before the
+first frame (`wal.c:4115`), so on sequential-write devices that header sync is safely skipped. Go's `wal.open`
+has no `syncHeader` field and unconditionally calls `fdatasync(w.file)` for the header in both `flushHeader`
+(`wal.go:1656`) and `writeHeader` (`wal.go:1680`). The consequence is a strictly-more-conservative behavior:
+Go always pays the header fsync that SQLite would elide on `SQLITE_IOCAP_SEQUENTIAL` devices — correct but
+potentially a needless durability cost where the device guarantees ordered sequential writes.
+
+<a id="drift-108-busy-handler-retry-count-resets-per-call"></a>
+### Drift: Busy Handler Retry Count Resets Per Call
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:walBusyLock` (`wal.go:211`).
+
+C's `walBusyLock` invokes the busy handler through `sqlite3InvokeBusyHandler(&db->busyHandler)`, passing the
+CONNECTION-WIDE counter `db->busyHandler.nBusy` that accumulates across retries (`nBusy++` each attempt) and is
+reset to 0 only when `sqlite3_busy_handler()`/`sqlite3_busy_timeout()` is re-set — so the retry count persists
+across successive lock attempts on the same connection. Go's `walBusyLock` declares a function-local
+`var count int` (`wal.go:212`) that starts at 0 on every call and only increments within that single call
+(`wal.go:224`), with an intentionally stateless handler (DefaultBusyTimeout). The consequence is that the
+busy-handler back-off no longer accumulates per-connection: each `walBusyLock` call restarts the retry/back-off
+sequence from zero rather than continuing the connection-wide progression SQLite maintains.
+
+<a id="drift-109-walbusylock-locks-single-slot-not-n-consecutive"></a>
+### Drift: walBusyLock Locks Single Slot Not n Consecutive
+- **Category:** platform-support  -  **Severity:** low
+- **Affected functions:** `wal.go:walBusyLock` (`wal.go:211`).
+
+C's `walBusyLock(pWal, xBusy, pBusyArg, lockIdx, n)` forwards `n` to `walLockExclusive` ->
+`sqlite3OsShmLock(pDbFd, lockIdx, n, EXCLUSIVE)` (`wal.c:1104`), acquiring `n` consecutive lock slots in ONE
+atomic OS shm-lock operation; the only `n>1` call site is `wal.c:2361`
+`walBusyLock(pWal, xBusy, pBusyArg, WAL_READ_LOCK(1), WAL_NREADER-1)`, which locks reader slots 1..4 as a single
+range. Go's `walBusyLock` signature is instead `(wi, xBusy, slot, lockType)` and locks a single slot
+(`wal.go:211`). The consequence is that any-store cannot express SQLite's atomic multi-slot range lock; where
+SQLite grabs reader slots 1..4 in one operation, Go must lock them individually, which changes the lock-granularity
+contract but is acceptable because Go does not exercise the multi-slot reader range the way C does.
+
+<a id="drift-110-multi-process-readframe-bypasses-local-nframe-bound"></a>
+### Drift: Multi Process readFrame Bypasses Local nFrame Bound
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.readFrame` (`internal/btree/wal.go:2307-2327`),
+  `wal.go:*wal.readFrameRaw` (`internal/btree/wal.go:2255-2268`).
+
+In multi-process (mmap) mode, `readFrame` and `readFrameRaw` intentionally do NOT reject a frame number that
+exceeds this process's local `nFrame`: only the `w.inProcess && frame > nf` guard rejects up front
+(`wal.go:2255`), and for file-backed multi-process WALs the code falls through and issues the `ReadAt` directly
+(`wal.go:2263`), letting the OS validate whether a peer has physically written that frame. This is deliberate so a
+reader can observe frames a concurrent peer committed after this process last refreshed its in-memory frame count,
+but the behavior is undocumented. The consequence is a non-obvious divergence from a naive bounds-check
+expectation: a frame index above the local snapshot is not an error in multi-process mode, and correctness instead
+relies on the OS read returning short/EOF for genuinely absent frames.
+
+<a id="drift-111-per-snapshot-reader-dbsize-bound-implemented-but-notes-says-"></a>
+### Drift: Per Snapshot Reader dbSize Bound Implemented But NOTES Says Otherwise
+- **Category:** changed-logic  -  **Severity:** high
+- **Affected functions:** `integrity.go` (`internal/btree/integrity.go:48-50` getPage->getPageReader,
+  `:577-579` cache.dbSize = nPages snapshot bound),
+  `pager.go` (`internal/btree/pager.go:1606-1617` readerDbSizeBound,
+  `:962-985` reader disk-read bound, `:1599-1604` effectiveReaderDbSize).
+
+A per-snapshot reader `dbSize` bound IS implemented in the code, contradicting NOTES.md section 19 which states it
+is NOT implemented. `pager.getPageReader`'s miss/disk/temp paths bound `pgno` against a per-snapshot page count via
+`readerDbSizeBound(cache)`: if `cache.dbSize != 0` it uses that captured snapshot value, otherwise it falls back to
+the process-local atomic `p.dbSize` (`pager.go:1612-1617`). `IntegrityCheckN` sets `cache.dbSize = nPages` (the
+WAL/file-capped snapshot size, `integrity.go:577-579`), and the `pcache.dbSize` field mirrors SQLite's
+per-connection `pPager->dbSize` captured cross-process at `BeginRead`. The consequence is documentation drift of
+high severity: a maintainer reading NOTES.md section 19 would believe the cross-process read-after-write bound is
+absent and could "re-add" it or reason incorrectly about reader safety, when the protection already exists in
+`getPageReader`/`readerDbSizeBound`.
+
+<a id="drift-112-integritycheck-treats-master-page-1-as-flat-leaf"></a>
+### Drift: IntegrityCheck Treats Master Page 1 As Flat Leaf
+- **Category:** changed-logic  -  **Severity:** high
+- **Affected functions:** `integrity.go:*DB.IntegrityCheck` (`internal/btree/integrity.go:615-695`),
+  `integrity.go:*DB.IntegrityCheckN` (`integrity.go:601-681`, esp. `609`, `642`, `661-667`).
+
+C routes EVERY tree root — including `sqlite_master` / page 1 — uniformly through `checkTreePage`
+(`btree.c:11246`), which handles both leaf (`pageTypeLeafIdx`) and interior (`pageTypeIntIdx`) roots, recursing
+into children and validating coverage/depth/key-order at every level. Go's `IntegrityCheckN` instead special-cases
+the master B-tree (page 1) with a hardcoded leaf-only cell loop: although the page-type guard at `integrity.go:609`
+explicitly allows `pageTypeIntIdx`, the loop unconditionally calls `parseLeafCellWithSize` on every page-1 cell
+(`integrity.go:642`), extracts namespace roots from `cell.value`, and proceeds straight to the orphan scan — it
+never calls `checkTreePage(1, ...)` and never recurses into page 1's interior children. The consequence is a
+high-severity false-positive flood: once the master/namespace catalog grows large enough that page 1 becomes an
+interior root, the leaf-only parse misinterprets interior cells and a healthy database is reported as corrupt,
+confirmed in live reproduction.
+
+<a id="drift-113-integrity-freeblock-walk-and-coverage-diagnostics-diverge"></a>
+### Drift: Integrity Freeblock Walk And Coverage Diagnostics Diverge
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `integrity.go:*integrityChecker.checkPageCoverage`
+  (`internal/btree/integrity.go:181-223`, `:198-201`, `:183-196`).
+
+Go's `checkPageCoverage` freeblock handling diverges from SQLite in three ways. First, it reports a diagnostic and
+`break`s on the FIRST malformed freeblock (out-of-range, size<4, extends-off-page, or unordered chain,
+`integrity.go:181-203`) yet then falls through unconditionally into the overlap/fragmentation coverage analysis
+(`L205-223`) using a heap that is missing every freeblock at or beyond the break point — producing a spurious
+extra diagnostic SQLite never emits. Second, its ordering check is weaker: it flags an unordered chain only when
+`nextFb != 0 && nextFb <= fb` (`integrity.go:198`), requiring the next link to merely start after the current
+freeblock's START, whereas SQLite's invariant (`btree.c:11069`: `j==0 || j>i+size`) requires it to start after the
+current freeblock's END. Third, it adds runtime range/size validation (`fb < contentOffset` lower-bound,
+`fbSize < 4`, `fb+fbSize > usableSize`, `integrity.go:183-196`) where SQLite relies on prior
+`btreeComputeFreeSpace` asserts and only upper-bound-checks. The consequence is purely diagnostic divergence:
+different, sometimes spurious or differently-ordered integrity messages, with no impact on data correctness.
+
+<a id="drift-114-integrity-report-inverts-zero-error-budget-and-omits-progres"></a>
+### Drift: Integrity report Inverts Zero Error Budget And Omits Progress Hook
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `integrity.go:*integrityChecker.report`
+  (`internal/btree/integrity.go:52`, `:56`).
+
+C's `checkAppendMsg` gates on `if(!pCheck->mxErr) return;` (`btree.c:10626`) and the integrity walk loops are
+guarded `&& pCheck->mxErr`, so an initial `mxErr==0` means STOP IMMEDIATELY / report nothing — and helpers like
+`checkOom` deliberately set `mxErr=0` to halt the entire check. Go's equivalent `report()` -> `tooManyErrors()`
+evaluates `ic.maxErrors > 0 && len(ic.errors) >= ic.maxErrors` (`integrity.go:52`), which inverts the meaning of a
+zero budget: with `maxErrors==0` Go treats it as "unlimited" and keeps reporting rather than halting. Separately,
+C's `checkAppendMsg` unconditionally calls `checkProgress(pCheck)` as its first action on every message-append
+(`btree.c:10625`), reading the interrupt flag and optional `xProgress` callback and aborting the check on
+interrupt/cancel; Go's `report()` omits this per-message progress/interrupt hook entirely (`integrity.go:56`). The
+consequence is two behavioral divergences: a zero error budget no longer aborts as SQLite intends, and a long
+integrity check cannot be interrupted or report progress mid-walk.
+
+<a id="drift-115-cursor-skip-and-appendvaluebykey-new-apis-beyond-sqlite-surf"></a>
+### Drift: Cursor Skip And AppendValueByKey New APIs Beyond SQLite Surface
+- **Category:** new-feature  -  **Severity:** low
+- **Affected functions:** `btree.go:Cursor.Skip` (`internal/btree/btree.go:3839`),
+  `btree.go:Cursor.SkipBackward` (`btree.go:3866`),
+  `btree.go:Cursor.AppendValueByKey` (`internal/btree/btree.go:3424`).
+
+any-store adds cursor APIs with no SQLite `BtCursor` counterpart. `Skip(n)`/`SkipBackward(n)` advance or rewind the
+cursor by `n` positions using an O(1) in-page `cellIdx` bump and only cross leaf boundaries via `Next()`/
+`Previous()`, giving a batched O(N/entries_per_page) skip used in production by the query planner's offset/limit
+path (`internal/qplanner/fullscan_iter.go:59-61`). `AppendValueByKey` (`btree.go:3424`) composes `SeekNear` + an
+exact-key check + value extraction, appending the value bytes directly into a caller buffer to avoid extra
+parse/copy work — for non-overflow cells it appends `cell.value` (a slice into the pinned page buffer) directly and
+falls back to `Cursor.Value()` reconstruction only for overflow payloads. The consequence is added public surface
+beyond the documented cursor API (NOTES.md section 15 lists only `SeekNear` as an any-store extension), so the
+cursor contract a maintainer infers from NOTES is incomplete.
+
+<a id="drift-116-open-forces-inprocess-on-non-mmap-shm-platforms-and-build-ta"></a>
+### Drift: Open Forces InProcess On Non Mmap SHM Platforms And Build Tag Scope Drift
+- **Category:** platform-support  -  **Severity:** low
+- **Affected functions:** `db.go` (`internal/btree/db.go:364-367` force InProcess when `!hasMmapShm`),
+  `dbfile_lock_other.go` (`internal/btree/dbfile_lock_other.go:1,6,10-12` `//go:build !unix` no-op stubs),
+  `dbfile_lock_unix.go` (`internal/btree/dbfile_lock_unix.go:1,34-73` `//go:build unix` real flock),
+  with `shm_mmap.go` (`//go:build (linux||darwin)&&(amd64||arm64)`) / `shm_other.go`
+  (`//go:build !((linux||darwin)&&(amd64||arm64))`) and the `isLastClient` gate at `pager.go:2773-2787`.
+
+`Open` silently coerces `opts.InProcess = true` whenever `!hasMmapShm` (`db.go:364-367`), forcing single-process
+heap-SHM mode on any platform lacking mmap SHM (e.g. Windows) with no error. The build-tag matrix diverges and is
+mis-documented: `dbfile_lock_*.go` split on `unix` vs `!unix`, while `shm_*.go` split on
+`(linux||darwin)&&(amd64||arm64)` vs its negation — so a unix platform that is NOT linux/darwin-on-amd64/arm64
+(linux/386, linux/riscv64, freebsd, darwin on an unsupported arch) compiles the REAL flock implementation yet still
+gets `hasMmapShm=false` and is forced into single-process mode. On non-unix targets the lock stubs are pure no-ops
+where `tryUpgradeDBLockExclusive` returns `(true, nil)` unconditionally (`dbfile_lock_other.go:10-12`), and since
+`pager.close` uses that result as `isLastClient` to gate `wal.truncateFile()` and `shm.close(isLastClient)`
+(`pager.go:2773-2787`), every non-unix closer believes it is the last client. NOTES.md compounds this by
+referencing an obsolete single `dbfile_lock.go`, citing stale source locations (the stub comment points at
+`db.go:201-204`, now `buildCodec` encryption code; the real forcing is `db.go:364-366`; NOTES line 415 points at a
+moved file), and never documenting the no-op lock stubs at all. The consequence is undocumented platform behavior
+that could mislead a maintainer auditing the multi-process lock protocol on non-mainstream platforms.
+
+<a id="drift-117-heap-and-inprocess-shm-implement-real-locks-contradicting-no"></a>
+### Drift: Heap And InProcess SHM Implement Real Locks Contradicting NOTES
+- **Category:** platform-support  -  **Severity:** low
+- **Affected functions:** `shm.go` (`internal/btree/shm.go:34-40` newHeapShm/inProcessShm,
+  `:36-112` lock at `72-92`), `shm_other.go` (`internal/btree/shm_other.go:1,29-34,55-99`
+  heapShm.lock/unlock), with selection paths `wal.go:552-562` and `db.go:360-367`.
+
+NOTES.md describes a single undifferentiated "Heap SHM fallback" with no-op locks (lines 373-374, 393), but the
+code ships two distinct heap-backed shm types, both implementing REAL per-slot shared/exclusive lock semantics.
+`newHeapShm()` returns `*inProcessShm` (`shm.go:34-40`), whose `lock`/`unlock` (`shm.go:72-112`) maintain genuine
+per-slot lock counts backed by `sync.Mutex` + an int state (0=unlocked, >0=shared count, -1=exclusive) and return
+`ErrBusy` on conflict; these are actually exercised by the WAL code (`lockWrite`/`lockCheckpoint`/`lockRecover`
+exclusive, `lockRead0`... shared) in InProcess/InMemory mode. The separate `heapShm` (`shm_other.go:55-99`) on
+non-mmap platforms implements the same real per-slot counter semantics. Crucially `inProcessShm` is selected on ALL
+platforms — including mmap-capable linux/darwin amd64/arm64 — whenever `inProcess==true` (forced for InMemory and
+InProcess, `db.go:360-367`, `wal.go:552-562`). The consequence is that NOTES is wrong on both counts: the
+"no-op locks" claim and the platform matrix both misrepresent the real, always-on heap lock implementation.
+
+<a id="drift-118-notes-platform-matrix-understates-mmap-shm-support"></a>
+### Drift: NOTES Platform Matrix Understates mmap SHM Support
+- **Category:** platform-support  -  **Severity:** low
+- **Affected functions:** `shm_mmap.go` (`internal/btree/shm_mmap.go:1,68` build tag + newPlatformShm,
+  `:233` shmLockOffset, `:30` shmDMSOffset, `:238` fcntlLock),
+  `shm_other.go` (`internal/btree/shm_other.go:1,29-34` build tag + newPlatformShm,
+  `:18-22` planned-support roadmap comment).
+
+NOTES.md's platform matrix claims mmap multi-process SHM is linux/amd64 only and understates the heap-SHM fallback
+set, but the code's build tags cover `(linux || darwin) && (amd64 || arm64)` for the mmap path (`shm_mmap.go:1`,
+verified to compile on darwin/arm64) with the heap fallback `newPlatformShm` on the exact negation
+(`shm_other.go:1`) — i.e. Windows, wasm/js, the BSDs, and non-amd64/arm64 arches. The mmap implementation also
+carries an undocumented SHM lock-byte region layout: each slot maps to a 1-byte fcntl byte-range at offset
+`120 + slot` (`shmLockOffset`, `shm_mmap.go:233`), the dead-man-switch lock sits at
+`shmDMSOffset = 120 + lockSlotCount` (`shm_mmap.go:30`), and `fcntlLock` uses non-blocking `F_SETLK` mapping
+EACCES/EAGAIN to `ErrBusy` (`shm_mmap.go:238`). Finally `shm_other.go:18-22` carries a "Planned platform support"
+roadmap comment (now partially stale, since linux/arm64 and darwin are already covered by the mmap build) absent
+from NOTES. The consequence is documentation drift: NOTES understates which platforms get real multi-process SHM
+and omits both the on-disk lock-region layout and the roadmap notes a maintainer would need.
+
+<a id="drift-119-vfs-injection-layer-and-open-registry-undocumented"></a>
+### Drift: VFS Injection Layer And Open Registry Undocumented
+- **Category:** new-feature  -  **Severity:** medium
+- **Affected functions:** `osfuncs.go` (`internal/btree/osfuncs.go:8,16-32` default-build aliases + panic stubs),
+  `osfuncs_vfs.go` (`internal/btree/osfuncs_vfs.go:7,9-48` swappable vars, SetVFS `:21`, ResetVFS `:34`,
+  ResetOpenRegistry `:43`), `osfuncs_vfs_js.go` (`internal/btree/osfuncs_vfs_js.go:1-34` wasm panic-stub init),
+  `osfuncs_sync_linux.go` / `osfuncs_vfs_sync_linux.go:7` / `osfuncs_vfs_sync_other.go:5` (defaultFdatasync split),
+  `vfs.go` (`internal/btree/vfs.go:6-22` File interface + VFS struct),
+  with the registry at `db.go:20` (openDBs), `db.go:385` (LoadOrStore double-open guard), `db.go:587` (Delete on close).
+
+any-store implements its own runtime-swappable OS layer with no SQLite analogue in the mapping and no NOTES.md
+documentation, gated on the `vfs` build tag (or `js && wasm`). In the default production build
+(`//go:build !vfs && !(js && wasm)`) `SetVFS`/`ResetVFS`/`ResetOpenRegistry` are panic-only stubs and `fileHandle`
+is the concrete `*os.File` for zero interface overhead (`osfuncs.go:8,16-32`). Under `-tags vfs` (or wasm),
+`osfuncs_vfs.go` makes `osOpenFile`/`osRemove`/`fdatasync` mutable package vars swapped via `SetVFS` from a `VFS`
+struct (`vfs.go:18-22`) and restored via `ResetVFS`, enabling fault injection (e.g. simulating fdatasync failures
+during checkpoint) and a pluggable wasm backend; the wasm build's `init()` further replaces the defaults with
+panic stubs ("btree: SetVFS not called — anystore on wasm requires a VFS backend") because under GOOS=js the bare
+`os.*` calls return ENOSYS rather than failing loudly (`osfuncs_vfs_js.go:1-34`). Alongside this sits a
+process-global `openDBs sync.Map` keyed by canonical absolute path that blocks same-process double-open
+(`db.go:20,385,587`), plus the `ResetOpenRegistry` crash-simulation hook that clears it so tests skipping `Close`
+can re-open. The consequence is a substantial undocumented feature surface — VFS injection, the wasm panic
+contract, and the single-open-per-process registry — that a maintainer cannot discover from NOTES.
+
+<a id="drift-120-mmap-backed-reads-bypass-injected-vfs-file"></a>
+### Drift: mmap Backed Reads Bypass Injected VFS File
+- **Category:** platform-support  -  **Severity:** medium
+- **Affected functions:** `mmap_db.go` (`internal/btree/mmap_db.go:96-100,129-137` fdFromFile + remap),
+  `mmap_db_other.go` (no-op variant context), with `pager.go:298-326,381` (readDBPage mmap-first gate, newDBMmap),
+  `osfuncs_vfs.go:7,21-31` (fileHandle = File, SetVFS), `vfs.go:6-22` (File interface + VFS struct).
+
+On a `-tags vfs` build for linux/darwin + amd64/arm64 the REAL `mmap_db.go` is compiled (not the no-op
+`mmap_db_other.go`), and `dbMmap.remap` maps the raw OS file descriptor directly:
+`syscall.Mmap(fd, 0, int(target), PROT_READ, MAP_SHARED)` where `fd` comes from `fdFromFile(m.file)` -> `f.Fd()`
+(`mmap_db.go:96-100,129-137`). Under this build `fileHandle` is the `File` interface (`osfuncs_vfs.go:7`) and a
+caller can install a custom `File` via `SetVFS`/`VFS.OpenFile` (`vfs.go:16-22`), yet that custom `File` flows into
+`newDBMmap` (`pager.go:381`) and is unwrapped to its raw fd, silently bypassing the injected
+`File.ReadAt`. Because the pager read path tries `dbMmap.readAt` (the mmap fast path) before falling back to
+`p.file.ReadAt` (`pager.go:298-326`), an injected VFS sees its custom read interception bypassed for all
+mmap-served DB pages. The consequence is a fault-injection/VFS-backend correctness gap: a custom `File` cannot
+intercept or fault mmap-backed reads on the platforms where mmap is active, which can invalidate VFS-based read
+fault-injection tests and wasm/custom backends.
+
+<a id="drift-121-fdatasync-durability-primitive-platform-split-undocumented"></a>
+### Drift: fdatasync Durability Primitive Platform Split Undocumented
+- **Category:** platform-support  -  **Severity:** medium
+- **Affected functions:** `osfuncs_sync_linux.go` (`internal/btree/osfuncs_sync_linux.go:10` ; `internal/btree/osfuncs_sync_other.go:7`),
+  `osfuncs_vfs_js.go` (`internal/btree/osfuncs_vfs_sync_linux.go:7`; `internal/btree/osfuncs_vfs_sync_other.go:5`;
+  `internal/btree/osfuncs_sync_linux.go:10`; `internal/btree/osfuncs_sync_other.go:7`).
+
+The `fdatasync` durability primitive invoked on every WAL commit (`wal.go:1656/1680/2087`) and checkpoint
+(`wal.go:3141/3277`, `pager.go:610`) is selected by a build-tag matrix that silently changes its sync semantics
+per platform, and NOTES.md documents none of it. On Linux the non-vfs build calls `syscall.Fdatasync(int(f.Fd()))`
+(`osfuncs_sync_linux.go:10`, tag `!vfs && linux`), a true data-only sync matching SQLite's `HAVE_FDATASYNC`; on
+every other platform (darwin, windows, the BSDs) it falls back to `f.Sync()` (`osfuncs_sync_other.go:7`, tag
+`!vfs && !(js && wasm) && !linux`), i.e. a full fsync that also flushes inode metadata. The vfs / wasm build mirrors
+this split for `defaultFdatasync` (`osfuncs_vfs_sync_linux.go:7` `syscall.Fdatasync` vs `osfuncs_vfs_sync_other.go:5`
+`f.Sync()`). The consequence is that the cost and exact durability guarantee of the commit/checkpoint hot path
+differs by OS — Linux gets the cheaper data-only flush SQLite assumes, while all other platforms pay for full
+metadata fsync — a semantic platform divergence a maintainer reasoning about commit performance or crash durability
+cannot discover from NOTES.
+
+<a id="drift-122-inmemory-masterstore-disk-emulation-undocumented"></a>
+### Drift: InMemory masterStore Disk Emulation Undocumented
+- **Category:** platform-support  -  **Severity:** low
+- **Affected functions:** `pager.go` (`internal/btree/pager.go:43` masterStore type, `:49` readPageInto,
+  `:60` writePage, `:1058` readRawPage fallback, `:1725` readHeaderCounters InMemory branch).
+
+For InMemory databases there is no file on disk, so `pager.open` creates a `masterStore` — an `RWMutex`-protected
+`map[uint32][]byte` (`pager.go:43`) — that REPLACES the database file as the "disk" backing, holding checkpointed
+page data flushed out of the WAL. Its `readPageInto`/`writePage` (`pager.go:49,60`) form a VFS-disk emulation:
+`checkpointPassive` writes pages into the map, and the page-read paths (`readRawPage` at `:1058`,
+`readHeaderCounters` at `:1725`) fall back to it whenever `p.file == nil`. This is an in-process stand-in for the
+real file VFS with no SQLite analogue, and it is entirely undocumented in NOTES.md. The consequence is that a
+maintainer tracing where checkpointed pages physically land for an InMemory DB has no documentation pointing at the
+map-backed "disk", and any reasoning about durability or post-checkpoint page state must reverse-engineer this layer.
+
+<a id="drift-123-process-global-page-buffer-pool-single-page-size-constraint"></a>
+### Drift: Process Global Page Buffer Pool Single Page Size Constraint
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `page_slab.go` (`internal/btree/page_slab.go:53-66` initPageBufferPool,
+  `:45-47` pageBufferPoolSize, `errors.go:81-84` ErrPageBufferPoolSizeMismatch, `db.go:373` enforcement at Open),
+  `page_slab.go` (`internal/btree/page_slab.go:41-47` pageBufferPool/pageBufferPoolSize,
+  `:78-107` allocPageBuffer/freePageBuffer dispatch, `:161-164` + `:185-189` slab overflow recycles via default pool).
+
+In the default (non-slab) mode, page-buffer allocation routes through a single process-global `sync.Pool`
+(`pageBufferPool`, `page_slab.go:41-47`) shared across every DB in the process, keyed to one global page size held in
+the atomic `pageBufferPoolSize`. `initPageBufferPool` (`page_slab.go:53-66`) CAS-sets that size on first init and
+thereafter returns `ErrPageBufferPoolSizeMismatch` (`errors.go:81-84`) for any DB opened with a different `PageSize`;
+`db.Open` enforces this unconditionally on every open (`db.go:373`). Because `useSlab` defaults false
+(`pcache.go:36,133`, `pager.go:202-204,270`), all page buffers for all DBs come from and return to this one shared
+pool, and even slab-mode OVERFLOW buffers recycle through the same default pool (`page_slab.go:161-164,185-189`). The
+consequence is an undocumented process-wide constraint with no SQLite counterpart: two DBs in the same process cannot
+use different page sizes in default mode, and the shared-pool/overflow-recycling design is invisible to a maintainer
+relying on NOTES.
+
+<a id="drift-124-debug-tracing-subsystem-undocumented"></a>
+### Drift: Debug Tracing Subsystem Undocumented
+- **Category:** platform-support  -  **Severity:** low
+- **Affected functions:** `debug_trace.go` (`internal/btree/debug_trace.go:1-7`;
+  `internal/btree/debug_trace_on.go:1-31` trace at `:29`, BTREE_TRACE env handling at `:14-27`),
+  `debug_trace_on.go` (`internal/btree/debug_trace_on.go:12` init; build-tag pair
+  `debug_trace_on.go:1` `//go:build debugtrace` vs `debug_trace.go:1` `//go:build !debugtrace`).
+
+The btree package ships a Go-only, build-tag-gated debug tracing facility with no SQLite C counterpart and no NOTES.md
+documentation, split across two files. The default build (`debug_trace.go:1`, tag `!debugtrace`) defines
+`const debugTrace = false` and a no-op `func trace(format string, args ...any) {}` so tracing compiles away entirely.
+Under `-tags debugtrace` (`debug_trace_on.go:1`) `debugTrace = true` and a package-init `init()` (`debug_trace_on.go:12`)
+reads the `BTREE_TRACE` environment variable at process startup, routing log output: empty / `"1"` / `"stderr"` go to
+stderr, while any other value is treated as a file path opened with `os.OpenFile(v, O_CREATE|O_WRONLY|O_APPEND, 0644)`
+(`debug_trace_on.go:14-27`), creating the file if absent. The consequence is an undocumented diagnostic subsystem with
+an environment-driven side effect (file creation) that a maintainer cannot discover from NOTES, and which has no place
+in the C-to-Go mapping because it is purely a Go-side addition.
+
+<a id="drift-125-dead-or-non-protocol-crc32-checksum-helpers"></a>
+### Drift: Dead Or Non Protocol CRC32 Checksum Helpers
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `page.go` (`internal/btree/page.go:556-559`), `wal.go` (`wal.go:3432-3435`).
+
+Two CRC32-IEEE helpers exist that are unrelated to the actual WAL checksum, which NOTES.md §7 documents as a
+paired-word Fletcher-style additive recurrence (`s1 += x[i]+s2; s2 += x[i+1]+s1`), and both are misleading. `page.go:557`
+defines `func checksum(data []byte) uint32 { return crc32.ChecksumIEEE(data) }` carrying the doc comment "checksum
+computes a CRC32 checksum for data (used in WAL frames)", which is false — the function has ZERO production callers
+(only `page_test.go` references it) and the real WAL framing uses the custom paired-word algorithm, not CRC32. Separately
+`walPageChecksum` (`wal.go:3432-3435`) also computes `crc32.ChecksumIEEE`, a distinct algorithm from the documented
+`walChecksum`/`walFrameChecksum` recurrence in NOTES.md §7 (lines 344-359), and is itself undocumented. The consequence
+is documentation/code confusion: a maintainer reading the `checksum` comment would wrongly believe CRC32 protects WAL
+frames, and `walPageChecksum`'s separate CRC32 usage is invisible in the §7 checksum spec.
+
+<a id="drift-126-pcache-truncate-and-clear-omit-page-1-zero-and-preserve-spec"></a>
+### Drift: pcache Truncate And Clear Omit Page 1 Zero And Preserve Special Case
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pcache.go:*pcache.clear` (`internal/btree/pcache.go:571`),
+  `pcache.go:*pcache.truncate` (`pcache.go:690-725`).
+
+C's `sqlite3PcacheTruncate` (and `sqlite3PcacheClear`, which delegates to `Truncate(pCache, 0)`) carries a `pgno==0`
+special case (`pcache.c:713-721`): when an outstanding reference to page 1 still exists (`pCache->nRefSum>0`), it does
+NOT drop page 1 — instead it fetches it, zeroes its buffer in place (`memset(pPage1->pBuf, 0, szPage)`), and bumps
+`pgno` to 1 so the final `xTruncate(pgno+1) == xTruncate(2)` RETAINS page 1 in cache with zeroed content. Go's
+`clear()` (`pcache.go:571`) and `truncate()` (`pcache.go:690-725`) omit this page-1 zero-and-preserve branch for
+referenced caches. The consequence is a behavioral divergence in the rare path where page 1 is still referenced during
+a cache clear/truncate: SQLite keeps a live, zeroed page-1 header while Go does not, which could surface as a different
+cache state for a still-pinned root page.
+
+<a id="drift-127-pcache-recycle-and-spill-thresholds-off-by-one"></a>
+### Drift: pcache Recycle And Spill Thresholds Off By One
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pcache.go:*pcache.create` (`internal/btree/pcache.go:321`),
+  `pcache.go:*pcache.create` (`pcache.go:347`).
+
+Go's merged `pcache.create()` diverges from SQLite on two cache-pressure thresholds, both shifting the trigger by one
+page. For LRU recycle/buffer reuse, C's `pcache1FetchStage2` step 4 enters at `(pCache->nPage+1 >= pCache->nMax)`
+(`pcache1.c:898-901`) and recycles AT MOST ONE page per create (net `nPage` unchanged), whereas Go uses
+`for pc.nPage >= pc.maxPages && ...` (`pcache.go:321`) — both an off-by-one threshold (`nPage>=maxPages` vs
+`nPage+1>=nMax`) and a loop instead of a single recycle. For dirty-page spill, C's `sqlite3PcacheFetchStress` gates on
+strict `sqlite3PcachePagecount(pCache) > pCache->szSpill` (`pcache.c:453`) while Go gates the inline stress branch on
+`pc.nPage >= spill` (`pcache.go:347`), firing the `xStress` spill callback one page earlier. The consequence is that
+Go's cache begins recycling and spilling slightly sooner than SQLite, a subtle eviction-timing difference that could
+affect cache occupancy and spill frequency under memory pressure.
+
+<a id="drift-128-makeclean-lru-insert-missing-non-purgeable-guard"></a>
+### Drift: makeClean LRU Insert Missing Non Purgeable Guard
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pcache.go:*pcache.makeClean` (`pcache.go:512`).
+
+C's `sqlite3PcacheMakeClean` ends with `if(p->nRef==0) pcacheUnpin(p)` (`pcache.c:622-624`), and `pcacheUnpin`
+(`pcache.c:265-271`) is a no-op for non-purgeable caches (`if(p->pCache->bPurgeable){ ... }`), so cleaning a page in a
+non-purgeable (InMemory) cache leaves it OUT of the LRU/recyclable list. Go's `makeClean` (`pcache.go:512-514`) instead
+does `if p.pinCount == 0 { pc.lruPrepend(p) }` with no `pc.purgeable` guard — unlike the companion `release()`
+(`pcache.go:458`), which correctly guards the identical LRU insert with `else if pc.purgeable`. The consequence is that
+in a non-purgeable cache Go can prepend a cleaned page onto the LRU list where SQLite would not, making it eligible for
+recycling/eviction in a mode where SQLite keeps such pages pinned out of the recyclable set.
+
+<a id="drift-129-resetpage-zeroes-buffer-on-every-page-creation"></a>
+### Drift: resetPage Zeroes Buffer On Every Page Creation
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pcache.go:*pcache.resetPage` (`pcache.go:408`).
+
+SQLite's pcache layer never zeroes the page data buffer at fetch/recycle time: `pcacheFetchFinishWithInit`
+(`pcache.c:501-520`) does `memset(&pPgHdr->pDirty, 0, sizeof(PgHdr)-offsetof(PgHdr,pDirty))`, clearing only the `PgHdr`
+bookkeeping fields and leaving the page content buffer as-is (the buffer is overwritten by the subsequent read). Go's
+`resetPage` (`pcache.go:408`) begins with `clear(p.data)`, unconditionally zeroing the full page content buffer on
+every page-struct init — heap-alloc, `pFree` reuse, `initBulk`, and recycled-victim reuse alike. The consequence is an
+extra full-buffer wipe on every page creation that SQLite does not perform; functionally safe but an added per-page
+cost and a behavioral divergence (stale buffer contents are always cleared in Go) that NOTES.md does not record.
+
+<a id="drift-130-newpcache-hash-table-pre-sized-to-capacity"></a>
+### Drift: newPcache Hash Table Pre Sized To Capacity
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `pcache.go:newPcache` (`internal/btree/pcache.go:129`; hashSizeFor at `pcache.go:144-150`;
+  minHashSize at `pcache.go:140`).
+
+SQLite always seeds the pcache hash table to exactly 256 buckets — `pcache1Create` (`pcache1.c:789`) calls
+`pcache1ResizeHash` once and grows the table on demand thereafter. Go's `newPcache` (`pcache.go:129`) instead pre-sizes
+`apHash := make([]*page, hashSizeFor(maxPages))`, where `hashSizeFor` (`pcache.go:144-150`) returns the smallest power
+of two `>= maxPages` and `>= minHashSize` (256, `pcache.go:140`). With the default `defaultCacheSize=5000` this
+allocates 8192 buckets up front, and a larger configured cache allocates proportionally more. The consequence is a
+larger eager hash-table allocation at cache creation than SQLite's fixed 256-bucket seed — a memory-vs-rehash tradeoff
+divergence that NOTES.md does not document.

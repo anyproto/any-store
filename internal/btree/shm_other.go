@@ -27,6 +27,7 @@ type heapShm struct {
 }
 
 // newPlatformShm creates a heap-backed shm (single-process fallback).
+// DRIFT: NOTES understates mmap SHM platform set (linux/darwin x amd64/arm64); layout/roadmap undoc See docs/btree/NOTES.md#drift-118-notes-platform-matrix-understates-mmap-shm-support
 func newPlatformShm(_ string) (shm, error) {
 	return &heapShm{
 		regions: make([][]byte, 0, shmMaxRegions),
@@ -52,6 +53,7 @@ func (s *heapShm) region(index int, create bool) ([]byte, error) {
 	return s.regions[index], nil
 }
 
+// DRIFT: heap/inProcess SHM implement real per-slot locks (not no-ops); NOTES conflates them See docs/btree/NOTES.md#drift-117-heap-and-inprocess-shm-implement-real-locks-contradicting-no
 func (s *heapShm) lock(slot int, lockType int) error {
 	if slot < 0 || slot >= lockSlotCount {
 		return fmt.Errorf("btree: invalid lock slot %d", slot)
@@ -76,6 +78,7 @@ func (s *heapShm) lock(slot int, lockType int) error {
 	return nil
 }
 
+// DRIFT: heap/inProcess SHM implement real per-slot locks (not no-ops); NOTES conflates them See docs/btree/NOTES.md#drift-117-heap-and-inprocess-shm-implement-real-locks-contradicting-no
 func (s *heapShm) unlock(slot int, lockType int) error {
 	if slot < 0 || slot >= lockSlotCount {
 		return fmt.Errorf("btree: invalid lock slot %d", slot)
