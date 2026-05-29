@@ -217,23 +217,37 @@ func (e And) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 	return true
 }
 
-// IndexBounds intersects the bounds each conjunct contributes for fieldName.
-// A conjunct that does not constrain fieldName leaves the bound count
-// unchanged and is skipped; contributing conjuncts are intersected into the
-// running result. An empty intersection short-circuits — a ∧ ∅ = ∅, and no
-// later conjunct can widen it. When no conjunct constrains the field, the
-// input bs is returned unchanged.
+// IndexBounds combines the bounds the conjuncts contribute for fieldName.
 //
-// Intersecting (rather than returning the first contributor, as the code did
-// before) is required for correctness on the CountOnly fast path: a query
-// like {a:{$in:[1,2]},$and:[{a:{$gte:5}}]} must yield empty bounds, not the
-// $in set. See I-04 in docs/known-issues.md.
+// At the top level (bs empty — how the planner calls it per field), the
+// contributing conjuncts are INTERSECTED: {a:{$in:[1,2]},$and:[{a:{$gte:5}}]}
+// must yield empty bounds, not the $in set, so the CountOnly fast path cannot
+// over-count (I-04, see docs/known-issues.md). An empty intersection
+// short-circuits — a ∧ ∅ = ∅, no later conjunct can widen it.
+//
+// When bs is NON-EMPTY the call is seeded by a union context: Or threads its
+// running accumulator through each branch (filter.go Or.IndexBounds), and the
+// other bound builders (In, Comp) union their bounds into bs. Intersecting the
+// seed-polluted conjunct results there would UNDER-approximate the match set —
+// an unsatisfiable conjunction would wrongly empty the Or accumulator — which
+// breaks the invariant that index bounds over-approximate (bounds ⊇ matches).
+// So when seeded we keep the original safe behavior: return the first
+// contributing conjunct's (union) bounds. Index seeks over such bounds are
+// always re-checked by a FilterIter, so the over-approximation is correct.
 func (e And) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
-	bounds = bs
+	if len(bs) != 0 {
+		for _, f := range e {
+			if bounds = f.IndexBounds(fieldName, bs); len(bounds) != len(bs) {
+				return bounds
+			}
+		}
+		return bs
+	}
+
 	contributed := false
 	for _, f := range e {
 		childBounds := f.IndexBounds(fieldName, bs)
-		if len(childBounds) == len(bs) {
+		if len(childBounds) == 0 {
 			continue // this conjunct does not constrain fieldName
 		}
 		if !contributed {

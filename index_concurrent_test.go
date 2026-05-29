@@ -1018,7 +1018,7 @@ func TestAudit15_ConcurrentReaderMultiKey_StableSnapshotCount(t *testing.T) {
 // The result set per pass must contain at most {"d1"} (never d1 twice,
 // never an unexpected id). This catches a leak in planIterator.Next /
 // DocDedup that Count alone might miss because Count has its own dedup
-// pipeline (CountEntries / countEntriesWithDedup).
+// pipeline (CountEntries / countEntriesViaSortDedup).
 func TestAudit15_ConcurrentReaderMultiKey_StableSnapshotIter(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "audit15_stable_iter")

@@ -264,6 +264,20 @@ func TestAndIndexBounds_ThreeConjuncts_EmptyStaysEmpty(t *testing.T) {
 	assert.Len(t, bs, 0)
 }
 
+// TestOrIndexBounds_DisjointAndBranch_SafeOverApprox pins that the I-04 And
+// intersection applies only at the top level (empty bs). When And.IndexBounds
+// is seeded by Or's accumulator (non-empty bs), it must stay an
+// over-approximation: an unsatisfiable And branch must NOT collapse the Or
+// bounds to empty and drop the satisfiable a==1 disjunct. Index bounds must
+// always be a superset of the match set (a FilterIter re-checks them).
+func TestOrIndexBounds_DisjointAndBranch_SafeOverApprox(t *testing.T) {
+	f, err := ParseCondition(`{"$or":[{"a":1},{"$and":[{"a":{"$in":[1,2,3]}},{"a":{"$gte":5}}]}]}`)
+	require.NoError(t, err)
+	bs := f.IndexBounds("a", nil)
+	require.NotEmpty(t, bs, "Or bounds must not collapse to empty for a satisfiable query")
+	assert.True(t, bs.Contains(newBoundKey(1)), "bounds must include the matching value a=1")
+}
+
 func TestOr(t *testing.T) {
 	f, err := ParseCondition(`{"$or":[{"a":1},{"b":"2"}]}`)
 	require.NoError(t, err)
