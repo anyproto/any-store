@@ -695,7 +695,7 @@
       {
         "file": "wal.c",
         "func": "walPagesize",
-        "reason": "returns pWal-\u003ehdr.szPage or a default; any-store reads the header field inline."
+        "reason": "returns pWal->hdr.szPage or a default; any-store reads the header field inline."
       },
       {
         "file": "wal.c",
@@ -1418,7 +1418,7 @@
   {
     "group": "mmap_io",
     "category": "feature-not-ported",
-    "reason": "any-store reads via os.File.ReadAt without memory-mapping; the mmap getter, map-header pool, and mmap-limit setter have no Go counterpart.",
+    "reason": "any-store's VFS-level mmap (unixFetch/unixRemapfile analogs) is implemented in mmap_db.go (resolved 2026-04-22); these pager.c page-header-pool helpers remain unported because any-store copies page data out of the mapping into the page cache rather than using the zero-copy xFetch pointer model.",
     "funcs": [
       {
         "file": "pager.c",
@@ -1812,6 +1812,319 @@
       {
         "file": "wal.c",
         "func": "walIteratorFree"
+      }
+    ]
+  },
+  {
+    "group": "util_sql_value_conversion",
+    "category": "feature-not-ported",
+    "reason": "util.c helpers converting between SQL text/blob values and machine numbers, plus overflow-checked integer arithmetic, used by the VDBE and SQL expression evaluator. any-store has no SQL surface and no typed value system: keys and values are opaque byte slices, so none of these conversions or the bignum/Fp helpers have a btree-layer analog.",
+    "funcs": [
+      {
+        "file": "util.c",
+        "func": "compare2pow63"
+      },
+      {
+        "file": "util.c",
+        "func": "countLeadingZeros"
+      },
+      {
+        "file": "util.c",
+        "func": "powerOfTen"
+      },
+      {
+        "file": "util.c",
+        "func": "pwr10to2"
+      },
+      {
+        "file": "util.c",
+        "func": "pwr2to10"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3AbsInt32"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3AddInt64"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3AtoF"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3Atoi"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3Atoi64"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3DecOrHexToI64"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3Fp10Convert2"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3Fp2Convert10"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3FpDecode"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3GetInt32"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3GetUInt32"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3Int64ToText"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3IsNaN"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3IsOverflow"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3MulInt64"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3Multiply128"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3Multiply160"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3SubInt64"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3UInt64ToText"
+      }
+    ]
+  },
+  {
+    "group": "util_sql_text",
+    "category": "feature-not-ported",
+    "reason": "util.c string/identifier helpers driving SQL parsing and collation: dequoting literals, case-insensitive identifier compare/hash, hex-literal decoding, 30-bit-clamped strlen, the tokenizer init, column-type affinity, and the bound-parameter name list. any-store has no SQL surface, so there is nothing to tokenize, dequote, or collate; keys compare bytewise.",
+    "funcs": [
+      {
+        "file": "util.c",
+        "func": "sqlite3ColumnType"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3Dequote"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3DequoteExpr"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3DequoteNumber"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3DequoteToken"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3FileSuffix3"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3HexToBlob",
+        "reason": "SQL x'..' blob-literal hex decode (also widened by SQLITE_HAS_CODEC for PRAGMA hexkey, see sqlcipher_codec.json util.c:1891-1912). any-store consumes raw 32-byte keys via Options.Key."
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3HexToInt"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3StrICmp"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3StrIHash"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3Strlen30"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3TokenInit"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3VListAdd"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3VListNameToNum"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3VListNumToName"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3_stricmp"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3_strnicmp"
+      }
+    ]
+  },
+  {
+    "group": "util_connection_error_state",
+    "category": "feature-not-ported",
+    "reason": "util.c routines managing the sqlite3* connection handle's error state (errCode/errMsg), validating handle liveness, and hosting the runtime fault-injection and progress-handler hooks. any-store reports errors as ordinary Go error values returned up the call stack; there is no long-lived connection object carrying sticky error state, no safety-check magic, and no progress/fault-sim instrumentation.",
+    "funcs": [
+      {
+        "file": "util.c",
+        "func": "logBadConnection"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3Error"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3ErrorClear"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3ErrorFinish"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3ErrorMsg"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3ErrorToParser"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3ErrorWithMsg"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3FaultSim"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3ProgressCheck"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3SafetyCheckOk"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3SafetyCheckSickOrOk"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3SystemError"
+      }
+    ]
+  },
+  {
+    "group": "util_query_planner_logest",
+    "category": "feature-not-ported",
+    "reason": "LogEst is SQLite's base-2 logarithm fixed-point estimate type used purely by the query planner to cost candidate plans. any-store has no query planner in the btree layer (callers drive cursors directly), so the LogEst arithmetic has no analog.",
+    "funcs": [
+      {
+        "file": "util.c",
+        "func": "sqlite3LogEst"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3LogEstAdd"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3LogEstFromDouble"
+      },
+      {
+        "file": "util.c",
+        "func": "sqlite3LogEstToInt"
+      }
+    ]
+  },
+  {
+    "group": "util_byte_read",
+    "category": "inlined-helper",
+    "reason": "sqlite3Get4byte is SQLite's big-endian 4-byte page-number reader. any-store reads 4-byte big-endian fields inline via encoding/binary.BigEndian.Uint32 at each call site rather than through a named helper. The write side IS factored out as backup.go putUint32BE (cites util.c:sqlite3Put4byte); only the read side stays inlined.",
+    "funcs": [
+      {
+        "file": "util.c",
+        "func": "sqlite3Get4byte"
+      }
+    ]
+  },
+  {
+    "group": "backup_connection_helpers",
+    "category": "feature-not-ported",
+    "reason": "backup.c helpers tied to SQLite's multi-database connection model and live-update machinery that any-store's backup (backup.go) does not need. any-store backs up a single source btree to a single destination over already-decrypted in-memory pages: no aDb[] name resolution, no per-pager list of in-flight Backup objects to notify on source writes, no page-size renegotiation (matching size enforced at BackupInit), and no btree-level whole-file copy primitive. Public API + step/restart/update + backupOnePage are ported on the backup.go rows; these are the remaining internals.",
+    "funcs": [
+      {
+        "file": "backup.c",
+        "func": "attachBackupObject",
+        "reason": "links a Backup into the source pager's backup list for live update; any-store has at most one backup and no such list."
+      },
+      {
+        "file": "backup.c",
+        "func": "backupTruncateFile",
+        "reason": "truncate-dest helper; any-store truncates the destination inline in Backup.finalize via pager.sqlite3PagerTruncateImage."
+      },
+      {
+        "file": "backup.c",
+        "func": "checkReadTransaction"
+      },
+      {
+        "file": "backup.c",
+        "func": "findDatabase",
+        "reason": "resolves a db name to an index in the connection's aDb[]; any-store has no named-database namespace."
+      },
+      {
+        "file": "backup.c",
+        "func": "isFatalError"
+      },
+      {
+        "file": "backup.c",
+        "func": "setDestPgsz",
+        "reason": "negotiates destination page size; any-store enforces equal page size at BackupInit instead."
+      },
+      {
+        "file": "backup.c",
+        "func": "sqlite3BackupUpdate",
+        "reason": "connection-wide dispatcher invoked when a source page changes mid-backup, walking every Backup on the source; any-store has the per-object backupUpdate (cited by backup.go Backup.update) but no multi-object dispatch."
+      },
+      {
+        "file": "backup.c",
+        "func": "sqlite3BtreeCopyFile",
+        "reason": "btree-level whole-file copy used by VACUUM INTO; any-store has no VACUUM and no CopyFile primitive (see sqlcipher_codec.json backup.c:801-803)."
       }
     ]
   }
