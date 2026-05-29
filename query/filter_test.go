@@ -216,60 +216,54 @@ func TestAnd(t *testing.T) {
 	})
 }
 
-// TestAndIndexBounds_TwoConjunctsSameField_Range pins that two range
-// conjuncts on the same field intersect into a single bounded range
-// (I-04: pre-fix And.IndexBounds returned only the first conjunct's bounds).
-func TestAndIndexBounds_TwoConjunctsSameField_Range(t *testing.T) {
+// TestAndIndexBounds_SameFieldOverApprox pins the I-04 contract: And.IndexBounds
+// returns a SOUND OVER-APPROXIMATION (the first contributing conjunct's bounds),
+// NOT the intersection. Intersecting would be unsound for array/multi-key fields
+// (see And.IndexBounds and TestQueryCount_ArrayTwoSidedRange). Here two range
+// conjuncts on "a" yield just the first, [5,+inf), a superset a FilterIter trims.
+func TestAndIndexBounds_SameFieldOverApprox(t *testing.T) {
 	f, err := ParseCondition(`{"$and":[{"a":{"$gte":5}},{"a":{"$lte":10}}]}`)
 	require.NoError(t, err)
 	bs := f.IndexBounds("a", nil)
 	require.Len(t, bs, 1)
 	assert.Equal(t, []byte(newBoundKey(5)), []byte(bs[0].Start))
-	assert.Equal(t, []byte(newBoundKey(10)), []byte(bs[0].End))
 	assert.True(t, bs[0].StartInclude)
-	assert.True(t, bs[0].EndInclude)
+	assert.Empty(t, []byte(bs[0].End), "over-approx keeps the first conjunct's open upper bound (+inf), not the $lte")
 }
 
-// TestAndIndexBounds_InAndRange pins that an $in set intersected with a
-// range conjunct keeps only the in-values inside the range (I-04).
-func TestAndIndexBounds_InAndRange(t *testing.T) {
+// TestAndIndexBounds_InAndRange_OverApprox pins that an $in conjoined with a
+// range yields the full $in set (the first conjunct), NOT the in-values trimmed
+// to the range. The dropped $gte is re-applied by a FilterIter; for Count the
+// CountOnly fast path is gated off (indexCoversFilter rejects the 2-predicate
+// field) so the over-approx is never miscounted.
+func TestAndIndexBounds_InAndRange_OverApprox(t *testing.T) {
 	f, err := ParseCondition(`{"a":{"$in":[1,2,5,10]},"$and":[{"a":{"$gte":5}}]}`)
 	require.NoError(t, err)
 	bs := f.IndexBounds("a", nil)
-	require.Len(t, bs, 2)
-	// SortAndMerge orders by Start: {5} then {10}.
-	assert.Equal(t, []byte(newBoundKey(5)), []byte(bs[0].Start))
-	assert.Equal(t, []byte(newBoundKey(5)), []byte(bs[0].End))
-	assert.Equal(t, []byte(newBoundKey(10)), []byte(bs[1].Start))
-	assert.Equal(t, []byte(newBoundKey(10)), []byte(bs[1].End))
+	require.Len(t, bs, 4, "all four $in values, not just those >= 5")
+	assert.Equal(t, []byte(newBoundKey(1)), []byte(bs[0].Start))
+	assert.Equal(t, []byte(newBoundKey(10)), []byte(bs[3].Start))
 }
 
-// TestAndIndexBounds_DisjointConjuncts pins that conjuncts with no common
-// value intersect to an empty bound set (I-04: the wrong-answer trigger —
-// pre-fix this returned the $in bounds and CountOnly over-counted).
-func TestAndIndexBounds_DisjointConjuncts(t *testing.T) {
+// TestAndIndexBounds_DisjointConjuncts_OverApproxNotEmpty pins that disjoint
+// conjuncts (no common value) do NOT collapse to empty bounds — they
+// over-approximate to the first conjunct's $in set. The I-04 wrong-answer
+// (CountOnly over-count) is prevented instead at the planner gate
+// (indexCoversFilter rejects a >1-predicate field) and re-checked end-to-end by
+// TestQueryCount_AndConjunctionLostInCount.
+func TestAndIndexBounds_DisjointConjuncts_OverApproxNotEmpty(t *testing.T) {
 	f, err := ParseCondition(`{"a":{"$in":[1,2]},"$and":[{"a":{"$gte":5}}]}`)
 	require.NoError(t, err)
 	bs := f.IndexBounds("a", nil)
-	assert.Len(t, bs, 0)
+	require.Len(t, bs, 2, "over-approx returns the $in bounds, never empty (would drop matches for array fields)")
+	assert.True(t, bs.Contains(newBoundKey(1)))
+	assert.True(t, bs.Contains(newBoundKey(2)))
 }
 
-// TestAndIndexBounds_ThreeConjuncts_EmptyStaysEmpty pins that once the
-// running intersection is empty, a later contributing conjunct cannot
-// resurrect it (a ∧ ∅ = ∅).
-func TestAndIndexBounds_ThreeConjuncts_EmptyStaysEmpty(t *testing.T) {
-	f, err := ParseCondition(`{"$and":[{"a":{"$in":[1,2]}},{"a":{"$gte":5}},{"a":{"$lte":8}}]}`)
-	require.NoError(t, err)
-	bs := f.IndexBounds("a", nil)
-	assert.Len(t, bs, 0)
-}
-
-// TestOrIndexBounds_DisjointAndBranch_SafeOverApprox pins that the I-04 And
-// intersection applies only at the top level (empty bs). When And.IndexBounds
-// is seeded by Or's accumulator (non-empty bs), it must stay an
-// over-approximation: an unsatisfiable And branch must NOT collapse the Or
-// bounds to empty and drop the satisfiable a==1 disjunct. Index bounds must
-// always be a superset of the match set (a FilterIter re-checks them).
+// TestOrIndexBounds_DisjointAndBranch_SafeOverApprox pins that an And nested in
+// an Or stays an over-approximation: an unsatisfiable And branch must NOT
+// collapse the Or bounds to empty and drop the satisfiable a==1 disjunct. Index
+// bounds must always be a superset of the match set (a FilterIter re-checks them).
 func TestOrIndexBounds_DisjointAndBranch_SafeOverApprox(t *testing.T) {
 	f, err := ParseCondition(`{"$or":[{"a":1},{"$and":[{"a":{"$in":[1,2,3]}},{"a":{"$gte":5}}]}]}`)
 	require.NoError(t, err)

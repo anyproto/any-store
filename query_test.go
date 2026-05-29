@@ -39,9 +39,10 @@ func TestCollQuery_Count(t *testing.T) {
 // for I-04: an indexed CountOnly query whose same-field conjuncts are mutually
 // exclusive must Count 0, matching Iter. Pre-fix, And.IndexBounds dropped the
 // $gte conjunct and the CountOnly fast path (which skips FilterIter for an
-// index that "covers" the filter) returned 2. The root-cause unit fail-first
-// gate is query/filter_test.go:TestAndIndexBounds_DisjointConjuncts; this test
-// pins the fix at the public Count API. See docs/known-issues.md (I-04).
+// index that "covers" the filter) returned 2. The fix gates that fast path:
+// And.IndexBounds over-approximates and indexCoversFilter rejects the
+// 2-predicate field (unit gate: qplanner.TestIndexCoversFilter_GatesMultiPredicateField).
+// This test pins the fix at the public Count API. See docs/known-issues.md (I-04).
 func TestQueryCount_AndConjunctionLostInCount(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "i04")
@@ -76,6 +77,50 @@ func TestQueryCount_AndConjunctionLostInCount(t *testing.T) {
 			assert.Equal(t, 0, n, "Iter must agree with Count")
 		})
 	}
+}
+
+// TestQueryCount_ArrayTwoSidedRange is the fail-before-fix gate for the I-04
+// follow-up: a two-sided range ($gte AND $lte) over an ARRAY/multi-key field.
+// Array filter semantics match each conjunct against the whole array
+// independently, so a doc matches if SOME element is >=lo AND SOME (possibly
+// different) element is <=hi. INTERSECTING the conjunct bounds (the original
+// I-04 fix) narrows the seek to [lo,hi] and misses docs like [5,1,4] (5>=2,
+// 1<=3, but no element in [2,3]) — under-counting Count AND Iter. The fix makes
+// And.IndexBounds over-approximate (sound seek superset) and gates the CountOnly
+// fast path so it is not taken when bounds don't exactly capture the filter.
+// See docs/known-issues.md (I-04).
+func TestQueryCount_ArrayTwoSidedRange(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "arr_range")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "tags", Fields: []string{"tags"}}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"tags":[5,1,4]}`), // 5>=2 and 1<=3 → matches (no element IN [2,3])
+		anyenc.MustParseJson(`{"id":2,"tags":[3]}`),     // 3>=2 and 3<=3 → matches
+		anyenc.MustParseJson(`{"id":3,"tags":[2,9]}`),   // 2>=2 and 2<=3 → matches
+		anyenc.MustParseJson(`{"id":4,"tags":[7]}`),     // 7>=2 but no element <=3 → no match
+	))
+
+	const filter = `{"tags":{"$gte":2,"$lte":3}}`
+	// Force the index so the bug path (the narrowed seek) is exercised; with 4
+	// docs the cost model would otherwise pick FullScan, which filters correctly.
+	hint := IndexHint{IndexName: "tags", Boost: 1_000_000}
+
+	explain, err := coll.Find(filter).IndexHint(hint).Explain(ctx)
+	require.NoError(t, err)
+	require.Contains(t, explain.Sql, "IndexScan", "reproducer must take the index path; got: %s", explain.Sql)
+
+	assertQueryCount(t, coll.Find(filter).IndexHint(hint), 3)
+
+	it, err := coll.Find(filter).IndexHint(hint).Iter(ctx)
+	require.NoError(t, err)
+	n := 0
+	for it.Next() {
+		n++
+	}
+	require.NoError(t, it.Err())
+	require.NoError(t, it.Close())
+	assert.Equal(t, 3, n, "Iter must agree with Count")
 }
 
 // TestQueryCount_ScalarFirstCrossBoundDedup is the fail-before-fix gate for

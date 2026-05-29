@@ -71,8 +71,8 @@ func TestBuildPlan_SelectiveIndex_IndexSeek(t *testing.T) {
 
 // TestIndexCoversFilter_RejectsUncoveredField is the defensive regression for
 // the I-04 field-coverage check: a filter touching a field not in the index is
-// never reported as covered, and empty bounds (the post-And.IndexBounds
-// disjoint-conjuncts state) are never covered. See docs/known-issues.md (I-04).
+// never reported as covered, and empty index bounds are never covered. See
+// docs/known-issues.md (I-04).
 func TestIndexCoversFilter_RejectsUncoveredField(t *testing.T) {
 	pointBound := query.Bounds{{
 		Start:        anyenc.AppendAnyValue(nil, 1),
@@ -90,11 +90,54 @@ func TestIndexCoversFilter_RejectsUncoveredField(t *testing.T) {
 	assert.True(t, indexCoversFilter(idx, query.MustParseCondition(`{"a":1}`)),
 		"a predicate fully on the indexed field is covered")
 
-	// Empty bounds (e.g. disjoint same-field conjuncts after And.IndexBounds)
-	// are rejected by the len(idx.Bounds)==0 early-return — the I-04 path.
+	// Empty bounds are rejected by the len(idx.Bounds)==0 early-return.
 	idxEmpty := &CBOIndex{Info: &IndexInfo{Name: "a", FieldNames: []string{"a"}}}
 	assert.False(t, indexCoversFilter(idxEmpty, query.MustParseCondition(`{"a":1}`)),
 		"empty bounds must not be reported as covered")
+}
+
+// TestIndexCoversFilter_GatesMultiPredicateField pins the I-04 fast-path gate.
+// Once And.IndexBounds over-approximates (its bounds are a superset of the
+// matches — required for array/multi-key correctness, see And.IndexBounds), the
+// CountOnly fast path, which skips the FilterIter, is sound only when each
+// covered field carries a SINGLE predicate so the bounds equal the matches
+// exactly. A field with two predicates — a same-field $and, an inline
+// {$in,$gte}, or a two-sided range — must NOT be reported as covered. Single
+// predicates and compound point lookups stay covered. See docs/known-issues.md
+// (I-04).
+func TestIndexCoversFilter_GatesMultiPredicateField(t *testing.T) {
+	idxA := &CBOIndex{
+		Info:   &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+		Bounds: mustParseBounds("a", `{"a":1}`),
+	}
+
+	// Rejected: more than one predicate on the single covered field.
+	for _, f := range []string{
+		`{"a":{"$in":[1,2]},"$and":[{"a":{"$gte":5}}]}`, // same-field $and
+		`{"a":{"$in":[1,2],"$gte":5}}`,                  // inline multi-op
+		`{"a":{"$gte":2,"$lte":3}}`,                     // two-sided range
+	} {
+		assert.False(t, indexCoversFilter(idxA, query.MustParseCondition(f)),
+			"multi-predicate field must not be covered (over-approx bounds): %s", f)
+	}
+
+	// Covered: exactly one predicate on the field.
+	for _, f := range []string{
+		`{"a":1}`,
+		`{"a":{"$in":[1,2,3]}}`,
+	} {
+		assert.True(t, indexCoversFilter(idxA, query.MustParseCondition(f)),
+			"single-predicate field must stay covered: %s", f)
+	}
+
+	// Covered: a compound point lookup keeps one predicate per field, so the
+	// fast path (CountEntries over the compound index) must remain available.
+	idxAB := &CBOIndex{
+		Info:   &IndexInfo{Name: "ab", FieldNames: []string{"a", "b"}},
+		Bounds: mustParseBounds("a", `{"a":1}`),
+	}
+	assert.True(t, indexCoversFilter(idxAB, query.MustParseCondition(`{"a":1,"b":2}`)),
+		"compound point lookup (one predicate per field) must stay covered")
 }
 
 func TestBuildPlan_IndexScan_SortWithLimit(t *testing.T) {

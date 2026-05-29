@@ -88,14 +88,37 @@ If a future feature is tempted to use the sketch to determine an answer, fix I-0
 
 ## I-04: `And.IndexBounds` silently discards conjuncts; CountOnly fast path returns wrong answer
 
-**Status: FIXED** on `feat/array-index-in-sortdedup` (2026-05-29). `And.IndexBounds`
-(`query/filter.go`) now intersects the bounds of every contributing same-field
-conjunct via a new `Bounds.Intersect` helper (`query/bound.go`); an empty
-intersection short-circuits, so `indexCoversFilter`'s `len(idx.Bounds)==0`
-early-return rejects the CountOnly fast path and FilterIter is applied.
-Reproducer: `TestQueryCount_AndConjunctionLostInCount` in `query_test.go`
-(verified Count=2 before the fix); unit gate
-`query/filter_test.go:TestAndIndexBounds_DisjointConjuncts`.
+**Status: FIXED** on `feat/array-index-in-sortdedup` (2026-05-29). Two
+collaborating parts:
+
+1. `And.IndexBounds` (`query/filter.go`) returns a SOUND OVER-APPROXIMATION — the
+   first contributing same-field conjunct's bounds, a superset of the matches. It
+   does NOT intersect conjunct bounds.
+2. The CountOnly fast path (which skips `FilterIter`) is gated in
+   `indexCoversFilter` (`internal/qplanner/planner.go`): a covered field carrying
+   more than one predicate (same-field `$and`, inline `{$in,$gte}`, or a
+   two-sided range) is rejected, so the fast path runs only when the bounds equal
+   the matches exactly. Every other case falls through to `FilterIter`, which
+   re-checks the full conjunction.
+
+Reproducers in `query_test.go`: `TestQueryCount_AndConjunctionLostInCount` (the
+original disjoint-conjuncts case, Count must be 0) and
+`TestQueryCount_ArrayTwoSidedRange` (the array-range regression below, Count/Iter
+must be 3). Unit gate: `internal/qplanner/planner_test.go:TestIndexCoversFilter_GatesMultiPredicateField`;
+over-approx contract: `query/filter_test.go:TestAndIndexBounds_SameFieldOverApprox`.
+
+**Regression note (array two-sided range).** The initial fix here intersected
+same-field conjunct bounds via a `Bounds.Intersect` helper (fix-sketch option 1
+below). That fixed the scalar over-count but was UNSOUND for array/multi-key
+fields: a doc matches `{tags:{$gte:2,$lte:3}}` when one element is >=2 and a
+*different* element is <=3, so it need not have any element in the intersection
+`[2,3]`. Intersecting narrowed the index seek to `[2,3]` and dropped such docs
+from BOTH Count and Iter (e.g. `{tags:[5,1,4]}` — 5>=2, 1<=3 — was missed),
+under-counting silently. Found by the 2026-05-29 differential review.
+`Bounds.Intersect` was removed; the over-approximation + fast-path gate above
+(fix-sketch options 2+3) replace it — sound for scalar and array fields alike,
+at the cost of routing scalar two-sided ranges through `FilterIter` instead of a
+tight seek.
 
 **Discovered:** 2026-05-28, during the array-index multi-bound `$in` merge code review (4-agent review of `feat/array-index-multi-bound-in-merge`).
 

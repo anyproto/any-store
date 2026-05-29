@@ -217,50 +217,33 @@ func (e And) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 	return true
 }
 
-// IndexBounds combines the bounds the conjuncts contribute for fieldName.
+// IndexBounds returns a SOUND OVER-APPROXIMATION of the index bounds for this
+// conjunction: the bounds of the first conjunct that constrains fieldName. The
+// result must be a SUPERSET of the matching set so the index seek (and Iter)
+// never miss a doc.
 //
-// At the top level (bs empty — how the planner calls it per field), the
-// contributing conjuncts are INTERSECTED: {a:{$in:[1,2]},$and:[{a:{$gte:5}}]}
-// must yield empty bounds, not the $in set, so the CountOnly fast path cannot
-// over-count (I-04, see docs/known-issues.md). An empty intersection
-// short-circuits — a ∧ ∅ = ∅, no later conjunct can widen it.
+// Intersecting conjunct bounds (the original I-04 fix) is UNSOUND for
+// ARRAY/multi-key fields: array filter semantics match each conjunct against
+// the whole array independently, so a doc matches {$gte:2,$lte:3} when one
+// element is >=2 and a DIFFERENT element is <=3 — it need not have any element
+// in [2,3]. Narrowing the seek to the intersection drops such docs from both
+// Count and Iter (and a FilterIter cannot re-add what the seek skipped). The
+// over-approximation here is correct for scalar AND array fields because every
+// matching doc has an element satisfying the first conjunct, hence in its
+// bounds; a FilterIter re-checks the full conjunction.
 //
-// When bs is NON-EMPTY the call is seeded by a union context: Or threads its
-// running accumulator through each branch (filter.go Or.IndexBounds), and the
-// other bound builders (In, Comp) union their bounds into bs. Intersecting the
-// seed-polluted conjunct results there would UNDER-approximate the match set —
-// an unsatisfiable conjunction would wrongly empty the Or accumulator — which
-// breaks the invariant that index bounds over-approximate (bounds ⊇ matches).
-// So when seeded we keep the original safe behavior: return the first
-// contributing conjunct's (union) bounds. Index seeks over such bounds are
-// always re-checked by a FilterIter, so the over-approximation is correct.
+// The CountOnly fast path skips that FilterIter, so it would over-count when
+// these over-approx bounds are a strict superset of the matches. It is gated
+// separately: indexCoversFilter rejects a covered field carrying more than one
+// predicate, so the fast path is only taken when bounds exactly equal the
+// matches (a single In/Eq/range per field). See docs/known-issues.md (I-04).
 func (e And) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
-	if len(bs) != 0 {
-		for _, f := range e {
-			if bounds = f.IndexBounds(fieldName, bs); len(bounds) != len(bs) {
-				return bounds
-			}
-		}
-		return bs
-	}
-
-	contributed := false
 	for _, f := range e {
-		childBounds := f.IndexBounds(fieldName, bs)
-		if len(childBounds) == 0 {
-			continue // this conjunct does not constrain fieldName
-		}
-		if !contributed {
-			bounds = childBounds
-			contributed = true
-			continue
-		}
-		bounds = bounds.Intersect(childBounds)
-		if len(bounds) == 0 {
-			return bounds
+		if bounds = f.IndexBounds(fieldName, bs); len(bounds) != len(bs) {
+			return
 		}
 	}
-	return bounds
+	return bs
 }
 
 func (e And) String() string {

@@ -1098,29 +1098,98 @@ func AllBoundsFixed(bounds query.Bounds) bool {
 	return true
 }
 
-// indexCoversFilter returns true if the index's fields cover all fields
-// referenced by the filter. When true, index bounds alone are sufficient
-// to determine which documents match, and no data fetch is needed for Count().
-// Zero-allocation: uses inline field matching instead of maps or slices.
+// indexCoversFilter reports whether the CountOnly fast path — where index
+// bounds alone determine the matching docs and no data fetch (FilterIter) is
+// needed — is SOUND for this filter and index. Two conditions must hold:
 //
-// I-04 invariant: this function only checks field membership, not that every
-// predicate is absorbed into the bounds. That is sound because of the
-// collaborating layer in query.And.IndexBounds: same-field conjuncts are
-// intersected, so a filter like {a:{$in:[1,2]},$and:[{a:{$gte:5}}]} with no
-// common value yields empty idx.Bounds, which the len(idx.Bounds)==0
-// early-return below rejects (CountOnly fast path skipped → FilterIter wraps).
-// Do not weaken this without revisiting And.IndexBounds. See docs/known-issues.md
-// (I-04) and query/filter_test.go:TestAndIndexBounds_DisjointConjuncts.
+//  1. Every field referenced by the filter is an index field
+//     (filterFieldsCoveredBy). Complex nodes (Or/Not/Nor) where field
+//     extraction isn't reliable are treated as not covered.
+//
+//  2. No covered field carries more than one predicate. And.IndexBounds returns
+//     a SOUND OVER-APPROXIMATION (a superset of the matches) whenever a field
+//     has multiple conjuncts: {a:{$in:[1,2]},$and:[{a:{$gte:5}}]} yields the
+//     $in bounds, and a two-sided range {a:{$gte:2,$lte:3}} yields just
+//     [2,+inf]. Counting those bounds directly would over-count — the FilterIter
+//     the fast path skips is exactly what trims the superset to the real
+//     matches (and for ARRAY fields the bounds MUST over-approximate; see
+//     query/filter.go:And.IndexBounds). So reject multi-predicate fields here
+//     and let the FilterIter path handle them. See docs/known-issues.md (I-04).
+//
+// Zero-allocation: inline field matching, no maps or slices.
 func indexCoversFilter(idx *CBOIndex, filter query.Filter) bool {
 	if filter == nil || len(idx.Bounds) == 0 {
 		return false
 	}
-	// Walk the filter tree checking each field against the index's field names.
-	// Returns false if any filter field is not in the index, or if the filter
-	// contains complex nodes (Or, Not, Nor) where field extraction isn't reliable.
+	// Condition 1: every filter field is an index field. Returns false on any
+	// uncovered field or any complex node (Or/Not/Nor).
 	hasFields := false
-	ok := filterFieldsCoveredBy(filter, idx.Info.FieldNames, &hasFields)
-	return ok && hasFields
+	if ok := filterFieldsCoveredBy(filter, idx.Info.FieldNames, &hasFields); !ok || !hasFields {
+		return false
+	}
+	// Condition 2: reject when any covered field carries >1 predicate, because
+	// And.IndexBounds then over-approximates and the fast path skips the
+	// FilterIter that would trim the result.
+	for _, field := range idx.Info.FieldNames {
+		if countFilterFieldPreds(filter, field) > 1 {
+			return false
+		}
+	}
+	return true
+}
+
+// countFilterFieldPreds returns how many leaf predicates in f constrain the
+// given field path. A field bound by more than one predicate — two same-field
+// conjuncts ({a:{$in:[1,2]},$and:[{a:{$gte:5}}]}) or an inline multi-op
+// ({a:{$in:[1,2],$gte:5}}, which parses to a Key wrapping an And) — is NOT
+// exactly captured by And.IndexBounds' over-approximation, so indexCoversFilter
+// uses this to gate the CountOnly fast path. Zero-allocation.
+func countFilterFieldPreds(f query.Filter, field string) int {
+	switch ft := f.(type) {
+	case query.Key:
+		if strings.Join(ft.Path, ".") != field {
+			return 0
+		}
+		// One Key on this field; its inner filter is an And when the field
+		// carries several ops inline (e.g. {$in,$gte}), so count those leaves.
+		return countInnerPreds(ft.Filter)
+	case query.And:
+		n := 0
+		for _, sub := range ft {
+			n += countFilterFieldPreds(sub, field)
+		}
+		return n
+	case *query.And:
+		n := 0
+		for _, sub := range *ft {
+			n += countFilterFieldPreds(sub, field)
+		}
+		return n
+	default:
+		return 0
+	}
+}
+
+// countInnerPreds counts the leaf predicates inside a Key's filter: a bare
+// Comp/In is one; an inline And of ops ({a:{$in,$gte}}) is the sum of its
+// leaves. The inner filter constrains a single field, so it contains no Keys.
+func countInnerPreds(f query.Filter) int {
+	switch ft := f.(type) {
+	case query.And:
+		n := 0
+		for _, sub := range ft {
+			n += countInnerPreds(sub)
+		}
+		return n
+	case *query.And:
+		n := 0
+		for _, sub := range *ft {
+			n += countInnerPreds(sub)
+		}
+		return n
+	default:
+		return 1
+	}
 }
 
 // filterFieldsCoveredBy walks the filter tree and checks that every referenced
