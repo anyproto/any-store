@@ -22,6 +22,21 @@ func (a *sortDedupArena) reset() {
 	a.spans = a.spans[:0]
 }
 
+// spanSorter orders spans by their arena-backed docId bytes. A typed
+// sort.Interface is used instead of sort.Slice so the hot swap path avoids
+// reflect.Swapper — a measurable win when sorting tens of thousands of spans.
+type spanSorter struct {
+	buf   []byte
+	spans []sortDedupSpan
+}
+
+func (s *spanSorter) Len() int { return len(s.spans) }
+func (s *spanSorter) Less(i, j int) bool {
+	a, b := s.spans[i], s.spans[j]
+	return bytes.Compare(s.buf[a.off:a.off+a.length], s.buf[b.off:b.off+b.length]) < 0
+}
+func (s *spanSorter) Swap(i, j int) { s.spans[i], s.spans[j] = s.spans[j], s.spans[i] }
+
 var sortDedupPool = sync.Pool{New: func() any { return new(sortDedupArena) }}
 
 // countEntriesViaSortDedup counts DISTINCT docIds across all of it.Bounds.
@@ -73,15 +88,14 @@ func (it *IndexIter) countEntriesViaSortDedup() (int, error) {
 		}
 	}
 
-	if len(arena.spans) == 0 {
-		return 0, nil
+	// 0 or 1 entry → that many distinct docs; no sort needed.
+	if len(arena.spans) <= 1 {
+		return len(arena.spans), nil
 	}
 
-	get := func(s sortDedupSpan) []byte { return arena.buf[s.off : s.off+s.length] }
-	sort.Slice(arena.spans, func(i, j int) bool {
-		return bytes.Compare(get(arena.spans[i]), get(arena.spans[j])) < 0
-	})
+	sort.Sort(&spanSorter{buf: arena.buf, spans: arena.spans})
 
+	get := func(s sortDedupSpan) []byte { return arena.buf[s.off : s.off+s.length] }
 	distinct := 1
 	prev := get(arena.spans[0])
 	for _, s := range arena.spans[1:] {
