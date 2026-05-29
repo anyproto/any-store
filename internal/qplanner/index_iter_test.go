@@ -803,6 +803,137 @@ func TestCountEntriesViaSortDedup_AllocsBudget(t *testing.T) {
 		"pooled sort-dedup should be low-alloc with a warmed pool, got %.1f", avg)
 }
 
+// TestCountEntries_Dispatch pins the 4-branch CountEntries routing using the
+// cached probe flags as route markers: Branch 3 (probe ran, false → batch),
+// Branch 4 (probe ran, true → sort-dedup), Branch 2 (probe NOT run → compound
+// sort-dedup). Each branch's count must also be correct.
+func TestCountEntries_Dispatch(t *testing.T) {
+	scalarStr := func(s, docId string) []byte {
+		return append(anyenc.AppendAnyValue(nil, s), []byte(docId)...)
+	}
+	jsonKey := func(json, docId string) []byte {
+		return append(anyenc.MustParseJson(json).MarshalTo(nil), []byte(docId)...)
+	}
+
+	t.Run("Branch3_PureScalar_PointLookup_Batch", func(t *testing.T) {
+		db, ns := rawKeyBtree(t, []rawEntry{
+			{scalarStr("a", "d1"), IndexValueScalar},
+			{scalarStr("b", "d2"), IndexValueScalar},
+			{scalarStr("c", "d3"), IndexValueScalar},
+		})
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+
+		it := &IndexIter{
+			Source:      &CursorSource{Tx: rtx, Ns: ns},
+			IdxInfo:     &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+			Bounds:      query.Bounds{boundForValue("a"), boundForValue("b")},
+			PointLookup: true,
+		}
+		defer it.Close()
+		n, err := it.CountEntries()
+		require.NoError(t, err)
+		assert.Equal(t, 2, n)
+		assert.True(t, it.indexHasMultiKeyProbed, "single-field PointLookup must run the probe")
+		assert.False(t, it.indexHasMultiKey, "pure-scalar → probe false → Branch 3 batch")
+	})
+
+	t.Run("Branch4_MultiKey_PointLookup_SortDedup", func(t *testing.T) {
+		// d3 = array ["a","b"]: per-element keys (a,d3),(b,d3) + canonical 0x06.
+		db, ns := rawKeyBtree(t, []rawEntry{
+			{scalarStr("a", "d1"), IndexValueScalar},
+			{scalarStr("a", "d3"), IndexValueMultiKey},
+			{scalarStr("b", "d2"), IndexValueScalar},
+			{scalarStr("b", "d3"), IndexValueMultiKey},
+			{jsonKey(`["a","b"]`, "d3"), IndexValueMultiKey}, // canonical key → probe true
+		})
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+
+		it := &IndexIter{
+			Source:      &CursorSource{Tx: rtx, Ns: ns},
+			IdxInfo:     &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+			Bounds:      query.Bounds{boundForValue("a"), boundForValue("b")},
+			PointLookup: true,
+		}
+		defer it.Close()
+		n, err := it.CountEntries()
+		require.NoError(t, err)
+		assert.Equal(t, 3, n, "d1, d2 scalar + d3 array straddling both bounds, deduped to one")
+		assert.True(t, it.indexHasMultiKeyProbed)
+		assert.True(t, it.indexHasMultiKey, "array entry present → probe true → Branch 4 sort-dedup")
+	})
+
+	t.Run("Branch2_Compound_SortDedup_NoProbe", func(t *testing.T) {
+		compoundKey := func(p int, tval, docId string) []byte {
+			k := anyenc.AppendAnyValue(nil, p)
+			k = anyenc.AppendAnyValue(k, tval)
+			return append(k, []byte(docId)...)
+		}
+		compoundBound := func(p int, tval string) query.Bound {
+			k := anyenc.AppendAnyValue(nil, p)
+			k = anyenc.AppendAnyValue(k, tval)
+			end := append(append([]byte{}, k...), 0xff)
+			return query.Bound{Start: k, End: end, StartInclude: true, EndInclude: true}
+		}
+		// Doc d1: {p:5, t:["a","b"]} → per-element entries (5,a,d1),(5,b,d1).
+		db, ns := rawKeyBtree(t, []rawEntry{
+			{compoundKey(5, "a", "d1"), IndexValueMultiKey},
+			{compoundKey(5, "b", "d1"), IndexValueMultiKey},
+		})
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+
+		it := &IndexIter{
+			Source:      &CursorSource{Tx: rtx, Ns: ns},
+			IdxInfo:     &IndexInfo{Name: "ix", FieldNames: []string{"p", "t"}},
+			Bounds:      query.Bounds{compoundBound(5, "a"), compoundBound(5, "b")},
+			PointLookup: true,
+		}
+		defer it.Close()
+		n, err := it.CountEntries()
+		require.NoError(t, err)
+		assert.Equal(t, 1, n, "compound array doc straddling both bounds counted once")
+		assert.False(t, it.indexHasMultiKeyProbed, "compound index must NOT run the probe (Branch 2)")
+	})
+
+	t.Run("Branch4_LegacyNilValue_PointLookup_SortDedup", func(t *testing.T) {
+		// Realistic legacy index: per-element keys AND the canonical 0x06
+		// whole-array key, all with nil (pre-value-byte) value bytes — the
+		// shape a pre-value-byte writer produced (writeValues has written the
+		// canonical key since before the value byte existed). The probe reads
+		// the key prefix, not the value, so the 0x06 keys are detected even
+		// though their values are nil. d1=[a,b], d2=[b,c] straddle the bounds.
+		db, ns := rawKeyBtree(t, []rawEntry{
+			{scalarStr("a", "d1"), nil},
+			{scalarStr("b", "d1"), nil},
+			{jsonKey(`["a","b"]`, "d1"), nil}, // canonical 0x06 key, nil value
+			{scalarStr("b", "d2"), nil},
+			{scalarStr("c", "d2"), nil},
+			{jsonKey(`["b","c"]`, "d2"), nil}, // canonical 0x06 key, nil value
+		})
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+
+		it := &IndexIter{
+			Source:      &CursorSource{Tx: rtx, Ns: ns},
+			IdxInfo:     &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+			Bounds:      query.Bounds{boundForValue("a"), boundForValue("b"), boundForValue("c")},
+			PointLookup: true,
+		}
+		defer it.Close()
+		n, err := it.CountEntries()
+		require.NoError(t, err)
+		assert.Equal(t, 2, n, "legacy multi-key with canonical 0x06 keys dedups: d1{a,b}, d2{b,c}")
+		assert.True(t, it.indexHasMultiKeyProbed)
+		assert.True(t, it.indexHasMultiKey, "canonical 0x06 key (even nil-valued) → probe true → dedup")
+	})
+}
+
 // TestIndexIter_Next_DecodesMultiKeyBit_Scalar pins that an IndexIter walking
 // entries written with IndexValueScalar reports multiKey=false.
 func TestIndexIter_Next_DecodesMultiKeyBit_Scalar(t *testing.T) {

@@ -78,6 +78,47 @@ func TestQueryCount_AndConjunctionLostInCount(t *testing.T) {
 	}
 }
 
+// TestQueryCount_ScalarFirstCrossBoundDedup is the fail-before-fix gate for
+// I-05: a mixed scalar/array index where a multi-key doc's array values
+// straddle two $in bounds and each bound's first entry is scalar. The pre-fix
+// countEntriesWithDedup peek-then-batch shortcut sees the scalar first entry,
+// batch-counts the whole bound (including the array doc's multi-key entry),
+// and double-counts the array doc → Count=4. The true distinct-doc count is 3,
+// and Iter returns 3. See docs/known-issues.md (I-05).
+func TestQueryCount_ScalarFirstCrossBoundDedup(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "i05")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "x", Fields: []string{"x"}}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"x":5}`),      // scalar, small id → sorts first under value 5
+		anyenc.MustParseJson(`{"id":2,"x":10}`),     // scalar, small id → sorts first under value 10
+		anyenc.MustParseJson(`{"id":3,"x":[5,10]}`), // multi-key, straddles both bounds
+	))
+
+	const filter = `{"x":{"$in":[5,10]}}`
+	// Force the index so the bug path (indexed CountOnly) is exercised — with
+	// only 3 docs the cost model would otherwise pick FullScan (which filters
+	// correctly and hides the bug).
+	hint := IndexHint{IndexName: "x", Boost: 1_000_000}
+
+	explain, err := coll.Find(filter).IndexHint(hint).Explain(ctx)
+	require.NoError(t, err)
+	require.Contains(t, explain.Sql, "IndexScan", "I-05 reproducer must take the index path; got: %s", explain.Sql)
+
+	assertQueryCount(t, coll.Find(filter).IndexHint(hint), 3)
+
+	it, err := coll.Find(filter).IndexHint(hint).Iter(ctx)
+	require.NoError(t, err)
+	n := 0
+	for it.Next() {
+		n++
+	}
+	require.NoError(t, it.Err())
+	require.NoError(t, it.Close())
+	assert.Equal(t, 3, n, "Iter must agree with Count")
+}
+
 func TestCollQuery_Explain(t *testing.T) {
 	fx := newFixture(t)
 
