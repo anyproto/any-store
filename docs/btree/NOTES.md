@@ -2732,24 +2732,6 @@ than SQLite's. The consequence is that some pages SQLite would rebalance after a
 left under-occupied by the Go port, a benign space-utilization divergence rather than a
 correctness defect.
 
-<a id="drift-39-backup-treats-done-as-non-fatal-allowing-post-completion-re-"></a>
-### Drift: Backup Treats Done As Non Fatal Allowing Post Completion Re Copy Corruption
-- **Category:** changed-logic  -  **Severity:** high
-- **Affected functions:** `backup.go:*Backup.update` (`backup.go:341`),
-  `pager.go:*pager.dispatchBackupUpdate` (`backup.go:341`).
-
-SQLite's `backupUpdate` gates each per-page re-copy on
-`if( !isFatalError(p->rc) && iPage<p->iNext )` (`backup.c:675`), and `isFatalError`
-(`backup.c:217-219`) returns TRUE for `SQLITE_DONE` because DONE is neither OK, BUSY, nor
-LOCKED. Therefore once a backup has finished (`p->rc == SQLITE_DONE`, set at `backup.c:564`),
-`backupUpdate` does nothing for any further source-page write and the finalized destination
-is never touched again. Go's `update` guards instead with
-`if b.rc != nil && b.rc != ErrBackupDone { return }` (`backup.go:341`), explicitly treating
-`ErrBackupDone` as non-fatal so the update path *proceeds* after completion. The consequence
-is that source commits arriving after a backup completes re-copy pages into the
-already-finalized destination -- whose schema cookie has been bumped and which has been
-truncated -- corrupting it.
-
 <a id="drift-41-backup-empty-source-finalization-path-missing"></a>
 ### Drift: Backup Empty Source Finalization Path Missing
 - **Category:** changed-logic  -  **Severity:** low

@@ -355,13 +355,16 @@ func (b *Backup) finalize(nSrcPage uint32) error {
 // Caller holds the source pager's backups list lock momentarily — see
 // pager.dispatchBackupUpdate — but the callback runs outside that lock
 // to avoid nesting b.mu under backupsMu.
-// DRIFT: backup re-copies pages after DONE (DONE not treated fatal); corrupts finalized dst See docs/btree/NOTES.md#drift-39-backup-treats-done-as-non-fatal-allowing-post-completion-re-
 func (b *Backup) update(iPage uint32, data []byte) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// ~ backup.c:669 — skip if fatal error or page not yet copied.
-	if b.rc != nil && b.rc != ErrBackupDone {
+	// ~ backup.c:675 — skip if fatal error or page not yet copied.
+	// Any non-nil b.rc is fatal-for-update here, including ErrBackupDone:
+	// isFatalError(SQLITE_DONE)==TRUE (backup.c:217-219, DONE is neither
+	// SQLITE_OK/BUSY/LOCKED), so backupUpdate never re-touches a DONE backup's
+	// finalized destination.
+	if b.rc != nil {
 		return
 	}
 	if iPage >= b.iNext {

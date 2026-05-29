@@ -230,6 +230,94 @@ func TestBackup_OnlineWriteBetweenSteps(t *testing.T) {
 		"update hook (backup.c:661-688) must re-copy pages modified after they were copied")
 }
 
+// TestBackup_PostDoneWriteDoesNotReachDst verifies that once a backup has
+// reached completion (Step returned ErrBackupDone), a later committed write to
+// the source that touches an already-copied page does NOT get re-copied into
+// the (finalized) destination. In SQLite, isFatalError(SQLITE_DONE)==TRUE
+// (backup.c:217-219), so backupUpdate's `!isFatalError(p->rc)` guard
+// (backup.c:675) skips a DONE backup entirely. The destination must reflect the
+// source snapshot at completion, not the later write.
+func TestBackup_PostDoneWriteDoesNotReachDst(t *testing.T) {
+	src, dst := backupPair(t)
+	ns, _ := src.GetNamespace("data")
+
+	// Seed: multi-page source with fat values.
+	stx, err := src.BeginWrite()
+	require.NoError(t, err)
+	fat := make([]byte, 300)
+	for i := 0; i < 200; i++ {
+		require.NoError(t, stx.Put(ns, fmt.Appendf(nil, "k-%04d", i), fat))
+	}
+	require.NoError(t, stx.Commit())
+	require.NoError(t, src.Checkpoint(CheckpointFull))
+
+	nSrc := src.DatabaseSize()
+	require.Greater(t, nSrc, uint32(4), "need a multi-page source")
+
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+
+	// First do a PARTIAL Step that leaves at least one page to copy. This is the
+	// path (backup.c:553) that attaches the backup to the source pager so it
+	// receives update() callbacks. A single full Step would finish without ever
+	// attaching, and update() would never fire — failing to exercise the drift.
+	require.NoError(t, b.Step(int(nSrc-1)), "partial Step should leave 1 page to copy")
+	require.Equal(t, uint32(1), b.Remaining())
+	b.mu.Lock()
+	attached := b.isAttached
+	b.mu.Unlock()
+	require.True(t, attached, "partial Step must attach the backup so update() can fire")
+
+	// Now Step to completion WITHOUT calling Finish. The backup is now DONE and
+	// its destination has been finalized (schema bump + truncate) but the dst
+	// write tx is still open until Finish commits it. The backup stays attached
+	// to the source pager (detach only happens in Finish, ~ backup.c:589-597).
+	require.ErrorIs(t, b.Step(-1), ErrBackupDone)
+
+	// Commit a source write touching an already-copied early page ("k-0000"
+	// lives on the leftmost leaf, copied long before completion). With the
+	// pre-fix guard this fired update() on the DONE backup and re-copied the
+	// page into the finalized dst. With the fix, b.rc == ErrBackupDone is fatal
+	// for update() so it returns early and dst is untouched.
+	postDone := []byte("post-done-write")
+	stx2, err := src.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, stx2.Put(ns, []byte("k-0000"), postDone))
+	require.NoError(t, stx2.Commit())
+
+	// Now finalize the destination.
+	require.NoError(t, b.Finish())
+
+	// Reopen dst and assert the post-DONE write did NOT land. dst must reflect
+	// the original snapshot value (the fat seed value, length 300).
+	dstPath := dst.Path()
+	_ = dst.Close()
+	d2, err := Open(dstPath, DefaultOptions())
+	require.NoError(t, err)
+	defer d2.Close()
+
+	rtx, err := d2.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	ns2, _ := d2.GetNamespace("data")
+	got, err := rtx.Get(ns2, []byte("k-0000"))
+	require.NoError(t, err)
+	require.Equal(t, string(fat), string(got),
+		"post-DONE source write must NOT reach finalized dst: isFatalError(SQLITE_DONE)==TRUE "+
+			"so backupUpdate (backup.c:675) skips a DONE backup")
+	require.NotEqual(t, string(postDone), string(got),
+		"dst must reflect the snapshot at completion, not the later write")
+
+	// Sanity: dst is not corrupt — every seeded key is readable with the
+	// snapshot value. (IntegrityCheck is not used here: it false-positives on a
+	// backed-up dst per drift-112, treating the master page as a flat leaf.)
+	for i := 0; i < 200; i++ {
+		v, err := rtx.Get(ns2, fmt.Appendf(nil, "k-%04d", i))
+		require.NoError(t, err)
+		require.Equal(t, string(fat), string(v))
+	}
+}
+
 func TestBackup_RestartOnCheckpointRestart(t *testing.T) {
 	src, dst := backupPair(t)
 	ns, _ := src.GetNamespace("data")
