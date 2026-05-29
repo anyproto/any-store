@@ -584,6 +584,95 @@ type indexEntry struct {
 	value []byte // per-entry value byte: nil (legacy), {0} scalar, {1} multi-key
 }
 
+type rawEntry struct {
+	key   []byte
+	value []byte
+}
+
+// rawKeyBtree opens an in-memory btree namespace and writes entries with
+// caller-supplied raw key bytes. Used to exercise indexProbeAnyMultiKey with
+// array (0x06) and object (0x07) leading bytes that anyenc.AppendAnyValue
+// (scalars only) cannot produce — array/object keys are built via
+// anyenc.MustParseJson(...).MarshalTo to avoid hand-coded byte drift.
+func rawKeyBtree(t *testing.T, entries []rawEntry) (*btree.DB, *btree.Namespace) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ix.db")
+	db, err := btree.Open(path, btree.Options{PageSize: 4096, CacheSize: 128, InMemory: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("ix")
+	require.NoError(t, err)
+	for _, e := range entries {
+		require.NoError(t, wtx.Put(ns, e.key, e.value))
+	}
+	require.NoError(t, wtx.Commit())
+	return db, ns
+}
+
+// TestIndexProbeAnyMultiKey pins the canonical-key probe: it returns true iff
+// the namespace contains an entry whose key starts with the array type tag
+// (0x06), which writeValues emits exactly for array-valued (multi-key) docs.
+func TestIndexProbeAnyMultiKey(t *testing.T) {
+	scalarStr := func(s, docId string) []byte {
+		return append(anyenc.AppendAnyValue(nil, s), []byte(docId)...)
+	}
+	scalarNum := func(n int, docId string) []byte {
+		return append(anyenc.AppendAnyValue(nil, n), []byte(docId)...)
+	}
+	jsonKey := func(json, docId string) []byte {
+		return append(anyenc.MustParseJson(json).MarshalTo(nil), []byte(docId)...)
+	}
+
+	// Sanity: the encodings carry the leading type tags the probe relies on.
+	require.Equal(t, byte(anyenc.TypeArray), jsonKey(`["a","b"]`, "d")[0])
+	require.Equal(t, byte(anyenc.TypeObject), jsonKey(`{"k":"v"}`, "d")[0])
+
+	cases := []struct {
+		name    string
+		entries []rawEntry
+		want    bool
+	}{
+		{"pure-scalar string (0x03)", []rawEntry{
+			{scalarStr("a", "d1"), IndexValueScalar},
+			{scalarStr("b", "d2"), IndexValueScalar},
+		}, false},
+		{"pure-scalar number (0x02)", []rawEntry{
+			{scalarNum(5, "d1"), IndexValueScalar},
+			{scalarNum(10, "d2"), IndexValueScalar},
+		}, false},
+		{"array entries (0x06)", []rawEntry{
+			{jsonKey(`["a","b"]`, "d1"), IndexValueMultiKey},
+		}, true},
+		{"mixed scalar + array", []rawEntry{
+			{scalarStr("a", "d1"), IndexValueScalar},
+			{jsonKey(`["a","b"]`, "d2"), IndexValueMultiKey},
+		}, true},
+		{"empty namespace", nil, false},
+		{"object-only (0x07, cursor lands past 0x06)", []rawEntry{
+			{jsonKey(`{"k":"v"}`, "d1"), IndexValueScalar},
+		}, false},
+		{"legacy nil-value array (probe reads key, not value)", []rawEntry{
+			{jsonKey(`["a","b"]`, "d1"), nil},
+		}, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, ns := rawKeyBtree(t, tc.entries)
+			rtx, err := db.BeginRead()
+			require.NoError(t, err)
+			defer func() { _ = rtx.Rollback() }()
+
+			got, err := indexProbeAnyMultiKey(&CursorSource{Tx: rtx, Ns: ns})
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
 // TestIndexIter_Next_DecodesMultiKeyBit_Scalar pins that an IndexIter walking
 // entries written with IndexValueScalar reports multiKey=false.
 func TestIndexIter_Next_DecodesMultiKeyBit_Scalar(t *testing.T) {
@@ -954,8 +1043,8 @@ func TestIndexIter_SkipOffset_PastEnd(t *testing.T) {
 // entries at the index level would mis-count logical rows.
 func TestIndexIter_SkipOffset_StopsAtMultiKey(t *testing.T) {
 	db, ns := indexEntryBtree(t, []indexEntry{
-		{field: "a", docId: "p1", value: IndexValueScalar},   // skipped (scalar)
-		{field: "b", docId: "p2", value: IndexValueScalar},   // skipped (scalar)
+		{field: "a", docId: "p1", value: IndexValueScalar},    // skipped (scalar)
+		{field: "b", docId: "p2", value: IndexValueScalar},    // skipped (scalar)
 		{field: "m1", docId: "p3", value: IndexValueMultiKey}, // STOP here
 		{field: "m2", docId: "p3", value: IndexValueMultiKey},
 		{field: "z", docId: "p4", value: IndexValueScalar},

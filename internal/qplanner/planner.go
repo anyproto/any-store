@@ -877,10 +877,11 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	b := &seekBatch{}
 	b.indexCS = CursorSource{Tx: params.Tx, Ns: idx.Info.Ns}
 	b.indexIter = IndexIter{
-		Source:  &b.indexCS,
-		IdxInfo: idx.Info,
-		Bounds:  idx.Bounds,
-		Reverse: reverse,
+		Source:      &b.indexCS,
+		IdxInfo:     idx.Info,
+		Bounds:      idx.Bounds,
+		Reverse:     reverse,
+		PointLookup: idx.PointLookup,
 	}
 
 	var root Iterator = &b.indexIter
@@ -983,9 +984,10 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 			Tx: params.Tx,
 			Ns: idx.Info.Ns,
 		},
-		IdxInfo: idx.Info,
-		Bounds:  idx.Bounds, // may be nil for full index scan
-		Reverse: reverse,
+		IdxInfo:     idx.Info,
+		Bounds:      idx.Bounds, // may be nil for full index scan
+		Reverse:     reverse,
+		PointLookup: idx.PointLookup,
 	}
 
 	// Insert IndexFilterIter when compound index fields cover filter conditions.

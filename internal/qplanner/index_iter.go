@@ -21,6 +21,13 @@ type IndexIter struct {
 	Reverse  bool
 	started  bool
 
+	// PointLookup mirrors CBOIndex.PointLookup: true iff every original bound
+	// was an equality (Start == End) before AdjustBoundsForNonUnique widened
+	// the End. CountEntries uses it to gate the single-field canonical-key
+	// probe — the probe is a valid multi-key detector only when the indexed
+	// value sits at byte position 0 of the key (single-field PointLookup).
+	PointLookup bool
+
 	// pendingCurrent is set by skipOffset after it positions the cursor
 	// directly on the first row to emit. When true, the next Next() call
 	// returns the entry at the current cursor position WITHOUT advancing
@@ -277,6 +284,39 @@ func (it *IndexIter) skipOffset(n int) (remaining int, err error) {
 	// cursor and returns end-of-stream.
 	it.pendingCurrent = true
 	return n - skipped, nil
+}
+
+// arrayPrefix is the anyenc type tag for array-typed values. writeValues
+// emits a key with this leading byte exactly when a doc has an array-typed
+// value for an indexed field (the per-element keys of a nested array, and the
+// whole-value-as-tuple key of any multi-key doc). So a key with this prefix
+// exists in a single-field index iff that index has ever held a multi-key
+// (array) entry. See docs/specs/2026-05-28-i04-i05-fix-option-d-canonical-key-probe.md.
+var arrayPrefix = []byte{byte(anyenc.TypeArray)}
+
+// indexProbeAnyMultiKey reports whether the index namespace has any entry whose
+// key begins with the array type tag — i.e. whether any indexed doc had an
+// array-typed value. It is a single btree Seek, snapshot-consistent with the
+// caller's read tx.
+//
+// PRECONDITION: only valid for single-field indexes. For a compound index the
+// array field's value is not at byte position 0 of the key, so its 0x06 byte
+// sits mid-key and Seek(arrayPrefix) would miss it (false negative). Callers
+// must route compound/non-PointLookup shapes elsewhere before probing.
+func indexProbeAnyMultiKey(cs *CursorSource) (bool, error) {
+	c := cs.NewCursor()
+	defer c.Close()
+	if err := c.Seek(arrayPrefix); err != nil {
+		return false, err
+	}
+	if !c.Valid() {
+		return false, nil
+	}
+	k, err := c.Key()
+	if err != nil {
+		return false, err
+	}
+	return len(k) > 0 && k[0] == byte(anyenc.TypeArray), nil
 }
 
 // CountEntries counts distinct documents matching this index iterator's
