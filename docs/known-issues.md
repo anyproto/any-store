@@ -159,9 +159,18 @@ misclassify. Reproducer: `TestQueryCount_ScalarFirstCrossBoundDedup` in
 compound index's multi-key entries (the array type tag is mid-key, not at byte 0),
 so compound / non-PointLookup multi-bound counts always route to sort-dedup. For a
 high-selectivity *scalar* compound index this is materially slower than the old
-value-byte peek-batch (e.g. `simple_index/In`, which the planner routes to a
-compound `(a,b)` index, regresses from ~22 µs to ~1.8 ms at 200k docs). This is a
-performance-only regression — the answer is correct. See the bench notes in
+value-byte peek-batch: `simple_index/In` (`{a:{$in:[...]}}`), which the planner
+routes to a compound `(a,b)` index on a cost tie, regresses ~24 µs → ~3.5 ms
+(~144×) at 500k docs. This is a performance-only regression — the answer is
+correct. The single-field array path it was built for is *faster* than baseline:
+`array_index/In` 8.56 ms → 7.75 ms (0.91×) with allocs 75 584 → 63 (~1200×
+fewer); `unique_index/In3` stays within ±5%; `array_index/InEmpty` is +9%
+(~0.5 µs, the one extra probe Seek). Two further characteristics: the canonical-
+key probe adds one Seek to every single-field multi-bound count (visible only on
+near-empty results like InEmpty); and `sortDedupPool` retains each arena at the
+high-water mark of the largest count it served (the pooling is what buys the
+low-alloc win — the parked k-way merge is the O(k)-memory alternative if bounded
+footprint under concurrent large counts ever matters). See the bench table in
 `docs/plans/2026-05-29-array-index-in-sortdedup-plan.md`.
 
 **Discovered:** 2026-05-28, during the 4-agent review of `feat/array-index-multi-bound-in-merge`. Pre-existing on the `btree` baseline — not introduced by the merge feature.
@@ -263,3 +272,29 @@ True answer: 1 distinct doc. **Over-counts by the number of bounds the doc's arr
 3. **CoverIter detects multi-key once.** Run the canonical-key probe (the same `Seek([0x06])` Option D uses for I-05) when constructing the CoverIter; if the index has any multi-key entry, set a flag and read value bytes per entry. Pure-scalar unique indexes keep the zero-cost hardcoded-false.
 
 Option 1 is the smallest correct fix. Tracked as a follow-up; may be folded into the Option D plan if scope is expanded.
+
+---
+
+## I-07: `Count()` with `Limit`/`Offset` over a multi-key index disagrees with `Iter()`
+
+**Discovered:** 2026-05-29, adversarial review of `feat/array-index-in-sortdedup`. **Pre-existing on the `btree` baseline (alpha.6)** — confirmed by detaching to `eb667a0` and reproducing identical numbers. NOT introduced by the sort-dedup branch.
+
+**Affected code:** `query.go` Count path. When the query carries a `Limit`/`Offset`, the plan root is a `LimitIter`, which is not a `CountableIterator`, so Count falls to the generic dedup loop. Over a multi-key index two dedup layers (`CanonicalKeyDedupIter` upstream + the consumer `DocDedup`) interact with the limit cutoff and produce a count that is neither `min(limit, distinct)` nor the true distinct count.
+
+**Trigger:** index `{x}`, docs `d0..d9` each `{x:[i,i+1]}`; `Find({x:{$in:[0..10]}}).Limit(3).Count()` → **2**, but `.Limit(3).Iter()` yields **3**. `.Offset(4).Count()` → **8** vs `Iter` **6**. Scalar indexes are unaffected (Count respects the limit). 
+
+**Impact: CORRECTNESS (Count ≠ len(Iter)).** Most likely to surface as wrong paginated counts on array fields. Out of scope for the sort-dedup branch (predates it; lives in the Count/Limit wiring, not the dedup count path).
+
+**Fix sketch:** route limited/offset counts through a count-aware limit (count distinct, then clamp), or make the limited multi-key Count path reuse the same dedup as Iter.
+
+---
+
+## I-08: `$in` containing an empty array (`$in:[[]]`) over-counts vs the filter
+
+**Discovered:** 2026-05-29, adversarial review of `feat/array-index-in-sortdedup`. **Pre-existing on the `btree` baseline** — confirmed identical at `eb667a0`. NOT introduced by the sort-dedup branch.
+
+**Affected code:** `query/filter.go` `In.IndexBounds` vs `In.Ok`. `writeValues` indexes an empty-array field value under its canonical key (`0x06 0x00`); `In.IndexBounds` builds a point bound for the `[]` member that matches that entry, so the index/Count path counts the doc — but `In.Ok` iterates the (empty) array and matches nothing, so the FullScan/Iter path correctly excludes it.
+
+**Trigger:** index `{x}`, docs `{x:[]}`,`{x:1}`; `Find({x:{$in:[[],1]}}).Count()` → **2**, `Iter()` → **1**.
+
+**Impact: CORRECTNESS (Count ≠ len(Iter)), extreme corner** (an `$in` list literally containing an empty array). Fix would live in `In.IndexBounds` / unsatisfiability handling, not the count dispatch.
