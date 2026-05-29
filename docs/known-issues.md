@@ -174,27 +174,33 @@ This issue is OUT OF SCOPE for `docs/plans/2026-05-28-array-index-multi-bound-in
 (the peek-then-batch + `stickyMulti` shortcut) is **deleted**. `IndexIter.CountEntries`
 is now a 4-branch dispatch: single-bound and probe-says-pure-scalar use the
 page-batch fast path; compound/non-PointLookup and probe-says-multi-key use a
-pooled sort-dedup that counts distinct docIds with no peek-then-batch shortcut to
-misclassify. Reproducer: `TestQueryCount_ScalarFirstCrossBoundDedup` in
-`query_test.go` (verified Count=4 before the fix).
+pooled **seen-set** (`internal/qplanner/seenset.go`) that counts distinct docIds
+with no peek-then-batch shortcut to misclassify. Reproducer:
+`TestQueryCount_ScalarFirstCrossBoundDedup` in `query_test.go` (verified Count=4
+before the fix).
 
 **Trade-off (accepted 2026-05-29):** the canonical-key probe cannot detect a
 compound index's multi-key entries (the array type tag is mid-key, not at byte 0),
-so compound / non-PointLookup multi-bound counts always route to sort-dedup. For a
-high-selectivity *scalar* compound index this is materially slower than the old
-value-byte peek-batch: `simple_index/In` (`{a:{$in:[...]}}`), which the planner
-routes to a compound `(a,b)` index on a cost tie, regresses ~24 µs → ~3.5 ms
-(~144×) at 500k docs. This is a performance-only regression — the answer is
-correct. The single-field array path it was built for is *faster* than baseline:
-`array_index/In` 8.56 ms → 7.75 ms (0.91×) with allocs 75 584 → 63 (~1200×
-fewer); `unique_index/In3` stays within ±5%; `array_index/InEmpty` is +9%
-(~0.5 µs, the one extra probe Seek). Two further characteristics: the canonical-
-key probe adds one Seek to every single-field multi-bound count (visible only on
-near-empty results like InEmpty); and `sortDedupPool` retains each arena at the
-high-water mark of the largest count it served (the pooling is what buys the
-low-alloc win — the parked k-way merge is the O(k)-memory alternative if bounded
-footprint under concurrent large counts ever matters). See the bench table in
-`docs/plans/2026-05-29-array-index-in-sortdedup-plan.md`.
+so compound / non-PointLookup multi-bound counts always route to the seen-set. For
+a high-selectivity *scalar* compound index this is slower than a page-level batch:
+`simple_index/In` (`{a:{$in:[...]}}`), which the planner routes to a compound
+`(a,b)` index on a cost tie, walks every entry instead of batching. The seen-set's
+**skip-scalar** mode (read the per-entry value byte and count scalar entries
+without touching the map) keeps this as cheap as a walk can be — **−78%** vs the
+original typed-sort sort-dedup — but it is still a per-entry walk (~0.7 ms for a
+25k-doc count vs `btree`'s ~24 µs batch). This is a performance-only regression —
+the answer is correct. The single-field array path it was built for is *faster*
+than the `btree` baseline: the seen-set beats the sort-dedup that was already
+0.91× `btree` on `array_index/In`, with allocs ~1200× fewer; `unique_index/In3`
+within ±5%; `array_index/InEmpty` +9% (~0.5 µs, the one extra probe Seek). Two
+further characteristics: the canonical-key probe adds one Seek to every
+single-field multi-bound count (visible only on near-empty results like InEmpty);
+and `seenSetPool` retains its map + chunks at the high-water mark of the largest
+count it served (the pooling is the low-alloc win, and the map buckets dominate —
+~3.5× the chunk bytes). The 4-agent review confirmed this retention is bounded and
+GC-reclaimable — no leak/corruption; a Put-time cap is a known follow-up. See the
+seen-set A/B in the `129ffc0` commit message and
+`docs/2026-05-29-array-index-sortdedup-summary.md`.
 
 **Discovered:** 2026-05-28, during the 4-agent review of `feat/array-index-multi-bound-in-merge`. Pre-existing on the `btree` baseline — not introduced by the merge feature.
 
@@ -241,7 +247,7 @@ The bug appears only when the SAME index field is sometimes scalar (1 entry, SCA
 
 The dispatch routes to `countEntriesWithDedup` (not the merge) when the sketch sum is below `kWayMergeMinEntries` — true at small N. At larger N where the merge engages, the bug doesn't trigger because the merge correctly dedups by docId. So a mixed-array workload at small N is the window of exposure. At larger N the bug becomes correct again — a confusing data-size-dependent artifact.
 
-**Reproducer:** `TestQuery_KnownIssueI05_ScalarFirstCrossBoundDedup` in `query_test.go` (marked `t.Skip` pending the fix plan). Sets up the trigger conditions, confirms Count=4 and Iter=3.
+**Reproducer:** `TestQueryCount_ScalarFirstCrossBoundDedup` in `query_test.go` (now active). Sets up the trigger conditions, confirms Count=4 before the fix and 3 after, with Iter=3.
 
 **Fix sketch (graduated):**
 
