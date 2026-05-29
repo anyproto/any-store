@@ -76,3 +76,71 @@ func TestCoverIter_Next_PrefixMismatch(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, docId, "seek finds 'z' which lacks prefix 'b' → skip")
 }
+
+// TestCoverIter_MultiBound_MultiKey_SetsMultiKeyFlag pins the I-06 fix: a
+// multi-bound CoverIter over an index that holds an array (0x06) entry yields
+// multiKey=true (so DocDedup collapses cross-bound repeats); single-bound and
+// pure-scalar multi-bound keep the zero-cost multiKey=false.
+func TestCoverIter_MultiBound_MultiKey_SetsMultiKeyFlag(t *testing.T) {
+	elemKey := func(s, doc string) []byte {
+		return append(anyenc.AppendAnyValue(nil, s), []byte(doc)...)
+	}
+	arrayKey := func(json, doc string) []byte {
+		return append(anyenc.MustParseJson(json).MarshalTo(nil), []byte(doc)...)
+	}
+	info := &IndexInfo{Name: "ci", FieldNames: []string{"x"}}
+	twoBounds := query.Bounds{
+		{Start: anyenc.AppendAnyValue(nil, "a")},
+		{Start: anyenc.AppendAnyValue(nil, "b")},
+	}
+
+	t.Run("multi-bound + array data → multiKey true", func(t *testing.T) {
+		db, ns := rawKeyBtree(t, []rawEntry{
+			{elemKey("a", "d1"), IndexValueMultiKey},
+			{elemKey("b", "d1"), IndexValueMultiKey},
+			{arrayKey(`["a","b"]`, "d1"), IndexValueMultiKey}, // canonical 0x06 key
+		})
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+		it := &CoverIter{Source: &CursorSource{Tx: rtx, Ns: ns}, IdxInfo: info, Bounds: twoBounds}
+		_, docID, multiKey, err := it.Next()
+		require.NoError(t, err)
+		require.NotNil(t, docID)
+		assert.True(t, multiKey, "array (0x06) entry present → probe true → multiKey=true")
+	})
+
+	t.Run("single-bound → multiKey false (no probe)", func(t *testing.T) {
+		db, ns := rawKeyBtree(t, []rawEntry{
+			{elemKey("a", "d1"), IndexValueMultiKey},
+			{arrayKey(`["a","b"]`, "d1"), IndexValueMultiKey},
+		})
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+		it := &CoverIter{
+			Source:  &CursorSource{Tx: rtx, Ns: ns},
+			IdxInfo: info,
+			Bounds:  query.Bounds{{Start: anyenc.AppendAnyValue(nil, "a")}},
+		}
+		_, docID, multiKey, err := it.Next()
+		require.NoError(t, err)
+		require.NotNil(t, docID)
+		assert.False(t, multiKey, "single bound can't straddle → probe skipped → multiKey=false")
+	})
+
+	t.Run("multi-bound pure-scalar → multiKey false", func(t *testing.T) {
+		db, ns := rawKeyBtree(t, []rawEntry{
+			{elemKey("a", "d1"), IndexValueScalar},
+			{elemKey("b", "d2"), IndexValueScalar},
+		})
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+		it := &CoverIter{Source: &CursorSource{Tx: rtx, Ns: ns}, IdxInfo: info, Bounds: twoBounds}
+		_, docID, multiKey, err := it.Next()
+		require.NoError(t, err)
+		require.NotNil(t, docID)
+		assert.False(t, multiKey, "pure-scalar index → probe false → multiKey=false")
+	})
+}

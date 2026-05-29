@@ -16,9 +16,26 @@ type CoverIter struct {
 
 	idx    int
 	keyBuf []byte // reusable buffer for SeekKey results
+
+	multiKeyProbed bool // lazy: probe runs on the first Next when len(Bounds) > 1
+	hasMultiKey    bool
 }
 
 func (it *CoverIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
+	// A unique index CAN hold array entries (each element unique across docs),
+	// so a multi-bound $in can match the SAME doc through several of its array
+	// values. Probe once for any 0x06 (array) entry; if present, tag yielded
+	// entries multiKey so the consumer's DocDedup collapses the cross-bound
+	// repeats (I-06). DocDedup keys on docId, so a conservative index-level
+	// true never merges distinct docs. Single-bound lookups can't straddle
+	// bounds, so they skip the probe and keep the zero-cost multiKey=false.
+	if len(it.Bounds) > 1 && !it.multiKeyProbed {
+		it.hasMultiKey, err = indexProbeAnyMultiKey(it.Source)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		it.multiKeyProbed = true
+	}
 	for it.idx < len(it.Bounds) {
 		b := it.Bounds[it.idx]
 		it.idx++
@@ -36,8 +53,7 @@ func (it *CoverIter) Next() (key []byte, docId []byte, multiKey bool, err error)
 			continue
 		}
 		docID := extractDocId(it.keyBuf, len(it.IdxInfo.FieldNames))
-		// Unique-index point lookup: at most one entry per doc — never a duplicate.
-		return it.keyBuf, docID, false, nil
+		return it.keyBuf, docID, it.hasMultiKey, nil
 	}
 	return nil, nil, false, nil
 }

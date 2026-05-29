@@ -119,6 +119,44 @@ func TestQueryCount_ScalarFirstCrossBoundDedup(t *testing.T) {
 	assert.Equal(t, 3, n, "Iter must agree with Count")
 }
 
+// TestQueryCount_UniqueIndex_MultiKeyData_DedupsCorrectly is the fail-before-fix
+// gate for I-06: a unique single-field index CAN hold an array doc (its elements
+// are unique across docs). A multi-bound $in whose values are the doc's array
+// elements routes through the unique CoverIter shortcut, which pre-fix hardcoded
+// multiKey=false so DocDedup never collapsed the cross-bound repeats → Count=2.
+// The true distinct-doc count is 1, and Iter returns 1. See docs/known-issues.md
+// (I-06).
+func TestQueryCount_UniqueIndex_MultiKeyData_DedupsCorrectly(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "i06")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "x", Fields: []string{"x"}, Unique: true}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"x":["a","b"]}`),
+	))
+
+	const filter = `{"x":{"$in":["a","b"]}}`
+	// Force the unique index so the CoverIter shortcut (where the bug lives) is
+	// exercised rather than a FullScan over the single doc.
+	hint := IndexHint{IndexName: "x", Boost: 1_000_000}
+
+	explain, err := coll.Find(filter).IndexHint(hint).Explain(ctx)
+	require.NoError(t, err)
+	require.Contains(t, explain.Sql, "CoverLookup", "I-06 reproducer must take the unique CoverIter path; got: %s", explain.Sql)
+
+	assertQueryCount(t, coll.Find(filter).IndexHint(hint), 1)
+
+	it, err := coll.Find(filter).IndexHint(hint).Iter(ctx)
+	require.NoError(t, err)
+	n := 0
+	for it.Next() {
+		n++
+	}
+	require.NoError(t, it.Err())
+	require.NoError(t, it.Close())
+	assert.Equal(t, 1, n, "Iter must agree with Count")
+}
+
 func TestCollQuery_Explain(t *testing.T) {
 	fx := newFixture(t)
 
