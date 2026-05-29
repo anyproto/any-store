@@ -174,6 +174,99 @@ func maxEndKey(a, b Bound) ([]byte, bool) {
 	}
 	return b.End, b.EndInclude
 }
+
+// Intersect returns the lex-intersection of this bound set with other.
+// A bound set is a union of value ranges; the intersection is the set of
+// values present in BOTH unions. Used by And.IndexBounds to combine the
+// bounds contributed by multiple conjuncts on the same field.
+//
+// An empty result (returned as a zero-length Bounds) means the two sets
+// share no values — distinct from "no narrowing", which preserves the input.
+// The pairwise intersections are sorted and merged before returning.
+func (bs Bounds) Intersect(other Bounds) Bounds {
+	if len(bs) == 0 || len(other) == 0 {
+		return Bounds{}
+	}
+	var result Bounds
+	for _, a := range bs {
+		for _, b := range other {
+			if p, ok := intersectPair(a, b); ok {
+				result = append(result, p)
+			}
+		}
+	}
+	if len(result) == 0 {
+		return Bounds{}
+	}
+	return result.SortAndMerge()
+}
+
+// intersectPair returns the intersection of two single bounds and whether it
+// is non-empty. The intersection's lower bound is the tighter (greater) of the
+// two starts; its upper bound the tighter (lesser) of the two ends.
+func intersectPair(a, b Bound) (Bound, bool) {
+	start, startInclude := maxStartKey(a, b)
+	end, endInclude := minEndKey(a, b)
+	// With both ends finite, a start past the end is empty, and a start equal
+	// to the end is a single point only if both sides include it.
+	if len(start) > 0 && len(end) > 0 {
+		switch bytes.Compare(start, end) {
+		case 1: // start > end
+			return Bound{}, false
+		case 0:
+			if !startInclude || !endInclude {
+				return Bound{}, false
+			}
+		}
+	}
+	return Bound{
+		Start:        start,
+		End:          end,
+		StartInclude: startInclude,
+		EndInclude:   endInclude,
+	}, true
+}
+
+// maxStartKey returns the tighter (greater) lower bound of a and b — the
+// inverse of minStartKey. An empty Start means -∞, so the other side wins.
+// At equal starts the point is included only if both sides include it.
+func maxStartKey(a, b Bound) ([]byte, bool) {
+	if len(a.Start) == 0 {
+		return b.Start, b.StartInclude
+	}
+	if len(b.Start) == 0 {
+		return a.Start, a.StartInclude
+	}
+	switch bytes.Compare(a.Start, b.Start) {
+	case 0:
+		return a.Start, a.StartInclude && b.StartInclude
+	case 1: // a.Start > b.Start
+		return a.Start, a.StartInclude
+	default: // a.Start < b.Start
+		return b.Start, b.StartInclude
+	}
+}
+
+// minEndKey returns the tighter (lesser) upper bound of a and b — the inverse
+// of maxEndKey. An empty End means +∞, so the other side wins. At equal ends
+// the point is included only if both sides include it.
+func minEndKey(a, b Bound) ([]byte, bool) {
+	if len(a.End) == 0 {
+		return b.End, b.EndInclude
+	}
+	if len(b.End) == 0 {
+		return a.End, a.EndInclude
+	}
+	switch bytes.Compare(a.End, b.End) {
+	case 0:
+		return a.End, a.EndInclude && b.EndInclude
+	case -1: // a.End < b.End
+		return a.End, a.EndInclude
+	default: // a.End > b.End
+		return b.End, b.EndInclude
+	}
+}
+
 func (bs Bounds) Len() int {
 	return len(bs)
 }
