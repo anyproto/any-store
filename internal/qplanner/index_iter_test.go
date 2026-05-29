@@ -684,7 +684,7 @@ func boundForValue(v string) query.Bound {
 	return query.Bound{Start: k, End: end, StartInclude: true, EndInclude: true}
 }
 
-func sortDedupIter(rtx *btree.ReadTx, ns *btree.Namespace, bounds query.Bounds) *IndexIter {
+func seenSetIter(rtx *btree.ReadTx, ns *btree.Namespace, bounds query.Bounds) *IndexIter {
 	return &IndexIter{
 		Source:  &CursorSource{Tx: rtx, Ns: ns},
 		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
@@ -692,9 +692,22 @@ func sortDedupIter(rtx *btree.ReadTx, ns *btree.Namespace, bounds query.Bounds) 
 	}
 }
 
-// TestCountEntriesViaSortDedup_Disjoint: three docs each matching one bound,
-// no cross-bound overlap → distinct count == entry count.
-func TestCountEntriesViaSortDedup_Disjoint(t *testing.T) {
+// assertSeenSetCount runs countEntriesViaSeenSet in BOTH modes — blind
+// (Branch 4) and skip-scalar (Branch 2) — and asserts each yields want. The two
+// must always agree on the distinct-doc count.
+func assertSeenSetCount(t *testing.T, it *IndexIter, want int) {
+	t.Helper()
+	nBlind, err := it.countEntriesViaSeenSet(false)
+	require.NoError(t, err)
+	assert.Equal(t, want, nBlind, "blind seen-set count")
+	nSkip, err := it.countEntriesViaSeenSet(true)
+	require.NoError(t, err)
+	assert.Equal(t, want, nSkip, "skip-scalar seen-set count")
+}
+
+// TestCountEntriesViaSeenSet_Disjoint: three scalar docs each matching one
+// bound, no cross-bound overlap → distinct count == entry count.
+func TestCountEntriesViaSeenSet_Disjoint(t *testing.T) {
 	db, ns := indexEntryBtree(t, []indexEntry{
 		{field: "a", docId: "d1", value: IndexValueScalar},
 		{field: "b", docId: "d2", value: IndexValueScalar},
@@ -704,16 +717,14 @@ func TestCountEntriesViaSortDedup_Disjoint(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = rtx.Rollback() }()
 
-	it := sortDedupIter(rtx, ns, query.Bounds{boundForValue("a"), boundForValue("b"), boundForValue("c")})
+	it := seenSetIter(rtx, ns, query.Bounds{boundForValue("a"), boundForValue("b"), boundForValue("c")})
 	defer it.Close()
-	n, err := it.countEntriesViaSortDedup()
-	require.NoError(t, err)
-	assert.Equal(t, 3, n)
+	assertSeenSetCount(t, it, 3)
 }
 
-// TestCountEntriesViaSortDedup_Overlapping: doc d1 has array [a,b] so it
-// appears under both bounds; it must be counted once.
-func TestCountEntriesViaSortDedup_Overlapping(t *testing.T) {
+// TestCountEntriesViaSeenSet_Overlapping: doc d1 (array [a,b]) appears under
+// both bounds → counted once; plus scalar d2.
+func TestCountEntriesViaSeenSet_Overlapping(t *testing.T) {
 	db, ns := indexEntryBtree(t, []indexEntry{
 		{field: "a", docId: "d1", value: IndexValueMultiKey},
 		{field: "b", docId: "d1", value: IndexValueMultiKey},
@@ -723,16 +734,33 @@ func TestCountEntriesViaSortDedup_Overlapping(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = rtx.Rollback() }()
 
-	it := sortDedupIter(rtx, ns, query.Bounds{boundForValue("a"), boundForValue("b")})
+	it := seenSetIter(rtx, ns, query.Bounds{boundForValue("a"), boundForValue("b")})
 	defer it.Close()
-	n, err := it.countEntriesViaSortDedup()
-	require.NoError(t, err)
-	assert.Equal(t, 2, n, "d1 (array [a,b]) counted once + d2")
+	assertSeenSetCount(t, it, 2)
 }
 
-// TestCountEntriesViaSortDedup_HeavyOverlap200: 200 docs each with array
-// [x,y]; every doc straddles both bounds → 200 distinct, not 400.
-func TestCountEntriesViaSortDedup_HeavyOverlap200(t *testing.T) {
+// TestCountEntriesViaSeenSet_MixedScalarArray is the I-05 shape at the unit
+// level: scalar docs d1 (a) and d2 (b) plus an array doc d3 ([a,b]) straddling
+// both bounds. Skip-scalar mode must count d1/d2 directly and dedup d3 → 3.
+func TestCountEntriesViaSeenSet_MixedScalarArray(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "d1", value: IndexValueScalar},
+		{field: "a", docId: "d3", value: IndexValueMultiKey},
+		{field: "b", docId: "d2", value: IndexValueScalar},
+		{field: "b", docId: "d3", value: IndexValueMultiKey},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := seenSetIter(rtx, ns, query.Bounds{boundForValue("a"), boundForValue("b")})
+	defer it.Close()
+	assertSeenSetCount(t, it, 3)
+}
+
+// TestCountEntriesViaSeenSet_HeavyOverlap200: 200 docs each with array [x,y];
+// every doc straddles both bounds → 200 distinct, not 400.
+func TestCountEntriesViaSeenSet_HeavyOverlap200(t *testing.T) {
 	entries := make([]indexEntry, 0, 400)
 	for i := 0; i < 200; i++ {
 		d := fmt.Sprintf("d%03d", i)
@@ -746,16 +774,15 @@ func TestCountEntriesViaSortDedup_HeavyOverlap200(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = rtx.Rollback() }()
 
-	it := sortDedupIter(rtx, ns, query.Bounds{boundForValue("x"), boundForValue("y")})
+	it := seenSetIter(rtx, ns, query.Bounds{boundForValue("x"), boundForValue("y")})
 	defer it.Close()
-	n, err := it.countEntriesViaSortDedup()
-	require.NoError(t, err)
-	assert.Equal(t, 200, n)
+	assertSeenSetCount(t, it, 200)
 }
 
-// TestCountEntriesViaSortDedup_LegacyNilValue: sort-dedup keys on docId only
-// and never reads the value byte, so legacy nil-value entries dedup correctly.
-func TestCountEntriesViaSortDedup_LegacyNilValue(t *testing.T) {
+// TestCountEntriesViaSeenSet_LegacyNilValue: legacy nil-value entries decode as
+// multi-key (EntryValueIsMultiKey(nil)==true), so skip-scalar mode does NOT skip
+// them — they dedup correctly, same as blind mode.
+func TestCountEntriesViaSeenSet_LegacyNilValue(t *testing.T) {
 	db, ns := indexEntryBtree(t, []indexEntry{
 		{field: "a", docId: "d1", value: nil},
 		{field: "b", docId: "d1", value: nil},
@@ -765,17 +792,15 @@ func TestCountEntriesViaSortDedup_LegacyNilValue(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = rtx.Rollback() }()
 
-	it := sortDedupIter(rtx, ns, query.Bounds{boundForValue("a"), boundForValue("b")})
+	it := seenSetIter(rtx, ns, query.Bounds{boundForValue("a"), boundForValue("b")})
 	defer it.Close()
-	n, err := it.countEntriesViaSortDedup()
-	require.NoError(t, err)
-	assert.Equal(t, 2, n)
+	assertSeenSetCount(t, it, 2)
 }
 
-// TestCountEntriesViaSortDedup_AllocsBudget pins the pooled arena's steady
-// state: with a warmed pool and a reused IndexIter the per-count allocation
-// is small and independent of the distinct-doc count.
-func TestCountEntriesViaSortDedup_AllocsBudget(t *testing.T) {
+// TestCountEntriesViaSeenSet_AllocsBudget pins the pooled set's steady state:
+// with a warmed pool and a reused IndexIter the per-count allocation is small
+// and independent of the distinct-doc count.
+func TestCountEntriesViaSeenSet_AllocsBudget(t *testing.T) {
 	entries := make([]indexEntry, 0, 200)
 	for i := 0; i < 100; i++ {
 		d := fmt.Sprintf("d%03d", i)
@@ -789,18 +814,57 @@ func TestCountEntriesViaSortDedup_AllocsBudget(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = rtx.Rollback() }()
 
-	it := sortDedupIter(rtx, ns, query.Bounds{boundForValue("x"), boundForValue("y")})
+	it := seenSetIter(rtx, ns, query.Bounds{boundForValue("x"), boundForValue("y")})
 	defer it.Close()
-	// Warm the sync.Pool arena and the cursor.
-	n, err := it.countEntriesViaSortDedup()
+	// Warm the sync.Pool set (map buckets + chunks) and the cursor.
+	n, err := it.countEntriesViaSeenSet(false)
 	require.NoError(t, err)
 	require.Equal(t, 100, n)
 
 	avg := testing.AllocsPerRun(20, func() {
-		_, _ = it.countEntriesViaSortDedup()
+		_, _ = it.countEntriesViaSeenSet(false)
 	})
 	assert.LessOrEqual(t, avg, float64(30),
-		"pooled sort-dedup should be low-alloc with a warmed pool, got %.1f", avg)
+		"pooled seen-set should be low-alloc with a warmed pool, got %.1f", avg)
+}
+
+// TestPooledSeenSet_ChunkRolloverAndReuse exercises the unsafe chunked arena:
+// many distinct docIds force chunk rollovers; re-adding every key must report a
+// duplicate (proving keys interned across chunk boundaries stay valid — no
+// dangling unsafe.String); an oversized docId gets its own chunk; and reset()
+// reuse across a big→small workload keeps counts exact.
+func TestPooledSeenSet_ChunkRolloverAndReuse(t *testing.T) {
+	s := newPooledSeenSet()
+	key := func(i int) []byte { return []byte(fmt.Sprintf("docid-%010d", i)) } // ~16 bytes
+	const big = 10000                                                          // ~160 KiB of keys → several 64 KiB chunks → forces rollover
+
+	for round := 0; round < 5; round++ {
+		s.reset()
+		distinct := 0
+		for i := 0; i < big; i++ {
+			if s.add(key(i)) {
+				distinct++
+			}
+		}
+		require.Equalf(t, big, distinct, "round %d: distinct on first pass", round)
+		// Re-adding every key must dup — keys spanning multiple chunks stayed valid.
+		for i := 0; i < big; i++ {
+			require.Falsef(t, s.add(key(i)), "round %d: re-add key %d should be a duplicate", round, i)
+		}
+		// Oversized docId (> one chunk) gets a dedicated chunk and still dedups.
+		huge := make([]byte, seenChunkSize+100)
+		require.Truef(t, s.add(huge), "round %d: oversized first add", round)
+		require.Falsef(t, s.add(huge), "round %d: oversized re-add should dup", round)
+		// Shrink to a tiny workload, reusing the same set (chunks rewound).
+		s.reset()
+		small := 0
+		for i := 0; i < 3; i++ {
+			if s.add(key(i)) {
+				small++
+			}
+		}
+		require.Equalf(t, 3, small, "round %d: small reuse", round)
+	}
 }
 
 // TestCountEntries_Dispatch pins the 4-branch CountEntries routing using the

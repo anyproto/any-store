@@ -332,19 +332,22 @@ func indexProbeAnyMultiKey(cs *CursorSource) (bool, error) {
 //	  concern — within-doc dedup in insertKeys guarantees ≤1 entry per distinct
 //	  value per doc, so entry count == doc count. Fast: no per-entry walk.
 //
-//	Branch 2 (compound / non-PointLookup): per-doc sort-dedup. The canonical-key
-//	  probe is only a valid multi-key detector for single-field indexes (the
-//	  array type tag is at byte 0 only there), so any other shape skips the
-//	  probe and dedups by docId unconditionally — correct, slightly slower.
+//	Branch 2 (compound / non-PointLookup): pooled seen-set, skip-scalar mode.
+//	  The canonical-key probe is only a valid multi-key detector for single-field
+//	  indexes (the array tag is at byte 0 only there), so any other shape skips
+//	  the probe and dedups by docId. Reading the per-entry value byte lets scalar
+//	  entries be counted without touching the map — a scalar compound index
+//	  queried on its prefix costs just the walk.
 //
 //	Branch 3 (single-field PointLookup, probe says no multi-key): page-batch
 //	  CountUntil summed across bounds. With no array-valued doc, every doc has
 //	  exactly one entry and matches at most one bound, so the sum is the
 //	  distinct-doc count — no dedup needed.
 //
-//	Branch 4 (single-field PointLookup, probe says multi-key): per-doc
-//	  sort-dedup. An array doc whose values straddle several $in bounds is
-//	  counted once.
+//	Branch 4 (single-field PointLookup, probe says multi-key): pooled seen-set,
+//	  blind mode (every entry interned). Such an index is array-dense, so the
+//	  value byte is not consulted. An array doc whose values straddle several
+//	  $in bounds is counted once.
 //
 // This is the I-05 fix: there is no peek-then-batch shortcut to misclassify a
 // scalar-first bound that also holds multi-key entries.
@@ -358,9 +361,10 @@ func (it *IndexIter) CountEntries() (int, error) {
 		return it.countEntriesBatch()
 	}
 
-	// Branch 2: the probe doesn't apply to compound / non-PointLookup shapes.
+	// Branch 2: the probe doesn't apply to compound / non-PointLookup shapes;
+	// skip-scalar mode counts scalar entries without deduping them.
 	if !it.PointLookup || len(it.IdxInfo.FieldNames) != 1 {
-		return it.countEntriesViaSortDedup()
+		return it.countEntriesViaSeenSet(true)
 	}
 
 	// Branches 3 & 4: single-field PointLookup — the probe decides.
@@ -371,7 +375,7 @@ func (it *IndexIter) CountEntries() (int, error) {
 	if !hasMultiKey {
 		return it.countEntriesBatch() // Branch 3
 	}
-	return it.countEntriesViaSortDedup() // Branch 4
+	return it.countEntriesViaSeenSet(false) // Branch 4: blind dedup
 }
 
 // probeMultiKey runs the canonical-key probe lazily and caches the result for
@@ -380,7 +384,7 @@ func (it *IndexIter) CountEntries() (int, error) {
 // done this since before the value-byte feature, so legacy multi-key data is
 // detected too). The caller must have established that this is a single-field
 // index (see indexProbeAnyMultiKey's precondition); CountEntries enforces that
-// by routing compound/non-PointLookup to the sort-dedup path (Branch 2) first.
+// by routing compound/non-PointLookup to the seen-set path (Branch 2) first.
 func (it *IndexIter) probeMultiKey() (bool, error) {
 	if it.indexHasMultiKeyProbed {
 		return it.indexHasMultiKey, nil
@@ -435,7 +439,7 @@ func (it *IndexIter) countEntriesBatch() (int, error) {
 
 // seekBoundStart positions the cursor at the first entry of the given
 // bound, accounting for StartInclude. Shared by countEntriesBatch and
-// countEntriesViaSortDedup.
+// countEntriesViaSeenSet.
 func (it *IndexIter) seekBoundStart(b query.Bound) error {
 	if len(b.Start) > 0 {
 		if err := it.cursor.Seek(b.Start); err != nil {
