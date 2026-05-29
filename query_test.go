@@ -35,6 +35,49 @@ func TestCollQuery_Count(t *testing.T) {
 
 }
 
+// TestQueryCount_AndConjunctionLostInCount is the end-to-end regression pin
+// for I-04: an indexed CountOnly query whose same-field conjuncts are mutually
+// exclusive must Count 0, matching Iter. Pre-fix, And.IndexBounds dropped the
+// $gte conjunct and the CountOnly fast path (which skips FilterIter for an
+// index that "covers" the filter) returned 2. The root-cause unit fail-first
+// gate is query/filter_test.go:TestAndIndexBounds_DisjointConjuncts; this test
+// pins the fix at the public Count API. See docs/known-issues.md (I-04).
+func TestQueryCount_AndConjunctionLostInCount(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "i04")
+	require.NoError(t, err)
+	// Index on "a" so the planner takes the indexed PointLookup CountOnly
+	// fast path — the only path the bug lives on (Iter always re-filters).
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":1}`),
+		anyenc.MustParseJson(`{"id":2,"a":2}`),
+		anyenc.MustParseJson(`{"id":3,"a":5}`),
+		anyenc.MustParseJson(`{"id":4,"a":10}`),
+	))
+
+	// a ∈ {1,2} AND a >= 5 = ∅ for both the $and form and the equivalent
+	// same-field inline form.
+	for _, filter := range []string{
+		`{"a":{"$in":[1,2]},"$and":[{"a":{"$gte":5}}]}`,
+		`{"a":{"$in":[1,2],"$gte":5}}`,
+	} {
+		t.Run(filter, func(t *testing.T) {
+			assertQueryCount(t, coll.Find(filter), 0)
+
+			it, err := coll.Find(filter).Iter(ctx)
+			require.NoError(t, err)
+			n := 0
+			for it.Next() {
+				n++
+			}
+			require.NoError(t, it.Err())
+			require.NoError(t, it.Close())
+			assert.Equal(t, 0, n, "Iter must agree with Count")
+		})
+	}
+}
+
 func TestCollQuery_Explain(t *testing.T) {
 	fx := newFixture(t)
 

@@ -1100,6 +1100,15 @@ func AllBoundsFixed(bounds query.Bounds) bool {
 // referenced by the filter. When true, index bounds alone are sufficient
 // to determine which documents match, and no data fetch is needed for Count().
 // Zero-allocation: uses inline field matching instead of maps or slices.
+//
+// I-04 invariant: this function only checks field membership, not that every
+// predicate is absorbed into the bounds. That is sound because of the
+// collaborating layer in query.And.IndexBounds: same-field conjuncts are
+// intersected, so a filter like {a:{$in:[1,2]},$and:[{a:{$gte:5}}]} with no
+// common value yields empty idx.Bounds, which the len(idx.Bounds)==0
+// early-return below rejects (CountOnly fast path skipped → FilterIter wraps).
+// Do not weaken this without revisiting And.IndexBounds. See docs/known-issues.md
+// (I-04) and query/filter_test.go:TestAndIndexBounds_DisjointConjuncts.
 func indexCoversFilter(idx *CBOIndex, filter query.Filter) bool {
 	if filter == nil || len(idx.Bounds) == 0 {
 		return false

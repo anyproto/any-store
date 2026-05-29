@@ -69,6 +69,34 @@ func TestBuildPlan_SelectiveIndex_IndexSeek(t *testing.T) {
 	assert.True(t, plan.Cost < 1000*CostDocFetch, "index seek should be cheaper than full scan")
 }
 
+// TestIndexCoversFilter_RejectsUncoveredField is the defensive regression for
+// the I-04 field-coverage check: a filter touching a field not in the index is
+// never reported as covered, and empty bounds (the post-And.IndexBounds
+// disjoint-conjuncts state) are never covered. See docs/known-issues.md (I-04).
+func TestIndexCoversFilter_RejectsUncoveredField(t *testing.T) {
+	pointBound := query.Bounds{{
+		Start:        anyenc.AppendAnyValue(nil, 1),
+		End:          anyenc.AppendAnyValue(nil, 1),
+		StartInclude: true,
+		EndInclude:   true,
+	}}
+	idx := &CBOIndex{
+		Info:   &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+		Bounds: pointBound,
+	}
+
+	assert.False(t, indexCoversFilter(idx, query.MustParseCondition(`{"a":1,"b":2}`)),
+		"a predicate on an uncovered field must not be reported as covered")
+	assert.True(t, indexCoversFilter(idx, query.MustParseCondition(`{"a":1}`)),
+		"a predicate fully on the indexed field is covered")
+
+	// Empty bounds (e.g. disjoint same-field conjuncts after And.IndexBounds)
+	// are rejected by the len(idx.Bounds)==0 early-return — the I-04 path.
+	idxEmpty := &CBOIndex{Info: &IndexInfo{Name: "a", FieldNames: []string{"a"}}}
+	assert.False(t, indexCoversFilter(idxEmpty, query.MustParseCondition(`{"a":1}`)),
+		"empty bounds must not be reported as covered")
+}
+
 func TestBuildPlan_IndexScan_SortWithLimit(t *testing.T) {
 	// Sort on indexed field with LIMIT: IndexScan should win.
 	plan := BuildPlan(&PlanParams{
@@ -147,12 +175,12 @@ func TestBuildPlan_IndexHint(t *testing.T) {
 		TotalDocs: 100,
 		Indexes: []CBOIndex{
 			{
-				Info: &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+				Info:   &IndexInfo{Name: "a", FieldNames: []string{"a"}},
 				Sketch: mockSketch(10), Bounds: boundsA,
 				PointLookup: true, BoundFields: 1,
 			},
 			{
-				Info: &IndexInfo{Name: "b", FieldNames: []string{"b"}},
+				Info:   &IndexInfo{Name: "b", FieldNames: []string{"b"}},
 				Sketch: mockSketch(14), Bounds: boundsB,
 				PointLookup: true, BoundFields: 1,
 			},
@@ -167,12 +195,12 @@ func TestBuildPlan_IndexHint(t *testing.T) {
 		TotalDocs: 100,
 		Indexes: []CBOIndex{
 			{
-				Info: &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+				Info:   &IndexInfo{Name: "a", FieldNames: []string{"a"}},
 				Sketch: mockSketch(10), Bounds: boundsA,
 				PointLookup: true, BoundFields: 1,
 			},
 			{
-				Info: &IndexInfo{Name: "b", FieldNames: []string{"b"}},
+				Info:   &IndexInfo{Name: "b", FieldNames: []string{"b"}},
 				Sketch: mockSketch(14), Bounds: boundsB,
 				PointLookup: true, BoundFields: 1,
 			},
@@ -1554,6 +1582,7 @@ func TestQueryExplain_Coverage_FullScan(t *testing.T) {
 	assert.Contains(t, explain, "Iterator: ",
 		"ExplainString must include the iterator chain")
 }
+
 // TestPlan_Close_DelegatesToRoot asserts Plan.Close calls Root.Close exactly once
 // when Root is set, and is a no-op when Root is nil.
 func TestPlan_Close_DelegatesToRoot(t *testing.T) {
@@ -3385,7 +3414,8 @@ func TestBuildPlan_PlanC_CoverFiltersNoLimit(t *testing.T) {
 // 50/100=0.5. scanSel = 1.0/0.5 = 2.0 → clamps to 1.0. s = Limit/1.0 = 10.
 // e = sum(sketch estimates) = 50 (one bound × 50). s=10 < e=50 → no clamp.
 // Cost = nSeeks×CostIndexSeek + s×fetchCost + s×CostFilter
-//      = 1×0.5 + 10×3.0 + 10×0.5 = 35.5.
+//
+//	= 1×0.5 + 10×3.0 + 10×0.5 = 35.5.
 func TestBuildPlan_PlanB_ExactSortLimit_ScanSelClamp_High(t *testing.T) {
 	sorter := &sortFieldStub{fields: []query.SortField{{Field: "a"}}}
 	plan := BuildPlan(&PlanParams{
