@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"os/exec"
@@ -386,6 +387,129 @@ func TestBackup_BumpsDstSchemaCookie(t *testing.T) {
 	defer rtx1.Rollback()
 	require.NotEqual(t, dstCookieBefore, rtx1.DiskSchemaCookie(),
 		"post-backup dst schema cookie must differ from pre-backup (backup.c:423 bump)")
+}
+
+// TestBackup_PreservesSrcPage1HeaderFields verifies that a full backup carries
+// the SOURCE's page-1 header fields into the destination, matching SQLite's
+// verbatim page-1 copy (backup.c:269 memcpy; only offset 28/40 + WAL bytes
+// patched). Regression for drift-40: the Go pager re-serializes its in-memory
+// dbHeader over page 1 at commit (pager.go:1946), so without finalize
+// re-syncing that header from the copied source bytes, fields like the freelist
+// trunk pointers (offset 32/36), UserVersion, AppID, and TextEncoding revert to
+// the destination's own stale values. The freelist case is load-bearing: the
+// trunk pages now hold source content, so reverting offset 32/36 to the dst's
+// own pointers is a genuine freelist-corruption vector.
+func TestBackup_PreservesSrcPage1HeaderFields(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	srcPath := filepath.Join(dir, "src.db")
+	dstPath := filepath.Join(dir, "dst.db")
+
+	// --- Source: distinct header metadata + a non-empty freelist. ---
+	src, err := testOpen(t, srcPath, opts)
+	require.NoError(t, err)
+	stx, err := src.BeginWrite()
+	require.NoError(t, err)
+	sns, err := stx.CreateNamespace("data")
+	require.NoError(t, err)
+	require.NoError(t, stx.Commit())
+
+	// Insert then delete a batch so the source frees pages onto its freelist
+	// (populates FirstFreelistPg@32 / TotalFreelistPgs@36).
+	stx, err = src.BeginWrite()
+	require.NoError(t, err)
+	sns, err = src.GetNamespace("data")
+	require.NoError(t, err)
+	val := make([]byte, 200)
+	for i := 0; i < 300; i++ {
+		require.NoError(t, stx.Put(sns, fmt.Appendf(nil, "s-%04d", i), val))
+	}
+	require.NoError(t, stx.Commit())
+	stx, err = src.BeginWrite()
+	require.NoError(t, err)
+	sns, err = src.GetNamespace("data")
+	require.NoError(t, err)
+	for i := 0; i < 300; i++ {
+		require.NoError(t, stx.Delete(sns, fmt.Appendf(nil, "s-%04d", i)))
+	}
+	// Set distinct page-1 metadata that differs from any default. savedHeader
+	// was snapshotted at BeginWrite, so these in-memory edits make the commit
+	// see real header changes and serialize them onto page 1.
+	src.pager.header.UserVersion = 0xABCD1234
+	src.pager.header.AppID = 0x5A5A0001
+	src.pager.header.TextEncoding = 2 // UTF-16le
+	require.NoError(t, stx.Commit())
+	require.NoError(t, src.Checkpoint(CheckpointFull))
+
+	// --- Destination: an EMPTY freelist (FirstFreelistPg/TotalFreelistPgs ==
+	// 0) and different metadata, so it differs unambiguously from the source's
+	// non-empty freelist and distinct metadata. ---
+	dst, err := testOpen(t, dstPath, opts)
+	require.NoError(t, err)
+	dtx, err := dst.BeginWrite()
+	require.NoError(t, err)
+	_, err = dtx.CreateNamespace("data")
+	require.NoError(t, err)
+	require.NoError(t, dtx.Commit())
+	dtx, err = dst.BeginWrite()
+	require.NoError(t, err)
+	dns, err := dst.GetNamespace("data")
+	require.NoError(t, err)
+	for i := 0; i < 60; i++ {
+		require.NoError(t, dtx.Put(dns, fmt.Appendf(nil, "d-%04d", i), val))
+	}
+	dst.pager.header.UserVersion = 0x11110000
+	dst.pager.header.AppID = 0x22220000
+	dst.pager.header.TextEncoding = 1 // UTF-8
+	require.NoError(t, dtx.Commit())
+	require.NoError(t, dst.Checkpoint(CheckpointFull))
+
+	// Capture the source's page-1 header fields straight from disk.
+	srcData, err := os.ReadFile(srcPath)
+	require.NoError(t, err)
+	srcFirstFree := binary.BigEndian.Uint32(srcData[32:36])
+	srcTotalFree := binary.BigEndian.Uint32(srcData[36:40])
+	srcUserVer := binary.BigEndian.Uint32(srcData[60:64])
+	srcAppID := binary.BigEndian.Uint32(srcData[68:72])
+	srcTextEnc := binary.BigEndian.Uint32(srcData[56:60])
+	require.NotZero(t, srcFirstFree, "test setup: source must have a non-empty freelist")
+	require.NotZero(t, srcTotalFree, "test setup: source freelist page count must be non-zero")
+
+	// Sanity: the destination's pre-backup page-1 fields really differ, so the
+	// assertions below distinguish "kept source" from "reverted to dst".
+	dstBefore, err := os.ReadFile(dstPath)
+	require.NoError(t, err)
+	require.NotEqual(t, srcFirstFree, binary.BigEndian.Uint32(dstBefore[32:36]),
+		"test setup: dst freelist trunk must differ from src")
+	require.NotEqual(t, srcUserVer, binary.BigEndian.Uint32(dstBefore[60:64]),
+		"test setup: dst UserVersion must differ from src")
+
+	// --- Full backup src -> dst. ---
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+	for {
+		err := b.Step(-1)
+		if err == ErrBackupDone {
+			break
+		}
+		require.NoError(t, err)
+	}
+	require.NoError(t, b.Finish())
+	require.NoError(t, dst.Checkpoint(CheckpointFull))
+
+	// --- Assert dst page-1 header now mirrors the source. ---
+	dstData, err := os.ReadFile(dstPath)
+	require.NoError(t, err)
+	require.Equal(t, srcFirstFree, binary.BigEndian.Uint32(dstData[32:36]),
+		"FirstFreelistPg@32 must carry over from source (load-bearing: trunk pages hold source content)")
+	require.Equal(t, srcTotalFree, binary.BigEndian.Uint32(dstData[36:40]),
+		"TotalFreelistPgs@36 must carry over from source")
+	require.Equal(t, srcUserVer, binary.BigEndian.Uint32(dstData[60:64]),
+		"UserVersion@60 must carry over from source")
+	require.Equal(t, srcAppID, binary.BigEndian.Uint32(dstData[68:72]),
+		"AppID@68 must carry over from source")
+	require.Equal(t, srcTextEnc, binary.BigEndian.Uint32(dstData[56:60]),
+		"TextEncoding@56 must carry over from source")
 }
 
 // multiProcessBackupChild is invoked in a subprocess via exec.Command.

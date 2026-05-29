@@ -306,11 +306,11 @@ func (b *Backup) PageCount() uint32 {
 //
 // Both mutate the destination; Finish then commits the result.
 // Caller holds b.mu.
-// DRIFT: backup dst page-1 header fields reverted at commit (only cookie+dbsize survive) See docs/btree/NOTES.md#drift-40-backup-page-1-header-fields-reverted-at-commit
 // DRIFT: backup empty-source (nSrcPage==0 -> NewDb) path missing; truncateTo(0) errors See docs/btree/NOTES.md#drift-41-backup-empty-source-finalization-path-missing
 // DRIFT: backup finalize omits SetVersion(2) for WAL dest (page-1 bytes 18/19) See docs/btree/NOTES.md#drift-42-backup-finalize-omits-setversion-for-wal-destination
 func (b *Backup) finalize(nSrcPage uint32) error {
-	// 1. Bump dst schema cookie. ~ sqlite3BtreeUpdateMeta writes meta
+	// 1. Re-sync the in-memory header from the source page-1 bytes, then
+	// bump the dst schema cookie. ~ sqlite3BtreeUpdateMeta writes meta
 	// value #1 (the schema cookie) to the header at offset 40. Our page 1
 	// has the source's header bytes copied in; we overwrite offset 40
 	// with iDstSchema+1 so readers on dst observe a different cookie
@@ -319,10 +319,23 @@ func (b *Backup) finalize(nSrcPage uint32) error {
 	if err != nil {
 		return err
 	}
+	// Re-sync the in-memory db-header from the source page-1 bytes that
+	// onePage copied verbatim into dstPg1 (~ backup.c:269 memcpy). The pager
+	// unconditionally re-serializes p.header over page 1 at commit
+	// (pager.go:1946); without this reload that serialize would revert every
+	// page-1 header field (freelist trunk pointers, page size, text encoding,
+	// user/application metadata, salt, file-change/version counters, ...) to
+	// the destination's own stale values. SQLite has no such re-serialize, so
+	// the verbatim-copied source fields survive there (only offset 28/40 and
+	// the WAL version bytes are patched). This mirrors the established
+	// savepoint page-1 restore at pager.go:2274.
+	b.dst.pager.header.deserialize(dstPg1.data[:dbHeaderSize])
+	// Bump the schema cookie AFTER the deserialize so it is not overwritten.
+	// ~ sqlite3BtreeUpdateMeta writes meta value #1 (the cookie) to offset 40.
 	newCookie := b.iDstSchema + 1
 	putUint32BE(dstPg1.data[40:44], newCookie)
 	// Keep the in-memory header in sync so commit's page-1 serialize
-	// (pager.commit:1371) doesn't clobber our write.
+	// (pager.go:1946) doesn't clobber our write.
 	b.dst.pager.header.SchemaCookie = newCookie
 	b.dst.pager.releasePage(dstPg1)
 

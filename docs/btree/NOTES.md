@@ -2770,25 +2770,6 @@ is that source commits arriving after a backup completes re-copy pages into the
 already-finalized destination -- whose schema cookie has been bumped and which has been
 truncated -- corrupting it.
 
-<a id="drift-40-backup-page-1-header-fields-reverted-at-commit"></a>
-### Drift: Backup Page 1 Header Fields Reverted At Commit
-- **Category:** changed-logic  -  **Severity:** critical
-- **Affected functions:** `backup.go:*Backup.finalize` (`internal/btree/backup.go:306-326`,
-  `internal/btree/pager.go:1920`).
-
-In SQLite, `backupOnePage` copies the source page-1 bytes *verbatim* into the destination
-(only offset 28 patched to source `LastPage`), and `finalize` then patches only meta-1
-(cookie at offset 40) via `sqlite3BtreeUpdateMeta` plus the WAL version bytes; SQLite has no
-parsed in-memory db-header it re-serializes over page 1 at commit, so every other page-1
-field the backup copied survives unchanged. Go's `onePage` likewise copies the source
-page-1 bytes and patches offset 28, but the Go pager *does* hold a parsed `dbHeader` that it
-re-serializes over page 1 at commit (`pager.go:1920`), so any page-1 header field copied
-from the source is silently reverted to the destination's own header values -- only the
-`SchemaCookie` and `DatabaseSize` that Go explicitly re-applies in `finalize`
-(`backup.go:306-326`) survive. The consequence is that backup destinations can lose page-1
-header fields (page size, text encoding, user/application metadata, etc.) that SQLite would
-have faithfully carried over from the source, making this a critical fidelity divergence.
-
 <a id="drift-41-backup-empty-source-finalization-path-missing"></a>
 ### Drift: Backup Empty Source Finalization Path Missing
 - **Category:** changed-logic  -  **Severity:** low
