@@ -2732,26 +2732,6 @@ than SQLite's. The consequence is that some pages SQLite would rebalance after a
 left under-occupied by the Go port, a benign space-utilization divergence rather than a
 correctness defect.
 
-<a id="drift-38-backup-step-page-count-from-global-dbsize-not-read-snapshot"></a>
-### Drift: Backup Step Page Count From Global dbSize Not Read Snapshot
-- **Category:** changed-logic  -  **Severity:** high
-- **Affected functions:** `backup.go:*Backup.Step` (`internal/btree/backup.go:234`),
-  `backup.go:*Backup.onePage` (`internal/btree/backup.go:152-154`, `db.go:616-617`,
-  `backup.go:204+234`).
-
-SQLite captures the source page count under the read transaction it opened for the copy:
-`nSrcPage = sqlite3BtreeLastPage(pSrc)` (`backup.c:394`) returns `pWal->hdr.nPage` as held
-consistent at read-lock time, i.e. the *snapshot's* page count, and `backupOnePage` patches
-destination page-1 offset 28 with the same read-lock-stable `sqlite3BtreeLastPage`
-(`backup.c:272`). The Go port opens a fresh read tx via `b.src.BeginRead()`
-(`backup.go:204`) but then derives both the copy-loop bound and the page-1 `DatabaseSize`
-patch from `b.src.DatabaseSize()` (`backup.go:234`, `backup.go:152-154`), which resolves to
-`db.pager.dbSize.Load()` (`db.go:616-617`) -- the single shared, global pager allocation
-counter, not the read snapshot. The consequence is that a concurrent writer advancing the
-global `dbSize` between snapshot acquisition and these reads can skew the copied page count
-and the size field written into the backup, producing a destination whose recorded size does
-not match the snapshot actually copied.
-
 <a id="drift-39-backup-treats-done-as-non-fatal-allowing-post-completion-re-"></a>
 ### Drift: Backup Treats Done As Non Fatal Allowing Post Completion Re Copy Corruption
 - **Category:** changed-logic  -  **Severity:** high

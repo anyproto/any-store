@@ -120,8 +120,7 @@ func (dst *DB) BackupInit(src *DB) (*Backup, error) {
 // for-loop at backup.c:251–276 collapses to one iteration with no
 // offset arithmetic. DRIFT #1 removes the PENDING_BYTE_PAGE guard at
 // backup.c:243/254.
-// DRIFT: backup uses global pager dbSize for page count, not the read-tx snapshot See docs/btree/NOTES.md#drift-38-backup-step-page-count-from-global-dbsize-not-read-snapshot
-func (b *Backup) onePage(iSrcPg uint32, srcData []byte, bUpdate bool) error {
+func (b *Backup) onePage(iSrcPg uint32, srcData []byte, bUpdate bool, snapPageCount uint32) error {
 	if b.dst.pager.pageSize != b.src.pager.pageSize {
 		// Defensive: caught at Init, but reopen-race could in theory
 		// change sizes. Return the same error.
@@ -151,7 +150,7 @@ func (b *Backup) onePage(iSrcPg uint32, srcData []byte, bUpdate bool) error {
 	// For page 1 on the initial (non-update) copy, patch the database-size
 	// field so dst's header reflects the source's page count.
 	if iSrcPg == 1 && !bUpdate {
-		putUint32BE(dstPg.data[28:32], b.src.DatabaseSize())
+		putUint32BE(dstPg.data[28:32], snapPageCount)
 	}
 
 	// ~ backup.c:270: invalidate the btree parse-cache on the dst page.
@@ -187,7 +186,6 @@ func putUint32BE(buf []byte, v uint32) {
 // and re-returned by future calls (~ backup.c:329 + backup.c:558).
 //
 // ~ sqlite3_backup_step (backup.c:314–566).
-// DRIFT: backup uses global pager dbSize for page count, not the read-tx snapshot See docs/btree/NOTES.md#drift-38-backup-step-page-count-from-global-dbsize-not-read-snapshot
 // DRIFT: backup empty-source (nSrcPage==0 -> NewDb) path missing; truncateTo(0) errors See docs/btree/NOTES.md#drift-41-backup-empty-source-finalization-path-missing
 func (b *Backup) Step(nPage int) error {
 	b.mu.Lock()
@@ -234,7 +232,12 @@ func (b *Backup) Step(nPage int) error {
 		b.dstLocked = true
 	}
 
-	nSrcPage := b.src.DatabaseSize() // ~ backup.c:388
+	// ~ backup.c:394: nSrcPage = sqlite3BtreeLastPage(pSrc), read once under
+	// the source read-lock. Derive from the read-tx snapshot opened above so
+	// the loop bound, nPagecount/nRemaining, finalize, and the page-1 size
+	// patch are all consistent with the same snapshot (and with the bound
+	// getPageReader validates copied pages against, pager.go:952).
+	nSrcPage := b.src.pager.readerDbSizeBound(rtx.cache)
 	srcPgsz := b.src.PageSize()
 
 	// Main copy loop. ~ backup.c:390–401.
@@ -249,7 +252,7 @@ func (b *Backup) Step(nPage int) error {
 		}
 		// No explicit releasePage on reader cache — tx.Rollback handles it.
 
-		if err := b.onePage(iSrcPg, srcPg.data[:srcPgsz], false); err != nil {
+		if err := b.onePage(iSrcPg, srcPg.data[:srcPgsz], false, nSrcPage); err != nil {
 			b.rc = err
 			return err
 		}
@@ -367,7 +370,7 @@ func (b *Backup) update(iPage uint32, data []byte) {
 
 	// bUpdate=true suppresses the page-1 DatabaseSize patch, which would
 	// be wrong to redo mid-backup.
-	if err := b.onePage(iPage, data, true); err != nil {
+	if err := b.onePage(iPage, data, true, 0); err != nil {
 		b.rc = err
 	}
 }

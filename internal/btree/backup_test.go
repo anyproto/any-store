@@ -82,7 +82,7 @@ func TestBackup_OnePage_CopiesPageDataAndClearsMemPageFlag(t *testing.T) {
 	require.NoError(t, err)
 
 	// ~ backup.c:226–279 — copy one page.
-	require.NoError(t, b.onePage(1, srcPg1.data, false))
+	require.NoError(t, b.onePage(1, srcPg1.data, false, src.pager.readerDbSizeBound(rtx.cache)))
 
 	// Verify dst page 1 equals src page 1 byte-for-byte (modulo the
 	// DatabaseSize patch at offset 28–31 that onePage applies).
