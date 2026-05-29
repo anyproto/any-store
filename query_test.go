@@ -157,6 +157,43 @@ func TestQueryCount_UniqueIndex_MultiKeyData_DedupsCorrectly(t *testing.T) {
 	assert.Equal(t, 1, n, "Iter must agree with Count")
 }
 
+// TestQueryCount_Compound_ArrayNotFirst_NoDoubleCount is the forward-looking
+// guard for the Branch-2 gate (BLOCKER-1): a compound index whose array field
+// is NOT the first field encodes the array's 0x06 tag mid-key, so the
+// canonical-key probe (Seek 0x06) would miss it and a probe-trusting batch
+// count would double-count. CountEntries routes ALL compound shapes to
+// sort-dedup without probing, so the doc whose tags straddle both bounds is
+// counted once. (Honest note: this passes because Branch 2 never probes
+// compound — it is a regression guard, not a fail-before-fix reproducer.)
+func TestQueryCount_Compound_ArrayNotFirst_NoDoubleCount(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "compound_blocker1")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "pt", Fields: []string{"priority", "tags"}}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"priority":5,"tags":["a","b"]}`),
+	))
+
+	const filter = `{"priority":5,"tags":{"$in":["a","b"]}}`
+	hint := IndexHint{IndexName: "pt", Boost: 1_000_000}
+
+	explain, err := coll.Find(filter).IndexHint(hint).Explain(ctx)
+	require.NoError(t, err)
+	require.Contains(t, explain.Sql, "IndexScan", "must use the compound index; got: %s", explain.Sql)
+
+	assertQueryCount(t, coll.Find(filter).IndexHint(hint), 1)
+
+	it, err := coll.Find(filter).IndexHint(hint).Iter(ctx)
+	require.NoError(t, err)
+	n := 0
+	for it.Next() {
+		n++
+	}
+	require.NoError(t, it.Err())
+	require.NoError(t, it.Close())
+	assert.Equal(t, 1, n, "Iter must agree with Count")
+}
+
 func TestCollQuery_Explain(t *testing.T) {
 	fx := newFixture(t)
 

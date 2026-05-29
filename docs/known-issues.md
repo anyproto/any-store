@@ -88,6 +88,15 @@ If a future feature is tempted to use the sketch to determine an answer, fix I-0
 
 ## I-04: `And.IndexBounds` silently discards conjuncts; CountOnly fast path returns wrong answer
 
+**Status: FIXED** on `feat/array-index-in-sortdedup` (2026-05-29). `And.IndexBounds`
+(`query/filter.go`) now intersects the bounds of every contributing same-field
+conjunct via a new `Bounds.Intersect` helper (`query/bound.go`); an empty
+intersection short-circuits, so `indexCoversFilter`'s `len(idx.Bounds)==0`
+early-return rejects the CountOnly fast path and FilterIter is applied.
+Reproducer: `TestQueryCount_AndConjunctionLostInCount` in `query_test.go`
+(verified Count=2 before the fix); unit gate
+`query/filter_test.go:TestAndIndexBounds_DisjointConjuncts`.
+
 **Discovered:** 2026-05-28, during the array-index multi-bound `$in` merge code review (4-agent review of `feat/array-index-multi-bound-in-merge`).
 
 **Affected code:**
@@ -137,6 +146,23 @@ This issue is OUT OF SCOPE for `docs/plans/2026-05-28-array-index-multi-bound-in
 ---
 
 ## I-05: `countEntriesWithDedup` peek-then-batch double-counts cross-bound docs when bound-firsts are scalar
+
+**Status: FIXED** on `feat/array-index-in-sortdedup` (2026-05-29). `countEntriesWithDedup`
+(the peek-then-batch + `stickyMulti` shortcut) is **deleted**. `IndexIter.CountEntries`
+is now a 4-branch dispatch: single-bound and probe-says-pure-scalar use the
+page-batch fast path; compound/non-PointLookup and probe-says-multi-key use a
+pooled sort-dedup that counts distinct docIds with no peek-then-batch shortcut to
+misclassify. Reproducer: `TestQueryCount_ScalarFirstCrossBoundDedup` in
+`query_test.go` (verified Count=4 before the fix).
+
+**Trade-off (accepted 2026-05-29):** the canonical-key probe cannot detect a
+compound index's multi-key entries (the array type tag is mid-key, not at byte 0),
+so compound / non-PointLookup multi-bound counts always route to sort-dedup. For a
+high-selectivity *scalar* compound index this is materially slower than the old
+value-byte peek-batch (e.g. `simple_index/In`, which the planner routes to a
+compound `(a,b)` index, regresses from ~22 µs to ~1.8 ms at 200k docs). This is a
+performance-only regression — the answer is correct. See the bench notes in
+`docs/plans/2026-05-29-array-index-in-sortdedup-plan.md`.
 
 **Discovered:** 2026-05-28, during the 4-agent review of `feat/array-index-multi-bound-in-merge`. Pre-existing on the `btree` baseline — not introduced by the merge feature.
 
@@ -196,6 +222,15 @@ This issue is OUT OF SCOPE for `docs/plans/2026-05-28-array-index-multi-bound-in
 ---
 
 ## I-06: `CoverIter` hardcodes multiKey=false; unique-index multi-key `$in` Count over-counts
+
+**Status: FIXED** on `feat/array-index-in-sortdedup` (2026-05-29). `CoverIter.Next`
+(`internal/qplanner/cover_iter.go`) runs the canonical-key probe once, gated on
+`len(Bounds) > 1`, and yields the index-level multi-key flag instead of a hardcoded
+`false`. `DocDedup` then collapses the cross-bound repeats of an array doc; single-
+bound point lookups skip the probe and keep the zero-cost `false`. Reproducer:
+`TestQueryCount_UniqueIndex_MultiKeyData_DedupsCorrectly` in `query_test.go`
+(verified Count=2 before the fix); unit test
+`internal/qplanner/cover_iter_test.go:TestCoverIter_MultiBound_MultiKey_SetsMultiKeyFlag`.
 
 **Discovered:** 2026-05-28, during round-3 review of the I-04/I-05 fix design (`docs/specs/2026-05-28-i04-i05-fix-option-d-canonical-key-probe.md`).
 
