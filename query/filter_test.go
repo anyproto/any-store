@@ -216,6 +216,54 @@ func TestAnd(t *testing.T) {
 	})
 }
 
+// TestAndIndexBounds_TwoConjunctsSameField_Range pins that two range
+// conjuncts on the same field intersect into a single bounded range
+// (I-04: pre-fix And.IndexBounds returned only the first conjunct's bounds).
+func TestAndIndexBounds_TwoConjunctsSameField_Range(t *testing.T) {
+	f, err := ParseCondition(`{"$and":[{"a":{"$gte":5}},{"a":{"$lte":10}}]}`)
+	require.NoError(t, err)
+	bs := f.IndexBounds("a", nil)
+	require.Len(t, bs, 1)
+	assert.Equal(t, []byte(newBoundKey(5)), []byte(bs[0].Start))
+	assert.Equal(t, []byte(newBoundKey(10)), []byte(bs[0].End))
+	assert.True(t, bs[0].StartInclude)
+	assert.True(t, bs[0].EndInclude)
+}
+
+// TestAndIndexBounds_InAndRange pins that an $in set intersected with a
+// range conjunct keeps only the in-values inside the range (I-04).
+func TestAndIndexBounds_InAndRange(t *testing.T) {
+	f, err := ParseCondition(`{"a":{"$in":[1,2,5,10]},"$and":[{"a":{"$gte":5}}]}`)
+	require.NoError(t, err)
+	bs := f.IndexBounds("a", nil)
+	require.Len(t, bs, 2)
+	// SortAndMerge orders by Start: {5} then {10}.
+	assert.Equal(t, []byte(newBoundKey(5)), []byte(bs[0].Start))
+	assert.Equal(t, []byte(newBoundKey(5)), []byte(bs[0].End))
+	assert.Equal(t, []byte(newBoundKey(10)), []byte(bs[1].Start))
+	assert.Equal(t, []byte(newBoundKey(10)), []byte(bs[1].End))
+}
+
+// TestAndIndexBounds_DisjointConjuncts pins that conjuncts with no common
+// value intersect to an empty bound set (I-04: the wrong-answer trigger —
+// pre-fix this returned the $in bounds and CountOnly over-counted).
+func TestAndIndexBounds_DisjointConjuncts(t *testing.T) {
+	f, err := ParseCondition(`{"a":{"$in":[1,2]},"$and":[{"a":{"$gte":5}}]}`)
+	require.NoError(t, err)
+	bs := f.IndexBounds("a", nil)
+	assert.Len(t, bs, 0)
+}
+
+// TestAndIndexBounds_ThreeConjuncts_EmptyStaysEmpty pins that once the
+// running intersection is empty, a later contributing conjunct cannot
+// resurrect it (a ∧ ∅ = ∅).
+func TestAndIndexBounds_ThreeConjuncts_EmptyStaysEmpty(t *testing.T) {
+	f, err := ParseCondition(`{"$and":[{"a":{"$in":[1,2]}},{"a":{"$gte":5}},{"a":{"$lte":8}}]}`)
+	require.NoError(t, err)
+	bs := f.IndexBounds("a", nil)
+	assert.Len(t, bs, 0)
+}
+
 func TestOr(t *testing.T) {
 	f, err := ParseCondition(`{"$or":[{"a":1},{"b":"2"}]}`)
 	require.NoError(t, err)

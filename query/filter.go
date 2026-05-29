@@ -217,13 +217,36 @@ func (e And) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 	return true
 }
 
+// IndexBounds intersects the bounds each conjunct contributes for fieldName.
+// A conjunct that does not constrain fieldName leaves the bound count
+// unchanged and is skipped; contributing conjuncts are intersected into the
+// running result. An empty intersection short-circuits — a ∧ ∅ = ∅, and no
+// later conjunct can widen it. When no conjunct constrains the field, the
+// input bs is returned unchanged.
+//
+// Intersecting (rather than returning the first contributor, as the code did
+// before) is required for correctness on the CountOnly fast path: a query
+// like {a:{$in:[1,2]},$and:[{a:{$gte:5}}]} must yield empty bounds, not the
+// $in set. See I-04 in docs/known-issues.md.
 func (e And) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
+	bounds = bs
+	contributed := false
 	for _, f := range e {
-		if bounds = f.IndexBounds(fieldName, bs); len(bounds) != len(bs) {
-			return
+		childBounds := f.IndexBounds(fieldName, bs)
+		if len(childBounds) == len(bs) {
+			continue // this conjunct does not constrain fieldName
+		}
+		if !contributed {
+			bounds = childBounds
+			contributed = true
+			continue
+		}
+		bounds = bounds.Intersect(childBounds)
+		if len(bounds) == 0 {
+			return bounds
 		}
 	}
-	return bs
+	return bounds
 }
 
 func (e And) String() string {
