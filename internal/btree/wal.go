@@ -2931,10 +2931,31 @@ func (w *wal) authoritativeMxFrame() uint32 {
 	return w.index.mxCommitFrame.LoadLocal()
 }
 
+// authoritativeNPage returns the committed database size in pages (the page
+// count carried by the last commit frame) from the most authoritative source.
+// It is the checkpoint-backfill counterpart of authoritativeMxFrame: where that
+// bounds which WAL frames are safe to copy, this bounds which target page
+// numbers are still logically in the committed image.
+//
+// In multi-process mode it reads hdr.nPage from the SHM header (written under
+// lockWrite by whichever process committed last), so we honor a peer's shrink
+// or grow rather than a stale process-local view. In single-process or
+// in-memory mode the in-process atomic w.index.maxPage is authoritative, and a
+// torn/invalid SHM read also falls back to it. Mirrors SQLite's
+// mxPage = pWal->hdr.nPage in walCheckpoint (wal.c:2228), which gates the
+// iDbpage>mxPage backfill skip (wal.c:2306).
+func (w *wal) authoritativeNPage() uint32 {
+	if !w.inProcess && !w.inMemory {
+		if hdr, valid := w.index.readHeader(); valid {
+			return hdr.nPage
+		}
+	}
+	return w.index.maxPage.Load()
+}
+
 // checkpoint writes WAL frames back to the database file.
 // For InMemory databases, master is used to store checkpointed pages instead of dbFile.
 // DRIFT: checkpoint never truncates DB file to committed nPage after full backfill See docs/btree/NOTES.md#drift-50-checkpoint-never-physically-truncates-db-file-after-full-bac
-// DRIFT: checkpoint backfill lacks iDbpage>mxPage (committed nPage) skip filter See docs/btree/NOTES.md#drift-51-checkpoint-backfill-missing-idbpage-greater-than-mxpage-filt
 // DRIFT: checkpoint omits page-size-mismatch and over-grow corruption guards See docs/btree/NOTES.md#drift-52-checkpoint-missing-page-size-mismatch-and-over-grow-corrupti
 func (w *wal) checkpoint(dbFile fileHandle, master *masterStore) error {
 	return w.checkpointWithMode(dbFile, master, CheckpointFull, nil)
@@ -3121,7 +3142,6 @@ func (w *wal) rewriteChecksums(iLast uint32) error {
 // frames before truncate — losing the peer's data (commit 9023f5b).
 // DRIFT: FULL/RESTART/TRUNCATE checkpoint returns nil vs SQLITE_BUSY on incomplete backfill See docs/btree/NOTES.md#drift-49-non-passive-checkpoint-returns-success-instead-of-busy-on-in
 // DRIFT: checkpoint never truncates DB file to committed nPage after full backfill See docs/btree/NOTES.md#drift-50-checkpoint-never-physically-truncates-db-file-after-full-bac
-// DRIFT: checkpoint backfill lacks iDbpage>mxPage (committed nPage) skip filter See docs/btree/NOTES.md#drift-51-checkpoint-backfill-missing-idbpage-greater-than-mxpage-filt
 func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode CheckpointMode, xBusy BusyHandler) error {
 	// Acquire checkpoint lock -- serialize concurrent checkpoints.
 	// The busy handler is NOT used for the checkpoint lock itself, matching
@@ -3175,6 +3195,20 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	if nf == 0 {
 		return nil
 	}
+
+	// Committed page-count bound for the backfill. SQLite's walCheckpoint skips
+	// any frame whose target pgno exceeds the last commit's page count
+	// (mxPage = pWal->hdr.nPage at wal.c:2228; iDbpage>mxPage skip at wal.c:2306).
+	// This discards orphan frames for pages that a later shrinking commit
+	// logically dropped but that still physically reside in the append-only WAL;
+	// without it the write loops below would copy them past the committed DB
+	// size and materialize stale pages SQLite never exposes.
+	//
+	// We only reach here with nf!=0, i.e. a commit frame exists, so nPage is
+	// always >=1. Defensively, if a torn-header fallback ever yields 0 we leave
+	// the backfill unbounded (mxPage==0 disables the filter) — strictly
+	// conservative: that can only fail to prune, never skip a legitimate page.
+	mxPage := w.authoritativeNPage()
 
 	// Compute mxSafeFrame: the highest frame we can safely copy to DB.
 	// Start with all committed frames, then lower based on active readers.
@@ -3309,6 +3343,12 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 		sort.Slice(pgnos, func(a, b int) bool { return pgnos[a] < pgnos[b] })
 
 		for _, pgno := range pgnos {
+			// Skip orphan frames past the committed DB size (iDbpage>mxPage,
+			// wal.c:2306). mxPage==0 means "unbounded" — see the
+			// authoritativeNPage call above.
+			if mxPage != 0 && pgno > mxPage {
+				continue
+			}
 			mf := &w.memFrames[latest[pgno]]
 			if dbFile != nil {
 				pageOffset := int64(mf.pgno-1) * pageSz
@@ -3376,6 +3416,12 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 			// codec hook between them).
 			// END ENCRYPTION
 			for _, pgno := range pgnos {
+				// Skip orphan frames past the committed DB size (iDbpage>mxPage,
+				// wal.c:2306). mxPage==0 means "unbounded" — see the
+				// authoritativeNPage call above.
+				if mxPage != 0 && pgno > mxPage {
+					continue
+				}
 				frameIdx := latest[pgno]
 				off := int64(walHeaderSize) + int64(frameIdx)*frameSize
 				n, err := w.file.ReadAt(pageData, off+walFrameSize)

@@ -534,3 +534,121 @@ func TestCheckpoint_RewriteHeavyEndToEnd(t *testing.T) {
 		}
 	}
 }
+
+// TestCheckpoint_SkipsOrphanFramesPastCommittedNPage is the drift-51 regression:
+// frames written by an earlier larger commit (dbSize=grown) that a later
+// shrinking commit (dbSize=shrunk) logically dropped still physically reside in
+// the append-only WAL. SQLite's walCheckpoint skips them via iDbpage>mxPage
+// (mxPage = pWal->hdr.nPage; wal.c:2228, wal.c:2306) so they are never copied to
+// the DB file past the committed end. Without the filter, buildBackfillMap keeps
+// the orphan frames' latest version and the write loop copies them to
+// (pgno-1)*pageSize, materializing stale pages SQLite would never expose.
+//
+// We pre-stamp the orphan-page region of the DB file with a sentinel, run a full
+// checkpoint, and assert the checkpoint did NOT overwrite those pages with the
+// orphan WAL data — i.e. the committed pages are written but pgno>nPage are left
+// untouched.
+func TestCheckpoint_SkipsOrphanFramesPastCommittedNPage(t *testing.T) {
+	w, dbFile := openWalForDedupTest(t)
+	t.Cleanup(func() { _ = w.close(false) })
+
+	const grown = 5      // earlier larger commit's dbSize
+	const shrunk = 2     // later shrinking commit's dbSize
+	const walMark = 0x11 // byte stamped into WAL frame data
+	const dbSentinel = 0x22
+
+	// Pre-stamp the DB file's orphan-page region (pgno shrunk+1..grown) with a
+	// sentinel so we can detect any checkpoint overwrite. Pages 1..shrunk are
+	// left zero; the checkpoint is expected to fill those from the WAL.
+	sentinel := make([]byte, int(w.pageSize))
+	for i := range sentinel {
+		sentinel[i] = dbSentinel
+	}
+	for p := uint32(shrunk + 1); p <= grown; p++ {
+		off := int64(p-1) * int64(w.pageSize)
+		if _, err := dbFile.WriteAt(sentinel, off); err != nil {
+			t.Fatalf("pre-stamp db page %d: %v", p, err)
+		}
+	}
+
+	// Earlier larger commit: write all `grown` pages, committing with dbSize=grown.
+	// This appends frames for pages 1..grown to the WAL. We stamp each frame's
+	// data with walMark + pgno so an erroneous backfill would be detectable.
+	if _, err := w.beginWrite(); err != nil {
+		t.Fatalf("beginWrite (grow): %v", err)
+	}
+	growPages := make([]*page, 0, grown)
+	for p := uint32(1); p <= grown; p++ {
+		data := make([]byte, w.pageSize)
+		data[0] = walMark
+		data[1] = byte(p)
+		growPages = append(growPages, &page{pgno: p, data: data})
+	}
+	if err := w.writeFrames(growPages, true, grown); err != nil {
+		t.Fatalf("writeFrames (grow): %v", err)
+	}
+	w.endWrite()
+
+	// Later shrinking commit: touch page 1 and commit with dbSize=shrunk. The
+	// orphan frames for pages shrunk+1..grown remain physically in the WAL but
+	// are logically dropped (committed nPage is now shrunk).
+	commitData := make([]byte, w.pageSize)
+	commitData[0] = walMark
+	commitData[1] = 1
+	commitData[2] = 0xFF // distinguish the latest page-1 content
+	if _, err := w.beginWrite(); err != nil {
+		t.Fatalf("beginWrite (shrink): %v", err)
+	}
+	if err := w.writeFrames([]*page{{pgno: 1, data: commitData}}, true, shrunk); err != nil {
+		t.Fatalf("writeFrames (shrink): %v", err)
+	}
+	w.endWrite()
+
+	// Sanity: buildBackfillMap (no nPage bound) still tracks the orphan pgnos,
+	// proving the skip filter — not the dedup map — is what protects the DB file.
+	latest, err := w.buildBackfillMap(0, w.nFrame.Load())
+	if err != nil {
+		t.Fatalf("buildBackfillMap: %v", err)
+	}
+	for p := uint32(shrunk + 1); p <= grown; p++ {
+		if _, ok := latest[p]; !ok {
+			t.Fatalf("precondition: expected orphan pgno %d present in backfill map; "+
+				"test no longer exercises the iDbpage>mxPage skip", p)
+		}
+	}
+
+	if err := w.checkpointWithMode(dbFile, nil, CheckpointFull, nil); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+
+	buf := make([]byte, int(w.pageSize))
+
+	// Committed page 1 must reflect the latest (shrinking) commit's content.
+	if _, err := dbFile.ReadAt(buf, 0); err != nil {
+		t.Fatalf("read db page 1: %v", err)
+	}
+	if buf[0] != walMark || buf[1] != 1 || buf[2] != 0xFF {
+		t.Fatalf("db page 1: checkpoint did not backfill the committed page; got (%#x,%#x,%#x)",
+			buf[0], buf[1], buf[2])
+	}
+
+	// Orphan pages shrunk+1..grown must be UNTOUCHED — still the sentinel, never
+	// the walMark orphan data. This is the drift-51 assertion: with the skip
+	// filter absent, these pages would be overwritten with walMark+pgno and the
+	// DB file would grow past its committed size.
+	for p := uint32(shrunk + 1); p <= grown; p++ {
+		off := int64(p-1) * int64(w.pageSize)
+		if _, err := dbFile.ReadAt(buf, off); err != nil {
+			t.Fatalf("read db page %d: %v", p, err)
+		}
+		if buf[0] == walMark {
+			t.Fatalf("db page %d (pgno>nPage=%d) was backfilled from an orphan WAL frame "+
+				"(got walMark %#x) — checkpoint must skip iDbpage>mxPage (wal.c:2306)",
+				p, shrunk, buf[0])
+		}
+		if buf[0] != dbSentinel {
+			t.Fatalf("db page %d: expected untouched sentinel %#x, got %#x",
+				p, byte(dbSentinel), buf[0])
+		}
+	}
+}

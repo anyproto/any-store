@@ -2648,24 +2648,6 @@ the committed page count. The consequence is that trailing pages dropped by a sh
 remain physically allocated on disk indefinitely; the database file only grows, and the
 `pager.go:2639-2640` comment promising "truncation at next checkpoint" is incorrect.
 
-<a id="drift-51-checkpoint-backfill-missing-idbpage-greater-than-mxpage-filt"></a>
-### Drift: Checkpoint Backfill Missing iDbpage Greater Than mxPage Filter
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `wal.go:*wal.checkpoint` (`internal/btree/wal.go:3244-3266`),
-  `wal.go:*wal.checkpointWithMode` (`wal.go:2861-2888` (buildBackfillMap, no nPage bound) and
-  `wal.go:3244-3266` (write loop, no iDbpage>mxPage skip)).
-
-SQLite's `walCheckpoint` backfill loop skips any frame whose target page number exceeds the
-committed DB size: `if( iFrame<=nBackfill || iFrame>mxSafeFrame || iDbpage>mxPage ) continue;`
-where `mxPage = pWal->hdr.nPage` is the committed page count from the last commit frame
-(`wal.c:2228`, `wal.c:2306`). This prevents copying orphaned WAL frames for pages that lie
-beyond the final committed end of the database -- for example a page that was written and then
-logically dropped by a later shrinking commit. The Go path has no such bound:
-`buildBackfillMap` (`wal.go:2861-2888`) carries no `nPage` limit and the write loop
-(`wal.go:3244-3266`) has no `iDbpage>mxPage` skip. The consequence is that over-grown / orphan
-frames could be backfilled into the DB file past its committed size, writing stale pages that
-SQLite would have discarded.
-
 <a id="drift-52-checkpoint-missing-page-size-mismatch-and-over-grow-corrupti"></a>
 ### Drift: Checkpoint Missing Page Size Mismatch And Over Grow Corruption Guards
 - **Category:** changed-logic  -  **Severity:** low
