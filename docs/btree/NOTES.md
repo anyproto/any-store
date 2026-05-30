@@ -2579,21 +2579,6 @@ which on a failed re-descent unconditionally calls `splitRoot` as a "safety net"
 interior overflow produces a different (and looser) page-fill distribution than SQLite's
 balanced redistribution.
 
-<a id="drift-30-rebuildpage-missing-content-area-cell-pointer-collision-fit-"></a>
-### Drift: rebuildPage Missing Content Area Cell Pointer Collision Fit Check
-- **Category:** changed-logic  -  **Severity:** high
-- **Affected functions:** `btree.go:*btree.rebuildInteriorPage` (`btree.go:1737-1762`), `btree.go:*btree.rebuildLeafPage` (`internal/btree/btree.go:1669-1708`).
-
-C's `rebuildPage` defends against the descending content cursor colliding with the ascending
-cell-pointer array on every single cell: after `pData -= sz` and writing the pointer it does
-`if( pData < pCellptr ) return SQLITE_CORRUPT_BKPT;` (`btree.c:7691-7693`). This in-function
-guard catches the case where the accumulated cell content no longer fits on the page. Go's
-`rebuildLeafPage` (`btree.go:1669-1708`) and `rebuildInteriorPage` (`btree.go:1737-1762`)
-decrement `contentOff` and write each cell and pointer with no such lower-bound fit check.
-The consequence is that on a page-overflow condition Go panics (out-of-bounds slice) or
-silently overwrites the cell-pointer array, corrupting the page, instead of cleanly
-returning `ErrCorrupt` the way SQLite does.
-
 <a id="drift-31-rebuildinteriorpage-accepts-zero-cell-pages"></a>
 ### Drift: rebuildInteriorPage Accepts Zero Cell Pages
 - **Category:** changed-logic  -  **Severity:** low

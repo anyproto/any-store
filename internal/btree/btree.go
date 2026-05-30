@@ -1680,7 +1680,6 @@ func (bt *btree) collectInteriorCells(pg *page) ([]cellData, error) {
 
 // rebuildLeafPage rewrites a leaf page from a list of cells.
 // Cells with large values will have overflow chains written automatically.
-// DRIFT: rebuild*Page omit rebuildPage's content/cell-ptr collision check; panic/corrupt See docs/btree/NOTES.md#drift-30-rebuildpage-missing-content-area-cell-pointer-collision-fit-
 func (bt *btree) rebuildLeafPage(pg *page, cells []cellData) error {
 	pageUsable := bt.usablePageSize()
 	hdrOff := 0
@@ -1703,9 +1702,17 @@ func (bt *btree) rebuildLeafPage(pg *page, cells []cellData) error {
 	maxLocal := maxLocalPayload(pageUsable)
 	contentOff := pageUsable
 	for i, c := range cells {
+		// pCellptr after writing this cell's pointer (C: pCellptr += 2).
+		ptrOff := hdrOff + pg.header.headerSize() + i*2
 		if c.rawCell != nil {
 			// Raw passthrough: copy cell bytes directly, preserving overflow pointer.
 			size := len(c.rawCell)
+			// Mirror C btree.c:7693: reject if content area would collide
+			// with the cell-pointer array (pData < pCellptr). Check before
+			// writing so we never emit content we cannot fit.
+			if contentOff-size < ptrOff+2 {
+				return ErrCorrupt
+			}
 			contentOff -= size
 			copy(pg.data[contentOff:], c.rawCell)
 		} else {
@@ -1724,16 +1731,21 @@ func (bt *btree) rebuildLeafPage(pg *page, cells []cellData) error {
 				}
 				hdr := varintSize(uint64(len(c.key))) + varintSize(uint64(len(c.value)))
 				size := hdr + nLocal + overflowPtrSize
+				if contentOff-size < ptrOff+2 {
+					return ErrCorrupt
+				}
 				contentOff -= size
 				writeLeafCellOverflow(pg.data[contentOff:], c.key, c.value, nLocal, overflowPgno)
 			} else {
 				size := leafCellSize(c.key, c.value)
+				if contentOff-size < ptrOff+2 {
+					return ErrCorrupt
+				}
 				contentOff -= size
 				writeLeafCell(pg.data[contentOff:], c.key, c.value)
 			}
 		}
 		// Write cell pointer
-		ptrOff := hdrOff + pg.header.headerSize() + i*2
 		binary.BigEndian.PutUint16(pg.data[ptrOff:], uint16(contentOff))
 	}
 
@@ -1749,7 +1761,6 @@ func (bt *btree) rebuildLeafPage(pg *page, cells []cellData) error {
 
 // rebuildInteriorPage rewrites an interior page from cells and a right child.
 // Keys that exceed maxLocal are written with overflow chains.
-// DRIFT: rebuild*Page omit rebuildPage's content/cell-ptr collision check; panic/corrupt See docs/btree/NOTES.md#drift-30-rebuildpage-missing-content-area-cell-pointer-collision-fit-
 // DRIFT: rebuildInteriorPage writes 0-cell pages; C rebuildPage asserts nCell>0 See docs/btree/NOTES.md#drift-31-rebuildinteriorpage-accepts-zero-cell-pages
 func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint32) error {
 	pageUsable := bt.usablePageSize()
@@ -1773,6 +1784,8 @@ func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint
 	maxLocal := maxLocalPayload(pageUsable)
 	contentOff := pageUsable
 	for i, c := range cells {
+		// pCellptr after writing this cell's pointer (C: pCellptr += 2).
+		ptrOff := hdrOff + pg.header.headerSize() + i*2
 		keyLen := len(c.key)
 		if keyLen > maxLocal {
 			localSize := localPayloadSize(keyLen, pageUsable)
@@ -1782,14 +1795,22 @@ func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint
 				return err
 			}
 			size := 4 + varintSize(uint64(keyLen)) + localSize + overflowPtrSize
+			// Mirror C btree.c:7693: reject if content area would collide
+			// with the cell-pointer array (pData < pCellptr). Check before
+			// writing so we never emit content we cannot fit.
+			if contentOff-size < ptrOff+2 {
+				return ErrCorrupt
+			}
 			contentOff -= size
 			writeInteriorCellOverflow(pg.data[contentOff:], c.leftChild, keyLen, c.key[:localSize], overflowPgno)
 		} else {
 			size := interiorCellSize(c.key)
+			if contentOff-size < ptrOff+2 {
+				return ErrCorrupt
+			}
 			contentOff -= size
 			writeInteriorCell(pg.data[contentOff:], c.leftChild, c.key)
 		}
-		ptrOff := hdrOff + pg.header.headerSize() + i*2
 		binary.BigEndian.PutUint16(pg.data[ptrOff:], uint16(contentOff))
 	}
 
