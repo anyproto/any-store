@@ -2634,23 +2634,6 @@ beyond SQLite: an automatic checkpoint can reset/restart the WAL rather than lea
 later explicit checkpoint, changing when the WAL is recycled relative to stock SQLite -- a new
 feature that callers tuning checkpoint behavior should be aware of.
 
-<a id="drift-54-close-time-checkpoint-runs-unconditionally-without-guards"></a>
-### Drift: Close Time Checkpoint Runs Unconditionally Without Guards
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `db.go:*DB.Close` (`internal/btree/pager.go:2758-2789`).
-
-SQLite's `sqlite3PagerClose` enables the close-time checkpoint (passing the non-NULL buffer
-`a=pTmp` to `sqlite3WalClose`) only when `db && 0==(db->flags & SQLITE_NoCkptOnClose) &&
-SQLITE_OK==databaseIsUnmoved(pPager)` (`pager.c:4189-4191`). `databaseIsUnmoved`
-(`pager.c:4142-4161`) issues `SQLITE_FCNTL_HAS_MOVED` and, if the DB file has been
-renamed/relinked out from under the open fd, returns `SQLITE_READONLY_DBMOVED` so the
-checkpoint is skipped -- avoiding checkpointing into a file that is no longer the real
-database, and honoring the `NoCkptOnClose` opt-out. The Go close-time checkpoint
-(`pager.c:2758-2789` in the port) runs unconditionally with no `databaseIsUnmoved` /
-`NoCkptOnClose` guard. The consequence is that closing a connection whose DB file was moved or
-unlinked underneath it will still attempt to checkpoint, and callers have no way to suppress
-the close-time checkpoint -- a behavior SQLite explicitly guards against.
-
 <a id="drift-55-wal-file-truncated-but-never-unlinked-on-last-client-close"></a>
 ### Drift: WAL File Truncated But Never Unlinked On Last Client Close
 - **Category:** changed-logic  -  **Severity:** low

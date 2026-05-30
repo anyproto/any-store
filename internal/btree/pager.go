@@ -199,6 +199,19 @@ type pager struct {
 	// inMemory keeps the entire database in memory with no files on disk
 	inMemory bool
 
+	// openDev / openIno capture the (device, inode) identity of the live DB
+	// file at open time. openIdentOK reports whether that identity could be
+	// obtained from the OS (false on non-unix / VFS-injected files where no
+	// real inode is available). databaseIsUnmoved compares the current
+	// on-disk identity against these to detect a file renamed/unlinked/
+	// relinked out from under the open fd, mirroring SQLite's
+	// SQLITE_FCNTL_HAS_MOVED check (databaseIsUnmoved pager.c:4142-4159 →
+	// fileHasMoved os_unix.c:1623-1632). Captured once in pager.open; never
+	// mutated afterwards, so no synchronization is needed (close holds p.mu).
+	openDev     uint64
+	openIno     uint64
+	openIdentOK bool
+
 	// useSlab is set once by btree.Open from Options.SlabPages.
 	// Local bool — no atomic/global reads on hot path.
 	useSlab bool
@@ -415,9 +428,22 @@ func (p *pager) open() error {
 	}
 
 	if info.Size() == 0 {
-		// New database - initialize
-		return p.initNewDB()
+		// New database - initialize. initNewDB writes page 1 to the file
+		// (and fdatasyncs), so re-stat once afterwards to capture the
+		// identity of the now-materialized inode. Cheap: one extra Stat on
+		// the create path only.
+		if err := p.initNewDB(); err != nil {
+			return err
+		}
+		if info2, err := f.Stat(); err == nil {
+			p.openDev, p.openIno, p.openIdentOK = statIdentity(info2)
+		}
+		return nil
 	}
+
+	// Existing database - reuse the already-fetched info (no extra syscall)
+	// to capture the file identity for the close-time databaseIsUnmoved guard.
+	p.openDev, p.openIno, p.openIdentOK = statIdentity(info)
 
 	// Existing database - read header
 	readSize := p.pageSize
@@ -3010,6 +3036,30 @@ func (p *pager) withWriteLock(fn func(locked bool) error) error {
 	return fn(locked)
 }
 
+// databaseIsUnmoved reports whether the live DB file on disk is still the same
+// physical file (same device+inode) that was opened, so that the close-time
+// checkpoint is safe to run into p.file. Models SQLite's databaseIsUnmoved
+// (pager.c:4142-4159) + fileHasMoved (os_unix.c:1623-1632): if the DB file was
+// renamed, unlinked, or relinked out from under the open fd, checkpointing into
+// the (now detached or unrelated) inode would silently lose the committed
+// transaction or clobber an unrelated file, so the checkpoint must be skipped.
+//
+// Returns true (unmoved) for:
+//   - in-memory DB (analog of C tempFile short-circuit, pager.c:4146);
+//   - dbSize==0 (C dbSize==0 short-circuit, pager.c:4147 — a brand-new/empty DB);
+//   - !openIdentOK (no real inode available, e.g. non-unix / VFS-injected file):
+//     analog of C SQLITE_NOTFOUND "HAS_MOVED unimplemented → assume unmoved"
+//     fallback (pager.c:4150-4154), preserving today's behavior there.
+//
+// Otherwise it stats p.path and returns false on any stat error (file moved or
+// gone) or on a (device,inode) mismatch against the identity captured at open.
+func (p *pager) databaseIsUnmoved() bool {
+	if p.inMemory || p.dbSize.Load() == 0 || !p.openIdentOK {
+		return true
+	}
+	return dbFileUnmoved(p.path, p.openDev, p.openIno)
+}
+
 // close closes the pager, WAL, and database file.
 // Matches SQLite's sqlite3PagerClose() -> sqlite3WalClose(): checkpoint the WAL,
 // then truncate the WAL file to zero bytes before closing.
@@ -3030,6 +3080,27 @@ func (p *pager) close() error {
 			// leak the lock. Matches SQLite's sqlite3WalClose which guards
 			// walLimitSize with an exclusive DB-file lock (wal.c:2509-2534).
 			_ = p.withWriteLock(func(lockedWrite bool) error {
+				// databaseIsUnmoved gate: matches SQLite's sqlite3PagerClose
+				// (pager.c:4189-4191), which passes a non-NULL buffer to
+				// sqlite3WalClose (enabling the close-time checkpoint) only when
+				// databaseIsUnmoved(pPager)==SQLITE_OK. A NULL buffer (moved DB)
+				// skips the WHOLE checkpoint+truncate arm in sqlite3WalClose
+				// (the `if(zBuf!=0 ...)` gate at wal.c:2522). Skipping is the
+				// safe behavior: if the DB file was renamed/unlinked/relinked
+				// out from under this fd, checkpointing into p.file would write
+				// committed WAL frames into a path that is no longer the real
+				// database — silently losing the transaction on the visible
+				// path or clobbering an unrelated file now living at p.path.
+				// We therefore skip both the checkpoint and the dependent
+				// truncate (truncate stays gated on cpErr==nil below, and cpErr
+				// is left non-nil for the moved case).
+				moved := !p.databaseIsUnmoved()
+				if moved {
+					if debugTrace {
+						trace("close: skipping close-time checkpoint, DB file moved/unlinked since open (path=%s)", p.path)
+					}
+					return nil
+				}
 				if debugTrace {
 					trace("close: starting passive checkpoint before WAL truncation, dbSize=%d lockedWrite=%v", p.dbSize.Load(), lockedWrite)
 				}
