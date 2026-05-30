@@ -28,10 +28,10 @@ type chachaCodec struct {
 }
 
 const (
-	chacha20NonceLen  = chacha20poly1305.NonceSize       // 12
-	xChaCha20NonceLen = chacha20poly1305.NonceSizeX      // 24
-	chachaTagLen      = chacha20poly1305.Overhead        // 16
-	chachaKeyLen      = chacha20poly1305.KeySize         // 32
+	chacha20NonceLen  = chacha20poly1305.NonceSize  // 12
+	xChaCha20NonceLen = chacha20poly1305.NonceSizeX // 24
+	chachaTagLen      = chacha20poly1305.Overhead   // 16
+	chachaKeyLen      = chacha20poly1305.KeySize    // 32
 
 	// chacha20Overhead: 12 + 16 = 28 → 32 (aligned to 16).
 	chacha20Overhead = 32

@@ -20,20 +20,20 @@ The test runs twice: once with empty WAL at start (tn=1) and once with a
 prior write in the WAL (tn=2: UPDATE t1 key=4 to randomblob(799)).
 
 Deviations from original:
-- CREATE INDEX i1y ON t1(y): Skipped -- we have no secondary indexes. This means
-  fewer pages are written to WAL per update (no index pages), so the WAL frame
-  count will be smaller than SQLite's. The core behavior (savepoint rollback +
-  recovery) is still tested.
-- PRAGMA cache_size=5: Adapted to Options{CacheSize: 5} on Open. Our cache
-  eviction behavior may differ from SQLite's.
-- WAL frame count checks (1.$tn.2 and 1.$tn.7): Relaxed range to account for
-  missing index pages. Check WAL has reasonable size rather than exact frame count.
-- File copy for recovery testing: Uses os.ReadFile/os.WriteFile to copy DB and WAL
-  files while the DB is still open (matching the SQLite test pattern where the
-  connection stays open during forcecopy).
-- SELECT sum(length(y)): Adapted to cursor scan summing value lengths.
-- DB handle is kept open across steps 2-6 and 7-10 to match SQLite's connection
-  lifecycle. rawClose is used for step 7 close to preserve WAL state.
+  - CREATE INDEX i1y ON t1(y): Skipped -- we have no secondary indexes. This means
+    fewer pages are written to WAL per update (no index pages), so the WAL frame
+    count will be smaller than SQLite's. The core behavior (savepoint rollback +
+    recovery) is still tested.
+  - PRAGMA cache_size=5: Adapted to Options{CacheSize: 5} on Open. Our cache
+    eviction behavior may differ from SQLite's.
+  - WAL frame count checks (1.$tn.2 and 1.$tn.7): Relaxed range to account for
+    missing index pages. Check WAL has reasonable size rather than exact frame count.
+  - File copy for recovery testing: Uses os.ReadFile/os.WriteFile to copy DB and WAL
+    files while the DB is still open (matching the SQLite test pattern where the
+    connection stays open during forcecopy).
+  - SELECT sum(length(y)): Adapted to cursor scan summing value lengths.
+  - DB handle is kept open across steps 2-6 and 7-10 to match SQLite's connection
+    lifecycle. rawClose is used for step 7 close to preserve WAL state.
 */
 package btree
 

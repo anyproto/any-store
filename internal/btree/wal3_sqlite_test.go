@@ -11,26 +11,26 @@ inserts 100 rows in a transaction that is rolled back, and verifies data
 integrity. Also tests crash recovery by copying DB+WAL files and reopening.
 
 Deviations from original:
-- wal3-1.0: SQLite uses doubling INSERT...SELECT FROM t1 to build 4018 rows.
-  Adapted as a simple loop inserting 4018 rows sequentially with unique
-  800-byte values. PRAGMA auto_vacuum=off, synchronous=normal,
-  wal_autocheckpoint=0 have no direct equivalents; auto_vacuum is off by
-  default, and we use DisableAutoCheckpoint to prevent checkpoint during test.
-  WAL frame count check replaced with WAL file size check (approximate).
-- wal3-1.$i.2 through wal3-1.$i.4: "Second connection" simulated by closing
-  and reopening the database (which triggers WAL recovery).
-- wal3-1.$i.5 through wal3-1.$i.7: File copy for crash recovery testing
-  preserved as-is.
-- wal3-1.$i.3 and wal3-1.$i.6: SQLite reads the updated row via SQL
-  "SELECT x FROM t1 WHERE rowid=$i". Our API uses Get with the integer key.
-- wal3-2.*: Skipped — do_multiclient_test with checkpoint coordination
-  (aReadMark[] slot management). SQLite-internal WAL locking protocol.
-- wal3-3.*: Skipped — xSync counting via testvfs VFS shim.
-- wal3-5.*: Skipped — WAL recovery locking protocol via testvfs.
-- wal3-6.*: Skipped — aReadMark[] read-lock slot management via testvfs.
-- wal3-7.*: Skipped — reader snapshot interleaving via testvfs xShmLock.
-- wal3-9.*: Skipped — aReadMark[] slot exhaustion (50+ connections).
-- wal3-10.*: Skipped — do_multiclient_test + CREATE INDEX.
+  - wal3-1.0: SQLite uses doubling INSERT...SELECT FROM t1 to build 4018 rows.
+    Adapted as a simple loop inserting 4018 rows sequentially with unique
+    800-byte values. PRAGMA auto_vacuum=off, synchronous=normal,
+    wal_autocheckpoint=0 have no direct equivalents; auto_vacuum is off by
+    default, and we use DisableAutoCheckpoint to prevent checkpoint during test.
+    WAL frame count check replaced with WAL file size check (approximate).
+  - wal3-1.$i.2 through wal3-1.$i.4: "Second connection" simulated by closing
+    and reopening the database (which triggers WAL recovery).
+  - wal3-1.$i.5 through wal3-1.$i.7: File copy for crash recovery testing
+    preserved as-is.
+  - wal3-1.$i.3 and wal3-1.$i.6: SQLite reads the updated row via SQL
+    "SELECT x FROM t1 WHERE rowid=$i". Our API uses Get with the integer key.
+  - wal3-2.*: Skipped — do_multiclient_test with checkpoint coordination
+    (aReadMark[] slot management). SQLite-internal WAL locking protocol.
+  - wal3-3.*: Skipped — xSync counting via testvfs VFS shim.
+  - wal3-5.*: Skipped — WAL recovery locking protocol via testvfs.
+  - wal3-6.*: Skipped — aReadMark[] read-lock slot management via testvfs.
+  - wal3-7.*: Skipped — reader snapshot interleaving via testvfs xShmLock.
+  - wal3-9.*: Skipped — aReadMark[] slot exhaustion (50+ connections).
+  - wal3-10.*: Skipped — do_multiclient_test + CREATE INDEX.
 */
 package btree
 

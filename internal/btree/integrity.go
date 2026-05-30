@@ -32,7 +32,7 @@ func (e *IntegrityError) Error() string {
 // integrityChecker holds state for a single integrity check run.
 type integrityChecker struct {
 	pager       *pager
-	cache       *pcache  // private reader cache (avoids racing with writerCache)
+	cache       *pcache // private reader cache (avoids racing with writerCache)
 	walMaxFrame uint32
 	pageRef     []byte   // bit-packed: 1 bit per page
 	nPages      uint32   // total database pages

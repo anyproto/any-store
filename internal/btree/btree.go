@@ -87,11 +87,30 @@ func (bt *btree) getPage(pgno uint32) (*page, error) {
 // with ErrCorrupt instead of descending into a fabricated zero page. The bound
 // is the snapshot page count: the writer's live p.dbSize (cache==nil) or the
 // reader cache's frozen snapshot bound, exactly as readerDbSizeBound resolves.
+//
+// It additionally rejects a descended INTERIOR child with cellCount<1, mirroring
+// moveToChild's `pPage->nCell<1 -> SQLITE_CORRUPT_PGNO` guard (btree.c:5477-5482,
+// inlined at btree.c:6253-6258). On a valid any-store tree this is unreachable —
+// the delete-rebalance cascade (completeMergeUpward) never persists a zero-cell
+// non-root interior, and a 0-cell interior root is the empty-tree sentinel that
+// callers handle before descending — so this is pure corruption-hardening (see
+// the drift-11 invariant test, docs/btree/NOTES.md#drift-11-movetochild-child-page-ncell-greater-than-equal-one-descent-).
+// Without it, searchInterior on a corrupt n==0 interior would dereference the
+// cleared first cell-pointer slot as a bogus child pgno instead of routing to
+// rightChild; failing fast here yields ErrCorrupt instead of a wild descent.
 func (bt *btree) descendChild(childPgno uint32) (*page, error) {
 	if childPgno == 0 || childPgno > bt.pager.readerDbSizeBound(bt.cache) {
 		return nil, ErrCorrupt
 	}
-	return bt.getPage(childPgno)
+	pg, err := bt.getPage(childPgno)
+	if err != nil {
+		return nil, err
+	}
+	if pg.header.isInterior() && pg.header.cellCount < 1 {
+		bt.pager.releasePage(pg)
+		return nil, ErrCorrupt
+	}
+	return pg, nil
 }
 
 // usablePageSize returns the usable page size, accounting for reserved space.

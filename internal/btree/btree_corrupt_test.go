@@ -138,7 +138,7 @@ func TestCorruptCov_SearchInteriorCellKeyError(t *testing.T) {
 		return // namespace lookup itself might fail
 	}
 	cur := rtx.NewCursor(ns2)
-	_ = cur.First()      // may error on corrupted page
+	_ = cur.First()                   // may error on corrupted page
 	_ = cur.Seek([]byte{0, 0, 0, 50}) // trigger search through interior
 }
 
@@ -206,7 +206,7 @@ func TestCorruptCov_SearchLeafVarintCorruption(t *testing.T) {
 					// Make keyLen varint a multi-byte value that claims huge key
 					data[cellOff] = 0x80 | 0x40   // continuation byte
 					data[cellOff+1] = 0x80 | 0x01 // continuation
-					data[cellOff+2] = 0xFF         // huge value
+					data[cellOff+2] = 0xFF        // huge value
 				}
 			}
 			break

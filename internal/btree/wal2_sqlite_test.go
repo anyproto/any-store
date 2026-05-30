@@ -9,10 +9,10 @@ file permissions, and checkpoint sync behavior. Most tests depend on testvfs (SQ
 for intercepting shared memory operations) which has no equivalent in our system.
 
 Two tests are adaptable:
-- wal2-7: WAL frame checksum corruption — corrupts one byte in the first frame's checksum area
-  of the WAL file, then verifies the frame is ignored during recovery.
-- wal2-8: Large database WAL + transaction rollback — creates a database with root page >= 8192,
-  performs a large transaction with rollback, then verifies post-rollback writes are correct.
+  - wal2-7: WAL frame checksum corruption — corrupts one byte in the first frame's checksum area
+    of the WAL file, then verifies the frame is ignored during recovery.
+  - wal2-8: Large database WAL + transaction rollback — creates a database with root page >= 8192,
+    performs a large transaction with rollback, then verifies post-rollback writes are correct.
 
 Skipped tests (all OUT_OF_SCOPE):
 - wal2-1.*, wal2-2.*, wal2-3.*: Wal-index header corruption via testvfs shared-memory manipulation
@@ -26,19 +26,19 @@ Skipped tests (all OUT_OF_SCOPE):
 - wal2-14.*, wal2-15.*: PRAGMA checkpoint_fullfsync and sync counting
 
 Deviations from original:
-- wal2-7: Original corrupts offset 48 in the WAL file (first byte of first frame checksum) and
-  verifies sqlite_master is empty (the CREATE TABLE frame is skipped). We corrupt the same
-  offset (which is the first frame's checksum-1 in our WAL format as well, since our WAL header
-  is 32 bytes and frame checksum-1 is at frame offset 16, giving absolute offset 48). We verify
-  that either the namespace has no data (corrupted frame ignored) or Open returns an error.
-  We use rawClose instead of normal close to avoid checkpointing before corruption.
-- wal2-8: Original uses PRAGMA auto_vacuum=OFF and PRAGMA cache_size=10 which we skip (our system
-  has no auto-vacuum and manages page cache differently). Original uses INSERT INTO t1
-  VALUES(zeroblob(8188*1020)) as a single row with a huge blob; we insert 8188 separate rows
-  with 1020-byte values to achieve the same page count. Original uses INSERT...SELECT to double
-  rows in t3; we manually insert the equivalent count of 900-byte random blobs. Original checks
-  SELECT * FROM t2 returns "goodbye"; we check the single key in t2 has value "goodbye".
-  Original opens db2 as a second connection to verify; we close and reopen.
+  - wal2-7: Original corrupts offset 48 in the WAL file (first byte of first frame checksum) and
+    verifies sqlite_master is empty (the CREATE TABLE frame is skipped). We corrupt the same
+    offset (which is the first frame's checksum-1 in our WAL format as well, since our WAL header
+    is 32 bytes and frame checksum-1 is at frame offset 16, giving absolute offset 48). We verify
+    that either the namespace has no data (corrupted frame ignored) or Open returns an error.
+    We use rawClose instead of normal close to avoid checkpointing before corruption.
+  - wal2-8: Original uses PRAGMA auto_vacuum=OFF and PRAGMA cache_size=10 which we skip (our system
+    has no auto-vacuum and manages page cache differently). Original uses INSERT INTO t1
+    VALUES(zeroblob(8188*1020)) as a single row with a huge blob; we insert 8188 separate rows
+    with 1020-byte values to achieve the same page count. Original uses INSERT...SELECT to double
+    rows in t3; we manually insert the equivalent count of 900-byte random blobs. Original checks
+    SELECT * FROM t2 returns "goodbye"; we check the single key in t2 has value "goodbye".
+    Original opens db2 as a second connection to verify; we close and reopen.
 */
 package btree
 

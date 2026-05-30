@@ -7,39 +7,42 @@ Sources:
 
 Test scenario:
 savepoint7-3.*: Tests savepoint rollback with large (~804-byte) values at
-  page_size=1024, exercising overflow page handling during savepoint rollback.
-  Loop i=248..253, each iteration: begin write, insert i rows of ~804 bytes,
-  savepoint, insert more, rollback savepoint, verify count=i, integrity check.
-  Based on ticket https://sqlite.org/src/tktview/7f7f8026eda387d544b (segfault
-  in in-memory journal logic triggered by tricky SAVEPOINT combinations).
+
+	page_size=1024, exercising overflow page handling during savepoint rollback.
+	Loop i=248..253, each iteration: begin write, insert i rows of ~804 bytes,
+	savepoint, insert more, rollback savepoint, verify count=i, integrity check.
+	Based on ticket https://sqlite.org/src/tktview/7f7f8026eda387d544b (segfault
+	in in-memory journal logic triggered by tricky SAVEPOINT combinations).
 
 savepoint6-1.2: Tests a 3-level nested savepoint pattern: insert 44 keys,
-  savepoint one, insert+delete, savepoint two, savepoint three, insert,
-  rollback three, rollback two, release one, verify count=44.
+
+	savepoint one, insert+delete, savepoint two, savepoint three, insert,
+	rollback three, rollback two, release one, verify count=44.
 
 savepoint2-nested: 20-iteration nested savepoint stress test. Each iteration
-  creates 3 nested savepoints with mutations between each, rolls back
-  inner/outer savepoints, and verifies state is correctly restored at each step.
+
+	creates 3 nested savepoints with mutations between each, rolls back
+	inner/outer savepoints, and verifies state is correctly restored at each step.
 
 Deviations from original:
-- savepoint7-3.*: Namespace created before BEGIN transaction (our API does not
-  support DDL rollback via savepoints). Original creates table inside BEGIN.
-  PRAGMA temp_store=MEMORY skipped (not applicable).
-- savepoint6-1.2: PRAGMA incremental_vacuum skipped (no-op in our system).
-  Schema uses auto_vacuum + unique/secondary indexes in original; adapted to
-  plain namespace. Value sizes adapted from x_to_y() (250-500 char random
-  strings) to fixed 300-byte values.
-- savepoint6-1.1: Skipped — requires auto_vacuum + unique indexes + secondary indexes.
-- savepoint6 stress loop: Skipped — requires auto_vacuum, INSERT OR REPLACE,
-  incremental_vacuum, unique indexes.
-- savepoint2: Mutations adapted from random SQL expressions (random()%10,
-  md5sum, randstr) to deterministic patterns. State verification uses full
-  key-value snapshot comparison instead of md5sum signature. Alternating
-  BEGIN wrapping (every other iteration in original) is preserved.
-- savepoint2-$ii.7: Skipped — wal_check_journal_mode (always WAL).
-- savepoint4 (all): Skipped — crash simulation (crashsql) + fault injection.
-- savepoint5 (all): Skipped — DDL rollback inside savepoints.
-- savepoint7-1.*, 2.*: Skipped — DDL in savepoints, multi-table cursor abort semantics.
+  - savepoint7-3.*: Namespace created before BEGIN transaction (our API does not
+    support DDL rollback via savepoints). Original creates table inside BEGIN.
+    PRAGMA temp_store=MEMORY skipped (not applicable).
+  - savepoint6-1.2: PRAGMA incremental_vacuum skipped (no-op in our system).
+    Schema uses auto_vacuum + unique/secondary indexes in original; adapted to
+    plain namespace. Value sizes adapted from x_to_y() (250-500 char random
+    strings) to fixed 300-byte values.
+  - savepoint6-1.1: Skipped — requires auto_vacuum + unique indexes + secondary indexes.
+  - savepoint6 stress loop: Skipped — requires auto_vacuum, INSERT OR REPLACE,
+    incremental_vacuum, unique indexes.
+  - savepoint2: Mutations adapted from random SQL expressions (random()%10,
+    md5sum, randstr) to deterministic patterns. State verification uses full
+    key-value snapshot comparison instead of md5sum signature. Alternating
+    BEGIN wrapping (every other iteration in original) is preserved.
+  - savepoint2-$ii.7: Skipped — wal_check_journal_mode (always WAL).
+  - savepoint4 (all): Skipped — crash simulation (crashsql) + fault injection.
+  - savepoint5 (all): Skipped — DDL rollback inside savepoints.
+  - savepoint7-1.*, 2.*: Skipped — DDL in savepoints, multi-table cursor abort semantics.
 */
 package btree
 

@@ -5,7 +5,7 @@ package btree
 // dbMmap is a no-op on platforms without mmap support.
 type dbMmap struct{}
 
-func newDBMmap(_ fileHandle, _ int64) *dbMmap { return &dbMmap{} }
+func newDBMmap(_ fileHandle, _ int64) *dbMmap   { return &dbMmap{} }
 func (m *dbMmap) readAt(_ []byte, _ int64) bool { return false }
 func (m *dbMmap) remap(_ int64) error           { return nil }
 func (m *dbMmap) unmap() error                  { return nil }

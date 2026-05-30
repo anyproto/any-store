@@ -13,23 +13,23 @@ that WAL frames written after a savepoint rollback have correct checksums and
 can be recovered by a fresh process after a crash.
 
 Deviations from original:
-- walcksum-1.$endian.1: Adapted. Original uses journal mode then switches to WAL;
-  our system is always WAL. Original copies files with forcecopy and checks exact sizes;
-  we use rawClose and check WAL exists with size > 0.
-- walcksum-1.$endian.2.$f: Adapted. Original verifies checksums with both big and little
-  endian; our system only uses big-endian checksums (walMagic = 0x42540601).
-- walcksum-1.$endian.3-7, 9: Skipped. Endian-switching of WAL checksums is not supported
-  (our implementation uses fixed big-endian checksums with a different magic number).
-- walcksum-1.$endian.8: Adapted. Original tests that after checkpoint, new frames use
-  native byte order. We verify that after checkpoint, new frame checksums are correct.
-- walcksum-2.1: Adapted. INSERT...SELECT doubling pattern done manually with cursor read
-  + new unique key inserts. randomblob(800) mapped to 800-byte random values.
-- walcksum-3.0 through 3.2, 1.3: Adapted. Text column value combined with key as needed.
-  NULL blob mapped to empty []byte{}. "forcecopy + second connection" mapped to rawClose +
-  openDBNoCleanup pattern (but using Open with PageSize: 1024).
-- walcksum-4.0 through 4.3: Adapted. Same as group 3 but with outer savepoint pattern.
-  SAVEPOINT one at transaction boundary mapped to BeginWrite + Savepoint.
-- walcksum-5.0 through 5.3: Adapted. Post-checkpoint savepoint rollback pattern.
+  - walcksum-1.$endian.1: Adapted. Original uses journal mode then switches to WAL;
+    our system is always WAL. Original copies files with forcecopy and checks exact sizes;
+    we use rawClose and check WAL exists with size > 0.
+  - walcksum-1.$endian.2.$f: Adapted. Original verifies checksums with both big and little
+    endian; our system only uses big-endian checksums (walMagic = 0x42540601).
+  - walcksum-1.$endian.3-7, 9: Skipped. Endian-switching of WAL checksums is not supported
+    (our implementation uses fixed big-endian checksums with a different magic number).
+  - walcksum-1.$endian.8: Adapted. Original tests that after checkpoint, new frames use
+    native byte order. We verify that after checkpoint, new frame checksums are correct.
+  - walcksum-2.1: Adapted. INSERT...SELECT doubling pattern done manually with cursor read
+  - new unique key inserts. randomblob(800) mapped to 800-byte random values.
+  - walcksum-3.0 through 3.2, 1.3: Adapted. Text column value combined with key as needed.
+    NULL blob mapped to empty []byte{}. "forcecopy + second connection" mapped to rawClose +
+    openDBNoCleanup pattern (but using Open with PageSize: 1024).
+  - walcksum-4.0 through 4.3: Adapted. Same as group 3 but with outer savepoint pattern.
+    SAVEPOINT one at transaction boundary mapped to BeginWrite + Savepoint.
+  - walcksum-5.0 through 5.3: Adapted. Post-checkpoint savepoint rollback pattern.
 */
 package btree
 

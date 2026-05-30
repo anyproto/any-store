@@ -9,15 +9,15 @@ read format version (offset 19), max embedded payload fraction (offset 21),
 min embedded payload fraction (offset 22), and leaf payload fraction (offset 23).
 
 Deviations from original:
-- corruptA-2.1: Original corrupts offset 19 (ReadVersion) which our impl does NOT
-  validate. Adapted to corrupt magic string byte at offset 0 instead. The original
-  offset is tested as a secondary subtest documenting our behavioral difference.
-- corruptA-2.2: Original corrupts offset 21 (max embedded payload frac) which our
-  impl does NOT read (hardcoded constant). Adapted to corrupt magic byte at offset 5.
-- corruptA-2.3: Original corrupts offset 22 (min embedded payload frac) which our
-  impl does NOT read (hardcoded constant). Adapted to corrupt magic byte at offset 10.
-- corruptA-2.4: Original corrupts offset 23 (leaf payload frac) which our impl does
-  NOT read (hardcoded constant). Adapted to corrupt magic byte at offset 14.
+  - corruptA-2.1: Original corrupts offset 19 (ReadVersion) which our impl does NOT
+    validate. Adapted to corrupt magic string byte at offset 0 instead. The original
+    offset is tested as a secondary subtest documenting our behavioral difference.
+  - corruptA-2.2: Original corrupts offset 21 (max embedded payload frac) which our
+    impl does NOT read (hardcoded constant). Adapted to corrupt magic byte at offset 5.
+  - corruptA-2.3: Original corrupts offset 22 (min embedded payload frac) which our
+    impl does NOT read (hardcoded constant). Adapted to corrupt magic byte at offset 10.
+  - corruptA-2.4: Original corrupts offset 23 (leaf payload frac) which our impl does
+    NOT read (hardcoded constant). Adapted to corrupt magic byte at offset 14.
 */
 package btree
 

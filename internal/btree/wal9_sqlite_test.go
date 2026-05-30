@@ -16,21 +16,21 @@ with page_size=512, inserts 8200 rows with 300-byte zero-blob values, and runs
 integrity check. This exercises small page size with many overflow pages.
 
 Deviations from original:
-- wal9-1.0: PRAGMA wal_autocheckpoint=0 not directly mapped; we use
-  DisableAutoCheckpoint option to prevent automatic checkpoints.
-- wal9-1.1: Original uses second connection (db2). Adapted as a read transaction
-  on the same DB handle verifying empty namespace.
-- wal9-1.2: Original doubles rows 17 times (INSERT INTO t SELECT randomblob(100)
-  FROM t) starting from 1 row, producing 131072 rows. DEVIATION: Reduced to 12
-  doublings (4096 rows) to keep test runtime reasonable while still creating a
-  large enough WAL to test the same behavior. Each row has 100-byte random values.
-- wal9-1.3 through 1.5: Skipped -- check exact file/SHM sizes (SQLite internals).
-- wal9-1.6: PRAGMA wal_checkpoint mapped to db.Checkpoint(CheckpointFull).
-- wal9-1.7: Original uses db2 (second connection). Adapted as begin write, insert,
-  rollback on the same DB. Verifies rollback worked by checking row count unchanged.
-- wal64k-1.0 through 1.3: Skipped -- require test_syscall pagesize and SHM file checks.
-- wal64k-2.1: Adapted. Skipped CREATE INDEX (no secondary indexes). Skipped unix-excl
-  VFS (not applicable). Core test (page_size=512, 8200 rows, integrity check) is portable.
+  - wal9-1.0: PRAGMA wal_autocheckpoint=0 not directly mapped; we use
+    DisableAutoCheckpoint option to prevent automatic checkpoints.
+  - wal9-1.1: Original uses second connection (db2). Adapted as a read transaction
+    on the same DB handle verifying empty namespace.
+  - wal9-1.2: Original doubles rows 17 times (INSERT INTO t SELECT randomblob(100)
+    FROM t) starting from 1 row, producing 131072 rows. DEVIATION: Reduced to 12
+    doublings (4096 rows) to keep test runtime reasonable while still creating a
+    large enough WAL to test the same behavior. Each row has 100-byte random values.
+  - wal9-1.3 through 1.5: Skipped -- check exact file/SHM sizes (SQLite internals).
+  - wal9-1.6: PRAGMA wal_checkpoint mapped to db.Checkpoint(CheckpointFull).
+  - wal9-1.7: Original uses db2 (second connection). Adapted as begin write, insert,
+    rollback on the same DB. Verifies rollback worked by checking row count unchanged.
+  - wal64k-1.0 through 1.3: Skipped -- require test_syscall pagesize and SHM file checks.
+  - wal64k-2.1: Adapted. Skipped CREATE INDEX (no secondary indexes). Skipped unix-excl
+    VFS (not applicable). Core test (page_size=512, 8200 rows, integrity check) is portable.
 */
 package btree
 
@@ -238,4 +238,3 @@ func TestSqlite_WAL64k_2_1(t *testing.T) {
 // Reason: Check exact file sizes (db=1024 bytes, wal>1500*1024, shm>32768).
 // These verify SQLite's specific file layout and SHM behavior which differ
 // in our implementation.
-

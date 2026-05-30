@@ -1,50 +1,51 @@
 /*
 Ported from SQLite: corrupt2.test, corrupt3.test, corrupt4.test, corrupt6.test, corrupt7.test, corrupt9.test
 Sources:
-  /home/dev/work/sqlitec/test/corrupt2.test
-  /home/dev/work/sqlitec/test/corrupt3.test
-  /home/dev/work/sqlitec/test/corrupt4.test
-  /home/dev/work/sqlitec/test/corrupt6.test
-  /home/dev/work/sqlitec/test/corrupt7.test
-  /home/dev/work/sqlitec/test/corrupt9.test
+
+	/home/dev/work/sqlitec/test/corrupt2.test
+	/home/dev/work/sqlitec/test/corrupt3.test
+	/home/dev/work/sqlitec/test/corrupt4.test
+	/home/dev/work/sqlitec/test/corrupt6.test
+	/home/dev/work/sqlitec/test/corrupt7.test
+	/home/dev/work/sqlitec/test/corrupt9.test
 
 Test scenario:
 Combined corruption tests from six SQLite test files:
-- corrupt3: Overflow chain corruption (self-loop, invalid page, zeroed pointer)
-- corrupt7: Cell pointer offset corruption (0xFF, 0x04 high bytes)
-- corrupt2: Header magic, page-size, page type flags, cell count, cross-tree sharing,
-  free-block list, freelist count header
-- corrupt6: Payload size varint corruption (increased, decreased, oversized varints)
-- corrupt4: Negative freelist leaf count
-- corrupt9: Duplicate freelist entries
+  - corrupt3: Overflow chain corruption (self-loop, invalid page, zeroed pointer)
+  - corrupt7: Cell pointer offset corruption (0xFF, 0x04 high bytes)
+  - corrupt2: Header magic, page-size, page type flags, cell count, cross-tree sharing,
+    free-block list, freelist count header
+  - corrupt6: Payload size varint corruption (increased, decreased, oversized varints)
+  - corrupt4: Negative freelist leaf count
+  - corrupt9: Duplicate freelist entries
 
 Deviations from original:
-- corrupt3: Overflow page offsets are computed dynamically by parsing our leaf cell
-  format (varint(keyLen) | key | varint(valLen) | value_local | [overflow_ptr]).
-  SQLite uses a different cell format with record headers.
-- corrupt2-1.2: Magic string is "BTree format 1\x00" (not SQLite's). Corrupt at offset 8.
-- corrupt2-1.3: Page size field at offsets 16-17, same as SQLite.
-- corrupt2-1.4, 1.5: Free-block list pointer at page 1 btree header (offset 101-102).
-- corrupt2-5.1: Cross-table page sharing adapted to two namespaces. Exact cell offsets
-  are computed dynamically from ns.RootPage().
-- corrupt2-7.1a, 7.1b, 8.1: Index B-tree corruption adapted to table B-tree corruption.
-  Our B-tree uses type 10 (leaf index) for leaf pages and type 2 (interior index) for
-  interior pages. Original corrupted index leaf pages.
-- corrupt2-14.2/14.3: Freelist count corruption at offset 36, same as SQLite.
-- corrupt6: SerialTypeLen corruption adapted to payload varint corruption in our cell
-  format. Our cells have varint(keyLen) + key + varint(valLen) + value instead of
-  SQLite's record header format.
-- corrupt7: Cell pointer array offsets computed dynamically from the leaf page.
-  Original used hardcoded offset 1062.
-- corrupt4-1.4: DROP TABLE adapted to delete operations that trigger freelist usage.
-- corrupt9: Setup adapted -- no CREATE INDEX. We insert/delete rows to create freelist
-  pages. Freelist trunk page corruption is the same.
-- corrupt2-2.1, 3.1, 4.1, 6.1-6.4, 9.1, 10.1-10.2, 11.1, 12.1, 13.1-13.3:
-  OUT_OF_SCOPE -- require auto_vacuum, CREATE INDEX, sqlite_master, writable_schema.
-- corrupt4-2.0 through 2.3: OUT_OF_SCOPE -- sqlite_master multi-level B-tree.
-- corrupt7-3.1: OUT_OF_SCOPE -- commented out in original.
-- corrupt6-1.2, 1.3, 1.5.1, 1.5.2: OUT_OF_SCOPE -- hexio_read format verification.
-- corrupt9-2.2, 3.2, 4.2: OUT_OF_SCOPE -- CREATE INDEX + REINDEX.
+  - corrupt3: Overflow page offsets are computed dynamically by parsing our leaf cell
+    format (varint(keyLen) | key | varint(valLen) | value_local | [overflow_ptr]).
+    SQLite uses a different cell format with record headers.
+  - corrupt2-1.2: Magic string is "BTree format 1\x00" (not SQLite's). Corrupt at offset 8.
+  - corrupt2-1.3: Page size field at offsets 16-17, same as SQLite.
+  - corrupt2-1.4, 1.5: Free-block list pointer at page 1 btree header (offset 101-102).
+  - corrupt2-5.1: Cross-table page sharing adapted to two namespaces. Exact cell offsets
+    are computed dynamically from ns.RootPage().
+  - corrupt2-7.1a, 7.1b, 8.1: Index B-tree corruption adapted to table B-tree corruption.
+    Our B-tree uses type 10 (leaf index) for leaf pages and type 2 (interior index) for
+    interior pages. Original corrupted index leaf pages.
+  - corrupt2-14.2/14.3: Freelist count corruption at offset 36, same as SQLite.
+  - corrupt6: SerialTypeLen corruption adapted to payload varint corruption in our cell
+    format. Our cells have varint(keyLen) + key + varint(valLen) + value instead of
+    SQLite's record header format.
+  - corrupt7: Cell pointer array offsets computed dynamically from the leaf page.
+    Original used hardcoded offset 1062.
+  - corrupt4-1.4: DROP TABLE adapted to delete operations that trigger freelist usage.
+  - corrupt9: Setup adapted -- no CREATE INDEX. We insert/delete rows to create freelist
+    pages. Freelist trunk page corruption is the same.
+  - corrupt2-2.1, 3.1, 4.1, 6.1-6.4, 9.1, 10.1-10.2, 11.1, 12.1, 13.1-13.3:
+    OUT_OF_SCOPE -- require auto_vacuum, CREATE INDEX, sqlite_master, writable_schema.
+  - corrupt4-2.0 through 2.3: OUT_OF_SCOPE -- sqlite_master multi-level B-tree.
+  - corrupt7-3.1: OUT_OF_SCOPE -- commented out in original.
+  - corrupt6-1.2, 1.3, 1.5.1, 1.5.2: OUT_OF_SCOPE -- hexio_read format verification.
+  - corrupt9-2.2, 3.2, 4.2: OUT_OF_SCOPE -- CREATE INDEX + REINDEX.
 */
 package btree
 

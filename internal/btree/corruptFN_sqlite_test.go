@@ -1,38 +1,39 @@
 /*
 Ported from SQLite: corruptI.test, corruptJ.test, corruptL.test
 Sources:
-  /home/dev/work/sqlitec/test/corruptI.test
-  /home/dev/work/sqlitec/test/corruptJ.test
-  /home/dev/work/sqlitec/test/corruptL.test
+
+	/home/dev/work/sqlitec/test/corruptI.test
+	/home/dev/work/sqlitec/test/corruptJ.test
+	/home/dev/work/sqlitec/test/corruptL.test
 
 Test scenario:
 Five corruption test cases from the corruptF-N test group:
-- corruptI-4: Cell content offset and free block pointer zeroed on a leaf page
-  (page_size=65536). Delete operation should detect corruption.
-- corruptI-6: Cell payload size varint corrupted to near 2^32 (page_size=512).
-  Delete may succeed or error depending on implementation.
-- corruptI-8: Child pointer on interior page set to page 1 (the DB header page,
-  page_size=1024). Delete and IntegrityCheck should detect corruption.
-- corruptJ-1: Self-referencing child pointer on interior node (page_size=1024).
-  DeleteNamespace should detect corruption and not infinite-loop.
-- corruptL-17: WAL checkpoint on truncated database file. Database built large,
-  WAL has pending frames, main DB truncated to 2048 bytes. Checkpoint should fail.
+  - corruptI-4: Cell content offset and free block pointer zeroed on a leaf page
+    (page_size=65536). Delete operation should detect corruption.
+  - corruptI-6: Cell payload size varint corrupted to near 2^32 (page_size=512).
+    Delete may succeed or error depending on implementation.
+  - corruptI-8: Child pointer on interior page set to page 1 (the DB header page,
+    page_size=1024). Delete and IntegrityCheck should detect corruption.
+  - corruptJ-1: Self-referencing child pointer on interior node (page_size=1024).
+    DeleteNamespace should detect corruption and not infinite-loop.
+  - corruptL-17: WAL checkpoint on truncated database file. Database built large,
+    WAL has pending frames, main DB truncated to 2048 bytes. Checkpoint should fail.
 
 Deviations from original:
-- corruptI-4: Original uses SQL key -1 (signed integer) and key 0. We use
-  4-byte big-endian keys 0xFFFFFFFF (representing -1) and 0x00000000. Root page
-  offset computed dynamically. page_size=65536.
-- corruptI-6: Original uses zeroblob(300) and zeroblob(600) as SQL values. We
-  use zero-filled byte slices. Corruption offset 616 is a file-absolute offset
-  from the original; we apply it identically. page_size=512.
-- corruptI-8: Original does DELETE FROM t1 (deletes all rows). We iterate and
-  delete keys 1..4. page_size=1024.
-- corruptJ-1: Original does DROP TABLE t1. We use tx.DeleteNamespace("t1")
-  which frees all pages recursively. page_size=1024.
-- corruptL-17: Original uses CREATE INDEX and 512 rows of randomblob(123).
-  We use 512 keys with random 123-byte values. Truncation target is 2048 bytes.
-  Original expects PRAGMA wal_checkpoint to fail; we expect Checkpoint() to fail
-  or the reopen itself to fail.
+  - corruptI-4: Original uses SQL key -1 (signed integer) and key 0. We use
+    4-byte big-endian keys 0xFFFFFFFF (representing -1) and 0x00000000. Root page
+    offset computed dynamically. page_size=65536.
+  - corruptI-6: Original uses zeroblob(300) and zeroblob(600) as SQL values. We
+    use zero-filled byte slices. Corruption offset 616 is a file-absolute offset
+    from the original; we apply it identically. page_size=512.
+  - corruptI-8: Original does DELETE FROM t1 (deletes all rows). We iterate and
+    delete keys 1..4. page_size=1024.
+  - corruptJ-1: Original does DROP TABLE t1. We use tx.DeleteNamespace("t1")
+    which frees all pages recursively. page_size=1024.
+  - corruptL-17: Original uses CREATE INDEX and 512 rows of randomblob(123).
+    We use 512 keys with random 123-byte values. Truncation target is 2048 bytes.
+    Original expects PRAGMA wal_checkpoint to fail; we expect Checkpoint() to fail
+    or the reopen itself to fail.
 */
 package btree
 
