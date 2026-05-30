@@ -2400,20 +2400,6 @@ The consequence is a dangling rightChild pointer into a freed page, which downst
 (`finishParentRemoval` `btree.go:2996-3005`, `collapseSingleChild` `btree.go:3031-3067`)
 can turn into a double-free on the root, corrupting the freelist.
 
-<a id="drift-23-emptied-root-leaf-not-reset-to-pristine-empty-page"></a>
-### Drift: Emptied Root Leaf Not Reset To Pristine Empty Page
-- **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `btree.go:*btree.Delete` (`internal/btree/btree.go:2510-2513 (root-leaf 0-cell falls through to no-op return without header reset)`).
-
-When `dropCell` takes a page's `nCell` to 0, SQLite resets it to a pristine empty page:
-`memset(&data[hdr+1],0,4)` clears the freeblock pointer and fragmentation byte,
-`put2byte(&data[hdr+5], usableSize)` resets the cell-content offset, and `nFree` is reset
-to a full empty page (`btree.c:7301-7306`). Go's `Delete` resets a page on becoming empty
-only in the non-root fast path; an emptied root leaf falls through to a no-op return
-(`btree.go:2510-2513`) without this header reset. The consequence is that the emptied
-root leaf retains stale `cellContentOff`/`fragBytes` values rather than the pristine
-empty-page header SQLite guarantees.
-
 <a id="drift-24-delete-fast-path-validates-cell-bounds-against-full-page-not"></a>
 ### Drift: Delete Fast Path Validates Cell Bounds Against Full Page Not usableSize
 - **Category:** changed-logic  -  **Severity:** low

@@ -2486,7 +2486,6 @@ func (bt *btree) insertIntoInterior(pg *page, key, value []byte) error {
 //
 // When fragmentation exceeds the threshold (60 bytes, matching SQLite's limit),
 // a full rebuild is triggered to defragment the page.
-// DRIFT: emptied root leaf keeps stale cellContentOff/fragBytes; C resets pristine See docs/btree/NOTES.md#drift-23-emptied-root-leaf-not-reset-to-pristine-empty-page
 // DRIFT: delete fast path checks cell bounds vs page size not usableSize (reserved region) See docs/btree/NOTES.md#drift-24-delete-fast-path-validates-cell-bounds-against-full-page-not
 func (bt *btree) Delete(key []byte) error {
 	// Phase 1: Read-only descent to find the leaf
@@ -2657,6 +2656,26 @@ func (bt *btree) Delete(key []byte) error {
 
 	// Not underfull (or the leaf is the root): SQLite's no-op branch
 	// (btree.c:10008). The fast in-place drop above is the whole operation.
+	//
+	// If the drop emptied the page, reset it to a pristine empty state, mirroring
+	// SQLite's dropCell when pPage->nCell reaches 0 (btree.c:7301-7306): clear the
+	// freeblock pointer and fragmentation byte and reset cellContentOff to the
+	// usable size. At this program point cellCount==0 can only be the ROOT leaf —
+	// the non-root empty case already returned at the cellCount==0 && pgno !=
+	// rootPage branch above. These values match what rebuildLeafPage writes for a
+	// 0-cell page (btree.go:1743-1747).
+	if wpg.header.cellCount == 0 {
+		wpg.header.firstFreeBlk = 0
+		wpg.header.fragBytes = 0
+		// page size <= 65536 here, so the uint16 cast is exact (C's
+		// usableSize==65536 / cellContentOff==0 special case cannot occur).
+		wpg.header.cellContentOff = uint16(bt.usablePageSize())
+		hdrOff := 0
+		if wpg.pgno == 1 {
+			hdrOff = dbHeaderSize
+		}
+		wpg.header.serialize(wpg.data[hdrOff:])
+	}
 	bt.pager.releasePage(wpg)
 	return nil
 }
