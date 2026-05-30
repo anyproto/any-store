@@ -27,7 +27,6 @@ type heapShm struct {
 }
 
 // newPlatformShm creates a heap-backed shm (single-process fallback).
-// DRIFT: NOTES understates mmap SHM platform set (linux/darwin x amd64/arm64); layout/roadmap undoc See docs/btree/NOTES.md#drift-118-notes-platform-matrix-understates-mmap-shm-support
 func newPlatformShm(_ string) (shm, error) {
 	return &heapShm{
 		regions: make([][]byte, 0, shmMaxRegions),

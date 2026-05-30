@@ -370,7 +370,7 @@ Both implementations use the same SHM layout:
 
 | Aspect | SQLite | Go |
 |--------|--------|-----|
-| SHM format | mmap'd file, native byte order | mmap'd file (linux/amd64) or heap (other platforms) |
+| SHM format | mmap'd file, native byte order | mmap'd file on `(linux \|\| darwin) && (amd64 \|\| arm64)`, heap on all other platforms (windows, wasm/js, the BSDs, non-amd64/arm64 arches) |
 | Lock protocol | POSIX fcntl locks on SHM | Same for mmap; no-ops for heap mode |
 | Same-process lookup | Iterates `aSegment[]` in `walIterator` | Uses in-process Go map (`pageMap`) |
 | Cross-process lookup | Hash table scan (`walHashGet`) | `shmHashGet()` for cross-process, Go map for same-process |
@@ -475,7 +475,7 @@ const (
 | Journal modes | DELETE, TRUNCATE, PERSIST, MEMORY, WAL, OFF | WAL only |
 | Rollback journal | Full implementation | Not implemented |
 | Lock escalation | SHARED -> RESERVED -> PENDING -> EXCLUSIVE | WAL write lock only |
-| Multi-process support | Full (via file locks + SHM) | Limited (mmap on linux/amd64, heap elsewhere) |
+| Multi-process support | Full (via file locks + SHM) | mmap-backed SHM on `(linux \|\| darwin) && (amd64 \|\| arm64)`; heap fallback (single-process) elsewhere |
 | Hot journal rollback | Automatic recovery | Not applicable (no rollback journal) |
 | Sub-journal (savepoint journal) | Written to disk | In-memory page copies |
 | NOCONTENT optimization | `PAGER_GET_NOCONTENT` flag | `getPageNoContent()` |
@@ -3480,26 +3480,6 @@ non-mmap platforms implements the same real per-slot counter semantics. Cruciall
 platforms — including mmap-capable linux/darwin amd64/arm64 — whenever `inProcess==true` (forced for InMemory and
 InProcess, `db.go:360-367`, `wal.go:552-562`). The consequence is that NOTES is wrong on both counts: the
 "no-op locks" claim and the platform matrix both misrepresent the real, always-on heap lock implementation.
-
-<a id="drift-118-notes-platform-matrix-understates-mmap-shm-support"></a>
-### Drift: NOTES Platform Matrix Understates mmap SHM Support
-- **Category:** platform-support  -  **Severity:** low
-- **Affected functions:** `shm_mmap.go` (`internal/btree/shm_mmap.go:1,68` build tag + newPlatformShm,
-  `:233` shmLockOffset, `:30` shmDMSOffset, `:238` fcntlLock),
-  `shm_other.go` (`internal/btree/shm_other.go:1,29-34` build tag + newPlatformShm,
-  `:18-22` planned-support roadmap comment).
-
-NOTES.md's platform matrix claims mmap multi-process SHM is linux/amd64 only and understates the heap-SHM fallback
-set, but the code's build tags cover `(linux || darwin) && (amd64 || arm64)` for the mmap path (`shm_mmap.go:1`,
-verified to compile on darwin/arm64) with the heap fallback `newPlatformShm` on the exact negation
-(`shm_other.go:1`) — i.e. Windows, wasm/js, the BSDs, and non-amd64/arm64 arches. The mmap implementation also
-carries an undocumented SHM lock-byte region layout: each slot maps to a 1-byte fcntl byte-range at offset
-`120 + slot` (`shmLockOffset`, `shm_mmap.go:233`), the dead-man-switch lock sits at
-`shmDMSOffset = 120 + lockSlotCount` (`shm_mmap.go:30`), and `fcntlLock` uses non-blocking `F_SETLK` mapping
-EACCES/EAGAIN to `ErrBusy` (`shm_mmap.go:238`). Finally `shm_other.go:18-22` carries a "Planned platform support"
-roadmap comment (now partially stale, since linux/arm64 and darwin are already covered by the mmap build) absent
-from NOTES. The consequence is documentation drift: NOTES understates which platforms get real multi-process SHM
-and omits both the on-disk lock-region layout and the roadmap notes a maintainer would need.
 
 <a id="drift-121-fdatasync-durability-primitive-platform-split-undocumented"></a>
 ### Drift: fdatasync Durability Primitive Platform Split Undocumented
