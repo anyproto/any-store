@@ -560,6 +560,13 @@ func TestCheckpoint_SkipsOrphanFramesPastCommittedNPage(t *testing.T) {
 	// Pre-stamp the DB file's orphan-page region (pgno shrunk+1..grown) with a
 	// sentinel so we can detect any checkpoint overwrite. Pages 1..shrunk are
 	// left zero; the checkpoint is expected to fill those from the WAL.
+	//
+	// NOTE: after the drift-50 fix, a full-backfill checkpoint physically
+	// truncates the DB file down to the committed page count (mxPage=shrunk),
+	// so the orphan region is removed entirely (SQLite walCheckpoint
+	// wal.c:2320-2329). We still pre-stamp it so that if the iDbpage>mxPage
+	// skip filter (drift-51, wal.c:2306) ever regressed and copied an orphan
+	// frame BEFORE the truncate, the grown file size below would catch it.
 	sentinel := make([]byte, int(w.pageSize))
 	for i := range sentinel {
 		sentinel[i] = dbSentinel
@@ -632,23 +639,28 @@ func TestCheckpoint_SkipsOrphanFramesPastCommittedNPage(t *testing.T) {
 			buf[0], buf[1], buf[2])
 	}
 
-	// Orphan pages shrunk+1..grown must be UNTOUCHED — still the sentinel, never
-	// the walMark orphan data. This is the drift-51 assertion: with the skip
-	// filter absent, these pages would be overwritten with walMark+pgno and the
-	// DB file would grow past its committed size.
-	for p := uint32(shrunk + 1); p <= grown; p++ {
-		off := int64(p-1) * int64(w.pageSize)
-		if _, err := dbFile.ReadAt(buf, off); err != nil {
-			t.Fatalf("read db page %d: %v", p, err)
-		}
-		if buf[0] == walMark {
-			t.Fatalf("db page %d (pgno>nPage=%d) was backfilled from an orphan WAL frame "+
-				"(got walMark %#x) — checkpoint must skip iDbpage>mxPage (wal.c:2306)",
-				p, shrunk, buf[0])
-		}
-		if buf[0] != dbSentinel {
-			t.Fatalf("db page %d: expected untouched sentinel %#x, got %#x",
-				p, byte(dbSentinel), buf[0])
-		}
+	// After the drift-50 fix the full-backfill checkpoint physically truncates
+	// the DB file to the committed page count (mxPage=shrunk), so the orphan
+	// region (pgno shrunk+1..grown) no longer exists on disk. The file size must
+	// be exactly shrunk*pageSize: this is BOTH the drift-50 truncate assertion
+	// (file shrank to hdr.nPage*szPage, SQLite wal.c:2320-2329) AND the drift-51
+	// guarantee — had the iDbpage>mxPage skip (wal.c:2306) regressed and an
+	// orphan frame been copied to page shrunk+1..grown before truncate, that
+	// write would have extended the file beyond shrunk*pageSize and the truncate
+	// to shrunk*pageSize would still have removed it; but if the truncate guard
+	// itself regressed, a surviving orphan backfill would show up as a file
+	// larger than shrunk*pageSize. Either way, exact-size is the tightest check.
+	wantSize := int64(shrunk) * int64(w.pageSize)
+	if fi, err := dbFile.Stat(); err != nil {
+		t.Fatalf("stat db file: %v", err)
+	} else if fi.Size() != wantSize {
+		t.Fatalf("db file size = %d, want %d (checkpoint must truncate to committed "+
+			"nPage=%d*pageSize and skip orphan frames pgno>nPage)", fi.Size(), wantSize, shrunk)
+	}
+
+	// Reading past the committed size must now return EOF (the orphan pages were
+	// physically removed), confirming no orphan frame was materialized.
+	if _, err := dbFile.ReadAt(buf, int64(shrunk)*int64(w.pageSize)); err == nil {
+		t.Fatalf("expected EOF reading past committed nPage=%d; orphan region still present", shrunk)
 	}
 }

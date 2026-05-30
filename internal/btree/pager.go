@@ -2858,8 +2858,10 @@ func (p *pager) freeOverflowChain(firstPgno uint32) error {
 // truncateTo shrinks the database to the given page count. Matches
 // SQLite's sqlite3PagerTruncateImage (pager.c). Discards writerCache
 // entries above the new size (via pcache.truncate) and updates the
-// atomic dbSize so subsequent writes see the new bound. Physical file
-// truncation happens at the next checkpoint.
+// atomic dbSize so subsequent writes see the new bound. The on-disk file
+// is physically shrunk to the committed page count at the next full-backfill
+// checkpoint (wal.checkpointWithMode's post-backfill dbFile.Truncate, matching
+// SQLite walCheckpoint wal.c:2320-2329).
 // DRIFT: truncateTo eagerly drops dirty pages (savepoint hazard) + adds non-C guards See docs/btree/NOTES.md#drift-79-truncateto-eager-dirty-page-drop-and-extra-guards
 func (p *pager) truncateTo(newDbSize uint32) error {
 	if pagerState(p.state.Load()) != pagerWriter {

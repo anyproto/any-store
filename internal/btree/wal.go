@@ -2953,9 +2953,32 @@ func (w *wal) authoritativeNPage() uint32 {
 	return w.index.maxPage.Load()
 }
 
+// authoritativeMxFrameAndPage returns a CONSISTENT (mxFrame, nPage) pair from a
+// single authoritative snapshot. It is the combined form of authoritativeMxFrame
+// and authoritativeNPage, and MUST be used wherever both values feed the same
+// decision (e.g. the checkpoint full-backfill truncate): in multi-process mode
+// the two values come from a single readHeader() so a peer's PASSIVE-mode commit
+// cannot land between two separate header reads and yield a torn pair (mxFrame
+// from before a grow/shrink, nPage from after) — which would over- or
+// under-truncate the DB file. In single-process or in-memory mode the in-process
+// atomics are authoritative and w.mu serializes checkpoint against every writer,
+// so the pair is trivially consistent. A torn/invalid SHM read falls back to the
+// atomics. Mirrors SQLite's single pWal->hdr snapshot in walCheckpoint
+// (mxSafeFrame=pWal->hdr.mxFrame, mxPage=pWal->hdr.nPage at wal.c:2227-2228).
+func (w *wal) authoritativeMxFrameAndPage() (mxFrame, nPage uint32) {
+	if !w.inProcess && !w.inMemory {
+		if hdr, valid := w.index.readHeader(); valid {
+			return hdr.mxFrame, hdr.nPage
+		}
+	}
+	return w.index.mxCommitFrame.LoadLocal(), w.index.maxPage.Load()
+}
+
 // checkpoint writes WAL frames back to the database file.
 // For InMemory databases, master is used to store checkpointed pages instead of dbFile.
-// DRIFT: checkpoint never truncates DB file to committed nPage after full backfill See docs/btree/NOTES.md#drift-50-checkpoint-never-physically-truncates-db-file-after-full-bac
+// RESOLVED (was DRIFT-50): checkpointWithMode now physically truncates the DB
+// file down to the committed page count after a full backfill, matching SQLite
+// walCheckpoint (wal.c:2320-2329). See the truncate block in checkpointWithMode.
 // DRIFT: checkpoint omits page-size-mismatch and over-grow corruption guards See docs/btree/NOTES.md#drift-52-checkpoint-missing-page-size-mismatch-and-over-grow-corrupti
 func (w *wal) checkpoint(dbFile fileHandle, master *masterStore) error {
 	return w.checkpointWithMode(dbFile, master, CheckpointFull, nil)
@@ -2967,7 +2990,9 @@ func (w *wal) checkpoint(dbFile fileHandle, master *masterStore) error {
 // matching SQLite's SQLITE_BUSY return from sqlite3WalCheckpoint in
 // PASSIVE mode when readers block progress. Callers must not truncate
 // the WAL when ErrBusy is returned.
-// DRIFT: checkpoint never truncates DB file to committed nPage after full backfill See docs/btree/NOTES.md#drift-50-checkpoint-never-physically-truncates-db-file-after-full-bac
+// RESOLVED (was DRIFT-50): the post-backfill physical DB-file truncate added to
+// checkpointWithMode runs for PASSIVE too (it is gated on the live-mxFrame
+// guard, not the mode), matching SQLite walCheckpoint (wal.c:2320-2329).
 func (w *wal) checkpointPassive(dbFile fileHandle, master *masterStore) error {
 	err := w.checkpointWithMode(dbFile, master, CheckpointPassive, nil)
 	if err != nil {
@@ -3134,14 +3159,18 @@ func (w *wal) rewriteChecksums(iLast uint32) error {
 	return nil
 }
 
-// mxFrame source (multi-process): `nf` is read via authoritativeMxFrame,
+// mxFrame source (multi-process): `nf` is read via authoritativeMxFrameAndPage,
 // which consults the SHM header under lockCheckpoint. This mirrors SQLite's
 // walCheckpoint using pWal->hdr.mxFrame. Reading the process-local
 // mxCommitFrame would undercount committed frames written by peer
 // processes, causing a close-time checkpoint to only backfill our own
 // frames before truncate — losing the peer's data (commit 9023f5b).
 // DRIFT: FULL/RESTART/TRUNCATE checkpoint returns nil vs SQLITE_BUSY on incomplete backfill See docs/btree/NOTES.md#drift-49-non-passive-checkpoint-returns-success-instead-of-busy-on-in
-// DRIFT: checkpoint never truncates DB file to committed nPage after full backfill See docs/btree/NOTES.md#drift-50-checkpoint-never-physically-truncates-db-file-after-full-bac
+// RESOLVED (was DRIFT-50): after a full backfill this function now physically
+// truncates the DB file down to the committed page count (mxPage*pageSize) and
+// fdatasyncs, gated on a live-mxFrame guard so a concurrent older-snapshot
+// reader or a mid-checkpoint peer commit is honored. Mirrors SQLite
+// walCheckpoint full-backfill truncate (wal.c:2320-2329).
 func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode CheckpointMode, xBusy BusyHandler) error {
 	// Acquire checkpoint lock -- serialize concurrent checkpoints.
 	// The busy handler is NOT used for the checkpoint lock itself, matching
@@ -3186,29 +3215,36 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	// at commit time via walIndexWriteHdr.
 	//
 	// In multi-process mode, read mxFrame from the SHM header via
-	// authoritativeMxFrame, not the process-local mxCommitFrame. A sibling
-	// process may have committed frames we haven't synced — without this,
-	// our close-time checkpoint would only backfill our own frames, then
+	// authoritativeMxFrameAndPage, not the process-local mxCommitFrame. A
+	// sibling process may have committed frames we haven't synced — without
+	// this, our close-time checkpoint would only backfill our own frames, then
 	// truncate the WAL and lose the sibling's data (measured as the
 	// residual ~4% failure in TestMultiProcessIndex_ConcurrentSketchUpdates).
-	nf := w.authoritativeMxFrame()
-	if nf == 0 {
-		return nil
-	}
-
-	// Committed page-count bound for the backfill. SQLite's walCheckpoint skips
-	// any frame whose target pgno exceeds the last commit's page count
-	// (mxPage = pWal->hdr.nPage at wal.c:2228; iDbpage>mxPage skip at wal.c:2306).
-	// This discards orphan frames for pages that a later shrinking commit
-	// logically dropped but that still physically reside in the append-only WAL;
-	// without it the write loops below would copy them past the committed DB
-	// size and materialize stale pages SQLite never exposes.
 	//
-	// We only reach here with nf!=0, i.e. a commit frame exists, so nPage is
+	// nf (committed frame frontier) and mxPage (committed page-count bound) are
+	// read together as a CONSISTENT pair from a single authoritative snapshot.
+	// Reading them separately would risk a torn pair: a peer's PASSIVE-mode
+	// commit could grow/shrink the DB between two header reads, yielding nf from
+	// before and mxPage from after (or vice versa), which the full-backfill
+	// truncate below would turn into an over- or under-truncation. Mirrors
+	// SQLite's single pWal->hdr snapshot in walCheckpoint (wal.c:2227-2228).
+	//
+	// mxPage is the committed page-count bound for the backfill. SQLite's
+	// walCheckpoint skips any frame whose target pgno exceeds the last commit's
+	// page count (mxPage = pWal->hdr.nPage at wal.c:2228; iDbpage>mxPage skip at
+	// wal.c:2306). This discards orphan frames for pages that a later shrinking
+	// commit logically dropped but that still physically reside in the
+	// append-only WAL; without it the write loops below would copy them past the
+	// committed DB size and materialize stale pages SQLite never exposes.
+	//
+	// We only proceed past nf==0 below, i.e. a commit frame exists, so nPage is
 	// always >=1. Defensively, if a torn-header fallback ever yields 0 we leave
 	// the backfill unbounded (mxPage==0 disables the filter) — strictly
 	// conservative: that can only fail to prune, never skip a legitimate page.
-	mxPage := w.authoritativeNPage()
+	nf, mxPage := w.authoritativeMxFrameAndPage()
+	if nf == 0 {
+		return nil
+	}
 
 	// Compute mxSafeFrame: the highest frame we can safely copy to DB.
 	// Start with all committed frames, then lower based on active readers.
@@ -3345,7 +3381,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 		for _, pgno := range pgnos {
 			// Skip orphan frames past the committed DB size (iDbpage>mxPage,
 			// wal.c:2306). mxPage==0 means "unbounded" — see the
-			// authoritativeNPage call above.
+			// authoritativeMxFrameAndPage call above.
 			if mxPage != 0 && pgno > mxPage {
 				continue
 			}
@@ -3418,7 +3454,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 			for _, pgno := range pgnos {
 				// Skip orphan frames past the committed DB size (iDbpage>mxPage,
 				// wal.c:2306). mxPage==0 means "unbounded" — see the
-				// authoritativeNPage call above.
+				// authoritativeMxFrameAndPage call above.
 				if mxPage != 0 && pgno > mxPage {
 					continue
 				}
@@ -3454,6 +3490,43 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 
 	// Sync the database file (skip for InMemory)
 	if dbFile != nil {
+		if err := fdatasync(dbFile); err != nil {
+			_ = w.index.unlock(lockRead0, lockExclusive)
+			return err
+		}
+	}
+
+	// Full-backfill physical truncation. When this checkpoint copied the entire
+	// committed WAL frontier into the DB file, shrink the DB file down to the
+	// committed page count so trailing pages dropped by a shrinking commit (e.g.
+	// pager.truncateTo from backup, or a future VACUUM) are physically reclaimed
+	// rather than left allocated forever. Mirrors SQLite walCheckpoint
+	// (wal.c:2320-2329): on rc==SQLITE_OK and mxSafeFrame==walIndexHdr->mxFrame,
+	// szDb = pWal->hdr.nPage*szPage; OsTruncate(pDbFd, szDb); OsSync(pDbFd).
+	//
+	// Guards (each maps to C):
+	//   - dbFile != nil skips InMemory / masterStore, which has no trailing-disk
+	//     concept (masterStore is a map[uint32][]byte; there is nothing to
+	//     truncate).
+	//   - mxSafeFrame == w.authoritativeMxFrame() re-reads the LIVE committed
+	//     frontier (C's mxSafeFrame==walIndexHdr(pWal)->mxFrame, wal.c:2322): we
+	//     only truncate when no peer commit grew/shrank the DB during backfill,
+	//     and when a concurrent reader pinned to an older (pre-shrink) snapshot
+	//     lowered mxSafeFrame below the frontier the guard is false and we leave
+	//     the trailing pages that reader still reads from the DB file.
+	//   - mxPage > 0 guards the no-committed-size fallback (mxPage==0 from a
+	//     torn-header read).
+	//
+	// On Truncate or its fdatasync error we return WITHOUT advancing nBackfill
+	// (mirrors C gating AtomicStore(nBackfill) on rc==SQLITE_OK at wal.c:2330),
+	// so a failed shrink is retried next checkpoint and the WAL stays
+	// authoritative rather than durably advancing the checkpoint frontier.
+	if dbFile != nil && mxPage > 0 && mxSafeFrame == w.authoritativeMxFrame() {
+		szDb := int64(mxPage) * int64(w.pageSize)
+		if err := dbFile.Truncate(szDb); err != nil {
+			_ = w.index.unlock(lockRead0, lockExclusive)
+			return err
+		}
 		if err := fdatasync(dbFile); err != nil {
 			_ = w.index.unlock(lockRead0, lockExclusive)
 			return err

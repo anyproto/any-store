@@ -2627,27 +2627,6 @@ checkpoint gets a false success and cannot tell that readers blocked the operati
 path stays consistent, so this is not corruption, but the BUSY-means-retry semantics SQLite
 guarantees are lost.
 
-<a id="drift-50-checkpoint-never-physically-truncates-db-file-after-full-bac"></a>
-### Drift: Checkpoint Never Physically Truncates DB File After Full Backfill
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `wal.go:*wal.checkpoint` (`internal/btree/wal.go:3275-3290`),
-  `wal.go:*wal.checkpointPassive` (`internal/btree/wal.go:3276-3290` (and the promise at
-  `pager.go:2636-2655`)), `wal.go:*wal.checkpointWithMode` (`wal.go:3270-3291` (post-backfill:
-  WriteAt + fdatasync, no dbFile.Truncate); `pager.go:2639-2640` (incorrect 'truncation at next
-  checkpoint' comment)).
-
-SQLite's `walCheckpoint` physically shrinks the database file once the entire WAL has been
-backfilled: when `mxSafeFrame==walIndexHdr(pWal)->mxFrame` it computes
-`szDb = pWal->hdr.nPage*szPage` and calls `sqlite3OsTruncate(pWal->pDbFd, szDb)` followed by an
-`sqlite3OsSync` (`wal.c:2321-2329`), and this runs for all non-error modes
-(PASSIVE/FULL/RESTART/TRUNCATE). This is how on-disk space is reclaimed after a committed
-transaction reduced the page count (e.g. `backup.go`'s `truncateTo`, or any future
-VACUUM/shrink). The Go `checkpointWithMode` only writes backfilled pages back via WriteAt +
-fdatasync (`wal.go:3270-3291`) and never reads `hdr.nPage` to call `dbFile.Truncate` down to
-the committed page count. The consequence is that trailing pages dropped by a shrinking commit
-remain physically allocated on disk indefinitely; the database file only grows, and the
-`pager.go:2639-2640` comment promising "truncation at next checkpoint" is incorrect.
-
 <a id="drift-52-checkpoint-missing-page-size-mismatch-and-over-grow-corrupti"></a>
 ### Drift: Checkpoint Missing Page Size Mismatch And Over Grow Corruption Guards
 - **Category:** changed-logic  -  **Severity:** low
