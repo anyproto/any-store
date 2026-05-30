@@ -2843,24 +2843,6 @@ length but never unlinking it. The consequence is that after the last client clo
 zero-length `-wal` file is left behind on disk rather than being removed as stock SQLite would
 do; this is benign in operation but diverges from SQLite's default file-lifecycle cleanup.
 
-<a id="drift-56-databasesize-returns-global-writer-counter-not-read-snapshot"></a>
-### Drift: DatabaseSize Returns Global Writer Counter Not Read Snapshot
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `db.go:*DB.DatabaseSize` (`db.go:616-618`).
-
-SQLite's `sqlite3PagerPagecount` (`pager.c:3928`) returns `pPager->dbSize`, a *per-connection*
-value established at the calling connection's read-transaction start (set from
-`sqlite3WalDbsize() == pWal->hdr.nPage`), and it asserts a read transaction is open
-(`assert(pPager->eState>=PAGER_READER)` and `!=PAGER_WRITER_FINISHED`, `pager.c:3926-3927`)
-because that assertion is what makes the value a meaningful snapshot; the equivalent
-`sqlite3BtreeLastPage` returns the caller's snapshot `pBt->nPage`. The Go `DatabaseSize()`
-(`db.go:616-618`) instead returns `db.pager.dbSize.Load()` -- the *process-global writer*
-allocation counter bumped in `allocatePage` -- and has no read-transaction precondition,
-so it can be called with no transaction open at all. The consequence is that `DatabaseSize()`
-returns whatever the last writer left in the global counter rather than a stable per-reader
-snapshot, so concurrent readers can observe a size that does not match their own consistent
-view of the database.
-
 <a id="drift-57-path-returns-raw-string-for-in-memory-dbs"></a>
 ### Drift: Path Returns Raw String For In Memory DBs
 - **Category:** changed-logic  -  **Severity:** low

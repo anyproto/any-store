@@ -237,7 +237,7 @@ func (b *Backup) Step(nPage int) error {
 	// the loop bound, nPagecount/nRemaining, finalize, and the page-1 size
 	// patch are all consistent with the same snapshot (and with the bound
 	// getPageReader validates copied pages against, pager.go:952).
-	nSrcPage := b.src.pager.readerDbSizeBound(rtx.cache)
+	nSrcPage := rtx.DatabaseSize()
 	srcPgsz := b.src.PageSize()
 
 	// Main copy loop. ~ backup.c:390–401.

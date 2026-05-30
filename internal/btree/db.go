@@ -611,11 +611,17 @@ func (db *DB) PageSize() uint32 {
 }
 
 // DatabaseSize returns the current number of pages in the database,
-// including page 1 (the header page). ~ sqlite3BtreeLastPage (btree.c).
-// Reads the atomic pager.dbSize directly; safe under any concurrent
-// transaction state because dbSize is monotonic within the current
-// WAL snapshot visible to the caller.
-// DRIFT: DatabaseSize returns global p.dbSize, not per-connection read snapshot; no tx check See docs/btree/NOTES.md#drift-56-databasesize-returns-global-writer-counter-not-read-snapshot
+// including page 1 (the header page). It reads the live, process-global
+// writer counter (atomic pager.dbSize) and provides NO read-snapshot
+// guarantee: unlike SQLite's sqlite3BtreeLastPage / sqlite3PagerPagecount
+// (btree.c:2371, pager.c:3925), which return the caller's per-connection
+// snapshot count, this value can be advanced by a concurrent writer at any
+// time. It is meaningful only when called inside the writer (where p.dbSize
+// is the writer's own live count) or when there are no concurrent writers.
+// Callers that need a count consistent with a read snapshot must use
+// ReadTx.DatabaseSize() instead, which returns the snapshot-faithful bound.
+// DB has no tx handle to derive a snapshot from, so this method intentionally
+// keeps the global-counter semantics.
 func (db *DB) DatabaseSize() uint32 {
 	return db.pager.dbSize.Load()
 }
@@ -1632,6 +1638,23 @@ func (tx *ReadTx) Count(ns *Namespace) (int, error) {
 	}
 	bt := &btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: tx.writable}
 	return bt.Count()
+}
+
+// DatabaseSize returns the number of pages in the database, including page 1
+// (the header page), as of this transaction's snapshot.
+// ~ sqlite3BtreeLastPage / sqlite3PagerPagecount (btree.c:2371, pager.c:3925):
+// SQLite returns the per-connection pPager->dbSize, which is set from the
+// reader's captured WAL-index header (sqlite3WalDbsize == pWal->hdr.nPage,
+// pager.c:5448). Here it is the per-reader snapshot bound carried on the
+// reader cache (tx.cache.dbSize, set at BeginRead from effectiveReaderDbSize),
+// so the count is consistent with the same snapshot used for page reads —
+// not the live global writer counter that DB.DatabaseSize exposes.
+//
+// For a write transaction (embedded ReadTx, cache==nil), readerDbSizeBound
+// falls back to p.dbSize, which is the writer's live page count and matches
+// sqlite3BtreeLastPage's pBt->nPage for the writing connection.
+func (tx *ReadTx) DatabaseSize() uint32 {
+	return tx.pager.readerDbSizeBound(tx.cache)
 }
 
 // GetNamespace returns a Namespace handle for the given name.
