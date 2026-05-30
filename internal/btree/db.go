@@ -1069,9 +1069,11 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 // writer goroutine has a different ref/pin model than SQLite's shared cache).
 const maxTreeDepth = 64
 
-// freeTreePages recursively frees all pages in a B-tree,
-// including any overflow page chains attached to leaf cells.
-// DRIFT: freeTreePages frees root (drop) vs clearDatabasePage retains root (clear) See docs/btree/NOTES.md#drift-20-freetreepages-frees-root-page-versus-cleardatabasepage-clear
+// freeTreePages recursively frees all pages in a B-tree, including the root
+// and any overflow page chains attached to leaf cells. Its only caller is
+// DeleteNamespace, which also removes the namespace's master-table entry, so
+// this implements drop-table semantics (root reclaimed) matching SQLite's
+// sqlite3BtreeDropTable (btree.c:10331), not clear-table (root retained).
 func (db *DB) freeTreePages(pgno uint32) error {
 	return db.freeTreePagesDepth(pgno, 0)
 }

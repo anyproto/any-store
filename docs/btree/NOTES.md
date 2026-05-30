@@ -2357,21 +2357,6 @@ platform-dependent. The consequence is that on a 64-bit target the behavior is
 practically equivalent, but on a 32-bit target the total is 32-bit and could overflow for
 a very large tree, whereas SQLite is always `i64`.
 
-<a id="drift-20-freetreepages-frees-root-page-versus-cleardatabasepage-clear"></a>
-### Drift: freeTreePages Frees Root Page Versus clearDatabasePage Clear Semantics
-- **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `db.go:*DB.freeTreePages` (`db.go:1041`).
-
-The mapped C function `clearDatabasePage` is the engine behind
-`sqlite3BtreeClearTable`, invoked with `freePageFlag=0` for the table root
-(`btree.c:10296`): the root is not freed but zeroed and kept as an empty root page
-(`btree.c:10258-10262`), only its child pages being freed with `freePageFlag=1`. Go's
-`freeTreePages` (`db.go:989-1042`) ends unconditionally with
-`return db.pager.freePage(pgno)` (`db.go:1041`) for every page, including the root, with
-no `freePageFlag` distinction. The consequence is a behavioral mismatch with the named
-mapping: Go implements drop-table semantics (root freed) where the mapped
-`clearDatabasePage` implements clear-table semantics (root retained).
-
 <a id="drift-22-removechildfromparent-rightchild-dangling-pointer-and-double"></a>
 ### Drift: removeChildFromParent rightChild Dangling Pointer And Double Free
 - **Category:** changed-logic  -  **Severity:** medium
