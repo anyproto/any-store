@@ -2400,21 +2400,6 @@ The consequence is a dangling rightChild pointer into a freed page, which downst
 (`finishParentRemoval` `btree.go:2996-3005`, `collapseSingleChild` `btree.go:3031-3067`)
 can turn into a double-free on the root, corrupting the freelist.
 
-<a id="drift-24-delete-fast-path-validates-cell-bounds-against-full-page-not"></a>
-### Drift: Delete Fast Path Validates Cell Bounds Against Full Page Not usableSize
-- **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `btree.go:*btree.Delete` (`internal/btree/btree.go:2399-2405 (parseLeafCellWithSize bounds against dataLen=pageSize, not usableSize)`).
-
-SQLite's `dropCell` explicitly rejects a cell whose content runs past the usable region:
-`if( pc+sz > pPage->pBt->usableSize ) *pRC = SQLITE_CORRUPT_BKPT`
-(`btree.c:7291-7294`). Go's `Delete` fast path parses the deleted cell via
-`parseLeafCellWithSize` (`btree.go:2401`), whose bounds checks compare offsets against
-`dataLen = len(page.data)`, and the page buffer is always allocated at the full
-`pageSize` (not `usableSize`) (`btree.go:2399-2405`). The consequence is that Go validates
-against full page size and so drops SQLite's reserved-region corruption check: a cell that
-extends into the reserved tail (past `usableSize` but within `pageSize`) is accepted
-instead of being rejected as `ErrCorrupt`.
-
 <a id="drift-26-leaf-cell-size-missing-four-byte-minimum-clamp"></a>
 ### Drift: Leaf Cell Size Missing Four Byte Minimum Clamp
 - **Category:** changed-logic  -  **Severity:** low

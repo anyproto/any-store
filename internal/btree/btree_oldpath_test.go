@@ -1067,3 +1067,33 @@ func TestOldPath_InsertIntoParent_GetPageError(t *testing.T) {
 	// Restore root for cleanup
 	bt.rootPage = realRoot
 }
+
+// TestDelCurCov_DeleteCellPastUsableSize exercises the reserved-region bounds
+// guard in Delete that mirrors SQLite's dropCell (btree.c:7291-7294):
+//
+//	if( pc+sz > pPage->pBt->usableSize ){ *pRC = SQLITE_CORRUPT_BKPT; return; }
+//
+// We insert a single cell, then artificially shrink the pager's usable size so
+// the (otherwise valid) cell now extends into the reserved/codec tail. Delete
+// must reject it with ErrCorrupt before any freeSpace/fragmentation accounting.
+func TestDelCurCov_DeleteCellPastUsableSize(t *testing.T) {
+	p := tempPager(t)
+	bt := initLeafBtree(t, p)
+
+	key := binary.BigEndian.AppendUint32(nil, 1)
+	pg, err := p.getWritablePage(bt.rootPage)
+	require.NoError(t, err)
+	require.NoError(t, bt.insertIntoPage(pg, key, make([]byte, 40)))
+	cellOff := int(pg.getCellOffset(0))
+	_, cellSize, perr := parseLeafCellWithSize(pg.data, cellOff, p.usableSize())
+	require.NoError(t, perr)
+	p.releasePage(pg)
+
+	// Shrink usable size so the existing cell's end runs into the reserved tail.
+	origUsable := p.usableSize_
+	p.usableSize_ = cellOff + cellSize - 1
+	t.Cleanup(func() { p.usableSize_ = origUsable })
+
+	err = bt.Delete(key)
+	require.ErrorIs(t, err, ErrCorrupt)
+}

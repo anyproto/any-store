@@ -2486,7 +2486,6 @@ func (bt *btree) insertIntoInterior(pg *page, key, value []byte) error {
 //
 // When fragmentation exceeds the threshold (60 bytes, matching SQLite's limit),
 // a full rebuild is triggered to defragment the page.
-// DRIFT: delete fast path checks cell bounds vs page size not usableSize (reserved region) See docs/btree/NOTES.md#drift-24-delete-fast-path-validates-cell-bounds-against-full-page-not
 func (bt *btree) Delete(key []byte) error {
 	// Phase 1: Read-only descent to find the leaf
 	pg, err := bt.getPage(bt.rootPage)
@@ -2536,6 +2535,15 @@ func (bt *btree) Delete(key []byte) error {
 	if cerr != nil {
 		bt.pager.releasePage(wpg)
 		return cerr
+	}
+
+	// Reject a cell whose content runs into the reserved/codec tail
+	// [usableSize, pageSize) before freeSpace/fragmentation accounting runs.
+	// Mirrors SQLite's dropCell (btree.c:7291-7294):
+	//   if( pc+sz > pPage->pBt->usableSize ){ *pRC = SQLITE_CORRUPT_BKPT; return; }
+	if cellOff+oldCellSize > usableSize {
+		bt.pager.releasePage(wpg)
+		return ErrCorrupt
 	}
 
 	n := int(wpg.header.cellCount)
