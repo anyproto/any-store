@@ -1326,6 +1326,104 @@ func TestRollbackCleanupAcrossSegments(t *testing.T) {
 		"segment-0 frame 200 must still be reachable")
 }
 
+// TestRollbackReadvanceTrailingSegmentConsistency pins the wal-index hash
+// consistency invariant across an mxFrame DECREASE followed by a RE-ADVANCE
+// into a trailing segment that shmCleanupFromFrame wholesale-zeroed.
+//
+// This is the load-bearing equivalence behind drift-95
+// (docs/btree/NOTES.md#drift-95-shmcleanupfromframe-zeros-all-segments-above-target):
+// SQLite's walCleanupHash cleans only the boundary segment and relies on
+// walIndexAppend's idx==1 memset (wal.c:1315-1319) to lazily re-clear higher
+// segments when they are reused on re-advance. any-store deliberately omits
+// that idx==1 zero-init (drift-91) and instead eagerly scrubs every trailing
+// segment in shmCleanupFromFrame. For the two strategies to be observationally
+// equivalent, after mxFrame decreases past a segment boundary and then
+// re-advances back into that same (now-reused) segment, hash reads must be
+// exactly correct.
+//
+// The adversarial shape that distinguishes eager-scrub from a no-op is a
+// PARTIAL re-advance: gen2 re-advances mxFrame far enough to make a stale gen1
+// slot's frame fall back within [minFrame, maxFrame], but writes FEWER frames
+// than gen1, so it does NOT overwrite the trailing gen1 aPgno[idx]. Without the
+// trailing-segment scrub, that surviving aPgno[idx]+aHash slot would resurrect
+// a rolled-back page (exactly the corruption C's idx==1 memset prevents lazily
+// and the EXPENSIVE_ASSERT at wal.c:1277-1286 guards). With the scrub, the slot
+// is zeroed, so the read is correct. This test FAILS if the trailing-segment
+// wholesale-zero is removed.
+func TestRollbackReadvanceTrailingSegmentConsistency(t *testing.T) {
+	wi := &walIndex{
+		shm:       newHeapShm(),
+		pageMap:   make(map[uint32][]uint32),
+		inProcess: false,
+	}
+
+	// Commit one frame at the very end of segment 0 so the next frame spills
+	// into trailing segment 1 (the wholesale-zeroed case in
+	// shmCleanupFromFrame, target <= iZero).
+	committed := uint32(htNPageOne)
+	wi.shmHashWrite(100, committed)
+	wi.maxFrame.Store(committed)
+
+	// First generation: spill FOUR frames into trailing segment 1 at indices
+	// 0..3 (frames committed+1..committed+4), then roll them all back.
+	gen1 := []uint32{300, 400, 500, 600}
+	for i, pgno := range gen1 {
+		wi.shmHashWrite(pgno, committed+1+uint32(i))
+	}
+	wi.maxFrame.Store(committed + uint32(len(gen1)))
+
+	// Sanity: first-generation frames are present before rollback.
+	for _, pgno := range gen1 {
+		require.NotZero(t, wi.shmHashGet(pgno, wi.maxFrame.Load(), 1),
+			"gen1 page %d should be present pre-rollback", pgno)
+	}
+
+	// mxFrame DECREASE: roll back to the boundary. shmCleanupFromFrame
+	// wholesale-zeroes trailing segment 1.
+	wi.rollbackToFrame(committed)
+	require.Equal(t, committed, wi.maxFrame.Load(), "rollback must restore mxFrame")
+
+	// mxFrame RE-ADVANCE, but only PARTIALLY: write TWO frames (gen2) into
+	// segment-1 indices 0..1 (frames committed+1, committed+2). This overwrites
+	// only gen1's first two aPgno slots; gen1's pages 500 (idx 2, frame
+	// committed+3) and 600 (idx 3, frame committed+4) are NOT overwritten.
+	gen2 := []uint32{700, 800}
+	for i, pgno := range gen2 {
+		wi.shmHashWrite(pgno, committed+1+uint32(i))
+	}
+	// Advance mxFrame to committed+4 — far enough that the stale gen1 frames
+	// for pages 500 and 600 (committed+3, committed+4) would be IN RANGE and
+	// thus resurrectable by shmHashGet if their slots were not scrubbed.
+	wi.maxFrame.Store(committed + 4)
+	maxF := wi.maxFrame.Load()
+
+	// Re-advanced gen2 frames resolve to their new frame numbers.
+	for i, pgno := range gen2 {
+		want := committed + 1 + uint32(i)
+		assert.Equal(t, want, wi.shmHashGet(pgno, maxF, 1),
+			"re-advanced page %d must resolve to its new frame", pgno)
+	}
+
+	// THE INVARIANT: rolled-back gen1 pages whose slots were NOT overwritten by
+	// the partial re-advance (500, 600) must still be invisible. Their frames
+	// (committed+3, committed+4) are <= maxF, so only the eager trailing-segment
+	// scrub keeps them from being resurrected. A no-op scrub fails here.
+	assert.Equal(t, uint32(0), wi.shmHashGet(500, maxF, 1),
+		"rolled-back page 500 must not be resurrected by partial re-advance")
+	assert.Equal(t, uint32(0), wi.shmHashGet(600, maxF, 1),
+		"rolled-back page 600 must not be resurrected by partial re-advance")
+
+	// Overwritten gen1 pages (300, 400) likewise stay invisible.
+	assert.Equal(t, uint32(0), wi.shmHashGet(300, maxF, 1),
+		"rolled-back page 300 must not be resurrected after re-advance")
+	assert.Equal(t, uint32(0), wi.shmHashGet(400, maxF, 1),
+		"rolled-back page 400 must not be resurrected after re-advance")
+
+	// Boundary-segment committed frame is untouched throughout.
+	assert.Equal(t, committed, wi.shmHashGet(100, maxF, 1),
+		"boundary-segment committed page 100 must remain reachable")
+}
+
 // clearHeaderForTest zeroes the shm header so the next reader's
 // readHeader() returns valid=false and ensureHeaderInitialized takes
 // the slow path. Test-only helper.
