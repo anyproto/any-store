@@ -2393,23 +2393,6 @@ no `freePageFlag` distinction. The consequence is a behavioral mismatch with the
 mapping: Go implements drop-table semantics (root freed) where the mapped
 `clearDatabasePage` implements clear-table semantics (root retained).
 
-<a id="drift-21-empty-page-delete-does-not-cascade-underfullness-upward"></a>
-### Drift: Empty Page Delete Does Not Cascade Underfullness Upward
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `btree.go:*btree.Delete` (`internal/btree/btree.go:2493-2499 (empty-leaf path) and btree.go:2984-3007 (finishParentRemoval, no completeMergeUpward)`), `btree.go:*btree.removeChildFromParent` (`internal/btree/btree.go:2996-3006 (finishParentRemoval returns without cascading a non-root 0-cell interior)`).
-
-When a delete empties a non-root leaf, Go takes a dedicated fast path
-(`btree.go:2493-2499`) that releases the leaf, calls `pager.freePage(leafPgno)`, then
-`removeChildFromParent -> finishParentRemoval` (`btree.go:2984-3007`), which removes the
-divider and rebuilds the parent in place. If that non-root parent drops to 0 cells,
-`finishParentRemoval` rebuilds it as a degenerate single-child interior
-(`rebuildInteriorPage`, `btree.go:3000`) and simply returns, with no upward cascade.
-SQLite instead runs a `balance()` do-loop (`btree.c:9250-9258`) that propagates a merge /
-under-fullness from the emptied page up through every ancestor to the root. The
-consequence is that Go can leave a chain of degenerate single-child or under-full
-interior pages along the deletion path that SQLite would have merged away, producing a
-structurally looser (taller, sparser) tree than SQLite.
-
 <a id="drift-22-removechildfromparent-rightchild-dangling-pointer-and-double"></a>
 ### Drift: removeChildFromParent rightChild Dangling Pointer And Double Free
 - **Category:** changed-logic  -  **Severity:** medium

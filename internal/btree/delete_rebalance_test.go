@@ -376,3 +376,131 @@ func TestDeleteRebalance_RootCollapse(t *testing.T) {
 	require.NoError(t, gerr)
 	require.Len(t, got, 20)
 }
+
+// assertNoDegenerateInterior walks the tree and fails if any NON-root interior
+// page has zero divider cells (i.e. a single child via rightChild only). Such a
+// "degenerate single-child interior" is the structural debt the empty-leaf
+// delete path could leave behind: when it removed a leaf and the parent dropped
+// to 0 cells, the old code returned without cascading that 0-cell/underfull
+// state upward (drift-21), so the looser node survived along the deletion path.
+// SQLite's balance() do-loop never persists such a node — it carries the
+// single-child parent up and pools it under its grandparent (btree.c:9250-9255).
+// The fix routes the emptied parent through completeMergeUpward, exactly like the
+// underfull-leaf path, eliminating the degenerate node.
+func assertNoDegenerateInterior(t *testing.T, bt *btree, pgno uint32, isRoot bool) {
+	t.Helper()
+	pg, err := bt.getPage(pgno)
+	require.NoError(t, err)
+	defer bt.pager.releasePage(pg)
+
+	if !pg.header.isInterior() {
+		return
+	}
+
+	if !isRoot {
+		require.NotZero(t, int(pg.header.cellCount),
+			"non-root interior page %d has 0 divider cells (degenerate single-child interior)", pgno)
+	}
+
+	cells, cerr := bt.collectInteriorCells(pg)
+	require.NoError(t, cerr)
+	for _, c := range cells {
+		assertNoDegenerateInterior(t, bt, c.leftChild, false)
+	}
+	assertNoDegenerateInterior(t, bt, pg.header.rightChild, false)
+}
+
+// TestDeleteRebalance_EmptyLeafCascade is a structural-tightness guard for the
+// drift-21 fix: after the empty-leaf delete path (Delete's cellCount==0 branch)
+// frees a leaf and removes it from its parent, the parent's own resulting
+// 0-cell/underfull state must be cascaded upward via completeMergeUpward —
+// exactly as the underfull-leaf path does — so no degenerate single-child
+// non-root interior is ever left behind (the looser-tree consequence of
+// drift-21; see assertNoDegenerateInterior). It runs a heavy delete workload
+// over a multi-level tree and asserts: (1) every key but the survivors is gone
+// with no lost/duplicated cells (scan parity), (2) no non-root interior survives
+// with 0 dividers (direct walk), and (3) IntegrityCheck (equal child-page depth)
+// passes.
+func TestDeleteRebalance_EmptyLeafCascade(t *testing.T) {
+	// 512-byte pages (the minimum) give a low leaf fanout, so the tree is
+	// multi-level and deletes empty whole leaves rather than only thinning them.
+	db := tempDBWithPageSize(t, 512)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace("t1")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	// Build a multi-level (depth>=3) tree. Mid-size values lower the leaf fanout
+	// so the tree is deeper (more interior levels exercised by the cascade).
+	const total = 2000
+	putN(t, db, "t1", total, 40)
+	require.NoError(t, db.IntegrityCheck(), "integrity after insert")
+
+	rootOf := func() uint32 {
+		ns, nerr := db.getNamespaceLocked("t1")
+		require.NoError(t, nerr)
+		return ns.rootPage
+	}
+	depthOf := func() int {
+		rtx, rerr := db.BeginRead()
+		require.NoError(t, rerr)
+		defer func() { _ = rtx.Rollback() }()
+		ns2, _ := db.getNamespaceLocked("t1")
+		bt := &btree{pager: db.pager, rootPage: ns2.rootPage, walMaxFrame: rtx.walMaxFrame}
+		return measureTreeDepth(t, bt, bt.rootPage)
+	}
+	require.GreaterOrEqual(t, depthOf(), 3, "need a multi-level tree to exercise the upward cascade")
+
+	// Keep only every 7th key. Deleting 6 of every 7 keys drives leaves down to
+	// (and through) empty and repeatedly empties/under-fills their parents —
+	// exercising the upward cascade the fix must propagate.
+	keep := func(i int) bool { return i%7 == 0 }
+	survivors := make([][]byte, 0, total/7+1)
+	for i := 1; i <= total; i++ {
+		if keep(i) {
+			survivors = append(survivors, binary.BigEndian.AppendUint32(nil, uint32(i)))
+		}
+	}
+	sort.Slice(survivors, func(a, b int) bool {
+		return bytes.Compare(survivors[a], survivors[b]) < 0
+	})
+
+	tx, err = db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := db.getNamespaceLocked("t1")
+	require.NoError(t, err)
+	for i := 1; i <= total; i++ {
+		if !keep(i) {
+			require.NoError(t, tx.Delete(ns, binary.BigEndian.AppendUint32(nil, uint32(i))))
+		}
+	}
+	require.NoError(t, tx.Commit())
+
+	// (3) Equal-depth + structural integrity.
+	require.NoError(t, db.IntegrityCheck(), "integrity after delete (equal-depth validator)")
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+	ns2, err := db.getNamespaceLocked("t1")
+	require.NoError(t, err)
+	bt := &btree{pager: db.pager, rootPage: ns2.rootPage, walMaxFrame: rtx.walMaxFrame}
+
+	// (2) No degenerate single-child non-root interior survived.
+	assertNoDegenerateInterior(t, bt, rootOf(), true)
+
+	// (1) Forward scan == sorted survivor set (no lost or duplicated cells).
+	cur := rtx.NewCursor(ns2)
+	fwd := make([][]byte, 0, len(survivors))
+	for cerr := cur.First(); cerr == nil && cur.Valid(); cerr = cur.Next() {
+		k, kerr := cur.Key()
+		require.NoError(t, kerr)
+		fwd = append(fwd, bytes.Clone(k))
+	}
+	require.Equal(t, len(survivors), len(fwd), "forward scan count")
+	for i := range survivors {
+		require.True(t, bytes.Equal(survivors[i], fwd[i]), "scan key mismatch at %d", i)
+	}
+}

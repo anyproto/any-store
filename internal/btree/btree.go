@@ -2434,7 +2434,6 @@ func (bt *btree) insertIntoInterior(pg *page, key, value []byte) error {
 //
 // When fragmentation exceeds the threshold (60 bytes, matching SQLite's limit),
 // a full rebuild is triggered to defragment the page.
-// DRIFT: empty-leaf delete doesn't cascade parent under-fullness/0-cell interior upward See docs/btree/NOTES.md#drift-21-empty-page-delete-does-not-cascade-underfullness-upward
 // DRIFT: emptied root leaf keeps stale cellContentOff/fragBytes; C resets pristine See docs/btree/NOTES.md#drift-23-emptied-root-leaf-not-reset-to-pristine-empty-page
 // DRIFT: delete fast path checks cell bounds vs page size not usableSize (reserved region) See docs/btree/NOTES.md#drift-24-delete-fast-path-validates-cell-bounds-against-full-page-not
 func (bt *btree) Delete(key []byte) error {
@@ -2583,7 +2582,16 @@ func (bt *btree) Delete(key []byte) error {
 		if err := bt.pager.freePage(leafPgno); err != nil {
 			return err
 		}
-		return bt.removeChildFromParent(leafPgno, path)
+		if err := bt.removeChildFromParent(leafPgno, path); err != nil {
+			return err
+		}
+		// Cascade the parent's own under-fullness/0-cell state upward, exactly
+		// as deleteRebalanceLeaf does after balanceNonroot (above), mirroring
+		// SQLite's balance() do-loop walking iPage up (btree.c:9250-9255).
+		// removeChildFromParent -> finishParentRemoval always releases the parent
+		// pin, so completeMergeUpward can re-acquire it fresh via getWritablePage.
+		parentEntry := path[len(path)-1]
+		return bt.completeMergeUpward(parentEntry.pgno, path[:len(path)-1])
 	}
 
 	// Underfull (but non-empty) non-root leaf: funnel it through the general
@@ -3022,7 +3030,6 @@ func (bt *btree) removeMergedRightSeparator(parentPgno uint32, childIdx int, kee
 }
 
 // removeChildFromParent removes a child page reference from its parent interior page.
-// DRIFT: empty-leaf delete doesn't cascade parent under-fullness/0-cell interior upward See docs/btree/NOTES.md#drift-21-empty-page-delete-does-not-cascade-underfullness-upward
 // DRIFT: removeChildFromParent rightChild branch leaves dangling ptr / double-free See docs/btree/NOTES.md#drift-22-removechildfromparent-rightchild-dangling-pointer-and-double
 func (bt *btree) removeChildFromParent(childPgno uint32, path []pathEntry) error {
 	if len(path) == 0 {
