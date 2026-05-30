@@ -102,6 +102,48 @@ func TestPcacheMakeCleanPinned(t *testing.T) {
 	assert.Equal(t, pg.pinCount, 0)
 }
 
+// TestPcacheMakeCleanUnpinnedNonPurgeable asserts that cleaning an unpinned
+// page in a non-purgeable (InMemory) cache leaves it OFF the LRU/recyclable
+// set. Mirrors SQLite sqlite3PcacheMakeClean (pcache.c:622-624), whose
+// trailing pcacheUnpin (pcache.c:265-271) is a no-op for non-purgeable caches.
+func TestPcacheMakeCleanUnpinnedNonPurgeable(t *testing.T) {
+	pc := newPcache(4096, 100, false) // non-purgeable (InMemory)
+
+	pg := pc.create(1, 2)
+	pc.makeDirty(pg)
+	pc.release(pg) // unpinned; dirty pages stay off LRU
+	assert.Equal(t, 0, pg.pinCount)
+	assert.True(t, pg.dirty)
+	assert.Equal(t, 1, pc.nDirty)
+	assert.Equal(t, 0, pc.nRecyclable)
+	assert.Nil(t, pc.lruHead)
+
+	// makeClean of the unpinned page in a non-purgeable cache must NOT add it
+	// to the LRU (matching C's pcacheUnpin no-op).
+	pc.makeClean(pg)
+	assert.False(t, pg.dirty)
+	assert.Equal(t, 0, pc.nDirty)
+	assert.Equal(t, 0, pc.nRecyclable)
+	assert.Nil(t, pc.lruHead)
+}
+
+// TestPcacheMakeCleanUnpinnedPurgeable is the companion case: a purgeable
+// cache DOES place a cleaned unpinned page onto the LRU/recyclable set.
+func TestPcacheMakeCleanUnpinnedPurgeable(t *testing.T) {
+	pc := newPcache(4096, 100, true) // purgeable
+
+	pg := pc.create(1, 2)
+	pc.makeDirty(pg)
+	pc.release(pg) // unpinned; dirty pages stay off LRU until cleaned
+	assert.Equal(t, 0, pg.pinCount)
+	assert.Equal(t, 0, pc.nRecyclable)
+
+	pc.makeClean(pg)
+	assert.False(t, pg.dirty)
+	assert.Equal(t, 1, pc.nRecyclable)
+	assert.Equal(t, pg, pc.lruHead)
+}
+
 func TestPcacheLRUEviction(t *testing.T) {
 	pc := newPcache(4096, 3, true) // max 3 pages
 

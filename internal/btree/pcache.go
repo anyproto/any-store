@@ -495,7 +495,6 @@ func (pc *pcache) makeDirty(p *page) {
 }
 
 // makeClean marks a page as clean (after writing to disk).
-// DRIFT: makeClean LRU insert missing release()'s non-purgeable (pcacheUnpin) guard See docs/btree/NOTES.md#drift-128-makeclean-lru-insert-missing-non-purgeable-guard
 func (pc *pcache) makeClean(p *page) {
 	if p.dirty {
 		p.dirty = false
@@ -513,7 +512,12 @@ func (pc *pcache) makeClean(p *page) {
 		p.next = nil
 		p.prev = nil
 		pc.nDirty--
-		if p.pinCount == 0 {
+		// Non-purgeable caches (InMemory) skip the LRU entirely — pages are
+		// never evicted, so a cleaned unpinned page is left off the LRU.
+		// Mirrors release()'s guard above and matches SQLite
+		// sqlite3PcacheMakeClean (pcache.c:622-624), whose trailing
+		// pcacheUnpin (pcache.c:265-271) is a no-op for non-purgeable caches.
+		if p.pinCount == 0 && pc.purgeable {
 			pc.lruPrepend(p)
 		}
 	}

@@ -3681,19 +3681,6 @@ strict `sqlite3PcachePagecount(pCache) > pCache->szSpill` (`pcache.c:453`) while
 Go's cache begins recycling and spilling slightly sooner than SQLite, a subtle eviction-timing difference that could
 affect cache occupancy and spill frequency under memory pressure.
 
-<a id="drift-128-makeclean-lru-insert-missing-non-purgeable-guard"></a>
-### Drift: makeClean LRU Insert Missing Non Purgeable Guard
-- **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `pcache.go:*pcache.makeClean` (`pcache.go:512`).
-
-C's `sqlite3PcacheMakeClean` ends with `if(p->nRef==0) pcacheUnpin(p)` (`pcache.c:622-624`), and `pcacheUnpin`
-(`pcache.c:265-271`) is a no-op for non-purgeable caches (`if(p->pCache->bPurgeable){ ... }`), so cleaning a page in a
-non-purgeable (InMemory) cache leaves it OUT of the LRU/recyclable list. Go's `makeClean` (`pcache.go:512-514`) instead
-does `if p.pinCount == 0 { pc.lruPrepend(p) }` with no `pc.purgeable` guard — unlike the companion `release()`
-(`pcache.go:458`), which correctly guards the identical LRU insert with `else if pc.purgeable`. The consequence is that
-in a non-purgeable cache Go can prepend a cleaned page onto the LRU list where SQLite would not, making it eligible for
-recycling/eviction in a mode where SQLite keeps such pages pinned out of the recyclable set.
-
 <a id="drift-129-resetpage-zeroes-buffer-on-every-page-creation"></a>
 ### Drift: resetPage Zeroes Buffer On Every Page Creation
 - **Category:** changed-logic  -  **Severity:** low
