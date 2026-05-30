@@ -272,7 +272,6 @@ func shmLockOffset(slot int) int64 {
 }
 
 // fcntlLock performs a POSIX fcntl lock operation on a 1-byte range.
-// DRIFT: fcntlLock maps only EACCES/EAGAIN to ErrBusy; C maps all fcntl errors to BUSY See docs/btree/NOTES.md#drift-82-fcntllock-maps-only-eacces-eagain-to-busy
 func (s *mmapShm) fcntlLock(lockType int, offset int64) error {
 	if s.file == nil {
 		return fmt.Errorf("btree: shm file closed")
@@ -289,7 +288,15 @@ func (s *mmapShm) fcntlLock(lockType int, offset int64) error {
 		uintptr(syscall.F_SETLK),
 		uintptr(unsafe.Pointer(&flock)))
 	if errno != 0 {
-		if errno == syscall.EACCES || errno == syscall.EAGAIN {
+		// Mirror sqliteErrorFromPosixError (os_unix.c:1029-1038): the documented
+		// set of transient/NFS-retry errnos that SQLite collapses to SQLITE_BUSY
+		// so the WAL busy-handler loop retries instead of aborting. EPERM is
+		// intentionally excluded (SQLite maps it to SQLITE_PERM), and genuine
+		// hard errors (EBADF/EFAULT) keep returning the wrapped error to surface
+		// closed-fd bugs.
+		switch errno {
+		case syscall.EACCES, syscall.EAGAIN, syscall.ETIMEDOUT,
+			syscall.EBUSY, syscall.EINTR, syscall.ENOLCK:
 			return ErrBusy
 		}
 		return fmt.Errorf("btree: fcntl lock: %w", errno)

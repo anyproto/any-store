@@ -3191,21 +3191,6 @@ SHARED lock that SQLite treats as a free no-op instead bumps the shared refcount
 lock/unlock accounting can drift from SQLite's behavior when a connection re-requests a lock it
 already holds.
 
-<a id="drift-82-fcntllock-maps-only-eacces-eagain-to-busy"></a>
-### Drift: fcntlLock Maps Only EACCES EAGAIN To Busy
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `shm_mmap.go:*mmapShm.fcntlLock` (`internal/btree/shm_mmap.go:253-258`).
-
-C's `unixShmSystemLock` unconditionally treats ANY `fcntl` failure as retryable: it returns the
-fcntl result and `if(res==-1){ rc = SQLITE_BUSY; }` (`os_unix.c:4751-4758`) with no errno inspection
-at all, so `EINTR`, `ENOLCK`, `EDEADLK`, `EACCES`, and `EAGAIN` all collapse to `SQLITE_BUSY` that
-the WAL busy-handler loop then retries. Go's `fcntlLock` instead inspects errno and maps ONLY
-`syscall.EACCES`/`syscall.EAGAIN` to `ErrBusy`; every other errno returns a generic wrapped error
-`fmt.Errorf("btree: fcntl lock: %w", errno)` (`shm_mmap.go:253-258`). The consequence is that
-transient or otherwise-retryable lock failures (e.g. `EINTR`, `ENOLCK`) become hard, non-retryable
-errors in Go that abort the operation, where SQLite would have transparently retried them via the
-busy handler.
-
 <a id="drift-84-shm-region-extension-uses-sparse-ftruncate-reintroducing-sig"></a>
 ### Drift: SHM Region Extension Uses Sparse ftruncate Reintroducing SIGBUS Risk
 - **Category:** changed-logic  -  **Severity:** medium
