@@ -2436,23 +2436,6 @@ against full page size and so drops SQLite's reserved-region corruption check: a
 extends into the reserved tail (past `usableSize` but within `pageSize`) is accepted
 instead of being rejected as `ErrCorrupt`.
 
-<a id="drift-25-updateleafcell-in-place-overwrite-uses-255-byte-fragmentatio"></a>
-### Drift: updateLeafCell In Place Overwrite Uses 255 Byte Fragmentation Cap
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `btree.go:*btree.Put` (`btree.go:1388`), `btree.go:*btree.updateLeafCell` (`internal/btree/btree.go:1389`), `db.go:*WriteTx.Put` (`internal/btree/btree.go:1389`).
-
-On a same-key `Put` that shrinks a cell, the live update path (`*btree.Put` ->
-`insertIntoLeafWithPath` -> `updateLeafCell`) overwrites the new data in place and treats
-the leftover bytes (`waste = oldCellSize - newCellSize`) as page fragmentation, computing
-`newFrag := int(pg.header.fragBytes) + waste` and taking the in-place branch whenever
-`newFrag <= 255` (`btree.go:1386-1397`). That `255` is just the saturation point of the
-uint8 `fragBytes` header field, not SQLite's defragmentation trigger: SQLite forces a
-`defragmentPage` rebuild once fragmentation reaches roughly 57-60 bytes. The cap is also
-internally inconsistent with the Delete path, which uses a 60-byte threshold. The
-consequence is that Go lets a leaf page accumulate up to 255 bytes of dead space before
-ever compacting it, so repeated shrinking same-key updates leave pages far more fragmented
-(and free-space far more scattered) than SQLite would tolerate.
-
 <a id="drift-26-leaf-cell-size-missing-four-byte-minimum-clamp"></a>
 ### Drift: Leaf Cell Size Missing Four Byte Minimum Clamp
 - **Category:** changed-logic  -  **Severity:** low

@@ -1117,7 +1117,6 @@ func (bt *btree) Has(key []byte) (bool, error) {
 const maxKeySize = 1 << 30 // 1GB
 
 // Put inserts or updates a key-value pair in the B-tree.
-// DRIFT: updateLeafCell in-place uses 255-byte frag cap vs SQLite's ~57-60 defrag trigger See docs/btree/NOTES.md#drift-25-updateleafcell-in-place-overwrite-uses-255-byte-fragmentatio
 func (bt *btree) Put(key, value []byte) error {
 	// Validate key size. Both leaf and interior cells support overflow,
 	// so this is just a sanity limit to prevent absurd allocations.
@@ -1354,7 +1353,6 @@ func (bt *btree) insertLeafCellAt(pg *page, idx int, key, value []byte) error {
 // using the path for parent propagation. This mirrors SQLite's approach in
 // sqlite3BtreeInsert (btree.c): dropCell + insertCell, then balance() if the
 // page overflows.
-// DRIFT: updateLeafCell in-place uses 255-byte frag cap vs SQLite's ~57-60 defrag trigger See docs/btree/NOTES.md#drift-25-updateleafcell-in-place-overwrite-uses-255-byte-fragmentatio
 func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []pathEntry) error {
 	usableSize := bt.usablePageSize()
 
@@ -1400,10 +1398,15 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []pat
 
 		// Account for wasted space as fragmentation.
 		// SQLite tracks fragmentation in the page header's fragBytes field.
+		// SQLite's fragmentation budget is 60 bytes: pageFindSlot refuses to
+		// reuse a sub-4-byte slot once that would push fragBytes past 60
+		// (btree.c:1755 "may not exceed 60", btree.c:1780 aData[hdr+7]>57).
+		// Cap the in-place overwrite at the same limit so it matches both
+		// SQLite and the Delete path's threshold (btree.go:2508).
 		waste := oldCellSize - newCellSize
 		if waste > 0 {
 			newFrag := int(pg.header.fragBytes) + waste
-			if newFrag <= 255 {
+			if newFrag <= 60 {
 				pg.header.fragBytes = uint8(newFrag)
 				hdrOff := 0
 				if pg.pgno == 1 {
