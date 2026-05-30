@@ -3082,26 +3082,6 @@ and no error if they differ. The consequence is a buffer-pool size mismatch: the
 header-sized pages, so opening a file whose real page size differs from the caller's option yields
 mis-sized page buffers rather than the clean error SQLite would raise.
 
-<a id="drift-65-open-trusts-header-databasesize-without-reconciling-file-siz"></a>
-### Drift: Open Trusts Header DatabaseSize Without Reconciling File Size
-- **Category:** changed-logic  -  **Severity:** high
-- **Affected functions:** `page.go:*dbHeader.deserialize` (`internal/btree/pager.go:448`),
-  `pager.go:*pager.open` (`internal/btree/pager.go:448`).
-
-C's `lockBtree` cross-checks the header's page count against the actual file length: it reads
-`nPage=get4byte(28+aData)`, obtains the real file page count `nPageFile` via
-`sqlite3PagerPagecount`, falls back to `nPageFile` when the header counter is `0` or the
-change-counter sentinel looks stale (`btree.c:3304-3308`), and treats `nPage > nPageFile` as
-`SQLITE_CORRUPT_BKPT` (unless writable-schema), otherwise clamping `nPage=nPageFile`
-(`btree.c:3411-3418`) -- i.e. it refuses to trust a header claiming more pages than the file
-physically contains. Go's `deserialize` stores `DatabaseSize` verbatim and `open()` does
-`p.dbSize.Store(p.header.DatabaseSize)` straight from the header (`pager.go:448`), with the only
-later adjustment being a max-with-WAL bump (`if p.wal.index.maxPage.Load() > p.dbSize.Load()`);
-the lone `f.Stat()` call never reconciles the header against the file size. The consequence is
-that a corrupt or truncated header page count is trusted wholesale, so the pager can believe the
-database has more pages than the file actually holds -- reading past the real end of file rather
-than rejecting the file as corrupt the way SQLite does.
-
 <a id="drift-66-page-1-header-validation-missing-in-open-and-deserialize"></a>
 ### Drift: Page 1 Header Validation Missing In Open And Deserialize
 - **Category:** changed-logic  -  **Severity:** medium

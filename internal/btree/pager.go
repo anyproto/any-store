@@ -359,7 +359,6 @@ func (p *pager) recycleCellSlice(s []cellData) {
 }
 
 // open opens the database file, initializes the WAL, and recovers if needed.
-// DRIFT: open() trusts header DatabaseSize without file-size reconciliation/corruption check See docs/btree/NOTES.md#drift-65-open-trusts-header-databasesize-without-reconciling-file-siz
 // DRIFT: open()/deserialize skip lockBtree page-1 validations (21-23, 18/19, usable>=480, flags) See docs/btree/NOTES.md#drift-66-page-1-header-validation-missing-in-open-and-deserialize
 func (p *pager) open() error {
 	p.mu.Lock()
@@ -448,7 +447,24 @@ func (p *pager) open() error {
 
 	p.pageSize = p.header.PageSize
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
-	p.dbSize.Store(p.header.DatabaseSize)
+
+	// Reconcile the header page count against the physical file size,
+	// mirroring C lockBtree (btree.c:3304-3308). C derives nPageFile via
+	// sqlite3PagerPagecount and falls back to it when the header count is
+	// zero or the change-counter sentinel (FileChangeCount bytes 24-27 vs
+	// VersionValidFor bytes 92-95) mismatches. The VersionValidFor!=0
+	// mismatch is already rejected above; this fallback arm covers the
+	// nPage==0 / legacy-sentinel (VersionValidFor==0) case. When the header
+	// count is untrusted, clamp dbSize to the file page count (C sets
+	// nPage=nPageFile); a trusted-but-too-large header is rejected below
+	// after the WAL is opened, not here.
+	fileNPage := uint32((info.Size() + int64(p.pageSize) - 1) / int64(p.pageSize))
+	headerNPageTrusted := p.header.DatabaseSize != 0 && p.header.VersionValidFor == p.header.FileChangeCount
+	if headerNPageTrusted {
+		p.dbSize.Store(p.header.DatabaseSize)
+	} else {
+		p.dbSize.Store(fileNPage)
+	}
 	p.cellBuf = make([]byte, 0, p.usableSize_)
 	p.writerCache = newPcache(int(p.pageSize), p.writerCache.maxPages, p.writerCache.purgeable)
 	p.writerCache.useSlab = p.useSlab
@@ -486,6 +502,24 @@ func (p *pager) open() error {
 		// DatabaseSize than what survives in the WAL after recovery.
 		if p.wal.index.maxPage.Load() > p.dbSize.Load() {
 			p.dbSize.Store(p.wal.index.maxPage.Load())
+		}
+	}
+
+	// Reject a trusted header whose DatabaseSize exceeds the available pages,
+	// mirroring C lockBtree (btree.c:3411-3417): outside writable-schema mode
+	// (which any-store never enables) nPage>nPageFile is SQLITE_CORRUPT, not a
+	// clamp. nPageFile here is the file page count, but C's pagerPagecount
+	// (pager.c:3292) prefers the WAL-committed size when larger, so account
+	// for pages committed to the WAL but not yet checkpointed into the DB file
+	// to avoid false-positively rejecting WAL-extended databases.
+	if headerNPageTrusted {
+		walNPage := p.wal.index.maxPage.Load()
+		effectiveFileN := fileNPage
+		if walNPage > effectiveFileN {
+			effectiveFileN = walNPage
+		}
+		if p.header.DatabaseSize > effectiveFileN {
+			return fmt.Errorf("%w: header DatabaseSize=%d exceeds file pages=%d wal=%d", ErrCorrupt, p.header.DatabaseSize, fileNPage, walNPage)
 		}
 	}
 
