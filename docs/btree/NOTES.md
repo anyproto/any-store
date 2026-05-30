@@ -2357,20 +2357,6 @@ platform-dependent. The consequence is that on a 64-bit target the behavior is
 practically equivalent, but on a 32-bit target the total is 32-bit and could overflow for
 a very large tree, whereas SQLite is always `i64`.
 
-<a id="drift-22-removechildfromparent-rightchild-dangling-pointer-and-double"></a>
-### Drift: removeChildFromParent rightChild Dangling Pointer And Double Free
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `btree.go:*btree.removeChildFromParent` (`internal/btree/btree.go:2952-2964 (no-op when len(cells)==0); consequence at finishParentRemoval btree.go:2996-3005 and collapseSingleChild btree.go:3031-3067`).
-
-In `removeChildFromParent`'s rightChild-removal branch (`childIdx == len(cells)`), the
-code only repoints `rightChild` when `len(cells) > 0`:
-`if len(cells) > 0 { rightChild = cells[len-1].leftChild; cells = cells[:len-1] }`
-(`btree.go:2952-2964`). When `len(cells)==0` the branch is a no-op, so `rightChild` keeps
-pointing at `childPgno` -- the page the caller (`Delete`, `btree.go:2495`) already freed.
-The consequence is a dangling rightChild pointer into a freed page, which downstream
-(`finishParentRemoval` `btree.go:2996-3005`, `collapseSingleChild` `btree.go:3031-3067`)
-can turn into a double-free on the root, corrupting the freelist.
-
 <a id="drift-26-leaf-cell-size-missing-four-byte-minimum-clamp"></a>
 ### Drift: Leaf Cell Size Missing Four Byte Minimum Clamp
 - **Category:** changed-logic  -  **Severity:** low

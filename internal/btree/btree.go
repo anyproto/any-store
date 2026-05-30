@@ -3122,7 +3122,12 @@ func (bt *btree) removeMergedRightSeparator(parentPgno uint32, childIdx int, kee
 }
 
 // removeChildFromParent removes a child page reference from its parent interior page.
-// DRIFT: removeChildFromParent rightChild branch leaves dangling ptr / double-free See docs/btree/NOTES.md#drift-22-removechildfromparent-rightchild-dangling-pointer-and-double
+// DRIFT (hardened): the rightChild branch's 0-cell case is now a defensive
+// corruption guard (return ErrCorrupt) rather than a silent no-op that would leave
+// a dangling rightChild into a freed page and double-free it downstream. It is
+// defensively unreachable post delete-rebalance refactor — descendChild's
+// 0-cell-interior guard and the completeMergeUpward/deleteRebalanceInterior cascade
+// prevent descend-reachable 0-cell parents.
 func (bt *btree) removeChildFromParent(childPgno uint32, path []pathEntry) error {
 	if len(path) == 0 {
 		return nil
@@ -3169,6 +3174,21 @@ func (bt *btree) removeChildFromParent(childPgno uint32, path []pathEntry) error
 		if len(cells) > 0 {
 			rightChild = cells[len(cells)-1].leftChild
 			cells = cells[:len(cells)-1]
+		} else {
+			// 0-cell parent whose only child (rightChild) is the just-freed
+			// childPgno. SQLite's balance() treats this configuration as an
+			// asserted impossibility (a non-root single-child interior pointing
+			// at a freed page never persists: btree.c:9000-9004 frees surplus
+			// apOld pages only after editPage re-homes their cells, and the
+			// shallower collapse is isRoot-gated, btree.c:8960). Persisting the
+			// no-op would leave rightChild dangling at the freed page and
+			// double-free it downstream (collapseSingleChild getPage(freed) +
+			// freePage(freed)). Reject as corruption instead. Defensively
+			// unreachable: descendChild's 0-cell-interior guard and the
+			// completeMergeUpward/deleteRebalanceInterior cascade eliminate
+			// 0-cell parents in the same Delete before this branch can run.
+			bt.pager.releasePage(parentPg)
+			return ErrCorrupt
 		}
 	}
 

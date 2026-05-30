@@ -2644,6 +2644,43 @@ func TestRemoveChildFromParentNotFound(t *testing.T) {
 }
 
 // =============================================================================
+// removeChildFromParent — rightChild branch, 0-cell parent (drift-22 guard)
+// =============================================================================
+
+// TestRemoveChildFromParentRightChildZeroCells locks the hardened guard in
+// removeChildFromParent's rightChild branch (drift-22). A 0-cell interior page
+// whose only child (rightChild) is the page being removed is an asserted
+// impossibility in SQLite's balance() — persisting the no-op would leave
+// rightChild dangling at the freed page and double-free it downstream
+// (collapseSingleChild getPage(freed)+freePage(freed)). The branch must reject
+// with ErrCorrupt instead of silently writing the dangling pointer.
+//
+// Without the fix this returns nil (the len(cells)==0 no-op fell through and
+// finishParentRemoval persisted/collapsed the dangling rightChild).
+func TestRemoveChildFromParentRightChildZeroCells(t *testing.T) {
+	p := tempPager(t)
+	rootPg, err := p.allocatePage()
+	require.NoError(t, err)
+	childPg, err := p.allocatePage()
+	require.NoError(t, err)
+	// Non-root interior so we don't fall into the root-collapse path; the
+	// guard fires before finishParentRemoval regardless.
+	bt := &btree{pager: p, rootPage: rootPg.pgno + 1000, writable: true}
+
+	// Build a 0-cell interior page whose single child (rightChild) is childPg.
+	bt.rebuildInteriorPage(rootPg, nil, childPg.pgno)
+	bt.rebuildLeafPage(childPg, []cellData{{key: []byte("a"), value: []byte("1")}})
+	p.releasePage(rootPg)
+	p.releasePage(childPg)
+
+	// Path points at the rightChild slot: cellIdx == len(cells) == 0, and the
+	// child being removed (childPg) is exactly the rightChild. This is the
+	// dangling/double-free configuration the guard must reject.
+	err = bt.removeChildFromParent(childPg.pgno, []pathEntry{{pgno: rootPg.pgno, cellIdx: 0, nCell: 0}})
+	assert.ErrorIs(t, err, ErrCorrupt)
+}
+
+// =============================================================================
 // searchLeafPage — corruption branches
 // =============================================================================
 
