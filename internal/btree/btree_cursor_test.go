@@ -474,6 +474,173 @@ func TestDelCurCov_NonRootEmptyInterior(t *testing.T) {
 	require.Equal(t, 0, countKeys(t, db, "t1"))
 }
 
+// TestCursorEmptyInteriorRootInvariant pins the empty-interior-root invariant:
+// a cursor must never land on (or stop short at) a 0-cell interior ROOT that
+// carries a NON-empty subtree while a populated path exists. First/Next treat
+// a 0-cell interior as terminal-empty (by design — see
+// docs/btree/NOTES.md#drift-13-empty-interior-root-treated-as-empty-btree-not-corruption);
+// that is only safe because the production Delete path never persists such a
+// shape on a populated path. This test pins both halves of that contract:
+//
+//  1. The synthetic shape the by-design treatment relies on being unreachable:
+//     a hand-built 0-cell interior root whose rightChild leads to real data.
+//     We assert exactly how First/Next vs Last/Previous diverge on it, so the
+//     asymmetry is tested and any change to the terminal-empty treatment is
+//     caught here rather than silently dropping data in production.
+//
+//  2. The production invariant itself: a heavy, realistic delete cascade over a
+//     3-level tree, asserting after every commit that the full forward
+//     iteration (First+Next) returns the exact, complete remaining set. If any
+//     delete ever left a 0-cell interior root above live data on the leftmost
+//     path, First/Next would under-report here and the test would fail.
+func TestCursorEmptyInteriorRootInvariant(t *testing.T) {
+	// ---- Part 1: synthetic 0-cell interior root over a populated subtree ----
+	//
+	// Build the exact "legitimate degenerate interior" shape that
+	// IntegrityCheck accepts (integrity.go descends rightChild when nCells==0)
+	// and that Last descends: a 0-cell interior root whose rightChild is a leaf
+	// holding real keys. This shape is NOT produced by Delete; we construct it
+	// by hand purely to pin the documented First/Next-vs-Last asymmetry.
+	func() {
+		p := tempPager(t)
+		rootPg, err := p.allocatePage()
+		require.NoError(t, err)
+		leafPg, err := p.allocatePage()
+		require.NoError(t, err)
+
+		bt := &btree{pager: p, rootPage: rootPg.pgno, writable: true}
+
+		// Populate the leaf with real, ordered key/value pairs.
+		leafKeys := [][]byte{
+			binary.BigEndian.AppendUint32(nil, 1),
+			binary.BigEndian.AppendUint32(nil, 2),
+			binary.BigEndian.AppendUint32(nil, 3),
+		}
+		leafCells := make([]cellData, len(leafKeys))
+		for i, k := range leafKeys {
+			leafCells[i] = cellData{key: k, value: bytes.Repeat([]byte("v"), 8)}
+		}
+		require.NoError(t, bt.rebuildLeafPage(leafPg, leafCells))
+
+		// Root: 0-cell interior whose rightChild points at the populated leaf.
+		require.NoError(t, bt.rebuildInteriorPage(rootPg, nil, leafPg.pgno))
+		require.Equal(t, uint16(0), rootPg.header.cellCount)
+		require.True(t, rootPg.header.isInterior())
+
+		p.releasePage(leafPg)
+		p.releasePage(rootPg)
+
+		// Last descends rightChild and reaches the real data: the subtree is
+		// genuinely non-empty and reachable. This is the case the by-design
+		// First/Next treatment must never silently drop in production.
+		curLast := bt.NewCursor()
+		require.NoError(t, curLast.Last())
+		require.True(t, curLast.Valid(), "Last must descend a 0-cell interior root with a non-empty subtree")
+		k, err := curLast.Key()
+		require.NoError(t, err)
+		require.Equal(t, leafKeys[len(leafKeys)-1], k)
+
+		// Walk all the way back with Previous and confirm we see every key.
+		seen := [][]byte{append([]byte(nil), k...)}
+		for {
+			require.NoError(t, curLast.Previous())
+			if !curLast.Valid() {
+				break
+			}
+			pk, perr := curLast.Key()
+			require.NoError(t, perr)
+			seen = append([][]byte{append([]byte(nil), pk...)}, seen...)
+		}
+		require.Equal(t, leafKeys, seen, "Last+Previous must enumerate the full subtree")
+
+		// First/Next treat the 0-cell interior root as terminal-empty (by
+		// design). Pinned here so the asymmetry is tested: if this ever flips
+		// to descending the subtree, that is a behavior change to review, not a
+		// silent regression. With an EMPTY leaf this is correct; with the
+		// non-empty leaf above it is the deliberately-tolerated divergence that
+		// is only safe because Delete never builds this shape (Part 2 proves
+		// the production path never does).
+		curFirst := bt.NewCursor()
+		require.NoError(t, curFirst.First())
+		require.False(t, curFirst.Valid(), "First treats a 0-cell interior root as terminal-empty (by design)")
+		// Next from an invalid/never-positioned cursor must stay empty.
+		require.NoError(t, curFirst.Next())
+		require.False(t, curFirst.Valid())
+	}()
+
+	// ---- Part 2: production Delete cascade never lands on such a root ----
+	//
+	// Build a 3-level tree, then delete in batches. After every commit, the
+	// full forward iteration (First+Next, via countKeys) and a manual key-by-key
+	// walk must both return the exact remaining set. A 0-cell interior root over
+	// live data on the leftmost path would make First/Next under-report and fail
+	// these assertions.
+	db := tempDBWithPageSize(t, 512)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace("t1")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	const total = 600
+	putN(t, db, "t1", total, 10)
+
+	// Confirm we actually built a multi-level tree (otherwise the invariant is
+	// vacuous for this run).
+	func() {
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		ns, _ := db.getNamespaceLocked("t1")
+		bt := &btree{pager: db.pager, rootPage: ns.rootPage, walMaxFrame: rtx.walMaxFrame}
+		depth := measureTreeDepth(t, bt, bt.rootPage)
+		require.NoError(t, rtx.Rollback())
+		require.GreaterOrEqual(t, depth, 2, "expected a multi-level tree")
+	}()
+
+	remaining := total
+	for batch := 0; batch < total/10; batch++ {
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns, err := db.getNamespaceLocked("t1")
+		require.NoError(t, err)
+		for i := batch*10 + 1; i <= batch*10+10; i++ {
+			require.NoError(t, tx.Delete(ns, binary.BigEndian.AppendUint32(nil, uint32(i))))
+			remaining--
+		}
+		require.NoError(t, tx.Commit())
+
+		// Tree stays structurally valid (IntegrityCheck descends 0-cell
+		// interior rightChildren, so it would still pass even if one existed —
+		// the First/Next walk below is what actually pins the invariant).
+		require.NoError(t, db.IntegrityCheck())
+
+		// Full forward iteration must see exactly the remaining keys, in order,
+		// with no gap — proving no live data hides behind a 0-cell interior root
+		// that First/Next skipped.
+		require.Equal(t, remaining, countKeys(t, db, "t1"))
+
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		ns2, err := db.getNamespaceLocked("t1")
+		require.NoError(t, err)
+		cur := rtx.NewCursor(ns2)
+		want := uint32(batch*10 + 11) // smallest key not yet deleted
+		walked := 0
+		for err := cur.First(); err == nil && cur.Valid(); err = cur.Next() {
+			k, kerr := cur.Key()
+			require.NoError(t, kerr)
+			require.Equal(t, binary.BigEndian.AppendUint32(nil, want), k)
+			want++
+			walked++
+		}
+		require.NoError(t, rtx.Rollback())
+		require.Equal(t, remaining, walked)
+	}
+	require.Equal(t, 0, remaining)
+	require.Equal(t, 0, countKeys(t, db, "t1"))
+}
+
 // TestDelCurCov_CountPageCorruptCellPointer exercises the countPage
 // cpBase+2 > dataLen error path (L2393-2396).
 func TestDelCurCov_CountPageCorruptCellPointer(t *testing.T) {
