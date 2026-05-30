@@ -71,6 +71,13 @@ func TestDBPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, path, db.Path())
 	db.Close()
+
+	// In-memory databases report an empty path, matching SQLite's
+	// sqlite3BtreeGetFilename -> sqlite3PagerFilename(pPager, nullIfMemDb=1).
+	memDB, err := testOpen(t, "ignored.db", Options{InMemory: true})
+	require.NoError(t, err)
+	assert.Equal(t, "", memDB.Path())
+	memDB.Close()
 }
 
 // === Reopen / Persistence Tests ===

@@ -656,8 +656,14 @@ func (db *DB) SetClosing() {
 }
 
 // Path returns the database file path.
-// DRIFT: Path() returns raw string for in-memory DBs vs SQLite's empty string See docs/btree/NOTES.md#drift-57-path-returns-raw-string-for-in-memory-dbs
+// For in-memory databases it returns the empty string, matching SQLite's
+// sqlite3BtreeGetFilename (btree.c:11302), which calls
+// sqlite3PagerFilename(pPager, /*nullIfMemDb=*/1) and returns "" (&zFake[4])
+// for memDb/TEMP databases (pager.c:7088).
 func (db *DB) Path() string {
+	if db.opts.InMemory {
+		return ""
+	}
 	return db.path
 }
 

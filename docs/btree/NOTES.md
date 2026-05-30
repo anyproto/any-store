@@ -2807,21 +2807,6 @@ length but never unlinking it. The consequence is that after the last client clo
 zero-length `-wal` file is left behind on disk rather than being removed as stock SQLite would
 do; this is benign in operation but diverges from SQLite's default file-lifecycle cleanup.
 
-<a id="drift-57-path-returns-raw-string-for-in-memory-dbs"></a>
-### Drift: Path Returns Raw String For In Memory DBs
-- **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `db.go:*DB.Path` (`db.go:600`).
-
-SQLite's `sqlite3BtreeGetFilename` calls `sqlite3PagerFilename(pPager, /*nullIfMemDb=*/1)`,
-which for in-memory / memdb (and TEMP) databases returns `&zFake[4]`, i.e. the empty string
-`""`, and only returns the real `pPager->zFilename` for genuine file-backed databases. The Go
-`*DB.Path()` (`db.go:600-602`) unconditionally returns `db.path`, which is the raw
-caller-supplied `path` argument (set at `db.go:506`, never canonicalized for in-memory since
-`filepath.Abs` is applied only when `!opts.InMemory`). The consequence is that for an
-in-memory database `Path()` returns the caller's literal string rather than the empty string
-SQLite reports, so callers using an empty path to detect an in-memory DB (the SQLite
-convention) will misclassify it.
-
 <a id="drift-58-wal-read-begin-backoff-off-by-one"></a>
 ### Drift: WAL Read Begin Backoff Off By One
 - **Category:** changed-logic  -  **Severity:** low
