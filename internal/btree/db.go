@@ -1030,9 +1030,11 @@ func (db *DB) freeTreePagesDepth(pgno uint32, depth int) error {
 
 	if pg.header.isInterior() {
 		// Collect child page numbers before freeing
+		usableSize := db.pager.usableSize()
 		n := int(pg.header.cellCount)
 		cpOff := pg.cellPointerOffset()
 		children := make([]uint32, 0, n+1)
+		var overflowHeads []uint32
 		for i := range n {
 			// Bounds-check the interior child-pointer read: a corrupt 16-bit
 			// cell offset near page end must yield ErrCorrupt, not a panic in
@@ -1049,9 +1051,30 @@ func (db *DB) freeTreePagesDepth(pgno uint32, depth int) error {
 			}
 			childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
 			children = append(children, childPgno)
+			// Free the overflow chain hanging off this interior divider cell.
+			// clearDatabasePage runs BTREE_CLEAR_CELL on EVERY cell including
+			// interior dividers (btree.c:10240-10248); the macro frees the
+			// cell's overflow chain whenever the payload spills off-page
+			// (btree.c:7056-7062). Collect the chain heads while the page is
+			// held; free them after releasing the page.
+			c, _, perr := parseInteriorCell(pg.data, int(off), usableSize)
+			if perr != nil {
+				db.pager.releasePage(pg)
+				return perr
+			}
+			if c.overflowPg != 0 {
+				overflowHeads = append(overflowHeads, c.overflowPg)
+			}
 		}
 		children = append(children, pg.header.rightChild)
 		db.pager.releasePage(pg)
+
+		// Free the divider-cell overflow chains collected above.
+		for _, ovfl := range overflowHeads {
+			if err := db.pager.freeOverflowChain(ovfl); err != nil {
+				return err
+			}
+		}
 
 		// Recurse into children first (free leaves before interior)
 		for _, child := range children {
@@ -1820,7 +1843,6 @@ func (tx *WriteTx) CreateNamespace(name string) (*Namespace, error) {
 }
 
 // DeleteNamespace deletes a namespace within this transaction.
-// DRIFT: freeTreePages leaks overflow chains on interior divider cells See docs/btree/NOTES.md#drift-19-deletenamespace-leaks-overflow-chains-on-interior-divider-ce
 func (tx *WriteTx) DeleteNamespace(name string) error {
 	if tx.closed {
 		return ErrTxClosed

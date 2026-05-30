@@ -2364,20 +2364,6 @@ platform-dependent. The consequence is that on a 64-bit target the behavior is
 practically equivalent, but on a 32-bit target the total is 32-bit and could overflow for
 a very large tree, whereas SQLite is always `i64`.
 
-<a id="drift-19-deletenamespace-leaks-overflow-chains-on-interior-divider-ce"></a>
-### Drift: DeleteNamespace Leaks Overflow Chains On Interior Divider Cells
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `db.go:*WriteTx.DeleteNamespace` (`db.go:995-1013 (freeTreePages interior branch); leaf-only overflow free at db.go:1014-1037`).
-
-SQLite's `clearDatabasePage` frees the overflow chains of every cell on every page,
-interior dividers included. Go's `freeTreePages` only frees overflow chains for leaf
-cells (`db.go:1014-1037`, `freeOverflowChain` at `db.go:1027`); its interior-page branch
-(`db.go:995-1013`) merely collects child pointers plus rightChild and recurses, never
-calling `parseInteriorCell`/`freeOverflowChain`. The consequence is that any overflow
-chain hanging off an interior divider cell -- a large index key whose payload exceeds
-`maxLocal` -- is never returned to the freelist when the namespace is dropped, leaking
-those pages.
-
 <a id="drift-20-freetreepages-frees-root-page-versus-cleardatabasepage-clear"></a>
 ### Drift: freeTreePages Frees Root Page Versus clearDatabasePage Clear Semantics
 - **Category:** changed-logic  -  **Severity:** low
