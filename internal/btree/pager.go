@@ -1215,7 +1215,6 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 // allocatePage allocates a new page and returns it. Equivalent to
 // allocatePageNear(0) — no locality hint. Most callers (btree splits,
 // root allocation) don't have a meaningful hint and use this form.
-// DRIFT: allocatePageNear swallows freelist errors (incl ErrCorrupt) and grows DB silently See docs/btree/NOTES.md#drift-71-allocatepagenear-swallows-freelist-errors-and-grows-db
 func (p *pager) allocatePage() (*page, error) {
 	return p.allocatePageNear(0)
 }
@@ -1235,13 +1234,14 @@ func (p *pager) allocatePageNear(nearby uint32) (*page, error) {
 		return nil, ErrReadOnly
 	}
 
-	// Check freelist first.
+	// Check freelist first. Matches SQLite allocateBtreePage
+	// (btree.c:6543 freelist branch): when the freelist is non-empty we
+	// allocate from it and PROPAGATE any error (including ErrCorrupt)
+	// rather than swallowing it and growing the DB. The grow-the-DB
+	// fallback (btree.c:6758-6815 else branch) only runs when the
+	// freelist is empty (n==0, here FirstFreelistPg == 0).
 	if p.header.FirstFreelistPg != 0 {
-		pg, err := p.allocateFromFreelist(nearby)
-		if err == nil {
-			return pg, nil
-		}
-		// Fall through to grow database if freelist read fails.
+		return p.allocateFromFreelist(nearby)
 	}
 
 	pgno := p.dbSize.Add(1)

@@ -3030,23 +3030,6 @@ consequence is that in the default no-slab configuration Go always reports no me
 whereas SQLite would still surface heap-based pressure, so the cache never receives the
 pressure signal that would otherwise prompt it to shed pages.
 
-<a id="drift-71-allocatepagenear-swallows-freelist-errors-and-grows-db"></a>
-### Drift: allocatePageNear Swallows Freelist Errors And Grows DB
-- **Category:** changed-logic  -  **Severity:** high
-- **Affected functions:** `pager.go:*pager.allocatePage` (`internal/btree/pager.go:1165-1171`).
-
-In C, `allocateBtreePage`'s freelist branch (the `if(n>0)` block, `btree.c:6543-6757`) jumps to
-`end_allocate_page` and returns the error code on any failure -- `SQLITE_CORRUPT_BKPT` for a bad
-trunk/leaf page number or out-of-range leaf count, or an I/O/pager error -- so every caller stops
-and propagates the error rather than continuing. Go's allocation path (`pager.go:1165-1171`) does
-`pg, err := p.allocateFromFreelist(nearby); if err == nil { return pg, nil }` and then falls
-through with the comment "Fall through to grow database if freelist read fails", calling
-`p.dbSize.Add(1)` -- discarding `err` entirely, including `ErrCorrupt`. The consequence is that a
-corrupt freelist is not surfaced as an error but is silently papered over by growing the database
-file, so corruption SQLite would report as `SQLITE_CORRUPT` is converted into continued operation
-on a database whose freelist is known to be broken, risking further damage instead of failing
-loudly.
-
 <a id="drift-72-freeoverflowchain-omits-refcount-and-fixed-count-versus-term"></a>
 ### Drift: freeOverflowChain Omits Refcount And Fixed Count Versus Terminator Walk
 - **Category:** changed-logic  -  **Severity:** low

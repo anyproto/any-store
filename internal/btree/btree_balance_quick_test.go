@@ -276,6 +276,7 @@ func reportFillStats(t *testing.T, mode string, s *leafFillStats, usable, nRows 
 		t.Logf("  %s : %5d  %s", b.label, count, bar)
 	}
 }
+
 // TestBalanceQuick_HappyPath verifies the rightmost-append fast path
 // produces tightly-packed leaves on monotonic workloads. Port of
 // SQLite balance_quick (btree.c:7992-8086, dispatch btree.c:9169-9192).
@@ -695,22 +696,18 @@ func TestBalanceQuick_ConcurrentReader(t *testing.T) {
 	require.Len(t, got, 80)
 }
 
-// TestBalanceQuick_AllocFreelistCorruptResilience verifies the fast
-// path's defensive allocation behavior.
+// TestBalanceQuick_AllocFreelistCorruptResilience verifies that an
+// allocation attempt against a corrupt freelist is DETECTED and surfaced
+// as ErrCorrupt rather than being silently swallowed and grown over.
 //
 // Intent per spec matrix test 8: "fail allocatePage inside the fast
-// path; assert clean rollback; no partial pages." any-store's
-// allocatePage (pager.go allocatePageNear) is defensively designed:
-// if the freelist trunk is corrupt, it silently falls through to
-// growing the DB file (comment at pager.go ~line 919: "Fall through
-// to grow database if freelist read fails"). This makes the spec's
-// "must-fail" assertion incorrect for any-store; the actual contract
-// is "fast path tolerates freelist corruption AND produces a
-// structurally valid tree."
-//
-// SQLite's equivalent SQLITE_FAULTINJECTION coverage targets
-// allocateBtreePage failures; any-store mitigates the same risks via
-// the grow fallback plus IntegrityCheck post-conditions.
+// path; assert clean rollback; no partial pages." Matching SQLite
+// allocateBtreePage (btree.c:6543 freelist branch -> return rc): when
+// FirstFreelistPg != 0, allocatePage allocates from the freelist and
+// propagates any error (including ErrCorrupt). The grow-the-DB fallback
+// (btree.c:6758-6815 else branch) only runs when the freelist is empty.
+// A corrupt non-zero FirstFreelistPg therefore fails the allocation,
+// which rolls back cleanly with no partial pages committed.
 func TestBalanceQuick_AllocFreelistCorruptResilience(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
@@ -751,16 +748,16 @@ func TestBalanceQuick_AllocFreelistCorruptResilience(t *testing.T) {
 	require.NoError(t, db.Close())
 
 	// Phase 2: corrupt FirstFreelistPg at offset 32 in page 1 (see
-	// page.go dbHeader.serialize).
+	// page.go dbHeader.serialize). 0x7FFFFFFF > dbSize trips the
+	// trunk-page guard in allocateFromFreelist.
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
 	binary.BigEndian.PutUint32(data[32:36], 0x7FFFFFFF)
 	require.NoError(t, os.WriteFile(path, data, 0644))
 
-	// Phase 3: reopen and drive monotonic appends. allocatePage must
-	// not propagate the corruption as a failure; every insert should
-	// succeed via the grow-the-DB fallback, and the resulting tree
-	// must be structurally valid.
+	// Phase 3: reopen and drive monotonic appends. Because the freelist
+	// is non-empty (and corrupt), the first allocation that consults it
+	// must surface ErrCorrupt instead of silently growing the DB.
 	db, err = testOpen(t, path, Options{PageSize: 1024})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
@@ -770,36 +767,17 @@ func TestBalanceQuick_AllocFreelistCorruptResilience(t *testing.T) {
 	ns, err = db.getNamespaceLocked("t1")
 	require.NoError(t, err)
 
-	db.pager.balanceQuickDispatchCount.Store(0)
-	// 3000 monotonic appends force depth ≥ 3 so the fast path fires.
-	for i := 10000; i < 13000; i++ {
+	// Some leading appends fit on existing pages without allocating; the
+	// first insert that needs a fresh page consults the corrupt freelist
+	// and must fail with ErrCorrupt (detection, not silent grow).
+	var putErr error
+	for i := 10000; i < 13000 && putErr == nil; i++ {
 		key := binary.BigEndian.AppendUint32(nil, uint32(i))
-		require.NoError(t, tx.Put(ns, key, val),
-			"insert %d must not fail despite corrupt freelist", i)
+		putErr = tx.Put(ns, key, val)
 	}
-	require.NoError(t, tx.Commit())
+	require.ErrorIs(t, putErr, ErrCorrupt,
+		"corrupt freelist must be detected, not silently grown over")
 
-	// Even with corrupt freelist, fast path fired for at least some
-	// appends (monotonic workload + depth ≥ 3).
-	require.Greater(t, db.pager.balanceQuickDispatchCount.Load(), int64(0))
-
-	// Tree must still be internally consistent. Corrupt FirstFreelistPg
-	// is caught by IntegrityCheck's freelist walk — but the btree itself
-	// remains intact, which is what matters for this test.
-	// IntegrityCheck may report the freelist corruption; that's
-	// orthogonal to the fast-path behavior we are verifying.
-	_ = db.IntegrityCheck()
-
-	// Spot-check rows spread through the range (readback proof).
-	rtx, err := db.BeginRead()
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = rtx.Rollback() })
-	ns2, err := db.getNamespaceLocked("t1")
-	require.NoError(t, err)
-	for _, i := range []uint32{10000, 11000, 12000, 12999} {
-		key := binary.BigEndian.AppendUint32(nil, i)
-		got, err := rtx.Get(ns2, key)
-		require.NoError(t, err, "row %d", i)
-		require.Len(t, got, 80, "row %d", i)
-	}
+	// Clean rollback: the failed allocation must not leave partial state.
+	require.NoError(t, tx.Rollback())
 }

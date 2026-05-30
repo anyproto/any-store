@@ -3286,16 +3286,21 @@ func TestAllocatePage_AllocateFromFreelistFails(t *testing.T) {
 	p.walMaxFrame.Store(mf)
 	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
-	// Set corrupted freelist header so allocateFromFreelist fails
+	// Set corrupted freelist header so allocateFromFreelist fails.
+	// trunkPgno 999 > dbSize triggers the trunk-page guard in
+	// allocateFromFreelist (pager.go ~1395). With FirstFreelistPg != 0,
+	// allocatePage must propagate ErrCorrupt rather than silently
+	// growing the DB (matches SQLite allocateBtreePage, btree.c:6543).
 	p.header.FirstFreelistPg = 999
-	// allocatePage should fall through to grow database
 	pg, err := p.allocatePage()
-	require.NoError(t, err)
-	assert.GreaterOrEqual(t, pg.pgno, uint32(2))
-	p.releasePage(pg)
-
-	require.NoError(t, p.rollback())
+	// Roll back the writer transaction BEFORE asserting so a failing
+	// assertion (FailNow) doesn't leave the writer RWMutex held, which
+	// would deadlock the deferred p.close().
+	rbErr := p.rollback()
 	p.endRead(slot)
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.Nil(t, pg)
+	require.NoError(t, rbErr)
 }
 
 // ============================================================
@@ -3771,20 +3776,30 @@ func TestFreePage_TrunkReadError(t *testing.T) {
 	p.walMaxFrame.Store(mf)
 	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
-	// Set up a freelist pointing to an invalid page
-	p.header.FirstFreelistPg = 999 // Beyond dbSize
-
-	// Allocate a real page to free
+	// Allocate a real page to free, while the freelist is still empty so
+	// allocatePage grows the DB (allocatePage now propagates freelist
+	// errors instead of silently growing, so the corrupt FirstFreelistPg
+	// must be set AFTER this allocation).
 	pg, err := p.allocatePage()
-	require.NoError(t, err)
+	// Roll back / release writer state before any failing assertion so a
+	// FailNow doesn't leave the writer RWMutex held and deadlock close().
+	if err != nil {
+		_ = p.rollback()
+		p.endRead(slot)
+		require.NoError(t, err)
+	}
 	pgno := pg.pgno
 	p.releasePage(pg)
 
-	err = p.freePage(pgno)
-	assert.ErrorIs(t, err, ErrCorrupt)
+	// Set up a freelist pointing to an invalid page so freePage's trunk
+	// read hits the corrupt-trunk guard.
+	p.header.FirstFreelistPg = 999 // Beyond dbSize
 
-	require.NoError(t, p.rollback())
+	freeErr := p.freePage(pgno)
+	rbErr := p.rollback()
 	p.endRead(slot)
+	assert.ErrorIs(t, freeErr, ErrCorrupt)
+	require.NoError(t, rbErr)
 }
 
 // --- pager.go:668-680 freePage() getWritablePage fails with savepoints ---
