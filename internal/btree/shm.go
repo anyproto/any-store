@@ -21,6 +21,12 @@ const (
 	// shmRegionSize is the size of each shared memory region (32 KB, matching SQLite).
 	shmRegionSize = 32768
 
+	// shmPageSize is the fixed page granularity SQLite uses when pre-touching
+	// newly extended shm pages to force the OS to back them (avoiding SIGBUS).
+	// SQLite hardcodes `static const int pgsz = 4096;` regardless of the actual
+	// OS page size (os_unix.c:5175), so we match that constant exactly here.
+	shmPageSize = 4096
+
 	// shmHeaderOffset is the byte offset of the WAL index header in region 0.
 	shmHeaderOffset = 0
 

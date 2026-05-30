@@ -3191,23 +3191,6 @@ SHARED lock that SQLite treats as a free no-op instead bumps the shared refcount
 lock/unlock accounting can drift from SQLite's behavior when a connection re-requests a lock it
 already holds.
 
-<a id="drift-84-shm-region-extension-uses-sparse-ftruncate-reintroducing-sig"></a>
-### Drift: SHM Region Extension Uses Sparse ftruncate Reintroducing SIGBUS Risk
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `shm_mmap.go:*mmapShm.region` (`internal/btree/shm_mmap.go:119`).
-
-When extending the shm file, SQLite deliberately does NOT rely on `ftruncate` alone: after finding
-the file too small (with `bExtend` true) it writes a single byte to the last byte of every newly
-allocated/extended OS page
-(`for(iPg=st_size/pgsz; iPg<nByte/pgsz; iPg++) seekAndWriteFd(... iPg*pgsz+pgsz-1, "", 1)`,
-`os_unix.c:5174-5188`), with an in-source comment explaining the rationale: backing the pages avoids
-a later `SIGBUS` when the mapped-but-unbacked region is touched. Go's `region` extends the shm file
-solely via `s.file.Truncate(requiredSize)` (`shm_mmap.go:119-123`), producing a sparse file with
-unbacked holes, then mmaps the region. The consequence is that Go reintroduces exactly the `SIGBUS`
-risk SQLite engineered around: if the filesystem cannot later allocate backing storage for a hole
-that is touched through the mapping, the process can take a `SIGBUS` rather than a clean error,
-whereas SQLite's pre-touch write surfaces the out-of-space condition up front.
-
 <a id="drift-85-shm-unlock-single-slot-and-per-connection-counter"></a>
 ### Drift: SHM Unlock Single Slot And Per Connection Counter
 - **Category:** changed-logic  -  **Severity:** low

@@ -112,7 +112,6 @@ func newPlatformShm(path string) (shm, error) {
 	return s, nil
 }
 
-// DRIFT: shm region extend uses sparse ftruncate (SIGBUS risk) vs C per-page byte-write See docs/btree/NOTES.md#drift-84-shm-region-extension-uses-sparse-ftruncate-reintroducing-sig
 func (s *mmapShm) region(index int, create bool) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -144,8 +143,24 @@ func (s *mmapShm) region(index int, create bool) ([]byte, error) {
 		return nil, err
 	}
 	if info.Size() < requiredSize {
+		oldSize := info.Size()
 		if err := s.file.Truncate(requiredSize); err != nil {
 			return nil, fmt.Errorf("btree: extend shm file: %w", err)
+		}
+		// Pre-touch each newly allocated page by writing a single byte to its
+		// last byte. Technically only the final page must be written to grow the
+		// file, but writing to all new pages forces the OS to allocate them
+		// immediately, which reduces the chances of SIGBUS while accessing the
+		// mapped region later on. Mirrors SQLite's unixShmMap bExtend loop
+		// (os_unix.c:5180-5187), using a fixed 4096 page size (shmPageSize) to
+		// match C's `static const int pgsz = 4096;`. requiredSize is a multiple
+		// of shmRegionSize (32768), hence of 4096, so the loop covers full pages
+		// (matches C assert `(nByte % pgsz)==0`, os_unix.c:5179).
+		var oneByte [1]byte
+		for iPg := oldSize / shmPageSize; iPg < requiredSize/shmPageSize; iPg++ {
+			if _, err := s.file.WriteAt(oneByte[:], iPg*shmPageSize+shmPageSize-1); err != nil {
+				return nil, fmt.Errorf("btree: pre-touch shm page: %w", err)
+			}
 		}
 	}
 
