@@ -359,7 +359,6 @@ func (p *pager) recycleCellSlice(s []cellData) {
 }
 
 // open opens the database file, initializes the WAL, and recovers if needed.
-// DRIFT: open()/deserialize skip lockBtree page-1 validations (21-23, 18/19, usable>=480, flags) See docs/btree/NOTES.md#drift-66-page-1-header-validation-missing-in-open-and-deserialize
 func (p *pager) open() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -468,6 +467,17 @@ func (p *pager) open() error {
 
 	p.pageSize = p.header.PageSize
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
+
+	// Mirror C lockBtree (btree.c:3422-3424): the usable size (pageSize minus
+	// the on-disk reserved-space byte) is not allowed to be less than 480 — at
+	// page size 512 the reserved space cannot exceed 32. A larger ReservedSpace
+	// byte would otherwise feed degenerate geometry into maxLocalPayload /
+	// minLocalPayload / overflowPageUsable and the cell-content math. This
+	// floors only the on-disk-open path; the codec-install and new-DB paths
+	// derive usableSize from process-chosen Options, not untrusted bytes.
+	if p.usableSize_ < 480 {
+		return fmt.Errorf("%w: usable size %d < 480", ErrCorrupt, p.usableSize_)
+	}
 
 	// Reconcile the header page count against the physical file size,
 	// mirroring C lockBtree (btree.c:3304-3308). C derives nPageFile via

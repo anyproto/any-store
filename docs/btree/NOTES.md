@@ -2813,37 +2813,6 @@ page 1 is durably committed to the main file outside of any transaction, so a cr
 or any reader/recovery logic that assumes page 1 first appears via the WAL sees a state SQLite
 would never produce.
 
-<a id="drift-66-page-1-header-validation-missing-in-open-and-deserialize"></a>
-### Drift: Page 1 Header Validation Missing In Open And Deserialize
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `page.go:*dbHeader.deserialize` (`internal/btree/page.go:250-253`),
-  `page.go:*dbHeader.deserialize` (`internal/btree/page.go:250-251`),
-  `page.go:*dbHeader.deserialize` (`internal/btree/pager.go:447`),
-  `page.go:*pageHeader.deserialize` (`internal/btree/page.go:313-322`),
-  `page.go:*pageHeader.deserialize`
-  (`internal/btree/page.go:316 (and the read-path callers in pager.go:760/807/839/897/954/1000 that never validate cellCount)`),
-  `pager.go:*pager.open` (`internal/btree/pager.go:432`),
-  `pager.go:*pager.open` (`internal/btree/page.go:251`),
-  `pager.go:*pager.open` (`internal/btree/pager.go:447`).
-
-C's `lockBtree` rejects a malformed page 1 with `SQLITE_NOTADB` on a battery of checks the Go open
-path omits entirely: the embedded-payload-fraction bytes 21-23 must equal exactly `64/32/32`
-(`if( memcmp(&page1[21], "\100\040\040",3)!=0 ) goto page1_init_failed;`, `btree.c:3371`); the
-file-format version bytes are validated (`if(page1[18]>2)` marks `BTS_READ_ONLY` and
-`if(page1[19]>2) goto page1_init_failed`, with `page1[19]==2` routing into WAL mode,
-`btree.c:3332-3362`); and `usableSize` (pageSize minus the reserved-space byte) must be `>= 480`
-(`btree.c:3422`). Go's `dbHeader.deserialize` (`page.go:232-270`) reads `ReservedSpace`,
-`WriteVersion`, and `ReadVersion` but never checks bytes 21-23, never tests the version bytes
-anywhere in the open path, and computes `usableSize_` (`pager.go:447`) with no `>= 480` floor.
-Additionally, `pageHeader.deserialize` (`page.go:313-322`) copies the offset-0 flag byte
-(`ph.pageType = buf[0]`) and the offset-3 `nCell` with no validation, whereas SQLite's
-`btreeInitPage`/`decodeFlags` rejects any flag byte that isn't one of the four valid page types
-(`SQLITE_CORRUPT_PAGE`, `btree.c:2240-2241`) and rejects `nCell > MX_CELL(pBt) = (pageSize-8)/6`
-(`btree.c:2252-2256`) on every page init. The consequence is that corrupt or non-SQLite files
-that stock SQLite would reject up front as `SQLITE_NOTADB`/`SQLITE_CORRUPT` are instead accepted by
-Go and carried into the engine, producing degenerate geometry or out-of-bounds cell processing
-downstream rather than a clean rejection at open time.
-
 <a id="drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl"></a>
 ### Drift: pageSlab And ConfigPageCache Idempotent Versus Reconfigurable Setup
 - **Category:** changed-logic  -  **Severity:** low

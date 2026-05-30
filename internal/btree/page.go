@@ -229,7 +229,6 @@ func (h *dbHeader) serialize(buf []byte) {
 }
 
 // deserialize reads the database header from the first 100 bytes of buf.
-// DRIFT: open()/deserialize skip lockBtree page-1 validations (21-23, 18/19, usable>=480, flags) See docs/btree/NOTES.md#drift-66-page-1-header-validation-missing-in-open-and-deserialize
 func (h *dbHeader) deserialize(buf []byte) error {
 	if len(buf) < dbHeaderSize {
 		return ErrCorrupt
@@ -246,6 +245,16 @@ func (h *dbHeader) deserialize(buf []byte) error {
 		return ErrCorrupt // invalid: 0, non-power-of-two, or < 512
 	} else {
 		h.PageSize = uint32(ps)
+	}
+
+	// Mirror C lockBtree (btree.c:3371-3373): the embedded-payload-fraction
+	// bytes 21-23 must equal exactly 64/32/32. SQLite fixed these constants in
+	// 3.6.0 and rejects any other values as SQLITE_NOTADB. serialize() always
+	// hardcodes them (these bytes live inside the always-plaintext 100-byte
+	// dbHeader prefix), so every DB this package writes round-trips cleanly,
+	// while a non-DB / corrupt file is rejected here before codec setup.
+	if buf[21] != maxEmbeddedPayloadFrac || buf[22] != minEmbeddedPayloadFrac || buf[23] != leafPayloadFrac {
+		return ErrCorrupt
 	}
 
 	h.WriteVersion = buf[18]
@@ -311,7 +320,6 @@ func (ph *pageHeader) serialize(buf []byte) {
 }
 
 // deserialize reads the page header from buf.
-// DRIFT: open()/deserialize skip lockBtree page-1 validations (21-23, 18/19, usable>=480, flags) See docs/btree/NOTES.md#drift-66-page-1-header-validation-missing-in-open-and-deserialize
 func (ph *pageHeader) deserialize(buf []byte) {
 	ph.pageType = buf[0]
 	ph.firstFreeBlk = binary.BigEndian.Uint16(buf[1:3])
