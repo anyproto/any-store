@@ -2985,22 +2985,6 @@ that stock SQLite would reject up front as `SQLITE_NOTADB`/`SQLITE_CORRUPT` are 
 Go and carried into the engine, producing degenerate geometry or out-of-bounds cell processing
 downstream rather than a clean rejection at open time.
 
-<a id="drift-67-contentareaoffset-accepts-zero-cell-content-offset-as-valid"></a>
-### Drift: contentAreaOffset Accepts Zero Cell Content Offset As Valid
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `page.go:*page.contentAreaOffset` (`page.go:386-393`).
-
-SQLite's `allocateSpace` treats a zero cell-content-offset (`top`) as the real `usableSize` value
-*only* for the exact 65536-byte special-case page; for every other page a stored `top` less than
-`gap` (which includes `top==0` on any non-65536 page) is `SQLITE_CORRUPT_PAGE`. Concretely C does
-`top=get2byte(&data[hdr+5]); if(gap>top){ if(top==0 && usableSize==65536){top=65536;} else
-{return CORRUPT;} }`. Go's `contentAreaOffset` (`page.go:386-393`) instead does
-`if top==0 { if usableSize==65536 {top=65536} else {top=usableSize} }` and only then bounds-checks
-`if top > usableSize || top < gap`, so a `top==0` on a non-65536 page is silently promoted to
-`usableSize` and accepted as a valid empty content area. The consequence is that a corrupt page
-with a zero content-offset, which SQLite would flag as corruption, is treated as a valid full-free
-page by Go, masking corruption that should have been detected.
-
 <a id="drift-68-pageslab-and-configpagecache-idempotent-versus-reconfigurabl"></a>
 ### Drift: pageSlab And ConfigPageCache Idempotent Versus Reconfigurable Setup
 - **Category:** changed-logic  -  **Severity:** low

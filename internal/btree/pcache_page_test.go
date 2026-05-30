@@ -416,7 +416,9 @@ func TestLocalPayloadSize_UnderMaxLocal(t *testing.T) {
 }
 
 func TestContentAreaOffset_CellContentOffZero(t *testing.T) {
-	// When cellContentOff == 0 and usableSize != 65536, top = usableSize
+	// When cellContentOff == 0 and usableSize != 65536, the page is corrupt:
+	// valid non-65536 pages store usableSize (never 0) in the cell content
+	// offset, matching SQLite allocateSpace() (btree.c:1855-1863).
 	pg := &page{
 		pgno: 2,
 		data: make([]byte, 4096),
@@ -426,9 +428,8 @@ func TestContentAreaOffset_CellContentOffZero(t *testing.T) {
 			cellCount:      0,
 		},
 	}
-	off, err := pg.contentAreaOffset(4096)
-	require.NoError(t, err)
-	assert.Equal(t, 4096, off)
+	_, err := pg.contentAreaOffset(4096)
+	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
 func TestContentAreaOffset_CellContentOffZero65536(t *testing.T) {

@@ -382,7 +382,6 @@ func (p *page) getCellOffsetSafe(i int) (uint16, error) {
 // (btree.c lines 1843-1853): if cellContentOff is 0 and usableSize is 65536,
 // treat as 65536; if cellContentOff > usableSize, return ErrCorrupt; if
 // cellContentOff < gap (cell pointer array end), return ErrCorrupt.
-// DRIFT: contentAreaOffset treats cellContentOff==0 as valid on non-64K pages (corrupt in C) See docs/btree/NOTES.md#drift-67-contentareaoffset-accepts-zero-cell-content-offset-as-valid
 func (p *page) contentAreaOffset(usableSize int) (int, error) {
 	top := int(p.header.cellContentOff)
 	gap := p.cellPointerOffset() + int(p.header.cellCount)*2
@@ -390,7 +389,7 @@ func (p *page) contentAreaOffset(usableSize int) (int, error) {
 		if usableSize == 65536 {
 			top = 65536
 		} else {
-			top = usableSize
+			return 0, ErrCorrupt
 		}
 	}
 	if top > usableSize || top < gap {
