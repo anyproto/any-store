@@ -45,11 +45,25 @@ const shmDMSOffset = 120 + int64(lockSlotCount) // right after the per-slot lock
 // state. The in-process layer provides correct intra-process lock semantics,
 // while fcntl provides inter-process coordination.
 type mmapShm struct {
-	mu      sync.Mutex
-	file    fileHandle
-	path    string
-	regions [][]byte // mmap'd regions
-	locks   [lockSlotCount]int // in-process lock state: 0=unlocked, >0=shared count, -1=exclusive
+	mu       sync.Mutex
+	file     fileHandle
+	path     string
+	regions  [][]byte           // mmap'd regions (each exactly shmRegionSize bytes)
+	baseMaps [][]byte           // underlying mmap'd backing maps, keyed by group-base region index; entries are nil except at group bases. close() munmaps these (one per real mmap), never the sub-region slices in regions.
+	locks    [lockSlotCount]int // in-process lock state: 0=unlocked, >0=shared count, -1=exclusive
+}
+
+// shmRegionsPerMap mirrors SQLite's unixShmRegionPerMap() (os_unix.c:4797-4803).
+// Each mmap must cover an integer multiple of the OS page size. When the page
+// size is >= shmRegionSize (e.g. 64KB pages), a single mapping must span
+// multiple shm regions so that every mmap offset stays page-aligned.
+// On 4KB/16KB-page systems this returns 1, keeping behavior byte-identical.
+func shmRegionsPerMap() int {
+	pg := os.Getpagesize()
+	if pg < shmRegionSize {
+		return 1
+	}
+	return pg / shmRegionSize
 }
 
 // newPlatformShm creates a new mmap-backed shm and acquires a shared DMS
@@ -71,9 +85,10 @@ func newPlatformShm(path string) (shm, error) {
 		return nil, fmt.Errorf("btree: open shm file: %w", err)
 	}
 	s := &mmapShm{
-		file:    f,
-		path:    path,
-		regions: make([][]byte, 0, shmMaxRegions),
+		file:     f,
+		path:     path,
+		regions:  make([][]byte, 0, shmMaxRegions),
+		baseMaps: make([][]byte, 0, shmMaxRegions),
 	}
 	if err := s.fcntlLock(syscall.F_RDLCK, shmDMSOffset); err != nil {
 		_ = f.Close()
@@ -97,7 +112,6 @@ func newPlatformShm(path string) (shm, error) {
 	return s, nil
 }
 
-// DRIFT: mmap SHM offset not page-aligned on 64KB pages; nShmPerMap grouping absent See docs/btree/NOTES.md#drift-83-mmap-shm-offset-not-page-aligned-and-region-grouping-absent
 // DRIFT: shm region extend uses sparse ftruncate (SIGBUS risk) vs C per-page byte-write See docs/btree/NOTES.md#drift-84-shm-region-extension-uses-sparse-ftruncate-reintroducing-sig
 func (s *mmapShm) region(index int, create bool) ([]byte, error) {
 	s.mu.Lock()
@@ -112,8 +126,19 @@ func (s *mmapShm) region(index int, create bool) ([]byte, error) {
 		return nil, fmt.Errorf("btree: shm region %d not available", index)
 	}
 
-	// Extend the file if needed.
-	requiredSize := int64((index + 1) * shmRegionSize)
+	// On systems whose page size is >= shmRegionSize, a single mmap must span
+	// multiple shm regions to keep the mmap offset page-aligned. Map the whole
+	// page-aligned group containing `index` at once and slice it into the
+	// per-region 32KB windows, mirroring SQLite's unixShmRegionPerMap grouping
+	// (os_unix.c:5202-5224). On 4KB/16KB pages regionsPerMap==1, so this is a
+	// single 32KB mapping at offset index*32KB (unchanged behavior).
+	regionsPerMap := shmRegionsPerMap()
+	base := (index / regionsPerMap) * regionsPerMap
+	nMap := regionsPerMap * shmRegionSize
+	offset := int64(base) * int64(shmRegionSize) // always a multiple of os.Getpagesize()
+
+	// Extend the file to back the whole group before mapping.
+	requiredSize := int64(base+regionsPerMap) * int64(shmRegionSize)
 	info, err := s.file.Stat()
 	if err != nil {
 		return nil, err
@@ -124,20 +149,28 @@ func (s *mmapShm) region(index int, create bool) ([]byte, error) {
 		}
 	}
 
-	// mmap the region.
-	offset := int64(index) * int64(shmRegionSize)
-	data, err := sysMmap(int(s.file.Fd()), offset, shmRegionSize,
+	// Map the whole group once.
+	data, err := sysMmap(int(s.file.Fd()), offset, nMap,
 		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
 		return nil, fmt.Errorf("btree: mmap shm region %d: %w", index, err)
 	}
 
-	// Grow the regions slice if needed.
-	for len(s.regions) <= index {
+	// Grow the slices to cover the whole group.
+	for len(s.regions) <= base+regionsPerMap-1 {
 		s.regions = append(s.regions, nil)
+		s.baseMaps = append(s.baseMaps, nil)
 	}
-	s.regions[index] = data
-	return data, nil
+
+	// Slice the single mapping into regionsPerMap per-region 32KB windows,
+	// matching C's apRegion[nRegion+i] = &pMem[szRegion*i] (os_unix.c:5223-5224).
+	// Record the full backing map at the group base so close() munmaps it once.
+	s.baseMaps[base] = data
+	for i := 0; i < regionsPerMap; i++ {
+		s.regions[base+i] = data[i*shmRegionSize : (i+1)*shmRegionSize : (i+1)*shmRegionSize]
+	}
+
+	return s.regions[index], nil
 }
 
 // lock acquires a lock on the given slot. It first checks the in-process lock
@@ -268,11 +301,18 @@ func (s *mmapShm) close(isLastClient bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for i, region := range s.regions {
-		if region != nil {
-			_ = sysMunmap(region)
-			s.regions[i] = nil
+	// munmap each real backing mapping exactly once. Sub-region slices in
+	// s.regions share a backing map (see region()); munmapping a sub-slice
+	// rather than the full mapping would be incorrect, so we munmap the
+	// group-base maps tracked in s.baseMaps instead.
+	for i, m := range s.baseMaps {
+		if m != nil {
+			_ = sysMunmap(m)
+			s.baseMaps[i] = nil
 		}
+	}
+	for i := range s.regions {
+		s.regions[i] = nil
 	}
 
 	// Unlink the shm file iff the caller (pager.close) tells us we are the

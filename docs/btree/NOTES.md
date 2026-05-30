@@ -3336,22 +3336,6 @@ transient or otherwise-retryable lock failures (e.g. `EINTR`, `ENOLCK`) become h
 errors in Go that abort the operation, where SQLite would have transparently retried them via the
 busy handler.
 
-<a id="drift-83-mmap-shm-offset-not-page-aligned-and-region-grouping-absent"></a>
-### Drift: mmap SHM Offset Not Page Aligned And Region Grouping Absent
-- **Category:** platform-support  -  **Severity:** high
-- **Affected functions:** `shm_mmap.go:*mmapShm.region` (`internal/btree/shm_mmap.go:126`).
-
-SQLite's `unixShmMap` groups regions per `mmap` call:
-`nShmPerMap = unixShmRegionPerMap() = (pgsz < 32KB ? 1 : pgsz/32KB)`, always maps at offset
-`szRegion*(i64)pShmNode->nRegion` (with `nRegion` advancing in steps of `nShmPerMap`) and maps
-`szRegion*nShmPerMap` bytes per call, so every `mmap` offset stays a multiple of the OS page size.
-Go's `region()` ignores the OS page size entirely: it maps exactly one region per call at
-`offset := int64(index) * int64(shmRegionSize)` with `shmRegionSize=32768` and no region grouping
-(`shm_mmap.go:126-128`, `shm.go:22`). The consequence is a platform-correctness failure on systems
-with a 64KB OS page size: odd region indices yield offsets (32768, 98304, ...) that are not
-page-aligned, which `mmap` rejects, so SHM mapping is broken on those platforms where SQLite's
-`nShmPerMap` grouping keeps every offset aligned.
-
 <a id="drift-84-shm-region-extension-uses-sparse-ftruncate-reintroducing-sig"></a>
 ### Drift: SHM Region Extension Uses Sparse ftruncate Reintroducing SIGBUS Risk
 - **Category:** changed-logic  -  **Severity:** medium
