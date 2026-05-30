@@ -2315,6 +2315,24 @@ func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 
 // END ENCRYPTION
 
+// walReadFrameFaultHook is a test-only fault-injection point for wal.readFrame.
+// It is nil in production so the only cost on the read path is a single atomic
+// pointer load. Tests install a hook via setWalReadFrameFaultHook to force a
+// readFrame failure for a chosen frame and exercise the by-design WAL-frame-read
+// fallthrough in the pager getters (see drift-6 in docs/btree/NOTES.md). The hook
+// receives the frame number and returns a non-nil error to fail that read.
+var walReadFrameFaultHook atomic.Pointer[func(frame uint32) error]
+
+// setWalReadFrameFaultHook installs (fn != nil) or clears (fn == nil) the
+// test-only readFrame fault-injection hook. Test-only.
+func setWalReadFrameFaultHook(fn func(frame uint32) error) {
+	if fn == nil {
+		walReadFrameFaultHook.Store(nil)
+		return
+	}
+	walReadFrameFaultHook.Store(&fn)
+}
+
 // readFrame reads the page data for a given frame number.
 // For the file-based path, only an atomic load of nFrame is needed (WAL frames
 // on disk are immutable once written). For the memFrames path, RLock protects
@@ -2329,6 +2347,15 @@ func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 func (w *wal) readFrame(frame uint32, buf, scratchBuf []byte, aeadScratchBuf *aeadScratch) error {
 	if frame == 0 {
 		return ErrWALCorrupt
+	}
+	// Test-only fault-injection hook. nil in production (zero overhead beyond a
+	// pointer load). When set, a non-nil return forces readFrame to fail for the
+	// given frame, exercising the by-design WAL-frame-read fallthrough documented
+	// at docs/btree/NOTES.md#drift-6-wal-frame-read-failure-falls-through-to-disk-read.
+	if hook := walReadFrameFaultHook.Load(); hook != nil {
+		if err := (*hook)(frame); err != nil {
+			return err
+		}
 	}
 	nf := w.nFrame.Load()
 	// Fast path: read from in-memory frames (needs RLock for slice access).
