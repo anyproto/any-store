@@ -580,8 +580,7 @@ func newWalIndex(shmPath string, inProcess bool) (*walIndex, error) {
 // relies on the SHM hash written below — matching SQLite's walFrames →
 // walIndexAppend (wal.c:2900, 1295-1338) where SHM hash is the authoritative
 // page→frame index.
-// DRIFT: shmHash write/get drop walIndexAppend/walFindFrame nCollide CORRUPT + cleanup/zero-init See docs/btree/NOTES.md#drift-91-wal-index-hash-append-missing-collision-limit-corruption-det
-func (wi *walIndex) set(pgno, frame uint32) {
+func (wi *walIndex) set(pgno, frame uint32) error {
 	if wi.inProcess {
 		wi.mu.Lock()
 		frames := wi.pageMap[pgno]
@@ -594,7 +593,10 @@ func (wi *walIndex) set(pgno, frame uint32) {
 	if frame > wi.maxFrame.Load() {
 		wi.maxFrame.Store(frame)
 	}
-	wi.shmHashWrite(pgno, frame)
+	// Propagate an ErrCorrupt (full/over-probed hash segment) so a single-frame
+	// write aborts like C's walFrames loop (wal.c:4229) instead of silently
+	// dropping the mapping.
+	return wi.shmHashWrite(pgno, frame)
 }
 
 // setBatch records multiple page->frame mappings under a single lock and
@@ -604,8 +606,7 @@ func (wi *walIndex) set(pgno, frame uint32) {
 // advanced on commit via walIndexWriteHdr), so uncommitted hash entries are
 // present but unreachable. Rollback uses shmCleanupFromFrame (analog of
 // walCleanupHash, wal.c:1247-1282) to zero out dangling hash entries.
-// DRIFT: shmHash write/get drop walIndexAppend/walFindFrame nCollide CORRUPT + cleanup/zero-init See docs/btree/NOTES.md#drift-91-wal-index-hash-append-missing-collision-limit-corruption-det
-func (wi *walIndex) setBatch(pages []*page, startFrame uint32, commit bool) {
+func (wi *walIndex) setBatch(pages []*page, startFrame uint32, commit bool) error {
 	_ = commit
 	if wi.inProcess {
 		wi.mu.Lock()
@@ -622,9 +623,15 @@ func (wi *walIndex) setBatch(pages []*page, startFrame uint32, commit bool) {
 	if f := startFrame + uint32(len(pages)) - 1; f > wi.maxFrame.Load() {
 		wi.maxFrame.Store(f)
 	}
+	// Propagate the first ErrCorrupt (full/over-probed hash segment) so the
+	// commit aborts like C's walFrames loop (wal.c:4229 stops the loop, skips
+	// walIndexWriteHdr, returns rc) instead of silently dropping the mapping.
 	for i, p := range pages {
-		wi.shmHashWrite(p.pgno, startFrame+uint32(i))
+		if err := wi.shmHashWrite(p.pgno, startFrame+uint32(i)); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // rollbackToFrame removes all pageMap entries with frame > target and restores
@@ -727,17 +734,17 @@ func (wi *walIndex) shmCleanupFromFrame(target, maxFrame uint32) {
 //
 // In-process mode walks pageMap; multi-process mode consults the SHM
 // hash via shmHashGet.
-func (wi *walIndex) getInTxRange(pgno, maxFrame, minFrame uint32) uint32 {
+func (wi *walIndex) getInTxRange(pgno, maxFrame, minFrame uint32) (uint32, error) {
 	if wi.inProcess {
 		wi.mu.RLock()
 		frames := wi.pageMap[pgno]
 		wi.mu.RUnlock()
 		for i := len(frames) - 1; i >= 0; i-- {
 			if frames[i] <= maxFrame && frames[i] >= minFrame {
-				return frames[i]
+				return frames[i], nil
 			}
 		}
-		return 0
+		return 0, nil
 	}
 	return wi.shmHashGet(pgno, maxFrame, minFrame)
 }
@@ -746,7 +753,7 @@ func (wi *walIndex) getInTxRange(pgno, maxFrame, minFrame uint32) uint32 {
 // within the given maxFrame snapshot, or 0 if not in WAL.
 // The maxFrame parameter limits which frames are visible (for snapshot isolation).
 // DRIFT: WAL hash-probe full-chain (nCollide) CORRUPT signal dropped in get/shmHashGet See docs/btree/NOTES.md#drift-93-wal-hash-probe-full-chain-corruption-signal-dropped
-func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
+func (wi *walIndex) get(pgno, maxFrame uint32) (uint32, error) {
 	if wi.inProcess {
 		// In-process: no SHM to consult; pageMap is the sole source of truth.
 		// minFrame filters out frames already checkpointed back to the DB
@@ -757,10 +764,10 @@ func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
 		wi.mu.RUnlock()
 		for i := len(frames) - 1; i >= 0; i-- {
 			if frames[i] <= maxFrame && frames[i] >= minFrame {
-				return frames[i]
+				return frames[i], nil
 			}
 		}
-		return 0
+		return 0, nil
 	}
 	// Multi-process: SHM hash tables are the sole source of truth, matching
 	// SQLite's walFindFrame (wal.c:3554-3582). nBackfill lives in SHM
@@ -780,15 +787,15 @@ func (wi *walIndex) get(pgno, maxFrame uint32) uint32 {
 // In multi-process mode this consults SHM hash exclusively (the SQLite-
 // aligned source of truth per walFindFrame). In in-process mode it walks
 // pageMap — there is no SHM to query in that mode.
-func (wi *walIndex) getLatest(pgno uint32) uint32 {
+func (wi *walIndex) getLatest(pgno uint32) (uint32, error) {
 	if wi.inProcess {
 		wi.mu.RLock()
 		frames := wi.pageMap[pgno]
 		wi.mu.RUnlock()
 		if len(frames) > 0 {
-			return frames[len(frames)-1]
+			return frames[len(frames)-1], nil
 		}
-		return 0
+		return 0, nil
 	}
 	// Multi-process: SHM hash only. Use mxCommitFrame as upper bound so
 	// cross-process readers never observe uncommitted spill frames (readers
@@ -1032,13 +1039,32 @@ func htSegmentInfo(seg int) (pgnoBase int, nEntry int, iZero uint32) {
 // (any-store's lockWrite) so linear probing does not race another writer.
 // The write ordering + barrier guarantees cross-process readers either see
 // a fully-populated entry or none at all.
-// DRIFT: shmHash write/get drop walIndexAppend/walFindFrame nCollide CORRUPT + cleanup/zero-init See docs/btree/NOTES.md#drift-91-wal-index-hash-append-missing-collision-limit-corruption-det
-func (wi *walIndex) shmHashWrite(pgno, frame uint32) {
+//
+// Returns ErrCorrupt when the linear-probe insert cannot find a free hash
+// slot within the bounded number of collisions C permits (wal.c:1333-1336
+// `nCollide = idx; ... if((nCollide--)==0) return SQLITE_CORRUPT_BKPT;`). A
+// full/cyclic chain is provably corrupt because a valid segment holds at
+// most `idx` live entries, so any chain longer than that cannot terminate on
+// a genuine empty slot. Surfacing ErrCorrupt lets the caller abort the
+// commit (writeFrames/writeFramesMem return the error, skipping the
+// mxFrame/mxCommitFrame advance) exactly as C stops walFrames' loop and
+// skips walIndexWriteHdr (wal.c:4229-4257) — instead of silently writing
+// aPgno[idx] with no reachable aHash slot (a committed-but-unindexed frame
+// that later reads as missing/stale).
+//
+// DRIFT (intentional, write-ordering): C writes aPgno[idx] only AFTER the
+// probe finds a free slot (wal.c:1337 is past the loop at 1334-1336); Go
+// writes aPgno[idx] BEFORE probing (so the release barrier can order it
+// ahead of the aHash publish). On the corrupt path Go has therefore already
+// stored aPgno[idx]. That is harmless: the transaction aborts and the frame
+// is never published via mxFrame/mxCommitFrame, so no reader can reach it,
+// and shmCleanupFromFrame/reset scrubs the slot on rollback.
+func (wi *walIndex) shmHashWrite(pgno, frame uint32) error {
 	seg, idx := htFrameSegIdx(frame)
 
 	region, err := wi.shm.region(seg, true)
 	if err != nil {
-		return
+		return err
 	}
 
 	// Write pgno to aPgno[idx] first (SQLite wal.c:1337). u32-aligned.
@@ -1054,15 +1080,27 @@ func (wi *walIndex) shmHashWrite(pgno, frame uint32) {
 	// Insert into hash table (linear probing). aHash entries are u16; we
 	// publish via a plain store here because writes are serialized under
 	// lockWrite and the preceding barrier ordered aPgno before us.
+	//
+	// Bound the probe like C's walIndexAppend (wal.c:1333-1336). C uses
+	// `nCollide = idx` where its idx is 1-based (`iFrame - sLoc.iZero`); Go's
+	// idx (from htFrameSegIdx) is 0-based, so C's `nCollide = idx` equals
+	// Go's `idx + 1`. Decrement BEFORE advancing h on each occupied slot so a
+	// full/cyclic chain returns ErrCorrupt instead of falling out of the
+	// `for range htNSlot` loop with aPgno written but no reachable aHash slot.
+	nCollide := idx + 1
 	h := int(pgno*htHash1) & (htNSlot - 1)
 	for range htNSlot {
 		slotOff := htHashArrayOff + h*2
 		if binary.LittleEndian.Uint16(region[slotOff:]) == 0 {
 			binary.LittleEndian.PutUint16(region[slotOff:], uint16(idx+1))
-			return
+			return nil
+		}
+		if nCollide--; nCollide < 0 {
+			return ErrCorrupt
 		}
 		h = (h + 1) & (htNSlot - 1)
 	}
+	return nil
 }
 
 // shmHashGet looks up the latest frame for pgno from shm hash tables.
@@ -1076,11 +1114,21 @@ func (wi *walIndex) shmHashWrite(pgno, frame uint32) {
 // that could contain frames in [minFrame, maxFrame], searching backwards
 // from the newest segment. This avoids scanning already-checkpointed
 // segments, which is critical for performance on large WALs.
-// DRIFT: shmHash write/get drop walIndexAppend/walFindFrame nCollide CORRUPT + cleanup/zero-init See docs/btree/NOTES.md#drift-91-wal-index-hash-append-missing-collision-limit-corruption-det
+// Returns ErrCorrupt when a probe chain walks past nCollide occupied slots
+// without hitting an empty slot, mirroring walFindFrame's bounded probe
+// (wal.c:3580 `nCollide = HASHTABLE_NSLOT`, wal.c:3592-3595
+// `if((nCollide--)==0){ *piRead = 0; return SQLITE_CORRUPT_BKPT; }`). nCollide
+// is reset per segment (C resets inside the iHash loop, wal.c:3580) so a
+// multi-segment scan bounds each hash table independently, not cumulatively.
+// An empty slot mid-chain is a genuine miss (returns 0, nil) and lets the
+// caller legitimately read the page from the DB file; only an over-probed
+// non-empty chain is corruption — the read FAILS instead of silently
+// returning 0 and reading a pre-commit page from the DB file (a stale read
+// that would mask the corruption).
 // DRIFT: shmHashGet silently skips segment on SHM map/IO error vs C abort See docs/btree/NOTES.md#drift-92-shmhashget-skips-segment-on-map-io-error
-func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) uint32 {
+func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) {
 	if maxFrame == 0 {
-		return 0
+		return 0, nil
 	}
 
 	lastSeg, _ := htFrameSegIdx(maxFrame)
@@ -1105,12 +1153,15 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) uint32 {
 		pgnoBase, nEntry, iZero := htSegmentInfo(seg)
 		h := int(pgno*htHash1) & (htNSlot - 1)
 
+		// Per-segment probe bound, matching C's `nCollide = HASHTABLE_NSLOT`
+		// reset inside the iHash loop (wal.c:3580). htNSlot == HASHTABLE_NSLOT.
+		nCollide := htNSlot
 		var bestFrame uint32
 		for range htNSlot {
 			slotOff := htHashArrayOff + h*2
 			entry := binary.LittleEndian.Uint16(region[slotOff:])
 			if entry == 0 {
-				break // end of probe chain
+				break // end of probe chain (genuine miss)
 			}
 			idx := int(entry) - 1
 			if idx < nEntry {
@@ -1122,15 +1173,20 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) uint32 {
 					}
 				}
 			}
+			// Bound the probe AFTER the match check, like C (wal.c:3592-3595):
+			// walking past nCollide occupied slots = full/corrupt chain.
+			if nCollide--; nCollide == 0 {
+				return 0, ErrCorrupt
+			}
 			h = (h + 1) & (htNSlot - 1)
 		}
 
 		if bestFrame > 0 {
-			return bestFrame
+			return bestFrame, nil
 		}
 	}
 
-	return 0
+	return 0, nil
 }
 
 // shmClearHash zeros out all hash table data in shm regions.
@@ -1992,7 +2048,10 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 		// for non-last-of-commit pages; the last commit frame must
 		// be a fresh append carrying the dbSize commit marker.
 		if !(commit && isLast) && iFirst > 0 && !DiagDisableReuse.Load() {
-			iWrite := w.index.getInTxRange(p.pgno, nf+nAppended, iFirst)
+			iWrite, err := w.index.getInTxRange(p.pgno, nf+nAppended, iFirst)
+			if err != nil {
+				return err
+			}
 			if iWrite > 0 {
 				// Overwrite the page data at frame iWrite. The frame
 				// header (pgno, dbSize, salts, checksums) is NOT
@@ -2098,9 +2157,14 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 
 	// Batch update walIndex for APPENDED frames only — reused frames
 	// already have their hash entries at the reused index (setBatch
-	// would overwrite with the wrong frame number otherwise).
+	// would overwrite with the wrong frame number otherwise). A full /
+	// over-probed SHM hash segment surfaces as ErrCorrupt here, aborting
+	// the commit before mxFrame/mxCommitFrame advance (mirrors C's
+	// walFrames loop stopping on SQLITE_CORRUPT, wal.c:4229-4257).
 	if nAppended > 0 {
-		w.index.setBatch(appended, startFrame, commit)
+		if err := w.index.setBatch(appended, startFrame, commit); err != nil {
+			return err
+		}
 	}
 
 	// Invariant (defense-in-depth): every physically-appended frame must be
@@ -2209,7 +2273,10 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 
 		// Reuse check — same semantics as disk-mode writeFrames.
 		if !(commit && isLast) && iFirst > 0 {
-			iWrite := w.index.getInTxRange(p.pgno, nf+nAppended, iFirst)
+			iWrite, err := w.index.getInTxRange(p.pgno, nf+nAppended, iFirst)
+			if err != nil {
+				return err
+			}
 			if iWrite > 0 {
 				// Overwrite the existing memFrame slot in place.
 				// memFrames is 0-indexed; frames are 1-indexed.
@@ -2244,9 +2311,14 @@ func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 
 	// Batch update walIndex for APPENDED frames only — `appended` was
 	// recorded inline in the write loop above (never re-derived), so the
-	// force-appended commit frame is always present.
+	// force-appended commit frame is always present. A full / over-probed
+	// SHM hash segment surfaces as ErrCorrupt here, aborting the commit
+	// before mxFrame/mxCommitFrame advance (mirrors C's walFrames loop
+	// stopping on SQLITE_CORRUPT, wal.c:4229-4257).
 	if nAppended > 0 {
-		w.index.setBatch(appended, startFrame, commit)
+		if err := w.index.setBatch(appended, startFrame, commit); err != nil {
+			return err
+		}
 	}
 
 	// Invariant (defense-in-depth): registered maxFrame must cover every

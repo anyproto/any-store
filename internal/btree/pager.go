@@ -521,7 +521,10 @@ func (p *pager) open() error {
 	// occurred before checkpoint. Without this, commit() would serialize
 	// stale p.header fields back into page 1, corrupting the freelist.
 	if p.wal.index.maxFrame.Load() > 0 {
-		frame := p.wal.index.get(1, p.wal.index.maxFrame.Load())
+		frame, err := p.wal.index.get(1, p.wal.index.maxFrame.Load())
+		if err != nil {
+			return err
+		}
 		if frame > 0 {
 			walBuf := make([]byte, p.pageSize)
 			if err := p.wal.readFrame(frame, walBuf, nil, nil); err == nil {
@@ -848,7 +851,15 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 
 	// Try to read from WAL first
 	if walMaxFrame > 0 {
-		frame := p.wal.index.get(pgno, walMaxFrame)
+		frame, err := p.wal.index.get(pgno, walMaxFrame)
+		if err != nil {
+			// ErrCorrupt from a full/over-probed SHM hash chain: fail the
+			// read (matching C's walFindFrame SQLITE_CORRUPT_BKPT at
+			// wal.c:3593) instead of falling through to the DB file, which
+			// would silently serve a pre-commit page and mask the corruption.
+			p.writerCache.discard(pg.pgno)
+			return nil, err
+		}
 		if frame > 0 {
 			if err := p.wal.readFrame(frame, pg.data, p.codecScratch, &p.codecAEAD); err == nil {
 				// Parse page header
@@ -941,7 +952,14 @@ func (p *pager) readTempPage(pgno, walMaxFrame, dbSizeBound uint32, codecBuf []b
 
 	// Try to read from WAL first.
 	if walMaxFrame > 0 {
-		frame := p.wal.index.get(pgno, walMaxFrame)
+		frame, err := p.wal.index.get(pgno, walMaxFrame)
+		if err != nil {
+			// ErrCorrupt from a full/over-probed SHM hash chain: fail the read
+			// (C walFindFrame SQLITE_CORRUPT_BKPT, wal.c:3593) rather than
+			// serving a stale pre-commit page from disk.
+			p.recycleTempPage(pg)
+			return nil, err
+		}
 		if frame > 0 {
 			if err := p.wal.readFrame(frame, pg.data, codecBuf, codecAEAD); err == nil {
 				off := 0
@@ -1061,7 +1079,14 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 
 	// Try to read from WAL first.
 	if walMaxFrame > 0 {
-		frame := p.wal.index.get(pgno, walMaxFrame)
+		frame, err := p.wal.index.get(pgno, walMaxFrame)
+		if err != nil {
+			// ErrCorrupt from a full/over-probed SHM hash chain: fail the read
+			// (C walFindFrame SQLITE_CORRUPT_BKPT, wal.c:3593) rather than
+			// serving a stale pre-commit page from disk/masterStore.
+			cache.discard(pg.pgno)
+			return nil, err
+		}
 		if frame > 0 {
 			// BEGIN ENCRYPTION
 			if p.codec != nil && cache.codecScratch == nil {
@@ -1170,7 +1195,14 @@ func (p *pager) readRawPage(pgno, walMaxFrame uint32) ([]byte, error) {
 	}
 	buf := make([]byte, p.pageSize)
 	if walMaxFrame > 0 && p.wal != nil {
-		if frame := p.wal.index.get(pgno, walMaxFrame); frame > 0 {
+		frame, err := p.wal.index.get(pgno, walMaxFrame)
+		if err != nil {
+			// ErrCorrupt from a full/over-probed SHM hash chain: fail the read
+			// (C walFindFrame SQLITE_CORRUPT_BKPT, wal.c:3593) rather than
+			// serving a stale pre-commit page from disk/masterStore.
+			return nil, err
+		}
+		if frame > 0 {
 			if err := p.wal.readFrameRaw(frame, buf); err == nil {
 				return buf, nil
 			}
@@ -1790,7 +1822,14 @@ func (p *pager) refreshHeaderFromPage1() error {
 	// can be propagated to the caller rather than swallowed.
 	var walErr error
 	if effectiveMaxFrame > 0 {
-		frame := p.wal.index.get(1, effectiveMaxFrame)
+		frame, err := p.wal.index.get(1, effectiveMaxFrame)
+		if err != nil {
+			// ErrCorrupt from a full/over-probed SHM hash chain is a hard error,
+			// not a "WAL has no page 1" miss: do not fall back to the DB file
+			// (which would mask the corruption with a stale header). Matches C's
+			// walFindFrame SQLITE_CORRUPT_BKPT propagation (wal.c:3593).
+			return err
+		}
 		if frame > 0 {
 			var buf [dbHeaderSize]byte
 			if err := p.readWalFrameData(frame, buf[:]); err == nil {
@@ -1892,7 +1931,14 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 	// frames. After an external state change, beginWrite rebuilds the local page
 	// map from the WAL so page-1 refreshes do not depend solely on SHM hashes.
 	if effectiveMaxFrame > 0 {
-		frame := p.wal.index.get(1, effectiveMaxFrame)
+		frame, gerr := p.wal.index.get(1, effectiveMaxFrame)
+		if gerr != nil {
+			// ErrCorrupt from a full/over-probed SHM hash chain is a hard error,
+			// not a "WAL has no page 1" miss: fail rather than reading stale
+			// counters from the DB file (C walFindFrame SQLITE_CORRUPT_BKPT,
+			// wal.c:3593).
+			return 0, 0, gerr
+		}
 		if frame > 0 {
 			var buf [dbHeaderSize]byte
 			if err := p.readWalFrameData(frame, buf[:]); err == nil {

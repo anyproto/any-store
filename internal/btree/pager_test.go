@@ -2330,22 +2330,22 @@ func TestShmHashWriteGet_CrossSegment(t *testing.T) {
 	// Write entries that span multiple segments
 	// Region 0 holds htNPageOne = 4062 entries
 	for i := uint32(1); i <= 4070; i++ {
-		idx.shmHashWrite(i, i)
+		mustShmHashWrite(t, idx, i, i)
 	}
 
 	// Look up some entries
-	frame := idx.shmHashGet(1, 5000, 1)
+	frame := mustShmHashGet(t, idx, 1, 5000, 1)
 	assert.Equal(t, uint32(1), frame)
 
-	frame = idx.shmHashGet(4070, 5000, 1)
+	frame = mustShmHashGet(t, idx, 4070, 5000, 1)
 	assert.Equal(t, uint32(4070), frame)
 
 	// Look up non-existent
-	frame = idx.shmHashGet(9999, 5000, 1)
+	frame = mustShmHashGet(t, idx, 9999, 5000, 1)
 	assert.Equal(t, uint32(0), frame)
 
 	// maxFrame=0 returns 0
-	frame = idx.shmHashGet(1, 0, 1)
+	frame = mustShmHashGet(t, idx, 1, 0, 1)
 	assert.Equal(t, uint32(0), frame)
 }
 
@@ -3131,7 +3131,7 @@ func TestShmHashGet_RegionError(t *testing.T) {
 	defer idx.close(false)
 
 	// Query when no regions have data -> should return 0
-	frame := idx.shmHashGet(1, 100, 1)
+	frame := mustShmHashGet(t, idx, 1, 100, 1)
 	assert.Equal(t, uint32(0), frame)
 }
 
@@ -3426,11 +3426,17 @@ func TestShmHashWrite_RegionError(t *testing.T) {
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
 	require.NoError(t, err)
 
-	// Close shm to cause region errors
+	// Close the in-process shm. Note: inProcessShm.close() only nils the region
+	// slices; a subsequent region(0, create=true) re-allocates a fresh region,
+	// so this does NOT actually surface a region error. shmHashWrite therefore
+	// succeeds (returns nil) — the test asserts it handles a closed shm
+	// gracefully (no panic) and now also that no spurious error is returned.
+	// The genuine region-error propagation path (errorRegionShm) is covered by
+	// TestWalIndex_ShmHashWrite_RegionError.
 	idx.close(false)
 
-	// shmHashWrite should handle error gracefully (no panic)
-	idx.shmHashWrite(1, 1)
+	err = idx.shmHashWrite(1, 1)
+	require.NoError(t, err)
 }
 
 // ============================================================
@@ -5832,9 +5838,12 @@ func TestWalIndex_ShmHashWrite_RegionError(t *testing.T) {
 		regionErr:  os.ErrClosed,
 	}
 
-	// shmHashWrite for frame 4097 should hit region 1 and silently return.
-	// The function has no return value; it just returns early.
-	w.index.shmHashWrite(1, 4097) // should not panic, just return
+	// shmHashWrite for frame 4097 should hit region 1 and now propagate the
+	// region error to its caller (previously it returned void/silently). This
+	// mirrors C's walIndexAppend returning the walHashGet failure rc
+	// (wal.c:1299-1304), letting writeFrames/writeFramesMem abort the commit.
+	err := w.index.shmHashWrite(1, 4097)
+	require.ErrorIs(t, err, os.ErrClosed)
 }
 
 // --- wal.go:850-852 shmWriteCkptInfo region error ---

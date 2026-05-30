@@ -2980,32 +2980,6 @@ transform. The consequence is that Go neither encodes a meaningful page size int
 write nor reconstructs it on read; the field carries no usable page-size information, diverging from
 SQLite's per-read `szPage` decode (low impact because Go derives page size elsewhere).
 
-<a id="drift-91-wal-index-hash-append-missing-collision-limit-corruption-det"></a>
-### Drift: WAL Index Hash Append Missing Collision Limit Corruption Detection
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `wal.go:*walIndex.set`
-  (`internal/btree/wal.go:1031-1040` shmHashWrite probe loop; caller `wal.go:581-595`;
-  `wal.go:1010-1040` no idx==1 zero-init, no aPgno[idx] occupied check),
-  `wal.go:*walIndex.setBatch`
-  (`internal/btree/wal.go:621-623` setBatch loop; `wal.go:1031-1039` probe loop falls through),
-  `wal.go:*walIndex.shmHashGet` (`internal/btree/wal.go:1081-1098`),
-  `wal.go:*walIndex.shmHashWrite` (`internal/btree/wal.go:1031-1039`).
-
-C's `walIndexAppend` bounds the linear-probe insert with a corruption detector — `nCollide = idx;` then
-`for(iKey=walHash(iPage); aHash[iKey]; iKey=walNextHash(iKey)){ if((nCollide--)==0) return SQLITE_CORRUPT_BKPT; }`
-(`wal.c:1333-1336`) — and on read `walFindFrame` bounds the probe chain with `nCollide=HASHTABLE_NSLOT`
-returning `SQLITE_CORRUPT_BKPT` when exhausted; the rc propagates to the application. It also performs two
-protective steps Go omits: a first-entry zero-init `if(idx==1){ memset(aPgno, 0, ...); }` (`wal.c:1315-1319`)
-that re-clears reused wal-index space, and an inline crashed-writer cleanup
-`if(sLoc.aPgno[idx-1]){ walCleanupHash(pWal); }` (`wal.c:1321-1330`) that scrubs a peer writer's uncommitted
-SHM hash remnants before reusing a slot. Go's `shmHashWrite`/`setBatch` probe up to `htNSlot` iterations and,
-finding no free slot, simply fall out of the loop writing no entry and returning no error, while `shmHashGet`
-likewise lacks the bounded-chain corruption return; neither the `idx==1` zero-init nor the inline
-`walCleanupHash` is performed. The consequence is that on a full/over-probed or corrupt hash segment Go
-silently drops or skips frame mappings instead of surfacing `SQLITE_CORRUPT`, and stale remnants from a
-crashed writer or reused WAL generation can be left in place — turning detectable corruption into silent
-data loss or stale reads.
-
 <a id="drift-92-shmhashget-skips-segment-on-map-io-error"></a>
 ### Drift: shmHashGet Skips Segment On Map IO Error
 - **Category:** changed-logic  -  **Severity:** low

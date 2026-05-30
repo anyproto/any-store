@@ -77,7 +77,7 @@ func TestWALReadFrameFaultFallsThroughToDisk(t *testing.T) {
 	// This is exactly the C `iFrame != 0` case where C reads ONLY from the WAL.
 	var targetPgno, targetFrame uint32
 	for pgno := uint32(1); pgno <= pager.dbSize.Load(); pgno++ {
-		if f := pager.wal.index.get(pgno, walMaxFrame); f > 0 {
+		if f := mustWiGet(t, pager.wal.index, pgno, walMaxFrame); f > 0 {
 			targetPgno, targetFrame = pgno, f
 			break
 		}

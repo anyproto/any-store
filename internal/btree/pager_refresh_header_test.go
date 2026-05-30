@@ -50,7 +50,7 @@ func TestRefreshHeaderFromPage1_DoubleIOFailure(t *testing.T) {
 		effectiveMaxFrame = mf
 	}
 	require.Greater(t, effectiveMaxFrame, uint32(0))
-	require.Greater(t, p.wal.index.get(1, effectiveMaxFrame), uint32(0))
+	require.Greater(t, mustWiGet(t, p.wal.index, 1, effectiveMaxFrame), uint32(0))
 
 	// Force the double I/O failure: WAL-frame read fails (file-backed WAL with
 	// nil file => ErrWALCorrupt) AND the DB-file fallback is unavailable.
