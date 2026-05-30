@@ -2559,8 +2559,10 @@ func (p *pager) releaseSavepoint(id int) error {
 // checkpointWithMode runs a WAL checkpoint with the specified mode.
 // Does NOT take pager.mu.Lock — readers can continue during checkpoint.
 // The WAL's busy handler is used for FULL/RESTART/TRUNCATE modes to wait
-// for readers that block progress, matching SQLite's behavior.
-// DRIFT: FULL/RESTART/TRUNCATE checkpoint returns nil vs SQLITE_BUSY on incomplete backfill See docs/btree/NOTES.md#drift-49-non-passive-checkpoint-returns-success-instead-of-busy-on-in
+// for readers that block progress, matching SQLite's behavior. For
+// non-PASSIVE modes an incomplete backfill (or a write-lock downgrade)
+// surfaces ErrBusy from wal.checkpointWithMode; we only dispatch a backup
+// restart on success, so a BUSY result correctly suppresses it.
 func (p *pager) checkpointWithMode(mode CheckpointMode) error {
 	err := p.wal.checkpointWithMode(p.file, p.master, mode, p.wal.busyHandler)
 	if err == nil && (mode == CheckpointRestart || mode == CheckpointTruncate) {

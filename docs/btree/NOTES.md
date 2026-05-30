@@ -2602,31 +2602,6 @@ The consequence is a reduced observability surface: callers cannot inspect how m
 WAL existed or was backfilled by a checkpoint, a benign API-completeness divergence rather
 than a correctness defect.
 
-<a id="drift-49-non-passive-checkpoint-returns-success-instead-of-busy-on-in"></a>
-### Drift: Non Passive Checkpoint Returns Success Instead Of BUSY On Incomplete Backfill
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `pager.go:*pager.checkpointWithMode` (`pager.go:2321-2329` (wrapper);
-  `wal.go:3008-3012` and `wal.go:3340-3341` (suppression points)),
-  `wal.go:*wal.checkpointPost` (`internal/btree/wal.go:3305-3307`),
-  `wal.go:*wal.checkpointWithMode` (`wal.go:3295-3319` (checkpointPost;
-  backfill<authoritativeMxFrame -> return nil)).
-
-SQLite's `walCheckpoint` enforces the documented `sqlite3_wal_checkpoint_v2` contract for
-non-PASSIVE modes (FULL/RESTART/TRUNCATE): after the backfill phase it runs
-`if( pInfo->nBackfill < pWal->hdr.mxFrame ){ rc = SQLITE_BUSY; }` (`wal.c:2352-2356`), and its
-final return `return (rc==SQLITE_OK && eMode!=eMode2 ? SQLITE_BUSY : rc)` (`wal.c:4425`) also
-surfaces `SQLITE_BUSY` whenever the requested mode was silently downgraded to PASSIVE because
-the writer lock could not be obtained (`eMode2 = SQLITE_CHECKPOINT_PASSIVE`, `wal.c:4356`).
-Both signals tell the caller that active readers prevented the full WAL from being copied into
-the DB, so the requested mode did not fully succeed. The Go port suppresses both: a single
-incomplete-case gate in `checkpointPost` (`wal.go:3305-3307`) returns `nil` (success)
-regardless of mode when `backfill < w.authoritativeMxFrame()`, and the write-lock busy
-downgrade is likewise swallowed (`wal.go:3008-3012`, `wal.go:3340-3341`). The consequence is
-an error-signaling / API-contract drift: a caller requesting a FULL/RESTART/TRUNCATE
-checkpoint gets a false success and cannot tell that readers blocked the operation -- the data
-path stays consistent, so this is not corruption, but the BUSY-means-retry semantics SQLite
-guarantees are lost.
-
 <a id="drift-52-checkpoint-missing-page-size-mismatch-and-over-grow-corrupti"></a>
 ### Drift: Checkpoint Missing Page Size Mismatch And Over Grow Corruption Guards
 - **Category:** changed-logic  -  **Severity:** low

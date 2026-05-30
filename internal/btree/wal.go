@@ -143,6 +143,13 @@ const (
 	// database snapshot. It then checkpoints all frames in the log file and
 	// syncs the database file. Blocks new writers while pending, but new
 	// readers are allowed to continue. Does not reset the WAL.
+	//
+	// Returns ErrBusy if active readers/writers prevented copying the entire
+	// WAL into the database, or if the requested mode had to be downgraded to
+	// PASSIVE because the writer lock was busy. This mirrors SQLite's
+	// SQLITE_BUSY contract for non-PASSIVE checkpoints (wal.c:2352-2356,
+	// wal.c:4425): BUSY means "retry" — the data path is unchanged and the
+	// frames that could be copied were copied.
 	CheckpointFull
 
 	// CheckpointRestart works the same as CheckpointFull with the addition
@@ -150,10 +157,22 @@ const (
 	// readers are reading from the database file only. This ensures that the
 	// next writer will restart the log file from the beginning. Blocks new
 	// writers while pending, but does not impede readers.
+	//
+	// Returns ErrBusy (and does NOT reset the WAL) if the backfill was
+	// incomplete because active readers/writers blocked it, or if the mode was
+	// downgraded to PASSIVE because the writer lock was busy — so the caller
+	// can tell the WAL was not actually reset and can retry. Mirrors SQLite
+	// (wal.c:2352-2356 short-circuits before the eMode>=RESTART reset branch;
+	// wal.c:4425 re-surfaces BUSY on a write-lock downgrade).
 	CheckpointRestart
 
 	// CheckpointTruncate works the same as CheckpointRestart with the addition
 	// that it also truncates the log file to zero bytes.
+	//
+	// Returns ErrBusy (and does NOT truncate/reset the WAL) under the same
+	// incomplete-backfill or write-lock-downgrade conditions as
+	// CheckpointRestart, so the caller can tell the WAL was not truncated and
+	// can retry. Mirrors SQLite (wal.c:2352-2356, wal.c:4425).
 	CheckpointTruncate
 )
 
@@ -3237,13 +3256,35 @@ func (w *wal) rewriteChecksums(iLast uint32) error {
 // mxCommitFrame would undercount committed frames written by peer
 // processes, causing a close-time checkpoint to only backfill our own
 // frames before truncate — losing the peer's data (commit 9023f5b).
-// DRIFT: FULL/RESTART/TRUNCATE checkpoint returns nil vs SQLITE_BUSY on incomplete backfill See docs/btree/NOTES.md#drift-49-non-passive-checkpoint-returns-success-instead-of-busy-on-in
 // RESOLVED (was DRIFT-50): after a full backfill this function now physically
 // truncates the DB file down to the committed page count (mxPage*pageSize) and
 // fdatasyncs, gated on a live-mxFrame guard so a concurrent older-snapshot
 // reader or a mid-checkpoint peer commit is honored. Mirrors SQLite
 // walCheckpoint full-backfill truncate (wal.c:2320-2329).
 func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode CheckpointMode, xBusy BusyHandler) error {
+	// Remember the originally requested mode. If the write-lock acquisition
+	// below fails, `mode` is silently downgraded to CheckpointPassive (matching
+	// SQLite's eMode2 = SQLITE_CHECKPOINT_PASSIVE, wal.c:4356). SQLite still
+	// reports SQLITE_BUSY to the caller in that case at the very end of
+	// sqlite3WalCheckpoint: `return (rc==SQLITE_OK && eMode!=eMode2 ? SQLITE_BUSY : rc)`
+	// (wal.c:4425). We re-surface that BUSY via downgradeResult below so the
+	// caller learns the requested stronger mode did not actually run.
+	requestedMode := mode
+
+	// downgradeResult mirrors wal.c:4425. Given the result rc of the checkpoint
+	// body, it converts a nil (success) result into ErrBusy when the requested
+	// non-PASSIVE mode was downgraded to PASSIVE because the write lock was
+	// busy (requestedMode != mode, i.e. mode == CheckpointPassive). Errors and
+	// genuine PASSIVE requests pass through unchanged. (The downgraded-and-
+	// incomplete case already returns ErrBusy from checkpointPost, so this only
+	// adds BUSY for the downgraded-but-fully-backfilled case — precisely C.)
+	downgradeResult := func(rc error) error {
+		if rc == nil && requestedMode != CheckpointPassive && mode == CheckpointPassive {
+			return ErrBusy
+		}
+		return rc
+	}
+
 	// Acquire checkpoint lock -- serialize concurrent checkpoints.
 	// The busy handler is NOT used for the checkpoint lock itself, matching
 	// SQLite: "Even if there is a busy-handler configured, it will not be
@@ -3386,7 +3427,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 		// Nothing new to checkpoint.
 		// For non-PASSIVE modes, check if we need to wait for readers
 		// to finish before attempting RESTART/TRUNCATE.
-		return w.checkpointPost(mode, xBusy)
+		return downgradeResult(w.checkpointPost(mode, xBusy))
 	}
 
 	// Acquire exclusive lock on reader slot 0 before backfilling,
@@ -3395,7 +3436,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	lockErr := walBusyLock(w.index, xBusy, lockRead0, lockExclusive)
 	if lockErr == ErrBusy {
 		// Reader on slot 0 active; can't backfill but not a fatal error.
-		return w.checkpointPost(mode, xBusy)
+		return downgradeResult(w.checkpointPost(mode, xBusy))
 	}
 	if lockErr != nil {
 		return lockErr
@@ -3612,12 +3653,12 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	// Release the reader lock held while backfilling
 	_ = w.index.unlock(lockRead0, lockExclusive)
 
-	return w.checkpointPost(mode, xBusy)
+	return downgradeResult(w.checkpointPost(mode, xBusy))
 }
 
 // checkpointPost handles post-backfill logic: WAL reset for modes that
-// completed a full checkpoint.
-// DRIFT: FULL/RESTART/TRUNCATE checkpoint returns nil vs SQLITE_BUSY on incomplete backfill See docs/btree/NOTES.md#drift-49-non-passive-checkpoint-returns-success-instead-of-busy-on-in
+// completed a full checkpoint. For non-PASSIVE modes with an incomplete
+// backfill it returns ErrBusy (SQLite walCheckpoint, wal.c:2351-2356).
 func (w *wal) checkpointPost(mode CheckpointMode, xBusy BusyHandler) error {
 	backfill := w.index.nBackfill.Load()
 
@@ -3630,6 +3671,20 @@ func (w *wal) checkpointPost(mode CheckpointMode, xBusy BusyHandler) error {
 	// a peer's committed frames that we never saw.
 	if backfill < w.authoritativeMxFrame() {
 		// Not everything was checkpointed. Can't reset the WAL.
+		//
+		// For non-PASSIVE modes (FULL/RESTART/TRUNCATE) SQLite reports
+		// SQLITE_BUSY here so the caller learns active readers/writers
+		// prevented copying the whole WAL into the DB and can retry
+		// (BUSY-means-retry). Mirrors walCheckpoint (wal.c:2351-2356):
+		// `if( eMode!=PASSIVE ){ if( pInfo->nBackfill<pWal->hdr.mxFrame ) rc = SQLITE_BUSY; }`.
+		// Note `mode` here is the possibly-downgraded mode (see the write-lock
+		// downgrade in checkpointWithMode): when the write lock was busy, mode
+		// is already CheckpointPassive, so this returns nil and the downgrade
+		// BUSY is surfaced instead at the checkpointWithMode tail (wal.c:4425),
+		// exactly as C passes eMode2 to walCheckpoint.
+		if mode != CheckpointPassive {
+			return ErrBusy
+		}
 		return nil
 	}
 

@@ -138,10 +138,14 @@ func TestCheckpointPartialWithActiveReader(t *testing.T) {
 	}
 	require.NoError(t, tx2.Commit())
 
-	// Checkpoint should do a partial checkpoint — it can't copy
-	// frames past the reader's snapshot
+	// Checkpoint does a partial checkpoint — it can't copy frames past
+	// the reader's snapshot. For non-PASSIVE modes SQLite reports BUSY
+	// when the backfill is incomplete because active readers blocked it
+	// (walCheckpoint, wal.c:2352-2356), so the caller can retry. The
+	// frames that could be copied still were; this is BUSY-means-retry,
+	// not a failure of the data path.
 	err = db.Checkpoint(CheckpointFull)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrBusy)
 
 	// Reader should still see its snapshot (batch 1 data)
 	ns4, _ := db.getNamespaceLocked("data")
@@ -169,6 +173,97 @@ func TestCheckpointPartialWithActiveReader(t *testing.T) {
 	}
 	require.NoError(t, rtx2.Rollback())
 	_ = ns
+}
+
+// TestCheckpointNonPassiveBusyOnIncompleteBackfill is the regression test for
+// the BUSY-signaling contract of non-PASSIVE checkpoints. SQLite's walCheckpoint
+// returns SQLITE_BUSY (BUSY-means-retry) when active readers/writers prevent the
+// entire WAL from being copied into the DB (wal.c:2352-2356), and also when the
+// requested mode had to be downgraded to PASSIVE because the writer lock was busy
+// (wal.c:4356 + wal.c:4425). PASSIVE keeps the original nil-on-partial contract.
+//
+// Without the fix the FULL/RESTART/TRUNCATE cases below return nil and these
+// require.ErrorIs assertions fail.
+func TestCheckpointNonPassiveBusyOnIncompleteBackfill(t *testing.T) {
+	// --- EDIT 1: incomplete backfill (active reader pins an older snapshot). ---
+	t.Run("incomplete_backfill_active_reader", func(t *testing.T) {
+		db, _ := tempDBWithNS(t, "data")
+		// Short busy timeout so the FULL checkpoint's wait for the reader is brief.
+		db.pager.wal.busyHandler = DefaultBusyTimeout(100 * time.Millisecond)
+
+		// Batch 1.
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns2, _ := db.getNamespaceLocked("data")
+		for i := range 30 {
+			require.NoError(t, tx.Put(ns2, fmt.Appendf(nil, "k-%04d", i), []byte("v")))
+		}
+		require.NoError(t, tx.Commit())
+
+		// Reader pinned at batch 1.
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+
+		// Batch 2 (frames past the reader's snapshot).
+		tx2, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns3, _ := db.getNamespaceLocked("data")
+		for i := 30; i < 60; i++ {
+			require.NoError(t, tx2.Put(ns3, fmt.Appendf(nil, "k-%04d", i), []byte("v")))
+		}
+		require.NoError(t, tx2.Commit())
+
+		// Non-PASSIVE modes must report ErrBusy: the backfill cannot complete
+		// past the reader's snapshot.
+		for _, mode := range []CheckpointMode{CheckpointFull, CheckpointRestart, CheckpointTruncate} {
+			err = db.Checkpoint(mode)
+			require.ErrorIs(t, err, ErrBusy, "mode=%d must return ErrBusy on incomplete backfill", mode)
+		}
+
+		// PASSIVE keeps the original contract: nil even though the backfill is
+		// incomplete. This guards auto-checkpoint/close paths.
+		require.NoError(t, db.Checkpoint(CheckpointPassive))
+	})
+
+	// --- EDIT 2: write-lock downgrade with a COMPLETE backfill. ---
+	// Holding lockWrite exclusively makes the non-PASSIVE checkpoint fail to
+	// acquire the writer lock (xBusy=nil) and silently downgrade to PASSIVE.
+	// With no readers the backfill completes fully, so checkpointPost returns
+	// nil — but the downgrade must be re-surfaced as ErrBusy (wal.c:4425).
+	t.Run("write_lock_downgrade_complete_backfill", func(t *testing.T) {
+		dir := t.TempDir()
+		p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+		p.inProcess = true
+		require.NoError(t, p.open())
+		defer func() { _ = p.close() }()
+
+		// Commit one frame.
+		mf, slot, err := p.beginRead()
+		require.NoError(t, err)
+		p.walMaxFrame.Store(mf)
+		require.NoError(t, p.beginWrite(WalIndexHdr{}))
+		pg, err := p.getWritablePage(1)
+		require.NoError(t, err)
+		p.releasePage(pg)
+		_, _, _, err = p.commit(true, false)
+		require.NoError(t, err)
+		p.endRead(slot)
+
+		// Hold lockWrite exclusively so the checkpoint can't get the writer
+		// lock and downgrades to PASSIVE.
+		require.NoError(t, p.wal.index.lock(lockWrite, lockExclusive))
+		defer func() { _ = p.wal.index.unlock(lockWrite, lockExclusive) }()
+
+		// xBusy=nil -> immediate downgrade; backfill completes (no readers) ->
+		// downgrade re-surfaced as ErrBusy.
+		err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
+		require.ErrorIs(t, err, ErrBusy)
+
+		// PASSIVE never tries the writer lock and is never downgraded -> nil.
+		err = p.wal.checkpointWithMode(p.file, p.master, CheckpointPassive, nil)
+		require.NoError(t, err)
+	})
 }
 
 func TestReaderSlotRotation(t *testing.T) {

@@ -180,7 +180,12 @@ func TestCheckpoint_NoTruncateWithOlderSnapshotReader(t *testing.T) {
 	// readmark lowers mxSafeFrame below the live mxFrame, so the truncate guard
 	// (mxSafeFrame==authoritativeMxFrame()) is FALSE and the file is NOT shrunk:
 	// the trailing pages the reader still reads must remain on disk.
-	require.NoError(t, db.Checkpoint(CheckpointFull))
+	//
+	// The non-PASSIVE checkpoint reports ErrBusy because the active reader
+	// blocked a complete backfill (BUSY-means-retry, wal.c:2352-2356); the
+	// data-path guard below (file must NOT shrink) is what this test verifies
+	// and is unaffected by the error return.
+	require.ErrorIs(t, db.Checkpoint(CheckpointFull), ErrBusy)
 	require.Equal(t, bigFileSize, fileSize(t, path),
 		"file must NOT shrink while an older-snapshot reader is open (concurrent-reader safety, wal.c:2322)")
 

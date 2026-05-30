@@ -2117,11 +2117,19 @@ func TestCheckpointPost_IncompleteBackfill(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
 
-	// Set nBackfill < nFrame -> checkpointPost should return nil (can't reset)
+	// Set nBackfill < nFrame -> backfill incomplete, can't reset. For a
+	// non-PASSIVE mode (CheckpointRestart) checkpointPost now returns ErrBusy,
+	// matching SQLite's walCheckpoint (wal.c:2351-2356): active readers/writers
+	// prevented copying the whole WAL, so the caller learns it must retry.
 	w.index.nBackfill.Store(0)
 
 	err := w.checkpointPost(CheckpointRestart, nil)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrBusy)
+
+	// PASSIVE keeps the original contract: nil (success) on incomplete backfill,
+	// so auto-checkpoint/close paths are unaffected.
+	errPassive := w.checkpointPost(CheckpointPassive, nil)
+	require.NoError(t, errPassive)
 }
 
 // ============================================================
@@ -2840,8 +2848,12 @@ func TestCheckpointWithMode_DowngradeToPassive(t *testing.T) {
 	// Hold write lock to force downgrade from FULL to PASSIVE
 	require.NoError(t, p.wal.index.lock(lockWrite, lockExclusive))
 
+	// The backfill still completes (no readers), but the requested FULL mode was
+	// silently downgraded to PASSIVE because the writer lock was busy. SQLite
+	// re-surfaces this as SQLITE_BUSY (wal.c:4356 eMode2=PASSIVE + wal.c:4425
+	// eMode!=eMode2 ? BUSY) so the caller knows the stronger mode did not run.
 	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrBusy)
 
 	_ = p.wal.index.unlock(lockWrite, lockExclusive)
 }
@@ -3575,11 +3587,14 @@ func TestCheckpointWithMode_FullFallbackToPassive(t *testing.T) {
 	require.NoError(t, err)
 	p.endRead(slot)
 
-	// Hold write lock -> FULL downgrades to PASSIVE
+	// Hold write lock -> RESTART downgrades to PASSIVE. The requested mode was
+	// silently downgraded because the writer lock was busy, which SQLite
+	// re-surfaces as SQLITE_BUSY (wal.c:4356 + wal.c:4425) so the caller knows
+	// the RESTART did not run (the WAL was not reset).
 	require.NoError(t, p.wal.index.lock(lockWrite, lockExclusive))
 
 	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrBusy)
 
 	_ = p.wal.index.unlock(lockWrite, lockExclusive)
 }
