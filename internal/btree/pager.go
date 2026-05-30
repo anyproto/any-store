@@ -814,7 +814,6 @@ func (p *pager) getPage(pgno uint32) (*page, error) {
 
 // getPageWriter returns a page using the writer's cache, reading from
 // WAL or disk on cache miss. Used by the writer goroutine only.
-// DRIFT: getPageWriter reads disk/WAL before dbSize check; can surface stale page bytes See docs/btree/NOTES.md#drift-5-getpagewriter-reads-disk-before-checking-dbsize
 // DRIFT: WAL frame read failure silently falls through to stale disk read See docs/btree/NOTES.md#drift-6-wal-frame-read-failure-falls-through-to-disk-read
 // DRIFT: no mxPgno / SQLITE_FULL max-page-count guard in page getters See docs/btree/NOTES.md#drift-8-max-page-count-sqlite-full-enforcement-absent
 func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
@@ -832,6 +831,20 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 
 	// Cache miss: create a new cached page (hard create — writer always succeeds).
 	pg := p.writerCache.create(pgno, 2)
+
+	// Decide read-vs-zero up front, matching C getPageNormal
+	// (pager.c:5590,5615): a page whose number exceeds the logical database
+	// size is never read from WAL or disk — it is memset(0)ed. p.dbSize is the
+	// writer's authoritative same-process allocation counter (refreshed via
+	// beginWrite -> refreshHeaderFromPage1 on cross-process state change), so a
+	// pgno above it cannot be live; reading WAL/disk could resurrect stale
+	// trailing bytes from a since-truncated region (truncateTo defers the
+	// physical ftruncate). Same idiom as getPageNoContent.
+	if pgno > p.dbSize.Load() {
+		clear(pg.data)
+		pg.header = pageHeader{}
+		return pg, nil
+	}
 
 	// Try to read from WAL first
 	if walMaxFrame > 0 {
@@ -853,16 +866,14 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 		}
 	}
 
-	// Read from database file
+	// Read from database file. Reached only when pgno <= p.dbSize (the upfront
+	// guard above returned for any out-of-bounds page), so a read failure here
+	// is for an in-bounds page and is always a hard error — matching C, where
+	// readDbPage runs only in the in-bounds else branch (pager.c:5617-5623).
 	if p.file != nil {
 		if err := p.readDBPage(pgno, pg.data); err != nil {
-			// If page is beyond current file but within dbSize, it's a new page
-			if pgno <= p.dbSize.Load() {
-				p.writerCache.discard(pg.pgno)
-				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
-			}
-			// Zero-fill new pages
-			clear(pg.data)
+			p.writerCache.discard(pg.pgno)
+			return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 		} else {
 			// BEGIN ENCRYPTION
 			if p.codec != nil {
@@ -915,6 +926,19 @@ func (p *pager) readTempPage(pgno, walMaxFrame, dbSizeBound uint32, codecBuf []b
 	pg.pinCount = 1
 	pg.uncached = true
 
+	// Decide read-vs-zero up front, matching C getPageNormal
+	// (pager.c:5590,5615). dbSizeBound is the reader's per-snapshot page count
+	// (effectiveReaderDbSize → hdr.nPage in multi-process mode) or p.dbSize on
+	// the uncached/writer path; a page beyond it is not part of this snapshot,
+	// so it is zeroed rather than read from WAL or disk. WAL-then-disk still
+	// runs for pgno <= dbSizeBound, so a peer-committed page in
+	// (p.dbSize, snapshotBound] living only in the WAL is still served.
+	if pgno > dbSizeBound {
+		clear(pg.data)
+		pg.header = pageHeader{}
+		return pg, nil
+	}
+
 	// Try to read from WAL first.
 	if walMaxFrame > 0 {
 		frame := p.wal.index.get(pgno, walMaxFrame)
@@ -930,17 +954,13 @@ func (p *pager) readTempPage(pgno, walMaxFrame, dbSizeBound uint32, codecBuf []b
 		}
 	}
 
-	// Read from database file.
+	// Read from database file. Reached only when pgno <= dbSizeBound (the
+	// upfront guard returned for any out-of-snapshot page), so a read failure
+	// here is for an in-bounds page and is always a hard error — matching C.
 	if p.file != nil {
 		if err := p.readDBPage(pgno, pg.data); err != nil {
-			// dbSizeBound is the caller's snapshot page count (reader) or
-			// p.dbSize (writer/uncached); a page beyond it is a not-yet-
-			// materialized new page → zero-fill rather than error.
-			if pgno <= dbSizeBound {
-				p.recycleTempPage(pg)
-				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
-			}
-			clear(pg.data)
+			p.recycleTempPage(pg)
+			return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 		} else {
 			// BEGIN ENCRYPTION
 			if p.codec != nil {
@@ -1026,6 +1046,19 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 		return p.readTempPage(pgno, walMaxFrame, p.readerDbSizeBound(cache), cache.codecScratch, &cache.codecAEAD)
 	}
 
+	// Decide read-vs-zero up front, matching C getPageNormal
+	// (pager.c:5590,5615). The reader bounds on the per-snapshot page count
+	// (readerDbSizeBound → pcache.dbSize → effectiveReaderDbSize, hdr.nPage in
+	// multi-process mode), NOT p.dbSize: a peer can commit frames for pages with
+	// pgno > p.dbSize that are still within this reader's snapshot, and they
+	// live in the WAL, so WAL-then-disk must still run for pgno <= snapshotBound.
+	// A page truly beyond the snapshot is zeroed instead of reading stale bytes.
+	if pgno > p.readerDbSizeBound(cache) {
+		clear(pg.data)
+		pg.header = pageHeader{}
+		return pg, nil
+	}
+
 	// Try to read from WAL first.
 	if walMaxFrame > 0 {
 		frame := p.wal.index.get(pgno, walMaxFrame)
@@ -1047,16 +1080,13 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 		}
 	}
 
-	// Read from database file.
+	// Read from database file. Reached only when pgno <= snapshotBound (the
+	// upfront guard returned for any out-of-snapshot page), so a read failure
+	// here is for an in-bounds page and is always a hard error — matching C.
 	if p.file != nil {
 		if err := p.readDBPage(pgno, pg.data); err != nil {
-			// Reader snapshot bound (cache is non-nil here): a page beyond it
-			// is a peer-allocated page not yet in the file → zero-fill.
-			if pgno <= p.readerDbSizeBound(cache) {
-				cache.discard(pg.pgno)
-				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
-			}
-			clear(pg.data)
+			cache.discard(pg.pgno)
+			return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 		} else {
 			// BEGIN ENCRYPTION
 			if p.codec != nil {

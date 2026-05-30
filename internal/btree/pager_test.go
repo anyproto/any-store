@@ -701,6 +701,80 @@ func TestReadPageUncached_InMemoryFallback(t *testing.T) {
 	p.releasePage(pg)
 }
 
+// TestGetPage_BeyondDbSizeZeroesStaleDiskBytes is the regression test for
+// drift-5 (getPageWriter Reads Disk Before Checking dbSize). It plants stale,
+// physically-present, non-zero bytes in the DB file at a page number ABOVE the
+// logical database size (the precise hazard of a since-truncated region whose
+// physical ftruncate is deferred), then verifies all three getters
+// (getPageWriter, getPageReader cache path, readTempPage via the nil-cache
+// fallback) return a CLEAN ZEROED page rather than resurrecting the stale
+// bytes. This matches C getPageNormal, which memset(0)s any page whose pgno
+// exceeds pPager->dbSize without ever touching WAL or disk (pager.c:5590,5615).
+//
+// Before the fix these getters called readDBPage FIRST and only consulted
+// dbSize afterward, so a physically-present out-of-bounds page returned its
+// stale on-disk content. After the fix the upfront `pgno > bound` guard zeroes
+// the page, so the test fails (sees 0xAB bytes) without the fix and passes with
+// it.
+func TestGetPage_BeyondDbSizeZeroesStaleDiskBytes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	p := newPager(path, 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	// Sanity: a freshly opened DB has dbSize 1 (page 1 only). The stale page
+	// number sits well beyond that logical size.
+	require.Equal(t, uint32(1), p.dbSize.Load())
+	const stalePgno = uint32(7)
+
+	// Physically grow the file and plant non-zero stale bytes at stalePgno,
+	// WITHOUT bumping dbSize. mmap is disabled in this harness (mmapSize==0),
+	// so readDBPage uses ReadAt and will see these bytes if it is ever reached.
+	stale := make([]byte, p.pageSize)
+	for i := range stale {
+		stale[i] = 0xAB
+	}
+	off := int64(stalePgno-1) * int64(p.pageSize)
+	_, err := p.file.WriteAt(stale, off)
+	require.NoError(t, err)
+
+	allZero := func(t *testing.T, pg *page) {
+		t.Helper()
+		for i, b := range pg.data {
+			require.Zerof(t, b, "page byte %d should be zero (got 0x%02X); stale disk bytes leaked", i, b)
+		}
+		require.Equal(t, pageHeader{}, pg.header, "page header should be zero-value")
+	}
+
+	// (A) getPageWriter: writer bounds on p.dbSize.
+	pgW, err := p.getPageWriter(stalePgno, 0)
+	require.NoError(t, err)
+	allZero(t, pgW)
+	// Drop it from the writer cache so the reader paths below don't short-
+	// circuit on a cache hit — we want each getter's own upfront guard tested.
+	p.writerCache.clear()
+
+	// (C) getPageReader cache path: bounds on readerDbSizeBound(cache). With an
+	// unset cache.dbSize the bound degrades to p.dbSize (==1), so stalePgno is
+	// out of bounds. beginRead establishes the read snapshot.
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	cache := newPcache(int(p.pageSize), 50, true)
+	pgR, err := p.getPageReader(stalePgno, mf, cache)
+	require.NoError(t, err)
+	allZero(t, pgR)
+
+	// (B) readTempPage via getPageReader's nil-cache fallback (uncached path).
+	pgT, err := p.getPageReader(stalePgno, mf, nil)
+	require.NoError(t, err)
+	allZero(t, pgT)
+	p.releasePage(pgT)
+
+	p.endRead(slot)
+}
+
 // ============================================================
 // getPageAt — various branches (91.9%)
 // ============================================================

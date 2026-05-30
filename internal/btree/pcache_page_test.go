@@ -2648,9 +2648,23 @@ func TestIntegrityCheck_DatabaseSizeZero_Header(t *testing.T) {
 	db.pager.dbSize.Store(0)
 	db.pager.releasePage(pg1)
 	require.NoError(t, tx2.Commit())
+	require.NoError(t, db.Close())
 
-	// IntegrityCheckN should hit nPages==0 and return nil
-	err = db.IntegrityCheckN(0)
+	// Reopen so the pager rebuilds p.dbSize the way C does — from the actual
+	// file size, not the corrupt header field. With the header's
+	// DatabaseSize==0 (untrusted, see pager.open), p.dbSize becomes the file's
+	// real page count (>=1), so page 1 is in-bounds and readable. Operating on
+	// the prior handle would have left p.dbSize at the artificial 0 stored
+	// above — a state a genuine open never produces — which, after the drift-5
+	// fix (getPageReader zero-fills any pgno > snapshot bound, matching C
+	// getPageNormal pager.c:5590), would zero-fill even page 1.
+	db2, err := testOpen(t, path, DefaultOptions())
+	require.NoError(t, err)
+	defer db2.Close()
+
+	// IntegrityCheckN should read the (now in-bounds) page 1, see the header's
+	// DatabaseSize==0, hit the nPages==0 short-circuit and return nil.
+	err = db2.IntegrityCheckN(0)
 	// It should return nil (no error for empty database)
 	assert.NoError(t, err)
 }

@@ -2188,20 +2188,6 @@ an un-validated zero page entering the descent/read path in place of a corruptio
 error; severity is low because it is the same root failure surfaced by drift-3 and is
 bounded by the per-snapshot `dbSize` check.
 
-<a id="drift-5-getpagewriter-reads-disk-before-checking-dbsize"></a>
-### Drift: getPageWriter Reads Disk Before Checking dbSize
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `pager.go:*pager.getPageWriter` (`internal/btree/pager.go:770-808`).
-
-SQLite's `getPageNormal` decides read-vs-zero up front -- `if( !isOpen(fd) ||
-pPager->dbSize<pgno || noContent )` => `memset(pData,0,pageSize)` (`pager.c:5590,5615`)
--- and never touches disk or WAL for a page whose number exceeds the logical database
-size. Go's `getPageWriter` inverts this ordering: it consults the WAL
-(`pager.go:751-768`) and calls `readDBPage` (`pager.go:772`) FIRST, only afterward
-considering `dbSize`. The consequence is that for a page number above the current
-database size `getPageWriter` can return stale trailing on-disk page content instead
-of a clean zeroed page, where SQLite would have guaranteed zeros.
-
 <a id="drift-6-wal-frame-read-failure-falls-through-to-disk-read"></a>
 ### Drift: WAL Frame Read Failure Falls Through To Disk Read
 - **Category:** changed-logic  -  **Severity:** high
