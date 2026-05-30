@@ -2576,21 +2576,6 @@ production (non-test, non-`WithPath`) entry point. It is dead/legacy code supers
 `tryMergeLeaf`, which is explicitly marked superseded, this legacy cluster is not annotated
 as dead code, so a reader may mistake it for a live, divergent insert path.
 
-<a id="drift-36-cursor-stack-not-cleared-on-close-enabling-use-after-close-r"></a>
-### Drift: Cursor Stack Not Cleared On Close Enabling Use After Close Repin
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `btree.go:*Cursor.releasePages` (`btree.go:3157`).
-
-SQLite's `btreeReleaseAllCursorPages` (`btree.c:700-709`) both releases every pinned page in
-the cursor's stack and sets `pCur->iPage = -1`; the `iPage=-1` reset is the load-bearing part
-that logically empties the stack, and SQLite's traversal/insert/delete code keys off
-`iPage<0` (e.g. the assert at `btree.c:9709`). Go's `releasePages` (`btree.go:3157-3164`)
-only nils each `frame.pg` to release the pinned pages but does not reset the stack to empty.
-The consequence is that after `Close()` the cursor still reports a non-empty stack, which
-defeats the `Next`/`Previous` emptiness guard and enables a use-after-close: a subsequent
-operation can re-pin a since-released (and possibly repurposed) page and misread it as an
-interior page.
-
 <a id="drift-37-delete-rebalance-underfull-trigger-counts-fragbytes-as-used"></a>
 ### Drift: Delete Rebalance Underfull Trigger Counts fragBytes As Used
 - **Category:** changed-logic  -  **Severity:** low

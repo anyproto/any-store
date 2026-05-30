@@ -3281,7 +3281,6 @@ func (c *Cursor) Close() {
 }
 
 // releasePages releases all pinned pages in the cursor stack.
-// DRIFT: releasePages doesn't empty cursor stack (no iPage=-1); use-after-close repin See docs/btree/NOTES.md#drift-36-cursor-stack-not-cleared-on-close-enabling-use-after-close-r
 func (c *Cursor) releasePages() {
 	for i := range c.stack {
 		if c.stack[i].pg != nil {
@@ -3289,6 +3288,13 @@ func (c *Cursor) releasePages() {
 			c.stack[i].pg = nil
 		}
 	}
+	// Logically empty the stack so the cursor no longer claims a tree position.
+	// Mirrors SQLite's pCur->iPage = -1 in btreeReleaseAllCursorPages (btree.c:707):
+	// after releasing pinned pages the cursor must report no position, otherwise
+	// post-close Next/Previous (whose guard is !c.valid && len(c.stack) == 0) would
+	// re-pin released, possibly-repurposed pages. Capacity-preserving truncate keeps
+	// the pre-allocated stackBuf backing array, so no allocation churn is introduced.
+	c.stack = c.stack[:0]
 }
 
 // First positions the cursor at the first (smallest) key.

@@ -1734,6 +1734,54 @@ func TestDelCurCov_DirectCursorSeekExactKeyError(t *testing.T) {
 	cur.Close()
 }
 
+// TestDelCurCov_CursorCloseClearsStackNoRepin verifies that Close() empties the
+// cursor stack so that post-close Next()/Previous() short-circuit and do not
+// re-pin (and re-read) released pages. This mirrors SQLite's
+// btreeReleaseAllCursorPages setting pCur->iPage = -1 (btree.c:707): releasing
+// the pinned pages must also logically empty the stack, otherwise the
+// !c.valid && len(c.stack) == 0 emptiness guard in Next/Previous fails open and
+// the leaf frame (now pg==nil) is misclassified as interior, re-pinning a
+// possibly-repurposed page.
+func TestDelCurCov_CursorCloseClearsStackNoRepin(t *testing.T) {
+	p := tempPagerWithPageSize(t, 512)
+	bt := initLeafBtree(t, p)
+
+	// Build a multi-level tree so the cursor stack holds interior frames.
+	for i := 0; i < 100; i++ {
+		key := binary.BigEndian.AppendUint32(nil, uint32(i))
+		require.NoError(t, bt.Put(key, make([]byte, 20)))
+	}
+
+	pg, err := bt.getPage(bt.rootPage)
+	require.NoError(t, err)
+	rootInterior := pg.header.isInterior()
+	bt.pager.releasePage(pg)
+	require.True(t, rootInterior, "expected a multi-level tree (interior root)")
+
+	// pinned counts pages currently held pinned by the writer cache.
+	pinned := func() int { return bt.pager.writerCache.nPage - bt.pager.writerCache.nRecyclable }
+
+	cur := bt.NewCursor()
+	require.NoError(t, cur.First())
+	require.True(t, cur.Valid())
+
+	cur.Close()
+	require.False(t, cur.Valid())
+	require.Empty(t, cur.stack, "Close() must empty the cursor stack")
+
+	pinnedAfterClose := pinned()
+
+	// Post-close Next/Previous must no-op (no error, stay invalid) and must not
+	// re-pin any pages.
+	require.NoError(t, cur.Next())
+	require.False(t, cur.Valid())
+	require.Equal(t, pinnedAfterClose, pinned(), "Next() after Close re-pinned a page")
+
+	require.NoError(t, cur.Previous())
+	require.False(t, cur.Valid())
+	require.Equal(t, pinnedAfterClose, pinned(), "Previous() after Close re-pinned a page")
+}
+
 // TestDelCurCov_DirectNextEmptyInterior exercises Next() descent into an
 // interior page with cellCount == 0 (L2868-2869).
 func TestDelCurCov_DirectNextEmptyInterior(t *testing.T) {
