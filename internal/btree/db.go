@@ -1935,7 +1935,6 @@ func (tx *WriteTx) ReleaseSavepoint(id int) error {
 }
 
 // CreateNamespace creates a new namespace within this transaction.
-// DRIFT: CreateNamespace adds ErrNamespaceExists uniqueness pre-check not in C See docs/btree/NOTES.md#drift-59-createnamespace-uniqueness-pre-check-not-in-btreecreatetable
 func (tx *WriteTx) CreateNamespace(name string) (*Namespace, error) {
 	if tx.closed {
 		return nil, ErrTxClosed

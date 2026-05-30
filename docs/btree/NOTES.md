@@ -2792,20 +2792,6 @@ later than SQLite (`wal.go:2421`). The consequence is a minor timing divergence 
 read-transaction retry path: under contention the Go reader sleeps one iteration behind
 SQLite's schedule, which affects retry pacing only and not correctness.
 
-<a id="drift-59-createnamespace-uniqueness-pre-check-not-in-btreecreatetable"></a>
-### Drift: CreateNamespace Uniqueness Pre Check Not In btreeCreateTable
-- **Category:** new-feature  -  **Severity:** low
-- **Affected functions:** `db.go:*WriteTx.CreateNamespace` (`internal/btree/db.go:927-933`).
-
-Go's `*DB.CreateNamespace` (the worker invoked by `*WriteTx.CreateNamespace`) first calls
-`db.getNamespaceLocked(name)` and, before allocating a root page, returns `ErrNamespaceExists`
-if the namespace already exists (propagating any non-`ErrNamespaceNotFound` lookup error)
-(`db.go:927-933`). SQLite's `btreeCreateTable` performs no existence or uniqueness check at all
--- it unconditionally allocates and zeroes a new root page, leaving uniqueness entirely to the
-higher schema layer. The consequence is an added, non-SQLite uniqueness contract at the btree
-layer: namespace creation is idempotently rejected rather than always allocating a fresh root,
-a new feature that changes the create semantics relative to stock SQLite.
-
 <a id="drift-61-out-of-range-savepoint-release-errors-instead-of-no-op"></a>
 ### Drift: Out Of Range Savepoint Release Errors Instead Of No Op
 - **Category:** changed-logic  -  **Severity:** low
