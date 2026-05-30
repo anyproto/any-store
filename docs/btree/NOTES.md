@@ -1056,27 +1056,47 @@ concurrent access to a shared variable be synchronized via `sync/atomic` operati
 a data race -- even if "logically" only one goroutine writes at any given time --
 unless the Go race detector can see a happens-before relationship.
 
-The options were:
-- **Mutex on every read** -- too expensive; readers would contend with the writer
-  on every overflow bounds check
-- **Per-reader `dbSize` snapshot** (matching SQLite's per-connection model) -- would
-  require threading a snapshot value through every reader call path
-- **`atomic.Uint32`** -- minimal overhead (~1 ns per Load on x86), zero contention,
-  zero API changes
+Two mechanisms coexist in the implementation, each solving a distinct problem:
 
-We chose `atomic.Uint32` as the simplest correct solution. The writer uses
-`dbSize.Add(1)` in `allocatePage()` and `dbSize.Store()` for rollback/init paths.
-Readers use `dbSize.Load()` for bounds checking. This is safe under Go's memory
-model and introduces no contention.
+1. **Writer-side `atomic.Uint32`** -- the `pager.dbSize` field is the writer's
+   allocation counter. The writer uses `dbSize.Add(1)` in `allocatePage()` and
+   `dbSize.Store()` for rollback/init paths; any goroutine reading it uses
+   `dbSize.Load()`. The atomic is what makes this shared-field access safe under
+   Go's memory model with no contention (~1 ns per Load on x86). A mutex on every
+   read was rejected as too expensive (readers would contend with the writer on
+   every overflow bounds check).
+
+2. **Reader-side per-snapshot `dbSize` bound** (matching SQLite's per-connection
+   `pPager->dbSize` model) -- a pure reader must *not* bound-check against the
+   writer's `pager.dbSize`, because that atomic is only refreshed on the write path
+   (`beginWrite` → `refreshHeaderFromPage1`), so a reader would wrongly reject pages
+   a peer process allocated after this process opened. Instead, each reader cache
+   carries `pcache.dbSize` (pcache.go:69-81), the committed page count captured
+   cross-process at `BeginRead`, set in lockstep with `walMaxFrame` at every
+   snapshot-establish site. It is derived by `pager.effectiveReaderDbSize`
+   (pager.go:1664-1686), which mirrors `sqlite3WalDbsize` (wal.c:3672, returning
+   `pWal->hdr.nPage`) and falls back to `pager.dbSize` when the WAL header carries
+   no committed size -- mirroring `pagerPagecount`'s file-size fallback
+   (pager.c:3299-3305). Every reader bound check consults this via
+   `pager.readerDbSizeBound` (pager.go:1688-1699), which returns `cache.dbSize`
+   when set and otherwise degrades safely to `pager.dbSize.Load()` for the
+   writer/uncached paths. `IntegrityCheckN` sets `cache.dbSize = nPages` likewise
+   (integrity.go:583).
+
+So the `atomic.Uint32` is *not* an alternative to a per-reader snapshot -- the two
+are complementary. The atomic provides safe concurrent access to the writer's
+counter under Go's memory model; the per-snapshot `pcache.dbSize` provides the
+correct cross-process read-after-write bound that SQLite gets for free from its
+per-connection `Pager`.
 
 ### Drift
 
 | Aspect | SQLite C | Go |
 |--------|----------|-----|
-| `dbSize` ownership | Per-connection (`Pager.dbSize`) -- no sharing | Single shared `pager.dbSize` |
+| `dbSize` ownership | Per-connection (`Pager.dbSize`) -- no sharing | Writer counter is a single shared `pager.dbSize`; readers carry per-snapshot `pcache.dbSize` |
 | Writer/reader isolation | Separate `Pager` instances per thread | Shared struct, goroutine concurrency |
-| Synchronization | None needed (no sharing) or `pBt->mutex` | `atomic.Uint32` (Load/Store/Add) |
-| WAL snapshot | `pWal->hdr.nPage` local copy at read-lock time | `walMaxFrame` per reader, atomic `dbSize` for bounds |
+| Synchronization | None needed (no sharing) or `pBt->mutex` | `atomic.Uint32` (Load/Store/Add) on the writer counter |
+| WAL snapshot | `pWal->hdr.nPage` local copy at read-lock time | `pcache.dbSize` captured at `BeginRead` in lockstep with `walMaxFrame`, via `effectiveReaderDbSize`/`readerDbSizeBound` |
 | Performance cost | Zero (no sharing = no synchronization) | ~1 ns per `atomic.Load` on x86 |
 
 **Classification: Divergent** -- This drift stems from a fundamental architectural
@@ -1084,10 +1104,14 @@ difference: SQLite uses per-connection state isolation (each connection has its 
 `Pager`), while the Go implementation shares a single `pager` across goroutines. The
 Go memory model mandates explicit synchronization for any cross-goroutine field access,
 even for benign races that C compilers and POSIX threads would handle correctly via
-hardware cache coherence. The `atomic.Uint32` is the minimal correct fix; an
-alternative would be to refactor toward per-reader `dbSize` snapshots (matching
-SQLite's architecture), but that would be a much larger change for the same correctness
-guarantee.
+hardware cache coherence. The Go implementation addresses both halves of SQLite's
+per-connection `Pager.dbSize`: the writer's allocation counter is an `atomic.Uint32`
+(`pager.dbSize`) for safe shared access, *and* readers carry a per-snapshot
+`pcache.dbSize` (captured cross-process at `BeginRead` in lockstep with `walMaxFrame`,
+surfaced via `effectiveReaderDbSize` mirroring `sqlite3WalDbsize` and consulted via
+`readerDbSizeBound`) so the reader bound check matches SQLite's
+`sqlite3WalDbsize`/`pagerPagecount` snapshot semantics rather than the writer-only
+counter.
 
 ---
 
@@ -3545,24 +3569,6 @@ reader can observe frames a concurrent peer committed after this process last re
 but the behavior is undocumented. The consequence is a non-obvious divergence from a naive bounds-check
 expectation: a frame index above the local snapshot is not an error in multi-process mode, and correctness instead
 relies on the OS read returning short/EOF for genuinely absent frames.
-
-<a id="drift-111-per-snapshot-reader-dbsize-bound-implemented-but-notes-says-"></a>
-### Drift: Per Snapshot Reader dbSize Bound Implemented But NOTES Says Otherwise
-- **Category:** changed-logic  -  **Severity:** high
-- **Affected functions:** `integrity.go` (`internal/btree/integrity.go:48-50` getPage->getPageReader,
-  `:577-579` cache.dbSize = nPages snapshot bound),
-  `pager.go` (`internal/btree/pager.go:1606-1617` readerDbSizeBound,
-  `:962-985` reader disk-read bound, `:1599-1604` effectiveReaderDbSize).
-
-A per-snapshot reader `dbSize` bound IS implemented in the code, contradicting NOTES.md section 19 which states it
-is NOT implemented. `pager.getPageReader`'s miss/disk/temp paths bound `pgno` against a per-snapshot page count via
-`readerDbSizeBound(cache)`: if `cache.dbSize != 0` it uses that captured snapshot value, otherwise it falls back to
-the process-local atomic `p.dbSize` (`pager.go:1612-1617`). `IntegrityCheckN` sets `cache.dbSize = nPages` (the
-WAL/file-capped snapshot size, `integrity.go:577-579`), and the `pcache.dbSize` field mirrors SQLite's
-per-connection `pPager->dbSize` captured cross-process at `BeginRead`. The consequence is documentation drift of
-high severity: a maintainer reading NOTES.md section 19 would believe the cross-process read-after-write bound is
-absent and could "re-add" it or reason incorrectly about reader safety, when the protection already exists in
-`getPageReader`/`readerDbSizeBound`.
 
 <a id="drift-112-integritycheck-treats-master-page-1-as-flat-leaf"></a>
 ### Drift: IntegrityCheck Treats Master Page 1 As Flat Leaf
