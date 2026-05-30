@@ -1089,14 +1089,19 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 // the freelist or growing the database, where the old content is irrelevant.
 // Modeled after SQLite's PAGER_GET_NOCONTENT flag in pager.c:5507.
 // DRIFT: no mxPgno / SQLITE_FULL max-page-count guard in page getters See docs/btree/NOTES.md#drift-8-max-page-count-sqlite-full-enforcement-absent
-// DRIFT: getPageNoContent returns cache hit un-zeroed; C re-zeroes on NOCONTENT path See docs/btree/NOTES.md#drift-9-getpagenocontent-returns-cached-page-un-zeroed
 // DRIFT: no btreeGetUnusedPage refcount>1 in-use ErrCorrupt check See docs/btree/NOTES.md#drift-10-missing-refcount-greater-than-one-in-use-page-corruption-det
 func (p *pager) getPageNoContent(pgno uint32) (*page, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
 	}
-	// Cache hit: return as-is (the content may be stale but the caller will overwrite it)
+	// Cache hit: re-zero before returning. SQLite's NOCONTENT path always
+	// re-zeroes even on a cache hit (pager.c:5567-5618: the cache-hit shortcut
+	// is gated on `pPg->pPager && !noContent`, so with noContent set control
+	// always falls through to memset(pPg->pData, 0, pPager->pageSize)). Match
+	// that so a NOCONTENT fetch never hands back stale residual bytes.
 	if pg := p.writerCache.fetch(pgno); pg != nil {
+		clear(pg.data)
+		pg.header = pageHeader{}
 		return pg, nil
 	}
 	// Cache miss: create a blank page without any disk/WAL read (hard create — writer).

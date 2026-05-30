@@ -2250,20 +2250,6 @@ via `p.dbSize.Add(1)` (`pager.go:1173`) with no bound, and the defined `ErrFull`
 (`errors.go:37`) is unused. The consequence is that database growth is never capped and
 the 32-bit pgno guard SQLite relies on is absent.
 
-<a id="drift-9-getpagenocontent-returns-cached-page-un-zeroed"></a>
-### Drift: getPageNoContent Returns Cached Page Un Zeroed
-- **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `pager.go:*pager.getPageNoContent` (`internal/btree/pager.go:1017`).
-
-In SQLite `getPageNormal` the early "return without further ado" path is gated on
-`pPg->pPager && !noContent` (`pager.c:5567`), so on the NOCONTENT path the cache-hit
-shortcut is bypassed and control always falls into the branch that re-executes
-`memset(pPg->pData, 0, pPager->pageSize)` (`pager.c:5618`) -- a NOCONTENT request
-always yields a freshly zeroed page, even on a cache hit. Go's `getPageNoContent`
-(`pager.go:1017`) can return a cached page without re-zeroing it. The consequence is
-that a NOCONTENT caller in Go may observe stale residual bytes from the page's previous
-life, whereas SQLite guarantees zeros.
-
 <a id="drift-10-missing-refcount-greater-than-one-in-use-page-corruption-det"></a>
 ### Drift: Missing Refcount Greater Than One In Use Page Corruption Detection
 - **Category:** changed-logic  -  **Severity:** low
