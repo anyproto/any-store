@@ -2360,23 +2360,6 @@ without counting them. The consequence is a structural design divergence that su
 in traversal (no interior-key stops) and in counting (interior cells excluded); for the
 B+tree shape both results are correct, but they differ from SQLite's B-tree semantics.
 
-<a id="drift-15-countpage-unbounded-recursion-no-depth-or-cycle-guard"></a>
-### Drift: countPage Unbounded Recursion No Depth Or Cycle Guard
-- **Category:** changed-logic  -  **Severity:** high
-- **Affected functions:** `btree.go:*btree.Count` (`btree.go:3077-3123 (specifically the unbounded recursion at 3107 and 3117)`), `btree.go:*btree.countPage` (`btree.go:3107`), `db.go:*ReadTx.Count` (`btree.go:3077-3123 (esp. recursive calls at 3107 and 3117; no depth guard)`).
-
-SQLite walks the tree for `sqlite3BtreeCount` iteratively using a cursor whose descent
-goes through `moveToChild`, which returns `SQLITE_CORRUPT_BKPT` once `iPage` reaches
-`BTCURSOR_MAX_DEPTH-1` (==19) (`btree.c:5466-5468`), so a cyclic or over-deep page
-structure is turned into a clean corruption error. Go's `countPage`
-(`btree.go:3077-3123`) is plain recursion: it validates only per-page cell-pointer/offset
-bounds (`btree.go:3097-3104`) and recurses on child pgno at `btree.go:3107` and on
-rightChild at `btree.go:3117` with no depth counter, no visited-page set, and no
-`btCursorMaxDepth` guard. The consequence is that a corrupt child-pointer cycle drives
-unbounded recursion to stack overflow and a hard process crash instead of returning
-`ErrCorrupt` -- and notably every other Go traversal (First/Next/Seek) does enforce a
-depth bound, making `countPage` the lone unguarded walker.
-
 <a id="drift-16-count-traversal-missing-interrupt-cancellation-check"></a>
 ### Drift: Count Traversal Missing Interrupt Cancellation Check
 - **Category:** platform-support  -  **Severity:** low

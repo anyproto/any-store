@@ -3161,17 +3161,18 @@ func (bt *btree) collapseSingleChild(parentPg *page, childPgno uint32) error {
 // Count returns the total number of key-value pairs in the B-tree.
 // It traverses all pages but only reads page headers (cellCount),
 // avoiding any key/value parsing — similar to SQLite's COUNT(*) optimization.
-// DRIFT: countPage recurses with no depth/cycle bound; corrupt tree crashes process See docs/btree/NOTES.md#drift-15-countpage-unbounded-recursion-no-depth-or-cycle-guard
 // DRIFT: count traversal has no per-iteration interrupt/cancellation check See docs/btree/NOTES.md#drift-16-count-traversal-missing-interrupt-cancellation-check
 func (bt *btree) Count() (int, error) {
-	return bt.countPage(bt.rootPage)
+	return bt.countPage(bt.rootPage, 0)
 }
 
 // DRIFT: B+tree (leaf-only keys) drops interior-cell positions that SQLite B-tree visits See docs/btree/NOTES.md#drift-14-b-plus-tree-traversal-drops-interior-cell-keys-versus-sqlite
-// DRIFT: countPage recurses with no depth/cycle bound; corrupt tree crashes process See docs/btree/NOTES.md#drift-15-countpage-unbounded-recursion-no-depth-or-cycle-guard
 // DRIFT: count traversal has no per-iteration interrupt/cancellation check See docs/btree/NOTES.md#drift-16-count-traversal-missing-interrupt-cancellation-check
 // DRIFT: Count uses Go int vs C i64 *pnEntry; entry total can truncate See docs/btree/NOTES.md#drift-17-count-return-type-truncates-i64-entry-total-to-go-int
-func (bt *btree) countPage(pgno uint32) (int, error) {
+func (bt *btree) countPage(pgno uint32, depth int) (int, error) {
+	if depth > btCursorMaxDepth {
+		return 0, ErrCorrupt
+	}
 	pg, err := bt.getPage(pgno)
 	if err != nil {
 		return 0, err
@@ -3201,7 +3202,7 @@ func (bt *btree) countPage(pgno uint32) (int, error) {
 			return 0, ErrCorrupt
 		}
 		childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
-		c, cerr := bt.countPage(childPgno)
+		c, cerr := bt.countPage(childPgno, depth+1)
 		if cerr != nil {
 			bt.pager.releasePage(pg)
 			return 0, cerr
@@ -3211,7 +3212,7 @@ func (bt *btree) countPage(pgno uint32) (int, error) {
 	rightChild := pg.header.rightChild
 	bt.pager.releasePage(pg)
 
-	c, err := bt.countPage(rightChild)
+	c, err := bt.countPage(rightChild, depth+1)
 	if err != nil {
 		return 0, err
 	}
