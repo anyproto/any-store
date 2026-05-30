@@ -2489,13 +2489,17 @@ func (w *wal) tryBeginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err
 	return w.tryBeginReadMultiProcessHdr()
 }
 
-// tryBeginReadInProcess handles the in-process/in-memory path where all
-// state is in process-local atomics and there are no cross-goroutine SHM races.
-// No re-validation needed because writes go through process-local atomics
-// (mxCommitFrame, nBackfill, aReadMark) which are always consistent within
-// a single process. No WAL_RETRY — the in-process path never races with
-// external checkpoint or writer state changes.
-// DRIFT: reused reader slot's read-mark not advanced to mxFrame when below it See docs/btree/NOTES.md#drift-101-reader-slot-mark-not-advanced-to-mxframe-on-reuse
+// tryBeginReadInProcess handles the in-process/in-memory path where all state
+// is in process-local atomics. There are no cross-PROCESS SHM races, but an
+// INTERNAL concurrent checkpoint (auto-checkpoint from Commit via
+// pager.tryCheckpoint, or DB.Checkpoint) runs WITHOUT pager.mu and can advance
+// mxCommitFrame / nBackfill and grab+clear free reader slots while a reader is
+// mid-acquire. The slot-0 fast path and the fresh-slot claim both publish a
+// mark equal to mxFrame, but the slot-REUSE branch publishes no mark, so it
+// re-validates mxCommitFrame and nBackfill after taking the shared lock and
+// returns errWALRetry if either moved (mirrors SQLite walTryBeginRead's
+// post-lock re-check of aReadMark[mxI], wal.c:3239-3249). On retry the
+// nBackfill==mxFrame slot-0 fast path stays safe.
 func (w *wal) tryBeginReadInProcess() (maxFrame uint32, slot int, err error) {
 	_, maxFrame, slot, err = w.tryBeginReadInProcessHdr()
 	return maxFrame, slot, err
@@ -2527,6 +2531,22 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame uint32, slot
 	if bestSlot != -1 {
 		lockSlot := lockRead0 + bestSlot
 		if err := w.index.lock(lockSlot, lockShared); err == nil {
+			// Post-lock re-validation. An internal concurrent checkpoint
+			// (auto-checkpoint from Commit / DB.Checkpoint) runs WITHOUT
+			// pager.mu and may, between our lock-free scan above and the
+			// shared-lock acquisition here, advance mxCommitFrame and/or
+			// nBackfill (and exclusively grab+clear a now-free reader slot).
+			// The reused slot's stored mark may then lag our snapshot
+			// (endRead never resets a slot's mark), so a checkpointer that
+			// read that under-reported mark could backfill frames past the
+			// snapshot this slot still pins. Mirror SQLite walTryBeginRead's
+			// post-lock re-check of aReadMark[mxI] (wal.c:3239-3249): if
+			// either value changed, drop the lock and retry. On retry the
+			// nBackfill==mxFrame slot-0 fast path stays safe.
+			if w.index.mxCommitFrame.LoadLocal() != mxFrame || w.index.nBackfill.Load() != nBackfill {
+				_ = w.index.unlock(lockSlot, lockShared)
+				return WalIndexHdr{}, 0, 0, errWALRetry
+			}
 			return hdr, mxFrame, bestSlot, nil
 		}
 	}

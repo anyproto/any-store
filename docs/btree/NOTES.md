@@ -3418,22 +3418,6 @@ The consequence is that slot 0 no longer reliably signals "reader views db file 
 carries a frame value, so any cross-process code (including checkpoint logic) that assumes slot 0 is pinned at
 0 can misinterpret the lowest reader bound.
 
-<a id="drift-101-reader-slot-mark-not-advanced-to-mxframe-on-reuse"></a>
-### Drift: Reader Slot Mark Not Advanced To mxFrame On Reuse
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `wal.go:*wal.tryBeginReadInProcess`
-  (`internal/btree/wal.go:2481-2486`; contrast `wal.go:2488-2494` which only runs when `bestSlot==-1`).
-
-SQLite's `walTryBeginRead`, after picking the best existing read-mark slot, checks `if( mxReadMark<mxFrame ||
-mxI==0 )` (`wal.c:3184-3185`) and, when the chosen slot's mark is below the current `mxFrame`, claims a fresh
-slot 1..4 exclusively and stores `mxFrame` into its read-mark (`wal.c:3187-3198`), keeping the held slot's mark
-consistent with the snapshot the reader actually sees. Go's `tryBeginReadInProcessHdr` reuses an existing
-reader slot whenever `bestSlot != -1` (`wal.go:2481-2486`) with NO `bestMark < mxFrame` test and NO advance of
-that slot's read-mark to `mxFrame`, returning `maxFrame=mxFrame` (line 2484) while the held slot's stored mark
-stays below it. The consequence is that the published read-mark can lag the reader's actual snapshot frame, so
-a concurrent checkpointer reading that under-reported mark could reclaim/overwrite WAL frames the reader still
-needs — a real read-safety concern, hence the medium severity.
-
 <a id="drift-102-reader-slot-tie-break-selects-lowest-not-highest"></a>
 ### Drift: Reader Slot Tie Break Selects Lowest Not Highest
 - **Category:** changed-logic  -  **Severity:** low
