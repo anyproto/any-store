@@ -2385,26 +2385,6 @@ platform-dependent. The consequence is that on a 64-bit target the behavior is
 practically equivalent, but on a 32-bit target the total is 32-bit and could overflow for
 a very large tree, whereas SQLite is always `i64`.
 
-<a id="drift-18-freetreepages-missing-corruption-cycle-and-refcount-guards-o"></a>
-### Drift: freeTreePages Missing Corruption Cycle And Refcount Guards Of clearDatabasePage
-- **Category:** changed-logic  -  **Severity:** high
-- **Affected functions:** `db.go:*DB.DeleteNamespace` (`db.go:989-1042`), `db.go:*DB.freeTreePages` (`db.go:990`), `db.go:*DB.freeTreePages` (`db.go:1001-1002`), `db.go:*DB.freeTreePages` (`db.go:989`), `db.go:*WriteTx.DeleteNamespace` (`db.go:989-1042 (freeTreePages: no refcount/visited/depth guard; recursion at db.go:1009-1013)`).
-
-SQLite's `clearDatabasePage` validates each page before clearing it: it rejects
-`pgno > btreePagecount` with `SQLITE_CORRUPT_PGNO` (`btree.c:10228-10230`), runs
-`getAndInitPage` to validate the page header/cell structure (`btree.c:10231`), and
-rejects a page whose pager refcount `!= (1 + (pgno==1))` with `SQLITE_CORRUPT_PAGE`
-(`btree.c:10233-10238`) -- that refcount check is precisely what stops a corrupt
-self-referencing or cyclic child pointer from being followed. Go's `freeTreePages`
-(`db.go:989-1042`) fetches pages via `db.pager.getPage` with no upper-bound page-count
-check, no page-init validation, and no refcount/visited/cycle guard, and on interior
-pages it reads each child pointer straight from raw bytes --
-`off := ...Uint16(pg.data[cpOff+i*2:])` then `...Uint32(pg.data[off:off+4])`
-(`db.go:1001-1002`) -- with no bounds check on the cell offset. The consequence is that a
-corrupt cell offset near the page end can index out of `pg.data` and panic, and a cyclic
-child pointer drives unbounded recursion, instead of either returning a clean
-`ErrCorrupt`.
-
 <a id="drift-19-deletenamespace-leaks-overflow-chains-on-interior-divider-ce"></a>
 ### Drift: DeleteNamespace Leaks Overflow Chains On Interior Divider Cells
 - **Category:** changed-logic  -  **Severity:** medium

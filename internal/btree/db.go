@@ -964,7 +964,6 @@ func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
 
 // DeleteNamespace deletes a namespace. Must be called within a write transaction.
 // All pages belonging to the namespace's B-tree are freed to the freelist.
-// DRIFT: freeTreePages lacks clearDatabasePage's page-count/init/refcount/cycle guards See docs/btree/NOTES.md#drift-18-freetreepages-missing-corruption-cycle-and-refcount-guards-o
 func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 	if tx.closed {
 		return ErrTxClosed
@@ -992,11 +991,38 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 	return nil
 }
 
+// maxTreeDepth bounds freeTreePages recursion. It is a conservative cap far
+// above any real B-tree height for this page size; exceeding it implies a
+// cyclic/self-referencing child pointer and is treated as corruption. This is
+// the practical stand-in for clearDatabasePage's pager-refcount guard
+// (btree.c:10233-10238), which any-store does not port verbatim (its single
+// writer goroutine has a different ref/pin model than SQLite's shared cache).
+const maxTreeDepth = 64
+
 // freeTreePages recursively frees all pages in a B-tree,
 // including any overflow page chains attached to leaf cells.
-// DRIFT: freeTreePages lacks clearDatabasePage's page-count/init/refcount/cycle guards See docs/btree/NOTES.md#drift-18-freetreepages-missing-corruption-cycle-and-refcount-guards-o
 // DRIFT: freeTreePages frees root (drop) vs clearDatabasePage retains root (clear) See docs/btree/NOTES.md#drift-20-freetreepages-frees-root-page-versus-cleardatabasepage-clear
 func (db *DB) freeTreePages(pgno uint32) error {
+	return db.freeTreePagesDepth(pgno, 0)
+}
+
+// freeTreePagesDepth is the recursive worker for freeTreePages. The depth
+// parameter bounds recursion against a cyclic child pointer.
+func (db *DB) freeTreePagesDepth(pgno uint32, depth int) error {
+	// Up-front page-count guard, mirroring clearDatabasePage's
+	// `if(pgno>btreePagecount(pBt)) return SQLITE_CORRUPT_PGNO` (btree.c:10228).
+	// Catching an out-of-range child up front matches C and avoids touching a
+	// zero-filled buffer (getPageWriter zero-fills pages within dbSize).
+	if pgno == 0 || pgno > db.pager.dbSize.Load() {
+		return ErrCorrupt
+	}
+	// Bound recursion to prevent infinite recursion / stack overflow on a
+	// cyclic child pointer (stand-in for the C refcount guard at
+	// btree.c:10233-10238).
+	if depth > maxTreeDepth {
+		return ErrCorrupt
+	}
+
 	pg, err := db.pager.getPage(pgno)
 	if err != nil {
 		return err
@@ -1008,7 +1034,19 @@ func (db *DB) freeTreePages(pgno uint32) error {
 		cpOff := pg.cellPointerOffset()
 		children := make([]uint32, 0, n+1)
 		for i := range n {
-			off := int(binary.BigEndian.Uint16(pg.data[cpOff+i*2:]))
+			// Bounds-check the interior child-pointer read: a corrupt 16-bit
+			// cell offset near page end must yield ErrCorrupt, not a panic in
+			// the writer goroutine (C equivalent: btreeInitPage validation via
+			// getAndInitPage, btree.c:10231).
+			off, oerr := pg.getCellOffsetSafe(i)
+			if oerr != nil {
+				db.pager.releasePage(pg)
+				return oerr
+			}
+			if int(off) < cpOff+(n*2) || int(off)+4 > len(pg.data) {
+				db.pager.releasePage(pg)
+				return ErrCorrupt
+			}
 			childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
 			children = append(children, childPgno)
 		}
@@ -1017,7 +1055,7 @@ func (db *DB) freeTreePages(pgno uint32) error {
 
 		// Recurse into children first (free leaves before interior)
 		for _, child := range children {
-			if err := db.freeTreePages(child); err != nil {
+			if err := db.freeTreePagesDepth(child, depth+1); err != nil {
 				return err
 			}
 		}
@@ -1782,7 +1820,6 @@ func (tx *WriteTx) CreateNamespace(name string) (*Namespace, error) {
 }
 
 // DeleteNamespace deletes a namespace within this transaction.
-// DRIFT: freeTreePages lacks clearDatabasePage's page-count/init/refcount/cycle guards See docs/btree/NOTES.md#drift-18-freetreepages-missing-corruption-cycle-and-refcount-guards-o
 // DRIFT: freeTreePages leaks overflow chains on interior divider cells See docs/btree/NOTES.md#drift-19-deletenamespace-leaks-overflow-chains-on-interior-divider-ce
 func (tx *WriteTx) DeleteNamespace(name string) error {
 	if tx.closed {
