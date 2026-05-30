@@ -2427,8 +2427,6 @@ func (w *wal) readFramePgno(frame uint32) (uint32, error) {
 //   - Slot 0: used when nBackfill == maxFrame (read everything from DB, skip WAL)
 //   - Slots 1-4: used for readers that need WAL frames. Best slot is the one
 //     with the largest readmark <= current maxFrame.
-//
-// DRIFT: header-change re-validation skipped when SHM header invalid (C does unconditional memcmp) See docs/btree/NOTES.md#drift-103-re-validation-skips-header-change-check-when-shm-header-inva
 func (w *wal) beginRead() (maxFrame uint32, slot int, err error) {
 	_, maxFrame, slot, err = w.beginReadHdr()
 	return maxFrame, slot, err
@@ -2477,7 +2475,6 @@ func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err er
 // max frame number. Returns errWALRetry if the WAL state changed between
 // reading metadata and acquiring the lock, signaling the caller to retry.
 // DRIFT: slot-0 read path writes mxFrame into aReadMark[0] (must stay 0) See docs/btree/NOTES.md#drift-100-slot-0-read-path-writes-mxframe-violating-areadmark0-invaria
-// DRIFT: header-change re-validation skipped when SHM header invalid (C does unconditional memcmp) See docs/btree/NOTES.md#drift-103-re-validation-skips-header-change-check-when-shm-header-inva
 func (w *wal) tryBeginRead() (maxFrame uint32, slot int, err error) {
 	_, maxFrame, slot, err = w.tryBeginReadHdr()
 	return maxFrame, slot, err
@@ -2576,7 +2573,6 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame uint32, slot
 //     nBackfill directly from SHM via pInfo pointer everywhere)
 //
 // DRIFT: reader-slot tie-break selects lowest slot; SQLite selects highest on equal marks See docs/btree/NOTES.md#drift-102-reader-slot-tie-break-selects-lowest-not-highest
-// DRIFT: header-change re-validation skipped when SHM header invalid (C does unconditional memcmp) See docs/btree/NOTES.md#drift-103-re-validation-skips-header-change-check-when-shm-header-inva
 func (w *wal) tryBeginReadMultiProcess() (maxFrame uint32, slot int, err error) {
 	_, maxFrame, slot, err = w.tryBeginReadMultiProcessHdr()
 	return maxFrame, slot, err
@@ -2615,8 +2611,11 @@ func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame uint32, s
 		if err == nil {
 			walShmBarrier()
 			// Re-validate: compare live SHM header against our local copy
-			// (SQLite wal.c:3125: memcmp(walIndexHdr(pWal), &pWal->hdr, sizeof(WalIndexHdr)))
-			if liveHdr, ok := w.index.readHeader(); ok && liveHdr != hdr {
+			// (SQLite wal.c:3139: memcmp(walIndexHdr(pWal), &pWal->hdr, sizeof(WalIndexHdr)))
+			// C does an unconditional raw memcmp against the validated cached
+			// hdr, so an invalid/zeroed live header (!ok, e.g. a recoverer
+			// mid-zeroing SHM) always differs and forces WAL_RETRY.
+			if liveHdr, ok := w.index.readHeader(); !ok || liveHdr != hdr {
 				_ = w.index.unlock(lockRead0, lockShared)
 				return WalIndexHdr{}, 0, 0, errWALRetry
 			}
@@ -2686,7 +2685,10 @@ func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame uint32, s
 
 	liveMark := w.index.shmReadMark(bestSlot)
 	liveHdr, liveValid := w.index.readHeader()
-	if liveMark != bestMark || (liveValid && liveHdr != hdr) {
+	// C does an unconditional raw memcmp against the validated cached hdr
+	// (wal.c:3255-3256), so an invalid/zeroed live header (!liveValid) always
+	// differs and forces WAL_RETRY.
+	if liveMark != bestMark || !liveValid || liveHdr != hdr {
 		_ = w.index.unlock(lockSlot, lockShared)
 		return WalIndexHdr{}, 0, 0, errWALRetry
 	}
@@ -2717,7 +2719,6 @@ func (w *wal) endRead(slot int) {
 // Returns stateChanged=true if the WAL state was re-synced from SHM (indicating
 // another process committed or checkpointed since the last local write).
 // Callers should invalidate any stale page caches when stateChanged is true.
-// DRIFT: header-change re-validation skipped when SHM header invalid (C does unconditional memcmp) See docs/btree/NOTES.md#drift-103-re-validation-skips-header-change-check-when-shm-header-inva
 func (w *wal) beginWrite() (stateChanged bool, err error) {
 	// Legacy entry for raw-wal tests. Passes zero snapshot → BUSY_SNAPSHOT
 	// check is skipped (acceptable; these tests don't exercise the race).
@@ -2747,7 +2748,13 @@ func (w *wal) beginWriteWithSnapshot(readSnap WalIndexHdr) (stateChanged bool, e
 		trace("beginWriteWithSnapshot: valid=%v readSnap.init=%d readSnap.mx=%d live.mx=%d writerHdr.init=%d writerHdr.mx=%d",
 			valid, readSnap.isInit, readSnap.mxFrame, hdr.mxFrame, w.writerHdr.isInit, w.writerHdr.mxFrame)
 	}
-	if valid && readSnap.isInit != 0 && hdr != readSnap {
+	// C does an unconditional raw memcmp of the validated reader snapshot
+	// (pWal->hdr == readSnap) against the live header (wal.c:3729), so an
+	// invalid/zeroed live header (!valid) with a populated reader snapshot
+	// also differs and yields SQLITE_BUSY_SNAPSHOT. We return before the
+	// valid-gated re-sync block below, which must only read from a valid
+	// live header. A zero snapshot (isInit==0, raw-wal tests) still skips.
+	if readSnap.isInit != 0 && (!valid || hdr != readSnap) {
 		if debugTrace {
 			trace("beginWriteWithSnapshot: busy_snapshot live.mx=%d readSnap.mx=%d", hdr.mxFrame, readSnap.mxFrame)
 		}

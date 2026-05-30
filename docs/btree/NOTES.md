@@ -3441,28 +3441,6 @@ Go pins the lowest-numbered slot among equals where SQLite pins the highest. Thi
 correctness but changes which physical slot is held, altering slot-occupancy patterns that other processes
 observe.
 
-<a id="drift-103-re-validation-skips-header-change-check-when-shm-header-inva"></a>
-### Drift: Re Validation Skips Header Change Check When SHM Header Invalid
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `wal.go:*wal.beginRead`
-  (`internal/btree/wal.go:2567` and `internal/btree/wal.go:2637`),
-  `wal.go:*wal.beginWrite` (`internal/btree/wal.go:2692-2711`),
-  `wal.go:*wal.tryBeginRead` (`internal/btree/wal.go:2567` and `internal/btree/wal.go:2636-2640`),
-  `wal.go:*wal.tryBeginReadMultiProcess`
-  (`internal/btree/wal.go:2567` slot-0 and `wal.go:2636-2640` final-slot re-validation).
-
-SQLite's `walTryBeginRead` and `sqlite3WalBeginWriteTransaction` re-validate after locking with an
-UNCONDITIONAL raw byte `memcmp` of the live SHM wal-index header against the reader's cached snapshot — slot-0
-path `wal.c:3139`, WAL-frames/final-slot path `wal.c:3256`, and write-tx guard `wal.c:3729` — and any
-difference, including a header a concurrent recoverer has zeroed/invalidated in place, forces `WAL_RETRY` /
-`SQLITE_BUSY_SNAPSHOT`. Go gates every one of these comparisons on the header first reading as VALID:
-`if liveHdr, ok := w.index.readHeader(); ok && liveHdr != hdr` (`wal.go:2567`), `if liveMark != bestMark ||
-(liveValid && liveHdr != hdr)` (`wal.go:2636-2640`), and the write path's `if valid && ...` / `if valid {`
-blocks (`wal.go:2692-2711`). The consequence is that when `readHeader()` reports invalid (`valid=false`) — the
-exact window in which a concurrent process is mid-recovery and has invalidated the SHM header — Go proceeds
-where SQLite would retry, weakening the recovery-race defense and risking a reader/writer continuing against a
-header that SQLite would have rejected.
-
 <a id="drift-104-padtosectorboundary-sector-padding-of-commit-frames-not-port"></a>
 ### Drift: padToSectorBoundary Sector Padding Of Commit Frames Not Ported
 - **Category:** changed-logic  -  **Severity:** medium
