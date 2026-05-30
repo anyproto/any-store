@@ -941,19 +941,25 @@ func (wi *walIndex) readHeader() (WalIndexHdr, bool) {
 	return hdr1, true
 }
 
-// walShmBarrier issues a memory barrier for cross-process mmap'd memory.
+// walShmBarrier issues a full memory barrier for cross-process mmap'd memory.
 // On x86/amd64, stores are already ordered (TSO), but we need a compiler barrier
 // to prevent the Go compiler from reordering. On ARM64, we need a full fence.
 // This matches SQLite's walShmBarrier() / sqlite3OsShmBarrier().
-// DRIFT: walShmBarrier store-release only on ARM64 (weaker than full fence) + no mutex fallback See docs/btree/NOTES.md#drift-86-walshmbarrier-emits-store-release-not-full-fence-on-arm64
 func walShmBarrier() {
-	// atomic.StoreUint32 on a dummy variable acts as both a compiler barrier
-	// and a memory fence (uses MFENCE on x86, DMB on ARM64). This is the sole
-	// mechanism providing cross-process publish ordering, matching SQLite's
-	// sqlite3MemoryBarrier (mutex_unix.c:98-104) = pure __sync_synchronize(),
-	// which performs no scheduler yield.
+	// atomic.SwapUint32 on a dummy variable acts as both a compiler barrier
+	// and a full bidirectional memory fence. Unlike atomic.StoreUint32 (which
+	// lowers to a one-way store-release STLRW on ARM64), the atomic
+	// read-modify-write lowers to SWPALW (or LDAXRW+STLXRW on pre-LSE) on ARM64
+	// and XCHGL (implicit LOCK prefix) on amd64, both providing the full
+	// LoadLoad+LoadStore+StoreLoad+StoreStore ordering SQLite requires. This is
+	// the sole mechanism providing cross-process publish ordering, matching
+	// SQLite's sqlite3MemoryBarrier (mutex_unix.c:98-104) = pure
+	// __sync_synchronize() (= DMB ISH on ARM64), which performs no scheduler
+	// yield. SQLite's redundant unixEnterMutex/unixLeaveMutex fallback is only
+	// needed when sqlite3MemoryBarrier() compiles to a no-op; Go's atomic RMW
+	// never degrades to a no-op, so the fallback is intentionally dropped.
 	var dummy uint32
-	atomic.StoreUint32(&dummy, 0)
+	atomic.SwapUint32(&dummy, 0)
 }
 
 // lock acquires a shm lock.

@@ -3372,23 +3372,6 @@ per-`mmapShm` `s.locks[slot]` array (`shm_mmap.go:52`). The consequence is that 
 both span (single slot vs. contiguous range) and scope (per-connection vs. process-wide per-inode counter),
 so multi-slot range unlocks and cross-connection shared-lock accounting are not reproduced.
 
-<a id="drift-86-walshmbarrier-emits-store-release-not-full-fence-on-arm64"></a>
-### Drift: walShmBarrier Emits Store Release Not Full Fence On ARM64
-- **Category:** changed-logic  -  **Severity:** high
-- **Affected functions:** `wal.go:walShmBarrier` (`internal/btree/wal.go:937`, `internal/btree/wal.go:943`).
-
-C's `unixShmBarrier` (`os_unix.c:5484-5494`) does two things: it calls `sqlite3MemoryBarrier()`, which on
-GCC/clang compiles to `__sync_synchronize()` (`mutex_unix.c:98-104`) — a FULL bidirectional fence (`DMB ISH`
-on ARM64) whose documented contract is "All loads and stores begun before the barrier must complete before
-any load or store begun after the barrier" (`os_unix.c:5481-5482`) — and then issues a redundant
-`unixEnterMutex(); unixLeaveMutex();` belt-and-suspenders fence (comment "Also mutex, for redundancy",
-`os_unix.c:5488-5493`) for builds where the compiler barrier degrades to a no-op. Go's `walShmBarrier`
-(`wal.go:937-945`) emits only a store-release (`STLRW`) on ARM64 and omits the redundant mutex fallback
-fence entirely. The consequence is a strictly weaker barrier than SQLite's: a store-release orders prior
-accesses before the release store but does not block later loads from being reordered ahead of it, so the
-full bidirectional ordering SQLite relies on for SHM/wal-index visibility across CPUs is not guaranteed,
-risking subtle cross-process memory-ordering bugs on ARM64.
-
 <a id="drift-87-wal-recovery-omits-pgno-zero-frame-validity-check"></a>
 ### Drift: WAL Recovery Omits pgno Zero Frame Validity Check
 - **Category:** changed-logic  -  **Severity:** medium
