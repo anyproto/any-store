@@ -310,7 +310,6 @@ func (wf *walFrame) serialize(buf []byte) {
 	binary.BigEndian.PutUint32(buf[20:24], wf.checksum2)
 }
 
-// DRIFT: WAL recovery omits walDecodeFrame's pgno==0 frame-validity rejection See docs/btree/NOTES.md#drift-87-wal-recovery-omits-pgno-zero-frame-validity-check
 func (wf *walFrame) deserialize(buf []byte) {
 	wf.pgno = binary.BigEndian.Uint32(buf[0:4])
 	wf.dbSize = binary.BigEndian.Uint32(buf[4:8])
@@ -1739,7 +1738,6 @@ func (w *wal) writeHeader() error {
 // any-store relies on recoverLocked only being invoked from wal.open (before
 // any peer reader/writer has attached) or from ensureHeaderInitialized
 // (which holds lockWrite + lockCheckpoint + lockRecover exclusive).
-// DRIFT: WAL recovery omits walDecodeFrame's pgno==0 frame-validity rejection See docs/btree/NOTES.md#drift-87-wal-recovery-omits-pgno-zero-frame-validity-check
 // DRIFT: recoverLocked sets all read-marks NOT_USED; C pre-seeds slot 1 to mxFrame See docs/btree/NOTES.md#drift-88-wal-recovery-does-not-pre-seed-read-mark-slot-1
 func (w *wal) recoverLocked() error {
 	w.headerOnDisk = true
@@ -1787,6 +1785,13 @@ func (w *wal) recoverLocked() error {
 		}
 		fr.deserialize(scratch[:walFrameSize])
 		if fr.salt1 != w.header.salt1 || fr.salt2 != w.header.salt2 {
+			break
+		}
+		// A frame is only valid if its page number is greater than zero.
+		// Matches SQLite walDecodeFrame (wal.c:1019-1024), placed after the
+		// salt match and before the running-checksum fold so a pgno==0 frame
+		// terminates recovery without polluting the checksum state.
+		if fr.pgno == 0 {
 			break
 		}
 		s1, s2 = walChecksum(scratch[0:8], s1, s2)

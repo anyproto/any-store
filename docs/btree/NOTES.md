@@ -3210,23 +3210,6 @@ per-`mmapShm` `s.locks[slot]` array (`shm_mmap.go:52`). The consequence is that 
 both span (single slot vs. contiguous range) and scope (per-connection vs. process-wide per-inode counter),
 so multi-slot range unlocks and cross-connection shared-lock accounting are not reproduced.
 
-<a id="drift-87-wal-recovery-omits-pgno-zero-frame-validity-check"></a>
-### Drift: WAL Recovery Omits pgno Zero Frame Validity Check
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `wal.go:*wal.recoverLocked`
-  (`/Users/roma/anytype/any-store/internal/btree/wal.go:1759-1768`),
-  `wal.go:*walFrame.deserialize` (`internal/btree/wal.go:1755-1776`).
-
-SQLite's `walDecodeFrame` declares a frame invalid if its page number is zero
-(`pgno = sqlite3Get4byte(&aFrame[0]); if(pgno==0){ return 0; }`, `wal.c:1019-1024`), a check placed AFTER
-the salt match but BEFORE the checksum comparison; `walIndexRecover` then breaks the recovery scan on the
-first invalid frame (`wal.c:1504-1505`, `if(!isValid) break;`), so a page-0 frame ends recovery and is never
-indexed. The Go port splits `walDecodeFrame`'s responsibilities across `walFrame.deserialize` and the
-`recoverLocked` scan loop, which validate only salt match and frame checksum and omit the `pgno!=0` test
-entirely. The consequence is that an end-of-log/corrupt frame carrying a zero page number that nonetheless
-satisfies the salt and checksum constraints would be accepted and indexed by Go rather than terminating
-recovery, diverging from SQLite's explicit page-0 rejection.
-
 <a id="drift-88-wal-recovery-does-not-pre-seed-read-mark-slot-1"></a>
 ### Drift: WAL Recovery Does Not Pre Seed Read Mark Slot 1
 - **Category:** changed-logic  -  **Severity:** low

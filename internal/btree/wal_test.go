@@ -287,6 +287,87 @@ func TestWALRecoveryUncommittedTruncated(t *testing.T) {
 	require.NoError(t, w2.close(false))
 }
 
+// TestWALRecoveryStopsAtPgnoZeroFrame verifies recovery halts at a frame whose
+// page number is zero, even when its salt matches the WAL header and its
+// checksum correctly continues the running chain. This mirrors SQLite's
+// walDecodeFrame pgno==0 rejection (wal.c:1019-1024) and the walIndexRecover
+// call-site termination (wal.c:1504-1505): the first invalid frame ends the
+// scan, so only the prior committed frames are recovered.
+func TestWALRecoveryStopsAtPgnoZeroFrame(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+
+	const pageSize = 4096
+
+	// Write one committed frame (page 5) via the normal API.
+	w := newWal(path, pageSize)
+	require.NoError(t, w.open())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
+	pg := &page{pgno: 5, data: make([]byte, pageSize)}
+	copy(pg.data, "committed data")
+	require.NoError(t, w.writeFrames([]*page{pg}, true, 5))
+	w.endWrite()
+	salt1, salt2 := w.header.salt1, w.header.salt2
+	require.NoError(t, w.close(false))
+
+	frameSize := int64(walFrameSize) + int64(pageSize)
+
+	// Reconstruct the running checksum state after the first committed frame
+	// exactly as recoverLocked does: seed from header words [0:24], then fold
+	// in frame-header bytes [0:8] and the full page payload.
+	contents, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, int64(len(contents)), walHeaderSize+frameSize)
+
+	s1, s2 := walChecksum(contents[0:24], 0, 0)
+	frame0 := contents[walHeaderSize : walHeaderSize+frameSize]
+	s1, s2 = walChecksum(frame0[0:8], s1, s2)
+	s1, s2 = walChecksum(frame0[walFrameSize:], s1, s2)
+
+	// Hand-craft a second frame with pgno==0 but a matching salt and a checksum
+	// that correctly continues the chain — so only the pgno==0 guard can reject
+	// it. dbSize is set as a commit marker to prove recovery still stops here.
+	var hdr [walFrameSize]byte
+	binary.BigEndian.PutUint32(hdr[0:4], 0) // pgno == 0 (invalid frame)
+	binary.BigEndian.PutUint32(hdr[4:8], 7) // dbSize commit marker
+	binary.BigEndian.PutUint32(hdr[8:12], salt1)
+	binary.BigEndian.PutUint32(hdr[12:16], salt2)
+	data := make([]byte, pageSize)
+	copy(data, "page-zero frame")
+	cs1, cs2 := walChecksum(hdr[0:8], s1, s2)
+	cs1, cs2 = walChecksum(data, cs1, cs2)
+	binary.BigEndian.PutUint32(hdr[16:20], cs1)
+	binary.BigEndian.PutUint32(hdr[20:24], cs2)
+
+	f, err := os.OpenFile(path, os.O_WRONLY, 0666)
+	require.NoError(t, err)
+	off := walHeaderSize + frameSize
+	_, err = f.WriteAt(hdr[:], off)
+	require.NoError(t, err)
+	_, err = f.WriteAt(data, off+walFrameSize)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	// Reopen — recovery must stop at the pgno==0 frame, recovering only the
+	// first committed frame.
+	w2 := newWal(path, pageSize)
+	require.NoError(t, w2.open())
+
+	assert.Equal(t, uint32(1), w2.nFrame.Load(), "recovery must stop at the pgno==0 frame")
+	assert.Equal(t, uint32(5), w2.index.maxPage.Load())
+
+	// The pgno==0 frame lives at frame index 2; it must not be indexed.
+	assert.Equal(t, uint32(0), w2.index.get(0, w2.nFrame.Load()))
+
+	// The prior committed frame is recoverable.
+	buf := make([]byte, pageSize)
+	require.NoError(t, w2.readFrame(1, buf, nil, nil))
+	assert.Equal(t, pg.data, buf)
+
+	require.NoError(t, w2.close(false))
+}
+
 func TestWALRecoveryCorruptHeader(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.wal")
@@ -1137,7 +1218,6 @@ func TestEnsureHeaderInitialized_TriggersRecoveryWhenSHMInvalid(t *testing.T) {
 	require.True(t, validAfter)
 	require.Equal(t, expectedFrames, hdr.mxFrame)
 }
-
 
 // TestRollbackCleanupZerosShmHashEntries exercises shmCleanupFromFrame: a
 // cross-process reader consulting shmHashGet directly (bypassing the
