@@ -789,7 +789,6 @@ func searchInteriorWithOverflow(pg *page, key []byte, usableSize int, p *pager, 
 // if the key spills. Returns a slice into page buffer for non-overflow keys,
 // or an allocated copy for overflow keys.
 // Matches SQLite's accessPayload() slow path in sqlite3BtreeIndexMoveto().
-// DRIFT: readOverflow* zero-fill a truncated overflow chain instead of returning ErrCorrupt See docs/btree/NOTES.md#drift-1-overflow-chain-premature-termination-silently-tolerated
 func leafFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFrame uint32, cache *pcache) ([]byte, error) {
 	dataLen := len(data)
 	if offset >= dataLen {
@@ -1581,7 +1580,6 @@ func (bt *btree) collectLeafCells(pg *page) ([]cellData, []byte, error) {
 // For non-overflow cells, c.key is already the full key.
 // For overflow cells where the key fits locally (only value overflows), c.key is full.
 // For the rare case where the key itself overflows, read the remainder from overflow pages.
-// DRIFT: readOverflow* zero-fill a truncated overflow chain instead of returning ErrCorrupt See docs/btree/NOTES.md#drift-1-overflow-chain-premature-termination-silently-tolerated
 func (bt *btree) cellFullKey(c *cellData) ([]byte, error) {
 	if c.rawCell == nil || c.overflowPg == 0 {
 		return c.key, nil // already full

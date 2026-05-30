@@ -1025,8 +1025,14 @@ func TestReadOverflowChainInternal_CorruptPageNumbers(t *testing.T) {
 	require.NoError(t, p.open())
 	defer p.close()
 
-	// pgno=0 causes the loop to exit immediately (no error)
+	// pgno=0 ends the chain before any of the 100 requested bytes are read:
+	// a premature terminator. Mirrors C accessPayload's post-loop completeness
+	// check (btree.c:5327-5330) -> SQLITE_CORRUPT_PAGE.
 	err := p.readOverflowChainAt(0, make([]byte, 100), 0)
+	assert.ErrorIs(t, err, ErrCorrupt)
+
+	// pgno=0 with a zero-length request is a complete read (nothing requested).
+	err = p.readOverflowChainAt(0, nil, 0)
 	assert.NoError(t, err)
 
 	// pgno=1 -> 1 < 2 -> ErrCorrupt

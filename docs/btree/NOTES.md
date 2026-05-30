@@ -2148,27 +2148,6 @@ The following drifts were found by an automated per-function C-vs-Go audit of th
 b-tree port against sqlitec and deduplicated by root cause (the encryption/sqlcipher
 codec is excluded here and tracked separately).
 
-<a id="drift-1-overflow-chain-premature-termination-silently-tolerated"></a>
-### Drift: Overflow Chain Premature Termination Silently Tolerated
-- **Category:** changed-logic  -  **Severity:** high
-- **Affected functions:** `btree.go:*Cursor.AppendValue` (`pager.go:2535 (loop condition pgno != 0 && written < amt); pager.go:2592 (return nil); reached from btree.go:3634-3643 (Cursor.AppendValue)`), `btree.go:*Cursor.Value` (`internal/btree/pager.go:2535-2592 (called from internal/btree/btree.go:3564-3573)`), `btree.go:*btree.AppendValue` (`internal/btree/pager.go:2469`), `btree.go:*btree.cellFullKey` (`internal/btree/btree.go:1575 (call) and internal/btree/pager.go:2447-2469 (readOverflowChainAt loop/return)`), `btree.go:interiorFullKey` (`internal/btree/pager.go:2447 (and 2492); invoked from internal/btree/btree.go:896-904`), `btree.go:leafFullKey` (`btree.go:847-857; pager.go:2447-2469 (readOverflowChainAt); pager.go:2492-2513 (readOverflowChainReader)`), `db.go:*ReadTx.AppendValue` (`internal/btree/pager.go:2535`), `pager.go:*pager.readOverflowAt` (`internal/btree/pager.go:2535-2592`), `pager.go:*pager.readOverflowChainAt` (`internal/btree/pager.go:2447-2469`), `pager.go:*pager.readOverflowChainReader` (`pager.go:2492-2514`).
-
-SQLite's `accessPayload` ends every overflow-chain walk with an explicit
-completeness check -- `if( rc==SQLITE_OK && amt>0 ) return SQLITE_CORRUPT_PAGE(pPage)`
-(`btree.c:5327-5330`, comment "Overflow chain ends prematurely") -- so a chain whose
-next-page pointer hits 0 before all requested payload bytes have been transferred is
-rejected as corruption. The Go overflow readers (`readOverflowAt` loops
-`for pgno != 0 && written < amt`; `readOverflowChainAt` / `readOverflowChainReader`
-loop `for pgno != 0 && off < len(buf)`) simply exit the loop on a zero terminator and
-unconditionally `return nil`, with no post-loop `written == amt` / `off == len(buf)`
-check anywhere. Because the destination buffers are freshly zero-allocated, a short or
-truncated chain is silently accepted with the missing tail left zero-filled. Every
-caller inherits this gap -- value reads (`Cursor.Value`, `Cursor.AppendValue`,
-`ReadTx.AppendValue`, `btree.AppendValue`) and full-key reconstruction
-(`cellFullKey`, `leafFullKey`, `interiorFullKey`) -- so corrupt overflow data is
-returned to the application as a valid, partly-zeroed payload or key rather than
-surfacing as `ErrCorrupt`.
-
 <a id="drift-3-missing-pgno-greater-than-pagecount-descent-corruption-guard"></a>
 ### Drift: Missing pgno Greater Than Pagecount Descent Corruption Guard
 - **Category:** changed-logic  -  **Severity:** high

@@ -2496,7 +2496,6 @@ func (p *pager) writeOverflowChainMulti(segments ...[]byte) (uint32, error) {
 
 // readOverflowChainAt reads data from a chain of overflow pages into buf,
 // using the writer's page cache (getPage). Suitable for the writer path.
-// DRIFT: readOverflow* zero-fill a truncated overflow chain instead of returning ErrCorrupt See docs/btree/NOTES.md#drift-1-overflow-chain-premature-termination-silently-tolerated
 func (p *pager) readOverflowChainAt(firstPgno uint32, buf []byte, walMaxFrame uint32) error {
 	usable := overflowPageUsable(p.usableSize())
 	pgno := firstPgno
@@ -2532,13 +2531,19 @@ func (p *pager) readOverflowChainAt(firstPgno uint32, buf []byte, walMaxFrame ui
 		p.releasePage(pg)
 		off += chunk
 	}
+	// Post-loop completeness check: if the chain's next-page pointer became 0
+	// before all requested bytes were transferred, the overflow chain ended
+	// prematurely. Mirrors C accessPayload (btree.c:5327-5330
+	// `if( rc==SQLITE_OK && amt>0 ) return SQLITE_CORRUPT_PAGE(pPage)`).
+	if off < len(buf) {
+		return ErrCorrupt
+	}
 	return nil
 }
 
 // readOverflowChainReader reads overflow chain data using the reader's private
 // cache. Pages are cached across overflow reads within the same transaction.
 // Falls back to the writer path (readOverflowChainAt) if no reader cache.
-// DRIFT: readOverflow* zero-fill a truncated overflow chain instead of returning ErrCorrupt See docs/btree/NOTES.md#drift-1-overflow-chain-premature-termination-silently-tolerated
 func (p *pager) readOverflowChainReader(firstPgno uint32, buf []byte, walMaxFrame uint32, cache *pcache) error {
 	if cache == nil {
 		return p.readOverflowChainAt(firstPgno, buf, walMaxFrame)
@@ -2577,6 +2582,11 @@ func (p *pager) readOverflowChainReader(firstPgno uint32, buf []byte, walMaxFram
 		p.releasePage(pg)
 		off += chunk
 	}
+	// Post-loop completeness check: chain ended before all requested bytes were
+	// transferred. Mirrors C accessPayload (btree.c:5327-5330).
+	if off < len(buf) {
+		return ErrCorrupt
+	}
 	return nil
 }
 
@@ -2584,7 +2594,6 @@ func (p *pager) readOverflowChainReader(firstPgno uint32, buf []byte, walMaxFram
 // skip into the chain payload. Copies directly into dst. Matches SQLite's
 // accessPayload() offset logic — skips overflow pages that fall before skip,
 // then copies from the first relevant page onward.
-// DRIFT: readOverflow* zero-fill a truncated overflow chain instead of returning ErrCorrupt See docs/btree/NOTES.md#drift-1-overflow-chain-premature-termination-silently-tolerated
 func (p *pager) readOverflowAt(firstPgno uint32, skip, amt int, dst []byte, walMaxFrame uint32, cache *pcache) error {
 	usable := overflowPageUsable(p.usableSize())
 	pgno := firstPgno
@@ -2656,6 +2665,11 @@ func (p *pager) readOverflowAt(firstPgno uint32, skip, amt int, dst []byte, walM
 		pgno = binary.BigEndian.Uint32(pg.data[0:4])
 		p.releasePage(pg)
 		off = end
+	}
+	// Post-loop completeness check: chain ended before amt bytes were
+	// transferred. Mirrors C accessPayload (btree.c:5327-5330).
+	if written < amt {
+		return ErrCorrupt
 	}
 	return nil
 }
