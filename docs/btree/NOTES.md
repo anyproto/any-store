@@ -2389,23 +2389,6 @@ freeblock minimum, so freeing it could not store a valid freeblock header -- a l
 deviation from SQLite's free-space format guarantee, mitigated in practice only because
 real key/value cells comfortably exceed 4 bytes.
 
-<a id="drift-27-interior-cell-parser-missing-maxpayloadalloc-validation-and-"></a>
-### Drift: Interior Cell Parser Missing maxPayloadAlloc Validation And u32 Truncation
-- **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `btree.go:parseInteriorCell` (`btree.go:197-223`), `btree.go:parseInteriorCell` (`btree.go:197-201`).
-
-`parseInteriorCell` decodes `keyLen` via `getVarintSafe` as a full uncapped 64-bit varint
-(`btree.go:183-226`) and never validates it against `maxPayloadAlloc` (`1<<30`) the way the
-sibling leaf parsers do (`parseLeafCellWithSize` at `btree.go:132-138`, `leafCellPayloadLen`
-at `namespace_size.go:135`). Its overflow detection is gated on `us > 0`, so when
-`usableSize` is omitted/zero a corrupt 9-byte varint flows through unchecked and can panic.
-This also diverges from SQLite's `btreeParseCellPtrIndex`, which accumulates `nPayload` into
-a `u32` (`btree.c:1363,1369-1376`) and therefore silently truncates an oversized varint to
-its low 32 bits before clamping to the page (deliberately unlike the table-leaf parser's
-u64-plus-mask path). The consequence is that Go's interior parser neither caps nor truncates
-a corrupt key length, so a malformed interior cell can produce an out-of-range allocation or
-panic where SQLite would have bounded or silently wrapped the value.
-
 <a id="drift-28-searchleafpage-missing-overflow-cell-compare-guard"></a>
 ### Drift: searchLeafPage Missing Overflow Cell Compare Guard
 - **Category:** changed-logic  -  **Severity:** low

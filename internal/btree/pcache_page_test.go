@@ -2296,10 +2296,11 @@ func TestIntegrityCheck_InteriorCellExtendsOffPage(t *testing.T) {
 }
 
 func TestIntegrityCheck_InteriorCorruptKey(t *testing.T) {
-	// Cover integrity.go line 358: corrupt interior key (interiorFullKey returns error).
+	// Cover integrity.go "corrupt cell data" path (parseInteriorCell returns error).
 	// Strategy: craft an interior cell with keyLen > maxPayloadAlloc (1<<30).
-	// parseInteriorCell doesn't check maxPayloadAlloc, so it succeeds.
-	// But interiorFullKey checks maxPayloadAlloc and returns ErrCorrupt.
+	// parseInteriorCell validates keyLen against maxPayloadAlloc and returns
+	// ErrCorrupt, so the integrity check reports "corrupt cell data" before it ever
+	// reaches interiorFullKey's "corrupt interior key" path.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
@@ -2388,7 +2389,7 @@ func TestIntegrityCheck_InteriorCorruptKey(t *testing.T) {
 
 	err = db2.IntegrityCheckN(0)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "corrupt interior key")
+	assert.Contains(t, err.Error(), "corrupt cell data")
 }
 
 func TestIntegrityCheck_ChildDepthDiffers_RightChild(t *testing.T) {

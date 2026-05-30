@@ -1289,6 +1289,26 @@ func TestParseInteriorCellCorrupt(t *testing.T) {
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
+// TestParseInteriorCellOversizedKeyLen verifies that an interior cell whose
+// keyLen varint exceeds maxPayloadAlloc is rejected (mirroring
+// parseLeafCellWithSize and C's btreeParseCellPtrIndex u32 truncation guard),
+// rather than being trusted and causing huge allocations / slice panics.
+func TestParseInteriorCellOversizedKeyLen(t *testing.T) {
+	// Cell layout: [4-byte leftChild] [varint keyLen] [key...]
+	// keyLen = maxPayloadAlloc + 1 = (1<<30)+1 = 0x40000001, varint = 5 bytes.
+	data := make([]byte, 32)
+	binary.BigEndian.PutUint32(data[0:4], 7) // arbitrary leftChild
+	copy(data[4:], []byte{0x84, 0x80, 0x80, 0x80, 0x01})
+
+	// Without usableSize (overflow detection skipped) it must still be rejected.
+	_, _, err := parseInteriorCell(data, 0)
+	assert.ErrorIs(t, err, ErrCorrupt)
+
+	// With usableSize provided it must also be rejected before overflow handling.
+	_, _, err = parseInteriorCell(data, 0, 512)
+	assert.ErrorIs(t, err, ErrCorrupt)
+}
+
 func TestSearchLeafWithOverflowPrefixCompare(t *testing.T) {
 	db := tempDBWithPageSize(t, 512)
 

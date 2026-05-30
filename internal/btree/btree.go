@@ -219,7 +219,8 @@ func parseLeafCellWithSize(data []byte, offset int, usableSize int) (cellData, i
 // When keyLen exceeds maxLocal, only localPayloadSize bytes of key are stored
 // in-page and the rest is on overflow pages (matching SQLite's index btree interior cells).
 // If usableSize is 0, overflow detection is skipped.
-// DRIFT: parseInteriorCell skips maxPayloadAlloc check / u32 truncation; can panic See docs/btree/NOTES.md#drift-27-interior-cell-parser-missing-maxpayloadalloc-validation-and-
+// keyLen is validated against maxPayloadAlloc (mirroring parseLeafCellWithSize and
+// C's btreeParseCellPtrIndex u32 nPayload truncation) to reject oversized/negative lengths.
 func parseInteriorCell(data []byte, offset int, usableSize ...int) (cellData, int, error) {
 	var c cellData
 	pos := offset
@@ -239,6 +240,10 @@ func parseInteriorCell(data []byte, offset int, usableSize ...int) (cellData, in
 		return c, 0, ErrCorrupt
 	}
 	pos += n
+
+	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc {
+		return c, 0, ErrCorrupt
+	}
 
 	us := 0
 	if len(usableSize) > 0 {
