@@ -3223,22 +3223,6 @@ instead stores `readMarkNotUsed` (`0xFFFFFFFF`) into every slot 1..4 and only se
 reader after recovery cannot reuse a pre-seeded slot at the recovered `mxFrame` and must instead carve out
 a fresh read-mark, diverging from SQLite's seeded fast path.
 
-<a id="drift-89-wal-index-header-version-not-validated"></a>
-### Drift: WAL Index Header Version Not Validated
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `wal.go:*walIndex.readHeader`
-  (`internal/btree/wal.go:919-930`; callers at `wal.go:1352-1358`, `wal.go:1455-1525`, `wal.go:1595-1612`
-  also omit it).
-
-After `walIndexTryHdr` succeeds, C's `walIndexReadHdr` enforces the wal-index format version:
-`if( badHdr==0 && pWal->hdr.iVersion!=WALINDEX_MAX_VERSION ) rc = SQLITE_CANTOPEN_BKPT;` (`wal.c:2740-2742`,
-with `WALINDEX_MAX_VERSION=3007000`), rejecting a SHM header written with an incompatible/future format
-version. This is distinct from the on-disk WAL file header version check. Go's `readHeader` validates the
-dual-copy match, `isInit==1`, and the `aCksum`, but never compares `iVersion`, and none of its callers add
-the check. The consequence is that a wal-index header bearing an unsupported future format version is
-silently accepted by Go where SQLite would refuse to open with `SQLITE_CANTOPEN`, removing a
-forward-compatibility guard.
-
 <a id="drift-90-wal-index-szpage-field-not-encoded-or-decoded"></a>
 ### Drift: WAL Index szPage Field Not Encoded Or Decoded
 - **Category:** changed-logic  -  **Severity:** low

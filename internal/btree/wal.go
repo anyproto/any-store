@@ -886,7 +886,6 @@ func (wi *walIndex) writeHeader(maxFrame, maxPage, nBackfill uint32, frameCksum,
 // It compares both copies of the header to detect torn writes (7.3).
 // Returns the header and true if valid, or a zero header and false if
 // the header is corrupt or the two copies don't match.
-// DRIFT: wal-index header iVersion never validated (missing WALINDEX_MAX_VERSION gate) See docs/btree/NOTES.md#drift-89-wal-index-header-version-not-validated
 // DRIFT: wal-index szPage neither encoded nor decoded (szPage transform absent) See docs/btree/NOTES.md#drift-90-wal-index-szpage-field-not-encoded-or-decoded
 func (wi *walIndex) readHeader() (WalIndexHdr, bool) {
 	region, err := wi.shm.region(0, false)
@@ -934,6 +933,14 @@ func (wi *walIndex) readHeader() (WalIndexHdr, bool) {
 	saved := hdr1.aCksum
 	hdr1.computeCksum()
 	if hdr1.aCksum != saved {
+		return WalIndexHdr{}, false
+	}
+
+	// Reject a SHM wal-index header written with an incompatible/future
+	// format version. Matches SQLite's walIndexReadHdr gate
+	// (wal.c:2740-2742: iVersion != WALINDEX_MAX_VERSION -> SQLITE_CANTOPEN).
+	// any-store uses its own walVersion (1000000) instead of 3007000.
+	if hdr1.iVersion != walVersion {
 		return WalIndexHdr{}, false
 	}
 
