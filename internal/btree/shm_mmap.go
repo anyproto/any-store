@@ -243,7 +243,6 @@ func (s *mmapShm) lock(slot int, lockType int) error {
 
 // unlock releases the lock on the given slot. It updates the in-process lock
 // counters and calls fcntl only when the last holder releases.
-// DRIFT: shm unlock is single-slot & per-connection counter vs C n-span & process-wide aLock[] See docs/btree/NOTES.md#drift-85-shm-unlock-single-slot-and-per-connection-counter
 func (s *mmapShm) unlock(slot int, lockType int) error {
 	if slot < 0 || slot >= lockSlotCount {
 		return fmt.Errorf("btree: invalid lock slot %d", slot)

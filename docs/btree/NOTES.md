@@ -3066,25 +3066,6 @@ SHARED lock that SQLite treats as a free no-op instead bumps the shared refcount
 lock/unlock accounting can drift from SQLite's behavior when a connection re-requests a lock it
 already holds.
 
-<a id="drift-85-shm-unlock-single-slot-and-per-connection-counter"></a>
-### Drift: SHM Unlock Single Slot And Per Connection Counter
-- **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `shm_mmap.go:*mmapShm.unlock`
-  (`internal/btree/shm_mmap.go:195-229`, and `fcntlLock` `Len:1` at `shm_mmap.go:246`),
-  `shm_mmap.go:*mmapShm.unlock` (`internal/btree/shm_mmap.go:52,209-223`).
-
-C's `unixShmLock` releases a contiguous span of `n` lock slots in a SINGLE `fcntl` `F_UNLCK` call
-(`unixShmSystemLock(pDbFd, F_UNLCK, ofst+UNIX_SHM_BASE, n)` then `memset(&aLock[ofst], 0, sizeof(int)*n)`,
-`os_unix.c:5408-5412`), and SQLite genuinely uses `n>1` — e.g. `walUnlockExclusive(pWal, WAL_READ_LOCK(1), WAL_NREADER-1)`
-frees reader slots 1..4 in one range op (`wal.c:2380`). Go's `mmapShm.unlock(slot, lockType)` takes no
-count parameter and its `fcntlLock` hardcodes `Len: 1` (`shm_mmap.go:246`), so every release is exactly
-one byte/slot. The drift also spans scope: C's "last shared holder" decision reads/writes
-`pShmNode->aLock[ofst]`, which lives in `unixShmNode` and is shared by EVERY connection to the same inode
-within the process (only `sharedMask`/`exclMask` are per-connection), whereas Go collapses this to a
-per-`mmapShm` `s.locks[slot]` array (`shm_mmap.go:52`). The consequence is that Go diverges from SQLite on
-both span (single slot vs. contiguous range) and scope (per-connection vs. process-wide per-inode counter),
-so multi-slot range unlocks and cross-connection shared-lock accounting are not reproduced.
-
 <a id="drift-88-wal-recovery-does-not-pre-seed-read-mark-slot-1"></a>
 ### Drift: WAL Recovery Does Not Pre Seed Read Mark Slot 1
 - **Category:** changed-logic  -  **Severity:** low
