@@ -2967,32 +2967,6 @@ higher schema layer. The consequence is an added, non-SQLite uniqueness contract
 layer: namespace creation is idempotently rejected rather than always allocating a fresh root,
 a new feature that changes the create semantics relative to stock SQLite.
 
-<a id="drift-60-savepoint-rollback-resurrects-pages-allocated-after-savepoin"></a>
-### Drift: Savepoint Rollback Resurrects Pages Allocated After Savepoint
-- **Category:** changed-logic  -  **Severity:** high
-- **Affected functions:** `db.go:*WriteTx.RollbackToSavepoint`
-  (`internal/btree/pager.go:2226`), `pager.go:*pager.getWritablePage`
-  (`/Users/roma/anytype/any-store/internal/btree/pager.go:1088-1095` (and `1129-1136`);
-  rollback restore at `pager.go:2226-2260`), `pager.go:*pager.rollbackToSavepoint`
-  (`pager.go:2230-2256` (restore loop, no pgno<=sp.dbSize guard); `pager.go:1088-1095` &
-  `1128-1136` (COW save, no guard)).
-
-SQLite only journals and replays a page for a savepoint when that page existed when the
-savepoint was opened, enforced by a two-fold guard on the original page count `nOrig`:
-`subjRequiresPage` requires `p->nOrig>=pgno` (`pager.c:1073`) so a page allocated after a
-savepoint is never sub-journaled into it, and `addToSavepointBitvecs` sets a page's bit only
-when `pgno<=p->nOrig` (`pager.c:1815`). On `ROLLBACK TO`, `pagerPlaybackSavepoint` first
-restores `pPager->dbSize = pSavepoint->nOrig` (`pager.c:3426`) and `pager_playback_one_page`
-skips any journaled page with `pgno>pPager->dbSize`, so pages allocated after the savepoint are
-simply discarded (`assertTruncateConstraintCb` even asserts no dirty page exists with
-`pgno>dbSize`). The Go port has neither guard: `getWritablePage` saves savepoint
-copy-on-write copies for pages allocated after the savepoint (`pager.go:1088-1095`,
-`1129-1136`), and `rollbackToSavepoint` restores them with no `pgno<=sp.dbSize` filter
-(`pager.go:2230-2256`). The consequence is that savepoint rollback resurrects pages that were
-allocated after the savepoint as dirty "ghost" pages above `dbSize`, violating the invariant
-SQLite explicitly asserts and risking corruption from dirty pages living beyond the logical end
-of the database.
-
 <a id="drift-61-out-of-range-savepoint-release-errors-instead-of-no-op"></a>
 ### Drift: Out Of Range Savepoint Release Errors Instead Of No Op
 - **Category:** changed-logic  -  **Severity:** low

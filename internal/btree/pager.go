@@ -1120,7 +1120,6 @@ func (p *pager) readRawPage(pgno, walMaxFrame uint32) ([]byte, error) {
 
 // getWritablePage returns a page ready for writing. It marks the page as dirty
 // and saves a copy for savepoint rollback if needed.
-// DRIFT: savepoint rollback resurrects ghost dirty pages above dbSize (missing nOrig guard) See docs/btree/NOTES.md#drift-60-savepoint-rollback-resurrects-pages-allocated-after-savepoin
 func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 	if pagerState(p.state.Load()) != pagerWriter {
 		return nil, ErrReadOnly
@@ -2236,7 +2235,6 @@ func (p *pager) savepoint() (int, error) {
 }
 
 // rollbackToSavepoint rolls back to the given savepoint, restoring pages.
-// DRIFT: savepoint rollback resurrects ghost dirty pages above dbSize (missing nOrig guard) See docs/btree/NOTES.md#drift-60-savepoint-rollback-resurrects-pages-allocated-after-savepoin
 func (p *pager) rollbackToSavepoint(id int) error {
 	if pagerState(p.state.Load()) != pagerWriter {
 		return ErrReadOnly
@@ -2284,11 +2282,24 @@ func (p *pager) rollbackToSavepoint(id int) error {
 	// written last and wins. This is analogous to SQLite's pDone bitvec that
 	// skips pages already restored — our reverse iteration achieves the same
 	// result by letting the oldest copy overwrite newer ones.
+	//
+	// Skip any saved copy whose page number is above the target savepoint's
+	// original dbSize. This mirrors SQLite, which resets pPager->dbSize to
+	// pSavepoint->nOrig (pager.c:3426) and then has pager_playback_one_page
+	// skip every journaled page with pgno > pPager->dbSize (pager.c:2341).
+	// The comparison is against the single restored dbSize (the target
+	// savepoint's nOrig), not each inner savepoint's, so capture it once
+	// before the loop. Without this guard, pages allocated after the target
+	// savepoint would be resurrected as ghost dirty pages above dbSize.
+	target := sp.dbSize
 	for i := len(p.savepoints) - 1; i >= id; i-- {
 		if debugTrace {
 			trace("rollbackToSavepoint: restoring sp[%d] pages (%d entries)", i, len(p.savepoints[i].pages))
 		}
 		for pgno, data := range p.savepoints[i].pages {
+			if pgno > target {
+				continue
+			}
 			// Find the page in cache, or create a new one if evicted.
 			pg := p.writerCache.fetch(pgno)
 			if pg == nil {
