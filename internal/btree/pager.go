@@ -769,7 +769,19 @@ func (p *pager) beginWrite(readSnap WalIndexHdr) error {
 	// tables are consulted in multi-process mode.
 	if stateChanged {
 		p.writerCache.clear()
-		p.refreshHeaderFromPage1()
+		// If the page-1 re-read fails at both the WAL frame and the DB file
+		// (double I/O failure), abort beginWrite rather than continuing with a
+		// stale header/dbSize that commit() would later serialize over the
+		// peer's page 1. Mirrors SQLite propagating the page-1 read error out
+		// of the begin/shared-lock path. We release the exclusive WAL write
+		// lock that beginWriteWithSnapshot acquired (the pager never reached
+		// pagerWriter, so the caller's error path only ends the read tx via
+		// endRead and would otherwise leak the write lock); the caller's read
+		// transaction itself is left intact.
+		if err := p.refreshHeaderFromPage1(); err != nil {
+			p.wal.endWrite()
+			return err
+		}
 	}
 	p.state.Store(int32(pagerWriter))
 	// Save a snapshot of the database header so rollback can restore it (fix 5.2).
@@ -1699,7 +1711,25 @@ func (p *pager) readerDbSizeBound(cache *pcache) uint32 {
 // page 1 bytes, consulting WAL first (via SHM hash tables in multi-process
 // mode) and falling back to the database file. Called from beginWrite when
 // another process's commit has been detected.
-func (p *pager) refreshHeaderFromPage1() {
+//
+// It returns an error only on a genuine DOUBLE I/O failure: a page-1 WAL frame
+// existed but its read failed AND the DB-file fallback read also failed. In
+// that case the cached header/dbSize cannot be reconciled with the on-disk
+// image at all, so continuing would later let commit() serialize a stale
+// header over a peer's page 1. SQLite propagates the page-1 read error out of
+// the shared-lock/begin path rather than continuing with a stale header
+// (pager.c sqlite3PagerSharedLock -> readDbPage error propagation), and
+// beginWrite mirrors that by aborting on this error.
+//
+// All other outcomes return nil to preserve the prior best-effort behavior:
+//   - page 1 read successfully from the WAL frame or the DB file;
+//   - page 1 legitimately absent from both sources (e.g. a brand-new WAL with
+//     no frames and no backing file, as in InMemory mode);
+//   - no page-1 WAL frame existed and only the single DB-file read failed
+//     (e.g. a truncated/corrupt file) — that corruption is still caught when
+//     the writer first touches a page that must be read from disk, matching
+//     the existing reader-path behavior.
+func (p *pager) refreshHeaderFromPage1() error {
 	// Determine effective max frame, same logic as readHeaderCounters.
 	effectiveMaxFrame := p.wal.nFrame.Load()
 	if p.inProcess {
@@ -1710,7 +1740,10 @@ func (p *pager) refreshHeaderFromPage1() {
 		effectiveMaxFrame = hdr.mxFrame
 	}
 
-	// Try WAL first.
+	// Try WAL first. walErr records a WAL-frame read failure so that, if the
+	// DB-file fallback also fails (or is unavailable), the original read error
+	// can be propagated to the caller rather than swallowed.
+	var walErr error
 	if effectiveMaxFrame > 0 {
 		frame := p.wal.index.get(1, effectiveMaxFrame)
 		if frame > 0 {
@@ -1723,7 +1756,9 @@ func (p *pager) refreshHeaderFromPage1() {
 						frame, effectiveMaxFrame, p.wal.index.nBackfill.Load(),
 						p.header.DatabaseSize, p.header.FirstFreelistPg, p.header.TotalFreelistPgs)
 				}
-				return
+				return nil
+			} else {
+				walErr = err
 			}
 		}
 	}
@@ -1739,9 +1774,30 @@ func (p *pager) refreshHeaderFromPage1() {
 					effectiveMaxFrame, p.wal.index.nBackfill.Load(),
 					p.header.DatabaseSize, p.header.FirstFreelistPg, p.header.TotalFreelistPgs)
 			}
-			return
+			return nil
+		} else if walErr != nil {
+			// Double I/O failure: the WAL frame read failed AND the DB-file
+			// read failed. Continuing would leave p.header / p.dbSize stale,
+			// which commit() would later serialize back over a peer's page 1.
+			// Propagate so beginWrite aborts (matching SQLite, which surfaces
+			// the page-1 read error).
+			return fmt.Errorf("refreshHeaderFromPage1: wal read failed (%w) and db read failed (%w)", walErr, err)
 		}
+		// No WAL page-1 frame existed; only the single DB-file read failed.
+		// Preserve the prior best-effort behavior (return nil): the corruption
+		// is caught when the writer first touches a page read from disk, as the
+		// reader path already relies on.
+		return nil
 	}
+
+	// No DB file to fall back to. If a WAL page-1 frame existed but its read
+	// failed, there is no second source to reconcile the header against — that
+	// is the genuine page-1 read failure, so report it. Otherwise page 1 was
+	// simply absent from both sources (best-effort, no read attempted): nil.
+	if walErr != nil {
+		return fmt.Errorf("refreshHeaderFromPage1: wal page 1 read failed and no db file: %w", walErr)
+	}
+	return nil
 }
 
 // committedCounters returns the FileChangeCount and SchemaCookie from the
