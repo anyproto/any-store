@@ -3371,21 +3371,6 @@ range. Go's `walBusyLock` signature is instead `(wi, xBusy, slot, lockType)` and
 SQLite grabs reader slots 1..4 in one operation, Go must lock them individually, which changes the lock-granularity
 contract but is acceptable because Go does not exercise the multi-slot reader range the way C does.
 
-<a id="drift-110-multi-process-readframe-bypasses-local-nframe-bound"></a>
-### Drift: Multi Process readFrame Bypasses Local nFrame Bound
-- **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `wal.go:*wal.readFrame` (`internal/btree/wal.go:2307-2327`),
-  `wal.go:*wal.readFrameRaw` (`internal/btree/wal.go:2255-2268`).
-
-In multi-process (mmap) mode, `readFrame` and `readFrameRaw` intentionally do NOT reject a frame number that
-exceeds this process's local `nFrame`: only the `w.inProcess && frame > nf` guard rejects up front
-(`wal.go:2255`), and for file-backed multi-process WALs the code falls through and issues the `ReadAt` directly
-(`wal.go:2263`), letting the OS validate whether a peer has physically written that frame. This is deliberate so a
-reader can observe frames a concurrent peer committed after this process last refreshed its in-memory frame count,
-but the behavior is undocumented. The consequence is a non-obvious divergence from a naive bounds-check
-expectation: a frame index above the local snapshot is not an error in multi-process mode, and correctness instead
-relies on the OS read returning short/EOF for genuinely absent frames.
-
 <a id="drift-112-integritycheck-treats-master-page-1-as-flat-leaf"></a>
 ### Drift: IntegrityCheck Treats Master Page 1 As Flat Leaf
 - **Category:** changed-logic  -  **Severity:** high
