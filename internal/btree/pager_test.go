@@ -5077,6 +5077,73 @@ func TestWriteOverflowChain_MultiPage(t *testing.T) {
 	p.endRead(slot)
 }
 
+// TestWriteOverflowChain_AllocateError_MidChainReleasesPrev verifies that when
+// a mid-chain overflow-page allocation fails (prevPg already pinned), the
+// previously-held overflow page is released rather than leaked. This mirrors C
+// fillInCell's allocation-failure path (btree.c:7235-7238: releasePage(pToRelease)).
+func TestWriteOverflowChain_AllocateError_MidChainReleasesPrev(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	p := newPager(path, 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf)
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
+
+	// Allocate two pages by growing the DB. pgA becomes the freelist trunk and
+	// pgB becomes a valid leaf on it. We then hand-craft the trunk so that the
+	// FIRST overflow allocation succeeds (pops pgB) but the SECOND allocation
+	// fails: after pgB is popped, leafCount drops to 0, so the trunk-recycle
+	// branch reads the (deliberately corrupt) next-trunk pointer and returns
+	// ErrCorrupt. This exercises the loop with prevPg already pinned.
+	pgA, err := p.allocatePage()
+	require.NoError(t, err)
+	pgAno := pgA.pgno
+	p.releasePage(pgA)
+
+	pgB, err := p.allocatePage()
+	require.NoError(t, err)
+	pgBno := pgB.pgno
+	p.releasePage(pgB)
+
+	// Build the trunk page pgA: leafCount=1, leaf[0]=pgB (valid), and a corrupt
+	// next-trunk pointer so the second allocation (leafCount==0) trips the
+	// trunk-validation guard (nextTrunk > dbSize → ErrCorrupt).
+	trunkPg, err := p.getWritablePage(pgAno)
+	require.NoError(t, err)
+	clear(trunkPg.data)
+	binary.BigEndian.PutUint32(trunkPg.data[0:4], p.dbSize.Load()+999) // corrupt next-trunk
+	binary.BigEndian.PutUint32(trunkPg.data[4:8], 1)                   // leafCount = 1
+	binary.BigEndian.PutUint32(trunkPg.data[8:12], pgBno)              // leaf[0] = pgB
+	trunkPg.header = pageHeader{}
+	p.releasePage(trunkPg)
+
+	p.header.FirstFreelistPg = pgAno
+	p.header.TotalFreelistPgs = 2 // < dbSize so the aggregate guard passes
+
+	// Data spanning exactly two overflow pages forces two allocations: the
+	// first pops pgB (success), the second hits the corrupt trunk (failure).
+	usable := overflowPageUsable(p.usableSize())
+	data := make([]byte, usable+10)
+
+	_, err = p.writeOverflowChain(data)
+	require.ErrorIs(t, err, ErrCorrupt)
+
+	// The first overflow page (allocated from pgB) must have been released by
+	// the allocation-failure path; otherwise its pin leaks. Without the fix,
+	// pinCount stays at 1.
+	leakedPg := p.writerCache.hashFind(pgBno)
+	require.NotNil(t, leakedPg, "expected the first overflow page to remain cached")
+	assert.Equal(t, 0, leakedPg.pinCount, "first overflow page pin leaked on allocation failure")
+
+	require.NoError(t, p.rollback())
+	p.endRead(slot)
+}
+
 // --- Test allocateFromFreelist with hasContent page ---
 func TestAllocateFromFreelist_HasContent(t *testing.T) {
 	dir := t.TempDir()

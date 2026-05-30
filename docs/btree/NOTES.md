@@ -2993,20 +2993,6 @@ unconditionally. The consequence is that deleted row/cell data physically remain
 on disk in Go where SQLite's secure_delete mode would have scrubbed it, and this gap is currently
 undocumented.
 
-<a id="drift-75-overflow-page-allocation-failure-leaks-held-pin"></a>
-### Drift: Overflow Page Allocation Failure Leaks Held Pin
-- **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `pager.go:*pager.writeOverflowChainMulti` (`internal/btree/pager.go:2397`).
-
-In the overflow-write loop, when the current overflow page is full (`spaceLeft==0`) and a new
-overflow page must be allocated, Go's `writeOverflowChainMulti` calls `allocatePageNear(nearby)` and
-on error does `return 0, err` immediately, WITHOUT releasing the previously-allocated/held overflow
-page `prevPg` (`pager.go:2397-2400`). The C original at the equivalent `allocateBtreePage` failure
-point does `releasePage(pToRelease); return rc;`, dropping the currently-held overflow page's pin
-before propagating the error. The consequence is a leaked page pin on the allocation-failure path:
-the held overflow page is never released, so its cache reference count stays elevated where SQLite
-would have cleanly released it.
-
 <a id="drift-76-beginwrite-re-reads-page-1-header-on-state-change"></a>
 ### Drift: beginWrite Re Reads Page 1 Header On State Change
 - **Category:** changed-logic  -  **Severity:** medium

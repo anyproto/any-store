@@ -2522,7 +2522,6 @@ func (p *pager) writeOverflowChain(data []byte) (uint32, error) {
 // writeOverflowChainMulti writes multiple data segments to a chain of overflow
 // pages without assembling them into a contiguous intermediate buffer.
 // This matches SQLite's fillInCell streaming pattern (btree.c:7158-7239).
-// DRIFT: overflow-write alloc failure leaks held prevPg page pin See docs/btree/NOTES.md#drift-75-overflow-page-allocation-failure-leaks-held-pin
 func (p *pager) writeOverflowChainMulti(segments ...[]byte) (uint32, error) {
 	if pagerState(p.state.Load()) != pagerWriter {
 		return 0, ErrReadOnly
@@ -2555,6 +2554,12 @@ func (p *pager) writeOverflowChainMulti(segments ...[]byte) (uint32, error) {
 				}
 				newPg, err := p.allocatePageNear(nearby)
 				if err != nil {
+					// Release the currently-held overflow page before
+					// returning, mirroring C fillInCell's allocation-failure
+					// path (btree.c:7235-7238: releasePage(pToRelease);
+					// return rc;). prevPg is nil on the first overflow page
+					// (releasePage no-ops on nil), matching C's pToRelease==0.
+					p.releasePage(prevPg)
 					return 0, err
 				}
 				if firstPgno == 0 {
