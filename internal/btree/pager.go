@@ -1215,7 +1215,6 @@ func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 // allocatePage allocates a new page and returns it. Equivalent to
 // allocatePageNear(0) — no locality hint. Most callers (btree splits,
 // root allocation) don't have a meaningful hint and use this form.
-// DRIFT: missing allocateBtreePage upfront freelist-count (n>=mxPage) corruption guard See docs/btree/NOTES.md#drift-70-missing-aggregate-freelist-count-corruption-guard
 // DRIFT: allocatePageNear swallows freelist errors (incl ErrCorrupt) and grows DB silently See docs/btree/NOTES.md#drift-71-allocatepagenear-swallows-freelist-errors-and-grows-db
 func (p *pager) allocatePage() (*page, error) {
 	return p.allocatePageNear(0)
@@ -1381,11 +1380,16 @@ func (p *pager) freePage(pgno uint32) error {
 // If nearby > 0, the leaf with minimum |leafPgno - nearby| is selected
 // instead of the last leaf — matches SQLite btree.c:6678-6699 in
 // BTALLOC_ANY mode. Callers that don't care about locality pass 0.
-// DRIFT: missing allocateBtreePage upfront freelist-count (n>=mxPage) corruption guard See docs/btree/NOTES.md#drift-70-missing-aggregate-freelist-count-corruption-guard
 func (p *pager) allocateFromFreelist(nearby uint32) (*page, error) {
 	trunkPgno := p.header.FirstFreelistPg
 	if trunkPgno == 0 {
 		return nil, ErrInvalidPage
+	}
+	// Aggregate freelist-count corruption guard. C allocateBtreePage rejects the
+	// whole allocation if the recorded freelist page count is >= the DB page count
+	// (btree.c:6538-6542, n>=mxPage). page-1 offset 36 == header.TotalFreelistPgs.
+	if p.header.TotalFreelistPgs >= p.dbSize.Load() {
+		return nil, ErrCorrupt
 	}
 	// Validate trunk page number (fix 5.1).
 	if trunkPgno > p.dbSize.Load() {

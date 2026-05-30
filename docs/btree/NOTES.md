@@ -3006,23 +3006,6 @@ consequence is that in the default no-slab configuration Go always reports no me
 whereas SQLite would still surface heap-based pressure, so the cache never receives the
 pressure signal that would otherwise prompt it to shed pages.
 
-<a id="drift-70-missing-aggregate-freelist-count-corruption-guard"></a>
-### Drift: Missing Aggregate Freelist Count Corruption Guard
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `pager.go:*pager.allocateFromFreelist` (`pager.go:1307-1329`),
-  `pager.go:*pager.allocatePage` (`internal/btree/pager.go:1307-1330`).
-
-C's `allocateBtreePage` reads the total freelist page count from page-1 offset 36
-(`n = get4byte(&pPage1->aData[36])`) and, before touching any trunk page, rejects the whole
-allocation as `SQLITE_CORRUPT_BKPT` if `n >= mxPage` (`mxPage = btreePagecount(pBt)`,
-`btree.c:6538-6542`) -- i.e. if the freelist claims at least as many pages as the entire database
-file. Go's `allocateFromFreelist` (`pager.go:1307-1372`) performs only per-element bounds checks
-on individual trunk/leaf page numbers and has no upfront aggregate guard comparing the recorded
-freelist count (`header.TotalFreelistPgs`, page-1 offset 36) against the database page count. The
-consequence is that a corrupt freelist whose total count is impossibly large is not rejected at
-entry the way SQLite does; instead Go proceeds into the trunk walk, missing an early, cheap
-corruption signal that protects the rest of the allocation path.
-
 <a id="drift-71-allocatepagenear-swallows-freelist-errors-and-grows-db"></a>
 ### Drift: allocatePageNear Swallows Freelist Errors And Grows DB
 - **Category:** changed-logic  -  **Severity:** high

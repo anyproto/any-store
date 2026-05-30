@@ -415,6 +415,37 @@ func TestAllocateFromFreelist_CorruptTrunk(t *testing.T) {
 	p.endRead(slot)
 }
 
+// TestFreelistAggregateCountCorruptionGuard verifies the upfront aggregate
+// freelist-count corruption guard, mirroring C allocateBtreePage
+// (btree.c:6538-6542): if the recorded freelist page count (page-1 offset 36,
+// header.TotalFreelistPgs) is >= the DB page count (dbSize), the whole
+// allocation is rejected with ErrCorrupt before the trunk is consulted.
+func TestFreelistAggregateCountCorruptionGuard(t *testing.T) {
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf)
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
+
+	// Nonzero freelist head so the trunk-path guard is reached, with a
+	// recorded freelist count >= the DB page count (impossible for any
+	// legitimate state, since every freelist page is a real page counted
+	// within dbSize).
+	p.header.FirstFreelistPg = 1
+	p.header.TotalFreelistPgs = p.dbSize.Load()
+
+	_, err = p.allocateFromFreelist(0)
+	assert.ErrorIs(t, err, ErrCorrupt)
+
+	require.NoError(t, p.rollback())
+	p.endRead(slot)
+}
+
 func TestAllocateFromFreelist_CorruptLeafCount(t *testing.T) {
 	dir := t.TempDir()
 	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
