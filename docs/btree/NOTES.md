@@ -3235,21 +3235,6 @@ root as the restart counter/salt drifts (97, 98) surfacing on the read-mark/rese
 that the `aReadMark[0]==0` invariant is broken on restart (a slot-0 reader normally views only the db file)
 and the deterministic restart sequence/salt advances are lost.
 
-<a id="drift-100-slot-0-read-path-writes-mxframe-violating-areadmark0-invaria"></a>
-### Drift: Slot 0 Read Path Writes mxFrame Violating aReadMark0 Invariant
-- **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `wal.go:*wal.tryBeginRead` (`internal/btree/wal.go:2571-2572`).
-
-SQLite treats `aReadMark[0]` as a hard invariant fixed at 0 (`assert(pInfo->aReadMark[0]==0)`, `wal.c:2159`;
-comment `wal.c:361`), because a slot-0 reader reads the entire db file with no WAL view (mxFrame view 0); its
-`walTryBeginRead` slot-0 fast path only takes the shared lock on `WAL_READ_LOCK(0)`, runs the header memcmp,
-sets `pWal->readLock=0`, and returns — it never writes `pInfo->aReadMark[0]`. Go's slot-0 read path instead
-writes the current `mxFrame` into slot 0 both in SHM and process-local — `w.index.shmWriteReadMark(0, mxFrame)`
-plus `w.index.aReadMark[0].Store(mxFrame)` (`wal.go:2571-2572`) — violating the `aReadMark[0]==0` invariant.
-The consequence is that slot 0 no longer reliably signals "reader views db file only": its read-mark now
-carries a frame value, so any cross-process code (including checkpoint logic) that assumes slot 0 is pinned at
-0 can misinterpret the lowest reader bound.
-
 <a id="drift-102-reader-slot-tie-break-selects-lowest-not-highest"></a>
 ### Drift: Reader Slot Tie Break Selects Lowest Not Highest
 - **Category:** changed-logic  -  **Severity:** low

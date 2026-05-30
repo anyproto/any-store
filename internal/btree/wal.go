@@ -2501,7 +2501,12 @@ func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err er
 // tryBeginRead attempts to acquire a reader slot and returns the current
 // max frame number. Returns errWALRetry if the WAL state changed between
 // reading metadata and acquiring the lock, signaling the caller to retry.
-// DRIFT: slot-0 read path writes mxFrame into aReadMark[0] (must stay 0) See docs/btree/NOTES.md#drift-100-slot-0-read-path-writes-mxframe-violating-areadmark0-invaria
+//
+// The slot-0 read paths (both in-process and multi-process below) take the
+// read-0 lock and return WITHOUT writing aReadMark[0]: that mark is a fixed 0
+// sentinel meaning "read nothing from the WAL" and must stay 0, matching
+// SQLite's walTryBeginRead slot-0 fast path (wal.c:3136-3157) and its
+// aReadMark[0]==0 invariant (wal.c:2159,361).
 func (w *wal) tryBeginRead() (maxFrame uint32, slot int, err error) {
 	_, maxFrame, slot, err = w.tryBeginReadHdr()
 	return maxFrame, slot, err
@@ -2541,7 +2546,13 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame uint32, slot
 		if err := w.index.lock(lockRead0, lockShared); err != nil {
 			return WalIndexHdr{}, 0, 0, err
 		}
-		w.index.aReadMark[0].Store(mxFrame)
+		// Slot 0's read mark is a fixed sentinel that must stay 0 (set at
+		// wal.go:1900): it pins frame 0, i.e. "read nothing from the WAL".
+		// SQLite's walTryBeginRead slot-0 fast path (wal.c:3136-3157) takes
+		// WAL_READ_LOCK(0) and returns WITHOUT writing aReadMark[0], relying on
+		// the invariant aReadMark[0]==0 (wal.c:2159,361). The returned maxFrame
+		// comes from the local mxFrame snapshot, and no reader/checkpointer scan
+		// consults slot 0 (all loops start at i=1), so no write is needed here.
 		return hdr, mxFrame, 0, nil
 	}
 
@@ -2597,7 +2608,9 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame uint32, slot
 		}
 		return WalIndexHdr{}, 0, 0, err
 	}
-	w.index.aReadMark[0].Store(mxFrame)
+	// Slot 0 fallback: like the fast path above, do not write aReadMark[0].
+	// It is a fixed 0 sentinel (wal.go:1900); the returned maxFrame comes from
+	// the local mxFrame snapshot. Matches SQLite walTryBeginRead (wal.c:3136-3157).
 	return hdr, mxFrame, 0, nil
 }
 
@@ -2666,8 +2679,14 @@ func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame uint32, s
 				_ = w.index.unlock(lockRead0, lockShared)
 				return WalIndexHdr{}, 0, 0, errWALRetry
 			}
-			w.index.shmWriteReadMark(0, mxFrame)
-			w.index.aReadMark[0].Store(mxFrame) // keep process-local in sync
+			// Do not write aReadMark[0]: slot 0's mark is a fixed 0 sentinel
+			// (wal.go:1900) meaning "read nothing from the WAL". SQLite's
+			// slot-0 fast path (wal.c:3136-3157) takes WAL_READ_LOCK(0) and
+			// returns without touching aReadMark[0], relying on the invariant
+			// aReadMark[0]==0 (wal.c:2159,361). The returned maxFrame comes from
+			// the local hdr snapshot, and no reader/checkpointer scan reads slot
+			// 0 (all loops start at i=1), so neither the SHM mark nor the
+			// process-local mirror needs updating.
 			return hdr, mxFrame, 0, nil
 		}
 		if !errors.Is(err, ErrBusy) {
