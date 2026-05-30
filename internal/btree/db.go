@@ -339,7 +339,6 @@ func (db *DB) LastAutoCheckpointError() error {
 }
 
 // Open opens or creates a database at the given path.
-// DRIFT: Open doesn't validate opts.PageSize against existing file's on-disk page size See docs/btree/NOTES.md#drift-64-open-does-not-validate-pagesize-against-on-disk-page-size
 func Open(path string, opts Options) (*DB, error) {
 	if opts.PageSize == 0 {
 		opts.PageSize = DefaultPageSize

@@ -2938,22 +2938,6 @@ page 1 is durably committed to the main file outside of any transaction, so a cr
 or any reader/recovery logic that assumes page 1 first appears via the WAL sees a state SQLite
 would never produce.
 
-<a id="drift-64-open-does-not-validate-pagesize-against-on-disk-page-size"></a>
-### Drift: Open Does Not Validate PageSize Against On Disk Page Size
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `db.go:Open`
-  (`internal/btree/db.go:373,396 and internal/btree/pager.go:446 (no opts-vs-header page-size check); internal/btree/page_slab.go:78-86 (pool returns opts-sized buffer)`).
-
-`Open()` validates `opts.PageSize` only for self-consistency (`db.go:343-352`), then uses it to
-(1) key the process-global page buffer pool via `initPageBufferPool(opts.PageSize)` (`db.go:373`)
-and (2) construct the pager with `opts.PageSize` (`db.go:396`). When opening an EXISTING file,
-`p.open()` silently overwrites `p.pageSize` with the on-disk header value via
-`p.pageSize = p.header.PageSize` (`pager.go:446`) -- with no comparison against `opts.PageSize`
-and no error if they differ. The consequence is a buffer-pool size mismatch: the global page pool
-(`page_slab.go:78-86`) hands out buffers sized to `opts.PageSize` while the pager now operates on
-header-sized pages, so opening a file whose real page size differs from the caller's option yields
-mis-sized page buffers rather than the clean error SQLite would raise.
-
 <a id="drift-66-page-1-header-validation-missing-in-open-and-deserialize"></a>
 ### Drift: Page 1 Header Validation Missing In Open And Deserialize
 - **Category:** changed-logic  -  **Severity:** medium

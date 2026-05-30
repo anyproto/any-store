@@ -968,6 +968,38 @@ func TestOpen_PageSizeTooLarge(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid page size")
 }
 
+// TestOpen_OnDiskPageSizeMismatchSharedPool exercises drift-64: when the
+// process-global page buffer pool is already keyed to one page size, opening an
+// existing DB whose on-disk page size differs must fail with
+// ErrPageBufferPoolSizeMismatch rather than adopt the on-disk size and draw
+// mis-sized buffers from the shared pool. The two DBs are opened WITHOUT a
+// resetPageBufferPool() between them so the shared-pool path is exercised
+// (testOpen resets per call, so call Open directly here).
+func TestOpen_OnDiskPageSizeMismatchSharedPool(t *testing.T) {
+	dir := t.TempDir()
+	pathA := filepath.Join(dir, "a.db")
+	pathB := filepath.Join(dir, "b.db")
+
+	// Create DB A with the minimum page size, then close it so the on-disk
+	// header records PageSize == MinPageSize.
+	resetPageBufferPool()
+	dbA, err := Open(pathA, Options{PageSize: MinPageSize})
+	require.NoError(t, err)
+	require.NoError(t, dbA.Close())
+
+	// Key the process-global pool to a DIFFERENT page size via DB B, WITHOUT
+	// resetting the pool first.
+	resetPageBufferPool()
+	dbB, err := Open(pathB, Options{PageSize: 2 * MinPageSize})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = dbB.Close() })
+
+	// Re-open DB A (on-disk MinPageSize) against the pool now keyed to
+	// 2*MinPageSize. Must be rejected, not silently adopted.
+	_, err = Open(pathA, Options{PageSize: 2 * MinPageSize})
+	require.ErrorIs(t, err, ErrPageBufferPoolSizeMismatch)
+}
+
 // === UpdateLocalCounters ===
 
 func TestUpdateLocalCounters(t *testing.T) {

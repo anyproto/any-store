@@ -445,6 +445,27 @@ func (p *pager) open() error {
 		return fmt.Errorf("%w: VersionValidFor=%d FileChangeCount=%d", ErrCorrupt, p.header.VersionValidFor, p.header.FileChangeCount)
 	}
 
+	// Validate the on-disk header page size, mirroring C lockBtree
+	// (btree.c:3377-3385): it must be a power of two within
+	// [MinPageSize, MaxPageSize], else SQLITE_NOTADB. The on-disk size is
+	// adopted as authoritative below (p.pageSize = p.header.PageSize), so
+	// reject a corrupt/non-DB value here instead of trusting it into the
+	// engine.
+	if p.header.PageSize < MinPageSize || p.header.PageSize > MaxPageSize ||
+		(p.header.PageSize&(p.header.PageSize-1)) != 0 {
+		return fmt.Errorf("%w: invalid on-disk page size %d", ErrCorrupt, p.header.PageSize)
+	}
+
+	// Reconcile the on-disk page size against the process-global page buffer
+	// pool. Open already keyed the pool to opts.PageSize (db.go), so this
+	// returns ErrPageBufferPoolSizeMismatch when the on-disk size differs;
+	// propagate it rather than draw mis-sized buffers from the shared pool.
+	// (C allocates per-pager pTmpSpace/PCache at the file's actual page size,
+	// pager.c:5016-5028, and so never mixes sizes the way this pool would.)
+	if err := initPageBufferPool(p.header.PageSize); err != nil {
+		return err
+	}
+
 	p.pageSize = p.header.PageSize
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
 
