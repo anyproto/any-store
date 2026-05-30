@@ -17,9 +17,40 @@ import (
 	"sync/atomic"
 )
 
-// openDBs tracks database files currently open in this process.
-// Keyed by canonical absolute path. Prevents double-open corruption.
+// openDBs tracks database files currently open in this process. It is the sole
+// guard against same-process double-open corruption (two writers each believing
+// they hold the exclusive WAL write lock): in-process SHM locks are
+// instance-local, and a same-process second SHARED flock on the DB file also
+// succeeds, so neither backstops this. SQLite coordinates same-process opens
+// through a process-global unixInodeInfo keyed by (dev,ino) (os_unix.c:1282-1349);
+// any-store forbids them instead, but must key on the same FILE IDENTITY rather
+// than a lexical path so that the same inode reached via a symlink, hardlink,
+// bind-mount, or distinct mount path is recognised as already-open. See
+// openRegistryKey for how the key is derived. Prevents double-open corruption.
 var openDBs sync.Map
+
+// openRegistryKey returns the key under which a database file is tracked in
+// openDBs. It prefers FILE IDENTITY (device, inode) over the lexical path so
+// that the same physical file opened under two different spellings (symlink,
+// hardlink, bind-mount, …) collides in the registry, matching SQLite's
+// (dev,ino) unixInodeInfo keying.
+//
+// It falls back to the lexical canonical path (filepath.Abs) when no inode is
+// available — a brand-new file that os.Stat cannot yet see, a platform with no
+// portable (dev,ino) (Windows/wasm), or a VFS-injected FileInfo. Those cases
+// keep the previous lexical behaviour and never break in-memory/VFS opens.
+func openRegistryKey(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("btree: cannot resolve path: %w", err)
+	}
+	if fi, statErr := os.Stat(path); statErr == nil {
+		if key, ok := fileIdentityKey(fi); ok {
+			return key, nil
+		}
+	}
+	return abs, nil
+}
 
 // Options configures the database.
 type Options struct {
@@ -269,6 +300,7 @@ type DB struct {
 	writeMu         sync.Mutex // serializes write transactions
 	pager           *pager
 	path            string
+	registryKey     string // key under which this DB is tracked in openDBs (file identity or lexical path)
 	opts            Options
 	closing         atomic.Bool // set to reject new transactions
 	closed          atomic.Bool // set when Close() is actually called
@@ -374,22 +406,22 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 
-	// Prevent double-open of the same database file.
-	var canonicalPath string
+	// canonicalPath is the lexical absolute path, used for Path()/db.path. The
+	// double-open guard itself keys on FILE IDENTITY (dev,ino) and is registered
+	// after p.open() below, once the file exists and can be stat'd — see the
+	// openDBs registration following p.open().
+	var canonicalPath, registryKey string
 	if !opts.InMemory {
 		var err error
 		canonicalPath, err = filepath.Abs(path)
 		if err != nil {
 			return nil, fmt.Errorf("btree: cannot resolve path: %w", err)
 		}
-		if _, loaded := openDBs.LoadOrStore(canonicalPath, true); loaded {
-			return nil, ErrDatabaseOpen
-		}
 	}
 	openSuccess := false
 	defer func() {
-		if !openSuccess && canonicalPath != "" {
-			openDBs.Delete(canonicalPath)
+		if !openSuccess && registryKey != "" {
+			openDBs.Delete(registryKey)
 		}
 	}()
 
@@ -485,6 +517,32 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 
+	// Register in the process-global open-DB guard, keyed on FILE IDENTITY
+	// (dev,ino) rather than the lexical path, so that the same inode reached via
+	// a symlink/hardlink/bind-mount/distinct-mount-path is recognised as already
+	// open. We do this AFTER p.open() because the file now definitely exists (it
+	// was created for a new DB), so its inode is stable — keying before open
+	// would mis-key brand-new files (no inode yet -> lexical fallback) against a
+	// later open of the same now-existing file (inode). This mirrors SQLite,
+	// which opens the fd and then consults its (dev,ino) unixInodeInfo registry
+	// (os_unix.c:1282-1349). Falls back to the lexical canonical path when no
+	// inode is available (Windows/wasm, or a VFS-injected FileInfo).
+	if !opts.InMemory {
+		registryKey = canonicalPath
+		if fi, statErr := p.file.Stat(); statErr == nil {
+			if key, ok := fileIdentityKey(fi); ok {
+				registryKey = key
+			}
+		}
+		if _, loaded := openDBs.LoadOrStore(registryKey, true); loaded {
+			_ = p.close()
+			// Clear so the deferred cleanup does not delete the entry that the
+			// already-open handle owns.
+			registryKey = ""
+			return nil, ErrDatabaseOpen
+		}
+	}
+
 	// Reject databases created with an older schema format.
 	// Schema format 5 introduced unified leaf cell overflow (key+value as a
 	// single payload blob). Older formats stored key fully on-page and only
@@ -502,9 +560,10 @@ func Open(path string, opts Options) (*DB, error) {
 	}
 
 	db := &DB{
-		pager: p,
-		path:  path,
-		opts:  opts,
+		pager:       p,
+		path:        path,
+		registryKey: registryKey,
+		opts:        opts,
 		masterBT: &btree{
 			pager:    p,
 			rootPage: 1,
@@ -584,7 +643,7 @@ drained:
 	err := db.pager.close()
 	// Remove from open registry after full cleanup
 	if !db.opts.InMemory {
-		openDBs.Delete(db.path)
+		openDBs.Delete(db.registryKey)
 	}
 	return err
 }

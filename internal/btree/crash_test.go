@@ -42,7 +42,7 @@ func rawClose(db *DB) {
 	}
 	// Remove from open registry so the path can be re-opened.
 	if !db.opts.InMemory {
-		openDBs.Delete(db.path)
+		openDBs.Delete(db.registryKey)
 	}
 }
 

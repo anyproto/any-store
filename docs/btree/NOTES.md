@@ -3667,30 +3667,6 @@ roadmap comment (now partially stale, since linux/arm64 and darwin are already c
 from NOTES. The consequence is documentation drift: NOTES understates which platforms get real multi-process SHM
 and omits both the on-disk lock-region layout and the roadmap notes a maintainer would need.
 
-<a id="drift-119-vfs-injection-layer-and-open-registry-undocumented"></a>
-### Drift: VFS Injection Layer And Open Registry Undocumented
-- **Category:** new-feature  -  **Severity:** medium
-- **Affected functions:** `osfuncs.go` (`internal/btree/osfuncs.go:8,16-32` default-build aliases + panic stubs),
-  `osfuncs_vfs.go` (`internal/btree/osfuncs_vfs.go:7,9-48` swappable vars, SetVFS `:21`, ResetVFS `:34`,
-  ResetOpenRegistry `:43`), `osfuncs_vfs_js.go` (`internal/btree/osfuncs_vfs_js.go:1-34` wasm panic-stub init),
-  `osfuncs_sync_linux.go` / `osfuncs_vfs_sync_linux.go:7` / `osfuncs_vfs_sync_other.go:5` (defaultFdatasync split),
-  `vfs.go` (`internal/btree/vfs.go:6-22` File interface + VFS struct),
-  with the registry at `db.go:20` (openDBs), `db.go:385` (LoadOrStore double-open guard), `db.go:587` (Delete on close).
-
-any-store implements its own runtime-swappable OS layer with no SQLite analogue in the mapping and no NOTES.md
-documentation, gated on the `vfs` build tag (or `js && wasm`). In the default production build
-(`//go:build !vfs && !(js && wasm)`) `SetVFS`/`ResetVFS`/`ResetOpenRegistry` are panic-only stubs and `fileHandle`
-is the concrete `*os.File` for zero interface overhead (`osfuncs.go:8,16-32`). Under `-tags vfs` (or wasm),
-`osfuncs_vfs.go` makes `osOpenFile`/`osRemove`/`fdatasync` mutable package vars swapped via `SetVFS` from a `VFS`
-struct (`vfs.go:18-22`) and restored via `ResetVFS`, enabling fault injection (e.g. simulating fdatasync failures
-during checkpoint) and a pluggable wasm backend; the wasm build's `init()` further replaces the defaults with
-panic stubs ("btree: SetVFS not called — anystore on wasm requires a VFS backend") because under GOOS=js the bare
-`os.*` calls return ENOSYS rather than failing loudly (`osfuncs_vfs_js.go:1-34`). Alongside this sits a
-process-global `openDBs sync.Map` keyed by canonical absolute path that blocks same-process double-open
-(`db.go:20,385,587`), plus the `ResetOpenRegistry` crash-simulation hook that clears it so tests skipping `Close`
-can re-open. The consequence is a substantial undocumented feature surface — VFS injection, the wasm panic
-contract, and the single-open-per-process registry — that a maintainer cannot discover from NOTES.
-
 <a id="drift-121-fdatasync-durability-primitive-platform-split-undocumented"></a>
 ### Drift: fdatasync Durability Primitive Platform Split Undocumented
 - **Category:** platform-support  -  **Severity:** medium
