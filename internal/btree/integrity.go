@@ -274,7 +274,7 @@ func (ic *integrityChecker) keyInBounds(key, lower, upper []byte, context string
 // strict cell ordering check this enforces
 //
 //	max(subtree[child i]) < D_i <= min(subtree[child i+1]).
-func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte) int {
+func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLeafCell func(cell cellData)) int {
 	if ic.tooManyErrors() {
 		return 0
 	}
@@ -405,6 +405,16 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte) int 
 
 			// Add to heap for coverage check
 			heapInsert(&h, (uint32(cellOff)<<16)|uint32(cellOff+cellSize-1))
+
+			// Per-leaf-cell hook. SQLite has no equivalent here because it
+			// pre-builds aRoot[] from the in-memory schema (pragma.c:1761-1774);
+			// any-store has no such list, so the master root discovers each
+			// namespace subtree from its own leaf cells via this callback. The
+			// hook only READS cell.value; it does not touch the coverage heap or
+			// fragmentation accounting, so coverage is unchanged.
+			if onLeafCell != nil {
+				onLeafCell(cell)
+			}
 		} else {
 			// Interior cell (with overflow support)
 			cell, sz, cerr := parseInteriorCell(pg.data, cellOff, ic.usableSize)
@@ -460,7 +470,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte) int 
 			if fkerr == nil {
 				childUpper = fullKey
 			}
-			childDepth := ic.checkTreePage(cell.leftChild, prevDivider, childUpper)
+			childDepth := ic.checkTreePage(cell.leftChild, prevDivider, childUpper, onLeafCell)
 			if i == 0 {
 				depth = childDepth
 			} else if childDepth != depth {
@@ -480,7 +490,7 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte) int 
 	// >= D_{n-1} (the last divider, now in prevDivider) and < this page's
 	// upper bound — bound [prevDivider, upper).
 	if !isLeaf {
-		childDepth := ic.checkTreePage(pg.header.rightChild, prevDivider, upper)
+		childDepth := ic.checkTreePage(pg.header.rightChild, prevDivider, upper, onLeafCell)
 		if nCells > 0 && childDepth != depth {
 			ic.report("%s: child page depth differs (rightChild %d depth %d vs expected %d)", context, pg.header.rightChild, childDepth, depth)
 		}
@@ -513,14 +523,12 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte) int 
 // IntegrityCheck validates the internal consistency of the entire database.
 // Returns nil if the database is consistent, or an *IntegrityError with
 // all issues found.
-// DRIFT: IntegrityCheck treats master page 1 as flat leaf; false positives once it splits See docs/btree/NOTES.md#drift-112-integritycheck-treats-master-page-1-as-flat-leaf
 func (db *DB) IntegrityCheck() error {
 	return db.IntegrityCheckN(100)
 }
 
 // IntegrityCheckN is like IntegrityCheck but stops after maxErrors issues.
 // Pass 0 for unlimited.
-// DRIFT: IntegrityCheck treats master page 1 as flat leaf; false positives once it splits See docs/btree/NOTES.md#drift-112-integritycheck-treats-master-page-1-as-flat-leaf
 func (db *DB) IntegrityCheckN(maxErrors int) error {
 	// Start a read transaction
 	maxFrame, slot, err := db.pager.beginRead()
@@ -592,8 +600,11 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 		maxErrors:   maxErrors,
 	}
 
-	// Mark page 1 as referenced (it is the master B-tree root)
-	ic.setReferenced(1)
+	// Page 1 (the master B-tree root) is NOT pre-referenced here. It is routed
+	// through checkTreePage(1, ...) below, which calls checkRef(1, ...) itself
+	// (mirroring btree.c:10897). Pre-marking it would make that checkRef emit a
+	// spurious "page 1: 2nd reference" and abort the walk. SQLite likewise
+	// pre-references only PENDING_BYTE_PAGE (btree.c:11200-11201), never tree roots.
 
 	// 1. Check freelist
 	if hdr.FirstFreelistPg != 0 {
@@ -602,89 +613,47 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 		ic.report("freelist: header says %d free pages but first trunk is 0", hdr.TotalFreelistPgs)
 	}
 
-	// 2. Check master B-tree (page 1) structure
+	// 2. Check master B-tree (page 1) structure.
+	//
+	// Route page 1 through the SAME uniform checkTreePage path SQLite uses for
+	// every root (btree.c:11236-11247). checkTreePage handles both leaf and
+	// interior roots — recursing into children, validating coverage/depth/key
+	// order at every level — so an interior master page (after a split) is no
+	// longer misparsed as a flat leaf.
+	//
+	// masterLeaf is the per-leaf-cell hook that performs the one any-store-
+	// specific step SQLite does not need: SQLite pre-builds aRoot[] from the
+	// in-memory schema (pragma.c:1761-1774); any-store has no such list, so each
+	// namespace subtree is discovered here from the master's own LEAF cells, at
+	// ANY master depth. The hook only reads cell.value (the namespace root page),
+	// never the coverage heap.
 	ic.treeName = "master"
-	pg1, err = ic.getPage(1)
-	if err != nil {
-		return err
-	}
-
-	pt := pg1.header.pageType
-	if pt != pageTypeLeafIdx && pt != pageTypeIntIdx {
-		ic.report("tree master page 1: invalid page type %d", pt)
-		db.pager.releasePage(pg1)
-		goto checkOrphans
-	}
-
-	{
-		nCells := int(pg1.header.cellCount)
-		// Validate contentOffset, matching SQLite's allocateSpace()
-		// validation (btree.c lines 1843-1853).
-		contentOffset, coErr := pg1.contentAreaOffset(ic.usableSize)
-		if coErr != nil {
-			ic.report("tree master page 1: invalid cell content offset")
-			db.pager.releasePage(pg1)
-			goto checkOrphans
+	masterLeaf := func(cell cellData) {
+		// A master leaf value < 4 bytes is corrupt (matches resolveNamespace,
+		// db.go:1253). The interior/leaf parse + bounds checks in checkTreePage
+		// already validated cell structure; here we only validate the value.
+		if len(cell.value) < 4 {
+			ic.report("tree master cell key %q: corrupt namespace root value", string(cell.key))
+			return
 		}
-
-		var h []uint32
-		var prevKey []byte
-		doCoverageCheck := true
-
-		for i := 0; i < nCells; i++ {
-			if ic.tooManyErrors() {
-				break
-			}
-
-			cellOff := int(pg1.getCellOffset(i))
-			if cellOff < contentOffset || cellOff > ic.usableSize-4 {
-				ic.report("tree master page 1 cell %d: offset %d out of range %d..%d", i, cellOff, contentOffset, ic.usableSize-4)
-				doCoverageCheck = false
-				continue
-			}
-
-			cell, cellSize, cerr := parseLeafCellWithSize(pg1.data, cellOff, ic.usableSize)
-			if cerr != nil {
-				ic.report("tree master page 1 cell %d: corrupt cell data", i)
-				doCoverageCheck = false
-				continue
-			}
-			if cellOff+cellSize > ic.usableSize {
-				ic.report("tree master page 1 cell %d: extends off end of page", i)
-				doCoverageCheck = false
-				continue
-			}
-
-			// Key ordering
-			if prevKey != nil && bytes.Compare(prevKey, cell.key) >= 0 {
-				ic.report("tree master page 1 cell %d: key out of order", i)
-			}
-			prevKey = bytes.Clone(cell.key)
-
-			// Check the namespace's root page
-			if len(cell.value) >= 4 {
-				rootPage := binary.BigEndian.Uint32(cell.value)
-				if rootPage >= 2 && rootPage <= nPages {
-					ic.treeName = string(cell.key)
-					// Each namespace tree is an independent B-tree; its root
-					// has no divider bounds (unbounded both ways).
-					ic.checkTreePage(rootPage, nil, nil)
-				} else if rootPage != 0 {
-					ic.report("tree master page 1 cell %d: namespace %q root page %d out of range", i, string(cell.key), rootPage)
-				}
-			}
-
-			heapInsert(&h, (uint32(cellOff)<<16)|uint32(cellOff+cellSize-1))
-		}
-
-		if doCoverageCheck {
-			ic.treeName = "master"
-			ic.checkPageCoverage(pg1, "tree master page 1", h)
+		rootPage := binary.BigEndian.Uint32(cell.value[:4])
+		switch {
+		case rootPage >= 2 && rootPage <= nPages:
+			// Each namespace tree is an independent B-tree; its root has no
+			// divider bounds (unbounded both ways) and carries user data in
+			// its own leaf values, so it needs no leaf-cell hook (nil).
+			savedName := ic.treeName
+			ic.treeName = string(cell.key)
+			ic.checkTreePage(rootPage, nil, nil, nil)
+			ic.treeName = savedName
+		case rootPage != 0:
+			// rootPage == 0 is a valid empty namespace (intentionally skipped;
+			// exercised by TestDeleteNamespace_RootPageZero).
+			ic.report("tree master cell key %q: namespace root page %d out of range", string(cell.key), rootPage)
 		}
 	}
-	db.pager.releasePage(pg1)
+	ic.checkTreePage(1, nil, nil, masterLeaf)
 
-checkOrphans:
 	// 3. Check for orphan pages
 	// The tooManyErrors check matches SQLite's `sCheck.mxErr` guard in the
 	// orphan loop (btree.c:11237), preventing iteration over billions of

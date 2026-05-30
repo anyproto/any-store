@@ -3339,23 +3339,6 @@ range. Go's `walBusyLock` signature is instead `(wi, xBusy, slot, lockType)` and
 SQLite grabs reader slots 1..4 in one operation, Go must lock them individually, which changes the lock-granularity
 contract but is acceptable because Go does not exercise the multi-slot reader range the way C does.
 
-<a id="drift-112-integritycheck-treats-master-page-1-as-flat-leaf"></a>
-### Drift: IntegrityCheck Treats Master Page 1 As Flat Leaf
-- **Category:** changed-logic  -  **Severity:** high
-- **Affected functions:** `integrity.go:*DB.IntegrityCheck` (`internal/btree/integrity.go:615-695`),
-  `integrity.go:*DB.IntegrityCheckN` (`integrity.go:601-681`, esp. `609`, `642`, `661-667`).
-
-C routes EVERY tree root — including `sqlite_master` / page 1 — uniformly through `checkTreePage`
-(`btree.c:11246`), which handles both leaf (`pageTypeLeafIdx`) and interior (`pageTypeIntIdx`) roots, recursing
-into children and validating coverage/depth/key-order at every level. Go's `IntegrityCheckN` instead special-cases
-the master B-tree (page 1) with a hardcoded leaf-only cell loop: although the page-type guard at `integrity.go:609`
-explicitly allows `pageTypeIntIdx`, the loop unconditionally calls `parseLeafCellWithSize` on every page-1 cell
-(`integrity.go:642`), extracts namespace roots from `cell.value`, and proceeds straight to the orphan scan — it
-never calls `checkTreePage(1, ...)` and never recurses into page 1's interior children. The consequence is a
-high-severity false-positive flood: once the master/namespace catalog grows large enough that page 1 becomes an
-interior root, the leaf-only parse misinterprets interior cells and a healthy database is reported as corrupt,
-confirmed in live reproduction.
-
 <a id="drift-113-integrity-freeblock-walk-and-coverage-diagnostics-diverge"></a>
 ### Drift: Integrity Freeblock Walk And Coverage Diagnostics Diverge
 - **Category:** changed-logic  -  **Severity:** low
