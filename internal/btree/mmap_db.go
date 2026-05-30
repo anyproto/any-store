@@ -3,11 +3,19 @@
 package btree
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sync"
 	"syscall"
 )
+
+// errMmapNotRealFile signals that the active fileHandle is not the real OS
+// file (e.g. a custom VFS File injected for fault injection), so there is no
+// raw fd whose bytes are guaranteed to equal its ReadAt. Mmap is disabled and
+// reads fall back to File.ReadAt — the analogue of SQLite leaving bUseFetch=0
+// when the VFS lacks xFetch (pager.c:3536-3539 pagerFixMaplimit).
+var errMmapNotRealFile = errors.New("btree: mmap unavailable: file is not a real OS file")
 
 // dbMmap holds the optional mmap region for the database file. When
 // enabled, reads of any offset within [0, curSize) memcpy from the
@@ -70,7 +78,6 @@ func (m *dbMmap) readAt(dst []byte, off int64) (ok bool) {
 // at maxSize. Called lazily on first fetch and after DB-file growth.
 // Matches SQLite's unixRemapfile (os_unix.c:5570-5640+). No-op when
 // disabled (maxSize == 0).
-// DRIFT: mmap reads raw OS fd, bypassing injected VFS/custom File.ReadAt See docs/btree/NOTES.md#drift-120-mmap-backed-reads-bypass-injected-vfs-file
 func (m *dbMmap) remap(need int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -96,6 +103,17 @@ func (m *dbMmap) remap(need int64) error {
 	}
 	fd, err := fdFromFile(m.file)
 	if err != nil {
+		if errors.Is(err, errMmapNotRealFile) {
+			// The active file is a custom VFS File (no real raw fd whose
+			// bytes equal its ReadAt). Permanently disable mmap for this
+			// dbMmap so every read falls through to File.ReadAt. This is
+			// the exact analogue of SQLite leaving bUseFetch=0 when the VFS
+			// lacks xFetch (pager.c:3536-3539): all reads then go through
+			// the injected File.ReadAt, restoring interception/fault
+			// injection.
+			m.maxSize = 0
+			return nil
+		}
 		return err
 	}
 	b, err := syscall.Mmap(fd, 0, int(target), syscall.PROT_READ, syscall.MAP_SHARED)
@@ -127,13 +145,22 @@ func (m *dbMmap) enabled() bool {
 	return m != nil && m.maxSize > 0
 }
 
-// fdFromFile extracts the OS fd from a fileHandle. On the default
-// build (fileHandle = *os.File) it's direct. On the vfs build
-// (fileHandle = File interface), Fd() is part of the File contract.
-// DRIFT: mmap reads raw OS fd, bypassing injected VFS/custom File.ReadAt See docs/btree/NOTES.md#drift-120-mmap-backed-reads-bypass-injected-vfs-file
+// fdFromFile extracts the OS fd from a fileHandle, but ONLY when the handle
+// is the real OS file (*os.File), whose raw-fd bytes are guaranteed to equal
+// its ReadAt. On the default build (fileHandle = *os.File) the assert always
+// holds. On the vfs build (fileHandle = File interface), the default
+// os.OpenFile still returns an *os.File so the real-OS path keeps mmap; an
+// injected custom File fails the assert and yields errMmapNotRealFile so the
+// caller falls back to File.ReadAt. This mirrors SQLite gating mmap on the
+// VFS providing its own xFetch (bUseFetch only set when iVersion>=3,
+// pager.c:3536-3539); SQLite never reaches around an active VFS to mmap a raw
+// fd (getPageMMap fetches via the SAME VFS, pager.c:5682).
 func fdFromFile(f fileHandle) (int, error) {
 	if f == nil {
 		return -1, os.ErrClosed
 	}
-	return int(f.Fd()), nil
+	if of, ok := any(f).(*os.File); ok {
+		return int(of.Fd()), nil
+	}
+	return -1, errMmapNotRealFile // custom VFS file: no equivalent raw fd
 }

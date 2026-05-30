@@ -3854,25 +3854,6 @@ process-global `openDBs sync.Map` keyed by canonical absolute path that blocks s
 can re-open. The consequence is a substantial undocumented feature surface — VFS injection, the wasm panic
 contract, and the single-open-per-process registry — that a maintainer cannot discover from NOTES.
 
-<a id="drift-120-mmap-backed-reads-bypass-injected-vfs-file"></a>
-### Drift: mmap Backed Reads Bypass Injected VFS File
-- **Category:** platform-support  -  **Severity:** medium
-- **Affected functions:** `mmap_db.go` (`internal/btree/mmap_db.go:96-100,129-137` fdFromFile + remap),
-  `mmap_db_other.go` (no-op variant context), with `pager.go:298-326,381` (readDBPage mmap-first gate, newDBMmap),
-  `osfuncs_vfs.go:7,21-31` (fileHandle = File, SetVFS), `vfs.go:6-22` (File interface + VFS struct).
-
-On a `-tags vfs` build for linux/darwin + amd64/arm64 the REAL `mmap_db.go` is compiled (not the no-op
-`mmap_db_other.go`), and `dbMmap.remap` maps the raw OS file descriptor directly:
-`syscall.Mmap(fd, 0, int(target), PROT_READ, MAP_SHARED)` where `fd` comes from `fdFromFile(m.file)` -> `f.Fd()`
-(`mmap_db.go:96-100,129-137`). Under this build `fileHandle` is the `File` interface (`osfuncs_vfs.go:7`) and a
-caller can install a custom `File` via `SetVFS`/`VFS.OpenFile` (`vfs.go:16-22`), yet that custom `File` flows into
-`newDBMmap` (`pager.go:381`) and is unwrapped to its raw fd, silently bypassing the injected
-`File.ReadAt`. Because the pager read path tries `dbMmap.readAt` (the mmap fast path) before falling back to
-`p.file.ReadAt` (`pager.go:298-326`), an injected VFS sees its custom read interception bypassed for all
-mmap-served DB pages. The consequence is a fault-injection/VFS-backend correctness gap: a custom `File` cannot
-intercept or fault mmap-backed reads on the platforms where mmap is active, which can invalidate VFS-based read
-fault-injection tests and wasm/custom backends.
-
 <a id="drift-121-fdatasync-durability-primitive-platform-split-undocumented"></a>
 ### Drift: fdatasync Durability Primitive Platform Split Undocumented
 - **Category:** platform-support  -  **Severity:** medium
