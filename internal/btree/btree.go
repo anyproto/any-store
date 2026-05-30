@@ -7,18 +7,20 @@ package btree
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 	"slices"
 	"sync/atomic"
 )
 
-// debugOverflowReadErrors, when non-zero, causes collectLeafCells and
-// collectInteriorCells to panic when readOverflowChainAt returns an error,
-// rather than silently ignoring it. Set via atomic for test use only.
+// debugOverflowReadErrors is a test-only toggle retained as a stricter-debug
+// aid. collectLeafCells and collectInteriorCells now propagate overflow
+// read/parse errors directly (instead of silently ignoring them), so this flag
+// no longer gates a panic in the collectors; real error propagation supersedes
+// it. Set via atomic for test use only.
 var debugOverflowReadErrors atomic.Int32
 
-// SetDebugOverflowReadErrors enables or disables the debug mode that panics
-// on overflow read errors in collectLeafCells/collectInteriorCells.
+// SetDebugOverflowReadErrors enables or disables the test-only debug toggle.
+// The collectors now surface overflow read errors directly, so this is a no-op
+// for production behavior; kept for test compatibility.
 func SetDebugOverflowReadErrors(enabled bool) {
 	if enabled {
 		debugOverflowReadErrors.Store(1)
@@ -1208,7 +1210,10 @@ func (bt *btree) insertIntoLeafWithPath(pg *page, key, value []byte, path []path
 	// when the gap is insufficient but total free space is enough.
 	totalFree := gapSpace + int(pg.header.fragBytes)
 	if cellSize+2 <= totalFree {
-		cells, cellBuf := bt.collectLeafCells(pg)
+		cells, cellBuf, cerr := bt.collectLeafCells(pg)
+		if cerr != nil {
+			return cerr
+		}
 		err := bt.rebuildLeafPage(pg, cells)
 		bt.pager.recycleCellSlice(cells)
 		bt.pager.recycleCellBuf(cellBuf)
@@ -1254,7 +1259,10 @@ func (bt *btree) insertIntoLeaf(pg *page, key, value []byte) error {
 	// Check if defragmentation would free enough space
 	totalFree := gapSpace + int(pg.header.fragBytes)
 	if cellSize+2 <= totalFree {
-		cells, cellBuf := bt.collectLeafCells(pg)
+		cells, cellBuf, cerr := bt.collectLeafCells(pg)
+		if cerr != nil {
+			return cerr
+		}
 		err := bt.rebuildLeafPage(pg, cells)
 		bt.pager.recycleCellSlice(cells)
 		bt.pager.recycleCellBuf(cellBuf)
@@ -1418,7 +1426,10 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []pat
 	// Slow path: new cell doesn't fit or too much fragmentation.
 	// collectLeafCells preserves overflow chains (raw passthrough).
 	// Free overflow only for the cell being replaced.
-	cells, cellBuf := bt.collectLeafCells(pg)
+	cells, cellBuf, cerr := bt.collectLeafCells(pg)
+	if cerr != nil {
+		return cerr
+	}
 	defer bt.pager.recycleCellSlice(cells)
 	defer bt.pager.recycleCellBuf(cellBuf)
 	if cells[idx].overflowPg != 0 {
@@ -1491,7 +1502,7 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []pat
 // and "returned" by the caller via pager.recycleCellBuf after the cells are
 // consumed. The take-and-nil pattern handles the merge path (two overlapping
 // calls) — the second call finds nil and allocates fresh.
-func (bt *btree) collectLeafCells(pg *page) ([]cellData, []byte) {
+func (bt *btree) collectLeafCells(pg *page) ([]cellData, []byte, error) {
 	n := int(pg.header.cellCount)
 
 	// Reuse pager's pooled cellData slice to avoid per-call allocation.
@@ -1527,7 +1538,16 @@ func (bt *btree) collectLeafCells(pg *page) ([]cellData, []byte) {
 	for i := range n {
 		off := pg.getCellOffset(i)
 		var bytesRead int
-		cells[i], bytesRead, _ = parseLeafCellWithSize(pg.data, int(off), usableSize)
+		var perr error
+		// A malformed cell surfaces as corruption, mirroring SQLite's cell-pointer
+		// load loop where a bad cell yields SQLITE_CORRUPT (btree.c:8443-8446,
+		// 8467-8470). Recycle the taken slice/buf before returning.
+		cells[i], bytesRead, perr = parseLeafCellWithSize(pg.data, int(off), usableSize)
+		if perr != nil {
+			bt.pager.recycleCellSlice(cells)
+			bt.pager.recycleCellBuf(buf)
+			return nil, nil, perr
+		}
 
 		// Copy raw cell bytes into contiguous buffer for passthrough.
 		rcStart := len(buf)
@@ -1554,7 +1574,7 @@ func (bt *btree) collectLeafCells(pg *page) ([]cellData, []byte) {
 			cells[i].value = buf[vStart:len(buf)]
 		}
 	}
-	return cells, buf
+	return cells, buf, nil
 }
 
 // cellFullKey returns the full key for a cell collected by collectLeafCells.
@@ -1597,7 +1617,7 @@ func (bt *btree) cellFullKey(c *cellData) ([]byte, error) {
 // Uses pager.cellBuf as reusable scratch space (same buffer as collectLeafCells;
 // callers never interleave leaf and interior collection). Self-recycles the
 // buffer back to the pager at the end since interior collection never overlaps.
-func (bt *btree) collectInteriorCells(pg *page) []cellData {
+func (bt *btree) collectInteriorCells(pg *page) ([]cellData, error) {
 	n := int(pg.header.cellCount)
 	cells := make([]cellData, n)
 	usable := bt.usablePageSize()
@@ -1632,10 +1652,14 @@ func (bt *btree) collectInteriorCells(pg *page) []cellData {
 			copy(fullKey, pg.data[pos:pos+localSize])
 			overflowPg := binary.BigEndian.Uint32(pg.data[pos+localSize : pos+localSize+4])
 			if err := bt.pager.readOverflowChainAt(overflowPg, fullKey[localSize:], bt.walMaxFrame); err != nil {
-				if debugOverflowReadErrors.Load() != 0 {
-					panic(fmt.Sprintf("collectInteriorCells: readOverflowChainAt(pg=%d, walMaxFrame=%d) failed: %v",
-						overflowPg, bt.walMaxFrame, err))
-				}
+				// Surface the read error instead of swallowing it. Do NOT free the
+				// overflow chain or overwrite cells[i].key: the cell's overflow
+				// pointer must stay intact, matching C balance_nonroot which copies
+				// the raw cell bytes verbatim and never re-reads/frees overflow
+				// chains during balance (btree.c:8473-8489); errors propagate up the
+				// balance() do-loop as SQLITE_CORRUPT/IO (btree.c:9131-9242).
+				bt.pager.recycleCellBuf(buf)
+				return nil, err
 			}
 			_ = bt.pager.freeOverflowChain(overflowPg)
 			cells[i].key = fullKey
@@ -1651,7 +1675,7 @@ func (bt *btree) collectInteriorCells(pg *page) []cellData {
 
 	// Return buffer to pager for reuse.
 	bt.pager.recycleCellBuf(buf)
-	return cells
+	return cells, nil
 }
 
 // rebuildLeafPage rewrites a leaf page from a list of cells.
@@ -1905,7 +1929,10 @@ func (bt *btree) splitLeafAndInsertWithPath(pg *page, idx int, key, value []byte
 // is converted to an interior node pointing at them. Mirrors the previous
 // splitLeafAndInsertWithPath 2-way body, retained only for the root-leaf case.
 func (bt *btree) splitRootLeafAndInsert(pg *page, idx int, key, value []byte) error {
-	cells, cellBuf := bt.collectLeafCells(pg)
+	cells, cellBuf, cerr := bt.collectLeafCells(pg)
+	if cerr != nil {
+		return cerr
+	}
 
 	combined := make([]byte, len(key)+len(value))
 	copy(combined, key)
@@ -2128,7 +2155,11 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 	}
 
 	// Root interior page overflow: 2-way split + balance_deeper (splitRoot).
-	cells := bt.collectInteriorCells(parentPg)
+	cells, cerr := bt.collectInteriorCells(parentPg)
+	if cerr != nil {
+		bt.pager.releasePage(parentPg)
+		return cerr
+	}
 	origRightChild := parentPg.header.rightChild
 	origCellCount := len(cells)
 
@@ -2186,7 +2217,10 @@ func (bt *btree) insertSepIntoInterior(parentPg *page, leftPgno uint32, key []by
 // splitLeafAndInsert splits a leaf page and inserts the new key-value pair.
 // DRIFT: legacy unreachable insert-path functions undocumented as superseded See docs/btree/NOTES.md#drift-35-legacy-superseded-insert-path-functions-undocumented
 func (bt *btree) splitLeafAndInsert(pg *page, idx int, key, value []byte) error {
-	cells, cellBuf := bt.collectLeafCells(pg)
+	cells, cellBuf, cerr := bt.collectLeafCells(pg)
+	if cerr != nil {
+		return cerr
+	}
 
 	// Insert the new cell at the correct position.
 	// Clone key+value into a single allocation.
@@ -2308,7 +2342,11 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 	// appropriate collect/rebuild path so we don't misinterpret cell formats.
 	if oldRoot.header.isLeaf() {
 		// Leaf root: collect leaf cells and rebuild as leaf in the new page.
-		cells, cellBuf := bt.collectLeafCells(oldRoot)
+		cells, cellBuf, cerr := bt.collectLeafCells(oldRoot)
+		if cerr != nil {
+			bt.pager.releasePage(newLeftPg)
+			return cerr
+		}
 		newLeftPg.header = oldRoot.header
 		err := bt.rebuildLeafPage(newLeftPg, cells)
 		bt.pager.recycleCellSlice(cells)
@@ -2319,7 +2357,11 @@ func (bt *btree) splitRoot(oldRoot *page, sepKey []byte, rightChildPgno uint32) 
 	} else {
 		// Interior root: collect interior cells and rebuild as interior in the
 		// new page, preserving the rightChild pointer.
-		cells := bt.collectInteriorCells(oldRoot)
+		cells, cerr := bt.collectInteriorCells(oldRoot)
+		if cerr != nil {
+			bt.pager.releasePage(newLeftPg)
+			return cerr
+		}
 		newLeftPg.header = oldRoot.header
 		if err := bt.rebuildInteriorPage(newLeftPg, cells, oldRoot.header.rightChild); err != nil {
 			return err
@@ -2454,7 +2496,11 @@ func (bt *btree) Delete(key []byte) error {
 	if needsRebuild {
 		// Fall back to full rebuild. collectLeafCells preserves overflow chains,
 		// so we must explicitly free the deleted cell's overflow chain.
-		cells, cellBuf := bt.collectLeafCells(wpg)
+		cells, cellBuf, cerr := bt.collectLeafCells(wpg)
+		if cerr != nil {
+			bt.pager.releasePage(wpg)
+			return cerr
+		}
 		if cells[idx].overflowPg != 0 {
 			if err := bt.pager.freeOverflowChain(cells[idx].overflowPg); err != nil {
 				bt.pager.recycleCellSlice(cells)
@@ -2801,8 +2847,20 @@ func (bt *btree) tryMergeLeaf(leafPgno uint32, path []pathEntry) error {
 	}
 
 	// Merge will proceed. Collect cells (overflow chains are preserved via raw passthrough).
-	leafCells, leafCellBuf := bt.collectLeafCells(leafPg)
-	sibCells, sibCellBuf := bt.collectLeafCells(sibPg)
+	leafCells, leafCellBuf, lerr := bt.collectLeafCells(leafPg)
+	if lerr != nil {
+		bt.pager.releasePage(leafPg)
+		bt.pager.releasePage(sibPg)
+		return lerr
+	}
+	sibCells, sibCellBuf, serr := bt.collectLeafCells(sibPg)
+	if serr != nil {
+		bt.pager.recycleCellSlice(leafCells)
+		bt.pager.recycleCellBuf(leafCellBuf)
+		bt.pager.releasePage(leafPg)
+		bt.pager.releasePage(sibPg)
+		return serr
+	}
 	bt.pager.releasePage(leafPg)
 	bt.pager.releasePage(sibPg)
 
@@ -2902,7 +2960,11 @@ func (bt *btree) removeMergedRightSeparator(parentPgno uint32, childIdx int, kee
 		return err
 	}
 
-	cells := bt.collectInteriorCells(parentPg)
+	cells, cerr := bt.collectInteriorCells(parentPg)
+	if cerr != nil {
+		bt.pager.releasePage(parentPg)
+		return cerr
+	}
 	rightChild := parentPg.header.rightChild
 
 	// childIdx is the kept page's slot; it must address a real divider cell
@@ -2955,7 +3017,11 @@ func (bt *btree) removeChildFromParent(childPgno uint32, path []pathEntry) error
 		return err
 	}
 
-	cells := bt.collectInteriorCells(parentPg)
+	cells, cerr := bt.collectInteriorCells(parentPg)
+	if cerr != nil {
+		bt.pager.releasePage(parentPg)
+		return cerr
+	}
 	rightChild := parentPg.header.rightChild
 
 	// Use path[len-1].cellIdx to locate the child slot directly.

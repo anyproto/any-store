@@ -350,7 +350,14 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 		injectHere := inject.active && nxDiv+g == inject.childSlot
 
 		if leaf {
-			cells, buf := bt.collectLeafCells(pOld)
+			cells, buf, cerr := bt.collectLeafCells(pOld)
+			if cerr != nil {
+				// collectLeafCells already recycled its own scratch buffers on
+				// failure; release the gathered pages and previously-pooled buffers
+				// and propagate up the balance() do-loop (btree.c:9131-9242).
+				poolFail(g)
+				return cerr
+			}
 			cellBufs = append(cellBufs, buf)
 			// Inject the new over-full LEAF cell at its sorted position in the
 			// target sibling (btree.c:8466-8482 pools MemPage.apOvfl[] at
@@ -372,7 +379,13 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 			// payload is owned by the caller (driver), not this slice.
 			bt.pager.recycleCellSlice(cells)
 		} else {
-			cells := bt.collectInteriorCells(pOld)
+			cells, cerr := bt.collectInteriorCells(pOld)
+			if cerr != nil {
+				// Release the gathered pages and previously-pooled buffers and
+				// propagate up the balance() do-loop (btree.c:9131-9242).
+				poolFail(g)
+				return cerr
+			}
 			// collectInteriorCells self-recycles the pager's shared cellBuf
 			// (btree.go:1642), so non-overflow cell keys alias a buffer that the
 			// NEXT collectInteriorCells call (for the next gathered sibling) will
@@ -793,7 +806,13 @@ func (bt *btree) rewriteParentAfterBalance(
 	// rebuildInteriorPage re-creates as needed — same contract as the existing
 	// interior split, btree.go:2023). After this the parent's old divider chains
 	// are gone; we rebuild from childPgnos + divKeys below.
-	parentCells := bt.collectInteriorCells(parentPg)
+	parentCells, cerr := bt.collectInteriorCells(parentPg)
+	if cerr != nil {
+		// Caller (balanceNonroot) retains parentPg's pin; do not release it here,
+		// matching the ErrCorrupt path below. Propagate up the balance() do-loop
+		// (btree.c:9131-9242).
+		return cerr
+	}
 	nc := len(parentCells)
 	parentRightChild := parentPg.header.rightChild
 

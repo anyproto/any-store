@@ -2169,22 +2169,6 @@ caller inherits this gap -- value reads (`Cursor.Value`, `Cursor.AppendValue`,
 returned to the application as a valid, partly-zeroed payload or key rather than
 surfacing as `ErrCorrupt`.
 
-<a id="drift-2-collectleafcells-and-collectinteriorcells-swallow-overflow-e"></a>
-### Drift: collectLeafCells And collectInteriorCells Swallow Overflow Errors During Rebuild
-- **Category:** changed-logic  -  **Severity:** high
-- **Affected functions:** `btree.go` (`internal/btree/btree.go:1520, 1623-1631 (silent swallow); btree.go:18-28 (SetDebugOverflowReadErrors / debugOverflowReadErrors toggle)`).
-
-During rebuild/balance, `collectInteriorCells` (`btree.go:1623-1631`) and
-`collectLeafCells` (`btree.go:1520`) read the overflowing key tail via
-`readOverflowChainAt` but discard the returned read/parse error in production code,
-panicking only when the global `debugOverflowReadErrors` flag is set by the test-only
-`SetDebugOverflowReadErrors` toggle (`btree.go:18-28`). `collectInteriorCells` then
-unconditionally frees the overflow chain (`freeOverflowChain` at `btree.go:1629`) and
-writes the possibly-truncated key back into the rebuilt page. The consequence is that
-a corrupt or short overflow read is silently folded back into the tree during balance
-and its source chain freed, converting a detectable read error into permanent,
-undetectable on-disk corruption.
-
 <a id="drift-3-missing-pgno-greater-than-pagecount-descent-corruption-guard"></a>
 ### Drift: Missing pgno Greater Than Pagecount Descent Corruption Guard
 - **Category:** changed-logic  -  **Severity:** high

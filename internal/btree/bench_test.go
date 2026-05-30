@@ -407,7 +407,10 @@ func BenchmarkCollectRebuildOverflow(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		cells, cellBuf := bt.collectLeafCells(wpg)
+		cells, cellBuf, cerr := bt.collectLeafCells(wpg)
+		if cerr != nil {
+			b.Fatal(cerr)
+		}
 		_ = bt.rebuildLeafPage(wpg, cells)
 		bt.pager.recycleCellBuf(cellBuf)
 		bt.pager.releasePage(wpg)

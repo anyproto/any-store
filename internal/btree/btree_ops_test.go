@@ -1373,7 +1373,8 @@ func TestRebuildInteriorPageWithOverflowKeys(t *testing.T) {
 	bigKey := bytes.Repeat([]byte("K"), maxLocalPayload(p.usableSize())+100)
 	require.NoError(t, bt.rebuildInteriorPage(pg, []cellData{{leftChild: 10, key: bigKey}}, 20))
 
-	got := bt.collectInteriorCells(pg)
+	got, err := bt.collectInteriorCells(pg)
+	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, bigKey, got[0].key)
 	p.releasePage(pg)
@@ -1390,7 +1391,8 @@ func TestRebuildLeafPageWithOverflow(t *testing.T) {
 
 	// Verify raw passthrough round-trip: collect preserves overflow chains,
 	// rebuild copies raw cells, and the data is still readable via parsing.
-	got, _ := bt.collectLeafCells(pg)
+	got, _, err := bt.collectLeafCells(pg)
+	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, []byte("key"), got[0].key)
 	assert.NotNil(t, got[0].rawCell, "overflow cell should have rawCell set")
@@ -1582,7 +1584,8 @@ func TestCollectLeafCellsCorruptContentOff(t *testing.T) {
 		hdr = dbHeaderSize
 	}
 	pg.header.serialize(pg.data[hdr:])
-	got, _ := bt.collectLeafCells(pg)
+	got, _, err := bt.collectLeafCells(pg)
+	require.NoError(t, err)
 	assert.Len(t, got, 2)
 	p.releasePage(pg)
 }
@@ -3381,7 +3384,8 @@ func TestCollectInteriorCellsWithSmallOverflowKeys(t *testing.T) {
 	bigKey := bytes.Repeat([]byte("K"), maxLocalPayload(p.usableSize())+50)
 	require.NoError(t, bt.rebuildInteriorPage(pg, []cellData{{leftChild: 10, key: bigKey}}, 20))
 
-	cells := bt.collectInteriorCells(pg)
+	cells, err := bt.collectInteriorCells(pg)
+	require.NoError(t, err)
 	require.Len(t, cells, 1)
 	assert.Equal(t, bigKey, cells[0].key)
 	p.releasePage(pg)
@@ -3771,8 +3775,8 @@ func TestCov_InteriorCellKeyKeyEndBeyondData(t *testing.T) {
 	data := make([]byte, 20)
 	binary.BigEndian.PutUint32(data[0:4], 10)
 	// Multi-byte varint: keyLen that exceeds available data
-	data[4] = 0x84   // multi-byte varint start
-	data[5] = 0x00   // keyLen = 512
+	data[4] = 0x84 // multi-byte varint start
+	data[5] = 0x00 // keyLen = 512
 	_, _, err := interiorCellKey(data, 0)
 	assert.ErrorIs(t, err, ErrCorrupt)
 }
@@ -3943,8 +3947,8 @@ func TestCov_LeafFullKeyNoOverflowKeyBeyondData(t *testing.T) {
 func TestCov_LeafFullKeyOverflowKeyLocalBeyondData(t *testing.T) {
 	// L824-826: pos+localKeyBytes > dataLen for overflow with key local
 	data := make([]byte, 20)
-	n := putVarint(data[0:], 100)  // keyLen=100
-	n += putVarint(data[n:], 400)  // valLen=400
+	n := putVarint(data[0:], 100) // keyLen=100
+	n += putVarint(data[n:], 400) // valLen=400
 	// totalPayload=500 > maxLocal(512) ~ 102
 	// nLocal = localPayloadSize(500, 512)
 	// localKeyBytes = min(nLocal, 100) = nLocal (since nLocal < 100 with 512 page)
@@ -3956,8 +3960,8 @@ func TestCov_LeafFullKeyOverflowKeyLocalBeyondData(t *testing.T) {
 func TestCov_LeafFullKeyOverflowNLocalBeyondData(t *testing.T) {
 	// L831-833: pos+nLocal+4 > dataLen for overflow with key overflow
 	data := make([]byte, 20)
-	n := putVarint(data[0:], 300)  // keyLen=300
-	n += putVarint(data[n:], 300)  // valLen=300
+	n := putVarint(data[0:], 300) // keyLen=300
+	n += putVarint(data[n:], 300) // valLen=300
 	// totalPayload=600, maxLocal(512)~102
 	// localKeyBytes = min(nLocal, 300) = nLocal (since nLocal < 300)
 	// Key overflows, need pos+nLocal+4 > 20
@@ -4566,7 +4570,7 @@ func TestCov_LeafKeyAtMultiByteValLenError(t *testing.T) {
 	target := uint16(len(pg.data) - 3) // only 3 bytes available
 	binary.BigEndian.PutUint16(pg.data[cpOff:], target)
 	// Write: keyLen=3 (single byte <0x80), then truncated multi-byte valLen
-	pg.data[target] = 3    // keyLen=3, single byte
+	pg.data[target] = 3      // keyLen=3, single byte
 	pg.data[target+1] = 0x80 // multi-byte valLen start (continuation bit set)
 	pg.data[target+2] = 0x80 // still continuation, no terminator - truncated
 
@@ -4589,7 +4593,7 @@ func TestCov_LeafKeyAtMultiByteKeyEndBeyondData(t *testing.T) {
 	binary.BigEndian.PutUint16(pg.data[cpOff:], target)
 	// Write: keyLen=120 (single byte <0x80), valLen=0x80 0x01 (multi-byte, 128)
 	// keyStart would be at target+3, end = target+3+120 which exceeds dataLen
-	pg.data[target] = 120  // keyLen=120 (single byte, <0x80)
+	pg.data[target] = 120    // keyLen=120 (single byte, <0x80)
 	pg.data[target+1] = 0x80 // multi-byte valLen start
 	pg.data[target+2] = 0x01 // valLen continuation+terminator (value=128)
 	// keyStart = target+3, end = target+3+120 > dataLen
@@ -4756,7 +4760,8 @@ func TestCov_CollectLeafCellsContentSizeNeg(t *testing.T) {
 	}
 	pg.header.serialize(pg.data[hdr:])
 
-	cells, _ := bt.collectLeafCells(pg)
+	cells, _, err := bt.collectLeafCells(pg)
+	require.NoError(t, err)
 	assert.Len(t, cells, 1)
 	p.releasePage(pg)
 }
@@ -4785,9 +4790,13 @@ func TestCov_CollectInteriorCellsOverflowReadError(t *testing.T) {
 	// Write invalid overflow page number
 	binary.BigEndian.PutUint32(pg.data[pos:], 99999)
 
-	// collectInteriorCells should silently handle the error
-	cells := bt.collectInteriorCells(pg)
-	assert.Len(t, cells, 1)
+	// collectInteriorCells must now PROPAGATE the overflow read error instead of
+	// silently swallowing it (and must NOT free the overflow chain / truncate the
+	// key). Mirrors C balance() propagating SQLITE_CORRUPT/IO up the do-loop
+	// (btree.c:9131-9242).
+	cells, err := bt.collectInteriorCells(pg)
+	require.Error(t, err)
+	assert.Nil(t, cells)
 	p.releasePage(pg)
 }
 
@@ -4841,8 +4850,13 @@ func TestCov_CollectLeafCellsOverflowReadError(t *testing.T) {
 		binary.BigEndian.PutUint32(pg.data[pos:], 99999)
 	}
 
-	// Now collectLeafCells should handle the error
-	cells, _ := bt.collectLeafCells(pg)
+	// collectLeafCells preserves overflow chains via raw passthrough and does not
+	// read the value overflow chain (only a key that overflows is read, via
+	// cellFullKey), so corrupting the value overflow pointer does not surface an
+	// error here — the raw cell is copied verbatim, matching C balance_nonroot
+	// (btree.c:8473-8489).
+	cells, _, err := bt.collectLeafCells(pg)
+	require.NoError(t, err)
 	assert.Len(t, cells, 1)
 	bt.pager.releasePage(pg)
 	require.NoError(t, tx3.Rollback())
@@ -5896,6 +5910,7 @@ func TestCov_CountPageInteriorRightChildGetPageError(t *testing.T) {
 	_, err = bt.countPage(intPg.pgno)
 	assert.Error(t, err)
 }
+
 // populate pathEntry.cellIdx correctly — specifically that a monotonic-append
 // workload produces a path where every interior level was reached via the
 // rightChild pointer (cellIdx == nCell).

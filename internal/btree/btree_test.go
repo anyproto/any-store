@@ -1366,7 +1366,8 @@ func TestCollectInteriorCells(t *testing.T) {
 
 	pg2, err := p.getPage(pg.pgno)
 	require.NoError(t, err)
-	got := bt.collectInteriorCells(pg2)
+	got, err := bt.collectInteriorCells(pg2)
+	require.NoError(t, err)
 	p.releasePage(pg2)
 
 	require.Len(t, got, 3)
