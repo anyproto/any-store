@@ -342,8 +342,23 @@ func (b *Backup) finalize(nSrcPage uint32) error {
 	b.dst.pager.header.SchemaCookie = newCookie
 	b.dst.pager.releasePage(dstPg1)
 
-	// 2. Truncate dst to nSrcPage. ~ sqlite3PagerTruncateImage
-	// (backup.c:530). Shrinks dst.dbSize; file shrinks at next checkpoint.
+	// 2. Set dst's logical page count to nSrcPage. ~ sqlite3PagerTruncateImage
+	// (backup.c:530). In SQLite the destination pager's dbSize is grown as each
+	// page is written through sqlite3PagerWrite; here onePage copies pages via
+	// getWritablePage, which does NOT grow p.dbSize (only allocatePage does).
+	// So after copying a source larger than the dst's prior size, p.dbSize is
+	// still stale (e.g. 1 for a fresh dst) even though nSrcPage physical pages
+	// were written. Commit serializes p.header.DatabaseSize = p.dbSize.Load()
+	// (pager.go:1937), so a stale p.dbSize would write a wrong page-1
+	// DatabaseSize — a reopened dst would then report DatabaseSize=1 while
+	// holding nSrcPage pages, and the descent bound check would flag a valid
+	// interior child (pgno>1) as corrupt. Grow p.dbSize to nSrcPage here; the
+	// shrink case (dst was larger) is handled by truncateTo, which also evicts
+	// writerCache pages beyond nSrcPage.
+	if cur := b.dst.pager.dbSize.Load(); nSrcPage > cur {
+		b.dst.pager.dbSize.Store(nSrcPage)
+		b.dst.pager.header.DatabaseSize = nSrcPage
+	}
 	return b.dst.pager.truncateTo(nSrcPage)
 }
 

@@ -785,7 +785,6 @@ func (p *pager) beginWrite(readSnap WalIndexHdr) error {
 // getPage returns the page with the given page number, reading from WAL or disk as needed.
 // Uses the current WAL nFrame (not walMaxFrame) so that spilled pages written
 // to WAL beyond walMaxFrame during this write transaction are visible.
-// DRIFT: page getters lack getAndInitPage's upfront pgno>pagecount ErrCorrupt guard See docs/btree/NOTES.md#drift-3-missing-pgno-greater-than-pagecount-descent-corruption-guard
 // DRIFT: no mxPgno / SQLITE_FULL max-page-count guard in page getters See docs/btree/NOTES.md#drift-8-max-page-count-sqlite-full-enforcement-absent
 func (p *pager) getPage(pgno uint32) (*page, error) {
 	return p.getPageWriter(pgno, p.wal.nFrame.Load())
@@ -793,7 +792,6 @@ func (p *pager) getPage(pgno uint32) (*page, error) {
 
 // getPageWriter returns a page using the writer's cache, reading from
 // WAL or disk on cache miss. Used by the writer goroutine only.
-// DRIFT: page getters lack getAndInitPage's upfront pgno>pagecount ErrCorrupt guard See docs/btree/NOTES.md#drift-3-missing-pgno-greater-than-pagecount-descent-corruption-guard
 // DRIFT: getPageWriter reads disk/WAL before dbSize check; can surface stale page bytes See docs/btree/NOTES.md#drift-5-getpagewriter-reads-disk-before-checking-dbsize
 // DRIFT: WAL frame read failure silently falls through to stale disk read See docs/btree/NOTES.md#drift-6-wal-frame-read-failure-falls-through-to-disk-read
 // DRIFT: no mxPgno / SQLITE_FULL max-page-count guard in page getters See docs/btree/NOTES.md#drift-8-max-page-count-sqlite-full-enforcement-absent
@@ -973,7 +971,6 @@ func (p *pager) readTempPage(pgno, walMaxFrame, dbSizeBound uint32, codecBuf []b
 // cache were populated during this transaction, so they're valid for this
 // snapshot). On cache miss the page is read from WAL/disk/masterStore and
 // stored in the reader cache for subsequent lookups within the same transaction.
-// DRIFT: page getters lack getAndInitPage's upfront pgno>pagecount ErrCorrupt guard See docs/btree/NOTES.md#drift-3-missing-pgno-greater-than-pagecount-descent-corruption-guard
 // DRIFT: no mxPgno / SQLITE_FULL max-page-count guard in page getters See docs/btree/NOTES.md#drift-8-max-page-count-sqlite-full-enforcement-absent
 func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, error) {
 	if pgno == 0 {

@@ -2172,23 +2172,6 @@ The following drifts were found by an automated per-function C-vs-Go audit of th
 b-tree port against sqlitec and deduplicated by root cause (the encryption/sqlcipher
 codec is excluded here and tracked separately).
 
-<a id="drift-3-missing-pgno-greater-than-pagecount-descent-corruption-guard"></a>
-### Drift: Missing pgno Greater Than Pagecount Descent Corruption Guard
-- **Category:** changed-logic  -  **Severity:** high
-- **Affected functions:** `db.go:*ReadTx.txGetPage` (`internal/btree/db.go:1219`), `pager.go:*pager.getPage` (`pager.go:728-811 (getPage/getPageWriter); pager.go:962-970 (getPageReader read path)`), `pager.go:*pager.getPageReader` (`internal/btree/pager.go:962-993`), `pager.go:*pager.getPageWriter` (`internal/btree/pager.go:734-810`).
-
-C's `getAndInitPage` -- the getter used for every interior->child step during cursor
-descent (`moveToChild` at `btree.c:5475`, inlined seek at `btree.c:6252`) -- begins
-with an upfront corruption guard `if( pgno>btreePagecount(pBt) ){ *ppPage=0; return
-SQLITE_CORRUPT_BKPT; }` (`btree.c:2396-2399`) that rejects any requested page number
-greater than the snapshot logical page count BEFORE the pager touches disk. The Go
-page getters (`txGetPage`, `getPage`/`getPageWriter`, `getPageReader`) have no such
-upfront bound check on the requested pgno. As a result a wild or out-of-range child
-pointer is not rejected as corruption; instead it flows down the read path where (per
-drift-4) an above-file, above-`dbSize` page is silently zero-filled and accepted,
-allowing descent to continue on a fabricated zero page rather than failing fast with
-`ErrCorrupt`.
-
 <a id="drift-4-beyond-file-pages-silently-zero-filled-skipping-header-valid"></a>
 ### Drift: Beyond File Pages Silently Zero Filled Skipping Header Validation
 - **Category:** changed-logic  -  **Severity:** low

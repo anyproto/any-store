@@ -318,6 +318,73 @@ func TestBackup_PostDoneWriteDoesNotReachDst(t *testing.T) {
 	}
 }
 
+// TestBackup_FinalizedDstReportsTruePageCount verifies the coupled fix:
+// (A) a finalized backup destination's page-1 DatabaseSize equals its true
+// physical page count (not a stale 1), and (B) with that in place the descent
+// corruption guard accepts the dst's interior-master child pointers (pgno>1)
+// rather than flagging them as corrupt.
+//
+// The bug: onePage patches dst page-1 bytes[28:32] to nSrcPage, but commit
+// re-serializes p.header.DatabaseSize = p.dbSize.Load() (pager.go:1937), and
+// finalize's truncateTo(nSrcPage) is a no-op when nSrcPage >= dst.dbSize
+// (dst.dbSize stays 1 for a fresh dst — getWritablePage never grows it). So
+// the committed page-1 DatabaseSize was 1 while the dst held ~19 pages; a
+// reopened dst reported DatabaseSize()==1, and the new descent guard then
+// rejected the master interior's child pgno (e.g. 4) as out-of-range corrupt.
+func TestBackup_FinalizedDstReportsTruePageCount(t *testing.T) {
+	src, dst := backupPair(t)
+	ns, _ := src.GetNamespace("data")
+
+	// Seed a multi-page source whose master table is an interior page (its
+	// child root pointers exceed 1), so descent over the dst exercises the
+	// pgno>1 child guard.
+	stx, err := src.BeginWrite()
+	require.NoError(t, err)
+	fat := make([]byte, 300)
+	for i := 0; i < 200; i++ {
+		require.NoError(t, stx.Put(ns, fmt.Appendf(nil, "k-%04d", i), fat))
+	}
+	require.NoError(t, stx.Commit())
+	require.NoError(t, src.Checkpoint(CheckpointFull))
+
+	nSrc := src.DatabaseSize()
+	require.Greater(t, nSrc, uint32(4), "need a multi-page source")
+
+	// Full backup in one Step, then Finish (commits the dst write tx).
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+	require.ErrorIs(t, b.Step(-1), ErrBackupDone)
+	require.NoError(t, b.Finish())
+
+	// Reopen dst from disk: DatabaseSize is now read back from the committed
+	// page-1 bytes (pager.go:485 p.dbSize.Store(p.header.DatabaseSize)).
+	dstPath := dst.Path()
+	require.NoError(t, dst.Close())
+	d2, err := Open(dstPath, DefaultOptions())
+	require.NoError(t, err)
+	defer d2.Close()
+
+	require.Equal(t, nSrc, d2.DatabaseSize(),
+		"reopened dst page-1 DatabaseSize must equal its true physical page count, not stale 1")
+
+	rtx, err := d2.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	require.Equal(t, nSrc, rtx.DatabaseSize(),
+		"snapshot DatabaseSize must equal the true page count")
+
+	// Descent over the dst must succeed for every key. With a stale
+	// DatabaseSize=1 bound, the guard would reject the master interior's
+	// child pgno and return ErrCorrupt here.
+	ns2, err := d2.GetNamespace("data")
+	require.NoError(t, err)
+	for i := 0; i < 200; i++ {
+		v, err := rtx.Get(ns2, fmt.Appendf(nil, "k-%04d", i))
+		require.NoError(t, err, "descent must not flag a valid interior child as corrupt")
+		require.Equal(t, string(fat), string(v))
+	}
+}
+
 func TestBackup_RestartOnCheckpointRestart(t *testing.T) {
 	src, dst := backupPair(t)
 	ns, _ := src.GetNamespace("data")

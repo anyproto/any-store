@@ -77,6 +77,23 @@ func (bt *btree) getPage(pgno uint32) (*page, error) {
 	return bt.pager.getPageReader(pgno, bt.walMaxFrame, bt.cache)
 }
 
+// descendChild fetches a child page reached from an interior cell during
+// cursor descent, after rejecting an out-of-range pgno as corruption.
+// ~ C's getAndInitPage upfront guard `if( pgno>btreePagecount(pBt) ) return
+// SQLITE_CORRUPT_BKPT` (btree.c:2396-2399), the getter used for every
+// interior->child step in moveToChild / the inlined seek (btree.c:5475,6252).
+// The pager getters keep zero-filling above-bound pages (drift-4); this guard
+// lives at the descent call site so a wild or freed child pointer fails fast
+// with ErrCorrupt instead of descending into a fabricated zero page. The bound
+// is the snapshot page count: the writer's live p.dbSize (cache==nil) or the
+// reader cache's frozen snapshot bound, exactly as readerDbSizeBound resolves.
+func (bt *btree) descendChild(childPgno uint32) (*page, error) {
+	if childPgno == 0 || childPgno > bt.pager.readerDbSizeBound(bt.cache) {
+		return nil, ErrCorrupt
+	}
+	return bt.getPage(childPgno)
+}
+
 // usablePageSize returns the usable page size, accounting for reserved space.
 func (bt *btree) usablePageSize() int {
 	return bt.pager.usableSize()
@@ -1081,6 +1098,13 @@ func (bt *btree) AppendValue(key []byte, buf []byte) ([]byte, error) {
 			return buf, serr
 		}
 		bt.pager.releasePage(pg)
+		// Reject an out-of-range child pointer as corruption before fetching
+		// (~ getAndInitPage's pgno>btreePagecount guard, btree.c:2396-2399);
+		// see descendChild. Inlined here because this path reads with the
+		// spill-inclusive maxFrame, not bt.walMaxFrame.
+		if childPgno == 0 || childPgno > bt.pager.readerDbSizeBound(bt.cache) {
+			return buf, ErrCorrupt
+		}
 		if bt.writable {
 			pg, err = bt.getPage(childPgno)
 		} else {
@@ -1147,7 +1171,7 @@ func (bt *btree) Put(key, value []byte) error {
 		}
 		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: uint16(cellIdx), nCell: nCell})
 		bt.pager.releasePage(pg)
-		pg, err = bt.getPage(childPgno)
+		pg, err = bt.descendChild(childPgno)
 		if err != nil {
 			return err
 		}
@@ -2335,7 +2359,7 @@ func (bt *btree) insertIntoParent(leftPg *page, key []byte, rightPgno uint32) er
 		}
 		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: uint16(cellIdx), nCell: nCell})
 		bt.pager.releasePage(pg)
-		pg, err = bt.getPage(childPgno)
+		pg, err = bt.descendChild(childPgno)
 		if err != nil {
 			return err
 		}
@@ -2406,6 +2430,12 @@ func (bt *btree) insertIntoInterior(pg *page, key, value []byte) error {
 		return serr
 	}
 
+	// Reject an out-of-range child pointer as corruption before fetching
+	// (~ getAndInitPage's pgno>btreePagecount guard, btree.c:2396-2399);
+	// see descendChild. Writer path: bound is the live p.dbSize.
+	if childPgno == 0 || childPgno > bt.pager.readerDbSizeBound(bt.cache) {
+		return ErrCorrupt
+	}
 	childPg, err := bt.pager.getWritablePage(childPgno)
 	if err != nil {
 		return err
@@ -2457,7 +2487,7 @@ func (bt *btree) Delete(key []byte) error {
 		}
 		path = append(path, pathEntry{pgno: pg.pgno, cellIdx: uint16(cellIdx), nCell: nCell})
 		bt.pager.releasePage(pg)
-		pg, err = bt.getPage(childPgno)
+		pg, err = bt.descendChild(childPgno)
 		if err != nil {
 			return err
 		}
@@ -3329,7 +3359,7 @@ func (c *Cursor) First() error {
 		childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
 		c.bt.pager.releasePage(pg)
 
-		pg, err = c.bt.getPage(childPgno)
+		pg, err = c.bt.descendChild(childPgno)
 		if err != nil {
 			return err
 		}
@@ -3368,7 +3398,7 @@ func (c *Cursor) Last() error {
 		childPgno := pg.header.rightChild
 		c.bt.pager.releasePage(pg)
 
-		pg, err = c.bt.getPage(childPgno)
+		pg, err = c.bt.descendChild(childPgno)
 		if err != nil {
 			return err
 		}
@@ -3410,7 +3440,7 @@ func (c *Cursor) Seek(key []byte) error {
 		c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: cellIdx})
 		c.bt.pager.releasePage(pg)
 
-		pg, err = c.bt.getPage(childPgno)
+		pg, err = c.bt.descendChild(childPgno)
 		if err != nil {
 			return err
 		}

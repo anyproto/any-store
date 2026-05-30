@@ -1262,7 +1262,7 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 			return nil, serr
 		}
 		bt.pager.releasePage(pg)
-		pg, err = bt.getPage(childPgno)
+		pg, err = bt.descendChild(childPgno)
 		if err != nil {
 			return nil, err
 		}
@@ -1351,7 +1351,6 @@ func (tx *ReadTx) WalMaxFrame() uint32 { return tx.walHdr.mxFrame }
 // txGetPage fetches a page respecting MVCC snapshot isolation.
 // For write transactions, pages are fetched from the writer cache or WAL.
 // For read transactions, getPageReader uses a private cache for snapshot isolation.
-// DRIFT: page getters lack getAndInitPage's upfront pgno>pagecount ErrCorrupt guard See docs/btree/NOTES.md#drift-3-missing-pgno-greater-than-pagecount-descent-corruption-guard
 func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 	if tx.writable {
 		// Use pager.getPage which uses wal.nFrame (not the frozen
@@ -1359,6 +1358,22 @@ func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 		return tx.pager.getPage(pgno)
 	}
 	return tx.pager.getPageReader(pgno, tx.walHdr.mxFrame, tx.cache)
+}
+
+// txDescendChild fetches a child page reached from an interior cell during a
+// cursor-free descent, after rejecting an out-of-range pgno as corruption.
+// ~ C's getAndInitPage upfront guard `if( pgno>btreePagecount(pBt) ) return
+// SQLITE_CORRUPT_BKPT` (btree.c:2396-2399). The pager getters keep zero-filling
+// above-bound pages (drift-4); this guard lives at the descent call site so a
+// wild or freed child pointer fails fast with ErrCorrupt instead of descending
+// into a fabricated zero page. The bound is the snapshot page count: the
+// writer's live p.dbSize (cache==nil) or the reader cache's frozen snapshot
+// bound, exactly as readerDbSizeBound resolves.
+func (tx *ReadTx) txDescendChild(childPgno uint32) (*page, error) {
+	if childPgno == 0 || childPgno > tx.pager.readerDbSizeBound(tx.cache) {
+		return nil, ErrCorrupt
+	}
+	return tx.txGetPage(childPgno)
 }
 
 // readOverflow reads overflow chain data using the correct isolation level.
@@ -1459,7 +1474,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 			return buf, serr
 		}
 		tx.pager.releasePage(pg)
-		pg, err = tx.txGetPage(childPgno)
+		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
 			return buf, err
 		}
@@ -1507,7 +1522,7 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 			return false, serr
 		}
 		tx.pager.releasePage(pg)
-		pg, err = tx.txGetPage(childPgno)
+		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
 			return false, err
 		}
@@ -1594,7 +1609,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 			fallbackIdx = cellIdx
 		}
 		tx.pager.releasePage(pg)
-		pg, err = tx.txGetPage(childPgno)
+		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
 			return buf, err
 		}
@@ -1633,7 +1648,7 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 	// Descend to the leftmost key of this subtree.
 	usableSize := tx.pager.usableSize()
 	cache := tx.cache // nil for writers, per-connection pcache for readers
-	pg, err = tx.txGetPage(nextPgno)
+	pg, err = tx.txDescendChild(nextPgno)
 	if err != nil {
 		return buf, err
 	}
@@ -1673,7 +1688,7 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 		}
 		childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
 		tx.pager.releasePage(pg)
-		pg, err = tx.txGetPage(childPgno)
+		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
 			return buf, err
 		}
