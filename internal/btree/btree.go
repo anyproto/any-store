@@ -1894,8 +1894,16 @@ func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint
 // rightChild now points to rightPg. Parent overflow cascades through
 // the standard path (insertIntoParentWithPath → insertSepIntoInterior),
 // matching SQLite's balance() do-loop (btree.c:9123).
-// DRIFT: no balance_quick `nCell==0 -> CORRUPT` over-full-empty-page guard See docs/btree/NOTES.md#drift-32-missing-balance-quick-zero-cell-over-full-page-corruption-gu
+// Ports balance_quick's `nCell==0 -> CORRUPT` over-full-empty-page guard
+// (btree.c:8020).
 func (bt *btree) splitLeafRightmostAppend(pg *page, key, value []byte, path []pathEntry) error {
+	// Corruption guard. Mirror balance_quick's first statement (btree.c:8020,
+	// added for dbfuzz001.test): an over-full page reporting zero cells is
+	// corrupt and is rejected before any allocation or parent mutation.
+	if pg.header.cellCount == 0 {
+		return ErrCorrupt
+	}
+
 	// Allocate new right sibling. Equiv. btree.c:8010 (allocateBtreePage).
 	rightPg, err := bt.pager.allocatePage()
 	if err != nil {

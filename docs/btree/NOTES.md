@@ -2483,20 +2483,6 @@ degenerate single-child interior pages are a normal, accepted state rather than 
 impossibility, which is the structural foundation that lets the underfullness-cascade drifts
 (see Drift 20/21) leave such pages in the tree.
 
-<a id="drift-32-missing-balance-quick-zero-cell-over-full-page-corruption-gu"></a>
-### Drift: Missing balance_quick Zero Cell Over Full Page Corruption Guard
-- **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `btree.go:*btree.splitLeafRightmostAppend` (`btree.go:1794-1826`).
-
-SQLite's `balance_quick` opens with `if( pPage->nCell==0 ) return SQLITE_CORRUPT_BKPT;`
-(`btree.c:8020`, added for `dbfuzz001.test`): an over-full page that nonetheless reports
-zero cells is corruption and is rejected before any allocation or parent mutation. Go's
-`splitLeafRightmostAppend` (the rightmost-append fast split, `btree.go:1794-1826`) has no
-analogous `cellCount==0` guard; its dispatch precondition is only
-`idx == int(pg.header.cellCount) && len(path) > 0`. The consequence is that a corrupt
-over-full-but-zero-cell page that SQLite would reject up front is instead processed by Go,
-allocating a page and mutating the parent on malformed input.
-
 <a id="drift-33-missing-balance-self-ancestor-refcount-corruption-guard"></a>
 ### Drift: Missing balance Self Ancestor Refcount Corruption Guard
 - **Category:** changed-logic  -  **Severity:** low
