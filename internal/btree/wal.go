@@ -504,10 +504,10 @@ type walIndex struct {
 	// SQLite's lock-free walTryBeginRead design. Do NOT add mu.RLock/Lock
 	// around atomic field accesses.
 	//
-	// DRIFT from SQLite (docs/btree/NOTES.md §20, drifts 2-3): SQLite has no process-local
-	// copies of mxCommitFrame, nBackfill, or aReadMark. These values live ONLY
-	// in the mmap'd SHM region (via volatile WalCkptInfo* pointer). We maintain
-	// process-local atomic.Uint32 copies alongside SHM because:
+	// SQLite has no process-local copies of mxCommitFrame, nBackfill, or
+	// aReadMark — those values live ONLY in the mmap'd SHM region (via volatile
+	// WalCkptInfo* pointer). We maintain process-local atomic.Uint32 copies
+	// alongside SHM because:
 	//   - In-process mode (heapShm) has no mmap'd region — process-local atomics
 	//     ARE the single source of truth.
 	//   - walIndex.get() reads nBackfill.Load()+1 as minFrame — this code path is
@@ -834,9 +834,7 @@ func (wi *walIndex) writeHeader(maxFrame, maxPage, nBackfill uint32, frameCksum,
 	}
 
 	// Populate the header struct.
-	// DRIFT from SQLite: SQLite's walIndexWriteHdr (wal.c:942-954) copies
-	// pWal->hdr directly to SHM — no parameters. We pass explicit values
-	// because walIndex.hdr and wal fields are separate structs.
+	// DRIFT: pass explicit values vs SQLite copying pWal->hdr (separate structs). See docs/btree/NOTES.md#old-drift-multiprocess-wal-structural-drift
 	wi.hdr.isInit = 1
 	wi.hdr.iVersion = walVersion
 	wi.hdr.mxFrame = maxFrame
@@ -1335,9 +1333,9 @@ type wal struct {
 	// each successful commit (writeFrames) and after re-sync in beginWrite().
 	// Used to detect external state changes: if the live SHM header differs from
 	// writerHdr, another process committed or checkpointed since our last write.
-	// DRIFT from SQLite: SQLite stores this in pWal->hdr (shared with readers).
-	// We keep it separate because our readers use per-connection pcache isolation
-	// and never share pWal->hdr with the writer.
+	// SQLite stores this in pWal->hdr (shared with readers). We keep it separate
+	// because our readers use per-connection pcache isolation and never share
+	// pWal->hdr with the writer.
 	writerHdr WalIndexHdr
 
 	// iReCksum is the earliest WAL frame overwritten by the current
@@ -1515,10 +1513,8 @@ func (w *wal) open() error {
 //     WAL_CKPT_LOCK + WAL_RECOVER_LOCK exclusive to serialize against siblings
 //     that may be trying to initialize concurrently (wal.c:1400-1404).
 //
-// DRIFT from SQLite (docs/btree/NOTES.md): SQLite's walIndexReadHdr uses WAL_WRITE_LOCK
-// alone. We additionally take WAL_CKPT_LOCK + WAL_RECOVER_LOCK so a reader
-// triggering recovery fences peers via the same barrier that our Item-1
-// reader handshake uses.
+// DRIFT: recovery takes WAL_CKPT_LOCK + WAL_RECOVER_LOCK beyond WAL_WRITE_LOCK. See docs/btree/NOTES.md#old-drift-ensureheader-triple-lock-recovery-gate
+//
 // ensureHeaderInitialized guarantees the SHM header is published and returns
 // a snapshot of it so callers can stamp it onto their per-tx walHdr. During
 // the per-connection-hdr migration (spec:
@@ -2545,10 +2541,10 @@ func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err er
 	//   retries 6..9:              1 µs sleep
 	//   retries 10..100:           (cnt-9)² × 39 µs (≈ 323 ms at cnt=100)
 	//
-	// DRIFT from SQLite (docs/btree/NOTES.md §20, drift 5): SQLite does not use a
-	// *pChanged output signal — pWal->hdr already reflects the current SHM
-	// state after walIndexReadHdr(). Our per-connection caches are invalidated
-	// via dataVersion in DB.beginRead(), not via a signal from tryBeginRead.
+	// SQLite uses no *pChanged output signal — pWal->hdr already reflects the
+	// current SHM state after walIndexReadHdr(). Our per-connection caches are
+	// invalidated via dataVersion in DB.beginRead(), not via a signal from
+	// tryBeginRead.
 	const protocolLimit = 100
 	for cnt := 0; cnt <= protocolLimit; cnt++ {
 		hdr, maxFrame, slot, err = w.tryBeginReadHdr()
@@ -2900,11 +2896,7 @@ func (w *wal) beginWriteWithSnapshot(readSnap WalIndexHdr) (stateChanged bool, e
 	}
 
 	// Re-sync WAL state from SHM header for writeFrames correctness.
-	// DRIFT from SQLite: SQLite doesn't re-sync in beginWriteTransaction —
-	// if headers match, pWal->hdr is already correct (because walIndexTryHdr
-	// populated it). We re-sync because our WAL state (nFrame, cksum1/2,
-	// salts) is separate from the SHM header struct. When BUSY_SNAPSHOT
-	// passes (headers match), this is a no-op in practice.
+	// DRIFT: explicit re-sync since nFrame/cksum1-2/salts are separate from SHM hdr. See docs/btree/NOTES.md#old-drift-multiprocess-wal-structural-drift
 	if valid {
 		// Detect external state change: compare current SHM header against
 		// the snapshot saved after our last writeFrames commit. writerHdr

@@ -25,9 +25,8 @@ var (
 	// open read/write transaction at BackupInit time.
 	ErrBackupDstBusy = errors.New("btree: backup destination has an open transaction")
 
-	// ErrBackupFinished — returned by Step after Finish or by Finish
-	// called twice. DRIFT from C: backup.c:577 tolerates NULL; Go
-	// prefers explicit misuse errors.
+	// ErrBackupFinished — returned by Step after Finish or by Finish called twice.
+	// DRIFT: SQLite's finish is NULL-tolerant/idempotent; Go surfaces double-finish. See docs/btree/NOTES.md#drift-44-backup-finish-double-call-returns-error-not-no-op
 	ErrBackupFinished = errors.New("btree: backup already finished")
 
 	// ErrBackupDone — non-error sentinel returned by Step once every
@@ -71,14 +70,13 @@ type Backup struct {
 	// 0 = "no prior Step" (init state).
 	lastFCC uint32
 
-	// finished is set by Finish. DRIFT from backup.c:577 which tolerates
-	// NULL; we want explicit double-close detection.
+	// finished is set by Finish; enables explicit double-close detection.
+	// DRIFT: SQLite's finish is NULL-tolerant/idempotent; Go surfaces double-finish. See docs/btree/NOTES.md#drift-44-backup-finish-double-call-returns-error-not-no-op
 	finished bool
 
 	// mu protects Backup state against concurrent Step/Finish/update/restart
 	// and the external Remaining/PageCount accessors. SQLite splits this
-	// across two mutexes (src db + BtShared); our single-mutex model is
-	// DRIFT #4.
+	// across two mutexes (src db + BtShared); we use a single mutex.
 	mu sync.Mutex
 }
 
