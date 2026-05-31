@@ -282,6 +282,10 @@ func (pc *pcache) initBulk() {
 // are available and xStress is set, invokes the stress callback to spill
 // a dirty page, making it clean and evictable.
 // DRIFT: pcache recycle/spill thresholds off-by-one ('>=' vs C 'nPage+1>=nMax' / strict '>') See docs/btree/NOTES.md#drift-127-pcache-recycle-and-spill-thresholds-off-by-one
+// DRIFT: create() merges SQLite's two-phase Fetch + FetchStress (soft create then spill+hard retry) See docs/btree/NOTES.md#old-drift-merged-fetch-fetchstress
+// DRIFT: pcache.create ignores xStress error (no error return); C FetchStress propagates non-BUSY r See docs/btree/NOTES.md#old-drift-pcache-create-drops-xstress-error
+// DRIFT: create() keeps evicted victim as recycled & reuses its buffer for both reader/writer cache See docs/btree/NOTES.md#old-drift-pcache-buffer-reuse-on-eviction
+// DRIFT: create() takes createFlag directly; no eCreate auto-select (readers=1 soft, writers=2 hard See docs/btree/NOTES.md#old-drift-no-ecreate-state-machine
 func (pc *pcache) create(pgno uint32, createFlag int) *page {
 	if p := pc.hashFind(pgno); p != nil {
 		p.pinCount++
@@ -338,10 +342,6 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 		}
 
 		// If still full and stress callback available, try to spill a dirty page.
-		// Merges SQLite's two-phase sqlite3PcacheFetch + sqlite3PcacheFetchStress
-		// (pcache.c:403-490) into a single call. Admission control (step 3),
-		// eviction (step 4), stress callback, and allocation (step 5) are all
-		// handled inline. See "Known Drifts in Page Cache" in docs/btree/NOTES.md.
 		spill := pc.szSpill
 		if spill == 0 {
 			spill = pc.maxPages
@@ -349,11 +349,6 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 		if pc.nPage >= spill && pc.xStress != nil {
 			victim := pc.findSpillVictim()
 			if victim != nil {
-				// DRIFT from SQLite: we ignore the xStress error here because
-				// create() has no error return. SQLite's FetchStress returns
-				// the error but only for OOM/non-BUSY cases. The pagerStress
-				// callback calls pagerError() on failure to transition the
-				// pager to error state, so the error is not silently lost.
 				pc.xStress(victim)
 				// After stress callback, victim should be clean. Retry eviction.
 				for pc.nPage >= pc.maxPages && pc.nRecyclable > 0 {
@@ -439,6 +434,8 @@ func (pc *pcache) resetPage(p *page, pgno uint32) {
 // to nPage>nMax. This fires when createFlag=2 (hard create) lets the
 // cache grow beyond nMax during a transaction — the excess pages are
 // shed on release instead of accumulating in the LRU.
+// DRIFT: release() lacks SQLite's reuseUnlikely flag; only matches the overfull nPage>maxPages disc See docs/btree/NOTES.md#old-drift-release-no-reuse-unlikely-hint
+// DRIFT: release()/makeClean skip LRU for non-purgeable (InMemory) caches, matching SQLite pcacheUn See docs/btree/NOTES.md#old-drift-non-purgeable-skip-lru
 func (pc *pcache) release(p *page) {
 	p.pinCount--
 	if p.pinCount <= 0 {
@@ -555,6 +552,7 @@ func (pc *pcache) dirtyPages() []*page {
 }
 
 // appendDirtyPages appends all dirty pages to the provided slice and returns it.
+// DRIFT: dirty list written to WAL unsorted (MRU->LRU); SQLite pgno-sorts. Harmless: WAL frames are See docs/btree/NOTES.md#old-drift-pcache-dirty-list-unsorted-wal-write
 func (pc *pcache) appendDirtyPages(buf []*page) []*page {
 	for p := pc.dirtyHead; p != nil; p = p.next {
 		buf = append(buf, p)

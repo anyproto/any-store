@@ -88,6 +88,8 @@ func (ic *integrityChecker) checkRef(pgno uint32, context string) bool {
 
 // checkList validates a freelist (isFreeList=true) or overflow chain (isFreeList=false).
 // Port of SQLite's checkList() (btree.c:10705-10769).
+// DRIFT: checkList returns on over-large trunk leaf-count; SQLite reports and continues next trunk See docs/btree/NOTES.md#old-drift-checklist-aborts-walk-on-overlarge-trunk-leafcount
+// DRIFT: checkList reports freelist size mismatch unconditionally; SQLite suppresses if errors alre See docs/btree/NOTES.md#old-drift-checklist-unconditional-size-mismatch-report
 func (ic *integrityChecker) checkList(isFreeList bool, firstPgno uint32, expected uint32) {
 	if ic.tooManyErrors() {
 		return

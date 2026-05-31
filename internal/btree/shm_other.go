@@ -33,6 +33,7 @@ func newPlatformShm(_ string) (shm, error) {
 	}, nil
 }
 
+// DRIFT: heap SHM fallback (single-process) on platforms without mmap SHM; SQLite always mmaps SHM See docs/btree/NOTES.md#old-drift-heap-shm-single-process-fallback
 func (s *heapShm) region(index int, create bool) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

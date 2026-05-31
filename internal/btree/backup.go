@@ -84,8 +84,8 @@ type Backup struct {
 
 // BackupInit starts a new backup operation. The caller ("dst") is the
 // database to write into; "src" is the database to read from.
-// ~ sqlite3_backup_init (backup.c:140–210), minus the handle/name
-// resolution described in DRIFT #2.
+// ~ sqlite3_backup_init (backup.c:140–210).
+// DRIFT: WAL-only: same-page-size enforced at init; no PENDING_BYTE/findDatabase/nBackup See docs/btree/NOTES.md#old-drift-backup-intentional-simplifications
 func (dst *DB) BackupInit(src *DB) (*Backup, error) {
 	// ~ backup.c:166–170.
 	if dst == src {
@@ -115,11 +115,7 @@ func (dst *DB) BackupInit(src *DB) (*Backup, error) {
 // onePage copies page iSrcPg from the source into the destination.
 // ~ backupOnePage (backup.c:226–279). The bUpdate parameter matches
 // SQLite: false for normal Step copies, true for update-callback copies.
-//
-// Our page sizes are always equal (enforced at BackupInit), so the
-// for-loop at backup.c:251–276 collapses to one iteration with no
-// offset arithmetic. DRIFT #1 removes the PENDING_BYTE_PAGE guard at
-// backup.c:243/254.
+// DRIFT: WAL-only: same-page-size enforced at init; no PENDING_BYTE/findDatabase/nBackup See docs/btree/NOTES.md#old-drift-backup-intentional-simplifications
 func (b *Backup) onePage(iSrcPg uint32, srcData []byte, bUpdate bool, snapPageCount uint32) error {
 	if b.dst.pager.pageSize != b.src.pager.pageSize {
 		// Defensive: caught at Init, but reopen-race could in theory
@@ -243,7 +239,6 @@ func (b *Backup) Step(nPage int) error {
 	// Main copy loop. ~ backup.c:390–401.
 	for ii := 0; (nPage < 0 || ii < nPage) && b.iNext <= nSrcPage; ii++ {
 		iSrcPg := b.iNext
-		// DRIFT #1 skips PENDING_BYTE_PAGE check at backup.c:392.
 
 		srcPg, err := b.src.pager.getPageReader(iSrcPg, rtx.walMaxFrame, rtx.cache)
 		if err != nil {

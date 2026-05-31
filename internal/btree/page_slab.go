@@ -206,9 +206,7 @@ func (s *pageSlab) UnderPressure() bool {
 // page size. If pageSize is 0, it only checks whether the slab is initialized
 // at all. This is used by pcache.initBulk() and create() to avoid pulling
 // buffers of the wrong size from a slab initialized for a different page size.
-// Lock-free: initialized is an atomic.Bool; pageSize is immutable after Init.
-// DRIFT from SQLite: SQLite's pcache1.isInit and pcache1.szSlot are also
-// read without mutex (pcache1.c:220-222 "do not require mutex protection").
+// DRIFT: Initialized() reads initialized (atomic.Bool) + immutable pageSize lock-free, matching SQL See docs/btree/NOTES.md#old-drift-initialized-lock-free-atomic
 func (s *pageSlab) Initialized(pageSize int) bool {
 	if !s.initialized.Load() {
 		return false

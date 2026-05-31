@@ -420,7 +420,7 @@ func interiorCellSizeWithOverflow(key []byte, usableSize int) int {
 }
 
 // writeLeafCell writes a leaf cell to buf and returns bytes written.
-// Format: [varint(keyLen)] [varint(valLen)] [key] [value]
+// DRIFT: Leaf cell uses 2 varints (keyLen,valLen) vs SQLite's 1 varint(nPayload) for key/value sema See docs/btree/NOTES.md#old-drift-leaf-cell-two-varint-keyvalue-format
 func writeLeafCell(buf []byte, key, value []byte) int {
 	pos := 0
 	pos += putVarint(buf[pos:], uint64(len(key)))
@@ -434,8 +434,7 @@ func writeLeafCell(buf []byte, key, value []byte) int {
 
 // writeLeafCellOverflow writes a leaf cell with overflow.
 // nLocal is the number of bytes of (key||value) stored on-page.
-// Matches SQLite's fillInCell() for index btrees, adapted for
-// separate key/value varints (see format documentation in page.go).
+// DRIFT: Leaf cell uses 2 varints (keyLen,valLen) vs SQLite's 1 varint(nPayload) for key/value sema See docs/btree/NOTES.md#old-drift-leaf-cell-two-varint-keyvalue-format
 func writeLeafCellOverflow(buf []byte, key []byte, value []byte, nLocal int, overflowPgno uint32) int {
 	pos := 0
 	pos += putVarint(buf[pos:], uint64(len(key)))
@@ -576,6 +575,7 @@ func (bt *btree) searchLeaf(pg *page, key []byte) (int, bool, error) {
 
 // searchLeafWithOverflow is a standalone function for searching leaf pages
 // with overflow key support. Used by ReadTx which doesn't have a btree struct.
+// DRIFT: Search uses raw bytes.Compare + prefix-before-overflow-read and has no aOverflow page cach See docs/btree/NOTES.md#old-drift-binsearch-rawbytes-prefix-no-overflow-cache
 func searchLeafWithOverflow(pg *page, key []byte, usableSize int, p *pager, walMaxFrame uint32, cache *pcache) (int, bool, error) {
 	n := int(pg.header.cellCount)
 	data := pg.data

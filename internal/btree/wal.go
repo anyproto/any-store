@@ -39,27 +39,6 @@ package btree
 //   - Hash tables: mapping page numbers to WAL frame positions
 //   - Lock slots: coordinating readers, writer, and checkpoint
 //
-// Frame lookup — in-process map vs. SHM hash (issue 7.9):
-//
-// walIndex.get()/getLatest() select their source of truth based on mode:
-//
-//  1. InProcess mode (single-process, heap shm): the in-process Go map
-//     (pageMap) is the sole source of truth. There is no mmap'd SHM to
-//     consult, and the Go map gives O(1) lookup without the linear-probing
-//     overhead of the hash table.
-//  2. Multi-process mode (mmap'd shm): get()/getLatest() consult the SHM
-//     hash tables exclusively via shmHashGet(), matching SQLite's
-//     walFindFrame (wal.c:3554-3582). A peer process may have written WAL
-//     frames that never touched this process's pageMap, so the shared SHM
-//     hash — populated on every frame by shmHashWrite — is authoritative.
-//     nBackfill is likewise read from SHM (shmNBackfill) since a peer
-//     checkpoint may advance it without updating our process-local copy.
-//
-// In SQLite, walHashGet/walFramePage are used during recovery, checkpoint
-// iteration, AND normal cross-process reads (all frame lookups go through
-// the shared SHM). Our pageMap mirrors SQLite's in-memory state only for the
-// InProcess fast path; cross-process readers use the SHM hash directly.
-
 import (
 	"encoding/binary"
 	"errors"
@@ -619,12 +598,8 @@ func (wi *walIndex) set(pgno, frame uint32) error {
 }
 
 // setBatch records multiple page->frame mappings under a single lock and
-// publishes them to the SHM hash tables. Matches SQLite's walFrames loop
-// (wal.c:2900-ish) calling walIndexAppend (wal.c:1295-1338) for every frame
-// regardless of commit: peer readers are still gated by hdr.mxFrame (only
-// advanced on commit via walIndexWriteHdr), so uncommitted hash entries are
-// present but unreachable. Rollback uses shmCleanupFromFrame (analog of
-// walCleanupHash, wal.c:1247-1282) to zero out dangling hash entries.
+// publishes them to the SHM hash tables.
+// DRIFT: wal-index updated by one post-loop setBatch (eager shmHashWrite); C replays PGHDR_WAL_APPEND See docs/btree/NOTES.md#old-drift-batched-walindex-setbatch
 func (wi *walIndex) setBatch(pages []*page, startFrame uint32, commit bool) error {
 	_ = commit
 	if wi.inProcess {
@@ -772,6 +747,7 @@ func (wi *walIndex) getInTxRange(pgno, maxFrame, minFrame uint32) (uint32, error
 // within the given maxFrame snapshot, or 0 if not in WAL.
 // The maxFrame parameter limits which frames are visible (for snapshot isolation).
 // DRIFT: WAL hash-probe full-chain (nCollide) CORRUPT signal dropped in get/shmHashGet See docs/btree/NOTES.md#drift-93-wal-hash-probe-full-chain-corruption-signal-dropped
+// DRIFT: in-process WAL lookup via Go map (O(1)) vs SQLite hash scan; cross-process still uses SHM See docs/btree/NOTES.md#old-drift-pagemap-same-process-lookup
 func (wi *walIndex) get(pgno, maxFrame uint32) (uint32, error) {
 	if wi.inProcess {
 		// In-process: no SHM to consult; pageMap is the sole source of truth.
@@ -806,6 +782,7 @@ func (wi *walIndex) get(pgno, maxFrame uint32) (uint32, error) {
 // In multi-process mode this consults SHM hash exclusively (the SQLite-
 // aligned source of truth per walFindFrame). In in-process mode it walks
 // pageMap — there is no SHM to query in that mode.
+// DRIFT: getLatest reads one shared pageMap; spill frames (>walMaxFrame) cause transient reader cache miss See docs/btree/NOTES.md#old-drift-shared-pagemap-transient-cache-miss
 func (wi *walIndex) getLatest(pgno uint32) (uint32, error) {
 	if wi.inProcess {
 		wi.mu.RLock()
@@ -1663,6 +1640,7 @@ func (w *wal) ensureHeaderInitializedInProcess() (WalIndexHdr, error) {
 // for WAL offset + backfill tracking.
 //
 // Caller must hold w.mu and have observed a valid SHM header.
+// DRIFT: headerOnDisk inferred from hdr.mxFrame>0 not fstat (relies on flushHeader-before-frame invariant) See docs/btree/NOTES.md#old-drift-headerondisk-mxframe-inference
 func (w *wal) syncFromSHMLocked() {
 	hdr, valid := w.index.readHeader()
 	if !valid {
@@ -1998,6 +1976,7 @@ func (w *wal) recoverLocked() error {
 // DRIFT: wal-index header iChange counter never incremented (always 0) See docs/btree/NOTES.md#drift-96-wal-index-change-counter-ichange-never-incremented
 // DRIFT: padToSectorBoundary commit-frame sector padding not ported See docs/btree/NOTES.md#drift-104-padtosectorboundary-sector-padding-of-commit-frames-not-port
 // DRIFT: journal_size_limit/mxWalSize WAL truncation unimplemented (truncateOnCommit/walLimitSize) See docs/btree/NOTES.md#drift-105-journal-size-limit-wal-truncation-feature-unimplemented
+// DRIFT: in-process mode skips SHM hdr write on commit; BeginRead/Write synthesize a minimal walHdr See docs/btree/NOTES.md#old-drift-inprocess-skips-shm-hdr-on-commit
 func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 	if len(pages) == 0 {
 		return nil
@@ -2260,6 +2239,7 @@ func (w *wal) writeFrames(pages []*page, commit bool, dbSize uint32) error {
 // per-page overhead (so page format stays consistent with a future
 // serialization) but the codec itself is not invoked on this fast path.
 // END ENCRYPTION
+// DRIFT: InMemory+NoSync WAL stores page data in arena, skipping checksums entirely; no disk persistence See docs/btree/NOTES.md#old-drift-inmemory-wal-skips-checksums
 func (w *wal) writeFramesMem(pages []*page, commit bool, dbSize uint32) error {
 	w.mu.Lock()
 

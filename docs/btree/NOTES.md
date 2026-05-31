@@ -46,7 +46,10 @@ The Go implementation uses **two varints** (keyLen, valLen) because it implement
 separate key/value semantics (e.g., `Put(docId, encodedDocument)`). Both lengths
 are always fully on-page, so overflow detection remains I/O-free.
 
+<a id="old-drift-leaf-cell-two-varint-keyvalue-format"></a>
 ### Drift
+
+**Severity:** low
 
 | Aspect | SQLite Index B-tree | Go Implementation |
 |--------|-------------------|-------------------|
@@ -84,16 +87,6 @@ In `parseInteriorCell()` / `writeInteriorCell()` (btree.go):
 ```
 
 Interior cells use a single varint (keyLen). No value is stored in interior cells.
-
-### Drift
-
-| Aspect | SQLite | Go |
-|--------|--------|-----|
-| Format | `[4B child] [varint(nPayload)] [key] [ovfl?]` | `[4B child] [varint(keyLen)] [key] [ovfl?]` |
-| Semantics | Key-only (nPayload = key size) | Key-only (keyLen) |
-
-**Classification: Intentional** -- The formats are semantically identical. The varint
-means the same thing (the key size). Interior cells are key-only in both implementations.
 
 ---
 
@@ -146,7 +139,10 @@ func localPayloadSize(totalPayload, usableSize int) int {
 }
 ```
 
+<a id="old-drift-index-only-local-payload-no-maxleaf-minleaf"></a>
 ### Drift
+
+**Severity:** low
 
 | Aspect | SQLite | Go |
 |--------|--------|-----|
@@ -192,7 +188,10 @@ In `searchLeafPage()` / `searchLeafWithOverflow()` (btree.go):
    - Only reads the full overflow key if the prefix comparison is inconclusive
    - Uses `leafFullKey()` to reconstruct the complete key from overflow pages
 
+<a id="old-drift-binsearch-rawbytes-prefix-no-overflow-cache"></a>
 ### Drift
+
+**Severity:** medium
 
 | Aspect | SQLite | Go |
 |--------|--------|-----|
@@ -244,7 +243,10 @@ Both implementations follow the same 100-byte layout:
 | 92 | 4 | Version-valid-for | Version-valid-for |
 | 96 | 4 | SQLite version number | 1 (hardcoded) |
 
+<a id="old-drift-db-file-header-magic-version-salt-vacuum"></a>
 ### Drift
+
+**Severity:** low
 
 | Aspect | SQLite | Go |
 |--------|--------|-----|
@@ -318,7 +320,10 @@ if p.header.SchemaFormat != 0 && p.header.SchemaFormat < 5 {
 | 4 | Original Go format: `[varint(keyLen)] [key] [varint(valLen)] [value]` -- only values could overflow |
 | 5 | Unified overflow: `[varint(keyLen)] [varint(valLen)] [key\|\|value]` -- both keys and values can overflow |
 
+<a id="old-drift-schema-format-5-custom-not-sqlite-fmt4"></a>
 ### Drift
+
+**Severity:** low
 
 **Classification: Intentional** -- Go's "format 5" is NOT the same as SQLite's schema
 format 4. It is a custom version number for the Go implementation's own format evolution.
@@ -361,6 +366,10 @@ has LSB=1, indicating big-endian checksums).
 The Go implementation includes an unrolled 8x (4-pair) fast path using `unsafe`
 pointer arithmetic (wal.go).
 
+<a id="old-drift-pagemap-same-process-lookup"></a>
+**Severity:** low (same-process lookup: in-process WAL lookup via Go map (O(1)) vs SQLite hash scan; cross-process still uses SHM)
+<a id="old-drift-heap-shm-single-process-fallback"></a>
+**Severity:** low (heap SHM fallback (single-process) on platforms without mmap SHM; SQLite always mmaps SHM)
 ### WAL Index (SHM)
 
 Both implementations use the same SHM layout:
@@ -382,6 +391,10 @@ Both implementations use the same SHM layout:
 
 Both support: PASSIVE, FULL, RESTART, TRUNCATE with identical semantics.
 
+<a id="old-drift-wal-magic-version-be-checksum"></a>
+**Severity:** medium (distinct WAL magic/version + BE-only checksums; prevents cross-tool open, simplifies impl)
+<a id="old-drift-wal-undo-via-pager-rollback"></a>
+**Severity:** low (no sqlite3WalUndo; rollback resets wal.nFrame to savedWalFrame + rollbackToFrame trims pages)
 ### Drift Summary
 
 | Aspect | Classification |
@@ -467,6 +480,8 @@ const (
 )
 ```
 
+<a id="old-drift-pager-state-machine-simplified"></a>
+**Severity:** low (WAL-only 4-state pager vs SQLite 7-state; no rollback journal / on-disk subjournal)
 ### Feature Comparison
 
 | Feature | SQLite | Go |
@@ -565,6 +580,8 @@ With 200 open DBs: 200 × 800KB = ~156MB reader cache total.
 Writer caches (1 per DB): bounded by `CacheSize × pageSize` per DB, with buffers
 drawn from the global slab that enforces a process-wide soft cap.
 
+<a id="old-drift-pcache-dirty-list-unsorted-wal-write"></a>
+**Severity:** low (dirty list written to WAL unsorted (MRU->LRU); SQLite pgno-sorts. Harmless: WAL frames are pgno-addressed -- see "Dirty-list order" row)
 ### Drift
 
 | Aspect | SQLite | Go |
@@ -616,6 +633,8 @@ The Go implementation uses the same trunk/leaf format (pager.go):
 - `dontWritePages` map (replacing SQLite's `PGHDR_DONT_WRITE` flag)
 - Bounds validation on trunk/leaf page numbers
 
+<a id="old-drift-freelist-trunk-fill-corruption-ceiling"></a>
+**Severity:** medium (trunk fills to usableSize/4-2 (corruption ceiling) not SQLite's conservative -8; pre-3.6.0 readers flag it corrupt)
 ### Drift
 
 | Aspect | SQLite | Go |
@@ -664,6 +683,8 @@ Key features:
   pages by following only the next-pointer); the chain readers
   `readOverflowChainAt`/`readOverflowChainReader` read from the start
 
+<a id="old-drift-no-aoverflow-page-cache"></a>
+**Severity:** low (no aOverflow[] cursor cache; overflow chains re-walked from start each read (perf, not correctness))
 ### Drift
 
 | Aspect | SQLite | Go |
@@ -716,21 +737,6 @@ Readers use their private cache via `getPageReader()`. Overflow pages use
 `readOverflowChainReader()`. The writer uses `writerCache` via `getPageWriter()`.
 Each goroutine accesses only its own cache — no mutex needed.
 
-### Drift
-
-| Aspect | SQLite | Go |
-|--------|--------|-----|
-| Isolation mechanism | WAL frame lookup bounded by `mxFrame` | WAL frame lookup bounded by `walMaxFrame` — matches SQLite |
-| Cache ownership | Per-connection private caches | Per-connection private caches — matches SQLite |
-| Writer dirty pages | In-cache with `PGHDR_DIRTY` flag | In `writerCache` dirty list via `writerCache.fetch()` — matches SQLite |
-| Overflow reads | Per-connection cache | Per-connection reader cache — matches SQLite |
-| Concurrent readers | Multiple readers, each with own `mxFrame` | Same, each with own `walMaxFrame` and private cache |
-
-**Classification: Structural** -- The Go implementation now matches SQLite's per-connection
-cache model. Each reader has its own private cache, and the writer has its own cache.
-No mutex is needed on the page cache since each cache is accessed by a single goroutine.
-The writer uses `writerCache` directly for dirty-page access, matching SQLite's PCache approach.
-
 ---
 
 ## 13. Corruption Protection
@@ -766,9 +772,16 @@ The Go implementation has:
 | Overflow protection | Trust chain structure | `maxIter` + bounds checks |
 | Max tree depth | `BTCURSOR_MAX_DEPTH = 20` | `btCursorMaxDepth` (same value) |
 
+<a id="old-drift-corruption-fixed-1gb-payload-cap-vs-npage-validation"></a>
+**Severity:** low
+
 **Classification: Divergent** -- Both implementations protect against corruption, but
 the specific cap values differ. SQLite's `nCell/usableSize > nPage` check is more
 precise (validates against actual database size), while Go uses a fixed 1 GB cap.
+
+<a id="old-drift-additive-maxiter-circular-chain-guard"></a>
+**Severity:** low
+
 The Go implementation adds circular-chain protection that SQLite doesn't need
 (SQLite trusts the page structure more due to its integrity check infrastructure).
 
@@ -833,10 +846,16 @@ input. Auto-vacuum and PENDING_BYTE checks are absent because those features don
 page to detect ciphertext tampering or bit-rot. No SQLite analogue: stock SQLite has no
 page-level MAC, and this is the codec layer's own consistency check. Any-store-specific.
 
+<a id="old-drift-checklist-aborts-walk-on-overlarge-trunk-leafcount"></a>
+**Severity:** low
+
 **Two diagnostic-quality drifts in `checkList`** (corrupt-input only, no effect on healthy
 DBs): on an over-large trunk leaf-count it `return`s (aborting the whole freelist walk)
 where SQLite reports and continues to the next trunk (btree.c:10778) — so later trunk pages
-are then reported as orphans; and it emits the size/overflow count-mismatch message
+are then reported as orphans;
+<a id="old-drift-checklist-unconditional-size-mismatch-report"></a>
+**Severity:** low
+and it emits the size/overflow count-mismatch message
 unconditionally, lacking SQLite's `nErrAtStart==pCheck->nErr` suppression (btree.c:10781),
 so it can pile a redundant line onto an already-reported corruption.
 
@@ -907,6 +926,9 @@ Key features:
 | Save/restore | Automatic via `pKey`/`nKey` | Not supported |
 | Delete during iterate | `SKIPNEXT` mechanism | Not supported |
 
+<a id="old-drift-readonly-two-state-cursor"></a>
+**Severity:** low
+
 **Classification: Structural** -- The Go cursor is significantly simpler, designed
 for read-only iteration. Write operations go through `btree.Put()` / `btree.Delete()`
 which do their own tree traversal rather than using a cursor. The lack of
@@ -942,10 +964,12 @@ Go savepoints (pager.go):
 |--------|--------|-----|
 | Storage | On-disk sub-journal | In-memory page copies |
 | WAL integration | `sqlite3WalSavepoint()` captures 4 u32 values | Captures a `walHdr` snapshot (mxFrame + `aFrameCksum[2]`) |
-| WAL truncation | `sqlite3WalSavepointUndo()` truncates WAL | No WAL truncation on rollback |
 | Page restoration | Reads from sub-journal file | Copies from in-memory maps |
 | Merge on release | Sub-journal frames retained | Page maps merged to parent |
 | Header restoration | Implicit via page 1 journal | Explicit `header` snapshot |
+
+<a id="old-drift-savepoint-inmemory-copies-vs-subjournal"></a>
+**Severity:** medium
 
 **Classification: Divergent** -- Both achieve the same semantics (nested savepoints
 with rollback/release), but Go uses in-memory storage while SQLite uses disk-based
@@ -954,6 +978,9 @@ sub-journals. This makes Go savepoints faster but memory-intensive for large tra
 ---
 
 ## 17. Auto-vacuum / Incremental Vacuum
+
+<a id="old-drift-autovacuum-not-implemented"></a>
+**Severity:** low
 
 **Not implemented.** The database file header fields for auto-vacuum (offsets 52 and 64)
 are always set to 0. Freed pages go to the freelist and stay there until reused.
@@ -993,6 +1020,9 @@ semantics:
 | Leaf cell format | `[varint(keyLen)] [varint(valLen)] [key\|\|value]` |
 | Interior cell | `[4B child] [varint(keyLen)] [key]` |
 | Overflow limits | `maxLocal` / `minLocal` (index formulas) |
+
+<a id="old-drift-index-only-btrees-no-intkey-table"></a>
+**Severity:** medium
 
 **Classification: Structural** -- This is a fundamental architectural difference.
 SQLite's table B-trees use integer keys with record-format values, optimized for
@@ -1099,6 +1129,9 @@ per-connection `Pager`.
 | WAL snapshot | `pWal->hdr.nPage` local copy at read-lock time | `pcache.dbSize` captured at `BeginRead` in lockstep with `walMaxFrame`, via `effectiveReaderDbSize`/`readerDbSizeBound` |
 | Performance cost | Zero (no sharing = no synchronization) | ~1 ns per `atomic.Load` on x86 |
 
+<a id="old-drift-dbsize-atomic-and-per-snapshot-reader-bound"></a>
+**Severity:** medium
+
 **Classification: Divergent** -- This drift stems from a fundamental architectural
 difference: SQLite uses per-connection state isolation (each connection has its own
 `Pager`), while the Go implementation shares a single `pager` across goroutines. The
@@ -1172,7 +1205,9 @@ Key components:
 Cache spill drifts from SQLite (all intentional, marked with `DRIFT from SQLite`
 comments in source):
 
-1. **pagerError eager cleanup** (`pager.go:pagerError`): SQLite's `pager_error()`
+<a id="old-drift-pagererror-eager-cleanup"></a>
+1. **pagerError eager cleanup** (`pager.go:pagerError`) — **Severity:** medium.
+   SQLite's `pager_error()`
    only sets errCode and transitions to `PAGER_ERROR`, deferring cleanup to a
    subsequent `sqlite3PagerRollback()`. We perform eager cleanup (cache purge,
    WAL rollback, lock release, transition to pagerOpen) because there is no
@@ -1180,20 +1215,26 @@ comments in source):
    abandons the transaction, the WAL write lock would remain held, blocking the
    next `BeginWrite`.
 
-2. **Page-1 explicit exclusion** (`pager.go:pagerStress`): SQLite does not check
+<a id="old-drift-pagerstress-page1-exclusion"></a>
+2. **Page-1 explicit exclusion** (`pager.go:pagerStress`) — **Severity:** high.
+   SQLite does not check
    `pgno==1` in `pagerStress()`. Page 1 is structurally protected: it stays pinned
    (referenced) throughout the transaction, so pcache never selects it as a spill
    victim. We add an explicit guard because page 1 may become unpinned between
    b-tree operations.
 
-3. **`pcache.create()` drops xStress error** (`pcache.go:create`): SQLite's
+<a id="old-drift-pcache-create-drops-xstress-error"></a>
+3. **`pcache.create()` drops xStress error** (`pcache.go:create`) — **Severity:** low.
+   SQLite's
    `pcache1Fetch` propagates non-BUSY errors from xStress to the caller, allowing
    the pager to abort page acquisition. Our `create()` has no error return (it
    always returns a `*page`), so xStress errors are silently dropped. In practice,
    `pagerStress` calls `pagerError` on WAL write failure, which performs eager
    cleanup, so the dropped error is harmless.
 
-4. **Batched wal-index update** (`wal.go:setBatch`): SQLite updates the wal-index
+<a id="old-drift-batched-walindex-setbatch"></a>
+4. **Batched wal-index update** (`wal.go:setBatch`) — **Severity:** medium.
+   SQLite updates the wal-index
    inline in `walFrames()` — the write loop tags each page `PGHDR_WAL_APPEND`
    (set on append, cleared on in-place reuse), then a second loop replays the flag
    via `walIndexAppend()` (`wal.c:4154/4166/4228-4233`); rollback uses
@@ -1208,13 +1249,16 @@ comments in source):
    `writeFrames`/`writeFramesMem` now fails loudly if any appended frame is
    unregistered.
 
-5. **dontWrite pages made clean without WAL write** (`pager.go:pagerStress`):
+<a id="old-drift-pagerstress-dontwrite-skip-walwrite"></a>
+5. **dontWrite pages made clean without WAL write** (`pager.go:pagerStress`) — **Severity:** low.
    SQLite's `pagerStress` in WAL mode writes `PGHDR_DONT_WRITE` pages to WAL
    anyway (the data is irrelevant but the frame is still written). We skip the WAL
    write and just mark them clean, avoiding unnecessary I/O. Safe because dontWrite
    page data is never read back.
 
-6. **Shared pageMap causes transient cache misses** (`wal.go:getLatest`): We now use
+<a id="old-drift-shared-pagemap-transient-cache-miss"></a>
+6. **Shared pageMap causes transient cache misses** (`wal.go:getLatest`) — **Severity:** low.
+   We now use
    per-connection page caches matching SQLite's model, but we still share one `pageMap`
    across all goroutines. Spill frames are visible to `getLatest()`, causing transient
    cache misses during active spill when `latestFrame > walMaxFrame`. Each reader's
@@ -1254,12 +1298,18 @@ validation (`sqlitec/src/wal.c:1406-1419`). Covered by
 `TestWalHeaderDeserialize_RejectsBadVersion` and
 `TestWalHeaderDeserialize_RejectsBadPageSize`.
 
+<a id="old-drift-inmemory-wal-skips-checksums"></a>
 **In-Memory WAL Mode Skips Checksums** -- Severity: Minor (accepted)
+
+**Severity:** low
 
 Intentional design choice for the `InProcess + NoSync` fast path. No disk
 persistence means checksums add overhead without value.
 
+<a id="old-drift-autocheckpoint-threshold-10000-vs-1000"></a>
 **Auto-Checkpoint Uses PASSIVE Mode** -- Severity: Minor
+
+**Severity:** low
 
 Default threshold is 10,000 frames vs SQLite's 1,000. Auto-checkpoint runs as
 PASSIVE (`tryCheckpoint()` -> `checkpointPassive()`), matching SQLite's default
@@ -1372,11 +1422,6 @@ loses SQLite's zero-copy win; a follow-up could add a zero-copy path
 with `nFetchOut`-style refcounting if the memcpy cost becomes
 material (measurement shows it is secondary to syscall cost).
 
-**Missing Salt Cross-Check** -- Severity: Minor
-
-No validation that the WAL file's salt matches the database header's salt.
-Would detect stale or mismatched WAL files.
-
 **VersionValidFor Integrity Check** -- Resolved 2026-04-22
 
 `pager.open` compares `VersionValidFor` against `FileChangeCount`
@@ -1483,23 +1528,27 @@ chained hash (`pcache.apHash []*page` + `page.hashNext`), a direct port of
   B/op or allocs/op. No on-disk, WAL, dirty-list, or eviction-order change.
 
 **Known Drifts in Page Cache:**
-- Buffer reuse on eviction: matches SQLite step 4 (`pcache1.c:897-914`) — since
+<a id="old-drift-pcache-buffer-reuse-on-eviction"></a>
+- Buffer reuse on eviction: **Severity:** low — matches SQLite step 4 (`pcache1.c:897-914`) — since
   commit `acf91a0`, `create()` keeps the evicted victim as `recycled` and reuses
   its buffer in-place (`resetPage` → `clear(p.data)`) for **both** writer and reader
   caches (gated on `pc.purgeable`, not `xStress`). Only *surplus* evicted buffers
   beyond the kept one go back to the slab in `clear()`/`discard()`/`truncate()`;
   `evictOne` does not free the kept victim's buffer.
-- No `reuseUnlikely` on unpin: SQLite's `pcache1Unpin` accepts a
+<a id="old-drift-release-no-reuse-unlikely-hint"></a>
+- No `reuseUnlikely` on unpin: **Severity:** low — SQLite's `pcache1Unpin` accepts a
   `reuseUnlikely` flag (`pcache1.c:1079`); when true, pages are immediately
   freed. Our `release()` does not have this hint. Overfull eviction
   (`nPage > maxPages`) matches SQLite's `pGroup->nPurgeable > nMaxPage`
   check (`pcache1.c:1094`). `sqlite3PcacheDrop` maps to our `discard()` method.
-- Merged Fetch+FetchStress: SQLite splits page acquisition into
+<a id="old-drift-merged-fetch-fetchstress"></a>
+- Merged Fetch+FetchStress: **Severity:** low — SQLite splits page acquisition into
   `sqlite3PcacheFetch` (soft create, may return NULL) and
   `sqlite3PcacheFetchStress` (spill + hard retry) as separate calls from the
   pager (`pcache.c:403-490`). Our `create()` merges both into a single
   function with inline stress handling.
-- No `eCreate` state machine: SQLite's `PCache.eCreate` toggles between 1
+<a id="old-drift-no-ecreate-state-machine"></a>
+- No `eCreate` state machine: **Severity:** low — SQLite's `PCache.eCreate` toggles between 1
   (soft, when dirty list non-empty) and 2 (hard, when dirty list empty) so
   that `createFlag & eCreate` auto-selects the allocation strategy
   (`pcache.c:50,216-228,423`). Our `create()` takes `createFlag` directly —
@@ -1510,10 +1559,12 @@ chained hash (`pcache.apHash []*page` + `page.hashNext`), a direct port of
   auto-vacuum is not implemented (see "Not Implemented" section).
 - No `xShrink`: `pcache1Shrink` (`pcache1.c:837-847`) frees all unpinned
   pages on demand. No external memory pressure API exists yet.
-- Non-purgeable caches skip LRU: SQLite's `pcacheUnpin` (`pcache.c:265-271`)
+<a id="old-drift-non-purgeable-skip-lru"></a>
+- Non-purgeable caches skip LRU: **Severity:** none — SQLite's `pcacheUnpin` (`pcache.c:265-271`)
   is a no-op for non-purgeable caches. Our `release()` matches this by
   guarding LRU operations with `pc.purgeable`.
-- `Initialized()` is lock-free: uses `atomic.Bool` for the `initialized` flag.
+<a id="old-drift-initialized-lock-free-atomic"></a>
+- `Initialized()` is lock-free: **Severity:** none — uses `atomic.Bool` for the `initialized` flag.
   `pageSize` is immutable after Init, read without mutex via acquire semantics
   from the atomic load. Matches SQLite's mutex-free reads of `pcache1.isInit`
   and `pcache1.szSlot` (`pcache1.c:220-222`).
@@ -1524,7 +1575,10 @@ chained hash (`pcache.apHash []*page` + `page.hashNext`), a direct port of
 
 ### B-tree Operations
 
+<a id="old-drift-balance-nonroot-3sibling-index-btree-deviations"></a>
 **Full 3-Sibling Redistribution (`balance_nonroot` port)** -- Resolved (insert side commit 4834f89; delete side a57d3d7)
+
+**Severity:** low
 
 A faithful port of SQLite's `balance_nonroot()` lives in `balance.go` (`balanceNonroot`):
 it gathers the over-/under-full child plus up to two adjacent siblings (NB=3), pools their
@@ -1542,7 +1596,10 @@ btree.c:8960). The former 2-way `leafSplitPoint` split survives only as the root
 `2026-05-23-delete-time-rebalancing.md`. Deferred (optional): first-key divider advance on
 delete and retiring the now-dead `tryMergeLeaf`.
 
+<a id="old-drift-balance-quick-first-key-divider"></a>
 **Rightmost-Append Fast Path (balance_quick port)** -- Resolved 2026-04-23
+
+**Severity:** low
 
 SQLite's `balance_quick` (`btree.c:7992-8086`, dispatched at
 `btree.c:9169-9192`) handles the "rightmost append into the rightmost
@@ -1586,7 +1643,10 @@ Benchmark: `BenchmarkBalanceQuick_MonotonicAppend` reports rows/sec,
 final leaf count, and leaves/row. At pageSize=4096, valSize=128,
 10000 rows: 474 leaves (≈0.047 leaves/row, near the ideal packing).
 
+<a id="old-drift-no-freeblock-chain-fragbytes-rebuild"></a>
 **No Full Freeblock Chain** -- Severity: Important (partially addressed)
+
+**Severity:** low
 
 SQLite maintains a sorted linked list of free blocks within each page for
 fine-grained space reuse. We implemented in-place update (when new cell <=
@@ -1594,109 +1654,12 @@ old cell size), in-place delete (with fragmentation tracking), and
 defragmentation-before-split. Our approach tracks fragmentation in `fragBytes`
 and triggers a full rebuild when it exceeds 60 bytes.
 
-**Path Tracking Stores Only Page Numbers** -- Resolved 2026-04-23
-
-The cursor path used to store only page numbers. The descent path is now
-`[]pathEntry{pgno, cellIdx, nCell}`, mirroring SQLite's `apPage[]`/`aiIdx[]`
-cursor stack (`btreeInt.h:553-556`). `cellIdx` is populated from
-`searchInterior`'s second return value (which was previously discarded).
-
-Commit 2 (`insertSepIntoInterior`): takes `insertIdx` directly, mirroring
-SQLite's `balance_nonroot(iIdx=...)` at `btree.c:8230, 9213`. The O(nCell)
-linear parent re-scan before inserting a divider is gone.
-`BenchmarkInsertSepIntoInterior_DeepTree` pins the win.
-
-Commit 3 (`removeChildFromParent`): uses `path[len-1].cellIdx` directly to
-locate the child slot, replacing the linear scans, with defensive bounds-checks
-against path-builder drift. (`tryMergeLeaf` — the original non-faithful 2-page
-merge — is now **dead code**: delete-time merging funnels through `balanceNonroot`
-instead, see the 3-Sibling note above. `tryMergeLeaf` and its helper
-`removeMergedRightSeparator` remain only as test-exercised code pending retirement
-per the delete-rebalance plan.)
-
-**Nearby Allocation Hint for Overflow Pages** -- Resolved 2026-04-22
-
-`pager.allocatePageNear(nearby)` accepts an optional locality hint
-(nearby == 0 keeps the legacy last-leaf pop). When nearby > 0 and a
-freelist trunk is selected, the leaf with minimum absolute distance
-to `nearby` is picked — matches SQLite `btree.c:6678-6699`
-(BTALLOC_ANY + nearby path).
-
-`writeOverflowChainMulti` threads the previous overflow page's pgno
-as the hint on each subsequent allocation, matching SQLite's
-`fillInCell` at `btree.c:7197` (`allocateBtreePage(pBt, &pOvfl,
-&pgnoOvfl, pgnoOvfl, 0)`) and the first-page zero-hint init at
-`btree.c:7131` (`pgnoOvfl = 0`). Result: overflow chains for a single
-cell allocated from scattered freelist leaves live in clustered
-runs on disk, improving sequential-read and OS-prefetch locality —
-relevant for large-blob workloads (10 MB payload = ~2560 overflow
-pages).
-
-Measured delta on `BenchmarkOverflow10MB_FindIdCold`: +2.9% trend
-(p=0.132, within noise). The bench uses a fresh DB where overflow
-chains are allocated via monotonic `dbSize` growth and are already
-contiguous — the hint only changes allocation order when the
-freelist has scattered leaves. Real workloads with document churn
-(update/delete/re-insert cycles) will see benefit; current bench
-doesn't model that. See
-`any-store-tests/results/session_perf/benchstat_nearby_overflow.txt`.
-
-Covered by `TestAllocateFromFreelist_NearbyHint`,
-`TestAllocateFromFreelist_NearbyZeroIsLegacyBehavior`, and
-`TestWriteOverflowChain_ContiguousOnFreshFreelist` (in
-`pager_test.go`).
-
-**Out of scope:** `BTALLOC_EXACT` and `BTALLOC_LE` modes (used in
-SQLite for auto-vacuum relocation; any-store has no auto-vacuum, see
-`btree.c:6515`). btree split / root allocation callers don't use
-the hint — a future optimization could pass the parent-page pgno as
-nearby on split (matches `btree.c:8666` style) but would require
-benchmark justification.
-
-**Reader-Begin BUSY Conversion (SQLite walTryBeginRead)** -- Resolved 2026-04-23
-
-SQLite's `walTryBeginRead` (`sqlitec/src/wal.c:3000-3252`) never surfaces
-`SQLITE_BUSY` to its caller from the reader-slot claim path. Three
-conversion sites turn BUSY into the internal sentinel `WAL_RETRY`
-(`#define WAL_RETRY (-1)` at wal.c:2626):
-
-  - slot-0 fast path BUSY (wal.c:3144-3146): falls through to slot-1..4
-  - all slots 1..4 busy (wal.c:3186-3188): explicit `rc==SQLITE_BUSY ? WAL_RETRY : ...`
-  - final shared-acquire BUSY (wal.c:3203): same conversion
-
-The caller `walBeginReadTransaction` (wal.c:3391-3393) consumes WAL_RETRY
-in an unbounded `do { ... } while(rc==WAL_RETRY)` with internal back-off
-(wal.c:3022-3056): first 5 retries Gosched-equivalent, then 1 µs sleep,
-then quadratic ramp `(cnt-9)² × 39 µs` capped at WAL_RETRY_PROTOCOL_LIMIT
-= 100 (wal.c:2943) for ~10 s total budget before returning
-`SQLITE_PROTOCOL`.
-
-any-store previously surfaced `ErrBusy` from two of the three sites
-(`wal.tryBeginReadMultiProcessHdr`'s slot-0 lock fail and no-slot-claim
-fallback) and ran a flat 5000-iteration `runtime.Gosched()`-only retry
-loop. Under concurrent readers + checkpoints,
-`TestRapidCheckpointDuringOverflowWrites` produced ~130k transient
-ErrBusy returns per run despite the database being fully consistent
-(`QuickCheck` clean); an additional 2–16 residual `ErrProtocol` returns
-came from retry-budget exhaustion because 5000 Gosch'd iterations
-completed before peer readers could release their slot locks.
-
-All three SQLite conversions are now ported plus the SQLite back-off
-ramp. The same ErrBusy→errWALRetry conversion applies symmetrically to
-the in-process path's slot-0 fallback (`tryBeginReadInProcessHdr`) for
-consistency.
-
-**Test evidence:** `TestRapidCheckpointDuringOverflowWrites` 10/10 PASS
-after fix vs ~130k read errors before. Full any-store unit suite + the
-storetest stress slice (`TestStressSavepoint`, `TestStressReaderWriter`,
-`TestStressCheckpoint`) remain green.
-
-**Covered by:** `TestTryBeginReadMultiProcessHdr_AllSlotsBusyReturnsRetry`
-(internal/btree/wal_reader_retry_test.go).
-
 ### Freelist
 
+<a id="old-drift-freelist-trunk-fill-bound-corruption-ceiling"></a>
 **Freelist Formula Respects Reserved Space** -- Resolved (stale drift note)
+
+**Severity:** medium
 
 `freelistMaxLeaves()` uses `(p.usableSize() - 8) / 4` where `usableSize`
 is `pageSize - ReservedSpace`. Correct regardless of ReservedSpace
@@ -1704,56 +1667,18 @@ value. See `pager.go:1190-1192`. Note this equals `usableSize/4 - 2` — SQLite'
 freelist *corruption ceiling*, not its conservative fill bound `usableSize/4 - 8`,
 so any-store packs up to 6 more leaves per trunk than SQLite (see §10 drift).
 
+<a id="old-drift-no-btalloc-exact-le-modes"></a>
 **No BTALLOC_EXACT / BTALLOC_LE Modes** -- Severity: Minor
+
+**Severity:** low
 
 Only `BTALLOC_ANY` allocation mode. `BTALLOC_EXACT` and `BTALLOC_LE` are only
 needed for auto-vacuum and locality hints.
 
-**Reserved Space Used in Overflow Computations** -- Resolved (stale drift note)
-
-`overflowPageUsable(usableSize int)` takes `usableSize` as its parameter
-and all 7 callers pass `p.usableSize()` (which is
-`pageSize - ReservedSpace`). See `page.go:116-118`.
-
-### Multi-Process WAL Write Safety -- FIXED
-
-When `InProcess` is false (default on linux/darwin amd64/arm64), two separate OS
-processes can open the same database file. Multi-process writes are now safe
-thanks to three mechanisms:
-
-1. **BUSY_SNAPSHOT check** (`wal.beginWrite`): After acquiring the SHM write lock,
-   compares the reader's snapshot (`tx.walHdr`, passed as `readSnap` to
-   `beginWriteWithSnapshot`) against the current SHM header. If they differ, another
-   process committed between our `beginRead` and `beginWrite`, so we return
-   `ErrBusySnapshot`. Matches `sqlite3WalBeginWriteTransaction` (wal.c:3712).
-
-2. **WAL state re-sync** (`wal.beginWrite`): After the BUSY_SNAPSHOT check passes,
-   re-syncs `nFrame`, `cksum1/2`, and salts from the SHM header so `writeFrames`
-   uses correct offsets and checksum chains. Also clears `writerCache` via
-   `stateChanged` if another process committed since our last write.
-
-3. **SHM header sync in `tryBeginRead`**: For multi-process mode, reads `mxFrame`
-   and `nBackfill` from SHM instead of stale process-local atomics, so readers
-   see the latest committed state from other processes.
-
-**Internal retry in `DB.BeginWrite`** (resolved 2026-04-22): When `ErrBusySnapshot`
-is returned, the retry loop ends the stale read, clears `writerCache`, and
-re-calls `pager.beginRead` to get a fresh snapshot. Previously the loop had
-a hidden cap of 1000 attempts with no backoff. Now the loop tight-retries at
-most `busySnapshotInnerRetries` (= 3) times, then delegates to the configured
-`BusyHandler` for delays[]-table backoff (matching `sqliteDefaultBusyCallback`
-in `sqlitec/src/main.c:1717`), and finally surfaces `ErrBusySnapshot` to the
-caller — matching SQLite's `SQLITE_BUSY_SNAPSHOT` caller contract
-(`sqlitec/src/wal.c:3714`).
-
-**`writeHeader` parameterization**: `walIndex.writeHeader` now accepts explicit
-`frameCksum` and `salt` parameters so the SHM header always contains the correct
-running checksums and salts for frame chaining.
-
-Verified by `TestMultiProcessWALCorruption` which spawns a child OS process that
-writes to the same database file concurrently with the parent.
-
+<a id="old-drift-multiprocess-wal-structural-drift"></a>
 ### Multi-Process WAL Fix — Drift from SQLite
+
+**Severity:** low
 
 1. **writeHeader parameterization**: SQLite's `walIndexWriteHdr` (wal.c:942-954)
    copies `pWal->hdr` directly to SHM — no parameters. Our `walIndex.writeHeader`
@@ -1806,6 +1731,9 @@ below for why cold-open was attempted and reverted.
 
 **Drifts from SQLite's `walIndexReadHdr` preserved:**
 
+<a id="old-drift-ensureheader-triple-lock-recovery-gate"></a>
+**Severity:** low
+
 1. **Triple-lock recovery gate**: SQLite `walIndexRecover` takes
    `WAL_ALL_BUT_WRITE..READ_LOCK(0)` exclusive (wal.c:1400-1401). Our
    `recoverLocked` requires callers to hold `lockCheckpoint + lockRecover`
@@ -1821,6 +1749,9 @@ below for why cold-open was attempted and reverted.
    `sqlitec/src/os_unix.c:4872-4907`). Upstream `DB.BeginWrite` routes
    `ErrBusyRecovery` through the configured `BusyHandler` for proper
    backoff instead of spinning.
+
+<a id="old-drift-headerondisk-mxframe-inference"></a>
+**Severity:** low
 
 3. **`headerOnDisk` shortcut in `syncFromSHMLocked`**: we infer "on-disk WAL
    header exists" from `hdr.mxFrame > 0` rather than `fstat`-ing, relying on
@@ -1866,6 +1797,9 @@ for the design). Summary:
   now forces an affirmative decision.
 
 **Known preserved drifts:**
+<a id="old-drift-inprocess-skips-shm-hdr-on-commit"></a>
+**Severity:** low
+
 - In-process mode skips SHM hdr updates on commit (`writeFrames`
   `!w.inProcess` guard). `db.BeginRead`/`BeginWrite` synthesize a minimal
   `walHdr{isInit:1, mxFrame:maxFrame}` in that mode so read paths
@@ -1888,172 +1822,10 @@ for the design). Summary:
 Post-migration reliability sits in the ~93-100% band per 30-run sample,
 up from the ~77-95% pre-migration band.
 
-### Checkpoint latest-frame-per-page (resolved 2026-04-22)
-
-**Previously:** the backfill loop in `checkpointWithMode` wrote every
-frame's page to the DB file — a page rewritten N times in the WAL got
-written N times, most of them overwritten by later frames.
-
-**Now:** two-phase backfill — (1) `buildBackfillMap(lo, hi)` scans
-frame headers `[lo, hi)` and returns `map[pgno]frameIdx` keeping the
-latest frame per pgno; (2) iterate pgnos ascending for sequential
-DB-file write locality, writing each page exactly once. Matches
-SQLite's `walIteratorNext` (`sqlitec/src/wal.c:1758-1786`).
-
-**Invariants preserved:** `nBackfill` is still a frame-index cursor
-(crash recovery works unchanged); `nBackfillAttempted` is set before
-the write phase (partial-write detection still correct); in-memory
-mode uses the same dedup logic on `w.memFrames`.
-
-**Measured delta** (see
-`any-store-tests/results/session_perf/benchstat_ckpt_dedup_scratch.txt`):
-`Crud/BatchUpdate` sec/op **-7.97%** (p=0.022), alloc-neutral. Geomean
-flat (most benches don't stress checkpoint). The original dedup commit
-introduced a per-checkpoint map/slice allocation (naively matching
-SQLite's `walIteratorInit` + `walIteratorFree` at
-`sqlitec/src/wal.c:1929-1933` / `:1948` which also `malloc`s/`free`s
-per checkpoint). We can do better than SQLite here: any-store's
-single-writer invariant (`lockCheckpoint` held exclusive) lets us
-reuse `w.ckptLatest` + `w.ckptPgnos` scratch across checkpoints,
-erasing the allocation cost entirely.
-
-### Checkpoint mxFrame source fix (commit `9023f5b`)
-
-A ~4-5% residual failure persisted through all per-tx walHdr work
-because none of those steps touched `checkpointWithMode`'s mxFrame
-source. Root cause: `wal.go:checkpointWithMode` used
-`nf := w.index.mxCommitFrame.Load()` which is process-local. In
-multi-process mode, a sibling's committed frames appear in the SHM
-header but NOT in this process's local `mxCommitFrame`. Close-time
-`checkpointPassive` only backfilled THIS process's own frames, then
-`truncateFile` wiped the WAL — destroying sibling's uncopied frames.
-
-Fix: in multi-process mode, read `nf` from the live SHM hdr at
-checkpoint start. Matches SQLite's `walCheckpoint` which reads
-`pWal->hdr.mxFrame` populated by `walIndexTryHdr`.
-
-Reliability: 100/100 on the 100-run multi-process index harness.
-
-**Follow-up: same bug class in sibling sites.** A drift review flagged
-two more call sites with identical process-local reads:
-`checkpointPassive`'s completeness probe
-(`nBackfill >= mxCommitFrame.Load()` — controls whether `pager.close`
-truncates) and `checkpointPost`'s reset gate
-(`backfill < mxCommitFrame.Load()` — controls `tryResetWAL`). Stale
-local `mxCommitFrame` would falsely report "complete" / "ready to
-reset" after only backfilling our own frames.
-
-Fix: extracted helper `(w *wal) authoritativeMxFrame()` that reads SHM
-hdr in multi-process mode, falls back to `mxCommitFrame.LoadLocal()`
-otherwise. `checkpointWithMode`, `checkpointPassive`, and
-`checkpointPost` all use the helper. Mirrors SQLite's
-`pWal->hdr.mxFrame` usage throughout `walCheckpoint` (wal.c:2216,
-2227, 2309, 2341). Reader-path call sites (`shmHashGet`,
-`tryBeginReadInProcess`) intentionally retain the local read — those
-are per-tx snapshots that must not observe frames we haven't sync'd.
-
-**Compile-time guard added 2026-04-22.** `walIndex.mxCommitFrame` is
-now a `commitFrameCounter` (see `mxframe.go`) whose only reader is
-`LoadLocal()`; there is no plain `Load()`. Callers that want the
-cross-process authoritative value must go through
-`authoritativeMxFrame()`. A regressing commit that reads
-`mxCommitFrame.Load()` directly no longer compiles. The one production
-site still reading the local cursor in multi-process mode
-(`tryCheckpoint` in `pager.go`) now uses the authoritative accessor.
-
-### pager.close lockWrite gate
-
-Close-time checkpoint+truncate must hold `lockWrite` exclusive across
-both operations so a peer's in-flight `writeFrames` cannot race the
-truncate. Earlier code called `walBusyLock(lockWrite)` but discarded
-the error: on 5s timeout we proceeded without the lock, racing the
-peer and corrupting the WAL. The unconditional `unlock` at the end
-also released a slot we never acquired.
-
-Fix: track acquisition with a `lockedWrite bool`; truncate only when
-`lockedWrite || inProcess`; unlock only when we hold it. If lock
-acquisition fails, `checkpointPassive` still runs (it doesn't need
-the write lock) but truncate is skipped — WAL stays intact for the
-next opener. Mirrors SQLite's `sqlite3WalClose` which only calls
-`walLimitSize` inside the `SQLITE_OK==sqlite3OsLock(EXCLUSIVE)` arm
-(wal.c:2508-2536).
-
-**Structural guard added 2026-04-22.** The manual `lockedWrite bool` +
-trailing manual unlock has been replaced by
-`(*pager).withWriteLock(fn func(locked bool) error) error`, which
-acquires (or skips) the lock in one place and releases via `defer`. A
-future early-return or panic inside the closure cannot leak the lock.
-The close body is now the closure; correctness of the truncate gate
-no longer depends on the code path walking past the unlock line.
-Regression test: `TestWithWriteLock_AlwaysReleases` covers clean /
-error / panic return paths.
-
-### Race fixes evaluated and not ported
-
-#### SQLite `fe57e14b49` — checkpointer vs. writer WAL wrap (evaluated 2026-04-22, not applicable)
-
-Upstream SQLite commit `fe57e14b49` (2026-03-03, "Avoid an obscure race
-condition between a checkpointer and a writer wrapping around to the
-start of the wal file") adds a salt-revalidation check in
-`walCheckpoint()` right after acquiring `WAL_READ_LOCK(0)` exclusive:
-
-```c
-WalIndexHdr *pLive = (WalIndexHdr*)walIndexHdr(pWal);
-if( 0==memcmp(pLive->aSalt, pWal->hdr.aSalt, sizeof(pWal->hdr.aSalt)) ){
-    /* ... proceed with backfill ... */
-}
-```
-
-**The race in SQLite:**
-1. Checkpointer C snapshots `pWal->hdr.mxFrame=N, aSalt=S` via
-   `walIndexReadHdr`.
-2. C reads `pInfo->nBackfill` live (not snapshotted).
-3. Writer W runs `sqlite3WalBeginWriteTransaction → walRestartLog`,
-   briefly grabs `WAL_READ_LOCK(0)` exclusive, writes new salts `S'`,
-   sets `pInfo->nBackfill=0`, releases.
-4. C's `walBusyLock(WAL_READ_LOCK(0))` now succeeds (W released).
-5. Without the fix, C sees `nBackfill(0) < hdr.mxFrame(N)`, proceeds
-   to iterate frames 1..N using its stale snapshot, reads whatever W
-   has begun writing at those offsets, copies to wrong DB pages.
-
-**Key enabler in SQLite:** writers wrap the WAL without holding
-`CHECKPOINT_LOCK`.
-
-**Why the race cannot occur in any-store:**
-
-Salt regeneration (`rand.Uint32()`) happens at exactly two call sites:
-- `initHeaderStateLocked` (wal.go:1608-1609)
-- `writeHeader` (wal.go:1653-1654)
-
-All callers are either first-time open/recovery paths (no concurrent
-checkpointer yet exists) or `doResetWAL`. `doResetWAL` is reachable
-only via `tryResetWALWithBusy → checkpointPost → checkpointWithMode`,
-and `checkpointWithMode` holds `lockCheckpoint` exclusive throughout
-(wal.go:2780 + deferred unlock covering the entire body including
-`checkpointPost`). `lockCheckpoint` is fcntl-backed (shm_mmap.go:147),
-so it's genuinely cross-process exclusive.
-
-Writers never regenerate salts: `beginWriteWithSnapshot` copies
-existing salts from SHM (wal.go:2518-2519), `writeFrames` rewrites
-the SHM header preserving the existing `w.header.salt1/salt2`
-(wal.go:2054).
-
-Therefore: while any checkpointer is inside `checkpointWithMode`, no
-other actor — writer or checkpointer — can mutate salts. The
-snapshot-vs-backfill window SQLite's fix protects cannot observe a
-salt change in any-store.
-
-**Architectural difference:** SQLite permits writer-initiated wrap
-via `walRestartLog` inside `beginWriteTransaction` when
-`nBackfill == mxFrame`; any-store only wraps via
-`CheckpointRestart/Truncate` modes, which require `lockCheckpoint`.
-
-**Consequence:** fe57e14b49 is a no-op in any-store. If a future
-change introduces a writer-wrap path (e.g. auto-wrap in
-`beginWriteWithSnapshot` when `nBackfill == mxFrame`), that change
-must re-evaluate this invariant and include the salt-revalidation.
-
+<a id="old-drift-not-implemented-by-design"></a>
 ### Not Implemented (by design)
+
+**Severity:** low
 
 These SQLite features are intentionally absent:
 
@@ -2091,7 +1863,11 @@ same restart.
 Anystore-level `(*db).Backup(ctx, path)` drives the engine by opening
 a fresh destination DB at `path` with matching options.
 
+<a id="old-drift-backup-intentional-simplifications"></a>
 **Key intentional simplifications** (full list in the plan document):
+
+**Severity:** low
+
 - Always same-page-size: any-store is WAL-only, so `backup.c:378-383`'s
   `SQLITE_READONLY` for WAL+size-mismatch is our `ErrBackupPageSizeMismatch`
   at init. The cross-size packing path at `backup.c:449-528` is
@@ -2157,14 +1933,6 @@ exploit the partial ordering (`PartiallySorted`). This is verified by the
 benchmark `compound_rev/SortAscDesc` + `compound_rev/FilterSort` scenarios
 (any-store-tests), whose `Sort("a","-b")` now plans
 `IndexScan(a,-b) -> Fetch -> Limit` instead of `FullScan -> TopK`.
-
-**Classification: Aligned** -- the matching predicate (equality-prefix skip +
-single consistent composite direction) is a faithful port of SQLite's rule.
-any-store does not implement SQLite's `isOrderDistinct` / UNIQUE-NOT-NULL
-refinements (`where.c:5300,5363-5377`, tag-20210426-1) or the
-`WHERE_BIGNULL_SORT` NULLS-ordering handling -- they only affect whether
-*trailing* unconstrained columns can be elided or how NULLs sort, neither of
-which any-store's index/sort model exposes.
 
 ## Audit-Discovered Drifts (2026-05-29)
 

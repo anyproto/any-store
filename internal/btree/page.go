@@ -120,6 +120,7 @@ func overflowPageUsable(usableSize int) int {
 
 // localPayloadSize computes how many bytes of payload are stored locally
 // when total payload exceeds maxLocal. Uses SQLite's surplus algorithm.
+// DRIFT: Go has only index maxLocal/minLocal; SQLite's table maxLeaf/minLeaf pair absent (no table See docs/btree/NOTES.md#old-drift-index-only-local-payload-no-maxleaf-minleaf
 func localPayloadSize(totalPayload, usableSize int) int {
 	maxLocal := maxLocalPayload(usableSize)
 	if totalPayload <= maxLocal {
@@ -179,12 +180,13 @@ type dbHeader struct {
 }
 
 // serialize writes the database header to the first 100 bytes of buf.
+// DRIFT: DB header: 'BTree format 1' magic, version=1, KDF salt at 72-87, auto/incr-vacuum fields z See docs/btree/NOTES.md#old-drift-db-file-header-magic-version-salt-vacuum
 func (h *dbHeader) serialize(buf []byte) {
 	copy(buf[0:16], dbMagic)
 
 	var ps uint16
 	if h.PageSize >= 65536 {
-		ps = 1 // SQLite convention: page size 65536 stored as 1
+		ps = 1 // page size 65536 stored as 1
 	} else {
 		ps = uint16(h.PageSize)
 	}
@@ -205,7 +207,7 @@ func (h *dbHeader) serialize(buf []byte) {
 	binary.BigEndian.PutUint32(buf[44:48], h.SchemaFormat)
 	binary.BigEndian.PutUint32(buf[48:52], h.DefaultCacheSize)
 
-	// Largest root b-tree page number (not used for now)
+	// Largest root b-tree page / auto-vacuum (unused, 0)
 	binary.BigEndian.PutUint32(buf[52:56], 0)
 
 	binary.BigEndian.PutUint32(buf[56:60], h.TextEncoding)
