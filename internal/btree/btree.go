@@ -29,6 +29,28 @@ func SetDebugOverflowReadErrors(enabled bool) {
 	}
 }
 
+// Events reported by searchLeafOverflowProbe (test-only).
+const (
+	// searchProbePrefixShortCircuit is reported when the on-page local key
+	// prefix alone decides the ordering for an overflow cell, so the full
+	// overflow key is NOT read (the intended optimization win).
+	searchProbePrefixShortCircuit = iota
+	// searchProbeFullKeyRead is reported when the prefix compares equal on
+	// cmpLen and the search therefore falls through to a full leafFullKey
+	// read instead of making a truncated decision.
+	searchProbeFullKeyRead
+)
+
+// searchLeafOverflowProbe is a test-only hook for searchLeafWithOverflow's
+// overflow-key prefix shortcut. It is nil in production (the only cost is a
+// nil-check, and only on the overflow-key branch). Tests set it to pin the
+// by-design invariant documented at
+// docs/btree/NOTES.md#old-drift-binsearch-rawbytes-prefix-no-overflow-cache:
+// a truncated prefix decision (prefixCmp != 0) may short-circuit, but whenever
+// the prefix compares EQUAL on cmpLen the code MUST fall through to a full key
+// read so no decision is made on truncated bytes.
+var searchLeafOverflowProbe func(event int)
+
 // pathEntry records one level of the root-to-leaf descent performed by
 // Put/Delete/insertIntoParent. It mirrors SQLite's cursor stack pair
 // (apPage[i], aiIdx[i]) at btreeInt.h:553-556.
@@ -639,6 +661,9 @@ func searchLeafWithOverflow(pg *page, key []byte, usableSize int, p *pager, walM
 				prefixCmp := bytes.Compare(prefix[:cmpLen], key[:cmpLen])
 				if prefixCmp != 0 {
 					// Prefix alone determines ordering
+					if searchLeafOverflowProbe != nil {
+						searchLeafOverflowProbe(searchProbePrefixShortCircuit)
+					}
 					if prefixCmp < 0 {
 						lo = mid + 1
 					} else {
@@ -647,6 +672,9 @@ func searchLeafWithOverflow(pg *page, key []byte, usableSize int, p *pager, walM
 					continue
 				}
 				// Need full key — read from overflow
+				if searchLeafOverflowProbe != nil {
+					searchLeafOverflowProbe(searchProbeFullKeyRead)
+				}
 				var fkerr error
 				cellKey, fkerr = leafFullKey(data, off, usableSize, p, walMaxFrame, cache)
 				if fkerr != nil {
