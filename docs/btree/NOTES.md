@@ -1291,6 +1291,28 @@ validation (`sqlitec/src/wal.c:1406-1419`). Covered by
 `TestWalHeaderDeserialize_RejectsBadVersion` and
 `TestWalHeaderDeserialize_RejectsBadPageSize`.
 
+**Checkpoint DB-File Over-Sync** -- Resolved 2026-05-31
+
+`checkpointWithMode` no longer fdatasyncs the DB file before the truncate. SQLite
+syncs the DB once per checkpoint — post-truncate, in the full-backfill block only
+(`wal.c:2322-2327`) — and zero times on a partial backfill; copied pages stay
+recoverable from the WAL synced before the copy loop.
+
+**Eager WAL-Header Fsync on Checkpoint Reset** -- Resolved 2026-05-31
+
+`doResetWAL` defers the on-disk WAL-header rewrite+fdatasync to the lazy
+`flushHeader` path (next first-frame write), matching SQLite `walRestartHdr`
+(`wal.c:2363-2389`): the reset publishes only the SHM header (fresh salt), and
+TRUNCATE leaves a 0-byte WAL. Avoids an eager header fsync per RESTART/TRUNCATE
+checkpoint (routine via auto-checkpoint escalation, DRIFT-53).
+
+**Checkpoint Page-Size-Mismatch + Over-Grow Corruption Guards** -- Resolved 2026-05-31 (was DRIFT-52)
+
+`checkpointWithMode` adds the over-grow guard before the backfill loop
+(`nSize+65536+mxFrame*szPage < nReq` -> `ErrCorrupt`, `wal.c:2276-2294`), and
+`recoverLocked` validates the WAL header page size against the DB page size
+instead of adopting it (`walPagesize!=nBuf`, `wal.c:4386-4387`).
+
 <a id="old-drift-inmemory-wal-skips-checksums"></a>
 **In-Memory WAL Mode Skips Checksums** -- Severity: Minor (accepted)
 
@@ -2362,22 +2384,6 @@ progress. Go's `DB.Checkpoint` signature (`db.go:897`) drops both out-parameters
 The consequence is a reduced observability surface: callers cannot inspect how much of the
 WAL existed or was backfilled by a checkpoint, a benign API-completeness divergence rather
 than a correctness defect.
-
-<a id="drift-52-checkpoint-missing-page-size-mismatch-and-over-grow-corrupti"></a>
-### Drift: Checkpoint Missing Page Size Mismatch And Over Grow Corruption Guards
-- **Category:** changed-logic  -  **Severity:** low
-- **Affected functions:** `wal.go:*wal.checkpoint` (`internal/btree/wal.go:3040-3043`).
-
-SQLite's `sqlite3WalCheckpoint` carries two corruption guards the Go port omits: (1) a
-page-size sanity check `if( pWal->hdr.mxFrame && walPagesize(pWal)!=nBuf ) rc =
-SQLITE_CORRUPT_BKPT;` rejecting a checkpoint when the WAL's recorded page size disagrees with
-the configured page/buffer size (`wal.c:4386-4387`); and (2) inside `walCheckpoint`, an
-over-grow check `if( (nSize+65536+mxFrame*szPage)<nReq ) rc = SQLITE_CORRUPT_BKPT;` that flags
-corruption when the DB would need to grow implausibly far. The Go `checkpoint` path
-(`wal.go:3040-3043`) performs neither test. The consequence is that a corrupt WAL header (wrong
-page size) or an implausibly over-grown checkpoint that SQLite would refuse with
-`SQLITE_CORRUPT` is instead processed silently; the practical exposure is low because such
-states are themselves rare, but the defensive corruption detection is absent.
 
 <a id="drift-53-auto-checkpoint-escalates-to-wal-restart-beyond-passive"></a>
 ### Drift: Auto Checkpoint Escalates To WAL Restart Beyond Passive
