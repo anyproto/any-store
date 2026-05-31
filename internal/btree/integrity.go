@@ -88,8 +88,11 @@ func (ic *integrityChecker) checkRef(pgno uint32, context string) bool {
 
 // checkList validates a freelist (isFreeList=true) or overflow chain (isFreeList=false).
 // Port of SQLite's checkList() (btree.c:10705-10769).
-// DRIFT: checkList returns on over-large trunk leaf-count; SQLite reports and continues next trunk See docs/btree/NOTES.md#old-drift-checklist-aborts-walk-on-overlarge-trunk-leafcount
-// DRIFT: checkList reports freelist size mismatch unconditionally; SQLite suppresses if errors alre See docs/btree/NOTES.md#old-drift-checklist-unconditional-size-mismatch-report
+// On an over-large trunk leaf-count, checkList now reports and continues to the
+// next trunk (matching SQLite btree.c:10749-10778), and suppresses the trailing
+// size/length mismatch line when an error was already reported during the walk
+// (SQLite's nErrAtStart==pCheck->nErr guard, btree.c:10781). See historical
+// docs/btree/NOTES.md#old-drift-checklist-unconditional-size-mismatch-report
 func (ic *integrityChecker) checkList(isFreeList bool, firstPgno uint32, expected uint32) {
 	if ic.tooManyErrors() {
 		return
@@ -97,6 +100,12 @@ func (ic *integrityChecker) checkList(isFreeList bool, firstPgno uint32, expecte
 
 	pgno := firstPgno
 	count := uint32(0)
+	// SQLite captures the error count before the walk (nErrAtStart) and only
+	// emits the size/length mismatch if NO new errors were reported during the
+	// walk (btree.c:10781 `N && nErrAtStart==pCheck->nErr`). This suppresses a
+	// redundant wrong-count line when the chain was already flagged as corrupt
+	// (e.g. an over-large trunk leaf count above).
+	nErrAtStart := len(ic.errors)
 
 	for pgno != 0 {
 		if ic.tooManyErrors() {
@@ -127,19 +136,23 @@ func (ic *integrityChecker) checkList(isFreeList bool, firstPgno uint32, expecte
 			maxLeaves := uint32(ic.pager.freelistMaxLeaves())
 
 			if leafCount > maxLeaves {
+				// SQLite reports and continues to the next trunk rather than
+				// aborting the freelist walk (btree.c:10749-10764). The bogus
+				// leaf entries are NOT iterated and NOT counted toward `count`
+				// (C does an extra N-- here, i.e. one phantom page, but skips
+				// N-=n). Control falls through to the next-trunk pointer below.
 				ic.report("freelist: leaf count %d too big on trunk page %d (max %d)", leafCount, pgno, maxLeaves)
-				ic.pager.releasePage(pg)
-				return
-			}
-
-			for i := uint32(0); i < leafCount; i++ {
-				if ic.tooManyErrors() {
-					ic.pager.releasePage(pg)
-					return
-				}
-				leafPgno := binary.BigEndian.Uint32(pg.data[8+i*4:])
-				ic.checkRef(leafPgno, "freelist leaf")
 				count++
+			} else {
+				for i := uint32(0); i < leafCount; i++ {
+					if ic.tooManyErrors() {
+						ic.pager.releasePage(pg)
+						return
+					}
+					leafPgno := binary.BigEndian.Uint32(pg.data[8+i*4:])
+					ic.checkRef(leafPgno, "freelist leaf")
+					count++
+				}
 			}
 
 			pgno = binary.BigEndian.Uint32(pg.data[0:4])
@@ -152,11 +165,11 @@ func (ic *integrityChecker) checkList(isFreeList bool, firstPgno uint32, expecte
 	}
 
 	if isFreeList {
-		if count != expected {
+		if count != expected && nErrAtStart == len(ic.errors) {
 			ic.report("freelist: expected %d pages but found %d", expected, count)
 		}
 	} else {
-		if count != expected {
+		if count != expected && nErrAtStart == len(ic.errors) {
 			ic.report("tree %s: overflow chain length is %d but should be %d", ic.treeName, count, expected)
 		}
 	}

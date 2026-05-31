@@ -411,3 +411,116 @@ func TestIntegrityErrorFormat(t *testing.T) {
 	ie := &IntegrityError{Errors: []string{"error 1", "error 2"}}
 	assert.Equal(t, "error 1\nerror 2", ie.Error())
 }
+
+// TestCheckListOverlargeTrunkContinuesWalk is a regression test for the drift
+// where checkList() aborted the entire freelist walk on an over-large trunk
+// leaf-count (early return) instead of reporting and continuing to the next
+// trunk, as SQLite's checkList() does (btree.c:10749-10778).
+//
+// It builds a two-trunk freelist:
+//
+//	trunk A (corrupt): next = trunk B, leafCount field = maxLeaves+1, no real leaves
+//	trunk B (valid):   next = 0,       leafCount = 2, leaves = [L1, L2]
+//
+// Before the fix, checkList reports "leaf count too big" on trunk A and then
+// returns — so trunk B, L1 and L2 are never referenced and the orphan loop
+// reports three spurious "page N: never used" errors. After the fix, the walk
+// continues into trunk B, references B/L1/L2, and the only error is the single
+// "leaf count too big" line. The redundant freelist size mismatch is also
+// suppressed (SQLite's nErrAtStart==pCheck->nErr guard, btree.c:10781).
+func TestCheckListOverlargeTrunkContinuesWalk(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	db, err := testOpen(t, path, DefaultOptions())
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Put a little data so the DB is non-trivial and page 1 is a real root.
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("test")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("k"), []byte("v")))
+	require.NoError(t, tx.Commit())
+	require.NoError(t, db.IntegrityCheck())
+
+	// Construct the two-trunk freelist by hand.
+	tx2, err := db.BeginWrite()
+	require.NoError(t, err)
+
+	// Allocate four fresh pages: two trunks and two leaves for trunk B.
+	trunkA, err := db.pager.allocatePage()
+	require.NoError(t, err)
+	tAno := trunkA.pgno
+	db.pager.releasePage(trunkA)
+
+	trunkB, err := db.pager.allocatePage()
+	require.NoError(t, err)
+	tBno := trunkB.pgno
+	db.pager.releasePage(trunkB)
+
+	leaf1, err := db.pager.allocatePage()
+	require.NoError(t, err)
+	l1no := leaf1.pgno
+	db.pager.releasePage(leaf1)
+
+	leaf2, err := db.pager.allocatePage()
+	require.NoError(t, err)
+	l2no := leaf2.pgno
+	db.pager.releasePage(leaf2)
+
+	maxLeaves := uint32(db.pager.freelistMaxLeaves())
+
+	// Trunk B: valid trunk holding two real leaves, terminates the list.
+	wB, err := db.pager.getWritablePage(tBno)
+	require.NoError(t, err)
+	clear(wB.data)
+	binary.BigEndian.PutUint32(wB.data[0:4], 0)     // next trunk = 0 (last)
+	binary.BigEndian.PutUint32(wB.data[4:8], 2)     // leaf count
+	binary.BigEndian.PutUint32(wB.data[8:12], l1no) // leaf 1
+	binary.BigEndian.PutUint32(wB.data[12:16], l2no)
+	wB.header = pageHeader{}
+	db.pager.releasePage(wB)
+
+	// Trunk A: CORRUPT leaf count (> maxLeaves), no real leaf entries, links
+	// to trunk B. The over-large count must NOT abort the walk.
+	wA, err := db.pager.getWritablePage(tAno)
+	require.NoError(t, err)
+	clear(wA.data)
+	binary.BigEndian.PutUint32(wA.data[0:4], tBno)        // next trunk = B
+	binary.BigEndian.PutUint32(wA.data[4:8], maxLeaves+1) // CORRUPT leaf count
+	wA.header = pageHeader{}
+	db.pager.releasePage(wA)
+
+	// Point the header at trunk A. The four pages we allocated are all on the
+	// freelist now (trunk A, trunk B, L1, L2). We deliberately set a count that
+	// does NOT match the walk's found count to prove the mismatch line is
+	// suppressed once the "too big" error has been reported.
+	db.pager.header.FirstFreelistPg = tAno
+	db.pager.header.TotalFreelistPgs = 4
+	require.NoError(t, tx2.Commit())
+
+	err = db.IntegrityCheck()
+	require.Error(t, err)
+	ie, ok := err.(*IntegrityError)
+	require.True(t, ok, "expected *IntegrityError, got %T: %v", err, err)
+
+	var tooBig, neverUsed, mismatch int
+	for _, e := range ie.Errors {
+		switch {
+		case strings.Contains(e, "leaf count") && strings.Contains(e, "too big"):
+			tooBig++
+		case strings.Contains(e, "never used"):
+			neverUsed++
+		case strings.Contains(e, "expected") && strings.Contains(e, "but found"):
+			mismatch++
+		}
+	}
+
+	assert.Equal(t, 1, tooBig, "expected exactly one over-large leaf count report, got: %v", ie.Errors)
+	// The key regression assertion: the walk must continue past trunk A and
+	// reference trunk B, L1, L2 — so none of them are reported as orphans.
+	assert.Equal(t, 0, neverUsed, "walk aborted on over-large trunk: trunk B and its leaves were left as orphans: %v", ie.Errors)
+	// And the redundant size-mismatch line must be suppressed.
+	assert.Equal(t, 0, mismatch, "redundant freelist size mismatch was not suppressed: %v", ie.Errors)
+}

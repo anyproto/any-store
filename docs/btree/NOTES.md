@@ -846,13 +846,6 @@ input. Auto-vacuum and PENDING_BYTE checks are absent because those features don
 page to detect ciphertext tampering or bit-rot. No SQLite analogue: stock SQLite has no
 page-level MAC, and this is the codec layer's own consistency check. Any-store-specific.
 
-<a id="old-drift-checklist-aborts-walk-on-overlarge-trunk-leafcount"></a>
-**Severity:** low
-
-**Two diagnostic-quality drifts in `checkList`** (corrupt-input only, no effect on healthy
-DBs): on an over-large trunk leaf-count it `return`s (aborting the whole freelist walk)
-where SQLite reports and continues to the next trunk (btree.c:10778) — so later trunk pages
-are then reported as orphans;
 <a id="old-drift-checklist-unconditional-size-mismatch-report"></a>
 **Severity:** low
 and it emits the size/overflow count-mismatch message
