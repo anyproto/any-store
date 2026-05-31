@@ -2,7 +2,7 @@ package anystore
 
 /*
 Regression tests for correctness bugs found by the docs/qplanner audit
-(see docs/qplanner/audit/findings.json). Each test failed before its fix and
+(see docs/qplanner/CORRECTIONS.md). Each test failed before its fix and
 passes after. Fixes live in internal/qplanner/planner.go.
 
   bug-01  Mixed-direction compound index (a,-b) returned the wrong within-group
