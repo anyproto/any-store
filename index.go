@@ -228,13 +228,25 @@ func (idx *index) writeValues(d *anyenc.Value, i int) bool {
 		return false
 	}
 
+	// Reverse-flagged fields are stored bitwise-inverted so a single forward
+	// index scan yields the field's declared (descending) order; readers skip
+	// such fields via the inverted-tag length path in anyenc.parseValue. The
+	// docId suffix appended later (insertKeys/deleteKeys) and the per-entry
+	// value flag are NEVER inverted. Inversion is a bijection, so the unique
+	// dedup (isUnique) and unique-constraint seek still compare correctly.
+	reverse := i < len(idx.reverse) && idx.reverse[i]
+
 	k := idx.keyBuf
 	if v != nil && v.Type() == anyenc.TypeArray {
 		arr, _ := v.Array()
 		if len(arr) != 0 {
 			idx.uniqBuf[i] = idx.uniqBuf[i][:0]
 			for _, av := range arr {
-				idx.keyBuf = av.MarshalTo(k)
+				if reverse {
+					idx.keyBuf = anyenc.Tuple(k).AppendInverted(av)
+				} else {
+					idx.keyBuf = av.MarshalTo(k)
+				}
 				if idx.isUnique(i, idx.keyBuf) {
 					if !idx.writeValues(d, i+1) {
 						return false
@@ -244,7 +256,11 @@ func (idx *index) writeValues(d *anyenc.Value, i int) bool {
 		}
 	}
 
-	idx.keyBuf = v.MarshalTo(k)
+	if reverse {
+		idx.keyBuf = anyenc.Tuple(k).AppendInverted(v)
+	} else {
+		idx.keyBuf = v.MarshalTo(k)
+	}
 	return idx.writeValues(d, i+1)
 }
 

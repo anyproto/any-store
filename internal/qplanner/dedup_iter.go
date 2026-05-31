@@ -39,7 +39,14 @@ type CanonicalKeyDedupIter struct {
 	Plan      *Plan
 	Bounds    query.Bounds
 	FieldPath []string // path of the multi-key field (e.g. ["tags"] or ["meta", "labels"])
-	Reverse   bool     // match IndexIter.Reverse
+	Reverse   bool     // match IndexIter.Reverse (physical scan direction)
+
+	// FieldReverse is the index field's declared reverse flag. When true the
+	// index stores the field bitwise-inverted, so fieldVal (sliced from the
+	// stored key) and it.Bounds are both in the inverted (stored) byte space.
+	// Array elements are then re-encoded inverted before comparison so the
+	// canonical-element selection happens in the same space the cursor walks.
+	FieldReverse bool
 
 	keyBuf []byte // reusable encode buffer for min/max comparison
 	best   []byte // reusable buffer for the canonical element
@@ -76,7 +83,13 @@ func (it *CanonicalKeyDedupIter) Next() (key []byte, docId []byte, multiKey bool
 		it.best = it.best[:0]
 		noBounds := len(it.Bounds) == 0
 		for _, item := range items {
-			it.keyBuf = item.MarshalTo(it.keyBuf[:0])
+			// Encode in the same byte space as fieldVal and Bounds: inverted
+			// (stored) for a reverse field, plain ascending otherwise.
+			if it.FieldReverse {
+				it.keyBuf = anyenc.Tuple(it.keyBuf[:0]).AppendInverted(item)
+			} else {
+				it.keyBuf = item.MarshalTo(it.keyBuf[:0])
+			}
 			if !noBounds && !it.Bounds.Contains(it.keyBuf) {
 				continue
 			}

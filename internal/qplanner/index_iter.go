@@ -300,19 +300,36 @@ func (it *IndexIter) skipOffset(n int) (remaining int, err error) {
 // (array) entry. See docs/specs/2026-05-28-i04-i05-fix-option-d-canonical-key-probe.md.
 var arrayPrefix = []byte{byte(anyenc.TypeArray)}
 
+// arrayPrefixInverted is the array tag for a REVERSE-flagged single-field index.
+// Such an index stores the whole-array key bitwise-inverted (index.go
+// writeValues), so its leading byte is ^TypeArray (0xF9) instead of 0x06.
+var arrayPrefixInverted = []byte{^byte(anyenc.TypeArray)}
+
+// arrayProbePrefix returns the leading byte the probe must seek to detect a
+// multi-key (array) entry: the inverted array tag for a reverse single-field
+// index, the plain array tag otherwise.
+func arrayProbePrefix(reverse bool) []byte {
+	if reverse {
+		return arrayPrefixInverted
+	}
+	return arrayPrefix
+}
+
 // indexProbeAnyMultiKey reports whether the index namespace has any entry whose
 // key begins with the array type tag — i.e. whether any indexed doc had an
 // array-typed value. It is a single btree Seek, snapshot-consistent with the
-// caller's read tx.
+// caller's read tx. fieldReverse selects the inverted array tag for a reverse
+// single-field index.
 //
 // PRECONDITION: only valid for single-field indexes. For a compound index the
-// array field's value is not at byte position 0 of the key, so its 0x06 byte
-// sits mid-key and Seek(arrayPrefix) would miss it (false negative). Callers
-// must route compound/non-PointLookup shapes elsewhere before probing.
-func indexProbeAnyMultiKey(cs *CursorSource) (bool, error) {
+// array field's value is not at byte position 0 of the key, so its array tag
+// sits mid-key and the Seek would miss it (false negative). Callers must route
+// compound/non-PointLookup shapes elsewhere before probing.
+func indexProbeAnyMultiKey(cs *CursorSource, fieldReverse bool) (bool, error) {
 	c := cs.NewCursor()
 	defer c.Close()
-	if err := c.Seek(arrayPrefix); err != nil {
+	prefix := arrayProbePrefix(fieldReverse)
+	if err := c.Seek(prefix); err != nil {
 		return false, err
 	}
 	if !c.Valid() {
@@ -322,7 +339,7 @@ func indexProbeAnyMultiKey(cs *CursorSource) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return len(k) > 0 && k[0] == byte(anyenc.TypeArray), nil
+	return len(k) > 0 && k[0] == prefix[0], nil
 }
 
 // CountEntries counts distinct documents matching this index iterator's
@@ -389,7 +406,10 @@ func (it *IndexIter) probeMultiKey() (bool, error) {
 	if it.indexHasMultiKeyProbed {
 		return it.indexHasMultiKey, nil
 	}
-	has, err := indexProbeAnyMultiKey(it.Source)
+	// CountEntries only reaches here for single-field indexes (it gates on
+	// len(FieldNames)==1), so Reverse[0] is the array field's direction.
+	fieldReverse := len(it.IdxInfo.Reverse) > 0 && it.IdxInfo.Reverse[0]
+	has, err := indexProbeAnyMultiKey(it.Source, fieldReverse)
 	if err != nil {
 		return false, err
 	}

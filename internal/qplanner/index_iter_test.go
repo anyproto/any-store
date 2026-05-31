@@ -667,7 +667,7 @@ func TestIndexProbeAnyMultiKey(t *testing.T) {
 			require.NoError(t, err)
 			defer func() { _ = rtx.Rollback() }()
 
-			got, err := indexProbeAnyMultiKey(&CursorSource{Tx: rtx, Ns: ns})
+			got, err := indexProbeAnyMultiKey(&CursorSource{Tx: rtx, Ns: ns}, false)
 			require.NoError(t, err)
 			assert.Equal(t, tc.want, got)
 		})

@@ -5,12 +5,14 @@ Regression tests for correctness bugs found by the docs/qplanner audit
 (see docs/qplanner/CORRECTIONS.md). Each test failed before its fix and
 passes after. Fixes live in internal/qplanner/planner.go.
 
-  bug-01  Mixed-direction compound index (a,-b) returned the wrong within-group
-          order: IndexSortMatch claimed ExactSort for an order the all-ascending
-          physical storage cannot realize via a single scan direction.
-  bug-01b A reverse-declared covering filter field made coveringFilterFields
-          bitwise-invert the match value, so IndexFilterIter matched nothing and
-          dropped every row.
+  bug-01  Mixed-direction compound index (a,-b) is stored with reverse-flagged
+          fields bitwise-inverted, so a single forward scan yields (a asc, b desc)
+          and a reverse scan (a desc, b asc). Sort(a,-b) / Sort(-a,b) are served by
+          a FAST index scan with NO in-memory Sort; only genuinely-unrealizable
+          orders (e.g. Sort(a,b) on an (a,-b) index) fall back to in-memory sort.
+  bug-01b A reverse-declared covering filter field is stored inverted, so
+          coveringFilterFields bitwise-inverts the match value to match the stored
+          key bytes; IndexFilterIter then compares correctly and drops no rows.
   bug-02  Skip-middle compound Count over-counted: indexCoversFilter gated on ALL
           index fields instead of the contiguously-bounded prefix, so a trailing
           equality outside the bound prefix was ignored by the covering count.
@@ -60,9 +62,10 @@ func auditIntField(t testing.TB, q Query, field string) []int {
 	return out
 }
 
-// bug-01: a mixed-direction compound index must yield the same order as the
-// (correct) in-memory sort. The index can't physically realize the mixed order,
-// so the planner must fall back to an in-memory sort rather than mis-serve it.
+// bug-01: a mixed-direction compound index (a,-b) is stored inverted so a single
+// forward scan realizes (a asc, b desc). Sort(a,-b) and Sort(-a,b) must be served
+// by a FAST index scan (no in-memory Sort), matching the unindexed twin's order.
+// Sort(a,b) is genuinely unrealizable by one scan and falls back to in-memory sort.
 func TestIndex_Audit_MixedDirCompound_CorrectOrder(t *testing.T) {
 	mk := func(withIndex bool) Collection {
 		fx := newFixture(t)
@@ -80,6 +83,27 @@ func TestIndex_Audit_MixedDirCompound_CorrectOrder(t *testing.T) {
 	idx, noidx := mk(true), mk(false)
 	assert.Equal(t, auditABPairs(t, noidx, "a", "-b"), auditABPairs(t, idx, "a", "-b"), "Sort(a,-b)")
 	assert.Equal(t, auditABPairs(t, noidx, "-a", "b"), auditABPairs(t, idx, "-a", "b"), "Sort(-a,b)")
+	assert.Equal(t, auditABPairs(t, noidx, "a", "b"), auditABPairs(t, idx, "a", "b"), "Sort(a,b)")
+
+	// Sort(a,-b) is served by a FORWARD index scan: no in-memory Sort.
+	exFwd, err := idx.Find(nil).Sort("a", "-b").Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, exFwd.Sql, "IndexScan(a,-b)")
+	assert.NotContains(t, exFwd.Sql, "(reverse)")
+	assert.NotContains(t, exFwd.Sql, "-> Sort")
+
+	// Sort(-a,b) is the exact opposite: a REVERSE index scan, still no Sort.
+	exRev, err := idx.Find(nil).Sort("-a", "b").Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, exRev.Sql, "IndexScan(a,-b)")
+	assert.Contains(t, exRev.Sql, "(reverse)")
+	assert.NotContains(t, exRev.Sql, "-> Sort")
+
+	// Sort(a,b) cannot be realized by a single scan direction → in-memory Sort.
+	exMixed, err := idx.Find(nil).Sort("a", "b").Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, exMixed.Sql, "-> Sort", "Sort(a,b) on (a,-b) must fall back to in-memory sort")
+
 	// Explicit within-group check for Sort(a,-b): b strictly tracked descending.
 	prevA, prevB, first := -1, -1, true
 	for _, p := range auditABPairs(t, idx, "a", "-b") {
@@ -195,8 +219,11 @@ func TestIndex_Audit_OffsetWithoutLimit_InMemorySort(t *testing.T) {
 	})
 }
 
-// baseline: single-field reverse indexes scan-direction must stay correct
-// (the bug-01 fix must not regress single-field reverse).
+// baseline: a single-field reverse index (-a) stores values inverted, so a
+// FORWARD scan yields descending order. Sort("-a") is therefore served by a
+// forward scan (NO "(reverse)"), and Sort("a") by a reverse scan — both with no
+// in-memory Sort. (Before the invert-on-write redesign, shouldReverse picked the
+// wrong direction here.)
 func TestIndex_Audit_SingleReverse_Baseline(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "c")
@@ -208,4 +235,18 @@ func TestIndex_Audit_SingleReverse_Baseline(t *testing.T) {
 	assert.Equal(t, []int{0, 1, 2, 3, 4, 5, 6, 7}, auditIntField(t, coll.Find(nil).Sort("a"), "a"))
 	assert.Equal(t, []int{7, 6, 5, 4, 3, 2, 1, 0}, auditIntField(t, coll.Find(nil).Sort("-a"), "a"))
 	assert.Equal(t, []int{3, 4, 5, 6}, auditIntField(t, coll.Find(`{"a":{"$gte":3,"$lte":6}}`).Sort("a"), "a"))
+
+	// Sort("-a") == the index's declared direction → FORWARD scan, no Sort.
+	exDesc, err := coll.Find(nil).Sort("-a").Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, exDesc.Sql, "IndexScan(-a)")
+	assert.NotContains(t, exDesc.Sql, "(reverse)")
+	assert.NotContains(t, exDesc.Sql, "-> Sort")
+
+	// Sort("a") == opposite of declared → REVERSE scan, still no Sort.
+	exAsc, err := coll.Find(nil).Sort("a").Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, exAsc.Sql, "IndexScan(-a)")
+	assert.Contains(t, exAsc.Sql, "(reverse)")
+	assert.NotContains(t, exAsc.Sql, "-> Sort")
 }

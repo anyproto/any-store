@@ -107,12 +107,41 @@ func parseValue(b []byte, c *cache) (v *Value, tail []byte, err error) {
 	if len(b) == 0 {
 		return nil, nil, fmt.Errorf("expected value, but got 0 byte")
 	}
-	switch Type(b[0]) {
+	// Index keys store reverse-flagged fields bitwise-inverted (see
+	// index.go writeValues / anyenc.Tuple.AppendInverted). An inverted
+	// field's leading tag byte is ^Type(n) (e.g. iTypeNumber=0xFD), which
+	// the normal switch below treats as an unknown type. The readers that
+	// skip over such fields (Tuple.OffsetAfter/FieldBytes/ReadBytes, which
+	// call parseValue with c==nil) only need the correct field LENGTH, never
+	// a decoded *Value. So we normalize the inverted tag to its base type and
+	// run the same length computation, scanning for the inverted terminator
+	// (^EOS == 0xFF) where the normal path uses EOS. Decoding inverted bytes
+	// into a *Value (c != nil) is intentionally unsupported: it keeps the hot
+	// document-parse path's "unknown type" guard for corrupt input intact, and
+	// no production reader decodes an inverted index-key field (only the cosmetic
+	// Explain Bound.String() path would, where a decode error renders harmlessly).
+	t0 := b[0]
+	inverted := t0 >= byte(iTypeCompressedObjectS2) && t0 <= byte(iTypeNull) // 0xF6..0xFE
+	nt := Type(t0)
+	eos := byte(EOS)
+	if inverted {
+		if c != nil {
+			return nil, nil, fmt.Errorf("unknown type %d", Type(t0))
+		}
+		nt = ^Type(t0)
+		eos = ^byte(EOS) // 0xFF
+	}
+	switch nt {
 	case TypeString:
-		eosIdx := bytes.IndexByte(b, EOS)
-		if eosIdx < 0 {
+		// Search from index 1 so the leading tag byte is never mistaken for
+		// the terminator (the inverted tag 0xFD..0xFE differs from 0xFF, but
+		// the normal tag 0x03 also differs from 0x00 — searching from 1 keeps
+		// both paths correct and symmetric).
+		rel := bytes.IndexByte(b[1:], eos)
+		if rel < 0 {
 			return nil, nil, fmt.Errorf("end of string not found")
 		}
+		eosIdx := rel + 1
 		if c != nil {
 			v = c.getValue()
 			v.t = TypeString
@@ -131,11 +160,11 @@ func parseValue(b []byte, c *cache) (v *Value, tail []byte, err error) {
 		}
 		return v, b[9:], nil
 	case TypeBinary:
-		return parseBinary(b[1:], c)
+		return parseBinary(b[1:], c, inverted)
 	case TypeObject:
-		return parseObject(b[1:], c)
+		return parseObject(b[1:], c, eos)
 	case TypeArray:
-		return parseArray(b[1:], c)
+		return parseArray(b[1:], c, eos)
 	case TypeTrue:
 		return valueTrue, b[1:], nil
 	case TypeFalse:
@@ -143,13 +172,24 @@ func parseValue(b []byte, c *cache) (v *Value, tail []byte, err error) {
 	case TypeNull:
 		return valueNull, b[1:], nil
 	case TypeCompressedObjectS2:
+		// Compression is whole-document only; a compressed object never
+		// appears inside an index key, so its inverted form is unreachable.
+		// The non-inverted form is handled normally below.
+		if inverted {
+			return nil, nil, fmt.Errorf("unknown type %d", Type(t0))
+		}
 		return parseCompressedObjectS2(b, c)
 	default:
-		return nil, nil, fmt.Errorf("unknown type %d", Type(b[0]))
+		return nil, nil, fmt.Errorf("unknown type %d", Type(t0))
 	}
 }
 
-func parseObject(b []byte, c *cache) (*Value, []byte, error) {
+// parseObject parses an object body (after the leading object tag). eos is the
+// terminator/separator byte: EOS (0x00) for a normal object, ^EOS (0xFF) for an
+// inverted (reverse index-key) object. When the object is inverted, c is always
+// nil (decode of inverted bytes is unsupported); only length matters, so the
+// inverted key bytes are skipped via the inverted terminator without decoding.
+func parseObject(b []byte, c *cache, eos byte) (*Value, []byte, error) {
 	var o *Value
 	if c != nil {
 		o = c.getValue()
@@ -162,10 +202,10 @@ func parseObject(b []byte, c *cache) (*Value, []byte, error) {
 		if len(b) == 0 {
 			return nil, nil, fmt.Errorf("parse object: unexpected end")
 		}
-		if b[0] == EOS {
+		if b[0] == eos {
 			return o, b[1:], nil
 		}
-		eosI := bytes.IndexByte(b, EOS)
+		eosI := bytes.IndexByte(b, eos)
 		if eosI < 0 {
 			return nil, nil, fmt.Errorf("parse object key: end of string not found")
 		}
@@ -188,7 +228,13 @@ func parseObject(b []byte, c *cache) (*Value, []byte, error) {
 	}
 }
 
-func parseArray(b []byte, c *cache) (*Value, []byte, error) {
+// parseArray parses an array body (after the leading array tag). eos is the
+// element terminator: EOS (0x00) for a normal array, ^EOS (0xFF) for an inverted
+// (reverse index-key) array. Each element is parsed by parseValue, which
+// self-normalizes inverted element tags; only the array's own terminator needs
+// the eos byte. An inverted element's leading tag (0xF6..0xFE) never collides
+// with the inverted terminator 0xFF, so the b[0]==eos check is unambiguous.
+func parseArray(b []byte, c *cache, eos byte) (*Value, []byte, error) {
 	var a *Value
 	if c != nil {
 		a = c.getValue()
@@ -202,7 +248,7 @@ func parseArray(b []byte, c *cache) (*Value, []byte, error) {
 		if len(b) == 0 {
 			return nil, nil, fmt.Errorf("parse array: unexpected end")
 		}
-		if b[0] == EOS {
+		if b[0] == eos {
 			return a, b[1:], nil
 		}
 		if val, b, err = parseValue(b, c); err != nil {
@@ -216,11 +262,22 @@ func parseArray(b []byte, c *cache) (*Value, []byte, error) {
 	}
 }
 
-func parseBinary(b []byte, c *cache) (*Value, []byte, error) {
+// parseBinary parses a binary body (after the leading binary tag). When
+// inverted (reverse index-key, c always nil), the 4-byte big-endian length
+// header is itself bitwise-inverted; un-invert it to recover the payload length
+// so the field can be skipped. The payload bytes are not decoded on this path.
+func parseBinary(b []byte, c *cache, inverted bool) (*Value, []byte, error) {
 	if len(b) < 4 {
 		return nil, nil, fmt.Errorf("expected minimum 4 byte for binary header, but got %d", len(b))
 	}
-	l := binary.BigEndian.Uint32(b)
+	var l uint32
+	if inverted {
+		var hdr [4]byte
+		hdr[0], hdr[1], hdr[2], hdr[3] = ^b[0], ^b[1], ^b[2], ^b[3]
+		l = binary.BigEndian.Uint32(hdr[:])
+	} else {
+		l = binary.BigEndian.Uint32(b)
+	}
 	if len(b[4:]) < int(l) {
 		return nil, nil, fmt.Errorf("expected %d bytes to read binary, but got %d", l, len(b)-4)
 	}

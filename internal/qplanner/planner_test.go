@@ -329,25 +329,26 @@ func TestCalculateSelectivity_NoIndexes(t *testing.T) {
 
 func TestIndexSortMatch_ExactMatch(t *testing.T) {
 	idx := &IndexInfo{FieldNames: []string{"a", "b"}}
-	exact, partial := IndexSortMatch(idx, []query.SortField{
+	exact, partial, ms := IndexSortMatch(idx, []query.SortField{
 		{Field: "a"},
 		{Field: "b"},
 	}, 0)
 	assert.True(t, exact)
 	assert.False(t, partial)
+	assert.Equal(t, 0, ms)
 }
 
 func TestIndexSortMatch_PartialMatch(t *testing.T) {
 	// Index (a, b, c), sort on (a) → all sort fields matched = exactSort
 	idx := &IndexInfo{FieldNames: []string{"a", "b", "c"}}
-	exact, partial := IndexSortMatch(idx, []query.SortField{
+	exact, partial, _ := IndexSortMatch(idx, []query.SortField{
 		{Field: "a"},
 	}, 0)
 	assert.True(t, exact)
 	assert.False(t, partial)
 
 	// Index (a, b, c), sort on (a, b, d) → first 2 matched but not all = partialSort
-	exact2, partial2 := IndexSortMatch(idx, []query.SortField{
+	exact2, partial2, _ := IndexSortMatch(idx, []query.SortField{
 		{Field: "a"},
 		{Field: "b"},
 		{Field: "d"},
@@ -358,7 +359,7 @@ func TestIndexSortMatch_PartialMatch(t *testing.T) {
 
 func TestIndexSortMatch_NoMatch(t *testing.T) {
 	idx := &IndexInfo{FieldNames: []string{"a", "b"}}
-	exact, partial := IndexSortMatch(idx, []query.SortField{
+	exact, partial, _ := IndexSortMatch(idx, []query.SortField{
 		{Field: "c"},
 	}, 0)
 	assert.False(t, exact)
@@ -368,17 +369,18 @@ func TestIndexSortMatch_NoMatch(t *testing.T) {
 func TestIndexSortMatch_EqualityPrefix(t *testing.T) {
 	// Index (a, b), filter pins a, sort on b → should match via prefix skip
 	idx := &IndexInfo{FieldNames: []string{"a", "b"}}
-	exact, partial := IndexSortMatch(idx, []query.SortField{
+	exact, partial, ms := IndexSortMatch(idx, []query.SortField{
 		{Field: "b"},
 	}, 1)
 	assert.True(t, exact)
 	assert.False(t, partial)
+	assert.Equal(t, 1, ms, "matched run starts at the equality-pinned prefix position")
 }
 
 func TestIndexSortMatch_FullyPinned(t *testing.T) {
 	// Index (a), filter pins a, sort on a → should still match (Try 1)
 	idx := &IndexInfo{FieldNames: []string{"a"}}
-	exact, partial := IndexSortMatch(idx, []query.SortField{
+	exact, partial, _ := IndexSortMatch(idx, []query.SortField{
 		{Field: "a"},
 	}, 1)
 	assert.True(t, exact)
@@ -2040,12 +2042,12 @@ func TestCoveringFilterFields(t *testing.T) {
 			assert.Equal(t, []byte{0x11, 0x22}, got[0].MatchValue)
 		}
 	})
-	t.Run("reverse_field_not_inverted", func(t *testing.T) {
-		// Index keys store every field ascending (writeValues never inverts
-		// reverse-flagged fields), so the covering-filter match value must be
-		// the RAW encoded bytes even for a reverse-declared field. Inverting
-		// here would never match the ascending-stored key bytes and would drop
-		// every row (the IndexFilter would return nothing).
+	t.Run("reverse_field_inverted", func(t *testing.T) {
+		// Reverse-flagged fields are stored bitwise-inverted (writeValues), so
+		// IndexFilterIter compares key.FieldBytes (inverted stored bytes) against
+		// MatchValue. The covering-filter match value must therefore be the
+		// bitwise-NOT of the encoded equality value; otherwise the IndexFilter
+		// would never match and would drop every row.
 		idx := &CBOIndex{
 			Info: &IndexInfo{
 				FieldNames: []string{"a", "b"},
@@ -2053,17 +2055,18 @@ func TestCoveringFilterFields(t *testing.T) {
 			},
 			BoundFields: 1,
 		}
+		raw := []byte{0x00, 0xff, 0x11}
 		br := &BoundsResult{
 			Fields: []FieldBounds{{
 				Field: "b", Start: 0, Count: 1, Fixed: true,
 			}},
-			Bounds: []query.Bound{{Start: []byte{0x00, 0xff, 0x11}, End: []byte{0x00, 0xff, 0x11}}},
+			Bounds: []query.Bound{{Start: raw, End: raw}},
 		}
 		got := coveringFilterFields(idx, br)
 		if assert.Len(t, got, 1) {
 			assert.Equal(t, 1, got[0].FieldIdx)
-			assert.Equal(t, []byte{0x00, 0xff, 0x11}, got[0].MatchValue,
-				"reverse field match value must NOT be inverted (storage is ascending)")
+			assert.Equal(t, []byte{0xff, 0x00, 0xee}, got[0].MatchValue,
+				"reverse field match value must be bitwise-inverted to match stored bytes")
 		}
 	})
 }
@@ -2079,8 +2082,10 @@ func (s *sortFieldStub) AppendKey(k anyenc.Tuple, _ *anyenc.Value) anyenc.Tuple 
 	return k
 }
 
-// TestShouldReverse covers all branches: nil sorter, empty fields, and the
-// fields[0].Reverse read-through (both forward and reverse).
+// TestShouldReverse covers scan-direction selection. A forward scan yields the
+// index's declared per-field directions, so the scan is forward iff the first
+// matched sort field's direction equals the declared direction at SortMatchStart,
+// and reverse iff opposite.
 func TestShouldReverse(t *testing.T) {
 	t.Run("nil_sorter", func(t *testing.T) {
 		assert.False(t, shouldReverse(nil, nil))
@@ -2089,13 +2094,42 @@ func TestShouldReverse(t *testing.T) {
 		s := &sortFieldStub{fields: nil}
 		assert.False(t, shouldReverse(s, &CBOIndex{}))
 	})
-	t.Run("forward", func(t *testing.T) {
+	// Forward-declared index (Reverse nil ⇒ idxRev=false): scan direction
+	// equals the requested sort direction.
+	t.Run("forward_index_forward_sort", func(t *testing.T) {
 		s := &sortFieldStub{fields: []query.SortField{{Field: "a", Reverse: false}}}
 		assert.False(t, shouldReverse(s, &CBOIndex{}))
 	})
-	t.Run("reverse", func(t *testing.T) {
+	t.Run("forward_index_reverse_sort", func(t *testing.T) {
 		s := &sortFieldStub{fields: []query.SortField{{Field: "a", Reverse: true}}}
-		assert.True(t, shouldReverse(s, &CBOIndex{}))
+		assert.True(t, shouldReverse(s, &CBOIndex{Reverse: []bool{false}}))
+	})
+	// Reverse-declared single-field index: a forward scan already yields
+	// descending, so Sort("-a") is served FORWARD and Sort("a") REVERSE.
+	t.Run("reverse_index_reverse_sort_is_forward", func(t *testing.T) {
+		s := &sortFieldStub{fields: []query.SortField{{Field: "a", Reverse: true}}}
+		idx := &CBOIndex{Reverse: []bool{true}, SortMatchStart: 0}
+		assert.False(t, shouldReverse(s, idx), "Sort(-a) on (-a) index must scan forward")
+	})
+	t.Run("reverse_index_forward_sort_is_reverse", func(t *testing.T) {
+		s := &sortFieldStub{fields: []query.SortField{{Field: "a", Reverse: false}}}
+		idx := &CBOIndex{Reverse: []bool{true}, SortMatchStart: 0}
+		assert.True(t, shouldReverse(s, idx), "Sort(a) on (-a) index must scan reverse")
+	})
+	// Equality-pinned prefix: matchStart shifts to the trailing field, so the
+	// declared direction read must be idx.Reverse[SortMatchStart].
+	t.Run("equality_prefix_reverse_trailing_forward_scan", func(t *testing.T) {
+		// Index (a,-b): Reverse=[false,true]. a pinned, Sort(-b), matchStart=1.
+		// f[0].Reverse(true) == idx.Reverse[1](true) → forward.
+		s := &sortFieldStub{fields: []query.SortField{{Field: "b", Reverse: true}}}
+		idx := &CBOIndex{Reverse: []bool{false, true}, SortMatchStart: 1}
+		assert.False(t, shouldReverse(s, idx))
+	})
+	t.Run("equality_prefix_reverse_trailing_reverse_scan", func(t *testing.T) {
+		// Same index, Sort(b): f[0].Reverse(false) != idx.Reverse[1](true) → reverse.
+		s := &sortFieldStub{fields: []query.SortField{{Field: "b", Reverse: false}}}
+		idx := &CBOIndex{Reverse: []bool{false, true}, SortMatchStart: 1}
+		assert.True(t, shouldReverse(s, idx))
 	})
 }
 
@@ -2171,17 +2205,18 @@ func TestSetPlanRef(t *testing.T) {
 // (where the prefix beats the start-of-index match).
 func TestIndexSortMatch(t *testing.T) {
 	t.Run("empty_sort", func(t *testing.T) {
-		ex, pa := IndexSortMatch(&IndexInfo{FieldNames: []string{"a"}}, nil, 0)
+		ex, pa, ms := IndexSortMatch(&IndexInfo{FieldNames: []string{"a"}}, nil, 0)
 		assert.False(t, ex)
 		assert.False(t, pa)
+		assert.Equal(t, 0, ms)
 	})
 	t.Run("empty_index", func(t *testing.T) {
-		ex, pa := IndexSortMatch(&IndexInfo{}, []query.SortField{{Field: "a"}}, 0)
+		ex, pa, _ := IndexSortMatch(&IndexInfo{}, []query.SortField{{Field: "a"}}, 0)
 		assert.False(t, ex)
 		assert.False(t, pa)
 	})
 	t.Run("no_match", func(t *testing.T) {
-		ex, pa := IndexSortMatch(
+		ex, pa, _ := IndexSortMatch(
 			&IndexInfo{FieldNames: []string{"a"}},
 			[]query.SortField{{Field: "z"}},
 			0,
@@ -2190,17 +2225,18 @@ func TestIndexSortMatch(t *testing.T) {
 		assert.False(t, pa)
 	})
 	t.Run("exact_match", func(t *testing.T) {
-		ex, pa := IndexSortMatch(
+		ex, pa, ms := IndexSortMatch(
 			&IndexInfo{FieldNames: []string{"a", "b"}},
 			[]query.SortField{{Field: "a"}, {Field: "b"}},
 			0,
 		)
 		assert.True(t, ex)
 		assert.False(t, pa)
+		assert.Equal(t, 0, ms)
 	})
 	t.Run("partial_match", func(t *testing.T) {
 		// 3-field sort, index has only first 2. match=2 != 3 → partial.
-		ex, pa := IndexSortMatch(
+		ex, pa, _ := IndexSortMatch(
 			&IndexInfo{FieldNames: []string{"a", "b"}},
 			[]query.SortField{{Field: "a"}, {Field: "b"}, {Field: "c"}},
 			0,
@@ -2211,17 +2247,18 @@ func TestIndexSortMatch(t *testing.T) {
 	t.Run("equality_prefix_wins", func(t *testing.T) {
 		// Index is (a, b). Equality on a (prefix=1). Sort by b.
 		// matchAt(0) fails (b != a). matchAt(1) succeeds (idx[1]==b). Exact.
-		ex, pa := IndexSortMatch(
+		ex, pa, ms := IndexSortMatch(
 			&IndexInfo{FieldNames: []string{"a", "b"}},
 			[]query.SortField{{Field: "b"}},
 			1,
 		)
 		assert.True(t, ex)
 		assert.False(t, pa)
+		assert.Equal(t, 1, ms)
 	})
 	t.Run("equality_prefix_ignored_when_out_of_range", func(t *testing.T) {
 		// equalityPrefix >= len(FieldNames): matchAt returns 0.
-		ex, pa := IndexSortMatch(
+		ex, pa, _ := IndexSortMatch(
 			&IndexInfo{FieldNames: []string{"a"}},
 			[]query.SortField{{Field: "a"}},
 			5,
@@ -2230,16 +2267,73 @@ func TestIndexSortMatch(t *testing.T) {
 		assert.False(t, pa)
 	})
 	t.Run("direction_mismatch_breaks", func(t *testing.T) {
-		// First field matches with sameMode=true (both forward).
-		// Second field also sameMode? idxRev=false, sortRev=true → curSame=false.
-		// This is inconsistent with first → loop breaks at 1, match=1 partial.
-		ex, pa := IndexSortMatch(
+		// Index (a,b) both forward. Sort(a,-b): first field same (fwd==fwd),
+		// second field idxRev=false vs sortRev=true → curSame=false, inconsistent
+		// with the first → loop breaks at 1, match=1 != 2 sort fields → partial.
+		ex, pa, _ := IndexSortMatch(
 			&IndexInfo{FieldNames: []string{"a", "b"}, Reverse: []bool{false, false}},
 			[]query.SortField{{Field: "a", Reverse: false}, {Field: "b", Reverse: true}},
 			0,
 		)
 		assert.False(t, ex)
 		assert.True(t, pa)
+	})
+	t.Run("mixed_dir_index_matching_sort_is_exact", func(t *testing.T) {
+		// Index (a,-b): Reverse=[false,true]. Sort(a,-b) aligns with the index's
+		// declared directions (a same, b same) → uniform same → exact forward.
+		ex, pa, ms := IndexSortMatch(
+			&IndexInfo{FieldNames: []string{"a", "b"}, Reverse: []bool{false, true}},
+			[]query.SortField{{Field: "a", Reverse: false}, {Field: "b", Reverse: true}},
+			0,
+		)
+		assert.True(t, ex, "Sort(a,-b) on (a,-b) index must be exact")
+		assert.False(t, pa)
+		assert.Equal(t, 0, ms)
+	})
+	t.Run("mixed_dir_index_opposite_sort_is_exact_reverse", func(t *testing.T) {
+		// Index (a,-b). Sort(-a,b): a opposite, b opposite → uniform opposite →
+		// exact, served by a reverse scan.
+		ex, pa, _ := IndexSortMatch(
+			&IndexInfo{FieldNames: []string{"a", "b"}, Reverse: []bool{false, true}},
+			[]query.SortField{{Field: "a", Reverse: true}, {Field: "b", Reverse: false}},
+			0,
+		)
+		assert.True(t, ex, "Sort(-a,b) on (a,-b) index must be exact (reverse)")
+		assert.False(t, pa)
+	})
+	t.Run("mixed_dir_index_uniform_sort_is_partial", func(t *testing.T) {
+		// Index (a,-b). Sort(a,b): a same (fwd==fwd) but b opposite (idxRev=true
+		// vs sortRev=false) → breaks at 1 → partial (genuinely unrealizable).
+		ex, pa, _ := IndexSortMatch(
+			&IndexInfo{FieldNames: []string{"a", "b"}, Reverse: []bool{false, true}},
+			[]query.SortField{{Field: "a", Reverse: false}, {Field: "b", Reverse: false}},
+			0,
+		)
+		assert.False(t, ex, "Sort(a,b) on (a,-b) index is not realizable by one scan")
+		assert.True(t, pa)
+	})
+	t.Run("reverse_first_field_single_match_exact", func(t *testing.T) {
+		// Index (-a): Reverse=[true]. Sort(-a) → same → exact (forward scan).
+		ex, pa, ms := IndexSortMatch(
+			&IndexInfo{FieldNames: []string{"a"}, Reverse: []bool{true}},
+			[]query.SortField{{Field: "a", Reverse: true}},
+			0,
+		)
+		assert.True(t, ex)
+		assert.False(t, pa)
+		assert.Equal(t, 0, ms)
+	})
+	t.Run("equality_prefix_reverse_trailing_field", func(t *testing.T) {
+		// Index (a,-b), a pinned by equality (prefix=1). Sort(-b) aligns with the
+		// declared reverse direction of field 1 → exact, matchStart=1.
+		ex, pa, ms := IndexSortMatch(
+			&IndexInfo{FieldNames: []string{"a", "b"}, Reverse: []bool{false, true}},
+			[]query.SortField{{Field: "b", Reverse: true}},
+			1,
+		)
+		assert.True(t, ex)
+		assert.False(t, pa)
+		assert.Equal(t, 1, ms)
 	})
 }
 

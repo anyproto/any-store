@@ -213,6 +213,12 @@ type CBOIndex struct {
 	// Sort coverage analysis
 	ExactSort   bool
 	PartialSort bool
+
+	// SortMatchStart is the index-field position where IndexSortMatch aligned
+	// the sort run (0 for a prefix match, or the equality prefix when the
+	// equality-pinned start wins). shouldReverse reads idx.Reverse[SortMatchStart]
+	// to decide forward vs reverse scan. Only load-bearing when ExactSort is true.
+	SortMatchStart int
 }
 
 // BuildPlan constructs an iterator chain using the Cost-Based Optimizer.
@@ -961,10 +967,11 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	// allocated for fully-scalar streams.
 	if len(idx.Info.FieldPaths) == 1 {
 		root = &CanonicalKeyDedupIter{
-			Source:    root,
-			Bounds:    idx.Bounds,
-			FieldPath: idx.Info.FieldPaths[0],
-			Reverse:   reverse,
+			Source:       root,
+			Bounds:       idx.Bounds,
+			FieldPath:    idx.Info.FieldPaths[0],
+			Reverse:      reverse,
+			FieldReverse: len(idx.Info.Reverse) > 0 && idx.Info.Reverse[0],
 		}
 	}
 
@@ -1041,10 +1048,11 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 	// chain from IndexIter's per-entry value byte.
 	if len(idx.Info.FieldPaths) == 1 {
 		root = &CanonicalKeyDedupIter{
-			Source:    root,
-			Bounds:    idx.Bounds,
-			FieldPath: idx.Info.FieldPaths[0],
-			Reverse:   reverse,
+			Source:       root,
+			Bounds:       idx.Bounds,
+			FieldPath:    idx.Info.FieldPaths[0],
+			Reverse:      reverse,
+			FieldReverse: len(idx.Info.Reverse) > 0 && idx.Info.Reverse[0],
 		}
 	}
 
@@ -1053,7 +1061,21 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 }
 
 // shouldReverse determines if an index scan should go in reverse direction
-// based on the sort spec and index field ordering.
+// based on the sort spec and the index's declared per-field direction.
+//
+// A forward index scan yields the index's declared per-field directions
+// (reverse-flagged fields are stored bitwise-inverted; see index.go
+// writeValues). So the scan is FORWARD iff the first matched sort field's
+// direction equals the declared direction of the index field it aligns to, and
+// REVERSE iff they are opposite. The first matched sort field is always
+// fields[0] (IndexSortMatch aligns sortFields[si] → idx.FieldNames[matchStart+si],
+// and the matched run is uniform), so reading idx.Reverse[SortMatchStart] is
+// sufficient for the whole run.
+//
+// Note: this is also called for index-SEEK plans where ExactSort==false; there
+// the output is re-sorted by a SortIter, so the scan direction is immaterial and
+// a stale SortMatchStart (0) is harmless. Direction is only load-bearing when
+// ExactSort==true, and then SortMatchStart is set correctly.
 func shouldReverse(sorter query.Sort, idx *CBOIndex) bool {
 	if sorter == nil {
 		return false
@@ -1062,10 +1084,14 @@ func shouldReverse(sorter query.Sort, idx *CBOIndex) bool {
 	if len(fields) == 0 {
 		return false
 	}
-	// Scan direction controls final output direction for index iteration.
-	// Use requested sort direction directly for stable behavior with reverse indexes.
-	_ = idx
-	return fields[0].Reverse
+	idxRev := false
+	if idx != nil {
+		ms := idx.SortMatchStart
+		if ms >= 0 && ms < len(idx.Reverse) {
+			idxRev = idx.Reverse[ms]
+		}
+	}
+	return fields[0].Reverse != idxRev
 }
 
 // setPlanRef walks the iterator chain and sets the Plan reference on FilterIter/FetchIter/FullScanIter nodes.
@@ -1311,10 +1337,12 @@ func buildVerifyChain(params *PlanParams, idx *CBOIndex, root Iterator) Iterator
 
 		// Find a non-unique single-field index for this field
 		var verifyNs *btree.Namespace
+		var verifyReverse bool
 		for i := range params.Indexes {
 			info := params.Indexes[i].Info
 			if !info.Unique && len(info.FieldNames) == 1 && info.FieldNames[0] == field {
 				verifyNs = info.Ns
+				verifyReverse = len(info.Reverse) > 0 && info.Reverse[0]
 				break
 			}
 		}
@@ -1322,11 +1350,19 @@ func buildVerifyChain(params *PlanParams, idx *CBOIndex, root Iterator) Iterator
 			return nil
 		}
 
+		// The verify index stores its field bitwise-inverted when reverse-declared,
+		// so the equality prefix (computed in ascending space) must be inverted to
+		// match the stored key bytes; otherwise VerifyIter never finds the entry.
+		prefix := bounds[0].Start
+		if verifyReverse {
+			prefix = invertBytes(prefix)
+		}
+
 		current = &VerifyIter{
 			Source:   current,
 			Tx:       params.Tx,
 			VerifyNs: verifyNs,
-			Prefix:   bounds[0].Start,
+			Prefix:   prefix,
 		}
 	}
 
@@ -1429,6 +1465,44 @@ func (br *BoundsResult) AllFixed() bool {
 	return true
 }
 
+// invertBytes returns a fresh bitwise-NOT of b (nil for empty input).
+func invertBytes(b []byte) []byte {
+	if len(b) == 0 {
+		return nil
+	}
+	out := make([]byte, len(b))
+	for i, c := range b {
+		out[i] = ^c
+	}
+	return out
+}
+
+// transformReverseBounds maps per-field bounds from ascending value space into
+// the inverted (stored) byte space used for a reverse-flagged index field.
+// Inversion reverses byte order, so each bound's Start/End are inverted AND
+// swapped, and the inclusivity flags swap with them. An open ascending end
+// (empty End, +inf) becomes an open stored start (empty Start), and vice versa.
+// Because the per-bound Start keys change, the result is re-sorted/merged so
+// IndexIter walks the bounds in cursor order (relevant for $in / $ne, which
+// produce multiple bounds). A FRESH slice is always returned — the input
+// (which aliases BoundsResult) is never mutated, so ascending-space readers
+// such as calculateSelectivity remain correct.
+func transformReverseBounds(bs query.Bounds) query.Bounds {
+	if len(bs) == 0 {
+		return bs
+	}
+	out := make(query.Bounds, 0, len(bs))
+	for _, b := range bs {
+		out = append(out, query.Bound{
+			Start:        invertBytes(b.End),
+			End:          invertBytes(b.Start),
+			StartInclude: b.EndInclude,
+			EndInclude:   b.StartInclude,
+		})
+	}
+	return out.SortAndMerge()
+}
+
 // ComputeIndexBounds computes combined tuple bounds for an index
 // using pre-computed per-field bounds from BoundsResult.
 func ComputeIndexBounds(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
@@ -1458,7 +1532,20 @@ func ComputeIndexBounds(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
 
 	chainLen := len(chain)
 
-	// Single-field index: return cached bounds directly (no copy needed)
+	// Reverse-flagged fields are stored bitwise-inverted, so their per-field
+	// bounds (computed in ascending value space by query/filter.go) must be
+	// transformed into the inverted (stored) byte space before being used to
+	// seek or concatenated into a compound tuple bound. transformReverseBounds
+	// returns a FRESH slice, so the aliased BoundsResult (read by selectivity in
+	// ascending space) is never mutated.
+	for i := range chain {
+		if i < len(idx.Reverse) && idx.Reverse[i] {
+			chain[i].bounds = transformReverseBounds(chain[i].bounds)
+		}
+	}
+
+	// Single-field index: return bounds directly (transformed above if reverse,
+	// otherwise the cached ascending bounds — no copy needed).
 	if len(chain) == 1 {
 		return chain[0].bounds, chainLen
 	}
@@ -1540,9 +1627,15 @@ func AdjustBoundsForNonUnique(bounds query.Bounds) query.Bounds {
 // IndexSortMatch checks if an index covers the sort fields.
 // equalityPrefix is the number of leading index fields pinned by equality filters;
 // these can be skipped when matching sort fields since they're constant within a range.
-func IndexSortMatch(idx *IndexInfo, sortFields []query.SortField, equalityPrefix int) (exactSort, partialSort bool) {
+//
+// matchStart is the index-field position where the matched sort run begins
+// (0 for a prefix match, or equalityPrefix when the equality-pinned start wins).
+// shouldReverse uses it to read the declared direction of the first matched
+// field (idx.Reverse[matchStart]) and pick the scan direction. It defaults to 0,
+// which is correct when no equality prefix shifts the match.
+func IndexSortMatch(idx *IndexInfo, sortFields []query.SortField, equalityPrefix int) (exactSort, partialSort bool, matchStart int) {
 	if len(sortFields) == 0 || len(idx.FieldNames) == 0 {
-		return false, false
+		return false, false, 0
 	}
 	matchAt := func(start int) int {
 		if start < 0 || start >= len(idx.FieldNames) {
@@ -1559,17 +1652,20 @@ func IndexSortMatch(idx *IndexInfo, sortFields []query.SortField, equalityPrefix
 			if idx.FieldNames[ii] != sf.Field {
 				break
 			}
-			// Physical index storage is ALWAYS ascending: writeValues marshals
-			// every field via v.MarshalTo and never byte-inverts reverse-flagged
-			// fields (the AppendIndexKey inversion path is dead code). A whole-
-			// tuple forward scan therefore yields all-ascending order and a
-			// reverse scan all-descending; a per-field MIXED order (e.g. a asc,
-			// b desc) is not realizable by a single scan direction. So match
-			// sort fields against ascending storage (ignore idx.Reverse): a
-			// uniform-direction run is covered (exact/partial) and a mixed-
-			// direction sort correctly falls through to an in-memory sort
-			// instead of being mis-served by a plain IndexScan.
-			curSame := !sf.Reverse
+			// Reverse-flagged fields are stored bitwise-inverted (index.go
+			// writeValues), so a forward index scan yields the index's declared
+			// per-field directions. A sort field is "in the same direction" as a
+			// forward scan iff the index's declared direction equals the sort's
+			// direction. The whole matched run must be uniform under this
+			// relation: an all-same run is served by a forward scan, an
+			// all-opposite run by a reverse scan, and a run that is mixed
+			// relative to the declared directions (e.g. Sort(a,b) on an (a,-b)
+			// index) breaks here and falls back to an in-memory sort.
+			idxRev := false
+			if ii < len(idx.Reverse) {
+				idxRev = idx.Reverse[ii]
+			}
+			curSame := idxRev == sf.Reverse
 			if !modeSet {
 				sameMode = curSame
 				modeSet = true
@@ -1582,19 +1678,21 @@ func IndexSortMatch(idx *IndexInfo, sortFields []query.SortField, equalityPrefix
 	}
 
 	bestMatch := matchAt(0)
+	bestStart := 0
 	if equalityPrefix > 0 && equalityPrefix < len(idx.FieldNames) {
 		if m := matchAt(equalityPrefix); m > bestMatch {
 			bestMatch = m
+			bestStart = equalityPrefix
 		}
 	}
 
 	if bestMatch == 0 {
-		return false, false
+		return false, false, 0
 	}
 	if bestMatch == len(sortFields) {
-		return true, false
+		return true, false, bestStart
 	}
-	return false, true
+	return false, true, bestStart
 }
 
 // coveringFilterFields identifies non-bound index fields that have equality
@@ -1612,12 +1710,19 @@ func coveringFilterFields(idx *CBOIndex, fieldBounds *BoundsResult) []IndexField
 			continue
 		}
 
-		// Index keys store every field ascending (writeValues never inverts
-		// reverse-flagged fields), so IndexFilterIter must compare the raw,
-		// NON-inverted encoded value against the key bytes — even for fields
-		// declared reverse. Inverting here would never match the ascending-
-		// stored bytes and would silently drop every row.
+		// Reverse-flagged fields are stored bitwise-inverted (index.go
+		// writeValues), so IndexFilterIter compares key.FieldBytes(fi) (the
+		// inverted stored bytes) against MatchValue. The equality value must
+		// therefore be inverted to match. This is a pure equality check
+		// (Start == End), so no Start/End swap is needed — only invert.
 		matchValue := bounds[0].Start
+		if fi < len(idx.Info.Reverse) && idx.Info.Reverse[fi] {
+			inv := make([]byte, len(matchValue))
+			for j, bb := range matchValue {
+				inv[j] = ^bb
+			}
+			matchValue = inv
+		}
 
 		filters = append(filters, IndexFieldFilter{
 			FieldIdx:   fi,

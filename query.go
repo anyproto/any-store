@@ -703,19 +703,21 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 
 		// Check sort coverage (accounting for equality-pinned prefix)
 		var exactSort, partialSort bool
+		var sortMatchStart int
 		if len(sortFields) > 0 {
-			exactSort, partialSort = qplanner.IndexSortMatch(info, sortFields, equalityPrefix)
+			exactSort, partialSort, sortMatchStart = qplanner.IndexSortMatch(info, sortFields, equalityPrefix)
 		}
 
 		cboIdx := qplanner.CBOIndex{
-			Info:        info,
-			Sketch:      idx.sketch,
-			Bounds:      bounds,
-			Reverse:     idx.reverse,
-			PointLookup: pointLookup,
-			BoundFields: chainLen,
-			ExactSort:   exactSort,
-			PartialSort: partialSort,
+			Info:           info,
+			Sketch:         idx.sketch,
+			Bounds:         bounds,
+			Reverse:        idx.reverse,
+			PointLookup:    pointLookup,
+			BoundFields:    chainLen,
+			ExactSort:      exactSort,
+			PartialSort:    partialSort,
+			SortMatchStart: sortMatchStart,
 		}
 		result = append(result, cboIdx)
 	}

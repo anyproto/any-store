@@ -30,7 +30,14 @@ func (it *CoverIter) Next() (key []byte, docId []byte, multiKey bool, err error)
 	// true never merges distinct docs. Single-bound lookups can't straddle
 	// bounds, so they skip the probe and keep the zero-cost multiKey=false.
 	if len(it.Bounds) > 1 && !it.multiKeyProbed {
-		it.hasMultiKey, err = indexProbeAnyMultiKey(it.Source)
+		// Only a single-field index has the array tag at byte 0, so only there
+		// does the reverse flag flip the probe prefix to the inverted tag. For a
+		// compound index the array tag is mid-key and the probe is already a
+		// documented conservative-true, so the plain (non-inverted) prefix is
+		// kept regardless of any trailing field's direction.
+		fieldReverse := len(it.IdxInfo.FieldNames) == 1 &&
+			len(it.IdxInfo.Reverse) > 0 && it.IdxInfo.Reverse[0]
+		it.hasMultiKey, err = indexProbeAnyMultiKey(it.Source, fieldReverse)
 		if err != nil {
 			return nil, nil, false, err
 		}
