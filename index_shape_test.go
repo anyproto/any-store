@@ -303,69 +303,76 @@ func TestIndex_Compound_MixedDirectionsSort(t *testing.T) {
 		require.NoError(t, coll.Insert(ctx, doc))
 	}
 
-	t.Run("sort matching index direction a asc b desc", func(t *testing.T) {
-		// KNOWN BUG: The compound index with mixed directions (a, -b) does not
-		// correctly produce b-descending order within each a group when using
-		// IndexScan. The index scan returns b in ascending order instead.
-		// Without the index, Sort("a", "-b") works correctly via in-memory sort.
-		// This test verifies that at least count and a-ordering are correct.
-		iter, err := coll.Find(nil).Sort("a", "-b").Iter(ctx)
+	// Unindexed twin with identical data: its in-memory sort is the correct
+	// reference order. Mixed-direction (a,-b) cannot be physically realized by a
+	// single index-scan direction (storage is all-ascending), so after the fix
+	// the planner falls back to an in-memory sort and the RESULT ORDER — incl.
+	// b within each a group — must match the unindexed twin exactly.
+	fx2 := newFixture(t)
+	twin, err := fx2.CreateCollection(ctx, "twin")
+	require.NoError(t, err)
+	for i := range 40 {
+		require.NoError(t, twin.Insert(ctx, anyenc.MustParseJson(
+			fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%4, i%5))))
+	}
+
+	abPairs := func(c Collection, sort ...any) []string {
+		iter, err := c.Find(nil).Sort(sort...).Iter(ctx)
 		require.NoError(t, err)
 		defer iter.Close()
-
-		var prevA int
-		prevA = -1
-		first := true
-		count := 0
+		var out []string
 		for iter.Next() {
-			doc, err := iter.Doc()
-			require.NoError(t, err)
-			a := doc.Value().GetInt("a")
-			if !first && a != prevA {
-				assert.True(t, a > prevA, "a should be non-decreasing: got %d after %d", a, prevA)
-			}
-			prevA = a
-			first = false
-			count++
+			d, derr := iter.Doc()
+			require.NoError(t, derr)
+			out = append(out, fmt.Sprintf("%d,%d", d.Value().GetInt("a"), d.Value().GetInt("b")))
 		}
 		require.NoError(t, iter.Err())
-		assert.Equal(t, 40, count)
+		return out
+	}
 
-		explain, err := coll.Find(nil).Sort("a", "-b").Explain(ctx)
-		require.NoError(t, err)
-		assert.Contains(t, explain.Sql, "IndexScan")
+	t.Run("sort matching index direction a asc b desc", func(t *testing.T) {
+		got := abPairs(coll, "a", "-b")
+		assert.Equal(t, abPairs(twin, "a", "-b"), got, "indexed (a,-b) order must match the correct in-memory order")
+		require.Len(t, got, 40)
+		// Within each a group, b must be non-increasing (descending).
+		prevA, prevB, first := -1, -1, true
+		for _, p := range got {
+			var a, b int
+			_, _ = fmt.Sscanf(p, "%d,%d", &a, &b)
+			if !first {
+				if a == prevA {
+					assert.True(t, b <= prevB, "b must be descending within a=%d: got %d after %d", a, b, prevB)
+				} else {
+					assert.True(t, a > prevA, "a must be ascending: got %d after %d", a, prevA)
+				}
+			}
+			prevA, prevB, first = a, b, false
+		}
 	})
 
 	t.Run("sort exact reverse of index", func(t *testing.T) {
-		// Index is (a ASC, -b DESC), reverse scan gives (-a, b)
-		iter, err := coll.Find(nil).Sort("-a", "b").Iter(ctx)
-		require.NoError(t, err)
-		defer iter.Close()
-
-		var prevA int
-		prevA = 999
-		first := true
-		count := 0
-		for iter.Next() {
-			doc, err := iter.Doc()
-			require.NoError(t, err)
-			a := doc.Value().GetInt("a")
-			if !first && a != prevA {
-				assert.True(t, a < prevA, "a should be non-increasing: got %d after %d", a, prevA)
+		// Sort("-a","b"): a descending, b ascending within each a group.
+		got := abPairs(coll, "-a", "b")
+		assert.Equal(t, abPairs(twin, "-a", "b"), got)
+		require.Len(t, got, 40)
+		prevA, prevB, first := 1<<30, -1, true
+		for _, p := range got {
+			var a, b int
+			_, _ = fmt.Sscanf(p, "%d,%d", &a, &b)
+			if !first {
+				if a == prevA {
+					assert.True(t, b >= prevB, "b must be ascending within a=%d: got %d after %d", a, b, prevB)
+				} else {
+					assert.True(t, a < prevA, "a must be descending: got %d after %d", a, prevA)
+				}
 			}
-			prevA = a
-			first = false
-			count++
+			prevA, prevB, first = a, b, false
 		}
-		require.NoError(t, iter.Err())
-		assert.Equal(t, 40, count)
 	})
 
 	t.Run("sort direction mismatch produces correct results", func(t *testing.T) {
-		// (a ASC, b ASC) doesn't match index (a ASC, -b DESC)
-		// Results should still be correct regardless of plan strategy
-		vals := collectField(t, coll.Find(nil).Sort("a", "b"), "a")
-		assert.Equal(t, 40, len(vals))
+		// (a ASC, b ASC) — also mixed vs index (a ASC, -b DESC) → in-memory sort.
+		assert.Equal(t, abPairs(twin, "a", "b"), abPairs(coll, "a", "b"))
 	})
 }
 

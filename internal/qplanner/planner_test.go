@@ -81,8 +81,9 @@ func TestIndexCoversFilter_RejectsUncoveredField(t *testing.T) {
 		EndInclude:   true,
 	}}
 	idx := &CBOIndex{
-		Info:   &IndexInfo{Name: "a", FieldNames: []string{"a"}},
-		Bounds: pointBound,
+		Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+		Bounds:      pointBound,
+		BoundFields: 1, // "a" pinned by the point bound
 	}
 
 	assert.False(t, indexCoversFilter(idx, query.MustParseCondition(`{"a":1,"b":2}`)),
@@ -107,8 +108,9 @@ func TestIndexCoversFilter_RejectsUncoveredField(t *testing.T) {
 // (I-04).
 func TestIndexCoversFilter_GatesMultiPredicateField(t *testing.T) {
 	idxA := &CBOIndex{
-		Info:   &IndexInfo{Name: "a", FieldNames: []string{"a"}},
-		Bounds: mustParseBounds("a", `{"a":1}`),
+		Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+		Bounds:      mustParseBounds("a", `{"a":1}`),
+		BoundFields: 1, // "a" is pinned by the bound prefix
 	}
 
 	// Rejected: more than one predicate on the single covered field.
@@ -130,14 +132,27 @@ func TestIndexCoversFilter_GatesMultiPredicateField(t *testing.T) {
 			"single-predicate field must stay covered: %s", f)
 	}
 
-	// Covered: a compound point lookup keeps one predicate per field, so the
-	// fast path (CountEntries over the compound index) must remain available.
+	// Covered: a compound point lookup that pins BOTH fields via the bound
+	// prefix (BoundFields == 2) keeps one predicate per field, so the fast path
+	// (CountEntries over the compound index) must remain available.
 	idxAB := &CBOIndex{
-		Info:   &IndexInfo{Name: "ab", FieldNames: []string{"a", "b"}},
-		Bounds: mustParseBounds("a", `{"a":1}`),
+		Info:        &IndexInfo{Name: "ab", FieldNames: []string{"a", "b"}},
+		Bounds:      mustParseBounds("a", `{"a":1}`),
+		BoundFields: 2, // both a and b pinned by the equality-equality bound chain
 	}
 	assert.True(t, indexCoversFilter(idxAB, query.MustParseCondition(`{"a":1,"b":2}`)),
 		"compound point lookup (one predicate per field) must stay covered")
+
+	// NOT covered: skip-middle — a trailing equality field (c) lies BEYOND the
+	// bounded prefix [a], so the bounds don't enforce it and the covering-count
+	// fast path would over-count. Must fall through to the FilterIter path.
+	idxABC := &CBOIndex{
+		Info:        &IndexInfo{Name: "abc", FieldNames: []string{"a", "b", "c"}},
+		Bounds:      mustParseBounds("a", `{"a":1}`),
+		BoundFields: 1, // only a is pinned; b unconstrained breaks the chain
+	}
+	assert.False(t, indexCoversFilter(idxABC, query.MustParseCondition(`{"a":1,"c":0}`)),
+		"skip-middle filter field beyond the bound prefix must NOT be covered")
 }
 
 func TestBuildPlan_IndexScan_SortWithLimit(t *testing.T) {
@@ -1964,8 +1979,9 @@ func TestIndexCoversFilter(t *testing.T) {
 	})
 	t.Run("covered", func(t *testing.T) {
 		idx := &CBOIndex{
-			Info:   &IndexInfo{FieldNames: []string{"a", "b"}},
-			Bounds: query.Bounds{{Start: []byte{1}, End: []byte{1}}},
+			Info:        &IndexInfo{FieldNames: []string{"a", "b"}},
+			Bounds:      query.Bounds{{Start: []byte{1}, End: []byte{1}}},
+			BoundFields: 1, // filter {a:1} pins only the leading field a
 		}
 		f := query.MustParseCondition(`{"a": 1}`)
 		assert.True(t, indexCoversFilter(idx, f))
@@ -2024,7 +2040,12 @@ func TestCoveringFilterFields(t *testing.T) {
 			assert.Equal(t, []byte{0x11, 0x22}, got[0].MatchValue)
 		}
 	})
-	t.Run("reverse_field_inverted", func(t *testing.T) {
+	t.Run("reverse_field_not_inverted", func(t *testing.T) {
+		// Index keys store every field ascending (writeValues never inverts
+		// reverse-flagged fields), so the covering-filter match value must be
+		// the RAW encoded bytes even for a reverse-declared field. Inverting
+		// here would never match the ascending-stored key bytes and would drop
+		// every row (the IndexFilter would return nothing).
 		idx := &CBOIndex{
 			Info: &IndexInfo{
 				FieldNames: []string{"a", "b"},
@@ -2041,9 +2062,8 @@ func TestCoveringFilterFields(t *testing.T) {
 		got := coveringFilterFields(idx, br)
 		if assert.Len(t, got, 1) {
 			assert.Equal(t, 1, got[0].FieldIdx)
-			// Each byte should be bitwise-NOT of the source.
-			assert.Equal(t, []byte{0xff, 0x00, 0xee}, got[0].MatchValue,
-				"reverse field must be bitwise-inverted")
+			assert.Equal(t, []byte{0x00, 0xff, 0x11}, got[0].MatchValue,
+				"reverse field match value must NOT be inverted (storage is ascending)")
 		}
 	})
 }
