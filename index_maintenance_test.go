@@ -1087,9 +1087,12 @@ func TestIndex_UpsertMutation_UpdateOneIndexConsistency(t *testing.T) {
 }
 
 func TestIndex_UpsertMutation_FindUpdateUniqueConstraintViaInsert(t *testing.T) {
-	// Unique constraint is enforced on Insert, not on Find().Update().
-	// The update path (collection.update) does deleteKeys+insertKeys which
-	// is a btree Put (overwrite), not a uniqueness-checked insert.
+	// The unique constraint is enforced on EVERY write path, including
+	// Find().Update(): collection.update does deleteKeys+insertKeys, and
+	// insertKeys runs the AppendSeekKey prefix check on each insert, so an
+	// update onto another doc's unique value returns ErrUniqueConstraint and
+	// the whole tx rolls back (see TestIndex_Maintenance_FindUpdateUniqueConstraintEnforced
+	// and TestIndex_UniqueSparse_FindUpdateMultiDocCollisionRollsBack).
 	// This test verifies that direct Insert enforces uniqueness.
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")
