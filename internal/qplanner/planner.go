@@ -591,6 +591,21 @@ func sortCost(n float64) float64 {
 	return n * math.Log2(n) * CostSortSwap
 }
 
+// sortTopK returns the bounded heap size for an in-memory SortIter.
+//
+// The bounded max-heap optimization (keep only the smallest Limit+Offset rows)
+// is sound ONLY when a finite Limit caps the result window. With Limit == 0 the
+// caller wants the full result tail past Offset, so the heap must be unbounded
+// (TopK == 0 → full sort): a heap sized to just Offset would retain exactly the
+// rows the subsequent LimitIter then skips, yielding zero results. See the
+// offset-without-limit regression in offset/limit tests.
+func sortTopK(params *PlanParams) int {
+	if params.Limit > 0 {
+		return params.Limit + params.Offset
+	}
+	return 0
+}
+
 // calculateSelectivity computes the combined selectivity for all filter predicates.
 func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs float64, br *BoundsResult) float64 {
 	if filter == nil || isAllFilter(filter) {
@@ -797,7 +812,7 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 			},
 			Sorter: params.Sorter,
 			Buf:    params.Buf,
-			TopK:   params.Limit + params.Offset,
+			TopK:   sortTopK(params),
 		}
 	}
 
@@ -865,7 +880,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 				},
 				Sorter: params.Sorter,
 				Buf:    params.Buf,
-				TopK:   params.Limit + params.Offset,
+				TopK:   sortTopK(params),
 			}
 		}
 
@@ -962,7 +977,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 			},
 			Sorter:          params.Sorter,
 			Buf:             params.Buf,
-			TopK:            params.Limit + params.Offset,
+			TopK:            sortTopK(params),
 			PartiallySorted: idx.PartialSort,
 		}
 	}
@@ -1121,16 +1136,26 @@ func indexCoversFilter(idx *CBOIndex, filter query.Filter) bool {
 	if filter == nil || len(idx.Bounds) == 0 {
 		return false
 	}
-	// Condition 1: every filter field is an index field. Returns false on any
-	// uncovered field or any complex node (Or/Not/Nor).
+	// Only fields pinned by the CONTIGUOUS bound prefix are actually constrained
+	// by the index seek. A filter field that is an index field but lies BEYOND
+	// the bound prefix (skip-middle, e.g. {a,c} on index (a,b,c) → BoundFields=1)
+	// is NOT enforced by the bounds; counting entries in the bounded range would
+	// silently ignore it and over-count. So gate coverage on the bounded prefix
+	// only, mirroring buildVerifyChain's FieldNames[:idx.BoundFields].
+	boundedFields := idx.Info.FieldNames
+	if idx.BoundFields < len(boundedFields) {
+		boundedFields = boundedFields[:idx.BoundFields]
+	}
+	// Condition 1: every filter field is within the bounded index prefix.
+	// Returns false on any uncovered field or any complex node (Or/Not/Nor).
 	hasFields := false
-	if ok := filterFieldsCoveredBy(filter, idx.Info.FieldNames, &hasFields); !ok || !hasFields {
+	if ok := filterFieldsCoveredBy(filter, boundedFields, &hasFields); !ok || !hasFields {
 		return false
 	}
 	// Condition 2: reject when any covered field carries >1 predicate, because
 	// And.IndexBounds then over-approximates and the fast path skips the
 	// FilterIter that would trim the result.
-	for _, field := range idx.Info.FieldNames {
+	for _, field := range boundedFields {
 		if countFilterFieldPreds(filter, field) > 1 {
 			return false
 		}
@@ -1534,11 +1559,17 @@ func IndexSortMatch(idx *IndexInfo, sortFields []query.SortField, equalityPrefix
 			if idx.FieldNames[ii] != sf.Field {
 				break
 			}
-			idxRev := false
-			if ii < len(idx.Reverse) {
-				idxRev = idx.Reverse[ii]
-			}
-			curSame := idxRev == sf.Reverse
+			// Physical index storage is ALWAYS ascending: writeValues marshals
+			// every field via v.MarshalTo and never byte-inverts reverse-flagged
+			// fields (the AppendIndexKey inversion path is dead code). A whole-
+			// tuple forward scan therefore yields all-ascending order and a
+			// reverse scan all-descending; a per-field MIXED order (e.g. a asc,
+			// b desc) is not realizable by a single scan direction. So match
+			// sort fields against ascending storage (ignore idx.Reverse): a
+			// uniform-direction run is covered (exact/partial) and a mixed-
+			// direction sort correctly falls through to an in-memory sort
+			// instead of being mis-served by a plain IndexScan.
+			curSame := !sf.Reverse
 			if !modeSet {
 				sameMode = curSame
 				modeSet = true
@@ -1581,15 +1612,12 @@ func coveringFilterFields(idx *CBOIndex, fieldBounds *BoundsResult) []IndexField
 			continue
 		}
 
+		// Index keys store every field ascending (writeValues never inverts
+		// reverse-flagged fields), so IndexFilterIter must compare the raw,
+		// NON-inverted encoded value against the key bytes — even for fields
+		// declared reverse. Inverting here would never match the ascending-
+		// stored bytes and would silently drop every row.
 		matchValue := bounds[0].Start
-		// For reverse fields, invert the match value to compare against stored bytes
-		if fi < len(idx.Info.Reverse) && idx.Info.Reverse[fi] {
-			inv := make([]byte, len(matchValue))
-			for j, b := range matchValue {
-				inv[j] = ^b
-			}
-			matchValue = inv
-		}
 
 		filters = append(filters, IndexFieldFilter{
 			FieldIdx:   fi,
