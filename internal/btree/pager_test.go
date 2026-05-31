@@ -2026,10 +2026,12 @@ func TestCheckpointWithMode_Truncate(t *testing.T) {
 	err = p.checkpointWithMode(CheckpointTruncate)
 	require.NoError(t, err)
 
-	// WAL file should be truncated then writeHeader writes 32 bytes
+	// After TRUNCATE the WAL file is 0 bytes: SQLite walRestartHdr updates only the
+	// SHM wal-index header (new salt) then truncates the WAL to 0 (wal.c:2362-2378);
+	// the on-disk header is rewritten lazily on the next writer's first frame.
 	info, err := os.Stat(p.path + "-wal")
 	require.NoError(t, err)
-	assert.Equal(t, int64(walHeaderSize), info.Size())
+	assert.Equal(t, int64(0), info.Size())
 }
 
 func TestCheckpointWithMode_PassiveNoBusyHandler(t *testing.T) {
@@ -2179,8 +2181,9 @@ func TestTryResetWALWithBusy_Truncate(t *testing.T) {
 
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	// After truncate + writeHeader, file has 32-byte header
-	assert.Equal(t, int64(walHeaderSize), info.Size())
+	// After TRUNCATE the WAL file is 0 bytes (SQLite walRestartHdr + OsTruncate(0),
+	// wal.c:2362-2378); the on-disk header is deferred to the next writer's first frame.
+	assert.Equal(t, int64(0), info.Size())
 }
 
 func TestTryResetWALWithBusy_SlotsBusy(t *testing.T) {
@@ -2282,8 +2285,9 @@ func TestDoResetWAL_Truncate(t *testing.T) {
 
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	// After truncate + writeHeader, file has just the 32-byte header
-	assert.Equal(t, int64(walHeaderSize), info.Size())
+	// After TRUNCATE the WAL file is 0 bytes (SQLite walRestartHdr + OsTruncate(0),
+	// wal.c:2362-2378); the on-disk header is deferred to the next writer's first frame.
+	assert.Equal(t, int64(0), info.Size())
 	assert.Equal(t, uint32(0), w.nFrame.Load())
 }
 
@@ -5095,11 +5099,12 @@ func TestCheckpointWithMode_Truncate_Full(t *testing.T) {
 	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointTruncate, nil)
 	require.NoError(t, err)
 
-	// WAL file should have header size (32 bytes) after truncate+writeHeader
+	// After TRUNCATE the WAL file is 0 bytes (SQLite walRestartHdr + OsTruncate(0),
+	// wal.c:2362-2378); the on-disk header is deferred to the next writer's first frame.
 	walPath := path + "-wal"
 	info, err := os.Stat(walPath)
 	require.NoError(t, err)
-	assert.Equal(t, int64(walHeaderSize), info.Size())
+	assert.Equal(t, int64(0), info.Size())
 }
 
 // Test checkpointWithMode FULL with everything checkpointed but no reset

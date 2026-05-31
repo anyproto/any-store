@@ -1810,7 +1810,12 @@ func (w *wal) recoverLocked() error {
 		return w.writeHeader()
 	}
 
-	w.pageSize = w.header.pageSize
+	// Validate (don't adopt) the WAL page size against the DB page size — SQLite
+	// rejects a mismatch as corrupt (walPagesize!=nBuf, wal.c:4386-4387).
+	if w.header.pageSize != w.pageSize {
+		return fmt.Errorf("%w: WAL header page size %d != db page size %d",
+			ErrCorrupt, w.header.pageSize, w.pageSize)
+	}
 	headerCksum1, headerCksum2 := walChecksum(buf[0:24], 0, 0)
 
 	info, err := w.file.Stat()
@@ -3042,7 +3047,8 @@ func (w *wal) authoritativeMxFrameAndPage() (mxFrame, nPage uint32) {
 // RESOLVED (was DRIFT-50): checkpointWithMode now physically truncates the DB
 // file down to the committed page count after a full backfill, matching SQLite
 // walCheckpoint (wal.c:2320-2329). See the truncate block in checkpointWithMode.
-// DRIFT: checkpoint omits page-size-mismatch and over-grow corruption guards See docs/btree/NOTES.md#drift-52-checkpoint-missing-page-size-mismatch-and-over-grow-corrupti
+// RESOLVED (was DRIFT-52): checkpoint over-grow guard (checkpointWithMode) +
+// WAL/DB page-size guard (recoverLocked) now match SQLite.
 func (w *wal) checkpoint(dbFile fileHandle, master *masterStore) error {
 	return w.checkpointWithMode(dbFile, master, CheckpointFull, nil)
 }
@@ -3433,6 +3439,22 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 		}
 	}
 
+	// Over-grow corruption guard, matching SQLite walCheckpoint (wal.c:2276-2294):
+	// reject if the committed db size can't be reached from the current file + WAL
+	// (+64KiB pending-byte slack). Skipped for InMemory and the mxPage==0 fallback.
+	if dbFile != nil && mxPage > 0 {
+		info, statErr := dbFile.Stat()
+		if statErr != nil {
+			_ = w.index.unlock(lockRead0, lockExclusive)
+			return statErr
+		}
+		nReq := int64(mxPage) * int64(w.pageSize)
+		if nSize := info.Size(); nSize < nReq && nSize+65536+int64(nf)*int64(w.pageSize) < nReq {
+			_ = w.index.unlock(lockRead0, lockExclusive)
+			return ErrCorrupt
+		}
+	}
+
 	// Copy frames (nBackfill+1)..mxSafeFrame to DB
 	pageSz := int64(w.pageSize)
 	var backfillErr error
@@ -3573,13 +3595,9 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 		return backfillErr
 	}
 
-	// Sync the database file (skip for InMemory)
-	if dbFile != nil {
-		if err := fdatasync(dbFile); err != nil {
-			_ = w.index.unlock(lockRead0, lockExclusive)
-			return err
-		}
-	}
+	// No DB-file sync here: SQLite syncs the db once per checkpoint, post-truncate
+	// in the full-backfill block (wal.c:2322-2327), never after the copy loop. The
+	// copied pages stay recoverable from the WAL synced above (wal.c:2271).
 
 	// Full-backfill physical truncation. When this checkpoint copied the entire
 	// committed WAL frontier into the DB file, shrink the DB file down to the
@@ -3743,7 +3761,13 @@ func (w *wal) doResetWAL(truncate bool) error {
 		return nil
 	}
 
-	return w.writeHeader()
+	// Defer the on-disk WAL-header write+fdatasync to the next writer's first frame
+	// (flushHeader), matching SQLite walRestartHdr (wal.c:2363-2389): the reset only
+	// publishes the SHM header (fresh salt, so peers detect the wrap); on TRUNCATE
+	// the WAL stays 0 bytes. Durability unchanged (flushHeader fdatasyncs at the
+	// first-frame write); avoids an eager header fsync per RESTART/TRUNCATE checkpoint.
+	w.initHeaderStateLocked()
+	return nil
 }
 
 // truncateFile truncates the WAL file to zero bytes under the WAL mutex.
