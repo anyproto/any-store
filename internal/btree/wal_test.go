@@ -281,8 +281,89 @@ func TestWALRecoveryUncommittedTruncated(t *testing.T) {
 	assert.Equal(t, uint32(1), w2.index.maxPage.Load())
 
 	// Frame for page 2 should not be in index
-	frame := w2.index.get(2, w2.nFrame.Load())
+	frame := mustWiGet(t, w2.index, 2, w2.nFrame.Load())
 	assert.Equal(t, uint32(0), frame)
+
+	require.NoError(t, w2.close(false))
+}
+
+// TestWALRecoveryStopsAtPgnoZeroFrame verifies recovery halts at a frame whose
+// page number is zero, even when its salt matches the WAL header and its
+// checksum correctly continues the running chain. This mirrors SQLite's
+// walDecodeFrame pgno==0 rejection (wal.c:1019-1024) and the walIndexRecover
+// call-site termination (wal.c:1504-1505): the first invalid frame ends the
+// scan, so only the prior committed frames are recovered.
+func TestWALRecoveryStopsAtPgnoZeroFrame(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.wal")
+
+	const pageSize = 4096
+
+	// Write one committed frame (page 5) via the normal API.
+	w := newWal(path, pageSize)
+	require.NoError(t, w.open())
+	_, bwErr := w.beginWrite()
+	require.NoError(t, bwErr)
+	pg := &page{pgno: 5, data: make([]byte, pageSize)}
+	copy(pg.data, "committed data")
+	require.NoError(t, w.writeFrames([]*page{pg}, true, 5))
+	w.endWrite()
+	salt1, salt2 := w.header.salt1, w.header.salt2
+	require.NoError(t, w.close(false))
+
+	frameSize := int64(walFrameSize) + int64(pageSize)
+
+	// Reconstruct the running checksum state after the first committed frame
+	// exactly as recoverLocked does: seed from header words [0:24], then fold
+	// in frame-header bytes [0:8] and the full page payload.
+	contents, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, int64(len(contents)), walHeaderSize+frameSize)
+
+	s1, s2 := walChecksum(contents[0:24], 0, 0)
+	frame0 := contents[walHeaderSize : walHeaderSize+frameSize]
+	s1, s2 = walChecksum(frame0[0:8], s1, s2)
+	s1, s2 = walChecksum(frame0[walFrameSize:], s1, s2)
+
+	// Hand-craft a second frame with pgno==0 but a matching salt and a checksum
+	// that correctly continues the chain — so only the pgno==0 guard can reject
+	// it. dbSize is set as a commit marker to prove recovery still stops here.
+	var hdr [walFrameSize]byte
+	binary.BigEndian.PutUint32(hdr[0:4], 0) // pgno == 0 (invalid frame)
+	binary.BigEndian.PutUint32(hdr[4:8], 7) // dbSize commit marker
+	binary.BigEndian.PutUint32(hdr[8:12], salt1)
+	binary.BigEndian.PutUint32(hdr[12:16], salt2)
+	data := make([]byte, pageSize)
+	copy(data, "page-zero frame")
+	cs1, cs2 := walChecksum(hdr[0:8], s1, s2)
+	cs1, cs2 = walChecksum(data, cs1, cs2)
+	binary.BigEndian.PutUint32(hdr[16:20], cs1)
+	binary.BigEndian.PutUint32(hdr[20:24], cs2)
+
+	f, err := os.OpenFile(path, os.O_WRONLY, 0666)
+	require.NoError(t, err)
+	off := walHeaderSize + frameSize
+	_, err = f.WriteAt(hdr[:], off)
+	require.NoError(t, err)
+	_, err = f.WriteAt(data, off+walFrameSize)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	// Reopen — recovery must stop at the pgno==0 frame, recovering only the
+	// first committed frame.
+	w2 := newWal(path, pageSize)
+	require.NoError(t, w2.open())
+
+	assert.Equal(t, uint32(1), w2.nFrame.Load(), "recovery must stop at the pgno==0 frame")
+	assert.Equal(t, uint32(5), w2.index.maxPage.Load())
+
+	// The pgno==0 frame lives at frame index 2; it must not be indexed.
+	assert.Equal(t, uint32(0), mustWiGet(t, w2.index, 0, w2.nFrame.Load()))
+
+	// The prior committed frame is recoverable.
+	buf := make([]byte, pageSize)
+	require.NoError(t, w2.readFrame(1, buf, nil, nil))
+	assert.Equal(t, pg.data, buf)
 
 	require.NoError(t, w2.close(false))
 }
@@ -308,25 +389,25 @@ func TestWALIndexSetGet(t *testing.T) {
 	require.NoError(t, err)
 	defer idx.close(false)
 
-	idx.set(1, 1)
-	idx.set(2, 2)
-	idx.set(1, 3) // Update page 1 to frame 3
+	mustWiSet(t, idx, 1, 1)
+	mustWiSet(t, idx, 2, 2)
+	mustWiSet(t, idx, 1, 3) // Update page 1 to frame 3
 
 	// Get with full visibility
-	assert.Equal(t, uint32(3), idx.get(1, 10))
-	assert.Equal(t, uint32(2), idx.get(2, 10))
+	assert.Equal(t, uint32(3), mustWiGet(t, idx, 1, 10))
+	assert.Equal(t, uint32(2), mustWiGet(t, idx, 2, 10))
 
 	// Snapshot isolation: max frame limits visibility
-	assert.Equal(t, uint32(0), idx.get(1, 0))
-	assert.Equal(t, uint32(2), idx.get(2, 5))
+	assert.Equal(t, uint32(0), mustWiGet(t, idx, 1, 0))
+	assert.Equal(t, uint32(2), mustWiGet(t, idx, 2, 5))
 
 	// Page 1 has frames [1, 3]. With maxFrame=2, we see frame 1 (latest <= 2).
 	// With maxFrame >= 3, we see frame 3 (the newest version).
-	assert.Equal(t, uint32(1), idx.get(1, 2)) // frame 1 <= maxFrame 2
-	assert.Equal(t, uint32(3), idx.get(1, 3))
+	assert.Equal(t, uint32(1), mustWiGet(t, idx, 1, 2)) // frame 1 <= maxFrame 2
+	assert.Equal(t, uint32(3), mustWiGet(t, idx, 1, 3))
 
 	// Non-existent page
-	assert.Equal(t, uint32(0), idx.get(999, 100))
+	assert.Equal(t, uint32(0), mustWiGet(t, idx, 999, 100))
 }
 
 func TestWALIndexReset(t *testing.T) {
@@ -336,14 +417,14 @@ func TestWALIndexReset(t *testing.T) {
 	require.NoError(t, err)
 	defer idx.close(false)
 
-	idx.set(1, 1)
-	idx.set(2, 2)
+	mustWiSet(t, idx, 1, 1)
+	mustWiSet(t, idx, 2, 2)
 	assert.Equal(t, uint32(2), idx.maxFrame.Load())
 
 	idx.reset()
 	assert.Equal(t, uint32(0), idx.maxFrame.Load())
-	assert.Equal(t, uint32(0), idx.get(1, 100))
-	assert.Equal(t, uint32(0), idx.get(2, 100))
+	assert.Equal(t, uint32(0), mustWiGet(t, idx, 1, 100))
+	assert.Equal(t, uint32(0), mustWiGet(t, idx, 2, 100))
 }
 
 func TestWALIndexWriteHeader(t *testing.T) {
@@ -454,7 +535,7 @@ func TestWALMultipleCommits(t *testing.T) {
 	assert.Equal(t, uint32(2), w.nFrame.Load())
 
 	// Latest frame for page 1 should be frame 2
-	frame := w.index.get(1, w.nFrame.Load())
+	frame := mustWiGet(t, w.index, 1, w.nFrame.Load())
 	assert.Equal(t, uint32(2), frame)
 
 	// Read latest frame
@@ -592,25 +673,25 @@ func TestWalIndexGetCrossProcessFallback(t *testing.T) {
 	}
 
 	// Write frames to SHM hash tables only (simulating another process)
-	wi.shmHashWrite(5, 1)
+	mustShmHashWrite(t, wi, 5, 1)
 	wi.maxFrame.Store(1)
 	wi.mxCommitFrame.Store(1) // getLatest() uses mxCommitFrame for SHM fallback bound
 	wi.nBackfill.Store(0)
 
 	// get() should find frame 1 for page 5 via SHM fallback
-	frame := wi.get(5, 1)
+	frame := mustWiGet(t, wi, 5, 1)
 	assert.Equal(t, uint32(1), frame, "get() SHM fallback: expected frame 1")
 
 	// getLatest() should also find it
-	frame = wi.getLatest(5)
+	frame = mustWiGetLatest(t, wi, 5)
 	assert.Equal(t, uint32(1), frame, "getLatest() SHM fallback: expected frame 1")
 
 	// With inProcess=true, should NOT fall back to SHM
 	wi.inProcess = true
-	frame = wi.get(5, 1)
+	frame = mustWiGet(t, wi, 5, 1)
 	assert.Equal(t, uint32(0), frame, "get() inProcess should not use SHM fallback")
 
-	frame = wi.getLatest(5)
+	frame = mustWiGetLatest(t, wi, 5)
 	assert.Equal(t, uint32(0), frame, "getLatest() inProcess should not use SHM fallback")
 }
 
@@ -642,8 +723,8 @@ func TestWriteFramesCommitFalseDoesNotAdvanceMxCommitFrame(t *testing.T) {
 	assert.Equal(t, uint32(1), w.index.mxCommitFrame.LoadLocal())
 
 	// Writer can find spilled pages via pageMap
-	assert.Equal(t, uint32(2), w.index.get(2, 3))
-	assert.Equal(t, uint32(3), w.index.get(3, 3))
+	assert.Equal(t, uint32(2), mustWiGet(t, w.index, 2, 3))
+	assert.Equal(t, uint32(3), mustWiGet(t, w.index, 3, 3))
 
 	// Now commit — mxCommitFrame should catch up
 	pg4 := &page{pgno: 4, data: make([]byte, 4096)}
@@ -666,29 +747,29 @@ func TestGetLatestIgnoresSpilledFrames(t *testing.T) {
 	}
 
 	// Simulate a commit: page 1 at frame 1
-	wi.shmHashWrite(1, 1)
+	mustShmHashWrite(t, wi, 1, 1)
 	wi.maxFrame.Store(1)
 	wi.mxCommitFrame.Store(1)
 
 	// Simulate spill: page 2 at frame 2, written to SHM hash but not committed.
 	// In real code, spill does NOT write SHM hash (deferred), but here we test
 	// that getLatest bounds the SHM search to mxCommitFrame even if SHM has the entry.
-	wi.shmHashWrite(2, 2)
+	mustShmHashWrite(t, wi, 2, 2)
 	wi.maxFrame.Store(2)
 	// mxCommitFrame stays at 1
 
 	// getLatest for page 2: pageMap is empty (cross-process scenario),
 	// SHM fallback uses mxCommitFrame=1, so frame 2 is invisible.
-	frame := wi.getLatest(2)
+	frame := mustWiGetLatest(t, wi, 2)
 	assert.Equal(t, uint32(0), frame, "getLatest should not see spilled frame beyond mxCommitFrame")
 
 	// getLatest for page 1: should still find frame 1 (within mxCommitFrame)
-	frame = wi.getLatest(1)
+	frame = mustWiGetLatest(t, wi, 1)
 	assert.Equal(t, uint32(1), frame, "getLatest should find committed frame")
 
 	// After commit, advancing mxCommitFrame makes frame 2 visible
 	wi.mxCommitFrame.Store(2)
-	frame = wi.getLatest(2)
+	frame = mustWiGetLatest(t, wi, 2)
 	assert.Equal(t, uint32(2), frame, "getLatest should see frame after mxCommitFrame advances")
 }
 
@@ -729,8 +810,8 @@ func TestRollbackCleansUpSpilledFrames(t *testing.T) {
 	assert.Equal(t, uint32(4), w.nFrame.Load())
 
 	// Writer can see spilled frames in pageMap
-	assert.Equal(t, uint32(3), w.index.get(3, 4))
-	assert.Equal(t, uint32(4), w.index.get(4, 4))
+	assert.Equal(t, uint32(3), mustWiGet(t, w.index, 3, 4))
+	assert.Equal(t, uint32(4), mustWiGet(t, w.index, 4, 4))
 
 	// Rollback to savedFrame (discard spilled frames)
 	w.index.rollbackToFrame(savedFrame)
@@ -739,12 +820,12 @@ func TestRollbackCleansUpSpilledFrames(t *testing.T) {
 	assert.Equal(t, uint32(2), w.index.maxFrame.Load())
 
 	// Spilled pages should be gone from pageMap
-	assert.Equal(t, uint32(0), w.index.get(3, 10))
-	assert.Equal(t, uint32(0), w.index.get(4, 10))
+	assert.Equal(t, uint32(0), mustWiGet(t, w.index, 3, 10))
+	assert.Equal(t, uint32(0), mustWiGet(t, w.index, 4, 10))
 
 	// Committed pages should still be visible
-	assert.Equal(t, uint32(1), w.index.get(1, 10))
-	assert.Equal(t, uint32(2), w.index.get(2, 10))
+	assert.Equal(t, uint32(1), mustWiGet(t, w.index, 1, 10))
+	assert.Equal(t, uint32(2), mustWiGet(t, w.index, 2, 10))
 
 	w.endWrite()
 	require.NoError(t, w.close(false))
@@ -793,12 +874,12 @@ func TestRollbackToSavepointWithSpilledFrames(t *testing.T) {
 	assert.Equal(t, uint32(2), w.index.maxFrame.Load())
 
 	// Pages written after savepoint should be gone
-	assert.Equal(t, uint32(0), w.index.get(3, 10))
-	assert.Equal(t, uint32(0), w.index.get(4, 10))
+	assert.Equal(t, uint32(0), mustWiGet(t, w.index, 3, 10))
+	assert.Equal(t, uint32(0), mustWiGet(t, w.index, 4, 10))
 
 	// Pages from before savepoint should still be visible
-	assert.Equal(t, uint32(1), w.index.get(1, 10))
-	assert.Equal(t, uint32(2), w.index.get(2, 10))
+	assert.Equal(t, uint32(1), mustWiGet(t, w.index, 1, 10))
+	assert.Equal(t, uint32(2), mustWiGet(t, w.index, 2, 10))
 
 	w.endWrite()
 	require.NoError(t, w.close(false))
@@ -830,8 +911,8 @@ func TestCrossProcessReaderDoesNotSeeSpilledFrames(t *testing.T) {
 	assert.Equal(t, uint32(2), hdr1.nPage, "SHM header nPage should be 2 after commit")
 
 	// Verify committed pages are in SHM hash
-	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10, 1), "committed page 1 should be in SHM hash")
-	assert.Equal(t, uint32(2), w.index.shmHashGet(2, 10, 1), "committed page 2 should be in SHM hash")
+	assert.Equal(t, uint32(1), mustShmHashGet(t, w.index, 1, 10, 1), "committed page 1 should be in SHM hash")
+	assert.Equal(t, uint32(2), mustShmHashGet(t, w.index, 2, 10, 1), "committed page 2 should be in SHM hash")
 
 	// Spill pages 3 and 4 (commit=false)
 	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
@@ -852,8 +933,8 @@ func TestCrossProcessReaderDoesNotSeeSpilledFrames(t *testing.T) {
 	assert.Equal(t, uint32(4), w.index.maxFrame.Load(), "maxFrame should include spilled frames")
 
 	// Committed pages still accessible via SHM hash
-	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10, 1), "committed page 1 still in SHM hash")
-	assert.Equal(t, uint32(2), w.index.shmHashGet(2, 10, 1), "committed page 2 still in SHM hash")
+	assert.Equal(t, uint32(1), mustShmHashGet(t, w.index, 1, 10, 1), "committed page 1 still in SHM hash")
+	assert.Equal(t, uint32(2), mustShmHashGet(t, w.index, 2, 10, 1), "committed page 2 still in SHM hash")
 
 	// A cross-process reader gated by mxCommitFrame must not see spilled pages:
 	// SHM hash is written eagerly (SQLite-aligned), but readers bound by
@@ -867,11 +948,11 @@ func TestCrossProcessReaderDoesNotSeeSpilledFrames(t *testing.T) {
 	reader.nBackfill.Store(0)
 
 	// Reader should see committed pages via SHM hash
-	assert.Equal(t, uint32(1), reader.getLatest(1), "cross-process reader sees committed page 1")
-	assert.Equal(t, uint32(2), reader.getLatest(2), "cross-process reader sees committed page 2")
+	assert.Equal(t, uint32(1), mustWiGetLatest(t, reader, 1), "cross-process reader sees committed page 1")
+	assert.Equal(t, uint32(2), mustWiGetLatest(t, reader, 2), "cross-process reader sees committed page 2")
 	// Reader should NOT see spilled pages (frame > mxCommitFrame)
-	assert.Equal(t, uint32(0), reader.getLatest(3), "cross-process reader must not see spilled page 3")
-	assert.Equal(t, uint32(0), reader.getLatest(4), "cross-process reader must not see spilled page 4")
+	assert.Equal(t, uint32(0), mustWiGetLatest(t, reader, 3), "cross-process reader must not see spilled page 3")
+	assert.Equal(t, uint32(0), mustWiGetLatest(t, reader, 4), "cross-process reader must not see spilled page 4")
 
 	w.endWrite()
 	require.NoError(t, w.close(false))
@@ -925,16 +1006,16 @@ func TestRecoveryIgnoresSpilledFrames(t *testing.T) {
 	assert.Equal(t, uint32(3), w2.index.maxPage.Load(), "recovery: maxPage should be 3")
 
 	// Committed pages should be in index
-	assert.Equal(t, uint32(1), w2.index.get(1, 3), "recovery: page 1 at frame 1")
-	assert.Equal(t, uint32(2), w2.index.get(2, 3), "recovery: page 2 at frame 2")
-	assert.Equal(t, uint32(3), w2.index.get(3, 3), "recovery: page 3 at frame 3")
+	assert.Equal(t, uint32(1), mustWiGet(t, w2.index, 1, 3), "recovery: page 1 at frame 1")
+	assert.Equal(t, uint32(2), mustWiGet(t, w2.index, 2, 3), "recovery: page 2 at frame 2")
+	assert.Equal(t, uint32(3), mustWiGet(t, w2.index, 3, 3), "recovery: page 3 at frame 3")
 
 	// Spilled pages should NOT be in index
-	assert.Equal(t, uint32(0), w2.index.get(4, 10), "recovery: spilled page 4 not visible")
-	assert.Equal(t, uint32(0), w2.index.get(5, 10), "recovery: spilled page 5 not visible")
+	assert.Equal(t, uint32(0), mustWiGet(t, w2.index, 4, 10), "recovery: spilled page 4 not visible")
+	assert.Equal(t, uint32(0), mustWiGet(t, w2.index, 5, 10), "recovery: spilled page 5 not visible")
 
 	// Page 1 should be at frame 1 (committed version), NOT frame 6 (spilled update)
-	assert.Equal(t, uint32(1), w2.index.get(1, 10), "recovery: page 1 should be at committed frame, not spilled")
+	assert.Equal(t, uint32(1), mustWiGet(t, w2.index, 1, 10), "recovery: page 1 should be at committed frame, not spilled")
 
 	// Verify data integrity of committed frames
 	buf := make([]byte, 4096)
@@ -974,8 +1055,8 @@ func TestWriteFramesCommitFlushesToShm(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg1, pg2}, false, 0))
 
 	// SHM hash holds entries eagerly (invisible to peer readers via mxCommitFrame)
-	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10, 1))
-	assert.Equal(t, uint32(2), w.index.shmHashGet(2, 10, 1))
+	assert.Equal(t, uint32(1), mustShmHashGet(t, w.index, 1, 10, 1))
+	assert.Equal(t, uint32(2), mustShmHashGet(t, w.index, 2, 10, 1))
 
 	// Now commit page 3
 	pg3 := &page{pgno: 3, data: make([]byte, 4096)}
@@ -983,11 +1064,11 @@ func TestWriteFramesCommitFlushesToShm(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg3}, true, 3))
 
 	// All frames visible in SHM hash
-	frame := w.index.shmHashGet(1, 10, 1)
+	frame := mustShmHashGet(t, w.index, 1, 10, 1)
 	assert.Equal(t, uint32(1), frame, "page 1 in SHM hash")
-	frame = w.index.shmHashGet(2, 10, 1)
+	frame = mustShmHashGet(t, w.index, 2, 10, 1)
 	assert.Equal(t, uint32(2), frame, "page 2 in SHM hash")
-	frame = w.index.shmHashGet(3, 10, 1)
+	frame = mustShmHashGet(t, w.index, 3, 10, 1)
 	assert.Equal(t, uint32(3), frame, "page 3 in SHM hash")
 
 	// mxCommitFrame should include all frames
@@ -1138,7 +1219,6 @@ func TestEnsureHeaderInitialized_TriggersRecoveryWhenSHMInvalid(t *testing.T) {
 	require.Equal(t, expectedFrames, hdr.mxFrame)
 }
 
-
 // TestRollbackCleanupZerosShmHashEntries exercises shmCleanupFromFrame: a
 // cross-process reader consulting shmHashGet directly (bypassing the
 // mxCommitFrame gate on getLatest) must find zero entries for frames that
@@ -1163,7 +1243,7 @@ func TestRollbackCleanupZerosShmHashEntries(t *testing.T) {
 	committedFrame := w.nFrame.Load()
 
 	// Verify SHM hash has frame 1 for page 1.
-	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10, 1),
+	assert.Equal(t, uint32(1), mustShmHashGet(t, w.index, 1, 10, 1),
 		"committed frame 1 should be in SHM hash")
 
 	// Spill two more pages (commit=false). With eager SHM writes, they land
@@ -1176,9 +1256,9 @@ func TestRollbackCleanupZerosShmHashEntries(t *testing.T) {
 
 	// Pre-rollback: spilled frames are in SHM hash (caller must use
 	// mxCommitFrame to gate visibility).
-	assert.Equal(t, uint32(2), w.index.shmHashGet(2, 10, 1),
+	assert.Equal(t, uint32(2), mustShmHashGet(t, w.index, 2, 10, 1),
 		"spilled frame 2 should be present in SHM hash (eager)")
-	assert.Equal(t, uint32(3), w.index.shmHashGet(3, 10, 1),
+	assert.Equal(t, uint32(3), mustShmHashGet(t, w.index, 3, 10, 1),
 		"spilled frame 3 should be present in SHM hash (eager)")
 
 	// Rollback to the commit boundary — this must invoke shmCleanupFromFrame.
@@ -1189,14 +1269,14 @@ func TestRollbackCleanupZerosShmHashEntries(t *testing.T) {
 	// unaware of mxCommitFrame (e.g. a fresh peer process scanning SHM
 	// after the writer died) must NOT find dangling entries for rolled-back
 	// frames.
-	assert.Equal(t, uint32(0), w.index.shmHashGet(2, 10, 1),
+	assert.Equal(t, uint32(0), mustShmHashGet(t, w.index, 2, 10, 1),
 		"frame 2 hash entry must be zeroed by rollback cleanup")
-	assert.Equal(t, uint32(0), w.index.shmHashGet(3, 10, 1),
+	assert.Equal(t, uint32(0), mustShmHashGet(t, w.index, 3, 10, 1),
 		"frame 3 hash entry must be zeroed by rollback cleanup")
 
 	// Committed frame must still be reachable — cleanup preserves the
 	// probe chain for idx <= iLimit (wal.c:1258-1264).
-	assert.Equal(t, uint32(1), w.index.shmHashGet(1, 10, 1),
+	assert.Equal(t, uint32(1), mustShmHashGet(t, w.index, 1, 10, 1),
 		"committed frame 1 must remain reachable after rollback cleanup")
 }
 
@@ -1216,34 +1296,132 @@ func TestRollbackCleanupAcrossSegments(t *testing.T) {
 	// around htNPageOne. Commit up through frame htNPageOne, spill the
 	// next frame (which lands in segment 1), then roll back.
 	committed := uint32(htNPageOne)
-	wi.shmHashWrite(100, committed-1)
-	wi.shmHashWrite(200, committed)
+	mustShmHashWrite(t, wi, 100, committed-1)
+	mustShmHashWrite(t, wi, 200, committed)
 	wi.maxFrame.Store(committed)
 
 	// Spill two frames into segment 1.
 	spill1 := committed + 1
 	spill2 := committed + 2
-	wi.shmHashWrite(300, spill1)
-	wi.shmHashWrite(400, spill2)
+	mustShmHashWrite(t, wi, 300, spill1)
+	mustShmHashWrite(t, wi, 400, spill2)
 	wi.maxFrame.Store(spill2)
 
 	// Pre-rollback: segment-1 entries are present.
-	assert.NotZero(t, wi.shmHashGet(300, spill2, 1), "spill frame 300 in SHM")
-	assert.NotZero(t, wi.shmHashGet(400, spill2, 1), "spill frame 400 in SHM")
+	assert.NotZero(t, mustShmHashGet(t, wi, 300, spill2, 1), "spill frame 300 in SHM")
+	assert.NotZero(t, mustShmHashGet(t, wi, 400, spill2, 1), "spill frame 400 in SHM")
 
 	wi.rollbackToFrame(committed)
 
 	// Post-rollback: segment-1 hash entries zeroed.
-	assert.Equal(t, uint32(0), wi.shmHashGet(300, spill2, 1),
+	assert.Equal(t, uint32(0), mustShmHashGet(t, wi, 300, spill2, 1),
 		"trailing-segment frame 300 hash must be zeroed")
-	assert.Equal(t, uint32(0), wi.shmHashGet(400, spill2, 1),
+	assert.Equal(t, uint32(0), mustShmHashGet(t, wi, 400, spill2, 1),
 		"trailing-segment frame 400 hash must be zeroed")
 
 	// Pre-boundary committed frames in segment 0 must remain.
-	assert.Equal(t, committed-1, wi.shmHashGet(100, committed, 1),
+	assert.Equal(t, committed-1, mustShmHashGet(t, wi, 100, committed, 1),
 		"segment-0 frame 100 must still be reachable")
-	assert.Equal(t, committed, wi.shmHashGet(200, committed, 1),
+	assert.Equal(t, committed, mustShmHashGet(t, wi, 200, committed, 1),
 		"segment-0 frame 200 must still be reachable")
+}
+
+// TestRollbackReadvanceTrailingSegmentConsistency pins the wal-index hash
+// consistency invariant across an mxFrame DECREASE followed by a RE-ADVANCE
+// into a trailing segment that shmCleanupFromFrame wholesale-zeroed.
+//
+// This is the load-bearing equivalence behind drift-95
+// (docs/btree/NOTES.md#drift-95-shmcleanupfromframe-zeros-all-segments-above-target):
+// SQLite's walCleanupHash cleans only the boundary segment and relies on
+// walIndexAppend's idx==1 memset (wal.c:1315-1319) to lazily re-clear higher
+// segments when they are reused on re-advance. any-store deliberately omits
+// that idx==1 zero-init (drift-91) and instead eagerly scrubs every trailing
+// segment in shmCleanupFromFrame. For the two strategies to be observationally
+// equivalent, after mxFrame decreases past a segment boundary and then
+// re-advances back into that same (now-reused) segment, hash reads must be
+// exactly correct.
+//
+// The adversarial shape that distinguishes eager-scrub from a no-op is a
+// PARTIAL re-advance: gen2 re-advances mxFrame far enough to make a stale gen1
+// slot's frame fall back within [minFrame, maxFrame], but writes FEWER frames
+// than gen1, so it does NOT overwrite the trailing gen1 aPgno[idx]. Without the
+// trailing-segment scrub, that surviving aPgno[idx]+aHash slot would resurrect
+// a rolled-back page (exactly the corruption C's idx==1 memset prevents lazily
+// and the EXPENSIVE_ASSERT at wal.c:1277-1286 guards). With the scrub, the slot
+// is zeroed, so the read is correct. This test FAILS if the trailing-segment
+// wholesale-zero is removed.
+func TestRollbackReadvanceTrailingSegmentConsistency(t *testing.T) {
+	wi := &walIndex{
+		shm:       newHeapShm(),
+		pageMap:   make(map[uint32][]uint32),
+		inProcess: false,
+	}
+
+	// Commit one frame at the very end of segment 0 so the next frame spills
+	// into trailing segment 1 (the wholesale-zeroed case in
+	// shmCleanupFromFrame, target <= iZero).
+	committed := uint32(htNPageOne)
+	mustShmHashWrite(t, wi, 100, committed)
+	wi.maxFrame.Store(committed)
+
+	// First generation: spill FOUR frames into trailing segment 1 at indices
+	// 0..3 (frames committed+1..committed+4), then roll them all back.
+	gen1 := []uint32{300, 400, 500, 600}
+	for i, pgno := range gen1 {
+		mustShmHashWrite(t, wi, pgno, committed+1+uint32(i))
+	}
+	wi.maxFrame.Store(committed + uint32(len(gen1)))
+
+	// Sanity: first-generation frames are present before rollback.
+	for _, pgno := range gen1 {
+		require.NotZero(t, mustShmHashGet(t, wi, pgno, wi.maxFrame.Load(), 1),
+			"gen1 page %d should be present pre-rollback", pgno)
+	}
+
+	// mxFrame DECREASE: roll back to the boundary. shmCleanupFromFrame
+	// wholesale-zeroes trailing segment 1.
+	wi.rollbackToFrame(committed)
+	require.Equal(t, committed, wi.maxFrame.Load(), "rollback must restore mxFrame")
+
+	// mxFrame RE-ADVANCE, but only PARTIALLY: write TWO frames (gen2) into
+	// segment-1 indices 0..1 (frames committed+1, committed+2). This overwrites
+	// only gen1's first two aPgno slots; gen1's pages 500 (idx 2, frame
+	// committed+3) and 600 (idx 3, frame committed+4) are NOT overwritten.
+	gen2 := []uint32{700, 800}
+	for i, pgno := range gen2 {
+		mustShmHashWrite(t, wi, pgno, committed+1+uint32(i))
+	}
+	// Advance mxFrame to committed+4 — far enough that the stale gen1 frames
+	// for pages 500 and 600 (committed+3, committed+4) would be IN RANGE and
+	// thus resurrectable by shmHashGet if their slots were not scrubbed.
+	wi.maxFrame.Store(committed + 4)
+	maxF := wi.maxFrame.Load()
+
+	// Re-advanced gen2 frames resolve to their new frame numbers.
+	for i, pgno := range gen2 {
+		want := committed + 1 + uint32(i)
+		assert.Equal(t, want, mustShmHashGet(t, wi, pgno, maxF, 1),
+			"re-advanced page %d must resolve to its new frame", pgno)
+	}
+
+	// THE INVARIANT: rolled-back gen1 pages whose slots were NOT overwritten by
+	// the partial re-advance (500, 600) must still be invisible. Their frames
+	// (committed+3, committed+4) are <= maxF, so only the eager trailing-segment
+	// scrub keeps them from being resurrected. A no-op scrub fails here.
+	assert.Equal(t, uint32(0), mustShmHashGet(t, wi, 500, maxF, 1),
+		"rolled-back page 500 must not be resurrected by partial re-advance")
+	assert.Equal(t, uint32(0), mustShmHashGet(t, wi, 600, maxF, 1),
+		"rolled-back page 600 must not be resurrected by partial re-advance")
+
+	// Overwritten gen1 pages (300, 400) likewise stay invisible.
+	assert.Equal(t, uint32(0), mustShmHashGet(t, wi, 300, maxF, 1),
+		"rolled-back page 300 must not be resurrected after re-advance")
+	assert.Equal(t, uint32(0), mustShmHashGet(t, wi, 400, maxF, 1),
+		"rolled-back page 400 must not be resurrected after re-advance")
+
+	// Boundary-segment committed frame is untouched throughout.
+	assert.Equal(t, committed, mustShmHashGet(t, wi, 100, maxF, 1),
+		"boundary-segment committed page 100 must remain reachable")
 }
 
 // clearHeaderForTest zeroes the shm header so the next reader's
@@ -1462,7 +1640,7 @@ func TestWriteFrames_ChecksumChainConsistentAfterRewrite(t *testing.T) {
 
 	// Latest frame for pgno 3 should be the overwritten one (frame 1)
 	// with V1' = 0x77 in its data.
-	frame := w2.index.get(3, w2.index.maxFrame.Load())
+	frame := mustWiGet(t, w2.index, 3, w2.index.maxFrame.Load())
 	require.NotZero(t, frame, "pgno 3 should have a frame after recovery")
 	buf := make([]byte, 4096)
 	require.NoError(t, w2.readFrame(frame, buf, nil, nil))

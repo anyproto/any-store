@@ -968,6 +968,38 @@ func TestOpen_PageSizeTooLarge(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid page size")
 }
 
+// TestOpen_OnDiskPageSizeMismatchSharedPool exercises drift-64: when the
+// process-global page buffer pool is already keyed to one page size, opening an
+// existing DB whose on-disk page size differs must fail with
+// ErrPageBufferPoolSizeMismatch rather than adopt the on-disk size and draw
+// mis-sized buffers from the shared pool. The two DBs are opened WITHOUT a
+// resetPageBufferPool() between them so the shared-pool path is exercised
+// (testOpen resets per call, so call Open directly here).
+func TestOpen_OnDiskPageSizeMismatchSharedPool(t *testing.T) {
+	dir := t.TempDir()
+	pathA := filepath.Join(dir, "a.db")
+	pathB := filepath.Join(dir, "b.db")
+
+	// Create DB A with the minimum page size, then close it so the on-disk
+	// header records PageSize == MinPageSize.
+	resetPageBufferPool()
+	dbA, err := Open(pathA, Options{PageSize: MinPageSize})
+	require.NoError(t, err)
+	require.NoError(t, dbA.Close())
+
+	// Key the process-global pool to a DIFFERENT page size via DB B, WITHOUT
+	// resetting the pool first.
+	resetPageBufferPool()
+	dbB, err := Open(pathB, Options{PageSize: 2 * MinPageSize})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = dbB.Close() })
+
+	// Re-open DB A (on-disk MinPageSize) against the pool now keyed to
+	// 2*MinPageSize. Must be rejected, not silently adopted.
+	_, err = Open(pathA, Options{PageSize: 2 * MinPageSize})
+	require.ErrorIs(t, err, ErrPageBufferPoolSizeMismatch)
+}
+
 // === UpdateLocalCounters ===
 
 func TestUpdateLocalCounters(t *testing.T) {
@@ -3012,6 +3044,56 @@ func TestCov2_ListNamespaces_NextError2(t *testing.T) {
 		// Skip gracefully.
 		t.Log("Master table is leaf, not interior. Page type:", p1Type)
 	}
+}
+
+// TestIntegrityCheck_MasterInteriorPageNoFalsePositives is a regression test
+// for the drift where IntegrityCheck treated master page 1 as a flat leaf. Once
+// the master/namespace catalog grows large enough that page 1 splits to an
+// interior root (pageTypeIntIdx), the old leaf-only cell loop misparsed the
+// interior cells (reading a 4-byte leftChild as two leaf varints) and never
+// reference-marked the master's interior children, producing a flood of false
+// "corrupt cell data" / "key out of order" / "page N: never used" errors on a
+// perfectly healthy database. SQLite routes every root — page 1 included —
+// through the uniform checkTreePage path (btree.c:11236-11247); after the fix
+// any-store does the same, so a healthy interior master verifies cleanly.
+//
+// Without the fix this test fails: IntegrityCheck returns a non-nil
+// *IntegrityError listing ~100 spurious errors.
+func TestIntegrityCheck_MasterInteriorPageNoFalsePositives(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	db, err := testOpen(t, path, Options{PageSize: 512, InProcess: true})
+	require.NoError(t, err)
+	defer db.Close()
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	// 200 namespaces at 512B pages forces the master table (page 1) to split
+	// from a leaf into a multi-level interior root. Each namespace also gets a
+	// non-empty subtree so the leaf-cell hook discovers and validates real
+	// namespace roots after the master split.
+	for i := 0; i < 200; i++ {
+		ns, nerr := tx.CreateNamespace(fmt.Sprintf("ns_%03d", i))
+		require.NoError(t, nerr)
+		require.NoError(t, tx.Put(ns, []byte(fmt.Sprintf("k_%03d", i)), []byte("v")))
+	}
+	require.NoError(t, tx.Commit())
+	require.NoError(t, db.Checkpoint(CheckpointTruncate))
+
+	// A healthy database with an interior master must pass IntegrityCheck with
+	// no false positives.
+	if err := db.IntegrityCheck(); err != nil {
+		t.Fatalf("IntegrityCheck reported errors on a healthy interior-master DB: %v", err)
+	}
+
+	// Confirm the precondition: page 1 must actually be an interior page,
+	// otherwise this test would not exercise the fixed path. Read it straight
+	// from the checkpointed file (TRUNCATE flushed everything to disk).
+	require.NoError(t, db.Close())
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equalf(t, byte(pageTypeIntIdx), data[dbHeaderSize],
+		"precondition: master page 1 must be interior to exercise the fix (got page type %d)", data[dbHeaderSize])
 }
 
 // --- db.go L655-658: parseLeafCellWithSize error in AppendValue ---

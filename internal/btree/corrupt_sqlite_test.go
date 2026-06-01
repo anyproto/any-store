@@ -10,27 +10,27 @@ corruption during balance-deeper, overflow page pointer corruption, and cell
 area byte corruption.
 
 Deviations from original:
-- corrupt-1 / corrupt-2: Original creates ~768 rows via SQL string concat plus
-  an index and a second table. We create 200 rows with random-length values
-  (80-3000 bytes) to produce a multi-page file. Sub-operations per offset are
-  reduced from 8 to 4 (open, scan, write, integrity check). Page ref leak check
-  (corrupt-2.$tn.8) is skipped (internal implementation detail).
-- corrupt-3 through corrupt-5: Skipped — test sqlite_master rootpage swapping,
-  index B-tree type confusion, and sqlite_master column count corruption. None
-  of these concepts exist in our key-value API.
-- corrupt-6.1: Our delete uses fragmentation tracking instead of freeblocks,
-  so we insert 55 cells then manually create a freeblock via raw byte patching.
-  Cell count is 55 (not 63) because our cell format is slightly larger.
-  The net effect is the same: a page with a corrupted freeblock size.
-- corrupt-7: Original uses 39 rows which fit on one page in SQLite's format.
-  Our cell format is larger (26 vs ~23 bytes), so we use 35 rows instead.
-  Key 36 triggers balance-deeper (instead of key 40). Cell-offset array
-  corruption logic and fake cell header approach are the same.
-- corrupt-8.1: Overflow pointer offset and change counter corruption offsets
-  computed empirically for our page layout. INSERT OR REPLACE maps to Put (upsert).
-  secure_delete and auto_vacuum pragmas not applicable.
-- corrupt-8.2: Byte offset 2047 corruption and change counter at offset 24.
-  Same offset adjustments as corrupt-8.1.
+  - corrupt-1 / corrupt-2: Original creates ~768 rows via SQL string concat plus
+    an index and a second table. We create 200 rows with random-length values
+    (80-3000 bytes) to produce a multi-page file. Sub-operations per offset are
+    reduced from 8 to 4 (open, scan, write, integrity check). Page ref leak check
+    (corrupt-2.$tn.8) is skipped (internal implementation detail).
+  - corrupt-3 through corrupt-5: Skipped — test sqlite_master rootpage swapping,
+    index B-tree type confusion, and sqlite_master column count corruption. None
+    of these concepts exist in our key-value API.
+  - corrupt-6.1: Our delete uses fragmentation tracking instead of freeblocks,
+    so we insert 55 cells then manually create a freeblock via raw byte patching.
+    Cell count is 55 (not 63) because our cell format is slightly larger.
+    The net effect is the same: a page with a corrupted freeblock size.
+  - corrupt-7: Original uses 39 rows which fit on one page in SQLite's format.
+    Our cell format is larger (26 vs ~23 bytes), so we use 35 rows instead.
+    Key 36 triggers balance-deeper (instead of key 40). Cell-offset array
+    corruption logic and fake cell header approach are the same.
+  - corrupt-8.1: Overflow pointer offset and change counter corruption offsets
+    computed empirically for our page layout. INSERT OR REPLACE maps to Put (upsert).
+    secure_delete and auto_vacuum pragmas not applicable.
+  - corrupt-8.2: Byte offset 2047 corruption and change counter at offset 24.
+    Same offset adjustments as corrupt-8.1.
 */
 package btree
 
@@ -318,8 +318,8 @@ func TestSqlite_Corrupt_6_FreeblockSize(t *testing.T) {
 	// becomes a freeblock. Our freeblock is 16 bytes (like one cell).
 	freeblockOff := cellContentOff // within page
 	// Freeblock format: 2-byte next ptr (0 = none), 2-byte size
-	binary.BigEndian.PutUint16(data[page2Off+freeblockOff:], 0)     // next = 0
-	binary.BigEndian.PutUint16(data[page2Off+freeblockOff+2:], 16)  // size = 16 bytes
+	binary.BigEndian.PutUint16(data[page2Off+freeblockOff:], 0)    // next = 0
+	binary.BigEndian.PutUint16(data[page2Off+freeblockOff+2:], 16) // size = 16 bytes
 	// Set firstFreeBlk in page header
 	binary.BigEndian.PutUint16(data[page2Off+1:page2Off+3], uint16(freeblockOff))
 

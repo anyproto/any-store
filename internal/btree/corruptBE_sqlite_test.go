@@ -1,43 +1,44 @@
 /*
 Ported from SQLite: corruptB.test, corruptC.test, corruptD.test, corruptE.test
 Sources:
-  /home/dev/work/sqlitec/test/corruptB.test
-  /home/dev/work/sqlitec/test/corruptC.test
-  /home/dev/work/sqlitec/test/corruptD.test
-  /home/dev/work/sqlitec/test/corruptE.test
+
+	/home/dev/work/sqlitec/test/corruptB.test
+	/home/dev/work/sqlitec/test/corruptC.test
+	/home/dev/work/sqlitec/test/corruptD.test
+	/home/dev/work/sqlitec/test/corruptE.test
 
 Test scenario:
 Four corruption test files that exercise corruption detection in the B-tree layer:
-- corruptB: Tests B-tree loop detection (circular page references where a page is
-  both an ancestor and descendant of itself) and out-of-range page pointers.
-- corruptC: Single-byte corruption at known offsets (firstFreeBlk on page 1,
-  overflow page corruption near EOF) and a byte-by-byte fuzzing loop.
-- corruptD: Page header field corruption (firstFreeBlk set to 0xFFFF or near
-  page end) to verify no buffer overreads.
-- corruptE: Key ordering corruption -- targeted byte patching to break the
-  sorted-key invariant, verifying IntegrityCheck detects out-of-order entries.
+  - corruptB: Tests B-tree loop detection (circular page references where a page is
+    both an ancestor and descendant of itself) and out-of-range page pointers.
+  - corruptC: Single-byte corruption at known offsets (firstFreeBlk on page 1,
+    overflow page corruption near EOF) and a byte-by-byte fuzzing loop.
+  - corruptD: Page header field corruption (firstFreeBlk set to 0xFFFF or near
+    page end) to verify no buffer overreads.
+  - corruptE: Key ordering corruption -- targeted byte patching to break the
+    sorted-key invariant, verifying IntegrityCheck detects out-of-order entries.
 
 Deviations from original:
-- corruptB-1.*: Original uses PRAGMA auto_vacuum=1 which adds pointer-map pages.
-  We use auto_vacuum=0 (our only mode). Root page and offsets are computed
-  dynamically via ns.RootPage(). Original inserts via SQL doubling; we insert
-  directly via Put.
-- corruptB-3.1: OUT_OF_SCOPE -- SQL record header-size corruption. Our B-tree
-  stores raw key-value bytes without SQLite's record format.
-- corruptC-1.1, corruptC-2.1 through 2.12, 2.15: OUT_OF_SCOPE -- require
-  CREATE INDEX or sqlite_master queries.
-- corruptC-2.2 through 2.11: OUT_OF_SCOPE -- schema-dependent offsets.
-- corruptC-2.13: ADAPTABLE -- firstFreeBlk corruption on page 1.
-- corruptC-2.14: ADAPTABLE -- overflow page corruption near EOF.
-- corruptC-3.*: ADAPTABLE -- simplified byte-by-byte fuzz (single corruption per
-  offset, stride every 1 byte). Gated behind !testing.Short().
-- corruptD-1.0: OUT_OF_SCOPE -- requires CREATE INDEX.
-- corruptD-1.1.1, 1.1.2: ADAPTABLE -- firstFreeBlk corruption on namespace root.
-- corruptD-1.2.*, 1.4.*, 1.5.*: OUT_OF_SCOPE -- empty/stub tests in original.
-- corruptE-1.*, 2.*: OUT_OF_SCOPE -- require CREATE INDEX and schema-dependent offsets.
-- corruptE-3.*: ADAPTABLE -- concept-level adaptation. We create our own DB with
-  sequential keys, find cell offsets, corrupt key bytes to break ordering, and
-  verify IntegrityCheck detects it.
+  - corruptB-1.*: Original uses PRAGMA auto_vacuum=1 which adds pointer-map pages.
+    We use auto_vacuum=0 (our only mode). Root page and offsets are computed
+    dynamically via ns.RootPage(). Original inserts via SQL doubling; we insert
+    directly via Put.
+  - corruptB-3.1: OUT_OF_SCOPE -- SQL record header-size corruption. Our B-tree
+    stores raw key-value bytes without SQLite's record format.
+  - corruptC-1.1, corruptC-2.1 through 2.12, 2.15: OUT_OF_SCOPE -- require
+    CREATE INDEX or sqlite_master queries.
+  - corruptC-2.2 through 2.11: OUT_OF_SCOPE -- schema-dependent offsets.
+  - corruptC-2.13: ADAPTABLE -- firstFreeBlk corruption on page 1.
+  - corruptC-2.14: ADAPTABLE -- overflow page corruption near EOF.
+  - corruptC-3.*: ADAPTABLE -- simplified byte-by-byte fuzz (single corruption per
+    offset, stride every 1 byte). Gated behind !testing.Short().
+  - corruptD-1.0: OUT_OF_SCOPE -- requires CREATE INDEX.
+  - corruptD-1.1.1, 1.1.2: ADAPTABLE -- firstFreeBlk corruption on namespace root.
+  - corruptD-1.2.*, 1.4.*, 1.5.*: OUT_OF_SCOPE -- empty/stub tests in original.
+  - corruptE-1.*, 2.*: OUT_OF_SCOPE -- require CREATE INDEX and schema-dependent offsets.
+  - corruptE-3.*: ADAPTABLE -- concept-level adaptation. We create our own DB with
+    sequential keys, find cell offsets, corrupt key bytes to break ordering, and
+    verify IntegrityCheck detects it.
 */
 package btree
 
@@ -962,9 +963,9 @@ func TestSqlite_CorruptE_3_KeyOrderingVectors(t *testing.T) {
 	type corruptVector struct {
 		name   string
 		pgno   uint32
-		cellID int   // which cell on the page to corrupt
-		keyOff int   // which byte within the key to corrupt (0-based)
-		value  byte  // corrupt value
+		cellID int  // which cell on the page to corrupt
+		keyOff int  // which byte within the key to corrupt (0-based)
+		value  byte // corrupt value
 	}
 
 	// We need pages with at least 3 cells so we can corrupt a middle one
@@ -1013,7 +1014,7 @@ func TestSqlite_CorruptE_3_KeyOrderingVectors(t *testing.T) {
 			name:   fmt.Sprintf("leaf%d_cell%d_pg%d", i, targetCell, pgno),
 			pgno:   pgno,
 			cellID: targetCell,
-			keyOff: 0,                    // most significant byte
+			keyOff: 0,                         // most significant byte
 			value:  template[keyStart] + 0x80, // make much larger
 		})
 

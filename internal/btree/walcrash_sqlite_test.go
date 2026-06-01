@@ -1,44 +1,45 @@
 /*
 Ported from SQLite: walcrash.test, pager1.test, wal6.test
 Sources:
-  /home/dev/work/sqlitec/test/walcrash.test
-  /home/dev/work/sqlitec/test/pager1.test
-  /home/dev/work/sqlitec/test/wal6.test
+
+	/home/dev/work/sqlitec/test/walcrash.test
+	/home/dev/work/sqlitec/test/pager1.test
+	/home/dev/work/sqlitec/test/wal6.test
 
 Test scenario:
 Ten WAL crash recovery, pager edge case, and MVCC tests:
-- walcrash-1: Basic crash recovery -- insert 3 rows, rawClose, reopen, verify,
-  insert 2 more, rawClose, reopen, verify.
-- walcrash-2: Same crash recovery pattern with different key/value data
-  (simulates PRIMARY KEY table in original).
-- walcrash-4: Crash recovery with page_size=1024, verify specific key lookup.
-- walcrash-5: Insert 32 rows of 900-byte blobs, checkpoint, insert 3 more,
-  rawClose, verify count.
-- walcrash-6: Insert 32 rows of 900-byte blobs, checkpoint, insert 4 rows of
-  9000-byte overflow blobs, rawClose, verify count.
-- walcrash-7: Various page sizes, insert, checkpoint, insert more, checkpoint
-  again, rawClose, verify.
-- pager1-20.3: WAL commit with small cache_size=10, insert 32 rows of 800 bytes.
-- pager1-25.1/25.2: Savepoint rollback of namespace creation.
-- pager1-38: Open garbage file, expect error.
-- wal6-2: MVCC snapshot isolation -- reader sees old snapshot while writer commits.
+  - walcrash-1: Basic crash recovery -- insert 3 rows, rawClose, reopen, verify,
+    insert 2 more, rawClose, reopen, verify.
+  - walcrash-2: Same crash recovery pattern with different key/value data
+    (simulates PRIMARY KEY table in original).
+  - walcrash-4: Crash recovery with page_size=1024, verify specific key lookup.
+  - walcrash-5: Insert 32 rows of 900-byte blobs, checkpoint, insert 3 more,
+    rawClose, verify count.
+  - walcrash-6: Insert 32 rows of 900-byte blobs, checkpoint, insert 4 rows of
+    9000-byte overflow blobs, rawClose, verify count.
+  - walcrash-7: Various page sizes, insert, checkpoint, insert more, checkpoint
+    again, rawClose, verify.
+  - pager1-20.3: WAL commit with small cache_size=10, insert 32 rows of 800 bytes.
+  - pager1-25.1/25.2: Savepoint rollback of namespace creation.
+  - pager1-38: Open garbage file, expect error.
+  - wal6-2: MVCC snapshot isolation -- reader sees old snapshot while writer commits.
 
 Deviations from original:
-- walcrash-1 through 7: Original uses `crashsql` to crash at random delay points
-  via a special VFS. We use rawClose(db) to simulate crash (no checkpoint on close).
-  Since rawClose is deterministic, we run 3 iterations instead of the original's 100.
-- walcrash-4: Original specifies blocksize=4096 for crashsql (irrelevant to our sim).
-- walcrash-5: Original inserts rows individually (auto-commit). We batch inserts
-  into groups of 4 per transaction for efficiency.
-- walcrash-7: Original crashes DURING checkpoint. We checkpoint then rawClose,
-  which is not exactly the same but tests the recovery path.
-- pager1-20.3: Original uses recursive_select Tcl proc to force cache population
-  during write. We use a cursor scan within the write transaction.
-- pager1-25.1/25.2: Original uses SAVEPOINT as transaction boundary (25.2).
-  Our API requires BeginWrite + Savepoint, so both tests are structurally similar.
-- pager1-38: Original tests sqlite3_errmsg. We test Open() returning error.
-- wal6-2: Original tests SQLITE_BUSY_SNAPSHOT (reader-to-writer upgrade).
-  Our API doesn't support tx upgrades; we test core MVCC isolation instead.
+  - walcrash-1 through 7: Original uses `crashsql` to crash at random delay points
+    via a special VFS. We use rawClose(db) to simulate crash (no checkpoint on close).
+    Since rawClose is deterministic, we run 3 iterations instead of the original's 100.
+  - walcrash-4: Original specifies blocksize=4096 for crashsql (irrelevant to our sim).
+  - walcrash-5: Original inserts rows individually (auto-commit). We batch inserts
+    into groups of 4 per transaction for efficiency.
+  - walcrash-7: Original crashes DURING checkpoint. We checkpoint then rawClose,
+    which is not exactly the same but tests the recovery path.
+  - pager1-20.3: Original uses recursive_select Tcl proc to force cache population
+    during write. We use a cursor scan within the write transaction.
+  - pager1-25.1/25.2: Original uses SAVEPOINT as transaction boundary (25.2).
+    Our API requires BeginWrite + Savepoint, so both tests are structurally similar.
+  - pager1-38: Original tests sqlite3_errmsg. We test Open() returning error.
+  - wal6-2: Original tests SQLITE_BUSY_SNAPSHOT (reader-to-writer upgrade).
+    Our API doesn't support tx upgrades; we test core MVCC isolation instead.
 */
 package btree
 

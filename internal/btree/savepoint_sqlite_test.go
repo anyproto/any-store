@@ -14,31 +14,31 @@ multi-client locking — all of which are out of scope for our WAL-only
 key-value btree.
 
 Deviations from original:
-- savepoint-1.*: SQLite uses named savepoints outside explicit transactions
-  (implicit auto-commit transaction). Our API requires savepoints within a
-  WriteTx, so each test is wrapped in BeginWrite/Commit.
-- savepoint-1.3: SQLite tests SAVEPOINT + db close without RELEASE.
-  Adapted as BeginWrite + Savepoint + db.Close() without Commit.
-- savepoint-1.6: Skipped — tests COMMIT of implicit auto-commit tx (SQL-only).
-- savepoint-1.7: Skipped — wal_check_journal_mode (always WAL).
-- savepoint-2.12: Skipped — wal_check_journal_mode.
-- savepoint-3.*: Skipped — lock_status in rollback mode only (WAL-only btree).
-- savepoint-4.*: Skipped — DDL (CREATE/DROP TABLE) inside savepoints.
-- savepoint-5.*: Skipped — incrblob, multi-handle locking.
-- savepoint-6.*: Skipped — incremental vacuum.
-- savepoint-7.*: Skipped — incremental vacuum + DDL.
-- savepoint-8-1, 8-2: SQLite tests quoted/whitespace savepoint names.
-  Our API uses integer IDs; adapted as basic savepoint create + release.
-- savepoint-9.*: Skipped — authorization callbacks.
-- savepoint-10.*: Skipped — ATTACH databases.
-- savepoint-11.*: Skipped — auto_vacuum + DDL.
-- savepoint-12.*: Skipped — ON CONFLICT ROLLBACK with UNIQUE constraints.
-- savepoint-13.*: Skipped — journal_mode=off (rollback mode only).
-- savepoint-14.*, 15.*, 16.*: Skipped — multi-client (multi-process) tests.
-- savepoint-17.1: CREATE TABLE inside BEGIN is out of scope. Adapted by
-  creating namespace before the main tx, testing data insert + savepoint +
-  rollback + full tx rollback.
-- savepoint-17.2: Skipped — tests schema cache cleanup after ROLLBACK (SQL-only).
+  - savepoint-1.*: SQLite uses named savepoints outside explicit transactions
+    (implicit auto-commit transaction). Our API requires savepoints within a
+    WriteTx, so each test is wrapped in BeginWrite/Commit.
+  - savepoint-1.3: SQLite tests SAVEPOINT + db close without RELEASE.
+    Adapted as BeginWrite + Savepoint + db.Close() without Commit.
+  - savepoint-1.6: Skipped — tests COMMIT of implicit auto-commit tx (SQL-only).
+  - savepoint-1.7: Skipped — wal_check_journal_mode (always WAL).
+  - savepoint-2.12: Skipped — wal_check_journal_mode.
+  - savepoint-3.*: Skipped — lock_status in rollback mode only (WAL-only btree).
+  - savepoint-4.*: Skipped — DDL (CREATE/DROP TABLE) inside savepoints.
+  - savepoint-5.*: Skipped — incrblob, multi-handle locking.
+  - savepoint-6.*: Skipped — incremental vacuum.
+  - savepoint-7.*: Skipped — incremental vacuum + DDL.
+  - savepoint-8-1, 8-2: SQLite tests quoted/whitespace savepoint names.
+    Our API uses integer IDs; adapted as basic savepoint create + release.
+  - savepoint-9.*: Skipped — authorization callbacks.
+  - savepoint-10.*: Skipped — ATTACH databases.
+  - savepoint-11.*: Skipped — auto_vacuum + DDL.
+  - savepoint-12.*: Skipped — ON CONFLICT ROLLBACK with UNIQUE constraints.
+  - savepoint-13.*: Skipped — journal_mode=off (rollback mode only).
+  - savepoint-14.*, 15.*, 16.*: Skipped — multi-client (multi-process) tests.
+  - savepoint-17.1: CREATE TABLE inside BEGIN is out of scope. Adapted by
+    creating namespace before the main tx, testing data insert + savepoint +
+    rollback + full tx rollback.
+  - savepoint-17.2: Skipped — tests schema cache cleanup after ROLLBACK (SQL-only).
 */
 package btree
 

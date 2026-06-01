@@ -304,7 +304,7 @@ func TestSeekKey_MatchesCursor(t *testing.T) {
 
 	// Test existing keys, gap keys, and boundary keys.
 	probes := []string{
-		"aaa",     // before all
+		"aaa",                                          // before all
 		"key-0000", "key-0001", "key-0250", "key-0499", // exact
 		"key-0000x", "key-0100z", "key-0499z", // gaps
 		"zzz", // past all

@@ -21,6 +21,12 @@ const (
 	// shmRegionSize is the size of each shared memory region (32 KB, matching SQLite).
 	shmRegionSize = 32768
 
+	// shmPageSize is the fixed page granularity SQLite uses when pre-touching
+	// newly extended shm pages to force the OS to back them (avoiding SIGBUS).
+	// SQLite hardcodes `static const int pgsz = 4096;` regardless of the actual
+	// OS page size (os_unix.c:5175), so we match that constant exactly here.
+	shmPageSize = 4096
+
 	// shmHeaderOffset is the byte offset of the WAL index header in region 0.
 	shmHeaderOffset = 0
 
@@ -69,6 +75,7 @@ func (s *inProcessShm) region(index int, create bool) ([]byte, error) {
 	return s.regions[index], nil
 }
 
+// DRIFT: in-process/mmap shm collapse per-conn masks to one refcount; repeat shared not no-op See docs/btree/NOTES.md#drift-81-in-process-shm-lock-collapses-per-connection-masks-to-single
 func (s *inProcessShm) lock(slot int, lockType int) error {
 	if slot < 0 || slot >= lockSlotCount {
 		return fmt.Errorf("btree: invalid lock slot %d", slot)
@@ -111,6 +118,7 @@ func (s *inProcessShm) unlock(slot int, lockType int) error {
 	return nil
 }
 
+// DRIFT: inProcessShm.close non-terminal: regions cleared but object/lock-state reusable See docs/btree/NOTES.md#drift-80-inprocessshm-close-non-terminal-teardown
 func (s *inProcessShm) close(isLastClient bool) error {
 	_ = isLastClient
 	s.regMu.Lock()

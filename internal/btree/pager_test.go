@@ -415,6 +415,37 @@ func TestAllocateFromFreelist_CorruptTrunk(t *testing.T) {
 	p.endRead(slot)
 }
 
+// TestFreelistAggregateCountCorruptionGuard verifies the upfront aggregate
+// freelist-count corruption guard, mirroring C allocateBtreePage
+// (btree.c:6538-6542): if the recorded freelist page count (page-1 offset 36,
+// header.TotalFreelistPgs) is >= the DB page count (dbSize), the whole
+// allocation is rejected with ErrCorrupt before the trunk is consulted.
+func TestFreelistAggregateCountCorruptionGuard(t *testing.T) {
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf)
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
+
+	// Nonzero freelist head so the trunk-path guard is reached, with a
+	// recorded freelist count >= the DB page count (impossible for any
+	// legitimate state, since every freelist page is a real page counted
+	// within dbSize).
+	p.header.FirstFreelistPg = 1
+	p.header.TotalFreelistPgs = p.dbSize.Load()
+
+	_, err = p.allocateFromFreelist(0)
+	assert.ErrorIs(t, err, ErrCorrupt)
+
+	require.NoError(t, p.rollback())
+	p.endRead(slot)
+}
+
 func TestAllocateFromFreelist_CorruptLeafCount(t *testing.T) {
 	dir := t.TempDir()
 	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
@@ -668,6 +699,80 @@ func TestReadPageUncached_InMemoryFallback(t *testing.T) {
 	pg, err := p.getPageReader(1, 0, nil)
 	require.NoError(t, err)
 	p.releasePage(pg)
+}
+
+// TestGetPage_BeyondDbSizeZeroesStaleDiskBytes is the regression test for
+// drift-5 (getPageWriter Reads Disk Before Checking dbSize). It plants stale,
+// physically-present, non-zero bytes in the DB file at a page number ABOVE the
+// logical database size (the precise hazard of a since-truncated region whose
+// physical ftruncate is deferred), then verifies all three getters
+// (getPageWriter, getPageReader cache path, readTempPage via the nil-cache
+// fallback) return a CLEAN ZEROED page rather than resurrecting the stale
+// bytes. This matches C getPageNormal, which memset(0)s any page whose pgno
+// exceeds pPager->dbSize without ever touching WAL or disk (pager.c:5590,5615).
+//
+// Before the fix these getters called readDBPage FIRST and only consulted
+// dbSize afterward, so a physically-present out-of-bounds page returned its
+// stale on-disk content. After the fix the upfront `pgno > bound` guard zeroes
+// the page, so the test fails (sees 0xAB bytes) without the fix and passes with
+// it.
+func TestGetPage_BeyondDbSizeZeroesStaleDiskBytes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	p := newPager(path, 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	// Sanity: a freshly opened DB has dbSize 1 (page 1 only). The stale page
+	// number sits well beyond that logical size.
+	require.Equal(t, uint32(1), p.dbSize.Load())
+	const stalePgno = uint32(7)
+
+	// Physically grow the file and plant non-zero stale bytes at stalePgno,
+	// WITHOUT bumping dbSize. mmap is disabled in this harness (mmapSize==0),
+	// so readDBPage uses ReadAt and will see these bytes if it is ever reached.
+	stale := make([]byte, p.pageSize)
+	for i := range stale {
+		stale[i] = 0xAB
+	}
+	off := int64(stalePgno-1) * int64(p.pageSize)
+	_, err := p.file.WriteAt(stale, off)
+	require.NoError(t, err)
+
+	allZero := func(t *testing.T, pg *page) {
+		t.Helper()
+		for i, b := range pg.data {
+			require.Zerof(t, b, "page byte %d should be zero (got 0x%02X); stale disk bytes leaked", i, b)
+		}
+		require.Equal(t, pageHeader{}, pg.header, "page header should be zero-value")
+	}
+
+	// (A) getPageWriter: writer bounds on p.dbSize.
+	pgW, err := p.getPageWriter(stalePgno, 0)
+	require.NoError(t, err)
+	allZero(t, pgW)
+	// Drop it from the writer cache so the reader paths below don't short-
+	// circuit on a cache hit — we want each getter's own upfront guard tested.
+	p.writerCache.clear()
+
+	// (C) getPageReader cache path: bounds on readerDbSizeBound(cache). With an
+	// unset cache.dbSize the bound degrades to p.dbSize (==1), so stalePgno is
+	// out of bounds. beginRead establishes the read snapshot.
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	cache := newPcache(int(p.pageSize), 50, true)
+	pgR, err := p.getPageReader(stalePgno, mf, cache)
+	require.NoError(t, err)
+	allZero(t, pgR)
+
+	// (B) readTempPage via getPageReader's nil-cache fallback (uncached path).
+	pgT, err := p.getPageReader(stalePgno, mf, nil)
+	require.NoError(t, err)
+	allZero(t, pgT)
+	p.releasePage(pgT)
+
+	p.endRead(slot)
 }
 
 // ============================================================
@@ -1025,8 +1130,14 @@ func TestReadOverflowChainInternal_CorruptPageNumbers(t *testing.T) {
 	require.NoError(t, p.open())
 	defer p.close()
 
-	// pgno=0 causes the loop to exit immediately (no error)
+	// pgno=0 ends the chain before any of the 100 requested bytes are read:
+	// a premature terminator. Mirrors C accessPayload's post-loop completeness
+	// check (btree.c:5327-5330) -> SQLITE_CORRUPT_PAGE.
 	err := p.readOverflowChainAt(0, make([]byte, 100), 0)
+	assert.ErrorIs(t, err, ErrCorrupt)
+
+	// pgno=0 with a zero-length request is a complete read (nothing requested).
+	err = p.readOverflowChainAt(0, nil, 0)
 	assert.NoError(t, err)
 
 	// pgno=1 -> 1 < 2 -> ErrCorrupt
@@ -1915,10 +2026,12 @@ func TestCheckpointWithMode_Truncate(t *testing.T) {
 	err = p.checkpointWithMode(CheckpointTruncate)
 	require.NoError(t, err)
 
-	// WAL file should be truncated then writeHeader writes 32 bytes
+	// After TRUNCATE the WAL file is 0 bytes: SQLite walRestartHdr updates only the
+	// SHM wal-index header (new salt) then truncates the WAL to 0 (wal.c:2362-2378);
+	// the on-disk header is rewritten lazily on the next writer's first frame.
 	info, err := os.Stat(p.path + "-wal")
 	require.NoError(t, err)
-	assert.Equal(t, int64(walHeaderSize), info.Size())
+	assert.Equal(t, int64(0), info.Size())
 }
 
 func TestCheckpointWithMode_PassiveNoBusyHandler(t *testing.T) {
@@ -2006,11 +2119,19 @@ func TestCheckpointPost_IncompleteBackfill(t *testing.T) {
 	require.NoError(t, w.writeFrames([]*page{pg}, true, 1))
 	w.endWrite()
 
-	// Set nBackfill < nFrame -> checkpointPost should return nil (can't reset)
+	// Set nBackfill < nFrame -> backfill incomplete, can't reset. For a
+	// non-PASSIVE mode (CheckpointRestart) checkpointPost now returns ErrBusy,
+	// matching SQLite's walCheckpoint (wal.c:2351-2356): active readers/writers
+	// prevented copying the whole WAL, so the caller learns it must retry.
 	w.index.nBackfill.Store(0)
 
 	err := w.checkpointPost(CheckpointRestart, nil)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrBusy)
+
+	// PASSIVE keeps the original contract: nil (success) on incomplete backfill,
+	// so auto-checkpoint/close paths are unaffected.
+	errPassive := w.checkpointPost(CheckpointPassive, nil)
+	require.NoError(t, errPassive)
 }
 
 // ============================================================
@@ -2060,8 +2181,9 @@ func TestTryResetWALWithBusy_Truncate(t *testing.T) {
 
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	// After truncate + writeHeader, file has 32-byte header
-	assert.Equal(t, int64(walHeaderSize), info.Size())
+	// After TRUNCATE the WAL file is 0 bytes (SQLite walRestartHdr + OsTruncate(0),
+	// wal.c:2362-2378); the on-disk header is deferred to the next writer's first frame.
+	assert.Equal(t, int64(0), info.Size())
 }
 
 func TestTryResetWALWithBusy_SlotsBusy(t *testing.T) {
@@ -2163,8 +2285,9 @@ func TestDoResetWAL_Truncate(t *testing.T) {
 
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	// After truncate + writeHeader, file has just the 32-byte header
-	assert.Equal(t, int64(walHeaderSize), info.Size())
+	// After TRUNCATE the WAL file is 0 bytes (SQLite walRestartHdr + OsTruncate(0),
+	// wal.c:2362-2378); the on-disk header is deferred to the next writer's first frame.
+	assert.Equal(t, int64(0), info.Size())
 	assert.Equal(t, uint32(0), w.nFrame.Load())
 }
 
@@ -2219,22 +2342,22 @@ func TestShmHashWriteGet_CrossSegment(t *testing.T) {
 	// Write entries that span multiple segments
 	// Region 0 holds htNPageOne = 4062 entries
 	for i := uint32(1); i <= 4070; i++ {
-		idx.shmHashWrite(i, i)
+		mustShmHashWrite(t, idx, i, i)
 	}
 
 	// Look up some entries
-	frame := idx.shmHashGet(1, 5000, 1)
+	frame := mustShmHashGet(t, idx, 1, 5000, 1)
 	assert.Equal(t, uint32(1), frame)
 
-	frame = idx.shmHashGet(4070, 5000, 1)
+	frame = mustShmHashGet(t, idx, 4070, 5000, 1)
 	assert.Equal(t, uint32(4070), frame)
 
 	// Look up non-existent
-	frame = idx.shmHashGet(9999, 5000, 1)
+	frame = mustShmHashGet(t, idx, 9999, 5000, 1)
 	assert.Equal(t, uint32(0), frame)
 
 	// maxFrame=0 returns 0
-	frame = idx.shmHashGet(1, 0, 1)
+	frame = mustShmHashGet(t, idx, 1, 0, 1)
 	assert.Equal(t, uint32(0), frame)
 }
 
@@ -2729,8 +2852,12 @@ func TestCheckpointWithMode_DowngradeToPassive(t *testing.T) {
 	// Hold write lock to force downgrade from FULL to PASSIVE
 	require.NoError(t, p.wal.index.lock(lockWrite, lockExclusive))
 
+	// The backfill still completes (no readers), but the requested FULL mode was
+	// silently downgraded to PASSIVE because the writer lock was busy. SQLite
+	// re-surfaces this as SQLITE_BUSY (wal.c:4356 eMode2=PASSIVE + wal.c:4425
+	// eMode!=eMode2 ? BUSY) so the caller knows the stronger mode did not run.
 	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrBusy)
 
 	_ = p.wal.index.unlock(lockWrite, lockExclusive)
 }
@@ -3020,7 +3147,7 @@ func TestShmHashGet_RegionError(t *testing.T) {
 	defer idx.close(false)
 
 	// Query when no regions have data -> should return 0
-	frame := idx.shmHashGet(1, 100, 1)
+	frame := mustShmHashGet(t, idx, 1, 100, 1)
 	assert.Equal(t, uint32(0), frame)
 }
 
@@ -3249,16 +3376,21 @@ func TestAllocatePage_AllocateFromFreelistFails(t *testing.T) {
 	p.walMaxFrame.Store(mf)
 	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
-	// Set corrupted freelist header so allocateFromFreelist fails
+	// Set corrupted freelist header so allocateFromFreelist fails.
+	// trunkPgno 999 > dbSize triggers the trunk-page guard in
+	// allocateFromFreelist (pager.go ~1395). With FirstFreelistPg != 0,
+	// allocatePage must propagate ErrCorrupt rather than silently
+	// growing the DB (matches SQLite allocateBtreePage, btree.c:6543).
 	p.header.FirstFreelistPg = 999
-	// allocatePage should fall through to grow database
 	pg, err := p.allocatePage()
-	require.NoError(t, err)
-	assert.GreaterOrEqual(t, pg.pgno, uint32(2))
-	p.releasePage(pg)
-
-	require.NoError(t, p.rollback())
+	// Roll back the writer transaction BEFORE asserting so a failing
+	// assertion (FailNow) doesn't leave the writer RWMutex held, which
+	// would deadlock the deferred p.close().
+	rbErr := p.rollback()
 	p.endRead(slot)
+	require.ErrorIs(t, err, ErrCorrupt)
+	require.Nil(t, pg)
+	require.NoError(t, rbErr)
 }
 
 // ============================================================
@@ -3310,11 +3442,17 @@ func TestShmHashWrite_RegionError(t *testing.T) {
 	idx, err := newWalIndex(filepath.Join(dir, "test.shm"), true)
 	require.NoError(t, err)
 
-	// Close shm to cause region errors
+	// Close the in-process shm. Note: inProcessShm.close() only nils the region
+	// slices; a subsequent region(0, create=true) re-allocates a fresh region,
+	// so this does NOT actually surface a region error. shmHashWrite therefore
+	// succeeds (returns nil) — the test asserts it handles a closed shm
+	// gracefully (no panic) and now also that no spurious error is returned.
+	// The genuine region-error propagation path (errorRegionShm) is covered by
+	// TestWalIndex_ShmHashWrite_RegionError.
 	idx.close(false)
 
-	// shmHashWrite should handle error gracefully (no panic)
-	idx.shmHashWrite(1, 1)
+	err = idx.shmHashWrite(1, 1)
+	require.NoError(t, err)
 }
 
 // ============================================================
@@ -3453,11 +3591,14 @@ func TestCheckpointWithMode_FullFallbackToPassive(t *testing.T) {
 	require.NoError(t, err)
 	p.endRead(slot)
 
-	// Hold write lock -> FULL downgrades to PASSIVE
+	// Hold write lock -> RESTART downgrades to PASSIVE. The requested mode was
+	// silently downgraded because the writer lock was busy, which SQLite
+	// re-surfaces as SQLITE_BUSY (wal.c:4356 + wal.c:4425) so the caller knows
+	// the RESTART did not run (the WAL was not reset).
 	require.NoError(t, p.wal.index.lock(lockWrite, lockExclusive))
 
 	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointRestart, nil)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrBusy)
 
 	_ = p.wal.index.unlock(lockWrite, lockExclusive)
 }
@@ -3734,20 +3875,30 @@ func TestFreePage_TrunkReadError(t *testing.T) {
 	p.walMaxFrame.Store(mf)
 	require.NoError(t, p.beginWrite(WalIndexHdr{}))
 
-	// Set up a freelist pointing to an invalid page
-	p.header.FirstFreelistPg = 999 // Beyond dbSize
-
-	// Allocate a real page to free
+	// Allocate a real page to free, while the freelist is still empty so
+	// allocatePage grows the DB (allocatePage now propagates freelist
+	// errors instead of silently growing, so the corrupt FirstFreelistPg
+	// must be set AFTER this allocation).
 	pg, err := p.allocatePage()
-	require.NoError(t, err)
+	// Roll back / release writer state before any failing assertion so a
+	// FailNow doesn't leave the writer RWMutex held and deadlock close().
+	if err != nil {
+		_ = p.rollback()
+		p.endRead(slot)
+		require.NoError(t, err)
+	}
 	pgno := pg.pgno
 	p.releasePage(pg)
 
-	err = p.freePage(pgno)
-	assert.ErrorIs(t, err, ErrCorrupt)
+	// Set up a freelist pointing to an invalid page so freePage's trunk
+	// read hits the corrupt-trunk guard.
+	p.header.FirstFreelistPg = 999 // Beyond dbSize
 
-	require.NoError(t, p.rollback())
+	freeErr := p.freePage(pgno)
+	rbErr := p.rollback()
 	p.endRead(slot)
+	assert.ErrorIs(t, freeErr, ErrCorrupt)
+	require.NoError(t, rbErr)
 }
 
 // --- pager.go:668-680 freePage() getWritablePage fails with savepoints ---
@@ -4948,11 +5099,12 @@ func TestCheckpointWithMode_Truncate_Full(t *testing.T) {
 	err = p.wal.checkpointWithMode(p.file, p.master, CheckpointTruncate, nil)
 	require.NoError(t, err)
 
-	// WAL file should have header size (32 bytes) after truncate+writeHeader
+	// After TRUNCATE the WAL file is 0 bytes (SQLite walRestartHdr + OsTruncate(0),
+	// wal.c:2362-2378); the on-disk header is deferred to the next writer's first frame.
 	walPath := path + "-wal"
 	info, err := os.Stat(walPath)
 	require.NoError(t, err)
-	assert.Equal(t, int64(walHeaderSize), info.Size())
+	assert.Equal(t, int64(0), info.Size())
 }
 
 // Test checkpointWithMode FULL with everything checkpointed but no reset
@@ -5020,6 +5172,73 @@ func TestWriteOverflowChain_MultiPage(t *testing.T) {
 	err = p.readOverflowChainAt(firstPg, readBuf, p.walMaxFrame.Load())
 	require.NoError(t, err)
 	assert.Equal(t, data, readBuf)
+
+	require.NoError(t, p.rollback())
+	p.endRead(slot)
+}
+
+// TestWriteOverflowChain_AllocateError_MidChainReleasesPrev verifies that when
+// a mid-chain overflow-page allocation fails (prevPg already pinned), the
+// previously-held overflow page is released rather than leaked. This mirrors C
+// fillInCell's allocation-failure path (btree.c:7235-7238: releasePage(pToRelease)).
+func TestWriteOverflowChain_AllocateError_MidChainReleasesPrev(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	p := newPager(path, 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf)
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
+
+	// Allocate two pages by growing the DB. pgA becomes the freelist trunk and
+	// pgB becomes a valid leaf on it. We then hand-craft the trunk so that the
+	// FIRST overflow allocation succeeds (pops pgB) but the SECOND allocation
+	// fails: after pgB is popped, leafCount drops to 0, so the trunk-recycle
+	// branch reads the (deliberately corrupt) next-trunk pointer and returns
+	// ErrCorrupt. This exercises the loop with prevPg already pinned.
+	pgA, err := p.allocatePage()
+	require.NoError(t, err)
+	pgAno := pgA.pgno
+	p.releasePage(pgA)
+
+	pgB, err := p.allocatePage()
+	require.NoError(t, err)
+	pgBno := pgB.pgno
+	p.releasePage(pgB)
+
+	// Build the trunk page pgA: leafCount=1, leaf[0]=pgB (valid), and a corrupt
+	// next-trunk pointer so the second allocation (leafCount==0) trips the
+	// trunk-validation guard (nextTrunk > dbSize → ErrCorrupt).
+	trunkPg, err := p.getWritablePage(pgAno)
+	require.NoError(t, err)
+	clear(trunkPg.data)
+	binary.BigEndian.PutUint32(trunkPg.data[0:4], p.dbSize.Load()+999) // corrupt next-trunk
+	binary.BigEndian.PutUint32(trunkPg.data[4:8], 1)                   // leafCount = 1
+	binary.BigEndian.PutUint32(trunkPg.data[8:12], pgBno)              // leaf[0] = pgB
+	trunkPg.header = pageHeader{}
+	p.releasePage(trunkPg)
+
+	p.header.FirstFreelistPg = pgAno
+	p.header.TotalFreelistPgs = 2 // < dbSize so the aggregate guard passes
+
+	// Data spanning exactly two overflow pages forces two allocations: the
+	// first pops pgB (success), the second hits the corrupt trunk (failure).
+	usable := overflowPageUsable(p.usableSize())
+	data := make([]byte, usable+10)
+
+	_, err = p.writeOverflowChain(data)
+	require.ErrorIs(t, err, ErrCorrupt)
+
+	// The first overflow page (allocated from pgB) must have been released by
+	// the allocation-failure path; otherwise its pin leaks. Without the fix,
+	// pinCount stays at 1.
+	leakedPg := p.writerCache.hashFind(pgBno)
+	require.NotNil(t, leakedPg, "expected the first overflow page to remain cached")
+	assert.Equal(t, 0, leakedPg.pinCount, "first overflow page pin leaked on allocation failure")
 
 	require.NoError(t, p.rollback())
 	p.endRead(slot)
@@ -5639,9 +5858,12 @@ func TestWalIndex_ShmHashWrite_RegionError(t *testing.T) {
 		regionErr:  os.ErrClosed,
 	}
 
-	// shmHashWrite for frame 4097 should hit region 1 and silently return.
-	// The function has no return value; it just returns early.
-	w.index.shmHashWrite(1, 4097) // should not panic, just return
+	// shmHashWrite for frame 4097 should hit region 1 and now propagate the
+	// region error to its caller (previously it returned void/silently). This
+	// mirrors C's walIndexAppend returning the walHashGet failure rc
+	// (wal.c:1299-1304), letting writeFrames/writeFramesMem abort the commit.
+	err := w.index.shmHashWrite(1, 4097)
+	require.ErrorIs(t, err, os.ErrClosed)
 }
 
 // --- wal.go:850-852 shmWriteCkptInfo region error ---

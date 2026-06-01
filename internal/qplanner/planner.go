@@ -213,6 +213,12 @@ type CBOIndex struct {
 	// Sort coverage analysis
 	ExactSort   bool
 	PartialSort bool
+
+	// SortMatchStart is the index-field position where IndexSortMatch aligned
+	// the sort run (0 for a prefix match, or the equality prefix when the
+	// equality-pinned start wins). shouldReverse reads idx.Reverse[SortMatchStart]
+	// to decide forward vs reverse scan. Only load-bearing when ExactSort is true.
+	SortMatchStart int
 }
 
 // BuildPlan constructs an iterator chain using the Cost-Based Optimizer.
@@ -591,6 +597,21 @@ func sortCost(n float64) float64 {
 	return n * math.Log2(n) * CostSortSwap
 }
 
+// sortTopK returns the bounded heap size for an in-memory SortIter.
+//
+// The bounded max-heap optimization (keep only the smallest Limit+Offset rows)
+// is sound ONLY when a finite Limit caps the result window. With Limit == 0 the
+// caller wants the full result tail past Offset, so the heap must be unbounded
+// (TopK == 0 → full sort): a heap sized to just Offset would retain exactly the
+// rows the subsequent LimitIter then skips, yielding zero results. See the
+// offset-without-limit regression in offset/limit tests.
+func sortTopK(params *PlanParams) int {
+	if params.Limit > 0 {
+		return params.Limit + params.Offset
+	}
+	return 0
+}
+
 // calculateSelectivity computes the combined selectivity for all filter predicates.
 func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs float64, br *BoundsResult) float64 {
 	if filter == nil || isAllFilter(filter) {
@@ -797,7 +818,7 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 			},
 			Sorter: params.Sorter,
 			Buf:    params.Buf,
-			TopK:   params.Limit + params.Offset,
+			TopK:   sortTopK(params),
 		}
 	}
 
@@ -865,7 +886,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 				},
 				Sorter: params.Sorter,
 				Buf:    params.Buf,
-				TopK:   params.Limit + params.Offset,
+				TopK:   sortTopK(params),
 			}
 		}
 
@@ -877,10 +898,11 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	b := &seekBatch{}
 	b.indexCS = CursorSource{Tx: params.Tx, Ns: idx.Info.Ns}
 	b.indexIter = IndexIter{
-		Source:  &b.indexCS,
-		IdxInfo: idx.Info,
-		Bounds:  idx.Bounds,
-		Reverse: reverse,
+		Source:      &b.indexCS,
+		IdxInfo:     idx.Info,
+		Bounds:      idx.Bounds,
+		Reverse:     reverse,
+		PointLookup: idx.PointLookup,
 	}
 
 	var root Iterator = &b.indexIter
@@ -945,10 +967,11 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	// allocated for fully-scalar streams.
 	if len(idx.Info.FieldPaths) == 1 {
 		root = &CanonicalKeyDedupIter{
-			Source:    root,
-			Bounds:    idx.Bounds,
-			FieldPath: idx.Info.FieldPaths[0],
-			Reverse:   reverse,
+			Source:       root,
+			Bounds:       idx.Bounds,
+			FieldPath:    idx.Info.FieldPaths[0],
+			Reverse:      reverse,
+			FieldReverse: len(idx.Info.Reverse) > 0 && idx.Info.Reverse[0],
 		}
 	}
 
@@ -961,7 +984,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 			},
 			Sorter:          params.Sorter,
 			Buf:             params.Buf,
-			TopK:            params.Limit + params.Offset,
+			TopK:            sortTopK(params),
 			PartiallySorted: idx.PartialSort,
 		}
 	}
@@ -983,9 +1006,10 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 			Tx: params.Tx,
 			Ns: idx.Info.Ns,
 		},
-		IdxInfo: idx.Info,
-		Bounds:  idx.Bounds, // may be nil for full index scan
-		Reverse: reverse,
+		IdxInfo:     idx.Info,
+		Bounds:      idx.Bounds, // may be nil for full index scan
+		Reverse:     reverse,
+		PointLookup: idx.PointLookup,
 	}
 
 	// Insert IndexFilterIter when compound index fields cover filter conditions.
@@ -1024,10 +1048,11 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 	// chain from IndexIter's per-entry value byte.
 	if len(idx.Info.FieldPaths) == 1 {
 		root = &CanonicalKeyDedupIter{
-			Source:    root,
-			Bounds:    idx.Bounds,
-			FieldPath: idx.Info.FieldPaths[0],
-			Reverse:   reverse,
+			Source:       root,
+			Bounds:       idx.Bounds,
+			FieldPath:    idx.Info.FieldPaths[0],
+			Reverse:      reverse,
+			FieldReverse: len(idx.Info.Reverse) > 0 && idx.Info.Reverse[0],
 		}
 	}
 
@@ -1036,7 +1061,21 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 }
 
 // shouldReverse determines if an index scan should go in reverse direction
-// based on the sort spec and index field ordering.
+// based on the sort spec and the index's declared per-field direction.
+//
+// A forward index scan yields the index's declared per-field directions
+// (reverse-flagged fields are stored bitwise-inverted; see index.go
+// writeValues). So the scan is FORWARD iff the first matched sort field's
+// direction equals the declared direction of the index field it aligns to, and
+// REVERSE iff they are opposite. The first matched sort field is always
+// fields[0] (IndexSortMatch aligns sortFields[si] → idx.FieldNames[matchStart+si],
+// and the matched run is uniform), so reading idx.Reverse[SortMatchStart] is
+// sufficient for the whole run.
+//
+// Note: this is also called for index-SEEK plans where ExactSort==false; there
+// the output is re-sorted by a SortIter, so the scan direction is immaterial and
+// a stale SortMatchStart (0) is harmless. Direction is only load-bearing when
+// ExactSort==true, and then SortMatchStart is set correctly.
 func shouldReverse(sorter query.Sort, idx *CBOIndex) bool {
 	if sorter == nil {
 		return false
@@ -1045,10 +1084,14 @@ func shouldReverse(sorter query.Sort, idx *CBOIndex) bool {
 	if len(fields) == 0 {
 		return false
 	}
-	// Scan direction controls final output direction for index iteration.
-	// Use requested sort direction directly for stable behavior with reverse indexes.
-	_ = idx
-	return fields[0].Reverse
+	idxRev := false
+	if idx != nil {
+		ms := idx.SortMatchStart
+		if ms >= 0 && ms < len(idx.Reverse) {
+			idxRev = idx.Reverse[ms]
+		}
+	}
+	return fields[0].Reverse != idxRev
 }
 
 // setPlanRef walks the iterator chain and sets the Plan reference on FilterIter/FetchIter/FullScanIter nodes.
@@ -1096,20 +1139,108 @@ func AllBoundsFixed(bounds query.Bounds) bool {
 	return true
 }
 
-// indexCoversFilter returns true if the index's fields cover all fields
-// referenced by the filter. When true, index bounds alone are sufficient
-// to determine which documents match, and no data fetch is needed for Count().
-// Zero-allocation: uses inline field matching instead of maps or slices.
+// indexCoversFilter reports whether the CountOnly fast path — where index
+// bounds alone determine the matching docs and no data fetch (FilterIter) is
+// needed — is SOUND for this filter and index. Two conditions must hold:
+//
+//  1. Every field referenced by the filter is an index field
+//     (filterFieldsCoveredBy). Complex nodes (Or/Not/Nor) where field
+//     extraction isn't reliable are treated as not covered.
+//
+//  2. No covered field carries more than one predicate. And.IndexBounds returns
+//     a SOUND OVER-APPROXIMATION (a superset of the matches) whenever a field
+//     has multiple conjuncts: {a:{$in:[1,2]},$and:[{a:{$gte:5}}]} yields the
+//     $in bounds, and a two-sided range {a:{$gte:2,$lte:3}} yields just
+//     [2,+inf]. Counting those bounds directly would over-count — the FilterIter
+//     the fast path skips is exactly what trims the superset to the real
+//     matches (and for ARRAY fields the bounds MUST over-approximate; see
+//     query/filter.go:And.IndexBounds). So reject multi-predicate fields here
+//     and let the FilterIter path handle them. See docs/known-issues.md (I-04).
+//
+// Zero-allocation: inline field matching, no maps or slices.
 func indexCoversFilter(idx *CBOIndex, filter query.Filter) bool {
 	if filter == nil || len(idx.Bounds) == 0 {
 		return false
 	}
-	// Walk the filter tree checking each field against the index's field names.
-	// Returns false if any filter field is not in the index, or if the filter
-	// contains complex nodes (Or, Not, Nor) where field extraction isn't reliable.
+	// Only fields pinned by the CONTIGUOUS bound prefix are actually constrained
+	// by the index seek. A filter field that is an index field but lies BEYOND
+	// the bound prefix (skip-middle, e.g. {a,c} on index (a,b,c) → BoundFields=1)
+	// is NOT enforced by the bounds; counting entries in the bounded range would
+	// silently ignore it and over-count. So gate coverage on the bounded prefix
+	// only, mirroring buildVerifyChain's FieldNames[:idx.BoundFields].
+	boundedFields := idx.Info.FieldNames
+	if idx.BoundFields < len(boundedFields) {
+		boundedFields = boundedFields[:idx.BoundFields]
+	}
+	// Condition 1: every filter field is within the bounded index prefix.
+	// Returns false on any uncovered field or any complex node (Or/Not/Nor).
 	hasFields := false
-	ok := filterFieldsCoveredBy(filter, idx.Info.FieldNames, &hasFields)
-	return ok && hasFields
+	if ok := filterFieldsCoveredBy(filter, boundedFields, &hasFields); !ok || !hasFields {
+		return false
+	}
+	// Condition 2: reject when any covered field carries >1 predicate, because
+	// And.IndexBounds then over-approximates and the fast path skips the
+	// FilterIter that would trim the result.
+	for _, field := range boundedFields {
+		if countFilterFieldPreds(filter, field) > 1 {
+			return false
+		}
+	}
+	return true
+}
+
+// countFilterFieldPreds returns how many leaf predicates in f constrain the
+// given field path. A field bound by more than one predicate — two same-field
+// conjuncts ({a:{$in:[1,2]},$and:[{a:{$gte:5}}]}) or an inline multi-op
+// ({a:{$in:[1,2],$gte:5}}, which parses to a Key wrapping an And) — is NOT
+// exactly captured by And.IndexBounds' over-approximation, so indexCoversFilter
+// uses this to gate the CountOnly fast path. Zero-allocation.
+func countFilterFieldPreds(f query.Filter, field string) int {
+	switch ft := f.(type) {
+	case query.Key:
+		if strings.Join(ft.Path, ".") != field {
+			return 0
+		}
+		// One Key on this field; its inner filter is an And when the field
+		// carries several ops inline (e.g. {$in,$gte}), so count those leaves.
+		return countInnerPreds(ft.Filter)
+	case query.And:
+		n := 0
+		for _, sub := range ft {
+			n += countFilterFieldPreds(sub, field)
+		}
+		return n
+	case *query.And:
+		n := 0
+		for _, sub := range *ft {
+			n += countFilterFieldPreds(sub, field)
+		}
+		return n
+	default:
+		return 0
+	}
+}
+
+// countInnerPreds counts the leaf predicates inside a Key's filter: a bare
+// Comp/In is one; an inline And of ops ({a:{$in,$gte}}) is the sum of its
+// leaves. The inner filter constrains a single field, so it contains no Keys.
+func countInnerPreds(f query.Filter) int {
+	switch ft := f.(type) {
+	case query.And:
+		n := 0
+		for _, sub := range ft {
+			n += countInnerPreds(sub)
+		}
+		return n
+	case *query.And:
+		n := 0
+		for _, sub := range *ft {
+			n += countInnerPreds(sub)
+		}
+		return n
+	default:
+		return 1
+	}
 }
 
 // filterFieldsCoveredBy walks the filter tree and checks that every referenced
@@ -1206,10 +1337,12 @@ func buildVerifyChain(params *PlanParams, idx *CBOIndex, root Iterator) Iterator
 
 		// Find a non-unique single-field index for this field
 		var verifyNs *btree.Namespace
+		var verifyReverse bool
 		for i := range params.Indexes {
 			info := params.Indexes[i].Info
 			if !info.Unique && len(info.FieldNames) == 1 && info.FieldNames[0] == field {
 				verifyNs = info.Ns
+				verifyReverse = len(info.Reverse) > 0 && info.Reverse[0]
 				break
 			}
 		}
@@ -1217,11 +1350,19 @@ func buildVerifyChain(params *PlanParams, idx *CBOIndex, root Iterator) Iterator
 			return nil
 		}
 
+		// The verify index stores its field bitwise-inverted when reverse-declared,
+		// so the equality prefix (computed in ascending space) must be inverted to
+		// match the stored key bytes; otherwise VerifyIter never finds the entry.
+		prefix := bounds[0].Start
+		if verifyReverse {
+			prefix = invertBytes(prefix)
+		}
+
 		current = &VerifyIter{
 			Source:   current,
 			Tx:       params.Tx,
 			VerifyNs: verifyNs,
-			Prefix:   bounds[0].Start,
+			Prefix:   prefix,
 		}
 	}
 
@@ -1324,6 +1465,44 @@ func (br *BoundsResult) AllFixed() bool {
 	return true
 }
 
+// invertBytes returns a fresh bitwise-NOT of b (nil for empty input).
+func invertBytes(b []byte) []byte {
+	if len(b) == 0 {
+		return nil
+	}
+	out := make([]byte, len(b))
+	for i, c := range b {
+		out[i] = ^c
+	}
+	return out
+}
+
+// transformReverseBounds maps per-field bounds from ascending value space into
+// the inverted (stored) byte space used for a reverse-flagged index field.
+// Inversion reverses byte order, so each bound's Start/End are inverted AND
+// swapped, and the inclusivity flags swap with them. An open ascending end
+// (empty End, +inf) becomes an open stored start (empty Start), and vice versa.
+// Because the per-bound Start keys change, the result is re-sorted/merged so
+// IndexIter walks the bounds in cursor order (relevant for $in / $ne, which
+// produce multiple bounds). A FRESH slice is always returned — the input
+// (which aliases BoundsResult) is never mutated, so ascending-space readers
+// such as calculateSelectivity remain correct.
+func transformReverseBounds(bs query.Bounds) query.Bounds {
+	if len(bs) == 0 {
+		return bs
+	}
+	out := make(query.Bounds, 0, len(bs))
+	for _, b := range bs {
+		out = append(out, query.Bound{
+			Start:        invertBytes(b.End),
+			End:          invertBytes(b.Start),
+			StartInclude: b.EndInclude,
+			EndInclude:   b.StartInclude,
+		})
+	}
+	return out.SortAndMerge()
+}
+
 // ComputeIndexBounds computes combined tuple bounds for an index
 // using pre-computed per-field bounds from BoundsResult.
 func ComputeIndexBounds(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
@@ -1353,7 +1532,20 @@ func ComputeIndexBounds(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
 
 	chainLen := len(chain)
 
-	// Single-field index: return cached bounds directly (no copy needed)
+	// Reverse-flagged fields are stored bitwise-inverted, so their per-field
+	// bounds (computed in ascending value space by query/filter.go) must be
+	// transformed into the inverted (stored) byte space before being used to
+	// seek or concatenated into a compound tuple bound. transformReverseBounds
+	// returns a FRESH slice, so the aliased BoundsResult (read by selectivity in
+	// ascending space) is never mutated.
+	for i := range chain {
+		if i < len(idx.Reverse) && idx.Reverse[i] {
+			chain[i].bounds = transformReverseBounds(chain[i].bounds)
+		}
+	}
+
+	// Single-field index: return bounds directly (transformed above if reverse,
+	// otherwise the cached ascending bounds — no copy needed).
 	if len(chain) == 1 {
 		return chain[0].bounds, chainLen
 	}
@@ -1435,9 +1627,15 @@ func AdjustBoundsForNonUnique(bounds query.Bounds) query.Bounds {
 // IndexSortMatch checks if an index covers the sort fields.
 // equalityPrefix is the number of leading index fields pinned by equality filters;
 // these can be skipped when matching sort fields since they're constant within a range.
-func IndexSortMatch(idx *IndexInfo, sortFields []query.SortField, equalityPrefix int) (exactSort, partialSort bool) {
+//
+// matchStart is the index-field position where the matched sort run begins
+// (0 for a prefix match, or equalityPrefix when the equality-pinned start wins).
+// shouldReverse uses it to read the declared direction of the first matched
+// field (idx.Reverse[matchStart]) and pick the scan direction. It defaults to 0,
+// which is correct when no equality prefix shifts the match.
+func IndexSortMatch(idx *IndexInfo, sortFields []query.SortField, equalityPrefix int) (exactSort, partialSort bool, matchStart int) {
 	if len(sortFields) == 0 || len(idx.FieldNames) == 0 {
-		return false, false
+		return false, false, 0
 	}
 	matchAt := func(start int) int {
 		if start < 0 || start >= len(idx.FieldNames) {
@@ -1454,6 +1652,15 @@ func IndexSortMatch(idx *IndexInfo, sortFields []query.SortField, equalityPrefix
 			if idx.FieldNames[ii] != sf.Field {
 				break
 			}
+			// Reverse-flagged fields are stored bitwise-inverted (index.go
+			// writeValues), so a forward index scan yields the index's declared
+			// per-field directions. A sort field is "in the same direction" as a
+			// forward scan iff the index's declared direction equals the sort's
+			// direction. The whole matched run must be uniform under this
+			// relation: an all-same run is served by a forward scan, an
+			// all-opposite run by a reverse scan, and a run that is mixed
+			// relative to the declared directions (e.g. Sort(a,b) on an (a,-b)
+			// index) breaks here and falls back to an in-memory sort.
 			idxRev := false
 			if ii < len(idx.Reverse) {
 				idxRev = idx.Reverse[ii]
@@ -1471,19 +1678,21 @@ func IndexSortMatch(idx *IndexInfo, sortFields []query.SortField, equalityPrefix
 	}
 
 	bestMatch := matchAt(0)
+	bestStart := 0
 	if equalityPrefix > 0 && equalityPrefix < len(idx.FieldNames) {
 		if m := matchAt(equalityPrefix); m > bestMatch {
 			bestMatch = m
+			bestStart = equalityPrefix
 		}
 	}
 
 	if bestMatch == 0 {
-		return false, false
+		return false, false, 0
 	}
 	if bestMatch == len(sortFields) {
-		return true, false
+		return true, false, bestStart
 	}
-	return false, true
+	return false, true, bestStart
 }
 
 // coveringFilterFields identifies non-bound index fields that have equality
@@ -1501,12 +1710,16 @@ func coveringFilterFields(idx *CBOIndex, fieldBounds *BoundsResult) []IndexField
 			continue
 		}
 
+		// Reverse-flagged fields are stored bitwise-inverted (index.go
+		// writeValues), so IndexFilterIter compares key.FieldBytes(fi) (the
+		// inverted stored bytes) against MatchValue. The equality value must
+		// therefore be inverted to match. This is a pure equality check
+		// (Start == End), so no Start/End swap is needed — only invert.
 		matchValue := bounds[0].Start
-		// For reverse fields, invert the match value to compare against stored bytes
 		if fi < len(idx.Info.Reverse) && idx.Info.Reverse[fi] {
 			inv := make([]byte, len(matchValue))
-			for j, b := range matchValue {
-				inv[j] = ^b
+			for j, bb := range matchValue {
+				inv[j] = ^bb
 			}
 			matchValue = inv
 		}

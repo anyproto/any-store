@@ -138,10 +138,14 @@ func TestCheckpointPartialWithActiveReader(t *testing.T) {
 	}
 	require.NoError(t, tx2.Commit())
 
-	// Checkpoint should do a partial checkpoint — it can't copy
-	// frames past the reader's snapshot
+	// Checkpoint does a partial checkpoint — it can't copy frames past
+	// the reader's snapshot. For non-PASSIVE modes SQLite reports BUSY
+	// when the backfill is incomplete because active readers blocked it
+	// (walCheckpoint, wal.c:2352-2356), so the caller can retry. The
+	// frames that could be copied still were; this is BUSY-means-retry,
+	// not a failure of the data path.
 	err = db.Checkpoint(CheckpointFull)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrBusy)
 
 	// Reader should still see its snapshot (batch 1 data)
 	ns4, _ := db.getNamespaceLocked("data")
@@ -169,6 +173,97 @@ func TestCheckpointPartialWithActiveReader(t *testing.T) {
 	}
 	require.NoError(t, rtx2.Rollback())
 	_ = ns
+}
+
+// TestCheckpointNonPassiveBusyOnIncompleteBackfill is the regression test for
+// the BUSY-signaling contract of non-PASSIVE checkpoints. SQLite's walCheckpoint
+// returns SQLITE_BUSY (BUSY-means-retry) when active readers/writers prevent the
+// entire WAL from being copied into the DB (wal.c:2352-2356), and also when the
+// requested mode had to be downgraded to PASSIVE because the writer lock was busy
+// (wal.c:4356 + wal.c:4425). PASSIVE keeps the original nil-on-partial contract.
+//
+// Without the fix the FULL/RESTART/TRUNCATE cases below return nil and these
+// require.ErrorIs assertions fail.
+func TestCheckpointNonPassiveBusyOnIncompleteBackfill(t *testing.T) {
+	// --- EDIT 1: incomplete backfill (active reader pins an older snapshot). ---
+	t.Run("incomplete_backfill_active_reader", func(t *testing.T) {
+		db, _ := tempDBWithNS(t, "data")
+		// Short busy timeout so the FULL checkpoint's wait for the reader is brief.
+		db.pager.wal.busyHandler = DefaultBusyTimeout(100 * time.Millisecond)
+
+		// Batch 1.
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns2, _ := db.getNamespaceLocked("data")
+		for i := range 30 {
+			require.NoError(t, tx.Put(ns2, fmt.Appendf(nil, "k-%04d", i), []byte("v")))
+		}
+		require.NoError(t, tx.Commit())
+
+		// Reader pinned at batch 1.
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+
+		// Batch 2 (frames past the reader's snapshot).
+		tx2, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns3, _ := db.getNamespaceLocked("data")
+		for i := 30; i < 60; i++ {
+			require.NoError(t, tx2.Put(ns3, fmt.Appendf(nil, "k-%04d", i), []byte("v")))
+		}
+		require.NoError(t, tx2.Commit())
+
+		// Non-PASSIVE modes must report ErrBusy: the backfill cannot complete
+		// past the reader's snapshot.
+		for _, mode := range []CheckpointMode{CheckpointFull, CheckpointRestart, CheckpointTruncate} {
+			err = db.Checkpoint(mode)
+			require.ErrorIs(t, err, ErrBusy, "mode=%d must return ErrBusy on incomplete backfill", mode)
+		}
+
+		// PASSIVE keeps the original contract: nil even though the backfill is
+		// incomplete. This guards auto-checkpoint/close paths.
+		require.NoError(t, db.Checkpoint(CheckpointPassive))
+	})
+
+	// --- EDIT 2: write-lock downgrade with a COMPLETE backfill. ---
+	// Holding lockWrite exclusively makes the non-PASSIVE checkpoint fail to
+	// acquire the writer lock (xBusy=nil) and silently downgrade to PASSIVE.
+	// With no readers the backfill completes fully, so checkpointPost returns
+	// nil — but the downgrade must be re-surfaced as ErrBusy (wal.c:4425).
+	t.Run("write_lock_downgrade_complete_backfill", func(t *testing.T) {
+		dir := t.TempDir()
+		p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+		p.inProcess = true
+		require.NoError(t, p.open())
+		defer func() { _ = p.close() }()
+
+		// Commit one frame.
+		mf, slot, err := p.beginRead()
+		require.NoError(t, err)
+		p.walMaxFrame.Store(mf)
+		require.NoError(t, p.beginWrite(WalIndexHdr{}))
+		pg, err := p.getWritablePage(1)
+		require.NoError(t, err)
+		p.releasePage(pg)
+		_, _, _, err = p.commit(true, false)
+		require.NoError(t, err)
+		p.endRead(slot)
+
+		// Hold lockWrite exclusively so the checkpoint can't get the writer
+		// lock and downgrades to PASSIVE.
+		require.NoError(t, p.wal.index.lock(lockWrite, lockExclusive))
+		defer func() { _ = p.wal.index.unlock(lockWrite, lockExclusive) }()
+
+		// xBusy=nil -> immediate downgrade; backfill completes (no readers) ->
+		// downgrade re-surfaced as ErrBusy.
+		err = p.wal.checkpointWithMode(p.file, p.master, CheckpointFull, nil)
+		require.ErrorIs(t, err, ErrBusy)
+
+		// PASSIVE never tries the writer lock and is never downgraded -> nil.
+		err = p.wal.checkpointWithMode(p.file, p.master, CheckpointPassive, nil)
+		require.NoError(t, err)
+	})
 }
 
 func TestReaderSlotRotation(t *testing.T) {
@@ -532,5 +627,135 @@ func TestCheckpoint_RewriteHeavyEndToEnd(t *testing.T) {
 			t.Fatalf("db page %d: expected (r=%d, p=%d), got (r=%d, p=%d) — checkpoint picked wrong frame",
 				p, wantR, wantP, buf[0], buf[1])
 		}
+	}
+}
+
+// TestCheckpoint_SkipsOrphanFramesPastCommittedNPage is the drift-51 regression:
+// frames written by an earlier larger commit (dbSize=grown) that a later
+// shrinking commit (dbSize=shrunk) logically dropped still physically reside in
+// the append-only WAL. SQLite's walCheckpoint skips them via iDbpage>mxPage
+// (mxPage = pWal->hdr.nPage; wal.c:2228, wal.c:2306) so they are never copied to
+// the DB file past the committed end. Without the filter, buildBackfillMap keeps
+// the orphan frames' latest version and the write loop copies them to
+// (pgno-1)*pageSize, materializing stale pages SQLite would never expose.
+//
+// We pre-stamp the orphan-page region of the DB file with a sentinel, run a full
+// checkpoint, and assert the checkpoint did NOT overwrite those pages with the
+// orphan WAL data — i.e. the committed pages are written but pgno>nPage are left
+// untouched.
+func TestCheckpoint_SkipsOrphanFramesPastCommittedNPage(t *testing.T) {
+	w, dbFile := openWalForDedupTest(t)
+	t.Cleanup(func() { _ = w.close(false) })
+
+	const grown = 5      // earlier larger commit's dbSize
+	const shrunk = 2     // later shrinking commit's dbSize
+	const walMark = 0x11 // byte stamped into WAL frame data
+	const dbSentinel = 0x22
+
+	// Pre-stamp the DB file's orphan-page region (pgno shrunk+1..grown) with a
+	// sentinel so we can detect any checkpoint overwrite. Pages 1..shrunk are
+	// left zero; the checkpoint is expected to fill those from the WAL.
+	//
+	// NOTE: after the drift-50 fix, a full-backfill checkpoint physically
+	// truncates the DB file down to the committed page count (mxPage=shrunk),
+	// so the orphan region is removed entirely (SQLite walCheckpoint
+	// wal.c:2320-2329). We still pre-stamp it so that if the iDbpage>mxPage
+	// skip filter (drift-51, wal.c:2306) ever regressed and copied an orphan
+	// frame BEFORE the truncate, the grown file size below would catch it.
+	sentinel := make([]byte, int(w.pageSize))
+	for i := range sentinel {
+		sentinel[i] = dbSentinel
+	}
+	for p := uint32(shrunk + 1); p <= grown; p++ {
+		off := int64(p-1) * int64(w.pageSize)
+		if _, err := dbFile.WriteAt(sentinel, off); err != nil {
+			t.Fatalf("pre-stamp db page %d: %v", p, err)
+		}
+	}
+
+	// Earlier larger commit: write all `grown` pages, committing with dbSize=grown.
+	// This appends frames for pages 1..grown to the WAL. We stamp each frame's
+	// data with walMark + pgno so an erroneous backfill would be detectable.
+	if _, err := w.beginWrite(); err != nil {
+		t.Fatalf("beginWrite (grow): %v", err)
+	}
+	growPages := make([]*page, 0, grown)
+	for p := uint32(1); p <= grown; p++ {
+		data := make([]byte, w.pageSize)
+		data[0] = walMark
+		data[1] = byte(p)
+		growPages = append(growPages, &page{pgno: p, data: data})
+	}
+	if err := w.writeFrames(growPages, true, grown); err != nil {
+		t.Fatalf("writeFrames (grow): %v", err)
+	}
+	w.endWrite()
+
+	// Later shrinking commit: touch page 1 and commit with dbSize=shrunk. The
+	// orphan frames for pages shrunk+1..grown remain physically in the WAL but
+	// are logically dropped (committed nPage is now shrunk).
+	commitData := make([]byte, w.pageSize)
+	commitData[0] = walMark
+	commitData[1] = 1
+	commitData[2] = 0xFF // distinguish the latest page-1 content
+	if _, err := w.beginWrite(); err != nil {
+		t.Fatalf("beginWrite (shrink): %v", err)
+	}
+	if err := w.writeFrames([]*page{{pgno: 1, data: commitData}}, true, shrunk); err != nil {
+		t.Fatalf("writeFrames (shrink): %v", err)
+	}
+	w.endWrite()
+
+	// Sanity: buildBackfillMap (no nPage bound) still tracks the orphan pgnos,
+	// proving the skip filter — not the dedup map — is what protects the DB file.
+	latest, err := w.buildBackfillMap(0, w.nFrame.Load())
+	if err != nil {
+		t.Fatalf("buildBackfillMap: %v", err)
+	}
+	for p := uint32(shrunk + 1); p <= grown; p++ {
+		if _, ok := latest[p]; !ok {
+			t.Fatalf("precondition: expected orphan pgno %d present in backfill map; "+
+				"test no longer exercises the iDbpage>mxPage skip", p)
+		}
+	}
+
+	if err := w.checkpointWithMode(dbFile, nil, CheckpointFull, nil); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+
+	buf := make([]byte, int(w.pageSize))
+
+	// Committed page 1 must reflect the latest (shrinking) commit's content.
+	if _, err := dbFile.ReadAt(buf, 0); err != nil {
+		t.Fatalf("read db page 1: %v", err)
+	}
+	if buf[0] != walMark || buf[1] != 1 || buf[2] != 0xFF {
+		t.Fatalf("db page 1: checkpoint did not backfill the committed page; got (%#x,%#x,%#x)",
+			buf[0], buf[1], buf[2])
+	}
+
+	// After the drift-50 fix the full-backfill checkpoint physically truncates
+	// the DB file to the committed page count (mxPage=shrunk), so the orphan
+	// region (pgno shrunk+1..grown) no longer exists on disk. The file size must
+	// be exactly shrunk*pageSize: this is BOTH the drift-50 truncate assertion
+	// (file shrank to hdr.nPage*szPage, SQLite wal.c:2320-2329) AND the drift-51
+	// guarantee — had the iDbpage>mxPage skip (wal.c:2306) regressed and an
+	// orphan frame been copied to page shrunk+1..grown before truncate, that
+	// write would have extended the file beyond shrunk*pageSize and the truncate
+	// to shrunk*pageSize would still have removed it; but if the truncate guard
+	// itself regressed, a surviving orphan backfill would show up as a file
+	// larger than shrunk*pageSize. Either way, exact-size is the tightest check.
+	wantSize := int64(shrunk) * int64(w.pageSize)
+	if fi, err := dbFile.Stat(); err != nil {
+		t.Fatalf("stat db file: %v", err)
+	} else if fi.Size() != wantSize {
+		t.Fatalf("db file size = %d, want %d (checkpoint must truncate to committed "+
+			"nPage=%d*pageSize and skip orphan frames pgno>nPage)", fi.Size(), wantSize, shrunk)
+	}
+
+	// Reading past the committed size must now return EOF (the orphan pages were
+	// physically removed), confirming no orphan frame was materialized.
+	if _, err := dbFile.ReadAt(buf, int64(shrunk)*int64(w.pageSize)); err == nil {
+		t.Fatalf("expected EOF reading past committed nPage=%d; orphan region still present", shrunk)
 	}
 }

@@ -1,0 +1,372 @@
+{
+ "single-index": [
+  {
+   "id": "act-01",
+   "title": "$ne on an indexed scalar field uses two-bound seek and includes null/missing (non-sparse)",
+   "proposedTestName": "TestIndex_Single_Ne_TwoBoundSeek_IncludesNullAndMissing",
+   "proposedTestSketch": "Non-sparse index {a}. Insert {id:1,a:5},{id:2,a:7},{id:3,a:null},{id:4} (missing a). Also build an unindexed twin collection with identical data. (1) coll.Find(`{\"a\":{\"$ne\":5}}`).Count(ctx)==3 and == unindexed count. (2) collectIdsString(Find(`{\"a\":{\"$ne\":5}}`).Sort(\"id\")) ElementsMatch [\"2\",\"3\",\"4\"] for BOTH collections (use JSON string ids so collectIdsString resolves). (3) assertIndexLen(GetIndexes()[0],4) (null + missing both indexed). (4) Explain.Sql Contains \"IndexScan(a)\", Contains \"[-inf,'5'),('5',inf]\", Contains \"-> Filter\" (do NOT assert NotContains Dedup \u2014 chain ends \"-> Dedup(canonical)\"). Optionally add a 0..9 dataset sub-case asserting Sort(\"a\") a-values == [0,1,2,3,4,6,7,8,9], Count==9.",
+   "expectedBehavior": "$ne emits two exclusive index bounds [-inf,5) and (5,inf], so the index IS used (IndexScan, not FullScan); value 5 is excluded; null and missing docs (which marshal to the 'null' key in the lower bound) survive the Comp.Ok($ne) re-filter because valueNull != 5. Count==Iter==3, identical with and without the index. PointLookup is false so no covering-count fast path; a residual Filter re-checks each row.",
+   "priority": "high"
+  },
+  {
+   "id": "act-03",
+   "title": "Cross-type ordering: $gte on a number matches string/bool-typed values per anyenc type ordering",
+   "proposedTestName": "TestIndex_Single_MixedTypeOrdering",
+   "proposedTestSketch": "Index {a}. Insert {id:1,a:5},{id:2,a:\"5\"},{id:3,a:\"hello\"},{id:4,a:true}. assert Find(`{\"a\":5}`).Count==1 and collectField(id)==[\"1\"] (number 5 only, NOT string \"5\"). Find(`{\"a\":\"5\"}`).Count==1, id==[\"2\"]. Find(`{\"a\":{\"$gte\":0}}`).Count==4 (number-0 sorts before all strings/bools). assert.Equal([]string{\"5\",\"\\\"5\\\"\",\"\\\"hello\\\"\",\"true\"}, collectField(coll.Find(nil).Sort(\"a\"),\"a\")) confirming Number<String<True. Optionally collectField(id) for Sort(\"a\")==[\"1\",\"2\",\"3\",\"4\"].",
+   "expectedBehavior": "Equality is type-strict (number 5 != string \"5\"). The encoded value of number 0 sorts before all strings and bools, so $gte:0 sweeps all four docs via the index. Sort ordering is Null<Number<String<False<True per anyenc type tags. Pins the intentional typed-ordering contract so a future encoding change cannot silently re-order or drop cross-type docs.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-04",
+   "title": "Negative numbers round-trip through order-preserving encoding for equality, range and sort",
+   "proposedTestName": "TestIndex_Single_NegativeNumbers",
+   "proposedTestSketch": "Index {a}. For v in {-5,-3,-1,0,2,4} insert {id:v+100,a:v}. (1) collectField(Find(`{\"a\":{\"$gte\":-3,\"$lt\":2}}`).Sort(\"a\"),\"a\")==[\"-3\",\"-1\",\"0\"]. (2) collectField(Find(nil).Sort(\"a\"),\"a\")==[\"-5\",\"-3\",\"-1\",\"0\",\"2\",\"4\"]. (3) Find(`{\"a\":-3}`).Count==1. (4) collectField(Find(nil).Sort(\"-a\"),\"a\")==[\"4\",\"2\",\"0\",\"-1\",\"-3\",\"-5\"]. Assert on RESULTS/COUNTS only \u2014 do NOT assert on Explain.Sql bound substrings for negatives (bound stringification over-strips a 0xff byte and renders an err string; query results are correct).",
+   "expectedBehavior": "Signed values round-trip through the order-preserving anyenc encoding; equality, two-sided range, and ascending/descending sort all return correct, correctly-ordered results across the sign boundary. Note: Explain bound rendering for negatives is cosmetically broken (stripTrailing0xff) but does not affect correctness.",
+   "priority": "low"
+  }
+ ],
+ "array-nested": [
+  {
+   "id": "act-02",
+   "title": "$ne over a multikey (array) index: two-bound negation seek with a straddling element must dedup; $nin cannot use the index",
+   "proposedTestName": "TestIndex_ArrayNested_NeOverMultiKey_DedupAndAgreement",
+   "proposedTestSketch": "Index {Name:tags,Fields:[tags]}. Insert (JSON string ids) id1 tags=[\"a\",\"b\"], id2 [\"b\",\"c\"], id3 [\"A\",\"z\"] (straddles: \"A\"<\"a\"<\"z\"), id4 scalar \"a\", id5 scalar \"d\". For {\"tags\":{\"$ne\":\"a\"}}: (a) Explain.Sql Contains \"IndexScan\" AND Contains \"Dedup(canonical)\" AND Contains the 2-bound split `[-inf,'\\\"a\\\"'),('\\\"a\\\"',inf]` \u2014 both with and without an IndexHint. (b) Count==3 and == fullscan count. (c) Iter ids, SORTED, == [\"2\",\"3\",\"5\"] (raw scan order is 3,2,5 \u2014 sort or compare as a set); id3 the straddler appears exactly once; id1 and id4 (contain \"a\") excluded. For {\"tags\":{\"$nin\":[\"a\"]}}: assert Explain.Sql Contains \"FullScan\" (NOT IndexScan) even WITH a max-Boost IndexHint, and Count==Iter==3 \u2014 $nin desugars to Nor and yields NO index bounds.",
+   "expectedBehavior": "The $ne over-approximating two-bound seek visits the straddling doc id3 via BOTH bounds; CanonicalKeyDedup emits it once. The residual FilterIter applies MongoDB-style ALL-elements $ne semantics. Indexed result EQUALS fullscan result (3 docs). $nin is intentionally NOT indexable (Nor.IndexBounds returns bounds unchanged), so it fullscans even when hinted; correctness must still hold.",
+   "priority": "high"
+  },
+  {
+   "id": "act-29",
+   "title": "Nested index path through an array intermediate is NOT traversed (single null entry, unqueryable by element)",
+   "proposedTestName": "TestIndex_ArrayNested_NestedField_IntermediateArray_NotTraversed",
+   "proposedTestSketch": "EnsureIndex {Fields:[items.name]}. Insert {id:1,items:[{name:\"a\"},{name:\"b\"}]},{id:2,items:[{name:\"c\"}]}. assertIndexLen(GetIndexes()[0],2) (each doc -> one null entry). Find(`{\"items.name\":\"a\"}`).Count==0 (no implicit traversal; this query still IndexScans, just finds nothing). Find(`{\"items.0.name\":\"a\"}`).Count==1 (positional works; this query FullScans since items.0.name is a different unindexed path \u2014 do NOT assert IndexScan for it). Find(`{\"items.name\":null}`).Count==2.",
+   "expectedBehavior": "Value.Get does strconv.Atoi on a path segment after an array intermediate; non-numeric \"name\" fails -> nil -> one 'null' entry (non-sparse). No implicit array traversal (MongoDB-divergent). Positional access resolves via the numeric index.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-30",
+   "title": "Querying by a whole NON-empty array value uses the whole-array index entry (order-sensitive point bound)",
+   "proposedTestName": "TestIndex_ArrayNested_WholeArrayEquality_UsesIndex",
+   "proposedTestSketch": "EnsureIndex {Name:tags,Fields:[tags]}. Insert {id:1,tags:[\"a\",\"b\"]},{id:2,tags:[\"a\"]}. Find(`{\"tags\":[\"a\",\"b\"]}`).Count==1, collectField(id)==[\"1\"]. Explain.Sql Contains \"IndexScan(tags)\" AND Contains the point-bound substring `['[\"a\",\"b\"]','[\"a\",\"b\"]']`. Find(`{\"tags\":[\"b\",\"a\"]}`).Count==0 (order-sensitive). Find(`{\"tags\":[\"a\"]}`).Count==1, ids==[\"2\"].",
+   "expectedBehavior": "The post-loop whole-array index entry is both written AND used as a single point bound on the order-sensitive whole-array encoding for array-valued equality predicates. Only the empty-array case was previously tested.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-31",
+   "title": "Array with a null ELEMENT: null indexed as a real element, collides with non-sparse missing-field null; dedup of duplicate nulls",
+   "proposedTestName": "TestIndex_ArrayNested_NullElementInArray_IndexedAndQueryable",
+   "proposedTestSketch": "Non-sparse {tags}: Insert {id:1,tags:[\"a\",null,\"b\"]} (4 entries: null,a,b,whole-array) and {id:2} (missing -> 1 null). assertIndexLen==5. Find(`{\"tags\":null}`).Count==2 (null-element doc AND missing-field doc); Find(`{\"tags\":\"a\"}`).Count==1. Sparse {tags}, same two docs: index len 4 (null element still indexed; missing-field skipped); Find(`{\"tags\":null}`).Count==1. Fresh non-sparse: Insert {id:3,tags:[null,null,\"a\"]} -> len 3 (dup nulls collapse + a + whole-array).",
+   "expectedBehavior": "The sparse guard only short-circuits the whole-field-null case; a null ARRAY ELEMENT bypasses it (v.Type()==TypeArray) so it is indexed even when sparse. A null element makes a doc indistinguishable from a missing-field doc by a {tags:null} query on a non-sparse index. Duplicate nulls dedup within a doc.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-32",
+   "title": "Deep nested path where the LEAF is an array: multikey fan-out is path-depth-independent",
+   "proposedTestName": "TestIndex_ArrayNested_NestedLeafArray_MultiKeyFanout",
+   "proposedTestSketch": "EnsureIndex {Name:abc,Fields:[a.b.c]}. Insert {id:1,a:{b:{c:[\"x\",\"y\"]}}},{id:2,a:{b:{c:[\"y\",\"z\"]}}}. assertIndexLen(GetIndexes()[0],6) (3 per doc). Find(`{\"a.b.c\":\"x\"}`).Count==1; Find(`{\"a.b.c\":\"y\"}`).Count==2. $in dedup: Find(`{\"a.b.c\":{\"$in\":[\"x\",\"y\"]}}`).Count==2 (id1 has both x,y but dedups to 1 doc; id2 has y). Iter over the $in filter yields 2 results, each id once. Explain.Sql Contains \"IndexScan\". Use count,err:=Find(...).Count(ctx) pattern (no assertQueryCount helper).",
+   "expectedBehavior": "writeValues branches on v.Type()==TypeArray path-agnostically, so multikey fan-out (K elements + whole-array) fires for an array leaf at any nesting depth. $in over nested-leaf elements dedups overlapping docs to one.",
+   "priority": "medium"
+  }
+ ],
+ "unique-sparse": [
+  {
+   "id": "act-05",
+   "title": "Find().Update() enforces the unique constraint and rolls back (and stale test comment is wrong)",
+   "proposedTestName": "TestIndex_Maintenance_FindUpdateUniqueConstraintEnforced",
+   "proposedTestSketch": "EnsureIndex {Fields:[a],Unique:true}. Insert {id:1,a:1},{id:2,a:2}. res,err:=coll.Find(`{\"a\":2}`).Update(ctx,`{\"$set\":{\"a\":1}}`). require.ErrorIs(err,ErrUniqueConstraint); assert res.Matched==1 (matched before the constraint check), res.Modified==0. FindId(2).Value().String()==`{\"id\":2,\"a\":2}` (unchanged). Find(`{\"a\":1}`).Count==1 and Find(`{\"a\":2}`).Count==1. assertIndexLen(idx,2). ALSO: replace the stale comment in index_maintenance_test.go:1090-1092 (TestIndex_UpsertMutation_FindUpdateUniqueConstraintViaInsert) that claims uniqueness is not enforced on Find().Update().",
+   "expectedBehavior": "Find().Update() that drives a matched doc's indexed value onto another doc's existing unique value funnels through collection.update -> insertKeys, whose AppendSeekKey+prefix check fires, returning ErrUniqueConstraint and rolling back the whole tx. ModifyResult is {Matched:1,Modified:0}; both old values stay queryable via the index. Covers BOTH unique-sparse-01 and idxmaint-01 (same scenario).",
+   "priority": "high"
+  },
+  {
+   "id": "act-06",
+   "title": "Non-sparse UNIQUE index: second missing/null-field doc collides on the shared 'null' key (sparse contrast allows it)",
+   "proposedTestName": "TestIndex_UniqueSparse_NonSparseUniqueNullCollision",
+   "proposedTestSketch": "Sub A (non-sparse): EnsureIndex {Fields:[a],Unique:true}. Insert {id:1,a:5} ok; Insert {id:2,b:1} ok (first null); Insert {id:3,c:1} -> ErrorIs ErrUniqueConstraint; Insert {id:4,a:null} -> ErrorIs ErrUniqueConstraint. assertCollCount(coll,2); assertIndexLen(GetIndexes()[0],2). Sub B (contrast): fresh coll, EnsureIndex {Fields:[a],Sparse:true,Unique:true}; same {id:2,b:1},{id:3,c:1},{id:4,a:null} all succeed.",
+   "expectedBehavior": "On a non-sparse unique index, missing field and explicit null both marshal to the same single 'null' key, so a second missing/null doc collides -> ErrUniqueConstraint. On a sparse unique index they emit zero entries, so no collision. Pins the load-bearing 'missing == null == one indexed slot' rule and its sparse inversion.",
+   "priority": "high"
+  },
+  {
+   "id": "act-07",
+   "title": "EnsureIndex unique backfill fails on pre-existing missing-field duplicates (non-sparse), succeeds sparse",
+   "proposedTestName": "TestIndex_UniqueSparse_CreateUniqueOnNullDuplicatesFailsButSparseSucceeds",
+   "proposedTestSketch": "Insert {id:1,b:1},{id:2,c:2} (neither has \"a\"). err:=EnsureIndex {Fields:[a],Unique:true}; require.ErrorIs(err,ErrUniqueConstraint); assert.Len(GetIndexes(),0); assertCollCount(coll,2). Then EnsureIndex {Fields:[a],Sparse:true,Unique:true} returns nil; assert.Len(GetIndexes(),1); assertIndexLen(GetIndexes()[0],0).",
+   "expectedBehavior": "Backfill of a non-sparse unique index over two docs both lacking the field hits the duplicate 'null' key during buildIndex -> insertKeys; doWriteTxModified rolls back fully so no index is registered and data is intact. The sparse+unique variant skips missing fields, writes zero null keys, and backfill succeeds (empty index).",
+   "priority": "high"
+  },
+  {
+   "id": "act-08",
+   "title": "Compound UNIQUE update-to-duplicate fails and rolls back the doc and both index entries",
+   "proposedTestName": "TestIndex_UniqueSparse_CompoundUpdateToDuplicateRollback",
+   "proposedTestSketch": "EnsureIndex {Fields:[a,b],Unique:true}. Insert {id:1,a:1,b:1},{id:2,a:1,b:2}. err:=coll.UpdateOne(ctx, MustParseJson(`{\"id\":2,\"a\":1,\"b\":1}`)); require.ErrorIs(err,ErrUniqueConstraint). FindId(2).Value().String()==`{\"id\":2,\"a\":1,\"b\":2}` (byte-for-byte unchanged). assertIndexLen(GetIndexes()[0],2). Find({\"a\":1,\"b\":1}).Count==1 (only id:1); Find({\"a\":1,\"b\":2}).Count==1 (only id:2, proving old entry restored, no orphan (1,1,id2)).",
+   "expectedBehavior": "deleteKeys(old)+insertKeys(new) on a compound unique index detects the (1,1) collision and rolls the whole tx back, restoring the (1,2,id2) entry and leaving no orphan. Exercises compound-granularity rollback that single-field tests don't reach. (Finding prose has a typo; the assert string is correct.)",
+   "priority": "medium"
+  },
+  {
+   "id": "act-09",
+   "title": "Sparse+unique: removing the field via update frees the unique slot for another doc",
+   "proposedTestName": "TestIndex_UniqueSparse_SparseUniqueUpdateFreesSlot",
+   "proposedTestSketch": "EnsureIndex {Fields:[a],Sparse:true,Unique:true}. Insert {id:1,a:10},{id:2,b:1} (index len 1). (1) UpdateOne({id:2,a:10}) -> ErrUniqueConstraint; assertIndexLen==1 (rollback-safe). (2) UpdateOne({id:1,b:9}) removes a; assertIndexLen==0. (3) UpdateOne({id:2,a:10}) succeeds; assertIndexLen==1. Find({\"a\":10}).Count==1 and collectField(id)==[\"2\"].",
+   "expectedBehavior": "Updating doc1 to drop the sparse field deletes its index entry (empty keysBuf), freeing the unique value 10; doc2 can then claim it. Exercises the sparse empty-keysBuf path interacting with unique slot reclamation, including the failed-update rollback leaving the index unchanged.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-10",
+   "title": "Find().Update() over multiple docs rolls back atomically when a later doc collides",
+   "proposedTestName": "TestIndex_UniqueSparse_FindUpdateMultiDocCollisionRollsBack",
+   "proposedTestSketch": "EnsureIndex {Fields:[u],Unique:true}. Insert {id:1,grp:1,u:1},{id:2,grp:1,u:2},{id:3,grp:2,u:100}. res,err:=coll.Find(`{\"grp\":1}`).Update(ctx,`{\"$inc\":{\"u\":99}}`). require.ErrorIs(err,ErrUniqueConstraint). FindId(1).Value().String()==`{\"id\":1,\"grp\":1,\"u\":1}`; FindId(2).Value().String()==`{\"id\":2,\"grp\":1,\"u\":2}` (both reverted); FindId(3).Value().GetFloat64(\"u\")==100. assertIndexLen(idx,3). Assert full doc strings to prove no partial commit. res.Matched==1 is correct under FullScan id-order but consider asserting only ErrUniqueConstraint + rollback states for order-independence.",
+   "expectedBehavior": "A multi-row Find().Update() where id:1 increments u 1->100 colliding with id:3.u=100 fails and rolls back the entire tx; no doc updated earlier in the loop is committed. Pins multi-row update atomicity under a unique constraint.",
+   "priority": "high"
+  },
+  {
+   "id": "act-11",
+   "title": "Unique ARRAY index: cross-doc element collision, then delete + reinsert frees the blocked value",
+   "proposedTestName": "TestIndex_UniqueSparse_UniqueArrayCollisionThenDeleteReinsert",
+   "proposedTestSketch": "EnsureIndex {Fields:[x],Unique:true}. (1) Insert {id:1,x:[\"a\",\"b\"]} ok; assertIndexLen(idx,3). (2) Insert {id:2,x:[\"b\",\"c\"]} -> ErrUniqueConstraint (shared \"b\"); assertIndexLen(idx,3); assertCollCount(coll,1). (3) DeleteId(1); assertIndexLen(idx,0). (4) Insert {id:2,x:[\"b\",\"c\"]} now ok; assertIndexLen(idx,3). Find({\"x\":\"a\"}).Count==0; Find({\"x\":\"c\"}).Count==1; Find({\"x\":\"b\"}).Count==1.",
+   "expectedBehavior": "Per-element unique seek blocks id:2 on the shared element \"b\". deleteKeys removes ALL of id:1's per-element entries, so re-inserting the previously-blocked array succeeds. Confirms multikey delete fully frees the colliding element.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-12",
+   "title": "Sparse COMPOUND index, array leading field + missing/null trailing field => ZERO entries (no partial multikey leak)",
+   "proposedTestName": "TestIndex_UniqueSparse_SparseCompoundArrayLeadMissingTrail",
+   "proposedTestSketch": "EnsureIndex {Fields:[a,b],Sparse:true}. Insert {id:1,a:[1,2],c:9} (array lead, b missing); assertIndexLen(GetIndexes()[0],0). Insert {id:2,a:[1,2],b:7} (both present); assertIndexLen(...,3). Find({\"a\":1,\"b\":7}).Count==1, Find({\"a\":2,\"b\":7}).Count==1, Find({\"a\":1}).Count==1 (all id:2; id:1 not indexed).",
+   "expectedBehavior": "The array expansion over field 0 starts but every recursive descent hits the sparse guard on missing field b and returns false, so fillKeysBuf clears keysBuf entirely -> 0 entries, with no partial/leaked multikey entry from the started array branch.",
+   "priority": "medium"
+  }
+ ],
+ "index-maintenance": [
+  {
+   "id": "act-13",
+   "title": "Multi-index insert partial failure: non-unique leading index keeps no stray entry when trailing unique index conflicts",
+   "proposedTestName": "TestIndex_Maintenance_MultiIndexInsertPartialFailureRollsBack",
+   "proposedTestSketch": "EnsureIndex {Fields:[a]} (non-unique, first); EnsureIndex {Fields:[b],Unique:true} (second). Insert {id:1,a:10,b:100}. idxA:=GetIndexes()[0]; idxB:=GetIndexes()[1]. err:=Insert {id:2,a:20,b:100}; require.ErrorIs(err,ErrUniqueConstraint). assertIndexLen(idxA,1); assertIndexLen(idxB,1); Find({\"a\":20}).Count==0; Find({\"a\":10}).Count==1; assertCollCount(coll,1). Optional: later legitimate Insert {id:3,a:20,b:200} -> Find({\"a\":20}).Count==1 (sketch not corrupted by rolled-back Increment).",
+   "expectedBehavior": "insertItem Puts the index-a entry for a=20 before the index-b unique check fails; doWriteTx rolls back the whole tx, erasing the stray a=20 entry. Both indexes stay length 1.",
+   "priority": "high"
+  },
+  {
+   "id": "act-14",
+   "title": "Multi-index UPDATE where the conflicting unique index is NOT first: all indexes restored on rollback",
+   "proposedTestName": "TestIndex_Maintenance_MultiIndexUpdateUniqueConflictOnTrailingIndexRollsBack",
+   "proposedTestSketch": "EnsureIndex {Fields:[a]} (first); EnsureIndex {Fields:[b],Unique:true} (second). Insert {id:1,a:1,b:100},{id:2,a:2,b:200}. idxA,idxB from GetIndexes(). err:=UpdateOne({id:1,a:99,b:200}); require.ErrorIs(err,ErrUniqueConstraint). Find({\"a\":99}).Count==0; Find({\"a\":1}).Count==1; assertIndexLen(idxA,2); assertIndexLen(idxB,2); FindId(1).Value().String()==`{\"id\":1,\"a\":1,\"b\":100}`.",
+   "expectedBehavior": "Index-a's deleteKeys(a=1)+insertKeys(a=99) is applied before index-b's insertKeys hits ErrUniqueConstraint; the whole tx rolls back, restoring a=1 and removing a=99. Locks in cross-index rollback ordering.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-15",
+   "title": "Unique update-to-existing leaves OLD value still queryable VIA INDEX after rollback",
+   "proposedTestName": "TestIndex_Maintenance_UniqueUpdateToExisting_IndexQueryableAfterRollback",
+   "proposedTestSketch": "EnsureIndex {Fields:[a],Unique:true}. Insert {id:1,a:10},{id:2,a:20}. err:=UpdateOne({id:1,a:20}); require.ErrorIs(err,ErrUniqueConstraint). Find(`{\"a\":10}`).Count==1 (old value still indexed); Find(`{\"a\":20}`).Count==1; assertIndexLen(idx,2). DROP the proposed 'Explain contains IndexScan' assertion \u2014 the token is CoverLookup(a) and the CBO is non-deterministic on this tiny dataset; assert only Counts and index length.",
+   "expectedBehavior": "After the failed unique update, deleteKeys(a=10) is rolled back so a=10 remains reachable through an index Find, and a=20 still resolves to id:2. Catches a regression where the delete commits but the insert rollback is incomplete (which FindId-only tests miss).",
+   "priority": "medium"
+  },
+  {
+   "id": "act-16",
+   "title": "Non-sparse index collapses a removed array field to a single 'null' entry on update",
+   "proposedTestName": "TestIndex_Maintenance_NonSparseArrayFieldRemovedBecomesNull",
+   "proposedTestSketch": "EnsureIndex {Fields:[tags]} (non-sparse). Insert {id:1,tags:[\"a\",\"b\"]}; idx:=GetIndexes()[0]; assertIndexLen(idx,3). UpdateOne({id:1,x:1}) (tags removed). assertIndexLen(idx,1). Find(`{\"tags\":\"a\"}`).Count==0; Find(`{\"tags\":null}`).Count==1.",
+   "expectedBehavior": "On a non-sparse index, removing a former array field deletes the 3 multikey entries and inserts exactly one 'null' entry (missing field marshals to TypeNull). Index length collapses 3->1 and the doc becomes findable only via tags:null.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-17",
+   "title": "Compound index with array LEADING field: update changing the array maintains per-element entries",
+   "proposedTestName": "TestIndex_Maintenance_CompoundArrayLeadingFieldUpdate",
+   "proposedTestSketch": "EnsureIndex {Fields:[tags,p]} (non-unique). Insert {id:1,tags:[\"a\",\"b\"],p:1}; idx:=GetIndexes()[0]; assertIndexLen(idx,3) (entries (a,1),(b,1),([a,b],1)). UpdateOne({id:1,tags:[\"c\"],p:1}). assertIndexLen(idx,2) (entries (c,1),([c],1)). Find({\"tags\":\"a\",\"p\":1}).Count==0; Find({\"tags\":\"b\",\"p\":1}).Count==0; Find({\"tags\":\"c\",\"p\":1}).Count==1.",
+   "expectedBehavior": "deleteKeys removes all 3 old leading-array entries, insertKeys writes 2 new (single-element array still yields element + whole-array). Per-element queryability tracks the array change. No prior test mutates a leading array field of a compound index.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-18",
+   "title": "Bulk insert mixing scalar, multi-key array, and missing-field docs: index length is the SUM of per-doc entries",
+   "proposedTestName": "TestIndex_Maintenance_BulkInsertMixedScalarArrayMissingCount",
+   "proposedTestSketch": "EnsureIndex {Fields:[tags]} (non-sparse). Single Insert(ctx, {id:1,tags:\"x\"},{id:2,tags:[\"a\",\"b\"]},{id:3,tags:[\"c\",\"d\",\"e\"]},{id:4}). idx:=GetIndexes()[0]; assertIndexLen(idx,9) (1+3+4+1, NOT 4). assertCollCount(coll,4). Find(`{\"tags\":\"a\"}`).Count==1, Find(`{\"tags\":\"x\"}`).Count==1, Find(`{\"tags\":\"c\"}`).Count==1, Find(`{\"tags\":null}`).Count==1.",
+   "expectedBehavior": "Index length is the sum of per-doc keys (K+1 per K-distinct-element array, 1 per scalar, 1 'null' per missing on non-sparse), decoupled from document count. Contrasts the all-scalar len==docCount invariant.",
+   "priority": "low"
+  }
+ ],
+ "planner-cbo": [
+  {
+   "id": "act-19",
+   "title": "$in multi-bound IndexScan Explain output and per-bound seek cost",
+   "proposedTestName": "TestIndex_Planner_InOperator_MultipleBounds",
+   "proposedTestSketch": "Index {a}, 100 docs id=i,a=i. explain:=Find(`{\"a\":{\"$in\":[5,10,15,20]}}`).Explain(ctx). assert.Equal(explain.Sql, \"IndexScan(a)[bounds=Bounds{['5','5'],['10','10'],['15','15'],['20','20']}] -> Fetch -> Filter -> Dedup(canonical)\"). assert.NotContains(explain.Sql,\"FullScan\"). assert.Contains(explain.Plan,\"4\u00d7seek\"). Count==4; collectField(Find(...),\"a\")==[\"5\",\"10\",\"15\",\"20\"].",
+   "expectedBehavior": "A 4-value $in yields exactly 4 distinct fixed bounds, one B-tree seek per value (nSeeks=4 in the cost breakdown), chosen as IndexSeek cost 19.5 over FullScan 350. Prefer exact Sql equality over separator counting.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-20",
+   "title": "Compound index equality-prefix + descending sort on non-prefix field uses reverse scan, no in-memory Sort",
+   "proposedTestName": "TestIndex_Planner_CompoundEqualityPrefix_ReverseSort",
+   "proposedTestSketch": "Index (c,a), 100 docs id=i,c=i%10,a=i. explain:=Find(`{\"c\":5}`).Sort(\"-a\").Explain(ctx). assert Contains \"IndexScan(c,a)\", Contains \"(reverse)\", Contains \"[bounds=Bounds{['5','5']}]\", NotContains \"-> Sort\". collectField(Find(`{\"c\":5}`).Sort(\"-a\"),\"a\")==[\"95\",\"85\",...,\"5\"] (len 10, strictly descending); collectField(...,\"c\") all \"5\". (Chosen plan label is IndexSeek; assert iterator-chain tokens, not the label.)",
+   "expectedBehavior": "The equality prefix c=5 pins field 0; the index covers the sort on a in reverse, so the plan reverse-scans IndexScan(c,a) with NO in-memory Sort. Results strictly descending by a, all c==5. This is the legitimate (correct) reverse-scan path. Note: covers BOTH cbo-04 and compound-06 (equality-first + desc-on-second).",
+   "priority": "medium"
+  },
+  {
+   "id": "act-21",
+   "title": "No-filter no-sort query with usable indexes present still chooses FullScan",
+   "proposedTestName": "TestIndex_Planner_NoFilterNoSort_WithIndexesUsesFullScan",
+   "proposedTestSketch": "EnsureIndex {a}; EnsureIndex {b}; insert 50 docs a=i%10,b=i%7. explain:=Find(nil).Explain(ctx). assert.Contains(explain.Sql,\"FullScan\") (actual token FullScan(filtered)); assert.NotContains(explain.Sql,\"IndexScan\"). assert.Len(explain.Indexes,2) and iterate to assert zero have Used==true. Count==50.",
+   "expectedBehavior": "With no bounds (no filter) and no sort coverage, neither IndexSeek nor IndexScan candidates are built; only FullScan remains. Both indexes are reported with Used==false. Prefer Contains/NotContains over exact equality.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-22",
+   "title": "IndexHint on an index with neither bounds nor sort coverage is a silent no-op",
+   "proposedTestName": "TestIndex_Planner_HintOnUnusableIndex_IsNoOp",
+   "proposedTestSketch": "EnsureIndex {a}; EnsureIndex {b}; insert 100 docs a=i%10,b=i%7. explain:=Find(`{\"a\":5}`).IndexHint(IndexHint{IndexName:\"b\",Boost:1000000}).Explain(ctx). assert.Contains(explain.Sql,\"IndexScan(a)\"); assert.NotContains(explain.Sql,\"IndexScan(b)\"). explain.Indexes[0].Name==\"a\" with Used==true. Count==10 with and without the hint.",
+   "expectedBehavior": "Index (b) has no bounds for filter {a:5} and no sort coverage, so it is skipped in both planner loops and its boost is never applied. The hint cannot conjure an unusable candidate; plan still uses (a). Documents the IndexHint boundary.",
+   "priority": "low"
+  },
+  {
+   "id": "act-23",
+   "title": "Partial-prefix query on a UNIQUE compound index uses range IndexScan, not CoverLookup",
+   "proposedTestName": "TestIndex_Planner_UniqueCompound_PrefixUsesRangeScan",
+   "proposedTestSketch": "EnsureIndex {Fields:[a,b],Unique:true}. Insert 100 docs id=i,a=i%10,b=i (distinct (a,b) pairs to avoid ErrUniqueConstraint). Prefix: explain:=Find(`{\"a\":5}`).Explain(ctx). assert.Equal(explain.Sql,\"IndexScan(a,b)[bounds=Bounds{['5','5']}] -> Fetch -> Filter\") (or Contains \"IndexScan(a,b)\" + NotContains \"CoverLookup\"). Count==10 (NOT truncated to 1). Control full equality: Find(`{\"a\":5,\"b\":5}`).Explain.Sql==\"CoverLookup(a,b)[1 bounds] -> Filter\", Count==1.",
+   "expectedBehavior": "A prefix-only filter on a unique compound index is not a point lookup (BoundFields < len(FieldNames)), so CoverLookup is correctly skipped and a 0xff-extended range IndexScan returns all 10 matching docs. Full equality is the point-lookup CoverLookup path returning 1.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-24",
+   "title": "FullScan with no-sort + small limit uses early-termination scan estimate over the present index",
+   "proposedTestName": "TestIndex_Planner_FullScanLimit_EarlyTerminationCost",
+   "proposedTestSketch": "EnsureIndex {a}; insert 2000 docs id=i,a=i%100. explain:=Find(`{\"a\":{\"$gte\":50}}`).Limit(5).Explain(ctx). assert.Equal(explain.Sql,\"FullScan(filtered) -> Limit(5)\"); NotContains \"IndexScan(a)\". Cost assertion: Contains(explain.Plan,\"10\u00d7fetch\") (limit5/sel0.5=10 docs) and the FullScan chosen cost 35.0 (prefer asserting cost/est over the brittle label). collectDocs(Find(`{\"a\":{\"$gte\":50}}`).Limit(5)) len 5.",
+   "expectedBehavior": "With no sort, fullScanEffective=(limit+offset)/selectivity=10 docs, so FullScan cost 35.0 beats IndexSeek ~3500.5 (no limit optimization on the seek path). Guards the early-termination accounting that makes FullScan competitive under small limits. Distinct from the unit-level TestBuildPlan_LimitScalesByPTotal (no index present).",
+   "priority": "low"
+  }
+ ],
+ "limit-offset": [
+  {
+   "id": "act-25",
+   "title": "Offset >= result size on the in-memory sort (TopK) path returns an empty window with no error",
+   "proposedTestName": "TestIndex_LimitOffset_OffsetLargerThanResultSet_InMemorySort",
+   "proposedTestSketch": "Collection with NO index on the sort field (forces FullScan->TopK->Limit). Insert 10 docs {id:i,a:i}. (1) Find(nil).Sort(\"a\").Offset(10).Limit(5) -> 0 rows (plan FullScan(filtered) -> TopK(15) -> Limit(offset=10,limit=5)). (2) Offset(100).Limit(5) -> 0 rows. (3) Sort(\"a\").Limit(100) -> [0..9] in order (TopK(100)). (4) Sort(\"a\").Offset(9).Limit(5) -> [9]. All complete with no iterator error. Do NOT add an index on \"a\" or it degrades to the ExactSort path.",
+   "expectedBehavior": "Offset applied above the materialized TopK heap via LimitIter's per-row skip; boundary Offset==N and over-boundary yield empty results cleanly; Limit larger than the result set returns everything. This is a distinct code path from the cursor-skip used by every existing offset-past-end test.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-26",
+   "title": "TopK-heap sort stability/determinism with duplicate keys under offset+limit (non-indexed sort)",
+   "proposedTestName": "TestIndex_LimitOffset_TopKStability_DuplicateKeys_NonIndexedSort",
+   "proposedTestSketch": "Collection with NO index. Insert 30 docs {id:i,a:i/10} (3 groups of 10 identical keys). full:=collectField(Find(nil).Sort(\"a\"),\"id\"); require.Len(full,30). Determinism: run collectField(Find(nil).Sort(\"a\").Offset(7).Limit(8),\"id\") twice; assert.Equal run1,run2 (TopK=15, eviction active). Pagination: paged:=concat over O in {0,10,20} of collectField(Find(nil).Sort(\"a\").Offset(uint(O)).Limit(10),\"id\"); assert.Equal(full,paged); each window len 10. Self-consistency check (non-indexed full vs non-indexed pages).",
+   "expectedBehavior": "collectAndSort appends the unique docId after the sort key, making the heap order a total order, so the TopK eviction is deterministic and pagination produces no duplicate/missing ids across pages. Validates the docId tail makes the heap stable under eviction.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-27",
+   "title": "Filter + offset on the in-memory sort path skips filtered+sorted rows, never raw scan rows",
+   "proposedTestName": "TestIndex_LimitOffset_FilterOffset_InMemorySort_SkipsFilteredRows",
+   "proposedTestSketch": "EnsureIndex {a} only (sort field b unindexed). Insert 40 docs {id:i,a:i,b:40-i}. filter:=`{\"a\":{\"$gte\":20}}` (keeps a=20..39, b=1..20). allFiltered:=collectIntField(Find(filter).Sort(\"b\"),\"b\"); require.Len(allFiltered,20). window:=collectIntField(Find(filter).Sort(\"b\").Offset(5).Limit(5),\"b\"); assert.Equal(allFiltered[5:10],window) == [6,7,8,9,10]. Explain.Sql == \"IndexScan(a)[bounds=Bounds{['20',inf]}] -> Fetch -> Filter -> Dedup(canonical) -> TopK(10) -> Limit(offset=5,limit=5)\"; NotContains \"skip=\"; Contains \"TopK\".",
+   "expectedBehavior": "Because SortIter is not an offsetSkipper, the offset is applied by LimitIter's per-row skip ABOVE the filtered+sorted stream \u2014 never as a cursor-level skip leaking below the filter. Guards against window corruption from skipping raw rows the filter would reject.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-28",
+   "title": "Explain token contract: indexed sort+limit prints neither Sort nor TopK; non-indexed sort+limit prints TopK(N); non-indexed unlimited sort prints Sort",
+   "proposedTestName": "TestIndex_LimitOffset_ExplainTokens_TopKvsSort",
+   "proposedTestSketch": "50 docs {id:i,a:i}. (1) Indexed: EnsureIndex {a}; Find(nil).Sort(\"a\").Limit(5).Explain.Sql==\"IndexScan(a) -> Fetch -> Dedup(canonical) -> Limit(5)\"; Contains \"IndexScan(a)\", NotContains \"TopK\", NotContains \"-> Sort\". (2) Non-indexed: Find(nil).Sort(\"a\").Limit(5).Explain.Sql==\"FullScan(filtered) -> TopK(5) -> Limit(5)\"; Contains \"TopK(5)\", NotContains \"-> Sort\". (3) Non-indexed unlimited: Find(nil).Sort(\"a\").Explain.Sql==\"FullScan(filtered) -> Sort\"; Contains \"-> Sort\", NotContains \"TopK\". Optional: non-indexed Sort(\"-a\").Offset(5).Limit(5) Contains \"TopK(10)\". Values a=0..4 for Limit(5).",
+   "expectedBehavior": "An in-memory sort UNDER a limit prints TopK(limit+offset), never Sort; an unlimited in-memory sort prints Sort; an index-covered sort prints neither. Highest-value assertion is the TopK(5) token, which no existing test protects (many NotContains \"Sort(\" assertions are misleading since real tokens are \"-> Sort\"/\"TopK(N)\").",
+   "priority": "low"
+  }
+ ],
+ "or-complex-filter": [
+  {
+   "id": "act-33",
+   "title": "$nor over an indexed collection is sound and fullscans (pure $nor); mixed equality+$nor narrows on the equality field",
+   "proposedTestName": "TestIndex_ComplexFilter_NorIsSoundAndFullScans",
+   "proposedTestSketch": "setupTestCollection(t,100,IndexInfo{Fields:[a]}) and an unindexed twin. (1) `{\"$nor\":[{\"a\":1},{\"a\":2}]}`: Count==80==unindexed Count; ElementsMatch ids; Explain.Sql Contains \"FullScan\". (2) Mixed `{\"a\":5,\"$nor\":[{\"b\":1},{\"b\":2}]}`: Count==7==unindexed; ElementsMatch; Explain.Sql Contains \"IndexScan(a)\" + \"-> Filter\" (index narrows on a, NOR is residual filter).",
+   "expectedBehavior": "Nor.IndexBounds returns bounds unchanged, so a pure $nor cannot narrow via index and must FullScan-and-filter (80 docs). A mixed equality+$nor narrows on the equality index field and applies the NOR as a residual filter (7 docs). Indexed and unindexed results agree.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-34",
+   "title": "$not operator form over an index is sound and fullscans",
+   "proposedTestName": "TestIndex_ComplexFilter_NotOperatorSound",
+   "proposedTestSketch": "setupTestCollection(t,100,IndexInfo{Fields:[a]}) and unindexed twin. (1) `{\"a\":{\"$not\":{\"$eq\":5}}}`: Count==90==unindexed; ElementsMatch ids; Explain.Sql Contains \"FullScan(filtered)\", NotContains \"IndexScan\"/\"IndexSeek\"/\"CoverLookup\". (2) `{\"a\":{\"$not\":{\"$gte\":8}}}`: Count==80 (negated range).",
+   "expectedBehavior": "Not.IndexBounds returns bounds unchanged, so a negated predicate yields no index bounds and the planner fullscans-and-filters. Indexed and unindexed Count/Iter are identical.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-35",
+   "title": "$exists:false and $exists:true over a non-sparse index both fullscan (not answered from index entries)",
+   "proposedTestName": "TestIndex_ComplexFilter_ExistsFalseAndNonSparse",
+   "proposedTestSketch": "NON-sparse EnsureIndex {opt}. Insert 100 docs: even i -> {id:i,opt:i}, odd i -> {id:i}. (1) Find(`{\"opt\":{\"$exists\":false}}`).Count==50; Explain.Sql Contains \"FullScan\". (2) Find(`{\"opt\":{\"$exists\":true}}`).Count==50; Explain.Sql Contains \"FullScan\", NotContains \"IndexScan\" (a buggy index-based answer would yield 100 since non-sparse index len==100). Repeat $exists:false with a SPARSE index -> Count==50, FullScan, sparse index len==50. All counts match a no-index baseline.",
+   "expectedBehavior": "Exists.IndexBounds and Not{Exists}.IndexBounds both return bounds unchanged, so $exists never narrows via index and always fullscans-and-filters; $exists:true over a non-sparse index (len 100) correctly returns 50, NOT 100. No test covered $exists:false at all.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-36",
+   "title": "Contradictory two-range $and on one indexed field (a>5 AND a<3) returns 0; over-approx seek trimmed by re-filter",
+   "proposedTestName": "TestIndex_ComplexFilter_ContradictoryRangeAnd",
+   "proposedTestSketch": "setupTestCollection(t,100,IndexInfo{Fields:[a]}). For both `{\"$and\":[{\"a\":{\"$gt\":5}},{\"a\":{\"$lt\":3}}]}` and inline `{\"a\":{\"$gt\":5,\"$lt\":3}}`: Count==0; Iter len 0; assert Count==len(Iter). Explain the $and form: Contains \"IndexScan(a)\" AND Contains \"-> Filter\" (over-approx seek bounds ('5',inf] trimmed by re-filter; CountOnly fast path correctly NOT fired since 2 predicates on a).",
+   "expectedBehavior": "And.IndexBounds returns only the first conjunct's bounds (sound over-approximation to ('5',inf]); FilterIter rejects every row so Count==Iter==0. The two-predicate field disqualifies the covering-count fast path. Distinct shape from the existing $in+$gte test.",
+   "priority": "high"
+  },
+  {
+   "id": "act-37",
+   "title": "$or whose two branches are on two SEPARATE indexed fields fullscans (union soundness; no single-index seek that drops a branch)",
+   "proposedTestName": "TestIndex_ComplexFilter_OrTwoIndexedFieldsUnion",
+   "proposedTestSketch": "Indexed coll with indexes on BOTH a and b (100 docs a=i%10,b=i%7) plus an unindexed twin. f:=`{\"$or\":[{\"a\":1},{\"b\":2}]}`. assert idx.Find(f).Count==23==noidx Count (exact value 23, not the finding's 24); ElementsMatch(collectIdsString both). Explain.Sql Contains \"FullScan\" (== \"FullScan(filtered)\"); candidate list has only FullScan (no IndexSeek/IndexScan generated).",
+   "expectedBehavior": "Or.IndexBounds for a given field returns bounds unchanged whenever any branch yields no bounds for that field, so a cross-field $or produces empty bounds for every index and must FullScan-and-filter. Guards against a future change that wrongly seeks one index and silently drops the other branch.",
+   "priority": "high"
+  }
+ ],
+ "corruption-recovery": [
+  {
+   "id": "act-38",
+   "title": "Stale UNIQUE index entry blocks reinserting the same value after the original doc's data row was deleted; rebuild fixes it",
+   "proposedTestName": "TestIndex_Corruption_UniqueStaleEntryBlocksReinsert",
+   "proposedTestSketch": "EnsureIndex {Fields:[a],Unique:true}. Insert {id:1,a:100}. Directly delete data row id=1 (idKey:=anyenc.AppendAnyValue(anyenc.Tuple(nil),1); tx.Delete(c.ns,idKey)) leaving the phantom unique entry. err:=Insert {id:2,a:100}; require.ErrorIs(err,ErrUniqueConstraint). assertCollCount(coll,0). Recovery: DropIndex(\"a\")+EnsureIndex(unique on a); Insert {id:2,a:100} succeeds; assertIndexLen(GetIndexes()[0],1); n,_:=Find(`{\"a\":100}`).Count(ctx); assert.Equal(1,n). (No mustCount helper.)",
+   "expectedBehavior": "Unique insertKeys seeks the value-only prefix with no data-liveness check, so a stale entry pointing at a deleted doc falsely returns ErrUniqueConstraint. Pins the documented limitation (unique constraints trust index entries, not data) and proves DropIndex+EnsureIndex rebuild recovers.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-39",
+   "title": "API delete is value-derived and leaves a pre-existing spurious same-docId entry orphaned; only rebuild self-heals",
+   "proposedTestName": "TestIndex_Corruption_DeleteLeavesOrphanedSpuriousEntry",
+   "proposedTestSketch": "EnsureIndex {Fields:[a]}. Insert {id:1,a:100}. injectRawIndexEntry(t,c,idx,buildIndexFullKey([]any{777},1),[]byte{0x00}) (same docId=1, different value). assertIndexLen(idx,2). DeleteId(ctx,1); assertCollCount(coll,0); assertIndexLen(idx,1) (a=100 removed, 777 orphaned, NOT 0). Recovery: DropIndex(\"a\")+EnsureIndex; assertIndexLen(GetIndexes()[0],0).",
+   "expectedBehavior": "deleteKeys recomputes keys from the doc's CURRENT field values and deletes only those, so a spurious entry with a different value but the same docId is never visited and is orphaned. Documents that API delete does not self-heal pre-existing corruption; EnsureIndex rebuild does.",
+   "priority": "low"
+  },
+  {
+   "id": "act-40",
+   "title": "DeleteId on a doc whose data row is already gone returns ErrDocNotFound and does not touch the stale index entry",
+   "proposedTestName": "TestIndex_Corruption_DeleteIdAfterDataRowGone",
+   "proposedTestSketch": "EnsureIndex {Fields:[a]}. Insert id=1..3 (a=i*10). Directly delete data row id=2 (tx.Delete(c.ns, AppendAnyValue(Tuple(nil),2))); idx.Len==3. err:=DeleteId(ctx,2); require.ErrorIs(err,ErrDocNotFound). assertIndexLen(c.indexes[0],3) (stale entry untouched); assertCollCount(coll,2). DropIndex+EnsureIndex; assertIndexLen(GetIndexes()[0],2); assertCollCount(coll,2).",
+   "expectedBehavior": "DeleteId calls loadById first, which maps ErrKeyNotFound -> ErrDocNotFound and returns before deleteItem, so it fails fast without panicking or mutating the index. Recovery rebuild drops the stale entry.",
+   "priority": "low"
+  },
+  {
+   "id": "act-41",
+   "title": "EnsureIndex rebuild restores compound null padding; missing-trailing-field and explicit-null both encode as v/null and are both found",
+   "proposedTestName": "TestIndex_Corruption_CompoundRebuildRestoresNullPadding",
+   "proposedTestSketch": "EnsureIndex {Fields:[a,b]} (non-sparse). Insert {id:1,a:1,b:2},{id:2,a:1} (no b),{id:3,a:1,b:null}. assertIndexLen(idx,3). Find({\"a\":1,\"b\":null}) returns id=2 AND id=3; Find({\"a\":1,\"b\":2}) returns id=1. Directly delete id=2's 1/null entry (key built via AppendAnyValue(AppendAnyValue(Tuple(nil),1),nil) then docId 2 appended; tx.Delete(idx.ns,full)); idx.Len==2, Find({\"a\":1,\"b\":null}) returns only [3]. DropIndex+EnsureIndex; idx.Len==3, Find({\"a\":1,\"b\":null}) ElementsMatch [\"2\",\"3\"]; Find({\"a\":1,\"b\":2}).Count==1. Import internal/btree; use .Count(ctx) (no mustCount).",
+   "expectedBehavior": "A missing trailing field marshals to null padding (v/null), identical to an explicit b:null, so both docs are found by {a:1,b:null}. EnsureIndex rebuild from data restores the deleted padding entry. Existing compound-corruption test never includes a missing-trailing-field doc.",
+   "priority": "medium"
+  },
+  {
+   "id": "act-42",
+   "title": "EnsureIndex with an existing name but changed definition (add Unique) is a silent no-op; drop+recreate required to change semantics",
+   "proposedTestName": "TestIndex_EnsureIndex_SameNameChangedDefinitionIsNoOp",
+   "proposedTestSketch": "EnsureIndex {Fields:[a]}; Insert {id:1,a:5},{id:2,a:5}. EnsureIndex {Fields:[a],Unique:true} returns nil (swallowed no-op); assert.False(GetIndexes()[0].Info().Unique); Insert {id:3,a:5} still succeeds. Upgrade path: DropIndex(\"a\"); EnsureIndex {Fields:[a],Unique:true} returns ErrUniqueConstraint (rebuild fails on dup a=5, tx rolls back, GetIndexes() empty). Delete dups, retry EnsureIndex{Unique:true}; Info().Unique==true and a dup insert returns ErrUniqueConstraint.",
+   "expectedBehavior": "Index name == join(Fields), so Unique/Sparse changes don't change the name; createIndexes(ensure=true) swallows ErrIndexExists and retains the old non-unique definition. The upgrade requires DropIndex then EnsureIndex (whose backfill fails if existing data has duplicates). Pins the correct-but-surprising contract.",
+   "priority": "medium"
+  }
+ ],
+ "compound-index": [
+  {
+   "id": "act-43",
+   "title": "Whole-tuple reverse of an all-ascending compound index Sort(-a,-b) is index-covered (no in-memory Sort)",
+   "proposedTestName": "TestIndex_Compound_SortReversedIndex_WholeTuple",
+   "proposedTestSketch": "EnsureIndex {Fields:[a,b]} ascending. Insert 9 docs a in 0..2 x b in 0..2 (ids 0..8). collectField pairs for Find(nil).Sort(\"-a\",\"-b\") in order (2,2)(2,1)(2,0)(1,2)(1,1)(1,0)(0,2)(0,1)(0,0). Explain.Sql == \"IndexScan(a,b)(reverse) -> Fetch\" \u2014 Contains \"(reverse)\" and \"IndexScan(a,b)\", NotContains \"Sort\". No [bounds=...] since no filter. Optionally compare to an unindexed twin.",
+   "expectedBehavior": "A whole-tuple reverse of an all-ascending index IS realizable by a single reverse scan (consistent-reversal path in IndexSortMatch), so the plan reverse-scans with no in-memory Sort. This is legitimate, unlike the mixed-direction bug (sb-01). Distinct from existing ascending-only compound-sort tests.",
+   "priority": "low"
+  },
+  {
+   "id": "act-44",
+   "title": "Equality-first + range-second with sort on the range field (asc and desc) is fully index-covered",
+   "proposedTestName": "TestIndex_Compound_FilterAndRangeOnSecond",
+   "proposedTestSketch": "EnsureIndex {Fields:[a,b]}. Insert a=1..3, b=1..10 (30 docs). (1) Find({\"a\":2,\"b\":{\"$gte\":5}}).Sort(\"b\") -> b=[5,6,7,8,9,10]; Explain.Sql Contains \"IndexScan(a,b)\", NotContains \"-> Sort\". (2) Sort(\"-b\") -> b=[10,9,8,7,6,5]; Explain Contains \"IndexScan(a,b)(reverse)\", NotContains \"-> Sort\". Count 6 both. (3) Find({\"a\":2,\"b\":{\"$lt\":5}}).Sort(\"b\") -> b=[1,2,3,4]. Assert on \"IndexScan(a,b)\" substring, NOT the full bounds text (inf cap renders cosmetically odd).",
+   "expectedBehavior": "equalityPrefix=1 (a fixed); the sort on the second range field b is index-covered ascending or reverse, so no in-memory Sort. Spec's TestIndex_Compound_FilterAndRangeOnSecond is unimplemented; impl is correct.",
+   "priority": "medium"
+  }
+ ]
+}

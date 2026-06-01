@@ -2325,3 +2325,1080 @@ func TestAudit11_SingletonIn_MultipleDocs(t *testing.T) {
 	assert.Equal(t, expected, ids,
 		"Iter must yield d0..d%d each exactly once (got %v)", N-1, ids)
 }
+
+// ── Single-index audit (act-01/03/04) ──
+/*
+Audit tests for the "single-index" domain (docs/qplanner/audit/actionable_by_domain.json).
+
+  act-01  $ne on an indexed scalar uses a two-bound seek and still includes
+          null/missing (non-sparse): the index IS used (IndexScan, not FullScan),
+          value 5 is excluded, and null/missing docs survive the residual Filter.
+  act-03  Cross-type ordering: equality is type-strict (number 5 != string "5");
+          $gte:0 sweeps strings/bools because number-0 sorts before them; the
+          ascending sort order is Null<Number<String<False<True.
+  act-04  Negative numbers round-trip through the order-preserving encoding for
+          equality, two-sided range and asc/desc sort.
+
+All helpers used here (newFixture, collectField, collectIdsString, assertIndexLen)
+are defined elsewhere in the package test suite and reused as-is.
+*/
+
+
+// act-01
+func TestIndex_Single_Ne_TwoBoundSeek_IncludesNullAndMissing(t *testing.T) {
+	// Builds a collection; when withIndex is true a non-sparse index {a} is added.
+	mk := func(withIndex bool, docs ...string) Collection {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "c")
+		require.NoError(t, err)
+		if withIndex {
+			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+		}
+		for _, d := range docs {
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
+		}
+		return coll
+	}
+
+	sortedIds := func(c Collection, filter string) []string {
+		ids := collectIdsString(t, c.Find(filter).Sort("id"))
+		sort.Strings(ids)
+		return ids
+	}
+
+	t.Run("null and missing survive $ne", func(t *testing.T) {
+		// id values are JSON strings so collectIdsString (GetStringBytes) resolves them.
+		docs := []string{
+			`{"id":"1","a":5}`,
+			`{"id":"2","a":7}`,
+			`{"id":"3","a":null}`,
+			`{"id":"4"}`, // missing a
+		}
+		idx := mk(true, docs...)
+		noidx := mk(false, docs...)
+
+		// (1) Count == 3, identical with and without the index.
+		idxCount, err := idx.Find(`{"a":{"$ne":5}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 3, idxCount)
+		noidxCount, err := noidx.Find(`{"a":{"$ne":5}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, idxCount, noidxCount)
+
+		// (2) Same id set for indexed and unindexed: 2 (a=7), 3 (null), 4 (missing).
+		want := []string{"2", "3", "4"}
+		assert.ElementsMatch(t, want, sortedIds(idx, `{"a":{"$ne":5}}`))
+		assert.ElementsMatch(t, want, sortedIds(noidx, `{"a":{"$ne":5}}`))
+
+		// (3) Both null and missing are indexed (non-sparse) => 4 entries.
+		assertIndexLen(t, idx.GetIndexes()[0], 4)
+
+		// (4) Explain: index IS used via the two-bound seek, with a residual Filter.
+		explain, err := idx.Find(`{"a":{"$ne":5}}`).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, explain.Sql, "IndexScan(a)")
+		assert.Contains(t, explain.Sql, "[-inf,'5'),('5',inf]")
+		assert.Contains(t, explain.Sql, "-> Filter")
+		assert.NotContains(t, explain.Sql, "FullScan")
+	})
+
+	t.Run("dense 0..9 dataset", func(t *testing.T) {
+		var docs []string
+		for i := 0; i < 10; i++ {
+			docs = append(docs, fmt.Sprintf(`{"id":"%d","a":%d}`, i, i))
+		}
+		idx := mk(true, docs...)
+		noidx := mk(false, docs...)
+
+		// $ne:5 excludes exactly a=5; ascending a-values are 0,1,2,3,4,6,7,8,9.
+		gotIdx := collectField(t, idx.Find(`{"a":{"$ne":5}}`).Sort("a"), "a")
+		gotNoidx := collectField(t, noidx.Find(`{"a":{"$ne":5}}`).Sort("a"), "a")
+		want := []string{"0", "1", "2", "3", "4", "6", "7", "8", "9"}
+		assert.Equal(t, want, gotIdx)
+		assert.Equal(t, want, gotNoidx)
+
+		cnt, err := idx.Find(`{"a":{"$ne":5}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 9, cnt)
+	})
+}
+
+// act-03
+func TestIndex_Single_MixedTypeOrdering(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"1","a":5}`),
+		anyenc.MustParseJson(`{"id":"2","a":"5"}`),
+		anyenc.MustParseJson(`{"id":"3","a":"hello"}`),
+		anyenc.MustParseJson(`{"id":"4","a":true}`),
+	))
+
+	// Equality is type-strict: number 5 matches only the numeric doc.
+	cnt, err := coll.Find(`{"a":5}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, cnt)
+	assert.Equal(t, []string{"1"}, collectIdsString(t, coll.Find(`{"a":5}`)))
+
+	// String "5" matches only the string doc.
+	cnt, err = coll.Find(`{"a":"5"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, cnt)
+	assert.Equal(t, []string{"2"}, collectIdsString(t, coll.Find(`{"a":"5"}`)))
+
+	// $gte:0 sweeps all four docs (number 0 sorts before all strings/bools).
+	cnt, err = coll.Find(`{"a":{"$gte":0}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 4, cnt)
+
+	// Ascending sort order: Number(5) < String("5") < String("hello") < True.
+	assert.Equal(t,
+		[]string{"5", "\"5\"", "\"hello\"", "true"},
+		collectField(t, coll.Find(nil).Sort("a"), "a"),
+	)
+	// And the corresponding id order.
+	assert.Equal(t,
+		[]string{"1", "2", "3", "4"},
+		collectIdsString(t, coll.Find(nil).Sort("a")),
+	)
+}
+
+// act-04
+func TestIndex_Single_NegativeNumbers(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+
+	for _, v := range []int{-5, -3, -1, 0, 2, 4} {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+			fmt.Sprintf(`{"id":%d,"a":%d}`, v+100, v))))
+	}
+
+	// (1) Two-sided range across the sign boundary, ascending.
+	assert.Equal(t,
+		[]string{"-3", "-1", "0"},
+		collectField(t, coll.Find(`{"a":{"$gte":-3,"$lt":2}}`).Sort("a"), "a"),
+	)
+
+	// (2) Full ascending sort across the sign boundary.
+	assert.Equal(t,
+		[]string{"-5", "-3", "-1", "0", "2", "4"},
+		collectField(t, coll.Find(nil).Sort("a"), "a"),
+	)
+
+	// (3) Equality on a negative value.
+	cnt, err := coll.Find(`{"a":-3}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, cnt)
+
+	// (4) Full descending sort across the sign boundary.
+	assert.Equal(t,
+		[]string{"4", "2", "0", "-1", "-3", "-5"},
+		collectField(t, coll.Find(nil).Sort("-a"), "a"),
+	)
+}
+
+// ── Limit/offset audit (act-25/26/27/28) ──
+// act-25: Offset >= result size on the in-memory sort (TopK) path returns an
+// empty window with no error. Forces the FullScan -> TopK -> Limit path by
+// leaving the sort field UNINDEXED (adding an index on "a" would degrade to the
+// index-ordered ExactSort path with a cursor-level skip instead).
+func TestIndex_LimitOffset_OffsetLargerThanResultSet_InMemorySort(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "noidx")
+	require.NoError(t, err)
+	// NO index on "a" on purpose.
+
+	for i := 0; i < 10; i++ {
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))))
+	}
+
+	// local closure: collect the int "a" field, asserting no iterator error.
+	collectA := func(q Query) []int {
+		t.Helper()
+		iter, err := q.Iter(ctx)
+		require.NoError(t, err)
+		defer iter.Close()
+		var out []int
+		for iter.Next() {
+			d, derr := iter.Doc()
+			require.NoError(t, derr)
+			out = append(out, int(d.Value().GetInt("a")))
+		}
+		require.NoError(t, iter.Err())
+		return out
+	}
+
+	// (1) Offset == N (boundary) -> empty window, in-memory TopK path.
+	t.Run("offset_equals_size", func(t *testing.T) {
+		ex, err := coll.Find(nil).Sort("a").Offset(10).Limit(5).Explain(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, "FullScan(filtered) -> TopK(15) -> Limit(offset=10,limit=5)", ex.Sql)
+
+		got := collectA(coll.Find(nil).Sort("a").Offset(10).Limit(5))
+		assert.Len(t, got, 0)
+	})
+
+	// (2) Offset well past the end -> still empty, no error.
+	t.Run("offset_past_end", func(t *testing.T) {
+		got := collectA(coll.Find(nil).Sort("a").Offset(100).Limit(5))
+		assert.Len(t, got, 0)
+	})
+
+	// (3) Limit larger than the result set -> everything, in order, TopK(100).
+	t.Run("limit_larger_than_result", func(t *testing.T) {
+		ex, err := coll.Find(nil).Sort("a").Limit(100).Explain(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, "FullScan(filtered) -> TopK(100) -> Limit(100)", ex.Sql)
+
+		got := collectA(coll.Find(nil).Sort("a").Limit(100))
+		assert.Equal(t, []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, got)
+	})
+
+	// (4) Offset == N-1 -> exactly the last element survives.
+	t.Run("offset_n_minus_one", func(t *testing.T) {
+		got := collectA(coll.Find(nil).Sort("a").Offset(9).Limit(5))
+		assert.Equal(t, []int{9}, got)
+	})
+}
+
+// act-26: TopK-heap sort stability/determinism with duplicate keys under
+// offset+limit on a NON-indexed sort. collectAndSort appends the unique docId
+// after the sort key so the heap order is a total order: eviction is
+// deterministic and pagination yields no duplicate/missing ids across pages.
+func TestIndex_LimitOffset_TopKStability_DuplicateKeys_NonIndexedSort(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "noidx")
+	require.NoError(t, err)
+	// NO index: forces the in-memory TopK/Sort path.
+
+	// 30 docs, a = i/10 -> 3 groups of 10 identical sort keys (0,1,2).
+	for i := 0; i < 30; i++ {
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i/10))))
+	}
+
+	collectIDs := func(q Query) []int {
+		t.Helper()
+		iter, err := q.Iter(ctx)
+		require.NoError(t, err)
+		defer iter.Close()
+		var out []int
+		for iter.Next() {
+			d, derr := iter.Doc()
+			require.NoError(t, derr)
+			out = append(out, int(d.Value().GetInt("id")))
+		}
+		require.NoError(t, iter.Err())
+		return out
+	}
+
+	// Baseline: full ordered stream (unbounded in-memory Sort).
+	full := collectIDs(coll.Find(nil).Sort("a"))
+	require.Len(t, full, 30)
+
+	// Determinism: a windowed query with active TopK eviction (TopK=15) must be
+	// identical across repeated runs.
+	t.Run("deterministic_eviction", func(t *testing.T) {
+		// Confirm the eviction-active TopK path is taken (15 < 30 rows).
+		ex, err := coll.Find(nil).Sort("a").Offset(7).Limit(8).Explain(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, "FullScan(filtered) -> TopK(15) -> Limit(offset=7,limit=8)", ex.Sql)
+
+		run1 := collectIDs(coll.Find(nil).Sort("a").Offset(7).Limit(8))
+		run2 := collectIDs(coll.Find(nil).Sort("a").Offset(7).Limit(8))
+		require.Len(t, run1, 8)
+		assert.Equal(t, run1, run2)
+		// And the window must match the same slice of the full ordered stream.
+		assert.Equal(t, full[7:15], run1)
+	})
+
+	// Pagination across the full set in 3 pages of 10 reconstructs `full`
+	// exactly: no duplicate/missing ids, even with the duplicate sort keys.
+	t.Run("pagination_no_gaps_no_dups", func(t *testing.T) {
+		var paged []int
+		for _, off := range []int{0, 10, 20} {
+			window := collectIDs(coll.Find(nil).Sort("a").Offset(uint(off)).Limit(10))
+			require.Lenf(t, window, 10, "window at offset %d", off)
+			paged = append(paged, window...)
+		}
+		assert.Equal(t, full, paged)
+	})
+}
+
+// act-27: Filter + offset on the in-memory sort path skips filtered+sorted
+// rows, never raw scan rows. The sort field "b" is unindexed so the offset is
+// applied by LimitIter ABOVE the filtered+sorted stream (TopK), not as a
+// cursor-level skip leaking below the filter.
+func TestIndex_LimitOffset_FilterOffset_InMemorySort_SkipsFilteredRows(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	// Index only on "a"; the sort field "b" is intentionally unindexed.
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+
+	// 40 docs: a=i, b=40-i. Filter a>=20 keeps a=20..39 -> b=1..20.
+	for i := 0; i < 40; i++ {
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i, 40-i))))
+	}
+
+	const filter = `{"a":{"$gte":20}}`
+
+	// Full filtered+sorted reference: b ascending over the kept rows.
+	allFiltered := collectIntField(t, coll.Find(filter).Sort("b"), "b")
+	require.Len(t, allFiltered, 20)
+	// Sanity: the kept rows are exactly b = 1..20 ascending.
+	wantAll := make([]int, 20)
+	for i := range wantAll {
+		wantAll[i] = i + 1
+	}
+	require.Equal(t, wantAll, allFiltered)
+
+	// The window [offset 5, limit 5] must equal allFiltered[5:10] == [6,7,8,9,10].
+	window := collectIntField(t, coll.Find(filter).Sort("b").Offset(5).Limit(5), "b")
+	assert.Equal(t, allFiltered[5:10], window)
+	assert.Equal(t, []int{6, 7, 8, 9, 10}, window)
+
+	// Explain: offset is applied above the TopK by LimitIter (never as a
+	// cursor-level "skip=" below the filter).
+	ex, err := coll.Find(filter).Sort("b").Offset(5).Limit(5).Explain(ctx)
+	require.NoError(t, err)
+	assert.Equal(t,
+		"IndexScan(a)[bounds=Bounds{['20',inf]}] -> Fetch -> Filter -> Dedup(canonical) -> TopK(10) -> Limit(offset=5,limit=5)",
+		ex.Sql)
+	assert.NotContains(t, ex.Sql, "skip=")
+	assert.Contains(t, ex.Sql, "TopK")
+}
+
+// act-28: Explain token contract for sort+limit.
+//   - index-covered sort+limit: neither Sort nor TopK (just Limit).
+//   - non-indexed sort+limit: TopK(limit+offset), never Sort.
+//   - non-indexed unlimited sort: Sort, never TopK.
+func TestIndex_LimitOffset_ExplainTokens_TopKvsSort(t *testing.T) {
+	fx := newFixture(t)
+
+	// (1) Indexed sort + limit -> IndexScan, neither TopK nor Sort.
+	t.Run("indexed_sort_limit_no_topk_no_sort", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "idx")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+		for i := 0; i < 50; i++ {
+			require.NoError(t, coll.Insert(ctx,
+				anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))))
+		}
+
+		ex, err := coll.Find(nil).Sort("a").Limit(5).Explain(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, "IndexScan(a) -> Fetch -> Dedup(canonical) -> Limit(5)", ex.Sql)
+		assert.Contains(t, ex.Sql, "IndexScan(a)")
+		assert.NotContains(t, ex.Sql, "TopK")
+		assert.NotContains(t, ex.Sql, "-> Sort")
+
+		// And the values are the smallest 5, in order.
+		vals := collectIntField(t, coll.Find(nil).Sort("a").Limit(5), "a")
+		assert.Equal(t, []int{0, 1, 2, 3, 4}, vals)
+	})
+
+	// (2) Non-indexed sort + limit -> TopK(5), never Sort.
+	t.Run("nonindexed_sort_limit_topk", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "noidx")
+		require.NoError(t, err)
+		for i := 0; i < 50; i++ {
+			require.NoError(t, coll.Insert(ctx,
+				anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))))
+		}
+
+		ex, err := coll.Find(nil).Sort("a").Limit(5).Explain(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, "FullScan(filtered) -> TopK(5) -> Limit(5)", ex.Sql)
+		assert.Contains(t, ex.Sql, "TopK(5)")
+		assert.NotContains(t, ex.Sql, "-> Sort")
+
+		vals := collectIntField(t, coll.Find(nil).Sort("a").Limit(5), "a")
+		assert.Equal(t, []int{0, 1, 2, 3, 4}, vals)
+	})
+
+	// (3) Non-indexed unlimited sort -> Sort, never TopK.
+	t.Run("nonindexed_unlimited_sort", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "noidx2")
+		require.NoError(t, err)
+		for i := 0; i < 50; i++ {
+			require.NoError(t, coll.Insert(ctx,
+				anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))))
+		}
+
+		ex, err := coll.Find(nil).Sort("a").Explain(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, "FullScan(filtered) -> Sort", ex.Sql)
+		assert.Contains(t, ex.Sql, "-> Sort")
+		assert.NotContains(t, ex.Sql, "TopK")
+	})
+
+	// (4) Non-indexed sort + offset + limit -> TopK(limit+offset).
+	t.Run("nonindexed_sort_offset_limit_topk_sum", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "noidx3")
+		require.NoError(t, err)
+		for i := 0; i < 50; i++ {
+			require.NoError(t, coll.Insert(ctx,
+				anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))))
+		}
+
+		ex, err := coll.Find(nil).Sort("-a").Offset(5).Limit(5).Explain(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, "FullScan(filtered) -> TopK(10) -> Limit(offset=5,limit=5)", ex.Sql)
+		assert.Contains(t, ex.Sql, "TopK(10)")
+		assert.NotContains(t, ex.Sql, "-> Sort")
+	})
+}
+
+// ── Array/nested audit (act-02/29/30/31/32) ──
+// act-02: $ne over a multikey (array) index performs a two-bound negation
+// seek that visits a straddling element via BOTH bounds; CanonicalKeyDedup
+// emits it exactly once. The residual FilterIter applies all-elements $ne
+// semantics. $nin desugars to Nor and yields NO index bounds, so it must
+// FullScan even when given a max-Boost IndexHint. In every case the indexed
+// result equals the fullscan result.
+func TestIndex_ArrayNested_NeOverMultiKey_DedupAndAgreement(t *testing.T) {
+	sortedIds := func(ids []string) []string {
+		out := append([]string(nil), ids...)
+		sort.Strings(out)
+		return out
+	}
+
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "tags", Fields: []string{"tags"}}))
+
+	// id3 straddles the negated value "a": "A" < "a" < "z", so both the
+	// lower bound [-inf,"a") and the upper bound ("a",inf] visit it.
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"1","tags":["a","b"]}`),
+		anyenc.MustParseJson(`{"id":"2","tags":["b","c"]}`),
+		anyenc.MustParseJson(`{"id":"3","tags":["A","z"]}`),
+		anyenc.MustParseJson(`{"id":"4","tags":"a"}`),
+		anyenc.MustParseJson(`{"id":"5","tags":"d"}`),
+	))
+
+	// (a) Explain: index IS used with the two-bound split, and the chain
+	// ends in Dedup(canonical). Identical with and without an IndexHint.
+	neExplain, err := coll.Find(`{"tags":{"$ne":"a"}}`).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, neExplain.Sql, "IndexScan(tags)")
+	assert.Contains(t, neExplain.Sql, "Dedup(canonical)")
+	assert.Contains(t, neExplain.Sql, `[-inf,'"a"'),('"a"',inf]`)
+
+	neHintExplain, err := coll.Find(`{"tags":{"$ne":"a"}}`).
+		IndexHint(IndexHint{IndexName: "tags", Boost: 1000000}).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, neHintExplain.Sql, "IndexScan(tags)")
+	assert.Contains(t, neHintExplain.Sql, "Dedup(canonical)")
+	assert.Contains(t, neHintExplain.Sql, `[-inf,'"a"'),('"a"',inf]`)
+
+	// (b) Count == 3 and == fullscan count (no-index twin).
+	neCount, err := coll.Find(`{"tags":{"$ne":"a"}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 3, neCount)
+
+	fxNo := newFixture(t)
+	collNo, err := fxNo.CreateCollection(ctx, "test_noidx")
+	require.NoError(t, err)
+	require.NoError(t, collNo.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"1","tags":["a","b"]}`),
+		anyenc.MustParseJson(`{"id":"2","tags":["b","c"]}`),
+		anyenc.MustParseJson(`{"id":"3","tags":["A","z"]}`),
+		anyenc.MustParseJson(`{"id":"4","tags":"a"}`),
+		anyenc.MustParseJson(`{"id":"5","tags":"d"}`),
+	))
+	neCountNo, err := collNo.Find(`{"tags":{"$ne":"a"}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, neCount, neCountNo)
+
+	// (c) Iter ids: raw scan order is 3,2,5; compare as a sorted set.
+	// id3 the straddler appears exactly once; id1 and id4 (contain "a") excluded.
+	neIds := collectIdsString(t, coll.Find(`{"tags":{"$ne":"a"}}`))
+	assert.Len(t, neIds, 3) // exactly once each — no duplicate straddler
+	assert.Equal(t, []string{"2", "3", "5"}, sortedIds(neIds))
+	neIdsNo := collectIdsString(t, collNo.Find(`{"tags":{"$ne":"a"}}`))
+	assert.Equal(t, sortedIds(neIds), sortedIds(neIdsNo))
+
+	// $nin desugars to Nor: NO index bounds, must FullScan even when hinted.
+	ninExplain, err := coll.Find(`{"tags":{"$nin":["a"]}}`).
+		IndexHint(IndexHint{IndexName: "tags", Boost: 1000000}).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, ninExplain.Sql, "FullScan")
+	assert.NotContains(t, ninExplain.Sql, "IndexScan")
+
+	ninCount, err := coll.Find(`{"tags":{"$nin":["a"]}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 3, ninCount)
+	ninIds := collectIdsString(t, coll.Find(`{"tags":{"$nin":["a"]}}`))
+	assert.Len(t, ninIds, 3)
+	assert.Equal(t, []string{"2", "3", "5"}, sortedIds(ninIds))
+}
+
+// act-29: A nested index path that crosses an array intermediate is NOT
+// implicitly traversed. Value.Get does strconv.Atoi on the segment after the
+// array; the non-numeric "name" fails -> nil -> one 'null' entry (non-sparse).
+// Positional access (items.0.name) resolves via the numeric index but is a
+// different, unindexed path.
+func TestIndex_ArrayNested_NestedField_IntermediateArray_NotTraversed(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "items.name", Fields: []string{"items.name"}}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"items":[{"name":"a"},{"name":"b"}]}`),
+		anyenc.MustParseJson(`{"id":2,"items":[{"name":"c"}]}`),
+	))
+
+	// Each doc contributes exactly one 'null' entry: the array intermediate
+	// stops traversal so the indexed value is null for both docs.
+	idx := coll.GetIndexes()[0]
+	assertIndexLen(t, idx, 2)
+
+	// No implicit array traversal: items.name="a" finds nothing. This query
+	// still IndexScans the items.name index (which holds only null entries).
+	cnt, err := coll.Find(`{"items.name":"a"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, cnt)
+
+	// Positional access works (resolves via the numeric index). This is a
+	// different, unindexed path -> FullScan; do not assert IndexScan.
+	posCnt, err := coll.Find(`{"items.0.name":"a"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, posCnt)
+
+	// Both docs are findable via the shared 'null' entry.
+	nullCnt, err := coll.Find(`{"items.name":null}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, nullCnt)
+}
+
+// act-30: Querying by a whole NON-empty array value uses the post-loop
+// whole-array index entry as a single, order-sensitive point bound.
+func TestIndex_ArrayNested_WholeArrayEquality_UsesIndex(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "tags", Fields: []string{"tags"}}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"1","tags":["a","b"]}`),
+		anyenc.MustParseJson(`{"id":"2","tags":["a"]}`),
+	))
+
+	// Whole-array equality uses the index with a single point bound on the
+	// order-sensitive whole-array encoding.
+	wholeExplain, err := coll.Find(`{"tags":["a","b"]}`).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, wholeExplain.Sql, "IndexScan(tags)")
+	assert.Contains(t, wholeExplain.Sql, `['["a","b"]','["a","b"]']`)
+
+	cnt, err := coll.Find(`{"tags":["a","b"]}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, cnt)
+	assert.Equal(t, []string{"1"}, collectIdsString(t, coll.Find(`{"tags":["a","b"]}`)))
+
+	// Order-sensitive: ["b","a"] is a different encoding -> no match.
+	revCnt, err := coll.Find(`{"tags":["b","a"]}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 0, revCnt)
+
+	// Single-element whole array matches only its own doc.
+	oneCnt, err := coll.Find(`{"tags":["a"]}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, oneCnt)
+	assert.Equal(t, []string{"2"}, collectIdsString(t, coll.Find(`{"tags":["a"]}`)))
+}
+
+// act-31: A null ARRAY ELEMENT is indexed as a real element (the sparse
+// guard only short-circuits whole-field null), so it survives even on a
+// sparse index. On a non-sparse index a null element makes a doc
+// indistinguishable from a missing-field doc by a {tags:null} query.
+// Duplicate nulls dedup within a doc.
+func TestIndex_ArrayNested_NullElementInArray_IndexedAndQueryable(t *testing.T) {
+	// Sub A: non-sparse.
+	fxA := newFixture(t)
+	collA, err := fxA.CreateCollection(ctx, "ns")
+	require.NoError(t, err)
+	require.NoError(t, collA.EnsureIndex(ctx, IndexInfo{Name: "tags", Fields: []string{"tags"}}))
+	require.NoError(t, collA.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"tags":["a",null,"b"]}`), // null,a,b,whole-array = 4
+		anyenc.MustParseJson(`{"id":2}`),                       // missing -> 1 null
+	))
+	assertIndexLen(t, collA.GetIndexes()[0], 5)
+
+	// {tags:null} matches BOTH the null-element doc and the missing-field doc.
+	nullA, err := collA.Find(`{"tags":null}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, nullA)
+	aA, err := collA.Find(`{"tags":"a"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, aA)
+
+	// Sub B: sparse contrast. The null element is still indexed (v is an
+	// array, so the sparse guard does not fire); only the missing-field doc
+	// is skipped.
+	fxB := newFixture(t)
+	collB, err := fxB.CreateCollection(ctx, "sp")
+	require.NoError(t, err)
+	require.NoError(t, collB.EnsureIndex(ctx, IndexInfo{Name: "tags", Fields: []string{"tags"}, Sparse: true}))
+	require.NoError(t, collB.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"tags":["a",null,"b"]}`), // null,a,b,whole-array = 4
+		anyenc.MustParseJson(`{"id":2}`),                       // missing -> skipped
+	))
+	assertIndexLen(t, collB.GetIndexes()[0], 4)
+	nullB, err := collB.Find(`{"tags":null}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, nullB)
+
+	// Sub C: duplicate nulls collapse within a doc.
+	fxC := newFixture(t)
+	collC, err := fxC.CreateCollection(ctx, "dup")
+	require.NoError(t, err)
+	require.NoError(t, collC.EnsureIndex(ctx, IndexInfo{Name: "tags", Fields: []string{"tags"}}))
+	require.NoError(t, collC.Insert(ctx,
+		anyenc.MustParseJson(`{"id":3,"tags":[null,null,"a"]}`), // null + a + whole-array = 3
+	))
+	assertIndexLen(t, collC.GetIndexes()[0], 3)
+}
+
+// act-32: A deep nested path whose LEAF is an array fans out multikey-style
+// (K elements + whole-array) path-agnostically. $in over nested-leaf
+// elements dedups overlapping docs to one result.
+func TestIndex_ArrayNested_NestedLeafArray_MultiKeyFanout(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "abc", Fields: []string{"a.b.c"}}))
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":{"b":{"c":["x","y"]}}}`),
+		anyenc.MustParseJson(`{"id":2,"a":{"b":{"c":["y","z"]}}}`),
+	))
+
+	// 3 entries per doc (2 elements + whole-array) regardless of nesting depth.
+	idx := coll.GetIndexes()[0]
+	assertIndexLen(t, idx, 6)
+
+	xCount, err := coll.Find(`{"a.b.c":"x"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, xCount)
+
+	yCount, err := coll.Find(`{"a.b.c":"y"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, yCount)
+
+	// The single-field equality on the nested-leaf array uses the index.
+	eqExplain, err := coll.Find(`{"a.b.c":"x"}`).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, eqExplain.Sql, "IndexScan(abc)")
+
+	// $in dedup: id1 has both x and y but collapses to one doc; id2 has y.
+	inCount, err := coll.Find(`{"a.b.c":{"$in":["x","y"]}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, inCount)
+
+	// Iter over the $in filter yields 2 results, each id exactly once.
+	inIds := collectIntField(t, coll.Find(`{"a.b.c":{"$in":["x","y"]}}`), "id")
+	sort.Ints(inIds)
+	assert.Equal(t, []int{1, 2}, inIds)
+}
+
+// ── Or/complex-filter audit (act-33/34/35/36/37) ──
+// =============================================================================
+// Domain: or-complex-filter
+//
+// These tests pin the soundness of the planner's handling of filter operators
+// that intentionally produce NO index bounds ($nor, $not, $exists, cross-field
+// $or), plus the over-approximating two-range $and. For every such operator the
+// contract is: the index cannot narrow the candidate set, so the planner must
+// FullScan-and-filter (or, for a partially-indexable predicate, IndexScan the
+// indexable conjunct and apply the rest as a residual Filter), and the result
+// must be byte-for-byte identical to an unindexed twin collection.
+//
+// Ground-truth references (verified in query/filter.go in this worktree):
+//   - Nor.IndexBounds    returns bounds unchanged  (pure $nor => FullScan)
+//   - Not.IndexBounds    returns bounds unchanged  (negation  => FullScan)
+//   - Exists.IndexBounds returns bounds unchanged  ($exists   => FullScan)
+//   - Or.IndexBounds     returns bounds unchanged when any branch yields no
+//                        bounds for the field (cross-field $or => FullScan)
+//   - And.IndexBounds    returns the FIRST conjunct's bounds (over-approx);
+//                        remaining conjuncts are a residual Filter.
+//
+// The FullScan token in Explain.Sql prints as "FullScan(filtered)" whenever a
+// residual filter is present (fullscan_iter.go String()).
+// =============================================================================
+
+// act-33: $nor over an indexed collection is sound and fullscans (pure $nor);
+// mixed equality+$nor narrows on the equality field and applies NOR as a
+// residual filter.
+func TestIndex_ComplexFilter_NorIsSoundAndFullScans(t *testing.T) {
+	// Local closure: build a collection of 100 docs (a=i%10, b=i%7), optionally
+	// indexed on "a". Twin (unindexed) collection is built by passing nil.
+	build := func(t *testing.T, indexes ...IndexInfo) Collection {
+		t.Helper()
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		for _, idx := range indexes {
+			require.NoError(t, coll.EnsureIndex(ctx, idx))
+		}
+		for i := 0; i < 100; i++ {
+			doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%10, i%7))
+			require.NoError(t, coll.Insert(ctx, doc))
+		}
+		return coll
+	}
+
+	idx := build(t, IndexInfo{Fields: []string{"a"}})
+	noidx := build(t)
+
+	t.Run("pure nor fullscans and agrees with unindexed", func(t *testing.T) {
+		f := `{"$nor":[{"a":1},{"a":2}]}`
+
+		// Nor.IndexBounds returns bounds unchanged => no narrowing => FullScan.
+		ex, err := idx.Find(f).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, ex.Sql, "FullScan")
+		assert.NotContains(t, ex.Sql, "IndexScan")
+
+		// a=1 (10 docs) + a=2 (10 docs) excluded => 80 docs remain.
+		cntIdx, err := idx.Find(f).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 80, cntIdx)
+
+		cntNo, err := noidx.Find(f).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, cntIdx, cntNo, "indexed Count must equal unindexed Count")
+
+		// Exact id-set parity between indexed and unindexed collections.
+		idsIdx := collectIntField(t, idx.Find(f), "id")
+		idsNo := collectIntField(t, noidx.Find(f), "id")
+		assert.Len(t, idsIdx, 80)
+		assert.ElementsMatch(t, idsNo, idsIdx)
+	})
+
+	t.Run("mixed equality+nor narrows on indexed field, nor is residual", func(t *testing.T) {
+		f := `{"a":5,"$nor":[{"b":1},{"b":2}]}`
+
+		// The equality on "a" narrows via the index; the $nor is a residual Filter.
+		ex, err := idx.Find(f).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, ex.Sql, "IndexScan(a)")
+		assert.Contains(t, ex.Sql, "-> Filter")
+
+		// a=5 => 10 docs (ids 5,15,...,95). Of those, b=i%7 in {1,2} are removed.
+		// ids with a=5 and (b==1 or b==2): 15(b=1), 65(b=2), 85(b=1) => 3 removed
+		// => 7 remain.
+		cntIdx, err := idx.Find(f).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 7, cntIdx)
+
+		cntNo, err := noidx.Find(f).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, cntIdx, cntNo)
+
+		idsIdx := collectIntField(t, idx.Find(f), "id")
+		idsNo := collectIntField(t, noidx.Find(f), "id")
+		assert.Len(t, idsIdx, 7)
+		assert.ElementsMatch(t, idsNo, idsIdx)
+	})
+}
+
+// act-34: $not operator form over an index is sound and fullscans.
+func TestIndex_ComplexFilter_NotOperatorSound(t *testing.T) {
+	build := func(t *testing.T, indexes ...IndexInfo) Collection {
+		t.Helper()
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		for _, idx := range indexes {
+			require.NoError(t, coll.EnsureIndex(ctx, idx))
+		}
+		for i := 0; i < 100; i++ {
+			doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%10, i%7))
+			require.NoError(t, coll.Insert(ctx, doc))
+		}
+		return coll
+	}
+
+	idx := build(t, IndexInfo{Fields: []string{"a"}})
+	noidx := build(t)
+
+	t.Run("not eq fullscans, 90 docs, agrees with unindexed", func(t *testing.T) {
+		f := `{"a":{"$not":{"$eq":5}}}`
+
+		// Not.IndexBounds returns bounds unchanged => FullScan, never index access.
+		ex, err := idx.Find(f).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, ex.Sql, "FullScan(filtered)")
+		assert.NotContains(t, ex.Sql, "IndexScan")
+		assert.NotContains(t, ex.Sql, "IndexSeek")
+		assert.NotContains(t, ex.Sql, "CoverLookup")
+
+		// a=5 => 10 docs excluded => 90 remain.
+		cntIdx, err := idx.Find(f).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 90, cntIdx)
+
+		cntNo, err := noidx.Find(f).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, cntIdx, cntNo)
+
+		idsIdx := collectIntField(t, idx.Find(f), "id")
+		idsNo := collectIntField(t, noidx.Find(f), "id")
+		assert.Len(t, idsIdx, 90)
+		assert.ElementsMatch(t, idsNo, idsIdx)
+	})
+
+	t.Run("not gte negated range, 80 docs", func(t *testing.T) {
+		f := `{"a":{"$not":{"$gte":8}}}`
+
+		ex, err := idx.Find(f).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, ex.Sql, "FullScan")
+		assert.NotContains(t, ex.Sql, "IndexScan")
+
+		// !(a>=8) => a in 0..7 => 80 docs.
+		cntIdx, err := idx.Find(f).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 80, cntIdx)
+
+		cntNo, err := noidx.Find(f).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, cntIdx, cntNo)
+
+		idsIdx := collectIntField(t, idx.Find(f), "id")
+		idsNo := collectIntField(t, noidx.Find(f), "id")
+		assert.ElementsMatch(t, idsNo, idsIdx)
+	})
+}
+
+// act-35: $exists:false and $exists:true over a non-sparse index both fullscan
+// (the answer is NOT derived from index entries). A buggy index-based answer to
+// $exists:true would yield 100 (non-sparse index len==100), so the FullScan and
+// the exact count of 50 are the load-bearing assertions.
+func TestIndex_ComplexFilter_ExistsFalseAndNonSparse(t *testing.T) {
+	// Local closure: 100 docs; even i has "opt", odd i does not. Index on "opt".
+	build := func(t *testing.T, sparse bool) Collection {
+		t.Helper()
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"opt"}, Sparse: sparse}))
+		for i := 0; i < 100; i++ {
+			var doc *anyenc.Value
+			if i%2 == 0 {
+				doc = anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"opt":%d}`, i, i))
+			} else {
+				doc = anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, i))
+			}
+			require.NoError(t, coll.Insert(ctx, doc))
+		}
+		return coll
+	}
+
+	// Unindexed baseline (no index at all) for parity.
+	baseline := func(t *testing.T) Collection {
+		t.Helper()
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		for i := 0; i < 100; i++ {
+			var doc *anyenc.Value
+			if i%2 == 0 {
+				doc = anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"opt":%d}`, i, i))
+			} else {
+				doc = anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, i))
+			}
+			require.NoError(t, coll.Insert(ctx, doc))
+		}
+		return coll
+	}
+
+	idxLen := func(t *testing.T, c Collection) int {
+		t.Helper()
+		n, err := c.GetIndexes()[0].Len(ctx)
+		require.NoError(t, err)
+		return n
+	}
+
+	nonSparse := build(t, false)
+	base := baseline(t)
+
+	t.Run("non-sparse exists:false fullscans, 50 docs", func(t *testing.T) {
+		f := `{"opt":{"$exists":false}}`
+
+		ex, err := nonSparse.Find(f).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, ex.Sql, "FullScan")
+
+		// Odd ids (no "opt") => 50.
+		cnt, err := nonSparse.Find(f).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 50, cnt)
+
+		cntBase, err := base.Find(f).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, cnt, cntBase)
+
+		assert.ElementsMatch(t,
+			collectIntField(t, base.Find(f), "id"),
+			collectIntField(t, nonSparse.Find(f), "id"))
+	})
+
+	t.Run("non-sparse exists:true fullscans, 50 docs not 100", func(t *testing.T) {
+		f := `{"opt":{"$exists":true}}`
+
+		// Non-sparse index has 100 entries (one "null" per missing-field doc).
+		assert.Equal(t, 100, idxLen(t, nonSparse))
+
+		ex, err := nonSparse.Find(f).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, ex.Sql, "FullScan")
+		// Critical: must NOT answer $exists:true from the index (would be 100).
+		assert.NotContains(t, ex.Sql, "IndexScan")
+
+		cnt, err := nonSparse.Find(f).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 50, cnt, "exists:true must be 50, not the index length 100")
+
+		cntBase, err := base.Find(f).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, cnt, cntBase)
+
+		assert.ElementsMatch(t,
+			collectIntField(t, base.Find(f), "id"),
+			collectIntField(t, nonSparse.Find(f), "id"))
+	})
+
+	t.Run("sparse exists:false fullscans, 50 docs, sparse index len 50", func(t *testing.T) {
+		sparse := build(t, true)
+		f := `{"opt":{"$exists":false}}`
+
+		// Sparse index skips missing fields => 50 entries.
+		assert.Equal(t, 50, idxLen(t, sparse))
+
+		ex, err := sparse.Find(f).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, ex.Sql, "FullScan")
+
+		cnt, err := sparse.Find(f).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 50, cnt)
+
+		cntBase, err := base.Find(f).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, cnt, cntBase)
+
+		assert.ElementsMatch(t,
+			collectIntField(t, base.Find(f), "id"),
+			collectIntField(t, sparse.Find(f), "id"))
+	})
+}
+
+// act-36: Contradictory two-range $and on one indexed field (a>5 AND a<3)
+// returns 0. And.IndexBounds yields only the first conjunct's over-approx seek
+// bounds ('5',inf]; the residual FilterIter rejects every row.
+func TestIndex_ComplexFilter_ContradictoryRangeAnd(t *testing.T) {
+	coll := setupTestCollection(t, 100, IndexInfo{Fields: []string{"a"}})
+
+	// Both the explicit $and form and the inline two-operator form must behave
+	// identically: seek the first conjunct, re-filter to empty.
+	cases := map[string]string{
+		"explicit $and": `{"$and":[{"a":{"$gt":5}},{"a":{"$lt":3}}]}`,
+		"inline range":  `{"a":{"$gt":5,"$lt":3}}`,
+	}
+
+	for name, f := range cases {
+		f := f
+		t.Run(name, func(t *testing.T) {
+			cnt, err := coll.Find(f).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, 0, cnt)
+
+			// Count must equal the iterated length.
+			ids := collectIntField(t, coll.Find(f), "id")
+			assert.Len(t, ids, 0)
+			assert.Equal(t, cnt, len(ids))
+		})
+	}
+
+	t.Run("explain explicit $and uses over-approx index seek + residual Filter", func(t *testing.T) {
+		ex, err := coll.Find(`{"$and":[{"a":{"$gt":5}},{"a":{"$lt":3}}]}`).Explain(ctx)
+		require.NoError(t, err)
+		// First conjunct a>5 produces the over-approx seek bounds; second is residual.
+		assert.Contains(t, ex.Sql, "IndexScan(a)")
+		assert.Contains(t, ex.Sql, "-> Filter")
+		// The covering-count fast path must NOT fire (two predicates on a).
+		assert.NotContains(t, ex.Sql, "CoverLookup")
+	})
+}
+
+// act-37: $or whose two branches are on two SEPARATE indexed fields must
+// fullscan. Or.IndexBounds returns bounds unchanged whenever any branch yields
+// no bounds for a given field, so a cross-field $or produces empty bounds for
+// every index. Guards against a future change that wrongly seeks one index and
+// silently drops the other branch.
+func TestIndex_ComplexFilter_OrTwoIndexedFieldsUnion(t *testing.T) {
+	// Local closure: 100 docs (a=i%10, b=i%7); optionally index BOTH a and b.
+	build := func(t *testing.T, indexed bool) Collection {
+		t.Helper()
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		if indexed {
+			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"b"}}))
+		}
+		for i := 0; i < 100; i++ {
+			doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%10, i%7))
+			require.NoError(t, coll.Insert(ctx, doc))
+		}
+		return coll
+	}
+
+	idx := build(t, true)
+	noidx := build(t, false)
+
+	f := `{"$or":[{"a":1},{"b":2}]}`
+
+	// a=1 => 10 docs (i%10==1). b=2 => 15 docs (i%7==2). Overlap a=1 AND b=2
+	// (i%10==1 AND i%7==2 => i=51) => 2 docs counted in both branches, so the
+	// union is 10+15-2 = 23. Exact value verified empirically.
+	cntIdx, err := idx.Find(f).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 23, cntIdx)
+
+	cntNo, err := noidx.Find(f).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 23, cntNo)
+	assert.Equal(t, cntNo, cntIdx, "indexed must equal unindexed")
+
+	// Exact id-set parity.
+	assert.ElementsMatch(t,
+		collectIntField(t, noidx.Find(f), "id"),
+		collectIntField(t, idx.Find(f), "id"))
+
+	// The plan must FullScan: no index candidate may be Used, and no IndexScan
+	// token may appear (a single-index seek would silently drop the other branch).
+	ex, err := idx.Find(f).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, ex.Sql, "FullScan")
+	assert.NotContains(t, ex.Sql, "IndexScan")
+
+	// Both indexes are reported as present but unused candidates.
+	require.Len(t, ex.Indexes, 2)
+	for _, ie := range ex.Indexes {
+		assert.False(t, ie.Used, "index %q must not be used for a cross-field $or", ie.Name)
+	}
+}

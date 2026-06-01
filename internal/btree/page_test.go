@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -73,6 +74,64 @@ func TestDBHeaderDeserializeCorrupt(t *testing.T) {
 	buf := make([]byte, dbHeaderSize)
 	copy(buf[0:16], "Wrong magic str\x00")
 	assert.ErrorIs(t, h.deserialize(buf), ErrCorrupt)
+}
+
+// TestDeserializeBadPayloadFraction asserts that deserialize rejects a
+// page-1 header whose embedded-payload-fraction bytes 21-23 are not exactly
+// 64/32/32, mirroring C lockBtree (btree.c:3371-3373,
+// memcmp(&page1[21],"\100\040\040",3) -> SQLITE_NOTADB). This guards against a
+// non-any-store / non-SQLite-shaped file whose magic coincidentally matches but
+// whose fraction bytes do not.
+func TestDeserializeBadPayloadFraction(t *testing.T) {
+	// Build a fully valid, round-trippable header via serialize() so only the
+	// fraction bytes are under test.
+	base := dbHeader{PageSize: 4096, WriteVersion: 2, ReadVersion: 2, DatabaseSize: 1}
+	good := make([]byte, dbHeaderSize)
+	base.serialize(good)
+
+	// Sanity: the untouched, serialized header deserializes cleanly (and bytes
+	// 21-23 are the required constants).
+	var ok dbHeader
+	require.NoError(t, ok.deserialize(good))
+	require.Equal(t, []byte{maxEmbeddedPayloadFrac, minEmbeddedPayloadFrac, leafPayloadFrac}, good[21:24])
+
+	// Each fraction byte, individually wrong, must be rejected.
+	for _, off := range []int{21, 22, 23} {
+		buf := make([]byte, dbHeaderSize)
+		copy(buf, good)
+		buf[off] = 0xFF // any non-conforming value
+		var h dbHeader
+		assert.ErrorIsf(t, h.deserialize(buf), ErrCorrupt, "byte %d not validated", off)
+	}
+}
+
+// TestOpenRejectsUsableSizeBelow480 asserts the open path rejects an
+// on-disk header whose ReservedSpace byte (offset 20) drives usableSize below
+// 480, mirroring C lockBtree (btree.c:3422-3424, "the usable size is not
+// allowed to be less than 480"). An xChaCha20-style 48-byte overhead on a
+// claimed 512-byte page (usable 464) is exactly the corruption SQLite floors.
+func TestOpenRejectsUsableSizeBelow480(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	// Create a valid 512-byte-page DB, then close it so we can corrupt page 1.
+	db, err := testOpen(t, path, Options{PageSize: 512})
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	// ReservedSpace (offset 20) is inside the always-plaintext dbHeader prefix.
+	// 512 - 64 = 448 usable, which is < 480 and must be rejected. 64 is also a
+	// large-enough reserved value that stock SQLite forbids at page size 512
+	// (reserved cannot exceed 32 there).
+	corruptByte(t, path, 20, 64)
+
+	resetPageBufferPool()
+	db2, err := Open(path, Options{PageSize: 512})
+	if db2 != nil {
+		_ = db2.Close()
+	}
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
 func TestDBHeaderNotSQLiteCompatible(t *testing.T) {

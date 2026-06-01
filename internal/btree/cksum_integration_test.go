@@ -13,7 +13,7 @@ func TestCksum_OpenCreate_SetsReservedSpace(t *testing.T) {
 	path := filepath.Join(dir, "db")
 	opts := DefaultOptions()
 	opts.Checksum = true
-	db, err := Open(path,opts)
+	db, err := Open(path, opts)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

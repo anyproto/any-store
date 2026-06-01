@@ -1,38 +1,39 @@
 /*
 Ported from SQLite: trans.test, trans2.test, rollback2.test
 Sources:
-  /home/dev/work/sqlitec/test/trans.test
-  /home/dev/work/sqlitec/test/trans2.test
-  /home/dev/work/sqlitec/test/rollback2.test
+
+	/home/dev/work/sqlitec/test/trans.test
+	/home/dev/work/sqlitec/test/trans2.test
+	/home/dev/work/sqlitec/test/rollback2.test
 
 Test scenario:
 Tests transaction commit, rollback, and MVCC read isolation. Covers:
-- Snapshot isolation: a reader started before a write sees the old state
-  even after the write commits (trans-3)
-- Rollback restores exact prior state after mass delete/insert (trans-7)
-- Repeated rollback stress with growing dataset (trans-9)
-- Rollback-then-commit cycle: rollback restores, re-commit persists (trans2)
-- MVCC: concurrent reader unaffected by writer rollback (rollback2)
+  - Snapshot isolation: a reader started before a write sees the old state
+    even after the write commits (trans-3)
+  - Rollback restores exact prior state after mass delete/insert (trans-7)
+  - Repeated rollback stress with growing dataset (trans-9)
+  - Rollback-then-commit cycle: rollback restores, re-commit persists (trans2)
+  - MVCC: concurrent reader unaffected by writer rollback (rollback2)
 
 Deviations from original:
-- trans-3: Uses a single DB handle instead of two separate sqlite3 connections.
-  Namespaces replace tables. Our single-DB API shares dirty pages between
-  concurrent read/write txs, so we test WAL-level MVCC (read tx sees old
-  snapshot after writer commits) rather than cross-connection isolation
-  (read tx during active writer).
-- trans-7: Uses full key-value snapshot comparison instead of md5sum().
-  Skipped steps involving DDL (CREATE TABLE, DROP TABLE) rollback.
-- trans-9: Uses deterministic patterns (every Nth key) instead of random()%10.
-  Uses Go math/rand for value generation instead of randstr().
-- trans2: Removed UNIQUE constraint and statement journal tests. Kept the
-  core rollback/commit state verification pattern.
-- rollback2: Tests WAL-level MVCC (read tx started before write keeps old
-  snapshot) and rollback preservation. Cannot test cross-connection isolation
-  since our single-DB shares dirty pages (wal-3.2 pattern).
-- trans-1,2,4,5,6,8: Skipped — SQL syntax, DDL rollback, multi-process crash.
-- trans3 (all): Skipped — SQL statement abort semantics.
-- rollback (all): Skipped — ON CONFLICT ROLLBACK, journal recovery.
-- rollback2-2.2,3,4: Skipped — covered by savepoint tests + 2.1 adaptation.
+  - trans-3: Uses a single DB handle instead of two separate sqlite3 connections.
+    Namespaces replace tables. Our single-DB API shares dirty pages between
+    concurrent read/write txs, so we test WAL-level MVCC (read tx sees old
+    snapshot after writer commits) rather than cross-connection isolation
+    (read tx during active writer).
+  - trans-7: Uses full key-value snapshot comparison instead of md5sum().
+    Skipped steps involving DDL (CREATE TABLE, DROP TABLE) rollback.
+  - trans-9: Uses deterministic patterns (every Nth key) instead of random()%10.
+    Uses Go math/rand for value generation instead of randstr().
+  - trans2: Removed UNIQUE constraint and statement journal tests. Kept the
+    core rollback/commit state verification pattern.
+  - rollback2: Tests WAL-level MVCC (read tx started before write keeps old
+    snapshot) and rollback preservation. Cannot test cross-connection isolation
+    since our single-DB shares dirty pages (wal-3.2 pattern).
+  - trans-1,2,4,5,6,8: Skipped — SQL syntax, DDL rollback, multi-process crash.
+  - trans3 (all): Skipped — SQL statement abort semantics.
+  - rollback (all): Skipped — ON CONFLICT ROLLBACK, journal recovery.
+  - rollback2-2.2,3,4: Skipped — covered by savepoint tests + 2.1 adaptation.
 */
 package btree
 

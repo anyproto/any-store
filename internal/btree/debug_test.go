@@ -36,7 +36,7 @@ func TestDebugMVCC(t *testing.T) {
 	// Read current WAL state
 	t.Logf("WAL nFrame after setup: %d", db.pager.wal.nFrame.Load())
 	t.Logf("WAL index maxFrame: %d", db.pager.wal.index.maxFrame.Load())
-	
+
 	// Dump all page->frame mappings
 	db.pager.wal.index.mu.RLock()
 	for pgno, frame := range db.pager.wal.index.pageMap {
@@ -73,7 +73,7 @@ func TestDebugMVCC(t *testing.T) {
 	t.Logf("After writer commit:")
 	t.Logf("  WAL nFrame: %d", db.pager.wal.nFrame.Load())
 	t.Logf("  WAL index maxFrame: %d", db.pager.wal.index.maxFrame.Load())
-	
+
 	// Dump updated page->frame mappings
 	db.pager.wal.index.mu.RLock()
 	for pgno, frame := range db.pager.wal.index.pageMap {
@@ -85,20 +85,20 @@ func TestDebugMVCC(t *testing.T) {
 	ns, err = db.getNamespaceLocked("t1")
 	require.NoError(t, err)
 	t.Logf("Namespace t1 rootPage (re-fetched): %d", ns.rootPage)
-	
+
 	// Test reading pages manually
 	rootPg, err := db.pager.getPageWriter(ns.rootPage, rtx2.walMaxFrame)
 	if err != nil {
 		t.Logf("Error reading root page at walMaxFrame %d: %v", rtx2.walMaxFrame, err)
 	} else {
-		t.Logf("Root page %d: type=%d cellCount=%d uncached=%v dirty=%v", 
+		t.Logf("Root page %d: type=%d cellCount=%d uncached=%v dirty=%v",
 			rootPg.pgno, rootPg.header.pageType, rootPg.header.cellCount,
 			rootPg.uncached, rootPg.dirty)
 		if rootPg.header.isInterior() {
 			t.Logf("  rightChild=%d", rootPg.header.rightChild)
 			for i := 0; i < int(rootPg.header.cellCount); i++ {
 				off := rootPg.getCellOffset(i)
-				childPgno := binary.BigEndian.Uint32(rootPg.data[off:off+4])
+				childPgno := binary.BigEndian.Uint32(rootPg.data[off : off+4])
 				t.Logf("  cell[%d] leftChild=%d", i, childPgno)
 			}
 		}

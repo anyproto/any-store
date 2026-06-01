@@ -282,6 +282,7 @@ func TestOverflowNamespaceDelete(t *testing.T) {
 // each cell size from contentOff, which goes negative, resulting in:
 //
 //	panic: runtime error: slice bounds out of range [-N:]
+//
 // TestOverflowConcurrentReaderCorruption reproduces a snapshot isolation bug
 // in ReadTx.AppendValue. When a reader holds a snapshot and a concurrent writer
 // deletes overflow documents and reuses those pages, the reader's overflow chain
@@ -858,11 +859,11 @@ func TestLeafKeyOverflow_IntegrityCheck(t *testing.T) {
 
 	// Mix overflow keys, overflow values, both overflow, and normal entries
 	entries := []struct{ key, val []byte }{
-		{bytes.Repeat([]byte("K"), 1500), []byte("small-val")},                      // key overflow only
-		{[]byte("small-key"), bytes.Repeat([]byte("V"), 5000)},                       // val overflow only
-		{bytes.Repeat([]byte("B"), 1500), bytes.Repeat([]byte("W"), 5000)},           // both overflow
-		{[]byte("normal"), []byte("normal-val")},                                     // no overflow
-		{bytes.Repeat([]byte("X"), 2000), bytes.Repeat([]byte("Y"), 2000)},           // large both
+		{bytes.Repeat([]byte("K"), 1500), []byte("small-val")},             // key overflow only
+		{[]byte("small-key"), bytes.Repeat([]byte("V"), 5000)},             // val overflow only
+		{bytes.Repeat([]byte("B"), 1500), bytes.Repeat([]byte("W"), 5000)}, // both overflow
+		{[]byte("normal"), []byte("normal-val")},                           // no overflow
+		{bytes.Repeat([]byte("X"), 2000), bytes.Repeat([]byte("Y"), 2000)}, // large both
 	}
 	for _, e := range entries {
 		require.NoError(t, tx.Put(ns2, e.key, e.val))

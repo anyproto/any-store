@@ -416,7 +416,9 @@ func TestLocalPayloadSize_UnderMaxLocal(t *testing.T) {
 }
 
 func TestContentAreaOffset_CellContentOffZero(t *testing.T) {
-	// When cellContentOff == 0 and usableSize != 65536, top = usableSize
+	// When cellContentOff == 0 and usableSize != 65536, the page is corrupt:
+	// valid non-65536 pages store usableSize (never 0) in the cell content
+	// offset, matching SQLite allocateSpace() (btree.c:1855-1863).
 	pg := &page{
 		pgno: 2,
 		data: make([]byte, 4096),
@@ -426,9 +428,8 @@ func TestContentAreaOffset_CellContentOffZero(t *testing.T) {
 			cellCount:      0,
 		},
 	}
-	off, err := pg.contentAreaOffset(4096)
-	require.NoError(t, err)
-	assert.Equal(t, 4096, off)
+	_, err := pg.contentAreaOffset(4096)
+	assert.ErrorIs(t, err, ErrCorrupt)
 }
 
 func TestContentAreaOffset_CellContentOffZero65536(t *testing.T) {
@@ -2295,10 +2296,11 @@ func TestIntegrityCheck_InteriorCellExtendsOffPage(t *testing.T) {
 }
 
 func TestIntegrityCheck_InteriorCorruptKey(t *testing.T) {
-	// Cover integrity.go line 358: corrupt interior key (interiorFullKey returns error).
+	// Cover integrity.go "corrupt cell data" path (parseInteriorCell returns error).
 	// Strategy: craft an interior cell with keyLen > maxPayloadAlloc (1<<30).
-	// parseInteriorCell doesn't check maxPayloadAlloc, so it succeeds.
-	// But interiorFullKey checks maxPayloadAlloc and returns ErrCorrupt.
+	// parseInteriorCell validates keyLen against maxPayloadAlloc and returns
+	// ErrCorrupt, so the integrity check reports "corrupt cell data" before it ever
+	// reaches interiorFullKey's "corrupt interior key" path.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 	opts := DefaultOptions()
@@ -2387,7 +2389,7 @@ func TestIntegrityCheck_InteriorCorruptKey(t *testing.T) {
 
 	err = db2.IntegrityCheckN(0)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "corrupt interior key")
+	assert.Contains(t, err.Error(), "corrupt cell data")
 }
 
 func TestIntegrityCheck_ChildDepthDiffers_RightChild(t *testing.T) {
@@ -2646,9 +2648,23 @@ func TestIntegrityCheck_DatabaseSizeZero_Header(t *testing.T) {
 	db.pager.dbSize.Store(0)
 	db.pager.releasePage(pg1)
 	require.NoError(t, tx2.Commit())
+	require.NoError(t, db.Close())
 
-	// IntegrityCheckN should hit nPages==0 and return nil
-	err = db.IntegrityCheckN(0)
+	// Reopen so the pager rebuilds p.dbSize the way C does — from the actual
+	// file size, not the corrupt header field. With the header's
+	// DatabaseSize==0 (untrusted, see pager.open), p.dbSize becomes the file's
+	// real page count (>=1), so page 1 is in-bounds and readable. Operating on
+	// the prior handle would have left p.dbSize at the artificial 0 stored
+	// above — a state a genuine open never produces — which, after the drift-5
+	// fix (getPageReader zero-fills any pgno > snapshot bound, matching C
+	// getPageNormal pager.c:5590), would zero-fill even page 1.
+	db2, err := testOpen(t, path, DefaultOptions())
+	require.NoError(t, err)
+	defer db2.Close()
+
+	// IntegrityCheckN should read the (now in-bounds) page 1, see the header's
+	// DatabaseSize==0, hit the nPages==0 short-circuit and return nil.
+	err = db2.IntegrityCheckN(0)
 	// It should return nil (no error for empty database)
 	assert.NoError(t, err)
 }

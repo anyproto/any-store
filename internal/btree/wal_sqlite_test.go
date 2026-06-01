@@ -11,18 +11,18 @@ WAL file persistence across close/reopen cycles, and database creation with
 different page sizes.
 
 Deviations from original:
-- wal-0.1, wal-0.2: Skipped — test PRAGMA result strings and initial file size (SQLite format details)
-- wal-1.0: Only check WAL file exists (no journal file check, no exact db size)
-- wal-1.1: Only check WAL file exists (no journal file in our system)
-- wal-1.2: Check WAL file size > 0 rather than exact value (our WAL format may differ)
-- wal-1.3: Skipped — queries sqlite_master (no equivalent)
-- wal-4.4.1, wal-4.5.1: Always WAL mode on reopen (original reopens without WAL pragma)
-- wal-4.4.2, wal-4.5.2: INSERT...SELECT doubling done manually with cursor read + new unique keys
-- wal-4.4.4, wal-4.5.4: WAL size check uses <= instead of == (WAL reuse behavior may differ)
-- wal-4.4.6, wal-4.5.6: File copy includes WAL index file if present
-- wal-5.*: Skipped — temp tables not supported
-- wal-6.*: Sector size dimension skipped (devsym VFS out of scope); only page sizes tested.
-  Exact db file size check uses multiple-of-page-size rather than exact pgsz*2.
+  - wal-0.1, wal-0.2: Skipped — test PRAGMA result strings and initial file size (SQLite format details)
+  - wal-1.0: Only check WAL file exists (no journal file check, no exact db size)
+  - wal-1.1: Only check WAL file exists (no journal file in our system)
+  - wal-1.2: Check WAL file size > 0 rather than exact value (our WAL format may differ)
+  - wal-1.3: Skipped — queries sqlite_master (no equivalent)
+  - wal-4.4.1, wal-4.5.1: Always WAL mode on reopen (original reopens without WAL pragma)
+  - wal-4.4.2, wal-4.5.2: INSERT...SELECT doubling done manually with cursor read + new unique keys
+  - wal-4.4.4, wal-4.5.4: WAL size check uses <= instead of == (WAL reuse behavior may differ)
+  - wal-4.4.6, wal-4.5.6: File copy includes WAL index file if present
+  - wal-5.*: Skipped — temp tables not supported
+  - wal-6.*: Sector size dimension skipped (devsym VFS out of scope); only page sizes tested.
+    Exact db file size check uses multiple-of-page-size rather than exact pgsz*2.
 */
 package btree
 

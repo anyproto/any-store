@@ -20,6 +20,17 @@ func mustParseItem(t testing.TB, s string) item {
 }
 
 func assertIdxKeyBuf(t *testing.T, idx *index, keyCase fillKeysCase) {
+	// A single-field reverse index stores keys bitwise-inverted, which
+	// Tuple.String cannot decode. Each `expected` entry is valid JSON, so
+	// compare the raw key bytes against the inverted marshal of that value.
+	if len(idx.reverse) == 1 && idx.reverse[0] {
+		require.Equal(t, len(keyCase.expected), len(idx.keysBuf), keyCase.doc)
+		for i, ej := range keyCase.expected {
+			want := anyenc.Tuple{}.AppendInverted(anyenc.MustParseJson(ej))
+			assert.Equal(t, []byte(want), []byte(idx.keysBuf[i]), "%s key %d (inverted %s)", keyCase.doc, i, ej)
+		}
+		return
+	}
 	var keysStrings = make([]string, len(idx.keysBuf))
 	for i, k := range idx.keysBuf {
 		keysStrings[i] = k.String()
@@ -71,6 +82,11 @@ var fillKeysCases = []fillKeysCaseIndex{
 		},
 	},
 	{
+		// Reverse single-field index: keys are stored bitwise-inverted. Each
+		// `expected` entry is valid JSON; assertIdxKeyBuf detects the reverse
+		// field (idx.reverse[0]) and compares the raw key bytes against the
+		// inverted marshal of MustParseJson(expected[i]) — Tuple.String cannot
+		// decode inverted bytes. The per-doc shape matches the forward case.
 		name: "reverse",
 		info: IndexInfo{Fields: []string{"-a"}},
 		cases: []fillKeysCase{
@@ -122,6 +138,46 @@ func TestIndex_fillKeysBuf(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestIndex_fillKeysBuf_CompoundMixedDirection verifies that for an (a,-b) index
+// only the reverse-flagged field (b) is bitwise-inverted in the stored key,
+// while the forward field (a) and the per-element array expansion keep their
+// normal encoding. This is the element-wise half of the invert-on-write design.
+func TestIndex_fillKeysBuf_CompoundMixedDirection(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	idx := &index{info: IndexInfo{Name: "a,-b", Fields: []string{"a", "-b"}}, c: coll.(*collection)}
+	require.NoError(t, idx.init())
+
+	fwd := func(j string) anyenc.Tuple { return anyenc.Tuple{}.Append(anyenc.MustParseJson(j)) }
+	inv := func(j string) anyenc.Tuple { return anyenc.Tuple{}.AppendInverted(anyenc.MustParseJson(j)) }
+	key := func(aj, bj string) []byte { return append(append([]byte{}, fwd(aj)...), inv(bj)...) }
+
+	t.Run("scalar", func(t *testing.T) {
+		idx.fillKeysBuf(mustParseItem(t, `{"id":1,"a":1,"b":2}`))
+		require.Len(t, idx.keysBuf, 1)
+		assert.Equal(t, key("1", "2"), []byte(idx.keysBuf[0]))
+	})
+
+	t.Run("array_on_a_only_b_inverted", func(t *testing.T) {
+		// a=[1,2], b=2 → keys (1,^2),(2,^2),([1,2],^2); a stays forward, b inverted.
+		idx.fillKeysBuf(mustParseItem(t, `{"id":1,"a":[1,2],"b":2}`))
+		require.Len(t, idx.keysBuf, 3)
+		assert.Equal(t, key("1", "2"), []byte(idx.keysBuf[0]))
+		assert.Equal(t, key("2", "2"), []byte(idx.keysBuf[1]))
+		assert.Equal(t, key("[1,2]", "2"), []byte(idx.keysBuf[2]))
+	})
+
+	t.Run("missing_reverse_field_is_inverted_null", func(t *testing.T) {
+		// b missing → stored as inverted null (0xFE), a forward.
+		idx.fillKeysBuf(mustParseItem(t, `{"id":1,"a":1}`))
+		require.Len(t, idx.keysBuf, 1)
+		assert.Equal(t, key("1", "null"), []byte(idx.keysBuf[0]))
+		// Sanity: the b segment is exactly the inverted null tag.
+		assert.Equal(t, []byte{^byte(anyenc.TypeNull)}, []byte(idx.keysBuf[0][len(fwd("1")):]))
+	})
 }
 
 func TestIndex_Insert(t *testing.T) {

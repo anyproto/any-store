@@ -174,6 +174,7 @@ func maxEndKey(a, b Bound) ([]byte, bool) {
 	}
 	return b.End, b.EndInclude
 }
+
 func (bs Bounds) Len() int {
 	return len(bs)
 }

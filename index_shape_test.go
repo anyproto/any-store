@@ -118,17 +118,26 @@ func TestIndex_Single_ReverseField(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 3, count)
 
-	// Sort descending should use index scan (no in-memory sort)
-	// KNOWN ISSUE: planner's reverse scan direction is inverted.
-	// Sort("-a") with index "-a" currently produces ascending order.
-	// We verify the index is used and all values are present.
+	// Sort("-a") matches the index's declared direction (the field is stored
+	// inverted), so it is served by a FORWARD index scan with no in-memory sort
+	// and yields strictly descending order.
 	vals := collectField(t, coll.Find(nil).Sort("-a"), "a")
-	require.Len(t, vals, 8)
+	require.Equal(t, []string{"8", "7", "6", "5", "4", "3", "2", "1"}, vals)
 
 	explain, err := coll.Find(nil).Sort("-a").Explain(ctx)
 	require.NoError(t, err)
 	assert.Contains(t, explain.Sql, "IndexScan(-a)")
+	assert.NotContains(t, explain.Sql, "(reverse)")
 	assert.NotContains(t, explain.Sql, "Sort(")
+
+	// Sort("a") is the opposite of the declared direction → reverse scan, no sort.
+	valsAsc := collectField(t, coll.Find(nil).Sort("a"), "a")
+	require.Equal(t, []string{"1", "2", "3", "4", "5", "6", "7", "8"}, valsAsc)
+	explainAsc, err := coll.Find(nil).Sort("a").Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explainAsc.Sql, "IndexScan(-a)")
+	assert.Contains(t, explainAsc.Sql, "(reverse)")
+	assert.NotContains(t, explainAsc.Sql, "Sort(")
 
 	// Verify equality filter still works correctly
 	count, err = coll.Find(`{"a": 5}`).Count(ctx)
@@ -159,15 +168,19 @@ func TestIndex_Single_ReverseFieldWithRange(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 3, count)
 
-	// KNOWN ISSUE: Sort direction is inverted with reverse index.
-	// We verify correct value sets are returned (counts match) and
-	// that the index is used for the scan.
+	// Range on a reverse index, Sort("-a"): a forward scan over the inverted
+	// storage yields strictly descending order, served entirely by the index
+	// (no in-memory sort). The reverse-field bounds segment renders as an
+	// "unknown type" placeholder in Explain (the decode path intentionally does
+	// not un-invert), so we assert only the plan shape, not the bounds string.
 	vals := collectField(t, coll.Find(`{"a":{"$gte":3,"$lte":7}}`).Sort("-a"), "a")
-	require.Len(t, vals, 5)
+	require.Equal(t, []string{"7", "6", "5", "4", "3"}, vals)
 
 	explain, err := coll.Find(`{"a":{"$gte":3,"$lte":7}}`).Sort("-a").Explain(ctx)
 	require.NoError(t, err)
-	assert.Contains(t, explain.Sql, "IndexScan")
+	assert.Contains(t, explain.Sql, "IndexScan(-a)")
+	assert.NotContains(t, explain.Sql, "(reverse)")
+	assert.NotContains(t, explain.Sql, "-> Sort")
 }
 
 // --- from compound_index_test.go ---
@@ -303,69 +316,92 @@ func TestIndex_Compound_MixedDirectionsSort(t *testing.T) {
 		require.NoError(t, coll.Insert(ctx, doc))
 	}
 
-	t.Run("sort matching index direction a asc b desc", func(t *testing.T) {
-		// KNOWN BUG: The compound index with mixed directions (a, -b) does not
-		// correctly produce b-descending order within each a group when using
-		// IndexScan. The index scan returns b in ascending order instead.
-		// Without the index, Sort("a", "-b") works correctly via in-memory sort.
-		// This test verifies that at least count and a-ordering are correct.
-		iter, err := coll.Find(nil).Sort("a", "-b").Iter(ctx)
+	// Unindexed twin with identical data: its in-memory sort is the correct
+	// reference order. (a,-b) is stored with the reverse field inverted, so a
+	// single forward scan realizes (a asc, b desc) and a reverse scan (a desc,
+	// b asc); the indexed RESULT ORDER — incl. b within each a group — must match
+	// the unindexed twin exactly while being served by a FAST index scan.
+	fx2 := newFixture(t)
+	twin, err := fx2.CreateCollection(ctx, "twin")
+	require.NoError(t, err)
+	for i := range 40 {
+		require.NoError(t, twin.Insert(ctx, anyenc.MustParseJson(
+			fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%4, i%5))))
+	}
+
+	abPairs := func(c Collection, sort ...any) []string {
+		iter, err := c.Find(nil).Sort(sort...).Iter(ctx)
 		require.NoError(t, err)
 		defer iter.Close()
-
-		var prevA int
-		prevA = -1
-		first := true
-		count := 0
+		var out []string
 		for iter.Next() {
-			doc, err := iter.Doc()
-			require.NoError(t, err)
-			a := doc.Value().GetInt("a")
-			if !first && a != prevA {
-				assert.True(t, a > prevA, "a should be non-decreasing: got %d after %d", a, prevA)
-			}
-			prevA = a
-			first = false
-			count++
+			d, derr := iter.Doc()
+			require.NoError(t, derr)
+			out = append(out, fmt.Sprintf("%d,%d", d.Value().GetInt("a"), d.Value().GetInt("b")))
 		}
 		require.NoError(t, iter.Err())
-		assert.Equal(t, 40, count)
+		return out
+	}
 
-		explain, err := coll.Find(nil).Sort("a", "-b").Explain(ctx)
+	t.Run("sort matching index direction a asc b desc", func(t *testing.T) {
+		got := abPairs(coll, "a", "-b")
+		assert.Equal(t, abPairs(twin, "a", "-b"), got, "indexed (a,-b) order must match the correct in-memory order")
+		require.Len(t, got, 40)
+		// Served by a FORWARD index scan: no in-memory Sort.
+		ex, err := coll.Find(nil).Sort("a", "-b").Explain(ctx)
 		require.NoError(t, err)
-		assert.Contains(t, explain.Sql, "IndexScan")
+		assert.Contains(t, ex.Sql, "IndexScan(a,-b)")
+		assert.NotContains(t, ex.Sql, "(reverse)")
+		assert.NotContains(t, ex.Sql, "-> Sort")
+		// Within each a group, b must be non-increasing (descending).
+		prevA, prevB, first := -1, -1, true
+		for _, p := range got {
+			var a, b int
+			_, _ = fmt.Sscanf(p, "%d,%d", &a, &b)
+			if !first {
+				if a == prevA {
+					assert.True(t, b <= prevB, "b must be descending within a=%d: got %d after %d", a, b, prevB)
+				} else {
+					assert.True(t, a > prevA, "a must be ascending: got %d after %d", a, prevA)
+				}
+			}
+			prevA, prevB, first = a, b, false
+		}
 	})
 
 	t.Run("sort exact reverse of index", func(t *testing.T) {
-		// Index is (a ASC, -b DESC), reverse scan gives (-a, b)
-		iter, err := coll.Find(nil).Sort("-a", "b").Iter(ctx)
+		// Sort("-a","b"): a descending, b ascending within each a group.
+		got := abPairs(coll, "-a", "b")
+		assert.Equal(t, abPairs(twin, "-a", "b"), got)
+		require.Len(t, got, 40)
+		// The exact opposite of the declared directions → REVERSE scan, no Sort.
+		ex, err := coll.Find(nil).Sort("-a", "b").Explain(ctx)
 		require.NoError(t, err)
-		defer iter.Close()
-
-		var prevA int
-		prevA = 999
-		first := true
-		count := 0
-		for iter.Next() {
-			doc, err := iter.Doc()
-			require.NoError(t, err)
-			a := doc.Value().GetInt("a")
-			if !first && a != prevA {
-				assert.True(t, a < prevA, "a should be non-increasing: got %d after %d", a, prevA)
+		assert.Contains(t, ex.Sql, "IndexScan(a,-b)")
+		assert.Contains(t, ex.Sql, "(reverse)")
+		assert.NotContains(t, ex.Sql, "-> Sort")
+		prevA, prevB, first := 1<<30, -1, true
+		for _, p := range got {
+			var a, b int
+			_, _ = fmt.Sscanf(p, "%d,%d", &a, &b)
+			if !first {
+				if a == prevA {
+					assert.True(t, b >= prevB, "b must be ascending within a=%d: got %d after %d", a, b, prevB)
+				} else {
+					assert.True(t, a < prevA, "a must be descending: got %d after %d", a, prevA)
+				}
 			}
-			prevA = a
-			first = false
-			count++
+			prevA, prevB, first = a, b, false
 		}
-		require.NoError(t, iter.Err())
-		assert.Equal(t, 40, count)
 	})
 
 	t.Run("sort direction mismatch produces correct results", func(t *testing.T) {
-		// (a ASC, b ASC) doesn't match index (a ASC, -b DESC)
-		// Results should still be correct regardless of plan strategy
-		vals := collectField(t, coll.Find(nil).Sort("a", "b"), "a")
-		assert.Equal(t, 40, len(vals))
+		// (a ASC, b ASC) is mixed relative to declared (a ASC, -b DESC) and is
+		// not realizable by a single scan direction → genuine in-memory sort.
+		assert.Equal(t, abPairs(twin, "a", "b"), abPairs(coll, "a", "b"))
+		ex, err := coll.Find(nil).Sort("a", "b").Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, ex.Sql, "-> Sort", "Sort(a,b) on (a,-b) must fall back to in-memory sort")
 	})
 }
 
@@ -1583,4 +1619,93 @@ func TestAudit08_CompoundArrayArray_TwoDocsOverlap(t *testing.T) {
 	sort.Strings(ids)
 	assert.Equal(t, []string{"d1", "d2"}, ids,
 		"each doc must appear in Iter exactly once despite multiple matching index entries")
+}
+
+// ── Compound-index audit (act-43/44) ──
+/*
+Audit tests for the "compound-index" domain (docs/qplanner/audit/actionable_by_domain.json).
+Rewritten for the btree/v2 cost-based planner (the agent draft targeted SQLite EXPLAIN).
+
+  act-43  Whole-tuple reverse of an all-ascending compound index IS realizable by a
+          single reverse scan (no in-memory Sort) — distinct from the mixed-direction
+          bug which now falls back to an in-memory sort.
+  act-44  Equality on the first field + range on the second, with sort on the second:
+          index-covered ascending or reverse, no in-memory sort.
+*/
+
+
+// act-43
+func TestIndex_Compound_SortReversedIndex_WholeTuple(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}}))
+	id := 0
+	for a := 0; a < 3; a++ {
+		for b := 0; b < 3; b++ {
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+				fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, id, a, b))))
+			id++
+		}
+	}
+	pairs := func(sort ...any) []string {
+		iter, err := coll.Find(nil).Sort(sort...).Iter(ctx)
+		require.NoError(t, err)
+		defer iter.Close()
+		var out []string
+		for iter.Next() {
+			d, derr := iter.Doc()
+			require.NoError(t, derr)
+			out = append(out, fmt.Sprintf("%d,%d", d.Value().GetInt("a"), d.Value().GetInt("b")))
+		}
+		require.NoError(t, iter.Err())
+		return out
+	}
+	assert.Equal(t, []string{"2,2", "2,1", "2,0", "1,2", "1,1", "1,0", "0,2", "0,1", "0,0"},
+		pairs("-a", "-b"))
+
+	explain, err := coll.Find(nil).Sort("-a", "-b").Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explain.Sql, "IndexScan(a,b)")
+	assert.Contains(t, explain.Sql, "(reverse)")
+	assert.NotContains(t, explain.Sql, "-> Sort")
+	assert.NotContains(t, explain.Sql, "TopK")
+}
+
+// act-44
+func TestIndex_Compound_FilterAndRangeOnSecond(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}}))
+	for a := 1; a <= 3; a++ {
+		for b := 1; b <= 10; b++ {
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+				fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, a*100+b, a, b))))
+		}
+	}
+
+	// equality a + range b ($gte:5), sort b ascending → index-covered, no in-memory sort.
+	assert.Equal(t, []string{"5", "6", "7", "8", "9", "10"},
+		collectField(t, coll.Find(`{"a":2,"b":{"$gte":5}}`).Sort("b"), "b"))
+	ex1, err := coll.Find(`{"a":2,"b":{"$gte":5}}`).Sort("b").Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, ex1.Sql, "IndexScan(a,b)")
+	assert.NotContains(t, ex1.Sql, "-> Sort")
+	c1, err := coll.Find(`{"a":2,"b":{"$gte":5}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 6, c1)
+
+	// sort b descending → reverse scan, still no in-memory sort.
+	assert.Equal(t, []string{"10", "9", "8", "7", "6", "5"},
+		collectField(t, coll.Find(`{"a":2,"b":{"$gte":5}}`).Sort("-b"), "b"))
+	ex2, err := coll.Find(`{"a":2,"b":{"$gte":5}}`).Sort("-b").Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, ex2.Sql, "IndexScan(a,b)")
+	assert.Contains(t, ex2.Sql, "(reverse)")
+	assert.NotContains(t, ex2.Sql, "-> Sort")
+
+	// upper-bound range.
+	assert.Equal(t, []string{"1", "2", "3", "4"},
+		collectField(t, coll.Find(`{"a":2,"b":{"$lt":5}}`).Sort("b"), "b"))
 }

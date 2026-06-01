@@ -126,7 +126,7 @@ func TestFinal_CollectLeafCellsContentAreaError(t *testing.T) {
 	// Set cellContentOff to 0 (invalid - less than header size)
 	pg.header.cellContentOff = 0
 	// Don't serialize to page data since collectLeafCells reads pg.header directly
-	cells, _ := bt.collectLeafCells(pg)
+	cells, _, _ := bt.collectLeafCells(pg)
 	p.releasePage(pg)
 	// Should not panic; contentOff fallback to usableSize
 	_ = cells
@@ -151,7 +151,7 @@ func TestFinal_CollectLeafCellsNegativeContentSize(t *testing.T) {
 	pg, err := p.getWritablePage(bt.rootPage)
 	require.NoError(t, err)
 	pg.header.cellContentOff = uint16(p.usableSize() + 10) // beyond usable → offset error → fallback
-	cells, _ := bt.collectLeafCells(pg)
+	cells, _, _ := bt.collectLeafCells(pg)
 	p.releasePage(pg)
 	_ = cells
 }
@@ -1576,32 +1576,25 @@ func TestTargeted_CollectInteriorCells_OverflowReadPanic(t *testing.T) {
 		t.Skip("no interior overflow cells found to corrupt")
 	}
 
-	// Enable debug overflow read errors
-	SetDebugOverflowReadErrors(true)
-	defer SetDebugOverflowReadErrors(false)
-
-	// Trigger collectInteriorCells. This happens during interior page split.
-	// Insert more large keys to force a split that calls collectInteriorCells on root.
-	recovered := false
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				recovered = true
-				t.Logf("recovered panic: %v", r)
-			}
-		}()
-		for i := 40; i < 200; i++ {
-			key := make([]byte, 150)
-			binary.BigEndian.PutUint32(key, uint32(i))
-			if err := bt.Put(key, make([]byte, 5)); err != nil {
-				t.Logf("Put error: %v", err)
-				break
-			}
+	// collectInteriorCells now PROPAGATES the overflow read error (it no longer
+	// panics or silently swallows it). Trigger collectInteriorCells via further
+	// inserts that force a split/rebalance touching the corrupted interior page;
+	// the corrupt overflow chain must surface as a Put error rather than silent
+	// data loss. Mirrors C balance() propagating SQLITE_CORRUPT/IO up the do-loop
+	// (btree.c:9131-9242).
+	var gotErr error
+	for i := 40; i < 200; i++ {
+		key := make([]byte, 150)
+		binary.BigEndian.PutUint32(key, uint32(i))
+		if err := bt.Put(key, make([]byte, 5)); err != nil {
+			gotErr = err
+			break
 		}
-	}()
-
-	if !recovered {
-		t.Log("collectInteriorCells overflow read panic not triggered")
+	}
+	if gotErr == nil {
+		t.Log("collectInteriorCells overflow read error not triggered (corrupted cell not re-collected)")
+	} else {
+		t.Logf("collectInteriorCells overflow read error propagated as expected: %v", gotErr)
 	}
 }
 

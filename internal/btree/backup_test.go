@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"os/exec"
@@ -81,7 +82,7 @@ func TestBackup_OnePage_CopiesPageDataAndClearsMemPageFlag(t *testing.T) {
 	require.NoError(t, err)
 
 	// ~ backup.c:226–279 — copy one page.
-	require.NoError(t, b.onePage(1, srcPg1.data, false))
+	require.NoError(t, b.onePage(1, srcPg1.data, false, src.pager.readerDbSizeBound(rtx.cache)))
 
 	// Verify dst page 1 equals src page 1 byte-for-byte (modulo the
 	// DatabaseSize patch at offset 28–31 that onePage applies).
@@ -227,6 +228,161 @@ func TestBackup_OnlineWriteBetweenSteps(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, string(updated), string(got),
 		"update hook (backup.c:661-688) must re-copy pages modified after they were copied")
+}
+
+// TestBackup_PostDoneWriteDoesNotReachDst verifies that once a backup has
+// reached completion (Step returned ErrBackupDone), a later committed write to
+// the source that touches an already-copied page does NOT get re-copied into
+// the (finalized) destination. In SQLite, isFatalError(SQLITE_DONE)==TRUE
+// (backup.c:217-219), so backupUpdate's `!isFatalError(p->rc)` guard
+// (backup.c:675) skips a DONE backup entirely. The destination must reflect the
+// source snapshot at completion, not the later write.
+func TestBackup_PostDoneWriteDoesNotReachDst(t *testing.T) {
+	src, dst := backupPair(t)
+	ns, _ := src.GetNamespace("data")
+
+	// Seed: multi-page source with fat values.
+	stx, err := src.BeginWrite()
+	require.NoError(t, err)
+	fat := make([]byte, 300)
+	for i := 0; i < 200; i++ {
+		require.NoError(t, stx.Put(ns, fmt.Appendf(nil, "k-%04d", i), fat))
+	}
+	require.NoError(t, stx.Commit())
+	require.NoError(t, src.Checkpoint(CheckpointFull))
+
+	nSrc := src.DatabaseSize()
+	require.Greater(t, nSrc, uint32(4), "need a multi-page source")
+
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+
+	// First do a PARTIAL Step that leaves at least one page to copy. This is the
+	// path (backup.c:553) that attaches the backup to the source pager so it
+	// receives update() callbacks. A single full Step would finish without ever
+	// attaching, and update() would never fire — failing to exercise the drift.
+	require.NoError(t, b.Step(int(nSrc-1)), "partial Step should leave 1 page to copy")
+	require.Equal(t, uint32(1), b.Remaining())
+	b.mu.Lock()
+	attached := b.isAttached
+	b.mu.Unlock()
+	require.True(t, attached, "partial Step must attach the backup so update() can fire")
+
+	// Now Step to completion WITHOUT calling Finish. The backup is now DONE and
+	// its destination has been finalized (schema bump + truncate) but the dst
+	// write tx is still open until Finish commits it. The backup stays attached
+	// to the source pager (detach only happens in Finish, ~ backup.c:589-597).
+	require.ErrorIs(t, b.Step(-1), ErrBackupDone)
+
+	// Commit a source write touching an already-copied early page ("k-0000"
+	// lives on the leftmost leaf, copied long before completion). With the
+	// pre-fix guard this fired update() on the DONE backup and re-copied the
+	// page into the finalized dst. With the fix, b.rc == ErrBackupDone is fatal
+	// for update() so it returns early and dst is untouched.
+	postDone := []byte("post-done-write")
+	stx2, err := src.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, stx2.Put(ns, []byte("k-0000"), postDone))
+	require.NoError(t, stx2.Commit())
+
+	// Now finalize the destination.
+	require.NoError(t, b.Finish())
+
+	// Reopen dst and assert the post-DONE write did NOT land. dst must reflect
+	// the original snapshot value (the fat seed value, length 300).
+	dstPath := dst.Path()
+	_ = dst.Close()
+	d2, err := Open(dstPath, DefaultOptions())
+	require.NoError(t, err)
+	defer d2.Close()
+
+	rtx, err := d2.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	ns2, _ := d2.GetNamespace("data")
+	got, err := rtx.Get(ns2, []byte("k-0000"))
+	require.NoError(t, err)
+	require.Equal(t, string(fat), string(got),
+		"post-DONE source write must NOT reach finalized dst: isFatalError(SQLITE_DONE)==TRUE "+
+			"so backupUpdate (backup.c:675) skips a DONE backup")
+	require.NotEqual(t, string(postDone), string(got),
+		"dst must reflect the snapshot at completion, not the later write")
+
+	// Sanity: dst is not corrupt — every seeded key is readable with the
+	// snapshot value. (IntegrityCheck is not used here: it false-positives on a
+	// backed-up dst per drift-112, treating the master page as a flat leaf.)
+	for i := 0; i < 200; i++ {
+		v, err := rtx.Get(ns2, fmt.Appendf(nil, "k-%04d", i))
+		require.NoError(t, err)
+		require.Equal(t, string(fat), string(v))
+	}
+}
+
+// TestBackup_FinalizedDstReportsTruePageCount verifies the coupled fix:
+// (A) a finalized backup destination's page-1 DatabaseSize equals its true
+// physical page count (not a stale 1), and (B) with that in place the descent
+// corruption guard accepts the dst's interior-master child pointers (pgno>1)
+// rather than flagging them as corrupt.
+//
+// The bug: onePage patches dst page-1 bytes[28:32] to nSrcPage, but commit
+// re-serializes p.header.DatabaseSize = p.dbSize.Load() (pager.go:1937), and
+// finalize's truncateTo(nSrcPage) is a no-op when nSrcPage >= dst.dbSize
+// (dst.dbSize stays 1 for a fresh dst — getWritablePage never grows it). So
+// the committed page-1 DatabaseSize was 1 while the dst held ~19 pages; a
+// reopened dst reported DatabaseSize()==1, and the new descent guard then
+// rejected the master interior's child pgno (e.g. 4) as out-of-range corrupt.
+func TestBackup_FinalizedDstReportsTruePageCount(t *testing.T) {
+	src, dst := backupPair(t)
+	ns, _ := src.GetNamespace("data")
+
+	// Seed a multi-page source whose master table is an interior page (its
+	// child root pointers exceed 1), so descent over the dst exercises the
+	// pgno>1 child guard.
+	stx, err := src.BeginWrite()
+	require.NoError(t, err)
+	fat := make([]byte, 300)
+	for i := 0; i < 200; i++ {
+		require.NoError(t, stx.Put(ns, fmt.Appendf(nil, "k-%04d", i), fat))
+	}
+	require.NoError(t, stx.Commit())
+	require.NoError(t, src.Checkpoint(CheckpointFull))
+
+	nSrc := src.DatabaseSize()
+	require.Greater(t, nSrc, uint32(4), "need a multi-page source")
+
+	// Full backup in one Step, then Finish (commits the dst write tx).
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+	require.ErrorIs(t, b.Step(-1), ErrBackupDone)
+	require.NoError(t, b.Finish())
+
+	// Reopen dst from disk: DatabaseSize is now read back from the committed
+	// page-1 bytes (pager.go:485 p.dbSize.Store(p.header.DatabaseSize)).
+	dstPath := dst.Path()
+	require.NoError(t, dst.Close())
+	d2, err := Open(dstPath, DefaultOptions())
+	require.NoError(t, err)
+	defer d2.Close()
+
+	require.Equal(t, nSrc, d2.DatabaseSize(),
+		"reopened dst page-1 DatabaseSize must equal its true physical page count, not stale 1")
+
+	rtx, err := d2.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	require.Equal(t, nSrc, rtx.DatabaseSize(),
+		"snapshot DatabaseSize must equal the true page count")
+
+	// Descent over the dst must succeed for every key. With a stale
+	// DatabaseSize=1 bound, the guard would reject the master interior's
+	// child pgno and return ErrCorrupt here.
+	ns2, err := d2.GetNamespace("data")
+	require.NoError(t, err)
+	for i := 0; i < 200; i++ {
+		v, err := rtx.Get(ns2, fmt.Appendf(nil, "k-%04d", i))
+		require.NoError(t, err, "descent must not flag a valid interior child as corrupt")
+		require.Equal(t, string(fat), string(v))
+	}
 }
 
 func TestBackup_RestartOnCheckpointRestart(t *testing.T) {
@@ -386,6 +542,129 @@ func TestBackup_BumpsDstSchemaCookie(t *testing.T) {
 	defer rtx1.Rollback()
 	require.NotEqual(t, dstCookieBefore, rtx1.DiskSchemaCookie(),
 		"post-backup dst schema cookie must differ from pre-backup (backup.c:423 bump)")
+}
+
+// TestBackup_PreservesSrcPage1HeaderFields verifies that a full backup carries
+// the SOURCE's page-1 header fields into the destination, matching SQLite's
+// verbatim page-1 copy (backup.c:269 memcpy; only offset 28/40 + WAL bytes
+// patched). Regression for drift-40: the Go pager re-serializes its in-memory
+// dbHeader over page 1 at commit (pager.go:1946), so without finalize
+// re-syncing that header from the copied source bytes, fields like the freelist
+// trunk pointers (offset 32/36), UserVersion, AppID, and TextEncoding revert to
+// the destination's own stale values. The freelist case is load-bearing: the
+// trunk pages now hold source content, so reverting offset 32/36 to the dst's
+// own pointers is a genuine freelist-corruption vector.
+func TestBackup_PreservesSrcPage1HeaderFields(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	srcPath := filepath.Join(dir, "src.db")
+	dstPath := filepath.Join(dir, "dst.db")
+
+	// --- Source: distinct header metadata + a non-empty freelist. ---
+	src, err := testOpen(t, srcPath, opts)
+	require.NoError(t, err)
+	stx, err := src.BeginWrite()
+	require.NoError(t, err)
+	sns, err := stx.CreateNamespace("data")
+	require.NoError(t, err)
+	require.NoError(t, stx.Commit())
+
+	// Insert then delete a batch so the source frees pages onto its freelist
+	// (populates FirstFreelistPg@32 / TotalFreelistPgs@36).
+	stx, err = src.BeginWrite()
+	require.NoError(t, err)
+	sns, err = src.GetNamespace("data")
+	require.NoError(t, err)
+	val := make([]byte, 200)
+	for i := 0; i < 300; i++ {
+		require.NoError(t, stx.Put(sns, fmt.Appendf(nil, "s-%04d", i), val))
+	}
+	require.NoError(t, stx.Commit())
+	stx, err = src.BeginWrite()
+	require.NoError(t, err)
+	sns, err = src.GetNamespace("data")
+	require.NoError(t, err)
+	for i := 0; i < 300; i++ {
+		require.NoError(t, stx.Delete(sns, fmt.Appendf(nil, "s-%04d", i)))
+	}
+	// Set distinct page-1 metadata that differs from any default. savedHeader
+	// was snapshotted at BeginWrite, so these in-memory edits make the commit
+	// see real header changes and serialize them onto page 1.
+	src.pager.header.UserVersion = 0xABCD1234
+	src.pager.header.AppID = 0x5A5A0001
+	src.pager.header.TextEncoding = 2 // UTF-16le
+	require.NoError(t, stx.Commit())
+	require.NoError(t, src.Checkpoint(CheckpointFull))
+
+	// --- Destination: an EMPTY freelist (FirstFreelistPg/TotalFreelistPgs ==
+	// 0) and different metadata, so it differs unambiguously from the source's
+	// non-empty freelist and distinct metadata. ---
+	dst, err := testOpen(t, dstPath, opts)
+	require.NoError(t, err)
+	dtx, err := dst.BeginWrite()
+	require.NoError(t, err)
+	_, err = dtx.CreateNamespace("data")
+	require.NoError(t, err)
+	require.NoError(t, dtx.Commit())
+	dtx, err = dst.BeginWrite()
+	require.NoError(t, err)
+	dns, err := dst.GetNamespace("data")
+	require.NoError(t, err)
+	for i := 0; i < 60; i++ {
+		require.NoError(t, dtx.Put(dns, fmt.Appendf(nil, "d-%04d", i), val))
+	}
+	dst.pager.header.UserVersion = 0x11110000
+	dst.pager.header.AppID = 0x22220000
+	dst.pager.header.TextEncoding = 1 // UTF-8
+	require.NoError(t, dtx.Commit())
+	require.NoError(t, dst.Checkpoint(CheckpointFull))
+
+	// Capture the source's page-1 header fields straight from disk.
+	srcData, err := os.ReadFile(srcPath)
+	require.NoError(t, err)
+	srcFirstFree := binary.BigEndian.Uint32(srcData[32:36])
+	srcTotalFree := binary.BigEndian.Uint32(srcData[36:40])
+	srcUserVer := binary.BigEndian.Uint32(srcData[60:64])
+	srcAppID := binary.BigEndian.Uint32(srcData[68:72])
+	srcTextEnc := binary.BigEndian.Uint32(srcData[56:60])
+	require.NotZero(t, srcFirstFree, "test setup: source must have a non-empty freelist")
+	require.NotZero(t, srcTotalFree, "test setup: source freelist page count must be non-zero")
+
+	// Sanity: the destination's pre-backup page-1 fields really differ, so the
+	// assertions below distinguish "kept source" from "reverted to dst".
+	dstBefore, err := os.ReadFile(dstPath)
+	require.NoError(t, err)
+	require.NotEqual(t, srcFirstFree, binary.BigEndian.Uint32(dstBefore[32:36]),
+		"test setup: dst freelist trunk must differ from src")
+	require.NotEqual(t, srcUserVer, binary.BigEndian.Uint32(dstBefore[60:64]),
+		"test setup: dst UserVersion must differ from src")
+
+	// --- Full backup src -> dst. ---
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+	for {
+		err := b.Step(-1)
+		if err == ErrBackupDone {
+			break
+		}
+		require.NoError(t, err)
+	}
+	require.NoError(t, b.Finish())
+	require.NoError(t, dst.Checkpoint(CheckpointFull))
+
+	// --- Assert dst page-1 header now mirrors the source. ---
+	dstData, err := os.ReadFile(dstPath)
+	require.NoError(t, err)
+	require.Equal(t, srcFirstFree, binary.BigEndian.Uint32(dstData[32:36]),
+		"FirstFreelistPg@32 must carry over from source (load-bearing: trunk pages hold source content)")
+	require.Equal(t, srcTotalFree, binary.BigEndian.Uint32(dstData[36:40]),
+		"TotalFreelistPgs@36 must carry over from source")
+	require.Equal(t, srcUserVer, binary.BigEndian.Uint32(dstData[60:64]),
+		"UserVersion@60 must carry over from source")
+	require.Equal(t, srcAppID, binary.BigEndian.Uint32(dstData[68:72]),
+		"AppID@68 must carry over from source")
+	require.Equal(t, srcTextEnc, binary.BigEndian.Uint32(dstData[56:60]),
+		"TextEncoding@56 must carry over from source")
 }
 
 // multiProcessBackupChild is invoked in a subprocess via exec.Command.

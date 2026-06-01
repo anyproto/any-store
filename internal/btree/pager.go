@@ -199,6 +199,19 @@ type pager struct {
 	// inMemory keeps the entire database in memory with no files on disk
 	inMemory bool
 
+	// openDev / openIno capture the (device, inode) identity of the live DB
+	// file at open time. openIdentOK reports whether that identity could be
+	// obtained from the OS (false on non-unix / VFS-injected files where no
+	// real inode is available). databaseIsUnmoved compares the current
+	// on-disk identity against these to detect a file renamed/unlinked/
+	// relinked out from under the open fd, mirroring SQLite's
+	// SQLITE_FCNTL_HAS_MOVED check (databaseIsUnmoved pager.c:4142-4159 →
+	// fileHasMoved os_unix.c:1623-1632). Captured once in pager.open; never
+	// mutated afterwards, so no synchronization is needed (close holds p.mu).
+	openDev     uint64
+	openIno     uint64
+	openIdentOK bool
+
 	// useSlab is set once by btree.Open from Options.SlabPages.
 	// Local bool — no atomic/global reads on hot path.
 	useSlab bool
@@ -263,6 +276,7 @@ type savepointState struct {
 
 // newPager creates a new pager for the given database path.
 // purgeable controls whether the page cache can evict pages (false for InMemory databases).
+// DRIFT: no mxPgno / SQLITE_FULL max-page-count guard in page getters See docs/btree/NOTES.md#drift-8-max-page-count-sqlite-full-enforcement-absent
 func newPager(path string, pageSize uint32, cacheSize int, purgeable bool) *pager {
 	p := &pager{
 		path:     path,
@@ -414,9 +428,22 @@ func (p *pager) open() error {
 	}
 
 	if info.Size() == 0 {
-		// New database - initialize
-		return p.initNewDB()
+		// New database - initialize. initNewDB writes page 1 to the file
+		// (and fdatasyncs), so re-stat once afterwards to capture the
+		// identity of the now-materialized inode. Cheap: one extra Stat on
+		// the create path only.
+		if err := p.initNewDB(); err != nil {
+			return err
+		}
+		if info2, err := f.Stat(); err == nil {
+			p.openDev, p.openIno, p.openIdentOK = statIdentity(info2)
+		}
+		return nil
 	}
+
+	// Existing database - reuse the already-fetched info (no extra syscall)
+	// to capture the file identity for the close-time databaseIsUnmoved guard.
+	p.openDev, p.openIno, p.openIdentOK = statIdentity(info)
 
 	// Existing database - read header
 	readSize := p.pageSize
@@ -443,9 +470,58 @@ func (p *pager) open() error {
 		return fmt.Errorf("%w: VersionValidFor=%d FileChangeCount=%d", ErrCorrupt, p.header.VersionValidFor, p.header.FileChangeCount)
 	}
 
+	// Validate the on-disk header page size, mirroring C lockBtree
+	// (btree.c:3377-3385): it must be a power of two within
+	// [MinPageSize, MaxPageSize], else SQLITE_NOTADB. The on-disk size is
+	// adopted as authoritative below (p.pageSize = p.header.PageSize), so
+	// reject a corrupt/non-DB value here instead of trusting it into the
+	// engine.
+	if p.header.PageSize < MinPageSize || p.header.PageSize > MaxPageSize ||
+		(p.header.PageSize&(p.header.PageSize-1)) != 0 {
+		return fmt.Errorf("%w: invalid on-disk page size %d", ErrCorrupt, p.header.PageSize)
+	}
+
+	// Reconcile the on-disk page size against the process-global page buffer
+	// pool. Open already keyed the pool to opts.PageSize (db.go), so this
+	// returns ErrPageBufferPoolSizeMismatch when the on-disk size differs;
+	// propagate it rather than draw mis-sized buffers from the shared pool.
+	// (C allocates per-pager pTmpSpace/PCache at the file's actual page size,
+	// pager.c:5016-5028, and so never mixes sizes the way this pool would.)
+	if err := initPageBufferPool(p.header.PageSize); err != nil {
+		return err
+	}
+
 	p.pageSize = p.header.PageSize
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
-	p.dbSize.Store(p.header.DatabaseSize)
+
+	// Mirror C lockBtree (btree.c:3422-3424): the usable size (pageSize minus
+	// the on-disk reserved-space byte) is not allowed to be less than 480 — at
+	// page size 512 the reserved space cannot exceed 32. A larger ReservedSpace
+	// byte would otherwise feed degenerate geometry into maxLocalPayload /
+	// minLocalPayload / overflowPageUsable and the cell-content math. This
+	// floors only the on-disk-open path; the codec-install and new-DB paths
+	// derive usableSize from process-chosen Options, not untrusted bytes.
+	if p.usableSize_ < 480 {
+		return fmt.Errorf("%w: usable size %d < 480", ErrCorrupt, p.usableSize_)
+	}
+
+	// Reconcile the header page count against the physical file size,
+	// mirroring C lockBtree (btree.c:3304-3308). C derives nPageFile via
+	// sqlite3PagerPagecount and falls back to it when the header count is
+	// zero or the change-counter sentinel (FileChangeCount bytes 24-27 vs
+	// VersionValidFor bytes 92-95) mismatches. The VersionValidFor!=0
+	// mismatch is already rejected above; this fallback arm covers the
+	// nPage==0 / legacy-sentinel (VersionValidFor==0) case. When the header
+	// count is untrusted, clamp dbSize to the file page count (C sets
+	// nPage=nPageFile); a trusted-but-too-large header is rejected below
+	// after the WAL is opened, not here.
+	fileNPage := uint32((info.Size() + int64(p.pageSize) - 1) / int64(p.pageSize))
+	headerNPageTrusted := p.header.DatabaseSize != 0 && p.header.VersionValidFor == p.header.FileChangeCount
+	if headerNPageTrusted {
+		p.dbSize.Store(p.header.DatabaseSize)
+	} else {
+		p.dbSize.Store(fileNPage)
+	}
 	p.cellBuf = make([]byte, 0, p.usableSize_)
 	p.writerCache = newPcache(int(p.pageSize), p.writerCache.maxPages, p.writerCache.purgeable)
 	p.writerCache.useSlab = p.useSlab
@@ -471,7 +547,10 @@ func (p *pager) open() error {
 	// occurred before checkpoint. Without this, commit() would serialize
 	// stale p.header fields back into page 1, corrupting the freelist.
 	if p.wal.index.maxFrame.Load() > 0 {
-		frame := p.wal.index.get(1, p.wal.index.maxFrame.Load())
+		frame, err := p.wal.index.get(1, p.wal.index.maxFrame.Load())
+		if err != nil {
+			return err
+		}
 		if frame > 0 {
 			walBuf := make([]byte, p.pageSize)
 			if err := p.wal.readFrame(frame, walBuf, nil, nil); err == nil {
@@ -483,6 +562,24 @@ func (p *pager) open() error {
 		// DatabaseSize than what survives in the WAL after recovery.
 		if p.wal.index.maxPage.Load() > p.dbSize.Load() {
 			p.dbSize.Store(p.wal.index.maxPage.Load())
+		}
+	}
+
+	// Reject a trusted header whose DatabaseSize exceeds the available pages,
+	// mirroring C lockBtree (btree.c:3411-3417): outside writable-schema mode
+	// (which any-store never enables) nPage>nPageFile is SQLITE_CORRUPT, not a
+	// clamp. nPageFile here is the file page count, but C's pagerPagecount
+	// (pager.c:3292) prefers the WAL-committed size when larger, so account
+	// for pages committed to the WAL but not yet checkpointed into the DB file
+	// to avoid false-positively rejecting WAL-extended databases.
+	if headerNPageTrusted {
+		walNPage := p.wal.index.maxPage.Load()
+		effectiveFileN := fileNPage
+		if walNPage > effectiveFileN {
+			effectiveFileN = walNPage
+		}
+		if p.header.DatabaseSize > effectiveFileN {
+			return fmt.Errorf("%w: header DatabaseSize=%d exceeds file pages=%d wal=%d", ErrCorrupt, p.header.DatabaseSize, fileNPage, walNPage)
 		}
 	}
 
@@ -539,6 +636,8 @@ func (p *pager) decryptPage(scratch, src []byte, pgno uint32) ([]byte, error) {
 // END ENCRYPTION
 
 // initNewDB initializes a brand new database file.
+// DRIFT: new-DB page 1 written+fdatasynced direct to file, bypassing WAL (C defers to WAL) See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
+// DRIFT: SchemaFormat=5 is a Go-specific value (unified key||value overflow), unrelated to SQLite's See docs/btree/NOTES.md#old-drift-schema-format-5-custom-not-sqlite-fmt4
 func (p *pager) initNewDB() error {
 	if p.pageSize == 0 {
 		p.pageSize = DefaultPageSize
@@ -691,6 +790,7 @@ func (p *pager) endRead(slot int) {
 // deliberately no zero-arg form, because a WalIndexHdr{} snapshot
 // silently disables the BUSY_SNAPSHOT check and is a multi-process
 // correctness hazard (docs/btree/NOTES.md P0.2 drift, resolved).
+// DRIFT: beginWrite refreshes page-1 header/dbSize on stateChanged (C does it on read path) See docs/btree/NOTES.md#drift-76-beginwrite-re-reads-page-1-header-on-state-change
 func (p *pager) beginWrite(readSnap WalIndexHdr) error {
 	stateChanged, err := p.wal.beginWriteWithSnapshot(readSnap)
 	if err != nil {
@@ -709,7 +809,19 @@ func (p *pager) beginWrite(readSnap WalIndexHdr) error {
 	// tables are consulted in multi-process mode.
 	if stateChanged {
 		p.writerCache.clear()
-		p.refreshHeaderFromPage1()
+		// If the page-1 re-read fails at both the WAL frame and the DB file
+		// (double I/O failure), abort beginWrite rather than continuing with a
+		// stale header/dbSize that commit() would later serialize over the
+		// peer's page 1. Mirrors SQLite propagating the page-1 read error out
+		// of the begin/shared-lock path. We release the exclusive WAL write
+		// lock that beginWriteWithSnapshot acquired (the pager never reached
+		// pagerWriter, so the caller's error path only ends the read tx via
+		// endRead and would otherwise leak the write lock); the caller's read
+		// transaction itself is left intact.
+		if err := p.refreshHeaderFromPage1(); err != nil {
+			p.wal.endWrite()
+			return err
+		}
 	}
 	p.state.Store(int32(pagerWriter))
 	// Save a snapshot of the database header so rollback can restore it (fix 5.2).
@@ -725,12 +837,15 @@ func (p *pager) beginWrite(readSnap WalIndexHdr) error {
 // getPage returns the page with the given page number, reading from WAL or disk as needed.
 // Uses the current WAL nFrame (not walMaxFrame) so that spilled pages written
 // to WAL beyond walMaxFrame during this write transaction are visible.
+// DRIFT: no mxPgno / SQLITE_FULL max-page-count guard in page getters See docs/btree/NOTES.md#drift-8-max-page-count-sqlite-full-enforcement-absent
 func (p *pager) getPage(pgno uint32) (*page, error) {
 	return p.getPageWriter(pgno, p.wal.nFrame.Load())
 }
 
 // getPageWriter returns a page using the writer's cache, reading from
 // WAL or disk on cache miss. Used by the writer goroutine only.
+// DRIFT: WAL frame read failure silently falls through to stale disk read See docs/btree/NOTES.md#drift-6-wal-frame-read-failure-falls-through-to-disk-read
+// DRIFT: no mxPgno / SQLITE_FULL max-page-count guard in page getters See docs/btree/NOTES.md#drift-8-max-page-count-sqlite-full-enforcement-absent
 func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
@@ -747,9 +862,31 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 	// Cache miss: create a new cached page (hard create — writer always succeeds).
 	pg := p.writerCache.create(pgno, 2)
 
+	// Decide read-vs-zero up front, matching C getPageNormal
+	// (pager.c:5590,5615): a page whose number exceeds the logical database
+	// size is never read from WAL or disk — it is memset(0)ed. p.dbSize is the
+	// writer's authoritative same-process allocation counter (refreshed via
+	// beginWrite -> refreshHeaderFromPage1 on cross-process state change), so a
+	// pgno above it cannot be live; reading WAL/disk could resurrect stale
+	// trailing bytes from a since-truncated region (truncateTo defers the
+	// physical ftruncate). Same idiom as getPageNoContent.
+	if pgno > p.dbSize.Load() {
+		clear(pg.data)
+		pg.header = pageHeader{}
+		return pg, nil
+	}
+
 	// Try to read from WAL first
 	if walMaxFrame > 0 {
-		frame := p.wal.index.get(pgno, walMaxFrame)
+		frame, err := p.wal.index.get(pgno, walMaxFrame)
+		if err != nil {
+			// ErrCorrupt from a full/over-probed SHM hash chain: fail the
+			// read (matching C's walFindFrame SQLITE_CORRUPT_BKPT at
+			// wal.c:3593) instead of falling through to the DB file, which
+			// would silently serve a pre-commit page and mask the corruption.
+			p.writerCache.discard(pg.pgno)
+			return nil, err
+		}
 		if frame > 0 {
 			if err := p.wal.readFrame(frame, pg.data, p.codecScratch, &p.codecAEAD); err == nil {
 				// Parse page header
@@ -767,16 +904,14 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 		}
 	}
 
-	// Read from database file
+	// Read from database file. Reached only when pgno <= p.dbSize (the upfront
+	// guard above returned for any out-of-bounds page), so a read failure here
+	// is for an in-bounds page and is always a hard error — matching C, where
+	// readDbPage runs only in the in-bounds else branch (pager.c:5617-5623).
 	if p.file != nil {
 		if err := p.readDBPage(pgno, pg.data); err != nil {
-			// If page is beyond current file but within dbSize, it's a new page
-			if pgno <= p.dbSize.Load() {
-				p.writerCache.discard(pg.pgno)
-				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
-			}
-			// Zero-fill new pages
-			clear(pg.data)
+			p.writerCache.discard(pg.pgno)
+			return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 		} else {
 			// BEGIN ENCRYPTION
 			if p.codec != nil {
@@ -821,15 +956,37 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 // cache.codecScratch / &cache.codecAEAD. Pass nil/nil for the rare nil-
 // cache path (admission-control refusal, integrity checks); the codec
 // falls back to allocPageBuffer in that case.
+// DRIFT: WAL frame read failure silently falls through to stale disk read See docs/btree/NOTES.md#drift-6-wal-frame-read-failure-falls-through-to-disk-read
+// DRIFT: short DB-file read on in-bounds page is hard error in Go, zero-pad OK in C See docs/btree/NOTES.md#drift-7-short-db-file-read-treated-as-hard-error
 func (p *pager) readTempPage(pgno, walMaxFrame, dbSizeBound uint32, codecBuf []byte, codecAEAD *aeadScratch) (*page, error) {
 	pg := p.acquireTempPage()
 	pg.pgno = pgno
 	pg.pinCount = 1
 	pg.uncached = true
 
+	// Decide read-vs-zero up front, matching C getPageNormal
+	// (pager.c:5590,5615). dbSizeBound is the reader's per-snapshot page count
+	// (effectiveReaderDbSize → hdr.nPage in multi-process mode) or p.dbSize on
+	// the uncached/writer path; a page beyond it is not part of this snapshot,
+	// so it is zeroed rather than read from WAL or disk. WAL-then-disk still
+	// runs for pgno <= dbSizeBound, so a peer-committed page in
+	// (p.dbSize, snapshotBound] living only in the WAL is still served.
+	if pgno > dbSizeBound {
+		clear(pg.data)
+		pg.header = pageHeader{}
+		return pg, nil
+	}
+
 	// Try to read from WAL first.
 	if walMaxFrame > 0 {
-		frame := p.wal.index.get(pgno, walMaxFrame)
+		frame, err := p.wal.index.get(pgno, walMaxFrame)
+		if err != nil {
+			// ErrCorrupt from a full/over-probed SHM hash chain: fail the read
+			// (C walFindFrame SQLITE_CORRUPT_BKPT, wal.c:3593) rather than
+			// serving a stale pre-commit page from disk.
+			p.recycleTempPage(pg)
+			return nil, err
+		}
 		if frame > 0 {
 			if err := p.wal.readFrame(frame, pg.data, codecBuf, codecAEAD); err == nil {
 				off := 0
@@ -842,17 +999,13 @@ func (p *pager) readTempPage(pgno, walMaxFrame, dbSizeBound uint32, codecBuf []b
 		}
 	}
 
-	// Read from database file.
+	// Read from database file. Reached only when pgno <= dbSizeBound (the
+	// upfront guard returned for any out-of-snapshot page), so a read failure
+	// here is for an in-bounds page and is always a hard error — matching C.
 	if p.file != nil {
 		if err := p.readDBPage(pgno, pg.data); err != nil {
-			// dbSizeBound is the caller's snapshot page count (reader) or
-			// p.dbSize (writer/uncached); a page beyond it is a not-yet-
-			// materialized new page → zero-fill rather than error.
-			if pgno <= dbSizeBound {
-				p.recycleTempPage(pg)
-				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
-			}
-			clear(pg.data)
+			p.recycleTempPage(pg)
+			return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 		} else {
 			// BEGIN ENCRYPTION
 			if p.codec != nil {
@@ -905,6 +1058,7 @@ func (p *pager) readTempPage(pgno, walMaxFrame, dbSizeBound uint32, codecBuf []b
 // cache were populated during this transaction, so they're valid for this
 // snapshot). On cache miss the page is read from WAL/disk/masterStore and
 // stored in the reader cache for subsequent lookups within the same transaction.
+// DRIFT: no mxPgno / SQLITE_FULL max-page-count guard in page getters See docs/btree/NOTES.md#drift-8-max-page-count-sqlite-full-enforcement-absent
 func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
@@ -937,9 +1091,29 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 		return p.readTempPage(pgno, walMaxFrame, p.readerDbSizeBound(cache), cache.codecScratch, &cache.codecAEAD)
 	}
 
+	// Decide read-vs-zero up front, matching C getPageNormal
+	// (pager.c:5590,5615). The reader bounds on the per-snapshot page count
+	// (readerDbSizeBound → pcache.dbSize → effectiveReaderDbSize, hdr.nPage in
+	// multi-process mode), NOT p.dbSize: a peer can commit frames for pages with
+	// pgno > p.dbSize that are still within this reader's snapshot, and they
+	// live in the WAL, so WAL-then-disk must still run for pgno <= snapshotBound.
+	// A page truly beyond the snapshot is zeroed instead of reading stale bytes.
+	if pgno > p.readerDbSizeBound(cache) {
+		clear(pg.data)
+		pg.header = pageHeader{}
+		return pg, nil
+	}
+
 	// Try to read from WAL first.
 	if walMaxFrame > 0 {
-		frame := p.wal.index.get(pgno, walMaxFrame)
+		frame, err := p.wal.index.get(pgno, walMaxFrame)
+		if err != nil {
+			// ErrCorrupt from a full/over-probed SHM hash chain: fail the read
+			// (C walFindFrame SQLITE_CORRUPT_BKPT, wal.c:3593) rather than
+			// serving a stale pre-commit page from disk/masterStore.
+			cache.discard(pg.pgno)
+			return nil, err
+		}
 		if frame > 0 {
 			// BEGIN ENCRYPTION
 			if p.codec != nil && cache.codecScratch == nil {
@@ -958,16 +1132,13 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 		}
 	}
 
-	// Read from database file.
+	// Read from database file. Reached only when pgno <= snapshotBound (the
+	// upfront guard returned for any out-of-snapshot page), so a read failure
+	// here is for an in-bounds page and is always a hard error — matching C.
 	if p.file != nil {
 		if err := p.readDBPage(pgno, pg.data); err != nil {
-			// Reader snapshot bound (cache is non-nil here): a page beyond it
-			// is a peer-allocated page not yet in the file → zero-fill.
-			if pgno <= p.readerDbSizeBound(cache) {
-				cache.discard(pg.pgno)
-				return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
-			}
-			clear(pg.data)
+			cache.discard(pg.pgno)
+			return nil, fmt.Errorf("btree: failed to read page %d: %w", pgno, err)
 		} else {
 			// BEGIN ENCRYPTION
 			if p.codec != nil {
@@ -1009,12 +1180,20 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 // cache, a new blank page is created. This is used when allocating pages from
 // the freelist or growing the database, where the old content is irrelevant.
 // Modeled after SQLite's PAGER_GET_NOCONTENT flag in pager.c:5507.
+// DRIFT: no mxPgno / SQLITE_FULL max-page-count guard in page getters See docs/btree/NOTES.md#drift-8-max-page-count-sqlite-full-enforcement-absent
+// DRIFT: no btreeGetUnusedPage refcount>1 in-use ErrCorrupt check See docs/btree/NOTES.md#drift-10-missing-refcount-greater-than-one-in-use-page-corruption-det
 func (p *pager) getPageNoContent(pgno uint32) (*page, error) {
 	if pgno == 0 {
 		return nil, ErrInvalidPage
 	}
-	// Cache hit: return as-is (the content may be stale but the caller will overwrite it)
+	// Cache hit: re-zero before returning. SQLite's NOCONTENT path always
+	// re-zeroes even on a cache hit (pager.c:5567-5618: the cache-hit shortcut
+	// is gated on `pPg->pPager && !noContent`, so with noContent set control
+	// always falls through to memset(pPg->pData, 0, pPager->pageSize)). Match
+	// that so a NOCONTENT fetch never hands back stale residual bytes.
 	if pg := p.writerCache.fetch(pgno); pg != nil {
+		clear(pg.data)
+		pg.header = pageHeader{}
 		return pg, nil
 	}
 	// Cache miss: create a blank page without any disk/WAL read (hard create — writer).
@@ -1043,7 +1222,14 @@ func (p *pager) readRawPage(pgno, walMaxFrame uint32) ([]byte, error) {
 	}
 	buf := make([]byte, p.pageSize)
 	if walMaxFrame > 0 && p.wal != nil {
-		if frame := p.wal.index.get(pgno, walMaxFrame); frame > 0 {
+		frame, err := p.wal.index.get(pgno, walMaxFrame)
+		if err != nil {
+			// ErrCorrupt from a full/over-probed SHM hash chain: fail the read
+			// (C walFindFrame SQLITE_CORRUPT_BKPT, wal.c:3593) rather than
+			// serving a stale pre-commit page from disk/masterStore.
+			return nil, err
+		}
+		if frame > 0 {
 			if err := p.wal.readFrameRaw(frame, buf); err == nil {
 				return buf, nil
 			}
@@ -1161,13 +1347,14 @@ func (p *pager) allocatePageNear(nearby uint32) (*page, error) {
 		return nil, ErrReadOnly
 	}
 
-	// Check freelist first.
+	// Check freelist first. Matches SQLite allocateBtreePage
+	// (btree.c:6543 freelist branch): when the freelist is non-empty we
+	// allocate from it and PROPAGATE any error (including ErrCorrupt)
+	// rather than swallowing it and growing the DB. The grow-the-DB
+	// fallback (btree.c:6758-6815 else branch) only runs when the
+	// freelist is empty (n==0, here FirstFreelistPg == 0).
 	if p.header.FirstFreelistPg != 0 {
-		pg, err := p.allocateFromFreelist(nearby)
-		if err == nil {
-			return pg, nil
-		}
-		// Fall through to grow database if freelist read fails.
+		return p.allocateFromFreelist(nearby)
 	}
 
 	pgno := p.dbSize.Add(1)
@@ -1201,11 +1388,16 @@ func (p *pager) usableSize() int {
 }
 
 // freelistMaxLeaves returns the max number of leaf entries per trunk page.
+// DRIFT: trunk fills to usableSize/4-2 (corruption ceiling) not SQLite's conservative -8; pre-3.6.0 See docs/btree/NOTES.md#old-drift-freelist-trunk-fill-corruption-ceiling
+// DRIFT: freelist trunk fills to usableSize/4-2 (corruption ceiling), not SQLite's usableSize/4-8 See docs/btree/NOTES.md#old-drift-freelist-trunk-fill-bound-corruption-ceiling
 func (p *pager) freelistMaxLeaves() int {
 	return (p.usableSize() - 8) / 4
 }
 
 // freePage adds a page to the freelist.
+// DRIFT: freePage2 trunk decision uses offset 32 not nFree; freed-leaf isInit not cleared See docs/btree/NOTES.md#drift-73-freepage2-trunk-decision-and-page-invalidation-drifts
+// DRIFT: secure_delete page-zeroing on free unsupported and undocumented See docs/btree/NOTES.md#drift-74-secure-delete-page-zeroing-on-free-unsupported
+// DRIFT: freelist trunk fills to usableSize/4-2 (corruption ceiling), not SQLite's usableSize/4-8 See docs/btree/NOTES.md#old-drift-freelist-trunk-fill-bound-corruption-ceiling
 func (p *pager) freePage(pgno uint32) error {
 	if pagerState(p.state.Load()) != pagerWriter {
 		return ErrReadOnly
@@ -1304,10 +1496,17 @@ func (p *pager) freePage(pgno uint32) error {
 // If nearby > 0, the leaf with minimum |leafPgno - nearby| is selected
 // instead of the last leaf — matches SQLite btree.c:6678-6699 in
 // BTALLOC_ANY mode. Callers that don't care about locality pass 0.
+// DRIFT: only BTALLOC_ANY; EXACT/LE absent (any-store has no auto-vacuum, their sole consumer) See docs/btree/NOTES.md#old-drift-no-btalloc-exact-le-modes
 func (p *pager) allocateFromFreelist(nearby uint32) (*page, error) {
 	trunkPgno := p.header.FirstFreelistPg
 	if trunkPgno == 0 {
 		return nil, ErrInvalidPage
+	}
+	// Aggregate freelist-count corruption guard. C allocateBtreePage rejects the
+	// whole allocation if the recorded freelist page count is >= the DB page count
+	// (btree.c:6538-6542, n>=mxPage). page-1 offset 36 == header.TotalFreelistPgs.
+	if p.header.TotalFreelistPgs >= p.dbSize.Load() {
+		return nil, ErrCorrupt
 	}
 	// Validate trunk page number (fix 5.1).
 	if trunkPgno > p.dbSize.Load() {
@@ -1620,7 +1819,25 @@ func (p *pager) readerDbSizeBound(cache *pcache) uint32 {
 // page 1 bytes, consulting WAL first (via SHM hash tables in multi-process
 // mode) and falling back to the database file. Called from beginWrite when
 // another process's commit has been detected.
-func (p *pager) refreshHeaderFromPage1() {
+//
+// It returns an error only on a genuine DOUBLE I/O failure: a page-1 WAL frame
+// existed but its read failed AND the DB-file fallback read also failed. In
+// that case the cached header/dbSize cannot be reconciled with the on-disk
+// image at all, so continuing would later let commit() serialize a stale
+// header over a peer's page 1. SQLite propagates the page-1 read error out of
+// the shared-lock/begin path rather than continuing with a stale header
+// (pager.c sqlite3PagerSharedLock -> readDbPage error propagation), and
+// beginWrite mirrors that by aborting on this error.
+//
+// All other outcomes return nil to preserve the prior best-effort behavior:
+//   - page 1 read successfully from the WAL frame or the DB file;
+//   - page 1 legitimately absent from both sources (e.g. a brand-new WAL with
+//     no frames and no backing file, as in InMemory mode);
+//   - no page-1 WAL frame existed and only the single DB-file read failed
+//     (e.g. a truncated/corrupt file) — that corruption is still caught when
+//     the writer first touches a page that must be read from disk, matching
+//     the existing reader-path behavior.
+func (p *pager) refreshHeaderFromPage1() error {
 	// Determine effective max frame, same logic as readHeaderCounters.
 	effectiveMaxFrame := p.wal.nFrame.Load()
 	if p.inProcess {
@@ -1631,9 +1848,19 @@ func (p *pager) refreshHeaderFromPage1() {
 		effectiveMaxFrame = hdr.mxFrame
 	}
 
-	// Try WAL first.
+	// Try WAL first. walErr records a WAL-frame read failure so that, if the
+	// DB-file fallback also fails (or is unavailable), the original read error
+	// can be propagated to the caller rather than swallowed.
+	var walErr error
 	if effectiveMaxFrame > 0 {
-		frame := p.wal.index.get(1, effectiveMaxFrame)
+		frame, err := p.wal.index.get(1, effectiveMaxFrame)
+		if err != nil {
+			// ErrCorrupt from a full/over-probed SHM hash chain is a hard error,
+			// not a "WAL has no page 1" miss: do not fall back to the DB file
+			// (which would mask the corruption with a stale header). Matches C's
+			// walFindFrame SQLITE_CORRUPT_BKPT propagation (wal.c:3593).
+			return err
+		}
 		if frame > 0 {
 			var buf [dbHeaderSize]byte
 			if err := p.readWalFrameData(frame, buf[:]); err == nil {
@@ -1644,7 +1871,9 @@ func (p *pager) refreshHeaderFromPage1() {
 						frame, effectiveMaxFrame, p.wal.index.nBackfill.Load(),
 						p.header.DatabaseSize, p.header.FirstFreelistPg, p.header.TotalFreelistPgs)
 				}
-				return
+				return nil
+			} else {
+				walErr = err
 			}
 		}
 	}
@@ -1660,9 +1889,30 @@ func (p *pager) refreshHeaderFromPage1() {
 					effectiveMaxFrame, p.wal.index.nBackfill.Load(),
 					p.header.DatabaseSize, p.header.FirstFreelistPg, p.header.TotalFreelistPgs)
 			}
-			return
+			return nil
+		} else if walErr != nil {
+			// Double I/O failure: the WAL frame read failed AND the DB-file
+			// read failed. Continuing would leave p.header / p.dbSize stale,
+			// which commit() would later serialize back over a peer's page 1.
+			// Propagate so beginWrite aborts (matching SQLite, which surfaces
+			// the page-1 read error).
+			return fmt.Errorf("refreshHeaderFromPage1: wal read failed (%w) and db read failed (%w)", walErr, err)
 		}
+		// No WAL page-1 frame existed; only the single DB-file read failed.
+		// Preserve the prior best-effort behavior (return nil): the corruption
+		// is caught when the writer first touches a page read from disk, as the
+		// reader path already relies on.
+		return nil
 	}
+
+	// No DB file to fall back to. If a WAL page-1 frame existed but its read
+	// failed, there is no second source to reconcile the header against — that
+	// is the genuine page-1 read failure, so report it. Otherwise page 1 was
+	// simply absent from both sources (best-effort, no read attempted): nil.
+	if walErr != nil {
+		return fmt.Errorf("refreshHeaderFromPage1: wal page 1 read failed and no db file: %w", walErr)
+	}
+	return nil
 }
 
 // committedCounters returns the FileChangeCount and SchemaCookie from the
@@ -1712,7 +1962,14 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 	// frames. After an external state change, beginWrite rebuilds the local page
 	// map from the WAL so page-1 refreshes do not depend solely on SHM hashes.
 	if effectiveMaxFrame > 0 {
-		frame := p.wal.index.get(1, effectiveMaxFrame)
+		frame, gerr := p.wal.index.get(1, effectiveMaxFrame)
+		if gerr != nil {
+			// ErrCorrupt from a full/over-probed SHM hash chain is a hard error,
+			// not a "WAL has no page 1" miss: fail rather than reading stale
+			// counters from the DB file (C walFindFrame SQLITE_CORRUPT_BKPT,
+			// wal.c:3593).
+			return 0, 0, gerr
+		}
 		if frame > 0 {
 			var buf [dbHeaderSize]byte
 			if err := p.readWalFrameData(frame, buf[:]); err == nil {
@@ -1774,6 +2031,8 @@ func (p *pager) readWalFrameData(frame uint32, buf []byte) error {
 // to the WAL without committing, making it clean and evictable.
 // Only the writer's cache has xStress set; reader caches have no stress callback.
 // Modeled after SQLite's pagerStress() (pager.c:4609-4681).
+// DRIFT: pagerStress guards pgno==1; C relies on page-1 staying pinned (never a victim) See docs/btree/NOTES.md#old-drift-pagerstress-page1-exclusion
+// DRIFT: pagerStress skips WAL write for dontWrite pages, just makeClean; C writes the frame anyway See docs/btree/NOTES.md#old-drift-pagerstress-dontwrite-skip-walwrite
 func (p *pager) pagerStress(pg *page) error {
 	// Defense-in-depth: do not spill in error state (SQLite pager.c:4632).
 	// SQLite marks this path NEVER() — it should be unreachable because
@@ -1788,20 +2047,18 @@ func (p *pager) pagerStress(pg *page) error {
 		return nil
 	}
 
-	// Page 1 contains the database header and must not be spilled.
-	// In SQLite, page 1 stays pinned throughout the transaction so pcache
-	// never selects it as a victim. We guard it explicitly because page 1
-	// may become unpinned between b-tree operations.
+	// Page 1 contains the database header and must not be spilled. We guard
+	// it explicitly because page 1 may become unpinned between b-tree
+	// operations (see the page1-exclusion DRIFT on this func's doc comment).
 	if pg.pgno == 1 {
 		return nil
 	}
 
-	// DRIFT from SQLite: SQLite's pagerStress in WAL mode writes DONT_WRITE
-	// pages to WAL anyway (the data is irrelevant but the frame is still
-	// written). We skip the WAL write and just mark them clean, avoiding
-	// unnecessary I/O. Safe because dontWrite page data is never read back.
-	// We must still make them clean so they become evictable — without this,
-	// the cache grows unbounded when freed pages are the only dirty victims.
+	// Skip the WAL write for dontWrite pages and just mark them clean (see
+	// the dontWrite-skip DRIFT on this func's doc comment). Safe because
+	// dontWrite page data is never read back. We must still make them clean
+	// so they become evictable — without this, the cache grows unbounded
+	// when freed pages are the only dirty victims.
 	if p.dontWritePages[pg.pgno] {
 		p.writerCache.makeClean(pg)
 		return nil
@@ -1837,6 +2094,8 @@ func (p *pager) pagerStress(pg *page) error {
 // commit writes all dirty pages to WAL and commits the transaction.
 // dataChanged/schemaChanged control whether FileChangeCount/SchemaCookie are
 // incremented. Returns the WAL frame count and the new counter values.
+// DRIFT: FileChangeCount bumped only on dataChanged=true, not every data-page commit See docs/btree/NOTES.md#drift-77-filechangecount-bumped-conditionally-not-unconditionally
+// DRIFT: commit doesn't prune dirty pages pgno>dbSize before WAL write (no nTruncate prune) See docs/btree/NOTES.md#drift-78-commit-does-not-prune-dirty-pages-above-dbsize-before-wal-wr
 func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC uint32, err error) {
 	p.writerOpMu.Lock()
 	defer p.writerOpMu.Unlock()
@@ -1983,6 +2242,7 @@ func (p *pager) rollback() error {
 }
 
 // rollbackLocked is the inner rollback implementation. Caller must hold writerOpMu.
+// DRIFT: no sqlite3WalUndo; rollback resets wal.nFrame to savedWalFrame + rollbackToFrame trims pages See docs/btree/NOTES.md#old-drift-wal-undo-via-pager-rollback
 func (p *pager) rollbackLocked() error {
 	st := pagerState(p.state.Load())
 	if st != pagerWriter && st != pagerError {
@@ -2080,12 +2340,7 @@ func (p *pager) rollbackForClose() {
 // Recovery path: the cache is purged and the header is restored from the
 // saved snapshot. The next call to rollback() (or beginRead which checks
 // for pagerError) will transition back to pagerOpen.
-// DRIFT from SQLite: SQLite's pager_error() only sets errCode and transitions
-// to PAGER_ERROR, deferring cleanup to the subsequent sqlite3PagerRollback().
-// We perform eager cleanup here (cache purge, WAL rollback, lock release,
-// transition to pagerOpen) because there is no guaranteed subsequent rollback
-// call — if the caller's goroutine panics or abandons the transaction, the
-// WAL write lock would remain held, blocking the next BeginWrite.
+// DRIFT: pagerError eager-cleans (purge/WAL-rollback/unlock); C pager_error only sets errCode, defers See docs/btree/NOTES.md#old-drift-pagererror-eager-cleanup
 func (p *pager) pagerError() {
 	p.state.Store(int32(pagerError))
 
@@ -2223,11 +2478,24 @@ func (p *pager) rollbackToSavepoint(id int) error {
 	// written last and wins. This is analogous to SQLite's pDone bitvec that
 	// skips pages already restored — our reverse iteration achieves the same
 	// result by letting the oldest copy overwrite newer ones.
+	//
+	// Skip any saved copy whose page number is above the target savepoint's
+	// original dbSize. This mirrors SQLite, which resets pPager->dbSize to
+	// pSavepoint->nOrig (pager.c:3426) and then has pager_playback_one_page
+	// skip every journaled page with pgno > pPager->dbSize (pager.c:2341).
+	// The comparison is against the single restored dbSize (the target
+	// savepoint's nOrig), not each inner savepoint's, so capture it once
+	// before the loop. Without this guard, pages allocated after the target
+	// savepoint would be resurrected as ghost dirty pages above dbSize.
+	target := sp.dbSize
 	for i := len(p.savepoints) - 1; i >= id; i-- {
 		if debugTrace {
 			trace("rollbackToSavepoint: restoring sp[%d] pages (%d entries)", i, len(p.savepoints[i].pages))
 		}
 		for pgno, data := range p.savepoints[i].pages {
+			if pgno > target {
+				continue
+			}
 			// Find the page in cache, or create a new one if evicted.
 			pg := p.writerCache.fetch(pgno)
 			if pg == nil {
@@ -2281,6 +2549,7 @@ func (p *pager) rollbackToSavepoint(id int) error {
 
 // releaseSavepoint releases a savepoint and all savepoints above it,
 // merging their changes into the parent savepoint (or transaction).
+// DRIFT: out-of-range savepoint release errors in Go vs C documented no-op (OK) See docs/btree/NOTES.md#drift-61-out-of-range-savepoint-release-errors-instead-of-no-op
 func (p *pager) releaseSavepoint(id int) error {
 	if pagerState(p.state.Load()) != pagerWriter {
 		return ErrReadOnly
@@ -2317,7 +2586,10 @@ func (p *pager) releaseSavepoint(id int) error {
 // checkpointWithMode runs a WAL checkpoint with the specified mode.
 // Does NOT take pager.mu.Lock — readers can continue during checkpoint.
 // The WAL's busy handler is used for FULL/RESTART/TRUNCATE modes to wait
-// for readers that block progress, matching SQLite's behavior.
+// for readers that block progress, matching SQLite's behavior. For
+// non-PASSIVE modes an incomplete backfill (or a write-lock downgrade)
+// surfaces ErrBusy from wal.checkpointWithMode; we only dispatch a backup
+// restart on success, so a BUSY result correctly suppresses it.
 func (p *pager) checkpointWithMode(mode CheckpointMode) error {
 	err := p.wal.checkpointWithMode(p.file, p.master, mode, p.wal.busyHandler)
 	if err == nil && (mode == CheckpointRestart || mode == CheckpointTruncate) {
@@ -2330,6 +2602,7 @@ func (p *pager) checkpointWithMode(mode CheckpointMode) error {
 
 // tryCheckpoint attempts a passive checkpoint for auto-checkpoint.
 // Uses PASSIVE mode to avoid blocking writers or readers, matching SQLite.
+// DRIFT: auto-checkpoint escalates to WAL-RESTART; SQLite auto-checkpoint is PASSIVE-only See docs/btree/NOTES.md#drift-53-auto-checkpoint-escalates-to-wal-restart-beyond-passive
 func (p *pager) tryCheckpoint() error {
 	// First run a non-blocking backfill (PASSIVE), matching SQLite's
 	// auto-checkpoint behavior.
@@ -2396,6 +2669,12 @@ func (p *pager) writeOverflowChainMulti(segments ...[]byte) (uint32, error) {
 				}
 				newPg, err := p.allocatePageNear(nearby)
 				if err != nil {
+					// Release the currently-held overflow page before
+					// returning, mirroring C fillInCell's allocation-failure
+					// path (btree.c:7235-7238: releasePage(pToRelease);
+					// return rc;). prevPg is nil on the first overflow page
+					// (releasePage no-ops on nil), matching C's pToRelease==0.
+					p.releasePage(prevPg)
 					return 0, err
 				}
 				if firstPgno == 0 {
@@ -2431,6 +2710,7 @@ func (p *pager) writeOverflowChainMulti(segments ...[]byte) (uint32, error) {
 
 // readOverflowChainAt reads data from a chain of overflow pages into buf,
 // using the writer's page cache (getPage). Suitable for the writer path.
+// DRIFT: no aOverflow[] cursor cache; overflow chains re-walked from start each read (perf, not corruption) See docs/btree/NOTES.md#old-drift-no-aoverflow-page-cache
 func (p *pager) readOverflowChainAt(firstPgno uint32, buf []byte, walMaxFrame uint32) error {
 	usable := overflowPageUsable(p.usableSize())
 	pgno := firstPgno
@@ -2465,6 +2745,13 @@ func (p *pager) readOverflowChainAt(firstPgno uint32, buf []byte, walMaxFrame ui
 		pgno = binary.BigEndian.Uint32(pg.data[0:4])
 		p.releasePage(pg)
 		off += chunk
+	}
+	// Post-loop completeness check: if the chain's next-page pointer became 0
+	// before all requested bytes were transferred, the overflow chain ended
+	// prematurely. Mirrors C accessPayload (btree.c:5327-5330
+	// `if( rc==SQLITE_OK && amt>0 ) return SQLITE_CORRUPT_PAGE(pPage)`).
+	if off < len(buf) {
+		return ErrCorrupt
 	}
 	return nil
 }
@@ -2509,6 +2796,11 @@ func (p *pager) readOverflowChainReader(firstPgno uint32, buf []byte, walMaxFram
 		pgno = binary.BigEndian.Uint32(pg.data[0:4])
 		p.releasePage(pg)
 		off += chunk
+	}
+	// Post-loop completeness check: chain ended before all requested bytes were
+	// transferred. Mirrors C accessPayload (btree.c:5327-5330).
+	if off < len(buf) {
+		return ErrCorrupt
 	}
 	return nil
 }
@@ -2589,10 +2881,16 @@ func (p *pager) readOverflowAt(firstPgno uint32, skip, amt int, dst []byte, walM
 		p.releasePage(pg)
 		off = end
 	}
+	// Post-loop completeness check: chain ended before amt bytes were
+	// transferred. Mirrors C accessPayload (btree.c:5327-5330).
+	if written < amt {
+		return ErrCorrupt
+	}
 	return nil
 }
 
 // freeOverflowChain frees all pages in an overflow chain.
+// DRIFT: freeOverflowChain walks-to-terminator and omits refcount==1 / nOvfl fixed count See docs/btree/NOTES.md#drift-72-freeoverflowchain-omits-refcount-and-fixed-count-versus-term
 func (p *pager) freeOverflowChain(firstPgno uint32) error {
 	if debugTrace {
 		trace("freeOverflowChain: start firstPg=%d", firstPgno)
@@ -2636,8 +2934,11 @@ func (p *pager) freeOverflowChain(firstPgno uint32) error {
 // truncateTo shrinks the database to the given page count. Matches
 // SQLite's sqlite3PagerTruncateImage (pager.c). Discards writerCache
 // entries above the new size (via pcache.truncate) and updates the
-// atomic dbSize so subsequent writes see the new bound. Physical file
-// truncation happens at the next checkpoint.
+// atomic dbSize so subsequent writes see the new bound. The on-disk file
+// is physically shrunk to the committed page count at the next full-backfill
+// checkpoint (wal.checkpointWithMode's post-backfill dbFile.Truncate, matching
+// SQLite walCheckpoint wal.c:2320-2329).
+// DRIFT: truncateTo eagerly drops dirty pages (savepoint hazard) + adds non-C guards See docs/btree/NOTES.md#drift-79-truncateto-eager-dirty-page-drop-and-extra-guards
 func (p *pager) truncateTo(newDbSize uint32) error {
 	if pagerState(p.state.Load()) != pagerWriter {
 		return ErrReadOnly
@@ -2737,9 +3038,34 @@ func (p *pager) withWriteLock(fn func(locked bool) error) error {
 	return fn(locked)
 }
 
+// databaseIsUnmoved reports whether the live DB file on disk is still the same
+// physical file (same device+inode) that was opened, so that the close-time
+// checkpoint is safe to run into p.file. Models SQLite's databaseIsUnmoved
+// (pager.c:4142-4159) + fileHasMoved (os_unix.c:1623-1632): if the DB file was
+// renamed, unlinked, or relinked out from under the open fd, checkpointing into
+// the (now detached or unrelated) inode would silently lose the committed
+// transaction or clobber an unrelated file, so the checkpoint must be skipped.
+//
+// Returns true (unmoved) for:
+//   - in-memory DB (analog of C tempFile short-circuit, pager.c:4146);
+//   - dbSize==0 (C dbSize==0 short-circuit, pager.c:4147 — a brand-new/empty DB);
+//   - !openIdentOK (no real inode available, e.g. non-unix / VFS-injected file):
+//     analog of C SQLITE_NOTFOUND "HAS_MOVED unimplemented → assume unmoved"
+//     fallback (pager.c:4150-4154), preserving today's behavior there.
+//
+// Otherwise it stats p.path and returns false on any stat error (file moved or
+// gone) or on a (device,inode) mismatch against the identity captured at open.
+func (p *pager) databaseIsUnmoved() bool {
+	if p.inMemory || p.dbSize.Load() == 0 || !p.openIdentOK {
+		return true
+	}
+	return dbFileUnmoved(p.path, p.openDev, p.openIno)
+}
+
 // close closes the pager, WAL, and database file.
 // Matches SQLite's sqlite3PagerClose() -> sqlite3WalClose(): checkpoint the WAL,
 // then truncate the WAL file to zero bytes before closing.
+// DRIFT: last-client close truncates -wal to zero but never unlinks it (SQLite deletes) See docs/btree/NOTES.md#drift-55-wal-file-truncated-but-never-unlinked-on-last-client-close
 func (p *pager) close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -2756,6 +3082,27 @@ func (p *pager) close() error {
 			// leak the lock. Matches SQLite's sqlite3WalClose which guards
 			// walLimitSize with an exclusive DB-file lock (wal.c:2509-2534).
 			_ = p.withWriteLock(func(lockedWrite bool) error {
+				// databaseIsUnmoved gate: matches SQLite's sqlite3PagerClose
+				// (pager.c:4189-4191), which passes a non-NULL buffer to
+				// sqlite3WalClose (enabling the close-time checkpoint) only when
+				// databaseIsUnmoved(pPager)==SQLITE_OK. A NULL buffer (moved DB)
+				// skips the WHOLE checkpoint+truncate arm in sqlite3WalClose
+				// (the `if(zBuf!=0 ...)` gate at wal.c:2522). Skipping is the
+				// safe behavior: if the DB file was renamed/unlinked/relinked
+				// out from under this fd, checkpointing into p.file would write
+				// committed WAL frames into a path that is no longer the real
+				// database — silently losing the transaction on the visible
+				// path or clobbering an unrelated file now living at p.path.
+				// We therefore skip both the checkpoint and the dependent
+				// truncate (truncate stays gated on cpErr==nil below, and cpErr
+				// is left non-nil for the moved case).
+				moved := !p.databaseIsUnmoved()
+				if moved {
+					if debugTrace {
+						trace("close: skipping close-time checkpoint, DB file moved/unlinked since open (path=%s)", p.path)
+					}
+					return nil
+				}
 				if debugTrace {
 					trace("close: starting passive checkpoint before WAL truncation, dbSize=%d lockedWrite=%v", p.dbSize.Load(), lockedWrite)
 				}

@@ -25,9 +25,8 @@ var (
 	// open read/write transaction at BackupInit time.
 	ErrBackupDstBusy = errors.New("btree: backup destination has an open transaction")
 
-	// ErrBackupFinished — returned by Step after Finish or by Finish
-	// called twice. DRIFT from C: backup.c:577 tolerates NULL; Go
-	// prefers explicit misuse errors.
+	// ErrBackupFinished — returned by Step after Finish or by Finish called twice.
+	// DRIFT: SQLite's finish is NULL-tolerant/idempotent; Go surfaces double-finish. See docs/btree/NOTES.md#drift-44-backup-finish-double-call-returns-error-not-no-op
 	ErrBackupFinished = errors.New("btree: backup already finished")
 
 	// ErrBackupDone — non-error sentinel returned by Step once every
@@ -71,21 +70,20 @@ type Backup struct {
 	// 0 = "no prior Step" (init state).
 	lastFCC uint32
 
-	// finished is set by Finish. DRIFT from backup.c:577 which tolerates
-	// NULL; we want explicit double-close detection.
+	// finished is set by Finish; enables explicit double-close detection.
+	// DRIFT: SQLite's finish is NULL-tolerant/idempotent; Go surfaces double-finish. See docs/btree/NOTES.md#drift-44-backup-finish-double-call-returns-error-not-no-op
 	finished bool
 
 	// mu protects Backup state against concurrent Step/Finish/update/restart
 	// and the external Remaining/PageCount accessors. SQLite splits this
-	// across two mutexes (src db + BtShared); our single-mutex model is
-	// DRIFT #4.
+	// across two mutexes (src db + BtShared); we use a single mutex.
 	mu sync.Mutex
 }
 
 // BackupInit starts a new backup operation. The caller ("dst") is the
 // database to write into; "src" is the database to read from.
-// ~ sqlite3_backup_init (backup.c:140–210), minus the handle/name
-// resolution described in DRIFT #2.
+// ~ sqlite3_backup_init (backup.c:140–210).
+// DRIFT: WAL-only: same-page-size enforced at init; no PENDING_BYTE/findDatabase/nBackup See docs/btree/NOTES.md#old-drift-backup-intentional-simplifications
 func (dst *DB) BackupInit(src *DB) (*Backup, error) {
 	// ~ backup.c:166–170.
 	if dst == src {
@@ -115,12 +113,8 @@ func (dst *DB) BackupInit(src *DB) (*Backup, error) {
 // onePage copies page iSrcPg from the source into the destination.
 // ~ backupOnePage (backup.c:226–279). The bUpdate parameter matches
 // SQLite: false for normal Step copies, true for update-callback copies.
-//
-// Our page sizes are always equal (enforced at BackupInit), so the
-// for-loop at backup.c:251–276 collapses to one iteration with no
-// offset arithmetic. DRIFT #1 removes the PENDING_BYTE_PAGE guard at
-// backup.c:243/254.
-func (b *Backup) onePage(iSrcPg uint32, srcData []byte, bUpdate bool) error {
+// DRIFT: WAL-only: same-page-size enforced at init; no PENDING_BYTE/findDatabase/nBackup See docs/btree/NOTES.md#old-drift-backup-intentional-simplifications
+func (b *Backup) onePage(iSrcPg uint32, srcData []byte, bUpdate bool, snapPageCount uint32) error {
 	if b.dst.pager.pageSize != b.src.pager.pageSize {
 		// Defensive: caught at Init, but reopen-race could in theory
 		// change sizes. Return the same error.
@@ -150,7 +144,7 @@ func (b *Backup) onePage(iSrcPg uint32, srcData []byte, bUpdate bool) error {
 	// For page 1 on the initial (non-update) copy, patch the database-size
 	// field so dst's header reflects the source's page count.
 	if iSrcPg == 1 && !bUpdate {
-		putUint32BE(dstPg.data[28:32], b.src.DatabaseSize())
+		putUint32BE(dstPg.data[28:32], snapPageCount)
 	}
 
 	// ~ backup.c:270: invalidate the btree parse-cache on the dst page.
@@ -186,6 +180,7 @@ func putUint32BE(buf []byte, v uint32) {
 // and re-returned by future calls (~ backup.c:329 + backup.c:558).
 //
 // ~ sqlite3_backup_step (backup.c:314–566).
+// DRIFT: backup empty-source (nSrcPage==0 -> NewDb) path missing; truncateTo(0) errors See docs/btree/NOTES.md#drift-41-backup-empty-source-finalization-path-missing
 func (b *Backup) Step(nPage int) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -231,13 +226,17 @@ func (b *Backup) Step(nPage int) error {
 		b.dstLocked = true
 	}
 
-	nSrcPage := b.src.DatabaseSize() // ~ backup.c:388
+	// ~ backup.c:394: nSrcPage = sqlite3BtreeLastPage(pSrc), read once under
+	// the source read-lock. Derive from the read-tx snapshot opened above so
+	// the loop bound, nPagecount/nRemaining, finalize, and the page-1 size
+	// patch are all consistent with the same snapshot (and with the bound
+	// getPageReader validates copied pages against, pager.go:952).
+	nSrcPage := rtx.DatabaseSize()
 	srcPgsz := b.src.PageSize()
 
 	// Main copy loop. ~ backup.c:390–401.
 	for ii := 0; (nPage < 0 || ii < nPage) && b.iNext <= nSrcPage; ii++ {
 		iSrcPg := b.iNext
-		// DRIFT #1 skips PENDING_BYTE_PAGE check at backup.c:392.
 
 		srcPg, err := b.src.pager.getPageReader(iSrcPg, rtx.walMaxFrame, rtx.cache)
 		if err != nil {
@@ -246,7 +245,7 @@ func (b *Backup) Step(nPage int) error {
 		}
 		// No explicit releasePage on reader cache — tx.Rollback handles it.
 
-		if err := b.onePage(iSrcPg, srcPg.data[:srcPgsz], false); err != nil {
+		if err := b.onePage(iSrcPg, srcPg.data[:srcPgsz], false, nSrcPage); err != nil {
 			b.rc = err
 			return err
 		}
@@ -303,8 +302,11 @@ func (b *Backup) PageCount() uint32 {
 //
 // Both mutate the destination; Finish then commits the result.
 // Caller holds b.mu.
+// DRIFT: backup empty-source (nSrcPage==0 -> NewDb) path missing; truncateTo(0) errors See docs/btree/NOTES.md#drift-41-backup-empty-source-finalization-path-missing
+// DRIFT: backup finalize omits SetVersion(2) for WAL dest (page-1 bytes 18/19) See docs/btree/NOTES.md#drift-42-backup-finalize-omits-setversion-for-wal-destination
 func (b *Backup) finalize(nSrcPage uint32) error {
-	// 1. Bump dst schema cookie. ~ sqlite3BtreeUpdateMeta writes meta
+	// 1. Re-sync the in-memory header from the source page-1 bytes, then
+	// bump the dst schema cookie. ~ sqlite3BtreeUpdateMeta writes meta
 	// value #1 (the schema cookie) to the header at offset 40. Our page 1
 	// has the source's header bytes copied in; we overwrite offset 40
 	// with iDstSchema+1 so readers on dst observe a different cookie
@@ -313,15 +315,43 @@ func (b *Backup) finalize(nSrcPage uint32) error {
 	if err != nil {
 		return err
 	}
+	// Re-sync the in-memory db-header from the source page-1 bytes that
+	// onePage copied verbatim into dstPg1 (~ backup.c:269 memcpy). The pager
+	// unconditionally re-serializes p.header over page 1 at commit
+	// (pager.go:1946); without this reload that serialize would revert every
+	// page-1 header field (freelist trunk pointers, page size, text encoding,
+	// user/application metadata, salt, file-change/version counters, ...) to
+	// the destination's own stale values. SQLite has no such re-serialize, so
+	// the verbatim-copied source fields survive there (only offset 28/40 and
+	// the WAL version bytes are patched). This mirrors the established
+	// savepoint page-1 restore at pager.go:2274.
+	b.dst.pager.header.deserialize(dstPg1.data[:dbHeaderSize])
+	// Bump the schema cookie AFTER the deserialize so it is not overwritten.
+	// ~ sqlite3BtreeUpdateMeta writes meta value #1 (the cookie) to offset 40.
 	newCookie := b.iDstSchema + 1
 	putUint32BE(dstPg1.data[40:44], newCookie)
 	// Keep the in-memory header in sync so commit's page-1 serialize
-	// (pager.commit:1371) doesn't clobber our write.
+	// (pager.go:1946) doesn't clobber our write.
 	b.dst.pager.header.SchemaCookie = newCookie
 	b.dst.pager.releasePage(dstPg1)
 
-	// 2. Truncate dst to nSrcPage. ~ sqlite3PagerTruncateImage
-	// (backup.c:530). Shrinks dst.dbSize; file shrinks at next checkpoint.
+	// 2. Set dst's logical page count to nSrcPage. ~ sqlite3PagerTruncateImage
+	// (backup.c:530). In SQLite the destination pager's dbSize is grown as each
+	// page is written through sqlite3PagerWrite; here onePage copies pages via
+	// getWritablePage, which does NOT grow p.dbSize (only allocatePage does).
+	// So after copying a source larger than the dst's prior size, p.dbSize is
+	// still stale (e.g. 1 for a fresh dst) even though nSrcPage physical pages
+	// were written. Commit serializes p.header.DatabaseSize = p.dbSize.Load()
+	// (pager.go:1937), so a stale p.dbSize would write a wrong page-1
+	// DatabaseSize — a reopened dst would then report DatabaseSize=1 while
+	// holding nSrcPage pages, and the descent bound check would flag a valid
+	// interior child (pgno>1) as corrupt. Grow p.dbSize to nSrcPage here; the
+	// shrink case (dst was larger) is handled by truncateTo, which also evicts
+	// writerCache pages beyond nSrcPage.
+	if cur := b.dst.pager.dbSize.Load(); nSrcPage > cur {
+		b.dst.pager.dbSize.Store(nSrcPage)
+		b.dst.pager.header.DatabaseSize = nSrcPage
+	}
 	return b.dst.pager.truncateTo(nSrcPage)
 }
 
@@ -337,8 +367,12 @@ func (b *Backup) update(iPage uint32, data []byte) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// ~ backup.c:669 — skip if fatal error or page not yet copied.
-	if b.rc != nil && b.rc != ErrBackupDone {
+	// ~ backup.c:675 — skip if fatal error or page not yet copied.
+	// Any non-nil b.rc is fatal-for-update here, including ErrBackupDone:
+	// isFatalError(SQLITE_DONE)==TRUE (backup.c:217-219, DONE is neither
+	// SQLITE_OK/BUSY/LOCKED), so backupUpdate never re-touches a DONE backup's
+	// finalized destination.
+	if b.rc != nil {
 		return
 	}
 	if iPage >= b.iNext {
@@ -347,7 +381,7 @@ func (b *Backup) update(iPage uint32, data []byte) {
 
 	// bUpdate=true suppresses the page-1 DatabaseSize patch, which would
 	// be wrong to redo mid-backup.
-	if err := b.onePage(iPage, data, true); err != nil {
+	if err := b.onePage(iPage, data, true, 0); err != nil {
 		b.rc = err
 	}
 }
@@ -365,6 +399,8 @@ func (b *Backup) restart() {
 // Finish releases all resources associated with a Backup and commits
 // or rolls back the destination write transaction based on b.rc.
 // ~ sqlite3_backup_finish (backup.c:571–619).
+// DRIFT: backup dst commit deferred Step->Finish; durability/error point moved See docs/btree/NOTES.md#drift-43-backup-commit-point-moved-from-step-to-finish
+// DRIFT: double/late backup Finish returns ErrBackupFinished vs C no-op OK See docs/btree/NOTES.md#drift-44-backup-finish-double-call-returns-error-not-no-op
 func (b *Backup) Finish() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()

@@ -71,6 +71,13 @@ func TestDBPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, path, db.Path())
 	db.Close()
+
+	// In-memory databases report an empty path, matching SQLite's
+	// sqlite3BtreeGetFilename -> sqlite3PagerFilename(pPager, nullIfMemDb=1).
+	memDB, err := testOpen(t, "ignored.db", Options{InMemory: true})
+	require.NoError(t, err)
+	assert.Equal(t, "", memDB.Path())
+	memDB.Close()
 }
 
 // === Reopen / Persistence Tests ===
@@ -1366,7 +1373,8 @@ func TestCollectInteriorCells(t *testing.T) {
 
 	pg2, err := p.getPage(pg.pgno)
 	require.NoError(t, err)
-	got := bt.collectInteriorCells(pg2)
+	got, err := bt.collectInteriorCells(pg2)
+	require.NoError(t, err)
 	p.releasePage(pg2)
 
 	require.Len(t, got, 3)

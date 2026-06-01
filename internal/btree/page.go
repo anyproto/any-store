@@ -120,6 +120,7 @@ func overflowPageUsable(usableSize int) int {
 
 // localPayloadSize computes how many bytes of payload are stored locally
 // when total payload exceeds maxLocal. Uses SQLite's surplus algorithm.
+// DRIFT: Go has only index maxLocal/minLocal; SQLite's table maxLeaf/minLeaf pair absent (no table See docs/btree/NOTES.md#old-drift-index-only-local-payload-no-maxleaf-minleaf
 func localPayloadSize(totalPayload, usableSize int) int {
 	maxLocal := maxLocalPayload(usableSize)
 	if totalPayload <= maxLocal {
@@ -179,12 +180,13 @@ type dbHeader struct {
 }
 
 // serialize writes the database header to the first 100 bytes of buf.
+// DRIFT: DB header: 'BTree format 1' magic, version=1, KDF salt at 72-87, auto/incr-vacuum fields z See docs/btree/NOTES.md#old-drift-db-file-header-magic-version-salt-vacuum
 func (h *dbHeader) serialize(buf []byte) {
 	copy(buf[0:16], dbMagic)
 
 	var ps uint16
 	if h.PageSize >= 65536 {
-		ps = 1 // SQLite convention: page size 65536 stored as 1
+		ps = 1 // page size 65536 stored as 1
 	} else {
 		ps = uint16(h.PageSize)
 	}
@@ -205,7 +207,7 @@ func (h *dbHeader) serialize(buf []byte) {
 	binary.BigEndian.PutUint32(buf[44:48], h.SchemaFormat)
 	binary.BigEndian.PutUint32(buf[48:52], h.DefaultCacheSize)
 
-	// Largest root b-tree page number (not used for now)
+	// Largest root b-tree page / auto-vacuum (unused, 0)
 	binary.BigEndian.PutUint32(buf[52:56], 0)
 
 	binary.BigEndian.PutUint32(buf[56:60], h.TextEncoding)
@@ -245,6 +247,16 @@ func (h *dbHeader) deserialize(buf []byte) error {
 		return ErrCorrupt // invalid: 0, non-power-of-two, or < 512
 	} else {
 		h.PageSize = uint32(ps)
+	}
+
+	// Mirror C lockBtree (btree.c:3371-3373): the embedded-payload-fraction
+	// bytes 21-23 must equal exactly 64/32/32. SQLite fixed these constants in
+	// 3.6.0 and rejects any other values as SQLITE_NOTADB. serialize() always
+	// hardcodes them (these bytes live inside the always-plaintext 100-byte
+	// dbHeader prefix), so every DB this package writes round-trips cleanly,
+	// while a non-DB / corrupt file is rejected here before codec setup.
+	if buf[21] != maxEmbeddedPayloadFrac || buf[22] != minEmbeddedPayloadFrac || buf[23] != leafPayloadFrac {
+		return ErrCorrupt
 	}
 
 	h.WriteVersion = buf[18]
@@ -387,7 +399,7 @@ func (p *page) contentAreaOffset(usableSize int) (int, error) {
 		if usableSize == 65536 {
 			top = 65536
 		} else {
-			top = usableSize
+			return 0, ErrCorrupt
 		}
 	}
 	if top > usableSize || top < gap {
@@ -554,6 +566,7 @@ func varintSize(v uint64) int {
 }
 
 // checksum computes a CRC32 checksum for data (used in WAL frames).
+// DRIFT: dead/non-protocol CRC32 helpers (checksum, walPageChecksum) mislabeled re WAL frames See docs/btree/NOTES.md#drift-125-dead-or-non-protocol-crc32-checksum-helpers
 func checksum(data []byte) uint32 {
 	return crc32.ChecksumIEEE(data)
 }

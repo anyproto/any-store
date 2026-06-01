@@ -10,13 +10,14 @@ import (
 )
 
 // allowDoubleOpen removes a path from the open registry so a second Open()
-// can succeed. Used only in multi-process simulation tests.
+// can succeed. Used only in multi-process simulation tests. It must use the
+// same key derivation as Open (file identity, falling back to lexical path).
 func allowDoubleOpen(path string) {
-	abs, err := filepath.Abs(path)
+	key, err := openRegistryKey(path)
 	if err != nil {
 		return
 	}
-	openDBs.Delete(abs)
+	openDBs.Delete(key)
 }
 
 // TestCacheInvalidation_SingleProcess_NotStaleAfterOwnWrite verifies that

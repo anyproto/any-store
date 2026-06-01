@@ -33,6 +33,7 @@ func newPlatformShm(_ string) (shm, error) {
 	}, nil
 }
 
+// DRIFT: heap SHM fallback (single-process) on platforms without mmap SHM; SQLite always mmaps SHM See docs/btree/NOTES.md#old-drift-heap-shm-single-process-fallback
 func (s *heapShm) region(index int, create bool) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -52,6 +53,7 @@ func (s *heapShm) region(index int, create bool) ([]byte, error) {
 	return s.regions[index], nil
 }
 
+// DRIFT: heap/inProcess SHM implement real per-slot locks (not no-ops); NOTES conflates them See docs/btree/NOTES.md#drift-117-heap-and-inprocess-shm-implement-real-locks-contradicting-no
 func (s *heapShm) lock(slot int, lockType int) error {
 	if slot < 0 || slot >= lockSlotCount {
 		return fmt.Errorf("btree: invalid lock slot %d", slot)
@@ -76,6 +78,7 @@ func (s *heapShm) lock(slot int, lockType int) error {
 	return nil
 }
 
+// DRIFT: heap/inProcess SHM implement real per-slot locks (not no-ops); NOTES conflates them See docs/btree/NOTES.md#drift-117-heap-and-inprocess-shm-implement-real-locks-contradicting-no
 func (s *heapShm) unlock(slot int, lockType int) error {
 	if slot < 0 || slot >= lockSlotCount {
 		return fmt.Errorf("btree: invalid lock slot %d", slot)

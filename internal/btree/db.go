@@ -17,9 +17,40 @@ import (
 	"sync/atomic"
 )
 
-// openDBs tracks database files currently open in this process.
-// Keyed by canonical absolute path. Prevents double-open corruption.
+// openDBs tracks database files currently open in this process. It is the sole
+// guard against same-process double-open corruption (two writers each believing
+// they hold the exclusive WAL write lock): in-process SHM locks are
+// instance-local, and a same-process second SHARED flock on the DB file also
+// succeeds, so neither backstops this. SQLite coordinates same-process opens
+// through a process-global unixInodeInfo keyed by (dev,ino) (os_unix.c:1282-1349);
+// any-store forbids them instead, but must key on the same FILE IDENTITY rather
+// than a lexical path so that the same inode reached via a symlink, hardlink,
+// bind-mount, or distinct mount path is recognised as already-open. See
+// openRegistryKey for how the key is derived. Prevents double-open corruption.
 var openDBs sync.Map
+
+// openRegistryKey returns the key under which a database file is tracked in
+// openDBs. It prefers FILE IDENTITY (device, inode) over the lexical path so
+// that the same physical file opened under two different spellings (symlink,
+// hardlink, bind-mount, …) collides in the registry, matching SQLite's
+// (dev,ino) unixInodeInfo keying.
+//
+// It falls back to the lexical canonical path (filepath.Abs) when no inode is
+// available — a brand-new file that os.Stat cannot yet see, a platform with no
+// portable (dev,ino) (Windows/wasm), or a VFS-injected FileInfo. Those cases
+// keep the previous lexical behaviour and never break in-memory/VFS opens.
+func openRegistryKey(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("btree: cannot resolve path: %w", err)
+	}
+	if fi, statErr := os.Stat(path); statErr == nil {
+		if key, ok := fileIdentityKey(fi); ok {
+			return key, nil
+		}
+	}
+	return abs, nil
+}
 
 // Options configures the database.
 type Options struct {
@@ -269,6 +300,7 @@ type DB struct {
 	writeMu         sync.Mutex // serializes write transactions
 	pager           *pager
 	path            string
+	registryKey     string // key under which this DB is tracked in openDBs (file identity or lexical path)
 	opts            Options
 	closing         atomic.Bool // set to reject new transactions
 	closed          atomic.Bool // set when Close() is actually called
@@ -374,22 +406,22 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 
-	// Prevent double-open of the same database file.
-	var canonicalPath string
+	// canonicalPath is the lexical absolute path, used for Path()/db.path. The
+	// double-open guard itself keys on FILE IDENTITY (dev,ino) and is registered
+	// after p.open() below, once the file exists and can be stat'd — see the
+	// openDBs registration following p.open().
+	var canonicalPath, registryKey string
 	if !opts.InMemory {
 		var err error
 		canonicalPath, err = filepath.Abs(path)
 		if err != nil {
 			return nil, fmt.Errorf("btree: cannot resolve path: %w", err)
 		}
-		if _, loaded := openDBs.LoadOrStore(canonicalPath, true); loaded {
-			return nil, ErrDatabaseOpen
-		}
 	}
 	openSuccess := false
 	defer func() {
-		if !openSuccess && canonicalPath != "" {
-			openDBs.Delete(canonicalPath)
+		if !openSuccess && registryKey != "" {
+			openDBs.Delete(registryKey)
 		}
 	}()
 
@@ -485,6 +517,32 @@ func Open(path string, opts Options) (*DB, error) {
 		return nil, err
 	}
 
+	// Register in the process-global open-DB guard, keyed on FILE IDENTITY
+	// (dev,ino) rather than the lexical path, so that the same inode reached via
+	// a symlink/hardlink/bind-mount/distinct-mount-path is recognised as already
+	// open. We do this AFTER p.open() because the file now definitely exists (it
+	// was created for a new DB), so its inode is stable — keying before open
+	// would mis-key brand-new files (no inode yet -> lexical fallback) against a
+	// later open of the same now-existing file (inode). This mirrors SQLite,
+	// which opens the fd and then consults its (dev,ino) unixInodeInfo registry
+	// (os_unix.c:1282-1349). Falls back to the lexical canonical path when no
+	// inode is available (Windows/wasm, or a VFS-injected FileInfo).
+	if !opts.InMemory {
+		registryKey = canonicalPath
+		if fi, statErr := p.file.Stat(); statErr == nil {
+			if key, ok := fileIdentityKey(fi); ok {
+				registryKey = key
+			}
+		}
+		if _, loaded := openDBs.LoadOrStore(registryKey, true); loaded {
+			_ = p.close()
+			// Clear so the deferred cleanup does not delete the entry that the
+			// already-open handle owns.
+			registryKey = ""
+			return nil, ErrDatabaseOpen
+		}
+	}
+
 	// Reject databases created with an older schema format.
 	// Schema format 5 introduced unified leaf cell overflow (key+value as a
 	// single payload blob). Older formats stored key fully on-page and only
@@ -502,9 +560,10 @@ func Open(path string, opts Options) (*DB, error) {
 	}
 
 	db := &DB{
-		pager: p,
-		path:  path,
-		opts:  opts,
+		pager:       p,
+		path:        path,
+		registryKey: registryKey,
+		opts:        opts,
 		masterBT: &btree{
 			pager:    p,
 			rootPage: 1,
@@ -584,7 +643,7 @@ drained:
 	err := db.pager.close()
 	// Remove from open registry after full cleanup
 	if !db.opts.InMemory {
-		openDBs.Delete(db.path)
+		openDBs.Delete(db.registryKey)
 	}
 	return err
 }
@@ -597,7 +656,14 @@ func (db *DB) SetClosing() {
 }
 
 // Path returns the database file path.
+// For in-memory databases it returns the empty string, matching SQLite's
+// sqlite3BtreeGetFilename (btree.c:11302), which calls
+// sqlite3PagerFilename(pPager, /*nullIfMemDb=*/1) and returns "" (&zFake[4])
+// for memDb/TEMP databases (pager.c:7088).
 func (db *DB) Path() string {
+	if db.opts.InMemory {
+		return ""
+	}
 	return db.path
 }
 
@@ -609,10 +675,17 @@ func (db *DB) PageSize() uint32 {
 }
 
 // DatabaseSize returns the current number of pages in the database,
-// including page 1 (the header page). ~ sqlite3BtreeLastPage (btree.c).
-// Reads the atomic pager.dbSize directly; safe under any concurrent
-// transaction state because dbSize is monotonic within the current
-// WAL snapshot visible to the caller.
+// including page 1 (the header page). It reads the live, process-global
+// writer counter (atomic pager.dbSize) and provides NO read-snapshot
+// guarantee: unlike SQLite's sqlite3BtreeLastPage / sqlite3PagerPagecount
+// (btree.c:2371, pager.c:3925), which return the caller's per-connection
+// snapshot count, this value can be advanced by a concurrent writer at any
+// time. It is meaningful only when called inside the writer (where p.dbSize
+// is the writer's own live count) or when there are no concurrent writers.
+// Callers that need a count consistent with a read snapshot must use
+// ReadTx.DatabaseSize() instead, which returns the snapshot-faithful bound.
+// DB has no tx handle to derive a snapshot from, so this method intentionally
+// keeps the global-counter semantics.
 func (db *DB) DatabaseSize() uint32 {
 	return db.pager.dbSize.Load()
 }
@@ -732,12 +805,14 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 }
 
 // BeginRead starts a read-only transaction.
+// DRIFT: BeginReadFast skips page-1 counter read; staleness APIs return stale/false See docs/btree/NOTES.md#drift-45-beginreadfast-skips-page-1-staleness-counter-reads
 func (db *DB) BeginRead() (*ReadTx, error) {
 	return db.beginRead(true)
 }
 
 // BeginReadFast starts a read-only transaction without reading page-1 counters.
 // It preserves snapshot isolation for data access, but skips staleness metadata.
+// DRIFT: BeginReadFast skips page-1 counter read; staleness APIs return stale/false See docs/btree/NOTES.md#drift-45-beginreadfast-skips-page-1-staleness-counter-reads
 func (db *DB) BeginReadFast() (*ReadTx, error) {
 	return db.beginRead(false)
 }
@@ -894,6 +969,8 @@ func (db *DB) WriterCacheLen() int {
 
 // Checkpoint triggers a WAL checkpoint with the specified mode, writing
 // committed WAL frames back to the database file.
+// DRIFT: DB.Checkpoint omits SQLite's same-handle open-tx SQLITE_LOCKED guard See docs/btree/NOTES.md#drift-47-checkpoint-omits-open-transaction-guard
+// DRIFT: DB.Checkpoint drops pnLog/pnCkpt out-parameters See docs/btree/NOTES.md#drift-48-checkpoint-drops-frame-count-out-parameters
 func (db *DB) Checkpoint(mode CheckpointMode) error {
 	if db.closing.Load() {
 		return ErrClosed
@@ -984,9 +1061,40 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 	return nil
 }
 
-// freeTreePages recursively frees all pages in a B-tree,
-// including any overflow page chains attached to leaf cells.
+// maxTreeDepth bounds freeTreePages recursion. It is a conservative cap far
+// above any real B-tree height for this page size; exceeding it implies a
+// cyclic/self-referencing child pointer and is treated as corruption. This is
+// the practical stand-in for clearDatabasePage's pager-refcount guard
+// (btree.c:10233-10238), which any-store does not port verbatim (its single
+// writer goroutine has a different ref/pin model than SQLite's shared cache).
+const maxTreeDepth = 64
+
+// freeTreePages recursively frees all pages in a B-tree, including the root
+// and any overflow page chains attached to leaf cells. Its only caller is
+// DeleteNamespace, which also removes the namespace's master-table entry, so
+// this implements drop-table semantics (root reclaimed) matching SQLite's
+// sqlite3BtreeDropTable (btree.c:10331), not clear-table (root retained).
 func (db *DB) freeTreePages(pgno uint32) error {
+	return db.freeTreePagesDepth(pgno, 0)
+}
+
+// freeTreePagesDepth is the recursive worker for freeTreePages. The depth
+// parameter bounds recursion against a cyclic child pointer.
+func (db *DB) freeTreePagesDepth(pgno uint32, depth int) error {
+	// Up-front page-count guard, mirroring clearDatabasePage's
+	// `if(pgno>btreePagecount(pBt)) return SQLITE_CORRUPT_PGNO` (btree.c:10228).
+	// Catching an out-of-range child up front matches C and avoids touching a
+	// zero-filled buffer (getPageWriter zero-fills pages within dbSize).
+	if pgno == 0 || pgno > db.pager.dbSize.Load() {
+		return ErrCorrupt
+	}
+	// Bound recursion to prevent infinite recursion / stack overflow on a
+	// cyclic child pointer (stand-in for the C refcount guard at
+	// btree.c:10233-10238).
+	if depth > maxTreeDepth {
+		return ErrCorrupt
+	}
+
 	pg, err := db.pager.getPage(pgno)
 	if err != nil {
 		return err
@@ -994,20 +1102,55 @@ func (db *DB) freeTreePages(pgno uint32) error {
 
 	if pg.header.isInterior() {
 		// Collect child page numbers before freeing
+		usableSize := db.pager.usableSize()
 		n := int(pg.header.cellCount)
 		cpOff := pg.cellPointerOffset()
 		children := make([]uint32, 0, n+1)
+		var overflowHeads []uint32
 		for i := range n {
-			off := int(binary.BigEndian.Uint16(pg.data[cpOff+i*2:]))
+			// Bounds-check the interior child-pointer read: a corrupt 16-bit
+			// cell offset near page end must yield ErrCorrupt, not a panic in
+			// the writer goroutine (C equivalent: btreeInitPage validation via
+			// getAndInitPage, btree.c:10231).
+			off, oerr := pg.getCellOffsetSafe(i)
+			if oerr != nil {
+				db.pager.releasePage(pg)
+				return oerr
+			}
+			if int(off) < cpOff+(n*2) || int(off)+4 > len(pg.data) {
+				db.pager.releasePage(pg)
+				return ErrCorrupt
+			}
 			childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
 			children = append(children, childPgno)
+			// Free the overflow chain hanging off this interior divider cell.
+			// clearDatabasePage runs BTREE_CLEAR_CELL on EVERY cell including
+			// interior dividers (btree.c:10240-10248); the macro frees the
+			// cell's overflow chain whenever the payload spills off-page
+			// (btree.c:7056-7062). Collect the chain heads while the page is
+			// held; free them after releasing the page.
+			c, _, perr := parseInteriorCell(pg.data, int(off), usableSize)
+			if perr != nil {
+				db.pager.releasePage(pg)
+				return perr
+			}
+			if c.overflowPg != 0 {
+				overflowHeads = append(overflowHeads, c.overflowPg)
+			}
 		}
 		children = append(children, pg.header.rightChild)
 		db.pager.releasePage(pg)
 
+		// Free the divider-cell overflow chains collected above.
+		for _, ovfl := range overflowHeads {
+			if err := db.pager.freeOverflowChain(ovfl); err != nil {
+				return err
+			}
+		}
+
 		// Recurse into children first (free leaves before interior)
 		for _, child := range children {
-			if err := db.freeTreePages(child); err != nil {
+			if err := db.freeTreePagesDepth(child, depth+1); err != nil {
 				return err
 			}
 		}
@@ -1127,7 +1270,7 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 			return nil, serr
 		}
 		bt.pager.releasePage(pg)
-		pg, err = bt.getPage(childPgno)
+		pg, err = bt.descendChild(childPgno)
 		if err != nil {
 			return nil, err
 		}
@@ -1223,6 +1366,22 @@ func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 		return tx.pager.getPage(pgno)
 	}
 	return tx.pager.getPageReader(pgno, tx.walHdr.mxFrame, tx.cache)
+}
+
+// txDescendChild fetches a child page reached from an interior cell during a
+// cursor-free descent, after rejecting an out-of-range pgno as corruption.
+// ~ C's getAndInitPage upfront guard `if( pgno>btreePagecount(pBt) ) return
+// SQLITE_CORRUPT_BKPT` (btree.c:2396-2399). The pager getters keep zero-filling
+// above-bound pages (drift-4); this guard lives at the descent call site so a
+// wild or freed child pointer fails fast with ErrCorrupt instead of descending
+// into a fabricated zero page. The bound is the snapshot page count: the
+// writer's live p.dbSize (cache==nil) or the reader cache's frozen snapshot
+// bound, exactly as readerDbSizeBound resolves.
+func (tx *ReadTx) txDescendChild(childPgno uint32) (*page, error) {
+	if childPgno == 0 || childPgno > tx.pager.readerDbSizeBound(tx.cache) {
+		return nil, ErrCorrupt
+	}
+	return tx.txGetPage(childPgno)
 }
 
 // readOverflow reads overflow chain data using the correct isolation level.
@@ -1323,7 +1482,7 @@ func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, er
 			return buf, serr
 		}
 		tx.pager.releasePage(pg)
-		pg, err = tx.txGetPage(childPgno)
+		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
 			return buf, err
 		}
@@ -1371,7 +1530,7 @@ func (tx *ReadTx) Has(ns *Namespace, key []byte) (bool, error) {
 			return false, serr
 		}
 		tx.pager.releasePage(pg)
-		pg, err = tx.txGetPage(childPgno)
+		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
 			return false, err
 		}
@@ -1458,7 +1617,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 			fallbackIdx = cellIdx
 		}
 		tx.pager.releasePage(pg)
-		pg, err = tx.txGetPage(childPgno)
+		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
 			return buf, err
 		}
@@ -1468,6 +1627,7 @@ func (tx *ReadTx) AppendSeekKey(ns *Namespace, prefix []byte, buf []byte) ([]byt
 // leftmostKeyAfter navigates to the first key in the subtree immediately
 // following cell[cellIdx].leftChild on interior page interiorPgno.
 // Used when a leaf search overshoots and needs the next sibling's first key.
+// DRIFT: descent omits moveToChild's per-child nCell>=1 corruption guard See docs/btree/NOTES.md#drift-11-movetochild-child-page-ncell-greater-than-equal-one-descent-
 func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte) ([]byte, error) {
 	pg, err := tx.txGetPage(interiorPgno)
 	if err != nil {
@@ -1496,7 +1656,7 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 	// Descend to the leftmost key of this subtree.
 	usableSize := tx.pager.usableSize()
 	cache := tx.cache // nil for writers, per-connection pcache for readers
-	pg, err = tx.txGetPage(nextPgno)
+	pg, err = tx.txDescendChild(nextPgno)
 	if err != nil {
 		return buf, err
 	}
@@ -1536,7 +1696,7 @@ func (tx *ReadTx) leftmostKeyAfter(interiorPgno uint32, cellIdx int, buf []byte)
 		}
 		childPgno := binary.BigEndian.Uint32(pg.data[off : off+4])
 		tx.pager.releasePage(pg)
-		pg, err = tx.txGetPage(childPgno)
+		pg, err = tx.txDescendChild(childPgno)
 		if err != nil {
 			return buf, err
 		}
@@ -1559,6 +1719,23 @@ func (tx *ReadTx) Count(ns *Namespace) (int, error) {
 	}
 	bt := &btree{pager: tx.pager, cache: tx.cache, rootPage: ns.rootPage, walMaxFrame: tx.walHdr.mxFrame, writable: tx.writable}
 	return bt.Count()
+}
+
+// DatabaseSize returns the number of pages in the database, including page 1
+// (the header page), as of this transaction's snapshot.
+// ~ sqlite3BtreeLastPage / sqlite3PagerPagecount (btree.c:2371, pager.c:3925):
+// SQLite returns the per-connection pPager->dbSize, which is set from the
+// reader's captured WAL-index header (sqlite3WalDbsize == pWal->hdr.nPage,
+// pager.c:5448). Here it is the per-reader snapshot bound carried on the
+// reader cache (tx.cache.dbSize, set at BeginRead from effectiveReaderDbSize),
+// so the count is consistent with the same snapshot used for page reads —
+// not the live global writer counter that DB.DatabaseSize exposes.
+//
+// For a write transaction (embedded ReadTx, cache==nil), readerDbSizeBound
+// falls back to p.dbSize, which is the writer's live page count and matches
+// sqlite3BtreeLastPage's pBt->nPage for the writing connection.
+func (tx *ReadTx) DatabaseSize() uint32 {
+	return tx.pager.readerDbSizeBound(tx.cache)
 }
 
 // GetNamespace returns a Namespace handle for the given name.

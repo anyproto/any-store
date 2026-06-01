@@ -11,8 +11,13 @@ import (
 // loadDB creates a test database at path, writes 50 entries into namespace
 // "x", checkpoints to flush WAL into the main DB file, and closes. Used as
 // a setup for sweep tests.
+//
+// Calls resetPageBufferPool() so that running this in a suite alongside
+// other tests that opened with a different page size does not produce
+// ErrPageBufferPoolSizeMismatch on Open.
 func setupSweepDB(t *testing.T, path string, opts Options) {
 	t.Helper()
+	resetPageBufferPool()
 	db, err := Open(path, opts)
 	if err != nil {
 		t.Fatal(err)

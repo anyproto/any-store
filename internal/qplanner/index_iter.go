@@ -21,6 +21,19 @@ type IndexIter struct {
 	Reverse  bool
 	started  bool
 
+	// PointLookup mirrors CBOIndex.PointLookup: true iff every original bound
+	// was an equality (Start == End) before AdjustBoundsForNonUnique widened
+	// the End. CountEntries uses it to gate the single-field canonical-key
+	// probe — the probe is a valid multi-key detector only when the indexed
+	// value sits at byte position 0 of the key (single-field PointLookup).
+	PointLookup bool
+
+	// indexHasMultiKey caches the canonical-key probe result for the lifetime
+	// of this iterator (set lazily on the first CountEntries dispatch that
+	// needs it). Per-IndexIter; never shared across goroutines.
+	indexHasMultiKeyProbed bool
+	indexHasMultiKey       bool
+
 	// pendingCurrent is set by skipOffset after it positions the cursor
 	// directly on the first row to emit. When true, the next Next() call
 	// returns the entry at the current cursor position WITHOUT advancing
@@ -279,32 +292,130 @@ func (it *IndexIter) skipOffset(n int) (remaining int, err error) {
 	return n - skipped, nil
 }
 
+// arrayPrefix is the anyenc type tag for array-typed values. writeValues
+// emits a key with this leading byte exactly when a doc has an array-typed
+// value for an indexed field (the per-element keys of a nested array, and the
+// whole-value-as-tuple key of any multi-key doc). So a key with this prefix
+// exists in a single-field index iff that index has ever held a multi-key
+// (array) entry. See docs/specs/2026-05-28-i04-i05-fix-option-d-canonical-key-probe.md.
+var arrayPrefix = []byte{byte(anyenc.TypeArray)}
+
+// arrayPrefixInverted is the array tag for a REVERSE-flagged single-field index.
+// Such an index stores the whole-array key bitwise-inverted (index.go
+// writeValues), so its leading byte is ^TypeArray (0xF9) instead of 0x06.
+var arrayPrefixInverted = []byte{^byte(anyenc.TypeArray)}
+
+// arrayProbePrefix returns the leading byte the probe must seek to detect a
+// multi-key (array) entry: the inverted array tag for a reverse single-field
+// index, the plain array tag otherwise.
+func arrayProbePrefix(reverse bool) []byte {
+	if reverse {
+		return arrayPrefixInverted
+	}
+	return arrayPrefix
+}
+
+// indexProbeAnyMultiKey reports whether the index namespace has any entry whose
+// key begins with the array type tag — i.e. whether any indexed doc had an
+// array-typed value. It is a single btree Seek, snapshot-consistent with the
+// caller's read tx. fieldReverse selects the inverted array tag for a reverse
+// single-field index.
+//
+// PRECONDITION: only valid for single-field indexes. For a compound index the
+// array field's value is not at byte position 0 of the key, so its array tag
+// sits mid-key and the Seek would miss it (false negative). Callers must route
+// compound/non-PointLookup shapes elsewhere before probing.
+func indexProbeAnyMultiKey(cs *CursorSource, fieldReverse bool) (bool, error) {
+	c := cs.NewCursor()
+	defer c.Close()
+	prefix := arrayProbePrefix(fieldReverse)
+	if err := c.Seek(prefix); err != nil {
+		return false, err
+	}
+	if !c.Valid() {
+		return false, nil
+	}
+	k, err := c.Key()
+	if err != nil {
+		return false, err
+	}
+	return len(k) > 0 && k[0] == prefix[0], nil
+}
+
 // CountEntries counts distinct documents matching this index iterator's
-// bounds. Two strategies based on bound count:
+// bounds via a 4-branch dispatch:
 //
-//	len(Bounds) <= 1: use cursor.CountUntil — page-batch count without
-//	                  visiting individual cells. Within-doc dedup in
-//	                  insertKeys guarantees ≤1 entry per distinct value
-//	                  per doc, so the entry count equals the doc count.
-//	                  Fast: no per-entry walk, no value reads.
+//	Branch 1 (len(Bounds) <= 1): page-batch CountUntil. No cross-bound dedup
+//	  concern — within-doc dedup in insertKeys guarantees ≤1 entry per distinct
+//	  value per doc, so entry count == doc count. Fast: no per-entry walk.
 //
-//	len(Bounds) >  1: walk each entry, read the value byte, stream-count
-//	                  scalar entries, and dedup multi-key (or legacy)
-//	                  entries through a lazy seen-set. A doc with array
-//	                  [v1,v2] would otherwise be counted twice when
-//	                  $in:[v1,v2] crosses both bounds — the seen-set
-//	                  reduces it to one. The seen-set is allocated on
-//	                  the first multi-key entry and skipped entirely for
-//	                  fully-scalar streams.
+//	Branch 2 (compound / non-PointLookup): pooled seen-set, skip-scalar mode.
+//	  The canonical-key probe is only a valid multi-key detector for single-field
+//	  indexes (the array tag is at byte 0 only there), so any other shape skips
+//	  the probe and dedups by docId. Reading the per-entry value byte lets scalar
+//	  entries be counted without touching the map — a scalar compound index
+//	  queried on its prefix costs just the walk.
+//
+//	Branch 3 (single-field PointLookup, probe says no multi-key): page-batch
+//	  CountUntil summed across bounds. With no array-valued doc, every doc has
+//	  exactly one entry and matches at most one bound, so the sum is the
+//	  distinct-doc count — no dedup needed.
+//
+//	Branch 4 (single-field PointLookup, probe says multi-key): pooled seen-set,
+//	  blind mode (every entry interned). Such an index is array-dense, so the
+//	  value byte is not consulted. An array doc whose values straddle several
+//	  $in bounds is counted once.
+//
+// This is the I-05 fix: there is no peek-then-batch shortcut to misclassify a
+// scalar-first bound that also holds multi-key entries.
 func (it *IndexIter) CountEntries() (int, error) {
 	if it.cursor == nil {
 		it.cursor = it.Source.NewCursor()
 	}
 
+	// Branch 1.
 	if len(it.Bounds) <= 1 {
 		return it.countEntriesBatch()
 	}
-	return it.countEntriesWithDedup()
+
+	// Branch 2: the probe doesn't apply to compound / non-PointLookup shapes;
+	// skip-scalar mode counts scalar entries without deduping them.
+	if !it.PointLookup || len(it.IdxInfo.FieldNames) != 1 {
+		return it.countEntriesViaSeenSet(true)
+	}
+
+	// Branches 3 & 4: single-field PointLookup — the probe decides.
+	hasMultiKey, err := it.probeMultiKey()
+	if err != nil {
+		return 0, err
+	}
+	if !hasMultiKey {
+		return it.countEntriesBatch() // Branch 3
+	}
+	return it.countEntriesViaSeenSet(false) // Branch 4: blind dedup
+}
+
+// probeMultiKey runs the canonical-key probe lazily and caches the result for
+// this iterator. True iff the index holds a multi-key entry — a doc with an
+// array-typed value writes a canonical 0x06 whole-array key (writeValues has
+// done this since before the value-byte feature, so legacy multi-key data is
+// detected too). The caller must have established that this is a single-field
+// index (see indexProbeAnyMultiKey's precondition); CountEntries enforces that
+// by routing compound/non-PointLookup to the seen-set path (Branch 2) first.
+func (it *IndexIter) probeMultiKey() (bool, error) {
+	if it.indexHasMultiKeyProbed {
+		return it.indexHasMultiKey, nil
+	}
+	// CountEntries only reaches here for single-field indexes (it gates on
+	// len(FieldNames)==1), so Reverse[0] is the array field's direction.
+	fieldReverse := len(it.IdxInfo.Reverse) > 0 && it.IdxInfo.Reverse[0]
+	has, err := indexProbeAnyMultiKey(it.Source, fieldReverse)
+	if err != nil {
+		return false, err
+	}
+	it.indexHasMultiKey = has
+	it.indexHasMultiKeyProbed = true
+	return has, nil
 }
 
 // countEntriesBatch is the original page-batch fast path, used for
@@ -346,94 +457,9 @@ func (it *IndexIter) countEntriesBatch() (int, error) {
 	return total, nil
 }
 
-// countEntriesWithDedup walks each bound. If the bound's first entry is
-// scalar AND no multi-key entry has been seen across previous bounds,
-// the bound is counted via the page-batch fast path (cursor.CountUntil)
-// — same as the single-bound case. As soon as a multi-key (or legacy)
-// entry appears anywhere, we fall back to the per-entry walk for the
-// remainder of the iteration so docId-level dedup is applied.
-//
-// Rationale: in practice most indexes are entirely scalar OR entirely
-// multi-key for a given query (the field is either array-typed or not).
-// Mixed indexes are rare. The peek-then-batch shortcut means the common
-// scalar-only case pays only one extra value-read per bound (vs the
-// pure-batch path), recovering most of the alpha.2 SimpleIndex/In speed
-// while preserving correctness for multi-key.
-func (it *IndexIter) countEntriesWithDedup() (int, error) {
-	var seen map[string]struct{}
-	total := 0
-	stickyMulti := false // once any multi-key seen, never re-engage batch fast path
-
-	for _, b := range it.Bounds {
-		if err := it.seekBoundStart(b); err != nil {
-			return 0, err
-		}
-		if !it.cursor.Valid() {
-			continue
-		}
-
-		// Peek the first entry's value. If it's scalar AND we haven't yet
-		// seen a multi-key entry in this iteration, use batch counting:
-		// the within-doc dedup invariant still holds (each doc has ≤1
-		// entry per distinct value across the whole index, which means
-		// ≤1 entry in any value-range covered by a single bound).
-		if !stickyMulti {
-			val, verr := it.cursor.Value()
-			if verr != nil {
-				return 0, verr
-			}
-			if !EntryValueIsMultiKey(val) {
-				n, err := it.cursor.CountUntil(b.End, b.EndInclude)
-				if err != nil {
-					return 0, err
-				}
-				total += n
-				continue
-			}
-			stickyMulti = true
-		}
-
-		// Per-entry walk with seen-set dedup.
-		for it.cursor.Valid() {
-			k, kerr := it.cursor.Key()
-			if kerr != nil {
-				return 0, kerr
-			}
-			if len(b.End) > 0 {
-				cmp := bytes.Compare(k, b.End)
-				if cmp > 0 || (cmp == 0 && !b.EndInclude) {
-					break
-				}
-			}
-			val, verr := it.cursor.Value()
-			if verr != nil {
-				return 0, verr
-			}
-			if EntryValueIsMultiKey(val) {
-				if seen == nil {
-					seen = make(map[string]struct{}, 64)
-				}
-				docId := extractDocId(k, len(it.IdxInfo.FieldNames))
-				if _, dup := seen[string(docId)]; dup {
-					if err := it.cursor.Next(); err != nil {
-						return 0, err
-					}
-					continue
-				}
-				seen[string(docId)] = struct{}{}
-			}
-			total++
-			if err := it.cursor.Next(); err != nil {
-				return 0, err
-			}
-		}
-	}
-	return total, nil
-}
-
 // seekBoundStart positions the cursor at the first entry of the given
-// bound, accounting for StartInclude. Shared between
-// countEntriesWithDedup and the existing countEntriesBatch.
+// bound, accounting for StartInclude. Shared by countEntriesBatch and
+// countEntriesViaSeenSet.
 func (it *IndexIter) seekBoundStart(b query.Bound) error {
 	if len(b.Start) > 0 {
 		if err := it.cursor.Seek(b.Start); err != nil {

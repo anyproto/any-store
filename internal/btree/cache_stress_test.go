@@ -62,7 +62,7 @@ func TestCacheStressConcurrentReaderAndSpillingWriter(t *testing.T) {
 					return
 				}
 				rns, _ := rtx.GetNamespace("test")
-				
+
 				// Capture the current round's values (could be initial or some later round)
 				// We expect these values to stay consistent throughout this ReadTx.
 				getRound := func(v []byte) int {
@@ -102,7 +102,7 @@ func TestCacheStressConcurrentReaderAndSpillingWriter(t *testing.T) {
 						}
 						continue
 					}
-					
+
 					// Every key read in this transaction must belong to the same writer "round"
 					if getRound(val) != expectedRound {
 						if readErrors.Add(1) < 10 {
@@ -186,7 +186,7 @@ func TestCacheStressSavepointRollbackAndEviction(t *testing.T) {
 		require.NoError(t, wtx.Put(wns, []byte(fmt.Sprintf("k%d", i)), []byte("new")))
 	}
 	// At this point many pages are spilled to WAL and marked clean in pcache.
-	
+
 	// 3. Simulate reader polluting pcache with "clean" versions of those pages
 	for i := 1; i <= 10; i++ {
 		pg, err := db.pager.getPageWriter(uint32(i), wtx.walMaxFrame)
@@ -232,7 +232,7 @@ func TestCacheStressOverflowChains(t *testing.T) {
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
-	
+
 	// Reader constantly reading the overflow chain
 	wg.Add(1)
 	go func() {

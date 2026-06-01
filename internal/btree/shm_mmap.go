@@ -45,11 +45,25 @@ const shmDMSOffset = 120 + int64(lockSlotCount) // right after the per-slot lock
 // state. The in-process layer provides correct intra-process lock semantics,
 // while fcntl provides inter-process coordination.
 type mmapShm struct {
-	mu      sync.Mutex
-	file    fileHandle
-	path    string
-	regions [][]byte // mmap'd regions
-	locks   [lockSlotCount]int // in-process lock state: 0=unlocked, >0=shared count, -1=exclusive
+	mu       sync.Mutex
+	file     fileHandle
+	path     string
+	regions  [][]byte           // mmap'd regions (each exactly shmRegionSize bytes)
+	baseMaps [][]byte           // underlying mmap'd backing maps, keyed by group-base region index; entries are nil except at group bases. close() munmaps these (one per real mmap), never the sub-region slices in regions.
+	locks    [lockSlotCount]int // in-process lock state: 0=unlocked, >0=shared count, -1=exclusive
+}
+
+// shmRegionsPerMap mirrors SQLite's unixShmRegionPerMap() (os_unix.c:4797-4803).
+// Each mmap must cover an integer multiple of the OS page size. When the page
+// size is >= shmRegionSize (e.g. 64KB pages), a single mapping must span
+// multiple shm regions so that every mmap offset stays page-aligned.
+// On 4KB/16KB-page systems this returns 1, keeping behavior byte-identical.
+func shmRegionsPerMap() int {
+	pg := os.Getpagesize()
+	if pg < shmRegionSize {
+		return 1
+	}
+	return pg / shmRegionSize
 }
 
 // newPlatformShm creates a new mmap-backed shm and acquires a shared DMS
@@ -71,9 +85,10 @@ func newPlatformShm(path string) (shm, error) {
 		return nil, fmt.Errorf("btree: open shm file: %w", err)
 	}
 	s := &mmapShm{
-		file:    f,
-		path:    path,
-		regions: make([][]byte, 0, shmMaxRegions),
+		file:     f,
+		path:     path,
+		regions:  make([][]byte, 0, shmMaxRegions),
+		baseMaps: make([][]byte, 0, shmMaxRegions),
 	}
 	if err := s.fcntlLock(syscall.F_RDLCK, shmDMSOffset); err != nil {
 		_ = f.Close()
@@ -110,32 +125,67 @@ func (s *mmapShm) region(index int, create bool) ([]byte, error) {
 		return nil, fmt.Errorf("btree: shm region %d not available", index)
 	}
 
-	// Extend the file if needed.
-	requiredSize := int64((index + 1) * shmRegionSize)
+	// On systems whose page size is >= shmRegionSize, a single mmap must span
+	// multiple shm regions to keep the mmap offset page-aligned. Map the whole
+	// page-aligned group containing `index` at once and slice it into the
+	// per-region 32KB windows, mirroring SQLite's unixShmRegionPerMap grouping
+	// (os_unix.c:5202-5224). On 4KB/16KB pages regionsPerMap==1, so this is a
+	// single 32KB mapping at offset index*32KB (unchanged behavior).
+	regionsPerMap := shmRegionsPerMap()
+	base := (index / regionsPerMap) * regionsPerMap
+	nMap := regionsPerMap * shmRegionSize
+	offset := int64(base) * int64(shmRegionSize) // always a multiple of os.Getpagesize()
+
+	// Extend the file to back the whole group before mapping.
+	requiredSize := int64(base+regionsPerMap) * int64(shmRegionSize)
 	info, err := s.file.Stat()
 	if err != nil {
 		return nil, err
 	}
 	if info.Size() < requiredSize {
+		oldSize := info.Size()
 		if err := s.file.Truncate(requiredSize); err != nil {
 			return nil, fmt.Errorf("btree: extend shm file: %w", err)
 		}
+		// Pre-touch each newly allocated page by writing a single byte to its
+		// last byte. Technically only the final page must be written to grow the
+		// file, but writing to all new pages forces the OS to allocate them
+		// immediately, which reduces the chances of SIGBUS while accessing the
+		// mapped region later on. Mirrors SQLite's unixShmMap bExtend loop
+		// (os_unix.c:5180-5187), using a fixed 4096 page size (shmPageSize) to
+		// match C's `static const int pgsz = 4096;`. requiredSize is a multiple
+		// of shmRegionSize (32768), hence of 4096, so the loop covers full pages
+		// (matches C assert `(nByte % pgsz)==0`, os_unix.c:5179).
+		var oneByte [1]byte
+		for iPg := oldSize / shmPageSize; iPg < requiredSize/shmPageSize; iPg++ {
+			if _, err := s.file.WriteAt(oneByte[:], iPg*shmPageSize+shmPageSize-1); err != nil {
+				return nil, fmt.Errorf("btree: pre-touch shm page: %w", err)
+			}
+		}
 	}
 
-	// mmap the region.
-	offset := int64(index) * int64(shmRegionSize)
-	data, err := sysMmap(int(s.file.Fd()), offset, shmRegionSize,
+	// Map the whole group once.
+	data, err := sysMmap(int(s.file.Fd()), offset, nMap,
 		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 	if err != nil {
 		return nil, fmt.Errorf("btree: mmap shm region %d: %w", index, err)
 	}
 
-	// Grow the regions slice if needed.
-	for len(s.regions) <= index {
+	// Grow the slices to cover the whole group.
+	for len(s.regions) <= base+regionsPerMap-1 {
 		s.regions = append(s.regions, nil)
+		s.baseMaps = append(s.baseMaps, nil)
 	}
-	s.regions[index] = data
-	return data, nil
+
+	// Slice the single mapping into regionsPerMap per-region 32KB windows,
+	// matching C's apRegion[nRegion+i] = &pMem[szRegion*i] (os_unix.c:5223-5224).
+	// Record the full backing map at the group base so close() munmaps it once.
+	s.baseMaps[base] = data
+	for i := 0; i < regionsPerMap; i++ {
+		s.regions[base+i] = data[i*shmRegionSize : (i+1)*shmRegionSize : (i+1)*shmRegionSize]
+	}
+
+	return s.regions[index], nil
 }
 
 // lock acquires a lock on the given slot. It first checks the in-process lock
@@ -144,6 +194,7 @@ func (s *mmapShm) region(index int, create bool) ([]byte, error) {
 //
 // This matches SQLite's unixShmLock() (os_unix.c) which checks the
 // unixInodeInfo.aLock[] counters before calling fcntl.
+// DRIFT: in-process/mmap shm collapse per-conn masks to one refcount; repeat shared not no-op See docs/btree/NOTES.md#drift-81-in-process-shm-lock-collapses-per-connection-masks-to-single
 func (s *mmapShm) lock(slot int, lockType int) error {
 	if slot < 0 || slot >= lockSlotCount {
 		return fmt.Errorf("btree: invalid lock slot %d", slot)
@@ -251,7 +302,15 @@ func (s *mmapShm) fcntlLock(lockType int, offset int64) error {
 		uintptr(syscall.F_SETLK),
 		uintptr(unsafe.Pointer(&flock)))
 	if errno != 0 {
-		if errno == syscall.EACCES || errno == syscall.EAGAIN {
+		// Mirror sqliteErrorFromPosixError (os_unix.c:1029-1038): the documented
+		// set of transient/NFS-retry errnos that SQLite collapses to SQLITE_BUSY
+		// so the WAL busy-handler loop retries instead of aborting. EPERM is
+		// intentionally excluded (SQLite maps it to SQLITE_PERM), and genuine
+		// hard errors (EBADF/EFAULT) keep returning the wrapped error to surface
+		// closed-fd bugs.
+		switch errno {
+		case syscall.EACCES, syscall.EAGAIN, syscall.ETIMEDOUT,
+			syscall.EBUSY, syscall.EINTR, syscall.ENOLCK:
 			return ErrBusy
 		}
 		return fmt.Errorf("btree: fcntl lock: %w", errno)
@@ -263,11 +322,18 @@ func (s *mmapShm) close(isLastClient bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for i, region := range s.regions {
-		if region != nil {
-			_ = sysMunmap(region)
-			s.regions[i] = nil
+	// munmap each real backing mapping exactly once. Sub-region slices in
+	// s.regions share a backing map (see region()); munmapping a sub-slice
+	// rather than the full mapping would be incorrect, so we munmap the
+	// group-base maps tracked in s.baseMaps instead.
+	for i, m := range s.baseMaps {
+		if m != nil {
+			_ = sysMunmap(m)
+			s.baseMaps[i] = nil
 		}
+	}
+	for i := range s.regions {
+		s.regions[i] = nil
 	}
 
 	// Unlink the shm file iff the caller (pager.close) tells us we are the

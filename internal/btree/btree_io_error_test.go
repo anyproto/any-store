@@ -917,6 +917,71 @@ func TestIO_ReadOverflowChain_OutOfBoundsPage(t *testing.T) {
 	db.Close()
 }
 
+// TestIO_ReadOverflowChain_PrematureTerminator verifies that an overflow chain
+// whose next-page pointer becomes 0 before all requested bytes are transferred
+// is reported as corruption rather than silently zero-filling the missing tail.
+// Mirrors C accessPayload's post-loop completeness check (btree.c:5327-5330:
+// `if( rc==SQLITE_OK && amt>0 ) return SQLITE_CORRUPT_PAGE(pPage)`).
+func TestIO_ReadOverflowChain_PrematureTerminator(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	db, err := testOpen(t, path, Options{PageSize: 4096})
+	require.NoError(t, err)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("t1")
+	require.NoError(t, err)
+
+	// 8000 bytes on 4096-byte pages spans several overflow pages, so zeroing
+	// the first overflow page's next pointer truncates the chain mid-stream.
+	bigVal := make([]byte, 8000)
+	require.NoError(t, tx.Put(ns, []byte("k1"), bigVal))
+	require.NoError(t, tx.Commit())
+
+	tx, err = db.BeginWrite()
+	require.NoError(t, err)
+	ns, err = tx.GetNamespace("t1")
+	require.NoError(t, err)
+
+	bt := &btree{pager: db.pager, rootPage: ns.rootPage, walMaxFrame: tx.walMaxFrame, writable: true}
+	pg, gpErr := bt.getPage(ns.rootPage)
+	if gpErr != nil {
+		require.NoError(t, tx.Rollback())
+		db.Close()
+		return
+	}
+
+	usableSize := bt.usablePageSize()
+	corrupted := false
+	n := int(pg.header.cellCount)
+	for i := 0; i < n; i++ {
+		off := pg.getCellOffset(i)
+		cell, _, cerr := parseLeafCellWithSize(pg.data, int(off), usableSize)
+		if cerr == nil && cell.overflowPg != 0 {
+			ovfPg, ovfErr := db.pager.getWritablePage(cell.overflowPg)
+			if ovfErr == nil {
+				// Terminate the chain prematurely: zero the next-page pointer
+				// while payload bytes still remain to be read.
+				binary.BigEndian.PutUint32(ovfPg.data[0:4], 0)
+				db.pager.releasePage(ovfPg)
+				corrupted = true
+			}
+			break
+		}
+	}
+	bt.pager.releasePage(pg)
+	require.True(t, corrupted, "expected to corrupt the first overflow page's next pointer")
+
+	// Read must surface corruption rather than returning a zero-padded value.
+	_, err = tx.Get(ns, []byte("k1"))
+	require.Error(t, err, "premature overflow chain termination must be reported as corruption")
+
+	require.NoError(t, tx.Rollback())
+	db.Close()
+}
+
 // --- wal.go L647: readHeader short region ---
 // This tests the WAL index header validation with a short SHM region.
 
