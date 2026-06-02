@@ -66,6 +66,11 @@ type DB interface {
 	// Returns a WriteTx or an error if there is an issue starting the transaction.
 	WriteTx(ctx context.Context) (WriteTx, error)
 
+	// StalledConnections returns the acquire-site stack traces of connections
+	// that have been held longer than threshold. Returns nil unless
+	// StalledConnectionsDetectorEnabled was set in Config.
+	StalledConnections(threshold time.Duration) []string
+
 	// Close closes the database connection.
 	// Returns an error if there is an issue closing the connection.
 	Close() error
@@ -115,14 +120,15 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 
 	var err error
 	conf := driver.Config{
-		Pragma:                    config.pragma(),
-		ReadCount:                 config.ReadConnections,
-		PreAllocatedPageCacheSize: config.SQLiteGlobalPageCachePreallocateSizeBytes,
-		SortRegistry:              ds.sortReg,
-		FilterRegistry:            ds.filterReg,
-		Version:                   2,
-		ReadConnTTL:               time.Minute,
-		WriteObservers:            []driver.WriteObserver{ds.recoveryController.OnWriteEvent},
+		Pragma:                     config.pragma(),
+		ReadCount:                  config.ReadConnections,
+		PreAllocatedPageCacheSize:  config.SQLiteGlobalPageCachePreallocateSizeBytes,
+		SortRegistry:               ds.sortReg,
+		FilterRegistry:             ds.filterReg,
+		Version:                    2,
+		ReadConnTTL:                time.Minute,
+		StalledConnDetectorEnabled: config.StalledConnectionsDetectorEnabled,
+		WriteObservers:             []driver.WriteObserver{ds.recoveryController.OnWriteEvent},
 	}
 
 	if ds.cm, err = driver.NewConnManager(path, conf); err != nil {
@@ -598,6 +604,13 @@ func (db *db) createRecoveryController(ctx context.Context, path string) (*durab
 	}
 
 	return controller, dirty
+}
+
+func (db *db) StalledConnections(threshold time.Duration) []string {
+	if db.cm == nil {
+		return nil
+	}
+	return db.cm.StalledConnections(threshold)
 }
 
 func (db *db) Flush(ctx context.Context, waitIdleTime time.Duration, mode FlushMode) error {

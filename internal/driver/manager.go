@@ -32,6 +32,10 @@ type Config struct {
 	Version                   int
 	ReadConnTTL               time.Duration
 
+	// StalledConnDetectorEnabled turns on capture of acquire-site stack traces
+	// for every connection acquisition. Required for ConnManager.StalledConnections.
+	StalledConnDetectorEnabled bool
+
 	// WriteObservers will be called synchronously on acquire and release of the write connection
 	WriteObservers []WriteObserver
 }
@@ -68,17 +72,19 @@ func NewConnManager(path string, conf Config) (*ConnManager, error) {
 	var readConn = make([]*Conn, 0, conf.ReadCount)
 
 	cm := &ConnManager{
-		readCh:         make(chan *Conn),
-		readConnLimit:  conf.ReadCount,
-		readConn:       readConn,
-		readConnTTL:    conf.ReadConnTTL,
-		writeCh:        make(chan *Conn, 1),
-		closed:         make(chan struct{}),
-		sortRegistry:   conf.SortRegistry,
-		filterRegistry: conf.FilterRegistry,
-		path:           path,
-		pragma:         conf.Pragma,
-		observers:      conf.WriteObservers,
+		readCh:                     make(chan *Conn),
+		readConnLimit:              conf.ReadCount,
+		readConn:                   readConn,
+		readConnTTL:                conf.ReadConnTTL,
+		writeCh:                    make(chan *Conn, 1),
+		closed:                     make(chan struct{}),
+		sortRegistry:               conf.SortRegistry,
+		filterRegistry:             conf.FilterRegistry,
+		path:                       path,
+		pragma:                     conf.Pragma,
+		observers:                  conf.WriteObservers,
+		stalledConnDetectorEnabled: conf.StalledConnDetectorEnabled,
+		stalledConnStackTraces:     map[uintptr][]uintptr{},
 	}
 
 	// open write connection

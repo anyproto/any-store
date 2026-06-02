@@ -130,6 +130,62 @@ func TestDb_Backup(t *testing.T) {
 	assertCollCount(t, coll2, 2)
 }
 
+func TestDb_StalledConnections(t *testing.T) {
+	t.Run("enabled write tx", func(t *testing.T) {
+		fx := newFixture(t, &Config{StalledConnectionsDetectorEnabled: true})
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		defer func() { _ = tx.Rollback() }()
+
+		traces := fx.StalledConnections(0)
+		require.NotEmpty(t, traces)
+		joined := strings.Join(traces, "\n")
+		assert.Contains(t, joined, "newWriteTx")
+	})
+	t.Run("enabled read tx", func(t *testing.T) {
+		fx := newFixture(t, &Config{StalledConnectionsDetectorEnabled: true})
+
+		tx, err := fx.ReadTx(ctx)
+		require.NoError(t, err)
+		defer func() { _ = tx.Commit() }()
+
+		traces := fx.StalledConnections(0)
+		require.NotEmpty(t, traces)
+		assert.Contains(t, strings.Join(traces, "\n"), "ReadTx")
+	})
+	t.Run("threshold filters short-lived connections", func(t *testing.T) {
+		fx := newFixture(t, &Config{StalledConnectionsDetectorEnabled: true})
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		defer func() { _ = tx.Rollback() }()
+
+		// Stack timestamp is recorded as Unix seconds, so anything > 1s is
+		// guaranteed to filter out a freshly-acquired connection.
+		assert.Nil(t, fx.StalledConnections(time.Hour))
+	})
+	t.Run("released connections drop out", func(t *testing.T) {
+		fx := newFixture(t, &Config{StalledConnectionsDetectorEnabled: true})
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NotEmpty(t, fx.StalledConnections(0))
+
+		require.NoError(t, tx.Commit())
+		assert.Empty(t, fx.StalledConnections(0))
+	})
+	t.Run("disabled returns nil", func(t *testing.T) {
+		fx := newFixture(t)
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		defer func() { _ = tx.Rollback() }()
+
+		assert.Nil(t, fx.StalledConnections(0))
+	})
+}
+
 func TestDb_Close(t *testing.T) {
 	t.Run("race", func(t *testing.T) {
 		fx := newFixture(t, &Config{ReadConnections: 2})
