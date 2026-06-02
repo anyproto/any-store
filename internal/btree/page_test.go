@@ -138,6 +138,67 @@ func TestDBHeaderNotSQLiteCompatible(t *testing.T) {
 	assert.NotEqual(t, "SQLite format 3\000", dbMagic)
 }
 
+// TestDBHeaderRejectsGenuineSQLiteMagic pins the assumed invariant that the
+// "index-only B-trees" by-design drift relies on (docs/btree/NOTES.md
+// #old-drift-not-implemented-by-design, "Integer-key (table) B-trees" line).
+//
+// Drift, by design and confirmed: any-store never *produces* table pages, but
+// its readers isLeaf/isInterior (page.go:303-310) ACCEPT the table-page type
+// bytes 5 (pageTypeIntTbl) and 13 (pageTypeLeafTbl) exactly like SQLite's
+// decodeFlags. So if a genuine SQLite file — which legitimately stores table
+// B-tree pages tagged 5/13 with rowid/table cell layout — were ever opened by
+// any-store, those pages would be traversed with INDEX-cell layout, silently
+// misparsing payloads. any-store has no decodeFlags-equivalent load-time
+// page-type whitelist; the *only* thing that makes this case unreachable for
+// real SQLite files is that dbHeader.deserialize (page.go:239) rejects them at
+// header parse, before any page is ever loaded, because the 15-byte magic
+// prefix differs ("BTree format 1\000" vs SQLite's "SQLite format 3\000",
+// NOTES.md:253). That rejection is an *assumed* invariant, not an explicit
+// whitelist — so we pin it here. A refactor that widens/weakens the magic
+// comparison (e.g. accepts SQLite's magic, or compares too few bytes) would
+// re-open the 5/13 table-page misparse path and must fail this test loudly.
+func TestDBHeaderRejectsGenuineSQLiteMagic(t *testing.T) {
+	const sqliteMagic = "SQLite format 3\x00" // 16 bytes, the genuine SQLite header magic
+
+	// Guard: the two formats' 15-byte magic prefixes (the bytes deserialize
+	// actually compares) must differ. If a refactor ever made them coincide,
+	// the behavioral rejection below could not hold.
+	require.NotEqual(t, sqliteMagic[:15], dbMagic[:15],
+		"magic prefixes coincide: a genuine SQLite file (with 5/13 table pages) could be opened and traversed with index-cell layout")
+
+	// Build a header that is byte-for-byte acceptable to deserialize EXCEPT for
+	// its magic: start from a valid any-store header (valid page size, valid
+	// 64/32/32 payload fractions, etc.), then overwrite only the 16 magic bytes
+	// with SQLite's magic. This isolates the magic check as the sole cause of
+	// rejection — proving the defense is the magic gate, not some incidental
+	// downstream validation.
+	base := dbHeader{PageSize: 4096, WriteVersion: 2, ReadVersion: 2, DatabaseSize: 1}
+	buf := make([]byte, dbHeaderSize)
+	base.serialize(buf)
+
+	// Sanity: untouched, the header deserializes cleanly (so any rejection below
+	// is attributable to the magic alone).
+	var sane dbHeader
+	require.NoError(t, sane.deserialize(buf))
+
+	copy(buf[0:16], sqliteMagic)
+
+	// THE PINNED INVARIANT: a genuine-SQLite-magic header is rejected at parse,
+	// before any page (and thus any 5/13 table page) can be loaded.
+	var h dbHeader
+	assert.ErrorIs(t, h.deserialize(buf), ErrCorrupt,
+		"deserialize must reject a genuine SQLite header so real SQLite table pages (type 5/13) never reach the index-only readers")
+
+	// Positive control: restoring only the magic to any-store's value makes the
+	// very same buffer deserialize cleanly. This proves the magic bytes are the
+	// gate (the test fails for the right reason, not because of unrelated bytes).
+	copy(buf[0:16], dbMagic)
+	buf[15] = 0 // dbMagic is 15 bytes; ensure byte 15 (null terminator) is zero
+	var h2 dbHeader
+	assert.NoError(t, h2.deserialize(buf),
+		"buffer differing from a valid header only in the magic must parse once the any-store magic is restored")
+}
+
 func TestDBHeaderSaltRoundTrip(t *testing.T) {
 	h := dbHeader{
 		PageSize:     4096,
