@@ -117,6 +117,95 @@ func TestOpen_OldSchemaFormat(t *testing.T) {
 	assert.ErrorIs(t, err, ErrOldFormat)
 }
 
+// readOnDiskSchemaFormat reads the 4-byte big-endian schema-format field at
+// header offset 44 of page 1 directly from the file on disk.
+func readOnDiskSchemaFormat(t *testing.T, path string) uint32 {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(data), 48, "file shorter than db header")
+	return binary.BigEndian.Uint32(data[44:48])
+}
+
+// TestSchemaFormat_Drift_WriteAndGate is a regression test pinning the
+// by-design drift documented at docs/btree/NOTES.md#old-drift-schema-format-5-custom-not-sqlite-fmt4:
+// Go's on-disk "schema format" (header offset 44, the SQLite BTREE_FILE_FORMAT
+// slot) is a Go-specific version number whose meaning diverges from SQLite's.
+// Two distinct invariants the v5 unified key||value cell parser depends on:
+//
+//  1. WRITER: a freshly created DB must persist SchemaFormat == 5. v5 is the
+//     unified-payload cell format; if pager.initNewDB ever wrote a different
+//     value, readers would mis-parse cells (or reject their own files).
+//  2. READER GATE (db.go:550-552): a file whose format byte is in 1..4 (a
+//     genuine SQLite-era / hand-edited old format) must be rejected with
+//     ErrOldFormat, because the v5 parser mis-reads single-payload-varint
+//     index-leaf cells (and historically panicked on large keys). The unset
+//     value 0 is intentionally allowed through (mirrors SQLite normalize-0-to-1),
+//     and the current value 5 must continue to open.
+func TestSchemaFormat_Drift_WriteAndGate(t *testing.T) {
+	// --- Invariant 1: production WRITES SchemaFormat == 5 on disk ---
+	// Open a REAL new DB through the normal Open/initNewDB path (we do NOT
+	// write the header byte ourselves), persist it to the main file via a
+	// full checkpoint, then read offset 44 back from disk and assert it is 5.
+	// This fails if pager.initNewDB is changed to write any other value.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fresh.db")
+
+	db, err := testOpen(t, path, DefaultOptions())
+	require.NoError(t, err)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace("ns")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+	require.NoError(t, db.Close())
+
+	require.Equal(t, uint32(5), readOnDiskSchemaFormat(t, path),
+		"a freshly created DB must persist SchemaFormat==5 at header offset 44; "+
+			"see docs/btree/NOTES.md#old-drift-schema-format-5-custom-not-sqlite-fmt4")
+
+	// Snapshot the valid on-disk bytes so we can flip just the format field.
+	good, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	// setFormat rewrites the file with the format field set to f and returns
+	// the resulting path (a fresh copy so cases never contaminate each other).
+	setFormat := func(t *testing.T, f uint32) string {
+		t.Helper()
+		buf := make([]byte, len(good))
+		copy(buf, good)
+		binary.BigEndian.PutUint32(buf[44:48], f)
+		p := filepath.Join(t.TempDir(), "edited.db")
+		require.NoError(t, os.WriteFile(p, buf, 0o644))
+		return p
+	}
+
+	// --- Invariant 2: READER GATE rejects genuine old formats 1..4 ---
+	// Each of these must fail with ErrOldFormat. If the db.go:550 `< 5` check
+	// is removed/weakened, these open successfully and the assertion fails.
+	for _, f := range []uint32{1, 2, 3, 4} {
+		t.Run(fmt.Sprintf("reject_old_format_%d", f), func(t *testing.T) {
+			_, err := testOpen(t, setFormat(t, f), DefaultOptions())
+			assert.ErrorIs(t, err, ErrOldFormat,
+				"format %d must be rejected as an unsupported old format", f)
+		})
+	}
+
+	// --- Invariant 3: 0 (unset) and 5 (current) must OPEN ---
+	// 0 is intentionally allowed by the `!= 0` guard (SQLite normalize-0-to-1);
+	// 5 is the current format. If the guard regresses (e.g. drops the `!= 0`
+	// special-case so 0 is treated as <5), the format-0 case fails.
+	for _, f := range []uint32{0, 5} {
+		t.Run(fmt.Sprintf("accept_format_%d", f), func(t *testing.T) {
+			db, err := testOpen(t, setFormat(t, f), DefaultOptions())
+			require.NoError(t, err,
+				"format %d must open (0=unset/allowed, 5=current)", f)
+			require.NoError(t, db.Close())
+		})
+	}
+}
+
 func TestOpen_InvalidPath(t *testing.T) {
 	// Try opening a db at a non-existent directory
 	_, err := testOpen(t, "/nonexistent/path/to/db.file", DefaultOptions())
