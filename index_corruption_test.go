@@ -49,7 +49,7 @@ func TestIndex_Corruption_StaleIndexEntry(t *testing.T) {
 	assertCollCount(t, coll, 10)
 
 	c := coll.(*collection)
-	idx := c.indexes[0]
+	idx := c.loadIndexes()[0]
 	assertIndexLen(t, idx, 10)
 
 	// Directly delete doc id=5 from the data namespace, bypassing index cleanup.
@@ -104,7 +104,7 @@ func TestIndex_Corruption_MissingIndexEntry(t *testing.T) {
 	}
 
 	c := coll.(*collection)
-	idx := c.indexes[0]
+	idx := c.loadIndexes()[0]
 	assertIndexLen(t, idx, 10)
 
 	// Directly delete the index entry for doc id=7 (a=70).
@@ -159,7 +159,7 @@ func TestIndex_Corruption_UniqueIndexWrongDocId(t *testing.T) {
 	))
 
 	c := coll.(*collection)
-	idx := c.indexes[0]
+	idx := c.loadIndexes()[0]
 	assertIndexLen(t, idx, 3)
 
 	// For unique index: key = Tuple(a_value), value = docId
@@ -208,7 +208,7 @@ func TestIndex_Corruption_ExtraIndexEntries(t *testing.T) {
 	}
 
 	c := coll.(*collection)
-	idx := c.indexes[0]
+	idx := c.loadIndexes()[0]
 	assertIndexLen(t, idx, 5)
 
 	// Insert 3 extra spurious entries into the index namespace
@@ -255,7 +255,7 @@ func TestIndex_Corruption_CountMismatch(t *testing.T) {
 	}
 
 	c := coll.(*collection)
-	idx := c.indexes[0]
+	idx := c.loadIndexes()[0]
 	assertCollCount(t, coll, 20)
 	assertIndexLen(t, idx, 20)
 
@@ -300,7 +300,7 @@ func TestIndex_Corruption_EnsureIndexRecoversMissingEntries(t *testing.T) {
 	}
 
 	c := coll.(*collection)
-	idx := c.indexes[0]
+	idx := c.loadIndexes()[0]
 	assertIndexLen(t, idx, 5)
 
 	// Delete index entries for "bob" and "dave" directly
@@ -353,7 +353,7 @@ func TestIndex_Corruption_EnsureIndexRecoversStaleEntries(t *testing.T) {
 	}
 
 	c := coll.(*collection)
-	idx := c.indexes[0]
+	idx := c.loadIndexes()[0]
 
 	// Delete docs 3 and 6 from data only
 	for _, docId := range []int{3, 6} {
@@ -411,7 +411,7 @@ func TestIndex_Corruption_CompoundIndexMissingEntry(t *testing.T) {
 	}
 
 	c := coll.(*collection)
-	idx := c.indexes[0]
+	idx := c.loadIndexes()[0]
 	assertIndexLen(t, idx, 10)
 
 	// Delete compound index entry for doc id=4 (a=1, b=4)
@@ -460,7 +460,7 @@ func TestIndex_Corruption_UniqueIndexDuplicateEntries(t *testing.T) {
 	))
 
 	c := coll.(*collection)
-	idx := c.indexes[0]
+	idx := c.loadIndexes()[0]
 	assertIndexLen(t, idx, 2)
 
 	// Corrupt: overwrite the unique index entry for "bob@test.com" to point to doc id=1
@@ -513,8 +513,8 @@ func TestIndex_Corruption_MultipleIndexesCorrupted(t *testing.T) {
 	}
 
 	c := coll.(*collection)
-	idxA := c.indexes[0]
-	idxB := c.indexes[1]
+	idxA := c.loadIndexes()[0]
+	idxB := c.loadIndexes()[1]
 	assertIndexLen(t, idxA, 15)
 	assertIndexLen(t, idxB, 15)
 
@@ -587,7 +587,7 @@ func TestIndex_Corruption_SparseIndexExtraEntries(t *testing.T) {
 	))
 
 	c := coll.(*collection)
-	idx := c.indexes[0]
+	idx := c.loadIndexes()[0]
 	assertIndexLen(t, idx, 2) // only docs 1 and 3
 
 	// Corrupt: add fake entries for docs 2 and 4 (which don't have "a")
@@ -677,7 +677,7 @@ func TestIndex_Corruption_DeleteAfterExtraEntries(t *testing.T) {
 	}
 
 	c := coll.(*collection)
-	idx := c.indexes[0]
+	idx := c.loadIndexes()[0]
 
 	// Add fake entries
 	err = c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
@@ -722,7 +722,7 @@ func TestIndex_Corruption_LargeScaleRecovery(t *testing.T) {
 	}
 
 	c := coll.(*collection)
-	idx := c.indexes[0]
+	idx := c.loadIndexes()[0]
 	assertIndexLen(t, idx, 200)
 
 	// Delete 50 docs from data only (bypass index)
@@ -777,7 +777,7 @@ func TestIndex_Corruption_ArrayIndexMissingEntries(t *testing.T) {
 	))
 
 	c := coll.(*collection)
-	idx := c.indexes[0]
+	idx := c.loadIndexes()[0]
 	// Each doc: 2 elements + 1 array-as-value = 3 entries, total 6
 	assertIndexLen(t, idx, 6)
 
@@ -824,7 +824,7 @@ func TestIndex_Corruption_IndexNamespaceCleared(t *testing.T) {
 	}
 
 	c := coll.(*collection)
-	idx := c.indexes[0]
+	idx := c.loadIndexes()[0]
 	assertIndexLen(t, idx, 10)
 
 	// Clear all entries from the index namespace
@@ -889,7 +889,7 @@ func TestIndex_Corruption_UpdateWithMissingIndexEntry(t *testing.T) {
 	))
 
 	c := coll.(*collection)
-	idx := c.indexes[0]
+	idx := c.loadIndexes()[0]
 
 	// Delete index entry for doc 1 (a=10)
 	idxKey := anyenc.Tuple(nil)
@@ -1707,7 +1707,7 @@ func findIndex(t *testing.T, coll Collection, indexName string) (*collection, *i
 	c := coll.(*collection)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, i := range c.indexes {
+	for _, i := range c.loadIndexes() {
 		if i.info.Name == indexName {
 			return c, i
 		}
@@ -2266,7 +2266,14 @@ func TestIndex_Corruption_CompoundRebuildRestoresNullPadding(t *testing.T) {
 }
 
 // act-42
-func TestIndex_EnsureIndex_SameNameChangedDefinitionIsNoOp(t *testing.T) {
+//
+// Updated for the index-staleness fix: a same-name EnsureIndex with a CHANGED
+// definition is no longer a silent no-op. registerIndex now compares the
+// persisted definition against the request and returns ErrIndexMismatch when
+// they differ (fields / unique / sparse) — surfaced even under ensure=true — so
+// a redefinition is never silently dropped. The upgrade path remains explicit:
+// drop, then create with the new definition.
+func TestIndex_EnsureIndex_SameNameChangedDefinitionErrors(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "c")
 	require.NoError(t, err)
@@ -2276,11 +2283,18 @@ func TestIndex_EnsureIndex_SameNameChangedDefinitionIsNoOp(t *testing.T) {
 		anyenc.MustParseJson(`{"id":2,"a":5}`),
 	))
 
-	// Index name == join(Fields), so a changed Unique flag does NOT change the name;
-	// EnsureIndex swallows ErrIndexExists and keeps the old (non-unique) definition.
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true}))
+	// Index name == join(Fields), so a changed Unique flag does NOT change the
+	// name. The request collides with the existing "a" index but carries a
+	// different definition, so EnsureIndex returns ErrIndexMismatch (rather than
+	// silently keeping the old non-unique definition) and the index is unchanged.
+	err = coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}, Unique: true})
+	require.ErrorIs(t, err, ErrIndexMismatch)
 	assert.False(t, coll.GetIndexes()[0].Info().Unique)
-	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":5}`))) // still allowed
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":5}`))) // still non-unique
+
+	// An identical EnsureIndex (same definition) remains an idempotent no-op.
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	assert.False(t, coll.GetIndexes()[0].Info().Unique)
 
 	// Upgrade path: drop then ensure-unique — backfill fails on the existing dups.
 	require.NoError(t, coll.DropIndex(ctx, "a"))

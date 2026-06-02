@@ -95,7 +95,7 @@ type CollectionStats struct {
 func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err error) {
 	c.mu.Lock()
 	name := c.name
-	indexes := append([]*index(nil), c.indexes...)
+	indexes := append([]*index(nil), c.loadIndexes()...)
 	c.mu.Unlock()
 
 	stats.Name = name

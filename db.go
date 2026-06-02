@@ -325,23 +325,66 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 	return rTx, nil
 }
 
-// checkStale checks if the on-disk data or schema has changed (by another process)
-// and reloads in-memory caches (sketches, index metadata) if necessary.
+// checkStale checks if the on-disk data or schema has changed (by another
+// process) and reloads in-memory caches if necessary. It runs at the start of
+// every top-level read and write transaction (the analog of SQLite verifying
+// the schema cookie in OP_Transaction before a statement runs).
+//
+// The reaction is two-tiered, mirroring SQLite's sqlite3InitOne (structure)
+// running before sqlite3AnalysisLoad (statistics):
+//
+//   Tier 1 — STRUCTURAL (correctness): when the SCHEMA cookie advanced, a peer
+//     committed DDL (index create/drop/recreate). reconcileIndexSet rebuilds
+//     each open collection's index set from on-disk metadata: it adds
+//     peer-created indexes, drops peer-removed ones, and re-resolves the btree
+//     namespace handle (root) of any index whose definition or root changed —
+//     so a long-lived handle can never keep reading/writing a dropped or
+//     recreated index's stale namespace. A stale schema is never tolerated.
+//
+//   Tier 2 — STATISTICAL (advisory): reloadSketches refreshes the selectivity
+//     sketches over the (now reconciled) index set. A stale sketch only affects
+//     which index the planner CHOOSES, never query RESULTS (the any-store analog
+//     of sqlite_stat1), so it runs strictly after the structural reconcile.
 func (db *db) checkStale(tx *btree.ReadTx) {
+	if tx.IsSchemaStale() {
+		db.reconcileIndexSet(tx)
+	}
 	if tx.IsSchemaStale() || tx.IsDataStale() {
 		db.reloadSketches(tx)
 		db.btreeDB.UpdateLocalCounters(tx.DiskFileChangeCounter(), tx.DiskSchemaCookie())
 	}
 }
 
+// reconcileIndexSet rebuilds the in-memory index set of every open collection
+// from on-disk metadata, called from checkStale when the schema cookie advanced.
+// See checkStale for the contract. Each collection is reconciled under its own
+// c.mu and the result published atomically (copy-on-write), so lock-free query
+// readers always observe a complete index generation.
+func (db *db) reconcileIndexSet(tx *btree.ReadTx) {
+	db.mu.Lock()
+	colls := make([]*collection, 0, len(db.openedCollections))
+	for _, coll := range db.openedCollections {
+		colls = append(colls, coll.(*collection))
+	}
+	db.mu.Unlock()
+
+	for _, c := range colls {
+		c.reconcileIndexes(tx)
+	}
+}
+
 // reloadSketches reloads all sketch data from the _system namespace for opened collections.
 func (db *db) reloadSketches(tx *btree.ReadTx) {
 	db.mu.Lock()
-	defer db.mu.Unlock()
+	colls := make([]*collection, 0, len(db.openedCollections))
 	for _, coll := range db.openedCollections {
-		c := coll.(*collection)
+		colls = append(colls, coll.(*collection))
+	}
+	db.mu.Unlock()
+
+	for _, c := range colls {
 		c.mu.Lock()
-		for _, idx := range c.indexes {
+		for _, idx := range c.loadIndexes() {
 			c.loadSketch(tx, idx)
 		}
 		c.mu.Unlock()
@@ -837,12 +880,48 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 	return result, nil
 }
 
-// registerIndex stores index metadata in the system namespace
+// indexDefMatches reports whether a persisted index record (the system-namespace
+// value bytes) describes the same definition as info: same fields (order
+// significant), same unique and sparse flags. The name is implicitly equal —
+// the record was fetched by name. Used to distinguish an idempotent
+// EnsureIndex (identical definition) from a conflicting redefinition.
+func indexDefMatches(persisted []byte, info IndexInfo) bool {
+	var p anyenc.Parser
+	v, err := p.Parse(persisted)
+	if err != nil {
+		return false
+	}
+	if v.GetBool("unique") != info.Unique || v.GetBool("sparse") != info.Sparse {
+		return false
+	}
+	fields := v.GetArray("fields")
+	if len(fields) != len(info.Fields) {
+		return false
+	}
+	for i, fv := range fields {
+		if string(fv.GetStringBytes()) != info.Fields[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// registerIndex stores index metadata in the system namespace.
+//
+// If an index with the same name already exists, the persisted definition is
+// compared against info: an IDENTICAL definition returns ErrIndexExists (which
+// EnsureIndex treats as an idempotent no-op), while a DIFFERENT definition
+// (fields / unique / sparse) returns ErrIndexMismatch — a redefinition is never
+// applied silently. This mirrors SQLite, where CREATE INDEX never mutates an
+// existing object's definition in place; the caller must DROP then CREATE.
 func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) error {
 	key := indexKey(collName, info.Name)
 	// Check if already exists
-	if _, err := tx.Get(db.systemNS, key); err == nil {
-		return ErrIndexExists
+	if existing, err := tx.Get(db.systemNS, key); err == nil {
+		if indexDefMatches(existing, info) {
+			return ErrIndexExists
+		}
+		return ErrIndexMismatch
 	}
 	var a anyenc.Arena
 	obj := a.NewObject()
@@ -861,10 +940,16 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 	return tx.Put(db.systemNS, key, obj.MarshalTo(nil))
 }
 
-// removeIndex removes index metadata from the system namespace
+// removeIndex removes index metadata from the system namespace. An already-absent
+// key is not an error: a peer (or a racing same-process caller that committed
+// between our staleness snapshot and now) may have removed it first. Callers
+// rely on this so DropIndex never leaks a raw btree.ErrKeyNotFound.
 func (db *db) removeIndex(tx *btree.WriteTx, collName, indexName string) error {
 	key := indexKey(collName, indexName)
-	return tx.Delete(db.systemNS, key)
+	if err := tx.Delete(db.systemNS, key); err != nil && !errors.Is(err, btree.ErrKeyNotFound) {
+		return err
+	}
+	return nil
 }
 
 // removeCollection removes collection metadata from the system namespace
