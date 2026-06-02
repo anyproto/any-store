@@ -69,6 +69,11 @@ type DB interface {
 	// StalledConnections returns the acquire-site stack traces of connections
 	// that have been held longer than threshold. Returns nil unless
 	// StalledConnectionsDetectorEnabled was set in Config.
+	//
+	// Usage: enable the detector in Config, then periodically call
+	// db.StalledConnections(30*time.Second) from a watchdog goroutine and
+	// log/report any returned stacks — each entry is the call site that
+	// acquired a tx and hasn't released it yet.
 	StalledConnections(threshold time.Duration) []string
 
 	// Close closes the database connection.
