@@ -1,12 +1,15 @@
 package btree
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -2366,6 +2369,7 @@ func TestShmHashWriteGet_CrossSegment(t *testing.T) {
 // ============================================================
 
 func TestPagerOpen_ExistingDBWithWALRecovery(t *testing.T) {
+	resetPageBufferPool() // isolate: a prior test may have left a non-4096 page-buffer-pool size
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
@@ -2407,6 +2411,7 @@ func TestPagerOpen_ExistingDBWithWALRecovery(t *testing.T) {
 }
 
 func TestPagerOpen_ExistingDBZeroPageSize(t *testing.T) {
+	resetPageBufferPool() // isolate: a prior test may have left a non-4096 page-buffer-pool size
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
@@ -4403,6 +4408,7 @@ func TestWALRecover_PartialFrame(t *testing.T) {
 
 // --- wal.go:1161-1163 recover() readAt error in committed frame rebuild ---
 func TestWALRecover_RebuildReadError(t *testing.T) {
+	resetPageBufferPool() // isolate: a prior test may have left a non-4096 page-buffer-pool size
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
@@ -8124,4 +8130,875 @@ func TestWriteOverflowChain_ContiguousOnFreshFreelist(t *testing.T) {
 	assert.LessOrEqual(t, span, 10, "chain should be clustered, got span=%d pgnos=%v", span, chain)
 
 	require.NoError(t, tx.Rollback())
+}
+
+// ============================================================
+// Merged from initnewdb_page1_test.go
+// ============================================================
+
+// Regression tests pinning the by-design behavior of initNewDB writing page 1
+// directly to the main DB file (bypassing the WAL).
+// See docs/btree/NOTES.md#drift-63-new-db-page-1-written-directly-to-file-bypassing-wal
+//
+// SQLite defers page-1 creation to the first write transaction so the new
+// page 1 reaches the main file only through a checksum-protected WAL frame.
+// Go's initNewDB instead builds the empty page-1 image and writes it straight
+// to the main file via WriteAt+fdatasync inside Open(), before opening the WAL.
+// That is intentional and kept; these tests pin the two properties that make it
+// safe:
+//
+//  1. A crash during initial page-1 creation puts no pre-existing user data at
+//     risk: a zero-length leftover re-initializes cleanly, and the only image
+//     the direct write can produce is the fully-deterministic empty page 1,
+//     which is trivially re-derivable and opens as a valid empty DB even with
+//     no WAL present.
+//
+//  2. Cross-process creation is harmless even though Go takes only a shared
+//     flock (not C's exclusive write lock) while deciding "new DB": the empty
+//     page-1 image is byte-for-byte deterministic for an unencrypted DB, so
+//     concurrent creators write identical bytes and the racing-creator window
+//     cannot corrupt the file.
+
+// referenceEmptyPage1 returns the exact bytes initNewDB writes to the main file
+// for a fresh unencrypted DB created with the given options. It opens a fresh DB
+// on a throwaway path, closes it, and reads back the raw main-file image.
+func referenceEmptyPage1(t *testing.T, opts Options) []byte {
+	t.Helper()
+	resetPageBufferPool()
+	p := filepath.Join(t.TempDir(), "ref.db")
+	db, err := Open(p, opts)
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	img, err := os.ReadFile(p)
+	require.NoError(t, err)
+	require.Len(t, img, int(opts.PageSize), "fresh DB main file must be exactly one page")
+	return img
+}
+
+// assertValidEmptyDB reopens path and confirms it behaves as a valid, empty DB:
+// a write transaction can create a namespace, store a key, and read it back.
+func assertValidEmptyDB(t *testing.T, path string, opts Options) {
+	t.Helper()
+	resetPageBufferPool()
+	db, err := Open(path, opts)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("ns")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("k"), []byte("v")))
+	require.NoError(t, tx.Commit())
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rtx.Rollback()) }()
+	ns2, err := db.getNamespaceLocked("ns")
+	require.NoError(t, err)
+	got, err := rtx.Get(ns2, []byte("k"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), got)
+}
+
+// TestInitNewDB_Page1_CrashRecoverable pins that a crash during the initial
+// direct-to-file page-1 creation leaves a recoverable / trivially re-derivable
+// empty page 1 with no pre-existing user data at risk.
+//
+// Because initNewDB writes the new page 1 straight to the main file (not through
+// the WAL), the only crash states reachable mid-creation are:
+//   - a zero-length leftover file (WriteAt never landed / fdatasync skipped),
+//     which Open re-initializes cleanly on the next open, identical to C; and
+//   - the complete deterministic page-1 image (WriteAt+fdatasync completed),
+//     which is a valid empty DB on its own with no WAL frame required.
+//
+// A torn intermediate (header written, body still zero) is not produced by the
+// happy path; the recoverable invariant tested here is that the only persisted
+// new-DB image is one Open accepts as a clean empty DB, and that no earlier
+// user data ever existed to be lost.
+func TestInitNewDB_Page1_CrashRecoverable(t *testing.T) {
+	opts := DefaultOptions()
+
+	t.Run("zero-length leftover re-initializes", func(t *testing.T) {
+		resetPageBufferPool()
+		path := filepath.Join(t.TempDir(), "test.db")
+
+		// Create then truncate to 0 to model "crash before page-1 WriteAt landed":
+		// Open() opened the file with O_CREATE but the direct write never reached
+		// disk, so the next opener still sees info.Size()==0.
+		db, err := Open(path, opts)
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+		require.NoError(t, os.Truncate(path, 0))
+		_ = os.Remove(path + "-wal")
+		_ = os.Remove(path + "-shm")
+
+		// Reopen: Open must re-run initNewDB (no pre-existing user data) and the
+		// result must be a valid empty DB.
+		assertValidEmptyDB(t, path, opts)
+	})
+
+	t.Run("completed direct write opens with no WAL", func(t *testing.T) {
+		// Model "crash right after page-1 WriteAt+fdatasync, before any write
+		// transaction / WAL activity": only the bare deterministic page-1 image
+		// is on disk, with no WAL or shm. It must open as a valid empty DB,
+		// proving the direct-to-file image is self-consistent and re-derivable
+		// without a covering WAL frame.
+		img := referenceEmptyPage1(t, opts)
+
+		path := filepath.Join(t.TempDir(), "bare.db")
+		require.NoError(t, os.WriteFile(path, img, 0o644))
+		require.NoFileExists(t, path+"-wal")
+		require.NoFileExists(t, path+"-shm")
+
+		assertValidEmptyDB(t, path, opts)
+	})
+}
+
+// childCreateEnvVar selects the cross-process page-1 creator child mode and
+// carries the target DB path for TestInitNewDB_Page1_CrossProcessSerialization.
+const childCreateEnvVar = "TEST_INITNEWDB_PAGE1_CREATE_PATH"
+
+// TestInitNewDB_Page1_CrossProcessSerialization pins that cross-process
+// creation of the initial page 1 behaves as intended even though Go only holds
+// a shared flock (not C's exclusive write lock) while deciding "new DB".
+//
+// Several OS processes race to Open the same brand-new path with
+// InProcess:false. Each independently sees info.Size()==0 and writes the empty
+// page-1 image directly to the main file. Because that image is byte-for-byte
+// deterministic for an unencrypted DB, every concurrent creator writes the
+// identical 4096 bytes, so the missing exclusive lock cannot corrupt the file:
+// the final on-disk image equals the single-creator reference image, and the DB
+// opens as a valid empty DB.
+func TestInitNewDB_Page1_CrossProcessSerialization(t *testing.T) {
+	opts := Options{PageSize: 4096, CacheSize: 100, InProcess: false}
+
+	if path := os.Getenv(childCreateEnvVar); path != "" {
+		// === CHILD PROCESS ===
+		// Race the other children to create page 1, then close immediately.
+		resetPageBufferPool()
+		db, err := Open(path, opts)
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+		return
+	}
+
+	// === PARENT PROCESS ===
+	// Reference image a lone single-process creator would produce.
+	reference := referenceEmptyPage1(t, opts)
+
+	path := filepath.Join(t.TempDir(), "race.db")
+
+	const nChildren = 4
+	var wg sync.WaitGroup
+	errs := make([]error, nChildren)
+	for i := range nChildren {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			cmd := exec.Command(os.Args[0],
+				"-test.run=^TestInitNewDB_Page1_CrossProcessSerialization$",
+				"-test.timeout=60s",
+			)
+			cmd.Env = append(os.Environ(), childCreateEnvVar+"="+path)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			errs[i] = cmd.Run()
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		require.NoError(t, err, "child %d failed to create page 1", i)
+	}
+
+	// The racing creators must have produced exactly the deterministic
+	// single-creator image — no torn or divergent bytes from the missing
+	// exclusive lock.
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.True(t, bytes.Equal(reference, got),
+		"cross-process page-1 image diverged from the single-creator reference")
+
+	// And the raced-into-existence DB must open as a valid empty DB.
+	assertValidEmptyDB(t, path, opts)
+}
+
+// ============================================================
+// Merged from pager_refresh_header_test.go
+// ============================================================
+
+// Regression tests for the beginWrite page-1 re-read error-propagation
+// hardening (docs/btree/NOTES.md#drift-76-beginwrite-re-reads-page-1-header-on-state-change).
+//
+// On the stateChanged edge (a peer committed/checkpointed), beginWrite clears
+// the writerCache and re-reads page 1 via refreshHeaderFromPage1. If BOTH the
+// WAL-frame read AND the DB-file read fail (double I/O failure),
+// refreshHeaderFromPage1 must now return that error and beginWrite must
+// PROPAGATE it (aborting the write) instead of silently continuing with a
+// stale header/dbSize that commit() would later serialize over the peer's
+// page 1. This mirrors SQLite, which propagates the page-1 read error out of
+// the begin/shared-lock path.
+
+// TestRefreshHeaderFromPage1_DoubleIOFailure exercises the core unit:
+// refreshHeaderFromPage1 returns an error when page 1 exists (a WAL frame is
+// recorded for it) but neither the WAL frame nor the DB file can be read.
+func TestRefreshHeaderFromPage1_DoubleIOFailure(t *testing.T) {
+	dir := t.TempDir()
+	p := newPager(filepath.Join(dir, "test.db"), 4096, 100, true)
+	p.inProcess = true
+	require.NoError(t, p.open())
+	defer p.close()
+
+	// Commit a write so page 1 is recorded as a WAL frame (effectiveMaxFrame>0
+	// and wal.index.get(1, ...) returns frame>0).
+	mf, slot, err := p.beginRead()
+	require.NoError(t, err)
+	p.walMaxFrame.Store(mf)
+	require.NoError(t, p.beginWrite(WalIndexHdr{}))
+	pg, err := p.getWritablePage(1)
+	require.NoError(t, err)
+	p.releasePage(pg)
+	_, _, _, err = p.commit(true, false)
+	require.NoError(t, err)
+	p.endRead(slot)
+
+	// Sanity: page 1 is reachable as a WAL frame, so refreshHeaderFromPage1
+	// will attempt the WAL-frame read (not the no-read best-effort path).
+	effectiveMaxFrame := p.wal.nFrame.Load()
+	if mf := p.wal.index.mxCommitFrame.LoadLocal(); mf > effectiveMaxFrame {
+		effectiveMaxFrame = mf
+	}
+	require.Greater(t, effectiveMaxFrame, uint32(0))
+	require.Greater(t, mustWiGet(t, p.wal.index, 1, effectiveMaxFrame), uint32(0))
+
+	// Force the double I/O failure: WAL-frame read fails (file-backed WAL with
+	// nil file => ErrWALCorrupt) AND the DB-file fallback is unavailable.
+	walFile := p.wal.file
+	require.NotNil(t, walFile)
+	_ = walFile.Close()
+	p.wal.file = nil
+	dbFile := p.file
+	p.file = nil
+	// Restore the handles for clean teardown so p.close() does not touch nil.
+	defer func() {
+		p.wal.file = walFile
+		p.file = dbFile
+	}()
+
+	err = p.refreshHeaderFromPage1()
+	require.Error(t, err, "refreshHeaderFromPage1 must propagate the double I/O read failure")
+	assert.ErrorIs(t, err, ErrWALCorrupt)
+}
+
+// TestBeginWriteHeaderRefreshError_DoubleIOFailure exercises the end-to-end
+// propagation: a real multi-process setup (two DB handles on one file) drives
+// the stateChanged edge in beginWrite, and a double page-1 read failure on
+// that edge must cause beginWrite to return the error and leave the pager in a
+// non-writer state.
+func TestBeginWriteHeaderRefreshError_DoubleIOFailure(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	db1, err := testOpen(t, dbPath, Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer db1.Close()
+
+	allowDoubleOpen(dbPath)
+	db2, err := testOpen(t, dbPath, Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer db2.Close()
+
+	// Prime db2's writerHdr baseline with a no-op write so a subsequent peer
+	// commit (db1) is what flips stateChanged — not the first-write
+	// writerHdr.isInit==0 case.
+	wtx, err := db2.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("seed")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns, []byte("k"), []byte("v")))
+	wtx.MarkDataChanged()
+	require.NoError(t, wtx.Commit())
+
+	// db1 (the "other process") commits, advancing the shared SHM header past
+	// db2's writerHdr snapshot. db2's next beginWrite will see stateChanged.
+	wtx, err = db1.BeginWrite()
+	require.NoError(t, err)
+	ns1, err := wtx.GetNamespace("seed")
+	require.NoError(t, err)
+	require.NoError(t, wtx.Put(ns1, []byte("k2"), []byte("v2")))
+	wtx.MarkDataChanged()
+	require.NoError(t, wtx.Commit())
+
+	// Drive db2's beginWrite manually so we can inject the read failure on the
+	// stateChanged edge. Mirror DB.BeginWrite's beginReadHdr -> beginWrite flow.
+	p := db2.pager
+	readSnap, maxFrame, slot, err := p.beginReadHdr()
+	require.NoError(t, err)
+	p.writerWalSlot = slot
+
+	// Inject the double I/O failure: both the WAL-frame read and the DB-file
+	// read fail when beginWrite re-reads page 1 on the stateChanged edge.
+	walFile := p.wal.file
+	require.NotNil(t, walFile)
+	_ = walFile.Close()
+	p.wal.file = nil
+	dbFile := p.file
+	p.file = nil
+	defer func() {
+		p.wal.file = walFile
+		p.file = dbFile
+		p.endRead(slot)
+	}()
+
+	err = p.beginWrite(readSnap)
+	require.Error(t, err, "beginWrite must propagate the page-1 re-read failure on the stateChanged edge")
+	assert.ErrorIs(t, err, ErrWALCorrupt)
+	// The pager must NOT have transitioned to a writer state on the aborted
+	// begin (no half-open write transaction left behind).
+	assert.NotEqual(t, int32(pagerWriter), p.state.Load(),
+		"pager must not be in writer state after an aborted beginWrite")
+	_ = maxFrame
+}
+
+// ============================================================
+// Merged from pager_stress_dontwrite_test.go
+// ============================================================
+
+// TestPagerStress_DontWriteSkipsWALWrite_RegressionPin pins a by-design drift
+// between the Go port and upstream SQLite.
+//
+// DRIFT (docs/btree/NOTES.md#old-drift-pagerstress-dontwrite-skip-walwrite):
+// Go's pagerStress short-circuits a PGHDR_DONT_WRITE page (pager.go:2062-2065):
+// it calls makeClean(pg) and returns WITHOUT writing a WAL frame. SQLite's
+// pagerStress (sqlitec/src/pager.c:4645-4650) instead calls
+// pagerWalFrames(pPager,pPg,0,0) in WAL mode, and pagerWalFrames
+// (pager.c:3179-3236) writes the frame UNCONDITIONALLY — it never checks
+// PGHDR_DONT_WRITE. The DONT_WRITE skip in C lives only in the rollback-journal
+// path pager_write_pagelist (pager.c:4471), gated by assert(!pagerUseWal)
+// (pager.c:4432). So in WAL mode C writes a (garbage) frame for a spilled
+// dontWrite page; Go does not. This is an intentional I/O-avoidance optimization.
+//
+// THE INVARIANT a future refactor must not break (the relied-upon behavior that
+// makes skipping the write safe): a freed freelist-leaf page is marked dontWrite,
+// and pagerStress must still be able to make it CLEAN (evictable) WITHOUT
+// emitting a WAL frame — so freed pages whose content is irrelevant never bloat
+// the WAL, yet the cache can still drain them under memory pressure. The
+// stale/garbage cached content is never read back: getWritablePage clears
+// dontWrite and re-dirties on same-tx re-allocation (pager.go:1268), and
+// allocateFromFreelist uses getPageNoContent in later txs (hasContent is cleared
+// at commit), so no consumer ever interprets the spilled-but-not-rewritten bytes.
+//
+// This test builds the EXACT scenario the drift relies on: a real page that was
+// allocated, then freed via freePage as a freelist LEAF (which calls
+// dontWrite(pgno) at pager.go:1446 because the page is cached). The page is left
+// dirty + cached, made the genuine spill victim via the real findSpillVictim,
+// then handed to the real pagerStress. We assert the two halves of the
+// invariant: NO WAL frame is appended, and the page IS made clean. If a refactor
+// deletes the dontWrite branch (so it falls through to wal.writeFrames), the
+// "no WAL frame" assertion fails loudly.
+//
+// Production logic is unchanged; the test only drives existing internal methods.
+func TestPagerStress_DontWriteSkipsWALWrite_RegressionPin(t *testing.T) {
+	db := tempDB(t)
+	p := db.pager
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	// Allocate two fresh data pages (pgno>1, within dbSize, dirty + cached).
+	// Both are released to pinCount==0 but stay dirty in the writer cache.
+	pgA, err := p.allocatePage()
+	require.NoError(t, err)
+	pgnoA := pgA.pgno
+	p.releasePage(pgA)
+
+	pgB, err := p.allocatePage()
+	require.NoError(t, err)
+	pgnoB := pgB.pgno
+	p.releasePage(pgB)
+
+	require.Greater(t, pgnoA, uint32(1))
+	require.Greater(t, pgnoB, uint32(1))
+
+	// Free pgA first: with no freelist yet, it becomes the new trunk page (its
+	// content is meaningful, so it is NOT marked dontWrite).
+	require.NoError(t, p.freePage(pgnoA))
+
+	// Free pgB: the trunk (pgA) now has room, so pgB is appended as a freelist
+	// LEAF. Because pgB is still cached, freePage marks it dontWrite
+	// (pager.go:1445-1447) — exactly the spill-then-free state the drift targets.
+	require.NoError(t, p.freePage(pgnoB))
+
+	require.True(t, p.dontWritePages[pgnoB],
+		"freeing a cached page as a freelist leaf must mark it dontWrite")
+
+	// pgB must still be a dirty, cached, unpinned page — the precondition for a
+	// pagerStress spill victim.
+	pgBcached := p.writerCache.hashFind(pgnoB)
+	require.NotNil(t, pgBcached, "freed dontWrite leaf must still be cached")
+	require.True(t, pgBcached.dirty, "freed dontWrite leaf must still be dirty")
+	require.Equal(t, 0, pgBcached.pinCount, "freed dontWrite leaf must be unpinned")
+
+	// Park every OTHER dirty page ahead of pgB so pgB is the oldest unpinned
+	// dirty page — the page findSpillVictim walks back to first. We must NOT
+	// touch pgB via getWritablePage: that would clear its dontWrite flag
+	// (pager.go:1268) and defeat the scenario.
+	for _, d := range p.writerCache.appendDirtyPages(nil) {
+		if d.pgno == pgnoB {
+			continue
+		}
+		if d.dirty {
+			wp, gerr := p.getWritablePage(d.pgno)
+			require.NoError(t, gerr)
+			p.releasePage(wp)
+		}
+	}
+
+	// Load-bearing precondition: the REAL victim search selects the dontWrite
+	// page. This proves the dontWrite branch in pagerStress is genuinely
+	// reachable for this page under memory pressure.
+	victim := p.writerCache.findSpillVictim()
+	require.NotNil(t, victim, "there must be an unpinned dirty victim")
+	require.Equal(t, pgnoB, victim.pgno,
+		"the dontWrite leaf must be the oldest unpinned dirty page (spill victim)")
+	require.True(t, p.dontWritePages[pgnoB],
+		"sanity: dontWrite flag must survive the parking step")
+
+	walFramesBefore := p.wal.index.maxFrame.Load()
+	dirtyBefore := p.writerCache.nDirty
+
+	// Drive the REAL pagerStress on the dontWrite victim.
+	require.NoError(t, p.pagerStress(pgBcached),
+		"pagerStress on a dontWrite page must return nil")
+
+	// INVARIANT 1 (the drift): NO WAL frame was appended. SQLite would append a
+	// (garbage) frame here; Go must not. A wal.writeFrames call would advance
+	// walIndex.maxFrame.
+	assert.Equal(t, walFramesBefore, p.wal.index.maxFrame.Load(),
+		"pagerStress on a dontWrite page must NOT append a WAL frame")
+
+	// INVARIANT 2: the page WAS made clean (evictable) and the dirty count
+	// dropped by exactly one. This is what lets the cache drain freed pages
+	// under memory pressure even though no WAL write happened.
+	assert.False(t, pgBcached.dirty,
+		"pagerStress on a dontWrite page must make it clean (evictable)")
+	assert.Equal(t, dirtyBefore-1, p.writerCache.nDirty,
+		"pagerStress on a dontWrite page must drop the dirty count by exactly one")
+}
+
+// TestPagerStress_NonDontWriteWritesWALFrame_Control is the control proving the
+// regression pin above is not vacuous. An otherwise identical dirty/unpinned
+// spill victim that is NOT marked dontWrite IS written to the WAL by the real
+// pagerStress (maxFrame advances) and then made clean. This guards against
+// pagerStress silently becoming a no-op for all pages, which would make the
+// "no WAL frame" assertion above pass for the wrong reason.
+func TestPagerStress_NonDontWriteWritesWALFrame_Control(t *testing.T) {
+	db := tempDB(t)
+	p := db.pager
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+
+	// A plain dirty data page that is NOT freed / NOT marked dontWrite.
+	pg, err := p.allocatePage()
+	require.NoError(t, err)
+	pgno := pg.pgno
+	require.Greater(t, pgno, uint32(1))
+	p.releasePage(pg)
+
+	require.False(t, p.dontWritePages[pgno],
+		"control page must NOT be marked dontWrite")
+
+	pgCached := p.writerCache.hashFind(pgno)
+	require.NotNil(t, pgCached)
+	require.True(t, pgCached.dirty)
+	require.Equal(t, 0, pgCached.pinCount)
+
+	// Park other dirty pages ahead so this page is the spill victim.
+	for _, d := range p.writerCache.appendDirtyPages(nil) {
+		if d.pgno == pgno {
+			continue
+		}
+		if d.dirty {
+			wp, gerr := p.getWritablePage(d.pgno)
+			require.NoError(t, gerr)
+			p.releasePage(wp)
+		}
+	}
+
+	victim := p.writerCache.findSpillVictim()
+	require.NotNil(t, victim)
+	require.Equal(t, pgno, victim.pgno)
+
+	walFramesBefore := p.wal.index.maxFrame.Load()
+
+	require.NoError(t, p.pagerStress(pgCached))
+
+	// A non-dontWrite victim IS spilled: a WAL frame is appended and it is cleaned.
+	assert.Greater(t, p.wal.index.maxFrame.Load(), walFramesBefore,
+		"a non-dontWrite spill victim must append a WAL frame (proves pagerStress is not a global no-op)")
+	assert.False(t, pgCached.dirty,
+		"a non-dontWrite spill victim must be made clean (evictable)")
+}
+
+// ============================================================
+// Merged from pager_stress_page1_test.go
+// ============================================================
+
+// TestPagerStress_Page1NeverSpilled_RegressionPin pins a by-design drift between
+// the Go port and upstream SQLite.
+//
+// DRIFT (docs/btree/NOTES.md#old-drift-pagerstress-page1-exclusion): Go's
+// pagerStress explicitly guards pg.pgno==1 (pager.go:2053-2055); SQLite's
+// pagerStress (sqlitec/src/pager.c:4609-4681) has NO such check. SQLite is safe
+// without it because its btree layer keeps BtShared.pPage1 referenced
+// (nRef>=1) for the entire open transaction (pager.c:5775-5778), so the pcache
+// stress victim search (pcache.c:464,469 — skips any pPg with nRef) can never
+// select page 1. any-store does NOT hold page 1 pinned across b-tree
+// operations, so page 1 CAN sit unpinned (pinCount==0, which mirrors C nRef==0)
+// at the dirty tail and be selected by findSpillVictim (pcache.go:808-815).
+// The explicit pgno==1 guard substitutes for C's missing structural pin.
+//
+// WHY THE GUARD MATTERS (the invariants a future refactor must not break):
+//   - A spilled page-1 frame is an UNCOMMITTED (commit=false) WAL frame carrying
+//     mid-transaction header bytes. Concurrent readers / other processes must
+//     not observe it (defended elsewhere by mxCommitFrame bounding at
+//     pager.go:1952-1955). Not spilling page 1 at all keeps that surface small.
+//   - The authoritative dbHeader is re-serialized over page 1 at commit
+//     (pager.go:2173-2179); spilling-then-evicting page 1 forces a fragile
+//     re-read + re-encode round-trip.
+//
+// This test reproduces the EXACT scenario the guard defends: page 1 dirtied by a
+// master/namespace-catalog btree write (CreateNamespace -> btree{rootPage:1}.Put,
+// db.go:1031-1032), released to pinCount==0, sitting at the dirty tail as the
+// oldest unpinned dirty page, AND confirmed (via the real findSpillVictim) to be
+// the page the writer cache would spill. It then asserts the guard holds:
+// pagerStress(page1) is a no-op — no WAL frame is appended and page 1 stays
+// dirty (never made clean / evictable). If a refactor deletes the pgno==1 guard,
+// the WAL-frame and stays-dirty assertions fail loudly.
+//
+// Production logic is unchanged; the test only drives existing internal methods.
+func TestPagerStress_Page1NeverSpilled_RegressionPin(t *testing.T) {
+	db := tempDB(t)
+	p := db.pager
+
+	// Establish page 1 (the master/namespace catalog btree root) with a first
+	// namespace, then commit so the on-disk header is authoritative.
+	tx0, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx0.CreateNamespace("seed")
+	require.NoError(t, err)
+	require.NoError(t, tx0.Commit())
+
+	// New write transaction. A master-catalog btree write (CreateNamespace ->
+	// bt{rootPage:1}.Put at db.go:1031-1032) dirties page 1.
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.CreateNamespace("ns")
+	require.NoError(t, err)
+
+	// Grab page 1 from the writer cache. The catalog write left it cached.
+	pg1 := p.writerCache.hashFind(1)
+	require.NotNil(t, pg1, "page 1 must be in the writer cache after a catalog write")
+
+	// Reproduce the precise pre-spill state the C pin would otherwise prevent:
+	// page 1 dirty and fully released to pinCount==0 (mirrors C nRef==0). A page
+	// with pinCount>0 is structurally unreachable as a victim; we drop it to 0.
+	if !pg1.dirty {
+		p.writerCache.makeDirty(pg1)
+	}
+	for pg1.pinCount > 0 {
+		p.writerCache.release(pg1)
+	}
+	require.True(t, pg1.dirty, "page 1 must be dirty for the scenario to be real")
+	require.Equal(t, 0, pg1.pinCount, "page 1 must be unpinned (mirrors C nRef==0)")
+
+	// Park page 1 at the dirty TAIL so it is the OLDEST unpinned dirty page —
+	// exactly the page findSpillVictim walks back to first (pcache.go:809). Any
+	// other dirty pages created by the catalog write are moved ahead of it by
+	// touching them through getWritablePage (dirtyMoveToFront), guaranteeing
+	// page 1 is the genuine spill victim.
+	moveAhead := func(pgno uint32) {
+		if pgno == 1 {
+			return
+		}
+		if other := p.writerCache.hashFind(pgno); other != nil && other.dirty {
+			wp, gerr := p.getWritablePage(pgno)
+			require.NoError(t, gerr)
+			p.releasePage(wp) // released unpinned -> dirtyMoveToFront ahead of page 1
+		}
+	}
+	for _, d := range p.writerCache.appendDirtyPages(nil) {
+		moveAhead(d.pgno)
+	}
+
+	// Precondition (the load-bearing one): the writer cache's REAL victim search
+	// selects page 1. This proves the scenario is genuinely reachable — without
+	// the pgno==1 guard, page 1 would be spilled here.
+	victim := p.writerCache.findSpillVictim()
+	require.NotNil(t, victim, "there must be an unpinned dirty victim")
+	require.Equal(t, uint32(1), victim.pgno,
+		"page 1 must be the oldest unpinned dirty page (the spill victim)")
+
+	// Capture observable state, then drive the REAL pagerStress on page 1.
+	walFramesBefore := p.wal.index.maxFrame.Load()
+	dirtyBefore := p.writerCache.nDirty
+
+	require.NoError(t, p.pagerStress(pg1),
+		"pagerStress(page1) must return nil (the pgno==1 guard short-circuits)")
+
+	// INVARIANT 1: no WAL frame was appended. A spilled page-1 frame would
+	// advance walIndex.maxFrame; the guard prevents the writeFrames call.
+	assert.Equal(t, walFramesBefore, p.wal.index.maxFrame.Load(),
+		"pagerStress(page1) must NOT append a WAL frame (page-1 spill is forbidden)")
+
+	// INVARIANT 2: page 1 is still dirty and still pinned-out of the LRU as a
+	// non-victim. makeClean was NOT called, so it cannot be evicted out from
+	// under the at-commit getWritablePage(1) re-serialization of the header.
+	assert.True(t, pg1.dirty,
+		"pagerStress(page1) must NOT makeClean page 1 (it must stay dirty)")
+	assert.Equal(t, dirtyBefore, p.writerCache.nDirty,
+		"pagerStress(page1) must not change the dirty count")
+	assert.Same(t, pg1, p.writerCache.findSpillVictim(),
+		"page 1 must STILL be sitting at the dirty tail (not spilled away)")
+}
+
+// TestPagerStress_NonPage1Spilled_Control is the control for the regression pin
+// above: it proves the test harness is not vacuous. A NON-page-1 dirty page in
+// the identical state (dirty, unpinned, the findSpillVictim victim) IS spilled by
+// the real pagerStress — a WAL frame is appended and the page is made clean. This
+// guards against pagerStress silently becoming a no-op for ALL pages (which would
+// make the page-1 assertions above pass for the wrong reason).
+func TestPagerStress_NonPage1Spilled_Control(t *testing.T) {
+	db := tempDB(t)
+	p := db.pager
+
+	// Seed a namespace and a few rows so the tree has data pages beyond page 1.
+	tx0, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx0.CreateNamespace("ns")
+	require.NoError(t, err)
+	for i := 0; i < 50; i++ {
+		require.NoError(t, tx0.Put(ns, []byte{byte(i)}, []byte("v")))
+	}
+	require.NoError(t, tx0.Commit())
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback() }()
+	ns2, err := db.getNamespaceLocked("ns")
+	require.NoError(t, err)
+	for i := 0; i < 50; i++ {
+		require.NoError(t, tx.Put(ns2, []byte{byte(i)}, []byte("w")))
+	}
+
+	// Find a dirty, non-page-1 page; release it to pinCount==0 and make it the
+	// spill victim by parking it at the dirty tail (move everything else ahead).
+	var target *page
+	for _, d := range p.writerCache.appendDirtyPages(nil) {
+		if d.pgno != 1 {
+			target = d
+			break
+		}
+	}
+	require.NotNil(t, target, "expected at least one dirty non-page-1 page")
+
+	for target.pinCount > 0 {
+		p.writerCache.release(target)
+	}
+	require.True(t, target.dirty)
+	require.Equal(t, 0, target.pinCount)
+
+	for _, d := range p.writerCache.appendDirtyPages(nil) {
+		if d.pgno == target.pgno {
+			continue
+		}
+		if d.dirty {
+			wp, gerr := p.getWritablePage(d.pgno)
+			require.NoError(t, gerr)
+			p.releasePage(wp)
+		}
+	}
+
+	victim := p.writerCache.findSpillVictim()
+	require.NotNil(t, victim)
+	require.Equal(t, target.pgno, victim.pgno, "target must be the spill victim")
+
+	walFramesBefore := p.wal.index.maxFrame.Load()
+
+	require.NoError(t, p.pagerStress(target))
+
+	// A non-page-1 victim IS spilled: a WAL frame is appended and it is cleaned.
+	assert.Greater(t, p.wal.index.maxFrame.Load(), walFramesBefore,
+		"a non-page-1 spill victim must append a WAL frame (proves pagerStress is not a global no-op)")
+	assert.False(t, target.dirty,
+		"a non-page-1 spill victim must be made clean (evictable)")
+}
+
+// ============================================================
+// Merged from unmoved_test.go
+// ============================================================
+
+// unmovedPutN writes n key/value rows in n separate committed transactions so
+// that the WAL accumulates uncheckpointed frames (auto-checkpoint disabled).
+func unmovedPutN(t *testing.T, db *DB, nsName string, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		tx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ns, err := tx.GetNamespace(nsName)
+		require.NoError(t, err)
+		key := binary.BigEndian.AppendUint32(nil, uint32(i))
+		require.NoError(t, tx.Put(ns, key, make([]byte, 200)))
+		require.NoError(t, tx.Commit())
+	}
+}
+
+func unmovedCreateNS(t *testing.T, db *DB, nsName string) {
+	t.Helper()
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace(nsName)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+}
+
+// TestUnmoved_DatabaseIsUnmoved_Direct unit-tests the databaseIsUnmoved guard
+// against the three filesystem states C's databaseIsUnmoved (pager.c:4142-4159)
+// / fileHasMoved (os_unix.c:1623-1632) distinguish: in place (unmoved), renamed
+// away (moved), and relinked with a different file at the path (moved).
+func TestUnmoved_DatabaseIsUnmoved_Direct(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	opts := DefaultOptions()
+	opts.DisableAutoCheckpoint = true
+	opts.InProcess = true
+	db, err := testOpen(t, path, opts)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	p := db.pager
+	require.True(t, p.openIdentOK, "unix open must capture a real inode identity")
+
+	// File in place -> unmoved.
+	assert.True(t, p.databaseIsUnmoved(), "file in place must report unmoved")
+
+	// Rename the DB file away -> nothing at path -> moved (stat error).
+	moved := filepath.Join(dir, "test.db.bak")
+	require.NoError(t, os.Rename(path, moved))
+	assert.False(t, p.databaseIsUnmoved(), "renamed-away DB file must report moved")
+
+	// Relink: put a DIFFERENT file back at the original path. Its inode
+	// differs from the one captured at open -> still moved.
+	require.NoError(t, os.WriteFile(path, []byte("unrelated"), 0o600))
+	assert.False(t, p.databaseIsUnmoved(), "relinked (different inode) DB file must report moved")
+
+	// Restore the original file so cleanup Close() runs the happy path.
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, os.Rename(moved, path))
+	assert.True(t, p.databaseIsUnmoved(), "restored original inode must report unmoved")
+}
+
+// TestUnmoved_CloseSkipsCheckpointWhenMoved is the end-to-end regression test:
+// when the DB file is renamed out from under the open handle before Close, the
+// close-time checkpoint must be SKIPPED (matching SQLite's databaseIsUnmoved
+// gate in sqlite3PagerClose, pager.c:4189-4191). Skipping the checkpoint leaves
+// the whole checkpoint+truncate arm unrun (wal.c:2522 `if(zBuf!=0 ...)`), so the
+// WAL retains its committed frames instead of being truncated to zero.
+//
+// Without the fix, pager.close() unconditionally runs checkpointPassive into
+// p.file (which still references the renamed-away inode) and, in InProcess mode,
+// then truncates the WAL — committing frames into a path that is no longer the
+// real database and discarding them from the WAL. The assertion below (WAL not
+// truncated) fails in that case.
+func TestUnmoved_CloseSkipsCheckpointWhenMoved(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	walPath := path + "-wal"
+	opts := DefaultOptions()
+	opts.DisableAutoCheckpoint = true
+	opts.InProcess = true
+
+	db, err := testOpen(t, path, opts)
+	require.NoError(t, err)
+
+	unmovedCreateNS(t, db, "data")
+	unmovedPutN(t, db, "data", 50)
+
+	// Sanity: the WAL holds uncheckpointed frames before close.
+	require.Greater(t, db.pager.wal.index.maxFrame.Load(), uint32(0),
+		"precondition: WAL must hold uncheckpointed frames")
+	walBefore, err := os.Stat(walPath)
+	require.NoError(t, err)
+	require.Greater(t, walBefore.Size(), int64(0), "precondition: WAL must be non-empty")
+
+	// Rename the DB file out from under the open handle, then put an
+	// unrelated file back at the original path (the relink scenario the C
+	// guard protects against — close must not clobber it via a stale-WAL
+	// checkpoint, nor discard the WAL frames).
+	movedPath := filepath.Join(dir, "test.db.moved")
+	require.NoError(t, os.Rename(path, movedPath))
+	require.NoError(t, os.WriteFile(path, []byte("a different unrelated file"), 0o600))
+
+	require.NoError(t, db.Close())
+
+	// With the fix: checkpoint skipped -> WAL NOT truncated -> still holds
+	// the committed frames. Without the fix: checkpoint ran and (InProcess,
+	// last client) truncated the WAL to zero.
+	walAfter, err := os.Stat(walPath)
+	require.NoError(t, err)
+	assert.Greater(t, walAfter.Size(), int64(0),
+		"DRIFT-54 REGRESSION: close-time checkpoint must be skipped when the DB file was moved, leaving the WAL un-truncated")
+
+	// The unrelated file placed at the original path must be untouched by the
+	// skipped checkpoint.
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "a different unrelated file", string(got),
+		"close must not write checkpoint pages over the unrelated file now at the DB path")
+}
+
+// TestUnmoved_CloseCheckpointsWhenInPlace pins the happy path: when the DB file
+// is never moved, databaseIsUnmoved()==true and Close runs the unchanged
+// checkpoint+truncate path, so the WAL is truncated to zero on a last-client
+// InProcess close exactly as before the guard was added.
+func TestUnmoved_CloseCheckpointsWhenInPlace(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+	walPath := path + "-wal"
+	opts := DefaultOptions()
+	opts.DisableAutoCheckpoint = true
+	opts.InProcess = true
+
+	db, err := testOpen(t, path, opts)
+	require.NoError(t, err)
+
+	unmovedCreateNS(t, db, "data")
+	unmovedPutN(t, db, "data", 50)
+
+	require.Greater(t, db.pager.wal.index.maxFrame.Load(), uint32(0))
+
+	require.NoError(t, db.Close())
+
+	// File in place -> checkpoint ran -> WAL truncated to zero (last client).
+	walAfter, err := os.Stat(walPath)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), walAfter.Size(),
+		"in-place close must run the close-time checkpoint and truncate the WAL")
+
+	// Reopen and verify all data survived the checkpoint into the DB file.
+	db2, err := testOpen(t, path, opts)
+	require.NoError(t, err)
+	defer func() { _ = db2.Close() }()
+	rtx, err := db2.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+	ns, err := rtx.GetNamespace("data")
+	require.NoError(t, err)
+	n, err := rtx.Count(ns)
+	require.NoError(t, err)
+	assert.Equal(t, 50, n, "all 50 rows must survive the in-place close-time checkpoint")
 }
