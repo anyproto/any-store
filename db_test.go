@@ -165,6 +165,18 @@ func TestDb_StalledConnections(t *testing.T) {
 		// guaranteed to filter out a freshly-acquired connection.
 		assert.Nil(t, fx.StalledConnections(time.Hour))
 	})
+	t.Run("leaked write tx points at leaking caller", func(t *testing.T) {
+		fx := newFixture(t, &Config{StalledConnectionsDetectorEnabled: true})
+
+		leakedTx := leakWriteConnForStalledTest(t, fx)
+		defer func() { _ = leakedTx.Rollback() }()
+
+		traces := fx.StalledConnections(0)
+		require.Len(t, traces, 1)
+		// The trace must call out the leaking site so consumers can find it.
+		assert.Contains(t, traces[0], "leakWriteConnForStalledTest")
+		assert.Contains(t, traces[0], "newWriteTx")
+	})
 	t.Run("released connections drop out", func(t *testing.T) {
 		fx := newFixture(t, &Config{StalledConnectionsDetectorEnabled: true})
 
@@ -265,6 +277,16 @@ func TestDb_Close(t *testing.T) {
 		}
 	})
 
+}
+
+// leakWriteConnForStalledTest simulates a caller that acquires a write tx and
+// forgets to release it. The function name is asserted against in
+// TestDb_StalledConnections so the diagnostic actually points at the
+// leaking call site.
+func leakWriteConnForStalledTest(t *testing.T, fx *fixture) WriteTx {
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	return tx
 }
 
 func newFixture(t testing.TB, c ...*Config) *fixture {
