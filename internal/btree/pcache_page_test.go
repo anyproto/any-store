@@ -2949,16 +2949,17 @@ func TestMmapShm_RegionStatError(t *testing.T) {
 
 	ms := s.(*mmapShm)
 
-	// Close the fd via syscall. The Go *os.File object still exists
-	// but the underlying fd is invalid.
-	fd := ms.file.Fd()
-	_ = syscall.Close(int(fd))
+	// Close the file so region()'s Stat() fails. Use the *os.File's own Close
+	// rather than syscall.Close on the raw fd: a raw-fd close leaves the
+	// *os.File believing its fd is still open, so the GC finalizer later closes
+	// that fd number — which may have been recycled to an unrelated file by
+	// then, corrupting it (observed as spurious "bad file descriptor" failures
+	// in later tests).
+	require.NoError(t, ms.file.Close())
 
-	// Now Stat() will fail with EBADF
+	// Stat() on the closed file now fails, exercising region()'s Stat-error path.
 	_, err = ms.region(0, true)
 	assert.Error(t, err)
-
-	ms.file = nil // prevent double close
 }
 
 func TestMmapShm_RegionMmapError(t *testing.T) {

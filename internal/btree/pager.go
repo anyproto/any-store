@@ -372,7 +372,7 @@ func (p *pager) recycleCellSlice(s []cellData) {
 }
 
 // open opens the database file, initializes the WAL, and recovers if needed.
-func (p *pager) open() error {
+func (p *pager) open() (err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -388,6 +388,29 @@ func (p *pager) open() error {
 		return err
 	}
 	p.file = f
+
+	// Release the file/mmap/WAL on any error after this point. Open() returns
+	// the error to its caller and discards this pager, so without explicit
+	// cleanup the opened fds leak: a leaked *os.File is closed by the GC
+	// finalizer at an arbitrary later time, and on Linux that close can land on
+	// an fd the runtime has since recycled to an unrelated file — corrupting it
+	// (observed as spurious "bad file descriptor" errors in later operations).
+	defer func() {
+		if err != nil {
+			if p.dbMmap != nil {
+				_ = p.dbMmap.unmap()
+				p.dbMmap = nil
+			}
+			if p.wal != nil {
+				_ = p.wal.close(false)
+				p.wal = nil
+			}
+			if p.file != nil {
+				_ = p.file.Close()
+				p.file = nil
+			}
+		}
+	}()
 
 	// Initialize the optional mmap reader. No syscalls here — the
 	// underlying syscall.Mmap is deferred until the first fetch() to
