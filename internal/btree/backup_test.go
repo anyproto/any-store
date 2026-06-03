@@ -563,6 +563,7 @@ func TestBackup_PreservesSrcPage1HeaderFields(t *testing.T) {
 	// --- Source: distinct header metadata + a non-empty freelist. ---
 	src, err := testOpen(t, srcPath, opts)
 	require.NoError(t, err)
+	defer src.Close()
 	stx, err := src.BeginWrite()
 	require.NoError(t, err)
 	sns, err := stx.CreateNamespace("data")
@@ -601,6 +602,7 @@ func TestBackup_PreservesSrcPage1HeaderFields(t *testing.T) {
 	// non-empty freelist and distinct metadata. ---
 	dst, err := testOpen(t, dstPath, opts)
 	require.NoError(t, err)
+	defer dst.Close()
 	dtx, err := dst.BeginWrite()
 	require.NoError(t, err)
 	_, err = dtx.CreateNamespace("data")
