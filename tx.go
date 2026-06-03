@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 )
@@ -129,6 +130,12 @@ func (w writeTx) Commit() error {
 		}
 		err := w.writeTx.Commit()
 		if err == nil && w.modified {
+			// Publish each index's mutated sketchLive to sketchFrozen so
+			// readers atomically observe the just-committed view. Done
+			// AFTER pager.commit succeeds so a failed commit doesn't leak
+			// uncommitted increments into the read-side snapshot.
+			w.db.publishFrozenSketches()
+			w.db.lastSketchRefresh.Store(time.Now().UnixNano())
 			w.db.recoveryController.OnWriteEvent()
 		}
 		return err

@@ -146,7 +146,7 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		Offset:      int(q.offset),
 		Buf:         buf,
 		TotalDocs:   q.docCount(btx),
-		Indexes:     q.buildCBOIndexesInto(nil, &br),
+		Indexes:     q.buildCBOIndexesInto(nil, &br, btx.Writable()),
 		IndexHints:  q.buildIndexHints(),
 		FieldBounds: &br,
 	})
@@ -207,7 +207,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		Offset:      int(q.offset),
 		Buf:         buf,
 		TotalDocs:   q.docCount(btx),
-		Indexes:     q.buildCBOIndexesInto(nil, &br),
+		Indexes:     q.buildCBOIndexesInto(nil, &br, btx.Writable()),
 		IndexHints:  q.buildIndexHints(),
 		FieldBounds: &br,
 	})
@@ -337,7 +337,7 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 		Offset:      int(q.offset),
 		Buf:         buf,
 		TotalDocs:   q.docCount(btx),
-		Indexes:     q.buildCBOIndexesInto(nil, &br),
+		Indexes:     q.buildCBOIndexesInto(nil, &br, btx.Writable()),
 		IndexHints:  q.buildIndexHints(),
 		FieldBounds: &br,
 	})
@@ -436,11 +436,17 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 
 	br := q.buildBoundsResult()
 	var cboBuf [8]qplanner.CBOIndex
-	cboIndexes := q.buildCBOIndexesInto(cboBuf[:0], &br)
 
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		buf := q.c.db.syncPool.GetDocBuf()
 		defer q.c.db.syncPool.ReleaseDocBuf(buf)
+
+		// buildCBOIndexesInto needs to know the tx kind (read vs the
+		// embedded read of a write tx) to pick sketchLive vs sketchFrozen.
+		// Built inside the callback so doReadTx's getReadTx resolution —
+		// which may surface a pre-existing in-context write tx — is in
+		// effect.
+		cboIndexes := q.buildCBOIndexesInto(cboBuf[:0], &br, tx.Writable())
 
 		plan := qplanner.BuildPlan(&qplanner.PlanParams{
 			Tx:          tx,
@@ -502,9 +508,13 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
 	br := q.buildBoundsResult()
-	cboIndexes := q.buildCBOIndexesInto(nil, &br)
 
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		// See the matching note in Count: build inside the callback so the
+		// tx-kind switch (sketchLive vs sketchFrozen) sees the actual
+		// resolved tx, which may be an in-context write tx.
+		cboIndexes := q.buildCBOIndexesInto(nil, &br, tx.Writable())
+
 		plan := qplanner.BuildPlan(&qplanner.PlanParams{
 			Tx:          tx,
 			DataNs:      q.c.ns,
@@ -565,12 +575,28 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 
 // docCount returns the total number of documents from the first index's sketch DocCount.
 // Falls back to tx.Count() if no indexes have sketches.
-func (q *collQuery) docCount(tx interface {
-	Count(ns *btree.Namespace) (int, error)
-}) int {
+//
+// Source of truth differs by tx kind:
+//   - Read tx: sketchFrozen (immutable atomic-Pointer snapshot, stable
+//     under concurrent in-process writers — Count() never sees torn
+//     mid-mutation values).
+//   - Write tx: sketchLive (writer's working copy including in-flight
+//     inserts/deletes from this same tx). Required so the planner
+//     selectivity estimate inside a write tx reflects the docs the
+//     writer just inserted but hasn't committed yet — otherwise plans
+//     for queries-within-the-writer's-own-tx misjudge cardinality and
+//     fall back to FullScan.
+func (q *collQuery) docCount(tx *btree.ReadTx) int {
+	inWriteTx := tx.Writable()
 	for _, idx := range q.c.indexes {
-		if idx.sketch != nil {
-			return int(idx.sketch.GetDocCount())
+		var s *qplanner.IndexSketch
+		if inWriteTx {
+			s = idx.sketchLive.Load()
+		} else {
+			s = idx.readSketch()
+		}
+		if s != nil {
+			return int(s.GetDocCount())
 		}
 	}
 	count, _ := tx.Count(q.c.ns)
@@ -669,8 +695,10 @@ func (q *collQuery) buildBoundsResult() qplanner.BoundsResult {
 	return br
 }
 
-// buildCBOIndexesInto builds CBOIndex entries into the provided buffer using pre-computed bounds.
-func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.BoundsResult) []qplanner.CBOIndex {
+// buildCBOIndexesInto builds CBOIndex entries into the provided buffer using
+// pre-computed bounds. inWriteTx selects the sketch source — see the
+// comment inside the loop and docCount for rationale.
+func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.BoundsResult, inWriteTx bool) []qplanner.CBOIndex {
 	result := buf
 
 	var sortFields []query.SortField
@@ -708,9 +736,21 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 			exactSort, partialSort, sortMatchStart = qplanner.IndexSortMatch(info, sortFields, equalityPrefix)
 		}
 
+		// Planner uses sketchLive when inside a write tx (caller hands in
+		// inWriteTx) so selectivity estimation reflects in-flight
+		// inserts/deletes from the same tx. In a read tx use sketchFrozen
+		// (snapshot-stable, won't shift mid-plan). Either way the
+		// pointer is atomic.Load-ed and the underlying sketch fields are
+		// atomic — race-free with concurrent in-process writers.
+		var sketch *qplanner.IndexSketch
+		if inWriteTx {
+			sketch = idx.sketchLive.Load()
+		} else {
+			sketch = idx.readSketch()
+		}
 		cboIdx := qplanner.CBOIndex{
 			Info:           info,
-			Sketch:         idx.sketch,
+			Sketch:         sketch,
 			Bounds:         bounds,
 			Reverse:        idx.reverse,
 			PointLookup:    pointLookup,

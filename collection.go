@@ -176,6 +176,7 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 				return idxErr
 			}
 			c.loadSketch(tx, idx)
+			idx.publishFrozen() // make initial values visible to readers
 			c.indexes = append(c.indexes, idx)
 		}
 		return nil
@@ -588,20 +589,23 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 		return nil, err
 	}
 
-	// Initialize sketch for the new index
-	idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
+	// Initialize sketch for the new index. sketchLive is the writer-side
+	// mutable copy buildIndex/insertKeys mutate; sketchFrozen gets a
+	// snapshot below so readers can see the just-built sketch immediately.
+	idx.sketchLive.Store(qplanner.NewIndexSketch(qplanner.DefaultSketchSize))
 
-	// Build index from existing documents (also populates sketch via insertKeys)
+	// Build index from existing documents (also populates sketchLive via insertKeys)
 	if err = c.buildIndex(tx, idx); err != nil {
 		return nil, err
 	}
 
 	// Persist the sketch
 	skKey := sketchKey(c.name, info.Name)
-	if err = tx.Put(c.db.systemNS, skKey, idx.sketch.MarshalBinary(nil)); err != nil {
+	if err = tx.Put(c.db.systemNS, skKey, idx.sketchLive.Load().MarshalBinary(nil)); err != nil {
 		return nil, err
 	}
 	idx.sketchModified = false
+	idx.publishFrozen()
 
 	return idx, nil
 }
@@ -755,47 +759,40 @@ func (c *collection) buildIndex(tx *btree.WriteTx, idx *index) error {
 	return nil
 }
 
-// loadSketch loads a sketch from the _system namespace for the given index.
+// loadSketch loads a sketch from the _system namespace into idx.sketchLive
+// (the writer's working copy). Callers that need readers to see the loaded
+// values must also publish to sketchFrozen — for the write-path reload this
+// happens via reloadLiveAndPublish below; for the initial open path
+// (openCollection) the caller publishes after the load.
 //
-// Concurrency contract: this function is called both from createIndex
-// (before the new index is appended to c.indexes — readers can't see it
-// yet) and from reloadSketches via checkStale (under c.mu, but
-// concurrent readers may already hold pointers into c.indexes and read
-// idx.sketch without c.mu — see (*collQuery).docCount and the
-// CBOIndex.Sketch escape in buildCBOIndexesInto).
-//
-// To avoid a data race on the idx.sketch pointer field with those
-// readers, the existing sketch is updated in place via UnmarshalBinary
-// instead of being replaced. UnmarshalBinary writes Buckets and
-// docCount via atomic stores (see internal/qplanner/sketch.go), so
-// concurrent GetDocCount / Estimate readers see consistent values
-// without locking. Only the very first call (idx.sketch == nil)
-// allocates a new sketch — that path is reached only from createIndex
-// before the index is visible to readers, so the assignment is
-// unobservable.
+// Only writers and the open path call this; both hold writeMu (or run before
+// the index is visible to any reader), so mutating sketchLive in place is
+// safe from concurrent reads.
 func (c *collection) loadSketch(tx *btree.ReadTx, idx *index) {
-	if idx.sketch == nil {
-		idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
+	live := idx.sketchLive.Load()
+	if live == nil {
+		live = qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
+		idx.sketchLive.Store(live)
 	}
 	key := sketchKey(c.name, idx.info.Name)
 	data, err := tx.AppendValue(c.db.systemNS, key, nil)
 	if err != nil {
-		// No persisted sketch data; keep current in-memory state. Used to
-		// reset to a fresh sketch here, which (a) raced with concurrent
-		// readers on the pointer field and (b) silently dropped any
-		// in-memory counter increments not yet persisted. Preserving
-		// state is the correct behaviour in both respects.
+		// No persisted sketch data; keep current in-memory state.
+		// Preserves any in-memory counter increments not yet persisted.
 		return
 	}
-	idx.sketch.UnmarshalBinary(data)
+	live.UnmarshalBinary(data)
 }
 
-// persistSketches writes all modified sketches to the _system namespace.
+// persistSketches writes all modified sketchLive bytes to the _system
+// namespace. The matching publishFrozen call happens later, after
+// pager.commit succeeds (writeTx.Commit), so readers never see a snapshot
+// the writer hasn't actually committed.
 func (c *collection) persistSketches(tx *btree.WriteTx) error {
 	for _, idx := range c.indexes {
 		if idx.sketchModified {
 			key := sketchKey(c.name, idx.info.Name)
-			idx.sketchBuf = idx.sketch.MarshalBinary(idx.sketchBuf)
+			idx.sketchBuf = idx.sketchLive.Load().MarshalBinary(idx.sketchBuf)
 			if err := tx.Put(c.db.systemNS, key, idx.sketchBuf); err != nil {
 				return err
 			}
@@ -803,6 +800,32 @@ func (c *collection) persistSketches(tx *btree.WriteTx) error {
 		}
 	}
 	return nil
+}
+
+// publishFrozenSketches snapshots sketchLive into sketchFrozen for every
+// index in this collection. Called after a successful pager.commit so
+// readers atomically observe the just-committed sketch.
+func (c *collection) publishFrozenSketches() {
+	for _, idx := range c.indexes {
+		idx.publishFrozen()
+	}
+}
+
+// resetLiveSketchesFromFrozen overwrites each index's sketchLive with a
+// clone of its current sketchFrozen. Called at the start of every write tx
+// so that (a) any uncommitted increments from a previously rolled-back tx
+// are dropped, and (b) any reader-side reload that updated sketchFrozen
+// since our last write is reflected in sketchLive — keeping the writer's
+// base in sync with the latest view without re-reading disk.
+func (c *collection) resetLiveSketchesFromFrozen() {
+	for _, idx := range c.indexes {
+		frozen := idx.sketchFrozen.Load()
+		if frozen == nil {
+			continue
+		}
+		idx.sketchLive.Store(frozen.Clone())
+		idx.sketchModified = false
+	}
 }
 
 // loadByIdRead loads a document by ID using a read transaction

@@ -82,6 +82,24 @@ func (s *IndexSketch) GetDocCount() uint64 {
 	return s.docCount.Load()
 }
 
+// Clone returns a deep copy of the sketch. Used by the copy-on-write
+// snapshot mechanism in collection/index.go: writer mutates sketchLive in
+// place, and on commit success a Clone is atomically published as the new
+// reader-visible sketchFrozen. Bucket reads use atomic.Load so the snapshot
+// is consistent even if the source is being concurrently mutated (though
+// in the live/frozen design the source is single-writer under writeMu).
+func (s *IndexSketch) Clone() *IndexSketch {
+	dst := &IndexSketch{
+		Buckets: make([]uint64, s.Size),
+		Size:    s.Size,
+	}
+	for i := range s.Size {
+		atomic.StoreUint64(&dst.Buckets[i], atomic.LoadUint64(&s.Buckets[i]))
+	}
+	dst.docCount.Store(s.docCount.Load())
+	return dst
+}
+
 // MarshalBinary serializes the sketch into dst, reusing its capacity when possible.
 // Format: [buckets (8*size bytes)] [docCount (8 bytes)]
 func (s *IndexSketch) MarshalBinary(dst []byte) []byte {

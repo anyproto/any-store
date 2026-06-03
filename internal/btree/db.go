@@ -1356,6 +1356,13 @@ type ReadTx struct {
 // walHdr.mxFrame per the per-connection-hdr spec.
 func (tx *ReadTx) WalMaxFrame() uint32 { return tx.walHdr.mxFrame }
 
+// Writable reports whether this ReadTx is the embedded ReadTx of a WriteTx
+// (i.e., the caller may see this tx's own uncommitted writes through MVCC).
+// Used by anystore callers that need to choose between sketchLive (in-write-
+// tx view, includes in-flight mutations) and sketchFrozen (last-committed
+// view, snapshot-stable).
+func (tx *ReadTx) Writable() bool { return tx.writable }
+
 // txGetPage fetches a page respecting MVCC snapshot isolation.
 // For write transactions, pages are fetched from the writer cache or WAL.
 // For read transactions, getPageReader uses a private cache for snapshot isolation.

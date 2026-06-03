@@ -16,6 +16,7 @@ import (
 	"github.com/anyproto/any-store/v2/internal/durability"
 	"github.com/anyproto/any-store/v2/internal/durability/sentinel"
 	"github.com/anyproto/any-store/v2/internal/objectid"
+	"github.com/anyproto/any-store/v2/internal/qplanner"
 	"github.com/anyproto/any-store/v2/syncpool"
 )
 
@@ -122,10 +123,11 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	sPool := syncpool.NewSyncPool(config.SyncPoolElementMaxSize)
 
 	ds := &db{
-		instanceId:        objectid.NewObjectID().Hex(),
-		config:            config,
-		syncPool:          sPool,
-		openedCollections: make(map[string]Collection),
+		instanceId:          objectid.NewObjectID().Hex(),
+		config:              config,
+		syncPool:            sPool,
+		openedCollections:   make(map[string]Collection),
+		sketchReadStaleness: config.SketchReadStaleness,
 	}
 
 	var quickCheckNeeded bool
@@ -241,6 +243,20 @@ type db struct {
 	dirtyQuickCheckDuration time.Duration
 	mu                      sync.Mutex
 	writeMu                 sync.Mutex
+
+	// sketchReadStaleness gates read-tx sketch reloads from disk. Zero
+	// (default) disables the read-side reload entirely; cross-process data
+	// updates land in our sketches via the next write tx. A positive value
+	// caps how long a reader can see stale sketch values across processes —
+	// at most this duration between disk-driven refreshes.
+	sketchReadStaleness time.Duration
+
+	// lastSketchRefresh records unix-nano of the last event that brought
+	// the in-memory sketches in line with disk: a successful writer commit
+	// (sketchLive → sketchFrozen), a write-path reload, or a read-path
+	// time-gated reload. checkStaleForRead skips the disk reload if
+	// (now - lastSketchRefresh) < sketchReadStaleness.
+	lastSketchRefresh atomic.Int64
 }
 
 func collKey(name string) []byte {
@@ -325,19 +341,23 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 	return rTx, nil
 }
 
-// checkStaleForWrite is invoked when opening a write transaction. It always
-// reloads sketches on either schema- or data-cookie staleness so that the
-// upcoming insertKeys/deleteKeys mutate against the latest cross-process
-// committed sketch state — preserving write consistency across processes
-// (a peer's increments are merged in before we apply our own delta on top).
+// checkStaleForWrite is invoked when opening a write transaction. It
+// always resets each index's sketchLive from sketchFrozen so that
+//   (a) any uncommitted increments from a previously rolled-back tx are
+//       dropped, and
+//   (b) any reader-side reload that updated sketchFrozen since our last
+//       write is picked up into sketchLive — keeping the writer's base in
+//       sync with the latest known view without re-reading disk.
+// If on top of that the cross-process FCC/SC indicates a peer has
+// committed since our last catch-up, sketchLive is reloaded from disk
+// (overwriting the frozen-clone) so the writer's deltas accumulate on top
+// of the peer's persisted state — preserving cross-process write
+// consistency.
 //
-// Safe to reload here even when concurrent in-process readers are holding
-// idx.sketch references: BeginWrite holds db.writeMu (cross-process WAL
-// writer lock) and there is no other in-flight writer, our tx's snapshot
-// reflects the latest committed sketch, and UnmarshalBinary updates the
-// existing IndexSketch in place via atomic stores (collection.loadSketch /
-// internal/qplanner.IndexSketch).
+// Safe under writeMu (cross-process WAL writer lock + in-process serial),
+// so no concurrent writer can race the sketchLive mutation.
 func (db *db) checkStaleForWrite(tx *btree.ReadTx) {
+	db.resetLiveSketchesFromFrozen()
 	if !tx.IsSchemaStale() && !tx.IsDataStale() {
 		return
 	}
@@ -364,16 +384,26 @@ func (db *db) checkStaleForWrite(tx *btree.ReadTx) {
 // checkStaleForWrite) or at DB reopen.
 func (db *db) checkStaleForRead(tx *btree.ReadTx) {
 	schemaStale := tx.IsSchemaStale()
-	if !schemaStale && !tx.IsDataStale() {
+	dataStale := tx.IsDataStale()
+	if !schemaStale && !dataStale {
 		return
 	}
 	if schemaStale {
 		db.reloadSketches(tx)
 	}
 	db.btreeDB.UpdateLocalCounters(tx.DiskFileChangeCounter(), tx.DiskSchemaCookie())
+	if !schemaStale && dataStale {
+		// Time-gated, lock-free read-path reload — bounded staleness
+		// against peer-process data writes without racing in-process
+		// writers (sketchLive is untouched; only sketchFrozen is swapped).
+		db.reloadFrozenSketchesIfStale()
+	}
 }
 
-// reloadSketches reloads all sketch data from the _system namespace for opened collections.
+// reloadSketches reloads sketch data from the _system namespace into each
+// open index's sketchLive AND publishes the result to sketchFrozen.
+// Called from checkStaleForWrite (under writeMu) and from the schema-stale
+// branch of checkStaleForRead (rare, only on DDL).
 func (db *db) reloadSketches(tx *btree.ReadTx) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -382,9 +412,81 @@ func (db *db) reloadSketches(tx *btree.ReadTx) {
 		c.mu.Lock()
 		for _, idx := range c.indexes {
 			c.loadSketch(tx, idx)
+			idx.publishFrozen()
 		}
 		c.mu.Unlock()
 	}
+	db.lastSketchRefresh.Store(time.Now().UnixNano())
+}
+
+// resetLiveSketchesFromFrozen restores sketchLive from sketchFrozen for
+// every open index. Cheap (~one IndexSketch.Clone per index, ~8KB memcpy),
+// called at writer setup. See checkStaleForWrite for rationale.
+func (db *db) resetLiveSketchesFromFrozen() {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	for _, coll := range db.openedCollections {
+		c := coll.(*collection)
+		c.mu.Lock()
+		c.resetLiveSketchesFromFrozen()
+		c.mu.Unlock()
+	}
+}
+
+// publishFrozenSketches snapshots sketchLive into sketchFrozen for every
+// open index. Called by writeTx.Commit AFTER pager.commit succeeds.
+func (db *db) publishFrozenSketches() {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	for _, coll := range db.openedCollections {
+		c := coll.(*collection)
+		c.mu.Lock()
+		c.publishFrozenSketches()
+		c.mu.Unlock()
+	}
+}
+
+// reloadFrozenSketchesIfStale runs the read-path lock-free reload: open a
+// fresh BeginReadFast tx (captures the latest committed snapshot), decode
+// each on-disk sketch into a brand-new IndexSketch, and publish it to
+// idx.sketchFrozen via a single atomic Pointer store. No writer lock, no
+// merge games, no race with concurrent in-process writers (sketchLive is
+// untouched). Time-gated by Config.SketchReadStaleness so a hot read loop
+// doesn't pay this cost on every call.
+func (db *db) reloadFrozenSketchesIfStale() {
+	staleness := db.sketchReadStaleness
+	if staleness <= 0 {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := db.lastSketchRefresh.Load()
+	if now-last < int64(staleness) {
+		return
+	}
+	freshTx, err := db.btreeDB.BeginReadFast()
+	if err != nil {
+		return
+	}
+	defer freshTx.Rollback()
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	for _, coll := range db.openedCollections {
+		c := coll.(*collection)
+		c.mu.Lock()
+		for _, idx := range c.indexes {
+			data, err := freshTx.AppendValue(db.systemNS, sketchKey(c.name, idx.info.Name), nil)
+			if err != nil {
+				continue
+			}
+			fresh := qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
+			fresh.UnmarshalBinary(data)
+			idx.sketchFrozen.Store(fresh)
+		}
+		c.mu.Unlock()
+	}
+	db.lastSketchRefresh.Store(time.Now().UnixNano())
+	db.btreeDB.UpdateLocalCounters(freshTx.DiskFileChangeCounter(), freshTx.DiskSchemaCookie())
 }
 
 func mergeCollOpts(opts []CollectionOptions) CollectionOptions {

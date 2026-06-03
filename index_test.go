@@ -393,9 +393,9 @@ func TestIndex_InsertKeys_IdempotentSameDoc(t *testing.T) {
 	// Snapshot the encoded key by value — keysBuf is reused by the second
 	// insertKeys call and its backing storage will be overwritten in place.
 	var keyCopy []byte
-	if idx.sketch != nil {
+	if live := idx.sketchLive.Load(); live != nil {
 		keyCopy = append(keyCopy, idx.keysBuf[0]...)
-		sketchKeyCountBefore = idx.sketch.Estimate(keyCopy)
+		sketchKeyCountBefore = live.Estimate(keyCopy)
 	}
 
 	// Second insert with the same item: unique seek finds the existing entry
@@ -413,8 +413,8 @@ func TestIndex_InsertKeys_IdempotentSameDoc(t *testing.T) {
 	// If the index has a sketch, the per-key bucket must not advance on the
 	// idempotent path — otherwise per-value selectivity estimates would drift
 	// on every duplicate re-insert.
-	if idx.sketch != nil {
-		assert.Equal(t, sketchKeyCountBefore, idx.sketch.Estimate(keyCopy),
+	if live := idx.sketchLive.Load(); live != nil {
+		assert.Equal(t, sketchKeyCountBefore, live.Estimate(keyCopy),
 			"sketch per-key bucket must not increment on idempotent re-insert")
 	}
 

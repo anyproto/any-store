@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
@@ -65,7 +66,28 @@ type index struct {
 	fieldPaths [][]string
 	reverse    []bool
 
-	sketch         *qplanner.IndexSketch
+	// sketchLive is the writer's working sketch — its IndexSketch.Buckets
+	// and docCount fields are mutated by insertKeys/deleteKeys under the
+	// WAL writer lock (writeMu). The pointer is held in an atomic.Pointer
+	// because resetLiveSketchesFromFrozen reassigns it at every write tx
+	// setup (clone of sketchFrozen so any uncommitted increments from a
+	// previously rolled-back tx are dropped), and the planner — which
+	// runs from both read and write paths in any goroutine — reads
+	// sketchLive concurrently. Atomic Load/Store on the pointer eliminates
+	// the data race; the underlying sketch fields are themselves atomic.
+	//
+	// Reloaded from disk by checkStaleForWrite when the cross-process
+	// FCC indicates a peer has written since our last catch-up.
+	sketchLive atomic.Pointer[qplanner.IndexSketch]
+
+	// sketchFrozen is the read-side snapshot — the last committed sketch
+	// view. Published atomically by:
+	//   (a) writer's successful commit: snap = sketchLive.Clone(); store;
+	//   (b) reader's time-gated probabilistic reload from disk.
+	// Readers do a single atomic Load and operate on the returned
+	// pointer's immutable fields — no atomics, no locking, no race.
+	sketchFrozen atomic.Pointer[qplanner.IndexSketch]
+
 	sketchBuf      []byte
 	sketchModified bool
 
@@ -77,6 +99,24 @@ type index struct {
 	uniqBuf     [][]anyenc.Tuple
 	fullKeyBuf anyenc.Tuple // reusable buffer for full keys (key+docId)
 	seekBuf    anyenc.Tuple // reusable buffer for unique constraint seek results
+}
+
+// readSketch returns the latest committed sketch snapshot — what readers
+// (planner, Stats, docCount, etc.) must use. Nil if the index has no
+// sketch (currently always non-nil after openCollection/createIndex).
+func (idx *index) readSketch() *qplanner.IndexSketch {
+	return idx.sketchFrozen.Load()
+}
+
+// publishFrozen snapshots sketchLive into sketchFrozen. Called by the
+// writer after a successful pager.commit so readers see the just-
+// committed view on their next read.
+func (idx *index) publishFrozen() {
+	live := idx.sketchLive.Load()
+	if live == nil {
+		return
+	}
+	idx.sketchFrozen.Store(live.Clone())
 }
 
 func validateIndexField(s string) (err error) {
@@ -175,13 +215,13 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 		if err := tx.Put(idx.ns, idx.fullKeyBuf, entryValue); err != nil {
 			return err
 		}
-		if idx.sketch != nil {
-			idx.sketch.Increment(key)
+		if live := idx.sketchLive.Load(); live != nil {
+			live.Increment(key)
 			idx.sketchModified = true
 		}
 	}
-	if idx.sketch != nil {
-		idx.sketch.IncrementDocCount()
+	if live := idx.sketchLive.Load(); live != nil {
+		live.IncrementDocCount()
 		idx.sketchModified = true
 	}
 	return nil
@@ -200,13 +240,13 @@ func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 				return err
 			}
 		}
-		if idx.sketch != nil {
-			idx.sketch.Decrement(key)
+		if live := idx.sketchLive.Load(); live != nil {
+			live.Decrement(key)
 			idx.sketchModified = true
 		}
 	}
-	if idx.sketch != nil {
-		idx.sketch.DecrementDocCount()
+	if live := idx.sketchLive.Load(); live != nil {
+		live.DecrementDocCount()
 		idx.sketchModified = true
 	}
 	return nil

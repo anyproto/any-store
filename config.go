@@ -117,6 +117,17 @@ type Config struct {
 	// runtime mutation.
 	OnIntegrityError func(IntegrityError)
 
+	// SketchReadStaleness caps how stale a read-side index sketch is
+	// allowed to get before a lock-free disk reload runs. Default 1s: a
+	// read transaction whose snapshot indicates a peer process committed
+	// new data triggers, at most once per second, a fresh BeginReadFast
+	// that decodes each sketch from disk and atomically publishes it to
+	// the read-side snapshot pointer. Single-process workloads almost
+	// never hit this path — own-process writer commits already refresh
+	// the gate. Zero disables the read-side reload entirely; readers
+	// then catch up only via their own next write or DB reopen.
+	SketchReadStaleness time.Duration
+
 	// ContinueOnIntegrityError, when true, lets reads of corrupt pages
 	// return their (potentially garbage) bytes instead of erroring with
 	// ErrPageIntegrity. The OnIntegrityError callback still fires —
@@ -238,6 +249,9 @@ type DurabilityConfig struct {
 func (c *Config) setDefaults() {
 	if c.SyncPoolElementMaxSize <= 0 {
 		c.SyncPoolElementMaxSize = 2 << 20
+	}
+	if c.SketchReadStaleness == 0 {
+		c.SketchReadStaleness = time.Second
 	}
 
 	if c.Durability.AutoFlush {

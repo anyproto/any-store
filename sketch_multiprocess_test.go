@@ -56,7 +56,7 @@ func TestSketch_MultiProcess_WriteConsistency(t *testing.T) {
 
 	c := coll.(*collection)
 	c.mu.Lock()
-	parentBefore := c.indexes[0].sketch.GetDocCount()
+	parentBefore := c.indexes[0].readSketch().GetDocCount()
 	c.mu.Unlock()
 	require.Equal(t, uint64(parentInitial), parentBefore)
 
@@ -78,7 +78,7 @@ func TestSketch_MultiProcess_WriteConsistency(t *testing.T) {
 		anyenc.MustParseJson(`{"id":9000,"k":9000}`)))
 
 	c.mu.Lock()
-	parentAfter := c.indexes[0].sketch.GetDocCount()
+	parentAfter := c.indexes[0].readSketch().GetDocCount()
 	c.mu.Unlock()
 	require.Equal(t, uint64(expectedTotal), parentAfter,
 		"parent's in-memory sketch after its post-child write must include child's inserts")
@@ -119,7 +119,7 @@ func sketchMultiProcessChild(t *testing.T, dbPath string) {
 
 	c := coll.(*collection)
 	c.mu.Lock()
-	got := c.indexes[0].sketch.GetDocCount()
+	got := c.indexes[0].readSketch().GetDocCount()
 	c.mu.Unlock()
 	require.Equal(t, uint64(parentInitial+childInserts), got,
 		"child's in-memory sketch after its inserts must include parent's pre-existing docs (loaded from disk on open)")
