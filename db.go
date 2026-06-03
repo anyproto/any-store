@@ -292,7 +292,7 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 		return nil, err
 	}
 
-	db.checkStale(&btWtx.ReadTx)
+	db.checkStaleForWrite(&btWtx.ReadTx)
 
 	version := newTxVersion()
 	tx := txPool.Get().(*commonTx)
@@ -312,7 +312,7 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 		return nil, err
 	}
 
-	db.checkStale(btRtx)
+	db.checkStaleForRead(btRtx)
 
 	version := newTxVersion()
 	tx := txPool.Get().(*commonTx)
@@ -325,13 +325,52 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 	return rTx, nil
 }
 
-// checkStale checks if the on-disk data or schema has changed (by another process)
-// and reloads in-memory caches (sketches, index metadata) if necessary.
-func (db *db) checkStale(tx *btree.ReadTx) {
-	if tx.IsSchemaStale() || tx.IsDataStale() {
-		db.reloadSketches(tx)
-		db.btreeDB.UpdateLocalCounters(tx.DiskFileChangeCounter(), tx.DiskSchemaCookie())
+// checkStaleForWrite is invoked when opening a write transaction. It always
+// reloads sketches on either schema- or data-cookie staleness so that the
+// upcoming insertKeys/deleteKeys mutate against the latest cross-process
+// committed sketch state — preserving write consistency across processes
+// (a peer's increments are merged in before we apply our own delta on top).
+//
+// Safe to reload here even when concurrent in-process readers are holding
+// idx.sketch references: BeginWrite holds db.writeMu (cross-process WAL
+// writer lock) and there is no other in-flight writer, our tx's snapshot
+// reflects the latest committed sketch, and UnmarshalBinary updates the
+// existing IndexSketch in place via atomic stores (collection.loadSketch /
+// internal/qplanner.IndexSketch).
+func (db *db) checkStaleForWrite(tx *btree.ReadTx) {
+	if !tx.IsSchemaStale() && !tx.IsDataStale() {
+		return
 	}
+	db.reloadSketches(tx)
+	db.btreeDB.UpdateLocalCounters(tx.DiskFileChangeCounter(), tx.DiskSchemaCookie())
+}
+
+// checkStaleForRead is invoked when opening a read transaction. It reloads
+// sketches only on schema-cookie staleness, never on data-only staleness.
+//
+// Data-only reload from a read tx races destructively with concurrent
+// in-process writers: WriteTx.Commit (internal/btree/db.go) advances the
+// on-disk FileChangeCount inside pager.commit and only then stores
+// localFileChangeCounter, and a reader caught in that gap sees
+// IsDataStale=true. Its tx snapshot was usually captured before the writer's
+// commit, so loadSketch reads the older sketch bytes from that snapshot and
+// UnmarshalBinary overwrites the writer's in-memory increments — silently
+// losing counts (caught by stats_test.go's "concurrent with writes" subtest).
+//
+// We accept slightly-stale reads in exchange for write consistency: the
+// sketch feeds the planner's selectivity estimator (qplanner), where freshness
+// is a heuristic input, not a correctness invariant. Cross-process data
+// updates land in our in-memory sketch on the next write tx (which calls
+// checkStaleForWrite) or at DB reopen.
+func (db *db) checkStaleForRead(tx *btree.ReadTx) {
+	schemaStale := tx.IsSchemaStale()
+	if !schemaStale && !tx.IsDataStale() {
+		return
+	}
+	if schemaStale {
+		db.reloadSketches(tx)
+	}
+	db.btreeDB.UpdateLocalCounters(tx.DiskFileChangeCounter(), tx.DiskSchemaCookie())
 }
 
 // reloadSketches reloads all sketch data from the _system namespace for opened collections.
