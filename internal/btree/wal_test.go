@@ -1687,3 +1687,858 @@ func TestWriteFrames_SavepointRollbackResetsIReCksum(t *testing.T) {
 	w.resetIReCksumIfPast(0)
 	assert.Equal(t, uint32(0), w.iReCksum, "rollback past iReCksum should clear it")
 }
+
+// fileSize returns the physical on-disk size of the database file in bytes.
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	require.NoError(t, err)
+	return fi.Size()
+}
+
+// TestCheckpoint_PhysicalTruncateAfterShrink asserts that a full-backfill
+// checkpoint physically shrinks the DB file down to the committed page count
+// after a shrinking commit (here driven by backup's truncateTo, the same path
+// used by sqlite3PagerTruncateImage / VACUUM). Mirrors SQLite walCheckpoint
+// (wal.c:2320-2329): when mxSafeFrame==hdr.mxFrame the DB file is truncated to
+// hdr.nPage*szPage.
+//
+// Before the fix, checkpointWithMode only wrote backfilled pages via WriteAt +
+// fdatasync and never called dbFile.Truncate, so the file only ever grew and
+// this test failed (the file stayed at its pre-shrink size).
+func TestCheckpoint_PhysicalTruncateAfterShrink(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.DisableAutoCheckpoint = true
+	opts.InProcess = true
+
+	srcPath := filepath.Join(dir, "src.db")
+	dstPath := filepath.Join(dir, "dst.db")
+
+	src, err := testOpen(t, srcPath, opts)
+	require.NoError(t, err)
+	defer func() { _ = src.Close() }()
+	dst, err := testOpen(t, dstPath, opts)
+	require.NoError(t, err)
+	defer func() { _ = dst.Close() }()
+
+	// src: a tiny database.
+	stx, err := src.BeginWrite()
+	require.NoError(t, err)
+	sns, err := stx.CreateNamespace("data")
+	require.NoError(t, err)
+	require.NoError(t, stx.Put(sns, []byte("small"), []byte("v")))
+	require.NoError(t, stx.Commit())
+
+	// dst: a much larger database (many pages).
+	dtx, err := dst.BeginWrite()
+	require.NoError(t, err)
+	dns, err := dtx.CreateNamespace("data")
+	require.NoError(t, err)
+	require.NoError(t, dtx.Commit())
+	dtx2, err := dst.BeginWrite()
+	require.NoError(t, err)
+	fat := make([]byte, 256)
+	for i := 0; i < 800; i++ {
+		require.NoError(t, dtx2.Put(dns, fmt.Appendf(nil, "dst-%05d", i), fat))
+	}
+	require.NoError(t, dtx2.Commit())
+
+	// Checkpoint dst so the LARGE image is physically materialized on disk.
+	require.NoError(t, dst.Checkpoint(CheckpointFull))
+	bigPages := dst.DatabaseSize()
+	pageSize := int64(dst.PageSize())
+	bigFileSize := fileSize(t, dstPath)
+	require.Equal(t, int64(bigPages)*pageSize, bigFileSize,
+		"after checkpointing the large image the file should be bigPages*pageSize")
+	require.Greater(t, bigPages, uint32(50), "test setup: dst must be many pages")
+
+	// Backup the tiny src over the large dst. backup.finalize calls
+	// pager.truncateTo(nSrcPage), committing a SHRINKING image to dst's WAL.
+	b, err := dst.BackupInit(src)
+	require.NoError(t, err)
+	for {
+		err := b.Step(-1)
+		if err == ErrBackupDone {
+			break
+		}
+		require.NoError(t, err)
+	}
+	require.NoError(t, b.Finish())
+
+	smallPages := dst.DatabaseSize()
+	require.Less(t, smallPages, bigPages, "backup must have shrunk the logical page count")
+
+	// At this point the shrink lives in dst's WAL; the physical file is still
+	// the large size (truncation is deferred to checkpoint).
+	require.Equal(t, bigFileSize, fileSize(t, dstPath),
+		"file should still be large before the post-shrink checkpoint")
+
+	// Full-backfill checkpoint: must physically shrink the file to the
+	// committed page count.
+	require.NoError(t, dst.Checkpoint(CheckpointFull))
+
+	wantSize := int64(smallPages) * pageSize
+	gotSize := fileSize(t, dstPath)
+	require.Equal(t, wantSize, gotSize,
+		"checkpoint must physically truncate the DB file to smallPages*pageSize (SQLite wal.c:2320-2329)")
+	require.Less(t, gotSize, bigFileSize, "file must be physically smaller after the shrinking checkpoint")
+}
+
+// TestCheckpoint_NoTruncateWithOlderSnapshotReader asserts that the
+// full-backfill truncate is SKIPPED while a concurrent reader is pinned to an
+// older (pre-shrink) snapshot, then performed once that reader closes.
+//
+// This is the concurrent-reader-safety edge case SQLite protects (wal.c:2229-2245
+// + 2322): a reader holding readmark==its mxFrame lowers mxSafeFrame below the
+// live mxFrame, so mxSafeFrame!=authoritativeMxFrame() at the truncate guard and
+// the trailing pages the reader still reads from the DB file are preserved.
+func TestCheckpoint_NoTruncateWithOlderSnapshotReader(t *testing.T) {
+	dir := t.TempDir()
+	opts := DefaultOptions()
+	opts.DisableAutoCheckpoint = true
+	opts.InProcess = true
+
+	path := filepath.Join(dir, "test.db")
+	db, err := testOpen(t, path, opts)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	// Grow to many pages.
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("data")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+	tx2, err := db.BeginWrite()
+	require.NoError(t, err)
+	fat := make([]byte, 256)
+	for i := 0; i < 800; i++ {
+		require.NoError(t, tx2.Put(ns, fmt.Appendf(nil, "k-%05d", i), fat))
+	}
+	require.NoError(t, tx2.Commit())
+
+	// Checkpoint so the large image is on disk, then write one more commit so
+	// nBackfill < mxFrame and a new reader pins a REAL readmark slot (1-4)
+	// rather than the slot-0 "read nothing from WAL" fast path.
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+	bigPages := db.DatabaseSize()
+	pageSize := int64(db.PageSize())
+	bigFileSize := fileSize(t, path)
+	require.Equal(t, int64(bigPages)*pageSize, bigFileSize)
+	require.Greater(t, bigPages, uint32(50))
+
+	tx3, err := db.BeginWrite()
+	require.NoError(t, err)
+	require.NoError(t, tx3.Put(ns, []byte("marker"), []byte("1")))
+	require.NoError(t, tx3.Commit())
+
+	// Open a reader pinned to this PRE-shrink snapshot. It takes a readmark
+	// slot at the current mxFrame.
+	reader, err := db.BeginRead()
+	require.NoError(t, err)
+	readerOpen := true
+	defer func() {
+		if readerOpen {
+			_ = reader.Rollback()
+		}
+	}()
+
+	// Now commit a SHRINKING image via truncateTo. This drives the pager's
+	// dbSize down and commits the smaller page-1 header to the WAL, advancing
+	// mxFrame past the reader's pinned snapshot.
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	smallPages := uint32(8)
+	require.Less(t, smallPages, bigPages)
+	require.NoError(t, db.pager.truncateTo(smallPages))
+	require.NoError(t, wtx.Commit())
+	require.Equal(t, smallPages, db.DatabaseSize())
+
+	// Checkpoint while the older-snapshot reader is still open. The reader's
+	// readmark lowers mxSafeFrame below the live mxFrame, so the truncate guard
+	// (mxSafeFrame==authoritativeMxFrame()) is FALSE and the file is NOT shrunk:
+	// the trailing pages the reader still reads must remain on disk.
+	//
+	// The non-PASSIVE checkpoint reports ErrBusy because the active reader
+	// blocked a complete backfill (BUSY-means-retry, wal.c:2352-2356); the
+	// data-path guard below (file must NOT shrink) is what this test verifies
+	// and is unaffected by the error return.
+	require.ErrorIs(t, db.Checkpoint(CheckpointFull), ErrBusy)
+	require.Equal(t, bigFileSize, fileSize(t, path),
+		"file must NOT shrink while an older-snapshot reader is open (concurrent-reader safety, wal.c:2322)")
+
+	// Close the reader, then checkpoint again. Now mxSafeFrame can reach the
+	// live mxFrame, the guard passes, and the file physically shrinks.
+	require.NoError(t, reader.Rollback())
+	readerOpen = false
+
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+	wantSize := int64(smallPages) * pageSize
+	require.Equal(t, wantSize, fileSize(t, path),
+		"file must physically shrink to smallPages*pageSize once no older reader pins the old size")
+	require.Less(t, fileSize(t, path), bigFileSize)
+}
+
+// TestInProcessSHMHeaderFrozenButReadsSeeCommits pins the by-design drift
+// documented in docs/btree/NOTES.md#old-drift-inprocess-skips-shm-hdr-on-commit:
+//
+//	"In-process mode skips SHM hdr updates on commit (writeFrames !w.inProcess
+//	 guard). db.BeginRead/BeginWrite synthesize a minimal walHdr{isInit:1,
+//	 mxFrame:maxFrame} in that mode so read paths consuming tx.walHdr.mxFrame
+//	 see the correct frame ceiling."
+//
+// The drift relies on TWO invariants that this test pins:
+//
+//  1. FROZEN HEADER: in in-process mode the heap-SHM region-0 WAL-index header
+//     is written exactly once at open (initHeaderStateLocked -> writeHeader(0,
+//     0,0,...), wal.go:1718, NOT gated by inProcess) and is NEVER refreshed on
+//     commit (writeFrames gates w.index.writeHeader behind `if !w.inProcess`,
+//     wal.go:2204). So for the DB's lifetime readHeader() returns the frozen
+//     {isInit:1, mxFrame:0, nPage:0} regardless of how many commits land.
+//
+//  2. SYNTHESIZED CEILING: despite the frozen header, BeginRead (db.go:797) and
+//     BeginWrite (db.go:930) synthesize walHdr{isInit:1, mxFrame:maxFrame} from
+//     the live process-local mxCommitFrame atomic (beginReadHdr ->
+//     tryBeginReadInProcessHdr, wal.go:2613), so reads observe every committed
+//     frame.
+//
+// Why this fails loudly under a future refactor:
+//
+//   - If someone "fixes" the commit path to publish the SHM header in-process
+//     (drops the `!w.inProcess` guard at wal.go:2204), readHeader().mxFrame
+//     advances past 0 and the FROZEN HEADER assertion below fails. That guard
+//     is load-bearing: the heap SHM hash slots are written without the
+//     cross-process barrier (writeHeader's walShmBarrier is itself gated on
+//     !inProcess), so publishing a non-zero mxFrame there would expose readers
+//     to a header that promises frames the in-process get() path does not route
+//     through. The test makes that silent re-coupling impossible.
+//
+//   - If someone breaks the synthesis (e.g. drops the else-branch at
+//     db.go:797/930 so tx.walHdr stays the zero/frozen header), the SYNTHESIZED
+//     CEILING assertions fail: WalMaxFrame() reads 0 and the post-commit reader
+//     cannot see the committed rows.
+func TestInProcessSHMHeaderFrozenButReadsSeeCommits(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	db, err := testOpen(t, dbPath, Options{PageSize: 4096, InProcess: true})
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Precondition: this DB really is in in-process (heap-SHM) mode, otherwise
+	// the drift under test does not apply and the assertions would be vacuous.
+	require.True(t, db.pager.inProcess, "test requires InProcess mode")
+	require.True(t, db.pager.wal.inProcess, "wal must be in-process")
+	require.True(t, db.pager.wal.index.inProcess, "wal index must be in-process")
+
+	// readSHMHeader reads the RAW heap-SHM region-0 WAL-index header — the only
+	// thing a cross-process peer (or any non-synthesizing reader) could observe.
+	// This bypasses the BeginRead/BeginWrite synthesis entirely.
+	readSHMHeader := func() WalIndexHdr {
+		hdr, valid := db.pager.wal.index.readHeader()
+		require.True(t, valid, "heap-SHM region-0 header must be valid (written once at open)")
+		return hdr
+	}
+
+	// At open, initHeaderStateLocked has written the frozen header.
+	openHdr := readSHMHeader()
+	require.Equal(t, uint8(1), openHdr.isInit, "header initialized at open")
+	require.Equal(t, uint32(0), openHdr.mxFrame, "open header mxFrame is 0")
+	require.Equal(t, uint32(0), openHdr.nPage, "open header nPage is 0")
+
+	// Perform several committed writes. Each commit appends WAL frames and
+	// advances the process-local mxCommitFrame, but (in-process) must NOT touch
+	// the SHM region-0 header.
+	const nsName = "drift"
+	const nRows = 64
+	const valSize = 200 // forces multi-page growth so nPage would change if published
+
+	want := make(map[uint32][]byte, nRows)
+	for round := 0; round < 3; round++ {
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+
+		// The writer's synthesized walHdr must already carry a non-zero ceiling
+		// once frames are committed (invariant 2, BeginWrite path, db.go:930).
+		if round > 0 {
+			require.NotZero(t, wtx.WalMaxFrame(),
+				"BeginWrite must synthesize a non-zero mxFrame after prior commits")
+			require.Equal(t, db.pager.wal.index.mxCommitFrame.LoadLocal(), wtx.WalMaxFrame(),
+				"synthesized writer mxFrame must equal live committed frame ceiling")
+		}
+
+		ns, err := wtx.CreateNamespace(nsName)
+		if err != nil {
+			// Namespace already exists after the first round; re-resolve it.
+			ns, err = wtx.GetNamespace(nsName)
+		}
+		require.NoError(t, err)
+
+		for i := 0; i < nRows; i++ {
+			key := binary.BigEndian.AppendUint32(nil, uint32(round*nRows+i))
+			val := []byte(fmt.Sprintf("r%d-row%d-", round, i))
+			for len(val) < valSize {
+				val = append(val, byte(i))
+			}
+			require.NoError(t, wtx.Put(ns, key, val))
+			want[binary.BigEndian.Uint32(key)] = val
+		}
+		require.NoError(t, wtx.Commit())
+
+		// INVARIANT 1 (FROZEN HEADER): the raw SHM header is unchanged by the
+		// commit. mxCommitFrame has advanced, yet the published header is still
+		// frozen at the open-time {isInit:1, mxFrame:0, nPage:0}.
+		require.Positive(t, db.pager.wal.index.mxCommitFrame.LoadLocal(),
+			"commit must advance the process-local committed-frame cursor")
+		postHdr := readSHMHeader()
+		require.Equal(t, uint8(1), postHdr.isInit, "header stays initialized")
+		require.Equal(t, uint32(0), postHdr.mxFrame,
+			"in-process commit must NOT publish mxFrame to the SHM header")
+		require.Equal(t, uint32(0), postHdr.nPage,
+			"in-process commit must NOT publish nPage to the SHM header")
+	}
+
+	committedFrame := db.pager.wal.index.mxCommitFrame.LoadLocal()
+	require.Positive(t, committedFrame)
+
+	// INVARIANT 2 (SYNTHESIZED CEILING): a fresh reader synthesizes a correct
+	// minimal walHdr from the live committed-frame cursor (NOT from the frozen
+	// SHM header), and therefore observes every committed row across the
+	// commit->read cycle.
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	require.Equal(t, uint8(1), rtx.walHdr.isInit,
+		"reader walHdr must be synthesized as initialized")
+	require.Equal(t, committedFrame, rtx.WalMaxFrame(),
+		"reader's synthesized mxFrame must equal the committed frame ceiling")
+	// Sanity: the synthesized reader ceiling is NOT what the raw SHM header says.
+	require.NotEqual(t, readSHMHeader().mxFrame, rtx.WalMaxFrame(),
+		"reader ceiling must come from synthesis, not the frozen SHM header")
+
+	ns, err := rtx.GetNamespace(nsName)
+	require.NoError(t, err)
+	for k, v := range want {
+		key := binary.BigEndian.AppendUint32(nil, k)
+		got, err := rtx.Get(ns, key)
+		require.NoError(t, err, "committed key %d must be visible to a fresh reader", k)
+		require.Equal(t, v, got, "value for key %d must match the committed write", k)
+	}
+}
+
+// These regression tests pin SQLite's bounded-probe corruption detection on
+// both SHM-hash paths (drift-91). Before the fix, a full / cyclically-corrupt
+// hash segment was NOT detected: shmHashWrite fell out of `for range htNSlot`
+// having written aPgno[idx] with no reachable aHash slot (silent
+// committed-but-unindexed frame), and shmHashGet fell out of the loop
+// returning 0 (a silent miss that masks corruption and serves a stale page
+// from the DB file). After the fix both surface ErrCorrupt, mirroring C's
+// walIndexAppend (wal.c:1333-1336) and walFindFrame (wal.c:3580,3592-3595)
+// returning SQLITE_CORRUPT_BKPT.
+
+// hashSlotOff returns the byte offset of aHash[h] within a (non-region-0)
+// segment region. Region 0 shares the same aHash layout offset.
+func hashSlotOff(h int) int { return htHashArrayOff + h*2 }
+
+// TestShmHashWrite_CollisionLimit_Corrupt verifies the WRITE-side bound:
+// walking past nCollide = idx+1 occupied slots returns ErrCorrupt instead of
+// silently inserting nothing. Mirrors walIndexAppend's
+// `nCollide = idx; for(...){ if((nCollide--)==0) return SQLITE_CORRUPT_BKPT; }`.
+func TestShmHashWrite_CollisionLimit_Corrupt(t *testing.T) {
+	wi, err := newWalIndex("", true) // in-process shm
+	require.NoError(t, err)
+	defer wi.close(false)
+
+	region, err := wi.shm.region(0, true)
+	require.NoError(t, err)
+
+	// Target frame 1 => idx 0 => nCollide = idx+1 = 1. The probe may pass over
+	// at most one occupied slot; a second occupied slot is provably corrupt.
+	const pgno = uint32(12345)
+	const frame = uint32(1)
+	h0 := int(pgno*htHash1) & (htNSlot - 1)
+
+	// Occupy the first TWO slots of pgno's probe chain with non-matching, valid
+	// entries so there is no empty slot within nCollide+1 probes. (No third
+	// slot is occupied, so a fix that mis-bounds the probe would still find a
+	// free slot — only the correctly-bounded check fires here.)
+	binary.LittleEndian.PutUint16(region[hashSlotOff(h0):], 7)
+	binary.LittleEndian.PutUint16(region[hashSlotOff((h0+1)&(htNSlot-1)):], 9)
+
+	err = wi.shmHashWrite(pgno, frame)
+	require.ErrorIs(t, err, ErrCorrupt,
+		"shmHashWrite must return ErrCorrupt when the probe walks past nCollide=idx+1 occupied slots")
+}
+
+// TestShmHashWrite_CollisionLimit_PropagatesThroughSetBatch verifies the
+// ErrCorrupt aborts the commit via setBatch (the production write path),
+// matching C's walFrames loop stopping on SQLITE_CORRUPT and skipping the
+// mxFrame advance (wal.c:4229-4257).
+func TestShmHashWrite_CollisionLimit_PropagatesThroughSetBatch(t *testing.T) {
+	wi, err := newWalIndex("", true)
+	require.NoError(t, err)
+	defer wi.close(false)
+
+	region, err := wi.shm.region(0, true)
+	require.NoError(t, err)
+
+	const pgno = uint32(54321)
+	h0 := int(pgno*htHash1) & (htNSlot - 1)
+	// frame 1 => idx 0 => nCollide = 1: two occupied slots => corrupt.
+	binary.LittleEndian.PutUint16(region[hashSlotOff(h0):], 3)
+	binary.LittleEndian.PutUint16(region[hashSlotOff((h0+1)&(htNSlot-1)):], 5)
+
+	p := &page{pgno: pgno}
+	err = wi.setBatch([]*page{p}, 1, true)
+	require.ErrorIs(t, err, ErrCorrupt,
+		"setBatch must propagate shmHashWrite's ErrCorrupt so the commit aborts")
+}
+
+// TestShmHashGet_FullChain_Corrupt verifies the READ-side bound: a probe chain
+// that walks past nCollide = htNSlot occupied slots without an empty slot
+// returns ErrCorrupt instead of a silent 0/miss. Mirrors walFindFrame's
+// `nCollide = HASHTABLE_NSLOT; ... if((nCollide--)==0){ *piRead=0; return
+// SQLITE_CORRUPT_BKPT; }`.
+func TestShmHashGet_FullChain_Corrupt(t *testing.T) {
+	wi, err := newWalIndex("", true)
+	require.NoError(t, err)
+	defer wi.close(false)
+
+	region, err := wi.shm.region(0, true)
+	require.NoError(t, err)
+
+	// Fill EVERY aHash slot of segment 0 with a non-zero entry pointing at a
+	// valid-but-non-matching aPgno index, so the probe chain for any pgno never
+	// hits an empty slot. Using entry index 1 (=> aPgno[0]) which we set to a
+	// page number that won't match the looked-up pgno.
+	for h := 0; h < htNSlot; h++ {
+		binary.LittleEndian.PutUint16(region[hashSlotOff(h):], 1)
+	}
+	binary.LittleEndian.PutUint32(region[htPgnoOff0:], 999999) // aPgno[0]
+
+	frame, err := wi.shmHashGet(7, 100, 1)
+	require.ErrorIs(t, err, ErrCorrupt,
+		"shmHashGet must return ErrCorrupt when the probe walks a full chain of occupied slots")
+	require.Zero(t, frame, "corrupt read must not return a frame (C sets *piRead = 0)")
+}
+
+// TestShmHashGet_FullChain_Corrupt_PropagatesThroughGet verifies ErrCorrupt
+// reaches the multi-process get() wrapper (the read path used by the pager),
+// rather than being swallowed into a 0 miss that would read a stale DB page.
+func TestShmHashGet_FullChain_Corrupt_PropagatesThroughGet(t *testing.T) {
+	wi, err := newWalIndex("", true)
+	require.NoError(t, err)
+	defer wi.close(false)
+
+	// get() in multi-process mode consults shmHashGet exclusively.
+	wi.inProcess = false
+
+	region, err := wi.shm.region(0, true)
+	require.NoError(t, err)
+	for h := 0; h < htNSlot; h++ {
+		binary.LittleEndian.PutUint16(region[hashSlotOff(h):], 1)
+	}
+	binary.LittleEndian.PutUint32(region[htPgnoOff0:], 999999)
+
+	frame, err := wi.get(7, 100)
+	require.ErrorIs(t, err, ErrCorrupt,
+		"walIndex.get must forward shmHashGet's ErrCorrupt to the pager")
+	require.Zero(t, frame)
+}
+
+// Test-only thin wrappers that assert the (now error-returning) walIndex
+// lookup/insert methods succeed, so the many existing positive-path tests can
+// keep their compact `assert.Equal(t, want, wi.getX(...))` form without each
+// site re-deriving the (value, error) pair. A real ErrCorrupt still fails the
+// test loudly via t.Fatal. Tests that specifically exercise the error path
+// call the error-returning methods directly.
+
+func mustShmHashGet(t *testing.T, wi *walIndex, pgno, maxFrame, minFrame uint32) uint32 {
+	t.Helper()
+	v, err := wi.shmHashGet(pgno, maxFrame, minFrame)
+	if err != nil {
+		t.Fatalf("shmHashGet(%d, %d, %d): unexpected error: %v", pgno, maxFrame, minFrame, err)
+	}
+	return v
+}
+
+func mustShmHashWrite(t *testing.T, wi *walIndex, pgno, frame uint32) {
+	t.Helper()
+	if err := wi.shmHashWrite(pgno, frame); err != nil {
+		t.Fatalf("shmHashWrite(%d, %d): unexpected error: %v", pgno, frame, err)
+	}
+}
+
+func mustWiGet(t *testing.T, wi *walIndex, pgno, maxFrame uint32) uint32 {
+	t.Helper()
+	v, err := wi.get(pgno, maxFrame)
+	if err != nil {
+		t.Fatalf("walIndex.get(%d, %d): unexpected error: %v", pgno, maxFrame, err)
+	}
+	return v
+}
+
+func mustWiGetLatest(t *testing.T, wi *walIndex, pgno uint32) uint32 {
+	t.Helper()
+	v, err := wi.getLatest(pgno)
+	if err != nil {
+		t.Fatalf("walIndex.getLatest(%d): unexpected error: %v", pgno, err)
+	}
+	return v
+}
+
+func mustWiSet(t *testing.T, wi *walIndex, pgno, frame uint32) {
+	t.Helper()
+	if err := wi.set(pgno, frame); err != nil {
+		t.Fatalf("walIndex.set(%d, %d): unexpected error: %v", pgno, frame, err)
+	}
+}
+
+// hookShm wraps a real shm and runs onLock(slot, lockType) just before each
+// lock acquisition is granted. It lets a test deterministically inject a
+// concurrent-checkpointer/writer state change into the precise window between
+// tryBeginReadInProcessHdr's pre-lock metadata scan and its shared-lock
+// acquisition on the reused reader slot — reproducing the cross-goroutine race
+// (internal auto-checkpoint runs without pager.mu) without sleeps or timing.
+type hookShm struct {
+	shm
+	onLock func(slot, lockType int)
+}
+
+func (h *hookShm) lock(slot, lockType int) error {
+	if h.onLock != nil {
+		h.onLock(slot, lockType)
+	}
+	return h.shm.lock(slot, lockType)
+}
+
+// TestWALReaderSlotReuseRevalidatesOnStaleMark reproduces the read-safety
+// violation that arises when the in-process reader-slot REUSE branch of
+// tryBeginReadInProcessHdr skips post-lock re-validation.
+//
+// Scenario:
+//
+//  1. A reader claimed slot 1 at mxFrame=10, then ended. endRead never resets a
+//     slot's mark, so slot 1 keeps the stale mark 10 while nBackfill stays < 10.
+//  2. A reusing reader runs the lock-free scan and picks slot 1 (mark 10 <=
+//     mxFrame 10). BUT between that scan and acquiring the shared lock, an
+//     internal concurrent checkpoint advances nBackfill past the snapshot the
+//     reusing reader is about to adopt (and a commit advances mxCommitFrame).
+//  3. If the reuse branch returns without re-validating, the reader proceeds
+//     with maxFrame=10 while nBackfill has moved to 10 — the checkpointer is
+//     now free to backfill/overwrite frames the reader believes it can read,
+//     corrupting the reader's snapshot.
+//
+// With the fix the reuse branch re-loads mxCommitFrame/nBackfill after taking
+// the shared lock; because they changed it drops the lock and returns
+// errWALRetry. On retry the nBackfill==mxFrame slot-0 fast path is safe.
+func TestWALReaderSlotReuseRevalidatesOnStaleMark(t *testing.T) {
+	dir := t.TempDir()
+	w := newWal(filepath.Join(dir, "test.wal"), 4096)
+	w.inProcess = true
+	require.NoError(t, w.open())
+	t.Cleanup(func() { _ = w.close(false) })
+
+	// Establish the precondition directly on the WAL index (the established
+	// pattern for WAL unit tests): committed up to frame 10, only frames <= 3
+	// backfilled, and slot 1 holding a stale mark of 10 from a departed reader.
+	w.index.mxCommitFrame.Store(10)
+	w.index.maxFrame.Store(10)
+	w.index.nBackfill.Store(3)
+	w.index.aReadMark[1].Store(10) // stale mark left by an ended reader
+
+	// Inject the concurrent checkpoint + writer that runs in the race window:
+	// when the reusing reader takes the SHARED lock on reused slot 1
+	// (lockRead0+1), advance nBackfill up to (and past) the stale mark and bump
+	// the commit frame, exactly as an internal auto-checkpoint + commit would.
+	var injected bool
+	hooked := &hookShm{shm: w.index.shm}
+	hooked.onLock = func(slot, lockType int) {
+		if slot == lockRead0+1 && lockType == lockShared && !injected {
+			injected = true
+			// Checkpointer backfilled the WAL up to frame 10 and a writer
+			// committed new frames, raising the commit ceiling to 20.
+			w.index.nBackfill.Store(10)
+			w.index.mxCommitFrame.Store(20)
+			w.index.maxFrame.Store(20)
+		}
+	}
+	w.index.shm = hooked
+
+	// The reuse path must detect the changed state and signal retry rather than
+	// silently adopting the stale (now-unsafe) snapshot.
+	_, _, _, err := w.tryBeginReadInProcessHdr()
+	require.True(t, injected, "test must exercise the slot-reuse shared-lock path")
+	require.ErrorIs(t, err, errWALRetry,
+		"reuse branch must re-validate and retry when the checkpointer advanced "+
+			"nBackfill/mxCommitFrame past the reused slot's stale mark")
+
+	// The retry attempt (state now stable: nBackfill=10, mxCommitFrame=20) must
+	// adopt the LIVE commit ceiling (20), never the stale snapshot (10). A
+	// snapshot that floored at the stale mark while nBackfill had already
+	// advanced to 10 is exactly the corruption window the re-validation closes.
+	hdr, maxFrame, slot, err := w.tryBeginReadInProcessHdr()
+	require.NoError(t, err)
+	assert.Equal(t, uint32(20), maxFrame, "retry must adopt the live commit ceiling, not the stale 10")
+	assert.Equal(t, uint32(20), hdr.mxFrame)
+	// The reader's snapshot ceiling (20) must stay strictly above the
+	// checkpointer's backfill floor (nBackfill==10): walIndex.get() floors reads
+	// at nBackfill+1==11, so no frame the checkpointer already backfilled past is
+	// readable through this snapshot. A held reused slot's mark may lag the
+	// snapshot — that is conservative-safe because the checkpointer cannot
+	// exclusively lock a still-held slot and so keeps frames above the mark live.
+	assert.Greater(t, maxFrame, w.index.nBackfill.Load(),
+		"reader snapshot must stay above the checkpointer's backfill floor")
+	w.endRead(slot)
+}
+
+// TestWALReaderSlotReuseFastPathSafeAfterBackfill verifies the companion
+// guarantee referenced by the fix: once the checkpointer has backfilled the
+// whole WAL (nBackfill == mxFrame), a reusing reader takes the slot-0 fast path
+// and adopts a correct, fully-backfilled snapshot — the fix must not break it.
+func TestWALReaderSlotReuseFastPathSafeAfterBackfill(t *testing.T) {
+	dir := t.TempDir()
+	w := newWal(filepath.Join(dir, "test.wal"), 4096)
+	w.inProcess = true
+	require.NoError(t, w.open())
+	t.Cleanup(func() { _ = w.close(false) })
+
+	// mxFrame==nBackfill: WAL fully checkpointed. A stale slot-1 mark of 10 must
+	// be ignored in favor of the slot-0 fast path.
+	w.index.mxCommitFrame.Store(10)
+	w.index.maxFrame.Store(10)
+	w.index.nBackfill.Store(10)
+	w.index.aReadMark[1].Store(10)
+
+	hdr, maxFrame, slot, err := w.tryBeginReadInProcessHdr()
+	require.NoError(t, err)
+	assert.Equal(t, 0, slot, "fully-backfilled WAL must use the slot-0 fast path")
+	assert.Equal(t, uint32(10), maxFrame)
+	assert.Equal(t, uint32(10), hdr.mxFrame)
+	w.endRead(slot)
+}
+
+// TestWALReaderSlotReuseSucceedsWhenStateStable confirms the fix does not
+// over-retry: when no checkpoint/writer advances state during slot reuse, a
+// reusing reader on a valid slot proceeds normally on the reused slot.
+func TestWALReaderSlotReuseSucceedsWhenStateStable(t *testing.T) {
+	dir := t.TempDir()
+	w := newWal(filepath.Join(dir, "test.wal"), 4096)
+	w.inProcess = true
+	require.NoError(t, w.open())
+	t.Cleanup(func() { _ = w.close(false) })
+
+	// Committed to 10, backfilled to 3, slot 1 holds mark 10 == mxFrame, and
+	// no concurrent state change happens during acquisition.
+	w.index.mxCommitFrame.Store(10)
+	w.index.maxFrame.Store(10)
+	w.index.nBackfill.Store(3)
+	w.index.aReadMark[1].Store(10)
+
+	hdr, maxFrame, slot, err := w.tryBeginReadInProcessHdr()
+	require.NoError(t, err)
+	require.False(t, errors.Is(err, errWALRetry))
+	assert.Equal(t, 1, slot, "stable state must reuse the existing slot 1")
+	assert.Equal(t, uint32(10), maxFrame)
+	assert.Equal(t, uint32(10), hdr.mxFrame)
+	w.endRead(slot)
+}
+
+// TestWALReadFrameFaultFallsThroughToDisk pins the by-design behavior documented
+// at docs/btree/NOTES.md#drift-6-wal-frame-read-failure-falls-through-to-disk-read.
+//
+// In C readDbPage (pager.c:3035-3045) a WAL-resolved page is read ONLY from the
+// WAL frame and a sqlite3WalReadFrame failure propagates as the page-get error.
+// The Go getters (getPageWriter / readTempPage / getPageReader) instead, on a
+// readFrame failure, deliberately ignore the error and fall through to a DB-file
+// (or masterStore) read. This is a deliberate drift, NOT a bug, because the
+// primary protections that C relies on are preserved in Go:
+//
+//	(1) A reader holds its WAL read-mark slot for the whole transaction, so the
+//	    authoritative WAL frame within the reader's snapshot is served from the
+//	    WAL (the normal, non-faulting path).
+//	(2) A checkpoint cannot truncate / reset the WAL out from under a held reader
+//	    slot, and the backfill-before-truncate ordering guarantees that any frame
+//	    a reader could resolve is already durable in the DB file before it could
+//	    ever be truncated. So the disk fallthrough can only return content at
+//	    least as new as the faulting WAL frame — never an older committed copy.
+//
+// This test installs the minimal test-only readFrame fault-injection hook and
+// asserts: the frame is normally served from the WAL; truncation cannot occur
+// under a held reader slot; and on an injected readFrame error the getter falls
+// through (no error surfaced) rather than propagating the WAL read failure.
+//
+// There is no production fault-injection hook on wal.readFrame — this hook is the
+// minimal test-only surface required to make the invariant deterministically
+// observable.
+func TestWALReadFrameFaultFallsThroughToDisk(t *testing.T) {
+	// Ensure any hook installed by this (or a prior) test is cleared on exit so
+	// the production no-op path is restored for every other test.
+	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	// DisableAutoCheckpoint keeps committed frames in the WAL so the reader's
+	// snapshot resolves pages to live WAL frames (the precondition for the drift).
+	db, err := testOpen(t, dbPath, Options{PageSize: 4096, DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Seed a namespace and rows so several pages (incl. page 1) gain WAL frames.
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("t1")
+	require.NoError(t, err)
+	for i := 1; i <= 64; i++ {
+		key := binary.BigEndian.AppendUint32(nil, uint32(i))
+		require.NoError(t, wtx.Put(ns, key, make([]byte, 200)))
+	}
+	require.NoError(t, wtx.Commit())
+
+	// Open a read transaction. The reader claims a WAL read-mark slot and freezes
+	// its snapshot ceiling (walMaxFrame); it holds the slot for the whole tx.
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rtx.Rollback() })
+
+	walMaxFrame := rtx.WalMaxFrame()
+	require.Greater(t, walMaxFrame, uint32(0),
+		"reader snapshot must include the just-committed WAL frames")
+
+	pager := db.pager
+
+	// Find a page that resolves to a live WAL frame within the reader's snapshot.
+	// This is exactly the C `iFrame != 0` case where C reads ONLY from the WAL.
+	var targetPgno, targetFrame uint32
+	for pgno := uint32(1); pgno <= pager.dbSize.Load(); pgno++ {
+		if f := mustWiGet(t, pager.wal.index, pgno, walMaxFrame); f > 0 {
+			targetPgno, targetFrame = pgno, f
+			break
+		}
+	}
+	require.NotZero(t, targetPgno, "expected at least one page resolvable to a WAL frame")
+	require.NotZero(t, targetFrame)
+
+	// readPgnoFreshCache reads targetPgno through getPageReader with a brand-new
+	// reader cache, forcing a true cache miss so wal.readFrame is invoked every
+	// call (a cache hit would bypass readFrame and defeat the fault injection).
+	readPgnoFreshCache := func() ([]byte, error) {
+		cache := newPcache(int(pager.pageSize), db.readerCacheSize, true)
+		pg, gerr := pager.getPageReader(targetPgno, walMaxFrame, cache)
+		if gerr != nil {
+			return nil, gerr
+		}
+		out := make([]byte, pager.pageSize)
+		copy(out, pg.data[:pager.pageSize])
+		pager.releasePage(pg)
+		return out, nil
+	}
+
+	// --- Protection (1): the frame within the snapshot is served from the WAL. ---
+	// With no fault injected, getPageReader must succeed and return the WAL-frame
+	// content. Capture it as the authoritative bytes for the fallthrough check.
+	require.Nil(t, walReadFrameFaultHook.Load(), "no hook installed yet")
+	walServed, err := readPgnoFreshCache()
+	require.NoError(t, err, "frame within snapshot must be served from the WAL without error")
+
+	// --- The drift: an injected readFrame error falls through, not propagates. ---
+	// Inject a failure for exactly the target frame. C would propagate this as the
+	// page-get error; Go must instead fall through to the DB-file/masterStore read
+	// and return successfully (the documented, intentional behavior). This is the
+	// core invariant this regression test pins.
+	sentinel := errors.New("injected WAL readFrame fault")
+	var hookFired bool
+	setWalReadFrameFaultHook(func(frame uint32) error {
+		if frame == targetFrame {
+			hookFired = true
+			return sentinel
+		}
+		return nil
+	})
+
+	fellThrough, err := readPgnoFreshCache()
+	require.True(t, hookFired, "fault hook must have been exercised for the target frame")
+	require.NoError(t, err,
+		"by design, a readFrame failure must fall through to a disk read, not surface the error")
+	require.NotNil(t, fellThrough)
+	// Note: at this point (frame NOT yet backfilled to the DB file) the fallthrough
+	// can legitimately return content OLDER than the WAL frame — that is exactly the
+	// drift hazard the NOTES entry documents. We deliberately do NOT assert the
+	// fallthrough equals the WAL bytes here: the safety argument is not "the disk
+	// copy is always current" but "this fallthrough is unreachable in production",
+	// proven by the two protections asserted below. Asserting current-content here
+	// would falsely claim the drift is harmless even before backfill.
+
+	// Clearing the hook restores the WAL-served path with no error, reconfirming the
+	// non-faulting production path returns the authoritative WAL frame content.
+	setWalReadFrameFaultHook(nil)
+	require.Nil(t, walReadFrameFaultHook.Load())
+	afterClear, err := readPgnoFreshCache()
+	require.NoError(t, err)
+	assert.Equal(t, walServed, afterClear,
+		"clearing the fault must restore the normal WAL-served read")
+
+	// --- Protection (2): truncation/reset cannot occur under a held reader slot. ---
+	// The structural guarantee that makes the (unreachable-in-prod) fallthrough safe:
+	// a reader holding its read-mark slot blocks the checkpointer from RESET/TRUNCATE
+	// (tryResetWALWithBusy must exclusively lock the reader slots, which ErrBusy-fails
+	// while one is held), so the WAL frame numbering and salt are NOT recycled under
+	// the reader. A passive backfill may copy frames to the DB file and raise
+	// nBackfill (transparently shifting the reader's reads to the now-durable disk
+	// copy), but the WAL is never reset out from under the snapshot — so readFrame
+	// cannot fail due to truncation, and the only way to reach the fallthrough is a
+	// genuine I/O error (which this test simulates).
+	saltBefore := [2]uint32{pager.wal.header.salt1, pager.wal.header.salt2}
+	nFrameBefore := pager.wal.nFrame.Load()
+	require.Greater(t, nFrameBefore, uint32(0), "WAL must hold frames before the checkpoint")
+
+	require.NoError(t, db.Checkpoint(CheckpointTruncate),
+		"truncate checkpoint must not error while a reader holds a slot")
+
+	saltAfter := [2]uint32{pager.wal.header.salt1, pager.wal.header.salt2}
+	assert.Equal(t, saltBefore, saltAfter,
+		"WAL salt must be unchanged: a held reader slot blocks WAL reset/truncation")
+	assert.Equal(t, nFrameBefore, pager.wal.nFrame.Load(),
+		"WAL frame numbering must not be recycled while a reader holds its slot")
+
+	// The reader's snapshot remains internally consistent across the checkpoint:
+	// the same page reads back with identical content (no error).
+	afterCkpt, err := readPgnoFreshCache()
+	require.NoError(t, err, "page must remain readable across a checkpoint under a held slot")
+	assert.Equal(t, walServed, afterCkpt,
+		"snapshot content must be stable while the reader holds its slot")
+
+	// --- Claim (3): backfill-before-truncate makes the fallthrough content safe. ---
+	// The checkpoint above ran its PASSIVE backfill, which copies (and fdatasyncs)
+	// each frame to the DB file BEFORE advancing nBackfill — and a truncate can only
+	// follow a completed backfill. So once a frame's content is eligible to be
+	// truncated, that content is already durably in the DB file. We prove the
+	// ordering directly: after the backfill, the raw DB-file copy of targetPgno now
+	// equals the WAL-frame content. Hence in the only window the fallthrough could be
+	// reached (frame still live but unreadable due to a real I/O fault), the disk
+	// copy it falls back to is at least as new as the frame — never an older version.
+	rawDisk := make([]byte, pager.pageSize)
+	require.NoError(t, pager.readDBPage(targetPgno, rawDisk),
+		"backfill must have written the page to the DB file")
+	assert.Equal(t, walServed, rawDisk,
+		"backfill-before-truncate: DB-file copy must match the WAL frame once backfilled")
+}
+
+// TestWALReadFrameFaultHookDefaultsToNoop guards the production contract: the
+// fault-injection hook is nil unless a test installs it, so production readFrame
+// behavior is unchanged (the by-design fallthrough is never triggered in prod by
+// the hook).
+func TestWALReadFrameFaultHookDefaultsToNoop(t *testing.T) {
+	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
+
+	require.Nil(t, walReadFrameFaultHook.Load(),
+		"readFrame fault hook must be nil by default (production no-op)")
+
+	// Installing then clearing must round-trip cleanly back to nil.
+	setWalReadFrameFaultHook(func(uint32) error { return errors.New("x") })
+	require.NotNil(t, walReadFrameFaultHook.Load())
+	setWalReadFrameFaultHook(nil)
+	require.Nil(t, walReadFrameFaultHook.Load())
+}

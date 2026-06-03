@@ -117,6 +117,95 @@ func TestOpen_OldSchemaFormat(t *testing.T) {
 	assert.ErrorIs(t, err, ErrOldFormat)
 }
 
+// readOnDiskSchemaFormat reads the 4-byte big-endian schema-format field at
+// header offset 44 of page 1 directly from the file on disk.
+func readOnDiskSchemaFormat(t *testing.T, path string) uint32 {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(data), 48, "file shorter than db header")
+	return binary.BigEndian.Uint32(data[44:48])
+}
+
+// TestSchemaFormat_Drift_WriteAndGate is a regression test pinning the
+// by-design drift documented at docs/btree/NOTES.md#old-drift-schema-format-5-custom-not-sqlite-fmt4:
+// Go's on-disk "schema format" (header offset 44, the SQLite BTREE_FILE_FORMAT
+// slot) is a Go-specific version number whose meaning diverges from SQLite's.
+// Two distinct invariants the v5 unified key||value cell parser depends on:
+//
+//  1. WRITER: a freshly created DB must persist SchemaFormat == 5. v5 is the
+//     unified-payload cell format; if pager.initNewDB ever wrote a different
+//     value, readers would mis-parse cells (or reject their own files).
+//  2. READER GATE (db.go:550-552): a file whose format byte is in 1..4 (a
+//     genuine SQLite-era / hand-edited old format) must be rejected with
+//     ErrOldFormat, because the v5 parser mis-reads single-payload-varint
+//     index-leaf cells (and historically panicked on large keys). The unset
+//     value 0 is intentionally allowed through (mirrors SQLite normalize-0-to-1),
+//     and the current value 5 must continue to open.
+func TestSchemaFormat_Drift_WriteAndGate(t *testing.T) {
+	// --- Invariant 1: production WRITES SchemaFormat == 5 on disk ---
+	// Open a REAL new DB through the normal Open/initNewDB path (we do NOT
+	// write the header byte ourselves), persist it to the main file via a
+	// full checkpoint, then read offset 44 back from disk and assert it is 5.
+	// This fails if pager.initNewDB is changed to write any other value.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fresh.db")
+
+	db, err := testOpen(t, path, DefaultOptions())
+	require.NoError(t, err)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	_, err = tx.CreateNamespace("ns")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+	require.NoError(t, db.Close())
+
+	require.Equal(t, uint32(5), readOnDiskSchemaFormat(t, path),
+		"a freshly created DB must persist SchemaFormat==5 at header offset 44; "+
+			"see docs/btree/NOTES.md#old-drift-schema-format-5-custom-not-sqlite-fmt4")
+
+	// Snapshot the valid on-disk bytes so we can flip just the format field.
+	good, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	// setFormat rewrites the file with the format field set to f and returns
+	// the resulting path (a fresh copy so cases never contaminate each other).
+	setFormat := func(t *testing.T, f uint32) string {
+		t.Helper()
+		buf := make([]byte, len(good))
+		copy(buf, good)
+		binary.BigEndian.PutUint32(buf[44:48], f)
+		p := filepath.Join(t.TempDir(), "edited.db")
+		require.NoError(t, os.WriteFile(p, buf, 0o644))
+		return p
+	}
+
+	// --- Invariant 2: READER GATE rejects genuine old formats 1..4 ---
+	// Each of these must fail with ErrOldFormat. If the db.go:550 `< 5` check
+	// is removed/weakened, these open successfully and the assertion fails.
+	for _, f := range []uint32{1, 2, 3, 4} {
+		t.Run(fmt.Sprintf("reject_old_format_%d", f), func(t *testing.T) {
+			_, err := testOpen(t, setFormat(t, f), DefaultOptions())
+			assert.ErrorIs(t, err, ErrOldFormat,
+				"format %d must be rejected as an unsupported old format", f)
+		})
+	}
+
+	// --- Invariant 3: 0 (unset) and 5 (current) must OPEN ---
+	// 0 is intentionally allowed by the `!= 0` guard (SQLite normalize-0-to-1);
+	// 5 is the current format. If the guard regresses (e.g. drops the `!= 0`
+	// special-case so 0 is treated as <5), the format-0 case fails.
+	for _, f := range []uint32{0, 5} {
+		t.Run(fmt.Sprintf("accept_format_%d", f), func(t *testing.T) {
+			db, err := testOpen(t, setFormat(t, f), DefaultOptions())
+			require.NoError(t, err,
+				"format %d must open (0=unset/allowed, 5=current)", f)
+			require.NoError(t, db.Close())
+		})
+	}
+}
+
 func TestOpen_InvalidPath(t *testing.T) {
 	// Try opening a db at a non-existent directory
 	_, err := testOpen(t, "/nonexistent/path/to/db.file", DefaultOptions())
@@ -3856,4 +3945,107 @@ func TestP3_4_LastAutoCheckpointErrorIsNilOnFreshOpen(t *testing.T) {
 	if got := db.LastAutoCheckpointError(); got != nil {
 		t.Fatalf("fresh open: LastAutoCheckpointError should be nil, got %v", got)
 	}
+}
+
+// TestOpen_DoubleOpenByInodeIdentity verifies that the process-global
+// double-open guard keys on FILE IDENTITY (dev,ino), not the lexical path.
+// The same physical file reached via a non-lexically-identical spelling — a
+// symlink or a hardlink — must be recognised as already open and rejected with
+// ErrDatabaseOpen. Otherwise two independent writers would each believe they
+// hold the exclusive WAL write lock, corrupting the file (lost updates / torn
+// pages). This mirrors SQLite's process-global unixInodeInfo keyed by (dev,ino)
+// (os_unix.c:1282-1349).
+func TestOpen_DoubleOpenByInodeIdentity(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink/hardlink identity guard is a unix concern; non-unix forces single-process")
+	}
+
+	dir := t.TempDir()
+	realPath := filepath.Join(dir, "real.db")
+	symPath := filepath.Join(dir, "link.db")    // symlink -> real.db
+	hardPath := filepath.Join(dir, "hard.db")   // hardlink to the same inode
+	otherPath := filepath.Join(dir, "other.db") // distinct file, must stay openable
+
+	// Open the real file first. Use a real on-disk (non-InProcess) DB so the
+	// double-open guard is exercised as the load-bearing protection.
+	opts := Options{PageSize: 4096}
+	db, err := testOpen(t, realPath, opts)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	// Create a symlink and a hardlink pointing at the same inode.
+	require.NoError(t, os.Symlink(realPath, symPath))
+	require.NoError(t, os.Link(realPath, hardPath))
+
+	// Sanity: the OS agrees these spellings are the same physical file, but
+	// their lexical absolute paths differ (so a path-keyed guard would miss them).
+	realInfo, err := os.Stat(realPath)
+	require.NoError(t, err)
+	symInfo, err := os.Stat(symPath)
+	require.NoError(t, err)
+	hardInfo, err := os.Stat(hardPath)
+	require.NoError(t, err)
+	assert.True(t, os.SameFile(realInfo, symInfo), "symlink must resolve to the same inode")
+	assert.True(t, os.SameFile(realInfo, hardInfo), "hardlink must share the same inode")
+
+	symAbs, _ := filepath.Abs(symPath)
+	hardAbs, _ := filepath.Abs(hardPath)
+	realAbs, _ := filepath.Abs(realPath)
+	require.NotEqual(t, realAbs, symAbs, "lexical paths must differ (guard cannot rely on them)")
+	require.NotEqual(t, realAbs, hardAbs, "lexical paths must differ (guard cannot rely on them)")
+
+	// Second open via the SYMLINK must be rejected as already open.
+	db2, err := Open(symPath, opts)
+	if db2 != nil {
+		_ = db2.Close()
+	}
+	require.ErrorIs(t, err, ErrDatabaseOpen, "opening the same inode via symlink must be rejected")
+
+	// Third open via the HARDLINK must also be rejected as already open.
+	db3, err := Open(hardPath, opts)
+	if db3 != nil {
+		_ = db3.Close()
+	}
+	require.ErrorIs(t, err, ErrDatabaseOpen, "opening the same inode via hardlink must be rejected")
+
+	// A genuinely different file must remain openable (the guard must not be a
+	// blanket lock on the directory).
+	dbOther, err := Open(otherPath, opts)
+	require.NoError(t, err, "a distinct inode must still open")
+	require.NoError(t, dbOther.Close())
+
+	// After closing the original handle, the inode is free again: reopening via
+	// any spelling must succeed (registry entry was removed under the same key).
+	require.NoError(t, db.Close())
+	dbReopen, err := testOpen(t, symPath, opts)
+	require.NoError(t, err, "after Close the same inode must be reopenable via the symlink")
+	require.NoError(t, dbReopen.Close())
+}
+
+// TestOpen_DoubleOpenSamePathStillRejected guards the pre-existing behaviour:
+// opening the exact same path string (and lexically-equivalent spellings)
+// twice in one process is still rejected. This must keep working alongside the
+// inode-identity keying.
+func TestOpen_DoubleOpenSamePathStillRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	db, err := testOpen(t, path, Options{PageSize: 4096})
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	// Exact same path.
+	db2, err := Open(path, Options{PageSize: 4096})
+	if db2 != nil {
+		_ = db2.Close()
+	}
+	require.ErrorIs(t, err, ErrDatabaseOpen)
+
+	// Lexically-different but equivalent spelling (./ and a/../ collapse).
+	weird := filepath.Join(dir, ".", "x", "..", "test.db")
+	db3, err := Open(weird, Options{PageSize: 4096})
+	if db3 != nil {
+		_ = db3.Close()
+	}
+	require.ErrorIs(t, err, ErrDatabaseOpen)
 }
