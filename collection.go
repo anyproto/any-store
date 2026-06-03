@@ -784,10 +784,13 @@ func (c *collection) loadSketch(tx *btree.ReadTx, idx *index) {
 	live.UnmarshalBinary(data)
 }
 
-// persistSketches writes all modified sketchLive bytes to the _system
-// namespace. The matching publishFrozen call happens later, after
-// pager.commit succeeds (writeTx.Commit), so readers never see a snapshot
-// the writer hasn't actually committed.
+// persistSketches writes the sketchLive bytes of every index that was
+// mutated by this tx to the _system namespace. The matching publishFrozen
+// call happens later in writeTx.Commit (after pager.commit succeeds),
+// which is also where sketchModified is finally cleared — keeping the flag
+// live across persistSketches lets publishFrozenSketches gate its own
+// (more expensive) Clone on the same "this tx actually changed the sketch"
+// signal.
 func (c *collection) persistSketches(tx *btree.WriteTx) error {
 	for _, idx := range c.indexes {
 		if idx.sketchModified {
@@ -796,18 +799,24 @@ func (c *collection) persistSketches(tx *btree.WriteTx) error {
 			if err := tx.Put(c.db.systemNS, key, idx.sketchBuf); err != nil {
 				return err
 			}
-			idx.sketchModified = false
 		}
 	}
 	return nil
 }
 
-// publishFrozenSketches snapshots sketchLive into sketchFrozen for every
-// index in this collection. Called after a successful pager.commit so
-// readers atomically observe the just-committed sketch.
+// publishFrozenSketches snapshots sketchLive into sketchFrozen only for
+// indexes the tx mutated (sketchModified == true). Called after a
+// successful pager.commit so readers atomically observe the just-
+// committed view. Clears sketchModified for every published index so the
+// next resetLiveSketchesFromFrozen sees a clean slate and can take its
+// skip-Clone hot path.
 func (c *collection) publishFrozenSketches() {
 	for _, idx := range c.indexes {
+		if !idx.sketchModified {
+			continue
+		}
 		idx.publishFrozen()
+		idx.sketchModified = false
 	}
 }
 
