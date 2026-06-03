@@ -482,6 +482,11 @@ func (db *db) reloadFrozenSketchesIfStale() {
 			fresh := qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
 			fresh.UnmarshalBinary(data)
 			idx.sketchFrozen.Store(fresh)
+			// Bump the version so the next writer's
+			// resetLiveSketchesFromFrozen detects "frozen has moved" and
+			// re-clones into sketchLive (instead of taking the hot-path
+			// skip on a stale sketchLiveSyncedVersion match).
+			idx.sketchFrozenVersion.Add(1)
 		}
 		c.mu.Unlock()
 	}

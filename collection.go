@@ -812,18 +812,30 @@ func (c *collection) publishFrozenSketches() {
 }
 
 // resetLiveSketchesFromFrozen overwrites each index's sketchLive with a
-// clone of its current sketchFrozen. Called at the start of every write tx
-// so that (a) any uncommitted increments from a previously rolled-back tx
-// are dropped, and (b) any reader-side reload that updated sketchFrozen
-// since our last write is reflected in sketchLive — keeping the writer's
-// base in sync with the latest view without re-reading disk.
+// clone of its current sketchFrozen so that (a) any uncommitted increments
+// from a previously rolled-back tx are dropped, and (b) any reader-side
+// reload that updated sketchFrozen since our last write is reflected in
+// sketchLive.
+//
+// Hot-path optimization: skip the Clone entirely when sketchLive is
+// already in sync — sketchModified is false (previous tx committed and
+// publishFrozen ran) AND sketchFrozenVersion hasn't moved since we last
+// synced (no reader-side reload). The Clone runs only after a rollback
+// or when an external publish has landed. This is the single biggest
+// per-write cost the CoW design introduces, so skipping it in the common
+// case is what keeps Crud/Insert and friends close to baseline.
 func (c *collection) resetLiveSketchesFromFrozen() {
 	for _, idx := range c.indexes {
+		frozenVer := idx.sketchFrozenVersion.Load()
+		if !idx.sketchModified && idx.sketchLiveSyncedVersion == frozenVer {
+			continue
+		}
 		frozen := idx.sketchFrozen.Load()
 		if frozen == nil {
 			continue
 		}
 		idx.sketchLive.Store(frozen.Clone())
+		idx.sketchLiveSyncedVersion = frozenVer
 		idx.sketchModified = false
 	}
 }

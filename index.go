@@ -88,6 +88,15 @@ type index struct {
 	// pointer's immutable fields — no atomics, no locking, no race.
 	sketchFrozen atomic.Pointer[qplanner.IndexSketch]
 
+	// sketchFrozenVersion bumps every time sketchFrozen is replaced
+	// (writer's publishFrozen on commit, reader's time-gated reload).
+	// resetLiveSketchesFromFrozen compares against sketchLiveSyncedVersion
+	// to skip the per-tx Clone when sketchLive is already in sync with the
+	// latest publish and the previous tx committed cleanly (most common
+	// case in single-process write-heavy workloads).
+	sketchFrozenVersion     atomic.Uint64
+	sketchLiveSyncedVersion uint64 // writeMu-protected
+
 	sketchBuf      []byte
 	sketchModified bool
 
@@ -110,13 +119,20 @@ func (idx *index) readSketch() *qplanner.IndexSketch {
 
 // publishFrozen snapshots sketchLive into sketchFrozen. Called by the
 // writer after a successful pager.commit so readers see the just-
-// committed view on their next read.
+// committed view on their next read. Bumps sketchFrozenVersion so the
+// next writer's resetLiveSketchesFromFrozen knows whether anything
+// (this commit, or a reader-side reload) has changed since live was
+// last synced.
 func (idx *index) publishFrozen() {
 	live := idx.sketchLive.Load()
 	if live == nil {
 		return
 	}
 	idx.sketchFrozen.Store(live.Clone())
+	newVer := idx.sketchFrozenVersion.Add(1)
+	// Live now matches frozen — record so the next BeginWrite's reset
+	// can skip the Clone.
+	idx.sketchLiveSyncedVersion = newVer
 }
 
 func validateIndexField(s string) (err error) {
