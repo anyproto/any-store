@@ -3,7 +3,6 @@ package anystore
 import (
 	"context"
 	"errors"
-	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -120,15 +119,45 @@ func newCollection(ctx context.Context, db *db, name string, wtx ...*btree.Write
 }
 
 type collection struct {
-	name    string
-	indexes []*index
+	name string
+	// indexes is an atomic copy-on-write snapshot of the collection's index
+	// set. The query path (query.go) reads it lock-free via loadIndexes();
+	// structural mutations (createIndex / DropIndex / reconcileIndexSet) build a
+	// fresh slice under c.mu and publish it via storeIndexes(). Readers always
+	// observe a complete generation, never a torn slice — mirroring SQLite's
+	// whole-schema reload on a schema-cookie bump (a reader sees either the old
+	// or the new schema, never half-applied DDL).
+	indexes atomic.Pointer[[]*index]
 	db      *db
 	ns      *btree.Namespace
 
 	compression Compression // 0 = use db default
 
+	// sketchReadBuf is reused scratch for decoding persisted sketch bytes during
+	// the advisory reload (reloadSketch). Only touched under c.mu, so a single
+	// per-collection buffer is safe and keeps the stale-reload path from
+	// allocating a fresh read buffer per index.
+	sketchReadBuf []byte
+
 	closed atomic.Bool
 	mu     sync.Mutex
+}
+
+// loadIndexes returns the current index-set snapshot. Safe to call without
+// holding c.mu — the slice it returns is immutable (publishers always build a
+// fresh slice rather than mutating in place), so callers may range over it
+// freely while a concurrent reconcile swaps in a new generation.
+func (c *collection) loadIndexes() []*index {
+	if p := c.indexes.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// storeIndexes publishes a new index-set snapshot. Callers must hold c.mu (to
+// serialise concurrent publishers); readers need no lock.
+func (c *collection) storeIndexes(idxs []*index) {
+	c.indexes.Store(&idxs)
 }
 
 // init initializes the collection, loading namespace handles and index metadata.
@@ -165,6 +194,7 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 		if err != nil {
 			return err
 		}
+		var idxs []*index
 		for _, info := range idxInfos {
 			nsName := indexNsName(c.name, info.Name)
 			ns, nsErr := getNamespace(nsName)
@@ -175,9 +205,10 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 			if idxErr != nil {
 				return idxErr
 			}
-			c.loadSketch(tx, idx)
-			c.indexes = append(c.indexes, idx)
+			c.loadSketchAtOpen(tx, idx)
+			idxs = append(idxs, idx)
 		}
+		c.storeIndexes(idxs)
 		return nil
 	})
 }
@@ -297,7 +328,7 @@ func (c *collection) insertItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, it i
 	}
 
 	// Insert index entries
-	for _, idx := range c.indexes {
+	for _, idx := range c.loadIndexes() {
 		if err = idx.insertKeys(tx, it); err != nil {
 			return err
 		}
@@ -426,7 +457,7 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 	}
 
 	// Update index entries: delete old, insert new
-	for _, idx := range c.indexes {
+	for _, idx := range c.loadIndexes() {
 		if err = idx.deleteKeys(tx, prevIt); err != nil {
 			return
 		}
@@ -501,12 +532,12 @@ func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
 
 func (c *collection) deleteItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, id []byte) (err error) {
 	// Delete index entries
-	if len(c.indexes) > 0 {
+	if idxs := c.loadIndexes(); len(idxs) > 0 {
 		it, loadErr := c.loadById(tx, buf, id)
 		if loadErr != nil {
 			return loadErr
 		}
-		for _, idx := range c.indexes {
+		for _, idx := range idxs {
 			if err = idx.deleteKeys(tx, it); err != nil {
 				return err
 			}
@@ -541,6 +572,12 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 		for _, idxInfo := range info {
 			idx, txErr := c.createIndex(ctx, tx, idxInfo)
 			if txErr != nil {
+				// ensure=true is idempotent only for an EXISTING index whose
+				// definition matches. A same-name index with a DIFFERENT
+				// definition is a genuine conflict (ErrIndexExists) that must be
+				// surfaced even under ensure — never silently kept at the old
+				// shape. createIndex returns ErrIndexMismatch for that case so it
+				// is not swallowed here.
 				if ensure && errors.Is(txErr, ErrIndexExists) {
 					continue
 				}
@@ -555,7 +592,14 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		c.indexes = append(c.indexes, newIndexes...)
+		// Copy-on-write publish: build a fresh slice (current snapshot + new
+		// indexes) and swap it in atomically so lock-free query readers always
+		// see a complete generation.
+		cur := c.loadIndexes()
+		merged := make([]*index, 0, len(cur)+len(newIndexes))
+		merged = append(merged, cur...)
+		merged = append(merged, newIndexes...)
+		c.storeIndexes(merged)
 		return true, nil
 	})
 }
@@ -601,6 +645,10 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 	if err = tx.Put(c.db.systemNS, skKey, idx.sketch.MarshalBinary(nil)); err != nil {
 		return nil, err
 	}
+	// Publish the live sketch as the reader snapshot before the index becomes
+	// reader-visible (appended to c.indexes by the caller), so no reader ever
+	// observes a nil sketchPub.
+	idx.storePubSketch(idx.sketch)
 	idx.sketchModified = false
 
 	return idx, nil
@@ -609,12 +657,15 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 func (c *collection) DropIndex(ctx context.Context, indexName string) (err error) {
 	return c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (txErr error) {
 		tx.MarkSchemaChanged()
-		// Check index exists
-		found := false
+		// The write transaction began via checkStale, which reconciled the index
+		// set against on-disk metadata. So the snapshot here reflects on-disk
+		// truth: an index a peer created is present (drop must succeed), and one
+		// a peer dropped is absent (return ErrIndexNotFound, not a false success).
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		for _, idx := range c.indexes {
-			if idx.Info().Name == indexName {
+		found := false
+		for _, idx := range c.loadIndexes() {
+			if idx.info.Name == indexName {
 				found = true
 				break
 			}
@@ -623,6 +674,10 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 			return ErrIndexNotFound
 		}
 
+		// removeIndex tolerates an already-absent metadata key: a concurrent peer
+		// may have dropped the same index between our checkStale snapshot and
+		// here, and a raw btree.ErrKeyNotFound must never escape DropIndex (whose
+		// contract is nil or ErrIndexNotFound).
 		if txErr = c.db.removeIndex(tx, c.name, indexName); txErr != nil {
 			return
 		}
@@ -632,22 +687,29 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 			if !errors.Is(txErr, btree.ErrNamespaceNotFound) {
 				return
 			}
+			txErr = nil
 		}
 		// Delete sketch data
 		skKey := sketchKey(c.name, indexName)
 		_ = tx.Delete(c.db.systemNS, skKey) // ignore if not found
-		c.indexes = slices.DeleteFunc(c.indexes, func(i *index) bool {
-			return i.Info().Name == indexName
-		})
+		// Copy-on-write publish: build a fresh slice without the dropped index
+		// and swap it in atomically for lock-free query readers.
+		cur := c.loadIndexes()
+		next := make([]*index, 0, len(cur))
+		for _, idx := range cur {
+			if idx.info.Name != indexName {
+				next = append(next, idx)
+			}
+		}
+		c.storeIndexes(next)
 		return nil
 	})
 }
 
 func (c *collection) GetIndexes() (indexes []Index) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	indexes = make([]Index, len(c.indexes))
-	for i, idx := range c.indexes {
+	idxs := c.loadIndexes()
+	indexes = make([]Index, len(idxs))
+	for i, idx := range idxs {
 		indexes[i] = idx
 	}
 	return
@@ -676,9 +738,20 @@ func (c *collection) Drop(ctx context.Context) error {
 		if err = c.close(); err != nil {
 			return err
 		}
-		// Delete all index namespaces
-		for _, idx := range c.indexes {
-			nsName := indexNsName(c.name, idx.info.Name)
+		// Delete all index namespaces. Enumerate indexes from the SAME on-disk
+		// source (idx:<coll>: metadata keys) that removeCollection deletes,
+		// rather than the in-memory index set which can lag the on-disk metadata
+		// (a peer handle's create, or this handle's own create that committed but
+		// has not yet been published to the in-memory snapshot). This keeps the
+		// namespace-delete set and the metadata-delete set identical within the
+		// single atomic Drop tx, so Drop can never leave an orphaned index
+		// namespace. Enumerate BEFORE removeCollection deletes the idx: keys.
+		idxInfos, err := c.db.getIndexInfos(&tx.ReadTx, c.name)
+		if err != nil {
+			return err
+		}
+		for _, info := range idxInfos {
+			nsName := indexNsName(c.name, info.Name)
 			if err = tx.DeleteNamespace(nsName); err != nil {
 				if !errors.Is(err, btree.ErrNamespaceNotFound) {
 					return
@@ -755,50 +828,184 @@ func (c *collection) buildIndex(tx *btree.WriteTx, idx *index) error {
 	return nil
 }
 
-// loadSketch loads a sketch from the _system namespace for the given index.
-//
-// Concurrency contract: this function is called both from createIndex
-// (before the new index is appended to c.indexes — readers can't see it
-// yet) and from reloadSketches via checkStale (under c.mu, but
-// concurrent readers may already hold pointers into c.indexes and read
-// idx.sketch without c.mu — see (*collQuery).docCount and the
-// CBOIndex.Sketch escape in buildCBOIndexesInto).
-//
-// To avoid a data race on the idx.sketch pointer field with those
-// readers, the existing sketch is updated in place via UnmarshalBinary
-// instead of being replaced. UnmarshalBinary writes Buckets and
-// docCount via atomic stores (see internal/qplanner/sketch.go), so
-// concurrent GetDocCount / Estimate readers see consistent values
-// without locking. Only the very first call (idx.sketch == nil)
-// allocates a new sketch — that path is reached only from createIndex
-// before the index is visible to readers, so the assignment is
-// unobservable.
-func (c *collection) loadSketch(tx *btree.ReadTx, idx *index) {
+// loadSketchAtOpen populates a brand-new (not-yet-reader-visible) index's live
+// sketch from the _system namespace and publishes it as the reader snapshot.
+// Called from init, createIndex, and reconcile's rebuild arm — in every case the
+// index is not yet in c.indexes, so filling live in place and publishing it is
+// unobservable to readers (no copy-on-write ceremony needed).
+func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, idx *index) {
 	if idx.sketch == nil {
 		idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
 	}
 	key := sketchKey(c.name, idx.info.Name)
-	data, err := tx.AppendValue(c.db.systemNS, key, nil)
-	if err != nil {
-		// No persisted sketch data; keep current in-memory state. Used to
-		// reset to a fresh sketch here, which (a) raced with concurrent
-		// readers on the pointer field and (b) silently dropped any
-		// in-memory counter increments not yet persisted. Preserving
-		// state is the correct behaviour in both respects.
-		return
+	if data, err := tx.AppendValue(c.db.systemNS, key, nil); err == nil {
+		idx.sketch.UnmarshalBinary(data)
 	}
-	idx.sketch.UnmarshalBinary(data)
+	// Publish the live object as the initial reader snapshot. The index is not
+	// yet visible to readers, so no reader can be holding the previous value.
+	idx.storePubSketch(idx.sketch)
 }
 
-// persistSketches writes all modified sketches to the _system namespace.
+// reloadSketch refreshes one already-published index's sketch from the _system
+// namespace during the advisory staleness tier (checkStale -> reloadSketches).
+// It is the sqlite_stat1 reload analog and is advisory/fail-soft: a missing key
+// or decode error leaves current state intact and never aborts the transaction.
+//
+//	WRITE tx (writable): the calling goroutine holds the btree writeMu and is the
+//	  SOLE mutator of idx.sketch, so it reloads IN PLACE into the live object (0
+//	  alloc) — catching up to a peer's committed counts BEFORE applying its own
+//	  deltas, which keeps sequential cross-process counts exact for free — then
+//	  republishes live so readers see the peer's state immediately.
+//
+//	READ tx (!writable): a concurrent in-process writer may be incrementing
+//	  idx.sketch right now, so we NEVER touch it. We decode the disk bytes into a
+//	  FRESH sketch and swap it into sketchPub (copy-on-write). The writer's live
+//	  object is untouched; its in-flight increments can never be lost. This is the
+//	  fix for the reader-clobbers-writer count loss.
+func (c *collection) reloadSketch(tx *btree.ReadTx, idx *index, writable bool) {
+	key := sketchKey(c.name, idx.info.Name)
+	data, err := tx.AppendValue(c.db.systemNS, key, c.sketchReadBuf[:0])
+	if err != nil {
+		return // no persisted bytes: preserve current state (advisory)
+	}
+	c.sketchReadBuf = data
+	if writable {
+		if idx.sketch == nil {
+			idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
+		}
+		idx.sketch.UnmarshalBinary(data) // in-place into live (sole mutator)
+		idx.storePubSketch(idx.sketch)   // republish live for readers
+		// Live now equals the committed on-disk state, so any prior
+		// uncommitted (e.g. rolled-back) deltas are discarded — clear the dirty
+		// flag so they are not re-persisted on the next commit.
+		idx.sketchModified = false
+		return
+	}
+	fresh := qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
+	fresh.UnmarshalBinary(data)
+	idx.storePubSketch(fresh) // copy-on-write swap; live object untouched
+}
+
+// reconcileIndexes rebuilds the collection's index set from on-disk metadata
+// after a peer committed DDL (detected via the schema cookie in checkStale). It
+// is the any-store analog of SQLite's sqlite3InitOne: the authoritative source
+// is the persisted metadata, and the in-memory set is brought into agreement
+// with it — never the other way round.
+//
+// An existing in-memory *index is REUSED (preserving its loaded sketch) only
+// when its persisted definition is byte-for-byte unchanged AND its namespace
+// root page still matches disk. The root-page check is essential: a peer
+// drop+recreate of an index reuses the same name-keyed metadata slot but
+// allocates a FRESH btree root, so the cached *index (whose idx.ns/cboInfo.Ns
+// still address the freed old root) must be discarded and rebuilt — otherwise a
+// long-lived handle would read or write the wrong/old namespace and return
+// wrong results or corrupt the recreated index.
+//
+// Indexes present in memory but absent on disk are dropped. Indexes present on
+// disk but not yet in memory are built fresh. The new set is published
+// copy-on-write so lock-free query readers see a complete generation.
+//
+// Errors resolving an individual index's namespace (e.g. a transient view where
+// the metadata is visible but the namespace page is not) cause that index to be
+// skipped for this reconcile rather than aborting the transaction; the next
+// schema-stale tx will retry. The whole operation is best-effort and never
+// surfaces an error to the caller — a failed reconcile must not break an
+// otherwise valid read/write transaction.
+func (c *collection) reconcileIndexes(tx *btree.ReadTx) {
+	infos, err := c.db.getIndexInfos(tx, c.name)
+	if err != nil {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	cur := c.loadIndexes()
+	byName := make(map[string]*index, len(cur))
+	for _, idx := range cur {
+		byName[idx.info.Name] = idx
+	}
+
+	rebuilt := make([]*index, 0, len(infos))
+	changed := len(infos) != len(cur)
+	for _, info := range infos {
+		nsName := indexNsName(c.name, info.Name)
+		ns, nsErr := tx.GetNamespace(nsName)
+		if nsErr != nil {
+			// Namespace not resolvable in this snapshot: keep the existing
+			// in-memory index if we have one (so we don't lose a working index
+			// over a transient view), otherwise skip it this round.
+			if existing, ok := byName[info.Name]; ok {
+				rebuilt = append(rebuilt, existing)
+			} else {
+				changed = true
+			}
+			continue
+		}
+		if existing, ok := byName[info.Name]; ok &&
+			indexInfoEqual(existing.info, info) &&
+			existing.ns != nil && existing.ns.RootPage() == ns.RootPage() {
+			// Unchanged: reuse the live object (and its loaded sketch).
+			rebuilt = append(rebuilt, existing)
+			continue
+		}
+		// Added or changed (definition differs, or root moved via
+		// drop+recreate): build a fresh index bound to the current namespace.
+		idx, idxErr := newIndex(c, info, ns)
+		if idxErr != nil {
+			// Malformed definition on disk: keep any existing object rather than
+			// dropping a working index over a parse error.
+			if existing, ok := byName[info.Name]; ok {
+				rebuilt = append(rebuilt, existing)
+			}
+			continue
+		}
+		c.loadSketchAtOpen(tx, idx)
+		rebuilt = append(rebuilt, idx)
+		changed = true
+	}
+
+	if !changed {
+		// Fast path: same set, same definitions, same roots — nothing to publish.
+		return
+	}
+	c.storeIndexes(rebuilt)
+}
+
+// indexInfoEqual reports whether two IndexInfo values describe the same index
+// definition: same name, same fields (order significant), same unique and
+// sparse flags.
+func indexInfoEqual(a, b IndexInfo) bool {
+	if a.Name != b.Name || a.Unique != b.Unique || a.Sparse != b.Sparse {
+		return false
+	}
+	if len(a.Fields) != len(b.Fields) {
+		return false
+	}
+	for i := range a.Fields {
+		if a.Fields[i] != b.Fields[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// persistSketches writes all modified live sketches to the _system namespace and
+// republishes each as the reader snapshot. Last-writer-wins (no cross-process
+// merge — the sketch is advisory, like sqlite_stat1). Republishing is a pointer
+// Store of the writer's own live object — no clone: the writer will not mutate
+// live again until its next write tx, and a reader that loads it sees an
+// advisory, atomically-fielded snapshot. Runs inside Commit before pager.commit,
+// so the bytes are atomic with the file-change counter / schema cookie.
 func (c *collection) persistSketches(tx *btree.WriteTx) error {
-	for _, idx := range c.indexes {
+	for _, idx := range c.loadIndexes() {
 		if idx.sketchModified {
 			key := sketchKey(c.name, idx.info.Name)
 			idx.sketchBuf = idx.sketch.MarshalBinary(idx.sketchBuf)
 			if err := tx.Put(c.db.systemNS, key, idx.sketchBuf); err != nil {
 				return err
 			}
+			idx.storePubSketch(idx.sketch) // republish live as the reader snapshot
 			idx.sketchModified = false
 		}
 	}

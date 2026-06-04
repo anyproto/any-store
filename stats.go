@@ -95,7 +95,7 @@ type CollectionStats struct {
 func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err error) {
 	c.mu.Lock()
 	name := c.name
-	indexes := append([]*index(nil), c.indexes...)
+	indexes := append([]*index(nil), c.loadIndexes()...)
 	c.mu.Unlock()
 
 	stats.Name = name
@@ -149,10 +149,10 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 				PayloadBytes: idxSize.PayloadBytes,
 				SizeBytes:    idxSize.TotalPages() * pageSize,
 			}
-			if idx.sketch != nil {
-				is.SketchDocCount = idx.sketch.GetDocCount()
-				is.SketchSize = idx.sketch.Size
-				is.SketchDistribution = idx.sketch.Distribution()
+			if s := idx.loadPubSketch(); s != nil {
+				is.SketchDocCount = s.GetDocCount()
+				is.SketchSize = s.Size
+				is.SketchDistribution = s.Distribution()
 			}
 			stats.IndexesSizeBytes += is.SizeBytes
 			stats.Indexes = append(stats.Indexes, is)

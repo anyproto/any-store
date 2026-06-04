@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
@@ -65,7 +66,23 @@ type index struct {
 	fieldPaths [][]string
 	reverse    []bool
 
-	sketch         *qplanner.IndexSketch
+	// sketch is the WRITER-OWNED live selectivity sketch. It is mutated in place
+	// ONLY by the single writer (insertKeys/deleteKeys, serialized by the btree
+	// writeMu and the cross-process WAL write lock) and marshaled by
+	// persistSketches. No reader ever swaps or mutates it, so a concurrent
+	// read-tx reload can never lose the writer's accumulated increments. Inside a
+	// write tx it is also the planner's view (reflects this tx's own uncommitted
+	// inserts).
+	sketch *qplanner.IndexSketch
+
+	// sketchPub is the READER-VISIBLE copy-on-write snapshot — the per-index
+	// analog of collection.indexes. The query/Stats path reads it lock-free via
+	// loadPubSketch(); the advisory staleness tier publishes a freshly decoded
+	// sketch into it on a stale READ (build-fresh, never mutate-in-place); the
+	// writer republishes its live object into it at commit (a pointer Store, no
+	// clone). Non-nil once the index is published to readers.
+	sketchPub atomic.Pointer[qplanner.IndexSketch]
+
 	sketchBuf      []byte
 	sketchModified bool
 
@@ -78,6 +95,15 @@ type index struct {
 	fullKeyBuf anyenc.Tuple // reusable buffer for full keys (key+docId)
 	seekBuf    anyenc.Tuple // reusable buffer for unique constraint seek results
 }
+
+// loadPubSketch returns the published reader snapshot. Lock-free; the returned
+// pointer is valid for the caller's transaction (a concurrent reload swaps a new
+// object in, leaving this one untouched). Mirrors collection.loadIndexes().
+func (idx *index) loadPubSketch() *qplanner.IndexSketch { return idx.sketchPub.Load() }
+
+// storePubSketch publishes a reader snapshot. Callers hold c.mu (publisher
+// serialisation, like storeIndexes); readers need no lock.
+func (idx *index) storePubSketch(s *qplanner.IndexSketch) { idx.sketchPub.Store(s) }
 
 func validateIndexField(s string) (err error) {
 	if s == "" || s == "-" {

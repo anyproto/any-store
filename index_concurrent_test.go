@@ -1367,7 +1367,7 @@ func TestSketch_LoadDuringConcurrentReader(t *testing.T) {
 		}
 	}()
 
-	// Readers: exercise both the docCount (q.c.indexes[*].sketch read) and
+	// Readers: exercise both the docCount (q.c.loadIndexes()[*].sketch read) and
 	// the planner's Sketch field via Find().Count and Find().Iter.
 	const numReaders = 8
 	for r := 0; r < numReaders; r++ {
@@ -1435,7 +1435,7 @@ func TestSketch_DocCountSurvivesReload(t *testing.T) {
 	// every insert, not regress to zero from a reload that dropped state.
 	c := coll.(*collection)
 	c.mu.Lock()
-	got := c.indexes[0].sketch.GetDocCount()
+	got := c.loadIndexes()[0].sketch.GetDocCount()
 	c.mu.Unlock()
 	assert.Equal(t, uint64(N), got,
 		"sketch DocCount must equal inserted-doc count after reload (%d), got %d", N, got)

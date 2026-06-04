@@ -135,7 +135,8 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	buf := q.c.db.syncPool.GetDocBuf()
 	btx := tx.btreeReadTx()
 
-	br := q.buildBoundsResult()
+	idxs := q.c.loadIndexes()
+	br := q.buildBoundsResult(idxs)
 	plan := qplanner.BuildPlan(&qplanner.PlanParams{
 		Tx:          btx,
 		DataNs:      q.c.ns,
@@ -146,7 +147,7 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		Offset:      int(q.offset),
 		Buf:         buf,
 		TotalDocs:   q.docCount(btx),
-		Indexes:     q.buildCBOIndexesInto(nil, &br),
+		Indexes:     q.buildCBOIndexesInto(nil, &br, idxs),
 		IndexHints:  q.buildIndexHints(),
 		FieldBounds: &br,
 	})
@@ -197,7 +198,8 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
-	br := q.buildBoundsResult()
+	idxs := q.c.loadIndexes()
+	br := q.buildBoundsResult(idxs)
 	plan := qplanner.BuildPlan(&qplanner.PlanParams{
 		Tx:          btx,
 		DataNs:      q.c.ns,
@@ -207,7 +209,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		Offset:      int(q.offset),
 		Buf:         buf,
 		TotalDocs:   q.docCount(btx),
-		Indexes:     q.buildCBOIndexesInto(nil, &br),
+		Indexes:     q.buildCBOIndexesInto(nil, &br, idxs),
 		IndexHints:  q.buildIndexHints(),
 		FieldBounds: &br,
 	})
@@ -327,7 +329,8 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
-	br := q.buildBoundsResult()
+	idxs := q.c.loadIndexes()
+	br := q.buildBoundsResult(idxs)
 	plan := qplanner.BuildPlan(&qplanner.PlanParams{
 		Tx:          btx,
 		DataNs:      q.c.ns,
@@ -337,7 +340,7 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 		Offset:      int(q.offset),
 		Buf:         buf,
 		TotalDocs:   q.docCount(btx),
-		Indexes:     q.buildCBOIndexesInto(nil, &br),
+		Indexes:     q.buildCBOIndexesInto(nil, &br, idxs),
 		IndexHints:  q.buildIndexHints(),
 		FieldBounds: &br,
 	})
@@ -434,9 +437,10 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 		return
 	}
 
-	br := q.buildBoundsResult()
+	idxs := q.c.loadIndexes()
+	br := q.buildBoundsResult(idxs)
 	var cboBuf [8]qplanner.CBOIndex
-	cboIndexes := q.buildCBOIndexesInto(cboBuf[:0], &br)
+	cboIndexes := q.buildCBOIndexesInto(cboBuf[:0], &br, idxs)
 
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		buf := q.c.db.syncPool.GetDocBuf()
@@ -501,8 +505,9 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
-	br := q.buildBoundsResult()
-	cboIndexes := q.buildCBOIndexesInto(nil, &br)
+	idxs := q.c.loadIndexes()
+	br := q.buildBoundsResult(idxs)
+	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs)
 
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		plan := qplanner.BuildPlan(&qplanner.PlanParams{
@@ -568,9 +573,9 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 func (q *collQuery) docCount(tx interface {
 	Count(ns *btree.Namespace) (int, error)
 }) int {
-	for _, idx := range q.c.indexes {
-		if idx.sketch != nil {
-			return int(idx.sketch.GetDocCount())
+	for _, idx := range q.c.loadIndexes() {
+		if s := idx.loadPubSketch(); s != nil {
+			return int(s.GetDocCount())
 		}
 	}
 	count, _ := tx.Count(q.c.ns)
@@ -657,20 +662,25 @@ func isIDOnlyFilterNode(f query.Filter) bool {
 	}
 }
 
-// buildBoundsResult computes IndexBounds once per unique field across all indexes.
-func (q *collQuery) buildBoundsResult() qplanner.BoundsResult {
+// buildBoundsResult computes IndexBounds once per unique field across all
+// indexes. idxs is the index-set snapshot for this planning pass; the caller
+// passes the SAME snapshot to buildCBOIndexesInto so bounds and CBOIndex entries
+// stay positionally consistent even if a concurrent reconcile swaps the set.
+func (q *collQuery) buildBoundsResult(idxs []*index) qplanner.BoundsResult {
 	var br qplanner.BoundsResult
 	var idxInfoBuf [8]*qplanner.IndexInfo
 	idxInfos := idxInfoBuf[:0]
-	for i := range q.c.indexes {
-		idxInfos = append(idxInfos, q.c.indexes[i].cboInfo)
+	for i := range idxs {
+		idxInfos = append(idxInfos, idxs[i].cboInfo)
 	}
 	br.Build(idxInfos, q.cond)
 	return br
 }
 
-// buildCBOIndexesInto builds CBOIndex entries into the provided buffer using pre-computed bounds.
-func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.BoundsResult) []qplanner.CBOIndex {
+// buildCBOIndexesInto builds CBOIndex entries into the provided buffer using
+// pre-computed bounds. idxs MUST be the same snapshot passed to
+// buildBoundsResult for this pass.
+func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.BoundsResult, idxs []*index) []qplanner.CBOIndex {
 	result := buf
 
 	var sortFields []query.SortField
@@ -678,7 +688,7 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 		sortFields = q.sort.Fields()
 	}
 
-	for _, idx := range q.c.indexes {
+	for _, idx := range idxs {
 		info := idx.cboInfo
 
 		// Compute bounds for this index
@@ -710,7 +720,7 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 
 		cboIdx := qplanner.CBOIndex{
 			Info:           info,
-			Sketch:         idx.sketch,
+			Sketch:         idx.loadPubSketch(),
 			Bounds:         bounds,
 			Reverse:        idx.reverse,
 			PointLookup:    pointLookup,
