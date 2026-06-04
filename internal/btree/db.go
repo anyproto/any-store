@@ -1748,6 +1748,14 @@ func (tx *ReadTx) GetNamespace(name string) (*Namespace, error) {
 	return tx.db.getNamespaceAt(name, tx.walHdr.mxFrame, tx.cache)
 }
 
+// IsWritable reports whether this ReadTx is the read view embedded in a write
+// transaction (the writer holds db.writeMu and is the sole in-process mutator).
+// The advisory sketch tier uses this to choose an in-place reload (writer path,
+// safe to mutate the live sketch) vs a fresh copy-on-write swap (reader path).
+func (tx *ReadTx) IsWritable() bool {
+	return tx.writable
+}
+
 // IsDataStale returns true if the on-disk FileChangeCount differs from the
 // locally cached value, indicating another process has committed data changes
 // since this DB last committed or synced counters.

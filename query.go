@@ -574,8 +574,8 @@ func (q *collQuery) docCount(tx interface {
 	Count(ns *btree.Namespace) (int, error)
 }) int {
 	for _, idx := range q.c.loadIndexes() {
-		if idx.sketch != nil {
-			return int(idx.sketch.GetDocCount())
+		if s := idx.loadPubSketch(); s != nil {
+			return int(s.GetDocCount())
 		}
 	}
 	count, _ := tx.Count(q.c.ns)
@@ -720,7 +720,7 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 
 		cboIdx := qplanner.CBOIndex{
 			Info:           info,
-			Sketch:         idx.sketch,
+			Sketch:         idx.loadPubSketch(),
 			Bounds:         bounds,
 			Reverse:        idx.reverse,
 			PointLookup:    pointLookup,

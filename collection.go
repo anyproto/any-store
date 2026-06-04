@@ -133,6 +133,12 @@ type collection struct {
 
 	compression Compression // 0 = use db default
 
+	// sketchReadBuf is reused scratch for decoding persisted sketch bytes during
+	// the advisory reload (reloadSketch). Only touched under c.mu, so a single
+	// per-collection buffer is safe and keeps the stale-reload path from
+	// allocating a fresh read buffer per index.
+	sketchReadBuf []byte
+
 	closed atomic.Bool
 	mu     sync.Mutex
 }
@@ -199,7 +205,7 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 			if idxErr != nil {
 				return idxErr
 			}
-			c.loadSketch(tx, idx)
+			c.loadSketchAtOpen(tx, idx)
 			idxs = append(idxs, idx)
 		}
 		c.storeIndexes(idxs)
@@ -639,6 +645,10 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 	if err = tx.Put(c.db.systemNS, skKey, idx.sketch.MarshalBinary(nil)); err != nil {
 		return nil, err
 	}
+	// Publish the live sketch as the reader snapshot before the index becomes
+	// reader-visible (appended to c.indexes by the caller), so no reader ever
+	// observes a nil sketchPub.
+	idx.storePubSketch(idx.sketch)
 	idx.sketchModified = false
 
 	return idx, nil
@@ -807,39 +817,58 @@ func (c *collection) buildIndex(tx *btree.WriteTx, idx *index) error {
 	return nil
 }
 
-// loadSketch loads a sketch from the _system namespace for the given index.
-//
-// Concurrency contract: this function is called both from createIndex
-// (before the new index is appended to c.indexes — readers can't see it
-// yet) and from reloadSketches via checkStale (under c.mu, but
-// concurrent readers may already hold pointers into c.indexes and read
-// idx.sketch without c.mu — see (*collQuery).docCount and the
-// CBOIndex.Sketch escape in buildCBOIndexesInto).
-//
-// To avoid a data race on the idx.sketch pointer field with those
-// readers, the existing sketch is updated in place via UnmarshalBinary
-// instead of being replaced. UnmarshalBinary writes Buckets and
-// docCount via atomic stores (see internal/qplanner/sketch.go), so
-// concurrent GetDocCount / Estimate readers see consistent values
-// without locking. Only the very first call (idx.sketch == nil)
-// allocates a new sketch — that path is reached only from createIndex
-// before the index is visible to readers, so the assignment is
-// unobservable.
-func (c *collection) loadSketch(tx *btree.ReadTx, idx *index) {
+// loadSketchAtOpen populates a brand-new (not-yet-reader-visible) index's live
+// sketch from the _system namespace and publishes it as the reader snapshot.
+// Called from init, createIndex, and reconcile's rebuild arm — in every case the
+// index is not yet in c.indexes, so filling live in place and publishing it is
+// unobservable to readers (no copy-on-write ceremony needed).
+func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, idx *index) {
 	if idx.sketch == nil {
 		idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
 	}
 	key := sketchKey(c.name, idx.info.Name)
-	data, err := tx.AppendValue(c.db.systemNS, key, nil)
+	if data, err := tx.AppendValue(c.db.systemNS, key, nil); err == nil {
+		idx.sketch.UnmarshalBinary(data)
+	}
+	// Publish the live object as the initial reader snapshot. The index is not
+	// yet visible to readers, so no reader can be holding the previous value.
+	idx.storePubSketch(idx.sketch)
+}
+
+// reloadSketch refreshes one already-published index's sketch from the _system
+// namespace during the advisory staleness tier (checkStale -> reloadSketches).
+// It is the sqlite_stat1 reload analog and is advisory/fail-soft: a missing key
+// or decode error leaves current state intact and never aborts the transaction.
+//
+//	WRITE tx (writable): the calling goroutine holds the btree writeMu and is the
+//	  SOLE mutator of idx.sketch, so it reloads IN PLACE into the live object (0
+//	  alloc) — catching up to a peer's committed counts BEFORE applying its own
+//	  deltas, which keeps sequential cross-process counts exact for free — then
+//	  republishes live so readers see the peer's state immediately.
+//
+//	READ tx (!writable): a concurrent in-process writer may be incrementing
+//	  idx.sketch right now, so we NEVER touch it. We decode the disk bytes into a
+//	  FRESH sketch and swap it into sketchPub (copy-on-write). The writer's live
+//	  object is untouched; its in-flight increments can never be lost. This is the
+//	  fix for the reader-clobbers-writer count loss.
+func (c *collection) reloadSketch(tx *btree.ReadTx, idx *index, writable bool) {
+	key := sketchKey(c.name, idx.info.Name)
+	data, err := tx.AppendValue(c.db.systemNS, key, c.sketchReadBuf[:0])
 	if err != nil {
-		// No persisted sketch data; keep current in-memory state. Used to
-		// reset to a fresh sketch here, which (a) raced with concurrent
-		// readers on the pointer field and (b) silently dropped any
-		// in-memory counter increments not yet persisted. Preserving
-		// state is the correct behaviour in both respects.
+		return // no persisted bytes: preserve current state (advisory)
+	}
+	c.sketchReadBuf = data
+	if writable {
+		if idx.sketch == nil {
+			idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
+		}
+		idx.sketch.UnmarshalBinary(data) // in-place into live (sole mutator)
+		idx.storePubSketch(idx.sketch)   // republish live for readers
 		return
 	}
-	idx.sketch.UnmarshalBinary(data)
+	fresh := qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
+	fresh.UnmarshalBinary(data)
+	idx.storePubSketch(fresh) // copy-on-write swap; live object untouched
 }
 
 // reconcileIndexes rebuilds the collection's index set from on-disk metadata
@@ -916,7 +945,7 @@ func (c *collection) reconcileIndexes(tx *btree.ReadTx) {
 			}
 			continue
 		}
-		c.loadSketch(tx, idx)
+		c.loadSketchAtOpen(tx, idx)
 		rebuilt = append(rebuilt, idx)
 		changed = true
 	}
@@ -946,7 +975,13 @@ func indexInfoEqual(a, b IndexInfo) bool {
 	return true
 }
 
-// persistSketches writes all modified sketches to the _system namespace.
+// persistSketches writes all modified live sketches to the _system namespace and
+// republishes each as the reader snapshot. Last-writer-wins (no cross-process
+// merge — the sketch is advisory, like sqlite_stat1). Republishing is a pointer
+// Store of the writer's own live object — no clone: the writer will not mutate
+// live again until its next write tx, and a reader that loads it sees an
+// advisory, atomically-fielded snapshot. Runs inside Commit before pager.commit,
+// so the bytes are atomic with the file-change counter / schema cookie.
 func (c *collection) persistSketches(tx *btree.WriteTx) error {
 	for _, idx := range c.loadIndexes() {
 		if idx.sketchModified {
@@ -955,6 +990,7 @@ func (c *collection) persistSketches(tx *btree.WriteTx) error {
 			if err := tx.Put(c.db.systemNS, key, idx.sketchBuf); err != nil {
 				return err
 			}
+			idx.storePubSketch(idx.sketch) // republish live as the reader snapshot
 			idx.sketchModified = false
 		}
 	}

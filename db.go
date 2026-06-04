@@ -373,8 +373,13 @@ func (db *db) reconcileIndexSet(tx *btree.ReadTx) {
 	}
 }
 
-// reloadSketches reloads all sketch data from the _system namespace for opened collections.
+// reloadSketches reloads all sketch data from the _system namespace for opened
+// collections (the advisory Tier-2 of checkStale). The per-index leaf branches
+// on whether this tx is the writer: a write tx (sole mutator under writeMu)
+// reloads in place into the live sketch; a read tx swaps a fresh copy-on-write
+// snapshot so it can never clobber a concurrent writer's in-flight increments.
 func (db *db) reloadSketches(tx *btree.ReadTx) {
+	writable := tx.IsWritable()
 	db.mu.Lock()
 	colls := make([]*collection, 0, len(db.openedCollections))
 	for _, coll := range db.openedCollections {
@@ -385,7 +390,7 @@ func (db *db) reloadSketches(tx *btree.ReadTx) {
 	for _, c := range colls {
 		c.mu.Lock()
 		for _, idx := range c.loadIndexes() {
-			c.loadSketch(tx, idx)
+			c.reloadSketch(tx, idx, writable)
 		}
 		c.mu.Unlock()
 	}
