@@ -293,6 +293,7 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 	}
 
 	db.checkStale(&btWtx.ReadTx)
+	db.resetUncommittedSketches(&btWtx.ReadTx)
 
 	version := newTxVersion()
 	tx := txPool.Get().(*commonTx)
@@ -391,6 +392,41 @@ func (db *db) reloadSketches(tx *btree.ReadTx) {
 		c.mu.Lock()
 		for _, idx := range c.loadIndexes() {
 			c.reloadSketch(tx, idx, writable)
+		}
+		c.mu.Unlock()
+	}
+}
+
+// resetUncommittedSketches discards leftover, never-committed sketch deltas at
+// write-tx begin. insertKeys/deleteKeys mutate the live sketch in place and set
+// sketchModified; a committed tx clears that flag via persistSketches, but a
+// ROLLED-BACK tx does not — so a still-set sketchModified at the start of a new
+// write tx means a prior tx incremented the sketch and then rolled back. Left
+// alone, those phantom deltas would accumulate across rolled-back txs (and be
+// persisted on the next commit), drifting the planner's cardinality estimate
+// (advisory only — never query results). Here we rebase any such index's live
+// sketch to the last committed on-disk state before the new tx applies its own
+// deltas — the in-methodology analog of resetting to the committed snapshot at
+// tx begin, with zero cost on the all-commit happy path (sketchModified is
+// false there, so the reload is skipped). Write-tx only: the caller holds the
+// btree write lock, so the live sketch has a single mutator.
+func (db *db) resetUncommittedSketches(tx *btree.ReadTx) {
+	db.mu.Lock()
+	colls := make([]*collection, 0, len(db.openedCollections))
+	for _, coll := range db.openedCollections {
+		colls = append(colls, coll.(*collection))
+	}
+	db.mu.Unlock()
+
+	for _, c := range colls {
+		c.mu.Lock()
+		for _, idx := range c.loadIndexes() {
+			if idx.sketchModified {
+				// reloadSketch (writable) rebases live to the committed bytes and
+				// clears sketchModified; if there are no committed bytes yet
+				// (brand-new pre-commit index) it preserves the built sketch.
+				c.reloadSketch(tx, idx, true)
+			}
 		}
 		c.mu.Unlock()
 	}

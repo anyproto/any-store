@@ -864,6 +864,10 @@ func (c *collection) reloadSketch(tx *btree.ReadTx, idx *index, writable bool) {
 		}
 		idx.sketch.UnmarshalBinary(data) // in-place into live (sole mutator)
 		idx.storePubSketch(idx.sketch)   // republish live for readers
+		// Live now equals the committed on-disk state, so any prior
+		// uncommitted (e.g. rolled-back) deltas are discarded — clear the dirty
+		// flag so they are not re-persisted on the next commit.
+		idx.sketchModified = false
 		return
 	}
 	fresh := qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
