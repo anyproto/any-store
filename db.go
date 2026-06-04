@@ -391,30 +391,24 @@ func (db *db) checkStaleForRead(tx *btree.ReadTx) {
 	if !schemaStale && !dataStale {
 		return
 	}
-	if schemaStale {
-		// Schema staleness goes through the in-place sketchLive reload
-		// path (loadSketch → UnmarshalBinary). Hold writeMu so we don't
-		// race a concurrent in-process writer's insertKeys/deleteKeys
-		// atomic increments on the same IndexSketch — the same race the
-		// data-only path avoids by simply not reloading. Schema changes
-		// are rare (DDL only), so the brief writer serialisation is OK.
-		db.btreeDB.WithWriteLock(func() {
-			db.reloadSketches(tx)
-		})
-	}
+	// Both staleness flavours go through the lock-free fresh-tx +
+	// atomic-pointer-swap reload below. sketchLive — the in-process
+	// writer's working copy — is never touched on the read path, so an
+	// in-flight long write tx never blocks reads. Schema staleness
+	// force-reloads (rare, peer DDL only); data staleness is gated by
+	// Config.SketchReadStaleness so a hot read loop doesn't pay the
+	// cost on every call.
+	db.reloadFrozenSketches(schemaStale)
 	db.btreeDB.UpdateLocalCounters(tx.DiskFileChangeCounter(), tx.DiskSchemaCookie())
-	if !schemaStale && dataStale {
-		// Time-gated, lock-free read-path reload — bounded staleness
-		// against peer-process data writes without racing in-process
-		// writers (sketchLive is untouched; only sketchFrozen is swapped).
-		db.reloadFrozenSketchesIfStale()
-	}
 }
 
 // reloadSketches reloads sketch data from the _system namespace into each
 // open index's sketchLive AND publishes the result to sketchFrozen.
-// Called from checkStaleForWrite (under writeMu) and from the schema-stale
-// branch of checkStaleForRead (rare, only on DDL).
+// Write-path only — called from checkStaleForWrite while writeMu is held
+// (BeginWrite path), where in-place UnmarshalBinary on sketchLive cannot
+// race a concurrent in-process writer. The read path uses the lock-free
+// reloadFrozenSketches that allocates fresh IndexSketches and swaps them
+// in via atomic.Pointer.Store — see that function for the rationale.
 func (db *db) reloadSketches(tx *btree.ReadTx) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -457,22 +451,26 @@ func (db *db) publishFrozenSketches() {
 	}
 }
 
-// reloadFrozenSketchesIfStale runs the read-path lock-free reload: open a
-// fresh BeginReadFast tx (captures the latest committed snapshot), decode
-// each on-disk sketch into a brand-new IndexSketch, and publish it to
+// reloadFrozenSketches runs the read-path lock-free reload: open a fresh
+// BeginReadFast tx (captures the latest committed snapshot), decode each
+// on-disk sketch into a brand-new IndexSketch, and publish it to
 // idx.sketchFrozen via a single atomic Pointer store. No writer lock, no
 // merge games, no race with concurrent in-process writers (sketchLive is
-// untouched). Time-gated by Config.SketchReadStaleness so a hot read loop
-// doesn't pay this cost on every call.
-func (db *db) reloadFrozenSketchesIfStale() {
-	staleness := db.sketchReadStaleness
-	if staleness <= 0 {
-		return
-	}
-	now := time.Now().UnixNano()
-	last := db.lastSketchRefresh.Load()
-	if now-last < int64(staleness) {
-		return
+// untouched — a long in-flight write tx does not block this path).
+//
+// When force is false, the call is gated by Config.SketchReadStaleness so
+// a hot read loop doesn't pay the cost on every call (data-stale path).
+// When force is true, the gate is bypassed (schema-stale path, peer DDL
+// only — must always pick up the new disk state).
+func (db *db) reloadFrozenSketches(force bool) {
+	if !force {
+		staleness := db.sketchReadStaleness
+		if staleness <= 0 {
+			return
+		}
+		if time.Now().UnixNano()-db.lastSketchRefresh.Load() < int64(staleness) {
+			return
+		}
 	}
 	freshTx, err := db.btreeDB.BeginReadFast()
 	if err != nil {

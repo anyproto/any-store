@@ -992,21 +992,6 @@ func (db *DB) UpdateLocalCounters(fileChangeCounter, schemaCookie uint32) {
 	db.localSchemaCookie.Store(schemaCookie)
 }
 
-// WithWriteLock runs fn while holding writeMu (the in-process writer
-// serialization mutex BeginWrite acquires first). Lets anystore-level code
-// briefly exclude in-process writers from non-tx state mutations — e.g.
-// the read-path schema-stale sketch reload, which calls
-// IndexSketch.UnmarshalBinary in place and would otherwise race with a
-// concurrent insertKeys/deleteKeys atomic Increment.
-//
-// fn must not call BeginWrite (it would deadlock on writeMu) or otherwise
-// re-enter the writer path; it's intended for brief in-memory cache
-// updates only.
-func (db *DB) WithWriteLock(fn func()) {
-	db.writeMu.Lock()
-	defer db.writeMu.Unlock()
-	fn()
-}
 
 // CreateNamespace creates a new namespace. Must be called within a write transaction.
 func (db *DB) CreateNamespace(tx *WriteTx, name string) error {
