@@ -90,8 +90,20 @@ type CollectionStats struct {
 // storage footprint, compression effectiveness and per-index sketch state.
 //
 // It performs a full scan of the collection and is therefore O(documents +
-// index entries); it is intended for diagnostics, not hot paths. All figures
-// are read within a single read transaction and are mutually consistent.
+// index entries); it is intended for diagnostics, not hot paths. The
+// btree-derived figures (DocCount, *SizeBytes, EntryCount, PayloadBytes)
+// are all read within a single read transaction and are mutually consistent.
+//
+// IndexStats.SketchDocCount / SketchDistribution come from the in-memory
+// sketchFrozen pointer (the published read-side snapshot), NOT from the
+// read tx's snapshot. In a multi-process workload Config.SketchReadStaleness
+// may have refreshed sketchFrozen from a strictly newer disk state than the
+// read tx is observing, so a peer-process write committed between
+// BeginRead and the sketchFrozen access can show up in SketchDocCount
+// before it shows up in DocCount within the same Stats call. The sketch is
+// a cardinality estimator, so a brief disagreement is harmless for
+// planner / diagnostics, but tests that assert exact equality between
+// DocCount and SketchDocCount need to quiesce all peer writers first.
 func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err error) {
 	c.mu.Lock()
 	name := c.name

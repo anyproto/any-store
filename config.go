@@ -118,14 +118,24 @@ type Config struct {
 	OnIntegrityError func(IntegrityError)
 
 	// SketchReadStaleness caps how stale a read-side index sketch is
-	// allowed to get before a lock-free disk reload runs. Default 1s: a
-	// read transaction whose snapshot indicates a peer process committed
-	// new data triggers, at most once per second, a fresh BeginReadFast
-	// that decodes each sketch from disk and atomically publishes it to
-	// the read-side snapshot pointer. Single-process workloads almost
-	// never hit this path — own-process writer commits already refresh
-	// the gate. Zero disables the read-side reload entirely; readers
-	// then catch up only via their own next write or DB reopen.
+	// allowed to get before a lock-free disk reload runs.
+	//
+	// Semantics:
+	//   - Zero (default): replaced by setDefaults with 1s, the standard
+	//     opt-in.
+	//   - Positive duration: a read transaction whose snapshot indicates
+	//     a peer process committed new data triggers, at most once per
+	//     this duration, a fresh BeginReadFast that decodes each sketch
+	//     from disk and atomically publishes it into the read-side
+	//     snapshot pointer (sketchFrozen).
+	//   - Negative duration: disables the read-side reload entirely.
+	//     Readers then catch up to peer-process changes only via their
+	//     own next write tx (checkStaleForWrite) or DB reopen.
+	//
+	// Single-process workloads almost never hit this path — own-process
+	// writer commits already refresh the gate via writeTx.Commit's
+	// publishFrozen, so the time window only elapses while a peer
+	// process is solely responsible for writes.
 	SketchReadStaleness time.Duration
 
 	// ContinueOnIntegrityError, when true, lets reads of corrupt pages

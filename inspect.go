@@ -24,9 +24,25 @@ type IndexSketchInfo struct {
 
 // InspectIndexSketch returns the decoded on-disk sketch for the named index.
 // Returns ErrIndexNotFound if no sketch bytes exist for that (collName, indexName).
-// This reads the persisted sketch, not any in-memory state held by an open
-// collection handle — callers that want a live view should close and reopen
-// the DB, or ensure no writes are in flight.
+//
+// This reads the persisted sketch, NOT the in-memory sketchFrozen snapshot
+// that Collection.Stats / the planner consume. The two can disagree:
+//
+//   - On disk reflects the last successful pager.commit. The in-memory
+//     sketchFrozen also reflects that commit, but can additionally have
+//     been refreshed by Config.SketchReadStaleness from a strictly newer
+//     peer-process commit since our last own commit — in that case the
+//     in-memory view is ahead.
+//   - Between writeTx.persistSketches and writeTx.Commit returning, the
+//     on-disk bytes have been written to the WAL but not yet exposed via
+//     readHeaderCounters; in that brief window the on-disk view returned
+//     by Inspect is one commit behind sketchFrozen.
+//
+// Use Collection.Stats for the value the planner / cardinality estimator
+// actually uses; use this method when you need the persisted on-disk
+// truth (forensics, post-crash inspection, cross-version sketch decode).
+// Callers that want a strict live view should close and reopen the DB or
+// quiesce all writers first.
 func (db *db) InspectIndexSketch(ctx context.Context, collName, indexName string) (IndexSketchInfo, error) {
 	var info IndexSketchInfo
 	err := db.doReadTx(ctx, func(tx *btree.ReadTx) error {

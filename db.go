@@ -244,11 +244,14 @@ type db struct {
 	mu                      sync.Mutex
 	writeMu                 sync.Mutex
 
-	// sketchReadStaleness gates read-tx sketch reloads from disk. Zero
-	// (default) disables the read-side reload entirely; cross-process data
+	// sketchReadStaleness gates read-tx sketch reloads from disk. Zero or
+	// negative disables the read-side reload entirely; cross-process data
 	// updates land in our sketches via the next write tx. A positive value
 	// caps how long a reader can see stale sketch values across processes —
-	// at most this duration between disk-driven refreshes.
+	// at most this duration between disk-driven refreshes. See
+	// Config.SketchReadStaleness for the user-facing semantics
+	// (setDefaults re-maps Config-zero to a 1s positive default before
+	// it lands here).
 	sketchReadStaleness time.Duration
 
 	// lastSketchRefresh records unix-nano of the last event that brought
@@ -389,7 +392,15 @@ func (db *db) checkStaleForRead(tx *btree.ReadTx) {
 		return
 	}
 	if schemaStale {
-		db.reloadSketches(tx)
+		// Schema staleness goes through the in-place sketchLive reload
+		// path (loadSketch → UnmarshalBinary). Hold writeMu so we don't
+		// race a concurrent in-process writer's insertKeys/deleteKeys
+		// atomic increments on the same IndexSketch — the same race the
+		// data-only path avoids by simply not reloading. Schema changes
+		// are rare (DDL only), so the brief writer serialisation is OK.
+		db.btreeDB.WithWriteLock(func() {
+			db.reloadSketches(tx)
+		})
 	}
 	db.btreeDB.UpdateLocalCounters(tx.DiskFileChangeCounter(), tx.DiskSchemaCookie())
 	if !schemaStale && dataStale {
