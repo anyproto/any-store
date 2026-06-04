@@ -1390,7 +1390,7 @@ func newWal(path string, pageSize uint32) *wal {
 // DRIFT: padToSectorBoundary commit-frame sector padding not ported See docs/btree/NOTES.md#drift-104-padtosectorboundary-sector-padding-of-commit-frames-not-port
 // DRIFT: no read-only WAL fallback (readOnly=WAL_RDONLY) when open downgraded See docs/btree/NOTES.md#drift-106-wal-read-only-fallback-not-ported
 // DRIFT: syncHeader device-characteristic tuning not ported (always-on) See docs/btree/NOTES.md#drift-107-syncheader-device-characteristic-tuning-not-ported
-func (w *wal) open() error {
+func (w *wal) open() (err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -1411,6 +1411,23 @@ func (w *wal) open() error {
 		return err
 	}
 	w.file = f
+
+	// Release the WAL file/shm on any error after this point so a failed open
+	// doesn't leak fds (see the equivalent guard in pager.open for why a leaked
+	// fd is harmful: the GC finalizer closes it later onto a possibly-recycled
+	// fd number). Cleanup runs after the unlock defers below (LIFO order).
+	defer func() {
+		if err != nil {
+			if w.index != nil {
+				_ = w.index.close(false)
+				w.index = nil
+			}
+			if w.file != nil {
+				_ = w.file.Close()
+				w.file = nil
+			}
+		}
+	}()
 
 	// Initialize shared memory for WAL index.
 	idx, err := newWalIndex(w.path+"-shm", w.inProcess)
