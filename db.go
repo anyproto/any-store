@@ -380,7 +380,7 @@ func (db *db) reconcileIndexSet(tx *btree.ReadTx) {
 // reloads in place into the live sketch; a read tx swaps a fresh copy-on-write
 // snapshot so it can never clobber a concurrent writer's in-flight increments.
 func (db *db) reloadSketches(tx *btree.ReadTx) {
-	writable := tx.IsWritable()
+	writable := tx.IsWriteTx()
 	db.mu.Lock()
 	colls := make([]*collection, 0, len(db.openedCollections))
 	for _, coll := range db.openedCollections {

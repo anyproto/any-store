@@ -738,9 +738,20 @@ func (c *collection) Drop(ctx context.Context) error {
 		if err = c.close(); err != nil {
 			return err
 		}
-		// Delete all index namespaces
-		for _, idx := range c.loadIndexes() {
-			nsName := indexNsName(c.name, idx.info.Name)
+		// Delete all index namespaces. Enumerate indexes from the SAME on-disk
+		// source (idx:<coll>: metadata keys) that removeCollection deletes,
+		// rather than the in-memory index set which can lag the on-disk metadata
+		// (a peer handle's create, or this handle's own create that committed but
+		// has not yet been published to the in-memory snapshot). This keeps the
+		// namespace-delete set and the metadata-delete set identical within the
+		// single atomic Drop tx, so Drop can never leave an orphaned index
+		// namespace. Enumerate BEFORE removeCollection deletes the idx: keys.
+		idxInfos, err := c.db.getIndexInfos(&tx.ReadTx, c.name)
+		if err != nil {
+			return err
+		}
+		for _, info := range idxInfos {
+			nsName := indexNsName(c.name, info.Name)
 			if err = tx.DeleteNamespace(nsName); err != nil {
 				if !errors.Is(err, btree.ErrNamespaceNotFound) {
 					return
