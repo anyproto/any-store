@@ -494,7 +494,7 @@ func readRawIndexEntries(t *testing.T, anyDB DB, collName, indexName string) []r
 
 	var idx *index
 	c.mu.Lock()
-	for _, i := range c.indexes {
+	for _, i := range c.loadIndexes() {
 		if i.info.Name == indexName {
 			idx = i
 			break
