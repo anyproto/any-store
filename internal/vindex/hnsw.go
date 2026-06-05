@@ -27,6 +27,7 @@ type Params struct {
 	EfConstruction int     // candidate list at insert (default 200)
 	EfSearch       int     // candidate list at query (default 64)
 	Ml             float64 // level factor (default 0.25)
+	Quantization   Quantization
 }
 
 func (p *Params) withDefaults() {
@@ -56,12 +57,13 @@ type Hit struct {
 type Index struct {
 	vmeta, vvec, vadj, vdoc, vlbl *btree.Namespace
 
-	dim int
-	m   int
-	m0  int
-	efC int
-	efS int
-	ml  float64
+	dim   int
+	m     int
+	m0    int
+	efC   int
+	efS   int
+	ml    float64
+	quant Quantization
 
 	dist DistanceFunc
 
@@ -121,10 +123,10 @@ func Create(wtx *btree.WriteTx, prefix string, p Params, seed int64) (*Index, er
 		}
 		ns[i] = n
 	}
-	ix := newIndex(ns, p.Dim, p.M, 2*p.M, p.EfConstruction, p.EfSearch, p.Ml, p.Metric, seed)
+	ix := newIndex(ns, p.Dim, p.M, 2*p.M, p.EfConstruction, p.EfSearch, p.Ml, p.Metric, p.Quantization, seed)
 	mt := &meta{
 		dim: p.Dim, metric: p.Metric, m: p.M, m0: 2 * p.M,
-		efC: p.EfConstruction, efS: p.EfSearch, ml: p.Ml,
+		efC: p.EfConstruction, efS: p.EfSearch, ml: p.Ml, quant: p.Quantization,
 	}
 	if err := ix.writeMeta(wtx, mt); err != nil {
 		return nil, err
@@ -156,7 +158,7 @@ func Open(db *btree.DB, prefix string, seed int64) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newIndex(ns, mt.dim, mt.m, mt.m0, mt.efC, mt.efS, mt.ml, mt.metric, seed), nil
+	return newIndex(ns, mt.dim, mt.m, mt.m0, mt.efC, mt.efS, mt.ml, mt.metric, mt.quant, seed), nil
 }
 
 // OpenTx resolves an existing index using a caller-provided read transaction
@@ -179,13 +181,13 @@ func OpenTx(rtx *btree.ReadTx, prefix string, seed int64) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newIndex(ns, mt.dim, mt.m, mt.m0, mt.efC, mt.efS, mt.ml, mt.metric, seed), nil
+	return newIndex(ns, mt.dim, mt.m, mt.m0, mt.efC, mt.efS, mt.ml, mt.metric, mt.quant, seed), nil
 }
 
-func newIndex(ns [5]*btree.Namespace, dim, m, m0, efC, efS int, ml float64, metric Metric, seed int64) *Index {
+func newIndex(ns [5]*btree.Namespace, dim, m, m0, efC, efS int, ml float64, metric Metric, quant Quantization, seed int64) *Index {
 	return &Index{
 		vmeta: ns[0], vvec: ns[1], vadj: ns[2], vdoc: ns[3], vlbl: ns[4],
-		dim: dim, m: m, m0: m0, efC: efC, efS: efS, ml: ml,
+		dim: dim, m: m, m0: m0, efC: efC, efS: efS, ml: ml, quant: quant,
 		dist: distanceFor(metric),
 		rng:  rand.New(rand.NewSource(seed)),
 	}
@@ -263,7 +265,13 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 		return keyArr[:]
 	}
 
-	if err = wtx.Put(ix.vvec, key(label), f32bytes(vec)); err != nil {
+	var vbytes []byte
+	if ix.quant == QuantNone {
+		vbytes = f32bytes(vec) // zero-copy
+	} else {
+		vbytes = encodeVec(nil, vec, ix.quant)
+	}
+	if err = wtx.Put(ix.vvec, key(label), vbytes); err != nil {
 		return err
 	}
 	var lb [4]byte

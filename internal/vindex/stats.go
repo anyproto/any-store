@@ -7,6 +7,7 @@ import "github.com/anyproto/any-store/v2/internal/btree"
 type Stats struct {
 	Dim          int
 	Metric       Metric
+	Quantization Quantization
 	M            int
 	M0           int
 	EfSearch     int
@@ -32,6 +33,7 @@ func (ix *Index) Stats(rtx *btree.ReadTx) (Stats, error) {
 	s := Stats{
 		Dim:          mt.dim,
 		Metric:       mt.metric,
+		Quantization: mt.quant,
 		M:            mt.m,
 		M0:           mt.m0,
 		EfSearch:     mt.efS,

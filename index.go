@@ -47,6 +47,24 @@ func (m VectorMetric) toVindex() vindex.Metric {
 	}
 }
 
+// VectorQuantization selects how the index stores vectors.
+type VectorQuantization uint8
+
+const (
+	// VectorQuantNone stores full float32 vectors (default).
+	VectorQuantNone VectorQuantization = iota
+	// VectorQuantInt8 stores scalar-quantized int8 vectors (~4x less storage /
+	// page-cache RAM) at a small recall cost.
+	VectorQuantInt8
+)
+
+func (q VectorQuantization) toVindex() vindex.Quantization {
+	if q == VectorQuantInt8 {
+		return vindex.QuantInt8
+	}
+	return vindex.QuantNone
+}
+
 // VectorParams configures a vector (HNSW) index.
 type VectorParams struct {
 	// Field is the path to the embedding field (an array of numbers).
@@ -59,6 +77,8 @@ type VectorParams struct {
 	M              int `json:"m,omitempty"`
 	EfConstruction int `json:"efConstruction,omitempty"`
 	EfSearch       int `json:"efSearch,omitempty"`
+	// Quantization selects the stored vector format (default full float32).
+	Quantization VectorQuantization `json:"quantization,omitempty"`
 }
 
 // IndexInfo provides information about an index.

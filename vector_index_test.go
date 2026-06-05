@@ -225,6 +225,98 @@ func TestVectorIndex_Stats(t *testing.T) {
 		vs2.NodeCount, vs2.LiveCount, vs2.DeletedCount, vs2.VectorBytes, vs2.GraphBytes, vs2.SizeBytes)
 }
 
+func TestVectorIndex_Int8Quantization(t *testing.T) {
+	const (
+		dim = 32
+		n   = 800
+	)
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{
+		Name: "emb", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 64, Quantization: VectorQuantInt8},
+	}))
+	vecs := vrand(n, dim, 4)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+	// self-query still returns the doc with int8 storage
+	hits, err := coll.VectorSearch(ctx, "emb", vecs[42], 1, 128)
+	require.NoError(t, err)
+	require.Len(t, hits, 1)
+	assert.Equal(t, idBytesOf(42), hits[0].DocId)
+
+	st, err := coll.Stats(ctx)
+	require.NoError(t, err)
+	require.Len(t, st.VectorIndexes, 1)
+	assert.Equal(t, "int8", st.VectorIndexes[0].Quantization)
+	t.Logf("int8 vector index: nodes=%d vec=%dB graph=%dB", st.VectorIndexes[0].NodeCount,
+		st.VectorIndexes[0].VectorBytes, st.VectorIndexes[0].GraphBytes)
+
+	// reopen-from-disk preserves int8 + results (covered for in-memory here via a
+	// fresh Find through the pipeline)
+	iter, err := coll.Find(fmt.Sprintf(`{"v":[%s]}`, joinFloats(vecs[7]))).Limit(1).Iter(ctx)
+	require.NoError(t, err)
+	require.True(t, iter.Next())
+	d, _ := iter.Doc()
+	assert.Equal(t, idBytesOf(7), d.Value().Get("id").MarshalTo(nil))
+	require.NoError(t, iter.Close())
+}
+
+func joinFloats(vec []float32) string {
+	parts := make([]string, len(vec))
+	for i, f := range vec {
+		parts[i] = fmt.Sprintf("%g", f)
+	}
+	return strings.Join(parts, ",")
+}
+
+func TestVectorIndex_UpdateSkipsUnchangedVector(t *testing.T) {
+	const dim = 16
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{
+		Name: "emb", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2},
+	}))
+	vecs := vrand(200, dim, 9)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+
+	vecJSON := func(vec []float32) string {
+		parts := make([]string, len(vec))
+		for i, f := range vec {
+			parts[i] = fmt.Sprintf("%g", f)
+		}
+		return "[" + strings.Join(parts, ",") + "]"
+	}
+	nodesAndTombs := func() (int, int) {
+		st, serr := coll.Stats(ctx)
+		require.NoError(t, serr)
+		require.Len(t, st.VectorIndexes, 1)
+		return st.VectorIndexes[0].NodeCount, st.VectorIndexes[0].DeletedCount
+	}
+
+	n0, d0 := nodesAndTombs()
+
+	// update a NON-vector field, keeping the same vector → index must NOT change
+	require.NoError(t, coll.UpsertOne(ctx, anyenc.MustParseJson(
+		fmt.Sprintf(`{"id":5,"v":%s,"label":"changed"}`, vecJSON(vecs[5])))))
+	n1, d1 := nodesAndTombs()
+	assert.Equal(t, n0, n1, "vector index reindexed despite unchanged vector")
+	assert.Equal(t, d0, d1, "vector index tombstoned despite unchanged vector")
+
+	// now change the vector → index MUST reindex (old tombstoned, new node added)
+	require.NoError(t, coll.UpsertOne(ctx, anyenc.MustParseJson(
+		fmt.Sprintf(`{"id":5,"v":%s}`, vecJSON(vecs[100])))))
+	n2, d2 := nodesAndTombs()
+	assert.Equal(t, n1+1, n2, "changed vector should add a node")
+	assert.Equal(t, d1+1, d2, "changed vector should tombstone the old node")
+}
+
 func TestVectorIndex_Drop(t *testing.T) {
 	const dim = 16
 	fx := newFixture(t)

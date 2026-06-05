@@ -28,6 +28,7 @@ type meta struct {
 	nextLabel    uint32
 	deletedCount int64
 	hasEntry     bool
+	quant        Quantization
 }
 
 var metaKey = []byte("m")
@@ -58,6 +59,7 @@ func encodeMeta(buf []byte, mt *meta) []byte {
 	} else {
 		buf = append(buf, 0)
 	}
+	buf = append(buf, byte(mt.quant))
 	return buf
 }
 
@@ -86,6 +88,10 @@ func decodeMeta(data []byte) (*meta, error) {
 	mt.nextLabel = get32()
 	mt.deletedCount = int64(get64())
 	mt.hasEntry = data[off] != 0
+	off++
+	if off < len(data) { // quant byte (absent in pre-quantization records → none)
+		mt.quant = Quantization(data[off])
+	}
 	return mt, nil
 }
 

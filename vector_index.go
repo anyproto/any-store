@@ -174,6 +174,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 		M:              info.Vector.M,
 		EfConstruction: info.Vector.EfConstruction,
 		EfSearch:       info.Vector.EfSearch,
+		Quantization:   info.Vector.Quantization.toVindex(),
 	}
 	ix, err := vindex.Create(tx, prefix, p, vectorIndexSeed(c.name, info.Name))
 	if err != nil {

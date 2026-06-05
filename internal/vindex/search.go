@@ -77,6 +77,8 @@ type searcher struct {
 	vf    []float32 // aliases vbuf — vector A (reused each read)
 	vbuf2 []byte
 	vf2   []float32 // aliases vbuf2 — vector B (held during pairwise prune)
+	qbuf  []byte    // quantized-record read buffer for vf (int8 mode)
+	qbuf2 []byte    // quantized-record read buffer for vf2 (int8 mode)
 
 	adjbuf  []byte
 	nbrs    []uint32
@@ -113,6 +115,13 @@ func (ix *Index) newSearcher(rtx *btree.ReadTx, query []float32) *searcher {
 // vecOf call).
 func (s *searcher) vecOf(label uint32) ([]float32, error) {
 	s.keyBuf = labelKey(s.keyBuf, label)
+	if s.ix.quant != QuantNone {
+		s.qbuf, _ = s.rtx.AppendValue(s.ix.vvec, s.keyBuf, s.qbuf[:0])
+		if v, ok := decodeVecInto(s.qbuf, s.ix.dim, s.ix.quant, s.vf); ok {
+			return v, nil
+		}
+		return nil, fmt.Errorf("vindex: bad quantized vector record len %d", len(s.qbuf))
+	}
 	b, err := s.rtx.AppendValue(s.ix.vvec, s.keyBuf, s.vbuf[:0])
 	if err != nil {
 		return nil, err
@@ -129,6 +138,13 @@ func (s *searcher) vecOf(label uint32) ([]float32, error) {
 // vec2Of reads label's vector into the secondary scratch (held across a prune).
 func (s *searcher) vec2Of(label uint32) ([]float32, error) {
 	s.keyBuf = labelKey(s.keyBuf, label)
+	if s.ix.quant != QuantNone {
+		s.qbuf2, _ = s.rtx.AppendValue(s.ix.vvec, s.keyBuf, s.qbuf2[:0])
+		if v, ok := decodeVecInto(s.qbuf2, s.ix.dim, s.ix.quant, s.vf2); ok {
+			return v, nil
+		}
+		return nil, fmt.Errorf("vindex: bad quantized vector record len %d", len(s.qbuf2))
+	}
 	b, err := s.rtx.AppendValue(s.ix.vvec, s.keyBuf, s.vbuf2[:0])
 	if err != nil {
 		return nil, err

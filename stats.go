@@ -58,6 +58,8 @@ type VectorIndexStats struct {
 	// Dim is the embedding dimension; Metric is the distance metric.
 	Dim    int
 	Metric string
+	// Quantization is the stored vector format ("none" | "int8").
+	Quantization string
 
 	// M / EfSearch are the HNSW graph parameters.
 	M        int
@@ -212,6 +214,7 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 				Field:        vi.info.Vector.Field,
 				Dim:          vs.Dim,
 				Metric:       vs.Metric.String(),
+				Quantization: vs.Quantization.String(),
 				M:            vs.M,
 				EfSearch:     vs.EfSearch,
 				NodeCount:    vs.NodeCount,
