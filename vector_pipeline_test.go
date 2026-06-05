@@ -126,6 +126,70 @@ func TestPipeline_AdditionalFilter(t *testing.T) {
 	require.Greater(t, count, 0)
 }
 
+// setupPipelineEf is like setupPipeline but with a small index EfSearch so
+// over-fetch behaviour is observable.
+func setupPipelineEf(t *testing.T, n, dim, efSearch int) (Collection, [][]float32) {
+	t.Helper()
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{
+		Name: "emb", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: efSearch},
+	}))
+	vecs := vrand(n, dim, 7)
+	for i, vc := range vecs {
+		lang := "en"
+		if i%2 == 1 {
+			lang = "fr"
+		}
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocFull(i, vc, lang, fmt.Sprintf("name%04d", i)))))
+	}
+	return coll, vecs
+}
+
+// TestPipeline_OverFetch: a filtered query with a limit fills the limit because
+// the planner over-fetches candidates (ef = limit×factor), even though the
+// index's own EfSearch is small.
+func TestPipeline_OverFetch(t *testing.T) {
+	const (
+		dim      = 16
+		efSearch = 16 // small: limit alone (30) would not yield 30 en survivors
+		limit    = 30
+	)
+	coll, vecs := setupPipelineEf(t, 1000, dim, efSearch)
+
+	iter, err := coll.Find(fmt.Sprintf(`{"v":%s,"lang":"en"}`, vqJSON(vecs[0]))).Limit(limit).Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+	var count int
+	for iter.Next() {
+		d, derr := iter.Doc()
+		require.NoError(t, derr)
+		require.Equal(t, "en", string(d.Value().Get("lang").GetStringBytes()))
+		count++
+	}
+	require.NoError(t, iter.Err())
+	assert.Equal(t, limit, count, "over-fetch should fill the limit despite a selective filter")
+}
+
+// TestPipeline_VectorEf: an explicit VectorEf bounds the candidate set.
+func TestPipeline_VectorEf(t *testing.T) {
+	const dim = 16
+	coll, vecs := setupPipelineEf(t, 1000, dim, 64)
+
+	iter, err := coll.Find(fmt.Sprintf(`{"v":%s}`, vqJSON(vecs[0]))).VectorEf(5).Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+	var count int
+	for iter.Next() {
+		count++
+	}
+	require.NoError(t, iter.Err())
+	assert.LessOrEqual(t, count, 5, "VectorEf(5) must cap the candidate set")
+	assert.Greater(t, count, 0)
+}
+
 // TestPipeline_Limit: limit applies over the distance-ordered results.
 func TestPipeline_Limit(t *testing.T) {
 	const dim = 16

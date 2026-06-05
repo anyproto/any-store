@@ -33,6 +33,11 @@ type Query interface {
 	// IndexHint adds or removes boost for some indexes
 	IndexHint(hints ...IndexHint) Query
 
+	// VectorEf overrides the ANN candidate-list size (numCandidates) for a
+	// vector query. 0 (default) auto-sizes it: the index default, raised to
+	// cover the limit and over-fetched when a residual filter is present.
+	VectorEf(ef uint) Query
+
 	// Iter executes the query and returns an Iterator for the results.
 	Iter(ctx context.Context) (Iterator, error)
 
@@ -79,6 +84,10 @@ type collQuery struct {
 
 	indexHints []IndexHint
 
+	// vectorEf overrides the ANN candidate-list size (numCandidates) for a
+	// vector query; 0 = auto (index default, raised to cover limit/over-fetch).
+	vectorEf uint
+
 	err error
 }
 
@@ -102,6 +111,11 @@ func (q *collQuery) Offset(offset uint) Query {
 
 func (q *collQuery) IndexHint(hints ...IndexHint) Query {
 	q.indexHints = hints
+	return q
+}
+
+func (q *collQuery) VectorEf(ef uint) Query {
+	q.vectorEf = ef
 	return q
 }
 

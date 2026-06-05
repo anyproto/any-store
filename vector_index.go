@@ -301,10 +301,7 @@ func (q *collQuery) detectVectorQuery() (*qplanner.VectorQuerySpec, query.Filter
 	}
 
 	residual := residualFilter(clauses, vecIdx)
-	ef := vi.ix.EfSearch()
-	if int(q.limit) > ef {
-		ef = int(q.limit)
-	}
+	ef := chooseEf(int(q.vectorEf), vi.ix.EfSearch(), int(q.limit), residual != nil)
 	captured := vi
 	spec := &qplanner.VectorQuerySpec{
 		Query: qvec,
@@ -360,6 +357,39 @@ func decodeVectorValue(eqValue []byte, dim int) ([]float32, error) {
 		out[i] = float32(e.GetFloat64())
 	}
 	return out, nil
+}
+
+// vectorOverFetch is how many ANN candidates to fetch per requested result when
+// a residual filter is present, so post-filtering rarely under-fills the limit
+// (akin to MongoDB's numCandidates ≈ 10–20× limit guidance).
+const vectorOverFetch = 10
+
+// vectorEfCap bounds the auto-sized candidate list so a huge limit + selective
+// filter can't trigger a pathologically wide search. Callers that genuinely need
+// more set VectorEf explicitly.
+const vectorEfCap = 4096
+
+// chooseEf resolves the ANN candidate-list size (numCandidates). An explicit
+// override wins; otherwise start from the index default, ensure it covers the
+// limit, and over-fetch when a residual filter will discard candidates.
+func chooseEf(explicit, indexDefault, limit int, hasFilter bool) int {
+	if explicit > 0 {
+		return explicit
+	}
+	ef := indexDefault
+	if limit > 0 {
+		want := limit
+		if hasFilter {
+			want = limit * vectorOverFetch
+		}
+		if want > ef {
+			ef = want
+		}
+	}
+	if ef > vectorEfCap {
+		ef = vectorEfCap
+	}
+	return ef
 }
 
 func residualFilter(clauses []query.Filter, skip int) query.Filter {
