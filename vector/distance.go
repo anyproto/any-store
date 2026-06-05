@@ -46,17 +46,31 @@ type DistanceFunc func(a, b []float32) float32
 // CPU. When false, vek still works but falls back to portable Go.
 func SIMD() bool { return vek32.Info().Acceleration }
 
-// DistanceFor returns the SIMD-backed distance function for the metric.
+// simdActive caches whether vek selected a vectorised kernel (vek is amd64-only,
+// so this is false on arm64 and any non-AVX2 x86 — see CROSS_HARDWARE.md).
+var simdActive = SIMD()
+
+// DistanceFor returns the best available distance function for the metric on
+// this CPU. When vek has no SIMD kernel (arm64, or x86 without AVX2+FMA) its
+// L2 fallback is slower than our hand-unrolled scalar loop (measured 685 vs
+// 608 ns on an Ivy Bridge Xeon), so we dispatch L2 to the unrolled kernel. The
+// real fix for ARM is a NEON kernel; see CROSS_HARDWARE.md.
 func (m Metric) DistanceFor() DistanceFunc {
 	switch m {
 	case L2:
-		return L2DistanceSIMD
+		if simdActive {
+			return L2DistanceSIMD
+		}
+		return L2DistanceUnrolled
 	case Cosine:
 		return CosineDistanceSIMD
 	case Dot:
 		return DotDistanceSIMD
 	default:
-		return L2DistanceSIMD
+		if simdActive {
+			return L2DistanceSIMD
+		}
+		return L2DistanceUnrolled
 	}
 }
 

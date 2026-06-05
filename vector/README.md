@@ -38,6 +38,7 @@ The goal was to answer three questions:
 `mddata_test.go` (`TestMDDataset`) is the realistic-scale dataset: 75k synthetic topic-clustered markdown documents embedded with the feature-hashing trick (dim 768, cosine) — representative geometry, not uniform-random. Run with `go test ./vector -run TestMDDataset -v` (skipped in `-short`).
 
 - [CROSS_HARDWARE.md](./CROSS_HARDWARE.md) — `cmd/vectorbench` run on three linux/amd64 machines (disk-backed, twice each). Headline: a no-AVX2 box makes distance ~25× slower (vek's fallback is even slower than the unrolled loop) — SIMD presence dominates everything; the hybrid stays the sweet spot (1.3–2.4×) and cold reload-from-disk is 8–37 ms loading only topology.
+- [ARM.md](./ARM.md) — how it runs on modern ARM (Apple Silicon / Graviton / mobile): vek is **amd64-only** so `vector.SIMD()` is false on arm64 → portable scalar path (now auto-dispatched to the unrolled kernel). The real fixes: a NEON kernel and quantization (binary-Hamming is natively fast on arm64 via `CNT`).
 
 A self-contained, static, no-CGO benchmark binary lives at [`cmd/vectorbench`](../cmd/vectorbench) — build once, copy to any linux/amd64 box (no Go needed on the target), and run `-db <path>` twice for build-then-cold-reload measurements.
 
