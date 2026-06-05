@@ -39,6 +39,7 @@ The goal was to answer three questions:
 
 - [CROSS_HARDWARE.md](./CROSS_HARDWARE.md) — `cmd/vectorbench` run on three linux/amd64 machines (disk-backed, twice each). Headline: a no-AVX2 box makes distance ~25× slower (vek's fallback is even slower than the unrolled loop) — SIMD presence dominates everything; the hybrid stays the sweet spot (1.3–2.4×) and cold reload-from-disk is 8–37 ms loading only topology.
 - [ARM.md](./ARM.md) — how it runs on modern ARM (Apple Silicon / Graviton / mobile): vek is **amd64-only** so `vector.SIMD()` is false on arm64 → portable scalar path (now auto-dispatched to the unrolled kernel). The real fixes: a NEON kernel and quantization (binary-Hamming is natively fast on arm64 via `CNT`).
+- [PLAN_INTEGRATION.md](./PLAN_INTEGRATION.md) — **plan to land this in any-store** as a btree-resident vector index (full-btree/Option B): where it plugs into the existing index/write-tx machinery, on-disk namespaces, write/read paths, the cross-process MVCC reliability argument, API, and phasing.
 
 A self-contained, static, no-CGO benchmark binary lives at [`cmd/vectorbench`](../cmd/vectorbench) — build once, copy to any linux/amd64 box (no Go needed on the target), and run `-db <path>` twice for build-then-cold-reload measurements.
 
