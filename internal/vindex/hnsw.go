@@ -257,8 +257,13 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 	mt.count++
 	level := ix.randomLevel()
 
-	var kbuf []byte
-	if err = wtx.Put(ix.vvec, labelKey(kbuf, label), f32bytes(vec)); err != nil {
+	var keyArr [4]byte
+	key := func(l uint32) []byte {
+		binary.BigEndian.PutUint32(keyArr[:], l)
+		return keyArr[:]
+	}
+
+	if err = wtx.Put(ix.vvec, key(label), f32bytes(vec)); err != nil {
 		return err
 	}
 	var lb [4]byte
@@ -266,18 +271,15 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 	if err = wtx.Put(ix.vdoc, docID, lb[:]); err != nil {
 		return err
 	}
-	if err = wtx.Put(ix.vlbl, labelKey(kbuf, label), docID); err != nil {
-		return err
-	}
-	empty := make([][]uint32, level+1)
-	for i := range empty {
-		empty[i] = nil
-	}
-	if err = wtx.Put(ix.vadj, labelKey(kbuf, label), encodeAdj(nil, level, false, empty)); err != nil {
+	if err = wtx.Put(ix.vlbl, key(label), docID); err != nil {
 		return err
 	}
 
 	if !mt.hasEntry {
+		empty := make([][]uint32, level+1)
+		if err = wtx.Put(ix.vadj, key(label), encodeAdj(nil, level, false, empty)); err != nil {
+			return err
+		}
 		mt.hasEntry, mt.entryLabel, mt.topLayer = true, label, level
 		return ix.writeMeta(wtx, mt)
 	}
@@ -294,6 +296,11 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 	if level < start {
 		start = level
 	}
+
+	// Accumulate the new node's neighbours per layer and write its adjacency
+	// ONCE after connecting, instead of a read-modify-write per selected
+	// neighbour. Only the back-links (neighbour -> new node) need addNeighbor.
+	newNbrs := make([][]uint32, level+1)
 	for lc := start; lc >= 0; lc-- {
 		found, serr := s.searchLayer(ep, ix.efC, lc)
 		if serr != nil {
@@ -303,10 +310,12 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 		if len(found) > m {
 			found = found[:m]
 		}
+		sel := make([]uint32, len(found))
+		for i, c := range found {
+			sel[i] = c.label
+		}
+		newNbrs[lc] = sel
 		for _, c := range found {
-			if err = ix.addNeighbor(wtx, s, label, c.label, lc); err != nil {
-				return err
-			}
 			if err = ix.addNeighbor(wtx, s, c.label, label, lc); err != nil {
 				return err
 			}
@@ -314,6 +323,9 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 		if len(found) > 0 {
 			ep = found[0].label
 		}
+	}
+	if err = wtx.Put(ix.vadj, key(label), encodeAdj(nil, level, false, newNbrs)); err != nil {
+		return err
 	}
 	if level > mt.topLayer {
 		mt.entryLabel, mt.topLayer = label, level
