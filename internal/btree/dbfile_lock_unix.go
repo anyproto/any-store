@@ -35,6 +35,18 @@ func acquireSharedDBLock(fd fileHandle) error {
 	return flockNB(fd, syscall.LOCK_SH)
 }
 
+// acquireExclusiveDBLock takes a non-blocking EXCLUSIVE flock on fd, held for
+// the pager's lifetime (released when the fd is closed). Returns ErrBusy if any
+// other open file description — in this process or another — already holds a
+// lock on the file. Used by in-process mode (heap-backed SHM is process-local,
+// so the DB is single-handle): a second opener is rejected instead of silently
+// corrupting via a separate heap SHM. flock (per-description) is used rather
+// than fcntl so a failed second open in the same process, when it closes its
+// fd, does not release the first handle's lock.
+func acquireExclusiveDBLock(fd fileHandle) error {
+	return flockNB(fd, syscall.LOCK_EX)
+}
+
 // tryUpgradeDBLockExclusive attempts to upgrade the caller's shared flock
 // to exclusive. Returns (true, nil) if the upgrade succeeded (caller is
 // the only holder, safe to unlink shm / truncate WAL). Returns (false, nil)
