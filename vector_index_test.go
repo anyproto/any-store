@@ -177,6 +177,54 @@ func TestVectorIndex_BuildOnExisting(t *testing.T) {
 	assert.Equal(t, idBytesOf(123), hits[0].DocId)
 }
 
+func TestVectorIndex_Stats(t *testing.T) {
+	const (
+		n   = 500
+		dim = 32
+	)
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{
+		Name: "emb", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorCosine, EfSearch: 64},
+	}))
+	vecs := vrand(n, dim, 9)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+
+	st, err := coll.Stats(ctx)
+	require.NoError(t, err)
+	require.Len(t, st.VectorIndexes, 1, "vector index must appear in stats")
+	vs := st.VectorIndexes[0]
+	assert.Equal(t, "emb", vs.Name)
+	assert.Equal(t, "v", vs.Field)
+	assert.Equal(t, dim, vs.Dim)
+	assert.Equal(t, "cosine", vs.Metric)
+	assert.Equal(t, n, vs.NodeCount)
+	assert.Equal(t, n, vs.LiveCount)
+	assert.Equal(t, 0, vs.DeletedCount)
+	assert.Greater(t, vs.VectorBytes, 0, "vec namespace should have size")
+	assert.Greater(t, vs.GraphBytes, 0, "adj namespace should have size")
+	assert.Greater(t, vs.SizeBytes, vs.VectorBytes, "total > just vectors")
+	assert.Greater(t, st.VectorIndexesSizeBytes, 0)
+	assert.GreaterOrEqual(t, st.TotalSizeBytes, st.VectorIndexesSizeBytes)
+
+	// delete some docs → DeletedCount/LiveCount reflect the tombstones
+	for i := 0; i < 100; i++ {
+		require.NoError(t, coll.DeleteId(ctx, i))
+	}
+	st2, err := coll.Stats(ctx)
+	require.NoError(t, err)
+	vs2 := st2.VectorIndexes[0]
+	assert.Equal(t, n, vs2.NodeCount, "physical node count unchanged by tombstones")
+	assert.Equal(t, n-100, vs2.LiveCount)
+	assert.Equal(t, 100, vs2.DeletedCount)
+	t.Logf("vector index stats: nodes=%d live=%d deleted=%d  vec=%dB graph=%dB total=%dB",
+		vs2.NodeCount, vs2.LiveCount, vs2.DeletedCount, vs2.VectorBytes, vs2.GraphBytes, vs2.SizeBytes)
+}
+
 func TestVectorIndex_Drop(t *testing.T) {
 	const dim = 16
 	fx := newFixture(t)
