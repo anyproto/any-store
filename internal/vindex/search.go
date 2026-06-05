@@ -1,0 +1,205 @@
+package vindex
+
+import (
+	"fmt"
+
+	"github.com/anyproto/any-store/v2/internal/btree"
+)
+
+// searcher carries the reusable per-operation buffers for traversing the
+// btree-resident graph. One searcher serves a single Insert or Search call
+// (not safe to share across goroutines). Vectors are read zero-copy into
+// float32-backed scratch; adjacency into a reused byte buffer.
+type searcher struct {
+	ix    *Index
+	rtx   *btree.ReadTx
+	query []float32
+
+	vbuf  []byte
+	vf    []float32 // aliases vbuf — vector A (reused each read)
+	vbuf2 []byte
+	vf2   []float32 // aliases vbuf2 — vector B (held during pairwise prune)
+
+	adjbuf  []byte
+	nbrs    []uint32
+	keyBuf  []byte
+	visited map[uint32]struct{}
+
+	cand cheap
+	res  cheap
+	out  []candidate
+}
+
+func (ix *Index) newSearcher(rtx *btree.ReadTx, query []float32) *searcher {
+	vf := make([]float32, ix.dim)
+	vf2 := make([]float32, ix.dim)
+	return &searcher{
+		ix:      ix,
+		rtx:     rtx,
+		query:   query,
+		vf:      vf,
+		vbuf:    f32bytes(vf),
+		vf2:     vf2,
+		vbuf2:   f32bytes(vf2),
+		visited: make(map[uint32]struct{}, 256),
+	}
+}
+
+// vecOf reads label's vector into the primary scratch (valid until the next
+// vecOf call).
+func (s *searcher) vecOf(label uint32) ([]float32, error) {
+	s.keyBuf = labelKey(s.keyBuf, label)
+	b, err := s.rtx.AppendValue(s.ix.vvec, s.keyBuf, s.vbuf[:0])
+	if err != nil {
+		return nil, err
+	}
+	if len(b) != s.ix.dim*4 {
+		return nil, fmt.Errorf("vindex: bad vector record len %d", len(b))
+	}
+	if &b[0] == &s.vbuf[0] {
+		return s.vf, nil
+	}
+	return bytesAsF32(b, s.ix.dim), nil
+}
+
+// vec2Of reads label's vector into the secondary scratch (held across a prune).
+func (s *searcher) vec2Of(label uint32) ([]float32, error) {
+	s.keyBuf = labelKey(s.keyBuf, label)
+	b, err := s.rtx.AppendValue(s.ix.vvec, s.keyBuf, s.vbuf2[:0])
+	if err != nil {
+		return nil, err
+	}
+	if len(b) != s.ix.dim*4 {
+		return nil, fmt.Errorf("vindex: bad vector record len %d", len(b))
+	}
+	if &b[0] == &s.vbuf2[0] {
+		return s.vf2, nil
+	}
+	return bytesAsF32(b, s.ix.dim), nil
+}
+
+func (s *searcher) adjBytesOf(label uint32) ([]byte, error) {
+	s.keyBuf = labelKey(s.keyBuf, label)
+	b, err := s.rtx.AppendValue(s.ix.vadj, s.keyBuf, s.adjbuf[:0])
+	if err != nil {
+		return nil, err
+	}
+	s.adjbuf = b
+	return b, nil
+}
+
+func (s *searcher) isDeleted(label uint32) (bool, error) {
+	b, err := s.adjBytesOf(label)
+	if err != nil {
+		return false, err
+	}
+	_, deleted, err := adjHeader(b)
+	return deleted, err
+}
+
+// greedyClosest walks one layer toward the query, returning the closest label.
+func (s *searcher) greedyClosest(ep uint32, layer int32) (uint32, error) {
+	best := ep
+	bv, err := s.vecOf(best)
+	if err != nil {
+		return 0, err
+	}
+	bestDist := s.ix.dist(s.query, bv)
+	for {
+		adjB, err := s.adjBytesOf(best)
+		if err != nil {
+			return 0, err
+		}
+		s.nbrs, err = adjNeighbors(adjB, layer, s.nbrs)
+		if err != nil {
+			return 0, err
+		}
+		improved := false
+		for _, nb := range s.nbrs {
+			nv, err := s.vecOf(nb)
+			if err != nil {
+				return 0, err
+			}
+			if d := s.ix.dist(s.query, nv); d < bestDist {
+				bestDist, best, improved = d, nb, true
+			}
+		}
+		if !improved {
+			return best, nil
+		}
+	}
+}
+
+// searchLayer is the two-heap HNSW layer search. Deleted nodes are still
+// expanded (they route) but never enter the result set. Returns results
+// closest-first.
+func (s *searcher) searchLayer(ep uint32, ef int, layer int32) ([]candidate, error) {
+	clear(s.visited)
+	s.cand.reset(false)
+	s.res.reset(true)
+
+	ev, err := s.vecOf(ep)
+	if err != nil {
+		return nil, err
+	}
+	d0 := s.ix.dist(s.query, ev)
+	s.visited[ep] = struct{}{}
+	s.cand.push(candidate{d0, ep})
+	epDel, err := s.isDeleted(ep)
+	if err != nil {
+		return nil, err
+	}
+	if !epDel {
+		s.res.push(candidate{d0, ep})
+	}
+
+	for s.cand.len() > 0 {
+		cur := s.cand.pop()
+		if s.res.len() >= ef && cur.dist > s.res.peek().dist {
+			break
+		}
+		adjB, err := s.adjBytesOf(cur.label)
+		if err != nil {
+			return nil, err
+		}
+		s.nbrs, err = adjNeighbors(adjB, layer, s.nbrs)
+		if err != nil {
+			return nil, err
+		}
+		for _, nb := range s.nbrs {
+			if _, seen := s.visited[nb]; seen {
+				continue
+			}
+			s.visited[nb] = struct{}{}
+			nv, err := s.vecOf(nb)
+			if err != nil {
+				return nil, err
+			}
+			d := s.ix.dist(s.query, nv)
+			if s.res.len() >= ef && d >= s.res.peek().dist {
+				continue
+			}
+			s.cand.push(candidate{d, nb})
+			del, err := s.isDeleted(nb)
+			if err != nil {
+				return nil, err
+			}
+			if del {
+				continue
+			}
+			s.res.push(candidate{d, nb})
+			if s.res.len() > ef {
+				s.res.pop()
+			}
+		}
+	}
+
+	s.out = s.out[:0]
+	for s.res.len() > 0 {
+		s.out = append(s.out, s.res.pop())
+	}
+	for i, j := 0, len(s.out)-1; i < j; i, j = i+1, j-1 {
+		s.out[i], s.out[j] = s.out[j], s.out[i]
+	}
+	return s.out, nil
+}
