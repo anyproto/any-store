@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"sync"
 	"testing"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
@@ -120,6 +121,45 @@ func TestVindexRecall(t *testing.T) {
 	recall /= float64(len(queries))
 	t.Logf("btree-resident HNSW recall@%d = %.3f", k, recall)
 	assert.Greater(t, recall, 0.85)
+}
+
+func TestVindexConcurrentSearch(t *testing.T) {
+	const (
+		n   = 2000
+		dim = 32
+	)
+	vecs := randVecs(n, dim, 5)
+	db, ix := newTestIndex(t, dim, L2)
+	insertAll(t, db, ix, vecs)
+	queries := randVecs(200, dim, 9)
+
+	// Concurrent readers each open their own read tx (the multiprocess analog of
+	// independent snapshots) and share the pooled searchers — must be race-free.
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(off int) {
+			defer wg.Done()
+			rtx, err := db.BeginRead()
+			if err != nil {
+				t.Errorf("begin read: %v", err)
+				return
+			}
+			defer rtx.Rollback()
+			for i := 0; i < len(queries); i++ {
+				hits, err := ix.Search(rtx, queries[(i+off)%len(queries)], 10, 64)
+				if err != nil {
+					t.Errorf("search: %v", err)
+					return
+				}
+				if len(hits) == 0 {
+					t.Errorf("empty result")
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
 }
 
 func TestVindexDelete(t *testing.T) {
