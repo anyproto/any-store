@@ -69,18 +69,7 @@ func BuildPagedFromFlat(g *FlatHNSW, db *btree.DB, name string, metric Metric) (
 	if vecNS, err = db.GetNamespace(name + ":vec"); err != nil {
 		return nil, err
 	}
-
-	scratchF := make([]float32, g.dim)
-	p := &PagedHNSW{
-		g:        g,
-		db:       db,
-		vecNS:    vecNS,
-		dim:      g.dim,
-		dist:     metric.DistanceFor(),
-		scratchF: scratchF,
-		scratchB: unsafe.Slice((*byte)(unsafe.Pointer(&scratchF[0])), g.dim*4),
-	}
-	return p, nil
+	return newPagedHNSW(g, db, vecNS, metric), nil
 }
 
 // f32bytes reinterprets a []float32 as its little-endian byte view (x86). For a

@@ -280,6 +280,36 @@ func (h *FlatHNSW) appendRaw(key uint64, level int32, vec []float32, neighborsPe
 	}
 }
 
+// appendTopo bulk-loads a node's TOPOLOGY only (key, level, per-layer
+// neighbours) without a vector — the vector stays on disk for a paged index.
+// Like appendRaw, nodes must arrive in ascending id order. The resulting
+// FlatHNSW must only be used through a PagedHNSW (its vector slab is empty, so
+// vectorAt / in-memory Search would be invalid).
+func (h *FlatHNSW) appendTopo(key uint64, level int32, neighborsPerLayer [][]uint32) {
+	id := uint32(len(h.keys))
+	h.keys = append(h.keys, key)
+	h.keyToID[key] = id
+	h.level = append(h.level, level)
+	h.deleted = append(h.deleted, false)
+	h.liveCount++
+
+	h.linkOff = append(h.linkOff, int32(len(h.links)))
+	blockLinks := h.M0 + int(level)*h.M
+	h.links = append(h.links, make([]uint32, blockLinks)...)
+	h.countOff = append(h.countOff, int32(len(h.counts)))
+	h.counts = append(h.counts, make([]int32, int(level)+1)...)
+
+	for lc := int32(0); lc <= level; lc++ {
+		nbs := neighborsPerLayer[lc]
+		start, capacity := h.neighborSlots(id, lc)
+		if len(nbs) > capacity {
+			nbs = nbs[:capacity]
+		}
+		copy(h.links[start:start+len(nbs)], nbs)
+		h.counts[int(h.countOff[id])+int(lc)] = int32(len(nbs))
+	}
+}
+
 // setEntry restores the graph entry point (used after a bulk load).
 func (h *FlatHNSW) setEntry(id uint32, top int32) {
 	h.entryID, h.topLayer, h.hasEntry = id, top, true

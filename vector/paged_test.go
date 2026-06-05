@@ -43,6 +43,50 @@ func TestPagedMatchesMemory(t *testing.T) {
 	}
 }
 
+func TestPersistReloadParity(t *testing.T) {
+	const (
+		n   = 1500
+		dim = 48
+		k   = 10
+	)
+	vecs, keys := randVectors(n, dim, 23)
+	queries, _ := randVectors(40, dim, 91)
+
+	g := NewFlatHNSW(dim, L2, 1)
+	g.EfSearch = 64
+	for i := range vecs {
+		g.Add(keys[i], vecs[i])
+	}
+
+	path := filepath.Join(t.TempDir(), "p.db")
+	// build + persist, then close
+	{
+		db, err := btree.Open(path, btree.Options{})
+		require.NoError(t, err)
+		require.NoError(t, PersistPaged(g, db, "emb", L2))
+		require.NoError(t, db.Checkpoint(btree.CheckpointFull))
+		require.NoError(t, db.Close())
+	}
+	// reopen cold and search — topology-only load must reproduce paged results
+	db, err := btree.Open(path, btree.Options{})
+	require.NoError(t, err)
+	defer db.Close()
+	require.True(t, PagedExists(db, "emb"))
+	p, err := OpenPaged(db, "emb")
+	require.NoError(t, err)
+	require.Equal(t, n, p.PhysLen())
+
+	for _, q := range queries {
+		mem := g.Search(q, k)
+		rel, err := p.Search(q, k)
+		require.NoError(t, err)
+		require.Equal(t, len(mem), len(rel))
+		for j := range mem {
+			require.Equal(t, mem[j].Key, rel[j].Key, "reloaded paged result mismatch")
+		}
+	}
+}
+
 // TestPagedVsMemory measures the latency and RAM trade of paging vectors from
 // the btree (Option B) vs the in-memory arena (Option A), warm cache.
 func TestPagedVsMemory(t *testing.T) {
