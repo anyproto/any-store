@@ -67,6 +67,27 @@ type Index struct {
 
 	rngMu sync.Mutex
 	rng   *rand.Rand
+
+	// scratch pools per-operation searchers (heaps, visited set, vector and
+	// adjacency buffers) so a steady-state Search/Insert reuses them instead of
+	// allocating fresh every call. sync.Pool is safe under concurrent Search.
+	scratch sync.Pool
+}
+
+// getSearcher returns a pooled searcher bound to rtx/query (or a fresh one).
+func (ix *Index) getSearcher(rtx *btree.ReadTx, query []float32) *searcher {
+	if s, ok := ix.scratch.Get().(*searcher); ok {
+		s.rtx = rtx
+		s.query = query
+		return s
+	}
+	return ix.newSearcher(rtx, query)
+}
+
+func (ix *Index) putSearcher(s *searcher) {
+	s.rtx = nil
+	s.query = nil
+	ix.scratch.Put(s)
 }
 
 func nsNames(prefix string) [5]string {
@@ -261,7 +282,8 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 		return ix.writeMeta(wtx, mt)
 	}
 
-	s := ix.newSearcher(rtx, vec)
+	s := ix.getSearcher(rtx, vec)
+	defer ix.putSearcher(s)
 	ep := mt.entryLabel
 	for lc := mt.topLayer; lc > level; lc-- {
 		if ep, err = s.greedyClosest(ep, lc); err != nil {
@@ -425,7 +447,8 @@ func (ix *Index) Search(rtx *btree.ReadTx, query []float32, k, efSearch int) ([]
 		ef = k
 	}
 
-	s := ix.newSearcher(rtx, query)
+	s := ix.getSearcher(rtx, query)
+	defer ix.putSearcher(s)
 	ep := mt.entryLabel
 	for lc := mt.topLayer; lc > 0; lc-- {
 		if ep, err = s.greedyClosest(ep, lc); err != nil {

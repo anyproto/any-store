@@ -31,7 +31,8 @@ func (ix *Index) SearchCandidates(rtx *btree.ReadTx, query []float32, ef int) ([
 	if ef <= 0 {
 		ef = ix.efS
 	}
-	s := ix.newSearcher(rtx, query)
+	s := ix.getSearcher(rtx, query)
+	defer ix.putSearcher(s)
 	epn := mt.entryLabel
 	for lc := mt.topLayer; lc > 0; lc-- {
 		if epn, err = s.greedyClosest(epn, lc); err != nil {
