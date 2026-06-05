@@ -33,6 +33,7 @@ func (ix *Index) SearchCandidates(rtx *btree.ReadTx, query []float32, ef int) ([
 	}
 	s := ix.getSearcher(rtx, query)
 	defer ix.putSearcher(s)
+	s.checkDeleted = mt.deletedCount > 0
 	epn := mt.entryLabel
 	for lc := mt.topLayer; lc > 0; lc-- {
 		if epn, err = s.greedyClosest(epn, lc); err != nil {
@@ -66,6 +67,11 @@ type searcher struct {
 	ix    *Index
 	rtx   *btree.ReadTx
 	query []float32
+
+	// checkDeleted gates the per-visited-node tombstone read. When the index has
+	// no tombstones (the common case, and always during a fresh build) every node
+	// is live, so we skip that extra adjacency read entirely.
+	checkDeleted bool
 
 	vbuf  []byte
 	vf    []float32 // aliases vbuf — vector A (reused each read)
@@ -203,9 +209,11 @@ func (s *searcher) searchLayer(ep uint32, ef int, layer int32) ([]candidate, err
 	d0 := s.ix.dist(s.query, ev)
 	s.visited[ep] = struct{}{}
 	s.cand.push(candidate{d0, ep})
-	epDel, err := s.isDeleted(ep)
-	if err != nil {
-		return nil, err
+	epDel := false
+	if s.checkDeleted {
+		if epDel, err = s.isDeleted(ep); err != nil {
+			return nil, err
+		}
 	}
 	if !epDel {
 		s.res.push(candidate{d0, ep})
@@ -238,12 +246,14 @@ func (s *searcher) searchLayer(ep uint32, ef int, layer int32) ([]candidate, err
 				continue
 			}
 			s.cand.push(candidate{d, nb})
-			del, err := s.isDeleted(nb)
-			if err != nil {
-				return nil, err
-			}
-			if del {
-				continue
+			if s.checkDeleted {
+				del, derr := s.isDeleted(nb)
+				if derr != nil {
+					return nil, derr
+				}
+				if del {
+					continue
+				}
 			}
 			s.res.push(candidate{d, nb})
 			if s.res.len() > ef {

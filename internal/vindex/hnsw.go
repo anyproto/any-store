@@ -286,6 +286,7 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 
 	s := ix.getSearcher(rtx, vec)
 	defer ix.putSearcher(s)
+	s.checkDeleted = mt.deletedCount > 0
 	ep := mt.entryLabel
 	for lc := mt.topLayer; lc > level; lc-- {
 		if ep, err = s.greedyClosest(ep, lc); err != nil {
@@ -465,6 +466,7 @@ func (ix *Index) Search(rtx *btree.ReadTx, query []float32, k, efSearch int) ([]
 
 	s := ix.getSearcher(rtx, query)
 	defer ix.putSearcher(s)
+	s.checkDeleted = mt.deletedCount > 0
 	ep := mt.entryLabel
 	for lc := mt.topLayer; lc > 0; lc-- {
 		if ep, err = s.greedyClosest(ep, lc); err != nil {
