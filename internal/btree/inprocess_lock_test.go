@@ -96,3 +96,61 @@ func TestInProcess_PeerCanOpenAfterClose(t *testing.T) {
 	require.NoError(t, syscall.Flock(int(peer.Fd()), syscall.LOCK_EX|syscall.LOCK_NB),
 		"peer must acquire the lock after the in-process holder closed")
 }
+
+// --- Mixed mode (in-process vs multi-process mmap) ---------------------------
+//
+// anystore never opens the same file in both modes (Config exposes no InProcess;
+// mode is platform-derived: unix->mmap, Windows->in-process), so this is not a
+// user-reachable scenario. But if it ever happened — an mmap-mode process and an
+// in-process process on one file — it would be UNSAFE (one coordinates via the
+// mmap'd -shm, the other via heap SHM, with no shared coordination). The DB-file
+// locks must therefore be mutually exclusive: the second opener of either mode is
+// rejected rather than allowed to dual-open. (Before the exclusive-lock fix the
+// in-process side took no lock, so this dual-opened and corrupted.)
+
+// TestInProcess_RejectedWhilePeerHoldsShared: a multi-process (mmap) opener holds
+// a SHARED lock; an in-process open must be rejected with ErrInProcessLocked
+// (its exclusive lock cannot coexist with the peer's shared lock).
+func TestInProcess_RejectedWhilePeerHoldsShared(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mixed.db")
+
+	// Materialize a real DB, then close it.
+	db, err := testOpen(t, path, DefaultOptions())
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	// Peer holds SHARED, as a multi-process mmap-mode opener would.
+	peer, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer peer.Close()
+	require.NoError(t, syscall.Flock(int(peer.Fd()), syscall.LOCK_SH|syscall.LOCK_NB))
+
+	_, err = testOpen(t, path, inProcessOpts())
+	require.ErrorIs(t, err, ErrInProcessLocked,
+		"in-process open must be rejected while an mmap-mode peer holds the shared lock")
+}
+
+// TestInProcess_MmapRejectedWhilePeerHoldsExclusive: an in-process opener holds an
+// EXCLUSIVE lock; a multi-process (mmap) open must be rejected (no dual-open).
+// The mmap path surfaces a generic busy-after-retries error rather than
+// ErrInProcessLocked, so we assert only that it is rejected — the safety property
+// is "no concurrent open across modes", not the specific message.
+func TestInProcess_MmapRejectedWhilePeerHoldsExclusive(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mixed.db")
+
+	db, err := testOpen(t, path, DefaultOptions())
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	// Peer holds EXCLUSIVE, as an in-process opener would.
+	peer, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer peer.Close()
+	require.NoError(t, syscall.Flock(int(peer.Fd()), syscall.LOCK_EX|syscall.LOCK_NB))
+
+	got, err := testOpen(t, path, DefaultOptions()) // InProcess=false (mmap mode)
+	require.Error(t, err, "mmap open must be rejected while an in-process peer holds the exclusive lock")
+	require.Nil(t, got, "no DB handle must be returned on a rejected open")
+}
