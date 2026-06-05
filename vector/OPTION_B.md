@@ -74,6 +74,41 @@ performance is **page-cache-bound**, exactly as pgvector's docs ("keep vectors i
 `shared_buffers`") and Lucene's mmap model (see
 [COMPARISON_mongodb.md](./COMPARISON_mongodb.md)) describe.
 
+## Measured — realistic dataset (75 000 markdown docs, dim 768, cosine)
+
+The numbers above use 128-dim uniform-random vectors (the HNSW worst case). The
+capstone `TestMDDataset` (`mddata_test.go`) instead generates **75 000 synthetic
+topic-clustered markdown documents** (avg ~2 KB, 12 topics) and embeds them with
+the **feature-hashing trick** at **dim 768** — the geometry real doc embeddings
+have. This is the more representative picture:
+
+```
+75 000 docs, avg 2083 B  (≈149 MiB corpus) → 768-d cosine embeddings (≈220 MiB raw)
+build flat HNSW in-mem: 21 s (3 500 docs/s)
+recall@10: ef=64 → 0.86,  ef=128 → 0.87,  ef=256 → 0.88   (ceiling = crude hash
+            embedding + simple neighbour selection; heuristic select / larger M lift it)
+```
+
+| variant | latency | RAM | gets/query |
+|---------|--------:|-----|-----------:|
+| **A** in-memory arena | 152 µs/q | **244 MiB** (full) | 0 |
+| **B** paged vectors | 940 µs/q (6.2×) | **14.8 MiB** (topology only — **94% less**) | 937 |
+| **B′** hybrid route+rerank | 258 µs/q (**1.7×**) | routing-slab + topology | 64 |
+
+Two things change for the better at a realistic embedding width:
+
+- **Pure paging is relatively less bad (6.2× vs 10.6× at 128d)** — at 768d the
+  distance computation is a larger slice of each hop, so the fixed btree-descent
+  overhead is a smaller multiple. Fewer nodes are visited too (937 vs 1897),
+  because clustered data converges faster than uniform-random.
+- **The RAM win from paging is dramatic: 244 MiB → 14.8 MiB (94% less).** This is
+  the whole point — at 768/1536-d the vector dwarfs the ~128 B of topology, so
+  keeping only the graph resident and paging the vectors saves almost everything.
+  The hybrid keeps that storage option open while holding latency to 1.7×.
+
+So the case for Option B / the hybrid gets **stronger** at real embedding
+dimensions, not weaker.
+
 ## Conclusions
 
 1. **Pure Option B is not the answer for the hot path.** ~1900 btree descents per

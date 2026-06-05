@@ -33,7 +33,9 @@ The goal was to answer three questions:
 - [DELETE_UPDATE.md](./DELETE_UPDATE.md) — deletes/updates research + measurements (tombstones, compaction, write amplification, RAM, doc-id mapping).
 - [COMPARISON_pgvector.md](./COMPARISON_pgvector.md) — vs pgvector (disk-resident buffer-cache-paged graph vs in-memory arena; the "real fork" for any-store).
 - [COMPARISON_mongodb.md](./COMPARISON_mongodb.md) — vs MongoDB Atlas Vector Search (closest external/API analog; Lucene segment model; quantization; read-your-writes advantage).
-- [OPTION_B.md](./OPTION_B.md) — prototype + measurements of paging vectors through the btree page cache (disk-resident graph): pure paging is ~10× slower, but a quantized-routing + paged-rerank **hybrid** lands at ~1.5× with a fraction of the RAM (`paged.go`).
+- [OPTION_B.md](./OPTION_B.md) — prototype + measurements of paging vectors through the btree page cache (disk-resident graph): pure paging is ~6–10× slower, but a quantized-routing + paged-rerank **hybrid** lands at ~1.7× with a fraction of the RAM (`paged.go`). Includes a realistic **75k markdown-doc / dim-768** capstone where paging holds **94% less RAM**.
+
+`mddata_test.go` (`TestMDDataset`) is the realistic-scale dataset: 75k synthetic topic-clustered markdown documents embedded with the feature-hashing trick (dim 768, cosine) — representative geometry, not uniform-random. Run with `go test ./vector -run TestMDDataset -v` (skipped in `-short`).
 
 ## Three ways to land it — and the one that wins
 
