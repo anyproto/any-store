@@ -135,6 +135,41 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	buf := q.c.db.syncPool.GetDocBuf()
 	btx := tx.btreeReadTx()
 
+	// Vector query: detect `{vectorField: [..]}` against the collection's vector
+	// indexes. When matched, build a vector plan (ANN source) and ignore all
+	// other indexes; the residual filter + sort run as downstream stages.
+	vspec, residual, verr := q.detectVectorQuery()
+	if verr != nil {
+		q.c.db.syncPool.ReleaseDocBuf(buf)
+		_ = tx.Commit()
+		qb.Close()
+		return nil, verr
+	}
+	if vspec != nil {
+		sorter := q.sort
+		if sorter == nil {
+			// simple variant: order by distance ascending
+			sorter, _ = query.ParseSort(qplanner.DistanceField)
+		}
+		plan := qplanner.BuildPlan(&qplanner.PlanParams{
+			Tx:     btx,
+			DataNs: q.c.ns,
+			Filter: residual,
+			Sorter: sorter,
+			Limit:  int(q.limit),
+			Offset: int(q.offset),
+			Buf:    buf,
+			Vector: vspec,
+		})
+		return &planIterator{
+			plan: plan,
+			tx:   tx,
+			buf:  buf,
+			qb:   qb,
+			data: &qplanner.CursorSource{Tx: btx, Ns: q.c.ns},
+		}, nil
+	}
+
 	idxs := q.c.loadIndexes()
 	br := q.buildBoundsResult(idxs)
 	plan := qplanner.BuildPlan(&qplanner.PlanParams{

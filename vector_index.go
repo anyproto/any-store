@@ -8,7 +8,9 @@ import (
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/qplanner"
 	"github.com/anyproto/any-store/v2/internal/vindex"
+	"github.com/anyproto/any-store/v2/query"
 )
 
 // VectorHit is a single vector-search result.
@@ -245,6 +247,135 @@ func (c *collection) reconcileVectorIndexesLocked(tx *btree.ReadTx, infos []Inde
 	}
 	if changed {
 		c.storeVectorIndexes(rebuilt)
+	}
+}
+
+// ErrMultipleVectorClauses is returned when a query constrains more than one
+// vector-indexed field (unsupported).
+var ErrMultipleVectorClauses = errors.New("any-store: query has multiple vector clauses")
+
+// detectVectorQuery inspects the parsed filter for an equality on a
+// vector-indexed field (`{vectorField: [..]}`). If found it returns a planner
+// spec and the residual filter (the original filter minus the vector clause —
+// keeping _distance predicates and any other field filters). Returns
+// (nil, original, nil) when this is not a vector query.
+func (q *collQuery) detectVectorQuery() (*qplanner.VectorQuerySpec, query.Filter, error) {
+	vidxs := q.c.loadVectorIndexes()
+	if len(vidxs) == 0 || q.cond == nil {
+		return nil, q.cond, nil
+	}
+
+	var clauses []query.Filter
+	switch f := q.cond.(type) {
+	case query.And:
+		clauses = f
+	default:
+		clauses = []query.Filter{q.cond}
+	}
+
+	vecIdx := -1
+	var vi *vectorIndex
+	var qvec []float32
+	for i, cl := range clauses {
+		path, comp, ok := asEqClause(cl)
+		if !ok {
+			continue
+		}
+		field := strings.Join(path, ".")
+		for _, v := range vidxs {
+			if v.info.Vector.Field != field {
+				continue
+			}
+			vec, derr := decodeVectorValue(comp.EqValue, v.dim)
+			if derr != nil {
+				continue // value isn't a dim-sized numeric array — not an ANN query
+			}
+			if vecIdx >= 0 {
+				return nil, nil, ErrMultipleVectorClauses
+			}
+			vecIdx, vi, qvec = i, v, vec
+		}
+	}
+	if vecIdx < 0 {
+		return nil, q.cond, nil
+	}
+
+	residual := residualFilter(clauses, vecIdx)
+	ef := vi.ix.EfSearch()
+	if int(q.limit) > ef {
+		ef = int(q.limit)
+	}
+	captured := vi
+	spec := &qplanner.VectorQuerySpec{
+		Query: qvec,
+		Ef:    ef,
+		Search: func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
+			cands, err := captured.ix.SearchCandidates(tx, qv, ef)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]qplanner.VectorCandidate, len(cands))
+			for i, c := range cands {
+				out[i] = qplanner.VectorCandidate{DocId: c.DocID, Distance: c.Distance}
+			}
+			return out, nil
+		},
+	}
+	return spec, residual, nil
+}
+
+// asEqClause returns the field path and Comp for a `{field: value}` equality
+// clause (a query.Key wrapping a CompOpEq), else ok=false.
+func asEqClause(cl query.Filter) (path []string, comp *query.Comp, ok bool) {
+	k, isKey := cl.(query.Key)
+	if !isKey {
+		return nil, nil, false
+	}
+	c, isComp := k.Filter.(*query.Comp)
+	if !isComp || c.CompOp != query.CompOpEq {
+		return nil, nil, false
+	}
+	return k.Path, c, true
+}
+
+// decodeVectorValue decodes a marshaled anyenc array into a dim-sized []float32.
+func decodeVectorValue(eqValue []byte, dim int) ([]float32, error) {
+	var p anyenc.Parser
+	v, err := p.Parse(eqValue)
+	if err != nil {
+		return nil, err
+	}
+	if v.Type() != anyenc.TypeArray {
+		return nil, fmt.Errorf("not an array")
+	}
+	arr, err := v.Array()
+	if err != nil || len(arr) != dim {
+		return nil, fmt.Errorf("array length %d != dim %d", len(arr), dim)
+	}
+	out := make([]float32, dim)
+	for i, e := range arr {
+		if e.Type() != anyenc.TypeNumber {
+			return nil, fmt.Errorf("non-numeric element")
+		}
+		out[i] = float32(e.GetFloat64())
+	}
+	return out, nil
+}
+
+func residualFilter(clauses []query.Filter, skip int) query.Filter {
+	rest := make([]query.Filter, 0, len(clauses)-1)
+	for i, c := range clauses {
+		if i != skip {
+			rest = append(rest, c)
+		}
+	}
+	switch len(rest) {
+	case 0:
+		return nil
+	case 1:
+		return rest[0]
+	default:
+		return query.And(rest)
 	}
 }
 

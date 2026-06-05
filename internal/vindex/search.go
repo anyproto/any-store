@@ -6,6 +6,57 @@ import (
 	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
+// Candidate is one ANN result: the document id and its distance to the query.
+type Candidate struct {
+	DocID    []byte
+	Distance float32
+}
+
+// SearchCandidates runs the ANN beam search and returns up to ef live
+// candidates with their distances. Unlike Search it does NOT rank/truncate to k
+// — the query pipeline's sort+limit own the final ordering ("drop heap"). The
+// returned order is whatever the layer search produced (closest-first); callers
+// must not rely on it.
+func (ix *Index) SearchCandidates(rtx *btree.ReadTx, query []float32, ef int) ([]Candidate, error) {
+	if len(query) != ix.dim {
+		return nil, fmt.Errorf("vindex: dim mismatch: got %d want %d", len(query), ix.dim)
+	}
+	mt, err := ix.readMeta(rtx)
+	if err != nil {
+		return nil, err
+	}
+	if !mt.hasEntry {
+		return nil, nil
+	}
+	if ef <= 0 {
+		ef = ix.efS
+	}
+	s := ix.newSearcher(rtx, query)
+	epn := mt.entryLabel
+	for lc := mt.topLayer; lc > 0; lc-- {
+		if epn, err = s.greedyClosest(epn, lc); err != nil {
+			return nil, err
+		}
+	}
+	found, err := s.searchLayer(epn, ef, 0)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Candidate, 0, len(found))
+	var kbuf []byte
+	for _, c := range found {
+		docID, derr := rtx.Get(ix.vlbl, labelKey(kbuf, c.label))
+		if derr != nil {
+			return nil, derr
+		}
+		out = append(out, Candidate{DocID: append([]byte(nil), docID...), Distance: c.dist})
+	}
+	return out, nil
+}
+
+// EfSearch returns the index's default query-time candidate-list size.
+func (ix *Index) EfSearch() int { return ix.efS }
+
 // searcher carries the reusable per-operation buffers for traversing the
 // btree-resident graph. One searcher serves a single Insert or Search call
 // (not safe to share across goroutines). Vectors are read zero-copy into
