@@ -89,7 +89,6 @@ type DB interface {
 	// returned in IntegrityReport.Errors; the function only errors on I/O or
 	// context cancellation. See IntegrityConfig.
 	VerifyIntegrity(ctx context.Context) (IntegrityReport, error)
-
 }
 
 // DBStats represents the statistics of the database.
@@ -334,18 +333,18 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 // The reaction is two-tiered, mirroring SQLite's sqlite3InitOne (structure)
 // running before sqlite3AnalysisLoad (statistics):
 //
-//   Tier 1 — STRUCTURAL (correctness): when the SCHEMA cookie advanced, a peer
-//     committed DDL (index create/drop/recreate). reconcileIndexSet rebuilds
-//     each open collection's index set from on-disk metadata: it adds
-//     peer-created indexes, drops peer-removed ones, and re-resolves the btree
-//     namespace handle (root) of any index whose definition or root changed —
-//     so a long-lived handle can never keep reading/writing a dropped or
-//     recreated index's stale namespace. A stale schema is never tolerated.
+//	Tier 1 — STRUCTURAL (correctness): when the SCHEMA cookie advanced, a peer
+//	  committed DDL (index create/drop/recreate). reconcileIndexSet rebuilds
+//	  each open collection's index set from on-disk metadata: it adds
+//	  peer-created indexes, drops peer-removed ones, and re-resolves the btree
+//	  namespace handle (root) of any index whose definition or root changed —
+//	  so a long-lived handle can never keep reading/writing a dropped or
+//	  recreated index's stale namespace. A stale schema is never tolerated.
 //
-//   Tier 2 — STATISTICAL (advisory): reloadSketches refreshes the selectivity
-//     sketches over the (now reconciled) index set. A stale sketch only affects
-//     which index the planner CHOOSES, never query RESULTS (the any-store analog
-//     of sqlite_stat1), so it runs strictly after the structural reconcile.
+//	Tier 2 — STATISTICAL (advisory): reloadSketches refreshes the selectivity
+//	  sketches over the (now reconciled) index set. A stale sketch only affects
+//	  which index the planner CHOOSES, never query RESULTS (the any-store analog
+//	  of sqlite_stat1), so it runs strictly after the structural reconcile.
 func (db *db) checkStale(tx *btree.ReadTx) {
 	if tx.IsSchemaStale() {
 		db.reconcileIndexSet(tx)
@@ -913,6 +912,19 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 		for _, fv := range v.GetArray("fields") {
 			info.Fields = append(info.Fields, string(fv.GetStringBytes()))
 		}
+		if IndexKind(v.GetInt("kind")) == IndexKindVector {
+			if vv := v.Get("vector"); vv != nil {
+				info.Kind = IndexKindVector
+				info.Vector = &VectorParams{
+					Field:          vv.GetString("field"),
+					Dim:            vv.GetInt("dim"),
+					Metric:         VectorMetric(vv.GetInt("metric")),
+					M:              vv.GetInt("m"),
+					EfConstruction: vv.GetInt("efc"),
+					EfSearch:       vv.GetInt("efs"),
+				}
+			}
+		}
 		result = append(result, info)
 		if err := cursor.Next(); err != nil {
 			return nil, err
@@ -977,6 +989,17 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 	}
 	if info.Unique {
 		obj.Set("unique", a.NewTrue())
+	}
+	if info.Kind == IndexKindVector && info.Vector != nil {
+		obj.Set("kind", a.NewNumberInt(int(IndexKindVector)))
+		vobj := a.NewObject()
+		vobj.Set("field", a.NewString(info.Vector.Field))
+		vobj.Set("dim", a.NewNumberInt(info.Vector.Dim))
+		vobj.Set("metric", a.NewNumberInt(int(info.Vector.Metric)))
+		vobj.Set("m", a.NewNumberInt(info.Vector.M))
+		vobj.Set("efc", a.NewNumberInt(info.Vector.EfConstruction))
+		vobj.Set("efs", a.NewNumberInt(info.Vector.EfSearch))
+		obj.Set("vector", vobj)
 	}
 	return tx.Put(db.systemNS, key, obj.MarshalTo(nil))
 }

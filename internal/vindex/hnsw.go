@@ -138,6 +138,29 @@ func Open(db *btree.DB, prefix string, seed int64) (*Index, error) {
 	return newIndex(ns, mt.dim, mt.m, mt.m0, mt.efC, mt.efS, mt.ml, mt.metric, seed), nil
 }
 
+// OpenTx resolves an existing index using a caller-provided read transaction
+// (no nested BeginRead) — used when opening/reconciling inside another tx.
+func OpenTx(rtx *btree.ReadTx, prefix string, seed int64) (*Index, error) {
+	names := nsNames(prefix)
+	var ns [5]*btree.Namespace
+	for i, name := range names {
+		n, err := rtx.GetNamespace(name)
+		if err != nil {
+			return nil, err
+		}
+		ns[i] = n
+	}
+	b, err := rtx.Get(ns[0], metaKey)
+	if err != nil {
+		return nil, err
+	}
+	mt, err := decodeMeta(b)
+	if err != nil {
+		return nil, err
+	}
+	return newIndex(ns, mt.dim, mt.m, mt.m0, mt.efC, mt.efS, mt.ml, mt.metric, seed), nil
+}
+
 func newIndex(ns [5]*btree.Namespace, dim, m, m0, efC, efS int, ml float64, metric Metric, seed int64) *Index {
 	return &Index{
 		vmeta: ns[0], vvec: ns[1], vadj: ns[2], vdoc: ns[3], vlbl: ns[4],

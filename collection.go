@@ -74,6 +74,11 @@ type Collection interface {
 	// GetIndexes returns a list of indexes on the collection.
 	GetIndexes() (indexes []Index)
 
+	// VectorSearch returns the k nearest documents to query under the named
+	// vector (HNSW) index. efSearch <= 0 uses the index default. Results are
+	// ordered closest-first.
+	VectorSearch(ctx context.Context, indexName string, query []float32, k, efSearch int) (hits []VectorHit, err error)
+
 	// Stats returns the storage footprint of the collection: document count,
 	// stored and uncompressed sizes, compression ratio and per-index sizes.
 	// It scans the whole collection and is intended for diagnostics.
@@ -128,8 +133,12 @@ type collection struct {
 	// whole-schema reload on a schema-cookie bump (a reader sees either the old
 	// or the new schema, never half-applied DDL).
 	indexes atomic.Pointer[[]*index]
-	db      *db
-	ns      *btree.Namespace
+	// vindexes is the parallel CoW snapshot of vector (HNSW) indexes. They are
+	// not queried via the filter path; the write hooks update them alongside the
+	// range indexes, and VectorSearch reads them.
+	vindexes atomic.Pointer[[]*vectorIndex]
+	db       *db
+	ns       *btree.Namespace
 
 	compression Compression // 0 = use db default
 
@@ -158,6 +167,19 @@ func (c *collection) loadIndexes() []*index {
 // serialise concurrent publishers); readers need no lock.
 func (c *collection) storeIndexes(idxs []*index) {
 	c.indexes.Store(&idxs)
+}
+
+// loadVectorIndexes returns the current vector-index snapshot (lock-free).
+func (c *collection) loadVectorIndexes() []*vectorIndex {
+	if p := c.vindexes.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// storeVectorIndexes publishes a new vector-index snapshot. Callers hold c.mu.
+func (c *collection) storeVectorIndexes(vidxs []*vectorIndex) {
+	c.vindexes.Store(&vidxs)
 }
 
 // init initializes the collection, loading namespace handles and index metadata.
@@ -195,7 +217,16 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 			return err
 		}
 		var idxs []*index
+		var vidxs []*vectorIndex
 		for _, info := range idxInfos {
+			if info.Kind == IndexKindVector {
+				vi, viErr := c.loadVectorIndex(tx, info)
+				if viErr != nil {
+					return viErr
+				}
+				vidxs = append(vidxs, vi)
+				continue
+			}
 			nsName := indexNsName(c.name, info.Name)
 			ns, nsErr := getNamespace(nsName)
 			if nsErr != nil {
@@ -209,6 +240,7 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 			idxs = append(idxs, idx)
 		}
 		c.storeIndexes(idxs)
+		c.storeVectorIndexes(vidxs)
 		return nil
 	})
 }
@@ -231,7 +263,6 @@ func (c *collection) compressionDisabled() bool {
 		return c.db.config.DisableCompression
 	}
 }
-
 
 func (c *collection) FindId(ctx context.Context, docId any) (doc Doc, err error) {
 	return c.FindIdWithParser(ctx, &anyenc.Parser{}, docId)
@@ -330,6 +361,11 @@ func (c *collection) insertItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, it i
 	// Insert index entries
 	for _, idx := range c.loadIndexes() {
 		if err = idx.insertKeys(tx, it); err != nil {
+			return err
+		}
+	}
+	for _, vi := range c.loadVectorIndexes() {
+		if err = vi.insert(tx, it, nil); err != nil {
 			return err
 		}
 	}
@@ -465,6 +501,12 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 			return
 		}
 	}
+	// Vector indexes: only touch the graph when the embedding actually changed.
+	for _, vi := range c.loadVectorIndexes() {
+		if err = vi.update(tx, prevIt, it); err != nil {
+			return
+		}
+	}
 
 	if c.compressionDisabled() {
 		buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
@@ -532,13 +574,19 @@ func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
 
 func (c *collection) deleteItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, id []byte) (err error) {
 	// Delete index entries
-	if idxs := c.loadIndexes(); len(idxs) > 0 {
+	vidxs := c.loadVectorIndexes()
+	if idxs := c.loadIndexes(); len(idxs) > 0 || len(vidxs) > 0 {
 		it, loadErr := c.loadById(tx, buf, id)
 		if loadErr != nil {
 			return loadErr
 		}
 		for _, idx := range idxs {
 			if err = idx.deleteKeys(tx, it); err != nil {
+				return err
+			}
+		}
+		for _, vi := range vidxs {
+			if err = vi.delete(tx, it); err != nil {
 				return err
 			}
 		}
@@ -569,7 +617,19 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 	}
 	return c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
 		var newIndexes []*index
+		var newVIndexes []*vectorIndex
 		for _, idxInfo := range info {
+			if idxInfo.Kind == IndexKindVector {
+				vi, viErr := c.createVectorIndex(tx, idxInfo)
+				if viErr != nil {
+					if ensure && errors.Is(viErr, ErrIndexExists) {
+						continue
+					}
+					return false, viErr
+				}
+				newVIndexes = append(newVIndexes, vi)
+				continue
+			}
 			idx, txErr := c.createIndex(ctx, tx, idxInfo)
 			if txErr != nil {
 				// ensure=true is idempotent only for an EXISTING index whose
@@ -586,7 +646,7 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 			newIndexes = append(newIndexes, idx)
 		}
 
-		if len(newIndexes) == 0 {
+		if len(newIndexes) == 0 && len(newVIndexes) == 0 {
 			return false, nil
 		}
 
@@ -595,11 +655,20 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 		// Copy-on-write publish: build a fresh slice (current snapshot + new
 		// indexes) and swap it in atomically so lock-free query readers always
 		// see a complete generation.
-		cur := c.loadIndexes()
-		merged := make([]*index, 0, len(cur)+len(newIndexes))
-		merged = append(merged, cur...)
-		merged = append(merged, newIndexes...)
-		c.storeIndexes(merged)
+		if len(newIndexes) > 0 {
+			cur := c.loadIndexes()
+			merged := make([]*index, 0, len(cur)+len(newIndexes))
+			merged = append(merged, cur...)
+			merged = append(merged, newIndexes...)
+			c.storeIndexes(merged)
+		}
+		if len(newVIndexes) > 0 {
+			cur := c.loadVectorIndexes()
+			merged := make([]*vectorIndex, 0, len(cur)+len(newVIndexes))
+			merged = append(merged, cur...)
+			merged = append(merged, newVIndexes...)
+			c.storeVectorIndexes(merged)
+		}
 		return true, nil
 	})
 }
@@ -663,6 +732,29 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 		// a peer dropped is absent (return ErrIndexNotFound, not a false success).
 		c.mu.Lock()
 		defer c.mu.Unlock()
+
+		// Vector index drop: unregister, delete its namespaces, republish.
+		for _, vi := range c.loadVectorIndexes() {
+			if vi.info.Name != indexName {
+				continue
+			}
+			if txErr = c.db.removeIndex(tx, c.name, indexName); txErr != nil {
+				return
+			}
+			if txErr = dropVectorIndexNamespaces(tx, c.name, indexName); txErr != nil {
+				return
+			}
+			cur := c.loadVectorIndexes()
+			next := make([]*vectorIndex, 0, len(cur))
+			for _, v := range cur {
+				if v.info.Name != indexName {
+					next = append(next, v)
+				}
+			}
+			c.storeVectorIndexes(next)
+			return nil
+		}
+
 		found := false
 		for _, idx := range c.loadIndexes() {
 			if idx.info.Name == indexName {
@@ -751,6 +843,12 @@ func (c *collection) Drop(ctx context.Context) error {
 			return err
 		}
 		for _, info := range idxInfos {
+			if info.Kind == IndexKindVector {
+				if err = dropVectorIndexNamespaces(tx, c.name, info.Name); err != nil {
+					return
+				}
+				continue
+			}
 			nsName := indexNsName(c.name, info.Name)
 			if err = tx.DeleteNamespace(nsName); err != nil {
 				if !errors.Is(err, btree.ErrNamespaceNotFound) {
@@ -925,6 +1023,17 @@ func (c *collection) reconcileIndexes(tx *btree.ReadTx) {
 	for _, idx := range cur {
 		byName[idx.info.Name] = idx
 	}
+
+	// Reconcile vector indexes separately (different namespaces / type).
+	c.reconcileVectorIndexesLocked(tx, infos)
+
+	rangeInfos := infos[:0:0]
+	for _, info := range infos {
+		if info.Kind != IndexKindVector {
+			rangeInfos = append(rangeInfos, info)
+		}
+	}
+	infos = rangeInfos
 
 	rebuilt := make([]*index, 0, len(infos))
 	changed := len(infos) != len(cur)

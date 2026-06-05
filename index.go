@@ -12,7 +12,54 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/qplanner"
+	"github.com/anyproto/any-store/v2/internal/vindex"
 )
+
+// IndexKind selects the kind of index.
+type IndexKind uint8
+
+const (
+	// IndexKindRange is the default B-tree range/equality index.
+	IndexKindRange IndexKind = iota
+	// IndexKindVector is an HNSW approximate-nearest-neighbour index over a
+	// vector (embedding) field. Queried via Collection.VectorSearch, not the
+	// normal filter path.
+	IndexKindVector
+)
+
+// VectorMetric selects the distance measure for a vector index.
+type VectorMetric uint8
+
+const (
+	VectorCosine VectorMetric = iota
+	VectorL2
+	VectorDot
+)
+
+func (m VectorMetric) toVindex() vindex.Metric {
+	switch m {
+	case VectorL2:
+		return vindex.L2
+	case VectorDot:
+		return vindex.Dot
+	default:
+		return vindex.Cosine
+	}
+}
+
+// VectorParams configures a vector (HNSW) index.
+type VectorParams struct {
+	// Field is the path to the embedding field (an array of numbers).
+	Field string `json:"field"`
+	// Dim is the embedding dimension.
+	Dim int `json:"dim"`
+	// Metric is the distance measure (default cosine).
+	Metric VectorMetric `json:"metric"`
+	// M / EfConstruction / EfSearch tune the HNSW graph; 0 = sensible defaults.
+	M              int `json:"m,omitempty"`
+	EfConstruction int `json:"efConstruction,omitempty"`
+	EfSearch       int `json:"efSearch,omitempty"`
+}
 
 // IndexInfo provides information about an index.
 type IndexInfo struct {
@@ -30,6 +77,12 @@ type IndexInfo struct {
 	// Sparse indicates whether the index is sparse, indexing only documents
 	// with the specified fields.
 	Sparse bool `json:"sparse"`
+
+	// Kind selects the index type (range by default, or vector).
+	Kind IndexKind `json:"kind,omitempty"`
+
+	// Vector configures a vector index when Kind == IndexKindVector.
+	Vector *VectorParams `json:"vector,omitempty"`
 }
 
 func (i IndexInfo) createName() string {
@@ -92,8 +145,8 @@ type index struct {
 	keysBuf     []anyenc.Tuple
 	keysBufPrev []anyenc.Tuple
 	uniqBuf     [][]anyenc.Tuple
-	fullKeyBuf anyenc.Tuple // reusable buffer for full keys (key+docId)
-	seekBuf    anyenc.Tuple // reusable buffer for unique constraint seek results
+	fullKeyBuf  anyenc.Tuple // reusable buffer for full keys (key+docId)
+	seekBuf     anyenc.Tuple // reusable buffer for unique constraint seek results
 }
 
 // loadPubSketch returns the published reader snapshot. Lock-free; the returned
