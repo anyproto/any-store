@@ -13,7 +13,14 @@ import (
 // tempPagerWithPageSize creates a pager with a custom page size and an active write tx.
 func tempPagerWithPageSize(t *testing.T, pageSize uint32) *pager {
 	t.Helper()
-	resetPageBufferPool()
+	// resetPoolForTest clears the process-global page buffer pool now AND on
+	// cleanup. The cleanup half is essential: this helper opens pagers at
+	// non-default page sizes (e.g. 512), so without it the pool's size key and
+	// 512-byte buffers leak into a later default-4096 test, which then either
+	// fails initPageBufferPool with ErrPageBufferPoolSizeMismatch or draws an
+	// undersized buffer and panics slicing buf[:pageSize] in wal.readFrame.
+	// Order-dependent; only surfaces under `go test -shuffle=on`.
+	resetPoolForTest(t)
 	p := newPager(filepath.Join(t.TempDir(), "t.db"), pageSize, 200, true)
 	require.NoError(t, p.open())
 	_, slot, err := p.beginRead()

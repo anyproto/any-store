@@ -125,7 +125,7 @@ func TestOpenRejectsUsableSizeBelow480(t *testing.T) {
 	// (reserved cannot exceed 32 there).
 	corruptByte(t, path, 20, 64)
 
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	db2, err := Open(path, Options{PageSize: 512})
 	if db2 != nil {
 		_ = db2.Close()

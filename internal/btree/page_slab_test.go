@@ -275,3 +275,63 @@ func TestPageSlab_PressureEdgeCases(t *testing.T) {
 		t.Fatal("should not be under pressure after putting buffer back")
 	}
 }
+
+// TestAllocPageBuffer_RejectsUndersizedPooledBuffer is a deterministic
+// regression for the cross-test page-buffer-pool pollution flake: a test that
+// opens a DB at a small page size (e.g. 1024) leaves 1024-cap buffers in the
+// process-global pageBufferPool; a later 4096-page test that reaches
+// allocPageBuffer without first calling resetPageBufferPool (newPager-based
+// pager tests, backup_test.go's bare-Open dst) then draws the undersized buffer
+// and either panics in wal.readFrame on buf[:4096] (slice bounds out of range
+// with capacity 1024) or reads short and reports "database is corrupt". Under
+// `go test -shuffle=on` this is order- AND GC/sync.Pool-timing-dependent.
+func TestAllocPageBuffer_RejectsUndersizedPooledBuffer(t *testing.T) {
+	// Isolate from any pool state leaked by other tests, and restore on exit.
+	resetPageBufferPool()
+	t.Cleanup(resetPageBufferPool)
+
+	// Simulate a smaller-page-size predecessor leaving an undersized buffer in
+	// the shared pool.
+	pageBufferPool.Put(make([]byte, 1024))
+
+	const pageSize = 4096
+	for i := 0; i < 8; i++ {
+		buf := allocPageBuffer(pageSize, false)
+		if len(buf) != pageSize {
+			t.Fatalf("allocPageBuffer returned len=%d, want %d (undersized buffer leaked from pool)", len(buf), pageSize)
+		}
+		// The caller slices buf[:pageSize]; with a too-small buffer this panics.
+		_ = buf[:pageSize]
+	}
+
+	// An oversized pooled buffer (e.g. from a 65536-page predecessor) must be
+	// usable too, sliced down to the requested page size.
+	resetPageBufferPool()
+	pageBufferPool.Put(make([]byte, 65536))
+	buf := allocPageBuffer(pageSize, false)
+	if len(buf) != pageSize {
+		t.Fatalf("oversized pooled buffer: got len=%d, want %d", len(buf), pageSize)
+	}
+}
+
+// TestAllocPageBuffer_SlabOverflowUndersized covers the useSlab=true overflow
+// path on an uninitialized global slab (reachable only via tests that call
+// newPcache(pageSize, n, true) directly; production rejects UsePageSlab on an
+// uninitialized slab at db.Open). Get() on an uninit slab falls to
+// pageBufferPool, which may hold an undersized buffer; allocPageBuffer must
+// still return a correctly sized buffer rather than a zero/short one.
+func TestAllocPageBuffer_SlabOverflowUndersized(t *testing.T) {
+	globalPageSlab.Reset() // uninitialized: pageSize==0, freeList==nil
+	t.Cleanup(globalPageSlab.Reset)
+	resetPageBufferPool()
+	t.Cleanup(resetPageBufferPool)
+
+	pageBufferPool.Put(make([]byte, 1024))
+
+	const pageSize = 4096
+	buf := allocPageBuffer(pageSize, true)
+	if len(buf) != pageSize {
+		t.Fatalf("slab-overflow allocPageBuffer returned len=%d, want %d", len(buf), pageSize)
+	}
+	_ = buf[:pageSize]
+}

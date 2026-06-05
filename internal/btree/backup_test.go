@@ -18,7 +18,10 @@ func backupPair(t *testing.T) (src, dst *DB) {
 	dir := t.TempDir()
 	opts := DefaultOptions()
 
-	s, err := Open(filepath.Join(dir, "src.db"), opts)
+	// testOpen resets the process-global page buffer pool before opening so a
+	// preceding test that used a different page size (e.g. 512/1024) cannot
+	// leave pageBufferPoolSize set and trip ErrPageBufferPoolSizeMismatch here.
+	s, err := testOpen(t, filepath.Join(dir, "src.db"), opts)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 
@@ -714,7 +717,9 @@ func TestBackup_RestartsOnExternalProcessWrite(t *testing.T) {
 
 	// Seed src.
 	{
-		s, err := Open(srcPath, opts)
+		// Reset the process-global page buffer pool: a preceding test using a
+		// different page size would otherwise trip ErrPageBufferPoolSizeMismatch.
+		s, err := testOpen(t, srcPath, opts)
 		require.NoError(t, err)
 		stx, err := s.BeginWrite()
 		require.NoError(t, err)

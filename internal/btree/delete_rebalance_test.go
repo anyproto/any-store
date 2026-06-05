@@ -108,7 +108,7 @@ func TestDeleteRebalance_FillFactor(t *testing.T) {
 				keyOf = randKey
 			}
 
-			resetPageBufferPool()
+			resetPoolForTest(t)
 			dir := t.TempDir()
 			db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: pageSize})
 			require.NoError(t, err)
@@ -238,7 +238,7 @@ func TestDeleteRebalance_FillFactor(t *testing.T) {
 // merge), the freelist grew by exactly one page (the freed surplus sibling), and
 // IntegrityCheck passes.
 func TestDeleteRebalance_Merge(t *testing.T) {
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 1024})
 	require.NoError(t, err)

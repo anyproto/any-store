@@ -14,7 +14,7 @@ import (
 // tempPagerSmall creates a pager with a specific page size and begins a write tx.
 func tempPagerSmall(t *testing.T, pageSize uint32) *pager {
 	t.Helper()
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	p := newPager(filepath.Join(t.TempDir(), "t.db"), pageSize, 200, true)
 	require.NoError(t, p.open())
 	_, slot, err := p.beginRead()

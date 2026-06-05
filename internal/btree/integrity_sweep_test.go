@@ -17,7 +17,7 @@ import (
 // ErrPageBufferPoolSizeMismatch on Open.
 func setupSweepDB(t *testing.T, path string, opts Options) {
 	t.Helper()
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	db, err := Open(path, opts)
 	if err != nil {
 		t.Fatal(err)

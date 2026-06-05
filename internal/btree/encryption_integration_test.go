@@ -18,7 +18,7 @@ func tmpEncryptedFile(t *testing.T, name string) string {
 // configuration. Uses a Cleanup to reset again at teardown for hygiene.
 func encTestSetup(t testing.TB) {
 	t.Helper()
-	resetPageBufferPool()
+	resetPoolForTest(t)
 }
 
 func TestOpen_KeyRoundTrip(t *testing.T) {

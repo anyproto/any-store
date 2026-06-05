@@ -70,7 +70,7 @@ func TestBalanceQuick_AppendFillFactor(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resetPageBufferPool()
+			resetPoolForTest(t)
 			dir := t.TempDir()
 			db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: pageSize})
 			require.NoError(t, err)
@@ -301,7 +301,7 @@ func TestBalanceQuick_HappyPath(t *testing.T) {
 		valSize  = 80
 	)
 
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: pageSize})
 	require.NoError(t, err)
@@ -357,7 +357,7 @@ func TestBalanceQuick_HappyPath(t *testing.T) {
 // depth-2 tree (root interior + a few leaves). None of those splits have
 // parent != root, so the dispatch counter must remain 0.
 func TestBalanceQuick_RootIsParent(t *testing.T) {
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 1024})
 	require.NoError(t, err)
@@ -396,7 +396,7 @@ func TestBalanceQuick_RootIsParent(t *testing.T) {
 // balance_deeper()." Any-store's equivalent cascade is
 // insertSepIntoInterior's slow path.
 func TestBalanceQuick_CascadeToParentSplit(t *testing.T) {
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 512})
 	require.NoError(t, err)
@@ -443,7 +443,7 @@ func TestBalanceQuick_CascadeToParentSplit(t *testing.T) {
 // the regular split path: middle-of-tree inserts after a fast-path split
 // must still work correctly, and later appends must still hit the fast path.
 func TestBalanceQuick_InterleavedInserts(t *testing.T) {
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 1024})
 	require.NoError(t, err)
@@ -516,7 +516,7 @@ func TestBalanceQuick_InterleavedInserts(t *testing.T) {
 // every append triggers a split with an overflow-bearing cell landing
 // on the new right sibling via the fast path.
 func TestBalanceQuick_OverflowBearingCell(t *testing.T) {
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 512})
 	require.NoError(t, err)
@@ -577,7 +577,7 @@ func TestBalanceQuick_OverflowBearingCell(t *testing.T) {
 // dirty pages; the fast path touches parent + allocates a new right
 // sibling, both of which must be rolled back cleanly.
 func TestBalanceQuick_SavepointRollback(t *testing.T) {
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 1024})
 	require.NoError(t, err)
@@ -636,7 +636,7 @@ func TestBalanceQuick_SavepointRollback(t *testing.T) {
 // independent of which write path was used; this test pins the
 // behavior under the new fast path.
 func TestBalanceQuick_ConcurrentReader(t *testing.T) {
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 1024})
 	require.NoError(t, err)
@@ -788,7 +788,7 @@ func TestBalanceQuick_AllocFreelistCorruptResilience(t *testing.T) {
 // dbfuzz001.test). An over-full page that reports zero cells is corrupt and
 // must be rejected BEFORE any allocation or parent mutation.
 func TestBalanceQuick_ZeroCellCorruptGuard(t *testing.T) {
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 1024})
 	require.NoError(t, err)

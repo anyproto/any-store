@@ -60,6 +60,12 @@ func TestDBMmap_EnabledSmallDB(t *testing.T) {
 // remap past the initial small cap, then reads back and verifies no
 // error. Coverage: miss-then-remap path in readDBPage.
 func TestDBMmap_GrowRemapsAndReadsCorrect(t *testing.T) {
+	// This test opens a default-4096 DB via raw Open. Without resetting the
+	// process-global page buffer pool first, a predecessor that opened a
+	// non-4096 DB (e.g. a 512/1024 corrupt-DB test) and leaked its pool size
+	// makes this Open fail with ErrPageBufferPoolSizeMismatch under
+	// -shuffle=on. resetPoolForTest isolates us. See helpers_test.go.
+	resetPoolForTest(t)
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "t.db")
 

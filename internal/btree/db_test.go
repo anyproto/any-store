@@ -1065,20 +1065,26 @@ func TestOpen_PageSizeTooLarge(t *testing.T) {
 // resetPageBufferPool() between them so the shared-pool path is exercised
 // (testOpen resets per call, so call Open directly here).
 func TestOpen_OnDiskPageSizeMismatchSharedPool(t *testing.T) {
+	// This test deliberately keys the process-global pool to a non-default page
+	// size (2*MinPageSize) and intentionally does NOT reset between the two
+	// Opens. Register a cleanup so the leftover pool key/buffers do not leak
+	// into a later test (which would fail it with ErrPageBufferPoolSizeMismatch
+	// or panic drawing an undersized buffer under `go test -shuffle=on`).
+	t.Cleanup(resetPageBufferPool)
 	dir := t.TempDir()
 	pathA := filepath.Join(dir, "a.db")
 	pathB := filepath.Join(dir, "b.db")
 
 	// Create DB A with the minimum page size, then close it so the on-disk
 	// header records PageSize == MinPageSize.
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	dbA, err := Open(pathA, Options{PageSize: MinPageSize})
 	require.NoError(t, err)
 	require.NoError(t, dbA.Close())
 
 	// Key the process-global pool to a DIFFERENT page size via DB B, WITHOUT
 	// resetting the pool first.
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	dbB, err := Open(pathB, Options{PageSize: 2 * MinPageSize})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = dbB.Close() })

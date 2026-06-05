@@ -91,6 +91,11 @@ func TestCksum_CannotCombineWithEncryption(t *testing.T) {
 // close, flip a body byte on disk, reopen and read — checksum mismatch must
 // surface as an error. Modeled on encryption_integration_test.go:344-426.
 func TestCksum_TamperDetected(t *testing.T) {
+	// Opens a default-4096 DB via raw Open. Reset the process-global page
+	// buffer pool first so a predecessor that leaked a non-4096 pool size
+	// (corrupt-DB tests at 512/1024) does not make this Open fail with
+	// ErrPageBufferPoolSizeMismatch under -shuffle=on. See helpers_test.go.
+	resetPoolForTest(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "tamper.db")
 	opts := DefaultOptions()

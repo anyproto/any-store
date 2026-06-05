@@ -184,6 +184,14 @@ func isInteriorPage(data []byte, hdrOff int) bool {
 // any operation panicked or timed out. The DB is closed before returning.
 // A 5-second timeout is used to detect infinite loops from circular page refs.
 func scanNamespaceCatchPanic(path string, pageSize uint32) (panicked any, scanErr error) {
+	// Isolate the process-global page buffer pool: this helper Opens at a
+	// caller-given (often non-4096) page size. Reset before (so the Open
+	// succeeds regardless of a prior test's pool size) and after (so we do not
+	// leak pageSize into the next test). See helpers_test.go and
+	// corruptAndCheckIntegrity for the full pollution model.
+	resetPageBufferPool()
+	defer resetPageBufferPool()
+
 	type result struct {
 		panicked any
 		scanErr  error
@@ -231,6 +239,16 @@ func scanNamespaceCatchPanic(path string, pageSize uint32) (panicked any, scanEr
 // corruptAndCheckIntegrity is a helper that opens a corrupt DB and runs
 // IntegrityCheck with a timeout to avoid infinite loops from circular refs.
 func corruptAndCheckIntegrity(path string, pageSize uint32) (panicked any, integrityErr error) {
+	// Isolate the process-global page buffer pool. This helper Opens at a
+	// caller-given (often non-4096) page size; without a reset, the Open here
+	// can fail with ErrPageBufferPoolSizeMismatch if a prior test left the pool
+	// at a different size, and (worse) it would otherwise leak pageSize into the
+	// pool for the NEXT test, breaking unrelated default-4096 tests under
+	// -shuffle=on. Reset before (so the Open succeeds) and after (so we do not
+	// leak) the run. See helpers_test.go for the full pollution model.
+	resetPageBufferPool()
+	defer resetPageBufferPool()
+
 	type result struct {
 		panicked     any
 		integrityErr error

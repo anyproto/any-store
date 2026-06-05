@@ -5997,7 +5997,7 @@ func TestCountPageSelfReferentialInteriorCycle(t *testing.T) {
 // This is the structural precondition for the balance_quick fast path
 // (docs/btree/specs/2026-04-23-balance-quick-port-design.md §4-5).
 func TestPath_CellIdxRightmost(t *testing.T) {
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 1024})
 	require.NoError(t, err)
@@ -6059,7 +6059,7 @@ func TestPath_CellIdxRightmost(t *testing.T) {
 // TestPath_CellIdxMiddle verifies that a mid-key lookup populates cellIdx
 // with the correct middle-of-parent slot.
 func TestPath_CellIdxMiddle(t *testing.T) {
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 1024})
 	require.NoError(t, err)

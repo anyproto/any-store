@@ -110,7 +110,7 @@ func TestBalanceNonroot_FillFactor(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resetPageBufferPool()
+			resetPoolForTest(t)
 			dir := t.TempDir()
 			db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: pageSize})
 			require.NoError(t, err)
@@ -192,7 +192,7 @@ func TestBalanceNonroot_FillFactor(t *testing.T) {
 // lastBalanceNOld / lastBalanceNNew hooks that exactly 3 siblings were gathered
 // and the output page count stayed within {nOld-1, nOld, nOld+1}.
 func TestBalanceNonroot_SiblingGather(t *testing.T) {
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 1024})
 	require.NoError(t, err)
@@ -293,7 +293,7 @@ func TestBalanceNonroot_RandomMutationIntegrity(t *testing.T) {
 	for _, pageSize := range []uint32{512, 1024, 4096} {
 		pageSize := pageSize
 		t.Run("page"+itoaTest(int(pageSize)), func(t *testing.T) {
-			resetPageBufferPool()
+			resetPoolForTest(t)
 			dir := t.TempDir()
 			db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: pageSize})
 			require.NoError(t, err)

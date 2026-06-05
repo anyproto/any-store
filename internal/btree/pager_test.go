@@ -2369,7 +2369,7 @@ func TestShmHashWriteGet_CrossSegment(t *testing.T) {
 // ============================================================
 
 func TestPagerOpen_ExistingDBWithWALRecovery(t *testing.T) {
-	resetPageBufferPool() // isolate: a prior test may have left a non-4096 page-buffer-pool size
+	resetPoolForTest(t) // reset now AND on cleanup: isolate from a prior non-4096 pool size and do not leak ours
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
@@ -2411,7 +2411,7 @@ func TestPagerOpen_ExistingDBWithWALRecovery(t *testing.T) {
 }
 
 func TestPagerOpen_ExistingDBZeroPageSize(t *testing.T) {
-	resetPageBufferPool() // isolate: a prior test may have left a non-4096 page-buffer-pool size
+	resetPoolForTest(t) // reset now AND on cleanup: isolate from a prior non-4096 pool size and do not leak ours
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 
@@ -4408,7 +4408,7 @@ func TestWALRecover_PartialFrame(t *testing.T) {
 
 // --- wal.go:1161-1163 recover() readAt error in committed frame rebuild ---
 func TestWALRecover_RebuildReadError(t *testing.T) {
-	resetPageBufferPool() // isolate: a prior test may have left a non-4096 page-buffer-pool size
+	resetPoolForTest(t) // reset now AND on cleanup: isolate from a prior non-4096 pool size and do not leak ours
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
 
@@ -7888,7 +7888,10 @@ func TestWithWriteLock_AlwaysReleases(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			dbPath := filepath.Join(dir, "t.db")
-			db, err := Open(dbPath, Options{})
+			// testOpen resets the process-global page buffer pool first, so a
+			// preceding test that used a different page size cannot trip
+			// ErrPageBufferPoolSizeMismatch on this default-page-size open.
+			db, err := testOpen(t, dbPath, Options{})
 			if err != nil {
 				t.Fatalf("open: %v", err)
 			}
@@ -8164,7 +8167,7 @@ func TestWriteOverflowChain_ContiguousOnFreshFreelist(t *testing.T) {
 // on a throwaway path, closes it, and reads back the raw main-file image.
 func referenceEmptyPage1(t *testing.T, opts Options) []byte {
 	t.Helper()
-	resetPageBufferPool()
+	resetPoolForTest(t) // reset now AND on cleanup: opts may carry a non-default page size
 	p := filepath.Join(t.TempDir(), "ref.db")
 	db, err := Open(p, opts)
 	require.NoError(t, err)
@@ -8179,7 +8182,7 @@ func referenceEmptyPage1(t *testing.T, opts Options) []byte {
 // a write transaction can create a namespace, store a key, and read it back.
 func assertValidEmptyDB(t *testing.T, path string, opts Options) {
 	t.Helper()
-	resetPageBufferPool()
+	resetPoolForTest(t) // reset now AND on cleanup: opts may carry a non-default page size
 	db, err := Open(path, opts)
 	require.NoError(t, err)
 	defer func() { require.NoError(t, db.Close()) }()
@@ -8220,7 +8223,7 @@ func TestInitNewDB_Page1_CrashRecoverable(t *testing.T) {
 	opts := DefaultOptions()
 
 	t.Run("zero-length leftover re-initializes", func(t *testing.T) {
-		resetPageBufferPool()
+		resetPoolForTest(t)
 		path := filepath.Join(t.TempDir(), "test.db")
 
 		// Create then truncate to 0 to model "crash before page-1 WriteAt landed":

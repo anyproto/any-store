@@ -407,7 +407,7 @@ func TestDeep_InsertIntoParentViaInsertIntoPage(t *testing.T) {
 // TestDeep_InsertIntoParentSmallPage exercises insertIntoParent with a small
 // page size to force more frequent splits and deeper trees.
 func TestDeep_InsertIntoParentSmallPage(t *testing.T) {
-	resetPageBufferPool()
+	resetPoolForTest(t) // reset now AND on cleanup: this opens a 512-page pager; without the cleanup half it leaks the 512 pool key/buffers into a later default-4096 test (shuffle-order flake)
 	dir := t.TempDir()
 	p := newPager(filepath.Join(dir, "t.db"), 512, 200, true)
 	require.NoError(t, p.open())

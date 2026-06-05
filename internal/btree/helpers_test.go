@@ -12,7 +12,7 @@ import (
 // tempDBWithPageSize creates a temp DB with a custom page size and registers cleanup.
 func tempDBWithPageSize(t *testing.T, pageSize uint32) *DB {
 	t.Helper()
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	dir := t.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: pageSize})
 	require.NoError(t, err)
@@ -24,8 +24,30 @@ func tempDBWithPageSize(t *testing.T, pageSize uint32) *DB {
 // call Open directly instead of tempDBWithPageSize.
 func testOpen(t testing.TB, path string, opts Options) (*DB, error) {
 	t.Helper()
-	resetPageBufferPool()
+	resetPoolForTest(t)
 	return Open(path, opts)
+}
+
+// resetPoolForTest clears the process-global page buffer pool now AND registers
+// a cleanup that clears it again after the test finishes.
+//
+// The pool (pageBufferPool + pageBufferPoolSize) is a process-global singleton
+// keyed to a single page size; all DBs in a process must share it. Tests open
+// DBs at many different page sizes (512/1024/4096/65536), so each test must
+// start from a clean pool (the reset-now) AND must NOT leak its page-sized
+// buffers or size key into a later test (the reset-on-cleanup). Without the
+// cleanup, a page-size-512 test leaves the pool keyed to 512 and full of
+// 512-byte buffers; a later test that opens a default-4096 DB through a path
+// that does NOT reset first (e.g. backup_test.go's backupPair, which calls
+// Open directly, or TestGetPageAt_ReadFromFile, which builds a pager via
+// newPager) then either fails initPageBufferPool with
+// ErrPageBufferPoolSizeMismatch or draws an undersized 512-byte buffer and
+// reads short / EOF. This is order-dependent and only surfaces under
+// `go test -shuffle=on`.
+func resetPoolForTest(t testing.TB) {
+	t.Helper()
+	resetPageBufferPool()
+	t.Cleanup(resetPageBufferPool)
 }
 
 // putN inserts rows 1..n with 4-byte big-endian keys and zero-filled values of valSize.

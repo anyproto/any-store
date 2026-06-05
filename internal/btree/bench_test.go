@@ -431,7 +431,7 @@ func BenchmarkCollectRebuildOverflow(b *testing.B) {
 // SQLite's equivalent: balance_nonroot takes iIdx as a parameter
 // (btree.c:8230, 9213), populated from the cursor stack.
 func BenchmarkInsertSepIntoInterior_DeepTree(b *testing.B) {
-	resetPageBufferPool()
+	resetPoolForTest(b)
 	dir := b.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
 	if err != nil {
@@ -499,7 +499,7 @@ func BenchmarkInsertSepIntoInterior_DeepTree(b *testing.B) {
 // appends leave the left page untouched and put one cell on the new
 // sibling. Both leaf count and bytes-written-per-insert should drop.
 func BenchmarkBalanceQuick_MonotonicAppend(b *testing.B) {
-	resetPageBufferPool()
+	resetPoolForTest(b)
 	dir := b.TempDir()
 	db, err := Open(filepath.Join(dir, "test.db"), Options{PageSize: 4096})
 	if err != nil {

@@ -75,12 +75,31 @@ func resetPageBufferPool() {
 
 // allocPageBuffer returns a page-sized buffer. useSlab is a local bool
 // resolved once at pcache/pager creation time — no global reads on hot path.
+//
+// The sync.Pool path validates the pooled buffer's capacity against the
+// requested pageSize and discards any buffer that is too small. In production
+// this is a no-op (initPageBufferPool enforces a single page size per process,
+// so every pooled buffer is the right size), but it makes the allocator robust
+// against a stale buffer of a different page size lingering in the
+// process-global pool — e.g. across tests that open DBs at multiple page sizes
+// and reach this path without first calling resetPageBufferPool (newPager-based
+// pager tests, backup_test.go's bare-Open dst). Without the guard such a buffer
+// is sliced to [:pageSize] by callers (wal.readFrame) and panics with
+// "slice bounds out of range", or reads short and surfaces as "database is
+// corrupt" — an order- and GC-timing-dependent flake under `go test -shuffle`.
 func allocPageBuffer(pageSize int, useSlab bool) []byte {
 	if useSlab {
-		return globalPageSlab.Get()
+		buf := globalPageSlab.Get()
+		if cap(buf) >= pageSize {
+			return buf[:pageSize]
+		}
+		// Slab overflow handed back an undersized buffer (only reachable on an
+		// uninitialized slab, which production rejects at db.Open). Allocate a
+		// correctly-sized buffer instead of returning a short one.
+		return make([]byte, pageSize)
 	}
-	if buf, ok := pageBufferPool.Get().([]byte); ok {
-		return buf
+	if buf, ok := pageBufferPool.Get().([]byte); ok && cap(buf) >= pageSize {
+		return buf[:pageSize]
 	}
 	return make([]byte, pageSize)
 }
