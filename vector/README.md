@@ -28,6 +28,12 @@ The goal was to answer three questions:
 | `hnsw_flat_delete.go` | **deletes/updates** — tombstone delete, update (delete+reinsert), Compact, Rebuild, and a hard-delete-with-repair variant for cost comparison. See [DELETE_UPDATE.md](./DELETE_UPDATE.md). |
 | `idmap.go` + `docindex.go` | **doc-id mapping** — `IDDict` turns any-store's `[]byte` document ids into dense `uint32` labels via a flat arena; `DocFlatHNSW` shows the composed `[]byte`-keyed index. |
 
+### Design notes & comparisons
+
+- [DELETE_UPDATE.md](./DELETE_UPDATE.md) — deletes/updates research + measurements (tombstones, compaction, write amplification, RAM, doc-id mapping).
+- [COMPARISON_pgvector.md](./COMPARISON_pgvector.md) — vs pgvector (disk-resident buffer-cache-paged graph vs in-memory arena; the "real fork" for any-store).
+- [COMPARISON_mongodb.md](./COMPARISON_mongodb.md) — vs MongoDB Atlas Vector Search (closest external/API analog; Lucene segment model; quantization; read-your-writes advantage).
+
 ## Three ways to land it — and the one that wins
 
 The arena/flat layout (`FlatHNSW`) is the centrepiece. It differs from the
