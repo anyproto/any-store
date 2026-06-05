@@ -337,15 +337,18 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 // when the list is full (coder/hnsw's rule). Reads/writes a's adjacency record.
 func (ix *Index) addNeighbor(wtx *btree.WriteTx, s *searcher, a, b uint32, layer int32) error {
 	rtx := &wtx.ReadTx
-	var kbuf []byte
-	adjBytes, err := rtx.Get(ix.vadj, labelKey(kbuf, a))
+	var kb [4]byte
+	binary.BigEndian.PutUint32(kb[:], a)
+	var err error
+	s.naAdj, err = rtx.AppendValue(ix.vadj, kb[:], s.naAdj[:0])
 	if err != nil {
 		return err
 	}
-	level, deleted, nbrs, err := decodeAllAdj(adjBytes)
+	level, deleted, nbrs, err := decodeAllAdjInto(s.naAdj, s.naDec)
 	if err != nil {
 		return err
 	}
+	s.naDec = nbrs
 	if layer > level {
 		return nil // a doesn't exist at this layer
 	}
@@ -384,7 +387,8 @@ func (ix *Index) addNeighbor(wtx *btree.WriteTx, s *searcher, a, b uint32, layer
 		}
 		nbrs[layer] = list
 	}
-	return wtx.Put(ix.vadj, labelKey(kbuf, a), encodeAdj(nil, level, deleted, nbrs))
+	s.naEnc = encodeAdj(s.naEnc[:0], level, deleted, nbrs)
+	return wtx.Put(ix.vadj, kb[:], s.naEnc)
 }
 
 func (ix *Index) tombstoneLabel(wtx *btree.WriteTx, label uint32, mt *meta) error {

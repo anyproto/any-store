@@ -172,6 +172,36 @@ func decodeAllAdj(data []byte) (level int32, deleted bool, neighbors [][]uint32,
 	return level, deleted, neighbors, nil
 }
 
+// decodeAllAdjInto decodes the adjacency record into the caller's reusable dst
+// (growing it as needed), avoiding the per-call slice allocations of
+// decodeAllAdj. Returns the (possibly regrown) dst as nbrs.
+func decodeAllAdjInto(data []byte, dst [][]uint32) (level int32, deleted bool, nbrs [][]uint32, err error) {
+	level, deleted, err = adjHeader(data)
+	if err != nil {
+		return 0, false, nil, err
+	}
+	if cap(dst) < int(level)+1 {
+		dst = make([][]uint32, level+1)
+	} else {
+		dst = dst[:level+1]
+	}
+	off := 3
+	for lc := int32(0); lc <= level; lc++ {
+		if off+2 > len(data) {
+			return 0, false, nil, errors.New("vindex: truncated adj")
+		}
+		cnt := int(binary.LittleEndian.Uint16(data[off:]))
+		off += 2
+		l := dst[lc][:0]
+		for i := 0; i < cnt; i++ {
+			l = append(l, binary.LittleEndian.Uint32(data[off:]))
+			off += 4
+		}
+		dst[lc] = l
+	}
+	return level, deleted, dst, nil
+}
+
 // f32bytes reinterprets a []float32 as its host byte view (write path).
 func f32bytes(v []float32) []byte {
 	if len(v) == 0 {

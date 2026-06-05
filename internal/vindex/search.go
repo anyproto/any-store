@@ -80,6 +80,12 @@ type searcher struct {
 	cand cheap
 	res  cheap
 	out  []candidate
+
+	// write-path scratch reused by addNeighbor (insert connect phase, which runs
+	// after searchLayer so these don't overlap with the read buffers above).
+	naAdj []byte     // a's adjacency record read buffer
+	naEnc []byte     // re-encoded adjacency write buffer
+	naDec [][]uint32 // decoded per-layer neighbour lists (reused)
 }
 
 func (ix *Index) newSearcher(rtx *btree.ReadTx, query []float32) *searcher {
