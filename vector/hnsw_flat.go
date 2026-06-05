@@ -39,6 +39,13 @@ type FlatHNSW struct {
 	keyToID map[uint64]uint32
 	level   []int32 // id -> top layer of the node
 
+	// deleted[id] tombstones a node: it stays in the arenas and is still
+	// traversed during graph navigation (it may be a vital waypoint), but is
+	// excluded from search results and from neighbour selection. liveCount is
+	// the number of non-deleted nodes. Tombstones are reclaimed by Compact.
+	deleted   []bool
+	liveCount int
+
 	// Adjacency arena. For a node with top layer L the block holds M0 slots for
 	// layer 0 followed by L blocks of M slots for layers 1..L. counts holds L+1
 	// entries (one neighbour-count per layer).
@@ -54,6 +61,10 @@ type FlatHNSW struct {
 	// notifyDirty, when set, is called with the id of every node whose data or
 	// adjacency changed. BtreeHNSW uses it to track which records to persist.
 	notifyDirty func(id uint32)
+	// notifyDelete, when set, is called with the id of every tombstoned node so
+	// the persistence layer can record a (cheap) tombstone instead of rewriting
+	// the whole node record.
+	notifyDelete func(id uint32)
 
 	scratch sync.Pool
 }
@@ -75,8 +86,16 @@ func NewFlatHNSW(dim int, m Metric, seed int64) *FlatHNSW {
 	}
 }
 
-// Len returns the number of indexed vectors.
+// Len returns the number of live (non-deleted) vectors.
 func (h *FlatHNSW) Len() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.liveCount
+}
+
+// PhysicalLen returns the number of slots in the arenas, including tombstones.
+// PhysicalLen-Len is the reclaimable space waiting for Compact.
+func (h *FlatHNSW) PhysicalLen() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return len(h.keys)
@@ -151,14 +170,19 @@ func (h *FlatHNSW) markDirty(id uint32) {
 	}
 }
 
-// Add inserts a vector. If key already exists the call is ignored (this index
-// is append-only; use the btree layer for updates).
+// Add inserts a vector. If the key already exists the call is ignored; use
+// Update to change an existing key's vector.
 func (h *FlatHNSW) Add(key uint64, vec []float32) {
 	if len(vec) != h.dim {
 		panic("vector: dimension mismatch")
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.addLocked(key, vec)
+}
+
+// addLocked is the lock-free insert core (h.mu must be held).
+func (h *FlatHNSW) addLocked(key uint64, vec []float32) {
 	if _, ok := h.keyToID[key]; ok {
 		return
 	}
@@ -170,6 +194,8 @@ func (h *FlatHNSW) Add(key uint64, vec []float32) {
 	h.keyToID[key] = id
 	h.vectors = append(h.vectors, vec...)
 	h.level = append(h.level, L)
+	h.deleted = append(h.deleted, false)
+	h.liveCount++
 
 	// allocate adjacency block (append-only arena growth)
 	h.linkOff = append(h.linkOff, int32(len(h.links)))
@@ -234,6 +260,8 @@ func (h *FlatHNSW) appendRaw(key uint64, level int32, vec []float32, neighborsPe
 	h.keyToID[key] = id
 	h.vectors = append(h.vectors, vec...)
 	h.level = append(h.level, level)
+	h.deleted = append(h.deleted, false)
+	h.liveCount++
 
 	h.linkOff = append(h.linkOff, int32(len(h.links)))
 	blockLinks := h.M0 + int(level)*h.M
@@ -299,11 +327,18 @@ func (h *FlatHNSW) searchLayer(target []float32, ep uint32, ef int, layer int32,
 
 	d0 := h.dist(target, h.vectorAt(ep))
 	sc.vis.visit(ep)
+	// Deleted nodes are still expanded (they may be the only route to a live
+	// region) but never enter the result set.
 	sc.cand.push(candidate{d0, ep})
-	sc.res.push(candidate{d0, ep})
+	if !h.deleted[ep] {
+		sc.res.push(candidate{d0, ep})
+	}
 
 	for sc.cand.len() > 0 {
 		cur := sc.cand.pop()
+		// Termination uses the result-set bound. While res is under-filled
+		// (e.g. a neighbourhood thick with tombstones) we keep expanding, which
+		// is exactly the extra work tombstones cost a query.
 		if sc.res.len() >= ef && cur.dist > sc.res.peek().dist {
 			break
 		}
@@ -312,12 +347,17 @@ func (h *FlatHNSW) searchLayer(target []float32, ep uint32, ef int, layer int32,
 				continue
 			}
 			d := h.dist(target, h.vectorAt(nb))
-			if sc.res.len() < ef || d < sc.res.peek().dist {
-				sc.cand.push(candidate{d, nb})
-				sc.res.push(candidate{d, nb})
-				if sc.res.len() > ef {
-					sc.res.pop()
-				}
+			admit := sc.res.len() < ef || d < sc.res.peek().dist
+			if !admit {
+				continue
+			}
+			sc.cand.push(candidate{d, nb}) // route through, deleted or not
+			if h.deleted[nb] {
+				continue
+			}
+			sc.res.push(candidate{d, nb})
+			if sc.res.len() > ef {
+				sc.res.pop()
 			}
 		}
 	}

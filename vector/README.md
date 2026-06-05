@@ -24,7 +24,9 @@ The goal was to answer three questions:
 | `hnsw.go` | **Map-based in-memory HNSW** — a faithful adaptation of coder/hnsw (`map[id]*node` adjacency, per-node pointers). The "idiomatic Go" baseline. |
 | `hnsw_flat.go` | **Arena / SoA HNSW** — every vector in one contiguous `[]float32` slab, every adjacency list in one flat `[]uint32` arena, dense `uint32` ids, pooled per-query heaps + epoch-stamped visited set. Allocation-free steady-state search. |
 | `heap.go` | Two-heap search frontier + epoch-stamped `visitedList` (arena trick: bump a generation counter instead of clearing N bytes per query). |
-| `hnsw_btree.go` | **btree-backed persistent HNSW** — wraps the flat index, persists each node (vector + per-layer adjacency) into two btree namespaces, and rebuilds the arenas on reopen straight from the persisted records (no re-construction). |
+| `hnsw_btree.go` | **btree-backed persistent HNSW** — wraps the flat index, persists each node (vector + per-layer adjacency) into btree namespaces, and rebuilds the arenas on reopen straight from the persisted records (no re-construction). |
+| `hnsw_flat_delete.go` | **deletes/updates** — tombstone delete, update (delete+reinsert), Compact, Rebuild, and a hard-delete-with-repair variant for cost comparison. See [DELETE_UPDATE.md](./DELETE_UPDATE.md). |
+| `idmap.go` + `docindex.go` | **doc-id mapping** — `IDDict` turns any-store's `[]byte` document ids into dense `uint32` labels via a flat arena; `DocFlatHNSW` shows the composed `[]byte`-keyed index. |
 
 ## Three ways to land it — and the one that wins
 

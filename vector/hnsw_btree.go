@@ -33,17 +33,36 @@ type BtreeHNSW struct {
 	db      *btree.DB
 	nodesNS *btree.Namespace
 	metaNS  *btree.Namespace
+	tombNS  *btree.Namespace
 	flat    *FlatHNSW
 	metric  Metric
 	dim     int
 
-	mu    sync.Mutex
-	dirty map[uint32]struct{}
+	mu      sync.Mutex
+	dirty   map[uint32]struct{}
+	tombing map[uint32]struct{} // ids tombstoned since last Flush
+
+	stats WriteStats
+}
+
+// WriteStats accumulates write-amplification telemetry. RecordsWritten counts
+// btree Put calls; the byte counters split node-record payload into the
+// (large, rarely-changing) vector part and the (small, churning) adjacency part
+// — the split that motivates storing them in separate namespaces.
+type WriteStats struct {
+	Flushes        int
+	RecordsWritten int // total btree Put calls (nodes + tombstones + meta)
+	NodeRecords    int // node Puts only
+	Tombstones     int // tombstone Puts
+	BytesWritten   int // total payload bytes
+	VectorBytes    int // of node payloads, the vector portion
+	AdjacencyBytes int // of node payloads, the adjacency portion
 }
 
 const (
-	btreeMetaVersion = 1
+	btreeMetaVersion = 2
 	btreeMetaKey     = "meta"
+	tombMark         = 1
 )
 
 // OpenBtreeHNSW opens (or creates) a persistent index named name inside db. If
@@ -51,14 +70,15 @@ const (
 // the stored meta and the dim/metric arguments are only used when creating a
 // fresh index.
 func OpenBtreeHNSW(db *btree.DB, name string, dim int, m Metric) (*BtreeHNSW, error) {
-	b := &BtreeHNSW{db: db, metric: m, dim: dim, dirty: make(map[uint32]struct{})}
+	b := &BtreeHNSW{db: db, metric: m, dim: dim,
+		dirty: make(map[uint32]struct{}), tombing: make(map[uint32]struct{})}
 
-	// Ensure both namespaces exist.
+	// Ensure namespaces exist.
 	wtx, err := db.BeginWrite()
 	if err != nil {
 		return nil, err
 	}
-	for _, ns := range []string{name + ":meta", name + ":nodes"} {
+	for _, ns := range []string{name + ":meta", name + ":nodes", name + ":tomb"} {
 		if _, err := wtx.GetNamespace(ns); err != nil {
 			if !errors.Is(err, btree.ErrNamespaceNotFound) {
 				_ = wtx.Rollback()
@@ -80,11 +100,15 @@ func OpenBtreeHNSW(db *btree.DB, name string, dim int, m Metric) (*BtreeHNSW, er
 	if b.nodesNS, err = db.GetNamespace(name + ":nodes"); err != nil {
 		return nil, err
 	}
+	if b.tombNS, err = db.GetNamespace(name + ":tomb"); err != nil {
+		return nil, err
+	}
 
 	if err := b.load(); err != nil {
 		return nil, err
 	}
 	b.flat.notifyDirty = func(id uint32) { b.dirty[id] = struct{}{} }
+	b.flat.notifyDelete = func(id uint32) { b.tombing[id] = struct{}{} }
 	return b, nil
 }
 
@@ -144,6 +168,30 @@ func (b *BtreeHNSW) load() error {
 	if meta.count > 0 {
 		flat.setEntry(meta.entryID, meta.topLayer)
 	}
+
+	// Apply tombstones: deleted nodes keep their record (they are still
+	// navigation waypoints) but are marked so they never enter results.
+	tcur := rtx.NewCursor(b.tombNS)
+	defer tcur.Close()
+	if err := tcur.First(); err != nil {
+		return err
+	}
+	for tcur.Valid() {
+		tk, err := tcur.Key()
+		if err != nil {
+			return err
+		}
+		id := binary.BigEndian.Uint64(tk)
+		if int(id) < len(flat.deleted) && !flat.deleted[id] {
+			flat.deleted[id] = true
+			flat.liveCount--
+			delete(flat.keyToID, flat.keys[id])
+		}
+		if err := tcur.Next(); err != nil {
+			return err
+		}
+	}
+
 	b.flat = flat
 	return nil
 }
@@ -154,12 +202,20 @@ func (b *BtreeHNSW) Add(key uint64, vec []float32) {
 	b.flat.Add(key, vec)
 }
 
-// Flush durably writes all nodes touched since the last Flush, plus the index
-// meta, in a single btree write transaction.
+// Delete tombstones key. Persistence is a single tiny record on the next Flush
+// — the node's own record is retained because it still routes searches.
+func (b *BtreeHNSW) Delete(key uint64) bool { return b.flat.Delete(key) }
+
+// Update changes key's vector (delete-old + reinsert-new). On Flush this costs
+// one tombstone plus the new node and its touched neighbours.
+func (b *BtreeHNSW) Update(key uint64, vec []float32) bool { return b.flat.Update(key, vec) }
+
+// Flush durably writes all nodes and tombstones touched since the last Flush,
+// plus the index meta, in a single btree write transaction.
 func (b *BtreeHNSW) Flush() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if len(b.dirty) == 0 {
+	if len(b.dirty) == 0 && len(b.tombing) == 0 {
 		return nil
 	}
 
@@ -170,7 +226,14 @@ func (b *BtreeHNSW) Flush() error {
 
 	var keyBuf [8]byte
 	var valBuf []byte
+	var records, nodeRecs, tombRecs, total, vecB, adjB int
+
+	// Dirty node records. We skip nodes that are being tombstoned this same
+	// Flush: their record is already on disk and stays valid as a waypoint.
 	for id := range b.dirty {
+		if _, gone := b.tombing[id]; gone {
+			continue
+		}
 		key, level, vec, nbrs := b.flat.snapshot(id)
 		binary.BigEndian.PutUint64(keyBuf[:], uint64(id))
 		valBuf = encodeNode(valBuf[:0], key, level, vec, nbrs)
@@ -178,6 +241,24 @@ func (b *BtreeHNSW) Flush() error {
 			_ = wtx.Rollback()
 			return err
 		}
+		records++
+		nodeRecs++
+		total += len(valBuf)
+		v := b.dim * 4
+		vecB += v
+		adjB += len(valBuf) - v - 12 // minus key(8)+level(4)
+	}
+
+	// Tombstones: one tiny record per newly-deleted id.
+	for id := range b.tombing {
+		binary.BigEndian.PutUint64(keyBuf[:], uint64(id))
+		if err := wtx.Put(b.tombNS, keyBuf[:], []byte{tombMark}); err != nil {
+			_ = wtx.Rollback()
+			return err
+		}
+		records++
+		tombRecs++
+		total++
 	}
 
 	meta := indexMeta{
@@ -187,15 +268,36 @@ func (b *BtreeHNSW) Flush() error {
 		entryID: b.flat.entryID, topLayer: b.flat.topLayer,
 		count: uint32(len(b.flat.keys)),
 	}
-	if err := wtx.Put(b.metaNS, []byte(btreeMetaKey), encodeMeta(nil, meta)); err != nil {
+	metaBytes := encodeMeta(nil, meta)
+	if err := wtx.Put(b.metaNS, []byte(btreeMetaKey), metaBytes); err != nil {
 		_ = wtx.Rollback()
 		return err
 	}
+	records++
+	total += len(metaBytes)
+
 	if err := wtx.Commit(); err != nil {
 		return err
 	}
+
+	b.stats.Flushes++
+	b.stats.RecordsWritten += records
+	b.stats.NodeRecords += nodeRecs
+	b.stats.Tombstones += tombRecs
+	b.stats.BytesWritten += total
+	b.stats.VectorBytes += vecB
+	b.stats.AdjacencyBytes += adjB
+
 	b.dirty = make(map[uint32]struct{})
+	b.tombing = make(map[uint32]struct{})
 	return nil
+}
+
+// Stats returns accumulated write-amplification telemetry.
+func (b *BtreeHNSW) Stats() WriteStats {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.stats
 }
 
 // Search runs an in-memory ANN search over the working graph.
