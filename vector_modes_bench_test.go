@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,6 +11,46 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/stretchr/testify/require"
 )
+
+// vclustered generates n vectors from `centers` Gaussian clusters — a stand-in
+// for real embeddings (which cluster), unlike near-equidistant uniform vectors.
+func vclustered(n, dim, centers int, seed int64) [][]float32 {
+	rng := rand.New(rand.NewSource(seed))
+	cs := make([][]float32, centers)
+	for c := range cs {
+		v := make([]float32, dim)
+		for d := range v {
+			v[d] = rng.Float32()*2 - 1
+		}
+		cs[c] = v
+	}
+	out := make([][]float32, n)
+	for i := range out {
+		base := cs[rng.Intn(centers)]
+		v := make([]float32, dim)
+		for d := range v {
+			v[d] = base[d] + float32(rng.NormFloat64())*0.1
+		}
+		out[i] = v
+	}
+	return out
+}
+
+// vqueriesFromData builds realistic queries: perturbed copies of random data
+// points, so ground truth (the source point + its near neighbours) is clear.
+func vqueriesFromData(vecs [][]float32, nq int, noise float32, seed int64) [][]float32 {
+	rng := rand.New(rand.NewSource(seed))
+	out := make([][]float32, nq)
+	for i := range out {
+		src := vecs[rng.Intn(len(vecs))]
+		q := make([]float32, len(src))
+		for d := range q {
+			q[d] = src[d] + float32(rng.NormFloat64())*noise
+		}
+		out[i] = q
+	}
+	return out
+}
 
 // TestVectorModesCompare builds the same dataset under each index mode and
 // reports build RPS, search RPS, recall@k (vs an exact oracle), on-disk size and
@@ -31,8 +72,18 @@ func TestVectorModesCompare(t *testing.T) {
 		baseDir = os.TempDir()
 	}
 
-	vecs := vrand(n, dim, 1)
-	queries := vrand(nq, dim, 2)
+	// Clustered data (set ASV_CMP_CLUSTERED=1) stands in for real embeddings,
+	// which cluster; uniform random vectors are nearly equidistant and
+	// intrinsically hard for ANN. Clustered queries are perturbed copies of real
+	// data points (the "find similar" case) so ground truth is unambiguous.
+	var vecs, queries [][]float32
+	if os.Getenv("ASV_CMP_CLUSTERED") != "" {
+		vecs = vclustered(n, dim, 200, 1)
+		queries = vqueriesFromData(vecs, nq, 0.02, 2)
+	} else {
+		vecs = vrand(n, dim, 1)
+		queries = vrand(nq, dim, 2)
+	}
 	// exact oracle (L2) for recall.
 	truth := make([]map[string]bool, nq)
 	for i, q := range queries {
