@@ -79,6 +79,38 @@ func BenchmarkVindexSelectNeighbors(b *testing.B) {
 	}
 }
 
+// BenchmarkVindexVecDist isolates per-vector "read+distance" cost for the tier:
+// f32 (zero-copy + SIMD distance) vs int8 (dequant + SIMD distance), at dim768.
+// The gap is the dequant scalar loop — what an int8 SIMD kernel would remove.
+func BenchmarkVindexVecDist(b *testing.B) {
+	const dim = 768
+	q := randVecs(1, dim, 1)[0]
+	v := randVecs(1, dim, 2)[0]
+	df := distanceFor(L2)
+	f32rec := f32bytes(v)
+	i8rec := encodeVec(nil, v, QuantInt8)
+	dst := make([]float32, dim)
+
+	b.Run("f32", func(b *testing.B) {
+		b.ReportAllocs()
+		var sink float32
+		for i := 0; i < b.N; i++ {
+			fv := bytesAsF32(f32rec, dim)
+			sink += df(q, fv)
+		}
+		_ = sink
+	})
+	b.Run("int8", func(b *testing.B) {
+		b.ReportAllocs()
+		var sink float32
+		for i := 0; i < b.N; i++ {
+			fv, _ := decodeVecInto(i8rec, dim, QuantInt8, dst)
+			sink += df(q, fv)
+		}
+		_ = sink
+	})
+}
+
 func BenchmarkVindexSearch(b *testing.B) {
 	db, ix, _ := buildBench(b, benchN, benchDim)
 	defer db.Close()
