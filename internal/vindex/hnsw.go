@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -411,7 +410,9 @@ func (ix *Index) addNeighbor(wtx *btree.WriteTx, s *searcher, a, b uint32, layer
 			return berr
 		}
 		s.naCand = append(s.naCand, candidate{ix.dist(s.aVecBuf, bv), b})
-		sort.Slice(s.naCand, func(i, j int) bool { return s.naCand[i].dist < s.naCand[j].dist })
+		// Alloc-free sort (sort.Slice uses reflection and allocates); the
+		// candidate set is tiny (<= maxConn+1), so insertion sort is ideal.
+		insertionSortCands(s.naCand)
 		kept, kerr := s.selectNeighborsHeuristic(s.naCand, capn)
 		if kerr != nil {
 			return kerr

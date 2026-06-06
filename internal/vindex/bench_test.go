@@ -38,6 +38,47 @@ func buildBench(b testing.TB, n, dim int) (*btree.DB, *Index, [][]float32) {
 	return db, ix, vecs
 }
 
+// BenchmarkVindexSelectNeighbors isolates the Malkov neighbour-selection
+// heuristic: a realistic ~efConstruction candidate set, selecting M0. It must be
+// allocation-free (all scratch is reused on the pooled searcher).
+func BenchmarkVindexSelectNeighbors(b *testing.B) {
+	db, ix, _ := buildBench(b, benchN, benchDim)
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer rtx.Rollback()
+
+	q := randVecs(1, benchDim, 5)[0]
+	mt, err := ix.readMeta(rtx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	s := ix.getSearcher(rtx, q)
+	defer ix.putSearcher(s)
+	ep := mt.entryLabel
+	for lc := mt.topLayer; lc > 0; lc-- {
+		if ep, err = s.greedyClosest(ep, lc); err != nil {
+			b.Fatal(err)
+		}
+	}
+	found, err := s.searchLayer(ep, ix.efC, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	// Stable input copy (the heuristic returns s.sel, which it also overwrites).
+	cands := append([]candidate(nil), found...)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := s.selectNeighborsHeuristic(cands, ix.m0); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkVindexSearch(b *testing.B) {
 	db, ix, _ := buildBench(b, benchN, benchDim)
 	defer db.Close()

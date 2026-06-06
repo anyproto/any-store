@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -500,7 +500,16 @@ func (c *collection) VectorSearch(ctx context.Context, indexName string, query [
 			if serr != nil {
 				return serr
 			}
-			sort.Slice(cands, func(i, j int) bool { return cands[i].Distance < cands[j].Distance })
+			slices.SortFunc(cands, func(a, b qplanner.VectorCandidate) int {
+				switch {
+				case a.Distance < b.Distance:
+					return -1
+				case a.Distance > b.Distance:
+					return 1
+				default:
+					return 0
+				}
+			})
 			if k > 0 && len(cands) > k {
 				cands = cands[:k]
 			}

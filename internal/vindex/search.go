@@ -259,6 +259,21 @@ func (s *searcher) selectNeighborsHeuristic(cands []candidate, m int) ([]candida
 	return s.sel, nil
 }
 
+// insertionSortCands sorts candidates ascending by distance, in place and
+// allocation-free. Used on the tiny addNeighbor candidate set (<= maxConn+1),
+// where insertion sort beats a general sort and avoids reflection (sort.Slice).
+func insertionSortCands(c []candidate) {
+	for i := 1; i < len(c); i++ {
+		x := c[i]
+		j := i - 1
+		for j >= 0 && c[j].dist > x.dist {
+			c[j+1] = c[j]
+			j--
+		}
+		c[j+1] = x
+	}
+}
+
 // greedyClosest walks one layer toward the query, returning the closest label.
 func (s *searcher) greedyClosest(ep uint32, layer int32) (uint32, error) {
 	best := ep
