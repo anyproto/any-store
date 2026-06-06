@@ -29,6 +29,12 @@ type meta struct {
 	deletedCount int64
 	hasEntry     bool
 	quant        Quantization
+	// l0Gen is a monotonic version bumped on every write that changes layer 0
+	// (insert/replace/delete). Hybrid-mode searches use it to detect when the
+	// RAM layer-0 mirror is stale relative to the read snapshot (in this process
+	// or a peer) and must be rebuilt. Persisted at the meta tail (back-compat:
+	// absent in older records => 0).
+	l0Gen uint64
 }
 
 var metaKey = []byte("m")
@@ -60,6 +66,7 @@ func encodeMeta(buf []byte, mt *meta) []byte {
 		buf = append(buf, 0)
 	}
 	buf = append(buf, byte(mt.quant))
+	put64(mt.l0Gen)
 	return buf
 }
 
@@ -91,6 +98,11 @@ func decodeMeta(data []byte) (*meta, error) {
 	off++
 	if off < len(data) { // quant byte (absent in pre-quantization records → none)
 		mt.quant = Quantization(data[off])
+		off++
+	}
+	if off+8 <= len(data) { // l0Gen (absent in pre-hybrid records → 0)
+		mt.l0Gen = binary.LittleEndian.Uint64(data[off:])
+		off += 8
 	}
 	return mt, nil
 }

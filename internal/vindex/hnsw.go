@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 )
@@ -67,6 +68,12 @@ type Index struct {
 
 	dist DistanceFunc
 
+	// hybrid enables the RAM layer-0 mirror on the read path (set by the caller
+	// for VectorModeHybrid). l0pub holds the most recently built mirror as a
+	// lock-free cache; a search only uses a mirror whose gen matches its snapshot.
+	hybrid bool
+	l0pub  atomic.Pointer[l0Mirror]
+
 	rngMu sync.Mutex
 	rng   *rand.Rand
 
@@ -89,6 +96,7 @@ func (ix *Index) getSearcher(rtx *btree.ReadTx, query []float32) *searcher {
 func (ix *Index) putSearcher(s *searcher) {
 	s.rtx = nil
 	s.query = nil
+	s.l0 = nil
 	ix.scratch.Put(s)
 }
 
@@ -196,6 +204,11 @@ func newIndex(ns [5]*btree.Namespace, dim, m, m0, efC, efS int, ml float64, metr
 // Dim returns the index dimension.
 func (ix *Index) Dim() int { return ix.dim }
 
+// SetHybrid enables (or disables) the RAM layer-0 mirror on the read path. Call
+// once right after Create/Open, before concurrent use. The btree stays the
+// source of truth; the mirror is a derived, snapshot-aligned read cache.
+func (ix *Index) SetHybrid(h bool) { ix.hybrid = h }
+
 func (ix *Index) readMeta(rtx *btree.ReadTx) (*meta, error) {
 	b, err := rtx.Get(ix.vmeta, metaKey)
 	if err != nil {
@@ -243,6 +256,7 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 	if err != nil {
 		return err
 	}
+	mt.l0Gen++ // this insert changes layer 0 (new node + back-links)
 
 	// replace existing
 	if old, gerr := rtx.Get(ix.vdoc, docID); gerr == nil {
@@ -438,6 +452,7 @@ func (ix *Index) Delete(wtx *btree.WriteTx, docID []byte) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	mt.l0Gen++ // tombstoning this node changes its layer-0 deleted flag
 	if err = ix.tombstoneLabel(wtx, label, mt); err != nil {
 		return false, err
 	}
@@ -475,6 +490,11 @@ func (ix *Index) Search(rtx *btree.ReadTx, query []float32, k, efSearch int) ([]
 	s := ix.getSearcher(rtx, query)
 	defer ix.putSearcher(s)
 	s.checkDeleted = mt.deletedCount > 0
+	if ix.hybrid {
+		if s.l0, err = ix.layer0Mirror(rtx, mt); err != nil {
+			return nil, err
+		}
+	}
 	ep := mt.entryLabel
 	for lc := mt.topLayer; lc > 0; lc-- {
 		if ep, err = s.greedyClosest(ep, lc); err != nil {

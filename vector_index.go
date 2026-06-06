@@ -175,6 +175,7 @@ func (c *collection) loadVectorIndex(tx *btree.ReadTx, info IndexInfo) (*vectorI
 	if err != nil {
 		return nil, err
 	}
+	ix.SetHybrid(info.Vector.Mode == VectorModeHybrid)
 	return newVectorIndexFromVindex(info, ix), nil
 }
 
@@ -209,6 +210,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	if err != nil {
 		return nil, err
 	}
+	ix.SetHybrid(info.Vector.Mode == VectorModeHybrid)
 	vi := newVectorIndexFromVindex(info, ix)
 
 	// Build from existing documents.

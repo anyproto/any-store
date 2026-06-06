@@ -34,6 +34,11 @@ func (ix *Index) SearchCandidates(rtx *btree.ReadTx, query []float32, ef int) ([
 	s := ix.getSearcher(rtx, query)
 	defer ix.putSearcher(s)
 	s.checkDeleted = mt.deletedCount > 0
+	if ix.hybrid {
+		if s.l0, err = ix.layer0Mirror(rtx, mt); err != nil {
+			return nil, err
+		}
+	}
 	epn := mt.entryLabel
 	for lc := mt.topLayer; lc > 0; lc-- {
 		if epn, err = s.greedyClosest(epn, lc); err != nil {
@@ -72,6 +77,11 @@ type searcher struct {
 	// no tombstones (the common case, and always during a fresh build) every node
 	// is live, so we skip that extra adjacency read entirely.
 	checkDeleted bool
+
+	// l0 is the RAM layer-0 mirror for hybrid-mode READ searches; when set,
+	// layer-0 neighbour and deleted lookups are served from it instead of the
+	// btree. nil on the write path (Insert), which must see the in-progress graph.
+	l0 *l0Mirror
 
 	vbuf  []byte
 	vf    []float32 // aliases vbuf — vector A (reused each read)
@@ -177,6 +187,29 @@ func (s *searcher) isDeleted(label uint32) (bool, error) {
 	return deleted, err
 }
 
+// neighborsAt returns label's neighbours at layer, served from the RAM mirror
+// when available (hybrid read path, layer 0) else from the btree.
+func (s *searcher) neighborsAt(label uint32, layer int32) ([]uint32, error) {
+	if s.l0 != nil && layer == 0 {
+		return s.l0.neighbors(label), nil
+	}
+	adjB, err := s.adjBytesOf(label)
+	if err != nil {
+		return nil, err
+	}
+	s.nbrs, err = adjNeighbors(adjB, layer, s.nbrs)
+	return s.nbrs, err
+}
+
+// isDeletedAt reports whether label is tombstoned, from the mirror on the hybrid
+// layer-0 read path, else from the btree.
+func (s *searcher) isDeletedAt(label uint32, layer int32) (bool, error) {
+	if s.l0 != nil && layer == 0 {
+		return s.l0.isDeleted(label), nil
+	}
+	return s.isDeleted(label)
+}
+
 // greedyClosest walks one layer toward the query, returning the closest label.
 func (s *searcher) greedyClosest(ep uint32, layer int32) (uint32, error) {
 	best := ep
@@ -227,7 +260,7 @@ func (s *searcher) searchLayer(ep uint32, ef int, layer int32) ([]candidate, err
 	s.cand.push(candidate{d0, ep})
 	epDel := false
 	if s.checkDeleted {
-		if epDel, err = s.isDeleted(ep); err != nil {
+		if epDel, err = s.isDeletedAt(ep, layer); err != nil {
 			return nil, err
 		}
 	}
@@ -240,15 +273,13 @@ func (s *searcher) searchLayer(ep uint32, ef int, layer int32) ([]candidate, err
 		if s.res.len() >= ef && cur.dist > s.res.peek().dist {
 			break
 		}
-		adjB, err := s.adjBytesOf(cur.label)
-		if err != nil {
-			return nil, err
+		// nbrs may alias the read-only mirror slice (hybrid layer 0) or the
+		// reused s.nbrs buffer (btree); iterate it read-only either way.
+		nbrs, nerr := s.neighborsAt(cur.label, layer)
+		if nerr != nil {
+			return nil, nerr
 		}
-		s.nbrs, err = adjNeighbors(adjB, layer, s.nbrs)
-		if err != nil {
-			return nil, err
-		}
-		for _, nb := range s.nbrs {
+		for _, nb := range nbrs {
 			if _, seen := s.visited[nb]; seen {
 				continue
 			}
@@ -263,7 +294,7 @@ func (s *searcher) searchLayer(ep uint32, ef int, layer int32) ([]candidate, err
 			}
 			s.cand.push(candidate{d, nb})
 			if s.checkDeleted {
-				del, derr := s.isDeleted(nb)
+				del, derr := s.isDeletedAt(nb, layer)
 				if derr != nil {
 					return nil, derr
 				}
