@@ -13,7 +13,7 @@ storage/latency/RAM trade-off that fits their collection:
 |---|---|---|---|---|---|---|
 | **a. btree** (current) | full HNSW graph + vectors in btree namespaces | high (graph maintenance, read-heavy insert) | ~ANN, btree-read-bound | ~0 (btree page cache only) | approx | large sets, low RAM, multiprocess writes |
 | **b. hybrid** | same as btree (btree = source of truth) | same writes + RAM mirror update | ~ANN, layer-0 reads served from RAM | layer-0 mirror (≈128 MB/1M @ M0=32) + optional int8 vec tier | approx (== btree) | read-heavy, RAM available, want max search RPS |
-| **c. brute-force** | **none** (index is metadata-only: a declaration that a field is a vector) | **~0** (nothing to maintain) | O(N): scan docs, exact top-k | ~0 (optional int8 vec cache, see §4) | **exact (100%)** | small/medium sets, max write throughput, min storage, or as the recall ground-truth |
+| **c. brute-force** | **none** (index is metadata-only: a declaration that a field is a vector) | **~0** (nothing to maintain) | O(N): scan docs, compute `_distance`, reuse SortIter | **~0** (no cache — pure) | **exact (100%)** | small/medium sets, max write throughput, min storage, or as the recall ground-truth |
 
 Invariants across all modes (unchanged from today): **no btree-engine changes**;
 multiprocess-safe; `-race` clean; default mode = btree (full back-compat for existing
@@ -54,30 +54,35 @@ func (m VectorMode) String() string
 (`registerIndex` ~`:994-1003`, `getIndexInfos` ~`:915-925`). Absent ⇒ `VectorModeBTree`.
 
 **Backend abstraction** (`vector_index.go`): replace the bare `ix *vindex.Index` field
-with a backend:
+with a **write+stats** backend (search is dispatched by mode in the planner, not here —
+see below, because brute search is a scan, not an HNSW lookup):
 ```go
 type vectorBackend interface {
     Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error
     Update(wtx *btree.WriteTx, docID []byte, oldVec, newVec []float32) error
     Delete(wtx *btree.WriteTx, docID []byte) (bool, error)
-    // Search returns docID+distance hits. ef is advisory (ignored by brute).
-    // filter (may be nil) lets a backend push residual filtering down (brute uses it).
-    Search(rtx *btree.ReadTx, query []float32, k, ef int, filter ...) ([]vindex.Hit, error)
     Stats(rtx *btree.ReadTx) (vindex.Stats, error)
 }
 ```
 - `btreeBackend` — thin wrapper over `*vindex.Index` (today's behaviour, zero functional
   change).
-- `hybridBackend` — Phase 2; in Phase 1 it is constructed identically to btree (alias) so
-  the mode is selectable and persists, but behaves exactly like btree until the mirror
-  lands. This lets Phase 1 ship and be tested without the mirror.
-- `bruteBackend` — holds the collection's doc namespace handle + field path + dim/metric;
-  Insert/Update/Delete are no-ops; Search scans (Phase 3 fleshes it out; Phase 1 may land a
-  correct-but-simple scan to make the mode end-to-end testable immediately).
+- `hybridBackend` — Phase 2; embeds `btreeBackend` and adds the mirror. In Phase 1 it is
+  constructed identically to btree (alias) so the mode is selectable and persists, but
+  behaves exactly like btree until the mirror lands.
+- `bruteBackend` — metadata only; Insert/Update/Delete are **no-ops** (the vector already
+  lives in the document); Stats reports zero index bytes. Creates **no** vindex namespaces.
+
+**Search dispatch is by mode** (the key consequence of the brute decision):
+- btree / hybrid → today's HNSW candidate iterator (over-fetch + `_distance` + SortIter +
+  Limit). Hybrid serves layer-0 reads from the mirror.
+- brute → a **full-collection scan** candidate source that computes `_distance` per doc and
+  feeds the **same existing `_distance` + SortIter + Limit** pipeline. No custom top-k heap,
+  no new sort path — pure reuse of the mechanisms the HNSW path already uses. The residual
+  filter applies inline during the scan (brute is exact ⇒ no over-fetch).
 
 Dispatch: `createVectorIndex`/`loadVectorIndex` (`vector_index.go:145-215`) choose the
-backend from `info.Vector.Mode`. The brute backend needs the collection's `c.ns` and field
-path, so its constructor takes them (the others ignore them).
+write backend from `info.Vector.Mode`; the query path branches on mode when emitting the
+candidate source.
 
 **Validation** (`validateVectorParams`, `:50`): brute ignores M/EfC/EfS/Quantization
 (reject or warn if set, TBD); hybrid accepts all; reject unknown mode values.
@@ -93,12 +98,18 @@ suite green with and without `-race`. Commit.
 
 ## Phase 2 — hybrid (see `PLAN_HYBRID_L0.md`)
 
-Implement the RAM layer-0 mirror and cross-process sync exactly as specified there
-(sub-phases 0→4): `l0Gen` in `:meta`; `:l0log` delta log; COW atomic-pointer publish;
-snapshot-alignment contract; compaction; optional int8 vector tier. The `hybridBackend`
-embeds `btreeBackend` (writes go to btree first = source of truth) and adds the mirror for
-layer-0 search. Truth-equivalence test: hybrid hits == btree hits, exactly, at every
-snapshot. Multiprocess convergence test. `-race`. Commit per hybrid sub-phase.
+Implement the RAM layer-0 mirror per that doc. **Decisions for v1:**
+- **Cache scope:** adjacency + tombstones by default (~128 MB/1M @ M0=32, removes ~2/3 of
+  layer-0 btree reads). The int8 vector tier (~768 MB/1M @ dim768) is **opt-in** via a
+  param, not on by default.
+- **Cross-process sync:** **Phase 2a — scan-rebuild on staleness** (rebuild the mirror by
+  scanning `:adj` when `l0Gen` at the snapshot ≠ mirror gen; simple, O(N), proves
+  truth-equivalence). **Phase 2b — `:l0log` incremental replay + compaction** as the
+  optimization once 2a is correct and race-clean.
+
+The `hybridBackend` embeds `btreeBackend` (writes go to btree first = source of truth) and
+updates the mirror. Truth-equivalence test: hybrid hits == btree hits, exactly, at every
+snapshot. Multiprocess convergence test. `-race`. Commit per sub-phase (2a, then 2b).
 
 ---
 
@@ -109,21 +120,17 @@ snapshot. Multiprocess convergence test. `-race`. Commit per hybrid sub-phase.
 - **Writes:** Insert/Update/Delete are no-ops (the vector already lives in the document).
   So brute has the *cheapest possible* write path — effectively free index maintenance,
   the headline number for the comparison.
-- **Search:** scan the collection's document namespace; for each doc, extract the vector
-  field (`extractVector`), compute distance, maintain a top-k min-heap. Apply the residual
-  **filter inline during the scan** (brute is exact, so no over-fetch needed — this avoids
-  the `chooseEf` over-fetch dance entirely). Inject `_distance` as today.
-- **Pipeline integration:** when the planner sees a vector query on a brute index, it emits
-  a scan-distance iterator instead of an HNSW `VectorIter`. Keep the same `iter.Distance()`
-  / `_distance` surface so callers don't change.
-- **Optional int8 RAM vector cache:** brute is read-bound on *document* reads (full docs,
-  which include text + metadata, not just the vector). An opt-in RAM cache of int8 vectors
-  (keyed by docId→vec) turns the scan into a tight in-RAM distance loop — bridging toward
-  hybrid's vector tier without any graph. Gated by a memory cap; off by default to honour
-  "no data to save". Decide in Phase 3 whether to land this now or defer.
-- **Tests:** brute recall == 100% by construction; cross-check that btree/hybrid recall is
-  measured *against brute as ground truth*; filter pushdown correctness; empty/边 cases.
-  Commit.
+- **Search (reuse existing mechanisms):** when the planner sees a vector query on a brute
+  index, emit a **full-collection scan** as the candidate source; for each doc extract the
+  vector field (`extractVector`), compute the distance, inject `_distance`, and let the
+  **existing SortIter sort by `_distance`** with the existing Limit applying top-k. No
+  custom top-k heap, no new sort path — the exact same `_distance` + SortIter + Limit the
+  HNSW path already uses, only the candidate source differs (all docs vs HNSW candidates).
+  The residual filter applies inline during the scan (brute is exact ⇒ no `chooseEf`
+  over-fetch). Same `iter.Distance()` surface so callers don't change.
+- **No RAM cache.** Pure metadata-only, honouring "no data to save".
+- **Tests:** brute recall == 100% by construction; use brute as the ground truth that
+  btree/hybrid recall is measured against; filter correctness; empty/edge cases. Commit.
 
 ---
 
