@@ -104,6 +104,11 @@ type searcher struct {
 	naAdj []byte     // a's adjacency record read buffer
 	naEnc []byte     // re-encoded adjacency write buffer
 	naDec [][]uint32 // decoded per-layer neighbour lists (reused)
+
+	// neighbour-selection-heuristic scratch.
+	sel     []candidate // selected diverse neighbours (reused)
+	naCand  []candidate // candidate set for an addNeighbor prune (reused)
+	aVecBuf []float32   // stable copy of the centre vector during a prune
 }
 
 func (ix *Index) newSearcher(rtx *btree.ReadTx, query []float32) *searcher {
@@ -208,6 +213,50 @@ func (s *searcher) isDeletedAt(label uint32, layer int32) (bool, error) {
 		return s.l0.isDeleted(label), nil
 	}
 	return s.isDeleted(label)
+}
+
+// selectNeighborsHeuristic picks up to m diverse neighbours from cands (which
+// must be sorted closest-first, with cand.dist = distance to the centre node)
+// using Malkov's Algorithm 4: keep a candidate only if it is closer to the
+// centre than to every already-kept neighbour. Plain "keep the m closest"
+// instead fills a node's edges with same-cluster points and keeps no long-range
+// bridges, fragmenting the graph on clustered (real-embedding) data so recall
+// plateaus far below 1 regardless of ef. The result aliases s.sel (reused) —
+// the caller must copy out the labels before the next heuristic call.
+//
+// Buffers: candidate vectors are read into the secondary scratch (vec2Of, vf2),
+// kept-neighbour vectors into the primary scratch (vecOf, vf); the two never
+// alias, and any centre vector the caller needs must live in its own buffer.
+func (s *searcher) selectNeighborsHeuristic(cands []candidate, m int) ([]candidate, error) {
+	if len(cands) <= m {
+		return cands, nil
+	}
+	s.sel = s.sel[:0]
+	for ci := range cands {
+		if len(s.sel) >= m {
+			break
+		}
+		c := cands[ci]
+		cv, err := s.vec2Of(c.label)
+		if err != nil {
+			return nil, err
+		}
+		keep := true
+		for _, r := range s.sel {
+			rv, rerr := s.vecOf(r.label)
+			if rerr != nil {
+				return nil, rerr
+			}
+			if s.ix.dist(cv, rv) < c.dist {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			s.sel = append(s.sel, c)
+		}
+	}
+	return s.sel, nil
 }
 
 // greedyClosest walks one layer toward the query, returning the closest label.

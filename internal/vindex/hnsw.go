@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -330,21 +331,24 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 			return serr
 		}
 		m := ix.maxConn(lc)
-		if len(found) > m {
-			found = found[:m]
+		found, err = s.selectNeighborsHeuristic(found, m)
+		if err != nil {
+			return err
 		}
+		// Copy labels out before any addNeighbor call: addNeighbor runs the
+		// heuristic too and would overwrite s.sel (which `found` aliases).
 		sel := make([]uint32, len(found))
 		for i, c := range found {
 			sel[i] = c.label
 		}
 		newNbrs[lc] = sel
-		for _, c := range found {
-			if err = ix.addNeighbor(wtx, s, c.label, label, lc); err != nil {
+		for _, lbl := range sel {
+			if err = ix.addNeighbor(wtx, s, lbl, label, lc); err != nil {
 				return err
 			}
 		}
-		if len(found) > 0 {
-			ep = found[0].label
+		if len(sel) > 0 {
+			ep = sel[0]
 		}
 	}
 	if err = wtx.Put(ix.vadj, key(label), encodeAdj(nil, level, false, newNbrs)); err != nil {
@@ -385,30 +389,38 @@ func (ix *Index) addNeighbor(wtx *btree.WriteTx, s *searcher, a, b uint32, layer
 	if len(list) < capn {
 		nbrs[layer] = append(list, b)
 	} else {
-		// prune: keep the cap closest to a
-		aVec, err := s.vec2Of(a)
+		// Full: re-select capn diverse neighbours from {existing ∪ b} via the
+		// heuristic, centred on a — preserves bridges instead of just keeping the
+		// closest (which fragments the graph). Centre vector lives in aVecBuf so
+		// the heuristic's vec2Of/vecOf scratch can't clobber it.
+		av, err := s.vecOf(a)
 		if err != nil {
 			return err
 		}
-		bVec, err := s.vecOf(b)
-		if err != nil {
-			return err
-		}
-		worstDist := ix.dist(aVec, bVec)
-		worstIdx := -1
-		for i, x := range list {
-			xVec, err := s.vecOf(x)
-			if err != nil {
-				return err
+		s.aVecBuf = append(s.aVecBuf[:0], av...)
+		s.naCand = s.naCand[:0]
+		for _, x := range list {
+			xv, xerr := s.vecOf(x)
+			if xerr != nil {
+				return xerr
 			}
-			if d := ix.dist(aVec, xVec); d > worstDist {
-				worstDist, worstIdx = d, i
-			}
+			s.naCand = append(s.naCand, candidate{ix.dist(s.aVecBuf, xv), x})
 		}
-		if worstIdx >= 0 {
-			list[worstIdx] = b
+		bv, berr := s.vecOf(b)
+		if berr != nil {
+			return berr
 		}
-		nbrs[layer] = list
+		s.naCand = append(s.naCand, candidate{ix.dist(s.aVecBuf, bv), b})
+		sort.Slice(s.naCand, func(i, j int) bool { return s.naCand[i].dist < s.naCand[j].dist })
+		kept, kerr := s.selectNeighborsHeuristic(s.naCand, capn)
+		if kerr != nil {
+			return kerr
+		}
+		out := list[:0]
+		for _, c := range kept {
+			out = append(out, c.label)
+		}
+		nbrs[layer] = out
 	}
 	s.naEnc = encodeAdj(s.naEnc[:0], level, deleted, nbrs)
 	return wtx.Put(ix.vadj, kb[:], s.naEnc)
