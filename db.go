@@ -923,6 +923,7 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 					EfConstruction: vv.GetInt("efc"),
 					EfSearch:       vv.GetInt("efs"),
 					Quantization:   VectorQuantization(vv.GetInt("quant")),
+					Mode:           VectorMode(vv.GetInt("mode")),
 				}
 			}
 		}
@@ -1001,6 +1002,7 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 		vobj.Set("efc", a.NewNumberInt(info.Vector.EfConstruction))
 		vobj.Set("efs", a.NewNumberInt(info.Vector.EfSearch))
 		vobj.Set("quant", a.NewNumberInt(int(info.Vector.Quantization)))
+		vobj.Set("mode", a.NewNumberInt(int(info.Vector.Mode)))
 		obj.Set("vector", vobj)
 	}
 	return tx.Put(db.systemNS, key, obj.MarshalTo(nil))

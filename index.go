@@ -65,6 +65,36 @@ func (q VectorQuantization) toVindex() vindex.Quantization {
 	return vindex.QuantNone
 }
 
+// VectorMode selects the index strategy for a vector index.
+type VectorMode uint8
+
+const (
+	// VectorModeBTree stores the full HNSW graph in the btree (default): lowest
+	// RAM, multiprocess-safe writes, approximate search.
+	VectorModeBTree VectorMode = iota
+	// VectorModeHybrid is VectorModeBTree plus a RAM-resident copy of HNSW layer 0
+	// for faster search; the btree remains the source of truth.
+	VectorModeHybrid
+	// VectorModeBruteForce stores no index data — the index is only a declaration
+	// that a field is a vector. Search scans the collection and computes exact
+	// distances: ~free writes, ~0 storage, exact (100%) recall, O(N) search.
+	VectorModeBruteForce
+)
+
+func (m VectorMode) String() string {
+	switch m {
+	case VectorModeHybrid:
+		return "hybrid"
+	case VectorModeBruteForce:
+		return "brute"
+	default:
+		return "btree"
+	}
+}
+
+// isBruteForce reports whether this mode keeps no on-disk index structure.
+func (m VectorMode) isBruteForce() bool { return m == VectorModeBruteForce }
+
 // VectorParams configures a vector (HNSW) index.
 type VectorParams struct {
 	// Field is the path to the embedding field (an array of numbers).
@@ -79,6 +109,8 @@ type VectorParams struct {
 	EfSearch       int `json:"efSearch,omitempty"`
 	// Quantization selects the stored vector format (default full float32).
 	Quantization VectorQuantization `json:"quantization,omitempty"`
+	// Mode selects the index strategy (default btree). See VectorMode.
+	Mode VectorMode `json:"mode,omitempty"`
 }
 
 // IndexInfo provides information about an index.

@@ -58,6 +58,8 @@ type VectorIndexStats struct {
 	// Dim is the embedding dimension; Metric is the distance metric.
 	Dim    int
 	Metric string
+	// Mode is the index strategy ("btree" | "hybrid" | "brute").
+	Mode string
 	// Quantization is the stored vector format ("none" | "int8").
 	Quantization string
 
@@ -204,6 +206,18 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 
 		// Per-vector-index statistics.
 		for _, vi := range vindexes {
+			// Brute-force mode keeps no index data: report metadata only, zero bytes.
+			if vi.ix == nil {
+				stats.VectorIndexes = append(stats.VectorIndexes, VectorIndexStats{
+					Name:         vi.info.Name,
+					Field:        vi.info.Vector.Field,
+					Dim:          vi.dim,
+					Metric:       vi.info.Vector.Metric.toVindex().String(),
+					Mode:         vi.mode.String(),
+					Quantization: vi.info.Vector.Quantization.toVindex().String(),
+				})
+				continue
+			}
 			vs, vErr := vi.ix.Stats(tx)
 			if vErr != nil {
 				return vErr
@@ -214,6 +228,7 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 				Field:        vi.info.Vector.Field,
 				Dim:          vs.Dim,
 				Metric:       vs.Metric.String(),
+				Mode:         vi.mode.String(),
 				Quantization: vs.Quantization.String(),
 				M:            vs.M,
 				EfSearch:     vs.EfSearch,

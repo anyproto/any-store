@@ -29,7 +29,10 @@ type vectorIndex struct {
 	info      IndexInfo
 	fieldPath []string
 	dim       int
-	ix        *vindex.Index
+	mode      VectorMode
+	// ix is the btree-resident HNSW graph for btree/hybrid modes; it is nil for
+	// brute-force mode, which stores no index data (search scans the documents).
+	ix *vindex.Index
 }
 
 func vectorIndexNsPrefix(collName, indexName string) string {
@@ -57,6 +60,11 @@ func validateVectorParams(p *VectorParams) error {
 	if p.Dim <= 0 {
 		return fmt.Errorf("vector index requires Dim > 0")
 	}
+	switch p.Mode {
+	case VectorModeBTree, VectorModeHybrid, VectorModeBruteForce:
+	default:
+		return fmt.Errorf("vector index: unknown mode %d", p.Mode)
+	}
 	return nil
 }
 
@@ -65,6 +73,7 @@ func newVectorIndexFromVindex(info IndexInfo, ix *vindex.Index) *vectorIndex {
 		info:      info,
 		fieldPath: strings.Split(info.Vector.Field, "."),
 		dim:       info.Vector.Dim,
+		mode:      info.Vector.Mode,
 		ix:        ix,
 	}
 }
@@ -91,7 +100,11 @@ func (vi *vectorIndex) extractVector(it item, buf []float32) ([]float32, bool) {
 }
 
 // insert indexes the document's vector (no-op if the field is absent/invalid).
+// Brute-force mode keeps no index, so there is nothing to maintain.
 func (vi *vectorIndex) insert(tx *btree.WriteTx, it item, vbuf []float32) error {
+	if vi.ix == nil {
+		return nil
+	}
 	vec, ok := vi.extractVector(it, vbuf)
 	if !ok {
 		return nil
@@ -101,6 +114,9 @@ func (vi *vectorIndex) insert(tx *btree.WriteTx, it item, vbuf []float32) error 
 
 // delete removes the document's vector (no-op if it was never indexed).
 func (vi *vectorIndex) delete(tx *btree.WriteTx, it item) error {
+	if vi.ix == nil {
+		return nil
+	}
 	_, err := vi.ix.Delete(tx, it.appendId(nil))
 	return err
 }
@@ -109,6 +125,9 @@ func (vi *vectorIndex) delete(tx *btree.WriteTx, it item) error {
 // field went away, otherwise insert (which replaces the old node). This avoids
 // re-inserting into the HNSW graph on every unrelated document update.
 func (vi *vectorIndex) update(tx *btree.WriteTx, prevIt, it item) error {
+	if vi.ix == nil {
+		return nil
+	}
 	newVec, newOk := vi.extractVector(it, nil)
 	oldVec, oldOk := vi.extractVector(prevIt, nil)
 	switch {
@@ -146,6 +165,10 @@ func (c *collection) loadVectorIndex(tx *btree.ReadTx, info IndexInfo) (*vectorI
 	if err := validateVectorParams(info.Vector); err != nil {
 		return nil, err
 	}
+	if info.Vector.Mode.isBruteForce() {
+		// No on-disk graph to open — the index is metadata only.
+		return newVectorIndexFromVindex(info, nil), nil
+	}
 	prefix := vectorIndexNsPrefix(c.name, info.Name)
 	ix, err := vindex.OpenTx(tx, prefix, vectorIndexSeed(c.name, info.Name))
 	if err != nil {
@@ -166,6 +189,11 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	}
 	if err := c.db.registerIndex(tx, c.name, info); err != nil {
 		return nil, err
+	}
+	if info.Vector.Mode.isBruteForce() {
+		// Brute-force: no namespaces, no graph, nothing to build from documents.
+		// The persisted metadata above is the entire index.
+		return newVectorIndexFromVindex(info, nil), nil
 	}
 	prefix := vectorIndexNsPrefix(c.name, info.Name)
 	p := vindex.Params{
@@ -255,6 +283,11 @@ func (c *collection) reconcileVectorIndexesLocked(tx *btree.ReadTx, infos []Inde
 // vector-indexed field (unsupported).
 var ErrMultipleVectorClauses = errors.New("any-store: query has multiple vector clauses")
 
+// errBruteVectorSearchNotImplemented is returned for searches against a
+// brute-force vector index until the scan-distance path lands (modes plan,
+// Phase 3). Writes and Stats already work in brute-force mode.
+var errBruteVectorSearchNotImplemented = errors.New("any-store: brute-force vector search not yet implemented")
+
 // detectVectorQuery inspects the parsed filter for an equality on a
 // vector-indexed field (`{vectorField: [..]}`). If found it returns a planner
 // spec and the residual filter (the original filter minus the vector clause —
@@ -299,6 +332,10 @@ func (q *collQuery) detectVectorQuery() (*qplanner.VectorQuerySpec, query.Filter
 	}
 	if vecIdx < 0 {
 		return nil, q.cond, nil
+	}
+	if vi.ix == nil {
+		// Brute-force search via the query pipeline lands in Phase 3.
+		return nil, nil, errBruteVectorSearchNotImplemented
 	}
 
 	residual := residualFilter(clauses, vecIdx)
@@ -416,6 +453,9 @@ func (c *collection) VectorSearch(ctx context.Context, indexName string, query [
 	vi := c.findVectorIndex(indexName)
 	if vi == nil {
 		return nil, fmt.Errorf("%w: vector index %q", ErrIndexNotFound, indexName)
+	}
+	if vi.ix == nil {
+		return nil, errBruteVectorSearchNotImplemented
 	}
 	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		raw, serr := vi.ix.Search(tx, query, k, efSearch)
