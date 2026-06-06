@@ -106,6 +106,21 @@ own snapshot** — this is the version we align the mirror to. (`FileChangeCount
 cross-process *wake-up*; `l0Gen` is the *precise* mirror version. We need both: the former is
 free and global, the latter is snapshot-exact and per-index.)
 
+> **Why a dedicated `l0Gen` and not the index sketch's doc count?** The sketch is the
+> obvious candidate to reuse for staleness detection, but it *cannot* detect the changes
+> we care about: (a) vector indexes are not wired into the sketch system at all today
+> (the sketch lives only on range indexes); (b) `docCount` is **net** — an update is
+> tombstone-old + insert-new = `-1 + 1 = 0`, so the count never moves even though layer-0
+> edges changed; (c) the buckets sketch *field values*, but a 768-dim vector has no
+> meaningful bucket; (d) pure back-link churn (`addNeighbor` rewriting an existing node's
+> neighbour list during another node's insert) changes layer 0 with no doc-count or bucket
+> change at all. So we reuse the sketch's *mechanism* — persist-inside-commit,
+> reload-at-exact-snapshot, COW atomic-pointer publish, rollback-rebase
+> (`resetUncommittedSketches`) — but carry a **monotonic `l0Gen`** as the value, kept in
+> the load-bearing `:meta` record (already read at the tx snapshot via `readMeta(rtx)`)
+> rather than in the advisory sketch, so a correctness-critical version is never coupled to
+> a structure other code may treat as throwaway.
+
 ### 2.3 A delta log in the btree (so sync is incremental and snapshot-consistent)
 
 New namespace `:l0log`, keyed by `l0Gen` (big-endian, cursor-ordered). Each write tx appends
