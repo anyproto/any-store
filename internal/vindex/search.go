@@ -106,9 +106,10 @@ type searcher struct {
 	naDec [][]uint32 // decoded per-layer neighbour lists (reused)
 
 	// neighbour-selection-heuristic scratch.
-	sel     []candidate // selected diverse neighbours (reused)
-	naCand  []candidate // candidate set for an addNeighbor prune (reused)
-	aVecBuf []float32   // stable copy of the centre vector during a prune
+	sel      []candidate // selected diverse neighbours (reused)
+	naCand   []candidate // candidate set for an addNeighbor prune (reused)
+	aVecBuf  []float32   // stable copy of the centre vector during a prune
+	keptVecs []float32   // RAM cache of kept-neighbour vectors (m*dim, reused)
 }
 
 func (ix *Index) newSearcher(rtx *btree.ReadTx, query []float32) *searcher {
@@ -231,6 +232,17 @@ func (s *searcher) selectNeighborsHeuristic(cands []candidate, m int) ([]candida
 	if len(cands) <= m {
 		return cands, nil
 	}
+	// Cache kept-neighbour vectors in a reused RAM slab (m*dim floats, bounded by
+	// graph degree — not N). Each candidate is read from the btree once (vec2Of);
+	// the inner "closer to a kept neighbour?" check then runs entirely in RAM,
+	// instead of re-reading every kept vector from the btree per candidate. This
+	// removes the dominant cost of the heuristic (it was ~64% of insert time, all
+	// btree reads). Distances use the same SIMD kernel; results are identical.
+	dim := s.ix.dim
+	if cap(s.keptVecs) < m*dim {
+		s.keptVecs = make([]float32, m*dim)
+	}
+	kept := s.keptVecs[:0]
 	s.sel = s.sel[:0]
 	for ci := range cands {
 		if len(s.sel) >= m {
@@ -242,17 +254,15 @@ func (s *searcher) selectNeighborsHeuristic(cands []candidate, m int) ([]candida
 			return nil, err
 		}
 		keep := true
-		for _, r := range s.sel {
-			rv, rerr := s.vecOf(r.label)
-			if rerr != nil {
-				return nil, rerr
-			}
+		for r := 0; r < len(s.sel); r++ {
+			rv := kept[r*dim : r*dim+dim]
 			if s.ix.dist(cv, rv) < c.dist {
 				keep = false
 				break
 			}
 		}
 		if keep {
+			kept = append(kept, cv...) // copy into the slab (cv is reused scratch)
 			s.sel = append(s.sel, c)
 		}
 	}
