@@ -916,14 +916,15 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 			if vv := v.Get("vector"); vv != nil {
 				info.Kind = IndexKindVector
 				info.Vector = &VectorParams{
-					Field:          vv.GetString("field"),
-					Dim:            vv.GetInt("dim"),
-					Metric:         VectorMetric(vv.GetInt("metric")),
-					M:              vv.GetInt("m"),
-					EfConstruction: vv.GetInt("efc"),
-					EfSearch:       vv.GetInt("efs"),
-					Quantization:   VectorQuantization(vv.GetInt("quant")),
-					Mode:           VectorMode(vv.GetInt("mode")),
+					Field:              vv.GetString("field"),
+					Dim:                vv.GetInt("dim"),
+					Metric:             VectorMetric(vv.GetInt("metric")),
+					M:                  vv.GetInt("m"),
+					EfConstruction:     vv.GetInt("efc"),
+					EfSearch:           vv.GetInt("efs"),
+					Quantization:       VectorQuantization(vv.GetInt("quant")),
+					Mode:               VectorMode(vv.GetInt("mode")),
+					HybridCacheVectors: vv.GetInt("hvc") != 0,
 				}
 			}
 		}
@@ -1003,6 +1004,9 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 		vobj.Set("efs", a.NewNumberInt(info.Vector.EfSearch))
 		vobj.Set("quant", a.NewNumberInt(int(info.Vector.Quantization)))
 		vobj.Set("mode", a.NewNumberInt(int(info.Vector.Mode)))
+		if info.Vector.HybridCacheVectors {
+			vobj.Set("hvc", a.NewNumberInt(1))
+		}
 		obj.Set("vector", vobj)
 	}
 	return tx.Put(db.systemNS, key, obj.MarshalTo(nil))

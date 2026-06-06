@@ -38,6 +38,12 @@ func (ix *Index) SearchCandidates(rtx *btree.ReadTx, query []float32, ef int) ([
 		if s.l0, err = ix.layer0Mirror(rtx, mt); err != nil {
 			return nil, err
 		}
+		if ix.vecCache {
+			if s.tierData, err = ix.vtier.ensure(rtx, ix.vvec, mt.nextLabel); err != nil {
+				return nil, err
+			}
+			s.tierStride = ix.vtier.stride
+		}
 	}
 	epn := mt.entryLabel
 	for lc := mt.topLayer; lc > 0; lc-- {
@@ -82,6 +88,12 @@ type searcher struct {
 	// layer-0 neighbour and deleted lookups are served from it instead of the
 	// btree. nil on the write path (Insert), which must see the in-progress graph.
 	l0 *l0Mirror
+
+	// tierData is a captured snapshot of the vector-tier slab for hybrid READ
+	// searches; when non-nil, vecOf reads vectors from it instead of the btree.
+	// nil on the write path. tierStride is the per-record byte stride.
+	tierData   []byte
+	tierStride int
 
 	vbuf  []byte
 	vf    []float32 // aliases vbuf — vector A (reused each read)
@@ -128,8 +140,20 @@ func (ix *Index) newSearcher(rtx *btree.ReadTx, query []float32) *searcher {
 }
 
 // vecOf reads label's vector into the primary scratch (valid until the next
-// vecOf call).
+// vecOf call). On the hybrid read path with the vector tier, the record comes
+// from the RAM slab instead of the btree; decoding is identical either way.
 func (s *searcher) vecOf(label uint32) ([]float32, error) {
+	if s.tierData != nil {
+		off := int(label) * s.tierStride
+		rec := s.tierData[off : off+s.tierStride]
+		if s.ix.quant != QuantNone {
+			if v, ok := decodeVecInto(rec, s.ix.dim, s.ix.quant, s.vf); ok {
+				return v, nil
+			}
+			return nil, fmt.Errorf("vindex: bad quantized vector record len %d", len(rec))
+		}
+		return bytesAsF32(rec, s.ix.dim), nil
+	}
 	s.keyBuf = labelKey(s.keyBuf, label)
 	if s.ix.quant != QuantNone {
 		s.qbuf, _ = s.rtx.AppendValue(s.ix.vvec, s.keyBuf, s.qbuf[:0])

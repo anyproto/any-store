@@ -95,13 +95,16 @@ func TestVectorModesCompare(t *testing.T) {
 		label string
 		mode  VectorMode
 		quant VectorQuantization
+		vc    bool // hybrid vector cache (RAM vector tier)
 	}
 	scenarios := []scenario{
-		{"btree  f32", VectorModeBTree, VectorQuantNone},
-		{"btree  int8", VectorModeBTree, VectorQuantInt8},
-		{"hybrid f32", VectorModeHybrid, VectorQuantNone},
-		{"hybrid int8", VectorModeHybrid, VectorQuantInt8},
-		{"brute", VectorModeBruteForce, VectorQuantNone},
+		{"btree  f32", VectorModeBTree, VectorQuantNone, false},
+		{"btree  int8", VectorModeBTree, VectorQuantInt8, false},
+		{"hybrid f32", VectorModeHybrid, VectorQuantNone, false},
+		{"hybrid int8", VectorModeHybrid, VectorQuantInt8, false},
+		{"hybr+vc f32", VectorModeHybrid, VectorQuantNone, true},
+		{"hybr+vc int8", VectorModeHybrid, VectorQuantInt8, true},
+		{"brute", VectorModeBruteForce, VectorQuantNone, false},
 	}
 
 	type result struct {
@@ -130,7 +133,7 @@ func TestVectorModesCompare(t *testing.T) {
 		require.NoError(t, coll.CreateIndex(ctx, IndexInfo{
 			Name:   "emb",
 			Kind:   IndexKindVector,
-			Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 64, EfConstruction: efc, Mode: sc.mode, Quantization: sc.quant},
+			Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 64, EfConstruction: efc, Mode: sc.mode, Quantization: sc.quant, HybridCacheVectors: sc.vc},
 		}))
 
 		// build (single batched tx)

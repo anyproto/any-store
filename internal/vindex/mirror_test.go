@@ -34,6 +34,59 @@ func assertHybridEqualsBtree(t *testing.T, db *btree.DB, ix *Index, queries [][]
 	}
 }
 
+// TestVindexVectorTierEqualsBtree verifies the RAM vector tier returns identical
+// results to reading vectors from the btree — for both float32 and int8 indexes
+// (the tier caches the exact :vec bytes). Run against the same index with the
+// cache off then on.
+func TestVindexVectorTierEqualsBtree(t *testing.T) {
+	const (
+		n   = 1500
+		dim = 32
+		k   = 10
+	)
+	vecs := randVecs(n, dim, 7)
+	queries := randVecs(40, dim, 99)
+
+	searchAll := func(ix *Index, rtx *btree.ReadTx) [][]string {
+		out := make([][]string, len(queries))
+		for qi, q := range queries {
+			hits, err := ix.Search(rtx, q, k, 64)
+			require.NoError(t, err)
+			ids := make([]string, len(hits))
+			for i, h := range hits {
+				ids[i] = string(h.DocID)
+			}
+			out[qi] = ids
+		}
+		return out
+	}
+
+	for _, quant := range []Quantization{QuantNone, QuantInt8} {
+		db, err := btree.Open(":memory:", btree.Options{InMemory: true})
+		require.NoError(t, err)
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		ix, err := Create(wtx, "vix", Params{Dim: dim, Metric: L2, EfSearch: 64, Quantization: quant}, 1)
+		require.NoError(t, err)
+		require.NoError(t, wtx.Commit())
+		insertAll(t, db, ix, vecs)
+
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+
+		ix.SetHybrid(true)
+		ix.SetVectorCache(false)
+		base := searchAll(ix, rtx)
+		ix.SetVectorCache(true)
+		cached := searchAll(ix, rtx)
+
+		require.Equal(t, base, cached, "vector tier must match btree reads (quant=%v)", quant)
+
+		_ = rtx.Rollback()
+		_ = db.Close()
+	}
+}
+
 func TestVindexHybridTruthEquivalence(t *testing.T) {
 	const (
 		n   = 1500

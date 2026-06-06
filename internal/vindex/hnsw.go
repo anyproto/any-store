@@ -74,6 +74,11 @@ type Index struct {
 	hybrid bool
 	l0pub  atomic.Pointer[l0Mirror]
 
+	// vecCache enables the RAM vector tier (hybrid only): layer-0 vector reads are
+	// served from RAM instead of the btree. vtier is created lazily.
+	vecCache bool
+	vtier    *vecTier
+
 	rngMu sync.Mutex
 	rng   *rand.Rand
 
@@ -97,6 +102,7 @@ func (ix *Index) putSearcher(s *searcher) {
 	s.rtx = nil
 	s.query = nil
 	s.l0 = nil
+	s.tierData = nil
 	ix.scratch.Put(s)
 }
 
@@ -208,6 +214,18 @@ func (ix *Index) Dim() int { return ix.dim }
 // once right after Create/Open, before concurrent use. The btree stays the
 // source of truth; the mirror is a derived, snapshot-aligned read cache.
 func (ix *Index) SetHybrid(h bool) { ix.hybrid = h }
+
+// SetVectorCache enables (or disables) the RAM vector tier (hybrid only): layer-0
+// vector reads come from a RAM slab instead of the btree, making a hop pure-RAM.
+// It caches the btree's exact :vec bytes (int8 if the index is int8), so results
+// are unchanged. RAM cost ≈ liveLabels × vecRecordSize; use int8 to keep it down.
+// Call once right after Create/Open, before concurrent use.
+func (ix *Index) SetVectorCache(v bool) {
+	ix.vecCache = v
+	if v && ix.vtier == nil {
+		ix.vtier = newVecTier(vecRecordSize(ix.dim, ix.quant))
+	}
+}
 
 func (ix *Index) readMeta(rtx *btree.ReadTx) (*meta, error) {
 	b, err := rtx.Get(ix.vmeta, metaKey)
@@ -506,6 +524,12 @@ func (ix *Index) Search(rtx *btree.ReadTx, query []float32, k, efSearch int) ([]
 	if ix.hybrid {
 		if s.l0, err = ix.layer0Mirror(rtx, mt); err != nil {
 			return nil, err
+		}
+		if ix.vecCache {
+			if s.tierData, err = ix.vtier.ensure(rtx, ix.vvec, mt.nextLabel); err != nil {
+				return nil, err
+			}
+			s.tierStride = ix.vtier.stride
 		}
 	}
 	ep := mt.entryLabel

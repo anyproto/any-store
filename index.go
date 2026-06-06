@@ -111,6 +111,11 @@ type VectorParams struct {
 	Quantization VectorQuantization `json:"quantization,omitempty"`
 	// Mode selects the index strategy (default btree). See VectorMode.
 	Mode VectorMode `json:"mode,omitempty"`
+	// HybridCacheVectors, for VectorModeHybrid, also caches vectors in RAM (the
+	// "vector tier") so layer-0 search avoids btree vector reads entirely — the
+	// bulk of search cost. RAM ≈ liveVectors × recordSize (use int8 to keep it
+	// small). Ignored unless Mode == VectorModeHybrid.
+	HybridCacheVectors bool `json:"hybridCacheVectors,omitempty"`
 }
 
 // IndexInfo provides information about an index.
