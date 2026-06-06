@@ -66,6 +66,7 @@ func TestVectorModesCompare(t *testing.T) {
 	dim := envIntDefault("ASV_CMP_DIM", 128)
 	nq := envIntDefault("ASV_CMP_Q", 300)
 	k := envIntDefault("ASV_CMP_K", 10)
+	efc := envIntDefault("ASV_CMP_EFC", 0) // 0 = index default (200)
 
 	baseDir := os.Getenv("ASV_RPS_DIR")
 	if baseDir == "" {
@@ -129,7 +130,7 @@ func TestVectorModesCompare(t *testing.T) {
 		require.NoError(t, coll.CreateIndex(ctx, IndexInfo{
 			Name:   "emb",
 			Kind:   IndexKindVector,
-			Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 64, Mode: sc.mode, Quantization: sc.quant},
+			Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 64, EfConstruction: efc, Mode: sc.mode, Quantization: sc.quant},
 		}))
 
 		// build (single batched tx)
@@ -173,7 +174,7 @@ func TestVectorModesCompare(t *testing.T) {
 		_ = os.RemoveAll(dir)
 	}
 
-	t.Logf("=== mode comparison: N=%d dim=%d queries=%d k=%d ===", n, dim, nq, k)
+	t.Logf("=== mode comparison: N=%d dim=%d queries=%d k=%d efc=%d ===", n, dim, nq, k, efc)
 	t.Logf("%-12s %12s %12s %8s %10s %10s", "mode", "build/s", "search/s", "recall", "indexMiB", "heapMiB")
 	for _, r := range results {
 		t.Logf("%-12s %12.0f %12.0f %8.3f %10.1f %10.1f", r.label, r.buildRPS, r.searchRPS, r.recall, r.diskMiB, r.heapMiB)
