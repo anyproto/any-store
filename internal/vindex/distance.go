@@ -39,6 +39,10 @@ func (m Metric) String() string {
 // DistanceFunc returns the distance between two equal-length vectors.
 type DistanceFunc func(a, b []float32) float32
 
+// DistanceFor returns the best distance function for the metric on this CPU —
+// the same kernel the index uses, so brute-force search ranks identically to ANN.
+func DistanceFor(m Metric) DistanceFunc { return distanceFor(m) }
+
 // SIMD reports whether vek selected a vectorised kernel (amd64 + AVX2). False on
 // arm64 and non-AVX2 x86 — see vector/ARM.md and vector/CROSS_HARDWARE.md.
 func SIMD() bool { return vek32.Info().Acceleration }

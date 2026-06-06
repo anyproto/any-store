@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -283,11 +284,6 @@ func (c *collection) reconcileVectorIndexesLocked(tx *btree.ReadTx, infos []Inde
 // vector-indexed field (unsupported).
 var ErrMultipleVectorClauses = errors.New("any-store: query has multiple vector clauses")
 
-// errBruteVectorSearchNotImplemented is returned for searches against a
-// brute-force vector index until the scan-distance path lands (modes plan,
-// Phase 3). Writes and Stats already work in brute-force mode.
-var errBruteVectorSearchNotImplemented = errors.New("any-store: brute-force vector search not yet implemented")
-
 // detectVectorQuery inspects the parsed filter for an equality on a
 // vector-indexed field (`{vectorField: [..]}`). If found it returns a planner
 // spec and the residual filter (the original filter minus the vector clause —
@@ -333,14 +329,22 @@ func (q *collQuery) detectVectorQuery() (*qplanner.VectorQuerySpec, query.Filter
 	if vecIdx < 0 {
 		return nil, q.cond, nil
 	}
-	if vi.ix == nil {
-		// Brute-force search via the query pipeline lands in Phase 3.
-		return nil, nil, errBruteVectorSearchNotImplemented
-	}
 
 	residual := residualFilter(clauses, vecIdx)
-	ef := chooseEf(int(q.vectorEf), vi.ix.EfSearch(), int(q.limit), residual != nil)
 	captured := vi
+	if vi.ix == nil {
+		// Brute-force: every document is a candidate. The existing
+		// FilterIter -> SortIter -> LimitIter chain then filters, sorts by
+		// _distance, and takes top-k — exact, no over-fetch needed.
+		spec := &qplanner.VectorQuerySpec{
+			Query: qvec,
+			Search: func(tx *btree.ReadTx, qv []float32, _ int) ([]qplanner.VectorCandidate, error) {
+				return q.c.bruteVectorCandidates(tx, captured, qv)
+			},
+		}
+		return spec, residual, nil
+	}
+	ef := chooseEf(int(q.vectorEf), vi.ix.EfSearch(), int(q.limit), residual != nil)
 	spec := &qplanner.VectorQuerySpec{
 		Query: qvec,
 		Ef:    ef,
@@ -393,6 +397,39 @@ func decodeVectorValue(eqValue []byte, dim int) ([]float32, error) {
 			return nil, fmt.Errorf("non-numeric element")
 		}
 		out[i] = float32(e.GetFloat64())
+	}
+	return out, nil
+}
+
+// bruteVectorCandidates scans the whole collection and returns every document
+// with its distance to qv — the candidate source for a brute-force vector index.
+// It uses the same distance kernel as the ANN index, so rankings are identical.
+func (c *collection) bruteVectorCandidates(tx *btree.ReadTx, vi *vectorIndex, qv []float32) ([]qplanner.VectorCandidate, error) {
+	dist := vindex.DistanceFor(vi.info.Vector.Metric.toVindex())
+	cursor := tx.NewCursor(c.ns)
+	defer cursor.Close()
+	if err := cursor.First(); err != nil {
+		return nil, err
+	}
+	var p anyenc.Parser
+	buf := make([]float32, 0, vi.dim)
+	var out []qplanner.VectorCandidate
+	for cursor.Valid() {
+		val, err := cursor.Value()
+		if err != nil {
+			return nil, err
+		}
+		doc, err := p.Parse(val) // compression-aware
+		if err != nil {
+			return nil, err
+		}
+		it := item{val: doc}
+		if vec, ok := vi.extractVector(it, buf); ok {
+			out = append(out, qplanner.VectorCandidate{DocId: it.appendId(nil), Distance: dist(qv, vec)})
+		}
+		if err := cursor.Next(); err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }
@@ -455,7 +492,23 @@ func (c *collection) VectorSearch(ctx context.Context, indexName string, query [
 		return nil, fmt.Errorf("%w: vector index %q", ErrIndexNotFound, indexName)
 	}
 	if vi.ix == nil {
-		return nil, errBruteVectorSearchNotImplemented
+		// Brute-force: scan all docs, sort by distance, take top-k.
+		err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+			cands, serr := c.bruteVectorCandidates(tx, vi, query)
+			if serr != nil {
+				return serr
+			}
+			sort.Slice(cands, func(i, j int) bool { return cands[i].Distance < cands[j].Distance })
+			if k > 0 && len(cands) > k {
+				cands = cands[:k]
+			}
+			hits = make([]VectorHit, len(cands))
+			for i, cnd := range cands {
+				hits[i] = VectorHit{DocId: cnd.DocId, Distance: cnd.Distance}
+			}
+			return nil
+		})
+		return hits, err
 	}
 	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		raw, serr := vi.ix.Search(tx, query, k, efSearch)

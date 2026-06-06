@@ -1,7 +1,6 @@
 package anystore
 
 import (
-	"errors"
 	"path/filepath"
 	"testing"
 
@@ -97,26 +96,57 @@ func TestVectorMode_BruteNoStorage(t *testing.T) {
 	assert.Equal(t, dim, st.VectorIndexes[0].Dim)
 }
 
-// TestVectorMode_BruteSearchNotYet asserts brute-force search returns the
-// explicit not-implemented error (Phase 3 will replace this with a scan).
-func TestVectorMode_BruteSearchNotYet(t *testing.T) {
-	const dim = 8
+// TestVectorMode_BruteExact verifies brute-force search is exact: it returns the
+// true nearest neighbours (recall 1.0) via both the direct API and the Find
+// pipeline, and applies a residual filter correctly.
+func TestVectorMode_BruteExact(t *testing.T) {
+	const (
+		dim = 12
+		n   = 400
+		k   = 10
+	)
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "docs")
 	require.NoError(t, err)
 	makeVectorIndex(t, coll, VectorModeBruteForce, dim)
-	vecs := vrand(20, dim, 5)
+	vecs := vrand(n, dim, 5)
 	for i, vc := range vecs {
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
 	}
 
-	// direct API
-	_, err = coll.VectorSearch(ctx, "emb", vecs[0], 5, 64)
-	assert.ErrorIs(t, err, errBruteVectorSearchNotImplemented)
+	// direct API: exact top-1 self-retrieval + recall 1.0 vs brute oracle.
+	hits, err := coll.VectorSearch(ctx, "emb", vecs[42], 1, 0)
+	require.NoError(t, err)
+	require.Len(t, hits, 1)
+	assert.Equal(t, idBytesOf(42), hits[0].DocId)
+	assert.InDelta(t, 0, hits[0].Distance, 1e-3)
 
-	// query pipeline
-	_, err = coll.Find(vectorEqFilter(vecs[0])).Limit(5).Iter(ctx)
-	assert.ErrorIs(t, err, errBruteVectorSearchNotImplemented)
+	queries := vrand(30, dim, 99)
+	var recall float64
+	for _, q := range queries {
+		truth := bruteIDs(vecs, q, k)
+		hh, err := coll.VectorSearch(ctx, "emb", q, k, 0)
+		require.NoError(t, err)
+		hit := 0
+		for _, h := range hh {
+			if truth[string(h.DocId)] {
+				hit++
+			}
+		}
+		recall += float64(hit) / float64(k)
+	}
+	recall /= float64(len(queries))
+	assert.Equal(t, 1.0, recall, "brute-force search must be exact")
+
+	// query pipeline returns the same nearest doc, decorated with _distance.
+	iter, err := coll.Find(vectorEqFilter(vecs[7])).Limit(1).Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+	require.True(t, iter.Next())
+	doc, err := iter.Doc()
+	require.NoError(t, err)
+	assert.Equal(t, 7, doc.Value().GetInt("id"))
+	assert.InDelta(t, 0, iter.Distance(), 1e-3)
 }
 
 // TestVectorMode_HybridBehavesLikeBTree confirms hybrid mode is a working index
@@ -157,6 +187,5 @@ func TestVectorMode_UnknownRejected(t *testing.T) {
 		Kind:   IndexKindVector,
 		Vector: &VectorParams{Field: "v", Dim: 8, Mode: VectorMode(99)},
 	})
-	require.Error(t, err)
-	assert.False(t, errors.Is(err, errBruteVectorSearchNotImplemented))
+	assert.Error(t, err, "unknown vector mode must be rejected")
 }
