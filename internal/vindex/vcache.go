@@ -179,6 +179,22 @@ func (s *u32set) visit(label uint32) bool {
 	return true
 }
 
+// contains reports whether label is in the set, without inserting it. Used to read
+// an immutable overlay's deleted set on the search path.
+func (s *u32set) contains(label uint32) bool {
+	if s.key == nil {
+		return false
+	}
+	pos := hashU32(label) & s.mask
+	for s.seen[pos] == s.gen {
+		if s.key[pos] == label {
+			return true
+		}
+		pos = (pos + 1) & s.mask
+	}
+	return false
+}
+
 func (s *u32set) grow() {
 	size := len(s.key) * 2
 	nkey := make([]uint32, size)

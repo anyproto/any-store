@@ -119,6 +119,11 @@ type searcher struct {
 	res  cheap
 	out  []candidate
 
+	// dirtyL0 accumulates the layer-0 labels an Insert/Delete changes (new node,
+	// its back-link neighbours, tombstoned labels) for the hybrid dirty ring.
+	// Reused across inserts via the pooled searcher; reset at the start of Insert.
+	dirtyL0 []uint32
+
 	// write-path scratch reused by addNeighbor (insert connect phase, which runs
 	// after searchLayer so these don't overlap with the read buffers above).
 	naAdj []byte     // a's adjacency record read buffer

@@ -76,10 +76,17 @@ type Index struct {
 	normalize bool
 
 	// hybrid enables the RAM layer-0 mirror on the read path (set by the caller
-	// for VectorModeHybrid). l0pub holds the most recently built mirror as a
-	// lock-free cache; a search only uses a mirror whose gen matches its snapshot.
-	hybrid bool
-	l0pub  atomic.Pointer[l0Mirror]
+	// for VectorModeHybrid). l0pub holds the most recently built mirror and l0base
+	// the immutable CSR base both are derived from, as lock-free CAS-to-newest
+	// caches; a search only uses a mirror whose gen matches its snapshot. dirty is
+	// the in-memory changelog the writer records to so reads can rebuild the mirror
+	// incrementally; fullStreak counts consecutive full rebuilds for the thrash
+	// valve. See mirror.go.
+	hybrid     bool
+	l0pub      atomic.Pointer[l0Mirror]
+	l0base     atomic.Pointer[l0Base]
+	dirty      *dirtyRing
+	fullStreak atomic.Uint64
 
 	// vecCache enables the RAM vector tier (hybrid only): layer-0 vector reads are
 	// served from RAM instead of the btree. vtier is created lazily.
@@ -251,7 +258,12 @@ func (ix *Index) Dim() int { return ix.dim }
 // SetHybrid enables (or disables) the RAM layer-0 mirror on the read path. Call
 // once right after Create/Open, before concurrent use. The btree stays the
 // source of truth; the mirror is a derived, snapshot-aligned read cache.
-func (ix *Index) SetHybrid(h bool) { ix.hybrid = h }
+func (ix *Index) SetHybrid(h bool) {
+	ix.hybrid = h
+	if h && ix.dirty == nil {
+		ix.dirty = &dirtyRing{}
+	}
+}
 
 // SetVectorCache enables (or disables) the RAM vector tier (hybrid only): layer-0
 // vector reads come from a RAM slab instead of the btree, making a hop pure-RAM.
@@ -334,11 +346,20 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 	}
 	s.beginVecCache() // serve repeated per-insert vector reads from RAM (lever 1)
 
+	// Track the layer-0 labels this insert changes, for the hybrid dirty ring.
+	track := ix.hybrid && ix.dirty != nil
+	if track {
+		s.dirtyL0 = s.dirtyL0[:0]
+	}
+
 	// replace existing
 	if old, gerr := rtx.Get(ix.vdoc, docID); gerr == nil {
 		oldLabel := binary.LittleEndian.Uint32(old)
 		if terr := ix.tombstoneLabel(wtx, oldLabel, mt); terr != nil {
 			return terr
+		}
+		if track {
+			s.dirtyL0 = append(s.dirtyL0, oldLabel) // its deleted flag flipped
 		}
 	} else if !errors.Is(gerr, btree.ErrKeyNotFound) {
 		return gerr
@@ -348,6 +369,9 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 	mt.nextLabel++
 	mt.count++
 	level := ix.randomLevel()
+	if track {
+		s.dirtyL0 = append(s.dirtyL0, label) // the new node's own layer-0 adjacency
+	}
 
 	var keyArr [4]byte
 	key := func(l uint32) []byte {
@@ -379,6 +403,9 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 			return err
 		}
 		mt.hasEntry, mt.entryLabel, mt.topLayer = true, label, level
+		if track {
+			ix.dirty.record(mt.l0Gen, s.dirtyL0)
+		}
 		return ix.writeMeta(wtx, mt)
 	}
 
@@ -415,6 +442,9 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 			sel[i] = c.label
 		}
 		newNbrs[lc] = sel
+		if track && lc == 0 {
+			s.dirtyL0 = append(s.dirtyL0, sel...) // these neighbours gained a back-link
+		}
 		for _, lbl := range sel {
 			if err = ix.addNeighbor(wtx, s, lbl, label, lc); err != nil {
 				return err
@@ -429,6 +459,9 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 	}
 	if level > mt.topLayer {
 		mt.entryLabel, mt.topLayer = label, level
+	}
+	if track {
+		ix.dirty.record(mt.l0Gen, s.dirtyL0)
 	}
 	return ix.writeMeta(wtx, mt)
 }
@@ -545,6 +578,9 @@ func (ix *Index) Delete(wtx *btree.WriteTx, docID []byte) (bool, error) {
 	}
 	if err = wtx.Delete(ix.vdoc, docID); err != nil {
 		return false, err
+	}
+	if ix.hybrid && ix.dirty != nil {
+		ix.dirty.record(mt.l0Gen, []uint32{label})
 	}
 	return true, ix.writeMeta(wtx, mt)
 }
