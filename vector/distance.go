@@ -1,4 +1,9 @@
-// Package vector is an experimental vector-search add-on for any-store.
+// Package vector is an experimental vector-search PROTOTYPE for any-store.
+//
+// Deprecated: this package is NOT the live vector engine and is not imported by
+// any-store itself (only by cmd/vectorbench). The production vector index is
+// internal/vindex (a btree-resident HNSW). This package is retained only as a
+// benchmarking/recall reference and may be removed.
 //
 // It explores a few ways to land approximate nearest-neighbour (ANN) search on
 // top of the embedded btree engine, using github.com/coder/hnsw as the

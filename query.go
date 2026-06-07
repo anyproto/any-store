@@ -161,8 +161,11 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	}
 	if vspec != nil {
 		sorter := q.sort
-		if sorter == nil {
-			// simple variant: order by distance ascending
+		if sorter == nil && !vspec.Ordered {
+			// No explicit sort and the source isn't already distance-ordered
+			// (brute-force): order by distance ascending. When the ANN source is
+			// ordered, we leave sorter nil so the planner skips a redundant SortIter
+			// and streams the already-closest-first candidates straight to LimitIter.
 			sorter, _ = query.ParseSort(qplanner.DistanceField)
 		}
 		plan := qplanner.BuildPlan(&qplanner.PlanParams{
@@ -228,6 +231,15 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	if isUnsatisfiable(q.cond) {
 		return
 	}
+
+	// Reclaim tombstones this bulk update creates once it commits, mirroring the
+	// single-doc mutators. Registered before the commit defer so it runs after
+	// commit; no-ops inside a caller-managed tx (the guard in maybeAutoCompactVectors).
+	defer func() {
+		if err == nil {
+			q.c.maybeAutoCompactVectors(ctx)
+		}
+	}()
 
 	tx, err := q.c.db.WriteTx(ctx)
 	if err != nil {
@@ -359,6 +371,15 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	if isUnsatisfiable(q.cond) {
 		return
 	}
+
+	// Reclaim tombstones this bulk delete creates once it commits, mirroring the
+	// single-doc mutators. Registered before the commit defer so it runs after
+	// commit; no-ops inside a caller-managed tx (the guard in maybeAutoCompactVectors).
+	defer func() {
+		if err == nil {
+			q.c.maybeAutoCompactVectors(ctx)
+		}
+	}()
 
 	tx, err := q.c.db.WriteTx(ctx)
 	if err != nil {

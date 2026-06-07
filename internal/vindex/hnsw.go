@@ -256,8 +256,10 @@ func (ix *Index) SetHybrid(h bool) { ix.hybrid = h }
 // SetVectorCache enables (or disables) the RAM vector tier (hybrid only): layer-0
 // vector reads come from a RAM slab instead of the btree, making a hop pure-RAM.
 // It caches the btree's exact :vec bytes (int8 if the index is int8), so results
-// are unchanged. RAM cost ≈ liveLabels × vecRecordSize; use int8 to keep it down.
-// Call once right after Create/Open, before concurrent use.
+// are unchanged. RAM cost ≈ nextLabel × vecRecordSize, where nextLabel is the
+// label high-water mark — every delete/replace allocates a fresh label, so this
+// grows with write churn (NOT just the live set) until a Compact resets it. Use
+// int8 to keep it down. Call once right after Create/Open, before concurrent use.
 func (ix *Index) SetVectorCache(v bool) {
 	ix.vecCache = v
 	if v && ix.vtier == nil {
@@ -551,17 +553,12 @@ func (ix *Index) Delete(wtx *btree.WriteTx, docID []byte) (bool, error) {
 // Search
 // ---------------------------------------------------------------------------
 
-// Search returns the k nearest live documents to query. efSearch <= 0 uses the
-// index default.
+// Search returns the k nearest live documents to query, ranked closest-first.
+// efSearch <= 0 uses the index default. It is a thin ranking wrapper over
+// SearchCandidates (which yields the beam in closest-first order); the live
+// query pipeline uses SearchCandidates directly and owns its own sort+limit.
 func (ix *Index) Search(rtx *btree.ReadTx, query []float32, k, efSearch int) ([]Hit, error) {
-	if len(query) != ix.dim {
-		return nil, fmt.Errorf("vindex: dim mismatch: got %d want %d", len(query), ix.dim)
-	}
-	mt, err := ix.readMeta(rtx)
-	if err != nil {
-		return nil, err
-	}
-	if !mt.hasEntry || k <= 0 {
+	if k <= 0 {
 		return nil, nil
 	}
 	ef := efSearch
@@ -569,48 +566,18 @@ func (ix *Index) Search(rtx *btree.ReadTx, query []float32, k, efSearch int) ([]
 		ef = ix.efS
 	}
 	if k > ef {
-		ef = k
+		ef = k // candidate list must cover k
 	}
-
-	s := ix.getSearcher(rtx, query)
-	defer ix.putSearcher(s)
-	if ix.normalize {
-		s.normBuf = normalizeInto(s.normBuf, query)
-		s.query = s.normBuf
-	}
-	s.checkDeleted = mt.deletedCount > 0
-	if ix.hybrid {
-		if s.l0, err = ix.layer0Mirror(rtx, mt); err != nil {
-			return nil, err
-		}
-		if ix.vecCache {
-			if s.tierData, err = ix.vtier.ensure(rtx, ix.vvec, mt.nextLabel); err != nil {
-				return nil, err
-			}
-			s.tierStride = ix.vtier.stride
-		}
-	}
-	ep := mt.entryLabel
-	for lc := mt.topLayer; lc > 0; lc-- {
-		if ep, err = s.greedyClosest(ep, lc); err != nil {
-			return nil, err
-		}
-	}
-	found, err := s.searchLayer(ep, ef, 0)
+	cands, err := ix.SearchCandidates(rtx, query, ef)
 	if err != nil {
 		return nil, err
 	}
-	if k > len(found) {
-		k = len(found)
+	if k > len(cands) {
+		k = len(cands)
 	}
-	out := make([]Hit, 0, k)
-	var kbuf []byte
+	out := make([]Hit, k)
 	for i := 0; i < k; i++ {
-		docID, derr := rtx.Get(ix.vlbl, labelKey(kbuf, found[i].label))
-		if derr != nil {
-			return nil, derr
-		}
-		out = append(out, Hit{DocID: append([]byte(nil), docID...), Distance: found[i].dist})
+		out[i] = Hit{DocID: cands[i].DocID, Distance: cands[i].Distance}
 	}
 	return out, nil
 }

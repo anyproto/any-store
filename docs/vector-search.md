@@ -125,15 +125,25 @@ coll.Find(`{"a":{"$gt":42}, "embedding":[...]}`).Sort("_distance", "-name").Iter
 
 `Iterator.Distance()` returns the row's distance (0 for non-vector queries).
 
+`_distance` is a reserved synthetic field: on a vector query it is injected into
+each result (shadowing any stored field of that name), and referencing it in a
+filter or sort *without* a vector clause is an error (`ErrDistanceWithoutVector`).
+
 ### Limit, offset, and candidate set size
 
-`Limit`/`Offset` apply over the distance-ordered results. When a residual filter is
-selective, the planner over-fetches ANN candidates so the limit still fills.
-`VectorEf(n)` overrides the candidate-list size (recall/speed trade-off):
+`Limit`/`Offset` apply over the distance-ordered results. The ANN candidate list
+is auto-sized to cover `Offset+Limit`, and over-fetched further when a residual
+filter is selective so the page still fills. `VectorEf(n)` overrides the
+candidate-list size (recall/speed trade-off):
 
 ```go
 coll.Find(`{"embedding":[...], "lang":"en"}`).Limit(20).VectorEf(200).Iter(ctx)
 ```
+
+The auto-sized candidate list is capped (~4096) to bound a runaway search, so very
+deep pagination (`Offset+Limit` beyond that) or a very large `Limit` returns fewer
+rows than requested unless you set `VectorEf(n)` explicitly — an explicit `VectorEf`
+is never capped.
 
 ## 4. Errors for malformed queries
 

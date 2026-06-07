@@ -75,6 +75,15 @@ func buildL0Mirror(rtx *btree.ReadTx, ix *Index, gen uint64) (*l0Mirror, error) 
 	return m, nil
 }
 
+// TODO(perf): the mirror is rebuilt wholesale (full :adj scan + fresh maps)
+// whenever l0Gen changes, so the first search after ANY write pays an O(N)
+// rebuild and map-allocation churn — in a mixed read/write workload hybrid mode
+// can lose to plain btree. Two improvements to land later: (1) rebuild
+// incrementally, applying only the labels whose adjacency changed since the last
+// gen (like vecTier grows); (2) back adj/deleted with a flat slice indexed by the
+// dense [0,nextLabel) label space instead of Go maps (cf. vcache.go / u32set) to
+// cut RAM, hashing and GC scan cost.
+//
 // layer0Mirror returns a mirror whose gen matches mt.l0Gen, building one if the
 // cached mirror is absent or stale. The returned mirror is the one the caller
 // must use for this search (its gen == the read snapshot's l0Gen). The cache

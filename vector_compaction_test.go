@@ -226,6 +226,46 @@ func TestVectorIndex_CompactAuto(t *testing.T) {
 	assert.Equal(t, idBytesOf(n-1), hits[0].DocId)
 }
 
+// TestVectorIndex_CompactAuto_BulkDelete verifies CompactRatio also fires after a
+// query-based bulk delete (coll.Find(...).Delete()), not just the single-doc
+// mutators — the tombstones a bulk delete creates are reclaimed once it commits.
+func TestVectorIndex_CompactAuto_BulkDelete(t *testing.T) {
+	const (
+		n   = 400
+		dim = 16
+	)
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{
+		Name: "emb", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 64, CompactRatio: 0.5},
+	}))
+	vecs := vrand(n, dim, 13)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+
+	// One bulk delete of half the corpus — well past the 0.5 ratio — in a single
+	// self-contained write. Auto-compaction must reclaim the tombstones it creates.
+	res, err := coll.Find(`{"id":{"$lt":200}}`).Delete(ctx)
+	require.NoError(t, err)
+	require.EqualValues(t, 200, res.Modified)
+
+	final := vstat(t, coll, "emb")
+	t.Logf("bulk-delete auto-compact: live=%d deleted=%d node=%d",
+		final.LiveCount, final.DeletedCount, final.NodeCount)
+	assert.Equal(t, 200, final.LiveCount)
+	assert.Equal(t, 0, final.DeletedCount, "bulk delete should have triggered auto-compaction")
+	assert.LessOrEqual(t, final.NodeCount, 200, "node space should be densified to the live set")
+
+	// Search still serves the surviving live set.
+	hits, err := vsearch(coll, "v", vecs[n-1], 1, 64)
+	require.NoError(t, err)
+	require.Len(t, hits, 1)
+	assert.Equal(t, idBytesOf(n-1), hits[0].DocId)
+}
+
 // TestVectorIndex_CompactAuto_DeferredInUserTx verifies auto-compaction does NOT
 // run inside a caller-managed transaction (it needs its own committed tx), but
 // does run on the next self-contained write.

@@ -248,3 +248,39 @@ func TestPipeline_Limit(t *testing.T) {
 	assert.LessOrEqual(t, count, 10)
 	assert.Greater(t, count, 0)
 }
+
+// TestPipeline_Offset: Offset pages the distance-ordered ANN results. The
+// candidate list is sized for Offset+Limit, so a later page still fills and its
+// window matches the corresponding slice of the full ranking (C2).
+func TestPipeline_Offset(t *testing.T) {
+	const dim = 16
+	coll, vecs := setupPipeline(t, 800, dim)
+	qv := vqJSON(vecs[5])
+
+	collect := func(query Query) []string {
+		iter, err := query.Iter(ctx)
+		require.NoError(t, err)
+		defer iter.Close()
+		var (
+			ids  []string
+			prev float32 = -1
+		)
+		for iter.Next() {
+			d, derr := iter.Doc()
+			require.NoError(t, derr)
+			dist := iter.Distance()
+			assert.GreaterOrEqual(t, dist, prev, "results not in distance order")
+			prev = dist
+			ids = append(ids, string(d.Value().Get("id").MarshalTo(nil)))
+		}
+		require.NoError(t, iter.Err())
+		return ids
+	}
+
+	full := collect(coll.Find(fmt.Sprintf(`{"v":%s}`, qv)).Limit(20))
+	require.Len(t, full, 20)
+
+	page2 := collect(coll.Find(fmt.Sprintf(`{"v":%s}`, qv)).Limit(10).Offset(10))
+	require.Len(t, page2, 10, "offset page must still fill")
+	assert.Equal(t, full[10:20], page2, "offset window must match the full-ranking slice")
+}

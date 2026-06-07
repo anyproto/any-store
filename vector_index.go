@@ -432,10 +432,15 @@ func (q *collQuery) detectVectorQuery() (*qplanner.VectorQuerySpec, query.Filter
 		}
 		return spec, residual, nil
 	}
-	ef := chooseEf(int(q.vectorEf), vi.ix.EfSearch(), int(q.limit), residual != nil)
+	// Size the candidate list for the whole window the caller will page through
+	// (offset+limit), over-fetching when a residual filter will discard some. The
+	// limit/offset themselves are still applied downstream by Sort/LimitIter over
+	// the post-filter stream — ef only governs how many candidates the ANN yields.
+	ef := chooseEf(int(q.vectorEf), vi.ix.EfSearch(), int(q.limit)+int(q.offset), residual != nil)
 	spec := &qplanner.VectorQuerySpec{
-		Query: qvec,
-		Ef:    ef,
+		Query:   qvec,
+		Ef:      ef,
+		Ordered: true, // SearchCandidates yields candidates closest-first
 		Search: func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
 			cands, err := captured.ix.SearchCandidates(tx, qv, ef)
 			if err != nil {
@@ -665,15 +670,19 @@ func (c *collection) maybeAutoCompactVectors(ctx context.Context) {
 	if !enabled {
 		return
 	}
+	// The threshold check only reads each index's meta record (live/deleted
+	// counts), so a fast read tx — no checkStale/reconcile/sketch-reload — is
+	// enough. A momentarily stale count at worst defers a compaction by one write,
+	// which is harmless for this heuristic.
 	var due []string
-	_ = c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+	if rtx, rerr := c.db.btreeDB.BeginReadFast(); rerr == nil {
 		for _, vi := range vidxs {
-			if over, err := vi.overThreshold(tx); err == nil && over {
+			if over, err := vi.overThreshold(rtx); err == nil && over {
 				due = append(due, vi.info.Name)
 			}
 		}
-		return nil
-	})
+		_ = rtx.Rollback()
+	}
 	for _, name := range due {
 		// Best-effort: a concurrent writer may have compacted already, in which
 		// case Compact is a no-op. Errors here must not fail the user's write.

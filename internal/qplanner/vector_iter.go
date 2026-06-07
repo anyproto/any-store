@@ -31,6 +31,11 @@ type VectorQuerySpec struct {
 	Query  []float32
 	Ef     int
 	Search VectorSearchFunc
+	// Ordered is true when Search returns candidates already sorted closest-first
+	// (the ANN path). The planner can then skip the SortIter for the default
+	// distance-ascending order. Brute-force search leaves it false (its candidates
+	// come back in document order), so a distance SortIter is always applied.
+	Ordered bool
 }
 
 // VectorIter is the source iterator for a vector query. On first Next it runs
