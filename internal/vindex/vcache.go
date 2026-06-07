@@ -39,7 +39,13 @@ type vecCache struct {
 	count int // cached vectors this generation
 }
 
-const vecCacheBlockVecs = 256 // vectors per arena block
+// Arena block size: a power of two so slotSlice resolves a slot with a shift +
+// mask instead of integer division/modulo (it runs on every cache hit).
+const (
+	vecCacheBlockVecs  = 256 // vectors per arena block (1 << shift)
+	vecCacheBlockShift = 8
+	vecCacheBlockMask  = vecCacheBlockVecs - 1
+)
 
 // reset prepares the cache for a new batch. Allocation-free once dim and capVecs
 // are stable (the arena blocks and probe table are reused): it just rewinds the
@@ -106,10 +112,11 @@ func (c *vecCache) reserve(label uint32) ([]float32, bool) {
 	return dst, false
 }
 
-// slotSlice resolves an arena slot to its dim-length backing slice.
+// slotSlice resolves an arena slot to its dim-length backing slice. block is a
+// power of two, so the block index and in-block offset are a shift and a mask.
 func (c *vecCache) slotSlice(slot int32) []float32 {
-	b := int(slot) / c.block
-	o := (int(slot) % c.block) * c.dim
+	b := int(slot) >> vecCacheBlockShift
+	o := (int(slot) & vecCacheBlockMask) * c.dim
 	return c.blocks[b][o : o+c.dim]
 }
 
