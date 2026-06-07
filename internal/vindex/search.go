@@ -33,6 +33,10 @@ func (ix *Index) SearchCandidates(rtx *btree.ReadTx, query []float32, ef int) ([
 	}
 	s := ix.getSearcher(rtx, query)
 	defer ix.putSearcher(s)
+	if ix.normalize {
+		s.normBuf = normalizeInto(s.normBuf, query)
+		s.query = s.normBuf
+	}
 	s.checkDeleted = mt.deletedCount > 0
 	if ix.hybrid {
 		if s.l0, err = ix.layer0Mirror(rtx, mt); err != nil {
@@ -101,6 +105,10 @@ type searcher struct {
 	vf2   []float32 // aliases vbuf2 — vector B (held during pairwise prune)
 	qbuf  []byte    // quantized-record read buffer for vf (int8 mode)
 	qbuf2 []byte    // quantized-record read buffer for vf2 (int8 mode)
+
+	// normBuf holds the unit-normalized query for a Cosine index (the stored
+	// vectors are normalized too, so distance is a dot product). Reused per op.
+	normBuf []float32
 
 	adjbuf  []byte
 	nbrs    []uint32

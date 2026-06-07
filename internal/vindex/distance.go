@@ -70,6 +70,36 @@ func l2SIMD(a, b []float32) float32         { return vek32.Distance(a, b) }
 func cosineDistance(a, b []float32) float32 { return 1 - vek32.CosineSimilarity(a, b) }
 func dotDistance(a, b []float32) float32    { return -vek32.Dot(a, b) }
 
+// cosineDotDistance is the cosine kernel for an index that stores unit-normalized
+// vectors (and normalizes queries): with both operands unit length, cosine
+// similarity is just their dot product, so this returns the SAME value as
+// cosineDistance (1 - cos) but via the cheaper Dot kernel (no per-call norms).
+func cosineDotDistance(a, b []float32) float32 { return 1 - vek32.Dot(a, b) }
+
+// normalizeInto writes the unit-normalized v into dst (reusing dst's capacity)
+// and returns it. A zero vector is copied through unchanged (norm 0 → leave as
+// zeros; its distance to anything is then 1, i.e. maximally far).
+func normalizeInto(dst, v []float32) []float32 {
+	if cap(dst) < len(v) {
+		dst = make([]float32, len(v))
+	} else {
+		dst = dst[:len(v)]
+	}
+	var ss float32
+	for _, x := range v {
+		ss += x * x
+	}
+	if ss == 0 {
+		copy(dst, v)
+		return dst
+	}
+	inv := float32(1 / math.Sqrt(float64(ss)))
+	for i, x := range v {
+		dst[i] = x * inv
+	}
+	return dst
+}
+
 // l2Unrolled is a 4-accumulator Euclidean distance for CPUs without SIMD.
 func l2Unrolled(a, b []float32) float32 {
 	var s0, s1, s2, s3 float32

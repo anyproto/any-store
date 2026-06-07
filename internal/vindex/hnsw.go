@@ -70,6 +70,11 @@ type Index struct {
 
 	dist DistanceFunc
 
+	// normalize is set for the Cosine metric: vectors are unit-normalized on write
+	// and queries on read, so dist is the dot-product cosine kernel
+	// (cosineDotDistance) — same distance values, cheaper than recomputing norms.
+	normalize bool
+
 	// hybrid enables the RAM layer-0 mirror on the read path (set by the caller
 	// for VectorModeHybrid). l0pub holds the most recently built mirror as a
 	// lock-free cache; a search only uses a mirror whose gen matches its snapshot.
@@ -207,13 +212,20 @@ func OpenTx(rtx *btree.ReadTx, prefix string, seed int64) (*Index, error) {
 }
 
 func newIndex(ns [5]*btree.Namespace, dim, m, m0, efC, efS int, ml float64, metric Metric, quant Quantization, seed int64) *Index {
-	return &Index{
+	ix := &Index{
 		vmeta: ns[0], vvec: ns[1], vadj: ns[2], vdoc: ns[3], vlbl: ns[4],
 		dim: dim, m: m, m0: m0, efC: efC, efS: efS, ml: ml, quant: quant,
 		dist:      distanceFor(metric),
 		rng:       rand.New(rand.NewSource(seed)),
 		vcacheCap: defaultInsertCacheVecs,
 	}
+	if metric == Cosine {
+		// Store unit-normalized vectors and normalize queries, so every distance is
+		// a dot product instead of a cosine (which recomputes both norms per call).
+		ix.normalize = true
+		ix.dist = cosineDotDistance
+	}
+	return ix
 }
 
 // defaultInsertCacheVecs is the default per-batch insert vector cache size, in
@@ -309,6 +321,17 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 	}
 	mt.l0Gen++ // this insert changes layer 0 (new node + back-links)
 
+	// One searcher for the whole insert: it also owns the normalize buffer, so
+	// the normalized vector is stored AND used as the traversal query (one norm).
+	s := ix.getSearcher(rtx, vec)
+	defer ix.putSearcher(s)
+	if ix.normalize {
+		s.normBuf = normalizeInto(s.normBuf, vec)
+		s.query = s.normBuf // traversal compares against normalized stored vectors
+		vec = s.normBuf     // and the stored :vec record is normalized too
+	}
+	s.beginVecCache() // serve repeated per-insert vector reads from RAM (lever 1)
+
 	// replace existing
 	if old, gerr := rtx.Get(ix.vdoc, docID); gerr == nil {
 		oldLabel := binary.LittleEndian.Uint32(old)
@@ -357,9 +380,6 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 		return ix.writeMeta(wtx, mt)
 	}
 
-	s := ix.getSearcher(rtx, vec)
-	defer ix.putSearcher(s)
-	s.beginVecCache() // serve repeated per-insert vector reads from RAM (lever 1)
 	s.checkDeleted = mt.deletedCount > 0
 	ep := mt.entryLabel
 	for lc := mt.topLayer; lc > level; lc-- {
@@ -554,6 +574,10 @@ func (ix *Index) Search(rtx *btree.ReadTx, query []float32, k, efSearch int) ([]
 
 	s := ix.getSearcher(rtx, query)
 	defer ix.putSearcher(s)
+	if ix.normalize {
+		s.normBuf = normalizeInto(s.normBuf, query)
+		s.query = s.normBuf
+	}
 	s.checkDeleted = mt.deletedCount > 0
 	if ix.hybrid {
 		if s.l0, err = ix.layer0Mirror(rtx, mt); err != nil {
