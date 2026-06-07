@@ -79,6 +79,13 @@ type Collection interface {
 	// ordered closest-first.
 	VectorSearch(ctx context.Context, indexName string, query []float32, k, efSearch int) (hits []VectorHit, err error)
 
+	// CompactVectorIndex rebuilds the named vector index from its live vectors,
+	// reclaiming nodes and storage left behind by deletes and replaces (which only
+	// tombstone). It is synchronous and holds the write lock for the rebuild;
+	// prefer a maintenance window for large indexes. No-op when nothing is
+	// reclaimable or for a brute-force index. Returns ErrIndexNotFound if absent.
+	CompactVectorIndex(ctx context.Context, indexName string) error
+
 	// Stats returns the storage footprint of the collection: document count,
 	// stored and uncompressed sizes, compression ratio and per-index sizes.
 	// It scans the whole collection and is intended for diagnostics.
@@ -373,6 +380,11 @@ func (c *collection) insertItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, it i
 }
 
 func (c *collection) UpdateOne(ctx context.Context, doc *anyenc.Value) (err error) {
+	defer func() {
+		if err == nil {
+			c.maybeAutoCompactVectors(ctx)
+		}
+	}()
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
@@ -387,6 +399,11 @@ func (c *collection) UpdateOne(ctx context.Context, doc *anyenc.Value) (err erro
 }
 
 func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error) {
+	defer func() {
+		if err == nil {
+			c.maybeAutoCompactVectors(ctx)
+		}
+	}()
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
@@ -418,6 +435,11 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 }
 
 func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error) {
+	defer func() {
+		if err == nil {
+			c.maybeAutoCompactVectors(ctx)
+		}
+	}()
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
@@ -536,6 +558,11 @@ func (c *collection) loadById(tx *btree.WriteTx, buf *syncpool.DocBuffer, id any
 }
 
 func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err error) {
+	defer func() {
+		if err == nil {
+			c.maybeAutoCompactVectors(ctx)
+		}
+	}()
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
@@ -558,6 +585,11 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err erro
 }
 
 func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
+	defer func() {
+		if err == nil {
+			c.maybeAutoCompactVectors(ctx)
+		}
+	}()
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 

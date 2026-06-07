@@ -27,10 +27,11 @@ type VectorHit struct {
 // field and keys the graph by the document id. It mutates inside the collection
 // write transaction, exactly like the range index's insertKeys/deleteKeys.
 type vectorIndex struct {
-	info      IndexInfo
-	fieldPath []string
-	dim       int
-	mode      VectorMode
+	info         IndexInfo
+	fieldPath    []string
+	dim          int
+	mode         VectorMode
+	compactRatio float64
 	// ix is the btree-resident HNSW graph for btree/hybrid modes; it is nil for
 	// brute-force mode, which stores no index data (search scans the documents).
 	ix *vindex.Index
@@ -71,11 +72,12 @@ func validateVectorParams(p *VectorParams) error {
 
 func newVectorIndexFromVindex(info IndexInfo, ix *vindex.Index) *vectorIndex {
 	return &vectorIndex{
-		info:      info,
-		fieldPath: strings.Split(info.Vector.Field, "."),
-		dim:       info.Vector.Dim,
-		mode:      info.Vector.Mode,
-		ix:        ix,
+		info:         info,
+		fieldPath:    strings.Split(info.Vector.Field, "."),
+		dim:          info.Vector.Dim,
+		mode:         info.Vector.Mode,
+		compactRatio: info.Vector.CompactRatio,
+		ix:           ix,
 	}
 }
 
@@ -159,6 +161,55 @@ func float32sEqual(a, b []float32) bool {
 }
 
 func (vi *vectorIndex) Info() IndexInfo { return vi.info }
+
+// rootUnchanged reports whether the index's on-disk :meta namespace still has the
+// btree root page this object was opened against. It returns false after a
+// compaction recreated the namespaces (root moved), which means the object's
+// handles are stale and it must be reopened. Brute-force indexes (no namespaces)
+// are always "unchanged". A transient resolution failure returns true so a
+// working index is not dropped over a momentary view.
+func (vi *vectorIndex) rootUnchanged(tx *btree.ReadTx, collName string) bool {
+	if vi.ix == nil {
+		return true
+	}
+	ns, err := tx.GetNamespace(vectorIndexNsPrefix(collName, vi.info.Name) + ":meta")
+	if err != nil {
+		return true
+	}
+	return ns.RootPage() == vi.ix.MetaRoot()
+}
+
+// compact rebuilds the HNSW graph from its live vectors, reclaiming tombstones
+// and superseded vectors, and returns a fresh *vectorIndex bound to the rebuilt
+// namespaces (re-applying the mode's hybrid/vector-cache settings). Brute-force
+// has no graph, so it is returned unchanged.
+func (vi *vectorIndex) compact(tx *btree.WriteTx, collName string) (*vectorIndex, error) {
+	if vi.ix == nil {
+		return vi, nil
+	}
+	prefix := vectorIndexNsPrefix(collName, vi.info.Name)
+	ix, err := vindex.Compact(tx, prefix, vectorIndexSeed(collName, vi.info.Name))
+	if err != nil {
+		return nil, err
+	}
+	hybrid := vi.info.Vector.Mode == VectorModeHybrid
+	ix.SetHybrid(hybrid)
+	ix.SetVectorCache(hybrid && vi.info.Vector.HybridCacheVectors)
+	return newVectorIndexFromVindex(vi.info, ix), nil
+}
+
+// overThreshold reports whether tombstones have reached compactRatio × live
+// nodes (so an auto-compaction is due). Cheap: one meta read, no namespace walk.
+func (vi *vectorIndex) overThreshold(tx *btree.ReadTx) (bool, error) {
+	if vi.ix == nil || vi.compactRatio <= 0 {
+		return false, nil
+	}
+	live, deleted, _, err := vi.ix.Counts(tx)
+	if err != nil {
+		return false, err
+	}
+	return deleted > 0 && float64(deleted) >= vi.compactRatio*float64(live), nil
+}
 
 // loadVectorIndex resolves an existing vector index from persisted info using
 // the provided read transaction (no nested read tx).
@@ -268,14 +319,23 @@ func (c *collection) reconcileVectorIndexesLocked(tx *btree.ReadTx, infos []Inde
 		if info.Kind != IndexKindVector {
 			continue
 		}
-		if existing, ok := byName[info.Name]; ok {
+		if existing, ok := byName[info.Name]; ok && existing.rootUnchanged(tx, c.name) {
 			rebuilt = append(rebuilt, existing)
 			continue
 		}
+		// New index, or a compaction recreated the namespaces under the same name
+		// (root page moved) so the existing object's handles are stale — reopen
+		// with fresh handles. This mirrors the range-index reconcile's
+		// root-moved-via-drop+recreate path.
 		vi, err := c.loadVectorIndex(tx, info)
 		if err != nil {
-			// not resolvable in this snapshot — skip this round
-			changed = true
+			// not resolvable in this snapshot — keep any existing object rather than
+			// dropping a working index over a transient view; retry next round.
+			if existing, ok := byName[info.Name]; ok {
+				rebuilt = append(rebuilt, existing)
+			} else {
+				changed = true
+			}
 			continue
 		}
 		rebuilt = append(rebuilt, vi)
@@ -537,6 +597,83 @@ func (c *collection) VectorSearch(ctx context.Context, indexName string, query [
 		return nil
 	})
 	return hits, err
+}
+
+// CompactVectorIndex rebuilds the named vector index from its live vectors,
+// reclaiming the storage and graph quality lost to tombstoned (deleted or
+// replaced) nodes and re-densifying labels. It is synchronous and single-writer:
+// it holds the write lock for the whole O(live) rebuild, so prefer a maintenance
+// window for large indexes. It is a no-op when there is nothing to reclaim or
+// for a brute-force index (no graph). Returns ErrIndexNotFound if no vector index
+// with that name exists.
+func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) error {
+	return c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		cur := c.loadVectorIndexes()
+		idx := -1
+		for i, vi := range cur {
+			if vi.info.Name == indexName {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return fmt.Errorf("%w: vector index %q", ErrIndexNotFound, indexName)
+		}
+		vi := cur[idx]
+		if vi.ix == nil {
+			return nil // brute-force: no graph to compact
+		}
+		// Recreating the namespaces moves their root pages; MarkSchemaChanged so
+		// peers reconcile and reopen the index with fresh handles.
+		tx.MarkSchemaChanged()
+		nvi, err := vi.compact(tx, c.name)
+		if err != nil {
+			return err
+		}
+		next := make([]*vectorIndex, len(cur))
+		copy(next, cur)
+		next[idx] = nvi
+		c.storeVectorIndexes(next)
+		return nil
+	})
+}
+
+// maybeAutoCompactVectors runs synchronous auto-compaction for any vector index
+// whose tombstone ratio crossed its CompactRatio. It is invoked after a
+// self-contained write commits. It MUST NOT run inside a caller-managed
+// transaction — compaction needs its own committed tx — so it no-ops when ctx
+// already carries one (the caller can compact manually after their tx).
+func (c *collection) maybeAutoCompactVectors(ctx context.Context) {
+	if ctx.Value(ctxKeyTx) != nil {
+		return
+	}
+	vidxs := c.loadVectorIndexes()
+	enabled := false
+	for _, vi := range vidxs {
+		if vi.ix != nil && vi.compactRatio > 0 {
+			enabled = true
+			break
+		}
+	}
+	if !enabled {
+		return
+	}
+	var due []string
+	_ = c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		for _, vi := range vidxs {
+			if over, err := vi.overThreshold(tx); err == nil && over {
+				due = append(due, vi.info.Name)
+			}
+		}
+		return nil
+	})
+	for _, name := range due {
+		// Best-effort: a concurrent writer may have compacted already, in which
+		// case Compact is a no-op. Errors here must not fail the user's write.
+		_ = c.CompactVectorIndex(ctx, name)
+	}
 }
 
 func (c *collection) findVectorIndex(name string) *vectorIndex {

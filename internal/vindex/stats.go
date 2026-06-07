@@ -23,6 +23,18 @@ type Stats struct {
 	Meta btree.NamespaceSize // params + entry point
 }
 
+// Counts returns the live, tombstoned, and total-ever node counts from the meta
+// record alone — one btree read, no namespace walk. Cheap enough for a
+// per-write compaction-threshold check (deleted/live ratio). total is the
+// physical label high-water mark (live + tombstones).
+func (ix *Index) Counts(rtx *btree.ReadTx) (live, deleted, total int, err error) {
+	mt, err := ix.readMeta(rtx)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return int(mt.count), int(mt.deletedCount), int(mt.nextLabel), nil
+}
+
 // Stats reads the index meta and walks each namespace to produce a storage and
 // occupancy summary for the index as seen by rtx's snapshot.
 func (ix *Index) Stats(rtx *btree.ReadTx) (Stats, error) {

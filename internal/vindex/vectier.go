@@ -39,6 +39,11 @@ func newVecTier(stride int) *vecTier { return &vecTier{stride: stride} }
 // returned slice is safe to use without the lock for the duration of one search:
 // the slab only grows (it may be reallocated by a later ensure, but this slice
 // keeps pointing at a valid, immutable copy of every label it already covers).
+//
+// A Compact rebuilds the graph and reuses labels for DIFFERENT vectors, but it
+// also moves the index's namespace root pages, so the collection reopens the
+// Index with a fresh (empty) tier — this slab is never reused across a
+// compaction, which is why no epoch/versioning is needed here.
 func (t *vecTier) ensure(rtx *btree.ReadTx, ns *btree.Namespace, upto uint32) ([]byte, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
