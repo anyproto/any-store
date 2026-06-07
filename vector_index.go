@@ -291,7 +291,10 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 		}
 	}
 
-	ix, err := vindex.BulkBuild(tx, prefix, p, vectorIndexSeed(c.name, info.Name), ids, vecs)
+	// Parallel in-RAM build (graph constructed concurrently in RAM, then flushed
+	// single-threaded) — ~17x faster than per-insert at scale. threads=0 → GOMAXPROCS.
+	// The parallel phase touches only RAM; tx is used single-threaded in the flush.
+	ix, err := vindex.BulkBuildParallel(tx, prefix, p, vectorIndexSeed(c.name, info.Name), ids, vecs, 0)
 	if err != nil {
 		return nil, err
 	}
