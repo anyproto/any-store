@@ -113,6 +113,85 @@ func (c *vecCache) slotSlice(slot int32) []float32 {
 	return c.blocks[b][o : o+c.dim]
 }
 
+// u32set is a flat open-addressing set of uint32 labels with O(1) reset — the
+// search frontier's "visited" set. It replaces a map[uint32]struct{}: labels are
+// dense uint32, so linear probing over a power-of-two table (with the lowbias32
+// mix) beats the Go map's hashing + control-byte scan, and reset() bumps a
+// generation tag instead of clearing. Owned by a pooled searcher and reused
+// across layer searches; all fields are pointer-free (no GC scan cost).
+type u32set struct {
+	key  []uint32
+	seen []uint32 // position occupied iff seen[i]==gen
+	gen  uint32
+	mask uint32
+	n    int
+}
+
+// reset clears the set in O(1) (after the first call): it bumps the generation
+// so every prior entry reads as empty, keeping the backing arrays for reuse.
+func (s *u32set) reset() {
+	if s.key == nil {
+		const init = 2048 // power of two; grows on demand
+		s.key = make([]uint32, init)
+		s.seen = make([]uint32, init)
+		s.mask = uint32(init - 1)
+		s.gen = 1
+		s.n = 0
+		return
+	}
+	s.n = 0
+	s.gen++
+	if s.gen == 0 { // wrapped: stale tags could false-hit, so clear once
+		for i := range s.seen {
+			s.seen[i] = 0
+		}
+		s.gen = 1
+	}
+}
+
+// visit marks label as seen and reports whether it was newly added (true) or
+// already present (false) — i.e. it folds the map's "check then set" into one op.
+func (s *u32set) visit(label uint32) bool {
+	pos := hashU32(label) & s.mask
+	for s.seen[pos] == s.gen {
+		if s.key[pos] == label {
+			return false
+		}
+		pos = (pos + 1) & s.mask
+	}
+	if s.n >= int(s.mask-s.mask/4) { // keep load < 0.75
+		s.grow()
+		pos = hashU32(label) & s.mask
+		for s.seen[pos] == s.gen {
+			pos = (pos + 1) & s.mask
+		}
+	}
+	s.seen[pos] = s.gen
+	s.key[pos] = label
+	s.n++
+	return true
+}
+
+func (s *u32set) grow() {
+	size := len(s.key) * 2
+	nkey := make([]uint32, size)
+	nseen := make([]uint32, size)
+	nmask := uint32(size - 1)
+	g := s.gen
+	for i := range s.key {
+		if s.seen[i] != g {
+			continue
+		}
+		p := hashU32(s.key[i]) & nmask
+		for nseen[p] == g {
+			p = (p + 1) & nmask
+		}
+		nseen[p] = g
+		nkey[p] = s.key[i]
+	}
+	s.key, s.seen, s.mask = nkey, nseen, nmask
+}
+
 // hashU32 is the lowbias32 integer finalizer — a fast, well-distributed mix for
 // dense-ish uint32 labels (avoids the clustering a plain identity hash would
 // cause under linear probing).

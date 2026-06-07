@@ -105,7 +105,7 @@ type searcher struct {
 	adjbuf  []byte
 	nbrs    []uint32
 	keyBuf  []byte
-	visited map[uint32]struct{}
+	visited u32set // search frontier's visited set (flat, O(1) reset)
 
 	cand cheap
 	res  cheap
@@ -155,14 +155,13 @@ func (ix *Index) newSearcher(rtx *btree.ReadTx, query []float32) *searcher {
 	vf := make([]float32, ix.dim)
 	vf2 := make([]float32, ix.dim)
 	return &searcher{
-		ix:      ix,
-		rtx:     rtx,
-		query:   query,
-		vf:      vf,
-		vbuf:    f32bytes(vf),
-		vf2:     vf2,
-		vbuf2:   f32bytes(vf2),
-		visited: make(map[uint32]struct{}, 256),
+		ix:    ix,
+		rtx:   rtx,
+		query: query,
+		vf:    vf,
+		vbuf:  f32bytes(vf),
+		vf2:   vf2,
+		vbuf2: f32bytes(vf2),
 	}
 }
 
@@ -416,7 +415,7 @@ func (s *searcher) greedyClosest(ep uint32, layer int32) (uint32, error) {
 // expanded (they route) but never enter the result set. Returns results
 // closest-first.
 func (s *searcher) searchLayer(ep uint32, ef int, layer int32) ([]candidate, error) {
-	clear(s.visited)
+	s.visited.reset()
 	s.cand.reset(false)
 	s.res.reset(true)
 
@@ -425,7 +424,7 @@ func (s *searcher) searchLayer(ep uint32, ef int, layer int32) ([]candidate, err
 		return nil, err
 	}
 	d0 := s.ix.dist(s.query, ev)
-	s.visited[ep] = struct{}{}
+	s.visited.visit(ep)
 	s.cand.push(candidate{d0, ep})
 	epDel := false
 	if s.checkDeleted {
@@ -449,10 +448,9 @@ func (s *searcher) searchLayer(ep uint32, ef int, layer int32) ([]candidate, err
 			return nil, nerr
 		}
 		for _, nb := range nbrs {
-			if _, seen := s.visited[nb]; seen {
-				continue
+			if !s.visited.visit(nb) {
+				continue // already seen
 			}
-			s.visited[nb] = struct{}{}
 			nv, err := s.vecOf(nb)
 			if err != nil {
 				return nil, err
