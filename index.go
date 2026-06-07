@@ -22,8 +22,8 @@ const (
 	// IndexKindRange is the default B-tree range/equality index.
 	IndexKindRange IndexKind = iota
 	// IndexKindVector is an HNSW approximate-nearest-neighbour index over a
-	// vector (embedding) field. Queried via Collection.VectorSearch, not the
-	// normal filter path.
+	// vector (embedding) field. Queried via Find() with a `{field: [vector]}`
+	// clause; results carry a synthetic _distance field (see docs/vector-search.md).
 	IndexKindVector
 )
 

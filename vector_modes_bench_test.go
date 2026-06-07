@@ -149,12 +149,12 @@ func TestVectorModesCompare(t *testing.T) {
 		require.NoError(t, db.Flush(ctx, 0, FlushModeCheckpointTruncate))
 
 		// warm (build the hybrid mirror) then measure search + recall
-		_, err = coll.VectorSearch(ctx, "emb", queries[0], k, 0)
+		_, err = vsearch(coll, "v", queries[0], k, 0)
 		require.NoError(t, err)
 		hitSum := 0
 		t1 := time.Now()
 		for i, q := range queries {
-			hh, err := coll.VectorSearch(ctx, "emb", q, k, 0)
+			hh, err := vsearch(coll, "v", q, k, 0)
 			require.NoError(t, err)
 			for _, h := range hh {
 				if truth[i][string(h.DocId)] {

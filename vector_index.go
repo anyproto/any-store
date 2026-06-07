@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -13,14 +12,6 @@ import (
 	"github.com/anyproto/any-store/v2/internal/vindex"
 	"github.com/anyproto/any-store/v2/query"
 )
-
-// VectorHit is a single vector-search result.
-type VectorHit struct {
-	// DocId is the marshaled document id (as stored by the collection).
-	DocId []byte
-	// Distance to the query (smaller is closer).
-	Distance float32
-}
 
 // vectorIndex wraps a btree-resident HNSW (internal/vindex) and bridges it to
 // any-store documents: it extracts the embedding from the document's vector
@@ -350,6 +341,15 @@ func (c *collection) reconcileVectorIndexesLocked(tx *btree.ReadTx, infos []Inde
 // vector-indexed field (unsupported).
 var ErrMultipleVectorClauses = errors.New("any-store: query has multiple vector clauses")
 
+// ErrInvalidVectorQuery is returned when a clause targets a vector-indexed field
+// but isn't a valid ANN clause: it must be an equality against a numeric array of
+// the index's dimension, e.g. {embedding: [..dim floats..]}.
+var ErrInvalidVectorQuery = errors.New("any-store: invalid vector query clause")
+
+// ErrDistanceWithoutVector is returned when the synthetic _distance field is used
+// in a filter or sort but the query has no vector clause to produce it.
+var ErrDistanceWithoutVector = errors.New("any-store: _distance is only available in a vector query")
+
 // detectVectorQuery inspects the parsed filter for an equality on a
 // vector-indexed field (`{vectorField: [..]}`). If found it returns a planner
 // spec and the residual filter (the original filter minus the vector clause —
@@ -358,6 +358,10 @@ var ErrMultipleVectorClauses = errors.New("any-store: query has multiple vector 
 func (q *collQuery) detectVectorQuery() (*qplanner.VectorQuerySpec, query.Filter, error) {
 	vidxs := q.c.loadVectorIndexes()
 	if len(vidxs) == 0 || q.cond == nil {
+		// No vector clause is possible, so _distance (in filter or sort) is invalid.
+		if filterRefsField(q.cond, qplanner.DistanceField) || sortRefsField(q.sort, qplanner.DistanceField) {
+			return nil, nil, ErrDistanceWithoutVector
+		}
 		return nil, q.cond, nil
 	}
 
@@ -373,26 +377,39 @@ func (q *collQuery) detectVectorQuery() (*qplanner.VectorQuerySpec, query.Filter
 	var vi *vectorIndex
 	var qvec []float32
 	for i, cl := range clauses {
-		path, comp, ok := asEqClause(cl)
-		if !ok {
+		k, isKey := cl.(query.Key)
+		if !isKey {
 			continue
 		}
-		field := strings.Join(path, ".")
-		for _, v := range vidxs {
-			if v.info.Vector.Field != field {
-				continue
-			}
-			vec, derr := decodeVectorValue(comp.EqValue, v.dim)
-			if derr != nil {
-				continue // value isn't a dim-sized numeric array — not an ANN query
-			}
-			if vecIdx >= 0 {
-				return nil, nil, ErrMultipleVectorClauses
-			}
-			vecIdx, vi, qvec = i, v, vec
+		field := strings.Join(k.Path, ".")
+		v := findVectorIndexByField(vidxs, field)
+		if v == nil {
+			continue // ordinary (non-vector) field clause
 		}
+		// The clause targets a vector-indexed field, so it must be a valid ANN
+		// clause — an equality against a dim-sized numeric array. Anything else
+		// (a range op, a scalar, a wrong-dim array) is a mistake, not a silent
+		// fall-through to a literal field match.
+		comp, isComp := k.Filter.(*query.Comp)
+		if !isComp || comp.CompOp != query.CompOpEq {
+			return nil, nil, fmt.Errorf("%w: field %q must be an equality against a %d-dim array", ErrInvalidVectorQuery, field, v.dim)
+		}
+		vec, derr := decodeVectorValue(comp.EqValue, v.dim)
+		if derr != nil {
+			return nil, nil, fmt.Errorf("%w: field %q: %v", ErrInvalidVectorQuery, field, derr)
+		}
+		if vecIdx >= 0 {
+			return nil, nil, ErrMultipleVectorClauses
+		}
+		vecIdx, vi, qvec = i, v, vec
 	}
 	if vecIdx < 0 {
+		// Not a vector query: _distance is synthetic and only produced by a vector
+		// search, so referencing it in a filter or sort here is an error rather
+		// than a silent match-everything / sort-on-nothing.
+		if filterRefsField(q.cond, qplanner.DistanceField) || sortRefsField(q.sort, qplanner.DistanceField) {
+			return nil, nil, ErrDistanceWithoutVector
+		}
 		return nil, q.cond, nil
 	}
 
@@ -429,18 +446,50 @@ func (q *collQuery) detectVectorQuery() (*qplanner.VectorQuerySpec, query.Filter
 	return spec, residual, nil
 }
 
-// asEqClause returns the field path and Comp for a `{field: value}` equality
-// clause (a query.Key wrapping a CompOpEq), else ok=false.
-func asEqClause(cl query.Filter) (path []string, comp *query.Comp, ok bool) {
-	k, isKey := cl.(query.Key)
-	if !isKey {
-		return nil, nil, false
+// findVectorIndexByField returns the vector index whose embedding field path
+// matches field, or nil.
+func findVectorIndexByField(vidxs []*vectorIndex, field string) *vectorIndex {
+	for _, v := range vidxs {
+		if v.info.Vector.Field == field {
+			return v
+		}
 	}
-	c, isComp := k.Filter.(*query.Comp)
-	if !isComp || c.CompOp != query.CompOpEq {
-		return nil, nil, false
+	return nil
+}
+
+// filterRefsField reports whether the filter tree references the given field path
+// (used to detect _distance outside a vector query). Walks And/Or/Key.
+func filterRefsField(f query.Filter, field string) bool {
+	switch v := f.(type) {
+	case query.And:
+		for _, c := range v {
+			if filterRefsField(c, field) {
+				return true
+			}
+		}
+	case query.Or:
+		for _, c := range v {
+			if filterRefsField(c, field) {
+				return true
+			}
+		}
+	case query.Key:
+		return strings.Join(v.Path, ".") == field
 	}
-	return k.Path, c, true
+	return false
+}
+
+// sortRefsField reports whether any sort key is the given field.
+func sortRefsField(s query.Sort, field string) bool {
+	if s == nil {
+		return false
+	}
+	for _, sf := range s.Fields() {
+		if sf.Field == field {
+			return true
+		}
+	}
+	return false
 }
 
 // decodeVectorValue decodes a marshaled anyenc array into a dim-sized []float32.
@@ -550,55 +599,6 @@ func residualFilter(clauses []query.Filter, skip int) query.Filter {
 	}
 }
 
-// VectorSearch returns the k nearest documents to query under the named vector
-// index. efSearch <= 0 uses the index default.
-func (c *collection) VectorSearch(ctx context.Context, indexName string, query []float32, k, efSearch int) (hits []VectorHit, err error) {
-	vi := c.findVectorIndex(indexName)
-	if vi == nil {
-		return nil, fmt.Errorf("%w: vector index %q", ErrIndexNotFound, indexName)
-	}
-	if vi.ix == nil {
-		// Brute-force: scan all docs, sort by distance, take top-k.
-		err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-			cands, serr := c.bruteVectorCandidates(tx, vi, query)
-			if serr != nil {
-				return serr
-			}
-			slices.SortFunc(cands, func(a, b qplanner.VectorCandidate) int {
-				switch {
-				case a.Distance < b.Distance:
-					return -1
-				case a.Distance > b.Distance:
-					return 1
-				default:
-					return 0
-				}
-			})
-			if k > 0 && len(cands) > k {
-				cands = cands[:k]
-			}
-			hits = make([]VectorHit, len(cands))
-			for i, cnd := range cands {
-				hits[i] = VectorHit{DocId: cnd.DocId, Distance: cnd.Distance}
-			}
-			return nil
-		})
-		return hits, err
-	}
-	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		raw, serr := vi.ix.Search(tx, query, k, efSearch)
-		if serr != nil {
-			return serr
-		}
-		hits = make([]VectorHit, len(raw))
-		for i, h := range raw {
-			hits[i] = VectorHit{DocId: h.DocID, Distance: h.Distance}
-		}
-		return nil
-	})
-	return hits, err
-}
-
 // CompactVectorIndex rebuilds the named vector index from its live vectors,
 // reclaiming the storage and graph quality lost to tombstoned (deleted or
 // replaced) nodes and re-densifying labels. It is synchronous and single-writer:
@@ -674,15 +674,6 @@ func (c *collection) maybeAutoCompactVectors(ctx context.Context) {
 		// case Compact is a no-op. Errors here must not fail the user's write.
 		_ = c.CompactVectorIndex(ctx, name)
 	}
-}
-
-func (c *collection) findVectorIndex(name string) *vectorIndex {
-	for _, vi := range c.loadVectorIndexes() {
-		if vi.info.Name == name {
-			return vi
-		}
-	}
-	return nil
 }
 
 // vectorIndexSeed derives a deterministic level-generation seed per index so a

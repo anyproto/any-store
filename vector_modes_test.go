@@ -115,7 +115,7 @@ func TestVectorMode_BruteExact(t *testing.T) {
 	}
 
 	// direct API: exact top-1 self-retrieval + recall 1.0 vs brute oracle.
-	hits, err := coll.VectorSearch(ctx, "emb", vecs[42], 1, 0)
+	hits, err := vsearch(coll, "v", vecs[42], 1, 0)
 	require.NoError(t, err)
 	require.Len(t, hits, 1)
 	assert.Equal(t, idBytesOf(42), hits[0].DocId)
@@ -125,7 +125,7 @@ func TestVectorMode_BruteExact(t *testing.T) {
 	var recall float64
 	for _, q := range queries {
 		truth := bruteIDs(vecs, q, k)
-		hh, err := coll.VectorSearch(ctx, "emb", q, k, 0)
+		hh, err := vsearch(coll, "v", q, k, 0)
 		require.NoError(t, err)
 		hit := 0
 		for _, h := range hh {
@@ -166,7 +166,7 @@ func TestVectorMode_HybridBehavesLikeBTree(t *testing.T) {
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
 	}
 
-	hits, err := coll.VectorSearch(ctx, "emb", vecs[42], 1, 64)
+	hits, err := vsearch(coll, "v", vecs[42], 1, 64)
 	require.NoError(t, err)
 	require.Len(t, hits, 1)
 	assert.Equal(t, idBytesOf(42), hits[0].DocId)

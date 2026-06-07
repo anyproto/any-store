@@ -103,7 +103,7 @@ func TestVectorRPSAndSize(t *testing.T) {
 			require.NoError(t, db.Flush(ctx, 0, FlushModeCheckpointTruncate))
 			t0 := time.Now()
 			for i := 0; i < ops; i++ {
-				_, err := c.VectorSearch(ctx, "emb", vecs[i%n], 10, 0)
+				_, err := vsearch(c, "v", vecs[i%n], 10, 0)
 				require.NoError(t, err)
 			}
 			t.Logf("  search         %8.0f /s", float64(ops)/time.Since(t0).Seconds())

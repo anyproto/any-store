@@ -76,7 +76,7 @@ func TestVectorIndex_CompactManual(t *testing.T) {
 
 	// Self-retrieval: each survivor's own vector retrieves itself.
 	for i, v := range live {
-		hits, herr := coll.VectorSearch(ctx, "emb", v, 1, 64)
+		hits, herr := vsearch(coll, "v", v, 1, 64)
 		require.NoError(t, herr)
 		require.Len(t, hits, 1)
 		assert.Equal(t, idBytesOf(i), hits[0].DocId, "self-retrieval mismatch for doc %d", i)
@@ -86,7 +86,7 @@ func TestVectorIndex_CompactManual(t *testing.T) {
 		if _, ok := live[i]; ok {
 			continue
 		}
-		hits, herr := coll.VectorSearch(ctx, "emb", vecs[i], 5, 64)
+		hits, herr := vsearch(coll, "v", vecs[i], 5, 64)
 		require.NoError(t, herr)
 		for _, h := range hits {
 			assert.NotEqual(t, idBytesOf(i), h.DocId, "deleted doc %d leaked", i)
@@ -169,13 +169,13 @@ func TestVectorIndex_CompactReopen(t *testing.T) {
 	assert.Equal(t, n/2, st.NodeCount)
 
 	for i := n / 2; i < n; i++ {
-		hits, herr := coll2.VectorSearch(ctx, "emb", vecs[i], 1, 64)
+		hits, herr := vsearch(coll2, "v", vecs[i], 1, 64)
 		require.NoError(t, herr)
 		require.Len(t, hits, 1)
 		require.Equal(t, idBytesOf(i), hits[0].DocId, "survivor %d after reopen", i)
 	}
 	for i := 0; i < n/2; i++ {
-		hits, herr := coll2.VectorSearch(ctx, "emb", vecs[i], 3, 64)
+		hits, herr := vsearch(coll2, "v", vecs[i], 3, 64)
 		require.NoError(t, herr)
 		for _, h := range hits {
 			require.NotEqual(t, idBytesOf(i), h.DocId, "deleted doc %d survived reopen", i)
@@ -220,7 +220,7 @@ func TestVectorIndex_CompactAuto(t *testing.T) {
 	assert.Equal(t, final.LiveCount, n/2)
 
 	// Search still correct after the in-flight rebuilds.
-	hits, err := coll.VectorSearch(ctx, "emb", vecs[n-1], 1, 64)
+	hits, err := vsearch(coll, "v", vecs[n-1], 1, 64)
 	require.NoError(t, err)
 	require.Len(t, hits, 1)
 	assert.Equal(t, idBytesOf(n-1), hits[0].DocId)

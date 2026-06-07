@@ -42,6 +42,39 @@ func idBytesOf(id int) []byte {
 	return it.appendId(nil)
 }
 
+// vhit mirrors the old VectorHit result for tests.
+type vhit struct {
+	DocId    []byte
+	Distance float32
+}
+
+// vsearch runs a k-NN search through the public Find() pipeline (the supported
+// path now that collection.VectorSearch is removed) and returns docId+distance
+// pairs, closest-first. ef<=0 uses the index default; k<=0 means no limit.
+func vsearch(coll Collection, field string, q []float32, k, ef int) ([]vhit, error) {
+	fq := coll.Find(fmt.Sprintf(`{%q:%s}`, field, vqJSON(q)))
+	if k > 0 {
+		fq = fq.Limit(uint(k))
+	}
+	if ef > 0 {
+		fq = fq.VectorEf(uint(ef))
+	}
+	iter, err := fq.Iter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	var out []vhit
+	for iter.Next() {
+		d, derr := iter.Doc()
+		if derr != nil {
+			return nil, derr
+		}
+		out = append(out, vhit{DocId: d.Value().Get("id").MarshalTo(nil), Distance: iter.Distance()})
+	}
+	return out, iter.Err()
+}
+
 func vl2(a, b []float32) float32 {
 	var s float32
 	for i := range a {
@@ -89,7 +122,7 @@ func TestVectorIndex_EndToEnd(t *testing.T) {
 	}
 
 	// self-query returns the same doc
-	hits, err := coll.VectorSearch(ctx, "emb", vecs[42], 1, 64)
+	hits, err := vsearch(coll, "v", vecs[42], 1, 64)
 	require.NoError(t, err)
 	require.Len(t, hits, 1)
 	assert.Equal(t, idBytesOf(42), hits[0].DocId)
@@ -100,7 +133,7 @@ func TestVectorIndex_EndToEnd(t *testing.T) {
 	var recall float64
 	for _, q := range queries {
 		truth := bruteIDs(vecs, q, k)
-		hh, err := coll.VectorSearch(ctx, "emb", q, k, 64)
+		hh, err := vsearch(coll, "v", q, k, 64)
 		require.NoError(t, err)
 		hit := 0
 		for _, h := range hh {
@@ -132,7 +165,7 @@ func TestVectorIndex_DeleteUpdate(t *testing.T) {
 
 	// delete doc 50 → must vanish from results
 	require.NoError(t, coll.DeleteId(ctx, 50))
-	hits, err := coll.VectorSearch(ctx, "emb", vecs[50], 10, 64)
+	hits, err := vsearch(coll, "v", vecs[50], 10, 64)
 	require.NoError(t, err)
 	for _, h := range hits {
 		assert.NotEqual(t, idBytesOf(50), h.DocId, "deleted doc leaked")
@@ -140,7 +173,7 @@ func TestVectorIndex_DeleteUpdate(t *testing.T) {
 
 	// update doc 10's vector onto doc 400's location → found near 400
 	require.NoError(t, coll.UpsertOne(ctx, anyenc.MustParseJson(vecDocJSON(10, vecs[400]))))
-	hits, err = coll.VectorSearch(ctx, "emb", vecs[400], 5, 64)
+	hits, err = vsearch(coll, "v", vecs[400], 5, 64)
 	require.NoError(t, err)
 	var found bool
 	for _, h := range hits {
@@ -171,7 +204,7 @@ func TestVectorIndex_BuildOnExisting(t *testing.T) {
 		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 64},
 	}))
 
-	hits, err := coll.VectorSearch(ctx, "emb", vecs[123], 1, 64)
+	hits, err := vsearch(coll, "v", vecs[123], 1, 64)
 	require.NoError(t, err)
 	require.Len(t, hits, 1)
 	assert.Equal(t, idBytesOf(123), hits[0].DocId)
@@ -242,7 +275,7 @@ func TestVectorIndex_Int8Quantization(t *testing.T) {
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
 	}
 	// self-query still returns the doc with int8 storage
-	hits, err := coll.VectorSearch(ctx, "emb", vecs[42], 1, 128)
+	hits, err := vsearch(coll, "v", vecs[42], 1, 128)
 	require.NoError(t, err)
 	require.Len(t, hits, 1)
 	assert.Equal(t, idBytesOf(42), hits[0].DocId)
@@ -331,14 +364,18 @@ func TestVectorIndex_Drop(t *testing.T) {
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
 	}
 	// works before drop
-	hits, err := coll.VectorSearch(ctx, "emb", vecs[0], 1, 64)
+	hits, err := vsearch(coll, "v", vecs[0], 1, 64)
 	require.NoError(t, err)
 	require.Len(t, hits, 1)
 
 	require.NoError(t, coll.DropIndex(ctx, "emb"))
-	// search on a dropped index errors
-	_, err = coll.VectorSearch(ctx, "emb", vecs[0], 1, 64)
-	require.ErrorIs(t, err, ErrIndexNotFound)
+	// the index is gone: dropping it again reports not-found
+	require.ErrorIs(t, coll.DropIndex(ctx, "emb"), ErrIndexNotFound)
+	// and "v" is now an ordinary field — a {"v":[..]} query is no longer an ANN
+	// search (no vector index), so it runs as a plain filter without error.
+	iter, ferr := coll.Find(fmt.Sprintf(`{"v":%s}`, vqJSON(vecs[0]))).Iter(ctx)
+	require.NoError(t, ferr)
+	require.NoError(t, iter.Close())
 	// inserts after drop must not fail (index gone)
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(999, vecs[1]))))
 }
@@ -364,9 +401,9 @@ func TestVectorIndex_Reopen(t *testing.T) {
 	for i, vc := range vecs {
 		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
 	}
-	pre := make([][]VectorHit, len(queries))
+	pre := make([][]vhit, len(queries))
 	for i, q := range queries {
-		pre[i], err = coll.VectorSearch(ctx, "emb", q, 10, 64)
+		pre[i], err = vsearch(coll, "v", q, 10, 64)
 		require.NoError(t, err)
 	}
 	require.NoError(t, db.Close())
@@ -378,7 +415,7 @@ func TestVectorIndex_Reopen(t *testing.T) {
 	coll2, err := db2.OpenCollection(ctx, "docs")
 	require.NoError(t, err)
 	for i, q := range queries {
-		post, err := coll2.VectorSearch(ctx, "emb", q, 10, 64)
+		post, err := vsearch(coll2, "v", q, 10, 64)
 		require.NoError(t, err)
 		require.Equal(t, len(pre[i]), len(post))
 		for j := range post {

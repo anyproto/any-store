@@ -75,13 +75,13 @@ func TestVectorCompactThreshold(t *testing.T) {
 	measure := func() time.Duration {
 		const reps = 5
 		for _, q := range queries[:min(20, nq)] { // warm
-			_, _ = coll.VectorSearch(ctx, "emb", q, k, ef)
+			_, _ = vsearch(coll, "v", q, k, ef)
 		}
 		means := make([]time.Duration, reps)
 		for r := 0; r < reps; r++ {
 			start := time.Now()
 			for _, q := range queries {
-				_, serr := coll.VectorSearch(ctx, "emb", q, k, ef)
+				_, serr := vsearch(coll, "v", q, k, ef)
 				require.NoError(t, serr)
 			}
 			means[r] = time.Since(start) / time.Duration(nq)
@@ -97,7 +97,7 @@ func TestVectorCompactThreshold(t *testing.T) {
 		for qi := 0; qi < rq; qi++ {
 			q := queries[qi]
 			truth := bruteLivePrefix(vecs, delFrom, q, k)
-			hits, herr := coll.VectorSearch(ctx, "emb", q, k, ef)
+			hits, herr := vsearch(coll, "v", q, k, ef)
 			require.NoError(t, herr)
 			hit := 0
 			for _, h := range hits {

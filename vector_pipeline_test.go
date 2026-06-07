@@ -190,6 +190,48 @@ func TestPipeline_VectorEf(t *testing.T) {
 	assert.Greater(t, count, 0)
 }
 
+// TestPipeline_Errors: malformed vector queries return errors instead of
+// silently degrading to a literal filter or matching everything.
+func TestPipeline_Errors(t *testing.T) {
+	const dim = 16
+	coll, vecs := setupPipeline(t, 100, dim) // field "v", dim 16
+
+	cases := []struct {
+		name   string
+		find   string
+		sort   []any
+		wantIs error
+	}{
+		{"wrong-dim vector", `{"v":[1,2,3]}`, nil, ErrInvalidVectorQuery},
+		{"non-array on vector field", `{"v":"hello"}`, nil, ErrInvalidVectorQuery},
+		{"range op on vector field", `{"v":{"$gt":[0.0]}}`, nil, ErrInvalidVectorQuery},
+		{"_distance filter w/o vector clause", `{"_distance":{"$lt":1.0}}`, nil, ErrDistanceWithoutVector},
+		{"_distance sort w/o vector clause", `{"id":{"$gt":5}}`, []any{"-_distance"}, ErrDistanceWithoutVector},
+		{"_distance sort, no filter", ``, []any{"_distance"}, ErrDistanceWithoutVector},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var fq Query
+			if tc.find == "" {
+				fq = coll.Find(nil)
+			} else {
+				fq = coll.Find(tc.find)
+			}
+			if tc.sort != nil {
+				fq = fq.Sort(tc.sort...)
+			}
+			_, err := fq.Iter(ctx)
+			require.ErrorIs(t, err, tc.wantIs)
+		})
+	}
+
+	// sanity: a valid vector query (optionally with _distance) does NOT error
+	iter, err := coll.Find(fmt.Sprintf(`{"v":%s,"_distance":{"$lt":2.0}}`, vqJSON(vecs[0]))).
+		Sort("-_distance").Iter(ctx)
+	require.NoError(t, err)
+	require.NoError(t, iter.Close())
+}
+
 // TestPipeline_Limit: limit applies over the distance-ordered results.
 func TestPipeline_Limit(t *testing.T) {
 	const dim = 16

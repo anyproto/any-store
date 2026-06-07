@@ -74,11 +74,6 @@ type Collection interface {
 	// GetIndexes returns a list of indexes on the collection.
 	GetIndexes() (indexes []Index)
 
-	// VectorSearch returns the k nearest documents to query under the named
-	// vector (HNSW) index. efSearch <= 0 uses the index default. Results are
-	// ordered closest-first.
-	VectorSearch(ctx context.Context, indexName string, query []float32, k, efSearch int) (hits []VectorHit, err error)
-
 	// CompactVectorIndex rebuilds the named vector index from its live vectors,
 	// reclaiming nodes and storage left behind by deletes and replaces (which only
 	// tombstone). It is synchronous and holds the write lock for the rebuild;
@@ -140,9 +135,9 @@ type collection struct {
 	// whole-schema reload on a schema-cookie bump (a reader sees either the old
 	// or the new schema, never half-applied DDL).
 	indexes atomic.Pointer[[]*index]
-	// vindexes is the parallel CoW snapshot of vector (HNSW) indexes. They are
-	// not queried via the filter path; the write hooks update them alongside the
-	// range indexes, and VectorSearch reads them.
+	// vindexes is the parallel CoW snapshot of vector (HNSW) indexes. The write
+	// hooks update them alongside the range indexes; the Find() pipeline reads
+	// them when a query has a `{vectorField: [..]}` clause.
 	vindexes atomic.Pointer[[]*vectorIndex]
 	db       *db
 	ns       *btree.Namespace
