@@ -18,6 +18,11 @@ const (
 	TypeObject = Type(7)
 	TypeBinary             = Type(8)
 	TypeCompressedObjectS2 = Type(9)
+	// TypeVectorF32 stores a packed little-endian []float32 embedding as a single
+	// length-prefixed blob (4 bytes/dim) instead of a generic number array — far
+	// smaller on disk and decoded zero-copy. Vectors are not orderable, so they
+	// never appear in range/sort index keys (no inverted form needed).
+	TypeVectorF32 = Type(10)
 
 	iTypeNull               = ^Type(1)
 	iTypeNumber             = ^Type(2)
@@ -54,6 +59,8 @@ func (t Type) String() string {
 		return "binary"
 	case TypeCompressedObjectS2:
 		return "compressedObjectS2"
+	case TypeVectorF32:
+		return "vectorF32"
 	default:
 		return fmt.Sprintf("unknown type: %d", t)
 	}

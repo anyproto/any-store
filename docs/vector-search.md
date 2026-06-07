@@ -143,6 +143,28 @@ sizing guidance.
   automatic and bounded (configurable on the low-level `vindex.Index` via
   `SetInsertCacheSize`, or globally with the `ASV_VCACHE` env var, in vectors).
 
+### Tradeoffs at a glance
+
+Each setting trades among **write** speed, **read** (search) speed, **RAM**, and
+**disk**. Defaults are a balanced starting point; tune one axis at a time.
+
+| Setting | Write | Read | RAM | Disk | When to use |
+|---|---|---|---|---|---|
+| `Quantization: Int8` | ~same | ~same / slightly faster | lower | **~4× smaller** | almost always — recall cost is ~0.5% |
+| `Mode: Hybrid` | same | a bit faster | +graph mirror | same | cheap latency win |
+| `+ HybridCacheVectors` | same | **fastest** (vectors in RAM) | **+N·dim·4** | same | read-heavy, RAM to spare |
+| `Mode: BruteForce` | **fastest** (no graph) | **slowest** (O(N) scan) | lowest | none | small sets, or exact recall |
+| `EfSearch` ↑ | — | slower, higher recall | — | — | need recall; `~64` is the knee |
+| `EfConstruction`/`M` ↑ | slower build | slightly faster/higher recall | — | larger graph | build-once, query-often |
+| `ASV_VCACHE` ↑ | **faster bulk build** | — | +cache (≈ working set·dim·4) | — | large bulk loads |
+| dim ↓ (e.g. 768→128) | faster | faster | lower | smaller | recall-tolerant / first-stage retrieval |
+| store field as `anyenc` vector type | faster | **faster pipeline** | — | **~2× smaller docs** | embeddings stored in the document |
+
+Rules of thumb: **int8 + dim you can tolerate** for size; **Hybrid+CacheVectors**
+when reads dominate and RAM allows; **raise `ASV_VCACHE`** for one-off bulk
+builds; **brute-force** only for small collections. In-memory (`:memory:`) keeps
+the whole DB resident — far faster but uses many× the RAM of a file-backed DB.
+
 ## 7. End-to-end example
 
 ```go

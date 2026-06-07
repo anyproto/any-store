@@ -47,6 +47,9 @@ func Equal(a, b *anyenc.Value) bool {
 		return a.GetFloat64() == b.GetFloat64()
 	case anyenc.TypeBinary:
 		return bytes.Equal(a.GetBytes(), b.GetBytes())
+	case anyenc.TypeVectorF32:
+		// Single memcmp over the packed bytes: alloc-free, bit-exact.
+		return bytes.Equal(a.VectorBytes(), b.VectorBytes())
 	}
 	return true
 }

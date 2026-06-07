@@ -83,6 +83,17 @@ func (a *Arena) NewBinary(b []byte) *Value {
 	return v
 }
 
+// NewVectorF32 returns a new vector value holding a copy of vec, packed as
+// little-endian float32 bytes.
+//
+// The returned value is valid until Reset is called on a.
+func (a *Arena) NewVectorF32(vec []float32) *Value {
+	v := a.c.getValue()
+	v.t = TypeVectorF32
+	v.v = appendVectorF32LE(v.v[:0], vec)
+	return v
+}
+
 // NewNumberFloat64 returns new number value containing f.
 //
 // The returned number is valid until Reset is called on a.

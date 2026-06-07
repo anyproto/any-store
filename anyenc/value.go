@@ -292,6 +292,10 @@ func (v *Value) MarshalTo(dst []byte) []byte {
 		dst = append(dst, byte(TypeBinary))
 		dst = binary.BigEndian.AppendUint32(dst, uint32(len(v.v)))
 		return append(dst, v.v...)
+	case TypeVectorF32:
+		dst = append(dst, byte(TypeVectorF32))
+		dst = binary.BigEndian.AppendUint32(dst, uint32(len(v.v)))
+		return append(dst, v.v...)
 	}
 	return dst
 }
@@ -320,6 +324,8 @@ func (v *Value) estimateSize(limit int) int {
 		return 1 + len(v.v) + 1 // type + data + EOS
 	case TypeBinary:
 		return 1 + 4 + len(v.v) // type + length + data
+	case TypeVectorF32:
+		return 1 + 4 + len(v.v) // type + length + packed f32 data
 	case TypeArray:
 		size := 2 // type + EOS
 		for _, av := range v.a {
@@ -398,6 +404,13 @@ func (v *Value) FastJson(a *fastjson.Arena) *fastjson.Value {
 		return a.NewStringBytes(v.v)
 	case TypeBinary:
 		return a.NewString(base64.StdEncoding.EncodeToString(v.v))
+	case TypeVectorF32:
+		fs := bytesAsF32(v.v)
+		arr := a.NewArray()
+		for i, f := range fs {
+			arr.SetArrayItem(i, a.NewNumberFloat64(float64(f)))
+		}
+		return arr
 	case TypeArray:
 		arr := a.NewArray()
 		for i, av := range v.a {
@@ -439,6 +452,13 @@ func (v *Value) GoType() any {
 		return string(v.v)
 	case TypeBinary:
 		return append([]byte{}, v.v...)
+	case TypeVectorF32:
+		fs := bytesAsF32(v.v)
+		res := make([]any, len(fs))
+		for i, f := range fs {
+			res[i] = float64(f)
+		}
+		return res
 	case TypeArray:
 		res := make([]any, len(v.a))
 		for i, av := range v.a {

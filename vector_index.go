@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/qplanner"
 	"github.com/anyproto/any-store/v2/internal/vindex"
@@ -76,7 +77,19 @@ func newVectorIndexFromVindex(info IndexInfo, ix *vindex.Index) *vectorIndex {
 // field is absent or not a numeric array (the document is simply not indexed).
 func (vi *vectorIndex) extractVector(it item, buf []float32) ([]float32, bool) {
 	v := it.Value().Get(vi.fieldPath...)
-	if v == nil || v.Type() != anyenc.TypeArray {
+	if v == nil {
+		return nil, false
+	}
+	// Packed vector type: zero-copy []float32 view, copied into buf (the parser
+	// buffer it points into is reused after this call).
+	if v.Type() == anyenc.TypeVectorF32 {
+		vec, err := v.VectorF32()
+		if err != nil || len(vec) != vi.dim {
+			return nil, false
+		}
+		return append(buf[:0], vec...), true
+	}
+	if v.Type() != anyenc.TypeArray {
 		return nil, false
 	}
 	arr, err := v.Array()
@@ -122,14 +135,18 @@ func (vi *vectorIndex) update(tx *btree.WriteTx, prevIt, it item) error {
 	if vi.ix == nil {
 		return nil
 	}
+	// Fast path: identical stored field → embedding unchanged, leave the graph
+	// alone. anyencutil.Equal is a single bytes.Equal memcmp for the packed vector
+	// type and alloc-free for arrays, so the common "document updated, embedding
+	// untouched" case avoids both vector extractions below.
+	newField := it.Value().Get(vi.fieldPath...)
+	oldField := prevIt.Value().Get(vi.fieldPath...)
+	if newField != nil && oldField != nil && anyencutil.Equal(newField, oldField) {
+		return nil
+	}
 	newVec, newOk := vi.extractVector(it, nil)
-	oldVec, oldOk := vi.extractVector(prevIt, nil)
+	_, oldOk := vi.extractVector(prevIt, nil)
 	switch {
-	case newOk && oldOk:
-		if float32sEqual(newVec, oldVec) {
-			return nil // unchanged — leave the graph alone
-		}
-		return vi.ix.Insert(tx, it.appendId(nil), newVec)
 	case newOk:
 		return vi.ix.Insert(tx, it.appendId(nil), newVec)
 	case oldOk:
@@ -137,18 +154,6 @@ func (vi *vectorIndex) update(tx *btree.WriteTx, prevIt, it item) error {
 		return err
 	}
 	return nil
-}
-
-func float32sEqual(a, b []float32) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func (vi *vectorIndex) Info() IndexInfo { return vi.info }
