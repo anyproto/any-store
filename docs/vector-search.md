@@ -165,40 +165,79 @@ Reclaim them with `CompactRatio` (automatic) or `Collection.CompactVectorIndex(c
 name)` (manual, e.g. in a maintenance window). See `VectorParams.CompactRatio` for
 sizing guidance.
 
-## 6. Tuning notes
+## 6. Choosing a mode (and tuning)
 
-- **`Quantization: VectorQuantInt8`** — ~4× smaller vectors, RAM-resident; minor
-  recall cost. Good default for large or high-dimensional sets.
-- **`Mode: VectorModeHybrid` (+ `HybridCacheVectors`)** — keeps a RAM layer-0
-  mirror (and optionally the vectors) for faster search; the btree stays the source
-  of truth.
-- **`Mode: VectorModeBruteForce`** — exact O(N) scan, zero index storage; fine for
-  small collections or 100%-recall needs.
-- **Write throughput** — inserts use an internal per-batch vector cache; it's
-  automatic and bounded (configurable on the low-level `vindex.Index` via
-  `SetInsertCacheSize`, or globally with the `ASV_VCACHE` env var, in vectors).
+Pick by your dominant constraint. Figures below are file-backed and measured;
+treat them as ratios, not absolutes (they scale with N, dim, and hardware).
 
-### Tradeoffs at a glance
+| Your situation | Use | Why |
+|---|---|---|
+| **Default / unsure** | `Hybrid` + `Int8`, `EfSearch 64` | the mirror costs only a few MiB and is never slower than btree; int8 is ~4× smaller at ~0.5% recall cost |
+| **Lowest latency, RAM to spare** | `Hybrid` + `HybridCacheVectors` + `Int8` (or f32) | vectors served from RAM → sub-0.3 ms p50, ~3–9× the btree QPS; costs ≈ the stored vector size in RAM |
+| **Lowest RAM / many indexes / multi-process writers** | `BTree` + `Int8` | no RAM-resident layer beyond the btree page cache |
+| **Small set (≲ a few k) or exact 100% recall** | `BruteForce` | exact O(N) scan, zero index storage, fastest writes |
+| **Delete/update-heavy** | any mode + `CompactRatio 0.5` | caps tombstone growth — see below |
+| **Recall-tolerant / first-stage retrieval** | lower `Dim` (MRL 768→128) + `Int8` | ~2× faster, ~4× smaller; re-rank survivors at full dim |
 
-Each setting trades among **write** speed, **read** (search) speed, **RAM**, and
-**disk**. Defaults are a balanced starting point; tune one axis at a time.
+### What each mode costs
 
-| Setting | Write | Read | RAM | Disk | When to use |
-|---|---|---|---|---|---|
-| `Quantization: Int8` | ~same | ~same / slightly faster | lower | **~4× smaller** | almost always — recall cost is ~0.5% |
-| `Mode: Hybrid` | same | a bit faster | +graph mirror | same | cheap latency win |
-| `+ HybridCacheVectors` | same | **fastest** (vectors in RAM) | **+N·dim·4** | same | read-heavy, RAM to spare |
-| `Mode: BruteForce` | **fastest** (no graph) | **slowest** (O(N) scan) | lowest | none | small sets, or exact recall |
-| `EfSearch` ↑ | — | slower, higher recall | — | — | need recall; `~64` is the knee |
-| `EfConstruction`/`M` ↑ | slower build | slightly faster/higher recall | — | larger graph | build-once, query-often |
-| `ASV_VCACHE` ↑ | **faster bulk build** | — | +cache (≈ working set·dim·4) | — | large bulk loads |
-| dim ↓ (e.g. 768→128) | faster | faster | lower | smaller | recall-tolerant / first-stage retrieval |
-| store field as `anyenc` vector type | faster | **faster pipeline** | — | **~2× smaller docs** | embeddings stored in the document |
+- **`VectorModeBTree`** — the HNSW graph lives entirely in the btree; no
+  RAM-resident layer (just the shared page cache). Multi-process-write safe.
+  Baseline search latency.
+- **`VectorModeHybrid`** — adds a RAM layer-0 mirror of the graph *adjacency*. Its
+  RAM is **a few MiB and independent of the embedding dimension** — it scales with
+  node count × layer-0 degree, not vector size — and is pointer-free (no GC
+  pressure). Search is ≈ btree to slightly faster: the mirror alone is cheap
+  insurance, not the big win.
+- **`+ HybridCacheVectors`** — also caches the vectors in RAM (the "vector tier").
+  **This is the search win** (sub-0.3 ms p50, several× the QPS), at the cost of
+  roughly the stored vector size in RAM: `N × dim × 4` bytes (f32) or
+  `N × (dim + 4)` (int8). The tier (and the mirror's tombstone set) grow with the
+  label high-water mark, so heavy churn inflates RAM until a compaction — see
+  `CompactRatio`.
+- **`VectorModeBruteForce`** — no graph, no storage; every query is an exact full
+  scan. Fastest writes, exact recall, O(N) search.
 
-Rules of thumb: **int8 + dim you can tolerate** for size; **Hybrid+CacheVectors**
-when reads dominate and RAM allows; **raise `ASV_VCACHE`** for one-off bulk
-builds; **brute-force** only for small collections. In-memory (`:memory:`) keeps
-the whole DB resident — far faster but uses many× the RAM of a file-backed DB.
+Insert/update/delete throughput is **the same across all modes** — the hybrid
+mirror is built lazily on the read path, so it adds no measurable write cost.
+
+### Quantization
+
+`VectorQuantInt8` stores a per-vector scale + int8 components: **~4× smaller** on
+disk *and* in the vector tier, for **~0.5%** recall loss (f32 and int8 track each
+other across `EfSearch`). Recommended for large or high-dimensional sets — it's the
+default choice in the table above.
+
+### CompactRatio — reclaiming tombstones
+
+Deletes and replaces *tombstone* graph nodes (they still route, but never match),
+so btree search cost — and the `HybridCacheVectors` tier RAM — grow with churn.
+`CompactRatio` rebuilds the graph once tombstones reach that fraction of live nodes
+(`0` = off). Measured under sustained update churn:
+
+| CompactRatio | churn throughput | tombstones / search latency / tier RAM | use when |
+|---|---|---|---|
+| **`0.5`** (recommended) | ~80% of uncompacted | bounded | general default, moderate–heavy churn |
+| **`0.25`** | ~60% of uncompacted | tightest cap (best latency, lowest RAM) | read-latency- or RAM-sensitive; best when deletes are light–moderate |
+| **`< 0.25`** | collapses | marginal extra benefit | avoid |
+| **`0` / large** | fastest | unbounded growth | write-mostly or short-lived indexes |
+
+Auto-compaction is synchronous (a latency spike on the triggering write) and
+O(live); for very large indexes prefer `0` and schedule
+`Collection.CompactVectorIndex(ctx, name)` in a maintenance window.
+
+### Other knobs
+
+- **`EfSearch`** — query-time candidate list; higher = more recall, slower. ~64 is
+  the knee (recall ~0.96 at ~1 ms for dim 768). Override per-query with `VectorEf`.
+- **`EfConstruction` / `M`** — bigger graph, slower build, marginally better
+  recall; raise for build-once / query-often.
+- **`ASV_VCACHE`** — per-batch insert vector cache (RAM traded for build speed);
+  default 16384 vectors, size to the working set for large bulk loads.
+- **Document encoding** — store the embedding as `anyenc.TypeVectorF32` (not a
+  number array): ~2× smaller docs and a faster pipeline, recall unchanged.
+- **`:memory:`** keeps the whole DB resident — fastest, but many× the RAM of a
+  file-backed DB.
 
 ## 7. End-to-end example
 

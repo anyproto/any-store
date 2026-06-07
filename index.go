@@ -127,7 +127,10 @@ type VectorParams struct {
 	// nodes are still traversed during search, so latency rises roughly linearly
 	// with the deleted/live ratio (recall does NOT — it holds/improves as the live
 	// set shrinks). Search latency degrades ~30% at a ratio of ~0.2–0.25, ~50% at
-	// ~0.5, and ~2x at ~1.0 (steeper at larger N / higher dim). A rebuild costs
+	// ~0.5, and ~2x at ~1.0 (steeper at larger N / higher dim). With
+	// HybridCacheVectors, tombstones also inflate the RAM vector tier (it tracks
+	// the label high-water mark, not the live set), so compaction reclaims RAM too.
+	// A rebuild costs
 	// ~one re-insert of the live set, so the amortized compaction cost per delete
 	// is ~insertCost / CompactRatio — i.e. a smaller ratio caps latency tighter but
 	// rebuilds far more often. Balanced default: ~0.5. Use ~0.25 only for
