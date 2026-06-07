@@ -85,19 +85,12 @@ func normalizeInto(dst, v []float32) []float32 {
 	} else {
 		dst = dst[:len(v)]
 	}
-	var ss float32
-	for _, x := range v {
-		ss += x * x
-	}
-	if ss == 0 {
+	n := vek32.Norm(v) // SIMD sqrt(sum of squares)
+	if n == 0 {
 		copy(dst, v)
 		return dst
 	}
-	inv := float32(1 / math.Sqrt(float64(ss)))
-	for i, x := range v {
-		dst[i] = x * inv
-	}
-	return dst
+	return vek32.MulNumber_Into(dst, v, 1/n) // SIMD dst = v / n
 }
 
 // l2Unrolled is a 4-accumulator Euclidean distance for CPUs without SIMD.
