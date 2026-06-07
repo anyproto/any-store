@@ -45,14 +45,39 @@ Only `Field` and `Dim` are required. Other `VectorParams`:
 
 ## 2. Document shape
 
-The embedding is an ordinary field — a JSON/anyenc array of exactly `Dim` numbers.
-Nested paths work (`Field: "meta.vec"`). Documents missing the field, or whose
-value isn't a `Dim`-sized numeric array, are simply not indexed.
+The embedding lives in an ordinary field. Two encodings are accepted:
+
+- **Packed vector** (recommended) — store it as the `anyenc` `TypeVectorF32`
+  value, built with `Arena.NewVectorF32([]float32{...})`. It's a single packed
+  little-endian `[]float32` blob: ~2× smaller in the document store than a number
+  array, and decoded zero-copy (no per-element parsing) on both the write and the
+  search path.
+- **Number array** — a plain JSON/anyenc array of `Dim` numbers, e.g.
+  `[0.12, -0.03, ...]`. Convenient when documents arrive as JSON, but larger on
+  disk and slower to decode.
+
+Either way the field must hold exactly `Dim` values. Nested paths work
+(`Field: "meta.vec"`). Documents missing the field, or whose value isn't a
+`Dim`-sized vector/numeric array, are simply not indexed.
 
 ```go
+// Packed vector type (preferred): build the document with an Arena.
+arena := &anyenc.Arena{}
+obj := arena.NewObject()
+obj.Set("id", arena.NewNumberFloat64(1))
+obj.Set("title", arena.NewString("cat"))
+obj.Set("lang", arena.NewString("en"))
+obj.Set("embedding", arena.NewVectorF32([]float32{0.12, -0.03, /* ... Dim values */}))
+coll.Insert(ctx, obj)
+
+// Or a plain JSON array, when that's what you already have:
 coll.Insert(ctx, anyenc.MustParseJson(
-    `{"id":1, "title":"cat", "lang":"en", "embedding":[0.12, -0.03, ...]}`))
+    `{"id":2, "title":"dog", "lang":"en", "embedding":[0.12, -0.03, ...]}`))
 ```
+
+The two encodings are interchangeable within a collection — the index reads both,
+and you can mix them or migrate by re-inserting documents. Reuse one `Arena`
+across documents and call `arena.Reset()` between batches to avoid allocations.
 
 Inserts are batched: pass many documents to one `Insert(...)` call so they share a
 single transaction.
@@ -179,10 +204,19 @@ coll.EnsureIndex(ctx, anystore.IndexInfo{
     Vector: &anystore.VectorParams{Field: "embedding", Dim: 4, Metric: anystore.VectorCosine},
 })
 
+// Build documents with the packed anyenc vector type, then insert as one batch.
+arena := &anyenc.Arena{}
+mkDoc := func(id float64, lang string, vec []float32) *anyenc.Value {
+    obj := arena.NewObject()
+    obj.Set("id", arena.NewNumberFloat64(id))
+    obj.Set("lang", arena.NewString(lang))
+    obj.Set("embedding", arena.NewVectorF32(vec))
+    return obj
+}
 coll.Insert(ctx,
-    anyenc.MustParseJson(`{"id":1,"lang":"en","embedding":[0.9,0.1,0.0,0.2]}`),
-    anyenc.MustParseJson(`{"id":2,"lang":"en","embedding":[0.8,0.2,0.1,0.1]}`),
-    anyenc.MustParseJson(`{"id":3,"lang":"fr","embedding":[0.0,0.1,0.9,0.7]}`),
+    mkDoc(1, "en", []float32{0.9, 0.1, 0.0, 0.2}),
+    mkDoc(2, "en", []float32{0.8, 0.2, 0.1, 0.1}),
+    mkDoc(3, "fr", []float32{0.0, 0.1, 0.9, 0.7}),
 )
 
 iter, _ := coll.Find(`{"embedding":[0.85,0.15,0.05,0.15], "lang":"en"}`).
