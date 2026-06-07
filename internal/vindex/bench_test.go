@@ -130,6 +130,44 @@ func BenchmarkVindexSearch(b *testing.B) {
 	}
 }
 
+// BenchmarkVindexBatchInsert measures a from-scratch batch build: N vectors
+// inserted into a fresh index within a single write transaction (one fsync),
+// which is how collection.Insert(docs...) drives the vector index. Reported
+// ns/op is per whole batch; divide by batchN for per-vector cost. This is the
+// realistic "bulk load" path, distinct from BenchmarkVindexInsert which appends
+// to an already-large graph.
+func BenchmarkVindexBatchInsert(b *testing.B) {
+	const batchN = 2000
+	vecs := randVecs(batchN, benchDim, 11)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		db, err := btree.Open(":memory:", btree.Options{InMemory: true})
+		if err != nil {
+			b.Fatal(err)
+		}
+		wtx, err := db.BeginWrite()
+		if err != nil {
+			b.Fatal(err)
+		}
+		ix, err := Create(wtx, "vix", Params{Dim: benchDim, Metric: Cosine, EfSearch: 64}, 1)
+		if err != nil {
+			b.Fatal(err)
+		}
+		for j := 0; j < batchN; j++ {
+			if err := ix.Insert(wtx, docID(j), vecs[j]); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if err := wtx.Commit(); err != nil {
+			b.Fatal(err)
+		}
+		db.Close()
+	}
+	b.ReportMetric(float64(batchN), "vecs/batch")
+}
+
 func BenchmarkVindexInsert(b *testing.B) {
 	db, ix, _ := buildBench(b, benchN, benchDim)
 	defer db.Close()

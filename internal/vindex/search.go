@@ -122,6 +122,33 @@ type searcher struct {
 	naCand   []candidate // candidate set for an addNeighbor prune (reused)
 	aVecBuf  []float32   // stable copy of the centre vector during a prune
 	keptVecs []float32   // RAM cache of kept-neighbour vectors (m*dim, reused)
+
+	// Vector cache (lever 1), consulted by vecOf/vec2Of on the insert path. Spans
+	// a whole write BATCH: across the inserts in one WriteTx the same hub vectors
+	// are read repeatedly, and vectors are immutable, so each is read from the
+	// btree at most once per batch. Bounded by a configurable cap (ix.vcacheCap);
+	// see vcache.go. Disabled on the read path (vcacheOn=false), where the hybrid
+	// vecTier already serves this role. vcacheTx tracks the tx the cache was last
+	// reset for, to detect a batch boundary.
+	vcacheOn bool
+	vcache   vecCache
+	vcacheTx *btree.ReadTx
+}
+
+// beginVecCache turns the vector cache on for an insert and resets it at a batch
+// boundary (a new write tx). Within one batch the cache persists across inserts.
+// Disabled when ix.vcacheCap <= 0. Reset is O(1) and allocation-free after the
+// first batch (the arena and probe table are reused).
+func (s *searcher) beginVecCache() {
+	if s.ix.vcacheCap <= 0 {
+		s.vcacheOn = false
+		return
+	}
+	s.vcacheOn = true
+	if s.vcacheTx != s.rtx { // new batch → refresh the cache
+		s.vcache.reset(s.ix.dim, s.ix.vcacheCap)
+		s.vcacheTx = s.rtx
+	}
 }
 
 func (ix *Index) newSearcher(rtx *btree.ReadTx, query []float32) *searcher {
@@ -143,6 +170,27 @@ func (ix *Index) newSearcher(rtx *btree.ReadTx, query []float32) *searcher {
 // vecOf call). On the hybrid read path with the vector tier, the record comes
 // from the RAM slab instead of the btree; decoding is identical either way.
 func (s *searcher) vecOf(label uint32) ([]float32, error) {
+	if !s.vcacheOn {
+		return s.readVec(label)
+	}
+	dst, hit := s.vcache.reserve(label)
+	if hit {
+		return dst, nil
+	}
+	v, err := s.readVec(label) // miss: read into vf scratch
+	if err != nil {
+		return nil, err
+	}
+	if dst == nil { // cache full: return scratch directly (valid until next read)
+		return v, nil
+	}
+	copy(dst, v) // copy into the stable arena slot
+	return dst, nil
+}
+
+// readVec is vecOf's uncached body: reads label's vector into the primary scratch
+// (vf), from the hybrid vector tier when present else the btree.
+func (s *searcher) readVec(label uint32) ([]float32, error) {
 	if s.tierData != nil {
 		off := int(label) * s.tierStride
 		rec := s.tierData[off : off+s.tierStride]
@@ -176,7 +224,30 @@ func (s *searcher) vecOf(label uint32) ([]float32, error) {
 }
 
 // vec2Of reads label's vector into the secondary scratch (held across a prune).
+// When the per-insert cache is on it returns a stable cache slice instead — the
+// "secondary scratch" distinction exists only to stop vecOf clobbering a held
+// vector, which the cache (distinct stable slabs per label) already guarantees.
 func (s *searcher) vec2Of(label uint32) ([]float32, error) {
+	if !s.vcacheOn {
+		return s.readVec2(label)
+	}
+	dst, hit := s.vcache.reserve(label)
+	if hit {
+		return dst, nil
+	}
+	v, err := s.readVec2(label)
+	if err != nil {
+		return nil, err
+	}
+	if dst == nil { // cache full: return scratch directly (valid until next read)
+		return v, nil
+	}
+	copy(dst, v)
+	return dst, nil
+}
+
+// readVec2 is vec2Of's uncached body: reads into the secondary scratch (vf2).
+func (s *searcher) readVec2(label uint32) ([]float32, error) {
 	s.keyBuf = labelKey(s.keyBuf, label)
 	if s.ix.quant != QuantNone {
 		s.qbuf2, _ = s.rtx.AppendValue(s.ix.vvec, s.keyBuf, s.qbuf2[:0])

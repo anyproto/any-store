@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -79,6 +81,11 @@ type Index struct {
 	vecCache bool
 	vtier    *vecTier
 
+	// vcacheCap bounds the per-batch insert vector cache (lever 1), in vectors;
+	// 0 disables it. RAM ceiling ≈ vcacheCap*dim*4 bytes per active write searcher.
+	// See vecCache (vcache.go) and SetInsertCacheSize.
+	vcacheCap int
+
 	rngMu sync.Mutex
 	rng   *rand.Rand
 
@@ -103,6 +110,7 @@ func (ix *Index) putSearcher(s *searcher) {
 	s.query = nil
 	s.l0 = nil
 	s.tierData = nil
+	s.vcacheOn = false // read path must not reuse the insert cache
 	ix.scratch.Put(s)
 }
 
@@ -202,9 +210,27 @@ func newIndex(ns [5]*btree.Namespace, dim, m, m0, efC, efS int, ml float64, metr
 	return &Index{
 		vmeta: ns[0], vvec: ns[1], vadj: ns[2], vdoc: ns[3], vlbl: ns[4],
 		dim: dim, m: m, m0: m0, efC: efC, efS: efS, ml: ml, quant: quant,
-		dist: distanceFor(metric),
-		rng:  rand.New(rand.NewSource(seed)),
+		dist:      distanceFor(metric),
+		rng:       rand.New(rand.NewSource(seed)),
+		vcacheCap: defaultInsertCacheVecs,
 	}
+}
+
+// defaultInsertCacheVecs is the default per-batch insert vector cache size, in
+// vectors. ~16k vectors covers the hot hub set of typical graphs (sweeps show
+// build throughput still climbing at this size) while bounding RAM (e.g. ~8 MiB
+// at dim 128, ~50 MiB at dim 768). Override per-index with SetInsertCacheSize,
+// or globally via the ASV_VCACHE env var (vectors; 0 disables) — handy for
+// sweeping the optimal size across a test/benchmark suite.
+var defaultInsertCacheVecs = insertCacheDefault()
+
+func insertCacheDefault() int {
+	if s := os.Getenv("ASV_VCACHE"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			return n
+		}
+	}
+	return 16384
 }
 
 // Dim returns the index dimension.
@@ -226,6 +252,13 @@ func (ix *Index) SetVectorCache(v bool) {
 		ix.vtier = newVecTier(vecRecordSize(ix.dim, ix.quant))
 	}
 }
+
+// SetInsertCacheSize configures the per-batch insert vector cache (lever 1):
+// during a write batch, repeatedly-read node vectors (entry point and hubs) are
+// served from a capped RAM arena instead of the btree. n is the max cached
+// vectors (RAM ≈ n*dim*4 bytes per active write searcher); n <= 0 disables it.
+// Call once right after Create/Open, before concurrent use.
+func (ix *Index) SetInsertCacheSize(n int) { ix.vcacheCap = n }
 
 func (ix *Index) readMeta(rtx *btree.ReadTx) (*meta, error) {
 	b, err := rtx.Get(ix.vmeta, metaKey)
@@ -326,6 +359,7 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 
 	s := ix.getSearcher(rtx, vec)
 	defer ix.putSearcher(s)
+	s.beginVecCache() // serve repeated per-insert vector reads from RAM (lever 1)
 	s.checkDeleted = mt.deletedCount > 0
 	ep := mt.entryLabel
 	for lc := mt.topLayer; lc > level; lc-- {
