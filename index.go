@@ -130,18 +130,18 @@ type VectorParams struct {
 	// ~0.5, and ~2x at ~1.0 (steeper at larger N / higher dim). With
 	// HybridCacheVectors, tombstones also inflate the RAM vector tier (it tracks
 	// the label high-water mark, not the live set), so compaction reclaims RAM too.
-	// A rebuild costs
-	// ~one re-insert of the live set, so the amortized compaction cost per delete
-	// is ~insertCost / CompactRatio — i.e. a smaller ratio caps latency tighter but
-	// rebuilds far more often. Balanced default: ~0.5. Use ~0.25 only for
-	// read-latency-sensitive, delete-light workloads.
+	// A rebuild costs ~one re-insert of the live set, so the amortized compaction
+	// cost per delete is ~insertCost / CompactRatio — i.e. a smaller ratio caps
+	// latency tighter but rebuilds far more often. Balanced default: ~0.5. Use
+	// ~0.25 only for read-latency-sensitive, delete-light workloads.
 	//
 	// Auto-compaction runs synchronously, in its own transaction, right after the
 	// self-contained write that crosses the threshold — never inside a
-	// caller-managed transaction. The rebuild is O(live): seconds for small
-	// indexes but minutes for large ones (≈4 min for 50k×768), surfacing as a
-	// latency spike on the triggering write. For large indexes prefer leaving this
-	// 0 and scheduling Collection.CompactVectorIndex in a maintenance window.
+	// caller-managed transaction. The rebuild is O(live) at ~850 nodes/s for dim
+	// 768 (measured, see TestVectorCompactTiming): ~23 s to rebuild 19k live, ~45 s
+	// for 38k. It surfaces as a latency spike on the triggering write, so for large
+	// indexes prefer leaving this 0 and scheduling Collection.CompactVectorIndex in
+	// a maintenance window.
 	// Ignored for VectorModeBruteForce.
 	CompactRatio float64 `json:"compactRatio,omitempty"`
 }
