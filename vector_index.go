@@ -255,20 +255,20 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 		EfSearch:       info.Vector.EfSearch,
 		Quantization:   info.Vector.Quantization.toVindex(),
 	}
-	ix, err := vindex.Create(tx, prefix, p, vectorIndexSeed(c.name, info.Name))
-	if err != nil {
-		return nil, err
-	}
-	hybrid := info.Vector.Mode == VectorModeHybrid
-	ix.SetHybrid(hybrid)
-	ix.SetVectorCache(hybrid && info.Vector.HybridCacheVectors)
-	vi := newVectorIndexFromVindex(info, ix)
 
-	// Build from existing documents.
-	vbuf := make([]float32, 0, vi.dim)
+	// Collect (id, vector) from existing documents, then build the HNSW graph in RAM
+	// and flush it in one bulk pass (vindex.BulkBuild) — far faster than inserting
+	// node-by-node through the btree (no per-edge copy-on-write churn). The bulk path
+	// produces a graph byte-identical to the per-insert path, so it is a pure speedup.
+	// NOTE: this holds every indexed vector in RAM during the build; for very large
+	// collections a maintenance_work_mem-style cap + fallback to per-insert is future
+	// work (see BUILD_SPEED.md).
+	tmpVI := newVectorIndexFromVindex(info, nil) // extractVector needs fieldPath/dim
+	var ids [][]byte
+	var vecs [][]float32
 	cursor := tx.NewCursor(c.ns)
 	defer cursor.Close()
-	if err = cursor.First(); err != nil {
+	if err := cursor.First(); err != nil {
 		return nil, err
 	}
 	p2 := &anyenc.Parser{}
@@ -282,14 +282,23 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 			return nil, perr
 		}
 		it := item{val: doc}
-		if err = vi.insert(tx, it, vbuf); err != nil {
-			return nil, err
+		if vec, ok := tmpVI.extractVector(it, nil); ok { // nil buf → fresh copy per doc
+			ids = append(ids, it.appendId(nil))
+			vecs = append(vecs, vec)
 		}
-		if err = cursor.Next(); err != nil {
+		if err := cursor.Next(); err != nil {
 			return nil, err
 		}
 	}
-	return vi, nil
+
+	ix, err := vindex.BulkBuild(tx, prefix, p, vectorIndexSeed(c.name, info.Name), ids, vecs)
+	if err != nil {
+		return nil, err
+	}
+	hybrid := info.Vector.Mode == VectorModeHybrid
+	ix.SetHybrid(hybrid)
+	ix.SetVectorCache(hybrid && info.Vector.HybridCacheVectors)
+	return newVectorIndexFromVindex(info, ix), nil
 }
 
 // reconcileVectorIndexesLocked rebuilds the vector-index set from on-disk infos
