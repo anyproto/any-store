@@ -50,6 +50,15 @@ type Config struct {
 	// By default, objects larger than 256 bytes are compressed with S2.
 	DisableCompression bool
 
+	// VectorBuildConcurrency bounds the worker goroutines used to BUILD and COMPACT
+	// vector (HNSW) indexes — the only place any-store uses internal parallelism.
+	// It is a process-wide budget shared by every vector index in the process, so
+	// many simultaneous builds/compactions cannot oversubscribe the CPU. Zero
+	// (default) uses GOMAXPROCS; set it low (e.g. 1–2) on constrained or
+	// many-database deployments. It does NOT affect search, insert/update/delete,
+	// or any non-vector operation.
+	VectorBuildConcurrency int
+
 	// UseGlobalPageBuffer opts this DB into the global pre-allocated page
 	// buffer pool. The pool must be initialized beforehand via InitPageBuffer.
 	// When false (default), page buffers use sync.Pool (GC-managed, like
