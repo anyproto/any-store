@@ -153,15 +153,6 @@ func encodeCentroids(cents [][]float32) []byte {
 	return out
 }
 
-// decodeCentroids reconstructs k rows of dim floats from a blob (zero-copy rows).
-func decodeCentroids(data []byte, k, dim int) [][]float32 {
-	out := make([][]float32, k)
-	for i := 0; i < k; i++ {
-		out[i] = bytesAsF32(data[i*dim*4:], dim)
-	}
-	return out
-}
-
 // encodePQ flattens [m][pqK][dsub] to a raw blob (m·pqK·dsub floats).
 func encodePQ(pqcb [][][]float32) []byte {
 	if len(pqcb) == 0 {
@@ -173,21 +164,6 @@ func encodePQ(pqcb [][][]float32) []byte {
 		for _, c := range cb {
 			out = append(out, f32bytes(c)...)
 		}
-	}
-	return out
-}
-
-// decodePQ reconstructs [m][pqK][dsub] from a blob.
-func decodePQ(data []byte, m, dsub int) [][][]float32 {
-	out := make([][][]float32, m)
-	off := 0
-	for mm := 0; mm < m; mm++ {
-		cb := make([][]float32, pqK)
-		for j := 0; j < pqK; j++ {
-			cb[j] = bytesAsF32(data[off:], dsub)
-			off += dsub * 4
-		}
-		out[mm] = cb
 	}
 	return out
 }

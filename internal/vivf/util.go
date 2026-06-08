@@ -27,31 +27,6 @@ func normalizeInto(dst, v []float32) []float32 {
 	return vek32.MulNumber_Into(dst, v, 1/n)
 }
 
-// topNCellsInto fills out with the indices of the n coarse centroids nearest (L2)
-// to q, reusing the scratch slice (*scratch) for the per-centroid distances. The
-// alloc-free form of topNCells for the search path.
-func topNCellsInto(q []float32, coarse [][]float32, n int, scratch *[]cellDist, out []int) []int {
-	cd := *scratch
-	if cap(cd) < len(coarse) {
-		cd = make([]cellDist, len(coarse))
-	} else {
-		cd = cd[:len(coarse)]
-	}
-	for i, c := range coarse {
-		cd[i] = cellDist{i, vek32.Distance(q, c)}
-	}
-	slices.SortFunc(cd, func(a, b cellDist) int { return cmpF32(a.dist, b.dist) })
-	if n > len(cd) {
-		n = len(cd)
-	}
-	out = out[:0]
-	for i := 0; i < n; i++ {
-		out = append(out, cd[i].idx)
-	}
-	*scratch = cd
-	return out
-}
-
 // sqL2 is the scalar squared-L2 distance, used for the small PQ subspaces (dim
 // 4–24) where a SIMD call's overhead outweighs its benefit.
 func sqL2(a, b []float32) float32 {

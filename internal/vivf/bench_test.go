@@ -34,6 +34,29 @@ func benchIndex(b *testing.B, n, dim int) (*btree.DB, *btree.ReadTx, *StoreIndex
 	return db, rtx, ix, vecs
 }
 
+// BenchmarkOpenTx measures opening an existing index (decoding the codebooks into
+// RAM) — the path the arena/flat codebook layout targets (it ran once per open /
+// cross-process reconcile and used to build ~m·256 slice headers).
+func BenchmarkOpenTx(b *testing.B) {
+	const (
+		n   = 20000
+		dim = 768 // m≈96 → ~24k codeword headers in the nested layout
+	)
+	db, _, _, _ := benchIndex(b, n, dim)
+	rtx, err := db.BeginRead()
+	require.NoError(b, err)
+	b.Cleanup(func() { _ = rtx.Rollback() })
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ix, err := OpenTx(rtx, "ivf")
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = ix
+	}
+}
+
 func BenchmarkSearchCandidates(b *testing.B) {
 	const (
 		n   = 20000

@@ -60,8 +60,14 @@ type StoreIndex struct {
 	int8vec                             bool // :vec re-rank store is int8-quantized
 	sq                                  bool // IVF-SQ: :cell holds int8 full vectors, scanned directly
 
-	coarse [][]float32   // [nlist][dim]   — RAM-resident (the only hot set)
-	pqcb   [][][]float32 // [m][pqK][dsub]
+	// coarse and pqcb are the RAM-resident codebooks, each held as ONE flat,
+	// contiguous float32 view of its :cb blob (an arena) rather than nested slices:
+	// opening an index aliases the blob with zero extra allocation instead of
+	// building thousands of per-row/per-codeword slice headers (~m·256 for pqcb),
+	// and the hot loops read them contiguously. Row c of coarse is coarseRow(c);
+	// codeword j of PQ sub-quantizer m is pqSub(m, j).
+	coarse []float32 // nlist·dim
+	pqcb   []float32 // m·pqK·dsub
 
 	// precomp is the IVFADC precomputed table term[cell][m][j] = ‖cb[m][j]‖² +
 	// 2·c_cell_m·cb[m][j] (flat, nlist·m·pqK floats). When present, a query builds
@@ -107,11 +113,11 @@ func (ix *StoreIndex) buildPrecomp() {
 		cellBase := c * ix.m * pqK
 		for mm := 0; mm < ix.m; mm++ {
 			lo := mm * ix.dsub
-			csub := ix.coarse[c][lo : lo+ix.dsub]
-			cb := ix.pqcb[mm]
+			csub := ix.coarseRow(c)[lo : lo+ix.dsub]
+			cb := ix.pqcb[mm*pqK*ix.dsub:]
 			base := cellBase + mm*pqK
 			for j := 0; j < pqK; j++ {
-				cj := cb[j]
+				cj := cb[j*ix.dsub : j*ix.dsub+ix.dsub]
 				ix.precomp[base+j] = sqNormSmall(cj) + 2*dotSmall(csub, cj)
 			}
 		}
@@ -145,6 +151,49 @@ type searcher struct {
 	vbuf    []byte    // reused :vec read buffer (re-rank)
 	vbufF32 []float32 // reused dequant target for int8 :vec (re-rank)
 	dbuf    []byte    // reused :lbl (docID) read buffer (re-rank)
+}
+
+// pqSub returns the dsub-length codeword j of PQ sub-quantizer mm (a view into the
+// flat pqcb).
+func (ix *StoreIndex) pqSub(mm, j int) []float32 {
+	o := (mm*pqK + j) * ix.dsub
+	return ix.pqcb[o : o+ix.dsub]
+}
+
+// coarseRow returns coarse centroid c (a view into the flat coarse arena).
+func (ix *StoreIndex) coarseRow(c int) []float32 {
+	return ix.coarse[c*ix.dim : (c+1)*ix.dim]
+}
+
+// nearestCellsInto fills out with the n coarse cells nearest (L2) to q, reusing
+// the scratch slice. The flat-coarse cell finder for both search and build/insert.
+func (ix *StoreIndex) nearestCellsInto(q []float32, n int, scratch *[]cellDist, out []int) []int {
+	cd := *scratch
+	if cap(cd) < ix.nlist {
+		cd = make([]cellDist, ix.nlist)
+	} else {
+		cd = cd[:ix.nlist]
+	}
+	for c := 0; c < ix.nlist; c++ {
+		cd[c] = cellDist{c, vek32.Distance(q, ix.coarseRow(c))}
+	}
+	slices.SortFunc(cd, func(a, b cellDist) int { return cmpF32(a.dist, b.dist) })
+	if n > ix.nlist {
+		n = ix.nlist
+	}
+	out = out[:0]
+	for i := 0; i < n; i++ {
+		out = append(out, cd[i].idx)
+	}
+	*scratch = cd
+	return out
+}
+
+// nearestCells is the allocating form of nearestCellsInto for the build/insert
+// paths (not hot — one assignment per vector).
+func (ix *StoreIndex) nearestCells(q []float32, n int) []int {
+	var cd []cellDist
+	return ix.nearestCellsInto(q, n, &cd, nil)
 }
 
 func (ix *StoreIndex) getSearcher() *searcher {
@@ -201,21 +250,27 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 		}
 	}
 
-	// Train the coarse quantizer (always) and, for IVF-PQ, the PQ codebooks.
+	// Train the coarse quantizer (always) and, for IVF-PQ, the PQ codebooks. The PQ
+	// codebooks are persisted and then held as the flat view of that blob (same
+	// layout the reader gets), so there is one representation, not two.
 	pp := Params{Dim: p.Dim, NList: p.NList, M: p.M, Seed: p.Seed, KMeansPP: p.KMeansPP, Assign: p.Assign}
+	var coarseN [][]float32
 	if p.SQ {
-		ix.coarse, _ = kmeans(norm, p.NList, 15, p.Seed, p.KMeansPP) // IVF-SQ: coarse only
+		coarseN, _ = kmeans(norm, p.NList, 15, p.Seed, p.KMeansPP) // IVF-SQ: coarse only
 	} else {
-		ix.coarse, ix.pqcb = trainModel(norm, pp)
-	}
-	if err := wtx.Put(ix.vcb, coarseKey, encodeCentroids(ix.coarse)); err != nil {
-		return nil, err
-	}
-	if !p.SQ {
-		if err := wtx.Put(ix.vcb, pqKey, encodePQ(ix.pqcb)); err != nil {
+		var pqcbN [][][]float32
+		coarseN, pqcbN = trainModel(norm, pp)
+		pqBlob := encodePQ(pqcbN)
+		if err := wtx.Put(ix.vcb, pqKey, pqBlob); err != nil {
 			return nil, err
 		}
+		ix.pqcb = bytesAsF32(pqBlob, ix.m*pqK*ix.dsub)
 	}
+	coarseBlob := encodeCentroids(coarseN)
+	if err := wtx.Put(ix.vcb, coarseKey, coarseBlob); err != nil {
+		return nil, err
+	}
+	ix.coarse = bytesAsF32(coarseBlob, ix.nlist*ix.dim)
 
 	// Encode + place each vector. label == build order (dense 0..n-1). Accumulate the
 	// primary-cell reconstruction error to seed the drift baseline. IVF-SQ stores the
@@ -228,13 +283,13 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 		if err := ix.writeVecRecords(wtx, label, ids[i], x, &vecBuf); err != nil {
 			return nil, err
 		}
-		cells := topNCells(x, ix.coarse, ix.assign)
+		cells := ix.nearestCells(x, ix.assign)
 		if err := ix.putDocCells(wtx, ids[i], label, cells); err != nil {
 			return nil, err
 		}
 		for ci, c := range cells {
 			if ci == 0 {
-				vek32.Sub_Into(r, x, ix.coarse[c])
+				vek32.Sub_Into(r, x, ix.coarseRow(c))
 				reconSum += float64(sqNorm(r)) // nearest-cell residual = drift baseline
 			}
 			keyBuf = cellKey(keyBuf, uint32(c), label)
@@ -242,7 +297,7 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 				codeBuf = encodeVecInt8(codeBuf, x) // int8 full vector
 			} else {
 				if ci != 0 {
-					vek32.Sub_Into(r, x, ix.coarse[c])
+					vek32.Sub_Into(r, x, ix.coarseRow(c))
 				}
 				codeBuf = encodeResidualInto(codeBuf, r, ix)
 			}
@@ -274,9 +329,22 @@ func encodeResidualInto(dst []byte, r []float32, ix *StoreIndex) []byte {
 	dst = dst[:0]
 	for mm := 0; mm < ix.m; mm++ {
 		lo := mm * ix.dsub
-		dst = append(dst, byte(nearestSmall(r[lo:lo+ix.dsub], ix.pqcb[mm])))
+		dst = append(dst, byte(ix.nearestSub(mm, r[lo:lo+ix.dsub])))
 	}
 	return dst
+}
+
+// nearestSub returns the index of the codeword in PQ sub-quantizer mm nearest
+// (sqL2) to sub, reading the flat pqcb.
+func (ix *StoreIndex) nearestSub(mm int, sub []float32) int {
+	cb := ix.pqcb[mm*pqK*ix.dsub:]
+	best, bestD := 0, sqL2(sub, cb[:ix.dsub])
+	for j := 1; j < pqK; j++ {
+		if d := sqL2(sub, cb[j*ix.dsub:j*ix.dsub+ix.dsub]); d < bestD {
+			bestD, best = d, j
+		}
+	}
+	return best
 }
 
 // writeVecRecords stores the (normalized) vector for re-rank and the label↔docID
@@ -363,13 +431,13 @@ func OpenTx(rtx *btree.ReadTx, prefix string) (*StoreIndex, error) {
 	}
 	// rtx.Get already returns an owned copy (safe to retain after pages release), so
 	// the decoded float32 views can alias cb/pq directly — no extra clone.
-	ix.coarse = decodeCentroids(cb, ix.nlist, ix.dim)
-	if !ix.sq { // IVF-SQ has no PQ codebooks or precomputed table
+	ix.coarse = bytesAsF32(cb, ix.nlist*ix.dim) // flat arena view, no per-row headers
+	if !ix.sq {                                 // IVF-SQ has no PQ codebooks or precomputed table
 		pq, err := rtx.Get(ix.vcb, pqKey)
 		if err != nil {
 			return nil, err
 		}
-		ix.pqcb = decodePQ(pq, ix.m, ix.dsub)
+		ix.pqcb = bytesAsF32(pq, ix.m*pqK*ix.dsub) // flat view, no per-codeword headers
 		ix.buildPrecomp()
 	}
 	ix.metaRoot = ix.vmeta.RootPage()
@@ -563,7 +631,7 @@ func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) (
 		s.normBuf = normalizeInto(s.normBuf, q)
 		qn = s.normBuf
 	}
-	s.cells = topNCellsInto(qn, ix.coarse, ix.nprobe, &s.cd, s.cells)
+	s.cells = ix.nearestCellsInto(qn, ix.nprobe, &s.cd, s.cells)
 
 	// Scan probed cells into s.dedup (label -> best distance). PQ and SQ have
 	// separate scan loops so the per-entry hot path carries no mode branch.
@@ -769,13 +837,13 @@ func (ix *StoreIndex) scanCellsPQ(s *searcher, cur *btree.Cursor, qn []float32) 
 	for _, c := range s.cells {
 		var base float32
 		if usePrecomp {
-			base = sqL2(qn, ix.coarse[c]) // ‖q − c_cell‖²
+			base = sqL2(qn, ix.coarseRow(c)) // ‖q − c_cell‖²
 			pc := ix.precomp[c*ix.m*pqK:]
 			for k := 0; k < ix.m*pqK; k++ {
 				s.lut[k] = pc[k] + s.qlut[k]
 			}
 		} else {
-			vek32.Sub_Into(s.qr, qn, ix.coarse[c])
+			vek32.Sub_Into(s.qr, qn, ix.coarseRow(c))
 			ix.buildLUT(s.qr, s.lut)
 		}
 		binary.BigEndian.PutUint32(seek[0:], uint32(c))
@@ -812,9 +880,9 @@ func (ix *StoreIndex) buildLUT(qr, lut []float32) {
 		lo := mm * ix.dsub
 		sub := qr[lo : lo+ix.dsub]
 		base := mm * pqK
-		cb := ix.pqcb[mm]
+		cb := ix.pqcb[mm*pqK*ix.dsub:] // this sub-quantizer's pqK·dsub floats
 		for j := 0; j < pqK; j++ {
-			lut[base+j] = sqL2(sub, cb[j])
+			lut[base+j] = sqL2(sub, cb[j*ix.dsub:j*ix.dsub+ix.dsub])
 		}
 	}
 }
@@ -826,9 +894,9 @@ func (ix *StoreIndex) buildQTerm(q, lut []float32) {
 		lo := mm * ix.dsub
 		sub := q[lo : lo+ix.dsub]
 		base := mm * pqK
-		cb := ix.pqcb[mm]
+		cb := ix.pqcb[mm*pqK*ix.dsub:]
 		for j := 0; j < pqK; j++ {
-			lut[base+j] = -2 * dotSmall(sub, cb[j])
+			lut[base+j] = -2 * dotSmall(sub, cb[j*ix.dsub:j*ix.dsub+ix.dsub])
 		}
 	}
 }
@@ -858,14 +926,14 @@ func (ix *StoreIndex) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) er
 	if err := ix.writeVecRecords(wtx, label, docID, x, &vecBuf); err != nil {
 		return err
 	}
-	cells := topNCells(x, ix.coarse, ix.assign)
+	cells := ix.nearestCells(x, ix.assign)
 	if err := ix.putDocCells(wtx, docID, label, cells); err != nil {
 		return err
 	}
 	r := make([]float32, ix.dim)
 	for ci, c := range cells {
 		if ci == 0 {
-			vek32.Sub_Into(r, x, ix.coarse[c])
+			vek32.Sub_Into(r, x, ix.coarseRow(c))
 			// Track how well the frozen centroids fit this new vector (drift signal).
 			mt.driftSum += float64(sqNorm(r))
 			mt.driftN++
@@ -875,7 +943,7 @@ func (ix *StoreIndex) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) er
 			codeBuf = encodeVecInt8(codeBuf, x) // int8 full vector
 		} else {
 			if ci != 0 {
-				vek32.Sub_Into(r, x, ix.coarse[c])
+				vek32.Sub_Into(r, x, ix.coarseRow(c))
 			}
 			codeBuf = encodeResidualInto(codeBuf, r, ix)
 		}
