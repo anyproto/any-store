@@ -1,9 +1,12 @@
 package vivf
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
+	"sync"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/viterin/vek/vek32"
@@ -53,8 +56,45 @@ type StoreIndex struct {
 	coarse [][]float32   // [nlist][dim]   — RAM-resident (the only hot set)
 	pqcb   [][][]float32 // [m][pqK][dsub]
 
-	metaRoot uint32
+	metaRoot  uint32
+	searchers sync.Pool // *searcher — reusable per-query scratch (alloc-free search)
 }
+
+// cand is one scanned candidate: a label and its approximate (ADC) distance.
+type cand struct {
+	label uint32
+	dist  float32
+}
+
+// cellDist pairs a coarse cell index with the query's distance to its centroid.
+type cellDist struct {
+	idx  int
+	dist float32
+}
+
+// searcher holds all per-query scratch so a search allocates nothing beyond its
+// result. Pooled on the index and reused across queries.
+type searcher struct {
+	normBuf []float32
+	qr      []float32
+	lut     []float32
+	cd      []cellDist
+	cells   []int
+	cands   []cand
+	dedup   u32fmap // label -> best ADC, map-free with O(1) reset
+	docOff  [][2]int
+	vbuf    []byte // reused :vec read buffer (re-rank)
+	dbuf    []byte // reused :lbl (docID) read buffer (re-rank)
+}
+
+func (ix *StoreIndex) getSearcher() *searcher {
+	if v := ix.searchers.Get(); v != nil {
+		return v.(*searcher)
+	}
+	return &searcher{}
+}
+
+func (ix *StoreIndex) putSearcher(s *searcher) { ix.searchers.Put(s) }
 
 func storeNsNames(prefix string) [6]string {
 	return [6]string{prefix + nsMeta, prefix + nsCB, prefix + nsCell, prefix + nsVec, prefix + nsLbl, prefix + nsDoc}
@@ -113,7 +153,7 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 
 	// Encode + place each vector. label == build order (dense 0..n-1). Accumulate the
 	// primary-cell reconstruction error to seed the drift baseline.
-	var keyBuf []byte
+	var keyBuf, codeBuf []byte
 	var reconSum float64
 	r := make([]float32, ix.dim)
 	for i, x := range norm {
@@ -131,7 +171,8 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 				reconSum += float64(sqNorm(r)) // nearest-cell residual = reconstruction error
 			}
 			keyBuf = cellKey(keyBuf, uint32(c), label)
-			if err := wtx.Put(ix.vcell, keyBuf, encodeResidual(r, ix)); err != nil {
+			codeBuf = encodeResidualInto(codeBuf, r, ix)
+			if err := wtx.Put(ix.vcell, keyBuf, codeBuf); err != nil {
 				return nil, err
 			}
 		}
@@ -150,14 +191,15 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 	return ix, nil
 }
 
-// encodeResidual produces the stored :cell value (PQ code) for a residual.
-func encodeResidual(r []float32, ix *StoreIndex) []byte {
-	code := make([]byte, ix.m)
+// encodeResidualInto produces the stored :cell value (PQ code) for a residual,
+// reusing dst (wtx.Put copies the bytes, so one buffer can be shared across cells).
+func encodeResidualInto(dst []byte, r []float32, ix *StoreIndex) []byte {
+	dst = dst[:0]
 	for mm := 0; mm < ix.m; mm++ {
 		lo := mm * ix.dsub
-		code[mm] = byte(nearestSmall(r[lo:lo+ix.dsub], ix.pqcb[mm]))
+		dst = append(dst, byte(nearestSmall(r[lo:lo+ix.dsub], ix.pqcb[mm])))
 	}
-	return code
+	return dst
 }
 
 // writeVecRecords stores the (normalized) full vector for re-rank and the
@@ -390,22 +432,27 @@ func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) (
 	if ef < 1 {
 		ef = 1
 	}
+	s := ix.getSearcher()
+	defer ix.putSearcher(s)
+
 	qn := q
 	if ix.normalize {
-		qn = normalize(q)
+		s.normBuf = normalizeInto(s.normBuf, q)
+		qn = s.normBuf
 	}
-	cells := topNCells(qn, ix.coarse, ix.nprobe)
+	s.cells = topNCellsInto(qn, ix.coarse, ix.nprobe, &s.cd, s.cells)
 
-	// Scan probed cells; keep each label's best ADC (a label may recur via closure).
-	best := make(map[uint32]float32)
-	lut := make([]float32, ix.m*pqK)
-	qr := make([]float32, ix.dim)
+	// Scan probed cells; dedup labels keeping the best ADC (closure can place one
+	// label in several probed cells), map-free via the pooled u32fmap.
+	s.lut = ensureF32(s.lut, ix.m*pqK)
+	s.qr = ensureF32(s.qr, ix.dim)
+	s.dedup.reset()
 	cur := rtx.NewCursor(ix.vcell)
 	defer cur.Close()
 	var seek [8]byte
-	for _, c := range cells {
-		vek32.Sub_Into(qr, qn, ix.coarse[c])
-		ix.buildLUT(qr, lut)
+	for _, c := range s.cells {
+		vek32.Sub_Into(s.qr, qn, ix.coarse[c])
+		ix.buildLUT(s.qr, s.lut)
 		binary.BigEndian.PutUint32(seek[0:], uint32(c))
 		binary.BigEndian.PutUint32(seek[4:], 0)
 		if err := cur.Seek(seek[:]); err != nil {
@@ -419,62 +466,76 @@ func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) (
 			if err != nil {
 				return nil, err
 			}
-			if cellKeyList(key) != uint32(c) {
+			if !bytes.Equal(key[:4], seek[:4]) {
 				break // left this cell's contiguous range
 			}
 			code, err := cur.Value()
 			if err != nil {
 				return nil, err
 			}
-			label := cellKeyLabel(key)
-			d := adc(lut, code, ix.m)
-			if prev, ok := best[label]; !ok || d < prev {
-				best[label] = d
-			}
+			s.dedup.putMin(cellKeyLabel(key), adc(s.lut, code, ix.m))
 			if err := cur.Next(); err != nil {
 				return nil, err
 			}
 		}
 	}
 
-	type cand struct {
-		label uint32
-		dist  float32
-	}
-	cands := make([]cand, 0, len(best))
-	for label, d := range best {
-		cands = append(cands, cand{label, d})
-	}
-	// Truncate to ef best by ADC before the exact re-rank, bounding :vec reads.
-	partialSortByDist(cands, func(c cand) float32 { return c.dist }, ef)
-	if len(cands) > ef {
-		cands = cands[:ef]
+	// Keep the ef best by ADC before the exact re-rank (bounds :vec reads).
+	s.cands = s.dedup.collect(s.cands)
+	slices.SortFunc(s.cands, func(a, b cand) int { return cmpF32(a.dist, b.dist) })
+	if len(s.cands) > ef {
+		s.cands = s.cands[:ef]
 	}
 
-	// Re-rank survivors by exact distance, resolving docIDs.
-	out := make([]Candidate, 0, len(cands))
+	// Re-rank survivors by exact distance, packing docIDs into one backing slice so
+	// the result costs ~2 allocations regardless of ef.
+	out := make([]Candidate, 0, len(s.cands))
+	s.docOff = s.docOff[:0]
+	backing := make([]byte, 0, len(s.cands)*12)
 	var lk [4]byte
-	for _, c := range cands {
+	for _, c := range s.cands {
 		binary.BigEndian.PutUint32(lk[:], c.label)
-		vb, err := rtx.Get(ix.vvec, lk[:])
+		vb, err := rtx.AppendValue(ix.vvec, lk[:], s.vbuf[:0])
 		if err != nil {
 			if errors.Is(err, btree.ErrKeyNotFound) {
 				continue // tombstoned between scan and re-rank
 			}
 			return nil, err
 		}
-		x := bytesAsF32(vb, ix.dim)
-		docID, err := rtx.Get(ix.vlbl, lk[:])
+		s.vbuf = vb
+		dist := ix.exactDist(qn, bytesAsF32(vb, ix.dim))
+		docID, err := rtx.AppendValue(ix.vlbl, lk[:], s.dbuf[:0])
 		if err != nil {
 			if errors.Is(err, btree.ErrKeyNotFound) {
 				continue
 			}
 			return nil, err
 		}
-		out = append(out, Candidate{DocID: cloneBytes(docID), Distance: ix.exactDist(qn, x)})
+		s.dbuf = docID
+		start := len(backing)
+		backing = append(backing, docID...)
+		s.docOff = append(s.docOff, [2]int{start, len(backing)})
+		out = append(out, Candidate{Distance: dist})
 	}
-	partialSortByDist(out, func(c Candidate) float32 { return c.Distance }, len(out))
+	// backing is final now — slice docIDs out of it, then sort closest-first. Sorting
+	// the ~ef re-ranked survivors here (and marking the spec Ordered) is measurably
+	// cheaper than returning them unordered and letting the pipeline's SortIter
+	// collect+heap+fetch: with Ordered set the planner skips the SortIter for the
+	// default distance order and streams straight to LimitIter (~19% faster end to
+	// end). An explicit multi-key Sort still goes through SortIter regardless.
+	for i := range out {
+		out[i].DocID = backing[s.docOff[i][0]:s.docOff[i][1]]
+	}
+	slices.SortFunc(out, func(a, b Candidate) int { return cmpF32(a.Distance, b.Distance) })
 	return out, nil
+}
+
+// ensureF32 returns a length-n float32 slice reusing buf's capacity when possible.
+func ensureF32(buf []float32, n int) []float32 {
+	if cap(buf) < n {
+		return make([]float32, n)
+	}
+	return buf[:n]
 }
 
 // exactDist is the final re-rank distance: cosine (1−dot on unit vectors) for a
@@ -526,7 +587,7 @@ func (ix *StoreIndex) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) er
 	if err := ix.putDocCells(wtx, docID, label, cells); err != nil {
 		return err
 	}
-	var keyBuf []byte
+	var keyBuf, codeBuf []byte
 	r := make([]float32, ix.dim)
 	for ci, c := range cells {
 		vek32.Sub_Into(r, x, ix.coarse[c])
@@ -536,7 +597,8 @@ func (ix *StoreIndex) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) er
 			mt.driftN++
 		}
 		keyBuf = cellKey(keyBuf, uint32(c), label)
-		if err := wtx.Put(ix.vcell, keyBuf, encodeResidual(r, ix)); err != nil {
+		codeBuf = encodeResidualInto(codeBuf, r, ix)
+		if err := wtx.Put(ix.vcell, keyBuf, codeBuf); err != nil {
 			return err
 		}
 	}

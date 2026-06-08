@@ -597,8 +597,10 @@ func (q *collQuery) detectVectorQuery() (*qplanner.VectorQuerySpec, query.Filter
 	if vi.isIVF() {
 		// IVF-PQ: probe a few cells (contiguous range scans), re-rank by exact
 		// distance. ef is the re-rank depth / candidate count, sized to the page
-		// window; nprobe is fixed in the index. Candidates come back closest-first,
-		// so the same FilterIter -> SortIter -> LimitIter chain finishes the query.
+		// window; nprobe is fixed in the index. SearchCandidates returns them
+		// closest-first (Ordered) — measurably faster than letting SortIter sort, as
+		// the planner then skips the SortIter for the default distance order and
+		// streams straight to LimitIter; an explicit multi-key Sort still uses SortIter.
 		ef := chooseEf(int(q.vectorEf), captured.ivf.NProbe()*8, int(q.limit)+int(q.offset), residual != nil)
 		spec := &qplanner.VectorQuerySpec{
 			Query:   qvec,

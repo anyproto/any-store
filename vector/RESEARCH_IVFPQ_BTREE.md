@@ -359,6 +359,17 @@ as a later recall-per-byte upgrade. Always with an **exact re-rank** stage over 
   Tested: drift score rises on a distribution shift, auto-rebuild recovers recall a frozen index loses
   (0.67 → 1.00, `vector_ivfpq_test.go`), `Rebuild` clears drift and restores store-level recall
   0.58 → 1.00 (`internal/vivf/drift_test.go`).
+- **Search-path allocation pass. ✅ DONE.** `SearchCandidates` now allocates ~3 (result + cursor)
+  instead of ~339/query: a pooled `searcher` (sync.Pool, mirroring `internal/vindex`) holds all
+  scratch (normBuf/qr/lut/cell buffers); the closure-dedup `map[uint32]float32` is replaced by a
+  map-free flat open-addressing min-map with O(1) generation reset (`u32fmap`, the value-carrying
+  sibling of vindex's `u32set`); per-candidate `:vec`/`:lbl` reads use `rtx.AppendValue` into reusable
+  buffers instead of allocating `Get`; result docIDs pack into one backing slice; cell-boundary check
+  is `bytes.Equal`; `sqNorm` is `vek32.Dot`. Microbench: **339 → ~6 allocs/op, 136 KB → 7 KB/op**.
+  The final closest-first sort is kept *inside* `SearchCandidates` (with `spec.Ordered`) rather than
+  delegated to the pipeline `SortIter` — measured ~19% faster end-to-end, since the planner then skips
+  the SortIter for the default distance order and streams to `LimitIter`.
+
 - **Phase 3 — Ada-IVF local maintenance.** Local split/merge of hot violator lists; bound drift
   without full rebuilds; the IVFPQ analogue of `CompactRatio`.
 - **Phase 4 (optional) — recall/perf upgrades.** Anisotropic codebooks; OPQ rotation; an in-RAM
