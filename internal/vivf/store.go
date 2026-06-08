@@ -580,10 +580,22 @@ func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) (
 		selectSmallest(s.cands, ef)
 		s.cands = s.cands[:ef]
 	}
-	slices.SortFunc(s.cands, func(a, b cand) int { return cmpF32(a.dist, b.dist) })
-
-	// Re-rank survivors by exact distance, packing docIDs into one backing slice so
-	// the result costs ~2 allocations regardless of ef.
+	// Re-rank survivors by exact distance, reading :vec/:lbl in LABEL order rather
+	// than ADC-distance order: the records are keyed by label, so a label-sorted pass
+	// walks the btree in ascending key order — leaf-local and prefetch-friendly,
+	// sharing upper-tree pages across descents — instead of N random reads that
+	// thrash the cache (matters most on a large :vec that doesn't fit cache). The
+	// result is re-sorted by distance just below.
+	slices.SortFunc(s.cands, func(a, b cand) int {
+		switch {
+		case a.label < b.label:
+			return -1
+		case a.label > b.label:
+			return 1
+		default:
+			return 0
+		}
+	})
 	out := make([]Candidate, 0, len(s.cands))
 	s.docOff = s.docOff[:0]
 	backing := make([]byte, 0, len(s.cands)*12)
