@@ -120,7 +120,11 @@ type VectorParams struct {
 	M              int `json:"m,omitempty"`
 	EfConstruction int `json:"efConstruction,omitempty"`
 	EfSearch       int `json:"efSearch,omitempty"`
-	// Quantization selects the stored vector format (default full float32).
+	// Quantization selects the stored vector format (default full float32). For
+	// VectorModeIVFPQ it sets the format of the re-rank vector store (the bulk of the
+	// index): VectorQuantInt8 makes it ~4× smaller on disk and in the page cache —
+	// cutting RAM and speeding the random per-candidate re-rank reads — at ~0.5%
+	// recall, and is recommended there.
 	Quantization VectorQuantization `json:"quantization,omitempty"`
 	// Mode selects the index strategy (default btree). See VectorMode.
 	Mode VectorMode `json:"mode,omitempty"`

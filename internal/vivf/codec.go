@@ -42,6 +42,7 @@ type meta struct {
 	nprobe     int  // default cells to scan at search
 	precompMiB int  // precomputed-table RAM budget (StoreParams.PrecompMiB)
 	normalize  bool // cosine: vectors stored/queried unit-normalized
+	int8vec    bool // :vec re-rank store is int8-quantized
 	count      int64
 	nextLabel  uint32
 
@@ -84,6 +85,11 @@ func encodeMeta(mt *meta) []byte {
 	put64(uint64(mt.buildCount))
 	put64(uint64(mt.churn))
 	put32(uint32(int32(mt.precompMiB))) // signed; <0 disables the table
+	if mt.int8vec {
+		buf = append(buf, 1)
+	} else {
+		buf = append(buf, 0)
+	}
 	return buf
 }
 
@@ -116,6 +122,10 @@ func decodeMeta(data []byte) (*meta, error) {
 	}
 	if off+4 <= len(data) { // precompMiB (absent in older records → 0 = default)
 		mt.precompMiB = int(int32(get32()))
+	}
+	if off < len(data) { // int8vec (absent in older records → false)
+		mt.int8vec = data[off] != 0
+		off++
 	}
 	return mt, nil
 }

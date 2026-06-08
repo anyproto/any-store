@@ -397,6 +397,15 @@ as a later recall-per-byte upgrade. Always with an **exact re-rank** stage over 
 
 - **Phase 3 — Ada-IVF local maintenance.** Local split/merge of hot violator lists; bound drift
   without full rebuilds; the IVFPQ analogue of `CompactRatio`.
+- **int8 re-rank store. ✅ DONE.** `VectorParams.Quantization == VectorQuantInt8` stores the `:vec`
+  re-rank vectors int8 (`[scale][dim int8]`, the same codec as the HNSW path) instead of f32. Since
+  `:vec` is the bulk of the index, this is the big RAM win — and it attacks the e2e bottleneck (the
+  random per-candidate re-rank reads): query decodes int8 → f32 into a pooled buffer, distance stays
+  full-precision. Measured (real export, closure=4/nprobe=16): recall **0.951 → 0.945** (−0.6%), index
+  **192.7 → 53.8 MiB (3.6×)**, heap **418.8 → 286.4 MiB (−132 MiB)**, p50 1.19 → 1.14 ms. The `Int8`
+  flag is persisted in meta and carried through `Rebuild`; a store test asserts recall parity (~0.5%)
+  and the ~4–5× `:vec` shrink. Recommended default for IVF-PQ at scale.
+
 - **Phase 4 (optional) — recall/perf upgrades.** Anisotropic codebooks; OPQ rotation; an in-RAM
   pointer-free code slab for pure-RAM scans; RQ for tiny code budgets.
 

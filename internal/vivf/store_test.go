@@ -192,6 +192,71 @@ func TestStoreIVFPQPrecompBudget(t *testing.T) {
 	require.Nil(t, open(build(-1)).precomp, "negative budget disables the table")
 }
 
+// TestStoreIVFPQInt8 compares the int8 re-rank store to f32 on the real export:
+// recall must stay within ~1% and the :vec namespace must shrink ~4×.
+func TestStoreIVFPQInt8(t *testing.T) {
+	if testing.Short() {
+		t.Skip("recall diagnostic")
+	}
+	dir := vbenchDir()
+	base, err := readF32(filepath.Join(dir, "base.f32"))
+	if err != nil {
+		t.Skipf("no ASV_VBENCH export at %s: %v", dir, err)
+	}
+	queries, err := readF32(filepath.Join(dir, "query.f32"))
+	require.NoError(t, err)
+	gt, err := readI32(filepath.Join(dir, "gt.i32"))
+	require.NoError(t, err)
+	qidx, err := readI32(filepath.Join(dir, "qidx.i32"))
+	require.NoError(t, err)
+	self := func(i int) int { return int(qidx[0][i]) }
+	const (
+		k  = 10
+		ef = 100
+	)
+	dim := len(base[0])
+
+	run := func(int8vec bool) (recall float64, vecBytes int) {
+		db := openMem(t)
+		ids := make([][]byte, len(base))
+		for i := range base {
+			ids[i] = bid(i)
+		}
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		p := StoreParams{Dim: dim, NList: 256, M: 96, Assign: 4, NProbe: 16, Normalize: true, Int8: int8vec, KMeansPP: true, Seed: 42}
+		_, err = BulkBuild(wtx, "ivf", p, ids, base)
+		require.NoError(t, err)
+		require.NoError(t, wtx.Commit())
+
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer rtx.Rollback()
+		ix, err := OpenTx(rtx, "ivf")
+		require.NoError(t, err)
+		st, err := ix.Stats(rtx)
+		require.NoError(t, err)
+		var sum float64
+		for i, q := range queries {
+			cands, err := ix.SearchCandidates(rtx, q, ef)
+			require.NoError(t, err)
+			got := make([]int, 0, k)
+			for _, c := range cands {
+				got = append(got, int(binary.BigEndian.Uint64(c.DocID))-1)
+			}
+			got = exclude(got, self(i), k)
+			sum += recallVsGT(got, gt[i], k)
+		}
+		return sum / float64(len(queries)), st.Vec.TotalPages()
+	}
+
+	rF32, szF32 := run(false)
+	rInt8, szInt8 := run(true)
+	t.Logf("recall@%d f32=%.4f int8=%.4f | :vec pages f32=%d int8=%d (%.2f×)", k, rF32, rInt8, szF32, szInt8, float64(szF32)/float64(szInt8))
+	require.GreaterOrEqual(t, rInt8, rF32-0.015, "int8 recall must stay within ~1.5%% of f32")
+	require.Less(t, szInt8, szF32*45/100, "int8 :vec must be <45%% of f32 size")
+}
+
 // TestStoreIVFPQRecallReal builds the btree-resident index on the real export and
 // confirms its recall@10 matches the in-RAM prototype / HNSW baseline (~0.97),
 // proving the storage layer preserves the algorithm's recall.

@@ -27,6 +27,7 @@ type StoreParams struct {
 	Assign     int  // closure factor: each vector placed in its Assign nearest cells
 	NProbe     int  // default cells scanned per search
 	Normalize  bool // cosine: store/query unit-normalized vectors
+	Int8       bool // store the :vec re-rank vectors int8-quantized (~4× smaller)
 	KMeansPP   bool
 	PrecompMiB int // precomputed-table RAM budget: 0=default, <0=off, >0=MiB
 	Seed       int64
@@ -52,8 +53,9 @@ type StoreIndex struct {
 	vmeta, vcb, vcell, vvec, vlbl, vdoc *btree.Namespace
 
 	dim, nlist, m, dsub, nprobe, assign int
-	precompMiB                          int // precomputed-table RAM budget (see StoreParams)
+	precompMiB                          int  // precomputed-table RAM budget (see StoreParams)
 	normalize                           bool
+	int8vec                             bool // :vec re-rank store is int8-quantized
 
 	coarse [][]float32   // [nlist][dim]   — RAM-resident (the only hot set)
 	pqcb   [][][]float32 // [m][pqK][dsub]
@@ -137,8 +139,9 @@ type searcher struct {
 	dedup   u32fmap   // label -> best ADC, map-free with O(1) reset
 	qlut    []float32 // per-query −2·q_m·cb[m][j] table (precomp path)
 	docOff  [][2]int
-	vbuf    []byte // reused :vec read buffer (re-rank)
-	dbuf    []byte // reused :lbl (docID) read buffer (re-rank)
+	vbuf    []byte    // reused :vec read buffer (re-rank)
+	vbufF32 []float32 // reused dequant target for int8 :vec (re-rank)
+	dbuf    []byte    // reused :lbl (docID) read buffer (re-rank)
 }
 
 func (ix *StoreIndex) getSearcher() *searcher {
@@ -172,7 +175,7 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 		return nil, fmt.Errorf("vivf: dim %d must be a positive multiple of M %d", p.Dim, p.M)
 	}
 	p.withDefaults()
-	ix := &StoreIndex{dim: p.Dim, nlist: p.NList, m: p.M, dsub: p.Dim / p.M, nprobe: p.NProbe, assign: p.Assign, normalize: p.Normalize, precompMiB: p.PrecompMiB}
+	ix := &StoreIndex{dim: p.Dim, nlist: p.NList, m: p.M, dsub: p.Dim / p.M, nprobe: p.NProbe, assign: p.Assign, normalize: p.Normalize, int8vec: p.Int8, precompMiB: p.PrecompMiB}
 
 	names := storeNsNames(prefix)
 	ns := make([]*btree.Namespace, len(names))
@@ -207,12 +210,12 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 
 	// Encode + place each vector. label == build order (dense 0..n-1). Accumulate the
 	// primary-cell reconstruction error to seed the drift baseline.
-	var keyBuf, codeBuf []byte
+	var keyBuf, codeBuf, vecBuf []byte
 	var reconSum float64
 	r := make([]float32, ix.dim)
 	for i, x := range norm {
 		label := uint32(i)
-		if err := ix.writeVecRecords(wtx, label, ids[i], x); err != nil {
+		if err := ix.writeVecRecords(wtx, label, ids[i], x, &vecBuf); err != nil {
 			return nil, err
 		}
 		cells := topNCells(x, ix.coarse, ix.assign)
@@ -237,7 +240,7 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 	if n > 0 {
 		reconBase = reconSum / float64(n)
 	}
-	mt := &meta{dim: p.Dim, nlist: p.NList, m: p.M, assign: p.Assign, nprobe: p.NProbe, precompMiB: p.PrecompMiB, normalize: p.Normalize, count: int64(n), nextLabel: uint32(n), reconBase: reconBase, buildCount: int64(n)}
+	mt := &meta{dim: p.Dim, nlist: p.NList, m: p.M, assign: p.Assign, nprobe: p.NProbe, precompMiB: p.PrecompMiB, normalize: p.Normalize, int8vec: p.Int8, count: int64(n), nextLabel: uint32(n), reconBase: reconBase, buildCount: int64(n)}
 	if err := wtx.Put(ix.vmeta, metaKey, encodeMeta(mt)); err != nil {
 		return nil, err
 	}
@@ -257,18 +260,23 @@ func encodeResidualInto(dst []byte, r []float32, ix *StoreIndex) []byte {
 	return dst
 }
 
-// writeVecRecords stores the (normalized) full vector for re-rank and the
-// label↔docID maps.
-func (ix *StoreIndex) writeVecRecords(wtx *btree.WriteTx, label uint32, docID []byte, x []float32) error {
+// writeVecRecords stores the (normalized) vector for re-rank and the label↔docID
+// maps. enc is a reusable buffer for the int8 encoding (ignored for f32, which is
+// a zero-copy byte view).
+func (ix *StoreIndex) writeVecRecords(wtx *btree.WriteTx, label uint32, docID []byte, x []float32, enc *[]byte) error {
 	var lk [4]byte
 	binary.BigEndian.PutUint32(lk[:], label)
-	if err := wtx.Put(ix.vvec, lk[:], f32bytes(x)); err != nil {
+	var vb []byte
+	if ix.int8vec {
+		*enc = encodeVecInt8((*enc)[:0], x)
+		vb = *enc
+	} else {
+		vb = f32bytes(x)
+	}
+	if err := wtx.Put(ix.vvec, lk[:], vb); err != nil {
 		return err
 	}
-	if err := wtx.Put(ix.vlbl, lk[:], docID); err != nil {
-		return err
-	}
-	return nil
+	return wtx.Put(ix.vlbl, lk[:], docID)
 }
 
 // putDocCells records, under docID, the label and the cells it was placed in — so
@@ -323,6 +331,7 @@ func OpenTx(rtx *btree.ReadTx, prefix string) (*StoreIndex, error) {
 	ix.dim, ix.nlist, ix.m, ix.dsub = mt.dim, mt.nlist, mt.m, mt.dim/mt.m
 	ix.nprobe, ix.assign, ix.normalize = mt.nprobe, mt.assign, mt.normalize
 	ix.precompMiB = mt.precompMiB
+	ix.int8vec = mt.int8vec
 
 	cb, err := rtx.Get(ix.vcb, coarseKey)
 	if err != nil {
@@ -450,7 +459,13 @@ func Rebuild(wtx *btree.WriteTx, prefix string) (*StoreIndex, error) {
 			return nil, err
 		}
 		ids = append(ids, cloneBytes(docID))
-		vecs = append(vecs, append([]float32(nil), bytesAsF32(vb, old.dim)...))
+		v := make([]float32, old.dim)
+		if old.int8vec {
+			decodeVecInt8(vb, old.dim, v)
+		} else {
+			copy(v, bytesAsF32(vb, old.dim))
+		}
+		vecs = append(vecs, v)
 		if err := cur.Next(); err != nil {
 			return nil, err
 		}
@@ -462,7 +477,7 @@ func Rebuild(wtx *btree.WriteTx, prefix string) (*StoreIndex, error) {
 	}
 	p := StoreParams{
 		Dim: old.dim, NList: ivfRebuildNList(old.nlist, len(vecs)), M: old.m,
-		Assign: old.assign, NProbe: old.nprobe, Normalize: old.normalize,
+		Assign: old.assign, NProbe: old.nprobe, Normalize: old.normalize, Int8: old.int8vec,
 		KMeansPP: true, PrecompMiB: old.precompMiB, Seed: 1,
 	}
 	return BulkBuild(wtx, prefix, p, ids, vecs)
@@ -583,7 +598,14 @@ func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) (
 			return nil, err
 		}
 		s.vbuf = vb
-		dist := ix.exactDist(qn, bytesAsF32(vb, ix.dim))
+		var x []float32
+		if ix.int8vec {
+			s.vbufF32 = ensureF32(s.vbufF32, ix.dim)
+			x = decodeVecInt8(vb, ix.dim, s.vbufF32)
+		} else {
+			x = bytesAsF32(vb, ix.dim)
+		}
+		dist := ix.exactDist(qn, x)
 		docID, err := rtx.AppendValue(ix.vlbl, lk[:], s.dbuf[:0])
 		if err != nil {
 			if errors.Is(err, btree.ErrKeyNotFound) {
@@ -719,14 +741,14 @@ func (ix *StoreIndex) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) er
 	label := mt.nextLabel
 	mt.nextLabel++
 	mt.count++
-	if err := ix.writeVecRecords(wtx, label, docID, x); err != nil {
+	var keyBuf, codeBuf, vecBuf []byte
+	if err := ix.writeVecRecords(wtx, label, docID, x, &vecBuf); err != nil {
 		return err
 	}
 	cells := topNCells(x, ix.coarse, ix.assign)
 	if err := ix.putDocCells(wtx, docID, label, cells); err != nil {
 		return err
 	}
-	var keyBuf, codeBuf []byte
 	r := make([]float32, ix.dim)
 	for ci, c := range cells {
 		vek32.Sub_Into(r, x, ix.coarse[c])

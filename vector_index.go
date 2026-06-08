@@ -135,6 +135,7 @@ func ivfStoreParams(p *VectorParams, n int) vivf.StoreParams {
 		Assign:     closure,
 		NProbe:     nprobe,
 		Normalize:  p.Metric == VectorCosine,
+		Int8:       p.Quantization == VectorQuantInt8,
 		KMeansPP:   true,
 		PrecompMiB: p.PrecomputeTableMiB,
 	}
