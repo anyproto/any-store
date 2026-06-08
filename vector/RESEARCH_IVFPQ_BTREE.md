@@ -345,8 +345,20 @@ as a later recall-per-byte upgrade. Always with an **exact re-rank** stage over 
   and reopen-persistence; race-clean. Store-level recall on the real export = **0.963 @ nprobe=16**
   (`internal/vivf/store_test.go`), matching the prototype. Remaining: benchmark btree-reads/query vs HNSW
   on the `vector_rps_test.go` harness, and an int8 re-rank store.
-- **Phase 2 — incremental insert/delete + drift accounting.** Assign-on-insert, tombstone-delete,
-  per-list size/error/temperature counters in meta, the global fail-safe full-retrain.
+- **Phase 2 — incremental insert/delete + drift accounting. ✅ DONE.** Assign-on-insert, *physical*
+  delete (no tombstones — so no HNSW-style compaction needed), and **cheap drift detection**: the
+  reconstruction error `‖x−nearestCentroid‖²` is computed for free during `Insert`, so a running mean
+  vs the build-time baseline (`reconBase`) tells us how well the frozen codebooks still fit the data;
+  a churn counter backstops the delete-heavy case. `DriftScore = max(reconRatio−1, churnRatio)` (O(1),
+  one meta read; the recon signal gated behind ≥10% inserted so outliers can't trip it). The global
+  fail-safe full-retrain is `vivf.Rebuild` (re-train from live `:vec`, rescale nlist), wired to the
+  **existing auto-maintenance machinery**: IVF reuses `VectorParams.CompactRatio` as the drift
+  threshold, `vectorIndex.overThreshold` = `DriftScore ≥ CompactRatio`, `vectorIndex.compact` =
+  `Rebuild`, and `Collection.CompactVectorIndex` triggers it manually. (Required one fix: `Insert` now
+  also calls `maybeAutoCompactVectors`, since for IVF — unlike HNSW — inserts are what cause drift.)
+  Tested: drift score rises on a distribution shift, auto-rebuild recovers recall a frozen index loses
+  (0.67 → 1.00, `vector_ivfpq_test.go`), `Rebuild` clears drift and restores store-level recall
+  0.58 → 1.00 (`internal/vivf/drift_test.go`).
 - **Phase 3 — Ada-IVF local maintenance.** Local split/merge of hot violator lists; bound drift
   without full rebuilds; the IVFPQ analogue of `CompactRatio`.
 - **Phase 4 (optional) — recall/perf upgrades.** Anisotropic codebooks; OPQ rotation; an in-RAM

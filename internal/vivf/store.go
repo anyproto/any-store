@@ -111,8 +111,10 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 		return nil, err
 	}
 
-	// Encode + place each vector. label == build order (dense 0..n-1).
+	// Encode + place each vector. label == build order (dense 0..n-1). Accumulate the
+	// primary-cell reconstruction error to seed the drift baseline.
 	var keyBuf []byte
+	var reconSum float64
 	r := make([]float32, ix.dim)
 	for i, x := range norm {
 		label := uint32(i)
@@ -123,8 +125,11 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 		if err := ix.putDocCells(wtx, ids[i], label, cells); err != nil {
 			return nil, err
 		}
-		for _, c := range cells {
+		for ci, c := range cells {
 			vek32.Sub_Into(r, x, ix.coarse[c])
+			if ci == 0 {
+				reconSum += float64(sqNorm(r)) // nearest-cell residual = reconstruction error
+			}
 			keyBuf = cellKey(keyBuf, uint32(c), label)
 			if err := wtx.Put(ix.vcell, keyBuf, encodeResidual(r, ix)); err != nil {
 				return nil, err
@@ -132,7 +137,12 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 		}
 	}
 
-	mt := &meta{dim: p.Dim, nlist: p.NList, m: p.M, assign: p.Assign, nprobe: p.NProbe, normalize: p.Normalize, count: int64(len(vecs)), nextLabel: uint32(len(vecs))}
+	n := len(vecs)
+	reconBase := 0.0
+	if n > 0 {
+		reconBase = reconSum / float64(n)
+	}
+	mt := &meta{dim: p.Dim, nlist: p.NList, m: p.M, assign: p.Assign, nprobe: p.NProbe, normalize: p.Normalize, count: int64(n), nextLabel: uint32(n), reconBase: reconBase, buildCount: int64(n)}
 	if err := wtx.Put(ix.vmeta, metaKey, encodeMeta(mt)); err != nil {
 		return nil, err
 	}
@@ -267,6 +277,108 @@ func (ix *StoreIndex) Stats(rtx *btree.ReadTx) (StoreStats, error) {
 
 // NProbe returns the index's default cells-per-search.
 func (ix *StoreIndex) NProbe() int { return ix.nprobe }
+
+// DriftScore returns how far the index has drifted from its build-time codebooks,
+// as max(reconRatio−1, churnRatio):
+//   - reconRatio = mean residual norm of inserts-since-build ÷ the build baseline
+//     (how much worse new data fits the frozen centroids), and
+//   - churnRatio = writes-since-build ÷ built size (a delete-heavy backstop).
+//
+// Both are ~0 on a fresh build and grow with drift. A caller rebuilds when the
+// score crosses a threshold (the IVF analog of HNSW's tombstone CompactRatio). It
+// is O(1): just a meta read.
+func (ix *StoreIndex) DriftScore(rtx *btree.ReadTx) (float64, error) {
+	mt, err := ix.readMeta(rtx)
+	if err != nil {
+		return 0, err
+	}
+	if mt.buildCount <= 0 {
+		return 0, nil
+	}
+	// The reconstruction-error signal only counts once a meaningful fraction (~10%)
+	// of the built size has been inserted, so a handful of outliers can't trigger a
+	// rebuild — it needs a sustained distribution shift. Below that, only the churn
+	// backstop applies.
+	var recon float64
+	if mt.reconBase > 0 && mt.driftN*10 >= mt.buildCount && mt.driftN > 0 {
+		recon = (mt.driftSum / float64(mt.driftN)) / mt.reconBase
+	}
+	churn := float64(mt.churn) / float64(mt.buildCount)
+	score := churn
+	if recon-1 > score {
+		score = recon - 1
+	}
+	return score, nil
+}
+
+// Rebuild re-trains the codebooks from the live vectors and rewrites the whole
+// index, clearing accumulated drift (the IVF analog of compaction). It recreates
+// the namespaces (root pages move — the caller MarkSchemaChanged so peers
+// reconcile). nlist is re-derived from the current live count, so the partition
+// also rescales. Returns a fresh StoreIndex bound to the rebuilt namespaces.
+func Rebuild(wtx *btree.WriteTx, prefix string) (*StoreIndex, error) {
+	rtx := &wtx.ReadTx
+	old, err := OpenTx(rtx, prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	// Collect the live (docID, vector) set into RAM before dropping the namespaces.
+	var ids [][]byte
+	var vecs [][]float32
+	cur := rtx.NewCursor(old.vvec)
+	defer cur.Close()
+	if err := cur.First(); err != nil && !errors.Is(err, btree.ErrKeyNotFound) {
+		return nil, err
+	}
+	for cur.Valid() {
+		key, err := cur.Key()
+		if err != nil {
+			return nil, err
+		}
+		vb, err := cur.Value()
+		if err != nil {
+			return nil, err
+		}
+		docID, err := rtx.Get(old.vlbl, key)
+		if err != nil {
+			if errors.Is(err, btree.ErrKeyNotFound) {
+				if err := cur.Next(); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			return nil, err
+		}
+		ids = append(ids, cloneBytes(docID))
+		vecs = append(vecs, append([]float32(nil), bytesAsF32(vb, old.dim)...))
+		if err := cur.Next(); err != nil {
+			return nil, err
+		}
+	}
+	cur.Close()
+
+	if err := DropNamespaces(wtx, prefix); err != nil {
+		return nil, err
+	}
+	p := StoreParams{
+		Dim: old.dim, NList: ivfRebuildNList(old.nlist, len(vecs)), M: old.m,
+		Assign: old.assign, NProbe: old.nprobe, Normalize: old.normalize, KMeansPP: true, Seed: 1,
+	}
+	return BulkBuild(wtx, prefix, p, ids, vecs)
+}
+
+// ivfRebuildNList keeps the configured nlist but clamps it to the live count (a
+// shrunken index can't have more cells than points).
+func ivfRebuildNList(configured, n int) int {
+	if n > 0 && configured > n {
+		return n
+	}
+	if configured < 1 {
+		return 1
+	}
+	return configured
+}
 
 // SearchCandidates returns up to ef nearest candidates, closest-first. It scans
 // nprobe cells (each a contiguous :cell range), scores members code-only via the
@@ -416,13 +528,19 @@ func (ix *StoreIndex) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) er
 	}
 	var keyBuf []byte
 	r := make([]float32, ix.dim)
-	for _, c := range cells {
+	for ci, c := range cells {
 		vek32.Sub_Into(r, x, ix.coarse[c])
+		if ci == 0 {
+			// Track how well the frozen centroids fit this new vector (drift signal).
+			mt.driftSum += float64(sqNorm(r))
+			mt.driftN++
+		}
 		keyBuf = cellKey(keyBuf, uint32(c), label)
 		if err := wtx.Put(ix.vcell, keyBuf, encodeResidual(r, ix)); err != nil {
 			return err
 		}
 	}
+	mt.churn++
 	return wtx.Put(ix.vmeta, metaKey, encodeMeta(mt))
 }
 
@@ -437,6 +555,7 @@ func (ix *StoreIndex) Delete(wtx *btree.WriteTx, docID []byte) (bool, error) {
 	if err != nil || !removed {
 		return removed, err
 	}
+	mt.churn++ // a delete also shifts the live distribution away from the centroids
 	return true, wtx.Put(ix.vmeta, metaKey, encodeMeta(mt))
 }
 

@@ -152,11 +152,12 @@ func newVectorIndexFromVindex(info IndexInfo, ix *vindex.Index) *vectorIndex {
 
 func newVectorIndexFromIVF(info IndexInfo, ivf *vivf.StoreIndex) *vectorIndex {
 	return &vectorIndex{
-		info:      info,
-		fieldPath: strings.Split(info.Vector.Field, "."),
-		dim:       info.Vector.Dim,
-		mode:      info.Vector.Mode,
-		ivf:       ivf,
+		info:         info,
+		fieldPath:    strings.Split(info.Vector.Field, "."),
+		dim:          info.Vector.Dim,
+		mode:         info.Vector.Mode,
+		compactRatio: info.Vector.CompactRatio, // IVF: drift threshold for auto-rebuild
+		ivf:          ivf,
 	}
 }
 
@@ -298,10 +299,15 @@ func (vi *vectorIndex) rootUnchanged(tx *btree.ReadTx, collName string) bool {
 // has no graph, so it is returned unchanged.
 func (vi *vectorIndex) compact(tx *btree.WriteTx, collName string) (*vectorIndex, error) {
 	if vi.isIVF() {
-		// IVF-PQ deletes physically remove records (no tombstones to reclaim), so
-		// there is no compaction analog yet. Centroid-drift maintenance (re-train /
-		// local reindex) is a later phase (RESEARCH_IVFPQ_BTREE.md §6).
-		return vi, nil
+		// IVF-PQ has no tombstones to reclaim (deletes are physical); "compaction"
+		// here means re-training the codebooks from the live set to clear centroid
+		// drift (RESEARCH_IVFPQ_BTREE.md §6). Recreates the namespaces, so the caller
+		// MarkSchemaChanged (done by CompactVectorIndex) so peers reopen.
+		ivf, err := vivf.Rebuild(tx, vectorIndexNsPrefix(collName, vi.info.Name))
+		if err != nil {
+			return nil, err
+		}
+		return newVectorIndexFromIVF(vi.info, ivf), nil
 	}
 	if vi.ix == nil {
 		return vi, nil
@@ -321,7 +327,14 @@ func (vi *vectorIndex) compact(tx *btree.WriteTx, collName string) (*vectorIndex
 // nodes (so an auto-compaction is due). Cheap: one meta read, no namespace walk.
 func (vi *vectorIndex) overThreshold(tx *btree.ReadTx) (bool, error) {
 	if vi.isIVF() {
-		return false, nil // no tombstone-based compaction for IVF-PQ (see compact)
+		if vi.ivf == nil || vi.compactRatio <= 0 {
+			return false, nil
+		}
+		score, err := vi.ivf.DriftScore(tx)
+		if err != nil {
+			return false, err
+		}
+		return score >= vi.compactRatio, nil
 	}
 	if vi.ix == nil || vi.compactRatio <= 0 {
 		return false, nil
@@ -817,11 +830,12 @@ func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) e
 			return fmt.Errorf("%w: vector index %q", ErrIndexNotFound, indexName)
 		}
 		vi := cur[idx]
-		if vi.ix == nil {
-			return nil // brute-force: no graph to compact
+		if vi.ix == nil && vi.ivf == nil {
+			return nil // brute-force: no index to compact
 		}
 		// Recreating the namespaces moves their root pages; MarkSchemaChanged so
-		// peers reconcile and reopen the index with fresh handles.
+		// peers reconcile and reopen the index with fresh handles. (For IVF this
+		// re-trains the codebooks from the live set — see vectorIndex.compact.)
 		tx.MarkSchemaChanged()
 		nvi, err := vi.compact(tx, c.name)
 		if err != nil {
@@ -847,7 +861,7 @@ func (c *collection) maybeAutoCompactVectors(ctx context.Context) {
 	vidxs := c.loadVectorIndexes()
 	enabled := false
 	for _, vi := range vidxs {
-		if vi.ix != nil && vi.compactRatio > 0 {
+		if (vi.ix != nil || vi.ivf != nil) && vi.compactRatio > 0 {
 			enabled = true
 			break
 		}

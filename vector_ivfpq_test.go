@@ -182,6 +182,82 @@ func TestVectorMode_IVFPQ_FilterUpdateDelete(t *testing.T) {
 	}
 }
 
+// driftedRecall builds an IVF-PQ index (with the given CompactRatio) on cluster A,
+// then batch-inserts a far-shifted cluster B and returns recall on B. With
+// auto-rebuild enabled (ratio>0) the post-insert maybeAutoCompactVectors re-trains
+// the codebooks to cover B; with it disabled (ratio 0) the frozen centroids miss B.
+func driftedRecall(t *testing.T, collName string, compactRatio float64) float64 {
+	return driftedRecallMode(t, collName, compactRatio, false)
+}
+
+func driftedRecallMode(t *testing.T, collName string, compactRatio float64, manual bool) float64 {
+	const (
+		dim = 24
+		nA  = 2000
+		nB  = 2000
+		k   = 10
+	)
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, collName)
+	require.NoError(t, err)
+
+	A := clusteredVecsAS(nA, dim, 40, 1)
+	for i, v := range A {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, v))))
+	}
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{
+		Name: "emb", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, Mode: VectorModeIVFPQ,
+			Closure: 4, NProbe: 16, CompactRatio: compactRatio},
+	}))
+
+	// Far-shifted cluster B, inserted as one batch (one self-contained write → at
+	// most one auto-rebuild afterwards).
+	B := make([][]float32, nB)
+	Bdocs := make([]*anyenc.Value, nB)
+	for i := range B {
+		src := clusteredVecsAS(nB, dim, 40, 2)[i]
+		v := make([]float32, dim)
+		for d := range v {
+			v[d] = src[d] + 6
+		}
+		B[i] = v
+		Bdocs[i] = anyenc.MustParseJson(vecDocJSON(nA+i, v))
+	}
+	require.NoError(t, coll.Insert(ctx, Bdocs...))
+
+	if manual {
+		require.NoError(t, coll.CompactVectorIndex(ctx, "emb"))
+	}
+
+	all := append(append([][]float32{}, A...), B...)
+	var recall float64
+	for _, q := range B[:50] {
+		truth := bruteIDs(all, q, k)
+		hh, err := vsearch(coll, "v", q, k, 0)
+		require.NoError(t, err)
+		hit := 0
+		for _, h := range hh {
+			if truth[string(h.DocId)] {
+				hit++
+			}
+		}
+		recall += float64(hit) / float64(k)
+	}
+	return recall / 50
+}
+
+// TestVectorMode_IVFPQ_AutoRebuild proves the CompactRatio drift trigger: inserting
+// a distribution the build-time centroids don't cover auto-rebuilds the index
+// (when CompactRatio>0), recovering recall that a frozen index loses.
+func TestVectorMode_IVFPQ_AutoRebuild(t *testing.T) {
+	frozen := driftedRecall(t, "frozen", 0)     // no auto-rebuild
+	rebuilt := driftedRecall(t, "rebuilt", 0.5) // auto-rebuild on drift ≥ 0.5
+	t.Logf("recall on drifted cluster: frozen=%.3f, auto-rebuilt=%.3f", frozen, rebuilt)
+	assert.Greater(t, rebuilt, frozen, "auto-rebuild must recover recall lost to centroid drift")
+	assert.GreaterOrEqual(t, rebuilt, 0.9, "rebuilt index covers the new distribution")
+}
+
 // TestVectorMode_IVFPQ_Persist verifies the index round-trips through a reopen.
 func TestVectorMode_IVFPQ_Persist(t *testing.T) {
 	const (

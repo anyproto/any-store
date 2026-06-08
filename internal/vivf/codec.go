@@ -3,6 +3,7 @@ package vivf
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 	"unsafe"
 )
 
@@ -42,6 +43,19 @@ type meta struct {
 	normalize bool // cosine: vectors stored/queried unit-normalized
 	count     int64
 	nextLabel uint32
+
+	// Drift tracking (cheap, maintained incrementally): centroid quality decays as
+	// the data distribution shifts away from the build-time codebooks. reconBase is
+	// the mean squared residual norm (‖x−nearestCentroid‖²) over the build set;
+	// driftSum/driftN accumulate the same for inserts since the last build, so
+	// (driftSum/driftN)/reconBase is how much worse new data fits the centroids.
+	// buildCount is the live count at the last build and churn counts writes since,
+	// for a churn-ratio backstop. See StoreIndex.DriftScore.
+	reconBase  float64
+	driftSum   float64
+	driftN     int64
+	buildCount int64
+	churn      int64
 }
 
 func encodeMeta(mt *meta) []byte {
@@ -62,6 +76,12 @@ func encodeMeta(mt *meta) []byte {
 	}
 	put64(uint64(mt.count))
 	put32(mt.nextLabel)
+	putF := func(f float64) { put64(math.Float64bits(f)) }
+	putF(mt.reconBase)
+	putF(mt.driftSum)
+	put64(uint64(mt.driftN))
+	put64(uint64(mt.buildCount))
+	put64(uint64(mt.churn))
 	return buf
 }
 
@@ -85,6 +105,13 @@ func decodeMeta(data []byte) (*meta, error) {
 	off++
 	mt.count = int64(get64())
 	mt.nextLabel = get32()
+	if off+40 <= len(data) { // drift fields (absent in pre-drift records → 0)
+		mt.reconBase = math.Float64frombits(get64())
+		mt.driftSum = math.Float64frombits(get64())
+		mt.driftN = int64(get64())
+		mt.buildCount = int64(get64())
+		mt.churn = int64(get64())
+	}
 	return mt, nil
 }
 

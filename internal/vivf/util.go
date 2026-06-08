@@ -28,6 +28,15 @@ func sqL2(a, b []float32) float32 {
 	return s
 }
 
+// sqNorm is the squared L2 norm of v.
+func sqNorm(v []float32) float32 {
+	var s float32
+	for _, x := range v {
+		s += x * x
+	}
+	return s
+}
+
 // nearestSmall returns the index of the centroid closest (sqL2) to x among a PQ
 // sub-codebook.
 func nearestSmall(x []float32, cents [][]float32) int {

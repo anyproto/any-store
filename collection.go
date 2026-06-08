@@ -324,6 +324,14 @@ func (c *collection) Find(filter any) Query {
 }
 
 func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err error) {
+	// Inserts drive IVF-PQ centroid drift (they create no HNSW tombstones, so this
+	// is a no-op for the graph modes beyond a cheap enabled-check), so an insert can
+	// cross a vector index's auto-maintenance threshold just like an update/delete.
+	defer func() {
+		if err == nil {
+			c.maybeAutoCompactVectors(ctx)
+		}
+	}()
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 

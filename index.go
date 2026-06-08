@@ -156,6 +156,14 @@ type VectorParams struct {
 	// indexes prefer leaving this 0 and scheduling Collection.CompactVectorIndex in
 	// a maintenance window.
 	// Ignored for VectorModeBruteForce.
+	//
+	// For VectorModeIVFPQ, CompactRatio instead bounds *centroid drift*: IVF deletes
+	// are physical (no tombstones), but the codebooks are frozen at build, so as the
+	// data distribution shifts the partition degrades. CompactRatio triggers an
+	// automatic rebuild (re-train from the live set) when the drift score —
+	// max(reconstruction-error ratio − 1, churn ratio) — reaches it. ~0.5 rebuilds
+	// after the live set roughly doubles or new data fits the centroids ~50% worse;
+	// 0 disables auto-rebuild (use Collection.CompactVectorIndex manually).
 	CompactRatio float64 `json:"compactRatio,omitempty"`
 
 	// IVF-PQ parameters (Mode == VectorModeIVFPQ only). Zero values pick defaults.
