@@ -79,6 +79,14 @@ const (
 	// that a field is a vector. Search scans the collection and computes exact
 	// distances: ~free writes, ~0 storage, exact (100%) recall, O(N) search.
 	VectorModeBruteForce
+	// VectorModeIVFPQ is a btree-resident IVF-PQ index (see
+	// vector/RESEARCH_IVFPQ_BTREE.md): vectors are partitioned into nlist coarse
+	// cells and each is stored as a compact product-quantization code of its
+	// residual. Search probes a few cells (contiguous btree range scans — no random
+	// graph traversal) and re-ranks the survivors by exact distance. Far smaller hot
+	// RAM set (only the coarse centroids) and a sequential read pattern, at the cost
+	// of approximate recall recovered by re-rank. See VectorParams NList/NProbe/Closure.
+	VectorModeIVFPQ
 )
 
 func (m VectorMode) String() string {
@@ -87,10 +95,15 @@ func (m VectorMode) String() string {
 		return "hybrid"
 	case VectorModeBruteForce:
 		return "brute"
+	case VectorModeIVFPQ:
+		return "ivfpq"
 	default:
 		return "btree"
 	}
 }
+
+// isIVFPQ reports whether this mode is the btree-resident IVF-PQ index.
+func (m VectorMode) isIVFPQ() bool { return m == VectorModeIVFPQ }
 
 // isBruteForce reports whether this mode keeps no on-disk index structure.
 func (m VectorMode) isBruteForce() bool { return m == VectorModeBruteForce }
@@ -144,6 +157,22 @@ type VectorParams struct {
 	// a maintenance window.
 	// Ignored for VectorModeBruteForce.
 	CompactRatio float64 `json:"compactRatio,omitempty"`
+
+	// IVF-PQ parameters (Mode == VectorModeIVFPQ only). Zero values pick defaults.
+	//
+	// NList is the number of coarse cells (k-means centroids); 0 ⇒ ~4·√N at build.
+	// More cells = finer partition = fewer vectors scanned per probe, but more
+	// centroids to compare and a larger training requirement.
+	NList int `json:"nList,omitempty"`
+	// NProbe is how many cells a search scans (the recall/speed dial); 0 ⇒ 16.
+	// Higher = more recall, more cells scanned.
+	NProbe int `json:"nProbe,omitempty"`
+	// Closure is the multi-assignment factor: each vector is placed in its Closure
+	// nearest cells (with a per-cell residual code) so boundary vectors are found at
+	// lower NProbe (SPANN closure). 0/1 = single assignment; ~4 reaches parity at
+	// ~4× lower NProbe, costing ~Closure× the on-disk code bytes. M (above) sets the
+	// number of PQ subquantizers / code bytes; Dim must be divisible by M.
+	Closure int `json:"closure,omitempty"`
 }
 
 // IndexInfo provides information about an index.

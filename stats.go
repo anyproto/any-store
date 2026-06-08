@@ -206,6 +206,33 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 
 		// Per-vector-index statistics.
 		for _, vi := range vindexes {
+			// IVF-PQ backend: sum its btree namespaces (codes + vectors + maps).
+			if vi.ivf != nil {
+				vs, vErr := vi.ivf.Stats(tx)
+				if vErr != nil {
+					return vErr
+				}
+				pages := func(ns btree.NamespaceSize) int { return ns.TotalPages() * pageSize }
+				vstat := VectorIndexStats{
+					Name:         vi.info.Name,
+					Field:        vi.info.Vector.Field,
+					Dim:          vs.Dim,
+					Metric:       vi.info.Vector.Metric.toVindex().String(),
+					Mode:         vi.mode.String(),
+					Quantization: vi.info.Vector.Quantization.toVindex().String(),
+					M:            vs.M,
+					NodeCount:    int(vs.Count),
+					LiveCount:    int(vs.Count),
+					VectorBytes:  pages(vs.Vec),
+					GraphBytes:   pages(vs.Cell) + pages(vs.CB), // codes + codebooks
+					MappingBytes: pages(vs.Doc) + pages(vs.Lbl),
+					MetaBytes:    pages(vs.Meta),
+				}
+				vstat.SizeBytes = vstat.VectorBytes + vstat.GraphBytes + vstat.MappingBytes + vstat.MetaBytes
+				stats.VectorIndexesSizeBytes += vstat.SizeBytes
+				stats.VectorIndexes = append(stats.VectorIndexes, vstat)
+				continue
+			}
 			// Brute-force mode keeps no index data: report metadata only, zero bytes.
 			if vi.ix == nil {
 				stats.VectorIndexes = append(stats.VectorIndexes, VectorIndexStats{

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -11,6 +12,7 @@ import (
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/qplanner"
 	"github.com/anyproto/any-store/v2/internal/vindex"
+	"github.com/anyproto/any-store/v2/internal/vivf"
 	"github.com/anyproto/any-store/v2/query"
 )
 
@@ -25,18 +27,26 @@ type vectorIndex struct {
 	mode         VectorMode
 	compactRatio float64
 	// ix is the btree-resident HNSW graph for btree/hybrid modes; it is nil for
-	// brute-force mode, which stores no index data (search scans the documents).
+	// brute-force mode (search scans the documents) and for IVF-PQ mode (which uses
+	// ivf instead).
 	ix *vindex.Index
+	// ivf is the btree-resident IVF-PQ index for VectorModeIVFPQ; nil otherwise.
+	ivf *vivf.StoreIndex
 }
+
+// isIVF reports whether this index uses the IVF-PQ backend.
+func (vi *vectorIndex) isIVF() bool { return vi.mode.isIVFPQ() }
 
 func vectorIndexNsPrefix(collName, indexName string) string {
 	return "vix:" + collName + ":" + indexName
 }
 
 // dropVectorIndexNamespaces deletes all btree namespaces backing a vector index.
+// It drops the union of HNSW (:adj) and IVF-PQ (:cb, :cell) suffixes so it works
+// for either backend; DeleteNamespace ignores absent namespaces.
 func dropVectorIndexNamespaces(tx *btree.WriteTx, collName, indexName string) error {
 	prefix := vectorIndexNsPrefix(collName, indexName)
-	for _, suf := range []string{":meta", ":vec", ":adj", ":doc", ":lbl"} {
+	for _, suf := range []string{":meta", ":vec", ":adj", ":doc", ":lbl", ":cb", ":cell"} {
 		if err := tx.DeleteNamespace(prefix + suf); err != nil && !errors.Is(err, btree.ErrNamespaceNotFound) {
 			return err
 		}
@@ -56,10 +66,77 @@ func validateVectorParams(p *VectorParams) error {
 	}
 	switch p.Mode {
 	case VectorModeBTree, VectorModeHybrid, VectorModeBruteForce:
+	case VectorModeIVFPQ:
+		m := ivfM(p)
+		if p.Dim%m != 0 {
+			return fmt.Errorf("vector index: IVF-PQ requires Dim (%d) divisible by M (%d)", p.Dim, m)
+		}
 	default:
 		return fmt.Errorf("vector index: unknown mode %d", p.Mode)
 	}
 	return nil
+}
+
+// ivfM resolves the PQ subquantizer count: explicit M, else a default that divides
+// Dim (prefer 96 → 8-dim subspaces for typical embedding dims, else the largest of
+// a small candidate set that divides Dim, else Dim itself).
+func ivfM(p *VectorParams) int {
+	if p.M > 0 {
+		return p.M
+	}
+	for _, m := range []int{96, 64, 48, 32, 16, 8, 4, 2} {
+		if p.Dim%m == 0 && p.Dim/m >= 2 {
+			return m
+		}
+	}
+	return p.Dim
+}
+
+// ivfNList resolves the coarse cell count: explicit NList, else ~4·√N clamped to
+// [16, 65536] (FAISS sizing), with a points-per-centroid floor so tiny collections
+// don't over-partition.
+func ivfNList(p *VectorParams, n int) int {
+	if p.NList > 0 {
+		return p.NList
+	}
+	nl := 4 * int(math.Sqrt(float64(n)))
+	if nl < 16 {
+		nl = 16
+	}
+	if nl > 65536 {
+		nl = 65536
+	}
+	if minCells := n / 39; minCells >= 1 && nl > minCells {
+		nl = minCells // keep ≥~39 training points per centroid (FAISS floor)
+	}
+	if n > 0 && nl > n {
+		nl = n // can't have more cells than points
+	}
+	if nl < 1 {
+		nl = 1
+	}
+	return nl
+}
+
+// ivfStoreParams builds the vivf build/open parameters from VectorParams.
+func ivfStoreParams(p *VectorParams, n int) vivf.StoreParams {
+	closure := p.Closure
+	if closure < 1 {
+		closure = 1
+	}
+	nprobe := p.NProbe
+	if nprobe < 1 {
+		nprobe = 16
+	}
+	return vivf.StoreParams{
+		Dim:       p.Dim,
+		NList:     ivfNList(p, n),
+		M:         ivfM(p),
+		Assign:    closure,
+		NProbe:    nprobe,
+		Normalize: p.Metric == VectorCosine,
+		KMeansPP:  true,
+	}
 }
 
 func newVectorIndexFromVindex(info IndexInfo, ix *vindex.Index) *vectorIndex {
@@ -70,6 +147,16 @@ func newVectorIndexFromVindex(info IndexInfo, ix *vindex.Index) *vectorIndex {
 		mode:         info.Vector.Mode,
 		compactRatio: info.Vector.CompactRatio,
 		ix:           ix,
+	}
+}
+
+func newVectorIndexFromIVF(info IndexInfo, ivf *vivf.StoreIndex) *vectorIndex {
+	return &vectorIndex{
+		info:      info,
+		fieldPath: strings.Split(info.Vector.Field, "."),
+		dim:       info.Vector.Dim,
+		mode:      info.Vector.Mode,
+		ivf:       ivf,
 	}
 }
 
@@ -109,6 +196,16 @@ func (vi *vectorIndex) extractVector(it item, buf []float32) ([]float32, bool) {
 // insert indexes the document's vector (no-op if the field is absent/invalid).
 // Brute-force mode keeps no index, so there is nothing to maintain.
 func (vi *vectorIndex) insert(tx *btree.WriteTx, it item, vbuf []float32) error {
+	if vi.isIVF() {
+		if vi.ivf == nil {
+			return nil
+		}
+		vec, ok := vi.extractVector(it, vbuf)
+		if !ok {
+			return nil
+		}
+		return vi.ivf.Insert(tx, it.appendId(nil), vec)
+	}
 	if vi.ix == nil {
 		return nil
 	}
@@ -121,6 +218,13 @@ func (vi *vectorIndex) insert(tx *btree.WriteTx, it item, vbuf []float32) error 
 
 // delete removes the document's vector (no-op if it was never indexed).
 func (vi *vectorIndex) delete(tx *btree.WriteTx, it item) error {
+	if vi.isIVF() {
+		if vi.ivf == nil {
+			return nil
+		}
+		_, err := vi.ivf.Delete(tx, it.appendId(nil))
+		return err
+	}
 	if vi.ix == nil {
 		return nil
 	}
@@ -132,13 +236,13 @@ func (vi *vectorIndex) delete(tx *btree.WriteTx, it item) error {
 // field went away, otherwise insert (which replaces the old node). This avoids
 // re-inserting into the HNSW graph on every unrelated document update.
 func (vi *vectorIndex) update(tx *btree.WriteTx, prevIt, it item) error {
-	if vi.ix == nil {
+	if vi.ix == nil && vi.ivf == nil {
 		return nil
 	}
-	// Fast path: identical stored field → embedding unchanged, leave the graph
-	// alone. anyencutil.Equal is a single bytes.Equal memcmp for the packed vector
-	// type and alloc-free for arrays, so the common "document updated, embedding
-	// untouched" case avoids both vector extractions below.
+	// Fast path: identical stored field → embedding unchanged, nothing to reindex.
+	// anyencutil.Equal is a single bytes.Equal memcmp for the packed vector type and
+	// alloc-free for arrays, so the common "document updated, embedding untouched"
+	// case avoids both vector extractions below.
 	newField := it.Value().Get(vi.fieldPath...)
 	oldField := prevIt.Value().Get(vi.fieldPath...)
 	if newField != nil && oldField != nil && anyencutil.Equal(newField, oldField) {
@@ -146,6 +250,16 @@ func (vi *vectorIndex) update(tx *btree.WriteTx, prevIt, it item) error {
 	}
 	newVec, newOk := vi.extractVector(it, nil)
 	_, oldOk := vi.extractVector(prevIt, nil)
+	if vi.isIVF() {
+		switch {
+		case newOk:
+			return vi.ivf.Insert(tx, it.appendId(nil), newVec) // Insert replaces
+		case oldOk:
+			_, err := vi.ivf.Delete(tx, it.appendId(nil))
+			return err
+		}
+		return nil
+	}
 	switch {
 	case newOk:
 		return vi.ix.Insert(tx, it.appendId(nil), newVec)
@@ -165,12 +279,15 @@ func (vi *vectorIndex) Info() IndexInfo { return vi.info }
 // are always "unchanged". A transient resolution failure returns true so a
 // working index is not dropped over a momentary view.
 func (vi *vectorIndex) rootUnchanged(tx *btree.ReadTx, collName string) bool {
-	if vi.ix == nil {
+	if vi.ix == nil && vi.ivf == nil {
 		return true
 	}
 	ns, err := tx.GetNamespace(vectorIndexNsPrefix(collName, vi.info.Name) + ":meta")
 	if err != nil {
 		return true
+	}
+	if vi.isIVF() {
+		return ns.RootPage() == vi.ivf.MetaRoot()
 	}
 	return ns.RootPage() == vi.ix.MetaRoot()
 }
@@ -180,6 +297,12 @@ func (vi *vectorIndex) rootUnchanged(tx *btree.ReadTx, collName string) bool {
 // namespaces (re-applying the mode's hybrid/vector-cache settings). Brute-force
 // has no graph, so it is returned unchanged.
 func (vi *vectorIndex) compact(tx *btree.WriteTx, collName string) (*vectorIndex, error) {
+	if vi.isIVF() {
+		// IVF-PQ deletes physically remove records (no tombstones to reclaim), so
+		// there is no compaction analog yet. Centroid-drift maintenance (re-train /
+		// local reindex) is a later phase (RESEARCH_IVFPQ_BTREE.md §6).
+		return vi, nil
+	}
 	if vi.ix == nil {
 		return vi, nil
 	}
@@ -197,6 +320,9 @@ func (vi *vectorIndex) compact(tx *btree.WriteTx, collName string) (*vectorIndex
 // overThreshold reports whether tombstones have reached compactRatio × live
 // nodes (so an auto-compaction is due). Cheap: one meta read, no namespace walk.
 func (vi *vectorIndex) overThreshold(tx *btree.ReadTx) (bool, error) {
+	if vi.isIVF() {
+		return false, nil // no tombstone-based compaction for IVF-PQ (see compact)
+	}
 	if vi.ix == nil || vi.compactRatio <= 0 {
 		return false, nil
 	}
@@ -218,6 +344,13 @@ func (c *collection) loadVectorIndex(tx *btree.ReadTx, info IndexInfo) (*vectorI
 		return newVectorIndexFromVindex(info, nil), nil
 	}
 	prefix := vectorIndexNsPrefix(c.name, info.Name)
+	if info.Vector.Mode.isIVFPQ() {
+		ivf, err := vivf.OpenTx(tx, prefix)
+		if err != nil {
+			return nil, err
+		}
+		return newVectorIndexFromIVF(info, ivf), nil
+	}
 	ix, err := vindex.OpenTx(tx, prefix, vectorIndexSeed(c.name, info.Name))
 	if err != nil {
 		return nil, err
@@ -247,16 +380,8 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 		return newVectorIndexFromVindex(info, nil), nil
 	}
 	prefix := vectorIndexNsPrefix(c.name, info.Name)
-	p := vindex.Params{
-		Dim:            info.Vector.Dim,
-		Metric:         info.Vector.Metric.toVindex(),
-		M:              info.Vector.M,
-		EfConstruction: info.Vector.EfConstruction,
-		EfSearch:       info.Vector.EfSearch,
-		Quantization:   info.Vector.Quantization.toVindex(),
-	}
 
-	// Collect (id, vector) from existing documents, then build the HNSW graph in RAM
+	// Collect (id, vector) from existing documents, then build the index in RAM
 	// and flush it in one bulk pass (vindex.BulkBuild) — far faster than inserting
 	// node-by-node through the btree (no per-edge copy-on-write churn). The bulk path
 	// produces a graph byte-identical to the per-insert path, so it is a pure speedup.
@@ -291,6 +416,30 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 		}
 	}
 
+	// IVF-PQ: train the coarse + PQ codebooks and write the inverted lists in one
+	// pass (RESEARCH_IVFPQ_BTREE.md §5.1). nlist/closure auto-size from the live
+	// count. IVF trains from the existing documents, so the index must be created on
+	// a populated collection (the documented bulk-load pattern); creating it empty
+	// has no data to learn the quantizers from.
+	if info.Vector.Mode.isIVFPQ() {
+		if len(vecs) == 0 {
+			return nil, fmt.Errorf("vector index: IVF-PQ requires existing documents to train — insert documents before creating the index")
+		}
+		ivf, err := vivf.BulkBuild(tx, prefix, ivfStoreParams(info.Vector, len(vecs)), ids, vecs)
+		if err != nil {
+			return nil, err
+		}
+		return newVectorIndexFromIVF(info, ivf), nil
+	}
+
+	p := vindex.Params{
+		Dim:            info.Vector.Dim,
+		Metric:         info.Vector.Metric.toVindex(),
+		M:              info.Vector.M,
+		EfConstruction: info.Vector.EfConstruction,
+		EfSearch:       info.Vector.EfSearch,
+		Quantization:   info.Vector.Quantization.toVindex(),
+	}
 	// Parallel in-RAM build (graph constructed concurrently in RAM, then flushed
 	// single-threaded) — ~17x faster than per-insert at scale. threads=0 → GOMAXPROCS.
 	// The parallel phase touches only RAM; tx is used single-threaded in the flush.
@@ -432,6 +581,30 @@ func (q *collQuery) detectVectorQuery() (*qplanner.VectorQuerySpec, query.Filter
 
 	residual := residualFilter(clauses, vecIdx)
 	captured := vi
+	if vi.isIVF() {
+		// IVF-PQ: probe a few cells (contiguous range scans), re-rank by exact
+		// distance. ef is the re-rank depth / candidate count, sized to the page
+		// window; nprobe is fixed in the index. Candidates come back closest-first,
+		// so the same FilterIter -> SortIter -> LimitIter chain finishes the query.
+		ef := chooseEf(int(q.vectorEf), captured.ivf.NProbe()*8, int(q.limit)+int(q.offset), residual != nil)
+		spec := &qplanner.VectorQuerySpec{
+			Query:   qvec,
+			Ef:      ef,
+			Ordered: true,
+			Search: func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
+				cands, err := captured.ivf.SearchCandidates(tx, qv, ef)
+				if err != nil {
+					return nil, err
+				}
+				out := make([]qplanner.VectorCandidate, len(cands))
+				for i, c := range cands {
+					out[i] = qplanner.VectorCandidate{DocId: c.DocID, Distance: c.Distance}
+				}
+				return out, nil
+			},
+		}
+		return spec, residual, nil
+	}
 	if vi.ix == nil {
 		// Brute-force: every document is a candidate. The existing
 		// FilterIter -> SortIter -> LimitIter chain then filters, sorts by
