@@ -135,6 +135,28 @@ func TestBulkRealRecallDiag(t *testing.T) {
 	build("bulk-par(1)", func(wtx *btree.WriteTx) (*Index, error) {
 		return BulkBuildParallel(wtx, "vix", params, 1, ids, base, 1)
 	})
+	// Threads sweep (default repair): build time + recall vs worker count — the
+	// fair comparison point vs engines with small default worker counts (pgvector
+	// defaults to ~2). Run on a box with >= the max thread count to be meaningful.
+	repairEfTune = 0
+	for _, th := range []int{1, 2, 4, 8, 16} {
+		db, err := btree.Open(":memory:", btree.Options{InMemory: true})
+		require.NoError(t, err)
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		t0 := time.Now()
+		ix, err := BulkBuildParallel(wtx, "vix", params, 1, ids, base, th)
+		require.NoError(t, err)
+		require.NoError(t, wtx.Commit())
+		bt := time.Since(t0)
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		r := recall(ix, rtx)
+		_ = rtx.Rollback()
+		_ = db.Close()
+		t.Logf("threads=%-2d build=%s (%.0f/s) recall@%d=%.3f", th, bt.Round(time.Millisecond), float64(n)/bt.Seconds(), k, r)
+	}
+
 	// Repair-ef sweep: recall vs build time. A narrower repair beam is cheaper
 	// (better low-core scaling) — find the smallest ef that keeps recall parity.
 	for _, ref := range []int{16, 32, 64, 128, 200} {
