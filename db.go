@@ -16,7 +16,6 @@ import (
 	"github.com/anyproto/any-store/v2/internal/durability"
 	"github.com/anyproto/any-store/v2/internal/durability/sentinel"
 	"github.com/anyproto/any-store/v2/internal/objectid"
-	"github.com/anyproto/any-store/v2/internal/vindex"
 	"github.com/anyproto/any-store/v2/syncpool"
 )
 
@@ -118,10 +117,6 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		config = &Config{}
 	}
 	config.setDefaults()
-
-	if config.VectorBuildConcurrency > 0 {
-		vindex.SetBuildConcurrency(config.VectorBuildConcurrency)
-	}
 
 	sPool := syncpool.NewSyncPool(config.SyncPoolElementMaxSize)
 

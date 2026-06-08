@@ -30,7 +30,21 @@ err := coll.EnsureIndex(ctx, anystore.IndexInfo{
 ```
 
 `CreateIndex` errors if the index already exists; `EnsureIndex` is idempotent.
-Creating the index on a non-empty collection builds it from existing documents.
+Creating the index on a non-empty collection builds it from existing documents
+using a **parallel in-RAM build** across all cores, then writes the finished graph
+in one pass — far faster than inserting into a live index one vector at a time.
+
+> **Bulk-load pattern.** To load a large dataset, insert all documents *first*
+> (a plain doc-store write), *then* create the vector index. The one-shot parallel
+> build is ~20× faster per vector than building the graph incrementally. Inserting
+> into an already-existing index still works and is fully supported — it's just the
+> slower path for a large initial load.
+
+Build (and compaction) parallelism is a process-wide worker budget, default
+`GOMAXPROCS`. Cap it with `anystore.SetVectorBuildConcurrency(n)` (e.g. `1`–`2`) so
+many indexes building at once can't oversubscribe the CPU; it never affects search
+or insert/update/delete. Like `InitPageBuffer`, it's a process-global call made once
+at startup — not a per-database `Config` field.
 
 Only `Field` and `Dim` are required. Other `VectorParams`:
 
@@ -162,8 +176,10 @@ Updates and deletes are automatic: re-inserting a document id reindexes its vect
 deleting removes it from results. Deletes and replaces *tombstone* graph nodes
 rather than removing them, so storage and search cost slowly grow with churn.
 Reclaim them with `CompactRatio` (automatic) or `Collection.CompactVectorIndex(ctx,
-name)` (manual, e.g. in a maintenance window). See `VectorParams.CompactRatio` for
-sizing guidance.
+name)` (manual, e.g. in a maintenance window). Compaction rebuilds the live set with
+the same parallel builder used for index creation (so it's fast — seconds, not
+tens of seconds, for tens of thousands of live vectors). See
+`VectorParams.CompactRatio` for sizing guidance.
 
 ## 6. Choosing a mode (and tuning)
 
@@ -232,8 +248,26 @@ O(live); for very large indexes prefer `0` and schedule
   the knee (recall ~0.96 at ~1 ms for dim 768). Override per-query with `VectorEf`.
 - **`EfConstruction` / `M`** — bigger graph, slower build, marginally better
   recall; raise for build-once / query-often.
-- **`ASV_VCACHE`** — per-batch insert vector cache (RAM traded for build speed);
-  default 16384 vectors, size to the working set for large bulk loads.
+- **Per-batch insert cache** — repeatedly-read graph vectors are served from a
+  capped RAM arena during a write batch (RAM traded for insert/build speed). Sized
+  per-index with `Index.SetInsertCacheSize(n)` or globally via the `ASV_VCACHE` env
+  var (vectors; `0` disables); default 16384. It roughly **2–4×** batch-insert
+  throughput; size it toward the working set for large bulk loads.
+- **`Config.CacheSize`** — the btree page cache, in pages (default 5000 ≈ 20 MiB).
+  This is the main page-level performance/RAM dial, and it matters **only for
+  non-tiered modes** (`BTree`/`Hybrid` without `HybridCacheVectors`): search
+  throughput climbs as the cache approaches the index size, then plateaus. Raising
+  it toward the index size lifts disk-bound **f32** search materially (large f32
+  indexes are 100s of MiB); `Int8` indexes are small and saturate the cache early.
+  Tiered (`+HybridCacheVectors`) indexes serve search from the vector tier and are
+  **cache-insensitive** — leave `CacheSize` at the default and spend RAM on the tier
+  instead.
+- **`Config.UseGlobalPageBuffer`** (+ `InitPageBuffer(pageSize, nPages)`) — serve
+  page buffers from a pre-allocated fixed slab instead of the GC-managed `sync.Pool`.
+  **Throughput-neutral**; its value is a bounded, GC-quiet page-cache footprint.
+  Size the slab ≥ `CacheSize` (it falls back to `sync.Pool` on overflow).
+- **`anystore.SetVectorBuildConcurrency(n)`** — caps the process-wide
+  build/compaction worker budget (default `GOMAXPROCS`); see §1.
 - **Document encoding** — store the embedding as `anyenc.TypeVectorF32` (not a
   number array): ~2× smaller docs and a faster pipeline, recall unchanged.
 - **`:memory:`** keeps the whole DB resident — fastest, but many× the RAM of a
