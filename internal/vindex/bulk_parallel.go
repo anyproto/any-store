@@ -10,6 +10,31 @@ import (
 	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
+// buildSem bounds the total number of concurrent index-build / compaction workers
+// across the whole process. Every parallel build draws workers from one shared
+// budget, so many simultaneous builds cannot oversubscribe the CPU regardless of
+// how many indexes build at once. Default budget is GOMAXPROCS.
+type buildSem struct{ ch chan struct{} }
+
+var curBuildSem atomic.Pointer[buildSem]
+
+func init() {
+	n := runtime.GOMAXPROCS(0)
+	if n < 1 {
+		n = 1
+	}
+	curBuildSem.Store(&buildSem{ch: make(chan struct{}, n)})
+}
+
+// SetBuildConcurrency sets the process-wide budget of concurrent build/compaction
+// workers. n < 1 is treated as 1. In-flight builds keep the budget they captured.
+func SetBuildConcurrency(n int) {
+	if n < 1 {
+		n = 1
+	}
+	curBuildSem.Store(&buildSem{ch: make(chan struct{}, n)})
+}
+
 // BulkBuildParallel is BulkBuild with a concurrent in-RAM graph construction
 // phase, then the same single-threaded bulk flush. This is the technique hnswlib
 // and Lance use: many workers insert into one shared in-RAM graph guarded by
@@ -212,8 +237,12 @@ const (
 
 func (b *pBuilder) build(threads int) {
 	n := len(b.full)
+	sem := curBuildSem.Load()
 	if threads <= 0 {
-		threads = runtime.GOMAXPROCS(0)
+		threads = cap(sem.ch)
+	}
+	if threads < 1 {
+		threads = 1
 	}
 	seedN := n/seedFraction + 1
 	if seedN < seedFloor {
@@ -238,6 +267,8 @@ func (b *pBuilder) build(threads int) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			sem.ch <- struct{}{} // bound active workers to the shared budget
+			defer func() { <-sem.ch }()
 			lsc := &pScratch{}
 			for {
 				i := atomic.AddInt64(&next, 1) - 1
@@ -288,8 +319,9 @@ func (b *pBuilder) repair(threads int) {
 			}
 		}
 	}
+	sem := curBuildSem.Load()
 	if threads <= 0 {
-		threads = runtime.GOMAXPROCS(0)
+		threads = cap(sem.ch)
 	}
 	if threads <= 1 || n < threads*2 {
 		sc := &pScratch{}
@@ -304,6 +336,8 @@ func (b *pBuilder) repair(threads int) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			sem.ch <- struct{}{}
+			defer func() { <-sem.ch }()
 			sc := &pScratch{}
 			for {
 				i := atomic.AddInt64(&next, 1) - 1

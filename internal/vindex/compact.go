@@ -99,7 +99,18 @@ func Compact(wtx *btree.WriteTx, prefix string, seed int64) (*Index, error) {
 			return nil, derr
 		}
 	}
-	ix, err := Create(wtx, prefix, Params{
+	// Rebuild the graph from the live set with the parallel in-RAM builder, then
+	// flush in bulk — far cheaper than re-inserting the survivors one by one
+	// (no per-edge copy-on-write churn). The live set is already in RAM here, so
+	// this adds no extra memory. The rebuilt graph is a valid HNSW of equivalent
+	// recall (it is freshly constructed either way).
+	ids := make([][]byte, len(lives))
+	vecs := make([][]float32, len(lives))
+	for i, lv := range lives {
+		ids[i] = lv.docID
+		vecs[i] = lv.vec
+	}
+	return BulkBuildParallel(wtx, prefix, Params{
 		Dim:            mt.dim,
 		Metric:         mt.metric,
 		M:              mt.m,
@@ -107,16 +118,7 @@ func Compact(wtx *btree.WriteTx, prefix string, seed int64) (*Index, error) {
 		EfSearch:       mt.efS,
 		Ml:             mt.ml,
 		Quantization:   mt.quant,
-	}, seed)
-	if err != nil {
-		return nil, err
-	}
-	for _, lv := range lives {
-		if err = ix.Insert(wtx, lv.docID, lv.vec); err != nil {
-			return nil, err
-		}
-	}
-	return ix, nil
+	}, seed, ids, vecs, 0)
 }
 
 // MetaRoot returns the btree root page of the index's meta namespace. The
