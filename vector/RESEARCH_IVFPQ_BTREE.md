@@ -377,9 +377,23 @@ as a later recall-per-byte upgrade. Always with an **exact re-rank** stage over 
   `‖q−c−r̂‖² = ‖q−c‖² + Σ_m[‖cb_mj‖²+2c_m·cb_mj] − 2Σ_m q_m·cb_mj` precomputes the cell term
   (`precomp[cell][m][j]`, RAM-gated at 64 MiB; large indexes fall back to per-cell sqL2), so a query
   builds one `−2·q_m·cb` table and each cell's LUT is a cheap add instead of m·256 sqL2s (a test
-  asserts both paths return identical results). Net **~540 → ~320 µs/query (−40%)**, recall bit-identical.
-  The btree cell scan (the remaining ~⅓) is the engine's cost and the inherent IVF range-scan work —
-  left to the btree, unchanged.
+  asserts both paths return identical results). Net **~540 → ~320 µs/query (−40%)** on the dim-64
+  microbench, recall bit-identical.
+
+- **e2e profiling at dim 768 (the real win). ✅ DONE.** Profiling the *real* `Find()` path
+  (`cmd/vbench`, 38463×768 export) exposed what the dim-64 microbench hid: the IVFADC precomputed table
+  had silently disabled itself (its ~77 MiB exceeded a too-low 64 MiB cap), so search fell back to the
+  per-cell sqL2 LUT rebuild — **~80% of search time**. Making the table's RAM budget a configurable
+  `VectorParams.PrecomputeTableMiB` (0 = default 128 MiB on; <0 = off; >0 = MiB; persisted in meta)
+  turned it back on: **np64 7.23 → 2.38 ms p50 (137 → 413 q/s)** and **closure=4 / nprobe=16: 1.19 ms /
+  834 q/s at recall 0.951** — ~6× the original, now within ~1.4× of HNSW int8 (0.87 ms / 1158 q/s) but
+  with a much simpler, drift-maintainable index. The table costs ~77 MiB always-resident RAM (heap
+  341 → 412 MiB) — the explicit trade the knob exposes. **Iterator analysis:** the planner's own
+  `IndexIter` does the same `Key()`+`Value()` double-parse the IVF scan does — no more-efficient
+  *existing* btree primitive exists and no batch/callback scan is exposed, so the cell scan is left
+  unchanged (engine not modified). The remaining e2e gap to HNSW is the re-rank's random reads of `ef`
+  full **f32** vectors (memory-stall-bound, undercounted by the CPU profile) → an **int8 re-rank store**
+  is the next lever (cuts `:vec` 118 → 30 MiB, *reducing* total RAM while speeding the reads).
 
 - **Phase 3 — Ada-IVF local maintenance.** Local split/merge of hot violator lists; bound drift
   without full rebuilds; the IVFPQ analogue of `CompactRatio`.

@@ -129,13 +129,14 @@ func ivfStoreParams(p *VectorParams, n int) vivf.StoreParams {
 		nprobe = 16
 	}
 	return vivf.StoreParams{
-		Dim:       p.Dim,
-		NList:     ivfNList(p, n),
-		M:         ivfM(p),
-		Assign:    closure,
-		NProbe:    nprobe,
-		Normalize: p.Metric == VectorCosine,
-		KMeansPP:  true,
+		Dim:        p.Dim,
+		NList:      ivfNList(p, n),
+		M:          ivfM(p),
+		Assign:     closure,
+		NProbe:     nprobe,
+		Normalize:  p.Metric == VectorCosine,
+		KMeansPP:   true,
+		PrecompMiB: p.PrecomputeTableMiB,
 	}
 }
 

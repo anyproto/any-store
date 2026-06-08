@@ -181,6 +181,13 @@ type VectorParams struct {
 	// ~4× lower NProbe, costing ~Closure× the on-disk code bytes. M (above) sets the
 	// number of PQ subquantizers / code bytes; Dim must be divisible by M.
 	Closure int `json:"closure,omitempty"`
+	// PrecomputeTableMiB budgets the RAM for the IVF-PQ precomputed ADC table, which
+	// removes the per-cell distance-table rebuild from search (measured ~3× faster
+	// search at dim 768) at the cost of an always-resident table of nlist·M·1 KiB.
+	// 0 = the default budget (128 MiB: on for typical indexes, off for very large
+	// ones whose table would exceed it); a negative value disables the table
+	// (smallest RAM, slower search); a positive value sets the budget in MiB.
+	PrecomputeTableMiB int `json:"precomputeTableMiB,omitempty"`
 }
 
 // IndexInfo provides information about an index.

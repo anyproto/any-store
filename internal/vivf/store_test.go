@@ -157,6 +157,41 @@ func TestStoreIVFPQLUTPathsAgree(t *testing.T) {
 	}
 }
 
+// TestStoreIVFPQPrecompBudget verifies the precomputed-table RAM budget knob:
+// default builds the table, a negative budget disables it, and the setting
+// survives a reopen (it's persisted in meta).
+func TestStoreIVFPQPrecompBudget(t *testing.T) {
+	const dim = 32
+	vecs := clusteredVecs(2000, dim, 30, 4)
+
+	build := func(miB int) *btree.DB {
+		db := openMem(t)
+		ids := make([][]byte, len(vecs))
+		for i := range vecs {
+			ids[i] = bid(i)
+		}
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		p := StoreParams{Dim: dim, NList: 64, M: 8, Assign: 2, NProbe: 8, Normalize: true, KMeansPP: true, Seed: 1, PrecompMiB: miB}
+		_, err = BulkBuild(wtx, "ivf", p, ids, vecs)
+		require.NoError(t, err)
+		require.NoError(t, wtx.Commit())
+		return db
+	}
+	open := func(db *btree.DB) *StoreIndex {
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = rtx.Rollback() })
+		ix, err := OpenTx(rtx, "ivf")
+		require.NoError(t, err)
+		return ix
+	}
+
+	require.NotNil(t, open(build(0)).precomp, "default budget builds the table")
+	require.NotNil(t, open(build(64)).precomp, "explicit budget builds the table")
+	require.Nil(t, open(build(-1)).precomp, "negative budget disables the table")
+}
+
 // TestStoreIVFPQRecallReal builds the btree-resident index on the real export and
 // confirms its recall@10 matches the in-RAM prototype / HNSW baseline (~0.97),
 // proving the storage layer preserves the algorithm's recall.

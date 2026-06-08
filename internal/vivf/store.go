@@ -21,14 +21,15 @@ type Candidate struct {
 
 // StoreParams configures a btree-resident IVF-PQ index. Dim must be divisible by M.
 type StoreParams struct {
-	Dim       int
-	NList     int
-	M         int
-	Assign    int  // closure factor: each vector placed in its Assign nearest cells
-	NProbe    int  // default cells scanned per search
-	Normalize bool // cosine: store/query unit-normalized vectors
-	KMeansPP  bool
-	Seed      int64
+	Dim        int
+	NList      int
+	M          int
+	Assign     int  // closure factor: each vector placed in its Assign nearest cells
+	NProbe     int  // default cells scanned per search
+	Normalize  bool // cosine: store/query unit-normalized vectors
+	KMeansPP   bool
+	PrecompMiB int // precomputed-table RAM budget: 0=default, <0=off, >0=MiB
+	Seed       int64
 }
 
 func (p *StoreParams) withDefaults() {
@@ -51,6 +52,7 @@ type StoreIndex struct {
 	vmeta, vcb, vcell, vvec, vlbl, vdoc *btree.Namespace
 
 	dim, nlist, m, dsub, nprobe, assign int
+	precompMiB                          int // precomputed-table RAM budget (see StoreParams)
 	normalize                           bool
 
 	coarse [][]float32   // [nlist][dim]   — RAM-resident (the only hot set)
@@ -67,19 +69,31 @@ type StoreIndex struct {
 	searchers sync.Pool // *searcher — reusable per-query scratch (alloc-free search)
 }
 
-// precompMaxFloats caps the IVFADC precomputed table at 256 MiB (nlist·m·pqK
-// floats). The table is the search accelerator — it removes the per-cell ADC LUT
-// rebuild, which measured ~80% of search at dim 768 (a 3× e2e speedup once on) —
-// at a cost of nlist·m·1 KiB of RAM (e.g. ~77 MiB at nlist 784, m 96, small next
-// to the f32 re-rank store). A very large index (e.g. ~1M vectors → nlist 4096,
-// m 96 → ~400 MiB) exceeds the cap and falls back to the per-cell sqL2 LUT.
-const precompMaxFloats = 64 << 20
+// defaultPrecompMiB is the RAM budget for the IVFADC precomputed table when the
+// caller leaves it 0. The table removes the per-cell ADC LUT rebuild — ~80% of
+// search at dim 768 (a 3× e2e speedup) — costing nlist·m·1 KiB of always-resident
+// RAM. 128 MiB is on for typical embedding indexes (e.g. ~77 MiB at nlist 784,
+// m 96) and off for very large ones (~1M vectors → ~400 MiB → fall back to sqL2).
+const defaultPrecompMiB = 128
+
+// resolvePrecompFloats turns a MiB budget into a max float count: 0 → default,
+// negative → disabled (0), positive → that many MiB worth of float32s.
+func resolvePrecompFloats(miB int) int {
+	switch {
+	case miB < 0:
+		return 0
+	case miB == 0:
+		miB = defaultPrecompMiB
+	}
+	return miB * (1 << 20) / 4
+}
 
 // buildPrecomp fills ix.precomp (the cell-dependent IVFADC table) when it fits the
-// RAM cap. O(nlist·m·pqK·dsub) once, from the coarse centroids and PQ codebooks.
+// configured RAM budget. O(nlist·m·pqK·dsub) once, from the coarse centroids and
+// PQ codebooks.
 func (ix *StoreIndex) buildPrecomp() {
 	n := ix.nlist * ix.m * pqK
-	if n <= 0 || n > precompMaxFloats {
+	if n <= 0 || n > resolvePrecompFloats(ix.precompMiB) {
 		ix.precomp = nil
 		return
 	}
@@ -158,7 +172,7 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 		return nil, fmt.Errorf("vivf: dim %d must be a positive multiple of M %d", p.Dim, p.M)
 	}
 	p.withDefaults()
-	ix := &StoreIndex{dim: p.Dim, nlist: p.NList, m: p.M, dsub: p.Dim / p.M, nprobe: p.NProbe, assign: p.Assign, normalize: p.Normalize}
+	ix := &StoreIndex{dim: p.Dim, nlist: p.NList, m: p.M, dsub: p.Dim / p.M, nprobe: p.NProbe, assign: p.Assign, normalize: p.Normalize, precompMiB: p.PrecompMiB}
 
 	names := storeNsNames(prefix)
 	ns := make([]*btree.Namespace, len(names))
@@ -223,7 +237,7 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 	if n > 0 {
 		reconBase = reconSum / float64(n)
 	}
-	mt := &meta{dim: p.Dim, nlist: p.NList, m: p.M, assign: p.Assign, nprobe: p.NProbe, normalize: p.Normalize, count: int64(n), nextLabel: uint32(n), reconBase: reconBase, buildCount: int64(n)}
+	mt := &meta{dim: p.Dim, nlist: p.NList, m: p.M, assign: p.Assign, nprobe: p.NProbe, precompMiB: p.PrecompMiB, normalize: p.Normalize, count: int64(n), nextLabel: uint32(n), reconBase: reconBase, buildCount: int64(n)}
 	if err := wtx.Put(ix.vmeta, metaKey, encodeMeta(mt)); err != nil {
 		return nil, err
 	}
@@ -308,6 +322,7 @@ func OpenTx(rtx *btree.ReadTx, prefix string) (*StoreIndex, error) {
 	}
 	ix.dim, ix.nlist, ix.m, ix.dsub = mt.dim, mt.nlist, mt.m, mt.dim/mt.m
 	ix.nprobe, ix.assign, ix.normalize = mt.nprobe, mt.assign, mt.normalize
+	ix.precompMiB = mt.precompMiB
 
 	cb, err := rtx.Get(ix.vcb, coarseKey)
 	if err != nil {
@@ -447,7 +462,8 @@ func Rebuild(wtx *btree.WriteTx, prefix string) (*StoreIndex, error) {
 	}
 	p := StoreParams{
 		Dim: old.dim, NList: ivfRebuildNList(old.nlist, len(vecs)), M: old.m,
-		Assign: old.assign, NProbe: old.nprobe, Normalize: old.normalize, KMeansPP: true, Seed: 1,
+		Assign: old.assign, NProbe: old.nprobe, Normalize: old.normalize,
+		KMeansPP: true, PrecompMiB: old.precompMiB, Seed: 1,
 	}
 	return BulkBuild(wtx, prefix, p, ids, vecs)
 }

@@ -38,11 +38,12 @@ type meta struct {
 	dim       int
 	nlist     int
 	m         int
-	assign    int  // closure factor used at build (informational)
-	nprobe    int  // default cells to scan at search
-	normalize bool // cosine: vectors stored/queried unit-normalized
-	count     int64
-	nextLabel uint32
+	assign     int  // closure factor used at build (informational)
+	nprobe     int  // default cells to scan at search
+	precompMiB int  // precomputed-table RAM budget (StoreParams.PrecompMiB)
+	normalize  bool // cosine: vectors stored/queried unit-normalized
+	count      int64
+	nextLabel  uint32
 
 	// Drift tracking (cheap, maintained incrementally): centroid quality decays as
 	// the data distribution shifts away from the build-time codebooks. reconBase is
@@ -82,6 +83,7 @@ func encodeMeta(mt *meta) []byte {
 	put64(uint64(mt.driftN))
 	put64(uint64(mt.buildCount))
 	put64(uint64(mt.churn))
+	put32(uint32(int32(mt.precompMiB))) // signed; <0 disables the table
 	return buf
 }
 
@@ -111,6 +113,9 @@ func decodeMeta(data []byte) (*meta, error) {
 		mt.driftN = int64(get64())
 		mt.buildCount = int64(get64())
 		mt.churn = int64(get64())
+	}
+	if off+4 <= len(data) { // precompMiB (absent in older records → 0 = default)
+		mt.precompMiB = int(int32(get32()))
 	}
 	return mt, nil
 }
