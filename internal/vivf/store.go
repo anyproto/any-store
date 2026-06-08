@@ -21,13 +21,15 @@ type Candidate struct {
 
 // StoreParams configures a btree-resident IVF-PQ index. Dim must be divisible by M.
 type StoreParams struct {
-	Dim        int
-	NList      int
-	M          int
-	Assign     int  // closure factor: each vector placed in its Assign nearest cells
-	NProbe     int  // default cells scanned per search
-	Normalize  bool // cosine: store/query unit-normalized vectors
-	Int8       bool // store the :vec re-rank vectors int8-quantized (~4× smaller)
+	Dim       int
+	NList     int
+	M         int
+	Assign    int  // closure factor: each vector placed in its Assign nearest cells
+	NProbe    int  // default cells scanned per search
+	Normalize bool // cosine: store/query unit-normalized vectors
+	Int8      bool // store the :vec re-rank vectors int8-quantized (~4× smaller)
+	SQ        bool // IVF-SQ: store int8 full vectors per cell, scan them directly
+	//                (no PQ codes, no ADC LUT, no precomputed table, no re-rank)
 	KMeansPP   bool
 	PrecompMiB int // precomputed-table RAM budget: 0=default, <0=off, >0=MiB
 	Seed       int64
@@ -53,9 +55,10 @@ type StoreIndex struct {
 	vmeta, vcb, vcell, vvec, vlbl, vdoc *btree.Namespace
 
 	dim, nlist, m, dsub, nprobe, assign int
-	precompMiB                          int  // precomputed-table RAM budget (see StoreParams)
+	precompMiB                          int // precomputed-table RAM budget (see StoreParams)
 	normalize                           bool
 	int8vec                             bool // :vec re-rank store is int8-quantized
+	sq                                  bool // IVF-SQ: :cell holds int8 full vectors, scanned directly
 
 	coarse [][]float32   // [nlist][dim]   — RAM-resident (the only hot set)
 	pqcb   [][][]float32 // [m][pqK][dsub]
@@ -175,7 +178,7 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 		return nil, fmt.Errorf("vivf: dim %d must be a positive multiple of M %d", p.Dim, p.M)
 	}
 	p.withDefaults()
-	ix := &StoreIndex{dim: p.Dim, nlist: p.NList, m: p.M, dsub: p.Dim / p.M, nprobe: p.NProbe, assign: p.Assign, normalize: p.Normalize, int8vec: p.Int8, precompMiB: p.PrecompMiB}
+	ix := &StoreIndex{dim: p.Dim, nlist: p.NList, m: p.M, dsub: p.Dim / p.M, nprobe: p.NProbe, assign: p.Assign, normalize: p.Normalize, int8vec: p.Int8 || p.SQ, sq: p.SQ, precompMiB: p.PrecompMiB}
 
 	names := storeNsNames(prefix)
 	ns := make([]*btree.Namespace, len(names))
@@ -198,18 +201,25 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 		}
 	}
 
-	// Train codebooks (shared with the in-RAM prototype) and persist them.
+	// Train the coarse quantizer (always) and, for IVF-PQ, the PQ codebooks.
 	pp := Params{Dim: p.Dim, NList: p.NList, M: p.M, Seed: p.Seed, KMeansPP: p.KMeansPP, Assign: p.Assign}
-	ix.coarse, ix.pqcb = trainModel(norm, pp)
+	if p.SQ {
+		ix.coarse, _ = kmeans(norm, p.NList, 15, p.Seed, p.KMeansPP) // IVF-SQ: coarse only
+	} else {
+		ix.coarse, ix.pqcb = trainModel(norm, pp)
+	}
 	if err := wtx.Put(ix.vcb, coarseKey, encodeCentroids(ix.coarse)); err != nil {
 		return nil, err
 	}
-	if err := wtx.Put(ix.vcb, pqKey, encodePQ(ix.pqcb)); err != nil {
-		return nil, err
+	if !p.SQ {
+		if err := wtx.Put(ix.vcb, pqKey, encodePQ(ix.pqcb)); err != nil {
+			return nil, err
+		}
 	}
 
 	// Encode + place each vector. label == build order (dense 0..n-1). Accumulate the
-	// primary-cell reconstruction error to seed the drift baseline.
+	// primary-cell reconstruction error to seed the drift baseline. IVF-SQ stores the
+	// int8 full vector per cell; IVF-PQ stores the PQ code of the residual.
 	var keyBuf, codeBuf, vecBuf []byte
 	var reconSum float64
 	r := make([]float32, ix.dim)
@@ -223,12 +233,19 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 			return nil, err
 		}
 		for ci, c := range cells {
-			vek32.Sub_Into(r, x, ix.coarse[c])
 			if ci == 0 {
-				reconSum += float64(sqNorm(r)) // nearest-cell residual = reconstruction error
+				vek32.Sub_Into(r, x, ix.coarse[c])
+				reconSum += float64(sqNorm(r)) // nearest-cell residual = drift baseline
 			}
 			keyBuf = cellKey(keyBuf, uint32(c), label)
-			codeBuf = encodeResidualInto(codeBuf, r, ix)
+			if ix.sq {
+				codeBuf = encodeVecInt8(codeBuf, x) // int8 full vector
+			} else {
+				if ci != 0 {
+					vek32.Sub_Into(r, x, ix.coarse[c])
+				}
+				codeBuf = encodeResidualInto(codeBuf, r, ix)
+			}
 			if err := wtx.Put(ix.vcell, keyBuf, codeBuf); err != nil {
 				return nil, err
 			}
@@ -240,11 +257,13 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 	if n > 0 {
 		reconBase = reconSum / float64(n)
 	}
-	mt := &meta{dim: p.Dim, nlist: p.NList, m: p.M, assign: p.Assign, nprobe: p.NProbe, precompMiB: p.PrecompMiB, normalize: p.Normalize, int8vec: p.Int8, count: int64(n), nextLabel: uint32(n), reconBase: reconBase, buildCount: int64(n)}
+	mt := &meta{dim: p.Dim, nlist: p.NList, m: p.M, assign: p.Assign, nprobe: p.NProbe, precompMiB: p.PrecompMiB, normalize: p.Normalize, int8vec: p.Int8 || p.SQ, sq: p.SQ, count: int64(n), nextLabel: uint32(n), reconBase: reconBase, buildCount: int64(n)}
 	if err := wtx.Put(ix.vmeta, metaKey, encodeMeta(mt)); err != nil {
 		return nil, err
 	}
-	ix.buildPrecomp()
+	if !ix.sq {
+		ix.buildPrecomp()
+	}
 	ix.metaRoot = ix.vmeta.RootPage()
 	return ix, nil
 }
@@ -266,15 +285,19 @@ func encodeResidualInto(dst []byte, r []float32, ix *StoreIndex) []byte {
 func (ix *StoreIndex) writeVecRecords(wtx *btree.WriteTx, label uint32, docID []byte, x []float32, enc *[]byte) error {
 	var lk [4]byte
 	binary.BigEndian.PutUint32(lk[:], label)
-	var vb []byte
-	if ix.int8vec {
-		*enc = encodeVecInt8((*enc)[:0], x)
-		vb = *enc
-	} else {
-		vb = f32bytes(x)
-	}
-	if err := wtx.Put(ix.vvec, lk[:], vb); err != nil {
-		return err
+	// IVF-SQ keeps the int8 vector in :cell (the scan source of truth), so it needs
+	// no separate :vec re-rank store.
+	if !ix.sq {
+		var vb []byte
+		if ix.int8vec {
+			*enc = encodeVecInt8((*enc)[:0], x)
+			vb = *enc
+		} else {
+			vb = f32bytes(x)
+		}
+		if err := wtx.Put(ix.vvec, lk[:], vb); err != nil {
+			return err
+		}
 	}
 	return wtx.Put(ix.vlbl, lk[:], docID)
 }
@@ -332,18 +355,23 @@ func OpenTx(rtx *btree.ReadTx, prefix string) (*StoreIndex, error) {
 	ix.nprobe, ix.assign, ix.normalize = mt.nprobe, mt.assign, mt.normalize
 	ix.precompMiB = mt.precompMiB
 	ix.int8vec = mt.int8vec
+	ix.sq = mt.sq
 
 	cb, err := rtx.Get(ix.vcb, coarseKey)
 	if err != nil {
 		return nil, err
 	}
-	ix.coarse = decodeCentroids(cloneBytes(cb), ix.nlist, ix.dim)
-	pq, err := rtx.Get(ix.vcb, pqKey)
-	if err != nil {
-		return nil, err
+	// rtx.Get already returns an owned copy (safe to retain after pages release), so
+	// the decoded float32 views can alias cb/pq directly — no extra clone.
+	ix.coarse = decodeCentroids(cb, ix.nlist, ix.dim)
+	if !ix.sq { // IVF-SQ has no PQ codebooks or precomputed table
+		pq, err := rtx.Get(ix.vcb, pqKey)
+		if err != nil {
+			return nil, err
+		}
+		ix.pqcb = decodePQ(pq, ix.m, ix.dsub)
+		ix.buildPrecomp()
 	}
-	ix.pqcb = decodePQ(cloneBytes(pq), ix.m, ix.dsub)
-	ix.buildPrecomp()
 	ix.metaRoot = ix.vmeta.RootPage()
 	return ix, nil
 }
@@ -432,23 +460,45 @@ func Rebuild(wtx *btree.WriteTx, prefix string) (*StoreIndex, error) {
 	}
 
 	// Collect the live (docID, vector) set into RAM before dropping the namespaces.
+	// IVF-PQ keeps the vectors in :vec (one per label); IVF-SQ keeps them int8 in
+	// :cell (possibly replicated by closure → dedup by label).
 	var ids [][]byte
 	var vecs [][]float32
-	cur := rtx.NewCursor(old.vvec)
+	src := old.vvec
+	if old.sq {
+		src = old.vcell
+	}
+	cur := rtx.NewCursor(src)
 	defer cur.Close()
 	if err := cur.First(); err != nil && !errors.Is(err, btree.ErrKeyNotFound) {
 		return nil, err
+	}
+	var seen map[uint32]struct{}
+	if old.sq {
+		seen = make(map[uint32]struct{})
 	}
 	for cur.Valid() {
 		key, err := cur.Key()
 		if err != nil {
 			return nil, err
 		}
+		lblKey := key // :vec is keyed by label; :cell key's label is its last 4 bytes
+		if old.sq {
+			label := cellKeyLabel(key)
+			if _, dup := seen[label]; dup {
+				if err := cur.Next(); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			seen[label] = struct{}{}
+			lblKey = key[4:8]
+		}
 		vb, err := cur.Value()
 		if err != nil {
 			return nil, err
 		}
-		docID, err := rtx.Get(old.vlbl, key)
+		docID, err := rtx.Get(old.vlbl, lblKey)
 		if err != nil {
 			if errors.Is(err, btree.ErrKeyNotFound) {
 				if err := cur.Next(); err != nil {
@@ -458,7 +508,7 @@ func Rebuild(wtx *btree.WriteTx, prefix string) (*StoreIndex, error) {
 			}
 			return nil, err
 		}
-		ids = append(ids, cloneBytes(docID))
+		ids = append(ids, docID) // rtx.Get returns an owned copy
 		v := make([]float32, old.dim)
 		if old.int8vec {
 			decodeVecInt8(vb, old.dim, v)
@@ -477,7 +527,7 @@ func Rebuild(wtx *btree.WriteTx, prefix string) (*StoreIndex, error) {
 	}
 	p := StoreParams{
 		Dim: old.dim, NList: ivfRebuildNList(old.nlist, len(vecs)), M: old.m,
-		Assign: old.assign, NProbe: old.nprobe, Normalize: old.normalize, Int8: old.int8vec,
+		Assign: old.assign, NProbe: old.nprobe, Normalize: old.normalize, Int8: old.int8vec, SQ: old.sq,
 		KMeansPP: true, PrecompMiB: old.precompMiB, Seed: 1,
 	}
 	return BulkBuild(wtx, prefix, p, ids, vecs)
@@ -515,77 +565,35 @@ func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) (
 	}
 	s.cells = topNCellsInto(qn, ix.coarse, ix.nprobe, &s.cd, s.cells)
 
-	// Scan probed cells; dedup labels keeping the best ADC (closure can place one
-	// label in several probed cells), map-free via the pooled u32fmap.
-	s.lut = ensureF32(s.lut, ix.m*pqK)
+	// Scan probed cells into s.dedup (label -> best distance). PQ and SQ have
+	// separate scan loops so the per-entry hot path carries no mode branch.
 	s.dedup.reset()
-	usePrecomp := ix.precomp != nil
-	if usePrecomp {
-		s.qlut = ensureF32(s.qlut, ix.m*pqK)
-		ix.buildQTerm(qn, s.qlut) // per-query −2·q_m·cb table, built once
-	} else {
-		s.qr = ensureF32(s.qr, ix.dim)
-	}
 	cur := rtx.NewCursor(ix.vcell)
 	defer cur.Close()
-	var seek [8]byte
-	for _, c := range s.cells {
-		// Build this cell's ADC LUT and a constant base added to every code's
-		// distance. Precomp path: lut = precomp[cell] + qterm (cheap adds), base =
-		// ‖q−c‖²; otherwise: lut = sqL2(q−c residual, cb), base = 0.
-		var base float32
-		if usePrecomp {
-			base = sqL2(qn, ix.coarse[c]) // ‖q − c_cell‖²
-			pc := ix.precomp[c*ix.m*pqK:]
-			for k := 0; k < ix.m*pqK; k++ {
-				s.lut[k] = pc[k] + s.qlut[k]
-			}
-		} else {
-			vek32.Sub_Into(s.qr, qn, ix.coarse[c])
-			ix.buildLUT(s.qr, s.lut)
-		}
-		binary.BigEndian.PutUint32(seek[0:], uint32(c))
-		binary.BigEndian.PutUint32(seek[4:], 0)
-		if err := cur.Seek(seek[:]); err != nil {
-			if errors.Is(err, btree.ErrKeyNotFound) {
-				continue
-			}
-			return nil, err
-		}
-		for cur.Valid() {
-			key, err := cur.Key()
-			if err != nil {
-				return nil, err
-			}
-			if !bytes.Equal(key[:4], seek[:4]) {
-				break // left this cell's contiguous range
-			}
-			code, err := cur.Value()
-			if err != nil {
-				return nil, err
-			}
-			s.dedup.putMin(cellKeyLabel(key), base+adc(s.lut, code, ix.m))
-			if err := cur.Next(); err != nil {
-				return nil, err
-			}
-		}
+	var err error
+	if ix.sq {
+		err = ix.scanCellsSQ(s, cur, qn)
+	} else {
+		err = ix.scanCellsPQ(s, cur, qn)
+	}
+	if err != nil {
+		return nil, err
 	}
 
-	// Keep the ef best by ADC before the exact re-rank (bounds :vec reads). Use
-	// quickselect to partition out the ef smallest in O(n) — full-sorting the whole
-	// (often thousands-strong) candidate set just to take the top ef was ~23% of
-	// search — then sort only those ef.
+	// Keep the ef best by distance. Use quickselect to partition out the ef smallest
+	// in O(n) — full-sorting the whole (often thousands-strong) candidate set just to
+	// take the top ef was ~23% of search — then sort only those ef.
 	s.cands = s.dedup.collect(s.cands)
 	if len(s.cands) > ef {
 		selectSmallest(s.cands, ef)
 		s.cands = s.cands[:ef]
 	}
-	// Re-rank survivors by exact distance, reading :vec/:lbl in LABEL order rather
-	// than ADC-distance order: the records are keyed by label, so a label-sorted pass
-	// walks the btree in ascending key order — leaf-local and prefetch-friendly,
-	// sharing upper-tree pages across descents — instead of N random reads that
-	// thrash the cache (matters most on a large :vec that doesn't fit cache). The
-	// result is re-sorted by distance just below.
+	// Resolve docIDs (and, for IVF-PQ, exact distances) reading :vec/:lbl in LABEL
+	// order rather than distance order: the records are keyed by label, so a
+	// label-sorted pass walks the btree in ascending key order — leaf-local and
+	// prefetch-friendly, sharing upper-tree pages — instead of N random reads that
+	// thrash the cache. IVF-SQ already has the exact distance from the scan, so it
+	// only resolves docIDs. The result is re-sorted by distance just below.
 	slices.SortFunc(s.cands, func(a, b cand) int {
 		switch {
 		case a.label < b.label:
@@ -602,22 +610,25 @@ func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) (
 	var lk [4]byte
 	for _, c := range s.cands {
 		binary.BigEndian.PutUint32(lk[:], c.label)
-		vb, err := rtx.AppendValue(ix.vvec, lk[:], s.vbuf[:0])
-		if err != nil {
-			if errors.Is(err, btree.ErrKeyNotFound) {
-				continue // tombstoned between scan and re-rank
+		dist := c.dist // IVF-SQ: exact distance already computed during the scan
+		if !ix.sq {
+			vb, err := rtx.AppendValue(ix.vvec, lk[:], s.vbuf[:0])
+			if err != nil {
+				if errors.Is(err, btree.ErrKeyNotFound) {
+					continue // tombstoned between scan and re-rank
+				}
+				return nil, err
 			}
-			return nil, err
+			s.vbuf = vb
+			var x []float32
+			if ix.int8vec {
+				s.vbufF32 = ensureF32(s.vbufF32, ix.dim)
+				x = decodeVecInt8(vb, ix.dim, s.vbufF32)
+			} else {
+				x = bytesAsF32(vb, ix.dim)
+			}
+			dist = ix.exactDist(qn, x)
 		}
-		s.vbuf = vb
-		var x []float32
-		if ix.int8vec {
-			s.vbufF32 = ensureF32(s.vbufF32, ix.dim)
-			x = decodeVecInt8(vb, ix.dim, s.vbufF32)
-		} else {
-			x = bytesAsF32(vb, ix.dim)
-		}
-		dist := ix.exactDist(qn, x)
 		docID, err := rtx.AppendValue(ix.vlbl, lk[:], s.dbuf[:0])
 		if err != nil {
 			if errors.Is(err, btree.ErrKeyNotFound) {
@@ -706,6 +717,96 @@ func (ix *StoreIndex) exactDist(qn, x []float32) float32 {
 	return vek32.Distance(qn, x)
 }
 
+// scanCellsSQ scores every member of the probed cells by EXACT distance on its
+// int8 full vector (IVF-SQ): no LUT, no precomputed table, no re-rank.
+func (ix *StoreIndex) scanCellsSQ(s *searcher, cur *btree.Cursor, qn []float32) error {
+	s.vbufF32 = ensureF32(s.vbufF32, ix.dim)
+	var seek [8]byte
+	for _, c := range s.cells {
+		binary.BigEndian.PutUint32(seek[0:], uint32(c))
+		binary.BigEndian.PutUint32(seek[4:], 0)
+		if err := cur.Seek(seek[:]); err != nil {
+			if errors.Is(err, btree.ErrKeyNotFound) {
+				continue
+			}
+			return err
+		}
+		for cur.Valid() {
+			key, err := cur.Key()
+			if err != nil {
+				return err
+			}
+			if !bytes.Equal(key[:4], seek[:4]) {
+				break
+			}
+			val, err := cur.Value()
+			if err != nil {
+				return err
+			}
+			d := ix.exactDist(qn, decodeVecInt8(val, ix.dim, s.vbufF32))
+			s.dedup.putMin(cellKeyLabel(key), d)
+			if err := cur.Next(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// scanCellsPQ scores every member code-only via the per-cell ADC LUT (IVF-PQ).
+// With the precomputed table the per-cell LUT is precomp[cell]+qterm (cheap adds)
+// plus a ‖q−c‖² base; otherwise it is sqL2(q−c residual, codebook).
+func (ix *StoreIndex) scanCellsPQ(s *searcher, cur *btree.Cursor, qn []float32) error {
+	usePrecomp := ix.precomp != nil
+	s.lut = ensureF32(s.lut, ix.m*pqK)
+	if usePrecomp {
+		s.qlut = ensureF32(s.qlut, ix.m*pqK)
+		ix.buildQTerm(qn, s.qlut) // per-query −2·q_m·cb table, built once
+	} else {
+		s.qr = ensureF32(s.qr, ix.dim)
+	}
+	var seek [8]byte
+	for _, c := range s.cells {
+		var base float32
+		if usePrecomp {
+			base = sqL2(qn, ix.coarse[c]) // ‖q − c_cell‖²
+			pc := ix.precomp[c*ix.m*pqK:]
+			for k := 0; k < ix.m*pqK; k++ {
+				s.lut[k] = pc[k] + s.qlut[k]
+			}
+		} else {
+			vek32.Sub_Into(s.qr, qn, ix.coarse[c])
+			ix.buildLUT(s.qr, s.lut)
+		}
+		binary.BigEndian.PutUint32(seek[0:], uint32(c))
+		binary.BigEndian.PutUint32(seek[4:], 0)
+		if err := cur.Seek(seek[:]); err != nil {
+			if errors.Is(err, btree.ErrKeyNotFound) {
+				continue
+			}
+			return err
+		}
+		for cur.Valid() {
+			key, err := cur.Key()
+			if err != nil {
+				return err
+			}
+			if !bytes.Equal(key[:4], seek[:4]) {
+				break
+			}
+			val, err := cur.Value()
+			if err != nil {
+				return err
+			}
+			s.dedup.putMin(cellKeyLabel(key), base+adc(s.lut, val, ix.m))
+			if err := cur.Next(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (ix *StoreIndex) buildLUT(qr, lut []float32) {
 	for mm := 0; mm < ix.m; mm++ {
 		lo := mm * ix.dsub
@@ -763,14 +864,21 @@ func (ix *StoreIndex) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) er
 	}
 	r := make([]float32, ix.dim)
 	for ci, c := range cells {
-		vek32.Sub_Into(r, x, ix.coarse[c])
 		if ci == 0 {
+			vek32.Sub_Into(r, x, ix.coarse[c])
 			// Track how well the frozen centroids fit this new vector (drift signal).
 			mt.driftSum += float64(sqNorm(r))
 			mt.driftN++
 		}
 		keyBuf = cellKey(keyBuf, uint32(c), label)
-		codeBuf = encodeResidualInto(codeBuf, r, ix)
+		if ix.sq {
+			codeBuf = encodeVecInt8(codeBuf, x) // int8 full vector
+		} else {
+			if ci != 0 {
+				vek32.Sub_Into(r, x, ix.coarse[c])
+			}
+			codeBuf = encodeResidualInto(codeBuf, r, ix)
+		}
 		if err := wtx.Put(ix.vcell, keyBuf, codeBuf); err != nil {
 			return err
 		}
@@ -845,10 +953,4 @@ func (ix *StoreIndex) readMeta(rtx *btree.ReadTx) (*meta, error) {
 		return nil, err
 	}
 	return decodeMeta(b)
-}
-
-func cloneBytes(b []byte) []byte {
-	out := make([]byte, len(b))
-	copy(out, b)
-	return out
 }

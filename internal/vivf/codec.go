@@ -35,14 +35,15 @@ const metaVersion = 1
 
 // meta is the single :meta record.
 type meta struct {
-	dim       int
-	nlist     int
-	m         int
+	dim        int
+	nlist      int
+	m          int
 	assign     int  // closure factor used at build (informational)
 	nprobe     int  // default cells to scan at search
 	precompMiB int  // precomputed-table RAM budget (StoreParams.PrecompMiB)
 	normalize  bool // cosine: vectors stored/queried unit-normalized
 	int8vec    bool // :vec re-rank store is int8-quantized
+	sq         bool // IVF-SQ: :cell holds int8 full vectors (no PQ)
 	count      int64
 	nextLabel  uint32
 
@@ -90,6 +91,11 @@ func encodeMeta(mt *meta) []byte {
 	} else {
 		buf = append(buf, 0)
 	}
+	if mt.sq {
+		buf = append(buf, 1)
+	} else {
+		buf = append(buf, 0)
+	}
 	return buf
 }
 
@@ -125,6 +131,10 @@ func decodeMeta(data []byte) (*meta, error) {
 	}
 	if off < len(data) { // int8vec (absent in older records → false)
 		mt.int8vec = data[off] != 0
+		off++
+	}
+	if off < len(data) { // sq (absent in older records → false)
+		mt.sq = data[off] != 0
 		off++
 	}
 	return mt, nil

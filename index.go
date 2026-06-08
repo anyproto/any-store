@@ -87,6 +87,14 @@ const (
 	// RAM set (only the coarse centroids) and a sequential read pattern, at the cost
 	// of approximate recall recovered by re-rank. See VectorParams NList/NProbe/Closure.
 	VectorModeIVFPQ
+	// VectorModeIVFSQ is the same IVF partition but stores each vector as an int8
+	// scalar-quantized full vector per cell (no product quantization), scanned
+	// directly with exact int8 distance — no ADC table, no precomputed table, no
+	// re-rank. Versus IVFPQ: much faster builds (no PQ training), higher recall (int8
+	// is more faithful than PQ), smaller (no separate re-rank store), and no
+	// precompute-table RAM — at higher search cost (it reads full vectors, not codes).
+	// Favours Closure=1 with a higher NProbe (replicating full vectors is costly).
+	VectorModeIVFSQ
 )
 
 func (m VectorMode) String() string {
@@ -97,6 +105,8 @@ func (m VectorMode) String() string {
 		return "brute"
 	case VectorModeIVFPQ:
 		return "ivfpq"
+	case VectorModeIVFSQ:
+		return "ivfsq"
 	default:
 		return "btree"
 	}
@@ -104,6 +114,13 @@ func (m VectorMode) String() string {
 
 // isIVFPQ reports whether this mode is the btree-resident IVF-PQ index.
 func (m VectorMode) isIVFPQ() bool { return m == VectorModeIVFPQ }
+
+// isIVFSQ reports whether this mode is the btree-resident IVF-SQ index.
+func (m VectorMode) isIVFSQ() bool { return m == VectorModeIVFSQ }
+
+// isIVF reports whether this mode is an IVF index (PQ or SQ) — both share the
+// internal/vivf backend.
+func (m VectorMode) isIVF() bool { return m == VectorModeIVFPQ || m == VectorModeIVFSQ }
 
 // isBruteForce reports whether this mode keeps no on-disk index structure.
 func (m VectorMode) isBruteForce() bool { return m == VectorModeBruteForce }

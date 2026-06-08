@@ -406,6 +406,26 @@ as a later recall-per-byte upgrade. Always with an **exact re-rank** stage over 
   flag is persisted in meta and carried through `Rebuild`; a store test asserts recall parity (~0.5%)
   and the ~4–5× `:vec` shrink. Recommended default for IVF-PQ at scale.
 
+- **IVF-SQ (`VectorModeIVFSQ`). ✅ DONE.** A second IVF flavor: instead of PQ codes + ADC, store each
+  vector as an **int8 scalar-quantized full vector per cell** and scan it directly with exact int8
+  distance — no PQ codebooks, no ADC LUT, no precomputed table, no re-rank, no separate `:vec` store.
+  It shares the entire IVF backend (coarse quantizer, cells, closure, drift/rebuild, search skeleton,
+  cross-process reconcile); only the per-cell scoring differs (split into `scanCellsSQ`/`scanCellsPQ`
+  so the hot loop has no mode branch). Measured e2e (real 38463×768) vs IVF-PQ-int8 and HNSW:
+
+  | mode | recall@10 | search p50 | insert/s | index MiB | heap MiB |
+  |---|---|---|---|---|---|
+  | HNSW hyb+vc int8 | 0.953 | 0.52 ms | 1060 | 36.1 | 218.5 |
+  | IVF-PQ int8 | 0.946 | 1.08 ms | 2411 | 53.8 | 282.0 |
+  | **IVF-SQ np32** | 0.920 | 1.16 ms | **8514** | **35.4** | **188.9** |
+  | **IVF-SQ np64** | 0.951 | 2.09 ms | **8389** | **35.4** | **182.2** |
+
+  The split is clean: **IVF-PQ = lowest search latency; IVF-SQ = fastest writes (3.5× IVF-PQ, 8× HNSW),
+  smallest index, lowest RAM (~100 MiB under PQ), simplest** — at higher search cost (it reads full
+  vectors). IVF-SQ favours `Closure=1` + higher `NProbe` (replicating full vectors is costly, unlike
+  tiny PQ codes). The right default depends on the workload: write-heavy / RAM-constrained → SQ;
+  read-latency-critical → PQ; in-RAM-and-recall-max → HNSW.
+
 - **Phase 4 (optional) — recall/perf upgrades.** Anisotropic codebooks; OPQ rotation; an in-RAM
   pointer-free code slab for pure-RAM scans; RQ for tiny code budgets.
 

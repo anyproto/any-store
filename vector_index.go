@@ -34,8 +34,8 @@ type vectorIndex struct {
 	ivf *vivf.StoreIndex
 }
 
-// isIVF reports whether this index uses the IVF-PQ backend.
-func (vi *vectorIndex) isIVF() bool { return vi.mode.isIVFPQ() }
+// isIVF reports whether this index uses the IVF backend (PQ or SQ).
+func (vi *vectorIndex) isIVF() bool { return vi.mode.isIVF() }
 
 func vectorIndexNsPrefix(collName, indexName string) string {
 	return "vix:" + collName + ":" + indexName
@@ -66,10 +66,10 @@ func validateVectorParams(p *VectorParams) error {
 	}
 	switch p.Mode {
 	case VectorModeBTree, VectorModeHybrid, VectorModeBruteForce:
-	case VectorModeIVFPQ:
+	case VectorModeIVFPQ, VectorModeIVFSQ:
 		m := ivfM(p)
 		if p.Dim%m != 0 {
-			return fmt.Errorf("vector index: IVF-PQ requires Dim (%d) divisible by M (%d)", p.Dim, m)
+			return fmt.Errorf("vector index: IVF requires Dim (%d) divisible by M (%d)", p.Dim, m)
 		}
 	default:
 		return fmt.Errorf("vector index: unknown mode %d", p.Mode)
@@ -136,6 +136,7 @@ func ivfStoreParams(p *VectorParams, n int) vivf.StoreParams {
 		NProbe:     nprobe,
 		Normalize:  p.Metric == VectorCosine,
 		Int8:       p.Quantization == VectorQuantInt8,
+		SQ:         p.Mode == VectorModeIVFSQ,
 		KMeansPP:   true,
 		PrecompMiB: p.PrecomputeTableMiB,
 	}
@@ -359,7 +360,7 @@ func (c *collection) loadVectorIndex(tx *btree.ReadTx, info IndexInfo) (*vectorI
 		return newVectorIndexFromVindex(info, nil), nil
 	}
 	prefix := vectorIndexNsPrefix(c.name, info.Name)
-	if info.Vector.Mode.isIVFPQ() {
+	if info.Vector.Mode.isIVF() {
 		ivf, err := vivf.OpenTx(tx, prefix)
 		if err != nil {
 			return nil, err
@@ -436,7 +437,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	// count. IVF trains from the existing documents, so the index must be created on
 	// a populated collection (the documented bulk-load pattern); creating it empty
 	// has no data to learn the quantizers from.
-	if info.Vector.Mode.isIVFPQ() {
+	if info.Vector.Mode.isIVF() {
 		if len(vecs) == 0 {
 			return nil, fmt.Errorf("vector index: IVF-PQ requires existing documents to train — insert documents before creating the index")
 		}

@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/stretchr/testify/require"
@@ -255,6 +256,76 @@ func TestStoreIVFPQInt8(t *testing.T) {
 	t.Logf("recall@%d f32=%.4f int8=%.4f | :vec pages f32=%d int8=%d (%.2f×)", k, rF32, rInt8, szF32, szInt8, float64(szF32)/float64(szInt8))
 	require.GreaterOrEqual(t, rInt8, rF32-0.015, "int8 recall must stay within ~1.5%% of f32")
 	require.Less(t, szInt8, szF32*45/100, "int8 :vec must be <45%% of f32 size")
+}
+
+// TestStoreIVFSQvsPQ compares IVF-SQ (int8 full vectors scanned directly, no PQ
+// LUT, no re-rank) against IVF-PQ+int8 on the real export: recall@10 and per-query
+// search time. IVF-SQ uses closure=1 + higher nprobe (replicating full vectors is
+// expensive); IVF-PQ uses closure=4 + nprobe=16.
+func TestStoreIVFSQvsPQ(t *testing.T) {
+	if testing.Short() {
+		t.Skip("recall diagnostic")
+	}
+	dir := vbenchDir()
+	base, err := readF32(filepath.Join(dir, "base.f32"))
+	if err != nil {
+		t.Skipf("no ASV_VBENCH export at %s: %v", dir, err)
+	}
+	queries, err := readF32(filepath.Join(dir, "query.f32"))
+	require.NoError(t, err)
+	gt, err := readI32(filepath.Join(dir, "gt.i32"))
+	require.NoError(t, err)
+	qidx, err := readI32(filepath.Join(dir, "qidx.i32"))
+	require.NoError(t, err)
+	self := func(i int) int { return int(qidx[0][i]) }
+	const (
+		k  = 10
+		ef = 100
+	)
+	dim := len(base[0])
+
+	run := func(name string, p StoreParams) {
+		db := openMem(t)
+		ids := make([][]byte, len(base))
+		for i := range base {
+			ids[i] = bid(i)
+		}
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		t0 := time.Now()
+		_, err = BulkBuild(wtx, "ivf", p, ids, base)
+		require.NoError(t, err)
+		require.NoError(t, wtx.Commit())
+		buildMs := time.Since(t0).Milliseconds()
+
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer rtx.Rollback()
+		ix, err := OpenTx(rtx, "ivf")
+		require.NoError(t, err)
+		st, err := ix.Stats(rtx)
+		require.NoError(t, err)
+
+		var sum float64
+		ts := time.Now()
+		for i, q := range queries {
+			cands, err := ix.SearchCandidates(rtx, q, ef)
+			require.NoError(t, err)
+			got := make([]int, 0, k)
+			for _, c := range cands {
+				got = append(got, int(binary.BigEndian.Uint64(c.DocID))-1)
+			}
+			got = exclude(got, self(i), k)
+			sum += recallVsGT(got, gt[i], k)
+		}
+		usPerQuery := float64(time.Since(ts).Microseconds()) / float64(len(queries))
+		t.Logf("%-12s recall@%d=%.4f  %.0f µs/query  build=%dms  :cell=%d :vec=%d pages",
+			name, k, sum/float64(len(queries)), usPerQuery, buildMs, st.Cell.TotalPages(), st.Vec.TotalPages())
+	}
+
+	run("ivf-pq i8", StoreParams{Dim: dim, NList: 256, M: 96, Assign: 4, NProbe: 16, Normalize: true, Int8: true, KMeansPP: true, Seed: 42})
+	run("ivf-sq np32", StoreParams{Dim: dim, NList: 256, M: 96, Assign: 1, NProbe: 32, Normalize: true, SQ: true, KMeansPP: true, Seed: 42})
+	run("ivf-sq np64", StoreParams{Dim: dim, NList: 256, M: 96, Assign: 1, NProbe: 64, Normalize: true, SQ: true, KMeansPP: true, Seed: 42})
 }
 
 // TestStoreIVFPQRecallReal builds the btree-resident index on the real export and
