@@ -370,6 +370,17 @@ as a later recall-per-byte upgrade. Always with an **exact re-rank** stage over 
   delegated to the pipeline `SortIter` — measured ~19% faster end-to-end, since the planner then skips
   the SortIter for the default distance order and streams to `LimitIter`.
 
+- **Search-path latency pass (pprof-driven). ✅ DONE.** A CPU profile of the search loop found three
+  costs: full-sorting the candidate set, the per-cell ADC LUT rebuild, and the btree cell scan.
+  Fixes: (1) **quickselect** (Hoare, median-of-three) to partition out the ef best in O(n) instead of
+  sorting thousands to take ~100; (2) **IVFADC precomputed tables** — the exact decomposition
+  `‖q−c−r̂‖² = ‖q−c‖² + Σ_m[‖cb_mj‖²+2c_m·cb_mj] − 2Σ_m q_m·cb_mj` precomputes the cell term
+  (`precomp[cell][m][j]`, RAM-gated at 64 MiB; large indexes fall back to per-cell sqL2), so a query
+  builds one `−2·q_m·cb` table and each cell's LUT is a cheap add instead of m·256 sqL2s (a test
+  asserts both paths return identical results). Net **~540 → ~320 µs/query (−40%)**, recall bit-identical.
+  The btree cell scan (the remaining ~⅓) is the engine's cost and the inherent IVF range-scan work —
+  left to the btree, unchanged.
+
 - **Phase 3 — Ada-IVF local maintenance.** Local split/merge of hot violator lists; bound drift
   without full rebuilds; the IVFPQ analogue of `CompactRatio`.
 - **Phase 4 (optional) — recall/perf upgrades.** Anisotropic codebooks; OPQ rotation; an in-RAM

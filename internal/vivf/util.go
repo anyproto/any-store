@@ -68,6 +68,24 @@ func sqNorm(v []float32) float32 {
 	return vek32.Dot(v, v)
 }
 
+// dotSmall / sqNormSmall are scalar dot and squared-norm for the small PQ subspaces
+// (dim 2–24), where a SIMD call's overhead outweighs its benefit.
+func dotSmall(a, b []float32) float32 {
+	var s float32
+	for i := range a {
+		s += a[i] * b[i]
+	}
+	return s
+}
+
+func sqNormSmall(a []float32) float32 {
+	var s float32
+	for _, x := range a {
+		s += x * x
+	}
+	return s
+}
+
 // nearestSmall returns the index of the centroid closest (sqL2) to x among a PQ
 // sub-codebook.
 func nearestSmall(x []float32, cents [][]float32) int {

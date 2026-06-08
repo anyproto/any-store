@@ -56,8 +56,43 @@ type StoreIndex struct {
 	coarse [][]float32   // [nlist][dim]   — RAM-resident (the only hot set)
 	pqcb   [][][]float32 // [m][pqK][dsub]
 
+	// precomp is the IVFADC precomputed table term[cell][m][j] = ‖cb[m][j]‖² +
+	// 2·c_cell_m·cb[m][j] (flat, nlist·m·pqK floats). When present, a query builds
+	// one per-query table (−2·q_m·cb[m][j]) and each cell's ADC LUT is a cheap add
+	// instead of m·pqK sqL2s. nil for large indexes (gated by precompMaxFloats) →
+	// the per-cell residual-sqL2 path is used instead.
+	precomp []float32
+
 	metaRoot  uint32
 	searchers sync.Pool // *searcher — reusable per-query scratch (alloc-free search)
+}
+
+// precompMaxFloats caps the IVFADC precomputed table at 64 MiB (nlist·m·pqK
+// floats). Above this the per-cell sqL2 LUT path is used (no table, no extra RAM).
+const precompMaxFloats = 16 << 20
+
+// buildPrecomp fills ix.precomp (the cell-dependent IVFADC table) when it fits the
+// RAM cap. O(nlist·m·pqK·dsub) once, from the coarse centroids and PQ codebooks.
+func (ix *StoreIndex) buildPrecomp() {
+	n := ix.nlist * ix.m * pqK
+	if n <= 0 || n > precompMaxFloats {
+		ix.precomp = nil
+		return
+	}
+	ix.precomp = make([]float32, n)
+	for c := 0; c < ix.nlist; c++ {
+		cellBase := c * ix.m * pqK
+		for mm := 0; mm < ix.m; mm++ {
+			lo := mm * ix.dsub
+			csub := ix.coarse[c][lo : lo+ix.dsub]
+			cb := ix.pqcb[mm]
+			base := cellBase + mm*pqK
+			for j := 0; j < pqK; j++ {
+				cj := cb[j]
+				ix.precomp[base+j] = sqNormSmall(cj) + 2*dotSmall(csub, cj)
+			}
+		}
+	}
 }
 
 // cand is one scanned candidate: a label and its approximate (ADC) distance.
@@ -81,7 +116,8 @@ type searcher struct {
 	cd      []cellDist
 	cells   []int
 	cands   []cand
-	dedup   u32fmap // label -> best ADC, map-free with O(1) reset
+	dedup   u32fmap   // label -> best ADC, map-free with O(1) reset
+	qlut    []float32 // per-query −2·q_m·cb[m][j] table (precomp path)
 	docOff  [][2]int
 	vbuf    []byte // reused :vec read buffer (re-rank)
 	dbuf    []byte // reused :lbl (docID) read buffer (re-rank)
@@ -187,6 +223,7 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 	if err := wtx.Put(ix.vmeta, metaKey, encodeMeta(mt)); err != nil {
 		return nil, err
 	}
+	ix.buildPrecomp()
 	ix.metaRoot = ix.vmeta.RootPage()
 	return ix, nil
 }
@@ -278,6 +315,7 @@ func OpenTx(rtx *btree.ReadTx, prefix string) (*StoreIndex, error) {
 		return nil, err
 	}
 	ix.pqcb = decodePQ(cloneBytes(pq), ix.m, ix.dsub)
+	ix.buildPrecomp()
 	ix.metaRoot = ix.vmeta.RootPage()
 	return ix, nil
 }
@@ -445,14 +483,32 @@ func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) (
 	// Scan probed cells; dedup labels keeping the best ADC (closure can place one
 	// label in several probed cells), map-free via the pooled u32fmap.
 	s.lut = ensureF32(s.lut, ix.m*pqK)
-	s.qr = ensureF32(s.qr, ix.dim)
 	s.dedup.reset()
+	usePrecomp := ix.precomp != nil
+	if usePrecomp {
+		s.qlut = ensureF32(s.qlut, ix.m*pqK)
+		ix.buildQTerm(qn, s.qlut) // per-query −2·q_m·cb table, built once
+	} else {
+		s.qr = ensureF32(s.qr, ix.dim)
+	}
 	cur := rtx.NewCursor(ix.vcell)
 	defer cur.Close()
 	var seek [8]byte
 	for _, c := range s.cells {
-		vek32.Sub_Into(s.qr, qn, ix.coarse[c])
-		ix.buildLUT(s.qr, s.lut)
+		// Build this cell's ADC LUT and a constant base added to every code's
+		// distance. Precomp path: lut = precomp[cell] + qterm (cheap adds), base =
+		// ‖q−c‖²; otherwise: lut = sqL2(q−c residual, cb), base = 0.
+		var base float32
+		if usePrecomp {
+			base = sqL2(qn, ix.coarse[c]) // ‖q − c_cell‖²
+			pc := ix.precomp[c*ix.m*pqK:]
+			for k := 0; k < ix.m*pqK; k++ {
+				s.lut[k] = pc[k] + s.qlut[k]
+			}
+		} else {
+			vek32.Sub_Into(s.qr, qn, ix.coarse[c])
+			ix.buildLUT(s.qr, s.lut)
+		}
 		binary.BigEndian.PutUint32(seek[0:], uint32(c))
 		binary.BigEndian.PutUint32(seek[4:], 0)
 		if err := cur.Seek(seek[:]); err != nil {
@@ -473,19 +529,23 @@ func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) (
 			if err != nil {
 				return nil, err
 			}
-			s.dedup.putMin(cellKeyLabel(key), adc(s.lut, code, ix.m))
+			s.dedup.putMin(cellKeyLabel(key), base+adc(s.lut, code, ix.m))
 			if err := cur.Next(); err != nil {
 				return nil, err
 			}
 		}
 	}
 
-	// Keep the ef best by ADC before the exact re-rank (bounds :vec reads).
+	// Keep the ef best by ADC before the exact re-rank (bounds :vec reads). Use
+	// quickselect to partition out the ef smallest in O(n) — full-sorting the whole
+	// (often thousands-strong) candidate set just to take the top ef was ~23% of
+	// search — then sort only those ef.
 	s.cands = s.dedup.collect(s.cands)
-	slices.SortFunc(s.cands, func(a, b cand) int { return cmpF32(a.dist, b.dist) })
 	if len(s.cands) > ef {
+		selectSmallest(s.cands, ef)
 		s.cands = s.cands[:ef]
 	}
+	slices.SortFunc(s.cands, func(a, b cand) int { return cmpF32(a.dist, b.dist) })
 
 	// Re-rank survivors by exact distance, packing docIDs into one backing slice so
 	// the result costs ~2 allocations regardless of ef.
@@ -530,6 +590,51 @@ func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) (
 	return out, nil
 }
 
+// selectSmallest partitions cs in place so the k smallest by dist occupy cs[:k]
+// (in arbitrary order). Quickselect (Hoare partition, median-of-three pivot),
+// O(n) average — used instead of a full sort when only the ef best are needed.
+func selectSmallest(cs []cand, k int) {
+	lo, hi := 0, len(cs)-1
+	for lo < hi {
+		p := partitionDist(cs, lo, hi)
+		switch {
+		case p == k:
+			return
+		case p < k:
+			lo = p + 1
+		default:
+			hi = p - 1
+		}
+	}
+}
+
+// partitionDist partitions cs[lo:hi+1] around a median-of-three pivot by dist,
+// returning the final pivot index.
+func partitionDist(cs []cand, lo, hi int) int {
+	mid := lo + (hi-lo)/2
+	// median-of-three (lo, mid, hi) → move median to hi-1 as pivot
+	if cs[mid].dist < cs[lo].dist {
+		cs[lo], cs[mid] = cs[mid], cs[lo]
+	}
+	if cs[hi].dist < cs[lo].dist {
+		cs[lo], cs[hi] = cs[hi], cs[lo]
+	}
+	if cs[hi].dist < cs[mid].dist {
+		cs[mid], cs[hi] = cs[hi], cs[mid]
+	}
+	pivot := cs[mid].dist
+	cs[mid], cs[hi-1] = cs[hi-1], cs[mid]
+	i := lo
+	for j := lo; j < hi-1; j++ {
+		if cs[j].dist < pivot {
+			cs[i], cs[j] = cs[j], cs[i]
+			i++
+		}
+	}
+	cs[i], cs[hi-1] = cs[hi-1], cs[i]
+	return i
+}
+
 // ensureF32 returns a length-n float32 slice reusing buf's capacity when possible.
 func ensureF32(buf []float32, n int) []float32 {
 	if cap(buf) < n {
@@ -555,6 +660,20 @@ func (ix *StoreIndex) buildLUT(qr, lut []float32) {
 		cb := ix.pqcb[mm]
 		for j := 0; j < pqK; j++ {
 			lut[base+j] = sqL2(sub, cb[j])
+		}
+	}
+}
+
+// buildQTerm fills lut[m*pqK+j] = −2·q_m·cb[m][j] — the query-dependent half of the
+// precomputed-table ADC. Built once per query; combined per cell with ix.precomp.
+func (ix *StoreIndex) buildQTerm(q, lut []float32) {
+	for mm := 0; mm < ix.m; mm++ {
+		lo := mm * ix.dsub
+		sub := q[lo : lo+ix.dsub]
+		base := mm * pqK
+		cb := ix.pqcb[mm]
+		for j := 0; j < pqK; j++ {
+			lut[base+j] = -2 * dotSmall(sub, cb[j])
 		}
 	}
 }

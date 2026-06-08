@@ -123,6 +123,40 @@ func TestStoreIVFPQSmall(t *testing.T) {
 	require.NoError(t, rtx.Rollback())
 }
 
+// TestStoreIVFPQLUTPathsAgree verifies the precomputed-table ADC path (used by
+// small/medium indexes) and the per-cell sqL2 fallback (large indexes) return the
+// same candidates and distances — the precomp decomposition must be exact.
+func TestStoreIVFPQLUTPathsAgree(t *testing.T) {
+	const dim = 48
+	vecs := clusteredVecs(3000, dim, 50, 3)
+	db := openMem(t)
+	p := StoreParams{Dim: dim, NList: 64, M: 12, Assign: 3, NProbe: 12, Normalize: true, KMeansPP: true, Seed: 2}
+	buildStore(t, db, p, vecs)
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer rtx.Rollback()
+	ix, err := OpenTx(rtx, "ivf")
+	require.NoError(t, err)
+	require.NotNil(t, ix.precomp, "this config should use the precomputed table")
+
+	for _, qi := range []int{0, 100, 500, 1500, 2999} {
+		withPre, err := ix.SearchCandidates(rtx, vecs[qi], 50)
+		require.NoError(t, err)
+		saved := ix.precomp
+		ix.precomp = nil // force the sqL2 fallback
+		without, err := ix.SearchCandidates(rtx, vecs[qi], 50)
+		ix.precomp = saved
+		require.NoError(t, err)
+
+		require.Equal(t, len(withPre), len(without))
+		for i := range withPre {
+			require.Equal(t, withPre[i].DocID, without[i].DocID, "query %d rank %d docID", qi, i)
+			require.InDelta(t, withPre[i].Distance, without[i].Distance, 1e-4, "query %d rank %d dist", qi, i)
+		}
+	}
+}
+
 // TestStoreIVFPQRecallReal builds the btree-resident index on the real export and
 // confirms its recall@10 matches the in-RAM prototype / HNSW baseline (~0.97),
 // proving the storage layer preserves the algorithm's recall.
