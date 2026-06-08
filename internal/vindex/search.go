@@ -126,6 +126,9 @@ type searcher struct {
 
 	// write-path scratch reused by addNeighbor (insert connect phase, which runs
 	// after searchLayer so these don't overlap with the read buffers above).
+	naKey [4]byte    // neighbour key buffer (field of the pooled searcher so the
+	//                  big-endian label key handed to the btree doesn't heap-escape
+	//                  per addNeighbor call)
 	naAdj []byte     // a's adjacency record read buffer
 	naEnc []byte     // re-encoded adjacency write buffer
 	naDec [][]uint32 // decoded per-layer neighbour lists (reused)
