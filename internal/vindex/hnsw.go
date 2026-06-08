@@ -470,10 +470,10 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 // when the list is full (coder/hnsw's rule). Reads/writes a's adjacency record.
 func (ix *Index) addNeighbor(wtx *btree.WriteTx, s *searcher, a, b uint32, layer int32) error {
 	rtx := &wtx.ReadTx
-	var kb [4]byte
-	binary.BigEndian.PutUint32(kb[:], a)
+	binary.BigEndian.PutUint32(s.naKey[:], a)
+	kb := s.naKey[:]
 	var err error
-	s.naAdj, err = rtx.AppendValue(ix.vadj, kb[:], s.naAdj[:0])
+	s.naAdj, err = rtx.AppendValue(ix.vadj, kb, s.naAdj[:0])
 	if err != nil {
 		return err
 	}
