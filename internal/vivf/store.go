@@ -67,9 +67,13 @@ type StoreIndex struct {
 	searchers sync.Pool // *searcher — reusable per-query scratch (alloc-free search)
 }
 
-// precompMaxFloats caps the IVFADC precomputed table at 64 MiB (nlist·m·pqK
-// floats). Above this the per-cell sqL2 LUT path is used (no table, no extra RAM).
-const precompMaxFloats = 16 << 20
+// precompMaxFloats caps the IVFADC precomputed table at 256 MiB (nlist·m·pqK
+// floats). The table is the search accelerator — it removes the per-cell ADC LUT
+// rebuild, which measured ~80% of search at dim 768 (a 3× e2e speedup once on) —
+// at a cost of nlist·m·1 KiB of RAM (e.g. ~77 MiB at nlist 784, m 96, small next
+// to the f32 re-rank store). A very large index (e.g. ~1M vectors → nlist 4096,
+// m 96 → ~400 MiB) exceeds the cap and falls back to the per-cell sqL2 LUT.
+const precompMaxFloats = 64 << 20
 
 // buildPrecomp fills ix.precomp (the cell-dependent IVFADC table) when it fits the
 // RAM cap. O(nlist·m·pqK·dsub) once, from the coarse centroids and PQ codebooks.
