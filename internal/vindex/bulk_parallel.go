@@ -57,16 +57,6 @@ func BulkBuildParallel(wtx *btree.WriteTx, prefix string, p Params, seed int64, 
 			full = append([]float32(nil), vecs[i]...)
 		}
 		pb.full[i] = full
-		if ix.quant == QuantNone {
-			pb.vec[i] = full
-		} else {
-			dq := make([]float32, ix.dim)
-			v, ok := decodeVecInto(encodeVec(nil, full, ix.quant), ix.dim, ix.quant, dq)
-			if !ok {
-				return nil, fmt.Errorf("vindex: dequantize failed for vec %d", i)
-			}
-			pb.vec[i] = v
-		}
 		lvl := ix.randomLevel()
 		pb.levels[i] = lvl
 		pb.links[i] = make([]uint32, pb.slotsFor(lvl))
@@ -135,25 +125,48 @@ type pBuilder struct {
 	ix     *Index
 	m, m0  int
 	full   [][]float32
-	vec    [][]float32
 	levels []int32
 
 	links [][]uint32 // links[i] fixed; layer lc occupies [off(lc), off(lc)+m_lc)
 	cnt   [][]uint16 // cnt[i][lc] = neighbour count at layer lc
 	locks []sync.RWMutex
 
+	repairEf int
+
 	entryMu sync.Mutex
 	entry   uint32
 	top     int32
 }
 
+// repairEfTune, when >0, overrides the repair-pass ef (test/benchmark knob).
+var repairEfTune int
+
 func newPBuilder(ix *Index, n int) *pBuilder {
 	return &pBuilder{
 		ix: ix, m: ix.m, m0: ix.m0,
-		full: make([][]float32, n), vec: make([][]float32, n),
+		full: make([][]float32, n),
 		levels: make([]int32, n), links: make([][]uint32, n),
 		cnt: make([][]uint16, n), locks: make([]sync.RWMutex, n),
+		repairEf: repairEf(ix),
 	}
+}
+
+// repairEf chooses the ef for the repair pass. The repair re-searches the COMPLETE
+// graph, so a narrower beam than efConstruction still finds the few neighbours the
+// concurrent build missed — at a fraction of the cost, which matters most on
+// low-core machines where the repair caps the speedup.
+func repairEf(ix *Index) int {
+	if repairEfTune > 0 {
+		return repairEfTune
+	}
+	// A beam just wide enough to reselect the layer-0 degree (m0). Measured: recall
+	// is flat from here up to efConstruction, but build time isn't — so the narrow
+	// beam keeps recall parity at a fraction of the repair cost (best low-core scaling).
+	ef := ix.m0
+	if ef < 32 {
+		ef = 32
+	}
+	return ef
 }
 
 func (b *pBuilder) slotsFor(level int32) int { return b.m0 + int(level)*b.m }
@@ -261,7 +274,7 @@ func (b *pBuilder) repair(threads int) {
 			start = level
 		}
 		for lc := start; lc >= 0; lc-- {
-			found := b.searchLayer(query, ep, b.ix.efC, lc, sc)
+			found := b.searchLayer(query, ep, b.repairEf, lc, sc)
 			found = b.selectHeuristic(found, b.capAt(lc), sc)
 			for _, cd := range found {
 				if cd.label == i {
@@ -368,12 +381,12 @@ func (b *pBuilder) insert(label uint32, sc *pScratch) {
 
 func (b *pBuilder) greedy(query []float32, ep uint32, layer int32, sc *pScratch) uint32 {
 	best := ep
-	bestDist := b.ix.dist(query, b.vec[best])
+	bestDist := b.ix.dist(query, b.full[best])
 	for {
 		improved := false
 		sc.nbr = b.neighborsInto(best, layer, sc.nbr)
 		for _, nb := range sc.nbr {
-			if d := b.ix.dist(query, b.vec[nb]); d < bestDist {
+			if d := b.ix.dist(query, b.full[nb]); d < bestDist {
 				bestDist, best, improved = d, nb, true
 			}
 		}
@@ -387,7 +400,7 @@ func (b *pBuilder) searchLayer(query []float32, ep uint32, ef int, layer int32, 
 	sc.visited.reset()
 	sc.cand.reset(false)
 	sc.res.reset(true)
-	d0 := b.ix.dist(query, b.vec[ep])
+	d0 := b.ix.dist(query, b.full[ep])
 	sc.visited.visit(ep)
 	sc.cand.push(candidate{d0, ep})
 	sc.res.push(candidate{d0, ep})
@@ -401,7 +414,7 @@ func (b *pBuilder) searchLayer(query []float32, ep uint32, ef int, layer int32, 
 			if !sc.visited.visit(nb) {
 				continue
 			}
-			d := b.ix.dist(query, b.vec[nb])
+			d := b.ix.dist(query, b.full[nb])
 			if sc.res.len() >= ef && d >= sc.res.peek().dist {
 				continue
 			}
@@ -432,10 +445,10 @@ func (b *pBuilder) selectHeuristic(cands []candidate, m int, sc *pScratch) []can
 			break
 		}
 		c := cands[ci]
-		cv := b.vec[c.label]
+		cv := b.full[c.label]
 		keep := true
 		for r := 0; r < len(sc.sel); r++ {
-			if b.ix.dist(cv, b.vec[sc.sel[r].label]) < c.dist {
+			if b.ix.dist(cv, b.full[sc.sel[r].label]) < c.dist {
 				keep = false
 				break
 			}
@@ -469,13 +482,13 @@ func (b *pBuilder) addNeighbor(a, newID uint32, lc int32) {
 		return
 	}
 	// Full: re-select capn diverse neighbours from {existing ∪ newID}.
-	av := b.vec[a]
+	av := b.full[a]
 	cand := make([]candidate, 0, capn+1)
 	for i := 0; i < c; i++ {
 		x := b.links[a][o+i]
-		cand = append(cand, candidate{b.ix.dist(av, b.vec[x]), x})
+		cand = append(cand, candidate{b.ix.dist(av, b.full[x]), x})
 	}
-	cand = append(cand, candidate{b.ix.dist(av, b.vec[newID]), newID})
+	cand = append(cand, candidate{b.ix.dist(av, b.full[newID]), newID})
 	insertionSortCands(cand)
 	kept := b.selectHeuristicLocal(cand, capn)
 	for i, cd := range kept {
@@ -496,10 +509,10 @@ func (b *pBuilder) selectHeuristicLocal(cands []candidate, m int) []candidate {
 			break
 		}
 		c := cands[ci]
-		cv := b.vec[c.label]
+		cv := b.full[c.label]
 		keep := true
 		for r := 0; r < len(out); r++ {
-			if b.ix.dist(cv, b.vec[out[r].label]) < c.dist {
+			if b.ix.dist(cv, b.full[out[r].label]) < c.dist {
 				keep = false
 				break
 			}

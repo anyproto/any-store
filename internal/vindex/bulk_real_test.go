@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/stretchr/testify/require"
@@ -134,17 +135,27 @@ func TestBulkRealRecallDiag(t *testing.T) {
 	build("bulk-par(1)", func(wtx *btree.WriteTx) (*Index, error) {
 		return BulkBuildParallel(wtx, "vix", params, 1, ids, base, 1)
 	})
-	build("bulk-par(N)", func(wtx *btree.WriteTx) (*Index, error) {
-		return BulkBuildParallel(wtx, "vix", params, 1, ids, base, 0)
-	})
-	for _, efc := range []int{300, 400, 600} {
-		p := params
-		p.EfConstruction = efc
-		name := "bulk-par(N) efc=" + itoa(efc)
-		build(name, func(wtx *btree.WriteTx) (*Index, error) {
-			return BulkBuildParallel(wtx, "vix", p, 1, ids, base, 0)
-		})
+	// Repair-ef sweep: recall vs build time. A narrower repair beam is cheaper
+	// (better low-core scaling) — find the smallest ef that keeps recall parity.
+	for _, ref := range []int{16, 32, 64, 128, 200} {
+		repairEfTune = ref
+		db, err := btree.Open(":memory:", btree.Options{InMemory: true})
+		require.NoError(t, err)
+		wtx, err := db.BeginWrite()
+		require.NoError(t, err)
+		t0 := time.Now()
+		ix, err := BulkBuildParallel(wtx, "vix", params, 1, ids, base, 0)
+		require.NoError(t, err)
+		require.NoError(t, wtx.Commit())
+		bt := time.Since(t0)
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		r := recall(ix, rtx)
+		_ = rtx.Rollback()
+		_ = db.Close()
+		t.Logf("repairEf=%-3d build=%s recall@%d=%.3f", ref, bt.Round(time.Millisecond), k, r)
 	}
+	repairEfTune = 0
 }
 
 func itoa(i int) string {

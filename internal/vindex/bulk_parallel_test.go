@@ -2,6 +2,8 @@ package vindex
 
 import (
 	"path/filepath"
+	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -264,6 +266,79 @@ func TestBulkBuildParallelEdge(t *testing.T) {
 		_ = rtx.Rollback()
 		_ = db.Close()
 	}
+}
+
+// TestBulkBuildParallelMem reports the RAM/alloc cost of the parallel build (which
+// holds the whole graph in RAM) vs the per-insert path. Skipped in -short.
+func TestBulkBuildParallelMem(t *testing.T) {
+	if testing.Short() {
+		t.Skip("mem")
+	}
+	const (
+		n   = 20000
+		dim = 128
+	)
+	vecs := randVecs(n, dim, 7)
+	ids := make([][]byte, n)
+	for i := range ids {
+		ids[i] = docID(i)
+	}
+	params := Params{Dim: dim, Metric: Cosine, EfSearch: 64, Quantization: QuantInt8}
+
+	measure := func(name string, run func(db *btree.DB)) {
+		db, err := btree.Open(filepath.Join(t.TempDir(), "m.db"), btree.Options{})
+		require.NoError(t, err)
+		runtime.GC()
+		var m0 runtime.MemStats
+		runtime.ReadMemStats(&m0)
+		// peak HeapInuse sampler
+		stop := make(chan struct{})
+		var peak uint64
+		go func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					var ms runtime.MemStats
+					runtime.ReadMemStats(&ms)
+					if ms.HeapInuse > atomic.LoadUint64(&peak) {
+						atomic.StoreUint64(&peak, ms.HeapInuse)
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+			}
+		}()
+		run(db)
+		close(stop)
+		var m1 runtime.MemStats
+		runtime.ReadMemStats(&m1)
+		const MiB = 1 << 20
+		t.Logf("%-12s peakHeap=%4dMiB  allocated=%5dMiB  mallocs=%d",
+			name, atomic.LoadUint64(&peak)/MiB, (m1.TotalAlloc-m0.TotalAlloc)/MiB, m1.Mallocs-m0.Mallocs)
+		_ = db.Close()
+	}
+
+	measure("per-insert", func(db *btree.DB) {
+		wtx, _ := db.BeginWrite()
+		ix, _ := Create(wtx, "vix", params, 1)
+		_ = wtx.Commit()
+		wtx, _ = db.BeginWrite()
+		for i := 0; i < n; i++ {
+			require.NoError(t, ix.Insert(wtx, ids[i], vecs[i]))
+			if (i+1)%2000 == 0 {
+				require.NoError(t, wtx.Commit())
+				wtx, _ = db.BeginWrite()
+			}
+		}
+		require.NoError(t, wtx.Commit())
+	})
+	measure("parallel", func(db *btree.DB) {
+		wtx, _ := db.BeginWrite()
+		_, err := BulkBuildParallel(wtx, "vix", params, 1, ids, vecs, 0)
+		require.NoError(t, err)
+		require.NoError(t, wtx.Commit())
+	})
 }
 
 // TestBulkBuildParallelTiming compares per-insert vs sequential bulk vs parallel
