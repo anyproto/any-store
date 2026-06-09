@@ -1,6 +1,7 @@
 package anyenc
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"slices"
@@ -118,9 +119,6 @@ func parseValue(b []byte, c *cache, depth int) (v *Value, tail []byte, err error
 	if len(b) == 0 {
 		return nil, nil, fmt.Errorf("expected value, but got 0 byte")
 	}
-	if depth > maxParseDepth {
-		return nil, nil, fmt.Errorf("max parse depth (%d) exceeded", maxParseDepth)
-	}
 	// Index keys store reverse-flagged fields bitwise-inverted (see
 	// index.go writeValues / anyenc.Tuple.AppendInverted). An inverted
 	// field's leading tag byte is ^Type(n) (e.g. iTypeNumber=0xFD), which
@@ -150,12 +148,21 @@ func parseValue(b []byte, c *cache, depth int) (v *Value, tail []byte, err error
 		// Scan from index 1 so the leading tag byte is never mistaken for
 		// the terminator (the inverted tag 0xFD..0xFE differs from 0xFF, but
 		// the normal tag 0x03 also differs from 0x00 — scanning from 1 keeps
-		// both paths correct and symmetric). scanTerm steps over escaped EOS
-		// pairs (see escape.go), so embedded zero bytes never truncate the
-		// string.
-		rel, escaped, ok := scanTerm(b[1:], eos)
-		if !ok {
+		// both paths correct and symmetric). The hot path is one IndexByte
+		// plus one follow-byte compare; only when that byte is the escape
+		// tail (an escaped EOS inside the string, see escape.go) does the
+		// full scanTerm walk run.
+		rel := bytes.IndexByte(b[1:], eos)
+		if rel < 0 {
 			return nil, nil, fmt.Errorf("end of string not found")
+		}
+		var escaped bool
+		if rel+2 < len(b) && b[rel+2] == ^eos {
+			var ok bool
+			rel, escaped, ok = scanTerm(b[1:], eos)
+			if !ok {
+				return nil, nil, fmt.Errorf("end of string not found")
+			}
 		}
 		eosIdx := rel + 1
 		if c != nil {
@@ -184,8 +191,17 @@ func parseValue(b []byte, c *cache, depth int) (v *Value, tail []byte, err error
 	case TypeVectorF32:
 		return parseVectorF32(b[1:], c)
 	case TypeObject:
+		// Depth is only checked when entering a container (scalars cannot
+		// recurse): corrupt bytes like a long run of array tags must produce
+		// an error, not an unrecoverable stack overflow.
+		if depth >= maxParseDepth {
+			return nil, nil, fmt.Errorf("max parse depth (%d) exceeded", maxParseDepth)
+		}
 		return parseObject(b[1:], c, eos, depth)
 	case TypeArray:
+		if depth >= maxParseDepth {
+			return nil, nil, fmt.Errorf("max parse depth (%d) exceeded", maxParseDepth)
+		}
 		return parseArray(b[1:], c, eos, depth)
 	case TypeTrue:
 		return valueTrue, b[1:], nil
@@ -235,13 +251,28 @@ func parseObject(b []byte, c *cache, eos byte, depth int) (*Value, []byte, error
 		if b[0] == eos {
 			return o, b[1:], nil
 		}
-		eosI, escaped, ok := scanTerm(b, eos)
-		if !ok {
+		// Hot path: one IndexByte plus one follow-byte compare; the full
+		// scanTerm walk runs only when the found eos is an escape pair
+		// (escaped EOS inside the key, see escape.go).
+		eosI := bytes.IndexByte(b, eos)
+		if eosI < 0 {
 			return nil, nil, fmt.Errorf("parse object key: end of string not found")
+		}
+		var escaped bool
+		if eosI+1 < len(b) && b[eosI+1] == ^eos {
+			var ok bool
+			eosI, escaped, ok = scanTerm(b, eos)
+			if !ok {
+				return nil, nil, fmt.Errorf("parse object key: end of string not found")
+			}
 		}
 		if c != nil {
 			o.o.kvs = slices.Grow(o.o.kvs, 1)[:i+1]
-			o.o.kvs[i].key = decodeKey(b[:eosI], escaped)
+			if raw := b[:eosI]; escaped || (len(raw) > 0 && raw[0] == emptyKey) {
+				o.o.kvs[i].key = decodeKey(raw, escaped)
+			} else {
+				o.o.kvs[i].key = b2s(raw)
+			}
 			if o.o.kvs[i].value, b, err = parseValue(b[eosI+1:], c, depth+1); err != nil {
 				return nil, nil, err
 			}

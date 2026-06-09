@@ -47,8 +47,25 @@ import "bytes"
 // the escape tail by negation, so the same code serves both directions.
 
 // appendEscaped appends s to dst, escaping every EOS byte as (EOS, 0xFF).
-// The common no-EOS case is a single IndexByte plus one bulk append.
+// The marshal hot loops (Value.MarshalTo, marshalObject) do not call this —
+// they open-code the short-input scan to avoid call overhead per field (the
+// historical appendIgnoreEOS was small enough to inline; this isn't) and
+// fall back to appendEscapedSlow.
 func appendEscaped(dst []byte, s []byte) []byte {
+	if len(s) > 32 {
+		return appendEscapedSlow(dst, s)
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] == EOS {
+			return appendEscapedSlow(dst, s)
+		}
+	}
+	return append(dst, s...)
+}
+
+// appendEscapedSlow scans with SIMD IndexByte chunks: optimal for long
+// inputs and for inputs that actually contain EOS bytes.
+func appendEscapedSlow(dst []byte, s []byte) []byte {
 	for {
 		i := bytes.IndexByte(s, EOS)
 		if i < 0 {
@@ -97,7 +114,9 @@ func scanTerm(b []byte, eos byte) (term int, escaped bool, ok bool) {
 }
 
 // appendEscapedKey appends an object key with the rules described above,
-// followed by the EOS terminator.
+// followed by the EOS terminator. marshalObject open-codes the common case
+// (non-empty key, no reserved leading byte, no NUL) and only calls this for
+// the rest.
 func appendEscapedKey(dst []byte, key string) []byte {
 	if len(key) == 0 {
 		return append(dst, emptyKey, EOS)
@@ -105,7 +124,7 @@ func appendEscapedKey(dst []byte, key string) []byte {
 	if key[0] == EOS || key[0] == ^EOS {
 		dst = append(dst, emptyKey)
 	}
-	dst = appendEscaped(dst, s2b(key))
+	dst = appendEscapedSlow(dst, s2b(key))
 	return append(dst, EOS)
 }
 

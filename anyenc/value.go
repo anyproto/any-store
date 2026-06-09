@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"slices"
 	"strconv"
 	"unsafe"
 
@@ -272,7 +273,28 @@ func (v *Value) MarshalTo(dst []byte) []byte {
 		dst = append(dst, EOS)
 	case TypeString:
 		dst = append(dst, byte(TypeString))
-		dst = appendEscaped(dst, v.v)
+		// Open-coded fused scan+copy (see escape.go): short NUL-free strings
+		// — the overwhelmingly common case — stream per byte exactly like the
+		// historical appendIgnoreEOS (bulk append would be a memmove call,
+		// slower for the typical 2-16 byte string). On an EOS hit, roll back
+		// and take the escaping cold path.
+		if len(v.v) > 32 {
+			dst = appendEscapedSlow(dst, v.v)
+		} else {
+			mark := len(dst)
+			dst = slices.Grow(dst, len(v.v)+1)
+			clean := true
+			for i := 0; i < len(v.v); i++ {
+				if v.v[i] == EOS {
+					clean = false
+					break
+				}
+				dst = append(dst, v.v[i])
+			}
+			if !clean {
+				dst = appendEscapedSlow(dst[:mark], v.v)
+			}
+		}
 		dst = append(dst, EOS)
 	case TypeNumber:
 		dst = append(dst, byte(TypeNumber))
@@ -382,7 +404,29 @@ func (v *Value) MarshalCompressed(dst, scratch []byte) ([]byte, []byte) {
 func (v *Value) marshalObject(dst []byte) []byte {
 	dst = append(dst, byte(TypeObject))
 	for _, kv := range v.o.kvs {
-		dst = appendEscapedKey(dst, kv.key)
+		// Open-coded fused scan+copy for the common key shape (see the
+		// TypeString case and escape.go); empty, reserved-leading-byte, long
+		// or NUL-containing keys take the cold path.
+		key := kv.key
+		if len(key) == 0 || len(key) > 32 || key[0] == EOS || key[0] == ^EOS {
+			dst = appendEscapedKey(dst, key)
+		} else {
+			mark := len(dst)
+			dst = slices.Grow(dst, len(key)+1)
+			clean := true
+			for i := 0; i < len(key); i++ {
+				if key[i] == EOS {
+					clean = false
+					break
+				}
+				dst = append(dst, key[i])
+			}
+			if clean {
+				dst = append(dst, EOS)
+			} else {
+				dst = appendEscapedKey(dst[:mark], key)
+			}
+		}
 		dst = kv.value.MarshalTo(dst)
 	}
 	return append(dst, EOS)

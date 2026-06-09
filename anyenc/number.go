@@ -10,15 +10,18 @@ import (
 // AppendFloat64 encodes float64 as bytes that will be correctly comparable with byte.Compare
 func AppendFloat64(b []byte, f float64) []byte {
 	bits := math.Float64bits(f)
-	// Normalize -0 to +0: they compare equal as floats, so they must encode to
-	// identical key bytes (otherwise an index seek for 0 misses -0 entries).
-	if bits == 1<<63 {
-		bits = 0
-	}
 	n := len(b)
 	bytes := binary.BigEndian.AppendUint64(b, bits)
 	// handle negative numbers
 	if bits&(1<<63) != 0 {
+		// Normalize -0 to +0: equal floats must encode to identical key bytes
+		// (an index seek for 0 would miss -0 entries). The raw bytes of -0
+		// (0x80 00...) already equal the +0 ENCODING (sign-bit-flipped 0x00...),
+		// so skipping the flip below is exactly the normalization. The check
+		// lives in the negative branch so positive numbers pay nothing.
+		if bits == 1<<63 {
+			return bytes
+		}
 		// Flip all bits for negative numbers
 		for i := n; i < len(bytes); i++ {
 			bytes[i] = ^bytes[i]
