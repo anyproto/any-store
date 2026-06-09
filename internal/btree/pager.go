@@ -417,14 +417,19 @@ func (p *pager) open() (err error) {
 	// match SQLite's lazy initialization in unixFetch (os_unix.c:5727).
 	p.dbMmap = newDBMmap(f, p.mmapSize)
 
-	// Acquire a shared flock on the DB file. Held for the lifetime of
-	// this pager. Any closer attempting to upgrade to exclusive will
-	// BUSY-retry while we hold this — serializing shm unlink against
-	// new-opener races. Matches SQLite's sqlite3PagerSharedLock + the
-	// wal.c:2508 EXCLUSIVE-for-close invariant.
+	// Acquire a DB-file flock, held for the lifetime of this pager and released
+	// when p.file is closed.
 	//
-	// Only applies to multi-process mode; in-process skips it (in-memory
-	// already returned above).
+	// Multi-process mmap mode takes a SHARED lock: concurrent processes are
+	// allowed and coordinated through the mmap'd -shm; any closer upgrading to
+	// exclusive BUSY-retries while we hold shared, serializing shm unlink against
+	// new-opener races (SQLite's sqlite3PagerSharedLock + wal.c:2508 invariant).
+	//
+	// In-process mode uses heap-backed, process-local SHM and is therefore
+	// single-process only, so it takes an EXCLUSIVE lock instead — a second
+	// opener (another process, or another handle in this process) is rejected
+	// with a clear error rather than silently corrupting via a separate heap SHM.
+	// (In-memory already returned above, so here p.inProcess implies file-backed.)
 	if !p.inProcess {
 		for attempt := 0; attempt < 100; attempt++ {
 			lockErr := acquireSharedDBLock(f)
@@ -442,6 +447,26 @@ func (p *pager) open() (err error) {
 				return fmt.Errorf("btree: DB-file lock still busy after retries (peer mid-close?)")
 			}
 			time.Sleep(10 * time.Millisecond)
+		}
+	} else {
+		if lockErr := acquireExclusiveDBLock(f); lockErr != nil {
+			if errors.Is(lockErr, ErrBusy) {
+				// Derive the registry key BEFORE closing f (inode identity needs
+				// the open fd). A same-process second open is already tracked in
+				// openDBs (the first handle registered after its own open) -> use
+				// the established ErrDatabaseOpen; a lock held by a DIFFERENT
+				// process is reported as ErrInProcessLocked.
+				key := registryKeyForOpenFile(f, p.path)
+				_ = f.Close()
+				p.file = nil
+				if _, here := openDBs.Load(key); here {
+					return ErrDatabaseOpen
+				}
+				return ErrInProcessLocked
+			}
+			_ = f.Close()
+			p.file = nil
+			return fmt.Errorf("btree: acquire DB-file exclusive lock: %w", lockErr)
 		}
 	}
 

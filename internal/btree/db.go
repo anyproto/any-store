@@ -52,6 +52,23 @@ func openRegistryKey(path string) (string, error) {
 	return abs, nil
 }
 
+// registryKeyForOpenFile derives the openDBs key from an ALREADY-OPEN file
+// handle, preferring file identity (dev,ino) and falling back to the given
+// canonical/abs path when no inode is available (Windows/wasm or a VFS handle).
+// Using the open fd's Stat is correct even for a just-created file (the inode
+// now exists), unlike pre-open path stat. Shared by Open's registration and by
+// the pager's in-process exclusive-lock error path so both agree on the key.
+func registryKeyForOpenFile(f fileHandle, fallback string) string {
+	if f != nil {
+		if fi, err := f.Stat(); err == nil {
+			if key, ok := fileIdentityKey(fi); ok {
+				return key
+			}
+		}
+	}
+	return fallback
+}
+
 // Options configures the database.
 type Options struct {
 	PageSize  uint32 // Page size in bytes (default: 4096)
@@ -528,12 +545,7 @@ func Open(path string, opts Options) (*DB, error) {
 	// (os_unix.c:1282-1349). Falls back to the lexical canonical path when no
 	// inode is available (Windows/wasm, or a VFS-injected FileInfo).
 	if !opts.InMemory {
-		registryKey = canonicalPath
-		if fi, statErr := p.file.Stat(); statErr == nil {
-			if key, ok := fileIdentityKey(fi); ok {
-				registryKey = key
-			}
-		}
+		registryKey = registryKeyForOpenFile(p.file, canonicalPath)
 		if _, loaded := openDBs.LoadOrStore(registryKey, true); loaded {
 			_ = p.close()
 			// Clear so the deferred cleanup does not delete the entry that the
