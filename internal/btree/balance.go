@@ -824,27 +824,15 @@ func (bt *btree) rewriteParentAfterBalance(
 	// The promoted sepKey on the split path is independently cloned below, so it
 	// survives this recycle and the cascade up the tree.
 	defer bt.pager.recycleCellBuf(parentBuf)
+	// parentCells (and its key bytes in parentBuf) must stay alive through the
+	// rebuild below: the virtual splice (childAt/divAt) reads them directly rather
+	// than copying into intermediate slices. Recycle both at function exit — after
+	// the rebuild, and after any cascade on the split path (the promoted sepKey is
+	// independently cloned, so it survives). The free-list tolerates the cascade's
+	// re-entrancy: a deeper rewriteParentAfterBalance draws its own slice/buffer.
+	defer bt.pager.recycleCellSlice(parentCells)
 	nc := len(parentCells)
 	parentRightChild := parentPg.header.rightChild
-
-	// Old children (nc+1) and old divider keys (nc). oldDivs aliases parentBuf
-	// (non-overflow keys) / the freshly-read overflow keys — both valid until the
-	// deferred recycle above, which fires only after newCells is rebuilt.
-	oldChildren := make([]uint32, nc+1)
-	oldDivs := make([][]byte, nc)
-	for j := 0; j < nc; j++ {
-		oldChildren[j] = parentCells[j].leftChild
-		oldDivs[j] = parentCells[j].key
-	}
-	oldChildren[nc] = parentRightChild
-
-	// parentCells (the descriptor slice) is fully consumed: every leftChild is
-	// copied into oldChildren and every key header aliased into oldDivs (the key
-	// BYTES live in parentBuf, recycled separately by the defer above). Return the
-	// slice to the pool now — before the divider splice and the cascade — so the
-	// next balanceNonroot up the tree can reuse it. recycleCellSlice clears the
-	// entries, which does not disturb oldDivs (it holds its own header copies).
-	bt.pager.recycleCellSlice(parentCells)
 
 	// Bounds: the gathered run children are [nxDiv, nxDiv+nOld); valid child
 	// slots are 0..nc. rightmostChildSlot == nxDiv+nOld-1.
@@ -852,62 +840,82 @@ func (bt *btree) rewriteParentAfterBalance(
 		return ErrCorrupt
 	}
 
-	// Splice children: keep [0, nxDiv); insert newPgno; keep [nxDiv+nOld, nc].
-	newChildren := make([]uint32, 0, nc+1-nOld+nNew)
-	newChildren = append(newChildren, oldChildren[:nxDiv]...)
-	newChildren = append(newChildren, newPgno...)
-	newChildren = append(newChildren, oldChildren[nxDiv+nOld:]...)
-
-	// Splice dividers. Old internal dividers of the run are oldDivs[nxDiv ..
-	// nxDiv+nOld-2]. Kept dividers: [0, nxDiv) (left, incl. div_{nxDiv-1}
-	// connecting kept child to newPgno[0]) and [nxDiv+nOld-1, nc) (right, incl.
-	// div_{nxDiv+nOld-1} connecting newPgno[last] to the kept child after the
-	// run). The new internal dividers (nNew-1) go between the spliced children.
-	newDivs := make([][]byte, 0, nc-(nOld-1)+(nNew-1))
-	newDivs = append(newDivs, oldDivs[:nxDiv]...)
-	newDivs = append(newDivs, newDivKey...)
-	if nxDiv+nOld-1 < nc {
-		newDivs = append(newDivs, oldDivs[nxDiv+nOld-1:]...)
+	// Virtual splice (deviation 2, allocation-free). The rewritten parent replaces
+	// the gathered child run [nxDiv, nxDiv+nOld) with the nNew output pages
+	// (newPgno) and their nNew-1 internal dividers (newDivKey). Rather than
+	// materialise the spliced children/dividers/cells (the former newChildren/
+	// newDivs/newCells, which dominated the index-build heap profile), childAt/
+	// divAt compute each element on the fly from parentCells + newPgno + newDivKey.
+	//
+	// Output geometry: m cells {leftChild: childAt(i), key: divAt(i)} for i in
+	// [0,m), plus rightChild = childAt(m); m = nc - nOld + nNew (== old
+	// len(newDivs)). Child splice (m+1 children): [0,nxDiv) old | [nxDiv,
+	// nxDiv+nNew) newPgno | [nxDiv+nNew, m] old, index shifted by (nOld-nNew); old
+	// child index nc is the parent rightChild. Divider splice (m dividers):
+	// [0,nxDiv) old | [nxDiv, nxDiv+nNew-1) newDivKey | [nxDiv+nNew-1, m) old,
+	// shifted by the same (nOld-nNew). The two right segments shift identically but
+	// start one apart — children keep oldChildren[nxDiv+nOld:], dividers keep
+	// oldDivs[nxDiv+nOld-1:] — exactly the former explicit splice. The bounds check
+	// above guarantees every parentCells index stays in range.
+	m := nc - nOld + nNew
+	childAt := func(i int) uint32 {
+		switch {
+		case i < nxDiv:
+			return parentCells[i].leftChild
+		case i < nxDiv+nNew:
+			return newPgno[i-nxDiv]
+		default:
+			idx := i - nNew + nOld
+			if idx == nc {
+				return parentRightChild
+			}
+			return parentCells[idx].leftChild
+		}
+	}
+	divAt := func(i int) []byte {
+		switch {
+		case i < nxDiv:
+			return parentCells[i].key
+		case i < nxDiv+nNew-1:
+			return newDivKey[i-nxDiv]
+		default:
+			return parentCells[i-nNew+nOld].key
+		}
 	}
 
-	// Sanity: a valid interior page has len(children) == len(dividers)+1.
-	if len(newChildren) != len(newDivs)+1 {
-		return ErrCorrupt
-	}
-
-	// Build the new parent cell list: P'_j = {leftChild: newChildren[j],
-	// key: newDivs[j]} for j in 0..len(newDivs)-1; rightChild = last child.
-	newCells := make([]cellData, len(newDivs))
-	for j := range newDivs {
-		newCells[j] = cellData{leftChild: newChildren[j], key: newDivs[j]}
-	}
-	newRightChild := newChildren[len(newChildren)-1]
-
-	// Does the rewritten parent fit? Compute content + pointers vs usable space
-	// (interior header is 12 bytes; +dbHeader on page 1). Mirrors the fit check
-	// in insertSepIntoInterior (btree.go:1963-1975) generalised to a cell list.
+	// Does the rewritten parent fit? content + 2-byte pointers vs usable space
+	// (interior header 12 bytes; +dbHeader on page 1). Same arithmetic as before,
+	// summed over the virtual dividers — no materialisation.
 	hdrOff := 0
 	if parentPg.pgno == 1 {
 		hdrOff = dbHeaderSize
 	}
-	used := hdrOff + 12 + len(newCells)*2
-	for j := range newCells {
-		used += interiorCellSizeWithOverflow(newCells[j].key, usableSize)
+	used := hdrOff + 12 + m*2
+	for i := 0; i < m; i++ {
+		used += interiorCellSizeWithOverflow(divAt(i), usableSize)
 	}
 	if used <= usableSize {
-		// Fits: rebuild the parent wholesale. The merge-direction completion
+		// Fits (the common case): rebuild the parent directly from the virtual
+		// splice — zero working-slice allocation. The merge-direction completion
 		// (empty-collapse / underfull-cascade, spec §4) is handled by the caller
 		// via completeMergeUpward after parentPg is released — see the OWNERSHIP
 		// note above.
-		return bt.rebuildInteriorPage(parentPg, newCells, newRightChild)
+		return bt.rebuildInteriorPageSeq(parentPg, m, childAt, divAt, childAt(m))
 	}
 
-	// Over-full parent: split 2-way and cascade up (deviation 6). On the insert
-	// path nNew<=nOld+1 so the parent gained at most one net cell; a single
-	// 2-way split always suffices to relieve the overflow. The middle cell is
-	// promoted; its leftChild becomes the left page's rightChild; the right
-	// page keeps newRightChild. This is the same shape as insertSepIntoInterior's
-	// slow path (btree.go:2039-2075).
+	// Over-full parent (the rare cascade case): materialise the cell list once so
+	// the existing interiorSplitPoint + 2-way split below apply unchanged. On the
+	// insert path nNew<=nOld+1, so the parent gained at most one net cell and a
+	// single 2-way split always relieves the overflow. The middle cell is
+	// promoted; its leftChild becomes the left page's rightChild; the right page
+	// keeps newRightChild. Same shape as insertSepIntoInterior's slow path
+	// (btree.go:2039-2075).
+	newCells := make([]cellData, m)
+	for j := 0; j < m; j++ {
+		newCells[j] = cellData{leftChild: childAt(j), key: divAt(j)}
+	}
+	newRightChild := childAt(m)
+
 	mid := interiorSplitPoint(newCells, usableSize)
 	leftCells := newCells[:mid]
 	sepKey := bytes.Clone(newCells[mid].key)

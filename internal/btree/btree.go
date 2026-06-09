@@ -1876,7 +1876,27 @@ func (bt *btree) rebuildLeafPage(pg *page, cells []cellData) error {
 // rebuildInteriorPage rewrites an interior page from cells and a right child.
 // Keys that exceed maxLocal are written with overflow chains.
 // DRIFT: rebuildInteriorPage writes 0-cell pages; C rebuildPage asserts nCell>0 See docs/btree/NOTES.md#drift-31-rebuildinteriorpage-accepts-zero-cell-pages
+//
+// Thin adapter over rebuildInteriorPageSeq: cell i is {leftChild, key} pulled
+// from cells[i]. The closures do not escape rebuildInteriorPageSeq (it only
+// calls them in a loop), so they stay stack-allocated — no per-call heap cost
+// for the []cellData callers.
 func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint32) error {
+	return bt.rebuildInteriorPageSeq(pg, len(cells),
+		func(i int) uint32 { return cells[i].leftChild },
+		func(i int) []byte { return cells[i].key },
+		rightChild)
+}
+
+// rebuildInteriorPageSeq rewrites an interior page from a logical cell sequence
+// of length n — cell i is {leftChild: childAt(i), key: divAt(i)} (i in [0,n)),
+// plus the trailing rightChild — writing the on-page format directly without a
+// materialised []cellData. This lets rewriteParentAfterBalance assemble the
+// rebuilt parent from a virtual splice (childAt/divAt computed on the fly),
+// allocating none of the per-call child/divider/cell slices that previously
+// dominated the index-build heap profile. Keys exceeding maxLocal get overflow
+// chains, exactly as the former []cellData loop did.
+func (bt *btree) rebuildInteriorPageSeq(pg *page, n int, childAt func(int) uint32, divAt func(int) []byte, rightChild uint32) error {
 	pageUsable := bt.usablePageSize()
 	hdrOff := 0
 	if pg.pgno == 1 {
@@ -1890,20 +1910,22 @@ func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint
 	}
 
 	pg.header.pageType = pageTypeIntIdx
-	pg.header.cellCount = uint16(len(cells))
+	pg.header.cellCount = uint16(n)
 	pg.header.firstFreeBlk = 0
 	pg.header.fragBytes = 0
 	pg.header.rightChild = rightChild
 
 	maxLocal := maxLocalPayload(pageUsable)
 	contentOff := pageUsable
-	for i, c := range cells {
+	for i := 0; i < n; i++ {
+		leftChild := childAt(i)
+		key := divAt(i)
 		// pCellptr after writing this cell's pointer (C: pCellptr += 2).
 		ptrOff := hdrOff + pg.header.headerSize() + i*2
-		keyLen := len(c.key)
+		keyLen := len(key)
 		if keyLen > maxLocal {
 			localSize := localPayloadSize(keyLen, pageUsable)
-			overflowData := c.key[localSize:]
+			overflowData := key[localSize:]
 			overflowPgno, err := bt.pager.writeOverflowChain(overflowData)
 			if err != nil {
 				return err
@@ -1916,14 +1938,14 @@ func (bt *btree) rebuildInteriorPage(pg *page, cells []cellData, rightChild uint
 				return ErrCorrupt
 			}
 			contentOff -= size
-			writeInteriorCellOverflow(pg.data[contentOff:], c.leftChild, keyLen, c.key[:localSize], overflowPgno)
+			writeInteriorCellOverflow(pg.data[contentOff:], leftChild, keyLen, key[:localSize], overflowPgno)
 		} else {
-			size := interiorCellSize(c.key)
+			size := interiorCellSize(key)
 			if contentOff-size < ptrOff+2 {
 				return ErrCorrupt
 			}
 			contentOff -= size
-			writeInteriorCell(pg.data[contentOff:], c.leftChild, c.key)
+			writeInteriorCell(pg.data[contentOff:], leftChild, key)
 		}
 		binary.BigEndian.PutUint16(pg.data[ptrOff:], uint16(contentOff))
 	}
