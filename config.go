@@ -1,10 +1,12 @@
 package anystore
 
 import (
+	"runtime"
 	"time"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/durability"
+	"github.com/anyproto/any-store/v2/internal/vindex"
 )
 
 // InitPageBuffer pre-allocates a global pool of nPages page-sized buffers.
@@ -14,6 +16,23 @@ import (
 // Example: InitPageBuffer(4096, 5000) pre-allocates ~20MB of page buffers.
 func InitPageBuffer(pageSize, nPages int) {
 	btree.ConfigPageCache(pageSize, nPages)
+}
+
+// SetVectorBuildConcurrency bounds the worker goroutines used to BUILD and
+// COMPACT vector (HNSW) indexes — the only place any-store uses internal
+// parallelism. It is a single process-wide budget shared by every vector index
+// in the process, so many simultaneous builds/compactions cannot oversubscribe
+// the CPU. n <= 0 (the default) uses GOMAXPROCS; set it low (e.g. 1–2) on
+// constrained or many-database deployments. It does NOT affect search,
+// insert/update/delete, or any non-vector operation.
+//
+// Like InitPageBuffer this is a process-global setting, not per-database: call
+// it once at process startup, before opening databases.
+func SetVectorBuildConcurrency(n int) {
+	if n <= 0 {
+		n = runtime.GOMAXPROCS(0)
+	}
+	vindex.SetBuildConcurrency(n)
 }
 
 // Config provides the configuration options for the database.

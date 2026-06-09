@@ -46,6 +46,45 @@ type IndexStats struct {
 	SketchDistribution qplanner.SketchDistribution
 }
 
+// VectorIndexStats describes a vector (HNSW) index: its parameters, node
+// occupancy, and the physical size of its backing namespaces.
+type VectorIndexStats struct {
+	// Name is the index name.
+	Name string
+
+	// Field is the indexed embedding field path.
+	Field string
+
+	// Dim is the embedding dimension; Metric is the distance metric.
+	Dim    int
+	Metric string
+	// Mode is the index strategy ("btree" | "hybrid" | "brute").
+	Mode string
+	// Quantization is the stored vector format ("none" | "int8").
+	Quantization string
+
+	// M / EfSearch are the HNSW graph parameters.
+	M        int
+	EfSearch int
+
+	// NodeCount is the number of nodes ever allocated (including tombstones);
+	// LiveCount excludes tombstones; DeletedCount is the tombstone count. A high
+	// DeletedCount/NodeCount ratio signals that a compaction/rebuild is due.
+	NodeCount    int
+	LiveCount    int
+	DeletedCount int
+
+	// VectorBytes / GraphBytes / MappingBytes / MetaBytes are the on-disk sizes
+	// of the vector, adjacency, docId<->label, and meta namespaces respectively.
+	VectorBytes  int
+	GraphBytes   int
+	MappingBytes int
+	MetaBytes    int
+
+	// SizeBytes is the total physical size of the index (sum of the above).
+	SizeBytes int
+}
+
 // CollectionStats describes the storage footprint of a collection: its
 // documents, compression effectiveness and per-index sizes.
 type CollectionStats struct {
@@ -76,14 +115,20 @@ type CollectionStats struct {
 	// B-tree (page count including overflow pages times the page size).
 	DocsSizeBytes int
 
-	// IndexesSizeBytes is the sum of SizeBytes across all indexes.
+	// IndexesSizeBytes is the sum of SizeBytes across all range (B-tree) indexes.
 	IndexesSizeBytes int
 
-	// TotalSizeBytes is DocsSizeBytes plus IndexesSizeBytes.
+	// VectorIndexesSizeBytes is the sum of SizeBytes across all vector indexes.
+	VectorIndexesSizeBytes int
+
+	// TotalSizeBytes is DocsSizeBytes + IndexesSizeBytes + VectorIndexesSizeBytes.
 	TotalSizeBytes int
 
-	// Indexes holds per-index statistics.
+	// Indexes holds per-(range-)index statistics.
 	Indexes []IndexStats
+
+	// VectorIndexes holds per-vector-index statistics.
+	VectorIndexes []VectorIndexStats
 }
 
 // Stats walks the collection's document and index B-trees and reports their
@@ -96,6 +141,7 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 	c.mu.Lock()
 	name := c.name
 	indexes := append([]*index(nil), c.loadIndexes()...)
+	vindexes := append([]*vectorIndex(nil), c.loadVectorIndexes()...)
 	c.mu.Unlock()
 
 	stats.Name = name
@@ -157,13 +203,81 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 			stats.IndexesSizeBytes += is.SizeBytes
 			stats.Indexes = append(stats.Indexes, is)
 		}
+
+		// Per-vector-index statistics.
+		for _, vi := range vindexes {
+			// IVF-PQ backend: sum its btree namespaces (codes + vectors + maps).
+			if vi.ivf != nil {
+				vs, vErr := vi.ivf.Stats(tx)
+				if vErr != nil {
+					return vErr
+				}
+				pages := func(ns btree.NamespaceSize) int { return ns.TotalPages() * pageSize }
+				vstat := VectorIndexStats{
+					Name:         vi.info.Name,
+					Field:        vi.info.Vector.Field,
+					Dim:          vs.Dim,
+					Metric:       vi.info.Vector.Metric.toVindex().String(),
+					Mode:         vi.mode.String(),
+					Quantization: vi.info.Vector.Quantization.toVindex().String(),
+					M:            vs.M,
+					NodeCount:    int(vs.Count),
+					LiveCount:    int(vs.Count),
+					VectorBytes:  pages(vs.Vec),
+					GraphBytes:   pages(vs.Cell) + pages(vs.CB), // codes + codebooks
+					MappingBytes: pages(vs.Doc) + pages(vs.Lbl),
+					MetaBytes:    pages(vs.Meta),
+				}
+				vstat.SizeBytes = vstat.VectorBytes + vstat.GraphBytes + vstat.MappingBytes + vstat.MetaBytes
+				stats.VectorIndexesSizeBytes += vstat.SizeBytes
+				stats.VectorIndexes = append(stats.VectorIndexes, vstat)
+				continue
+			}
+			// Brute-force mode keeps no index data: report metadata only, zero bytes.
+			if vi.ix == nil {
+				stats.VectorIndexes = append(stats.VectorIndexes, VectorIndexStats{
+					Name:         vi.info.Name,
+					Field:        vi.info.Vector.Field,
+					Dim:          vi.dim,
+					Metric:       vi.info.Vector.Metric.toVindex().String(),
+					Mode:         vi.mode.String(),
+					Quantization: vi.info.Vector.Quantization.toVindex().String(),
+				})
+				continue
+			}
+			vs, vErr := vi.ix.Stats(tx)
+			if vErr != nil {
+				return vErr
+			}
+			pages := func(ns btree.NamespaceSize) int { return ns.TotalPages() * pageSize }
+			vstat := VectorIndexStats{
+				Name:         vi.info.Name,
+				Field:        vi.info.Vector.Field,
+				Dim:          vs.Dim,
+				Metric:       vs.Metric.String(),
+				Mode:         vi.mode.String(),
+				Quantization: vs.Quantization.String(),
+				M:            vs.M,
+				EfSearch:     vs.EfSearch,
+				NodeCount:    vs.NodeCount,
+				LiveCount:    vs.LiveCount,
+				DeletedCount: vs.DeletedCount,
+				VectorBytes:  pages(vs.Vec),
+				GraphBytes:   pages(vs.Adj),
+				MappingBytes: pages(vs.Doc) + pages(vs.Lbl),
+				MetaBytes:    pages(vs.Meta),
+			}
+			vstat.SizeBytes = vstat.VectorBytes + vstat.GraphBytes + vstat.MappingBytes + vstat.MetaBytes
+			stats.VectorIndexesSizeBytes += vstat.SizeBytes
+			stats.VectorIndexes = append(stats.VectorIndexes, vstat)
+		}
 		return nil
 	})
 	if err != nil {
 		return CollectionStats{}, err
 	}
 
-	stats.TotalSizeBytes = stats.DocsSizeBytes + stats.IndexesSizeBytes
+	stats.TotalSizeBytes = stats.DocsSizeBytes + stats.IndexesSizeBytes + stats.VectorIndexesSizeBytes
 	if stats.StoredDocsBytes > 0 {
 		stats.CompressionRatio = float64(stats.UncompressedDocsBytes) / float64(stats.StoredDocsBytes)
 	} else {

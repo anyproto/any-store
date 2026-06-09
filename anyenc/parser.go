@@ -161,6 +161,8 @@ func parseValue(b []byte, c *cache) (v *Value, tail []byte, err error) {
 		return v, b[9:], nil
 	case TypeBinary:
 		return parseBinary(b[1:], c, inverted)
+	case TypeVectorF32:
+		return parseVectorF32(b[1:], c)
 	case TypeObject:
 		return parseObject(b[1:], c, eos)
 	case TypeArray:
@@ -284,6 +286,27 @@ func parseBinary(b []byte, c *cache, inverted bool) (*Value, []byte, error) {
 	if c != nil {
 		a := c.getValue()
 		a.t = TypeBinary
+		a.v = slices.Grow(a.v[:0], int(l))[:l]
+		copy(a.v, b[4:l+4])
+		return a, b[l+4:], nil
+	}
+	return nil, b[l+4:], nil
+}
+
+// parseVectorF32 parses a vector body (after the leading tag): a 4-byte
+// big-endian byte length followed by packed little-endian float32 data. Vectors
+// never appear in index keys, so there is no inverted form.
+func parseVectorF32(b []byte, c *cache) (*Value, []byte, error) {
+	if len(b) < 4 {
+		return nil, nil, fmt.Errorf("expected minimum 4 byte for vectorF32 header, but got %d", len(b))
+	}
+	l := binary.BigEndian.Uint32(b)
+	if len(b[4:]) < int(l) {
+		return nil, nil, fmt.Errorf("expected %d bytes to read vectorF32, but got %d", l, len(b)-4)
+	}
+	if c != nil {
+		a := c.getValue()
+		a.t = TypeVectorF32
 		a.v = slices.Grow(a.v[:0], int(l))[:l]
 		copy(a.v, b[4:l+4])
 		return a, b[l+4:], nil

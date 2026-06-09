@@ -33,6 +33,11 @@ type Query interface {
 	// IndexHint adds or removes boost for some indexes
 	IndexHint(hints ...IndexHint) Query
 
+	// VectorEf overrides the ANN candidate-list size (numCandidates) for a
+	// vector query. 0 (default) auto-sizes it: the index default, raised to
+	// cover the limit and over-fetched when a residual filter is present.
+	VectorEf(ef uint) Query
+
 	// Iter executes the query and returns an Iterator for the results.
 	Iter(ctx context.Context) (Iterator, error)
 
@@ -79,6 +84,10 @@ type collQuery struct {
 
 	indexHints []IndexHint
 
+	// vectorEf overrides the ANN candidate-list size (numCandidates) for a
+	// vector query; 0 = auto (index default, raised to cover limit/over-fetch).
+	vectorEf uint
+
 	err error
 }
 
@@ -102,6 +111,11 @@ func (q *collQuery) Offset(offset uint) Query {
 
 func (q *collQuery) IndexHint(hints ...IndexHint) Query {
 	q.indexHints = hints
+	return q
+}
+
+func (q *collQuery) VectorEf(ef uint) Query {
+	q.vectorEf = ef
 	return q
 }
 
@@ -143,6 +157,44 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 
 	buf := q.c.db.syncPool.GetDocBuf()
 	btx := tx.btreeReadTx()
+
+	// Vector query: detect `{vectorField: [..]}` against the collection's vector
+	// indexes. When matched, build a vector plan (ANN source) and ignore all
+	// other indexes; the residual filter + sort run as downstream stages.
+	vspec, residual, verr := q.detectVectorQuery()
+	if verr != nil {
+		q.c.db.syncPool.ReleaseDocBuf(buf)
+		_ = tx.Commit()
+		qb.Close()
+		return nil, verr
+	}
+	if vspec != nil {
+		sorter := q.sort
+		if sorter == nil && !vspec.Ordered {
+			// No explicit sort and the source isn't already distance-ordered
+			// (brute-force): order by distance ascending. When the ANN source is
+			// ordered, we leave sorter nil so the planner skips a redundant SortIter
+			// and streams the already-closest-first candidates straight to LimitIter.
+			sorter, _ = query.ParseSort(qplanner.DistanceField)
+		}
+		plan := qplanner.BuildPlan(&qplanner.PlanParams{
+			Tx:     btx,
+			DataNs: q.c.ns,
+			Filter: residual,
+			Sorter: sorter,
+			Limit:  int(q.limit),
+			Offset: int(q.offset),
+			Buf:    buf,
+			Vector: vspec,
+		})
+		return &planIterator{
+			plan: plan,
+			tx:   tx,
+			buf:  buf,
+			qb:   qb,
+			data: &qplanner.CursorSource{Tx: btx, Ns: q.c.ns},
+		}, nil
+	}
 
 	idxs := q.c.loadIndexes()
 	br := q.buildBoundsResult(idxs)
@@ -239,6 +291,15 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	if isUnsatisfiable(q.cond) {
 		return
 	}
+
+	// Reclaim tombstones this bulk update creates once it commits, mirroring the
+	// single-doc mutators. Registered before the commit defer so it runs after
+	// commit; no-ops inside a caller-managed tx (the guard in maybeAutoCompactVectors).
+	defer func() {
+		if err == nil {
+			q.c.maybeAutoCompactVectors(ctx)
+		}
+	}()
 
 	tx, err := q.c.db.WriteTx(ctx)
 	if err != nil {
@@ -373,6 +434,15 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	if isUnsatisfiable(q.cond) {
 		return
 	}
+
+	// Reclaim tombstones this bulk delete creates once it commits, mirroring the
+	// single-doc mutators. Registered before the commit defer so it runs after
+	// commit; no-ops inside a caller-managed tx (the guard in maybeAutoCompactVectors).
+	defer func() {
+		if err == nil {
+			q.c.maybeAutoCompactVectors(ctx)
+		}
+	}()
 
 	tx, err := q.c.db.WriteTx(ctx)
 	if err != nil {

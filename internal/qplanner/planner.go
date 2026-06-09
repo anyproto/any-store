@@ -48,6 +48,11 @@ type Plan struct {
 	Root      Iterator
 	DocParsed *anyenc.Value // set by FilterIter/FetchIter/FullScanIter after parsing
 
+	// Distances is the per-document ANN distance sidecar for a vector query
+	// (docId string -> distance). Populated by VectorIter; consumed by the
+	// public iterator's Distance(). nil for non-vector plans.
+	Distances map[string]float32
+
 	// CBO metadata (for Explain)
 	Name      string  // "FullScan", "IndexSeek", "IndexScan"
 	Cost      float64 // computed cost
@@ -187,6 +192,11 @@ type PlanParams struct {
 	// When set, calculateSelectivity uses cached bounds instead of calling
 	// filter.IndexBounds repeatedly (avoids ~N redundant filter tree traversals).
 	FieldBounds *BoundsResult
+
+	// Vector, when set, makes this a vector (ANN) query: BuildPlan builds a
+	// VectorIter source and ignores all other indexes. Filter (the residual,
+	// minus the vector clause) and Sorter still apply as downstream stages.
+	Vector *VectorQuerySpec
 }
 
 // IndexHintParam mirrors the public IndexHint type.
@@ -224,6 +234,12 @@ type CBOIndex struct {
 // BuildPlan constructs an iterator chain using the Cost-Based Optimizer.
 // It evaluates full scan, index seek, and index scan plans, then picks the cheapest.
 func BuildPlan(params *PlanParams) *Plan {
+	// Vector query: the ANN search is the sole source. Bypass the CBO entirely —
+	// no range-index selection, no cost comparison, no full-scan fallback.
+	if params.Vector != nil {
+		return buildVectorPlan(params)
+	}
+
 	needSort := params.Sorter != nil
 	needFilter := params.Filter != nil && !isAllFilter(params.Filter)
 	totalDocs := float64(params.TotalDocs)
@@ -560,6 +576,45 @@ func BuildPlan(params *PlanParams) *Plan {
 	// Wire plan reference into FilterIter/FetchIter instances for doc value caching
 	setPlanRef(root, plan)
 
+	return plan
+}
+
+// buildVectorPlan builds the iterator chain for a vector query:
+//
+//	VectorIter -> [FilterIter(residual)] -> [SortIter] -> [LimitIter]
+//
+// The ANN search is the only source. The residual filter (everything except the
+// vector clause — including any _distance threshold and additional field
+// predicates) and the sort run as ordinary downstream stages over the
+// _distance-decorated candidate documents.
+func buildVectorPlan(params *PlanParams) *Plan {
+	needSort := params.Sorter != nil
+	needFilter := params.Filter != nil && !isAllFilter(params.Filter)
+
+	dataCS := &CursorSource{Tx: params.Tx, Ns: params.DataNs}
+	var root Iterator = &VectorIter{
+		Spec: params.Vector,
+		Data: dataCS,
+		Buf:  params.Buf,
+	}
+	if needFilter {
+		root = &FilterIter{Source: root, Data: dataCS, Filter: params.Filter, Buf: params.Buf}
+	}
+	if needSort {
+		root = &SortIter{
+			Source: root,
+			Data:   dataCS,
+			Sorter: params.Sorter,
+			Buf:    params.Buf,
+			TopK:   sortTopK(params),
+		}
+	}
+	if params.Limit > 0 || params.Offset > 0 {
+		root = &LimitIter{Source: root, Limit: params.Limit, Offset: params.Offset}
+	}
+
+	plan := &Plan{Root: root, Name: "VectorSearch"}
+	setPlanRef(root, plan)
 	return plan
 }
 
@@ -1117,6 +1172,9 @@ func setPlanRef(it Iterator, plan *Plan) {
 	case *CanonicalKeyDedupIter:
 		v.Plan = plan
 		setPlanRef(v.Source, plan)
+	case *VectorIter:
+		v.Plan = plan
+		// leaf — no upstream source
 	}
 }
 

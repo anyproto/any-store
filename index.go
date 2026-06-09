@@ -12,7 +12,208 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/qplanner"
+	"github.com/anyproto/any-store/v2/internal/vindex"
 )
+
+// IndexKind selects the kind of index.
+type IndexKind uint8
+
+const (
+	// IndexKindRange is the default B-tree range/equality index.
+	IndexKindRange IndexKind = iota
+	// IndexKindVector is an HNSW approximate-nearest-neighbour index over a
+	// vector (embedding) field. Queried via Find() with a `{field: [vector]}`
+	// clause; results carry a synthetic _distance field (see docs/vector-search.md).
+	IndexKindVector
+	// IndexKindFulltext is an inverted full-text index over one or more text
+	// fields, queried with the $text operator and ranked by BM25. See
+	// docs/fts/DESIGN.md.
+	IndexKindFulltext
+)
+
+// VectorMetric selects the distance measure for a vector index.
+type VectorMetric uint8
+
+const (
+	VectorCosine VectorMetric = iota
+	VectorL2
+	VectorDot
+)
+
+func (m VectorMetric) toVindex() vindex.Metric {
+	switch m {
+	case VectorL2:
+		return vindex.L2
+	case VectorDot:
+		return vindex.Dot
+	default:
+		return vindex.Cosine
+	}
+}
+
+// VectorQuantization selects how the index stores vectors.
+type VectorQuantization uint8
+
+const (
+	// VectorQuantNone stores full float32 vectors (default).
+	VectorQuantNone VectorQuantization = iota
+	// VectorQuantInt8 stores scalar-quantized int8 vectors (~4x less storage /
+	// page-cache RAM) at a small recall cost.
+	VectorQuantInt8
+)
+
+func (q VectorQuantization) toVindex() vindex.Quantization {
+	if q == VectorQuantInt8 {
+		return vindex.QuantInt8
+	}
+	return vindex.QuantNone
+}
+
+// VectorMode selects the index strategy for a vector index.
+type VectorMode uint8
+
+const (
+	// VectorModeBTree stores the full HNSW graph in the btree (default): lowest
+	// RAM, multiprocess-safe writes, approximate search.
+	VectorModeBTree VectorMode = iota
+	// VectorModeHybrid is VectorModeBTree plus a RAM-resident copy of HNSW layer 0
+	// for faster search; the btree remains the source of truth.
+	VectorModeHybrid
+	// VectorModeBruteForce stores no index data — the index is only a declaration
+	// that a field is a vector. Search scans the collection and computes exact
+	// distances: ~free writes, ~0 storage, exact (100%) recall, O(N) search.
+	VectorModeBruteForce
+	// VectorModeIVFPQ is a btree-resident IVF-PQ index (see
+	// vector/RESEARCH_IVFPQ_BTREE.md): vectors are partitioned into nlist coarse
+	// cells and each is stored as a compact product-quantization code of its
+	// residual. Search probes a few cells (contiguous btree range scans — no random
+	// graph traversal) and re-ranks the survivors by exact distance. Far smaller hot
+	// RAM set (only the coarse centroids) and a sequential read pattern, at the cost
+	// of approximate recall recovered by re-rank. See VectorParams NList/NProbe/Closure.
+	VectorModeIVFPQ
+	// VectorModeIVFSQ is the same IVF partition but stores each vector as an int8
+	// scalar-quantized full vector per cell (no product quantization), scanned
+	// directly with exact int8 distance — no ADC table, no precomputed table, no
+	// re-rank. Versus IVFPQ: much faster builds (no PQ training), higher recall (int8
+	// is more faithful than PQ), smaller (no separate re-rank store), and no
+	// precompute-table RAM — at higher search cost (it reads full vectors, not codes).
+	// Favours Closure=1 with a higher NProbe (replicating full vectors is costly).
+	VectorModeIVFSQ
+)
+
+func (m VectorMode) String() string {
+	switch m {
+	case VectorModeHybrid:
+		return "hybrid"
+	case VectorModeBruteForce:
+		return "brute"
+	case VectorModeIVFPQ:
+		return "ivfpq"
+	case VectorModeIVFSQ:
+		return "ivfsq"
+	default:
+		return "btree"
+	}
+}
+
+// isIVFPQ reports whether this mode is the btree-resident IVF-PQ index.
+func (m VectorMode) isIVFPQ() bool { return m == VectorModeIVFPQ }
+
+// isIVFSQ reports whether this mode is the btree-resident IVF-SQ index.
+func (m VectorMode) isIVFSQ() bool { return m == VectorModeIVFSQ }
+
+// isIVF reports whether this mode is an IVF index (PQ or SQ) — both share the
+// internal/vivf backend.
+func (m VectorMode) isIVF() bool { return m == VectorModeIVFPQ || m == VectorModeIVFSQ }
+
+// isBruteForce reports whether this mode keeps no on-disk index structure.
+func (m VectorMode) isBruteForce() bool { return m == VectorModeBruteForce }
+
+// VectorParams configures a vector (HNSW) index.
+type VectorParams struct {
+	// Field is the path to the embedding field (an array of numbers).
+	Field string `json:"field"`
+	// Dim is the embedding dimension.
+	Dim int `json:"dim"`
+	// Metric is the distance measure (default cosine).
+	Metric VectorMetric `json:"metric"`
+	// M / EfConstruction / EfSearch tune the HNSW graph; 0 = sensible defaults.
+	M              int `json:"m,omitempty"`
+	EfConstruction int `json:"efConstruction,omitempty"`
+	EfSearch       int `json:"efSearch,omitempty"`
+	// Quantization selects the stored vector format (default full float32). For
+	// VectorModeIVFPQ it sets the format of the re-rank vector store (the bulk of the
+	// index): VectorQuantInt8 makes it ~4× smaller on disk and in the page cache —
+	// cutting RAM and speeding the random per-candidate re-rank reads — at ~0.5%
+	// recall, and is recommended there.
+	Quantization VectorQuantization `json:"quantization,omitempty"`
+	// Mode selects the index strategy (default btree). See VectorMode.
+	Mode VectorMode `json:"mode,omitempty"`
+	// HybridCacheVectors, for VectorModeHybrid, also caches vectors in RAM (the
+	// "vector tier") so layer-0 search avoids btree vector reads entirely — the
+	// bulk of search cost. RAM ≈ liveVectors × recordSize (use int8 to keep it
+	// small). Ignored unless Mode == VectorModeHybrid.
+	HybridCacheVectors bool `json:"hybridCacheVectors,omitempty"`
+
+	// CompactRatio enables automatic compaction of the HNSW graph. Deletes and
+	// replaces only tombstone nodes; when tombstones reach CompactRatio × live
+	// nodes, the index is rebuilt to reclaim them (dropping dead nodes, superseded
+	// vectors, and re-densifying labels). 0 (the default) disables auto-compaction
+	// — the index is then only compacted via Collection.CompactVectorIndex.
+	//
+	// Choosing a value (measured — see TestVectorCompactThreshold): tombstoned
+	// nodes are still traversed during search, so latency rises roughly linearly
+	// with the deleted/live ratio (recall does NOT — it holds/improves as the live
+	// set shrinks). Search latency degrades ~30% at a ratio of ~0.2–0.25, ~50% at
+	// ~0.5, and ~2x at ~1.0 (steeper at larger N / higher dim). With
+	// HybridCacheVectors, tombstones also inflate the RAM vector tier (it tracks
+	// the label high-water mark, not the live set), so compaction reclaims RAM too.
+	// A rebuild costs ~one re-insert of the live set, so the amortized compaction
+	// cost per delete is ~insertCost / CompactRatio — i.e. a smaller ratio caps
+	// latency tighter but rebuilds far more often. Balanced default: ~0.5. Use
+	// ~0.25 only for read-latency-sensitive, delete-light workloads.
+	//
+	// Auto-compaction runs synchronously, in its own transaction, right after the
+	// self-contained write that crosses the threshold — never inside a
+	// caller-managed transaction. The rebuild is O(live) at ~850 nodes/s for dim
+	// 768 (measured, see TestVectorCompactTiming): ~23 s to rebuild 19k live, ~45 s
+	// for 38k. It surfaces as a latency spike on the triggering write, so for large
+	// indexes prefer leaving this 0 and scheduling Collection.CompactVectorIndex in
+	// a maintenance window.
+	// Ignored for VectorModeBruteForce.
+	//
+	// For VectorModeIVFPQ, CompactRatio instead bounds *centroid drift*: IVF deletes
+	// are physical (no tombstones), but the codebooks are frozen at build, so as the
+	// data distribution shifts the partition degrades. CompactRatio triggers an
+	// automatic rebuild (re-train from the live set) when the drift score —
+	// max(reconstruction-error ratio − 1, churn ratio) — reaches it. ~0.5 rebuilds
+	// after the live set roughly doubles or new data fits the centroids ~50% worse;
+	// 0 disables auto-rebuild (use Collection.CompactVectorIndex manually).
+	CompactRatio float64 `json:"compactRatio,omitempty"`
+
+	// IVF-PQ parameters (Mode == VectorModeIVFPQ only). Zero values pick defaults.
+	//
+	// NList is the number of coarse cells (k-means centroids); 0 ⇒ ~4·√N at build.
+	// More cells = finer partition = fewer vectors scanned per probe, but more
+	// centroids to compare and a larger training requirement.
+	NList int `json:"nList,omitempty"`
+	// NProbe is how many cells a search scans (the recall/speed dial); 0 ⇒ 16.
+	// Higher = more recall, more cells scanned.
+	NProbe int `json:"nProbe,omitempty"`
+	// Closure is the multi-assignment factor: each vector is placed in its Closure
+	// nearest cells (with a per-cell residual code) so boundary vectors are found at
+	// lower NProbe (SPANN closure). 0/1 = single assignment; ~4 reaches parity at
+	// ~4× lower NProbe, costing ~Closure× the on-disk code bytes. M (above) sets the
+	// number of PQ subquantizers / code bytes; Dim must be divisible by M.
+	Closure int `json:"closure,omitempty"`
+	// PrecomputeTableMiB budgets the RAM for the IVF-PQ precomputed ADC table, which
+	// removes the per-cell distance-table rebuild from search (measured ~3× faster
+	// search at dim 768) at the cost of an always-resident table of nlist·M·1 KiB.
+	// 0 = the default budget (128 MiB: on for typical indexes, off for very large
+	// ones whose table would exceed it); a negative value disables the table
+	// (smallest RAM, slower search); a positive value sets the budget in MiB.
+	PrecomputeTableMiB int `json:"precomputeTableMiB,omitempty"`
+}
 
 // IndexInfo provides information about an index.
 type IndexInfo struct {
@@ -31,24 +232,15 @@ type IndexInfo struct {
 	// with the specified fields.
 	Sparse bool `json:"sparse"`
 
-	// Kind selects the index type (range by default, or full-text).
+	// Kind selects the index type (range by default, full-text, or vector).
 	Kind IndexKind `json:"kind,omitempty"`
 
 	// Fulltext configures a full-text index when Kind == IndexKindFulltext.
 	Fulltext *FulltextParams `json:"fulltext,omitempty"`
+
+	// Vector configures a vector index when Kind == IndexKindVector.
+	Vector *VectorParams `json:"vector,omitempty"`
 }
-
-// IndexKind selects the kind of index.
-type IndexKind uint8
-
-const (
-	// IndexKindRange is the default B-tree range/equality index.
-	IndexKindRange IndexKind = iota
-	// IndexKindFulltext is an inverted full-text index over one or more text
-	// fields, queried with the $text operator and ranked by BM25. See
-	// docs/fts/DESIGN.md.
-	IndexKindFulltext
-)
 
 // FulltextParams configures a full-text index. It is reserved for future
 // options (per-field weights, analyzer selection, positionless mode); v1 uses
@@ -115,8 +307,8 @@ type index struct {
 	keysBuf     []anyenc.Tuple
 	keysBufPrev []anyenc.Tuple
 	uniqBuf     [][]anyenc.Tuple
-	fullKeyBuf anyenc.Tuple // reusable buffer for full keys (key+docId)
-	seekBuf    anyenc.Tuple // reusable buffer for unique constraint seek results
+	fullKeyBuf  anyenc.Tuple // reusable buffer for full keys (key+docId)
+	seekBuf     anyenc.Tuple // reusable buffer for unique constraint seek results
 }
 
 // loadPubSketch returns the published reader snapshot. Lock-free; the returned

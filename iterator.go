@@ -19,6 +19,11 @@ type Iterator interface {
 	// Doc returns the current document.
 	Doc() (Doc, error)
 
+	// Distance returns the vector distance of the current document to the query
+	// for a vector search (smaller is closer). It returns 0 for non-vector
+	// queries.
+	Distance() float32
+
 	// Err returns any error encountered during the lifetime of the iterator.
 	Err() error
 
@@ -61,12 +66,22 @@ func (pi *planIterator) Next() bool {
 		if !pi.dedup.Accept(docId, mk) {
 			continue
 		}
-		if pi.plan.DocParsed == nil {
-			// Only copy docId when we'll need it in Doc() fallback
+		if pi.plan.DocParsed == nil || pi.plan.Distances != nil {
+			// Copy docId when we'll need it in Doc() fallback, or to look up
+			// the distance sidecar for a vector query.
 			pi.docId = append(pi.docId[:0], docId...)
 		}
 		return true
 	}
+}
+
+// Distance returns the ANN distance of the current document for a vector query
+// (0 for non-vector queries).
+func (pi *planIterator) Distance() float32 {
+	if pi.plan == nil || pi.plan.Distances == nil {
+		return 0
+	}
+	return pi.plan.Distances[string(pi.docId)]
 }
 
 func (pi *planIterator) Doc() (Doc, error) {
@@ -166,7 +181,8 @@ func (e *emptyIter) Next() bool { return false }
 func (e *emptyIter) Doc() (Doc, error) {
 	return nil, ErrDocNotFound
 }
-func (e *emptyIter) Err() error { return nil }
+func (e *emptyIter) Distance() float32 { return 0 }
+func (e *emptyIter) Err() error        { return nil }
 func (e *emptyIter) Close() error {
 	if e.closed {
 		return ErrIterClosed
