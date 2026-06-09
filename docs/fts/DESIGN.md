@@ -229,26 +229,43 @@ coll.Find(`{"$text": {"$search": "east tokyo"}}`).
     Sort(`{"score": {"$meta": "textScore"}}`)
 ```
 
-## Query / planner integration
+## Query / planner integration (first-class, mirrors the vector index)
 
-FTS surfaces to the cost-based planner as an `FtsScan` iterator producing
-`(IntDocID, score)`.
+FTS is a **first-class planner source**, integrated exactly like the vector
+index. A `$text` predicate must drive the query (it's the only selective
+source), so `BuildPlan` bypasses the CBO and builds:
 
-Key gotcha: a scored iterator can't be cheaply *driven* by another index. If a
-query is relevance-sorted, the planner **must** make `FtsScan` the driver:
+```
+FtsIter -> [FilterIter(residual)] -> [SortIter(real field)] -> [LimitIter]
+```
 
-- `FtsScan` fetches the query terms' chunks, computes BM25, and maintains a
-  top-k max-heap.
-- Any remaining (non-FTS) filter predicates are evaluated **post-yield**: before
-  admitting a candidate to the heap, point-look-up the document and test the
-  rest of the AST.
-- To guarantee a correct global top-k, `FtsScan` exhausts the query terms'
-  chunks (cheap at our scale: decoding ~100k varint postings is single-digit
-  milliseconds). No index-intersection pushdown is built into the postings
-  format.
+- **`FtsIter`** (`internal/qplanner/fts_iter.go`) is the source. Its
+  `FtsQuerySpec{Search FtsSearchFunc, Ordered}` carries a search **closure**
+  (the anystore layer injects BM25 over the namespaces, so qplanner stays free of
+  any fts/analyzer dependency — the same `VectorSearchFunc` trick). On first
+  `Next()` it runs the search (all candidates, score-ranked), then streams them
+  lazily, fetching+parsing each doc, injecting the `_score` virtual field, and
+  recording `Plan.Scores`.
+- **Residual filter**: everything except the `$text` clause runs as a downstream
+  `FilterIter` over the ranked candidates (the `_distance`/residual analog).
+- **Sort**: no sort (or `{$meta:"textScore"}`) ⇒ the `FtsIter` is `Ordered`
+  (score-descending), so the planner emits no `SortIter` and streams straight to
+  `LimitIter`. A sort on a **real field** inserts a `SortIter` that re-orders the
+  candidates.
+- **Score sidecar**: `Plan.Scores` (docId→BM25) + the `_score` virtual field are
+  the `Plan.Distances`/`_distance` analog. The public iterator exposes
+  `Score() float64` (mirrors `Distance()`); `{$meta:"textScore"}` maps to
+  relevance order.
+- `Iter`, `Count`, `Update`, `Delete`, and `Explain` all flow through this one
+  plan (via `PlanParams.Fts`), so `$text` works uniformly across every operation
+  — Explain shows the `FtsSearch` plan.
 
-Phrase / CJK matching is a zig-zag merge join on `IntDocID` across the involved
-terms' chunks, then a positional adjacency check.
+To guarantee a correct global top-k the search exhausts the query terms' chunks
+(cheap at our scale: decoding ~100k varint postings is single-digit ms). No
+index-intersection pushdown is built into the postings format.
+
+Phrase / CJK matching (deferred) would be a zig-zag merge join on `IntDocID`
+across the involved terms' chunks, then a positional adjacency check.
 
 Prefix / search-as-you-type: prefix-scan `fts:vocab`, take the top-M completions
 by `df`, then query only those terms' postings — bounds latency.

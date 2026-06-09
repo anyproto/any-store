@@ -53,6 +53,11 @@ type Plan struct {
 	// public iterator's Distance(). nil for non-vector plans.
 	Distances map[string]float32
 
+	// Scores is the per-document BM25 relevance sidecar for a full-text query
+	// (docId string -> score). Populated by FtsIter; consumed by the public
+	// iterator's Score(). nil for non-fts plans.
+	Scores map[string]float64
+
 	// CBO metadata (for Explain)
 	Name      string  // "FullScan", "IndexSeek", "IndexScan"
 	Cost      float64 // computed cost
@@ -197,6 +202,11 @@ type PlanParams struct {
 	// VectorIter source and ignores all other indexes. Filter (the residual,
 	// minus the vector clause) and Sorter still apply as downstream stages.
 	Vector *VectorQuerySpec
+
+	// Fts, when set, makes this a full-text query: BuildPlan builds an FtsIter
+	// source and ignores all other indexes. Filter (the residual, minus the
+	// $text clause) and Sorter still apply as downstream stages.
+	Fts *FtsQuerySpec
 }
 
 // IndexHintParam mirrors the public IndexHint type.
@@ -238,6 +248,11 @@ func BuildPlan(params *PlanParams) *Plan {
 	// no range-index selection, no cost comparison, no full-scan fallback.
 	if params.Vector != nil {
 		return buildVectorPlan(params)
+	}
+	// Full-text query: the $text search is the sole source. Same rationale — a
+	// $text predicate must drive, so there is no cost decision to make.
+	if params.Fts != nil {
+		return buildFtsPlan(params)
 	}
 
 	needSort := params.Sorter != nil
@@ -614,6 +629,47 @@ func buildVectorPlan(params *PlanParams) *Plan {
 	}
 
 	plan := &Plan{Root: root, Name: "VectorSearch"}
+	setPlanRef(root, plan)
+	return plan
+}
+
+// buildFtsPlan builds the iterator chain for a full-text query:
+//
+//	FtsIter -> [FilterIter(residual)] -> [SortIter] -> [LimitIter]
+//
+// The BM25 search is the only source. The residual filter (everything except the
+// $text clause) and the sort run as ordinary downstream stages over the
+// _score-decorated candidate documents. With no sort (or a relevance/textScore
+// sort, which the caller maps to nil), the FtsIter's Ordered score-descending
+// stream flows straight to LimitIter — no SortIter. An explicit sort on a real
+// field inserts a SortIter that re-orders the candidates.
+func buildFtsPlan(params *PlanParams) *Plan {
+	needSort := params.Sorter != nil
+	needFilter := params.Filter != nil && !isAllFilter(params.Filter)
+
+	dataCS := &CursorSource{Tx: params.Tx, Ns: params.DataNs}
+	var root Iterator = &FtsIter{
+		Spec: params.Fts,
+		Data: dataCS,
+		Buf:  params.Buf,
+	}
+	if needFilter {
+		root = &FilterIter{Source: root, Data: dataCS, Filter: params.Filter, Buf: params.Buf}
+	}
+	if needSort {
+		root = &SortIter{
+			Source: root,
+			Data:   dataCS,
+			Sorter: params.Sorter,
+			Buf:    params.Buf,
+			TopK:   sortTopK(params),
+		}
+	}
+	if params.Limit > 0 || params.Offset > 0 {
+		root = &LimitIter{Source: root, Limit: params.Limit, Offset: params.Offset}
+	}
+
+	plan := &Plan{Root: root, Name: "FtsSearch"}
 	setPlanRef(root, plan)
 	return plan
 }
@@ -1173,6 +1229,9 @@ func setPlanRef(it Iterator, plan *Plan) {
 		v.Plan = plan
 		setPlanRef(v.Source, plan)
 	case *VectorIter:
+		v.Plan = plan
+		// leaf — no upstream source
+	case *FtsIter:
 		v.Plan = plan
 		// leaf — no upstream source
 	}

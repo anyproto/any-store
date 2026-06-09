@@ -140,15 +140,6 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		return &emptyIter{}, nil
 	}
 
-	// $text routes to the full-text scan, which drives the query (the CBO is
-	// bypassed: a $text predicate must always be the driver).
-	if text, hasText, terr := findTextFilter(q.cond); terr != nil {
-		qb.Close()
-		return nil, terr
-	} else if hasText {
-		return q.ftsIter(ctx, qb, text)
-	}
-
 	tx, err := q.c.db.getReadTx(ctx)
 	if err != nil {
 		qb.Close()
@@ -157,6 +148,36 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 
 	buf := q.c.db.syncPool.GetDocBuf()
 	btx := tx.btreeReadTx()
+
+	// $text query: the BM25 search drives the query (CBO bypassed). The residual
+	// filter runs as a downstream FilterIter; a relevance/textScore sort is the
+	// FtsIter's intrinsic order, a real-field sort inserts a SortIter.
+	ftsSpec, ftsResidual, ferr := q.detectFtsQuery()
+	if ferr != nil {
+		q.c.db.syncPool.ReleaseDocBuf(buf)
+		_ = tx.Commit()
+		qb.Close()
+		return nil, ferr
+	}
+	if ftsSpec != nil {
+		plan := qplanner.BuildPlan(&qplanner.PlanParams{
+			Tx:     btx,
+			DataNs: q.c.ns,
+			Filter: ftsResidual,
+			Sorter: ftsSorter(q.sort),
+			Limit:  int(q.limit),
+			Offset: int(q.offset),
+			Buf:    buf,
+			Fts:    ftsSpec,
+		})
+		return &planIterator{
+			plan: plan,
+			tx:   tx,
+			buf:  buf,
+			qb:   qb,
+			data: &qplanner.CursorSource{Tx: btx, Ns: q.c.ns},
+		}, nil
+	}
 
 	// Vector query: detect `{vectorField: [..]}` against the collection's vector
 	// indexes. When matched, build a vector plan (ANN source) and ignore all
@@ -222,58 +243,7 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	}, nil
 }
 
-// ftsIter builds the full-text execution: a scan iterator yielding documents in
-// descending BM25 order, an optional residual FilterIter for any non-$text
-// predicates, and a LimitIter for offset/limit. It reuses planIterator for the
-// document-fetch / lifecycle plumbing.
-func (q *collQuery) ftsIter(ctx context.Context, qb *queryBuilder, text query.Text) (Iterator, error) {
-	fxs := q.c.loadFtsIndexes()
-	if len(fxs) == 0 {
-		qb.Close()
-		return nil, ErrNoFulltextIndex
-	}
-	fx := fxs[0]
-
-	tx, err := q.c.db.getReadTx(ctx)
-	if err != nil {
-		qb.Close()
-		return nil, err
-	}
-	btx := tx.btreeReadTx()
-	buf := q.c.db.syncPool.GetDocBuf()
-
-	hits, err := fx.search(btx, text.Search)
-	if err != nil {
-		q.c.db.syncPool.ReleaseDocBuf(buf)
-		_ = tx.Commit()
-		qb.Close()
-		return nil, err
-	}
-
-	dataCS := &qplanner.CursorSource{Tx: btx, Ns: q.c.ns}
-	plan := &qplanner.Plan{Name: "FtsScan", IndexName: fx.info.Name}
-	var root qplanner.Iterator = &ftsScanIter{hits: hits}
-	if condHasResidual(q.cond) {
-		root = &qplanner.FilterIter{Source: root, Data: dataCS, Filter: q.cond, Buf: buf, Plan: plan}
-	}
-	if q.limit > 0 || q.offset > 0 {
-		root = &qplanner.LimitIter{Source: root, Offset: int(q.offset), Limit: int(q.limit)}
-	}
-	plan.Root = root
-
-	return &planIterator{
-		plan: plan,
-		tx:   tx,
-		buf:  buf,
-		qb:   qb,
-		data: dataCS,
-	}, nil
-}
-
 func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResult, err error) {
-	if containsText(q.cond) {
-		return ModifyResult{}, ErrFulltextUnsupportedOp
-	}
 	mod, err := query.ParseModifier(modifier)
 	if err != nil {
 		return
@@ -319,21 +289,28 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
-	idxs := q.c.loadIndexes()
-	br := q.buildBoundsResult(idxs)
-	plan := qplanner.BuildPlan(&qplanner.PlanParams{
-		Tx:          btx,
-		DataNs:      q.c.ns,
-		Filter:      q.cond,
-		IDBounds:    qb.idBounds,
-		Limit:       int(q.limit),
-		Offset:      int(q.offset),
-		Buf:         buf,
-		TotalDocs:   q.docCount(btx),
-		Indexes:     q.buildCBOIndexesInto(nil, &br, idxs),
-		IndexHints:  q.buildIndexHints(),
-		FieldBounds: &br,
-	})
+	plan, isFts, ferr := q.ftsScanPlan(btx, buf)
+	if ferr != nil {
+		err = ferr
+		return
+	}
+	if !isFts {
+		idxs := q.c.loadIndexes()
+		br := q.buildBoundsResult(idxs)
+		plan = qplanner.BuildPlan(&qplanner.PlanParams{
+			Tx:          btx,
+			DataNs:      q.c.ns,
+			Filter:      q.cond,
+			IDBounds:    qb.idBounds,
+			Limit:       int(q.limit),
+			Offset:      int(q.offset),
+			Buf:         buf,
+			TotalDocs:   q.docCount(btx),
+			Indexes:     q.buildCBOIndexesInto(nil, &br, idxs),
+			IndexHints:  q.buildIndexHints(),
+			FieldBounds: &br,
+		})
+	}
 
 	// Collect all matching docIds into a contiguous buffer to avoid
 	// per-ID allocations and cursor invalidation during updates. Dedup
@@ -420,9 +397,6 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 }
 
 func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error) {
-	if containsText(q.cond) {
-		return ModifyResult{}, ErrFulltextUnsupportedOp
-	}
 	qb, err := q.makeQuery()
 	if err != nil {
 		return
@@ -462,21 +436,28 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
-	idxs := q.c.loadIndexes()
-	br := q.buildBoundsResult(idxs)
-	plan := qplanner.BuildPlan(&qplanner.PlanParams{
-		Tx:          btx,
-		DataNs:      q.c.ns,
-		Filter:      q.cond,
-		IDBounds:    qb.idBounds,
-		Limit:       int(q.limit),
-		Offset:      int(q.offset),
-		Buf:         buf,
-		TotalDocs:   q.docCount(btx),
-		Indexes:     q.buildCBOIndexesInto(nil, &br, idxs),
-		IndexHints:  q.buildIndexHints(),
-		FieldBounds: &br,
-	})
+	plan, isFts, ferr := q.ftsScanPlan(btx, buf)
+	if ferr != nil {
+		err = ferr
+		return
+	}
+	if !isFts {
+		idxs := q.c.loadIndexes()
+		br := q.buildBoundsResult(idxs)
+		plan = qplanner.BuildPlan(&qplanner.PlanParams{
+			Tx:          btx,
+			DataNs:      q.c.ns,
+			Filter:      q.cond,
+			IDBounds:    qb.idBounds,
+			Limit:       int(q.limit),
+			Offset:      int(q.offset),
+			Buf:         buf,
+			TotalDocs:   q.docCount(btx),
+			Indexes:     q.buildCBOIndexesInto(nil, &br, idxs),
+			IndexHints:  q.buildIndexHints(),
+			FieldBounds: &br,
+		})
+	}
 
 	// Collect IDs to delete into a contiguous buffer (can't modify while iterating).
 	// Dedup multi-key entries so a doc matched on multiple array values
@@ -540,16 +521,13 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 		q.cond = query.All{}
 	}
 
-	// $text counts by iterating the full-text scan (respecting any residual
-	// predicate and offset/limit).
-	if text, hasText, terr := findTextFilter(q.cond); terr != nil {
+	// $text counts by iterating the full-text plan (respecting any residual
+	// predicate and offset/limit). Iter() builds the Fts plan; counting its
+	// results is the simplest correct path.
+	if _, hasText, terr := findTextFilter(q.cond); terr != nil {
 		return 0, terr
 	} else if hasText {
-		qb, qerr := q.makeQuery()
-		if qerr != nil {
-			return 0, qerr
-		}
-		iter, ierr := q.ftsIter(ctx, qb, text)
+		iter, ierr := q.Iter(ctx)
 		if ierr != nil {
 			return 0, ierr
 		}
@@ -653,9 +631,6 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 }
 
 func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
-	if containsText(q.cond) {
-		return Explain{}, ErrFulltextUnsupportedOp
-	}
 	qb, err := q.makeQuery()
 	if err != nil {
 		return
@@ -670,20 +645,26 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs)
 
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
-		plan := qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:          tx,
-			DataNs:      q.c.ns,
-			Filter:      q.cond,
-			Sorter:      q.sort,
-			IDBounds:    qb.idBounds,
-			Limit:       int(q.limit),
-			Offset:      int(q.offset),
-			Buf:         buf,
-			TotalDocs:   q.docCount(tx),
-			Indexes:     cboIndexes,
-			IndexHints:  q.buildIndexHints(),
-			FieldBounds: &br,
-		})
+		plan, isFts, ferr := q.ftsScanPlan(tx, buf)
+		if ferr != nil {
+			return ferr
+		}
+		if !isFts {
+			plan = qplanner.BuildPlan(&qplanner.PlanParams{
+				Tx:          tx,
+				DataNs:      q.c.ns,
+				Filter:      q.cond,
+				Sorter:      q.sort,
+				IDBounds:    qb.idBounds,
+				Limit:       int(q.limit),
+				Offset:      int(q.offset),
+				Buf:         buf,
+				TotalDocs:   q.docCount(tx),
+				Indexes:     cboIndexes,
+				IndexHints:  q.buildIndexHints(),
+				FieldBounds: &br,
+			})
+		}
 		explain.Sql = plan.String()
 		explain.Plan = plan.ExplainString()
 

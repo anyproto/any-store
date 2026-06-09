@@ -11,6 +11,7 @@ import (
 	"github.com/anyproto/any-store/v2/internal/fts"
 	"github.com/anyproto/any-store/v2/internal/qplanner"
 	"github.com/anyproto/any-store/v2/query"
+	"github.com/anyproto/any-store/v2/syncpool"
 )
 
 // fulltext_search.go implements the read/query side: BM25 ranking over the
@@ -27,25 +28,16 @@ const (
 // that has no full-text index.
 var ErrNoFulltextIndex = errors.New("any-store: collection has no full-text index for $text")
 
-// ErrFulltextUnsupportedOp is returned for operations that do not yet support
-// $text (Update/Delete/Explain in v1).
-var ErrFulltextUnsupportedOp = errors.New("any-store: $text is only supported in Find().Iter()/Count()")
-
-// ftsHit is a scored search result: the document's data-namespace key (its
-// encoded string id) and BM25 score.
-type ftsHit struct {
-	idKey []byte
-	score float64
-}
-
-// search runs a bag-of-words BM25 query over the index and returns hits sorted
-// by descending score (ties broken by ascending IntDocID for determinism).
+// searchCandidates runs a bag-of-words BM25 query over the index and returns the
+// matched documents as qplanner.FtsCandidates sorted by descending score (ties
+// broken by ascending IntDocID for determinism) — the closure the FtsIter source
+// calls.
 //
 // v1 semantics: the query is analyzed with the same pipeline as indexing and
 // treated as a bag of terms (OR); each matching document's score is the sum of
 // the per-term BM25 contributions. CJK bigrams participate as ordinary terms
 // (positional phrase matching is a documented v2 refinement).
-func (fx *ftsIndex) search(tx *btree.ReadTx, queryStr string) ([]ftsHit, error) {
+func (fx *ftsIndex) searchCandidates(tx *btree.ReadTx, queryStr string) ([]qplanner.FtsCandidate, error) {
 	terms := fts.Analyze(queryStr)
 	if len(terms) == 0 {
 		return nil, nil
@@ -169,7 +161,7 @@ func (fx *ftsIndex) search(tx *btree.ReadTx, queryStr string) ([]ftsHit, error) 
 
 	// NOTE: do not reuse `key` here — it still aliases btree page memory from the
 	// last cur.Key() above; writing into it would corrupt the page cache.
-	hits := make([]ftsHit, 0, len(ranked))
+	out := make([]qplanner.FtsCandidate, 0, len(ranked))
 	var mapKey []byte
 	for _, r := range ranked {
 		mapKey = ftsMapReverseKey(mapKey, r.docID)
@@ -180,9 +172,9 @@ func (fx *ftsIndex) search(tx *btree.ReadTx, queryStr string) ([]ftsHit, error) 
 			}
 			return nil, gerr
 		}
-		hits = append(hits, ftsHit{idKey: slices.Clone(idBytes), score: r.score})
+		out = append(out, qplanner.FtsCandidate{DocId: slices.Clone(idBytes), Score: r.score})
 	}
-	return hits, nil
+	return out, nil
 }
 
 // scoredDoc is one accumulated (IntDocID, BM25 score) pair.
@@ -328,28 +320,71 @@ func ftsDocLen(tx *btree.ReadTx, ns *btree.Namespace, docID uint64) (uint32, err
 	return uint32(n), nil
 }
 
-// ftsScanIter is the planner iterator that drives a $text query: it yields the
-// pre-ranked document ids (data-namespace keys) in descending score order. It
-// satisfies qplanner.Iterator so it can sit beneath FilterIter / LimitIter.
-type ftsScanIter struct {
-	hits []ftsHit
-	pos  int
-}
-
-func (it *ftsScanIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
-	if it.pos >= len(it.hits) {
-		return nil, nil, false, nil
+// detectFtsQuery inspects the query's condition for a $text clause. If present,
+// it returns an FtsQuerySpec (whose search closure runs BM25 over the
+// collection's full-text index) and the residual filter (everything except the
+// $text clause). If absent, it returns (nil, q.cond, nil). Mirrors
+// detectVectorQuery. An error is returned for invalid placement or a missing
+// full-text index.
+func (q *collQuery) detectFtsQuery() (*qplanner.FtsQuerySpec, query.Filter, error) {
+	text, hasText, err := findTextFilter(q.cond)
+	if err != nil {
+		return nil, nil, err
 	}
-	h := it.hits[it.pos]
-	it.pos++
-	return h.idKey, h.idKey, false, nil
+	if !hasText {
+		return nil, q.cond, nil
+	}
+	fxs := q.c.loadFtsIndexes()
+	if len(fxs) == 0 {
+		return nil, nil, ErrNoFulltextIndex
+	}
+	fx := fxs[0]
+	search := text.Search
+	spec := &qplanner.FtsQuerySpec{
+		Ordered: true, // searchCandidates returns score-descending
+		Search: func(tx *btree.ReadTx) ([]qplanner.FtsCandidate, error) {
+			return fx.searchCandidates(tx, search)
+		},
+	}
+	return spec, ftsResidualFilter(q.cond), nil
 }
 
-func (it *ftsScanIter) Close() {}
+// ftsScanPlan builds the docId-producing plan for the non-Iter operations
+// (Count/Update/Delete/Explain) when the query is a $text query, or returns
+// ok=false to let the caller take its normal CBO path. It keeps those operations
+// correct for $text (the BM25 source drives; the residual filter runs
+// downstream) instead of falling through to a match-everything full scan.
+func (q *collQuery) ftsScanPlan(btx *btree.ReadTx, buf *syncpool.DocBuffer) (plan *qplanner.Plan, ok bool, err error) {
+	spec, residual, derr := q.detectFtsQuery()
+	if derr != nil {
+		return nil, false, derr
+	}
+	if spec == nil {
+		return nil, false, nil
+	}
+	plan = qplanner.BuildPlan(&qplanner.PlanParams{
+		Tx:     btx,
+		DataNs: q.c.ns,
+		Filter: residual,
+		Sorter: ftsSorter(q.sort),
+		Limit:  int(q.limit),
+		Offset: int(q.offset),
+		Buf:    buf,
+		Fts:    spec,
+	})
+	return plan, true, nil
+}
 
-func (it *ftsScanIter) String() string { return "FtsScan" }
-
-var _ qplanner.Iterator = (*ftsScanIter)(nil)
+// ftsSorter maps the query's sort to the planner's sorter for a $text query:
+// the default (nil) and the relevance projection {$meta:"textScore"} both yield
+// the FtsIter's intrinsic score-descending order (nil → no SortIter); any other
+// sort is a real field that needs a SortIter.
+func ftsSorter(s query.Sort) query.Sort {
+	if s == nil || query.IsTextScoreSort(s) {
+		return nil
+	}
+	return s
+}
 
 // findTextFilter locates the $text predicate in a parsed filter. v1 supports a
 // $text only at the top level or directly inside an $and (AND context); a $text
@@ -427,28 +462,34 @@ func anyContainsText(fs []query.Filter) bool {
 	return false
 }
 
-// condHasResidual reports whether the filter constrains anything beyond the
-// $text predicate itself (i.e. whether a residual FilterIter is needed).
-func condHasResidual(f query.Filter) bool {
+// ftsResidualFilter returns the filter with the $text clause removed — the
+// predicate the planner's FilterIter applies to the BM25-ranked candidates. A
+// query that is just $text leaves no residual (query.All).
+func ftsResidualFilter(f query.Filter) query.Filter {
 	switch ft := f.(type) {
 	case query.Text:
-		return false
+		return query.All{}
 	case query.And:
-		for _, sub := range ft {
-			if condHasResidual(sub) {
-				return true
-			}
-		}
-		return false
+		return ftsResidualFromAnd(ft)
 	case *query.And:
-		for _, sub := range *ft {
-			if condHasResidual(sub) {
-				return true
-			}
-		}
-		return false
-	case nil, query.All:
-		return false
+		return ftsResidualFromAnd(*ft)
 	}
-	return true
+	return f
+}
+
+func ftsResidualFromAnd(and query.And) query.Filter {
+	var rest query.And
+	for _, sub := range and {
+		if _, isText := sub.(query.Text); !isText {
+			rest = append(rest, sub)
+		}
+	}
+	switch len(rest) {
+	case 0:
+		return query.All{}
+	case 1:
+		return rest[0]
+	default:
+		return rest
+	}
 }

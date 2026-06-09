@@ -24,6 +24,10 @@ type Iterator interface {
 	// queries.
 	Distance() float32
 
+	// Score returns the BM25 relevance score of the current document for a $text
+	// search (larger is more relevant). It returns 0 for non-fts queries.
+	Score() float64
+
 	// Err returns any error encountered during the lifetime of the iterator.
 	Err() error
 
@@ -66,9 +70,9 @@ func (pi *planIterator) Next() bool {
 		if !pi.dedup.Accept(docId, mk) {
 			continue
 		}
-		if pi.plan.DocParsed == nil || pi.plan.Distances != nil {
+		if pi.plan.DocParsed == nil || pi.plan.Distances != nil || pi.plan.Scores != nil {
 			// Copy docId when we'll need it in Doc() fallback, or to look up
-			// the distance sidecar for a vector query.
+			// the distance/score sidecar for a vector/fts query.
 			pi.docId = append(pi.docId[:0], docId...)
 		}
 		return true
@@ -82,6 +86,15 @@ func (pi *planIterator) Distance() float32 {
 		return 0
 	}
 	return pi.plan.Distances[string(pi.docId)]
+}
+
+// Score returns the BM25 relevance score of the current document for a $text
+// query (0 for non-fts queries).
+func (pi *planIterator) Score() float64 {
+	if pi.plan == nil || pi.plan.Scores == nil {
+		return 0
+	}
+	return pi.plan.Scores[string(pi.docId)]
 }
 
 func (pi *planIterator) Doc() (Doc, error) {
@@ -182,6 +195,8 @@ func (e *emptyIter) Doc() (Doc, error) {
 	return nil, ErrDocNotFound
 }
 func (e *emptyIter) Distance() float32 { return 0 }
+
+func (e *emptyIter) Score() float64 { return 0 }
 func (e *emptyIter) Err() error        { return nil }
 func (e *emptyIter) Close() error {
 	if e.closed {
