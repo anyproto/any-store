@@ -131,54 +131,76 @@ vectors rebuilt in **1.38 s** (48 MiB reclaimed).
 
 ### IVF-SQ vs IVF-PQ vs HNSW (all optimizations, local 32c)
 
+Local 32c, with the int8 byte kernel (§ Distance backend):
+
 | mode | recall | search/s | insert/s | index MiB | heap MiB |
 |---|--:|--:|--:|--:|--:|
-| HNSW btree int8 | 0.953 | 1144 | 1114 | 36 | 178 |
-| HNSW hyb+vc f32 | 0.961 | **3520** | 941 | 175 | 468 |
-| IVF-PQ i8 np64 | 0.951 | 485 | 5536 | 39 | 264 |
-| **IVF-SQ np64** | 0.951 | 487 | **8640** | **35** | **183** |
-| IVF-SQ np32 | 0.920 | 885 | 8780 | 35 | 183 |
+| HNSW btree int8 | 0.953 | 1582 | 1044 | 36 | 178 |
+| HNSW hyb+vc f32 | 0.959 | **3519** | 892 | 175 | 468 |
+| IVF-PQ i8 np64 | 0.951 | 506 | 5295 | 39 | 257 |
+| **IVF-SQ np64** | 0.951 | 1041 | **8583** | **35** | **180** |
+| IVF-SQ np32 | 0.920 | 1794 | 8504 | 35 | 189 |
 
-- **IVF-SQ is the write champion: ~8,600 insert/s ≈ 7.8× HNSW btree int8**, at the
-  **same RAM (183 vs 178)** and the **smallest index (35 MiB)**, recall parity.
-- **IVF-SQ dominates IVF-PQ** at equal recall: build ~2.3×, insert ~1.5×, RAM 1.4×
-  lower, smaller index, equal search — it drops PQ codes and the separate re-rank
-  store, scanning int8 vectors directly. (Flat-codebook arenas added a further
-  +4–11% on the IVF write paths.)
-- **Search stays HNSW's domain**: IVF modes are ~2× below btree int8 and ~7× below
-  `hyb+vc f32` at parity recall; tune via `NProbe` (np32 → 885 q/s @ 0.920 recall).
+- **IVF-SQ is the write champion: ~8,500 insert/s ≈ 8× HNSW btree int8**, at the
+  **same RAM (180 vs 178)** and the **smallest index (35 MiB)**, recall parity.
+- **IVF-SQ search ~2.2–2.3× faster** since the byte kernel (np64 487→1041, np32
+  885→1794): its `scanCellsSQ` scores every probed-cell member by exact int8
+  distance, so removing dequant lands the full win.
+- **IVF-SQ dominates IVF-PQ** at equal recall: build ~2.3×, insert ~1.5×, RAM lower,
+  smaller index, faster search — it drops PQ codes and the separate re-rank store,
+  scanning int8 directly. (The byte kernel only touches IVF-PQ's small re-rank set,
+  so IVF-PQ gains just ~9%.)
+- **Search still favours HNSW** (`hyb+vc f32` 3519 / btree int8 1582), but IVF-SQ
+  np32 (1794) now beats btree int8 at slightly lower recall; tune via `NProbe`.
 - IVF **build still under-parallelizes** (IVF-SQ ~7k/s local but ~850/s on 48c) — an
   open optimization vs HNSW's parallel build.
 
 ### Cross-hardware (insert/s · search/s · index MiB · heap MiB)
 
-| mode | 32c amd64 AVX2 | 16c amd64 laptop | 48c amd64 (weak cores) | 8c M2 arm64 scalar |
-|---|---|---|---|---|
-| HNSW btree int8 | 1114·1144·36·178 | 521·538·36·178 | 134·265·36·179 | 181·393·36·— |
-| HNSW hyb+vc f32 | 941·3520·175·468 | 412·1982·175·468 | 113·788·175·469 | — |
-| IVF-PQ i8 np64 | 5536·485·39·264 | 3187·227·39·262 | 646·112·39·259 | — |
-| **IVF-SQ np64** | **8640·487·35·183** | **4593·262·35·184** | **786·86·35·184** | — |
+Three amd64 boxes, with the int8 byte kernel (after migration):
+
+| mode | 32c AVX512 | 16c AVX2 | 48c (no-AVX2) |
+|---|---|---|---|
+| HNSW btree int8 | 1044·1582·36·178 | 509·744·36·178 | 154·271·36·179 |
+| HNSW hyb+vc f32 | 892·3519·175·468 | 421·1920·175·468 | 123·856·175·469 |
+| IVF-PQ i8 np64 | 5295·506·39·257 | 2711·239·39·265 | 700·123·39·262 |
+| **IVF-SQ np64** | **8583·1041·35·180** | **4166·489·35·182** | **933·122·35·181** |
 
 Recall, index size and heap are **arch-invariant**. IVF-SQ's write win holds on every
-machine — insert is **~6–9× HNSW** (7.8× local, 8.8× p14, 5.9× hp) — as does its
-RAM parity with HNSW int8 (~183 vs ~178 MiB) and the lowest IVF index size (35 MiB).
-(M2/arm64 IVF numbers pending; the ~2–2.5× scalar-distance penalty below applies.)
+machine — insert is **~6–9× HNSW** — as does its RAM parity with HNSW int8 and the
+lowest IVF index size (35 MiB). The **48c box has no AVX2**, so `internal/simd`
+dispatches to the pure-Go unrolled kernel (correct, recall-identical, just slower).
+**Apple-Silicon arm64 now runs NEON** (was scalar under vek); the self-contained
+`cmd/vbench` binary runs the same matrix there — M2 NEON numbers pending.
 
-### SIMD isolation (same machine, AVX2 on vs off)
+### Distance backend & SIMD (`internal/simd`)
 
-vek provides AVX2 only for amd64; **arm64 (Apple Silicon, iOS/Android) runs a scalar
-Go fallback**. Forcing AVX2 off on one host isolates the SIMD factor:
+Distance kernels run through **`internal/simd`** — vendored hand-written assembly
+(weaviate, BSD-3-Clause): **dot/L2 for amd64 (AVX2/AVX512) and arm64 (NEON/SVE)**,
+plus a **float×int8 kernel**, with a pure-Go fallback for wasm and non-AVX2 x86.
+This replaced the former `viterin/vek` (amd64-only, which left arm64 on a scalar
+fallback), so **`vector.SIMD()` is now true on Apple Silicon** — ARM gets real NEON,
+not scalar.
 
-| path | AVX2 / scalar |
-|---|:--:|
-| build / compaction | ~2.5× |
-| single insert | ~2.5× |
-| update | ~2.0× |
-| search (btree, memory-bound) | ~1.3× |
-| search (hyb+vc f32, pure-distance) | ~2.25× |
+**int8 byte distance.** Stored int8 vectors are scored straight from their bytes
+via the unsigned float×byte kernel (offset-binary format, `byte(q)^0x80`), skipping
+the per-element dequantization loop. Isolated int8 distance at dim768 drops
+**308 → 19.8 ns (15.6×) — f32 speed at 4× smaller storage**. End-to-end on the real
+dataset (recall unchanged):
 
-So distance-bound paths pay ~2–2.5× on arm64 today; NEON kernels (128-bit, half of
-AVX2's width) would recover most of it — biggest on build/compaction and insert.
+| path | int8 search before → after |
+|---|---|
+| HNSW btree int8 | 1021 → 1582 q/s (+52%) |
+| HNSW hyb+vc int8 | 1930 → 4925 q/s (~2.5×) |
+| IVF-SQ np64 (cosine) | 437 → 1041 q/s (~2.3×) |
+| IVF-SQ (isolated, cosine/L2) | ~2.9× / ~3.1× |
+
+IVF-SQ accelerates **both cosine and L2** (L2 via `‖q−x‖²=‖q‖²+‖x‖²−2·dot`, storing a
+per-vector `‖x‖²`); HNSW int8 covers cosine/dot (L2 keeps the float path). The change
+is read-path only — builds are unchanged. f32 search is unchanged within noise.
+
+The **no-AVX2 x86** path uses the pure-Go unrolled kernel, which *beats* vek's old
+fallback (682 vs 870 ns at dim768).
 
 ### Page cache / slab sizing (perf vs RAM)
 
@@ -206,8 +228,9 @@ Batch insert (768 btree int8): **572/s disabled → 1366/s @16384 (2.4×) → 21
   RAM on par with HNSW int8, recall parity), accepting ~2× lower search throughput.
   Prefer it over IVF-PQ at this scale.
 - **Exact / tiny sets:** `BruteForce`.
-- **arm64 / on-device:** expect ~2–2.5× slower distance-bound ops until NEON kernels
-  land; favour the tiered mode (fewer distance ops per query) and int8.
+- **arm64 / on-device:** distance kernels now run **NEON** via `internal/simd`
+  (Apple Silicon, Graviton, mobile) — no longer a scalar fallback. int8 is scored
+  by the NEON byte kernel (no dequant). Still favour the tiered mode and int8.
 
 ## Reproduce
 

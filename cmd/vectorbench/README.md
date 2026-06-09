@@ -44,8 +44,9 @@ it to the target box and run it.
 
 ## What it reports
 
-1. **CPU / SIMD** — `os/arch`, core count, and whether vek's AVX kernels are
-   active (so distance numbers are interpretable on the target).
+1. **CPU / SIMD** — `os/arch`, core count, and whether the `internal/simd` asm
+   kernels are active for this CPU (AVX2/AVX512 on amd64, NEON/SVE on arm64),
+   so distance numbers are interpretable on the target.
 2. **Distance kernel** — scalar vs unrolled vs SIMD ns/comparison.
 3. **Build** — HNSW construction rate (docs/s), with progress.
 4. **Recall** — recall@k vs exact brute force, swept over ef.
