@@ -386,11 +386,13 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 				poolFail(g)
 				return cerr
 			}
-			// collectInteriorCells self-recycles the pager's shared cellBuf
-			// (btree.go:1642), so non-overflow cell keys alias a buffer that the
-			// NEXT collectInteriorCells call (for the next gathered sibling) will
-			// overwrite. Clone every key into balance-owned memory before pooling
-			// so each sibling's keys survive the whole redistribution.
+			// The collectInteriorCells wrapper self-recycles its scratch buffer to
+			// the pager free-list, so non-overflow cell keys alias a buffer that the
+			// NEXT collectInteriorCells call (for the next gathered sibling) may
+			// reuse. Clone every key into balance-owned memory before pooling so each
+			// sibling's keys survive the whole redistribution. (rewriteParentAfter
+			// Balance avoids this clone by using collectInteriorCellsKeepBuf and
+			// holding the buffer across the rebuild instead.)
 			for j := range cells {
 				cells[j].key = bytes.Clone(cells[j].key)
 			}
@@ -806,27 +808,43 @@ func (bt *btree) rewriteParentAfterBalance(
 	// rebuildInteriorPage re-creates as needed — same contract as the existing
 	// interior split, btree.go:2023). After this the parent's old divider chains
 	// are gone; we rebuild from childPgnos + divKeys below.
-	parentCells, cerr := bt.collectInteriorCells(parentPg)
+	parentCells, parentBuf, cerr := bt.collectInteriorCellsKeepBuf(parentPg)
 	if cerr != nil {
 		// Caller (balanceNonroot) retains parentPg's pin; do not release it here,
 		// matching the ErrCorrupt path below. Propagate up the balance() do-loop
 		// (btree.c:9131-9242).
 		return cerr
 	}
+	// Hold the collected-cell scratch buffer for the whole rebuild so the parent's
+	// divider keys can be spliced by aliasing (oldDivs below) instead of cloning
+	// each one — the former per-divider bytes.Clone was the largest object
+	// producer of the index-build profile. parentBuf is read-only here (never
+	// appended to), so the aliases stay stable; the defer returns it to the
+	// free-list at every exit, after the parent rebuild(s) have consumed newCells.
+	// The promoted sepKey on the split path is independently cloned below, so it
+	// survives this recycle and the cascade up the tree.
+	defer bt.pager.recycleCellBuf(parentBuf)
 	nc := len(parentCells)
 	parentRightChild := parentPg.header.rightChild
 
-	// Old children (nc+1) and old divider keys (nc). Clone keys: collectInterior
-	// Cells self-recycles the shared cellBuf (btree.go:1642), so non-overflow
-	// keys would otherwise dangle once rebuildInteriorPage / the cascade re-takes
-	// the buffer.
+	// Old children (nc+1) and old divider keys (nc). oldDivs aliases parentBuf
+	// (non-overflow keys) / the freshly-read overflow keys — both valid until the
+	// deferred recycle above, which fires only after newCells is rebuilt.
 	oldChildren := make([]uint32, nc+1)
 	oldDivs := make([][]byte, nc)
 	for j := 0; j < nc; j++ {
 		oldChildren[j] = parentCells[j].leftChild
-		oldDivs[j] = bytes.Clone(parentCells[j].key)
+		oldDivs[j] = parentCells[j].key
 	}
 	oldChildren[nc] = parentRightChild
+
+	// parentCells (the descriptor slice) is fully consumed: every leftChild is
+	// copied into oldChildren and every key header aliased into oldDivs (the key
+	// BYTES live in parentBuf, recycled separately by the defer above). Return the
+	// slice to the pool now — before the divider splice and the cascade — so the
+	// next balanceNonroot up the tree can reuse it. recycleCellSlice clears the
+	// entries, which does not disturb oldDivs (it holds its own header copies).
+	bt.pager.recycleCellSlice(parentCells)
 
 	// Bounds: the gathered run children are [nxDiv, nxDiv+nOld); valid child
 	// slots are 0..nc. rightmostChildSlot == nxDiv+nOld-1.
