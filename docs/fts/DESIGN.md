@@ -314,6 +314,20 @@ ops) and the read loop is gather/scatter-shaped, neither of which SIMD helps.
 The lever was data layout (write-back buffer, dense `ftsScoreAcc`), not
 vectorization.
 
+**Compression (anyenc S2):** rejected for the index data. The doc btree already
+S2-compresses whole documents, but FTS data is the wrong shape for an LZ-family
+byte compressor:
+- Postings are delta-varints — dense small integers with no recurring 4-byte
+  patterns — in <512-byte chunks (below S2's dictionary warm-up). S2 yields
+  ~1.0× while adding compress-on-write / decompress-on-read CPU to the hot RMW
+  path. The right tool is *integer* coding, which we already do.
+- Vocab front-coding is the correct dictionary tool but lives in the B-tree node
+  format (off-limits); doing it at the app layer (term-blocking) would break the
+  B-tree's native binary search for prefix/range — not worth ~1MB.
+The real footprint lever is structural, not compression: a positionless
+(`DOCS_AND_FREQS_ONLY`) mode halves the postings (positions are ~50% of them).
+At ~19MB index for 29MB text (with positions), the index is already well-coded.
+
 Explicitly **deferred to v2+**: top-k materialization in `search` (it currently
 clones every matched id before `Limit` trims); replacing the per-doc `docinfo`
 `Get` with an in-memory dense quantized doc-length array (safe now that
