@@ -30,7 +30,30 @@ type IndexInfo struct {
 	// Sparse indicates whether the index is sparse, indexing only documents
 	// with the specified fields.
 	Sparse bool `json:"sparse"`
+
+	// Kind selects the index type (range by default, or full-text).
+	Kind IndexKind `json:"kind,omitempty"`
+
+	// Fulltext configures a full-text index when Kind == IndexKindFulltext.
+	Fulltext *FulltextParams `json:"fulltext,omitempty"`
 }
+
+// IndexKind selects the kind of index.
+type IndexKind uint8
+
+const (
+	// IndexKindRange is the default B-tree range/equality index.
+	IndexKindRange IndexKind = iota
+	// IndexKindFulltext is an inverted full-text index over one or more text
+	// fields, queried with the $text operator and ranked by BM25. See
+	// docs/fts/DESIGN.md.
+	IndexKindFulltext
+)
+
+// FulltextParams configures a full-text index. It is reserved for future
+// options (per-field weights, analyzer selection, positionless mode); v1 uses
+// the default analyzer (NFKC + case-fold + UAX#29 + CJK bigram) for all fields.
+type FulltextParams struct{}
 
 func (i IndexInfo) createName() string {
 	return strings.Join(i.Fields, ",")

@@ -412,6 +412,27 @@ func (a All) String() string {
 	return "null"
 }
 
+// Text is the {"$text":{"$search":"..."}} full-text predicate. Matching and
+// ranking are performed by the full-text index (the query is driven by an FTS
+// scan), so as a residual predicate Ok always passes: any document the FTS scan
+// yields has already matched. It contributes no index bounds. See
+// docs/fts/DESIGN.md.
+type Text struct {
+	Search string
+}
+
+func (t Text) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
+	return true
+}
+
+func (t Text) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
+	return bs
+}
+
+func (t Text) String() string {
+	return fmt.Sprintf(`{"$text":{"$search":%q}}`, t.Search)
+}
+
 type Exists struct{}
 
 func (e Exists) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {

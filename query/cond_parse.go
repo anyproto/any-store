@@ -16,6 +16,7 @@ const (
 	opAnd Operator = iota
 	opOr
 	opNor
+	opText
 
 	_opVal
 	opNe
@@ -57,6 +58,7 @@ var (
 	opBytesType   = []byte("$type")
 	opBytesRegexp = []byte("$regex")
 	opBytesSize   = []byte("$size")
+	opBytesText   = []byte("$text")
 )
 
 func MustParseCondition(cond any) Filter {
@@ -188,6 +190,13 @@ func parseAnd(val *anyenc.Value) (res Filter, err error) {
 				}
 			case opNor:
 				if f, err = parseNorArray(v); err != nil {
+					return
+				}
+				if fs != nil {
+					fs = append(fs, f)
+				}
+			case opText:
+				if f, err = parseText(v); err != nil {
 					return
 				}
 				if fs != nil {
@@ -371,6 +380,45 @@ func makeCompFilter(op Operator, v *anyenc.Value) (f Filter, err error) {
 	}
 }
 
+// parseText parses {"$search": "...", "$language": "..."} into a Text filter.
+// $language is accepted and ignored for v1 (the analyzer is language-neutral).
+func parseText(v *anyenc.Value) (Filter, error) {
+	if v.Type() != anyenc.TypeObject {
+		return nil, fmt.Errorf("$text must be an object, e.g. {\"$search\":\"...\"}")
+	}
+	obj, _ := v.Object()
+	var (
+		search string
+		hasS   bool
+		perr   error
+	)
+	obj.Visit(func(key []byte, val *anyenc.Value) {
+		if perr != nil {
+			return
+		}
+		switch string(key) {
+		case "$search":
+			sb, e := val.StringBytes()
+			if e != nil {
+				perr = fmt.Errorf("$search must be a string")
+				return
+			}
+			search, hasS = string(sb), true
+		case "$language", "$caseSensitive", "$diacriticSensitive":
+			// accepted for Mongo compatibility, ignored in v1
+		default:
+			perr = fmt.Errorf("unknown $text field: %s", string(key))
+		}
+	})
+	if perr != nil {
+		return nil, perr
+	}
+	if !hasS {
+		return nil, fmt.Errorf("$text requires $search")
+	}
+	return Text{Search: search}, nil
+}
+
 func parseSize(v *anyenc.Value) (Filter, error) {
 	size, err := v.Int()
 	if err != nil {
@@ -495,6 +543,8 @@ func isOperator(key []byte) (ok bool, op Operator, err error) {
 			return true, opRegexp, nil
 		case bytes.Equal(key, opBytesSize):
 			return true, opSize, nil
+		case bytes.Equal(key, opBytesText):
+			return true, opText, nil
 		default:
 			return true, 0, fmt.Errorf("unknow operator: %s", string(key))
 		}

@@ -128,8 +128,11 @@ type collection struct {
 	// whole-schema reload on a schema-cookie bump (a reader sees either the old
 	// or the new schema, never half-applied DDL).
 	indexes atomic.Pointer[[]*index]
-	db      *db
-	ns      *btree.Namespace
+	// ftsIndexes is the parallel copy-on-write snapshot of full-text indexes,
+	// maintained alongside indexes (range) on the same hot paths.
+	ftsIndexes atomic.Pointer[[]*ftsIndex]
+	db         *db
+	ns         *btree.Namespace
 
 	compression Compression // 0 = use db default
 
@@ -158,6 +161,19 @@ func (c *collection) loadIndexes() []*index {
 // serialise concurrent publishers); readers need no lock.
 func (c *collection) storeIndexes(idxs []*index) {
 	c.indexes.Store(&idxs)
+}
+
+// loadFtsIndexes returns the current full-text index snapshot (lock-free).
+func (c *collection) loadFtsIndexes() []*ftsIndex {
+	if p := c.ftsIndexes.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// storeFtsIndexes publishes a new full-text index snapshot. Callers hold c.mu.
+func (c *collection) storeFtsIndexes(idxs []*ftsIndex) {
+	c.ftsIndexes.Store(&idxs)
 }
 
 // init initializes the collection, loading namespace handles and index metadata.
@@ -195,7 +211,19 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 			return err
 		}
 		var idxs []*index
+		var ftsIdxs []*ftsIndex
 		for _, info := range idxInfos {
+			if isFulltext(info) {
+				fx, fErr := newFtsIndex(c, info)
+				if fErr != nil {
+					return fErr
+				}
+				if fErr = fx.bindNamespaces(getNamespace); fErr != nil {
+					return fErr
+				}
+				ftsIdxs = append(ftsIdxs, fx)
+				continue
+			}
 			nsName := indexNsName(c.name, info.Name)
 			ns, nsErr := getNamespace(nsName)
 			if nsErr != nil {
@@ -209,6 +237,7 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 			idxs = append(idxs, idx)
 		}
 		c.storeIndexes(idxs)
+		c.storeFtsIndexes(ftsIdxs)
 		return nil
 	})
 }
@@ -330,6 +359,11 @@ func (c *collection) insertItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, it i
 	// Insert index entries
 	for _, idx := range c.loadIndexes() {
 		if err = idx.insertKeys(tx, it); err != nil {
+			return err
+		}
+	}
+	for _, fx := range c.loadFtsIndexes() {
+		if err = fx.insertDoc(tx, it); err != nil {
 			return err
 		}
 	}
@@ -465,6 +499,11 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 			return
 		}
 	}
+	for _, fx := range c.loadFtsIndexes() {
+		if err = fx.updateDoc(tx, prevIt, it); err != nil {
+			return
+		}
+	}
 
 	if c.compressionDisabled() {
 		buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
@@ -531,14 +570,22 @@ func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
 }
 
 func (c *collection) deleteItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, id []byte) (err error) {
-	// Delete index entries
-	if idxs := c.loadIndexes(); len(idxs) > 0 {
+	// Delete index entries. The document is loaded once and reused for both the
+	// range and full-text index removals (both need the field values).
+	idxs := c.loadIndexes()
+	ftsIdxs := c.loadFtsIndexes()
+	if len(idxs) > 0 || len(ftsIdxs) > 0 {
 		it, loadErr := c.loadById(tx, buf, id)
 		if loadErr != nil {
 			return loadErr
 		}
 		for _, idx := range idxs {
 			if err = idx.deleteKeys(tx, it); err != nil {
+				return err
+			}
+		}
+		for _, fx := range ftsIdxs {
+			if err = fx.deleteDoc(tx, it); err != nil {
 				return err
 			}
 		}
@@ -569,7 +616,19 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 	}
 	return c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
 		var newIndexes []*index
+		var newFtsIndexes []*ftsIndex
 		for _, idxInfo := range info {
+			if isFulltext(idxInfo) {
+				fx, fErr := c.createFtsIndex(ctx, tx, idxInfo)
+				if fErr != nil {
+					if ensure && errors.Is(fErr, ErrIndexExists) {
+						continue
+					}
+					return false, fErr
+				}
+				newFtsIndexes = append(newFtsIndexes, fx)
+				continue
+			}
 			idx, txErr := c.createIndex(ctx, tx, idxInfo)
 			if txErr != nil {
 				// ensure=true is idempotent only for an EXISTING index whose
@@ -586,20 +645,29 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 			newIndexes = append(newIndexes, idx)
 		}
 
-		if len(newIndexes) == 0 {
+		if len(newIndexes) == 0 && len(newFtsIndexes) == 0 {
 			return false, nil
 		}
 
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		// Copy-on-write publish: build a fresh slice (current snapshot + new
-		// indexes) and swap it in atomically so lock-free query readers always
+		// Copy-on-write publish: build fresh slices (current snapshot + new
+		// indexes) and swap them in atomically so lock-free query readers always
 		// see a complete generation.
-		cur := c.loadIndexes()
-		merged := make([]*index, 0, len(cur)+len(newIndexes))
-		merged = append(merged, cur...)
-		merged = append(merged, newIndexes...)
-		c.storeIndexes(merged)
+		if len(newIndexes) > 0 {
+			cur := c.loadIndexes()
+			merged := make([]*index, 0, len(cur)+len(newIndexes))
+			merged = append(merged, cur...)
+			merged = append(merged, newIndexes...)
+			c.storeIndexes(merged)
+		}
+		if len(newFtsIndexes) > 0 {
+			cur := c.loadFtsIndexes()
+			merged := make([]*ftsIndex, 0, len(cur)+len(newFtsIndexes))
+			merged = append(merged, cur...)
+			merged = append(merged, newFtsIndexes...)
+			c.storeFtsIndexes(merged)
+		}
 		return true, nil
 	})
 }
@@ -654,6 +722,80 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 	return idx, nil
 }
 
+// createFtsIndex creates the five namespaces of a full-text index, registers
+// its metadata, and backfills existing documents. Mirrors createIndex.
+func (c *collection) createFtsIndex(ctx context.Context, tx *btree.WriteTx, info IndexInfo) (*ftsIndex, error) {
+	tx.MarkSchemaChanged()
+	if info.Name == "" {
+		info.Name = info.createName()
+	}
+	for _, field := range info.Fields {
+		if err := validateIndexField(field); err != nil {
+			return nil, err
+		}
+	}
+
+	// Register in system namespace (carries Kind so reopen rebuilds an fts index).
+	if err := c.db.registerIndex(tx, c.name, info); err != nil {
+		return nil, err
+	}
+
+	fx, err := newFtsIndex(c, info)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create the five namespaces.
+	for _, nsName := range ftsIndexNames(c.name, info.Name) {
+		if _, err = tx.CreateNamespace(nsName); err != nil {
+			return nil, err
+		}
+	}
+	if err = fx.bindNamespaces(tx.GetNamespace); err != nil {
+		return nil, err
+	}
+
+	// Backfill existing documents.
+	if err = c.buildFtsIndex(tx, fx); err != nil {
+		return nil, err
+	}
+	return fx, nil
+}
+
+// buildFtsIndex indexes every existing document into a new full-text index.
+func (c *collection) buildFtsIndex(tx *btree.WriteTx, fx *ftsIndex) error {
+	buf := c.db.syncPool.GetDocBuf()
+	defer c.db.syncPool.ReleaseDocBuf(buf)
+
+	cursor := tx.NewCursor(c.ns)
+	defer cursor.Close()
+	if err := cursor.First(); err != nil {
+		return err
+	}
+	for cursor.Valid() {
+		val, err := cursor.Value()
+		if err != nil {
+			return err
+		}
+		buf.DocBuf = append(buf.DocBuf[:0], val...)
+		doc, err := buf.Parser.ParseOwned(buf.DocBuf)
+		if err != nil {
+			return err
+		}
+		it, err := newItem(doc)
+		if err != nil {
+			return err
+		}
+		if err = fx.insertDoc(tx, it); err != nil {
+			return err
+		}
+		if err = cursor.Next(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *collection) DropIndex(ctx context.Context, indexName string) (err error) {
 	return c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (txErr error) {
 		tx.MarkSchemaChanged()
@@ -664,10 +806,19 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		found := false
+		isFts := false
 		for _, idx := range c.loadIndexes() {
 			if idx.info.Name == indexName {
 				found = true
 				break
+			}
+		}
+		if !found {
+			for _, fx := range c.loadFtsIndexes() {
+				if fx.info.Name == indexName {
+					found, isFts = true, true
+					break
+				}
 			}
 		}
 		if !found {
@@ -681,6 +832,28 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 		if txErr = c.db.removeIndex(tx, c.name, indexName); txErr != nil {
 			return
 		}
+
+		if isFts {
+			// Delete the five full-text namespaces.
+			for _, nsName := range ftsIndexNames(c.name, indexName) {
+				if txErr = tx.DeleteNamespace(nsName); txErr != nil {
+					if !errors.Is(txErr, btree.ErrNamespaceNotFound) {
+						return
+					}
+					txErr = nil
+				}
+			}
+			cur := c.loadFtsIndexes()
+			next := make([]*ftsIndex, 0, len(cur))
+			for _, fx := range cur {
+				if fx.info.Name != indexName {
+					next = append(next, fx)
+				}
+			}
+			c.storeFtsIndexes(next)
+			return nil
+		}
+
 		// Delete the index namespace
 		nsName := indexNsName(c.name, indexName)
 		if txErr = tx.DeleteNamespace(nsName); txErr != nil {
@@ -751,10 +924,17 @@ func (c *collection) Drop(ctx context.Context) error {
 			return err
 		}
 		for _, info := range idxInfos {
-			nsName := indexNsName(c.name, info.Name)
-			if err = tx.DeleteNamespace(nsName); err != nil {
-				if !errors.Is(err, btree.ErrNamespaceNotFound) {
-					return
+			var nsNames []string
+			if isFulltext(info) {
+				nsNames = ftsIndexNames(c.name, info.Name)
+			} else {
+				nsNames = []string{indexNsName(c.name, info.Name)}
+			}
+			for _, nsName := range nsNames {
+				if err = tx.DeleteNamespace(nsName); err != nil {
+					if !errors.Is(err, btree.ErrNamespaceNotFound) {
+						return
+					}
 				}
 			}
 		}

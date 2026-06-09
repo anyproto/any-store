@@ -909,6 +909,10 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 			Name:   v.GetString("name"),
 			Sparse: v.GetBool("sparse"),
 			Unique: v.GetBool("unique"),
+			Kind:   IndexKind(v.GetInt("kind")),
+		}
+		if info.Kind == IndexKindFulltext {
+			info.Fulltext = &FulltextParams{}
 		}
 		for _, fv := range v.GetArray("fields") {
 			info.Fields = append(info.Fields, string(fv.GetStringBytes()))
@@ -933,6 +937,9 @@ func indexDefMatches(persisted []byte, info IndexInfo) bool {
 		return false
 	}
 	if v.GetBool("unique") != info.Unique || v.GetBool("sparse") != info.Sparse {
+		return false
+	}
+	if IndexKind(v.GetInt("kind")) != info.Kind {
 		return false
 	}
 	fields := v.GetArray("fields")
@@ -977,6 +984,9 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 	}
 	if info.Unique {
 		obj.Set("unique", a.NewTrue())
+	}
+	if info.Kind != IndexKindRange {
+		obj.Set("kind", a.NewNumberInt(int(info.Kind)))
 	}
 	return tx.Put(db.systemNS, key, obj.MarshalTo(nil))
 }

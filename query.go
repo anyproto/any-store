@@ -126,6 +126,15 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		return &emptyIter{}, nil
 	}
 
+	// $text routes to the full-text scan, which drives the query (the CBO is
+	// bypassed: a $text predicate must always be the driver).
+	if text, hasText, terr := findTextFilter(q.cond); terr != nil {
+		qb.Close()
+		return nil, terr
+	} else if hasText {
+		return q.ftsIter(ctx, qb, text)
+	}
+
 	tx, err := q.c.db.getReadTx(ctx)
 	if err != nil {
 		qb.Close()
@@ -161,7 +170,58 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	}, nil
 }
 
+// ftsIter builds the full-text execution: a scan iterator yielding documents in
+// descending BM25 order, an optional residual FilterIter for any non-$text
+// predicates, and a LimitIter for offset/limit. It reuses planIterator for the
+// document-fetch / lifecycle plumbing.
+func (q *collQuery) ftsIter(ctx context.Context, qb *queryBuilder, text query.Text) (Iterator, error) {
+	fxs := q.c.loadFtsIndexes()
+	if len(fxs) == 0 {
+		qb.Close()
+		return nil, ErrNoFulltextIndex
+	}
+	fx := fxs[0]
+
+	tx, err := q.c.db.getReadTx(ctx)
+	if err != nil {
+		qb.Close()
+		return nil, err
+	}
+	btx := tx.btreeReadTx()
+	buf := q.c.db.syncPool.GetDocBuf()
+
+	hits, err := fx.search(btx, text.Search)
+	if err != nil {
+		q.c.db.syncPool.ReleaseDocBuf(buf)
+		_ = tx.Commit()
+		qb.Close()
+		return nil, err
+	}
+
+	dataCS := &qplanner.CursorSource{Tx: btx, Ns: q.c.ns}
+	plan := &qplanner.Plan{Name: "FtsScan", IndexName: fx.info.Name}
+	var root qplanner.Iterator = &ftsScanIter{hits: hits}
+	if condHasResidual(q.cond) {
+		root = &qplanner.FilterIter{Source: root, Data: dataCS, Filter: q.cond, Buf: buf, Plan: plan}
+	}
+	if q.limit > 0 || q.offset > 0 {
+		root = &qplanner.LimitIter{Source: root, Offset: int(q.offset), Limit: int(q.limit)}
+	}
+	plan.Root = root
+
+	return &planIterator{
+		plan: plan,
+		tx:   tx,
+		buf:  buf,
+		qb:   qb,
+		data: dataCS,
+	}, nil
+}
+
 func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResult, err error) {
+	if containsText(q.cond) {
+		return ModifyResult{}, ErrFulltextUnsupportedOp
+	}
 	mod, err := query.ParseModifier(modifier)
 	if err != nil {
 		return
@@ -299,6 +359,9 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 }
 
 func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error) {
+	if containsText(q.cond) {
+		return ModifyResult{}, ErrFulltextUnsupportedOp
+	}
 	qb, err := q.makeQuery()
 	if err != nil {
 		return
@@ -407,6 +470,30 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 		q.cond = query.All{}
 	}
 
+	// $text counts by iterating the full-text scan (respecting any residual
+	// predicate and offset/limit).
+	if text, hasText, terr := findTextFilter(q.cond); terr != nil {
+		return 0, terr
+	} else if hasText {
+		qb, qerr := q.makeQuery()
+		if qerr != nil {
+			return 0, qerr
+		}
+		iter, ierr := q.ftsIter(ctx, qb, text)
+		if ierr != nil {
+			return 0, ierr
+		}
+		defer func() {
+			if cerr := iter.Close(); cerr != nil && err == nil {
+				err = cerr
+			}
+		}()
+		for iter.Next() {
+			count++
+		}
+		return count, iter.Err()
+	}
+
 	// Fast path: filter provably matches no documents (e.g. $in:[]). Skip
 	// the planner, the read tx, and the index walk entirely — the answer
 	// is unconditionally zero. See isUnsatisfiable.
@@ -496,6 +583,9 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 }
 
 func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
+	if containsText(q.cond) {
+		return Explain{}, ErrFulltextUnsupportedOp
+	}
 	qb, err := q.makeQuery()
 	if err != nil {
 		return
