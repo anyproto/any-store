@@ -1,7 +1,6 @@
 package qplanner
 
 import (
-	"bytes"
 	"fmt"
 
 	"github.com/anyproto/any-store/v2/query"
@@ -14,8 +13,9 @@ type CoverIter struct {
 	IdxInfo *IndexInfo
 	Bounds  query.Bounds
 
-	idx    int
-	keyBuf []byte // reusable buffer for SeekKey results
+	idx     int
+	keyBuf  []byte // reusable buffer for SeekKey results
+	seekBuf []byte // reusable buffer for the padded seek key (inverted tail)
 
 	multiKeyProbed bool // lazy: probe runs on the first Next when len(Bounds) > 1
 	hasMultiKey    bool
@@ -51,12 +51,26 @@ func (it *CoverIter) Next() (key []byte, docId []byte, multiKey bool, err error)
 			continue
 		}
 
+		// Escape-aware lookup: a bare HasPrefix would also accept a key whose
+		// last field value extends b.Start's value with an escaped NUL ("a" vs
+		// "a\x00b"), returning a doc with the WRONG field value. For an
+		// inverted tail field those continuation keys (prefix+0x00...) also
+		// sort BEFORE the real match (prefix+tag, tag >= 0x01), so the seek
+		// starts at prefix+0x01 to hop over them; the ascending continuations
+		// (prefix+0xFF...) sort after every real match and need no hop.
+		lastInverted := len(it.IdxInfo.Reverse) >= len(it.IdxInfo.FieldNames) &&
+			it.IdxInfo.Reverse[len(it.IdxInfo.FieldNames)-1]
+		seekStart := b.Start
+		if lastInverted {
+			it.seekBuf = append(append(it.seekBuf[:0], b.Start...), 0x01)
+			seekStart = it.seekBuf
+		}
 		var kerr error
-		it.keyBuf, kerr = it.Source.AppendSeekKey(b.Start, it.keyBuf[:0])
+		it.keyBuf, kerr = it.Source.AppendSeekKey(seekStart, it.keyBuf[:0])
 		if kerr != nil {
 			continue // key not found
 		}
-		if !bytes.HasPrefix(it.keyBuf, b.Start) {
+		if !HasExactFieldPrefix(it.keyBuf, b.Start, lastInverted) {
 			continue
 		}
 		docID := extractDocId(it.keyBuf, len(it.IdxInfo.FieldNames))
