@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/simd"
 )
 
 const (
@@ -81,7 +82,8 @@ func BenchmarkVindexSelectNeighbors(b *testing.B) {
 
 // BenchmarkVindexVecDist isolates per-vector "read+distance" cost for the tier:
 // f32 (zero-copy + SIMD distance) vs int8 (dequant + SIMD distance), at dim768.
-// The gap is the dequant scalar loop — what an int8 SIMD kernel would remove.
+// The int8 gap here is the dequant scalar loop; BenchmarkVindexInt8Dist shows
+// the byte kernel removing it (int8 distance drops to f32 speed).
 func BenchmarkVindexVecDist(b *testing.B) {
 	const dim = 768
 	q := randVecs(1, dim, 1)[0]
@@ -106,6 +108,42 @@ func BenchmarkVindexVecDist(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			fv, _ := decodeVecInto(i8rec, dim, QuantInt8, dst)
 			sink += df(q, fv)
+		}
+		_ = sink
+	})
+}
+
+// BenchmarkVindexInt8Dist isolates the int8 query→stored distance for a cosine
+// index: the old path dequantizes the stored int8 to float32 then dots, the new
+// path runs the SIMD float×byte kernel straight on the offset-binary bytes (the
+// scale/bias correction folds in at the end). The gap is the dequant loop the
+// byte kernel removes.
+func BenchmarkVindexInt8Dist(b *testing.B) {
+	const dim = 768
+	q := normalizeInto(nil, randVecs(1, dim, 1)[0])
+	v := normalizeInto(nil, randVecs(1, dim, 2)[0])
+	i8rec := encodeVec(nil, v, QuantInt8)
+	scale, comps, _ := int8ScaleBytes(i8rec, dim)
+	dst := make([]float32, dim)
+	var qsum float32
+	for _, x := range q {
+		qsum += x
+	}
+
+	b.Run("dequant+dot", func(b *testing.B) {
+		b.ReportAllocs()
+		var sink float32
+		for i := 0; i < b.N; i++ {
+			fv, _ := decodeVecInto(i8rec, dim, QuantInt8, dst)
+			sink += 1 - simd.Dot(q, fv)
+		}
+		_ = sink
+	})
+	b.Run("byte-kernel", func(b *testing.B) {
+		b.ReportAllocs()
+		var sink float32
+		for i := 0; i < b.N; i++ {
+			sink += 1 - scale*(simd.DotFloatByte(q, comps)-int8Bias*qsum)
 		}
 		_ = sink
 	})

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/viterin/vek/vek32"
+	"github.com/anyproto/any-store/v2/internal/simd"
 )
 
 // readF32 / readI32 mirror the ASV_VBENCH export format used by
@@ -210,7 +210,7 @@ func bruteTopK(vecs [][]float32, q []float32, k int) []int {
 	}
 	all := make([]p, len(vecs))
 	for i := range vecs {
-		all[i] = p{i, vek32.Distance(q, vecs[i])}
+		all[i] = p{i, simd.Distance(q, vecs[i])}
 	}
 	partialSortByDist(all, func(x p) float32 { return x.d }, k)
 	out := make([]int, 0, k)

@@ -3,7 +3,7 @@ package vivf
 import (
 	"slices"
 
-	"github.com/viterin/vek/vek32"
+	"github.com/anyproto/any-store/v2/internal/simd"
 )
 
 // normalize returns a unit-length copy of v (zero vector copied through).
@@ -14,17 +14,7 @@ func normalize(v []float32) []float32 {
 // normalizeInto writes the unit-normalized v into dst (reusing dst's capacity) and
 // returns it — the alloc-free form for the pooled search path.
 func normalizeInto(dst, v []float32) []float32 {
-	if cap(dst) < len(v) {
-		dst = make([]float32, len(v))
-	} else {
-		dst = dst[:len(v)]
-	}
-	n := vek32.Norm(v)
-	if n == 0 {
-		copy(dst, v)
-		return dst
-	}
-	return vek32.MulNumber_Into(dst, v, 1/n)
+	return simd.NormalizeInto(dst, v)
 }
 
 // sqL2 is the scalar squared-L2 distance, used for the small PQ subspaces (dim
@@ -40,7 +30,7 @@ func sqL2(a, b []float32) float32 {
 
 // sqNorm is the squared L2 norm of v (SIMD dot with itself).
 func sqNorm(v []float32) float32 {
-	return vek32.Dot(v, v)
+	return simd.Dot(v, v)
 }
 
 // dotSmall / sqNormSmall are scalar dot and squared-norm for the small PQ subspaces
@@ -84,7 +74,7 @@ func topNCells(q []float32, coarse [][]float32, n int) []int {
 	}
 	cs := make([]cd, len(coarse))
 	for i, c := range coarse {
-		cs[i] = cd{i, vek32.Distance(q, c)}
+		cs[i] = cd{i, simd.Distance(q, c)}
 	}
 	slices.SortFunc(cs, func(a, b cd) int { return cmpF32(a.dist, b.dist) })
 	if n > len(cs) {

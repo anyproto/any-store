@@ -5,11 +5,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"sync"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
-	"github.com/viterin/vek/vek32"
+	"github.com/anyproto/any-store/v2/internal/simd"
 )
 
 // Candidate is one search result: the document id and its distance to the query
@@ -59,6 +60,11 @@ type StoreIndex struct {
 	normalize                           bool
 	int8vec                             bool // :vec re-rank store is int8-quantized
 	sq                                  bool // IVF-SQ: :cell holds int8 full vectors, scanned directly
+
+	// byteDist enables the SIMD float×byte distance on the read path: int8
+	// candidates are scored straight from their stored bytes (no dequant). Set
+	// when int8vec storage is on and a byte kernel is available for this CPU.
+	byteDist bool
 
 	// coarse and pqcb are the RAM-resident codebooks, each held as ONE flat,
 	// contiguous float32 view of its :cb blob (an arena) rather than nested slices:
@@ -151,6 +157,12 @@ type searcher struct {
 	vbuf    []byte    // reused :vec read buffer (re-rank)
 	vbufF32 []float32 // reused dequant target for int8 :vec (re-rank)
 	dbuf    []byte    // reused :lbl (docID) read buffer (re-rank)
+
+	// byteDist mirrors StoreIndex.byteDist for this (read-only) search; qsum=Σq
+	// and qnorm2=‖q‖² are the per-query terms of the offset-binary byte distance.
+	byteDist bool
+	qsum     float32
+	qnorm2   float32
 }
 
 // pqSub returns the dsub-length codeword j of PQ sub-quantizer mm (a view into the
@@ -175,7 +187,7 @@ func (ix *StoreIndex) nearestCellsInto(q []float32, n int, scratch *[]cellDist, 
 		cd = cd[:ix.nlist]
 	}
 	for c := 0; c < ix.nlist; c++ {
-		cd[c] = cellDist{c, vek32.Distance(q, ix.coarseRow(c))}
+		cd[c] = cellDist{c, simd.Distance(q, ix.coarseRow(c))}
 	}
 	slices.SortFunc(cd, func(a, b cellDist) int { return cmpF32(a.dist, b.dist) })
 	if n > ix.nlist {
@@ -228,6 +240,7 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 	}
 	p.withDefaults()
 	ix := &StoreIndex{dim: p.Dim, nlist: p.NList, m: p.M, dsub: p.Dim / p.M, nprobe: p.NProbe, assign: p.Assign, normalize: p.Normalize, int8vec: p.Int8 || p.SQ, sq: p.SQ, precompMiB: p.PrecompMiB}
+	ix.byteDist = ix.int8vec && simd.AcceleratedFloatByte()
 
 	names := storeNsNames(prefix)
 	ns := make([]*btree.Namespace, len(names))
@@ -289,15 +302,15 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 		}
 		for ci, c := range cells {
 			if ci == 0 {
-				vek32.Sub_Into(r, x, ix.coarseRow(c))
+				simd.Sub_Into(r, x, ix.coarseRow(c))
 				reconSum += float64(sqNorm(r)) // nearest-cell residual = drift baseline
 			}
 			keyBuf = cellKey(keyBuf, uint32(c), label)
 			if ix.sq {
-				codeBuf = encodeVecInt8(codeBuf, x) // int8 full vector
+				codeBuf = encodeVecInt8(codeBuf, x, !ix.normalize) // int8 full vector
 			} else {
 				if ci != 0 {
-					vek32.Sub_Into(r, x, ix.coarseRow(c))
+					simd.Sub_Into(r, x, ix.coarseRow(c))
 				}
 				codeBuf = encodeResidualInto(codeBuf, r, ix)
 			}
@@ -358,7 +371,7 @@ func (ix *StoreIndex) writeVecRecords(wtx *btree.WriteTx, label uint32, docID []
 	if !ix.sq {
 		var vb []byte
 		if ix.int8vec {
-			*enc = encodeVecInt8((*enc)[:0], x)
+			*enc = encodeVecInt8((*enc)[:0], x, !ix.normalize)
 			vb = *enc
 		} else {
 			vb = f32bytes(x)
@@ -424,6 +437,7 @@ func OpenTx(rtx *btree.ReadTx, prefix string) (*StoreIndex, error) {
 	ix.precompMiB = mt.precompMiB
 	ix.int8vec = mt.int8vec
 	ix.sq = mt.sq
+	ix.byteDist = ix.int8vec && simd.AcceleratedFloatByte()
 
 	cb, err := rtx.Get(ix.vcb, coarseKey)
 	if err != nil {
@@ -579,7 +593,7 @@ func Rebuild(wtx *btree.WriteTx, prefix string) (*StoreIndex, error) {
 		ids = append(ids, docID) // rtx.Get returns an owned copy
 		v := make([]float32, old.dim)
 		if old.int8vec {
-			decodeVecInt8(vb, old.dim, v)
+			decodeVecInt8(vb, old.dim, !old.normalize, v)
 		} else {
 			copy(v, bytesAsF32(vb, old.dim))
 		}
@@ -630,6 +644,19 @@ func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) (
 	if ix.normalize {
 		s.normBuf = normalizeInto(s.normBuf, q)
 		qn = s.normBuf
+	}
+	// Per-query terms for the int8 byte-kernel distance (read-only path): Σqn for
+	// the offset-binary correction, and ‖qn‖² for L2's squared-distance expansion.
+	s.byteDist = ix.byteDist
+	if s.byteDist {
+		var sum float32
+		for _, x := range qn {
+			sum += x
+		}
+		s.qsum = sum
+		if !ix.normalize {
+			s.qnorm2 = simd.Dot(qn, qn)
+		}
 	}
 	s.cells = ix.nearestCellsInto(qn, ix.nprobe, &s.cd, s.cells)
 
@@ -688,14 +715,22 @@ func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) (
 				return nil, err
 			}
 			s.vbuf = vb
-			var x []float32
-			if ix.int8vec {
-				s.vbufF32 = ensureF32(s.vbufF32, ix.dim)
-				x = decodeVecInt8(vb, ix.dim, s.vbufF32)
+			if s.byteDist { // int8vec re-rank straight from the bytes (no dequant)
+				scale, sqnorm, comps, ok := int8Split(vb, ix.dim, !ix.normalize)
+				if !ok {
+					return nil, fmt.Errorf("vivf: bad int8 vec record len %d", len(vb))
+				}
+				dist = ix.distBytes(qn, scale, sqnorm, comps, s.qsum, s.qnorm2)
 			} else {
-				x = bytesAsF32(vb, ix.dim)
+				var x []float32
+				if ix.int8vec {
+					s.vbufF32 = ensureF32(s.vbufF32, ix.dim)
+					x = decodeVecInt8(vb, ix.dim, !ix.normalize, s.vbufF32)
+				} else {
+					x = bytesAsF32(vb, ix.dim)
+				}
+				dist = ix.exactDist(qn, x)
 			}
-			dist = ix.exactDist(qn, x)
 		}
 		docID, err := rtx.AppendValue(ix.vlbl, lk[:], s.dbuf[:0])
 		if err != nil {
@@ -780,9 +815,29 @@ func ensureF32(buf []float32, n int) []float32 {
 // normalized index, L2 otherwise — matching the metric the DB exposes as _distance.
 func (ix *StoreIndex) exactDist(qn, x []float32) float32 {
 	if ix.normalize {
-		return 1 - vek32.Dot(qn, x)
+		return 1 - simd.Dot(qn, x)
 	}
-	return vek32.Distance(qn, x)
+	return simd.Distance(qn, x)
+}
+
+// distBytes is exactDist computed straight from an int8 record's offset-binary
+// bytes via the SIMD float×byte kernel — no dequant. comps are the dim component
+// bytes, sqnorm = ‖x‖² (L2 only), and qsum=Σqn / qnorm2=‖qn‖² are the per-query
+// terms. Returns the SAME distance as exactDist(qn, decode(record)).
+//
+//	d = dot(qn, x) = scale·(DotFloatByte(qn, comps) − 128·Σqn)
+//	cosine: 1 − d         (stored x is unit length)
+//	L2:     sqrt(max(0, ‖qn‖² + ‖x‖² − 2·d))
+func (ix *StoreIndex) distBytes(qn []float32, scale, sqnorm float32, comps []byte, qsum, qnorm2 float32) float32 {
+	d := scale * (simd.DotFloatByte(qn, comps) - int8Bias*qsum)
+	if ix.normalize {
+		return 1 - d
+	}
+	v := qnorm2 + sqnorm - 2*d
+	if v < 0 {
+		v = 0 // float roundoff when qn ≈ x; ‖q−x‖² is never truly negative
+	}
+	return float32(math.Sqrt(float64(v)))
 }
 
 // scanCellsSQ scores every member of the probed cells by EXACT distance on its
@@ -811,7 +866,16 @@ func (ix *StoreIndex) scanCellsSQ(s *searcher, cur *btree.Cursor, qn []float32) 
 			if err != nil {
 				return err
 			}
-			d := ix.exactDist(qn, decodeVecInt8(val, ix.dim, s.vbufF32))
+			var d float32
+			if s.byteDist {
+				scale, sqnorm, comps, ok := int8Split(val, ix.dim, !ix.normalize)
+				if !ok {
+					return fmt.Errorf("vivf: bad int8 cell record len %d", len(val))
+				}
+				d = ix.distBytes(qn, scale, sqnorm, comps, s.qsum, s.qnorm2)
+			} else {
+				d = ix.exactDist(qn, decodeVecInt8(val, ix.dim, !ix.normalize, s.vbufF32))
+			}
 			s.dedup.putMin(cellKeyLabel(key), d)
 			if err := cur.Next(); err != nil {
 				return err
@@ -843,7 +907,7 @@ func (ix *StoreIndex) scanCellsPQ(s *searcher, cur *btree.Cursor, qn []float32) 
 				s.lut[k] = pc[k] + s.qlut[k]
 			}
 		} else {
-			vek32.Sub_Into(s.qr, qn, ix.coarseRow(c))
+			simd.Sub_Into(s.qr, qn, ix.coarseRow(c))
 			ix.buildLUT(s.qr, s.lut)
 		}
 		binary.BigEndian.PutUint32(seek[0:], uint32(c))
@@ -933,17 +997,17 @@ func (ix *StoreIndex) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) er
 	r := make([]float32, ix.dim)
 	for ci, c := range cells {
 		if ci == 0 {
-			vek32.Sub_Into(r, x, ix.coarseRow(c))
+			simd.Sub_Into(r, x, ix.coarseRow(c))
 			// Track how well the frozen centroids fit this new vector (drift signal).
 			mt.driftSum += float64(sqNorm(r))
 			mt.driftN++
 		}
 		keyBuf = cellKey(keyBuf, uint32(c), label)
 		if ix.sq {
-			codeBuf = encodeVecInt8(codeBuf, x) // int8 full vector
+			codeBuf = encodeVecInt8(codeBuf, x, !ix.normalize) // int8 full vector
 		} else {
 			if ci != 0 {
-				vek32.Sub_Into(r, x, ix.coarseRow(c))
+				simd.Sub_Into(r, x, ix.coarseRow(c))
 			}
 			codeBuf = encodeResidualInto(codeBuf, r, ix)
 		}

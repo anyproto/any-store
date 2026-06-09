@@ -37,6 +37,16 @@ func (ix *Index) SearchCandidates(rtx *btree.ReadTx, query []float32, ef int) ([
 		s.normBuf = normalizeInto(s.normBuf, query)
 		s.query = s.normBuf
 	}
+	// Enable the int8 byte-kernel distance for this (read-only) search and
+	// precompute Σquery, the offset-binary correction term. Never set on Insert.
+	if ix.distInt8 != nil {
+		s.byteDistOn = true
+		var sum float32
+		for _, x := range s.query {
+			sum += x
+		}
+		s.qsum = sum
+	}
 	s.checkDeleted = mt.deletedCount > 0
 	if ix.hybrid {
 		if s.l0, err = ix.layer0Mirror(rtx, mt); err != nil {
@@ -99,12 +109,19 @@ type searcher struct {
 	tierData   []byte
 	tierStride int
 
-	vbuf  []byte
-	vf    []float32 // aliases vbuf — vector A (reused each read)
-	vbuf2 []byte
-	vf2   []float32 // aliases vbuf2 — vector B (held during pairwise prune)
-	qbuf  []byte    // quantized-record read buffer for vf (int8 mode)
-	qbuf2 []byte    // quantized-record read buffer for vf2 (int8 mode)
+	vbuf   []byte
+	vf     []float32 // aliases vbuf — vector A (reused each read)
+	vbuf2  []byte
+	vf2    []float32 // aliases vbuf2 — vector B (held during pairwise prune)
+	qbuf   []byte    // quantized-record read buffer for vf (int8 mode)
+	qbuf2  []byte    // quantized-record read buffer for vf2 (int8 mode)
+	recBuf []byte    // raw int8 record buffer for the byte-kernel distance path
+
+	// byteDistOn enables the int8 byte-kernel query distance (set only on the
+	// read/Search path, never during Insert, so builds stay on the float path).
+	// qsum is Σ of the query components — the offset-binary correction term.
+	byteDistOn bool
+	qsum       float32
 
 	// normBuf holds the unit-normalized query for a Cosine index (the stored
 	// vectors are normalized too, so distance is a dot product). Reused per op.
@@ -126,7 +143,7 @@ type searcher struct {
 
 	// write-path scratch reused by addNeighbor (insert connect phase, which runs
 	// after searchLayer so these don't overlap with the read buffers above).
-	naKey [4]byte    // neighbour key buffer (field of the pooled searcher so the
+	naKey [4]byte // neighbour key buffer (field of the pooled searcher so the
 	//                  big-endian label key handed to the btree doesn't heap-escape
 	//                  per addNeighbor call)
 	naAdj []byte     // a's adjacency record read buffer
@@ -179,6 +196,46 @@ func (ix *Index) newSearcher(rtx *btree.ReadTx, query []float32) *searcher {
 		vf2:   vf2,
 		vbuf2: f32bytes(vf2),
 	}
+}
+
+// distToQuery returns the distance from the (fixed) query to label's stored
+// vector. For an eligible int8 read search it uses the SIMD byte kernel straight
+// on the stored bytes (no dequant); otherwise it decodes to float32 and applies
+// the metric's distance function. Both produce the same ranking.
+func (s *searcher) distToQuery(label uint32) (float32, error) {
+	if s.byteDistOn {
+		rec, err := s.rawRecOf(label)
+		if err != nil {
+			return 0, err
+		}
+		scale, comps, ok := int8ScaleBytes(rec, s.ix.dim)
+		if !ok {
+			return 0, fmt.Errorf("vindex: bad quantized vector record len %d", len(rec))
+		}
+		return s.ix.distInt8(s.query, scale, comps, s.qsum), nil
+	}
+	v, err := s.vecOf(label)
+	if err != nil {
+		return 0, err
+	}
+	return s.ix.dist(s.query, v), nil
+}
+
+// rawRecOf returns label's raw stored record ([scale][offset-binary comps]),
+// from the RAM vector tier when present else the btree (into recBuf). The slice
+// is valid until the next rawRecOf call; distInt8 consumes it immediately.
+func (s *searcher) rawRecOf(label uint32) ([]byte, error) {
+	if s.tierData != nil {
+		off := int(label) * s.tierStride
+		return s.tierData[off : off+s.tierStride], nil
+	}
+	s.keyBuf = labelKey(s.keyBuf, label)
+	rec, err := s.rtx.AppendValue(s.ix.vvec, s.keyBuf, s.recBuf[:0])
+	if err != nil {
+		return nil, err
+	}
+	s.recBuf = rec
+	return rec, nil
 }
 
 // vecOf reads label's vector into the primary scratch (valid until the next
@@ -397,11 +454,10 @@ func insertionSortCands(c []candidate) {
 // greedyClosest walks one layer toward the query, returning the closest label.
 func (s *searcher) greedyClosest(ep uint32, layer int32) (uint32, error) {
 	best := ep
-	bv, err := s.vecOf(best)
+	bestDist, err := s.distToQuery(best)
 	if err != nil {
 		return 0, err
 	}
-	bestDist := s.ix.dist(s.query, bv)
 	for {
 		adjB, err := s.adjBytesOf(best)
 		if err != nil {
@@ -413,11 +469,11 @@ func (s *searcher) greedyClosest(ep uint32, layer int32) (uint32, error) {
 		}
 		improved := false
 		for _, nb := range s.nbrs {
-			nv, err := s.vecOf(nb)
+			d, err := s.distToQuery(nb)
 			if err != nil {
 				return 0, err
 			}
-			if d := s.ix.dist(s.query, nv); d < bestDist {
+			if d < bestDist {
 				bestDist, best, improved = d, nb, true
 			}
 		}
@@ -435,11 +491,10 @@ func (s *searcher) searchLayer(ep uint32, ef int, layer int32) ([]candidate, err
 	s.cand.reset(false)
 	s.res.reset(true)
 
-	ev, err := s.vecOf(ep)
+	d0, err := s.distToQuery(ep)
 	if err != nil {
 		return nil, err
 	}
-	d0 := s.ix.dist(s.query, ev)
 	s.visited.visit(ep)
 	s.cand.push(candidate{d0, ep})
 	epDel := false
@@ -467,11 +522,10 @@ func (s *searcher) searchLayer(ep uint32, ef int, layer int32) ([]candidate, err
 			if !s.visited.visit(nb) {
 				continue // already seen
 			}
-			nv, err := s.vecOf(nb)
+			d, err := s.distToQuery(nb)
 			if err != nil {
 				return nil, err
 			}
-			d := s.ix.dist(s.query, nv)
 			if s.res.len() >= ef && d >= s.res.peek().dist {
 				continue
 			}

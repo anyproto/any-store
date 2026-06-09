@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/simd"
 )
 
 // Namespace suffixes appended to the index prefix.
@@ -70,6 +71,14 @@ type Index struct {
 
 	dist DistanceFunc
 
+	// distInt8 is the byte-kernel distance from a float32 query to a stored
+	// offset-binary int8 record, for the dot-based metrics (Cosine, Dot). It uses
+	// the SIMD float×byte kernel and skips dequantization. nil when not eligible
+	// (non-int8 storage, L2 metric, or no SIMD byte kernel); callers then fall
+	// back to decode+dist. scale/comps come from the record; qsum is the
+	// precomputed Σ of the query components (the offset-binary correction term).
+	distInt8 func(q []float32, scale float32, comps []byte, qsum float32) float32
+
 	// normalize is set for the Cosine metric: vectors are unit-normalized on write
 	// and queries on read, so dist is the dot-product cosine kernel
 	// (cosineDotDistance) — same distance values, cheaper than recomputing norms.
@@ -122,7 +131,8 @@ func (ix *Index) putSearcher(s *searcher) {
 	s.query = nil
 	s.l0 = nil
 	s.tierData = nil
-	s.vcacheOn = false // read path must not reuse the insert cache
+	s.vcacheOn = false   // read path must not reuse the insert cache
+	s.byteDistOn = false // and the next op re-decides byte-kernel eligibility
 	ix.scratch.Put(s)
 }
 
@@ -231,6 +241,23 @@ func newIndex(ns [5]*btree.Namespace, dim, m, m0, efC, efS int, ml float64, metr
 		// a dot product instead of a cosine (which recomputes both norms per call).
 		ix.normalize = true
 		ix.dist = cosineDotDistance
+	}
+	// For int8 storage on a dot-based metric, the byte kernel can compute the
+	// query→stored distance straight from the stored bytes (no dequant). The
+	// offset-binary identity is dot(q, scale·(comps−bias)) = scale·(Σq·comps −
+	// bias·Σq), so both metrics share one signed-dot term and differ only in the
+	// final transform. L2 does not factor this way, so it keeps decode+dist.
+	if quant == QuantInt8 && simd.AcceleratedFloatByte() {
+		switch metric {
+		case Cosine:
+			ix.distInt8 = func(q []float32, scale float32, comps []byte, qsum float32) float32 {
+				return 1 - scale*(simd.DotFloatByte(q, comps)-int8Bias*qsum)
+			}
+		case Dot:
+			ix.distInt8 = func(q []float32, scale float32, comps []byte, qsum float32) float32 {
+				return -scale * (simd.DotFloatByte(q, comps) - int8Bias*qsum)
+			}
+		}
 	}
 	return ix
 }

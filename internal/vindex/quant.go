@@ -37,9 +37,21 @@ func vecRecordSize(dim int, q Quantization) int {
 	return dim * 4
 }
 
+// int8Bias is the offset-binary bias: a quantized component q ∈ [-127,127] is
+// stored as the unsigned byte q+128 ∈ [1,255]. Offset-binary (rather than signed
+// two's-complement) lets the UNSIGNED SIMD float×byte kernel compute the signed
+// dot via scale·(DotFloatByte(query,u) − bias·Σquery); see internal/simd. The
+// format has no on-disk back-compat constraint yet.
+//
+// Adding 128 mod 256 is exactly flipping the sign bit, so encode is the XOR
+// `byte(q) ^ 0x80` (cheaper and self-evidently reversible) and decode subtracts
+// the bias back off — the two are inverse on the full byte range.
+const int8Bias = 128
+
 // encodeVec appends v's storage bytes to buf (reusing it) and returns the slice.
 // For QuantNone it is the raw float32 byte view; for QuantInt8 it is
-// [scale float32 LE][dim int8] using a per-vector symmetric scale.
+// [scale float32 LE][dim uint8] using a per-vector symmetric scale and
+// offset-binary components (component q stored as byte q+int8Bias).
 func encodeVec(buf []byte, v []float32, q Quantization) []byte {
 	if q != QuantInt8 {
 		return append(buf[:0], f32bytes(v)...)
@@ -59,7 +71,11 @@ func encodeVec(buf []byte, v []float32, q Quantization) []byte {
 	binary.LittleEndian.PutUint32(sb[:], math.Float32bits(scale))
 	buf = append(buf, sb[:]...)
 	if maxAbs == 0 {
-		return append(buf, make([]byte, len(v))...) // zero vector
+		// zero vector: q=0 -> byte 0x80 (decode yields 0; scale is 0 anyway).
+		for range v {
+			buf = append(buf, 0x80)
+		}
+		return buf
 	}
 	inv := 127 / maxAbs
 	for _, x := range v {
@@ -69,7 +85,7 @@ func encodeVec(buf []byte, v []float32, q Quantization) []byte {
 		} else if qi < -127 {
 			qi = -127
 		}
-		buf = append(buf, byte(int8(qi)))
+		buf = append(buf, byte(qi)^0x80) // offset-binary via sign-bit flip
 	}
 	return buf
 }
@@ -88,7 +104,18 @@ func decodeVecInto(data []byte, dim int, q Quantization, dst []float32) ([]float
 	scale := math.Float32frombits(binary.LittleEndian.Uint32(data[:4]))
 	qb := data[4:]
 	for i := 0; i < dim; i++ {
-		dst[i] = float32(int8(qb[i])) * scale
+		dst[i] = (float32(qb[i]) - int8Bias) * scale
 	}
 	return dst, true
+}
+
+// int8ScaleBytes splits a QuantInt8 record into its scale and the offset-binary
+// component bytes (length dim). Used by the byte-kernel distance path, which
+// reads the stored bytes directly instead of dequantizing to float32.
+func int8ScaleBytes(data []byte, dim int) (scale float32, comps []byte, ok bool) {
+	if len(data) < 4+dim {
+		return 0, nil, false
+	}
+	scale = math.Float32frombits(binary.LittleEndian.Uint32(data[:4]))
+	return scale, data[4 : 4+dim], true
 }

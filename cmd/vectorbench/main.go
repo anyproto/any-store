@@ -49,7 +49,7 @@ func main() {
 	fmt.Println(" any-store vectorbench")
 	fmt.Println(hr)
 	fmt.Printf(" go=%s  os/arch=%s/%s  cpus=%d\n", runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.NumCPU())
-	fmt.Printf(" SIMD distance acceleration (vek): %v\n", vector.SIMD())
+	fmt.Printf(" SIMD distance acceleration (asm): %v\n", vector.SIMD())
 	fmt.Printf(" config: n=%d dim=%d metric=%s ef=%d k=%d queries=%d\n", *n, *dim, m, *ef, *k, *queries)
 	fmt.Println(hr)
 

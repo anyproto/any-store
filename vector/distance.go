@@ -25,7 +25,7 @@ package vector
 import (
 	"math"
 
-	"github.com/viterin/vek/vek32"
+	"github.com/anyproto/any-store/v2/internal/simd"
 )
 
 // Metric selects how the distance between two vectors is measured.
@@ -47,35 +47,22 @@ const (
 // Smaller means closer for every metric exposed here.
 type DistanceFunc func(a, b []float32) float32
 
-// SIMD reports whether vek selected a vectorised (AVX2/AVX-512) kernel on this
-// CPU. When false, vek still works but falls back to portable Go.
-func SIMD() bool { return vek32.Info().Acceleration }
-
-// simdActive caches whether vek selected a vectorised kernel (vek is amd64-only,
-// so this is false on arm64 and any non-AVX2 x86 — see CROSS_HARDWARE.md).
-var simdActive = SIMD()
+// SIMD reports whether a hand-written SIMD kernel was selected for this CPU.
+// When false, the simd package transparently uses a pure-Go fallback.
+func SIMD() bool { return simd.Accelerated() }
 
 // DistanceFor returns the best available distance function for the metric on
-// this CPU. When vek has no SIMD kernel (arm64, or x86 without AVX2+FMA) its
-// L2 fallback is slower than our hand-unrolled scalar loop (measured 685 vs
-// 608 ns on an Ivy Bridge Xeon), so we dispatch L2 to the unrolled kernel. The
-// real fix for ARM is a NEON kernel; see CROSS_HARDWARE.md.
+// this CPU. The simd package selects a SIMD or pure-Go kernel internally (the
+// pure-Go L2 is the hand-unrolled loop that beats vek's old fallback on no-AVX2
+// x86), so there is nothing CPU-specific to branch on here.
 func (m Metric) DistanceFor() DistanceFunc {
 	switch m {
-	case L2:
-		if simdActive {
-			return L2DistanceSIMD
-		}
-		return L2DistanceUnrolled
 	case Cosine:
 		return CosineDistanceSIMD
 	case Dot:
 		return DotDistanceSIMD
 	default:
-		if simdActive {
-			return L2DistanceSIMD
-		}
-		return L2DistanceUnrolled
+		return L2DistanceSIMD
 	}
 }
 
@@ -98,17 +85,17 @@ func (m Metric) String() string {
 
 // L2DistanceSIMD returns the Euclidean distance using vectorised kernels.
 func L2DistanceSIMD(a, b []float32) float32 {
-	return vek32.Distance(a, b)
+	return simd.Distance(a, b)
 }
 
 // CosineDistanceSIMD mirrors coder/hnsw's CosineDistance: 1 - cosineSimilarity.
 func CosineDistanceSIMD(a, b []float32) float32 {
-	return 1 - vek32.CosineSimilarity(a, b)
+	return 1 - simd.CosineSimilarity(a, b)
 }
 
 // DotDistanceSIMD returns the negated inner product (smaller = closer).
 func DotDistanceSIMD(a, b []float32) float32 {
-	return -vek32.Dot(a, b)
+	return -simd.Dot(a, b)
 }
 
 // ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/viterin/vek/vek32"
+	"github.com/anyproto/any-store/v2/internal/simd"
 )
 
 // Params configures an IVF-PQ index. Dim must be divisible by M.
@@ -75,7 +75,7 @@ func Train(vecs [][]float32, p Params) *Index {
 	r := make([]float32, ix.dim)
 	for i, x := range ix.norm {
 		for _, c := range topNCells(x, ix.coarse, p.Assign) {
-			vek32.Sub_Into(r, x, ix.coarse[c])
+			simd.Sub_Into(r, x, ix.coarse[c])
 			ix.cells[c] = append(ix.cells[c], cellEntry{int32(i), ix.encode(r)})
 		}
 	}
@@ -97,7 +97,7 @@ func trainModel(norm [][]float32, p Params) (coarse [][]float32, pqcb [][][]floa
 	resid := make([][]float32, n)
 	for i, x := range norm {
 		r := make([]float32, dim)
-		vek32.Sub_Into(r, x, coarse[assign[i]])
+		simd.Sub_Into(r, x, coarse[assign[i]])
 		resid[i] = r
 	}
 
@@ -157,7 +157,7 @@ func (ix *Index) Search(q []float32, k, nprobe, kFactor int) []int {
 	lut := make([]float32, ix.m*pqK)
 	qr := make([]float32, ix.dim)
 	for _, c := range cells {
-		vek32.Sub_Into(qr, qn, ix.coarse[c]) // query residual for this cell
+		simd.Sub_Into(qr, qn, ix.coarse[c]) // query residual for this cell
 		ix.buildLUT(qr, lut)
 		for _, e := range ix.cells[c] {
 			d := adc(lut, e.code, ix.m)
@@ -184,7 +184,7 @@ func (ix *Index) Search(q []float32, k, nprobe, kFactor int) []int {
 		cands = cands[:rerankN]
 	}
 	for i := range cands {
-		cands[i].dist = vek32.Distance(qn, ix.norm[cands[i].label])
+		cands[i].dist = simd.Distance(qn, ix.norm[cands[i].label])
 	}
 	partialSortByDist(cands, func(c cand) float32 { return c.dist }, k)
 	if len(cands) > k {

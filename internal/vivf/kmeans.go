@@ -12,7 +12,7 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/viterin/vek/vek32"
+	"github.com/anyproto/any-store/v2/internal/simd"
 )
 
 // kmeans runs Lloyd's algorithm on data, returning k centroids and the per-point
@@ -107,7 +107,7 @@ func kmeansppInit(data [][]float32, k int, rng *rand.Rand) [][]float32 {
 				defer wg.Done()
 				var s float64
 				for i := lo; i < hi; i++ {
-					dist := float64(vek32.Distance(data[i], c))
+					dist := float64(simd.Distance(data[i], c))
 					dd := dist * dist
 					if dd < d2[i] {
 						d2[i] = dd
@@ -177,9 +177,9 @@ func assignNearest(data [][]float32, cents [][]float32, assign []int32) {
 // nearest returns the index of the centroid closest (L2) to x.
 func nearest(x []float32, cents [][]float32) int {
 	best := 0
-	bestD := vek32.Distance(x, cents[0])
+	bestD := simd.Distance(x, cents[0])
 	for c := 1; c < len(cents); c++ {
-		d := vek32.Distance(x, cents[c])
+		d := simd.Distance(x, cents[c])
 		if d < bestD {
 			bestD = d
 			best = c

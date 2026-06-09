@@ -6,3 +6,8 @@
 
 # generated mapping artifacts — produced by scripts/extract_funcs and scripts/build_mappings
 docs/btree/mappings/*.gen.json
+
+# IDE + build/test artifacts
+.idea/
+*.test
+/wasm/wasm
