@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
-	"slices"
 	"strconv"
 	"unsafe"
 
@@ -56,10 +55,6 @@ func (v *Value) Del(key string) {
 		return
 	}
 	if v.t == TypeArray {
-		idx, err := strconv.Atoi(key)
-		if err != nil || idx < 0 {
-			return
-		}
 		n, err := strconv.Atoi(key)
 		if err != nil || n < 0 || n >= len(v.a) {
 			return
@@ -277,7 +272,7 @@ func (v *Value) MarshalTo(dst []byte) []byte {
 		dst = append(dst, EOS)
 	case TypeString:
 		dst = append(dst, byte(TypeString))
-		dst = appendIgnoreEOS(dst, v.v...)
+		dst = appendEscaped(dst, v.v)
 		dst = append(dst, EOS)
 	case TypeNumber:
 		dst = append(dst, byte(TypeNumber))
@@ -310,7 +305,10 @@ func (v *Value) IsSizeBigger(n int) bool {
 	return v.estimateSize(n) > n
 }
 
-// estimateSize returns the marshaled size of v, but stops early once it exceeds limit.
+// estimateSize returns the marshaled size of v, but stops early once it exceeds
+// limit. Escape bytes (strings/keys containing EOS, keys with a reserved first
+// byte — see escape.go) are not counted, so the result is a lower bound; for the
+// compression-threshold heuristic an occasional underestimate is harmless.
 func (v *Value) estimateSize(limit int) int {
 	if v == nil {
 		return 1 // TypeNull
@@ -384,12 +382,7 @@ func (v *Value) MarshalCompressed(dst, scratch []byte) ([]byte, []byte) {
 func (v *Value) marshalObject(dst []byte) []byte {
 	dst = append(dst, byte(TypeObject))
 	for _, kv := range v.o.kvs {
-		if len(kv.key) == 0 {
-			dst = append(dst, emptyKey)
-		} else {
-			dst = appendIgnoreEOS(dst, s2b(kv.key)...)
-		}
-		dst = append(dst, EOS)
+		dst = appendEscapedKey(dst, kv.key)
 		dst = kv.value.MarshalTo(dst)
 	}
 	return append(dst, EOS)
@@ -482,12 +475,3 @@ func (v *Value) GoType() any {
 	}
 }
 
-func appendIgnoreEOS(slice []byte, elems ...byte) []byte {
-	slice = slices.Grow(slice, len(elems))
-	for i := range elems {
-		if elems[i] != EOS {
-			slice = append(slice, elems[i])
-		}
-	}
-	return slice
-}

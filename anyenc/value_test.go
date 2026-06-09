@@ -165,7 +165,10 @@ func TestValue_Del(t *testing.T) {
 	assert.Equal(t, `{"a":{"b":[1,3]}}`, val.String())
 }
 
-func TestValue_InvalidStrings(t *testing.T) {
+// EOS bytes inside strings and keys are escaped on marshal and restored on
+// parse — values round-trip unchanged (historically they were silently
+// stripped, which mutated data).
+func TestValue_StringsWithEOS(t *testing.T) {
 	a := &Arena{}
 	obj := a.NewObject()
 	key := "a" + string(EOS) + "b"
@@ -174,7 +177,13 @@ func TestValue_InvalidStrings(t *testing.T) {
 	data := obj.MarshalTo(nil)
 	dec, err := Parse(data)
 	require.NoError(t, err)
-	assert.Equal(t, `{"ab":"cd"}`, dec.String())
+	require.Equal(t, value, dec.GetString(key))
+	o, err := dec.Object()
+	require.NoError(t, err)
+	require.Equal(t, 1, o.Len())
+	o.Visit(func(k []byte, _ *Value) {
+		assert.Equal(t, key, string(k))
+	})
 }
 
 // TestValue_NilGuards covers the nil-receiver and invalid-state guards on

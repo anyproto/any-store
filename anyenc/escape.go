@@ -1,0 +1,128 @@
+package anyenc
+
+import "bytes"
+
+// String and object-key escaping.
+//
+// Strings and keys are EOS(0x00)-terminated so that encoded values stay
+// memcmp-orderable. A raw 0x00 inside the data would be read as the
+// terminator, so it is escaped as the pair (0x00, 0xFF). The scan is
+// unambiguous because the escape tail 0xFF never legally follows a true
+// terminator: after a string or key terminator comes a type tag
+// (0x01..0x0A normal, 0xF5..0xFE inverted), a container EOS, an
+// emptyKey-prefixed or non-0xFF-leading key byte (see below), or the end
+// of input. Order is preserved: "a" < "a\x00" < "a\x01b" ⇔
+// (61 00) < (61 00 FF 00) < (61 01 62 00).
+//
+// BACK-COMPATIBILITY: the historical encoder silently STRIPPED EOS bytes
+// from strings and keys, so existing stored data contains no escape pairs
+// and parses bit-identically under these rules; NUL-free values also
+// encode bit-identically, so old and new encodings interoperate inside
+// the same btree. The only data the new scan would misread is an object
+// key whose FIRST byte is 0xFF (never valid UTF-8) written by the old
+// encoder; new writes emptyKey-prefix such keys.
+//
+// CAVEAT (prefix overlap): the encoding of "a" is a byte-prefix of the
+// encoding of "a\x00b" — unavoidable while keeping the old single-byte
+// terminator. Whole-key comparisons stay correct (the escape pair sorts
+// exactly where the raw string would), but PREFIX-based index bounds must
+// account for escape continuations (0xFF after a complete ascending
+// encoding, 0x00 after an inverted one) — see qplanner bound padding.
+//
+// Object keys reserve their FIRST byte:
+//   - emptyKey (0x1F) alone encodes the empty key "";
+//   - a key whose first byte is 0x00 or 0xFF is prefixed with emptyKey.
+//     Decode strips the prefix only when the byte after it is 0x00 or
+//     0xFF — byte sequences the old encoder could never produce there —
+//     so old-format keys that genuinely START with 0x1F still decode
+//     verbatim. A key therefore never starts with EOS (keeps the
+//     end-of-object check unambiguous; a leading 0x00 would also invert
+//     to the inverted end-of-object 0xFF) nor with 0xFF (would collide
+//     with the escape tail after a preceding string's terminator).
+//   - known wart kept for compatibility: the single-byte key "\x1f"
+//     still collides with the empty key and decodes as "".
+//
+// Inverted (descending index-key) fields invert every byte: terminator
+// 0xFF, escape pair (0xFF, 0x00). The scan takes the eos byte and derives
+// the escape tail by negation, so the same code serves both directions.
+
+// appendEscaped appends s to dst, escaping every EOS byte as (EOS, 0xFF).
+// The common no-EOS case is a single IndexByte plus one bulk append.
+func appendEscaped(dst []byte, s []byte) []byte {
+	for {
+		i := bytes.IndexByte(s, EOS)
+		if i < 0 {
+			return append(dst, s...)
+		}
+		dst = append(dst, s[:i+1]...)
+		dst = append(dst, ^EOS)
+		s = s[i+1:]
+	}
+}
+
+// appendUnescaped appends the escaped segment s (terminator excluded) to dst,
+// collapsing every (EOS, 0xFF) pair back to a single EOS. Call only when the
+// scan reported escapes; the caller keeps the plain copy on the common path.
+func appendUnescaped(dst []byte, s []byte) []byte {
+	for {
+		i := bytes.IndexByte(s, EOS)
+		if i < 0 || i+1 >= len(s) {
+			return append(dst, s...)
+		}
+		dst = append(dst, s[:i+1]...) // include the EOS, drop the 0xFF tail
+		s = s[i+2:]
+	}
+}
+
+// scanTerm returns the index of the terminator byte of an escaped string or
+// key segment and whether any escape pairs were seen. eos is the terminator
+// byte: EOS for normal data, ^EOS for inverted index-key data; the escape
+// tail is its bitwise negation in both cases.
+func scanTerm(b []byte, eos byte) (term int, escaped bool, ok bool) {
+	esc := ^eos
+	var pos int
+	for {
+		i := bytes.IndexByte(b[pos:], eos)
+		if i < 0 {
+			return 0, false, false
+		}
+		i += pos
+		if i+1 < len(b) && b[i+1] == esc {
+			escaped = true
+			pos = i + 2
+			continue
+		}
+		return i, escaped, true
+	}
+}
+
+// appendEscapedKey appends an object key with the rules described above,
+// followed by the EOS terminator.
+func appendEscapedKey(dst []byte, key string) []byte {
+	if len(key) == 0 {
+		return append(dst, emptyKey, EOS)
+	}
+	if key[0] == EOS || key[0] == ^EOS {
+		dst = append(dst, emptyKey)
+	}
+	dst = appendEscaped(dst, s2b(key))
+	return append(dst, EOS)
+}
+
+// decodeKey converts a raw escaped key segment (terminator excluded) into the
+// key string. Zero-copy (unsafe view into raw) on the common path; allocates
+// only when the key was escaped.
+func decodeKey(raw []byte, escaped bool) string {
+	if len(raw) > 0 && raw[0] == emptyKey {
+		if len(raw) == 1 {
+			return ""
+		}
+		if raw[1] == EOS || raw[1] == ^EOS {
+			raw = raw[1:]
+		}
+	}
+	if escaped {
+		return string(appendUnescaped(nil, raw))
+	}
+	return b2s(raw)
+}

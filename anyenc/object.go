@@ -55,3 +55,7 @@ func (o *Object) Len() int {
 func s2b(s string) (b []byte) {
 	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
+
+func b2s(b []byte) string {
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
