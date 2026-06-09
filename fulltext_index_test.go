@@ -2,6 +2,7 @@ package anystore
 
 import (
 	"encoding/binary"
+	"fmt"
 	"testing"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -171,8 +172,33 @@ func TestFts_UpdateReindexes(t *testing.T) {
 	assert.Equal(t, uint64(1), ftsVocabDF(t, coll, "entirely"))
 	// still exactly one indexed document
 	assert.Equal(t, uint64(1), ftsReadMeta(t, coll, ftsMetaCount))
-	// update = delete+insert in v1, so a fresh IntDocID (2) was allocated
-	assert.Equal(t, []uint64{2}, ftsTermDocIDs(t, coll, "replaced"))
+	// Delta-update keeps the IntDocID STABLE across edits (id 1, not a fresh 2)
+	// and does NOT advance the seq counter.
+	assert.Equal(t, []uint64{1}, ftsTermDocIDs(t, coll, "replaced"))
+	assert.Equal(t, uint64(1), ftsReadMeta(t, coll, ftsMetaSeq))
+}
+
+func TestFts_DeltaUpdateKeepsChunksDense(t *testing.T) {
+	fx, coll := ftsTestColl(t, "body")
+	defer fx.finish()
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"x","body":"alpha beta gamma"}`)))
+	// Edit the doc many times. The delta-update must keep IntDocID stable, never
+	// advance seq, and never accrete tombstones in the term chunks.
+	for i := 0; i < 50; i++ {
+		body := fmt.Sprintf("alpha beta gamma rev%d", i)
+		require.NoError(t, coll.UpsertOne(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":"x","body":%q}`, body))))
+	}
+	assert.Equal(t, uint64(1), ftsReadMeta(t, coll, ftsMetaSeq), "seq must not grow with edits")
+	assert.Equal(t, uint64(1), ftsReadMeta(t, coll, ftsMetaCount))
+	// Terms present in every revision keep a single live posting (docID 1) — the
+	// chunk is dense, not 50 tombstones + 1 live.
+	assert.Equal(t, []uint64{1}, ftsTermDocIDs(t, coll, "alpha"))
+	assert.Equal(t, []uint64{1}, ftsTermDocIDs(t, coll, "gamma"))
+	// Per-revision unique terms: only the latest survives.
+	assert.Equal(t, uint64(0), ftsVocabDF(t, coll, "rev0"))
+	assert.Equal(t, uint64(0), ftsVocabDF(t, coll, "rev48"))
+	assert.Equal(t, uint64(1), ftsVocabDF(t, coll, "rev49"))
 }
 
 func TestFts_CJKBigramsIndexed(t *testing.T) {

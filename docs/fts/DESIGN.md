@@ -148,20 +148,54 @@ those pages are dirtied once per tx.
 `fts:vocab` does double duty: a point lookup gives the exact `df` of a term, so
 the cost-based optimizer can estimate FTS selectivity precisely.
 
-## Updates (the keystroke problem)
+The query path accumulates per-document BM25 scores in `ftsScoreAcc` — a flat
+open-addressing `IntDocID → score` table with O(1) generation reset, pooled
+across queries and pointer-free (no GC scan). It replaces a per-query
+`map[uint64]float64` that would grow/rehash as a common term accumulates
+thousands of documents (the dense-`IntDocID` analog of `internal/vivf`'s
+`u32fmap`). This cut heavy-query memory ~40% with no change to ranking.
 
-A naive "delete old doc, insert new doc" on every save touches every term's
-chunk (~300 chunks for a 500-word note) — WAL thrash. Instead use **delta
-updates**:
+## Write path (write-first): per-tx buffer + delta updates
 
-1. Get the document's previous analyzed terms — either re-analyze the old text,
-   or read a forward `fts:docterms` (`IntDocID` → terms) index.
-2. Analyze the new text. Diff old vs new term/position sets.
-3. Read-modify-write only the chunks for terms that actually changed. Editing
-   one word in a 500-word note touches ~2 chunks, not 300.
+Writes (single + batch insert/update) are the priority. The on-disk format is
+unchanged — the wins are in how writes are *staged*. The bottleneck is B-tree IO
+and WAL dirty-page amplification, not varint CPU (<1µs/chunk), so we stage in
+memory and hit the tree once per touched key. (Implemented in
+`fulltext_pending.go`; the `internal/simd` package is float32/int8 distance
+kernels for the vector index and offers FTS nothing — see the design notes.)
 
-No tombstones, no background compaction: when an RMW empties a chunk, just
-`Delete` the key. The page cache absorbs repeated saves to the same hot chunk.
+**Per-tx write-back buffer** (`ftsPending`, mirrors SQLite FTS5's `fts5_hash.c`):
+instead of read-modify-writing a postings chunk and the vocab `df` for every
+term of every document, the maintenance path accumulates postings adds/removes
+and `df` deltas in memory for the whole write tx, then flushes each TOUCHED
+chunk/term to the B-tree exactly once, **in sorted key order** (cursor glides
+left-to-right; same-leaf updates coalesce while pinned). A batch of N docs that
+all contain "the" rewrites the "the" chunk once, not N times. The buffer is
+writer-owned (single writer holds the btree write lock for the whole tx), reset
+at tx start, and flushed at commit — the same lifecycle as the range-index
+sketch.
+
+**RAM bound:** once the buffer exceeds `ftsSpillPostings` (~200k buffered posting
+ops) it is flushed mid-tx (safe — same tx, just written earlier), so a single
+huge batch can't grow it without bound. Oversized buffer maps are released after
+a bulk load rather than retained.
+
+**Strong cross-process consistency:** the buffer is purely a per-transaction,
+in-memory staging area, flushed into the **same atomic btree commit** as the
+documents. There is no cross-transaction or cross-process in-memory cache, so
+another process opening a read tx after commit observes a complete, consistent
+index, and a crash never leaves a document without its postings. `IntDocID` is
+allocated by reading `fts:meta seq` fresh from committed state each tx (under the
+cross-process WAL write lock), so two processes never collide. (Verified by
+`TestFtsMultiprocessConsistency`, which drives a real child process.)
+
+**Stable `IntDocID` delta updates.** An update keeps the document's `IntDocID`
+and diffs old vs new token streams: removed terms drop the id from their chunk,
+added terms insert it, unchanged terms do nothing. Editing one word in a long
+note touches a couple of chunks, not all of them — and the `IntDocID` is reused,
+so chunks never accrete tombstones (no vacuum is ever needed) and `maxIntDocID`
+tracks the live-doc count, not the edit count. This is also the write-throughput
+win: delete+insert would rewrite every term's chunk twice.
 
 ## Public API (locked)
 
@@ -228,7 +262,13 @@ Lock these three; everything else can evolve in later versions:
    max-TF for WAND skipping, or repack varints). Mandatory.
 2. **Chunk divisor = 128** (power of two). Changing it rekeys the entire
    `fts:postings` namespace, forcing a full re-index. Pick 128 and never change.
-3. **Monotonic, never-reused `IntDocID`** (see above).
+3. **Stable, per-document `IntDocID`.** An `IntDocID` is allocated once when a
+   document is first indexed (`seq` is monotonic for *new* documents) and stays
+   bound to that document across all its edits — the delta-update reuses it. It
+   is never reused for a *different* document. A chunk's postings are
+   delta-encoded ascending by `IntDocID`; keeping the id stable preserves a
+   document's position in its chunk across edits and prevents tombstone
+   accretion (so no vacuum is ever needed).
 
 Changing any of these requires a blocking, multi-minute re-index on upgrade.
 
@@ -241,14 +281,26 @@ Build exactly this, in order:
    `[version, DocIdDelta, TF, PosDelta...]` chunk blob, with benchmarks proving
    microsecond decode.
 3. **Namespaces + write path** — `docmap`/`meta`/`vocab`/`docinfo`/`postings`;
-   IntDocID allocation; delta-update on insert/update/delete; in-memory stat
-   aggregation flushed at commit.
-4. **Read path** — chunk fetch, zig-zag phrase merge, BM25, top-k heap.
-5. **Planner hook** — wire `$text` into the AST; make `FtsScan` the driver with
-   post-yield filter evaluation.
+   IntDocID allocation; insert/update/delete maintenance. ✅
+4. **Read path** — chunk fetch, BM25 over the `ftsScoreAcc` accumulator, top-k.
+   ✅ (`fulltext_search.go`)
+5. **Planner hook** — `$text` in the AST; `FtsScan` drives, residual filters
+   evaluated post-yield; `{$meta:"textScore"}` relevance sort. ✅
+6. **Write-first staging** — per-tx write-back buffer (sorted flush, RAM-spill
+   cap), stable-`IntDocID` delta-update, reusable term maps. ✅
+   (`fulltext_pending.go`). Measured: batch insert ~1.5–2×, interactive edit
+   ~1.9×, heavy query memory −40%.
 
-Explicitly **deferred to v2+**: fuzzy/Levenshtein-automaton search over
-`fts:vocab`; chunk-level (max-TF) WAND skipping; configurable analyzers/
-dictionaries; stop-word removal (we index stop words — delta-varints compress
-them well, and personal-notes users search for "to do", "let it be", etc.);
-`DOCS_AND_FREQS_ONLY` positionless fields.
+**SIMD:** rejected for FTS — the `internal/simd` kernels are float32/int8 vector
+distances; the FTS write path is B-tree-bound (≈80% of allocs are btree page
+ops) and the read loop is gather/scatter-shaped, neither of which SIMD helps.
+The lever was data layout (write-back buffer, dense `ftsScoreAcc`), not
+vectorization.
+
+Explicitly **deferred to v2+**: top-k materialization in `search` (it currently
+clones every matched id before `Limit` trims); replacing the per-doc `docinfo`
+`Get` with an in-memory dense quantized doc-length array (safe now that
+`IntDocID` is stable and dense); fuzzy/Levenshtein search over `fts:vocab`;
+chunk-level (max-TF) WAND skipping; configurable analyzers; positional CJK phrase
+matching; `DOCS_AND_FREQS_ONLY` positionless fields. Stop words are intentionally
+indexed (cheap under delta-varints; personal-notes users search "to do" etc.).

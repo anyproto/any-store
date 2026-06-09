@@ -122,6 +122,12 @@ func (w writeTx) Commit() error {
 		defer txPool.Put(w.commonTx)
 		if w.modified {
 			w.writeTx.MarkDataChanged()
+			// Flush the full-text write-back buffer into this same tx BEFORE the
+			// btree commit, so postings commit atomically with the documents.
+			if err := w.db.flushAllFtsPending(w.writeTx); err != nil {
+				_ = w.writeTx.Rollback()
+				return err
+			}
 			if err := w.db.persistAllDirtySketches(w.writeTx); err != nil {
 				_ = w.writeTx.Rollback()
 				return err

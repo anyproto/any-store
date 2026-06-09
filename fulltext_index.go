@@ -60,11 +60,19 @@ type ftsIndex struct {
 
 	az *fts.Analyzer
 
+	// pending is the per-tx write-back buffer (postings + vocab deltas), flushed
+	// at commit. See fulltext_pending.go.
+	pending ftsPending
+
 	// scratch buffers, writer-owned (single writer, serialized by btree writeMu)
-	keyBuf  []byte
-	valBuf  []byte
-	tokBuf  []fts.Token
-	chunkPL []fts.Posting
+	keyBuf   []byte
+	valBuf   []byte
+	tokBuf   []fts.Token         // analyze() output (also old-doc tokens in updateDoc)
+	tokBufB  []fts.Token         // new-doc tokens in updateDoc
+	termBufA map[string][]uint32 // reused term->positions for insert/delete + old-doc
+	termBufB map[string][]uint32 // reused term->positions for new-doc in updateDoc
+	chunkPL  []fts.Posting
+	mergeBuf []fts.Posting // flushChunk merge scratch
 }
 
 func newFtsIndex(c *collection, info IndexInfo) (*ftsIndex, error) {
@@ -111,42 +119,42 @@ func (fx *ftsIndex) Info() IndexInfo { return fx.info }
 
 // ---- analysis -------------------------------------------------------------
 
-// analyze runs the analyzer over all indexed fields of the document, returning
-// the flat token stream (positions are offset per field by ftsPosGap so phrases
-// cannot bridge fields). Tokens are appended to fx.tokBuf, which is returned.
-func (fx *ftsIndex) analyze(it item) []fts.Token {
-	fx.tokBuf = fx.tokBuf[:0]
+// analyzeInto runs the analyzer over all indexed fields of the document,
+// appending the flat token stream to dst (positions are offset per field by
+// ftsPosGap so phrases cannot bridge fields) and returning the extended slice.
+func (fx *ftsIndex) analyzeInto(dst []fts.Token, it item) []fts.Token {
+	dst = dst[:0]
 	val := it.Value()
 	var base uint32
 	for _, path := range fx.fieldPaths {
 		fv := val.Get(path...)
-		before := len(fx.tokBuf)
-		fx.appendFieldTokens(fv, base)
-		emitted := len(fx.tokBuf) - before
+		before := len(dst)
+		dst = fx.appendFieldTokens(dst, fv, base)
+		emitted := len(dst) - before
 		if emitted > 0 {
 			base += uint32(emitted) + ftsPosGap
 		}
 	}
-	return fx.tokBuf
+	return dst
 }
 
 // appendFieldTokens analyzes a single field value (string, or array of strings)
-// and appends its tokens to fx.tokBuf with positions shifted by base.
-func (fx *ftsIndex) appendFieldTokens(fv *anyenc.Value, base uint32) {
+// and appends its tokens to dst with positions shifted by base.
+func (fx *ftsIndex) appendFieldTokens(dst []fts.Token, fv *anyenc.Value, base uint32) []fts.Token {
 	if fv == nil {
-		return
+		return dst
 	}
 	switch fv.Type() {
 	case anyenc.TypeString:
 		sb, err := fv.StringBytes()
 		if err != nil {
-			return
+			return dst
 		}
-		fx.appendText(string(sb), base)
+		dst = fx.appendText(dst, string(sb), base)
 	case anyenc.TypeArray:
 		arr, err := fv.Array()
 		if err != nil {
-			return
+			return dst
 		}
 		for _, av := range arr {
 			if av.Type() != anyenc.TypeString {
@@ -156,37 +164,40 @@ func (fx *ftsIndex) appendFieldTokens(fv *anyenc.Value, base uint32) {
 			if err != nil {
 				continue
 			}
-			fx.appendText(string(sb), base)
+			dst = fx.appendText(dst, string(sb), base)
 			// keep array elements on separate position runs too
 			base += ftsPosGap
 		}
 	}
+	return dst
 }
 
-func (fx *ftsIndex) appendText(text string, base uint32) {
-	start := len(fx.tokBuf)
-	fx.tokBuf = fx.az.Append(fx.tokBuf, text)
+func (fx *ftsIndex) appendText(dst []fts.Token, text string, base uint32) []fts.Token {
+	start := len(dst)
+	dst = fx.az.Append(dst, text)
 	if base != 0 {
-		for i := start; i < len(fx.tokBuf); i++ {
-			fx.tokBuf[i].Pos += base
+		for i := start; i < len(dst); i++ {
+			dst[i].Pos += base
 		}
 	}
+	return dst
 }
 
-// termPostings groups a token stream into per-term ascending position lists for
-// a single document. Returns a map term→positions and the document length.
-func termPostings(tokens []fts.Token) (map[string][]uint32, uint32) {
-	if len(tokens) == 0 {
-		return nil, 0
+// termPostingsInto groups a token stream into per-term ascending position lists
+// for a single document, reusing the provided map (cleared first) to avoid a
+// per-document map allocation on the hot write path. Returns the (same) map and
+// the document length. Tokens arrive in ascending position order, so the lists
+// are already sorted.
+func termPostingsInto(dst map[string][]uint32, tokens []fts.Token) (map[string][]uint32, uint32) {
+	if dst == nil {
+		dst = make(map[string][]uint32, len(tokens))
+	} else {
+		clear(dst)
 	}
-	m := make(map[string][]uint32, len(tokens))
 	for _, t := range tokens {
-		m[t.Term] = append(m[t.Term], t.Pos)
+		dst[t.Term] = append(dst[t.Term], t.Pos)
 	}
-	for _, ps := range m {
-		slices.Sort(ps)
-	}
-	return m, uint32(len(tokens))
+	return dst, uint32(len(tokens))
 }
 
 // ---- IntDocID allocation & docmap -----------------------------------------
@@ -276,14 +287,17 @@ func postingsKey(dst []byte, term string, chunkID uint64) []byte {
 
 // ---- maintenance ----------------------------------------------------------
 
-// insertDoc indexes a document: allocates an IntDocID, writes the docmap,
-// docinfo, vocab and postings entries, and bumps the global counters.
+// insertDoc indexes a document: allocates a stable IntDocID, writes the docmap,
+// docinfo and counters directly, and BUFFERS the postings + vocab deltas in the
+// per-tx write-back buffer (flushed once per touched chunk/term at commit).
 func (fx *ftsIndex) insertDoc(tx *btree.WriteTx, it item) error {
-	tokens := fx.analyze(it)
-	terms, docLen := termPostings(tokens)
+	fx.tokBuf = fx.analyzeInto(fx.tokBuf, it)
+	var docLen uint32
+	fx.termBufA, docLen = termPostingsInto(fx.termBufA, fx.tokBuf)
+	terms := fx.termBufA
 	if docLen == 0 {
-		// Nothing to index (no text / empty fields). Skip entirely — the doc is
-		// simply absent from this fts index.
+		// Nothing to index (no text / empty fields). The doc is simply absent
+		// from this fts index.
 		return nil
 	}
 
@@ -293,7 +307,7 @@ func (fx *ftsIndex) insertDoc(tx *btree.WriteTx, it item) error {
 		return err
 	}
 
-	// docmap forward + reverse
+	// docmap forward + reverse, docinfo — direct point Puts (no decode, cheap).
 	fx.keyBuf = ftsMapForwardKey(fx.keyBuf, stringID)
 	fx.valBuf = binary.AppendUvarint(fx.valBuf[:0], docID)
 	if err = tx.Put(fx.nsMap, fx.keyBuf, fx.valBuf); err != nil {
@@ -303,81 +317,126 @@ func (fx *ftsIndex) insertDoc(tx *btree.WriteTx, it item) error {
 	if err = tx.Put(fx.nsMap, fx.keyBuf, stringID); err != nil {
 		return err
 	}
-
-	// docinfo: doc length
 	if err = fx.putDocLen(tx, docID, docLen); err != nil {
 		return err
 	}
 
-	// postings + vocab
+	// postings + vocab — buffered, flushed at commit.
 	for term, positions := range terms {
-		if err = fx.addPosting(tx, term, docID, positions); err != nil {
-			return err
-		}
-		if err = fx.bumpVocab(tx, term, +1); err != nil {
-			return err
-		}
+		fx.addPostingPending(term, docID, positions)
+		fx.vocabDeltaPending(term, +1)
 	}
 
-	// global counters
+	// global counters — direct (same meta page, coalesced in the page cache).
 	if err = fx.addMetaDelta(tx, ftsMetaCount, +1); err != nil {
 		return err
 	}
-	return fx.addMetaDelta(tx, ftsMetaTokens, int64(docLen))
+	if err = fx.addMetaDelta(tx, ftsMetaTokens, int64(docLen)); err != nil {
+		return err
+	}
+	return fx.maybeSpill(tx)
 }
 
-// deleteDoc removes a document from the index. It is a no-op if the document was
-// never indexed (e.g. had no text).
+// deleteDoc removes a document from the index. No-op if it was never indexed.
 func (fx *ftsIndex) deleteDoc(tx *btree.WriteTx, it item) error {
 	stringID := it.appendId(nil)
 	docID, ok, err := fx.lookupDocID(tx, stringID)
 	if err != nil || !ok {
 		return err
 	}
+	fx.tokBuf = fx.analyzeInto(fx.tokBuf, it)
+	var docLen uint32
+	fx.termBufA, docLen = termPostingsInto(fx.termBufA, fx.tokBuf)
+	return fx.removeIndexedDoc(tx, stringID, docID, fx.termBufA, docLen)
+}
 
-	tokens := fx.analyze(it)
-	terms, docLen := termPostings(tokens)
-
+// removeIndexedDoc buffers removal of all of a doc's postings/df and deletes its
+// docmap/docinfo + counters. Shared by deleteDoc and the "update to empty" path.
+func (fx *ftsIndex) removeIndexedDoc(tx *btree.WriteTx, stringID []byte, docID uint64, terms map[string][]uint32, docLen uint32) error {
 	for term := range terms {
-		if err = fx.removePosting(tx, term, docID); err != nil {
-			return err
-		}
-		if err = fx.bumpVocab(tx, term, -1); err != nil {
-			return err
-		}
+		fx.removePostingPending(term, docID)
+		fx.vocabDeltaPending(term, -1)
 	}
-
-	// docinfo
 	fx.keyBuf = appendDocIDKey(fx.keyBuf, docID)
-	if err = deleteIfExists(tx, fx.nsDocinfo, fx.keyBuf); err != nil {
+	if err := deleteIfExists(tx, fx.nsDocinfo, fx.keyBuf); err != nil {
 		return err
 	}
-	// docmap forward + reverse
 	fx.keyBuf = ftsMapForwardKey(fx.keyBuf, stringID)
-	if err = deleteIfExists(tx, fx.nsMap, fx.keyBuf); err != nil {
+	if err := deleteIfExists(tx, fx.nsMap, fx.keyBuf); err != nil {
 		return err
 	}
 	fx.keyBuf = ftsMapReverseKey(fx.keyBuf, docID)
-	if err = deleteIfExists(tx, fx.nsMap, fx.keyBuf); err != nil {
+	if err := deleteIfExists(tx, fx.nsMap, fx.keyBuf); err != nil {
 		return err
 	}
-
-	// global counters
-	if err = fx.addMetaDelta(tx, ftsMetaCount, -1); err != nil {
+	if err := fx.addMetaDelta(tx, ftsMetaCount, -1); err != nil {
 		return err
 	}
-	return fx.addMetaDelta(tx, ftsMetaTokens, -int64(docLen))
+	if err := fx.addMetaDelta(tx, ftsMetaTokens, -int64(docLen)); err != nil {
+		return err
+	}
+	return fx.maybeSpill(tx)
 }
 
-// updateDoc re-indexes a changed document. v1 = delete old + insert new (which
-// allocates a fresh IntDocID and rewrites the affected chunks). The delta-update
-// optimization (diff old/new terms, touch only changed chunks, keep the
-// IntDocID) is a deferred v2 improvement — see DESIGN.md.
+// updateDoc re-indexes a changed document by DIFFING its old and new token
+// streams, keeping the IntDocID STABLE and touching only the chunks/terms that
+// actually changed. Editing one word in a long note touches a couple of chunks,
+// not all of them — and never accretes tombstones (the IntDocID is reused).
 func (fx *ftsIndex) updateDoc(tx *btree.WriteTx, oldIt, newIt item) error {
-	if err := fx.deleteDoc(tx, oldIt); err != nil {
+	stringID := newIt.appendId(nil)
+	docID, ok, err := fx.lookupDocID(tx, stringID)
+	if err != nil {
 		return err
 	}
-	return fx.insertDoc(tx, newIt)
+	if !ok {
+		// The previous version had no indexable text → this is a fresh insert.
+		return fx.insertDoc(tx, newIt)
+	}
+
+	fx.tokBuf = fx.analyzeInto(fx.tokBuf, oldIt)
+	var oldLen, newLen uint32
+	fx.termBufA, oldLen = termPostingsInto(fx.termBufA, fx.tokBuf)
+	oldTerms := fx.termBufA
+	fx.tokBufB = fx.analyzeInto(fx.tokBufB, newIt)
+	fx.termBufB, newLen = termPostingsInto(fx.termBufB, fx.tokBufB)
+	newTerms := fx.termBufB
+
+	if newLen == 0 {
+		// Doc lost all indexable text → drop it from the index entirely.
+		return fx.removeIndexedDoc(tx, stringID, docID, oldTerms, oldLen)
+	}
+
+	// Terms gone or whose positions changed.
+	for term, oldPos := range oldTerms {
+		newPos, inNew := newTerms[term]
+		switch {
+		case !inNew:
+			fx.removePostingPending(term, docID)
+			fx.vocabDeltaPending(term, -1)
+		case !slices.Equal(oldPos, newPos):
+			// term still present, positions changed: re-add (df unchanged).
+			fx.removePostingPending(term, docID)
+			fx.addPostingPending(term, docID, newPos)
+		}
+		// identical positions → nothing to do.
+	}
+	// Newly added terms.
+	for term, newPos := range newTerms {
+		if _, inOld := oldTerms[term]; !inOld {
+			fx.addPostingPending(term, docID, newPos)
+			fx.vocabDeltaPending(term, +1)
+		}
+	}
+
+	if newLen != oldLen {
+		if err = fx.putDocLen(tx, docID, newLen); err != nil {
+			return err
+		}
+		if err = fx.addMetaDelta(tx, ftsMetaTokens, int64(newLen)-int64(oldLen)); err != nil {
+			return err
+		}
+	}
+	return fx.maybeSpill(tx)
 }
 
 func (fx *ftsIndex) putDocLen(tx *btree.WriteTx, docID uint64, docLen uint32) error {
@@ -411,65 +470,6 @@ func (fx *ftsIndex) bumpVocab(tx *btree.WriteTx, term string, delta int64) error
 	}
 	fx.valBuf = binary.AppendUvarint(fx.valBuf[:0], uint64(next))
 	return tx.Put(fx.nsVocab, key, fx.valBuf)
-}
-
-// addPosting inserts (docID, positions) into the term's chunk. Because docID is
-// the largest yet allocated, it sorts last within its chunk, so we decode the
-// chunk, append, and re-encode.
-func (fx *ftsIndex) addPosting(tx *btree.WriteTx, term string, docID uint64, positions []uint32) error {
-	chunkID := fts.ChunkID(docID)
-	fx.keyBuf = postingsKey(fx.keyBuf, term, chunkID)
-
-	fx.chunkPL = fx.chunkPL[:0]
-	existing, err := tx.Get(fx.nsPost, fx.keyBuf)
-	if err != nil {
-		if !errors.Is(err, btree.ErrKeyNotFound) {
-			return err
-		}
-	} else {
-		fx.chunkPL, err = fts.DecodeChunk(fx.chunkPL, existing)
-		if err != nil {
-			return err
-		}
-	}
-	fx.chunkPL = append(fx.chunkPL, fts.Posting{
-		DocID:     docID,
-		Positions: slices.Clone(positions),
-	})
-	// keyBuf is reused by encoding below; rebuild key after the value buffer.
-	fx.valBuf = fts.AppendChunk(fx.valBuf[:0], fx.chunkPL)
-	fx.keyBuf = postingsKey(fx.keyBuf, term, chunkID)
-	return tx.Put(fx.nsPost, fx.keyBuf, fx.valBuf)
-}
-
-// removePosting drops docID from the term's chunk, deleting the chunk key if it
-// becomes empty.
-func (fx *ftsIndex) removePosting(tx *btree.WriteTx, term string, docID uint64) error {
-	chunkID := fts.ChunkID(docID)
-	fx.keyBuf = postingsKey(fx.keyBuf, term, chunkID)
-	existing, err := tx.Get(fx.nsPost, fx.keyBuf)
-	if err != nil {
-		if errors.Is(err, btree.ErrKeyNotFound) {
-			return nil
-		}
-		return err
-	}
-	fx.chunkPL = fx.chunkPL[:0]
-	if fx.chunkPL, err = fts.DecodeChunk(fx.chunkPL, existing); err != nil {
-		return err
-	}
-	out := fx.chunkPL[:0]
-	for _, p := range fx.chunkPL {
-		if p.DocID != docID {
-			out = append(out, p)
-		}
-	}
-	fx.keyBuf = postingsKey(fx.keyBuf, term, chunkID)
-	if len(out) == 0 {
-		return deleteIfExists(tx, fx.nsPost, fx.keyBuf)
-	}
-	fx.valBuf = fts.AppendChunk(fx.valBuf[:0], out)
-	return tx.Put(fx.nsPost, fx.keyBuf, fx.valBuf)
 }
 
 func deleteIfExists(tx *btree.WriteTx, ns *btree.Namespace, key []byte) error {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"slices"
+	"sync"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/fts"
@@ -66,18 +67,22 @@ func (fx *ftsIndex) search(tx *btree.ReadTx, queryStr string) ([]ftsHit, error) 
 		avgdl = 1
 	}
 
-	// Distinct query terms (repeated query words contribute once in v1).
-	seen := make(map[string]struct{}, len(terms))
-	scores := make(map[uint64]float64)
-	docLen := make(map[uint64]uint32)
+	// Per-query score accumulator: a flat open-addressing IntDocID->score table
+	// with O(1) generation reset, pooled across queries (see ftsScoreAcc). It
+	// replaces a per-query map[uint64]float64 that would grow/rehash as a common
+	// term accumulates thousands of docs.
+	acc := ftsScoreAccPool.Get().(*ftsScoreAcc)
+	acc.reset()
+	defer ftsScoreAccPool.Put(acc)
 
 	var key, val []byte
+	var doneTerms []string // distinct query terms already scanned (few)
 	for _, tok := range terms {
 		term := tok.Term
-		if _, dup := seen[term]; dup {
-			continue
+		if slices.Contains(doneTerms, term) {
+			continue // repeated query word contributes once
 		}
-		seen[term] = struct{}{}
+		doneTerms = append(doneTerms, term)
 
 		df, derr := ftsGetUint(tx, fx.nsVocab, []byte(term))
 		if derr != nil {
@@ -116,16 +121,13 @@ func (fx *ftsIndex) search(tx *btree.ReadTx, queryStr string) ([]ftsHit, error) 
 			for r.Next() {
 				docID := r.DocID()
 				tf := float64(r.TF())
-				dl, ok := docLen[docID]
-				if !ok {
-					dl, scanErr = ftsDocLen(tx, fx.nsDocinfo, docID)
-					if scanErr != nil {
-						break
-					}
-					docLen[docID] = dl
+				dl, e := ftsDocLen(tx, fx.nsDocinfo, docID)
+				if e != nil {
+					scanErr = e
+					break
 				}
 				denom := tf + bm25K1*(1-bm25B+bm25B*float64(dl)/avgdl)
-				scores[docID] += idf * (tf * (bm25K1 + 1)) / denom
+				acc.add(docID, idf*(tf*(bm25K1+1))/denom)
 			}
 			if scanErr == nil {
 				scanErr = r.Err()
@@ -143,20 +145,13 @@ func (fx *ftsIndex) search(tx *btree.ReadTx, queryStr string) ([]ftsHit, error) 
 		}
 	}
 
-	if len(scores) == 0 {
+	if acc.n == 0 {
 		return nil, nil
 	}
 
-	// Materialize, resolve string ids, and sort by score desc / docID asc.
-	type sd struct {
-		docID uint64
-		score float64
-	}
-	ranked := make([]sd, 0, len(scores))
-	for id, sc := range scores {
-		ranked = append(ranked, sd{id, sc})
-	}
-	slices.SortFunc(ranked, func(a, b sd) int {
+	// Materialize live (docID, score) pairs and sort by score desc / docID asc.
+	ranked := acc.appendTo(nil)
+	slices.SortFunc(ranked, func(a, b scoredDoc) int {
 		if a.score > b.score {
 			return -1
 		}
@@ -188,6 +183,116 @@ func (fx *ftsIndex) search(tx *btree.ReadTx, queryStr string) ([]ftsHit, error) 
 		hits = append(hits, ftsHit{idKey: slices.Clone(idBytes), score: r.score})
 	}
 	return hits, nil
+}
+
+// scoredDoc is one accumulated (IntDocID, BM25 score) pair.
+type scoredDoc struct {
+	docID uint64
+	score float64
+}
+
+// ftsScoreAcc is a flat open-addressing accumulator from a dense IntDocID to a
+// summed BM25 score, with O(1) generation reset. It is the FTS read-path analog
+// of internal/vivf's u32fmap (which replaced a per-query map[uint32]float32):
+// IntDocIDs are dense, so linear probing over a power-of-two table with a
+// splitmix64 mix beats the Go map's hashing, and reset bumps a tag instead of
+// clearing. Pooled across queries and pointer-free (no GC scan cost).
+type ftsScoreAcc struct {
+	key  []uint64
+	val  []float64
+	seen []uint32 // slot occupied iff seen[i] == gen
+	gen  uint32
+	mask uint32
+	n    int
+}
+
+var ftsScoreAccPool = sync.Pool{New: func() any { return &ftsScoreAcc{} }}
+
+// hashU64 is the splitmix64 finalizer.
+func hashU64(x uint64) uint64 {
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return x
+}
+
+// reset clears the accumulator in O(1) after the first call (bumps the generation).
+func (m *ftsScoreAcc) reset() {
+	if m.key == nil {
+		const init = 1024 // power of two; grows on demand
+		m.key = make([]uint64, init)
+		m.val = make([]float64, init)
+		m.seen = make([]uint32, init)
+		m.mask = init - 1
+		m.gen = 1
+		m.n = 0
+		return
+	}
+	m.n = 0
+	m.gen++
+	if m.gen == 0 { // wrapped: stale tags could false-hit, so clear once
+		for i := range m.seen {
+			m.seen[i] = 0
+		}
+		m.gen = 1
+	}
+}
+
+// add sums d into key's accumulated score, inserting the key on first sight.
+func (m *ftsScoreAcc) add(key uint64, d float64) {
+	pos := uint32(hashU64(key)) & m.mask
+	for m.seen[pos] == m.gen {
+		if m.key[pos] == key {
+			m.val[pos] += d
+			return
+		}
+		pos = (pos + 1) & m.mask
+	}
+	if m.n >= int(m.mask-m.mask/4) { // keep load < 0.75
+		m.grow()
+		pos = uint32(hashU64(key)) & m.mask
+		for m.seen[pos] == m.gen {
+			pos = (pos + 1) & m.mask
+		}
+	}
+	m.seen[pos] = m.gen
+	m.key[pos] = key
+	m.val[pos] = d
+	m.n++
+}
+
+// appendTo appends every live (docID, score) pair to dst.
+func (m *ftsScoreAcc) appendTo(dst []scoredDoc) []scoredDoc {
+	for i := range m.key {
+		if m.seen[i] == m.gen {
+			dst = append(dst, scoredDoc{m.key[i], m.val[i]})
+		}
+	}
+	return dst
+}
+
+func (m *ftsScoreAcc) grow() {
+	size := len(m.key) * 2
+	nkey := make([]uint64, size)
+	nval := make([]float64, size)
+	nseen := make([]uint32, size)
+	nmask := uint32(size - 1)
+	g := m.gen
+	for i := range m.key {
+		if m.seen[i] != g {
+			continue
+		}
+		p := uint32(hashU64(m.key[i])) & nmask
+		for nseen[p] == g {
+			p = (p + 1) & nmask
+		}
+		nseen[p] = g
+		nkey[p] = m.key[i]
+		nval[p] = m.val[i]
+	}
+	m.key, m.val, m.seen, m.mask = nkey, nval, nseen, nmask
 }
 
 // postingsTermPrefix builds the key prefix shared by all chunks of a term:

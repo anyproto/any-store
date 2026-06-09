@@ -293,6 +293,7 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 
 	db.checkStale(&btWtx.ReadTx)
 	db.resetUncommittedSketches(&btWtx.ReadTx)
+	db.resetAllFtsPending()
 
 	version := newTxVersion()
 	tx := txPool.Get().(*commonTx)
@@ -874,6 +875,40 @@ func (db *db) persistAllDirtySketches(tx *btree.WriteTx) error {
 		}
 	}
 	return nil
+}
+
+// flushAllFtsPending flushes every open collection's full-text write-back buffer
+// into the B-tree. Called once per write-tx commit, BEFORE the btree commit, so
+// the buffered postings land in the SAME atomic transaction as the document
+// writes — preserving strong cross-process consistency (another process opening
+// a read tx after commit sees a complete, consistent index; a crash leaves no
+// doc without its postings). The buffer never survives the commit boundary.
+func (db *db) flushAllFtsPending(tx *btree.WriteTx) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	for _, coll := range db.openedCollections {
+		c := coll.(*collection)
+		for _, fx := range c.loadFtsIndexes() {
+			if err := fx.flushPending(tx); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// resetAllFtsPending discards any buffered full-text writes left over from a
+// rolled-back transaction. Called at the start of every write tx so a new tx
+// begins with an empty buffer.
+func (db *db) resetAllFtsPending() {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	for _, coll := range db.openedCollections {
+		c := coll.(*collection)
+		for _, fx := range c.loadFtsIndexes() {
+			fx.pending.reset()
+		}
+	}
 }
 
 // getIndexInfos reads all index metadata for a collection from the system namespace
