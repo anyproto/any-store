@@ -18,9 +18,16 @@ import "bytes"
 // from strings and keys, so existing stored data contains no escape pairs
 // and parses bit-identically under these rules; NUL-free values also
 // encode bit-identically, so old and new encodings interoperate inside
-// the same btree. The only data the new scan would misread is an object
-// key whose FIRST byte is 0xFF (never valid UTF-8) written by the old
-// encoder; new writes emptyKey-prefix such keys.
+// the same btree. Two legacy shapes are documented as UNSUPPORTED — both
+// require an object key that is invalid UTF-8 at byte 0, which the JSON
+// ingestion path cannot produce, written by the OLD encoder:
+//   - a key whose first byte is 0xFF following a string value (the value's
+//     terminator plus that byte read as an escape pair); new writes
+//     emptyKey-prefix such keys;
+//   - a key starting with the two bytes (0x1F, 0xFF), which the decode
+//     prefix-strip rule below reads as a new-format escaped key "\xff...".
+// Numbers: -0.0 now encodes as +0.0 (see AppendFloat64); indexes built
+// before this change that contain -0.0 entries should be rebuilt.
 //
 // CAVEAT (prefix overlap): the encoding of "a" is a byte-prefix of the
 // encoding of "a\x00b" — unavoidable while keeping the old single-byte
@@ -32,9 +39,10 @@ import "bytes"
 // Object keys reserve their FIRST byte:
 //   - emptyKey (0x1F) alone encodes the empty key "";
 //   - a key whose first byte is 0x00 or 0xFF is prefixed with emptyKey.
-//     Decode strips the prefix only when the byte after it is 0x00 or
-//     0xFF — byte sequences the old encoder could never produce there —
-//     so old-format keys that genuinely START with 0x1F still decode
+//     Decode strips the prefix only when the byte after it is 0x00 (which
+//     the old encoder could never produce there) or 0xFF (possible in old
+//     data only for an invalid-UTF-8 key, unsupported — see above), so
+//     old-format keys that genuinely start with 0x1F otherwise decode
 //     verbatim. A key therefore never starts with EOS (keeps the
 //     end-of-object check unambiguous; a leading 0x00 would also invert
 //     to the inverted end-of-object 0xFF) nor with 0xFF (would collide

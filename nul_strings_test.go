@@ -1,7 +1,6 @@
 package anystore
 
 import (
-	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -166,7 +165,12 @@ func TestNulStrings(t *testing.T) {
 			}
 			require.NoError(t, it.Close())
 			assert.Len(t, got, len(names), field)
-			fmt.Printf("%s order: %q\n", field, got)
+			sorted := slices.Clone(names)
+			slices.Sort(sorted)
+			if field == "-name" {
+				slices.Reverse(sorted)
+			}
+			assert.Equal(t, sorted, got, field)
 		})
 	}
 }
