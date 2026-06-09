@@ -117,6 +117,15 @@ func TestFtsDatasetThroughput(t *testing.T) {
 	require.NoError(t, coll.Insert(ctx, docs...))
 	t.Logf("%-22s %8s %12s %12s %8.1f MB", "index loaded (held)", "-", "-", "-", float64(heapAlloc())/(1<<20))
 
+	// Real-corpus FTS index stats (correctness + storage breakdown).
+	if st, serr := coll.Stats(ctx); serr == nil && len(st.FtsIndexes) == 1 {
+		f := st.FtsIndexes[0]
+		t.Logf("fts stats: docs=%d vocab=%d tokens=%d avgDocLen=%.1f", f.DocCount, f.VocabSize, f.TotalTokens, f.AvgDocLen)
+		mb := func(b int) float64 { return float64(b) / (1 << 20) }
+		t.Logf("fts size:  total=%.1fMB  postings=%.1fMB vocab=%.1fMB docmap=%.1fMB docinfo=%.1fMB meta=%.1fMB  (docs btree=%.1fMB)",
+			mb(f.SizeBytes), mb(f.PostingsBytes), mb(f.VocabBytes), mb(f.DocmapBytes), mb(f.DocinfoBytes), mb(f.MetaBytes), mb(st.DocsSizeBytes))
+	}
+
 	// ---- search ----------------------------------------------------------
 	runQueries := func(label string, queries []string, repeats int) {
 		measure(label, len(queries)*repeats, func() {

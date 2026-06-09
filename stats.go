@@ -121,7 +121,11 @@ type CollectionStats struct {
 	// VectorIndexesSizeBytes is the sum of SizeBytes across all vector indexes.
 	VectorIndexesSizeBytes int
 
-	// TotalSizeBytes is DocsSizeBytes + IndexesSizeBytes + VectorIndexesSizeBytes.
+	// FtsIndexesSizeBytes is the sum of SizeBytes across all full-text indexes.
+	FtsIndexesSizeBytes int
+
+	// TotalSizeBytes is DocsSizeBytes + IndexesSizeBytes + VectorIndexesSizeBytes
+	// + FtsIndexesSizeBytes.
 	TotalSizeBytes int
 
 	// Indexes holds per-(range-)index statistics.
@@ -129,6 +133,36 @@ type CollectionStats struct {
 
 	// VectorIndexes holds per-vector-index statistics.
 	VectorIndexes []VectorIndexStats
+
+	// FtsIndexes holds per-full-text-index statistics.
+	FtsIndexes []FtsIndexStats
+}
+
+// FtsIndexStats reports the storage and corpus statistics of a full-text index.
+type FtsIndexStats struct {
+	// Name is the index name; Fields are the indexed text fields.
+	Name   string
+	Fields []string
+
+	// DocCount is the number of documents currently indexed (documents with no
+	// indexable text are excluded). VocabSize is the number of distinct terms.
+	// TotalTokens is the sum of all document lengths in tokens; AvgDocLen is the
+	// mean (TotalTokens/DocCount) — the BM25 length-normalization baseline.
+	DocCount    int
+	VocabSize   int
+	TotalTokens int
+	AvgDocLen   float64
+
+	// PostingsBytes / VocabBytes / DocmapBytes / DocinfoBytes / MetaBytes are the
+	// on-disk sizes of the five namespaces (the postings dominate).
+	PostingsBytes int
+	VocabBytes    int
+	DocmapBytes   int
+	DocinfoBytes  int
+	MetaBytes     int
+
+	// SizeBytes is the total physical size of the index (sum of the five).
+	SizeBytes int
 }
 
 // Stats walks the collection's document and index B-trees and reports their
@@ -142,6 +176,7 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 	name := c.name
 	indexes := append([]*index(nil), c.loadIndexes()...)
 	vindexes := append([]*vectorIndex(nil), c.loadVectorIndexes()...)
+	ftsindexes := append([]*ftsIndex(nil), c.loadFtsIndexes()...)
 	c.mu.Unlock()
 
 	stats.Name = name
@@ -271,13 +306,24 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 			stats.VectorIndexesSizeBytes += vstat.SizeBytes
 			stats.VectorIndexes = append(stats.VectorIndexes, vstat)
 		}
+
+		// Per-full-text-index statistics.
+		for _, fx := range ftsindexes {
+			fs, fErr := fx.computeStats(tx, pageSize)
+			if fErr != nil {
+				return fErr
+			}
+			stats.FtsIndexesSizeBytes += fs.SizeBytes
+			stats.FtsIndexes = append(stats.FtsIndexes, fs)
+		}
 		return nil
 	})
 	if err != nil {
 		return CollectionStats{}, err
 	}
 
-	stats.TotalSizeBytes = stats.DocsSizeBytes + stats.IndexesSizeBytes + stats.VectorIndexesSizeBytes
+	stats.TotalSizeBytes = stats.DocsSizeBytes + stats.IndexesSizeBytes +
+		stats.VectorIndexesSizeBytes + stats.FtsIndexesSizeBytes
 	if stats.StoredDocsBytes > 0 {
 		stats.CompressionRatio = float64(stats.UncompressedDocsBytes) / float64(stats.StoredDocsBytes)
 	} else {

@@ -287,6 +287,67 @@ func (m *ftsScoreAcc) grow() {
 	m.key, m.val, m.seen, m.mask = nkey, nval, nseen, nmask
 }
 
+// computeStats gathers the storage + corpus statistics of the full-text index:
+// the five namespaces' on-disk sizes plus the maintained counters (doc count,
+// total tokens) and the distinct-term count (vocab namespace entry count).
+func (fx *ftsIndex) computeStats(tx *btree.ReadTx, pageSize int) (FtsIndexStats, error) {
+	bytesOf := func(ns *btree.Namespace) (int, int, error) {
+		sz, err := tx.NamespaceSize(ns)
+		if err != nil {
+			return 0, 0, err
+		}
+		return sz.TotalPages() * pageSize, sz.Entries, nil
+	}
+
+	postBytes, _, err := bytesOf(fx.nsPost)
+	if err != nil {
+		return FtsIndexStats{}, err
+	}
+	vocabBytes, vocabEntries, err := bytesOf(fx.nsVocab)
+	if err != nil {
+		return FtsIndexStats{}, err
+	}
+	mapBytes, _, err := bytesOf(fx.nsMap)
+	if err != nil {
+		return FtsIndexStats{}, err
+	}
+	infoBytes, _, err := bytesOf(fx.nsDocinfo)
+	if err != nil {
+		return FtsIndexStats{}, err
+	}
+	metaBytes, _, err := bytesOf(fx.nsMeta)
+	if err != nil {
+		return FtsIndexStats{}, err
+	}
+
+	n, err := ftsGetUint(tx, fx.nsMeta, ftsMetaCount)
+	if err != nil {
+		return FtsIndexStats{}, err
+	}
+	totalTokens, err := ftsGetUint(tx, fx.nsMeta, ftsMetaTokens)
+	if err != nil {
+		return FtsIndexStats{}, err
+	}
+
+	fs := FtsIndexStats{
+		Name:          fx.info.Name,
+		Fields:        append([]string(nil), fx.info.Fields...),
+		DocCount:      int(n),
+		VocabSize:     vocabEntries,
+		TotalTokens:   int(totalTokens),
+		PostingsBytes: postBytes,
+		VocabBytes:    vocabBytes,
+		DocmapBytes:   mapBytes,
+		DocinfoBytes:  infoBytes,
+		MetaBytes:     metaBytes,
+	}
+	fs.SizeBytes = postBytes + vocabBytes + mapBytes + infoBytes + metaBytes
+	if n > 0 {
+		fs.AvgDocLen = float64(totalTokens) / float64(n)
+	}
+	return fs, nil
+}
+
 // postingsTermPrefix builds the key prefix shared by all chunks of a term:
 // uvarint(len(term)) | term. (postingsKey appends the 8-byte chunkID.)
 func postingsTermPrefix(dst []byte, term string) []byte {
