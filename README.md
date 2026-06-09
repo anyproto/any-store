@@ -14,6 +14,8 @@ Any Store brings schema‑less flexibility, rich indexes, ACID transactions, pag
 
 * **Mongo‑style queries** – `$in`, `$inc`, comparison & logical operators out of the box.
 * **Automatic indexes** – create, ensure or drop compound & unique indexes at runtime.
+* **Full‑text search** – btree‑resident inverted index with BM25 ranking, queried via `$text`. See [docs/full-text-search.md](docs/full-text-search.md).
+* **Vector search** – btree‑resident HNSW / IVF index for approximate nearest‑neighbour queries. See [docs/vector-search.md](docs/vector-search.md).
 * **ACID transactions** – explicit read / write transactions plus convenience helpers.
 * **Streaming iterators** – low‑memory scans with cursor API.
 * **Durability** – db flush and protections mechanisms in case of power-loss.
