@@ -157,21 +157,25 @@ Local 32c, with the int8 byte kernel (§ Distance backend):
 
 ### Cross-hardware (insert/s · search/s · index MiB · heap MiB)
 
-Three amd64 boxes, with the int8 byte kernel (after migration):
+Four machines, with the int8 byte kernel (after migration):
 
-| mode | 32c AVX512 | 16c AVX2 | 48c (no-AVX2) |
-|---|---|---|---|
-| HNSW btree int8 | 1044·1582·36·178 | 509·744·36·178 | 154·271·36·179 |
-| HNSW hyb+vc f32 | 892·3519·175·468 | 421·1920·175·468 | 123·856·175·469 |
-| IVF-PQ i8 np64 | 5295·506·39·257 | 2711·239·39·265 | 700·123·39·262 |
-| **IVF-SQ np64** | **8583·1041·35·180** | **4166·489·35·182** | **933·122·35·181** |
+| mode | 32c AVX512 | 16c AVX2 | 48c (no-AVX2) | 8c M-series arm64 NEON |
+|---|---|---|---|---|
+| HNSW btree int8 | 1044·1582·36·178 | 509·744·36·178 | 154·271·36·179 | 525·713·36·178 |
+| HNSW hyb+vc f32 | 892·3519·175·468 | 421·1920·175·468 | 123·856·175·469 | 500·1984·175·467 |
+| IVF-PQ i8 np64 | 5295·506·39·257 | 2711·239·39·265 | 700·123·39·262 | 2708·326·39·263 |
+| **IVF-SQ np64** | **8583·1041·35·180** | **4166·489·35·182** | **933·122·35·181** | **4883·691·35·183** |
 
 Recall, index size and heap are **arch-invariant**. IVF-SQ's write win holds on every
 machine — insert is **~6–9× HNSW** — as does its RAM parity with HNSW int8 and the
 lowest IVF index size (35 MiB). The **48c box has no AVX2**, so `internal/simd`
 dispatches to the pure-Go unrolled kernel (correct, recall-identical, just slower).
-**Apple-Silicon arm64 now runs NEON** (was scalar under vek); the self-contained
-`cmd/vbench` binary runs the same matrix there — M2 NEON numbers pending.
+
+**Apple-Silicon arm64 now runs NEON** (was a scalar fallback under vek). On an 8-core
+M-series Mac the same `cmd/vbench` all-in-one binary shows the scalar → NEON lift:
+HNSW btree-int8 **build 806 → 2991/s (~3.7×)**, p50 **4.64 → 1.37 ms**; hyb+vc int8
+build ~700 → **3719/s**; recall unchanged. The lift spans **every** mode (not just
+int8) because vek had no ARM SIMD at all — even f32 was scalar before.
 
 ### Distance backend & SIMD (`internal/simd`)
 

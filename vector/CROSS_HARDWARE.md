@@ -8,10 +8,12 @@ reopen-from-disk). All runs: `n=20000`, `dim=768`, cosine, ef=64, k=10.
 > **UPDATE (post-migration).** Distance now runs through `internal/simd` (vendored
 > weaviate asm: AVX2/AVX512 + NEON/SVE + pure-Go fallback), not `vek`. The
 > no-AVX2 box (`hp`) now dispatches to the **pure-Go unrolled kernel** (~682 ns vs
-> vek's ~870 ns at dim768 — the "Actionable" item below, done), and arm64 now runs
-> **NEON** instead of scalar. A fuller three-machine matrix over all index modes
-> (incl. the int8 byte kernel) lives in `docs/vector-engine.md` and
-> `any-store-vector/RESULTS.md`.
+> vek's ~870 ns at dim768 — the "Actionable" item below, done), and **arm64 now runs
+> NEON** instead of scalar: on an 8-core M-series Mac, HNSW btree-int8 build went
+> **806 → 2991/s (~3.7×)** and p50 **4.64 → 1.37 ms**, recall unchanged — the lift
+> spans every mode since vek had no ARM SIMD at all. A fuller four-machine matrix
+> over all index modes (incl. the int8 byte kernel) lives in `docs/vector-engine.md`
+> and `any-store-vector/RESULTS.md`.
 
 ```
 go build -o vectorbench ./cmd/vectorbench
