@@ -464,9 +464,18 @@ func makeArrComp(op Operator, v *anyenc.Value) (Filter, error) {
 func makeEqArray(v *anyenc.Value) []Filter {
 	vals, _ := v.Array()
 	res := make([]Filter, len(vals))
+	// All EqValues are marshaled into one shared buffer; offsets are recorded
+	// first and slices taken after the final append, so buffer reallocation
+	// during marshaling cannot invalidate earlier values.
+	var buf []byte
+	offs := make([]int, len(vals)+1)
+	for i, av := range vals {
+		buf = av.MarshalTo(buf)
+		offs[i+1] = len(buf)
+	}
 	for i, av := range vals {
 		eq := &Comp{CompOp: CompOpEq}
-		eq.EqValue = av.MarshalTo(nil)
+		eq.EqValue = buf[offs[i]:offs[i+1]:offs[i+1]]
 		eq.notArray = av.Type() != anyenc.TypeArray
 		res[i] = eq
 	}

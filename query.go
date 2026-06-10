@@ -560,11 +560,12 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	if len(idBounds) > 0 && q.isIDOnlyFilter() && q.offset == 0 && q.limit == 0 {
 		err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 			for i := range idBounds {
-				_, gerr := tx.Get(q.c.ns, idBounds[i].Start)
-				if gerr == nil {
-					count++
-				} else if gerr != btree.ErrKeyNotFound {
+				found, gerr := tx.Has(q.c.ns, idBounds[i].Start)
+				if gerr != nil {
 					return gerr
+				}
+				if found {
+					count++
 				}
 			}
 			return nil

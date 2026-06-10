@@ -262,8 +262,10 @@ type In struct {
 
 func NewInValue(values ...*anyenc.Value) In {
 	inValues := make(map[string]struct{}, len(values))
+	var scratch []byte // shared marshal buffer; the map key string is the only copy
 	for _, v := range values {
-		inValues[string(v.MarshalTo(nil))] = struct{}{}
+		scratch = v.MarshalTo(scratch[:0])
+		inValues[string(scratch)] = struct{}{}
 	}
 	return In{
 		Values: inValues,
@@ -300,9 +302,11 @@ func (e In) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	result := make(Bounds, len(bs), len(bs)+len(e.Values))
 	copy(result, bs)
 	for val := range e.Values {
+		// Start and End share one copy: bounds are read-only downstream.
+		b := []byte(val)
 		result = append(result, Bound{
-			Start:        []byte(val),
-			End:          []byte(val),
+			Start:        b,
+			End:          b,
 			StartInclude: true,
 			EndInclude:   true,
 		})
