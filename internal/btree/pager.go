@@ -147,18 +147,25 @@ type pager struct {
 	// Reusable slice for collecting dirty pages during commit
 	dirtyBuf []*page
 
-	// cellBuf is a reusable temp buffer for collectLeafCells / collectInteriorCells,
-	// matching SQLite's Pager.pTmpSpace (pager.c). Pre-allocated once at pager init
-	// and reused across defragment / balance / rebuild calls. Since writes are
-	// single-threaded, one buffer per pager is safe.
-	cellBuf []byte
+	// cellBufFree is a small bounded free-list of reusable temp buffers for
+	// collectLeafCells / collectInteriorCells, matching SQLite's scratch space
+	// (Pager.pTmpSpace / sqlite3ScratchMalloc, pager.c). A free-list rather than
+	// a single buffer because the balance path needs several alive AT ONCE: it
+	// gathers up to NB siblings and keeps each one's collected content buffer
+	// pinned while it redistributes (cellBufs in balanceNonroot). A single
+	// take-and-nil buffer forced the 2nd/3rd concurrent take to fall back to
+	// make() — the bulk of collectLeafCells' allocation churn during an
+	// append-heavy build. RAM stays controllable: at most cellScratchMax buffers
+	// are retained, each grows to at most the content size of one page, so the
+	// pool is bounded by ~cellScratchMax*pageSize (no sync.Pool, no unbounded
+	// growth). Since writes are single-threaded, the free-list needs no locking.
+	cellBufFree [][]byte
 
-	// cellSlice is a reusable []cellData for collectLeafCells, avoiding
-	// per-call allocation of the cells slice. Same take-and-nil pattern as
-	// cellBuf: taken by collectLeafCells, returned by callers via
-	// recycleCellSlice. Second concurrent call (merge path) finds nil and
-	// allocates fresh.
-	cellSlice []cellData
+	// cellSliceFree is the matching bounded free-list of reusable []cellData
+	// backing slices (SQLite apCell[]). Same rationale and bound as cellBufFree.
+	// recycleCellSlice clears entries before returning them so stale cellData
+	// headers do not pin old cellBuf backing arrays in the GC.
+	cellSliceFree [][]cellData
 
 	// dontWritePages tracks pages that were dirtied but whose content doesn't
 	// need to be persisted (e.g., freed leaf pages added to a freelist trunk).
@@ -288,14 +295,27 @@ func newPager(path string, pageSize uint32, cacheSize int, purgeable bool) *page
 	return p
 }
 
-// takeCellBuf returns the pager's reusable cell buffer if its capacity is >= minCap,
-// setting p.cellBuf to nil (take-and-nil pattern). Returns nil if no buffer is
-// available or it's too small. The caller owns the returned slice.
+// cellScratchMax bounds how many cell buffers / cellData slices the pager
+// retains in its scratch free-lists. The balance path's peak concurrent demand
+// is NB sibling buffers (nbMaxOut covers the gathered run plus output pages); a
+// couple of spares absorb the rewriteParentAfterBalance parent read overlapping
+// a cascade up the tree. Retained RAM is bounded by cellScratchMax*pageSize.
+const cellScratchMax = nbMaxOut + 3
+
+// takeCellBuf removes and returns a reusable cell buffer from the free-list
+// whose capacity is >= minCap. Returns nil if none qualifies (the caller then
+// allocates its own, which recycleCellBuf folds back into the pool). The caller
+// owns the returned slice until it recycles it.
 func (p *pager) takeCellBuf(minCap int) []byte {
-	if p.cellBuf != nil && cap(p.cellBuf) >= minCap {
-		buf := p.cellBuf[:0]
-		p.cellBuf = nil
-		return buf
+	for i := len(p.cellBufFree) - 1; i >= 0; i-- {
+		if cap(p.cellBufFree[i]) >= minCap {
+			buf := p.cellBufFree[i][:0]
+			last := len(p.cellBufFree) - 1
+			p.cellBufFree[i] = p.cellBufFree[last]
+			p.cellBufFree[last] = nil
+			p.cellBufFree = p.cellBufFree[:last]
+			return buf
+		}
 	}
 	return nil
 }
@@ -340,34 +360,81 @@ func (p *pager) readDBPage(pgno uint32, buf []byte) error {
 	return err
 }
 
-// recycleCellBuf returns a byte buffer to the pager for reuse. Keeps the larger
-// of the existing and returned buffers.
+// recycleCellBuf returns a byte buffer to the pager's free-list for reuse. If
+// the pool is full it keeps the larger buffers (replacing the smallest when the
+// incoming one is bigger), so the pool converges on page-content-sized buffers
+// and never grows past cellScratchMax entries.
 func (p *pager) recycleCellBuf(buf []byte) {
-	if cap(buf) > cap(p.cellBuf) {
-		p.cellBuf = buf[:0]
+	if cap(buf) == 0 {
+		return
+	}
+	if len(p.cellBufFree) < cellScratchMax {
+		p.cellBufFree = append(p.cellBufFree, buf[:0])
+		return
+	}
+	minI := 0
+	for i := 1; i < len(p.cellBufFree); i++ {
+		if cap(p.cellBufFree[i]) < cap(p.cellBufFree[minI]) {
+			minI = i
+		}
+	}
+	if cap(buf) > cap(p.cellBufFree[minI]) {
+		p.cellBufFree[minI] = buf[:0]
 	}
 }
 
-// takeCellSlice returns the pager's reusable cellData slice if its capacity
-// is >= minCap, setting p.cellSlice to nil (take-and-nil pattern). Returns nil
-// if no slice is available or it's too small.
+// takeCellSlice removes and returns a reusable cellData slice from the
+// free-list whose capacity is >= minCap. Returns nil if none qualifies (the
+// caller then allocates its own, which recycleCellSlice folds back into the
+// pool).
 func (p *pager) takeCellSlice(minCap int) []cellData {
-	if p.cellSlice != nil && cap(p.cellSlice) >= minCap {
-		s := p.cellSlice[:0]
-		p.cellSlice = nil
-		return s
+	for i := len(p.cellSliceFree) - 1; i >= 0; i-- {
+		if cap(p.cellSliceFree[i]) >= minCap {
+			s := p.cellSliceFree[i][:0]
+			last := len(p.cellSliceFree) - 1
+			p.cellSliceFree[i] = p.cellSliceFree[last]
+			p.cellSliceFree[last] = nil
+			p.cellSliceFree = p.cellSliceFree[:last]
+			return s
+		}
 	}
 	return nil
 }
 
-// recycleCellSlice returns a cellData slice to the pager for reuse. Keeps the
-// larger of the existing and returned slices. Clears all entries in the
-// returned slice to release references to cellBuf data, preventing stale
-// slice headers from pinning old buffers in the GC.
+// recycleCellSlice returns a cellData slice to the pager's free-list for reuse.
+// Clears all entries first to release references to cellBuf data, preventing
+// stale slice headers from pinning old buffers in the GC. When the pool is full
+// it keeps the larger slices, bounded at cellScratchMax entries.
 func (p *pager) recycleCellSlice(s []cellData) {
-	if cap(s) > cap(p.cellSlice) {
-		clear(s[:cap(s)])
-		p.cellSlice = s[:0]
+	if cap(s) == 0 {
+		return
+	}
+	clear(s[:cap(s)])
+	if len(p.cellSliceFree) < cellScratchMax {
+		p.cellSliceFree = append(p.cellSliceFree, s[:0])
+		return
+	}
+	minI := 0
+	for i := 1; i < len(p.cellSliceFree); i++ {
+		if cap(p.cellSliceFree[i]) < cap(p.cellSliceFree[minI]) {
+			minI = i
+		}
+	}
+	if cap(s) > cap(p.cellSliceFree[minI]) {
+		p.cellSliceFree[minI] = s[:0]
+	}
+}
+
+// initCellScratch (re-)seeds the cell-scratch free-list. It pre-allocates
+// nbSiblings page-content-sized buffers so the very first balance does not have
+// to make() its gathered-sibling buffers; the pool then self-tunes within the
+// cellScratchMax bound. Called from the pager init / re-open paths where the
+// usable page size is known. Replaces the former single-buffer pre-allocation.
+func (p *pager) initCellScratch() {
+	p.cellBufFree = p.cellBufFree[:0]
+	p.cellSliceFree = p.cellSliceFree[:0]
+	for i := 0; i < nbSiblings; i++ {
+		p.cellBufFree = append(p.cellBufFree, make([]byte, 0, p.usableSize_))
 	}
 }
 
@@ -570,7 +637,7 @@ func (p *pager) open() (err error) {
 	} else {
 		p.dbSize.Store(fileNPage)
 	}
-	p.cellBuf = make([]byte, 0, p.usableSize_)
+	p.initCellScratch()
 	p.writerCache = newPcache(int(p.pageSize), p.writerCache.maxPages, p.writerCache.purgeable)
 	p.writerCache.useSlab = p.useSlab
 	p.writerCache.xStress = p.pagerStress
@@ -716,7 +783,7 @@ func (p *pager) initNewDB() error {
 	}
 	// END ENCRYPTION
 	p.usableSize_ = int(p.pageSize) - int(p.header.ReservedSpace)
-	p.cellBuf = make([]byte, 0, p.usableSize_)
+	p.initCellScratch()
 
 	// Create page 1 with the database header and an empty leaf table page
 	buf := make([]byte, p.pageSize)

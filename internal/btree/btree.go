@@ -1575,11 +1575,13 @@ func (bt *btree) updateLeafCell(pg *page, idx int, key, value []byte, path []pat
 // This matches SQLite's balance_nonroot which never reads or frees overflow data during
 // rebalancing — overflow chains are only created/destroyed when cell content actually changes.
 //
-// Uses pager.cellBuf as reusable scratch space, modeled after SQLite's
-// Pager.pTmpSpace (pager.c). The buffer is "taken" from the pager on each call
-// and "returned" by the caller via pager.recycleCellBuf after the cells are
-// consumed. The take-and-nil pattern handles the merge path (two overlapping
-// calls) — the second call finds nil and allocates fresh.
+// Draws its scratch buffer and descriptor slice from the pager's bounded
+// free-lists (cellBufFree/cellSliceFree, SQLite Pager.pTmpSpace / apCell). The
+// buffer/slice are "taken" on each call and "returned" by the caller via
+// pager.recycleCellBuf/recycleCellSlice after the cells are consumed. The
+// free-list (rather than a single buffer) lets the balance path keep all NB
+// gathered siblings' buffers alive at once without falling back to make() — only
+// an empty free-list allocates fresh, and recycle folds that buffer back in.
 func (bt *btree) collectLeafCells(pg *page) ([]cellData, []byte, error) {
 	n := int(pg.header.cellCount)
 
@@ -1687,16 +1689,38 @@ func (bt *btree) cellFullKey(c *cellData) ([]byte, error) {
 	return fullKey, nil
 }
 
-// collectInteriorCells reads all cells from an interior page.
-// For cells with overflow keys, the full key is read from overflow pages
-// and the overflow chain is freed (since the caller will rebuild the page).
+// collectInteriorCellsKeepBuf reads all cells from an interior page and returns
+// the scratch content buffer to the caller INSTEAD of recycling it. Non-overflow
+// keys alias buf, so they stay valid for as long as the caller keeps buf alive;
+// the caller must return it via pager.recycleCellBuf when done.
 //
-// Uses pager.cellBuf as reusable scratch space (same buffer as collectLeafCells;
-// callers never interleave leaf and interior collection). Self-recycles the
-// buffer back to the pager at the end since interior collection never overlaps.
-func (bt *btree) collectInteriorCells(pg *page) ([]cellData, error) {
+// This is the lifetime contract the balance path needs: rewriteParentAfterBalance
+// splices the parent's existing divider keys into the rebuilt parent, and by
+// holding buf across the rebuild it can alias those keys directly instead of
+// cloning every one (the former per-divider bytes.Clone was the single largest
+// object producer of the index-build allocation profile). buf never grows past
+// the page content size (the total non-overflow key bytes are a subset of the
+// page content it was sized for), so the appends below never reallocate and the
+// returned aliases are stable.
+//
+// For cells with overflow keys the full key is read from overflow pages and the
+// overflow chain is freed (the caller will rebuild the page); such keys are
+// freshly allocated and do not alias buf.
+func (bt *btree) collectInteriorCellsKeepBuf(pg *page) ([]cellData, []byte, error) {
 	n := int(pg.header.cellCount)
-	cells := make([]cellData, n)
+	// Draw the descriptor slice from the pager free-list (SQLite apCell[]); this
+	// make() was the largest remaining byte producer of the interleaved index
+	// build. The caller returns it via pager.recycleCellSlice once it has read
+	// out everything it needs — rewriteParentAfterBalance does so right after
+	// splicing the dividers (it has copied each leftChild and aliased each key
+	// into oldDivs by then). The self-recycling collectInteriorCells wrapper and
+	// its callers leave it for GC, same as before (they keep the slice live).
+	cells := bt.pager.takeCellSlice(n)
+	if cells != nil {
+		cells = cells[:n]
+	} else {
+		cells = make([]cellData, n)
+	}
 	usable := bt.usablePageSize()
 	maxLocal := maxLocalPayload(usable)
 
@@ -1710,7 +1734,7 @@ func (bt *btree) collectInteriorCells(pg *page) ([]cellData, error) {
 		contentSize = 0
 	}
 
-	// Take pager's reusable buffer.
+	// Take a reusable buffer from the pager's free-list.
 	buf := bt.pager.takeCellBuf(contentSize)
 	if buf == nil {
 		buf = make([]byte, 0, contentSize)
@@ -1736,7 +1760,7 @@ func (bt *btree) collectInteriorCells(pg *page) ([]cellData, error) {
 				// chains during balance (btree.c:8473-8489); errors propagate up the
 				// balance() do-loop as SQLITE_CORRUPT/IO (btree.c:9131-9242).
 				bt.pager.recycleCellBuf(buf)
-				return nil, err
+				return nil, nil, err
 			}
 			_ = bt.pager.freeOverflowChain(overflowPg)
 			cells[i].key = fullKey
@@ -1750,7 +1774,20 @@ func (bt *btree) collectInteriorCells(pg *page) ([]cellData, error) {
 		_ = maxLocal
 	}
 
-	// Return buffer to pager for reuse.
+	return cells, buf, nil
+}
+
+// collectInteriorCells reads all cells from an interior page, self-recycling its
+// scratch buffer at the end. The returned keys alias the pager's shared scratch
+// buffer (now back in the free-list), so they remain valid only until the next
+// collect/take on this pager — the contract every non-balance caller relies on
+// (each rebuilds its page immediately, with no intervening collect). Callers that
+// must outlive that window use collectInteriorCellsKeepBuf instead.
+func (bt *btree) collectInteriorCells(pg *page) ([]cellData, error) {
+	cells, buf, err := bt.collectInteriorCellsKeepBuf(pg)
+	if err != nil {
+		return nil, err
+	}
 	bt.pager.recycleCellBuf(buf)
 	return cells, nil
 }
