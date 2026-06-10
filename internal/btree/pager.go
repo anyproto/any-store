@@ -3248,6 +3248,12 @@ func (p *pager) close() error {
 					if debugTrace {
 						trace("close: TRUNCATING WAL (cpErr=nil isLastClient=true) nBackfill=%d mxFrame=%d",
 							p.wal.index.nBackfill.Load(), p.wal.authoritativeMxFrame())
+						// Forensic aid (debugtrace builds only): keep the exact WAL
+						// bytes the close-time checkpoint consumed, so a post-mortem
+						// can replay the backfill decision after truncation.
+						if walBytes, rerr := os.ReadFile(p.path + "-wal"); rerr == nil {
+							_ = os.WriteFile(p.path+"-wal.pretruncate", walBytes, 0644)
+						}
 					}
 					p.wal.truncateFile()
 				} else if debugTrace {
