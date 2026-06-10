@@ -577,7 +577,82 @@ func (ix *Index) tombstoneLabel(wtx *btree.WriteTx, label uint32, mt *meta) erro
 	}
 	mt.count--
 	mt.deletedCount++
-	return wtx.Put(ix.vadj, labelKey(kbuf, label), encodeAdj(nil, level, true, nbrs))
+	if err = wtx.Put(ix.vadj, labelKey(kbuf, label), encodeAdj(nil, level, true, nbrs)); err != nil {
+		return err
+	}
+	// Searches start at the entry point and only route THROUGH tombstones;
+	// tombstoning the entry without repointing leaves a dead start — in the
+	// degenerate case (entry with no live neighbour, e.g. a one-document
+	// collection being updated) every subsequent search returned empty
+	// forever (BUG-18 in any-store-tests).
+	if mt.hasEntry && label == mt.entryLabel {
+		return ix.repointEntry(wtx, mt, nbrs)
+	}
+	return nil
+}
+
+// repointEntry moves the search entry off a just-tombstoned node onto a live
+// one. Preference order: the dead entry's own neighbours, highest layer first
+// (they are the natural hubs and cost O(M) adjacency reads); otherwise any
+// live document via the vdoc namespace, which excludes tombstones by
+// construction. topLayer follows the new entry's level — search descends from
+// there, so a lower level is merely less accelerated, never wrong; a later
+// higher-level insert raises it again. When no live node remains, hasEntry is
+// cleared: searches correctly return nothing and the next Insert re-seeds the
+// entry (the single-document update case).
+func (ix *Index) repointEntry(wtx *btree.WriteTx, mt *meta, deadNbrs [][]uint32) error {
+	mt.hasEntry, mt.entryLabel, mt.topLayer = false, 0, 0
+	if mt.count <= 0 {
+		return nil
+	}
+	rtx := &wtx.ReadTx
+	var kbuf []byte
+	setEntry := func(label uint32) (bool, error) {
+		adjBytes, err := rtx.Get(ix.vadj, labelKey(kbuf, label))
+		if errors.Is(err, btree.ErrKeyNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		level, deleted, _, derr := decodeAllAdj(adjBytes)
+		if derr != nil {
+			return false, derr
+		}
+		if deleted {
+			return false, nil
+		}
+		mt.hasEntry, mt.entryLabel, mt.topLayer = true, label, level
+		return true, nil
+	}
+	for l := len(deadNbrs) - 1; l >= 0; l-- {
+		for _, nb := range deadNbrs[l] {
+			ok, err := setEntry(nb)
+			if err != nil || ok {
+				return err
+			}
+		}
+	}
+	// Disconnected entry (no live neighbour): fall back to any live doc.
+	cur := rtx.NewCursor(ix.vdoc)
+	defer cur.Close()
+	if err := cur.First(); err != nil {
+		return err
+	}
+	for cur.Valid() {
+		lb, verr := cur.Value()
+		if verr != nil {
+			return verr
+		}
+		ok, err := setEntry(binary.LittleEndian.Uint32(lb))
+		if err != nil || ok {
+			return err
+		}
+		if err = cur.Next(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
