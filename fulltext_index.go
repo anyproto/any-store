@@ -73,6 +73,17 @@ type ftsIndex struct {
 	termBufB map[string][]uint32 // reused term->positions for new-doc in updateDoc
 	chunkPL  []fts.Posting
 	mergeBuf []fts.Posting // flushChunk merge scratch
+
+	// flushChunk scratch: decoded-positions arena, existing-chunk value buffer,
+	// sorted added-id buffer — all reused across chunks and transactions.
+	posDecode   []uint32
+	chunkValBuf []byte
+	addIDsBuf   []uint64
+
+	// posFree recycles per-term position slices harvested by termPostingsInto
+	// when it clears its map (clear() would otherwise drop their capacity and
+	// force one allocation per distinct term per document).
+	posFree [][]uint32
 }
 
 func newFtsIndex(c *collection, info IndexInfo) (*ftsIndex, error) {
@@ -188,14 +199,28 @@ func (fx *ftsIndex) appendText(dst []fts.Token, text string, base uint32) []fts.
 // per-document map allocation on the hot write path. Returns the (same) map and
 // the document length. Tokens arrive in ascending position order, so the lists
 // are already sorted.
-func termPostingsInto(dst map[string][]uint32, tokens []fts.Token) (map[string][]uint32, uint32) {
+func (fx *ftsIndex) termPostingsInto(dst map[string][]uint32, tokens []fts.Token) (map[string][]uint32, uint32) {
 	if dst == nil {
 		dst = make(map[string][]uint32, len(tokens))
 	} else {
+		// Harvest the previous document's position slices for reuse before
+		// clearing the map.
+		for _, v := range dst {
+			if cap(v) > 0 {
+				fx.posFree = append(fx.posFree, v[:0])
+			}
+		}
 		clear(dst)
 	}
 	for _, t := range tokens {
-		dst[t.Term] = append(dst[t.Term], t.Pos)
+		cur, ok := dst[t.Term]
+		if !ok {
+			if n := len(fx.posFree); n > 0 {
+				cur = fx.posFree[n-1]
+				fx.posFree = fx.posFree[:n-1]
+			}
+		}
+		dst[t.Term] = append(cur, t.Pos)
 	}
 	return dst, uint32(len(tokens))
 }
@@ -293,7 +318,7 @@ func postingsKey(dst []byte, term string, chunkID uint64) []byte {
 func (fx *ftsIndex) insertDoc(tx *btree.WriteTx, it item) error {
 	fx.tokBuf = fx.analyzeInto(fx.tokBuf, it)
 	var docLen uint32
-	fx.termBufA, docLen = termPostingsInto(fx.termBufA, fx.tokBuf)
+	fx.termBufA, docLen = fx.termPostingsInto(fx.termBufA, fx.tokBuf)
 	terms := fx.termBufA
 	if docLen == 0 {
 		// Nothing to index (no text / empty fields). The doc is simply absent
@@ -346,7 +371,7 @@ func (fx *ftsIndex) deleteDoc(tx *btree.WriteTx, it item) error {
 	}
 	fx.tokBuf = fx.analyzeInto(fx.tokBuf, it)
 	var docLen uint32
-	fx.termBufA, docLen = termPostingsInto(fx.termBufA, fx.tokBuf)
+	fx.termBufA, docLen = fx.termPostingsInto(fx.termBufA, fx.tokBuf)
 	return fx.removeIndexedDoc(tx, stringID, docID, fx.termBufA, docLen)
 }
 
@@ -395,10 +420,10 @@ func (fx *ftsIndex) updateDoc(tx *btree.WriteTx, oldIt, newIt item) error {
 
 	fx.tokBuf = fx.analyzeInto(fx.tokBuf, oldIt)
 	var oldLen, newLen uint32
-	fx.termBufA, oldLen = termPostingsInto(fx.termBufA, fx.tokBuf)
+	fx.termBufA, oldLen = fx.termPostingsInto(fx.termBufA, fx.tokBuf)
 	oldTerms := fx.termBufA
 	fx.tokBufB = fx.analyzeInto(fx.tokBufB, newIt)
-	fx.termBufB, newLen = termPostingsInto(fx.termBufB, fx.tokBufB)
+	fx.termBufB, newLen = fx.termPostingsInto(fx.termBufB, fx.tokBufB)
 	newTerms := fx.termBufB
 
 	if newLen == 0 {

@@ -3,6 +3,7 @@ package fts
 import (
 	"encoding/binary"
 	"errors"
+	"slices"
 )
 
 // Postings chunk format (the value stored at fts:postings key Tuple(term, chunkID)):
@@ -82,15 +83,30 @@ func AppendChunk(dst []byte, postings []Posting) []byte {
 // be nil). It materializes positions; the read path should prefer ChunkReader to
 // skip position decoding for documents it does not need.
 func DecodeChunk(dst []Posting, blob []byte) ([]Posting, error) {
+	dst, _, err := DecodeChunkInto(dst, nil, blob)
+	return dst, err
+}
+
+// DecodeChunkInto is DecodeChunk with a caller-reused position buffer: every
+// posting's Positions slice references posBuf's backing array, so a whole-chunk
+// decode costs zero steady-state allocations instead of one per posting. posBuf
+// is grown once up front to a safe upper bound (each encoded position is at
+// least one byte), which guarantees the returned subslices are never
+// invalidated by reallocation.
+func DecodeChunkInto(dst []Posting, posBuf []uint32, blob []byte) ([]Posting, []uint32, error) {
 	r, err := NewChunkReader(blob)
 	if err != nil {
-		return dst, err
+		return dst, posBuf, err
+	}
+	if need := len(blob) - (cap(posBuf) - len(posBuf)); need > 0 {
+		posBuf = slices.Grow(posBuf, len(blob))
 	}
 	for r.Next() {
-		positions := r.AppendPositions(nil)
-		dst = append(dst, Posting{DocID: r.DocID(), Positions: positions})
+		start := len(posBuf)
+		posBuf = r.AppendPositions(posBuf)
+		dst = append(dst, Posting{DocID: r.DocID(), Positions: posBuf[start:len(posBuf):len(posBuf)]})
 	}
-	return dst, r.Err()
+	return dst, posBuf, r.Err()
 }
 
 // ChunkReader streams documents out of a chunk blob without allocating, decoding
