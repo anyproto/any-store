@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/valyala/fastjson"
@@ -259,6 +260,14 @@ func (e And) String() string {
 
 type In struct {
 	Values map[string]struct{}
+
+	// sorted holds the marshaled values in ascending byte order (== anyenc
+	// value order == btree key order), built once by NewInValue. IndexBounds
+	// emits bounds in this order so the executor walks the btree
+	// monotonically (hot interior pages, leaves touched in sequence) and the
+	// per-call sort+merge is skipped — unique point bounds are already
+	// disjoint. nil for a hand-constructed In, which falls back to sorting.
+	sorted []string
 }
 
 func NewInValue(values ...*anyenc.Value) In {
@@ -269,14 +278,23 @@ func NewInValue(values ...*anyenc.Value) In {
 	// mutated: when append grows the arena, keys created earlier keep the
 	// previous backing array alive with their bytes intact.
 	var arena []byte
+	sorted := make([]string, 0, len(values))
 	for _, v := range values {
 		start := len(arena)
 		arena = v.MarshalTo(arena)
 		span := arena[start:]
-		inValues[unsafe.String(unsafe.SliceData(span), len(span))] = struct{}{}
+		key := unsafe.String(unsafe.SliceData(span), len(span))
+		if _, dup := inValues[key]; dup {
+			arena = arena[:start] // duplicate input value — reuse the span
+			continue
+		}
+		inValues[key] = struct{}{}
+		sorted = append(sorted, key)
 	}
+	slices.Sort(sorted)
 	return In{
 		Values: inValues,
+		sorted: sorted,
 	}
 }
 
@@ -288,14 +306,17 @@ func (e In) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 		if v.Type() == anyenc.TypeArray {
 			arr, _ := v.Array()
 			for _, item := range arr {
-				_, ok := e.Values[string(item.MarshalTo(docBuf.SmallBuf[:0]))]
-				if ok {
+				// Store the grown buffer back so the marshal is alloc-free
+				// from the second document on (Comp.Ok does the same).
+				docBuf.SmallBuf = item.MarshalTo(docBuf.SmallBuf[:0])
+				if _, ok := e.Values[string(docBuf.SmallBuf)]; ok {
 					return true
 				}
 			}
 			return false
 		} else {
-			_, ok := e.Values[string(v.MarshalTo(docBuf.SmallBuf[:0]))]
+			docBuf.SmallBuf = v.MarshalTo(docBuf.SmallBuf[:0])
+			_, ok := e.Values[string(docBuf.SmallBuf)]
 			return ok
 		}
 	} else {
@@ -307,14 +328,27 @@ func (e In) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	if len(e.Values) >= orExpressionLimit {
 		return bs
 	}
+	// Fast path: no incoming bounds and the pre-sorted key list is intact.
+	// The unique point bounds are emitted ascending and are pairwise
+	// disjoint, so the result is already in SortAndMerge's canonical form —
+	// and the executor gets a monotonic btree access pattern for free.
+	if len(bs) == 0 && len(e.sorted) == len(e.Values) {
+		result := make(Bounds, 0, len(e.sorted))
+		for _, val := range e.sorted {
+			b := inBoundBytes(val)
+			result = append(result, Bound{
+				Start:        b,
+				End:          b,
+				StartInclude: true,
+				EndInclude:   true,
+			})
+		}
+		return result
+	}
 	result := make(Bounds, len(bs), len(bs)+len(e.Values))
 	copy(result, bs)
 	for val := range e.Values {
-		// Zero-copy: the Bound aliases the map key string's bytes. Bound
-		// bytes are never written in place downstream, and unsafe.Slice
-		// yields cap == len, so even the planner's bound-extension appends
-		// are forced to reallocate rather than scribble over the string.
-		b := unsafe.Slice(unsafe.StringData(val), len(val))
+		b := inBoundBytes(val)
 		result = append(result, Bound{
 			Start:        b,
 			End:          b,
@@ -323,6 +357,14 @@ func (e In) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 		})
 	}
 	return result.SortAndMerge()
+}
+
+// inBoundBytes aliases a map key string's bytes for use as a read-only bound.
+// Bound bytes are never written in place downstream, and unsafe.Slice yields
+// cap == len, so even the planner's bound-extension appends are forced to
+// reallocate rather than scribble over the string.
+func inBoundBytes(val string) []byte {
+	return unsafe.Slice(unsafe.StringData(val), len(val))
 }
 
 func (e In) String() string {
