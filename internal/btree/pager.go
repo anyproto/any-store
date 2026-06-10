@@ -3248,13 +3248,18 @@ func (p *pager) close() error {
 					if debugTrace {
 						trace("close: TRUNCATING WAL (cpErr=nil isLastClient=true) nBackfill=%d mxFrame=%d",
 							p.wal.index.nBackfill.Load(), p.wal.authoritativeMxFrame())
-						// Forensic aid (debugtrace builds only): keep the exact WAL
-						// bytes the close-time checkpoint consumed, so a post-mortem
-						// can replay the backfill decision after truncation.
+					}
+					// Forensic aid: BTREE_KEEP_WAL_ON_CLOSE=1 keeps the exact WAL
+					// bytes the close-time checkpoint consumed, so a post-mortem can
+					// replay the backfill decision after truncation. Deliberately NOT
+					// tied to debugtrace: trace logging serializes the hot paths
+					// (logger mutex + write syscalls) and suppresses the very races
+					// being hunted. One getenv + one file copy at close is inert.
+					// O_EXCL: first close wins (the workload process), so a later
+					// verifier open+close cannot clobber the evidence with its
+					// already-truncated WAL.
+					if os.Getenv("BTREE_KEEP_WAL_ON_CLOSE") == "1" {
 						if walBytes, rerr := os.ReadFile(p.path + "-wal"); rerr == nil {
-							// O_EXCL: first close wins (the workload process), so a
-							// later verifier open+close cannot clobber the evidence
-							// with its already-truncated WAL.
 							if f, ferr := os.OpenFile(p.path+"-wal.pretruncate", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644); ferr == nil {
 								_, _ = f.Write(walBytes)
 								_ = f.Close()
