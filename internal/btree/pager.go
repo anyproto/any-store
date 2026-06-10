@@ -89,6 +89,13 @@ type pager struct {
 	dbSize      atomic.Uint32 // database size in pages (atomic: writer increments, readers bounds-check)
 	state       atomic.Int32  // pagerState
 
+	// closeInvalidated is set by rollbackForClose when DB.Close force-rolls
+	// back an in-flight write transaction. Writer-state guards consult it via
+	// writeStateErr so the abandoned writer goroutine observes ErrClosed
+	// rather than ErrReadOnly. Never cleared: once Close has invalidated the
+	// writer, the database is closing for good.
+	closeInvalidated atomic.Bool
+
 	// balanceQuickDispatchCount counts dispatches into splitLeafRightmostAppend.
 	// Test-only: production code never reads it (atomic load is ~ns). Used to
 	// verify the dispatch guard exercises both branches in the test matrix.
@@ -1367,11 +1374,22 @@ func (p *pager) readRawPage(pgno, walMaxFrame uint32) ([]byte, error) {
 
 // END ENCRYPTION
 
+// writeStateErr returns the error for a write operation attempted while the
+// pager is not in pagerWriter state: ErrClosed when the write transaction was
+// force-rolled-back by DB.Close (the writer goroutine lost its transaction to
+// Close, not to a read-only misuse), ErrReadOnly otherwise.
+func (p *pager) writeStateErr() error {
+	if p.closeInvalidated.Load() {
+		return ErrClosed
+	}
+	return ErrReadOnly
+}
+
 // getWritablePage returns a page ready for writing. It marks the page as dirty
 // and saves a copy for savepoint rollback if needed.
 func (p *pager) getWritablePage(pgno uint32) (*page, error) {
 	if pagerState(p.state.Load()) != pagerWriter {
-		return nil, ErrReadOnly
+		return nil, p.writeStateErr()
 	}
 
 	// Check writer cache first. Spilled pages (clean but still cached)
@@ -1459,7 +1477,7 @@ func (p *pager) allocatePage() (*page, error) {
 // a hint has no meaning there.
 func (p *pager) allocatePageNear(nearby uint32) (*page, error) {
 	if pagerState(p.state.Load()) != pagerWriter {
-		return nil, ErrReadOnly
+		return nil, p.writeStateErr()
 	}
 
 	// Check freelist first. Matches SQLite allocateBtreePage
@@ -1515,7 +1533,7 @@ func (p *pager) freelistMaxLeaves() int {
 // DRIFT: freelist trunk fills to usableSize/4-2 (corruption ceiling), not SQLite's usableSize/4-8 See docs/btree/NOTES.md#old-drift-freelist-trunk-fill-bound-corruption-ceiling
 func (p *pager) freePage(pgno uint32) error {
 	if pagerState(p.state.Load()) != pagerWriter {
-		return ErrReadOnly
+		return p.writeStateErr()
 	}
 	if pgno == 0 || pgno == 1 {
 		return ErrInvalidPage
@@ -2215,7 +2233,7 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 	p.writerOpMu.Lock()
 	defer p.writerOpMu.Unlock()
 	if pagerState(p.state.Load()) != pagerWriter {
-		return 0, 0, 0, ErrReadOnly
+		return 0, 0, 0, p.writeStateErr()
 	}
 
 	if debugTrace {
@@ -2427,6 +2445,12 @@ func (p *pager) rollbackForClose() {
 		return
 	}
 
+	// Mark the writer transaction as invalidated by Close BEFORE demoting
+	// the pager state: the abandoned writer goroutine loads the state first
+	// and then calls writeStateErr, so this ordering guarantees it observes
+	// ErrClosed rather than ErrReadOnly.
+	p.closeInvalidated.Store(true)
+
 	// Roll back spilled frames in the WAL index.
 	// index.rollbackToFrame and nFrame are safe (own locking / atomic).
 	p.wal.index.rollbackToFrame(p.savedWalFrame.Load())
@@ -2521,7 +2545,7 @@ func (p *pager) freeSavepointPageBuffers(from, to int) {
 // Page copies are saved lazily in getWritablePage when pages are actually modified.
 func (p *pager) savepoint() (int, error) {
 	if pagerState(p.state.Load()) != pagerWriter {
-		return 0, ErrReadOnly
+		return 0, p.writeStateErr()
 	}
 
 	id := len(p.savepoints)
@@ -2548,7 +2572,7 @@ func (p *pager) savepoint() (int, error) {
 // rollbackToSavepoint rolls back to the given savepoint, restoring pages.
 func (p *pager) rollbackToSavepoint(id int) error {
 	if pagerState(p.state.Load()) != pagerWriter {
-		return ErrReadOnly
+		return p.writeStateErr()
 	}
 	if id < 0 || id >= len(p.savepoints) {
 		return ErrInvalidSavepoint
@@ -2667,7 +2691,7 @@ func (p *pager) rollbackToSavepoint(id int) error {
 // DRIFT: out-of-range savepoint release errors in Go vs C documented no-op (OK) See docs/btree/NOTES.md#drift-61-out-of-range-savepoint-release-errors-instead-of-no-op
 func (p *pager) releaseSavepoint(id int) error {
 	if pagerState(p.state.Load()) != pagerWriter {
-		return ErrReadOnly
+		return p.writeStateErr()
 	}
 	if id < 0 || id >= len(p.savepoints) {
 		return ErrInvalidSavepoint
@@ -2754,7 +2778,7 @@ func (p *pager) writeOverflowChain(data []byte) (uint32, error) {
 // This matches SQLite's fillInCell streaming pattern (btree.c:7158-7239).
 func (p *pager) writeOverflowChainMulti(segments ...[]byte) (uint32, error) {
 	if pagerState(p.state.Load()) != pagerWriter {
-		return 0, ErrReadOnly
+		return 0, p.writeStateErr()
 	}
 
 	usable := overflowPageUsable(p.usableSize())
@@ -3056,7 +3080,7 @@ func (p *pager) freeOverflowChain(firstPgno uint32) error {
 // DRIFT: truncateTo eagerly drops dirty pages (savepoint hazard) + adds non-C guards See docs/btree/NOTES.md#drift-79-truncateto-eager-dirty-page-drop-and-extra-guards
 func (p *pager) truncateTo(newDbSize uint32) error {
 	if pagerState(p.state.Load()) != pagerWriter {
-		return ErrReadOnly
+		return p.writeStateErr()
 	}
 	if newDbSize == 0 {
 		return errors.New("btree: cannot truncate to zero pages")

@@ -3282,6 +3282,32 @@ func TestWriteTxAbandonedDoesNotDeadlockClose(t *testing.T) {
 	}
 }
 
+// A write tx force-rolled-back by Close must report ErrClosed (not
+// ErrReadOnly) from every subsequent operation on the orphaned handle.
+func TestWriteTxInvalidatedByCloseReturnsErrClosed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	db, err := testOpen(t, path, DefaultOptions())
+	require.NoError(t, err)
+
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("t")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, []byte("k"), []byte("v")))
+
+	// Close force-rolls-back the in-flight tx (Bug 14 path) and returns.
+	require.NoError(t, db.Close())
+
+	// The orphaned handle is still usable by its goroutine; every write
+	// operation must surface ErrClosed.
+	assert.ErrorIs(t, tx.Put(ns, []byte("k2"), []byte("v2")), ErrClosed)
+	_, err = tx.Savepoint()
+	assert.ErrorIs(t, err, ErrClosed)
+	assert.ErrorIs(t, tx.Commit(), ErrClosed)
+}
+
 func TestWriteTxAbandonedThenNewWriteTxWorks(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
