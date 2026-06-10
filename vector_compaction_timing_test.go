@@ -1,12 +1,23 @@
 package anystore
 
 import (
+	"os"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/stretchr/testify/require"
 )
+
+func envIntDefault(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
 
 func vecDocArena(a *anyenc.Arena, id int, vec []float32) *anyenc.Value {
 	a.Reset()
