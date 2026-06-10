@@ -74,6 +74,12 @@ var (
 	// ErrDatabaseOpen indicates the database file is already open in this process.
 	ErrDatabaseOpen = errors.New("btree: database already open in this process")
 
+	// ErrInProcessLocked indicates the database file is held by a DIFFERENT
+	// process. In-process mode uses heap-backed (process-local) WAL-index shared
+	// memory, so it is single-process only; on open it takes an exclusive
+	// whole-file lock and reports this error if another process already holds it.
+	ErrInProcessLocked = errors.New("btree: database is open by another process (in-process mode is single-process only)")
+
 	// ErrPageSlabNotInitialized indicates UsePageSlab was set but the global
 	// page slab was not initialized via ConfigPageCache.
 	ErrPageSlabNotInitialized = errors.New("btree: page slab not initialized (call ConfigPageCache first)")
