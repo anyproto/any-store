@@ -10,6 +10,7 @@ import (
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/syncpool"
+	"unsafe"
 )
 
 type Filter interface {
@@ -262,10 +263,17 @@ type In struct {
 
 func NewInValue(values ...*anyenc.Value) In {
 	inValues := make(map[string]struct{}, len(values))
-	var scratch []byte // shared marshal buffer; the map key string is the only copy
+	// All values are marshaled into one grow-only arena and the map keys are
+	// unsafe.Strings over their arena spans — no per-element key allocation.
+	// This is safe because the arena bytes are written once and never
+	// mutated: when append grows the arena, keys created earlier keep the
+	// previous backing array alive with their bytes intact.
+	var arena []byte
 	for _, v := range values {
-		scratch = v.MarshalTo(scratch[:0])
-		inValues[string(scratch)] = struct{}{}
+		start := len(arena)
+		arena = v.MarshalTo(arena)
+		span := arena[start:]
+		inValues[unsafe.String(unsafe.SliceData(span), len(span))] = struct{}{}
 	}
 	return In{
 		Values: inValues,
@@ -302,8 +310,11 @@ func (e In) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	result := make(Bounds, len(bs), len(bs)+len(e.Values))
 	copy(result, bs)
 	for val := range e.Values {
-		// Start and End share one copy: bounds are read-only downstream.
-		b := []byte(val)
+		// Zero-copy: the Bound aliases the map key string's bytes. Bound
+		// bytes are never written in place downstream, and unsafe.Slice
+		// yields cap == len, so even the planner's bound-extension appends
+		// are forced to reallocate rather than scribble over the string.
+		b := unsafe.Slice(unsafe.StringData(val), len(val))
 		result = append(result, Bound{
 			Start:        b,
 			End:          b,
