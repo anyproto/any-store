@@ -227,8 +227,11 @@ every insert, update, and delete.
 - **Interactive edits are cheap.** The diff-based update touches only changed
   terms, so editing a small note runs at tens of thousands of edits/second.
 - **Queries are interactive.** BM25 ranking over the postings is sub-millisecond
-  to low-milliseconds at local-first scale (10k–1M docs); a pooled, pointer-free
-  score accumulator keeps query allocation flat.
+  to low-milliseconds at local-first scale (10k–1M docs). Allocation is flat in
+  corpus and match count (~65 allocs / a few KB per relevance-ordered query,
+  measured at 20k and 38k indexed chunks): scoring runs in pooled, pointer-free
+  flat tables and candidates stream to the iterator, so a Limit-cut query
+  materializes only the documents it returns.
 - **Index size.** The inverted index is roughly comparable to the source text
   size (positions are stored, which is ~half of the postings). It is already
   entropy-coded (delta-varint integers); general-purpose byte compression does

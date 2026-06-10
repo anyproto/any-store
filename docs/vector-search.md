@@ -191,7 +191,7 @@ treat them as ratios, not absolutes (they scale with N, dim, and hardware).
 | **Default / unsure** | `Hybrid` + `Int8`, `EfSearch 64` | the mirror costs only a few MiB and is never slower than btree; int8 is ~4× smaller at ~0.5% recall cost |
 | **Lowest latency, RAM to spare** | `Hybrid` + `HybridCacheVectors` + `Int8` (or f32) | vectors served from RAM → sub-0.3 ms p50, ~3–9× the btree QPS; costs ≈ the stored vector size in RAM |
 | **Lowest RAM / many indexes / multi-process writers** | `BTree` + `Int8` | no RAM-resident layer beyond the btree page cache |
-| **Small set (≲ a few k) or exact 100% recall** | `BruteForce` | exact O(N) scan, zero index storage, fastest writes |
+| **Small set (≲ tens of k) or exact 100% recall** | `BruteForce` | exact O(N) scan, zero index storage, fastest writes; ~7 µs/doc at dim 768 on desktop CPUs |
 | **Delete/update-heavy** | any mode + `CompactRatio 0.5` | caps tombstone growth — see below |
 | **Recall-tolerant / first-stage retrieval** | lower `Dim` (MRL 768→128) + `Int8` | ~2× faster, ~4× smaller; re-rank survivors at full dim |
 
@@ -212,7 +212,14 @@ treat them as ratios, not absolutes (they scale with N, dim, and hardware).
   label high-water mark, so heavy churn inflates RAM until a compaction — see
   `CompactRatio`.
 - **`VectorModeBruteForce`** — no graph, no storage; every query is an exact full
-  scan. Fastest writes, exact recall, O(N) search.
+  scan. Fastest writes, exact recall, O(N) search time with O(k) allocations:
+  the scan reads each document's vector field lazily (no document parse),
+  ranks in-scan, and keeps only the query window when no residual filter or
+  explicit sort needs the full ranked set. Measured at 20k docs × 768 dims:
+  ~136 ms/query, 137 allocs, 0.7 MB churn on a desktop Ryzen (~3× faster and
+  ~99% less allocation than the v2.0.0-alpha.10 scan); ~250-500 ms on
+  laptop/server-class cores. The per-query cost is linear in N — past a few
+  tens of thousands of documents prefer an ANN mode.
 
 Insert/update/delete throughput is **the same across all modes** — the hybrid
 mirror is built lazily on the read path, so it adds no measurable write cost.
