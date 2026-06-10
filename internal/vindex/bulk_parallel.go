@@ -516,44 +516,60 @@ func (b *pBuilder) addNeighbor(a, newID uint32, lc int32) {
 		return
 	}
 	// Full: re-select capn diverse neighbours from {existing ∪ newID}.
+	// Candidate and selection scratch live on the stack for the default
+	// M/M0 sizes (the prune runs once per saturated edge — a heap slice
+	// here was a measurable share of bulk-build allocations).
 	av := b.full[a]
-	cand := make([]candidate, 0, capn+1)
+	var candArr, keptArr [maxStackNeighbors + 1]candidate
+	cand := candArr[:0]
+	if capn+1 > len(candArr) {
+		cand = make([]candidate, 0, capn+1)
+	}
 	for i := 0; i < c; i++ {
 		x := b.links[a][o+i]
 		cand = append(cand, candidate{b.ix.dist(av, b.full[x]), x})
 	}
 	cand = append(cand, candidate{b.ix.dist(av, b.full[newID]), newID})
 	insertionSortCands(cand)
-	kept := b.selectHeuristicLocal(cand, capn)
+	kept := keptArr[:0]
+	if capn > len(keptArr) {
+		kept = make([]candidate, 0, capn)
+	}
+	kept = b.selectHeuristicLocalInto(kept, cand, capn)
 	for i, cd := range kept {
 		b.links[a][o+i] = cd.label
 	}
 	b.cnt[a][lc] = uint16(len(kept))
 }
 
-// selectHeuristicLocal is the heuristic over a private candidate slice (used inside
-// addNeighbor where no shared scratch is held).
-func (b *pBuilder) selectHeuristicLocal(cands []candidate, m int) []candidate {
+// maxStackNeighbors bounds the stack-allocated neighbour scratch in
+// addNeighbor: covers M up to 64 / M0 up to 64 (defaults are 16/32);
+// larger configurations fall back to a heap slice.
+const maxStackNeighbors = 64
+
+// selectHeuristicLocalInto is the heuristic over a private candidate slice
+// (used inside addNeighbor where no shared scratch is held); results are
+// appended to dst.
+func (b *pBuilder) selectHeuristicLocalInto(dst, cands []candidate, m int) []candidate {
 	if len(cands) <= m {
-		return cands
+		return append(dst, cands...)
 	}
-	out := make([]candidate, 0, m)
 	for ci := range cands {
-		if len(out) >= m {
+		if len(dst) >= m {
 			break
 		}
 		c := cands[ci]
 		cv := b.full[c.label]
 		keep := true
-		for r := 0; r < len(out); r++ {
-			if b.ix.dist(cv, b.full[out[r].label]) < c.dist {
+		for r := 0; r < len(dst); r++ {
+			if b.ix.dist(cv, b.full[dst[r].label]) < c.dist {
 				keep = false
 				break
 			}
 		}
 		if keep {
-			out = append(out, c)
+			dst = append(dst, c)
 		}
 	}
-	return out
+	return dst
 }
