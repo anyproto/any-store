@@ -1,10 +1,12 @@
 package anystore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -624,13 +626,20 @@ func (q *collQuery) detectVectorQuery() (*qplanner.VectorQuerySpec, query.Filter
 		return spec, residual, nil
 	}
 	if vi.ix == nil {
-		// Brute-force: every document is a candidate. The existing
-		// FilterIter -> SortIter -> LimitIter chain then filters, sorts by
-		// _distance, and takes top-k — exact, no over-fetch needed.
+		// Brute-force: the scan computes an exact distance for every document,
+		// so it can rank and (when nothing downstream needs the full set) cut
+		// to the query window itself. With a residual filter or an explicit
+		// sort the full ranked set is returned — FilterIter/SortIter/LimitIter
+		// keep their exact semantics over it.
+		topK := 0
+		if residual == nil && q.sort == nil && q.limit > 0 {
+			topK = int(q.limit) + int(q.offset)
+		}
 		spec := &qplanner.VectorQuerySpec{
-			Query: qvec,
+			Query:   qvec,
+			Ordered: true, // bruteVectorCandidates returns distance-ascending
 			Search: func(tx *btree.ReadTx, qv []float32, _ int) ([]qplanner.VectorCandidate, error) {
-				return q.c.bruteVectorCandidates(tx, captured, qv)
+				return q.c.bruteVectorCandidates(tx, captured, qv, topK)
 			},
 		}
 		return spec, residual, nil
@@ -729,37 +738,141 @@ func decodeVectorValue(eqValue []byte, dim int) ([]float32, error) {
 	return out, nil
 }
 
-// bruteVectorCandidates scans the whole collection and returns every document
-// with its distance to qv — the candidate source for a brute-force vector index.
-// It uses the same distance kernel as the ANN index, so rankings are identical.
-func (c *collection) bruteVectorCandidates(tx *btree.ReadTx, vi *vectorIndex, qv []float32) ([]qplanner.VectorCandidate, error) {
+// bruteVectorCandidates scans the whole collection and returns the documents
+// ranked by exact distance to qv (ascending, ties by docId) — the candidate
+// source for a brute-force vector index. It uses the same distance kernel as
+// the ANN index, so rankings are identical. topK > 0 bounds the result to the
+// k closest documents via a max-heap (only valid when the whole set is not
+// needed downstream); topK == 0 returns every document, still ranked.
+//
+// The scan never builds a document tree: the vector field's raw bytes are
+// read with anyenc's lazy RawByPath into a reused buffer, and the docId is
+// the cursor key itself (the data namespace is keyed by encoded id). All
+// per-document state lives in reused buffers; the candidates' ids share one
+// arena.
+func (c *collection) bruteVectorCandidates(tx *btree.ReadTx, vi *vectorIndex, qv []float32, topK int) ([]qplanner.VectorCandidate, error) {
 	dist := vindex.DistanceFor(vi.info.Vector.Metric.toVindex())
 	cursor := tx.NewCursor(c.ns)
 	defer cursor.Close()
 	if err := cursor.First(); err != nil {
 		return nil, err
 	}
-	var p anyenc.Parser
-	buf := make([]float32, 0, vi.dim)
-	var out []qplanner.VectorCandidate
+	type cand struct {
+		d     float32
+		idOff uint32
+		idLen uint32
+	}
+	var (
+		p      anyenc.Parser
+		vbuf   = make([]float32, 0, vi.dim)
+		valBuf []byte
+		cands  []cand
+		arena  []byte
+	)
+	idOf := func(cd cand) []byte { return arena[cd.idOff : cd.idOff+cd.idLen] }
+	// less orders by distance ascending, ties by docId bytes ascending — the
+	// same deterministic order the previous _distance SortIter produced.
+	less := func(a, b cand) bool {
+		if a.d != b.d {
+			return a.d < b.d
+		}
+		return bytes.Compare(idOf(a), idOf(b)) < 0
+	}
 	for cursor.Valid() {
-		val, err := cursor.Value()
+		var err error
+		valBuf, err = cursor.AppendValue(valBuf[:0])
 		if err != nil {
 			return nil, err
 		}
-		doc, err := p.Parse(val) // compression-aware
+		vec, ok, err := p.Float32sByPath(valBuf, vbuf[:0], vi.fieldPath...)
 		if err != nil {
 			return nil, err
 		}
-		it := item{val: doc}
-		if vec, ok := vi.extractVector(it, buf); ok {
-			out = append(out, qplanner.VectorCandidate{DocId: it.appendId(nil), Distance: dist(qv, vec)})
+		vbuf = vec
+		if !ok || len(vec) != vi.dim {
+			if err = cursor.Next(); err != nil {
+				return nil, err
+			}
+			continue
 		}
-		if err := cursor.Next(); err != nil {
+		d := dist(qv, vec)
+		if topK > 0 && len(cands) == topK && !(d < cands[0].d) {
+			// Heap is full and this doc can't beat the current k-th best
+			// (on a distance tie the incumbent wins, matching stable order:
+			// the incumbent has the smaller docId — ids arrive in ascending
+			// cursor order).
+			if err = cursor.Next(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		key, err := cursor.Key()
+		if err != nil {
+			return nil, err
+		}
+		nc := cand{d: d, idOff: uint32(len(arena)), idLen: uint32(len(key))}
+		arena = append(arena, key...)
+		if topK > 0 {
+			// Max-heap by less (root = worst kept candidate).
+			if len(cands) == topK {
+				cands[0] = nc
+				heapSiftDown(cands, 0, less)
+			} else {
+				cands = append(cands, nc)
+				heapSiftUp(cands, len(cands)-1, less)
+			}
+		} else {
+			cands = append(cands, nc)
+		}
+		if err = cursor.Next(); err != nil {
 			return nil, err
 		}
 	}
+	slices.SortFunc(cands, func(a, b cand) int {
+		if less(a, b) {
+			return -1
+		}
+		if less(b, a) {
+			return 1
+		}
+		return 0
+	})
+	out := make([]qplanner.VectorCandidate, len(cands))
+	for i, cd := range cands {
+		out[i] = qplanner.VectorCandidate{DocId: idOf(cd), Distance: cd.d}
+	}
 	return out, nil
+}
+
+// heapSiftUp/heapSiftDown maintain a max-heap where less(a, b) means a is
+// BETTER than b (the root is the worst kept candidate, evicted first).
+func heapSiftUp[T any](h []T, i int, less func(a, b T) bool) {
+	for i > 0 {
+		parent := (i - 1) / 2
+		if !less(h[parent], h[i]) {
+			return
+		}
+		h[parent], h[i] = h[i], h[parent]
+		i = parent
+	}
+}
+
+func heapSiftDown[T any](h []T, i int, less func(a, b T) bool) {
+	n := len(h)
+	for {
+		worst := i
+		if l := 2*i + 1; l < n && less(h[worst], h[l]) {
+			worst = l
+		}
+		if r := 2*i + 2; r < n && less(h[worst], h[r]) {
+			worst = r
+		}
+		if worst == i {
+			return
+		}
+		h[i], h[worst] = h[worst], h[i]
+		i = worst
+	}
 }
 
 // vectorOverFetch is how many ANN candidates to fetch per requested result when
