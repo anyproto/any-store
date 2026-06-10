@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"fmt"
 	"slices"
+	"sync"
 	"testing"
 	"unsafe"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/syncpool"
 )
 
 // Benchmarks comparing three In-set representations (PERF-1 case 3 design
@@ -198,4 +200,36 @@ func TestInVariantsAgree(t *testing.T) {
 			t.Fatalf("bounds order mismatch at %d", i)
 		}
 	}
+}
+
+// One built In is shared by many queries running concurrently — the filter
+// immutability contract. Ok and IndexBounds must be safe without
+// synchronization (run under -race).
+func TestInConcurrentUse(t *testing.T) {
+	in := NewInValue(makeInValues(500)...)
+	probes := makeProbes(500)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := &syncpool.DocBuffer{}
+			a := &anyenc.Arena{}
+			for i := range 200 {
+				bounds := in.IndexBounds("f", nil)
+				if len(bounds) != 500 {
+					t.Errorf("bounds len = %d", len(bounds))
+					return
+				}
+				// Simulate the planner's bound extension: must reallocate,
+				// never write into the shared key bytes.
+				ext := append(bounds[i%500].Start, 0x01)
+				_ = ext
+				v, _ := anyenc.Parse(probes[i%len(probes)])
+				_ = in.Ok(v, buf)
+				a.Reset()
+			}
+		}()
+	}
+	wg.Wait()
 }
