@@ -3252,7 +3252,13 @@ func (p *pager) close() error {
 						// bytes the close-time checkpoint consumed, so a post-mortem
 						// can replay the backfill decision after truncation.
 						if walBytes, rerr := os.ReadFile(p.path + "-wal"); rerr == nil {
-							_ = os.WriteFile(p.path+"-wal.pretruncate", walBytes, 0644)
+							// O_EXCL: first close wins (the workload process), so a
+							// later verifier open+close cannot clobber the evidence
+							// with its already-truncated WAL.
+							if f, ferr := os.OpenFile(p.path+"-wal.pretruncate", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644); ferr == nil {
+								_, _ = f.Write(walBytes)
+								_ = f.Close()
+							}
 						}
 					}
 					p.wal.truncateFile()
