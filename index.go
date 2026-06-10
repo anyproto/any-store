@@ -309,6 +309,7 @@ type index struct {
 	uniqBuf     [][]anyenc.Tuple
 	fullKeyBuf  anyenc.Tuple // reusable buffer for full keys (key+docId)
 	seekBuf     anyenc.Tuple // reusable buffer for unique constraint seek results
+	uniqSeekBuf anyenc.Tuple // reusable buffer for the padded unique-probe seek key
 }
 
 // loadPubSketch returns the published reader snapshot. Lock-free; the returned
@@ -403,9 +404,22 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 		idx.fullKeyBuf = append(idx.fullKeyBuf, idKey...)
 
 		if idx.info.Unique {
+			// Escape-aware duplicate probe: a bare HasPrefix would match an
+			// entry whose last field value extends this key's value with an
+			// escaped NUL ("a" vs "a\x00b") and report a false
+			// ErrUniqueConstraint; for an inverted tail field those
+			// continuation entries (key+0x00...) also sort BEFORE a real
+			// duplicate (key+docIdTag, tag >= 0x01) and would shadow it, so
+			// the seek starts at key+0x01 to hop over them.
+			lastInverted := len(idx.reverse) > 0 && idx.reverse[len(idx.reverse)-1]
+			seekKey := key
+			if lastInverted {
+				idx.uniqSeekBuf = append(append(idx.uniqSeekBuf[:0], key...), 0x01)
+				seekKey = idx.uniqSeekBuf
+			}
 			var err error
-			idx.seekBuf, err = tx.AppendSeekKey(idx.ns, key, idx.seekBuf[:0])
-			if err == nil && bytes.HasPrefix(idx.seekBuf, key) {
+			idx.seekBuf, err = tx.AppendSeekKey(idx.ns, seekKey, idx.seekBuf[:0])
+			if err == nil && qplanner.HasExactFieldPrefix(idx.seekBuf, key, lastInverted) {
 				if !bytes.Equal(idx.seekBuf, idx.fullKeyBuf) {
 					return ErrUniqueConstraint
 				}

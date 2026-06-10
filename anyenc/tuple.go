@@ -41,7 +41,7 @@ func (t Tuple) ReadBytes(f func(b []byte) error) (err error) {
 	var tail = t
 	var nextTail []byte
 	for len(tail) > 0 {
-		if _, nextTail, err = parseValue(tail, nil); err != nil {
+		if _, nextTail, err = parseValue(tail, nil, 0); err != nil {
 			return
 		}
 		if err = f(tail[:len(tail)-len(nextTail)]); err != nil {
@@ -62,7 +62,7 @@ func (t Tuple) OffsetAfter(n int) (int, error) {
 	tail := t
 	off := 0
 	for i := 0; i < n && len(tail) > 0; i++ {
-		_, nextTail, err := parseValue(tail, nil)
+		_, nextTail, err := parseValue(tail, nil, 0)
 		if err != nil {
 			return 0, err
 		}
@@ -84,7 +84,7 @@ func (t Tuple) FieldBytes(n int) ([]byte, error) {
 		if len(tail) == 0 {
 			return nil, fmt.Errorf("tuple: field %d out of range", n)
 		}
-		_, nextTail, err := parseValue(tail, nil)
+		_, nextTail, err := parseValue(tail, nil, 0)
 		if err != nil {
 			return nil, err
 		}

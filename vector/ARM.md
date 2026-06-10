@@ -2,6 +2,15 @@
 
 Branch `btree-vector-search`. Companion to [CROSS_HARDWARE.md](./CROSS_HARDWARE.md).
 
+> **UPDATE — NEON has landed (this doc is now historical).** Distance kernels no
+> longer come from `viterin/vek` (amd64-only). They run through **`internal/simd`**,
+> a vendored set of hand-written assembly kernels (weaviate, BSD-3-Clause) with
+> **NEON/SVE for arm64** and AVX2/AVX512 for amd64, plus an int8 byte kernel and a
+> pure-Go fallback. So `vector.SIMD()` now returns **true** on Apple Silicon, and the
+> ~2–4× scalar penalty described below is recovered — including int8 (scored by the
+> NEON float×byte kernel, no dequant). The "how to get SIMD on ARM" plan below is
+> done (option 1, the NEON kernel); the rest is kept for context.
+
 ARM is a first-class target for any-store (Anytype ships on Apple Silicon macs,
 iOS, Android, and increasingly Graviton servers — all arm64). So: how does this
 vector index behave there?

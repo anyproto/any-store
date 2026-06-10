@@ -12,12 +12,14 @@ func AppendAnyValue(b []byte, v any) []byte {
 
 	switch tv := v.(type) {
 	case string:
+		// Escape exactly like Value.MarshalTo, so keys built here (e.g. FindId)
+		// match keys built by marshaling the document.
 		b = append(b, uint8(TypeString))
-		b = append(b, []byte(tv)...)
+		b = appendEscaped(b, s2b(tv))
 		b = append(b, EOS)
 	case []byte:
 		b = append(b, uint8(TypeString))
-		b = append(b, tv...)
+		b = appendEscaped(b, tv)
 		b = append(b, EOS)
 	case uint:
 		b = append(b, uint8(TypeNumber))

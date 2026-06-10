@@ -253,14 +253,17 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 	}
 	ix.vmeta, ix.vcb, ix.vcell, ix.vvec, ix.vlbl, ix.vdoc = ns[0], ns[1], ns[2], ns[3], ns[4], ns[5]
 
-	// Normalize a working copy (cosine -> unit vectors).
+	// Normalize a working copy (cosine -> unit vectors). The unit vectors land in
+	// one contiguous arena (one allocation + better locality) instead of a fresh
+	// slice per vector; norm[i] is a view into it.
 	norm := make([][]float32, len(vecs))
-	for i, v := range vecs {
-		if p.Normalize {
-			norm[i] = normalize(v)
-		} else {
-			norm[i] = v
+	if p.Normalize {
+		arena := make([]float32, len(vecs)*p.Dim)
+		for i, v := range vecs {
+			norm[i] = normalizeInto(arena[i*p.Dim:(i+1)*p.Dim:(i+1)*p.Dim], v)
 		}
+	} else {
+		copy(norm, vecs)
 	}
 
 	// Train the coarse quantizer (always) and, for IVF-PQ, the PQ codebooks. The PQ
@@ -291,12 +294,15 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 	var keyBuf, codeBuf, vecBuf []byte
 	var reconSum float64
 	r := make([]float32, ix.dim)
+	var cellScratch []cellDist // reused across vectors (was a fresh nlist-slice per call)
+	var cellsOut []int
 	for i, x := range norm {
 		label := uint32(i)
 		if err := ix.writeVecRecords(wtx, label, ids[i], x, &vecBuf); err != nil {
 			return nil, err
 		}
-		cells := ix.nearestCells(x, ix.assign)
+		cellsOut = ix.nearestCellsInto(x, ix.assign, &cellScratch, cellsOut)
+		cells := cellsOut
 		if err := ix.putDocCells(wtx, ids[i], label, cells); err != nil {
 			return nil, err
 		}

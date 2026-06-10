@@ -5,6 +5,16 @@ binary (static, no-CGO) copied to three linux/amd64 machines and run with the
 **disk-backed** index, **twice** per machine (build+persist, then cold
 reopen-from-disk). All runs: `n=20000`, `dim=768`, cosine, ef=64, k=10.
 
+> **UPDATE (post-migration).** Distance now runs through `internal/simd` (vendored
+> weaviate asm: AVX2/AVX512 + NEON/SVE + pure-Go fallback), not `vek`. The
+> no-AVX2 box (`hp`) now dispatches to the **pure-Go unrolled kernel** (~682 ns vs
+> vek's ~870 ns at dim768 — the "Actionable" item below, done), and **arm64 now runs
+> NEON** instead of scalar: on an 8-core M-series Mac, HNSW btree-int8 build went
+> **806 → 2991/s (~3.7×)** and p50 **4.64 → 1.37 ms**, recall unchanged — the lift
+> spans every mode since vek had no ARM SIMD at all. A fuller four-machine matrix
+> over all index modes (incl. the int8 byte kernel) lives in `docs/vector-engine.md`
+> and `any-store-vector/RESULTS.md`.
+
 ```
 go build -o vectorbench ./cmd/vectorbench
 ./vectorbench -n 20000 -dim 768 -db ~/vb.db      # run 1: build + persist
@@ -36,11 +46,12 @@ three for vector search: ANN query latency is single-thread-distance-bound, so a
 one-generation microarchitecture gap beats raw core count.
 
 Actionable for any-store:
-- **Prefer the unrolled scalar kernel over vek's fallback when AVX2 is absent**
-  (detect via `vector.SIMD()` and dispatch).
-- Better still, an **AVX-only** float32 distance kernel would accelerate this box
-  too — it *has* AVX, vek just has no AVX-only path (all-or-nothing on AVX2+FMA),
-  so the fallback leaves real speedup on the floor on Sandy/Ivy Bridge.
+- ✅ **Done — prefer the unrolled scalar kernel over vek's fallback when AVX2 is
+  absent.** `internal/simd` now dispatches the no-AVX2 path to the pure-Go unrolled
+  kernel (~682 vs ~870 ns) and arm64 to NEON.
+- An **AVX-only** float32 kernel would speed this box (it *has* AVX) further still —
+  the vendored asm requires AVX2, so Sandy/Ivy Bridge stays on the unrolled
+  fallback. Open if a no-AVX2 deployment becomes important.
 - Treat SIMD presence as a deployment fact to check, not assume.
 
 ## Build + search (n=20000, dim=768)

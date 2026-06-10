@@ -6,6 +6,12 @@ how to land approximate-nearest-neighbour (ANN) search on top of the embedded
 btree engine, using [`github.com/coder/hnsw`](https://github.com/coder/hnsw) as
 the algorithmic reference.
 
+> **Note:** the SIMD distance kernels moved off `viterin/vek` (amd64-only) to the
+> vendored **`internal/simd`** package — AVX2/AVX512 on amd64, **NEON/SVE on arm64**,
+> int8 byte kernel, pure-Go fallback. So `vector.SIMD()` is now true on Apple
+> Silicon too. References to "vek" below are historical (the answer to Q1 is now
+> "yes, on every arch, no CGO"). The production index is `internal/vindex`.
+
 The goal was to answer three questions:
 
 1. Can we keep SIMD (vector CPU instructions) for the distance kernels, like the
@@ -19,7 +25,7 @@ The goal was to answer three questions:
 
 | File | Approach |
 |------|----------|
-| `distance.go` | `L2` / `Cosine` / `Dot` distance. SIMD via [`viterin/vek`](https://github.com/viterin/vek) (AVX2/AVX-512, pure-Go assembly, **no CGO** — the same library coder/hnsw uses) plus scalar & hand-unrolled fallbacks kept only for the benchmark. |
+| `distance.go` | `L2` / `Cosine` / `Dot` distance. SIMD via **`internal/simd`** (vendored weaviate asm: AVX2/AVX512 on amd64, **NEON/SVE on arm64**, pure-Go fallback; **no CGO**) plus scalar & hand-unrolled fallbacks kept only for the benchmark. |
 | `brute.go` | Exact flat scan. Ground truth for recall, O(n·dim) per query. |
 | `hnsw.go` | **Map-based in-memory HNSW** — a faithful adaptation of coder/hnsw (`map[id]*node` adjacency, per-node pointers). The "idiomatic Go" baseline. |
 | `hnsw_flat.go` | **Arena / SoA HNSW** — every vector in one contiguous `[]float32` slab, every adjacency list in one flat `[]uint32` arena, dense `uint32` ids, pooled per-query heaps + epoch-stamped visited set. Allocation-free steady-state search. |
@@ -38,7 +44,7 @@ The goal was to answer three questions:
 `mddata_test.go` (`TestMDDataset`) is the realistic-scale dataset: 75k synthetic topic-clustered markdown documents embedded with the feature-hashing trick (dim 768, cosine) — representative geometry, not uniform-random. Run with `go test ./vector -run TestMDDataset -v` (skipped in `-short`).
 
 - [CROSS_HARDWARE.md](./CROSS_HARDWARE.md) — `cmd/vectorbench` run on three linux/amd64 machines (disk-backed, twice each). Headline: a no-AVX2 box makes distance ~25× slower (vek's fallback is even slower than the unrolled loop) — SIMD presence dominates everything; the hybrid stays the sweet spot (1.3–2.4×) and cold reload-from-disk is 8–37 ms loading only topology.
-- [ARM.md](./ARM.md) — how it runs on modern ARM (Apple Silicon / Graviton / mobile): vek is **amd64-only** so `vector.SIMD()` is false on arm64 → portable scalar path (now auto-dispatched to the unrolled kernel). The real fixes: a NEON kernel and quantization (binary-Hamming is natively fast on arm64 via `CNT`).
+- [ARM.md](./ARM.md) — how it runs on modern ARM (Apple Silicon / Graviton / mobile). **Now updated:** the NEON kernel landed (`internal/simd`), so `vector.SIMD()` is **true** on arm64 and the old scalar penalty is recovered, int8 included.
 - [PLAN_INTEGRATION.md](./PLAN_INTEGRATION.md) — **plan to land this in any-store** as a btree-resident vector index (full-btree/Option B): where it plugs into the existing index/write-tx machinery, on-disk namespaces, write/read paths, the cross-process MVCC reliability argument, API, and phasing.
 
 A self-contained, static, no-CGO benchmark binary lives at [`cmd/vectorbench`](../cmd/vectorbench) — build once, copy to any linux/amd64 box (no Go needed on the target), and run `-db <path>` twice for build-then-cold-reload measurements.
@@ -146,9 +152,9 @@ lossless.
 
 ## Takeaways / recommendation
 
-- **Keep SIMD via `vek`.** It's the dominant speedup, it's no-CGO, and it's the
-  reference's own choice. (Go 1.26 ships an experimental `simd` package too, but
-  it needs `GOEXPERIMENT=simd` — not worth the build friction yet.)
+- **Keep SIMD for distance** (the dominant speedup, no-CGO). *Update:* this now uses
+  the vendored **`internal/simd`** asm kernels (AVX2/AVX512 + NEON/SVE + fallback)
+  instead of `vek`, so the SIMD win extends to arm64, not just amd64.
 - **Land the arena/SoA layout, not the map port.** ~10× faster search, ~2×
   faster build, ~2× less memory, ~zero query allocations, same recall.
 - **Persist with the arena layout as the on-disk format.** Durability via the

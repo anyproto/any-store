@@ -1004,6 +1004,15 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 		return root
 	}
 
+	// IndexIter consumes range bounds over FULL keys (field values + docId
+	// suffix), so make them escape-exact for a reverse tail field. Keep the
+	// pre-pad bounds for CanonicalKeyDedupIter below: it tests BARE field
+	// values, which the +0x01 Start pad would wrongly exclude. (CoverIter
+	// above does not take padded bounds either — it seeks the raw prefix and
+	// applies HasExactFieldPrefix instead.)
+	dedupBounds := idx.Bounds
+	idx.Bounds = padBoundsForReverseTail(idx)
+
 	// Use batched allocation for the common case: IndexIter + FetchIter + FilterIter.
 	// This replaces 5 separate heap allocations with 1.
 	b := &seekBatch{}
@@ -1079,7 +1088,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	if len(idx.Info.FieldPaths) == 1 {
 		root = &CanonicalKeyDedupIter{
 			Source:       root,
-			Bounds:       idx.Bounds,
+			Bounds:       dedupBounds,
 			FieldPath:    idx.Info.FieldPaths[0],
 			Reverse:      reverse,
 			FieldReverse: len(idx.Info.Reverse) > 0 && idx.Info.Reverse[0],
@@ -1110,6 +1119,10 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 	if !idx.Info.Unique && len(idx.Bounds) > 0 {
 		idx.Bounds = AdjustBoundsForNonUnique(idx.Bounds)
 	}
+	// Pre-pad bounds for CanonicalKeyDedupIter (bare field values); padded
+	// bounds for IndexIter (full keys) — see buildIndexSeekChain.
+	dedupBounds := idx.Bounds
+	idx.Bounds = padBoundsForReverseTail(idx)
 	reverse := shouldReverse(params.Sorter, idx)
 
 	var root Iterator = &IndexIter{
@@ -1160,7 +1173,7 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 	if len(idx.Info.FieldPaths) == 1 {
 		root = &CanonicalKeyDedupIter{
 			Source:       root,
-			Bounds:       idx.Bounds,
+			Bounds:       dedupBounds,
 			FieldPath:    idx.Info.FieldPaths[0],
 			Reverse:      reverse,
 			FieldReverse: len(idx.Info.Reverse) > 0 && idx.Info.Reverse[0],
@@ -1620,6 +1633,67 @@ func transformReverseBounds(bs query.Bounds) query.Bounds {
 	return out.SortAndMerge()
 }
 
+// padReverseBounds makes inverted-space bounds exact in the presence of
+// anyenc escape continuations. The anyenc encoding of value v is a byte
+// prefix of the encoding of strings v+"\x00..." (see anyenc/escape.go); in
+// inverted space those continuation keys read inv(enc(v)) followed by 0x00,
+// while every key whose field value IS v continues with a byte >= 0x01 (a
+// docId or next-field type tag, possibly inverted). Without padding, a
+// closed stored-space Start at inv(enc(v)) wrongly admits the v+"\x00..."
+// group (ascending values > v), and an open End at inv(enc(v)) wrongly
+// rejects it:
+//
+//   - Start inclusive (asc Eq/Lte boundary): pad to inv(enc(v))+0x01 — keeps
+//     the whole v group, drops the 0x00 continuations.
+//   - Start exclusive (asc Lt boundary): pad to inv(enc(v))+0xFF inclusive —
+//     drops the v group AND its 0x00 continuations (both are >= v), keeps
+//     every smaller value (they diverge above inv(enc(v)) earlier).
+//   - End exclusive (asc Gt boundary): pad to inv(enc(v))+0x01, still
+//     exclusive — admits the 0x00 continuations (values > v), drops the
+//     v group.
+//   - End inclusive (asc Gte/Eq boundary): leave as is —
+//     AdjustBoundsForNonUnique appends 0xFF, which already admits both.
+//
+// Only the LAST chained field of an index bound may be padded: earlier
+// (fixed, equality) fields are used as exact byte prefixes that later field
+// bounds are concatenated to.
+// padBoundsForReverseTail applies padReverseBounds when the final field of the
+// bound chain is reverse-flagged. Call it only for the CHOSEN index, after
+// AdjustBoundsForNonUnique and after PointLookup/sketch estimation (both read
+// the raw bound bytes).
+func padBoundsForReverseTail(idx *CBOIndex) query.Bounds {
+	n := idx.BoundFields
+	if n == 0 || n > len(idx.Reverse) || !idx.Reverse[n-1] || len(idx.Bounds) == 0 {
+		return idx.Bounds
+	}
+	return padReverseBounds(idx.Bounds)
+}
+
+func padReverseBounds(bs query.Bounds) query.Bounds {
+	// Fresh Bound structs: callers keep the unpadded slice for consumers that
+	// test bare field values (CanonicalKeyDedupIter), so the originals must
+	// not be mutated. The byte appends below leave the original Start/End
+	// slices' contents untouched (they extend or reallocate).
+	out := make(query.Bounds, len(bs))
+	copy(out, bs)
+	bs = out
+	for i := range bs {
+		b := &bs[i]
+		if len(b.Start) > 0 {
+			if b.StartInclude {
+				b.Start = append(b.Start, 0x01)
+			} else {
+				b.Start = append(b.Start, 0xff)
+				b.StartInclude = true
+			}
+		}
+		if len(b.End) > 0 && !b.EndInclude {
+			b.End = append(b.End, 0x01)
+		}
+	}
+	return bs
+}
+
 // ComputeIndexBounds computes combined tuple bounds for an index
 // using pre-computed per-field bounds from BoundsResult.
 func ComputeIndexBounds(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
@@ -1728,6 +1802,28 @@ func ComputeIndexBounds(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
 	}
 
 	return result, chainLen
+}
+
+// HasExactFieldPrefix reports whether the stored index key k begins with the
+// encoded field prefix p as COMPLETE field values. bytes.HasPrefix alone is
+// not enough: the anyenc encoding of value v is a byte prefix of the encoding
+// of v+"\x00..." (escaped NUL, see anyenc/escape.go), and such a key continues
+// with the escape tail — 0xFF after an ascending field, 0x00 after an
+// inverted (descending) one — while every key whose value IS v continues with
+// a docId/next-field type tag (0x01..0x0A or 0xF5..0xFE). lastFieldInverted
+// is the direction of the final field covered by p.
+func HasExactFieldPrefix(k, p []byte, lastFieldInverted bool) bool {
+	if !bytes.HasPrefix(k, p) {
+		return false
+	}
+	if len(k) == len(p) {
+		return true
+	}
+	cont := byte(0xff)
+	if lastFieldInverted {
+		cont = 0x00
+	}
+	return k[len(p)] != cont
 }
 
 // AdjustBoundsForNonUnique adjusts End bounds in-place for non-unique indexes

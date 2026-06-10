@@ -56,10 +56,6 @@ func (v *Value) Del(key string) {
 		return
 	}
 	if v.t == TypeArray {
-		idx, err := strconv.Atoi(key)
-		if err != nil || idx < 0 {
-			return
-		}
 		n, err := strconv.Atoi(key)
 		if err != nil || n < 0 || n >= len(v.a) {
 			return
@@ -277,7 +273,28 @@ func (v *Value) MarshalTo(dst []byte) []byte {
 		dst = append(dst, EOS)
 	case TypeString:
 		dst = append(dst, byte(TypeString))
-		dst = appendIgnoreEOS(dst, v.v...)
+		// Open-coded fused scan+copy (see escape.go): short NUL-free strings
+		// — the overwhelmingly common case — stream per byte exactly like the
+		// historical appendIgnoreEOS (bulk append would be a memmove call,
+		// slower for the typical 2-16 byte string). On an EOS hit, roll back
+		// and take the escaping cold path.
+		if len(v.v) > 32 {
+			dst = appendEscapedSlow(dst, v.v)
+		} else {
+			mark := len(dst)
+			dst = slices.Grow(dst, len(v.v)+1)
+			clean := true
+			for i := 0; i < len(v.v); i++ {
+				if v.v[i] == EOS {
+					clean = false
+					break
+				}
+				dst = append(dst, v.v[i])
+			}
+			if !clean {
+				dst = appendEscapedSlow(dst[:mark], v.v)
+			}
+		}
 		dst = append(dst, EOS)
 	case TypeNumber:
 		dst = append(dst, byte(TypeNumber))
@@ -310,7 +327,10 @@ func (v *Value) IsSizeBigger(n int) bool {
 	return v.estimateSize(n) > n
 }
 
-// estimateSize returns the marshaled size of v, but stops early once it exceeds limit.
+// estimateSize returns the marshaled size of v, but stops early once it exceeds
+// limit. Escape bytes (strings/keys containing EOS, keys with a reserved first
+// byte — see escape.go) are not counted, so the result is a lower bound; for the
+// compression-threshold heuristic an occasional underestimate is harmless.
 func (v *Value) estimateSize(limit int) int {
 	if v == nil {
 		return 1 // TypeNull
@@ -384,12 +404,29 @@ func (v *Value) MarshalCompressed(dst, scratch []byte) ([]byte, []byte) {
 func (v *Value) marshalObject(dst []byte) []byte {
 	dst = append(dst, byte(TypeObject))
 	for _, kv := range v.o.kvs {
-		if len(kv.key) == 0 {
-			dst = append(dst, emptyKey)
+		// Open-coded fused scan+copy for the common key shape (see the
+		// TypeString case and escape.go); empty, reserved-leading-byte, long
+		// or NUL-containing keys take the cold path.
+		key := kv.key
+		if len(key) == 0 || len(key) > 32 || key[0] == EOS || key[0] == ^EOS {
+			dst = appendEscapedKey(dst, key)
 		} else {
-			dst = appendIgnoreEOS(dst, s2b(kv.key)...)
+			mark := len(dst)
+			dst = slices.Grow(dst, len(key)+1)
+			clean := true
+			for i := 0; i < len(key); i++ {
+				if key[i] == EOS {
+					clean = false
+					break
+				}
+				dst = append(dst, key[i])
+			}
+			if clean {
+				dst = append(dst, EOS)
+			} else {
+				dst = appendEscapedKey(dst[:mark], key)
+			}
 		}
-		dst = append(dst, EOS)
 		dst = kv.value.MarshalTo(dst)
 	}
 	return append(dst, EOS)
@@ -482,12 +519,3 @@ func (v *Value) GoType() any {
 	}
 }
 
-func appendIgnoreEOS(slice []byte, elems ...byte) []byte {
-	slice = slices.Grow(slice, len(elems))
-	for i := range elems {
-		if elems[i] != EOS {
-			slice = append(slice, elems[i])
-		}
-	}
-	return slice
-}
