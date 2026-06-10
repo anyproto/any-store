@@ -259,6 +259,10 @@ func (e And) String() string {
 }
 
 type In struct {
+	// Values is the membership set, keyed by anyenc-marshaled value. Treat
+	// it as read-only and build In via NewInValue: IndexBounds serves a
+	// pre-sorted view that tracks this map by length, so an external
+	// replace-style mutation (delete one key, add another) would go stale.
 	Values map[string]struct{}
 
 	// sorted holds the marshaled values in ascending byte order (== anyenc
