@@ -28,16 +28,21 @@ const (
 // that has no full-text index.
 var ErrNoFulltextIndex = errors.New("any-store: collection has no full-text index for $text")
 
-// searchCandidates runs a bag-of-words BM25 query over the index and returns the
-// matched documents as qplanner.FtsCandidates sorted by descending score (ties
-// broken by ascending IntDocID for determinism) — the closure the FtsIter source
-// calls.
+// searchCandidates runs a bag-of-words BM25 query over the index and returns a
+// stream of matched documents ordered by descending score (ties broken by
+// ascending IntDocID for determinism) — the source the FtsIter pulls from.
+//
+// The accumulation phase visits every matching posting (alloc-free: pooled
+// flat accumulator + pooled rank scratch), but per-candidate materialization
+// (reverse-map lookup + docId copy) happens lazily in the stream, so a
+// Limit-cut query allocates O(consumed), not O(matched). The stream's Close
+// returns the pooled state; a nil stream means no matches.
 //
 // v1 semantics: the query is analyzed with the same pipeline as indexing and
 // treated as a bag of terms (OR); each matching document's score is the sum of
 // the per-term BM25 contributions. CJK bigrams participate as ordinary terms
 // (positional phrase matching is a documented v2 refinement).
-func (fx *ftsIndex) searchCandidates(tx *btree.ReadTx, queryStr string) ([]qplanner.FtsCandidate, error) {
+func (fx *ftsIndex) searchCandidates(tx *btree.ReadTx, queryStr string) (qplanner.FtsCandidateStream, error) {
 	terms := fts.Analyze(queryStr)
 	if len(terms) == 0 {
 		return nil, nil
@@ -62,12 +67,13 @@ func (fx *ftsIndex) searchCandidates(tx *btree.ReadTx, queryStr string) ([]qplan
 	// Per-query score accumulator: a flat open-addressing IntDocID->score table
 	// with O(1) generation reset, pooled across queries (see ftsScoreAcc). It
 	// replaces a per-query map[uint64]float64 that would grow/rehash as a common
-	// term accumulates thousands of docs.
+	// term accumulates thousands of docs. On success its ownership transfers to
+	// the returned stream (released in Close); every error path puts it back.
 	acc := ftsScoreAccPool.Get().(*ftsScoreAcc)
 	acc.reset()
-	defer ftsScoreAccPool.Put(acc)
 
 	var key, val []byte
+	var dlBuf []byte       // reusable docinfo value buffer (tx.Get would alloc per posting)
 	var doneTerms []string // distinct query terms already scanned (few)
 	for _, tok := range terms {
 		term := tok.Term
@@ -78,6 +84,7 @@ func (fx *ftsIndex) searchCandidates(tx *btree.ReadTx, queryStr string) ([]qplan
 
 		df, derr := ftsGetUint(tx, fx.nsVocab, []byte(term))
 		if derr != nil {
+			ftsScoreAccPool.Put(acc)
 			return nil, derr
 		}
 		if df == 0 {
@@ -90,6 +97,7 @@ func (fx *ftsIndex) searchCandidates(tx *btree.ReadTx, queryStr string) ([]qplan
 		prefix := postingsTermPrefix(nil, term)
 		if serr := cur.Seek(prefix); serr != nil {
 			cur.Close()
+			ftsScoreAccPool.Put(acc)
 			return nil, serr
 		}
 		var scanErr error
@@ -113,7 +121,9 @@ func (fx *ftsIndex) searchCandidates(tx *btree.ReadTx, queryStr string) ([]qplan
 			for r.Next() {
 				docID := r.DocID()
 				tf := float64(r.TF())
-				dl, e := ftsDocLen(tx, fx.nsDocinfo, docID)
+				var dl uint32
+				var e error
+				dl, dlBuf, e = ftsDocLenBuf(tx, fx.nsDocinfo, docID, dlBuf)
 				if e != nil {
 					scanErr = e
 					break
@@ -133,17 +143,19 @@ func (fx *ftsIndex) searchCandidates(tx *btree.ReadTx, queryStr string) ([]qplan
 		}
 		cur.Close()
 		if scanErr != nil {
+			ftsScoreAccPool.Put(acc)
 			return nil, scanErr
 		}
 	}
 
 	if acc.n == 0 {
+		ftsScoreAccPool.Put(acc)
 		return nil, nil
 	}
 
-	// Materialize live (docID, score) pairs and sort by score desc / docID asc.
-	ranked := acc.appendTo(nil)
-	slices.SortFunc(ranked, func(a, b scoredDoc) int {
+	// Rank in the accumulator's pooled scratch: sort by score desc / docID asc.
+	acc.scratch = acc.appendTo(acc.scratch[:0])
+	slices.SortFunc(acc.scratch, func(a, b scoredDoc) int {
 		if a.score > b.score {
 			return -1
 		}
@@ -159,22 +171,47 @@ func (fx *ftsIndex) searchCandidates(tx *btree.ReadTx, queryStr string) ([]qplan
 		return 0
 	})
 
-	// NOTE: do not reuse `key` here — it still aliases btree page memory from the
-	// last cur.Key() above; writing into it would corrupt the page cache.
-	out := make([]qplanner.FtsCandidate, 0, len(ranked))
-	var mapKey []byte
-	for _, r := range ranked {
-		mapKey = ftsMapReverseKey(mapKey, r.docID)
-		idBytes, gerr := tx.Get(fx.nsMap, mapKey)
+	return &ftsCandidateStream{tx: tx, fx: fx, acc: acc}, nil
+}
+
+// ftsCandidateStream lazily materializes the ranked (IntDocID, score) pairs in
+// acc.scratch into (docId, score) candidates as the planner pulls them: one
+// reverse-map lookup + one copy into a reusable buffer per consumed candidate.
+// It owns the pooled accumulator until Close.
+type ftsCandidateStream struct {
+	tx     *btree.ReadTx
+	fx     *ftsIndex
+	acc    *ftsScoreAcc
+	idx    int
+	mapKey []byte
+	idBuf  []byte
+}
+
+// Next returns the next candidate's docId (valid until the following Next
+// call) and score.
+func (s *ftsCandidateStream) Next() (docId []byte, score float64, ok bool, err error) {
+	for s.idx < len(s.acc.scratch) {
+		r := s.acc.scratch[s.idx]
+		s.idx++
+		s.mapKey = ftsMapReverseKey(s.mapKey, r.docID)
+		idBuf, gerr := s.tx.AppendValue(s.fx.nsMap, s.mapKey, s.idBuf[:0])
 		if gerr != nil {
 			if errors.Is(gerr, btree.ErrKeyNotFound) {
 				continue // stale posting (doc removed) — skip
 			}
-			return nil, gerr
+			return nil, 0, false, gerr
 		}
-		out = append(out, qplanner.FtsCandidate{DocId: slices.Clone(idBytes), Score: r.score})
+		s.idBuf = idBuf
+		return s.idBuf, r.score, true, nil
 	}
-	return out, nil
+	return nil, 0, false, nil
+}
+
+func (s *ftsCandidateStream) Close() {
+	if s.acc != nil {
+		ftsScoreAccPool.Put(s.acc)
+		s.acc = nil
+	}
 }
 
 // scoredDoc is one accumulated (IntDocID, BM25 score) pair.
@@ -196,6 +233,10 @@ type ftsScoreAcc struct {
 	gen  uint32
 	mask uint32
 	n    int
+
+	// scratch is the pooled rank buffer the accumulated pairs are sorted in;
+	// it lives here so the per-query []scoredDoc is reused across queries.
+	scratch []scoredDoc
 }
 
 var ftsScoreAccPool = sync.Pool{New: func() any { return &ftsScoreAcc{} }}
@@ -368,17 +409,25 @@ func ftsGetUint(tx *btree.ReadTx, ns *btree.Namespace, key []byte) (uint64, erro
 }
 
 func ftsDocLen(tx *btree.ReadTx, ns *btree.Namespace, docID uint64) (uint32, error) {
+	dl, _, err := ftsDocLenBuf(tx, ns, docID, nil)
+	return dl, err
+}
+
+// ftsDocLenBuf is ftsDocLen with a caller-owned value buffer: the BM25
+// accumulation loop calls it once per posting, and tx.Get's nil-buffer
+// AppendValue would allocate every time.
+func ftsDocLenBuf(tx *btree.ReadTx, ns *btree.Namespace, docID uint64, buf []byte) (uint32, []byte, error) {
 	var k [8]byte
 	binary.BigEndian.PutUint64(k[:], docID)
-	v, err := tx.Get(ns, k[:])
+	v, err := tx.AppendValue(ns, k[:], buf[:0])
 	if err != nil {
 		if errors.Is(err, btree.ErrKeyNotFound) {
-			return 0, nil
+			return 0, buf, nil
 		}
-		return 0, err
+		return 0, buf, err
 	}
 	n, _ := binary.Uvarint(v)
-	return uint32(n), nil
+	return uint32(n), v, nil
 }
 
 // detectFtsQuery inspects the query's condition for a $text clause. If present,
@@ -402,8 +451,9 @@ func (q *collQuery) detectFtsQuery() (*qplanner.FtsQuerySpec, query.Filter, erro
 	fx := fxs[0]
 	search := text.Search
 	spec := &qplanner.FtsQuerySpec{
-		Ordered: true, // searchCandidates returns score-descending
-		Search: func(tx *btree.ReadTx) ([]qplanner.FtsCandidate, error) {
+		Ordered:    true, // searchCandidates returns score-descending
+		NeedScores: true, // cleared by ftsScanPlan for Count/Update/Delete
+		Search: func(tx *btree.ReadTx) (qplanner.FtsCandidateStream, error) {
 			return fx.searchCandidates(tx, search)
 		},
 	}
@@ -423,6 +473,7 @@ func (q *collQuery) ftsScanPlan(btx *btree.ReadTx, buf *syncpool.DocBuffer) (pla
 	if spec == nil {
 		return nil, false, nil
 	}
+	spec.NeedScores = false // Count/Update/Delete never read Score()
 	plan = qplanner.BuildPlan(&qplanner.PlanParams{
 		Tx:     btx,
 		DataNs: q.c.ns,

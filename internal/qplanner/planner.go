@@ -49,14 +49,14 @@ type Plan struct {
 	DocParsed *anyenc.Value // set by FilterIter/FetchIter/FullScanIter after parsing
 
 	// Distances is the per-document ANN distance sidecar for a vector query
-	// (docId string -> distance). Populated by VectorIter; consumed by the
+	// (docId bytes -> distance). Populated by VectorIter; consumed by the
 	// public iterator's Distance(). nil for non-vector plans.
-	Distances map[string]float32
+	Distances *FloatSidecar
 
 	// Scores is the per-document BM25 relevance sidecar for a full-text query
-	// (docId string -> score). Populated by FtsIter; consumed by the public
+	// (docId bytes -> score). Populated by FtsIter; consumed by the public
 	// iterator's Score(). nil for non-fts plans.
-	Scores map[string]float64
+	Scores *FloatSidecar
 
 	// CBO metadata (for Explain)
 	Name      string  // "FullScan", "IndexSeek", "IndexScan"

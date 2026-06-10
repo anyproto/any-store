@@ -85,7 +85,8 @@ func (pi *planIterator) Distance() float32 {
 	if pi.plan == nil || pi.plan.Distances == nil {
 		return 0
 	}
-	return pi.plan.Distances[string(pi.docId)]
+	d, _ := pi.plan.Distances.Get(pi.docId)
+	return float32(d)
 }
 
 // Score returns the BM25 relevance score of the current document for a $text
@@ -94,7 +95,8 @@ func (pi *planIterator) Score() float64 {
 	if pi.plan == nil || pi.plan.Scores == nil {
 		return 0
 	}
-	return pi.plan.Scores[string(pi.docId)]
+	s, _ := pi.plan.Scores.Get(pi.docId)
+	return s
 }
 
 func (pi *planIterator) Doc() (Doc, error) {

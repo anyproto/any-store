@@ -62,11 +62,11 @@ func (it *VectorIter) Next() (key []byte, docId []byte, multiKey bool, err error
 			return nil, nil, false, err
 		}
 		if it.Plan != nil && it.Plan.Distances == nil {
-			it.Plan.Distances = make(map[string]float32, len(it.candidates))
+			it.Plan.Distances = &FloatSidecar{}
 		}
 		for _, c := range it.candidates {
 			if it.Plan != nil {
-				it.Plan.Distances[string(c.DocId)] = c.Distance
+				it.Plan.Distances.Set(c.DocId, float64(c.Distance))
 			}
 		}
 	}
