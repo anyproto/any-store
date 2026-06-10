@@ -3094,8 +3094,12 @@ func (w *wal) checkpointPassive(dbFile fileHandle, master *masterStore) error {
 	// committed frames we haven't backfilled. Callers (notably pager.close)
 	// then truncate the WAL and destroy the peer's data. See
 	// authoritativeMxFrame for rationale.
-	complete := w.index.nBackfill.Load() >= w.authoritativeMxFrame()
-	if !complete {
+	nb, mx := w.index.nBackfill.Load(), w.authoritativeMxFrame()
+	if debugTrace {
+		trace("ckptPassive: completeness nBackfill=%d authoritativeMxFrame=%d localMxCommit=%d maxFrame=%d",
+			nb, mx, w.index.mxCommitFrame.LoadLocal(), w.index.maxFrame.Load())
+	}
+	if nb < mx {
 		return ErrBusy
 	}
 	return nil
@@ -3417,6 +3421,10 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	} else {
 		nBackfill = w.index.nBackfill.Load()
 	}
+	if debugTrace {
+		trace("ckpt: mode=%d nf=%d mxPage=%d mxSafeFrame=%d nBackfill=%d localMxCommit=%d localMaxFrame=%d",
+			mode, nf, mxPage, mxSafeFrame, nBackfill, w.index.mxCommitFrame.LoadLocal(), w.index.maxFrame.Load())
+	}
 
 	if mxSafeFrame <= nBackfill {
 		// Nothing new to checkpoint.
@@ -3475,6 +3483,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	// Copy frames (nBackfill+1)..mxSafeFrame to DB
 	pageSz := int64(w.pageSize)
 	var backfillErr error
+	skippedOrphans := 0
 
 	if w.inMemory {
 		// Phase 1: latest frame per pgno. Same reasoning as disk mode
@@ -3507,6 +3516,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 			// wal.c:2306). mxPage==0 means "unbounded" — see the
 			// authoritativeMxFrameAndPage call above.
 			if mxPage != 0 && pgno > mxPage {
+				skippedOrphans++
 				continue
 			}
 			mf := &w.memFrames[latest[pgno]]
@@ -3580,6 +3590,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 				// wal.c:2306). mxPage==0 means "unbounded" — see the
 				// authoritativeMxFrameAndPage call above.
 				if mxPage != 0 && pgno > mxPage {
+					skippedOrphans++
 					continue
 				}
 				frameIdx := latest[pgno]
@@ -3651,6 +3662,11 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 			_ = w.index.unlock(lockRead0, lockExclusive)
 			return err
 		}
+	}
+
+	if debugTrace {
+		trace("ckpt: backfill done, advancing nBackfill %d -> %d (skippedOrphans=%d) liveMxFrame=%d liveNPage=%d",
+			nBackfill, mxSafeFrame, skippedOrphans, w.authoritativeMxFrame(), w.index.maxPage.Load())
 	}
 
 	// Update nBackfill

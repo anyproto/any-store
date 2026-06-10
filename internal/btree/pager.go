@@ -3245,7 +3245,13 @@ func (p *pager) close() error {
 					}
 				}
 				if cpErr == nil && isLastClient {
+					if debugTrace {
+						trace("close: TRUNCATING WAL (cpErr=nil isLastClient=true) nBackfill=%d mxFrame=%d",
+							p.wal.index.nBackfill.Load(), p.wal.authoritativeMxFrame())
+					}
 					p.wal.truncateFile()
+				} else if debugTrace {
+					trace("close: NOT truncating WAL (cpErr=%v isLastClient=%v)", cpErr, isLastClient)
 				}
 				return nil
 			})
