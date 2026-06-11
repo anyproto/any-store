@@ -2,7 +2,9 @@ package query
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"math"
 	"regexp"
 	"slices"
 	"strings"
@@ -69,26 +71,27 @@ type Comp struct {
 
 var valueNull = anyenc.MustParseJson("null")
 
+var encodedNull = []byte{byte(anyenc.TypeNull)}
+
 func (e *Comp) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 	if v == nil {
-		v = valueNull
-	}
-	if docBuf == nil {
-		docBuf = &syncpool.DocBuffer{}
+		return e.comp(encodedNull)
 	}
 
 	if v.Type() == anyenc.TypeArray {
 		vals, _ := v.Array()
 		if e.CompOp == CompOpNe {
 			if !e.notArray {
+				if docBuf == nil {
+					docBuf = &syncpool.DocBuffer{}
+				}
 				docBuf.SmallBuf = v.MarshalTo(docBuf.SmallBuf[:0])
 				if !e.comp(docBuf.SmallBuf) {
 					return false
 				}
 			}
 			for _, val := range vals {
-				docBuf.SmallBuf = val.MarshalTo(docBuf.SmallBuf[:0])
-				if !e.comp(docBuf.SmallBuf) {
+				if !e.okScalar(val, docBuf) {
 					return false
 				}
 			}
@@ -96,23 +99,131 @@ func (e *Comp) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 			return true
 		} else {
 			if !e.notArray {
+				if docBuf == nil {
+					docBuf = &syncpool.DocBuffer{}
+				}
 				docBuf.SmallBuf = v.MarshalTo(docBuf.SmallBuf[:0])
 				if e.comp(docBuf.SmallBuf) {
 					return true
 				}
 			}
 			for _, val := range vals {
-				docBuf.SmallBuf = val.MarshalTo(docBuf.SmallBuf[:0])
-				if e.comp(docBuf.SmallBuf) {
+				if e.okScalar(val, docBuf) {
 					return true
 				}
 			}
 			return false
 		}
-	} else {
-		docBuf.SmallBuf = v.MarshalTo(docBuf.SmallBuf[:0])
-		return e.comp(docBuf.SmallBuf)
 	}
+	return e.okScalar(v, docBuf)
+}
+
+// okScalar compares one non-array value against EqValue, equivalent to
+// e.comp(v.MarshalTo(...)) but skipping the marshal whenever the comparison is
+// decidable from the value alone: the encoding starts with the type tag, so
+// mismatched tags resolve on the first byte; same-type numbers compare as the
+// monotonic uint64 the encoding is built from (see encodeFloatBits);
+// null/true/false encode as the bare tag. Strings, binary, and nested
+// containers fall back to marshal + bytes.Compare.
+func (e *Comp) okScalar(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
+	if len(e.EqValue) > 0 {
+		switch t := v.Type(); t {
+		case anyenc.TypeArray, anyenc.TypeObject:
+			// containers need their full encoding — no tag short-circuit:
+			// e.g. an array EqValue and an array probe share the tag byte
+		case anyenc.TypeNumber:
+			if tag := byte(t); e.EqValue[0] != tag {
+				return e.compResult(compareBytes(e.EqValue[0], tag))
+			}
+			if len(e.EqValue) == 1+8 {
+				f, _ := v.Float64()
+				return e.compResult(compareUint64(
+					binary.BigEndian.Uint64(e.EqValue[1:]),
+					encodeFloatBits(f),
+				))
+			}
+		case anyenc.TypeNull, anyenc.TypeTrue, anyenc.TypeFalse:
+			if tag := byte(t); e.EqValue[0] != tag {
+				return e.compResult(compareBytes(e.EqValue[0], tag))
+			}
+			// single-byte encoding: equal unless EqValue carries extra bytes
+			if len(e.EqValue) == 1 {
+				return e.compResult(0)
+			}
+			return e.compResult(1)
+		case anyenc.TypeString:
+			if tag := byte(t); e.EqValue[0] != tag {
+				return e.compResult(compareBytes(e.EqValue[0], tag))
+			}
+			// Plain (NUL-free) probe strings encode as tag + raw bytes + EOS
+			// (0x00 inside a string is escaped as the pair (0x00, 0xFF)), so
+			// the comparison can run on raw bytes without marshaling.
+			sb, _ := v.StringBytes()
+			if bytes.IndexByte(sb, 0) < 0 {
+				n := len(e.EqValue)
+				if e.CompOp == CompOpEq || e.CompOp == CompOpNe {
+					// only equality matters: EqValue must be byte-identical to
+					// tag + sb + EOS (any malformed EqValue is simply unequal)
+					if n == len(sb)+2 && e.EqValue[n-1] == 0 && bytes.Equal(e.EqValue[1:n-1], sb) {
+						return e.compResult(0)
+					}
+					return e.compResult(1)
+				}
+				// ordering ops additionally need the EqValue payload to be a
+				// plain string (an interior 0x00 means an escape pair or
+				// trailing junk): then both payloads are raw strings and the
+				// shared EOS terminator preserves order.
+				if n >= 2 && e.EqValue[n-1] == 0 {
+					payload := e.EqValue[1 : n-1]
+					if bytes.IndexByte(payload, 0) < 0 {
+						return e.compResult(bytes.Compare(payload, sb))
+					}
+				}
+			}
+		default:
+			// binary/vector: the tag still decides cross-type comparisons
+			if tag := byte(t); e.EqValue[0] != tag {
+				return e.compResult(compareBytes(e.EqValue[0], tag))
+			}
+		}
+	}
+	if docBuf == nil {
+		docBuf = &syncpool.DocBuffer{}
+	}
+	docBuf.SmallBuf = v.MarshalTo(docBuf.SmallBuf[:0])
+	return e.comp(docBuf.SmallBuf)
+}
+
+// encodeFloatBits returns the uint64 whose big-endian bytes are exactly
+// anyenc.AppendFloat64's encoding of f (sign-flip scheme, -0 normalized to +0),
+// so uint64 order == encoded byte order.
+func encodeFloatBits(f float64) uint64 {
+	bits := math.Float64bits(f)
+	if bits&(1<<63) != 0 {
+		if bits == 1<<63 { // -0 normalizes to +0's encoding
+			return bits
+		}
+		return ^bits
+	}
+	return bits | 1<<63
+}
+
+func compareBytes(a, b byte) int {
+	if a < b {
+		return -1
+	} else if a > b {
+		return 1
+	}
+	return 0
+}
+
+func compareUint64(a, b uint64) int {
+	if a < b {
+		return -1
+	} else if a > b {
+		return 1
+	}
+	return 0
 }
 
 func (e *Comp) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
@@ -160,7 +271,11 @@ func (e *Comp) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 }
 
 func (e *Comp) comp(b []byte) bool {
-	comp := bytes.Compare(e.EqValue, b)
+	return e.compResult(bytes.Compare(e.EqValue, b))
+}
+
+// compResult maps a bytes.Compare(EqValue, probe) result to the operator's verdict.
+func (e *Comp) compResult(comp int) bool {
 	switch e.CompOp {
 	case CompOpEq:
 		return comp == 0
@@ -288,6 +403,12 @@ type In struct {
 	// per-call sort+merge is skipped — unique point bounds are already
 	// disjoint. nil for a hand-constructed In, which falls back to sorting.
 	sorted []string
+
+	// numBits holds the numeric members as their encoded uint64 forms (see
+	// encodeFloatBits), ascending. Number probes binary-search here instead
+	// of marshaling + hashing into Values. Authoritative only when sorted is
+	// non-nil (built by NewInValue); a hand-constructed In takes the map path.
+	numBits []uint64
 }
 
 func NewInValue(values ...*anyenc.Value) In {
@@ -298,6 +419,7 @@ func NewInValue(values ...*anyenc.Value) In {
 	// mutated: when append grows the arena, keys created earlier keep the
 	// previous backing array alive with their bytes intact.
 	var arena []byte
+	var numBits []uint64
 	sorted := make([]string, 0, len(values))
 	for _, v := range values {
 		start := len(arena)
@@ -310,38 +432,52 @@ func NewInValue(values ...*anyenc.Value) In {
 		}
 		inValues[key] = struct{}{}
 		sorted = append(sorted, key)
+		if len(span) == 1+8 && span[0] == byte(anyenc.TypeNumber) {
+			numBits = append(numBits, binary.BigEndian.Uint64(span[1:]))
+		}
 	}
 	slices.Sort(sorted)
+	slices.Sort(numBits)
 	return In{
-		Values: inValues,
-		sorted: sorted,
+		Values:  inValues,
+		sorted:  sorted,
+		numBits: numBits,
 	}
 }
 
 func (e In) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
+	if v == nil {
+		return false
+	}
 	if docBuf == nil {
 		docBuf = &syncpool.DocBuffer{}
 	}
-	if v != nil {
-		if v.Type() == anyenc.TypeArray {
-			arr, _ := v.Array()
-			for _, item := range arr {
-				// Store the grown buffer back so the marshal is alloc-free
-				// from the second document on (Comp.Ok does the same).
-				docBuf.SmallBuf = item.MarshalTo(docBuf.SmallBuf[:0])
-				if _, ok := e.Values[string(docBuf.SmallBuf)]; ok {
-					return true
-				}
+	if v.Type() == anyenc.TypeArray {
+		arr, _ := v.Array()
+		for _, item := range arr {
+			if e.containsValue(item, docBuf) {
+				return true
 			}
-			return false
-		} else {
-			docBuf.SmallBuf = v.MarshalTo(docBuf.SmallBuf[:0])
-			_, ok := e.Values[string(docBuf.SmallBuf)]
-			return ok
 		}
-	} else {
 		return false
 	}
+	return e.containsValue(v, docBuf)
+}
+
+// containsValue reports membership of one non-array value. Number probes skip
+// the marshal + map hash via a binary search over numBits when the In was
+// built by NewInValue (sorted non-nil ⇒ numBits is authoritative).
+func (e In) containsValue(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
+	if e.sorted != nil && v.Type() == anyenc.TypeNumber {
+		f, _ := v.Float64()
+		_, found := slices.BinarySearch(e.numBits, encodeFloatBits(f))
+		return found
+	}
+	// Store the grown buffer back so the marshal is alloc-free from the
+	// second document on (Comp.Ok does the same).
+	docBuf.SmallBuf = v.MarshalTo(docBuf.SmallBuf[:0])
+	_, ok := e.Values[string(docBuf.SmallBuf)]
+	return ok
 }
 
 func (e In) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
