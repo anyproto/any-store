@@ -14,9 +14,18 @@ import (
 	"unsafe"
 )
 
+// Filter is built once (ParseCondition or a constructor) and is immutable
+// afterwards: it may be shared by any number of queries running concurrently.
+// Ok and IndexBounds never mutate filter state and need no synchronization;
+// bound bytes returned by IndexBounds that alias filter memory are clipped to
+// cap == len so downstream appends reallocate instead of writing into the
+// shared filter. Pinned by TestFilterConcurrentReuse and
+// TestIndexBounds_FilterOwnedBytesAreCapped; see docs/query-filter-contract.md.
 type Filter interface {
 	// Ok evaluates whether the given value satisfies the filter condition.
-	// docBuf is optional and can be nil it's used for reuse memory in some filters
+	// docBuf is optional and can be nil, it's used to reuse memory between
+	// calls: with a warm per-query DocBuffer, Ok is alloc-free
+	// (TestFilterOkAllocFree).
 	Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool
 
 	// IndexBounds appends bounds to the bs for the given field if it is applicable
@@ -107,37 +116,43 @@ func (e *Comp) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 }
 
 func (e *Comp) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
+	// Clip spare capacity: a built Comp is shared by concurrent queries, and
+	// the planner extends bound bytes with appends (AdjustBoundsForNonUnique,
+	// padReverseBounds). cap == len forces those appends to reallocate instead
+	// of writing into EqValue's backing array shared across queries (In gives
+	// the same guarantee via inBoundBytes).
+	ev := e.EqValue[:len(e.EqValue):len(e.EqValue)]
 	switch e.CompOp {
 	case CompOpEq:
 		return bs.Append(Bound{
-			Start:        e.EqValue,
-			End:          e.EqValue,
+			Start:        ev,
+			End:          ev,
 			StartInclude: true,
 			EndInclude:   true,
 		})
 	case CompOpGt:
 		return bs.Append(Bound{
-			Start: e.EqValue,
+			Start: ev,
 		})
 	case CompOpGte:
 		return bs.Append(Bound{
-			Start:        e.EqValue,
+			Start:        ev,
 			StartInclude: true,
 		})
 	case CompOpLt:
 		return bs.Append(Bound{
-			End: e.EqValue,
+			End: ev,
 		})
 	case CompOpLte:
 		return bs.Append(Bound{
-			End:        e.EqValue,
+			End:        ev,
 			EndInclude: true,
 		})
 	case CompOpNe:
 		return bs.Append(Bound{
-			End: e.EqValue,
+			End: ev,
 		}).Append(Bound{
-			Start: e.EqValue,
+			Start: ev,
 		})
 	default:
 		panic(fmt.Errorf("unexpected comp op: %v", e.CompOp))
@@ -477,8 +492,14 @@ func (a All) String() string {
 // Text is the {"$text":{"$search":"..."}} full-text predicate. Matching and
 // ranking are performed by the full-text index (the query is driven by an FTS
 // scan), so as a residual predicate Ok always passes: any document the FTS scan
-// yields has already matched. It contributes no index bounds. See
-// docs/fts/DESIGN.md.
+// yields has already matched. It contributes no index bounds.
+//
+// CAUTION: this makes Text meaningful only inside an FTS-driven query. Used
+// standalone — calling Ok directly to post-filter documents, as
+// subscription-style consumers of this package do — a $text condition silently
+// matches EVERY document; Ok never evaluates the search text. Placement rules
+// ($text only at the top level or inside $and, at most one per query) are also
+// enforced by the executor, not here. See docs/fts/DESIGN.md.
 type Text struct {
 	Search string
 }
