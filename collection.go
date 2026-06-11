@@ -30,6 +30,10 @@ type Collection interface {
 	// Find returns a new Query object with given filter
 	Find(filter any) Query
 
+	// Aggregate returns a new aggregation query for the given MongoDB-style
+	// pipeline (an array of stages like $match, $group, $sort, $unwind, ...).
+	Aggregate(pipeline any) AggQuery
+
 	// Insert inserts multiple documents into the collection.
 	// Returns an error if the insertion fails.
 	Insert(ctx context.Context, docs ...*anyenc.Value) (err error)

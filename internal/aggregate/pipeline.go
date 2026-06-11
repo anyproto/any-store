@@ -2,7 +2,91 @@ package aggregate
 
 import (
 	"fmt"
+	"strings"
+
+	"github.com/anyproto/any-store/v2/query"
 )
+
+// Prefix is the leading pipeline part that can be pushed down into the access
+// plan (the regular Find machinery: index/CBO selection, FTS/vector sources,
+// index-order sorts, cursor-level offset skips).
+type Prefix struct {
+	Filter query.Filter // folded leading $match chain; nil if none
+	Sort   query.Sort   // nil if no $sort was pushed
+	Skip   int
+	Limit  int // 0 = none
+}
+
+// SplitPrefix consumes the longest pushable pipeline prefix in canonical
+// order — $match* → $sort? → $skip? → $limit? — and returns it together with
+// the remaining stages (which run as in-pipeline operators). Pushdown stops
+// at the first stage that synthesizes documents ($group/$project/$addFields/
+// $unwind/$count) and at any stage out of canonical order: a $match after
+// $skip/$limit does not commute, and out-of-order combinations are rare
+// enough that running them in-pipeline (correct, just unoptimized) beats
+// rewrite complexity.
+func SplitPrefix(p Pipeline) (Prefix, Pipeline) {
+	var (
+		pre     Prefix
+		filters []query.Filter
+		phase   int // 0: $match, 1: $sort, 2: $skip, 3: $limit
+		i       int
+	)
+loop:
+	for ; i < len(p); i++ {
+		switch sp := p[i].(type) {
+		case MatchSpec:
+			if phase > 0 {
+				break loop
+			}
+			filters = append(filters, sp.Filter)
+		case SortSpec:
+			if phase >= 1 {
+				break loop
+			}
+			pre.Sort = sp.Sort
+			phase = 1
+		case SkipSpec:
+			if phase >= 2 {
+				break loop
+			}
+			pre.Skip = sp.N
+			phase = 2
+		case LimitSpec:
+			if phase >= 3 {
+				break loop
+			}
+			pre.Limit = sp.N
+			phase = 3
+		default:
+			break loop
+		}
+	}
+	switch len(filters) {
+	case 0:
+	case 1:
+		pre.Filter = filters[0]
+	default:
+		pre.Filter = query.And(filters)
+	}
+	return pre, p[i:]
+}
+
+// ExplainStages renders the in-pipeline stage list for Explain output,
+// including the top-K annotation a following $skip/$limit folds into $sort.
+func ExplainStages(p Pipeline) string {
+	var b strings.Builder
+	for i, spec := range p {
+		s := spec.String()
+		if ss, ok := spec.(SortSpec); ok {
+			if k := foldTopK(p[i+1:]); k > 0 {
+				s = (&SortStage{Spec: ss, TopK: k}).String()
+			}
+		}
+		fmt.Fprintf(&b, "  %d. %s\n", i+1, s)
+	}
+	return b.String()
+}
 
 // Build compiles parsed stage specs into an executable stage chain on top of
 // source. The source must reset Ctx.RowArena once per row it yields (it is

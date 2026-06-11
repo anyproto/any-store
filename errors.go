@@ -3,7 +3,25 @@ package anystore
 import (
 	"errors"
 
+	"github.com/anyproto/any-store/v2/internal/aggregate"
 	"github.com/anyproto/any-store/v2/internal/btree"
+)
+
+var (
+	// ErrGroupLimitExceeded is returned when an aggregation $group stage
+	// exceeds the configured maximum number of unique group keys
+	// (AggQuery.GroupLimit).
+	ErrGroupLimitExceeded = aggregate.ErrGroupLimitExceeded
+
+	// ErrAccumArrayLimitExceeded is returned when a $push or $addToSet
+	// accumulator exceeds the configured maximum array length
+	// (AggQuery.AccumArrayLimit).
+	ErrAccumArrayLimitExceeded = aggregate.ErrAccumArrayLimitExceeded
+
+	// ErrAggMemoryLimitExceeded is returned when the blocking stages of an
+	// aggregation pipeline retain more than the configured memory budget
+	// (AggQuery.MemoryLimit).
+	ErrAggMemoryLimitExceeded = aggregate.ErrMemoryLimitExceeded
 )
 
 var (

@@ -166,6 +166,9 @@ func MustParsePipeline(pipeline any) Pipeline {
 // the same parser as Find conditions) into stage specs. The result is fully
 // detached from the input value.
 func ParsePipeline(pipeline any) (Pipeline, error) {
+	if pipeline == nil {
+		return nil, nil // empty pipeline: plain passthrough scan
+	}
 	if p, ok := pipeline.(Pipeline); ok {
 		return p, nil
 	}
