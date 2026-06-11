@@ -433,6 +433,9 @@ func NewInValue(values ...*anyenc.Value) In {
 		inValues[key] = struct{}{}
 		sorted = append(sorted, key)
 		if len(span) == 1+8 && span[0] == byte(anyenc.TypeNumber) {
+			if numBits == nil {
+				numBits = make([]uint64, 0, len(values))
+			}
 			numBits = append(numBits, binary.BigEndian.Uint64(span[1:]))
 		}
 	}
