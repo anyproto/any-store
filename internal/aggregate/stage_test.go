@@ -74,6 +74,10 @@ func runPipeline(t *testing.T, src Stage, pipeline string, limits Limits) []stri
 	return res
 }
 
+func mustMarshalJson(j string) []byte {
+	return anyenc.MustParseJson(j).MarshalTo(nil)
+}
+
 func jsonRows(t *testing.T, jsons ...string) []string {
 	t.Helper()
 	res := make([]string, len(jsons))
@@ -180,7 +184,7 @@ func TestSkipLimitCountStages(t *testing.T) {
 }
 
 func TestBuildUnsupported(t *testing.T) {
-	_, err := Build(newSliceSource(), MustParsePipeline(`[{"$group": {"_id": null}}]`), Limits{})
+	_, err := Build(newSliceSource(), MustParsePipeline(`[{"$sort": {"a": 1}}]`), Limits{})
 	assert.ErrorContains(t, err, "not implemented yet")
 }
 

@@ -49,8 +49,14 @@ func Build(source Stage, specs Pipeline, limits Limits) (Stage, error) {
 			if rowOnArena {
 				heldOnArena = true
 			}
-		case GroupSpec, SortSpec:
-			// Wired in follow-up commits ($group, in-pipeline $sort).
+		case GroupSpec:
+			cur = newGroupStage(cur, sp, limits)
+			// $group drains its upstream completely before emitting; emitted
+			// rows are built fresh on RowArena with a per-emit reset, and
+			// nothing below stays live afterwards.
+			rowOnArena, heldOnArena = true, false
+		case SortSpec:
+			// Wired in a follow-up commit (in-pipeline $sort).
 			return nil, fmt.Errorf("aggregate: stage not implemented yet: %s", specs[i])
 		default:
 			return nil, fmt.Errorf("aggregate: unsupported stage: %T", sp)
