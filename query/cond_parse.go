@@ -382,6 +382,7 @@ func makeCompFilter(op Operator, v *anyenc.Value) (f Filter, err error) {
 
 // parseText parses {"$search": "...", "$language": "..."} into a Text filter.
 // $language is accepted and ignored for v1 (the analyzer is language-neutral).
+// Note the Text caveat: outside an FTS-driven query its Ok matches everything.
 func parseText(v *anyenc.Value) (Filter, error) {
 	if v.Type() != anyenc.TypeObject {
 		return nil, fmt.Errorf("$text must be an object, e.g. {\"$search\":\"...\"}")

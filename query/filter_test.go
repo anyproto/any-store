@@ -734,6 +734,21 @@ func BenchmarkFilter_Ok(b *testing.B) {
 	b.Run("all", func(b *testing.B) {
 		bench(b, `{"b":{"$all":[1,3]}}`)
 	})
+	b.Run("string eq", func(b *testing.B) {
+		bench(b, `{"c":"test"}`)
+	})
+	b.Run("string eq miss", func(b *testing.B) {
+		bench(b, `{"c":"other"}`)
+	})
+	b.Run("gt", func(b *testing.B) {
+		bench(b, `{"a":{"$gt":1}}`)
+	})
+	b.Run("ne", func(b *testing.B) {
+		bench(b, `{"a":{"$ne":5}}`)
+	})
+	b.Run("type miss", func(b *testing.B) {
+		bench(b, `{"c":2}`) // number filter against a string field
+	})
 }
 
 // --- Coverage tests from filter_size_coverage_test.go ---
