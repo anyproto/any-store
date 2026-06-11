@@ -56,11 +56,33 @@ func Build(source Stage, specs Pipeline, limits Limits) (Stage, error) {
 			// nothing below stays live afterwards.
 			rowOnArena, heldOnArena = true, false
 		case SortSpec:
-			// Wired in a follow-up commit (in-pipeline $sort).
-			return nil, fmt.Errorf("aggregate: stage not implemented yet: %s", specs[i])
+			// A directly following $skip/$limit bounds the sort's retained
+			// set (top-K); the skip/limit stages themselves stay in the chain.
+			cur = &SortStage{Src: cur, Spec: sp, TopK: foldTopK(specs[i+1:])}
+			// Emitted rows are owned by the stage parser; nothing below stays
+			// live after the drain.
+			rowOnArena, heldOnArena = false, false
 		default:
 			return nil, fmt.Errorf("aggregate: unsupported stage: %T", sp)
 		}
 	}
 	return cur, nil
+}
+
+// foldTopK returns skip+limit when an in-pipeline $sort is immediately
+// followed by $skip/$limit stages (in that combination), bounding how many
+// rows the sort must retain. 0 means a full sort.
+func foldTopK(rest Pipeline) int {
+	skip := 0
+	for _, spec := range rest {
+		switch sp := spec.(type) {
+		case SkipSpec:
+			skip += sp.N
+		case LimitSpec:
+			return skip + sp.N
+		default:
+			return 0
+		}
+	}
+	return 0
 }

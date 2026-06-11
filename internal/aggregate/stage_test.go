@@ -183,10 +183,6 @@ func TestSkipLimitCountStages(t *testing.T) {
 	})
 }
 
-func TestBuildUnsupported(t *testing.T) {
-	_, err := Build(newSliceSource(), MustParsePipeline(`[{"$sort": {"a": 1}}]`), Limits{})
-	assert.ErrorContains(t, err, "not implemented yet")
-}
 
 func TestCountStageCancellation(t *testing.T) {
 	// An endless upstream must be interrupted by context cancellation.
