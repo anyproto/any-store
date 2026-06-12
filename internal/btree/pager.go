@@ -669,7 +669,7 @@ func (p *pager) open() (err error) {
 	// occurred before checkpoint. Without this, commit() would serialize
 	// stale p.header fields back into page 1, corrupting the freelist.
 	if p.wal.index.maxFrame.Load() > 0 {
-		frame, err := p.wal.index.get(1, p.wal.index.maxFrame.Load())
+		frame, err := p.wal.index.get(1, p.wal.index.maxFrame.Load(), p.wal.index.liveMinFrame())
 		if err != nil {
 			return err
 		}
@@ -867,23 +867,23 @@ func (p *pager) initNewDB() error {
 // beginRead starts a read transaction, taking a WAL snapshot.
 // Returns the WAL max frame for snapshot isolation and the reader slot number.
 func (p *pager) beginRead() (maxFrame uint32, slot int, err error) {
-	_, maxFrame, slot, err = p.beginReadHdr()
+	_, maxFrame, _, slot, err = p.beginReadHdr()
 	return maxFrame, slot, err
 }
 
 // beginReadHdr is beginRead plus the exact WAL header snapshot used to claim
 // the reader slot. Callers that may escalate to a write transaction should use
 // this so BUSY_SNAPSHOT compares against the same snapshot the read lock used.
-func (p *pager) beginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err error) {
+func (p *pager) beginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
 	p.mu.RLock()
 	if pagerState(p.state.Load()) == pagerError {
 		p.mu.RUnlock()
-		return WalIndexHdr{}, 0, 0, ErrCorrupt
+		return WalIndexHdr{}, 0, 0, 0, ErrCorrupt
 	}
-	hdr, maxFrame, slot, err = p.wal.beginReadHdr()
+	hdr, maxFrame, minFrame, slot, err = p.wal.beginReadHdr()
 	if err != nil {
 		p.mu.RUnlock()
-		return WalIndexHdr{}, 0, 0, err
+		return WalIndexHdr{}, 0, 0, 0, err
 	}
 	// Update pager's walMaxFrame monotonically: never decrease, since a reader
 	// with an older snapshot must not overwrite a newer value set by the writer.
@@ -896,7 +896,7 @@ func (p *pager) beginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err 
 			break
 		}
 	}
-	return hdr, maxFrame, slot, nil
+	return hdr, maxFrame, minFrame, slot, nil
 }
 
 // endRead ends a read transaction for the given reader slot.
@@ -1000,7 +1000,9 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 
 	// Try to read from WAL first
 	if walMaxFrame > 0 {
-		frame, err := p.wal.index.get(pgno, walMaxFrame)
+		// Writer path: the write lock excludes a concurrent restart, so the
+		// live checkpoint frontier is a valid minFrame.
+		frame, err := p.wal.index.get(pgno, walMaxFrame, p.wal.index.liveMinFrame())
 		if err != nil {
 			// ErrCorrupt from a full/over-probed SHM hash chain: fail the
 			// read (matching C's walFindFrame SQLITE_CORRUPT_BKPT at
@@ -1080,7 +1082,7 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 // falls back to allocPageBuffer in that case.
 // DRIFT: WAL frame read failure silently falls through to stale disk read See docs/btree/NOTES.md#drift-6-wal-frame-read-failure-falls-through-to-disk-read
 // DRIFT: short DB-file read on in-bounds page is hard error in Go, zero-pad OK in C See docs/btree/NOTES.md#drift-7-short-db-file-read-treated-as-hard-error
-func (p *pager) readTempPage(pgno, walMaxFrame, dbSizeBound uint32, codecBuf []byte, codecAEAD *aeadScratch) (*page, error) {
+func (p *pager) readTempPage(pgno, walMaxFrame, walMinFrame, dbSizeBound uint32, codecBuf []byte, codecAEAD *aeadScratch) (*page, error) {
 	pg := p.acquireTempPage()
 	pg.pgno = pgno
 	pg.pinCount = 1
@@ -1101,7 +1103,7 @@ func (p *pager) readTempPage(pgno, walMaxFrame, dbSizeBound uint32, codecBuf []b
 
 	// Try to read from WAL first.
 	if walMaxFrame > 0 {
-		frame, err := p.wal.index.get(pgno, walMaxFrame)
+		frame, err := p.wal.index.get(pgno, walMaxFrame, walMinFrame)
 		if err != nil {
 			// ErrCorrupt from a full/over-probed SHM hash chain: fail the read
 			// (C walFindFrame SQLITE_CORRUPT_BKPT, wal.c:3593) rather than
@@ -1188,7 +1190,7 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 	// If no reader cache provided, read an uncached temporary page.
 	// Never fall back to writerCache — that would race with the writer goroutine.
 	if cache == nil {
-		return p.readTempPage(pgno, walMaxFrame, p.readerDbSizeBound(nil), nil, nil)
+		return p.readTempPage(pgno, walMaxFrame, p.wal.index.liveMinFrame(), p.readerDbSizeBound(nil), nil, nil)
 	}
 
 	// Check reader cache.
@@ -1210,7 +1212,7 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 			cache.codecScratch = make([]byte, p.pageSize)
 		}
 		// END ENCRYPTION
-		return p.readTempPage(pgno, walMaxFrame, p.readerDbSizeBound(cache), cache.codecScratch, &cache.codecAEAD)
+		return p.readTempPage(pgno, walMaxFrame, p.readerMinFrame(cache), p.readerDbSizeBound(cache), cache.codecScratch, &cache.codecAEAD)
 	}
 
 	// Decide read-vs-zero up front, matching C getPageNormal
@@ -1228,7 +1230,7 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 
 	// Try to read from WAL first.
 	if walMaxFrame > 0 {
-		frame, err := p.wal.index.get(pgno, walMaxFrame)
+		frame, err := p.wal.index.get(pgno, walMaxFrame, p.readerMinFrame(cache))
 		if err != nil {
 			// ErrCorrupt from a full/over-probed SHM hash chain: fail the read
 			// (C walFindFrame SQLITE_CORRUPT_BKPT, wal.c:3593) rather than
@@ -1344,7 +1346,7 @@ func (p *pager) readRawPage(pgno, walMaxFrame uint32) ([]byte, error) {
 	}
 	buf := make([]byte, p.pageSize)
 	if walMaxFrame > 0 && p.wal != nil {
-		frame, err := p.wal.index.get(pgno, walMaxFrame)
+		frame, err := p.wal.index.get(pgno, walMaxFrame, p.wal.index.liveMinFrame())
 		if err != nil {
 			// ErrCorrupt from a full/over-probed SHM hash chain: fail the read
 			// (C walFindFrame SQLITE_CORRUPT_BKPT, wal.c:3593) rather than
@@ -1948,6 +1950,19 @@ func (p *pager) readerDbSizeBound(cache *pcache) uint32 {
 	return p.dbSize.Load()
 }
 
+// readerMinFrame returns the WAL lookup floor for a read path: the snapshot
+// minFrame carried on the reader cache (captured at BeginRead, like SQLite's
+// pWal->minFrame), or the live checkpoint frontier when there is no reader
+// cache (writer / uncached paths, where the write lock or exclusivity rules
+// out a concurrent WAL restart). An unset cache value (0) degrades to the
+// live frontier.
+func (p *pager) readerMinFrame(cache *pcache) uint32 {
+	if cache != nil && cache.minFrame != 0 {
+		return cache.minFrame
+	}
+	return p.wal.index.liveMinFrame()
+}
+
 // refreshHeaderFromPage1 refreshes p.header and p.dbSize from the latest
 // page 1 bytes, consulting WAL first (via SHM hash tables in multi-process
 // mode) and falling back to the database file. Called from beginWrite when
@@ -1986,7 +2001,7 @@ func (p *pager) refreshHeaderFromPage1() error {
 	// can be propagated to the caller rather than swallowed.
 	var walErr error
 	if effectiveMaxFrame > 0 {
-		frame, err := p.wal.index.get(1, effectiveMaxFrame)
+		frame, err := p.wal.index.get(1, effectiveMaxFrame, p.wal.index.liveMinFrame())
 		if err != nil {
 			// ErrCorrupt from a full/over-probed SHM hash chain is a hard error,
 			// not a "WAL has no page 1" miss: do not fall back to the DB file
@@ -2095,7 +2110,7 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 	// frames. After an external state change, beginWrite rebuilds the local page
 	// map from the WAL so page-1 refreshes do not depend solely on SHM hashes.
 	if effectiveMaxFrame > 0 {
-		frame, gerr := p.wal.index.get(1, effectiveMaxFrame)
+		frame, gerr := p.wal.index.get(1, effectiveMaxFrame, p.wal.index.liveMinFrame())
 		if gerr != nil {
 			// ErrCorrupt from a full/over-probed SHM hash chain is a hard error,
 			// not a "WAL has no page 1" miss: fail rather than reading stale

@@ -5720,7 +5720,7 @@ func TestWalBeginRead_AllSlotsBusy_Slot0AlsoLocked(t *testing.T) {
 	// retry and eventually surface ErrProtocol after ~10s of back-off,
 	// but that's a retry-exhaustion contract, not a slot-lock contract —
 	// test the inner conversion directly to keep the test fast and focused.
-	_, _, _, err := w.tryBeginReadInProcessHdr()
+	_, _, _, _, err := w.tryBeginReadInProcessHdr()
 	assert.ErrorIs(t, err, errWALRetry)
 
 	for i := 0; i <= 4; i++ {
@@ -7815,7 +7815,7 @@ func TestPagerSlabIntegration(t *testing.T) {
 	defer p.endRead(slot3)
 
 	freeBeforeTemp := len(globalPageSlab.freeList)
-	tmpPg, err := p.readTempPage(pageNos[0], mf3, p.readerDbSizeBound(nil), nil, nil)
+	tmpPg, err := p.readTempPage(pageNos[0], mf3, p.wal.index.liveMinFrame(), p.readerDbSizeBound(nil), nil, nil)
 	require.NoError(t, err)
 	assert.NotNil(t, tmpPg.data)
 	freeAfterTemp := len(globalPageSlab.freeList)
@@ -8432,7 +8432,7 @@ func TestBeginWriteHeaderRefreshError_DoubleIOFailure(t *testing.T) {
 	// Drive db2's beginWrite manually so we can inject the read failure on the
 	// stateChanged edge. Mirror DB.BeginWrite's beginReadHdr -> beginWrite flow.
 	p := db2.pager
-	readSnap, maxFrame, slot, err := p.beginReadHdr()
+	readSnap, maxFrame, _, slot, err := p.beginReadHdr()
 	require.NoError(t, err)
 	p.writerWalSlot = slot
 

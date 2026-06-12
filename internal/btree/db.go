@@ -744,7 +744,7 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 		return nil, ErrClosed
 	}
 
-	hdr, maxFrame, slot, err := db.pager.beginReadHdr()
+	hdr, maxFrame, minFrame, slot, err := db.pager.beginReadHdr()
 	if err != nil {
 		db.mu.RUnlock()
 		<-db.readerSem
@@ -768,30 +768,53 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 
 	// Allocate reader cache from pool for per-connection page caching.
 	// Persistent cache: keep cached pages only if the DB snapshot hasn't
-	// changed. We check dataVersion (monotonic, never wraps) to detect
-	// writes. walMaxFrame alone suffers ABA after checkpoint restart.
-	// Matches SQLite pager.c:3246-3267 (pagerBeginReadTransaction —
-	// pager_reset only if change-counter changed).
+	// changed. The snapshot key is the FULL WAL-index header (not just
+	// mxFrame): aSalt is re-randomized on every WAL restart, so a peer
+	// process's checkpoint-restart cycle that happens to land on the same
+	// mxFrame still invalidates the cache. dataVersion (monotonic, never
+	// wraps) additionally covers in-process commits, whose synthesized
+	// header carries no salts. Matches SQLite's pChanged signal from
+	// walIndexReadHdr (raw header memcmp, wal.c:2611) driving pager_reset
+	// in pagerBeginReadTransaction (pager.c:3246-3267).
 	curDV := db.dataVersion.Load()
+	// Normalize the snapshot header once; the same value becomes both the
+	// cache validity key and tx.walHdr below.
+	snapHdr := hdr
+	if hdr.isInit == 0 {
+		snapHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
+	}
 	// Snapshot DB page count for this reader (hdr.nPage, fallback p.dbSize).
 	// Carried on the cache so reader bound checks accept pages a peer
-	// allocated after open. Set in lockstep with walMaxFrame.
+	// allocated after open. Set in lockstep with walHdr.
 	snapDbSize := db.pager.effectiveReaderDbSize(hdr)
 	var cache *pcache
 	select {
 	case cache = <-db.readerCaches:
-		if cache.dataVersion != curDV || cache.walMaxFrame != maxFrame {
+		if cache.dataVersion != curDV || cache.walHdr != snapHdr {
+			if debugTrace && cache.dataVersion == curDV && cache.walHdr.mxFrame == maxFrame {
+				trace("beginRead: reader cache ABA averted: mxFrame=%d cachedSalt=%x liveSalt=%x",
+					maxFrame, cache.walHdr.aSalt, snapHdr.aSalt)
+			}
 			cache.clear()
 			cache.dataVersion = curDV
+			cache.walHdr = snapHdr
 			cache.walMaxFrame = maxFrame
 		}
 		cache.dbSize = snapDbSize
+		// Refresh on every BeginRead, even when the cache is kept: a backfill
+		// between two same-header read txs raises the floor (harmless), and a
+		// slot-0 snapshot (minFrame == maxFrame+1) must not inherit a lower
+		// floor from an earlier slot-1..4 tx, or a peer's WAL restart could
+		// serve new-generation frames into it. See pcache.minFrame.
+		cache.minFrame = minFrame
 	default:
 		cache = newPcache(int(db.pager.pageSize), db.readerCacheSize, true)
 		cache.useSlab = db.pager.useSlab
 		cache.dataVersion = curDV
+		cache.walHdr = snapHdr
 		cache.walMaxFrame = maxFrame
 		cache.dbSize = snapDbSize
+		cache.minFrame = minFrame
 	}
 
 	tx := db.getReadTx()
@@ -803,11 +826,7 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 	// Dual-write during per-connection-hdr migration. Step 5 will remove
 	// walMaxFrame; until then, tests still read it directly.
 	tx.walMaxFrame = maxFrame
-	if hdr.isInit != 0 {
-		tx.walHdr = hdr
-	} else {
-		tx.walHdr = WalIndexHdr{isInit: 1, mxFrame: maxFrame}
-	}
+	tx.walHdr = snapHdr
 	tx.walSlot = slot
 	tx.diskFileChangeCounter = fcc
 	tx.diskSchemaCookie = sc
@@ -865,7 +884,7 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 
 	for attempt := 0; ; attempt++ {
 		var err error
-		readSnap, maxFrame, slot, err = db.pager.beginReadHdr()
+		readSnap, maxFrame, _, slot, err = db.pager.beginReadHdr()
 		if err != nil {
 			if errors.Is(err, ErrBusyRecovery) {
 				xBusy := db.pager.wal.busyHandler
@@ -1201,7 +1220,7 @@ func (db *DB) freeTreePagesDepth(pgno uint32, depth int) error {
 // goroutine. To resolve namespaces from the writer goroutine (seeing dirty
 // pages), use getNamespaceLocked directly.
 func (db *DB) GetNamespace(name string) (*Namespace, error) {
-	hdr, maxFrame, slot, err := db.pager.beginReadHdr()
+	hdr, maxFrame, minFrame, slot, err := db.pager.beginReadHdr()
 	if err != nil {
 		return nil, err
 	}
@@ -1210,6 +1229,7 @@ func (db *DB) GetNamespace(name string) (*Namespace, error) {
 	cache := newPcache(int(db.pager.pageSize), 200, true)
 	cache.useSlab = db.pager.useSlab
 	cache.dbSize = db.pager.effectiveReaderDbSize(hdr)
+	cache.minFrame = minFrame
 	defer cache.destroy()
 
 	return db.getNamespaceAt(name, maxFrame, cache)
@@ -1291,7 +1311,7 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 
 // ListNamespaces returns the names of all namespaces.
 func (db *DB) ListNamespaces() ([]string, error) {
-	hdr, maxFrame, slot, err := db.pager.beginReadHdr()
+	hdr, maxFrame, minFrame, slot, err := db.pager.beginReadHdr()
 	if err != nil {
 		return nil, err
 	}
@@ -1300,6 +1320,7 @@ func (db *DB) ListNamespaces() ([]string, error) {
 	cache := newPcache(int(db.pager.pageSize), 200, true)
 	cache.useSlab = db.pager.useSlab
 	cache.dbSize = db.pager.effectiveReaderDbSize(hdr)
+	cache.minFrame = minFrame
 	defer cache.destroy()
 
 	bt := &btree{pager: db.pager, cache: cache, rootPage: 1, walMaxFrame: maxFrame, writable: false}
@@ -1391,6 +1412,10 @@ func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 // bound, exactly as readerDbSizeBound resolves.
 func (tx *ReadTx) txDescendChild(childPgno uint32) (*page, error) {
 	if childPgno == 0 || childPgno > tx.pager.readerDbSizeBound(tx.cache) {
+		if debugTrace {
+			trace("txDescendChild: CORRUPT childPgno=%d bound=%d walMaxFrame=%d hdr.nPage=%d",
+				childPgno, tx.pager.readerDbSizeBound(tx.cache), tx.walHdr.mxFrame, tx.walHdr.nPage)
+		}
 		return nil, ErrCorrupt
 	}
 	return tx.txGetPage(childPgno)

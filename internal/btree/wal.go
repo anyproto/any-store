@@ -743,17 +743,32 @@ func (wi *walIndex) getInTxRange(pgno, maxFrame, minFrame uint32) (uint32, error
 	return wi.shmHashGet(pgno, maxFrame, minFrame)
 }
 
-// get returns the frame containing the latest version of pgno that is
-// within the given maxFrame snapshot, or 0 if not in WAL.
-// The maxFrame parameter limits which frames are visible (for snapshot isolation).
+// liveMinFrame returns the CURRENT checkpoint frontier bound (nBackfill+1)
+// for WAL lookups. Valid only for callers that cannot race a WAL restart:
+// the writer (restart needs the write lock) and open/recovery paths. Reader
+// transactions must NOT use this — they capture minFrame once at beginRead
+// (like SQLite's pWal->minFrame, wal.c:3239) so a peer's restart cannot
+// make recycled frame numbers of the NEW WAL generation pass their old
+// snapshot's maxFrame bound.
+func (wi *walIndex) liveMinFrame() uint32 {
+	if wi.inProcess {
+		return wi.nBackfill.Load() + 1
+	}
+	return wi.shmNBackfill() + 1
+}
+
+// get returns the frame containing the latest version of pgno within
+// [minFrame, maxFrame], or 0 if not in WAL. maxFrame is the snapshot's
+// visibility ceiling; minFrame is the snapshot's checkpoint-frontier floor
+// (frames below it were already backfilled to the DB file). Both come from
+// the caller's snapshot — readers thread the beginRead-captured value,
+// writers pass liveMinFrame(). Matches SQLite walFindFrame (wal.c:3554-3582)
+// with pWal->minFrame supplied by walTryBeginRead.
 // DRIFT: WAL hash-probe full-chain (nCollide) CORRUPT signal dropped in get/shmHashGet See docs/btree/NOTES.md#drift-93-wal-hash-probe-full-chain-corruption-signal-dropped
 // DRIFT: in-process WAL lookup via Go map (O(1)) vs SQLite hash scan; cross-process still uses SHM See docs/btree/NOTES.md#old-drift-pagemap-same-process-lookup
-func (wi *walIndex) get(pgno, maxFrame uint32) (uint32, error) {
+func (wi *walIndex) get(pgno, maxFrame, minFrame uint32) (uint32, error) {
 	if wi.inProcess {
 		// In-process: no SHM to consult; pageMap is the sole source of truth.
-		// minFrame filters out frames already checkpointed back to the DB
-		// (SQLite wal.c:3571).
-		minFrame := wi.nBackfill.Load() + 1
 		wi.mu.RLock()
 		frames := wi.pageMap[pgno]
 		wi.mu.RUnlock()
@@ -765,11 +780,7 @@ func (wi *walIndex) get(pgno, maxFrame uint32) (uint32, error) {
 		return 0, nil
 	}
 	// Multi-process: SHM hash tables are the sole source of truth, matching
-	// SQLite's walFindFrame (wal.c:3554-3582). nBackfill lives in SHM
-	// (wal.c:3114, 3571) since a peer checkpoint may advance it without
-	// touching our process-local copy — use shmNBackfill() rather than
-	// the cached atomic.
-	minFrame := wi.shmNBackfill() + 1
+	// SQLite's walFindFrame (wal.c:3554-3582).
 	return wi.shmHashGet(pgno, maxFrame, minFrame)
 }
 
@@ -2544,14 +2555,25 @@ func (w *wal) readFramePgno(frame uint32) (uint32, error) {
 //   - Slots 1-4: used for readers that need WAL frames. Best slot is the one
 //     with the largest readmark <= current maxFrame.
 func (w *wal) beginRead() (maxFrame uint32, slot int, err error) {
-	_, maxFrame, slot, err = w.beginReadHdr()
+	_, maxFrame, _, slot, err = w.beginReadHdr()
 	return maxFrame, slot, err
 }
 
 // beginReadHdr is beginRead plus the exact WAL header snapshot used to claim
 // the reader slot. The caller can thread this hdr into BUSY_SNAPSHOT checks so
 // beginWrite compares against the same snapshot that beginRead actually used.
-func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err error) {
+//
+// minFrame is the snapshot's checkpoint-frontier floor for WAL lookups,
+// captured at slot-claim time exactly like SQLite's pWal->minFrame
+// (wal.c:3239). For slot-0 readers it is maxFrame+1 (an empty WAL range:
+// the WAL is fully backfilled, so the reader serves everything from the DB
+// file — C expresses this as the readLock==0 short-circuit in walFindFrame,
+// wal.c:3567). This must stay fixed for the life of the read transaction: a
+// peer's checkpoint-RESTART may recycle frame numbers, and a live
+// nBackfill-derived floor would let NEW-generation frames pass the OLD
+// snapshot's maxFrame bound (observed as torn overflow chains in the
+// cross-process reader test).
+func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
 	// Retry loop matching SQLite's WAL_RETRY protocol (wal.c:3022-3056,
 	// 3391-3393). After 5 retries we begin sleeping; from the 10th retry
 	// onward the delay grows quadratically up to ~10s total before
@@ -2569,9 +2591,9 @@ func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err er
 	// tryBeginRead.
 	const protocolLimit = 100
 	for cnt := 0; cnt <= protocolLimit; cnt++ {
-		hdr, maxFrame, slot, err = w.tryBeginReadHdr()
+		hdr, maxFrame, minFrame, slot, err = w.tryBeginReadHdr()
 		if !errors.Is(err, errWALRetry) {
-			return hdr, maxFrame, slot, err
+			return hdr, maxFrame, minFrame, slot, err
 		}
 		if cnt < 5 {
 			runtime.Gosched()
@@ -2584,7 +2606,7 @@ func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err er
 		}
 		time.Sleep(nDelay)
 	}
-	return WalIndexHdr{}, 0, 0, ErrProtocol
+	return WalIndexHdr{}, 0, 0, 0, ErrProtocol
 }
 
 // tryBeginRead attempts to acquire a reader slot and returns the current
@@ -2597,13 +2619,13 @@ func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err er
 // SQLite's walTryBeginRead slot-0 fast path (wal.c:3136-3157) and its
 // aReadMark[0]==0 invariant (wal.c:2159,361).
 func (w *wal) tryBeginRead() (maxFrame uint32, slot int, err error) {
-	_, maxFrame, slot, err = w.tryBeginReadHdr()
+	_, maxFrame, _, slot, err = w.tryBeginReadHdr()
 	return maxFrame, slot, err
 }
 
 // tryBeginReadHdr is tryBeginRead plus the exact WAL header snapshot used to
 // choose/validate the reader slot.
-func (w *wal) tryBeginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err error) {
+func (w *wal) tryBeginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
 	if w.inProcess || w.inMemory {
 		return w.tryBeginReadInProcessHdr()
 	}
@@ -2622,18 +2644,18 @@ func (w *wal) tryBeginReadHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err
 // post-lock re-check of aReadMark[mxI], wal.c:3239-3249). On retry the
 // nBackfill==mxFrame slot-0 fast path stays safe.
 func (w *wal) tryBeginReadInProcess() (maxFrame uint32, slot int, err error) {
-	_, maxFrame, slot, err = w.tryBeginReadInProcessHdr()
+	_, maxFrame, _, slot, err = w.tryBeginReadInProcessHdr()
 	return maxFrame, slot, err
 }
 
-func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err error) {
+func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
 	mxFrame := w.index.mxCommitFrame.LoadLocal()
 	nBackfill := w.index.nBackfill.Load()
 	hdr = WalIndexHdr{isInit: 1, mxFrame: mxFrame}
 
 	if mxFrame == 0 || nBackfill == mxFrame {
 		if err := w.index.lock(lockRead0, lockShared); err != nil {
-			return WalIndexHdr{}, 0, 0, err
+			return WalIndexHdr{}, 0, 0, 0, err
 		}
 		// Slot 0's read mark is a fixed sentinel that must stay 0 (set at
 		// wal.go:1900): it pins frame 0, i.e. "read nothing from the WAL".
@@ -2642,7 +2664,10 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame uint32, slot
 		// the invariant aReadMark[0]==0 (wal.c:2159,361). The returned maxFrame
 		// comes from the local mxFrame snapshot, and no reader/checkpointer scan
 		// consults slot 0 (all loops start at i=1), so no write is needed here.
-		return hdr, mxFrame, 0, nil
+		// minFrame = mxFrame+1: a slot-0 reader reads nothing from the WAL
+		// (C's readLock==0 short-circuit, wal.c:3567), which keeps it immune
+		// to a concurrent WAL restart recycling frame numbers.
+		return hdr, mxFrame, mxFrame + 1, 0, nil
 	}
 
 	bestSlot := -1
@@ -2672,9 +2697,9 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame uint32, slot
 			// nBackfill==mxFrame slot-0 fast path stays safe.
 			if w.index.mxCommitFrame.LoadLocal() != mxFrame || w.index.nBackfill.Load() != nBackfill {
 				_ = w.index.unlock(lockSlot, lockShared)
-				return WalIndexHdr{}, 0, 0, errWALRetry
+				return WalIndexHdr{}, 0, 0, 0, errWALRetry
 			}
-			return hdr, mxFrame, bestSlot, nil
+			return hdr, mxFrame, nBackfill + 1, bestSlot, nil
 		}
 	}
 
@@ -2682,7 +2707,7 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame uint32, slot
 		lockSlot := lockRead0 + i
 		if err := w.index.lock(lockSlot, lockShared); err == nil {
 			w.index.aReadMark[i].Store(mxFrame)
-			return hdr, mxFrame, i, nil
+			return hdr, mxFrame, nBackfill + 1, i, nil
 		}
 	}
 
@@ -2693,14 +2718,18 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame uint32, slot
 		// conversion. In InProcess mode this is rare (process-local
 		// locks rarely race) but kept symmetric.
 		if errors.Is(err, ErrBusy) {
-			return WalIndexHdr{}, 0, 0, errWALRetry
+			return WalIndexHdr{}, 0, 0, 0, errWALRetry
 		}
-		return WalIndexHdr{}, 0, 0, err
+		return WalIndexHdr{}, 0, 0, 0, err
 	}
 	// Slot 0 fallback: like the fast path above, do not write aReadMark[0].
 	// It is a fixed 0 sentinel (wal.go:1900); the returned maxFrame comes from
 	// the local mxFrame snapshot. Matches SQLite walTryBeginRead (wal.c:3136-3157).
-	return hdr, mxFrame, 0, nil
+	// minFrame = nBackfill+1 (NOT mxFrame+1): unlike the fast path, mxFrame >
+	// nBackfill here, so the WAL must still be consulted. Holding read-0
+	// shared blocks backfill (it takes read-0 exclusive), so nBackfill cannot
+	// advance — and therefore no restart can recycle frames — while we hold it.
+	return hdr, mxFrame, nBackfill + 1, 0, nil
 }
 
 // tryBeginReadMultiProcess handles the multi-process path, matching SQLite's
@@ -2717,17 +2746,20 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame uint32, slot
 //  4. Re-validate after acquiring shared lock: compare live SHM header against local
 //     copy AND live readmark against saved value. If either changed → WAL_RETRY.
 //     Matches SQLite wal.c:3239-3249 (memcmp + AtomicLoad re-check).
-//  5. Sync nBackfill to process-local atomic for walIndex.get() minFrame filter.
-//     (docs/btree/NOTES.md §20, drift 3 — SQLite doesn't need this sync step because it reads
-//     nBackfill directly from SHM via pInfo pointer everywhere)
+//  5. Capture the snapshot minFrame (nBackfill+1) under the validated reader
+//     lock and return it to the caller — the read tx threads this fixed value
+//     into every WAL lookup, matching SQLite's pWal->minFrame (wal.c:3239).
+//     The slot-0 path returns maxFrame+1 instead (C: readLock==0 short-circuit
+//     in walFindFrame, wal.c:3567). nBackfill is also synced to the
+//     process-local atomic for live-frontier users (liveMinFrame).
 //
 // DRIFT: reader-slot tie-break selects lowest slot; SQLite selects highest on equal marks See docs/btree/NOTES.md#drift-102-reader-slot-tie-break-selects-lowest-not-highest
 func (w *wal) tryBeginReadMultiProcess() (maxFrame uint32, slot int, err error) {
-	_, maxFrame, slot, err = w.tryBeginReadMultiProcessHdr()
+	_, maxFrame, _, slot, err = w.tryBeginReadMultiProcessHdr()
 	return maxFrame, slot, err
 }
 
-func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame uint32, slot int, err error) {
+func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
 	// Step 1: Read SHM header into local copy (SQLite: walIndexReadHdr → walIndexTryHdr)
 	hdr, valid := w.index.readHeader()
 	if !valid {
@@ -2739,7 +2771,7 @@ func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame uint32, s
 		if err := w.index.lock(lockRecover, lockShared); err == nil {
 			_ = w.index.unlock(lockRecover, lockShared)
 		}
-		return WalIndexHdr{}, 0, 0, errWALRetry
+		return WalIndexHdr{}, 0, 0, 0, errWALRetry
 	}
 	mxFrame := hdr.mxFrame
 
@@ -2766,7 +2798,7 @@ func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame uint32, s
 			// mid-zeroing SHM) always differs and forces WAL_RETRY.
 			if liveHdr, ok := w.index.readHeader(); !ok || liveHdr != hdr {
 				_ = w.index.unlock(lockRead0, lockShared)
-				return WalIndexHdr{}, 0, 0, errWALRetry
+				return WalIndexHdr{}, 0, 0, 0, errWALRetry
 			}
 			// Do not write aReadMark[0]: slot 0's mark is a fixed 0 sentinel
 			// (wal.go:1900) meaning "read nothing from the WAL". SQLite's
@@ -2776,10 +2808,16 @@ func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame uint32, s
 			// the local hdr snapshot, and no reader/checkpointer scan reads slot
 			// 0 (all loops start at i=1), so neither the SHM mark nor the
 			// process-local mirror needs updating.
-			return hdr, mxFrame, 0, nil
+			// minFrame = mxFrame+1: a slot-0 reader reads nothing from the
+			// WAL (C's readLock==0 short-circuit in walFindFrame, wal.c:3567).
+			// This keeps the snapshot immune to a peer's WAL restart recycling
+			// frame numbers mid-transaction: restart only locks slots 1-4, so
+			// it can run while we hold slot 0, and new-generation frames must
+			// never pass this snapshot's [minFrame, maxFrame] filter.
+			return hdr, mxFrame, mxFrame + 1, 0, nil
 		}
 		if !errors.Is(err, ErrBusy) {
-			return WalIndexHdr{}, 0, 0, err
+			return WalIndexHdr{}, 0, 0, 0, err
 		}
 		// BUSY: fall through to slot 1..4 selection below.
 	}
@@ -2824,13 +2862,13 @@ func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame uint32, s
 		//   }
 		// any-store has no read-only-shm mode, so the conversion is
 		// unconditional.
-		return WalIndexHdr{}, 0, 0, errWALRetry
+		return WalIndexHdr{}, 0, 0, 0, errWALRetry
 	}
 
 	// Step 6: Acquire shared lock on the chosen slot (SQLite wal.c:3192)
 	lockSlot := lockRead0 + bestSlot
 	if err := w.index.lock(lockSlot, lockShared); err != nil {
-		return WalIndexHdr{}, 0, 0, errWALRetry
+		return WalIndexHdr{}, 0, 0, 0, errWALRetry
 	}
 
 	// Step 7: Re-validate after lock (SQLite wal.c:3239-3249)
@@ -2845,13 +2883,16 @@ func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame uint32, s
 	// differs and forces WAL_RETRY.
 	if liveMark != bestMark || !liveValid || liveHdr != hdr {
 		_ = w.index.unlock(lockSlot, lockShared)
-		return WalIndexHdr{}, 0, 0, errWALRetry
+		return WalIndexHdr{}, 0, 0, 0, errWALRetry
 	}
 
-	// Sync nBackfill to process-local for walIndex.get() minFrame filter
+	// Sync nBackfill to process-local (live-frontier users: liveMinFrame).
 	w.index.nBackfill.Store(nBackfill)
 
-	return hdr, mxFrame, bestSlot, nil
+	// Snapshot minFrame, captured under the validated reader lock exactly
+	// like SQLite's pWal->minFrame = nBackfill+1 (wal.c:3239). The read tx
+	// carries this fixed value for all its WAL lookups.
+	return hdr, mxFrame, nBackfill + 1, bestSlot, nil
 }
 
 // endRead releases the reader lock for the given slot.

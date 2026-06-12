@@ -60,7 +60,7 @@ func TestTryBeginReadMultiProcessHdr_AllSlotsBusyReturnsRetry(t *testing.T) {
 		}
 	}()
 
-	_, _, _, err = w.tryBeginReadMultiProcessHdr()
+	_, _, _, _, err = w.tryBeginReadMultiProcessHdr()
 	if !errors.Is(err, errWALRetry) {
 		t.Fatalf("got err=%v (type %T), want errWALRetry — SQLite wal.c:3188 converts SQLITE_BUSY to WAL_RETRY here", err, err)
 	}

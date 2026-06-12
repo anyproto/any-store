@@ -2142,7 +2142,7 @@ func TestShmHashGet_FullChain_Corrupt_PropagatesThroughGet(t *testing.T) {
 	}
 	binary.LittleEndian.PutUint32(region[htPgnoOff0:], 999999)
 
-	frame, err := wi.get(7, 100)
+	frame, err := wi.get(7, 100, wi.liveMinFrame())
 	require.ErrorIs(t, err, ErrCorrupt,
 		"walIndex.get must forward shmHashGet's ErrCorrupt to the pager")
 	require.Zero(t, frame)
@@ -2173,7 +2173,7 @@ func mustShmHashWrite(t *testing.T, wi *walIndex, pgno, frame uint32) {
 
 func mustWiGet(t *testing.T, wi *walIndex, pgno, maxFrame uint32) uint32 {
 	t.Helper()
-	v, err := wi.get(pgno, maxFrame)
+	v, err := wi.get(pgno, maxFrame, wi.liveMinFrame())
 	if err != nil {
 		t.Fatalf("walIndex.get(%d, %d): unexpected error: %v", pgno, maxFrame, err)
 	}
@@ -2269,7 +2269,7 @@ func TestWALReaderSlotReuseRevalidatesOnStaleMark(t *testing.T) {
 
 	// The reuse path must detect the changed state and signal retry rather than
 	// silently adopting the stale (now-unsafe) snapshot.
-	_, _, _, err := w.tryBeginReadInProcessHdr()
+	_, _, _, _, err := w.tryBeginReadInProcessHdr()
 	require.True(t, injected, "test must exercise the slot-reuse shared-lock path")
 	require.ErrorIs(t, err, errWALRetry,
 		"reuse branch must re-validate and retry when the checkpointer advanced "+
@@ -2279,7 +2279,7 @@ func TestWALReaderSlotReuseRevalidatesOnStaleMark(t *testing.T) {
 	// adopt the LIVE commit ceiling (20), never the stale snapshot (10). A
 	// snapshot that floored at the stale mark while nBackfill had already
 	// advanced to 10 is exactly the corruption window the re-validation closes.
-	hdr, maxFrame, slot, err := w.tryBeginReadInProcessHdr()
+	hdr, maxFrame, _, slot, err := w.tryBeginReadInProcessHdr()
 	require.NoError(t, err)
 	assert.Equal(t, uint32(20), maxFrame, "retry must adopt the live commit ceiling, not the stale 10")
 	assert.Equal(t, uint32(20), hdr.mxFrame)
@@ -2312,7 +2312,7 @@ func TestWALReaderSlotReuseFastPathSafeAfterBackfill(t *testing.T) {
 	w.index.nBackfill.Store(10)
 	w.index.aReadMark[1].Store(10)
 
-	hdr, maxFrame, slot, err := w.tryBeginReadInProcessHdr()
+	hdr, maxFrame, _, slot, err := w.tryBeginReadInProcessHdr()
 	require.NoError(t, err)
 	assert.Equal(t, 0, slot, "fully-backfilled WAL must use the slot-0 fast path")
 	assert.Equal(t, uint32(10), maxFrame)
@@ -2337,7 +2337,7 @@ func TestWALReaderSlotReuseSucceedsWhenStateStable(t *testing.T) {
 	w.index.nBackfill.Store(3)
 	w.index.aReadMark[1].Store(10)
 
-	hdr, maxFrame, slot, err := w.tryBeginReadInProcessHdr()
+	hdr, maxFrame, _, slot, err := w.tryBeginReadInProcessHdr()
 	require.NoError(t, err)
 	require.False(t, errors.Is(err, errWALRetry))
 	assert.Equal(t, 1, slot, "stable state must reuse the existing slot 1")
