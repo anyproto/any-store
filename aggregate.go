@@ -8,6 +8,7 @@ import (
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/aggregate"
+	"github.com/anyproto/any-store/v2/query"
 	"github.com/anyproto/any-store/v2/syncpool"
 )
 
@@ -88,7 +89,7 @@ func (q *aggQuery) IndexHint(hints ...IndexHint) AggQuery {
 // query and returns the remaining in-pipeline stages.
 func (q *aggQuery) prefixQuery() (*collQuery, aggregate.Pipeline, error) {
 	prefix, rest := aggregate.SplitPrefix(q.pipeline)
-	if err := validateInPipelineStages(rest); err != nil {
+	if err := q.validateInPipelineStages(rest); err != nil {
 		return nil, nil, err
 	}
 	return &collQuery{
@@ -102,24 +103,83 @@ func (q *aggQuery) prefixQuery() (*collQuery, aggregate.Pipeline, error) {
 }
 
 // validateInPipelineStages rejects stages that would execute with silently
-// wrong semantics outside the pushdown prefix: query.Text is a residual-only
-// predicate (Ok always passes — matching is done by the FTS scan that the
-// planner builds), so a $match with $text that did not reach the access
-// planner would match every row instead of searching.
-func validateInPipelineStages(rest aggregate.Pipeline) error {
+// wrong semantics outside the pushdown prefix:
+//
+//   - query.Text is a residual-only predicate (Ok always passes — matching is
+//     done by the FTS scan that the planner builds), so a $match with $text
+//     that did not reach the access planner would match every row instead of
+//     searching.
+//   - a vector (ANN) clause — an equality against a dim-sized numeric array
+//     on a vector-indexed field, exactly the shape detectVectorQuery turns
+//     into an ANN search — would degrade to a literal array comparison.
+func (q *aggQuery) validateInPipelineStages(rest aggregate.Pipeline) error {
+	var (
+		vidxs  []*vectorIndex
+		loaded bool
+	)
 	for _, spec := range rest {
-		if m, ok := spec.(aggregate.MatchSpec); ok && containsText(m.Filter) {
+		m, ok := spec.(aggregate.MatchSpec)
+		if !ok {
+			continue
+		}
+		if containsText(m.Filter) {
 			return errAggTextNotInPrefix
+		}
+		if !loaded {
+			vidxs, loaded = q.c.loadVectorIndexes(), true
+		}
+		if len(vidxs) > 0 && hasVectorClause(m.Filter, vidxs) {
+			return errAggVectorNotInPrefix
 		}
 	}
 	return nil
 }
 
-var errAggTextNotInPrefix = errors.New("any-store: aggregate: $text is only supported in the leading $match stages (the pushdown prefix)")
+// hasVectorClause mirrors detectVectorQuery's clause detection — a top-level
+// (or direct $and member) equality on a vector-indexed field whose value is a
+// valid dim-sized numeric array. Anything else on such a field stays a plain
+// literal comparison, exactly like Find's residual filters.
+func hasVectorClause(f query.Filter, vidxs []*vectorIndex) bool {
+	var clauses []query.Filter
+	switch ft := f.(type) {
+	case query.And:
+		clauses = ft
+	default:
+		clauses = []query.Filter{f}
+	}
+	for _, cl := range clauses {
+		k, isKey := cl.(query.Key)
+		if !isKey {
+			continue
+		}
+		vi := findVectorIndexByField(vidxs, strings.Join(k.Path, "."))
+		if vi == nil {
+			continue
+		}
+		comp, isComp := k.Filter.(*query.Comp)
+		if !isComp || comp.CompOp != query.CompOpEq {
+			continue
+		}
+		if _, err := decodeVectorValue(comp.EqValue, vi.dim); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+var (
+	errAggTextNotInPrefix   = errors.New("any-store: aggregate: $text is only supported in the leading $match stages (the pushdown prefix)")
+	errAggVectorNotInPrefix = errors.New("any-store: aggregate: a vector (ANN) clause is only supported in the leading $match stages (the pushdown prefix)")
+)
 
 func (q *aggQuery) Iter(ctx context.Context) (Iterator, error) {
 	if q.err != nil {
 		return nil, q.err
+	}
+	// Blocking stages poll the context only every few thousand rows; an
+	// already-cancelled context should not start the pipeline at all.
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	cq, rest, err := q.prefixQuery()
 	if err != nil {
