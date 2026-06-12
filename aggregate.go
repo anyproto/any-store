@@ -2,6 +2,7 @@ package anystore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -85,8 +86,11 @@ func (q *aggQuery) IndexHint(hints ...IndexHint) AggQuery {
 
 // prefixQuery compiles the pushable pipeline prefix into a regular collection
 // query and returns the remaining in-pipeline stages.
-func (q *aggQuery) prefixQuery() (*collQuery, aggregate.Pipeline) {
+func (q *aggQuery) prefixQuery() (*collQuery, aggregate.Pipeline, error) {
 	prefix, rest := aggregate.SplitPrefix(q.pipeline)
+	if err := validateInPipelineStages(rest); err != nil {
+		return nil, nil, err
+	}
 	return &collQuery{
 		c:          q.c,
 		cond:       prefix.Filter,
@@ -94,14 +98,33 @@ func (q *aggQuery) prefixQuery() (*collQuery, aggregate.Pipeline) {
 		limit:      uint(prefix.Limit),
 		offset:     uint(prefix.Skip),
 		indexHints: q.hints,
-	}, rest
+	}, rest, nil
 }
+
+// validateInPipelineStages rejects stages that would execute with silently
+// wrong semantics outside the pushdown prefix: query.Text is a residual-only
+// predicate (Ok always passes — matching is done by the FTS scan that the
+// planner builds), so a $match with $text that did not reach the access
+// planner would match every row instead of searching.
+func validateInPipelineStages(rest aggregate.Pipeline) error {
+	for _, spec := range rest {
+		if m, ok := spec.(aggregate.MatchSpec); ok && containsText(m.Filter) {
+			return errAggTextNotInPrefix
+		}
+	}
+	return nil
+}
+
+var errAggTextNotInPrefix = errors.New("any-store: aggregate: $text is only supported in the leading $match stages (the pushdown prefix)")
 
 func (q *aggQuery) Iter(ctx context.Context) (Iterator, error) {
 	if q.err != nil {
 		return nil, q.err
 	}
-	cq, rest := q.prefixQuery()
+	cq, rest, err := q.prefixQuery()
+	if err != nil {
+		return nil, err
+	}
 	inner, err := cq.Iter(ctx)
 	if err != nil {
 		return nil, err
@@ -151,7 +174,10 @@ func (q *aggQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	if q.err != nil {
 		return Explain{}, q.err
 	}
-	cq, rest := q.prefixQuery()
+	cq, rest, err := q.prefixQuery()
+	if err != nil {
+		return Explain{}, err
+	}
 	// Capture the pushdown shape before Explain runs: makeQuery normalizes a
 	// nil cond to query.All.
 	pushFilter, pushSort := cq.cond, cq.sort
