@@ -50,21 +50,36 @@ type pcache struct {
 	dirtyTail *page // oldest dirty page; spill victim search starts here
 	nDirty    int
 
-	// dataVersion and walMaxFrame together identify the DB snapshot for which
+	// dataVersion and walHdr together identify the DB snapshot for which
 	// this cache's pages are valid. On reuse from the pool, if EITHER value
 	// differs from the current transaction, the cache is cleared.
 	//
-	// walMaxFrame alone is insufficient because it can wrap after checkpoint
-	// restart (ABA problem). dataVersion alone is insufficient because of a
-	// TOCTOU race: the WAL mxFrame is updated inside pager.commit() but
-	// dataVersion is incremented afterward. A reader starting between these
-	// two points would see the new walMaxFrame but old dataVersion, matching
-	// a stale cache. Checking both eliminates both failure modes.
+	// walHdr is the full WAL-index header snapshot, not just mxFrame:
+	// mxFrame alone wraps after a checkpoint restart (ABA problem), and a
+	// PEER PROCESS's restart never bumps this process's dataVersion, so the
+	// salts (re-randomized on every restart) are the only signal that frame
+	// numbers were recycled cross-process. dataVersion alone is insufficient
+	// because of a TOCTOU race: the WAL mxFrame is updated inside
+	// pager.commit() but dataVersion is incremented afterward. A reader
+	// starting between these two points would see the new header but old
+	// dataVersion, matching a stale cache. Checking both eliminates both
+	// failure modes. (In-process mode synthesizes a salt-less header, where
+	// dataVersion covers every local commit by itself.)
 	//
 	// Matches SQLite pager.c:3246-3267 (pagerBeginReadTransaction — pager_reset
 	// only if change-counter changed) and pPager->iDataVersion (pager.c:1776).
 	dataVersion uint64
+	walHdr      WalIndexHdr
 	walMaxFrame uint32
+
+	// minFrame is the snapshot's WAL lookup floor (nBackfill+1 for slot 1-4
+	// readers, walMaxFrame+1 for slot-0 readers), captured at BeginRead like
+	// SQLite's pWal->minFrame (wal.c:3239) and refreshed on EVERY BeginRead
+	// (not just on clear): a reader re-entering on slot 0 must raise the
+	// floor so a peer's WAL restart cannot serve new-generation frames into
+	// this snapshot. 0 means "fall back to the live frontier" (writer /
+	// uncached paths via pager.readerMinFrame).
+	minFrame uint32
 
 	// dbSize is the database size in pages for the snapshot this cache serves
 	// (WalIndexHdr.nPage, captured cross-process at BeginRead). Reader page/

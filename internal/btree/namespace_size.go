@@ -143,7 +143,10 @@ func leafCellPayloadLen(data []byte, offset int) (keyLen, valLen int, err error)
 func (bt *btree) countOverflowChain(firstPgno uint32) (int, error) {
 	count := 0
 	pgno := firstPgno
-	dbSize := bt.pager.dbSize.Load()
+	// Snapshot bound, not pager.dbSize: a read-only process never refreshes
+	// pager.dbSize, so chains through pages a peer process allocated after we
+	// opened would be falsely rejected as corrupt. See readerDbSizeBound.
+	dbSize := bt.pager.readerDbSizeBound(bt.cache)
 	for pgno != 0 {
 		if pgno < 2 || pgno > dbSize {
 			return 0, ErrCorrupt
