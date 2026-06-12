@@ -67,6 +67,7 @@ type AddFieldsStage struct {
 
 	prev  *anyenc.Value   // previous overlaid row, nil when nothing to undo
 	saved []*anyenc.Value // per-field original values (nil = was missing)
+	evals []*anyenc.Value // per-row expression results, reused across rows
 }
 
 func (s *AddFieldsStage) Next(ctx *Ctx) (*anyenc.Value, error) {
@@ -80,19 +81,26 @@ func (s *AddFieldsStage) Next(ctx *Ctx) (*anyenc.Value, error) {
 	if v == nil || err != nil {
 		return nil, err
 	}
+	// Evaluate every expression against the unmodified input document first
+	// (Mongo semantics: $addFields expressions see the stage input, never the
+	// overlays of the same stage), then apply the overlays.
+	s.evals = s.evals[:0]
 	for i := range s.Fields {
 		fv, err := s.Fields[i].Expr.Eval(ctx.RowArena, v)
 		if err != nil {
 			return nil, err
 		}
+		s.evals = append(s.evals, fv)
+	}
+	for i := range s.Fields {
 		if s.undoOverlay {
 			s.saved = append(s.saved, v.Get(s.Fields[i].Name))
 		}
-		if fv == nil {
+		if fv := s.evals[i]; fv == nil {
 			v.Del(s.Fields[i].Name) // missing result removes the field, Mongo semantics
-			continue
+		} else {
+			v.Set(s.Fields[i].Name, fv)
 		}
-		v.Set(s.Fields[i].Name, fv)
 	}
 	if s.undoOverlay {
 		s.prev = v
