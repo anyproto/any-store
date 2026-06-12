@@ -135,6 +135,32 @@ func TestFts_InsertPopulatesIndex(t *testing.T) {
 	assert.Equal(t, []uint64{1}, ftsTermDocIDs(t, coll, "fox"))
 }
 
+func TestFts_GetIndexesIncludesFulltext(t *testing.T) {
+	fx, coll := ftsTestColl(t, "title", "body")
+	defer fx.finish()
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"year"}}))
+
+	insertJSON(t, coll,
+		`{"id":"a","title":"Hello World","body":"the quick brown fox","year":2001}`,
+		`{"id":"b","year":2002}`, // no indexable text — excluded from the fts corpus
+	)
+
+	indexes := coll.GetIndexes()
+	require.Len(t, indexes, 2)
+	// Range indexes first, then full-text.
+	assert.Equal(t, IndexKindRange, indexes[0].Info().Kind)
+	rangeLen, err := indexes[0].Len(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, rangeLen)
+
+	info := indexes[1].Info()
+	assert.Equal(t, IndexKindFulltext, info.Kind)
+	assert.Equal(t, []string{"title", "body"}, info.Fields)
+	ftsLen, err := indexes[1].Len(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, ftsLen)
+}
+
 func TestFts_DeleteRemovesPostings(t *testing.T) {
 	fx, coll := ftsTestColl(t, "body")
 	defer fx.finish()

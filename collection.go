@@ -75,7 +75,9 @@ type Collection interface {
 	// Returns an error if the operation fails.
 	DropIndex(ctx context.Context, indexName string) (err error)
 
-	// GetIndexes returns a list of indexes on the collection.
+	// GetIndexes returns a list of indexes on the collection: range indexes
+	// followed by full-text indexes (a full-text Len is the number of indexed
+	// documents). Vector indexes are not listed yet.
 	GetIndexes() (indexes []Index)
 
 	// CompactVectorIndex rebuilds the named vector index from its live vectors,
@@ -1010,9 +1012,13 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 
 func (c *collection) GetIndexes() (indexes []Index) {
 	idxs := c.loadIndexes()
-	indexes = make([]Index, len(idxs))
-	for i, idx := range idxs {
-		indexes[i] = idx
+	ftsIdxs := c.loadFtsIndexes()
+	indexes = make([]Index, 0, len(idxs)+len(ftsIdxs))
+	for _, idx := range idxs {
+		indexes = append(indexes, idx)
+	}
+	for _, fx := range ftsIdxs {
+		indexes = append(indexes, fx)
 	}
 	return
 }

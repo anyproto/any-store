@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"slices"
@@ -101,6 +102,18 @@ func newFtsIndex(c *collection, info IndexInfo) (*ftsIndex, error) {
 		return nil, errors.New("fts: index requires at least one field")
 	}
 	return fx, nil
+}
+
+// Len returns the number of indexed documents — the maintained N counter, not
+// a namespace scan; documents with no indexable text are excluded (Index
+// interface).
+func (fx *ftsIndex) Len(ctx context.Context) (count int, err error) {
+	err = fx.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		n, txErr := ftsGetUint(tx, fx.nsMeta, ftsMetaCount)
+		count = int(n)
+		return txErr
+	})
+	return
 }
 
 // bindNamespaces resolves (does not create) the five namespaces. resolve is the
