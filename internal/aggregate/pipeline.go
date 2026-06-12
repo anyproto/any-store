@@ -103,7 +103,10 @@ func Build(source Stage, specs Pipeline, limits Limits) (Stage, error) {
 	// RowArena-allocated values.
 	// heldOnArena: some stage below holds such a row across its Next calls
 	// (only $unwind does), so nobody above may reset the arena mid-stream.
-	var rowOnArena, heldOnArena bool
+	// multiEmit: an upstream $unwind may emit the same underlying document for
+	// several consecutive rows, so in-place mutations must be rolled back
+	// between rows.
+	var rowOnArena, heldOnArena, multiEmit bool
 	for i := 0; i < len(specs); i++ {
 		switch sp := specs[i].(type) {
 		case MatchSpec:
@@ -116,12 +119,14 @@ func Build(source Stage, specs Pipeline, limits Limits) (Stage, error) {
 			cur = &CountStage{Src: cur, Field: sp.Field}
 			// The single count row is built after the drain; nothing below is
 			// live anymore.
-			rowOnArena, heldOnArena = true, false
+			rowOnArena, heldOnArena, multiEmit = true, false, false
 		case ProjectSpec:
+			// $project builds a fresh output object per pull, so rows above it
+			// are distinct objects even under an upstream $unwind.
 			cur = &ProjectStage{Src: cur, Fields: sp.Fields, resetArena: !heldOnArena}
-			rowOnArena = true
+			rowOnArena, multiEmit = true, false
 		case AddFieldsSpec:
-			cur = &AddFieldsStage{Src: cur, Fields: sp.Fields, resetArena: !heldOnArena}
+			cur = &AddFieldsStage{Src: cur, Fields: sp.Fields, resetArena: !heldOnArena, undoOverlay: multiEmit}
 			rowOnArena = true
 		case UnwindSpec:
 			cur = &UnwindStage{
@@ -133,19 +138,20 @@ func Build(source Stage, specs Pipeline, limits Limits) (Stage, error) {
 			if rowOnArena {
 				heldOnArena = true
 			}
+			multiEmit = true
 		case GroupSpec:
 			cur = newGroupStage(cur, sp, limits)
 			// $group drains its upstream completely before emitting; emitted
 			// rows are built fresh on RowArena with a per-emit reset, and
 			// nothing below stays live afterwards.
-			rowOnArena, heldOnArena = true, false
+			rowOnArena, heldOnArena, multiEmit = true, false, false
 		case SortSpec:
 			// A directly following $skip/$limit bounds the sort's retained
 			// set (top-K); the skip/limit stages themselves stay in the chain.
 			cur = &SortStage{Src: cur, Spec: sp, TopK: foldTopK(specs[i+1:])}
 			// Emitted rows are owned by the stage parser; nothing below stays
 			// live after the drain.
-			rowOnArena, heldOnArena = false, false
+			rowOnArena, heldOnArena, multiEmit = false, false, false
 		default:
 			return nil, fmt.Errorf("aggregate: unsupported stage: %T", sp)
 		}
