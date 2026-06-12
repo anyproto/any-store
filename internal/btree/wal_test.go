@@ -2054,18 +2054,22 @@ func TestShmHashWrite_CollisionLimit_Corrupt(t *testing.T) {
 	region, err := wi.shm.region(0, true)
 	require.NoError(t, err)
 
-	// Target frame 1 => idx 0 => nCollide = idx+1 = 1. The probe may pass over
-	// at most one occupied slot; a second occupied slot is provably corrupt.
+	// Target frame 2 => idx 1 => nCollide = idx+1 = 2. The probe may pass over
+	// at most two occupied slots; a third occupied slot is provably corrupt.
+	// (Frame 1 / idx 0 cannot exercise the bound: the segment's first write
+	// lazily zeroes the whole table first, matching SQLite walIndexAppend
+	// wal.c:1324-1330.)
 	const pgno = uint32(12345)
-	const frame = uint32(1)
+	const frame = uint32(2)
 	h0 := int(pgno*htHash1) & (htNSlot - 1)
 
-	// Occupy the first TWO slots of pgno's probe chain with non-matching, valid
-	// entries so there is no empty slot within nCollide+1 probes. (No third
-	// slot is occupied, so a fix that mis-bounds the probe would still find a
-	// free slot — only the correctly-bounded check fires here.)
+	// Occupy the first THREE slots of pgno's probe chain with non-matching,
+	// valid entries so there is no empty slot within nCollide+1 probes. (No
+	// fourth slot is occupied, so a fix that mis-bounds the probe would still
+	// find a free slot — only the correctly-bounded check fires here.)
 	binary.LittleEndian.PutUint16(region[hashSlotOff(h0):], 7)
 	binary.LittleEndian.PutUint16(region[hashSlotOff((h0+1)&(htNSlot-1)):], 9)
+	binary.LittleEndian.PutUint16(region[hashSlotOff((h0+2)&(htNSlot-1)):], 11)
 
 	err = wi.shmHashWrite(pgno, frame)
 	require.ErrorIs(t, err, ErrCorrupt,
@@ -2086,14 +2090,57 @@ func TestShmHashWrite_CollisionLimit_PropagatesThroughSetBatch(t *testing.T) {
 
 	const pgno = uint32(54321)
 	h0 := int(pgno*htHash1) & (htNSlot - 1)
-	// frame 1 => idx 0 => nCollide = 1: two occupied slots => corrupt.
+	// frame 2 => idx 1 => nCollide = 2: three occupied slots => corrupt.
+	// (Frame 1 would lazily zero the segment first — see walIndexAppend's
+	// idx==1 memset, mirrored in shmHashWrite.)
 	binary.LittleEndian.PutUint16(region[hashSlotOff(h0):], 3)
 	binary.LittleEndian.PutUint16(region[hashSlotOff((h0+1)&(htNSlot-1)):], 5)
+	binary.LittleEndian.PutUint16(region[hashSlotOff((h0+2)&(htNSlot-1)):], 7)
 
 	p := &page{pgno: pgno}
-	err = wi.setBatch([]*page{p}, 1, true)
+	err = wi.setBatch([]*page{p}, 2, true)
 	require.ErrorIs(t, err, ErrCorrupt,
 		"setBatch must propagate shmHashWrite's ErrCorrupt so the commit aborts")
+}
+
+// TestShmHashWrite_FirstFrameLazilyClearsSegment verifies that writing the
+// FIRST entry of a hash segment zeroes the whole segment first, matching
+// SQLite walIndexAppend (wal.c:1324-1330 `if( idx==1 ) memset(...)`). This is
+// what makes stale entries from a previous WAL generation harmless: a WAL
+// reset only clears the segments the resetting connection has mapped, so a
+// regrowing WAL must be able to reclaim a junk-filled segment. Regression
+// test for the multi-process writer aborting with ErrCorrupt at the first
+// frame of segment 32 after a reset of a larger WAL.
+func TestShmHashWrite_FirstFrameLazilyClearsSegment(t *testing.T) {
+	wi, err := newWalIndex("", true)
+	require.NoError(t, err)
+	defer wi.close(false)
+
+	region, err := wi.shm.region(0, true)
+	require.NoError(t, err)
+
+	// Simulate a previous WAL generation: fill EVERY hash slot and a few
+	// aPgno entries with junk, as if the segment had been fully used and
+	// never cleared by reset.
+	for h := 0; h < htNSlot; h++ {
+		binary.LittleEndian.PutUint16(region[hashSlotOff(h):], uint16(h%htNPage)+1)
+	}
+	for i := 0; i < 16; i++ {
+		binary.LittleEndian.PutUint32(region[htPgnoOff0+i*4:], uint32(100000+i))
+	}
+
+	// Writing frame 1 (the segment's first entry of the new generation) must
+	// succeed — not ErrCorrupt — because the segment is zeroed first.
+	const pgno = uint32(777)
+	require.NoError(t, wi.shmHashWrite(pgno, 1),
+		"first frame of a segment must lazily clear stale entries, not trip the collision bound")
+
+	// The new entry is findable, and the junk is gone: a lookup for one of
+	// the junk page numbers misses cleanly.
+	frame := mustShmHashGet(t, wi, pgno, 1, 1)
+	require.Equal(t, uint32(1), frame)
+	miss := mustShmHashGet(t, wi, 100003, 1, 1)
+	require.Zero(t, miss, "stale pre-reset entries must not survive the segment's first write")
 }
 
 // TestShmHashGet_FullChain_Corrupt verifies the READ-side bound: a probe chain

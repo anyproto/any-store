@@ -1072,6 +1072,21 @@ func (wi *walIndex) shmHashWrite(pgno, frame uint32) error {
 		return err
 	}
 
+	// Lazily zero the segment's aPgno+aHash area when writing its FIRST
+	// entry, matching SQLite walIndexAppend (wal.c:1324-1330
+	// `if( idx==1 ){ memset((void*)&aPgno[1], 0, nByte); }`). A WAL reset
+	// (shmClearHash) only clears the segments the resetting connection has
+	// mapped; a WAL that previously grew further left stale entries from
+	// the prior generation in the higher segments, and those occupied slots
+	// overflow the bounded probe below (observed as ErrCorrupt on commit at
+	// frame 131039, the first frame of segment 32, after a reset of a
+	// ~140k-frame WAL). aHash is the tail of the region, so clearing from
+	// aPgno[0] to the region end covers both arrays in every segment.
+	if idx == 0 {
+		pgnoBase, _, _ := htSegmentInfo(seg)
+		clear(region[pgnoBase:])
+	}
+
 	// Write pgno to aPgno[idx] first (SQLite wal.c:1337). u32-aligned.
 	pgnoOff := htPgnoOffset(seg, idx)
 	atomic.StoreUint32((*uint32)(unsafe.Pointer(&region[pgnoOff])), pgno)
@@ -1101,6 +1116,9 @@ func (wi *walIndex) shmHashWrite(pgno, frame uint32) error {
 			return nil
 		}
 		if nCollide--; nCollide < 0 {
+			if debugTrace {
+				trace("shmHashWrite: CORRUPT full chain pgno=%d frame=%d seg=%d idx=%d", pgno, frame, seg, idx)
+			}
 			return ErrCorrupt
 		}
 		h = (h + 1) & (htNSlot - 1)
@@ -1181,6 +1199,9 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) 
 			// Bound the probe AFTER the match check, like C (wal.c:3592-3595):
 			// walking past nCollide occupied slots = full/corrupt chain.
 			if nCollide--; nCollide == 0 {
+				if debugTrace {
+					trace("shmHashGet: CORRUPT over-probed chain pgno=%d seg=%d maxFrame=%d minFrame=%d", pgno, seg, maxFrame, minFrame)
+				}
 				return 0, ErrCorrupt
 			}
 			h = (h + 1) & (htNSlot - 1)
@@ -1196,8 +1217,14 @@ func (wi *walIndex) shmHashGet(pgno, maxFrame, minFrame uint32) (uint32, error) 
 
 // shmClearHash zeros out all hash table data in shm regions.
 // Called during WAL reset. Preserves the header area in region 0.
+//
+// Best-effort: only segments this connection has mapped are cleared (the
+// loop stops at the first unmapped region, which on mmap SHM may be before
+// the end of the shm file if a peer grew the WAL further). Segments missed
+// here are lazily zeroed by shmHashWrite when their first entry of the new
+// WAL generation is written, matching SQLite walIndexAppend (wal.c:1324-1330).
 func (wi *walIndex) shmClearHash() {
-	for seg := range shmMaxRegions {
+	for seg := 0; ; seg++ {
 		region, err := wi.shm.region(seg, false)
 		if err != nil {
 			break
