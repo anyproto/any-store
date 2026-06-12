@@ -23,7 +23,8 @@ for iter.Next() {
 ```
 
 The pipeline is accepted in the same form as `Find()` filters: a JSON string,
-`[]byte`, `*anyenc.Value`, or any JSON-marshalable Go value.
+`[]byte` (a **marshaled anyenc value**, not JSON text), `*anyenc.Value`, or
+any JSON-marshalable Go value.
 
 ## 1. Stages
 
@@ -33,8 +34,8 @@ The pipeline is accepted in the same form as `Find()` filters: a JSON string,
 | `$sort` | `{"$sort": {"a": 1, "b.c": -1}}` | 1 ascending, -1 descending; anyenc value order across types; missing sorts as null. Stable. |
 | `$skip` / `$limit` | `{"$skip": 10}` / `{"$limit": 5}` | |
 | `$count` | `{"$count": "n"}` | Terminal: emits the single document `{"n": <count>}`. |
-| `$project` | `{"$project": {"a": 1, "b": "$x.y", "c": {"p": "$q"}}}` | Strictly explicit: only listed fields appear (`id` included **only if listed** — unlike Mongo's implicit `_id`). Exclusion (`"a": 0`) is not supported. |
-| `$addFields` / `$set` | `{"$addFields": {"b": "$x.y"}}` | Overlays computed fields; an expression evaluating to missing removes the field. |
+| `$project` | `{"$project": {"a": 1, "b": "$x.y", "c": {"p": "$q"}}}` | Strictly explicit: only listed fields appear (`id` included **only if listed** — unlike Mongo's implicit `_id`). Exclusion (`"a": 0`) is not supported. Bare numbers and booleans are include flags (Mongo): `{"a": 5}` includes the stored field `a`; a literal number needs `{"$literal": 5}`. |
+| `$addFields` / `$set` | `{"$addFields": {"b": "$x.y"}}` | Overlays computed fields; an expression evaluating to missing removes the field. All expressions are evaluated against the **stage input** (Mongo): a field added by the same stage is not visible to its sibling expressions. |
 | `$unwind` | `"$tags"` or `{"path": "$tags", "preserveNullAndEmptyArrays": true}` | Default drops documents whose path is missing/null/empty; preserve emits them as-is (empty array: field removed). Non-array values pass through. |
 | `$group` | see below | Hash aggregation. |
 
@@ -103,6 +104,13 @@ Pushdown stops at the first `$group`/`$project`/`$addFields`/`$unwind`/`$count`
 or any out-of-canonical-order stage; the remainder runs in-pipeline. An
 in-pipeline `$sort` directly followed by `$skip`/`$limit` keeps only the top
 `skip+limit` rows (heap + packed arena, O(K) memory).
+
+`$text` and vector (ANN) clauses are valid **only inside the pushdown
+prefix** — they are executed by the index sources the planner builds, not by
+the streaming `$match` operator. A `$match` containing them after the prefix
+ends (e.g. after `$unwind`/`$group`, or preceded by `$skip`/`$limit`) fails
+`Iter`/`Count`/`Explain` with a descriptive error instead of silently
+matching everything ($text) or comparing arrays literally (vector).
 
 `AggQuery.Explain` shows the split:
 
