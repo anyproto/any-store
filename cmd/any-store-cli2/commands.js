@@ -64,6 +64,21 @@ Query.prototype.hint = function (hint) {
     return this
 }
 
+Query.prototype.groupLimit = function (n) {
+    this.query.groupLimit = n;
+    return this
+}
+
+Query.prototype.accumArrayLimit = function (n) {
+    this.query.accumArrayLimit = n;
+    return this
+}
+
+Query.prototype.memoryLimit = function (bytes) {
+    this.query.memoryLimit = bytes;
+    return this
+}
+
 Query.prototype.project = function (project) {
     this.query.project = project;
     return this
@@ -134,6 +149,17 @@ function Collection(name) {
 Collection.prototype.find = function (condition) {
     this.query.reset();
     this.query.query.find = condition || {}
+    return this.query;
+}
+
+Collection.prototype.aggregate = function (pipeline) {
+    this.query.reset();
+    this.query.cmd = "aggregate";
+    var stages = Array.prototype.slice.call(arguments);
+    if (stages.length === 1 && Array.isArray(stages[0])) {
+        stages = stages[0];
+    }
+    this.query.query.pipeline = stages;
     return this.query;
 }
 

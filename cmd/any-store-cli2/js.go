@@ -42,17 +42,23 @@ type Cmd struct {
 }
 
 type Query struct {
-	Find    json.RawMessage `json:"find"`
-	Update  json.RawMessage `json:"update"`
-	Project json.RawMessage `json:"project"`
-	Limit   int             `json:"limit"`
-	Offset  int             `json:"offset"`
-	Count   bool            `json:"count"`
-	Delete  bool            `json:"delete"`
-	Explain bool            `json:"explain"`
-	Pretty  bool            `json:"pretty"`
-	Sort    []string        `json:"sort"`
-	Hint    map[string]int  `json:"hint"`
+	Find     json.RawMessage `json:"find"`
+	Pipeline json.RawMessage `json:"pipeline"`
+	Update   json.RawMessage `json:"update"`
+	Project  json.RawMessage `json:"project"`
+	Limit    int             `json:"limit"`
+	Offset   int             `json:"offset"`
+	Count    bool            `json:"count"`
+	Delete   bool            `json:"delete"`
+	Explain  bool            `json:"explain"`
+	Pretty   bool            `json:"pretty"`
+	Sort     []string        `json:"sort"`
+	Hint     map[string]int  `json:"hint"`
+
+	// Aggregation limit overrides (0 = library default, negative = unlimited).
+	GroupLimit      int `json:"groupLimit"`
+	AccumArrayLimit int `json:"accumArrayLimit"`
+	MemoryLimit     int `json:"memoryLimit"`
 }
 
 type Index struct {
@@ -60,6 +66,7 @@ type Index struct {
 	Fields []string `json:"fields"`
 	Unique bool     `json:"unique"`
 	Sparse bool     `json:"sparse"`
+	Kind   string   `json:"kind"`
 }
 
 func (j *js) GetQuery(line string) (q Cmd, err error) {

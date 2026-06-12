@@ -73,7 +73,7 @@ func collAccessor(name string) string {
 	return "db[" + strconv.Quote(name) + "]"
 }
 
-var collCommands = []string{"insert", "find", "findOne", "findId", "deleteId", "update", "updateId", "upsert", "upsertId", "ensureIndex", "dropIndex", "getIndexes", "rename", "drop", "count", "stats"}
+var collCommands = []string{"insert", "find", "findOne", "findId", "deleteId", "update", "updateId", "upsert", "upsertId", "aggregate", "ensureIndex", "dropIndex", "getIndexes", "rename", "drop", "count", "stats"}
 
 func (c *Conn) makeAutocomplete() (err error) {
 	collNames, err := c.db.GetCollectionNames(mainCtx.Ctx())
@@ -83,7 +83,7 @@ func (c *Conn) makeAutocomplete() (err error) {
 	c.syncCollections(collNames)
 	c.autocomplete = append(c.autocomplete[:0], "show collections", "show stats", "db.", "help", "it")
 	c.autocompleteDb = append(c.autocompleteDb[:0], "db.createCollection(", "db.backup(", "db.quickCheck()")
-	c.autocompleteQuery = append(c.autocompleteQuery[:0], "limit(", "offset(", "sort(", "hint(", "project(", "pretty()", "count()", "explain()", "delete()", "update(")
+	c.autocompleteQuery = append(c.autocompleteQuery[:0], "limit(", "offset(", "sort(", "hint(", "project(", "pretty()", "count()", "explain()", "delete()", "update(", "groupLimit(", "accumArrayLimit(", "memoryLimit(")
 	c.autocompleteColl = c.autocompleteColl[:0]
 	for _, collName := range collNames {
 		accessor := collAccessor(collName)
@@ -171,6 +171,8 @@ func (c *Conn) ExecCmd(cmd Cmd) (result string, err error) {
 		return c.Stats(cmd)
 	case "find":
 		return c.Find(cmd)
+	case "aggregate":
+		return c.Aggregate(cmd)
 	case "findOne":
 		return c.FindOne(cmd)
 	case "findId":
@@ -207,11 +209,15 @@ var helpData = map[string]string{
 	"upsertId":         "Description: Upsert a document by ID with a modifier\nExample: db.collection.upsertId(\"1\", {$set: {name: \"new name\"}})",
 	"count":            "Description: Count documents in a collection\nExample: db.collection.count()",
 	"stats":            "Description: Show storage statistics for a collection (doc count, sizes, compression, per-index size and sketch distribution)\nExample: db.collection.stats()",
-	"find":             "Description: Find documents in a collection\nExample: db.collection.find({name: \"test\"}).limit(10)",
+	"find":             "Description: Find documents in a collection. A {$text: {$search: \"...\"}} clause runs a full-text search (requires a fulltext index); results are ranked by BM25 and carry a _score field\nExample: db.collection.find({name: \"test\"}).limit(10)\nExample: db.collection.find({$text: {$search: \"zeppelin disaster\"}}).limit(10)",
+	"aggregate":        "Description: Run a MongoDB-style aggregation pipeline ($match, $sort, $skip, $limit, $count, $project, $addFields/$set, $unwind, $group). Chain .pretty(), .count(), .explain(), .hint(), .groupLimit(n), .accumArrayLimit(n), .memoryLimit(bytes)\nExample: db.collection.aggregate([{$match: {status: \"published\"}}, {$unwind: \"$tags\"}, {$group: {_id: \"$tags\", n: {$count: {}}}}, {$sort: {n: -1}}])",
+	"groupLimit":       "Description: Override the maximum number of unique $group keys (default 50000, negative = unlimited)\nExample: db.collection.aggregate([{$group: {_id: \"$cat\"}}]).groupLimit(200000)",
+	"accumArrayLimit":  "Description: Override the maximum $push/$addToSet array length (default 10000, negative = unlimited)\nExample: db.collection.aggregate([{$group: {_id: \"$cat\", tags: {$push: \"$tag\"}}}]).accumArrayLimit(100000)",
+	"memoryLimit":      "Description: Override the retained-bytes budget of blocking stages ($group, in-pipeline $sort; default 256 MiB, negative = unlimited)\nExample: db.collection.aggregate([{$group: {_id: \"$cat\"}}]).memoryLimit(1073741824)",
 	"findOne":          "Description: Find one document in a collection\nExample: db.collection.findOne({id: \"1\"})",
 	"findId":           "Description: Find documents by ID\nExample: db.collection.findId(\"1\", \"2\")",
 	"deleteId":         "Description: Delete documents by ID\nExample: db.collection.deleteId(\"1\", \"2\")",
-	"ensureIndex":      "Description: Ensure an index exists on a collection\nExample: db.collection.ensureIndex({name: \"indexName\", fields: [\"fieldName\"], unique: true})",
+	"ensureIndex":      "Description: Ensure an index exists on a collection. kind: \"fulltext\" creates a full-text (BM25) index over the listed text fields, queried with find({$text: {$search: \"...\"}})\nExample: db.collection.ensureIndex({name: \"indexName\", fields: [\"fieldName\"], unique: true})\nExample: db.collection.ensureIndex({name: \"fts\", kind: \"fulltext\", fields: [\"title\", \"body\"]})",
 	"dropIndex":        "Description: Drop an index from a collection\nExample: db.collection.dropIndex(\"indexName\")",
 	"getIndexes":       "Description: Get all indexes on a collection\nExample: db.collection.getIndexes()",
 	"drop":             "Description: Drop a collection\nExample: db.collection.drop()",
@@ -250,6 +256,14 @@ func (c *Conn) Help(cmd Cmd) (string, error) {
 		sb.WriteString("        .pretty()\n")
 		sb.WriteString("        .update(doc)\n")
 		sb.WriteString("        .delete()\n")
+		sb.WriteString("      .aggregate(pipeline)\n")
+		sb.WriteString("        .pretty()\n")
+		sb.WriteString("        .count()\n")
+		sb.WriteString("        .explain()\n")
+		sb.WriteString("        .hint(spec)\n")
+		sb.WriteString("        .groupLimit(n)\n")
+		sb.WriteString("        .accumArrayLimit(n)\n")
+		sb.WriteString("        .memoryLimit(bytes)\n")
 		sb.WriteString("      .findOne(query)\n")
 		sb.WriteString("      .findId(id, ...)\n")
 		sb.WriteString("      .update(updateDoc)\n")
@@ -604,6 +618,18 @@ func (c *Conn) Stats(cmd Cmd) (result string, err error) {
 				d.MaxBucket, d.MeanNonEmpty, d.P50, d.P90, d.P99, d.Skew)
 		}
 	}
+
+	if len(st.FtsIndexes) > 0 {
+		b.WriteString("\nFull-text indexes:\n")
+		for _, fx := range st.FtsIndexes {
+			fmt.Fprintf(&b, "  %s [%s]\n", fx.Name, strings.Join(fx.Fields, ","))
+			fmt.Fprintf(&b, "    docs=%d  terms=%d  tokens=%d  avgdl=%.1f\n",
+				fx.DocCount, fx.VocabSize, fx.TotalTokens, fx.AvgDocLen)
+			fmt.Fprintf(&b, "    size=%s (postings=%s vocab=%s docmap=%s docinfo=%s meta=%s)\n",
+				formatKiB(fx.SizeBytes), formatKiB(fx.PostingsBytes), formatKiB(fx.VocabBytes),
+				formatKiB(fx.DocmapBytes), formatKiB(fx.DocinfoBytes), formatKiB(fx.MetaBytes))
+		}
+	}
 	return strings.TrimRight(b.String(), "\n"), nil
 }
 
@@ -620,7 +646,19 @@ func (c *Conn) EnsureIndex(cmd Cmd) (result string, err error) {
 	if len(cmd.Index.Fields) == 0 {
 		return "", fmt.Errorf("no index fields specified")
 	}
-	indexInfo := anystore.IndexInfo(cmd.Index)
+	indexInfo := anystore.IndexInfo{
+		Name:   cmd.Index.Name,
+		Fields: cmd.Index.Fields,
+		Unique: cmd.Index.Unique,
+		Sparse: cmd.Index.Sparse,
+	}
+	switch cmd.Index.Kind {
+	case "", "range":
+	case "fulltext":
+		indexInfo.Kind = anystore.IndexKindFulltext
+	default:
+		return "", fmt.Errorf("unsupported index kind %q (supported: \"range\", \"fulltext\")", cmd.Index.Kind)
+	}
 	err = coll.EnsureIndex(mainCtx.Ctx(), indexInfo)
 	if err != nil {
 		return
@@ -643,15 +681,43 @@ func (c *Conn) DropIndex(cmd Cmd) (result string, err error) {
 	return
 }
 
+// indexDisplay is the CLI-facing shape of an IndexInfo: kind as a readable
+// string instead of the library's numeric enum.
+type indexDisplay struct {
+	Name   string   `json:"name"`
+	Fields []string `json:"fields"`
+	Unique bool     `json:"unique"`
+	Sparse bool     `json:"sparse"`
+	Kind   string   `json:"kind,omitempty"`
+}
+
+func indexKindString(kind anystore.IndexKind) string {
+	switch kind {
+	case anystore.IndexKindFulltext:
+		return "fulltext"
+	case anystore.IndexKindVector:
+		return "vector"
+	default:
+		return "" // range is the default; omitted
+	}
+}
+
 func (c *Conn) GetIndexes(cmd Cmd) (result string, err error) {
 	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
 	if err != nil {
 		return
 	}
 	indexes := coll.GetIndexes()
-	infos := make([]anystore.IndexInfo, len(indexes))
+	infos := make([]indexDisplay, len(indexes))
 	for i, idx := range indexes {
-		infos[i] = idx.Info()
+		info := idx.Info()
+		infos[i] = indexDisplay{
+			Name:   info.Name,
+			Fields: info.Fields,
+			Unique: info.Unique,
+			Sparse: info.Sparse,
+			Kind:   indexKindString(info.Kind),
+		}
 	}
 	var b []byte
 	if b, err = json.MarshalIndent(infos, "", "  "); err != nil {
@@ -877,6 +943,76 @@ func (c *Conn) Find(cmd Cmd) (result string, err error) {
 			return "", cErr
 		}
 		fmt.Printf("Deleted:\t%d\n", res.Modified)
+		return
+	}
+
+	iter, err := q.Iter(mainCtx.Ctx())
+	if err != nil {
+		return "", err
+	}
+	return c.printIter(iter, cmd.Query, true)
+}
+
+func (c *Conn) Aggregate(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	switch {
+	case cmd.Query.Update != nil:
+		return "", fmt.Errorf("update() is not supported on aggregate()")
+	case cmd.Query.Delete:
+		return "", fmt.Errorf("delete() is not supported on aggregate(); use find().delete()")
+	case cmd.Query.Sort != nil:
+		return "", fmt.Errorf("sort() is not supported on aggregate(); use a {$sort: ...} stage")
+	case cmd.Query.Limit > 0 || cmd.Query.Offset > 0:
+		return "", fmt.Errorf("limit()/offset() are not supported on aggregate(); use {$limit: n}/{$skip: n} stages")
+	case len(cmd.Query.Project) > 0:
+		return "", fmt.Errorf("project() is not supported on aggregate(); use a {$project: ...} stage")
+	}
+
+	// Pass the pipeline as a JSON string: a json.RawMessage ([]byte) would be
+	// taken for a marshaled anyenc value.
+	var pipeline any
+	if len(cmd.Query.Pipeline) > 0 {
+		pipeline = string(cmd.Query.Pipeline)
+	}
+	q := coll.Aggregate(pipeline)
+	if cmd.Query.GroupLimit != 0 {
+		q.GroupLimit(cmd.Query.GroupLimit)
+	}
+	if cmd.Query.AccumArrayLimit != 0 {
+		q.AccumArrayLimit(cmd.Query.AccumArrayLimit)
+	}
+	if cmd.Query.MemoryLimit != 0 {
+		q.MemoryLimit(cmd.Query.MemoryLimit)
+	}
+	if cmd.Query.Hint != nil {
+		hints := []anystore.IndexHint{}
+		for idxName, boost := range cmd.Query.Hint {
+			hints = append(hints, anystore.IndexHint{
+				IndexName: idxName,
+				Boost:     boost,
+			})
+		}
+		q.IndexHint(hints...)
+	}
+
+	if cmd.Query.Count {
+		count, cErr := q.Count(mainCtx.Ctx())
+		if cErr != nil {
+			return "", cErr
+		}
+		result = fmt.Sprintf("%d", count)
+		return
+	}
+
+	if cmd.Query.Explain {
+		explain, cErr := q.Explain(mainCtx.Ctx())
+		if cErr != nil {
+			return "", cErr
+		}
+		result = explain.Plan
 		return
 	}
 

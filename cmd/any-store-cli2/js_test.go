@@ -109,6 +109,82 @@ func Test_Js(t *testing.T) {
 			Index:      Index{Fields: []string{"a"}},
 		})
 	})
+	t.Run("ensure fulltext index", func(t *testing.T) {
+		assertCmd(t, `db.coll.ensureIndex({name:"fts", kind:"fulltext", fields:["title","body"]})`, Cmd{
+			Cmd:        "ensureIndex",
+			Collection: "coll",
+			Index:      Index{Name: "fts", Kind: "fulltext", Fields: []string{"title", "body"}},
+		})
+	})
+	t.Run("aggregate", func(t *testing.T) {
+		assertCmd(t, `db.coll.aggregate([{$match:{a:"b"}},{$group:{_id:"$a"}}])`, Cmd{
+			Cmd:        "aggregate",
+			Collection: "coll",
+			Query: Query{
+				Pipeline: json.RawMessage(`[{"$match":{"a":"b"}},{"$group":{"_id":"$a"}}]`),
+			},
+		})
+	})
+	t.Run("aggregate variadic stages", func(t *testing.T) {
+		assertCmd(t, `db.coll.aggregate({$match:{a:"b"}}, {$count:"n"})`, Cmd{
+			Cmd:        "aggregate",
+			Collection: "coll",
+			Query: Query{
+				Pipeline: json.RawMessage(`[{"$match":{"a":"b"}},{"$count":"n"}]`),
+			},
+		})
+	})
+	t.Run("aggregate empty", func(t *testing.T) {
+		assertCmd(t, `db.coll.aggregate()`, Cmd{
+			Cmd:        "aggregate",
+			Collection: "coll",
+			Query: Query{
+				Pipeline: json.RawMessage(`[]`),
+			},
+		})
+	})
+	t.Run("aggregate options", func(t *testing.T) {
+		assertCmd(t, `db.coll.aggregate([{$group:{_id:"$a"}}]).groupLimit(100).accumArrayLimit(-1).memoryLimit(1024).pretty()`, Cmd{
+			Cmd:        "aggregate",
+			Collection: "coll",
+			Query: Query{
+				Pipeline:        json.RawMessage(`[{"$group":{"_id":"$a"}}]`),
+				GroupLimit:      100,
+				AccumArrayLimit: -1,
+				MemoryLimit:     1024,
+				Pretty:          true,
+			},
+		})
+	})
+	t.Run("aggregate count", func(t *testing.T) {
+		assertCmd(t, `db.coll.aggregate([{$match:{a:"b"}}]).count()`, Cmd{
+			Cmd:        "aggregate",
+			Collection: "coll",
+			Query: Query{
+				Pipeline: json.RawMessage(`[{"$match":{"a":"b"}}]`),
+				Count:    true,
+			},
+		})
+	})
+	t.Run("aggregate explain", func(t *testing.T) {
+		assertCmd(t, `db.coll.aggregate([{$match:{a:"b"}}]).explain()`, Cmd{
+			Cmd:        "aggregate",
+			Collection: "coll",
+			Query: Query{
+				Pipeline: json.RawMessage(`[{"$match":{"a":"b"}}]`),
+				Explain:  true,
+			},
+		})
+	})
+	t.Run("find after aggregate resets cmd", func(t *testing.T) {
+		_, err := j.GetQuery(`db.coll.aggregate([{$match:{a:"b"}}])`)
+		require.NoError(t, err)
+		assertCmd(t, `db.coll.find({a:"b"})`, Cmd{
+			Cmd:        "find",
+			Collection: "coll",
+			Query:      Query{Find: json.RawMessage(`{"a":"b"}`)},
+		})
+	})
 	t.Run("drop index", func(t *testing.T) {
 		assertCmd(t, `db.coll.dropIndex("indexName")`, Cmd{
 			Cmd:        "dropIndex",
