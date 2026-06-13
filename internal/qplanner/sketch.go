@@ -2,6 +2,7 @@ package qplanner
 
 import (
 	"encoding/binary"
+	"math"
 	"slices"
 	"sync/atomic"
 
@@ -57,6 +58,48 @@ func (s *IndexSketch) Decrement(value []byte) {
 // Estimate returns the estimated count for the given encoded value.
 func (s *IndexSketch) Estimate(value []byte) uint64 {
 	return atomic.LoadUint64(&s.Buckets[s.bucket(value)])
+}
+
+// DistinctEstimate returns an estimate of the number of distinct values indexed
+// by the sketch, in a single atomic-load pass over the buckets. It powers the
+// per-column "indexed equality" selectivity heuristic used when a per-value
+// frequency cannot be read directly — e.g. the leading column of a compound
+// index, whose sketch is keyed on the full composite tuple.
+//
+// It uses the occupancy (coupon-collector) estimator: if k of Size buckets are
+// non-empty, the expected number of distinct hashed values is
+// D = -Size*ln(1 - k/Size). The result is capped at the document count (a hard
+// upper bound on distinct values) — mandatory because a saturated sketch (k==Size,
+// e.g. a unique compound index) drives the ln term to infinity. An empty/cold
+// sketch returns 1, so the caller clamps back to the default selectivity.
+func (s *IndexSketch) DistinctEstimate() float64 {
+	dc := float64(s.docCount.Load())
+	if dc <= 0 || s.Size == 0 {
+		return 1
+	}
+	nonEmpty := 0
+	for i := range s.Size {
+		if atomic.LoadUint64(&s.Buckets[i]) != 0 {
+			nonEmpty++
+		}
+	}
+	if nonEmpty == 0 {
+		return 1
+	}
+	if nonEmpty >= s.Size {
+		// Fully saturated: the occupancy estimator diverges (distinct >> Size).
+		// The tightest sound bound we have is the document count.
+		return dc
+	}
+	fill := float64(nonEmpty) / float64(s.Size)
+	d := -float64(s.Size) * math.Log(1-fill)
+	if d > dc {
+		d = dc
+	}
+	if d < 1 {
+		d = 1
+	}
+	return d
 }
 
 // IncrementDocCount atomically increments the document count.

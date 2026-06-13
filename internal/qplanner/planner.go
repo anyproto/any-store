@@ -349,6 +349,29 @@ func BuildPlan(params *PlanParams) *Plan {
 			}
 		}
 	}
+	// Second pass: harvest the LEADING-column selectivity of compound indexes whose
+	// leading field has an EQUALITY predicate, estimated from the index's distinct
+	// count. This lets a partial-bound seek on a compound index get a per-column
+	// leading estimate instead of the blind DefaultRangeSelectivity. The leading
+	// field's own (per-field) bound is used — NOT the combined index bound, which is
+	// not an equality once a trailing range is appended (e.g. {a==X, b>=Y}).
+	// Single-field entries (above) take precedence — they are exact per-value counts.
+	for i := range params.Indexes {
+		idx := &params.Indexes[i]
+		if len(idx.Info.FieldNames) <= 1 || idx.Sketch == nil || idx.BoundFields < 1 {
+			continue
+		}
+		f0 := idx.Info.FieldNames[0]
+		if fieldSelHas(fieldSelBuf[:nFieldSel], f0) || nFieldSel >= len(fieldSelBuf) {
+			continue
+		}
+		_, isEq, found := fieldBoundsLookup(params.Filter, params.FieldBounds, f0)
+		if !found || !isEq {
+			continue
+		}
+		fieldSelBuf[nFieldSel] = fieldSelEntry{field: f0, sel: indexedEqualitySelectivity(idx)}
+		nFieldSel++
+	}
 	var fieldSelectivity []fieldSelEntry
 	if nFieldSel > 0 {
 		fieldSelectivity = fieldSelBuf[:nFieldSel]
@@ -723,6 +746,77 @@ func sortTopK(params *PlanParams) int {
 	return 0
 }
 
+// boundIsEquality reports whether a single bound is an equality (point) bound.
+func boundIsEquality(b query.Bound) bool {
+	return len(b.Start) != 0 && bytes.Equal(b.Start, b.End)
+}
+
+// fieldBoundsLookup returns the per-field bounds for fieldName, whether they are
+// an equality (all fixed), and whether the field is bounded at all. It prefers a
+// precomputed BoundsResult and falls back to filter.IndexBounds — the single
+// source of truth for per-field equality detection used across the planner.
+func fieldBoundsLookup(filter query.Filter, br *BoundsResult, fieldName string) (bounds query.Bounds, isEquality bool, found bool) {
+	if br != nil {
+		var fixed bool
+		bounds, fixed, found = br.Lookup(fieldName)
+		if !found || len(bounds) == 0 {
+			return nil, false, false
+		}
+		return bounds, fixed, true
+	}
+	if filter == nil {
+		return nil, false, false
+	}
+	bounds = filter.IndexBounds(fieldName, nil)
+	if len(bounds) == 0 {
+		return nil, false, false
+	}
+	return bounds, AllBoundsFixed(bounds), true
+}
+
+// indexedEqualitySelectivity estimates the selectivity of an equality on a column
+// of a COMPOUND index whose per-value frequency cannot be read directly (the
+// composite sketch is keyed on the full tuple). distinct(composite) ≈ the product
+// of the per-column distinct counts, so distinct^(-1/k) (k = number of index
+// columns) estimates the average selectivity of an equality on ONE column — the
+// right scale for a leading-column equality, unlike the full-key 1/distinct (which
+// assumes the whole composite is pinned). It is clamped into
+// [MinIndexedEqualitySelectivity, DefaultRangeSelectivity]: the upper clamp keeps
+// it never less selective than the old blind default (no plan that 0.5 gets right
+// can regress), the floor stops it collapsing to zero rows. Returns
+// DefaultRangeSelectivity when the index has no sketch / is empty.
+func indexedEqualitySelectivity(idx *CBOIndex) float64 {
+	if idx.Sketch == nil {
+		return DefaultRangeSelectivity
+	}
+	d := idx.Sketch.DistinctEstimate()
+	if d <= 1 {
+		return DefaultRangeSelectivity
+	}
+	k := len(idx.Info.FieldNames)
+	if k < 1 {
+		k = 1
+	}
+	p := math.Pow(d, -1.0/float64(k))
+	if p > DefaultRangeSelectivity {
+		p = DefaultRangeSelectivity
+	}
+	if p < MinIndexedEqualitySelectivity {
+		p = MinIndexedEqualitySelectivity
+	}
+	return p
+}
+
+// fieldSelHas reports whether fs already carries a selectivity entry for field.
+func fieldSelHas(fs []fieldSelEntry, field string) bool {
+	for i := range fs {
+		if fs[i].field == field {
+			return true
+		}
+	}
+	return false
+}
+
 // calculateSelectivity computes the combined selectivity for all filter predicates.
 func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs float64, br *BoundsResult) float64 {
 	if filter == nil || isAllFilter(filter) {
@@ -749,21 +843,9 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 			if alreadyUsed {
 				continue
 			}
-			var bounds query.Bounds
-			var isEquality bool
-			if br != nil {
-				var fixed, found bool
-				bounds, fixed, found = br.Lookup(fieldName)
-				if !found || len(bounds) == 0 {
-					continue
-				}
-				isEquality = fixed
-			} else {
-				bounds = filter.IndexBounds(fieldName, nil)
-				if len(bounds) == 0 {
-					continue
-				}
-				isEquality = AllBoundsFixed(bounds)
+			bounds, isEquality, found := fieldBoundsLookup(filter, br, fieldName)
+			if !found {
+				continue
 			}
 			if nUsed < len(usedFields) {
 				usedFields[nUsed] = fieldName
@@ -781,9 +863,15 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 					p = 0.0001
 				}
 				pTotal *= p
+			} else if isEquality && idx.Sketch != nil && fi == 0 && len(idx.Info.FieldNames) > 1 {
+				// Leading equality on a COMPOUND index: the composite sketch can't
+				// answer this directly, so estimate the per-column selectivity from
+				// the index's distinct-value count rather than using the blind 0.5,
+				// which over-estimates a selective leading column and traps the
+				// planner into a FullScan.
+				pTotal *= indexedEqualitySelectivity(idx)
 			} else if isEquality {
-				// Equality on a field but can't use sketch directly (compound index)
-				// Use a more selective estimate than default range
+				// Equality on a non-leading field, or an index without a sketch.
 				pTotal *= DefaultRangeSelectivity
 			} else {
 				// Range predicate: use default selectivity
@@ -819,6 +907,24 @@ func selectivityForIndex(idx *CBOIndex, totalDocs float64) float64 {
 	if idx.PointLookup && idx.Sketch != nil && idx.BoundFields == len(idx.Info.FieldNames) {
 		est := idx.Sketch.Estimate(idx.Bounds[0].Start)
 		p := float64(est) / totalDocs
+		if p <= 0 {
+			p = 0.0001
+		}
+		if p > 1.0 {
+			p = 1.0
+		}
+		return p
+	}
+
+	// Leading equality on a compound index (partial bounds): use the per-column
+	// distinct-derived estimate, with DefaultRangeSelectivity per additional bound
+	// field, instead of a blanket 0.5 — keeping this consistent with the leading
+	// estimate used by estimateIndexDocsWithFieldSel.
+	if idx.Sketch != nil && len(idx.Info.FieldNames) > 1 && idx.BoundFields >= 1 && boundIsEquality(idx.Bounds[0]) {
+		p := indexedEqualitySelectivity(idx)
+		for k := 1; k < idx.BoundFields; k++ {
+			p *= DefaultRangeSelectivity
+		}
 		if p <= 0 {
 			p = 0.0001
 		}
