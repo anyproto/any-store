@@ -337,6 +337,10 @@ func (p *pager) takeCellBuf(minCap int) []byte {
 // ReadAt; the mmap path returns nil on success because the slice is
 // exactly len(buf) (checked in dbMmap.fetch).
 func (p *pager) readDBPage(pgno uint32, buf []byte) error {
+	if btreeCtrEnabled() {
+		btreeCtr.diskReads.Add(1)
+		btreeCtrNoteDiskPage(pgno)
+	}
 	if p.file == nil {
 		return fmt.Errorf("btree: db file closed")
 	}
@@ -1194,8 +1198,18 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 	}
 
 	// Check reader cache.
+	if btreeCtrEnabled() {
+		btreeCtr.getPageReaderCalls.Add(1)
+		btreeCtrNoteReaderPage(pgno)
+	}
 	if pg := cache.fetch(pgno); pg != nil {
+		if btreeCtrEnabled() {
+			btreeCtr.pcacheHits.Add(1)
+		}
 		return pg, nil
+	}
+	if btreeCtrEnabled() {
+		btreeCtr.pcacheMisses.Add(1)
 	}
 
 	// Cache miss: create a page in the reader cache (soft create — may be
@@ -2964,6 +2978,9 @@ func (p *pager) readOverflowChainReader(firstPgno uint32, buf []byte, walMaxFram
 // accessPayload() offset logic — skips overflow pages that fall before skip,
 // then copies from the first relevant page onward.
 func (p *pager) readOverflowAt(firstPgno uint32, skip, amt int, dst []byte, walMaxFrame uint32, cache *pcache) error {
+	if btreeCtrEnabled() {
+		btreeCtr.overflowReads.Add(1)
+	}
 	usable := overflowPageUsable(p.usableSize())
 	pgno := firstPgno
 	off := 0 // current byte offset in chain payload

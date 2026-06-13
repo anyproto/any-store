@@ -1411,6 +1411,9 @@ func (tx *ReadTx) txGetPage(pgno uint32) (*page, error) {
 // writer's live p.dbSize (cache==nil) or the reader cache's frozen snapshot
 // bound, exactly as readerDbSizeBound resolves.
 func (tx *ReadTx) txDescendChild(childPgno uint32) (*page, error) {
+	if btreeCtrEnabled() {
+		btreeCtr.descendChild.Add(1)
+	}
 	if childPgno == 0 || childPgno > tx.pager.readerDbSizeBound(tx.cache) {
 		if debugTrace {
 			trace("txDescendChild: CORRUPT childPgno=%d bound=%d walMaxFrame=%d hdr.nPage=%d",
