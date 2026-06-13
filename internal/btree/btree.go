@@ -121,6 +121,13 @@ func (bt *btree) getPage(pgno uint32) (*page, error) {
 // cleared first cell-pointer slot as a bogus child pgno instead of routing to
 // rightChild; failing fast here yields ErrCorrupt instead of a wild descent.
 func (bt *btree) descendChild(childPgno uint32) (*page, error) {
+	// Measurement parity: the cursor-free tx.txDescendChild (db.go) increments
+	// this debug counter, but this cursor-path descent did not, so naively
+	// switching FetchIter onto the cursor would make descendChild/row falsely
+	// read 0. Count both paths on equal footing. DEBUG ONLY (env/flag gated).
+	if btreeCtrEnabled() {
+		btreeCtr.descendChild.Add(1)
+	}
 	if childPgno == 0 || childPgno > bt.pager.readerDbSizeBound(bt.cache) {
 		return nil, ErrCorrupt
 	}

@@ -1052,7 +1052,11 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 		}
 	}
 
-	// Fetch documents by docId — share CursorSource between FetchIter and FilterIter
+	// Fetch documents by docId — share CursorSource between FetchIter and FilterIter.
+	// Data is bound to params.Tx (the index scan's ReadTx), so FetchIter's retained
+	// data cursor (minted lazily in Next, fetch_iter.go) shares that single ReadTx —
+	// the same-tx invariant. The retained cursor lives on FetchIter, NOT on this
+	// shared b.dataCS, so FilterIter (which also holds &b.dataCS) is unaffected.
 	b.dataCS = CursorSource{Tx: params.Tx, Ns: params.DataNs}
 	b.fetchIter = FetchIter{
 		Source: root,
@@ -1146,7 +1150,12 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 		}
 	}
 
-	// Fetch documents by docId — share CursorSource between FetchIter and FilterIter
+	// Fetch documents by docId — share CursorSource between FetchIter and FilterIter.
+	// scanDataSrc is bound to params.Tx (the index scan's ReadTx), so FetchIter's
+	// retained data cursor (minted lazily in Next, fetch_iter.go) shares that single
+	// ReadTx — the same-tx invariant. The retained cursor lives on FetchIter, NOT on
+	// this shared scanDataSrc, so FilterIter (which also holds scanDataSrc) is
+	// unaffected.
 	scanDataSrc := &CursorSource{
 		Tx: params.Tx,
 		Ns: params.DataNs,
