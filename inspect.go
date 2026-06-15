@@ -17,9 +17,10 @@ type IndexSketchInspector interface {
 
 // IndexSketchInfo is a read-only snapshot of an index's persisted sketch.
 type IndexSketchInfo struct {
-	Size     int      // bucket count; normally qplanner.DefaultSketchSize
+	Size     int      // buckets per level; normally qplanner.DefaultSketchSize
+	Levels   int      // number of prefix levels (= number of index fields)
 	DocCount uint64   // total documents tracked by this index
-	Buckets  []uint64 // per-bucket frequency counts, len == Size
+	Buckets  []uint64 // per-bucket frequency counts, len == Size*Levels; level L is Buckets[L*Size:(L+1)*Size]
 }
 
 // InspectIndexSketch returns the decoded on-disk sketch for the named index.
@@ -37,11 +38,13 @@ func (db *db) InspectIndexSketch(ctx context.Context, collName, indexName string
 			}
 			return err
 		}
-		sk := qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
+		// Constructed at 1 level; UnmarshalBinary adopts the blob's real shape.
+		sk := qplanner.NewIndexSketch(qplanner.DefaultSketchSize, 1)
 		sk.UnmarshalBinary(data)
 		info.Size = sk.Size
+		info.Levels = sk.NumLevels()
 		info.DocCount = sk.GetDocCount()
-		info.Buckets = make([]uint64, sk.Size)
+		info.Buckets = make([]uint64, len(sk.Buckets))
 		copy(info.Buckets, sk.Buckets)
 		return nil
 	})

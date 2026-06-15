@@ -395,7 +395,8 @@ func TestIndex_InsertKeys_IdempotentSameDoc(t *testing.T) {
 	var keyCopy []byte
 	if idx.sketch != nil {
 		keyCopy = append(keyCopy, idx.keysBuf[0]...)
-		sketchKeyCountBefore = idx.sketch.Estimate(keyCopy)
+		// keysBuf[0] is the full field-tuple → the full-key (deepest) level.
+		sketchKeyCountBefore = idx.sketch.Estimate(idx.sketch.NumLevels()-1, keyCopy)
 	}
 
 	// Second insert with the same item: unique seek finds the existing entry
@@ -414,7 +415,7 @@ func TestIndex_InsertKeys_IdempotentSameDoc(t *testing.T) {
 	// idempotent path — otherwise per-value selectivity estimates would drift
 	// on every duplicate re-insert.
 	if idx.sketch != nil {
-		assert.Equal(t, sketchKeyCountBefore, idx.sketch.Estimate(keyCopy),
+		assert.Equal(t, sketchKeyCountBefore, idx.sketch.Estimate(idx.sketch.NumLevels()-1, keyCopy),
 			"sketch per-key bucket must not increment on idempotent re-insert")
 	}
 
@@ -426,6 +427,41 @@ func TestIndex_InsertKeys_IdempotentSameDoc(t *testing.T) {
 		coll.Insert(ctx, anyenc.MustParseJson(`{"id":3,"a":99}`)),
 		ErrUniqueConstraint,
 		"cross-doc duplicate must be rejected through the full pipeline")
+}
+
+// TestIndex_InsertKeys_MultiLevelSketch_PrefixDedup verifies the multi-level
+// sketch maintenance: a deeper multikey (array) field fans one document into
+// several index entries, but the shallow (leading-field) level must be counted
+// only ONCE per distinct prefix — otherwise prefix selectivity for the leading
+// field would be inflated by the array length of a trailing field.
+func TestIndex_InsertKeys_MultiLevelSketch_PrefixDedup(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "idx_multilevel_dedup")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name: "ab", Fields: []string{"a", "b"},
+	}))
+
+	idx := coll.GetIndexes()[0].(*index)
+	require.Equal(t, 2, idx.sketch.NumLevels(), "compound (a,b) sketch must have 2 levels")
+
+	// a is scalar; b is an array → the trailing field fans out into multiple
+	// entries while the leading field a=7 has a single distinct prefix.
+	it, itErr := newItem(anyenc.MustParseJson(`{"id":1,"a":7,"b":[10,20]}`))
+	require.NoError(t, itErr)
+
+	wrTx, err := coll.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, idx.insertKeys(wrTx.btreeWriteTx(), it))
+
+	assert.Equal(t, uint64(1), idx.sketch.EntryCount(0),
+		"leading field a must be counted once despite b's array fan-out")
+	assert.Greater(t, idx.sketch.EntryCount(1), uint64(1),
+		"trailing field level must reflect the array fan-out (>1 entries)")
+	assert.Equal(t, uint64(1), idx.sketch.GetDocCount(),
+		"docCount must advance once per document, independent of fan-out")
+
+	require.NoError(t, wrTx.Rollback())
 }
 
 // TestIndex_DeleteKeys_SwallowsErrKeyNotFound directly calls deleteKeys on an

@@ -233,7 +233,9 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 			if s := idx.loadPubSketch(); s != nil {
 				is.SketchDocCount = s.GetDocCount()
 				is.SketchSize = s.Size
-				is.SketchDistribution = s.Distribution()
+				// Report the full-key level — the most saturated, matching the
+				// pre-multi-level single-sketch semantics.
+				is.SketchDistribution = s.Distribution(s.NumLevels() - 1)
 			}
 			stats.IndexesSizeBytes += is.SizeBytes
 			stats.Indexes = append(stats.Indexes, is)

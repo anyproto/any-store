@@ -306,7 +306,15 @@ type index struct {
 	keyBuf      anyenc.Tuple
 	keysBuf     []anyenc.Tuple
 	keysBufPrev []anyenc.Tuple
-	uniqBuf     [][]anyenc.Tuple
+	// keyBoundsBuf is parallel to keysBuf: keyBoundsBuf[k][L] is the byte offset
+	// in keysBuf[k] just past field L's encoding, so keysBuf[k][:keyBoundsBuf[k][L]]
+	// is the level-L prefix fed to the multi-level sketch.
+	keyBoundsBuf [][]int
+	// curBounds is scratch (len == number of index fields) holding the field-end
+	// offsets of the key currently being built by writeValues; copied into
+	// keyBoundsBuf at each leaf.
+	curBounds []int
+	uniqBuf   [][]anyenc.Tuple
 	fullKeyBuf  anyenc.Tuple // reusable buffer for full keys (key+docId)
 	seekBuf     anyenc.Tuple // reusable buffer for unique constraint seek results
 	uniqSeekBuf anyenc.Tuple // reusable buffer for the padded unique-probe seek key
@@ -351,6 +359,7 @@ func (idx *index) init() (err error) {
 		idx.reverse = append(idx.reverse, reverse)
 	}
 	idx.uniqBuf = make([][]anyenc.Tuple, len(idx.fieldPaths))
+	idx.curBounds = make([]int, len(idx.fieldPaths))
 
 	// Build cached CBO index info once (avoids per-query allocation)
 	idx.cboInfo = &qplanner.IndexInfo{
@@ -399,7 +408,8 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 		entryValue = qplanner.IndexValueMultiKey
 	}
 
-	for _, key := range idx.keysBuf {
+	prevKi := -1
+	for ki, key := range idx.keysBuf {
 		idx.fullKeyBuf = append(idx.fullKeyBuf[:0], key...)
 		idx.fullKeyBuf = append(idx.fullKeyBuf, idKey...)
 
@@ -423,7 +433,7 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 				if !bytes.Equal(idx.seekBuf, idx.fullKeyBuf) {
 					return ErrUniqueConstraint
 				}
-				continue // same doc, idempotent
+				continue // same doc, idempotent: leave prevKi (sketch already counted it)
 			}
 		}
 
@@ -431,9 +441,10 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 			return err
 		}
 		if idx.sketch != nil {
-			idx.sketch.Increment(key)
+			idx.applySketch(ki, prevKi, true)
 			idx.sketchModified = true
 		}
+		prevKi = ki
 	}
 	if idx.sketch != nil {
 		idx.sketch.IncrementDocCount()
@@ -447,7 +458,8 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 	idx.fillKeysBuf(it)
 	idKey := it.appendId(nil)
-	for _, key := range idx.keysBuf {
+	prevKi := -1
+	for ki, key := range idx.keysBuf {
 		idx.fullKeyBuf = append(idx.fullKeyBuf[:0], key...)
 		idx.fullKeyBuf = append(idx.fullKeyBuf, idKey...)
 		if err := tx.Delete(idx.ns, idx.fullKeyBuf); err != nil {
@@ -456,9 +468,10 @@ func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 			}
 		}
 		if idx.sketch != nil {
-			idx.sketch.Decrement(key)
+			idx.applySketch(ki, prevKi, false)
 			idx.sketchModified = true
 		}
+		prevKi = ki
 	}
 	if idx.sketch != nil {
 		idx.sketch.DecrementDocCount()
@@ -467,10 +480,38 @@ func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 	return nil
 }
 
+// applySketch increments (inc) or decrements the multi-level sketch for entry ki,
+// deduping each prefix level it shares with the previously processed entry prevKi
+// (-1 = none). writeValues' DFS emits keys with equal shallow prefixes
+// contiguously, so a deeper multikey (array) field that fans one document into
+// several entries does not inflate the shallow levels — the level it diverges at
+// and below are bumped, the unchanged shallow prefixes are skipped. A missed
+// duplicate could only over-count, never under-count, matching the sketch's
+// existing collision bias.
+func (idx *index) applySketch(ki, prevKi int, inc bool) {
+	key := idx.keysBuf[ki]
+	bounds := idx.keyBoundsBuf[ki]
+	for L := 0; L < len(bounds); L++ {
+		if prevKi >= 0 {
+			pe := idx.keyBoundsBuf[prevKi][L]
+			if pe == bounds[L] && bytes.Equal(key[:bounds[L]], idx.keysBuf[prevKi][:pe]) {
+				continue // same level-L prefix as previous entry: already applied
+			}
+		}
+		if inc {
+			idx.sketch.Increment(L, key[:bounds[L]])
+		} else {
+			idx.sketch.Decrement(L, key[:bounds[L]])
+		}
+	}
+}
+
 func (idx *index) writeKey() {
 	nl := len(idx.keysBuf) + 1
 	idx.keysBuf = slices.Grow(idx.keysBuf, nl)[:nl]
 	idx.keysBuf[nl-1] = append(idx.keysBuf[nl-1][:0], idx.keyBuf...)
+	idx.keyBoundsBuf = slices.Grow(idx.keyBoundsBuf, nl)[:nl]
+	idx.keyBoundsBuf[nl-1] = append(idx.keyBoundsBuf[nl-1][:0], idx.curBounds...)
 }
 
 func (idx *index) writeValues(d *anyenc.Value, i int) bool {
@@ -503,6 +544,7 @@ func (idx *index) writeValues(d *anyenc.Value, i int) bool {
 					idx.keyBuf = av.MarshalTo(k)
 				}
 				if idx.isUnique(i, idx.keyBuf) {
+					idx.curBounds[i] = len(idx.keyBuf)
 					if !idx.writeValues(d, i+1) {
 						return false
 					}
@@ -516,15 +558,18 @@ func (idx *index) writeValues(d *anyenc.Value, i int) bool {
 	} else {
 		idx.keyBuf = v.MarshalTo(k)
 	}
+	idx.curBounds[i] = len(idx.keyBuf)
 	return idx.writeValues(d, i+1)
 }
 
 func (idx *index) fillKeysBuf(it item) {
 	idx.keysBuf = idx.keysBuf[:0]
+	idx.keyBoundsBuf = idx.keyBoundsBuf[:0]
 	idx.keyBuf = idx.keyBuf[:0]
 	idx.resetUnique()
 	if !idx.writeValues(it.Value(), 0) {
 		idx.keysBuf = idx.keysBuf[:0]
+		idx.keyBoundsBuf = idx.keyBoundsBuf[:0]
 	}
 }
 
