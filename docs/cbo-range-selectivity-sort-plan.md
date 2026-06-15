@@ -112,6 +112,18 @@ empty, single-leaf, post-delete skew); planner picks IndexSeek for selective
 - Revisit `CostDocFetch`/`DefaultRangeSelectivity` only if benchmarks show the
   model is still too FullScan-happy for the user's query mix.
 
+**Result** (`../any-store-tests`, `simple_index` group, 50K docs, n=6, local
+`replace` to this branch vs base 40fa122):
+- **Latency: no regression.** Every scenario statistically unchanged
+  (Eq/Range/In/HighSelectivity/LowSelectivity all p>0.05; geomean −0.14%). The
+  two plan-time descents read pages already warm from the query's own work.
+- **Allocations: small, bounded.** +~125 B/op constant on all queries (the
+  CBOIndex struct grew by Ns+rangeSel; alloc count unchanged). Range queries that
+  actually interpolate add +3 allocs / ~1 KB (the plan-time cursor) — negligible
+  against a scan that fetches thousands of docs. Possible later micro-opt: pool
+  the plan-time cursor.
+- No constant retuning needed.
+
 ## Out of scope (follow-ups)
 
 - `{a:{$exists:true}}` produces no bounds today (`Exists.IndexBounds` returns
