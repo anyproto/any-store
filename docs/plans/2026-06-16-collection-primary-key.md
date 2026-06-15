@@ -507,6 +507,40 @@ func (i item) Value() *anyenc.Value {
 }
 ```
 
+- [ ] **Step 3b: Add test-only key-derivation shims (keep existing low-level tests compiling)**
+
+Several existing internal tests build an `item` directly and derive its id: `item_test.go`, `index_test.go` (lines 17, 369, 454), `index_unique_sparse_test.go` (line 1073), and `iterator_test.go` (lines 197, 199, 304, 306). They call the free `newItem(val)` and the `item.appendId(dst)` method that Step 3 removed from production. Re-provide them as **test-only** helpers defaulting to `"id"` — production derives keys via `collection.newItem`/`collection.appendId`, which honor the per-collection primary key.
+
+Create `item_compat_test.go`:
+
+```go
+package anystore
+
+import "github.com/anyproto/any-store/v2/anyenc"
+
+// newItem is a TEST-ONLY helper that wraps a value as an item keyed by the
+// default "id" field (the pre-configurable-primary-key contract). It lets
+// low-level index/iterator tests build items without a collection. Production
+// derives keys via collection.newItem / collection.appendId.
+func newItem(val *anyenc.Value) (item, error) {
+	objVal, err := val.Object()
+	if err != nil {
+		return item{}, err
+	}
+	if objVal.Get("id") == nil {
+		return item{}, ErrDocWithoutId
+	}
+	return item{val: val}, nil
+}
+
+// appendId is a TEST-ONLY mirror of collection.appendId for the default "id" key.
+func (i item) appendId(dst []byte) []byte {
+	return i.val.Get("id").MarshalTo(dst)
+}
+```
+
+Because production no longer references the free `newItem` or `item.appendId`, the non-test `go build ./...` is the guard that every production call site was converted.
+
 - [ ] **Step 4: Add `newItem` / `appendId` methods on `collection`**
 
 In `collection.go`, add these methods (e.g. right after `compressionDisabled`):
