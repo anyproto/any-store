@@ -87,8 +87,17 @@ page reads. Cost ≈ tree depth (3–5 pages, already warm).
 **2b. `internal/qplanner`:** add `Ns *btree.Namespace` to `CBOIndex` (populated
 in `query.go` from `idx.ns`); the planner holds `params.Tx`. In the range
 branches, open a plan-time cursor, sum `RangeFraction` over the index's bounds
-(handles the `$ne` 2-bound union), and set `e = max(1, f · EntryCount(L))` —
-the unifying formula; Phase 1's bound is the `f=1` special case.
+(handles the `$ne` 2-bound union), and set `e = f · EntryCount(L)` — the unifying
+formula; Phase 1's bound is the `f=1` special case.
+- **One-way ratchet:** adopt the interpolated `f` only when it is MORE selective
+  than `DefaultRangeSelectivity` (i.e. `f < 0.5`). A selective range is refined
+  down so the index wins; a broad range / dense `$ne` (`f ≈ 1`) keeps the
+  conservative default, so no previously-indexed plan regresses to full scan.
+  This matches the user's "prefer the index" lean and protects the cliff (the
+  0.5 default already routes 99%-ranges to full scan on large collections).
+- **Multikey gate:** skip interpolation when `EntryCount(0) > totalDocs` (array
+  fan-out): `RangeFraction` counts entries, not documents, so its entry-fraction
+  doesn't map to a doc-fraction. Those fall back to the Phase-1 EntryCount path.
 - Degrade safely to Phase-1 behavior when `Ns`/Tx unavailable or sketch needs
   rebuild.
 
