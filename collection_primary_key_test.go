@@ -160,3 +160,54 @@ func TestCollection_PrimaryKey_FilterByNonPkId(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
 }
+
+// sortedInts runs Find(nil).Sort(sortField) and collects intField from each doc.
+func sortedInts(t *testing.T, coll Collection, sortField, intField string) []int {
+	t.Helper()
+	iter, err := coll.Find(nil).Sort(sortField).Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+	var out []int
+	for iter.Next() {
+		d, derr := iter.Doc()
+		require.NoError(t, derr)
+		out = append(out, d.Value().GetInt(intField))
+	}
+	require.NoError(t, iter.Err())
+	return out
+}
+
+// sortedStrings runs Find(nil).Sort(sortField) and collects strField from each doc.
+func sortedStrings(t *testing.T, coll Collection, sortField, strField string) []string {
+	t.Helper()
+	iter, err := coll.Find(nil).Sort(sortField).Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+	var out []string
+	for iter.Next() {
+		d, derr := iter.Doc()
+		require.NoError(t, derr)
+		out = append(out, d.Value().GetString(strField))
+	}
+	require.NoError(t, iter.Err())
+	return out
+}
+
+func TestCollection_PrimaryKey_SortNonPkId(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c", CollectionOptions{PrimaryKey: "uuid"})
+	require.NoError(t, err)
+	// Storage order is by uuid (a,b,c); their ids 3,1,2 are deliberately NOT in
+	// storage order, so a wrong "natural order" optimization is observable.
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"uuid":"a","id":3}`),
+		anyenc.MustParseJson(`{"uuid":"b","id":1}`),
+		anyenc.MustParseJson(`{"uuid":"c","id":2}`),
+	))
+
+	// Sorting by the non-pk field "id" must sort by value, not storage order.
+	assert.Equal(t, []int{1, 2, 3}, sortedInts(t, coll, "id", "id"))
+
+	// Sorting by the real primary key yields natural (storage) order.
+	assert.Equal(t, []string{"a", "b", "c"}, sortedStrings(t, coll, "uuid", "uuid"))
+}
