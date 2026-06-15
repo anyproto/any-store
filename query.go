@@ -637,7 +637,7 @@ func isUnsatisfiable(f query.Filter) bool {
 	return false
 }
 
-// isIDOnlyFilter returns true if the filter only references the "id" field
+// isIDOnlyFilter returns true if the filter only references the primary-key field
 // with equality or $in conditions (all fixed bounds). This enables a fast path
 // that skips CBO planning entirely for simple ID lookups.
 func (q *collQuery) isIDOnlyFilter() bool {
