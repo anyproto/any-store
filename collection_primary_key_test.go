@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 func TestCollection_PrimaryKey_DefaultId(t *testing.T) {
@@ -57,4 +59,71 @@ func TestCollection_PrimaryKey_ImmutableMismatch(t *testing.T) {
 	// Re-opening with the same key (or none) is fine.
 	_, err = fx.Collection(ctx, "c", CollectionOptions{PrimaryKey: "uuid"})
 	require.NoError(t, err)
+}
+
+func TestCollection_PrimaryKey_RoundTrip(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c", CollectionOptions{PrimaryKey: "uuid"})
+	require.NoError(t, err)
+
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"uuid":"a","n":1}`),
+		anyenc.MustParseJson(`{"uuid":"b","n":2}`),
+	))
+	assertCollCount(t, coll, 2)
+
+	doc, err := coll.FindId(ctx, "a")
+	require.NoError(t, err)
+	assert.Equal(t, 1, doc.Value().GetInt("n"))
+
+	require.NoError(t, coll.UpdateOne(ctx, anyenc.MustParseJson(`{"uuid":"a","n":11}`)))
+	doc, err = coll.FindId(ctx, "a")
+	require.NoError(t, err)
+	assert.Equal(t, 11, doc.Value().GetInt("n"))
+
+	require.NoError(t, coll.UpsertOne(ctx, anyenc.MustParseJson(`{"uuid":"b","n":22}`)))
+	require.NoError(t, coll.UpsertOne(ctx, anyenc.MustParseJson(`{"uuid":"c","n":3}`)))
+	assertCollCount(t, coll, 3)
+
+	require.NoError(t, coll.DeleteId(ctx, "c"))
+	assertCollCount(t, coll, 2)
+
+	// A document missing the primary-key field is rejected.
+	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":"x","n":9}`))
+	assert.ErrorIs(t, err, ErrDocWithoutId)
+}
+
+func TestCollection_PrimaryKey_IntValue(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c", CollectionOptions{PrimaryKey: "key"})
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"key":2,"n":20}`),
+		anyenc.MustParseJson(`{"key":1,"n":10}`),
+	))
+	doc, err := coll.FindId(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, 10, doc.Value().GetInt("n"))
+}
+
+func TestCollection_PrimaryKey_Index(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c", CollectionOptions{PrimaryKey: "uuid"})
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"uuid":"a","color":"red"}`),
+		anyenc.MustParseJson(`{"uuid":"b","color":"red"}`),
+		anyenc.MustParseJson(`{"uuid":"c","color":"blue"}`),
+	))
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"color"}}))
+
+	n, err := coll.Find(`{"color":"red"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+
+	// Deleting a doc must remove its index entry (entry suffix is the uuid key).
+	require.NoError(t, coll.DeleteId(ctx, "a"))
+	n, err = coll.Find(`{"color":"red"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
 }

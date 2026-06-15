@@ -265,7 +265,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 			return
 		}
 
-		oldItem, itemErr := newItem(doc)
+		oldItem, itemErr := q.c.newItem(doc)
 		if itemErr != nil {
 			err = itemErr
 			return
@@ -284,7 +284,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		}
 
 		var it item
-		if it, err = newItem(modifiedVal); err != nil {
+		if it, err = q.c.newItem(modifiedVal); err != nil {
 			return
 		}
 		if _, err = q.c.update(btWtx, it, oldItem); err != nil {

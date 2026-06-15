@@ -277,6 +277,29 @@ func (c *collection) compressionDisabled() bool {
 	}
 }
 
+// newItem wraps a document value, validating that it carries this collection's
+// primary-key field. Returns ErrDocWithoutId when the field is absent.
+func (c *collection) newItem(val *anyenc.Value) (item, error) {
+	objVal, err := val.Object()
+	if err != nil {
+		return item{}, err
+	}
+	if objVal.Get(c.primaryKey) == nil {
+		return item{}, ErrDocWithoutId
+	}
+	return item{val: val}, nil
+}
+
+// appendId appends the marshaled primary-key value of val to dst. The field is
+// always present here because items are validated on construction.
+func (c *collection) appendId(dst []byte, val *anyenc.Value) []byte {
+	idVal := val.Get(c.primaryKey)
+	if idVal == nil {
+		panic("document without primary key")
+	}
+	return idVal.MarshalTo(dst)
+}
+
 
 func (c *collection) FindId(ctx context.Context, docId any) (doc Doc, err error) {
 	return c.FindIdWithParser(ctx, &anyenc.Parser{}, docId)
@@ -343,7 +366,7 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 		var it item
 		for _, doc := range docs {
 			buf.Arena.Reset()
-			if it, txErr = newItem(doc); txErr != nil {
+			if it, txErr = c.newItem(doc); txErr != nil {
 				return txErr
 			}
 			if txErr = c.insertItem(tx, buf, it); txErr != nil {
@@ -356,7 +379,7 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 }
 
 func (c *collection) insertItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, it item) (err error) {
-	buf.SmallBuf = it.appendId(buf.SmallBuf[:0])
+	buf.SmallBuf = c.appendId(buf.SmallBuf[:0], it.Value())
 	if c.compressionDisabled() {
 		buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
 	} else {
@@ -386,7 +409,7 @@ func (c *collection) UpdateOne(ctx context.Context, doc *anyenc.Value) (err erro
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	var it item
-	if it, err = newItem(doc); err != nil {
+	if it, err = c.newItem(doc); err != nil {
 		return
 	}
 
@@ -450,7 +473,7 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 				if txErr != nil {
 					return false, txErr
 				}
-				modValue.Set("id", idVal)
+				modValue.Set(c.primaryKey, idVal)
 				isInsert = true
 			} else {
 				return false, loadErr
@@ -489,7 +512,7 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
-	buf.SmallBuf = it.appendId(buf.SmallBuf[:0])
+	buf.SmallBuf = c.appendId(buf.SmallBuf[:0], it.Value())
 	if prevIt.val == nil {
 		prevIt, err = c.loadById(tx, buf, buf.SmallBuf)
 		if err != nil {
@@ -535,7 +558,7 @@ func (c *collection) loadById(tx *btree.WriteTx, buf *syncpool.DocBuffer, id any
 	if err != nil {
 		return
 	}
-	return newItem(doc)
+	return c.newItem(doc)
 }
 
 func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err error) {
@@ -543,7 +566,7 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err erro
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	var it item
-	if it, err = newItem(doc); err != nil {
+	if it, err = c.newItem(doc); err != nil {
 		return
 	}
 
@@ -859,7 +882,7 @@ func (c *collection) buildIndex(tx *btree.WriteTx, idx *index) error {
 		if err != nil {
 			return err
 		}
-		it, err := newItem(doc)
+		it, err := c.newItem(doc)
 		if err != nil {
 			return err
 		}
@@ -1070,5 +1093,5 @@ func (c *collection) loadByIdRead(tx *btree.ReadTx, buf *syncpool.DocBuffer, id 
 	if err != nil {
 		return
 	}
-	return newItem(doc)
+	return c.newItem(doc)
 }
