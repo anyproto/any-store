@@ -824,6 +824,36 @@ func sketchLevelTrusted(s *IndexSketch, level int) bool {
 	return level == s.NumLevels()-1
 }
 
+// indexPopulation returns the number of documents reachable through this index:
+// its live entry count at the deepest bound level. For a SPARSE index this count
+// is far below the collection size and is itself a selectivity cut, so a range
+// fallback measured against it (rather than totalDocs) lets a sparse index win
+// natively — e.g. {a:{$ne:""}} on an index where only a few percent of docs have
+// `a` touches only those entries. Falls back to totalDocs when the sketch is
+// absent or the level is untrusted (legacy blob pending rebuild). Multikey/array
+// indexes can report more entries than documents; matching DOCUMENTS can never
+// exceed the collection, so the result is capped at totalDocs.
+func indexPopulation(idx *CBOIndex, totalDocs float64) float64 {
+	if idx.Sketch == nil {
+		return totalDocs
+	}
+	level := idx.BoundFields - 1
+	if level < 0 {
+		level = 0
+	}
+	if level >= idx.Sketch.NumLevels() {
+		level = idx.Sketch.NumLevels() - 1
+	}
+	if !sketchLevelTrusted(idx.Sketch, level) {
+		return totalDocs
+	}
+	pop := float64(idx.Sketch.EntryCount(level))
+	if pop <= 0 || pop > totalDocs {
+		return totalDocs
+	}
+	return pop
+}
+
 // selectivityForIndex returns the selectivity contribution of a specific index.
 func selectivityForIndex(idx *CBOIndex, totalDocs float64) float64 {
 	if len(idx.Bounds) == 0 {
@@ -849,7 +879,11 @@ func selectivityForIndex(idx *CBOIndex, totalDocs float64) float64 {
 		return p
 	}
 
-	return DefaultRangeSelectivity
+	// Range / non-equality fallback: bound by the index's own population so a
+	// sparse index (EntryCount << totalDocs) is credited its presence cut instead
+	// of being charged the full collection. Dense indexes have pop ≈ totalDocs, so
+	// this reduces to the plain DefaultRangeSelectivity (no behavior change).
+	return DefaultRangeSelectivity * indexPopulation(idx, totalDocs) / totalDocs
 }
 
 // estimateIndexDocsWithFieldSel estimates the number of documents an index seek will return,
@@ -894,16 +928,17 @@ func estimateIndexDocsWithFieldSel(idx *CBOIndex, totalDocs float64, fieldSel []
 			}
 		}
 		if hasFieldSel {
-			return totalDocs * sel
+			return indexPopulation(idx, totalDocs) * sel
 		}
 	}
 
-	// Fallback: multiply DefaultRangeSelectivity per bound field
+	// Fallback: multiply DefaultRangeSelectivity per bound field, against the
+	// index's own population so a sparse index is credited its presence cut.
 	sel := 1.0
 	for range idx.BoundFields {
 		sel *= DefaultRangeSelectivity
 	}
-	return totalDocs * sel
+	return indexPopulation(idx, totalDocs) * sel
 }
 
 // buildFullScanChain constructs the iterator chain for a full collection scan.

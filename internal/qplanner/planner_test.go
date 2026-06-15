@@ -125,6 +125,57 @@ func TestBuildPlan_CompoundPrefix_SelectivePrefixBeatsFullScan(t *testing.T) {
 	})
 }
 
+// TestBuildPlan_SparseIndex_NeUsesIndex is the sparse-cut regression: {a:{$ne:""}}
+// on a sparse index where only a small fraction of docs have `a`. $ne is a range
+// (two open bounds), so there is no point estimate; bounding the estimate by the
+// index's own live entry count (EntryCount, far below totalDocs for a sparse
+// index) lets the index win — scanning only the present entries is far cheaper
+// than a full collection scan. A DENSE index with the same query must still pick
+// FullScan, because $ne there genuinely touches ~the whole collection.
+func TestBuildPlan_SparseIndex_NeUsesIndex(t *testing.T) {
+	const totalDocs = 50000
+	bounds := mustParseBounds("a", `{"a": {"$ne": ""}}`)
+	require.Len(t, bounds, 2, "$ne compiles to two open bounds")
+
+	newIdx := func(entryCount int) CBOIndex {
+		sk := NewIndexSketch(DefaultSketchSize, 1)
+		for i := 0; i < entryCount; i++ {
+			// Only levelTotals[0] (== EntryCount(0)) matters here; the bucketed
+			// counts are never consulted for a range predicate.
+			sk.Increment(0, []byte{byte(i), byte(i >> 8)})
+		}
+		return CBOIndex{
+			Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+			Sketch:      sk,
+			Bounds:      bounds,
+			PointLookup: false, // $ne is not an equality lookup
+			BoundFields: 1,
+		}
+	}
+
+	filter := query.MustParseCondition(`{"a": {"$ne": ""}}`)
+
+	t.Run("sparse index (500/50000 present) uses index", func(t *testing.T) {
+		plan := BuildPlan(&PlanParams{
+			Filter:    filter,
+			TotalDocs: totalDocs,
+			Indexes:   []CBOIndex{newIdx(500)},
+		})
+		assert.Equal(t, "IndexSeek", plan.Name,
+			"sparse index presence cut must beat full scan")
+	})
+
+	t.Run("dense index ($ne ~ all) stays full scan", func(t *testing.T) {
+		plan := BuildPlan(&PlanParams{
+			Filter:    filter,
+			TotalDocs: totalDocs,
+			Indexes:   []CBOIndex{newIdx(totalDocs)},
+		})
+		assert.Equal(t, "FullScan", plan.Name,
+			"$ne on a dense index genuinely touches ~all docs; full scan is correct")
+	})
+}
+
 // TestIndexCoversFilter_RejectsUncoveredField is the defensive regression for
 // the I-04 field-coverage check: a filter touching a field not in the index is
 // never reported as covered, and empty index bounds are never covered. See
