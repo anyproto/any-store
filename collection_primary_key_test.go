@@ -8,7 +8,23 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
 )
+
+func TestCollection_PrimaryKey_ModifierUnsetsKey(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c", CollectionOptions{PrimaryKey: "uuid"})
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"uuid":"a","n":1}`)))
+
+	// $unset of the primary-key field must return ErrDocWithoutId, not panic.
+	_, err = coll.UpdateId(ctx, "a", query.MustParseModifier(`{"$unset":{"uuid":""}}`))
+	assert.ErrorIs(t, err, ErrDocWithoutId)
+
+	// The UpsertId insert path that $unsets the pk likewise errors, not panics.
+	_, err = coll.UpsertId(ctx, "z", query.MustParseModifier(`{"$unset":{"uuid":""}}`))
+	assert.ErrorIs(t, err, ErrDocWithoutId)
+}
 
 func TestCollection_PrimaryKey_DefaultId(t *testing.T) {
 	fx := newFixture(t)
@@ -47,6 +63,8 @@ func TestCollection_PrimaryKey_Validation(t *testing.T) {
 	_, err := fx.CreateCollection(ctx, "c1", CollectionOptions{PrimaryKey: "$bad"})
 	require.Error(t, err)
 	_, err = fx.CreateCollection(ctx, "c2", CollectionOptions{PrimaryKey: "a.b"})
+	require.Error(t, err)
+	_, err = fx.CreateCollection(ctx, "c3", CollectionOptions{PrimaryKey: "-foo"})
 	require.Error(t, err)
 }
 
@@ -210,4 +228,118 @@ func TestCollection_PrimaryKey_SortNonPkId(t *testing.T) {
 
 	// Sorting by the real primary key yields natural (storage) order.
 	assert.Equal(t, []string{"a", "b", "c"}, sortedStrings(t, coll, "uuid", "uuid"))
+}
+
+func TestCollection_PrimaryKey_ReopenWithData(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "test.db")
+
+	db, err := Open(ctx, path, nil)
+	require.NoError(t, err)
+	coll, err := db.CreateCollection(ctx, "c", CollectionOptions{PrimaryKey: "uuid"})
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"uuid":"a","color":"red","n":1}`),
+		anyenc.MustParseJson(`{"uuid":"b","color":"red","n":2}`),
+		anyenc.MustParseJson(`{"uuid":"c","color":"blue","n":3}`),
+	))
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"color"}}))
+	require.NoError(t, db.Close())
+
+	// Reopen: data keys + secondary index must round-trip through a fresh init.
+	db2, err := Open(ctx, path, nil)
+	require.NoError(t, err)
+	defer db2.Close()
+	coll2, err := db2.OpenCollection(ctx, "c")
+	require.NoError(t, err)
+	assert.Equal(t, "uuid", coll2.PrimaryKey())
+
+	doc, err := coll2.FindId(ctx, "b")
+	require.NoError(t, err)
+	assert.Equal(t, 2, doc.Value().GetInt("n"))
+
+	n, err := coll2.Find(`{"color":"red"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+
+	require.NoError(t, coll2.UpdateOne(ctx, anyenc.MustParseJson(`{"uuid":"a","color":"red","n":11}`)))
+	doc, err = coll2.FindId(ctx, "a")
+	require.NoError(t, err)
+	assert.Equal(t, 11, doc.Value().GetInt("n"))
+
+	require.NoError(t, coll2.DeleteId(ctx, "c"))
+	assertCollCount(t, coll2, 2)
+}
+
+func TestCollection_PrimaryKey_UniqueIndex(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c", CollectionOptions{PrimaryKey: "uuid"})
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"email"}, Unique: true}))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"uuid":"a","email":"x@y.z"}`)))
+
+	// Same email under a different primary key violates the unique constraint.
+	err = coll.Insert(ctx, anyenc.MustParseJson(`{"uuid":"b","email":"x@y.z"}`))
+	assert.ErrorIs(t, err, ErrUniqueConstraint)
+
+	// Re-inserting the same primary key is ErrDocExists, not a unique violation.
+	err = coll.Insert(ctx, anyenc.MustParseJson(`{"uuid":"a","email":"new@y.z"}`))
+	assert.ErrorIs(t, err, ErrDocExists)
+
+	// Deleting the holder frees the unique value for a new pk.
+	require.NoError(t, coll.DeleteId(ctx, "a"))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"uuid":"b","email":"x@y.z"}`)))
+}
+
+func TestCollection_PrimaryKey_InOnPk(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c", CollectionOptions{PrimaryKey: "uuid"})
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"uuid":"a","n":1}`),
+		anyenc.MustParseJson(`{"uuid":"b","n":2}`),
+		anyenc.MustParseJson(`{"uuid":"c","n":3}`),
+	))
+
+	// $in over the primary key (id-bounds fast path) returns the right rows.
+	n, err := coll.Find(`{"uuid":{"$in":["a","c"]}}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+
+	iter, err := coll.Find(`{"uuid":{"$in":["a","c"]}}`).Sort("uuid").Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+	var got []string
+	for iter.Next() {
+		d, derr := iter.Doc()
+		require.NoError(t, derr)
+		got = append(got, d.Value().GetString("uuid"))
+	}
+	require.NoError(t, iter.Err())
+	assert.Equal(t, []string{"a", "c"}, got)
+}
+
+func TestCollection_PrimaryKey_QueryUpdateDelete(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c", CollectionOptions{PrimaryKey: "uuid"})
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"uuid":"a","grp":1,"n":1}`),
+		anyenc.MustParseJson(`{"uuid":"b","grp":1,"n":2}`),
+		anyenc.MustParseJson(`{"uuid":"c","grp":2,"n":3}`),
+	))
+
+	// UpdateMany via query exercises q.c.newItem on each modified value.
+	res, err := coll.Find(`{"grp":1}`).Update(ctx, `{"$inc":{"n":10}}`)
+	require.NoError(t, err)
+	assert.Equal(t, 2, res.Modified)
+	doc, err := coll.FindId(ctx, "a")
+	require.NoError(t, err)
+	assert.Equal(t, 11, doc.Value().GetInt("n"))
+
+	// DeleteMany via query removes index/data entries keyed by the pk.
+	dres, err := coll.Find(`{"grp":1}`).Delete(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, dres.Modified)
+	assertCollCount(t, coll, 1)
 }

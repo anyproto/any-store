@@ -258,6 +258,11 @@ func validatePrimaryKey(s string) error {
 	if strings.HasPrefix(s, "$") {
 		return fmt.Errorf("any-store: invalid primary key field name: %s", s)
 	}
+	if strings.HasPrefix(s, "-") {
+		// A leading '-' is parsed by Sort as a descending marker, so the
+		// natural-order fast path could never recognize such a field.
+		return fmt.Errorf("any-store: primary key field must not start with '-': %s", s)
+	}
 	if strings.Contains(s, ".") {
 		return fmt.Errorf("any-store: primary key must be a single top-level field: %s", s)
 	}
@@ -299,7 +304,6 @@ func (c *collection) appendId(dst []byte, val *anyenc.Value) []byte {
 	}
 	return idVal.MarshalTo(dst)
 }
-
 
 func (c *collection) FindId(ctx context.Context, docId any) (doc Doc, err error) {
 	return c.FindIdWithParser(ctx, &anyenc.Parser{}, docId)
@@ -442,7 +446,11 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 			return
 		}
 		res.Modified = 1
-		return c.update(tx, item{val: newVal}, it)
+		newIt, vErr := c.newItem(newVal)
+		if vErr != nil {
+			return false, vErr
+		}
+		return c.update(tx, newIt, it)
 	}); err != nil {
 		return ModifyResult{}, err
 	}
@@ -495,12 +503,16 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 			return
 		}
 		res.Modified = 1
+		newIt, vErr := c.newItem(newVal)
+		if vErr != nil {
+			return false, vErr
+		}
 		if isInsert {
-			txErr = c.insertItem(tx, buf2, item{val: newVal})
+			txErr = c.insertItem(tx, buf2, newIt)
 			return true, txErr
 		} else {
 			res.Matched = 1
-			return c.update(tx, item{val: newVal}, prevItem)
+			return c.update(tx, newIt, prevItem)
 		}
 	}); err != nil {
 		return ModifyResult{}, err
