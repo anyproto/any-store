@@ -9,6 +9,17 @@ const (
 	CostFilter    = 0.5  // Cost of in-memory evaluation of a predicate
 	CostSortSwap  = 0.25 // Cost of in-memory sort (includes re-fetch overhead after sorting)
 
+	// CostMaterialize is the per-document cost of buffering a row into the slice a
+	// full-scan sort must build before it can order anything. It models what the
+	// n*log2(n)*CostSortSwap term does not: Go heap allocation, GC pressure and
+	// pointer chasing for materializing the whole result set. It is the linear
+	// counterpart that lets an order-providing index scan (which streams, and can
+	// early-terminate under LIMIT) win when it should — WITHOUT a multiplicative
+	// discount on the scan, which would distort the random-fetch math that keeps a
+	// poorly-selective filter from scanning most of an index. Applied only to the
+	// full-scan sort path.
+	CostMaterialize = 1.0
+
 	// Fallback Heuristics
 	DefaultRangeSelectivity = 0.5 // Default assumption: a range predicate matches ~50% of the collection
 

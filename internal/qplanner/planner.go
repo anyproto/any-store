@@ -688,7 +688,12 @@ func computeFullScanCost(totalDocs, estimatedYield float64, needSort, idBoundsSe
 	}
 	cost := (totalDocs * perDocCost) + (totalDocs * CostFilter)
 	if needSort {
-		cost += sortCost(estimatedYield)
+		// A full-scan sort must materialize the filtered rows into a slice before
+		// it can order them: a linear Go allocation/GC cost the n*log2(n) swap term
+		// alone understates. Charging it here lets an order-providing index scan win
+		// for selective or LIMIT-capped queries, while the index scan's own
+		// per-row fetch cost still protects the poorly-selective case.
+		cost += sortCost(estimatedYield) + (estimatedYield * CostMaterialize)
 	}
 	return cost
 }

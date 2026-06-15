@@ -296,6 +296,42 @@ func TestBuildPlan_IndexScan_SortWithoutLimit(t *testing.T) {
 	assert.Equal(t, "IndexScan", plan.Name)
 }
 
+// TestComputeFullScanCost_SortAddsMaterialize pins the exact-sort boost: a
+// full-scan sort pays both the n*log2(n) swap term AND a linear CostMaterialize
+// per buffered row, so an order-providing index scan (which streams) is favored.
+func TestComputeFullScanCost_SortAddsMaterialize(t *testing.T) {
+	const totalDocs = 1000.0
+	const yield = 800.0
+	noSort := computeFullScanCost(totalDocs, yield, false, false)
+	withSort := computeFullScanCost(totalDocs, yield, true, false)
+
+	want := noSort + sortCost(yield) + yield*CostMaterialize
+	assert.InDelta(t, want, withSort, 1e-9)
+	assert.Greater(t, withSort-noSort, sortCost(yield),
+		"materialize must add cost beyond the swap term alone")
+}
+
+// TestBuildPlan_PoorSelectivitySort_StaysFullScan is the protection regression
+// for the exact-sort boost: a poorly-selective filter on a NON-indexed field with
+// an ORDER BY that an index satisfies must NOT flip to an ordered index scan,
+// because that scan would random-fetch the whole collection to evaluate the
+// filter. The per-row fetch cost keeps full-scan+sort cheaper. (Mirrors the
+// expert-validated "WHERE unindexed_b=x ORDER BY a" failure mode.)
+func TestBuildPlan_PoorSelectivitySort_StaysFullScan(t *testing.T) {
+	plan := BuildPlan(&PlanParams{
+		Filter:    query.MustParseCondition(`{"b": 5}`), // b is not in the index
+		Sorter:    mustParseSort("a"),
+		TotalDocs: 50000,
+		Indexes: []CBOIndex{{
+			Info:      &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+			Sketch:    mockSketch(0),
+			ExactSort: true, // covers ORDER BY a, but has no bounds (filter is on b)
+		}},
+	})
+	assert.Equal(t, "FullScan", plan.Name,
+		"ordered scan that must fetch ~all docs to filter must lose to full-scan+sort")
+}
+
 func TestBuildPlan_LowSelectivity_FullScan(t *testing.T) {
 	// When index estimates most of the collection, full scan is cheaper
 	// because sequential reads + filter is cheaper than seek + random fetch + filter.
