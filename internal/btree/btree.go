@@ -4281,6 +4281,95 @@ func (c *Cursor) CountUntil(endKey []byte, endInclusive bool) (int, error) {
 	return count, nil
 }
 
+// keyRank returns the approximate fraction (0..1) of the tree's entries that sort
+// strictly before key, via SQLite-style B-tree page interpolation. At each
+// interior node it takes the descended child index over the child count, weighted
+// by the product of the ancestors' inverse fanouts; the leaf contributes its
+// in-page position. This assumes uniform fanout (each child subtree holds roughly
+// the same number of entries) — exact subtree counts are not stored. Because a
+// self-balancing B-tree devotes pages in proportion to data density, the estimate
+// tracks skew far better than a value-domain min/max interpolation would, and is
+// more than accurate enough for the planner's "is this range selective enough to
+// beat a full scan" decision. It reads one page per level (tree depth ≈ 3–5),
+// exactly the pages a Seek touches, and holds no page across the call.
+func (c *Cursor) keyRank(key []byte) (float64, error) {
+	pg, err := c.bt.getPage(c.bt.rootPage)
+	if err != nil {
+		return 0, err
+	}
+	var r, weight float64 = 0, 1
+	depth := 0
+	for pg.header.isInterior() {
+		if depth >= btCursorMaxDepth {
+			c.bt.pager.releasePage(pg)
+			return 0, ErrCorrupt
+		}
+		depth++
+		n := int(pg.header.cellCount)
+		childPgno, cellIdx, serr := c.bt.searchInterior(pg, key)
+		if serr != nil {
+			c.bt.pager.releasePage(pg)
+			return 0, serr
+		}
+		// fanout = n separators + the right child = n+1 children. cellIdx is the
+		// number of children entirely to the left of the descended child.
+		fanout := float64(n + 1)
+		r += weight * float64(cellIdx) / fanout
+		weight /= fanout
+		c.bt.pager.releasePage(pg)
+		if pg, err = c.bt.descendChild(childPgno); err != nil {
+			return 0, err
+		}
+	}
+	n := int(pg.header.cellCount)
+	idx, _, serr := c.bt.searchLeaf(pg, key)
+	c.bt.pager.releasePage(pg)
+	if serr != nil {
+		return 0, serr
+	}
+	if n > 0 {
+		r += weight * float64(idx) / float64(n)
+	}
+	if r < 0 {
+		r = 0
+	} else if r > 1 {
+		r = 1
+	}
+	return r, nil
+}
+
+// RangeFraction estimates the fraction (0..1) of the tree's entries whose key
+// falls in the range [low, high), using B-tree page interpolation (see keyRank).
+// A nil low means unbounded-below (-inf, fraction 0); a nil high means
+// unbounded-above (+inf, fraction 1) — so one-sided ranges like {a:{$gt:v}} cost
+// only a single descent. The result is the difference of the two ranks, clamped
+// to [0,1]; bound inclusivity is ignored (an at-most-one-entry rounding the cost
+// model does not care about). It does not move the cursor.
+func (c *Cursor) RangeFraction(low, high []byte) (float64, error) {
+	var lo, hi float64 = 0, 1
+	if len(low) > 0 {
+		r, err := c.keyRank(low)
+		if err != nil {
+			return 0, err
+		}
+		lo = r
+	}
+	if len(high) > 0 {
+		r, err := c.keyRank(high)
+		if err != nil {
+			return 0, err
+		}
+		hi = r
+	}
+	f := hi - lo
+	if f < 0 {
+		f = 0
+	} else if f > 1 {
+		f = 1
+	}
+	return f, nil
+}
+
 // NewCursor creates a new cursor for the B-tree.
 // The btree data is copied into the Cursor to avoid a separate heap allocation.
 func (bt *btree) NewCursor() *Cursor {
