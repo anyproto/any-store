@@ -3,6 +3,8 @@ package anystore
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -18,6 +20,9 @@ import (
 type Collection interface {
 	// Name returns the name of the collection.
 	Name() string
+
+	// PrimaryKey returns the document field used as this collection's primary key.
+	PrimaryKey() string
 
 	// FindId finds a document by its ID.
 	// Returns the document or an error if the document is not found.
@@ -133,6 +138,11 @@ type collection struct {
 
 	compression Compression // 0 = use db default
 
+	// primaryKey is the document field whose value is the btree key. Resolved
+	// once in init (default "id") and never mutated after, so the data and query
+	// paths read it lock-free.
+	primaryKey string
+
 	// sketchReadBuf is reused scratch for decoding persisted sketch bytes during
 	// the advisory reload (reloadSketch). Only touched under c.mu, so a single
 	// per-collection buffer is safe and keeps the stale-reload path from
@@ -182,13 +192,22 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 	}
 	c.ns = ns
 
-	return c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
+	// load reads per-collection config + index metadata. When invoked within a
+	// write tx (CreateCollection) it MUST read through the writer's own view so
+	// it observes config written earlier in this same uncommitted tx — a fresh
+	// read tx would see only committed state and miss it (read-your-writes,
+	// matching SQLite where a write tx's reads go through the shared page cache).
+	load := func(tx *btree.ReadTx) (err error) {
 		// Load per-collection config
 		cfg, err := c.db.loadCollConfig(tx, c.name)
 		if err != nil {
 			return err
 		}
 		c.compression = cfg.Compression
+		c.primaryKey = cfg.PrimaryKey
+		if c.primaryKey == "" {
+			c.primaryKey = "id"
+		}
 
 		idxInfos, err := c.db.getIndexInfos(tx, c.name)
 		if err != nil {
@@ -210,13 +229,39 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 		}
 		c.storeIndexes(idxs)
 		return nil
-	})
+	}
+
+	if wtx != nil {
+		return load(&wtx.ReadTx)
+	}
+	return c.db.doReadTx(ctx, load)
 }
 
 func (c *collection) Name() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.name
+}
+
+func (c *collection) PrimaryKey() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.primaryKey
+}
+
+// validatePrimaryKey checks a primary-key field name: non-empty, no "$" prefix,
+// and a single top-level field (no "." path separators).
+func validatePrimaryKey(s string) error {
+	if s == "" {
+		return fmt.Errorf("any-store: primary key field is empty")
+	}
+	if strings.HasPrefix(s, "$") {
+		return fmt.Errorf("any-store: invalid primary key field name: %s", s)
+	}
+	if strings.Contains(s, ".") {
+		return fmt.Errorf("any-store: primary key must be a single top-level field: %s", s)
+	}
+	return nil
 }
 
 // compressionDisabled returns whether compression is disabled for this collection.
