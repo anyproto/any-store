@@ -143,6 +143,27 @@ type collConfig struct {
 `collection.init` (`collection.go:166`) resolves `c.primaryKey = cfg.PrimaryKey`
 with a fallback to `"id"` when empty.
 
+**Create-handle visibility (verified).** During `CreateCollection` the config is
+written inside an uncommitted write tx, then `newCollection`→`init` runs. Today
+`init` loads config via a *fresh* `c.db.doReadTx(ctx, …)` whose ctx does not
+carry the write tx, so it reads the committed snapshot and **cannot see** the
+just-written config (experimentally confirmed: the existing `Compression` option
+is likewise ignored on the create handle until reopen). The engine *does* expose
+the writer's uncommitted state through the write tx's own embedded `ReadTx`. Fix:
+`init` reads config + index metadata through `wtx` when non-nil (mirroring how its
+`getNamespace` already uses `wtx`); the `nil` (open) path keeps using `doReadTx`.
+This makes the primary key correct on the create handle and incidentally fixes
+the latent compression gap. No test depends on the old behavior.
+
+This is the SQLite-aligned behavior (confirmed against `sqlitec/src`): a SQLite
+connection has one transaction state per DB (`sqlite3BtreeBeginTrans`,
+btree.c:3811) and all reads in a write tx go through the shared page cache
+(`getPageNormal`, pager.c:5552), so they see the writer's uncommitted pages,
+including just-written catalog/schema rows (read back during the in-transaction
+reparse, build.c → vdbe.c `OP_ParseSchema`). SQLite has no notion of a fresh
+committed-snapshot read inside an open write tx; the old any-store sub-read was
+behaving like a separate connection, which is the defect being corrected.
+
 ## 7. Internal key derivation (`item.go`, `collection.go`, `index.go`)
 
 - Add field `primaryKey string` to `collection`.
