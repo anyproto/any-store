@@ -127,3 +127,36 @@ func TestCollection_PrimaryKey_Index(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
 }
+
+func TestCollection_PrimaryKey_FilterByNonPkId(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c", CollectionOptions{PrimaryKey: "uuid"})
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"uuid":"a","id":5}`),
+		anyenc.MustParseJson(`{"uuid":"b","id":6}`),
+	))
+
+	// "id" is an ordinary field here (NOT the primary key). It must match by
+	// value, not be treated as a data-namespace key seek.
+	n, err := coll.Find(`{"id":5}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+
+	iter, err := coll.Find(`{"id":5}`).Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+	var got []string
+	for iter.Next() {
+		d, derr := iter.Doc()
+		require.NoError(t, derr)
+		got = append(got, d.Value().GetString("uuid"))
+	}
+	require.NoError(t, iter.Err())
+	assert.Equal(t, []string{"a"}, got)
+
+	// Filtering by the real primary key still works.
+	n, err = coll.Find(`{"uuid":"b"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+}

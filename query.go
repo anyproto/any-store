@@ -414,9 +414,9 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 		return 0, nil
 	}
 
-	// Compute idBounds only if filter references "id" field
+	// Compute idBounds only if filter references the primary-key field
 	var idBounds query.Bounds
-	if ib := q.cond.IndexBounds("id", nil); len(ib) != 0 {
+	if ib := q.cond.IndexBounds(q.c.primaryKey, nil); len(ib) != 0 {
 		idBounds = ib
 	}
 
@@ -560,8 +560,8 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 		q.cond = query.All{}
 	}
 
-	// handle "id" field
-	if idBounds := q.cond.IndexBounds("id", nil); len(idBounds) != 0 {
+	// handle the primary-key field
+	if idBounds := q.cond.IndexBounds(q.c.primaryKey, nil); len(idBounds) != 0 {
 		qb.idBounds = idBounds
 	}
 
@@ -636,17 +636,17 @@ func isUnsatisfiable(f query.Filter) bool {
 // with equality or $in conditions (all fixed bounds). This enables a fast path
 // that skips CBO planning entirely for simple ID lookups.
 func (q *collQuery) isIDOnlyFilter() bool {
-	return isIDOnlyFilterNode(q.cond)
+	return isIDOnlyFilterNode(q.cond, q.c.primaryKey)
 }
 
-func isIDOnlyFilterNode(f query.Filter) bool {
+func isIDOnlyFilterNode(f query.Filter, pk string) bool {
 	switch ft := f.(type) {
 	case query.Key:
-		return len(ft.Path) == 1 && ft.Path[0] == "id"
+		return len(ft.Path) == 1 && ft.Path[0] == pk
 	case query.And:
-		// All children must be id-only
+		// All children must be primary-key-only
 		for _, child := range ft {
-			if !isIDOnlyFilterNode(child) {
+			if !isIDOnlyFilterNode(child, pk) {
 				return false
 			}
 		}
@@ -656,7 +656,7 @@ func isIDOnlyFilterNode(f query.Filter) bool {
 		// (see query/cond_parse.go:103). Delegate to the value arm so $and
 		// JSON syntax enjoys the same id-only fast path as comma-spelled
 		// filters like `{"a":1,"b":2}` (which parse to value query.And).
-		return isIDOnlyFilterNode(*ft)
+		return isIDOnlyFilterNode(*ft, pk)
 	default:
 		return false
 	}
