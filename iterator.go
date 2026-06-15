@@ -118,7 +118,7 @@ func (pi *planIterator) Doc() (Doc, error) {
 			return nil, perr
 		}
 	}
-	return newItem(doc)
+	return pi.qb.coll.newItem(doc)
 }
 
 func (pi *planIterator) Err() error {
