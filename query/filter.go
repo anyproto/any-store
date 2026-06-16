@@ -655,6 +655,49 @@ func (t Text) String() string {
 	return fmt.Sprintf(`{"$text":{"$search":%q}}`, t.Search)
 }
 
+// presenceNullProbe is an explicit JSON null used by GuaranteesPresence to test
+// whether a predicate rejects a present-but-null value, as distinct from a
+// missing field (which probes as a nil *anyenc.Value).
+var presenceNullProbe = anyenc.MustParseJson("null")
+
+// GuaranteesPresence reports whether every document matching f must carry a
+// present, non-null value at fieldName. It is true only when some top-level
+// conjunct constrains fieldName with a predicate that rejects BOTH a missing
+// field (a nil value) and an explicit null — exactly the two cases a sparse
+// index omits (see index.writeValues: it drops a key when any indexed field is
+// nil or TypeNull).
+//
+// The planner uses this to decide whether a SPARSE index can represent the whole
+// matching set: a sparse index that omits some matching document would silently
+// drop rows if seeked. Probing the field's own sub-filter with Ok keeps this in
+// lockstep with match semantics, so it is exact rather than a rule-of-thumb —
+// e.g. {$exists:true} yields false here because an explicit-null document
+// matches $exists:true yet is absent from the sparse index. An OR, a
+// $exists:false, a $ne, an equality-to-null, an $in containing null, or no
+// predicate on the field at all all yield false, keeping that sparse index out
+// of consideration (the planner then falls back to a complete index or scan).
+func GuaranteesPresence(f Filter, fieldName string) bool {
+	switch ft := f.(type) {
+	case Key:
+		if strings.Join(ft.Path, ".") == fieldName {
+			var buf syncpool.DocBuffer
+			return !ft.Filter.Ok(nil, &buf) && !ft.Filter.Ok(presenceNullProbe, &buf)
+		}
+		return false
+	case And:
+		for _, sub := range ft {
+			if GuaranteesPresence(sub, fieldName) {
+				return true
+			}
+		}
+		return false
+	case *And:
+		return GuaranteesPresence(*ft, fieldName)
+	default:
+		return false
+	}
+}
+
 type Exists struct{}
 
 func (e Exists) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {

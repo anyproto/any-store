@@ -408,6 +408,12 @@ func BuildPlan(params *PlanParams) *Plan {
 		if len(idx.Bounds) == 0 {
 			continue
 		}
+		// A sparse index omits documents missing/null in any of its fields, so it
+		// can only answer a query that constrains every field to be present —
+		// otherwise seeking it would silently drop matching rows.
+		if !sparseIndexComplete(idx, params.Filter) {
+			continue
+		}
 
 		// Estimate docs matching this index seek
 		e := estimateIndexDocsWithFieldSel(idx, totalDocs, fieldSelectivity)
@@ -503,6 +509,13 @@ func BuildPlan(params *PlanParams) *Plan {
 		for i := range params.Indexes {
 			idx := &params.Indexes[i]
 			if !idx.ExactSort {
+				continue
+			}
+			// Same sparse-completeness gate as Plan B: a sparse index that omits
+			// some matching document must not drive the scan even when it covers
+			// the sort order (e.g. Sort(a) over an unconstrained sparse index on a
+			// would drop every null/missing-a document).
+			if !sparseIndexComplete(idx, params.Filter) {
 				continue
 			}
 
@@ -930,6 +943,26 @@ func interpolateRangeSel(tx *btree.ReadTx, idx *CBOIndex) float64 {
 		f = 1
 	}
 	return f
+}
+
+// sparseIndexComplete reports whether idx can represent every document matching
+// filter. A non-sparse index always can: a missing field is encoded as null
+// (anyenc marshals a nil value to TypeNull), so every document gets a key. A
+// SPARSE index instead drops any key with a missing or null field, so it is
+// complete only when the query guarantees all of its fields are present and
+// non-null. Without this gate the cost model would happily pick a sparse index
+// for a query that leaves one of its fields unconstrained (or constrains it with
+// $exists:false) and silently drop the rows that index never stored.
+func sparseIndexComplete(idx *CBOIndex, filter query.Filter) bool {
+	if !idx.Info.Sparse {
+		return true
+	}
+	for _, field := range idx.Info.FieldNames {
+		if !query.GuaranteesPresence(filter, field) {
+			return false
+		}
+	}
+	return true
 }
 
 // selectivityForIndex returns the selectivity contribution of a specific index.

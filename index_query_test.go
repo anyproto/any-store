@@ -2946,7 +2946,9 @@ func TestIndex_ArrayNested_NullElementInArray_IndexedAndQueryable(t *testing.T) 
 
 	// Sub B: sparse contrast. The null element is still indexed (v is an
 	// array, so the sparse guard does not fire); only the missing-field doc
-	// is skipped.
+	// is skipped from the index. It is NOT, however, skipped from the result:
+	// {tags:null} matches a missing field too (see Sub A), so the planner must
+	// not seek the sparse index here — doing so would silently drop id:2.
 	fxB := newFixture(t)
 	collB, err := fxB.CreateCollection(ctx, "sp")
 	require.NoError(t, err)
@@ -2958,7 +2960,7 @@ func TestIndex_ArrayNested_NullElementInArray_IndexedAndQueryable(t *testing.T) 
 	assertIndexLen(t, collB.GetIndexes()[0], 4)
 	nullB, err := collB.Find(`{"tags":null}`).Count(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, 1, nullB)
+	assert.Equal(t, 2, nullB)
 
 	// Sub C: duplicate nulls collapse within a doc.
 	fxC := newFixture(t)

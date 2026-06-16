@@ -1406,7 +1406,10 @@ func TestIndex_UniqueSparse_SparseCompoundArrayLeadMissingTrail(t *testing.T) {
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":2,"a":[1,2],"b":7}`)))
 	assertIndexLen(t, coll.GetIndexes()[0], 3)
 
-	// all matches are id:2; id:1 is not indexed.
+	// id:1 is absent from the sparse (a,b) index (its b is missing), but it still
+	// MATCHES any query that doesn't require b — its a=[1,2] contains 1. The
+	// planner must therefore not seek the sparse index for a b-unconstrained query,
+	// or it would silently drop id:1.
 	collectIds := func(q Query) []string {
 		iter, iterErr := q.Iter(ctx)
 		require.NoError(t, iterErr)
@@ -1424,6 +1427,8 @@ func TestIndex_UniqueSparse_SparseCompoundArrayLeadMissingTrail(t *testing.T) {
 	assertQueryCount(t, coll.Find(`{"a":1,"b":7}`), 1)
 	assert.Equal(t, []string{"2"}, collectIds(coll.Find(`{"a":1,"b":7}`)))
 	assertQueryCount(t, coll.Find(`{"a":2,"b":7}`), 1)
-	assertQueryCount(t, coll.Find(`{"a":1}`), 1)
-	assert.Equal(t, []string{"2"}, collectIds(coll.Find(`{"a":1}`)))
+	// b is unconstrained, so the sparse (a,b) index is ineligible and both docs
+	// (which each contain a=1) are returned via a complete plan.
+	assertQueryCount(t, coll.Find(`{"a":1}`), 2)
+	assert.Equal(t, []string{"1", "2"}, collectIds(coll.Find(`{"a":1}`)))
 }
