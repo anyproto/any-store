@@ -229,7 +229,22 @@ type IndexInfo struct {
 	Unique bool `json:"unique"`
 
 	// Sparse indicates whether the index is sparse, indexing only documents
-	// with the specified fields.
+	// with a present, non-null value for every indexed field.
+	//
+	// Null is treated the same as missing: a document whose indexed field is
+	// explicitly null is NOT indexed (this differs from MongoDB, where a sparse
+	// index stores present-but-null values). The choice keeps sparse indexing
+	// consistent with query matching, where {field: null} matches both a null
+	// and a missing field.
+	//
+	// As a consequence, the planner only uses a sparse index for a query that
+	// guarantees every indexed field is present and non-null; otherwise it would
+	// silently drop matching documents the index never stored. In particular a
+	// query whose only constraint on a field is {$exists: true} cannot use a
+	// sparse index here, because an explicit-null document matches $exists:true
+	// yet is absent from the index — such a query falls back to a complete index
+	// or a full scan. For a unique sparse index, several documents with a missing
+	// or null field coexist freely, since none of them are indexed.
 	Sparse bool `json:"sparse"`
 
 	// Kind selects the index type (range by default, full-text, or vector).

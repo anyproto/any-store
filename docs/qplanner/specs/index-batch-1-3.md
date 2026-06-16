@@ -455,6 +455,14 @@ Operations:
 Status: PORTABLE
 Concept: Sparse index skips documents where the indexed field is null.
   Null is treated the same as missing for sparse indexes.
+  DIVERGENCE FROM MongoDB (intentional): MongoDB indexes present-but-null
+  values in a sparse index and only skips missing fields; we skip both.
+  This keeps sparse indexing consistent with our query matching, where
+  {field:null} matches both a null and a missing field. Consequence: the
+  planner uses a sparse index only when the query guarantees every indexed
+  field is present AND non-null (see qplanner.sparseIndexComplete /
+  query.GuaranteesPresence); a field constrained solely by {$exists:true}
+  is therefore NOT enough to make a sparse index eligible here.
 Inspiration: General sparse semantics (our code checks for null in writeValues)
 Operations:
   1. Create collection, EnsureIndex Sparse=true on "a"
