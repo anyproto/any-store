@@ -589,6 +589,12 @@ func (c *Conn) Stats(cmd Cmd) (result string, err error) {
 	}
 	fmt.Fprintf(&b, "Docs size:\t%s\n", formatKiB(st.DocsSizeBytes))
 	fmt.Fprintf(&b, "Indexes size:\t%s\n", formatKiB(st.IndexesSizeBytes))
+	if len(st.VectorIndexes) > 0 {
+		fmt.Fprintf(&b, "Vector indexes size:\t%s\n", formatKiB(st.VectorIndexesSizeBytes))
+	}
+	if len(st.FtsIndexes) > 0 {
+		fmt.Fprintf(&b, "Full-text indexes size:\t%s\n", formatKiB(st.FtsIndexesSizeBytes))
+	}
 	fmt.Fprintf(&b, "Total size:\t%s\n", formatKiB(st.TotalSizeBytes))
 
 	if len(st.Indexes) > 0 {
@@ -616,6 +622,19 @@ func (c *Conn) Stats(cmd Cmd) (result string, err error) {
 			d := idx.SketchDistribution
 			fmt.Fprintf(&b, "    distribution: max=%d  mean=%.1f  p50=%d p90=%d p99=%d  skew=%.1fx\n",
 				d.MaxBucket, d.MeanNonEmpty, d.P50, d.P90, d.P99, d.Skew)
+		}
+	}
+
+	if len(st.VectorIndexes) > 0 {
+		b.WriteString("\nVector indexes:\n")
+		for _, vx := range st.VectorIndexes {
+			fmt.Fprintf(&b, "  %s [%s] dim=%d metric=%s mode=%s quant=%s\n",
+				vx.Name, vx.Field, vx.Dim, vx.Metric, vx.Mode, vx.Quantization)
+			fmt.Fprintf(&b, "    nodes=%d  live=%d  deleted=%d  M=%d  efSearch=%d\n",
+				vx.NodeCount, vx.LiveCount, vx.DeletedCount, vx.M, vx.EfSearch)
+			fmt.Fprintf(&b, "    size=%s (vectors=%s graph=%s mapping=%s meta=%s)\n",
+				formatKiB(vx.SizeBytes), formatKiB(vx.VectorBytes), formatKiB(vx.GraphBytes),
+				formatKiB(vx.MappingBytes), formatKiB(vx.MetaBytes))
 		}
 	}
 
