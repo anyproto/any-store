@@ -222,6 +222,11 @@ type CBOIndex struct {
 	Bounds  query.Bounds
 	Reverse []bool // per-field reverse flags
 
+	// Ns is the index's B-tree namespace, used by BuildPlan to estimate range
+	// selectivity via page interpolation (RangeFraction) at plan time. May be nil
+	// in unit tests, in which case the planner falls back to DefaultRangeSelectivity.
+	Ns *btree.Namespace
+
 	// BoundFields is the number of index fields covered by the bound chain.
 	// Sketch estimates are only valid when BoundFields == len(Info.FieldNames).
 	BoundFields int
@@ -239,6 +244,14 @@ type CBOIndex struct {
 	// equality-pinned start wins). shouldReverse reads idx.Reverse[SortMatchStart]
 	// to decide forward vs reverse scan. Only load-bearing when ExactSort is true.
 	SortMatchStart int
+
+	// rangeSel is the within-index selectivity of this index's RANGE bounds,
+	// estimated by BuildPlan via B-tree page interpolation (sum of RangeFraction
+	// over the bounds). It is the real ordered-stats estimate the hash sketch
+	// cannot give for ranges. Zero means "not computed" (no read txn / namespace,
+	// or an equality lookup that uses the sketch instead) — the estimators then
+	// fall back to DefaultRangeSelectivity. Planner-internal; not set by callers.
+	rangeSel float64
 }
 
 // BuildPlan constructs an iterator chain using the Cost-Based Optimizer.
@@ -339,7 +352,7 @@ func BuildPlan(params *PlanParams) *Plan {
 	for i := range params.Indexes {
 		idx := &params.Indexes[i]
 		if len(idx.Info.FieldNames) == 1 && idx.PointLookup && idx.Sketch != nil && len(idx.Bounds) > 0 {
-			est := float64(idx.Sketch.Estimate(idx.Bounds[0].Start))
+			est := float64(idx.Sketch.Estimate(0, idx.Bounds[0].Start))
 			if est > 0 && nFieldSel < len(fieldSelBuf) {
 				fieldSelBuf[nFieldSel] = fieldSelEntry{
 					field: idx.Info.FieldNames[0],
@@ -352,6 +365,30 @@ func BuildPlan(params *PlanParams) *Plan {
 	var fieldSelectivity []fieldSelEntry
 	if nFieldSel > 0 {
 		fieldSelectivity = fieldSelBuf[:nFieldSel]
+	}
+
+	// Range selectivity via B-tree page interpolation. A range predicate
+	// ($gt/$lt/$ne/...) has no point estimate — the hash sketch is unordered — so
+	// for each non-equality index we interpolate the fraction of index entries its
+	// bounds cover directly from the live index B-tree (one descent per endpoint).
+	// This is what lets a selective range on a dense index beat a full scan; for a
+	// sparse index it composes with the EntryCount bound as e = rangeSel·EntryCount.
+	if params.Tx != nil {
+		for i := range params.Indexes {
+			idx := &params.Indexes[i]
+			if idx.PointLookup || idx.Ns == nil || len(idx.Bounds) == 0 {
+				continue
+			}
+			// Interpolation counts index ENTRIES. For a multikey/array index an
+			// entry-fraction no longer maps to a document-fraction (one document
+			// fans out to many entries, and dedup collapses them), so the estimate
+			// would be biased; fall back to the EntryCount-bounded default there.
+			// Entries == documents (no fan-out) is exactly EntryCount(0) <= totalDocs.
+			if idx.Sketch != nil && idx.Sketch.EntryCount(0) > uint64(params.TotalDocs) {
+				continue
+			}
+			idx.rangeSel = interpolateRangeSel(params.Tx, idx)
+		}
 	}
 
 	// ---- Plan B: Index Seek (Filtering Priority) ----
@@ -688,7 +725,12 @@ func computeFullScanCost(totalDocs, estimatedYield float64, needSort, idBoundsSe
 	}
 	cost := (totalDocs * perDocCost) + (totalDocs * CostFilter)
 	if needSort {
-		cost += sortCost(estimatedYield)
+		// A full-scan sort must materialize the filtered rows into a slice before
+		// it can order them: a linear Go allocation/GC cost the n*log2(n) swap term
+		// alone understates. Charging it here lets an order-providing index scan win
+		// for selective or LIMIT-capped queries, while the index scan's own
+		// per-row fetch cost still protects the poorly-selective case.
+		cost += sortCost(estimatedYield) + (estimatedYield * CostMaterialize)
 	}
 	return cost
 }
@@ -770,9 +812,11 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 				nUsed++
 			}
 
-			if isEquality && idx.Sketch != nil && fi == 0 && len(idx.Info.FieldNames) == 1 {
-				// Use sketch estimate for single-field equality predicates
-				est := idx.Sketch.Estimate(bounds[0].Start)
+			if isEquality && idx.Sketch != nil && fi == 0 && sketchLevelTrusted(idx.Sketch, 0) {
+				// Equality on the index's leading field: the level-0 sketch holds
+				// the count for that field's value alone (the prefix), so this is
+				// accurate for both single-field and compound indexes.
+				est := idx.Sketch.Estimate(0, bounds[0].Start)
 				p := float64(est) / totalDocs
 				if p > 1.0 {
 					p = 1.0
@@ -809,15 +853,89 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 	return pTotal
 }
 
+// sketchLevelTrusted reports whether a sketch level holds usable counts. After a
+// legacy single-level blob is loaded into a multi-level sketch (NeedsRebuild),
+// only the full-key level carries data; the shallow prefix levels are empty
+// until a rescan or fresh writes repopulate them, so estimating from them would
+// be falsely optimistic. Treat shallow levels of a not-yet-rebuilt sketch as
+// untrusted and let the caller fall back to DefaultRangeSelectivity.
+func sketchLevelTrusted(s *IndexSketch, level int) bool {
+	if !s.NeedsRebuild() {
+		return true
+	}
+	return level == s.NumLevels()-1
+}
+
+// indexPopulation returns the number of documents reachable through this index:
+// its live entry count at the deepest bound level. For a SPARSE index this count
+// is far below the collection size and is itself a selectivity cut, so a range
+// fallback measured against it (rather than totalDocs) lets a sparse index win
+// natively — e.g. {a:{$ne:""}} on an index where only a few percent of docs have
+// `a` touches only those entries. Falls back to totalDocs when the sketch is
+// absent or the level is untrusted (legacy blob pending rebuild). Multikey/array
+// indexes can report more entries than documents; matching DOCUMENTS can never
+// exceed the collection, so the result is capped at totalDocs.
+func indexPopulation(idx *CBOIndex, totalDocs float64) float64 {
+	if idx.Sketch == nil {
+		return totalDocs
+	}
+	level := idx.BoundFields - 1
+	if level < 0 {
+		level = 0
+	}
+	if level >= idx.Sketch.NumLevels() {
+		level = idx.Sketch.NumLevels() - 1
+	}
+	if !sketchLevelTrusted(idx.Sketch, level) {
+		return totalDocs
+	}
+	pop := float64(idx.Sketch.EntryCount(level))
+	if pop <= 0 || pop > totalDocs {
+		return totalDocs
+	}
+	return pop
+}
+
+// interpolateRangeSel estimates the fraction of this index's entries that its
+// range bounds cover, by interpolating positions in the live index B-tree. The
+// bounds of a $ne are a two-piece union ((-inf,v) ∪ (v,+inf)), so the per-bound
+// fractions are summed. Returns 0 (→ caller falls back to DefaultRangeSelectivity)
+// on any read error, leaving the planner's degraded behavior unchanged.
+func interpolateRangeSel(tx *btree.ReadTx, idx *CBOIndex) float64 {
+	cur := tx.NewCursor(idx.Ns)
+	defer cur.Close()
+	var f float64
+	for _, b := range idx.Bounds {
+		bf, err := cur.RangeFraction(b.Start, b.End)
+		if err != nil {
+			return 0
+		}
+		f += bf
+	}
+	if f <= 0 {
+		return 0
+	}
+	if f > 1 {
+		f = 1
+	}
+	return f
+}
+
 // selectivityForIndex returns the selectivity contribution of a specific index.
 func selectivityForIndex(idx *CBOIndex, totalDocs float64) float64 {
 	if len(idx.Bounds) == 0 {
 		return 1.0
 	}
 
-	// Only use sketch when bounds cover ALL index fields
-	if idx.PointLookup && idx.Sketch != nil && idx.BoundFields == len(idx.Info.FieldNames) {
-		est := idx.Sketch.Estimate(idx.Bounds[0].Start)
+	// Use the sketch for any equality prefix: the level-(BoundFields-1) row holds
+	// the joint count for the first BoundFields fields, so a partial prefix on a
+	// compound index (e.g. a=x on (a,b)) gets a real estimate instead of the
+	// DefaultRangeSelectivity fallback. idx.Bounds[0].Start is the encoded prefix
+	// of exactly those fields.
+	if idx.PointLookup && idx.Sketch != nil && idx.BoundFields >= 1 &&
+		idx.BoundFields <= idx.Sketch.NumLevels() &&
+		sketchLevelTrusted(idx.Sketch, idx.BoundFields-1) {
+		est := idx.Sketch.Estimate(idx.BoundFields-1, idx.Bounds[0].Start)
 		p := float64(est) / totalDocs
 		if p <= 0 {
 			p = 0.0001
@@ -828,7 +946,18 @@ func selectivityForIndex(idx *CBOIndex, totalDocs float64) float64 {
 		return p
 	}
 
-	return DefaultRangeSelectivity
+	// Range / non-equality fallback: bound by the index's own population so a
+	// sparse index (EntryCount << totalDocs) is credited its presence cut instead
+	// of being charged the full collection. Interpolation acts as a one-way
+	// ratchet: the real interpolated rangeSel is adopted only when it is MORE
+	// selective than the conservative default — it refines a genuinely selective
+	// range downward (so the index wins) but never penalizes an index above the
+	// default for a broad range (so no previously-indexed plan regresses).
+	f := DefaultRangeSelectivity
+	if idx.rangeSel > 0 && idx.rangeSel < f {
+		f = idx.rangeSel
+	}
+	return f * indexPopulation(idx, totalDocs) / totalDocs
 }
 
 // estimateIndexDocsWithFieldSel estimates the number of documents an index seek will return,
@@ -838,13 +967,27 @@ func estimateIndexDocsWithFieldSel(idx *CBOIndex, totalDocs float64, fieldSel []
 		return totalDocs
 	}
 
-	// Best case: sketch covers ALL index fields (exact match)
-	if idx.PointLookup && idx.Sketch != nil && idx.BoundFields == len(idx.Info.FieldNames) {
+	// Equality prefix: the level-(BoundFields-1) sketch row gives the joint count
+	// for the bound prefix directly — exact for the full key and accurate for a
+	// partial prefix on a compound index alike.
+	if idx.PointLookup && idx.Sketch != nil && idx.BoundFields >= 1 &&
+		idx.BoundFields <= idx.Sketch.NumLevels() &&
+		sketchLevelTrusted(idx.Sketch, idx.BoundFields-1) {
 		var total float64
 		for _, b := range idx.Bounds {
-			total += float64(idx.Sketch.Estimate(b.Start))
+			total += float64(idx.Sketch.Estimate(idx.BoundFields-1, b.Start))
 		}
 		return total
+	}
+
+	// Range bounds: adopt the interpolated within-index fraction (a real ordered
+	// B-tree estimate) only when it is MORE selective than the default — the
+	// one-way ratchet (see selectivityForIndex): a selective range is refined down
+	// so the index wins, a broad range never inflates e above the default. rangeSel
+	// already spans the whole bound union (e.g. both halves of a $ne), so it is
+	// applied directly to the population rather than multiplied per field.
+	if idx.rangeSel > 0 && idx.rangeSel < DefaultRangeSelectivity {
+		return idx.rangeSel * indexPopulation(idx, totalDocs)
 	}
 
 	// Fallback for partial bounds: use per-field selectivity from single-field indexes
@@ -869,16 +1012,17 @@ func estimateIndexDocsWithFieldSel(idx *CBOIndex, totalDocs float64, fieldSel []
 			}
 		}
 		if hasFieldSel {
-			return totalDocs * sel
+			return indexPopulation(idx, totalDocs) * sel
 		}
 	}
 
-	// Fallback: multiply DefaultRangeSelectivity per bound field
+	// Fallback: multiply DefaultRangeSelectivity per bound field, against the
+	// index's own population so a sparse index is credited its presence cut.
 	sel := 1.0
 	for range idx.BoundFields {
 		sel *= DefaultRangeSelectivity
 	}
-	return totalDocs * sel
+	return indexPopulation(idx, totalDocs) * sel
 }
 
 // buildFullScanChain constructs the iterator chain for a full collection scan.

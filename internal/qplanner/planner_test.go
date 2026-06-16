@@ -18,11 +18,13 @@ import (
 	"github.com/anyproto/any-store/v2/syncpool"
 )
 
-// mockSketch creates an IndexSketch where Estimate(key) always returns the given value.
+// mockSketch creates an IndexSketch where Estimate(level, key) always returns the
+// given value at every level. It allocates enough levels to cover any compound
+// index used in the planner tests.
 func mockSketch(estimate uint64) *IndexSketch {
-	s := NewIndexSketch(DefaultSketchSize)
-	// Increment a dummy key `estimate` times so that any hash-colliding lookup returns ~estimate.
-	// For testing, we just set all buckets to the same value.
+	s := NewIndexSketch(DefaultSketchSize, 8)
+	// Set every bucket (across all levels) to the same value so any lookup at any
+	// level returns ~estimate.
 	for i := range s.Buckets {
 		atomic.StoreUint64(&s.Buckets[i], estimate)
 	}
@@ -67,6 +69,111 @@ func TestBuildPlan_SelectiveIndex_IndexSeek(t *testing.T) {
 	assert.Equal(t, "IndexSeek", plan.Name)
 	assert.Equal(t, "a", plan.IndexName)
 	assert.True(t, plan.Cost < 1000*CostDocFetch, "index seek should be cheaper than full scan")
+}
+
+// TestBuildPlan_CompoundPrefix_SelectivePrefixBeatsFullScan is the motivating
+// regression: index (a,b), query Find({a:42}) [+ Sort(b)]. The level-0 prefix
+// sketch knows a=42 is selective (10 of 50000), so the planner picks the index.
+// Before multi-level prefix sketches, selectivityForIndex fell back to the 0.5
+// default for a partial prefix on a compound index, costing the index plan as if
+// it touched half the collection and (for the no-sort case, always) choosing a
+// full scan instead.
+func TestBuildPlan_CompoundPrefix_SelectivePrefixBeatsFullScan(t *testing.T) {
+	const totalDocs = 50000
+	bounds := mustParseBounds("a", `{"a": 42}`)
+
+	newIdx := func() CBOIndex {
+		sk := NewIndexSketch(DefaultSketchSize, 2)
+		for i := 0; i < 10; i++ {
+			sk.Increment(0, bounds[0].Start) // a=42 → 10 entries at the prefix level
+		}
+		return CBOIndex{
+			Info: &IndexInfo{
+				Name: "ab", FieldNames: []string{"a", "b"},
+				FieldPaths: [][]string{{"a"}, {"b"}},
+			},
+			Sketch:      sk,
+			Bounds:      bounds,
+			PointLookup: true,
+			BoundFields: 1,    // only a is bound (a prefix of (a,b))
+			ExactSort:   true, // (a,b) yields b-order once a is fixed
+		}
+	}
+
+	filter := query.MustParseCondition(`{"a": 42}`)
+
+	t.Run("no sort picks IndexSeek", func(t *testing.T) {
+		plan := BuildPlan(&PlanParams{
+			Filter:    filter,
+			TotalDocs: totalDocs,
+			Indexes:   []CBOIndex{newIdx()},
+		})
+		assert.Equal(t, "IndexSeek", plan.Name,
+			"selective compound prefix must beat full scan")
+	})
+
+	t.Run("Sort(b) uses the index, not full scan", func(t *testing.T) {
+		sorter := &sortFieldStub{fields: []query.SortField{{Field: "b"}}}
+		plan := BuildPlan(&PlanParams{
+			Filter:    filter,
+			Sorter:    sorter,
+			TotalDocs: totalDocs,
+			Indexes:   []CBOIndex{newIdx()},
+		})
+		assert.NotEqual(t, "FullScan", plan.Name,
+			"selective compound prefix with Sort(b) must use the index, not full scan")
+	})
+}
+
+// TestBuildPlan_SparseIndex_NeUsesIndex is the sparse-cut regression: {a:{$ne:""}}
+// on a sparse index where only a small fraction of docs have `a`. $ne is a range
+// (two open bounds), so there is no point estimate; bounding the estimate by the
+// index's own live entry count (EntryCount, far below totalDocs for a sparse
+// index) lets the index win — scanning only the present entries is far cheaper
+// than a full collection scan. A DENSE index with the same query must still pick
+// FullScan, because $ne there genuinely touches ~the whole collection.
+func TestBuildPlan_SparseIndex_NeUsesIndex(t *testing.T) {
+	const totalDocs = 50000
+	bounds := mustParseBounds("a", `{"a": {"$ne": ""}}`)
+	require.Len(t, bounds, 2, "$ne compiles to two open bounds")
+
+	newIdx := func(entryCount int) CBOIndex {
+		sk := NewIndexSketch(DefaultSketchSize, 1)
+		for i := 0; i < entryCount; i++ {
+			// Only levelTotals[0] (== EntryCount(0)) matters here; the bucketed
+			// counts are never consulted for a range predicate.
+			sk.Increment(0, []byte{byte(i), byte(i >> 8)})
+		}
+		return CBOIndex{
+			Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+			Sketch:      sk,
+			Bounds:      bounds,
+			PointLookup: false, // $ne is not an equality lookup
+			BoundFields: 1,
+		}
+	}
+
+	filter := query.MustParseCondition(`{"a": {"$ne": ""}}`)
+
+	t.Run("sparse index (500/50000 present) uses index", func(t *testing.T) {
+		plan := BuildPlan(&PlanParams{
+			Filter:    filter,
+			TotalDocs: totalDocs,
+			Indexes:   []CBOIndex{newIdx(500)},
+		})
+		assert.Equal(t, "IndexSeek", plan.Name,
+			"sparse index presence cut must beat full scan")
+	})
+
+	t.Run("dense index ($ne ~ all) stays full scan", func(t *testing.T) {
+		plan := BuildPlan(&PlanParams{
+			Filter:    filter,
+			TotalDocs: totalDocs,
+			Indexes:   []CBOIndex{newIdx(totalDocs)},
+		})
+		assert.Equal(t, "FullScan", plan.Name,
+			"$ne on a dense index genuinely touches ~all docs; full scan is correct")
+	})
 }
 
 // TestIndexCoversFilter_RejectsUncoveredField is the defensive regression for
@@ -187,6 +294,42 @@ func TestBuildPlan_IndexScan_SortWithoutLimit(t *testing.T) {
 	// IndexScan cost = 100*(0+2+0.5)=250, FullScan = 250 + sortCost
 	// IndexScan should win because no sort penalty
 	assert.Equal(t, "IndexScan", plan.Name)
+}
+
+// TestComputeFullScanCost_SortAddsMaterialize pins the exact-sort boost: a
+// full-scan sort pays both the n*log2(n) swap term AND a linear CostMaterialize
+// per buffered row, so an order-providing index scan (which streams) is favored.
+func TestComputeFullScanCost_SortAddsMaterialize(t *testing.T) {
+	const totalDocs = 1000.0
+	const yield = 800.0
+	noSort := computeFullScanCost(totalDocs, yield, false, false)
+	withSort := computeFullScanCost(totalDocs, yield, true, false)
+
+	want := noSort + sortCost(yield) + yield*CostMaterialize
+	assert.InDelta(t, want, withSort, 1e-9)
+	assert.Greater(t, withSort-noSort, sortCost(yield),
+		"materialize must add cost beyond the swap term alone")
+}
+
+// TestBuildPlan_PoorSelectivitySort_StaysFullScan is the protection regression
+// for the exact-sort boost: a poorly-selective filter on a NON-indexed field with
+// an ORDER BY that an index satisfies must NOT flip to an ordered index scan,
+// because that scan would random-fetch the whole collection to evaluate the
+// filter. The per-row fetch cost keeps full-scan+sort cheaper. (Mirrors the
+// expert-validated "WHERE unindexed_b=x ORDER BY a" failure mode.)
+func TestBuildPlan_PoorSelectivitySort_StaysFullScan(t *testing.T) {
+	plan := BuildPlan(&PlanParams{
+		Filter:    query.MustParseCondition(`{"b": 5}`), // b is not in the index
+		Sorter:    mustParseSort("a"),
+		TotalDocs: 50000,
+		Indexes: []CBOIndex{{
+			Info:      &IndexInfo{Name: "a", FieldNames: []string{"a"}},
+			Sketch:    mockSketch(0),
+			ExactSort: true, // covers ORDER BY a, but has no bounds (filter is on b)
+		}},
+	})
+	assert.Equal(t, "FullScan", plan.Name,
+		"ordered scan that must fetch ~all docs to filter must lose to full-scan+sort")
 }
 
 func TestBuildPlan_LowSelectivity_FullScan(t *testing.T) {
@@ -2528,9 +2671,9 @@ func TestCalculateSelectivity(t *testing.T) {
 		sel := calculateSelectivity(f, []CBOIndex{idx}, 1000, br)
 		assert.Equal(t, 0.0001, sel)
 	})
-	t.Run("compound_equality_uses_default_range", func(t *testing.T) {
-		// Compound index (a, b) with equality on a only → first field fi=0
-		// but len(FieldNames) != 1 → compound-equality branch.
+	t.Run("compound_equality_leading_field_uses_sketch", func(t *testing.T) {
+		// Compound index (a, b) with equality on a only: the leading field (fi=0)
+		// now uses the level-0 prefix sketch instead of the default-range fallback.
 		f := query.MustParseCondition(`{"a": 1}`)
 		idx := CBOIndex{
 			Info:   &IndexInfo{Name: "ab", FieldNames: []string{"a", "b"}},
@@ -2539,8 +2682,8 @@ func TestCalculateSelectivity(t *testing.T) {
 		br := &BoundsResult{}
 		br.Build([]*IndexInfo{idx.Info}, f)
 		sel := calculateSelectivity(f, []CBOIndex{idx}, 100, br)
-		// sel = DefaultRangeSelectivity (compound branch on a, no bounds for b → continues)
-		assert.Equal(t, DefaultRangeSelectivity, sel)
+		// sel = est/totalDocs = 10/100 (b has no bound → only a contributes).
+		assert.InDelta(t, 0.1, sel, 1e-9)
 	})
 	t.Run("range_predicate", func(t *testing.T) {
 		f := query.MustParseCondition(`{"a": {"$gt": 5}}`)
@@ -2608,14 +2751,45 @@ func TestSelectivityForIndex(t *testing.T) {
 		}
 		assert.Equal(t, DefaultRangeSelectivity, selectivityForIndex(idx, 100))
 	})
-	t.Run("partial_bounds_falls_back", func(t *testing.T) {
-		// PointLookup=false or BoundFields != len(FieldNames) → fallback.
+	t.Run("partial_prefix_uses_sketch", func(t *testing.T) {
+		// Compound (a, b) with an equality prefix on a only: the level-0 prefix
+		// sketch now gives a real estimate instead of the default-range fallback.
 		idx := &CBOIndex{
 			Info:        &IndexInfo{FieldNames: []string{"a", "b"}},
 			Bounds:      query.Bounds{{Start: []byte{1}, End: []byte{1}}},
 			Sketch:      mockSketch(10),
 			PointLookup: true,
 			BoundFields: 1, // only a bound, b is not bounded
+		}
+		assert.InDelta(t, 0.1, selectivityForIndex(idx, 100), 1e-9)
+	})
+	t.Run("legacy_unrebuilt_shallow_level_falls_back", func(t *testing.T) {
+		// A 2-level sketch loaded from a legacy single-level blob: only the
+		// full-key level holds data, so a shallow prefix (level 0) must fall back
+		// to DefaultRangeSelectivity instead of trusting an empty bucket.
+		legacy := make([]byte, DefaultSketchSize*8+8) // V1 buckets + docCount, no magic
+		sk := NewIndexSketch(DefaultSketchSize, 2)
+		sk.UnmarshalBinary(legacy)
+		if !sk.NeedsRebuild() {
+			t.Fatal("legacy load into multi-level sketch must set NeedsRebuild")
+		}
+		idx := &CBOIndex{
+			Info:        &IndexInfo{FieldNames: []string{"a", "b"}},
+			Bounds:      query.Bounds{{Start: []byte{1}, End: []byte{1}}},
+			Sketch:      sk,
+			PointLookup: true,
+			BoundFields: 1, // shallow prefix → untrusted on a not-yet-rebuilt sketch
+		}
+		assert.Equal(t, DefaultRangeSelectivity, selectivityForIndex(idx, 100))
+	})
+	t.Run("range_prefix_falls_back", func(t *testing.T) {
+		// Non-point-lookup (range) prefix: no sketch estimate, default range.
+		idx := &CBOIndex{
+			Info:        &IndexInfo{FieldNames: []string{"a", "b"}},
+			Bounds:      query.Bounds{{Start: []byte{1}, End: []byte{5}}},
+			Sketch:      mockSketch(10),
+			PointLookup: false,
+			BoundFields: 1,
 		}
 		assert.Equal(t, DefaultRangeSelectivity, selectivityForIndex(idx, 100))
 	})
@@ -3513,11 +3687,11 @@ func TestBuildPlan_PlanC_ScanDetailsRendered(t *testing.T) {
 //	           scanPopulation×CostFilter
 //
 // Setup: compound index (a,b) with BoundFields=1 (only a bound, b is trailing
-// fixed equality → coverFilters has 1 entry). idxSel falls back to
-// DefaultRangeSelectivity=0.5 (BoundFields != len(FieldNames)). coverSel is
+// fixed equality → coverFilters has 1 entry). idxSel comes from the level-0
+// prefix sketch: Estimate(0, a=5)/totalDocs = 10/100 = 0.1. coverSel is
 // DefaultRangeSelectivity=0.5 (no fieldSel because compound index doesn't
 // contribute to fieldSelectivity). scanPopulation = totalDocs × idxSel =
-// 100 × 0.5 = 50.
+// 100 × 0.1 = 10.
 func TestBuildPlan_PlanC_CoverFiltersNoLimit(t *testing.T) {
 	sorter := &sortFieldStub{fields: []query.SortField{{Field: "a"}}}
 	filter := query.MustParseCondition(`{"a": 5, "b": 10}`)
@@ -3556,7 +3730,7 @@ func TestBuildPlan_PlanC_CoverFiltersNoLimit(t *testing.T) {
 		t.Fatal("IndexScan candidate required to pin cover-filter no-limit formula")
 	}
 	fetchCost := indexFetchCost(100)
-	const scanPopulation = 50.0
+	const scanPopulation = 10.0 // totalDocs × idxSel = 100 × (10/100)
 	const coverSel = DefaultRangeSelectivity
 	expectedCost := scanPopulation*CostSeqRead +
 		scanPopulation*coverSel*fetchCost +
@@ -3715,11 +3889,12 @@ func TestBuildPlan_PlanC_HintBoost_CoversAllScanBoostLine(t *testing.T) {
 //
 //	scanCost = s×CostSeqRead + s×coverSel×fetchCost + s×CostFilter
 //
-// where s = (Limit+Offset)/scanSel. Setup: filter {"a":5,"b":10}, compound
-// index (a,b) with BoundFields=1 → idxSel=DefaultRangeSelectivity=0.5. pTotal
-// from two compound-equality branches (a then b) = 0.5×0.5 = 0.25. scanSel =
-// 0.25/0.5 = 0.5 (no clamp). s = 10/0.5 = 20. coverSel=0.5 (DefaultRange, no
-// fieldSel for compound index). Cost = 20×0.1 + 20×0.5×3.0 + 20×0.5 = 42.0.
+// where s = (Limit+Offset)/scanSel, capped at scanPopulation. Setup: filter
+// {"a":5,"b":10}, compound index (a,b) with BoundFields=1. idxSel from the
+// level-0 prefix sketch = Estimate(0, a=5)/100 = 5/100 = 0.05. pTotal = leading
+// field sketch (0.05) × b compound-equality DefaultRange (0.5) = 0.025. scanSel =
+// 0.025/0.05 = 0.5. raw s = 10/0.5 = 20, but scanPopulation = 100×0.05 = 5 caps
+// it to s = 5. coverSel=0.5. Cost = 5×0.1 + 5×0.5×3.0 + 5×0.5 = 10.5.
 func TestBuildPlan_PlanC_CoverFiltersWithLimit(t *testing.T) {
 	sorter := &sortFieldStub{fields: []query.SortField{{Field: "a"}}}
 	filter := query.MustParseCondition(`{"a": 5, "b": 10}`)
@@ -3755,7 +3930,7 @@ func TestBuildPlan_PlanC_CoverFiltersWithLimit(t *testing.T) {
 		t.Fatal("IndexScan candidate required to pin Plan-C with-limit cover-filter cost")
 	}
 	fetchCost := indexFetchCost(100)
-	const s = 20.0 // (Limit+Offset)/scanSel = 10/0.5
+	const s = 5.0 // (Limit+Offset)/scanSel = 20, capped at scanPopulation = 100×0.05 = 5
 	const coverSel = DefaultRangeSelectivity
 	expectedCost := s*CostSeqRead + s*coverSel*fetchCost + s*CostFilter
 	assert.InDelta(t, expectedCost, scan.Cost, 0.01,

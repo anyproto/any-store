@@ -808,8 +808,8 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 		return nil, err
 	}
 
-	// Initialize sketch for the new index
-	idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
+	// Initialize sketch for the new index (one prefix level per index field)
+	idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
 
 	// Build index from existing documents (also populates sketch via insertKeys)
 	if err = c.buildIndex(tx, idx); err != nil {
@@ -1156,7 +1156,7 @@ func (c *collection) buildIndex(tx *btree.WriteTx, idx *index) error {
 // unobservable to readers (no copy-on-write ceremony needed).
 func (c *collection) loadSketchAtOpen(tx *btree.ReadTx, idx *index) {
 	if idx.sketch == nil {
-		idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
+		idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
 	}
 	key := sketchKey(c.name, idx.info.Name)
 	if data, err := tx.AppendValue(c.db.systemNS, key, nil); err == nil {
@@ -1192,7 +1192,7 @@ func (c *collection) reloadSketch(tx *btree.ReadTx, idx *index, writable bool) {
 	c.sketchReadBuf = data
 	if writable {
 		if idx.sketch == nil {
-			idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
+			idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
 		}
 		idx.sketch.UnmarshalBinary(data) // in-place into live (sole mutator)
 		idx.storePubSketch(idx.sketch)   // republish live for readers
@@ -1202,7 +1202,7 @@ func (c *collection) reloadSketch(tx *btree.ReadTx, idx *index, writable bool) {
 		idx.sketchModified = false
 		return
 	}
-	fresh := qplanner.NewIndexSketch(qplanner.DefaultSketchSize)
+	fresh := qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
 	fresh.UnmarshalBinary(data)
 	idx.storePubSketch(fresh) // copy-on-write swap; live object untouched
 }

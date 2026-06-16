@@ -865,6 +865,7 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 			Sketch:         idx.loadPubSketch(),
 			Bounds:         bounds,
 			Reverse:        idx.reverse,
+			Ns:             idx.ns,
 			PointLookup:    pointLookup,
 			BoundFields:    chainLen,
 			ExactSort:      exactSort,
