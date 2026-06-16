@@ -620,7 +620,12 @@ func (c *Conn) EnsureIndex(cmd Cmd) (result string, err error) {
 	if len(cmd.Index.Fields) == 0 {
 		return "", fmt.Errorf("no index fields specified")
 	}
-	indexInfo := anystore.IndexInfo(cmd.Index)
+	indexInfo := anystore.IndexInfo{
+		Name:   cmd.Index.Name,
+		Fields: cmd.Index.Fields,
+		Unique: cmd.Index.Unique,
+		Sparse: cmd.Index.Sparse,
+	}
 	err = coll.EnsureIndex(mainCtx.Ctx(), indexInfo)
 	if err != nil {
 		return
