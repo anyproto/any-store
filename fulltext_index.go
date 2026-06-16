@@ -339,7 +339,7 @@ func (fx *ftsIndex) insertDoc(tx *btree.WriteTx, it item) error {
 		return nil
 	}
 
-	stringID := it.appendId(nil)
+	stringID := fx.c.appendId(nil, it.Value())
 	docID, err := fx.allocDocID(tx)
 	if err != nil {
 		return err
@@ -377,7 +377,7 @@ func (fx *ftsIndex) insertDoc(tx *btree.WriteTx, it item) error {
 
 // deleteDoc removes a document from the index. No-op if it was never indexed.
 func (fx *ftsIndex) deleteDoc(tx *btree.WriteTx, it item) error {
-	stringID := it.appendId(nil)
+	stringID := fx.c.appendId(nil, it.Value())
 	docID, ok, err := fx.lookupDocID(tx, stringID)
 	if err != nil || !ok {
 		return err
@@ -421,7 +421,7 @@ func (fx *ftsIndex) removeIndexedDoc(tx *btree.WriteTx, stringID []byte, docID u
 // actually changed. Editing one word in a long note touches a couple of chunks,
 // not all of them — and never accretes tombstones (the IntDocID is reused).
 func (fx *ftsIndex) updateDoc(tx *btree.WriteTx, oldIt, newIt item) error {
-	stringID := newIt.appendId(nil)
+	stringID := fx.c.appendId(nil, newIt.Value())
 	docID, ok, err := fx.lookupDocID(tx, stringID)
 	if err != nil {
 		return err

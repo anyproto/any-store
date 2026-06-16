@@ -41,11 +41,11 @@ Constants defined in `cost.go`:
 ```
 Cost = (EffectiveDocs × CostSeqRead) + (EffectiveDocs × CostFilter) + sortCost(EstimatedYield)
 ```
-When idBounds are present (point lookups on `id`), `EffectiveDocs` is replaced with `len(idBounds)`.
+When idBounds are present (point lookups on the primary key), `EffectiveDocs` is replaced with `len(idBounds)`.
 
-**id-sort optimization**: Sorting by `id` (asc or desc) is free — FullScan naturally reads in id order. When the sort is `id`-only, `fullScanNeedSort` is false and no SortIter is created. The `Reverse` flag on FullScanIter handles descending order. This works with or without a filter.
+**primary-key-sort optimization**: Sorting by the primary key (asc or desc) is free — FullScan naturally reads in primary-key order. When the sort is primary-key-only, `fullScanNeedSort` is false and no SortIter is created. The `Reverse` flag on FullScanIter handles descending order. This works with or without a filter. (The primary key is the collection's configured key field, default `id`.)
 
-**Limit-aware FullScan**: When the plan is FullScan with id-sort (no sort needed) and a LIMIT is present:
+**Limit-aware FullScan**: When the plan is FullScan with primary-key-sort (no sort needed) and a LIMIT is present:
 ```
 EffectiveDocs = min(TotalDocs, (LIMIT + OFFSET) / selectivity)
 ```
@@ -143,7 +143,7 @@ This reduces the final sort from O(N log N) to O(K log K) and keeps the entries 
 
 **Full Scan**: `FullScanIter(filter) → [SortIter] → [LimitIter]`
 
-**Full Scan (id-sort)**: `FullScanIter(filter, reverse?) → [LimitIter]` — no SortIter needed
+**Full Scan (primary-key-sort)**: `FullScanIter(filter, reverse?) → [LimitIter]` — no SortIter needed
 
 **Index Seek (unique point lookup)**: `CoverIter → [FilterIter] → [SortIter] → [LimitIter]`
 

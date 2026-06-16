@@ -252,6 +252,7 @@ func collConfigKey(name string) []byte {
 
 type collConfig struct {
 	Compression Compression
+	PrimaryKey  string
 }
 
 func indexKey(collName, indexName string) []byte {
@@ -438,6 +439,9 @@ func mergeCollOpts(opts []CollectionOptions) CollectionOptions {
 		if o.Compression != 0 {
 			merged.Compression = o.Compression
 		}
+		if o.PrimaryKey != "" {
+			merged.PrimaryKey = o.PrimaryKey
+		}
 	}
 	return merged
 }
@@ -450,6 +454,13 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 	}
 	db.mu.Unlock()
 	merged := mergeCollOpts(opts)
+	pk := merged.PrimaryKey
+	if pk == "" {
+		pk = "id"
+	}
+	if err := validatePrimaryKey(pk); err != nil {
+		return nil, err
+	}
 	var coll Collection
 	err := db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
 		tx.MarkSchemaChanged()
@@ -478,11 +489,16 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 			return err
 		}
 
-		// Persist per-collection config if non-default
-		if merged.Compression != 0 {
+		// Persist per-collection config when any setting is non-default.
+		if merged.Compression != 0 || pk != "id" {
 			var a anyenc.Arena
 			obj := a.NewObject()
-			obj.Set("compression", a.NewNumberInt(int(merged.Compression)))
+			if merged.Compression != 0 {
+				obj.Set("compression", a.NewNumberInt(int(merged.Compression)))
+			}
+			if pk != "id" {
+				obj.Set("primaryKey", a.NewString(pk))
+			}
 			if err = tx.Put(db.systemNS, collConfigKey(collectionName), obj.MarshalTo(nil)); err != nil {
 				return err
 			}
@@ -554,6 +570,11 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 func (db *db) Collection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error) {
 	coll, err := db.OpenCollection(ctx, collectionName)
 	if err == nil {
+		// Existing collection: a conflicting PrimaryKey option is a misuse, not a
+		// silent no-op — the primary key is immutable after creation.
+		if merged := mergeCollOpts(opts); merged.PrimaryKey != "" && merged.PrimaryKey != coll.PrimaryKey() {
+			return nil, ErrPrimaryKeyMismatch
+		}
 		return coll, nil
 	}
 	if !errors.Is(err, ErrCollectionNotFound) {
@@ -1189,6 +1210,7 @@ func (db *db) loadCollConfig(tx *btree.ReadTx, collName string) (collConfig, err
 		return cfg, err
 	}
 	cfg.Compression = Compression(val.GetInt("compression"))
+	cfg.PrimaryKey = val.GetString("primaryKey")
 	return cfg, nil
 }
 

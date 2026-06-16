@@ -3,6 +3,8 @@ package anystore
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -18,6 +20,9 @@ import (
 type Collection interface {
 	// Name returns the name of the collection.
 	Name() string
+
+	// PrimaryKey returns the document field used as this collection's primary key.
+	PrimaryKey() string
 
 	// FindId finds a document by its ID.
 	// Returns the document or an error if the document is not found.
@@ -153,6 +158,11 @@ type collection struct {
 
 	compression Compression // 0 = use db default
 
+	// primaryKey is the document field whose value is the btree key. Resolved
+	// once in init (default "id") and never mutated after, so the data and query
+	// paths read it lock-free.
+	primaryKey string
+
 	// sketchReadBuf is reused scratch for decoding persisted sketch bytes during
 	// the advisory reload (reloadSketch). Only touched under c.mu, so a single
 	// per-collection buffer is safe and keeps the stale-reload path from
@@ -228,13 +238,22 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 	}
 	c.ns = ns
 
-	return c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
+	// load reads per-collection config + index metadata. When invoked within a
+	// write tx (CreateCollection) it MUST read through the writer's own view so
+	// it observes config written earlier in this same uncommitted tx — a fresh
+	// read tx would see only committed state and miss it (read-your-writes,
+	// matching SQLite where a write tx's reads go through the shared page cache).
+	load := func(tx *btree.ReadTx) (err error) {
 		// Load per-collection config
 		cfg, err := c.db.loadCollConfig(tx, c.name)
 		if err != nil {
 			return err
 		}
 		c.compression = cfg.Compression
+		c.primaryKey = cfg.PrimaryKey
+		if c.primaryKey == "" {
+			c.primaryKey = "id"
+		}
 
 		idxInfos, err := c.db.getIndexInfos(tx, c.name)
 		if err != nil {
@@ -279,13 +298,44 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 		c.storeFtsIndexes(ftsIdxs)
 		c.storeVectorIndexes(vidxs)
 		return nil
-	})
+	}
+
+	if wtx != nil {
+		return load(&wtx.ReadTx)
+	}
+	return c.db.doReadTx(ctx, load)
 }
 
 func (c *collection) Name() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.name
+}
+
+func (c *collection) PrimaryKey() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.primaryKey
+}
+
+// validatePrimaryKey checks a primary-key field name: non-empty, no "$" prefix,
+// and a single top-level field (no "." path separators).
+func validatePrimaryKey(s string) error {
+	if s == "" {
+		return fmt.Errorf("any-store: primary key field is empty")
+	}
+	if strings.HasPrefix(s, "$") {
+		return fmt.Errorf("any-store: invalid primary key field name: %s", s)
+	}
+	if strings.HasPrefix(s, "-") {
+		// A leading '-' is parsed by Sort as a descending marker, so the
+		// natural-order fast path could never recognize such a field.
+		return fmt.Errorf("any-store: primary key field must not start with '-': %s", s)
+	}
+	if strings.Contains(s, ".") {
+		return fmt.Errorf("any-store: primary key must be a single top-level field: %s", s)
+	}
+	return nil
 }
 
 // compressionDisabled returns whether compression is disabled for this collection.
@@ -299,6 +349,29 @@ func (c *collection) compressionDisabled() bool {
 	default:
 		return c.db.config.DisableCompression
 	}
+}
+
+// newItem wraps a document value, validating that it carries this collection's
+// primary-key field. Returns ErrDocWithoutId when the field is absent.
+func (c *collection) newItem(val *anyenc.Value) (item, error) {
+	objVal, err := val.Object()
+	if err != nil {
+		return item{}, err
+	}
+	if objVal.Get(c.primaryKey) == nil {
+		return item{}, ErrDocWithoutId
+	}
+	return item{val: val}, nil
+}
+
+// appendId appends the marshaled primary-key value of val to dst. The field is
+// always present here because items are validated on construction.
+func (c *collection) appendId(dst []byte, val *anyenc.Value) []byte {
+	idVal := val.Get(c.primaryKey)
+	if idVal == nil {
+		panic("document without primary key")
+	}
+	return idVal.MarshalTo(dst)
 }
 
 func (c *collection) FindId(ctx context.Context, docId any) (doc Doc, err error) {
@@ -374,7 +447,7 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 		var it item
 		for _, doc := range docs {
 			buf.Arena.Reset()
-			if it, txErr = newItem(doc); txErr != nil {
+			if it, txErr = c.newItem(doc); txErr != nil {
 				return txErr
 			}
 			if txErr = c.insertItem(tx, buf, it); txErr != nil {
@@ -387,7 +460,7 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 }
 
 func (c *collection) insertItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, it item) (err error) {
-	buf.SmallBuf = it.appendId(buf.SmallBuf[:0])
+	buf.SmallBuf = c.appendId(buf.SmallBuf[:0], it.Value())
 	if c.compressionDisabled() {
 		buf.DocBuf = it.Value().MarshalTo(buf.DocBuf[:0])
 	} else {
@@ -432,7 +505,7 @@ func (c *collection) UpdateOne(ctx context.Context, doc *anyenc.Value) (err erro
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	var it item
-	if it, err = newItem(doc); err != nil {
+	if it, err = c.newItem(doc); err != nil {
 		return
 	}
 
@@ -470,7 +543,11 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 			return
 		}
 		res.Modified = 1
-		return c.update(tx, item{val: newVal}, it)
+		newIt, vErr := c.newItem(newVal)
+		if vErr != nil {
+			return false, vErr
+		}
+		return c.update(tx, newIt, it)
 	}); err != nil {
 		return ModifyResult{}, err
 	}
@@ -506,7 +583,7 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 				if txErr != nil {
 					return false, txErr
 				}
-				modValue.Set("id", idVal)
+				modValue.Set(c.primaryKey, idVal)
 				isInsert = true
 			} else {
 				return false, loadErr
@@ -528,12 +605,16 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 			return
 		}
 		res.Modified = 1
+		newIt, vErr := c.newItem(newVal)
+		if vErr != nil {
+			return false, vErr
+		}
 		if isInsert {
-			txErr = c.insertItem(tx, buf2, item{val: newVal})
+			txErr = c.insertItem(tx, buf2, newIt)
 			return true, txErr
 		} else {
 			res.Matched = 1
-			return c.update(tx, item{val: newVal}, prevItem)
+			return c.update(tx, newIt, prevItem)
 		}
 	}); err != nil {
 		return ModifyResult{}, err
@@ -545,7 +626,7 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
-	buf.SmallBuf = it.appendId(buf.SmallBuf[:0])
+	buf.SmallBuf = c.appendId(buf.SmallBuf[:0], it.Value())
 	if prevIt.val == nil {
 		prevIt, err = c.loadById(tx, buf, buf.SmallBuf)
 		if err != nil {
@@ -602,7 +683,7 @@ func (c *collection) loadById(tx *btree.WriteTx, buf *syncpool.DocBuffer, id any
 	if err != nil {
 		return
 	}
-	return newItem(doc)
+	return c.newItem(doc)
 }
 
 func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err error) {
@@ -615,7 +696,7 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err erro
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	var it item
-	if it, err = newItem(doc); err != nil {
+	if it, err = c.newItem(doc); err != nil {
 		return
 	}
 
@@ -890,7 +971,7 @@ func (c *collection) buildFtsIndex(tx *btree.WriteTx, fx *ftsIndex) error {
 		if err != nil {
 			return err
 		}
-		it, err := newItem(doc)
+		it, err := c.newItem(doc)
 		if err != nil {
 			return err
 		}
@@ -1135,7 +1216,7 @@ func (c *collection) buildIndex(tx *btree.WriteTx, idx *index) error {
 		if err != nil {
 			return err
 		}
-		it, err := newItem(doc)
+		it, err := c.newItem(doc)
 		if err != nil {
 			return err
 		}
@@ -1357,5 +1438,5 @@ func (c *collection) loadByIdRead(tx *btree.ReadTx, buf *syncpool.DocBuffer, id 
 	if err != nil {
 		return
 	}
-	return newItem(doc)
+	return c.newItem(doc)
 }

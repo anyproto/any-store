@@ -289,4 +289,9 @@ type CollectionOptions struct {
 	// Compression overrides the database-wide compression setting for this collection.
 	// Zero value inherits the database default.
 	Compression Compression
+
+	// PrimaryKey is the document field whose value is the collection's primary
+	// key. Empty defaults to "id". Honored only at CreateCollection; the primary
+	// key is immutable once the collection exists.
+	PrimaryKey string
 }

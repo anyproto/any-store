@@ -49,8 +49,9 @@ type Conn struct {
 	// context, so syncCollections can register/unregister only what changed.
 	knownColls map[string]struct{}
 
-	lastIter  anystore.Iterator
-	lastQuery Query
+	lastIter    anystore.Iterator
+	lastQuery   Query
+	lastPkField string
 }
 
 func (c *Conn) closeLastIter() {
@@ -764,7 +765,7 @@ func (c *Conn) FindId(cmd Cmd) (result string, err error) {
 
 	val := doc.Value()
 	if len(cmd.Query.Project) > 0 {
-		if val, err = applyProjection(val, cmd.Query.Project); err != nil {
+		if val, err = applyProjection(val, cmd.Query.Project, coll.PrimaryKey()); err != nil {
 			return
 		}
 	}
@@ -826,18 +827,18 @@ func (c *Conn) FindOne(cmd Cmd) (result string, err error) {
 		if doc, err = iter.Doc(); err != nil {
 			return "", err
 		}
-		err = c.printDoc(doc, cmd.Query)
+		err = c.printDoc(doc, cmd.Query, coll.PrimaryKey())
 	} else {
 		err = iter.Err()
 	}
 	return
 }
 
-func (c *Conn) printDoc(doc anystore.Doc, query Query) error {
+func (c *Conn) printDoc(doc anystore.Doc, query Query, pkField string) error {
 	val := doc.Value()
 	var err error
 	if len(query.Project) > 0 {
-		if val, err = applyProjection(val, query.Project); err != nil {
+		if val, err = applyProjection(val, query.Project, pkField); err != nil {
 			return err
 		}
 	}
@@ -853,7 +854,7 @@ func (c *Conn) printDoc(doc anystore.Doc, query Query) error {
 	return nil
 }
 
-func (c *Conn) printIter(iter anystore.Iterator, query Query, first bool) (string, error) {
+func (c *Conn) printIter(iter anystore.Iterator, query Query, first bool, pkField string) (string, error) {
 	batchSize := 30
 	count := 0
 
@@ -862,7 +863,7 @@ func (c *Conn) printIter(iter anystore.Iterator, query Query, first bool) (strin
 		if err != nil {
 			return "", err
 		}
-		if err := c.printDoc(doc, query); err != nil {
+		if err := c.printDoc(doc, query, pkField); err != nil {
 			return "", err
 		}
 		count++
@@ -873,7 +874,7 @@ func (c *Conn) printIter(iter anystore.Iterator, query Query, first bool) (strin
 		if err != nil {
 			return "", err
 		}
-		if err := c.printDoc(doc, query); err != nil {
+		if err := c.printDoc(doc, query, pkField); err != nil {
 			return "", err
 		}
 		count++
@@ -883,6 +884,7 @@ func (c *Conn) printIter(iter anystore.Iterator, query Query, first bool) (strin
 		fmt.Println("Type \"it\" for more")
 		c.lastIter = iter
 		c.lastQuery = query
+		c.lastPkField = pkField
 	} else {
 		if err := iter.Err(); err != nil {
 			return "", err
@@ -898,8 +900,9 @@ func (c *Conn) IterNext() (result string, err error) {
 	}
 	iter := c.lastIter
 	query := c.lastQuery
+	pkField := c.lastPkField
 	c.lastIter = nil
-	return c.printIter(iter, query, false)
+	return c.printIter(iter, query, false, pkField)
 }
 
 func (c *Conn) Find(cmd Cmd) (result string, err error) {
@@ -969,7 +972,7 @@ func (c *Conn) Find(cmd Cmd) (result string, err error) {
 	if err != nil {
 		return "", err
 	}
-	return c.printIter(iter, cmd.Query, true)
+	return c.printIter(iter, cmd.Query, true, coll.PrimaryKey())
 }
 
 func (c *Conn) Aggregate(cmd Cmd) (result string, err error) {
@@ -1039,7 +1042,7 @@ func (c *Conn) Aggregate(cmd Cmd) (result string, err error) {
 	if err != nil {
 		return "", err
 	}
-	return c.printIter(iter, cmd.Query, true)
+	return c.printIter(iter, cmd.Query, true, coll.PrimaryKey())
 }
 
 func prettyJson(s string) (string, error) {
@@ -1062,7 +1065,7 @@ func toAnySlice[T any](slice []T) []any {
 	return res
 }
 
-func applyProjection(val *anyenc.Value, projection json.RawMessage) (*anyenc.Value, error) {
+func applyProjection(val *anyenc.Value, projection json.RawMessage, pkField string) (*anyenc.Value, error) {
 	var projMap map[string]int
 	if err := json.Unmarshal(projection, &projMap); err != nil {
 		return nil, err
@@ -1090,7 +1093,7 @@ func applyProjection(val *anyenc.Value, projection json.RawMessage) (*anyenc.Val
 	if inclusion {
 		obj.Visit(func(k []byte, v *anyenc.Value) {
 			key := string(k)
-			if projMap[key] > 0 || key == "id" {
+			if projMap[key] > 0 || key == pkField {
 				newVal.Set(key, v)
 			}
 		})

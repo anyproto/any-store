@@ -179,9 +179,15 @@ type PlanParams struct {
 	Filter   query.Filter
 	Sorter   query.Sort
 	IDBounds query.Bounds
-	Limit    int
-	Offset   int
-	Buf      *syncpool.DocBuffer
+
+	// PrimaryKey is the collection's primary-key field. Empty ⇒ "id". A single
+	// Sort on this field needs no SortIter because a full scan already yields
+	// primary-key order.
+	PrimaryKey string
+
+	Limit  int
+	Offset int
+	Buf    *syncpool.DocBuffer
 
 	// CBO parameters
 	TotalDocs  int
@@ -298,11 +304,16 @@ func BuildPlan(params *PlanParams) *Plan {
 			estimatedYield = fullScanDocs
 		}
 	}
-	// FullScan naturally reads in ID order, so sorting by "id" is free.
+	// FullScan naturally reads in primary-key order, so sorting by the primary
+	// key is free.
 	fullScanNeedSort := needSort
 	if needSort {
 		fields := params.Sorter.Fields()
-		if len(fields) == 1 && fields[0].Field == "id" {
+		pk := params.PrimaryKey
+		if pk == "" {
+			pk = "id"
+		}
+		if len(fields) == 1 && fields[0].Field == pk {
 			fullScanNeedSort = false
 		}
 	}
@@ -1032,7 +1043,11 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 	idSorted := false
 	if needSort {
 		fields := params.Sorter.Fields()
-		if len(fields) == 1 && fields[0].Field == "id" {
+		pk := params.PrimaryKey
+		if pk == "" {
+			pk = "id"
+		}
+		if len(fields) == 1 && fields[0].Field == pk {
 			idSorted = true
 			fsi := &FullScanIter{
 				Source: &CursorSource{

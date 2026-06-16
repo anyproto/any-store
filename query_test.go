@@ -624,7 +624,7 @@ func TestQuery_IsIDOnlyFilterNode_And_Direct(t *testing.T) {
 		query.Key{Path: []string{"id"}},
 		query.Key{Path: []string{"id"}},
 	}
-	assert.True(t, isIDOnlyFilterNode(f),
+	assert.True(t, isIDOnlyFilterNode(f, "id"),
 		"query.And{Key{id}, Key{id}} must be recognized as id-only")
 
 	// And with a non-id child → returns false.
@@ -632,11 +632,11 @@ func TestQuery_IsIDOnlyFilterNode_And_Direct(t *testing.T) {
 		query.Key{Path: []string{"id"}},
 		query.Key{Path: []string{"other"}},
 	}
-	assert.False(t, isIDOnlyFilterNode(fMixed),
+	assert.False(t, isIDOnlyFilterNode(fMixed, "id"),
 		"And with non-id child must NOT be id-only")
 
 	// Empty And → returns false (len(ft) > 0 check).
-	assert.False(t, isIDOnlyFilterNode(query.And{}), "empty And is not id-only")
+	assert.False(t, isIDOnlyFilterNode(query.And{}, "id"), "empty And is not id-only")
 }
 
 // TestQuery_IsIDOnlyFilterNode_PointerAnd verifies the *query.And pointer-arm
@@ -647,7 +647,7 @@ func TestQuery_IsIDOnlyFilterNode_And_Direct(t *testing.T) {
 func TestQuery_IsIDOnlyFilterNode_PointerAnd(t *testing.T) {
 	// MustParseCondition produces *query.And for $and JSON.
 	f := query.MustParseCondition(`{"$and":[{"id":"a"},{"id":"b"}]}`)
-	assert.True(t, isIDOnlyFilterNode(f), "pointer-And with id-only children should match")
+	assert.True(t, isIDOnlyFilterNode(f, "id"), "pointer-And with id-only children should match")
 }
 
 // TestQuery_Update_NoopModifier covers query.go:258-261 — when the modifier

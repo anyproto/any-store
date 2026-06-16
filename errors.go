@@ -34,6 +34,11 @@ var (
 	// ErrDocWithoutId is returned when a document is provided without a required ID.
 	ErrDocWithoutId = errors.New("any-store: document missing ID")
 
+	// ErrPrimaryKeyMismatch is returned by Collection when the requested
+	// PrimaryKey option conflicts with an existing collection's stored primary
+	// key. The primary key is immutable after creation.
+	ErrPrimaryKeyMismatch = errors.New("any-store: primary key mismatch")
+
 	// ErrCollectionExists is returned when attempting to create a collection that already exists.
 	ErrCollectionExists = errors.New("any-store: collection already exists")
 

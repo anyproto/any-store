@@ -23,6 +23,7 @@ import (
 // field and keys the graph by the document id. It mutates inside the collection
 // write transaction, exactly like the range index's insertKeys/deleteKeys.
 type vectorIndex struct {
+	c            *collection
 	info         IndexInfo
 	fieldPath    []string
 	dim          int
@@ -144,8 +145,9 @@ func ivfStoreParams(p *VectorParams, n int) vivf.StoreParams {
 	}
 }
 
-func newVectorIndexFromVindex(info IndexInfo, ix *vindex.Index) *vectorIndex {
+func newVectorIndexFromVindex(c *collection, info IndexInfo, ix *vindex.Index) *vectorIndex {
 	return &vectorIndex{
+		c:            c,
 		info:         info,
 		fieldPath:    strings.Split(info.Vector.Field, "."),
 		dim:          info.Vector.Dim,
@@ -155,8 +157,9 @@ func newVectorIndexFromVindex(info IndexInfo, ix *vindex.Index) *vectorIndex {
 	}
 }
 
-func newVectorIndexFromIVF(info IndexInfo, ivf *vivf.StoreIndex) *vectorIndex {
+func newVectorIndexFromIVF(c *collection, info IndexInfo, ivf *vivf.StoreIndex) *vectorIndex {
 	return &vectorIndex{
+		c:            c,
 		info:         info,
 		fieldPath:    strings.Split(info.Vector.Field, "."),
 		dim:          info.Vector.Dim,
@@ -210,7 +213,7 @@ func (vi *vectorIndex) insert(tx *btree.WriteTx, it item, vbuf []float32) error 
 		if !ok {
 			return nil
 		}
-		return vi.ivf.Insert(tx, it.appendId(nil), vec)
+		return vi.ivf.Insert(tx, vi.c.appendId(nil, it.Value()), vec)
 	}
 	if vi.ix == nil {
 		return nil
@@ -219,7 +222,7 @@ func (vi *vectorIndex) insert(tx *btree.WriteTx, it item, vbuf []float32) error 
 	if !ok {
 		return nil
 	}
-	return vi.ix.Insert(tx, it.appendId(nil), vec)
+	return vi.ix.Insert(tx, vi.c.appendId(nil, it.Value()), vec)
 }
 
 // delete removes the document's vector (no-op if it was never indexed).
@@ -228,13 +231,13 @@ func (vi *vectorIndex) delete(tx *btree.WriteTx, it item) error {
 		if vi.ivf == nil {
 			return nil
 		}
-		_, err := vi.ivf.Delete(tx, it.appendId(nil))
+		_, err := vi.ivf.Delete(tx, vi.c.appendId(nil, it.Value()))
 		return err
 	}
 	if vi.ix == nil {
 		return nil
 	}
-	_, err := vi.ix.Delete(tx, it.appendId(nil))
+	_, err := vi.ix.Delete(tx, vi.c.appendId(nil, it.Value()))
 	return err
 }
 
@@ -259,18 +262,18 @@ func (vi *vectorIndex) update(tx *btree.WriteTx, prevIt, it item) error {
 	if vi.isIVF() {
 		switch {
 		case newOk:
-			return vi.ivf.Insert(tx, it.appendId(nil), newVec) // Insert replaces
+			return vi.ivf.Insert(tx, vi.c.appendId(nil, it.Value()), newVec) // Insert replaces
 		case oldOk:
-			_, err := vi.ivf.Delete(tx, it.appendId(nil))
+			_, err := vi.ivf.Delete(tx, vi.c.appendId(nil, it.Value()))
 			return err
 		}
 		return nil
 	}
 	switch {
 	case newOk:
-		return vi.ix.Insert(tx, it.appendId(nil), newVec)
+		return vi.ix.Insert(tx, vi.c.appendId(nil, it.Value()), newVec)
 	case oldOk:
-		_, err := vi.ix.Delete(tx, it.appendId(nil))
+		_, err := vi.ix.Delete(tx, vi.c.appendId(nil, it.Value()))
 		return err
 	}
 	return nil
@@ -312,7 +315,7 @@ func (vi *vectorIndex) compact(tx *btree.WriteTx, collName string) (*vectorIndex
 		if err != nil {
 			return nil, err
 		}
-		return newVectorIndexFromIVF(vi.info, ivf), nil
+		return newVectorIndexFromIVF(vi.c, vi.info, ivf), nil
 	}
 	if vi.ix == nil {
 		return vi, nil
@@ -325,7 +328,7 @@ func (vi *vectorIndex) compact(tx *btree.WriteTx, collName string) (*vectorIndex
 	hybrid := vi.info.Vector.Mode == VectorModeHybrid
 	ix.SetHybrid(hybrid)
 	ix.SetVectorCache(hybrid && vi.info.Vector.HybridCacheVectors)
-	return newVectorIndexFromVindex(vi.info, ix), nil
+	return newVectorIndexFromVindex(vi.c, vi.info, ix), nil
 }
 
 // overThreshold reports whether tombstones have reached compactRatio × live
@@ -359,7 +362,7 @@ func (c *collection) loadVectorIndex(tx *btree.ReadTx, info IndexInfo) (*vectorI
 	}
 	if info.Vector.Mode.isBruteForce() {
 		// No on-disk graph to open — the index is metadata only.
-		return newVectorIndexFromVindex(info, nil), nil
+		return newVectorIndexFromVindex(c, info, nil), nil
 	}
 	prefix := vectorIndexNsPrefix(c.name, info.Name)
 	if info.Vector.Mode.isIVF() {
@@ -367,7 +370,7 @@ func (c *collection) loadVectorIndex(tx *btree.ReadTx, info IndexInfo) (*vectorI
 		if err != nil {
 			return nil, err
 		}
-		return newVectorIndexFromIVF(info, ivf), nil
+		return newVectorIndexFromIVF(c, info, ivf), nil
 	}
 	ix, err := vindex.OpenTx(tx, prefix, vectorIndexSeed(c.name, info.Name))
 	if err != nil {
@@ -376,7 +379,7 @@ func (c *collection) loadVectorIndex(tx *btree.ReadTx, info IndexInfo) (*vectorI
 	hybrid := info.Vector.Mode == VectorModeHybrid
 	ix.SetHybrid(hybrid)
 	ix.SetVectorCache(hybrid && info.Vector.HybridCacheVectors)
-	return newVectorIndexFromVindex(info, ix), nil
+	return newVectorIndexFromVindex(c, info, ix), nil
 }
 
 // createVectorIndex creates a new vector index (namespaces + meta) and builds it
@@ -395,7 +398,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	if info.Vector.Mode.isBruteForce() {
 		// Brute-force: no namespaces, no graph, nothing to build from documents.
 		// The persisted metadata above is the entire index.
-		return newVectorIndexFromVindex(info, nil), nil
+		return newVectorIndexFromVindex(c, info, nil), nil
 	}
 	prefix := vectorIndexNsPrefix(c.name, info.Name)
 
@@ -406,7 +409,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	// NOTE: this holds every indexed vector in RAM during the build; for very large
 	// collections a maintenance_work_mem-style cap + fallback to per-insert is future
 	// work (see BUILD_SPEED.md).
-	tmpVI := newVectorIndexFromVindex(info, nil) // extractVector needs fieldPath/dim
+	tmpVI := newVectorIndexFromVindex(c, info, nil) // extractVector needs fieldPath/dim
 	var ids [][]byte
 	var vecs [][]float32
 	cursor := tx.NewCursor(c.ns)
@@ -426,7 +429,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 		}
 		it := item{val: doc}
 		if vec, ok := tmpVI.extractVector(it, nil); ok { // nil buf → fresh copy per doc
-			ids = append(ids, it.appendId(nil))
+			ids = append(ids, c.appendId(nil, it.Value()))
 			vecs = append(vecs, vec)
 		}
 		if err := cursor.Next(); err != nil {
@@ -447,7 +450,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 		if err != nil {
 			return nil, err
 		}
-		return newVectorIndexFromIVF(info, ivf), nil
+		return newVectorIndexFromIVF(c, info, ivf), nil
 	}
 
 	p := vindex.Params{
@@ -468,7 +471,7 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	hybrid := info.Vector.Mode == VectorModeHybrid
 	ix.SetHybrid(hybrid)
 	ix.SetVectorCache(hybrid && info.Vector.HybridCacheVectors)
-	return newVectorIndexFromVindex(info, ix), nil
+	return newVectorIndexFromVindex(c, info, ix), nil
 }
 
 // reconcileVectorIndexesLocked rebuilds the vector-index set from on-disk infos

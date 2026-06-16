@@ -401,7 +401,7 @@ func (idx *index) Len(ctx context.Context) (count int, err error) {
 // its single new entry written with IndexValueScalar.
 func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 	idx.fillKeysBuf(it)
-	idKey := it.appendId(nil)
+	idKey := idx.c.appendId(nil, it.Value())
 
 	entryValue := qplanner.IndexValueScalar
 	if len(idx.keysBuf) > 1 {
@@ -457,7 +457,7 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 // Both unique and non-unique indexes use key=Tuple(fields..., docId), value=nil.
 func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 	idx.fillKeysBuf(it)
-	idKey := it.appendId(nil)
+	idKey := idx.c.appendId(nil, it.Value())
 	prevKi := -1
 	for ki, key := range idx.keysBuf {
 		idx.fullKeyBuf = append(idx.fullKeyBuf[:0], key...)
