@@ -162,13 +162,50 @@ PosDelta   : uvarint × Σ TF_f   // GLOBAL gapped positions (unchanged from v1)
   list so `fieldIdx` is stable across reopen.
 - **`V2ChunkIterator`** reads `FieldMask`+TFs eagerly, skips positions in `Next()`
   (varint count known) → hot common-term path still never decodes positions.
-- **`FulltextParams`** carries per-field `Weights` and optional per-field `B`
-  (field→idx from `IndexInfo.Fields` order), persisted as a `fulltext` sub-object
-  on the index doc (mirrors the `vector` sub-object).
 - **Incremental update** stays one-chunk-per-term: the diff path carries per-field
   TF; moving a term title→body rewrites one chunk, not two.
 - **Migration**: a v1 chunk under a weighted index ⇒ blocking re-index on open
   (acceptable in alpha; no FTS on-disk back-compat promise yet).
+
+### Settled API — `FulltextParams` (locked 2026-06-17)
+
+One struct serves both Phase 2 (global `b`/`k1`) and Phase 3 (`Weights`), so
+neither phase churns it. `Weights` mirrors MongoDB's text-index `weights` option
+(keyed by field name, default 1.0); the scoring is BM25F, not Mongo's heuristic.
+
+```go
+type FulltextParams struct {
+    // Weights is the per-field BM25F boost, keyed by indexed field name (must
+    // match an entry of IndexInfo.Fields). A field absent from the map weighs
+    // 1.0. Mongo-compatible shape. Set at index creation; changing a weight
+    // re-indexes. Phase 3.
+    Weights map[string]float64 `json:"weights,omitempty"`
+
+    // B is the BM25 length-normalization parameter (global). 0 ⇒ 0.75. In BM25F
+    // this is the length term applied per field; a single global B is the common
+    // variant (per-field b is intentionally NOT exposed — niche, and adding the
+    // optional map later is non-breaking). Phase 2.
+    B float64 `json:"b,omitempty"`
+
+    // K1 is the BM25 term-frequency saturation parameter (global). 0 ⇒ 1.2.
+    // Phase 2.
+    K1 float64 `json:"k1,omitempty"`
+}
+```
+
+- **Field→index resolution:** `Weights` is keyed by the declared field string;
+  the writer resolves each to its `fieldIdx` (position in `IndexInfo.Fields`).
+  A weight for a field not in `Fields` is a validation error at `EnsureIndex`
+  (catches typos) — not silently ignored.
+- **Persistence:** a `fulltext` sub-object on the index doc, mirroring the
+  `vector` sub-object (`db.go`): `{ "weights": {field: w, …}, "b": …, "k1": … }`.
+  The `db.go:969` loader (today `info.Fulltext = &FulltextParams{}`) populates it.
+- **Zero-value = today's behavior:** empty map, `B=0→0.75`, `K1=0→1.2` reproduces
+  the current uniform-field BM25 exactly (the D1 single-field/weight-1 reduction).
+- **Dependency:** Phase 3 does NOT depend on Phase 2 — they only share this struct
+  and the `b`/`k1` parameters (Phase 2's global `b` is the scalar case of BM25F's
+  length term). Phase 2 may ship first (config-only, no migration) using `B`/`K1`;
+  Phase 3 adds `Weights` on the same struct. Or fold `b`/`k1` into Phase 3.
 
 ## Optional items
 
