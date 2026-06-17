@@ -82,7 +82,8 @@ func (fx *ftsIndex) searchCandidates(tx *btree.ReadTx, text query.Text) (qplanne
 	acc := ftsScoreAccPool.Get().(*ftsScoreAcc)
 	acc.reset()
 
-	e := ftsExec{tx: tx, fx: fx, acc: acc, n: float64(n), avgdl: avgdl, az: fts.NewAnalyzer()}
+	k1, b := ftsResolveBM25(fx.info.Fulltext)
+	e := ftsExec{tx: tx, fx: fx, acc: acc, n: float64(n), avgdl: avgdl, az: fts.NewAnalyzer(), k1: k1, b: b}
 	if err = e.run(clauses, text.DefaultAnd); err != nil {
 		ftsScoreAccPool.Put(acc)
 		return nil, err
@@ -128,18 +129,35 @@ type ftsExec struct {
 	n           float64 // corpus doc count
 	avgdl       float64
 	az          *fts.Analyzer
-	dlBuf       []byte // reusable docinfo value buffer (one per query)
+	k1, b       float64 // BM25 params for this index (resolved from FulltextParams)
+	dlBuf       []byte  // reusable docinfo value buffer (one per query)
 	tokBuf      []fts.Token
 	requiredAll uint64 // OR of every allocated required-clause bit
 	nextBit     uint   // next required-clause bit index
 }
 
-// bm25Contribution is the per-term BM25 score contribution. The expression and
-// evaluation order match the v1 inline form exactly, so pure-OR ranking is
-// bit-for-bit unchanged.
-func bm25Contribution(idf, tf, dl, avgdl float64) float64 {
-	denom := tf + bm25K1*(1-bm25B+bm25B*dl/avgdl)
-	return idf * (tf * (bm25K1 + 1)) / denom
+// ftsResolveBM25 resolves the effective BM25 (k1, b) for an index: a zero field
+// means "use the default". A single global pair (the default) reproduces the
+// original constants exactly, so default-param ranking is bit-for-bit unchanged.
+func ftsResolveBM25(p *FulltextParams) (k1, b float64) {
+	k1, b = bm25K1, bm25B
+	if p != nil {
+		if p.K1 > 0 {
+			k1 = p.K1
+		}
+		if p.B > 0 {
+			b = p.B
+		}
+	}
+	return k1, b
+}
+
+// bm25 is the per-term BM25 score contribution under this query's (k1, b). With
+// the default params the expression and evaluation order match the v1 inline
+// form exactly, so default-param OR ranking is bit-for-bit unchanged.
+func (e *ftsExec) bm25(idf, tf, dl float64) float64 {
+	denom := tf + e.k1*(1-e.b+e.b*dl/e.avgdl)
+	return idf * (tf * (e.k1 + 1)) / denom
 }
 
 // allocReqBit hands out the next required-clause bit, or 0 once 64 are exhausted
@@ -307,7 +325,7 @@ func (e *ftsExec) scanTerm(term string, reqBit uint64, tomb bool) error {
 			if derr != nil {
 				return derr
 			}
-			e.acc.addScore(docID, bm25Contribution(idf, tf, float64(dl), e.avgdl), reqBit)
+			e.acc.addScore(docID, e.bm25(idf, tf, float64(dl)), reqBit)
 		}
 		if it.Err() != nil {
 			return it.Err()
@@ -481,7 +499,7 @@ func (e *ftsExec) scorePhrase(terms []string, reqBit uint64, tomb bool) error {
 				if derr != nil {
 					return derr
 				}
-				e.acc.addScore(target, bm25Contribution(idfSum, float64(cnt), float64(dl), e.avgdl), reqBit)
+				e.acc.addScore(target, e.bm25(idfSum, float64(cnt), float64(dl)), reqBit)
 			}
 		}
 		for _, s := range streams {

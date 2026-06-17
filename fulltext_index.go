@@ -101,6 +101,14 @@ func newFtsIndex(c *collection, info IndexInfo) (*ftsIndex, error) {
 	if len(fx.fieldPaths) == 0 {
 		return nil, errors.New("fts: index requires at least one field")
 	}
+	if p := info.Fulltext; p != nil {
+		if p.B < 0 || p.B > 1 {
+			return nil, errors.New("fts: Fulltext.B must be in [0,1]")
+		}
+		if p.K1 < 0 {
+			return nil, errors.New("fts: Fulltext.K1 must be >= 0")
+		}
+	}
 	return fx, nil
 }
 

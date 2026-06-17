@@ -209,9 +209,9 @@ type FulltextParams struct {
 
 ## Optional items
 
-- **Configurable BM25 `b` (+`k1`)** — config only, no format change. Fold into the
-  `FulltextParams`/`fulltext` sub-object plumbing; thread into `searchCandidates`.
-  Even `b≈0.4` materially cuts short-doc bias. (Can land with Phase 1.)
+- **Configurable BM25 `b` (+`k1`)** — ✅ done (Phase 2). `FulltextParams.B`/`K1`,
+  persisted in the `fulltext` sub-object, resolved per query (`ftsResolveBM25`,
+  zero ⇒ default). Even `b≈0.4` materially cuts short-doc bias.
 - **Per-index stemming** (`$language` → Snowball in the analyzer) — opt-in, changes
   indexed terms (set at create, re-index to change), adds a dependency. Lowest
   priority; phrase+prefix recover most of its value. Pair with the Phase 3
@@ -222,11 +222,12 @@ type FulltextParams struct {
 
 ## Phases
 
-- **Phase 0** — structured query parser + `$defaultOperator`; prefix-before-analyze;
+- **Phase 0** ✅ — structured query parser + `$defaultOperator`; prefix-before-analyze;
   `ChunkIterator` extraction (`V1ChunkIterator`). No format change.
-- **Phase 1** — accumulator `requiredMask`/tombstone; phrase zig-zag merge;
-  CJK→implicit phrase; prefix vocab expansion. No re-index. **(this branch)**
-- **Phase 2** — configurable `b`/`k1` (optional, may fold into Phase 1 plumbing).
+- **Phase 1** ✅ — accumulator `requiredMask`/tombstone; phrase zig-zag merge;
+  CJK→implicit phrase; prefix vocab expansion. No re-index.
+- **Phase 2** ✅ — configurable `b`/`k1` (`FulltextParams.B/K1`, `fulltext`
+  sub-object, resolved per query; default-param ranking bit-for-bit unchanged).
 - **Phase 3** — per-field weights: postings v2 + docinfo v2 + per-field meta +
   `V2ChunkIterator` + BM25F scorer + migration. The one re-index.
 - **Phase 4** — stemming; vector `nProbe` (independent).

@@ -968,6 +968,10 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 		}
 		if info.Kind == IndexKindFulltext {
 			info.Fulltext = &FulltextParams{}
+			if fv := v.Get("fulltext"); fv != nil {
+				info.Fulltext.B = fv.GetFloat64("b")
+				info.Fulltext.K1 = fv.GetFloat64("k1")
+			}
 		}
 		for _, fv := range v.GetArray("fields") {
 			info.Fields = append(info.Fields, string(fv.GetStringBytes()))
@@ -1073,6 +1077,18 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 			vobj.Set("hvc", a.NewNumberInt(1))
 		}
 		obj.Set("vector", vobj)
+	}
+	if info.Kind == IndexKindFulltext && info.Fulltext != nil {
+		if info.Fulltext.B != 0 || info.Fulltext.K1 != 0 {
+			fobj := a.NewObject()
+			if info.Fulltext.B != 0 {
+				fobj.Set("b", a.NewNumberFloat64(info.Fulltext.B))
+			}
+			if info.Fulltext.K1 != 0 {
+				fobj.Set("k1", a.NewNumberFloat64(info.Fulltext.K1))
+			}
+			obj.Set("fulltext", fobj)
+		}
 	}
 	return tx.Put(db.systemNS, key, obj.MarshalTo(nil))
 }
