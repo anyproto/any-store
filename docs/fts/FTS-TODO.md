@@ -37,15 +37,16 @@ allocation analysis in its PERF-1.
    that skips unchanged regions, or accept and document the chunking
    guidance.
 
-3. **v1 query semantics gaps that will surface in app UX:**
-   - bag-of-words OR only — no phrase queries (positions are planned v2),
-     no AND semantics, no per-field weights;
-   - **no prefix search** — search-as-you-type needs `term*` or an edge-
-     ngram option;
-   - single default analyzer (NFKC + fold + UAX#29 + CJK bigram) — no
-     language stemming;
-   - `$text` only top-level or inside `$and`, one per query.
-   TODO: prioritize prefix matching for type-ahead; phrase support next.
+3. **Query semantics — Phase 1 closed most of these** (see `FTS-V2-PLAN.md`):
+   - ✅ phrase queries (`"..."`, positional merge) + positional CJK matching;
+   - ✅ boolean AND / required + exclude — via the typed `$require` / `$exclude`
+     sub-fields and `$defaultOperator:"and"` (deliberately NOT inline `+`/`-`,
+     which is unsafe for raw user input);
+   - ✅ prefix search (`term*`) for search-as-you-type;
+   - ⏳ per-field weights (BM25F) — Phase 3 (postings v2 + docinfo v2, re-index);
+   - ⏳ language stemming — still a single default analyzer (NFKC + fold +
+     UAX#29 + CJK bigram); optional, Phase 4;
+   - still: `$text` only top-level or inside `$and`, one per query.
 
 4. Residual filters on high-df queries inherit cost #1 (the filter applies
    after full BM25 accumulation): 15.9 ms for selective-filter over the

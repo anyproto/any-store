@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/parser"
@@ -380,8 +381,20 @@ func makeCompFilter(op Operator, v *anyenc.Value) (f Filter, err error) {
 	}
 }
 
-// parseText parses {"$search": "...", "$language": "..."} into a Text filter.
-// $language is accepted and ignored for v1 (the analyzer is language-neutral).
+// parseText parses the $text predicate object into a Text filter:
+//
+//	{
+//	  "$search": "free text \"phrases\" prefix*",  // should/OR (or AND, see below)
+//	  "$defaultOperator": "and" | "or",            // default joins $search terms
+//	  "$require": "critical" | ["a", "\"b c\""],   // each entry required (AND)
+//	  "$exclude": "spam" | ["draft", "x*"]          // each entry excluded
+//	}
+//
+// $require/$exclude take a string or an array of strings; each entry reuses the
+// phrase/prefix syntax of $search (ParseTextSearch) with its boolean role fixed
+// by the field. This replaces inline +/- in the search string, which is unsafe
+// for raw user input (see ParseTextSearch). $language/$caseSensitive/
+// $diacriticSensitive are accepted and ignored (the analyzer is language-neutral).
 // Note the Text caveat: outside an FTS-driven query its Ok matches everything.
 func parseText(v *anyenc.Value) (Filter, error) {
 	if v.Type() != anyenc.TypeObject {
@@ -389,10 +402,35 @@ func parseText(v *anyenc.Value) (Filter, error) {
 	}
 	obj, _ := v.Object()
 	var (
-		search string
-		hasS   bool
-		perr   error
+		search      string
+		hasS        bool
+		defaultAnd  bool
+		requireRaws []string
+		excludeRaws []string
+		perr        error
 	)
+	// appendStrings reads a string or array-of-strings field into dst.
+	appendStrings := func(field string, val *anyenc.Value, dst []string) []string {
+		switch val.Type() {
+		case anyenc.TypeString:
+			sb, _ := val.StringBytes()
+			return append(dst, string(sb))
+		case anyenc.TypeArray:
+			arr, _ := val.Array()
+			for _, e := range arr {
+				sb, er := e.StringBytes()
+				if er != nil {
+					perr = fmt.Errorf("%s entries must be strings", field)
+					return dst
+				}
+				dst = append(dst, string(sb))
+			}
+			return dst
+		default:
+			perr = fmt.Errorf("%s must be a string or an array of strings", field)
+			return dst
+		}
+	}
 	obj.Visit(func(key []byte, val *anyenc.Value) {
 		if perr != nil {
 			return
@@ -405,6 +443,24 @@ func parseText(v *anyenc.Value) (Filter, error) {
 				return
 			}
 			search, hasS = string(sb), true
+		case "$defaultOperator":
+			sb, e := val.StringBytes()
+			if e != nil {
+				perr = fmt.Errorf("$defaultOperator must be a string (\"and\" or \"or\")")
+				return
+			}
+			switch strings.ToLower(string(sb)) {
+			case "and":
+				defaultAnd = true
+			case "or", "":
+				defaultAnd = false
+			default:
+				perr = fmt.Errorf("$defaultOperator must be \"and\" or \"or\", got %q", string(sb))
+			}
+		case "$require":
+			requireRaws = appendStrings("$require", val, requireRaws)
+		case "$exclude":
+			excludeRaws = appendStrings("$exclude", val, excludeRaws)
 		case "$language", "$caseSensitive", "$diacriticSensitive":
 			// accepted for Mongo compatibility, ignored in v1
 		default:
@@ -417,7 +473,90 @@ func parseText(v *anyenc.Value) (Filter, error) {
 	if !hasS {
 		return nil, fmt.Errorf("$text requires $search")
 	}
-	return Text{Search: search}, nil
+
+	clauses := ParseTextSearch(search) // all should
+	for _, r := range requireRaws {
+		clauses = appendTextClauses(clauses, r, TextMust)
+	}
+	for _, r := range excludeRaws {
+		clauses = appendTextClauses(clauses, r, TextMustNot)
+	}
+	return Text{Search: search, DefaultAnd: defaultAnd, Clauses: clauses}, nil
+}
+
+// ParseTextSearch splits a $text $search string into clauses. It is a purely
+// syntactic scan — no analysis/tokenization happens here (that is the FTS
+// executor's job, using the index's analyzer). Every clause it returns is a
+// should (OR) clause; required/excluded clauses come from the typed $require /
+// $exclude sub-fields instead (see parseText), not from inline string signs.
+//
+//   - "double quoted"  → a phrase clause (positional adjacency).
+//   - word*            → a prefix clause (vocabulary expansion).
+//   - word             → a plain term clause.
+//
+// Deliberately there is NO inline +/- boolean syntax. Parsing boolean intent out
+// of a raw human search string is a footgun for an embedded library whose common
+// use is "forward the end-user's search box straight into $search": a user typing
+// "-9" (meaning −9°C) or "+1" (a vote) would silently get an exclusion/require.
+// The same characters are harmless here — they are punctuation the analyzer drops
+// — so "-9" is just the term "9". Boolean require/exclude lives in the structured
+// $require / $exclude arrays, which are unambiguous and run through the same
+// analyzer. An app that wants single-box power-user syntax can parse it itself and
+// populate those fields. A trailing * is still honoured on bare words (prefix
+// expansion has negligible false-positive rate in natural text); it is left
+// literal inside a phrase, where positional expansion would be combinatorial.
+func ParseTextSearch(s string) []TextClause {
+	var clauses []TextClause
+	rs := []rune(s)
+	i, n := 0, len(rs)
+	for i < n {
+		for i < n && unicode.IsSpace(rs[i]) {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		if rs[i] == '"' {
+			i++ // opening quote
+			start := i
+			for i < n && rs[i] != '"' {
+				i++
+			}
+			raw := strings.TrimSpace(string(rs[start:i]))
+			if i < n {
+				i++ // closing quote
+			}
+			if raw != "" {
+				clauses = append(clauses, TextClause{Raw: raw, Phrase: true, Op: TextShould})
+			}
+			continue
+		}
+		start := i
+		for i < n && !unicode.IsSpace(rs[i]) {
+			i++
+		}
+		word := string(rs[start:i])
+		prefix := false
+		if strings.HasSuffix(word, "*") {
+			prefix = true
+			word = strings.TrimRight(word, "*")
+		}
+		if word != "" {
+			clauses = append(clauses, TextClause{Raw: word, Prefix: prefix, Op: TextShould})
+		}
+	}
+	return clauses
+}
+
+// appendTextClauses parses raw with ParseTextSearch and appends its clauses to
+// dst with their boolean role forced to op (used for $require / $exclude entries,
+// which reuse the phrase/prefix syntax but fix the clause role by field).
+func appendTextClauses(dst []TextClause, raw string, op TextOp) []TextClause {
+	for _, c := range ParseTextSearch(raw) {
+		c.Op = op
+		dst = append(dst, c)
+	}
+	return dst
 }
 
 func parseSize(v *anyenc.Value) (Filter, error) {

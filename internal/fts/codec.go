@@ -109,10 +109,39 @@ func DecodeChunkInto(dst []Posting, posBuf []uint32, blob []byte) ([]Posting, []
 	return dst, posBuf, r.Err()
 }
 
+// ChunkIterator streams documents out of a postings chunk in ascending DocID,
+// decoding each document's term frequency eagerly but its positions only on
+// demand. It is the format-agnostic read primitive the search path consumes:
+// the BM25 scan reads only DocID/TF, and the zig-zag phrase merge advances
+// DocIDs cheaply and materializes positions only for documents that survive the
+// merge. v1 chunks are served by ChunkReader; a future v2 (per-field TF) chunk
+// will implement the same interface, so the search code never sees the layout.
+type ChunkIterator interface {
+	// Next advances to the next document, returning false at end of chunk or on
+	// error (check Err). It skips any unconsumed positions of the prior document.
+	Next() bool
+	// DocID returns the current document's internal id.
+	DocID() uint64
+	// TF returns the current document's total term frequency.
+	TF() uint32
+	// AppendPositions decodes the current document's positions onto dst. Calling
+	// it consumes the positions for this document.
+	AppendPositions(dst []uint32) []uint32
+	// Err returns the first decode error encountered.
+	Err() error
+}
+
+// NewChunkIterator returns a ChunkIterator for a postings chunk blob, dispatching
+// on the leading version byte. Today only v1 (ChunkReader) exists; v2 will slot
+// in here without touching any caller.
+func NewChunkIterator(blob []byte) (ChunkIterator, error) {
+	return NewChunkReader(blob)
+}
+
 // ChunkReader streams documents out of a chunk blob without allocating, decoding
 // each document's positions only on demand. It is the read-path primitive: the
 // zig-zag phrase merge advances DocIDs cheaply and only materializes positions
-// for documents that survive the merge.
+// for documents that survive the merge. It implements ChunkIterator.
 type ChunkReader struct {
 	buf         []byte // remaining undecoded tail
 	prevDoc     uint64
