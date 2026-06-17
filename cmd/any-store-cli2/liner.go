@@ -20,6 +20,12 @@ func runLiner() {
 	lineClose := func() {
 		mainCtx.CancelAndReplace()
 		_ = line.Close()
+		// Close any paged iterator left open by a "Type \"it\" for more"
+		// result before closing the db. The iterator holds a read
+		// transaction (and the btree reader lock); db.Close() blocks
+		// forever waiting for active readers to drain, so leaking it here
+		// hangs the process on Ctrl+C.
+		conn.closeLastIter()
 		_ = conn.db.Close()
 	}
 	defer lineClose()
