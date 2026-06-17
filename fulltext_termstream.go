@@ -72,7 +72,14 @@ func (ts *termStream) loadChunk() {
 			ts.valid = false
 			return
 		}
-		ts.it, err = fts.NewChunkIterator(val)
+		// Reuse one iterator across chunks: the first chunk picks the format impl
+		// (by version byte); the rest Reset it, so a multi-chunk term costs one
+		// iterator alloc, not one per chunk. All of a term's chunks share a version.
+		if ts.it == nil {
+			ts.it, err = fts.NewChunkIterator(val)
+		} else {
+			err = ts.it.Reset(val)
+		}
 		if err != nil {
 			ts.err = err
 			ts.valid = false

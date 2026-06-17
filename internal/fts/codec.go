@@ -127,6 +127,10 @@ type ChunkIterator interface {
 	// AppendPositions decodes the current document's positions onto dst. Calling
 	// it consumes the positions for this document.
 	AppendPositions(dst []uint32) []uint32
+	// Reset re-initializes the iterator over a new chunk blob (same format
+	// version), so a cross-chunk walk can reuse one iterator instead of
+	// allocating per chunk. Returns the same errors as the constructor.
+	Reset(blob []byte) error
 	// Err returns the first decode error encountered.
 	Err() error
 }
@@ -155,13 +159,25 @@ type ChunkReader struct {
 // NewChunkReader validates the version byte and returns a reader positioned
 // before the first document.
 func NewChunkReader(blob []byte) (*ChunkReader, error) {
+	r := &ChunkReader{}
+	if err := r.Reset(blob); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// Reset re-initializes the reader over a new chunk blob, clearing all decode
+// state, so a cross-chunk walk (termStream) can reuse one reader instead of
+// allocating a fresh one per chunk.
+func (r *ChunkReader) Reset(blob []byte) error {
 	if len(blob) == 0 {
-		return nil, ErrCorruptChunk
+		return ErrCorruptChunk
 	}
 	if blob[0] != PostingsVersion {
-		return nil, ErrUnknownVersion
+		return ErrUnknownVersion
 	}
-	return &ChunkReader{buf: blob[1:]}, nil
+	*r = ChunkReader{buf: blob[1:]}
+	return nil
 }
 
 // Next advances to the next document. It decodes the DocID and TF but leaves the
