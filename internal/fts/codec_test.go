@@ -7,12 +7,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// sf builds a single-field posting (field 0), the common case: FieldMask = 1,
+// one TF = len(positions).
+func sf(docID uint64, pos ...uint32) Posting {
+	return Posting{DocID: docID, Fields: 1, FieldTF: []uint32{uint32(len(pos))}, Positions: pos}
+}
+
 func TestChunk_RoundTrip(t *testing.T) {
 	in := []Posting{
-		{DocID: 3, Positions: []uint32{0, 5, 17}},
-		{DocID: 4, Positions: []uint32{2}},
-		{DocID: 130, Positions: []uint32{0, 1, 2, 3}},
-		{DocID: 9001, Positions: []uint32{42}},
+		sf(3, 0, 5, 17),
+		sf(4, 2),
+		sf(130, 0, 1, 2, 3),
+		sf(9001, 42),
 	}
 	blob := AppendChunk(nil, in)
 	assert.Equal(t, byte(PostingsVersion), blob[0])
@@ -22,8 +28,37 @@ func TestChunk_RoundTrip(t *testing.T) {
 	assert.Equal(t, in, out)
 }
 
+func TestChunk_MultiField_RoundTrip(t *testing.T) {
+	// Field 0 (title) + field 2 (tag): mask = 0b101, TFs in ascending field order.
+	in := []Posting{
+		{DocID: 1, Fields: 0b101, FieldTF: []uint32{1, 2}, Positions: []uint32{0, 200, 201}},
+		{DocID: 2, Fields: 0b010, FieldTF: []uint32{3}, Positions: []uint32{100, 101, 102}},
+	}
+	out, err := DecodeChunk(nil, AppendChunk(nil, in))
+	require.NoError(t, err)
+	assert.Equal(t, in, out)
+}
+
+func TestChunkReader_FieldTFAccessor(t *testing.T) {
+	in := []Posting{{DocID: 7, Fields: 0b1010, FieldTF: []uint32{4, 9}, Positions: make([]uint32, 13)}}
+	// fill positions ascending so decode is valid
+	for i := range in[0].Positions {
+		in[0].Positions[i] = uint32(i)
+	}
+	r, err := NewChunkReader(AppendChunk(nil, in))
+	require.NoError(t, err)
+	require.True(t, r.Next())
+	assert.Equal(t, uint64(0b1010), r.FieldMask())
+	assert.Equal(t, uint32(0), r.FieldTF(0))
+	assert.Equal(t, uint32(4), r.FieldTF(1)) // first set bit
+	assert.Equal(t, uint32(0), r.FieldTF(2))
+	assert.Equal(t, uint32(9), r.FieldTF(3)) // second set bit
+	assert.Equal(t, uint32(13), r.TF())      // total
+	assert.Equal(t, []uint32{4, 9}, r.AppendFieldTFs(nil))
+}
+
 func TestChunk_SingleDoc(t *testing.T) {
-	in := []Posting{{DocID: 0, Positions: []uint32{0}}}
+	in := []Posting{sf(0, 0)}
 	out, err := DecodeChunk(nil, AppendChunk(nil, in))
 	require.NoError(t, err)
 	assert.Equal(t, in, out)
@@ -38,12 +73,7 @@ func TestChunk_Empty(t *testing.T) {
 }
 
 func TestChunkReader_SkipPositions(t *testing.T) {
-	// Advancing without reading positions must still land on correct DocIDs/TF.
-	in := []Posting{
-		{DocID: 1, Positions: []uint32{0, 1, 2}},
-		{DocID: 7, Positions: []uint32{9}},
-		{DocID: 12, Positions: []uint32{3, 8}},
-	}
+	in := []Posting{sf(1, 0, 1, 2), sf(7, 9), sf(12, 3, 8)}
 	r, err := NewChunkReader(AppendChunk(nil, in))
 	require.NoError(t, err)
 
@@ -52,7 +82,6 @@ func TestChunkReader_SkipPositions(t *testing.T) {
 	for r.Next() {
 		gotDocs = append(gotDocs, r.DocID())
 		gotTF = append(gotTF, r.TF())
-		// deliberately do NOT call AppendPositions for most docs
 	}
 	require.NoError(t, r.Err())
 	assert.Equal(t, []uint64{1, 7, 12}, gotDocs)
@@ -60,27 +89,38 @@ func TestChunkReader_SkipPositions(t *testing.T) {
 }
 
 func TestChunkReader_PositionsOnDemand(t *testing.T) {
-	in := []Posting{
-		{DocID: 1, Positions: []uint32{0, 4}},
-		{DocID: 2, Positions: []uint32{7, 9, 11}},
-	}
+	in := []Posting{sf(1, 0, 4), sf(2, 7, 9, 11)}
 	r, err := NewChunkReader(AppendChunk(nil, in))
 	require.NoError(t, err)
 
 	require.True(t, r.Next())
 	assert.Equal(t, uint64(1), r.DocID())
-	// skip positions of doc 1 by not reading them
 	require.True(t, r.Next())
 	assert.Equal(t, uint64(2), r.DocID())
 	assert.Equal(t, []uint32{7, 9, 11}, r.AppendPositions(nil))
-	// idempotent: second call returns nothing more (already consumed)
 	assert.Empty(t, r.AppendPositions(nil))
 	require.False(t, r.Next())
 	require.NoError(t, r.Err())
 }
 
+func TestChunkReader_Reset(t *testing.T) {
+	a := AppendChunk(nil, []Posting{sf(1, 0), sf(2, 1)})
+	b := AppendChunk(nil, []Posting{sf(5, 0, 1)})
+	r, err := NewChunkReader(a)
+	require.NoError(t, err)
+	require.True(t, r.Next())
+	require.NoError(t, r.Reset(b))
+	require.True(t, r.Next())
+	assert.Equal(t, uint64(5), r.DocID())
+	assert.Equal(t, uint32(2), r.TF())
+	require.False(t, r.Next())
+}
+
 func TestChunkReader_BadVersion(t *testing.T) {
 	_, err := NewChunkReader([]byte{0xFF, 0x00})
+	assert.ErrorIs(t, err, ErrUnknownVersion)
+	// A v1 blob (version byte 1) is rejected — it must be migrated, not decoded.
+	_, err = NewChunkReader([]byte{0x01, 0x00})
 	assert.ErrorIs(t, err, ErrUnknownVersion)
 }
 
@@ -90,9 +130,7 @@ func TestChunkReader_EmptyBlob(t *testing.T) {
 }
 
 func TestChunkReader_TruncatedIsDetected(t *testing.T) {
-	in := []Posting{{DocID: 5, Positions: []uint32{1, 2, 3}}}
-	blob := AppendChunk(nil, in)
-	// Chop the last byte to truncate a position varint stream.
+	blob := AppendChunk(nil, []Posting{sf(5, 1, 2, 3)})
 	r, err := NewChunkReader(blob[:len(blob)-1])
 	require.NoError(t, err)
 	for r.Next() {
@@ -108,15 +146,12 @@ func TestChunkID(t *testing.T) {
 	assert.Equal(t, uint64(70), ChunkID(9001))
 }
 
-// buildFullChunk makes a realistic full (128-doc) chunk: a common term with a
-// few positions per doc.
+// buildFullChunk makes a realistic full (128-doc) chunk: a common single-field
+// term with a few positions per doc.
 func buildFullChunk() []byte {
 	postings := make([]Posting, ChunkSize)
 	for i := 0; i < ChunkSize; i++ {
-		postings[i] = Posting{
-			DocID:     uint64(i * 3), // gaps, ascending
-			Positions: []uint32{uint32(i), uint32(i + 10), uint32(i + 25)},
-		}
+		postings[i] = sf(uint64(i*3), uint32(i), uint32(i+10), uint32(i+25))
 	}
 	return AppendChunk(nil, postings)
 }
@@ -140,7 +175,6 @@ func BenchmarkDecodeChunk_Full(b *testing.B) {
 }
 
 func BenchmarkDecodeChunk_DocIDsOnly(b *testing.B) {
-	// Scoring/merge that only needs DocIDs+TF and skips positions.
 	blob := buildFullChunk()
 	b.ReportAllocs()
 	b.ResetTimer()

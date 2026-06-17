@@ -29,6 +29,26 @@ const (
 // that has no full-text index.
 var ErrNoFulltextIndex = errors.New("any-store: collection has no full-text index for $text")
 
+// ErrFtsFormatOutdated is returned when a full-text index's postings were written
+// by an older build (a different on-disk format version). The fix is to drop and
+// recreate the index. any-store makes no on-disk back-compatibility promise for
+// full-text indexes yet (see docs/fts/DESIGN.md); the postings version byte makes
+// this safe (the old blob is rejected, never mis-decoded as corruption).
+var ErrFtsFormatOutdated = errors.New("any-store: full-text index uses an older on-disk format; drop and recreate the index")
+
+// ftsFormatVersion is the current fts postings format, stamped into fts:meta. It
+// tracks fts.PostingsVersion (v2 added per-field TF).
+const ftsFormatVersion = uint64(2)
+
+// ftsMapFormatErr converts the low-level unknown-version error from decoding an
+// old chunk into the actionable ErrFtsFormatOutdated; other errors pass through.
+func ftsMapFormatErr(err error) error {
+	if errors.Is(err, fts.ErrUnknownVersion) {
+		return ErrFtsFormatOutdated
+	}
+	return err
+}
+
 // searchCandidates runs a bag-of-words BM25 query over the index and returns a
 // stream of matched documents ordered by descending score (ties broken by
 // ascending IntDocID for determinism) — the source the FtsIter pulls from.
@@ -83,10 +103,14 @@ func (fx *ftsIndex) searchCandidates(tx *btree.ReadTx, text query.Text) (qplanne
 	acc.reset()
 
 	k1, b := ftsResolveBM25(fx.info.Fulltext)
-	e := ftsExec{tx: tx, fx: fx, acc: acc, n: float64(n), avgdl: avgdl, az: fts.NewAnalyzer(), k1: k1, b: b}
+	weights, weighted := ftsResolveWeights(fx.info.Fulltext, fx.info.Fields)
+	e := ftsExec{
+		tx: tx, fx: fx, acc: acc, n: float64(n), avgdl: avgdl, az: fts.NewAnalyzer(),
+		k1: k1, b: b, nFields: fx.nFields, weights: weights, weighted: weighted,
+	}
 	if err = e.run(clauses, text.DefaultAnd); err != nil {
 		ftsScoreAccPool.Put(acc)
-		return nil, err
+		return nil, ftsMapFormatErr(err)
 	}
 
 	// Rank in the accumulator's pooled scratch: sort by score desc / docID asc.
@@ -129,11 +153,39 @@ type ftsExec struct {
 	n           float64 // corpus doc count
 	avgdl       float64
 	az          *fts.Analyzer
-	k1, b       float64 // BM25 params for this index (resolved from FulltextParams)
-	dlBuf       []byte  // reusable docinfo value buffer (one per query)
+	k1, b       float64   // BM25 params for this index (resolved from FulltextParams)
+	nFields     int       // number of indexed fields
+	weights     []float64 // per-field BM25F boost (len nFields); nil when unweighted
+	weighted    bool      // any field weight != 1.0 — enables the per-field score path
+	dlBuf       []byte    // reusable docinfo value buffer (one per query)
 	tokBuf      []fts.Token
 	requiredAll uint64 // OR of every allocated required-clause bit
 	nextBit     uint   // next required-clause bit index
+}
+
+// ftsResolveWeights builds the per-field BM25F boost slice (indexed by field
+// position) from FulltextParams.Weights (keyed by field name). weighted is false
+// when every weight is the default 1.0, so the scorer keeps the exact unweighted
+// fast path (and bit-for-bit-identical scores).
+func ftsResolveWeights(p *FulltextParams, fields []string) (weights []float64, weighted bool) {
+	if p == nil || len(p.Weights) == 0 {
+		return nil, false
+	}
+	weights = make([]float64, len(fields))
+	for i, f := range fields {
+		w, ok := p.Weights[f]
+		if !ok {
+			w = 1.0
+		}
+		weights[i] = w
+		if w != 1.0 {
+			weighted = true
+		}
+	}
+	if !weighted {
+		return nil, false
+	}
+	return weights, true
 }
 
 // ftsResolveBM25 resolves the effective BM25 (k1, b) for an index: a zero field
@@ -320,7 +372,21 @@ func (e *ftsExec) scanTerm(term string, reqBit uint64, tomb bool) error {
 				e.acc.markTomb(docID)
 				continue
 			}
-			tf := float64(it.TF())
+			// BM25F: combine per-field TFs by weight into a pseudo-frequency, then
+			// apply standard saturation + (global) length normalization. Unweighted
+			// indexes take the exact v1 path (total TF), so scores are unchanged.
+			var tf float64
+			if e.weighted {
+				for f := 0; f < e.nFields; f++ {
+					if w := e.weights[f]; w != 0 {
+						if ftf := it.FieldTF(f); ftf != 0 {
+							tf += w * float64(ftf)
+						}
+					}
+				}
+			} else {
+				tf = float64(it.TF())
+			}
 			dl, derr := e.docLen(docID)
 			if derr != nil {
 				return derr

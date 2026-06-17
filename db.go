@@ -971,6 +971,17 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 			if fv := v.Get("fulltext"); fv != nil {
 				info.Fulltext.B = fv.GetFloat64("b")
 				info.Fulltext.K1 = fv.GetFloat64("k1")
+				if wv := fv.Get("weights"); wv != nil {
+					if wobj, oerr := wv.Object(); oerr == nil {
+						weights := map[string]float64{}
+						wobj.Visit(func(key []byte, val *anyenc.Value) {
+							weights[string(key)] = val.GetFloat64()
+						})
+						if len(weights) > 0 {
+							info.Fulltext.Weights = weights
+						}
+					}
+				}
 			}
 		}
 		for _, fv := range v.GetArray("fields") {
@@ -1079,13 +1090,21 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 		obj.Set("vector", vobj)
 	}
 	if info.Kind == IndexKindFulltext && info.Fulltext != nil {
-		if info.Fulltext.B != 0 || info.Fulltext.K1 != 0 {
+		ft := info.Fulltext
+		if ft.B != 0 || ft.K1 != 0 || len(ft.Weights) != 0 {
 			fobj := a.NewObject()
-			if info.Fulltext.B != 0 {
-				fobj.Set("b", a.NewNumberFloat64(info.Fulltext.B))
+			if ft.B != 0 {
+				fobj.Set("b", a.NewNumberFloat64(ft.B))
 			}
-			if info.Fulltext.K1 != 0 {
-				fobj.Set("k1", a.NewNumberFloat64(info.Fulltext.K1))
+			if ft.K1 != 0 {
+				fobj.Set("k1", a.NewNumberFloat64(ft.K1))
+			}
+			if len(ft.Weights) != 0 {
+				wobj := a.NewObject()
+				for field, w := range ft.Weights {
+					wobj.Set(field, a.NewNumberFloat64(w))
+				}
+				fobj.Set("weights", wobj)
 			}
 			obj.Set("fulltext", fobj)
 		}

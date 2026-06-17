@@ -44,7 +44,8 @@ allocation analysis in its PERF-1.
      which is unsafe for raw user input);
    - ✅ prefix search (`term*`) for search-as-you-type;
    - ✅ configurable BM25 `b`/`k1` (`FulltextParams.B/K1`) — Phase 2;
-   - ⏳ per-field weights (BM25F) — Phase 3 (postings v2 + docinfo v2, re-index);
+   - ✅ per-field weights (BM25F) — Phase 3 (postings v2 + per-field TF; simplified
+     BM25F with global length-norm; `FulltextParams.Weights`); v1 data drops/recreates;
    - ⏳ language stemming — still a single default analyzer (NFKC + fold +
      UAX#29 + CJK bigram); optional, Phase 4;
    - still: `$text` only top-level or inside `$and`, one per query.

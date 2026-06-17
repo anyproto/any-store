@@ -982,7 +982,8 @@ func (c *collection) buildFtsIndex(tx *btree.WriteTx, fx *ftsIndex) error {
 			return err
 		}
 	}
-	return nil
+	// Stamp the postings format version so a future upgrade can detect old data.
+	return fx.putMetaUint(tx, ftsMetaFormat, ftsFormatVersion)
 }
 
 func (c *collection) DropIndex(ctx context.Context, indexName string) (err error) {

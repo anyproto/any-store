@@ -262,6 +262,14 @@ type IndexInfo struct {
 // and analyzer/stemming selection are reserved for a later version. The default
 // analyzer (NFKC + case-fold + UAX#29 + CJK bigram) is used for all fields.
 type FulltextParams struct {
+	// Weights is the per-field BM25F boost, keyed by indexed field name (each key
+	// must be one of IndexInfo.Fields). A field absent from the map has weight 1.0.
+	// Mirrors MongoDB's text-index weights option, but scoring is BM25F: the
+	// per-field term frequencies are combined as Σ weight_f · tf_f and then scored
+	// with standard BM25 saturation + length normalization. Set at index creation;
+	// changing a weight only changes ranking (no re-index needed — weights are read
+	// at query time). Boosting e.g. {"title": 5} ranks title matches above body.
+	Weights map[string]float64 `json:"weights,omitempty"`
 	// B is the BM25 length-normalization parameter, in [0,1]. 0 ⇒ the default
 	// 0.75. Lower values reduce the bias toward short documents (e.g. 0.4 is a
 	// reasonable choice for a corpus of mixed-length notes); 0 disables length

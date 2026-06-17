@@ -140,9 +140,9 @@ Traps (enforced):
   then only score other clauses against docs already present. Current scale
   doesn't need it.
 
-## On-disk format for per-field weights (Phase 3)
+## On-disk format for per-field weights (Phase 3) — IMPLEMENTED
 
-Postings chunk **v2** (version byte bumped), per document:
+Postings chunk **v2** (version byte 1→2), per document:
 
 ```
 DocIDDelta : uvarint
@@ -151,21 +151,42 @@ TF_f       : uvarint × popcount(FieldMask)   // per set bit, in field order
 PosDelta   : uvarint × Σ TF_f   // GLOBAL gapped positions (unchanged from v1)
 ```
 
+**Scoring — simplified BM25F (global length normalization).** Implemented as a
+weighted-frequency combine: `TF_combined = Σ_f weight_f · tf_f`, then standard
+BM25 saturation + length-norm on the *global* doc length:
+`score = IDF · TF_combined·(k1+1) / (TF_combined + k1·(1−b+b·dl/avgdl))`.
+This is the widely-used BM25F variant and, crucially, still reduces **exactly** to
+classic BM25 for a single field with weight 1 (so the existing oracle is
+unchanged). It deliberately does **not** do per-field length normalization
+(Robertson's full BM25F), which keeps the change to the postings format alone —
+no docinfo/meta format change, no per-field `avgL_f` bookkeeping, smaller
+migration surface. Per-field length-norm is a possible future refinement.
+
 - Positions stay **global + field-gapped** — phrase merge unchanged; the gap
   still blocks cross-field phrases. Per-field weighting uses only the TF vector.
 - `FieldMask` is 1 byte for ≤7 fields; empty fields cost 0 TF bytes.
-  **Cap FTS-indexed fields at 64** (fits a uint64 mask).
-- **`fts:vocab` unchanged** — DF stays global per term (corpus rarity drives IDF;
-  a term in both title and body of one doc is df=1).
-- **`fts:docinfo` v2**: `[Len_field0, Len_field1, …]` varints instead of one len.
-- **`fts:meta`**: track `TotalTokens` per field (for `avgL_f`); store the field
-  list so `fieldIdx` is stable across reopen.
-- **`V2ChunkIterator`** reads `FieldMask`+TFs eagerly, skips positions in `Next()`
-  (varint count known) → hot common-term path still never decodes positions.
+  **FTS-indexed fields capped at 64** (`fts.MaxFields`, fits a uint64 mask).
+- **`fts:vocab` unchanged** — DF stays global per term (corpus rarity drives IDF).
+- **`fts:docinfo` / `fts:meta` unchanged** — global doc length + global token
+  total only (the simplified scorer needs no per-field lengths). `fieldIdx` comes
+  from `IndexInfo.Fields` order (already persisted in the index doc).
+- **`ChunkReader` (the v2 iterator)** reads `FieldMask`+TFs eagerly, skips
+  positions in `Next()` (count known) → hot common-term path never decodes
+  positions. Unweighted indexes use `it.TF()` (total) directly — exact v1 path.
+- **Field attribution (write path):** `analyzeInto` records `fieldStarts` (the
+  global position where each field begins, advanced by the field's max position +
+  gap so multi-element array fields don't overlap); `fieldBreakdown` walks a
+  term's ascending positions once to produce the FieldMask + per-field TF.
 - **Incremental update** stays one-chunk-per-term: the diff path carries per-field
   TF; moving a term title→body rewrites one chunk, not two.
-- **Migration**: a v1 chunk under a weighted index ⇒ blocking re-index on open
-  (acceptable in alpha; no FTS on-disk back-compat promise yet).
+- **Migration**: the postings version byte makes old (v1) data **safe** — it is
+  rejected, never mis-decoded. A `fmt` marker is stamped in `fts:meta`, and any
+  attempt to read/write a v1 chunk surfaces the actionable `ErrFtsFormatOutdated`
+  ("drop and recreate the index"). Auto-rebuild on open was considered but isn't
+  done: open uses a read tx (no write tx to rebuild in), and a rebuild interleaved
+  with an in-flight write is fragile. Under the alpha no-back-compat policy,
+  drop-and-recreate is the documented upgrade path; auto-rebuild is a future option
+  once a back-compat promise is made.
 
 ### Settled API — `FulltextParams` (locked 2026-06-17)
 
@@ -228,8 +249,10 @@ type FulltextParams struct {
   CJK→implicit phrase; prefix vocab expansion. No re-index.
 - **Phase 2** ✅ — configurable `b`/`k1` (`FulltextParams.B/K1`, `fulltext`
   sub-object, resolved per query; default-param ranking bit-for-bit unchanged).
-- **Phase 3** — per-field weights: postings v2 + docinfo v2 + per-field meta +
-  `V2ChunkIterator` + BM25F scorer + migration. The one re-index.
+- **Phase 3** ✅ — per-field weights: postings v2 (FieldMask + per-field TF) +
+  v2 ChunkReader + simplified BM25F scorer + `Weights` API + format marker /
+  `ErrFtsFormatOutdated`. docinfo/meta unchanged (global length norm). v1 data
+  upgrades by drop-and-recreate.
 - **Phase 4** — stemming; vector `nProbe` (independent).
 
 ## Decision record
