@@ -122,8 +122,9 @@ NFKC normalize  ->  Unicode case-fold  ->  UAX#29 word split  ->  CJK bigram
   UAX#29 emits each CJK ideograph/kana/Hangul syllable as its own token.
 - **CJK bigrams**: consecutive CJK characters are re-assembled into overlapping
   bigrams (`東京都` → `東京`, `京都`) at contiguous positions. A lone CJK char is a
-  unigram. A CJK query is rewritten to a **phrase** over its bigrams and scored
-  by summing the bigram BM25 contributions.
+  unigram. A CJK query is matched as a **phrase** over its bigrams (positional
+  adjacency) and scored as one synthetic term: TF = the adjacency-confirmed
+  occurrence count, IDF = the sum of the constituent bigrams' IDFs.
 
 Explicitly **not** done: stemming (we can't assume a per-field language; prefix
 search covers most of its value) and diacritic stripping (NFKC already makes the
@@ -264,11 +265,20 @@ To guarantee a correct global top-k the search exhausts the query terms' chunks
 (cheap at our scale: decoding ~100k varint postings is single-digit ms). No
 index-intersection pushdown is built into the postings format.
 
-Phrase / CJK matching (deferred) would be a zig-zag merge join on `IntDocID`
-across the involved terms' chunks, then a positional adjacency check.
+Phrase / CJK matching (**implemented**, Phase 1 — see `FTS-V2-PLAN.md`) is a
+zig-zag merge join on `IntDocID` across the phrase terms' chunks (`termStream`),
+then a positional adjacency check; it scores the phrase as a synthetic term
+(TF = adjacency count, IDF = Σ of constituent IDFs). A CJK run analyzes to
+adjacent bigrams and is matched as an implicit phrase.
 
-Prefix / search-as-you-type: prefix-scan `fts:vocab`, take the top-M completions
-by `df`, then query only those terms' postings — bounds latency.
+Prefix / search-as-you-type (**implemented**, Phase 1): prefix-scan `fts:vocab`,
+take the top-M completions by `df` (`ftsPrefixMaxExpansions`), then OR those
+terms' postings — bounds latency.
+
+Boolean require/exclude (**implemented**, Phase 1) come from the typed
+`$require`/`$exclude` sub-fields of `$text` (not inline `+`/`-`): required clauses
+gate a per-doc `requiredMask` in the accumulator; excluded clauses tombstone
+matching docs. `$defaultOperator:"and"` makes bare `$search` terms required.
 
 ## On-disk invariants that are expensive to change
 
@@ -328,10 +338,15 @@ The real footprint lever is structural, not compression: a positionless
 (`DOCS_AND_FREQS_ONLY`) mode halves the postings (positions are ~50% of them).
 At ~19MB index for 29MB text (with positions), the index is already well-coded.
 
-Explicitly **deferred to v2+**: top-k materialization in `search` (it currently
-clones every matched id before `Limit` trims); replacing the per-doc `docinfo`
-`Get` with an in-memory dense quantized doc-length array (safe now that
-`IntDocID` is stable and dense); fuzzy/Levenshtein search over `fts:vocab`;
-chunk-level (max-TF) WAND skipping; configurable analyzers; positional CJK phrase
-matching; `DOCS_AND_FREQS_ONLY` positionless fields. Stop words are intentionally
+Implemented since the original v1 cut (Phase 1, `FTS-V2-PLAN.md`): phrase /
+positional CJK matching; prefix search; boolean require/exclude (`$require` /
+`$exclude`) and `$defaultOperator`.
+
+Explicitly **deferred to v2+**: per-field weights / BM25F (Phase 3 — postings v2
++ docinfo v2); configurable BM25 `b`/`k1` (Phase 2); top-k materialization in
+`search` (it currently clones every matched id before `Limit` trims); replacing
+the per-doc `docinfo` `Get` with an in-memory dense quantized doc-length array
+(safe now that `IntDocID` is stable and dense); fuzzy/Levenshtein search over
+`fts:vocab`; chunk-level (max-TF) WAND skipping; configurable analyzers /
+stemming; `DOCS_AND_FREQS_ONLY` positionless fields. Stop words are intentionally
 indexed (cheap under delta-varints; personal-notes users search "to do" etc.).

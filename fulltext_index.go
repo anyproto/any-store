@@ -44,6 +44,7 @@ var (
 	ftsMetaSeq    = []byte("seq") // last allocated IntDocID
 	ftsMetaCount  = []byte("N")   // number of indexed documents
 	ftsMetaTokens = []byte("tok") // total tokens across all documents
+	ftsMetaFormat = []byte("fmt") // on-disk postings format version (see fts.PostingsVersion)
 )
 
 // ftsIndex is a live full-text index bound to its five namespaces.
@@ -65,6 +66,10 @@ type ftsIndex struct {
 	// at commit. See fulltext_pending.go.
 	pending ftsPending
 
+	// nFields is the number of indexed fields (== len(fieldPaths)); each token's
+	// field index keys into the FieldMask / per-field TF of the v2 postings.
+	nFields int
+
 	// scratch buffers, writer-owned (single writer, serialized by btree writeMu)
 	keyBuf   []byte
 	valBuf   []byte
@@ -75,9 +80,17 @@ type ftsIndex struct {
 	chunkPL  []fts.Posting
 	mergeBuf []fts.Posting // flushChunk merge scratch
 
-	// flushChunk scratch: decoded-positions arena, existing-chunk value buffer,
-	// sorted added-id buffer — all reused across chunks and transactions.
+	// fieldStarts[f] is the global position at which indexed field f begins (after
+	// the per-field gap); fieldStarts[nFields] is the end. analyzeInto fills it so
+	// fieldBreakdown can attribute each term position to its field. fieldTFBuf is
+	// the reused dense per-field TF scratch.
+	fieldStarts []uint32
+	fieldTFBuf  []uint32
+
+	// flushChunk scratch: decoded-positions arena, decoded per-field-TF arena,
+	// existing-chunk value buffer, sorted added-id buffer — reused across chunks.
 	posDecode   []uint32
+	tfDecode    []uint32
 	chunkValBuf []byte
 	addIDsBuf   []uint64
 
@@ -100,6 +113,26 @@ func newFtsIndex(c *collection, info IndexInfo) (*ftsIndex, error) {
 	}
 	if len(fx.fieldPaths) == 0 {
 		return nil, errors.New("fts: index requires at least one field")
+	}
+	if len(fx.fieldPaths) > fts.MaxFields {
+		return nil, errors.New("fts: too many full-text fields (max 64)")
+	}
+	fx.nFields = len(fx.fieldPaths)
+	if p := info.Fulltext; p != nil {
+		if p.B < 0 || p.B > 1 {
+			return nil, errors.New("fts: Fulltext.B must be in [0,1]")
+		}
+		if p.K1 < 0 {
+			return nil, errors.New("fts: Fulltext.K1 must be >= 0")
+		}
+		for field, w := range p.Weights {
+			if !slices.Contains(info.Fields, field) {
+				return nil, errors.New("fts: Fulltext.Weights references unknown field: " + field)
+			}
+			if w < 0 {
+				return nil, errors.New("fts: Fulltext.Weights must be >= 0 for field: " + field)
+			}
+		}
 	}
 	return fx, nil
 }
@@ -145,21 +178,53 @@ func (fx *ftsIndex) Info() IndexInfo { return fx.info }
 
 // analyzeInto runs the analyzer over all indexed fields of the document,
 // appending the flat token stream to dst (positions are offset per field by
-// ftsPosGap so phrases cannot bridge fields) and returning the extended slice.
+// ftsPosGap so phrases cannot bridge fields) and returning the extended slice. It
+// also records fx.fieldStarts: the global position at which each field begins (and
+// fieldStarts[nFields] = the end), so fieldBreakdown can attribute every term
+// position to its field for the per-field TF of the v2 postings. The next field's
+// base is the current field's max position + 1 + gap, which keeps field position
+// ranges contiguous and non-overlapping even for multi-element array fields.
 func (fx *ftsIndex) analyzeInto(dst []fts.Token, it item) []fts.Token {
 	dst = dst[:0]
 	val := it.Value()
+	fx.fieldStarts = append(fx.fieldStarts[:0], make([]uint32, fx.nFields+1)...)
 	var base uint32
-	for _, path := range fx.fieldPaths {
+	for fieldIdx, path := range fx.fieldPaths {
+		fx.fieldStarts[fieldIdx] = base
 		fv := val.Get(path...)
 		before := len(dst)
 		dst = fx.appendFieldTokens(dst, fv, base)
-		emitted := len(dst) - before
-		if emitted > 0 {
-			base += uint32(emitted) + ftsPosGap
+		if len(dst) > before {
+			base = dst[len(dst)-1].Pos + 1 + ftsPosGap
 		}
 	}
+	fx.fieldStarts[fx.nFields] = base
 	return dst
+}
+
+// fieldBreakdown attributes a term's ascending global positions to their indexed
+// fields (using fieldStarts) and returns the FieldMask plus the dense per-field
+// TF (length nFields, reusing fieldTFBuf). Positions are ascending and field
+// ranges are contiguous, so a single forward walk suffices.
+func (fx *ftsIndex) fieldBreakdown(positions []uint32) (mask uint64, denseTF []uint32) {
+	tf := fx.fieldTFBuf[:0]
+	for i := 0; i < fx.nFields; i++ {
+		tf = append(tf, 0)
+	}
+	f := 0
+	for _, p := range positions {
+		for f+1 < fx.nFields && p >= fx.fieldStarts[f+1] {
+			f++
+		}
+		tf[f]++
+	}
+	for i, c := range tf {
+		if c > 0 {
+			mask |= uint64(1) << uint(i)
+		}
+	}
+	fx.fieldTFBuf = tf
+	return mask, tf
 }
 
 // appendFieldTokens analyzes a single field value (string, or array of strings)
@@ -359,9 +424,12 @@ func (fx *ftsIndex) insertDoc(tx *btree.WriteTx, it item) error {
 		return err
 	}
 
-	// postings + vocab — buffered, flushed at commit.
+	// postings + vocab — buffered, flushed at commit. fieldBreakdown reuses
+	// fieldTFBuf, so consume it immediately inside addPostingPending (it copies
+	// the dense TF into the per-tx arena).
 	for term, positions := range terms {
-		fx.addPostingPending(term, docID, positions)
+		_, denseTF := fx.fieldBreakdown(positions)
+		fx.addPostingPending(term, docID, positions, denseTF)
 		fx.vocabDeltaPending(term, +1)
 	}
 
@@ -444,6 +512,8 @@ func (fx *ftsIndex) updateDoc(tx *btree.WriteTx, oldIt, newIt item) error {
 		return fx.removeIndexedDoc(tx, stringID, docID, oldTerms, oldLen)
 	}
 
+	// fx.fieldStarts now reflects newIt (analyzed last), so fieldBreakdown below
+	// attributes new positions to the new document's fields.
 	// Terms gone or whose positions changed.
 	for term, oldPos := range oldTerms {
 		newPos, inNew := newTerms[term]
@@ -453,15 +523,19 @@ func (fx *ftsIndex) updateDoc(tx *btree.WriteTx, oldIt, newIt item) error {
 			fx.vocabDeltaPending(term, -1)
 		case !slices.Equal(oldPos, newPos):
 			// term still present, positions changed: re-add (df unchanged).
+			// Identical positions imply identical field attribution (an earlier
+			// field changing length would shift these positions), so the skip is safe.
 			fx.removePostingPending(term, docID)
-			fx.addPostingPending(term, docID, newPos)
+			_, denseTF := fx.fieldBreakdown(newPos)
+			fx.addPostingPending(term, docID, newPos, denseTF)
 		}
 		// identical positions → nothing to do.
 	}
 	// Newly added terms.
 	for term, newPos := range newTerms {
 		if _, inOld := oldTerms[term]; !inOld {
-			fx.addPostingPending(term, docID, newPos)
+			_, denseTF := fx.fieldBreakdown(newPos)
+			fx.addPostingPending(term, docID, newPos, denseTF)
 			fx.vocabDeltaPending(term, +1)
 		}
 	}

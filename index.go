@@ -257,10 +257,29 @@ type IndexInfo struct {
 	Vector *VectorParams `json:"vector,omitempty"`
 }
 
-// FulltextParams configures a full-text index. It is reserved for future
-// options (per-field weights, analyzer selection, positionless mode); v1 uses
-// the default analyzer (NFKC + case-fold + UAX#29 + CJK bigram) for all fields.
-type FulltextParams struct{}
+// FulltextParams configures a full-text index. All fields are optional; the
+// zero value reproduces the default BM25 scoring. Per-field weights (Weights)
+// and analyzer/stemming selection are reserved for a later version. The default
+// analyzer (NFKC + case-fold + UAX#29 + CJK bigram) is used for all fields.
+type FulltextParams struct {
+	// Weights is the per-field BM25F boost, keyed by indexed field name (each key
+	// must be one of IndexInfo.Fields). A field absent from the map has weight 1.0.
+	// Mirrors MongoDB's text-index weights option, but scoring is BM25F: the
+	// per-field term frequencies are combined as Σ weight_f · tf_f and then scored
+	// with standard BM25 saturation + length normalization. Set at index creation;
+	// changing a weight only changes ranking (no re-index needed — weights are read
+	// at query time). Boosting e.g. {"title": 5} ranks title matches above body.
+	Weights map[string]float64 `json:"weights,omitempty"`
+	// B is the BM25 length-normalization parameter, in [0,1]. 0 ⇒ the default
+	// 0.75. Lower values reduce the bias toward short documents (e.g. 0.4 is a
+	// reasonable choice for a corpus of mixed-length notes); 0 disables length
+	// normalization entirely — but note 0 is read as "use the default", so to
+	// approach no normalization use a small value rather than exactly 0.
+	B float64 `json:"b,omitempty"`
+	// K1 is the BM25 term-frequency saturation parameter (>= 0). 0 ⇒ the default
+	// 1.2. Higher values make repeated term occurrences count for more.
+	K1 float64 `json:"k1,omitempty"`
+}
 
 func (i IndexInfo) createName() string {
 	return strings.Join(i.Fields, ",")
@@ -328,8 +347,8 @@ type index struct {
 	// curBounds is scratch (len == number of index fields) holding the field-end
 	// offsets of the key currently being built by writeValues; copied into
 	// keyBoundsBuf at each leaf.
-	curBounds []int
-	uniqBuf   [][]anyenc.Tuple
+	curBounds   []int
+	uniqBuf     [][]anyenc.Tuple
 	fullKeyBuf  anyenc.Tuple // reusable buffer for full keys (key+docId)
 	seekBuf     anyenc.Tuple // reusable buffer for unique constraint seek results
 	uniqSeekBuf anyenc.Tuple // reusable buffer for the padded unique-probe seek key

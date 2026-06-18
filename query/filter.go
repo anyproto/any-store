@@ -640,7 +640,58 @@ func (a All) String() string {
 // ($text only at the top level or inside $and, at most one per query) are also
 // enforced by the executor, not here. See docs/fts/DESIGN.md.
 type Text struct {
+	// Search is the raw $search string, preserved verbatim for String() and as
+	// the fallback source when Clauses is nil (a directly-constructed Text).
 	Search string
+	// DefaultAnd is set by {"$defaultOperator":"and"}: bare (should) terms then
+	// become required (AND) rather than the default OR.
+	DefaultAnd bool
+	// Clauses are the parsed clauses of the whole $text predicate: the should
+	// clauses from $search (phrases, prefix*, plain terms) plus the required and
+	// excluded clauses from the $require / $exclude sub-fields. Populated by
+	// ParseCondition; a Text built directly with only Search set has nil Clauses
+	// and the executor re-parses Search on demand (yielding should clauses only).
+	Clauses []TextClause
+}
+
+// TextOp classifies a $text clause's boolean role within the query.
+type TextOp uint8
+
+const (
+	// TextShould is a default clause: OR'd with the other should-clauses, unless
+	// the query sets DefaultAnd, in which case it is required.
+	TextShould TextOp = iota
+	// TextMust is a +term: always required (AND), regardless of DefaultAnd.
+	TextMust
+	// TextMustNot is a -term: documents containing it are excluded.
+	TextMustNot
+)
+
+// TextClause is one parsed unit of a $text $search string: a single term, a
+// quoted phrase, or a prefix term, together with its boolean role. The raw text
+// is NOT analyzed here — the query package stays free of the fts analyzer; the
+// FTS executor analyzes each clause with the index's own pipeline.
+type TextClause struct {
+	// Raw is the unanalyzed clause text: a single word, or the inner text of a
+	// "quoted phrase".
+	Raw string
+	// Phrase marks a "..." clause: Raw analyzes to an ordered term list matched
+	// by positional adjacency.
+	Phrase bool
+	// Prefix marks a trailing-* clause (foo*): Raw's single analyzed term is
+	// expanded against the vocabulary. Mutually exclusive with Phrase.
+	Prefix bool
+	// Op is the clause's boolean role.
+	Op TextOp
+}
+
+// ParsedClauses returns the parsed clauses, parsing Search on demand for a Text
+// that was constructed directly (Clauses nil) rather than via ParseCondition.
+func (t Text) ParsedClauses() []TextClause {
+	if t.Clauses != nil {
+		return t.Clauses
+	}
+	return ParseTextSearch(t.Search)
 }
 
 func (t Text) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {

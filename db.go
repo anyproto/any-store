@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -134,6 +135,16 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	if cacheSize <= 0 {
 		cacheSize = 5000
 	}
+	// Concurrent read transactions are bounded by a semaphore (each live reader
+	// holds its own page cache). The default scales with the host — max(NumCPU-1,
+	// 4) — so concurrent $text/Find reads aren't artificially serialized on a
+	// multi-core machine, while staying modest on small devices. Reader caches are
+	// created lazily up to this cap, so RAM follows actual concurrency, not the
+	// cap. Override via Config.ReadConcurrency.
+	readConcurrency := config.ReadConcurrency
+	if readConcurrency <= 0 {
+		readConcurrency = max(runtime.NumCPU()-1, 4)
+	}
 	// Page-level integrity is on by default for non-encrypted databases.
 	// XXH3-128 trailer per page costs <1% on writes and is invisible on
 	// reads. Encrypted databases get stronger integrity from the
@@ -143,6 +154,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	opts := btree.Options{
 		PageSize:              4096,
 		CacheSize:             cacheSize,
+		MaxReaders:            readConcurrency,
 		InProcess:             false,
 		NoCommitSync:          !config.CommitSync,
 		InMemory:              config.InMemory,
@@ -968,6 +980,21 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 		}
 		if info.Kind == IndexKindFulltext {
 			info.Fulltext = &FulltextParams{}
+			if fv := v.Get("fulltext"); fv != nil {
+				info.Fulltext.B = fv.GetFloat64("b")
+				info.Fulltext.K1 = fv.GetFloat64("k1")
+				if wv := fv.Get("weights"); wv != nil {
+					if wobj, oerr := wv.Object(); oerr == nil {
+						weights := map[string]float64{}
+						wobj.Visit(func(key []byte, val *anyenc.Value) {
+							weights[string(key)] = val.GetFloat64()
+						})
+						if len(weights) > 0 {
+							info.Fulltext.Weights = weights
+						}
+					}
+				}
+			}
 		}
 		for _, fv := range v.GetArray("fields") {
 			info.Fields = append(info.Fields, string(fv.GetStringBytes()))
@@ -1073,6 +1100,26 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 			vobj.Set("hvc", a.NewNumberInt(1))
 		}
 		obj.Set("vector", vobj)
+	}
+	if info.Kind == IndexKindFulltext && info.Fulltext != nil {
+		ft := info.Fulltext
+		if ft.B != 0 || ft.K1 != 0 || len(ft.Weights) != 0 {
+			fobj := a.NewObject()
+			if ft.B != 0 {
+				fobj.Set("b", a.NewNumberFloat64(ft.B))
+			}
+			if ft.K1 != 0 {
+				fobj.Set("k1", a.NewNumberFloat64(ft.K1))
+			}
+			if len(ft.Weights) != 0 {
+				wobj := a.NewObject()
+				for field, w := range ft.Weights {
+					wobj.Set(field, a.NewNumberFloat64(w))
+				}
+				fobj.Set("weights", wobj)
+			}
+			obj.Set("fulltext", fobj)
+		}
 	}
 	return tx.Put(db.systemNS, key, obj.MarshalTo(nil))
 }

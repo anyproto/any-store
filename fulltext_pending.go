@@ -20,11 +20,19 @@ import (
 // btree write lock is held for the whole tx), reset at tx start, and flushed at
 // commit — mirroring the range-index sketch lifecycle. See docs/fts/DESIGN.md.
 
-// posSpan references a positions run inside ftsPending.posArena (offset/length
+// posSpan references a run inside one of ftsPending's arenas (offset/length
 // instead of a slice, so arena growth never invalidates buffered entries).
 type posSpan struct {
 	off uint32
 	n   uint32
+}
+
+// pendingAdd is a buffered posting insertion: the global positions span, the
+// FieldMask, and the per-occupied-field TF span (both in their arenas).
+type pendingAdd struct {
+	pos  posSpan // positions in posArena
+	mask uint64  // FieldMask
+	tf   posSpan // per-set-bit TFs in tfArena
 }
 
 // pendingChunk holds the in-memory mutations for one (term, chunkID) posting
@@ -32,8 +40,8 @@ type posSpan struct {
 type pendingChunk struct {
 	term    string
 	chunkID uint64
-	adds    map[uint64]posSpan  // IntDocID -> positions span in posArena
-	dels    map[uint64]struct{} // IntDocIDs to remove
+	adds    map[uint64]pendingAdd // IntDocID -> buffered posting
+	dels    map[uint64]struct{}   // IntDocIDs to remove
 }
 
 // ftsPending is the per-tx accumulator for one full-text index.
@@ -42,6 +50,7 @@ type ftsPending struct {
 	vocab    map[string]int64         // term -> df delta
 	count    int                      // buffered posting ops (adds+dels), for the spill cap
 	posArena []uint32                 // all buffered positions, addressed by posSpan
+	tfArena  []uint32                 // all buffered per-field TFs, addressed by posSpan
 	free     []*pendingChunk          // recycled pendingChunks (maps cleared, capacity kept)
 }
 
@@ -84,6 +93,11 @@ func (p *ftsPending) reset() {
 	} else {
 		p.posArena = p.posArena[:0]
 	}
+	if cap(p.tfArena) > ftsSpillPostings*4 {
+		p.tfArena = nil
+	} else {
+		p.tfArena = p.tfArena[:0]
+	}
 	p.count = 0
 }
 
@@ -97,9 +111,14 @@ func (p *ftsPending) getChunk() *pendingChunk {
 	return &pendingChunk{}
 }
 
-// positions resolves a buffered span to its arena slice.
+// positions resolves a buffered positions span to its arena slice.
 func (p *ftsPending) positions(s posSpan) []uint32 {
 	return p.posArena[s.off : s.off+s.n : s.off+s.n]
+}
+
+// fieldTFs resolves a buffered per-field-TF span to its arena slice.
+func (p *ftsPending) fieldTFs(s posSpan) []uint32 {
+	return p.tfArena[s.off : s.off+s.n : s.off+s.n]
 }
 
 // maybeSpill flushes the buffer mid-transaction if it has grown past the RAM cap.
@@ -110,17 +129,33 @@ func (fx *ftsIndex) maybeSpill(tx *btree.WriteTx) error {
 	return nil
 }
 
-// addPosting buffers an insertion of (docID, positions) into the term's chunk.
-// The positions are copied into the per-tx arena (one shared buffer, no
-// per-term clone).
-func (fx *ftsIndex) addPostingPending(term string, docID uint64, positions []uint32) {
+// addPosting buffers an insertion of (docID, positions, per-field TF) into the
+// term's chunk. positions (global) are copied into posArena; the FieldMask and
+// per-occupied-field TFs (derived from denseTF, length nFields) into tfArena. One
+// shared buffer each, no per-term clone.
+func (fx *ftsIndex) addPostingPending(term string, docID uint64, positions, denseTF []uint32) {
 	pc := fx.pendingChunkFor(term, docID)
 	if pc.adds == nil {
-		pc.adds = make(map[uint64]posSpan, 4)
+		pc.adds = make(map[uint64]pendingAdd, 4)
 	}
-	off := uint32(len(fx.pending.posArena))
+	posOff := uint32(len(fx.pending.posArena))
 	fx.pending.posArena = append(fx.pending.posArena, positions...)
-	pc.adds[docID] = posSpan{off: off, n: uint32(len(positions))}
+
+	tfOff := uint32(len(fx.pending.tfArena))
+	var mask uint64
+	var k uint32
+	for f, c := range denseTF {
+		if c > 0 {
+			mask |= uint64(1) << uint(f)
+			fx.pending.tfArena = append(fx.pending.tfArena, c)
+			k++
+		}
+	}
+	pc.adds[docID] = pendingAdd{
+		pos:  posSpan{off: posOff, n: uint32(len(positions))},
+		mask: mask,
+		tf:   posSpan{off: tfOff, n: k},
+	}
 	delete(pc.dels, docID) // an add supersedes a same-tx delete
 	fx.pending.count++
 }
@@ -177,7 +212,7 @@ func (fx *ftsIndex) flushPending(tx *btree.WriteTx) error {
 	slices.Sort(keys)
 	for _, k := range keys {
 		if err := fx.flushChunk(tx, fx.pending.chunks[k]); err != nil {
-			return err
+			return ftsMapFormatErr(err)
 		}
 	}
 
@@ -208,6 +243,7 @@ func (fx *ftsIndex) flushChunk(tx *btree.WriteTx, pc *pendingChunk) error {
 
 	fx.chunkPL = fx.chunkPL[:0]
 	fx.posDecode = fx.posDecode[:0]
+	fx.tfDecode = fx.tfDecode[:0]
 	existing, err := tx.AppendValue(fx.nsPost, fx.keyBuf, fx.chunkValBuf[:0])
 	if err != nil {
 		if !errors.Is(err, btree.ErrKeyNotFound) {
@@ -215,7 +251,7 @@ func (fx *ftsIndex) flushChunk(tx *btree.WriteTx, pc *pendingChunk) error {
 		}
 	} else {
 		fx.chunkValBuf = existing
-		if fx.chunkPL, fx.posDecode, err = fts.DecodeChunkInto(fx.chunkPL, fx.posDecode, existing); err != nil {
+		if fx.chunkPL, fx.posDecode, fx.tfDecode, err = fts.DecodeChunkInto(fx.chunkPL, fx.posDecode, fx.tfDecode, existing); err != nil {
 			return err
 		}
 	}
@@ -228,7 +264,16 @@ func (fx *ftsIndex) flushChunk(tx *btree.WriteTx, pc *pendingChunk) error {
 	slices.Sort(addIDs)
 	fx.addIDsBuf = addIDs
 
-	pos := func(id uint64) []uint32 { return fx.pending.positions(pc.adds[id]) }
+	// added builds the v2 Posting for a buffered add (positions + FieldMask + TFs).
+	added := func(id uint64) fts.Posting {
+		a := pc.adds[id]
+		return fts.Posting{
+			DocID:     id,
+			Fields:    a.mask,
+			FieldTF:   fx.pending.fieldTFs(a.tf),
+			Positions: fx.pending.positions(a.pos),
+		}
+	}
 
 	// Two-way merge of the existing postings (ascending) and the added postings
 	// (ascending), dropping any DocID that is deleted or re-added.
@@ -236,12 +281,12 @@ func (fx *ftsIndex) flushChunk(tx *btree.WriteTx, pc *pendingChunk) error {
 	ai := 0
 	for _, p := range fx.chunkPL {
 		for ai < len(addIDs) && addIDs[ai] < p.DocID {
-			merged = append(merged, fts.Posting{DocID: addIDs[ai], Positions: pos(addIDs[ai])})
+			merged = append(merged, added(addIDs[ai]))
 			ai++
 		}
 		if ai < len(addIDs) && addIDs[ai] == p.DocID {
-			// re-added: take the new positions, skip the old
-			merged = append(merged, fts.Posting{DocID: addIDs[ai], Positions: pos(addIDs[ai])})
+			// re-added: take the new posting, skip the old
+			merged = append(merged, added(addIDs[ai]))
 			ai++
 			continue
 		}
@@ -251,7 +296,7 @@ func (fx *ftsIndex) flushChunk(tx *btree.WriteTx, pc *pendingChunk) error {
 		merged = append(merged, p)
 	}
 	for ; ai < len(addIDs); ai++ {
-		merged = append(merged, fts.Posting{DocID: addIDs[ai], Positions: pos(addIDs[ai])})
+		merged = append(merged, added(addIDs[ai]))
 	}
 	fx.mergeBuf = merged
 

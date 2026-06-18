@@ -24,9 +24,20 @@ allocation analysis in its PERF-1.
    BM25 scores EVERY matching posting before the top-k is cut: 1.8 ms +
    8.5k allocs/op for "crash" at 20k chunks (vs 24 µs rare-term — a 75x
    spread); ~0.45 allocs + 23 B per matching doc, linear (18.4k allocs/op at
-   the full 38k corpus). `Count()` pays the same. TODO: top-k pruning
-   (MaxScore/WAND/block-max postings) for latency, and pooled postings/
-   accumulator buffers for the GC churn (any-store-tests PERF-1).
+   the full 38k corpus). `Count()` pays the same.
+   - Status (2026-06-18, see `FTS-PERF-PLAN.md`): the *concurrency* side is FIXED —
+     it was the `ReadConcurrency=4` reader cap (now `max(NumCPU−1,4)`), not GC;
+     and the per-chunk reader alloc regression is fixed (227→72 allocs/op).
+     Single-thread high-DF latency is still O(matched postings) but well within
+     the 100 ms interactive budget for local-first, so the remaining items are
+     **deferred TODO** (build only if a large corpus / heavy-AND workload bites):
+     - ⏳ **dense doc-length array** (O(1) length lookup vs per-posting `docinfo`
+       Get; ~halves single-thread latency; needs a generation-tied cross-process
+       cache) — highest ROI;
+     - ⏳ **lead-iterator AND** (drive `+required` from the lowest-DF term) —
+       pathological-query insurance;
+     - ❌ **Block-Max WAND — explicitly NOT building** (sub-frame-invisible gain
+       for a single-user store; server-throughput tech = debt here).
 
 2. **Big-document writes are heavy — chunking is the mitigation.**
    Whole-article profile: single-doc update 29.8 ms (27k allocs), one-token
@@ -37,15 +48,18 @@ allocation analysis in its PERF-1.
    that skips unchanged regions, or accept and document the chunking
    guidance.
 
-3. **v1 query semantics gaps that will surface in app UX:**
-   - bag-of-words OR only — no phrase queries (positions are planned v2),
-     no AND semantics, no per-field weights;
-   - **no prefix search** — search-as-you-type needs `term*` or an edge-
-     ngram option;
-   - single default analyzer (NFKC + fold + UAX#29 + CJK bigram) — no
-     language stemming;
-   - `$text` only top-level or inside `$and`, one per query.
-   TODO: prioritize prefix matching for type-ahead; phrase support next.
+3. **Query semantics — Phase 1 closed most of these** (see `FTS-V2-PLAN.md`):
+   - ✅ phrase queries (`"..."`, positional merge) + positional CJK matching;
+   - ✅ boolean AND / required + exclude — via the typed `$require` / `$exclude`
+     sub-fields and `$defaultOperator:"and"` (deliberately NOT inline `+`/`-`,
+     which is unsafe for raw user input);
+   - ✅ prefix search (`term*`) for search-as-you-type;
+   - ✅ configurable BM25 `b`/`k1` (`FulltextParams.B/K1`) — Phase 2;
+   - ✅ per-field weights (BM25F) — Phase 3 (postings v2 + per-field TF; simplified
+     BM25F with global length-norm; `FulltextParams.Weights`); v1 data drops/recreates;
+   - ⏳ language stemming — still a single default analyzer (NFKC + fold +
+     UAX#29 + CJK bigram); optional, Phase 4;
+   - still: `$text` only top-level or inside `$and`, one per query.
 
 4. Residual filters on high-df queries inherit cost #1 (the filter applies
    after full BM25 accumulation): 15.9 ms for selective-filter over the
