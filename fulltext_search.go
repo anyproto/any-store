@@ -109,7 +109,7 @@ func (fx *ftsIndex) searchCandidates(tx *btree.ReadTx, text query.Text) (qplanne
 		k1: k1, b: b, nFields: fx.nFields, weights: weights, weighted: weighted,
 	}
 	if err = e.run(clauses, text.DefaultAnd); err != nil {
-		ftsScoreAccPool.Put(acc)
+		ftsPutAcc(acc)
 		return nil, ftsMapFormatErr(err)
 	}
 
@@ -117,7 +117,7 @@ func (fx *ftsIndex) searchCandidates(tx *btree.ReadTx, text query.Text) (qplanne
 	// appendTo applies the required-mask gate and drops tombstoned docs.
 	acc.scratch = acc.appendTo(acc.scratch[:0], e.requiredAll)
 	if len(acc.scratch) == 0 {
-		ftsScoreAccPool.Put(acc)
+		ftsPutAcc(acc)
 		return nil, nil
 	}
 	slices.SortFunc(acc.scratch, func(a, b scoredDoc) int {
@@ -153,14 +153,35 @@ type ftsExec struct {
 	n           float64 // corpus doc count
 	avgdl       float64
 	az          *fts.Analyzer
-	k1, b       float64   // BM25 params for this index (resolved from FulltextParams)
-	nFields     int       // number of indexed fields
-	weights     []float64 // per-field BM25F boost (len nFields); nil when unweighted
-	weighted    bool      // any field weight != 1.0 — enables the per-field score path
-	dlBuf       []byte    // reusable docinfo value buffer (one per query)
-	tokBuf      []fts.Token
-	requiredAll uint64 // OR of every allocated required-clause bit
-	nextBit     uint   // next required-clause bit index
+	k1, b       float64           // BM25 params for this index (resolved from FulltextParams)
+	nFields     int               // number of indexed fields
+	weights     []float64         // per-field BM25F boost (len nFields); nil when unweighted
+	weighted    bool              // any field weight != 1.0 — enables the per-field score path
+	dlBuf       []byte            // reusable docinfo value buffer (one per query)
+	tokBuf      []fts.Token       // reusable analyze() output
+	prefixBuf   []byte            // reusable postings key-prefix (one per query)
+	chunkIt     fts.ChunkIterator // reused across every chunk/term of the query (Reset)
+	requiredAll uint64            // OR of every allocated required-clause bit
+	nextBit     uint              // next required-clause bit index
+}
+
+// chunkReader returns a chunk iterator over val, reusing the query's single
+// iterator (Reset) after the first chunk so a multi-chunk / multi-term query
+// allocates one reader, not one per chunk. All of a query's chunks share a format
+// version, so reuse is safe.
+func (e *ftsExec) chunkReader(val []byte) (fts.ChunkIterator, error) {
+	if e.chunkIt == nil {
+		it, err := fts.NewChunkIterator(val)
+		if err != nil {
+			return nil, err
+		}
+		e.chunkIt = it
+		return it, nil
+	}
+	if err := e.chunkIt.Reset(val); err != nil {
+		return nil, err
+	}
+	return e.chunkIt, nil
 }
 
 // ftsResolveWeights builds the per-field BM25F boost slice (indexed by field
@@ -346,7 +367,8 @@ func (e *ftsExec) scanTerm(term string, reqBit uint64, tomb bool) error {
 
 	cur := e.tx.NewCursor(e.fx.nsPost)
 	defer cur.Close()
-	prefix := postingsTermPrefix(nil, term)
+	e.prefixBuf = postingsTermPrefix(e.prefixBuf, term)
+	prefix := e.prefixBuf
 	if err = cur.Seek(prefix); err != nil {
 		return err
 	}
@@ -362,7 +384,7 @@ func (e *ftsExec) scanTerm(term string, reqBit uint64, tomb bool) error {
 		if verr != nil {
 			return verr
 		}
-		it, ierr := fts.NewChunkIterator(val)
+		it, ierr := e.chunkReader(val)
 		if ierr != nil {
 			return ierr
 		}
@@ -636,7 +658,7 @@ func (s *ftsCandidateStream) Next() (docId []byte, score float64, ok bool, err e
 
 func (s *ftsCandidateStream) Close() {
 	if s.acc != nil {
-		ftsScoreAccPool.Put(s.acc)
+		ftsPutAcc(s.acc)
 		s.acc = nil
 	}
 }
@@ -669,6 +691,27 @@ type ftsScoreAcc struct {
 }
 
 var ftsScoreAccPool = sync.Pool{New: func() any { return &ftsScoreAcc{} }}
+
+// ftsAccMaxPooled bounds the accumulator size kept in the pool. A high-DF query
+// over a large corpus can grow the table to many MB; returning that to a
+// sync.Pool would let every P pin a giant buffer (unbounded RAM on a constrained
+// device). So an oversized table is dropped on return (GC reclaims it; the next
+// user reallocates the small init size). Typical/small tables stay pooled, so the
+// common case still allocates nothing. Mirrors the write path's arena shrink.
+const ftsAccMaxPooled = 1 << 16 // ~64k slots ≈ a few MB across the parallel arrays
+
+// ftsPutAcc returns an accumulator to the pool, dropping its backing arrays first
+// if they grew past ftsAccMaxPooled so pooled RAM stays bounded.
+func ftsPutAcc(acc *ftsScoreAcc) {
+	if cap(acc.key) > ftsAccMaxPooled {
+		acc.key, acc.val, acc.seen, acc.req, acc.tomb = nil, nil, nil, nil, nil
+		acc.mask, acc.n, acc.gen = 0, 0, 0 // force reset() to reallocate small
+	}
+	if cap(acc.scratch) > ftsAccMaxPooled {
+		acc.scratch = nil
+	}
+	ftsScoreAccPool.Put(acc)
+}
 
 // hashU64 is the splitmix64 finalizer.
 func hashU64(x uint64) uint64 {
