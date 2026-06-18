@@ -1,6 +1,27 @@
 # FTS Perf — Top-k / Concurrency Plan (P1)
 
-Status: **design** (follows `FTS-V2-PLAN.md` Phases 1–3, merged in PR #123).
+Status: **concurrency + alloc hygiene SHIPPED; remaining latency optimizations
+deferred (TODO)** — see "Shipped vs TODO" below. Follows `FTS-V2-PLAN.md`
+Phases 1–3 (PR #123).
+
+## Shipped vs TODO
+
+**Shipped** (PR #123):
+- ✅ `ReadConcurrency = max(NumCPU−1, 4)` default — concurrency unblocked
+  (3.9×→14.2× scaling; 5.3k→24.3k q/s). The actual ceiling was the reader cap.
+- ✅ Per-query chunk-reader reuse + bounded accumulator pool (227→72 allocs/op).
+
+**TODO (deferred — search is interactive within budget; do only if a real large
+corpus or heavy-AND workload shows a problem):**
+- ⏳ **Dense doc-length array** — O(1) length lookup replacing the per-posting
+  `docinfo` B-tree Get; ~halves single-thread latency. Needs the generation-tied
+  cross-process cache (see "New P1" section). Highest ROI of the remaining items.
+- ⏳ **Lead-iterator AND** — drive `+required` queries from the lowest-DF term;
+  insurance against pathological high-DF AND queries on large corpora.
+- ❌ **Block-Max WAND — will not build.** For single-user local-first, the latency
+  gain is sub-frame-invisible and concurrent throughput is already far beyond one
+  user's needs; it's server-throughput tech and pure architectural debt here.
+  (The P1c section is retained only as the record of this decision.)
 
 Reviewed with an outside expert (Gemini 3.1 Pro) on 2026-06-18. The headline:
 **staged, measure-gated — do the cheap fixes first and stop if they suffice.**

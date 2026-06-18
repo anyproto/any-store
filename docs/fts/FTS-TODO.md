@@ -24,9 +24,20 @@ allocation analysis in its PERF-1.
    BM25 scores EVERY matching posting before the top-k is cut: 1.8 ms +
    8.5k allocs/op for "crash" at 20k chunks (vs 24 µs rare-term — a 75x
    spread); ~0.45 allocs + 23 B per matching doc, linear (18.4k allocs/op at
-   the full 38k corpus). `Count()` pays the same. TODO: top-k pruning
-   (MaxScore/WAND/block-max postings) for latency, and pooled postings/
-   accumulator buffers for the GC churn (any-store-tests PERF-1).
+   the full 38k corpus). `Count()` pays the same.
+   - Status (2026-06-18, see `FTS-PERF-PLAN.md`): the *concurrency* side is FIXED —
+     it was the `ReadConcurrency=4` reader cap (now `max(NumCPU−1,4)`), not GC;
+     and the per-chunk reader alloc regression is fixed (227→72 allocs/op).
+     Single-thread high-DF latency is still O(matched postings) but well within
+     the 100 ms interactive budget for local-first, so the remaining items are
+     **deferred TODO** (build only if a large corpus / heavy-AND workload bites):
+     - ⏳ **dense doc-length array** (O(1) length lookup vs per-posting `docinfo`
+       Get; ~halves single-thread latency; needs a generation-tied cross-process
+       cache) — highest ROI;
+     - ⏳ **lead-iterator AND** (drive `+required` from the lowest-DF term) —
+       pathological-query insurance;
+     - ❌ **Block-Max WAND — explicitly NOT building** (sub-frame-invisible gain
+       for a single-user store; server-throughput tech = debt here).
 
 2. **Big-document writes are heavy — chunking is the mitigation.**
    Whole-article profile: single-doc update 29.8 ms (27k allocs), one-token
