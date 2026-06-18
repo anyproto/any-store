@@ -59,6 +59,15 @@ type Config struct {
 	// cache-spill behavior at low data volumes. Zero means use the default.
 	CacheSize int
 
+	// ReadConcurrency caps the number of concurrent read transactions. Reads
+	// beyond this many serialize on a semaphore, so on a multi-core host a low cap
+	// throttles concurrent Find/$text throughput. Each live reader holds its own
+	// page cache (≈ CacheSize × PageSize), created lazily, so peak reader RAM is
+	// ReadConcurrency × that — only realized under actual concurrent load. Zero
+	// means the default, max(NumCPU-1, 4), which scales with the host while staying
+	// modest on small devices.
+	ReadConcurrency int
+
 	// InMemory keeps the entire database in memory with no files on disk.
 	// The database does not survive process crashes. When true, InProcess
 	// and CommitSync=false are forced on automatically.

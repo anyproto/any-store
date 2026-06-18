@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -134,6 +135,16 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	if cacheSize <= 0 {
 		cacheSize = 5000
 	}
+	// Concurrent read transactions are bounded by a semaphore (each live reader
+	// holds its own page cache). The default scales with the host — max(NumCPU-1,
+	// 4) — so concurrent $text/Find reads aren't artificially serialized on a
+	// multi-core machine, while staying modest on small devices. Reader caches are
+	// created lazily up to this cap, so RAM follows actual concurrency, not the
+	// cap. Override via Config.ReadConcurrency.
+	readConcurrency := config.ReadConcurrency
+	if readConcurrency <= 0 {
+		readConcurrency = max(runtime.NumCPU()-1, 4)
+	}
 	// Page-level integrity is on by default for non-encrypted databases.
 	// XXH3-128 trailer per page costs <1% on writes and is invisible on
 	// reads. Encrypted databases get stronger integrity from the
@@ -143,6 +154,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	opts := btree.Options{
 		PageSize:              4096,
 		CacheSize:             cacheSize,
+		MaxReaders:            readConcurrency,
 		InProcess:             false,
 		NoCommitSync:          !config.CommitSync,
 		InMemory:              config.InMemory,
