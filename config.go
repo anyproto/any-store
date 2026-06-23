@@ -76,7 +76,7 @@ func (c *Config) setDefaults() {
 		c.ReadConnections = runtime.NumCPU()
 	}
 	if c.SQLiteConnectionOptions == nil {
-		c.SQLiteConnectionOptions = defaultSQLiteOptions
+		c.SQLiteConnectionOptions = make(map[string]string, len(defaultSQLiteOptions))
 	}
 	for k, v := range defaultSQLiteOptions {
 		c.SQLiteConnectionOptions[k] = v
