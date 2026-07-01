@@ -94,6 +94,16 @@ func (a *Arena) NewVectorF32(vec []float32) *Value {
 	return v
 }
 
+// NewObjectID returns a new objectID value holding id.
+//
+// The returned value is valid until Reset is called on a.
+func (a *Arena) NewObjectID(id ObjectID) *Value {
+	v := a.c.getValue()
+	v.t = TypeObjectID
+	v.v = append(v.v[:0], id[:]...)
+	return v
+}
+
 // NewNumberFloat64 returns new number value containing f.
 //
 // The returned number is valid until Reset is called on a.

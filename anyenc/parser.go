@@ -133,7 +133,14 @@ func parseValue(b []byte, c *cache, depth int) (v *Value, tail []byte, err error
 	// no production reader decodes an inverted index-key field (only the cosmetic
 	// Explain Bound.String() path would, where a decode error renders harmlessly).
 	t0 := b[0]
-	inverted := t0 >= byte(iTypeCompressedObjectS2) && t0 <= byte(iTypeNull) // 0xF6..0xFE
+	// Inverted (reverse index-key) tags are the bitwise-NOT of a base type tag.
+	// The scalar/compressed base types 1..9 invert to a contiguous 0xF6..0xFE
+	// run. TypeObjectID (11) inverts to iTypeObjectID (0xF4), which sits just
+	// below that run; 0xF5 (^Type(10), inverted vectorF32) is an intentional gap
+	// that never occurs (vectors are never index-keyed) and must keep falling
+	// through to the "unknown type" default. So 0xF4 is detected explicitly
+	// rather than by widening the range, which would swallow a stray 0xF5.
+	inverted := (t0 >= byte(iTypeCompressedObjectS2) && t0 <= byte(iTypeNull)) || t0 == byte(iTypeObjectID) // 0xF4, 0xF6..0xFE
 	nt := Type(t0)
 	eos := byte(EOS)
 	if inverted {
@@ -190,6 +197,8 @@ func parseValue(b []byte, c *cache, depth int) (v *Value, tail []byte, err error
 		return parseBinary(b[1:], c, inverted)
 	case TypeVectorF32:
 		return parseVectorF32(b[1:], c)
+	case TypeObjectID:
+		return parseObjectID(b[1:], c)
 	case TypeObject:
 		// Depth is only checked when entering a container (scalars cannot
 		// recurse): corrupt bytes like a long run of array tags must produce
@@ -289,7 +298,7 @@ func parseObject(b []byte, c *cache, eos byte, depth int) (*Value, []byte, error
 // element terminator: EOS (0x00) for a normal array, ^EOS (0xFF) for an inverted
 // (reverse index-key) array. Each element is parsed by parseValue, which
 // self-normalizes inverted element tags; only the array's own terminator needs
-// the eos byte. An inverted element's leading tag (0xF6..0xFE) never collides
+// the eos byte. An inverted element's leading tag (0xF4..0xFE) never collides
 // with the inverted terminator 0xFF, so the b[0]==eos check is unambiguous.
 func parseArray(b []byte, c *cache, eos byte, depth int) (*Value, []byte, error) {
 	var a *Value

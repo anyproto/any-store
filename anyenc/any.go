@@ -65,6 +65,12 @@ func AppendAnyValue(b []byte, v any) []byte {
 		}
 	case *Value:
 		return tv.MarshalTo(b)
+	case ObjectID:
+		// Must match Value.MarshalTo's TypeObjectID encoding byte-for-byte so a
+		// key built here (e.g. FindId) equals the marshaled document's id field:
+		// tag + 12 raw bytes, no length prefix.
+		b = append(b, uint8(TypeObjectID))
+		return append(b, tv[:]...)
 	default:
 		panic(fmt.Sprintf("TODO: make other types: %T", v))
 	}

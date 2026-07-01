@@ -313,6 +313,11 @@ func (v *Value) MarshalTo(dst []byte) []byte {
 		dst = append(dst, byte(TypeVectorF32))
 		dst = binary.BigEndian.AppendUint32(dst, uint32(len(v.v)))
 		return append(dst, v.v...)
+	case TypeObjectID:
+		// Fixed 13 bytes: tag + 12 raw big-endian bytes. No length prefix
+		// (unlike Binary/Vector); the width is a constant.
+		dst = append(dst, byte(TypeObjectID))
+		return append(dst, v.v...)
 	}
 	return dst
 }
@@ -346,6 +351,8 @@ func (v *Value) estimateSize(limit int) int {
 		return 1 + 4 + len(v.v) // type + length + data
 	case TypeVectorF32:
 		return 1 + 4 + len(v.v) // type + length + packed f32 data
+	case TypeObjectID:
+		return 1 + objectIDLen // type + 12 fixed bytes (no length header)
 	case TypeArray:
 		size := 2 // type + EOS
 		for _, av := range v.a {
@@ -448,6 +455,12 @@ func (v *Value) FastJson(a *fastjson.Arena) *fastjson.Value {
 			arr.SetArrayItem(i, a.NewNumberFloat64(float64(f)))
 		}
 		return arr
+	case TypeObjectID:
+		// Lossy display form (like Binary -> base64 string). NewFromFastJson
+		// never re-derives an objectID from this string; MarshalTo/Parse is the
+		// authoritative round-trip.
+		id, _ := v.ObjectID()
+		return a.NewString(id.Hex())
 	case TypeArray:
 		arr := a.NewArray()
 		for i, av := range v.a {
@@ -496,6 +509,9 @@ func (v *Value) GoType() any {
 			res[i] = float64(f)
 		}
 		return res
+	case TypeObjectID:
+		id, _ := v.ObjectID()
+		return id.Hex()
 	case TypeArray:
 		res := make([]any, len(v.a))
 		for i, av := range v.a {
@@ -518,4 +534,3 @@ func (v *Value) GoType() any {
 		panic(fmt.Errorf("unexpected type: %s", v.Type()))
 	}
 }
-

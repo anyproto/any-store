@@ -98,6 +98,14 @@ var validParserCases = []parserCase{
 		`{"a": {"$type": "number"}}`,
 		`{"a": {"$type": "number"}}`,
 	},
+	{
+		`{"a": {"$type": 11}}`,
+		`{"a": {"$type": "objectId"}}`,
+	},
+	{
+		`{"a": {"$type": "objectId"}}`,
+		`{"a": {"$type": "objectId"}}`,
+	},
 }
 
 var errorParserCases = []parserCase{

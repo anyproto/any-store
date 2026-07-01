@@ -16,7 +16,6 @@ import (
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/durability"
 	"github.com/anyproto/any-store/v2/internal/durability/sentinel"
-	"github.com/anyproto/any-store/v2/internal/objectid"
 	"github.com/anyproto/any-store/v2/syncpool"
 )
 
@@ -122,7 +121,7 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 	sPool := syncpool.NewSyncPool(config.SyncPoolElementMaxSize)
 
 	ds := &db{
-		instanceId:        objectid.NewObjectID().Hex(),
+		instanceId:        anyenc.NewObjectID().Hex(),
 		config:            config,
 		syncPool:          sPool,
 		openedCollections: make(map[string]Collection),

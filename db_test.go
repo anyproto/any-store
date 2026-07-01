@@ -17,7 +17,6 @@ import (
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
-	"github.com/anyproto/any-store/v2/internal/objectid"
 )
 
 func init() {
@@ -196,7 +195,7 @@ func TestDb_Close(t *testing.T) {
 				results <- errors.Join(tErr, errors.New("writeTx"))
 				return
 			}
-			tErr = coll.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id": "%s", "value": %d}`, objectid.NewObjectID().Hex(), rand.Int())))
+			tErr = coll.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id": "%s", "value": %d}`, anyenc.NewObjectID().Hex(), rand.Int())))
 			if tErr != nil {
 				results <- errors.Join(tErr, errors.New("insert tx"))
 				return
