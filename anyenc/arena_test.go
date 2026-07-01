@@ -22,7 +22,7 @@ func testObject(a *Arena) *Value {
 
 func TestArena_Reset(t *testing.T) {
 	ap := &ArenaPool{}
-	var exp = `{"s":"string","n":4.4,"i":5,"a":[1,2],"b":"YmluYXJ5"}`
+	var exp = `{"s":"string","n":4.4,"i":5,"a":[1,2],"b":{"$binary":"YmluYXJ5"}}`
 	var n = 10
 	var wg sync.WaitGroup
 	wg.Add(n)

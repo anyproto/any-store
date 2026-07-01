@@ -447,20 +447,19 @@ func (v *Value) FastJson(a *fastjson.Arena) *fastjson.Value {
 	case TypeString:
 		return a.NewStringBytes(v.v)
 	case TypeBinary:
-		return a.NewString(base64.StdEncoding.EncodeToString(v.v))
+		// Extended-JSON wrapper (see extjson.go) so the type round-trips through
+		// JSON; NewFromFastJson decodes {"$binary": "<base64>"} back to binary.
+		return extWrapFastJson(a, extTagBinary, a.NewString(base64.StdEncoding.EncodeToString(v.v)))
 	case TypeVectorF32:
 		fs := bytesAsF32(v.v)
 		arr := a.NewArray()
 		for i, f := range fs {
 			arr.SetArrayItem(i, a.NewNumberFloat64(float64(f)))
 		}
-		return arr
+		return extWrapFastJson(a, extTagVector, arr)
 	case TypeObjectID:
-		// Lossy display form (like Binary -> base64 string). NewFromFastJson
-		// never re-derives an objectID from this string; MarshalTo/Parse is the
-		// authoritative round-trip.
 		id, _ := v.ObjectID()
-		return a.NewString(id.Hex())
+		return extWrapFastJson(a, extTagObjectID, a.NewString(id.Hex()))
 	case TypeArray:
 		arr := a.NewArray()
 		for i, av := range v.a {

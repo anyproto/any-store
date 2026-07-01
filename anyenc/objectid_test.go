@@ -78,8 +78,8 @@ func TestObjectID_FastJsonAndGoType(t *testing.T) {
 	id := mustOID(t, "0123456789abcdef01234567")
 	v := a.NewObjectID(id)
 
-	// FastJson/String render the hex form (lossy display, like Binary->base64).
-	assert.Equal(t, `"0123456789abcdef01234567"`, v.String())
+	// FastJson/String render the Extended-JSON wrapper so the type round-trips.
+	assert.Equal(t, `{"$oid":"0123456789abcdef01234567"}`, v.String())
 	assert.Equal(t, id.Hex(), v.GoType())
 }
 
