@@ -80,10 +80,17 @@ func (a *Analyzer) Append(dst []Token, text string) []Token {
 		var word string
 		word, normalized, state = uniseg.FirstWordInString(normalized, state)
 
-		// A CJK word from UAX#29 is a single ideograph/kana/Hangul char. Buffer
-		// consecutive ones so we can emit overlapping bigrams across the run.
-		if r, ok := singleCJK(word); ok {
-			a.cjkRun = append(a.cjkRun, r)
+		// Buffer CJK words so we can emit overlapping bigrams across the run.
+		// UAX#29 emits each Han ideograph and each Hiragana char as its own word,
+		// but keeps Katakana runs and Hangul syllable words together (Katakana ×
+		// Katakana and ALetter × ALetter don't break) — so a CJK word here is any
+		// word consisting solely of CJK runes, not just a single rune. Appending
+		// whole words to one run also keeps bigrams flowing across script
+		// boundaries inside a run (e.g. 東京タワー = 東 + 京 + タワー).
+		if allCJK(word) {
+			for _, r := range word {
+				a.cjkRun = append(a.cjkRun, r)
+			}
 			continue
 		}
 
@@ -140,22 +147,17 @@ func (a *Analyzer) flushCJK(dst []Token, pos uint32) ([]Token, uint32) {
 	return dst, pos
 }
 
-// singleCJK reports whether word is exactly one space-free-script (CJK) rune,
-// returning that rune.
-func singleCJK(word string) (rune, bool) {
-	var r rune
-	var n int
-	for _, c := range word {
-		r = c
-		n++
-		if n > 1 {
-			return 0, false
+// allCJK reports whether word is non-empty and consists solely of space-free-
+// script (CJK) runes.
+func allCJK(word string) bool {
+	n := 0
+	for _, r := range word {
+		if !isCJK(r) {
+			return false
 		}
+		n++
 	}
-	if n == 1 && isCJK(r) {
-		return r, true
-	}
-	return 0, false
+	return n > 0
 }
 
 // isIndexable reports whether a UAX#29 word should be indexed: it must contain
@@ -170,8 +172,15 @@ func isIndexable(word string) bool {
 }
 
 // isCJK reports whether r is a space-free script that should be bigram-indexed:
-// Han, Hiragana, Katakana, or Hangul.
+// Han, Hiragana, Katakana, or Hangul — plus the script-Common marks that occur
+// inside such words (ー prolonged sound mark, 々ゝゞヽヾ iteration marks), which
+// would otherwise split a run mid-word (タワー, 人々). The katakana middle dot
+// ・ (U+30FB) is deliberately absent: it separates words.
 func isCJK(r rune) bool {
+	switch r {
+	case 'ー', '々', 'ゝ', 'ゞ', 'ヽ', 'ヾ':
+		return true
+	}
 	switch {
 	case unicode.Is(unicode.Han, r),
 		unicode.Is(unicode.Hiragana, r),

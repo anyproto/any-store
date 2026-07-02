@@ -116,3 +116,26 @@ func TestAnalyzer_AppendAccumulates(t *testing.T) {
 	// Callers that index multiple fields handle field offsets themselves.
 	assert.Equal(t, []string{"alpha", "beta"}, terms(toks))
 }
+
+func TestAnalyze_KatakanaBigrams(t *testing.T) {
+	// UAX#29 keeps Katakana runs as one word (Katakana × Katakana doesn't
+	// break); they must still bigram like Han/Hiragana so partial matches work
+	// (query タワー must match inside トウキョウタワー).
+	got := Analyze("トウキョウ")
+	assert.Equal(t, []string{"トウ", "ウキ", "キョ", "ョウ"}, terms(got))
+}
+
+func TestAnalyze_HangulBigrams(t *testing.T) {
+	// Hangul syllables are ALetter in UAX#29 (kept as one word); bigramming is
+	// what lets 한국어 match inside 한국어입니다 (Korean nouns almost always
+	// carry particles).
+	got := Analyze("한국어입니다")
+	assert.Equal(t, []string{"한국", "국어", "어입", "입니", "니다"}, terms(got))
+}
+
+func TestAnalyze_CJKScriptBoundaryBigrams(t *testing.T) {
+	// Han + Katakana in one run must bigram across the script boundary, so the
+	// prefix query 東京タ finds docs containing 東京タワー.
+	got := Analyze("東京タワー")
+	assert.Equal(t, []string{"東京", "京タ", "タワ", "ワー"}, terms(got))
+}
