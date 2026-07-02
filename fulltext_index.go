@@ -85,7 +85,12 @@ type ftsIndex struct {
 	// fieldBreakdown can attribute each term position to its field. fieldTFBuf is
 	// the reused dense per-field TF scratch.
 	fieldStarts []uint32
-	fieldTFBuf  []uint32
+	// fieldStartsOld snapshots the OLD document's fieldStarts in updateDoc (analyzeInto
+	// overwrites fieldStarts with the new doc's). When old and new starts differ, the
+	// field ranges moved, so identical positions no longer imply identical field
+	// attribution and the unchanged-positions skip must be disabled.
+	fieldStartsOld []uint32
+	fieldTFBuf     []uint32
 
 	// flushChunk scratch: decoded-positions arena, decoded per-field-TF arena,
 	// existing-chunk value buffer, sorted added-id buffer — reused across chunks.
@@ -254,8 +259,17 @@ func (fx *ftsIndex) appendFieldTokens(dst []fts.Token, fv *anyenc.Value, base ui
 				continue
 			}
 			dst = fx.appendText(dst, string(sb), base)
-			// keep array elements on separate position runs too
-			base += ftsPosGap
+			// Keep array elements on separate position runs too. Advance past the
+			// element's last emitted position (not by a fixed step): an element with
+			// >= ftsPosGap tokens would otherwise overlap the next element's range,
+			// producing false cross-element phrase matches and non-ascending
+			// per-term position lists (breaking AppendChunk's ascending contract
+			// and countAdjacent's binary search).
+			if len(dst) > 0 {
+				base = dst[len(dst)-1].Pos + 1 + ftsPosGap
+			} else {
+				base += ftsPosGap
+			}
 		}
 	}
 	return dst
@@ -503,9 +517,14 @@ func (fx *ftsIndex) updateDoc(tx *btree.WriteTx, oldIt, newIt item) error {
 	var oldLen, newLen uint32
 	fx.termBufA, oldLen = fx.termPostingsInto(fx.termBufA, fx.tokBuf)
 	oldTerms := fx.termBufA
+	fx.fieldStartsOld = append(fx.fieldStartsOld[:0], fx.fieldStarts...)
 	fx.tokBufB = fx.analyzeInto(fx.tokBufB, newIt)
 	fx.termBufB, newLen = fx.termPostingsInto(fx.termBufB, fx.tokBufB)
 	newTerms := fx.termBufB
+	// Field ranges moved (e.g. an earlier field emptied, so a later field inherits
+	// its base): identical positions may now map to different fields, so every
+	// surviving term must be re-attributed even when its positions are unchanged.
+	startsChanged := !slices.Equal(fx.fieldStartsOld, fx.fieldStarts)
 
 	if newLen == 0 {
 		// Doc lost all indexable text → drop it from the index entirely.
@@ -521,15 +540,15 @@ func (fx *ftsIndex) updateDoc(tx *btree.WriteTx, oldIt, newIt item) error {
 		case !inNew:
 			fx.removePostingPending(term, docID)
 			fx.vocabDeltaPending(term, -1)
-		case !slices.Equal(oldPos, newPos):
-			// term still present, positions changed: re-add (df unchanged).
-			// Identical positions imply identical field attribution (an earlier
-			// field changing length would shift these positions), so the skip is safe.
+		case startsChanged || !slices.Equal(oldPos, newPos):
+			// term still present, positions changed (or the field ranges moved):
+			// re-add (df unchanged). With unchanged fieldStarts, identical positions
+			// imply identical field attribution, so the skip below is safe.
 			fx.removePostingPending(term, docID)
 			_, denseTF := fx.fieldBreakdown(newPos)
 			fx.addPostingPending(term, docID, newPos, denseTF)
 		}
-		// identical positions → nothing to do.
+		// identical positions with unchanged field ranges → nothing to do.
 	}
 	// Newly added terms.
 	for term, newPos := range newTerms {

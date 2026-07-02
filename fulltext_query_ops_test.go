@@ -1,7 +1,9 @@
 package anystore
 
 import (
+	"fmt"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -186,4 +188,29 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(b[p:])
+}
+
+func TestFtsPhrase_NoMatchAcrossArrayElements(t *testing.T) {
+	// Array elements sit on separate position runs. An element with >= ftsPosGap
+	// tokens used to overlap the next element's range (base advanced by a fixed
+	// gap), producing false cross-element phrase matches and non-ascending
+	// per-term position lists.
+	fx, coll := ftsTestColl(t, "tags")
+	defer fx.finish()
+
+	words := make([]string, 150)
+	for i := range words {
+		words[i] = fmt.Sprintf("w%03d", i)
+	}
+	insertJSON(t, coll, `{"id":"d1","tags":["`+strings.Join(words, " ")+`", "aaa bbb"]}`)
+
+	// "w100 bbb" is not a phrase anywhere in the doc.
+	ids, _ := collectIter(t, coll.Find(`{"$text":{"$search":"\"w100 bbb\""}}`))
+	assert.Empty(t, ids)
+
+	// A phrase within one element still matches.
+	ids, _ = collectIter(t, coll.Find(`{"$text":{"$search":"\"w100 w101\""}}`))
+	assert.Equal(t, []string{"d1"}, ids)
+	ids, _ = collectIter(t, coll.Find(`{"$text":{"$search":"\"aaa bbb\""}}`))
+	assert.Equal(t, []string{"d1"}, ids)
 }

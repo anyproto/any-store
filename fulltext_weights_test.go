@@ -3,6 +3,7 @@ package anystore
 import (
 	"testing"
 
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -94,4 +95,32 @@ func TestFtsWeights_SurviveReopen(t *testing.T) {
 	require.Len(t, fxs, 1)
 	assert.Equal(t, 4.0, fxs[0].info.Fulltext.Weights["title"])
 	assert.Equal(t, 1.0, fxs[0].info.Fulltext.Weights["body"])
+}
+
+func TestFtsWeights_UpdateMovesTermBetweenFields(t *testing.T) {
+	// A term moving from title to body with IDENTICAL positions (possible when
+	// the earlier field empties, so the later field inherits its base) must be
+	// re-attributed: the diff skip used to keep the stale title FieldMask, so the
+	// doc kept scoring with the title weight forever.
+	fx := newFixture(t)
+	defer fx.finish()
+
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Kind:     IndexKindFulltext,
+		Fields:   []string{"title", "body"},
+		Fulltext: &FulltextParams{Weights: map[string]float64{"title": 8}},
+	}))
+
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"x","title":"alpha beta gamma","body":""}`)))
+	require.NoError(t, coll.UpsertOne(ctx, anyenc.MustParseJson(`{"id":"x","title":"","body":"alpha beta gamma"}`)))
+	// control doc with the same final content inserted directly
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"y","title":"","body":"alpha beta gamma"}`)))
+
+	ids, scores := collectIter(t, coll.Find(`{"$text":{"$search":"alpha"}}`))
+	require.ElementsMatch(t, []string{"x", "y"}, ids)
+	require.Len(t, scores, 2)
+	assert.InDelta(t, scores[0], scores[1], 1e-9,
+		"identical-content docs must score identically (stale FieldMask if not): ids=%v scores=%v", ids, scores)
 }
