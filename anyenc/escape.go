@@ -9,7 +9,7 @@ import "bytes"
 // terminator, so it is escaped as the pair (0x00, 0xFF). The scan is
 // unambiguous because the escape tail 0xFF never legally follows a true
 // terminator: after a string or key terminator comes a type tag
-// (0x01..0x0A normal, 0xF5..0xFE inverted), a container EOS, an
+// (0x01..0x0B normal, 0xF4..0xFE inverted), a container EOS, an
 // emptyKey-prefixed or non-0xFF-leading key byte (see below), or the end
 // of input. Order is preserved: "a" < "a\x00" < "a\x01b" ⇔
 // (61 00) < (61 00 FF 00) < (61 01 62 00).

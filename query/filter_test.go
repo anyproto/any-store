@@ -393,6 +393,19 @@ func TestTypeFilter(t *testing.T) {
 	})
 }
 
+func TestTypeFilter_ObjectID(t *testing.T) {
+	a := &anyenc.Arena{}
+	doc := a.NewObject()
+	doc.Set("a", a.NewObjectID(anyenc.NewObjectID()))
+
+	for _, spec := range []string{`{"a":{"$type":"objectId"}}`, `{"a":{"$type":11}}`} {
+		f, err := ParseCondition(spec)
+		require.NoError(t, err, spec)
+		assert.True(t, f.Ok(doc, nil), spec)
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"a":"x"}`), nil), spec)
+	}
+}
+
 func TestRegexp(t *testing.T) {
 	t.Run("ok", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "a"}}`)

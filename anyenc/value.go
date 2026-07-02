@@ -313,6 +313,11 @@ func (v *Value) MarshalTo(dst []byte) []byte {
 		dst = append(dst, byte(TypeVectorF32))
 		dst = binary.BigEndian.AppendUint32(dst, uint32(len(v.v)))
 		return append(dst, v.v...)
+	case TypeObjectID:
+		// Fixed 13 bytes: tag + 12 raw big-endian bytes. No length prefix
+		// (unlike Binary/Vector); the width is a constant.
+		dst = append(dst, byte(TypeObjectID))
+		return append(dst, v.v...)
 	}
 	return dst
 }
@@ -346,6 +351,8 @@ func (v *Value) estimateSize(limit int) int {
 		return 1 + 4 + len(v.v) // type + length + data
 	case TypeVectorF32:
 		return 1 + 4 + len(v.v) // type + length + packed f32 data
+	case TypeObjectID:
+		return 1 + objectIDLen // type + 12 fixed bytes (no length header)
 	case TypeArray:
 		size := 2 // type + EOS
 		for _, av := range v.a {
@@ -440,14 +447,19 @@ func (v *Value) FastJson(a *fastjson.Arena) *fastjson.Value {
 	case TypeString:
 		return a.NewStringBytes(v.v)
 	case TypeBinary:
-		return a.NewString(base64.StdEncoding.EncodeToString(v.v))
+		// Extended-JSON wrapper (see extjson.go) so the type round-trips through
+		// JSON; NewFromFastJson decodes {"$binary": "<base64>"} back to binary.
+		return extWrapFastJson(a, extTagBinary, a.NewString(base64.StdEncoding.EncodeToString(v.v)))
 	case TypeVectorF32:
 		fs := bytesAsF32(v.v)
 		arr := a.NewArray()
 		for i, f := range fs {
 			arr.SetArrayItem(i, a.NewNumberFloat64(float64(f)))
 		}
-		return arr
+		return extWrapFastJson(a, extTagVector, arr)
+	case TypeObjectID:
+		id, _ := v.ObjectID()
+		return extWrapFastJson(a, extTagObjectID, a.NewString(id.Hex()))
 	case TypeArray:
 		arr := a.NewArray()
 		for i, av := range v.a {
@@ -496,6 +508,9 @@ func (v *Value) GoType() any {
 			res[i] = float64(f)
 		}
 		return res
+	case TypeObjectID:
+		id, _ := v.ObjectID()
+		return id.Hex()
 	case TypeArray:
 		res := make([]any, len(v.a))
 		for i, av := range v.a {
@@ -518,4 +533,3 @@ func (v *Value) GoType() any {
 		panic(fmt.Errorf("unexpected type: %s", v.Type()))
 	}
 }
-

@@ -639,7 +639,7 @@ func parseType(v *anyenc.Value) (f Filter, err error) {
 	case anyenc.TypeNumber:
 		n, _ := v.Int()
 		tv := Type(n)
-		if tv > TypeObject || tv < 0 {
+		if (tv > TypeObject && tv != TypeObjectID) || tv < 0 {
 			return nil, fmt.Errorf("unexpected type: %d", n)
 		}
 		return TypeFilter{Type: anyenc.Type(tv)}, err

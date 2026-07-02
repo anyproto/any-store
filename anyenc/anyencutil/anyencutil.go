@@ -50,6 +50,11 @@ func Equal(a, b *anyenc.Value) bool {
 	case anyenc.TypeVectorF32:
 		// Single memcmp over the packed bytes: alloc-free, bit-exact.
 		return bytes.Equal(a.VectorBytes(), b.VectorBytes())
+	case anyenc.TypeObjectID:
+		// [12]byte is comparable; == is alloc-free and bit-exact.
+		ai, _ := a.ObjectID()
+		bi, _ := b.ObjectID()
+		return ai == bi
 	}
 	return true
 }

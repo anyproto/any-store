@@ -754,8 +754,8 @@ func (c *Conn) FindId(cmd Cmd) (result string, err error) {
 	if len(cmd.Documents) != 1 {
 		return "", fmt.Errorf("you can specify only one id; got %d", len(cmd.Documents))
 	}
-	var id any
-	if err = json.Unmarshal(cmd.Documents[0], &id); err != nil {
+	id, err := anyenc.ParseJson(string(cmd.Documents[0]))
+	if err != nil {
 		return
 	}
 	doc, err := coll.FindId(mainCtx.Ctx(), id)
@@ -786,8 +786,8 @@ func (c *Conn) DeleteId(cmd Cmd) (result string, err error) {
 	if len(cmd.Documents) != 1 {
 		return "", fmt.Errorf("you can specify only one id; got %d", len(cmd.Documents))
 	}
-	var id any
-	if err = json.Unmarshal(cmd.Documents[0], &id); err != nil {
+	id, err := anyenc.ParseJson(string(cmd.Documents[0]))
+	if err != nil {
 		return
 	}
 	err = coll.DeleteId(mainCtx.Ctx(), id)
@@ -814,7 +814,13 @@ func (c *Conn) FindOne(cmd Cmd) (result string, err error) {
 	if err != nil {
 		return
 	}
-	q := coll.Find(cmd.Query.Find)
+	var filter any
+	if len(cmd.Query.Find) > 0 {
+		if filter, err = anyenc.ParseJson(string(cmd.Query.Find)); err != nil {
+			return
+		}
+	}
+	q := coll.Find(filter)
 	q.Limit(1)
 
 	iter, err := q.Iter(mainCtx.Ctx())
@@ -910,7 +916,13 @@ func (c *Conn) Find(cmd Cmd) (result string, err error) {
 	if err != nil {
 		return
 	}
-	q := coll.Find(cmd.Query.Find)
+	var filter any
+	if len(cmd.Query.Find) > 0 {
+		if filter, err = anyenc.ParseJson(string(cmd.Query.Find)); err != nil {
+			return
+		}
+	}
+	q := coll.Find(filter)
 
 	if cmd.Query.Sort != nil {
 		q.Sort(toAnySlice(cmd.Query.Sort)...)

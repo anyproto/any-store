@@ -42,12 +42,12 @@ func TestEscapeKeyRoundTrip(t *testing.T) {
 		"plain",
 		"\x00",
 		"a\x00b",
-		"\x1f\x1f",   // leading 0x1F keys keep their old-format literal encoding
+		"\x1f\x1f", // leading 0x1F keys keep their old-format literal encoding
 		"\x1fkey",
-		"\xff",       // reserved first byte, emptyKey-prefixed
+		"\xff", // reserved first byte, emptyKey-prefixed
 		"\xffkey",
 		"\x00key",
-		"key\x1f",    // reserved bytes are only special at position 0
+		"key\x1f", // reserved bytes are only special at position 0
 		"key\xff",
 	}
 	for _, key := range cases {
@@ -141,7 +141,7 @@ func TestBackCompatOldFormat(t *testing.T) {
 	old = append(old, 'k', 'e', 'y', EOS, byte(TypeString), 'v', 'a', 'l', EOS)
 	old = append(old, 'n', EOS)
 	old = AppendAnyValue(old, 42)
-	old = append(old, emptyKey, EOS, byte(TypeTrue)) // empty key
+	old = append(old, emptyKey, EOS, byte(TypeTrue))  // empty key
 	old = append(old, 0x1f, 'k', EOS, byte(TypeNull)) // old-format literal key "\x1fk"
 	old = append(old, EOS)
 
@@ -320,6 +320,9 @@ func FuzzParse(f *testing.F) {
 	arr.SetArrayItem(0, a.NewString("s\x00"))
 	arr.SetArrayItem(1, a.NewBinary([]byte{0, 1, 2}))
 	obj.Set("arr", arr)
+	oid, _ := ObjectIDFromHex("0123456789abcdef01234567")
+	obj.Set("oid", a.NewObjectID(oid))
+	f.Add(a.NewObjectID(oid).MarshalTo(nil))
 	f.Add(obj.MarshalTo(nil))
 	comp, _ := obj.MarshalCompressed(nil, nil)
 	f.Add(comp)

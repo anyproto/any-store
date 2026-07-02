@@ -1,3 +1,21 @@
+// Extended-JSON type constructors (decoded on the Go side by extjson.go).
+// They serialize via JSON.stringify to type wrappers that carry anyenc's
+// non-JSON value types through the JSON transport, MongoDB-shell style:
+//   ObjectId("665f…")  -> {"$oid": "665f…"}      (12-byte object id)
+//   BinData("iVBO…")   -> {"$binary": "iVBO…"}   (base64-encoded bytes)
+//   Vector([0.1, 0.2]) -> {"$vector": [0.1, 0.2]} (float32 embedding)
+function ObjectId(hex) {
+    return {"$oid": hex};
+}
+
+function BinData(base64) {
+    return {"$binary": base64};
+}
+
+function Vector(values) {
+    return {"$vector": values};
+}
+
 function DB() {}
 
 DB.prototype.createCollection = function (name) {
