@@ -271,4 +271,32 @@ func Test_Js(t *testing.T) {
 			Cmd: "it",
 		})
 	})
+	t.Run("insert with ObjectId/BinData/Vector constructors", func(t *testing.T) {
+		// One single-key document per constructor: otto's JSON.stringify reorders
+		// multi-key objects, so keep each wrapper on its own document to assert
+		// exact bytes. (Field order is not semantically meaningful anyway.)
+		assertCmd(t, `db.coll.insert({id: ObjectId("0123456789abcdef01234567")}, {b: BinData("AQID")}, {e: Vector([1,2,3])})`, Cmd{
+			Cmd:        "insert",
+			Collection: "coll",
+			Documents: []json.RawMessage{
+				json.RawMessage(`{"id":{"$oid":"0123456789abcdef01234567"}}`),
+				json.RawMessage(`{"b":{"$binary":"AQID"}}`),
+				json.RawMessage(`{"e":{"$vector":[1,2,3]}}`),
+			},
+		})
+	})
+	t.Run("findId with ObjectId constructor", func(t *testing.T) {
+		assertCmd(t, `db.coll.findId(ObjectId("0123456789abcdef01234567"))`, Cmd{
+			Cmd:        "findId",
+			Collection: "coll",
+			Documents:  []json.RawMessage{json.RawMessage(`{"$oid":"0123456789abcdef01234567"}`)},
+		})
+	})
+	t.Run("find by ObjectId field", func(t *testing.T) {
+		assertCmd(t, `db.coll.find({id: ObjectId("0123456789abcdef01234567")})`, Cmd{
+			Cmd:        "find",
+			Collection: "coll",
+			Query:      Query{Find: json.RawMessage(`{"id":{"$oid":"0123456789abcdef01234567"}}`)},
+		})
+	})
 }

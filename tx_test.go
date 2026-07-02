@@ -10,7 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/internal/objectid"
 )
 
 func TestDb_WriteTx(t *testing.T) {
@@ -73,7 +72,7 @@ func TestDb_WriteTx(t *testing.T) {
 			defer func() {
 				assert.NoError(t, tx.Rollback())
 			}()
-			assert.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":"%s", "data": %d}`, objectid.NewObjectID().Hex(), rand.Int()))))
+			assert.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id":"%s", "data": %d}`, anyenc.NewObjectID().Hex(), rand.Int()))))
 			assert.NoError(t, tx.Commit())
 		}
 

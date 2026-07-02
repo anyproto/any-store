@@ -15,7 +15,11 @@ import (
 // before the inverted-tag length handling was added to parseValue.
 func invertedSkipCases(t *testing.T) []*Value {
 	t.Helper()
+	// objectID cannot be produced from JSON, so build it via an arena. The arena
+	// is not reset, so the returned value stays valid for the test's lifetime.
+	a := &Arena{}
 	return []*Value{
+		a.NewObjectID(NewObjectID()),
 		MustParseJson(`123`),
 		MustParseJson(`-456.75`),
 		MustParseJson(`0`),

@@ -94,6 +94,16 @@ func (a *Arena) NewVectorF32(vec []float32) *Value {
 	return v
 }
 
+// NewObjectID returns a new objectID value holding id.
+//
+// The returned value is valid until Reset is called on a.
+func (a *Arena) NewObjectID(id ObjectID) *Value {
+	v := a.c.getValue()
+	v.t = TypeObjectID
+	v.v = append(v.v[:0], id[:]...)
+	return v
+}
+
 // NewNumberFloat64 returns new number value containing f.
 //
 // The returned number is valid until Reset is called on a.
@@ -157,8 +167,16 @@ func (a *Arena) NewFromFastJson(jv *fastjson.Value) *Value {
 		}
 		return arr
 	case fastjson.TypeObject:
+		o := jv.GetObject()
+		// A single-key object whose key is a known tag and whose payload is
+		// well-formed is an Extended-JSON typed value, not a plain object.
+		if o.Len() == 1 {
+			if tv := a.extValueFromFastJson(o); tv != nil {
+				return tv
+			}
+		}
 		obj := a.NewObject()
-		jv.GetObject().Visit(func(key []byte, v *fastjson.Value) {
+		o.Visit(func(key []byte, v *fastjson.Value) {
 			obj.Set(string(key), a.NewFromFastJson(v))
 		})
 		return obj

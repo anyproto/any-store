@@ -11,5 +11,6 @@ import (
 func TestType_String(t *testing.T) {
 	assert.Equal(t, "binary", TypeBinary.String())
 	assert.Equal(t, "compressedObjectS2", TypeCompressedObjectS2.String())
+	assert.Equal(t, "objectID", TypeObjectID.String())
 	assert.Contains(t, Type(99).String(), "unknown type")
 }

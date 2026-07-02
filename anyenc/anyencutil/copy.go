@@ -29,6 +29,9 @@ func Copy(a *anyenc.Arena, v *anyenc.Value) *anyenc.Value {
 	case anyenc.TypeVectorF32:
 		vec, _ := v.VectorF32()
 		return a.NewVectorF32(vec)
+	case anyenc.TypeObjectID:
+		id, _ := v.ObjectID()
+		return a.NewObjectID(id)
 	case anyenc.TypeArray:
 		arr := a.NewArray()
 		for i, av := range v.GetArray() {

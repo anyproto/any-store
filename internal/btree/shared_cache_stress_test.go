@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -67,6 +68,27 @@ func seedData(t *testing.T, db *DB, nsName string, n int, valSize int) *Namespac
 	tx.MarkDataChanged()
 	require.NoError(t, tx.Commit())
 	return ns
+}
+
+// writeUntilReaderProgress runs at least minRounds write rounds and keeps
+// writing until progress() reports the reader goroutines have completed work.
+// Without this, a writer running on the test goroutine can finish all its
+// rounds before freshly spawned readers are ever scheduled (common on a
+// loaded machine, deterministic with GOMAXPROCS=1), tripping the liveness
+// assertions with zero reads. The cap turns genuine reader starvation into a
+// clean failure instead of a test timeout.
+func writeUntilReaderProgress(t *testing.T, minRounds int, progress func() int64, writeRound func(round int)) {
+	t.Helper()
+	maxRounds := minRounds + 1000
+	for round := 0; round < minRounds || progress() == 0; round++ {
+		require.Less(t, round, maxRounds, "readers made no progress")
+		if round >= minRounds {
+			// Rounds can be faster than the scheduler's preemption interval;
+			// yield so starved readers actually get the processor.
+			runtime.Gosched()
+		}
+		writeRound(round)
+	}
 }
 
 // -------------------------------------------------------------------
@@ -135,7 +157,7 @@ func TestSharedCache_ReaderCacheHitDuringWriterSpill(t *testing.T) {
 	}
 
 	// Writer: update rows in a way that forces spill with the tiny cache.
-	for round := range 10 {
+	writeUntilReaderProgress(t, 10, func() int64 { return readerReads.Load() + readerErrors.Load() }, func(round int) {
 		tx, err := db.BeginWrite()
 		require.NoError(t, err)
 		for i := 1; i <= 50; i++ {
@@ -148,7 +170,7 @@ func TestSharedCache_ReaderCacheHitDuringWriterSpill(t *testing.T) {
 		}
 		tx.MarkDataChanged()
 		require.NoError(t, tx.Commit())
-	}
+	})
 
 	close(stopReaders)
 	wg.Wait()
@@ -289,7 +311,7 @@ func TestSharedCache_ConcurrentDirtyFlagObservation(t *testing.T) {
 	}
 
 	// Writer repeatedly dirtying pages
-	for round := range 30 {
+	writeUntilReaderProgress(t, 30, readerOK.Load, func(round int) {
 		tx, err := db.BeginWrite()
 		require.NoError(t, err)
 		for i := 1; i <= 20; i++ {
@@ -302,7 +324,7 @@ func TestSharedCache_ConcurrentDirtyFlagObservation(t *testing.T) {
 		}
 		tx.MarkDataChanged()
 		require.NoError(t, tx.Commit())
-	}
+	})
 
 	close(stopReaders)
 	wg.Wait()
@@ -434,7 +456,7 @@ func TestSharedCache_EvictionUnderConcurrentLoad(t *testing.T) {
 	}
 
 	// Writer: create eviction pressure
-	for round := range 25 {
+	writeUntilReaderProgress(t, 25, readerCount.Load, func(round int) {
 		tx, err := db.BeginWrite()
 		require.NoError(t, err)
 		for i := 1; i <= 40; i++ {
@@ -447,7 +469,7 @@ func TestSharedCache_EvictionUnderConcurrentLoad(t *testing.T) {
 		}
 		tx.MarkDataChanged()
 		require.NoError(t, tx.Commit())
-	}
+	})
 
 	close(stopReaders)
 	wg.Wait()
@@ -548,7 +570,7 @@ func TestSharedCache_ReaderOverflowDuringActiveSpill(t *testing.T) {
 	}
 
 	// Writer: update overflow values, causing spill
-	for round := range 10 {
+	writeUntilReaderProgress(t, 10, func() int64 { return readerReads.Load() + readerErrors.Load() }, func(round int) {
 		tx, err := db.BeginWrite()
 		require.NoError(t, err)
 		for i := 1; i <= 10; i++ {
@@ -564,7 +586,7 @@ func TestSharedCache_ReaderOverflowDuringActiveSpill(t *testing.T) {
 		}
 		tx.MarkDataChanged()
 		require.NoError(t, tx.Commit())
-	}
+	})
 
 	close(stopReaders)
 	wg.Wait()
@@ -898,7 +920,7 @@ func TestSharedCache_CursorDuringSpill(t *testing.T) {
 	}
 
 	// Writer
-	for round := range 15 {
+	writeUntilReaderProgress(t, 15, cursorIters.Load, func(round int) {
 		tx, err := db.BeginWrite()
 		require.NoError(t, err)
 		for i := 1; i <= 40; i++ {
@@ -911,7 +933,7 @@ func TestSharedCache_CursorDuringSpill(t *testing.T) {
 		}
 		tx.MarkDataChanged()
 		require.NoError(t, tx.Commit())
-	}
+	})
 
 	close(stopReaders)
 	wg.Wait()

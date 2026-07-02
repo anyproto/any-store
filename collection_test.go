@@ -15,7 +15,6 @@ import (
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
-	"github.com/anyproto/any-store/v2/internal/objectid"
 	"github.com/anyproto/any-store/v2/query"
 )
 
@@ -333,7 +332,7 @@ func BenchmarkCollection_Insert(b *testing.B) {
 	for range b.N {
 		a.Reset()
 		doc := a.NewObject()
-		doc.Set("id", a.NewString(objectid.NewObjectID().Hex()))
+		doc.Set("id", a.NewString(anyenc.NewObjectID().Hex()))
 		require.NoError(b, coll.Insert(ctx, doc))
 	}
 }
