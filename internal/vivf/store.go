@@ -238,6 +238,12 @@ func BulkBuild(wtx *btree.WriteTx, prefix string, p StoreParams, ids [][]byte, v
 	if p.Dim <= 0 || p.M <= 0 || p.Dim%p.M != 0 {
 		return nil, fmt.Errorf("vivf: dim %d must be a positive multiple of M %d", p.Dim, p.M)
 	}
+	if len(vecs) == 0 {
+		// k-means needs at least one point; an IVF store cannot exist without
+		// trained centroids. (Rebuild handles the emptied-index case itself by
+		// keeping the previous codebooks.)
+		return nil, fmt.Errorf("vivf: cannot build from an empty vector set")
+	}
 	p.withDefaults()
 	ix := &StoreIndex{dim: p.Dim, nlist: p.NList, m: p.M, dsub: p.Dim / p.M, nprobe: p.NProbe, assign: p.Assign, normalize: p.Normalize, int8vec: p.Int8 || p.SQ, sq: p.SQ, precompMiB: p.PrecompMiB}
 	ix.byteDist = ix.int8vec && simd.AcceleratedFloatByte()
@@ -609,6 +615,40 @@ func Rebuild(wtx *btree.WriteTx, prefix string) (*StoreIndex, error) {
 		}
 	}
 	cur.Close()
+
+	if len(vecs) == 0 {
+		// Every document was deleted since the last build: there is nothing to
+		// retrain on (kmeans on an empty set is not defined), and an IVF store
+		// cannot exist without centroids (index creation requires documents).
+		// Keep the trained codebooks, clear the per-vector namespaces, and reset
+		// the drift counters. Inserts keep placing into the last trained
+		// centroids; the first insert's churn ratio (buildCount=1) then makes the
+		// next drift check retrain on real data.
+		names := storeNsNames(prefix)
+		for _, name := range names[2:] { // :cell, :vec, :lbl, :doc — keep :meta and :cb
+			if err := wtx.DeleteNamespace(name); err != nil && !errors.Is(err, btree.ErrNamespaceNotFound) {
+				return nil, err
+			}
+			if _, err := ensureNS(wtx, name); err != nil {
+				return nil, err
+			}
+		}
+		b, err := rtx.Get(old.vmeta, metaKey)
+		if err != nil {
+			return nil, err
+		}
+		mt, err := decodeMeta(b)
+		if err != nil {
+			return nil, err
+		}
+		mt.count, mt.nextLabel = 0, 0
+		mt.churn, mt.driftSum, mt.driftN = 0, 0, 0
+		mt.buildCount = 1 // churn-ratio denominator; a build never has n=0 otherwise
+		if err := wtx.Put(old.vmeta, metaKey, encodeMeta(mt)); err != nil {
+			return nil, err
+		}
+		return OpenTx(rtx, prefix)
+	}
 
 	if err := DropNamespaces(wtx, prefix); err != nil {
 		return nil, err
