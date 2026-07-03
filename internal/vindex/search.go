@@ -48,7 +48,14 @@ func (ix *Index) SearchCandidates(rtx *btree.ReadTx, query []float32, ef int) ([
 		s.qsum = sum
 	}
 	s.checkDeleted = mt.deletedCount > 0
-	if ix.hybrid {
+	// The RAM mirror and vector tier are fed ONLY from committed snapshots. On a
+	// writer's view the meta gen/labels may be uncommitted: publishing a mirror
+	// tagged with an uncommitted gen, or growing the tier past an uncommitted
+	// nextLabel, would serve rolled-back adjacency/vectors to committed readers
+	// once a later commit reuses the same gens/labels. A search inside a write tx
+	// instead falls back to direct btree reads (nil l0/tierData), which correctly
+	// see the tx's own in-progress graph.
+	if ix.hybrid && !rtx.IsWriteTx() {
 		if s.l0, err = ix.layer0Mirror(rtx, mt); err != nil {
 			return nil, err
 		}
@@ -166,22 +173,37 @@ type searcher struct {
 	vcacheOn bool
 	vcache   vecCache
 	vcacheTx *btree.ReadTx
+	// vcacheNext is the label high-water mark ("all cached labels < vcacheNext")
+	// used by beginVecCache's rollback detection.
+	vcacheNext uint32
 }
 
 // beginVecCache turns the vector cache on for an insert and resets it at a batch
-// boundary (a new write tx). Within one batch the cache persists across inserts.
-// Disabled when ix.vcacheCap <= 0. Reset is O(1) and allocation-free after the
-// first batch (the arena and probe table are reused).
-func (s *searcher) beginVecCache() {
+// boundary. Within one batch the cache persists across inserts. Disabled when
+// ix.vcacheCap <= 0. Reset is O(1) and allocation-free after the first batch
+// (the arena and probe table are reused).
+//
+// nextLabel is the meta's label high-water mark at the start of this insert.
+// A batch boundary is EITHER a different tx pointer OR nextLabel moving
+// backwards: the pointer alone is unsound because (a) a savepoint rollback
+// keeps the same btree WriteTx while releasing labels, and (b) pooled WriteTx
+// objects can be reissued at the same address right after a rollback. In both
+// cases the released labels are re-allocated for DIFFERENT vectors, and serving
+// the cached ghosts would silently corrupt neighbour selection for the rest of
+// the batch. Labels only ever move backwards via rollback, so `nextLabel <
+// vcacheNext` detects exactly those cases.
+func (s *searcher) beginVecCache(nextLabel uint32) {
 	if s.ix.vcacheCap <= 0 {
 		s.vcacheOn = false
 		return
 	}
 	s.vcacheOn = true
-	if s.vcacheTx != s.rtx { // new batch → refresh the cache
+	if s.vcacheTx != s.rtx || nextLabel < s.vcacheNext {
 		s.vcache.reset(s.ix.dim, s.ix.vcacheCap)
 		s.vcacheTx = s.rtx
 	}
+	// This insert allocates nextLabel itself, so cached labels stay < nextLabel+1.
+	s.vcacheNext = nextLabel + 1
 }
 
 func (ix *Index) newSearcher(rtx *btree.ReadTx, query []float32) *searcher {

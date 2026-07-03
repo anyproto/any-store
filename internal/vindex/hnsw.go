@@ -371,7 +371,7 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 		s.query = s.normBuf // traversal compares against normalized stored vectors
 		vec = s.normBuf     // and the stored :vec record is normalized too
 	}
-	s.beginVecCache() // serve repeated per-insert vector reads from RAM (lever 1)
+	s.beginVecCache(mt.nextLabel) // serve repeated per-insert vector reads from RAM (lever 1)
 
 	// Track the layer-0 labels this insert changes, for the hybrid dirty ring.
 	track := ix.hybrid && ix.dirty != nil
