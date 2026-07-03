@@ -189,3 +189,91 @@ func TestVectorMode_UnknownRejected(t *testing.T) {
 	})
 	assert.Error(t, err, "unknown vector mode must be rejected")
 }
+
+// CompactRatio (and the IVF tuning params) must survive a DB reopen: they used
+// to be dropped by registerIndex/getIndexInfos, permanently disabling
+// auto-compaction after any restart.
+func TestVectorParams_PersistAcrossReopen(t *testing.T) {
+	const dim = 8
+	tmpDir := t.TempDir()
+	fx := newFixturePath(t, tmpDir)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	want := &VectorParams{
+		Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 64,
+		CompactRatio: 0.5, NProbe: 8,
+	}
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{Name: "emb", Kind: IndexKindVector, Vector: want}))
+	require.NoError(t, fx.Close())
+
+	db2, err := Open(ctx, filepath.Join(tmpDir, "any-store-test.db"), nil)
+	require.NoError(t, err)
+	defer db2.Close()
+	coll, err = db2.OpenCollection(ctx, "docs")
+	require.NoError(t, err)
+	vidxs := coll.(*collection).loadVectorIndexes()
+	require.Len(t, vidxs, 1)
+	require.NotNil(t, vidxs[0].info.Vector)
+	assert.Equal(t, *want, *vidxs[0].info.Vector)
+	assert.Equal(t, want.CompactRatio, vidxs[0].compactRatio)
+}
+
+// A same-name vector index with a DIFFERENT definition must surface
+// ErrIndexMismatch from EnsureIndex — vector params weren't compared at all, so
+// e.g. a dim upgrade silently kept the old index.
+func TestVectorIndex_RedefinitionDetected(t *testing.T) {
+	const dim = 8
+	fx := newFixture(t)
+	defer fx.finish()
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name: "emb", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2},
+	}))
+
+	// identical definition → idempotent no-op
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name: "emb", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2},
+	}))
+
+	// changed dim → mismatch
+	err = coll.EnsureIndex(ctx, IndexInfo{
+		Name: "emb", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim * 2, Metric: VectorL2},
+	})
+	require.ErrorIs(t, err, ErrIndexMismatch)
+
+	// changed metric → mismatch
+	err = coll.EnsureIndex(ctx, IndexInfo{
+		Name: "emb", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorCosine},
+	})
+	require.ErrorIs(t, err, ErrIndexMismatch)
+}
+
+// Same for fulltext scoring params (B/K1/weights are part of the definition).
+func TestFulltextIndex_RedefinitionDetected(t *testing.T) {
+	fx := newFixture(t)
+	defer fx.finish()
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name: "ft", Kind: IndexKindFulltext, Fields: []string{"title", "body"},
+		Fulltext: &FulltextParams{Weights: map[string]float64{"title": 8}},
+	}))
+
+	// identical → no-op
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name: "ft", Kind: IndexKindFulltext, Fields: []string{"title", "body"},
+		Fulltext: &FulltextParams{Weights: map[string]float64{"title": 8}},
+	}))
+
+	// different weights → mismatch
+	err = coll.EnsureIndex(ctx, IndexInfo{
+		Name: "ft", Kind: IndexKindFulltext, Fields: []string{"title", "body"},
+		Fulltext: &FulltextParams{Weights: map[string]float64{"title": 2}},
+	})
+	require.ErrorIs(t, err, ErrIndexMismatch)
+}

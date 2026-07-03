@@ -1011,6 +1011,11 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 					Quantization:       VectorQuantization(vv.GetInt("quant")),
 					Mode:               VectorMode(vv.GetInt("mode")),
 					HybridCacheVectors: vv.GetInt("hvc") != 0,
+					CompactRatio:       vv.GetFloat64("cr"),
+					NList:              vv.GetInt("nlist"),
+					NProbe:             vv.GetInt("nprobe"),
+					Closure:            vv.GetInt("closure"),
+					PrecomputeTableMiB: vv.GetInt("ptmib"),
 				}
 			}
 		}
@@ -1045,6 +1050,95 @@ func indexDefMatches(persisted []byte, info IndexInfo) bool {
 	}
 	for i, fv := range fields {
 		if string(fv.GetStringBytes()) != info.Fields[i] {
+			return false
+		}
+	}
+	// Kind-specific params are part of the definition too. Vector indexes have
+	// empty Fields and fulltext scoring params don't appear in Fields either, so
+	// without these checks ANY same-name redefinition (dim/metric/mode change,
+	// different weights) would read as identical and EnsureIndex would silently
+	// keep the old index.
+	if info.Kind == IndexKindVector && !vectorDefMatches(v.Get("vector"), info.Vector) {
+		return false
+	}
+	if info.Kind == IndexKindFulltext && !fulltextDefMatches(v.Get("fulltext"), info.Fulltext) {
+		return false
+	}
+	return true
+}
+
+// vectorDefMatches compares a persisted vector-param record against the given
+// VectorParams (nil-safe on both sides; absent numeric fields read as zero,
+// matching how zero-valued params are omitted at write time).
+func vectorDefMatches(vv *anyenc.Value, p *VectorParams) bool {
+	if p == nil {
+		p = &VectorParams{}
+	}
+	var (
+		field                                 string
+		dim, metric, m, efc, efs, quant, mode int
+		hvc                                   bool
+		cr                                    float64
+		nlist, nprobe, closure, ptmib         int
+	)
+	if vv != nil {
+		field = vv.GetString("field")
+		dim = vv.GetInt("dim")
+		metric = vv.GetInt("metric")
+		m = vv.GetInt("m")
+		efc = vv.GetInt("efc")
+		efs = vv.GetInt("efs")
+		quant = vv.GetInt("quant")
+		mode = vv.GetInt("mode")
+		hvc = vv.GetInt("hvc") != 0
+		cr = vv.GetFloat64("cr")
+		nlist = vv.GetInt("nlist")
+		nprobe = vv.GetInt("nprobe")
+		closure = vv.GetInt("closure")
+		ptmib = vv.GetInt("ptmib")
+	}
+	return field == p.Field &&
+		dim == p.Dim &&
+		metric == int(p.Metric) &&
+		m == p.M &&
+		efc == p.EfConstruction &&
+		efs == p.EfSearch &&
+		quant == int(p.Quantization) &&
+		mode == int(p.Mode) &&
+		hvc == p.HybridCacheVectors &&
+		cr == p.CompactRatio &&
+		nlist == p.NList &&
+		nprobe == p.NProbe &&
+		closure == p.Closure &&
+		ptmib == p.PrecomputeTableMiB
+}
+
+// fulltextDefMatches compares a persisted fulltext-param record against the
+// given FulltextParams (nil-safe; absent fields read as zero, matching the
+// omit-zero write side).
+func fulltextDefMatches(fv *anyenc.Value, p *FulltextParams) bool {
+	if p == nil {
+		p = &FulltextParams{}
+	}
+	var b, k1 float64
+	weights := map[string]float64{}
+	if fv != nil {
+		b = fv.GetFloat64("b")
+		k1 = fv.GetFloat64("k1")
+		if wv := fv.Get("weights"); wv != nil {
+			if wobj, oerr := wv.Object(); oerr == nil {
+				wobj.Visit(func(key []byte, val *anyenc.Value) {
+					weights[string(key)] = val.GetFloat64()
+				})
+			}
+		}
+	}
+	if b != p.B || k1 != p.K1 || len(weights) != len(p.Weights) {
+		return false
+	}
+	for f, w := range p.Weights {
+		pw, ok := weights[f]
+		if !ok || pw != w {
 			return false
 		}
 	}
@@ -1097,6 +1191,21 @@ func (db *db) registerIndex(tx *btree.WriteTx, collName string, info IndexInfo) 
 		vobj.Set("mode", a.NewNumberInt(int(info.Vector.Mode)))
 		if info.Vector.HybridCacheVectors {
 			vobj.Set("hvc", a.NewNumberInt(1))
+		}
+		if info.Vector.CompactRatio != 0 {
+			vobj.Set("cr", a.NewNumberFloat64(info.Vector.CompactRatio))
+		}
+		if info.Vector.NList != 0 {
+			vobj.Set("nlist", a.NewNumberInt(info.Vector.NList))
+		}
+		if info.Vector.NProbe != 0 {
+			vobj.Set("nprobe", a.NewNumberInt(info.Vector.NProbe))
+		}
+		if info.Vector.Closure != 0 {
+			vobj.Set("closure", a.NewNumberInt(info.Vector.Closure))
+		}
+		if info.Vector.PrecomputeTableMiB != 0 {
+			vobj.Set("ptmib", a.NewNumberInt(info.Vector.PrecomputeTableMiB))
 		}
 		obj.Set("vector", vobj)
 	}
