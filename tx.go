@@ -46,6 +46,7 @@ type ReadTx interface {
 	btreeReadTx() *btree.ReadTx
 	btreeWriteTx() *btree.WriteTx
 	instanceId() string
+	dbRef() *db
 }
 
 type commonTx struct {
@@ -71,6 +72,10 @@ func (tx *commonTx) SetModified() {
 
 func (tx *commonTx) instanceId() string {
 	return tx.db.instanceId
+}
+
+func (tx *commonTx) dbRef() *db {
+	return tx.db
 }
 
 var txPool = &sync.Pool{
@@ -156,6 +161,19 @@ var savepointPool = &sync.Pool{
 
 func newSavepointTx(ctx context.Context, wrTx WriteTx) (WriteTx, error) {
 	btWtx := wrTx.btreeWriteTx()
+	// Flush buffered full-text writes BEFORE creating the savepoint, so their
+	// btree writes land outside its scope. This keeps the fts pending buffer
+	// savepoint-consistent: at every savepoint creation the buffer is empty, so
+	// after RollbackToSavepoint (a) the buffer holds only ops made inside the
+	// rolled-back scope (discarded by resetAllFtsPending), and (b) everything
+	// flushed after this point sits inside the scope and is reverted by the
+	// btree itself. Without this, buffered postings from before the savepoint
+	// survive its rollback and flush at outer commit — while the seq/docmap
+	// writes they depend on were reverted, attributing ghost postings to
+	// whichever document later reuses the IntDocID.
+	if err := wrTx.dbRef().flushAllFtsPending(btWtx); err != nil {
+		return nil, err
+	}
 	spId, err := btWtx.Savepoint()
 	if err != nil {
 		return nil, err
@@ -196,9 +214,14 @@ func (w savepointWrapper) Commit() error {
 func (w savepointWrapper) Rollback() error {
 	if w.savepointTx.version.CompareAndSwap(w.version, 0) {
 		btWtx := w.WriteTx.btreeWriteTx()
+		db := w.WriteTx.dbRef()
 		if err := btWtx.RollbackToSavepoint(w.savepointId); err != nil {
 			return err
 		}
+		// The fts pending buffers hold only ops made inside this savepoint's
+		// scope (they were flushed empty at its creation), and the btree state
+		// those ops were derived from has just been reverted — discard them.
+		db.resetAllFtsPending()
 		savepointPool.Put(w.savepointTx)
 	}
 	return nil

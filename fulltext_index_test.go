@@ -432,3 +432,76 @@ func TestFts_SurvivesReopen(t *testing.T) {
 	assert.Equal(t, uint64(2), ftsReadMeta(t, c, ftsMetaSeq))
 	assert.Equal(t, uint64(2), ftsVocabDF(t, c, "persisted"))
 }
+
+// A savepoint rollback (an op failing inside an outer WriteTx) must not leak
+// buffered postings from the rolled-back op: the seq/docmap writes it depends
+// on are reverted, so leaked postings would attach to whichever document later
+// reuses the IntDocID.
+func TestFtsSavepointRollbackDiscardsPending(t *testing.T) {
+	fx, coll := ftsTestColl(t, "text")
+	defer fx.finish()
+
+	insertJSON(t, coll, `{"id":"a","text":"hello"}`)
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	// second doc duplicates "a" → whole Insert call rolls back its savepoint
+	err = coll.Insert(tx.Context(),
+		anyenc.MustParseJson(`{"id":"b","text":"ghostterm"}`),
+		anyenc.MustParseJson(`{"id":"a","text":"dup"}`))
+	require.ErrorIs(t, err, ErrDocExists)
+	// a successful op afterwards reuses the rolled-back IntDocID
+	require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":"c","text":"celery"}`)))
+	require.NoError(t, tx.Commit())
+
+	_, err = coll.FindId(ctx, "b")
+	assert.ErrorIs(t, err, ErrDocNotFound)
+
+	ids, _ := collectIter(t, coll.Find(`{"$text":{"$search":"ghostterm"}}`))
+	assert.Empty(t, ids, "rolled-back postings leaked: %v", ids)
+	assert.EqualValues(t, 0, ftsVocabDF(t, coll, "ghostterm"))
+
+	ids, _ = collectIter(t, coll.Find(`{"$text":{"$search":"celery"}}`))
+	assert.Equal(t, []string{"c"}, ids)
+}
+
+// The inverse leak: a delete inside a rolled-back savepoint must not strip
+// postings from a document that stays live.
+func TestFtsSavepointRollbackKeepsLiveDocPostings(t *testing.T) {
+	fx, coll := ftsTestColl(t, "text")
+	defer fx.finish()
+
+	insertJSON(t, coll, `{"id":"a","text":"alpha keeper"}`)
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	// delete succeeds, then the same op's tx is rolled back by the caller
+	sp, err := fx.WriteTx(tx.Context())
+	require.NoError(t, err)
+	require.NoError(t, coll.DeleteId(sp.Context(), "a"))
+	require.NoError(t, sp.Rollback())
+	require.NoError(t, tx.Commit())
+
+	ids, _ := collectIter(t, coll.Find(`{"$text":{"$search":"keeper"}}`))
+	assert.Equal(t, []string{"a"}, ids, "postings of a live doc were stripped by a rolled-back delete")
+	assert.EqualValues(t, 1, ftsVocabDF(t, coll, "keeper"))
+}
+
+// Ops buffered BEFORE a savepoint must survive that savepoint's rollback (they
+// are flushed outside its scope at creation).
+func TestFtsSavepointRollbackKeepsEarlierPending(t *testing.T) {
+	fx, coll := ftsTestColl(t, "text")
+	defer fx.finish()
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":"a","text":"early bird"}`)))
+	// failing op after the buffered one
+	err = coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":"a","text":"dup"}`))
+	require.ErrorIs(t, err, ErrDocExists)
+	require.NoError(t, tx.Commit())
+
+	ids, _ := collectIter(t, coll.Find(`{"$text":{"$search":"early"}}`))
+	assert.Equal(t, []string{"a"}, ids, "pre-savepoint buffered postings were lost")
+	assert.EqualValues(t, 1, ftsVocabDF(t, coll, "early"))
+}
