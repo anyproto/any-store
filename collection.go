@@ -352,14 +352,22 @@ func (c *collection) compressionDisabled() bool {
 }
 
 // newItem wraps a document value, validating that it carries this collection's
-// primary-key field. Returns ErrDocWithoutId when the field is absent.
+// primary-key field and that the pk value is not an array. Returns
+// ErrDocWithoutId when the field is absent and ErrArrayPrimaryKey when it is an
+// array. Every write path (insert, update, upsert, index backfill) constructs
+// items here, so the array ban holds for all data written by this version;
+// pure read paths do not re-check (see ErrArrayPrimaryKey).
 func (c *collection) newItem(val *anyenc.Value) (item, error) {
 	objVal, err := val.Object()
 	if err != nil {
 		return item{}, err
 	}
-	if objVal.Get(c.primaryKey) == nil {
+	pkVal := objVal.Get(c.primaryKey)
+	if pkVal == nil {
 		return item{}, ErrDocWithoutId
+	}
+	if pkVal.Type() == anyenc.TypeArray {
+		return item{}, ErrArrayPrimaryKey
 	}
 	return item{val: val}, nil
 }

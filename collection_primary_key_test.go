@@ -343,3 +343,50 @@ func TestCollection_PrimaryKey_QueryUpdateDelete(t *testing.T) {
 	assert.Equal(t, 2, dres.Modified)
 	assertCollCount(t, coll, 1)
 }
+
+func TestCollection_PrimaryKey_ArrayRejected(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c")
+	require.NoError(t, err)
+
+	// Insert with an array pk fails on both default and custom pk fields.
+	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":[1,2],"n":1}`))
+	assert.ErrorIs(t, err, ErrArrayPrimaryKey)
+
+	// A batch containing one array-pk doc fails as a whole (tx rollback).
+	err = coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":"ok","n":1}`),
+		anyenc.MustParseJson(`{"id":["bad"],"n":2}`),
+	)
+	assert.ErrorIs(t, err, ErrArrayPrimaryKey)
+	assertCollCount(t, coll, 0)
+
+	// UpsertOne and UpdateOne validate through the same item construction.
+	err = coll.UpsertOne(ctx, anyenc.MustParseJson(`{"id":[3],"n":1}`))
+	assert.ErrorIs(t, err, ErrArrayPrimaryKey)
+	err = coll.UpdateOne(ctx, anyenc.MustParseJson(`{"id":[3],"n":1}`))
+	assert.ErrorIs(t, err, ErrArrayPrimaryKey)
+
+	// A modifier that rewrites the pk to an array is rejected on the update
+	// and upsert-insert paths.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"a","n":1}`)))
+	_, err = coll.UpdateId(ctx, "a", query.MustParseModifier(`{"$set":{"id":[1]}}`))
+	assert.ErrorIs(t, err, ErrArrayPrimaryKey)
+	_, err = coll.UpsertId(ctx, "z", query.MustParseModifier(`{"$set":{"id":[1]}}`))
+	assert.ErrorIs(t, err, ErrArrayPrimaryKey)
+
+	// Non-array pks stay legal: strings, numbers, and objects (whole-value
+	// comparison semantics, no element-wise decoupling).
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1.5,"n":1}`)))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":{"k":"v"},"n":1}`)))
+}
+
+func TestCollection_PrimaryKey_ArrayRejected_CustomPk(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "c", CollectionOptions{PrimaryKey: "uuid"})
+	require.NoError(t, err)
+	err = coll.Insert(ctx, anyenc.MustParseJson(`{"uuid":[1,2],"n":1}`))
+	assert.ErrorIs(t, err, ErrArrayPrimaryKey)
+	// The default "id" field may still hold arrays when it is NOT the pk.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"uuid":"a","id":[1,2]}`)))
+}
