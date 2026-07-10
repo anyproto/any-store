@@ -1082,3 +1082,86 @@ func TestQueryCount_IdFastPathExactShapesOnly(t *testing.T) {
 		})
 	}
 }
+
+// TestQuery_ReverseMultiIntervalOrder is the BUG-13 regression gate (see
+// ../any-storev2-pre-beta-bugs): IndexIter must visit a multi-interval bound
+// set ($in => one point interval per value) in DESCENDING interval order when
+// scanning in reverse. Before the fix it walked intervals ascending (each
+// internally reversed), so a reverse ExactSort plan — which adds no SortIter —
+// yielded globally misordered rows, and with Limit the WRONG rows.
+func TestQuery_ReverseMultiIntervalOrder(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "bug13")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	for i := 1; i <= 9; i++ {
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))))
+	}
+	hint := IndexHint{IndexName: "a", Boost: 1_000_000}
+
+	collectA := func(t *testing.T, q Query) []int {
+		it, err := q.Iter(ctx)
+		require.NoError(t, err)
+		var got []int
+		for it.Next() {
+			d, derr := it.Doc()
+			require.NoError(t, derr)
+			got = append(got, d.Value().GetInt("a"))
+		}
+		require.NoError(t, it.Err())
+		require.NoError(t, it.Close())
+		return got
+	}
+
+	// The plan must serve the sort from the index in reverse with no SortIter
+	// for the bug to be reachable; pin that with explain.
+	explain, err := coll.Find(`{"a":{"$in":[1,5,9]}}`).IndexHint(hint).Sort("-a").Explain(ctx)
+	require.NoError(t, err)
+	require.Contains(t, explain.Sql, "IndexScan(a)(reverse)", "expected a reverse index scan plan: %s", explain.Sql)
+	require.NotContains(t, explain.Sql, "Sort", "the sort must be served by the index, not a SortIter: %s", explain.Sql)
+
+	// Full descending order across intervals.
+	got := collectA(t, coll.Find(`{"a":{"$in":[1,5,9]}}`).IndexHint(hint).Sort("-a"))
+	assert.Equal(t, []int{9, 5, 1}, got, "descending order must hold ACROSS intervals")
+
+	// With Limit the cutoff must keep the HIGHEST values.
+	got = collectA(t, coll.Find(`{"a":{"$in":[1,5,9]}}`).IndexHint(hint).Sort("-a").Limit(1))
+	assert.Equal(t, []int{9}, got, "Limit(1) must return the doc with the highest a")
+
+	// Offset skips from the top; ascending order is unaffected.
+	got = collectA(t, coll.Find(`{"a":{"$in":[1,5,9]}}`).IndexHint(hint).Sort("-a").Offset(1).Limit(1))
+	assert.Equal(t, []int{5}, got, "Offset(1).Limit(1) must return the second-highest a")
+	got = collectA(t, coll.Find(`{"a":{"$in":[1,5,9]}}`).IndexHint(hint).Sort("a"))
+	assert.Equal(t, []int{1, 5, 9}, got, "ascending order must be unchanged")
+
+	// $ne carves a one-field bound set into two rays — same interval-order
+	// requirement once tight bounds land (BUG-02 plan), and already
+	// exercisable today via $in.
+	got = collectA(t, coll.Find(`{"a":{"$in":[2,4,6,8]}}`).IndexHint(hint).Sort("-a").Limit(2))
+	assert.Equal(t, []int{8, 6}, got, "Limit quota must carry across interval boundaries in reverse")
+}
+
+// TestQuery_ReverseMultiIntervalOrder_FullScan pins the same cross-interval
+// descending contract on the FullScanIter path (pk $in bounds), which already
+// consumed intervals from the top — parity guard for BUG-13.
+func TestQuery_ReverseMultiIntervalOrder_FullScan(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "bug13fs")
+	require.NoError(t, err)
+	for i := 1; i <= 9; i++ {
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, i))))
+	}
+	it, err := coll.Find(`{"id":{"$in":[1,5,9]}}`).Sort("-id").Iter(ctx)
+	require.NoError(t, err)
+	var got []int
+	for it.Next() {
+		d, derr := it.Doc()
+		require.NoError(t, derr)
+		got = append(got, d.Value().GetInt("id"))
+	}
+	require.NoError(t, it.Err())
+	require.NoError(t, it.Close())
+	assert.Equal(t, []int{9, 5, 1}, got)
+}
