@@ -48,6 +48,13 @@ var (
 	// ErrWALCorrupt indicates the WAL file is corrupted.
 	ErrWALCorrupt = errors.New("btree: WAL is corrupt")
 
+	// ErrWALVersion indicates the WAL was written by an incompatible (newer)
+	// any-store version. Unlike ErrWALCorrupt it must never trigger
+	// recovery's start-fresh truncation: the WAL holds committed
+	// transactions this binary cannot read, and destroying it would lose
+	// them. Open fails instead; upgrade the binary to proceed.
+	ErrWALVersion = errors.New("btree: incompatible WAL version")
+
 	// ErrOldFormat indicates the database was created with an older schema format
 	// that is no longer supported. The database must be recreated.
 	ErrOldFormat = errors.New("btree: unsupported old schema format (requires version 5+)")

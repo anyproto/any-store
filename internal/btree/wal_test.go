@@ -1507,13 +1507,19 @@ func TestWalHeaderDeserialize_GoodHeader(t *testing.T) {
 }
 
 // TestWalHeaderDeserialize_RejectsBadVersion mirrors SQLite's
-// walIndexRecover rejection at wal.c:1406-1410.
+// walIndexRecover rejection at wal.c:1441-1446 (SQLITE_CANTOPEN). The error
+// must be ErrWALVersion, NOT ErrWALCorrupt: recoverLocked truncates the WAL
+// on corruption but must refuse to open on a version mismatch (a newer
+// binary's WAL holds committed transactions this binary cannot read).
 func TestWalHeaderDeserialize_RejectsBadVersion(t *testing.T) {
 	buf := buildWalHeader(t, walVersion+1, DefaultPageSize)
 	var h walHeader
 	err := h.deserialize(buf)
-	if !errors.Is(err, ErrWALCorrupt) {
-		t.Fatalf("bad version should be ErrWALCorrupt, got %v", err)
+	if !errors.Is(err, ErrWALVersion) {
+		t.Fatalf("bad version should be ErrWALVersion, got %v", err)
+	}
+	if errors.Is(err, ErrWALCorrupt) {
+		t.Fatalf("version mismatch must not map to ErrWALCorrupt (would trigger destructive recovery), got %v", err)
 	}
 }
 
@@ -2588,4 +2594,115 @@ func TestWALReadFrameFaultHookDefaultsToNoop(t *testing.T) {
 	require.NotNil(t, walReadFrameFaultHook.Load())
 	setWalReadFrameFaultHook(nil)
 	require.Nil(t, walReadFrameFaultHook.Load())
+}
+
+// TestWALVersionMismatchRefusesOpenWithoutTruncate guards Bug 10 (pre-beta
+// catalog): a checksum-valid WAL header whose version differs was previously
+// collapsed into the corrupt-header path, which truncates the WAL — an older
+// binary opening a newer database would silently destroy committed
+// transactions. SQLite returns SQLITE_CANTOPEN here (walIndexRecover,
+// wal.c:1441-1446); we must refuse to open and leave the WAL bytes intact.
+func TestWALVersionMismatchRefusesOpenWithoutTruncate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	db := openDBNoCleanup(t, path)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("t1")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, intKey(1), intVal(1)))
+	require.NoError(t, tx.Commit())
+	rawClose(db) // crash-style close: committed frames stay in the WAL
+
+	// Force recovery to read the WAL file header rather than adopt the shm.
+	require.NoError(t, os.Remove(path+"-wal-shm"))
+
+	// Stamp a newer version into the otherwise-valid header (serialize
+	// recomputes the header checksum, so it stays checksum-valid).
+	walPath := path + "-wal"
+	f, err := os.OpenFile(walPath, os.O_RDWR, 0)
+	require.NoError(t, err)
+	hdrBuf := make([]byte, walHeaderSize)
+	_, err = f.ReadAt(hdrBuf, 0)
+	require.NoError(t, err)
+	var hdr walHeader
+	require.NoError(t, hdr.deserialize(hdrBuf))
+	hdr.version = walVersion + 1
+	hdr.serialize(hdrBuf)
+	_, err = f.WriteAt(hdrBuf, 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	before, err := os.Stat(walPath)
+	require.NoError(t, err)
+
+	_, err = testOpen(t, path, DefaultOptions())
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrWALVersion)
+
+	after, err := os.Stat(walPath)
+	require.NoError(t, err)
+	require.Equal(t, before.Size(), after.Size(),
+		"refusing a newer-version WAL must not truncate it")
+
+	// Restoring the version restores access to the committed data — nothing
+	// was destroyed by the refused open.
+	f, err = os.OpenFile(walPath, os.O_RDWR, 0)
+	require.NoError(t, err)
+	hdr.version = walVersion
+	hdr.serialize(hdrBuf)
+	_, err = f.WriteAt(hdrBuf, 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	db2 := openDBNoCleanup(t, path)
+	assert.Equal(t, 1, countKeys(t, db2, "t1"))
+	require.NoError(t, db2.Close())
+}
+
+// TestOpenPage1WALReadErrorFailsOpen guards Bug 5 (pre-beta catalog):
+// pager.open's post-recovery page-1 header refresh used to swallow a
+// readFrame error and continue with the stale DB-file header — the next
+// commit would then serialize stale freelist pointers back into page 1,
+// double-allocating pages. A read failure at open must fail the open (as in
+// SQLite, where lockBtree's page-1 read propagates its error).
+func TestOpenPage1WALReadErrorFailsOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	db := openDBNoCleanup(t, path)
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := tx.CreateNamespace("t1")
+	require.NoError(t, err)
+	require.NoError(t, tx.Put(ns, intKey(1), intVal(1)))
+	require.NoError(t, tx.Commit())
+	rawClose(db) // committed frames (incl. page 1) remain in the WAL
+
+	// Fail only the FIRST readFrame after recovery: recovery itself reads the
+	// WAL via raw ReadAt, so the first readFrame is pager.open's page-1
+	// refresh. Subsequent reads succeed, isolating the injected fault.
+	injected := errors.New("injected transient page-1 read error")
+	var fired bool
+	setWalReadFrameFaultHook(func(uint32) error {
+		if !fired {
+			fired = true
+			return injected
+		}
+		return nil
+	})
+	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
+
+	_, err = testOpen(t, path, DefaultOptions())
+	require.Error(t, err, "open must fail when the page-1 WAL frame cannot be read")
+	require.ErrorIs(t, err, injected)
+	require.True(t, fired, "fault hook must have been exercised")
+
+	// The error was transient: with the fault cleared the same files open
+	// fine and the committed data is intact.
+	setWalReadFrameFaultHook(nil)
+	db2 := openDBNoCleanup(t, path)
+	assert.Equal(t, 1, countKeys(t, db2, "t1"))
+	require.NoError(t, db2.Close())
 }

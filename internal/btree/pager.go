@@ -674,9 +674,20 @@ func (p *pager) open() (err error) {
 			return err
 		}
 		if frame > 0 {
+			// A failure here must not be swallowed: skipping the refresh would
+			// leave stale freelist pointers in p.header, and the next commit
+			// would serialize them back into page 1 (double-allocated pages).
+			// Matches SQLite, where lockBtree reads page 1 through the
+			// WAL-aware pager (btree.c lockBtree → sqlite3PagerGet(1)) and any
+			// read error fails the open. Unlike the steady-state read paths,
+			// open holds recovery exclusively — there is no benign concurrent
+			// checkpoint race to fall through for.
 			walBuf := make([]byte, p.pageSize)
-			if err := p.wal.readFrame(frame, walBuf, nil, nil); err == nil {
-				p.header.deserialize(walBuf[:dbHeaderSize])
+			if err := p.wal.readFrame(frame, walBuf, nil, nil); err != nil {
+				return err
+			}
+			if err := p.header.deserialize(walBuf[:dbHeaderSize]); err != nil {
+				return err
 			}
 		}
 		// Use max of DB file's DatabaseSize and WAL's maxPage.

@@ -271,11 +271,15 @@ func (wh *walHeader) deserialize(buf []byte) error {
 		return ErrWALCorrupt
 	}
 
-	// Validate version — matches SQLite walIndexRecover (wal.c:1406-1410).
-	// A mismatch means the WAL was written by an incompatible any-store
-	// version; continuing would replay frames we don't know how to read.
+	// Validate version — matches SQLite walIndexRecover (wal.c:1441-1446):
+	// version != WAL_MAX_VERSION returns SQLITE_CANTOPEN, never a
+	// destructive recovery. The header checksum already validated above,
+	// so this is a genuine version difference, not corruption —
+	// ErrWALVersion makes recoverLocked refuse to open instead of
+	// truncating a WAL full of committed transactions written by a newer
+	// binary.
 	if wh.version != walVersion {
-		return ErrWALCorrupt
+		return fmt.Errorf("%w: wal version %d, this binary supports %d", ErrWALVersion, wh.version, walVersion)
 	}
 
 	// Validate page size — matches SQLite walIndexRecover (wal.c:1414-1419).
@@ -1858,7 +1862,21 @@ func (w *wal) recoverLocked() error {
 		return err
 	}
 	if err := w.header.deserialize(buf); err != nil {
-		// Invalid WAL header — start fresh.
+		if errors.Is(err, ErrWALVersion) {
+			// Checksum-valid header from an incompatible (newer) version:
+			// the WAL holds committed transactions this binary cannot read.
+			// Refuse to open — truncating here would destroy them. Matches
+			// SQLite walIndexRecover (wal.c:1441-1446, SQLITE_CANTOPEN).
+			return err
+		}
+		// Invalid WAL header — start fresh. DEVIATION from SQLite: on a
+		// header checksum/magic failure SQLite leaves the WAL bytes intact
+		// and treats the log as empty (wal.c:1466); we truncate and rewrite
+		// the header immediately because our write path assumes headerOnDisk
+		// after recovery. Safe for durability only because a header that
+		// fails its own checksum cannot describe replayable frames; the cost
+		// is forensic evidence, not committed data. Tracked as a drift in
+		// docs/btree/NOTES.md ("recoverLocked truncates the WAL...").
 		if err := w.file.Truncate(0); err != nil {
 			return err
 		}
