@@ -779,9 +779,13 @@ func isUnsatisfiable(f query.Filter) bool {
 	return false
 }
 
-// isIDOnlyFilter returns true if the filter only references the primary-key field
-// with equality or $in conditions (all fixed bounds). This enables a fast path
-// that skips CBO planning entirely for simple ID lookups.
+// isIDOnlyFilter returns true if the filter is EXACTLY ONE Eq or $in predicate
+// on the primary-key field, i.e. its match set equals its IndexBounds point set.
+// Only then may Count's tx.Has fast path (which never runs the residual filter)
+// skip CBO planning. Anything else — extra conjuncts ({$in,$ne}, {$in,$gt},
+// {$in,$type}), ranges, multiple pk Keys ({$and:[{id:1},{id:2}]} matches
+// nothing yet has two point bounds) — is NOT exactly represented by its bounds
+// and must go through the planner (BUG-12 in the pre-beta catalog).
 func (q *collQuery) isIDOnlyFilter() bool {
 	return isIDOnlyFilterNode(q.cond, q.c.primaryKey)
 }
@@ -789,20 +793,25 @@ func (q *collQuery) isIDOnlyFilter() bool {
 func isIDOnlyFilterNode(f query.Filter, pk string) bool {
 	switch ft := f.(type) {
 	case query.Key:
-		return len(ft.Path) == 1 && ft.Path[0] == pk
-	case query.And:
-		// All children must be primary-key-only
-		for _, child := range ft {
-			if !isIDOnlyFilterNode(child, pk) {
-				return false
-			}
+		if len(ft.Path) != 1 || ft.Path[0] != pk {
+			return false
 		}
-		return len(ft) > 0
+		switch inner := ft.Filter.(type) {
+		case *query.Comp:
+			return inner.CompOp == query.CompOpEq
+		case query.In:
+			return true
+		}
+		return false
+	case query.And:
+		// A conjunction qualifies only as a transparent single-child wrapper;
+		// two predicates on the pk are already inexact (see doc comment).
+		return len(ft) == 1 && isIDOnlyFilterNode(ft[0], pk)
 	case *query.And:
 		// query.MustParseCondition produces *query.And for `{"$and":[...]}`
 		// (see query/cond_parse.go:103). Delegate to the value arm so $and
-		// JSON syntax enjoys the same id-only fast path as comma-spelled
-		// filters like `{"a":1,"b":2}` (which parse to value query.And).
+		// JSON syntax enjoys the same id-only fast path as the plain
+		// `{"id":1}` spelling.
 		return isIDOnlyFilterNode(*ft, pk)
 	default:
 		return false

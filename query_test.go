@@ -612,42 +612,47 @@ func TestQuery_Iter_FilterParseError(t *testing.T) {
 }
 
 // TestQuery_IsIDOnlyFilterNode_And_Direct tests the query.And (value
-// receiver) branch of isIDOnlyFilterNode directly, since query.ParseCondition
-// only produces And{Key{"id"}, Key{"non-id"}} pairs (all-id-children is
-// impossible from JSON due to duplicate-key rejection).
+// receiver) branch of isIDOnlyFilterNode directly. Since the BUG-12 fix an
+// And qualifies only as a transparent single-child wrapper: two pk Keys mean
+// two predicates on the pk, whose match set (an intersection) is not the
+// point set tx.Has would probe — {$and:[{id:1},{id:2}]} matches nothing yet
+// has two point bounds.
 func TestQuery_IsIDOnlyFilterNode_And_Direct(t *testing.T) {
-	// Programmatic And{Key{id}, Key{id}} — normally impossible from JSON.
-	// This hits the for-loop recursion returning true at query.go:546-548.
-	// The isIDOnlyFilterNode function only inspects the Path of each Key,
-	// so a nil Filter is acceptable.
-	f := query.And{
-		query.Key{Path: []string{"id"}},
-		query.Key{Path: []string{"id"}},
-	}
-	assert.True(t, isIDOnlyFilterNode(f, "id"),
-		"query.And{Key{id}, Key{id}} must be recognized as id-only")
+	eq := query.MustParseCondition(`{"id":"a"}`).(query.Key)
+
+	// Single-child wrapper stays id-only.
+	assert.True(t, isIDOnlyFilterNode(query.And{eq}, "id"),
+		"single-child And wrapping an Eq pk Key must be id-only")
+
+	// Two pk predicates are inexact — rejected even though both are Eq.
+	f := query.And{eq, eq}
+	assert.False(t, isIDOnlyFilterNode(f, "id"),
+		"And with two pk predicates must NOT be id-only (BUG-12)")
 
 	// And with a non-id child → returns false.
 	fMixed := query.And{
-		query.Key{Path: []string{"id"}},
+		eq,
 		query.Key{Path: []string{"other"}},
 	}
 	assert.False(t, isIDOnlyFilterNode(fMixed, "id"),
 		"And with non-id child must NOT be id-only")
 
-	// Empty And → returns false (len(ft) > 0 check).
+	// Empty And → returns false.
 	assert.False(t, isIDOnlyFilterNode(query.And{}, "id"), "empty And is not id-only")
 }
 
 // TestQuery_IsIDOnlyFilterNode_PointerAnd verifies the *query.And pointer-arm
-// added to isIDOnlyFilterNode: query.MustParseCondition produces *query.And
-// for `{"$and": [...]}` JSON, and that filter should hit the id-only fast
-// path just like the value-receiver query.And emitted for comma-spelled
-// filters. Sister test to planner.go's filterFieldsCoveredBy pointer arm.
+// of isIDOnlyFilterNode: query.MustParseCondition produces *query.And for
+// `{"$and": [...]}` JSON. A single-child $and delegates to the value arm and
+// stays id-only; multiple pk children are rejected as inexact (BUG-12).
 func TestQuery_IsIDOnlyFilterNode_PointerAnd(t *testing.T) {
-	// MustParseCondition produces *query.And for $and JSON.
-	f := query.MustParseCondition(`{"$and":[{"id":"a"},{"id":"b"}]}`)
-	assert.True(t, isIDOnlyFilterNode(f, "id"), "pointer-And with id-only children should match")
+	single := query.MustParseCondition(`{"$and":[{"id":"a"}]}`)
+	assert.True(t, isIDOnlyFilterNode(single, "id"),
+		"single-child pointer-And wrapping an Eq pk Key must be id-only")
+
+	multi := query.MustParseCondition(`{"$and":[{"id":"a"},{"id":"b"}]}`)
+	assert.False(t, isIDOnlyFilterNode(multi, "id"),
+		"pointer-And with two pk predicates must NOT be id-only (BUG-12)")
 }
 
 // TestQuery_Update_NoopModifier covers query.go:258-261 — when the modifier
@@ -1023,4 +1028,57 @@ func TestQuery_Unsatisfiable_AllOpsConsistent(t *testing.T) {
 	count, err := coll.Find(nil).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 200, count)
+}
+
+// TestQueryCount_IdFastPathExactShapesOnly is the BUG-12 regression gate (see
+// ../any-storev2-pre-beta-bugs): the id-only Count fast path probes tx.Has per
+// point bound and never runs the residual filter, so it may fire only when the
+// filter's match set exactly equals its bounds — a single Eq or $in predicate
+// on the pk. Every shape below over-counted before the filter-shape gate.
+func TestQueryCount_IdFastPathExactShapesOnly(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "bug12")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1}`),
+		anyenc.MustParseJson(`{"id":2}`),
+		anyenc.MustParseJson(`{"id":3}`),
+	))
+
+	countViaIter := func(t *testing.T, filter string) int {
+		it, err := coll.Find(filter).Iter(ctx)
+		require.NoError(t, err)
+		n := 0
+		for it.Next() {
+			n++
+		}
+		require.NoError(t, it.Err())
+		require.NoError(t, it.Close())
+		return n
+	}
+
+	for _, tc := range []struct {
+		filter string
+		want   int
+	}{
+		// Exactly-representable shapes: the fast path stays correct.
+		{`{"id":2}`, 1},
+		{`{"id":{"$in":[1,2,3]}}`, 3},
+		{`{"id":{"$in":[1,5]}}`, 1},
+		{`{"$and":[{"id":2}]}`, 1},
+		// Extra predicates beyond the first contributor: wrong before the gate.
+		{`{"id":{"$gt":1,"$lt":5}}`, 2},          // was 1 (Has on exclusive Start)
+		{`{"id":{"$in":[1,2,3],"$nin":[2]}}`, 2}, // was 3
+		{`{"id":{"$in":[1,2,3],"$gt":1}}`, 2},    // was 3
+		{`{"id":{"$in":[1,2,3],"$type":"string"}}`, 0}, // was 3; $type adds no bounds
+		{`{"id":{"$gt":1}}`, 2},
+		{`{"id":{"$ne":2}}`, 2},
+		// Two pk predicates via $and: two point bounds, empty match set.
+		{`{"$and":[{"id":1},{"id":2}]}`, 0},
+	} {
+		t.Run(tc.filter, func(t *testing.T) {
+			assertQueryCount(t, coll.Find(tc.filter), tc.want)
+			assert.Equal(t, tc.want, countViaIter(t, tc.filter), "Count must agree with Iter")
+		})
+	}
 }
