@@ -70,3 +70,29 @@ func tightAndBounds(conj And, fieldName string) (bounds Bounds, empty bool) {
 	}
 	return bounds, false
 }
+
+// MayTighten reports whether f contains any conjunction that could make
+// TightIndexBounds differ from IndexBounds for SOME field — an And node with
+// more than one child, reachable outside Or/Not/Nor (which the tight channel
+// delegates wide). Callers use it to skip the tight walk for the common
+// single-predicate filters where the channels are provably identical.
+func MayTighten(f Filter) bool {
+	switch t := f.(type) {
+	case Key:
+		return MayTighten(t.Filter)
+	case And:
+		if len(t) > 1 {
+			return true
+		}
+		for _, c := range t {
+			if MayTighten(c) {
+				return true
+			}
+		}
+		return false
+	case *And:
+		return MayTighten(*t)
+	default:
+		return false
+	}
+}

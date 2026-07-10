@@ -135,7 +135,7 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 
 	// Fast path: filter provably matches no documents — return an empty
 	// iterator with no transaction, no plan construction, no I/O.
-	if isUnsatisfiable(q.cond) {
+	if q.unsatisfiable() {
 		qb.Close()
 		return &emptyIter{}, nil
 	}
@@ -259,7 +259,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	// no write tx required. ModifyResult is the zero value (Matched=0,
 	// Modified=0); the modifier was already parsed above so a malformed
 	// modifier is still surfaced.
-	if isUnsatisfiable(q.cond) {
+	if q.unsatisfiable() {
 		return
 	}
 
@@ -407,7 +407,7 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 
 	// Fast path: filter provably matches no documents — nothing to delete,
 	// no write tx required.
-	if isUnsatisfiable(q.cond) {
+	if q.unsatisfiable() {
 		return
 	}
 
@@ -548,7 +548,7 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	// Fast path: filter provably matches no documents (e.g. $in:[]). Skip
 	// the planner, the read tx, and the index walk entirely — the answer
 	// is unconditionally zero. See isUnsatisfiable.
-	if isUnsatisfiable(q.cond) {
+	if q.unsatisfiable() {
 		return 0, nil
 	}
 
@@ -742,6 +742,32 @@ func (q *collQuery) docCount(tx interface {
 	return count
 }
 
+// unsatisfiable reports whether this query's filter provably matches no
+// documents: structurally (isUnsatisfiable), or via a contradictory
+// primary-key constraint ({id:{$gt:5,$lt:3}}, {$and:[{id:1},{id:2}]}) whose
+// tight bounds intersect to the empty set.
+//
+// The pk is the ONLY field this emptiness argument is sound for: pk values
+// are scalars by construction (array pks rejected on write,
+// ErrArrayPrimaryKey), so an empty value set really means no doc can match.
+// For any other field — indexed or not — a contradictory-looking range can
+// still match array values element-wise ({a:{$gt:5,$lt:3}} matches
+// {a:[6,1]}), so tight-empty must NEVER short-circuit there. Contradictions
+// inside $or branches cannot leak here: the tight channel delegates Or wide.
+func (q *collQuery) unsatisfiable() bool {
+	if isUnsatisfiable(q.cond) {
+		return true
+	}
+	// MayTighten gates the walk: single-predicate filters (the hot id-lookup
+	// shapes) can't intersect to empty, so they skip the extra tree walk.
+	if q.cond != nil && query.MayTighten(q.cond) {
+		if _, empty := query.TightIndexBounds(q.cond, q.c.primaryKey); empty {
+			return true
+		}
+	}
+	return false
+}
+
 // isUnsatisfiable reports whether the given filter provably matches no
 // documents. Used to short-circuit Count/Iter/Update/Delete before we
 // open a transaction, build a plan, or read any pages — the operation
@@ -898,6 +924,12 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 			ExactSort:      exactSort,
 			PartialSort:    partialSort,
 			SortMatchStart: sortMatchStart,
+		}
+		// Tight-channel bounds for cost estimation: only when the
+		// intersected per-field bounds actually differ from the wide ones.
+		// Seeks keep Bounds; see CBOIndex.EstBounds.
+		if br.TightDiffers(info.FieldNames) {
+			cboIdx.EstBounds, _ = qplanner.ComputeIndexBoundsTight(info, br)
 		}
 		result = append(result, cboIdx)
 	}
