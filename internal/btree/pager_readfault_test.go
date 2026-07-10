@@ -165,7 +165,19 @@ func TestReadRawPageWALErrorPropagates(t *testing.T) {
 	require.NoError(t, err)
 	walMaxFrame := rtx.WalMaxFrame()
 	require.Greater(t, walMaxFrame, uint32(0))
-	targetPgno, targetFrame := seedWALResolvedPage(t, db, walMaxFrame)
+
+	// Pick a WAL-resolved page other than page 1: the fault hook also covers
+	// readWalFrameData, and BeginRead (used by VerifyIntegrity below) reads
+	// page 1's counters through it — faulting page 1's frame would fail the
+	// sweep's BeginRead instead of exercising the per-page sweep error.
+	var targetPgno, targetFrame uint32
+	for p := uint32(2); p <= db.pager.dbSize.Load(); p++ {
+		if f := mustWiGet(t, db.pager.wal.index, p, walMaxFrame); f > 0 {
+			targetPgno, targetFrame = p, f
+			break
+		}
+	}
+	require.NotZero(t, targetPgno, "expected a pgno>1 page resolvable to a WAL frame")
 
 	sentinel := errors.New("injected WAL readFrameRaw fault")
 	setWalReadFrameFaultHook(func(frame uint32) error {
@@ -438,4 +450,45 @@ func TestReadFrameNoBenignFailuresUnderTruncateStress(t *testing.T) {
 	stop.Store(true)
 	wg.Wait()
 	require.NoError(t, failure)
+}
+
+// TestReadHeaderCountersWALErrorPropagates pins the same propagation contract
+// on the page-1 header-counter read that BeginRead's staleness detection uses
+// (readHeaderCounters → readWalFrameData, which shares the fault hook): a WAL
+// read failure must fail BeginRead instead of silently serving the stale
+// DB-file FileChangeCount/SchemaCookie, which would defeat cross-process
+// staleness detection and backup restart detection.
+func TestReadHeaderCountersWALErrorPropagates(t *testing.T) {
+	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
+
+	dir := t.TempDir()
+	db, err := testOpen(t, filepath.Join(dir, "test.db"), Options{PageSize: 4096, DisableAutoCheckpoint: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	commitRows(t, db, "t1", 32, 200)
+
+	// Page 1 carries FileChangeCount/SchemaCookie and is rewritten by every
+	// committing tx, so it must resolve to a live WAL frame.
+	nf := db.pager.wal.nFrame.Load()
+	page1Frame := mustWiGet(t, db.pager.wal.index, 1, nf)
+	require.NotZero(t, page1Frame, "page 1 must resolve to a WAL frame after a commit")
+
+	sentinel := errors.New("injected page-1 header read fault")
+	setWalReadFrameFaultHook(func(frame uint32) error {
+		if frame == page1Frame {
+			return sentinel
+		}
+		return nil
+	})
+
+	_, err = db.BeginRead()
+	require.ErrorIs(t, err, sentinel,
+		"BeginRead must fail when the page-1 counter read fails, not serve stale counters")
+	require.Contains(t, err.Error(), "header counters")
+
+	setWalReadFrameFaultHook(nil)
+	rtx, err := db.BeginRead()
+	require.NoError(t, err, "BeginRead must recover once the fault clears")
+	require.NoError(t, rtx.Rollback())
 }

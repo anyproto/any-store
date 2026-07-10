@@ -2159,9 +2159,17 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 		}
 		if frame > 0 {
 			var buf [dbHeaderSize]byte
-			if err := p.readWalFrameData(frame, buf[:]); err == nil {
-				return binary.BigEndian.Uint32(buf[24:28]), binary.BigEndian.Uint32(buf[40:44]), nil
+			// Propagate readWalFrameData failures — the resolved frame holds
+			// the only current page-1 header; falling back to the DB file
+			// would serve stale FileChangeCount/SchemaCookie, silently
+			// defeating cross-process staleness detection and backup restart
+			// detection. Same contract as the page getters (drift-6
+			// resolution): the caller holds a reader slot, so the frame
+			// cannot have been legitimately reset away.
+			if err := p.readWalFrameData(frame, buf[:]); err != nil {
+				return 0, 0, fmt.Errorf("btree: read page-1 header counters (WAL frame %d): %w", frame, err)
 			}
+			return binary.BigEndian.Uint32(buf[24:28]), binary.BigEndian.Uint32(buf[40:44]), nil
 		}
 	}
 
@@ -2192,6 +2200,13 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 // counter, making it safe for cross-process reads where another process wrote
 // the frame. For InMemory mode (memFrames), it reads from the in-memory frames.
 func (p *pager) readWalFrameData(frame uint32, buf []byte) error {
+	// Test-only fault-injection hook, shared with readFrame/readFrameRaw; see
+	// walReadFrameFaultHook.
+	if hook := walReadFrameFaultHook.Load(); hook != nil {
+		if err := (*hook)(frame); err != nil {
+			return err
+		}
+	}
 	// Use the immutable inMemory flag instead of checking the mutable memFrames
 	// slice header to avoid a data race with writeFramesMem's append.
 	if p.wal.inMemory {

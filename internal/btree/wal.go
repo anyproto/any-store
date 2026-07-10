@@ -2479,9 +2479,10 @@ func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 
 // END ENCRYPTION
 
-// walReadFrameFaultHook is a test-only fault-injection point for wal.readFrame
-// and wal.readFrameRaw. It is nil in production so the only cost on the read
-// path is a single atomic pointer load. Tests install a hook via
+// walReadFrameFaultHook is a test-only fault-injection point for
+// wal.readFrame, wal.readFrameRaw, and pager.readWalFrameData. It is nil in
+// production so the only cost on the read path is a single atomic pointer
+// load. Tests install a hook via
 // setWalReadFrameFaultHook to force a frame-read failure for a chosen frame
 // and exercise the error-propagation contract of the pager getters: once the
 // wal-index resolves a frame, a read failure must surface as the page-get
