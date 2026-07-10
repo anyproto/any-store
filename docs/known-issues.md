@@ -317,6 +317,23 @@ Option 1 is the smallest correct fix. Tracked as a follow-up; may be folded into
 
 ---
 
+## I-09: files written before the array-primary-key ban may contain array pks — recreate them
+
+**Status: BY DESIGN** (pre-beta, alpha back-compat out of scope). Array pk
+values are rejected on write since the two-sided-bounds work (ErrArrayPrimaryKey,
+`collection.newItem`): filter semantics on arrays are element-wise while the
+data-namespace key is the whole-array encoding, so such docs were already
+semantically broken (match and key position decoupled even under the old
+half-open bounds). Files written by earlier builds can still contain them; on
+current builds pk-range queries seek tight two-sided bounds and will SILENTLY
+exclude those docs (pure read paths do not type-check the pk — the excluded
+keys are outside the scanned range by definition, so a scan cannot cheaply
+detect them). Any update, upsert, or index backfill touching such a doc fails
+loudly with ErrArrayPrimaryKey. Remediation: recreate the collection (or
+re-insert the docs with scalar pks) before upgrading.
+
+---
+
 ## I-07: `Count()` with `Limit`/`Offset` over a multi-key index disagrees with `Iter()`
 
 **Status: FIXED** on `bug02-two-sided-bounds` (2026-07-10, two-sided-bounds plan commit 4; see docs/plans/2026-07-10-bug02-two-sided-bounds-plan.md).

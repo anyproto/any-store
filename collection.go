@@ -901,7 +901,7 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 	// runs through insertKeys, which flips it to multikey in this same tx if
 	// the existing docs fan out. Writing the marker after the backfill would
 	// clobber that flip and unsoundly enable tight seeks.
-	if err = tx.Put(c.db.systemNS, multikeyKey(c.name, info.Name), mkValScalar); err != nil {
+	if err = tx.Put(c.db.systemNS, multikeyKey(nsName), mkValScalar); err != nil {
 		return nil, err
 	}
 
@@ -1094,8 +1094,16 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 		// Delete sketch data
 		skKey := sketchKey(c.name, indexName)
 		_ = tx.Delete(c.db.systemNS, skKey) // ignore if not found
-		// Delete the multikey flag: drop+recreate is its only reset path.
-		_ = tx.Delete(c.db.systemNS, multikeyKey(c.name, indexName))
+		// Delete the multikey flag (keyed by the immutable namespace name —
+		// resolve it from the live index object, since nsName computed from
+		// the CURRENT collection name is wrong after a rename): drop+recreate
+		// is the flag's only reset path.
+		for _, idx := range c.loadIndexes() {
+			if idx.info.Name == indexName {
+				_ = tx.Delete(c.db.systemNS, multikeyKey(idx.ns.Name()))
+				break
+			}
+		}
 		// Copy-on-write publish: build a fresh slice without the dropped index
 		// and swap it in atomically for lock-free query readers.
 		cur := c.loadIndexes()

@@ -154,3 +154,29 @@ func TestQuery_ArrayContradiction_MustMatch(t *testing.T) {
 	assert.Equal(t, 1, dres.Modified, "Delete must remove the array doc")
 	assertCollCount(t, coll, 1)
 }
+
+// TestCBO_TightBounds_AscAndDescIndexesOneField pins calculateSelectivity's
+// usedFields dedup when BOTH an ascending and a descending index cover the
+// same field: whichever index enumerates first, the two-sided range must not
+// fall back to the flat 0.5 default (each index's tight estimation bounds go
+// through its own reverse-flag transform).
+func TestCBO_TightBounds_AscAndDescIndexesOneField(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "ascdesc")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx,
+		IndexInfo{Name: "asc", Fields: []string{"a"}},
+		IndexInfo{Name: "desc", Fields: []string{"-a"}},
+	))
+	docs := make([]*anyenc.Value, 0, 5000)
+	for i := 0; i < 5000; i++ {
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i)))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+
+	explain, err := coll.Find(`{"a":{"$gt":2000,"$lt":2100}}`).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, explain.Sql, "Index", "plan: %s", explain.Sql)
+	assert.NotContains(t, explain.Plan, "Selectivity: 0.50",
+		"two-sided range selectivity must be interpolated regardless of index order:\n%s", explain.Plan)
+}

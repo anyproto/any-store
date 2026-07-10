@@ -288,8 +288,17 @@ func sketchKey(collName, indexName string) []byte {
 // in its own record (never inside the sketch blob), is written transactionally
 // with the entries it describes, and defaults to "assume multikey" when
 // absent (files created before the flag existed).
-func multikeyKey(collName, indexName string) []byte {
-	return []byte("idx_mk:" + collName + ":" + indexName)
+//
+// Keyed by the index NAMESPACE name, not collection+index names: namespace
+// names are immutable (btree namespaces can't be renamed — Collection.Rename
+// keeps them) and unique among live namespaces, so the record can never be
+// orphaned by a rename, resurrected by a rename cycle, or written under a
+// name that diverged from the persisted records when a rename's enclosing tx
+// rolls back. createIndex overwrites the record for the namespace it just
+// created, so even an orphan left by an incomplete cleanup can never be
+// adopted by a new index.
+func multikeyKey(nsName string) []byte {
+	return []byte("idx_mk:" + nsName)
 }
 
 // multikeyKey record values. One byte: scalar-so-far (written at index
@@ -1334,13 +1343,12 @@ func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 			return err
 		}
 	}
-	// Remove the per-index sketch and multikey records too: they are keyed by
-	// collection name, and a name-reusing CreateCollection+CreateIndex would
-	// otherwise adopt a stale record (answer-determining for the multikey
-	// flag).
+	// Remove the per-index sketch and multikey records too. The sketch is
+	// keyed by collection name (previously leaked here); the multikey flag is
+	// keyed by the namespace name.
 	for _, name := range idxNames {
 		_ = tx.Delete(db.systemNS, sketchKey(collName, name))
-		_ = tx.Delete(db.systemNS, multikeyKey(collName, name))
+		_ = tx.Delete(db.systemNS, multikeyKey(indexNsName(collName, name)))
 	}
 	// Remove collection config
 	_ = tx.Delete(db.systemNS, collConfigKey(collName))
@@ -1418,12 +1426,6 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 		if skData, err := tx.AppendValue(db.systemNS, sketchKey(oldName, e.name), nil); err == nil {
 			_ = tx.Delete(db.systemNS, sketchKey(oldName, e.name))
 			if err = tx.Put(db.systemNS, sketchKey(newName, e.name), skData); err != nil {
-				return err
-			}
-		}
-		if mkData, err := tx.AppendValue(db.systemNS, multikeyKey(oldName, e.name), nil); err == nil {
-			_ = tx.Delete(db.systemNS, multikeyKey(oldName, e.name))
-			if err = tx.Put(db.systemNS, multikeyKey(newName, e.name), mkData); err != nil {
 				return err
 			}
 		}

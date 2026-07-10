@@ -509,7 +509,7 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 // which is exactly the consistent outcome. deleteKeys never clears the flag
 // (older snapshots may still hold fanned-out entries); drop+recreate resets.
 func (idx *index) markMultiKey(tx *btree.WriteTx) error {
-	key := multikeyKey(idx.c.name, idx.info.Name)
+	key := multikeyKey(idx.ns.Name())
 	var err error
 	idx.mkBuf, err = tx.AppendValue(idx.c.db.systemNS, key, idx.mkBuf[:0])
 	if err == nil && len(idx.mkBuf) == 1 && idx.mkBuf[0] == mkValMultiKey[0] {
@@ -526,7 +526,7 @@ func (idx *index) markMultiKey(tx *btree.WriteTx) error {
 // the same tx as the entries (markMultiKey), so reading it through the query's
 // read tx is exact for that snapshot, including across processes.
 func (idx *index) isScalarProven(tx *btree.ReadTx) bool {
-	v, err := tx.Get(idx.c.db.systemNS, multikeyKey(idx.c.name, idx.info.Name))
+	v, err := tx.Get(idx.c.db.systemNS, multikeyKey(idx.ns.Name()))
 	return err == nil && len(v) == 1 && v[0] == mkValScalar[0]
 }
 

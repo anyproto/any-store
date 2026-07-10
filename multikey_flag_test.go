@@ -3,9 +3,14 @@ package anystore
 import (
 	"fmt"
 	"math/rand"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -134,8 +139,24 @@ func TestMultikeyFlag_Lifecycle(t *testing.T) {
 		// record out from under the collection.
 		c := coll.(*collection)
 		require.NoError(t, c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
-			return tx.Delete(c.db.systemNS, multikeyKey(c.name, "a"))
+			return tx.Delete(c.db.systemNS, multikeyKey(c.loadIndexes()[0].ns.Name()))
 		}))
+		assertWideBounds(t, coll, twoSided)
+	})
+
+	t.Run("top-level rollback keeps record and entries consistent", func(t *testing.T) {
+		coll := newColl(t, "c")
+		tx, err := coll.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":4,"a":[6,1]}`)))
+		require.NoError(t, tx.Rollback())
+
+		// Entries and flag rolled back together.
+		assertTightBounds(t, coll, twoSided)
+		assertQueryCount(t, coll.Find(twoSided), 1)
+
+		// The next committed array write still flips.
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":5,"a":[6,1]}`)))
 		assertWideBounds(t, coll, twoSided)
 	})
 
@@ -392,4 +413,149 @@ func TestMultikeyFlag_ExplainShowsBothEnds(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, explain.Sql, "idBounds", "plan: %s", explain.Sql)
 	require.False(t, strings.Contains(explain.Sql, "inf"), "pk bounds must be two-sided: %s", explain.Sql)
+}
+
+// TestMultikeyFlag_VerifyChainResidualPredicates: tight bounds can collapse a
+// multi-conjunct field ({$gte:5,$lte:5,$nin:[5]}) to a point, flipping
+// PointLookup=true — but the CountOnly verify chain skips the residual
+// FilterIter, so a bound-LESS conjunct on the covered field ($nin, $type)
+// would silently vanish from the count. The verify-chain gate must mirror
+// indexCoversFilter's one-predicate-per-bounded-field rule.
+func TestMultikeyFlag_VerifyChainResidualPredicates(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "verifyresid")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx,
+		IndexInfo{Name: "a", Fields: []string{"a"}},
+		IndexInfo{Name: "b", Fields: []string{"b"}},
+	))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":5,"b":1}`)))
+
+	hint := IndexHint{IndexName: "a", Boost: 1_000_000}
+	for _, tc := range []struct {
+		filter string
+		want   int
+	}{
+		{`{"a":{"$gte":5,"$lte":5,"$nin":[5]},"b":1}`, 0},
+		{`{"a":{"$gte":5,"$lte":5,"$type":"string"},"b":1}`, 0},
+		{`{"a":{"$gte":5,"$lte":5},"b":1}`, 1},
+	} {
+		t.Run(tc.filter, func(t *testing.T) {
+			it, err := coll.Find(tc.filter).IndexHint(hint).Iter(ctx)
+			require.NoError(t, err)
+			n := 0
+			for it.Next() {
+				n++
+			}
+			require.NoError(t, it.Err())
+			require.NoError(t, it.Close())
+			require.Equal(t, tc.want, n, "Iter")
+			assertQueryCount(t, coll.Find(tc.filter).IndexHint(hint), tc.want)
+		})
+	}
+}
+
+// TestMultikeyFlag_ScanCostPricedFromSeekBounds: an unproven (multikey-
+// flagged) index seeks WIDE even though its tight bounds are narrow. The
+// scan-cost estimate must price the wide seek — charging the tight fraction
+// picks an index seek that still walks half the index. 1000 scalar docs plus
+// one array doc (inserted and deleted: the flag is sticky) — a narrow
+// two-sided mid-range query must stay on the full scan, because the real
+// index seek would visit ~90% of the entries.
+func TestMultikeyFlag_ScanCostPricedFromSeekBounds(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "seekprice")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
+	docs := make([]*anyenc.Value, 0, 1000)
+	for i := 0; i < 1000; i++ {
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i)))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":9999,"a":[1,2]}`)))
+	require.NoError(t, coll.DeleteId(ctx, 9999))
+
+	explain, err := coll.Find(`{"a":{"$gt":100,"$lt":105}}`).Explain(ctx)
+	require.NoError(t, err)
+	require.Contains(t, explain.Sql, "FullScan",
+		"an unproven index seeking wide must not be priced at the tight fraction: %s\n%s",
+		explain.Sql, explain.Plan)
+}
+
+// TestMultikeyFlagMultiprocess verifies the flag's cross-process contract: it
+// travels in the same btree commit as the fan-out entries, so a separate OS
+// process opening the file sees either both or neither — tight bounds before
+// the array commit, wide bounds (and the array doc in results) after.
+func TestMultikeyFlagMultiprocess(t *testing.T) {
+	if expect := os.Getenv("MK_MP_EXPECT"); expect != "" {
+		mkMpChild(t, os.Getenv("MK_MP_PATH"), expect)
+		return
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mk_mp.db")
+
+	db, err := Open(ctx, path, nil)
+	require.NoError(t, err)
+	defer db.Close()
+	coll, err := db.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":1}`),
+		anyenc.MustParseJson(`{"id":2,"a":3}`),
+	))
+
+	runChild := func(expect string) {
+		t.Helper()
+		cmd := exec.Command(os.Args[0], "-test.run=^TestMultikeyFlagMultiprocess$", "-test.v=true")
+		cmd.Env = append(os.Environ(), "MK_MP_PATH="+path, "MK_MP_EXPECT="+expect)
+		done := make(chan struct{})
+		var out []byte
+		var cerr error
+		go func() { out, cerr = cmd.CombinedOutput(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(60 * time.Second):
+			_ = cmd.Process.Kill()
+			t.Fatalf("child timed out")
+		}
+		require.NoError(t, cerr, "child failed:\n%s", out)
+	}
+
+	// Scalar-only data committed: a fresh process must prove scalar and seek
+	// tight, counting exactly the in-range scalar doc.
+	runChild("tight=1")
+
+	// Commit fan-out entries; the flag travels in the same commit, so the
+	// next process must seek wide and include the array doc (6>2, 1<5).
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":[6,1]}`)))
+	runChild("wide=2")
+}
+
+// mkMpChild opens the same DB file and asserts the bounds shape (via explain)
+// and the count for the two-sided range under an index hint.
+func mkMpChild(t *testing.T, path, expect string) {
+	db, err := Open(ctx, path, nil)
+	require.NoError(t, err)
+	defer db.Close()
+	coll, err := db.OpenCollection(ctx, "docs")
+	require.NoError(t, err)
+
+	kv := strings.SplitN(expect, "=", 2)
+	mode, wantCount := kv[0], kv[1]
+
+	hint := IndexHint{IndexName: "a", Boost: 1_000_000}
+	explain, err := coll.Find(twoSided).IndexHint(hint).Explain(ctx)
+	require.NoError(t, err)
+	require.Contains(t, explain.Sql, "IndexScan(a)", "child plan: %s", explain.Sql)
+	switch mode {
+	case "tight":
+		require.NotContains(t, explain.Sql, "inf]", "child expected tight bounds: %s", explain.Sql)
+	case "wide":
+		require.Contains(t, explain.Sql, "inf]", "child expected wide bounds: %s", explain.Sql)
+	}
+	n, err := coll.Find(twoSided).IndexHint(hint).Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, wantCount, strconv.Itoa(n), "child count")
 }

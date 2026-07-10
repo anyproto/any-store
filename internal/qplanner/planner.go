@@ -260,21 +260,23 @@ type CBOIndex struct {
 	rangeSel float64
 
 	// EstBounds is the tight-channel tuple bounds (ComputeIndexBoundsTight),
-	// set only when they differ from Bounds. ESTIMATION ONLY: interpolation
-	// reads them so a two-sided range is ranked as (lo,hi) instead of
-	// (lo,+inf); seeks keep Bounds unless the index is proven fan-out-free
-	// Built through the same reverse-flag transform as Bounds,
-	// so RangeFraction ranks them in stored-key space.
+	// set only when they differ from Bounds. DOC-SELECTIVITY ESTIMATION ONLY:
+	// rangeSelTight ranks them so a two-sided range's match fraction is rated
+	// (lo,hi) instead of (lo,+inf). Seeks — and the SCAN-COST estimate, which
+	// must price the entries the chain actually visits — keep Bounds unless
+	// the index is proven fan-out-free (then Bounds IS tight and EstBounds is
+	// nil). Built through the same reverse-flag transform as Bounds, so
+	// RangeFraction ranks them in stored-key space.
 	EstBounds query.Bounds
-}
 
-// estBounds returns the bounds cost estimation should rank: the tight channel
-// when it differs, the seek bounds otherwise.
-func (idx *CBOIndex) estBounds() query.Bounds {
-	if idx.EstBounds != nil {
-		return idx.EstBounds
-	}
-	return idx.Bounds
+	// rangeSelTight is the interpolated fraction of EstBounds (== rangeSel
+	// when EstBounds is nil). It feeds calculateSelectivity's per-field match
+	// fraction (how many DOCS match — tight is sound and more accurate there)
+	// but never the seek/scan cost terms, which are priced from the bounds
+	// the chain executes with (rangeSel over Bounds): costing tight while
+	// seeking wide undercharges the seek and picks index scans that still
+	// walk half the index. Planner-internal.
+	rangeSelTight float64
 }
 
 // BuildPlan constructs an iterator chain using the Cost-Based Optimizer.
@@ -321,7 +323,14 @@ func BuildPlan(params *PlanParams) *Plan {
 			if idx.Sketch != nil && idx.Sketch.EntryCount(0) > uint64(params.TotalDocs) {
 				continue
 			}
-			idx.rangeSel = interpolateRangeSel(params.Tx, idx)
+			// rangeSel prices the SCAN (the bounds the chain seeks with);
+			// rangeSelTight rates the MATCH fraction (tight channel). They
+			// differ only for unproven indexes carrying EstBounds.
+			idx.rangeSel = interpolateRangeSel(params.Tx, idx, idx.Bounds)
+			idx.rangeSelTight = idx.rangeSel
+			if idx.EstBounds != nil {
+				idx.rangeSelTight = interpolateRangeSel(params.Tx, idx, idx.EstBounds)
+			}
 		}
 	}
 
@@ -883,8 +892,8 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 				// interpolation loop already skipped multikey indexes, whose
 				// entry fractions don't map to doc fractions.
 				p := DefaultRangeSelectivity
-				if fi == 0 && idx.BoundFields == 1 && idx.rangeSel > 0 && idx.rangeSel < p {
-					p = idx.rangeSel * indexPopulation(idx, totalDocs) / totalDocs
+				if fi == 0 && idx.BoundFields == 1 && idx.rangeSelTight > 0 && idx.rangeSelTight < p {
+					p = idx.rangeSelTight * indexPopulation(idx, totalDocs) / totalDocs
 					if p <= 0 {
 						p = 0.0001
 					}
@@ -962,11 +971,11 @@ func indexPopulation(idx *CBOIndex, totalDocs float64) float64 {
 // bounds of a $ne are a two-piece union ((-inf,v) ∪ (v,+inf)), so the per-bound
 // fractions are summed. Returns 0 (→ caller falls back to DefaultRangeSelectivity)
 // on any read error, leaving the planner's degraded behavior unchanged.
-func interpolateRangeSel(tx *btree.ReadTx, idx *CBOIndex) float64 {
+func interpolateRangeSel(tx *btree.ReadTx, idx *CBOIndex, bounds query.Bounds) float64 {
 	cur := tx.NewCursor(idx.Ns)
 	defer cur.Close()
 	var f float64
-	for _, b := range idx.estBounds() {
+	for _, b := range bounds {
 		bf, err := cur.RangeFraction(b.Start, b.End)
 		if err != nil {
 			return 0
@@ -1275,7 +1284,16 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	// Index verification for count queries: instead of fetching documents to
 	// check uncovered filter fields, verify each docId against single-field
 	// indexes for those fields. This avoids expensive document fetches.
-	if params.CountOnly && idx.PointLookup && params.FieldBounds != nil {
+	//
+	// Like the covering fast path above, this skips the residual FilterIter,
+	// so the candidate's bounded fields must be EXACTLY represented by their
+	// bounds: a field carrying more than one predicate can be PointLookup via
+	// the tight channel ({$gte:5,$lte:5,$nin:[5]} collapses to [5,5]) while a
+	// bound-LESS conjunct ($nin, $type, $not) still needs the filter — without
+	// this gate that conjunct silently vanishes and Count over-counts vs Iter.
+	// Mirrors indexCoversFilter condition 2.
+	if params.CountOnly && idx.PointLookup && params.FieldBounds != nil &&
+		boundedFieldsSinglePredicate(idx, params.Filter) {
 		if verifyRoot := buildVerifyChain(params, idx, root); verifyRoot != nil {
 			return verifyRoot
 		}
@@ -1540,6 +1558,23 @@ func indexCoversFilter(idx *CBOIndex, filter query.Filter) bool {
 	// Condition 2: reject when any covered field carries >1 predicate, because
 	// And.IndexBounds then over-approximates and the fast path skips the
 	// FilterIter that would trim the result.
+	for _, field := range boundedFields {
+		if countFilterFieldPreds(filter, field) > 1 {
+			return false
+		}
+	}
+	return true
+}
+
+// boundedFieldsSinglePredicate reports whether every field of idx's contiguous
+// bound prefix carries at most one predicate in filter — the condition under
+// which the bounds exactly represent those fields' constraints and a
+// FilterIter-skipping count path (covering count, verify chain) is sound.
+func boundedFieldsSinglePredicate(idx *CBOIndex, filter query.Filter) bool {
+	boundedFields := idx.Info.FieldNames
+	if idx.BoundFields < len(boundedFields) {
+		boundedFields = boundedFields[:idx.BoundFields]
+	}
 	for _, field := range boundedFields {
 		if countFilterFieldPreds(filter, field) > 1 {
 			return false

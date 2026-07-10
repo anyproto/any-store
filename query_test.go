@@ -1202,13 +1202,14 @@ func TestQueryCount_LimitOffsetMultiKey(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
 		limit, offset uint
+		want          int // hardcoded so a bug shared by Iter and Count can't hide
 	}{
-		{"limit3", 3, 0},
-		{"offset4", 0, 4},
-		{"limit3_offset4", 3, 4},
-		{"limit20", 20, 0},
-		{"offset20", 0, 20},
-		{"no_cutoff", 0, 0},
+		{"limit3", 3, 0, 3},
+		{"offset4", 0, 4, 6},
+		{"limit3_offset4", 3, 4, 3},
+		{"limit20", 20, 0, 10},
+		{"offset20", 0, 20, 0},
+		{"no_cutoff", 0, 0, 10},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			q := func() Query {
@@ -1221,8 +1222,8 @@ func TestQueryCount_LimitOffsetMultiKey(t *testing.T) {
 				}
 				return q
 			}
-			want := countViaIter(t, q())
-			assertQueryCount(t, q(), want)
+			require.Equal(t, tc.want, countViaIter(t, q()), "Iter ground truth")
+			assertQueryCount(t, q(), tc.want)
 		})
 	}
 }

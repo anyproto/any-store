@@ -212,10 +212,14 @@ Each commit is separable, individually testable, and keeps
   verify and add tests per path. Objects stay legal (whole-value semantics, total
   order holds; no element-wise decoupling — `Comp.Ok` treats objects as whole
   values, query/filter.go:131).
-- Defensive read: where the pk is decoded/appended (`appendId` neighborhood), a
-  `TypeArray` pk from a pre-ban file fails loudly instead of silently misbehaving.
-  Note in known-issues.md: files containing array pks predate the ban and must be
-  recreated (per the no-alpha-back-compat decision).
+- Defensive detection (as implemented): `newItem` is also the choke point for
+  update/upsert/index-backfill over EXISTING docs, so any write-adjacent touch
+  of a pre-ban array-pk doc fails loudly. Pure read paths do not type-check the
+  pk — a doc whose whole-array key lies outside the tight seek range is by
+  definition never reached by the scan, so read-side detection would need an
+  offline sweep, not a per-row check. Documented as known-issues I-09: files
+  containing array pks predate the ban and must be recreated (per the
+  no-alpha-back-compat decision).
 - Check interaction with BUG-09 (non-default pk) test fixtures.
 - Tests: each write path errors on array pk; object/string/number pks unaffected;
   existing suites green.
