@@ -602,6 +602,19 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 			FieldBounds: &br,
 		})
 
+		// Limit/Offset cutoffs must apply to DISTINCT docs, not raw entry
+		// rows: over a multi-key index LimitIter.Next skips/caps entries that
+		// later collapse in dedup, diverging from Iter (BUG-06 / I-07).
+		// CountDistinct deduplicates before the cutoff.
+		if li, ok := plan.Root.(*qplanner.LimitIter); ok {
+			n, cerr := li.CountDistinct()
+			plan.Close()
+			if cerr != nil {
+				return cerr
+			}
+			count = n
+			return nil
+		}
 		// Use batch counting if the root iterator supports it (covering index
 		// count). IndexIter.CountEntries handles the multi-bound + multi-key
 		// dedup internally via the per-entry value byte; consumers don't need

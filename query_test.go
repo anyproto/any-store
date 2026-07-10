@@ -1165,3 +1165,61 @@ func TestQuery_ReverseMultiIntervalOrder_FullScan(t *testing.T) {
 	require.NoError(t, it.Close())
 	assert.Equal(t, []int{9, 5, 1}, got)
 }
+
+// TestQueryCount_LimitOffsetMultiKey is the BUG-06 / I-07 regression gate:
+// Count with Limit/Offset over a multi-key index must agree with Iter. The
+// LimitIter cutoff used to apply to raw index-entry rows while doc dedup ran
+// only in the consumer loop, so limit capped entry-rows that then collapsed
+// (Limit(3).Count() = 2) and offset skipped entry-rows that were fewer
+// distinct docs (Offset(4).Count() = 8 instead of 6).
+func TestQueryCount_LimitOffsetMultiKey(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "i07")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "x", Fields: []string{"x"}}))
+	for i := 0; i < 10; i++ {
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"x":[%d,%d]}`, i, i, i+1))))
+	}
+	const filter = `{"x":{"$in":[0,1,2,3,4,5,6,7,8,9,10]}}`
+	hint := IndexHint{IndexName: "x", Boost: 1_000_000}
+
+	countViaIter := func(t *testing.T, q Query) int {
+		it, err := q.Iter(ctx)
+		require.NoError(t, err)
+		n := 0
+		for it.Next() {
+			n++
+		}
+		require.NoError(t, it.Err())
+		require.NoError(t, it.Close())
+		return n
+	}
+
+	for _, tc := range []struct {
+		name          string
+		limit, offset uint
+	}{
+		{"limit3", 3, 0},
+		{"offset4", 0, 4},
+		{"limit3_offset4", 3, 4},
+		{"limit20", 20, 0},
+		{"offset20", 0, 20},
+		{"no_cutoff", 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := func() Query {
+				q := coll.Find(filter).IndexHint(hint)
+				if tc.limit > 0 {
+					q = q.Limit(tc.limit)
+				}
+				if tc.offset > 0 {
+					q = q.Offset(tc.offset)
+				}
+				return q
+			}
+			want := countViaIter(t, q())
+			assertQueryCount(t, q(), want)
+		})
+	}
+}

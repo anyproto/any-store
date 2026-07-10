@@ -54,6 +54,64 @@ func (it *LimitIter) Next() (key []byte, docId []byte, multiKey bool, err error)
 	}
 }
 
+// CountDistinct counts the DISTINCT documents this LimitIter chain would
+// yield, i.e. min(Limit, max(0, distinct(source) - Offset)). Count consumers
+// must use this instead of pulling Next(): Next applies Offset/Limit to raw
+// source ROWS, which over a multi-key index can be several entries per doc —
+// the offset then skips fewer distinct docs than requested and the limit caps
+// entry rows that later collapse in the consumer's dedup, so Count diverges
+// from Iter (BUG-06 / known-issues I-07). Here dedup runs BEFORE the cutoff:
+// offset and limit are applied to distinct-doc counts, with early exit once
+// Offset+Limit distinct docs are seen.
+//
+// The cursor-level fast skip stays sound for distinct-doc arithmetic: the
+// offsetSkipper contract skips only entries recorded as scalar (the doc's
+// single entry in that namespace), so each skipped row IS one distinct doc,
+// and a skipped doc cannot reappear later marked multi-key.
+func (it *LimitIter) CountDistinct() (int, error) {
+	remainingOffset := it.Offset
+	if it.Offset > 0 {
+		if src, ok := it.Source.(offsetSkipper); ok {
+			rem, err := src.skipOffset(it.Offset)
+			if err != nil {
+				return 0, err
+			}
+			remainingOffset = rem
+		}
+	}
+
+	target := -1 // no early exit for offset-only cutoffs: the full tail counts
+	if it.Limit > 0 {
+		target = it.Limit + remainingOffset
+	}
+	var dedup DocDedup
+	distinct := 0
+	for {
+		_, docId, multiKey, err := it.Source.Next()
+		if err != nil {
+			return 0, err
+		}
+		if docId == nil {
+			break
+		}
+		if dedup.Accept(docId, multiKey) {
+			distinct++
+			if target >= 0 && distinct >= target {
+				break
+			}
+		}
+	}
+
+	n := distinct - remainingOffset
+	if n < 0 {
+		n = 0
+	}
+	if it.Limit > 0 && n > it.Limit {
+		n = it.Limit
+	}
+	return n, nil
+}
+
 // Close releases resources by closing the source iterator.
 func (it *LimitIter) Close() {
 	if it.Source != nil {

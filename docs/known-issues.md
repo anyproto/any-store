@@ -306,6 +306,16 @@ Option 1 is the smallest correct fix. Tracked as a follow-up; may be folded into
 
 ## I-07: `Count()` with `Limit`/`Offset` over a multi-key index disagrees with `Iter()`
 
+**Status: FIXED** on `bug02-two-sided-bounds` (2026-07-10, BUG-02 plan commit 4).
+`LimitIter.CountDistinct` (internal/qplanner/limit_iter.go) deduplicates BEFORE
+the cutoff: offset and limit apply to distinct-doc counts (early exit at
+Offset+Limit distinct), and the Count dispatch (query.go) routes any
+LimitIter-rooted plan through it instead of the generic Next loop. The
+cursor-level offset fast-skip stays sound: it skips only scalar-recorded
+entries, each of which is exactly one distinct doc. Regression:
+`query_test.go:TestQueryCount_LimitOffsetMultiKey` (the trigger below plus
+combined limit+offset and past-the-end cutoffs, asserted against Iter).
+
 **Discovered:** 2026-05-29, adversarial review of `feat/array-index-in-sortdedup`. **Pre-existing on the `btree` baseline (alpha.6)** — confirmed by detaching to `eb667a0` and reproducing identical numbers. NOT introduced by the sort-dedup branch.
 
 **Affected code:** `query.go` Count path. When the query carries a `Limit`/`Offset`, the plan root is a `LimitIter`, which is not a `CountableIterator`, so Count falls to the generic dedup loop. Over a multi-key index two dedup layers (`CanonicalKeyDedupIter` upstream + the consumer `DocDedup`) interact with the limit cutoff and produce a count that is neither `min(limit, distinct)` nor the true distinct count.
