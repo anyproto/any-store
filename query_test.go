@@ -109,6 +109,11 @@ func TestQueryCount_ArrayTwoSidedRange(t *testing.T) {
 	explain, err := coll.Find(filter).IndexHint(hint).Explain(ctx)
 	require.NoError(t, err)
 	require.Contains(t, explain.Sql, "IndexScan", "reproducer must take the index path; got: %s", explain.Sql)
+	// The index has seen arrays (multikey flag set), so the executed bounds
+	// must stay the sound half-open over-approximation — tight seeks on this
+	// index would drop doc 1 entirely.
+	require.Contains(t, explain.Sql, "inf]",
+		"a multikey index must serve wide bounds; got: %s", explain.Sql)
 
 	assertQueryCount(t, coll.Find(filter).IndexHint(hint), 3)
 

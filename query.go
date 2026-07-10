@@ -230,7 +230,7 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		Offset:      int(q.offset),
 		Buf:         buf,
 		TotalDocs:   q.docCount(btx),
-		Indexes:     q.buildCBOIndexesInto(nil, &br, idxs),
+		Indexes:     q.buildCBOIndexesInto(nil, &br, idxs, btx),
 		IndexHints:  q.buildIndexHints(),
 		FieldBounds: &br,
 	})
@@ -308,7 +308,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 			Offset:      int(q.offset),
 			Buf:         buf,
 			TotalDocs:   q.docCount(btx),
-			Indexes:     q.buildCBOIndexesInto(nil, &br, idxs),
+			Indexes:     q.buildCBOIndexesInto(nil, &br, idxs, btx),
 			IndexHints:  q.buildIndexHints(),
 			FieldBounds: &br,
 		})
@@ -456,7 +456,7 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 			Offset:      int(q.offset),
 			Buf:         buf,
 			TotalDocs:   q.docCount(btx),
-			Indexes:     q.buildCBOIndexesInto(nil, &br, idxs),
+			Indexes:     q.buildCBOIndexesInto(nil, &br, idxs, btx),
 			IndexHints:  q.buildIndexHints(),
 			FieldBounds: &br,
 		})
@@ -552,11 +552,8 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 		return 0, nil
 	}
 
-	// Compute idBounds only if filter references the primary-key field
-	var idBounds query.Bounds
-	if ib := q.cond.IndexBounds(q.c.primaryKey, nil); len(ib) != 0 {
-		idBounds = ib
-	}
+	// Primary-key bounds (tight channel — sound for the pk, see pkBounds)
+	idBounds := q.pkBounds()
 
 	// Fast path: ID-only filter with fixed point lookups and no additional conditions.
 	// Skip CBO/planner entirely — just check key existence in data namespace.
@@ -577,13 +574,17 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	}
 
 	idxs := q.c.loadIndexes()
-	br := q.buildBoundsResult(idxs)
-	var cboBuf [8]qplanner.CBOIndex
-	cboIndexes := q.buildCBOIndexesInto(cboBuf[:0], &br, idxs)
 
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		buf := q.c.db.syncPool.GetDocBuf()
 		defer q.c.db.syncPool.ReleaseDocBuf(buf)
+
+		// Bounds and CBO candidates are built INSIDE the read tx: the
+		// multikey-flag probe gating tight seek bounds must read the same
+		// snapshot the scan executes on.
+		br := q.buildBoundsResult(idxs)
+		var cboBuf [8]qplanner.CBOIndex
+		cboIndexes := q.buildCBOIndexesInto(cboBuf[:0], &br, idxs, tx)
 
 		plan := qplanner.BuildPlan(&qplanner.PlanParams{
 			Tx:          tx,
@@ -659,10 +660,14 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
 	idxs := q.c.loadIndexes()
-	br := q.buildBoundsResult(idxs)
-	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs)
 
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		// Built inside the read tx so the multikey-flag probe sees the same
+		// snapshot the (hypothetical) scan would — Explain must report the
+		// bounds the real query would use.
+		br := q.buildBoundsResult(idxs)
+		cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, tx)
+
 		plan, isFts, ferr := q.ftsScanPlan(tx, buf)
 		if ferr != nil {
 			return ferr
@@ -721,11 +726,26 @@ func (q *collQuery) makeQuery() (qb *queryBuilder, err error) {
 	}
 
 	// handle the primary-key field
-	if idBounds := q.cond.IndexBounds(q.c.primaryKey, nil); len(idBounds) != 0 {
-		qb.idBounds = idBounds
-	}
+	qb.idBounds = q.pkBounds()
 
 	return
+}
+
+// pkBounds computes the primary-key seek bounds. The pk namespace is
+// fan-out-free by construction (array pks are rejected on write,
+// ErrArrayPrimaryKey), so the TIGHT channel is sound for the actual seek here
+// — {id:{$gt:lo,$lt:hi}} seeks (lo,hi) instead of (lo,+inf). When the tight
+// intersection is empty the verbs have already short-circuited via
+// unsatisfiable(); Explain bypasses that and keeps the wide superset.
+func (q *collQuery) pkBounds() query.Bounds {
+	idBounds := q.cond.IndexBounds(q.c.primaryKey, nil)
+	if len(idBounds) == 0 || !query.MayTighten(q.cond) {
+		return idBounds
+	}
+	if tight, empty := query.TightIndexBounds(q.cond, q.c.primaryKey); !empty && len(tight) != 0 {
+		return tight
+	}
+	return idBounds
 }
 
 // docCount returns the total number of documents from the first index's sketch DocCount.
@@ -875,7 +895,19 @@ func (q *collQuery) buildBoundsResult(idxs []*index) qplanner.BoundsResult {
 // buildCBOIndexesInto builds CBOIndex entries into the provided buffer using
 // pre-computed bounds. idxs MUST be the same snapshot passed to
 // buildBoundsResult for this pass.
-func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.BoundsResult, idxs []*index) []qplanner.CBOIndex {
+//
+// tx is the READ TX THE QUERY WILL EXECUTE WITH; when a candidate's tight
+// bounds differ from the wide ones, it gates one point Get of the index's
+// multikey flag on that same snapshot. A scalar-proven index gets its ENTIRE
+// variant — bounds plus every flag derived from them (PointLookup,
+// equalityPrefix→ExactSort/SortMatchStart, and downstream dedupBounds/padding
+// in BuildPlan) — rebuilt from the tight channel: swapping only the bounds
+// under wide-derived flags (or vice versa) yields wrong plans and wrong rows
+// (a stale PointLookup routes a multikey unique index into CoverIter, which
+// ignores End; a stale ExactSort skips the SortIter). An unproven index keeps
+// the wide variant and carries the tight bounds in EstBounds for estimation
+// only. tx == nil (unit tests) means no proof — wide seeks.
+func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.BoundsResult, idxs []*index, tx *btree.ReadTx) []qplanner.CBOIndex {
 	result := buf
 
 	var sortFields []query.SortField
@@ -884,56 +916,73 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 	}
 
 	for _, idx := range idxs {
-		info := idx.cboInfo
-
-		// Compute bounds for this index
-		bounds, chainLen := qplanner.ComputeIndexBounds(info, br)
-
-		pointLookup := qplanner.AllBoundsFixed(bounds)
-		// Note: AdjustBoundsForNonUnique is deferred to BuildPlan's
-		// buildIndexSeekChain, which only adjusts the CHOSEN index.
-		// This avoids allocation overhead for indexes that aren't selected.
-
-		// Compute equality prefix: count leading index fields with equality bounds.
-		// This handles compound indexes like (t,o) with t=eq, o=range correctly,
-		// allowing IndexSortMatch to recognize sort coverage after equality prefix.
-		equalityPrefix := 0
-		for _, field := range info.FieldNames {
-			bounds, fixed, found := br.Lookup(field)
-			if !found || len(bounds) == 0 || !fixed {
-				break
+		cboIdx := q.buildCBOIndex(idx, br, sortFields, false)
+		if br.TightDiffers(idx.cboInfo.FieldNames) {
+			if tx != nil && idx.isScalarProven(tx) {
+				cboIdx = q.buildCBOIndex(idx, br, sortFields, true)
+			} else {
+				// Estimation-only tight bounds; seeks keep the wide Bounds.
+				cboIdx.EstBounds, _ = qplanner.ComputeIndexBoundsTight(idx.cboInfo, br)
 			}
-			equalityPrefix++
-		}
-
-		// Check sort coverage (accounting for equality-pinned prefix)
-		var exactSort, partialSort bool
-		var sortMatchStart int
-		if len(sortFields) > 0 {
-			exactSort, partialSort, sortMatchStart = qplanner.IndexSortMatch(info, sortFields, equalityPrefix)
-		}
-
-		cboIdx := qplanner.CBOIndex{
-			Info:           info,
-			Sketch:         idx.loadPubSketch(),
-			Bounds:         bounds,
-			Reverse:        idx.reverse,
-			Ns:             idx.ns,
-			PointLookup:    pointLookup,
-			BoundFields:    chainLen,
-			ExactSort:      exactSort,
-			PartialSort:    partialSort,
-			SortMatchStart: sortMatchStart,
-		}
-		// Tight-channel bounds for cost estimation: only when the
-		// intersected per-field bounds actually differ from the wide ones.
-		// Seeks keep Bounds; see CBOIndex.EstBounds.
-		if br.TightDiffers(info.FieldNames) {
-			cboIdx.EstBounds, _ = qplanner.ComputeIndexBoundsTight(info, br)
 		}
 		result = append(result, cboIdx)
 	}
 	return result
+}
+
+// buildCBOIndex builds one candidate's CBOIndex with bounds AND all
+// bounds-derived flags taken consistently from a single channel (wide or
+// tight) — see buildCBOIndexesInto for why mixing channels is forbidden.
+func (q *collQuery) buildCBOIndex(idx *index, br *qplanner.BoundsResult, sortFields []query.SortField, tight bool) qplanner.CBOIndex {
+	info := idx.cboInfo
+
+	// Compute bounds for this index
+	var bounds query.Bounds
+	var chainLen int
+	lookup := br.Lookup
+	if tight {
+		bounds, chainLen = qplanner.ComputeIndexBoundsTight(info, br)
+		lookup = br.LookupTight
+	} else {
+		bounds, chainLen = qplanner.ComputeIndexBounds(info, br)
+	}
+
+	pointLookup := qplanner.AllBoundsFixed(bounds)
+	// Note: AdjustBoundsForNonUnique is deferred to BuildPlan's
+	// buildIndexSeekChain, which only adjusts the CHOSEN index.
+	// This avoids allocation overhead for indexes that aren't selected.
+
+	// Compute equality prefix: count leading index fields with equality bounds.
+	// This handles compound indexes like (t,o) with t=eq, o=range correctly,
+	// allowing IndexSortMatch to recognize sort coverage after equality prefix.
+	equalityPrefix := 0
+	for _, field := range info.FieldNames {
+		bounds, fixed, found := lookup(field)
+		if !found || len(bounds) == 0 || !fixed {
+			break
+		}
+		equalityPrefix++
+	}
+
+	// Check sort coverage (accounting for equality-pinned prefix)
+	var exactSort, partialSort bool
+	var sortMatchStart int
+	if len(sortFields) > 0 {
+		exactSort, partialSort, sortMatchStart = qplanner.IndexSortMatch(info, sortFields, equalityPrefix)
+	}
+
+	return qplanner.CBOIndex{
+		Info:           info,
+		Sketch:         idx.loadPubSketch(),
+		Bounds:         bounds,
+		Reverse:        idx.reverse,
+		Ns:             idx.ns,
+		PointLookup:    pointLookup,
+		BoundFields:    chainLen,
+		ExactSort:      exactSort,
+		PartialSort:    partialSort,
+		SortMatchStart: sortMatchStart,
+	}
 }
 
 // buildIndexHints converts public IndexHint to internal IndexHintParam.

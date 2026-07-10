@@ -3,8 +3,10 @@
 **Date:** 2026-07-10
 **Bug:** `../any-storev2-pre-beta-bugs/BUG-02-and-indexbounds-drops-range-end.md` (pre-beta gate, severity High)
 **Also fixes:** BUG-06/I-07 (commit 4), BUG-12/NEW-A (commit 2), BUG-13/NEW-B (commit 3)
-**Status:** PLANNED (design expert-consulted; adversarially reviewed by 4 independent
-passes — all confirmed holes folded in below)
+**Status:** IMPLEMENTED on `bug02-two-sided-bounds` (2026-07-10), commits 1-7 as
+planned (design expert-consulted; adversarially reviewed by 4 independent
+passes — all confirmed holes folded in below). Measured on the acceptance
+shape (200k docs, descending two-sided pk range, Limit 10): 14.6ms → 26.9µs.
 
 ## Goal
 

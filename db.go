@@ -281,6 +281,26 @@ func sketchKey(collName, indexName string) []byte {
 	return []byte("stat_data:" + collName + ":" + indexName)
 }
 
+// multikeyKey is the system-namespace key of an index's sticky multikey flag.
+// Unlike the advisory sketch, this record is ANSWER-DETERMINING: it gates
+// whether the planner may seek with tight (intersected) bounds, which silently
+// drops docs if the index actually holds fan-out entries. It therefore lives
+// in its own record (never inside the sketch blob), is written transactionally
+// with the entries it describes, and defaults to "assume multikey" when
+// absent (files created before the flag existed).
+func multikeyKey(collName, indexName string) []byte {
+	return []byte("idx_mk:" + collName + ":" + indexName)
+}
+
+// multikeyKey record values. One byte: scalar-so-far (written at index
+// creation, before backfill) or multikey (flipped by the first fan-out write,
+// one-way — deletes never clear it because older snapshots may still hold the
+// fanned-out entries; drop+recreate is the reset).
+var (
+	mkValScalar   = []byte{1}
+	mkValMultiKey = []byte{2}
+)
+
 func indexKeyPrefix(collName string) string {
 	return "idx:" + collName + ":"
 }
@@ -1287,6 +1307,8 @@ func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 		return nil
 	}
 	var keysToDelete [][]byte
+	var idxNames []string
+	var p anyenc.Parser
 	for cursor.Valid() {
 		key, err := cursor.Key()
 		if err != nil {
@@ -1296,6 +1318,13 @@ func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 			break
 		}
 		keysToDelete = append(keysToDelete, append([]byte(nil), key...))
+		val, err := cursor.Value()
+		if err != nil {
+			return err
+		}
+		if v, err := p.Parse(val); err == nil {
+			idxNames = append(idxNames, v.GetString("name"))
+		}
 		if err := cursor.Next(); err != nil {
 			return err
 		}
@@ -1304,6 +1333,14 @@ func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 		if err := tx.Delete(db.systemNS, key); err != nil {
 			return err
 		}
+	}
+	// Remove the per-index sketch and multikey records too: they are keyed by
+	// collection name, and a name-reusing CreateCollection+CreateIndex would
+	// otherwise adopt a stale record (answer-determining for the multikey
+	// flag).
+	for _, name := range idxNames {
+		_ = tx.Delete(db.systemNS, sketchKey(collName, name))
+		_ = tx.Delete(db.systemNS, multikeyKey(collName, name))
 	}
 	// Remove collection config
 	_ = tx.Delete(db.systemNS, collConfigKey(collName))
@@ -1372,6 +1409,23 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 		}
 		if err := tx.Put(db.systemNS, indexKey(newName, e.name), e.val); err != nil {
 			return err
+		}
+		// The per-index sketch and multikey records are keyed by collection
+		// name too; leaving them behind would orphan them AND let a later
+		// rename back resurrect a stale record — for the multikey flag that
+		// means tight seeks against an index that has since seen arrays,
+		// i.e. silently dropped docs.
+		if skData, err := tx.AppendValue(db.systemNS, sketchKey(oldName, e.name), nil); err == nil {
+			_ = tx.Delete(db.systemNS, sketchKey(oldName, e.name))
+			if err = tx.Put(db.systemNS, sketchKey(newName, e.name), skData); err != nil {
+				return err
+			}
+		}
+		if mkData, err := tx.AppendValue(db.systemNS, multikeyKey(oldName, e.name), nil); err == nil {
+			_ = tx.Delete(db.systemNS, multikeyKey(oldName, e.name))
+			if err = tx.Put(db.systemNS, multikeyKey(newName, e.name), mkData); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

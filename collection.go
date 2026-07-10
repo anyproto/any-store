@@ -897,6 +897,14 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 		return nil, err
 	}
 
+	// Write the scalar-so-far multikey marker BEFORE the backfill: buildIndex
+	// runs through insertKeys, which flips it to multikey in this same tx if
+	// the existing docs fan out. Writing the marker after the backfill would
+	// clobber that flip and unsoundly enable tight seeks.
+	if err = tx.Put(c.db.systemNS, multikeyKey(c.name, info.Name), mkValScalar); err != nil {
+		return nil, err
+	}
+
 	// Initialize sketch for the new index (one prefix level per index field)
 	idx.sketch = qplanner.NewIndexSketch(qplanner.DefaultSketchSize, len(idx.fieldPaths))
 
@@ -1086,6 +1094,8 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 		// Delete sketch data
 		skKey := sketchKey(c.name, indexName)
 		_ = tx.Delete(c.db.systemNS, skKey) // ignore if not found
+		// Delete the multikey flag: drop+recreate is its only reset path.
+		_ = tx.Delete(c.db.systemNS, multikeyKey(c.name, indexName))
 		// Copy-on-write publish: build a fresh slice without the dropped index
 		// and swap it in atomically for lock-free query readers.
 		cur := c.loadIndexes()
