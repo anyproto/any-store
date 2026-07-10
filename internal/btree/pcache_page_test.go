@@ -3878,8 +3878,16 @@ func TestP3_1_FreshShmMarkerTruncatesToThree(t *testing.T) {
 	}
 }
 
-// TestP3_1_ExistingShmNotTruncated verifies the 3-byte truncate does
-// NOT fire when opening an already-populated shm file (second opener).
+// TestP3_1_ExistingShmNotTruncated verifies the 3-byte truncate does NOT
+// fire when a second opener attaches to a shm that live peers maintain.
+//
+// Since the DMS first-attacher election (see newPlatformShm), "live peers"
+// is decided by the F_GETLK probe of the DMS byte, not by file size. A real
+// second PROCESS would observe opener A's shared DMS lock; POSIX record
+// locks never conflict within one process, so simulating that here requires
+// stubbing the probe to report F_RDLCK (see stubDMSFcntl). A same-process
+// second attach without the stub would win the election and truncate — which
+// is exactly why openDBs forbids same-process double-open by file identity.
 func TestP3_1_ExistingShmNotTruncated(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "populated.shm")
@@ -3888,6 +3896,7 @@ func TestP3_1_ExistingShmNotTruncated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open A: %v", err)
 	}
+	defer sA.close(false)
 	if _, err := sA.region(0, true); err != nil {
 		t.Fatalf("region: %v", err)
 	}
@@ -3899,12 +3908,19 @@ func TestP3_1_ExistingShmNotTruncated(t *testing.T) {
 		t.Fatalf("after region(0, true), size should exceed 3, got %d", grownInfo.Size())
 	}
 
+	// Opener B "from another process": the DMS probe reports A's shared lock.
+	stubDMSFcntl(t, func(real func(uintptr, int, *syscall.Flock_t) syscall.Errno, fd uintptr, cmd int, flock *syscall.Flock_t) (syscall.Errno, bool) {
+		if cmd == syscall.F_GETLK {
+			flock.Type = syscall.F_RDLCK
+			return 0, true
+		}
+		return 0, false
+	})
 	sB, err := newPlatformShm(path)
 	if err != nil {
 		t.Fatalf("open B: %v", err)
 	}
 	defer sB.close(false)
-	defer sA.close(false)
 	sizeB, _ := os.Stat(path)
 	if sizeB.Size() != grownInfo.Size() {
 		t.Fatalf("opener B changed shm size %d → %d; should leave it alone", grownInfo.Size(), sizeB.Size())

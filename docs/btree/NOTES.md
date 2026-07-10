@@ -405,7 +405,7 @@ Both support: PASSIVE, FULL, RESTART, TRUNCATE with identical semantics.
 | Go map for same-process reads | **Divergent** -- O(1) map vs hash table scan |
 | Heap SHM fallback | **Divergent** -- enables non-mmap platforms |
 | WAL undo (`sqlite3WalUndo`) | **Missing** -- Go uses pager-level rollback instead |
-| First-opener `ftruncate(shm, 3)` marker | **REOPENED 2026-06-25** -- only partially aligned: `newPlatformShm` gates the 3 B truncate on `Size()==0` (a freshly-created shm), NOT on first-opener status, and there is no `F_GETLK` first-opener probe. A stale `*-shm` persisted across a power-loss / kernel-panic crash (writer died without `mmapShm.close` unlinking it) has `Size()>0`, so the truncate is skipped and the checksum-valid-but-stale wal-index header is adopted without forcing `walIndexRecover`. SQLite truncates unconditionally on the first-opener path precisely to avoid this. See [§drift-2026-06-25-25](#drift-2026-06-25-25-first-opener-does-not-reset-a-stale-persisted-shm-trusts-checksum-vali) and item 2 below |
+| First-opener `ftruncate(shm, 3)` marker | **Aligned (2026-07-10)** -- `newPlatformShm` now runs SQLite's full DMS first-attacher election (`unixLockSharedMemory`, os_unix.c:4860-4913, 3.52.0): F_GETLK probe → three-way branch (F_UNLCK: WRLCK + UNCONDITIONAL truncate-to-3 + atomic downgrade to RDLCK; F_RDLCK: join shared; F_WRLCK: back off BUSY, never join — the os_unix.c:4864-4871 race). The `Size()==0` gate is gone; a crash-persisted stale shm is physically reset by the first attacher and `recoverLocked` rebuilds from the WAL. See [§drift-2026-06-25-25](#drift-2026-06-25-25-first-opener-does-not-reset-a-stale-persisted-shm-trusts-checksum-vali) (RESOLVED) and item 2 below |
 | Orphan-inode handling on open race | **Aligned** -- DB-file flock serializes last-client-unlink (see §SHM open/close protocol drift) |
 
 ### SHM open/close protocol drift (resolved 2026-04-21)
@@ -438,22 +438,25 @@ intentional.
    inode locks" gotcha when multiple goroutines open the same DB path in a
    single process.
 
-2. **`robust_ftruncate(hShm, 3)` marker — resolved 2026-04-22.**
-   `newPlatformShm` now truncates a freshly created shm file to 3 bytes
-   immediately after acquiring the DMS lock — matches SQLite's
-   `os_unix.c:4902`. The marker is smaller than `walIndexHdrSize`
-   (48 bytes), so subsequent openers that mmap a 3-byte file know it's
-   blank-slate. The first `region(0, true)` call grows the file to
-   `shmRegionSize`, so the marker state is transient.
+2. **`robust_ftruncate(hShm, 3)` marker — fully aligned 2026-07-10.**
+   `newPlatformShm` runs the complete `unixLockSharedMemory` first-attacher
+   election (`os_unix.c:4860-4913`, 3.52.0): an `F_GETLK` probe of the DMS
+   byte, then a three-way branch — `F_UNLCK`: take the DMS EXCLUSIVE,
+   truncate to 3 bytes UNCONDITIONALLY, atomically downgrade to SHARED;
+   `F_RDLCK`: join shared (live peers maintain the shm); `F_WRLCK`: back off
+   BUSY and re-probe, never join (C documents at `os_unix.c:4864-4871` that
+   joining here re-opens the stale-shm window when the exclusive holder dies
+   pre-truncate). The marker is smaller than `walIndexHdrSize` (48 bytes),
+   and `region()`'s re-growth zero-fills, so `readHeader` can never validate
+   crash-stale content and `recoverLocked` rebuilds from the WAL. The DMS
+   SHARED lock is held for the attachment's lifetime; last-client unlink
+   remains at the DB-file flock (item 1).
 
-   **Caveat (reopened 2026-06-25):** this is only a *partial* match. The
-   `robust_ftruncate(hShm, 3)` is gated on `Size()==0` (a freshly-created
-   shm) in `shm_mmap.go`, NOT on first-opener status — there is no `F_GETLK`
-   first-opener probe — so a STALE persisted shm that survives a
-   power-loss/kernel-panic crash is adopted as-is without forcing WAL
-   recovery. SQLite truncates unconditionally on the first-opener path
-   precisely to discard such a stale shm. See the first-opener stale-shm
-   drift (#drift-2026-06-25-25-first-opener-does-not-reset-a-stale-persisted-shm-trusts-checksum-vali).
+   *History:* first landed 2026-04-22 gated on `Size()==0` (fresh-create
+   only); reopened 2026-06-25 because a crash-persisted stale shm has
+   `Size()>0` and was adopted as-is; resolved 2026-07-10 by the election —
+   see the first-opener stale-shm drift
+   (#drift-2026-06-25-25-first-opener-does-not-reset-a-stale-persisted-shm-trusts-checksum-vali).
 
 3. **Close ordering — aligned with SQLite.** Both implementations unlink
    before closing the shm fd (SQLite: `os_unix.c:5538-5541`; ours:
@@ -1999,7 +2002,7 @@ bounded by the per-snapshot `dbSize` check.
 
 <a id="drift-6-wal-frame-read-failure-falls-through-to-disk-read"></a>
 ### Drift: WAL Frame Read Failure Falls Through To Disk Read
-- **Category:** changed-logic  -  **Severity:** high
+- **Category:** changed-logic  -  **Severity:** high  -  **Status:** RESOLVED 2026-07-10 (2026-07 pre-beta review): all four getters (`getPageWriter`, `readTempPage`, `getPageReader`, `readRawPage`) now propagate `readFrame`/`readFrameRaw` errors wrapped with page/frame context, matching C `readDbPage`, where with `iFrame != 0` the DB-file read is the unreachable else branch and a WAL read error becomes the page-get error (`sqlitec/src/pager.c:3035-3046`, 3.52.0). The "benign reset between lookup and read" TOCTOU race the fallthrough covered (introduced with commit `1e2cec7`) is structurally excluded: the writer path holds `lockWrite`, which any restart requires (`checkpointWithMode`; PASSIVE never resets, `checkpointPost`); readers hold a slot 1-4 shared lock that `tryResetWALWithBusy` must take exclusively; slot-0 snapshots carry `minFrame = mxFrame+1` so `walIndex.get` never resolves a frame for them (C `readLock==0` short-circuit); and the in-process slot-0 fallback now re-validates after acquiring read-0 (see the 2026-07-10 fallback re-validation fix, mirroring C's READ_LOCK(0) re-check at `wal.c:3136-3139`). Caveat: API calls that begin pager reads without the `db.mu` drain (`GetNamespace`, `ListNamespaces`, `IntegrityCheckN`) and race `DB.Close`'s WAL truncate may now surface a read error where they previously silently succeeded (contract-gray; follow-up). Adjacent residual: `refreshHeaderFromPage1`'s single-failure-with-successful-fallback path (deliberate 2026-07-10 design) still adopts a DB-file page-1 header under the write lock — open follow-up. Regression tests: `TestWALReadFrameErrorPropagates{,_Writer,_TempPage}`, `TestReadRawPageWALErrorPropagates`, `TestWALDecryptFailurePropagatesFromReadFrame`, `TestReadFrameNoBenignFailuresUnderTruncateStress`, `TestInProcessSlot0FallbackTruncateStress`.
 - **Affected functions:** `pager.go:*pager.getPageWriter` (`internal/btree/pager.go:1014-1028`), `pager.go:*pager.readTempPage` (`internal/btree/pager.go:1114-1123`); the same fall-through also appears in the `getPageReader` cache path (`internal/btree/pager.go:1247`) and the `readFrameRaw` path (`internal/btree/pager.go:1357`).
 
 In C `readDbPage`, once `sqlite3WalFindFrame` resolves a WAL frame (`iFrame != 0`) the
@@ -2021,7 +2024,14 @@ authoritative WAL copy of a page cannot be read for those reasons, Go silently
 substitutes the older committed-DB-file version instead of surfacing the WAL error,
 which can return outdated page content as if it were current.
 
-<a id="drift-7-short-db-file-read-treated-as-hard-error"></a>
+<a id="drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt"></a>
+### Drift: readFrame Past-Tail Read Failure Remapped To ErrWALCorrupt
+- **Category:** error-handling  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.readFrame` (`internal/btree/wal.go`, past-tail remap in the `ReadAt` error branch), `wal.go:*wal.readFrameRaw` (same pattern).
+
+C `sqlite3WalReadFrame` (`sqlitec/src/wal.c:3649-3664`, 3.52.0) is a bare `sqlite3OsRead` with no bounds check — a read past the physical WAL tail surfaces as the raw OS error (typically `SQLITE_IOERR_SHORT_READ` from `unixRead`), and `readDbPage` forgives short reads only on the DB-file branch, never the WAL branch (`pager.c:3042-3045`). Go's `readFrame`/`readFrameRaw` instead remap a `ReadAt` failure at `frame > nFrame` (a stale process-local tail view in multi-process mode) to `ErrWALCorrupt` rather than leaking the raw I/O error. Both C and Go treat the condition as an error; the divergence is only the error identity. Since the drift-6 resolution these errors propagate to page-get callers, so the remap is now user-visible: callers see `ErrWALCorrupt` where C would surface an I/O error code. Kept deliberately — a lookup-resolved frame that cannot be read within the reader's validated snapshot implies index/tail inconsistency, which `ErrWALCorrupt` describes more accurately than a short-read errno.
+
+
 ### Drift: Short DB File Read Treated As Hard Error
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `pager.go:*pager.readTempPage` (`internal/btree/pager.go:1085-1178`; hard-error path `1126-1132`; underlying `readDBPage` `internal/btree/pager.go:339-368`).
@@ -3288,10 +3298,24 @@ A follow-up per-function C-vs-Go audit refresh (2026-06-25). Each drift below wa
 
 <a id="drift-2026-06-25-25-first-opener-does-not-reset-a-stale-persisted-shm-trusts-checksum-vali"></a>
 ### Drift: First Opener Does Not Reset A Stale Persisted Shm; Trusts Checksum-Valid WAL-Index Header After A Crash Instead Of Forcing WAL Recovery
-- **Category:** missing-feature  -  **Severity:** high
+- **Category:** missing-feature  -  **Severity:** high  -  **Status:** RESOLVED 2026-07-10 (2026-07 pre-beta review): `newPlatformShm` now runs the complete `unixLockSharedMemory` first-attacher election (`os_unix.c:4860-4913`, 3.52.0) — `F_GETLK` probe of the DMS byte, then: `F_UNLCK` → DMS EXCLUSIVE + **unconditional** `Truncate(3)` + atomic downgrade to SHARED; `F_RDLCK` → join shared (a live process maintains the shm); `F_WRLCK` → BUSY back-off and re-probe, never a shared-join (the `os_unix.c:4864-4871` crash-mid-election race). Bounded 100×10ms in-open retry on contention (see [drift-2026-07-10-2](#drift-2026-07-10-2-dms-busy-retried-in-open-instead-of-surfacing)). Intra-process soundness rests on `openDBs` forbidding same-process double-open by file identity (fcntl record locks are per-(process,inode)); the shm file must never be open+closed by an attached process (any fd close drops the process's record locks). One mechanism correction to the original entry: the adopt fast paths cited below were in fact unreachable on a *fresh* attach, because `region(create=false)` never maps existing file content — every cold attach already funneled into `recoverLocked` (see [drift-2026-07-10-3](#drift-2026-07-10-3-region-create-false-never-maps-existing-content)); the hazard was latent behind that accident rather than live, and the election now makes the guarantee structural instead of accidental. Regression tests: `TestDMSFirstAttacherTruncatesStaleShm`, `TestDMSNonFirstAttacherDoesNotTruncate`, `TestDMSMidElectionBacksOff`, `TestDMSDowngradeFailureFailsOpen`, `TestStaleShmMxFrameBehind_CommittedTailVisible`, `TestStaleShmMxFrameAhead_UncommittedNotResurrected`, `TestStaleShmGarbageDiscardedOnReopen`, `TestShmStumpCrashBeforeRecoverySelfHeals`, plus the multi-process election tests (`multiprocess_dms_test.go`).
 - **Affected functions:** `shm_mmap.go:newPlatformShm` (`internal/btree/shm_mmap.go:93`, `internal/btree/shm_mmap.go:105`), `wal.go:*wal.ensureHeaderInitialized` (`internal/btree/wal.go:1589`).
 
 In SQLite's `unixLockSharedMemory`, the connection that finds the DMS byte unlocked (`F_GETLK` reports `F_UNLCK`, `os_unix.c:4876`) is the first attacher: it takes an EXCLUSIVE DMS lock (`unixShmSystemLock(..., F_WRLCK, ...)`, `os_unix.c:4893`) and then *unconditionally* truncates the `*-shm` file to 3 bytes (`robust_ftruncate(pShmNode->hShm, 3)`, `os_unix.c:4902`) before downgrading to SHARED — and any peer that observes the DMS already held EXCLUSIVE backs off with `SQLITE_BUSY` (`os_unix.c:4906`) so the truncation is never raced. The 3-byte stump is smaller than the wal-index header, so the next `readHeader` necessarily fails validation and `walIndexRecover` rebuilds the index from the authoritative WAL file. The header comment (`os_unix.c:4864-4871`) spells out exactly why the truncate is unconditional: the shm is volatile and may be torn or stale after a power failure or crash, and trusting it can corrupt the database. The Go `newPlatformShm` acquires the DMS lock (`internal/btree/shm_mmap.go:93`) but then only truncates the shm to the 3-byte marker when the file was *freshly created* (`info.Size() == 0`, `internal/btree/shm_mmap.go:105`); if a `*-shm` file persists from a process that died without running `mmapShm.close` (so the file was never unlinked), the new opener sees `Size() > 0`, skips the truncate entirely, and `wal.ensureHeaderInitialized` takes its fast path (`if hdr, valid := w.index.readHeader(); valid`, `internal/btree/wal.go:1589`) — trusting the stale-but-checksum-valid header's `mxFrame`/salts/hash slots instead of recovering from the WAL. The consequence is that Go can resurrect a crashed writer's uncommitted frames, miss the real committed tail, or read against a mismatched salt generation, where SQLite's mandatory first-open truncate-to-3 would have forced a full WAL rebuild.
+
+<a id="drift-2026-07-10-2-dms-busy-retried-in-open-instead-of-surfacing"></a>
+### Drift: DMS Election BUSY Retried In-Open Instead Of Surfacing To The Caller
+- **Category:** changed-logic  -  **Severity:** low
+- **Affected functions:** `shm_mmap.go:newPlatformShm` (the election retry loop).
+
+SQLite's `unixLockSharedMemory` returns `SQLITE_BUSY` when it observes a peer mid-election (`os_unix.c:4906-4908`, 3.52.0) and relies on higher-level retry (the comment at `os_unix.c:4865`: "it will try again"). Go's shm attach is a one-shot call inside `wal.open` with no busy-handler plumbing above it, so `newPlatformShm` retries the probe in-line — bounded at 100×10ms, mirroring `pager.open`'s DB-flock retry loop — and only after exhaustion fails the open with an error wrapping `ErrBusy` (`errors.Is(err, ErrBusy)` holds). The exclusive-DMS window is microseconds (WRLCK → ftruncate(3) → downgrade, nothing else under it), so a single retry normally suffices; the observable divergence is worst-case ~1s of open latency under pathological contention instead of an immediate BUSY to the application.
+
+<a id="drift-2026-07-10-3-region-create-false-never-maps-existing-content"></a>
+### Drift: region(create=false) Never Maps Existing Shm Content On A Fresh Attach
+- **Category:** changed-logic  -  **Severity:** medium
+- **Affected functions:** `shm_mmap.go:*mmapShm.region` (the `!create` early return), `wal.go:*walIndex.readHeader` (first caller on the open path).
+
+C `unixShmMap` with `isWrite==0` still maps *existing* regions of the shm file — a fresh attacher can read a peer-written (or crash-persisted) wal-index header through it. Go's `mmapShm.region(index, create=false)` returns "region not available" for any region not already mapped *by this instance* and never maps existing file content on demand. Consequence: on a fresh attach, `readHeader` (which starts with `region(0, false)`) always reports invalid, so `wal.open`'s adopt fast paths are dead on a cold start and every fresh multi-process attach funnels into `recoverLocked`. This accident is what kept the crash-stale-shm hazard (drift-2026-06-25-25) latent rather than live before the DMS election landed; it also means a cold attach pays a full WAL scan where C would adopt a live peer's header. **Sequencing constraint:** any future alignment of `region()` with `unixShmMap`'s map-existing behavior is safe ONLY because the DMS first-attacher election (2026-07-10) now provides the structural stale-shm guarantee — do not revert the election. Adjacent follow-up (separate issue): `recoverLocked` publishes a reset `aReadMark` without taking the reader-slot locks, so recovery triggered by a late attach while peers hold read slots could stomp a live reader's mark; C's `walIndexRecover` resets each `aReadMark[i]` only after taking `WAL_READ_LOCK(i)` EXCLUSIVE for that slot and leaves BUSY (live-reader-held) slots untouched (`wal.c:1575-1587`, 3.52.0).
 
 <a id="drift-2026-06-25-01-transient-busy-locked-equivalent-errors-are-made-sticky-in-b-rc-so-a-b"></a>
 ### Drift: Transient BUSY/LOCKED-Equivalent Errors Are Made Sticky In b.rc So A Backup Cannot Be Retried Or Resumed

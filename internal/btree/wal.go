@@ -1488,6 +1488,17 @@ func (w *wal) open() (err error) {
 	// Multi-process mode: pageMap is unused — get()/getLatest() consult
 	// SHM hash exclusively (matches walFindFrame at wal.c:3554-3582).
 	// No per-process rebuild is needed; peer writes land directly in SHM.
+	//
+	// Crash-stale shm safety: this adopt can never validate a stale image
+	// left by power loss. The DMS first-attacher election in newPlatformShm
+	// truncates the shm to a 3-byte stump whenever no other process holds
+	// the DMS, so a fresh cold-start attach always fails readHeader and
+	// funnels into recoverLocked; a non-first attacher joins a shm that a
+	// LIVE process is maintaining, which is exactly when trusting it is
+	// correct. (Independently, region(create=false) never maps existing
+	// file content on a fresh attach — see
+	// docs/btree/NOTES.md#drift-2026-07-10-3-region-create-false-never-maps-existing-content —
+	// but the election is the load-bearing guarantee, not that accident.)
 	if !w.inProcess {
 		if hdr, valid := w.index.readHeader(); valid {
 			info, err := f.Stat()
@@ -2426,6 +2437,13 @@ func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 	if frame == 0 {
 		return ErrWALCorrupt
 	}
+	// Test-only fault-injection hook, shared with readFrame; see
+	// walReadFrameFaultHook.
+	if hook := walReadFrameFaultHook.Load(); hook != nil {
+		if err := (*hook)(frame); err != nil {
+			return err
+		}
+	}
 	nf := w.nFrame.Load()
 	if w.inMemory {
 		if frame > nf {
@@ -2450,6 +2468,7 @@ func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 	frameSize := int64(walFrameSize) + int64(w.pageSize)
 	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
 	if _, err := w.file.ReadAt(buf[:w.pageSize], offset); err != nil {
+		// DRIFT: past-tail ReadAt failure remapped to ErrWALCorrupt; C propagates the raw short-read error See docs/btree/NOTES.md#drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt
 		if frame > nf {
 			return ErrWALCorrupt
 		}
@@ -2460,12 +2479,16 @@ func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 
 // END ENCRYPTION
 
-// walReadFrameFaultHook is a test-only fault-injection point for wal.readFrame.
-// It is nil in production so the only cost on the read path is a single atomic
-// pointer load. Tests install a hook via setWalReadFrameFaultHook to force a
-// readFrame failure for a chosen frame and exercise the by-design WAL-frame-read
-// fallthrough in the pager getters (see drift-6 in docs/btree/NOTES.md). The hook
-// receives the frame number and returns a non-nil error to fail that read.
+// walReadFrameFaultHook is a test-only fault-injection point for
+// wal.readFrame, wal.readFrameRaw, and pager.readWalFrameData. It is nil in
+// production so the only cost on the read path is a single atomic pointer
+// load. Tests install a hook via
+// setWalReadFrameFaultHook to force a frame-read failure for a chosen frame
+// and exercise the error-propagation contract of the pager getters: once the
+// wal-index resolves a frame, a read failure must surface as the page-get
+// error, never fall through to the older DB-file copy (drift-6 in
+// docs/btree/NOTES.md, RESOLVED). The hook receives the
+// frame number and returns a non-nil error to fail that read.
 var walReadFrameFaultHook atomic.Pointer[func(frame uint32) error]
 
 // setWalReadFrameFaultHook installs (fn != nil) or clears (fn == nil) the
@@ -2493,10 +2516,10 @@ func (w *wal) readFrame(frame uint32, buf, scratchBuf []byte, aeadScratchBuf *ae
 	if frame == 0 {
 		return ErrWALCorrupt
 	}
-	// Test-only fault-injection hook. nil in production (zero overhead beyond a
-	// pointer load). When set, a non-nil return forces readFrame to fail for the
-	// given frame, exercising the by-design WAL-frame-read fallthrough documented
-	// at docs/btree/NOTES.md#drift-6-wal-frame-read-failure-falls-through-to-disk-read.
+	// Test-only fault-injection hook. nil in production (zero overhead beyond
+	// a pointer load). When set, a non-nil return forces readFrame to fail for
+	// the given frame, exercising the pager getters' error-propagation
+	// contract (drift-6, RESOLVED — see walReadFrameFaultHook).
 	if hook := walReadFrameFaultHook.Load(); hook != nil {
 		if err := (*hook)(frame); err != nil {
 			return err
@@ -2536,6 +2559,7 @@ func (w *wal) readFrame(frame uint32, buf, scratchBuf []byte, aeadScratchBuf *ae
 		// Multi-process: a stale nFrame view may have let us try to read
 		// past the peer's actual WAL tail. Treat that as corruption
 		// rather than leaking the raw I/O error.
+		// DRIFT: past-tail ReadAt failure remapped to ErrWALCorrupt; C propagates the raw short-read error See docs/btree/NOTES.md#drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt
 		if frame > nf {
 			return ErrWALCorrupt
 		}
@@ -2771,9 +2795,26 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 	// It is a fixed 0 sentinel (wal.go:1900); the returned maxFrame comes from
 	// the local mxFrame snapshot. Matches SQLite walTryBeginRead (wal.c:3136-3157).
 	// minFrame = nBackfill+1 (NOT mxFrame+1): unlike the fast path, mxFrame >
-	// nBackfill here, so the WAL must still be consulted. Holding read-0
-	// shared blocks backfill (it takes read-0 exclusive), so nBackfill cannot
-	// advance — and therefore no restart can recycle frames — while we hold it.
+	// nBackfill here, so the WAL must still be consulted.
+	//
+	// Post-lock re-validation, mirroring the slot-reuse branch above and C's
+	// own READ_LOCK(0) re-check (walTryBeginRead memcmps the live header after
+	// taking the lock and returns WAL_RETRY on change, wal.c:3136-3139).
+	// Between the lock-free snapshot and this read-0 acquisition, a checkpoint
+	// may have completed backfill (releasing read-0) and entered
+	// tryResetWALWithBusy — which locks only slots 1-4 — so a WAL reset could
+	// slip in and recycle frame numbers; the stale [minFrame, maxFrame] window
+	// would then match new-generation frames in walIndex.get. A change in
+	// either counter means the snapshot may span such a reset → drop the lock
+	// and retry with fresh values.
+	if w.index.mxCommitFrame.LoadLocal() != mxFrame || w.index.nBackfill.Load() != nBackfill {
+		_ = w.index.unlock(lockRead0, lockShared)
+		return WalIndexHdr{}, 0, 0, 0, errWALRetry
+	}
+	// Once validated, nBackfill < mxFrame still holds (this fallback is only
+	// reached when they differ), so backfill has work left and must take
+	// read-0 exclusive (blocked by our shared hold): nBackfill cannot advance
+	// — and therefore no restart can recycle frames — while we hold it.
 	return hdr, mxFrame, nBackfill + 1, 0, nil
 }
 
