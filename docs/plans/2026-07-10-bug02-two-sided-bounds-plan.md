@@ -5,8 +5,17 @@
 **Also fixes:** BUG-06/I-07 (commit 4), BUG-12/NEW-A (commit 2), BUG-13/NEW-B (commit 3)
 **Status:** IMPLEMENTED on `bug02-two-sided-bounds` (2026-07-10), commits 1-7 as
 planned (design expert-consulted; adversarially reviewed by 4 independent
-passes — all confirmed holes folded in below). Measured on the acceptance
-shape (200k docs, descending two-sided pk range, Limit 10): 14.6ms → 26.9µs.
+passes — all confirmed holes folded in below), plus a post-implementation
+hardening pass from a second adversarial review: verify-chain
+residual-predicate gate (a tight-collapsed PointLookup could skip the residual
+filter and over-count); scan cost priced from the bounds the chain executes
+with (rangeSel/rangeSelTight split); the multikey flag rekeyed by the
+IMMUTABLE index namespace name (rename handling becomes unnecessary; the
+plan-time probe no longer reads the mutable collection name); array-pk pre-ban
+detection documented as known-issues I-09. Measured on the acceptance shape
+(200k docs, descending two-sided pk range, Limit 10): 14.6ms → 26.9µs.
+External validation: any-store-tests e2e+storetest green; the 175-bench
+harness run shows no >10% regressions, CompoundIndex/PrefixRange -47%.
 
 ## Goal
 
