@@ -245,7 +245,14 @@ type db struct {
 	syncPool *syncpool.SyncPool
 
 	openedCollections map[string]Collection
-	closed            atomic.Bool
+	// orphanFtsPending holds fts indexes of collections closed mid-write-tx
+	// with a non-empty pending buffer. flushAllFtsPending / resetAllFtsPending
+	// enumerate openedCollections, so without this registry a Close() between
+	// Insert and Commit would silently drop the buffered postings — the doc
+	// commits but stays invisible to $text forever (pre-beta catalog BUG-01).
+	// Guarded by db.mu; drained by the next flush or reset.
+	orphanFtsPending []*ftsIndex
+	closed           atomic.Bool
 
 	dirtyOnOpen             bool
 	dirtyQuickCheckDuration time.Duration
@@ -889,9 +896,17 @@ func (db *db) Flush(ctx context.Context, waitIdleTime time.Duration, mode FlushM
 	return db.recoveryController.Flush(ctx, waitIdleTime, mode.toRecoveryFlushMode())
 }
 
-func (db *db) onCollectionClose(name string) {
+func (db *db) onCollectionClose(c *collection) {
 	db.mu.Lock()
-	delete(db.openedCollections, name)
+	delete(db.openedCollections, c.name)
+	// Keep non-empty fts pending buffers reachable for the commit-time flush
+	// (or the next tx-begin reset). The buffer is only ever non-empty inside
+	// an open write tx, so outside a tx this appends nothing.
+	for _, fx := range c.loadFtsIndexes() {
+		if !fx.pending.empty() {
+			db.orphanFtsPending = append(db.orphanFtsPending, fx)
+		}
+	}
 	db.mu.Unlock()
 }
 
@@ -918,6 +933,15 @@ func (db *db) persistAllDirtySketches(tx *btree.WriteTx) error {
 func (db *db) flushAllFtsPending(tx *btree.WriteTx) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	// Orphans first: their writes chronologically precede anything buffered
+	// by a same-name collection reopened after the close, so for a document
+	// touched on both sides of the close the later postings win.
+	for _, fx := range db.orphanFtsPending {
+		if err := fx.flushPending(tx); err != nil {
+			return err
+		}
+	}
+	db.orphanFtsPending = db.orphanFtsPending[:0]
 	for _, coll := range db.openedCollections {
 		c := coll.(*collection)
 		for _, fx := range c.loadFtsIndexes() {
@@ -935,6 +959,10 @@ func (db *db) flushAllFtsPending(tx *btree.WriteTx) error {
 func (db *db) resetAllFtsPending() {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	for _, fx := range db.orphanFtsPending {
+		fx.pending.reset()
+	}
+	db.orphanFtsPending = db.orphanFtsPending[:0]
 	for _, coll := range db.openedCollections {
 		c := coll.(*collection)
 		for _, fx := range c.loadFtsIndexes() {

@@ -505,3 +505,85 @@ func TestFtsSavepointRollbackKeepsEarlierPending(t *testing.T) {
 	assert.Equal(t, []string{"a"}, ids, "pre-savepoint buffered postings were lost")
 	assert.EqualValues(t, 1, ftsVocabDF(t, coll, "early"))
 }
+
+// TestFtsPendingSurvivesCollectionCloseMidTx guards pre-beta catalog BUG-01:
+// closing a collection between Insert and Commit removed it from
+// openedCollections, so the commit-time flushAllFtsPending never saw its
+// pending buffer — the document committed but its postings were silently
+// dropped, leaving it permanently invisible to $text.
+func TestFtsPendingSurvivesCollectionCloseMidTx(t *testing.T) {
+	t.Run("close then commit flushes postings", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "docs")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Kind: IndexKindFulltext, Fields: []string{"body"}}))
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":"a","body":"needleterm here"}`)))
+		require.NoError(t, coll.Close())
+		require.NoError(t, tx.Commit())
+
+		coll2, err := fx.OpenCollection(ctx, "docs")
+		require.NoError(t, err)
+		count, err := coll2.Find(`{"$text":{"$search":"needleterm"}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1, count, "postings buffered before Close must flush at Commit")
+	})
+
+	t.Run("close then rollback discards postings", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "docs")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Kind: IndexKindFulltext, Fields: []string{"body"}}))
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":"a","body":"needleterm here"}`)))
+		require.NoError(t, coll.Close())
+		require.NoError(t, tx.Rollback())
+
+		coll2, err := fx.OpenCollection(ctx, "docs")
+		require.NoError(t, err)
+		count, err := coll2.Find(`{"$text":{"$search":"needleterm"}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 0, count, "orphaned buffer of a rolled-back tx must be discarded")
+	})
+
+	t.Run("drop mid-tx discards postings and commit succeeds", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "docs")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Kind: IndexKindFulltext, Fields: []string{"body"}}))
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":"a","body":"needleterm here"}`)))
+		require.NoError(t, coll.Drop(tx.Context()))
+		require.NoError(t, tx.Commit(), "flushing into dropped namespaces must not fail the commit")
+	})
+
+	t.Run("reopen after close in same tx keeps both writes searchable", func(t *testing.T) {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, "docs")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Kind: IndexKindFulltext, Fields: []string{"body"}}))
+
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":"a","body":"needleterm here"}`)))
+		require.NoError(t, coll.Close())
+		collB, err := fx.OpenCollection(tx.Context(), "docs")
+		require.NoError(t, err)
+		require.NoError(t, collB.EnsureIndex(tx.Context(), IndexInfo{Kind: IndexKindFulltext, Fields: []string{"body"}}))
+		require.NoError(t, collB.Insert(tx.Context(), anyenc.MustParseJson(`{"id":"b","body":"otherterm here"}`)))
+		require.NoError(t, tx.Commit())
+
+		count, err := collB.Find(`{"$text":{"$search":"needleterm"}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1, count, "orphaned buffer must flush")
+		count, err = collB.Find(`{"$text":{"$search":"otherterm"}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1, count, "reopened collection's buffer must flush")
+	})
+}

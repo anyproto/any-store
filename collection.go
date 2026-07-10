@@ -1125,6 +1125,14 @@ func (c *collection) Drop(ctx context.Context) error {
 	return c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (err error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		// Discard buffered fts writes before close: close() preserves a
+		// non-empty pending buffer for the commit-time flush (BUG-01 fix),
+		// but Drop deletes the fts namespaces in this same tx — flushing the
+		// orphaned buffer at commit would write into dropped namespaces and
+		// fail the whole transaction.
+		for _, fx := range c.loadFtsIndexes() {
+			fx.pending.reset()
+		}
 		if err = c.close(); err != nil {
 			return err
 		}
@@ -1193,7 +1201,7 @@ func (c *collection) close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	c.db.onCollectionClose(c.name)
+	c.db.onCollectionClose(c)
 	return nil
 }
 
