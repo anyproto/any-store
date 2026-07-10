@@ -2399,34 +2399,40 @@ func TestWALReaderSlotReuseSucceedsWhenStateStable(t *testing.T) {
 	w.endRead(slot)
 }
 
-// TestWALReadFrameFaultFallsThroughToDisk pins the by-design behavior documented
-// at docs/btree/NOTES.md#drift-6-wal-frame-read-failure-falls-through-to-disk-read.
+// TestWALReadFrameErrorPropagates pins the error-propagation contract of the
+// pager getters (docs/btree/NOTES.md drift-6, RESOLVED).
 //
-// In C readDbPage (pager.c:3035-3045) a WAL-resolved page is read ONLY from the
-// WAL frame and a sqlite3WalReadFrame failure propagates as the page-get error.
-// The Go getters (getPageWriter / readTempPage / getPageReader) instead, on a
-// readFrame failure, deliberately ignore the error and fall through to a DB-file
-// (or masterStore) read. This is a deliberate drift, NOT a bug, because the
-// primary protections that C relies on are preserved in Go:
+// In C readDbPage (pager.c:3035-3046, sqlitec 3.52.0) a WAL-resolved page is
+// read ONLY from the WAL frame and a sqlite3WalReadFrame failure propagates as
+// the page-get error — the DB-file read sits in the unreachable else branch.
+// The Go getters (getPageWriter / readTempPage / getPageReader / readRawPage)
+// now match: on a readFrame failure they surface the error instead of falling
+// through to the older DB-file copy, which could silently serve stale content
+// (and, fed into a write tx, make the regression durable).
 //
-//	(1) A reader holds its WAL read-mark slot for the whole transaction, so the
-//	    authoritative WAL frame within the reader's snapshot is served from the
-//	    WAL (the normal, non-faulting path).
-//	(2) A checkpoint cannot truncate / reset the WAL out from under a held reader
-//	    slot, and the backfill-before-truncate ordering guarantees that any frame
-//	    a reader could resolve is already durable in the DB file before it could
-//	    ever be truncated. So the disk fallthrough can only return content at
-//	    least as new as the faulting WAL frame — never an older committed copy.
+// The "benign WAL-reset between lookup and read" race the old fallthrough was
+// built for (the TRUNCATE-checkpoint vs readFrame TOCTOU race, commit
+// 1e2cec7) is structurally excluded:
 //
-// This test installs the minimal test-only readFrame fault-injection hook and
-// asserts: the frame is normally served from the WAL; truncation cannot occur
-// under a held reader slot; and on an injected readFrame error the getter falls
-// through (no error surfaced) rather than propagating the WAL read failure.
+//	(1) A reader holds its WAL read-mark slot for the whole transaction, so
+//	    the authoritative WAL frame within the reader's snapshot is served
+//	    from the WAL (the normal, non-faulting path).
+//	(2) A checkpoint cannot truncate / reset the WAL out from under a held
+//	    reader slot (tryResetWALWithBusy needs slots 1-4 exclusive), slot-0
+//	    snapshots never resolve frames (minFrame = mxFrame+1, C readLock==0
+//	    short-circuit), and the writer path holds the write lock that any
+//	    restart requires. A readFrame failure after a successful lookup is
+//	    therefore always a genuine I/O or codec-integrity error.
 //
-// There is no production fault-injection hook on wal.readFrame — this hook is the
-// minimal test-only surface required to make the invariant deterministically
+// This test installs the test-only readFrame fault-injection hook and asserts:
+// the frame is normally served from the WAL; an injected readFrame error
+// PROPAGATES as the page-get error; truncation cannot occur under a held
+// reader slot; and backfill-before-truncate ordering holds.
+//
+// There is no production fault-injection hook on wal.readFrame — this hook is
+// the minimal test-only surface required to make the contract deterministically
 // observable.
-func TestWALReadFrameFaultFallsThroughToDisk(t *testing.T) {
+func TestWALReadFrameErrorPropagates(t *testing.T) {
 	// Ensure any hook installed by this (or a prior) test is cleared on exit so
 	// the production no-op path is restored for every other test.
 	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
@@ -2496,11 +2502,13 @@ func TestWALReadFrameFaultFallsThroughToDisk(t *testing.T) {
 	walServed, err := readPgnoFreshCache()
 	require.NoError(t, err, "frame within snapshot must be served from the WAL without error")
 
-	// --- The drift: an injected readFrame error falls through, not propagates. ---
-	// Inject a failure for exactly the target frame. C would propagate this as the
-	// page-get error; Go must instead fall through to the DB-file/masterStore read
-	// and return successfully (the documented, intentional behavior). This is the
-	// core invariant this regression test pins.
+	// --- The contract: an injected readFrame error PROPAGATES. ---
+	// Inject a failure for exactly the target frame. The frame is not yet
+	// backfilled, so the DB-file copy is OLDER than the WAL frame — the old
+	// fallthrough would have silently served that stale page. The getter must
+	// instead surface the readFrame error as the page-get error, exactly as C
+	// readDbPage does (pager.c:3035-3046). This is the core invariant this
+	// regression test pins.
 	sentinel := errors.New("injected WAL readFrame fault")
 	var hookFired bool
 	setWalReadFrameFaultHook(func(frame uint32) error {
@@ -2511,18 +2519,13 @@ func TestWALReadFrameFaultFallsThroughToDisk(t *testing.T) {
 		return nil
 	})
 
-	fellThrough, err := readPgnoFreshCache()
+	page, err := readPgnoFreshCache()
 	require.True(t, hookFired, "fault hook must have been exercised for the target frame")
-	require.NoError(t, err,
-		"by design, a readFrame failure must fall through to a disk read, not surface the error")
-	require.NotNil(t, fellThrough)
-	// Note: at this point (frame NOT yet backfilled to the DB file) the fallthrough
-	// can legitimately return content OLDER than the WAL frame — that is exactly the
-	// drift hazard the NOTES entry documents. We deliberately do NOT assert the
-	// fallthrough equals the WAL bytes here: the safety argument is not "the disk
-	// copy is always current" but "this fallthrough is unreachable in production",
-	// proven by the two protections asserted below. Asserting current-content here
-	// would falsely claim the drift is harmless even before backfill.
+	require.Error(t, err,
+		"a readFrame failure on a WAL-resolved frame must propagate, never fall through to a stale disk read")
+	require.ErrorIs(t, err, sentinel, "the underlying readFrame error must be wrapped, not replaced")
+	require.Contains(t, err.Error(), "WAL frame", "the error must identify the failing WAL frame")
+	require.Nil(t, page, "no page content may be served when the WAL read fails")
 
 	// Clearing the hook restores the WAL-served path with no error, reconfirming the
 	// non-faulting production path returns the authoritative WAL frame content.
@@ -2534,15 +2537,15 @@ func TestWALReadFrameFaultFallsThroughToDisk(t *testing.T) {
 		"clearing the fault must restore the normal WAL-served read")
 
 	// --- Protection (2): truncation/reset cannot occur under a held reader slot. ---
-	// The structural guarantee that makes the (unreachable-in-prod) fallthrough safe:
-	// a reader holding its read-mark slot blocks the checkpointer from RESET/TRUNCATE
+	// The structural guarantee that makes hard propagation correct: a reader
+	// holding its read-mark slot blocks the checkpointer from RESET/TRUNCATE
 	// (tryResetWALWithBusy must exclusively lock the reader slots, which ErrBusy-fails
 	// while one is held), so the WAL frame numbering and salt are NOT recycled under
 	// the reader. A passive backfill may copy frames to the DB file and raise
 	// nBackfill (transparently shifting the reader's reads to the now-durable disk
 	// copy), but the WAL is never reset out from under the snapshot — so readFrame
-	// cannot fail due to truncation, and the only way to reach the fallthrough is a
-	// genuine I/O error (which this test simulates).
+	// cannot fail due to truncation, and a failure on a resolved frame is always
+	// a genuine I/O or integrity error (which this test simulates).
 	saltBefore := [2]uint32{pager.wal.header.salt1, pager.wal.header.salt2}
 	nFrameBefore := pager.wal.nFrame.Load()
 	require.Greater(t, nFrameBefore, uint32(0), "WAL must hold frames before the checkpoint")
@@ -2563,15 +2566,14 @@ func TestWALReadFrameFaultFallsThroughToDisk(t *testing.T) {
 	assert.Equal(t, walServed, afterCkpt,
 		"snapshot content must be stable while the reader holds its slot")
 
-	// --- Claim (3): backfill-before-truncate makes the fallthrough content safe. ---
+	// --- Claim (3): backfill-before-truncate ordering. ---
 	// The checkpoint above ran its PASSIVE backfill, which copies (and fdatasyncs)
 	// each frame to the DB file BEFORE advancing nBackfill — and a truncate can only
 	// follow a completed backfill. So once a frame's content is eligible to be
 	// truncated, that content is already durably in the DB file. We prove the
 	// ordering directly: after the backfill, the raw DB-file copy of targetPgno now
-	// equals the WAL-frame content. Hence in the only window the fallthrough could be
-	// reached (frame still live but unreadable due to a real I/O fault), the disk
-	// copy it falls back to is at least as new as the frame — never an older version.
+	// equals the WAL-frame content. (This is why post-checkpoint reads that the
+	// minFrame filter redirects to the DB file converge on identical content.)
 	rawDisk := make([]byte, pager.pageSize)
 	require.NoError(t, pager.readDBPage(targetPgno, rawDisk),
 		"backfill must have written the page to the DB file")
@@ -2580,9 +2582,8 @@ func TestWALReadFrameFaultFallsThroughToDisk(t *testing.T) {
 }
 
 // TestWALReadFrameFaultHookDefaultsToNoop guards the production contract: the
-// fault-injection hook is nil unless a test installs it, so production readFrame
-// behavior is unchanged (the by-design fallthrough is never triggered in prod by
-// the hook).
+// fault-injection hook is nil unless a test installs it, so production
+// readFrame/readFrameRaw behavior is unchanged.
 func TestWALReadFrameFaultHookDefaultsToNoop(t *testing.T) {
 	t.Cleanup(func() { setWalReadFrameFaultHook(nil) })
 

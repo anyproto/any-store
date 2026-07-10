@@ -977,7 +977,6 @@ func (p *pager) getPage(pgno uint32) (*page, error) {
 
 // getPageWriter returns a page using the writer's cache, reading from
 // WAL or disk on cache miss. Used by the writer goroutine only.
-// DRIFT: WAL frame read failure silently falls through to stale disk read See docs/btree/NOTES.md#drift-6-wal-frame-read-failure-falls-through-to-disk-read
 // DRIFT: no mxPgno / SQLITE_FULL max-page-count guard in page getters See docs/btree/NOTES.md#drift-8-max-page-count-sqlite-full-enforcement-absent
 func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 	if pgno == 0 {
@@ -1023,19 +1022,29 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 			return nil, err
 		}
 		if frame > 0 {
-			if err := p.wal.readFrame(frame, pg.data, p.codecScratch, &p.codecAEAD); err == nil {
-				// Parse page header
-				off := 0
-				if pgno == 1 {
-					off = dbHeaderSize
-				}
-				pg.header.deserialize(pg.data[off:])
-				return pg, nil
+			// The resolved frame holds the page's only current version; the
+			// DB-file copy is older. A readFrame failure here is always a
+			// genuine I/O or codec-integrity error, never a benign WAL-reset
+			// race: this path holds the write lock, which excludes a
+			// concurrent restart (checkpointWithMode takes lockWrite
+			// exclusive for non-PASSIVE modes; PASSIVE never resets,
+			// checkpointPost). Propagate instead of falling through to a
+			// stale disk read, matching C readDbPage: with iFrame!=0 the
+			// DB-file read sits in the unreachable else branch and a WAL
+			// read error becomes the page-get error (pager.c:3035-3046).
+			// Reader paths (readTempPage, getPageReader) share this
+			// contract via the reader-slot lock — see readTempPage.
+			if err := p.wal.readFrame(frame, pg.data, p.codecScratch, &p.codecAEAD); err != nil {
+				p.writerCache.discard(pg.pgno)
+				return nil, fmt.Errorf("btree: failed to read page %d (WAL frame %d): %w", pgno, frame, err)
 			}
-			// readFrame can fail if the WAL was reset (checkpointed and
-			// truncated) between the index.get lookup and now. In this case,
-			// the page data has been written to the database file by the
-			// checkpoint, so we fall through to reading from disk.
+			// Parse page header
+			off := 0
+			if pgno == 1 {
+				off = dbHeaderSize
+			}
+			pg.header.deserialize(pg.data[off:])
+			return pg, nil
 		}
 	}
 
@@ -1091,7 +1100,6 @@ func (p *pager) getPageWriter(pgno, walMaxFrame uint32) (*page, error) {
 // cache.codecScratch / &cache.codecAEAD. Pass nil/nil for the rare nil-
 // cache path (admission-control refusal, integrity checks); the codec
 // falls back to allocPageBuffer in that case.
-// DRIFT: WAL frame read failure silently falls through to stale disk read See docs/btree/NOTES.md#drift-6-wal-frame-read-failure-falls-through-to-disk-read
 // DRIFT: short DB-file read on in-bounds page is hard error in Go, zero-pad OK in C See docs/btree/NOTES.md#drift-7-short-db-file-read-treated-as-hard-error
 func (p *pager) readTempPage(pgno, walMaxFrame, walMinFrame, dbSizeBound uint32, codecBuf []byte, codecAEAD *aeadScratch) (*page, error) {
 	pg := p.acquireTempPage()
@@ -1123,14 +1131,25 @@ func (p *pager) readTempPage(pgno, walMaxFrame, walMinFrame, dbSizeBound uint32,
 			return nil, err
 		}
 		if frame > 0 {
-			if err := p.wal.readFrame(frame, pg.data, codecBuf, codecAEAD); err == nil {
-				off := 0
-				if pgno == 1 {
-					off = dbHeaderSize
-				}
-				pg.header.deserialize(pg.data[off:])
-				return pg, nil
+			// Propagate readFrame failures (C readDbPage, pager.c:3035-3046)
+			// — never fall through to the older DB-file copy. Callers reach
+			// readTempPage only via getPageReader, whose read tx holds a
+			// reader-slot shared lock: a WAL reset needs slots 1-4 exclusive
+			// (tryResetWALWithBusy), and slot-0 snapshots carry
+			// minFrame = mxFrame+1 so the lookup above never resolves a
+			// frame for them (C readLock==0 short-circuit). The failure is
+			// therefore always genuine. See getPageWriter for the writer-
+			// path variant of this argument.
+			if err := p.wal.readFrame(frame, pg.data, codecBuf, codecAEAD); err != nil {
+				p.recycleTempPage(pg)
+				return nil, fmt.Errorf("btree: failed to read page %d (WAL frame %d): %w", pgno, frame, err)
 			}
+			off := 0
+			if pgno == 1 {
+				off = dbHeaderSize
+			}
+			pg.header.deserialize(pg.data[off:])
+			return pg, nil
 		}
 	}
 
@@ -1255,15 +1274,19 @@ func (p *pager) getPageReader(pgno, walMaxFrame uint32, cache *pcache) (*page, e
 				cache.codecScratch = make([]byte, p.pageSize)
 			}
 			// END ENCRYPTION
-			if err := p.wal.readFrame(frame, pg.data, cache.codecScratch, &cache.codecAEAD); err == nil {
-				off := 0
-				if pgno == 1 {
-					off = dbHeaderSize
-				}
-				pg.header.deserialize(pg.data[off:])
-				return pg, nil
+			// Propagate readFrame failures — the reader-slot lock held by
+			// this read tx makes them always genuine; see readTempPage for
+			// the full argument (C readDbPage, pager.c:3035-3046).
+			if err := p.wal.readFrame(frame, pg.data, cache.codecScratch, &cache.codecAEAD); err != nil {
+				cache.discard(pg.pgno)
+				return nil, fmt.Errorf("btree: failed to read page %d (WAL frame %d): %w", pgno, frame, err)
 			}
-			// WAL reset race: fall through to disk/masterStore.
+			off := 0
+			if pgno == 1 {
+				off = dbHeaderSize
+			}
+			pg.header.deserialize(pg.data[off:])
+			return pg, nil
 		}
 	}
 
@@ -1365,9 +1388,14 @@ func (p *pager) readRawPage(pgno, walMaxFrame uint32) ([]byte, error) {
 			return nil, err
 		}
 		if frame > 0 {
-			if err := p.wal.readFrameRaw(frame, buf); err == nil {
-				return buf, nil
+			// Propagate readFrameRaw failures — the caller's read lock (see
+			// the contract above) makes them always genuine; see
+			// readTempPage for the full argument (C readDbPage,
+			// pager.c:3035-3046).
+			if err := p.wal.readFrameRaw(frame, buf); err != nil {
+				return nil, fmt.Errorf("btree: readRawPage: page %d (WAL frame %d): %w", pgno, frame, err)
 			}
+			return buf, nil
 		}
 	}
 	if p.file != nil {

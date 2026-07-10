@@ -2426,6 +2426,13 @@ func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 	if frame == 0 {
 		return ErrWALCorrupt
 	}
+	// Test-only fault-injection hook, shared with readFrame; see
+	// walReadFrameFaultHook.
+	if hook := walReadFrameFaultHook.Load(); hook != nil {
+		if err := (*hook)(frame); err != nil {
+			return err
+		}
+	}
 	nf := w.nFrame.Load()
 	if w.inMemory {
 		if frame > nf {
@@ -2450,6 +2457,7 @@ func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 	frameSize := int64(walFrameSize) + int64(w.pageSize)
 	offset := int64(walHeaderSize) + int64(frame-1)*frameSize + walFrameSize
 	if _, err := w.file.ReadAt(buf[:w.pageSize], offset); err != nil {
+		// DRIFT: past-tail ReadAt failure remapped to ErrWALCorrupt; C propagates the raw short-read error See docs/btree/NOTES.md#drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt
 		if frame > nf {
 			return ErrWALCorrupt
 		}
@@ -2460,12 +2468,15 @@ func (w *wal) readFrameRaw(frame uint32, buf []byte) error {
 
 // END ENCRYPTION
 
-// walReadFrameFaultHook is a test-only fault-injection point for wal.readFrame.
-// It is nil in production so the only cost on the read path is a single atomic
-// pointer load. Tests install a hook via setWalReadFrameFaultHook to force a
-// readFrame failure for a chosen frame and exercise the by-design WAL-frame-read
-// fallthrough in the pager getters (see drift-6 in docs/btree/NOTES.md). The hook
-// receives the frame number and returns a non-nil error to fail that read.
+// walReadFrameFaultHook is a test-only fault-injection point for wal.readFrame
+// and wal.readFrameRaw. It is nil in production so the only cost on the read
+// path is a single atomic pointer load. Tests install a hook via
+// setWalReadFrameFaultHook to force a frame-read failure for a chosen frame
+// and exercise the error-propagation contract of the pager getters: once the
+// wal-index resolves a frame, a read failure must surface as the page-get
+// error, never fall through to the older DB-file copy (drift-6 in
+// docs/btree/NOTES.md, RESOLVED). The hook receives the
+// frame number and returns a non-nil error to fail that read.
 var walReadFrameFaultHook atomic.Pointer[func(frame uint32) error]
 
 // setWalReadFrameFaultHook installs (fn != nil) or clears (fn == nil) the
@@ -2493,10 +2504,10 @@ func (w *wal) readFrame(frame uint32, buf, scratchBuf []byte, aeadScratchBuf *ae
 	if frame == 0 {
 		return ErrWALCorrupt
 	}
-	// Test-only fault-injection hook. nil in production (zero overhead beyond a
-	// pointer load). When set, a non-nil return forces readFrame to fail for the
-	// given frame, exercising the by-design WAL-frame-read fallthrough documented
-	// at docs/btree/NOTES.md#drift-6-wal-frame-read-failure-falls-through-to-disk-read.
+	// Test-only fault-injection hook. nil in production (zero overhead beyond
+	// a pointer load). When set, a non-nil return forces readFrame to fail for
+	// the given frame, exercising the pager getters' error-propagation
+	// contract (drift-6, RESOLVED — see walReadFrameFaultHook).
 	if hook := walReadFrameFaultHook.Load(); hook != nil {
 		if err := (*hook)(frame); err != nil {
 			return err
@@ -2536,6 +2547,7 @@ func (w *wal) readFrame(frame uint32, buf, scratchBuf []byte, aeadScratchBuf *ae
 		// Multi-process: a stale nFrame view may have let us try to read
 		// past the peer's actual WAL tail. Treat that as corruption
 		// rather than leaking the raw I/O error.
+		// DRIFT: past-tail ReadAt failure remapped to ErrWALCorrupt; C propagates the raw short-read error See docs/btree/NOTES.md#drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt
 		if frame > nf {
 			return ErrWALCorrupt
 		}

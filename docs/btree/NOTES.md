@@ -1999,7 +1999,7 @@ bounded by the per-snapshot `dbSize` check.
 
 <a id="drift-6-wal-frame-read-failure-falls-through-to-disk-read"></a>
 ### Drift: WAL Frame Read Failure Falls Through To Disk Read
-- **Category:** changed-logic  -  **Severity:** high
+- **Category:** changed-logic  -  **Severity:** high  -  **Status:** RESOLVED 2026-07-10 (2026-07 pre-beta review): all four getters (`getPageWriter`, `readTempPage`, `getPageReader`, `readRawPage`) now propagate `readFrame`/`readFrameRaw` errors wrapped with page/frame context, matching C `readDbPage`, where with `iFrame != 0` the DB-file read is the unreachable else branch and a WAL read error becomes the page-get error (`sqlitec/src/pager.c:3035-3046`, 3.52.0). The "benign reset between lookup and read" TOCTOU race the fallthrough covered (introduced with commit `1e2cec7`) is structurally excluded: the writer path holds `lockWrite`, which any restart requires (`checkpointWithMode`; PASSIVE never resets, `checkpointPost`); readers hold a slot 1-4 shared lock that `tryResetWALWithBusy` must take exclusively; slot-0 snapshots carry `minFrame = mxFrame+1` so `walIndex.get` never resolves a frame for them (C `readLock==0` short-circuit); and the in-process slot-0 fallback now re-validates after acquiring read-0 (see the 2026-07-10 fallback re-validation fix, mirroring C's READ_LOCK(0) re-check at `wal.c:3136-3139`). Caveat: API calls that begin pager reads without the `db.mu` drain (`GetNamespace`, `ListNamespaces`, `IntegrityCheckN`) and race `DB.Close`'s WAL truncate may now surface a read error where they previously silently succeeded (contract-gray; follow-up). Adjacent residual: `refreshHeaderFromPage1`'s single-failure-with-successful-fallback path (deliberate 2026-07-10 design) still adopts a DB-file page-1 header under the write lock — open follow-up. Regression tests: `TestWALReadFrameErrorPropagates{,_Writer,_TempPage}`, `TestReadRawPageWALErrorPropagates`, `TestWALDecryptFailurePropagatesFromReadFrame`, `TestReadFrameNoBenignFailuresUnderTruncateStress`, `TestInProcessSlot0FallbackTruncateStress`.
 - **Affected functions:** `pager.go:*pager.getPageWriter` (`internal/btree/pager.go:1014-1028`), `pager.go:*pager.readTempPage` (`internal/btree/pager.go:1114-1123`); the same fall-through also appears in the `getPageReader` cache path (`internal/btree/pager.go:1247`) and the `readFrameRaw` path (`internal/btree/pager.go:1357`).
 
 In C `readDbPage`, once `sqlite3WalFindFrame` resolves a WAL frame (`iFrame != 0`) the
@@ -2021,7 +2021,14 @@ authoritative WAL copy of a page cannot be read for those reasons, Go silently
 substitutes the older committed-DB-file version instead of surfacing the WAL error,
 which can return outdated page content as if it were current.
 
-<a id="drift-7-short-db-file-read-treated-as-hard-error"></a>
+<a id="drift-2026-07-10-1-readframe-past-tail-read-failure-remapped-to-errwalcorrupt"></a>
+### Drift: readFrame Past-Tail Read Failure Remapped To ErrWALCorrupt
+- **Category:** error-handling  -  **Severity:** low
+- **Affected functions:** `wal.go:*wal.readFrame` (`internal/btree/wal.go`, past-tail remap in the `ReadAt` error branch), `wal.go:*wal.readFrameRaw` (same pattern).
+
+C `sqlite3WalReadFrame` (`sqlitec/src/wal.c:3649-3664`, 3.52.0) is a bare `sqlite3OsRead` with no bounds check — a read past the physical WAL tail surfaces as the raw OS error (typically `SQLITE_IOERR_SHORT_READ` from `unixRead`), and `readDbPage` forgives short reads only on the DB-file branch, never the WAL branch (`pager.c:3042-3045`). Go's `readFrame`/`readFrameRaw` instead remap a `ReadAt` failure at `frame > nFrame` (a stale process-local tail view in multi-process mode) to `ErrWALCorrupt` rather than leaking the raw I/O error. Both C and Go treat the condition as an error; the divergence is only the error identity. Since the drift-6 resolution these errors propagate to page-get callers, so the remap is now user-visible: callers see `ErrWALCorrupt` where C would surface an I/O error code. Kept deliberately — a lookup-resolved frame that cannot be read within the reader's validated snapshot implies index/tail inconsistency, which `ErrWALCorrupt` describes more accurately than a short-read errno.
+
+
 ### Drift: Short DB File Read Treated As Hard Error
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `pager.go:*pager.readTempPage` (`internal/btree/pager.go:1085-1178`; hard-error path `1126-1132`; underlying `readDBPage` `internal/btree/pager.go:339-368`).
