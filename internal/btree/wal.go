@@ -1488,6 +1488,17 @@ func (w *wal) open() (err error) {
 	// Multi-process mode: pageMap is unused — get()/getLatest() consult
 	// SHM hash exclusively (matches walFindFrame at wal.c:3554-3582).
 	// No per-process rebuild is needed; peer writes land directly in SHM.
+	//
+	// Crash-stale shm safety: this adopt can never validate a stale image
+	// left by power loss. The DMS first-attacher election in newPlatformShm
+	// truncates the shm to a 3-byte stump whenever no other process holds
+	// the DMS, so a fresh cold-start attach always fails readHeader and
+	// funnels into recoverLocked; a non-first attacher joins a shm that a
+	// LIVE process is maintaining, which is exactly when trusting it is
+	// correct. (Independently, region(create=false) never maps existing
+	// file content on a fresh attach — see
+	// docs/btree/NOTES.md#drift-2026-07-10-3-region-create-false-never-maps-existing-content —
+	// but the election is the load-bearing guarantee, not that accident.)
 	if !w.inProcess {
 		if hdr, valid := w.index.readHeader(); valid {
 			info, err := f.Stat()

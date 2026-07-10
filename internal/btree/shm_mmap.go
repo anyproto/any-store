@@ -3,18 +3,26 @@
 package btree
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
 var (
 	sysMmap   = syscall.Mmap
 	sysMunmap = syscall.Munmap
-	sysFcntl  = func(fd, cmd, arg uintptr) (uintptr, uintptr, syscall.Errno) {
-		return syscall.Syscall(syscall.SYS_FCNTL, fd, cmd, arg)
+	// sysFcntl performs an fcntl record-lock call (F_SETLK / F_GETLK). The
+	// typed *Flock_t parameter lets tests stub lock conflicts and probe
+	// responses (impossible with real fcntl intra-process, since POSIX locks
+	// never conflict within one process); for F_GETLK the kernel — or a stub
+	// — rewrites flock.Type with the answer.
+	sysFcntl = func(fd uintptr, cmd int, flock *syscall.Flock_t) syscall.Errno {
+		_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, fd, uintptr(cmd), uintptr(unsafe.Pointer(flock)))
+		return errno
 	}
 )
 
@@ -24,9 +32,18 @@ var (
 const hasMmapShm = true
 
 // shmDMSOffset is the byte offset of the "dead man switch" (DMS) lock in the
-// SHM file. Each open connection holds a shared lock on this byte. On close,
-// we try to acquire an exclusive lock: if successful, we're the last connection
-// and can safely delete the SHM file. This matches SQLite's UNIX_SHM_DMS pattern.
+// SHM file, matching SQLite's UNIX_SHM_DMS = UNIX_SHM_BASE+SQLITE_SHM_NLOCK =
+// 128 (os_unix.c:4602-4603, 3.52.0). Each attached process holds a SHARED
+// fcntl lock on this byte for the lifetime of the attachment (released when
+// the shm fd closes, including on process death); the first attacher briefly
+// holds it EXCLUSIVE during the open-time election that resets a stale shm
+// (see newPlatformShm). Last-client detection at close does NOT use the DMS —
+// it moved to the DB-file flock upgrade (pager.close); the DMS's remaining
+// job is the first-attacher election.
+//
+// Byte 128 overlaps the nBackfillAttempted field of the mmap'd wal-index
+// data (htNBackfillAttemptedOff, wal.go) — SQLite has the identical overlap.
+// Advisory fcntl locks never touch file bytes, so this is inert.
 const shmDMSOffset = 120 + int64(lockSlotCount) // right after the per-slot lock bytes
 
 // mmapShm implements the shm interface using mmap on a .shm file.
@@ -66,9 +83,48 @@ func shmRegionsPerMap() int {
 	return pg / shmRegionSize
 }
 
-// newPlatformShm creates a new mmap-backed shm and acquires a shared DMS
-// fcntl lock (kept for intra-process lock-slot coordination via the fcntl
-// layer). Single-shot — no retries, no inode verify.
+// newPlatformShm creates or attaches the mmap-backed shm and runs SQLite's
+// dead-man-switch (DMS) first-attacher election, mirroring unixLockSharedMemory
+// (os_unix.c:4860-4913, 3.52.0):
+//
+//   - Probe the DMS byte with F_GETLK (os_unix.c:4876). Three-way branch:
+//   - F_UNLCK (no holder): take the DMS EXCLUSIVE non-blocking
+//     (os_unix.c:4893). Success proves no other process is attached, so any
+//     existing shm content is cross-crash garbage — a *-shm that survived
+//     power loss reflects the dead writer's in-memory view, not the on-disk
+//     WAL, and adopting it can resurrect uncommitted frames or hide the
+//     committed tail. UNCONDITIONALLY reset it to the 3-byte stump
+//     (robust_ftruncate(hShm, 3), os_unix.c:4903), then downgrade to SHARED
+//     (os_unix.c:4910-4913). POSIX F_SETLK conversion of a held lock is
+//     atomic — there is no unlock window in which a raced peer could attach
+//     between the truncate and the downgrade.
+//   - F_RDLCK (live attachers): join with a SHARED lock and do not touch
+//     the file — a live process is maintaining the shm.
+//   - F_WRLCK (peer mid-election): back off and retry the whole probe.
+//     NEVER fall back to the shared lock here: SQLite documents
+//     (os_unix.c:4864-4871) that an earlier version did exactly that, and
+//     if the exclusive holder dies just before truncating, the joiner
+//     attaches an untruncated — possibly crash-corrupted — shm.
+//
+// The 3-byte stump is deliberately smaller than walIndexHdrSize (48); the
+// first region() call re-grows the file with zero-fill, so readHeader's
+// dual-copy compare (and the isInit/aCksum checks behind it) can never
+// validate stale content, and recoverLocked rebuilds the wal-index from the
+// authoritative WAL file.
+//
+// Retry policy: bounded 100×10ms in-open loop, mirroring pager.open's
+// DB-flock retry; exhaustion wraps ErrBusy. (C surfaces SQLITE_BUSY to the
+// caller instead — DRIFT below.) The exclusive window is microseconds
+// (WRLCK → ftruncate → downgrade), so a single retry normally suffices.
+//
+// Intra-process safety: POSIX fcntl record locks are per-(process, inode). A
+// second attachment in the SAME process would not conflict with our locks —
+// its F_WRLCK would silently convert our F_RDLCK and truncate a LIVE shm.
+// That cannot happen because openDBs (db.go) forbids same-process double-open
+// by file identity — the analog of SQLite's per-inode unixShmNode singleton.
+// For the same reason, no code may open+close this *-shm path in a process
+// that has it attached: closing ANY fd for the inode drops all of the
+// process's record locks on it (the shm slot locks and the DMS byte).
 //
 // The pager.open caller holds a SHARED flock on the DB file before we are
 // invoked. That flock is what serializes "last-client-unlink" vs. "new-
@@ -79,6 +135,14 @@ func shmRegionsPerMap() int {
 // created a new one) or stably attached. Either way the old inode-verify
 // retry loop is obsolete — see docs/btree/NOTES.md §SHM open/
 // close protocol drift.
+//
+// The election also excludes the mmap/ftruncate SIGBUS hazard: the truncate
+// runs only when zero other processes hold the DMS, every attacher takes the
+// DMS before its first region() mapping, and close() munmaps before closing
+// the fd that holds the lock — so no live mapping can exist over a page the
+// truncate discards.
+//
+// DRIFT: DMS BUSY retried in-line (100x10ms) instead of surfacing to the caller See docs/btree/NOTES.md#drift-2026-07-10-2-dms-busy-retried-in-open-instead-of-surfacing
 func newPlatformShm(path string) (shm, error) {
 	f, err := osOpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
@@ -90,26 +154,84 @@ func newPlatformShm(path string) (shm, error) {
 		regions:  make([][]byte, 0, shmMaxRegions),
 		baseMaps: make([][]byte, 0, shmMaxRegions),
 	}
-	if err := s.fcntlLock(syscall.F_RDLCK, shmDMSOffset); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("btree: acquire DMS shared lock: %w", err)
-	}
 
-	// If the file is freshly created (size == 0), truncate to 3 bytes as
-	// a "known-fresh" diagnostic marker — matches SQLite's unixOpenSharedMemory
-	// (os_unix.c:4902 robust_ftruncate(hShm, 3)). The marker size is
-	// deliberately smaller than walIndexHdrSize (48), so any subsequent
-	// opener that mmaps a 3-byte file knows it's a blank-slate shm and not
-	// a corruption. The first region() call will Truncate to shmRegionSize,
-	// so this 3-byte state is transient.
-	if info, err := f.Stat(); err == nil && info.Size() == 0 {
-		if err := f.Truncate(3); err != nil {
+	for attempt := 0; ; attempt++ {
+		typ, perr := s.fcntlGetLock(shmDMSOffset)
+		if perr != nil {
 			_ = f.Close()
-			return nil, fmt.Errorf("btree: ftruncate(shm, 3) marker: %w", err)
+			return nil, fmt.Errorf("btree: probe DMS lock: %w", perr)
 		}
-	}
+		switch typ {
+		case syscall.F_UNLCK:
+			// No holder: run the election.
+			werr := s.fcntlLock(syscall.F_WRLCK, shmDMSOffset)
+			if werr != nil {
+				if errors.Is(werr, ErrBusy) {
+					break // lost the race to another opener → re-probe
+				}
+				_ = f.Close()
+				return nil, fmt.Errorf("btree: acquire DMS exclusive lock: %w", werr)
+			}
+			// First attacher: reset the (possibly crash-stale) shm.
+			if terr := f.Truncate(3); terr != nil {
+				_ = f.Close()
+				return nil, fmt.Errorf("btree: ftruncate(shm, 3) first-attacher reset: %w", terr)
+			}
+			// Atomic downgrade to the lifetime SHARED lock. A conversion of
+			// a lock we hold cannot legitimately be denied — treat even
+			// ErrBusy as a hard protocol error, not contention.
+			if derr := s.fcntlLock(syscall.F_RDLCK, shmDMSOffset); derr != nil {
+				_ = f.Close()
+				return nil, fmt.Errorf("btree: downgrade DMS lock to shared: %w", derr)
+			}
+			return s, nil
 
-	return s, nil
+		case syscall.F_RDLCK:
+			// Live attachers: join shared; the shm is live-maintained.
+			rerr := s.fcntlLock(syscall.F_RDLCK, shmDMSOffset)
+			if rerr == nil {
+				return s, nil
+			}
+			if !errors.Is(rerr, ErrBusy) {
+				_ = f.Close()
+				return nil, fmt.Errorf("btree: acquire DMS shared lock: %w", rerr)
+			}
+			// Holder changed between probe and lock (readers left, a new
+			// opener elected itself) → re-probe.
+
+		case syscall.F_WRLCK:
+			// Peer mid-election: back off, never join (os_unix.c:4864-4871).
+		}
+
+		if attempt >= 99 {
+			_ = f.Close()
+			return nil, fmt.Errorf("btree: DMS lock busy after retries (peer mid-election?): %w", ErrBusy)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// fcntlGetLock probes the 1-byte range at offset with F_GETLK, asking whether
+// an exclusive lock could be placed there (l_type=F_WRLCK query, matching
+// unixLockSharedMemory's probe, os_unix.c:4872-4877). The kernel rewrites
+// l_type to the answer: F_UNLCK (no conflicting holder), or the type of the
+// conflicting lock held by another process (F_RDLCK / F_WRLCK). Locks held by
+// THIS process never conflict and report F_UNLCK — see the intra-process
+// invariant on newPlatformShm.
+func (s *mmapShm) fcntlGetLock(offset int64) (int16, error) {
+	if s.file == nil {
+		return 0, fmt.Errorf("btree: shm file closed")
+	}
+	flock := syscall.Flock_t{
+		Type:   int16(syscall.F_WRLCK),
+		Whence: 0, // SEEK_SET
+		Start:  offset,
+		Len:    1,
+	}
+	if errno := sysFcntl(s.file.Fd(), syscall.F_GETLK, &flock); errno != 0 {
+		return 0, fmt.Errorf("btree: fcntl getlk: %w", errno)
+	}
+	return flock.Type, nil
 }
 
 func (s *mmapShm) region(index int, create bool) ([]byte, error) {
@@ -297,10 +419,7 @@ func (s *mmapShm) fcntlLock(lockType int, offset int64) error {
 		Len:    1,
 	}
 	// Use F_SETLK for non-blocking lock attempts.
-	_, _, errno := sysFcntl(
-		s.file.Fd(),
-		uintptr(syscall.F_SETLK),
-		uintptr(unsafe.Pointer(&flock)))
+	errno := sysFcntl(s.file.Fd(), syscall.F_SETLK, &flock)
 	if errno != 0 {
 		// Mirror sqliteErrorFromPosixError (os_unix.c:1029-1038): the documented
 		// set of transient/NFS-retry errnos that SQLite collapses to SQLITE_BUSY
