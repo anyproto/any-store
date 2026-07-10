@@ -76,7 +76,7 @@ func (it *IndexIter) Next() (key []byte, docId []byte, multiKey bool, err error)
 
 		// boundIdx counts consumed intervals; the list is ascending-sorted, so
 		// a reverse scan consumes it from the top — otherwise global descending
-		// order breaks across intervals and Limit keeps the wrong rows (BUG-13).
+		// order breaks across intervals and Limit keeps the wrong rows.
 		bi := it.boundIdx
 		if it.Reverse {
 			bi = len(it.Bounds) - 1 - it.boundIdx

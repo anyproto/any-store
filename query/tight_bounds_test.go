@@ -16,7 +16,7 @@ func tb(t *testing.T, cond, field string) (Bounds, bool) {
 }
 
 func TestTightIndexBounds_TwoSidedRange(t *testing.T) {
-	// The BUG-02 headline shape: both ends must survive.
+	// The headline two-sided-range shape: both ends must survive.
 	bs, empty := tb(t, `{"a":{"$gt":10,"$lt":20}}`, "a")
 	require.False(t, empty)
 	require.Len(t, bs, 1)

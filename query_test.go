@@ -612,7 +612,7 @@ func TestQuery_Iter_FilterParseError(t *testing.T) {
 }
 
 // TestQuery_IsIDOnlyFilterNode_And_Direct tests the query.And (value
-// receiver) branch of isIDOnlyFilterNode directly. Since the BUG-12 fix an
+// receiver) branch of isIDOnlyFilterNode directly. Since the exact-shapes fix an
 // And qualifies only as a transparent single-child wrapper: two pk Keys mean
 // two predicates on the pk, whose match set (an intersection) is not the
 // point set tx.Has would probe — {$and:[{id:1},{id:2}]} matches nothing yet
@@ -627,7 +627,7 @@ func TestQuery_IsIDOnlyFilterNode_And_Direct(t *testing.T) {
 	// Two pk predicates are inexact — rejected even though both are Eq.
 	f := query.And{eq, eq}
 	assert.False(t, isIDOnlyFilterNode(f, "id"),
-		"And with two pk predicates must NOT be id-only (BUG-12)")
+		"And with two pk predicates must NOT be id-only")
 
 	// And with a non-id child → returns false.
 	fMixed := query.And{
@@ -644,7 +644,7 @@ func TestQuery_IsIDOnlyFilterNode_And_Direct(t *testing.T) {
 // TestQuery_IsIDOnlyFilterNode_PointerAnd verifies the *query.And pointer-arm
 // of isIDOnlyFilterNode: query.MustParseCondition produces *query.And for
 // `{"$and": [...]}` JSON. A single-child $and delegates to the value arm and
-// stays id-only; multiple pk children are rejected as inexact (BUG-12).
+// stays id-only; multiple pk children are rejected as inexact.
 func TestQuery_IsIDOnlyFilterNode_PointerAnd(t *testing.T) {
 	single := query.MustParseCondition(`{"$and":[{"id":"a"}]}`)
 	assert.True(t, isIDOnlyFilterNode(single, "id"),
@@ -652,7 +652,7 @@ func TestQuery_IsIDOnlyFilterNode_PointerAnd(t *testing.T) {
 
 	multi := query.MustParseCondition(`{"$and":[{"id":"a"},{"id":"b"}]}`)
 	assert.False(t, isIDOnlyFilterNode(multi, "id"),
-		"pointer-And with two pk predicates must NOT be id-only (BUG-12)")
+		"pointer-And with two pk predicates must NOT be id-only")
 }
 
 // TestQuery_Update_NoopModifier covers query.go:258-261 — when the modifier
@@ -1030,8 +1030,7 @@ func TestQuery_Unsatisfiable_AllOpsConsistent(t *testing.T) {
 	assert.Equal(t, 200, count)
 }
 
-// TestQueryCount_IdFastPathExactShapesOnly is the BUG-12 regression gate (see
-// ../any-storev2-pre-beta-bugs): the id-only Count fast path probes tx.Has per
+// TestQueryCount_IdFastPathExactShapesOnly: the id-only Count fast path probes tx.Has per
 // point bound and never runs the residual filter, so it may fire only when the
 // filter's match set exactly equals its bounds — a single Eq or $in predicate
 // on the pk. Every shape below over-counted before the filter-shape gate.
@@ -1083,8 +1082,7 @@ func TestQueryCount_IdFastPathExactShapesOnly(t *testing.T) {
 	}
 }
 
-// TestQuery_ReverseMultiIntervalOrder is the BUG-13 regression gate (see
-// ../any-storev2-pre-beta-bugs): IndexIter must visit a multi-interval bound
+// TestQuery_ReverseMultiIntervalOrder: IndexIter must visit a multi-interval bound
 // set ($in => one point interval per value) in DESCENDING interval order when
 // scanning in reverse. Before the fix it walked intervals ascending (each
 // internally reversed), so a reverse ExactSort plan — which adds no SortIter —
@@ -1136,7 +1134,7 @@ func TestQuery_ReverseMultiIntervalOrder(t *testing.T) {
 	assert.Equal(t, []int{1, 5, 9}, got, "ascending order must be unchanged")
 
 	// $ne carves a one-field bound set into two rays — same interval-order
-	// requirement once tight bounds land (BUG-02 plan), and already
+	// requirement once tight bounds land (two-sided-bounds plan), and already
 	// exercisable today via $in.
 	got = collectA(t, coll.Find(`{"a":{"$in":[2,4,6,8]}}`).IndexHint(hint).Sort("-a").Limit(2))
 	assert.Equal(t, []int{8, 6}, got, "Limit quota must carry across interval boundaries in reverse")
@@ -1144,7 +1142,7 @@ func TestQuery_ReverseMultiIntervalOrder(t *testing.T) {
 
 // TestQuery_ReverseMultiIntervalOrder_FullScan pins the same cross-interval
 // descending contract on the FullScanIter path (pk $in bounds), which already
-// consumed intervals from the top — parity guard for BUG-13.
+// consumed intervals from the top — parity guard for the reverse interval-order fix.
 func TestQuery_ReverseMultiIntervalOrder_FullScan(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "bug13fs")
@@ -1166,7 +1164,7 @@ func TestQuery_ReverseMultiIntervalOrder_FullScan(t *testing.T) {
 	assert.Equal(t, []int{9, 5, 1}, got)
 }
 
-// TestQueryCount_LimitOffsetMultiKey is the BUG-06 / I-07 regression gate:
+// TestQueryCount_LimitOffsetMultiKey is the known-issues I-07 regression gate:
 // Count with Limit/Offset over a multi-key index must agree with Iter. The
 // LimitIter cutoff used to apply to raw index-entry rows while doc dedup ran
 // only in the consumer loop, so limit capped entry-rows that then collapsed

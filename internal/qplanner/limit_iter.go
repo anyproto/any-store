@@ -60,7 +60,7 @@ func (it *LimitIter) Next() (key []byte, docId []byte, multiKey bool, err error)
 // source ROWS, which over a multi-key index can be several entries per doc —
 // the offset then skips fewer distinct docs than requested and the limit caps
 // entry rows that later collapse in the consumer's dedup, so Count diverges
-// from Iter (BUG-06 / known-issues I-07). Here dedup runs BEFORE the cutoff:
+// from Iter (known-issues I-07). Here dedup runs BEFORE the cutoff:
 // offset and limit are applied to distinct-doc counts, with early exit once
 // Offset+Limit distinct docs are seen.
 //

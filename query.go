@@ -604,7 +604,7 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 
 		// Limit/Offset cutoffs must apply to DISTINCT docs, not raw entry
 		// rows: over a multi-key index LimitIter.Next skips/caps entries that
-		// later collapse in dedup, diverging from Iter (BUG-06 / I-07).
+		// later collapse in dedup, diverging from Iter (known-issues I-07).
 		// CountDistinct deduplicates before the cutoff.
 		if li, ok := plan.Root.(*qplanner.LimitIter); ok {
 			n, cerr := li.CountDistinct()
@@ -798,7 +798,7 @@ func isUnsatisfiable(f query.Filter) bool {
 // skip CBO planning. Anything else — extra conjuncts ({$in,$ne}, {$in,$gt},
 // {$in,$type}), ranges, multiple pk Keys ({$and:[{id:1},{id:2}]} matches
 // nothing yet has two point bounds) — is NOT exactly represented by its bounds
-// and must go through the planner (BUG-12 in the pre-beta catalog).
+// and must go through the planner.
 func (q *collQuery) isIDOnlyFilter() bool {
 	return isIDOnlyFilterNode(q.cond, q.c.primaryKey)
 }

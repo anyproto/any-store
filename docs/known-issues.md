@@ -306,7 +306,7 @@ Option 1 is the smallest correct fix. Tracked as a follow-up; may be folded into
 
 ## I-07: `Count()` with `Limit`/`Offset` over a multi-key index disagrees with `Iter()`
 
-**Status: FIXED** on `bug02-two-sided-bounds` (2026-07-10, BUG-02 plan commit 4).
+**Status: FIXED** on `bug02-two-sided-bounds` (2026-07-10, two-sided-bounds plan commit 4; see docs/plans/2026-07-10-bug02-two-sided-bounds-plan.md).
 `LimitIter.CountDistinct` (internal/qplanner/limit_iter.go) deduplicates BEFORE
 the cutoff: offset and limit apply to distinct-doc counts (early exit at
 Offset+Limit distinct), and the Count dispatch (query.go) routes any
