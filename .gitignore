@@ -11,3 +11,4 @@ docs/btree/mappings/*.gen.json
 .idea/
 *.test
 /wasm/wasm
+/cmd/any-store-cli2/any-store-cli2
