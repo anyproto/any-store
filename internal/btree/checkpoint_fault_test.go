@@ -677,11 +677,20 @@ func cpFile(t *testing.T, src, dst string) {
 }
 
 // snapshotDB copies the DB, WAL, and SHM files to a snapshot directory.
+// The shm file is <db>-wal-shm (pager appends "-wal", the wal appends
+// "-shm"); it exists only for multi-process (mmap shm) DBs — for
+// InProcess/InMemory DBs the copy is a silent no-op via cpFile.
+//
+// WARNING: do not call this while THIS process has a multi-process DB
+// attached at dbPath — cpFile's os.ReadFile open+closes an fd on the
+// -wal-shm inode, and POSIX fcntl record locks (the shm slot locks and the
+// DMS byte) are dropped when any fd for the inode is closed in-process.
+// Snapshot from a child process (exec cp) in that case.
 func snapshotDB(t *testing.T, dbPath, snapDir string) {
 	t.Helper()
 	cpFile(t, dbPath, filepath.Join(snapDir, "test.db"))
 	cpFile(t, dbPath+"-wal", filepath.Join(snapDir, "test.db-wal"))
-	cpFile(t, dbPath+"-shm", filepath.Join(snapDir, "test.db-shm"))
+	cpFile(t, dbPath+"-wal-shm", filepath.Join(snapDir, "test.db-wal-shm"))
 }
 
 // TestCheckpointBackfill_CrashAfterPartialCheckpoint simulates a process
@@ -735,7 +744,7 @@ func TestCheckpointBackfill_CrashAfterPartialCheckpoint(t *testing.T) {
 	_ = db.Close()
 
 	// Remove SHM (not durable on crash)
-	_ = os.Remove(filepath.Join(snapDir, "test.db-shm"))
+	_ = os.Remove(filepath.Join(snapDir, "test.db-wal-shm"))
 
 	walSnap := filepath.Join(snapDir, "test.db-wal")
 	walInfo, err := os.Stat(walSnap)
@@ -806,7 +815,7 @@ func TestCheckpointBackfill_CrashDuringFdatasync(t *testing.T) {
 	doSnapshot.Store(false)
 	_ = db.Close()
 
-	_ = os.Remove(filepath.Join(snapDir, "test.db-shm"))
+	_ = os.Remove(filepath.Join(snapDir, "test.db-wal-shm"))
 
 	ResetVFS()
 	snapPath := filepath.Join(snapDir, "test.db")
@@ -874,7 +883,7 @@ func TestCheckpointBackfill_StressAutoCheckpointWithFaults(t *testing.T) {
 	require.NoError(t, db2.Close())
 
 	// Test 2: crash simulation from snapshot
-	_ = os.Remove(filepath.Join(snapDir, "test.db-shm"))
+	_ = os.Remove(filepath.Join(snapDir, "test.db-wal-shm"))
 	snapPath := filepath.Join(snapDir, "test.db")
 	db3, err := testOpen(t, snapPath, opts)
 	require.NoError(t, err)
@@ -1181,7 +1190,7 @@ func TestMinFrameFilter_FdatasyncNoop_CrashAfterTruncate(t *testing.T) {
 	}
 
 	// Open from the snapshot (simulating crash recovery)
-	_ = os.Remove(filepath.Join(snapDir, "test.db-shm"))
+	_ = os.Remove(filepath.Join(snapDir, "test.db-wal-shm"))
 	ResetVFS()
 	snapPath := filepath.Join(snapDir, "test.db")
 	db2, err := testOpen(t, snapPath, opts)
@@ -1589,7 +1598,7 @@ func TestCheckpointBackfill_ShortWrite_InlineRead(t *testing.T) {
 
 	// Fresh handle / crash recovery from the snapshot. With the first handle
 	// closed and the registry cleared, opening the snapshot path is allowed.
-	_ = os.Remove(filepath.Join(snapDir, "test.db-shm"))
+	_ = os.Remove(filepath.Join(snapDir, "test.db-wal-shm"))
 	ResetVFS()
 	ResetOpenRegistry()
 
@@ -1757,7 +1766,7 @@ func TestRegression_Bug11_Simulation(t *testing.T) {
 
 	// Simulate a crash: drop the volatile SHM and recover purely from the
 	// snapshot's DB + WAL (no clean-close checkpoint runs here).
-	_ = os.Remove(filepath.Join(snapDir, "test.db-shm"))
+	_ = os.Remove(filepath.Join(snapDir, "test.db-wal-shm"))
 	ResetVFS()
 	ResetOpenRegistry()
 
