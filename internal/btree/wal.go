@@ -2771,9 +2771,26 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 	// It is a fixed 0 sentinel (wal.go:1900); the returned maxFrame comes from
 	// the local mxFrame snapshot. Matches SQLite walTryBeginRead (wal.c:3136-3157).
 	// minFrame = nBackfill+1 (NOT mxFrame+1): unlike the fast path, mxFrame >
-	// nBackfill here, so the WAL must still be consulted. Holding read-0
-	// shared blocks backfill (it takes read-0 exclusive), so nBackfill cannot
-	// advance — and therefore no restart can recycle frames — while we hold it.
+	// nBackfill here, so the WAL must still be consulted.
+	//
+	// Post-lock re-validation, mirroring the slot-reuse branch above and C's
+	// own READ_LOCK(0) re-check (walTryBeginRead memcmps the live header after
+	// taking the lock and returns WAL_RETRY on change, wal.c:3136-3139).
+	// Between the lock-free snapshot and this read-0 acquisition, a checkpoint
+	// may have completed backfill (releasing read-0) and entered
+	// tryResetWALWithBusy — which locks only slots 1-4 — so a WAL reset could
+	// slip in and recycle frame numbers; the stale [minFrame, maxFrame] window
+	// would then match new-generation frames in walIndex.get. A change in
+	// either counter means the snapshot may span such a reset → drop the lock
+	// and retry with fresh values.
+	if w.index.mxCommitFrame.LoadLocal() != mxFrame || w.index.nBackfill.Load() != nBackfill {
+		_ = w.index.unlock(lockRead0, lockShared)
+		return WalIndexHdr{}, 0, 0, 0, errWALRetry
+	}
+	// Once validated, nBackfill < mxFrame still holds (this fallback is only
+	// reached when they differ), so backfill has work left and must take
+	// read-0 exclusive (blocked by our shared hold): nBackfill cannot advance
+	// — and therefore no restart can recycle frames — while we hold it.
 	return hdr, mxFrame, nBackfill + 1, 0, nil
 }
 
