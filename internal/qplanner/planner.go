@@ -1847,7 +1847,13 @@ func (br *BoundsResult) Build(indexInfos []*IndexInfo, filter query.Filter) {
 				Fixed:    allBoundsFixedNonEmpty(br.Bounds[start:]),
 				TightIdx: -1,
 			}
-			if mayTighten && count > 0 && len(br.tightFields) < 127 {
+			// countFilterFieldPreds is a zero-alloc pre-check: tight bounds
+			// can only differ from wide when THIS field carries more than
+			// one predicate — MayTighten alone also fires for multi-FIELD
+			// conjunctions ({a:1,b:2}), which would pay an allocating walk
+			// per field for an always-equal result.
+			if mayTighten && count > 0 && len(br.tightFields) < 127 &&
+				countFilterFieldPreds(filter, field) > 1 {
 				tight, tEmpty := query.TightIndexBounds(filter, field)
 				if !tEmpty && !boundsEqual(tight, bs) {
 					fb.TightIdx = int8(len(br.tightFields))
