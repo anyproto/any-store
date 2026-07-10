@@ -2296,3 +2296,68 @@ func TestIndex_Planner_FullScanLimit_EarlyTerminationCost(t *testing.T) {
 	docs := collectDocs(t, coll.Find(`{"a":{"$gte":50}}`).Limit(5))
 	assert.Len(t, docs, 5)
 }
+
+// setupBenchRangeDesc creates a collection with n docs carrying unique string
+// pks ("docNNNNNNNN"), the shape of the descending-range over-scan report:
+// with the End bound dropped, Find(id>lo AND id<hi).Sort("-id").Limit(k)
+// started the reverse cursor at the LAST key and filter-discarded every row
+// above hi — O(rows above hi) instead of O(k).
+func setupBenchRangeDesc(b *testing.B, n int) Collection {
+	b.Helper()
+	fx := newFixture(b)
+	coll, err := fx.CreateCollection(ctx, "rangedesc")
+	require.NoError(b, err)
+	docs := make([]*anyenc.Value, 0, 1000)
+	for i := 0; i < n; i++ {
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id":"doc%08d"}`, i)))
+		if len(docs) == 1000 {
+			require.NoError(b, coll.Insert(ctx, docs...))
+			docs = docs[:0]
+		}
+	}
+	if len(docs) > 0 {
+		require.NoError(b, coll.Insert(ctx, docs...))
+	}
+	return coll
+}
+
+// BenchmarkRangeDescLimit_200k: descending two-sided pk range with a limit,
+// near the bottom and near the top of the keyspace. With tight idBounds the
+// two are equivalent (seek to hi, walk k rows); with the End dropped the
+// near-bottom case scanned ~the whole collection per query.
+func BenchmarkRangeDescLimit_200k(b *testing.B) {
+	coll := setupBenchRangeDesc(b, 200_000)
+	run := func(b *testing.B, filter string) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			it, err := coll.Find(filter).Sort("-id").Limit(10).Iter(ctx)
+			require.NoError(b, err)
+			n := 0
+			for it.Next() {
+				n++
+			}
+			require.NoError(b, it.Err())
+			require.NoError(b, it.Close())
+			if n != 10 {
+				b.Fatalf("expected 10 rows, got %d", n)
+			}
+		}
+	}
+	b.Run("near_bottom", func(b *testing.B) {
+		run(b, `{"id":{"$gt":"doc00000100","$lt":"doc00001000"}}`)
+	})
+	b.Run("near_top", func(b *testing.B) {
+		run(b, `{"id":{"$gt":"doc00198000","$lt":"doc00199000"}}`)
+	})
+	b.Run("forward_count", func(b *testing.B) {
+		// Forward no-limit overrun: Count(lo<id<hi) must stop at hi.
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			n, err := coll.Find(`{"id":{"$gt":"doc00000100","$lt":"doc00001000"}}`).Count(ctx)
+			require.NoError(b, err)
+			if n != 899 {
+				b.Fatalf("expected 899, got %d", n)
+			}
+		}
+	})
+}

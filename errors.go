@@ -34,6 +34,13 @@ var (
 	// ErrDocWithoutId is returned when a document is provided without a required ID.
 	ErrDocWithoutId = errors.New("any-store: document missing ID")
 
+	// ErrArrayPrimaryKey is returned when a document's primary-key value is an
+	// array. Array pks are rejected because filter semantics on arrays are
+	// element-wise while the storage key is the whole-array encoding, so a doc
+	// could match a pk filter yet sit outside the scanned key range. Files
+	// written before this ban that contain array pks must be recreated.
+	ErrArrayPrimaryKey = errors.New("any-store: array values are not allowed as primary key")
+
 	// ErrPrimaryKeyMismatch is returned by Collection when the requested
 	// PrimaryKey option conflicts with an existing collection's stored primary
 	// key. The primary key is immutable after creation.

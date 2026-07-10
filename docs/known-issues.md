@@ -89,7 +89,9 @@ If a future feature is tempted to use the sketch to determine an answer, fix I-0
 ## I-04: `And.IndexBounds` silently discards conjuncts; CountOnly fast path returns wrong answer
 
 **Status: FIXED** on `feat/array-index-in-sortdedup` (2026-05-29). Two
-collaborating parts:
+collaborating parts (and see the 2026-07-10 follow-up note at the end of this
+entry: the perf cost of the over-approximation — dropped range Ends — is now
+recovered by a separate TIGHT bounds channel without touching this contract):
 
 1. `And.IndexBounds` (`query/filter.go`) returns a SOUND OVER-APPROXIMATION — the
    first contributing same-field conjunct's bounds, a superset of the matches. It
@@ -119,6 +121,17 @@ under-counting silently. Found by the 2026-05-29 differential review.
 (fix-sketch options 2+3) replace it — sound for scalar and array fields alike,
 at the cost of routing scalar two-sided ranges through `FilterIter` instead of a
 tight seek.
+
+**Follow-up (2026-07-10, `bug02-two-sided-bounds`):** the over-approximation's
+perf cost (two-sided ranges scanned as half-open; CBO fed one-sided ranges) is
+fixed WITHOUT weakening this contract, via a second channel:
+`query.TightIndexBounds` intersects same-field conjuncts; estimation always
+uses it; actual seeks use it only for the primary key (array pks now rejected
+on write) and for indexes whose persisted `idx_mk:` record proves no fan-out
+entry was ever written (see index.markMultiKey / isScalarProven). Multikey and
+unknown indexes keep the wide bounds this entry mandates. Plan and tests:
+docs/plans/2026-07-10-bug02-two-sided-bounds-plan.md,
+multikey_flag_test.go, query/tight_bounds_test.go.
 
 **Discovered:** 2026-05-28, during the array-index multi-bound `$in` merge code review (4-agent review of `feat/array-index-multi-bound-in-merge`).
 
@@ -304,7 +317,34 @@ Option 1 is the smallest correct fix. Tracked as a follow-up; may be folded into
 
 ---
 
+## I-09: files written before the array-primary-key ban may contain array pks — recreate them
+
+**Status: BY DESIGN** (pre-beta, alpha back-compat out of scope). Array pk
+values are rejected on write since the two-sided-bounds work (ErrArrayPrimaryKey,
+`collection.newItem`): filter semantics on arrays are element-wise while the
+data-namespace key is the whole-array encoding, so such docs were already
+semantically broken (match and key position decoupled even under the old
+half-open bounds). Files written by earlier builds can still contain them; on
+current builds pk-range queries seek tight two-sided bounds and will SILENTLY
+exclude those docs (pure read paths do not type-check the pk — the excluded
+keys are outside the scanned range by definition, so a scan cannot cheaply
+detect them). Any update, upsert, or index backfill touching such a doc fails
+loudly with ErrArrayPrimaryKey. Remediation: recreate the collection (or
+re-insert the docs with scalar pks) before upgrading.
+
+---
+
 ## I-07: `Count()` with `Limit`/`Offset` over a multi-key index disagrees with `Iter()`
+
+**Status: FIXED** on `bug02-two-sided-bounds` (2026-07-10, two-sided-bounds plan commit 4; see docs/plans/2026-07-10-bug02-two-sided-bounds-plan.md).
+`LimitIter.CountDistinct` (internal/qplanner/limit_iter.go) deduplicates BEFORE
+the cutoff: offset and limit apply to distinct-doc counts (early exit at
+Offset+Limit distinct), and the Count dispatch (query.go) routes any
+LimitIter-rooted plan through it instead of the generic Next loop. The
+cursor-level offset fast-skip stays sound: it skips only scalar-recorded
+entries, each of which is exactly one distinct doc. Regression:
+`query_test.go:TestQueryCount_LimitOffsetMultiKey` (the trigger below plus
+combined limit+offset and past-the-end cutoffs, asserted against Iter).
 
 **Discovered:** 2026-05-29, adversarial review of `feat/array-index-in-sortdedup`. **Pre-existing on the `btree` baseline (alpha.6)** — confirmed by detaching to `eb667a0` and reproducing identical numbers. NOT introduced by the sort-dedup branch.
 

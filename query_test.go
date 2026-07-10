@@ -109,6 +109,11 @@ func TestQueryCount_ArrayTwoSidedRange(t *testing.T) {
 	explain, err := coll.Find(filter).IndexHint(hint).Explain(ctx)
 	require.NoError(t, err)
 	require.Contains(t, explain.Sql, "IndexScan", "reproducer must take the index path; got: %s", explain.Sql)
+	// The index has seen arrays (multikey flag set), so the executed bounds
+	// must stay the sound half-open over-approximation — tight seeks on this
+	// index would drop doc 1 entirely.
+	require.Contains(t, explain.Sql, "inf]",
+		"a multikey index must serve wide bounds; got: %s", explain.Sql)
 
 	assertQueryCount(t, coll.Find(filter).IndexHint(hint), 3)
 
@@ -612,42 +617,47 @@ func TestQuery_Iter_FilterParseError(t *testing.T) {
 }
 
 // TestQuery_IsIDOnlyFilterNode_And_Direct tests the query.And (value
-// receiver) branch of isIDOnlyFilterNode directly, since query.ParseCondition
-// only produces And{Key{"id"}, Key{"non-id"}} pairs (all-id-children is
-// impossible from JSON due to duplicate-key rejection).
+// receiver) branch of isIDOnlyFilterNode directly. Since the exact-shapes fix an
+// And qualifies only as a transparent single-child wrapper: two pk Keys mean
+// two predicates on the pk, whose match set (an intersection) is not the
+// point set tx.Has would probe — {$and:[{id:1},{id:2}]} matches nothing yet
+// has two point bounds.
 func TestQuery_IsIDOnlyFilterNode_And_Direct(t *testing.T) {
-	// Programmatic And{Key{id}, Key{id}} — normally impossible from JSON.
-	// This hits the for-loop recursion returning true at query.go:546-548.
-	// The isIDOnlyFilterNode function only inspects the Path of each Key,
-	// so a nil Filter is acceptable.
-	f := query.And{
-		query.Key{Path: []string{"id"}},
-		query.Key{Path: []string{"id"}},
-	}
-	assert.True(t, isIDOnlyFilterNode(f, "id"),
-		"query.And{Key{id}, Key{id}} must be recognized as id-only")
+	eq := query.MustParseCondition(`{"id":"a"}`).(query.Key)
+
+	// Single-child wrapper stays id-only.
+	assert.True(t, isIDOnlyFilterNode(query.And{eq}, "id"),
+		"single-child And wrapping an Eq pk Key must be id-only")
+
+	// Two pk predicates are inexact — rejected even though both are Eq.
+	f := query.And{eq, eq}
+	assert.False(t, isIDOnlyFilterNode(f, "id"),
+		"And with two pk predicates must NOT be id-only")
 
 	// And with a non-id child → returns false.
 	fMixed := query.And{
-		query.Key{Path: []string{"id"}},
+		eq,
 		query.Key{Path: []string{"other"}},
 	}
 	assert.False(t, isIDOnlyFilterNode(fMixed, "id"),
 		"And with non-id child must NOT be id-only")
 
-	// Empty And → returns false (len(ft) > 0 check).
+	// Empty And → returns false.
 	assert.False(t, isIDOnlyFilterNode(query.And{}, "id"), "empty And is not id-only")
 }
 
 // TestQuery_IsIDOnlyFilterNode_PointerAnd verifies the *query.And pointer-arm
-// added to isIDOnlyFilterNode: query.MustParseCondition produces *query.And
-// for `{"$and": [...]}` JSON, and that filter should hit the id-only fast
-// path just like the value-receiver query.And emitted for comma-spelled
-// filters. Sister test to planner.go's filterFieldsCoveredBy pointer arm.
+// of isIDOnlyFilterNode: query.MustParseCondition produces *query.And for
+// `{"$and": [...]}` JSON. A single-child $and delegates to the value arm and
+// stays id-only; multiple pk children are rejected as inexact.
 func TestQuery_IsIDOnlyFilterNode_PointerAnd(t *testing.T) {
-	// MustParseCondition produces *query.And for $and JSON.
-	f := query.MustParseCondition(`{"$and":[{"id":"a"},{"id":"b"}]}`)
-	assert.True(t, isIDOnlyFilterNode(f, "id"), "pointer-And with id-only children should match")
+	single := query.MustParseCondition(`{"$and":[{"id":"a"}]}`)
+	assert.True(t, isIDOnlyFilterNode(single, "id"),
+		"single-child pointer-And wrapping an Eq pk Key must be id-only")
+
+	multi := query.MustParseCondition(`{"$and":[{"id":"a"},{"id":"b"}]}`)
+	assert.False(t, isIDOnlyFilterNode(multi, "id"),
+		"pointer-And with two pk predicates must NOT be id-only")
 }
 
 // TestQuery_Update_NoopModifier covers query.go:258-261 — when the modifier
@@ -1023,4 +1033,197 @@ func TestQuery_Unsatisfiable_AllOpsConsistent(t *testing.T) {
 	count, err := coll.Find(nil).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 200, count)
+}
+
+// TestQueryCount_IdFastPathExactShapesOnly: the id-only Count fast path probes tx.Has per
+// point bound and never runs the residual filter, so it may fire only when the
+// filter's match set exactly equals its bounds — a single Eq or $in predicate
+// on the pk. Every shape below over-counted before the filter-shape gate.
+func TestQueryCount_IdFastPathExactShapesOnly(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "bug12")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1}`),
+		anyenc.MustParseJson(`{"id":2}`),
+		anyenc.MustParseJson(`{"id":3}`),
+	))
+
+	countViaIter := func(t *testing.T, filter string) int {
+		it, err := coll.Find(filter).Iter(ctx)
+		require.NoError(t, err)
+		n := 0
+		for it.Next() {
+			n++
+		}
+		require.NoError(t, it.Err())
+		require.NoError(t, it.Close())
+		return n
+	}
+
+	for _, tc := range []struct {
+		filter string
+		want   int
+	}{
+		// Exactly-representable shapes: the fast path stays correct.
+		{`{"id":2}`, 1},
+		{`{"id":{"$in":[1,2,3]}}`, 3},
+		{`{"id":{"$in":[1,5]}}`, 1},
+		{`{"$and":[{"id":2}]}`, 1},
+		// Extra predicates beyond the first contributor: wrong before the gate.
+		{`{"id":{"$gt":1,"$lt":5}}`, 2},          // was 1 (Has on exclusive Start)
+		{`{"id":{"$in":[1,2,3],"$nin":[2]}}`, 2}, // was 3
+		{`{"id":{"$in":[1,2,3],"$gt":1}}`, 2},    // was 3
+		{`{"id":{"$in":[1,2,3],"$type":"string"}}`, 0}, // was 3; $type adds no bounds
+		{`{"id":{"$gt":1}}`, 2},
+		{`{"id":{"$ne":2}}`, 2},
+		// Two pk predicates via $and: two point bounds, empty match set.
+		{`{"$and":[{"id":1},{"id":2}]}`, 0},
+	} {
+		t.Run(tc.filter, func(t *testing.T) {
+			assertQueryCount(t, coll.Find(tc.filter), tc.want)
+			assert.Equal(t, tc.want, countViaIter(t, tc.filter), "Count must agree with Iter")
+		})
+	}
+}
+
+// TestQuery_ReverseMultiIntervalOrder: IndexIter must visit a multi-interval bound
+// set ($in => one point interval per value) in DESCENDING interval order when
+// scanning in reverse. Before the fix it walked intervals ascending (each
+// internally reversed), so a reverse ExactSort plan — which adds no SortIter —
+// yielded globally misordered rows, and with Limit the WRONG rows.
+func TestQuery_ReverseMultiIntervalOrder(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "bug13")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	for i := 1; i <= 9; i++ {
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d}`, i, i))))
+	}
+	hint := IndexHint{IndexName: "a", Boost: 1_000_000}
+
+	collectA := func(t *testing.T, q Query) []int {
+		it, err := q.Iter(ctx)
+		require.NoError(t, err)
+		var got []int
+		for it.Next() {
+			d, derr := it.Doc()
+			require.NoError(t, derr)
+			got = append(got, d.Value().GetInt("a"))
+		}
+		require.NoError(t, it.Err())
+		require.NoError(t, it.Close())
+		return got
+	}
+
+	// The plan must serve the sort from the index in reverse with no SortIter
+	// for the bug to be reachable; pin that with explain.
+	explain, err := coll.Find(`{"a":{"$in":[1,5,9]}}`).IndexHint(hint).Sort("-a").Explain(ctx)
+	require.NoError(t, err)
+	require.Contains(t, explain.Sql, "IndexScan(a)(reverse)", "expected a reverse index scan plan: %s", explain.Sql)
+	require.NotContains(t, explain.Sql, "Sort", "the sort must be served by the index, not a SortIter: %s", explain.Sql)
+
+	// Full descending order across intervals.
+	got := collectA(t, coll.Find(`{"a":{"$in":[1,5,9]}}`).IndexHint(hint).Sort("-a"))
+	assert.Equal(t, []int{9, 5, 1}, got, "descending order must hold ACROSS intervals")
+
+	// With Limit the cutoff must keep the HIGHEST values.
+	got = collectA(t, coll.Find(`{"a":{"$in":[1,5,9]}}`).IndexHint(hint).Sort("-a").Limit(1))
+	assert.Equal(t, []int{9}, got, "Limit(1) must return the doc with the highest a")
+
+	// Offset skips from the top; ascending order is unaffected.
+	got = collectA(t, coll.Find(`{"a":{"$in":[1,5,9]}}`).IndexHint(hint).Sort("-a").Offset(1).Limit(1))
+	assert.Equal(t, []int{5}, got, "Offset(1).Limit(1) must return the second-highest a")
+	got = collectA(t, coll.Find(`{"a":{"$in":[1,5,9]}}`).IndexHint(hint).Sort("a"))
+	assert.Equal(t, []int{1, 5, 9}, got, "ascending order must be unchanged")
+
+	// $ne carves a one-field bound set into two rays — same interval-order
+	// requirement once tight bounds land (two-sided-bounds plan), and already
+	// exercisable today via $in.
+	got = collectA(t, coll.Find(`{"a":{"$in":[2,4,6,8]}}`).IndexHint(hint).Sort("-a").Limit(2))
+	assert.Equal(t, []int{8, 6}, got, "Limit quota must carry across interval boundaries in reverse")
+}
+
+// TestQuery_ReverseMultiIntervalOrder_FullScan pins the same cross-interval
+// descending contract on the FullScanIter path (pk $in bounds), which already
+// consumed intervals from the top — parity guard for the reverse interval-order fix.
+func TestQuery_ReverseMultiIntervalOrder_FullScan(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "bug13fs")
+	require.NoError(t, err)
+	for i := 1; i <= 9; i++ {
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(fmt.Sprintf(`{"id":%d}`, i))))
+	}
+	it, err := coll.Find(`{"id":{"$in":[1,5,9]}}`).Sort("-id").Iter(ctx)
+	require.NoError(t, err)
+	var got []int
+	for it.Next() {
+		d, derr := it.Doc()
+		require.NoError(t, derr)
+		got = append(got, d.Value().GetInt("id"))
+	}
+	require.NoError(t, it.Err())
+	require.NoError(t, it.Close())
+	assert.Equal(t, []int{9, 5, 1}, got)
+}
+
+// TestQueryCount_LimitOffsetMultiKey is the known-issues I-07 regression gate:
+// Count with Limit/Offset over a multi-key index must agree with Iter. The
+// LimitIter cutoff used to apply to raw index-entry rows while doc dedup ran
+// only in the consumer loop, so limit capped entry-rows that then collapsed
+// (Limit(3).Count() = 2) and offset skipped entry-rows that were fewer
+// distinct docs (Offset(4).Count() = 8 instead of 6).
+func TestQueryCount_LimitOffsetMultiKey(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "i07")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "x", Fields: []string{"x"}}))
+	for i := 0; i < 10; i++ {
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"x":[%d,%d]}`, i, i, i+1))))
+	}
+	const filter = `{"x":{"$in":[0,1,2,3,4,5,6,7,8,9,10]}}`
+	hint := IndexHint{IndexName: "x", Boost: 1_000_000}
+
+	countViaIter := func(t *testing.T, q Query) int {
+		it, err := q.Iter(ctx)
+		require.NoError(t, err)
+		n := 0
+		for it.Next() {
+			n++
+		}
+		require.NoError(t, it.Err())
+		require.NoError(t, it.Close())
+		return n
+	}
+
+	for _, tc := range []struct {
+		name          string
+		limit, offset uint
+		want          int // hardcoded so a bug shared by Iter and Count can't hide
+	}{
+		{"limit3", 3, 0, 3},
+		{"offset4", 0, 4, 6},
+		{"limit3_offset4", 3, 4, 3},
+		{"limit20", 20, 0, 10},
+		{"offset20", 0, 20, 0},
+		{"no_cutoff", 0, 0, 10},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			q := func() Query {
+				q := coll.Find(filter).IndexHint(hint)
+				if tc.limit > 0 {
+					q = q.Limit(tc.limit)
+				}
+				if tc.offset > 0 {
+					q = q.Offset(tc.offset)
+				}
+				return q
+			}
+			require.Equal(t, tc.want, countViaIter(t, q()), "Iter ground truth")
+			assertQueryCount(t, q(), tc.want)
+		})
+	}
 }

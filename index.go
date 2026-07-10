@@ -352,6 +352,7 @@ type index struct {
 	fullKeyBuf  anyenc.Tuple // reusable buffer for full keys (key+docId)
 	seekBuf     anyenc.Tuple // reusable buffer for unique constraint seek results
 	uniqSeekBuf anyenc.Tuple // reusable buffer for the padded unique-probe seek key
+	mkBuf       []byte       // reusable buffer for the multikey-flag check-and-put read
 }
 
 // loadPubSketch returns the published reader snapshot. Lock-free; the returned
@@ -440,6 +441,12 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 	entryValue := qplanner.IndexValueScalar
 	if len(idx.keysBuf) > 1 {
 		entryValue = qplanner.IndexValueMultiKey
+		// This doc fans out (non-empty array at an indexed field): persist
+		// the sticky index-level multikey flag in this same tx, so any
+		// snapshot that can see these entries sees the flag.
+		if err := idx.markMultiKey(tx); err != nil {
+			return err
+		}
 	}
 
 	prevKi := -1
@@ -489,6 +496,40 @@ func (idx *index) insertKeys(tx *btree.WriteTx, it item) error {
 
 // deleteKeys deletes index entries for the given item from the index namespace.
 // Both unique and non-unique indexes use key=Tuple(fields..., docId), value=nil.
+// markMultiKey persists the sticky one-way index-level multikey flag in the
+// SAME write tx that commits this doc's fan-out entries: any snapshot that can
+// see the entries sees the flag, which is what lets plan-time tight-bounds
+// gating read it from the query's own read tx with no coherence protocol.
+//
+// Check-and-put against the tx's own view — deliberately NO in-memory latch:
+// a commit-time latch goes stale under savepoint partial rollback (the nested
+// tx's record write reverts while the outer tx commits) and under peer
+// drop+recreate with live-object reuse, silently leaving a scalar record over
+// committed fan-out entries. The record itself rolls back with the entries,
+// which is exactly the consistent outcome. deleteKeys never clears the flag
+// (older snapshots may still hold fanned-out entries); drop+recreate resets.
+func (idx *index) markMultiKey(tx *btree.WriteTx) error {
+	key := multikeyKey(idx.ns.Name())
+	var err error
+	idx.mkBuf, err = tx.AppendValue(idx.c.db.systemNS, key, idx.mkBuf[:0])
+	if err == nil && len(idx.mkBuf) == 1 && idx.mkBuf[0] == mkValMultiKey[0] {
+		return nil // already flagged in this tx's view
+	}
+	return tx.Put(idx.c.db.systemNS, key, mkValMultiKey)
+}
+
+// isScalarProven reports whether this index provably contains no fan-out
+// (multi-key) entries IN THE GIVEN SNAPSHOT: an explicit scalar-so-far marker
+// written at index creation and never flipped by a fan-out write. An absent
+// record (index built before the flag existed) or a multikey value means
+// "assume fan-out" — tight seek bounds must not be used. The flag travels in
+// the same tx as the entries (markMultiKey), so reading it through the query's
+// read tx is exact for that snapshot, including across processes.
+func (idx *index) isScalarProven(tx *btree.ReadTx) bool {
+	v, err := tx.Get(idx.c.db.systemNS, multikeyKey(idx.ns.Name()))
+	return err == nil && len(v) == 1 && v[0] == mkValScalar[0]
+}
+
 func (idx *index) deleteKeys(tx *btree.WriteTx, it item) error {
 	idx.fillKeysBuf(it)
 	idKey := idx.c.appendId(nil, it.Value())

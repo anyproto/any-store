@@ -369,6 +369,11 @@ func (e And) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 // separately: indexCoversFilter rejects a covered field carrying more than one
 // predicate, so the fast path is only taken when bounds exactly equal the
 // matches (a single In/Eq/range per field). See docs/known-issues.md (I-04).
+//
+// Consumers that can prove fan-out entries are absent (pk namespace, indexes
+// with a scalar-proven multikey flag) — or that only ESTIMATE — get the
+// intersected variant from TightIndexBounds (query/tight_bounds.go); this
+// method's contract stays over-approximating regardless.
 func (e And) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	for _, f := range e {
 		if bounds = f.IndexBounds(fieldName, bs); len(bounds) != len(bs) {

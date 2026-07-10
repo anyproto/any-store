@@ -258,6 +258,25 @@ type CBOIndex struct {
 	// or an equality lookup that uses the sketch instead) — the estimators then
 	// fall back to DefaultRangeSelectivity. Planner-internal; not set by callers.
 	rangeSel float64
+
+	// EstBounds is the tight-channel tuple bounds (ComputeIndexBoundsTight),
+	// set only when they differ from Bounds. DOC-SELECTIVITY ESTIMATION ONLY:
+	// rangeSelTight ranks them so a two-sided range's match fraction is rated
+	// (lo,hi) instead of (lo,+inf). Seeks — and the SCAN-COST estimate, which
+	// must price the entries the chain actually visits — keep Bounds unless
+	// the index is proven fan-out-free (then Bounds IS tight and EstBounds is
+	// nil). Built through the same reverse-flag transform as Bounds, so
+	// RangeFraction ranks them in stored-key space.
+	EstBounds query.Bounds
+
+	// rangeSelTight is the interpolated fraction of EstBounds (== rangeSel
+	// when EstBounds is nil). It feeds calculateSelectivity's per-field match
+	// fraction (how many DOCS match — tight is sound and more accurate there)
+	// but never the seek/scan cost terms, which are priced from the bounds
+	// the chain executes with (rangeSel over Bounds): costing tight while
+	// seeking wide undercharges the seek and picks index scans that still
+	// walk half the index. Planner-internal.
+	rangeSelTight float64
 }
 
 // BuildPlan constructs an iterator chain using the Cost-Based Optimizer.
@@ -279,6 +298,40 @@ func BuildPlan(params *PlanParams) *Plan {
 	totalDocs := float64(params.TotalDocs)
 	if totalDocs < 1 {
 		totalDocs = 1
+	}
+
+	// Range selectivity via B-tree page interpolation. A range predicate
+	// ($gt/$lt/$ne/...) has no point estimate — the hash sketch is unordered — so
+	// for each non-equality index we interpolate the fraction of index entries its
+	// bounds cover directly from the live index B-tree (one descent per endpoint).
+	// This is what lets a selective range on a dense index beat a full scan; for a
+	// sparse index it composes with the EntryCount bound as e = rangeSel·EntryCount.
+	// Runs BEFORE calculateSelectivity so pTotal's range terms can adopt the
+	// interpolated fraction. Interpolation ranks the tight-channel bounds
+	// (estBounds) so a two-sided range is rated (lo,hi), not (lo,+inf).
+	if params.Tx != nil {
+		for i := range params.Indexes {
+			idx := &params.Indexes[i]
+			if idx.PointLookup || idx.Ns == nil || len(idx.Bounds) == 0 {
+				continue
+			}
+			// Interpolation counts index ENTRIES. For a multikey/array index an
+			// entry-fraction no longer maps to a document-fraction (one document
+			// fans out to many entries, and dedup collapses them), so the estimate
+			// would be biased; fall back to the EntryCount-bounded default there.
+			// Entries == documents (no fan-out) is exactly EntryCount(0) <= totalDocs.
+			if idx.Sketch != nil && idx.Sketch.EntryCount(0) > uint64(params.TotalDocs) {
+				continue
+			}
+			// rangeSel prices the SCAN (the bounds the chain seeks with);
+			// rangeSelTight rates the MATCH fraction (tight channel). They
+			// differ only for unproven indexes carrying EstBounds.
+			idx.rangeSel = interpolateRangeSel(params.Tx, idx, idx.Bounds)
+			idx.rangeSelTight = idx.rangeSel
+			if idx.EstBounds != nil {
+				idx.rangeSelTight = interpolateRangeSel(params.Tx, idx, idx.EstBounds)
+			}
+		}
 	}
 
 	// Calculate combined selectivity for all filter predicates
@@ -376,30 +429,6 @@ func BuildPlan(params *PlanParams) *Plan {
 	var fieldSelectivity []fieldSelEntry
 	if nFieldSel > 0 {
 		fieldSelectivity = fieldSelBuf[:nFieldSel]
-	}
-
-	// Range selectivity via B-tree page interpolation. A range predicate
-	// ($gt/$lt/$ne/...) has no point estimate — the hash sketch is unordered — so
-	// for each non-equality index we interpolate the fraction of index entries its
-	// bounds cover directly from the live index B-tree (one descent per endpoint).
-	// This is what lets a selective range on a dense index beat a full scan; for a
-	// sparse index it composes with the EntryCount bound as e = rangeSel·EntryCount.
-	if params.Tx != nil {
-		for i := range params.Indexes {
-			idx := &params.Indexes[i]
-			if idx.PointLookup || idx.Ns == nil || len(idx.Bounds) == 0 {
-				continue
-			}
-			// Interpolation counts index ENTRIES. For a multikey/array index an
-			// entry-fraction no longer maps to a document-fraction (one document
-			// fans out to many entries, and dedup collapses them), so the estimate
-			// would be biased; fall back to the EntryCount-bounded default there.
-			// Entries == documents (no fan-out) is exactly EntryCount(0) <= totalDocs.
-			if idx.Sketch != nil && idx.Sketch.EntryCount(0) > uint64(params.TotalDocs) {
-				continue
-			}
-			idx.rangeSel = interpolateRangeSel(params.Tx, idx)
-		}
 	}
 
 	// ---- Plan B: Index Seek (Filtering Priority) ----
@@ -854,8 +883,25 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 				// Use a more selective estimate than default range
 				pTotal *= DefaultRangeSelectivity
 			} else {
-				// Range predicate: use default selectivity
-				pTotal *= DefaultRangeSelectivity
+				// Range predicate: prefer the interpolated fraction of THIS
+				// field's own bound chain (BoundFields==1 means the chain is
+				// exactly this leading field) over the flat default — this is
+				// what moves a two-sided range from 0.50 to its real ~0.005
+				// Same one-way ratchet as selectivityForIndex, same
+				// entries→docs conversion via the index population; the
+				// interpolation loop already skipped multikey indexes, whose
+				// entry fractions don't map to doc fractions.
+				p := DefaultRangeSelectivity
+				if fi == 0 && idx.BoundFields == 1 && idx.rangeSelTight > 0 && idx.rangeSelTight < p {
+					p = idx.rangeSelTight * indexPopulation(idx, totalDocs) / totalDocs
+					if p <= 0 {
+						p = 0.0001
+					}
+					if p > 1 {
+						p = 1
+					}
+				}
+				pTotal *= p
 			}
 		}
 	}
@@ -925,11 +971,11 @@ func indexPopulation(idx *CBOIndex, totalDocs float64) float64 {
 // bounds of a $ne are a two-piece union ((-inf,v) ∪ (v,+inf)), so the per-bound
 // fractions are summed. Returns 0 (→ caller falls back to DefaultRangeSelectivity)
 // on any read error, leaving the planner's degraded behavior unchanged.
-func interpolateRangeSel(tx *btree.ReadTx, idx *CBOIndex) float64 {
+func interpolateRangeSel(tx *btree.ReadTx, idx *CBOIndex, bounds query.Bounds) float64 {
 	cur := tx.NewCursor(idx.Ns)
 	defer cur.Close()
 	var f float64
-	for _, b := range idx.Bounds {
+	for _, b := range bounds {
 		bf, err := cur.RangeFraction(b.Start, b.End)
 		if err != nil {
 			return 0
@@ -1238,7 +1284,16 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	// Index verification for count queries: instead of fetching documents to
 	// check uncovered filter fields, verify each docId against single-field
 	// indexes for those fields. This avoids expensive document fetches.
-	if params.CountOnly && idx.PointLookup && params.FieldBounds != nil {
+	//
+	// Like the covering fast path above, this skips the residual FilterIter,
+	// so the candidate's bounded fields must be EXACTLY represented by their
+	// bounds: a field carrying more than one predicate can be PointLookup via
+	// the tight channel ({$gte:5,$lte:5,$nin:[5]} collapses to [5,5]) while a
+	// bound-LESS conjunct ($nin, $type, $not) still needs the filter — without
+	// this gate that conjunct silently vanishes and Count over-counts vs Iter.
+	// Mirrors indexCoversFilter condition 2.
+	if params.CountOnly && idx.PointLookup && params.FieldBounds != nil &&
+		boundedFieldsSinglePredicate(idx, params.Filter) {
 		if verifyRoot := buildVerifyChain(params, idx, root); verifyRoot != nil {
 			return verifyRoot
 		}
@@ -1511,6 +1566,23 @@ func indexCoversFilter(idx *CBOIndex, filter query.Filter) bool {
 	return true
 }
 
+// boundedFieldsSinglePredicate reports whether every field of idx's contiguous
+// bound prefix carries at most one predicate in filter — the condition under
+// which the bounds exactly represent those fields' constraints and a
+// FilterIter-skipping count path (covering count, verify chain) is sound.
+func boundedFieldsSinglePredicate(idx *CBOIndex, filter query.Filter) bool {
+	boundedFields := idx.Info.FieldNames
+	if idx.BoundFields < len(boundedFields) {
+		boundedFields = boundedFields[:idx.BoundFields]
+	}
+	for _, field := range boundedFields {
+		if countFilterFieldPreds(filter, field) > 1 {
+			return false
+		}
+	}
+	return true
+}
+
 // countFilterFieldPreds returns how many leaf predicates in f constrain the
 // given field path. A field bound by more than one predicate — two same-field
 // conjuncts ({a:{$in:[1,2]},$and:[{a:{$gte:5}}]}) or an inline multi-op
@@ -1699,11 +1771,23 @@ func isAllFilter(f query.Filter) bool {
 
 // BoundsResult stores IndexBounds results for all unique fields, computed once per query.
 // All bounds live in one slice; FieldBounds entries point into it by index.
+//
+// Two channels per field: the WIDE bounds from IndexBounds (the
+// sound over-approximation every seek may use) and the TIGHT bounds from
+// query.TightIndexBounds (same-field conjuncts intersected — safe for cost
+// estimation always, and for seeks only under a fan-out-free proof). For most
+// filters the channels are identical and the tight storage stays empty.
 type BoundsResult struct {
-	Bounds    []query.Bound // flat slice of all bounds across all fields
-	Fields    []FieldBounds // per-field metadata pointing into Bounds
-	boundsBuf [8]query.Bound
-	fieldsBuf [8]FieldBounds
+	Bounds      []query.Bound // flat slice of all WIDE bounds across all fields
+	TightBounds []query.Bound // flat slice of tight bounds for fields where they differ
+	Fields      []FieldBounds // per-field metadata pointing into Bounds
+	// tightFields carries the tight-channel spans, indexed by
+	// FieldBounds.TightIdx. Kept out of FieldBounds so the common no-tighten
+	// query pays zero struct growth (BoundsResult escapes per query and
+	// fieldsBuf is inline — every FieldBounds byte is multiplied by 8).
+	tightFields []tightFieldBounds
+	boundsBuf   [8]query.Bound
+	fieldsBuf   [8]FieldBounds
 }
 
 // FieldBounds holds pre-computed bounds for a single filter field.
@@ -1712,12 +1796,32 @@ type FieldBounds struct {
 	Start int  // start index into BoundsResult.Bounds
 	Count int  // number of bounds for this field
 	Fixed bool // all bounds are equality (Start == End)
+
+	// TightIdx indexes BoundsResult.tightFields, or -1 when the tight channel
+	// is identical to the wide one for this field (also when the tight
+	// intersection came out empty: emptiness must NOT be treated as a
+	// narrowing by estimation — it is not unsatisfiability under array
+	// semantics; the pk-only unsat decision is made at the query layer).
+	// int8 packs into Fixed's padding, keeping the struct at its pre-tight
+	// size.
+	TightIdx int8
+}
+
+// tightFieldBounds is a tight-channel span into BoundsResult.TightBounds.
+type tightFieldBounds struct {
+	Start int
+	Count int
+	Fixed bool
 }
 
 // Build computes bounds for all unique fields across the given indexes.
 func (br *BoundsResult) Build(indexInfos []*IndexInfo, filter query.Filter) {
 	br.Bounds = br.boundsBuf[:0]
+	br.TightBounds = nil
+	br.tightFields = nil
 	br.Fields = br.fieldsBuf[:0]
+	// Single-predicate filters can't tighten; skip the per-field tight walk.
+	mayTighten := query.MayTighten(filter)
 	for _, info := range indexInfos {
 		for _, field := range info.FieldNames {
 			// Check if already computed
@@ -1735,30 +1839,68 @@ func (br *BoundsResult) Build(indexInfos []*IndexInfo, filter query.Filter) {
 			bs := filter.IndexBounds(field, nil)
 			br.Bounds = append(br.Bounds, bs...)
 			count := len(bs)
-			allFixed := true
-			for _, b := range br.Bounds[start:] {
-				if len(b.Start) == 0 || !bytes.Equal(b.Start, b.End) {
-					allFixed = false
-					break
+
+			fb := FieldBounds{
+				Field:    field,
+				Start:    start,
+				Count:    count,
+				Fixed:    allBoundsFixedNonEmpty(br.Bounds[start:]),
+				TightIdx: -1,
+			}
+			// countFilterFieldPreds is a zero-alloc pre-check: tight bounds
+			// can only differ from wide when THIS field carries more than
+			// one predicate — MayTighten alone also fires for multi-FIELD
+			// conjunctions ({a:1,b:2}), which would pay an allocating walk
+			// per field for an always-equal result.
+			if mayTighten && count > 0 && len(br.tightFields) < 127 &&
+				countFilterFieldPreds(filter, field) > 1 {
+				tight, tEmpty := query.TightIndexBounds(filter, field)
+				if !tEmpty && !boundsEqual(tight, bs) {
+					fb.TightIdx = int8(len(br.tightFields))
+					br.tightFields = append(br.tightFields, tightFieldBounds{
+						Start: len(br.TightBounds),
+						Count: len(tight),
+						Fixed: allBoundsFixedNonEmpty(tight),
+					})
+					br.TightBounds = append(br.TightBounds, tight...)
 				}
 			}
-			// A field with zero bounds has no equality constraint and must not
-			// be reported as "fixed" (see AllFixed's godoc). Without this guard
-			// the loop above is skipped and allFixed stays true.
-			if count == 0 {
-				allFixed = false
-			}
-			br.Fields = append(br.Fields, FieldBounds{
-				Field: field,
-				Start: start,
-				Count: count,
-				Fixed: allFixed,
-			})
+			br.Fields = append(br.Fields, fb)
 		}
 	}
 }
 
-// Lookup returns the bounds for a field name.
+// allBoundsFixedNonEmpty reports whether bs is non-empty and every bound is an
+// equality point (Start == End). A field with zero bounds has no equality
+// constraint and must not be reported as "fixed" (see AllFixed's godoc).
+func allBoundsFixedNonEmpty(bs []query.Bound) bool {
+	if len(bs) == 0 {
+		return false
+	}
+	for _, b := range bs {
+		if len(b.Start) == 0 || !bytes.Equal(b.Start, b.End) {
+			return false
+		}
+	}
+	return true
+}
+
+// boundsEqual reports whether two bound sets are identical (count, endpoint
+// bytes, inclusivity) — the "tight ≠ wide" test gating tight-channel work.
+func boundsEqual(a, b query.Bounds) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].StartInclude != b[i].StartInclude || a[i].EndInclude != b[i].EndInclude ||
+			!bytes.Equal(a[i].Start, b[i].Start) || !bytes.Equal(a[i].End, b[i].End) {
+			return false
+		}
+	}
+	return true
+}
+
+// Lookup returns the WIDE bounds for a field name.
 func (br *BoundsResult) Lookup(field string) (bounds query.Bounds, fixed bool, found bool) {
 	for i := range br.Fields {
 		if br.Fields[i].Field == field {
@@ -1767,6 +1909,44 @@ func (br *BoundsResult) Lookup(field string) (bounds query.Bounds, fixed bool, f
 		}
 	}
 	return nil, false, false
+}
+
+// LookupTight returns the TIGHT bounds for a field name, falling back to the
+// wide bounds when the channels are identical. Callers own the soundness
+// argument: estimation may always use these; seeks may not without a
+// fan-out-free proof (see query.TightIndexBounds).
+func (br *BoundsResult) LookupTight(field string) (bounds query.Bounds, fixed bool, found bool) {
+	for i := range br.Fields {
+		if br.Fields[i].Field == field {
+			ti := br.Fields[i].TightIdx
+			if ti < 0 {
+				s := br.Fields[i].Start
+				return br.Bounds[s : s+br.Fields[i].Count], br.Fields[i].Fixed, true
+			}
+			tf := br.tightFields[ti]
+			return br.TightBounds[tf.Start : tf.Start+tf.Count], tf.Fixed, true
+		}
+	}
+	return nil, false, false
+}
+
+// TightDiffers reports whether the tight channel differs from the wide one
+// for any of the given fields.
+func (br *BoundsResult) TightDiffers(fields []string) bool {
+	if len(br.tightFields) == 0 {
+		return false
+	}
+	for _, field := range fields {
+		for i := range br.Fields {
+			if br.Fields[i].Field == field {
+				if br.Fields[i].TightIdx >= 0 {
+					return true
+				}
+				break
+			}
+		}
+	}
+	return false
 }
 
 // FieldCount returns the number of unique filter fields.
@@ -1887,8 +2067,20 @@ func padReverseBounds(bs query.Bounds) query.Bounds {
 }
 
 // ComputeIndexBounds computes combined tuple bounds for an index
-// using pre-computed per-field bounds from BoundsResult.
+// using pre-computed per-field WIDE bounds from BoundsResult.
 func ComputeIndexBounds(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
+	return computeIndexBounds(idx, br.Lookup)
+}
+
+// ComputeIndexBoundsTight is the tight-channel variant, built from
+// BoundsResult.LookupTight. Its result is for cost ESTIMATION only (CBOIndex
+// EstBounds): feeding it to a seek requires the fan-out-free proof documented
+// on query.TightIndexBounds.
+func ComputeIndexBoundsTight(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
+	return computeIndexBounds(idx, br.LookupTight)
+}
+
+func computeIndexBounds(idx *IndexInfo, lookup func(string) (query.Bounds, bool, bool)) (query.Bounds, int) {
 	type fieldBound struct {
 		bounds query.Bounds
 		fixed  bool
@@ -1897,7 +2089,7 @@ func ComputeIndexBounds(idx *IndexInfo, br *BoundsResult) (query.Bounds, int) {
 	var chainBuf [4]fieldBound // stack-allocated for typical compound indexes
 	chain := chainBuf[:0]
 	for _, field := range idx.FieldNames {
-		fb, fixed, found := br.Lookup(field)
+		fb, fixed, found := lookup(field)
 		if !found || len(fb) == 0 {
 			break
 		}
