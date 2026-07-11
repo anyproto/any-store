@@ -498,33 +498,29 @@ commit). Alternatively spill dirty pages to the destination WAL as it goes.
 **Workaround (any-sync node):** none needed at current space sizes; keep backups serialized and mind RAM headroom for
 multi-GB spaces until fixed.
 
-**Status: NEEDS RE-MEASUREMENT — the claimed mechanism is contradicted by the code (verified 2026-07-11).** The pager
-implements SQLite-style cache spill (`pagerStress`, pager.go:2238, wired as the writer cache's `xStress`): when the writer
-cache hits `CacheSize` (default 5000 pages ≈ 20MB), unpinned dirty pages are written to the WAL as non-commit frames and
-evicted. Backup releases every destination page right after copying it (`defer releasePage`, backup.go:136), so copied pages
-ARE spill victims — destination writer-cache RAM is bounded to ~CacheSize, and "spill to the destination WAL as it goes" is
-literally the existing behavior. What the single long tx really causes: the dst WAL is never checkpointed until Finish, so it
-grows to ≈ full DB size ON DISK (temporary disk doubling), not RAM. The measured ~700MB VmHWM therefore needs re-attribution
-before any fix — prime suspects: source mmap if the node config sets `Config.MmapSize > 0` (backup faults the whole source
-mapping into RSS; mmap is off by default), Go heap high-water from allocation churn, and the dst WAL page-index map
-(~10-15MB at 491MB). Action: heap-profile a backup run + check the production `MmapSize`. If the disk doubling matters,
-the fix is periodic intra-backup commits done as temp-path + atomic rename (the "mark invalid until Finish" idea is
-over-engineered — `db.Backup` already writes a fresh file and removes it on error; a crash-abandoned partial file is the
-thing to protect against, and rename-on-success handles it).
+**Status: ROOT-CAUSED, fix validated (2026-07-11) — the original mechanism was RIGHT and the first review refutation was WRONG.** The pager does implement cache spill (`pagerStress`), and backup pages are unpinned and eligible — but the spill is **permanently wedged on page 1**: backup copies page 1 first and releases it, making it the oldest unpinned dirty page; `findSpillVictim` (pcache.go) walks from `dirtyTail` and returns page 1 every time; `pagerStress` refuses `pgno == 1` by returning nil WITHOUT cleaning it, and `pcache.create` never retries another victim. Instrumented counters over one backup of a 467MB store: 108,975 spill attempts, 108,975 hit the page-1 guard, 0 frames spilled, all 113,974 dst pages accumulate dirty. Measured: VmHWM +608-645MB (heap profile: 95%+ `allocPageBuffer` via `Backup.onePage`), independent of CacheSize (the limit is unenforceable) and of MmapSize (production configs set none — the mmap theory is dead). This is the exact hazard named in `docs/btree/NOTES.md#old-drift-pagerstress-page1-exclusion`: C relies on page 1 staying pinned; backup breaks that invariant.
+
+**Fix (validated in a scratch copy):** skip page 1 in `findSpillVictim` (`p.pinCount == 0 && p.pgno != 1`) — one line. Result: VmHWM delta 612MB -> 84MB, writer cache bounded at exactly CacheSize (RSS now scales with it: 85MB @ 5000 pages, 315MB @ 20000), all spills write WAL frames, wall time 0.59s -> 0.49s. Also unwedges the same latent stall for any large write tx that dirties+releases page 1 early. Ship with a regression test bounding `writerCache.nPage` during a >CacheSize backup and an update to the page1-exclusion drift note.
+
+**Disk doubling: VERIFIED, accept-as-designed.** The dst WAL peaks at ~= full DB size (truncated by Finish's checkpoint); on current HEAD it is written in one burst at Finish, with spill fixed it grows gradually to the same peak. Single-tx WAL backup doubles transient disk in SQLite too; no fix needed.
 
 ---
 
-## I-16: `Rename` never re-keys `db.openedCollections` — old-name key and live handle diverge
+## I-16: `Rename` is half-implemented — stale map key is only the surface; renamed collections become unopenable
 
-**Discovered:** 2026-07-11, during the adversarial review of the I-11 fix (pre-existing; NOT introduced by the DDL undo log).
+**Discovered:** 2026-07-11 (map-key symptom during the I-11 fix review); full scope established by a dedicated investigation the same day (empirical, incl. a two-process repro).
 
-**Affected code:**
-- `collection.go` `Rename` — updates `c.name` (and the on-disk catalog via `renameCollection`) but never moves the `db.openedCollections` map entry, which stays keyed by the old name.
-- `db.go` `onCollectionClose` — deletes by `c.name` (the NEW name), missing the entry keyed by the old one.
+**Corrected failure mode (the original "second handle" claim was wrong — reality is worse):** `Rename(A→B)` rewrites the four system-namespace key families (`coll:`, `collcfg:`, `idx:`, `stat_data:`) and updates `c.name`, but (a) never re-keys `db.openedCollections` (entry stays under "A") and (b) never renames any btree namespace — the data namespace is still "A", index namespaces still `ix:A:*`, and `collection.init` resolves the data namespace BY NAME. Observed through the public API:
 
-**Failure mode:**
-Open "A" (map key "A"), `Rename(A→B)`: the handle now answers to `c.name = "B"` but is registered under "A". `OpenCollection("B")` misses the map and opens a SECOND handle for the same namespace — two live handles with independent in-memory index sets and sketches for one collection. Worse combined sequence: Rename A→B then `Drop` in one rolled-back tx — Drop's `onCollectionClose` deletes key "B" (absent), leaving a closed handle permanently registered under "A"; the rename undo restores `c.name = "A"`, so `OpenCollection("A")` afterwards returns a closed handle for a collection that still exists on disk.
+- `OpenCollection("B")` fails with a leaked `btree: namespace not found` (not `ErrCollectionNotFound`); after the cached handle is evicted or the DB reopens, the renamed collection is **permanently unopenable** — bricked durable state.
+- `OpenCollection("A")` returns the renamed handle under the wrong name; `CreateCollection("A")` is blocked by the stale map key even though the catalog freed the name.
+- `Rename` onto an existing collection name silently **overwrites its catalog entry** (blind `tx.Put(collKey(newName))`, no existence check).
+- **Cross-process (two-OS-process repro):** a peer holding "A" open sees the schema-cookie bump, reconciles under its stale name, finds no `idx:A:*` metadata, and publishes an EMPTY index set — its subsequent writes commit **unindexed** (verified raw: doc in ns "A" with no entry in `ix:A:a`). Durable index corruption, invisible to all processes.
+- `Drop` after rename deletes the "B"-derived namespaces (tolerating NotFound) and orphans the real "A" data + pre-rename index namespaces forever.
+- Post-rename index DDL splits worlds: metadata registers `idx:B:x` while pre-rename entries live in `ix:A:*`; the vector index even derives its HNSW seed from `c.name`.
 
-**Impact: CORRECTNESS (two-handle divergence: writes through one handle don't maintain indexes the other created), narrow trigger** (Rename is rare in practice).
+**Impact: CORRECTNESS (bricked collection, durable unindexed writes, silent catalog overwrite).** Trigger is any Rename use at all — not just the rollback corner the entry originally described.
 
-**Fix sketch:** re-key `openedCollections` inside `Rename` (delete old key, insert new, both under `db.mu`) with a matching rollback undo (`onRollbackUndo`) restoring the old key; make `onCollectionClose` tolerate either key or take the key as a parameter.
+**Fix plan (from the investigation):**
+- *Phase 1 (~half a day):* re-key `openedCollections` inside `Rename` under `c.mu`→`db.mu` with a single combined rollback undo (restore key + name by value; the `cur == c` guard makes the Rename→Drop-rollback zombie heal itself); guarded identity-delete in `onCollectionClose`; reject rename onto an existing name (`ErrCollectionExists`) and same-name no-op. Fixes the map-level symptoms while any handle stays cached.
+- *Phase 2 (~2-4 days):* the real fix — btree `RenameNamespace` (master-table re-key, root page unchanged; the ALTER TABLE RENAME analog, keeping sqlitec alignment), then `renameCollection` sweeps data + `ix:` + fts + vector namespaces AND `multikey:` keys; rename detection in peers' `checkStale` (collKey vanished → adopt new name or invalidate, SQLite re-prepare style); Rename input validation. Until Phase 2, Rename cannot be made safe — consider documenting it as broken/deprecated in the interim.
