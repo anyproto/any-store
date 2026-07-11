@@ -820,9 +820,19 @@ func (pc *pcache) returnPageBuffer(p *page) {
 // pages are pinned. Walks backward from dirtyTail for O(1) typical case
 // (the oldest dirty page is usually unpinned).
 // Matches SQLite pcache.c:463-469 (pDirtyTail search direction).
+//
+// Page 1 is never a victim: pagerStress refuses it WITHOUT cleaning it (see
+// the page1-exclusion drift note), so returning it here wedges the spill
+// permanently — every subsequent call selects the same page 1 and nothing
+// ever spills. Backup hits exactly this: it copies page 1 first and releases
+// it, making it the oldest unpinned dirty page, after which the whole
+// destination accumulated dirty in memory (peak RSS ~ database size; see
+// docs/known-issues.md I-15). SQLite has no such guard because its page 1
+// stays pinned for the life of the tx — the same invariant break that
+// motivates pagerStress's explicit page-1 check.
 func (pc *pcache) findSpillVictim() *page {
 	for p := pc.dirtyTail; p != nil; p = p.prev {
-		if p.pinCount == 0 {
+		if p.pinCount == 0 && p.pgno != 1 {
 			return p
 		}
 	}

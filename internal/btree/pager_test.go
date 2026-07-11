@@ -8735,13 +8735,19 @@ func TestPagerStress_Page1NeverSpilled_RegressionPin(t *testing.T) {
 		moveAhead(d.pgno)
 	}
 
-	// Precondition (the load-bearing one): the writer cache's REAL victim search
-	// selects page 1. This proves the scenario is genuinely reachable — without
-	// the pgno==1 guard, page 1 would be spilled here.
+	// First layer: the victim search itself must never select page 1, even
+	// when it is the oldest unpinned dirty page. pagerStress refuses page 1
+	// WITHOUT cleaning it, so a search that returned it would wedge the spill
+	// permanently on page 1 (nothing ever spills — the backup high-water-mark
+	// failure, see docs/known-issues.md I-15 and the page1-exclusion drift
+	// note). It must skip past page 1 to a later victim, or find none.
+	require.Equal(t, uint32(1), p.writerCache.dirtyTail.pgno,
+		"scenario setup: page 1 must be the oldest dirty page")
 	victim := p.writerCache.findSpillVictim()
-	require.NotNil(t, victim, "there must be an unpinned dirty victim")
-	require.Equal(t, uint32(1), victim.pgno,
-		"page 1 must be the oldest unpinned dirty page (the spill victim)")
+	if victim != nil {
+		require.NotEqual(t, uint32(1), victim.pgno,
+			"findSpillVictim must never select page 1")
+	}
 
 	// Capture observable state, then drive the REAL pagerStress on page 1.
 	walFramesBefore := p.wal.index.maxFrame.Load()
@@ -8762,7 +8768,7 @@ func TestPagerStress_Page1NeverSpilled_RegressionPin(t *testing.T) {
 		"pagerStress(page1) must NOT makeClean page 1 (it must stay dirty)")
 	assert.Equal(t, dirtyBefore, p.writerCache.nDirty,
 		"pagerStress(page1) must not change the dirty count")
-	assert.Same(t, pg1, p.writerCache.findSpillVictim(),
+	assert.Same(t, pg1, p.writerCache.dirtyTail,
 		"page 1 must STILL be sitting at the dirty tail (not spilled away)")
 }
 

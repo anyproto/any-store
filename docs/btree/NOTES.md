@@ -1222,12 +1222,19 @@ comments in source):
    next `BeginWrite`.
 
 <a id="old-drift-pagerstress-page1-exclusion"></a>
-2. **Page-1 explicit exclusion** (`pager.go:pagerStress`) — **Severity:** low.
+2. **Page-1 explicit exclusion** (`pager.go:pagerStress` AND
+   `pcache.go:findSpillVictim`) — **Severity:** low.
    SQLite does not check
    `pgno==1` in `pagerStress()`. Page 1 is structurally protected: it stays pinned
    (referenced) throughout the transaction, so pcache never selects it as a spill
    victim. We add an explicit guard because page 1 may become unpinned between
-   b-tree operations.
+   b-tree operations. The guard must exist in BOTH places: `pagerStress` refuses
+   page 1 WITHOUT cleaning it, so if `findSpillVictim` could still return it the
+   spill wedged permanently — every attempt selected page 1, nothing ever
+   spilled, and backup (which copies and releases page 1 first) accumulated the
+   entire destination dirty in memory (peak RSS ≈ database size). Fixed by
+   skipping page 1 in the victim search too; regression:
+   `TestBackupWriterCacheBounded`.
 
 <a id="old-drift-pcache-create-drops-xstress-error"></a>
 3. **`pcache.create()` drops xStress error** (`pcache.go:304`) — **Severity:** low.
