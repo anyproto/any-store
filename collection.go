@@ -158,6 +158,13 @@ type collection struct {
 
 	compression Compression // 0 = use db default
 
+	// catalogID is the coll: record value captured at init — the collection's
+	// identity token, compared by the staleness pass to detect that a peer
+	// dropped/renamed this collection and a different one now answers for the
+	// name. Set once in init (under c.mu), never mutated after (a rename moves
+	// the token with the collection).
+	catalogID []byte
+
 	// primaryKey is the document field whose value is the btree key. Resolved
 	// once in init (default "id") and never mutated after, so the data and query
 	// paths read it lock-free.
@@ -244,6 +251,19 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 	// read tx would see only committed state and miss it (read-your-writes,
 	// matching SQLite where a write tx's reads go through the shared page cache).
 	load := func(tx *btree.ReadTx) (err error) {
+		// Cache the catalog identity token (the coll: record value) — the
+		// staleness pass compares it to detect that a peer replaced this
+		// collection with a same-named one (see collectionVanished). The key
+		// can be legitimately absent here: openCollection's existence check
+		// ran in an earlier snapshot, and a peer may have dropped/renamed the
+		// collection in between — surface the public error, not the raw
+		// btree one, so open-or-create callers take their create path.
+		if c.catalogID, err = tx.AppendValue(c.db.systemNS, collKey(c.name), nil); err != nil {
+			if errors.Is(err, btree.ErrKeyNotFound) {
+				return ErrCollectionNotFound
+			}
+			return err
+		}
 		// Load per-collection config
 		cfg, err := c.db.loadCollConfig(tx, c.name)
 		if err != nil {
@@ -387,6 +407,9 @@ func (c *collection) FindId(ctx context.Context, docId any) (doc Doc, err error)
 }
 
 func (c *collection) FindIdWithParser(ctx context.Context, p *anyenc.Parser, docId any) (doc Doc, err error) {
+	if err = c.alive(); err != nil {
+		return
+	}
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
@@ -416,6 +439,9 @@ func (c *collection) FindIdWithParser(ctx context.Context, p *anyenc.Parser, doc
 	}
 
 	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) (err error) {
+		if err = c.alive(); err != nil {
+			return err
+		}
 		buf.DocBuf, err = tx.AppendValue(c.ns, buf.SmallBuf, buf.DocBuf[:0])
 		if err != nil {
 			if errors.Is(err, btree.ErrKeyNotFound) {
@@ -452,6 +478,9 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	err = c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (txErr error) {
+		if txErr = c.alive(); txErr != nil {
+			return txErr
+		}
 		var it item
 		for _, doc := range docs {
 			buf.Arena.Reset()
@@ -518,6 +547,9 @@ func (c *collection) UpdateOne(ctx context.Context, doc *anyenc.Value) (err erro
 	}
 
 	return c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+		if txErr = c.alive(); txErr != nil {
+			return false, txErr
+		}
 		return c.update(tx, it, item{})
 	})
 }
@@ -535,6 +567,9 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 	defer c.db.syncPool.ReleaseDocBuf(buf2)
 
 	if err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+		if txErr = c.alive(); txErr != nil {
+			return false, txErr
+		}
 		buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], id)
 		it, txErr := c.loadById(tx, buf, buf.SmallBuf)
 		if txErr != nil {
@@ -575,6 +610,9 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 	defer c.db.syncPool.ReleaseDocBuf(buf2)
 
 	if err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+		if txErr = c.alive(); txErr != nil {
+			return false, txErr
+		}
 		buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], id)
 		var (
 			isInsert bool
@@ -709,6 +747,9 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err erro
 	}
 
 	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+		if txErr = c.alive(); txErr != nil {
+			return false, txErr
+		}
 		insErr := c.insertItem(tx, buf, it)
 		if errors.Is(insErr, ErrDocExists) {
 			return c.update(tx, it, item{})
@@ -731,6 +772,9 @@ func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
 	return c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+		if txErr = c.alive(); txErr != nil {
+			return false, txErr
+		}
 		buf.SmallBuf = anyenc.AppendAnyValue(buf.SmallBuf[:0], id)
 		// Verify document exists
 		_, txErr = c.loadById(tx, buf, buf.SmallBuf)
@@ -773,6 +817,9 @@ func (c *collection) deleteItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, id [
 
 func (c *collection) Count(ctx context.Context) (count int, err error) {
 	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		if aErr := c.alive(); aErr != nil {
+			return aErr
+		}
 		var txErr error
 		count, txErr = tx.Count(c.ns)
 		return txErr
@@ -793,6 +840,9 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 		return nil
 	}
 	return c.db.doWriteTxModifiedW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (modified bool, txErr error) {
+		if txErr = c.alive(); txErr != nil {
+			return false, txErr
+		}
 		var newIndexes []*index
 		var newFtsIndexes []*ftsIndex
 		var newVIndexes []*vectorIndex
@@ -1023,6 +1073,9 @@ func (c *collection) buildFtsIndex(tx *btree.WriteTx, fx *ftsIndex) error {
 
 func (c *collection) DropIndex(ctx context.Context, indexName string) (err error) {
 	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (txErr error) {
+		if txErr = c.alive(); txErr != nil {
+			return txErr
+		}
 		tx.MarkSchemaChanged()
 		// The write transaction began via checkStale, which reconciled the index
 		// set against on-disk metadata. So the snapshot here reflects on-disk
@@ -1155,22 +1208,96 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (err error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-
-		if err = c.db.renameCollection(tx, c.name, newName); err != nil {
+		if err = c.alive(); err != nil {
 			return err
 		}
 
-		// Note: btree namespaces can't be renamed, so we keep the old namespace
-		// but update the name in our metadata
 		oldName := c.name
+		if newName == oldName {
+			return nil
+		}
+		// A foreign live handle under the new name implies the name is taken
+		// even if some stale state made the catalog check below miss it.
+		c.db.mu.Lock()
+		if cur, ok := c.db.openedCollections[newName]; ok && cur != Collection(c) {
+			c.db.mu.Unlock()
+			return ErrCollectionExists
+		}
+		c.db.mu.Unlock()
+
+		// Re-keys the catalog metadata AND every derived btree namespace
+		// (data, per-index) in this tx.
+		if err = c.db.renameCollection(tx, oldName, newName); err != nil {
+			return err
+		}
+
+		// Re-bind range-index handles to their renamed namespaces. The old
+		// handles keep working by root page, but their stale Name() would
+		// feed multikeyKey: a post-rename fan-out write would then flag the
+		// WRONG record, and a later rename back would clobber the real one —
+		// re-enabling tight seeks over an index holding arrays (dropped
+		// docs). Published copy-on-write: readers access idx.ns lock-free.
+		prevIdxs := c.loadIndexes()
+		next := make([]*index, len(prevIdxs))
+		for i, idx := range prevIdxs {
+			ns, nsErr := tx.GetNamespace(indexNsName(newName, idx.info.Name))
+			if nsErr != nil {
+				if errors.Is(nsErr, btree.ErrNamespaceNotFound) {
+					// Legacy-broken index (pre-fix rename victim): the sweep
+					// tolerated it; keep the old handle.
+					next[i] = idx
+					continue
+				}
+				return nsErr
+			}
+			next[i] = idx.cloneWithNs(ns)
+		}
+		c.storeIndexes(next)
+
 		c.name = newName
-		// A rollback restores the old name in the catalog; the in-memory name —
-		// which derives sketch keys, index metadata keys and the
-		// openedCollections mapping — must follow (see commonTx.undo).
+
+		// The handle registry is re-keyed only at COMMIT (see commonTx.pubs):
+		// re-keying here would open a window where a concurrent
+		// OpenCollection(oldName) misses the map, passes the catalog check on
+		// the still-committed old snapshot, and registers a duplicate live
+		// handle the in-process staleness pass never invalidates (own commits
+		// update localSchemaCookie). Until commit, OpenCollection(oldName)
+		// keeps returning this handle — correct for the committed state — and
+		// the staleness pass skips this collection while its registered name
+		// and c.name disagree (see reconcileIndexSet).
+		// Deliberately untouched: c.ns and the fts/vector-internal namespace
+		// handles — root pages are unchanged and nothing derives keys from
+		// their stale internal names; fts pending buffers flush at commit
+		// through those handles into the renamed namespaces.
+		wtx.onCommitPublish(func() {
+			c.db.mu.Lock()
+			if cur, ok := c.db.openedCollections[oldName]; ok && cur == Collection(c) {
+				delete(c.db.openedCollections, oldName)
+				// A Rename→Drop in the same tx closed and evicted the handle
+				// already; don't resurrect it under the new name.
+				if !c.closed.Load() {
+					c.db.openedCollections[newName] = c
+				}
+			}
+			c.db.mu.Unlock()
+		})
+
+		// A rollback restores the old catalog and namespaces; the in-memory
+		// name and index generation must follow (the map was never touched —
+		// the commit publication above is dropped unrun). Post-rename writes
+		// in this tx mutated the sketches SHARED with the restored snapshot
+		// through the clones: propagate their modified flags so the next tx
+		// begin rebases the restored sketches to committed bytes.
 		wtx.onRollbackUndo(func() {
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			c.name = oldName
+			for i, idx := range prevIdxs {
+				if next[i] != idx && next[i].sketchModified {
+					idx.sketchModified = true
+				}
+			}
+			c.storeIndexes(prevIdxs)
 		})
 		return nil
 	})
@@ -1180,6 +1307,9 @@ func (c *collection) Drop(ctx context.Context) error {
 	return c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (err error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		if err = c.alive(); err != nil {
+			return err
+		}
 		// Discard buffered fts writes before close: close() preserves a
 		// non-empty pending buffer for the commit-time flush (BUG-01 fix),
 		// but Drop deletes the fts namespaces in this same tx — flushing the
@@ -1257,6 +1387,22 @@ func (c *collection) close() error {
 		return nil
 	}
 	c.db.onCollectionClose(c)
+	return nil
+}
+
+// alive rejects operations on a handle that is no longer live: explicitly
+// closed, dropped, or invalidated because another process renamed or dropped
+// the collection. Checked INSIDE the operation's transaction scope (not at
+// entry) so it runs after the tx-begin staleness pass that performs the
+// invalidation — an op that raced the invalidation still fails before
+// touching the tree.
+func (c *collection) alive() error {
+	if c.closed.Load() {
+		if c.db.closed.Load() {
+			return ErrDBIsClosed
+		}
+		return ErrCollectionClosed
+	}
 	return nil
 }
 

@@ -35,6 +35,13 @@ type WriteTx interface {
 	onRollbackUndo(f func())
 	undoLen() int
 	runUndo(from int)
+
+	// onCommitPublish registers an in-memory publication that must become
+	// visible only when the tx durably commits; see commonTx.pubs.
+	// Unexported: DDL-internal.
+	onCommitPublish(f func())
+	pubLen() int
+	dropPubs(from int)
 }
 
 // ReadTx represents a read-only transaction.
@@ -77,10 +84,48 @@ type commonTx struct {
 	// only under the btree write lock, like the tx itself; runUndo must also
 	// execute while that lock is still held (see writeTx.Rollback).
 	undo []func()
+
+	// pubs are commit-time publications — the dual of undo: in-memory state
+	// changes that must become visible only once the tx durably commits.
+	// Rename's openedCollections re-key lives here: re-keying at execution
+	// time would let a concurrent OpenCollection(oldName) miss the map, pass
+	// the committed-snapshot catalog check, and register a duplicate live
+	// handle under the vacated name — one the in-process staleness pass never
+	// invalidates (own commits update localSchemaCookie). Pubs run in
+	// registration order after a successful btree commit and are dropped
+	// unrun on any rollback or failed commit; savepoint scoping mirrors
+	// undo (savepointTx records a mark, rollback-to-savepoint drops its
+	// scope's entries). Single-writer state, like undo.
+	pubs []func()
 }
 
 func (tx *commonTx) onRollbackUndo(f func()) {
 	tx.undo = append(tx.undo, f)
+}
+
+func (tx *commonTx) onCommitPublish(f func()) {
+	tx.pubs = append(tx.pubs, f)
+}
+
+func (tx *commonTx) pubLen() int {
+	return len(tx.pubs)
+}
+
+// runPubs executes and discards all commit publications in registration
+// order. Called only after a successful btree commit.
+func (tx *commonTx) runPubs() {
+	for _, f := range tx.pubs {
+		f()
+	}
+	clear(tx.pubs)
+	tx.pubs = tx.pubs[:0]
+}
+
+// dropPubs discards publications [from:] without running them: their tx scope
+// rolled back, so the state they would publish never became durable.
+func (tx *commonTx) dropPubs(from int) {
+	clear(tx.pubs[from:])
+	tx.pubs = tx.pubs[:from]
 }
 
 func (tx *commonTx) undoLen() int {
@@ -173,6 +218,7 @@ func (w writeTx) Rollback() error {
 		// reader-visible, so the restored snapshots match the committed
 		// on-disk state throughout.
 		w.commonTx.runUndo(0)
+		w.commonTx.dropPubs(0)
 		return w.writeTx.Rollback()
 	}
 	return nil
@@ -190,11 +236,13 @@ func (w writeTx) Commit() error {
 			// btree commit, so postings commit atomically with the documents.
 			if err := w.db.flushAllFtsPending(w.writeTx); err != nil {
 				w.commonTx.runUndo(0)
+				w.commonTx.dropPubs(0)
 				_ = w.writeTx.Rollback()
 				return err
 			}
 			if err := w.db.persistAllDirtySketches(w.writeTx); err != nil {
 				w.commonTx.runUndo(0)
+				w.commonTx.dropPubs(0)
 				_ = w.writeTx.Rollback()
 				return err
 			}
@@ -204,7 +252,7 @@ func (w writeTx) Commit() error {
 		// section — hold the DDL-unwind gate (paired with newWriteTx) across
 		// commit + unwind so no new writer can observe the phantoms in the
 		// gap. Only needed when this tx actually registered undos.
-		if len(w.commonTx.undo) > 0 {
+		if len(w.commonTx.undo) > 0 || len(w.commonTx.pubs) > 0 {
 			w.db.ddlUnwindGate.Lock()
 			defer w.db.ddlUnwindGate.Unlock()
 		}
@@ -214,10 +262,15 @@ func (w writeTx) Commit() error {
 				w.db.recoveryController.OnWriteEvent()
 			}
 			w.commonTx.discardUndo()
+			// Commit publications run under the gate (when held): no new
+			// writer observes the pre-publication in-memory state after the
+			// on-disk state it describes became visible.
+			w.commonTx.runPubs()
 		} else {
 			// A failed btree commit leaves the catalog without this tx's DDL —
-			// unwind (under the gate).
+			// unwind (under the gate), and its publications never happen.
 			w.commonTx.runUndo(0)
+			w.commonTx.dropPubs(0)
 		}
 		return err
 	}
@@ -273,13 +326,17 @@ type savepointTx struct {
 	// inside its scope (entries [undoMark:]); a release keeps them registered
 	// on the parent so an outer rollback still unwinds them.
 	undoMark int
-	version  atomic.Uint32
+	// pubMark scopes commit publications the same way: a rollback to this
+	// savepoint drops (unrun) the publications registered inside its scope.
+	pubMark int
+	version atomic.Uint32
 }
 
 func (tx *savepointTx) reset(wtx WriteTx, spId int) {
 	tx.WriteTx = wtx
 	tx.savepointId = spId
 	tx.undoMark = wtx.undoLen()
+	tx.pubMark = wtx.pubLen()
 	tx.version.Store(newTxVersion())
 }
 
@@ -310,6 +367,7 @@ func (w savepointWrapper) Rollback() error {
 		// runs inside the critical section.
 		db.resetAllFtsPending()
 		w.WriteTx.runUndo(w.undoMark)
+		w.WriteTx.dropPubs(w.pubMark)
 		if err != nil {
 			return err
 		}

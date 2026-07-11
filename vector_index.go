@@ -44,12 +44,17 @@ func vectorIndexNsPrefix(collName, indexName string) string {
 	return "vix:" + collName + ":" + indexName
 }
 
+// vectorIndexNsSuffixes is the union of namespace suffixes across both vector
+// backends: HNSW uses :adj, IVF-PQ uses :cb and :cell. Shared by the drop and
+// rename sweeps so the two lists can't drift.
+var vectorIndexNsSuffixes = []string{":meta", ":vec", ":adj", ":doc", ":lbl", ":cb", ":cell"}
+
 // dropVectorIndexNamespaces deletes all btree namespaces backing a vector index.
-// It drops the union of HNSW (:adj) and IVF-PQ (:cb, :cell) suffixes so it works
-// for either backend; DeleteNamespace ignores absent namespaces.
+// It drops the union of HNSW and IVF-PQ suffixes so it works for either
+// backend; absent namespaces are ignored.
 func dropVectorIndexNamespaces(tx *btree.WriteTx, collName, indexName string) error {
 	prefix := vectorIndexNsPrefix(collName, indexName)
-	for _, suf := range []string{":meta", ":vec", ":adj", ":doc", ":lbl", ":cb", ":cell"} {
+	for _, suf := range vectorIndexNsSuffixes {
 		if err := tx.DeleteNamespace(prefix + suf); err != nil && !errors.Is(err, btree.ErrNamespaceNotFound) {
 			return err
 		}
@@ -939,6 +944,9 @@ func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) e
 	return c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		if err := c.alive(); err != nil {
+			return err
+		}
 		cur := c.loadVectorIndexes()
 		idx := -1
 		for i, vi := range cur {
@@ -1013,6 +1021,10 @@ func (c *collection) maybeAutoCompactVectors(ctx context.Context) {
 // vectorIndexSeed derives a deterministic level-generation seed per index so a
 // reopened index generates the same levels as documents are (re)built. The graph
 // itself is persisted, so this only matters for newly inserted nodes after open.
+// A collection rename changes the seed for subsequently opened handles; only
+// new-insert level draws differ — persisted nodes carry their levels in the
+// graph, and HNSW needs the right level distribution, not any particular
+// sequence.
 func vectorIndexSeed(coll, name string) int64 {
 	var h int64 = 1469598103934665603
 	for _, s := range []string{coll, ":", name} {

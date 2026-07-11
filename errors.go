@@ -2,6 +2,7 @@ package anystore
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/anyproto/any-store/v2/internal/aggregate"
 	"github.com/anyproto/any-store/v2/internal/btree"
@@ -49,8 +50,20 @@ var (
 	// ErrCollectionExists is returned when attempting to create a collection that already exists.
 	ErrCollectionExists = errors.New("any-store: collection already exists")
 
+	// ErrInvalidCollectionName is returned when a collection name is empty or
+	// collides with a reserved namespace family (see validateCollectionName).
+	ErrInvalidCollectionName = errors.New("any-store: invalid collection name")
+
 	// ErrCollectionNotFound is returned when a collection cannot be found.
 	ErrCollectionNotFound = errors.New("any-store: collection not found")
+
+	// ErrCollectionClosed is returned by operations on a collection handle
+	// that is no longer live: explicitly closed, dropped, or invalidated
+	// because another process renamed or dropped the collection (SQLite
+	// re-prepare style — re-open the collection to continue). It wraps
+	// ErrCollectionNotFound so errors.Is matches what a fresh OpenCollection
+	// under the stale name returns.
+	ErrCollectionClosed = fmt.Errorf("any-store: collection handle is closed (dropped, renamed, or closed): %w", ErrCollectionNotFound)
 
 	// ErrIndexExists is returned when attempting to create an index that already exists.
 	ErrIndexExists = errors.New("any-store: index already exists")

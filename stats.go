@@ -172,6 +172,9 @@ type FtsIndexStats struct {
 // index entries); it is intended for diagnostics, not hot paths. All figures
 // are read within a single read transaction and are mutually consistent.
 func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err error) {
+	if err = c.alive(); err != nil {
+		return
+	}
 	c.mu.Lock()
 	name := c.name
 	indexes := append([]*index(nil), c.loadIndexes()...)

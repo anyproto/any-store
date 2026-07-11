@@ -128,6 +128,9 @@ func (q *collQuery) Sort(sorts ...any) Query {
 }
 
 func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
+	if err = q.c.alive(); err != nil {
+		return
+	}
 	qb, err := q.makeQuery()
 	if err != nil {
 		return
@@ -142,6 +145,15 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 
 	tx, err := q.c.db.getReadTx(ctx)
 	if err != nil {
+		qb.Close()
+		return
+	}
+
+	// Re-checked inside the tx scope: the begin-time staleness pass may have
+	// just invalidated the handle (a peer's drop frees the pages this
+	// snapshot would walk through the stale root).
+	if err = q.c.alive(); err != nil {
+		_ = tx.Commit()
 		qb.Close()
 		return
 	}
@@ -245,6 +257,9 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 }
 
 func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResult, err error) {
+	if err = q.c.alive(); err != nil {
+		return
+	}
 	mod, err := query.ParseModifier(modifier)
 	if err != nil {
 		return
@@ -283,6 +298,13 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 			err = tx.Commit()
 		}
 	}()
+
+	// Re-checked inside the tx scope: the begin-time staleness pass may have
+	// just invalidated the handle (see collection.alive) — the entry check
+	// alone would let this bulk write proceed through a stale handle.
+	if err = q.c.alive(); err != nil {
+		return
+	}
 
 	btWtx := tx.btreeWriteTx()
 	btx := tx.btreeReadTx()
@@ -399,6 +421,9 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 }
 
 func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error) {
+	if err = q.c.alive(); err != nil {
+		return
+	}
 	qb, err := q.makeQuery()
 	if err != nil {
 		return
@@ -431,6 +456,13 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 			err = tx.Commit()
 		}
 	}()
+
+	// Re-checked inside the tx scope: the begin-time staleness pass may have
+	// just invalidated the handle (see collection.alive) — the entry check
+	// alone would let this bulk write proceed through a stale handle.
+	if err = q.c.alive(); err != nil {
+		return
+	}
 
 	btWtx := tx.btreeWriteTx()
 	btx := tx.btreeReadTx()
@@ -511,6 +543,9 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 }
 
 func (q *collQuery) Count(ctx context.Context) (count int, err error) {
+	if err = q.c.alive(); err != nil {
+		return
+	}
 	// Fast path: no filter, no offset, no limit — use lightweight page-header count
 	_, isAll := q.cond.(query.All)
 	if (q.cond == nil || isAll) && q.offset == 0 && q.limit == 0 && q.sort == nil {
@@ -650,6 +685,9 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 }
 
 func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
+	if err = q.c.alive(); err != nil {
+		return
+	}
 	qb, err := q.makeQuery()
 	if err != nil {
 		return
@@ -662,6 +700,9 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	idxs := q.c.loadIndexes()
 
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		if aErr := q.c.alive(); aErr != nil {
+			return aErr
+		}
 		// Built inside the read tx so the multikey-flag probe sees the same
 		// snapshot the (hypothetical) scan would — Explain must report the
 		// bounds the real query would use.

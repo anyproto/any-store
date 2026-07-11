@@ -1,7 +1,9 @@
 package anystore
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log"
@@ -276,6 +278,20 @@ func collKey(name string) []byte {
 	return []byte("coll:" + name)
 }
 
+// newCatalogID returns a fresh identity token stored as the coll: record
+// value and cached on the handle at init. It distinguishes a recreated
+// same-named collection from the one a cached handle was opened against —
+// the data-namespace root page alone is unreliable for that (an immediate
+// drop+recreate typically gets the same root back from the freelist).
+// renameCollection moves the value verbatim, so identity survives a rename.
+// Legacy files store "1" for every collection; any post-fix recreate writes a
+// fresh token, so the comparison still detects recreation of legacy entries.
+func newCatalogID() []byte {
+	id := make([]byte, 8)
+	_, _ = rand.Read(id) // crypto/rand never fails on supported platforms
+	return id
+}
+
 func collConfigKey(name string) []byte {
 	return []byte("collcfg:" + name)
 }
@@ -301,14 +317,14 @@ func sketchKey(collName, indexName string) []byte {
 // with the entries it describes, and defaults to "assume multikey" when
 // absent (files created before the flag existed).
 //
-// Keyed by the index NAMESPACE name, not collection+index names: namespace
-// names are immutable (btree namespaces can't be renamed — Collection.Rename
-// keeps them) and unique among live namespaces, so the record can never be
-// orphaned by a rename, resurrected by a rename cycle, or written under a
-// name that diverged from the persisted records when a rename's enclosing tx
-// rolls back. createIndex overwrites the record for the namespace it just
-// created, so even an orphan left by an incomplete cleanup can never be
-// adopted by a new index.
+// Keyed by the index NAMESPACE name, unique among live namespaces.
+// renameCollection re-keys this record in the SAME tx that renames the
+// namespace itself, so key and namespace can never diverge — a rollback
+// reverts both together, and because the re-key moves (delete+put) rather
+// than copies, a rename cycle can never resurrect a stale record.
+// createIndex overwrites the record for the namespace it just created, so
+// even an orphan left by an incomplete cleanup can never be adopted by a new
+// index.
 func multikeyKey(nsName string) []byte {
 	return []byte("idx_mk:" + nsName)
 }
@@ -324,6 +340,32 @@ var (
 
 func indexKeyPrefix(collName string) string {
 	return "idx:" + collName + ":"
+}
+
+// validateCollectionName rejects names that collide with the system namespace
+// or a reserved namespace family — the collection's data namespace IS the raw
+// name, so a name like "ix:x:y" could alias a derived index namespace.
+//
+// ":" inside a name is allowed: every catalog key family is prefixed
+// ("coll:", "collcfg:", "idx:", "stat_data:", "idx_mk:") so families can't
+// cross-collide, and the residual within-family ambiguity (collection "A:b"
+// index "c" vs collection "A" index "b:c" both deriving ix:A:b:c) fails loudly
+// with ErrNamespaceExists at index-create or rename time — it can never
+// corrupt silently. Rejecting ":" would also strand pre-validation files whose
+// collection names legally contain it.
+func validateCollectionName(name string) error {
+	if name == "" {
+		return fmt.Errorf("%w: name must not be empty", ErrInvalidCollectionName)
+	}
+	if name == systemNamespace {
+		return fmt.Errorf("%w: %q is reserved", ErrInvalidCollectionName, name)
+	}
+	for _, prefix := range []string{"ix:", "ftx:", "vix:"} {
+		if strings.HasPrefix(name, prefix) {
+			return fmt.Errorf("%w: prefix %q is reserved for index namespaces", ErrInvalidCollectionName, prefix)
+		}
+	}
+	return nil
 }
 
 func (db *db) init(ctx context.Context) error {
@@ -368,6 +410,7 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 	tx.writeTx = btWtx
 	tx.modified = false
 	tx.undo = tx.undo[:0]
+	tx.pubs = tx.pubs[:0]
 	tx.version.Store(version)
 	wTx := writeTx{commonTx: tx, version: version}
 	tx.ctx = context.WithValue(ctx, ctxKeyTx, wTx)
@@ -425,20 +468,97 @@ func (db *db) checkStale(tx *btree.ReadTx) {
 
 // reconcileIndexSet rebuilds the in-memory index set of every open collection
 // from on-disk metadata, called from checkStale when the schema cookie advanced.
-// See checkStale for the contract. Each collection is reconciled under its own
-// c.mu and the result published atomically (copy-on-write), so lock-free query
-// readers always observe a complete index generation.
+// See checkStale for the contract. A handle whose collection no longer exists
+// in the snapshot (renamed away or dropped by another process) is invalidated
+// instead of reconciled — reconciling it against an empty index set would
+// publish exactly the unindexed-write corruption of I-16. Each surviving
+// collection is reconciled under its own c.mu and the result published
+// atomically (copy-on-write), so lock-free query readers always observe a
+// complete index generation.
 func (db *db) reconcileIndexSet(tx *btree.ReadTx) {
+	type namedColl struct {
+		name string
+		c    *collection
+	}
 	db.mu.Lock()
-	colls := make([]*collection, 0, len(db.openedCollections))
-	for _, coll := range db.openedCollections {
-		colls = append(colls, coll.(*collection))
+	colls := make([]namedColl, 0, len(db.openedCollections))
+	for name, coll := range db.openedCollections {
+		colls = append(colls, namedColl{name: name, c: coll.(*collection)})
 	}
 	db.mu.Unlock()
 
-	for _, c := range colls {
-		c.reconcileIndexes(tx)
+	for _, nc := range colls {
+		nc.c.mu.Lock()
+		renameInFlight := nc.c.name != nc.name
+		nc.c.mu.Unlock()
+		if renameInFlight {
+			// A local Rename is between its name flip and its commit (the
+			// registry re-keys only at commit). Skip: the renaming writer
+			// holds the cross-process write lock, so the cookie bump this
+			// pass consumes predates its begin and was reconciled there;
+			// checking c.name against this tx's older snapshot would
+			// spuriously invalidate the handle, and reconciling its index
+			// set under the flipped name would publish an empty one.
+			continue
+		}
+		if db.collectionVanished(tx, nc.name, nc.c) {
+			db.invalidateCollection(nc.c)
+			continue
+		}
+		nc.c.reconcileIndexes(tx)
 	}
+}
+
+// collectionVanished reports whether the collection this handle points at no
+// longer exists in the tx snapshot: its catalog key is gone (renamed away or
+// dropped by a peer process), or a DIFFERENT collection now answers for the
+// name (drop+recreate, or rename-away followed by a fresh create). The name is
+// the handle's REGISTERED key in openedCollections, which tracks committed
+// state (a local rename re-keys it only at commit) and therefore matches the
+// snapshot this tx reads — c.name may already be flipped by an in-flight
+// rename. Identity is the catalog token (see newCatalogID) plus the
+// data-namespace root page as a belt for legacy "1"-valued entries — the root
+// alone is unreliable because an immediate drop+recreate usually gets the same
+// root back from the freelist. Errors other than definite absence keep the
+// handle: invalidation must never fire on a read hiccup.
+func (db *db) collectionVanished(tx *btree.ReadTx, name string, c *collection) bool {
+	val, err := tx.AppendValue(db.systemNS, collKey(name), nil)
+	if err != nil {
+		return errors.Is(err, btree.ErrKeyNotFound)
+	}
+	if !bytes.Equal(val, c.catalogID) {
+		return true
+	}
+	ns, err := tx.GetNamespace(name)
+	if err != nil {
+		return errors.Is(err, btree.ErrNamespaceNotFound)
+	}
+	return ns.RootPage() != c.ns.RootPage()
+}
+
+// invalidateCollection retires a handle whose collection a peer process
+// renamed or dropped (SQLite re-prepare style: subsequent operations fail with
+// ErrCollectionClosed and the caller re-opens). Modeled on the CreateCollection
+// rollback undo, NOT on close(): onCollectionClose would orphan non-empty fts
+// pending buffers for the commit-time flush, and a dead handle's buffered
+// writes must never flush into the renamed/dropped collection's namespaces —
+// reset them instead. The CAS makes concurrent invalidations (multiple tx
+// begins observing the same cookie bump) idempotent.
+func (db *db) invalidateCollection(c *collection) {
+	if !c.closed.CompareAndSwap(false, true) {
+		return
+	}
+	for _, fx := range c.loadFtsIndexes() {
+		fx.pending.reset()
+	}
+	db.mu.Lock()
+	for name, cur := range db.openedCollections {
+		if cur == Collection(c) {
+			delete(db.openedCollections, name)
+			break
+		}
+	}
+	db.mu.Unlock()
 }
 
 // reloadSketches reloads all sketch data from the _system namespace for opened
@@ -513,6 +633,9 @@ func mergeCollOpts(opts []CollectionOptions) CollectionOptions {
 }
 
 func (db *db) CreateCollection(ctx context.Context, collectionName string, opts ...CollectionOptions) (Collection, error) {
+	if err := validateCollectionName(collectionName); err != nil {
+		return nil, err
+	}
 	db.mu.Lock()
 	if _, ok := db.openedCollections[collectionName]; ok {
 		db.mu.Unlock()
@@ -550,8 +673,8 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 			return err
 		}
 
-		// Register in system namespace
-		if err = tx.Put(db.systemNS, key, []byte("1")); err != nil {
+		// Register in system namespace under a fresh identity token.
+		if err = tx.Put(db.systemNS, key, newCatalogID()); err != nil {
 			return err
 		}
 
@@ -771,7 +894,31 @@ func (db *db) IntegrityCheck(ctx context.Context) (err error) {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	return db.btreeDB.IntegrityCheck()
+	if err = db.btreeDB.IntegrityCheck(); err != nil {
+		return err
+	}
+	// Catalog consistency: every cataloged collection must have its data
+	// namespace. A missing one is the signature of a rename performed by a
+	// pre-fix version (catalog re-keyed to the new name, data left under the
+	// old — see docs/known-issues.md I-16); its data survives as an orphan
+	// namespace but the collection is unopenable until manually repaired.
+	return db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		names, lErr := db.listCollectionNames(tx)
+		if lErr != nil {
+			return lErr
+		}
+		for _, name := range names {
+			if _, nsErr := tx.GetNamespace(name); nsErr != nil {
+				if errors.Is(nsErr, btree.ErrNamespaceNotFound) {
+					return fmt.Errorf("collection %q: data namespace missing (renamed by a pre-fix version, see docs/known-issues.md I-16); its data survives under the pre-rename namespace name", name)
+				}
+				// Any other failure to resolve the namespace is itself an
+				// integrity problem — never mask it as a clean result.
+				return fmt.Errorf("collection %q: resolving data namespace: %w", name, nsErr)
+			}
+		}
+		return nil
+	})
 }
 
 func (db *db) Backup(ctx context.Context, path string) (err error) {
@@ -985,7 +1132,16 @@ func (db *db) Flush(ctx context.Context, waitIdleTime time.Duration, mode FlushM
 
 func (db *db) onCollectionClose(c *collection) {
 	db.mu.Lock()
-	delete(db.openedCollections, c.name)
+	// Identity scan, not a delete by c.name: c.name is read here without c.mu
+	// (taking it would deadlock — Drop holds it when calling close()), so a
+	// name-keyed delete races with Rename's name flip and could evict a
+	// same-named successor handle or miss the entry entirely.
+	for name, cur := range db.openedCollections {
+		if cur == Collection(c) {
+			delete(db.openedCollections, name)
+			break
+		}
+	}
 	// Keep non-empty fts pending buffers reachable for the commit-time flush
 	// (or the next tx-begin reset). The buffer is only ever non-empty inside
 	// an open write tx, so outside a tx this appends nothing.
@@ -1063,8 +1219,10 @@ func (db *db) getIndexInfos(tx *btree.ReadTx, collName string) ([]IndexInfo, err
 	prefix := indexKeyPrefix(collName)
 	cursor := tx.NewCursor(db.systemNS)
 	defer cursor.Close()
+	// A Seek error is a real read failure, not "no indexes" — an empty or
+	// non-matching prefix leaves the cursor invalid with a nil error.
 	if err := cursor.Seek([]byte(prefix)); err != nil {
-		return nil, nil
+		return nil, err
 	}
 	var (
 		result []IndexInfo
@@ -1413,14 +1571,90 @@ func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 	return nil
 }
 
-// renameCollection renames collection metadata in the system namespace
+// renameCollection renames a collection: the catalog metadata in the system
+// namespace AND every btree namespace derived from the collection name (data,
+// per-index) are re-keyed in one transaction.
 func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error {
-	tx.MarkSchemaChanged()
-	// Remove old collection key, add new one
-	if err := tx.Delete(db.systemNS, collKey(oldName)); err != nil {
+	if oldName == newName {
+		return nil
+	}
+	if err := validateCollectionName(newName); err != nil {
 		return err
 	}
-	if err := tx.Put(db.systemNS, collKey(newName), []byte("1")); err != nil {
+	// Reject a rename onto an existing collection instead of silently
+	// overwriting its catalog entry. Read-your-writes through the write tx
+	// also covers a collection created earlier in the same tx.
+	if _, err := tx.Get(db.systemNS, collKey(newName)); err == nil {
+		return ErrCollectionExists
+	} else if !errors.Is(err, btree.ErrKeyNotFound) {
+		return err
+	}
+	tx.MarkSchemaChanged()
+
+	// Enumerate the on-disk index metadata BEFORE the idx: keys move (the
+	// same source Drop uses, for the same reason).
+	infos, err := db.getIndexInfos(&tx.ReadTx, oldName)
+	if err != nil {
+		return err
+	}
+
+	// Data namespace: hard error if missing — "renaming" only the metadata of
+	// a contents-less collection would recreate the pre-fix I-16 breakage.
+	if err = tx.RenameNamespace(oldName, newName); err != nil {
+		if errors.Is(err, btree.ErrNamespaceExists) {
+			return fmt.Errorf("rename %q -> %q: target namespace already exists: %w", oldName, newName, ErrCollectionExists)
+		}
+		if errors.Is(err, btree.ErrNamespaceNotFound) {
+			return fmt.Errorf("rename %q -> %q: data namespace missing (collection likely broken by a pre-fix rename, see docs/known-issues.md I-16): %w", oldName, newName, err)
+		}
+		return err
+	}
+	// Per-index namespaces. Absent ones are tolerated like Drop tolerates
+	// them: a missing namespace means the index is already broken (legacy
+	// pre-fix rename) or backend-dependent (HNSW has no :cb/:cell, IVF no
+	// :adj); failing the whole rename wouldn't repair it.
+	renameNs := func(from, to string) error {
+		if nsErr := tx.RenameNamespace(from, to); nsErr != nil && !errors.Is(nsErr, btree.ErrNamespaceNotFound) {
+			return nsErr
+		}
+		return nil
+	}
+	for _, info := range infos {
+		switch {
+		case isFulltext(info):
+			fromNames := ftsIndexNames(oldName, info.Name)
+			toNames := ftsIndexNames(newName, info.Name)
+			for i := range fromNames {
+				if err = renameNs(fromNames[i], toNames[i]); err != nil {
+					return err
+				}
+			}
+		case info.Kind == IndexKindVector:
+			fromPrefix := vectorIndexNsPrefix(oldName, info.Name)
+			toPrefix := vectorIndexNsPrefix(newName, info.Name)
+			for _, suf := range vectorIndexNsSuffixes {
+				if err = renameNs(fromPrefix+suf, toPrefix+suf); err != nil {
+					return err
+				}
+			}
+		default:
+			if err = renameNs(indexNsName(oldName, info.Name), indexNsName(newName, info.Name)); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Move the collection key, preserving the identity token in its value —
+	// cached handles (local and peer) recognise the renamed collection is a
+	// different one than any later same-named creation.
+	catalogID, err := tx.AppendValue(db.systemNS, collKey(oldName), nil)
+	if err != nil {
+		return err
+	}
+	if err = tx.Delete(db.systemNS, collKey(oldName)); err != nil {
+		return err
+	}
+	if err = tx.Put(db.systemNS, collKey(newName), catalogID); err != nil {
 		return err
 	}
 
@@ -1430,12 +1664,15 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 		_ = tx.Put(db.systemNS, collConfigKey(newName), cfgData)
 	}
 
-	// Rename index keys
+	// Rename index keys. A Seek error is a real read failure (an empty or
+	// non-matching prefix leaves the cursor invalid with a nil error) — it
+	// must fail the rename, or the tx would commit with the namespaces
+	// renamed but the idx:/stat_data:/idx_mk: records left under the old name.
 	oldPrefix := indexKeyPrefix(oldName)
 	cursor := tx.NewCursor(db.systemNS)
 	defer cursor.Close()
 	if err := cursor.Seek([]byte(oldPrefix)); err != nil {
-		return nil
+		return err
 	}
 	type kv struct {
 		oldKey []byte
@@ -1476,14 +1713,21 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 		if err := tx.Put(db.systemNS, indexKey(newName, e.name), e.val); err != nil {
 			return err
 		}
-		// The per-index sketch and multikey records are keyed by collection
+		// The per-index sketch and multikey records derive from the collection
 		// name too; leaving them behind would orphan them AND let a later
 		// rename back resurrect a stale record — for the multikey flag that
 		// means tight seeks against an index that has since seen arrays,
-		// i.e. silently dropped docs.
+		// i.e. silently dropped docs. Moved (delete+put), never copied.
 		if skData, err := tx.AppendValue(db.systemNS, sketchKey(oldName, e.name), nil); err == nil {
 			_ = tx.Delete(db.systemNS, sketchKey(oldName, e.name))
 			if err = tx.Put(db.systemNS, sketchKey(newName, e.name), skData); err != nil {
+				return err
+			}
+		}
+		oldMk := multikeyKey(indexNsName(oldName, e.name))
+		if mkVal, err := tx.AppendValue(db.systemNS, oldMk, nil); err == nil {
+			_ = tx.Delete(db.systemNS, oldMk)
+			if err = tx.Put(db.systemNS, multikeyKey(indexNsName(newName, e.name)), mkVal); err != nil {
 				return err
 			}
 		}
