@@ -115,6 +115,25 @@ func (p *Parser) ApproxSize() int {
 	return p.c.approxSizeValues()
 }
 
+// TrimScratch frees the reusable scratch buffers (decompBuf, input copy) when
+// their combined retained capacity exceeds limit. They are excluded from
+// ApproxSize by design — kept so consecutive large-document parses don't
+// re-allocate — but without a bound a single huge document pins its high-water
+// mark in a pooled parser forever, invisible to the pool's size accounting.
+// The bound is on the SUM (each buffer just under the limit would otherwise
+// retain ~2x); decompBuf is sacrificed first, then the input copy only if it
+// alone still exceeds the limit, so what remains is always <= limit. Limit <= 0
+// keeps everything.
+func (p *Parser) TrimScratch(limit int) {
+	if limit <= 0 || cap(p.b)+cap(p.c.decompBuf) <= limit {
+		return
+	}
+	p.c.decompBuf = nil
+	if cap(p.b) > limit {
+		p.b = nil
+	}
+}
+
 func parseValue(b []byte, c *cache, depth int) (v *Value, tail []byte, err error) {
 	if len(b) == 0 {
 		return nil, nil, fmt.Errorf("expected value, but got 0 byte")

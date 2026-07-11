@@ -393,6 +393,7 @@ func (v *Value) MarshalCompressed(dst, scratch []byte) ([]byte, []byte) {
 	headerStart := len(dst)
 	dst = append(dst, byte(TypeCompressedObjectS2))
 	dst = append(dst, 0, 0, 0, 0) // placeholder for compressed length
+	hdrLen := len(dst) - headerStart
 	// Ensure dst has enough capacity for s2 output
 	maxComp := s2.MaxEncodedLen(len(scratch))
 	if needed := len(dst) + maxComp; cap(dst) < needed {
@@ -402,6 +403,16 @@ func (v *Value) MarshalCompressed(dst, scratch []byte) ([]byte, []byte) {
 	}
 	// Encode directly into dst tail (s2 writes from position 0 of its dst arg)
 	compressed := s2.Encode(dst[len(dst):], scratch)
+	// Keep-plain fallback: a high-entropy object (encrypted or pre-compressed
+	// payloads) S2-encodes to at least its plain size, and the compressed form
+	// additionally costs a full decode+copy on every future parse. The plain
+	// TypeObject encoding is already in scratch and every reader dispatches on
+	// the leading type byte, so storing it instead is byte-compatible with
+	// existing data and readers.
+	if len(compressed)+hdrLen >= len(scratch) {
+		dst = append(dst[:headerStart], scratch...)
+		return dst, scratch
+	}
 	dst = dst[:len(dst)+len(compressed)]
 	compLen := uint32(len(compressed))
 	binary.BigEndian.PutUint32(dst[headerStart+1:], compLen)

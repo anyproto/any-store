@@ -78,6 +78,93 @@ func TestMarshalCompressedSmallFallback(t *testing.T) {
 	assert.Equal(t, js, got)
 }
 
+// genIncompressibleTestDoc builds an object whose payload is deterministic
+// high-entropy bytes (a keyed xorshift stream) — the shape of encrypted CRDT
+// change bodies, which S2 cannot shrink.
+func genIncompressibleTestDoc(a *Arena, n int) *Value {
+	data := make([]byte, n)
+	state := uint64(0x9e3779b97f4a7c15)
+	for i := range data {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		data[i] = byte(state)
+	}
+	obj := a.NewObject()
+	obj.Set("id", a.NewString("enc-doc"))
+	obj.Set("payload", a.NewBinary(data))
+	return obj
+}
+
+// TestMarshalCompressedIncompressibleKeepsPlain: when S2 output would not be
+// smaller than the plain encoding, the plain TypeObject bytes must be stored
+// instead — same format old readers already handle, and no decode+copy cost on
+// every future parse.
+func TestMarshalCompressedIncompressibleKeepsPlain(t *testing.T) {
+	a := &Arena{}
+	p := &Parser{}
+
+	val := genIncompressibleTestDoc(a, 4096)
+	require.True(t, val.IsSizeBigger(CompressMinSize))
+
+	plain := val.MarshalTo(nil)
+	dst, _ := val.MarshalCompressed(nil, nil)
+
+	assert.Equal(t, byte(TypeObject), dst[0], "incompressible object must be stored plain")
+	assert.Equal(t, plain, dst)
+
+	decoded, err := p.Parse(dst)
+	require.NoError(t, err)
+	assert.Equal(t, "enc-doc", string(decoded.GetStringBytes("id")))
+	assert.Equal(t, val.GetBytes("payload"), decoded.GetBytes("payload"))
+
+	// The fallback truncates dst back to the header start — a non-empty dst
+	// prefix must survive.
+	prefix := []byte("prefix")
+	dst2, _ := val.MarshalCompressed(append([]byte{}, prefix...), nil)
+	assert.Equal(t, prefix, dst2[:len(prefix)])
+	assert.Equal(t, plain, dst2[len(prefix):])
+}
+
+func TestParserTrimScratch(t *testing.T) {
+	a := &Arena{}
+	p := &Parser{}
+
+	// A compressible large doc so the parse path actually inflates decompBuf.
+	val := a.NewFromFastJson(fastjson.MustParse(compressedLargeDoc))
+	dst, _ := val.MarshalCompressed(nil, nil)
+	require.Equal(t, byte(TypeCompressedObjectS2), dst[0])
+	_, err := p.Parse(dst)
+	require.NoError(t, err)
+	require.Greater(t, cap(p.c.decompBuf), 0)
+	require.Greater(t, cap(p.b), 0)
+
+	p.TrimScratch(1 << 30) // above the combined caps: keeps everything
+	assert.Greater(t, cap(p.c.decompBuf), 0)
+	assert.Greater(t, cap(p.b), 0)
+
+	p.TrimScratch(0) // no limit: keeps everything
+	assert.Greater(t, cap(p.c.decompBuf), 0)
+
+	// Sum over limit but input copy alone within it: only decompBuf is freed —
+	// the bound is on the combined retention, sacrificing decompBuf first.
+	p.TrimScratch(cap(p.b) + cap(p.c.decompBuf) - 1)
+	assert.Equal(t, 0, cap(p.c.decompBuf))
+	assert.Greater(t, cap(p.b), 0)
+
+	_, err = p.Parse(dst) // regrow both
+	require.NoError(t, err)
+	require.Greater(t, cap(p.c.decompBuf), 0)
+
+	p.TrimScratch(16) // both over the limit: frees both
+	assert.Equal(t, 0, cap(p.c.decompBuf))
+	assert.Equal(t, 0, cap(p.b))
+
+	// Parser must still work after trimming.
+	_, err = p.Parse(dst)
+	require.NoError(t, err)
+}
+
 func TestMarshalCompressedNonObject(t *testing.T) {
 	a := &Arena{}
 
