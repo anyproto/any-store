@@ -415,8 +415,17 @@ func BuildPlan(params *PlanParams) *Plan {
 	nFieldSel := 0
 	for i := range params.Indexes {
 		idx := &params.Indexes[i]
-		if len(idx.Info.FieldNames) == 1 && idx.PointLookup && idx.Sketch != nil && len(idx.Bounds) > 0 {
-			est := float64(idx.Sketch.Estimate(0, idx.Bounds[0].Start))
+		if len(idx.Info.FieldNames) == 1 && idx.PointLookup && len(idx.Bounds) > 0 {
+			var est float64
+			if idx.Info.Unique && !idx.Info.Sparse {
+				// Each equality bound matches at most one document (see
+				// uniqueFullKeyDocs) — no sketch needed. Sparse is excluded:
+				// a sparse index drops null/missing docs, so eq-null bounds
+				// can match far more documents than the index has entries.
+				est = float64(len(idx.Bounds))
+			} else if idx.Sketch != nil {
+				est = float64(idx.Sketch.Estimate(0, idx.Bounds[0].Start))
+			}
 			if est > 0 && nFieldSel < len(fieldSelBuf) {
 				fieldSelBuf[nFieldSel] = fieldSelEntry{
 					field: idx.Info.FieldNames[0],
@@ -829,79 +838,104 @@ func calculateSelectivity(filter query.Filter, indexes []CBOIndex, totalDocs flo
 	var usedFields [8]string
 	nUsed := 0
 
-	// For each index, check if any of its fields have bounds in the filter
-	for i := range indexes {
-		idx := &indexes[i]
-		for fi, fieldName := range idx.Info.FieldNames {
-			// Check if field already processed (linear scan is faster than map for ≤8 fields)
-			alreadyUsed := false
-			for j := 0; j < nUsed; j++ {
-				if usedFields[j] == fieldName {
-					alreadyUsed = true
-					break
-				}
-			}
-			if alreadyUsed {
+	// For each index, check if any of its fields have bounds in the filter.
+	// Two passes: single-field UNIQUE (non-sparse) indexes claim their fields
+	// first — their equality bounds price a field at len(bounds)/N exactly (see
+	// uniqueFullKeyDocs), and each field is priced by whichever index claims it
+	// first, so letting a compound index (or a shared sketch bucket) claim the
+	// same field would re-inflate pTotal and misprice a LIMIT-capped FullScan
+	// (fullScanEffective = limit/pTotal).
+	for pass := 0; pass < 2; pass++ {
+		for i := range indexes {
+			idx := &indexes[i]
+			uniqueSingle := idx.Info.Unique && !idx.Info.Sparse && len(idx.Info.FieldNames) == 1
+			if (pass == 0) != uniqueSingle {
 				continue
 			}
-			var bounds query.Bounds
-			var isEquality bool
-			if br != nil {
-				var fixed, found bool
-				bounds, fixed, found = br.Lookup(fieldName)
-				if !found || len(bounds) == 0 {
+			for fi, fieldName := range idx.Info.FieldNames {
+				// Check if field already processed (linear scan is faster than map for ≤8 fields)
+				alreadyUsed := false
+				for j := 0; j < nUsed; j++ {
+					if usedFields[j] == fieldName {
+						alreadyUsed = true
+						break
+					}
+				}
+				if alreadyUsed {
 					continue
 				}
-				isEquality = fixed
-			} else {
-				bounds = filter.IndexBounds(fieldName, nil)
-				if len(bounds) == 0 {
-					continue
+				var bounds query.Bounds
+				var isEquality bool
+				if br != nil {
+					var fixed, found bool
+					bounds, fixed, found = br.Lookup(fieldName)
+					if !found || len(bounds) == 0 {
+						continue
+					}
+					isEquality = fixed
+				} else {
+					bounds = filter.IndexBounds(fieldName, nil)
+					if len(bounds) == 0 {
+						continue
+					}
+					isEquality = AllBoundsFixed(bounds)
 				}
-				isEquality = AllBoundsFixed(bounds)
-			}
-			if nUsed < len(usedFields) {
-				usedFields[nUsed] = fieldName
-				nUsed++
-			}
+				if nUsed < len(usedFields) {
+					usedFields[nUsed] = fieldName
+					nUsed++
+				}
 
-			if isEquality && idx.Sketch != nil && fi == 0 && sketchLevelTrusted(idx.Sketch, 0) {
-				// Equality on the index's leading field: the level-0 sketch holds
-				// the count for that field's value alone (the prefix), so this is
-				// accurate for both single-field and compound indexes.
-				est := idx.Sketch.Estimate(0, bounds[0].Start)
-				p := float64(est) / totalDocs
-				if p > 1.0 {
-					p = 1.0
-				}
-				if p <= 0 {
-					p = 0.0001
-				}
-				pTotal *= p
-			} else if isEquality {
-				// Equality on a field but can't use sketch directly (compound index)
-				// Use a more selective estimate than default range
-				pTotal *= DefaultRangeSelectivity
-			} else {
-				// Range predicate: prefer the interpolated fraction of THIS
-				// field's own bound chain (BoundFields==1 means the chain is
-				// exactly this leading field) over the flat default — this is
-				// what moves a two-sided range from 0.50 to its real ~0.005
-				// Same one-way ratchet as selectivityForIndex, same
-				// entries→docs conversion via the index population; the
-				// interpolation loop already skipped multikey indexes, whose
-				// entry fractions don't map to doc fractions.
-				p := DefaultRangeSelectivity
-				if fi == 0 && idx.BoundFields == 1 && idx.rangeSelTight > 0 && idx.rangeSelTight < p {
-					p = idx.rangeSelTight * indexPopulation(idx, totalDocs) / totalDocs
+				if isEquality && uniqueSingle {
+					// Equality on a single-field UNIQUE index: each bound matches at
+					// most one document (see uniqueFullKeyDocs) — bypass the sketch,
+					// whose shared-bucket floor would otherwise understate the
+					// selectivity and make a LIMIT-capped FullScan look cheap.
+					// Sparse uniques never take this branch (pass-0 filter above):
+					// a sparse index drops null/missing docs, so eq-null bounds can
+					// match far more documents than the index has entries.
+					p := float64(len(bounds)) / totalDocs
+					if p > 1.0 {
+						p = 1.0
+					}
+					pTotal *= p
+				} else if isEquality && idx.Sketch != nil && fi == 0 && sketchLevelTrusted(idx.Sketch, 0) {
+					// Equality on the index's leading field: the level-0 sketch holds
+					// the count for that field's value alone (the prefix), so this is
+					// accurate for both single-field and compound indexes.
+					est := idx.Sketch.Estimate(0, bounds[0].Start)
+					p := float64(est) / totalDocs
+					if p > 1.0 {
+						p = 1.0
+					}
 					if p <= 0 {
 						p = 0.0001
 					}
-					if p > 1 {
-						p = 1
+					pTotal *= p
+				} else if isEquality {
+					// Equality on a field but can't use sketch directly (compound index)
+					// Use a more selective estimate than default range
+					pTotal *= DefaultRangeSelectivity
+				} else {
+					// Range predicate: prefer the interpolated fraction of THIS
+					// field's own bound chain (BoundFields==1 means the chain is
+					// exactly this leading field) over the flat default — this is
+					// what moves a two-sided range from 0.50 to its real ~0.005
+					// Same one-way ratchet as selectivityForIndex, same
+					// entries→docs conversion via the index population; the
+					// interpolation loop already skipped multikey indexes, whose
+					// entry fractions don't map to doc fractions.
+					p := DefaultRangeSelectivity
+					if fi == 0 && idx.BoundFields == 1 && idx.rangeSelTight > 0 && idx.rangeSelTight < p {
+						p = idx.rangeSelTight * indexPopulation(idx, totalDocs) / totalDocs
+						if p <= 0 {
+							p = 0.0001
+						}
+						if p > 1 {
+							p = 1
+						}
 					}
+					pTotal *= p
 				}
-				pTotal *= p
 			}
 		}
 	}
@@ -1011,10 +1045,37 @@ func sparseIndexComplete(idx *CBOIndex, filter query.Filter) bool {
 	return true
 }
 
+// uniqueFullKeyDocs returns the exact row bound for a full-key equality lookup
+// on a UNIQUE index: every bound's key matches at most one entry, hence at most
+// one document, regardless of what the sketch says. The sketch is a shared-
+// bucket frequency estimate whose floor grows with the collection (~N/Size for
+// distinct values), so past ~150k docs it inflates a unique point lookup enough
+// to flip LIMIT-capped plans to FullScan. SQLite prices a fully-bound unique
+// index at one row without consulting stats (whereLoopAddBtreeIndex,
+// WHERE_ONEROW); this is the same rule. Partial prefixes are excluded —
+// uniqueness of (a,b) bounds nothing for a=x alone. Multikey/sparse entries
+// don't break the rule: unique enforcement is per entry, and a concrete
+// full-key value still maps to at most one entry.
+func uniqueFullKeyDocs(idx *CBOIndex) (float64, bool) {
+	if idx.Info.Unique && idx.PointLookup &&
+		idx.BoundFields == len(idx.Info.FieldNames) && len(idx.Bounds) > 0 {
+		return float64(len(idx.Bounds)), true
+	}
+	return 0, false
+}
+
 // selectivityForIndex returns the selectivity contribution of a specific index.
 func selectivityForIndex(idx *CBOIndex, totalDocs float64) float64 {
 	if len(idx.Bounds) == 0 {
 		return 1.0
+	}
+
+	if docs, ok := uniqueFullKeyDocs(idx); ok {
+		p := docs / totalDocs
+		if p > 1.0 {
+			p = 1.0
+		}
+		return p
 	}
 
 	// Use the sketch for any equality prefix: the level-(BoundFields-1) row holds
@@ -1055,6 +1116,10 @@ func selectivityForIndex(idx *CBOIndex, totalDocs float64) float64 {
 func estimateIndexDocsWithFieldSel(idx *CBOIndex, totalDocs float64, fieldSel []fieldSelEntry) float64 {
 	if len(idx.Bounds) == 0 {
 		return totalDocs
+	}
+
+	if docs, ok := uniqueFullKeyDocs(idx); ok {
+		return docs
 	}
 
 	// Equality prefix: the level-(BoundFields-1) sketch row gives the joint count

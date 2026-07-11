@@ -366,6 +366,108 @@ func TestBuildPlan_UniqueIndex_CoverLookup(t *testing.T) {
 	assert.Contains(t, plan.String(), "CoverLookup")
 }
 
+// TestBuildPlan_UniqueIndexPointLookup_NoFlipAtScale is the regression for the
+// sketch-floor plan flip: with ~N/DefaultSketchSize distinct values per bucket,
+// a unique-index point lookup's sketch estimate grows with the collection while
+// the true row count stays 1. Past ~150k docs the inflated estimate made
+// IndexSeek lose to a LIMIT-capped FullScan (fullScanEffective = limit/pTotal
+// collapses when pTotal is also sketch-derived). A full-key equality on a
+// UNIQUE index must be priced at len(bounds) rows, never the sketch.
+func TestBuildPlan_UniqueIndexPointLookup_NoFlipAtScale(t *testing.T) {
+	const totalDocs = 175000
+	// The bucket load a 1024-bucket sketch reports for a value occurring once.
+	inflated := uint64(totalDocs / DefaultSketchSize * 3) // a hot bucket
+	plan := BuildPlan(&PlanParams{
+		Filter:    query.MustParseCondition(`{"id": "bafyrei42"}`),
+		TotalDocs: totalDocs,
+		Limit:     1,
+		Indexes: []CBOIndex{{
+			Info:        &IndexInfo{Name: "id", FieldNames: []string{"id"}, Unique: true},
+			Sketch:      mockSketch(inflated),
+			Bounds:      mustParseBounds("id", `{"id": "bafyrei42"}`),
+			PointLookup: true,
+			BoundFields: 1,
+		}},
+	})
+	assert.Equal(t, "IndexSeek", plan.Name)
+	for _, c := range plan.Explain.Candidates {
+		if c.Name != "FullScan" {
+			assert.Equal(t, float64(1), c.EstRows, "unique point lookup must be priced at 1 row")
+		}
+	}
+}
+
+// TestBuildPlan_UniqueIndexPointLookup_OrderIndependent: the unique bypass in
+// calculateSelectivity must fire even when another index containing the same
+// field is iterated first — fields are priced by whichever index claims them
+// first, so without the unique-first pass a compound index claims the field
+// with a sketch-bucket (or DefaultRangeSelectivity for a non-leading field)
+// estimate and pTotal — which feeds estimatedYield and every candidate's
+// filtered-yield comparison — inflates by orders of magnitude.
+func TestBuildPlan_UniqueIndexPointLookup_OrderIndependent(t *testing.T) {
+	const totalDocs = 175000
+	inflated := uint64(totalDocs / DefaultSketchSize * 3)
+	plan := BuildPlan(&PlanParams{
+		Filter:    query.MustParseCondition(`{"id": "bafyrei42"}`),
+		TotalDocs: totalDocs,
+		Limit:     1,
+		Indexes: []CBOIndex{
+			{
+				// Compound non-unique index with `id` at a NON-leading position,
+				// listed before the unique index: pre-fix it claimed the field at
+				// DefaultRangeSelectivity (fi>0 skips both equality branches).
+				Info:        &IndexInfo{Name: "space_id", FieldNames: []string{"space", "id"}},
+				Sketch:      mockSketch(inflated),
+				PointLookup: false,
+				BoundFields: 0,
+			},
+			{
+				Info:        &IndexInfo{Name: "id", FieldNames: []string{"id"}, Unique: true},
+				Sketch:      mockSketch(inflated),
+				Bounds:      mustParseBounds("id", `{"id": "bafyrei42"}`),
+				PointLookup: true,
+				BoundFields: 1,
+			},
+		},
+	})
+	assert.Equal(t, "IndexSeek", plan.Name)
+	assert.Equal(t, "id", plan.IndexName)
+	// Without the unique-first pass the compound index claims `id` at
+	// DefaultRangeSelectivity (0.5); the unique claim prices it 1/totalDocs.
+	assert.Less(t, plan.Explain.Selectivity, 1e-4)
+}
+
+func TestUniqueFullKeyDocs(t *testing.T) {
+	bounds := mustParseBounds("a", `{"a": 42}`)
+	uniqueSingle := CBOIndex{
+		Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}, Unique: true},
+		Bounds:      bounds,
+		PointLookup: true,
+		BoundFields: 1,
+	}
+	docs, ok := uniqueFullKeyDocs(&uniqueSingle)
+	assert.True(t, ok)
+	assert.Equal(t, float64(1), docs)
+
+	nonUnique := uniqueSingle
+	nonUnique.Info = &IndexInfo{Name: "a", FieldNames: []string{"a"}}
+	_, ok = uniqueFullKeyDocs(&nonUnique)
+	assert.False(t, ok)
+
+	rangeLookup := uniqueSingle
+	rangeLookup.PointLookup = false
+	_, ok = uniqueFullKeyDocs(&rangeLookup)
+	assert.False(t, ok)
+
+	// Partial prefix on a compound unique index: uniqueness of (a,b) bounds
+	// nothing for a=x alone.
+	partialPrefix := uniqueSingle
+	partialPrefix.Info = &IndexInfo{Name: "ab", FieldNames: []string{"a", "b"}, Unique: true}
+	partialPrefix.BoundFields = 1
+	_, ok = uniqueFullKeyDocs(&partialPrefix)
+	assert.False(t, ok)
+}
+
 func TestBuildPlan_IndexHint(t *testing.T) {
 	boundsA := mustParseBounds("a", `{"a": 1}`)
 	boundsB := mustParseBounds("b", `{"b": 2}`)
