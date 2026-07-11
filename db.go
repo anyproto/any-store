@@ -244,6 +244,18 @@ type db struct {
 
 	syncPool *syncpool.SyncPool
 
+	// ddlUnwindGate serializes the failed-COMMIT undo unwind against new write
+	// txs. btree WriteTx.Commit releases the global write lock before
+	// returning its error (and a failed pager commit self-recovers to
+	// pagerOpen), so without this gate a writer beginning in that gap could
+	// still observe the phantom schema publications the unwind is about to
+	// revert — the I-11 corruption class. A tx that registered DDL undos holds
+	// the gate across btree Commit + unwind; newWriteTx passes through it once
+	// after acquiring the write lock. Plain data txs (no undos) skip it.
+	// The rollback and savepoint paths need no gate: their unwind runs while
+	// the btree write lock is still held.
+	ddlUnwindGate sync.Mutex
+
 	openedCollections map[string]Collection
 	// orphanFtsPending holds fts indexes of collections closed mid-write-tx
 	// with a non-empty pending buffer. flushAllFtsPending / resetAllFtsPending
@@ -339,6 +351,12 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 		return nil, err
 	}
 
+	// Pass the DDL-unwind gate (see its field comment): a prior tx whose btree
+	// commit failed may still be unwinding its schema publications after the
+	// write lock was released; block until its in-memory state is consistent.
+	db.ddlUnwindGate.Lock()
+	db.ddlUnwindGate.Unlock() //lint:ignore SA2001 gate pass-through, not a critical section
+
 	db.checkStale(&btWtx.ReadTx)
 	db.resetUncommittedSketches(&btWtx.ReadTx)
 	db.resetAllFtsPending()
@@ -349,6 +367,7 @@ func (db *db) newWriteTx(ctx context.Context) (WriteTx, error) {
 	tx.readTx = &btWtx.ReadTx
 	tx.writeTx = btWtx
 	tx.modified = false
+	tx.undo = tx.undo[:0]
 	tx.version.Store(version)
 	wTx := writeTx{commonTx: tx, version: version}
 	tx.ctx = context.WithValue(ctx, ctxKeyTx, wTx)
@@ -509,7 +528,7 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 		return nil, err
 	}
 	var coll Collection
-	err := db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+	err := db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) error {
 		tx.MarkSchemaChanged()
 
 		// Check if collection already exists in system namespace
@@ -556,8 +575,30 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 		}
 
 		db.mu.Lock()
-		defer db.mu.Unlock()
 		db.openedCollections[collectionName] = coll
+		db.mu.Unlock()
+
+		// A rollback of this scope reverts the namespace + catalog entries
+		// created above, but not the registration — a later write through the
+		// cached handle would land on the freed root page. Evict on rollback.
+		// Deliberately NOT close(): onCollectionClose unconditionally deletes
+		// by name (the guarded delete here spares a same-name handle
+		// re-registered after the rollback) and orphans non-empty fts pending
+		// buffers for the commit-time flush — but this collection's fts writes
+		// belong to the rolled-back tx and must never flush. Reset them and
+		// mark closed so the handle's own Close is a no-op.
+		wtx.onRollbackUndo(func() {
+			db.mu.Lock()
+			if cur, ok := db.openedCollections[collectionName]; ok && cur == coll {
+				delete(db.openedCollections, collectionName)
+			}
+			db.mu.Unlock()
+			cc := coll.(*collection)
+			for _, fx := range cc.loadFtsIndexes() {
+				fx.pending.reset()
+			}
+			cc.closed.Store(true)
+		})
 
 		return nil
 	})
@@ -802,31 +843,48 @@ func (db *db) WriteTx(ctx context.Context) (tx WriteTx, err error) {
 }
 
 func (db *db) doWriteTx(ctx context.Context, do func(tx *btree.WriteTx) error) error {
+	return db.doWriteTxW(ctx, func(_ WriteTx, tx *btree.WriteTx) error {
+		return do(tx)
+	})
+}
+
+// doWriteTxW is doWriteTx for DDL callbacks that publish in-memory schema
+// state and must register its reversal on the wrapper tx (onRollbackUndo, see
+// commonTx.undo) so a rollback of this scope — or of any enclosing tx — leaves
+// the in-memory maps consistent with the reverted on-disk catalog.
+func (db *db) doWriteTxW(ctx context.Context, do func(wtx WriteTx, tx *btree.WriteTx) error) error {
 	tx, err := db.WriteTx(ctx)
 	if err != nil {
 		return err
 	}
-	if err = do(tx.btreeWriteTx()); err != nil {
+	if err = do(tx, tx.btreeWriteTx()); err != nil {
 		return errors.Join(err, tx.Rollback())
 	}
 	tx.SetModified()
 	return tx.Commit()
 }
 
-func (db *db) doWriteTxModified(ctx context.Context, do func(tx *btree.WriteTx) (bool, error)) error {
+// doWriteTxModifiedW is doWriteTxModified with wrapper-tx access; see
+// doWriteTxW.
+func (db *db) doWriteTxModifiedW(ctx context.Context, do func(wtx WriteTx, tx *btree.WriteTx) (bool, error)) error {
 	tx, err := db.WriteTx(ctx)
 	if err != nil {
 		return err
 	}
 	var modified bool
-	if modified, err = do(tx.btreeWriteTx()); err != nil {
+	if modified, err = do(tx, tx.btreeWriteTx()); err != nil {
 		return errors.Join(err, tx.Rollback())
 	}
-
 	if modified {
 		tx.SetModified()
 	}
 	return tx.Commit()
+}
+
+func (db *db) doWriteTxModified(ctx context.Context, do func(tx *btree.WriteTx) (bool, error)) error {
+	return db.doWriteTxModifiedW(ctx, func(_ WriteTx, tx *btree.WriteTx) (bool, error) {
+		return do(tx)
+	})
 }
 
 func (db *db) getReadTx(ctx context.Context) (tx ReadTx, err error) {

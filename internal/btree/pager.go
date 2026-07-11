@@ -2545,9 +2545,11 @@ func (p *pager) rollbackForClose() {
 // indefinitely. Modeled after SQLite's pager_error() + pager_unlock() which
 // calls sqlite3WalEndWriteTransaction() when in PAGER_ERROR state.
 //
-// Recovery path: the cache is purged and the header is restored from the
-// saved snapshot. The next call to rollback() (or beginRead which checks
-// for pagerError) will transition back to pagerOpen.
+// Recovery path: the cache is purged, the header is restored from the saved
+// snapshot, and the state transitions back to pagerOpen before this function
+// returns — callers must NOT rely on a persistent error state to fence out
+// subsequent transactions (anystore's failed-commit DDL unwind gates itself
+// for exactly this reason; see db.ddlUnwindGate).
 // DRIFT: pagerError eager-cleans (purge/WAL-rollback/unlock); C pager_error only sets errCode, defers See docs/btree/NOTES.md#old-drift-pagererror-eager-cleanup
 func (p *pager) pagerError() {
 	p.state.Store(int32(pagerError))
