@@ -1,6 +1,7 @@
 package query
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
@@ -128,3 +129,68 @@ func TestFilterOkRawLazyCoverage(t *testing.T) {
 }
 
 var _ = fmt.Sprintf // keep fmt for debug edits
+
+// TestSortAppendKeyRawParity asserts the RawSort contract: whenever
+// AppendKeyRaw reports handled=true, the appended key bytes must equal
+// AppendKey on the parsed document — across asc/desc fields, dotted paths,
+// missing fields, arrays (as values and as blocking path containers), and
+// compressed roots.
+func TestSortAppendKeyRawParity(t *testing.T) {
+	docs := []string{
+		`{"id":1,"a":50,"name":"alice","addr":{"city":"berlin"},"tags":["x","y"]}`,
+		`{"id":2,"a":-3.5,"name":"","addr":{"city":null}}`,
+		`{"id":3,"a":"str","nested":{"deep":{"deeper":7}}}`,
+		`{"id":4,"tags":[{"k":1}],"a":true}`,
+		`{"id":5}`,
+	}
+	sortSpecs := [][]any{
+		{"a"},
+		{"-a"},
+		{"name", "-a"},
+		{"addr.city"},
+		{"-nested.deep.deeper", "id"},
+		{"missing.field"},
+		{"tags.0"},   // array container on path: must fall back (handled=false)
+		{"tags.k"},   // array of objects on path
+	}
+
+	parser := &anyenc.Parser{}
+	sp := syncpool.NewSyncPool(0)
+
+	for _, docJSON := range docs {
+		v, err := anyenc.ParseJson(docJSON)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plain := v.MarshalTo(nil)
+		compressed, _ := v.MarshalCompressed(nil, nil)
+		for _, spec := range sortSpecs {
+			s := MustParseSort(spec...)
+			rs, isRaw := s.(RawSort)
+			if !isRaw {
+				t.Fatalf("sort %v: %T does not implement RawSort", spec, s)
+			}
+			for enc, doc := range map[string][]byte{"plain": plain, "compressed": compressed} {
+				buf := sp.GetDocBuf()
+				parsed, perr := parser.ParseOwned(plain)
+				if perr != nil {
+					t.Fatal(perr)
+				}
+				want := s.AppendKey(nil, parsed)
+
+				decoded, derr := buf.Parser.DecodedDoc(doc)
+				if derr != nil {
+					t.Fatal(derr)
+				}
+				got, handled := rs.AppendKeyRaw(nil, decoded, buf)
+				if handled && !bytes.Equal(got, want) {
+					t.Errorf("parity broken (%s): doc=%s sort=%v raw=%x parsed=%x", enc, docJSON, spec, got, want)
+				}
+				if !handled && len(got) != 0 {
+					t.Errorf("unhandled must truncate (%s): doc=%s sort=%v leftover=%x", enc, docJSON, spec, got)
+				}
+				sp.ReleaseDocBuf(buf)
+			}
+		}
+	}
+}
