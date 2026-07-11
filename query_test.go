@@ -48,6 +48,41 @@ func TestCollQuery_DocCountSkipsWalkWithoutIndexes(t *testing.T) {
 	assert.Equal(t, 1, calls)
 }
 
+// TestCollQuery_InArrayMember_CountIterConsistent: an $in set containing an
+// array (including the empty array) must produce the same result via the
+// index/Count path and the filter/Iter path. In.Ok used to skip the
+// whole-array membership probe that Comp.Ok performs, so Count (index bounds
+// include whole-array keys) disagreed with Iter.
+func TestCollQuery_InArrayMember_CountIterConsistent(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"x"}}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"x":[]}`),
+		anyenc.MustParseJson(`{"id":2,"x":1}`),
+		anyenc.MustParseJson(`{"id":3,"x":[1,2]}`),
+	))
+
+	for filter, want := range map[string]int{
+		`{"x":{"$in":[[],1]}}`:  3, // [] matches doc1 whole-array; 1 matches docs 2,3
+		`{"x":{"$in":[[1,2]]}}`: 1, // whole-array member
+		`{"x":{"$in":[[],5]}}`:  1, // empty array only
+	} {
+		cnt, err := coll.Find(filter).Count(ctx)
+		require.NoError(t, err, filter)
+		assert.Equal(t, want, cnt, "Count %s", filter)
+		iterN := 0
+		it, err := coll.Find(filter).Iter(ctx)
+		require.NoError(t, err, filter)
+		for it.Next() {
+			iterN++
+		}
+		require.NoError(t, it.Close())
+		assert.Equal(t, want, iterN, "Iter %s", filter)
+	}
+}
+
 func TestCollQuery_Count(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")

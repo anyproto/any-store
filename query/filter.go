@@ -461,6 +461,15 @@ func (e In) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 		docBuf = &syncpool.DocBuffer{}
 	}
 	if v.Type() == anyenc.TypeArray {
+		// Whole-array membership first: $in is an OR of equalities, and the
+		// $eq path (Comp.Ok) matches a whole array before falling back to its
+		// elements. An empty array can ONLY match this way (it has no
+		// elements), and whole arrays are indexed alongside their elements,
+		// so IndexBounds/Count already include these matches — without this
+		// probe Iter disagreed with Count for $in sets containing an array.
+		if e.containsValue(v, docBuf) {
+			return true
+		}
 		arr, _ := v.Array()
 		for _, item := range arr {
 			if e.containsValue(item, docBuf) {

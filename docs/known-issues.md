@@ -32,6 +32,8 @@ This becomes a correctness issue *only* if any new feature uses sketch reads to 
 
 Cost: one slice allocation per write tx that mutates an indexed field; per-op O(1) append. Negligible compared to the btree work.
 
+**Status: FIXED** (verified 2026-07-11; the fix landed earlier and this entry was never closed). `db.resetUncommittedSketches` runs at every write-tx begin: a still-set `sketchModified` means a prior tx mutated the live sketch and rolled back, so the live sketch is rebased to the last committed on-disk bytes before the new tx applies its own deltas — phantom deltas are discarded instead of accumulating and are never persisted. Regression test: `TestSketchNoAccumulatingDriftAcrossRolledBackTxs` (sketch_isolation_repro_test.go). Residual (accepted): the drift of the single most recent rolled-back tx survives until the NEXT write tx begins — bounded, advisory-only, and read at most by plan choice in that window. Note the interplay recorded in I-13: any future sketch-persistence throttle must not confuse this rollback-detection flag with a committed-but-unpersisted state.
+
 ---
 
 ## I-02: Cross-process sketch staleness causes plan instability
@@ -367,6 +369,8 @@ combined limit+offset and past-the-end cutoffs, asserted against Iter).
 **Trigger:** index `{x}`, docs `{x:[]}`,`{x:1}`; `Find({x:{$in:[[],1]}}).Count()` → **2**, `Iter()` → **1**.
 
 **Impact: CORRECTNESS (Count ≠ len(Iter)), extreme corner** (an `$in` list literally containing an empty array). Fix would live in `In.IndexBounds` / unsatisfiability handling, not the count dispatch.
+
+**Status: FIXED** (2026-07-11) — on the OTHER side than sketched above. The entry assumed the Iter path was right and the Count path wrong; empirically it is the reverse: whole arrays ARE indexed alongside their elements and `Comp.Ok` ($eq) matches a whole array before falling back to elements (`Find({x:{$eq:[1,2]}})` was already consistent on both paths), so `$in` — an OR of equalities — was the odd one out: `In.Ok` only probed per-element membership. Worse than filed: `$in:[[1,2]]` gave Count=1/Iter=0 for a doc `{x:[1,2]}` (missed matches, not just the empty-array corner). Fix: `In.Ok` probes whole-array membership before iterating elements, mirroring `Comp.Ok`; matches MongoDB semantics. Tests: `TestIn` whole/empty/different-array subtests, `TestCollQuery_InArrayMember_CountIterConsistent` (Count==Iter across the trigger cases; red pre-fix).
 
 ---
 

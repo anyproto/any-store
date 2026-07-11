@@ -544,6 +544,24 @@ func TestIn(t *testing.T) {
 		assert.False(t, f.Ok(doc, docBuf))
 	})
 
+	// $in is an OR of equalities: an array member of the set must match the
+	// WHOLE field array, mirroring Comp.Ok — an empty array can only match
+	// this way, and the index/Count path already includes these matches.
+	t.Run("ok whole array member", func(t *testing.T) {
+		f, err := ParseCondition(`{"b": {"$in": [[3,2,1], 9]}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(doc, docBuf))
+	})
+	t.Run("ok empty array member", func(t *testing.T) {
+		f, err := ParseCondition(`{"e": {"$in": [[], 9]}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"e":[]}`), docBuf))
+	})
+	t.Run("not ok different whole array", func(t *testing.T) {
+		f, err := ParseCondition(`{"b": {"$in": [[1,2,3]]}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(doc, docBuf))
+	})
 }
 
 func TestIn_IndexBounds(t *testing.T) {
