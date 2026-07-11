@@ -146,12 +146,14 @@ func TestDropIndexRollback_RestoresIndex(t *testing.T) {
 	require.NoError(t, fx.IntegrityCheck(ctx))
 }
 
-// Rename inside a rolled-back tx must restore the in-memory name, which keys
-// sketch persistence and index metadata.
+// Rename inside a rolled-back tx must restore the in-memory name, the
+// openedCollections key, the index generation and (via the btree rollback)
+// the namespaces themselves.
 func TestRenameRollback_RestoresName(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "old")
 	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
 
 	tx, err := fx.WriteTx(ctx)
 	require.NoError(t, err)
@@ -163,6 +165,107 @@ func TestRenameRollback_RestoresName(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, names, "old")
 	assert.NotContains(t, names, "new")
+
+	// Map key restored: the cached handle answers for the old name, nothing
+	// answers for the new one.
+	sameColl, err := fx.OpenCollection(ctx, "old")
+	require.NoError(t, err)
+	assert.Same(t, coll, sameColl, "rolled-back rename must keep the handle keyed by the old name")
+	_, err = fx.OpenCollection(ctx, "new")
+	assert.ErrorIs(t, err, ErrCollectionNotFound)
+
+	// Namespace restore comes from the btree rollback — assert it, don't
+	// assume it.
+	nsNames, err := fx.DB.(*db).btreeDB.ListNamespaces()
+	require.NoError(t, err)
+	assert.Contains(t, nsNames, "old")
+	assert.Contains(t, nsNames, "ix:old:a")
+	assert.NotContains(t, nsNames, "new")
+	assert.NotContains(t, nsNames, "ix:new:a")
+
 	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"1"}`)))
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// Savepoint scope: a rename inside a rolled-back nested tx unwinds while the
+// outer tx stays alive and writable through the same handle.
+func TestRenameSavepointRollback_UnwindsOnlyNested(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "a")
+	require.NoError(t, err)
+
+	outer, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	nested, err := fx.WriteTx(outer.Context())
+	require.NoError(t, err)
+	require.NoError(t, coll.Rename(nested.Context(), "b"))
+	require.NoError(t, nested.Rollback())
+
+	assert.Equal(t, "a", coll.Name())
+	require.NoError(t, coll.Insert(outer.Context(), anyenc.MustParseJson(`{"id":"1"}`)))
+	require.NoError(t, outer.Commit())
+
+	names, err := fx.GetCollectionNames(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, names, "a")
+	assert.NotContains(t, names, "b")
+	cnt, err := coll.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, cnt)
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// After a rolled-back rename the target name must be freely creatable and
+// isolated from the original collection.
+func TestRenameRollback_NewNameReusable(t *testing.T) {
+	fx := newFixture(t)
+	collA, err := fx.CreateCollection(ctx, "a")
+	require.NoError(t, err)
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, collA.Rename(tx.Context(), "b"))
+	require.NoError(t, tx.Rollback())
+
+	collB, err := fx.CreateCollection(ctx, "b")
+	require.NoError(t, err)
+	require.NoError(t, collA.Insert(ctx, anyenc.MustParseJson(`{"id":"in-a"}`)))
+	require.NoError(t, collB.Insert(ctx, anyenc.MustParseJson(`{"id":"in-b"}`)))
+	_, err = collB.FindId(ctx, "in-a")
+	assert.ErrorIs(t, err, ErrDocNotFound)
+	_, err = collA.FindId(ctx, "in-b")
+	assert.ErrorIs(t, err, ErrDocNotFound)
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// Rename then Drop in one rolled-back tx: the undo log runs in reverse (Drop's
+// eviction first, then the rename undo), and the original handle must come
+// back alive under the old name — the "zombie heals itself" property of the
+// identity-guarded undo.
+func TestRenameThenDropRollback_HandleHeals(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "a")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"1"}`)))
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.Rename(tx.Context(), "b"))
+	require.NoError(t, coll.Drop(tx.Context()))
+	require.NoError(t, tx.Rollback())
+
+	// The dropped-then-rolled-back handle is closed; a fresh open under the
+	// old name must find the collection with its data intact.
+	reopened, err := fx.OpenCollection(ctx, "a")
+	require.NoError(t, err)
+	cnt, err := reopened.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, cnt)
+	require.NoError(t, reopened.Insert(ctx, anyenc.MustParseJson(`{"id":"2"}`)))
+
+	names, err := fx.GetCollectionNames(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, names, "a")
+	assert.NotContains(t, names, "b")
 	require.NoError(t, fx.IntegrityCheck(ctx))
 }

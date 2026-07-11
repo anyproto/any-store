@@ -1092,6 +1092,52 @@ func (db *DB) DeleteNamespace(tx *WriteTx, name string) error {
 	return nil
 }
 
+// RenameNamespace renames a namespace: the master-table entry is re-keyed from
+// oldName to newName; the root page (and the whole tree) is untouched. This is
+// the analog of SQLite's ALTER TABLE ... RENAME sqlite_master name update —
+// except the master table here is keyed BY the name, so the re-key is a
+// Delete+Put within the same transaction (atomic at commit).
+// Must be called within a write transaction. Like CreateNamespace and
+// DeleteNamespace, it does NOT bump the schema cookie — the caller must call
+// tx.MarkSchemaChanged(). On a mid-way error the enclosing transaction must be
+// rolled back (the master table may be missing the entry), the same contract
+// as a CreateNamespace failure after page allocation.
+// Existing *Namespace handles for oldName remain valid for data operations
+// (they address the tree by root page); only their Name() goes stale.
+func (db *DB) RenameNamespace(tx *WriteTx, oldName, newName string) error {
+	if tx.closed {
+		return ErrTxClosed
+	}
+
+	// Resolve the old namespace via the writer path (sees dirty pages from
+	// the current write tx; page 1 may be an interior node after splits).
+	ns, err := db.getNamespaceLocked(oldName)
+	if err != nil {
+		return err
+	}
+	if oldName == newName {
+		return nil
+	}
+
+	// The target name must be free.
+	_, err = db.getNamespaceLocked(newName)
+	if err == nil {
+		return ErrNamespaceExists
+	}
+	if !errors.Is(err, ErrNamespaceNotFound) {
+		return err
+	}
+
+	// Re-key the master-table cell; the root page is reused, no pages freed.
+	bt := &btree{pager: db.pager, rootPage: 1, walMaxFrame: tx.walHdr.mxFrame, writable: true}
+	if err = bt.Delete([]byte(oldName)); err != nil {
+		return err
+	}
+	var rootPgBuf [4]byte
+	binary.BigEndian.PutUint32(rootPgBuf[:], ns.rootPage)
+	return bt.Put([]byte(newName), rootPgBuf[:])
+}
+
 // maxTreeDepth bounds freeTreePages recursion. It is a conservative cap far
 // above any real B-tree height for this page size; exceeding it implies a
 // cyclic/self-referencing child pointer and is treated as corruption. This is
@@ -1998,4 +2044,14 @@ func (tx *WriteTx) DeleteNamespace(name string) error {
 		return ErrTxClosed
 	}
 	return tx.db.DeleteNamespace(tx, name)
+}
+
+// RenameNamespace renames a namespace within this transaction. See
+// DB.RenameNamespace for the contract (root page unchanged, caller bumps the
+// schema cookie, existing handles keep working by root page).
+func (tx *WriteTx) RenameNamespace(oldName, newName string) error {
+	if tx.closed {
+		return ErrTxClosed
+	}
+	return tx.db.RenameNamespace(tx, oldName, newName)
 }
