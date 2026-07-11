@@ -10,8 +10,43 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/query"
 )
+
+// fixedCountTx stands in for the read tx in docCount tests: it reports how
+// often the fallback namespace walk ran.
+type fixedCountTx struct {
+	count int
+	calls *int
+}
+
+func (f fixedCountTx) Count(ns *btree.Namespace) (int, error) {
+	*f.calls++
+	return f.count, nil
+}
+
+// TestCollQuery_DocCountSkipsWalkWithoutIndexes guards the plan-path shortcut:
+// with no secondary indexes the planner has a single candidate, so
+// docCountForPlan must not pay the O(namespace pages) tx.Count walk before
+// every query; docCountExact (Explain) always returns the real number.
+func TestCollQuery_DocCountSkipsWalkWithoutIndexes(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	q := &collQuery{c: coll.(*collection)}
+	idxs := q.c.loadIndexes()
+	require.Empty(t, idxs)
+
+	var calls int
+	tx := fixedCountTx{count: 42, calls: &calls}
+
+	assert.Equal(t, 0, q.docCountForPlan(tx, idxs))
+	assert.Equal(t, 0, calls, "plan-path docCount must skip the namespace walk with no secondary indexes")
+
+	assert.Equal(t, 42, q.docCountExact(tx, idxs), "explain-path docCount must stay exact")
+	assert.Equal(t, 1, calls)
+}
 
 func TestCollQuery_Count(t *testing.T) {
 	fx := newFixture(t)

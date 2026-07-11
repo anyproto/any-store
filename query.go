@@ -229,7 +229,7 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		Limit:       int(q.limit),
 		Offset:      int(q.offset),
 		Buf:         buf,
-		TotalDocs:   q.docCount(btx),
+		TotalDocs:   q.docCountForPlan(btx, idxs),
 		Indexes:     q.buildCBOIndexesInto(nil, &br, idxs, btx),
 		IndexHints:  q.buildIndexHints(),
 		FieldBounds: &br,
@@ -307,7 +307,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 			Limit:       int(q.limit),
 			Offset:      int(q.offset),
 			Buf:         buf,
-			TotalDocs:   q.docCount(btx),
+			TotalDocs:   q.docCountForPlan(btx, idxs),
 			Indexes:     q.buildCBOIndexesInto(nil, &br, idxs, btx),
 			IndexHints:  q.buildIndexHints(),
 			FieldBounds: &br,
@@ -455,7 +455,7 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 			Limit:       int(q.limit),
 			Offset:      int(q.offset),
 			Buf:         buf,
-			TotalDocs:   q.docCount(btx),
+			TotalDocs:   q.docCountForPlan(btx, idxs),
 			Indexes:     q.buildCBOIndexesInto(nil, &br, idxs, btx),
 			IndexHints:  q.buildIndexHints(),
 			FieldBounds: &br,
@@ -596,7 +596,7 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 			Limit:       int(q.limit),
 			Offset:      int(q.offset),
 			Buf:         buf,
-			TotalDocs:   q.docCount(tx),
+			TotalDocs:   q.docCountForPlan(tx, idxs),
 			Indexes:     cboIndexes,
 			IndexHints:  q.buildIndexHints(),
 			CountOnly:   true,
@@ -683,7 +683,7 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 				Limit:       int(q.limit),
 				Offset:      int(q.offset),
 				Buf:         buf,
-				TotalDocs:   q.docCount(tx),
+				TotalDocs:   q.docCountExact(tx, idxs),
 				Indexes:     cboIndexes,
 				IndexHints:  q.buildIndexHints(),
 				FieldBounds: &br,
@@ -748,12 +748,39 @@ func (q *collQuery) pkBounds() query.Bounds {
 	return idBounds
 }
 
-// docCount returns the total number of documents from the first index's sketch DocCount.
-// Falls back to tx.Count() if no indexes have sketches.
-func (q *collQuery) docCount(tx interface {
+// countTx is the read-tx capability docCount needs.
+type countTx interface {
 	Count(ns *btree.Namespace) (int, error)
-}) int {
-	for _, idx := range q.c.loadIndexes() {
+}
+
+// docCountForPlan returns TotalDocs for the planner's cost model: the first
+// index sketch's DocCount, falling back to tx.Count() — a full namespace page
+// walk — when no index has a published sketch yet.
+//
+// With no secondary indexes at all, FullScan is the planner's only candidate,
+// so the count can shift cost numbers but never the outcome. Paying an
+// O(namespace pages) walk before every query on exactly the collections that
+// need no secondary index (pk-ordered schemas) is pure waste — return 0 and
+// let BuildPlan clamp it. Explain uses docCountExact instead. idxs is the
+// caller's loadIndexes() snapshot — the same one its CBO candidates are built
+// from, so the count and the candidates can't disagree about the index set.
+func (q *collQuery) docCountForPlan(tx countTx, idxs []*index) int {
+	for _, idx := range idxs {
+		if s := idx.loadPubSketch(); s != nil {
+			return int(s.GetDocCount())
+		}
+	}
+	if len(idxs) == 0 {
+		return 0
+	}
+	count, _ := tx.Count(q.c.ns)
+	return count
+}
+
+// docCountExact is docCountForPlan without the no-indexes shortcut: Explain
+// reports TotalDocs to humans, so it pays the walk for a real number.
+func (q *collQuery) docCountExact(tx countTx, idxs []*index) int {
+	for _, idx := range idxs {
 		if s := idx.loadPubSketch(); s != nil {
 			return int(s.GetDocCount())
 		}
