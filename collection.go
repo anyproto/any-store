@@ -792,7 +792,7 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 	if len(info) == 0 {
 		return nil
 	}
-	return c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+	return c.db.doWriteTxModifiedW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (modified bool, txErr error) {
 		var newIndexes []*index
 		var newFtsIndexes []*ftsIndex
 		var newVIndexes []*vectorIndex
@@ -841,6 +841,7 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		c.registerIndexSetRestore(wtx)
 		// Copy-on-write publish: build fresh slices (current snapshot + new
 		// indexes) and swap them in atomically so lock-free query readers always
 		// see a complete generation.
@@ -866,6 +867,24 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 			c.storeVectorIndexes(merged)
 		}
 		return true, nil
+	})
+}
+
+// registerIndexSetRestore snapshots the collection's three index sets and
+// registers their restoration on rollback of the given tx scope (see
+// commonTx.undo). A reverted DDL must not leave the in-memory sets pointing at
+// state the on-disk catalog no longer has (a created index over freed
+// namespace pages) or missing state it still has (a rolled-back drop whose
+// index would silently stop being maintained). Call with c.mu held, BEFORE
+// swapping; restoring an unchanged set is a harmless pointer store.
+func (c *collection) registerIndexSetRestore(wtx WriteTx) {
+	prevIndexes, prevFts, prevVec := c.loadIndexes(), c.loadFtsIndexes(), c.loadVectorIndexes()
+	wtx.onRollbackUndo(func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.storeIndexes(prevIndexes)
+		c.storeFtsIndexes(prevFts)
+		c.storeVectorIndexes(prevVec)
 	})
 }
 
@@ -1003,7 +1022,7 @@ func (c *collection) buildFtsIndex(tx *btree.WriteTx, fx *ftsIndex) error {
 }
 
 func (c *collection) DropIndex(ctx context.Context, indexName string) (err error) {
-	return c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (txErr error) {
+	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (txErr error) {
 		tx.MarkSchemaChanged()
 		// The write transaction began via checkStale, which reconciled the index
 		// set against on-disk metadata. So the snapshot here reflects on-disk
@@ -1011,6 +1030,7 @@ func (c *collection) DropIndex(ctx context.Context, indexName string) (err error
 		// a peer dropped is absent (return ErrIndexNotFound, not a false success).
 		c.mu.Lock()
 		defer c.mu.Unlock()
+		c.registerIndexSetRestore(wtx)
 
 		// Vector index drop: unregister, delete its namespaces, republish.
 		for _, vi := range c.loadVectorIndexes() {
@@ -1132,7 +1152,7 @@ func (c *collection) GetIndexes() (indexes []Index) {
 }
 
 func (c *collection) Rename(ctx context.Context, newName string) error {
-	return c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (err error) {
+	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (err error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 
@@ -1142,7 +1162,16 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 
 		// Note: btree namespaces can't be renamed, so we keep the old namespace
 		// but update the name in our metadata
+		oldName := c.name
 		c.name = newName
+		// A rollback restores the old name in the catalog; the in-memory name —
+		// which derives sketch keys, index metadata keys and the
+		// openedCollections mapping — must follow (see commonTx.undo).
+		wtx.onRollbackUndo(func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.name = oldName
+		})
 		return nil
 	})
 }

@@ -412,9 +412,15 @@ Collection with a custom pk and a UNIQUE single-field index on `id` (random CID-
 
 **Workaround (any-sync):** treat a failed create-space tx as poisoning the whole DB handle — close and reopen it before any retry.
 
-**Reproducer:** `docs/repro/i11-stale-handle-rollback/main.go`.
+**Reproducer:** `docs/repro/i11-stale-handle-rollback/main.go` (post-fix it demonstrates the correct behavior: the re-acquired handle is fresh and the write lands in the right collection).
 
-**Status: OPEN — empirically confirmed 2026-07-11.** Dynamic repro through the public API: create "x" via `tx.Context()`, `tx.Rollback()`, create "y" (reuses x's freed root page), insert through the stale "x" handle → the document lands inside collection "y" (`y.FindId` returns it, y's count grows) and `IntegrityCheck` passes before AND after reopen — the corruption is logical, not structural. Before the freed page is reused the write fails loudly (`btree: database is corrupt`); the silent phase starts on page reuse. Two additions to the write-up: (1) the trigger is broader than ambient-tx rollback — in the standalone path the handle is registered before `tx.Commit()`, so a failed commit poisons it the same way; (2) "re-validate at tx begin" does NOT work as a fix: `checkStale` triggers on the schema cookie, which a rollback never bumps. Chosen fix direction: per-tx tracking of created collections/indexes, evicted in both `writeTx.Rollback` and `savepointWrapper.Rollback`, mirroring the existing fts-pending pattern (`flushAllFtsPending`/`resetAllFtsPending`, tx.go).
+**Status: FIXED** (2026-07-11, ddl-rollback-eviction). Empirically confirmed first: create "x" via `tx.Context()`, `tx.Rollback()`, create "y" (reuses x's freed root page), insert through the stale "x" handle → the document landed inside collection "y" (`y.FindId` returned it) while `IntegrityCheck` passed before AND after reopen — logical, not structural corruption. Before page reuse the write failed loudly (`btree: database is corrupt`); the silent phase started on reuse. Two additions to the write-up: (1) the trigger is broader than ambient-tx rollback — the handle is registered before `tx.Commit()`, so a failed top-level commit poisons it the same way (also covered by the fix); (2) "re-validate at tx begin" does NOT work: `checkStale` triggers on the schema cookie, which a rollback never bumps.
+
+Fix: a per-tx undo log on `commonTx` (`tx.go`). Every DDL that publishes in-memory schema state registers its reversal via `onRollbackUndo`: CreateCollection (evict + reset phantom fts pendings + mark closed), CreateIndexes/EnsureIndex and DropIndex (restore pre-change index-set snapshots via the shared `registerIndexSetRestore` — a rolled-back create otherwise maintains an index over freed pages, a rolled-back drop silently stops maintaining a live one), Rename (restore the name). Undos run in reverse order on top-level rollback, failed commit, and savepoint rollback (`savepointTx` records a mark, so a nested rollback unwinds only its own scope while a release keeps entries registered for the outer tx). `Drop` needs no undo: it closes and evicts at drop time, which is rollback-safe.
+
+Locking (from the adversarial review of the fix): the unwind must run inside the btree write critical section — `writeTx.Rollback` and the flush-failure commit paths run it BEFORE the btree rollback (which releases the global write lock); savepoint rollback keeps the lock throughout; the failed-COMMIT path is the exception (btree `Commit` releases the lock before returning its error, and a failed pager commit self-recovers to `pagerOpen` — no persistent error state fences writers), so it is serialized by `db.ddlUnwindGate`, held across btree commit + unwind by DDL-bearing txs and passed through once by `newWriteTx`.
+
+Known residual (pre-existing, broader than this bug): the `closed` flag is not checked by collection operations, so a caller that retains a handle across a rollback/Drop can still misuse it — eviction guarantees every NEWLY acquired handle is consistent with disk. See also I-16 (Rename never re-keys `openedCollections`; pre-existing, surfaced by this review). Tests: `ddl_rollback_test.go` (5 cases, all red pre-fix); race detector clean.
 
 ---
 
@@ -505,3 +511,20 @@ mapping into RSS; mmap is off by default), Go heap high-water from allocation ch
 the fix is periodic intra-backup commits done as temp-path + atomic rename (the "mark invalid until Finish" idea is
 over-engineered — `db.Backup` already writes a fresh file and removes it on error; a crash-abandoned partial file is the
 thing to protect against, and rename-on-success handles it).
+
+---
+
+## I-16: `Rename` never re-keys `db.openedCollections` — old-name key and live handle diverge
+
+**Discovered:** 2026-07-11, during the adversarial review of the I-11 fix (pre-existing; NOT introduced by the DDL undo log).
+
+**Affected code:**
+- `collection.go` `Rename` — updates `c.name` (and the on-disk catalog via `renameCollection`) but never moves the `db.openedCollections` map entry, which stays keyed by the old name.
+- `db.go` `onCollectionClose` — deletes by `c.name` (the NEW name), missing the entry keyed by the old one.
+
+**Failure mode:**
+Open "A" (map key "A"), `Rename(A→B)`: the handle now answers to `c.name = "B"` but is registered under "A". `OpenCollection("B")` misses the map and opens a SECOND handle for the same namespace — two live handles with independent in-memory index sets and sketches for one collection. Worse combined sequence: Rename A→B then `Drop` in one rolled-back tx — Drop's `onCollectionClose` deletes key "B" (absent), leaving a closed handle permanently registered under "A"; the rename undo restores `c.name = "A"`, so `OpenCollection("A")` afterwards returns a closed handle for a collection that still exists on disk.
+
+**Impact: CORRECTNESS (two-handle divergence: writes through one handle don't maintain indexes the other created), narrow trigger** (Rename is rare in practice).
+
+**Fix sketch:** re-key `openedCollections` inside `Rename` (delete old key, insert new, both under `db.mu`) with a matching rollback undo (`onRollbackUndo`) restoring the old key; make `onCollectionClose` tolerate either key or take the key as a parameter.
