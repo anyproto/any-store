@@ -231,12 +231,14 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 	// divider keys here (full keys, overflow resolved) but defers the parent
 	// rewrite to one wholesale splice at the end (deviation 2): dropping cells
 	// in place is unnecessary when the parent is rebuilt from scratch.
-	apOld := make([]*page, nOld)
+	var apOldArr [nbSiblings]*page
+	apOld := apOldArr[:nOld]
 	// dividerKey[g] is the parent divider key separating gathered child g and
 	// g+1 (g in 0..nOld-2). For interior siblings it is folded into a pooled
 	// divider cell; for leaf siblings it is unused (the divider is re-derived
 	// from the boundary cell — deviation 1).
-	dividerKey := make([][]byte, nOld-1)
+	var dividerKeyArr [nbSiblings - 1][]byte
+	dividerKey := dividerKeyArr[:nOld-1]
 
 	// getChild resolves a parent child slot (0..nCellParent) to its page
 	// number: a cell's leftChild, or the page rightChild. Mirrors SQLite's
@@ -302,7 +304,20 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 	// leafCorrection: 4 if siblings are leaves, else 0 (btree.c:8429). In the
 	// size loop below it is the per-page header allowance baked into
 	// usableSpace; here it also marks whether divider cells are pooled.
+	// cells/sz (SQLite apCell[]/szCell[]) draw on the pager scratch free-lists —
+	// SQLite likewise carves them from one per-balance scratch allocation
+	// (btree.c:8552-8560 szScratch) rather than growing fresh storage. The defer
+	// recycles whatever capacity the appends below converged on; on a cascade
+	// (rewriteParentAfterBalance → insertSepIntoAncestor → balanceNonroot on the
+	// parent) the nested call takes its own entries and the bounded pools fall
+	// back to make() when exhausted.
 	b := &cellArray{leaf: leaf, usableSize: usableSize}
+	b.cells = bt.pager.takeCellSlice(0)
+	b.sz = bt.pager.szScratch.take(0)
+	defer func() {
+		bt.pager.recycleCellSlice(b.cells)
+		bt.pager.szScratch.put(b.sz)
+	}()
 
 	// tailChildCapture is the rightmost gathered sibling's (possibly
 	// injection-repointed) rightChild, captured during pooling for the interior
@@ -315,12 +330,12 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 	var cellBufs [][]byte
 	// cntOld[g] = index in b.cells just past the last cell of old page g
 	// (pointing AT the divider cell for interior pools). Port of btree.c cntOld.
-	cntOld := make([]int, nbMaxOut)
+	var cntOld [nbMaxOut]int
 	// szOld[g] = bytes used by old page g's OWN cells incl. their 2-byte
 	// pointers, EXCLUDING any divider — equals SQLite's seed
 	// szNew[i] = usableSpace - p->nFree (btree.c:8557), which also excludes the
 	// divider. Computed directly here from the pooled cell sizes.
-	szOld := make([]int, nbMaxOut)
+	var szOld [nbMaxOut]int
 
 	releaseAll := func() {
 		for j := 0; j < nOld; j++ {
@@ -461,8 +476,7 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 	leafDataLike := leaf                            // see file header deviation (1)
 	usableSpace := usableSize - 12 + leafCorrection // btree.c:8543
 
-	cntNew := make([]int, nbMaxOut)
-	szNew := make([]int, nbMaxOut)
+	var cntNew, szNew [nbMaxOut]int
 	for g := 0; g < nOld; g++ {
 		szNew[g] = szOld[g]   // btree.c:8557 (seed = used bytes of old page g)
 		cntNew[g] = cntOld[g] // btree.c:8561
@@ -512,7 +526,7 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 		}
 		if cntNew[g] >= nCellPool { // btree.c:8599-8600
 			k = g + 1
-		} else if cntNew[g] <= boundaryLeft(cntNew, g) { // btree.c:8601-8604
+		} else if cntNew[g] <= boundaryLeft(cntNew[:], g) { // btree.c:8601-8604
 			releaseAll()
 			return ErrCorrupt
 		}
@@ -553,7 +567,7 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 		}
 		szNew[g] = szRight
 		szNew[g-1] = szLeft
-		if cntNew[g-1] <= boundaryLeft(cntNew, g-1) { // btree.c:8645-8648
+		if cntNew[g-1] <= boundaryLeft(cntNew[:], g-1) { // btree.c:8645-8648
 			releaseAll()
 			return ErrCorrupt
 		}
@@ -573,7 +587,8 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 	// ---- Step 7: allocate k pages, reuse old (btree.c:8668-8699) ------------
 	// Reuse apOld[0..min(nOld,nNew)-1] in place; allocate the rest. The pgno
 	// ascending sort (btree.c:8713-8741) is omitted — deviation 4.
-	apNew := make([]*page, nNew)
+	var apNewArr [nbMaxOut]*page
+	apNew := apNewArr[:nNew]
 	for g := 0; g < nNew; g++ {
 		if g < nOld {
 			apNew[g] = apOld[g]
@@ -609,7 +624,8 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 	// rebuilding apNew[g] (which may alias apOld[g]) can never clobber an
 	// unread source page — so SQLite's two-pass abDone ordering
 	// (btree.c:8915-8952) is unnecessary (deviation 2).
-	newDivKey := make([][]byte, nNew-1) // divider key between apNew[g], apNew[g+1]
+	var newDivKeyArr [nbMaxOut - 1][]byte
+	newDivKey := newDivKeyArr[:nNew-1] // divider key between apNew[g], apNew[g+1]
 
 	start := 0
 	for g := 0; g < nNew; g++ {
@@ -664,7 +680,8 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 	}
 
 	// Capture the new pgnos before releasing the output pages.
-	newPgno := make([]uint32, nNew)
+	var newPgnoArr [nbMaxOut]uint32
+	newPgno := newPgnoArr[:nNew]
 	for g := 0; g < nNew; g++ {
 		newPgno[g] = apNew[g].pgno
 	}
@@ -673,7 +690,8 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 	// Pages apOld[nNew..nOld) were not reused. Release our pin first (freePage
 	// re-acquires the trunk via getWritablePage and marks the freed page
 	// dontWrite), matching the merge path (btree.go:2552-2556).
-	surplus := make([]uint32, 0, nOld)
+	var surplusArr [nbSiblings]uint32
+	surplus := surplusArr[:0]
 	for g := nNew; g < nOld; g++ {
 		if apOld[g] != nil {
 			surplus = append(surplus, apOld[g].pgno)
@@ -830,8 +848,16 @@ func (bt *btree) rewriteParentAfterBalance(
 	// Old children (nc+1) and old divider keys (nc). oldDivs aliases parentBuf
 	// (non-overflow keys) / the freshly-read overflow keys — both valid until the
 	// deferred recycle above, which fires only after newCells is rebuilt.
-	oldChildren := make([]uint32, nc+1)
-	oldDivs := make([][]byte, nc)
+	// All five splice slices below draw on the pager scratch free-lists (with a
+	// make() fallback when a nested cascade has the pooled entries checked out)
+	// and are recycled on every exit: their contents are fully consumed by the
+	// rebuildInteriorPage calls / the cloned sepKey before this function returns.
+	oldChildren := bt.pager.pgnoScratch.takeOrMake(nc + 1)[:nc+1]
+	oldDivs := bt.pager.keyScratch.takeOrMake(nc)[:nc]
+	defer func() {
+		bt.pager.pgnoScratch.put(oldChildren)
+		bt.pager.keyScratch.put(oldDivs)
+	}()
 	for j := 0; j < nc; j++ {
 		oldChildren[j] = parentCells[j].leftChild
 		oldDivs[j] = parentCells[j].key
@@ -853,7 +879,8 @@ func (bt *btree) rewriteParentAfterBalance(
 	}
 
 	// Splice children: keep [0, nxDiv); insert newPgno; keep [nxDiv+nOld, nc].
-	newChildren := make([]uint32, 0, nc+1-nOld+nNew)
+	newChildren := bt.pager.pgnoScratch.takeOrMake(nc + 1 - nOld + nNew)
+	defer func() { bt.pager.pgnoScratch.put(newChildren) }()
 	newChildren = append(newChildren, oldChildren[:nxDiv]...)
 	newChildren = append(newChildren, newPgno...)
 	newChildren = append(newChildren, oldChildren[nxDiv+nOld:]...)
@@ -863,7 +890,8 @@ func (bt *btree) rewriteParentAfterBalance(
 	// connecting kept child to newPgno[0]) and [nxDiv+nOld-1, nc) (right, incl.
 	// div_{nxDiv+nOld-1} connecting newPgno[last] to the kept child after the
 	// run). The new internal dividers (nNew-1) go between the spliced children.
-	newDivs := make([][]byte, 0, nc-(nOld-1)+(nNew-1))
+	newDivs := bt.pager.keyScratch.takeOrMake(nc - (nOld - 1) + (nNew - 1))
+	defer func() { bt.pager.keyScratch.put(newDivs) }()
 	newDivs = append(newDivs, oldDivs[:nxDiv]...)
 	newDivs = append(newDivs, newDivKey...)
 	if nxDiv+nOld-1 < nc {
@@ -877,7 +905,8 @@ func (bt *btree) rewriteParentAfterBalance(
 
 	// Build the new parent cell list: P'_j = {leftChild: newChildren[j],
 	// key: newDivs[j]} for j in 0..len(newDivs)-1; rightChild = last child.
-	newCells := make([]cellData, len(newDivs))
+	newCells := bt.pager.cellSliceScratch.takeOrMake(len(newDivs))[:len(newDivs)]
+	defer func() { bt.pager.recycleCellSlice(newCells) }()
 	for j := range newDivs {
 		newCells[j] = cellData{leftChild: newChildren[j], key: newDivs[j]}
 	}
