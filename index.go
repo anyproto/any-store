@@ -364,6 +364,36 @@ func (idx *index) loadPubSketch() *qplanner.IndexSketch { return idx.sketchPub.L
 // serialisation, like storeIndexes); readers need no lock.
 func (idx *index) storePubSketch(s *qplanner.IndexSketch) { idx.sketchPub.Store(s) }
 
+// cloneWithNs returns a copy of the index bound to a different namespace
+// handle; Rename publishes clones copy-on-write (via storeIndexes) because
+// concurrent readers access idx.ns lock-free, so the field can't be mutated
+// in place. Field-by-field, not a struct copy (sketchPub is an atomic).
+// The live sketch pointer is SHARED with the original: the single writer is
+// the only mutator, and after storeIndexes the writer path loads the clone.
+// Scratch buffers start zero and regrow lazily.
+func (idx *index) cloneWithNs(ns *btree.Namespace) *index {
+	n := &index{
+		c:              idx.c,
+		info:           idx.info,
+		ns:             ns,
+		fieldNames:     idx.fieldNames,
+		fieldPaths:     idx.fieldPaths,
+		reverse:        idx.reverse,
+		sketch:         idx.sketch,
+		sketchModified: idx.sketchModified,
+		// uniqBuf and curBounds are indexed by field position, not appended —
+		// they must be pre-sized like init does.
+		uniqBuf:   make([][]anyenc.Tuple, len(idx.fieldPaths)),
+		curBounds: make([]int, len(idx.fieldPaths)),
+	}
+	// cboInfo embeds the namespace handle — rebuild it around the new one.
+	cbo := *idx.cboInfo
+	cbo.Ns = ns
+	n.cboInfo = &cbo
+	n.sketchPub.Store(idx.loadPubSketch())
+	return n
+}
+
 func validateIndexField(s string) (err error) {
 	if s == "" || s == "-" {
 		return fmt.Errorf("index field is empty")
