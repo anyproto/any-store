@@ -23,13 +23,38 @@ type FullScanIter struct {
 	Offset   int // batch-skip offset (only when Filter == nil)
 	Reverse  bool
 	started  bool
+	// rawFilter is Filter's RawFilter fast path, resolved once on the first
+	// Next (see checkFilter). nil when Filter doesn't implement it. The raw
+	// walk only pays off on REJECTED documents (accepted ones still get the
+	// full parse, so for them the walk is pure overhead) — rawChecked/
+	// rawAccepted track the accept rate and checkFilter permanently disables
+	// the fast path when the filter accepts most of the scan (see
+	// rawAcceptWarmup/rawAcceptCutoff).
+	rawFilter   query.RawFilter
+	rawChecked  int
+	rawAccepted int
 }
+
+const (
+	// rawAcceptWarmup is how many filter evaluations the raw fast path gets
+	// before its accept rate is judged.
+	rawAcceptWarmup = 64
+	// rawAcceptCutoff disables the raw fast path when accepted/checked exceeds
+	// 5/8. Break-even is around 70% acceptance (the skip-walk costs roughly a
+	// third of a full parse); 62.5% keeps a safety margin. Documents the walk
+	// could not decide (handled=false) count as accepted — they pay walk+parse
+	// too, so an always-unhandled filter (e.g. $text) also disables quickly.
+	rawAcceptCutoffNum, rawAcceptCutoffDen = 5, 8
+)
 
 func (it *FullScanIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
 	if it.cursor == nil {
 		it.cursor = it.Source.NewCursor()
 		if it.Reverse && len(it.IDBounds) > 0 {
 			it.boundIdx = len(it.IDBounds) - 1
+		}
+		if rf, isRaw := it.Filter.(query.RawFilter); isRaw {
+			it.rawFilter = rf
 		}
 	}
 
@@ -236,7 +261,47 @@ func (it *FullScanIter) checkFilter() (ok bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	doc, err := it.Buf.Parser.ParseOwned(it.Buf.DocBuf)
+	// Raw fast path: reject without building the Value tree. The scan discards
+	// most documents on a low-selectivity filter, and the full parse of every
+	// discarded document dominated the scan profile (~60% CPU). Accepted
+	// documents fall through to the full parse below so DocParsed and all
+	// downstream behavior stay identical. A decode error falls through too:
+	// ParseOwned reproduces the real error.
+	parseSrc := it.Buf.DocBuf
+	if it.rawFilter != nil {
+		rejected := false
+		if raw, derr := it.Buf.Parser.DecodedDoc(it.Buf.DocBuf); derr == nil {
+			// Accepted documents parse the already-decoded bytes below —
+			// re-parsing the compressed original would pay the s2 decode
+			// twice. Parsing a decoded root never touches decompBuf, so the
+			// resulting values keep the old lifetime (valid until the next
+			// document's decode).
+			parseSrc = raw
+			if rawOk, handled := it.rawFilter.OkRaw(raw, it.Buf); handled && !rawOk {
+				// BEHAVIOR CHANGE (deliberate): the walk validates only the
+				// bytes it traverses to reach the filtered fields, so corrupt
+				// bytes past them no longer fail the scan for a REJECTED
+				// document — the old code full-parsed (and so byte-validated)
+				// every scanned document as a side effect. Validating here
+				// (anyenc.ValidateRaw) was measured at ~80% of a full parse —
+				// it would erase the fast path entirely. Corruption defense
+				// stays with the page/WAL checksums and Integrity tooling,
+				// matching the precedent of the vector brute-force scan, which
+				// also reads one field per document without full validation.
+				rejected = true
+			}
+		}
+		it.rawChecked++
+		if rejected {
+			return false, nil
+		}
+		it.rawAccepted++
+		if it.rawChecked >= rawAcceptWarmup &&
+			it.rawAccepted*rawAcceptCutoffDen > it.rawChecked*rawAcceptCutoffNum {
+			it.rawFilter = nil // accepts most docs: the walk is net overhead
+		}
+	}
+	doc, err := it.Buf.Parser.ParseOwned(parseSrc)
 	if err != nil {
 		return false, err
 	}

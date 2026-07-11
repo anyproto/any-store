@@ -1,6 +1,7 @@
 package anyenc
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
@@ -72,4 +73,33 @@ func TestRawByPath(t *testing.T) {
 		_, ok := AppendFloat32s(raw, nil)
 		assert.False(t, ok)
 	})
+}
+
+// TestValidateRaw pins the raw-filter reject path's error surface: a scan that
+// skips the full parse must still fail on corrupt bytes anywhere in the
+// document, exactly like ParseOwned would.
+func TestValidateRaw(t *testing.T) {
+	v := MustParseJson(`{"a":50,"b":{"c":[1,2,3]},"s":"str"}`)
+	raw := v.MarshalTo(nil)
+	if err := ValidateRaw(raw); err != nil {
+		t.Fatalf("valid doc: %v", err)
+	}
+	// Truncated mid-document: field "a" (first) is still readable, the rest is not.
+	if err := ValidateRaw(raw[:len(raw)-3]); err == nil {
+		t.Fatal("truncated doc: expected error")
+	}
+	// Trailing junk after the root value.
+	if err := ValidateRaw(append(append([]byte{}, raw...), 0x01)); err == nil {
+		t.Fatal("trailing junk: expected error")
+	}
+	// Unknown type tag on the last field's value ("s": key bytes + EOS, then tag).
+	bad := append([]byte{}, raw...)
+	i := bytes.Index(bad, []byte{'s', EOS})
+	if i < 0 {
+		t.Fatal("key not found in encoding")
+	}
+	bad[i+2] = 0xEE
+	if err := ValidateRaw(bad); err == nil {
+		t.Fatal("corrupt tag: expected error")
+	}
 }

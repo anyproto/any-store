@@ -59,6 +59,14 @@ func (it *FilterIter) Next() (key []byte, docId []byte, multiKey bool, err error
 				return nil, nil, false, err
 			}
 
+			// NOTE: FullScanIter.checkFilter's raw reject fast path is
+			// deliberately NOT applied here. FilterIter's upstream is an index
+			// scan, so fetched documents usually satisfy the indexed predicates
+			// already (high accept rate → the raw walk is net overhead), and
+			// point queries (unique-index Eq and friends) create a fresh
+			// iterator per query, defeating the adaptive accept-rate cutoff —
+			// an A/B run showed a consistent +8% on UniqueIndex/Eq with the
+			// raw path enabled here and no measurable win elsewhere.
 			var perr error
 			doc, perr = it.Buf.Parser.ParseOwned(it.Buf.DocBuf)
 			if perr != nil {

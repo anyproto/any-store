@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/query"
 	"github.com/anyproto/any-store/v2/syncpool"
 )
@@ -45,7 +46,21 @@ type SortIter struct {
 	order     []int // reusable scratch: live-entry indices sorted by arena offset (compaction)
 	PartiallySorted bool // leading index fields match sort order; pdqsort benefits automatically
 	inited          bool
+	// rawSorter is Sorter's RawSort fast path, resolved once in collectAndSort.
+	// When the source yields no pre-parsed document, the sort key is built by
+	// seeking the sort fields' raw fragments instead of parsing the whole
+	// document (see appendSortKey). rawFallbacks counts consecutive documents
+	// the raw path could not handle (e.g. an array container on the sort
+	// path); after a few the fast path is disabled for the rest of this sort —
+	// field shapes are homogeneous within a collection, so early fallbacks
+	// predict wasted walks on every remaining document.
+	rawSorter    query.RawSort
+	rawFallbacks int
 }
+
+// sortRawFallbackMax disables the raw sort-key path after this many
+// consecutive unhandled documents.
+const sortRawFallbackMax = 8
 
 type sortEntry struct {
 	off      uint32 // offset into arena
@@ -101,11 +116,47 @@ func (it *SortIter) growArena(need int) {
 	it.arena = slices.Grow(it.arena, grow)
 }
 
+// appendSortKey appends the row's sort key for doc (pre-parsed upstream
+// document, may be nil) to dst. With no pre-parsed document it prefers the
+// RawSort fast path over raw (the decoded document bytes): the sort fields'
+// fragments are seeked and encoded without parsing the rest of the document —
+// the full parse just to read the sort fields dominated the unindexed-sort
+// profile. When the raw path cannot handle the document (array container on a
+// sort path) it parses raw — the already-decoded bytes, so the s2 decode is
+// not repeated — and takes the exact old path.
+func (it *SortIter) appendSortKey(dst []byte, doc *anyenc.Value, raw []byte) ([]byte, error) {
+	if doc == nil {
+		if raw != nil && it.rawSorter != nil {
+			if k, handled := it.rawSorter.AppendKeyRaw(dst, raw, it.Buf); handled {
+				it.rawFallbacks = 0
+				return k, nil
+			}
+			it.rawFallbacks++
+			if it.rawFallbacks >= sortRawFallbackMax {
+				it.rawSorter = nil
+			}
+		}
+		src := it.Buf.DocBuf
+		if raw != nil {
+			src = raw
+		}
+		var perr error
+		if doc, perr = it.Buf.Parser.ParseOwned(src); perr != nil {
+			return dst, perr
+		}
+	}
+	return it.Sorter.AppendKey(dst, doc), nil
+}
+
 func (it *SortIter) collectAndSort() error {
 	cmpEntry := func(a, b sortEntry) int {
 		ak := it.arena[a.off : a.off+uint32(a.keyLen)]
 		bk := it.arena[b.off : b.off+uint32(b.keyLen)]
 		return bytes.Compare(ak, bk)
+	}
+
+	if rs, isRaw := it.Sorter.(query.RawSort); isRaw {
+		it.rawSorter = rs
 	}
 
 	for {
@@ -119,6 +170,7 @@ func (it *SortIter) collectAndSort() error {
 
 		// Prefer already-parsed doc from upstream (FullScanIter/FetchIter/FilterIter)
 		doc := it.Plan.DocParsed
+		var raw []byte
 		if doc == nil {
 			// Cursor-free point lookup: avoids Cursor allocation
 			var verr error
@@ -126,10 +178,10 @@ func (it *SortIter) collectAndSort() error {
 			if verr != nil {
 				continue
 			}
-			var perr error
-			doc, perr = it.Buf.Parser.ParseOwned(it.Buf.DocBuf)
-			if perr != nil {
-				return perr
+			if it.rawSorter != nil {
+				if d, derr := it.Buf.Parser.DecodedDoc(it.Buf.DocBuf); derr == nil {
+					raw = d
+				}
 			}
 		}
 
@@ -142,7 +194,9 @@ func (it *SortIter) collectAndSort() error {
 			// Full sort: materialize every row (behavior unchanged).
 			it.growArena(256)
 			off := uint32(len(it.arena))
-			it.arena = it.Sorter.AppendKey(it.arena, doc)
+			if it.arena, err = it.appendSortKey(it.arena, doc, raw); err != nil {
+				return err
+			}
 			it.arena = append(it.arena, docId...)
 			keyLen := uint16(len(it.arena) - int(off))
 			it.entries = append(it.entries, sortEntry{
@@ -160,7 +214,9 @@ func (it *SortIter) collectAndSort() error {
 		// eviction (select.c), so the sorter holds <= LIMIT+OFFSET records.
 		base := uint32(len(it.arena))
 		it.growArena(256)
-		it.arena = it.Sorter.AppendKey(it.arena, doc)
+		if it.arena, err = it.appendSortKey(it.arena, doc, raw); err != nil {
+			return err
+		}
 		it.arena = append(it.arena, docId...)
 		candLen := uint16(len(it.arena) - int(base))
 		candKey := it.arena[base:] // view of the candidate at the tail
