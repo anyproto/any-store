@@ -367,3 +367,141 @@ combined limit+offset and past-the-end cutoffs, asserted against Iter).
 **Trigger:** index `{x}`, docs `{x:[]}`,`{x:1}`; `Find({x:{$in:[[],1]}}).Count()` → **2**, `Iter()` → **1**.
 
 **Impact: CORRECTNESS (Count ≠ len(Iter)), extreme corner** (an `$in` list literally containing an empty array). Fix would live in `In.IndexBounds` / unsatisfiability handling, not the count dispatch.
+
+---
+
+## I-10: CBO ignores index uniqueness — unique-index point lookups flip to FullScan above ~150k docs
+
+**Discovered:** 2026-07-11, while benchmarking storage layouts for any-sync spacestorage v2 (5 layouts × 6 real-corpus-shaped workloads).
+
+**Affected code:**
+- `internal/qplanner/planner.go` — IndexSeek cost estimation: the per-index count-min sketch (`DefaultSketchSize` = 1024 buckets) estimates `$eq` selectivity; `idx.Info.Unique` is never consulted when estimating rows for a full-key equality.
+- `internal/qplanner/cost.go:27` — 1024 buckets means the sketch floor for a hot bucket is ~N/1024 rows.
+
+**Failure mode:**
+Collection with a custom pk and a UNIQUE single-field index on `id` (random CID-like strings). At 50k docs, `Find({id: $eq}).Limit(1)` always plans IndexSeek: 0.01 ms/get. At 175k docs the sketch estimates 152–951 rows for a value that occurs exactly once; IndexSeek's estimated cost crosses FullScan's and the plan flips — per value, so behavior is erratic: measured 8/20 sampled values choosing FullScan, 7.4 ms/get average (CPU profile: 89% in `FullScanIter.checkFilter`). The flip threshold scales with collection size vs sketch resolution, not with any property of the data.
+
+**Impact: PERFORMANCE (severe, ~700× per lookup), PREDICTABILITY.** Answers stay correct. Any schema that uses a unique secondary index for point lookups on a large collection hits this once past the sketch resolution.
+
+**Reproducer:** `docs/repro/i10-unique-index-cbo/main.go` (self-contained sweep over doc count / payload size / id randomness; prints ms/get and per-value plan-flip counts; `PROFILE=1` writes cpu.prof).
+
+**Fix sketch:** for a full-key `$eq` (all index fields bound with equality) on an index with `Unique: true`, estimate ≤1 row regardless of the sketch. One condition in the estimator; no sketch change needed. (Same reasoning would also cap `$in` on a unique index at len(in).)
+
+**Workaround (what any-sync ships meanwhile):** `IndexHint{IndexName: "id", Boost: 1<<30}` on every point lookup — boost is subtracted from seek cost (`internal/qplanner/planner.go:508`), so the hint forces IndexSeek deterministically.
+
+**Status: FIXED** (2026-07-11). Verified: the flip is real but hinges on `Limit(1)` — with a limit and no sort, `fullScanEffective = limit/pTotal`, and since pTotal is also sketch-derived (~1/1024) FullScan cost collapses to a constant ~614 while seek cost grows as N/1024; crossover lands at ~150–180k. So the fix caps BOTH sides: `uniqueFullKeyDocs` (planner.go) prices a full-key equality on a Unique index at `len(bounds)` rows in `estimateIndexDocsWithFieldSel`/`selectivityForIndex`, and the same rule feeds `calculateSelectivity` + the per-field selectivity table so pTotal becomes ~1/N and FullScan is priced honestly again. Matches SQLite (`whereLoopAddBtreeIndex`, WHERE_ONEROW). Partial prefixes on compound unique indexes are excluded (uniqueness of `(a,b)` bounds nothing for `a=x`), as are SPARSE unique indexes on the pTotal/per-field-selectivity sites (a sparse index drops null/missing docs, so eq-null bounds can match far more documents than the index has entries; the seek-side `uniqueFullKeyDocs` needs no sparse guard because `GuaranteesPresence` already rejects eq-null bounds for sparse candidates). `calculateSelectivity` claims fields for single-field unique indexes in a first pass so the bypass is independent of index declaration order (a compound index listed first would otherwise claim the field with a sketch-bucket or DefaultRangeSelectivity estimate — not enough to re-flip the plan, since the seek side alone pins the unique candidate at ~cost 4 vs FullScan's ≥7, but it inflates pTotal by orders of magnitude, and pTotal feeds estimatedYield and every candidate's filtered-yield comparison). Regression tests: `TestBuildPlan_UniqueIndexPointLookup_NoFlipAtScale`, `TestBuildPlan_UniqueIndexPointLookup_OrderIndependent`, `TestUniqueFullKeyDocs`. Repro after fix: 0/20 flips at 175k, est_rows=1, 0.009 ms/get. (Nit: the sketch is a single-hash count sketch, not count-min — inflation-only, which is exactly why the bug existed.)
+
+---
+
+## I-11: DDL inside an ambient tx + outer rollback leaves stale in-memory handles → writes to freed pages
+
+**Discovered:** 2026-07-11, adversarial design review of any-sync spacestorage v2 (create-space-collections-in-one-tx pattern).
+
+**Affected code:**
+- `db.go:512-563` — `CreateCollection` registers the new `Collection` in `db.openedCollections` (`:558-560`) inside the tx callback; with an ambient ctx-tx this runs in a savepoint of the caller's tx.
+- `collection.go:873-928` — `createIndex` publishes the index (+ its namespace handle) to the collection's in-memory index set the same way.
+- `db.go:397-405` (`checkStale`) reacts only to a *committed* schema-cookie advance; `db.go:412-423` (`reconcileIndexSet`) re-resolves index namespaces of open collections but never evicts phantom collections.
+- `internal/btree/db.go:1881` — `WriteTx.Put` builds a btree rooted at the handle's cached `ns.rootPage` with no by-name re-resolution.
+
+**Failure mode:**
+`tx := db.WriteTx(ctx)` → `db.Collection(tx.Context(), "x")` creates the collection (savepoint commits, handle registered) → caller's OUTER `tx.Rollback()` undoes the namespace creation on disk — but the handle stays in `openedCollections` with its now-dangling root page. A later `db.Collection(ctx, "x")` returns the stale handle; the next write lands on a page that is free (or reallocated to another namespace): silent cross-namespace corruption. v1/sqlite failed loudly in the equivalent situation because tables resolve by name per statement.
+
+**Impact: CORRECTNESS (silent data corruption)** on a plausible pattern (create + populate in one tx, roll back on validation failure, retry later on the same DB handle).
+
+**Fix sketch:** publish DDL results to `openedCollections` / index sets only on top-level commit (tie registration to the outermost tx lifecycle), or re-validate `ns` by name at top-level tx begin, or evict handles created within a tx when that tx (or any ancestor) rolls back.
+
+**Workaround (any-sync):** treat a failed create-space tx as poisoning the whole DB handle — close and reopen it before any retry.
+
+**Reproducer:** `docs/repro/i11-stale-handle-rollback/main.go`.
+
+**Status: OPEN — empirically confirmed 2026-07-11.** Dynamic repro through the public API: create "x" via `tx.Context()`, `tx.Rollback()`, create "y" (reuses x's freed root page), insert through the stale "x" handle → the document lands inside collection "y" (`y.FindId` returns it, y's count grows) and `IntegrityCheck` passes before AND after reopen — the corruption is logical, not structural. Before the freed page is reused the write fails loudly (`btree: database is corrupt`); the silent phase starts on page reuse. Two additions to the write-up: (1) the trigger is broader than ambient-tx rollback — in the standalone path the handle is registered before `tx.Commit()`, so a failed commit poisons it the same way; (2) "re-validate at tx begin" does NOT work as a fix: `checkStale` triggers on the schema cookie, which a rollback never bumps. Chosen fix direction: per-tx tracking of created collections/indexes, evicted in both `writeTx.Rollback` and `savepointWrapper.Rollback`, mirroring the existing fts-pending pattern (`flushAllFtsPending`/`resetAllFtsPending`, tx.go).
+
+---
+
+## I-12: `docCount` full-walks index-less collections on every query
+
+**Discovered:** 2026-07-11, same layout-benchmark round as I-10.
+
+**Affected code:**
+- `query.go:753-762` — `collQuery.docCount` returns the first index sketch's DocCount, else falls back to `tx.Count(ns)`.
+- `query.go:232, 310, 458, 599, 686` — the fallback runs on every `Iter`/`Update`/`Delete`/`Count`/`Explain`.
+- `internal/btree/btree.go` `Count` — page-header traversal of the entire namespace (reads every page).
+
+**Failure mode / impact: PERFORMANCE.** A collection with no secondary indexes pays O(all pages of the namespace) *before* every query — even a fully pk-bounded range read of 3 rows. For a 300MB namespace that is ~73k page reads per query. This silently punishes exactly the schemas the custom-pk feature encourages (pk-ordered collections that need no secondary index).
+
+**Fix sketch:** persist a per-namespace document count (namespace header or master-table record, maintained on insert/delete like the freelist) → O(1) `docCount` and O(1) `Collection.Count()`. Until then any index's sketch (I-10 caveats aside) is the only O(1) source.
+
+**Status: FIXED** (2026-07-11), by a different route than the sketch above. Key fact the write-up missed: with no secondary indexes the planner has exactly one candidate (FullScan), so the counted value was never used — the walk was pure waste, not a needed input. Fix: `docCount(tx, exact)` skips the `tx.Count` namespace walk on the plan paths (Iter/Update/Delete/Count) when the collection has no secondary indexes; Explain passes `exact=true` and keeps the real count. The persisted-count idea was rejected: it adds a per-commit write hotspot and diverges from sqlite (which never counts during planning — stat tables only); indexed collections already have an O(1) source via the sketch DocCount. Regression test: `TestCollQuery_DocCountSkipsWalkWithoutIndexes`.
+
+---
+
+## I-13: whole-sketch persistence on every touched-index commit — 2-3× WAL amplification for small txs
+
+**Discovered:** 2026-07-11, perf review of the spacestorage v2 design (per-commit write patterns of sync workloads).
+
+**Affected code:**
+- `collection.go:1448` — `persistSketches` marshals and `Put`s the full sketch blob whenever `sketchModified`.
+- `db.go:944` — `persistAllDirtySketches` runs in the commit hook for every write tx.
+- `internal/qplanner/sketch.go` `MarshalBinary` — `DefaultSketchSize`=1024 buckets → 8,236-byte blob (~3 pages with overflow).
+
+**Failure mode / impact: PERFORMANCE.** A typical small commit (one ~1.7KB doc insert = 2-3 data WAL frames) that touches one indexed field also rewrites the 8.2KiB sketch blob — every commit, per touched index. Workloads with an always-touched index (e.g. a last-seq index maintained on every batch) carry 2-3× WAL bytes; two such indexes carry more. Compounds with I-01 (sketch drift is reloaded-clean only on reopen anyway).
+
+**Fix sketch (graduated):** (1) skip sketches entirely for `Unique` single-field indexes — they serve point lookups; with I-10 fixed the estimator needs no sketch for them; (2) persist dirty sketches on checkpoint/close instead of per-commit (they are advisory statistics; staleness within a session is already tolerated per I-03); (3) delta-encode sketch updates.
+
+**Status: OPEN — deliberately not fixed 2026-07-11.** A persist-every-N-commits throttle was considered and rejected for now: the persistence policy for shared state is a contract-level decision — the DB promises sqlite-like multi-process semantics (any process may open and read/write at any time), and the persisted blob is the only channel through which other processes see sketch updates. (SQLite itself keeps stats only ANALYZE-fresh, so bounded cross-process staleness would not violate that contract — which is why this stays a deliberate open decision rather than a quick fix.) Mechanically, a naive throttle also collides with `resetUncommittedSketches` (db.go), which reads a still-set `sketchModified` at write-tx begin as rolled-back phantom deltas and rebases the live sketch to the (now stale) committed bytes — any throttle needs a separate committed-but-unpersisted dirty signal. Note (2) is also harder than it sounds — checkpoints don't originate logical writes, so it needs a new write-tx-at-close path. Corrections to the numbers: the single-field blob is 8,220 bytes (not 8,236), and compound indexes are larger (3-field ≈ 24.6KiB, `nb = Size*Levels`); the trigger is any insert/delete/update of an indexed document (docCount bump), not only a changed indexed field. Remaining viable directions: (1) skip-unique (now unblocked by the I-10 fix, but only helps unique single-field indexes) and (3) delta encoding.
+
+---
+
+## I-14: `MarshalCompressed` has no incompressible fallback; parser `decompBuf` pins the largest-doc high-water mark
+
+**Discovered:** 2026-07-11, perf review of spacestorage v2 (encrypted change payloads; 5.4MB max doc in the profiled corpus).
+
+**Affected code:**
+- `anyenc/value.go:387` — `MarshalCompressed` S2-tags every object > `CompressMinSize` unconditionally; there is no "keep plain if not smaller" check.
+- `anyenc/parser.go:386, 400` + `anyenc/parser.go:112-116` — `decompBuf` grows to the largest compressed doc ever parsed and is deliberately excluded from the syncpool size accounting (`syncpool/syncpool.go:47-54`).
+
+**Failure mode / impact: PERFORMANCE / MEMORY.** High-entropy payloads (encrypted or already-compressed — the normal case for CRDT change bodies) pay `s2.Encode` + a second marshal on every insert and `s2.Decode` + a full copy on every parse (every doc of every scan), for zero size win. Pooled DocBuffers pin multi-MB `decompBuf`s per DB on blob-heavy data — invisible to `SyncPoolElementMaxSize`.
+
+**Fix sketch:** byte-level fallback at marshal time — if the S2 output is not smaller than plain, store plain (one length compare; the type tag already distinguishes). Separately, cap or count `decompBuf` in the pool's size accounting.
+
+**Workaround (any-sync):** `CollectionOptions{Compression: NoCompression}` on collections holding encrypted/binary payloads.
+
+**Status: FIXED** (2026-07-11). Both halves: (1) `MarshalCompressed` keeps the plain `TypeObject` bytes (already materialized in `scratch`) when `len(compressed)+5 >= len(plain)` — NOT a format change: readers dispatch on the leading type byte, so old readers handle the output unchanged, and incompressible docs skip the decode+copy on every future parse entirely; (2) `Parser.TrimScratch(limit)`, called from `SyncPool.ReleaseDocBuf` with `SyncPoolElementMaxSize`, frees the input-copy and decompression buffers when either alone exceeds the pool element limit. Corrections to the write-up: `decompBuf` retains the largest DECOMPRESSED doc (worse than stated, bounded only by the 1GB `maxDecompressedSize`); high-entropy S2 output was slightly LARGER than plain, not equal; the encode-side CPU cost was overstated (S2 emits uncompressed blocks) — the decode-side full copy per parse was the real cost. Tests: `TestMarshalCompressedIncompressibleKeepsPlain`, `TestParserTrimScratch`.
+
+---
+
+## I-15: Backup holds the entire destination in one write tx — peak RAM ≈ database size
+
+**Discovered:** 2026-07-11, node cold-sync benchmark of any-sync spacestorage v2 (real 491MB space store).
+
+**Affected code:**
+- `internal/btree/backup.go:46` — "dstWriteTx is held from first Step until Finish": a single destination write tx spans the
+  whole backup, so every copied page stays dirty in memory until the final commit.
+
+**Failure mode / impact: MEMORY.** Measured: backing up a 491MB store adds ~700MB VmHWM to the process (~1.27GB peak during a
+node cold-sync serve, vs ~200MB for the sqlite/v1 equivalent). Scales linearly with db size — a multi-GB space would take
+multi-GB RAM per concurrent backup. Wall time is fine (0.9s vs sqlite 0.66s for 491MB); this is purely a dirty-page-retention
+peak. On any-sync nodes Backup runs for coldsync serving and archiving — serialized today, so it's a spike not a leak, but it
+caps the safe space size and concurrency.
+
+**Fix sketch:** commit (or spill) the destination tx every N copied pages — SQLite's backup restarts on source change anyway
+(the FileChangeCounter check at backup.go:207 already handles that), so intra-backup commits only need the existing
+restart-on-change logic plus marking the backup file invalid until Finish (e.g. keep the header/page-1 write for the final
+commit). Alternatively spill dirty pages to the destination WAL as it goes.
+
+**Workaround (any-sync node):** none needed at current space sizes; keep backups serialized and mind RAM headroom for
+multi-GB spaces until fixed.
+
+**Status: NEEDS RE-MEASUREMENT — the claimed mechanism is contradicted by the code (verified 2026-07-11).** The pager
+implements SQLite-style cache spill (`pagerStress`, pager.go:2238, wired as the writer cache's `xStress`): when the writer
+cache hits `CacheSize` (default 5000 pages ≈ 20MB), unpinned dirty pages are written to the WAL as non-commit frames and
+evicted. Backup releases every destination page right after copying it (`defer releasePage`, backup.go:136), so copied pages
+ARE spill victims — destination writer-cache RAM is bounded to ~CacheSize, and "spill to the destination WAL as it goes" is
+literally the existing behavior. What the single long tx really causes: the dst WAL is never checkpointed until Finish, so it
+grows to ≈ full DB size ON DISK (temporary disk doubling), not RAM. The measured ~700MB VmHWM therefore needs re-attribution
+before any fix — prime suspects: source mmap if the node config sets `Config.MmapSize > 0` (backup faults the whole source
+mapping into RSS; mmap is off by default), Go heap high-water from allocation churn, and the dst WAL page-index map
+(~10-15MB at 491MB). Action: heap-profile a backup run + check the production `MmapSize`. If the disk doubling matters,
+the fix is periodic intra-backup commits done as temp-path + atomic rename (the "mark invalid until Finish" idea is
+over-engineered — `db.Backup` already writes a fresh file and removes it on error; a crash-abandoned partial file is the
+thing to protect against, and rename-on-success handles it).
