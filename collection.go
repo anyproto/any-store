@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -682,6 +683,13 @@ func (c *collection) update(tx *btree.WriteTx, it, prevIt item) (modified bool, 
 		if anyencutil.Equal(prevIt.Value(), it.Value()) {
 			return false, nil
 		}
+	}
+
+	// Primary key is immutable (Mongo _id semantics): reject a pk change
+	// instead of leaving a ghost data record under the old key. buf.SmallBuf
+	// already holds the new pk; compare it against the previous item's pk.
+	if oldId := c.appendId(nil, prevIt.Value()); !bytes.Equal(oldId, buf.SmallBuf) {
+		return false, ErrPrimaryKeyModification
 	}
 
 	// Update index entries: delete old, insert new
