@@ -26,9 +26,6 @@ index-covered sort cases the plan SHAPE is asserted via Explain.
 
 Independently verified (each reproduces identically on a FORWARD index, so it is a
 pre-existing planner limitation NOT introduced by this change):
-  - multi-bound ($in/$ne) + a reverse scan walks bounds in ascending boundIdx
-    order, so cross-bound ORDER is wrong (set+count are correct). Ordered parity
-    for multi-bound is asserted only for the forward declared-direction scan.
   - compound-multikey Count over-counts a partial prefix that leaves the array
     field unconstrained; Count parity is asserted only when the array field is
     constrained. Iter (DocDedup) is always correct.
@@ -198,12 +195,14 @@ func TestQRM_SingleField_FullOperatorMatrix(t *testing.T) {
 				})
 			}
 
-			// --- multi-bound operators: set/count parity + forward-only order ---
+			// --- multi-bound operators: set/count parity + order both ways ---
+			// A reverse scan consumes the ascending bound list from the top
+			// (index_iter.go), so cross-bound order holds in BOTH directions.
 			for _, f := range multiBound {
 				t.Run("op "+f, func(t *testing.T) {
 					qrmSet(t, idx, plain, f)
-					// Forward (declared-direction) scan must be correctly ordered.
 					qrmOrdered(t, idx, plain, f, []any{sh.fwdSort}, "a")
+					qrmOrdered(t, idx, plain, f, []any{sh.revSort}, "a")
 				})
 			}
 

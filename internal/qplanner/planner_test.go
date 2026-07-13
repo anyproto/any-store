@@ -4144,10 +4144,11 @@ func TestBuildPlan_PlanB_TieBreaking_SeekUniqueBeatsSeekNonUnique(t *testing.T) 
 	assert.Equal(t, "u", plan.IndexName, "unique index must win tie-break over non-unique")
 }
 
-// TestBuildPlan_Seek_CoverIter_NeedSortWraps hits planner.go:858-869 — the
-// CoverIter fast-path wraps in SortIter when needSort && !idx.ExactSort.
+// TestBuildPlan_Seek_CoverIter_NeedSortWraps hits the CoverIter fast-path in
+// buildIndexSeekChain: it wraps in SortIter whenever needSort — unconditionally,
+// idx.ExactSort is NOT consulted on this path (`if needSort {` in planner.go).
 // Construction: Unique + PointLookup + BoundFields==len(FieldNames) triggers
-// CoverIter; sort on a different field forces ExactSort=false.
+// CoverIter; the sort is on a different field (ExactSort=false is incidental).
 func TestBuildPlan_Seek_CoverIter_NeedSortWraps(t *testing.T) {
 	sorter := &sortFieldStub{fields: []query.SortField{{Field: "other"}}}
 	filter := query.MustParseCondition(`{"a": 1}`)
