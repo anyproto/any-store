@@ -314,6 +314,11 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 	if hasNonOp {
 		return false, nil, nil
 	}
+	if !ok {
+		// No $-operator keys (e.g. the empty object {}): treat as an
+		// equality match against the whole object value, like MongoDB.
+		return false, nil, nil
+	}
 	if fs != nil {
 		return true, fs, nil
 	}
