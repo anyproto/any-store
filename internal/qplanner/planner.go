@@ -1252,13 +1252,12 @@ type seekBatch struct {
 // buildIndexSeekChain constructs the iterator chain for an index seek plan.
 func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort bool) Iterator {
 	// Adjust End bounds so IndexIter range scans capture all key suffixes.
-	// For non-unique indexes, keys include a docId suffix after the index fields.
-	// For unique indexes with partial prefix bounds (BoundFields < len(FieldNames)),
-	// keys include trailing field values beyond the bound prefix.
-	// In both cases, appending 0xff to End extends the range to cover all suffixes.
-	needBoundsAdjust := len(idx.Bounds) > 0 &&
-		(!idx.Info.Unique || idx.BoundFields < len(idx.Info.FieldNames))
-	if needBoundsAdjust {
+	// EVERY index entry key is Tuple(fields..., docId) — unique and non-unique
+	// alike (index.go insertKeys appends the docId unconditionally) — so a bare
+	// inclusive End sorts strictly BEFORE every entry holding that value.
+	// Unbound trailing fields of a compound index add further suffix bytes.
+	// In all cases appending 0xff to an inclusive End covers all suffixes.
+	if len(idx.Bounds) > 0 {
 		idx.Bounds = AdjustBoundsForNonUnique(idx.Bounds)
 	}
 
@@ -1427,8 +1426,9 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 // buildIndexScanChain constructs the iterator chain for an index scan plan
 // (scan index in sort order, filter, stop at limit — no in-memory sort needed).
 func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Iterator {
-	// Adjust bounds for non-unique indexes (deferred from buildCBOIndexesInto).
-	if !idx.Info.Unique && len(idx.Bounds) > 0 {
+	// Adjust bounds for the docId key suffix (deferred from buildCBOIndexesInto).
+	// Applies to unique indexes too — see buildIndexSeekChain.
+	if len(idx.Bounds) > 0 {
 		idx.Bounds = AdjustBoundsForNonUnique(idx.Bounds)
 	}
 	// Pre-pad bounds for CanonicalKeyDedupIter (bare field values); padded
