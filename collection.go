@@ -470,8 +470,12 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 	// Inserts drive IVF-PQ centroid drift (they create no HNSW tombstones, so this
 	// is a no-op for the graph modes beyond a cheap enabled-check), so an insert can
 	// cross a vector index's auto-maintenance threshold just like an update/delete.
+	// returned is set once the write tx returns; err == nil alone would also hold
+	// while a panic unwinds, and compaction opens its own write tx — it must never
+	// run mid-panic. See doWriteTxW.
+	returned := false
 	defer func() {
-		if err == nil {
+		if returned && err == nil {
 			c.maybeAutoCompactVectors(ctx)
 		}
 	}()
@@ -494,6 +498,7 @@ func (c *collection) Insert(ctx context.Context, docs ...*anyenc.Value) (err err
 		}
 		return nil
 	})
+	returned = true
 	return
 }
 
@@ -534,8 +539,10 @@ func (c *collection) insertItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, it i
 }
 
 func (c *collection) UpdateOne(ctx context.Context, doc *anyenc.Value) (err error) {
+	// See Insert: gated on a normal return, not on err == nil alone.
+	returned := false
 	defer func() {
-		if err == nil {
+		if returned && err == nil {
 			c.maybeAutoCompactVectors(ctx)
 		}
 	}()
@@ -547,17 +554,23 @@ func (c *collection) UpdateOne(ctx context.Context, doc *anyenc.Value) (err erro
 		return
 	}
 
-	return c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
 		if txErr = c.alive(); txErr != nil {
 			return false, txErr
 		}
 		return c.update(tx, it, item{})
 	})
+	returned = true
+	return
 }
 
 func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error) {
+	// mod.Modify (user code) runs inside the write tx below. A panic there unwinds
+	// through here with err still nil, so gate on a normal return: compaction opens
+	// its own write tx and must never run mid-panic. See Insert and doWriteTxW.
+	returned := false
 	defer func() {
-		if err == nil {
+		if returned && err == nil {
 			c.maybeAutoCompactVectors(ctx)
 		}
 	}()
@@ -567,7 +580,7 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 	buf2 := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf2)
 
-	if err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
 		if txErr = c.alive(); txErr != nil {
 			return false, txErr
 		}
@@ -592,15 +605,19 @@ func (c *collection) UpdateId(ctx context.Context, id any, mod query.Modifier) (
 			return false, vErr
 		}
 		return c.update(tx, newIt, it)
-	}); err != nil {
+	})
+	returned = true
+	if err != nil {
 		return ModifyResult{}, err
 	}
 	return
 }
 
 func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (res ModifyResult, err error) {
+	// mod.Modify (user code) runs inside the write tx below; see UpdateId.
+	returned := false
 	defer func() {
-		if err == nil {
+		if returned && err == nil {
 			c.maybeAutoCompactVectors(ctx)
 		}
 	}()
@@ -610,7 +627,7 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 	buf2 := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf2)
 
-	if err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
 		if txErr = c.alive(); txErr != nil {
 			return false, txErr
 		}
@@ -663,7 +680,9 @@ func (c *collection) UpsertId(ctx context.Context, id any, mod query.Modifier) (
 			res.Matched = 1
 			return c.update(tx, newIt, prevItem)
 		}
-	}); err != nil {
+	})
+	returned = true
+	if err != nil {
 		return ModifyResult{}, err
 	}
 	return
@@ -741,8 +760,10 @@ func (c *collection) loadById(tx *btree.WriteTx, buf *syncpool.DocBuffer, id any
 }
 
 func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err error) {
+	// See Insert: gated on a normal return, not on err == nil alone.
+	returned := false
 	defer func() {
-		if err == nil {
+		if returned && err == nil {
 			c.maybeAutoCompactVectors(ctx)
 		}
 	}()
@@ -767,19 +788,22 @@ func (c *collection) UpsertOne(ctx context.Context, doc *anyenc.Value) (err erro
 		}
 		return true, nil
 	})
+	returned = true
 	return err
 }
 
 func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
+	// See Insert: gated on a normal return, not on err == nil alone.
+	returned := false
 	defer func() {
-		if err == nil {
+		if returned && err == nil {
 			c.maybeAutoCompactVectors(ctx)
 		}
 	}()
 	buf := c.db.syncPool.GetDocBuf()
 	defer c.db.syncPool.ReleaseDocBuf(buf)
 
-	return c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
+	err = c.db.doWriteTxModified(ctx, func(tx *btree.WriteTx) (modified bool, txErr error) {
 		if txErr = c.alive(); txErr != nil {
 			return false, txErr
 		}
@@ -791,6 +815,8 @@ func (c *collection) DeleteId(ctx context.Context, id any) (err error) {
 		}
 		return true, c.deleteItem(tx, buf, buf.SmallBuf)
 	})
+	returned = true
+	return err
 }
 
 func (c *collection) deleteItem(tx *btree.WriteTx, buf *syncpool.DocBuffer, id []byte) (err error) {
@@ -1311,6 +1337,12 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 	})
 }
 
+// Drop runs through doWriteTx — the variant that registers no undo — yet its
+// callback calls c.close(), evicting the handle from db.openedCollections. A
+// rollback (an error, or now a panic: see doWriteTxW) therefore restores the
+// on-disk collection while this handle stays closed; callers re-obtain it via
+// db.Collection, which heals the divergence because the map entry is gone.
+// Pre-existing on the error path; tracked separately.
 func (c *collection) Drop(ctx context.Context) error {
 	return c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (err error) {
 		c.mu.Lock()
