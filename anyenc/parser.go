@@ -153,13 +153,10 @@ func parseValue(b []byte, c *cache, depth int) (v *Value, tail []byte, err error
 	// Explain Bound.String() path would, where a decode error renders harmlessly).
 	t0 := b[0]
 	// Inverted (reverse index-key) tags are the bitwise-NOT of a base type tag.
-	// The scalar/compressed base types 1..9 invert to a contiguous 0xF6..0xFE
-	// run. TypeObjectID (11) inverts to iTypeObjectID (0xF4), which sits just
-	// below that run; 0xF5 (^Type(10), inverted vectorF32) is an intentional gap
-	// that never occurs (vectors are never index-keyed) and must keep falling
-	// through to the "unknown type" default. So 0xF4 is detected explicitly
-	// rather than by widening the range, which would swallow a stray 0xF5.
-	inverted := (t0 >= byte(iTypeCompressedObjectS2) && t0 <= byte(iTypeNull)) || t0 == byte(iTypeObjectID) // 0xF4, 0xF6..0xFE
+	// Base types 1..11 invert to the contiguous run 0xF4..0xFE — including
+	// iTypeVectorF32 (0xF5), which a descending index on a vector-valued field
+	// really does emit.
+	inverted := t0 >= byte(iTypeObjectID) && t0 <= byte(iTypeNull) // 0xF4..0xFE
 	nt := Type(t0)
 	eos := byte(EOS)
 	if inverted {
@@ -215,7 +212,7 @@ func parseValue(b []byte, c *cache, depth int) (v *Value, tail []byte, err error
 	case TypeBinary:
 		return parseBinary(b[1:], c, inverted)
 	case TypeVectorF32:
-		return parseVectorF32(b[1:], c)
+		return parseVectorF32(b[1:], c, inverted)
 	case TypeObjectID:
 		return parseObjectID(b[1:], c)
 	case TypeObject:
@@ -377,13 +374,23 @@ func parseBinary(b []byte, c *cache, inverted bool) (*Value, []byte, error) {
 }
 
 // parseVectorF32 parses a vector body (after the leading tag): a 4-byte
-// big-endian byte length followed by packed little-endian float32 data. Vectors
-// never appear in index keys, so there is no inverted form.
-func parseVectorF32(b []byte, c *cache) (*Value, []byte, error) {
+// big-endian byte length followed by packed little-endian float32 data. When
+// inverted (reverse index-key, c always nil), the length header is itself
+// bitwise-inverted; un-invert it to recover the payload length so the field can
+// be skipped, exactly as parseBinary does. The payload is not decoded on that
+// path — the caller only needs the offset of the next tuple element (the docId).
+func parseVectorF32(b []byte, c *cache, inverted bool) (*Value, []byte, error) {
 	if len(b) < 4 {
 		return nil, nil, fmt.Errorf("expected minimum 4 byte for vectorF32 header, but got %d", len(b))
 	}
-	l := binary.BigEndian.Uint32(b)
+	var l uint32
+	if inverted {
+		var hdr [4]byte
+		hdr[0], hdr[1], hdr[2], hdr[3] = ^b[0], ^b[1], ^b[2], ^b[3]
+		l = binary.BigEndian.Uint32(hdr[:])
+	} else {
+		l = binary.BigEndian.Uint32(b)
+	}
 	if l%4 != 0 {
 		return nil, nil, fmt.Errorf("vectorF32 byte length %d is not a multiple of 4", l)
 	}

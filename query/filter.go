@@ -73,7 +73,40 @@ var valueNull = anyenc.MustParseJson("null")
 
 var encodedNull = []byte{byte(anyenc.TypeNull)}
 
+// isOrderingOp reports whether the op places its operands on the scalar order.
+// $eq/$ne do not: they are byte equality, which is well-defined for a vector.
+func (e *Comp) isOrderingOp() bool {
+	switch e.CompOp {
+	case CompOpGt, CompOpGte, CompOpLt, CompOpLte:
+		return true
+	}
+	return false
+}
+
+// eqIsVector reports whether the filter operand is a packed TypeVectorF32 value.
+func (e *Comp) eqIsVector() bool {
+	return len(e.EqValue) > 0 && e.EqValue[0] == byte(anyenc.TypeVectorF32)
+}
+
+// Rule V (BUG-32): a vector is not a point on the scalar order.
+//
+// anyenc resolves a cross-type comparison on the type tag, and TypeVectorF32 (10)
+// sorts above every scalar tag (1..9). So an ordering op with a vector on either
+// side used to be true for EVERY document — {"v":{"$gt":1}} on a vector field, and
+// symmetrically {"anyField":{"$lt":{"$vector":[..]}}} on any field at all, even an
+// absent one. On Query.Delete that emptied the collection with err=nil, no vector
+// index required. $eq/$ne are unaffected: byte equality is well-defined for a vector.
+//
+// The parser rejects the operand-side spelling outright (ErrVectorNotOrderable);
+// these guards are what protect hand-built filters, which never see the parser.
 func (e *Comp) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
+	// Operand side. Must precede both the nil check and the array branch below:
+	// e.comp(encodedNull) would make $lt true for an ABSENT field (null's tag 1 <
+	// vector's tag 10), and the whole-array shortcut (notArray is false on a
+	// hand-built Comp) would make it true for an array-valued one.
+	if e.isOrderingOp() && e.eqIsVector() {
+		return false
+	}
 	if v == nil {
 		return e.comp(encodedNull)
 	}
@@ -126,6 +159,18 @@ func (e *Comp) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 // null/true/false encode as the bare tag. Strings, binary, and nested
 // containers fall back to marshal + bytes.Compare.
 func (e *Comp) okScalar(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
+	// Rule V (BUG-32), probe side: the stored value is the vector, as in
+	// {"v":{"$gt":1}}. See Comp.Ok for the rationale. Reached for a top-level
+	// value and for each element of an array — a vector nested deeper (inside an
+	// object, or inside an array compared whole) still resolves on the tag, the
+	// same as any other higher-tag value in a container.
+	//
+	// The eqIsVector disjunct is defense-in-depth: every production caller enters
+	// through Comp.Ok, which already rejected the operand side. Keep it — okScalar
+	// is unexported and must not become true for a vector if a new caller appears.
+	if e.isOrderingOp() && (v.Type() == anyenc.TypeVectorF32 || e.eqIsVector()) {
+		return false
+	}
 	if len(e.EqValue) > 0 {
 		switch t := v.Type(); t {
 		case anyenc.TypeArray, anyenc.TypeObject:
@@ -226,6 +271,12 @@ func compareUint64(a, b uint64) int {
 	return 0
 }
 
+// IndexBounds stays a sound over-approximation under Rule V: it may select keys
+// that Ok now rejects (an ordering op against a vector selects a tag range and
+// then matches nothing), never the reverse. Every plan that uses these bounds
+// still runs the residual filter — the covering CountOnly shortcuts require a
+// PointLookup with FIXED bounds, and an ordering op is neither — so a stricter
+// Ok cannot make a plan return rows it should not.
 func (e *Comp) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
 	// Clip spare capacity: a built Comp is shared by concurrent queries, and
 	// the planner extends bound bytes with appends (AdjustBoundsForNonUnique,
@@ -789,6 +840,19 @@ func (e TypeFilter) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 }
 
 func (e TypeFilter) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
+	if e.Type == anyenc.TypeVectorF32 {
+		// A vector is not a range: contribute no bounds and let the filter do the
+		// work. The [tag, tag+1) bound below does not survive inversion — on a
+		// DESCENDING index the reverse transform of a tag-10 range selects nothing
+		// at all, so Count and Iter both return 0 (measured; drop this guard and
+		// TestType_VectorF32_AcrossIndexes fails on every "-v" config). Costs a
+		// scan, which is the right price for a type that has no order.
+		//
+		// This is separate from — and was masked by — the inverted-vector-tag read
+		// bug fixed in anyenc/parser.go: that one silently dropped vector-valued
+		// rows from ANY reverse-index scan, filter or not.
+		return bs
+	}
 	// Upper bound is the next type tag, exclusive: this covers every key of
 	// type e.Type regardless of its payload bytes (an inclusive
 	// {tag, 0xff} end under-approximates — a payload whose first byte is

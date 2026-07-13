@@ -32,6 +32,8 @@ const filterZoo = `{
 	"$or": [{"l": 1}, {"l": {"$gt": 100}}],
 	"$nor": [{"m": "x"}],
 	"n": {"$not": {"$eq": 3}},
+	"vf": {"$eq": {"$vector": [1, 2]}},
+	"vt": {"$type": "vectorF32"},
 	"$text": {"$search": "hello"}
 }`
 

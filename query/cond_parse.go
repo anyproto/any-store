@@ -2,6 +2,7 @@ package query
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -10,6 +11,13 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/parser"
 )
+
+// ErrVectorNotOrderable is returned when an ordering operator ($gt/$gte/$lt/$lte)
+// is given a vector operand. Vectors are not points on the scalar order (Rule V,
+// BUG-32): the anyenc tag order sorts every vector above every scalar, which made
+// such a comparison true for every document — emptying the collection on Delete.
+// Equality ($eq/$ne) against a vector remains legal: it is byte equality.
+var ErrVectorNotOrderable = errors.New("any-store: a vector is not orderable")
 
 type Operator uint8
 
@@ -326,6 +334,17 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 }
 
 func makeCompFilter(op Operator, v *anyenc.Value) (f Filter, err error) {
+	// Rule V (BUG-32) at the door: an ordering op against a vector operand is
+	// decidable syntactically, so reject it here rather than silently evaluating
+	// to false. This also stops it reflecting through $not, where a
+	// never-satisfiable inner predicate becomes match-all. Comp.Ok keeps the
+	// eval-time guard for hand-built filters, which never see the parser.
+	switch op {
+	case opGt, opGte, opLt, opLte:
+		if v.Type() == anyenc.TypeVectorF32 {
+			return nil, fmt.Errorf("%w: use $eq for exact match, or a $vector index for similarity search", ErrVectorNotOrderable)
+		}
+	}
 	switch op {
 	case opEq:
 		cmp := &Comp{}
@@ -644,7 +663,7 @@ func parseType(v *anyenc.Value) (f Filter, err error) {
 	case anyenc.TypeNumber:
 		n, _ := v.Int()
 		tv := Type(n)
-		if (tv > TypeObject && tv != TypeObjectID) || tv < 0 {
+		if (tv > TypeObject && tv != TypeObjectID && tv != TypeVectorF32) || tv < 0 {
 			return nil, fmt.Errorf("unexpected type: %d", n)
 		}
 		return TypeFilter{Type: anyenc.Type(tv)}, err

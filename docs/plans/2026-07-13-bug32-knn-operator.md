@@ -524,6 +524,24 @@ remaining                    => id 3,4,5,6,7,8,9      ← it deleted ids 0, 1, 2
 
 Retained from this pass: the test `TestVerbCoherence_CBO` — `ids(Iter(Q))` == the ids `Delete(Q)` removes, over `{no sort, Sort("-p"), Sort("p","-id")} × {no limit, Limit(3), Offset(2).Limit(3)}` — which is a stronger property assertion than a single-shape regression test. Contribute it to BUG-47 if not already covered.
 
+### INCREMENT 1 — AS SHIPPED (2026-07-13), with corrections to the plan above
+
+Increment 1 is **implemented and green** (`go test ./...` + `-race`). Four adversarial reviewers attacked the diff; three corrections to the plan came out of it, recorded here because the plan text above is now wrong in two places.
+
+**1. A second, independent bug was found and fixed: BUG-48 (`anyenc` cannot read an inverted vector tag).**
+Not in the plan at all. `index.go` `AppendInverted`s a vector into a **descending** index key, producing the tag `^Type(10) = 0xF5` — which `anyenc/parser.go` explicitly reserved as an *unknown type*, on the stated grounds that "vectors are never index-keyed." That invariant is false. The parse failure made `extractDocId` return the whole key as the docId, the `Fetch` missed, and the row **vanished with err=nil**. Reachable with **no filter at all**: `Find(nil).Sort("-v")` silently dropped every vector-valued document while `Count` returned the right number. Fixed reader-side (`anyenc/type.go` + `parser.go`, mirroring `parseBinary`'s inverted length header) — no on-disk format change, so existing DBs are repaired, not migrated. See `any-store-tests/BUG-48-*.md`.
+
+**2. The plan's stated root cause for the `TypeFilter.IndexBounds` carve-out (T1.5) was wrong — but the carve-out is still required.**
+The plan (and a reviewer) each had half of it. Measured both ways: with BUG-48 fixed and the carve-out removed, `$type:"vectorF32"` still returns `Count=0, Iter=0` on **every** `-v` config — the `[tag, tag+1)` bound genuinely does not survive inversion. And with the carve-out but *without* the BUG-48 fix, rows are still dropped by any reverse-index scan. **Two independent defects, one masking the other.** Both are fixed; the comment in `filter.go` now says so.
+
+**3. `Count` swallowed every parse error** (the plan listed this as a T2.8 prerequisite; it had to land now, because Rule V's parse rejection is useless if `Count` discards it). `Count` is the only verb that bypasses `makeQuery`, so its `q.err` check sat *below* the no-filter fast path: a query that failed to parse left `q.cond == nil`, which the fast path read as "count everything." On the old code `Find('{"$badop":1}').Count(ctx)` returned `5, err=nil` on a 5-doc collection. Fixed by hoisting the check.
+
+**Scope note (the plan overclaims):** Increment 1 kills the **vector** mass delete, not *the* mass delete. `Find({"anyfield":{"$lt":1}}).Delete(ctx)` still empties any collection — missing-field-is-null under a total cross-type order is the general disease, and fixing it needs Mongo-style type bracketing (breaking, separate bug). Rule V closes the vector spelling, which is the one that fires on a *plain* `$gt` against a legitimately-typed field.
+
+**Accepted, deliberate widening:** `{"v":{"$not":{"$gt":1}}}` on a vector field now matches (it did not before, when `$gt` itself matched everything). This is MongoDB type-bracketing semantics and it is correct — a vector is not greater than 1. It is pinned by a test so nobody "fixes" it back.
+
+**Follow-up (not a blocker, lands with Increment 2):** a hand-built `Not{Comp{$lt, vector}}` is still match-all, because a fail-closed `Ok` is never safe under `Not`. Every JSON spelling is closed at the parser (`$not`/`$nor`/`$or`/`$and` all reject), and net reachability strictly *decreases* versus the old code, where the bare form was already a mass delete. The durable fix is a filter-tree walk at query-build time — the same walk Increment 2 needs for `ContainsKnn`.
+
 ### INCREMENT 1c — source-level determinism (non-breaking) · **M**
 
 1. `internal/vivf/store.go:806-823` — tie-break `partitionDist`/`selectSmallest` by `label`, so the ef-cut is the unique `(dist,label)`-smallest `ef`. **This is the membership fix.** Replace the final distance-only `slices.SortFunc` (`:803`) with `(dist, docId)`.

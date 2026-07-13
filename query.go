@@ -597,15 +597,21 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	if err = q.c.alive(); err != nil {
 		return
 	}
+	// A parse error must be reported before anything else: Cond()/Sort() leave
+	// q.cond nil when they fail, which is indistinguishable from "no filter" to
+	// the fast path below — so a rejected query used to count the WHOLE
+	// collection with err=nil, while Iter/Update/Delete (which reach q.err via
+	// makeQuery) correctly errored. Count is the only verb that skips makeQuery.
+	if q.err != nil {
+		return 0, q.err
+	}
+
 	// Fast path: no filter, no offset, no limit — use lightweight page-header count
 	_, isAll := q.cond.(query.All)
 	if (q.cond == nil || isAll) && q.offset == 0 && q.limit == 0 && q.sort == nil {
 		return q.c.Count(ctx)
 	}
 
-	if q.err != nil {
-		return 0, q.err
-	}
 	if q.cond == nil {
 		q.cond = query.All{}
 	}
