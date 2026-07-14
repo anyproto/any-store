@@ -1004,10 +1004,35 @@ func (db *db) doWriteTxW(ctx context.Context, do func(wtx WriteTx, tx *btree.Wri
 	if err != nil {
 		return err
 	}
+	// User code runs inside this tx (a query.Modifier, a DDL callback). A panic
+	// must not escape holding the btree write lock: BeginWrite has no ctx-cancel
+	// escape, so every later write — and Close() — would block forever. Roll back
+	// to release the lock, then re-panic so the caller still sees their bug.
+	//
+	// Deliberately not armed across Commit: both commit layers mark themselves
+	// done before doing any work (writeTx.Commit consumes the version CAS on
+	// entry and pools the commonTx; btree.WriteTx.Commit sets closed before
+	// pager.commit), so a rollback once commit has begun is a silent no-op on an
+	// already-recycled tx. A commit-time panic still leaks the lock — that needs
+	// the release moved into a defer inside btree.WriteTx.Commit; see BUG-14.
+	//
+	// The rollback runs the undo log, whose closures take c.mu / db.mu: a
+	// callback must not panic while holding either with an explicit (non-defer)
+	// unlock, or the unwind deadlocks here.
+	committing := false
+	defer func() {
+		if r := recover(); r != nil {
+			if !committing {
+				_ = tx.Rollback()
+			}
+			panic(r)
+		}
+	}()
 	if err = do(tx, tx.btreeWriteTx()); err != nil {
 		return errors.Join(err, tx.Rollback())
 	}
 	tx.SetModified()
+	committing = true
 	return tx.Commit()
 }
 
@@ -1018,6 +1043,18 @@ func (db *db) doWriteTxModifiedW(ctx context.Context, do func(wtx WriteTx, tx *b
 	if err != nil {
 		return err
 	}
+	// Rollback-on-panic; see doWriteTxW for why the guard stops at Commit. This
+	// is the single-doc modifier path (UpdateId/UpsertId call mod.Modify inside
+	// the callback), the one BUG-34 reported as wedging the DB.
+	committing := false
+	defer func() {
+		if r := recover(); r != nil {
+			if !committing {
+				_ = tx.Rollback()
+			}
+			panic(r)
+		}
+	}()
 	var modified bool
 	if modified, err = do(tx, tx.btreeWriteTx()); err != nil {
 		return errors.Join(err, tx.Rollback())
@@ -1025,6 +1062,7 @@ func (db *db) doWriteTxModifiedW(ctx context.Context, do func(wtx WriteTx, tx *b
 	if modified {
 		tx.SetModified()
 	}
+	committing = true
 	return tx.Commit()
 }
 
@@ -1058,10 +1096,25 @@ func (db *db) doReadTx(ctx context.Context, do func(tx *btree.ReadTx) error) err
 	if err != nil {
 		return err
 	}
+	// Rollback-on-panic, read side: Commit is a read tx's release path
+	// (readTx.Commit rolls back the underlying btree tx) — ReadTx has no
+	// Rollback. Left unreleased, a panic strands the reader-sem slot and
+	// db.mu.RLock; after MaxReaders of them every read blocks and Close() hangs.
+	// See doWriteTxW.
+	committing := false
+	defer func() {
+		if r := recover(); r != nil {
+			if !committing {
+				_ = tx.Commit()
+			}
+			panic(r)
+		}
+	}()
 	if err = do(tx.btreeReadTx()); err != nil {
 		_ = tx.Commit()
 		return err
 	}
+	committing = true
 	return tx.Commit()
 }
 
