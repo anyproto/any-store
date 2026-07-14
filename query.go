@@ -281,8 +281,12 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	// Reclaim tombstones this bulk update creates once it commits, mirroring the
 	// single-doc mutators. Registered before the commit defer so it runs after
 	// commit; no-ops inside a caller-managed tx (the guard in maybeAutoCompactVectors).
+	// Gated on an explicit commit, not on err == nil: err is still nil while a
+	// panic unwinds, and compaction opens its own write tx — it must never run
+	// on a failed operation, let alone mid-panic.
+	committed := false
 	defer func() {
-		if err == nil {
+		if committed {
 			q.c.maybeAutoCompactVectors(ctx)
 		}
 	}()
@@ -292,10 +296,19 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		return
 	}
 	defer func() {
+		// A panic (a user modifier's bug) leaves err == nil, so keying the commit
+		// on err alone would durably persist the documents modified before it — a
+		// torn bulk update. Roll back, then re-panic.
+		if r := recover(); r != nil {
+			_ = tx.Rollback()
+			panic(r)
+		}
 		if err != nil {
 			_ = tx.Rollback()
-		} else {
-			err = tx.Commit()
+			return
+		}
+		if err = tx.Commit(); err == nil {
+			committed = true
 		}
 	}()
 
@@ -336,6 +349,21 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		})
 	}
 
+	// Close-once: the plan must be closed before the write loop below (see the
+	// cursor-invalidation note), but a panic in a user Filter inside Next() would
+	// skip that call and strand the cursors' pinned pages. The deferred call
+	// covers the panic and error paths; Plan.Close is not idempotent, hence the
+	// flag. Registered after the tx finalizer so LIFO releases the cursors while
+	// the tx is still live.
+	planClosed := false
+	closePlan := func() {
+		if !planClosed {
+			planClosed = true
+			plan.Close()
+		}
+	}
+	defer closePlan()
+
 	// Collect all matching docIds into a contiguous buffer to avoid
 	// per-ID allocations and cursor invalidation during updates. Dedup
 	// multi-key entries so an UpdateMany over an array-indexed $in
@@ -346,7 +374,6 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	for {
 		_, docId, mk, iterErr := plan.Root.Next()
 		if iterErr != nil {
-			plan.Close()
 			err = iterErr
 			return
 		}
@@ -359,7 +386,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		idOffsets = append(idOffsets, uint32(len(idBuf)))
 		idBuf = append(idBuf, docId...)
 	}
-	plan.Close()
+	closePlan()
 
 	// Build slice references into the contiguous buffer.
 	idsToUpdate := make([][]byte, len(idOffsets))
@@ -439,8 +466,12 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	// Reclaim tombstones this bulk delete creates once it commits, mirroring the
 	// single-doc mutators. Registered before the commit defer so it runs after
 	// commit; no-ops inside a caller-managed tx (the guard in maybeAutoCompactVectors).
+	// Gated on an explicit commit, not on err == nil: err is still nil while a
+	// panic unwinds, and compaction opens its own write tx — it must never run
+	// on a failed operation, let alone mid-panic.
+	committed := false
 	defer func() {
-		if err == nil {
+		if committed {
 			q.c.maybeAutoCompactVectors(ctx)
 		}
 	}()
@@ -450,10 +481,19 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 		return
 	}
 	defer func() {
+		// A panic in user filter code leaves err == nil, so keying the commit on
+		// err alone would durably persist the documents deleted before it — a torn
+		// bulk delete. Roll back, then re-panic.
+		if r := recover(); r != nil {
+			_ = tx.Rollback()
+			panic(r)
+		}
 		if err != nil {
 			_ = tx.Rollback()
-		} else {
-			err = tx.Commit()
+			return
+		}
+		if err = tx.Commit(); err == nil {
+			committed = true
 		}
 	}()
 
@@ -494,6 +534,18 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 		})
 	}
 
+	// Close-once: the plan must be closed before the delete loop below, but a
+	// panic in a user Filter inside Next() would skip that call and strand the
+	// cursors' pinned pages. See the matching comment in Update.
+	planClosed := false
+	closePlan := func() {
+		if !planClosed {
+			planClosed = true
+			plan.Close()
+		}
+	}
+	defer closePlan()
+
 	// Collect IDs to delete into a contiguous buffer (can't modify while iterating).
 	// Dedup multi-key entries so a doc matched on multiple array values
 	// isn't deleted twice / counted twice in the affected count.
@@ -503,7 +555,6 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	for {
 		_, docId, mk, iterErr := plan.Root.Next()
 		if iterErr != nil {
-			plan.Close()
 			err = iterErr
 			return
 		}
@@ -516,7 +567,7 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 		idOffsets = append(idOffsets, uint32(len(idBuf)))
 		idBuf = append(idBuf, docId...)
 	}
-	plan.Close()
+	closePlan()
 
 	// Build slice references into the contiguous buffer.
 	idsToDelete := make([][]byte, len(idOffsets))
