@@ -789,12 +789,15 @@ func (e TypeFilter) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 }
 
 func (e TypeFilter) IndexBounds(fieldName string, bs Bounds) (bounds Bounds) {
-	k := []byte{byte(e.Type), 255}
+	// Upper bound is the next type tag, exclusive: this covers every key of
+	// type e.Type regardless of its payload bytes (an inclusive
+	// {tag, 0xff} end under-approximates — a payload whose first byte is
+	// 0xff sorts past it).
 	return bs.Append(Bound{
-		Start:        k[:1],
-		End:          k,
+		Start:        []byte{byte(e.Type)},
+		End:          []byte{byte(e.Type) + 1},
 		StartInclude: true,
-		EndInclude:   true,
+		EndInclude:   false,
 	})
 }
 
@@ -836,7 +839,7 @@ func (r Regexp) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 func (r Regexp) IndexBounds(_ string, bs Bounds) (bounds Bounds) {
 	prefix := extractPrefix(r.Regexp.String())
 	if prefix == "" {
-		return
+		return bs
 	}
 	var (
 		prefixBuf     = make([]byte, 0, len(prefix)+2)

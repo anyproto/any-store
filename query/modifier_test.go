@@ -288,7 +288,7 @@ func TestModifierRename_Modify(t *testing.T) {
 				`{"$rename":{"old":"new.new1"}}`,
 				`{"old":"value", "new":{"new1":"value"}}`,
 				`{"new":{"new1":"value"}}`,
-				false,
+				true,
 			},
 			{
 				`{"$rename":{"old.old1":"new.new1"}}`,

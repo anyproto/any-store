@@ -47,6 +47,12 @@ var (
 	// key. The primary key is immutable after creation.
 	ErrPrimaryKeyMismatch = errors.New("any-store: primary key mismatch")
 
+	// ErrPrimaryKeyModification is returned when an update would change a
+	// document's primary-key value. The primary key is immutable (Mongo
+	// _id semantics): a $set on the id field is rejected rather than
+	// leaving a ghost data record under the document's old key.
+	ErrPrimaryKeyModification = errors.New("any-store: primary key modification is not allowed")
+
 	// ErrCollectionExists is returned when attempting to create a collection that already exists.
 	ErrCollectionExists = errors.New("any-store: collection already exists")
 

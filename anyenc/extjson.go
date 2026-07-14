@@ -38,6 +38,9 @@ func (a *Arena) extValueFromFastJson(o *fastjson.Object) *Value {
 		return nil
 	}
 	if jv := o.Get(extTagBinary); jv != nil {
+		if jv.Type() != fastjson.TypeString {
+			return nil
+		}
 		if b, err := base64.StdEncoding.DecodeString(string(jv.GetStringBytes())); err == nil {
 			return a.NewBinary(b)
 		}
