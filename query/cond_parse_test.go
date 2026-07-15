@@ -1,6 +1,7 @@
 package query
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -181,6 +182,39 @@ func TestParseCondition(t *testing.T) {
 			assert.Nil(t, f, i)
 		}
 	})
+}
+
+// TestUnknownOperator pins the unknown-operator contract: an operator outside
+// the grammar is reported as ErrUnknownOperator and names the operator it
+// choked on, so a caller parsing an untrusted filter can answer with a
+// bad-request that says which token was wrong.
+func TestUnknownOperator(t *testing.T) {
+	for _, q := range []string{
+		`{"tags": {"$contains": "x"}}`,
+		`{"$contains": "x"}`,
+		`{"$and": [{"a": {"$contains": 1}}]}`,
+		`{"a": {"$not": {"$contains": 1}}}`,
+	} {
+		f, err := ParseCondition(fastjson.MustParse(q))
+		require.Error(t, err, q)
+		assert.Nil(t, f, q)
+
+		assert.True(t, errors.Is(err, ErrUnknownOperator), q)
+
+		var uoe *UnknownOperatorError
+		require.True(t, errors.As(err, &uoe), q)
+		assert.Equal(t, "$contains", uoe.Op, q)
+	}
+}
+
+// A known operator in a position that does not accept it is a distinct fault
+// from an unrecognized one, and must not be reported as ErrUnknownOperator.
+func TestOperatorNotValidAtTopLevel(t *testing.T) {
+	f, err := ParseCondition(fastjson.MustParse(`{"$eq": 1}`))
+	require.Error(t, err)
+	assert.Nil(t, f)
+	assert.False(t, errors.Is(err, ErrUnknownOperator))
+	assert.Contains(t, err.Error(), "not valid at the top level")
 }
 
 func BenchmarkParseCondition(b *testing.B) {
