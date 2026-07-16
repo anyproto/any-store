@@ -529,147 +529,139 @@ func (c *collection) reconcileVectorIndexesLocked(tx *btree.ReadTx, infos []Inde
 	}
 }
 
-// ErrMultipleVectorClauses is returned when a query constrains more than one
-// vector-indexed field (unsupported).
+// ErrMultipleVectorClauses is returned when a query carries more than one $knn
+// clause (unsupported).
 var ErrMultipleVectorClauses = errors.New("any-store: query has multiple vector clauses")
 
-// ErrInvalidVectorQuery is returned when a clause targets a vector-indexed field
-// but isn't a valid ANN clause: it must be an equality against a numeric array of
-// the index's dimension, e.g. {embedding: [..dim floats..]}.
-var ErrInvalidVectorQuery = errors.New("any-store: invalid vector query clause")
+// ErrInvalidVectorQuery is returned when a $knn clause is malformed: an empty or
+// non-finite $query, a $query whose length differs from the index dimension, or
+// an out-of-range $k/$ef. It says nothing about non-$knn clauses on a
+// vector-indexed field — those are ordinary filters on every verb.
+var ErrInvalidVectorQuery = errors.New("any-store: invalid $knn clause")
 
-// ErrVectorWriteWithoutLimit rejects an Update/Delete whose filter is a vector
-// clause but which carries no Limit. A vector clause denotes an ANN candidate
-// WINDOW (its size depends on tunable search parameters), not a predicate — an
-// unbounded write would mutate however many candidates the search happens to
-// yield. State the blast radius with .Limit(k); the planned $knn operator
-// moves k into the clause itself.
-var ErrVectorWriteWithoutLimit = errors.New("any-store: a vector-clause Update/Delete requires an explicit Limit")
+// ErrNoVectorIndex is returned when a $knn clause targets a field with no vector
+// index (or $index names one that doesn't exist). Exact search is an index MODE
+// (VectorModeBruteForce), not a fallback.
+var ErrNoVectorIndex = errors.New("any-store: no vector index on field")
+
+// ErrAmbiguousVectorIndex is returned when a $knn clause targets a field with
+// more than one vector index and no $index to disambiguate. Without it the
+// searched index — and therefore the selected documents, on Delete too — would
+// depend on index load order.
+var ErrAmbiguousVectorIndex = errors.New("any-store: field has multiple vector indexes; name one with $index")
+
+// ErrKnnBadPlacement is returned when a $knn clause sits anywhere other than the
+// top level or under $and: a ranked source cannot be a disjunct ($or/$nor), a
+// negation ($not — fail-closed Ok would reflect to match-all), or a nested
+// sub-filter.
+var ErrKnnBadPlacement = errors.New("any-store: $knn is only allowed at the top level or under $and")
+
+// ErrKnnWithText is returned when one query carries both $knn and $text: a query
+// has one source.
+var ErrKnnWithText = errors.New("any-store: $knn and $text cannot be combined in one query")
+
+// ErrLegacyVectorClause is returned, on every verb, for the pre-$knn ANN
+// spelling — a bare equality of a dim-sized numeric array against a
+// vector-indexed field. Silent demotion to a literal filter would mean 0 rows
+// (packed storage) or 1 row (plain-array storage) with err == nil; a hard error
+// turns every migration point into a test failure instead.
+var ErrLegacyVectorClause = errors.New(`any-store: field has a vector index; a bare-array equality clause is no longer an ANN query — use {"$knn":{"$query":[...],"$k":N}} (or query.NewKnn) to search it`)
 
 // ErrDistanceWithoutVector is returned when the synthetic _distance field is used
-// in a filter or sort but the query has no vector clause to produce it.
+// in a filter or sort but the query has no $knn clause to produce it.
 var ErrDistanceWithoutVector = errors.New("any-store: _distance is only available in a vector query")
 
-// detectVectorQuery inspects the parsed filter for an equality on a
-// vector-indexed field (`{vectorField: [..]}`). If found it returns a planner
-// spec and the residual filter (the original filter minus the vector clause —
-// keeping _distance predicates and any other field filters). Returns
-// (nil, original, nil) when this is not a vector query.
-func (q *collQuery) detectVectorQuery() (*qplanner.VectorQuerySpec, query.Filter, error) {
-	vidxs := q.c.loadVectorIndexes()
-	if len(vidxs) == 0 || q.cond == nil {
-		// No vector clause is possible, so _distance (in filter or sort) is invalid.
-		if filterRefsField(q.cond, qplanner.DistanceField) || sortRefsField(q.sort, qplanner.DistanceField) {
-			return nil, nil, ErrDistanceWithoutVector
-		}
+// detectKnnQuery is a SYNTACTIC operator check (template: detectFtsQuery): it
+// finds the $knn clause, validates it, resolves the vector index, and returns
+// the planner spec plus the residual filter (the original tree minus the Knn
+// node). Returns (nil, original, nil) when the query has no $knn.
+//
+// It runs on EVERY verb, via compilePlan, and it is AUTHORITATIVE: every rule
+// parseKnn enforces is re-checked here, because ParseCondition short-circuits
+// on an already-built Filter and the production consumers build their ANN
+// filter programmatically — this walk is the only validation they ever see.
+// NOTE: the result is deliberately NOT memoized across calls. The spec's
+// Search closure captures the resolved *vectorIndex HANDLE, and stale handles
+// are reconciled at read-tx begin — a spec detected before the verb's tx
+// opens (validateSources runs pre-tx, ahead of the unsatisfiable()
+// short-circuit) would search a peer-rebuilt index through its dead gen-0
+// namespaces (caught by the multiprocess IVF consistency test). compilePlan
+// re-detects after the tx begins, on the handle set the plan executes on.
+func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, error) {
+	if q.cond == nil || !query.ContainsKnn(q.cond) {
 		return nil, q.cond, nil
 	}
-
-	var clauses []query.Filter
-	switch f := q.cond.(type) {
-	case query.And:
-		clauses = f
-	default:
-		clauses = []query.Filter{q.cond}
+	node, err := findKnnClause(q.cond)
+	if err != nil {
+		return nil, nil, err
+	}
+	knn, _ := knnOf(node.Filter)
+	// Re-check the parse-time argument rules (query.Knn.Validate is the one
+	// shared copy): programmatic NewKnn filters never see the parser, and this
+	// walk is the only validation they get. Wrapped in ErrInvalidVectorQuery
+	// so consumers have a matchable sentinel.
+	if verr := knn.Validate(); verr != nil {
+		return nil, nil, fmt.Errorf("%w: %s", ErrInvalidVectorQuery, verr)
+	}
+	field := strings.Join(node.Path, ".")
+	vi, err := resolveKnnIndex(q.c.loadVectorIndexes(), field, knn.Index)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(knn.Query) != vi.dim {
+		return nil, nil, fmt.Errorf("%w: $knn on %q: got %d dims, index has %d", ErrInvalidVectorQuery, field, len(knn.Query), vi.dim)
 	}
 
-	vecIdx := -1
-	var vi *vectorIndex
-	var qvec []float32
-	for i, cl := range clauses {
-		k, isKey := cl.(query.Key)
-		if !isKey {
-			continue
-		}
-		field := strings.Join(k.Path, ".")
-		v := findVectorIndexByField(vidxs, field)
-		if v == nil {
-			continue // ordinary (non-vector) field clause
-		}
-		// The clause targets a vector-indexed field, so it must be a valid ANN
-		// clause — an equality against a dim-sized numeric array. Anything else
-		// (a range op, a scalar, a wrong-dim array) is a mistake, not a silent
-		// fall-through to a literal field match.
-		comp, isComp := k.Filter.(*query.Comp)
-		if !isComp || comp.CompOp != query.CompOpEq {
-			return nil, nil, fmt.Errorf("%w: field %q must be an equality against a %d-dim array", ErrInvalidVectorQuery, field, v.dim)
-		}
-		vec, derr := decodeVectorValue(comp.EqValue, v.dim)
-		if derr != nil {
-			return nil, nil, fmt.Errorf("%w: field %q: %v", ErrInvalidVectorQuery, field, derr)
-		}
-		if vecIdx >= 0 {
-			return nil, nil, ErrMultipleVectorClauses
-		}
-		vecIdx, vi, qvec = i, v, vec
+	residual := knnResidualFilter(q.cond)
+	// HARD post-condition, not an optimization: a Knn leaking into the residual
+	// FilterIter fail-closes every candidate — Iter = 0 rows, Delete = no-op,
+	// err == nil, on all verbs. findKnnClause has already rejected every shape
+	// the strip cannot handle, so this is unreachable; keep it that way.
+	if query.ContainsKnn(residual) {
+		return nil, nil, fmt.Errorf("%w: internal: $knn survived residual extraction", ErrKnnBadPlacement)
 	}
-	if vecIdx < 0 {
-		// Not a vector query: _distance is synthetic and only produced by a vector
-		// search, so referencing it in a filter or sort here is an error rather
-		// than a silent match-everything / sort-on-nothing.
-		if filterRefsField(q.cond, qplanner.DistanceField) || sortRefsField(q.sort, qplanner.DistanceField) {
-			return nil, nil, ErrDistanceWithoutVector
-		}
-		return nil, q.cond, nil
-	}
+	hasResidual := residual != nil && !isAllQueryFilter(residual)
 
-	residual := residualFilter(clauses, vecIdx)
 	captured := vi
-	if vi.isIVF() {
-		// IVF-PQ: probe a few cells (contiguous range scans), re-rank by exact
-		// distance. ef is the re-rank depth / candidate count, sized to the page
-		// window; nprobe is fixed in the index. SearchCandidates returns them
-		// closest-first (Ordered) — measurably faster than letting SortIter sort, as
-		// the planner then skips the SortIter for the default distance order and
-		// streams straight to LimitIter; an explicit multi-key Sort still uses SortIter.
-		ef := chooseEf(int(q.vectorEf), captured.ivf.NProbe()*8, int(q.limit)+int(q.offset), residual != nil)
-		spec := &qplanner.VectorQuerySpec{
-			Query:   qvec,
-			Ef:      ef,
-			Ordered: true,
-			Search: func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
-				cands, err := captured.ivf.SearchCandidates(tx, qv, ef)
-				if err != nil {
-					return nil, err
-				}
-				out := make([]qplanner.VectorCandidate, len(cands))
-				for i, c := range cands {
-					out[i] = qplanner.VectorCandidate{DocId: c.DocID, Distance: c.Distance}
-				}
-				return out, nil
-			},
-		}
-		return spec, residual, nil
-	}
-	if vi.ix == nil {
-		// Brute-force: the scan computes an exact distance for every document,
-		// so it can rank and (when nothing downstream needs the full set) cut
-		// to the query window itself. With a residual filter or an explicit
-		// sort the full ranked set is returned — FilterIter/SortIter/LimitIter
-		// keep their exact semantics over it.
-		topK := 0
-		if residual == nil && q.sort == nil && q.limit > 0 {
-			topK = int(q.limit) + int(q.offset)
-		}
-		spec := &qplanner.VectorQuerySpec{
-			Query:   qvec,
-			Ordered: true, // bruteVectorCandidates returns distance-ascending
-			Search: func(tx *btree.ReadTx, qv []float32, _ int) ([]qplanner.VectorCandidate, error) {
-				return q.c.bruteVectorCandidates(tx, captured, qv, topK)
-			},
-		}
-		return spec, residual, nil
-	}
-	// Size the candidate list for the whole window the caller will page through
-	// (offset+limit), over-fetching when a residual filter will discard some. The
-	// limit/offset themselves are still applied downstream by Sort/LimitIter over
-	// the post-filter stream — ef only governs how many candidates the ANN yields.
-	ef := chooseEf(int(q.vectorEf), vi.ix.EfSearch(), int(q.limit)+int(q.offset), residual != nil)
 	spec := &qplanner.VectorQuerySpec{
-		Query:   qvec,
-		Ef:      ef,
-		Ordered: true, // SearchCandidates yields candidates closest-first
-		Search: func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
+		Query:          knn.Query,
+		K:              knn.K,
+		IndexName:      vi.info.Name,
+		TotallyOrdered: true, // all three backends return (distance, docId) ascending
+	}
+	switch {
+	case vi.isIVF():
+		// IVF: probe a few cells (contiguous range scans), re-rank by exact
+		// distance. ef is the re-rank depth / candidate count; nprobe is fixed
+		// in the index.
+		spec.Ef = knnEf(knn.Ef, captured.ivf.NProbe()*8, knn.K, hasResidual)
+		spec.Search = func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
+			cands, err := captured.ivf.SearchCandidates(tx, qv, ef)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]qplanner.VectorCandidate, len(cands))
+			for i, c := range cands {
+				out[i] = qplanner.VectorCandidate{DocId: c.DocID, Distance: c.Distance}
+			}
+			return out, nil
+		}
+	case vi.ix == nil:
+		// Brute-force: the scan computes an exact distance for every document,
+		// so it can rank and cut to k itself — but ONLY when no residual will
+		// discard candidates downstream (it is the one backend that can
+		// guarantee k post-residual survivors, by returning everything).
+		topK := 0
+		if !hasResidual {
+			topK = knn.K
+		}
+		spec.Search = func(tx *btree.ReadTx, qv []float32, _ int) ([]qplanner.VectorCandidate, error) {
+			return q.c.bruteVectorCandidates(tx, captured, qv, topK)
+		}
+	default:
+		// HNSW: ef is the beam width.
+		spec.Ef = knnEf(knn.Ef, vi.ix.EfSearch(), knn.K, hasResidual)
+		spec.Search = func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
 			cands, err := captured.ix.SearchCandidates(tx, qv, ef)
 			if err != nil {
 				return nil, err
@@ -679,40 +671,330 @@ func (q *collQuery) detectVectorQuery() (*qplanner.VectorQuerySpec, query.Filter
 				out[i] = qplanner.VectorCandidate{DocId: c.DocID, Distance: c.Distance}
 			}
 			return out, nil
-		},
+		}
 	}
 	return spec, residual, nil
 }
 
-// findVectorIndexByField returns the vector index whose embedding field path
-// matches field, or nil.
-func findVectorIndexByField(vidxs []*vectorIndex, field string) *vectorIndex {
+// knnOf extracts the Knn from a leaf, accepting the pointer form too: every
+// composite filter here has value-receiver methods, so a hand-built &Knn{…}
+// satisfies query.Filter just like Knn does, and a value-only type test would
+// let it slip past detection into the residual (fail-closed → 0 rows / no-op
+// writes with err == nil).
+func knnOf(f query.Filter) (query.Knn, bool) {
+	switch k := f.(type) {
+	case query.Knn:
+		return k, true
+	case *query.Knn:
+		return *k, true
+	}
+	return query.Knn{}, false
+}
+
+// findKnnClause walks the WHOLE tree for the single legal $knn placement:
+// Key{path, Knn} at the top level or under $and (any nesting; And/*And). Every
+// composite is matched in BOTH value and pointer form — a pointer-built
+// &Not{Key{v, Knn}} that a value-only switch skipped would evaluate
+// !false == match-all on Delete. A second hit is ErrMultipleVectorClauses; a
+// Knn under Or/Nor/Not, nested inside a Key's inner filter, or bare (no Key
+// naming the field) is ErrKnnBadPlacement. Callers guarantee ContainsKnn(f).
+func findKnnClause(f query.Filter) (node query.Key, err error) {
+	var found bool
+	var walkKey func(ft query.Key)
+	var walk func(f query.Filter)
+	walkKey = func(ft query.Key) {
+		if _, isKnn := knnOf(ft.Filter); isKnn {
+			if found {
+				err = ErrMultipleVectorClauses
+				return
+			}
+			node, found = ft, true
+			return
+		}
+		// A Knn deeper inside this Key's inner filter (Key{p, And{Knn,…}},
+		// Key{p, Not{Knn}}, …) cannot be stripped as a unit.
+		if query.ContainsKnn(ft.Filter) {
+			err = ErrKnnBadPlacement
+		}
+	}
+	walk = func(f query.Filter) {
+		if err != nil {
+			return
+		}
+		switch ft := f.(type) {
+		case query.Knn, *query.Knn:
+			// A bare Knn names no field: nothing to resolve an index against.
+			err = fmt.Errorf("%w (a $knn must name its field: query.Key{Path, Knn})", ErrKnnBadPlacement)
+		case query.Key:
+			walkKey(ft)
+		case *query.Key:
+			walkKey(*ft)
+		case query.And:
+			for _, sub := range ft {
+				walk(sub)
+			}
+		case *query.And:
+			for _, sub := range *ft {
+				walk(sub)
+			}
+		default:
+			// Or/Nor/Not (any form), or an unknown filter type wrapping a Knn:
+			// not a placement the residual builder can strip.
+			if query.ContainsKnn(f) {
+				err = ErrKnnBadPlacement
+			}
+		}
+	}
+	walk(f)
+	if err != nil {
+		return query.Key{}, err
+	}
+	if !found {
+		return query.Key{}, fmt.Errorf("%w: internal: ContainsKnn true but no clause found", ErrKnnBadPlacement)
+	}
+	return node, nil
+}
+
+// knnResidualFilter returns f minus the (unique — findKnnClause enforced it)
+// Key{…, Knn} node, recursively rebuilding And/*And and collapsing an empty
+// result to nil, NOT All{}: the ef sizing and the brute-force topK both key off
+// "no residual", and an All{} would silently flip them to the ×10
+// over-fetch / full-ranking path on every bare $knn.
+//
+// The strip tests the NODE (is this Key's inner filter the Knn?), never the
+// path: And{Key{v, Knn}, Key{v, Comp{Ne,…}}} is legal programmatically, and a
+// path-keyed strip would drop the $ne too — widening the residual, so Delete
+// would remove documents the filter excluded. Pointer-built *Key/*Knn strip
+// identically (findKnnClause accepted them, so the strip must too).
+func knnResidualFilter(f query.Filter) query.Filter {
+	switch ft := f.(type) {
+	case query.Key:
+		if _, isKnn := knnOf(ft.Filter); isKnn {
+			return nil
+		}
+		return ft
+	case *query.Key:
+		if _, isKnn := knnOf(ft.Filter); isKnn {
+			return nil
+		}
+		return ft
+	case query.And:
+		rest := make(query.And, 0, len(ft))
+		for _, sub := range ft {
+			if r := knnResidualFilter(sub); r != nil {
+				rest = append(rest, r)
+			}
+		}
+		switch len(rest) {
+		case 0:
+			return nil
+		case 1:
+			return rest[0]
+		default:
+			return rest
+		}
+	case *query.And:
+		return knnResidualFilter(query.And(*ft))
+	default:
+		return f
+	}
+}
+
+// isAllQueryFilter reports whether f is the match-all filter. Distinct from
+// nil: knnResidualFilter never produces All{}, but a programmatic caller can
+// hand us And{Key{v,Knn}, All{}}, and All must not count as "has residual".
+func isAllQueryFilter(f query.Filter) bool {
+	_, isAll := f.(query.All)
+	return isAll
+}
+
+// resolveKnnIndex picks the vector index a $knn clause searches. With $index
+// set, the name must exist and be a vector index on the field; without it, the
+// field must carry exactly one vector index — with two, the searched index (and
+// therefore the selected documents, on Delete too) would depend on load order.
+func resolveKnnIndex(vidxs []*vectorIndex, field, indexName string) (*vectorIndex, error) {
+	var match *vectorIndex
 	for _, v := range vidxs {
-		if v.info.Vector.Field == field {
-			return v
+		if v.info.Vector.Field != field {
+			continue
+		}
+		if indexName != "" {
+			if v.info.Name == indexName {
+				return v, nil
+			}
+			continue
+		}
+		if match != nil {
+			return nil, fmt.Errorf("%w: field %q", ErrAmbiguousVectorIndex, field)
+		}
+		match = v
+	}
+	if match == nil {
+		if indexName != "" {
+			return nil, fmt.Errorf("%w: %q ($index %q matches no vector index on that field)", ErrNoVectorIndex, field, indexName)
+		}
+		return nil, fmt.Errorf("%w: %q", ErrNoVectorIndex, field)
+	}
+	return match, nil
+}
+
+// rejectLegacyVectorClause errors on the pre-$knn ANN spelling: an equality of
+// a plain dim-sized numeric ARRAY against a vector-indexed field, anywhere in
+// the tree (full walk — Or/Nor/Not/Key included, so no placement smuggles one
+// past). Scoped to TypeArray only, NEVER TypeVectorF32: $eq against a packed
+// {"$vector":[…]} literal is ordinary byte equality (Rule V defines it), and
+// catching it would make exact-vector equality unexpressible. The == dim
+// requirement means {"v":{"$eq":[]}} is never caught (validateVectorParams
+// forbids dim == 0).
+func rejectLegacyVectorClause(f query.Filter, vidxs []*vectorIndex) error {
+	if f == nil || len(vidxs) == 0 {
+		return nil
+	}
+	return rejectLegacyWalk(f, "", vidxs)
+}
+
+func rejectLegacyWalk(f query.Filter, path string, vidxs []*vectorIndex) error {
+	each := func(fs []query.Filter) error {
+		for _, sub := range fs {
+			if err := rejectLegacyWalk(sub, path, vidxs); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	switch ft := f.(type) {
+	case query.And:
+		return each(ft)
+	case *query.And:
+		return each(*ft)
+	case query.Or:
+		return each(ft)
+	case *query.Or:
+		return each(*ft)
+	case query.Nor:
+		return each(ft)
+	case *query.Nor:
+		return each(*ft)
+	case query.Not:
+		return rejectLegacyWalk(ft.Filter, path, vidxs)
+	case *query.Not:
+		return rejectLegacyWalk(ft.Filter, path, vidxs)
+	case query.Key:
+		return rejectLegacyKey(ft, path, vidxs)
+	case *query.Key:
+		return rejectLegacyKey(*ft, path, vidxs)
+	case *query.Comp:
+		// The legacy trigger is $eq — the old ANN spelling — AND $ne: on
+		// packed storage a plain-array operand never byte-equals the stored
+		// TypeVectorF32 value, so a dim-sized-array $ne is true for EVERY
+		// document (a "delete all but this vector" that removes that vector
+		// too, silently). Both are the same ANN-shaped-literal mistake.
+		// (Deliberate widening of the design's Eq-only scoping — the design's
+		// own rationale, "loud error over two silent wrong answers", applies
+		// with more force to the match-all direction.)
+		if path == "" || (ft.CompOp != query.CompOpEq && ft.CompOp != query.CompOpNe) {
+			return nil
+		}
+		raw := ft.EqValue
+		if len(raw) == 0 || raw[0] != byte(anyenc.TypeArray) {
+			return nil
+		}
+		for _, vi := range vidxs {
+			if vi.info.Vector.Field != path {
+				continue
+			}
+			if vec, ok := anyenc.AppendFloat32s(raw, nil); ok && len(vec) == vi.dim {
+				return fmt.Errorf("%w (field %q, index %q)", ErrLegacyVectorClause, path, vi.info.Name)
+			}
 		}
 	}
 	return nil
 }
 
-// filterRefsField reports whether the filter tree references the given field path
-// (used to detect _distance outside a vector query). Walks And/Or/Key.
+func rejectLegacyKey(ft query.Key, path string, vidxs []*vectorIndex) error {
+	p := strings.Join(ft.Path, ".")
+	if path != "" {
+		p = path + "." + p
+	}
+	return rejectLegacyWalk(ft.Filter, p, vidxs)
+}
+
+// knnEf resolves the ANN candidate depth. PURE function of the clause (+
+// whether a residual filter exists). q.limit / q.offset / q.sort are
+// deliberately NOT inputs, so every verb computes the same ef and walks the
+// same beam — that is what makes Count == len(Iter) a theorem instead of a
+// hope.
+func knnEf(explicit, indexDefault, k int, hasResidual bool) int {
+	ef := explicit
+	if ef == 0 {
+		ef = indexDefault
+		want := k
+		if hasResidual {
+			want = k * vectorOverFetch
+		}
+		if ef < want {
+			ef = want
+		}
+		if c := max(vectorEfCap, k); ef > c {
+			ef = c // the cap may NEVER starve k
+		}
+	}
+	if ef < k {
+		ef = k
+	}
+	return ef
+}
+
+// filterRefsField reports whether the filter tree references the given field
+// path (used to detect _distance outside a vector query). FULL walk —
+// And/Or/Nor/Not/Key, value and pointer forms — so no placement hides a
+// reference. A nested Key's path is RELATIVE to its parent: the walk descends
+// with the remaining suffix, so Key{["a"], Key{["_distance"], …}} refers to
+// the stored field "a._distance", not the synthetic top-level "_distance".
 func filterRefsField(f query.Filter, field string) bool {
 	switch v := f.(type) {
 	case query.And:
-		for _, c := range v {
-			if filterRefsField(c, field) {
-				return true
-			}
-		}
+		return anyRefsField(v, field)
+	case *query.And:
+		return anyRefsField(*v, field)
 	case query.Or:
-		for _, c := range v {
-			if filterRefsField(c, field) {
-				return true
-			}
-		}
+		return anyRefsField(v, field)
+	case *query.Or:
+		return anyRefsField(*v, field)
+	case query.Nor:
+		return anyRefsField(v, field)
+	case *query.Nor:
+		return anyRefsField(*v, field)
+	case query.Not:
+		return filterRefsField(v.Filter, field)
+	case *query.Not:
+		return filterRefsField(v.Filter, field)
 	case query.Key:
-		return strings.Join(v.Path, ".") == field
+		return keyRefsField(v, field)
+	case *query.Key:
+		return keyRefsField(*v, field)
+	}
+	return false
+}
+
+func anyRefsField(fs []query.Filter, field string) bool {
+	for _, c := range fs {
+		if filterRefsField(c, field) {
+			return true
+		}
+	}
+	return false
+}
+
+func keyRefsField(v query.Key, field string) bool {
+	p := strings.Join(v.Path, ".")
+	if p == field {
+		return true
+	}
+	// Nested Keys address sub-paths of this Key: only the matching suffix of
+	// field can still be referenced below.
+	if suffix, ok := strings.CutPrefix(field, p+"."); ok {
+		return filterRefsField(v.Filter, suffix)
 	}
 	return false
 }
@@ -728,30 +1010,6 @@ func sortRefsField(s query.Sort, field string) bool {
 		}
 	}
 	return false
-}
-
-// decodeVectorValue decodes a marshaled anyenc array into a dim-sized []float32.
-func decodeVectorValue(eqValue []byte, dim int) ([]float32, error) {
-	var p anyenc.Parser
-	v, err := p.Parse(eqValue)
-	if err != nil {
-		return nil, err
-	}
-	if v.Type() != anyenc.TypeArray {
-		return nil, fmt.Errorf("not an array")
-	}
-	arr, err := v.Array()
-	if err != nil || len(arr) != dim {
-		return nil, fmt.Errorf("array length %d != dim %d", len(arr), dim)
-	}
-	out := make([]float32, dim)
-	for i, e := range arr {
-		if e.Type() != anyenc.TypeNumber {
-			return nil, fmt.Errorf("non-numeric element")
-		}
-		out[i] = float32(e.GetFloat64())
-	}
-	return out, nil
 }
 
 // bruteVectorCandidates scans the whole collection and returns the documents
@@ -900,46 +1158,6 @@ const vectorOverFetch = 10
 // filter can't trigger a pathologically wide search. Callers that genuinely need
 // more set VectorEf explicitly.
 const vectorEfCap = 4096
-
-// chooseEf resolves the ANN candidate-list size (numCandidates). An explicit
-// override wins; otherwise start from the index default, ensure it covers the
-// limit, and over-fetch when a residual filter will discard candidates.
-func chooseEf(explicit, indexDefault, limit int, hasFilter bool) int {
-	if explicit > 0 {
-		return explicit
-	}
-	ef := indexDefault
-	if limit > 0 {
-		want := limit
-		if hasFilter {
-			want = limit * vectorOverFetch
-		}
-		if want > ef {
-			ef = want
-		}
-	}
-	if ef > vectorEfCap {
-		ef = vectorEfCap
-	}
-	return ef
-}
-
-func residualFilter(clauses []query.Filter, skip int) query.Filter {
-	rest := make([]query.Filter, 0, len(clauses)-1)
-	for i, c := range clauses {
-		if i != skip {
-			rest = append(rest, c)
-		}
-	}
-	switch len(rest) {
-	case 0:
-		return nil
-	case 1:
-		return rest[0]
-	default:
-		return query.And(rest)
-	}
-}
 
 // CompactVectorIndex rebuilds the named vector index from its live vectors,
 // reclaiming the storage and graph quality lost to tombstoned (deleted or

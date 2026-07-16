@@ -48,17 +48,14 @@ type vhit struct {
 	Distance float32
 }
 
-// vsearch runs a k-NN search through the public Find() pipeline (the supported
-// path now that collection.VectorSearch is removed) and returns docId+distance
-// pairs, closest-first. ef<=0 uses the index default; k<=0 means no limit.
+// vsearch runs a k-NN search through the public Find() pipeline via the $knn
+// operator and returns docId+distance pairs, closest-first. ef<=0 uses the
+// index default. k must be > 0: $k is mandatory in the clause.
 func vsearch(coll Collection, field string, q []float32, k, ef int) ([]vhit, error) {
-	fq := coll.Find(fmt.Sprintf(`{%q:%s}`, field, vqJSON(q)))
-	if k > 0 {
-		fq = fq.Limit(uint(k))
+	if k <= 0 {
+		panic("vsearch: $knn requires k > 0")
 	}
-	if ef > 0 {
-		fq = fq.VectorEf(uint(ef))
-	}
+	fq := coll.Find(fmt.Sprintf(`{%q:%s}`, field, vknnJSON(q, k, ef)))
 	iter, err := fq.Iter(ctx)
 	if err != nil {
 		return nil, err
@@ -289,7 +286,7 @@ func TestVectorIndex_Int8Quantization(t *testing.T) {
 
 	// reopen-from-disk preserves int8 + results (covered for in-memory here via a
 	// fresh Find through the pipeline)
-	iter, err := coll.Find(fmt.Sprintf(`{"v":[%s]}`, joinFloats(vecs[7]))).Limit(1).Iter(ctx)
+	iter, err := coll.Find(fmt.Sprintf(`{"v":{"$knn":{"$query":[%s],"$k":1}}}`, joinFloats(vecs[7]))).Iter(ctx)
 	require.NoError(t, err)
 	require.True(t, iter.Next())
 	d, _ := iter.Doc()

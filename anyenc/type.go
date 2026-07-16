@@ -20,8 +20,11 @@ const (
 	TypeCompressedObjectS2 = Type(9)
 	// TypeVectorF32 stores a packed little-endian []float32 embedding as a single
 	// length-prefixed blob (4 bytes/dim) instead of a generic number array — far
-	// smaller on disk and decoded zero-copy. Vectors are not orderable, so they
-	// never appear in range/sort index keys (no inverted form needed).
+	// smaller on disk and decoded zero-copy. Vectors are not orderable (query
+	// Rule V: ordering ops against one are always false), but they DO appear in
+	// range/sort index keys — an index on a vector-valued field marshals the
+	// value into the key, and a descending index stores the inverted form (see
+	// iTypeVectorF32 below).
 	TypeVectorF32 = Type(10)
 	// TypeObjectID stores a 12-byte ObjectID as a fixed-width, memcmp-orderable
 	// value: the tag followed by the 12 raw big-endian bytes (no length prefix),

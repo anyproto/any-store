@@ -47,6 +47,7 @@ type planIterator struct {
 	docId      []byte
 	closed     bool
 	dedup      qplanner.DocDedup // lazy-allocated when upstream emits multiKey=true
+	distArena  anyenc.Arena      // _distance re-injection on the post-sort re-fetch path
 }
 
 func (pi *planIterator) Next() bool {
@@ -150,6 +151,17 @@ func (pi *planIterator) Doc() (Doc, error) {
 		if perr != nil {
 			return nil, perr
 		}
+		// Re-decorate the synthetic _distance on the re-fetch path: SortIter
+		// clears DocParsed on emit, so a sorted $knn result would otherwise
+		// hand back the raw stored document with the documented _distance
+		// field missing. The sidecar always exists on the read verb (the only
+		// verb with a Doc()), keyed by docId.
+		if pi.plan.Distances != nil {
+			if d, ok := pi.plan.Distances.Get(pi.docId); ok {
+				pi.distArena.Reset()
+				doc.Set(qplanner.DistanceField, pi.distArena.NewNumberFloat64(d))
+			}
+		}
 	}
 	return pi.qb.coll.newItem(doc)
 }
@@ -202,7 +214,7 @@ func (e *emptyIter) Doc() (Doc, error) {
 func (e *emptyIter) Distance() float32 { return 0 }
 
 func (e *emptyIter) Score() float64 { return 0 }
-func (e *emptyIter) Err() error        { return nil }
+func (e *emptyIter) Err() error     { return nil }
 func (e *emptyIter) Close() error {
 	if e.closed {
 		return ErrIterClosed

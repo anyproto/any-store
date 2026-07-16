@@ -114,7 +114,7 @@ func TestVectorMode_IVFPQ_EndToEnd(t *testing.T) {
 	assert.GreaterOrEqual(t, recall, 0.85, "IVF-PQ + re-rank should reach high recall on clustered data")
 
 	// _distance decoration + ascending order through the pipeline.
-	iter, err := coll.Find(vectorEqFilter(vecs[7])).Limit(5).Iter(ctx)
+	iter, err := coll.Find(vectorKnnFilter(vecs[7], 5)).Iter(ctx)
 	require.NoError(t, err)
 	var last float32 = -1
 	got7 := false
@@ -147,7 +147,7 @@ func TestVectorMode_IVFPQ_FilterUpdateDelete(t *testing.T) {
 
 	// Residual filter: vector clause + id predicate. Every returned doc must satisfy
 	// the predicate.
-	iter, err := coll.Find(fmt.Sprintf(`{"v":%s,"id":{"$lt":100}}`, vqJSON(vecs[5]))).Limit(10).Iter(ctx)
+	iter, err := coll.Find(fmt.Sprintf(`{"v":%s,"id":{"$lt":100}}`, vknnJSON(vecs[5], 10, 0))).Iter(ctx)
 	require.NoError(t, err)
 	cnt := 0
 	for iter.Next() {

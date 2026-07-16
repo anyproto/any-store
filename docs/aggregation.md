@@ -30,7 +30,7 @@ any JSON-marshalable Go value.
 
 | Stage | Form | Notes |
 |---|---|---|
-| `$match` | `{"$match": <filter>}` | The full `Find()` filter language, including `$text` and vector clauses. |
+| `$match` | `{"$match": <filter>}` | The full `Find()` filter language, including `$text` and `$knn` clauses. |
 | `$sort` | `{"$sort": {"a": 1, "b.c": -1}}` | 1 ascending, -1 descending; anyenc value order across types; missing sorts as null. Stable. |
 | `$skip` / `$limit` | `{"$skip": 10}` / `{"$limit": 5}` | |
 | `$count` | `{"$count": "n"}` | Terminal: emits the single document `{"n": <count>}`. |
@@ -48,7 +48,7 @@ can be added compatibly later.
 
 Inside `$project`/`$addFields` values, `$group` keys and accumulator arguments:
 
-- **Field references** — `"$a.b.c"` (dot paths into the document; FTS/vector
+- **Field references** — `"$a.b.c"` (dot paths into the document; FTS/$knn
   virtual fields work too: `"$_score"`, `"$_distance"`).
 - **Literals** — any non-`$` value; `{"$literal": "$kept-verbatim"}` escapes a
   literal that starts with `$`.
@@ -95,8 +95,10 @@ hands it to the regular query planner. That means:
 - an indexed `$match`+`$sort` prefix runs as an index seek/scan with
   index-order sorting and cursor-level offset skips, exactly like `Find()`;
 - a `$match` containing `$text` makes the BM25 search drive the pipeline
-  source (`_score` available downstream), a vector clause makes the ANN index
-  drive it (`_distance` available downstream);
+  source (`_score` available downstream), a `$knn` clause makes the ANN index
+  drive it (`_distance` available downstream). With `$k` in the clause, the
+  prefix denotes at most `$k` documents — downstream `$group`/`$count` stages
+  aggregate exactly that page, never a silently `ef`-truncated stream;
 - `{"$match": {"x": {"$in": []}}}` short-circuits to an empty source with no
   I/O.
 
@@ -105,12 +107,15 @@ or any out-of-canonical-order stage; the remainder runs in-pipeline. An
 in-pipeline `$sort` directly followed by `$skip`/`$limit` keeps only the top
 `skip+limit` rows (heap + packed arena, O(K) memory).
 
-`$text` and vector (ANN) clauses are valid **only inside the pushdown
-prefix** — they are executed by the index sources the planner builds, not by
-the streaming `$match` operator. A `$match` containing them after the prefix
-ends (e.g. after `$unwind`/`$group`, or preceded by `$skip`/`$limit`) fails
+`$text` and `$knn` clauses are valid **only inside the pushdown prefix** —
+they are executed by the index sources the planner builds, not by the
+streaming `$match` operator. A `$match` containing them after the prefix ends
+(e.g. after `$unwind`/`$group`, or preceded by `$skip`/`$limit`) fails
 `Iter`/`Count`/`Explain` with a descriptive error instead of silently
-matching everything ($text) or comparing arrays literally (vector).
+matching everything ($text) or matching nothing ($knn). The legacy bare-array
+ANN spelling is likewise rejected in-pipeline (`ErrLegacyVectorClause`). This
+is final: `AggQuery` has no `Delete`/`Update`, so the rejection costs
+expressiveness, never data.
 
 `AggQuery.Explain` shows the split:
 

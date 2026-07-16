@@ -5,8 +5,8 @@
 any-store is an **embedded, btree-resident document store** (MVCC, WAL, crash-safe,
 multi-process-safe) with **built-in approximate-nearest-neighbour (ANN) vector
 search**. Embeddings live in ordinary documents and are queried through the normal
-`Find()` pipeline — a vector clause selects candidates, ordinary filters/sorts apply
-on top, and each result carries its `_distance`. There is no separate vector server
+`Find()` pipeline — a `$knn` clause selects the k nearest documents, ordinary
+filters/sorts apply on top, and each result carries its `_distance`. There is no separate vector server
 or in-memory index to manage: the index **lives in the same btree as the data**, so
 it inherits the store's durability, snapshot isolation, and cross-process semantics.
 

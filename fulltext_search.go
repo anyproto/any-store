@@ -952,6 +952,7 @@ func (q *collQuery) detectFtsQuery() (*qplanner.FtsQuerySpec, query.Filter, erro
 	}
 	fx := fxs[0]
 	spec := &qplanner.FtsQuerySpec{
+		IndexName:  fx.info.Name,
 		Ordered:    true, // searchCandidates returns score-descending
 		NeedScores: true, // compilePlan sets this from planOpts (Iter only)
 		Search: func(tx *btree.ReadTx) (qplanner.FtsCandidateStream, error) {
