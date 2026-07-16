@@ -50,6 +50,17 @@ build per query and carry no such guarantee.
    containing either — detect them with `query.ContainsSourceFilter` (walks
    the whole tree).
 
+   Corollary for CUSTOM `Filter` implementations: **never embed a source
+   filter inside one.** The detection/rejection walks descend only the
+   package's own node types (`And`/`Or`/`Nor`/`Not`/`Key`, value and pointer
+   forms alike) — a foreign type is structurally opaque, so an embedded `Knn`
+   silently matches nothing (fail-closed inherited through a pass-through
+   wrapper) and an embedded `Text` silently matches everything, on every
+   verb, `err == nil`. A custom filter that INVERTS its inner `Ok` reflects
+   fail-closed into match-all, exactly like `Not` would — that is arbitrary
+   user matching code, outside what any walk can guard. Pinned by
+   `TestKnn_InsideCustomFilterFailsClosed`.
+
 6. **`TypeVectorF32` is not orderable (Rule V).** In `Comp`, an ordering op
    (`$gt`/`$gte`/`$lt`/`$lte`) evaluates to `false` whenever either side is a
    packed vector — including vector-vs-vector. `$eq` is byte equality, `$ne`

@@ -9,6 +9,7 @@ import (
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/query"
+	"github.com/anyproto/any-store/v2/syncpool"
 )
 
 // knnDetectColl builds a 3-dim vector-indexed collection ("v", index "emb")
@@ -423,4 +424,56 @@ func TestExplain_UnconsideredSourceIndexesCarryNoCost(t *testing.T) {
 		}
 	}
 	assert.True(t, sawVector, "the vector index must still be listed")
+}
+
+// opaqueWrapKnn and opaqueNotKnn are CUSTOM Filter implementations wrapping a
+// $knn clause — foreign types the detection walk cannot see through, by
+// construction (a walker only knows the library's own node types; arbitrary
+// user code is not introspectable).
+type opaqueWrapKnn struct{ inner query.Filter }
+
+func (w opaqueWrapKnn) Ok(v *anyenc.Value, b *syncpool.DocBuffer) bool { return w.inner.Ok(v, b) }
+func (w opaqueWrapKnn) IndexBounds(_ string, bs query.Bounds) query.Bounds {
+	return bs
+}
+func (w opaqueWrapKnn) String() string { return "opaque" }
+
+type opaqueNotKnn struct{ inner query.Filter }
+
+func (w opaqueNotKnn) Ok(v *anyenc.Value, b *syncpool.DocBuffer) bool { return !w.inner.Ok(v, b) }
+func (w opaqueNotKnn) IndexBounds(_ string, bs query.Bounds) query.Bounds {
+	return bs
+}
+func (w opaqueNotKnn) String() string { return "opaqueNot" }
+
+// TestKnn_InsideCustomFilterFailsClosed pins the failure DIRECTIONS for a Knn
+// smuggled inside a custom Filter implementation, where detection is
+// structurally blind (see docs/query-filter-contract.md rule 5: custom filters
+// must not embed source filters).
+//
+//   - A pass-through wrapper inherits fail-closed Ok: the query silently
+//     matches NOTHING — zero rows, no-op writes, err == nil. Annoying but
+//     safe; this is precisely why Knn.Ok returns false and Text.Ok's true is
+//     the bug (a fail-open source filter here would over-delete instead).
+//   - A NEGATING wrapper reflects fail-closed into match-all, exactly like
+//     query.Not would — but unlike &Not{…} (the library's own type, walked
+//     since the pointer-form fix) this is the user's own matching code, which
+//     could just as easily `return true` outright: wrapping a Knn grants no
+//     destructive power that writing a custom filter didn't already grant.
+//
+// If an unwrap protocol (e.g. a Children() []Filter interface the walkers
+// descend) ever lands, update this test deliberately — until then these are
+// the documented consequences, not defects.
+func TestKnn_InsideCustomFilterFailsClosed(t *testing.T) {
+	coll := knnDetectColl(t)
+	kn := query.Key{Path: []string{"v"}, Filter: query.NewKnn([]float32{3, 1, 2}, 4)}
+
+	res, err := coll.Find(opaqueWrapKnn{kn}).Delete(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, res.Modified, "pass-through wrapper: fail-closed Knn.Ok matches nothing")
+	ids := writeOrderIterIds(t, coll.Find(opaqueWrapKnn{kn}))
+	assert.Empty(t, ids, "pass-through wrapper: Iter agrees (0 rows, err == nil)")
+	n, err := coll.Find(nil).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 10, n, "collection intact — the safe failure direction")
 }
