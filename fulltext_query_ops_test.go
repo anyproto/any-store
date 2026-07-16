@@ -8,6 +8,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 // These tests exercise the Phase 1 query operators added on top of the v1
@@ -238,4 +240,47 @@ func TestFtsCount_MatchesIterAcrossWindows(t *testing.T) {
 			assert.Equal(t, len(ids), count, "Count and Iter must agree; iter=%v", ids)
 		})
 	}
+}
+
+
+// $text inside an open write tx must see the tx's own uncommitted full-text
+// writes — the same view on every verb — and a rollback must discard them.
+// Previously Count/Iter matched against stale committed postings while
+// Update/Delete (whose savepoint path flushes the pending buffer) matched
+// current ones: one predicate, contradictory answers within one tx.
+func TestFtsReadYourWrites_InsideWriteTx(t *testing.T) {
+	fx, coll := ftsOpsColl(t)
+	defer fx.finish()
+	const q = `{"$text":{"$search":"zanzibar"}}`
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":"z1","body":"zanzibar ferry"}`)))
+
+	// In-tx Iter sees the tx's own write.
+	iter, err := coll.Find(q).Iter(tx.Context())
+	require.NoError(t, err)
+	var ids []string
+	for iter.Next() {
+		doc, derr := iter.Doc()
+		require.NoError(t, derr)
+		ids = append(ids, doc.Value().GetString("id"))
+	}
+	require.NoError(t, iter.Err())
+	require.NoError(t, iter.Close())
+	assert.Equal(t, []string{"z1"}, ids, "in-tx $text Iter must see the tx's own write")
+
+	// In-tx Count agrees with in-tx Iter.
+	count, err := coll.Find(q).Count(tx.Context())
+	require.NoError(t, err)
+	assert.Equal(t, 1, count, "in-tx $text Count must agree with Iter")
+
+	require.NoError(t, tx.Rollback())
+
+	// Rollback discards the pending postings entirely.
+	after, _ := collectIter(t, coll.Find(q))
+	assert.Empty(t, after, "rollback must discard the pending postings")
+	count, err = coll.Find(q).Count(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, count)
 }

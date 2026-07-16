@@ -162,7 +162,7 @@ type planOpts struct {
 // buildCBOIndexesInto and the bounds interpolation read it. The caller owns
 // alive()/unsatisfiable() gating, tx and buf lifetimes, and the sink. cbo is
 // non-nil only when opts.wantCandidates (Explain's index report).
-func (q *collQuery) compilePlan(btx *btree.ReadTx, buf *syncpool.DocBuffer,
+func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syncpool.DocBuffer,
 	idBounds query.Bounds, opts planOpts) (plan *qplanner.Plan, cbo []qplanner.CBOIndex, err error) {
 
 	// $text drives the query when present (CBO bypassed). The residual filter
@@ -173,6 +173,14 @@ func (q *collQuery) compilePlan(btx *btree.ReadTx, buf *syncpool.DocBuffer,
 		return nil, nil, err
 	}
 	if ftsSpec != nil {
+		// Read-your-writes: inside an ambient write tx the pending full-text
+		// postings buffer is flushed before the search, so a $text read sees
+		// the tx's own uncommitted writes — the same view the savepoint path
+		// gives the write verbs. One entry point, one visibility rule; a
+		// rollback still discards everything (resetAllFtsPending).
+		if err = q.c.db.flushAmbientFtsPending(ctx); err != nil {
+			return nil, nil, err
+		}
 		ftsSpec.NeedScores = opts.needScores
 		sorter := ftsSorter(q.sort)
 		if opts.countOnly {
@@ -297,7 +305,7 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	buf := q.c.db.syncPool.GetDocBuf()
 	btx := tx.btreeReadTx()
 
-	plan, _, err := q.compilePlan(btx, buf, qb.idBounds, planOpts{needScores: true})
+	plan, _, err := q.compilePlan(ctx, btx, buf, qb.idBounds, planOpts{needScores: true})
 	if err != nil {
 		q.c.db.syncPool.ReleaseDocBuf(buf)
 		_ = tx.Commit()
@@ -387,7 +395,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	// the equivalent Iter returns — same sorter, same access-path detection
 	// ($text AND vector; an invalid vector clause errors here like it does on
 	// Iter instead of degrading to a literal filter).
-	plan, _, ferr := q.compilePlan(btx, buf, qb.idBounds, planOpts{})
+	plan, _, ferr := q.compilePlan(ctx, btx, buf, qb.idBounds, planOpts{})
 	if ferr != nil {
 		err = ferr
 		return
@@ -534,7 +542,7 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	// the equivalent Iter returns — same sorter, same access-path detection
 	// ($text AND vector; an invalid vector clause errors here like it does on
 	// Iter instead of degrading to a literal filter).
-	plan, _, ferr := q.compilePlan(btx, buf, qb.idBounds, planOpts{})
+	plan, _, ferr := q.compilePlan(ctx, btx, buf, qb.idBounds, planOpts{})
 	if ferr != nil {
 		err = ferr
 		return
@@ -634,7 +642,7 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 		// fast paths, the sorter is dropped (a count is order-invariant), and
 		// $text/vector queries count their native plans — the same document
 		// set Iter yields, without the score sidecar or a public iterator.
-		plan, _, perr := q.compilePlan(tx, buf, idBounds, planOpts{countOnly: true})
+		plan, _, perr := q.compilePlan(ctx, tx, buf, idBounds, planOpts{countOnly: true})
 		if perr != nil {
 			return perr
 		}
@@ -725,7 +733,7 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 		// paths so the index report never silently shrinks. Vector queries
 		// are honestly explained as their ANN plan now, exactly what Iter and
 		// the write verbs execute.
-		plan, cboIndexes, perr := q.compilePlan(tx, buf, qb.idBounds, planOpts{
+		plan, cboIndexes, perr := q.compilePlan(ctx, tx, buf, qb.idBounds, planOpts{
 			exactTotalDocs: true,
 			wantCandidates: true,
 		})
