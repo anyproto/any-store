@@ -1220,12 +1220,45 @@ func (db *db) persistAllDirtySketches(tx *btree.WriteTx) error {
 	return nil
 }
 
-// flushAllFtsPending flushes every open collection's full-text write-back buffer
-// into the B-tree. Called once per write-tx commit, BEFORE the btree commit, so
-// the buffered postings land in the SAME atomic transaction as the document
-// writes — preserving strong cross-process consistency (another process opening
-// a read tx after commit sees a complete, consistent index; a crash leaves no
-// doc without its postings). The buffer never survives the commit boundary.
+// flushAmbientFtsPending flushes buffered full-text postings into the write
+// tx carried by ctx, if any — so a $text READ inside that tx sees the tx's
+// own uncommitted writes, matching the flush newSavepointTx already performs
+// for the write verbs. A no-op outside an ambient write tx: nothing is
+// buffered at the start of a fresh write tx (resetAllFtsPending), and a
+// read-only ambient tx cannot have buffered anything.
+// Caveat (documented, same class as iterate-while-mutate being undefined):
+// the flush WRITES into the ambient tx, so a $text read performed while an
+// iterator on the same tx is mid-iteration restructures pages under that
+// iterator's cursors — collect results before issuing in-tx $text reads.
+func (db *db) flushAmbientFtsPending(ctx context.Context) error {
+	wtx, ok := db.ambientWriteTx(ctx)
+	if !ok {
+		return nil
+	}
+	return db.flushAllFtsPending(wtx.btreeWriteTx())
+}
+
+// ambientWriteTx extracts a usable write tx carried by ctx: present, not
+// done, and belonging to this db instance.
+func (db *db) ambientWriteTx(ctx context.Context) (WriteTx, bool) {
+	ctxTx := ctx.Value(ctxKeyTx)
+	if ctxTx == nil {
+		return nil, false
+	}
+	wtx, ok := ctxTx.(WriteTx)
+	if !ok || wtx.Done() || wtx.instanceId() != db.instanceId {
+		return nil, false
+	}
+	return wtx, true
+}
+
+// flushAllFtsPending flushes every open collection's full-text write-back
+// buffer into the B-tree. Called once per write-tx commit, BEFORE the btree
+// commit, so the buffered postings land in the SAME atomic transaction as the
+// document writes — preserving strong cross-process consistency (another
+// process opening a read tx after commit sees a complete, consistent index; a
+// crash leaves no doc without its postings). The buffer never survives the
+// commit boundary.
 func (db *db) flushAllFtsPending(tx *btree.WriteTx) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()

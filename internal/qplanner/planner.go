@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 
@@ -1312,8 +1313,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	// values, which the +0x01 Start pad would wrongly exclude. (CoverIter
 	// above does not take padded bounds either — it seeks the raw prefix and
 	// applies HasExactFieldPrefix instead.)
-	dedupBounds := idx.Bounds
-	idx.Bounds = padBoundsForReverseTail(idx)
+	dedupBounds := finalizeIndexBounds(idx)
 
 	// Use batched allocation for the common case: IndexIter + FetchIter + FilterIter.
 	// This replaces 5 separate heap allocations with 1.
@@ -1433,8 +1433,7 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 	}
 	// Pre-pad bounds for CanonicalKeyDedupIter (bare field values); padded
 	// bounds for IndexIter (full keys) — see buildIndexSeekChain.
-	dedupBounds := idx.Bounds
-	idx.Bounds = padBoundsForReverseTail(idx)
+	dedupBounds := finalizeIndexBounds(idx)
 	reverse := shouldReverse(params.Sorter, idx)
 
 	var root Iterator = &IndexIter{
@@ -2049,11 +2048,24 @@ func invertBytes(b []byte) []byte {
 // Inversion reverses byte order, so each bound's Start/End are inverted AND
 // swapped, and the inclusivity flags swap with them. An open ascending end
 // (empty End, +inf) becomes an open stored start (empty Start), and vice versa.
-// Because the per-bound Start keys change, the result is re-sorted/merged so
+// Because the per-bound Start keys change, the result is re-sorted so
 // IndexIter walks the bounds in cursor order (relevant for $in / $ne, which
 // produce multiple bounds). A FRESH slice is always returned — the input
 // (which aliases BoundsResult) is never mutated, so ascending-space readers
 // such as calculateSelectivity remain correct.
+//
+// The sort key is compareInvertedStart, NOT plain bytes.Compare: anyenc
+// encodings are prefix-free except across the NUL escape (enc(v) is a
+// byte-prefix of enc(v+"\x00…")), and bitwise inversion preserves the prefix
+// relation without reversing it. The v+"\x00…" continuation group lives at
+// inv(enc(v))‖0x00…, BELOW every key of the v group (which continues with a
+// byte >= 0x01) — so the bound with the LONGER inverted Start selects the
+// SMALLER stored keys and must be walked first, the opposite of what a plain
+// byte compare on bare Starts yields. The input arrives merged (ascending
+// SortAndMerge upstream) and inversion preserves disjointness, so no merge
+// pass is needed — and Bounds.SortAndMerge must not run here, since its
+// bytes.Compare ordering is exactly the wrong order for prefix-related
+// Starts.
 func transformReverseBounds(bs query.Bounds) query.Bounds {
 	if len(bs) == 0 {
 		return bs
@@ -2067,7 +2079,35 @@ func transformReverseBounds(bs query.Bounds) query.Bounds {
 			EndInclude:   b.StartInclude,
 		})
 	}
-	return out.SortAndMerge()
+	slices.SortStableFunc(out, func(a, b query.Bound) int {
+		return compareInvertedStart(a.Start, b.Start)
+	})
+	return out
+}
+
+// compareInvertedStart orders inverted-space bound Starts in stored-key order.
+// An empty Start is -inf. For prefix-related Starts the longer one selects the
+// smaller stored keys (the escape-continuation group sorts below the base
+// value's own entries in inverted space) and therefore comes first; diverging
+// Starts compare bytewise as usual.
+func compareInvertedStart(a, b []byte) int {
+	switch {
+	case len(a) == 0 && len(b) == 0:
+		return 0
+	case len(a) == 0:
+		return -1
+	case len(b) == 0:
+		return 1
+	}
+	if len(a) != len(b) {
+		if bytes.HasPrefix(b, a) {
+			return 1 // a is the shorter prefix: its group starts above b's
+		}
+		if bytes.HasPrefix(a, b) {
+			return -1
+		}
+	}
+	return bytes.Compare(a, b)
 }
 
 // padReverseBounds makes inverted-space bounds exact in the presence of
@@ -2094,6 +2134,28 @@ func transformReverseBounds(bs query.Bounds) query.Bounds {
 // Only the LAST chained field of an index bound may be padded: earlier
 // (fixed, equality) fields are used as exact byte prefixes that later field
 // bounds are concatenated to.
+
+// finalizeIndexBounds applies the bound-normalization sequence every scanning
+// chain must share — seek and scan plans have to select identical rows for
+// the same query, so this order lives in exactly one place:
+//
+//	pad the reverse tail (escape-exact full keys for IndexIter), then
+//	coalesce overlapping compound tuples (MergeOverlappingBounds; only after
+//	the pad is its plain byte sort stored-key order — a bare inverted Start
+//	is a byte-prefix of its escape-continuation group and would sort wrongly).
+//
+// Returns the PRE-pad bounds for consumers that test bare field values
+// (CanonicalKeyDedupIter; the +0x01 Start pad would wrongly exclude them) and
+// leaves the padded, merged bounds on idx.Bounds for IndexIter.
+func finalizeIndexBounds(idx *CBOIndex) (dedupBounds query.Bounds) {
+	dedupBounds = idx.Bounds
+	idx.Bounds = padBoundsForReverseTail(idx)
+	if idx.BoundFields > 1 {
+		idx.Bounds = MergeOverlappingBounds(idx.Bounds)
+	}
+	return dedupBounds
+}
+
 // padBoundsForReverseTail applies padReverseBounds when the final field of the
 // bound chain is reverse-flagged. Call it only for the CHOSEN index, after
 // AdjustBoundsForNonUnique and after PointLookup/sketch estimation (both read
@@ -2223,6 +2285,17 @@ func computeIndexBounds(idx *IndexInfo, lookup func(string) (query.Bounds, bool,
 				} else {
 					off := len(arena)
 					arena = append(arena, prev.Start...)
+					// A bare prev.Start ending in an INVERTED field encoding
+					// admits that value's escape-continuation group, which
+					// lives at inv(enc(v))‖0x00… — ascending values GREATER
+					// than v that this tuple's range must not select. Append
+					// 0x01 to start above the continuations while keeping the
+					// whole v group (every v key continues with a byte >=
+					// 0x01) — the same rule padReverseBounds applies to a
+					// reverse tail and CoverIter applies to its seek prefix.
+					if i-1 < len(idx.Reverse) && idx.Reverse[i-1] && len(prev.Start) > 0 {
+						arena = append(arena, 0x01)
+					}
 					n := len(arena) - off
 					arena = append(arena, 0)
 					eb.Start = anyenc.Tuple(arena[off : off+n : off+n+1])
@@ -2284,6 +2357,81 @@ func AdjustBoundsForNonUnique(bounds query.Bounds) query.Bounds {
 		}
 	}
 	return bounds
+}
+
+// boundsOverlap reports whether b intersects a in key space, given that a
+// sorts at or before b by Start. An empty End is +inf; an equal boundary key
+// is shared only when both sides include it.
+func boundsOverlap(a, b *query.Bound) bool {
+	if len(a.End) == 0 {
+		return true
+	}
+	switch c := bytes.Compare(b.Start, a.End); {
+	case c < 0:
+		return true
+	case c == 0:
+		return a.EndInclude && b.StartInclude
+	default:
+		return false
+	}
+}
+
+// MergeOverlappingBounds sorts key-space bounds ascending by Start and
+// coalesces every overlapping pair into its hull. IndexIter walks the bound
+// list sequentially and requires it ordered and pairwise disjoint — bounds
+// that are disjoint per FIELD can still overlap after compound-tuple
+// concatenation, because anyenc string encodings are not prefix-free across
+// the NUL escape (enc(v) is a byte-prefix of enc(v+"\x00…")): the 0xff pad
+// after a shorter tuple then covers keys the next tuple's range also selects,
+// and a shared entry is emitted twice (duplicate rows, double-applied
+// modifiers, ErrDocNotFound on delete). Coalescing only ever WIDENS a bound —
+// the residual filter rejects the extra keys; it can never drop one.
+//
+// Callers gate this on compound chains (BoundFields > 1): single-field bound
+// lists alias a shared window into BoundsResult.Bounds and must not be
+// reordered or compacted in place; they are also already disjoint (one bound
+// per family member, no concatenation, wrapped in CanonicalKeyDedupIter).
+//
+// Deliberately NOT query.Bounds.SortAndMerge: that operates on ascending
+// VALUE-space bounds and differs at shared boundaries (it keeps the first
+// bound's EndInclude on equal Ends instead of OR-ing, and merges
+// touching-adjacent bounds — which here would widen a half-open pair into
+// covering a key neither side selects). This one runs on padded KEY-space
+// tuples and coalesces only genuine overlaps.
+func MergeOverlappingBounds(bounds query.Bounds) query.Bounds {
+	if len(bounds) < 2 {
+		return bounds
+	}
+	slices.SortStableFunc(bounds, func(a, b query.Bound) int {
+		return bytes.Compare(a.Start, b.Start)
+	})
+	out := bounds[:1]
+	for i := 1; i < len(bounds); i++ {
+		cur := &out[len(out)-1]
+		next := &bounds[i]
+		if !boundsOverlap(cur, next) {
+			out = append(out, *next)
+			continue
+		}
+		// Hull: Start stays cur's (sorted first; on equal Starts the include
+		// flags are OR-ed), End becomes the larger of the two.
+		if bytes.Equal(cur.Start, next.Start) {
+			cur.StartInclude = cur.StartInclude || next.StartInclude
+		}
+		switch {
+		case len(cur.End) == 0:
+			// already +inf
+		case len(next.End) == 0:
+			cur.End, cur.EndInclude = nil, false
+		default:
+			if c := bytes.Compare(next.End, cur.End); c > 0 {
+				cur.End, cur.EndInclude = next.End, next.EndInclude
+			} else if c == 0 {
+				cur.EndInclude = cur.EndInclude || next.EndInclude
+			}
+		}
+	}
+	return out
 }
 
 // IndexSortMatch checks if an index covers the sort fields.

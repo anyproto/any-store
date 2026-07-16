@@ -54,3 +54,32 @@ func (d *DocDedup) Reset() {
 		delete(d.seen, k)
 	}
 }
+
+// ForEachDistinct drives root to exhaustion, invoking fn once per DISTINCT
+// document under the DocDedup contract (multiKey=false is a hard uniqueness
+// guarantee; multiKey=true entries are deduped by docId). docId is only valid
+// for the duration of fn — iterators reuse buffers — so fn must copy what it
+// retains.
+//
+// This is the batch twin of planIterator.Next's streaming pull loop
+// (iterator.go): the two must implement the identical Accept contract. Every
+// batch consumer (bulk Update/Delete id collection, Count's generic tail)
+// goes through here so the contract lives in one place.
+func ForEachDistinct(root Iterator, fn func(docId []byte) error) error {
+	var dedup DocDedup
+	for {
+		_, docId, mk, err := root.Next()
+		if err != nil {
+			return err
+		}
+		if docId == nil {
+			return nil
+		}
+		if !dedup.Accept(docId, mk) {
+			continue
+		}
+		if err = fn(docId); err != nil {
+			return err
+		}
+	}
+}

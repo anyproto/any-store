@@ -97,3 +97,65 @@ func TestDocDedup_Reset(t *testing.T) {
 	assert.True(t, d.Accept([]byte("a"), true))
 	assert.True(t, d.Accept([]byte("b"), true))
 }
+
+// stubIter feeds ForEachDistinct a fixed (docId, multiKey) sequence, then EOI.
+type stubIter struct {
+	rows []stubRow
+	pos  int
+	err  error
+}
+
+type stubRow struct {
+	id string
+	mk bool
+}
+
+func (s *stubIter) Next() ([]byte, []byte, bool, error) {
+	if s.pos >= len(s.rows) {
+		if s.err != nil {
+			return nil, nil, false, s.err
+		}
+		return nil, nil, false, nil
+	}
+	r := s.rows[s.pos]
+	s.pos++
+	return nil, []byte(r.id), r.mk, nil
+}
+
+func (s *stubIter) Close()         {}
+func (s *stubIter) String() string { return "stub" }
+
+func TestForEachDistinct_ScalarPassthrough(t *testing.T) {
+	it := &stubIter{rows: []stubRow{{"a", false}, {"b", false}, {"a", false}}}
+	var got []string
+	require.NoError(t, ForEachDistinct(it, func(id []byte) error {
+		got = append(got, string(id))
+		return nil
+	}))
+	// multiKey=false is a hard uniqueness guarantee: no dedup is applied,
+	// exactly like planIterator.Next.
+	assert.Equal(t, []string{"a", "b", "a"}, got)
+}
+
+func TestForEachDistinct_MultiKeyDedup(t *testing.T) {
+	it := &stubIter{rows: []stubRow{{"a", true}, {"b", true}, {"a", true}, {"c", false}}}
+	var got []string
+	require.NoError(t, ForEachDistinct(it, func(id []byte) error {
+		got = append(got, string(id))
+		return nil
+	}))
+	assert.Equal(t, []string{"a", "b", "c"}, got)
+}
+
+func TestForEachDistinct_PropagatesErrors(t *testing.T) {
+	srcErr := assert.AnError
+	it := &stubIter{rows: []stubRow{{"a", false}}, err: srcErr}
+	var n int
+	err := ForEachDistinct(it, func([]byte) error { n++; return nil })
+	assert.ErrorIs(t, err, srcErr, "source error must surface")
+	assert.Equal(t, 1, n, "rows before the error are delivered")
+
+	it2 := &stubIter{rows: []stubRow{{"a", false}, {"b", false}}}
+	err = ForEachDistinct(it2, func([]byte) error { return assert.AnError })
+	assert.ErrorIs(t, err, assert.AnError, "fn error must stop the drive and surface")
+}

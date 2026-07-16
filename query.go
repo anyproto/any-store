@@ -7,6 +7,7 @@ import (
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/qplanner"
 	"github.com/anyproto/any-store/v2/query"
+	"github.com/anyproto/any-store/v2/syncpool"
 )
 
 // ModifyResult represents the result of a modification operation.
@@ -127,6 +128,165 @@ func (q *collQuery) Sort(sorts ...any) Query {
 	return q
 }
 
+// reportCandidates builds the CBO candidate list for Explain's index report
+// on the fts/vector paths, where compilation never consults the CBO. Nil for
+// every other verb.
+func (q *collQuery) reportCandidates(btx *btree.ReadTx, opts planOpts) []qplanner.CBOIndex {
+	if !opts.wantCandidates {
+		return nil
+	}
+	idxs := q.c.loadIndexes()
+	br := q.buildBoundsResult(idxs)
+	return q.buildCBOIndexesInto(nil, &br, idxs, btx)
+}
+
+// planOpts are the only per-verb compilation knobs. Everything else about
+// access-path selection is shared — a divergence here needs written rationale
+// (the SQLite shape: one WHERE/ORDER BY code generator, verb-specific only at
+// the row sink).
+type planOpts struct {
+	countOnly      bool // Count: PlanParams.CountOnly, Sorter forced nil (a count is order-invariant)
+	forWrite       bool // Update/Delete: unbounded-sort elision + vector write guard
+	needScores     bool // Iter only: keep the BM25 sidecar for Iterator.Score()
+	exactTotalDocs bool // Explain only: docCountExact (human-facing TotalDocs)
+	wantCandidates bool // Explain only: return the CBO candidate report even on fts/vector paths
+}
+
+// writeSorter applies the write-verb sorter rule: ordering decides WHICH
+// documents a Limit/Offset window selects, so a BOUNDED write must plan with
+// the sorter exactly like the equivalent read. Without a window the selected
+// set is order-invariant, and the sorter would only add a full
+// materialize-and-sort inside the write transaction — so it is elided.
+// Trade-off (deliberate): the order an unbounded Update applies its modifier
+// in is left to the plan, so transient unique-index collisions under e.g.
+// {$inc} are not caller-controllable; a caller that needs a deterministic
+// application order must bound the write.
+func (q *collQuery) writeSorter(opts planOpts) query.Sort {
+	if opts.countOnly || (opts.forWrite && q.limit == 0 && q.offset == 0) {
+		return nil
+	}
+	return q.sort
+}
+
+// compilePlan is the single query compiler shared by the verbs. It owns
+// $text detection (detectFtsQuery + ftsSorter), vector detection
+// (detectVectorQuery + the default distance-sort rule), and CBO input
+// assembly (buildBoundsResult, buildCBOIndexesInto, buildIndexHints,
+// docCountForPlan/docCountExact) — so every verb selects the same documents
+// for the same query by construction.
+//
+// btx MUST be the snapshot the plan executes on: the multikey-flag probe in
+// buildCBOIndexesInto and the bounds interpolation read it. The caller owns
+// alive()/unsatisfiable() gating, tx and buf lifetimes, and the sink. cbo is
+// non-nil only when opts.wantCandidates (Explain's index report).
+func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syncpool.DocBuffer,
+	idBounds query.Bounds, opts planOpts) (plan *qplanner.Plan, cbo []qplanner.CBOIndex, err error) {
+
+	// $text drives the query when present (CBO bypassed). The residual filter
+	// runs as a downstream FilterIter; a relevance/textScore sort is the
+	// FtsIter's intrinsic order, a real-field sort inserts a SortIter.
+	ftsSpec, ftsResidual, err := q.detectFtsQuery()
+	if err != nil {
+		return nil, nil, err
+	}
+	if ftsSpec != nil {
+		// Read-your-writes: inside an ambient write tx the pending full-text
+		// postings buffer is flushed before the search, so a $text read sees
+		// the tx's own uncommitted writes — the same view the savepoint path
+		// gives the write verbs. One entry point, one visibility rule; a
+		// rollback still discards everything (resetAllFtsPending).
+		if err = q.c.db.flushAmbientFtsPending(ctx); err != nil {
+			return nil, nil, err
+		}
+		ftsSpec.NeedScores = opts.needScores
+		// countOnly is sound without ordering: FtsIter emits one aggregate per
+		// doc (duplicate-free), and the distinct count is order-invariant.
+		sorter := ftsSorter(q.writeSorter(opts))
+		plan = qplanner.BuildPlan(&qplanner.PlanParams{
+			Tx:        btx,
+			DataNs:    q.c.ns,
+			Filter:    ftsResidual,
+			Sorter:    sorter,
+			Limit:     int(q.limit),
+			Offset:    int(q.offset),
+			Buf:       buf,
+			CountOnly: opts.countOnly,
+			Fts:       ftsSpec,
+		})
+		return plan, q.reportCandidates(btx, opts), nil
+	}
+
+	// Vector query: detect `{vectorField: [..]}` against the collection's
+	// vector indexes. When matched, build a vector plan (ANN source) and
+	// ignore all other indexes; the residual filter + sort run downstream.
+	vspec, residual, err := q.detectVectorQuery()
+	if err != nil {
+		return nil, nil, err
+	}
+	if vspec != nil {
+		// A vector clause denotes an ANN candidate WINDOW, not a predicate: an
+		// unbounded write would mutate however many candidates the (tunable)
+		// search happens to yield. Until the $knn operator makes k part of the
+		// clause, a vector-clause Update/Delete must state its blast radius.
+		if opts.forWrite && q.limit == 0 {
+			return nil, nil, ErrVectorWriteWithoutLimit
+		}
+		sorter := q.writeSorter(opts)
+		if sorter == nil && !opts.countOnly && !vspec.Ordered {
+			// No explicit sort and the source isn't already distance-ordered
+			// (brute-force): order by distance ascending. When the ANN source
+			// is ordered, we leave sorter nil so the planner skips a redundant
+			// SortIter and streams the already-closest-first candidates
+			// straight to LimitIter.
+			sorter, _ = query.ParseSort(qplanner.DistanceField)
+		}
+		plan = qplanner.BuildPlan(&qplanner.PlanParams{
+			Tx:        btx,
+			DataNs:    q.c.ns,
+			Filter:    residual,
+			Sorter:    sorter,
+			Limit:     int(q.limit),
+			Offset:    int(q.offset),
+			Buf:       buf,
+			CountOnly: opts.countOnly,
+			Vector:    vspec,
+		})
+		return plan, q.reportCandidates(btx, opts), nil
+	}
+
+	// CBO path. Bounds and candidates are built against btx: the
+	// multikey-flag probe gating tight seek bounds must read the same
+	// snapshot the scan executes on.
+	sorter := q.writeSorter(opts)
+	idxs := q.c.loadIndexes()
+	br := q.buildBoundsResult(idxs)
+	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx)
+	totalDocs := q.docCountForPlan(btx, idxs)
+	if opts.exactTotalDocs {
+		totalDocs = q.docCountExact(btx, idxs)
+	}
+	plan = qplanner.BuildPlan(&qplanner.PlanParams{
+		Tx:          btx,
+		DataNs:      q.c.ns,
+		Filter:      q.cond,
+		Sorter:      sorter,
+		IDBounds:    idBounds,
+		PrimaryKey:  q.c.primaryKey,
+		Limit:       int(q.limit),
+		Offset:      int(q.offset),
+		Buf:         buf,
+		TotalDocs:   totalDocs,
+		Indexes:     cboIndexes,
+		IndexHints:  q.buildIndexHints(),
+		CountOnly:   opts.countOnly,
+		FieldBounds: &br,
+	})
+	if opts.wantCandidates {
+		cbo = cboIndexes
+	}
+	return plan, cbo, nil
+}
+
 func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	if err = q.c.alive(); err != nil {
 		return
@@ -161,91 +321,13 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	buf := q.c.db.syncPool.GetDocBuf()
 	btx := tx.btreeReadTx()
 
-	// $text query: the BM25 search drives the query (CBO bypassed). The residual
-	// filter runs as a downstream FilterIter; a relevance/textScore sort is the
-	// FtsIter's intrinsic order, a real-field sort inserts a SortIter.
-	ftsSpec, ftsResidual, ferr := q.detectFtsQuery()
-	if ferr != nil {
+	plan, _, err := q.compilePlan(ctx, btx, buf, qb.idBounds, planOpts{needScores: true})
+	if err != nil {
 		q.c.db.syncPool.ReleaseDocBuf(buf)
 		_ = tx.Commit()
 		qb.Close()
-		return nil, ferr
+		return nil, err
 	}
-	if ftsSpec != nil {
-		plan := qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:     btx,
-			DataNs: q.c.ns,
-			Filter: ftsResidual,
-			Sorter: ftsSorter(q.sort),
-			Limit:  int(q.limit),
-			Offset: int(q.offset),
-			Buf:    buf,
-			Fts:    ftsSpec,
-		})
-		return &planIterator{
-			plan: plan,
-			tx:   tx,
-			buf:  buf,
-			qb:   qb,
-			data: &qplanner.CursorSource{Tx: btx, Ns: q.c.ns},
-		}, nil
-	}
-
-	// Vector query: detect `{vectorField: [..]}` against the collection's vector
-	// indexes. When matched, build a vector plan (ANN source) and ignore all
-	// other indexes; the residual filter + sort run as downstream stages.
-	vspec, residual, verr := q.detectVectorQuery()
-	if verr != nil {
-		q.c.db.syncPool.ReleaseDocBuf(buf)
-		_ = tx.Commit()
-		qb.Close()
-		return nil, verr
-	}
-	if vspec != nil {
-		sorter := q.sort
-		if sorter == nil && !vspec.Ordered {
-			// No explicit sort and the source isn't already distance-ordered
-			// (brute-force): order by distance ascending. When the ANN source is
-			// ordered, we leave sorter nil so the planner skips a redundant SortIter
-			// and streams the already-closest-first candidates straight to LimitIter.
-			sorter, _ = query.ParseSort(qplanner.DistanceField)
-		}
-		plan := qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:     btx,
-			DataNs: q.c.ns,
-			Filter: residual,
-			Sorter: sorter,
-			Limit:  int(q.limit),
-			Offset: int(q.offset),
-			Buf:    buf,
-			Vector: vspec,
-		})
-		return &planIterator{
-			plan: plan,
-			tx:   tx,
-			buf:  buf,
-			qb:   qb,
-			data: &qplanner.CursorSource{Tx: btx, Ns: q.c.ns},
-		}, nil
-	}
-
-	idxs := q.c.loadIndexes()
-	br := q.buildBoundsResult(idxs)
-	plan := qplanner.BuildPlan(&qplanner.PlanParams{
-		Tx:          btx,
-		DataNs:      q.c.ns,
-		Filter:      q.cond,
-		Sorter:      q.sort,
-		IDBounds:    qb.idBounds,
-		PrimaryKey:  q.c.primaryKey,
-		Limit:       int(q.limit),
-		Offset:      int(q.offset),
-		Buf:         buf,
-		TotalDocs:   q.docCountForPlan(btx, idxs),
-		Indexes:     q.buildCBOIndexesInto(nil, &br, idxs, btx),
-		IndexHints:  q.buildIndexHints(),
-		FieldBounds: &br,
-	})
 
 	return &planIterator{
 		plan: plan,
@@ -325,28 +407,14 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
-	plan, isFts, ferr := q.ftsScanPlan(btx, buf)
+	// The shared compiler: a bounded write must select exactly the documents
+	// the equivalent Iter returns — same sorter, same access-path detection
+	// ($text AND vector; an invalid vector clause errors here like it does on
+	// Iter instead of degrading to a literal filter).
+	plan, _, ferr := q.compilePlan(ctx, btx, buf, qb.idBounds, planOpts{forWrite: true})
 	if ferr != nil {
 		err = ferr
 		return
-	}
-	if !isFts {
-		idxs := q.c.loadIndexes()
-		br := q.buildBoundsResult(idxs)
-		plan = qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:          btx,
-			DataNs:      q.c.ns,
-			Filter:      q.cond,
-			IDBounds:    qb.idBounds,
-			PrimaryKey:  q.c.primaryKey,
-			Limit:       int(q.limit),
-			Offset:      int(q.offset),
-			Buf:         buf,
-			TotalDocs:   q.docCountForPlan(btx, idxs),
-			Indexes:     q.buildCBOIndexesInto(nil, &br, idxs, btx),
-			IndexHints:  q.buildIndexHints(),
-			FieldBounds: &br,
-		})
 	}
 
 	// Close-once: the plan must be closed before the write loop below (see the
@@ -364,39 +432,15 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	}
 	defer closePlan()
 
-	// Collect all matching docIds into a contiguous buffer to avoid
-	// per-ID allocations and cursor invalidation during updates. Dedup
-	// multi-key entries so an UpdateMany over an array-indexed $in
-	// query doesn't apply the modifier twice to the same doc.
-	var idBuf []byte       // contiguous buffer for all IDs
-	var idOffsets []uint32 // start offsets of each ID in idBuf
-	var dedup qplanner.DocDedup
-	for {
-		_, docId, mk, iterErr := plan.Root.Next()
-		if iterErr != nil {
-			err = iterErr
-			return
-		}
-		if docId == nil {
-			break
-		}
-		if !dedup.Accept(docId, mk) {
-			continue
-		}
-		idOffsets = append(idOffsets, uint32(len(idBuf)))
-		idBuf = append(idBuf, docId...)
+	// Materialize the distinct target ids, then release the plan's cursors
+	// BEFORE mutating ("can't modify while iterating"). Dedup ensures a bulk
+	// update over an array-indexed $in query doesn't apply the modifier twice
+	// to the same doc.
+	idsToUpdate, err := collectDistinctIDs(plan.Root)
+	if err != nil {
+		return
 	}
 	closePlan()
-
-	// Build slice references into the contiguous buffer.
-	idsToUpdate := make([][]byte, len(idOffsets))
-	for i, off := range idOffsets {
-		end := len(idBuf)
-		if i+1 < len(idOffsets) {
-			end = int(idOffsets[i+1])
-		}
-		idsToUpdate[i] = idBuf[off:end]
-	}
 
 	modBuf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(modBuf)
@@ -510,28 +554,14 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
-	plan, isFts, ferr := q.ftsScanPlan(btx, buf)
+	// The shared compiler: a bounded write must select exactly the documents
+	// the equivalent Iter returns — same sorter, same access-path detection
+	// ($text AND vector; an invalid vector clause errors here like it does on
+	// Iter instead of degrading to a literal filter).
+	plan, _, ferr := q.compilePlan(ctx, btx, buf, qb.idBounds, planOpts{forWrite: true})
 	if ferr != nil {
 		err = ferr
 		return
-	}
-	if !isFts {
-		idxs := q.c.loadIndexes()
-		br := q.buildBoundsResult(idxs)
-		plan = qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:          btx,
-			DataNs:      q.c.ns,
-			Filter:      q.cond,
-			IDBounds:    qb.idBounds,
-			PrimaryKey:  q.c.primaryKey,
-			Limit:       int(q.limit),
-			Offset:      int(q.offset),
-			Buf:         buf,
-			TotalDocs:   q.docCountForPlan(btx, idxs),
-			Indexes:     q.buildCBOIndexesInto(nil, &br, idxs, btx),
-			IndexHints:  q.buildIndexHints(),
-			FieldBounds: &br,
-		})
 	}
 
 	// Close-once: the plan must be closed before the delete loop below, but a
@@ -546,38 +576,14 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	}
 	defer closePlan()
 
-	// Collect IDs to delete into a contiguous buffer (can't modify while iterating).
-	// Dedup multi-key entries so a doc matched on multiple array values
-	// isn't deleted twice / counted twice in the affected count.
-	var idBuf []byte
-	var idOffsets []uint32
-	var dedup qplanner.DocDedup
-	for {
-		_, docId, mk, iterErr := plan.Root.Next()
-		if iterErr != nil {
-			err = iterErr
-			return
-		}
-		if docId == nil {
-			break
-		}
-		if !dedup.Accept(docId, mk) {
-			continue
-		}
-		idOffsets = append(idOffsets, uint32(len(idBuf)))
-		idBuf = append(idBuf, docId...)
+	// Materialize the distinct target ids, then release the plan's cursors
+	// BEFORE mutating ("can't modify while iterating"). Dedup ensures a doc
+	// matched on multiple array values isn't deleted twice / counted twice.
+	idsToDelete, err := collectDistinctIDs(plan.Root)
+	if err != nil {
+		return
 	}
 	closePlan()
-
-	// Build slice references into the contiguous buffer.
-	idsToDelete := make([][]byte, len(idOffsets))
-	for i, off := range idOffsets {
-		end := len(idBuf)
-		if i+1 < len(idOffsets) {
-			end = int(idOffsets[i+1])
-		}
-		idsToDelete[i] = idBuf[off:end]
-	}
 
 	// Now delete collected docs
 	for _, id := range idsToDelete {
@@ -616,27 +622,6 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 		q.cond = query.All{}
 	}
 
-	// $text counts by iterating the full-text plan (respecting any residual
-	// predicate and offset/limit). Iter() builds the Fts plan; counting its
-	// results is the simplest correct path.
-	if _, hasText, terr := findTextFilter(q.cond); terr != nil {
-		return 0, terr
-	} else if hasText {
-		iter, ierr := q.Iter(ctx)
-		if ierr != nil {
-			return 0, ierr
-		}
-		defer func() {
-			if cerr := iter.Close(); cerr != nil && err == nil {
-				err = cerr
-			}
-		}()
-		for iter.Next() {
-			count++
-		}
-		return count, iter.Err()
-	}
-
 	// Fast path: filter provably matches no documents (e.g. $in:[]). Skip
 	// the planner, the read tx, and the index walk entirely — the answer
 	// is unconditionally zero. See isUnsatisfiable.
@@ -665,80 +650,81 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 		return
 	}
 
-	idxs := q.c.loadIndexes()
-
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		buf := q.c.db.syncPool.GetDocBuf()
 		defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
-		// Bounds and CBO candidates are built INSIDE the read tx: the
-		// multikey-flag probe gating tight seek bounds must read the same
-		// snapshot the scan executes on.
-		br := q.buildBoundsResult(idxs)
-		var cboBuf [8]qplanner.CBOIndex
-		cboIndexes := q.buildCBOIndexesInto(cboBuf[:0], &br, idxs, tx)
-
-		plan := qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:          tx,
-			DataNs:      q.c.ns,
-			Filter:      q.cond,
-			Sorter:      nil, // no sort needed for count
-			IDBounds:    idBounds,
-			PrimaryKey:  q.c.primaryKey,
-			Limit:       int(q.limit),
-			Offset:      int(q.offset),
-			Buf:         buf,
-			TotalDocs:   q.docCountForPlan(tx, idxs),
-			Indexes:     cboIndexes,
-			IndexHints:  q.buildIndexHints(),
-			CountOnly:   true,
-			FieldBounds: &br,
-		})
-
-		// Limit/Offset cutoffs must apply to DISTINCT docs, not raw entry
-		// rows: over a multi-key index LimitIter.Next skips/caps entries that
-		// later collapse in dedup, diverging from Iter (known-issues I-07).
-		// CountDistinct deduplicates before the cutoff.
-		if li, ok := plan.Root.(*qplanner.LimitIter); ok {
-			n, cerr := li.CountDistinct()
-			plan.Close()
-			if cerr != nil {
-				return cerr
-			}
-			count = n
-			return nil
+		// The shared compiler, in count mode: CountOnly enables the covering
+		// fast paths, the sorter is dropped (a count is order-invariant), and
+		// $text/vector queries count their native plans — the same document
+		// set Iter yields, without the score sidecar or a public iterator.
+		plan, _, perr := q.compilePlan(ctx, tx, buf, idBounds, planOpts{countOnly: true})
+		if perr != nil {
+			return perr
 		}
-		// Use batch counting if the root iterator supports it (covering index
-		// count). IndexIter.CountEntries handles the multi-bound + multi-key
-		// dedup internally via the per-entry value byte; consumers don't need
-		// to layer another dedup on top.
-		if ci, ok := plan.Root.(qplanner.CountableIterator); ok {
-			n, cerr := ci.CountEntries()
-			plan.Close() // release cursor resources held by CountEntries
-			if cerr != nil {
-				return cerr
-			}
-			count = n
-			return nil
+		n, cerr := countPlanRoot(plan)
+		if cerr != nil {
+			return cerr
 		}
-		// Generic Next-loop count: dedup multi-key entries so a doc whose
-		// array values match multiple bounds is counted once.
-		var dedup qplanner.DocDedup
-		for {
-			_, docId, mk, iterErr := plan.Root.Next()
-			if iterErr != nil {
-				return iterErr
-			}
-			if docId == nil {
-				break
-			}
-			if dedup.Accept(docId, mk) {
-				count++
-			}
-		}
+		count = n
 		return nil
 	})
 	return
+}
+
+// countPlanRoot consumes a CountOnly plan and returns the distinct-doc count,
+// closing the plan. Dispatch order matters:
+//
+//  1. LimitIter first: the Limit/Offset cutoffs must apply to DISTINCT docs,
+//     not raw entry rows — over a multi-key index LimitIter.Next skips/caps
+//     entries that later collapse in dedup, diverging from Iter
+//     (known-issues I-07). CountDistinct deduplicates before the cutoff.
+//  2. The covering batch count (IndexIter.CountEntries) handles multi-bound +
+//     multi-key dedup internally via the per-entry value byte.
+//  3. Otherwise the shared generic distinct loop.
+func countPlanRoot(plan *qplanner.Plan) (int, error) {
+	if li, ok := plan.Root.(*qplanner.LimitIter); ok {
+		n, err := li.CountDistinct()
+		plan.Close()
+		return n, err
+	}
+	if ci, ok := plan.Root.(qplanner.CountableIterator); ok {
+		n, err := ci.CountEntries()
+		plan.Close() // release cursor resources held by CountEntries
+		return n, err
+	}
+	n := 0
+	err := qplanner.ForEachDistinct(plan.Root, func([]byte) error {
+		n++
+		return nil
+	})
+	plan.Close()
+	return n, err
+}
+
+// collectDistinctIDs materializes a plan's distinct docIds into slices backed
+// by one contiguous arena: one allocation curve, and the ids stay valid after
+// plan.Close — bulk writes must release the plan's cursors before mutating,
+// and iterators reuse their docId buffers between rows.
+func collectDistinctIDs(root qplanner.Iterator) ([][]byte, error) {
+	var idBuf []byte       // contiguous buffer for all ids
+	var idOffsets []uint32 // start offset of each id in idBuf
+	if err := qplanner.ForEachDistinct(root, func(docId []byte) error {
+		idOffsets = append(idOffsets, uint32(len(idBuf)))
+		idBuf = append(idBuf, docId...)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	ids := make([][]byte, len(idOffsets))
+	for i, off := range idOffsets {
+		end := len(idBuf)
+		if i+1 < len(idOffsets) {
+			end = int(idOffsets[i+1])
+		}
+		ids[i] = idBuf[off:end]
+	}
+	return ids, nil
 }
 
 func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
@@ -754,38 +740,21 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
-	idxs := q.c.loadIndexes()
-
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		if aErr := q.c.alive(); aErr != nil {
 			return aErr
 		}
-		// Built inside the read tx so the multikey-flag probe sees the same
-		// snapshot the (hypothetical) scan would — Explain must report the
-		// bounds the real query would use.
-		br := q.buildBoundsResult(idxs)
-		cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, tx)
-
-		plan, isFts, ferr := q.ftsScanPlan(tx, buf)
-		if ferr != nil {
-			return ferr
-		}
-		if !isFts {
-			plan = qplanner.BuildPlan(&qplanner.PlanParams{
-				Tx:          tx,
-				DataNs:      q.c.ns,
-				Filter:      q.cond,
-				Sorter:      q.sort,
-				IDBounds:    qb.idBounds,
-				PrimaryKey:  q.c.primaryKey,
-				Limit:       int(q.limit),
-				Offset:      int(q.offset),
-				Buf:         buf,
-				TotalDocs:   q.docCountExact(tx, idxs),
-				Indexes:     cboIndexes,
-				IndexHints:  q.buildIndexHints(),
-				FieldBounds: &br,
-			})
+		// The shared compiler, in report mode: exact TotalDocs (a human reads
+		// it), and the CBO candidate list is returned even on the fts/vector
+		// paths so the index report never silently shrinks. Vector queries
+		// are honestly explained as their ANN plan now, exactly what Iter and
+		// the write verbs execute.
+		plan, cboIndexes, perr := q.compilePlan(ctx, tx, buf, qb.idBounds, planOpts{
+			exactTotalDocs: true,
+			wantCandidates: true,
+		})
+		if perr != nil {
+			return perr
 		}
 		explain.Sql = plan.String()
 		explain.Plan = plan.ExplainString()
