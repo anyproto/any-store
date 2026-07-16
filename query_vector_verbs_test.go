@@ -107,3 +107,25 @@ func TestVectorClauseCount_MatchesIter(t *testing.T) {
 		})
 	}
 }
+
+func TestVectorClauseUnboundedWrite_Rejected(t *testing.T) {
+	// A vector clause denotes an ANN candidate window, not a predicate: an
+	// unbounded write must state its blast radius. Before the seam this call
+	// was a silent no-op (the clause degraded to a literal filter); executing
+	// the ANN plan unbounded would instead mutate the whole candidate set —
+	// both silently wrong, so it errors until $knn makes k part of the clause.
+	coll := vectorVerbColl(t)
+
+	_, err := coll.Find(vectorVerbClause).Delete(ctx)
+	require.ErrorIs(t, err, ErrVectorWriteWithoutLimit)
+	_, err = coll.Find(vectorVerbClause).Update(ctx, anyenc.MustParseJson(`{"$inc":{"n":1}}`))
+	require.ErrorIs(t, err, ErrVectorWriteWithoutLimit)
+
+	remaining, err := coll.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 20, remaining, "collection intact")
+
+	// Reads stay unbounded-legal.
+	ids := writeOrderIterIds(t, coll.Find(vectorVerbClause))
+	assert.NotEmpty(t, ids)
+}

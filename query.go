@@ -146,9 +146,26 @@ func (q *collQuery) reportCandidates(btx *btree.ReadTx, opts planOpts) []qplanne
 // the row sink).
 type planOpts struct {
 	countOnly      bool // Count: PlanParams.CountOnly, Sorter forced nil (a count is order-invariant)
+	forWrite       bool // Update/Delete: unbounded-sort elision + vector write guard
 	needScores     bool // Iter only: keep the BM25 sidecar for Iterator.Score()
 	exactTotalDocs bool // Explain only: docCountExact (human-facing TotalDocs)
 	wantCandidates bool // Explain only: return the CBO candidate report even on fts/vector paths
+}
+
+// writeSorter applies the write-verb sorter rule: ordering decides WHICH
+// documents a Limit/Offset window selects, so a BOUNDED write must plan with
+// the sorter exactly like the equivalent read. Without a window the selected
+// set is order-invariant, and the sorter would only add a full
+// materialize-and-sort inside the write transaction — so it is elided.
+// Trade-off (deliberate): the order an unbounded Update applies its modifier
+// in is left to the plan, so transient unique-index collisions under e.g.
+// {$inc} are not caller-controllable; a caller that needs a deterministic
+// application order must bound the write.
+func (q *collQuery) writeSorter(opts planOpts) query.Sort {
+	if opts.countOnly || (opts.forWrite && q.limit == 0 && q.offset == 0) {
+		return nil
+	}
+	return q.sort
 }
 
 // compilePlan is the single query compiler shared by the verbs. It owns
@@ -182,12 +199,9 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 			return nil, nil, err
 		}
 		ftsSpec.NeedScores = opts.needScores
-		sorter := ftsSorter(q.sort)
-		if opts.countOnly {
-			// Sound without ordering: FtsIter emits one aggregate per doc
-			// (duplicate-free), and the distinct count is order-invariant.
-			sorter = nil
-		}
+		// countOnly is sound without ordering: FtsIter emits one aggregate per
+		// doc (duplicate-free), and the distinct count is order-invariant.
+		sorter := ftsSorter(q.writeSorter(opts))
 		plan = qplanner.BuildPlan(&qplanner.PlanParams{
 			Tx:        btx,
 			DataNs:    q.c.ns,
@@ -210,10 +224,15 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 		return nil, nil, err
 	}
 	if vspec != nil {
-		sorter := q.sort
-		if opts.countOnly {
-			sorter = nil
-		} else if sorter == nil && !vspec.Ordered {
+		// A vector clause denotes an ANN candidate WINDOW, not a predicate: an
+		// unbounded write would mutate however many candidates the (tunable)
+		// search happens to yield. Until the $knn operator makes k part of the
+		// clause, a vector-clause Update/Delete must state its blast radius.
+		if opts.forWrite && q.limit == 0 {
+			return nil, nil, ErrVectorWriteWithoutLimit
+		}
+		sorter := q.writeSorter(opts)
+		if sorter == nil && !opts.countOnly && !vspec.Ordered {
 			// No explicit sort and the source isn't already distance-ordered
 			// (brute-force): order by distance ascending. When the ANN source
 			// is ordered, we leave sorter nil so the planner skips a redundant
@@ -238,10 +257,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 	// CBO path. Bounds and candidates are built against btx: the
 	// multikey-flag probe gating tight seek bounds must read the same
 	// snapshot the scan executes on.
-	sorter := q.sort
-	if opts.countOnly {
-		sorter = nil
-	}
+	sorter := q.writeSorter(opts)
 	idxs := q.c.loadIndexes()
 	br := q.buildBoundsResult(idxs)
 	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx)
@@ -395,7 +411,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	// the equivalent Iter returns — same sorter, same access-path detection
 	// ($text AND vector; an invalid vector clause errors here like it does on
 	// Iter instead of degrading to a literal filter).
-	plan, _, ferr := q.compilePlan(ctx, btx, buf, qb.idBounds, planOpts{})
+	plan, _, ferr := q.compilePlan(ctx, btx, buf, qb.idBounds, planOpts{forWrite: true})
 	if ferr != nil {
 		err = ferr
 		return
@@ -542,7 +558,7 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	// the equivalent Iter returns — same sorter, same access-path detection
 	// ($text AND vector; an invalid vector clause errors here like it does on
 	// Iter instead of degrading to a literal filter).
-	plan, _, ferr := q.compilePlan(ctx, btx, buf, qb.idBounds, planOpts{})
+	plan, _, ferr := q.compilePlan(ctx, btx, buf, qb.idBounds, planOpts{forWrite: true})
 	if ferr != nil {
 		err = ferr
 		return

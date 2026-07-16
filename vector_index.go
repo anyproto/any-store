@@ -538,6 +538,14 @@ var ErrMultipleVectorClauses = errors.New("any-store: query has multiple vector 
 // the index's dimension, e.g. {embedding: [..dim floats..]}.
 var ErrInvalidVectorQuery = errors.New("any-store: invalid vector query clause")
 
+// ErrVectorWriteWithoutLimit rejects an Update/Delete whose filter is a vector
+// clause but which carries no Limit. A vector clause denotes an ANN candidate
+// WINDOW (its size depends on tunable search parameters), not a predicate — an
+// unbounded write would mutate however many candidates the search happens to
+// yield. State the blast radius with .Limit(k); the planned $knn operator
+// moves k into the clause itself.
+var ErrVectorWriteWithoutLimit = errors.New("any-store: a vector-clause Update/Delete requires an explicit Limit")
+
 // ErrDistanceWithoutVector is returned when the synthetic _distance field is used
 // in a filter or sort but the query has no vector clause to produce it.
 var ErrDistanceWithoutVector = errors.New("any-store: _distance is only available in a vector query")

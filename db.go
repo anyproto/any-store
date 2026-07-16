@@ -1226,16 +1226,30 @@ func (db *db) persistAllDirtySketches(tx *btree.WriteTx) error {
 // for the write verbs. A no-op outside an ambient write tx: nothing is
 // buffered at the start of a fresh write tx (resetAllFtsPending), and a
 // read-only ambient tx cannot have buffered anything.
+// Caveat (documented, same class as iterate-while-mutate being undefined):
+// the flush WRITES into the ambient tx, so a $text read performed while an
+// iterator on the same tx is mid-iteration restructures pages under that
+// iterator's cursors — collect results before issuing in-tx $text reads.
 func (db *db) flushAmbientFtsPending(ctx context.Context) error {
-	ctxTx := ctx.Value(ctxKeyTx)
-	if ctxTx == nil {
-		return nil
-	}
-	wtx, ok := ctxTx.(WriteTx)
-	if !ok || wtx.Done() || wtx.instanceId() != db.instanceId {
+	wtx, ok := db.ambientWriteTx(ctx)
+	if !ok {
 		return nil
 	}
 	return db.flushAllFtsPending(wtx.btreeWriteTx())
+}
+
+// ambientWriteTx extracts a usable write tx carried by ctx: present, not
+// done, and belonging to this db instance.
+func (db *db) ambientWriteTx(ctx context.Context) (WriteTx, bool) {
+	ctxTx := ctx.Value(ctxKeyTx)
+	if ctxTx == nil {
+		return nil, false
+	}
+	wtx, ok := ctxTx.(WriteTx)
+	if !ok || wtx.Done() || wtx.instanceId() != db.instanceId {
+		return nil, false
+	}
+	return wtx, true
 }
 
 // flushAllFtsPending flushes every open collection's full-text write-back

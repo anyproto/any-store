@@ -126,3 +126,23 @@ func TestCollQuery_UnsortedLimitWrite_CardinalityOnly(t *testing.T) {
 	assert.Equal(t, 4, res.Modified)
 	assert.Len(t, writeOrderSurvivors(t, coll), 6)
 }
+
+func TestUnboundedSortedWrite_TouchesFullMatchedSet(t *testing.T) {
+	// With no Limit/Offset the selected set is order-invariant, so the write
+	// plans WITHOUT the sorter (no materialize-and-sort inside the write tx)
+	// and must still touch every matching document exactly once.
+	coll := writeOrderColl(t, 10)
+
+	res, err := coll.Find(`{"seq":{"$gte":4}}`).Sort("-seq").
+		Update(ctx, anyenc.MustParseJson(`{"$inc":{"n":1}}`))
+	require.NoError(t, err)
+	assert.Equal(t, 7, res.Modified, "seq 4..10 = 7 docs")
+
+	touched := writeOrderIterIds(t, coll.Find(`{"n":1}`))
+	assert.Len(t, touched, 7)
+
+	res, err = coll.Find(nil).Sort("seq").Delete(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 10, res.Modified)
+	assert.Empty(t, writeOrderSurvivors(t, coll))
+}

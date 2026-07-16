@@ -1313,14 +1313,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	// values, which the +0x01 Start pad would wrongly exclude. (CoverIter
 	// above does not take padded bounds either — it seeks the raw prefix and
 	// applies HasExactFieldPrefix instead.)
-	dedupBounds := idx.Bounds
-	idx.Bounds = padBoundsForReverseTail(idx)
-	// After the pad: a reverse-tail bound Start is no longer a bare inverted
-	// prefix, so MergeOverlappingBounds' plain byte sort is stored-key order.
-	// Compound tuples only — see MergeOverlappingBounds for the gate rationale.
-	if idx.BoundFields > 1 {
-		idx.Bounds = MergeOverlappingBounds(idx.Bounds)
-	}
+	dedupBounds := finalizeIndexBounds(idx)
 
 	// Use batched allocation for the common case: IndexIter + FetchIter + FilterIter.
 	// This replaces 5 separate heap allocations with 1.
@@ -1440,14 +1433,7 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 	}
 	// Pre-pad bounds for CanonicalKeyDedupIter (bare field values); padded
 	// bounds for IndexIter (full keys) — see buildIndexSeekChain.
-	dedupBounds := idx.Bounds
-	idx.Bounds = padBoundsForReverseTail(idx)
-	// After the pad: a reverse-tail bound Start is no longer a bare inverted
-	// prefix, so MergeOverlappingBounds' plain byte sort is stored-key order.
-	// Compound tuples only — see MergeOverlappingBounds for the gate rationale.
-	if idx.BoundFields > 1 {
-		idx.Bounds = MergeOverlappingBounds(idx.Bounds)
-	}
+	dedupBounds := finalizeIndexBounds(idx)
 	reverse := shouldReverse(params.Sorter, idx)
 
 	var root Iterator = &IndexIter{
@@ -2148,6 +2134,28 @@ func compareInvertedStart(a, b []byte) int {
 // Only the LAST chained field of an index bound may be padded: earlier
 // (fixed, equality) fields are used as exact byte prefixes that later field
 // bounds are concatenated to.
+
+// finalizeIndexBounds applies the bound-normalization sequence every scanning
+// chain must share — seek and scan plans have to select identical rows for
+// the same query, so this order lives in exactly one place:
+//
+//	pad the reverse tail (escape-exact full keys for IndexIter), then
+//	coalesce overlapping compound tuples (MergeOverlappingBounds; only after
+//	the pad is its plain byte sort stored-key order — a bare inverted Start
+//	is a byte-prefix of its escape-continuation group and would sort wrongly).
+//
+// Returns the PRE-pad bounds for consumers that test bare field values
+// (CanonicalKeyDedupIter; the +0x01 Start pad would wrongly exclude them) and
+// leaves the padded, merged bounds on idx.Bounds for IndexIter.
+func finalizeIndexBounds(idx *CBOIndex) (dedupBounds query.Bounds) {
+	dedupBounds = idx.Bounds
+	idx.Bounds = padBoundsForReverseTail(idx)
+	if idx.BoundFields > 1 {
+		idx.Bounds = MergeOverlappingBounds(idx.Bounds)
+	}
+	return dedupBounds
+}
+
 // padBoundsForReverseTail applies padReverseBounds when the final field of the
 // bound chain is reverse-flagged. Call it only for the CHOSEN index, after
 // AdjustBoundsForNonUnique and after PointLookup/sketch estimation (both read
@@ -2383,6 +2391,13 @@ func boundsOverlap(a, b *query.Bound) bool {
 // lists alias a shared window into BoundsResult.Bounds and must not be
 // reordered or compacted in place; they are also already disjoint (one bound
 // per family member, no concatenation, wrapped in CanonicalKeyDedupIter).
+//
+// Deliberately NOT query.Bounds.SortAndMerge: that operates on ascending
+// VALUE-space bounds and differs at shared boundaries (it keeps the first
+// bound's EndInclude on equal Ends instead of OR-ing, and merges
+// touching-adjacent bounds — which here would widen a half-open pair into
+// covering a key neither side selects). This one runs on padded KEY-space
+// tuples and coalesces only genuine overlaps.
 func MergeOverlappingBounds(bounds query.Bounds) query.Bounds {
 	if len(bounds) < 2 {
 		return bounds
