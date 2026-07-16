@@ -12,7 +12,15 @@ import (
 // compReference is the pre-fast-path implementation: always marshal the probe
 // and bytes.Compare against EqValue. okScalar must agree with it bit-for-bit
 // for every operator and every value pairing.
+//
+// It carries one deliberate divergence from raw bytes.Compare: Rule V (BUG-32).
+// The vector values stay in the matrix below precisely so the divergence stays
+// pinned — a vector is not a point on the scalar order, so an ordering op
+// against one is false on either side rather than resolving on the type tag.
 func compReference(e *Comp, v *anyenc.Value, buf *syncpool.DocBuffer) bool {
+	if e.isOrderingOp() && (v.Type() == anyenc.TypeVectorF32 || e.eqIsVector()) {
+		return false
+	}
 	buf.SmallBuf = v.MarshalTo(buf.SmallBuf[:0])
 	return e.compResult(bytes.Compare(e.EqValue, buf.SmallBuf))
 }
@@ -58,8 +66,14 @@ func TestCompOkScalar_MatchesMarshalReference(t *testing.T) {
 					t.Errorf("op=%d eq=%s probe=%s: okScalar=%v, reference=%v", op, eqV, probe, got, want)
 				}
 			}
-			// nil probe must equal comparing against encoded null
+			// nil probe (absent field) must equal comparing against encoded null —
+			// except under Rule V, where an ordering op against a vector operand is
+			// false. This row IS the bug: null's tag (1) sorts below a vector's (10),
+			// so {"absentField":{"$lt":{"$vector":[..]}}} used to match every document.
 			wantNil := cmp.compResult(bytes.Compare(cmp.EqValue, valueNull.MarshalTo(nil)))
+			if cmp.isOrderingOp() && cmp.eqIsVector() {
+				wantNil = false
+			}
 			if got := cmp.Ok(nil, buf); got != wantNil {
 				t.Errorf("op=%d eq=%s probe=nil: Ok=%v, reference=%v", op, eqV, got, wantNil)
 			}

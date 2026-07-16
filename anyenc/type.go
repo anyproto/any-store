@@ -38,10 +38,14 @@ const (
 	iTypeObject             = ^Type(7)
 	iTypeBinary             = ^Type(8)
 	iTypeCompressedObjectS2 = ^Type(9)
-	// iTypeObjectID (^Type(11) = 0xF4) is the inverted tag for reverse index
-	// keys. Note ^Type(10) = 0xF5 (inverted vectorF32) is deliberately skipped:
-	// vectors are never index-keyed, so 0xF5 must stay an "unknown type".
-	iTypeObjectID = ^Type(11)
+	// iTypeVectorF32 (^Type(10) = 0xF5) and iTypeObjectID (^Type(11) = 0xF4) are
+	// the inverted tags for reverse index keys. A vector IS index-keyed: a
+	// descending index on a vector-valued field AppendInverted's it into the key
+	// (see index.go writeValues), so 0xF5 must parse — when it did not, the
+	// reader failed to extract the docId from such a key and silently dropped
+	// every vector-valued row from a reverse-index scan (BUG-32 follow-up).
+	iTypeVectorF32 = ^Type(10)
+	iTypeObjectID  = ^Type(11)
 )
 
 const (
