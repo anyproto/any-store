@@ -7,6 +7,7 @@ import (
 	"math"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/valyala/fastjson"
@@ -771,6 +772,167 @@ func (t Text) String() string {
 	return fmt.Sprintf(`{"$text":{"$search":%q}}`, t.Search)
 }
 
+// Knn is the {"<field>":{"$knn":{"$query":[…],"$k":N}}} approximate-nearest-neighbour
+// clause. It is NOT a predicate: it selects the K documents whose vector at this
+// field the field's vector index ranks closest to Query. "Is this document one of
+// the k nearest?" is a property of the CANDIDATE SET, not of the document, so no
+// per-document truth value exists.
+//
+// Ok therefore returns FALSE, unconditionally, and is unreachable in a correct
+// plan: the executor detects the clause on EVERY verb, drives the query from the
+// ANN source, strips the clause from the residual, and hard-errors on any
+// placement where it could not be stripped. The false FAILS CLOSED — a Knn that
+// somehow reaches a document-by-document evaluator matches nothing rather than
+// everything. Contrast query.Text, whose Ok returns TRUE: fail-open on
+// Query.Delete costs the collection. Never do that here.
+//
+// FAIL-CLOSED IS LOAD-BEARING IN TWO PLACES, both of which must be kept in sync:
+//   - ContainsKnn must walk Not/Nor: Not{Knn}.Ok == !false == MATCH-ALL. A $knn
+//     that reaches a Not is a mass delete through the front door, reachable from
+//     Query.Delete.
+//   - GuaranteesPresence must special-case Knn: it calls the inner filter's Ok
+//     DIRECTLY and reads !Ok(nil) && !Ok(null) as "guarantees presence" — so a
+//     fail-closed Ok yields TRUE, the AGGRESSIVE answer.
+type Knn struct {
+	Query []float32 // non-empty, finite; len checked against the index dim at detection
+	K     int       // required, 1..KnnMaxK
+	Ef    int       // 0 = auto; candidate/beam depth (numCandidates); >= K when set
+	Index string    // optional: vector index name (disambiguates 2 indexes on one field)
+}
+
+const (
+	// KnnMaxK bounds $k. Policy, not semantics: raising it later is
+	// non-breaking, lowering it is not — start conservative.
+	KnnMaxK = 10_000
+	// KnnMaxEf bounds $ef, the ANN candidate/beam depth.
+	KnnMaxEf = 65_536
+)
+
+// Ok fails closed: a Knn is not a predicate (see the type comment).
+func (k Knn) Ok(*anyenc.Value, *syncpool.DocBuffer) bool { return false }
+
+// IndexBounds returns bs verbatim: a Knn clause contributes no range-index
+// bounds. Verbatim matters — Or.IndexBounds detects "this branch contributed
+// nothing" by comparing lengths, and a shorter return silently discards
+// accumulated sibling bounds.
+func (k Knn) IndexBounds(_ string, bs Bounds) Bounds { return bs }
+
+// String renders the clause losslessly: MustParseCondition round-trips it.
+func (k Knn) String() string {
+	var b strings.Builder
+	b.WriteString(`{"$knn":{"$query":[`)
+	for i, f := range k.Query {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(strconv.FormatFloat(float64(f), 'g', -1, 32))
+	}
+	b.WriteString(`],"$k":`)
+	b.WriteString(strconv.Itoa(k.K))
+	if k.Ef != 0 {
+		b.WriteString(`,"$ef":`)
+		b.WriteString(strconv.Itoa(k.Ef))
+	}
+	if k.Index != "" {
+		b.WriteString(`,"$index":`)
+		b.WriteString(strconv.Quote(k.Index))
+	}
+	b.WriteString(`}}`)
+	return b.String()
+}
+
+// KnnOpt is an option for NewKnn.
+type KnnOpt func(*Knn)
+
+// KnnEf sets the explicit ANN candidate/beam depth ($ef).
+func KnnEf(ef int) KnnOpt { return func(k *Knn) { k.Ef = ef } }
+
+// KnnIndex names the vector index to search ($index) — required only when the
+// field has more than one vector index.
+func KnnIndex(name string) KnnOpt { return func(k *Knn) { k.Index = name } }
+
+// NewKnn is the programmatic constructor for the $knn clause: wrap it in a
+// query.Key naming the vector field. It exists because programmatic consumers
+// build their ANN filter as a Go value and never touch JSON; every validation
+// the parser applies is re-checked at query build time (detection), which is
+// the only validation a hand-built filter ever sees.
+func NewKnn(vec []float32, k int, opts ...KnnOpt) Knn {
+	kn := Knn{Query: vec, K: k}
+	for _, o := range opts {
+		o(&kn)
+	}
+	return kn
+}
+
+// ContainsKnn reports whether the tree contains a Knn ANYWHERE. It MUST walk
+// And/*And/Or/Nor/Not/Key: a Knn under Not would evaluate !false == match-all
+// (see the Knn type comment), so every consumer that rejects bad placements
+// needs the full walk.
+func ContainsKnn(f Filter) bool {
+	switch ft := f.(type) {
+	case Knn:
+		return true
+	case And:
+		return anyContainsKnn(ft)
+	case *And:
+		return anyContainsKnn(*ft)
+	case Or:
+		return anyContainsKnn(ft)
+	case Nor:
+		return anyContainsKnn(ft)
+	case Not:
+		return ContainsKnn(ft.Filter)
+	case Key:
+		return ContainsKnn(ft.Filter)
+	}
+	return false
+}
+
+func anyContainsKnn(fs []Filter) bool {
+	for _, f := range fs {
+		if ContainsKnn(f) {
+			return true
+		}
+	}
+	return false
+}
+
+// ContainsSourceFilter reports whether the tree contains a SOURCE filter — one
+// matched by an index (Text, Knn) rather than by Ok. RECURSIVE, not a shallow
+// type check: the only legal shapes are Key{path, Knn} and And{Text, …}, so a
+// shallow test would return false for every real query and protect nobody.
+// External consumers that post-filter by calling Filter.Ok directly (the
+// subscription pattern) MUST reject these: Text.Ok matches everything, Knn.Ok
+// matches nothing.
+func ContainsSourceFilter(f Filter) bool {
+	switch ft := f.(type) {
+	case Text, Knn:
+		return true
+	case And:
+		return anyContainsSourceFilter(ft)
+	case *And:
+		return anyContainsSourceFilter(*ft)
+	case Or:
+		return anyContainsSourceFilter(ft)
+	case Nor:
+		return anyContainsSourceFilter(ft)
+	case Not:
+		return ContainsSourceFilter(ft.Filter)
+	case Key:
+		return ContainsSourceFilter(ft.Filter)
+	}
+	return false
+}
+
+func anyContainsSourceFilter(fs []Filter) bool {
+	for _, f := range fs {
+		if ContainsSourceFilter(f) {
+			return true
+		}
+	}
+	return false
+}
+
 // presenceNullProbe is an explicit JSON null used by GuaranteesPresence to test
 // whether a predicate rejects a present-but-null value, as distinct from a
 // missing field (which probes as a nil *anyenc.Value).
@@ -795,6 +957,16 @@ var presenceNullProbe = anyenc.MustParseJson("null")
 func GuaranteesPresence(f Filter, fieldName string) bool {
 	switch ft := f.(type) {
 	case Key:
+		// Source filters (Knn, Text) are matched by an index, not by Ok, so
+		// their Ok says nothing about presence. Knn is the trap this guard
+		// exists for: its fail-closed Ok would probe !false && !false == true —
+		// the AGGRESSIVE answer, feeding sparse-index selection with a claim
+		// the filter never made. (Text is "safe" only because its Ok fails
+		// open; special-case it anyway rather than lean on that accident.)
+		switch ft.Filter.(type) {
+		case Knn, Text:
+			return false
+		}
 		if strings.Join(ft.Path, ".") == fieldName {
 			var buf syncpool.DocBuffer
 			return !ft.Filter.Ok(nil, &buf) && !ft.Filter.Ok(presenceNullProbe, &buf)

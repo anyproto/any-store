@@ -34,6 +34,7 @@ const filterZoo = `{
 	"n": {"$not": {"$eq": 3}},
 	"vf": {"$eq": {"$vector": [1, 2]}},
 	"vt": {"$type": "vectorF32"},
+	"vk": {"$knn": {"$query": [1, 2], "$k": 3}},
 	"$text": {"$search": "hello"}
 }`
 
