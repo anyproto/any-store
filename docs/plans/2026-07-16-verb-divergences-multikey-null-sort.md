@@ -184,7 +184,7 @@ if exact && !scalarProven(idx) {          // lazy systemNS Get, chosen-candidate
 ### Out of scope, filed as such
 
 - **Recovering compound-descending order-providing scans** by teaching `DocDedupIter` to skip whole-array entries (it would need `Plan.DocParsed` + per-field tuple slicing — the deferred canonical-compound design). File as a perf follow-up in the test repo if it ever matters.
-- **Array primary keys**: `Sort("id")`'s FullScanIter fast path (planner.go:1200-1223) orders by stored id bytes; a doc with an array id would now sort differently under an explicit SortIter. Both differential sides share the path, so the fuzz cannot diverge on it. Verify id-type constraints once (`parseId`/insert validation) and add a note to `docs/query-filter-contract.md` if arrays are representable.
+- **Array primary keys**: not representable — `newItem` (collection.go:381-394) rejects them with `ErrArrayPrimaryKey` on every write path (insert/update/upsert/backfill; pinned by collection_primary_key_test.go), so `Sort("id")`'s FullScanIter fast path (planner.go:1200-1223) can never disagree with the new SortIter key. Only caveat, already accepted policy: read paths don't re-check, so pre-ban alpha data could theoretically hold array ids — alpha back-compat is explicitly out of scope (pre-beta catalog decision). Verified 2026-07-16; nothing to do.
 
 ---
 
