@@ -28,6 +28,8 @@ func TestFilterOkRawParity(t *testing.T) {
 		`{"a":{"$gt":10}}`,
 		`{"a":{"$lt":0}}`,
 		`{"a":{"$in":[50,"50",true]}}`,
+		`{"a":{"$in":[null,50]}}`, // null member matches a missing field
+		`{"n":{"$in":[null]}}`,
 		`{"a":{"$exists":true}}`,
 		`{"a":{"$exists":false}}`,
 		`{"name":{"$ne":"alice"}}`,

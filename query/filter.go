@@ -508,7 +508,13 @@ func NewInValue(values ...*anyenc.Value) In {
 
 func (e In) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 	if v == nil {
-		return false
+		// $in is an OR of equalities and {"$eq":null} matches a MISSING field
+		// (Comp.Ok probes encodedNull for a nil value), so a null member must
+		// match here too — otherwise {"$in":[null]} disagrees with {"$eq":null},
+		// and Iter drops missing-field docs that IndexBounds' null point bound
+		// (a missing field is indexed under TypeNull) lets Count include.
+		_, ok := e.Values[string(encodedNull)]
+		return ok
 	}
 	if docBuf == nil {
 		docBuf = &syncpool.DocBuffer{}

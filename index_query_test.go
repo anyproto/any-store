@@ -3411,3 +3411,45 @@ func TestIndex_ComplexFilter_OrTwoIndexedFieldsUnion(t *testing.T) {
 		assert.False(t, ie.Used, "index %q must not be used for a cross-field $or", ie.Name)
 	}
 }
+
+// A $in set containing null must match missing-field documents, agreeing with
+// {"$eq":null} and with the covering Count path (a missing field is indexed
+// under the null key, and In.IndexBounds emits a point bound for the null
+// member — Iter previously dropped what Count included).
+func TestIndex_InNullMatchesMissingField(t *testing.T) {
+	fx := newFixture(t)
+
+	build := func(t *testing.T, withIndex bool) Collection {
+		coll, err := fx.CreateCollection(ctx, fmt.Sprintf("innull_%v", withIndex))
+		require.NoError(t, err)
+		if withIndex {
+			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+		}
+		for _, doc := range []string{
+			`{"id":1}`,
+			`{"id":2,"a":null}`,
+			`{"id":3,"a":1}`,
+		} {
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(doc)))
+		}
+		return coll
+	}
+
+	idx := build(t, true)
+	noidx := build(t, false)
+
+	check := func(t *testing.T, filter string, wantIds []int) {
+		for name, coll := range map[string]Collection{"indexed": idx, "fullscan": noidx} {
+			cnt, err := coll.Find(filter).Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, len(wantIds), cnt, "%s Count %s", name, filter)
+			assert.ElementsMatch(t, wantIds, collectIntField(t, coll.Find(filter), "id"),
+				"%s Iter %s", name, filter)
+		}
+	}
+
+	check(t, `{"a":{"$in":[null]}}`, []int{1, 2})
+	check(t, `{"a":null}`, []int{1, 2}) // the $eq the $in must agree with
+	check(t, `{"a":{"$in":[null,1]}}`, []int{1, 2, 3})
+	check(t, `{"a":{"$in":[1]}}`, []int{3}) // no null member: missing stays excluded
+}
