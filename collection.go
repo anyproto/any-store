@@ -977,6 +977,9 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 	if info.Name == "" {
 		info.Name = info.createName()
 	}
+	if err = validateIndexName(info.Name); err != nil {
+		return nil, err
+	}
 	for _, field := range info.Fields {
 		if err = validateIndexField(field); err != nil {
 			return nil, err
@@ -1036,6 +1039,9 @@ func (c *collection) createFtsIndex(ctx context.Context, tx *btree.WriteTx, info
 	tx.MarkSchemaChanged()
 	if info.Name == "" {
 		info.Name = info.createName()
+	}
+	if err := validateIndexName(info.Name); err != nil {
+		return nil, err
 	}
 	for _, field := range info.Fields {
 		if err := validateIndexField(field); err != nil {

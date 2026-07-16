@@ -397,6 +397,9 @@ func (c *collection) createVectorIndex(tx *btree.WriteTx, info IndexInfo) (*vect
 	if info.Name == "" {
 		info.Name = info.Vector.Field
 	}
+	if err := validateIndexName(info.Name); err != nil {
+		return nil, err
+	}
 	if err := c.db.registerIndex(tx, c.name, info); err != nil {
 		return nil, err
 	}
