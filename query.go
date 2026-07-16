@@ -598,27 +598,6 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 		q.cond = query.All{}
 	}
 
-	// $text counts by iterating the full-text plan (respecting any residual
-	// predicate and offset/limit). Iter() builds the Fts plan; counting its
-	// results is the simplest correct path.
-	if _, hasText, terr := findTextFilter(q.cond); terr != nil {
-		return 0, terr
-	} else if hasText {
-		iter, ierr := q.Iter(ctx)
-		if ierr != nil {
-			return 0, ierr
-		}
-		defer func() {
-			if cerr := iter.Close(); cerr != nil && err == nil {
-				err = cerr
-			}
-		}()
-		for iter.Next() {
-			count++
-		}
-		return count, iter.Err()
-	}
-
 	// Fast path: filter provably matches no documents (e.g. $in:[]). Skip
 	// the planner, the read tx, and the index walk entirely — the answer
 	// is unconditionally zero. See isUnsatisfiable.
@@ -647,72 +626,56 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 		return
 	}
 
-	idxs := q.c.loadIndexes()
-
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		buf := q.c.db.syncPool.GetDocBuf()
 		defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
-		// Bounds and CBO candidates are built INSIDE the read tx: the
-		// multikey-flag probe gating tight seek bounds must read the same
-		// snapshot the scan executes on.
-		br := q.buildBoundsResult(idxs)
-		var cboBuf [8]qplanner.CBOIndex
-		cboIndexes := q.buildCBOIndexesInto(cboBuf[:0], &br, idxs, tx)
-
-		plan := qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:          tx,
-			DataNs:      q.c.ns,
-			Filter:      q.cond,
-			Sorter:      nil, // no sort needed for count
-			IDBounds:    idBounds,
-			PrimaryKey:  q.c.primaryKey,
-			Limit:       int(q.limit),
-			Offset:      int(q.offset),
-			Buf:         buf,
-			TotalDocs:   q.docCountForPlan(tx, idxs),
-			Indexes:     cboIndexes,
-			IndexHints:  q.buildIndexHints(),
-			CountOnly:   true,
-			FieldBounds: &br,
-		})
-
-		// Limit/Offset cutoffs must apply to DISTINCT docs, not raw entry
-		// rows: over a multi-key index LimitIter.Next skips/caps entries that
-		// later collapse in dedup, diverging from Iter (known-issues I-07).
-		// CountDistinct deduplicates before the cutoff.
-		if li, ok := plan.Root.(*qplanner.LimitIter); ok {
-			n, cerr := li.CountDistinct()
-			plan.Close()
-			if cerr != nil {
-				return cerr
-			}
-			count = n
-			return nil
+		// The shared compiler, in count mode: CountOnly enables the covering
+		// fast paths, the sorter is dropped (a count is order-invariant), and
+		// $text/vector queries count their native plans — the same document
+		// set Iter yields, without the score sidecar or a public iterator.
+		plan, _, perr := q.compilePlan(tx, buf, idBounds, planOpts{countOnly: true})
+		if perr != nil {
+			return perr
 		}
-		// Use batch counting if the root iterator supports it (covering index
-		// count). IndexIter.CountEntries handles the multi-bound + multi-key
-		// dedup internally via the per-entry value byte; consumers don't need
-		// to layer another dedup on top.
-		if ci, ok := plan.Root.(qplanner.CountableIterator); ok {
-			n, cerr := ci.CountEntries()
-			plan.Close() // release cursor resources held by CountEntries
-			if cerr != nil {
-				return cerr
-			}
-			count = n
-			return nil
+		n, cerr := countPlanRoot(plan)
+		if cerr != nil {
+			return cerr
 		}
-		// Generic distinct-doc count: a doc whose array values match multiple
-		// bounds is counted once.
-		cerr := qplanner.ForEachDistinct(plan.Root, func([]byte) error {
-			count++
-			return nil
-		})
-		plan.Close()
-		return cerr
+		count = n
+		return nil
 	})
 	return
+}
+
+// countPlanRoot consumes a CountOnly plan and returns the distinct-doc count,
+// closing the plan. Dispatch order matters:
+//
+//  1. LimitIter first: the Limit/Offset cutoffs must apply to DISTINCT docs,
+//     not raw entry rows — over a multi-key index LimitIter.Next skips/caps
+//     entries that later collapse in dedup, diverging from Iter
+//     (known-issues I-07). CountDistinct deduplicates before the cutoff.
+//  2. The covering batch count (IndexIter.CountEntries) handles multi-bound +
+//     multi-key dedup internally via the per-entry value byte.
+//  3. Otherwise the shared generic distinct loop.
+func countPlanRoot(plan *qplanner.Plan) (int, error) {
+	if li, ok := plan.Root.(*qplanner.LimitIter); ok {
+		n, err := li.CountDistinct()
+		plan.Close()
+		return n, err
+	}
+	if ci, ok := plan.Root.(qplanner.CountableIterator); ok {
+		n, err := ci.CountEntries()
+		plan.Close() // release cursor resources held by CountEntries
+		return n, err
+	}
+	n := 0
+	err := qplanner.ForEachDistinct(plan.Root, func([]byte) error {
+		n++
+		return nil
+	})
+	plan.Close()
+	return n, err
 }
 
 // collectDistinctIDs materializes a plan's distinct docIds into slices backed

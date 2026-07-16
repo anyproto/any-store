@@ -214,3 +214,28 @@ func TestFtsPhrase_NoMatchAcrossArrayElements(t *testing.T) {
 	ids, _ = collectIter(t, coll.Find(`{"$text":{"$search":"\"aaa bbb\""}}`))
 	assert.Equal(t, []string{"d1"}, ids)
 }
+
+// Count must denote the same document set as Iter on the identical $text
+// query — including under Limit/Offset and with a residual predicate. Count
+// compiles a native FTS plan (no score sidecar, no public iterator); these
+// pin that it cannot drift from the read path.
+func TestFtsCount_MatchesIterAcrossWindows(t *testing.T) {
+	fx, coll := ftsOpsColl(t)
+	defer fx.finish()
+
+	for name, q := range map[string]func() Query{
+		"plain":         func() Query { return coll.Find(`{"$text":{"$search":"tokyo"}}`) },
+		"limit":         func() Query { return coll.Find(`{"$text":{"$search":"tokyo"}}`).Limit(1) },
+		"offset":        func() Query { return coll.Find(`{"$text":{"$search":"tokyo"}}`).Offset(1) },
+		"limit_offset":  func() Query { return coll.Find(`{"$text":{"$search":"tokyo"}}`).Limit(2).Offset(1) },
+		"residual":      func() Query { return coll.Find(`{"$text":{"$search":"tokyo"},"id":{"$in":["a","d"]}}`) },
+		"match_nothing": func() Query { return coll.Find(`{"$text":{"$search":"zzznope"}}`) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			ids, _ := collectIter(t, q())
+			count, err := q().Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, len(ids), count, "Count and Iter must agree; iter=%v", ids)
+		})
+	}
+}

@@ -92,3 +92,18 @@ func TestVectorClauseInvalid_WriteVerbsAgreeWithIter(t *testing.T) {
 		assert.Equal(t, 20, remaining, "cond=%s: collection must be intact", cond)
 	}
 }
+
+func TestVectorClauseCount_MatchesIter(t *testing.T) {
+	coll := vectorVerbColl(t)
+	for name, q := range map[string]func() Query{
+		"plain": func() Query { return coll.Find(vectorVerbClause) },
+		"limit": func() Query { return coll.Find(vectorVerbClause).Limit(5) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			ids := writeOrderIterIds(t, q())
+			count, err := q().Count(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, len(ids), count, "Count and Iter must denote the same set")
+		})
+	}
+}
