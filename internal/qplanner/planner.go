@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 
@@ -1260,6 +1261,10 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	if len(idx.Bounds) > 0 {
 		idx.Bounds = AdjustBoundsForNonUnique(idx.Bounds)
 	}
+	// Compound tuples only: see MergeOverlappingBounds for the gate rationale.
+	if idx.BoundFields > 1 {
+		idx.Bounds = MergeOverlappingBounds(idx.Bounds)
+	}
 
 	// Determine reverse scan direction
 	reverse := shouldReverse(params.Sorter, idx)
@@ -1430,6 +1435,10 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 	// Applies to unique indexes too — see buildIndexSeekChain.
 	if len(idx.Bounds) > 0 {
 		idx.Bounds = AdjustBoundsForNonUnique(idx.Bounds)
+	}
+	// Compound tuples only: see MergeOverlappingBounds for the gate rationale.
+	if idx.BoundFields > 1 {
+		idx.Bounds = MergeOverlappingBounds(idx.Bounds)
 	}
 	// Pre-pad bounds for CanonicalKeyDedupIter (bare field values); padded
 	// bounds for IndexIter (full keys) — see buildIndexSeekChain.
@@ -2284,6 +2293,74 @@ func AdjustBoundsForNonUnique(bounds query.Bounds) query.Bounds {
 		}
 	}
 	return bounds
+}
+
+// boundsOverlap reports whether b intersects a in key space, given that a
+// sorts at or before b by Start. An empty End is +inf; an equal boundary key
+// is shared only when both sides include it.
+func boundsOverlap(a, b *query.Bound) bool {
+	if len(a.End) == 0 {
+		return true
+	}
+	switch c := bytes.Compare(b.Start, a.End); {
+	case c < 0:
+		return true
+	case c == 0:
+		return a.EndInclude && b.StartInclude
+	default:
+		return false
+	}
+}
+
+// MergeOverlappingBounds sorts key-space bounds ascending by Start and
+// coalesces every overlapping pair into its hull. IndexIter walks the bound
+// list sequentially and requires it ordered and pairwise disjoint — bounds
+// that are disjoint per FIELD can still overlap after compound-tuple
+// concatenation, because anyenc string encodings are not prefix-free across
+// the NUL escape (enc(v) is a byte-prefix of enc(v+"\x00…")): the 0xff pad
+// after a shorter tuple then covers keys the next tuple's range also selects,
+// and a shared entry is emitted twice (duplicate rows, double-applied
+// modifiers, ErrDocNotFound on delete). Coalescing only ever WIDENS a bound —
+// the residual filter rejects the extra keys; it can never drop one.
+//
+// Callers gate this on compound chains (BoundFields > 1): single-field bound
+// lists alias a shared window into BoundsResult.Bounds and must not be
+// reordered or compacted in place; they are also already disjoint (one bound
+// per family member, no concatenation, wrapped in CanonicalKeyDedupIter).
+func MergeOverlappingBounds(bounds query.Bounds) query.Bounds {
+	if len(bounds) < 2 {
+		return bounds
+	}
+	slices.SortStableFunc(bounds, func(a, b query.Bound) int {
+		return bytes.Compare(a.Start, b.Start)
+	})
+	out := bounds[:1]
+	for i := 1; i < len(bounds); i++ {
+		cur := &out[len(out)-1]
+		next := &bounds[i]
+		if !boundsOverlap(cur, next) {
+			out = append(out, *next)
+			continue
+		}
+		// Hull: Start stays cur's (sorted first; on equal Starts the include
+		// flags are OR-ed), End becomes the larger of the two.
+		if bytes.Equal(cur.Start, next.Start) {
+			cur.StartInclude = cur.StartInclude || next.StartInclude
+		}
+		switch {
+		case len(cur.End) == 0:
+			// already +inf
+		case len(next.End) == 0:
+			cur.End, cur.EndInclude = nil, false
+		default:
+			if c := bytes.Compare(next.End, cur.End); c > 0 {
+				cur.End, cur.EndInclude = next.End, next.EndInclude
+			} else if c == 0 {
+				cur.EndInclude = cur.EndInclude || next.EndInclude
+			}
+		}
+	}
+	return out
 }
 
 // IndexSortMatch checks if an index covers the sort fields.
