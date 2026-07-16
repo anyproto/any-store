@@ -2,16 +2,18 @@
 
 any-store has a built-in vector (embedding) index for approximate nearest-neighbour
 (ANN) search, implemented as a btree-resident HNSW graph. It integrates with the
-normal `Find()` query pipeline: a vector clause selects candidates, ordinary
-filters and sorting apply on top, and each result carries its distance to the
-query.
+normal `Find()` query pipeline: a `$knn` clause selects the k nearest documents,
+ordinary filters and sorting apply on top, and each result carries its distance
+to the query.
 
 - **Storage-resident** — the graph lives in the btree, so it's crash-safe,
   MVCC-consistent across readers, and multiprocess-safe for writes. No separate
   in-memory index to build or invalidate.
 - **Queried through `Find()`** — there is no separate search call; you express the
-  query as `Find({ <vectorField>: [...] })` and combine it with any other filter,
-  sort, limit, and offset.
+  query as `Find({ <vectorField>: {"$knn": {"$query": [...], "$k": 10}} })` and
+  combine it with any other filter, sort, limit, and offset. Every verb —
+  `Iter`, `Count`, `Update`, `Delete`, `Explain`, and an `Aggregate` `$match`
+  prefix — denotes the same k-bounded document set for the same query.
 
 ## 1. Create a vector index
 
@@ -96,22 +98,66 @@ across documents and call `arena.Reset()` between batches to avoid allocations.
 Inserts are batched: pass many documents to one `Insert(...)` call so they share a
 single transaction.
 
-## 3. Query
+## 3. Query: the `$knn` operator
 
-A query becomes a vector search when a top-level clause is an equality between a
-**vector-indexed field** and a `Dim`-sized array:
-
-```go
-// k nearest neighbours, closest first (the default order).
-iter, err := coll.Find(`{"embedding":[0.1, 0.2, ...]}`).Limit(10).Iter(ctx)
-```
-
-Everything else in the filter is applied as a normal predicate on the candidates:
+A query becomes a vector search when a **vector-indexed field** carries a `$knn`
+clause:
 
 ```go
-// ANN + ordinary filters.
-coll.Find(`{"embedding":[...], "lang":"en", "year":{"$gt":2020}}`).Limit(10).Iter(ctx)
+// The 10 nearest neighbours, closest first (the default order).
+iter, err := coll.Find(`{"embedding":{"$knn":{"$query":[0.1, 0.2, ...], "$k":10}}}`).Iter(ctx)
 ```
+
+`$knn` takes an options object — this is the only accepted form:
+
+| Option | | |
+|---|---|---|
+| `$query` | **required** | the query vector: a plain number array or a packed `{"$vector":[...]}` value |
+| `$k` | **required** | how many neighbours to select, `1..10000` |
+| `$ef` | optional | ANN candidate/beam depth (`numCandidates`), `$k..65536`; default auto-sizes from the index and over-fetches ×10 when a residual filter is present |
+| `$index` | optional | vector index name — required only when the field has more than one vector index |
+
+Programmatic consumers build the clause with `query.NewKnn(vec, k, opts...)`
+wrapped in a `query.Key` naming the field — no JSON involved:
+
+```go
+filter := query.Key{Path: []string{"embedding"}, Filter: query.NewKnn(vec, 10)}
+iter, err := coll.Find(filter).Iter(ctx)
+```
+
+Everything else in the filter is applied as a residual predicate **before** the
+k-cut — the query denotes the k nearest *matching* documents (hybrid search):
+
+```go
+// ANN + ordinary filters: the 10 nearest docs among those matching lang/year.
+coll.Find(`{"embedding":{"$knn":{"$query":[...], "$k":10}}, "lang":"en", "year":{"$gt":2020}}`).Iter(ctx)
+```
+
+### `$knn` is a ranked source, not a predicate
+
+"Is this document one of the k nearest?" is a property of the whole candidate
+set, not of a document, so `$knn` does not behave like a predicate:
+
+- **`$k` selects. `Sort` orders. `Limit` paginates.** The clause denotes at most
+  `$k` documents; `Sort` reorders that set; `Limit`/`Offset` page within it.
+  `Limit(20)` over `"$k":10` returns 10 rows; `Offset` at or past `$k` returns
+  none.
+- **`Count` returns the size of that page** (≤ `$k`) — not "how many documents
+  match", because `$knn` has no match set.
+- **`Delete`/`Update` mutate exactly the k nearest** — the blast radius is `$k`,
+  a number you typed. "Delete everything near X" is unrepresentable.
+- **The result is approximate** (recall < 1) except in brute-force mode. With a
+  selective residual filter you may get fewer than `$k` rows; the escape valve
+  is raising `$ef` (or `$k`).
+- **The set is not stable across index churn** (compaction, tombstones, a
+  different `$ef`). For exact determinism use brute-force mode, or collect ids
+  from `Iter` and act by id.
+- `$knn` is legal at the top level or under `$and` (any depth), once per query.
+  `$or`/`$nor`/`$not`, a second `$knn`, or combining with `$text` are errors.
+
+Non-`$knn` operators on a vector-indexed field (`$exists`, `$type`, `$eq`
+against a packed `{"$vector":[...]}` value, `$size`, …) stay **ordinary
+filters** on every verb.
 
 ### Distance: the `_distance` field
 
@@ -126,38 +172,40 @@ for iter.Next() {
     _ = doc; _ = d
 }
 
-// Filter by a distance threshold:
-coll.Find(`{"embedding":[...], "_distance":{"$lt":0.35}}`).Iter(ctx)
+// Filter by a distance threshold — note this is a threshold WITHIN the k
+// nearest (a residual filter over the $knn candidates), NOT "all documents
+// within 0.35": there is no radius search at any layer.
+coll.Find(`{"embedding":{"$knn":{"$query":[...], "$k":100}}, "_distance":{"$lt":0.35}}`).Iter(ctx)
 
 // Sort by distance (ascending is the default when no Sort is given):
-coll.Find(`{"embedding":[...]}`).Sort("_distance").Iter(ctx)        // closest first
-coll.Find(`{"embedding":[...]}`).Sort("-_distance").Iter(ctx)       // farthest first
+coll.Find(`{"embedding":{"$knn":{...}}}`).Sort("_distance").Iter(ctx)   // closest first
+coll.Find(`{"embedding":{"$knn":{...}}}`).Sort("-_distance").Iter(ctx)  // farthest first
 
 // Multi-key sort: distance, then a tie-breaker field:
-coll.Find(`{"a":{"$gt":42}, "embedding":[...]}`).Sort("_distance", "-name").Iter(ctx)
+coll.Find(`{"a":{"$gt":42}, "embedding":{"$knn":{...}}}`).Sort("_distance", "-name").Iter(ctx)
 ```
 
 `Iterator.Distance()` returns the row's distance (0 for non-vector queries).
 
 `_distance` is a reserved synthetic field: on a vector query it is injected into
 each result (shadowing any stored field of that name), and referencing it in a
-filter or sort *without* a vector clause is an error (`ErrDistanceWithoutVector`).
+filter or sort *without* a `$knn` clause is an error (`ErrDistanceWithoutVector`).
 
 ### Limit, offset, and candidate set size
 
-`Limit`/`Offset` apply over the distance-ordered results. The ANN candidate list
-is auto-sized to cover `Offset+Limit`, and over-fetched further when a residual
-filter is selective so the page still fills. `VectorEf(n)` overrides the
-candidate-list size (recall/speed trade-off):
+`Limit`/`Offset` paginate over the (sorted) k-set — they never change *which*
+documents `$knn` denotes. The ANN candidate list (`ef`) is a pure function of
+the clause: the index default, raised to `$k` (over-fetched ×10 when a residual
+filter is present, capped at ~4096 but never below `$k`). An explicit `$ef` is
+used verbatim and never capped:
 
 ```go
-coll.Find(`{"embedding":[...], "lang":"en"}`).Limit(20).VectorEf(200).Iter(ctx)
+coll.Find(`{"embedding":{"$knn":{"$query":[...], "$k":20, "$ef":200}}, "lang":"en"}`).Iter(ctx)
 ```
 
-The auto-sized candidate list is capped (~4096) to bound a runaway search, so very
-deep pagination (`Offset+Limit` beyond that) or a very large `Limit` returns fewer
-rows than requested unless you set `VectorEf(n)` explicitly — an explicit `VectorEf`
-is never capped.
+Because `ef` never depends on `Limit`/`Offset`/`Sort` or the verb, every verb
+walks the same beam and denotes the same set — `Count == len(Iter)` by
+construction.
 
 ## 4. Errors for malformed queries
 
@@ -165,10 +213,20 @@ Mistakes are reported rather than silently returning wrong results:
 
 | Query | Error |
 |---|---|
-| Wrong-dimension array on a vector field — `{"embedding":[1,2,3]}` (dim 768) | `ErrInvalidVectorQuery` |
-| Non-array / non-equality on a vector field — `{"embedding":"x"}`, `{"embedding":{"$gt":[...]}}` | `ErrInvalidVectorQuery` |
-| Two vector clauses in one query | `ErrMultipleVectorClauses` |
-| `_distance` in a filter or sort with no vector clause | `ErrDistanceWithoutVector` |
+| The pre-`$knn` spelling: a bare `Dim`-sized array equality on a vector-indexed field — `{"embedding":[...768 floats...]}` | `ErrLegacyVectorClause` |
+| Malformed `$knn`: wrong-dimension / empty / non-finite `$query`, out-of-range `$k` or `$ef` | `ErrInvalidVectorQuery` |
+| `$knn` on a field with no vector index (or `$index` names none) | `ErrNoVectorIndex` |
+| `$knn` on a field with several vector indexes and no `$index` | `ErrAmbiguousVectorIndex` |
+| `$knn` under `$or`/`$nor`/`$not`, nested, bare, or unstrippable | `ErrKnnBadPlacement` |
+| `$knn` and `$text` in one query | `ErrKnnWithText` |
+| Two `$knn` clauses in one query | `ErrMultipleVectorClauses` |
+| `_distance` in a filter or sort with no `$knn` clause | `ErrDistanceWithoutVector` |
+
+All of these fire identically on every verb (`Iter`/`Count`/`Update`/`Delete`/
+`Explain`/`Aggregate`), for JSON and programmatically-built filters alike.
+Ordinary predicates on a vector field are NOT errors — `{"embedding":"x"}` or a
+wrong-dimension array are literal field filters that simply match what they
+match.
 
 ## 5. Updates, deletes, compaction
 
@@ -252,7 +310,7 @@ O(live); for very large indexes prefer `0` and schedule
 ### Other knobs
 
 - **`EfSearch`** — query-time candidate list; higher = more recall, slower. ~64 is
-  the knee (recall ~0.96 at ~1 ms for dim 768). Override per-query with `VectorEf`.
+  the knee (recall ~0.96 at ~1 ms for dim 768). Override per-query with `$ef`.
 - **`EfConstruction` / `M`** — bigger graph, slower build, marginally better
   recall; raise for build-once / query-often.
 - **Per-batch insert cache** — repeatedly-read graph vectors are served from a
@@ -309,8 +367,8 @@ coll.Insert(ctx,
     mkDoc(3, "fr", []float32{0.0, 0.1, 0.9, 0.7}),
 )
 
-iter, _ := coll.Find(`{"embedding":[0.85,0.15,0.05,0.15], "lang":"en"}`).
-    Sort("_distance").Limit(2).Iter(ctx)
+iter, _ := coll.Find(`{"embedding":{"$knn":{"$query":[0.85,0.15,0.05,0.15],"$k":2}}, "lang":"en"}`).
+    Sort("_distance").Iter(ctx)
 defer iter.Close()
 
 for iter.Next() {

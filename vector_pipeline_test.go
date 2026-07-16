@@ -47,12 +47,21 @@ func vqJSON(vec []float32) string {
 	return "[" + strings.Join(parts, ",") + "]"
 }
 
-// TestPipeline_Minimum: Find({"v":[..]}).Iter() — implicit distance order + Distance().
+// vknnJSON renders the $knn clause value: {"$knn":{"$query":[...],"$k":k}}.
+// ef<=0 omits $ef (the index default applies).
+func vknnJSON(vec []float32, k, ef int) string {
+	if ef > 0 {
+		return fmt.Sprintf(`{"$knn":{"$query":%s,"$k":%d,"$ef":%d}}`, vqJSON(vec), k, ef)
+	}
+	return fmt.Sprintf(`{"$knn":{"$query":%s,"$k":%d}}`, vqJSON(vec), k)
+}
+
+// TestPipeline_Minimum: Find({"v":{"$knn":..}}).Iter() — implicit distance order + Distance().
 func TestPipeline_Minimum(t *testing.T) {
 	const dim = 16
 	coll, vecs := setupPipeline(t, 800, dim)
 
-	iter, err := coll.Find(fmt.Sprintf(`{"v":%s}`, vqJSON(vecs[42]))).Iter(ctx)
+	iter, err := coll.Find(fmt.Sprintf(`{"v":%s}`, vknnJSON(vecs[42], 64, 0))).Iter(ctx)
 	require.NoError(t, err)
 	defer iter.Close()
 
@@ -86,7 +95,7 @@ func TestPipeline_DistanceFilterAndSort(t *testing.T) {
 	coll, vecs := setupPipeline(t, 800, dim)
 
 	const thr = 1.5
-	iter, err := coll.Find(fmt.Sprintf(`{"v":%s,"_distance":{"$lt":%g}}`, vqJSON(vecs[100]), thr)).
+	iter, err := coll.Find(fmt.Sprintf(`{"v":%s,"_distance":{"$lt":%g}}`, vknnJSON(vecs[100], 64, 0), thr)).
 		Sort("_distance", "name").Iter(ctx)
 	require.NoError(t, err)
 	defer iter.Close()
@@ -111,7 +120,7 @@ func TestPipeline_AdditionalFilter(t *testing.T) {
 	const dim = 16
 	coll, vecs := setupPipeline(t, 800, dim)
 
-	iter, err := coll.Find(fmt.Sprintf(`{"v":%s,"lang":"en"}`, vqJSON(vecs[10]))).Iter(ctx)
+	iter, err := coll.Find(fmt.Sprintf(`{"v":%s,"lang":"en"}`, vknnJSON(vecs[10], 32, 0))).Iter(ctx)
 	require.NoError(t, err)
 	defer iter.Close()
 
@@ -148,18 +157,18 @@ func setupPipelineEf(t *testing.T, n, dim, efSearch int) (Collection, [][]float3
 	return coll, vecs
 }
 
-// TestPipeline_OverFetch: a filtered query with a limit fills the limit because
-// the planner over-fetches candidates (ef = limit×factor), even though the
-// index's own EfSearch is small.
+// TestPipeline_OverFetch: a filtered $knn fills $k because the auto ef
+// over-fetches candidates (ef = k×factor), even though the index's own
+// EfSearch is small.
 func TestPipeline_OverFetch(t *testing.T) {
 	const (
 		dim      = 16
-		efSearch = 16 // small: limit alone (30) would not yield 30 en survivors
-		limit    = 30
+		efSearch = 16 // small: k alone (30) would not yield 30 en survivors
+		limit    = 30 // $k
 	)
 	coll, vecs := setupPipelineEf(t, 1000, dim, efSearch)
 
-	iter, err := coll.Find(fmt.Sprintf(`{"v":%s,"lang":"en"}`, vqJSON(vecs[0]))).Limit(limit).Iter(ctx)
+	iter, err := coll.Find(fmt.Sprintf(`{"v":%s,"lang":"en"}`, vknnJSON(vecs[0], limit, 0))).Iter(ctx)
 	require.NoError(t, err)
 	defer iter.Close()
 	var count int
@@ -170,15 +179,18 @@ func TestPipeline_OverFetch(t *testing.T) {
 		count++
 	}
 	require.NoError(t, iter.Err())
-	assert.Equal(t, limit, count, "over-fetch should fill the limit despite a selective filter")
+	assert.Equal(t, limit, count, "over-fetch should fill $k despite a selective filter")
 }
 
-// TestPipeline_VectorEf: an explicit VectorEf bounds the candidate set.
-func TestPipeline_VectorEf(t *testing.T) {
+// TestPipeline_ExplicitEf: an explicit $ef bounds the candidate set — it
+// disables the auto ×10 residual over-fetch, so a selective residual
+// under-fills $k (the documented escape valve is raising $ef).
+func TestPipeline_ExplicitEf(t *testing.T) {
 	const dim = 16
 	coll, vecs := setupPipelineEf(t, 1000, dim, 64)
 
-	iter, err := coll.Find(fmt.Sprintf(`{"v":%s}`, vqJSON(vecs[0]))).VectorEf(5).Iter(ctx)
+	const k = 30
+	iter, err := coll.Find(fmt.Sprintf(`{"v":%s,"lang":"en"}`, vknnJSON(vecs[0], k, k))).Iter(ctx)
 	require.NoError(t, err)
 	defer iter.Close()
 	var count int
@@ -186,7 +198,7 @@ func TestPipeline_VectorEf(t *testing.T) {
 		count++
 	}
 	require.NoError(t, iter.Err())
-	assert.LessOrEqual(t, count, 5, "VectorEf(5) must cap the candidate set")
+	assert.Less(t, count, k, "an explicit $ef == $k must not over-fetch: ~half the candidates are filtered out")
 	assert.Greater(t, count, 0)
 }
 
@@ -196,17 +208,25 @@ func TestPipeline_Errors(t *testing.T) {
 	const dim = 16
 	coll, vecs := setupPipeline(t, 100, dim) // field "v", dim 16
 
+	knn := func(k int) string { return vknnJSON(vecs[0], k, 0) } // dim-16 query
 	cases := []struct {
 		name   string
 		find   string
 		sort   []any
 		wantIs error
 	}{
-		{"wrong-dim vector", `{"v":[1,2,3]}`, nil, ErrInvalidVectorQuery},
-		{"non-array on vector field", `{"v":"hello"}`, nil, ErrInvalidVectorQuery},
-		{"range op on vector field", `{"v":{"$gt":[0.0]}}`, nil, ErrInvalidVectorQuery},
-		{"_distance filter w/o vector clause", `{"_distance":{"$lt":1.0}}`, nil, ErrDistanceWithoutVector},
-		{"_distance sort w/o vector clause", `{"id":{"$gt":5}}`, []any{"-_distance"}, ErrDistanceWithoutVector},
+		{"legacy bare-array ANN clause", fmt.Sprintf(`{"v":%s}`, vqJSON(vecs[0])), nil, ErrLegacyVectorClause},
+		{"legacy clause under $or", fmt.Sprintf(`{"$or":[{"v":%s},{"id":1}]}`, vqJSON(vecs[0])), nil, ErrLegacyVectorClause},
+		{"wrong-dim $query", `{"v":{"$knn":{"$query":[1,2,3],"$k":5}}}`, nil, ErrInvalidVectorQuery},
+		{"$knn on unindexed field", fmt.Sprintf(`{"nosuch":%s}`, knn(5)), nil, ErrNoVectorIndex},
+		{"$index naming no index", `{"v":{"$knn":{"$query":[1,2,3],"$k":5,"$index":"bogus"}}}`, nil, ErrNoVectorIndex},
+		{"$knn under $or", fmt.Sprintf(`{"$or":[{"v":%s},{"id":1}]}`, knn(5)), nil, ErrKnnBadPlacement},
+		{"$knn under $nor", fmt.Sprintf(`{"$nor":[{"v":%s}]}`, knn(5)), nil, ErrKnnBadPlacement},
+		{"two $knn clauses", fmt.Sprintf(`{"$and":[{"v":%s},{"v":%s}]}`, knn(5), knn(5)), nil, ErrMultipleVectorClauses},
+		{"$knn with $text", fmt.Sprintf(`{"v":%s,"$text":{"$search":"x"}}`, knn(5)), nil, ErrKnnWithText},
+		{"_distance filter w/o $knn", `{"_distance":{"$lt":1.0}}`, nil, ErrDistanceWithoutVector},
+		{"_distance filter w/o $knn, inside $or", `{"$or":[{"_distance":{"$lt":1.0}},{"id":1}]}`, nil, ErrDistanceWithoutVector},
+		{"_distance sort w/o $knn", `{"id":{"$gt":5}}`, []any{"-_distance"}, ErrDistanceWithoutVector},
 		{"_distance sort, no filter", ``, []any{"_distance"}, ErrDistanceWithoutVector},
 	}
 	for _, tc := range cases {
@@ -225,11 +245,29 @@ func TestPipeline_Errors(t *testing.T) {
 		})
 	}
 
-	// sanity: a valid vector query (optionally with _distance) does NOT error
-	iter, err := coll.Find(fmt.Sprintf(`{"v":%s,"_distance":{"$lt":2.0}}`, vqJSON(vecs[0]))).
+	// sanity: a valid $knn query (optionally with _distance) does NOT error
+	iter, err := coll.Find(fmt.Sprintf(`{"v":%s,"_distance":{"$lt":2.0}}`, knn(10))).
 		Sort("-_distance").Iter(ctx)
 	require.NoError(t, err)
 	require.NoError(t, iter.Close())
+
+	// Non-$knn predicates on a vector-indexed field are ORDINARY filters on
+	// every verb — the rule, not the exception (programmatic consumers depend
+	// on it: {"v":{"$exists":true}}.Count decides index builds downstream).
+	for _, legal := range []string{
+		`{"v":"hello"}`,          // non-array literal
+		`{"v":[1,2,3]}`,          // wrong-dim array: not the ANN shape
+		`{"v":{"$exists":true}}`, // predicate op
+		`{"v":{"$size":16}}`,
+	} {
+		t.Run("legal literal "+legal, func(t *testing.T) {
+			it, lerr := coll.Find(legal).Iter(ctx)
+			require.NoError(t, lerr)
+			require.NoError(t, it.Close())
+			_, cerr := coll.Find(legal).Count(ctx)
+			require.NoError(t, cerr)
+		})
+	}
 }
 
 // TestPipeline_Limit: limit applies over the distance-ordered results.
@@ -237,7 +275,7 @@ func TestPipeline_Limit(t *testing.T) {
 	const dim = 16
 	coll, vecs := setupPipeline(t, 800, dim)
 
-	iter, err := coll.Find(fmt.Sprintf(`{"v":%s}`, vqJSON(vecs[5]))).Limit(10).Iter(ctx)
+	iter, err := coll.Find(fmt.Sprintf(`{"v":%s}`, vknnJSON(vecs[5], 10, 0))).Limit(10).Iter(ctx)
 	require.NoError(t, err)
 	defer iter.Close()
 	var count int
@@ -255,7 +293,7 @@ func TestPipeline_Limit(t *testing.T) {
 func TestPipeline_Offset(t *testing.T) {
 	const dim = 16
 	coll, vecs := setupPipeline(t, 800, dim)
-	qv := vqJSON(vecs[5])
+	qv := vknnJSON(vecs[5], 20, 0)
 
 	collect := func(query Query) []string {
 		iter, err := query.Iter(ctx)

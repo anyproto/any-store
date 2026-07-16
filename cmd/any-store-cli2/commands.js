@@ -16,6 +16,22 @@ function Vector(values) {
     return {"$vector": values};
 }
 
+// Knn builds the $knn ANN clause for a vector-indexed field:
+//   db.docs.find({emb: Knn([0.1, 0.2], 10)})
+//   db.docs.find({emb: Knn(vec, 10, {ef: 200, index: "emb"})})
+// A bare Vector([...]) equality on a vector-indexed field is no longer an ANN
+// query (it errors, ErrLegacyVectorClause) — the k must be stated.
+function Knn(queryVec, k, opts) {
+    const clause = {"$query": queryVec, "$k": k};
+    if (opts && opts.ef !== undefined) {
+        clause["$ef"] = opts.ef;
+    }
+    if (opts && opts.index !== undefined) {
+        clause["$index"] = opts.index;
+    }
+    return {"$knn": clause};
+}
+
 function DB() {}
 
 DB.prototype.createCollection = function (name) {

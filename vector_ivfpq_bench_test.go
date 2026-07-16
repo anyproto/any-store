@@ -28,21 +28,27 @@ func BenchmarkIVFPQQuery(b *testing.B) {
 		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, Mode: VectorModeIVFPQ, Closure: 4, NProbe: 16},
 	}))
 
-	queries := make([]string, 256)
-	for i := range queries {
-		queries[i] = fmt.Sprintf(`{"v":%s}`, vqJSON(vecs[i]))
+	// $k covers the page window (offset+limit); Limit/Offset paginate within it.
+	mkQueries := func(k int) []string {
+		queries := make([]string, 256)
+		for i := range queries {
+			queries[i] = fmt.Sprintf(`{"v":%s}`, vknnJSON(vecs[i], k, 0))
+		}
+		return queries
 	}
 
 	cases := []struct {
 		name          string
+		k             int
 		limit, offset uint
 	}{
-		{"limit10", 10, 0},
-		{"limit1", 1, 0},
-		{"limit100", 100, 0},
-		{"limit10_offset200", 10, 200},
+		{"limit10", 10, 10, 0},
+		{"limit1", 1, 1, 0},
+		{"limit100", 100, 100, 0},
+		{"limit10_offset200", 210, 10, 200},
 	}
 	for _, tc := range cases {
+		queries := mkQueries(tc.k)
 		b.Run(tc.name, func(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()

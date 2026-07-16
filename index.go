@@ -21,9 +21,10 @@ type IndexKind uint8
 const (
 	// IndexKindRange is the default B-tree range/equality index.
 	IndexKindRange IndexKind = iota
-	// IndexKindVector is an HNSW approximate-nearest-neighbour index over a
-	// vector (embedding) field. Queried via Find() with a `{field: [vector]}`
-	// clause; results carry a synthetic _distance field (see docs/vector-search.md).
+	// IndexKindVector is an approximate-nearest-neighbour index over a vector
+	// (embedding) field. Queried via Find() with a
+	// `{field: {"$knn": {"$query": [...], "$k": N}}}` clause; results carry a
+	// synthetic _distance field (see docs/vector-search.md).
 	IndexKindVector
 	// IndexKindFulltext is an inverted full-text index over one or more text
 	// fields, queried with the $text operator and ranked by BM25. See

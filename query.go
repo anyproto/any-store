@@ -34,11 +34,6 @@ type Query interface {
 	// IndexHint adds or removes boost for some indexes
 	IndexHint(hints ...IndexHint) Query
 
-	// VectorEf overrides the ANN candidate-list size (numCandidates) for a
-	// vector query. 0 (default) auto-sizes it: the index default, raised to
-	// cover the limit and over-fetched when a residual filter is present.
-	VectorEf(ef uint) Query
-
 	// Iter executes the query and returns an Iterator for the results.
 	Iter(ctx context.Context) (Iterator, error)
 
@@ -85,9 +80,15 @@ type collQuery struct {
 
 	indexHints []IndexHint
 
-	// vectorEf overrides the ANN candidate-list size (numCandidates) for a
-	// vector query; 0 = auto (index default, raised to cover limit/over-fetch).
-	vectorEf uint
+	// srcValidated memoizes validateSources: the verbs validate before their
+	// unsatisfiable() short-circuit and compilePlan validates again — without
+	// the flag a $knn query would pay the guard walks (and a throwaway
+	// detection) twice more per verb. Only the VERDICT is cached, never the
+	// detected spec: the spec's Search closure captures the resolved index
+	// handle, which is only reconciled (multi-process staleness) when the
+	// verb's read tx begins — see detectKnnQuery. A collQuery is a single-use
+	// builder (never shared across goroutines), so a plain field suffices.
+	srcValidated bool
 
 	err error
 }
@@ -112,11 +113,6 @@ func (q *collQuery) Offset(offset uint) Query {
 
 func (q *collQuery) IndexHint(hints ...IndexHint) Query {
 	q.indexHints = hints
-	return q
-}
-
-func (q *collQuery) VectorEf(ef uint) Query {
-	q.vectorEf = ef
 	return q
 }
 
@@ -146,10 +142,46 @@ func (q *collQuery) reportCandidates(btx *btree.ReadTx, opts planOpts) []qplanne
 // the row sink).
 type planOpts struct {
 	countOnly      bool // Count: PlanParams.CountOnly, Sorter forced nil (a count is order-invariant)
-	forWrite       bool // Update/Delete: unbounded-sort elision + vector write guard
-	needScores     bool // Iter only: keep the BM25 sidecar for Iterator.Score()
+	forWrite       bool // Update/Delete: unbounded-sort elision
+	needSidecars   bool // Iter only: keep the BM25/_distance sidecars for Iterator.Score()/Distance()
 	exactTotalDocs bool // Explain only: docCountExact (human-facing TotalDocs)
 	wantCandidates bool // Explain only: return the CBO candidate report even on fts/vector paths
+}
+
+// validateSources runs the source-detection guards that need no transaction:
+// the legacy-clause rejection, the _distance placement rule, the $knn/$text
+// exclusion, and the full $knn detection walk (placement, argument validation,
+// index resolution, dim check — detection is the ONLY validation programmatic
+// consumers ever see).
+//
+// The verbs call this BEFORE their unsatisfiable() short-circuit: an invalid
+// source must error identically on every verb, not return 0/nil wherever an
+// unrelated $in:[] happens to make the filter unsatisfiable.
+func (q *collQuery) validateSources() error {
+	if q.srcValidated {
+		return nil
+	}
+	vidxs := q.c.loadVectorIndexes()
+	if err := rejectLegacyVectorClause(q.cond, vidxs); err != nil {
+		return err
+	}
+	hasKnn := query.ContainsKnn(q.cond)
+	// _distance is synthetic and only produced by a $knn search: referencing it
+	// with no $knn (in filter or sort) is an error rather than a silent
+	// match-everything / sort-on-nothing.
+	if !hasKnn && (filterRefsField(q.cond, qplanner.DistanceField) || sortRefsField(q.sort, qplanner.DistanceField)) {
+		return ErrDistanceWithoutVector
+	}
+	if hasKnn {
+		if containsText(q.cond) {
+			return ErrKnnWithText
+		}
+		if _, _, err := q.detectKnnQuery(); err != nil {
+			return err
+		}
+	}
+	q.srcValidated = true
+	return nil
 }
 
 // writeSorter applies the write-verb sorter rule: ordering decides WHICH
@@ -168,12 +200,13 @@ func (q *collQuery) writeSorter(opts planOpts) query.Sort {
 	return q.sort
 }
 
-// compilePlan is the single query compiler shared by the verbs. It owns
-// $text detection (detectFtsQuery + ftsSorter), vector detection
-// (detectVectorQuery + the default distance-sort rule), and CBO input
-// assembly (buildBoundsResult, buildCBOIndexesInto, buildIndexHints,
+// compilePlan is the single query compiler shared by the verbs. It owns the
+// source guards (validateSources), $text detection (detectFtsQuery +
+// ftsSorter), $knn detection (detectKnnQuery), and CBO input assembly
+// (buildBoundsResult, buildCBOIndexesInto, buildIndexHints,
 // docCountForPlan/docCountExact) — so every verb selects the same documents
-// for the same query by construction.
+// for the same query by construction. A source not reachable from here is not
+// reachable at all.
 //
 // btx MUST be the snapshot the plan executes on: the multikey-flag probe in
 // buildCBOIndexesInto and the bounds interpolation read it. The caller owns
@@ -181,6 +214,13 @@ func (q *collQuery) writeSorter(opts planOpts) query.Sort {
 // non-nil only when opts.wantCandidates (Explain's index report).
 func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syncpool.DocBuffer,
 	idBounds query.Bounds, opts planOpts) (plan *qplanner.Plan, cbo []qplanner.CBOIndex, err error) {
+
+	// The unconditional source guards. The verbs already ran these (before
+	// their unsatisfiable() short-circuit); re-run here so compilePlan is safe
+	// for any future caller — the guards are cheap tree walks.
+	if err = q.validateSources(); err != nil {
+		return nil, nil, err
+	}
 
 	// $text drives the query when present (CBO bypassed). The residual filter
 	// runs as a downstream FilterIter; a relevance/textScore sort is the
@@ -198,7 +238,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 		if err = q.c.db.flushAmbientFtsPending(ctx); err != nil {
 			return nil, nil, err
 		}
-		ftsSpec.NeedScores = opts.needScores
+		ftsSpec.NeedScores = opts.needSidecars
 		// countOnly is sound without ordering: FtsIter emits one aggregate per
 		// doc (duplicate-free), and the distinct count is order-invariant.
 		sorter := ftsSorter(q.writeSorter(opts))
@@ -216,35 +256,23 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 		return plan, q.reportCandidates(btx, opts), nil
 	}
 
-	// Vector query: detect `{vectorField: [..]}` against the collection's
-	// vector indexes. When matched, build a vector plan (ANN source) and
-	// ignore all other indexes; the residual filter + sort run downstream.
-	vspec, residual, err := q.detectVectorQuery()
+	// $knn drives the query when present (CBO bypassed): the ANN search is the
+	// sole source on EVERY verb — filter → cut-to-k → sort → page. The blast
+	// radius of a write is k, a number the caller typed into the clause, so no
+	// verb rejects $knn. No default distance SortIter: the source is
+	// TotallyOrdered ((distance, docId) ascending), so with no explicit sort
+	// the k-cut streams straight through.
+	vspec, residual, err := q.detectKnnQuery()
 	if err != nil {
 		return nil, nil, err
 	}
 	if vspec != nil {
-		// A vector clause denotes an ANN candidate WINDOW, not a predicate: an
-		// unbounded write would mutate however many candidates the (tunable)
-		// search happens to yield. Until the $knn operator makes k part of the
-		// clause, a vector-clause Update/Delete must state its blast radius.
-		if opts.forWrite && q.limit == 0 {
-			return nil, nil, ErrVectorWriteWithoutLimit
-		}
-		sorter := q.writeSorter(opts)
-		if sorter == nil && !opts.countOnly && !vspec.Ordered {
-			// No explicit sort and the source isn't already distance-ordered
-			// (brute-force): order by distance ascending. When the ANN source
-			// is ordered, we leave sorter nil so the planner skips a redundant
-			// SortIter and streams the already-closest-first candidates
-			// straight to LimitIter.
-			sorter, _ = query.ParseSort(qplanner.DistanceField)
-		}
+		vspec.NeedDistances = opts.needSidecars
 		plan = qplanner.BuildPlan(&qplanner.PlanParams{
 			Tx:        btx,
 			DataNs:    q.c.ns,
 			Filter:    residual,
-			Sorter:    sorter,
+			Sorter:    q.writeSorter(opts),
 			Limit:     int(q.limit),
 			Offset:    int(q.offset),
 			Buf:       buf,
@@ -296,6 +324,14 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		return
 	}
 
+	// Source validation precedes the unsatisfiable() short-circuit: an invalid
+	// $knn/_distance/legacy clause must error here exactly as it would with a
+	// satisfiable filter.
+	if err = q.validateSources(); err != nil {
+		qb.Close()
+		return
+	}
+
 	// Fast path: filter provably matches no documents — return an empty
 	// iterator with no transaction, no plan construction, no I/O.
 	if q.unsatisfiable() {
@@ -321,7 +357,7 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	buf := q.c.db.syncPool.GetDocBuf()
 	btx := tx.btreeReadTx()
 
-	plan, _, err := q.compilePlan(ctx, btx, buf, qb.idBounds, planOpts{needScores: true})
+	plan, _, err := q.compilePlan(ctx, btx, buf, qb.idBounds, planOpts{needSidecars: true})
 	if err != nil {
 		q.c.db.syncPool.ReleaseDocBuf(buf)
 		_ = tx.Commit()
@@ -351,6 +387,11 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		return
 	}
 	defer qb.Close()
+
+	// Source validation precedes the unsatisfiable() short-circuit (see Iter).
+	if err = q.validateSources(); err != nil {
+		return
+	}
 
 	// Fast path: filter provably matches no documents — nothing to update,
 	// no write tx required. ModifyResult is the zero value (Matched=0,
@@ -501,6 +542,11 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	}
 	defer qb.Close()
 
+	// Source validation precedes the unsatisfiable() short-circuit (see Iter).
+	if err = q.validateSources(); err != nil {
+		return
+	}
+
 	// Fast path: filter provably matches no documents — nothing to delete,
 	// no write tx required.
 	if q.unsatisfiable() {
@@ -622,6 +668,11 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 		q.cond = query.All{}
 	}
 
+	// Source validation precedes the unsatisfiable() short-circuit (see Iter).
+	if err = q.validateSources(); err != nil {
+		return 0, err
+	}
+
 	// Fast path: filter provably matches no documents (e.g. $in:[]). Skip
 	// the planner, the read tx, and the index walk entirely — the answer
 	// is unconditionally zero. See isUnsatisfiable.
@@ -737,6 +788,19 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	}
 	defer qb.Close()
 
+	// Same ordering as the executing verbs: source validation first, then the
+	// unsatisfiable short-circuit — Explain(Q) describes the plan producing
+	// Rows(Q), and for an unsatisfiable filter that is the empty plan the other
+	// verbs short-circuit to, not a plan that will never run.
+	if err = q.validateSources(); err != nil {
+		return
+	}
+	if q.unsatisfiable() {
+		explain.Sql = "EmptyResult"
+		explain.Plan = "EmptyResult (filter is unsatisfiable)"
+		return
+	}
+
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
@@ -759,12 +823,18 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 		explain.Sql = plan.String()
 		explain.Plan = plan.ExplainString()
 
-		// Report indexes with used index first
-		for _, idx := range cboIndexes {
-			used := idx.Info.Name == plan.IndexName
+		// Report indexes with used index first. Vector and full-text indexes
+		// are enumerated alongside the CBO candidates: Explain printing
+		// "FullScan(filtered)" with no index report for a working ANN query is
+		// how four verbs ignoring the vector clause went unnoticed. They are
+		// NOT CBO candidates though — the optimizer never costed them — so
+		// they carry a cost only when they actually drive the plan; a phantom
+		// plan.Cost on an unconsidered index would read as a costed candidate.
+		addIndex := func(name string, cost float64) {
+			used := name == plan.IndexName
 			ie := IndexExplain{
-				Name: idx.Info.Name,
-				Cost: plan.Cost,
+				Name: name,
+				Cost: cost,
 				Used: used,
 			}
 			if used {
@@ -772,6 +842,21 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 			} else {
 				explain.Indexes = append(explain.Indexes, ie)
 			}
+		}
+		for _, idx := range cboIndexes {
+			addIndex(idx.Info.Name, plan.Cost)
+		}
+		sourceCost := func(name string) float64 {
+			if name == plan.IndexName {
+				return plan.Cost
+			}
+			return 0
+		}
+		for _, vi := range q.c.loadVectorIndexes() {
+			addIndex(vi.info.Name, sourceCost(vi.info.Name))
+		}
+		for _, fx := range q.c.loadFtsIndexes() {
+			addIndex(fx.info.Name, sourceCost(fx.info.Name))
 		}
 		return nil
 	})

@@ -43,6 +43,10 @@ const (
 	opType
 	opRegexp
 	opSize
+
+	// opKnn is appended at the END of the block deliberately: it stays > _opVal
+	// (field-level for free via isTopLevel) and shifts no existing iota value.
+	opKnn
 )
 
 var (
@@ -68,6 +72,7 @@ var (
 	opBytesRegexp = []byte("$regex")
 	opBytesSize   = []byte("$size")
 	opBytesText   = []byte("$text")
+	opBytesKnn    = []byte("$knn")
 )
 
 func MustParseCondition(cond any) Filter {
@@ -277,6 +282,7 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 		isOp     bool
 		op       Operator
 		hasNonOp bool
+		hasKnn   bool
 	)
 
 	var fs And
@@ -302,6 +308,9 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 				return
 			}
 			ok = true
+			if op == opKnn {
+				hasKnn = true
+			}
 			if f, err = makeCompFilter(op, v); err != nil {
 				return
 			}
@@ -318,6 +327,14 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 	})
 	if err != nil {
 		return false, nil, err
+	}
+	// A $knn is a ranked SOURCE, not a predicate: And{Knn, Comp} on one field
+	// would leave the Comp as a residual on a field the source already owns,
+	// with fail-closed Knn.Ok lurking under any evaluator that sees the pair.
+	// One JSON object, one operator. (Programmatic And{Key{f,Knn},Key{f,Comp}}
+	// stays legal — the residual builder strips by node identity.)
+	if hasKnn && obj.Len() > 1 {
+		return false, nil, errors.New("$knn must be the only operator on its field")
 	}
 	if hasNonOp {
 		return false, nil, nil
@@ -391,6 +408,11 @@ func makeCompFilter(op Operator, v *anyenc.Value) (f Filter, err error) {
 		if !isOp {
 			return nil, fmt.Errorf("no operators found for $not")
 		}
+		// A Knn under Not would evaluate !false == match-all (fail-closed Ok
+		// reflected). Unrepresentable, at the door.
+		if ContainsKnn(not.Filter) {
+			return nil, errors.New("$knn is not allowed under $not")
+		}
 		return not, nil
 	case opExists:
 		return parseExists(v)
@@ -400,9 +422,93 @@ func makeCompFilter(op Operator, v *anyenc.Value) (f Filter, err error) {
 		return parseRegexp(v)
 	case opSize:
 		return parseSize(v)
+	case opKnn:
+		// This arm is critical: without it a $knn value would fall through to
+		// makeArrComp, whose default arm panics on an unrecognized op.
+		return parseKnn(v)
 	default:
 		return makeArrComp(op, v)
 	}
+}
+
+// parseKnn parses the {"$knn":{...}} options object. Exactly one form is
+// accepted; every rejection is a parse error with a normative message. All of
+// these rules are RE-CHECKED at detection time (query build), because the two
+// production consumers construct query.Knn programmatically and never pass
+// through this parser.
+func parseKnn(v *anyenc.Value) (Filter, error) {
+	if v.Type() != anyenc.TypeObject {
+		// NOTE: a sole-key {"$vector":[…]} object cannot even reach here as an
+		// object — anyenc decodes it into a TypeVectorF32 VALUE before the
+		// parser runs. That extjson landmine is why the payload key is $query.
+		return nil, errors.New(`$knn must be an object, e.g. {"$knn":{"$query":[...],"$k":10}}`)
+	}
+	obj, _ := v.Object()
+	var (
+		kn       Knn
+		hasQuery bool
+		hasK     bool
+		perr     error
+	)
+	obj.Visit(func(key []byte, val *anyenc.Value) {
+		if perr != nil {
+			return
+		}
+		switch string(key) {
+		case "$query":
+			var ok bool
+			kn.Query, ok = anyenc.AppendFloat32s(val.MarshalTo(nil), nil)
+			if !ok {
+				perr = errors.New(`$knn: $query must be an array of numbers or {"$vector":[...]}`)
+				return
+			}
+			hasQuery = true
+		case "$k":
+			n, e := val.Int()
+			if e != nil || val.Type() != anyenc.TypeNumber || float64(n) != val.GetFloat64() || n < 1 || n > KnnMaxK {
+				perr = fmt.Errorf("$knn: $k must be an integer in [1, %d], got %v", KnnMaxK, val)
+				return
+			}
+			kn.K = n
+			hasK = true
+		case "$ef":
+			n, e := val.Int()
+			if e != nil || val.Type() != anyenc.TypeNumber || float64(n) != val.GetFloat64() || n > KnnMaxEf {
+				perr = fmt.Errorf("$knn: $ef must be an integer in [$k, %d], got %v", KnnMaxEf, val)
+				return
+			}
+			kn.Ef = n
+		case "$index":
+			sb, e := val.StringBytes()
+			if e != nil {
+				perr = errors.New("$knn: $index must be a string")
+				return
+			}
+			kn.Index = string(sb)
+		case "$vector":
+			perr = errors.New(`unknown $knn field: $vector (did you mean "$query"? $vector is the value-type wrapper: {"$query":{"$vector":[...]}})`)
+		case "$maxDistance", "$minScore", "$prefilter", "$nprobe":
+			// Reserved so adding them later is non-breaking; rejected in v1.
+			perr = fmt.Errorf("$knn: %s is reserved and not supported", string(key))
+		default:
+			perr = fmt.Errorf("unknown $knn field: %s", string(key))
+		}
+	})
+	if perr != nil {
+		return nil, perr
+	}
+	if !hasQuery {
+		return nil, errors.New("$knn requires $query")
+	}
+	if !hasK {
+		return nil, errors.New("$knn requires $k (the number of neighbours to select)")
+	}
+	// Range/finiteness rules live in ONE place, shared with the executor's
+	// detection walk (which validates programmatic NewKnn filters).
+	if err := kn.Validate(); err != nil {
+		return nil, err
+	}
+	return kn, nil
 }
 
 // parseText parses the $text predicate object into a Text filter:
@@ -718,6 +824,8 @@ func isOperator(key []byte) (ok bool, op Operator, err error) {
 			return true, opSize, nil
 		case bytes.Equal(key, opBytesText):
 			return true, opText, nil
+		case bytes.Equal(key, opBytesKnn):
+			return true, opKnn, nil
 		default:
 			return true, 0, fmt.Errorf("unknow operator: %s", string(key))
 		}

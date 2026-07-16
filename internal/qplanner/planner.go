@@ -694,14 +694,22 @@ func BuildPlan(params *PlanParams) *Plan {
 	return plan
 }
 
-// buildVectorPlan builds the iterator chain for a vector query:
+// buildVectorPlan builds the iterator chain for a $knn query:
 //
-//	VectorIter -> [FilterIter(residual)] -> [SortIter] -> [LimitIter]
+//	VectorIter(ef) -> [FilterIter(residual)] -> LimitIter{Limit:K} -> [SortIter] -> [LimitIter{Offset,Limit}]
 //
-// The ANN search is the only source. The residual filter (everything except the
-// vector clause — including any _distance threshold and additional field
-// predicates) and the sort run as ordinary downstream stages over the
-// _distance-decorated candidate documents.
+// The ANN search is the only source. The semantics are filter → cut-to-k →
+// sort → page: the residual filter (everything except the $knn clause —
+// including any _distance threshold and additional field predicates) runs over
+// the _distance-decorated candidates in the source's (distance, docId) order,
+// the k-cut then bounds the denoted set to the K nearest survivors, and only
+// that set is sorted and paginated. The k-cut sits BEFORE the user sort by
+// design — "k selects, Sort orders, Limit paginates" — so the same K documents
+// are denoted regardless of presentation order, on every verb.
+//
+// (LimitIter is not an offsetSkipper, so no pushed-down skip can corrupt the
+// k-cut; Count's LimitIter.CountDistinct fast path computes correctly over the
+// stacked shape.)
 func buildVectorPlan(params *PlanParams) *Plan {
 	needSort := params.Sorter != nil
 	needFilter := params.Filter != nil && !isAllFilter(params.Filter)
@@ -714,6 +722,9 @@ func buildVectorPlan(params *PlanParams) *Plan {
 	}
 	if needFilter {
 		root = &FilterIter{Source: root, Data: dataCS, Filter: params.Filter, Buf: params.Buf}
+	}
+	if params.Vector.K > 0 {
+		root = &LimitIter{Source: root, Limit: params.Vector.K}
 	}
 	if needSort {
 		root = &SortIter{
@@ -728,7 +739,7 @@ func buildVectorPlan(params *PlanParams) *Plan {
 		root = &LimitIter{Source: root, Limit: params.Limit, Offset: params.Offset}
 	}
 
-	plan := &Plan{Root: root, Name: "VectorSearch"}
+	plan := &Plan{Root: root, Name: "KnnSearch", IndexName: params.Vector.IndexName}
 	setPlanRef(root, plan)
 	return plan
 }
@@ -769,7 +780,7 @@ func buildFtsPlan(params *PlanParams) *Plan {
 		root = &LimitIter{Source: root, Limit: params.Limit, Offset: params.Offset}
 	}
 
-	plan := &Plan{Root: root, Name: "FtsSearch"}
+	plan := &Plan{Root: root, Name: "FtsSearch", IndexName: params.Fts.IndexName}
 	setPlanRef(root, plan)
 	return plan
 }
