@@ -39,6 +39,15 @@ func (it *FilterIter) Next() (key []byte, docId []byte, multiKey bool, err error
 	}()
 
 	for {
+		// The previous row's accepted document must not survive into this
+		// iteration: a source that never repopulates the slot (CoverIter has no
+		// FetchIter beneath it) would otherwise have the filter below evaluate
+		// the PREVIOUS row's document — accepting every subsequent row and
+		// handing a stale doc to SortIter/Doc(). Only a same-row producer
+		// (FetchIter, which runs inside Source.Next below) may fill it.
+		if it.Plan != nil {
+			it.Plan.DocParsed = nil
+		}
 		key, docId, multiKey, err = it.Source.Next()
 		if err != nil || docId == nil {
 			return nil, nil, false, err
