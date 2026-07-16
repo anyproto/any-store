@@ -7,6 +7,7 @@ import (
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/qplanner"
 	"github.com/anyproto/any-store/v2/query"
+	"github.com/anyproto/any-store/v2/syncpool"
 )
 
 // ModifyResult represents the result of a modification operation.
@@ -127,6 +128,141 @@ func (q *collQuery) Sort(sorts ...any) Query {
 	return q
 }
 
+// reportCandidates builds the CBO candidate list for Explain's index report
+// on the fts/vector paths, where compilation never consults the CBO. Nil for
+// every other verb.
+func (q *collQuery) reportCandidates(btx *btree.ReadTx, opts planOpts) []qplanner.CBOIndex {
+	if !opts.wantCandidates {
+		return nil
+	}
+	idxs := q.c.loadIndexes()
+	br := q.buildBoundsResult(idxs)
+	return q.buildCBOIndexesInto(nil, &br, idxs, btx)
+}
+
+// planOpts are the only per-verb compilation knobs. Everything else about
+// access-path selection is shared — a divergence here needs written rationale
+// (the SQLite shape: one WHERE/ORDER BY code generator, verb-specific only at
+// the row sink).
+type planOpts struct {
+	countOnly      bool // Count: PlanParams.CountOnly, Sorter forced nil (a count is order-invariant)
+	needScores     bool // Iter only: keep the BM25 sidecar for Iterator.Score()
+	exactTotalDocs bool // Explain only: docCountExact (human-facing TotalDocs)
+	wantCandidates bool // Explain only: return the CBO candidate report even on fts/vector paths
+}
+
+// compilePlan is the single query compiler shared by the verbs. It owns
+// $text detection (detectFtsQuery + ftsSorter), vector detection
+// (detectVectorQuery + the default distance-sort rule), and CBO input
+// assembly (buildBoundsResult, buildCBOIndexesInto, buildIndexHints,
+// docCountForPlan/docCountExact) — so every verb selects the same documents
+// for the same query by construction.
+//
+// btx MUST be the snapshot the plan executes on: the multikey-flag probe in
+// buildCBOIndexesInto and the bounds interpolation read it. The caller owns
+// alive()/unsatisfiable() gating, tx and buf lifetimes, and the sink. cbo is
+// non-nil only when opts.wantCandidates (Explain's index report).
+func (q *collQuery) compilePlan(btx *btree.ReadTx, buf *syncpool.DocBuffer,
+	idBounds query.Bounds, opts planOpts) (plan *qplanner.Plan, cbo []qplanner.CBOIndex, err error) {
+
+	// $text drives the query when present (CBO bypassed). The residual filter
+	// runs as a downstream FilterIter; a relevance/textScore sort is the
+	// FtsIter's intrinsic order, a real-field sort inserts a SortIter.
+	ftsSpec, ftsResidual, err := q.detectFtsQuery()
+	if err != nil {
+		return nil, nil, err
+	}
+	if ftsSpec != nil {
+		ftsSpec.NeedScores = opts.needScores
+		sorter := ftsSorter(q.sort)
+		if opts.countOnly {
+			// Sound without ordering: FtsIter emits one aggregate per doc
+			// (duplicate-free), and the distinct count is order-invariant.
+			sorter = nil
+		}
+		plan = qplanner.BuildPlan(&qplanner.PlanParams{
+			Tx:        btx,
+			DataNs:    q.c.ns,
+			Filter:    ftsResidual,
+			Sorter:    sorter,
+			Limit:     int(q.limit),
+			Offset:    int(q.offset),
+			Buf:       buf,
+			CountOnly: opts.countOnly,
+			Fts:       ftsSpec,
+		})
+		return plan, q.reportCandidates(btx, opts), nil
+	}
+
+	// Vector query: detect `{vectorField: [..]}` against the collection's
+	// vector indexes. When matched, build a vector plan (ANN source) and
+	// ignore all other indexes; the residual filter + sort run downstream.
+	vspec, residual, err := q.detectVectorQuery()
+	if err != nil {
+		return nil, nil, err
+	}
+	if vspec != nil {
+		sorter := q.sort
+		if opts.countOnly {
+			sorter = nil
+		} else if sorter == nil && !vspec.Ordered {
+			// No explicit sort and the source isn't already distance-ordered
+			// (brute-force): order by distance ascending. When the ANN source
+			// is ordered, we leave sorter nil so the planner skips a redundant
+			// SortIter and streams the already-closest-first candidates
+			// straight to LimitIter.
+			sorter, _ = query.ParseSort(qplanner.DistanceField)
+		}
+		plan = qplanner.BuildPlan(&qplanner.PlanParams{
+			Tx:        btx,
+			DataNs:    q.c.ns,
+			Filter:    residual,
+			Sorter:    sorter,
+			Limit:     int(q.limit),
+			Offset:    int(q.offset),
+			Buf:       buf,
+			CountOnly: opts.countOnly,
+			Vector:    vspec,
+		})
+		return plan, q.reportCandidates(btx, opts), nil
+	}
+
+	// CBO path. Bounds and candidates are built against btx: the
+	// multikey-flag probe gating tight seek bounds must read the same
+	// snapshot the scan executes on.
+	sorter := q.sort
+	if opts.countOnly {
+		sorter = nil
+	}
+	idxs := q.c.loadIndexes()
+	br := q.buildBoundsResult(idxs)
+	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx)
+	totalDocs := q.docCountForPlan(btx, idxs)
+	if opts.exactTotalDocs {
+		totalDocs = q.docCountExact(btx, idxs)
+	}
+	plan = qplanner.BuildPlan(&qplanner.PlanParams{
+		Tx:          btx,
+		DataNs:      q.c.ns,
+		Filter:      q.cond,
+		Sorter:      sorter,
+		IDBounds:    idBounds,
+		PrimaryKey:  q.c.primaryKey,
+		Limit:       int(q.limit),
+		Offset:      int(q.offset),
+		Buf:         buf,
+		TotalDocs:   totalDocs,
+		Indexes:     cboIndexes,
+		IndexHints:  q.buildIndexHints(),
+		CountOnly:   opts.countOnly,
+		FieldBounds: &br,
+	})
+	if opts.wantCandidates {
+		cbo = cboIndexes
+	}
+	return plan, cbo, nil
+}
+
 func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	if err = q.c.alive(); err != nil {
 		return
@@ -161,91 +297,13 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 	buf := q.c.db.syncPool.GetDocBuf()
 	btx := tx.btreeReadTx()
 
-	// $text query: the BM25 search drives the query (CBO bypassed). The residual
-	// filter runs as a downstream FilterIter; a relevance/textScore sort is the
-	// FtsIter's intrinsic order, a real-field sort inserts a SortIter.
-	ftsSpec, ftsResidual, ferr := q.detectFtsQuery()
-	if ferr != nil {
+	plan, _, err := q.compilePlan(btx, buf, qb.idBounds, planOpts{needScores: true})
+	if err != nil {
 		q.c.db.syncPool.ReleaseDocBuf(buf)
 		_ = tx.Commit()
 		qb.Close()
-		return nil, ferr
+		return nil, err
 	}
-	if ftsSpec != nil {
-		plan := qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:     btx,
-			DataNs: q.c.ns,
-			Filter: ftsResidual,
-			Sorter: ftsSorter(q.sort),
-			Limit:  int(q.limit),
-			Offset: int(q.offset),
-			Buf:    buf,
-			Fts:    ftsSpec,
-		})
-		return &planIterator{
-			plan: plan,
-			tx:   tx,
-			buf:  buf,
-			qb:   qb,
-			data: &qplanner.CursorSource{Tx: btx, Ns: q.c.ns},
-		}, nil
-	}
-
-	// Vector query: detect `{vectorField: [..]}` against the collection's vector
-	// indexes. When matched, build a vector plan (ANN source) and ignore all
-	// other indexes; the residual filter + sort run as downstream stages.
-	vspec, residual, verr := q.detectVectorQuery()
-	if verr != nil {
-		q.c.db.syncPool.ReleaseDocBuf(buf)
-		_ = tx.Commit()
-		qb.Close()
-		return nil, verr
-	}
-	if vspec != nil {
-		sorter := q.sort
-		if sorter == nil && !vspec.Ordered {
-			// No explicit sort and the source isn't already distance-ordered
-			// (brute-force): order by distance ascending. When the ANN source is
-			// ordered, we leave sorter nil so the planner skips a redundant SortIter
-			// and streams the already-closest-first candidates straight to LimitIter.
-			sorter, _ = query.ParseSort(qplanner.DistanceField)
-		}
-		plan := qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:     btx,
-			DataNs: q.c.ns,
-			Filter: residual,
-			Sorter: sorter,
-			Limit:  int(q.limit),
-			Offset: int(q.offset),
-			Buf:    buf,
-			Vector: vspec,
-		})
-		return &planIterator{
-			plan: plan,
-			tx:   tx,
-			buf:  buf,
-			qb:   qb,
-			data: &qplanner.CursorSource{Tx: btx, Ns: q.c.ns},
-		}, nil
-	}
-
-	idxs := q.c.loadIndexes()
-	br := q.buildBoundsResult(idxs)
-	plan := qplanner.BuildPlan(&qplanner.PlanParams{
-		Tx:          btx,
-		DataNs:      q.c.ns,
-		Filter:      q.cond,
-		Sorter:      q.sort,
-		IDBounds:    qb.idBounds,
-		PrimaryKey:  q.c.primaryKey,
-		Limit:       int(q.limit),
-		Offset:      int(q.offset),
-		Buf:         buf,
-		TotalDocs:   q.docCountForPlan(btx, idxs),
-		Indexes:     q.buildCBOIndexesInto(nil, &br, idxs, btx),
-		IndexHints:  q.buildIndexHints(),
-		FieldBounds: &br,
-	})
 
 	return &planIterator{
 		plan: plan,
