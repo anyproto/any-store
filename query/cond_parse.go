@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"math"
 	"regexp"
 	"strings"
 	"unicode"
@@ -449,7 +448,6 @@ func parseKnn(v *anyenc.Value) (Filter, error) {
 		kn       Knn
 		hasQuery bool
 		hasK     bool
-		hasEf    bool
 		perr     error
 	)
 	obj.Visit(func(key []byte, val *anyenc.Value) {
@@ -480,7 +478,6 @@ func parseKnn(v *anyenc.Value) (Filter, error) {
 				return
 			}
 			kn.Ef = n
-			hasEf = true
 		case "$index":
 			sb, e := val.StringBytes()
 			if e != nil {
@@ -503,19 +500,13 @@ func parseKnn(v *anyenc.Value) (Filter, error) {
 	if !hasQuery {
 		return nil, errors.New("$knn requires $query")
 	}
-	if len(kn.Query) == 0 {
-		return nil, errors.New("$knn: $query must be non-empty")
-	}
-	for _, f := range kn.Query {
-		if math.IsNaN(float64(f)) || math.IsInf(float64(f), 0) {
-			return nil, errors.New("$knn: $query must contain finite numbers")
-		}
-	}
 	if !hasK {
 		return nil, errors.New("$knn requires $k (the number of neighbours to select)")
 	}
-	if hasEf && kn.Ef < kn.K {
-		return nil, fmt.Errorf("$knn: $ef must be an integer in [$k, %d], got %v", KnnMaxEf, kn.Ef)
+	// Range/finiteness rules live in ONE place, shared with the executor's
+	// detection walk (which validates programmatic NewKnn filters).
+	if err := kn.Validate(); err != nil {
+		return nil, err
 	}
 	return kn, nil
 }

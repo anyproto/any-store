@@ -80,6 +80,16 @@ type collQuery struct {
 
 	indexHints []IndexHint
 
+	// srcValidated memoizes validateSources: the verbs validate before their
+	// unsatisfiable() short-circuit and compilePlan validates again — without
+	// the flag a $knn query would pay the guard walks (and a throwaway
+	// detection) twice more per verb. Only the VERDICT is cached, never the
+	// detected spec: the spec's Search closure captures the resolved index
+	// handle, which is only reconciled (multi-process staleness) when the
+	// verb's read tx begins — see detectKnnQuery. A collQuery is a single-use
+	// builder (never shared across goroutines), so a plain field suffices.
+	srcValidated bool
+
 	err error
 }
 
@@ -148,6 +158,9 @@ type planOpts struct {
 // source must error identically on every verb, not return 0/nil wherever an
 // unrelated $in:[] happens to make the filter unsatisfiable.
 func (q *collQuery) validateSources() error {
+	if q.srcValidated {
+		return nil
+	}
 	vidxs := q.c.loadVectorIndexes()
 	if err := rejectLegacyVectorClause(q.cond, vidxs); err != nil {
 		return err
@@ -167,6 +180,7 @@ func (q *collQuery) validateSources() error {
 			return err
 		}
 	}
+	q.srcValidated = true
 	return nil
 }
 
@@ -812,12 +826,15 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 		// Report indexes with used index first. Vector and full-text indexes
 		// are enumerated alongside the CBO candidates: Explain printing
 		// "FullScan(filtered)" with no index report for a working ANN query is
-		// how four verbs ignoring the vector clause went unnoticed.
-		addIndex := func(name string) {
+		// how four verbs ignoring the vector clause went unnoticed. They are
+		// NOT CBO candidates though — the optimizer never costed them — so
+		// they carry a cost only when they actually drive the plan; a phantom
+		// plan.Cost on an unconsidered index would read as a costed candidate.
+		addIndex := func(name string, cost float64) {
 			used := name == plan.IndexName
 			ie := IndexExplain{
 				Name: name,
-				Cost: plan.Cost,
+				Cost: cost,
 				Used: used,
 			}
 			if used {
@@ -827,13 +844,19 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 			}
 		}
 		for _, idx := range cboIndexes {
-			addIndex(idx.Info.Name)
+			addIndex(idx.Info.Name, plan.Cost)
+		}
+		sourceCost := func(name string) float64 {
+			if name == plan.IndexName {
+				return plan.Cost
+			}
+			return 0
 		}
 		for _, vi := range q.c.loadVectorIndexes() {
-			addIndex(vi.info.Name)
+			addIndex(vi.info.Name, sourceCost(vi.info.Name))
 		}
 		for _, fx := range q.c.loadFtsIndexes() {
-			addIndex(fx.info.Name)
+			addIndex(fx.info.Name, sourceCost(fx.info.Name))
 		}
 		return nil
 	})

@@ -266,8 +266,9 @@ func TestKnn_OkIsFalse(t *testing.T) {
 	a := &anyenc.Arena{}
 	assert.False(t, kn.Ok(a.NewVectorF32([]float32{1, 2}), buf), "vector probe — even the exact query vector")
 
-	// IndexBounds returns bs VERBATIM (BUG-30 shape: Or.IndexBounds detects a
-	// non-contributing branch by comparing lengths).
+	// IndexBounds returns bs VERBATIM: Or.IndexBounds detects a
+	// non-contributing branch by comparing lengths, so a shorter return would
+	// silently discard accumulated sibling bounds.
 	bs := Bounds{{}}
 	assert.Equal(t, bs, kn.IndexBounds("v", bs))
 }
@@ -297,6 +298,22 @@ func TestContainsKnn_WalksEveryNode(t *testing.T) {
 	assert.True(t, ContainsKnn(Key{Path: []string{"w"}, Filter: Not{Filter: NewKnn([]float32{1}, 1)}}))
 	assert.True(t, ContainsKnn(NewKnn([]float32{1}, 1)), "a bare unwrapped Knn")
 	assert.False(t, ContainsKnn(MustParseCondition(`{"x":{"$gt":1},"$text":{"$search":"q"}}`)))
+
+	// Pointer-built composites satisfy Filter via value-receiver method sets
+	// and MUST be walked too — a skipped &Not{Knn} is a match-all reflection.
+	knnP := NewKnn([]float32{1}, 3)
+	assert.True(t, ContainsKnn(&kn), "*Key")
+	assert.True(t, ContainsKnn(&knnP), "*Knn")
+	assert.True(t, ContainsKnn(Key{Path: []string{"v"}, Filter: &knnP}), "Key{*Knn}")
+	notP := Not{Filter: kn}
+	assert.True(t, ContainsKnn(&notP), "*Not")
+	orP := Or{kn}
+	assert.True(t, ContainsKnn(&orP), "*Or")
+	norP := Nor{kn}
+	assert.True(t, ContainsKnn(&norP), "*Nor")
+	textP := Text{Search: "x"}
+	assert.True(t, ContainsSourceFilter(&textP), "*Text")
+	assert.False(t, GuaranteesPresence(Key{Path: []string{"v"}, Filter: &knnP}, "v"), "*Knn presence carve-out")
 
 	assert.True(t, ContainsSourceFilter(and))
 	assert.True(t, ContainsSourceFilter(MustParseCondition(`{"$text":{"$search":"q"},"x":1}`)))

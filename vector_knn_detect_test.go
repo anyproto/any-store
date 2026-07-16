@@ -264,3 +264,163 @@ func TestKnnResidual_NoKnnSurvives(t *testing.T) {
 	assert.Nil(t, knnResidualFilter(query.MustParseCondition(fmt.Sprintf(`{"v":%s}`, kd))))
 	assert.Nil(t, knnResidualFilter(query.MustParseCondition(fmt.Sprintf(`{"$and":[{"v":%s}]}`, kd))))
 }
+
+// TestDetectKnn_PointerBuiltFilters pins the pointer-form walk: every
+// composite filter has value-receiver methods, so &Not{…}/&Key{…}/&Or{…}
+// satisfy query.Filter too, and a value-only type switch would skip them —
+// letting &Not{Key{v,Knn}} reflect fail-closed Ok into a full-collection
+// Delete, and &Key{v,Knn} silently return 0 rows instead of searching.
+func TestDetectKnn_PointerBuiltFilters(t *testing.T) {
+	coll := knnDetectColl(t)
+	knnLeaf := func() query.Knn { return query.NewKnn([]float32{3, 1, 2}, 4) }
+
+	t.Run("legal pointer forms search like their value forms", func(t *testing.T) {
+		for name, f := range map[string]query.Filter{
+			"&Key{v,Knn}": &query.Key{Path: []string{"v"}, Filter: knnLeaf()},
+			"Key{v,&Knn}": query.Key{Path: []string{"v"}, Filter: ptrKnn(knnLeaf())},
+			"&And{Key{v,Knn},residual}": func() query.Filter {
+				a := query.And{query.Key{Path: []string{"v"}, Filter: knnLeaf()}, query.MustParseCondition(`{"a":1}`)}
+				return &a
+			}(),
+		} {
+			ids := writeOrderIterIds(t, coll.Find(f))
+			require.NotEmpty(t, ids, "%s must search, not silently return 0 rows", name)
+			n, err := coll.Find(f).Count(ctx)
+			require.NoError(t, err, name)
+			assert.Equal(t, len(ids), n, name)
+		}
+	})
+
+	t.Run("illegal pointer forms error instead of bypassing detection", func(t *testing.T) {
+		for name, f := range map[string]query.Filter{
+			"&Not{Key{v,Knn}}": &query.Not{Filter: query.Key{Path: []string{"v"}, Filter: knnLeaf()}},
+			"&Or{Key{v,Knn},…}": func() query.Filter {
+				o := query.Or{query.Key{Path: []string{"v"}, Filter: knnLeaf()}, query.MustParseCondition(`{"a":1}`)}
+				return &o
+			}(),
+			"&Nor{Key{v,Knn}}": func() query.Filter {
+				n := query.Nor{query.Key{Path: []string{"v"}, Filter: knnLeaf()}}
+				return &n
+			}(),
+			"&Knn bare": ptrKnn(knnLeaf()),
+		} {
+			_, err := coll.Find(f).Iter(ctx)
+			require.ErrorIs(t, err, ErrKnnBadPlacement, "%s: Iter", name)
+			res, err := coll.Find(f).Delete(ctx)
+			require.ErrorIs(t, err, ErrKnnBadPlacement, "%s: Delete", name)
+			require.Zero(t, res.Modified, name)
+			remaining, cerr := coll.Find(nil).Count(ctx)
+			require.NoError(t, cerr)
+			require.Equal(t, 10, remaining, "%s: collection must be intact — this exact shape deleted everything before the pointer-walk fix", name)
+		}
+	})
+}
+
+func ptrKnn(k query.Knn) *query.Knn { return &k }
+
+// neArrComp builds Comp{Ne, <plain array>} — the programmatic twin of the JSON
+// {"$ne":[...]} spelling.
+func neArrComp(qv []float32) *query.Comp {
+	a := &anyenc.Arena{}
+	arr := a.NewArray()
+	for i, f := range qv {
+		arr.SetArrayItem(i, a.NewNumberFloat64(float64(f)))
+	}
+	return query.NewCompValue(query.CompOpNe, arr)
+}
+
+// TestDetectKnn_NeDimArrayIsLegacy: $ne with a dim-sized plain array on a
+// vector-indexed field is the match-all mirror of the legacy $eq spelling —
+// on packed storage the operand never byte-equals any stored value, so the
+// $ne would silently select EVERY document ("delete all but this vector"
+// removes that vector too). Loud error, both spellings.
+func TestDetectKnn_NeDimArrayIsLegacy(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "knn_ne")
+	require.NoError(t, err)
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{
+		Name: "emb", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: 3, Metric: VectorL2},
+	}))
+	// Packed storage — the encoding for which the $ne is a silent match-all.
+	a := &anyenc.Arena{}
+	for i := 0; i < 8; i++ {
+		obj := a.NewObject()
+		obj.Set("id", a.NewNumberInt(i))
+		obj.Set("v", a.NewVectorF32([]float32{float32(i), 1, 2}))
+		require.NoError(t, coll.Insert(ctx, obj))
+		a.Reset()
+	}
+
+	for name, f := range map[string]any{
+		"json $ne":         `{"v":{"$ne":[3,1,2]}}`,
+		"programmatic $ne": query.Key{Path: []string{"v"}, Filter: neArrComp([]float32{3, 1, 2})},
+	} {
+		_, err = coll.Find(f).Iter(ctx)
+		require.ErrorIs(t, err, ErrLegacyVectorClause, "%s: Iter", name)
+		res, derr := coll.Find(f).Delete(ctx)
+		require.ErrorIs(t, derr, ErrLegacyVectorClause, "%s: Delete", name)
+		require.Zero(t, res.Modified, name)
+	}
+	remaining, err := coll.Find(nil).Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 8, remaining, "the $ne must never have executed as a match-all literal")
+
+	// Wrong-dim $ne stays an ordinary filter (not ANN-shaped).
+	n, err := coll.Find(`{"v":{"$ne":[1,2]}}`).Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 8, n, "non-dim-sized $ne is an ordinary literal filter")
+}
+
+// TestDetectKnn_NestedKeyDistancePath: a nested-Key filter on a real stored
+// sub-field literally named _distance (a._distance) is NOT the synthetic
+// top-level _distance — the reference walk descends with the path suffix.
+func TestDetectKnn_NestedKeyDistancePath(t *testing.T) {
+	coll := knnDetectColl(t)
+	f := query.Key{Path: []string{"a"}, Filter: query.Key{Path: []string{"_distance"}, Filter: query.NewComp(query.CompOpGt, 1)}}
+	n, err := coll.Find(f).Count(ctx)
+	require.NoError(t, err, "a._distance is a stored sub-field, not the synthetic _distance")
+	assert.Zero(t, n)
+	// The synthetic reference itself still errors, wherever it hides.
+	_, err = coll.Find(query.Not{Filter: query.Key{Path: []string{"_distance"}, Filter: query.NewComp(query.CompOpLt, 1)}}).Count(ctx)
+	require.ErrorIs(t, err, ErrDistanceWithoutVector)
+}
+
+// TestKnn_SortedResultsKeepDistance: SortIter clears the in-flight decorated
+// doc, so the public iterator re-fetches — the _distance field must be
+// re-injected from the sidecar, as docs/vector-search.md promises.
+func TestKnn_SortedResultsKeepDistance(t *testing.T) {
+	coll := knnDetectColl(t)
+	iter, err := coll.Find(fmt.Sprintf(`{"v":%s}`, kd)).Sort("-_distance").Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+	rows := 0
+	for iter.Next() {
+		doc, derr := iter.Doc()
+		require.NoError(t, derr)
+		dv := doc.Value().Get("_distance")
+		require.NotNil(t, dv, "sorted $knn result lost the documented _distance field")
+		assert.InDelta(t, float64(iter.Distance()), dv.GetFloat64(), 1e-6)
+		rows++
+	}
+	require.NoError(t, iter.Err())
+	require.NotZero(t, rows)
+}
+
+// TestExplain_UnconsideredSourceIndexesCarryNoCost: vector/fts indexes are
+// listed for visibility, but only the driving index carries the plan's cost —
+// an unconsidered index with a phantom cost would read as a CBO candidate.
+func TestExplain_UnconsideredSourceIndexesCarryNoCost(t *testing.T) {
+	coll := knnDetectColl(t)
+	exp, err := coll.Find(`{"a":1}`).Explain(ctx)
+	require.NoError(t, err)
+	var sawVector bool
+	for _, ix := range exp.Indexes {
+		if ix.Name == "emb" {
+			sawVector = true
+			assert.False(t, ix.Used)
+			assert.Zero(t, ix.Cost, "the CBO never costed the vector index for a plain range query")
+		}
+	}
+	assert.True(t, sawVector, "the vector index must still be listed")
+}

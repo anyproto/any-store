@@ -3,6 +3,7 @@ package query
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"regexp"
@@ -841,6 +842,28 @@ func (k Knn) String() string {
 	return b.String()
 }
 
+// Validate checks the $knn argument rules — the ONE copy shared by the parser
+// (parseKnn, after its shape/presence checks) and the executor's detection
+// walk (which re-validates because programmatic NewKnn filters never see the
+// parser). Message texts are the normative parse-error strings.
+func (k Knn) Validate() error {
+	if len(k.Query) == 0 {
+		return errors.New("$knn: $query must be non-empty")
+	}
+	for _, f := range k.Query {
+		if math.IsNaN(float64(f)) || math.IsInf(float64(f), 0) {
+			return errors.New("$knn: $query must contain finite numbers")
+		}
+	}
+	if k.K < 1 || k.K > KnnMaxK {
+		return fmt.Errorf("$knn: $k must be an integer in [1, %d], got %d", KnnMaxK, k.K)
+	}
+	if k.Ef != 0 && (k.Ef < k.K || k.Ef > KnnMaxEf) {
+		return fmt.Errorf("$knn: $ef must be an integer in [$k, %d], got %d", KnnMaxEf, k.Ef)
+	}
+	return nil
+}
+
 // KnnOpt is an option for NewKnn.
 type KnnOpt func(*Knn)
 
@@ -864,37 +887,76 @@ func NewKnn(vec []float32, k int, opts ...KnnOpt) Knn {
 	return kn
 }
 
-// ContainsKnn reports whether the tree contains a Knn ANYWHERE. It MUST walk
-// And/*And/Or/Nor/Not/Key: a Knn under Not would evaluate !false == match-all
-// (see the Knn type comment), so every consumer that rejects bad placements
-// needs the full walk.
-func ContainsKnn(f Filter) bool {
-	switch ft := f.(type) {
-	case Knn:
+// FilterTreeAny walks the standard filter tree and reports whether pred is
+// true for any node. It descends And/Or/Nor/Not/Key — in BOTH their value and
+// pointer forms: every composite here has value-receiver methods, so a
+// pointer-built &Not{…}/&Key{…}/&Or{…} satisfies Filter too, and a walker that
+// switches only on value types silently skips such nodes. That is not a
+// stylistic gap — ContainsKnn is a mass-delete guard (see Knn), and a missed
+// node is a guard bypass.
+func FilterTreeAny(f Filter, pred func(Filter) bool) bool {
+	if f == nil {
+		return false
+	}
+	if pred(f) {
 		return true
+	}
+	switch ft := f.(type) {
 	case And:
-		return anyContainsKnn(ft)
+		return anyFilterTree(ft, pred)
 	case *And:
-		return anyContainsKnn(*ft)
+		return anyFilterTree(*ft, pred)
 	case Or:
-		return anyContainsKnn(ft)
+		return anyFilterTree(ft, pred)
+	case *Or:
+		return anyFilterTree(*ft, pred)
 	case Nor:
-		return anyContainsKnn(ft)
+		return anyFilterTree(ft, pred)
+	case *Nor:
+		return anyFilterTree(*ft, pred)
 	case Not:
-		return ContainsKnn(ft.Filter)
+		return FilterTreeAny(ft.Filter, pred)
+	case *Not:
+		return FilterTreeAny(ft.Filter, pred)
 	case Key:
-		return ContainsKnn(ft.Filter)
+		return FilterTreeAny(ft.Filter, pred)
+	case *Key:
+		return FilterTreeAny(ft.Filter, pred)
 	}
 	return false
 }
 
-func anyContainsKnn(fs []Filter) bool {
+func anyFilterTree(fs []Filter, pred func(Filter) bool) bool {
 	for _, f := range fs {
-		if ContainsKnn(f) {
+		if FilterTreeAny(f, pred) {
 			return true
 		}
 	}
 	return false
+}
+
+func isKnnLeaf(f Filter) bool {
+	switch f.(type) {
+	case Knn, *Knn:
+		return true
+	}
+	return false
+}
+
+func isSourceLeaf(f Filter) bool {
+	switch f.(type) {
+	case Knn, *Knn, Text, *Text:
+		return true
+	}
+	return false
+}
+
+// ContainsKnn reports whether the tree contains a Knn ANYWHERE. It MUST walk
+// the whole tree, pointer nodes included: a Knn under Not would evaluate
+// !false == match-all (see the Knn type comment), so every consumer that
+// rejects bad placements needs the full walk.
+func ContainsKnn(f Filter) bool {
+	return FilterTreeAny(f, isKnnLeaf)
 }
 
 // ContainsSourceFilter reports whether the tree contains a SOURCE filter — one
@@ -905,32 +967,7 @@ func anyContainsKnn(fs []Filter) bool {
 // subscription pattern) MUST reject these: Text.Ok matches everything, Knn.Ok
 // matches nothing.
 func ContainsSourceFilter(f Filter) bool {
-	switch ft := f.(type) {
-	case Text, Knn:
-		return true
-	case And:
-		return anyContainsSourceFilter(ft)
-	case *And:
-		return anyContainsSourceFilter(*ft)
-	case Or:
-		return anyContainsSourceFilter(ft)
-	case Nor:
-		return anyContainsSourceFilter(ft)
-	case Not:
-		return ContainsSourceFilter(ft.Filter)
-	case Key:
-		return ContainsSourceFilter(ft.Filter)
-	}
-	return false
-}
-
-func anyContainsSourceFilter(fs []Filter) bool {
-	for _, f := range fs {
-		if ContainsSourceFilter(f) {
-			return true
-		}
-	}
-	return false
+	return FilterTreeAny(f, isSourceLeaf)
 }
 
 // presenceNullProbe is an explicit JSON null used by GuaranteesPresence to test
@@ -963,8 +1000,7 @@ func GuaranteesPresence(f Filter, fieldName string) bool {
 		// the AGGRESSIVE answer, feeding sparse-index selection with a claim
 		// the filter never made. (Text is "safe" only because its Ok fails
 		// open; special-case it anyway rather than lean on that accident.)
-		switch ft.Filter.(type) {
-		case Knn, Text:
+		if isSourceLeaf(ft.Filter) {
 			return false
 		}
 		if strings.Join(ft.Path, ".") == fieldName {

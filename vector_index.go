@@ -580,6 +580,13 @@ var ErrDistanceWithoutVector = errors.New("any-store: _distance is only availabl
 // parseKnn enforces is re-checked here, because ParseCondition short-circuits
 // on an already-built Filter and the production consumers build their ANN
 // filter programmatically — this walk is the only validation they ever see.
+// NOTE: the result is deliberately NOT memoized across calls. The spec's
+// Search closure captures the resolved *vectorIndex HANDLE, and stale handles
+// are reconciled at read-tx begin — a spec detected before the verb's tx
+// opens (validateSources runs pre-tx, ahead of the unsatisfiable()
+// short-circuit) would search a peer-rebuilt index through its dead gen-0
+// namespaces (caught by the multiprocess IVF consistency test). compilePlan
+// re-detects after the tx begins, on the handle set the plan executes on.
 func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, error) {
 	if q.cond == nil || !query.ContainsKnn(q.cond) {
 		return nil, q.cond, nil
@@ -588,9 +595,13 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 	if err != nil {
 		return nil, nil, err
 	}
-	knn, _ := node.Filter.(query.Knn)
-	if err = validateKnnClause(knn); err != nil {
-		return nil, nil, err
+	knn, _ := knnOf(node.Filter)
+	// Re-check the parse-time argument rules (query.Knn.Validate is the one
+	// shared copy): programmatic NewKnn filters never see the parser, and this
+	// walk is the only validation they get. Wrapped in ErrInvalidVectorQuery
+	// so consumers have a matchable sentinel.
+	if verr := knn.Validate(); verr != nil {
+		return nil, nil, fmt.Errorf("%w: %s", ErrInvalidVectorQuery, verr)
 	}
 	field := strings.Join(node.Path, ".")
 	vi, err := resolveKnnIndex(q.c.loadVectorIndexes(), field, knn.Index)
@@ -665,76 +676,76 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 	return spec, residual, nil
 }
 
-// validateKnnClause re-checks every parse-time rule on a (possibly hand-built)
-// Knn. parseKnn's messages are the normative strings; these wrap
-// ErrInvalidVectorQuery so programmatic consumers get a matchable sentinel.
-func validateKnnClause(knn query.Knn) error {
-	if len(knn.Query) == 0 {
-		return fmt.Errorf("%w: $query must be non-empty", ErrInvalidVectorQuery)
+// knnOf extracts the Knn from a leaf, accepting the pointer form too: every
+// composite filter here has value-receiver methods, so a hand-built &Knn{…}
+// satisfies query.Filter just like Knn does, and a value-only type test would
+// let it slip past detection into the residual (fail-closed → 0 rows / no-op
+// writes with err == nil).
+func knnOf(f query.Filter) (query.Knn, bool) {
+	switch k := f.(type) {
+	case query.Knn:
+		return k, true
+	case *query.Knn:
+		return *k, true
 	}
-	for _, f := range knn.Query {
-		if math.IsNaN(float64(f)) || math.IsInf(float64(f), 0) {
-			return fmt.Errorf("%w: $query must contain finite numbers", ErrInvalidVectorQuery)
-		}
-	}
-	if knn.K < 1 || knn.K > query.KnnMaxK {
-		return fmt.Errorf("%w: $k must be an integer in [1, %d], got %d", ErrInvalidVectorQuery, query.KnnMaxK, knn.K)
-	}
-	if knn.Ef != 0 && (knn.Ef < knn.K || knn.Ef > query.KnnMaxEf) {
-		return fmt.Errorf("%w: $ef must be an integer in [$k, %d], got %d", ErrInvalidVectorQuery, query.KnnMaxEf, knn.Ef)
-	}
-	return nil
+	return query.Knn{}, false
 }
 
 // findKnnClause walks the WHOLE tree for the single legal $knn placement:
-// Key{path, Knn} at the top level or under $and (any nesting, both And and
-// *And). A second hit is ErrMultipleVectorClauses; a Knn under Or/Nor/Not,
-// nested inside a Key's inner filter, or bare (no Key naming the field) is
-// ErrKnnBadPlacement. Callers guarantee ContainsKnn(f).
+// Key{path, Knn} at the top level or under $and (any nesting; And/*And). Every
+// composite is matched in BOTH value and pointer form — a pointer-built
+// &Not{Key{v, Knn}} that a value-only switch skipped would evaluate
+// !false == match-all on Delete. A second hit is ErrMultipleVectorClauses; a
+// Knn under Or/Nor/Not, nested inside a Key's inner filter, or bare (no Key
+// naming the field) is ErrKnnBadPlacement. Callers guarantee ContainsKnn(f).
 func findKnnClause(f query.Filter) (node query.Key, err error) {
 	var found bool
-	var walk func(f query.Filter, andDepthOnly bool) // andDepthOnly: only And/*And above us
-	walk = func(f query.Filter, andDepthOnly bool) {
+	var walkKey func(ft query.Key)
+	var walk func(f query.Filter)
+	walkKey = func(ft query.Key) {
+		if _, isKnn := knnOf(ft.Filter); isKnn {
+			if found {
+				err = ErrMultipleVectorClauses
+				return
+			}
+			node, found = ft, true
+			return
+		}
+		// A Knn deeper inside this Key's inner filter (Key{p, And{Knn,…}},
+		// Key{p, Not{Knn}}, …) cannot be stripped as a unit.
+		if query.ContainsKnn(ft.Filter) {
+			err = ErrKnnBadPlacement
+		}
+	}
+	walk = func(f query.Filter) {
 		if err != nil {
 			return
 		}
 		switch ft := f.(type) {
-		case query.Knn:
+		case query.Knn, *query.Knn:
 			// A bare Knn names no field: nothing to resolve an index against.
 			err = fmt.Errorf("%w (a $knn must name its field: query.Key{Path, Knn})", ErrKnnBadPlacement)
 		case query.Key:
-			if _, isKnn := ft.Filter.(query.Knn); isKnn {
-				if !andDepthOnly {
-					err = ErrKnnBadPlacement
-					return
-				}
-				if found {
-					err = ErrMultipleVectorClauses
-					return
-				}
-				node, found = ft, true
-				return
-			}
-			// A Knn deeper inside this Key's inner filter (Key{p, And{Knn,…}},
-			// Key{p, Not{Knn}}, …) cannot be stripped as a unit.
-			if query.ContainsKnn(ft.Filter) {
-				err = ErrKnnBadPlacement
-			}
+			walkKey(ft)
+		case *query.Key:
+			walkKey(*ft)
 		case query.And:
 			for _, sub := range ft {
-				walk(sub, andDepthOnly)
+				walk(sub)
 			}
 		case *query.And:
 			for _, sub := range *ft {
-				walk(sub, andDepthOnly)
+				walk(sub)
 			}
-		case query.Or, query.Nor, query.Not:
+		default:
+			// Or/Nor/Not (any form), or an unknown filter type wrapping a Knn:
+			// not a placement the residual builder can strip.
 			if query.ContainsKnn(f) {
 				err = ErrKnnBadPlacement
 			}
 		}
 	}
-	walk(f, true)
+	walk(f)
 	if err != nil {
 		return query.Key{}, err
 	}
@@ -753,11 +764,17 @@ func findKnnClause(f query.Filter) (node query.Key, err error) {
 // The strip tests the NODE (is this Key's inner filter the Knn?), never the
 // path: And{Key{v, Knn}, Key{v, Comp{Ne,…}}} is legal programmatically, and a
 // path-keyed strip would drop the $ne too — widening the residual, so Delete
-// would remove documents the filter excluded.
+// would remove documents the filter excluded. Pointer-built *Key/*Knn strip
+// identically (findKnnClause accepted them, so the strip must too).
 func knnResidualFilter(f query.Filter) query.Filter {
 	switch ft := f.(type) {
 	case query.Key:
-		if _, isKnn := ft.Filter.(query.Knn); isKnn {
+		if _, isKnn := knnOf(ft.Filter); isKnn {
+			return nil
+		}
+		return ft
+	case *query.Key:
+		if _, isKnn := knnOf(ft.Filter); isKnn {
 			return nil
 		}
 		return ft
@@ -837,37 +854,45 @@ func rejectLegacyVectorClause(f query.Filter, vidxs []*vectorIndex) error {
 }
 
 func rejectLegacyWalk(f query.Filter, path string, vidxs []*vectorIndex) error {
+	each := func(fs []query.Filter) error {
+		for _, sub := range fs {
+			if err := rejectLegacyWalk(sub, path, vidxs); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	switch ft := f.(type) {
 	case query.And:
-		for _, sub := range ft {
-			if err := rejectLegacyWalk(sub, path, vidxs); err != nil {
-				return err
-			}
-		}
+		return each(ft)
 	case *query.And:
-		return rejectLegacyWalk(query.And(*ft), path, vidxs)
+		return each(*ft)
 	case query.Or:
-		for _, sub := range ft {
-			if err := rejectLegacyWalk(sub, path, vidxs); err != nil {
-				return err
-			}
-		}
+		return each(ft)
+	case *query.Or:
+		return each(*ft)
 	case query.Nor:
-		for _, sub := range ft {
-			if err := rejectLegacyWalk(sub, path, vidxs); err != nil {
-				return err
-			}
-		}
+		return each(ft)
+	case *query.Nor:
+		return each(*ft)
 	case query.Not:
 		return rejectLegacyWalk(ft.Filter, path, vidxs)
+	case *query.Not:
+		return rejectLegacyWalk(ft.Filter, path, vidxs)
 	case query.Key:
-		p := strings.Join(ft.Path, ".")
-		if path != "" {
-			p = path + "." + p
-		}
-		return rejectLegacyWalk(ft.Filter, p, vidxs)
+		return rejectLegacyKey(ft, path, vidxs)
+	case *query.Key:
+		return rejectLegacyKey(*ft, path, vidxs)
 	case *query.Comp:
-		if path == "" || ft.CompOp != query.CompOpEq {
+		// The legacy trigger is $eq — the old ANN spelling — AND $ne: on
+		// packed storage a plain-array operand never byte-equals the stored
+		// TypeVectorF32 value, so a dim-sized-array $ne is true for EVERY
+		// document (a "delete all but this vector" that removes that vector
+		// too, silently). Both are the same ANN-shaped-literal mistake.
+		// (Deliberate widening of the design's Eq-only scoping — the design's
+		// own rationale, "loud error over two silent wrong answers", applies
+		// with more force to the match-all direction.)
+		if path == "" || (ft.CompOp != query.CompOpEq && ft.CompOp != query.CompOpNe) {
 			return nil
 		}
 		raw := ft.EqValue
@@ -884,6 +909,14 @@ func rejectLegacyWalk(f query.Filter, path string, vidxs []*vectorIndex) error {
 		}
 	}
 	return nil
+}
+
+func rejectLegacyKey(ft query.Key, path string, vidxs []*vectorIndex) error {
+	p := strings.Join(ft.Path, ".")
+	if path != "" {
+		p = path + "." + p
+	}
+	return rejectLegacyWalk(ft.Filter, p, vidxs)
 }
 
 // knnEf resolves the ANN candidate depth. PURE function of the clause (+
@@ -914,36 +947,54 @@ func knnEf(explicit, indexDefault, k int, hasResidual bool) int {
 
 // filterRefsField reports whether the filter tree references the given field
 // path (used to detect _distance outside a vector query). FULL walk —
-// And/*And/Or/Nor/Not/Key — so no placement hides a reference.
+// And/Or/Nor/Not/Key, value and pointer forms — so no placement hides a
+// reference. A nested Key's path is RELATIVE to its parent: the walk descends
+// with the remaining suffix, so Key{["a"], Key{["_distance"], …}} refers to
+// the stored field "a._distance", not the synthetic top-level "_distance".
 func filterRefsField(f query.Filter, field string) bool {
 	switch v := f.(type) {
 	case query.And:
-		for _, c := range v {
-			if filterRefsField(c, field) {
-				return true
-			}
-		}
+		return anyRefsField(v, field)
 	case *query.And:
-		return filterRefsField(query.And(*v), field)
+		return anyRefsField(*v, field)
 	case query.Or:
-		for _, c := range v {
-			if filterRefsField(c, field) {
-				return true
-			}
-		}
+		return anyRefsField(v, field)
+	case *query.Or:
+		return anyRefsField(*v, field)
 	case query.Nor:
-		for _, c := range v {
-			if filterRefsField(c, field) {
-				return true
-			}
-		}
+		return anyRefsField(v, field)
+	case *query.Nor:
+		return anyRefsField(*v, field)
 	case query.Not:
 		return filterRefsField(v.Filter, field)
+	case *query.Not:
+		return filterRefsField(v.Filter, field)
 	case query.Key:
-		if strings.Join(v.Path, ".") == field {
+		return keyRefsField(v, field)
+	case *query.Key:
+		return keyRefsField(*v, field)
+	}
+	return false
+}
+
+func anyRefsField(fs []query.Filter, field string) bool {
+	for _, c := range fs {
+		if filterRefsField(c, field) {
 			return true
 		}
-		return filterRefsField(v.Filter, field)
+	}
+	return false
+}
+
+func keyRefsField(v query.Key, field string) bool {
+	p := strings.Join(v.Path, ".")
+	if p == field {
+		return true
+	}
+	// Nested Keys address sub-paths of this Key: only the matching suffix of
+	// field can still be referenced below.
+	if suffix, ok := strings.CutPrefix(field, p+"."); ok {
+		return filterRefsField(v.Filter, suffix)
 	}
 	return false
 }
