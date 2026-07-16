@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -3593,4 +3594,118 @@ func TestIndex_UniqueMultikeyCoverLookupDedup(t *testing.T) {
 	assert.Equal(t, []int{2}, collectIntField(t, coll.Find(filter).Offset(1), "id"))
 	got := collectIntField(t, coll.Find(filter).Limit(2), "id")
 	assert.ElementsMatch(t, []int{1, 2}, got)
+}
+
+// Array-valued sort fields must order identically under every plan (Mongo
+// semantics: min element ascending / max element descending, independent of
+// the query predicate). Each row runs against a plain and an indexed
+// collection and compares order AND Limit membership.
+func TestIndex_ArraySortPlanIndependence(t *testing.T) {
+	fx := newFixture(t)
+	seq := 0
+
+	build := func(t *testing.T, indexFields []string, docs ...string) (idx, plain Collection) {
+		seq++
+		mk := func(name string, fields []string) Collection {
+			coll, err := fx.CreateCollection(ctx, fmt.Sprintf("%s_%d", name, seq))
+			require.NoError(t, err)
+			if fields != nil {
+				require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "srt", Fields: fields}))
+			}
+			for _, d := range docs {
+				require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
+			}
+			return coll
+		}
+		return mk("idx", indexFields), mk("plain", nil)
+	}
+
+	hint := IndexHint{IndexName: "srt", Boost: 1 << 30}
+	check := func(t *testing.T, idx, plain Collection, filter any, want []int, sorts ...any) {
+		pOrder := collectIntField(t, plain.Find(filter).Sort(sorts...), "id")
+		iOrder := collectIntField(t, idx.Find(filter).IndexHint(hint).Sort(sorts...), "id")
+		assert.Equal(t, want, pOrder, "plain order")
+		assert.Equal(t, want, iOrder, "indexed order")
+		if len(want) > 1 {
+			pTop := collectIntField(t, plain.Find(filter).Sort(sorts...).Limit(1), "id")
+			iTop := collectIntField(t, idx.Find(filter).IndexHint(hint).Sort(sorts...).Limit(1), "id")
+			assert.Equal(t, want[:1], pTop, "plain limit")
+			assert.Equal(t, want[:1], iTop, "indexed limit")
+		}
+	}
+
+	t.Run("single-field asc min element", func(t *testing.T) {
+		idx, plain := build(t, []string{"x"},
+			`{"id":1,"x":[5,1]}`, `{"id":2,"x":3}`, `{"id":3,"x":[2,9]}`, `{"id":4,"x":0}`)
+		check(t, idx, plain, nil, []int{4, 1, 3, 2}, "x")
+	})
+	t.Run("single-field desc max element", func(t *testing.T) {
+		idx, plain := build(t, []string{"x"},
+			`{"id":1,"x":[1,9]}`, `{"id":2,"x":[8,2]}`, `{"id":3,"x":3}`)
+		check(t, idx, plain, nil, []int{1, 2, 3}, "-x")
+	})
+	t.Run("bounds on the sort field use the global min", func(t *testing.T) {
+		// -1 is OUT of bounds: the in-bounds canonical element (5) must not
+		// leak into the order — the gate forces a SortIter on unproven data.
+		idx, plain := build(t, []string{"x"},
+			`{"id":1,"x":[5,-1]}`, `{"id":2,"x":3}`)
+		check(t, idx, plain, `{"x":{"$gt":0}}`, []int{1, 2}, "x")
+	})
+	t.Run("compound equality prefix asc", func(t *testing.T) {
+		idx, plain := build(t, []string{"a", "x"},
+			`{"id":1,"a":1,"x":[1,9]}`, `{"id":2,"a":1,"x":[8,2]}`, `{"id":3,"a":1,"x":5}`)
+		check(t, idx, plain, `{"a":1}`, []int{1, 2, 3}, "x")
+	})
+	t.Run("compound equality prefix desc", func(t *testing.T) {
+		// the whole-array index entry sorts above every scalar: a reverse
+		// order-providing scan would surface id=2 ([8,2]) before id=1 (max 9).
+		idx, plain := build(t, []string{"a", "x"},
+			`{"id":1,"a":1,"x":[1,9]}`, `{"id":2,"a":1,"x":[8,2]}`, `{"id":3,"a":1,"x":5}`)
+		check(t, idx, plain, `{"a":1}`, []int{1, 2, 3}, "-x")
+	})
+	t.Run("empty array missing null object", func(t *testing.T) {
+		idx, plain := build(t, []string{"x"},
+			`{"id":1}`, `{"id":2,"x":null}`, `{"id":3,"x":[]}`, `{"id":4,"x":1}`, `{"id":5,"x":{"k":1}}`)
+		check(t, idx, plain, nil, []int{1, 2, 4, 3, 5}, "x")
+	})
+}
+
+// The order-providing gate: over possibly-multikey data an index scan may
+// claim ExactSort only when nothing narrows or reverses the traversal of the
+// sort-matched fields; scalar-proven indexes keep today's plans.
+func TestIndex_ArraySortOrderProvidingGate(t *testing.T) {
+	fx := newFixture(t)
+
+	mk := func(t *testing.T, name string, docs ...string) Collection {
+		coll, err := fx.CreateCollection(ctx, name)
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "srt", Fields: []string{"x"}}))
+		for _, d := range docs {
+			require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(d)))
+		}
+		return coll
+	}
+	hint := IndexHint{IndexName: "srt", Boost: 1 << 30}
+
+	t.Run("scalar-proven keeps the order-providing scan", func(t *testing.T) {
+		coll := mk(t, "scalar", `{"id":1,"x":1}`, `{"id":2,"x":2}`)
+		ex, err := coll.Find(`{"x":{"$gt":0}}`).IndexHint(hint).Sort("x").Explain(ctx)
+		require.NoError(t, err)
+		assert.NotContains(t, ex.Sql, "Sort", "bounds on the sort field are fine when scalar-proven: %s", ex.Sql)
+		assert.NotContains(t, ex.Sql, "TopK")
+	})
+	t.Run("unproven with bounds on the sort field re-sorts", func(t *testing.T) {
+		coll := mk(t, "arr", `{"id":1,"x":[5,-1]}`, `{"id":2,"x":3}`)
+		ex, err := coll.Find(`{"x":{"$gt":0}}`).IndexHint(hint).Sort("x").Explain(ctx)
+		require.NoError(t, err)
+		assert.True(t, strings.Contains(ex.Sql, "Sort") || strings.Contains(ex.Sql, "TopK"),
+			"unproven multikey + bounds on the sort field must re-sort: %s", ex.Sql)
+	})
+	t.Run("unproven without bounds keeps the order-providing scan", func(t *testing.T) {
+		coll := mk(t, "arrnobound", `{"id":1,"x":[5,1]}`, `{"id":2,"x":3}`)
+		ex, err := coll.Find(nil).IndexHint(hint).Sort("x").Explain(ctx)
+		require.NoError(t, err)
+		assert.NotContains(t, ex.Sql, "Sort", "no bounds on the sort run: index order == min-element order: %s", ex.Sql)
+		assert.NotContains(t, ex.Sql, "TopK")
+	})
 }

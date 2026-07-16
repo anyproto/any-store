@@ -31,17 +31,17 @@ func (s *SortField) AppendKeyRaw(k anyenc.Tuple, doc []byte, buf *syncpool.DocBu
 		return k, false
 	}
 	// An absent path appends TypeNull via the nil Value, exactly like
-	// v.Get(...) returning nil on the parsed-document path.
+	// v.Get(...) returning nil on the parsed-document path. A leaf ARRAY is
+	// handled here too — appendElementKey applies the same min/max-element
+	// selection as AppendKey, keeping the raw fast path byte-identical
+	// (TestSortAppendKeyRawParity) without falling back to a full parse.
 	var fv *anyenc.Value
 	if raw != nil {
 		if fv, err = buf.Parser.ParseOwned(raw); err != nil {
 			return k, false
 		}
 	}
-	if !s.Reverse {
-		return k.Append(fv), true
-	}
-	return k.AppendInverted(fv), true
+	return s.appendElementKey(k, fv), true
 }
 
 func (ss Sorts) AppendKeyRaw(k anyenc.Tuple, doc []byte, buf *syncpool.DocBuffer) (anyenc.Tuple, bool) {

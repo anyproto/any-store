@@ -144,6 +144,11 @@ func TestSortAppendKeyRawParity(t *testing.T) {
 		`{"id":3,"a":"str","nested":{"deep":{"deeper":7}}}`,
 		`{"id":4,"tags":[{"k":1}],"a":true}`,
 		`{"id":5}`,
+		// leaf arrays: the min/max-element sort key must be byte-identical on
+		// both paths — plain, empty, nested, mixed types, array of objects.
+		`{"id":6,"a":[5,1],"tags":[]}`,
+		`{"id":7,"a":[[9],3,"s"],"tags":[[2,1],[0]]}`,
+		`{"id":8,"a":[{"k":2},{"k":1}]}`,
 	}
 	sortSpecs := [][]any{
 		{"a"},
@@ -154,6 +159,9 @@ func TestSortAppendKeyRawParity(t *testing.T) {
 		{"missing.field"},
 		{"tags.0"},   // array container on path: must fall back (handled=false)
 		{"tags.k"},   // array of objects on path
+		{"tags"},     // leaf array as the sort value
+		{"-tags"},
+		{"a", "-tags"},
 	}
 
 	parser := &anyenc.Parser{}

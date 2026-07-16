@@ -1123,10 +1123,74 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 		if countOnly && len(idx.cboInfo.FieldPaths) > 1 {
 			scalarProven()
 		}
+		// Order-providing gate (Mongo array-sort semantics): an index scan's
+		// intrinsic order equals the min/max-element sort key only when
+		// nothing narrows or reverses the traversal over the sort-matched
+		// fields. Over possibly-multikey data, ExactSort must be demoted —
+		// SortIter then rebuilds the key from the document — when:
+		//   - a sort-run field carries bounds: the scan visits only in-bounds
+		//     element entries, so a doc surfaces at its in-bounds extremum,
+		//     not the global min/max the sort key uses (Mongo's rule: a
+		//     multikey index provides a sort only when the sort fields'
+		//     bounds are [MinKey, MaxKey]); bounds on the equality PREFIX
+		//     are fine — the per-entry cartesian fan-out keeps every suffix
+		//     combination inside the prefix run;
+		//   - a compound run has a descending-requested field: the reverse
+		//     traversal meets the doc's whole-array entry (array type tag,
+		//     above every scalar) before its maximum element. Single-field
+		//     indexes are exempt: CanonicalKeyDedupIter picks the canonical
+		//     element per direction and skips the whole-array entry.
+		// Scalar-proven indexes keep ExactSort unchanged; the proof is read
+		// lazily, only for candidates the gate would demote.
+		if cboIdx.ExactSort && sortRunNeedsScalarProof(&cboIdx, sortFields, br) && !scalarProven() {
+			cboIdx.ExactSort = false
+			cboIdx.PartialSort = false
+		}
 		cboIdx.ScalarProven = proven
 		result = append(result, cboIdx)
 	}
 	return result
+}
+
+// sortRunNeedsScalarProof reports whether idx's ExactSort claim is only valid
+// for scalar-proven data — see the gate in buildCBOIndexesInto.
+//
+// A bound on a sort-run field is only a problem when it can cut off the
+// element the sort key uses, making the doc surface at an in-bounds extremum
+// instead:
+//   - ascending selects the global MIN: only a lower cut (a bound with a
+//     Start — a range start or an equality/$in point) can exclude it. An
+//     upper-only bound is safe: a doc matches via some element <= End, and
+//     its global min is <= that element, hence also in bounds.
+//   - descending selects the global MAX: symmetrically, only an upper cut
+//     (a bound with an End) can exclude it; a lower-only bound is safe.
+//
+// Bounds here are the field's logical (plain-space) bounds from the wide
+// Lookup — presence of a predicate is channel-independent.
+func sortRunNeedsScalarProof(idx *qplanner.CBOIndex, sortFields []query.SortField, br *qplanner.BoundsResult) bool {
+	compound := len(idx.Info.FieldNames) > 1
+	for si, sf := range sortFields {
+		if compound && sf.Reverse {
+			// The reverse traversal meets the doc's whole-array entry (array
+			// type tag, above every scalar) before its maximum element;
+			// single-field chains skip it via CanonicalKeyDedupIter.
+			return true
+		}
+		fi := idx.SortMatchStart + si
+		if fi >= len(idx.Info.FieldNames) {
+			break
+		}
+		bs, _, _ := br.Lookup(idx.Info.FieldNames[fi])
+		for _, b := range bs {
+			if !sf.Reverse && len(b.Start) > 0 {
+				return true
+			}
+			if sf.Reverse && len(b.End) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // buildCBOIndex builds one candidate's CBOIndex with bounds AND all

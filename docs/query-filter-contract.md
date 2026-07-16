@@ -83,3 +83,29 @@ build per query and carry no such guarantee.
    reads as the AGGRESSIVE answer and feeds sparse-index selection. Source
    filters get explicit `false` arms there; any future `Ok`-overriding filter
    needs the same.
+
+9. **Null matches missing.** A missing field evaluates as an explicit `null`
+   throughout the filter surface: `Ok` receives a nil `*anyenc.Value`, the
+   index stores the doc under the `TypeNull` key, and every equality-family
+   operator treats the two identically — `{"$eq":null}`, `{"$in":[…,null,…]}`
+   match missing fields; `{"$ne":null}`, `{"$nin":[…,null,…]}` exclude them
+   (Mongo's null model). Sparse-index selection follows automatically:
+   `GuaranteesPresence` probes `Ok(nil)`/`Ok(null)`, so an operator matching
+   either keeps sparse indexes out of the plan.
+
+10. **Array sort keys are the min/max element.** A sort field holding a
+    non-empty array sorts by its MINIMUM element ascending / MAXIMUM element
+    descending — chosen from all elements, independent of any query predicate
+    (MongoDB ≥ 4.4 semantics, SERVER-19402). This is one definition shared by
+    every consumer: `SortField.AppendKey`, the raw fast path
+    (`AppendKeyRaw`, byte-identical — `TestSortAppendKeyRawParity`), the
+    aggregation `$sort` stage, and index-order-providing scans (the planner
+    demotes `ExactSort` to an in-memory sort whenever the index's intrinsic
+    order could differ: a lower-bounded sort-run field ascending, an
+    upper-bounded one descending, or a descending run on a compound index —
+    unless the index is scalar-proven via its sticky multikey flag).
+    Documented divergences from Mongo, both deliberate: an EMPTY array sorts
+    by its whole-array encoding (after scalars, where the index stores its
+    only entry; Mongo sorts `[]` before null — matching that would need a key
+    encoding below `TypeNull` on disk), and cross-type order is anyenc tag
+    order, not the BSON type order, as everywhere else in this engine.
