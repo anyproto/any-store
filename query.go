@@ -1071,13 +1071,27 @@ func (q *collQuery) buildCBOIndex(idx *index, br *qplanner.BoundsResult, sortFie
 	// buildIndexSeekChain, which only adjusts the CHOSEN index.
 	// This avoids allocation overhead for indexes that aren't selected.
 
-	// Compute equality prefix: count leading index fields with equality bounds.
-	// This handles compound indexes like (t,o) with t=eq, o=range correctly,
-	// allowing IndexSortMatch to recognize sort coverage after equality prefix.
+	// Compute equality prefix: count leading index fields pinned to a SINGLE
+	// point value. This handles compound indexes like (t,o) with t=eq, o=range,
+	// allowing IndexSortMatch to recognize sort coverage after the prefix.
+	//
+	// Exactly one fixed bound is required, not merely "all bounds fixed": a
+	// multi-bound equality set ($in with >=2 values, or an $or of equalities) is
+	// "fixed" per allBoundsFixedNonEmpty, but IndexIter walks the bound list
+	// sequentially, emitting one run per bound. Suffix fields are ordered only
+	// WITHIN a run, not across runs, so claiming ExactSort for a suffix sort
+	// drops the SortIter and yields silently misordered rows — and, under Limit,
+	// the wrong rows. Break rather than skip: a later single-bound field must not
+	// re-extend the prefix past the multi-bound one. See BUG-26.
+	//
+	// A sort that STARTS at the multi-bound field is still served by
+	// IndexSortMatch's matchAt() paths: the bound list is ascending and pairwise
+	// disjoint, and IndexIter consumes it from the top on a reverse scan, so the
+	// concatenated runs are globally ordered in that field.
 	equalityPrefix := 0
 	for _, field := range info.FieldNames {
 		bounds, fixed, found := lookup(field)
-		if !found || len(bounds) == 0 || !fixed {
+		if !found || len(bounds) != 1 || !fixed {
 			break
 		}
 		equalityPrefix++

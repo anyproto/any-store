@@ -171,7 +171,10 @@ func TestIndex_LimitOffset_CompoundSortLimit(t *testing.T) {
 		explain, err := coll.Find(nil).Sort("x", "y").Limit(10).Explain(ctx)
 		require.NoError(t, err)
 		assert.Contains(t, explain.Sql, "IndexScan")
-		assert.NotContains(t, explain.Sql, "Sort(")
+		// SortIter renders as "-> Sort" (or "-> TopK(n)" when a Limit turns it
+		// into a bounded sort); neither may appear — the index supplies order.
+		assert.NotContains(t, explain.Sql, "-> Sort", explain.Sql)
+		assert.NotContains(t, explain.Sql, "TopK", explain.Sql)
 	})
 
 	t.Run("compound sort matches sorted full result", func(t *testing.T) {
@@ -579,7 +582,8 @@ func TestIndex_SortStability_ReverseIndexDuplicates(t *testing.T) {
 	explain, err := coll.Find(nil).Sort("-a").Explain(ctx)
 	require.NoError(t, err)
 	assert.Contains(t, explain.Sql, "IndexScan(-a)")
-	assert.NotContains(t, explain.Sql, "Sort(")
+	assert.NotContains(t, explain.Sql, "-> Sort", explain.Sql)
+	assert.NotContains(t, explain.Sql, "TopK", explain.Sql)
 }
 
 func TestIndex_SortStability_AfterUpdate(t *testing.T) {
@@ -2067,12 +2071,15 @@ func TestAudit10_RangeMultiKey_ReverseRange(t *testing.T) {
 		// The plan should use the index (IndexScan or IndexSeek), not a
 		// full-collection scan + sort. We don't pin the exact SQL string
 		// — it can evolve — but it MUST contain "tags" (the index name)
-		// and MUST NOT contain "Sort(" (the in-memory sort iterator,
-		// which would mean the index didn't provide order).
+		// and MUST NOT contain the in-memory sort iterator, which
+		// SortIter.String renders as "-> Sort" (or "-> TopK(n)" when a
+		// Limit bounds it). Either would mean the index didn't provide order.
 		assert.Contains(t, explain.Sql, "tags",
 			"plan must use the tags index for a range query on tags; got: %s", explain.Sql)
-		assert.NotContains(t, explain.Sql, "Sort(",
-			"reverse scan must use index order, not in-memory Sort(): %s", explain.Sql)
+		assert.NotContains(t, explain.Sql, "-> Sort",
+			"reverse scan must use index order, not an in-memory Sort: %s", explain.Sql)
+		assert.NotContains(t, explain.Sql, "TopK",
+			"reverse scan must use index order, not an in-memory TopK sort: %s", explain.Sql)
 	})
 }
 

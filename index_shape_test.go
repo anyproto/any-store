@@ -128,7 +128,8 @@ func TestIndex_Single_ReverseField(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, explain.Sql, "IndexScan(-a)")
 	assert.NotContains(t, explain.Sql, "(reverse)")
-	assert.NotContains(t, explain.Sql, "Sort(")
+	assert.NotContains(t, explain.Sql, "-> Sort", explain.Sql)
+	assert.NotContains(t, explain.Sql, "TopK", explain.Sql)
 
 	// Sort("a") is the opposite of the declared direction → reverse scan, no sort.
 	valsAsc := collectField(t, coll.Find(nil).Sort("a"), "a")
@@ -137,7 +138,8 @@ func TestIndex_Single_ReverseField(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, explainAsc.Sql, "IndexScan(-a)")
 	assert.Contains(t, explainAsc.Sql, "(reverse)")
-	assert.NotContains(t, explainAsc.Sql, "Sort(")
+	assert.NotContains(t, explainAsc.Sql, "-> Sort", explainAsc.Sql)
+	assert.NotContains(t, explainAsc.Sql, "TopK", explainAsc.Sql)
 
 	// Verify equality filter still works correctly
 	count, err = coll.Find(`{"a": 5}`).Count(ctx)

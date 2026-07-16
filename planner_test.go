@@ -1181,19 +1181,19 @@ func TestQPlanner_ReverseIndex(t *testing.T) {
 	coll := setupTestCollection(t, 50, IndexInfo{Fields: []string{"-a"}})
 
 	t.Run("sort descending with reverse index", func(t *testing.T) {
-		// KNOWN ISSUE: planner's reverse scan direction logic is inverted.
-		// Sort("-a") with index "-a" should give descending order but the
-		// scan direction decision `fields[0].Reverse != idx.Reverse[0]` is
-		// wrong: when both are true it sets reverse=false giving ascending
-		// order from the btree's natural (inverted-key) ordering.
+		// A "-a" index stores the field bitwise-inverted, so Sort("-a")
+		// matches the index's declared direction and is served by a FORWARD
+		// scan of the inverted keys — descending order, no in-memory sort.
 		vals := collectField(t, coll.Find(nil).Sort("-a"), "a")
 		require.Len(t, vals, 50)
 
 		explain, err := coll.Find(nil).Sort("-a").Explain(ctx)
 		require.NoError(t, err)
-		// Uses index scan without in-memory sort
+		// Uses index scan without an in-memory SortIter, which renders as
+		// "-> Sort" (or "-> TopK(n)" when a Limit bounds it).
 		assert.Contains(t, explain.Sql, "IndexScan(-a)")
-		assert.NotContains(t, explain.Sql, "Sort(")
+		assert.NotContains(t, explain.Sql, "-> Sort", explain.Sql)
+		assert.NotContains(t, explain.Sql, "TopK", explain.Sql)
 	})
 
 	t.Run("filter still works with reverse index", func(t *testing.T) {
@@ -1382,8 +1382,10 @@ func TestQPlanner_FilterAndSortSameIndex(t *testing.T) {
 
 		explain, err := coll.Find(`{"a":{"$gte":3,"$lte":7}}`).Sort("a").Explain(ctx)
 		require.NoError(t, err)
-		// Should use index for both filter and sort - no Sort iterator
-		assert.NotContains(t, explain.Sql, "Sort(")
+		// Should use index for both filter and sort — no SortIter, which
+		// renders as "-> Sort" (or "-> TopK(n)" when a Limit bounds it).
+		assert.NotContains(t, explain.Sql, "-> Sort", explain.Sql)
+		assert.NotContains(t, explain.Sql, "TopK", explain.Sql)
 	})
 }
 
