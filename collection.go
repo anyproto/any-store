@@ -1584,12 +1584,18 @@ func (c *collection) reconcileIndexes(tx *btree.ReadTx) {
 		byName[idx.info.Name] = idx
 	}
 
-	// Reconcile vector indexes separately (different namespaces / type).
+	// Reconcile vector and full-text indexes separately (different
+	// namespaces / types). Full-text infos must not fall through to the
+	// range loop below: they have no ix: namespace, so they would silently
+	// fail resolution there and the ftsIndexes snapshot would never track a
+	// peer's full-text DDL — leaving a stale handle that flushes postings
+	// into freed-and-reused ftx: pages, or never adopting a peer's index.
 	c.reconcileVectorIndexesLocked(tx, infos)
+	c.reconcileFtsIndexesLocked(tx, infos)
 
 	rangeInfos := infos[:0:0]
 	for _, info := range infos {
-		if info.Kind != IndexKindVector {
+		if info.Kind != IndexKindVector && !isFulltext(info) {
 			rangeInfos = append(rangeInfos, info)
 		}
 	}
