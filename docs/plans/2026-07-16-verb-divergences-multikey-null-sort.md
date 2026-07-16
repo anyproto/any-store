@@ -1,5 +1,7 @@
 # Verb-divergence endgame grooming: compound-multikey dedup, array sort keys, $in-with-null
 
+**STATUS: IMPLEMENTED (2026-07-16, this branch).** Increment 1 = `c307d29`, Increment 2 = `cbdf9ae` (+ a CoverIter finding below), Increment 3 = `193bfd0`. Acceptance reached: `DF_STRICT=1` full storetest green, `dfKnownOpen` EMPTY, all 8 repros + 4-seed soak green, benchstat within noise on every group. One addition beyond this plan, found during implementation: the multi-bound `CoverIter` path (unique multikey index + full-key `$in`) had the same dedup-above-cutoffs shape and got the same `DocDedupIter` wrap. One refinement: the order-providing gate is direction-aware (a lower cut only breaks ascending/min, an upper cut only breaks descending/max), which keeps lower-bounded descending scans order-providing — two pre-existing tests pin that shape and the matching-doc argument (max ≥ bound ⇒ max in bounds) makes it sound.
+
 **Repo:** `github.com/anyproto/any-store/v2`, branch `btree` @ `f0fc0e9`
 **Worktree (read/edit code HERE):** `/home/che/projects/any-store/.claude/worktrees/verb-divergences-groom`
 **Companion test repo:** `/home/che/projects/any-store-tests` (module `any-store-tests`, go.work → `../any-store`)

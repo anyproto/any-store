@@ -348,6 +348,14 @@ entries, each of which is exactly one distinct doc. Regression:
 `query_test.go:TestQueryCount_LimitOffsetMultiKey` (the trigger below plus
 combined limit+offset and past-the-end cutoffs, asserted against Iter).
 
+*Update 2026-07-16:* the residual asymmetry this fix left — Count deduping
+BEFORE its cutoff while Iter's doc-dedup ran at the consumer, ABOVE the
+in-plan Limit/Sort — is gone for compound multikey indexes too: a
+`DocDedupIter` now dedups in-plan below every cutoff (see
+`internal/qplanner/dedup_iter.go`), so `Count == len(Iter)` holds at any
+offset on every plan shape. `CountDistinct` remains as the count sink; on a
+deduped stream its own `DocDedup` is a passthrough.
+
 **Discovered:** 2026-05-29, adversarial review of `feat/array-index-in-sortdedup`. **Pre-existing on the `btree` baseline (alpha.6)** — confirmed by detaching to `eb667a0` and reproducing identical numbers. NOT introduced by the sort-dedup branch.
 
 **Affected code:** `query.go` Count path. When the query carries a `Limit`/`Offset`, the plan root is a `LimitIter`, which is not a `CountableIterator`, so Count falls to the generic dedup loop. Over a multi-key index two dedup layers (`CanonicalKeyDedupIter` upstream + the consumer `DocDedup`) interact with the limit cutoff and produce a count that is neither `min(limit, distinct)` nor the true distinct count.
