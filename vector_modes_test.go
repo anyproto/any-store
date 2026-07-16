@@ -20,15 +20,11 @@ func makeVectorIndex(t *testing.T, coll Collection, mode VectorMode, dim int) {
 	}))
 }
 
-// vectorEqFilter builds the `{v: [..]}` equality filter used to issue a vector
-// query through the normal Find pipeline.
-func vectorEqFilter(qv []float32) query.Filter {
-	a := &anyenc.Arena{}
-	arr := a.NewArray()
-	for i, f := range qv {
-		arr.SetArrayItem(i, a.NewNumberFloat64(float64(f)))
-	}
-	return query.Key{Path: []string{"v"}, Filter: query.NewCompValue(query.CompOpEq, arr)}
+// vectorKnnFilter builds the programmatic $knn filter (query.NewKnn) used to
+// issue a vector query through the normal Find pipeline — the same construction
+// the downstream indexer uses (no JSON involved).
+func vectorKnnFilter(qv []float32, k int) query.Filter {
+	return query.Key{Path: []string{"v"}, Filter: query.NewKnn(qv, k)}
 }
 
 // TestVectorMode_Persist verifies every mode round-trips through reopen and is
@@ -139,7 +135,7 @@ func TestVectorMode_BruteExact(t *testing.T) {
 	assert.Equal(t, 1.0, recall, "brute-force search must be exact")
 
 	// query pipeline returns the same nearest doc, decorated with _distance.
-	iter, err := coll.Find(vectorEqFilter(vecs[7])).Limit(1).Iter(ctx)
+	iter, err := coll.Find(vectorKnnFilter(vecs[7], 1)).Iter(ctx)
 	require.NoError(t, err)
 	defer iter.Close()
 	require.True(t, iter.Next())

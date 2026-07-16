@@ -39,3 +39,36 @@ under `-race`), `TestFilterOkAllocFree`, and
 
 Note: the contract covers filters only. `Sort`/modifier values are cheap to
 build per query and carry no such guarantee.
+
+5. **Source filters do not evaluate.** `Text` and `Knn` are SOURCE filters:
+   matching is performed by an index scan the executor builds, not by `Ok`.
+   Their `Ok` is a fail-direction choice, not a predicate: `Text.Ok` returns
+   `true` unconditionally (fail-open), `Knn.Ok` returns `false` (fail-closed —
+   a leaked `$knn` must match nothing rather than everything, because the
+   query verbs include `Delete`). External consumers that post-filter by
+   calling `Filter.Ok` directly (the subscription pattern) MUST reject filters
+   containing either — detect them with `query.ContainsSourceFilter` (walks
+   the whole tree).
+
+6. **`TypeVectorF32` is not orderable (Rule V).** In `Comp`, an ordering op
+   (`$gt`/`$gte`/`$lt`/`$lte`) evaluates to `false` whenever either side is a
+   packed vector — including vector-vs-vector. `$eq` is byte equality, `$ne`
+   its negation. The parser additionally rejects an ordering op whose OPERAND
+   is a `$vector` literal (`ErrVectorNotOrderable`), which also keeps it out
+   of `$not`. Consequence (deliberate, Mongo-style type bracketing):
+   `{"v":{"$not":{"$gt":1}}}` matches a vector-valued `v` — `$not` of an
+   unsatisfiable comparison is true.
+
+7. **`$vector`, `$oid` and `$binary` are forbidden as option-key names**
+   inside any operator's options object. anyenc decodes a single-key
+   `{"$vector":[…]}` (et al.) object into a typed VALUE before the query
+   parser sees it, so an options object whose sole key were one of these
+   would change type depending on which other options are present. This is
+   why `$knn`'s payload key is `$query`.
+
+8. **A filter overriding `Ok`'s truth direction must be checked against
+   `GuaranteesPresence`.** It probes the inner filter's `Ok` directly
+   (`!Ok(nil) && !Ok(null)` ⇒ "guarantees presence") — a fail-closed `Ok`
+   reads as the AGGRESSIVE answer and feeds sparse-index selection. Source
+   filters get explicit `false` arms there; any future `Ok`-overriding filter
+   needs the same.

@@ -219,7 +219,7 @@ func TestRename_AllIndexKindsSurviveReopen(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, cnt, "fts index")
 	// Vector: nearest neighbour of [1,0,0,0] is doc 1.
-	iter, err := reopened.Find(`{"v":[1,0,0,0]}`).Limit(1).Iter(ctx)
+	iter, err := reopened.Find(`{"v":{"$knn":{"$query":[1,0,0,0],"$k":1}}}`).Iter(ctx)
 	require.NoError(t, err)
 	require.True(t, iter.Next(), "vector index returned no hits")
 	doc, err := iter.Doc()

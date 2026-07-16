@@ -42,6 +42,8 @@ type FtsSearchFunc func(tx *btree.ReadTx) (FtsCandidateStream, error)
 // predicate must drive the query).
 type FtsQuerySpec struct {
 	Search FtsSearchFunc
+	// IndexName is the driving full-text index, reported by Explain.
+	IndexName string
 	// Ordered is true when Search streams candidates already sorted by score
 	// descending (always the case for BM25). The planner can then skip the
 	// SortIter for the default relevance order and stream straight to LimitIter;

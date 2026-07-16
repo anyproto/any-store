@@ -81,7 +81,7 @@ func TestVectorMode_IVFSQ_EndToEnd(t *testing.T) {
 	assert.GreaterOrEqual(t, recall, 0.9, "IVF-SQ should reach high recall on clustered data")
 
 	// _distance ordering through the pipeline.
-	iter, err := coll.Find(vectorEqFilter(vecs[7])).Limit(5).Iter(ctx)
+	iter, err := coll.Find(vectorKnnFilter(vecs[7], 5)).Iter(ctx)
 	require.NoError(t, err)
 	var last float32 = -1
 	for iter.Next() {

@@ -25,12 +25,24 @@ type VectorCandidate struct {
 // vindex dependency.
 type VectorSearchFunc func(tx *btree.ReadTx, query []float32, ef int) ([]VectorCandidate, error)
 
-// VectorQuerySpec directs BuildPlan to build a vector-search plan. When present
-// it is the SOLE source — all range-index/CBO selection is bypassed.
+// VectorQuerySpec directs BuildPlan to build a vector-search ($knn) plan. When
+// present it is the SOLE source — all range-index/CBO selection is bypassed.
 type VectorQuerySpec struct {
-	Query  []float32
-	Ef     int
-	Search VectorSearchFunc
+	Query []float32
+	// K is the $knn clause's mandatory neighbour count: the k-cut
+	// (LimitIter{Limit:K}) sits after the residual filter and before any user
+	// sort, bounding the denoted set to at most K documents on every verb.
+	K  int
+	Ef int
+	// IndexName is the resolved vector index, reported by Explain.
+	IndexName string
+	Search    VectorSearchFunc
+	// NeedDistances gates ONLY the Plan.Distances sidecar (Iterator.Distance()
+	// on the read verb). injectDistance is unconditional: the residual filter
+	// reads _distance from Plan.DocParsed on every verb, so gating the
+	// injection would turn a {"_distance":{"$lt":x}} residual into match-all
+	// (Comp.Ok(nil) is true for $lt against null) on Count/Update/Delete.
+	NeedDistances bool
 	// TotallyOrdered is true when Search returns candidates in (distance, docId)
 	// ascending order — a TOTAL order, ties included. All three backends (HNSW,
 	// IVF, brute-force) enforce it at the source; the planner then skips the
@@ -64,11 +76,13 @@ func (it *VectorIter) Next() (key []byte, docId []byte, multiKey bool, err error
 		if err != nil {
 			return nil, nil, false, err
 		}
-		if it.Plan != nil && it.Plan.Distances == nil {
-			it.Plan.Distances = &FloatSidecar{}
-		}
-		for _, c := range it.candidates {
-			if it.Plan != nil {
+		// The sidecar (public Distance()) is kept only when the verb asked for
+		// it; injectDistance below stays UNCONDITIONAL — see NeedDistances.
+		if it.Spec.NeedDistances && it.Plan != nil {
+			if it.Plan.Distances == nil {
+				it.Plan.Distances = &FloatSidecar{}
+			}
+			for _, c := range it.candidates {
 				it.Plan.Distances.Set(c.DocId, float64(c.Distance))
 			}
 		}
@@ -110,5 +124,5 @@ func injectDistance(arena *anyenc.Arena, doc *anyenc.Value, dist float32) {
 func (it *VectorIter) Close() {}
 
 func (it *VectorIter) String() string {
-	return fmt.Sprintf("VectorSearch(ef=%d)", it.Spec.Ef)
+	return fmt.Sprintf("KnnSearch(k=%d,ef=%d)", it.Spec.K, it.Spec.Ef)
 }

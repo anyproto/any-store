@@ -109,9 +109,13 @@ func (q *aggQuery) prefixQuery() (*collQuery, aggregate.Pipeline, error) {
 //     done by the FTS scan that the planner builds), so a $match with $text
 //     that did not reach the access planner would match every row instead of
 //     searching.
-//   - a vector (ANN) clause — an equality against a dim-sized numeric array
-//     on a vector-indexed field, exactly the shape detectVectorQuery turns
-//     into an ANN search — would degrade to a literal array comparison.
+//   - query.Knn is a ranked source, not a predicate (Ok fails closed), so a
+//     $match with $knn that did not reach the access planner would match no
+//     row instead of searching.
+//   - a legacy bare-array ANN clause degrades to a literal array comparison
+//     here (0 rows on packed storage); it is a hard error on every path, and
+//     an in-pipeline $match — which compilePlan's guard never sees, because
+//     only the pushdown prefix reaches the compiler — must reject it itself.
 func (q *aggQuery) validateInPipelineStages(rest aggregate.Pipeline) error {
 	var (
 		vidxs  []*vectorIndex
@@ -125,51 +129,22 @@ func (q *aggQuery) validateInPipelineStages(rest aggregate.Pipeline) error {
 		if containsText(m.Filter) {
 			return errAggTextNotInPrefix
 		}
+		if query.ContainsKnn(m.Filter) {
+			return errAggVectorNotInPrefix
+		}
 		if !loaded {
 			vidxs, loaded = q.c.loadVectorIndexes(), true
 		}
-		if len(vidxs) > 0 && hasVectorClause(m.Filter, vidxs) {
-			return errAggVectorNotInPrefix
+		if err := rejectLegacyVectorClause(m.Filter, vidxs); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// hasVectorClause mirrors detectVectorQuery's clause detection — a top-level
-// (or direct $and member) equality on a vector-indexed field whose value is a
-// valid dim-sized numeric array. Anything else on such a field stays a plain
-// literal comparison, exactly like Find's residual filters.
-func hasVectorClause(f query.Filter, vidxs []*vectorIndex) bool {
-	var clauses []query.Filter
-	switch ft := f.(type) {
-	case query.And:
-		clauses = ft
-	default:
-		clauses = []query.Filter{f}
-	}
-	for _, cl := range clauses {
-		k, isKey := cl.(query.Key)
-		if !isKey {
-			continue
-		}
-		vi := findVectorIndexByField(vidxs, strings.Join(k.Path, "."))
-		if vi == nil {
-			continue
-		}
-		comp, isComp := k.Filter.(*query.Comp)
-		if !isComp || comp.CompOp != query.CompOpEq {
-			continue
-		}
-		if _, err := decodeVectorValue(comp.EqValue, vi.dim); err == nil {
-			return true
-		}
-	}
-	return false
-}
-
 var (
 	errAggTextNotInPrefix   = errors.New("any-store: aggregate: $text is only supported in the leading $match stages (the pushdown prefix)")
-	errAggVectorNotInPrefix = errors.New("any-store: aggregate: a vector (ANN) clause is only supported in the leading $match stages (the pushdown prefix)")
+	errAggVectorNotInPrefix = errors.New("any-store: aggregate: a vector ($knn) clause is only supported in the leading $match stages (the pushdown prefix)")
 )
 
 func (q *aggQuery) Iter(ctx context.Context) (Iterator, error) {
