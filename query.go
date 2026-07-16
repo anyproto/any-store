@@ -383,33 +383,14 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
-	plan, isFts, ferr := q.ftsScanPlan(btx, buf)
+	// The shared compiler: a bounded write must select exactly the documents
+	// the equivalent Iter returns — same sorter, same access-path detection
+	// ($text AND vector; an invalid vector clause errors here like it does on
+	// Iter instead of degrading to a literal filter).
+	plan, _, ferr := q.compilePlan(btx, buf, qb.idBounds, planOpts{})
 	if ferr != nil {
 		err = ferr
 		return
-	}
-	if !isFts {
-		idxs := q.c.loadIndexes()
-		br := q.buildBoundsResult(idxs)
-		plan = qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:          btx,
-			DataNs:      q.c.ns,
-			Filter:      q.cond,
-			// The sorter decides WHICH documents a Limit/Offset window selects,
-			// so a bounded write must plan with it exactly like the equivalent
-			// read — otherwise the window slices an unordered stream and the
-			// wrong documents are written.
-			Sorter:      q.sort,
-			IDBounds:    qb.idBounds,
-			PrimaryKey:  q.c.primaryKey,
-			Limit:       int(q.limit),
-			Offset:      int(q.offset),
-			Buf:         buf,
-			TotalDocs:   q.docCountForPlan(btx, idxs),
-			Indexes:     q.buildCBOIndexesInto(nil, &br, idxs, btx),
-			IndexHints:  q.buildIndexHints(),
-			FieldBounds: &br,
-		})
 	}
 
 	// Close-once: the plan must be closed before the write loop below (see the
@@ -549,33 +530,14 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
-	plan, isFts, ferr := q.ftsScanPlan(btx, buf)
+	// The shared compiler: a bounded write must select exactly the documents
+	// the equivalent Iter returns — same sorter, same access-path detection
+	// ($text AND vector; an invalid vector clause errors here like it does on
+	// Iter instead of degrading to a literal filter).
+	plan, _, ferr := q.compilePlan(btx, buf, qb.idBounds, planOpts{})
 	if ferr != nil {
 		err = ferr
 		return
-	}
-	if !isFts {
-		idxs := q.c.loadIndexes()
-		br := q.buildBoundsResult(idxs)
-		plan = qplanner.BuildPlan(&qplanner.PlanParams{
-			Tx:          btx,
-			DataNs:      q.c.ns,
-			Filter:      q.cond,
-			// The sorter decides WHICH documents a Limit/Offset window selects,
-			// so a bounded write must plan with it exactly like the equivalent
-			// read — otherwise the window slices an unordered stream and the
-			// wrong documents are written.
-			Sorter:      q.sort,
-			IDBounds:    qb.idBounds,
-			PrimaryKey:  q.c.primaryKey,
-			Limit:       int(q.limit),
-			Offset:      int(q.offset),
-			Buf:         buf,
-			TotalDocs:   q.docCountForPlan(btx, idxs),
-			Indexes:     q.buildCBOIndexesInto(nil, &br, idxs, btx),
-			IndexHints:  q.buildIndexHints(),
-			FieldBounds: &br,
-		})
 	}
 
 	// Close-once: the plan must be closed before the delete loop below, but a
