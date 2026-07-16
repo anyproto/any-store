@@ -369,39 +369,15 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	}
 	defer closePlan()
 
-	// Collect all matching docIds into a contiguous buffer to avoid
-	// per-ID allocations and cursor invalidation during updates. Dedup
-	// multi-key entries so an UpdateMany over an array-indexed $in
-	// query doesn't apply the modifier twice to the same doc.
-	var idBuf []byte       // contiguous buffer for all IDs
-	var idOffsets []uint32 // start offsets of each ID in idBuf
-	var dedup qplanner.DocDedup
-	for {
-		_, docId, mk, iterErr := plan.Root.Next()
-		if iterErr != nil {
-			err = iterErr
-			return
-		}
-		if docId == nil {
-			break
-		}
-		if !dedup.Accept(docId, mk) {
-			continue
-		}
-		idOffsets = append(idOffsets, uint32(len(idBuf)))
-		idBuf = append(idBuf, docId...)
+	// Materialize the distinct target ids, then release the plan's cursors
+	// BEFORE mutating ("can't modify while iterating"). Dedup ensures a bulk
+	// update over an array-indexed $in query doesn't apply the modifier twice
+	// to the same doc.
+	idsToUpdate, err := collectDistinctIDs(plan.Root)
+	if err != nil {
+		return
 	}
 	closePlan()
-
-	// Build slice references into the contiguous buffer.
-	idsToUpdate := make([][]byte, len(idOffsets))
-	for i, off := range idOffsets {
-		end := len(idBuf)
-		if i+1 < len(idOffsets) {
-			end = int(idOffsets[i+1])
-		}
-		idsToUpdate[i] = idBuf[off:end]
-	}
 
 	modBuf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(modBuf)
@@ -556,38 +532,14 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	}
 	defer closePlan()
 
-	// Collect IDs to delete into a contiguous buffer (can't modify while iterating).
-	// Dedup multi-key entries so a doc matched on multiple array values
-	// isn't deleted twice / counted twice in the affected count.
-	var idBuf []byte
-	var idOffsets []uint32
-	var dedup qplanner.DocDedup
-	for {
-		_, docId, mk, iterErr := plan.Root.Next()
-		if iterErr != nil {
-			err = iterErr
-			return
-		}
-		if docId == nil {
-			break
-		}
-		if !dedup.Accept(docId, mk) {
-			continue
-		}
-		idOffsets = append(idOffsets, uint32(len(idBuf)))
-		idBuf = append(idBuf, docId...)
+	// Materialize the distinct target ids, then release the plan's cursors
+	// BEFORE mutating ("can't modify while iterating"). Dedup ensures a doc
+	// matched on multiple array values isn't deleted twice / counted twice.
+	idsToDelete, err := collectDistinctIDs(plan.Root)
+	if err != nil {
+		return
 	}
 	closePlan()
-
-	// Build slice references into the contiguous buffer.
-	idsToDelete := make([][]byte, len(idOffsets))
-	for i, off := range idOffsets {
-		end := len(idBuf)
-		if i+1 < len(idOffsets) {
-			end = int(idOffsets[i+1])
-		}
-		idsToDelete[i] = idBuf[off:end]
-	}
 
 	// Now delete collected docs
 	for _, id := range idsToDelete {
@@ -731,24 +683,41 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 			count = n
 			return nil
 		}
-		// Generic Next-loop count: dedup multi-key entries so a doc whose
-		// array values match multiple bounds is counted once.
-		var dedup qplanner.DocDedup
-		for {
-			_, docId, mk, iterErr := plan.Root.Next()
-			if iterErr != nil {
-				return iterErr
-			}
-			if docId == nil {
-				break
-			}
-			if dedup.Accept(docId, mk) {
-				count++
-			}
-		}
-		return nil
+		// Generic distinct-doc count: a doc whose array values match multiple
+		// bounds is counted once.
+		cerr := qplanner.ForEachDistinct(plan.Root, func([]byte) error {
+			count++
+			return nil
+		})
+		plan.Close()
+		return cerr
 	})
 	return
+}
+
+// collectDistinctIDs materializes a plan's distinct docIds into slices backed
+// by one contiguous arena: one allocation curve, and the ids stay valid after
+// plan.Close — bulk writes must release the plan's cursors before mutating,
+// and iterators reuse their docId buffers between rows.
+func collectDistinctIDs(root qplanner.Iterator) ([][]byte, error) {
+	var idBuf []byte       // contiguous buffer for all ids
+	var idOffsets []uint32 // start offset of each id in idBuf
+	if err := qplanner.ForEachDistinct(root, func(docId []byte) error {
+		idOffsets = append(idOffsets, uint32(len(idBuf)))
+		idBuf = append(idBuf, docId...)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	ids := make([][]byte, len(idOffsets))
+	for i, off := range idOffsets {
+		end := len(idBuf)
+		if i+1 < len(idOffsets) {
+			end = int(idOffsets[i+1])
+		}
+		ids[i] = idBuf[off:end]
+	}
+	return ids, nil
 }
 
 func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {

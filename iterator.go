@@ -66,7 +66,10 @@ func (pi *planIterator) Next() bool {
 		// Skip duplicates emitted by multi-key sources (e.g. an
 		// $in over an array index where a doc matches multiple bounds).
 		// multiKey=false is a hard guarantee from upstream; the helper
-		// bypasses the seen-set entirely in that case.
+		// bypasses the seen-set entirely in that case. This streaming pull
+		// loop is the twin of qplanner.ForEachDistinct (the batch consumer
+		// behind bulk writes and the generic count) — both must implement
+		// the identical Accept contract.
 		if !pi.dedup.Accept(docId, mk) {
 			continue
 		}
