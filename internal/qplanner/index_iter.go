@@ -28,6 +28,21 @@ type IndexIter struct {
 	// value sits at byte position 0 of the key (single-field PointLookup).
 	PointLookup bool
 
+	// FullKeyBound is true when the bound chain pins EVERY index field with an
+	// EQUALITY (PointLookup && BoundFields == len(FieldNames)). Within-doc
+	// value dedup in index.writeValues guarantees at most one entry per doc
+	// per full key tuple, so a full-key point bound admits no per-doc fan-out
+	// even on a multikey index — CountEntries' page-batch stays exact. A
+	// trailing RANGE bound does NOT qualify: several suffix elements of one
+	// doc can fall inside the range.
+	FullKeyBound bool
+
+	// ScalarProven mirrors CBOIndex.ScalarProven: the index provably holds no
+	// fan-out entries in this snapshot (sticky multikey flag, index.go
+	// isScalarProven). False means "unknown or multikey" — CountEntries then
+	// takes the per-entry dedup walk for compound prefix bounds.
+	ScalarProven bool
+
 	// indexHasMultiKey caches the canonical-key probe result for the lifetime
 	// of this iterator (set lazily on the first CountEntries dispatch that
 	// needs it). Per-IndexIter; never shared across goroutines.
@@ -352,9 +367,15 @@ func indexProbeAnyMultiKey(cs *CursorSource, fieldReverse bool) (bool, error) {
 // CountEntries counts distinct documents matching this index iterator's
 // bounds via a 4-branch dispatch:
 //
-//	Branch 1 (len(Bounds) <= 1): page-batch CountUntil. No cross-bound dedup
-//	  concern — within-doc dedup in insertKeys guarantees ≤1 entry per distinct
-//	  value per doc, so entry count == doc count. Fast: no per-entry walk.
+//	Branch 1 (len(Bounds) <= 1, and the bound admits no per-doc fan-out):
+//	  page-batch CountUntil. Sound when the index is single-field (within-doc
+//	  dedup in insertKeys guarantees ≤1 entry per distinct value per doc), OR
+//	  the single bound pins the FULL key (≤1 entry per doc per full tuple even
+//	  on a multikey index), OR the index is scalar-proven for this snapshot.
+//	  A compound PREFIX bound on a possibly-multikey index is excluded: the
+//	  array suffix fans one doc into several entries plus a whole-array entry,
+//	  so the entry count overshoots the doc count — those route to Branch 2.
+//	  Fast: no per-entry walk.
 //
 //	Branch 2 (compound / non-PointLookup): pooled seen-set, skip-scalar mode.
 //	  The canonical-key probe is only a valid multi-key detector for single-field
@@ -380,8 +401,9 @@ func (it *IndexIter) CountEntries() (int, error) {
 		it.cursor = it.Source.NewCursor()
 	}
 
-	// Branch 1.
-	if len(it.Bounds) <= 1 {
+	// Branch 1 — see the fan-out conditions in the dispatch comment above.
+	if len(it.Bounds) <= 1 &&
+		(len(it.IdxInfo.FieldNames) == 1 || it.FullKeyBound || it.ScalarProven) {
 		return it.countEntriesBatch()
 	}
 

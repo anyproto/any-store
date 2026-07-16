@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
 )
 
 // --- from limit_offset_index_test.go ---
@@ -3452,4 +3453,144 @@ func TestIndex_InNullMatchesMissingField(t *testing.T) {
 	check(t, `{"a":null}`, []int{1, 2}) // the $eq the $in must agree with
 	check(t, `{"a":{"$in":[null,1]}}`, []int{1, 2, 3})
 	check(t, `{"a":{"$in":[1]}}`, []int{3}) // no null member: missing stays excluded
+}
+
+// A compound multikey index fans one document into several entries (one per
+// element combination plus a whole-array entry). Dedup must happen IN-PLAN,
+// below Sort/Limit/Offset and the covering Count, so raw entries never consume
+// result slots: every verb agrees with the FullScan oracle.
+func TestIndex_CompoundMultikeyDedupBelowCutoffs(t *testing.T) {
+	newColl := func(t *testing.T, name string, withIndex bool) Collection {
+		fx := newFixture(t)
+		coll, err := fx.CreateCollection(ctx, name)
+		require.NoError(t, err)
+		if withIndex {
+			require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "tb", Fields: []string{"tags", "b"}}))
+		}
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(`{"id":1,"tags":[1,2],"b":1}`),
+			anyenc.MustParseJson(`{"id":2,"tags":[2],"b":2}`)))
+		for i := 0; i < 300; i++ {
+			require.NoError(t, coll.Insert(ctx,
+				anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"tags":[100],"b":%d}`, 10+i, i))))
+		}
+		return coll
+	}
+
+	hint := IndexHint{IndexName: "tb", Boost: 1 << 30}
+	filter := `{"tags":{"$in":[1,2]}}`
+
+	t.Run("limit counts documents not entries", func(t *testing.T) {
+		coll := newColl(t, "lim", true)
+		got := collectIntField(t, coll.Find(filter).IndexHint(hint).Limit(2), "id")
+		assert.ElementsMatch(t, []int{1, 2}, got)
+		cnt, err := coll.Find(filter).IndexHint(hint).Limit(2).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 2, cnt)
+	})
+
+	t.Run("offset skips documents not entries", func(t *testing.T) {
+		// entries (1,d1),(2,d1),(2,d2): the offset must skip ONE DOC (d1),
+		// not eat d1's first entry and then emit it through its second.
+		coll := newColl(t, "off", true)
+		got := collectIntField(t, coll.Find(filter).IndexHint(hint).Offset(1), "id")
+		assert.Equal(t, []int{2}, got)
+	})
+
+	t.Run("sort topk ranks documents not entries", func(t *testing.T) {
+		coll := newColl(t, "topk", true)
+		got := collectIntField(t, coll.Find(filter).IndexHint(hint).Sort("b").Limit(2), "id")
+		assert.Equal(t, []int{1, 2}, got)
+	})
+
+	t.Run("bounded delete removes limit documents", func(t *testing.T) {
+		coll := newColl(t, "del", true)
+		res, err := coll.Find(filter).IndexHint(hint).Limit(2).Delete(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 2, res.Modified)
+	})
+
+	t.Run("bounded update modifies limit documents", func(t *testing.T) {
+		coll := newColl(t, "upd", true)
+		res, err := coll.Find(filter).IndexHint(hint).Limit(2).Update(ctx, query.MustParseModifier(`{"$set":{"u":1}}`))
+		require.NoError(t, err)
+		assert.Equal(t, 2, res.Modified)
+	})
+
+	t.Run("plan pins the dedup stage below the fetch", func(t *testing.T) {
+		coll := newColl(t, "explain", true)
+		ex, err := coll.Find(filter).IndexHint(hint).Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, ex.Sql, "-> Dedup(docid) -> Fetch")
+	})
+}
+
+// The covering Count path (CountEntries) must not report the entry count for
+// a compound prefix bound over multikey data: one array doc is one document.
+// A scalar-only compound index keeps the page-batch answer (and its speed).
+func TestIndex_CompoundCoveringCountMultikey(t *testing.T) {
+	fx := newFixture(t)
+
+	t.Run("array suffix fan-out counts one doc", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "fanout")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}}))
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1,"a":-1,"b":[1,2,3]}`)))
+
+		cnt, err := coll.Find(`{"a":-1}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 1, cnt)
+		assert.Equal(t, []int{1}, collectIntField(t, coll.Find(`{"a":-1}`), "id"))
+	})
+
+	t.Run("multi-bound in over array leading field", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "multibound")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"tags", "b"}}))
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(`{"id":1,"tags":[1,2],"b":1}`),
+			anyenc.MustParseJson(`{"id":2,"tags":[2],"b":2}`)))
+
+		cnt, err := coll.Find(`{"tags":{"$in":[1,2]}}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 2, cnt)
+	})
+
+	t.Run("scalar-only compound stays exact", func(t *testing.T) {
+		coll, err := fx.CreateCollection(ctx, "scalar")
+		require.NoError(t, err)
+		require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}}))
+		for i := 0; i < 10; i++ {
+			require.NoError(t, coll.Insert(ctx,
+				anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%d,"b":%d}`, i, i%3, i))))
+		}
+		cnt, err := coll.Find(`{"a":1}`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 3, cnt)
+	})
+}
+
+// A UNIQUE index can still be multikey (each array element unique across
+// docs): a multi-bound $in reaches the same doc through several elements via
+// the CoverIter point-lookup path, which must dedup below Offset/Limit too.
+func TestIndex_UniqueMultikeyCoverLookupDedup(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "uniqmk")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}, Unique: true}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":[1,2],"b":5}`),
+		anyenc.MustParseJson(`{"id":2,"a":[3],"b":5}`)))
+
+	filter := `{"a":{"$in":[1,2,3]},"b":5}`
+
+	cnt, err := coll.Find(filter).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, cnt)
+	assert.ElementsMatch(t, []int{1, 2}, collectIntField(t, coll.Find(filter), "id"))
+	// bounds (1,5),(2,5),(3,5): the offset must skip doc 1, not just its
+	// first cross-bound repeat.
+	assert.Equal(t, []int{2}, collectIntField(t, coll.Find(filter).Offset(1), "id"))
+	got := collectIntField(t, coll.Find(filter).Limit(2), "id")
+	assert.ElementsMatch(t, []int{1, 2}, got)
 }

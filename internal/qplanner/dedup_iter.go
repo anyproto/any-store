@@ -147,9 +147,78 @@ func (it *CanonicalKeyDedupIter) String() string {
 	return fmt.Sprintf("%s -> Dedup(canonical)", it.Source)
 }
 
-// SeenSetDedupIter was removed in favour of consumer-side DocDedup
-// threaded through the iterator chain via the multiKey return value of
-// Iterator.Next. Compound multi-key indexes are now deduped at the
-// boundary (planIterator.Next, query.go count/Update/Delete loops)
-// without an extra pipeline stage. See
-// docs/plans/2026-04-29-multikey-bit-and-dedup-pipeline.md.
+// DocDedupIter collapses a compound multikey index's entry fan-out to one row
+// per distinct document, in first-occurrence order. A doc whose indexed fields
+// hold arrays emits one entry per element combination PLUS a whole-array entry
+// per array field (index.go writeValues), all flagged multiKey; without an
+// in-plan dedup those raw entries reach SortIter's TopK heap and LimitIter's
+// offset/limit cutoffs, so one document consumes several slots and every verb
+// disagrees with Count (whose LimitIter.CountDistinct dedups before the
+// cutoff). This iterator restores "one row == one document" BELOW those
+// stages.
+//
+// History: consumer-boundary dedup via the multiKey flag (planIterator.Next,
+// ForEachDistinct) replaced an earlier pipeline stage here — see
+// docs/plans/2026-04-29-multikey-bit-and-dedup-pipeline.md — but the boundary
+// sits ABOVE Sort/Limit, which is exactly where the slots are consumed. The
+// consumer dedup remains as the contract backstop; it sees multiKey=false
+// from this iterator and degenerates to a passthrough.
+//
+// Placement (both index chains): directly above the entry source
+// (IndexIter/IndexFilterIter) and below FetchIter —
+//   - it must stay downstream of IndexFilterIter: cover filters test the
+//     ENTRY key tuple, and a doc's entries differ in covered fields, so
+//     deduping first could emit only an entry the cover filter rejects;
+//   - the residual FilterIter's verdict is per-DOCUMENT (identical across a
+//     doc's entries), so deduping below FetchIter is sound and skips the
+//     fetch+parse+filter of every duplicate entry.
+//
+// Emits multiKey=false unconditionally: emitted rows are unique by docId.
+// Scalar entries pass through with zero cost (DocDedup.Accept fast path, no
+// map). Memory is O(distinct multikey docs pulled) — bounded by the limit for
+// bounded queries, and otherwise the same map the consumer allocated before.
+//
+// Single-field indexes use CanonicalKeyDedupIter instead (O(1) memory,
+// doc-driven canonical-element selection); the planner picks exactly one of
+// the two per chain.
+type DocDedupIter struct {
+	Source Iterator
+	dedup  DocDedup
+}
+
+func (it *DocDedupIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
+	for {
+		key, docId, multiKey, err = it.Source.Next()
+		if err != nil || docId == nil {
+			return nil, nil, false, err
+		}
+		if !it.dedup.Accept(docId, multiKey) {
+			continue
+		}
+		return key, docId, false, nil
+	}
+}
+
+// skipOffset delegates a cursor-level offset skip to the source. Sound for
+// the same reason as CanonicalKeyDedupIter.skipOffset: the source only ever
+// fast-skips SCALAR-flagged entries, and a scalar entry is by construction
+// its doc's ONLY entry in the index (index.go insertKeys), so every skipped
+// row is one distinct doc that can never reappear — no dedup decision is
+// bypassed and no seen-set recording is missed. The skip stops at the first
+// multikey entry, from which normal Next() dedup resumes.
+func (it *DocDedupIter) skipOffset(n int) (remaining int, err error) {
+	if src, ok := it.Source.(offsetSkipper); ok {
+		return src.skipOffset(n)
+	}
+	return n, nil
+}
+
+func (it *DocDedupIter) Close() {
+	if it.Source != nil {
+		it.Source.Close()
+	}
+}
+
+func (it *DocDedupIter) String() string {
+	return fmt.Sprintf("%s -> Dedup(docid)", it.Source)
+}

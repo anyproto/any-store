@@ -242,6 +242,14 @@ type CBOIndex struct {
 	// before AdjustBoundsForNonUnique modifies End. This allows correct sketch estimation.
 	PointLookup bool
 
+	// ScalarProven is true when the index provably holds no fan-out (multikey)
+	// entries in the query's snapshot — the sticky index-level multikey flag
+	// read through the query's own read tx (index.go isScalarProven). False
+	// means "unknown or multikey": the flag is only resolved when a consumer
+	// needs it (a systemNS point Get per index), so absence of proof must
+	// always degrade to the conservative path.
+	ScalarProven bool
+
 	// Sort coverage analysis
 	ExactSort   bool
 	PartialSort bool
@@ -1290,6 +1298,17 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 			Bounds:  idx.Bounds,
 		}
 
+		// A unique index can still be multikey (each array element unique
+		// across docs), so a multi-bound $in can hit the SAME doc through
+		// several of its elements — CoverIter then tags entries multiKey (see
+		// its probe). Dedup in-plan, below the Sort/Limit stages added around
+		// this chain, for the same reason as the compound wrap below: raw
+		// cross-bound repeats must not consume offset/limit/TopK slots.
+		// Single-bound lookups can't straddle bounds and skip the wrap.
+		if len(idx.Bounds) > 1 {
+			root = &DocDedupIter{Source: root}
+		}
+
 		if needFilter {
 			root = &FilterIter{
 				Source: root,
@@ -1331,11 +1350,13 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	b := &seekBatch{}
 	b.indexCS = CursorSource{Tx: params.Tx, Ns: idx.Info.Ns}
 	b.indexIter = IndexIter{
-		Source:      &b.indexCS,
-		IdxInfo:     idx.Info,
-		Bounds:      idx.Bounds,
-		Reverse:     reverse,
-		PointLookup: idx.PointLookup,
+		Source:       &b.indexCS,
+		IdxInfo:      idx.Info,
+		Bounds:       idx.Bounds,
+		Reverse:      reverse,
+		PointLookup:  idx.PointLookup,
+		FullKeyBound: idx.PointLookup && idx.BoundFields == len(idx.Info.FieldNames),
+		ScalarProven: idx.ScalarProven,
 	}
 
 	var root Iterator = &b.indexIter
@@ -1374,6 +1395,15 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 		}
 	}
 
+	// Compound multikey dedup, BELOW the fetch and every Sort/Limit stage: a
+	// doc with arrays in the indexed fields fans out into several entries, and
+	// raw entries must not consume TopK/offset/limit slots or duplicate
+	// fetches. Single-field indexes get CanonicalKeyDedupIter below instead.
+	// See the DocDedupIter doc comment for the placement constraints.
+	if len(idx.Info.FieldPaths) > 1 {
+		root = &DocDedupIter{Source: root}
+	}
+
 	// Fetch documents by docId — share CursorSource between FetchIter and FilterIter
 	b.dataCS = CursorSource{Tx: params.Tx, Ns: params.DataNs}
 	b.fetchIter = FetchIter{
@@ -1395,18 +1425,16 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 
 	// Dedup wrap for multi-key safety.
 	//
-	// Single-field indexes use canonical-key dedup (O(1) memory, streaming)
-	// to filter duplicates upstream of the sort/fetch chain — useful when
-	// the result set is huge and the consumer's seen-set would balloon.
-	//
-	// Compound indexes have no equivalent O(1) dedup (canonical-key
-	// selection across compound tuples is non-trivial — see
-	// docs/plans/2026-04-17-multikey-index-dedup.md). For them we rely on
-	// the consumer-side DocDedup helper threaded via Iterator.multiKey:
-	// IndexIter sets multiKey based on the per-entry value byte, every
-	// iterator passes it through, and planIterator.Next /
-	// query.go consumers dedup at the boundary. No per-query map is
-	// allocated for fully-scalar streams.
+	// Single-field indexes use canonical-key dedup (O(1) memory, streaming,
+	// doc-driven — hence above FetchIter) to filter duplicates before the
+	// sort/limit stages. Compound indexes were already deduped by the
+	// DocDedupIter inserted below the fetch (canonical-key selection across
+	// compound tuples is non-trivial — see
+	// docs/plans/2026-04-17-multikey-index-dedup.md — so they dedup by docId
+	// in first-occurrence order instead). Exactly one of the two wraps is
+	// present per chain; either way the stream reaching SortIter/LimitIter
+	// and the consumers is unique-by-doc, and no per-query map is allocated
+	// for fully-scalar streams.
 	if len(idx.Info.FieldPaths) == 1 {
 		root = &CanonicalKeyDedupIter{
 			Source:       root,
@@ -1452,10 +1480,12 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 			Tx: params.Tx,
 			Ns: idx.Info.Ns,
 		},
-		IdxInfo:     idx.Info,
-		Bounds:      idx.Bounds, // may be nil for full index scan
-		Reverse:     reverse,
-		PointLookup: idx.PointLookup,
+		IdxInfo:      idx.Info,
+		Bounds:       idx.Bounds, // may be nil for full index scan
+		Reverse:      reverse,
+		PointLookup:  idx.PointLookup,
+		FullKeyBound: idx.PointLookup && idx.BoundFields == len(idx.Info.FieldNames),
+		ScalarProven: idx.ScalarProven,
 	}
 
 	// Insert IndexFilterIter when compound index fields cover filter conditions.
@@ -1466,6 +1496,13 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 			Source:  root,
 			Filters: coverFilters,
 		}
+	}
+
+	// Compound multikey dedup — see buildIndexSeekChain. Must sit ABOVE
+	// IndexFilterIter (per-entry cover verdicts differ across a doc's
+	// entries) and below the fetch.
+	if len(idx.Info.FieldPaths) > 1 {
+		root = &DocDedupIter{Source: root}
 	}
 
 	// Fetch documents by docId — share CursorSource between FetchIter and FilterIter
@@ -1489,9 +1526,8 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 	}
 
 	// Dedup wrap — see buildIndexSeekChain for rationale. Single-field gets
-	// the streaming canonical-key dedup; compound multi-key relies on
-	// consumer-side DocDedup via the multiKey flag flowing through the
-	// chain from IndexIter's per-entry value byte.
+	// the streaming canonical-key dedup here; compound multikey was already
+	// deduped by the DocDedupIter below the fetch.
 	if len(idx.Info.FieldPaths) == 1 {
 		root = &CanonicalKeyDedupIter{
 			Source:       root,
@@ -1563,6 +1599,8 @@ func setPlanRef(it Iterator, plan *Plan) {
 	case *CanonicalKeyDedupIter:
 		v.Plan = plan
 		setPlanRef(v.Source, plan)
+	case *DocDedupIter:
+		setPlanRef(v.Source, plan) // no Plan field: dedups by docId alone
 	case *VectorIter:
 		v.Plan = plan
 		// leaf — no upstream source

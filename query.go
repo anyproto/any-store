@@ -133,7 +133,7 @@ func (q *collQuery) reportCandidates(btx *btree.ReadTx, opts planOpts) []qplanne
 	}
 	idxs := q.c.loadIndexes()
 	br := q.buildBoundsResult(idxs)
-	return q.buildCBOIndexesInto(nil, &br, idxs, btx)
+	return q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
 }
 
 // planOpts are the only per-verb compilation knobs. Everything else about
@@ -288,7 +288,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 	sorter := q.writeSorter(opts)
 	idxs := q.c.loadIndexes()
 	br := q.buildBoundsResult(idxs)
-	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx)
+	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
 	totalDocs := q.docCountForPlan(btx, idxs)
 	if opts.exactTotalDocs {
 		totalDocs = q.docCountExact(btx, idxs)
@@ -1086,7 +1086,7 @@ func (q *collQuery) buildBoundsResult(idxs []*index) qplanner.BoundsResult {
 // ignores End; a stale ExactSort skips the SortIter). An unproven index keeps
 // the wide variant and carries the tight bounds in EstBounds for estimation
 // only. tx == nil (unit tests) means no proof — wide seeks.
-func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.BoundsResult, idxs []*index, tx *btree.ReadTx) []qplanner.CBOIndex {
+func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.BoundsResult, idxs []*index, tx *btree.ReadTx, countOnly bool) []qplanner.CBOIndex {
 	result := buf
 
 	var sortFields []query.SortField
@@ -1095,15 +1095,35 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 	}
 
 	for _, idx := range idxs {
+		// Lazy scalar-proof: at most one systemNS point Get per index per
+		// plan, and only when a consumer actually needs the answer. The
+		// result is memoized so the tight-bounds channel and CBOIndex flag
+		// can't disagree within one candidate.
+		proven, provenKnown := false, false
+		scalarProven := func() bool {
+			if !provenKnown {
+				provenKnown = true
+				proven = tx != nil && idx.isScalarProven(tx)
+			}
+			return proven
+		}
+
 		cboIdx := q.buildCBOIndex(idx, br, sortFields, false)
 		if br.TightDiffers(idx.cboInfo.FieldNames) {
-			if tx != nil && idx.isScalarProven(tx) {
+			if scalarProven() {
 				cboIdx = q.buildCBOIndex(idx, br, sortFields, true)
 			} else {
 				// Estimation-only tight bounds; seeks keep the wide Bounds.
 				cboIdx.EstBounds, _ = qplanner.ComputeIndexBoundsTight(idx.cboInfo, br)
 			}
 		}
+		// A covering Count on a compound index needs the proof to keep
+		// CountEntries' page-batch: a compound prefix bound over unproven
+		// data must dedup per entry (fan-out entries != docs).
+		if countOnly && len(idx.cboInfo.FieldPaths) > 1 {
+			scalarProven()
+		}
+		cboIdx.ScalarProven = proven
 		result = append(result, cboIdx)
 	}
 	return result
