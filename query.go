@@ -716,38 +716,21 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 	buf := q.c.db.syncPool.GetDocBuf()
 	defer q.c.db.syncPool.ReleaseDocBuf(buf)
 
-	idxs := q.c.loadIndexes()
-
 	err = q.c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		if aErr := q.c.alive(); aErr != nil {
 			return aErr
 		}
-		// Built inside the read tx so the multikey-flag probe sees the same
-		// snapshot the (hypothetical) scan would — Explain must report the
-		// bounds the real query would use.
-		br := q.buildBoundsResult(idxs)
-		cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, tx)
-
-		plan, isFts, ferr := q.ftsScanPlan(tx, buf)
-		if ferr != nil {
-			return ferr
-		}
-		if !isFts {
-			plan = qplanner.BuildPlan(&qplanner.PlanParams{
-				Tx:          tx,
-				DataNs:      q.c.ns,
-				Filter:      q.cond,
-				Sorter:      q.sort,
-				IDBounds:    qb.idBounds,
-				PrimaryKey:  q.c.primaryKey,
-				Limit:       int(q.limit),
-				Offset:      int(q.offset),
-				Buf:         buf,
-				TotalDocs:   q.docCountExact(tx, idxs),
-				Indexes:     cboIndexes,
-				IndexHints:  q.buildIndexHints(),
-				FieldBounds: &br,
-			})
+		// The shared compiler, in report mode: exact TotalDocs (a human reads
+		// it), and the CBO candidate list is returned even on the fts/vector
+		// paths so the index report never silently shrinks. Vector queries
+		// are honestly explained as their ANN plan now, exactly what Iter and
+		// the write verbs execute.
+		plan, cboIndexes, perr := q.compilePlan(tx, buf, qb.idBounds, planOpts{
+			exactTotalDocs: true,
+			wantCandidates: true,
+		})
+		if perr != nil {
+			return perr
 		}
 		explain.Sql = plan.String()
 		explain.Plan = plan.ExplainString()

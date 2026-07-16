@@ -12,7 +12,6 @@ import (
 	"github.com/anyproto/any-store/v2/internal/fts"
 	"github.com/anyproto/any-store/v2/internal/qplanner"
 	"github.com/anyproto/any-store/v2/query"
-	"github.com/anyproto/any-store/v2/syncpool"
 )
 
 // fulltext_search.go implements the read/query side: BM25 ranking over the
@@ -954,7 +953,7 @@ func (q *collQuery) detectFtsQuery() (*qplanner.FtsQuerySpec, query.Filter, erro
 	fx := fxs[0]
 	spec := &qplanner.FtsQuerySpec{
 		Ordered:    true, // searchCandidates returns score-descending
-		NeedScores: true, // cleared by ftsScanPlan for Count/Update/Delete
+		NeedScores: true, // compilePlan sets this from planOpts (Iter only)
 		Search: func(tx *btree.ReadTx) (qplanner.FtsCandidateStream, error) {
 			return fx.searchCandidates(tx, text)
 		},
@@ -962,32 +961,6 @@ func (q *collQuery) detectFtsQuery() (*qplanner.FtsQuerySpec, query.Filter, erro
 	return spec, ftsResidualFilter(q.cond), nil
 }
 
-// ftsScanPlan builds the docId-producing plan for the non-Iter operations
-// (Count/Update/Delete/Explain) when the query is a $text query, or returns
-// ok=false to let the caller take its normal CBO path. It keeps those operations
-// correct for $text (the BM25 source drives; the residual filter runs
-// downstream) instead of falling through to a match-everything full scan.
-func (q *collQuery) ftsScanPlan(btx *btree.ReadTx, buf *syncpool.DocBuffer) (plan *qplanner.Plan, ok bool, err error) {
-	spec, residual, derr := q.detectFtsQuery()
-	if derr != nil {
-		return nil, false, derr
-	}
-	if spec == nil {
-		return nil, false, nil
-	}
-	spec.NeedScores = false // Count/Update/Delete never read Score()
-	plan = qplanner.BuildPlan(&qplanner.PlanParams{
-		Tx:     btx,
-		DataNs: q.c.ns,
-		Filter: residual,
-		Sorter: ftsSorter(q.sort),
-		Limit:  int(q.limit),
-		Offset: int(q.offset),
-		Buf:    buf,
-		Fts:    spec,
-	})
-	return plan, true, nil
-}
 
 // ftsSorter maps the query's sort to the planner's sorter for a $text query:
 // the default (nil) and the relevance projection {$meta:"textScore"} both yield
