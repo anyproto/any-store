@@ -337,6 +337,11 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 			Tx:          btx,
 			DataNs:      q.c.ns,
 			Filter:      q.cond,
+			// The sorter decides WHICH documents a Limit/Offset window selects,
+			// so a bounded write must plan with it exactly like the equivalent
+			// read — otherwise the window slices an unordered stream and the
+			// wrong documents are written.
+			Sorter:      q.sort,
 			IDBounds:    qb.idBounds,
 			PrimaryKey:  q.c.primaryKey,
 			Limit:       int(q.limit),
@@ -522,6 +527,11 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 			Tx:          btx,
 			DataNs:      q.c.ns,
 			Filter:      q.cond,
+			// The sorter decides WHICH documents a Limit/Offset window selects,
+			// so a bounded write must plan with it exactly like the equivalent
+			// read — otherwise the window slices an unordered stream and the
+			// wrong documents are written.
+			Sorter:      q.sort,
 			IDBounds:    qb.idBounds,
 			PrimaryKey:  q.c.primaryKey,
 			Limit:       int(q.limit),
