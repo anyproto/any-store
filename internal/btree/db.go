@@ -366,6 +366,11 @@ type DB struct {
 	// the auto-checkpoint path otherwise swallows. Reads/writes are
 	// atomic via atomic.Value. Nil means "no error seen since open".
 	lastAutoCheckpointErr atomic.Value
+
+	// lastWriterUnwindErr records a failure of the writer panic-unwind
+	// cleanup itself (see LastWriterUnwindError). Same wrapping as
+	// lastAutoCheckpointErr.
+	lastWriterUnwindErr atomic.Value
 }
 
 // autoCheckpointResult wraps the result of an auto-checkpoint attempt
@@ -385,6 +390,68 @@ func (db *DB) LastAutoCheckpointError() error {
 	}
 	r, _ := v.(autoCheckpointResult)
 	return r.err
+}
+
+// LastWriterUnwindError returns the error recorded when a writer's
+// panic-unwind cleanup (pager.unwindWriter, run while a Commit/Rollback panic
+// propagates) itself failed, or nil. A non-nil value means the WAL writer
+// state may not have been fully released — treat the database handle as
+// unhealthy and restart. It is a monitoring surface, like
+// LastAutoCheckpointError: the original panic already propagated to the
+// caller and must not be masked by the secondary failure.
+func (db *DB) LastWriterUnwindError() error {
+	v := db.lastWriterUnwindErr.Load()
+	if v == nil {
+		return nil
+	}
+	r, _ := v.(autoCheckpointResult)
+	return r.err
+}
+
+// releaseWriterLocks is THE writer-lock teardown, shared by Commit, Rollback
+// and Close: exactly once per write transaction (the writerLocksDone CAS —
+// Close may race a finishing writer), it runs pre (the panic-unwind discard,
+// may be nil), releases the writer's WAL read slot, runs post (the
+// auto-checkpoint, may be nil), and releases db.mu.RLock + db.writeMu.
+//
+// The mutex releases are DEFERRED: once the CAS is consumed, Close's rescue
+// path can never fire again, so a panic in pre/endRead/post re-leaking the
+// locks would be permanent — the exact bug class this function exists to end.
+// A panic there now propagates with the mutexes released. Reports whether
+// this call won the CAS.
+func (db *DB) releaseWriterLocks(pager *pager, slot int, pre, post func()) bool {
+	if !db.writerLocksDone.CompareAndSwap(false, true) {
+		return false
+	}
+	defer db.writeMu.Unlock()
+	defer db.mu.RUnlock()
+	if pre != nil {
+		pre()
+	}
+	pager.endRead(slot)
+	if post != nil {
+		post()
+	}
+	return true
+}
+
+// writerUnwind returns the panic-unwind discard step for releaseWriterLocks:
+// pager.unwindWriter behind a shield. The shield does NOT swallow silently —
+// a secondary failure here means the WAL write lock may still be held
+// (blocking every future writer in every process), so it is recorded for
+// monitoring (LastWriterUnwindError) while the ORIGINAL panic, which the
+// caller is unwinding with, stays the one that propagates.
+func (db *DB) writerUnwind(pager *pager) func() {
+	return func() {
+		defer func() {
+			if r := recover(); r != nil {
+				db.lastWriterUnwindErr.Store(autoCheckpointResult{
+					err: fmt.Errorf("btree: writer panic-unwind cleanup failed (WAL writer state may be leaked): %v", r),
+				})
+			}
+		}()
+		pager.unwindWriter()
+	}
 }
 
 // Open opens or creates a database at the given path.
@@ -628,14 +695,11 @@ func (db *DB) Close() error {
 		}
 		db.pager.writerOpMu.Unlock()
 
-		// Use CAS to ensure the writer lock cleanup (endRead + RUnlock +
-		// Unlock) happens exactly once. Without this, the writer goroutine
-		// completing concurrently could race with Close and double-release.
-		if db.writerLocksDone.CompareAndSwap(false, true) {
-			db.pager.endRead(db.pager.writerWalSlot)
-			db.mu.RUnlock()
-			db.writeMu.Unlock()
-		}
+		// Exactly-once writer lock cleanup (endRead + RUnlock + Unlock) via
+		// the shared teardown: a writer goroutine completing concurrently
+		// could race with Close, and the writerLocksDone CAS inside
+		// releaseWriterLocks prevents the double-release.
+		db.releaseWriterLocks(db.pager, db.pager.writerWalSlot, nil, nil)
 		db.writeMu.Lock()
 	}
 	db.writeMu.Unlock()
@@ -1975,38 +2039,31 @@ func (tx *WriteTx) Commit() error {
 		needCheckpoint bool
 		completed      bool
 	)
-	// Use CAS to ensure writer lock cleanup happens exactly once.
-	// Close() may race with Commit, so both use writerLocksDone to coordinate.
 	defer func() {
-		if db.writerLocksDone.CompareAndSwap(false, true) {
-			if !completed {
-				// Unwinding from a panic inside pager.commit: discard the
-				// writer state (dirty cache, un-committed WAL frames) so the
-				// locks we are about to release don't hand the next writer a
-				// half-committed pager. rollback is a guarded, discard-only
-				// reset (writerOpMu was released by pager.commit's own defer
-				// during the unwind); shielded so a secondary failure cannot
-				// mask the original panic.
-				func() {
-					defer func() { _ = recover() }()
-					_ = pager.rollback()
-				}()
-			}
-			pager.endRead(slot)
-
-			// Auto-checkpoint before releasing db.mu.RLock to avoid deadlock with Close().
-			// Checkpoint does NOT block readers — it only blocks new writers.
-			// Errors are stored on db.lastAutoCheckpointErr instead of silently
-			// discarded so monitoring code can observe them via
-			// LastAutoCheckpointError(). Never runs on the panic path:
-			// needCheckpoint is still false while unwinding.
-			if err == nil && needCheckpoint && completed {
+		// Unwinding from a panic inside pager.commit: pager.unwindWriter
+		// discards the writer state so the locks about to be released don't
+		// hand the next writer a half-committed pager — WITHOUT ever rewinding
+		// a commit that was already published (that would silently destroy
+		// durable data; see unwindWriter). writerOpMu was released by
+		// pager.commit's own defer during the unwind.
+		var pre func()
+		if !completed {
+			pre = db.writerUnwind(pager)
+		}
+		// Auto-checkpoint before releasing db.mu.RLock to avoid deadlock with
+		// Close(). Checkpoint does NOT block readers — it only blocks new
+		// writers. Errors are stored on db.lastAutoCheckpointErr instead of
+		// silently discarded so monitoring code can observe them via
+		// LastAutoCheckpointError(). Never runs on the panic path:
+		// needCheckpoint is still false while unwinding.
+		var post func()
+		if err == nil && needCheckpoint {
+			post = func() {
 				cpErr := pager.tryCheckpoint()
 				db.lastAutoCheckpointErr.Store(autoCheckpointResult{err: cpErr})
 			}
-			db.mu.RUnlock()
-			db.writeMu.Unlock()
 		}
+		db.releaseWriterLocks(pager, slot, pre, post)
 	}()
 	if testWriterFinishHook != nil {
 		testWriterFinishHook()
@@ -2039,25 +2096,16 @@ func (tx *WriteTx) Rollback() error {
 	tx.closed = true
 	db, pager, slot := tx.db, tx.pager, tx.walSlot
 	var completed bool
-	// Use CAS to ensure writer lock cleanup happens exactly once.
-	// Close() may race with Rollback, so both use writerLocksDone to coordinate.
 	defer func() {
-		if db.writerLocksDone.CompareAndSwap(false, true) {
-			if !completed {
-				// Unwinding from a panic: retry the discard — pager.rollback
-				// also owns releasing the WAL writer state, without which the
-				// next BeginWrite blocks on the WAL write lock forever even
-				// with the Go mutexes released. Guarded and idempotent
-				// (rollbackLocked no-ops outside pagerWriter/pagerError).
-				func() {
-					defer func() { _ = recover() }()
-					_ = pager.rollback()
-				}()
-			}
-			pager.endRead(slot)
-			db.mu.RUnlock()
-			db.writeMu.Unlock()
+		// Unwinding from a panic inside pager.rollback: retry the discard —
+		// the pager also owns releasing the WAL writer state, without which
+		// the next BeginWrite blocks on the WAL write lock forever even with
+		// the Go mutexes released.
+		var pre func()
+		if !completed {
+			pre = db.writerUnwind(pager)
 		}
+		db.releaseWriterLocks(pager, slot, pre, nil)
 	}()
 	if testWriterFinishHook != nil {
 		testWriterFinishHook()
