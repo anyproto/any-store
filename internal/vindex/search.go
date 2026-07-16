@@ -1,7 +1,10 @@
 package vindex
 
 import (
+	"bytes"
+	"cmp"
 	"fmt"
+	"slices"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 )
@@ -13,10 +16,13 @@ type Candidate struct {
 }
 
 // SearchCandidates runs the ANN beam search and returns up to ef live
-// candidates with their distances. Unlike Search it does NOT rank/truncate to k
-// — the query pipeline's sort+limit own the final ordering ("drop heap"). The
-// returned order is whatever the layer search produced (closest-first); callers
-// must not rely on it.
+// candidates with their distances, in (distance, docId) ascending order — a
+// TOTAL order, so identical queries on identical snapshots return identical
+// sequences (query verb coherence). Membership of the ef-cut is likewise
+// deterministic: the beam admits at the boundary by (dist, label), so the
+// result is the unique (dist,label)-smallest ef of the visited set. Unlike
+// Search it does NOT rank/truncate to k — the query pipeline's k-cut/sort/limit
+// own the final windowing.
 func (ix *Index) SearchCandidates(rtx *btree.ReadTx, query []float32, ef int) ([]Candidate, error) {
 	if len(query) != ix.dim {
 		return nil, fmt.Errorf("vindex: dim mismatch: got %d want %d", len(query), ix.dim)
@@ -85,6 +91,16 @@ func (ix *Index) SearchCandidates(rtx *btree.ReadTx, query []float32, ef int) ([
 		}
 		out = append(out, Candidate{DocID: append([]byte(nil), docID...), Distance: c.dist})
 	}
+	// found arrives (dist, label)-ascending from the beam; re-sort ties by docId
+	// so the returned sequence is the (distance, docId) total order the query
+	// layer's TotallyOrdered contract promises (labels are insertion-ordered,
+	// docIds are not — the two tie orders differ).
+	slices.SortFunc(out, func(a, b Candidate) int {
+		if a.Distance != b.Distance {
+			return cmp.Compare(a.Distance, b.Distance)
+		}
+		return bytes.Compare(a.DocID, b.DocID)
+	})
 	return out, nil
 }
 
@@ -548,7 +564,12 @@ func (s *searcher) searchLayer(ep uint32, ef int, layer int32) ([]candidate, err
 			if err != nil {
 				return nil, err
 			}
-			if s.res.len() >= ef && d >= s.res.peek().dist {
+			// Admission at the ef boundary is (dist, label)-lexicographic, not
+			// distance-only: on an exact-distance tie with the current worst
+			// result, the smaller label wins. This makes the result MEMBERSHIP
+			// the unique (dist,label)-smallest ef of the visited set, instead of
+			// an arbitrary tie subset dependent on traversal order.
+			if s.res.len() >= ef && !candLess(candidate{d, nb}, s.res.peek()) {
 				continue
 			}
 			s.cand.push(candidate{d, nb})

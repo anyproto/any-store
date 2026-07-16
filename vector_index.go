@@ -619,14 +619,14 @@ func (q *collQuery) detectVectorQuery() (*qplanner.VectorQuerySpec, query.Filter
 		// IVF-PQ: probe a few cells (contiguous range scans), re-rank by exact
 		// distance. ef is the re-rank depth / candidate count, sized to the page
 		// window; nprobe is fixed in the index. SearchCandidates returns them
-		// closest-first (Ordered) — measurably faster than letting SortIter sort, as
+		// (distance, docId) ascending (TotallyOrdered) — measurably faster than letting SortIter sort, as
 		// the planner then skips the SortIter for the default distance order and
 		// streams straight to LimitIter; an explicit multi-key Sort still uses SortIter.
 		ef := chooseEf(int(q.vectorEf), captured.ivf.NProbe()*8, int(q.limit)+int(q.offset), residual != nil)
 		spec := &qplanner.VectorQuerySpec{
 			Query:   qvec,
 			Ef:      ef,
-			Ordered: true,
+			TotallyOrdered: true,
 			Search: func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
 				cands, err := captured.ivf.SearchCandidates(tx, qv, ef)
 				if err != nil {
@@ -653,7 +653,7 @@ func (q *collQuery) detectVectorQuery() (*qplanner.VectorQuerySpec, query.Filter
 		}
 		spec := &qplanner.VectorQuerySpec{
 			Query:   qvec,
-			Ordered: true, // bruteVectorCandidates returns distance-ascending
+			TotallyOrdered: true, // bruteVectorCandidates returns (distance, docId) ascending
 			Search: func(tx *btree.ReadTx, qv []float32, _ int) ([]qplanner.VectorCandidate, error) {
 				return q.c.bruteVectorCandidates(tx, captured, qv, topK)
 			},
@@ -668,7 +668,7 @@ func (q *collQuery) detectVectorQuery() (*qplanner.VectorQuerySpec, query.Filter
 	spec := &qplanner.VectorQuerySpec{
 		Query:   qvec,
 		Ef:      ef,
-		Ordered: true, // SearchCandidates yields candidates closest-first
+		TotallyOrdered: true, // SearchCandidates yields (distance, docId) ascending
 		Search: func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
 			cands, err := captured.ix.SearchCandidates(tx, qv, ef)
 			if err != nil {

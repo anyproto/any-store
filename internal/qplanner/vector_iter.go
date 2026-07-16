@@ -31,11 +31,14 @@ type VectorQuerySpec struct {
 	Query  []float32
 	Ef     int
 	Search VectorSearchFunc
-	// Ordered is true when Search returns candidates already sorted closest-first
-	// (the ANN path). The planner can then skip the SortIter for the default
-	// distance-ascending order. Brute-force search leaves it false (its candidates
-	// come back in document order), so a distance SortIter is always applied.
-	Ordered bool
+	// TotallyOrdered is true when Search returns candidates in (distance, docId)
+	// ascending order — a TOTAL order, ties included. All three backends (HNSW,
+	// IVF, brute-force) enforce it at the source; the planner then skips the
+	// SortIter for the default distance order and streams straight through. It
+	// must be total, not merely closest-first: the k-cut and pagination windows
+	// slice this sequence, so an under-specified tie order would make different
+	// verbs page different documents.
+	TotallyOrdered bool
 }
 
 // VectorIter is the source iterator for a vector query. On first Next it runs

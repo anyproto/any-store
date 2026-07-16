@@ -231,15 +231,10 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 		if opts.forWrite && q.limit == 0 {
 			return nil, nil, ErrVectorWriteWithoutLimit
 		}
+		// No default distance SortIter: every ANN source is TotallyOrdered —
+		// it streams (distance, docId) ascending at the source — so with no
+		// explicit sort the planner streams candidates straight to LimitIter.
 		sorter := q.writeSorter(opts)
-		if sorter == nil && !opts.countOnly && !vspec.Ordered {
-			// No explicit sort and the source isn't already distance-ordered
-			// (brute-force): order by distance ascending. When the ANN source
-			// is ordered, we leave sorter nil so the planner skips a redundant
-			// SortIter and streams the already-closest-first candidates
-			// straight to LimitIter.
-			sorter, _ = query.ParseSort(qplanner.DistanceField)
-		}
 		plan = qplanner.BuildPlan(&qplanner.PlanParams{
 			Tx:        btx,
 			DataNs:    q.c.ns,

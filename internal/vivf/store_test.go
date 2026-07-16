@@ -1,6 +1,7 @@
 package vivf
 
 import (
+	"bytes"
 	"encoding/binary"
 	"math/rand"
 	"path/filepath"
@@ -376,4 +377,94 @@ func TestStoreIVFPQRecallReal(t *testing.T) {
 	r := sum / float64(len(queries))
 	t.Logf("btree-resident IVF-PQ recall@%d = %.4f (nlist=256 M=96 assign=4 nprobe=16 ef=%d) — HNSW=0.970", k, r, ef)
 	require.GreaterOrEqual(t, r, 0.95, "btree IVF-PQ must preserve prototype recall")
+}
+
+// TestStoreEfCutIsDeterministic pins the (dist, label) tie-break on the ef-cut
+// and the (distance, docId) total order of the output.
+//
+// The hazard: dedup.collect walks the pooled searcher's open-addressed table in
+// SLOT order, so the permutation handed to the quickselect is a function of the
+// table's SIZE — i.e. of the searcher's history, not of the query. With a
+// distance-only cut, an exact-distance tie group straddling the ef boundary has
+// its membership chosen arbitrarily per searcher: a cold (1024-slot) and a
+// pre-grown (16384-slot) searcher select different candidates for the same
+// query on the same snapshot, and Rows(Q) is not well-defined across verbs.
+// The (dist, label) tie-break makes cs[:ef] the unique smallest ef.
+func TestStoreEfCutIsDeterministic(t *testing.T) {
+	const (
+		n   = 300
+		dim = 32
+		ef  = 20
+	)
+	// 10 docs near the query at distinct distances + 290 byte-identical docs
+	// (identical vectors ⇒ identical PQ codes ⇒ exact ADC ties). ef=20 needs
+	// 10 of the 290 ties: the cut lands inside the tie group.
+	query := make([]float32, dim)
+	for d := range query {
+		query[d] = float32(d) / dim
+	}
+	tie := make([]float32, dim)
+	for d := range tie {
+		tie[d] = query[d] + 0.5
+	}
+	vecs := make([][]float32, n)
+	for i := 0; i < 10; i++ {
+		v := make([]float32, dim)
+		for d := range v {
+			v[d] = query[d] + float32(i+1)*0.01
+		}
+		vecs[i] = v
+	}
+	for i := 10; i < n; i++ {
+		vecs[i] = tie
+	}
+	db := openMem(t)
+	p := StoreParams{Dim: dim, NList: 4, M: 8, Assign: 1, NProbe: 4, Seed: 1}
+	buildStore(t, db, p, vecs)
+
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rtx.Rollback()) }()
+
+	search := func(ix *StoreIndex) []Candidate {
+		out, serr := ix.SearchCandidates(rtx, query, ef)
+		require.NoError(t, serr)
+		require.Len(t, out, ef)
+		return out
+	}
+
+	// Cold: a fresh StoreIndex, so its pooled searcher starts at the initial
+	// 1024-slot dedup table.
+	ixCold, err := OpenTx(rtx, "ivf")
+	require.NoError(t, err)
+	cold := search(ixCold)
+
+	// Warm: a fresh StoreIndex whose pooled searcher is deliberately pre-grown
+	// past 8192 slots (as a label-heavy earlier query would leave it), changing
+	// the slot-order permutation dedup.collect emits.
+	ixWarm, err := OpenTx(rtx, "ivf")
+	require.NoError(t, err)
+	s := ixWarm.getSearcher()
+	s.dedup.reset()
+	for i := uint32(0); i < 8192; i++ {
+		s.dedup.putMin(i, 0)
+	}
+	require.GreaterOrEqual(t, len(s.dedup.key), 8192, "pre-grow must actually grow the table")
+	ixWarm.putSearcher(s)
+	warm := search(ixWarm)
+
+	for i := range cold {
+		require.Equal(t, cold[i].DocID, warm[i].DocID,
+			"ef-cut membership/order diverged at rank %d between cold and pre-grown searchers", i)
+		require.Equal(t, cold[i].Distance, warm[i].Distance)
+	}
+	// The output is the (distance, docId) TOTAL order — ties broken by docId.
+	for i := 1; i < len(cold); i++ {
+		if cold[i-1].Distance == cold[i].Distance {
+			require.Negative(t, bytes.Compare(cold[i-1].DocID, cold[i].DocID),
+				"exact-distance ties must be docId-ascending")
+		} else {
+			require.Less(t, cold[i-1].Distance, cold[i].Distance)
+		}
+	}
 }

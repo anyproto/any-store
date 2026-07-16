@@ -791,22 +791,40 @@ func (ix *StoreIndex) SearchCandidates(rtx *btree.ReadTx, q []float32, ef int) (
 		s.docOff = append(s.docOff, [2]int{start, len(backing)})
 		out = append(out, Candidate{Distance: dist})
 	}
-	// backing is final now — slice docIDs out of it, then sort closest-first. Sorting
-	// the ~ef re-ranked survivors here (and marking the spec Ordered) is measurably
-	// cheaper than returning them unordered and letting the pipeline's SortIter
-	// collect+heap+fetch: with Ordered set the planner skips the SortIter for the
-	// default distance order and streams straight to LimitIter (~19% faster end to
-	// end). An explicit multi-key Sort still goes through SortIter regardless.
+	// backing is final now — slice docIDs out of it, then sort (distance, docId)
+	// ascending. Sorting the ~ef re-ranked survivors here (and marking the spec
+	// TotallyOrdered) is measurably cheaper than returning them unordered and
+	// letting the pipeline's SortIter collect+heap+fetch: the planner skips the
+	// SortIter for the default distance order and streams straight to LimitIter
+	// (~19% faster end to end). An explicit multi-key Sort still goes through
+	// SortIter regardless. The docId tie-break makes the output a TOTAL order, so
+	// every verb pages the same sequence through identical ties.
 	for i := range out {
 		out[i].DocID = backing[s.docOff[i][0]:s.docOff[i][1]]
 	}
-	slices.SortFunc(out, func(a, b Candidate) int { return cmpF32(a.Distance, b.Distance) })
+	slices.SortFunc(out, func(a, b Candidate) int {
+		if c := cmpF32(a.Distance, b.Distance); c != 0 {
+			return c
+		}
+		return bytes.Compare(a.DocID, b.DocID)
+	})
 	return out, nil
 }
 
-// selectSmallest partitions cs in place so the k smallest by dist occupy cs[:k]
-// (in arbitrary order). Quickselect (Hoare partition, median-of-three pivot),
-// O(n) average — used instead of a full sort when only the ef best are needed.
+// candLess orders candidates by (dist, label). The label tie-break is what makes
+// the ef-cut deterministic: s.cands arrives from dedup.collect in SLOT order — a
+// function of the pooled searcher's table size, i.e. of its history — so a
+// distance-only cut selects an arbitrary subset of an exact-tie group straddling
+// the boundary, and two verbs of the same query can rank different candidate
+// sets. With the tie-break, cs[:ef] is the unique (dist,label)-smallest ef.
+func candLess(a, b cand) bool {
+	return a.dist < b.dist || (a.dist == b.dist && a.label < b.label)
+}
+
+// selectSmallest partitions cs in place so the k smallest by (dist, label)
+// occupy cs[:k] (in arbitrary order). Quickselect (Hoare partition,
+// median-of-three pivot), O(n) average — used instead of a full sort when only
+// the ef best are needed.
 func selectSmallest(cs []cand, k int) {
 	lo, hi := 0, len(cs)-1
 	for lo < hi {
@@ -822,25 +840,25 @@ func selectSmallest(cs []cand, k int) {
 	}
 }
 
-// partitionDist partitions cs[lo:hi+1] around a median-of-three pivot by dist,
-// returning the final pivot index.
+// partitionDist partitions cs[lo:hi+1] around a median-of-three pivot by
+// (dist, label), returning the final pivot index.
 func partitionDist(cs []cand, lo, hi int) int {
 	mid := lo + (hi-lo)/2
 	// median-of-three (lo, mid, hi) → move median to hi-1 as pivot
-	if cs[mid].dist < cs[lo].dist {
+	if candLess(cs[mid], cs[lo]) {
 		cs[lo], cs[mid] = cs[mid], cs[lo]
 	}
-	if cs[hi].dist < cs[lo].dist {
+	if candLess(cs[hi], cs[lo]) {
 		cs[lo], cs[hi] = cs[hi], cs[lo]
 	}
-	if cs[hi].dist < cs[mid].dist {
+	if candLess(cs[hi], cs[mid]) {
 		cs[mid], cs[hi] = cs[hi], cs[mid]
 	}
-	pivot := cs[mid].dist
+	pivot := cs[mid]
 	cs[mid], cs[hi-1] = cs[hi-1], cs[mid]
 	i := lo
 	for j := lo; j < hi-1; j++ {
-		if cs[j].dist < pivot {
+		if candLess(cs[j], pivot) {
 			cs[i], cs[j] = cs[j], cs[i]
 			i++
 		}

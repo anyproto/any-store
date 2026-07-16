@@ -6,9 +6,18 @@ type candidate struct {
 	label uint32
 }
 
-// cheap is a binary heap of candidates; min-heap (closest at root) when max is
-// false, max-heap (farthest at root) when true. Backing slice is reused across
-// the search via the searcher.
+// candLess orders candidates by (dist, label). The label tie-break makes the
+// beam's ef-cut membership deterministic among exact-distance ties (the result
+// set becomes the unique (dist,label)-smallest ef of the visited nodes) — a
+// requirement of query verb coherence, where every verb must rank the same
+// candidate set.
+func candLess(a, b candidate) bool {
+	return a.dist < b.dist || (a.dist == b.dist && a.label < b.label)
+}
+
+// cheap is a binary heap of candidates ordered by (dist, label); min-heap
+// (closest at root) when max is false, max-heap (farthest at root) when true.
+// Backing slice is reused across the search via the searcher.
 type cheap struct {
 	s   []candidate
 	max bool
@@ -23,9 +32,9 @@ func (h *cheap) len() int { return len(h.s) }
 
 func (h *cheap) less(i, j int) bool {
 	if h.max {
-		return h.s[i].dist > h.s[j].dist
+		return candLess(h.s[j], h.s[i])
 	}
-	return h.s[i].dist < h.s[j].dist
+	return candLess(h.s[i], h.s[j])
 }
 
 func (h *cheap) push(c candidate) {
