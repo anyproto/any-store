@@ -1945,59 +1945,127 @@ func (tx *WriteTx) Delete(ns *Namespace, key []byte) error {
 // an automatic passive checkpoint is triggered.
 var AutoCheckpointThreshold = 10000
 
+// testWriterFinishHook, when non-nil, runs inside Commit/Rollback after the
+// closed flag is set and before the pager operation — the exact spot where a
+// pager panic used to leak the writer locks. Test-only.
+var testWriterFinishHook func()
+
 // Commit commits the transaction, writing all changes to the WAL.
+//
+// Lock ownership is NOT tied to the operation's success (the SQLite shape:
+// lock lifetime is structural, never conditional on outcome). The writer-lock
+// release lives in a defer, so a panic inside pager.commit — btree code can
+// panic on corrupt pages — propagates with no locks held. Without this, the
+// panic skipped the release, a later Rollback saw closed=true and returned
+// ErrTxClosed without releasing either lock, and every subsequent WriteTx()
+// and Close() deadlocked permanently; no caller-side recover could help,
+// because the anystore layer has already consumed its version CAS and pooled
+// its wrapper by commit time.
 func (tx *WriteTx) Commit() error {
 	if tx.closed {
 		return ErrTxClosed
 	}
 	tx.closed = true
-	nFrame, newFCC, newSC, err := tx.pager.commit(tx.dataChanged, tx.schemaChanged)
-	if err == nil {
-		tx.db.localFileChangeCounter.Store(newFCC)
-		tx.db.localSchemaCookie.Store(newSC)
-		// Increment dataVersion so persistent reader caches detect staleness.
-		// Unlike walMaxFrame, this counter never wraps after checkpoint restart.
-		tx.db.dataVersion.Add(1)
-	}
-	threshold := tx.db.opts.AutoCheckpointAfter
-	needCheckpoint := threshold > 0 && int(nFrame) >= threshold
+	// Captured for the defer: on the normal path tx is returned to the pool
+	// before the defer runs (safe — the pool is only drained under writeMu,
+	// still held here — but the defer must not reach through a pooled tx).
+	db, pager, slot := tx.db, tx.pager, tx.walSlot
+	var (
+		err            error
+		needCheckpoint bool
+		completed      bool
+	)
 	// Use CAS to ensure writer lock cleanup happens exactly once.
 	// Close() may race with Commit, so both use writerLocksDone to coordinate.
-	db := tx.db
-	if db.writerLocksDone.CompareAndSwap(false, true) {
-		tx.pager.endRead(tx.walSlot)
+	defer func() {
+		if db.writerLocksDone.CompareAndSwap(false, true) {
+			if !completed {
+				// Unwinding from a panic inside pager.commit: discard the
+				// writer state (dirty cache, un-committed WAL frames) so the
+				// locks we are about to release don't hand the next writer a
+				// half-committed pager. rollback is a guarded, discard-only
+				// reset (writerOpMu was released by pager.commit's own defer
+				// during the unwind); shielded so a secondary failure cannot
+				// mask the original panic.
+				func() {
+					defer func() { _ = recover() }()
+					_ = pager.rollback()
+				}()
+			}
+			pager.endRead(slot)
 
-		// Auto-checkpoint before releasing db.mu.RLock to avoid deadlock with Close().
-		// Checkpoint does NOT block readers — it only blocks new writers.
-		// Errors are stored on db.lastAutoCheckpointErr instead of silently
-		// discarded so monitoring code can observe them via
-		// LastAutoCheckpointError().
-		if err == nil && needCheckpoint {
-			cpErr := tx.pager.tryCheckpoint()
-			db.lastAutoCheckpointErr.Store(autoCheckpointResult{err: cpErr})
+			// Auto-checkpoint before releasing db.mu.RLock to avoid deadlock with Close().
+			// Checkpoint does NOT block readers — it only blocks new writers.
+			// Errors are stored on db.lastAutoCheckpointErr instead of silently
+			// discarded so monitoring code can observe them via
+			// LastAutoCheckpointError(). Never runs on the panic path:
+			// needCheckpoint is still false while unwinding.
+			if err == nil && needCheckpoint && completed {
+				cpErr := pager.tryCheckpoint()
+				db.lastAutoCheckpointErr.Store(autoCheckpointResult{err: cpErr})
+			}
+			db.mu.RUnlock()
+			db.writeMu.Unlock()
 		}
-		db.mu.RUnlock()
-		db.writeMu.Unlock()
+	}()
+	if testWriterFinishHook != nil {
+		testWriterFinishHook()
 	}
+	var nFrame, newFCC, newSC uint32
+	nFrame, newFCC, newSC, err = pager.commit(tx.dataChanged, tx.schemaChanged)
+	completed = true
+	if err == nil {
+		db.localFileChangeCounter.Store(newFCC)
+		db.localSchemaCookie.Store(newSC)
+		// Increment dataVersion so persistent reader caches detect staleness.
+		// Unlike walMaxFrame, this counter never wraps after checkpoint restart.
+		db.dataVersion.Add(1)
+	}
+	threshold := db.opts.AutoCheckpointAfter
+	needCheckpoint = threshold > 0 && int(nFrame) >= threshold
+	// Not on the panic path: a tx that panicked mid-commit is dropped, never
+	// pooled — its internal state is undefined.
 	db.putWriteTx(tx)
 	return err
 }
 
-// Rollback discards all changes in the transaction.
+// Rollback discards all changes in the transaction. The writer-lock release
+// lives in a defer for the same reason as Commit's: a panic inside
+// pager.rollback must not leak the locks.
 func (tx *WriteTx) Rollback() error {
 	if tx.closed {
 		return ErrTxClosed
 	}
 	tx.closed = true
-	err := tx.pager.rollback()
+	db, pager, slot := tx.db, tx.pager, tx.walSlot
+	var completed bool
 	// Use CAS to ensure writer lock cleanup happens exactly once.
 	// Close() may race with Rollback, so both use writerLocksDone to coordinate.
-	db := tx.db
-	if db.writerLocksDone.CompareAndSwap(false, true) {
-		tx.pager.endRead(tx.walSlot)
-		db.mu.RUnlock()
-		db.writeMu.Unlock()
+	defer func() {
+		if db.writerLocksDone.CompareAndSwap(false, true) {
+			if !completed {
+				// Unwinding from a panic: retry the discard — pager.rollback
+				// also owns releasing the WAL writer state, without which the
+				// next BeginWrite blocks on the WAL write lock forever even
+				// with the Go mutexes released. Guarded and idempotent
+				// (rollbackLocked no-ops outside pagerWriter/pagerError).
+				func() {
+					defer func() { _ = recover() }()
+					_ = pager.rollback()
+				}()
+			}
+			pager.endRead(slot)
+			db.mu.RUnlock()
+			db.writeMu.Unlock()
+		}
+	}()
+	if testWriterFinishHook != nil {
+		testWriterFinishHook()
 	}
+	err := pager.rollback()
+	completed = true
+	// Not on the panic path: a tx that panicked mid-rollback is dropped,
+	// never pooled.
 	db.putWriteTx(tx)
 	return err
 }
