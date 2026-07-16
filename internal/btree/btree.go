@@ -935,6 +935,79 @@ func leafFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFrame 
 	return fullKey, nil
 }
 
+// leafFullValue reads the full value from a leaf cell, reading overflow pages
+// if the value spills. Returns a slice into the page buffer when the value is
+// fully local, or an allocated copy when it extends into the overflow chain.
+// Matches SQLite's accessPayload() (btree.c:5121), which reassembles local +
+// overflow transparently for every payload read.
+func leafFullValue(data []byte, offset int, usableSize int, p *pager, walMaxFrame uint32, cache *pcache) ([]byte, error) {
+	dataLen := len(data)
+	if offset >= dataLen {
+		return nil, ErrCorrupt
+	}
+	keyLen, n, err := getVarintSafe(data[offset:])
+	if err != nil {
+		return nil, ErrCorrupt
+	}
+	pos := offset + n
+	if pos >= dataLen {
+		return nil, ErrCorrupt
+	}
+	valLen, n, err := getVarintSafe(data[pos:])
+	if err != nil {
+		return nil, ErrCorrupt
+	}
+	pos += n
+
+	if int(keyLen) < 0 || int(keyLen) > maxPayloadAlloc {
+		return nil, ErrCorrupt
+	}
+	if int(valLen) < 0 || int(valLen) > maxPayloadAlloc {
+		return nil, ErrCorrupt
+	}
+
+	totalPayload := int(keyLen) + int(valLen)
+	if totalPayload < 0 || totalPayload > maxPayloadAlloc {
+		return nil, ErrCorrupt
+	}
+	maxLocal := maxLocalPayload(usableSize)
+
+	if totalPayload <= maxLocal {
+		// No overflow: value is fully on-page, right after the key
+		if pos+totalPayload > dataLen {
+			return nil, ErrCorrupt
+		}
+		return data[pos+int(keyLen) : pos+totalPayload], nil
+	}
+
+	// Overflow cell
+	nLocal := localPayloadSize(totalPayload, usableSize)
+	localKeyBytes := min(nLocal, int(keyLen))
+	localValBytes := nLocal - localKeyBytes
+	keyOverflow := int(keyLen) - localKeyBytes
+	valOverflow := int(valLen) - localValBytes
+
+	if pos+nLocal+4 > dataLen {
+		return nil, ErrCorrupt
+	}
+	if valOverflow == 0 {
+		// Value fits fully in the local portion (only the key overflows)
+		return data[pos+localKeyBytes : pos+localKeyBytes+int(valLen)], nil
+	}
+
+	fullVal := make([]byte, int(valLen))
+	copy(fullVal, data[pos+localKeyBytes:pos+nLocal])
+	overflowPg := binary.BigEndian.Uint32(data[pos+nLocal : pos+nLocal+4])
+
+	// Read the value remainder from the overflow chain, skipping the key
+	// remainder that precedes it.
+	if err := p.readOverflowAt(overflowPg, keyOverflow, valOverflow,
+		fullVal[localValBytes:], walMaxFrame, cache); err != nil {
+		return nil, err
+	}
+	return fullVal, nil
+}
+
 // interiorFullKey reads the full key from an interior cell, handling overflow.
 // cache controls overflow page reads: non-nil uses the reader's private cache,
 // nil uses readOverflowChainAt (for writers who need to see their own dirty pages).

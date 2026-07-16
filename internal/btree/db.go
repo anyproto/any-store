@@ -1199,7 +1199,23 @@ func (db *DB) RenameNamespace(tx *WriteTx, oldName, newName string) error {
 	}
 	var rootPgBuf [4]byte
 	binary.BigEndian.PutUint32(rootPgBuf[:], ns.rootPage)
-	return bt.Put([]byte(newName), rootPgBuf[:])
+	if err = bt.Put([]byte(newName), rootPgBuf[:]); err != nil {
+		return err
+	}
+
+	// Read-back guard: the rename must be resolvable before it is allowed to
+	// commit. A Put that succeeds but cannot be read back (e.g. a master-cell
+	// read defect) would otherwise durably brick the namespace — the caller
+	// rolls back on error per the contract above.
+	readBack, err := db.getNamespaceLocked(newName)
+	if err != nil {
+		return fmt.Errorf("%w: rename read-back failed for %q: %w", ErrCorrupt, newName, err)
+	}
+	if readBack.rootPage != ns.rootPage {
+		return fmt.Errorf("%w: rename read-back for %q resolved root %d, want %d",
+			ErrCorrupt, newName, readBack.rootPage, ns.rootPage)
+	}
+	return nil
 }
 
 // maxTreeDepth bounds freeTreePages recursion. It is a conservative cap far
@@ -1392,11 +1408,22 @@ func (db *DB) resolveNamespace(name string, bt *btree) (*Namespace, error) {
 				bt.pager.releasePage(pg)
 				return nil, cerr
 			}
-			if len(cell.value) < 4 {
+			// cell.value holds only the local portion; a long name can push
+			// the 4-byte root value (wholly or partially) into the overflow
+			// chain, so reassemble it the way accessPayload does.
+			value := cell.value
+			if cell.overflowPg != 0 {
+				value, cerr = leafFullValue(pg.data, int(off), usableSize, bt.pager, bt.walMaxFrame, bt.cache)
+				if cerr != nil {
+					bt.pager.releasePage(pg)
+					return nil, cerr
+				}
+			}
+			if len(value) < 4 {
 				bt.pager.releasePage(pg)
 				return nil, ErrCorrupt
 			}
-			rootPage := binary.BigEndian.Uint32(cell.value)
+			rootPage := binary.BigEndian.Uint32(value)
 			bt.pager.releasePage(pg)
 			return &Namespace{
 				name:     name,
