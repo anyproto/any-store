@@ -169,7 +169,7 @@ func parseAnd(val *anyenc.Value) (res Filter, err error) {
 		}
 		if isOp {
 			if !isTopLevel(op) {
-				err = fmt.Errorf("unknow top level operator: %s", string(key))
+				err = fmt.Errorf("operator %s is not valid at the top level", string(key))
 				return
 			}
 
@@ -556,7 +556,7 @@ func isOperator(key []byte) (ok bool, op Operator, err error) {
 		case bytes.Equal(key, opBytesText):
 			return true, opText, nil
 		default:
-			return true, 0, fmt.Errorf("unknow operator: %s", string(key))
+			return true, 0, &UnknownOperatorError{Op: string(key)}
 		}
 	}
 	return false, 0, nil
