@@ -269,3 +269,107 @@ func TestRenameThenDropRollback_HandleHeals(t *testing.T) {
 	assert.NotContains(t, names, "b")
 	require.NoError(t, fx.IntegrityCheck(ctx))
 }
+
+// The dual of the undo tests above: Drop's handle eviction is a COMMIT
+// publication (commonTx.pubs). Evicting at execution time opened the same
+// I-11 corruption through the concurrency side door: a concurrent
+// OpenCollection during the uncommitted-drop window re-registered a fresh
+// live handle against the still-committed catalog, the drop's commit freed
+// its root pages, and a later insert through it landed inside whichever
+// collection reused them.
+func TestDropConcurrentOpen_NoDanglingHandle(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "x")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"1"}`)))
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.Drop(tx.Context()))
+
+	// Window: the drop is uncommitted. A concurrent open must return the
+	// registered (closed) handle — fail-safe — not register a fresh live one.
+	// Probe it through the read path: a write would block on the write lock
+	// the open drop tx holds.
+	during, err := fx.OpenCollection(ctx, "x")
+	require.NoError(t, err)
+	_, err = during.FindId(ctx, "1")
+	assert.ErrorIs(t, err, ErrCollectionClosed)
+
+	require.NoError(t, tx.Commit())
+
+	// Committed: the handle is evicted and the catalog entry is gone.
+	_, err = fx.OpenCollection(ctx, "x")
+	assert.ErrorIs(t, err, ErrCollectionNotFound)
+
+	// Let a new collection reuse the freed pages, then write through the
+	// window handle: it must fail, and nothing may leak into "y".
+	collY, err := fx.CreateCollection(ctx, "y")
+	require.NoError(t, err)
+	require.NoError(t, collY.Insert(ctx, anyenc.MustParseJson(`{"id":"y1"}`)))
+	err = during.Insert(ctx, anyenc.MustParseJson(`{"id":"stray"}`))
+	assert.ErrorIs(t, err, ErrCollectionClosed)
+	cnt, err := collY.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, cnt)
+	_, err = collY.FindId(ctx, "stray")
+	assert.ErrorIs(t, err, ErrDocNotFound)
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// A rolled-back Drop must leave the handle exactly as it was: registered,
+// open, and usable. Pre-fix, the error/rollback path left it closed and
+// evicted (callers had to re-open by name to heal).
+func TestDropRollback_HandleHeals(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "x")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"1"}`)))
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.Drop(tx.Context()))
+
+	// Same-tx semantics: the handle is closed for the rest of the tx.
+	err = coll.Insert(tx.Context(), anyenc.MustParseJson(`{"id":"2"}`))
+	assert.ErrorIs(t, err, ErrCollectionClosed)
+
+	require.NoError(t, tx.Rollback())
+
+	// Healed: same handle, still registered, fully usable.
+	again, err := fx.OpenCollection(ctx, "x")
+	require.NoError(t, err)
+	assert.Same(t, coll, again)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"2"}`)))
+	cnt, err := coll.Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, cnt)
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// Create→Drop in one tx, both outcomes: the reverse-order undos must net to
+// closed+evicted on rollback, and the drop publication to evicted on commit.
+func TestCreateThenDropSameTx(t *testing.T) {
+	fx := newFixture(t)
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	coll, err := fx.CreateCollection(tx.Context(), "x")
+	require.NoError(t, err)
+	require.NoError(t, coll.Drop(tx.Context()))
+	require.NoError(t, tx.Rollback())
+	_, err = fx.OpenCollection(ctx, "x")
+	assert.ErrorIs(t, err, ErrCollectionNotFound)
+	err = coll.Insert(ctx, anyenc.MustParseJson(`{"id":"1"}`))
+	assert.ErrorIs(t, err, ErrCollectionClosed)
+
+	tx2, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	coll2, err := fx.CreateCollection(tx2.Context(), "y")
+	require.NoError(t, err)
+	require.NoError(t, coll2.Drop(tx2.Context()))
+	require.NoError(t, tx2.Commit())
+	_, err = fx.OpenCollection(ctx, "y")
+	assert.ErrorIs(t, err, ErrCollectionNotFound)
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}

@@ -1363,30 +1363,56 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 	})
 }
 
-// Drop runs through doWriteTx — the variant that registers no undo — yet its
-// callback calls c.close(), evicting the handle from db.openedCollections. A
-// rollback (an error, or now a panic: see doWriteTxW) therefore restores the
-// on-disk collection while this handle stays closed; callers re-obtain it via
-// db.Collection, which heals the divergence because the map entry is gone.
-// Pre-existing on the error path; tracked separately.
+// Drop closes the handle at execution time (same-tx semantics: later ops
+// through any alias fail ErrCollectionClosed) but defers the eviction from
+// db.openedCollections to COMMIT (see commonTx.pubs). Evicting at execution —
+// what close() would do — opens a corruption window: a concurrent
+// OpenCollection(name) misses the map, passes the catalog check on the
+// still-committed snapshot, and registers a fresh live handle the in-process
+// staleness pass never invalidates (own commits update localSchemaCookie);
+// once the drop commits and a new collection reuses the freed root pages,
+// writes through that handle land inside the wrong collection. Deferring the
+// eviction keeps the closed handle registered through the window, so a
+// concurrent open returns it and fails fail-safe instead. A rollback un-closes
+// the handle: the btree restored the on-disk catalog, the map entry was never
+// touched, and Drop mutates no in-memory index set — so the handle is whole
+// again (this also heals the error path, which previously left it closed and
+// evicted).
 func (c *collection) Drop(ctx context.Context) error {
-	return c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (err error) {
+	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (err error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if err = c.alive(); err != nil {
 			return err
 		}
-		// Discard buffered fts writes before close: close() preserves a
-		// non-empty pending buffer for the commit-time flush (BUG-01 fix),
-		// but Drop deletes the fts namespaces in this same tx — flushing the
-		// orphaned buffer at commit would write into dropped namespaces and
-		// fail the whole transaction.
+		// Discard buffered fts writes: Drop deletes the fts namespaces in this
+		// same tx — flushing a surviving buffer at commit would write into
+		// dropped namespaces and fail the whole transaction.
 		for _, fx := range c.loadFtsIndexes() {
 			fx.pending.reset()
 		}
-		if err = c.close(); err != nil {
-			return err
+		// CAS, not Store: a user Close() racing between alive() and here wins
+		// the flip and evicts the handle itself — then the rollback undo must
+		// NOT resurrect a handle its owner explicitly closed.
+		if c.closed.CompareAndSwap(false, true) {
+			wtx.onRollbackUndo(func() {
+				c.closed.Store(false)
+			})
 		}
+		// Identity scan, like onCollectionClose: a Rename earlier in this tx
+		// re-keys the entry in its own commit publication (which runs first,
+		// in registration order, and declines to resurrect a closed handle),
+		// and a racing user Close() may have evicted it already.
+		wtx.onCommitPublish(func() {
+			c.db.mu.Lock()
+			for name, cur := range c.db.openedCollections {
+				if cur == Collection(c) {
+					delete(c.db.openedCollections, name)
+					break
+				}
+			}
+			c.db.mu.Unlock()
+		})
 		// Delete all index namespaces. Enumerate indexes from the SAME on-disk
 		// source (idx:<coll>: metadata keys) that removeCollection deletes,
 		// rather than the in-memory index set which can lag the on-disk metadata
