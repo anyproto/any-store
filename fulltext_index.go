@@ -234,14 +234,17 @@ func (c *collection) reconcileFtsIndexesLocked(tx *btree.ReadTx, infos []IndexIn
 			err = fx.bindNamespaces(tx.GetNamespace)
 		}
 		if err != nil {
-			// Not resolvable in this snapshot — keep any existing object rather
-			// than dropping a working index over a transient view; retry on the
-			// next schema-stale tx.
-			if existing, ok := byName[info.Name]; ok {
-				rebuilt = append(rebuilt, existing)
-			} else {
-				changed = true
-			}
+			// Not resolvable in this snapshot. With no existing object this is
+			// a peer create racing our view — skip until a later reconcile.
+			// With an existing object we only got here because its definition
+			// or meta root no longer matches the on-disk index (peer
+			// drop+recreate): the handle is KNOWN-stale and must not be
+			// republished — a later flush through it would write into freed,
+			// reused pages. Evict it; $text fails cleanly until a rebind
+			// succeeds. (Keeping a working index over a merely-transient
+			// resolution failure is handled in metaRootUnchanged, which
+			// returns true when it cannot resolve.)
+			changed = true
 			continue
 		}
 		rebuilt = append(rebuilt, fx)
@@ -253,19 +256,15 @@ func (c *collection) reconcileFtsIndexesLocked(tx *btree.ReadTx, infos []IndexIn
 		return
 	}
 
-	// Reset the pending buffer of every evicted handle: the flush/reset
-	// drivers enumerate the published snapshot, so buffered postings on a
-	// handle that is no longer in it would be stranded (or worse, flushed by
-	// a caller still holding the old slice). Matches invalidateCollection.
-	kept := make(map[*ftsIndex]struct{}, len(rebuilt))
-	for _, fx := range rebuilt {
-		kept[fx] = struct{}{}
-	}
-	for _, fx := range cur {
-		if _, ok := kept[fx]; !ok {
-			fx.pending.reset()
-		}
-	}
+	// Eviction is publication-by-omission only — an evicted handle's pending
+	// buffer is deliberately NOT touched. Resetting it here would race a
+	// concurrent writer goroutine still buffering into it (inserts read the
+	// snapshot lock-free), and there is nothing to save anyway: the commit
+	// flush enumerates the published snapshot, so an evicted (peer-dropped)
+	// index's buffered postings are dropped with the object — exactly right
+	// for an index that no longer exists. (A writer's own uncommitted index
+	// can never be evicted here: the indexSetDDLTxs guard in reconcileIndexes
+	// skips the whole pass while local DDL is in flight.)
 	c.storeFtsIndexes(rebuilt)
 }
 

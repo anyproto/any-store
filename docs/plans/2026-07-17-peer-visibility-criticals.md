@@ -136,6 +136,46 @@ Per decisions 8-10:
 4. **fix(btree): publish checkpoint counters without rewriting read-marks** — single-word publishers + checkpointWithMode changes + protocol test. Own PR with 5.
 5. **fix(btree): recovery resets read-marks under per-slot locks** — recovery/open-path mark writes + NOTES annotation + end-to-end test.
 
+## Post-review revisions (2026-07-17, high-effort multi-agent review of the branch)
+
+Four correctness findings, all fixed on this branch:
+
+1. **Checkpoint regression (CONFIRMED):** the counters-only publish had dropped the
+   `nBackfillAttempted.Store(mxSafeFrame)` that the bulk write previously carried —
+   the publish wrote a stale value, breaking the crash-safety hint (C:
+   `pInfo->nBackfillAttempted = mxSafeFrame`, wal.c:2268). Store restored; the
+   two-process test now asserts nBackfillAttempted tracks the checkpoints.
+2. **Rename guard neutralized (CONFIRMED):** the read-back guard double-`%w`-wrapped
+   the inner error, so a not-found-class failure satisfied
+   `errors.Is(err, ErrNamespaceNotFound)` and the app-layer rename's tolerance for
+   already-missing index namespaces swallowed the guard. Inner error flattened to `%v`.
+3. **Reconcile vs. uncommitted local DDL (CONFIRMED):** a schema-stale read tx's
+   reconcile, rebuilding from its older snapshot, could evict a concurrent write
+   tx's just-published (uncommitted) index — and the evict-side `pending.reset()`
+   raced the writer's buffering. Fixed structurally: `collection.indexSetDDLTxs`
+   (set in `registerIndexSetRestore`, released exactly once at commit-publish or
+   rollback-undo) makes `reconcileIndexes` skip while local index DDL is in flight
+   (same argument as the renameInFlight guard — the cookie bump predates the
+   writer's begin, which already reconciled it), and eviction no longer touches
+   `pending` at all (publication-by-omission; the commit flush enumerates the
+   snapshot, so a dropped index's buffered postings are dropped with the object).
+   The sibling window — reconcile racing a *committed* local DDL from an older
+   snapshot — is pre-existing, shared with the range/vector paths, and
+   self-healing via the cookie; filed with the BUG-35/36/37 publish-at-commit family.
+4. **Known-stale keep on rebind failure (PLAUSIBLE):** when a peer drop+recreate was
+   already detected (definition or meta root changed) but fresh binding failed, the
+   old handle — known to point at freed roots — was republished with no retry (the
+   cookie is consumed). Now evicted: $text fails cleanly until a rebind succeeds.
+   (The vector path has the same keep-on-error shape; follow-up for that family.)
+
+Cleanups applied: the unlocked bulk `shmWriteCkptInfo` is deleted outright (tests
+compose the safe single-word publishers); the integrity master hook reports the
+value-reconstruction error class beside its generic corrupt-value report.
+Deferred (filed here as follow-ups): `leafFullKey`/`leafFullValue`/`AppendValue`
+share three hand-copies of the payload-split geometry (and the `AppendValue` copy
+lacks the `maxPayloadAlloc` bounds checks); `checkTreePage` walks an overflow
+cell's chain up to three times; the three reconcile functions share a skeleton.
+
 ## Verification
 
 - Per increment: `go test ./internal/btree/` + full `go test ./...` in the worktree (TMPDIR on a real filesystem for multiprocess tests); `-race` on changed packages.
