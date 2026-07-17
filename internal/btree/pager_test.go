@@ -1638,7 +1638,7 @@ func TestShmCkptInfo_RoundTrip(t *testing.T) {
 	idx.aReadMark[2].Store(20)
 	idx.aReadMark[3].Store(readMarkNotUsed)
 	idx.aReadMark[4].Store(readMarkNotUsed)
-	idx.shmWriteCkptInfo()
+	shmWriteCkptInfoForTest(idx)
 
 	// Clear and read back
 	idx.nBackfill.Store(0)
@@ -3408,8 +3408,8 @@ func TestShmWriteCkptInfo_NoRegion(t *testing.T) {
 	require.NoError(t, err)
 	defer idx.close(false)
 
-	// shmWriteCkptInfo when no region exists should not panic
-	idx.shmWriteCkptInfo()
+	// counter/mark publishers when no region exists should not panic
+	shmWriteCkptInfoForTest(idx)
 }
 
 // ============================================================
@@ -5888,7 +5888,7 @@ func TestWalIndex_ShmWriteCkptInfo_RegionError(t *testing.T) {
 	}
 
 	// Should return early without panic.
-	w.index.shmWriteCkptInfo()
+	shmWriteCkptInfoForTest(w.index)
 }
 
 // --- wal.go:1275-1277 writeFrames fdatasync error on commit ---

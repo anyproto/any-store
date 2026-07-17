@@ -2260,6 +2260,16 @@ func (p *pager) pagerStress(pg *page) error {
 // incremented. Returns the WAL frame count and the new counter values.
 // DRIFT: FileChangeCount bumped only on dataChanged=true, not every data-page commit See docs/btree/NOTES.md#drift-77-filechangecount-bumped-conditionally-not-unconditionally
 // DRIFT: commit doesn't prune dirty pages pgno>dbSize before WAL write (no nTruncate prune) See docs/btree/NOTES.md#drift-78-commit-does-not-prune-dirty-pages-above-dbsize-before-wal-wr
+// testCommitPrePublishHook / testCommitPostPublishHook, when non-nil, run
+// inside commit immediately before / after wal.writeFrames publishes the
+// commit frame — the boundary that decides whether a panic unwind must roll
+// back (pre) or must NOT (post: the transaction is durably committed).
+// Test-only.
+var (
+	testCommitPrePublishHook  func()
+	testCommitPostPublishHook func()
+)
+
 func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC uint32, err error) {
 	p.writerOpMu.Lock()
 	defer p.writerOpMu.Unlock()
@@ -2361,6 +2371,10 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 		trace("commit: writing %d dirty pages to WAL %v", len(p.dirtyBuf), dirtyPgnos)
 	}
 
+	if testCommitPrePublishHook != nil {
+		testCommitPrePublishHook()
+	}
+
 	// Write all dirty pages to WAL
 	if err := p.wal.writeFrames(p.dirtyBuf, true, p.dbSize.Load()); err != nil {
 		p.pagerError()
@@ -2369,6 +2383,10 @@ func (p *pager) commit(dataChanged, schemaChanged bool) (nFrame, newFCC, newSC u
 
 	// Capture nFrame atomically for checkpoint threshold decision.
 	nFrame = p.wal.nFrame.Load()
+
+	if testCommitPostPublishHook != nil {
+		testCommitPostPublishHook()
+	}
 
 	// Notify online backups that these pages have new committed content.
 	// ~ sqlite3BackupUpdate dispatch (backup.c:687). Must happen here,
@@ -2403,6 +2421,54 @@ func (p *pager) rollback() error {
 	p.writerOpMu.Lock()
 	defer p.writerOpMu.Unlock()
 	return p.rollbackLocked()
+}
+
+// unwindWriter is the panic-unwind cleanup for a writer whose Commit or
+// Rollback panicked mid-pager. Its job is to leave the pager and the WAL
+// writer state safe for the NEXT writer — which is NOT always a rollback:
+//
+//   - Commit frame already published (mxCommitFrame advanced past the
+//     transaction's start frame): the transaction IS durably committed — the
+//     panic struck in post-publish bookkeeping (backup dispatch, cache
+//     cleaning/truncate). Rolling back here would rewind nFrame and zero the
+//     WAL-index hash entries BELOW the still-advanced mxCommitFrame and reset
+//     the checksum chain behind it — committed data turns invisible to
+//     readers and the next writer starts a broken frame chain: silent loss of
+//     a durable commit. Instead, keep the header and every piece of WAL
+//     accounting exactly as the successful publish left them and discard only
+//     the writer-side state (cache contents are already durable in the WAL;
+//     discarding just forces re-reads).
+//   - Not published: an ordinary discard rollback (rollbackLocked restores
+//     nFrame/checksums/header to the pre-transaction snapshot).
+//
+// State-guarded and idempotent: when the state machine already left
+// pagerWriter (e.g. the panic struck inside endWrite on the empty-commit
+// path), it still re-runs the WAL write-lock release, which tolerates an
+// unheld lock — the lock staying held would block every future writer in
+// every process.
+func (p *pager) unwindWriter() {
+	p.writerOpMu.Lock()
+	defer p.writerOpMu.Unlock()
+	st := pagerState(p.state.Load())
+	if st != pagerWriter && st != pagerError {
+		p.wal.endWrite()
+		return
+	}
+	if p.wal.index.mxCommitFrame.LoadLocal() > p.savedWalFrame.Load() {
+		// Published: the commit is real. Writer-side discard only.
+		for _, pg := range p.writerCache.dirtyPages() {
+			p.writerCache.discard(pg.pgno)
+		}
+		p.writerCache.clear()
+		p.freeSavepointPageBuffers(0, len(p.savepoints))
+		p.savepoints = p.savepoints[:0]
+		clear(p.dontWritePages)
+		clear(p.hasContent)
+		p.state.Store(int32(pagerOpen))
+		p.wal.endWrite()
+		return
+	}
+	_ = p.rollbackLocked()
 }
 
 // rollbackLocked is the inner rollback implementation. Caller must hold writerOpMu.

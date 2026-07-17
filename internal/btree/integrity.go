@@ -289,7 +289,7 @@ func (ic *integrityChecker) keyInBounds(key, lower, upper []byte, context string
 // strict cell ordering check this enforces
 //
 //	max(subtree[child i]) < D_i <= min(subtree[child i+1]).
-func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLeafCell func(cell cellData)) int {
+func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLeafCell func(key, value []byte)) int {
 	if ic.tooManyErrors() {
 		return 0
 	}
@@ -425,10 +425,30 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 			// pre-builds aRoot[] from the in-memory schema (pragma.c:1761-1774);
 			// any-store has no such list, so the master root discovers each
 			// namespace subtree from its own leaf cells via this callback. The
-			// hook only READS cell.value; it does not touch the coverage heap or
-			// fragmentation accounting, so coverage is unchanged.
+			// hook receives the reassembled key and value — cell.key/cell.value
+			// hold only the local portions, and a long master key pushes the
+			// 4-byte root value into the overflow chain. The hook only reads
+			// them; it does not touch the coverage heap or fragmentation
+			// accounting, so coverage is unchanged.
 			if onLeafCell != nil {
-				onLeafCell(cell)
+				hookKey := fullKey
+				if hookKey == nil {
+					hookKey = cell.key
+				}
+				hookVal := cell.value
+				if cell.overflowPg != 0 {
+					fv, fverr := leafFullValue(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, ic.cache)
+					if fverr != nil {
+						// Surface the error class (I/O vs geometry) beside the
+						// hook's generic corrupt-value report, mirroring the
+						// key path's report above.
+						ic.report("%s cell %d: corrupt leaf value: %v", context, i, fverr)
+						hookVal = nil
+					} else {
+						hookVal = fv
+					}
+				}
+				onLeafCell(hookKey, hookVal)
 			}
 		} else {
 			// Interior cell (with overflow support)
@@ -643,28 +663,29 @@ func (db *DB) IntegrityCheckN(maxErrors int) error {
 	// ANY master depth. The hook only reads cell.value (the namespace root page),
 	// never the coverage heap.
 	ic.treeName = "master"
-	masterLeaf := func(cell cellData) {
-		// A master leaf value < 4 bytes is corrupt (matches resolveNamespace,
-		// db.go:1253). The interior/leaf parse + bounds checks in checkTreePage
-		// already validated cell structure; here we only validate the value.
-		if len(cell.value) < 4 {
-			ic.report("tree master cell key %q: corrupt namespace root value", string(cell.key))
+	masterLeaf := func(key, value []byte) {
+		// A master leaf value < 4 bytes is corrupt (matches resolveNamespace).
+		// The interior/leaf parse + bounds checks in checkTreePage already
+		// validated cell structure; the value arrives reassembled (local +
+		// overflow), so here we only validate its content.
+		if len(value) < 4 {
+			ic.report("tree master cell key %q: corrupt namespace root value", string(key))
 			return
 		}
-		rootPage := binary.BigEndian.Uint32(cell.value[:4])
+		rootPage := binary.BigEndian.Uint32(value[:4])
 		switch {
 		case rootPage >= 2 && rootPage <= nPages:
 			// Each namespace tree is an independent B-tree; its root has no
 			// divider bounds (unbounded both ways) and carries user data in
 			// its own leaf values, so it needs no leaf-cell hook (nil).
 			savedName := ic.treeName
-			ic.treeName = string(cell.key)
+			ic.treeName = string(key)
 			ic.checkTreePage(rootPage, nil, nil, nil)
 			ic.treeName = savedName
 		case rootPage != 0:
 			// rootPage == 0 is a valid empty namespace (intentionally skipped;
 			// exercised by TestDeleteNamespace_RootPageZero).
-			ic.report("tree master cell key %q: namespace root page %d out of range", string(cell.key), rootPage)
+			ic.report("tree master cell key %q: namespace root page %d out of range", string(key), rootPage)
 		}
 	}
 	ic.checkTreePage(1, nil, nil, masterLeaf)

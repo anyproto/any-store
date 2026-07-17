@@ -179,6 +179,95 @@ func (fx *ftsIndex) bindNamespaces(resolve func(name string) (*btree.Namespace, 
 
 func (fx *ftsIndex) Info() IndexInfo { return fx.info }
 
+// metaRootUnchanged reports whether the ftx: meta namespace still resolves to
+// the btree root this handle was bound against — false after a peer
+// drop+recreate moved the roots, which means the handles are stale and the
+// index must be rebound. A transient resolution failure returns true so a
+// working index is not dropped over a momentary view.
+func (fx *ftsIndex) metaRootUnchanged(tx *btree.ReadTx) bool {
+	if fx.nsMeta == nil {
+		return true
+	}
+	ns, err := tx.GetNamespace(ftsNsName(fx.c.name, fx.info.Name, ftsPartMeta))
+	if err != nil {
+		return true
+	}
+	return ns.RootPage() == fx.nsMeta.RootPage()
+}
+
+// reconcileFtsIndexesLocked rebuilds the full-text-index set from on-disk infos
+// after a peer committed full-text DDL. Caller holds c.mu. Mirrors
+// reconcileVectorIndexesLocked: adopt peer-created indexes (trusting the peer's
+// backfill, as the range/vector adoptions do), reuse live objects while their
+// definition and meta root are unchanged, and evict peer-dropped ones so a
+// stale handle can never flush postings into freed-and-reused ftx: pages.
+// Never touches disk — reconcile may run inside a read tx, and the peer
+// already performed the DDL; eviction is purely local handle release.
+func (c *collection) reconcileFtsIndexesLocked(tx *btree.ReadTx, infos []IndexInfo) {
+	cur := c.loadFtsIndexes()
+	byName := make(map[string]*ftsIndex, len(cur))
+	for _, fx := range cur {
+		byName[fx.info.Name] = fx
+	}
+
+	var want int
+	for _, info := range infos {
+		if isFulltext(info) {
+			want++
+		}
+	}
+	rebuilt := make([]*ftsIndex, 0, want)
+	changed := want != len(cur)
+	for _, info := range infos {
+		if !isFulltext(info) {
+			continue
+		}
+		if existing, ok := byName[info.Name]; ok &&
+			indexInfoEqual(existing.info, info) && existing.metaRootUnchanged(tx) {
+			rebuilt = append(rebuilt, existing)
+			continue
+		}
+		// New index, or a drop+recreate moved the roots under the same name so
+		// the existing object's handles are stale — bind fresh handles.
+		fx, err := newFtsIndex(c, info)
+		if err == nil {
+			err = fx.bindNamespaces(tx.GetNamespace)
+		}
+		if err != nil {
+			// Not resolvable in this snapshot. With no existing object this is
+			// a peer create racing our view — skip until a later reconcile.
+			// With an existing object we only got here because its definition
+			// or meta root no longer matches the on-disk index (peer
+			// drop+recreate): the handle is KNOWN-stale and must not be
+			// republished — a later flush through it would write into freed,
+			// reused pages. Evict it; $text fails cleanly until a rebind
+			// succeeds. (Keeping a working index over a merely-transient
+			// resolution failure is handled in metaRootUnchanged, which
+			// returns true when it cannot resolve.)
+			changed = true
+			continue
+		}
+		rebuilt = append(rebuilt, fx)
+		changed = true
+	}
+	if !changed {
+		// Same set, same definitions, same roots — every live object was
+		// carried forward, so there is nothing to evict or publish.
+		return
+	}
+
+	// Eviction is publication-by-omission only — an evicted handle's pending
+	// buffer is deliberately NOT touched. Resetting it here would race a
+	// concurrent writer goroutine still buffering into it (inserts read the
+	// snapshot lock-free), and there is nothing to save anyway: the commit
+	// flush enumerates the published snapshot, so an evicted (peer-dropped)
+	// index's buffered postings are dropped with the object — exactly right
+	// for an index that no longer exists. (A writer's own uncommitted index
+	// can never be evicted here: the indexSetDDLTxs guard in reconcileIndexes
+	// skips the whole pass while local DDL is in flight.)
+	c.storeFtsIndexes(rebuilt)
+}
+
 // ---- analysis -------------------------------------------------------------
 
 // analyzeInto runs the analyzer over all indexed fields of the document,

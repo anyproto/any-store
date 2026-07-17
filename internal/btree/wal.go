@@ -816,8 +816,11 @@ func (wi *walIndex) getLatest(pgno uint32) (uint32, error) {
 }
 
 // reset clears the WAL index (after a checkpoint + WAL truncate).
+// readMarksLocked tells shmPublishReadMarks whether the caller already holds
+// exclusive locks on reader slots 1-4 (the RESTART/TRUNCATE checkpoint path)
+// or the marks must be published under per-slot try-locks (recovery/open).
 // DRIFT: reset() clobbers aReadMark[0]/[1] to NOT_USED + drops nCkpt/salt increments See docs/btree/NOTES.md#drift-99-wal-restart-read-mark-reset-diverges-from-walrestarthdr
-func (wi *walIndex) reset() {
+func (wi *walIndex) reset(readMarksLocked bool) {
 	wi.mu.Lock()
 	clear(wi.pageMap)
 	wi.mu.Unlock()
@@ -829,7 +832,12 @@ func (wi *walIndex) reset() {
 		wi.aReadMark[i].Store(readMarkNotUsed)
 	}
 	wi.shmClearHash()
-	wi.shmWriteCkptInfo()
+	wi.shmWriteNBackfill()
+	wi.shmWriteNBackfillAttempted()
+	// Best-effort here: with readMarksLocked no locking is performed (no error
+	// possible), and the fresh-init open paths follow the SHM layer's existing
+	// no-op-on-failure convention. recoverLocked's own publish propagates.
+	_ = wi.shmPublishReadMarks(readMarksLocked)
 }
 
 // writeHeader writes the WAL index header to region 0 of the shm.
@@ -1241,19 +1249,74 @@ func (wi *walIndex) shmClearHash() {
 	}
 }
 
-// shmWriteCkptInfo writes checkpoint info (nBackfill, aReadMark, nBackfillAttempted)
-// to shm region 0. Matches SQLite's WalCkptInfo layout.
-func (wi *walIndex) shmWriteCkptInfo() {
+// There is deliberately NO bulk WalCkptInfo writer: a bulk store of
+// aReadMark[0..4] from process-local mirrors violates wal.c:367-370
+// ("aReadMark[K] may only be changed by a thread holding an exclusive lock on
+// WAL_READ_LOCK(K)") — it would overwrite a live cross-process reader's mark
+// and let a later checkpoint backfill past its pinned snapshot. Counters are
+// published individually (shmWriteNBackfill / shmWriteNBackfillAttempted) and
+// the marks via shmPublishReadMarks.
+
+// shmWriteNBackfill publishes nBackfill alone to shm region 0. Matches
+// SQLite's AtomicStore(&pInfo->nBackfill, ...) (wal.c:2331): the counter is
+// published as a single word, never as part of a bulk WalCkptInfo copy that
+// would also rewrite aReadMark[] slots this process holds no locks on.
+func (wi *walIndex) shmWriteNBackfill() {
 	region, err := wi.shm.region(0, true)
 	if err != nil {
 		return
 	}
 	atomic.StoreUint32((*uint32)(unsafe.Pointer(&region[htCkptOff])), wi.nBackfill.Load())
-	for i := range 5 {
-		atomic.StoreUint32((*uint32)(unsafe.Pointer(&region[htReadMarkOff+i*4])), wi.aReadMark[i].Load())
+}
+
+// shmWriteNBackfillAttempted publishes nBackfillAttempted alone to shm
+// region 0 (wal.c:2268 analog; see shmWriteNBackfill).
+func (wi *walIndex) shmWriteNBackfillAttempted() {
+	region, err := wi.shm.region(0, true)
+	if err != nil {
+		return
 	}
-	// Write nBackfillAttempted at offset 128 (issue 7.7)
 	atomic.StoreUint32((*uint32)(unsafe.Pointer(&region[htNBackfillAttemptedOff])), wi.nBackfillAttempted.Load())
+}
+
+// shmPublishReadMarks publishes this process's aReadMark[0..4] into SHM,
+// honoring wal.c:367-370's invariant that aReadMark[K] is written only while
+// holding WAL_READ_LOCK(K) exclusive:
+//
+//   - readMarksLocked=true: the caller already holds slots 1-4 exclusive —
+//     the checkpoint RESTART/TRUNCATE path (tryResetWALWithBusy), matching
+//     walRestartHdr's caller (wal.c:2361) — so the marks are written directly.
+//   - readMarksLocked=false (recovery/open paths): each slot is try-locked
+//     exclusively first, and a BUSY slot — a live peer reader — is left
+//     untouched, matching walIndexRecover (wal.c:1573-1588). Overwriting a
+//     live reader's mark would make a later checkpoint treat its slot as
+//     unused and backfill past the reader's pinned snapshot.
+//
+// Slot 0 is the fixed zero-frame sentinel and never pins a WAL frame; C
+// writes aReadMark[0] without a slot lock in both contexts (wal.c:1575,
+// wal.c:2157), mirrored here.
+//
+// A non-BUSY lock failure is returned immediately (marks written so far stay),
+// matching walIndexRecover's `goto recovery_error` (wal.c:1586-1587): only a
+// live reader's BUSY is a reason to leave a slot alone; an I/O-class lock
+// error must fail the surrounding recovery, not silently leave stale marks.
+func (wi *walIndex) shmPublishReadMarks(readMarksLocked bool) error {
+	wi.shmWriteReadMark(0, wi.aReadMark[0].Load())
+	for i := 1; i < len(wi.aReadMark); i++ {
+		if !readMarksLocked {
+			if err := wi.lock(lockRead0+i, lockExclusive); err != nil {
+				if err == ErrBusy {
+					continue // live reader holds the slot: leave its mark in place
+				}
+				return err
+			}
+		}
+		wi.shmWriteReadMark(i, wi.aReadMark[i].Load())
+		if !readMarksLocked {
+			_ = wi.unlock(lockRead0+i, lockExclusive)
+		}
+	}
+	return nil
 }
 
 // shmReadCkptInfo reads checkpoint info (nBackfill, aReadMark, nBackfillAttempted)
@@ -1443,7 +1506,7 @@ func (w *wal) open() (err error) {
 			return err
 		}
 		w.index = idx
-		w.initHeaderStateLocked()
+		w.initHeaderStateLocked(false)
 		w.memFrames = make([]memFrame, 0, 1024)
 		return nil
 	}
@@ -1566,7 +1629,7 @@ func (w *wal) open() (err error) {
 
 	// No SHM to adopt and no on-disk WAL. Initialize fresh state. The on-disk
 	// header is written lazily on the first writeFrames call (flushHeader).
-	w.initHeaderStateLocked()
+	w.initHeaderStateLocked(false)
 
 	return nil
 }
@@ -1668,7 +1731,7 @@ func (w *wal) ensureHeaderInitialized() (WalIndexHdr, error) {
 			return WalIndexHdr{}, err
 		}
 	} else {
-		w.initHeaderStateLocked()
+		w.initHeaderStateLocked(false)
 	}
 	hdr, _ := w.index.readHeader()
 	return hdr, nil
@@ -1691,7 +1754,7 @@ func (w *wal) ensureHeaderInitializedInProcess() (WalIndexHdr, error) {
 				return hdr, nil
 			}
 		}
-		w.initHeaderStateLocked()
+		w.initHeaderStateLocked(false)
 		w.inProcessInit = true
 	}
 	hdr, _ := w.index.readHeader()
@@ -1766,7 +1829,9 @@ func (w *wal) adoptSHMState(hdr WalIndexHdr, walHasHeader bool) {
 // header will be flushed to disk lazily on the first writeFrames call.
 //
 // Caller must hold w.mu.
-func (w *wal) initHeaderStateLocked() {
+// readMarksLocked: see walIndex.reset — true only on the RESTART/TRUNCATE
+// checkpoint path (doResetWAL), whose caller holds reader slots 1-4 exclusive.
+func (w *wal) initHeaderStateLocked(readMarksLocked bool) {
 	w.header = walHeader{
 		magic:      walMagic,
 		version:    walVersion,
@@ -1782,7 +1847,7 @@ func (w *wal) initHeaderStateLocked() {
 	w.cksum1, w.cksum2 = walChecksum(buf[0:24], 0, 0)
 	w.nFrame.Store(0)
 	w.headerOnDisk = false
-	w.index.reset()
+	w.index.reset(readMarksLocked)
 
 	// Update shm header with initial checksums and salts
 	_ = w.index.writeHeader(0, 0, 0,
@@ -1837,7 +1902,9 @@ func (w *wal) writeHeader() error {
 	w.cksum1, w.cksum2 = walChecksum(buf[0:24], 0, 0)
 	w.nFrame.Store(0)
 	w.headerOnDisk = true
-	w.index.reset()
+	// Recovery/open context: reader slots 1-4 are not held, so the SHM marks
+	// are published under per-slot try-locks (live peers' slots untouched).
+	w.index.reset(false)
 
 	// Update shm header
 	return w.index.writeHeader(0, 0, 0,
@@ -1993,8 +2060,9 @@ func (w *wal) recoverLocked() error {
 
 	// Phase 3: single-shot publish of all private buffers to SHM. For region 0
 	// we skip the first htHdrSize (=136) bytes so the OLD header + ckpt info
-	// stay in place; they are overwritten only by writeHeader / shmWriteCkptInfo
-	// at the end, matching SQLite wal.c:1524-1533 commentary.
+	// stay in place; they are overwritten only by writeHeader and the
+	// counter/mark publishes at the end, matching SQLite wal.c:1524-1533
+	// commentary.
 	for seg, b := range priv {
 		region, err := w.index.shm.region(seg, true)
 		if err != nil {
@@ -2046,7 +2114,16 @@ func (w *wal) recoverLocked() error {
 		[2]uint32{w.header.salt1, w.header.salt2}); err != nil {
 		return err
 	}
-	w.index.shmWriteCkptInfo()
+	w.index.shmWriteNBackfill()
+	w.index.shmWriteNBackfillAttempted()
+	// Recovery holds lockWrite/lockCheckpoint/lockRecover but NOT the reader
+	// slots, so the mark reset is published per-slot, skipping any slot a live
+	// peer reader holds — matching walIndexRecover (wal.c:1573-1588), which
+	// takes WAL_READ_LOCK(i) exclusive per slot, leaves BUSY slots alone, and
+	// fails recovery on any other lock error (wal.c:1586-1587).
+	if err := w.index.shmPublishReadMarks(false); err != nil {
+		return err
+	}
 
 	// Recovery reestablishes the canonical WAL state; no overwrites
 	// are pending. Matches SQLite wal.c:3733 walIndexTryHdr, which
@@ -3576,8 +3653,14 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 	// This provides a crash-safety hint: if we crash during backfill,
 	// recovery knows that frames up to nBackfillAttempted may have been
 	// partially written to the database.
+	// Publish the counter alone (wal.c:2268). The bulk shmWriteCkptInfo was a
+	// snapshot-isolation hole here: it rewrote aReadMark[1..4] from this
+	// process's stale local mirrors while holding only slot-0's lock, erasing
+	// a live peer reader's mark so the NEXT checkpoint treated its slot as
+	// unused and backfilled past its pinned snapshot. Read-marks are written
+	// only by the per-slot-locked reader loop above.
 	w.index.nBackfillAttempted.Store(mxSafeFrame)
-	w.index.shmWriteCkptInfo()
+	w.index.shmWriteNBackfillAttempted()
 
 	// Sync the WAL file before copying frames to the database, matching
 	// SQLite's walCheckpoint() (CKPT_SYNC_FLAGS). This ensures all WAL data
@@ -3796,9 +3879,10 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 			nBackfill, mxSafeFrame, skippedOrphans, w.authoritativeMxFrame(), w.index.maxPage.Load())
 	}
 
-	// Update nBackfill
+	// Update nBackfill; publish the counter alone (wal.c:2331) — never the
+	// read-marks (see the nBackfillAttempted publish above).
 	w.index.nBackfill.Store(mxSafeFrame)
-	w.index.shmWriteCkptInfo()
+	w.index.shmWriteNBackfill()
 
 	// Release the reader lock held while backfilling
 	_ = w.index.unlock(lockRead0, lockExclusive)
@@ -3899,7 +3983,9 @@ func (w *wal) doResetWAL(truncate bool) error {
 	// preventing TOCTOU races where readFrame passes the nFrame check
 	// but gets EOF from the truncated file. Matches SQLite's ordering:
 	// walRestartHdr (reset header) → sqlite3OsTruncate (wal.c:2363-2364).
-	w.index.reset()
+	// readMarksLocked: tryResetWALWithBusy holds reader slots 1-4 exclusive
+	// across this call (matching wal.c:2361 before walRestartHdr).
+	w.index.reset(true)
 	w.nFrame.Store(0)
 
 	if truncate && w.file != nil {
@@ -3917,7 +4003,7 @@ func (w *wal) doResetWAL(truncate bool) error {
 
 	if w.inMemory {
 		// InMemory: just reinitialize header state, no disk write
-		w.initHeaderStateLocked()
+		w.initHeaderStateLocked(true)
 		return nil
 	}
 
@@ -3926,7 +4012,7 @@ func (w *wal) doResetWAL(truncate bool) error {
 	// publishes the SHM header (fresh salt, so peers detect the wrap); on TRUNCATE
 	// the WAL stays 0 bytes. Durability unchanged (flushHeader fdatasyncs at the
 	// first-frame write); avoids an eager header fsync per RESTART/TRUNCATE checkpoint.
-	w.initHeaderStateLocked()
+	w.initHeaderStateLocked(true)
 	return nil
 }
 

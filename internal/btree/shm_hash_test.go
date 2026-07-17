@@ -120,7 +120,7 @@ func TestShmCkptInfo(t *testing.T) {
 	wi.aReadMark[2].Store(200)
 	wi.aReadMark[3].Store(readMarkNotUsed)
 	wi.aReadMark[4].Store(readMarkNotUsed)
-	wi.shmWriteCkptInfo()
+	shmWriteCkptInfoForTest(wi)
 
 	// Reset in-memory values
 	wi.nBackfill.Store(0)
