@@ -43,12 +43,13 @@ type vectorIndex struct {
 	uncommitted atomic.Bool
 	// prev is the handle this one replaced (compaction), still valid in every
 	// committed snapshot: while uncommitted, a non-creator tx searches through
-	// prev instead. Set before the CoW publish and never cleared — a reader
-	// that loaded uncommitted just before the commit publication may still
-	// dereference it, and its pre-commit snapshot is exactly what prev serves.
-	// nil for a freshly created index (nothing to serve; the reader errors as
-	// it did before the DDL began).
-	prev *vectorIndex
+	// prev instead. Set before the CoW publish; cleared by the commit
+	// publication AFTER the uncommitted flag (that order lets forTx resolve
+	// the cross-load race, see there) so successive compactions do not chain
+	// and pin every predecessor handle for the life of the process. nil for a
+	// freshly created index (nothing to serve; the reader errors as it did
+	// before the DDL began).
+	prev atomic.Pointer[vectorIndex]
 }
 
 // isIVF reports whether this index uses the IVF backend (PQ or SQ).
@@ -717,8 +718,16 @@ func (vi *vectorIndex) forTx(tx *btree.ReadTx) (*vectorIndex, error) {
 	if !vi.uncommitted.Load() || tx.IsWriteTx() {
 		return vi, nil
 	}
-	if vi.prev != nil {
-		return vi.prev, nil
+	if prev := vi.prev.Load(); prev != nil {
+		return prev, nil
+	}
+	// A nil prev after observing uncommitted is either a fresh create
+	// (nothing to serve) or the commit publication ran between the two
+	// loads. The publication clears the flag BEFORE prev, so re-checking
+	// disambiguates: flag now down means the index just committed and this
+	// handle is servable after all.
+	if !vi.uncommitted.Load() {
+		return vi, nil
 	}
 	return nil, fmt.Errorf("%w: vector index %q", ErrIndexNotFound, vi.info.Name)
 }
@@ -1214,7 +1223,7 @@ const vectorEfCap = 4096
 // for a brute-force index (no graph). Returns ErrIndexNotFound if no vector index
 // with that name exists.
 func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) error {
-	return c.db.doWriteTx(ctx, func(tx *btree.WriteTx) error {
+	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) error {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if err := c.alive(); err != nil {
@@ -1243,6 +1252,27 @@ func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) e
 		if err != nil {
 			return err
 		}
+		// This is an index-set publication inside an uncommitted tx, exactly
+		// like createIndexes': a rollback (ambient tx, or an error later in
+		// this one) reverts the namespace recreation and frees the compacted
+		// roots, so the pre-compaction snapshot must be restored — a handle
+		// left pointing at freed pages fails every subsequent vector op with
+		// "btree: key not found" until reopen. The restore undo also raises
+		// indexSetDDLTxs, so a concurrent read tx's reconcile (reacting to
+		// the cookie bump above) cannot rebuild the set from its older
+		// snapshot mid-tx.
+		c.registerIndexSetRestore(wtx)
+		// Visibility (see forTx): until commit, the compacted roots exist
+		// only in this tx's view — a concurrent reader searches through the
+		// replaced handle, whose namespaces its committed snapshot still
+		// holds. prev stays set past commit (see the field comment).
+		nvi.uncommitted.Store(true)
+		nvi.prev.Store(vi)
+		wtx.onCommitPublish(func() {
+			// Flag before prev — forTx relies on this order (see there).
+			nvi.uncommitted.Store(false)
+			nvi.prev.Store(nil)
+		})
 		next := make([]*vectorIndex, len(cur))
 		copy(next, cur)
 		next[idx] = nvi

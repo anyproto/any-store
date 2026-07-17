@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -303,4 +304,96 @@ func TestVectorIndex_CompactAuto_DeferredInUserTx(t *testing.T) {
 	after := vstat(t, coll, "emb")
 	assert.Less(t, after.DeletedCount, inTx.DeletedCount, "self-contained write should compact")
 	assert.Less(t, after.NodeCount, n)
+}
+
+// A compaction inside a caller-managed tx that rolls back must restore the
+// pre-compaction handle: the rollback reverts the namespace recreation and
+// frees the compacted roots, so a published compacted handle would fail every
+// subsequent vector op with "btree: key not found" until reopen.
+func TestVectorIndex_CompactAmbientRollback_RestoresHandle(t *testing.T) {
+	const (
+		n   = 200
+		dim = 8
+	)
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{
+		Name: "emb", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 64},
+	}))
+	vecs := vrand(n, dim, 7)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+	for i := 0; i < n; i += 3 {
+		require.NoError(t, coll.DeleteId(ctx, i))
+	}
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.CompactVectorIndex(tx.Context(), "emb"))
+	require.NoError(t, tx.Rollback())
+
+	// The restored handle must serve both sides of the index.
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(n+1, vecs[1]))))
+	hits, err := vsearch(coll, "v", vecs[1], 2, 64)
+	require.NoError(t, err)
+	require.Len(t, hits, 2)
+	require.NoError(t, fx.IntegrityCheck(ctx))
+}
+
+// During an uncommitted ambient-tx compaction the compacted roots exist only
+// in the writer's view; a concurrent reader must keep searching through the
+// replaced handle (still valid in its committed snapshot) instead of failing
+// on the recreated namespaces. After commit the compacted handle serves all.
+func TestVectorIndex_CompactAmbientCommit_ConcurrentReader(t *testing.T) {
+	const (
+		n   = 200
+		dim = 8
+	)
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{
+		Name: "emb", Kind: IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 64},
+	}))
+	vecs := vrand(n, dim, 7)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+	for i := 0; i < n; i += 3 {
+		require.NoError(t, coll.DeleteId(ctx, i))
+	}
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.CompactVectorIndex(tx.Context(), "emb"))
+
+	// Window: concurrent reader searches through the pre-compaction handle.
+	hits, err := vsearch(coll, "v", vecs[1], 2, 64)
+	require.NoError(t, err)
+	require.Len(t, hits, 2)
+	assert.Equal(t, idBytesOf(1), hits[0].DocId)
+
+	// The compacting tx itself searches the compacted handle.
+	fq := coll.Find(fmt.Sprintf(`{"v":%s}`, vknnJSON(vecs[1], 2, 64)))
+	iterTx, err := fq.Iter(tx.Context())
+	require.NoError(t, err)
+	var gotTx int
+	for iterTx.Next() {
+		gotTx++
+	}
+	require.NoError(t, iterTx.Err())
+	require.NoError(t, iterTx.Close())
+	assert.Equal(t, 2, gotTx)
+
+	require.NoError(t, tx.Commit())
+
+	hits, err = vsearch(coll, "v", vecs[1], 2, 64)
+	require.NoError(t, err)
+	require.Len(t, hits, 2)
+	assert.Equal(t, idBytesOf(1), hits[0].DocId)
+	require.NoError(t, fx.IntegrityCheck(ctx))
 }
