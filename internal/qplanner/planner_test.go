@@ -697,6 +697,42 @@ func TestAdjustBoundsForNonUnique(t *testing.T) {
 	assert.Equal(t, anyenc.Tuple{1}, adjusted[0].Start)
 }
 
+func TestTransformReverseBounds_PrefixStart(t *testing.T) {
+	// A complete-value bound keeps the plain inverted End with its
+	// inclusivity: continuations at tuple boundaries obey the docId-tag
+	// invariant, and the downstream 0xFF pad handles them.
+	v := anyenc.AppendAnyValue(nil, "a")
+	bs := transformReverseBounds(query.Bounds{{Start: v, End: v, StartInclude: true, EndInclude: true}})
+	require.Len(t, bs, 1)
+	assert.Equal(t, anyenc.Tuple(invertBytes(v)), bs[0].End)
+	assert.True(t, bs[0].EndInclude)
+
+	// A mid-value prefix Start (bare type tag, the $type shape) maps to the
+	// successor of the inverted prefix, exclusive — the only inclusive-End
+	// form that admits keys whose inverted continuation byte is 0xFF.
+	bs = transformReverseBounds(query.Bounds{{Start: []byte{0x0b}, End: []byte{0x0c}, StartInclude: true, EndInclude: false}})
+	require.Len(t, bs, 1)
+	assert.Equal(t, anyenc.Tuple{0xf5}, bs[0].End) // succ(^0x0b = 0xf4)
+	assert.False(t, bs[0].EndInclude)
+	assert.Equal(t, anyenc.Tuple{0xf3}, bs[0].Start)
+	assert.False(t, bs[0].StartInclude)
+
+	// The $regex shape: tag + prefix bytes, no EOS.
+	pfx := append([]byte{0x03}, "foo"...)
+	bs = transformReverseBounds(query.Bounds{{Start: pfx, End: append([]byte{0x03}, "fop"...), StartInclude: true, EndInclude: false}})
+	require.Len(t, bs, 1)
+	wantEnd := invertBytes(pfx)
+	wantEnd[len(wantEnd)-1]++
+	assert.Equal(t, anyenc.Tuple(wantEnd), bs[0].End)
+	assert.False(t, bs[0].EndInclude)
+}
+
+func TestPrefixSuccessor(t *testing.T) {
+	assert.Equal(t, []byte{0x02}, prefixSuccessor([]byte{0x01, 0xff, 0xff}))
+	assert.Equal(t, []byte{0xf5}, prefixSuccessor([]byte{0xf4}))
+	assert.Nil(t, prefixSuccessor([]byte{0xff, 0xff}))
+}
+
 func TestSortCost(t *testing.T) {
 	assert.Equal(t, 0.0, sortCost(0))
 	assert.Equal(t, 0.0, sortCost(1))
