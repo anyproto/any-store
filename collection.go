@@ -935,6 +935,32 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		c.registerIndexSetRestore(wtx)
+		// The new handles' namespaces exist only in this tx's uncommitted
+		// view: mark them so concurrent readers on older snapshots don't plan
+		// with them (see visibleIndexes), and lift the mark only once the tx
+		// durably commits. A rollback discards the handles themselves via the
+		// registerIndexSetRestore undo, so no flag work is needed there.
+		for _, idx := range newIndexes {
+			idx.uncommitted = &atomic.Bool{}
+			idx.uncommitted.Store(true)
+		}
+		for _, fx := range newFtsIndexes {
+			fx.uncommitted.Store(true)
+		}
+		for _, vi := range newVIndexes {
+			vi.uncommitted.Store(true)
+		}
+		wtx.onCommitPublish(func() {
+			for _, idx := range newIndexes {
+				idx.uncommitted.Store(false)
+			}
+			for _, fx := range newFtsIndexes {
+				fx.uncommitted.Store(false)
+			}
+			for _, vi := range newVIndexes {
+				vi.uncommitted.Store(false)
+			}
+		})
 		// Copy-on-write publish: build fresh slices (current snapshot + new
 		// indexes) and swap them in atomically so lock-free query readers always
 		// see a complete generation.

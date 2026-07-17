@@ -338,6 +338,23 @@ type index struct {
 
 	cboInfo *qplanner.IndexInfo // cached CBO index info, built once during init
 
+	// uncommitted marks a handle published to the shared CoW snapshot by a DDL
+	// whose write tx has not committed yet (createIndexes publishes at
+	// execution time so same-tx writes maintain the new index). Its namespace
+	// exists only in the creator's uncommitted view, so every OTHER tx must
+	// not plan with it — a stale-snapshot reader seeking it would scan an
+	// empty namespace and return wrong results with no error (Count = 0 while
+	// Iter finds rows). Cleared by the creating tx's commit publication; a
+	// rollback discards the handle itself (registerIndexSetRestore).
+	//
+	// A pointer, SHARED by clones and immutable after creation (nil on
+	// reconcile-built handles == committed): a same-tx Rename republishes the
+	// pending index through cloneWithNs, and the creator's commit publication
+	// holds the original — only a shared flag also lifts the clone's mark.
+	// The Bool is written by the single writer and read lock-free by
+	// concurrent planners; see isUncommitted and visibleIndexes.
+	uncommitted *atomic.Bool
+
 	keyBuf      anyenc.Tuple
 	keysBuf     []anyenc.Tuple
 	keysBufPrev []anyenc.Tuple
@@ -364,6 +381,12 @@ func (idx *index) loadPubSketch() *qplanner.IndexSketch { return idx.sketchPub.L
 // storePubSketch publishes a reader snapshot. Callers hold c.mu (publisher
 // serialisation, like storeIndexes); readers need no lock.
 func (idx *index) storePubSketch(s *qplanner.IndexSketch) { idx.sketchPub.Store(s) }
+
+// isUncommitted reports whether this handle's creating DDL tx has not yet
+// committed; see the uncommitted field.
+func (idx *index) isUncommitted() bool {
+	return idx.uncommitted != nil && idx.uncommitted.Load()
+}
 
 // cloneWithNs returns a copy of the index bound to a different namespace
 // handle; Rename publishes clones copy-on-write (via storeIndexes) because
@@ -392,6 +415,10 @@ func (idx *index) cloneWithNs(ns *btree.Namespace) *index {
 	cbo.Ns = ns
 	n.cboInfo = &cbo
 	n.sketchPub.Store(idx.loadPubSketch())
+	// Shared, not copied: a rename in the same tx as an uncommitted create
+	// keeps the pending state, and the creator's commit publication must lift
+	// it through the clone too.
+	n.uncommitted = idx.uncommitted
 	return n
 }
 

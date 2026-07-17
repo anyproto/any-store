@@ -8,6 +8,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
@@ -35,6 +36,19 @@ type vectorIndex struct {
 	ix *vindex.Index
 	// ivf is the btree-resident IVF-PQ index for VectorModeIVFPQ; nil otherwise.
 	ivf *vivf.StoreIndex
+
+	// uncommitted: the creating DDL tx (createIndexes or CompactVectorIndex)
+	// has not committed; other txs must not search through this handle. Same
+	// contract as index.uncommitted — see there and visibleIndexes.
+	uncommitted atomic.Bool
+	// prev is the handle this one replaced (compaction), still valid in every
+	// committed snapshot: while uncommitted, a non-creator tx searches through
+	// prev instead. Set before the CoW publish and never cleared — a reader
+	// that loaded uncommitted just before the commit publication may still
+	// dereference it, and its pre-commit snapshot is exactly what prev serves.
+	// nil for a freshly created index (nothing to serve; the reader errors as
+	// it did before the DDL began).
+	prev *vectorIndex
 }
 
 // isIVF reports whether this index uses the IVF backend (PQ or SQ).
@@ -639,7 +653,11 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 		// in the index.
 		spec.Ef = knnEf(knn.Ef, captured.ivf.NProbe()*8, knn.K, hasResidual)
 		spec.Search = func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
-			cands, err := captured.ivf.SearchCandidates(tx, qv, ef)
+			svi, err := captured.forTx(tx)
+			if err != nil {
+				return nil, err
+			}
+			cands, err := svi.ivf.SearchCandidates(tx, qv, ef)
 			if err != nil {
 				return nil, err
 			}
@@ -659,13 +677,21 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 			topK = knn.K
 		}
 		spec.Search = func(tx *btree.ReadTx, qv []float32, _ int) ([]qplanner.VectorCandidate, error) {
-			return q.c.bruteVectorCandidates(tx, captured, qv, topK)
+			svi, err := captured.forTx(tx)
+			if err != nil {
+				return nil, err
+			}
+			return q.c.bruteVectorCandidates(tx, svi, qv, topK)
 		}
 	default:
 		// HNSW: ef is the beam width.
 		spec.Ef = knnEf(knn.Ef, vi.ix.EfSearch(), knn.K, hasResidual)
 		spec.Search = func(tx *btree.ReadTx, qv []float32, ef int) ([]qplanner.VectorCandidate, error) {
-			cands, err := captured.ix.SearchCandidates(tx, qv, ef)
+			svi, err := captured.forTx(tx)
+			if err != nil {
+				return nil, err
+			}
+			cands, err := svi.ix.SearchCandidates(tx, qv, ef)
 			if err != nil {
 				return nil, err
 			}
@@ -677,6 +703,24 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 		}
 	}
 	return spec, residual, nil
+}
+
+// forTx resolves the handle the given SCAN tx may search through — the
+// visibility gate of visibleIndexes, vector-shaped. The creator's own write
+// tx (single-writer: any write-tx view) uses the handle as resolved. Another
+// tx during the uncommitted window falls back to prev — the pre-compaction
+// handle, whose namespaces its committed snapshot still holds — or, for a
+// freshly created index (prev == nil), errors exactly as it did before the
+// DDL began. The compact fallback preserves the mode, so the backend branch
+// chosen at detect time stays valid for prev.
+func (vi *vectorIndex) forTx(tx *btree.ReadTx) (*vectorIndex, error) {
+	if !vi.uncommitted.Load() || tx.IsWriteTx() {
+		return vi, nil
+	}
+	if vi.prev != nil {
+		return vi.prev, nil
+	}
+	return nil, fmt.Errorf("%w: vector index %q", ErrIndexNotFound, vi.info.Name)
 }
 
 // knnOf extracts the Knn from a leaf, accepting the pointer form too: every

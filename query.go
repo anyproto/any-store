@@ -124,6 +124,36 @@ func (q *collQuery) Sort(sorts ...any) Query {
 	return q
 }
 
+// visibleIndexes filters the CoW index snapshot down to the handles the given
+// tx may plan with: handles whose creating DDL tx has not committed are
+// excluded (their namespaces exist only in the creator's uncommitted view — a
+// stale-snapshot reader that selected one would scan an empty namespace and
+// return wrong results with no error, e.g. Count = 0 while Iter finds rows,
+// for the whole DDL/backfill window). Single-writer makes the check
+// creator-free: while a pending handle exists, its creating write tx IS the
+// open write tx, so any write-tx view (IsWriteTx) is the creator's own —
+// which must keep seeing the index for same-tx queries — and every other tx
+// skips it. The common case (nothing pending) returns the snapshot unchanged.
+func visibleIndexes(btx *btree.ReadTx, idxs []*index) []*index {
+	pending := false
+	for _, idx := range idxs {
+		if idx.isUncommitted() {
+			pending = true
+			break
+		}
+	}
+	if !pending || btx.IsWriteTx() {
+		return idxs
+	}
+	out := make([]*index, 0, len(idxs)-1)
+	for _, idx := range idxs {
+		if !idx.isUncommitted() {
+			out = append(out, idx)
+		}
+	}
+	return out
+}
+
 // reportCandidates builds the CBO candidate list for Explain's index report
 // on the fts/vector paths, where compilation never consults the CBO. Nil for
 // every other verb.
@@ -131,7 +161,7 @@ func (q *collQuery) reportCandidates(btx *btree.ReadTx, opts planOpts) []qplanne
 	if !opts.wantCandidates {
 		return nil
 	}
-	idxs := q.c.loadIndexes()
+	idxs := visibleIndexes(btx, q.c.loadIndexes())
 	br := q.buildBoundsResult(idxs)
 	return q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
 }
@@ -286,7 +316,7 @@ func (q *collQuery) compilePlan(ctx context.Context, btx *btree.ReadTx, buf *syn
 	// multikey-flag probe gating tight seek bounds must read the same
 	// snapshot the scan executes on.
 	sorter := q.writeSorter(opts)
-	idxs := q.c.loadIndexes()
+	idxs := visibleIndexes(btx, q.c.loadIndexes())
 	br := q.buildBoundsResult(idxs)
 	cboIndexes := q.buildCBOIndexesInto(nil, &br, idxs, btx, opts.countOnly)
 	totalDocs := q.docCountForPlan(btx, idxs)
@@ -853,9 +883,17 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 			return 0
 		}
 		for _, vi := range q.c.loadVectorIndexes() {
+			// Same visibility rule as visibleIndexes: an index whose creating
+			// tx has not committed is not a candidate for this tx.
+			if vi.uncommitted.Load() && !tx.IsWriteTx() {
+				continue
+			}
 			addIndex(vi.info.Name, sourceCost(vi.info.Name))
 		}
 		for _, fx := range q.c.loadFtsIndexes() {
+			if fx.uncommitted.Load() && !tx.IsWriteTx() {
+				continue
+			}
 			addIndex(fx.info.Name, sourceCost(fx.info.Name))
 		}
 		return nil

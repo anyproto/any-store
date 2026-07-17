@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"slices"
+	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
@@ -65,6 +66,11 @@ type ftsIndex struct {
 	// pending is the per-tx write-back buffer (postings + vocab deltas), flushed
 	// at commit. See fulltext_pending.go.
 	pending ftsPending
+
+	// uncommitted: the creating DDL tx has not committed; other txs must not
+	// search through this handle (empty namespaces in their snapshots). Same
+	// contract as index.uncommitted — see there and visibleIndexes.
+	uncommitted atomic.Bool
 
 	// nFields is the number of indexed fields (== len(fieldPaths)); each token's
 	// field index keys into the FieldMask / per-field TF of the v2 postings.
