@@ -957,6 +957,22 @@ func isSourceLeaf(f Filter) bool {
 	return false
 }
 
+func isTextLeaf(f Filter) bool {
+	switch f.(type) {
+	case Text, *Text:
+		return true
+	}
+	return false
+}
+
+// ContainsText reports whether the tree contains a Text ANYWHERE, pointer
+// nodes included — same full-walk contract as ContainsKnn. Consumers use it
+// both to reject bad placements ($text under $or/$nor/$not) and as the
+// post-condition that the fts residual extraction stripped every Text node.
+func ContainsText(f Filter) bool {
+	return FilterTreeAny(f, isTextLeaf)
+}
+
 // ContainsKnn reports whether the tree contains a Knn ANYWHERE. It MUST walk
 // the whole tree, pointer nodes included: a Knn under Not would evaluate
 // !false == match-all (see the Knn type comment), so every consumer that
