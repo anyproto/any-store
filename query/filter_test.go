@@ -562,6 +562,49 @@ func TestIn(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, f.Ok(doc, docBuf))
 	})
+
+	// A null member matches a MISSING field, keeping $in consistent with
+	// {"$eq":null} (Comp.Ok probes encodedNull for a nil value) and with the
+	// index/Count path (a missing field is indexed under TypeNull, and
+	// In.IndexBounds emits a point bound for the null member).
+	t.Run("null member matches missing field", func(t *testing.T) {
+		f, err := ParseCondition(`{"x": {"$in": [null]}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(doc, docBuf))
+	})
+	t.Run("no null member: missing field not matched", func(t *testing.T) {
+		f, err := ParseCondition(`{"x": {"$in": [1, "y"]}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(doc, docBuf))
+	})
+	t.Run("null member matches explicit null", func(t *testing.T) {
+		f, err := ParseCondition(`{"x": {"$in": [null]}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"x":null}`), docBuf))
+	})
+	t.Run("null member matches null array element", func(t *testing.T) {
+		f, err := ParseCondition(`{"x": {"$in": [null]}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"x":[null,1]}`), docBuf))
+	})
+	t.Run("hand-built In: nil probe by null membership", func(t *testing.T) {
+		withNull := In{Values: map[string]struct{}{string(encodedNull): {}}}
+		assert.True(t, withNull.Ok(nil, docBuf))
+		withoutNull := In{Values: map[string]struct{}{"x": {}}}
+		assert.False(t, withoutNull.Ok(nil, docBuf))
+	})
+	// Complements keep excluding missing fields: $nin parses to Nor-of-$eq
+	// (Comp already matches missing via encodedNull), and Not inverts Ok.
+	t.Run("nin null excludes missing field", func(t *testing.T) {
+		f, err := ParseCondition(`{"x": {"$nin": [null]}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(doc, docBuf))
+	})
+	t.Run("not-in null excludes missing field", func(t *testing.T) {
+		f, err := ParseCondition(`{"x": {"$not": {"$in": [null]}}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(doc, docBuf))
+	})
 }
 
 func TestIn_IndexBounds(t *testing.T) {
