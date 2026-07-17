@@ -126,7 +126,7 @@ func (q *aggQuery) validateInPipelineStages(rest aggregate.Pipeline) error {
 		if !ok {
 			continue
 		}
-		if containsText(m.Filter) {
+		if query.ContainsText(m.Filter) {
 			return errAggTextNotInPrefix
 		}
 		if query.ContainsKnn(m.Filter) {

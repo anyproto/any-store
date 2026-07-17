@@ -187,6 +187,27 @@ func (c *collection) Stats(ctx context.Context) (stats CollectionStats, err erro
 	pageSize := int(c.db.btreeDB.PageSize())
 
 	err = c.db.doReadTx(ctx, func(tx *btree.ReadTx) error {
+		// Visibility gate, like the query path: a handle whose creating DDL
+		// tx has not committed resolves to nothing in this tx's snapshot —
+		// NamespaceSize on it would fail the whole Stats call. Vector handles
+		// go through forTx so a compaction window reports the committed
+		// (pre-compaction) index instead of dropping it from the report.
+		indexes = visibleIndexes(tx, indexes)
+		keptV := vindexes[:0]
+		for _, vi := range vindexes {
+			if svi, ferr := vi.forTx(tx); ferr == nil {
+				keptV = append(keptV, svi)
+			}
+		}
+		vindexes = keptV
+		keptF := ftsindexes[:0]
+		for _, fx := range ftsindexes {
+			if fx.visibleTo(tx) {
+				keptF = append(keptF, fx)
+			}
+		}
+		ftsindexes = keptF
+
 		// Documents: scan the collection B-tree summing stored and
 		// uncompressed value sizes.
 		cursor := tx.NewCursor(c.ns)

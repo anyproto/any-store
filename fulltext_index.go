@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"slices"
+	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
@@ -65,6 +66,11 @@ type ftsIndex struct {
 	// pending is the per-tx write-back buffer (postings + vocab deltas), flushed
 	// at commit. See fulltext_pending.go.
 	pending ftsPending
+
+	// uncommitted: the creating DDL tx has not committed; other txs must not
+	// search through this handle (empty namespaces in their snapshots). Same
+	// contract as index.uncommitted — see there, visibleTo and visibleIndexes.
+	uncommitted atomic.Bool
 
 	// nFields is the number of indexed fields (== len(fieldPaths)); each token's
 	// field index keys into the FieldMask / per-field TF of the v2 postings.
@@ -178,6 +184,14 @@ func (fx *ftsIndex) bindNamespaces(resolve func(name string) (*btree.Namespace, 
 }
 
 func (fx *ftsIndex) Info() IndexInfo { return fx.info }
+
+// visibleTo reports whether the given tx may search through this handle — the
+// visibility gate of visibleIndexes, fts-shaped (see index.uncommitted): an
+// uncommitted handle is visible only to its creating write tx (single-writer:
+// any write-tx view).
+func (fx *ftsIndex) visibleTo(tx *btree.ReadTx) bool {
+	return !fx.uncommitted.Load() || tx.IsWriteTx()
+}
 
 // metaRootUnchanged reports whether the ftx: meta namespace still resolves to
 // the btree root this handle was bound against — false after a peer

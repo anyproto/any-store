@@ -657,10 +657,15 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 		return nil, err
 	}
 	db.mu.Lock()
-	if _, ok := db.openedCollections[collectionName]; ok {
+	if existing, ok := db.openedCollections[collectionName]; ok && !existing.(*collection).closed.Load() {
 		db.mu.Unlock()
 		return nil, ErrCollectionExists
 	}
+	// A CLOSED registered handle is a Drop in an open tx (eviction is
+	// deferred to its commit publication): whether the name is creatable is
+	// decided by the catalog check inside the tx below — the dropping tx
+	// sees its own delete and recreates; a concurrent creator blocks on the
+	// write lock and then sees whatever committed.
 	db.mu.Unlock()
 	merged := mergeCollOpts(opts)
 	pk := merged.PrimaryKey
@@ -718,6 +723,8 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 		}
 
 		db.mu.Lock()
+		// Plain assignment: a same-tx Drop's closed handle may still occupy
+		// the slot (its deferred eviction then finds nothing to evict).
 		db.openedCollections[collectionName] = coll
 		db.mu.Unlock()
 
@@ -753,17 +760,22 @@ func (db *db) CreateCollection(ctx context.Context, collectionName string, opts 
 
 func (db *db) OpenCollection(ctx context.Context, collectionName string) (Collection, error) {
 	db.mu.Lock()
-	if coll, ok := db.openedCollections[collectionName]; ok {
+	if coll, ok := db.openedCollections[collectionName]; ok && !coll.(*collection).closed.Load() {
 		db.mu.Unlock()
 		return coll, nil
 	}
+	// A CLOSED registered handle is a Drop in an open tx: fall through to the
+	// catalog check, which is ctx-aware — the dropping tx sees its own delete
+	// (ErrCollectionNotFound, the correct same-tx answer), while a concurrent
+	// caller sees the committed row and gets the closed handle back below
+	// (fail-safe: ops error until the drop resolves).
 	db.mu.Unlock()
 	return db.openCollection(ctx, collectionName)
 }
 
 func (db *db) openCollection(ctx context.Context, collectionName string) (Collection, error) {
 	db.mu.Lock()
-	if coll, ok := db.openedCollections[collectionName]; ok {
+	if coll, ok := db.openedCollections[collectionName]; ok && !coll.(*collection).closed.Load() {
 		db.mu.Unlock()
 		return coll, nil
 	}
@@ -792,6 +804,9 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if existing, ok := db.openedCollections[collectionName]; ok {
+		// Includes a CLOSED drop-in-flight handle: registering the fresh one
+		// over it would revive the dangling-handle corruption Drop's deferred
+		// eviction closes — return the closed handle instead (fail-safe).
 		return existing, nil
 	}
 	db.openedCollections[collectionName] = coll
@@ -1233,6 +1248,13 @@ func (db *db) persistAllDirtySketches(tx *btree.WriteTx) error {
 	defer db.mu.Unlock()
 	for _, coll := range db.openedCollections {
 		c := coll.(*collection)
+		if c.closed.Load() {
+			// A Drop in this tx (eviction deferred to its commit
+			// publication): its stat_data rows were deleted with the
+			// collection — persisting the still-dirty sketches would durably
+			// resurrect orphaned rows a later same-named index would adopt.
+			continue
+		}
 		if err := c.persistSketches(tx); err != nil {
 			return err
 		}
