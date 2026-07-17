@@ -421,10 +421,22 @@ func TestWALIndexReset(t *testing.T) {
 	mustWiSet(t, idx, 2, 2)
 	assert.Equal(t, uint32(2), idx.maxFrame.Load())
 
-	idx.reset()
+	idx.reset(false)
 	assert.Equal(t, uint32(0), idx.maxFrame.Load())
 	assert.Equal(t, uint32(0), mustWiGet(t, idx, 1, 100))
 	assert.Equal(t, uint32(0), mustWiGet(t, idx, 2, 100))
+}
+
+// shmWriteCkptInfoForTest publishes both counters and every read-mark from the
+// process-local mirrors — the safe composition of the single-word publishers,
+// for round-trip tests. Production code must never bulk-write marks; see the
+// invariant note above shmWriteNBackfill.
+func shmWriteCkptInfoForTest(wi *walIndex) {
+	wi.shmWriteNBackfill()
+	wi.shmWriteNBackfillAttempted()
+	for i := range wi.aReadMark {
+		wi.shmWriteReadMark(i, wi.aReadMark[i].Load())
+	}
 }
 
 func TestWALIndexWriteHeader(t *testing.T) {
@@ -436,7 +448,7 @@ func TestWALIndexWriteHeader(t *testing.T) {
 
 	idx.nBackfill.Store(5)
 	require.NoError(t, idx.writeHeader(10, 20, 5, [2]uint32{}, [2]uint32{}))
-	idx.shmWriteCkptInfo()
+	shmWriteCkptInfoForTest(idx)
 
 	// Read back from shm region 0
 	region, err := idx.shm.region(0, false)
