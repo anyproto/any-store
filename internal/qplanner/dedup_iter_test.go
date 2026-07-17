@@ -601,3 +601,86 @@ func TestDocDedup_HashSetStress(t *testing.T) {
 		require.Equal(t, 1, count, "docId %q must be emitted exactly once (got %d)", docId, count)
 	}
 }
+
+// mkIter is a stub source with per-hit multiKey flags, mirroring what
+// IndexIter emits from the per-entry value byte on a compound multikey index.
+type mkIter struct {
+	hits []mkHit
+	i    int
+}
+
+type mkHit struct {
+	docId    string
+	multiKey bool
+}
+
+func (f *mkIter) Next() ([]byte, []byte, bool, error) {
+	if f.i >= len(f.hits) {
+		return nil, nil, false, nil
+	}
+	h := f.hits[f.i]
+	f.i++
+	return []byte("k" + h.docId), []byte(h.docId), h.multiKey, nil
+}
+func (f *mkIter) Close()         {}
+func (f *mkIter) String() string { return "mk" }
+
+func TestDocDedupIter(t *testing.T) {
+	drain := func(it *DocDedupIter) (ids []string) {
+		for {
+			_, docId, mk, err := it.Next()
+			require.NoError(t, err)
+			if docId == nil {
+				return
+			}
+			assert.False(t, mk, "DocDedupIter must emit multiKey=false")
+			ids = append(ids, string(docId))
+		}
+	}
+
+	t.Run("multikey duplicates collapse to first occurrence", func(t *testing.T) {
+		src := &mkIter{hits: []mkHit{
+			{"d1", true}, {"d2", true}, {"d1", true}, {"d3", false}, {"d1", true}, {"d2", true},
+		}}
+		it := &DocDedupIter{Source: src}
+		assert.Equal(t, []string{"d1", "d2", "d3"}, drain(it))
+	})
+
+	t.Run("scalar stream passes through with no map", func(t *testing.T) {
+		src := &mkIter{hits: []mkHit{{"a", false}, {"b", false}, {"a", false}}}
+		it := &DocDedupIter{Source: src}
+		// multiKey=false is a hard uniqueness guarantee from the source; the
+		// duplicate "a" here deliberately violates it to prove the fast path
+		// does not dedup (and allocates no seen-set).
+		assert.Equal(t, []string{"a", "b", "a"}, drain(it))
+		assert.Nil(t, it.dedup.seen, "scalar entries must not allocate the seen-set")
+	})
+
+	t.Run("skipOffset delegates to an offsetSkipper source", func(t *testing.T) {
+		src := &fakeSkipIter{remainder: 1}
+		it := &DocDedupIter{Source: src}
+		rem, err := it.skipOffset(3)
+		require.NoError(t, err)
+		assert.Equal(t, 1, rem)
+		assert.Equal(t, 1, src.skipCalls)
+		assert.Equal(t, 3, src.lastSkipN)
+	})
+
+	t.Run("skipOffset without a skipper source skips nothing", func(t *testing.T) {
+		it := &DocDedupIter{Source: &mkIter{}}
+		rem, err := it.skipOffset(4)
+		require.NoError(t, err)
+		assert.Equal(t, 4, rem)
+	})
+
+	t.Run("close propagates", func(t *testing.T) {
+		tr := &closeTrackingIter{}
+		(&DocDedupIter{Source: tr}).Close()
+		assert.Equal(t, 1, tr.closed)
+	})
+
+	t.Run("string", func(t *testing.T) {
+		it := &DocDedupIter{Source: &mkIter{}}
+		assert.Equal(t, "mk -> Dedup(docid)", it.String())
+	})
+}

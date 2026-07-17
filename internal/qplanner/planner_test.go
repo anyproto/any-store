@@ -3316,6 +3316,8 @@ func TestBuildPlan_IndexScan_CoverFiltersInsertsIndexFilterIter(t *testing.T) {
 			root = r.Source
 		case *CanonicalKeyDedupIter:
 			root = r.Source
+		case *DocDedupIter:
+			root = r.Source
 		case *FilterIter:
 			root = r.Source
 		case *FetchIter:
