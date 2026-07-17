@@ -1141,11 +1141,18 @@ func (r Regexp) IndexBounds(_ string, bs Bounds) (bounds Bounds) {
 	)
 	// strip the 'eof' byte
 	prefixEncoded = prefixEncoded[:len(prefixEncoded)-1]
+	// Exclusive prefix-successor End, not the inclusive prefix+0xFF idiom:
+	// the latter drops any value whose payload continues with a raw 0xFF
+	// byte right after the prefix (the key is longer, so it compares greater
+	// than the End) — the same under-approximation 192c239 removed from
+	// TypeFilter. The successor admits exactly the prefix-continuation
+	// group, and survives the reverse-index transform (see
+	// qplanner.transformReverseBounds).
 	bound := Bound{
 		Start:        prefixEncoded,
-		End:          append(prefixEncoded, 255),
+		End:          PrefixSuccessor(prefixEncoded),
 		StartInclude: true,
-		EndInclude:   true,
+		EndInclude:   false,
 	}
 	return bs.Append(bound)
 }

@@ -86,3 +86,31 @@ func TestFtsPlacementRejections(t *testing.T) {
 	_, err := coll.Find(`{"$and":[{"$text":{"$search":"london"}},{"$and":[{"$text":{"$search":"fog"}}]}]}`).Count(ctx)
 	assert.ErrorIs(t, err, errFtsMultiple)
 }
+
+// TestFtsPointerFilterForms pins detection symmetry for programmatic filters
+// (ParseCondition passes a query.Filter through verbatim): pointer-built
+// nodes must behave exactly like their value forms — a *Text is a real $text
+// (searched, not silently ignored fail-open), and a Text inside a pointer
+// composite is a placement error, not a match-all.
+func TestFtsPointerFilterForms(t *testing.T) {
+	fx, coll := ftsPipelineColl(t)
+	defer fx.finish()
+	tf := query.MustParseCondition(`{"$text":{"$search":"london"}}`).(query.Text)
+
+	// *Text inside $and: the BM25 search must run — only the three "london"
+	// docs match, not all four.
+	ids, _ := collectIter(t, coll.Find(query.And{&tf, query.MustParseCondition(`{"status":"open"}`)}))
+	assert.ElementsMatch(t, []string{"a", "c"}, ids)
+
+	// Text inside pointer composites: same placement rejection as the value
+	// forms.
+	for _, f := range []query.Filter{
+		&query.Or{tf, query.MustParseCondition(`{"status":"open"}`)},
+		&query.Nor{tf},
+		&query.Not{Filter: tf},
+		query.And{tf, &query.Key{Path: []string{"a"}, Filter: tf}},
+	} {
+		_, err := coll.Find(f).Count(ctx)
+		assert.ErrorIs(t, err, errFtsBadPlacement, "%T", f)
+	}
+}

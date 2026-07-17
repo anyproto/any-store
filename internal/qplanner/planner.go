@@ -2104,25 +2104,6 @@ func invertBytes(b []byte) []byte {
 	return out
 }
 
-// prefixSuccessor returns the smallest byte string greater than every string
-// prefixed by p: trailing 0xFF bytes are stripped and the last remaining byte
-// incremented. Used as an EXCLUSIVE End, the result admits exactly the
-// p-prefixed keys. Returns nil (+inf) when p is all-0xFF (no successor
-// exists; unreachable for anyenc bounds — inverted tags top out at 0xFE).
-// p must be freshly allocated (invertBytes output): it is truncated and
-// mutated in place.
-func prefixSuccessor(p []byte) []byte {
-	i := len(p) - 1
-	for i >= 0 && p[i] == 0xff {
-		i--
-	}
-	if i < 0 {
-		return nil
-	}
-	p = p[:i+1]
-	p[i]++
-	return p
-}
 
 // transformReverseBounds maps per-field bounds from ascending value space into
 // the inverted (stored) byte space used for a reverse-flagged index field.
@@ -2177,8 +2158,15 @@ func transformReverseBounds(bs query.Bounds) query.Bounds {
 		// Starts keep the plain inverted End: their continuations obey the
 		// tuple-boundary invariant, and the 0xFF pad both admits them and
 		// deliberately excludes ascending 0xFF escape tails.
+		//
+		// The transformed endpoints stay slightly OVER-approximate after the
+		// downstream pads (padReverseBounds widens both the exclusive-Start
+		// 0xFF pad and this exclusive End with 0x01): a handful of
+		// adjacent-value keys can enter the scan and are rejected by the
+		// residual FilterIter. Any future exactness-based residual elision
+		// must therefore treat prefix-derived bounds as INEXACT.
 		if b.StartInclude && len(b.Start) > 0 && anyenc.ValidateRaw(b.Start) != nil {
-			nb.End = prefixSuccessor(nb.End)
+			nb.End = query.PrefixSuccessor(nb.End)
 			nb.EndInclude = false
 		}
 		out = append(out, nb)

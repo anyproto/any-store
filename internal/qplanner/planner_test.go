@@ -717,9 +717,15 @@ func TestTransformReverseBounds_PrefixStart(t *testing.T) {
 	assert.Equal(t, anyenc.Tuple{0xf3}, bs[0].Start)
 	assert.False(t, bs[0].StartInclude)
 
-	// The $regex shape: tag + prefix bytes, no EOS.
+	// The $regex shape, taken from the real emitter so this test pins what
+	// Regexp.IndexBounds actually produces (prefix-successor exclusive End).
+	rf := query.MustParseCondition(`{"name":{"$regex":"^foo"}}`)
+	fwd := rf.IndexBounds("name", nil)
+	require.Len(t, fwd, 1)
 	pfx := append([]byte{0x03}, "foo"...)
-	bs = transformReverseBounds(query.Bounds{{Start: pfx, End: append([]byte{0x03}, "fop"...), StartInclude: true, EndInclude: false}})
+	require.Equal(t, anyenc.Tuple(pfx), fwd[0].Start)
+	require.False(t, fwd[0].EndInclude)
+	bs = transformReverseBounds(fwd)
 	require.Len(t, bs, 1)
 	wantEnd := invertBytes(pfx)
 	wantEnd[len(wantEnd)-1]++
@@ -728,9 +734,10 @@ func TestTransformReverseBounds_PrefixStart(t *testing.T) {
 }
 
 func TestPrefixSuccessor(t *testing.T) {
-	assert.Equal(t, []byte{0x02}, prefixSuccessor([]byte{0x01, 0xff, 0xff}))
-	assert.Equal(t, []byte{0xf5}, prefixSuccessor([]byte{0xf4}))
-	assert.Nil(t, prefixSuccessor([]byte{0xff, 0xff}))
+	assert.Equal(t, []byte{0x02}, query.PrefixSuccessor([]byte{0x01, 0xff, 0xff}))
+	assert.Equal(t, []byte{0xf5}, query.PrefixSuccessor([]byte{0xf4}))
+	assert.Nil(t, query.PrefixSuccessor([]byte{0xff, 0xff}))
+	assert.Nil(t, query.PrefixSuccessor(nil))
 }
 
 func TestSortCost(t *testing.T) {

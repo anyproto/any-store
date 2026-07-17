@@ -986,20 +986,24 @@ func ftsSorter(s query.Sort) query.Sort {
 
 // findTextFilter locates the $text predicate in a parsed filter. v1 supports a
 // $text only at the top level or directly inside an $and (AND context); a $text
-// nested under $or/$nor/$not is rejected. Returns (text, found, error).
+// nested under $or/$nor/$not/Key is rejected. Returns (text, found, error).
+// Every composite is matched in BOTH value and pointer form — the same
+// contract as query.FilterTreeAny: programmatic filters (ParseCondition
+// passes a query.Filter through verbatim) legally build pointer nodes, and a
+// detection walk narrower than the strip/post-condition walk would either
+// silently skip the $text (fail-open: Text.Ok returns true) or trip the
+// residual assert on shapes detection accepted.
 func findTextFilter(f query.Filter) (query.Text, bool, error) {
 	switch ft := f.(type) {
 	case query.Text:
 		return ft, true, nil
+	case *query.Text:
+		return *ft, true, nil
 	case query.And:
 		return findTextInAnd(ft)
 	case *query.And:
 		return findTextInAnd(*ft)
-	case query.Key:
-		if _, ok, _ := findTextFilter(ft.Filter); ok {
-			return query.Text{}, false, errFtsBadPlacement
-		}
-	case query.Or, query.Nor, query.Not:
+	case query.Key, *query.Key, query.Or, *query.Or, query.Nor, *query.Nor, query.Not, *query.Not:
 		if query.ContainsText(f) {
 			return query.Text{}, false, errFtsBadPlacement
 		}

@@ -53,6 +53,26 @@ func (b Bound) String() string {
 	return fmt.Sprintf("%s,%s", as, bs)
 }
 
+// PrefixSuccessor returns the smallest byte string greater than every string
+// prefixed by p: trailing 0xFF bytes are stripped and the last remaining byte
+// incremented, into a fresh slice. Used as an EXCLUSIVE End, the result
+// admits exactly the p-prefixed keys — unlike the append-0xFF inclusive
+// idiom, which excludes any key continuing with a 0xFF byte after the prefix
+// (longer sorts greater). Returns nil (+inf) when p is all-0xFF or empty.
+func PrefixSuccessor(p []byte) []byte {
+	i := len(p) - 1
+	for i >= 0 && p[i] == 0xff {
+		i--
+	}
+	if i < 0 {
+		return nil
+	}
+	out := make([]byte, i+1)
+	copy(out, p[:i+1])
+	out[i]++
+	return out
+}
+
 type Bounds []Bound
 
 func (bs Bounds) String() string {

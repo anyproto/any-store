@@ -116,16 +116,20 @@ func TestReversePrefixBounds(t *testing.T) {
 
 			t.Run("regex prefix "+name, func(t *testing.T) {
 				coll, hint := newColl(t)
-				words := []string{"foo", "foobar", "fop", "fo", "other"}
+				// "foo" is one boundary row: its key continues with the
+				// inverted EOS (0xFF) right after the prefix bytes on a
+				// descending index. "foo\xff\xffz" is the other: a raw 0xFF
+				// payload run right after the prefix (legal — only NUL is
+				// escaped), which the old inclusive prefix+0xFF ascending
+				// End also dropped.
+				words := []string{"foo", "foobar", "fop", "fo", "other", "foo\xff\xffz"}
 				for i, w := range words {
 					w := w
 					trpbInsert(t, coll, i+1, func(a *anyenc.Arena, d *anyenc.Value) { d.Set("v", a.NewString(w)) })
 				}
 
-				// "foo" itself is the boundary row: its key continues with the
-				// inverted EOS (0xFF) right after the prefix bytes.
 				got := trpbFindIds(t, ctx, coll, hint, `{"v":{"$regex":"^foo"}}`)
-				assert.Equal(t, []int{1, 2}, got)
+				assert.Equal(t, []int{1, 2, 6}, got)
 			})
 		}
 	}
