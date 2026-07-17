@@ -187,7 +187,12 @@ type collection struct {
 	indexSetDDLTxs int
 
 	closed atomic.Bool
-	mu     sync.Mutex
+	// userClosed records that Close() was explicitly requested. Drop flips
+	// closed itself (CAS), which makes a Close() racing in AFTER the flip a
+	// silent no-op — this latch lets Drop's rollback undo honor that Close
+	// instead of resurrecting a handle its owner released.
+	userClosed atomic.Bool
+	mu         sync.Mutex
 }
 
 // loadIndexes returns the current index-set snapshot. Safe to call without
@@ -935,6 +940,32 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		c.registerIndexSetRestore(wtx)
+		// The new handles' namespaces exist only in this tx's uncommitted
+		// view: mark them so concurrent readers on older snapshots don't plan
+		// with them (see visibleIndexes), and lift the mark only once the tx
+		// durably commits. A rollback discards the handles themselves via the
+		// registerIndexSetRestore undo, so no flag work is needed there.
+		for _, idx := range newIndexes {
+			idx.uncommitted = &atomic.Bool{}
+			idx.uncommitted.Store(true)
+		}
+		for _, fx := range newFtsIndexes {
+			fx.uncommitted.Store(true)
+		}
+		for _, vi := range newVIndexes {
+			vi.uncommitted.Store(true)
+		}
+		wtx.onCommitPublish(func() {
+			for _, idx := range newIndexes {
+				idx.uncommitted.Store(false)
+			}
+			for _, fx := range newFtsIndexes {
+				fx.uncommitted.Store(false)
+			}
+			for _, vi := range newVIndexes {
+				vi.uncommitted.Store(false)
+			}
+		})
 		// Copy-on-write publish: build fresh slices (current snapshot + new
 		// indexes) and swap them in atomically so lock-free query readers always
 		// see a complete generation.
@@ -1363,30 +1394,75 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 	})
 }
 
-// Drop runs through doWriteTx — the variant that registers no undo — yet its
-// callback calls c.close(), evicting the handle from db.openedCollections. A
-// rollback (an error, or now a panic: see doWriteTxW) therefore restores the
-// on-disk collection while this handle stays closed; callers re-obtain it via
-// db.Collection, which heals the divergence because the map entry is gone.
-// Pre-existing on the error path; tracked separately.
+// Drop closes the handle at execution time (same-tx semantics: later ops
+// through any alias fail ErrCollectionClosed) but defers the eviction from
+// db.openedCollections to COMMIT (see commonTx.pubs). Evicting at execution —
+// what close() would do — opens a corruption window: a concurrent
+// OpenCollection(name) misses the map, passes the catalog check on the
+// still-committed snapshot, and registers a fresh live handle the in-process
+// staleness pass never invalidates (own commits update localSchemaCookie);
+// once the drop commits and a new collection reuses the freed root pages,
+// writes through that handle land inside the wrong collection. Deferring the
+// eviction keeps the closed handle registered through the window, so a
+// concurrent open returns it and fails fail-safe instead. A rollback un-closes
+// the handle: the btree restored the on-disk catalog, the map entry was never
+// touched, and Drop mutates no in-memory index set — so the handle is whole
+// again (this also heals the error path, which previously left it closed and
+// evicted).
 func (c *collection) Drop(ctx context.Context) error {
-	return c.db.doWriteTx(ctx, func(tx *btree.WriteTx) (err error) {
+	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (err error) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if err = c.alive(); err != nil {
 			return err
 		}
-		// Discard buffered fts writes before close: close() preserves a
-		// non-empty pending buffer for the commit-time flush (BUG-01 fix),
-		// but Drop deletes the fts namespaces in this same tx — flushing the
-		// orphaned buffer at commit would write into dropped namespaces and
-		// fail the whole transaction.
+		// Discard buffered fts writes: Drop deletes the fts namespaces in this
+		// same tx — flushing a surviving buffer at commit would write into
+		// dropped namespaces and fail the whole transaction.
 		for _, fx := range c.loadFtsIndexes() {
 			fx.pending.reset()
 		}
-		if err = c.close(); err != nil {
-			return err
+		// CAS, not Store: a user Close() racing between alive() and here wins
+		// the flip and evicts the handle itself — then the rollback undo must
+		// NOT resurrect a handle its owner explicitly closed.
+		if c.closed.CompareAndSwap(false, true) {
+			wtx.onRollbackUndo(func() {
+				// A Close() that landed AFTER the flip was swallowed by its
+				// CAS (no eviction, nil return): honor it now instead of
+				// un-closing a handle its owner released.
+				if c.userClosed.Load() {
+					c.db.onCollectionClose(c)
+					return
+				}
+				// Un-close only while still registered: a same-tx recreate of
+				// the name replaced this map entry, and its own undo evicted
+				// the replacement — reviving an unregistered handle would let
+				// it dangle past future peer DDL (the staleness pass only
+				// walks the registry). Callers re-obtain via db.Collection,
+				// as before.
+				c.db.mu.Lock()
+				registered := false
+				for _, cur := range c.db.openedCollections {
+					if cur == Collection(c) {
+						registered = true
+						break
+					}
+				}
+				c.db.mu.Unlock()
+				if registered {
+					c.closed.Store(false)
+				}
+			})
 		}
+		// The eviction is onCollectionClose verbatim (identity scan — a
+		// Rename earlier in this tx re-keys the entry in its own, earlier
+		// publication and declines to resurrect a closed handle; a same-tx
+		// recreate replaced it, making this a no-op). Its orphan-fts append
+		// is dead weight here: the buffers were reset above and the closed
+		// handle cannot repopulate them.
+		wtx.onCommitPublish(func() {
+			c.db.onCollectionClose(c)
+		})
 		// Delete all index namespaces. Enumerate indexes from the SAME on-disk
 		// source (idx:<coll>: metadata keys) that removeCollection deletes,
 		// rather than the in-memory index set which can lag the on-disk metadata
@@ -1449,6 +1525,10 @@ func (c *collection) Close() error {
 }
 
 func (c *collection) close() error {
+	// Latch the intent BEFORE the CAS: if a Drop in an open tx already
+	// flipped closed, this Close is otherwise a silent no-op, and Drop's
+	// rollback undo must not un-close a handle its owner released.
+	c.userClosed.Store(true)
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
