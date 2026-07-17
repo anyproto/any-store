@@ -439,7 +439,11 @@ func (ic *integrityChecker) checkTreePage(pgno uint32, lower, upper []byte, onLe
 				if cell.overflowPg != 0 {
 					fv, fverr := leafFullValue(pg.data, cellOff, ic.usableSize, ic.pager, ic.walMaxFrame, ic.cache)
 					if fverr != nil {
-						hookVal = nil // hook reports the corrupt value
+						// Surface the error class (I/O vs geometry) beside the
+						// hook's generic corrupt-value report, mirroring the
+						// key path's report above.
+						ic.report("%s cell %d: corrupt leaf value: %v", context, i, fverr)
+						hookVal = nil
 					} else {
 						hookVal = fv
 					}

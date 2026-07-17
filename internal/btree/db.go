@@ -1207,9 +1207,14 @@ func (db *DB) RenameNamespace(tx *WriteTx, oldName, newName string) error {
 	// commit. A Put that succeeds but cannot be read back (e.g. a master-cell
 	// read defect) would otherwise durably brick the namespace — the caller
 	// rolls back on error per the contract above.
+	// The inner error is flattened (%v, not %w) deliberately: a read-back
+	// failure of the ErrNamespaceNotFound class must NOT satisfy
+	// errors.Is(err, ErrNamespaceNotFound) — callers tolerate not-found on
+	// rename (already-missing index namespaces) and would swallow the guard,
+	// committing the very brick it exists to prevent.
 	readBack, err := db.getNamespaceLocked(newName)
 	if err != nil {
-		return fmt.Errorf("%w: rename read-back failed for %q: %w", ErrCorrupt, newName, err)
+		return fmt.Errorf("%w: rename read-back failed for %q: %v", ErrCorrupt, newName, err)
 	}
 	if readBack.rootPage != ns.rootPage {
 		return fmt.Errorf("%w: rename read-back for %q resolved root %d, want %d",
