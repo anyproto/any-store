@@ -177,6 +177,15 @@ type collection struct {
 	// allocating a fresh read buffer per index.
 	sketchReadBuf []byte
 
+	// indexSetDDLTxs counts local write transactions with UNCOMMITTED index-set
+	// publications on this collection (guarded by c.mu; incremented in
+	// registerIndexSetRestore, decremented exactly once at the tx's commit
+	// publish or rollback undo). reconcileIndexes consults it: a concurrent
+	// read tx's staleness pass must not rebuild the sets from ITS (older)
+	// snapshot while the writer's mid-tx publications are in them — it would
+	// evict the writer's uncommitted indexes. See the guard in reconcileIndexes.
+	indexSetDDLTxs int
+
 	closed atomic.Bool
 	mu     sync.Mutex
 }
@@ -963,12 +972,23 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 // swapping; restoring an unchanged set is a harmless pointer store.
 func (c *collection) registerIndexSetRestore(wtx WriteTx) {
 	prevIndexes, prevFts, prevVec := c.loadIndexes(), c.loadFtsIndexes(), c.loadVectorIndexes()
+	// Mark the DDL in flight so a concurrent read tx's reconcile leaves the
+	// sets alone until this tx resolves. Exactly one of the two callbacks runs
+	// per outcome (commit → pubs, rollback/failed commit → undo), so the
+	// counter balances.
+	c.indexSetDDLTxs++
 	wtx.onRollbackUndo(func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		c.storeIndexes(prevIndexes)
 		c.storeFtsIndexes(prevFts)
 		c.storeVectorIndexes(prevVec)
+		c.indexSetDDLTxs--
+	})
+	wtx.onCommitPublish(func() {
+		c.mu.Lock()
+		c.indexSetDDLTxs--
+		c.mu.Unlock()
 	})
 }
 
@@ -976,6 +996,9 @@ func (c *collection) createIndex(ctx context.Context, tx *btree.WriteTx, info In
 	tx.MarkSchemaChanged()
 	if info.Name == "" {
 		info.Name = info.createName()
+	}
+	if err = validateIndexName(info.Name); err != nil {
+		return nil, err
 	}
 	for _, field := range info.Fields {
 		if err = validateIndexField(field); err != nil {
@@ -1036,6 +1059,9 @@ func (c *collection) createFtsIndex(ctx context.Context, tx *btree.WriteTx, info
 	tx.MarkSchemaChanged()
 	if info.Name == "" {
 		info.Name = info.createName()
+	}
+	if err := validateIndexName(info.Name); err != nil {
+		return nil, err
 	}
 	for _, field := range info.Fields {
 		if err := validateIndexField(field); err != nil {
@@ -1572,18 +1598,36 @@ func (c *collection) reconcileIndexes(tx *btree.ReadTx) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.indexSetDDLTxs > 0 {
+		// A local write tx has uncommitted index DDL published in these sets.
+		// The cookie bump this pass reacts to predates that writer's begin (it
+		// holds the cross-process write lock), so the writer's own begin-time
+		// checkStale already reconciled it; rebuilding here from this tx's
+		// OLDER snapshot would evict the writer's uncommitted indexes (its
+		// same-tx inserts would silently stop being indexed, and buffered fts
+		// postings would never flush). Skip — the same argument as the
+		// renameInFlight guard in reconcileIndexSet.
+		return
+	}
+
 	cur := c.loadIndexes()
 	byName := make(map[string]*index, len(cur))
 	for _, idx := range cur {
 		byName[idx.info.Name] = idx
 	}
 
-	// Reconcile vector indexes separately (different namespaces / type).
+	// Reconcile vector and full-text indexes separately (different
+	// namespaces / types). Full-text infos must not fall through to the
+	// range loop below: they have no ix: namespace, so they would silently
+	// fail resolution there and the ftsIndexes snapshot would never track a
+	// peer's full-text DDL — leaving a stale handle that flushes postings
+	// into freed-and-reused ftx: pages, or never adopting a peer's index.
 	c.reconcileVectorIndexesLocked(tx, infos)
+	c.reconcileFtsIndexesLocked(tx, infos)
 
 	rangeInfos := infos[:0:0]
 	for _, info := range infos {
-		if info.Kind != IndexKindVector {
+		if info.Kind != IndexKindVector && !isFulltext(info) {
 			rangeInfos = append(rangeInfos, info)
 		}
 	}

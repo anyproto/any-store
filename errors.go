@@ -71,6 +71,10 @@ var (
 	// under the stale name returns.
 	ErrCollectionClosed = fmt.Errorf("any-store: collection handle is closed (dropped, renamed, or closed): %w", ErrCollectionNotFound)
 
+	// ErrInvalidIndexName is returned when an index name (given or derived from
+	// the field list) exceeds the maximum length (see validateIndexName).
+	ErrInvalidIndexName = errors.New("any-store: invalid index name")
+
 	// ErrIndexExists is returned when attempting to create an index that already exists.
 	ErrIndexExists = errors.New("any-store: index already exists")
 

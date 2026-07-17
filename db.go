@@ -353,9 +353,19 @@ func indexKeyPrefix(collName string) string {
 // with ErrNamespaceExists at index-create or rename time — it can never
 // corrupt silently. Rejecting ":" would also strand pre-validation files whose
 // collection names legally contain it.
+// maxNameLen caps collection and index names. Derived namespace names embed
+// both plus a family prefix/suffix (widest: fts "ftx:"+coll+":"+index+":vocab",
+// +11 bytes), and a master-table cell must keep its 4-byte root value within
+// maxLocalPayload(4096) = 1002, i.e. len(coll)+len(index) <= 987. 255 each
+// leaves ample margin and matches common identifier limits.
+const maxNameLen = 255
+
 func validateCollectionName(name string) error {
 	if name == "" {
 		return fmt.Errorf("%w: name must not be empty", ErrInvalidCollectionName)
+	}
+	if len(name) > maxNameLen {
+		return fmt.Errorf("%w: name exceeds %d bytes", ErrInvalidCollectionName, maxNameLen)
 	}
 	if name == systemNamespace {
 		return fmt.Errorf("%w: %q is reserved", ErrInvalidCollectionName, name)
@@ -364,6 +374,16 @@ func validateCollectionName(name string) error {
 		if strings.HasPrefix(name, prefix) {
 			return fmt.Errorf("%w: prefix %q is reserved for index namespaces", ErrInvalidCollectionName, prefix)
 		}
+	}
+	return nil
+}
+
+// validateIndexName caps the index name AFTER createName() defaulting — a long
+// field list can synthesize a name past the cap just as easily as a caller can
+// pass one.
+func validateIndexName(name string) error {
+	if len(name) > maxNameLen {
+		return fmt.Errorf("%w: name exceeds %d bytes", ErrInvalidIndexName, maxNameLen)
 	}
 	return nil
 }
