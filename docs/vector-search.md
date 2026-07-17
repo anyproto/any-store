@@ -52,10 +52,10 @@ Only `Field` and `Dim` are required. Other `VectorParams`:
 
 | Field | Default | Purpose |
 |---|---|---|
-| `Metric` | `VectorCosine` | distance measure: `VectorCosine`, `VectorL2`, `VectorDot` |
+| `Metric` | `VectorCosine` | distance measure: `VectorCosine`, `VectorL2`, `VectorDot`. `VectorDot` is not supported by the IVF modes (index creation and open fail with `ErrVectorMetricUnsupported`) |
 | `M`, `EfConstruction`, `EfSearch` | sensible defaults (0) | HNSW graph/search tuning |
 | `Quantization` | `VectorQuantNone` | `VectorQuantInt8` ≈ 4× smaller, RAM-resident vectors |
-| `Mode` | `VectorModeBTree` | `VectorModeHybrid` (RAM layer-0 cache) or `VectorModeBruteForce` (exact O(N) scan, no graph) |
+| `Mode` | `VectorModeBTree` | `VectorModeHybrid` (RAM layer-0 cache), `VectorModeBruteForce` (exact O(N) scan, no graph), `VectorModeIVFPQ`/`VectorModeIVFSQ` (inverted-file cells; Cosine/L2 only) |
 | `HybridCacheVectors` | `false` | hybrid only: also cache vectors in RAM for faster search |
 | `CompactRatio` | `0` (off) | auto-compact the graph when tombstones reach this ratio of live nodes |
 

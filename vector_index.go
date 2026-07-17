@@ -90,6 +90,14 @@ func validateVectorParams(p *VectorParams) error {
 	switch p.Mode {
 	case VectorModeBTree, VectorModeHybrid, VectorModeBruteForce:
 	case VectorModeIVFPQ, VectorModeIVFSQ:
+		if p.Metric == VectorDot {
+			// vivf has no dot-product ranking path: its distance surface is
+			// L2, or cosine via unit-normalization (StoreParams.Normalize).
+			// Accepting Dot here would silently rank by L2 — no error,
+			// plausible neighbours, wrong order. Refuse until a real MIPS
+			// path exists (dot-aware coarse assignment + ADC tables).
+			return ErrVectorMetricUnsupported
+		}
 		m := ivfM(p)
 		if p.Dim%m != 0 {
 			return fmt.Errorf("vector index: IVF requires Dim (%d) divisible by M (%d)", p.Dim, m)
@@ -99,6 +107,12 @@ func validateVectorParams(p *VectorParams) error {
 	}
 	return nil
 }
+
+// ErrVectorMetricUnsupported is returned when an index declares a metric the
+// selected mode cannot rank by. Validation runs on both create and open, so a
+// persisted index with an unsupported combination fails loudly instead of
+// silently ranking by the wrong metric.
+var ErrVectorMetricUnsupported = errors.New("any-store: vector index: VectorDot is not supported by IVF modes; use VectorModeBTree, VectorModeHybrid or VectorModeBruteForce, or the Cosine/L2 metrics")
 
 // ivfM resolves the PQ subquantizer count: explicit M, else a default that divides
 // Dim (prefer 96 → 8-dim subspaces for typical embedding dims, else the largest of

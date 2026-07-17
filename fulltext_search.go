@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"slices"
 	"sync"
@@ -965,7 +966,16 @@ func (q *collQuery) detectFtsQuery() (*qplanner.FtsQuerySpec, query.Filter, erro
 			return fx.searchCandidates(tx, text)
 		},
 	}
-	return spec, ftsResidualFilter(q.cond), nil
+	residual := ftsResidualFilter(q.cond)
+	// HARD post-condition, mirroring detectKnnQuery's ContainsKnn assert: a
+	// Text leaking into the residual FilterIter fails OPEN (Text.Ok returns
+	// true unconditionally), so today a leak only wastes a predicate — but
+	// any future fail-closed Text.Ok, or a residual evaluated against
+	// non-candidates, would turn it into silent 0-row results on every verb.
+	if query.ContainsText(residual) {
+		return nil, nil, fmt.Errorf("%w: internal: $text survived residual extraction", errFtsBadPlacement)
+	}
+	return spec, residual, nil
 }
 
 
@@ -982,21 +992,25 @@ func ftsSorter(s query.Sort) query.Sort {
 
 // findTextFilter locates the $text predicate in a parsed filter. v1 supports a
 // $text only at the top level or directly inside an $and (AND context); a $text
-// nested under $or/$nor/$not is rejected. Returns (text, found, error).
+// nested under $or/$nor/$not/Key is rejected. Returns (text, found, error).
+// Every composite is matched in BOTH value and pointer form — the same
+// contract as query.FilterTreeAny: programmatic filters (ParseCondition
+// passes a query.Filter through verbatim) legally build pointer nodes, and a
+// detection walk narrower than the strip/post-condition walk would either
+// silently skip the $text (fail-open: Text.Ok returns true) or trip the
+// residual assert on shapes detection accepted.
 func findTextFilter(f query.Filter) (query.Text, bool, error) {
 	switch ft := f.(type) {
 	case query.Text:
 		return ft, true, nil
+	case *query.Text:
+		return *ft, true, nil
 	case query.And:
 		return findTextInAnd(ft)
 	case *query.And:
 		return findTextInAnd(*ft)
-	case query.Key:
-		if _, ok, _ := findTextFilter(ft.Filter); ok {
-			return query.Text{}, false, errFtsBadPlacement
-		}
-	case query.Or, query.Nor, query.Not:
-		if containsText(f) {
+	case query.Key, *query.Key, query.Or, *query.Or, query.Nor, *query.Nor, query.Not, *query.Not:
+		if query.ContainsText(f) {
 			return query.Text{}, false, errFtsBadPlacement
 		}
 	}
@@ -1026,64 +1040,41 @@ var (
 	errFtsMultiple     = errors.New("any-store: only one $text expression is supported per query")
 )
 
-// containsText reports whether any node in the filter tree is a $text predicate.
-func containsText(f query.Filter) bool {
-	switch ft := f.(type) {
-	case query.Text:
-		return true
-	case query.And:
-		return anyContainsText(ft)
-	case *query.And:
-		return anyContainsText(*ft)
-	case query.Or:
-		return anyContainsText(query.And(ft))
-	case query.Nor:
-		return anyContainsText(query.And(ft))
-	case query.Not:
-		return containsText(ft.Filter)
-	case query.Key:
-		return containsText(ft.Filter)
-	}
-	return false
-}
-
-func anyContainsText(fs []query.Filter) bool {
-	for _, f := range fs {
-		if containsText(f) {
-			return true
-		}
-	}
-	return false
-}
-
 // ftsResidualFilter returns the filter with the $text clause removed — the
 // predicate the planner's FilterIter applies to the BM25-ranked candidates. A
-// query that is just $text leaves no residual (query.All).
+// query that is just $text leaves no residual (query.All). It recurses
+// through And in both forms, mirroring knnResidualFilter: detection
+// (findTextInAnd) recurses into nested $and, so the strip must too — a
+// shallow strip would hand the FilterIter a residual still containing the
+// Text node.
 func ftsResidualFilter(f query.Filter) query.Filter {
-	switch ft := f.(type) {
-	case query.Text:
-		return query.All{}
-	case query.And:
-		return ftsResidualFromAnd(ft)
-	case *query.And:
-		return ftsResidualFromAnd(*ft)
+	if r := ftsStripText(f); r != nil {
+		return r
 	}
-	return f
+	return query.All{}
 }
 
-func ftsResidualFromAnd(and query.And) query.Filter {
-	var rest query.And
-	for _, sub := range and {
-		if _, isText := sub.(query.Text); !isText {
-			rest = append(rest, sub)
+func ftsStripText(f query.Filter) query.Filter {
+	switch ft := f.(type) {
+	case query.Text, *query.Text:
+		return nil
+	case query.And:
+		rest := make(query.And, 0, len(ft))
+		for _, sub := range ft {
+			if r := ftsStripText(sub); r != nil {
+				rest = append(rest, r)
+			}
 		}
+		switch len(rest) {
+		case 0:
+			return nil
+		case 1:
+			return rest[0]
+		default:
+			return rest
+		}
+	case *query.And:
+		return ftsStripText(query.And(*ft))
 	}
-	switch len(rest) {
-	case 0:
-		return query.All{}
-	case 1:
-		return rest[0]
-	default:
-		return rest
-	}
+	return f
 }

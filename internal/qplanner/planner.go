@@ -2104,6 +2104,7 @@ func invertBytes(b []byte) []byte {
 	return out
 }
 
+
 // transformReverseBounds maps per-field bounds from ascending value space into
 // the inverted (stored) byte space used for a reverse-flagged index field.
 // Inversion reverses byte order, so each bound's Start/End are inverted AND
@@ -2133,12 +2134,42 @@ func transformReverseBounds(bs query.Bounds) query.Bounds {
 	}
 	out := make(query.Bounds, 0, len(bs))
 	for _, b := range bs {
-		out = append(out, query.Bound{
+		nb := query.Bound{
 			Start:        invertBytes(b.End),
 			End:          invertBytes(b.Start),
 			StartInclude: b.EndInclude,
 			EndInclude:   b.StartInclude,
-		})
+		}
+		// An inclusive ascending Start whose bytes are an INCOMPLETE value
+		// encoding — a mid-value prefix, as emitted by TypeFilter (bare type
+		// tag) and Regexp (tag + string prefix, no EOS) — does not survive
+		// inversion as an inclusive End: inversion reverses divergent-byte
+		// order but preserves the prefix-extension relation, so every key the
+		// prefix is meant to admit sorts ABOVE inv(prefix). The downstream
+		// inclusive-End pad (AdjustBoundsForNonUnique's 0xFF append) only
+		// rescues continuations that can never be 0xFF — true at tuple
+		// boundaries, where the next byte is a docId/next-field tag or a
+		// 0x00 escape tail, but false mid-value, where the continuation is
+		// inverted payload: a raw 0x00 payload byte (a 1970s ObjectID
+		// timestamp, a float ≤ -~9e307, the EOS of an empty string) inverts
+		// to 0xFF and the key escapes the padded End — silently dropping
+		// rows. Map the prefix to its exact stored-space upper bound instead:
+		// the successor of the inverted prefix, exclusive. Complete-value
+		// Starts keep the plain inverted End: their continuations obey the
+		// tuple-boundary invariant, and the 0xFF pad both admits them and
+		// deliberately excludes ascending 0xFF escape tails.
+		//
+		// The transformed endpoints stay slightly OVER-approximate after the
+		// downstream pads (padReverseBounds widens both the exclusive-Start
+		// 0xFF pad and this exclusive End with 0x01): a handful of
+		// adjacent-value keys can enter the scan and are rejected by the
+		// residual FilterIter. Any future exactness-based residual elision
+		// must therefore treat prefix-derived bounds as INEXACT.
+		if b.StartInclude && len(b.Start) > 0 && anyenc.ValidateRaw(b.Start) != nil {
+			nb.End = query.PrefixSuccessor(nb.End)
+			nb.EndInclude = false
+		}
+		out = append(out, nb)
 	}
 	slices.SortStableFunc(out, func(a, b query.Bound) int {
 		return compareInvertedStart(a.Start, b.Start)

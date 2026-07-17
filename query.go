@@ -203,7 +203,7 @@ func (q *collQuery) validateSources() error {
 		return ErrDistanceWithoutVector
 	}
 	if hasKnn {
-		if containsText(q.cond) {
+		if query.ContainsText(q.cond) {
 			return ErrKnnWithText
 		}
 		if _, _, err := q.detectKnnQuery(); err != nil {

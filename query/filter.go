@@ -957,6 +957,22 @@ func isSourceLeaf(f Filter) bool {
 	return false
 }
 
+func isTextLeaf(f Filter) bool {
+	switch f.(type) {
+	case Text, *Text:
+		return true
+	}
+	return false
+}
+
+// ContainsText reports whether the tree contains a Text ANYWHERE, pointer
+// nodes included — same full-walk contract as ContainsKnn. Consumers use it
+// both to reject bad placements ($text under $or/$nor/$not) and as the
+// post-condition that the fts residual extraction stripped every Text node.
+func ContainsText(f Filter) bool {
+	return FilterTreeAny(f, isTextLeaf)
+}
+
 // ContainsKnn reports whether the tree contains a Knn ANYWHERE. It MUST walk
 // the whole tree, pointer nodes included: a Knn under Not would evaluate
 // !false == match-all (see the Knn type comment), so every consumer that
@@ -1125,11 +1141,18 @@ func (r Regexp) IndexBounds(_ string, bs Bounds) (bounds Bounds) {
 	)
 	// strip the 'eof' byte
 	prefixEncoded = prefixEncoded[:len(prefixEncoded)-1]
+	// Exclusive prefix-successor End, not the inclusive prefix+0xFF idiom:
+	// the latter drops any value whose payload continues with a raw 0xFF
+	// byte right after the prefix (the key is longer, so it compares greater
+	// than the End) — the same under-approximation 192c239 removed from
+	// TypeFilter. The successor admits exactly the prefix-continuation
+	// group, and survives the reverse-index transform (see
+	// qplanner.transformReverseBounds).
 	bound := Bound{
 		Start:        prefixEncoded,
-		End:          append(prefixEncoded, 255),
+		End:          PrefixSuccessor(prefixEncoded),
 		StartInclude: true,
-		EndInclude:   true,
+		EndInclude:   false,
 	}
 	return bs.Append(bound)
 }
