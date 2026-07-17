@@ -101,9 +101,11 @@ build per query and carry no such guarantee.
     (`AppendKeyRaw`, byte-identical — `TestSortAppendKeyRawParity`), the
     aggregation `$sort` stage, and index-order-providing scans (the planner
     demotes `ExactSort` to an in-memory sort whenever the index's intrinsic
-    order could differ: a lower-bounded sort-run field ascending, an
-    upper-bounded one descending, or a descending run on a compound index —
-    unless the index is scalar-proven via its sticky multikey flag).
+    order could differ: any sort run on a compound index — its whole-array
+    entries can precede the key element in either direction, since element
+    types tagged above `TypeArray` exist — or a single-field sort field with
+    a lower cut ascending / an upper cut descending — unless the index is
+    scalar-proven via its sticky multikey flag).
     Documented divergences from Mongo, both deliberate: an EMPTY array sorts
     by its whole-array encoding (after scalars, where the index stores its
     only entry; Mongo sorts `[]` before null — matching that would need a key

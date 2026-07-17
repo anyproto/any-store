@@ -3594,6 +3594,26 @@ func TestIndex_UniqueMultikeyCoverLookupDedup(t *testing.T) {
 	assert.Equal(t, []int{2}, collectIntField(t, coll.Find(filter).Offset(1), "id"))
 	got := collectIntField(t, coll.Find(filter).Limit(2), "id")
 	assert.ElementsMatch(t, []int{1, 2}, got)
+
+	// The array at the SUFFIX field: the whole-array key detector (byte-0
+	// probe) cannot see mid-key arrays, so CoverIter must assume multikey
+	// for compound lookups rather than trust the probe.
+	sfx, err := fx.CreateCollection(ctx, "uniqmk_suffix")
+	require.NoError(t, err)
+	require.NoError(t, sfx.EnsureIndex(ctx, IndexInfo{Fields: []string{"a", "b"}, Unique: true}))
+	require.NoError(t, sfx.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"a":1,"b":[2,3]}`),
+		anyenc.MustParseJson(`{"id":2,"a":1,"b":[4]}`)))
+
+	sfxFilter := `{"a":1,"b":{"$in":[2,3,4]}}`
+	cnt, err = sfx.Find(sfxFilter).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 2, cnt)
+	assert.ElementsMatch(t, []int{1, 2}, collectIntField(t, sfx.Find(sfxFilter), "id"))
+	assert.Equal(t, []int{2}, collectIntField(t, sfx.Find(sfxFilter).Offset(1), "id"))
+	res, err := sfx.Find(sfxFilter).Update(ctx, query.MustParseModifier(`{"$set":{"u":1}}`))
+	require.NoError(t, err)
+	assert.Equal(t, 2, res.Modified)
 }
 
 // Array-valued sort fields must order identically under every plan (Mongo
@@ -3662,6 +3682,14 @@ func TestIndex_ArraySortPlanIndependence(t *testing.T) {
 		idx, plain := build(t, []string{"a", "x"},
 			`{"id":1,"a":1,"x":[1,9]}`, `{"id":2,"a":1,"x":[8,2]}`, `{"id":3,"a":1,"x":5}`)
 		check(t, idx, plain, `{"a":1}`, []int{1, 2, 3}, "-x")
+	})
+	t.Run("compound asc with object elements", func(t *testing.T) {
+		// The whole-array index entry (TypeArray tag) sorts BELOW object
+		// entries, so a forward order-providing scan would surface the array
+		// doc first; the min-element key orders it by enc({"x":9}) instead.
+		idx, plain := build(t, []string{"a", "x"},
+			`{"id":1,"a":1,"x":[{"x":9}]}`, `{"id":2,"a":1,"x":{"x":1}}`)
+		check(t, idx, plain, `{"a":1}`, []int{2, 1}, "x")
 	})
 	t.Run("empty array missing null object", func(t *testing.T) {
 		idx, plain := build(t, []string{"x"},

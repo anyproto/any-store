@@ -164,14 +164,19 @@ func (it *CanonicalKeyDedupIter) String() string {
 // consumer dedup remains as the contract backstop; it sees multiKey=false
 // from this iterator and degenerates to a passthrough.
 //
-// Placement (both index chains): directly above the entry source
-// (IndexIter/IndexFilterIter) and below FetchIter —
-//   - it must stay downstream of IndexFilterIter: cover filters test the
-//     ENTRY key tuple, and a doc's entries differ in covered fields, so
-//     deduping first could emit only an entry the cover filter rejects;
-//   - the residual FilterIter's verdict is per-DOCUMENT (identical across a
-//     doc's entries), so deduping below FetchIter is sound and skips the
+// Placement (three homes): directly above the entry source and below any
+// doc-level stage —
+//   - seek/scan chains: above IndexIter/IndexFilterIter, below FetchIter. It
+//     must stay downstream of IndexFilterIter: cover filters test the ENTRY
+//     key tuple, and a doc's entries differ in covered fields, so deduping
+//     first could emit only an entry the cover filter rejects; the residual
+//     FilterIter's verdict is per-DOCUMENT (identical across a doc's
+//     entries), so deduping below FetchIter is sound and skips the
 //     fetch+parse+filter of every duplicate entry.
+//   - multi-bound CoverIter lookups (unique full-key $in): directly above
+//     CoverIter — no FetchIter exists there, the FilterIter (if any) sits
+//     above and is per-doc, and CoverIter tags compound entries multiKey
+//     conservatively (its byte-0 probe cannot see mid-key array fields).
 //
 // Emits multiKey=false unconditionally: emitted rows are unique by docId.
 // Scalar entries pass through with zero cost (DocDedup.Accept fast path, no

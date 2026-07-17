@@ -288,6 +288,16 @@ type CBOIndex struct {
 	rangeSelTight float64
 }
 
+// fullKeyPointBound reports whether the bound chain pins EVERY index field
+// with an equality. One definition for its three consumers — the CoverIter
+// routing gate and the two IndexIter.FullKeyBound assignments — so they can
+// never drift on what "full-key point bound" means (a doc contributes at most
+// one entry per full key tuple, even on a multikey index; a trailing RANGE
+// bound does not qualify).
+func (idx *CBOIndex) fullKeyPointBound() bool {
+	return idx.PointLookup && idx.BoundFields == len(idx.Info.FieldNames)
+}
+
 // BuildPlan constructs an iterator chain using the Cost-Based Optimizer.
 // It evaluates full scan, index seek, and index scan plans, then picks the cheapest.
 func BuildPlan(params *PlanParams) *Plan {
@@ -1288,7 +1298,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	// Only safe when ALL index fields are covered by equality bounds;
 	// a partial prefix (BoundFields < len(FieldNames)) can match multiple
 	// entries with different trailing fields, so a range scan is needed.
-	if idx.Info.Unique && idx.PointLookup && idx.BoundFields == len(idx.Info.FieldNames) {
+	if idx.Info.Unique && idx.fullKeyPointBound() {
 		var root Iterator = &CoverIter{
 			Source: &CursorSource{
 				Tx: params.Tx,
@@ -1355,7 +1365,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 		Bounds:       idx.Bounds,
 		Reverse:      reverse,
 		PointLookup:  idx.PointLookup,
-		FullKeyBound: idx.PointLookup && idx.BoundFields == len(idx.Info.FieldNames),
+		FullKeyBound: idx.fullKeyPointBound(),
 		ScalarProven: idx.ScalarProven,
 	}
 
@@ -1400,7 +1410,9 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	// raw entries must not consume TopK/offset/limit slots or duplicate
 	// fetches. Single-field indexes get CanonicalKeyDedupIter below instead.
 	// See the DocDedupIter doc comment for the placement constraints.
-	if len(idx.Info.FieldPaths) > 1 {
+	// A resolved scalar proof makes the stage a provable passthrough — skip
+	// it; ScalarProven=false means unknown OR multikey, so the wrap stays.
+	if len(idx.Info.FieldPaths) > 1 && !idx.ScalarProven {
 		root = &DocDedupIter{Source: root}
 	}
 
@@ -1484,7 +1496,7 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 		Bounds:       idx.Bounds, // may be nil for full index scan
 		Reverse:      reverse,
 		PointLookup:  idx.PointLookup,
-		FullKeyBound: idx.PointLookup && idx.BoundFields == len(idx.Info.FieldNames),
+		FullKeyBound: idx.fullKeyPointBound(),
 		ScalarProven: idx.ScalarProven,
 	}
 
@@ -1501,7 +1513,7 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 	// Compound multikey dedup — see buildIndexSeekChain. Must sit ABOVE
 	// IndexFilterIter (per-entry cover verdicts differ across a doc's
 	// entries) and below the fetch.
-	if len(idx.Info.FieldPaths) > 1 {
+	if len(idx.Info.FieldPaths) > 1 && !idx.ScalarProven {
 		root = &DocDedupIter{Source: root}
 	}
 

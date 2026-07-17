@@ -1119,27 +1119,32 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 		}
 		// A covering Count on a compound index needs the proof to keep
 		// CountEntries' page-batch: a compound prefix bound over unproven
-		// data must dedup per entry (fan-out entries != docs).
-		if countOnly && len(idx.cboInfo.FieldPaths) > 1 {
+		// data must dedup per entry (fan-out entries != docs). Only the
+		// exact consuming shape pays the Get — a single point-bound chain
+		// that leaves trailing fields unbound. Full-key chains are already
+		// exact via FullKeyBound, multi-bound and non-point chains route to
+		// the seen-set walk regardless of the proof.
+		if countOnly && len(idx.cboInfo.FieldPaths) > 1 &&
+			cboIdx.PointLookup && len(cboIdx.Bounds) <= 1 &&
+			cboIdx.BoundFields < len(idx.cboInfo.FieldNames) {
 			scalarProven()
 		}
 		// Order-providing gate (Mongo array-sort semantics): an index scan's
-		// intrinsic order equals the min/max-element sort key only when
-		// nothing narrows or reverses the traversal over the sort-matched
-		// fields. Over possibly-multikey data, ExactSort must be demoted —
-		// SortIter then rebuilds the key from the document — when:
-		//   - a sort-run field carries bounds: the scan visits only in-bounds
-		//     element entries, so a doc surfaces at its in-bounds extremum,
-		//     not the global min/max the sort key uses (Mongo's rule: a
-		//     multikey index provides a sort only when the sort fields'
-		//     bounds are [MinKey, MaxKey]); bounds on the equality PREFIX
-		//     are fine — the per-entry cartesian fan-out keeps every suffix
-		//     combination inside the prefix run;
-		//   - a compound run has a descending-requested field: the reverse
-		//     traversal meets the doc's whole-array entry (array type tag,
-		//     above every scalar) before its maximum element. Single-field
-		//     indexes are exempt: CanonicalKeyDedupIter picks the canonical
-		//     element per direction and skips the whole-array entry.
+		// intrinsic order equals the min/max-element sort key only when the
+		// traversal is guaranteed to meet each doc's key element first. Over
+		// possibly-multikey data, ExactSort must be demoted — SortIter then
+		// rebuilds the key from the document — when:
+		//   - the index is COMPOUND: its dedup keeps the first-encountered
+		//     entry, and the whole-array entry can precede the key element
+		//     in either direction (see sortRunNeedsScalarProof);
+		//   - a single-field sort field carries a direction-relevant cut:
+		//     the scan visits only in-bounds element entries, so a doc
+		//     surfaces at its in-bounds extremum, not the global min/max the
+		//     sort key uses (Mongo's rule: a multikey index provides a sort
+		//     only when the sort fields' bounds are [MinKey, MaxKey]).
+		// Bounds on a compound EQUALITY PREFIX would be fine on their own —
+		// the per-entry cartesian fan-out keeps every suffix combination
+		// inside the prefix run — but compound is gated wholesale above.
 		// Scalar-proven indexes keep ExactSort unchanged; the proof is read
 		// lazily, only for candidates the gate would demote.
 		if cboIdx.ExactSort && sortRunNeedsScalarProof(&cboIdx, sortFields, br) && !scalarProven() {
@@ -1155,9 +1160,17 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 // sortRunNeedsScalarProof reports whether idx's ExactSort claim is only valid
 // for scalar-proven data — see the gate in buildCBOIndexesInto.
 //
-// A bound on a sort-run field is only a problem when it can cut off the
-// element the sort key uses, making the doc surface at an in-bounds extremum
-// instead:
+// A COMPOUND index always needs the proof: its dedup keeps the doc's
+// first-encountered entry, and the whole-array entry (TypeArray tag) sorts
+// BELOW element types tagged above it (object, binary, vectorF32, objectId) —
+// so even an unbounded ascending scan can surface a doc at its whole-array
+// position instead of its minimum element, and a descending scan meets the
+// whole-array entry before the maximum element for every element type.
+//
+// A SINGLE-FIELD index is immune to the whole-array entry
+// (CanonicalKeyDedupIter selects among ELEMENTS and skips it), so only a
+// bound that can cut off the element the sort key uses is a problem — the
+// doc then surfaces at an in-bounds extremum instead:
 //   - ascending selects the global MIN: only a lower cut (a bound with a
 //     Start — a range start or an equality/$in point) can exclude it. An
 //     upper-only bound is safe: a doc matches via some element <= End, and
@@ -1168,14 +1181,10 @@ func (q *collQuery) buildCBOIndexesInto(buf []qplanner.CBOIndex, br *qplanner.Bo
 // Bounds here are the field's logical (plain-space) bounds from the wide
 // Lookup — presence of a predicate is channel-independent.
 func sortRunNeedsScalarProof(idx *qplanner.CBOIndex, sortFields []query.SortField, br *qplanner.BoundsResult) bool {
-	compound := len(idx.Info.FieldNames) > 1
+	if len(idx.Info.FieldNames) > 1 {
+		return true
+	}
 	for si, sf := range sortFields {
-		if compound && sf.Reverse {
-			// The reverse traversal meets the doc's whole-array entry (array
-			// type tag, above every scalar) before its maximum element;
-			// single-field chains skip it via CanonicalKeyDedupIter.
-			return true
-		}
 		fi := idx.SortMatchStart + si
 		if fi >= len(idx.Info.FieldNames) {
 			break

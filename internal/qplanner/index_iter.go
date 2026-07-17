@@ -368,13 +368,14 @@ func indexProbeAnyMultiKey(cs *CursorSource, fieldReverse bool) (bool, error) {
 // bounds via a 4-branch dispatch:
 //
 //	Branch 1 (len(Bounds) <= 1, and the bound admits no per-doc fan-out):
-//	  page-batch CountUntil. Sound when the index is single-field (within-doc
-//	  dedup in insertKeys guarantees ≤1 entry per distinct value per doc), OR
-//	  the single bound pins the FULL key (≤1 entry per doc per full tuple even
-//	  on a multikey index), OR the index is scalar-proven for this snapshot.
-//	  A compound PREFIX bound on a possibly-multikey index is excluded: the
-//	  array suffix fans one doc into several entries plus a whole-array entry,
-//	  so the entry count overshoots the doc count — those route to Branch 2.
+//	  page-batch CountUntil. Sound when the single bound pins the FULL key
+//	  with an equality (≤1 entry per doc per full tuple even on a multikey
+//	  index — within-doc dedup in insertKeys; a single-field point bound is
+//	  the degenerate case), OR the index is scalar-proven for this snapshot.
+//	  Everything else is excluded because one doc can own several in-bound
+//	  entries: a compound PREFIX bound fans out across the array suffix plus
+//	  the whole-array entry, and a RANGE bound — even single-field — can
+//	  cover several elements of one doc. Excluded shapes route to Branch 2.
 //	  Fast: no per-entry walk.
 //
 //	Branch 2 (compound / non-PointLookup): pooled seen-set, skip-scalar mode.
@@ -402,8 +403,7 @@ func (it *IndexIter) CountEntries() (int, error) {
 	}
 
 	// Branch 1 — see the fan-out conditions in the dispatch comment above.
-	if len(it.Bounds) <= 1 &&
-		(len(it.IdxInfo.FieldNames) == 1 || it.FullKeyBound || it.ScalarProven) {
+	if len(it.Bounds) <= 1 && (it.FullKeyBound || it.ScalarProven) {
 		return it.countEntriesBatch()
 	}
 
