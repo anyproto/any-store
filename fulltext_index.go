@@ -69,7 +69,7 @@ type ftsIndex struct {
 
 	// uncommitted: the creating DDL tx has not committed; other txs must not
 	// search through this handle (empty namespaces in their snapshots). Same
-	// contract as index.uncommitted — see there and visibleIndexes.
+	// contract as index.uncommitted — see there, visibleTo and visibleIndexes.
 	uncommitted atomic.Bool
 
 	// nFields is the number of indexed fields (== len(fieldPaths)); each token's
@@ -184,6 +184,14 @@ func (fx *ftsIndex) bindNamespaces(resolve func(name string) (*btree.Namespace, 
 }
 
 func (fx *ftsIndex) Info() IndexInfo { return fx.info }
+
+// visibleTo reports whether the given tx may search through this handle — the
+// visibility gate of visibleIndexes, fts-shaped (see index.uncommitted): an
+// uncommitted handle is visible only to its creating write tx (single-writer:
+// any write-tx view).
+func (fx *ftsIndex) visibleTo(tx *btree.ReadTx) bool {
+	return !fx.uncommitted.Load() || tx.IsWriteTx()
+}
 
 // metaRootUnchanged reports whether the ftx: meta namespace still resolves to
 // the btree root this handle was bound against — false after a peer

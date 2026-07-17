@@ -1267,7 +1267,17 @@ func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) e
 		// replaced handle, whose namespaces its committed snapshot still
 		// holds. prev stays set past commit (see the field comment).
 		nvi.uncommitted.Store(true)
-		nvi.prev.Store(vi)
+		// prev must be a COMMITTED fallback: with chained same-tx DDL (create
+		// then compact, or compact twice) the replaced handle is itself
+		// uncommitted and would route concurrent readers onto namespaces that
+		// exist only in this tx's view — inherit the chain's committed tail
+		// instead (nil when the index was created in this tx: nothing
+		// committed to serve, the reader errors as before the DDL began).
+		prevTarget := vi
+		if vi.uncommitted.Load() {
+			prevTarget = vi.prev.Load()
+		}
+		nvi.prev.Store(prevTarget)
 		wtx.onCommitPublish(func() {
 			// Flag before prev — forTx relies on this order (see there).
 			nvi.uncommitted.Store(false)

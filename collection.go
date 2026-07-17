@@ -187,7 +187,12 @@ type collection struct {
 	indexSetDDLTxs int
 
 	closed atomic.Bool
-	mu     sync.Mutex
+	// userClosed records that Close() was explicitly requested. Drop flips
+	// closed itself (CAS), which makes a Close() racing in AFTER the flip a
+	// silent no-op — this latch lets Drop's rollback undo honor that Close
+	// instead of resurrecting a handle its owner released.
+	userClosed atomic.Bool
+	mu         sync.Mutex
 }
 
 // loadIndexes returns the current index-set snapshot. Safe to call without
@@ -1422,22 +1427,41 @@ func (c *collection) Drop(ctx context.Context) error {
 		// NOT resurrect a handle its owner explicitly closed.
 		if c.closed.CompareAndSwap(false, true) {
 			wtx.onRollbackUndo(func() {
-				c.closed.Store(false)
+				// A Close() that landed AFTER the flip was swallowed by its
+				// CAS (no eviction, nil return): honor it now instead of
+				// un-closing a handle its owner released.
+				if c.userClosed.Load() {
+					c.db.onCollectionClose(c)
+					return
+				}
+				// Un-close only while still registered: a same-tx recreate of
+				// the name replaced this map entry, and its own undo evicted
+				// the replacement — reviving an unregistered handle would let
+				// it dangle past future peer DDL (the staleness pass only
+				// walks the registry). Callers re-obtain via db.Collection,
+				// as before.
+				c.db.mu.Lock()
+				registered := false
+				for _, cur := range c.db.openedCollections {
+					if cur == Collection(c) {
+						registered = true
+						break
+					}
+				}
+				c.db.mu.Unlock()
+				if registered {
+					c.closed.Store(false)
+				}
 			})
 		}
-		// Identity scan, like onCollectionClose: a Rename earlier in this tx
-		// re-keys the entry in its own commit publication (which runs first,
-		// in registration order, and declines to resurrect a closed handle),
-		// and a racing user Close() may have evicted it already.
+		// The eviction is onCollectionClose verbatim (identity scan — a
+		// Rename earlier in this tx re-keys the entry in its own, earlier
+		// publication and declines to resurrect a closed handle; a same-tx
+		// recreate replaced it, making this a no-op). Its orphan-fts append
+		// is dead weight here: the buffers were reset above and the closed
+		// handle cannot repopulate them.
 		wtx.onCommitPublish(func() {
-			c.db.mu.Lock()
-			for name, cur := range c.db.openedCollections {
-				if cur == Collection(c) {
-					delete(c.db.openedCollections, name)
-					break
-				}
-			}
-			c.db.mu.Unlock()
+			c.db.onCollectionClose(c)
 		})
 		// Delete all index namespaces. Enumerate indexes from the SAME on-disk
 		// source (idx:<coll>: metadata keys) that removeCollection deletes,
@@ -1501,6 +1525,10 @@ func (c *collection) Close() error {
 }
 
 func (c *collection) close() error {
+	// Latch the intent BEFORE the CAS: if a Drop in an open tx already
+	// flipped closed, this Close is otherwise a silent no-op, and Drop's
+	// rollback undo must not un-close a handle its owner released.
+	c.userClosed.Store(true)
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}

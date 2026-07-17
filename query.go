@@ -883,15 +883,18 @@ func (q *collQuery) Explain(ctx context.Context) (explain Explain, err error) {
 			return 0
 		}
 		for _, vi := range q.c.loadVectorIndexes() {
-			// Same visibility rule as visibleIndexes: an index whose creating
-			// tx has not committed is not a candidate for this tx.
-			if vi.uncommitted.Load() && !tx.IsWriteTx() {
+			// forTx is the gate the executed $knn goes through: a handle it
+			// resolves (directly or via the pre-compaction prev, same name)
+			// must be listed, one it errors on must not — Explain may never
+			// contradict execution.
+			if _, ferr := vi.forTx(tx); ferr != nil {
 				continue
 			}
 			addIndex(vi.info.Name, sourceCost(vi.info.Name))
 		}
 		for _, fx := range q.c.loadFtsIndexes() {
-			if fx.uncommitted.Load() && !tx.IsWriteTx() {
+			// Same gate the executed $text goes through.
+			if !fx.visibleTo(tx) {
 				continue
 			}
 			addIndex(fx.info.Name, sourceCost(fx.info.Name))

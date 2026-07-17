@@ -956,10 +956,10 @@ func (q *collQuery) detectFtsQuery() (*qplanner.FtsQuerySpec, query.Filter, erro
 		Ordered:    true, // searchCandidates returns score-descending
 		NeedScores: true, // compilePlan sets this from planOpts (Iter only)
 		Search: func(tx *btree.ReadTx) (qplanner.FtsCandidateStream, error) {
-			// Visibility gate (see visibleIndexes): the index exists only in
-			// its creating write tx's uncommitted view; every other tx must
-			// behave exactly as before the CreateIndex began.
-			if fx.uncommitted.Load() && !tx.IsWriteTx() {
+			// Visibility gate: the index exists only in its creating write
+			// tx's uncommitted view; every other tx must behave exactly as
+			// before the CreateIndex began.
+			if !fx.visibleTo(tx) {
 				return nil, ErrNoFulltextIndex
 			}
 			return fx.searchCandidates(tx, text)

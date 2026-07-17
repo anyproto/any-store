@@ -377,6 +377,18 @@ func TestVectorIndex_CompactAmbientCommit_ConcurrentReader(t *testing.T) {
 	require.Len(t, hits, 2)
 	assert.Equal(t, idBytesOf(1), hits[0].DocId)
 
+	// Explain must agree with execution: the reader is index-served (via the
+	// pre-compaction handle), so the index is listed.
+	explain, err := coll.Find(fmt.Sprintf(`{"v":%s}`, vknnJSON(vecs[1], 2, 64))).Explain(ctx)
+	require.NoError(t, err)
+	listed := false
+	for _, ie := range explain.Indexes {
+		if ie.Name == "emb" {
+			listed = true
+		}
+	}
+	assert.True(t, listed, "Explain must list the index execution serves via the pre-compaction handle")
+
 	// The compacting tx itself searches the compacted handle.
 	fq := coll.Find(fmt.Sprintf(`{"v":%s}`, vknnJSON(vecs[1], 2, 64)))
 	iterTx, err := fq.Iter(tx.Context())
