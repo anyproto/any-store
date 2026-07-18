@@ -5,14 +5,14 @@ import (
 	"encoding/binary"
 	"math/rand"
 	"path/filepath"
-	"sort"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
 
 // TestDeleteRebalance_FillFactor is the spec success metric for delete-time
-// rebalancing (docs/btree/plans/2026-05-23-delete-time-rebalancing.md §a). It
+// rebalancing (any-store-tests:docs/any-store/btree/plans/2026-05-23-delete-time-rebalancing.md §a). It
 // reuses the balance_quick / balance_nonroot harness (walkLeavesForFill /
 // reportFillStats / leafFillStats, btree_balance_quick_test.go) so the
 // before/after fill numbers are directly comparable to the plan's measurement
@@ -45,7 +45,7 @@ func TestDeleteRebalance_FillFactor(t *testing.T) {
 			// Random 80% delete (the plan's primary case): keep every 5th key.
 			//
 			// THRESHOLD CALIBRATED TO MEASURED SQLITE, NOT THE SPEC ESTIMATE. The
-			// spec (docs/btree/plans/2026-05-23-delete-time-rebalancing.md §a)
+			// spec (any-store-tests:docs/any-store/btree/plans/2026-05-23-delete-time-rebalancing.md §a)
 			// asserts avgFill>=0.55 and claims "SQLite reaches ~0.65-0.70 on this
 			// workload". That SQLite estimate is wrong. Measured on SQLite 3.51,
 			// WITHOUT ROWID, page_size=1024, 20000 4-byte keys + 80-byte values,
@@ -149,9 +149,7 @@ func TestDeleteRebalance_FillFactor(t *testing.T) {
 					survivors = append(survivors, keyOf(i))
 				}
 			}
-			sort.Slice(survivors, func(a, b int) bool {
-				return bytes.Compare(survivors[a], survivors[b]) < 0
-			})
+			slices.SortFunc(survivors, bytes.Compare)
 
 			db.pager.deleteRebalanceDispatchCount.Store(0)
 
@@ -463,9 +461,7 @@ func TestDeleteRebalance_EmptyLeafCascade(t *testing.T) {
 			survivors = append(survivors, binary.BigEndian.AppendUint32(nil, uint32(i)))
 		}
 	}
-	sort.Slice(survivors, func(a, b int) bool {
-		return bytes.Compare(survivors[a], survivors[b]) < 0
-	})
+	slices.SortFunc(survivors, bytes.Compare)
 
 	tx, err = db.BeginWrite()
 	require.NoError(t, err)

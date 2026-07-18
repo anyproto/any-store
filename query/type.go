@@ -31,7 +31,7 @@ func init() {
 // typeString is indexed by the anyenc type value. The gaps at binary(8) and
 // compressedObjectS2(9) are intentionally empty — they are not queryable via
 // $type — and are skipped when building stringToType. objectId(11) is queryable,
-// and so is vectorF32(10): Rule V (BUG-32) makes ordering ops against a vector
+// and so is vectorF32(10): Rule V makes ordering ops against a vector
 // always false, so $type is the only way left to select vector-valued documents.
 var typeString = []string{
 	"", "null", "number", "string", "false", "true", "array", "object",

@@ -179,17 +179,3 @@ func TestBulkRealRecallDiag(t *testing.T) {
 	}
 	repairEfTune = 0
 }
-
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	var b [12]byte
-	p := len(b)
-	for i > 0 {
-		p--
-		b[p] = byte('0' + i%10)
-		i /= 10
-	}
-	return string(b[p:])
-}

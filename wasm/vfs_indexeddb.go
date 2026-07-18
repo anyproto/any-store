@@ -46,7 +46,7 @@ func InitIDBFS() (*IDBFS, error) {
 	var database js.Value
 	var openErr error
 
-	onUpgrade := js.FuncOf(func(_ js.Value, args []js.Value) interface{} {
+	onUpgrade := js.FuncOf(func(_ js.Value, args []js.Value) any {
 		db := args[0].Get("target").Get("result")
 		names := db.Get("objectStoreNames")
 		if names.IsUndefined() || names.IsNull() || !names.Call("contains", "files").Bool() {
@@ -56,12 +56,12 @@ func InitIDBFS() (*IDBFS, error) {
 		}
 		return nil
 	})
-	onSuccess := js.FuncOf(func(_ js.Value, args []js.Value) interface{} {
+	onSuccess := js.FuncOf(func(_ js.Value, args []js.Value) any {
 		database = args[0].Get("target").Get("result")
 		close(ch)
 		return nil
 	})
-	onError := js.FuncOf(func(_ js.Value, _ []js.Value) interface{} {
+	onError := js.FuncOf(func(_ js.Value, _ []js.Value) any {
 		openErr = fmt.Errorf("indexeddb: open failed: %s", request.Get("error").Call("toString").String())
 		close(ch)
 		return nil

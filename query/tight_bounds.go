@@ -1,6 +1,9 @@
 package query
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // TightIndexBounds computes the INTERSECTED ("tight") bounds for fieldName:
 // where a conjunction carries several bound-contributing conjuncts on the same
@@ -84,12 +87,7 @@ func MayTighten(f Filter) bool {
 		if len(t) > 1 {
 			return true
 		}
-		for _, c := range t {
-			if MayTighten(c) {
-				return true
-			}
-		}
-		return false
+		return slices.ContainsFunc(t, MayTighten)
 	case *And:
 		return MayTighten(*t)
 	default:

@@ -2132,7 +2132,7 @@ func TestAudit14_LegacyNilValue_PlannerRoutesViaSeenSet(t *testing.T) {
 
 // ── Corruption-recovery audit (act-38..42) ──
 /*
-Audit tests for the "corruption-recovery" domain (docs/qplanner/audit/actionable_by_domain.json).
+Audit tests for the "corruption-recovery" domain (any-store-tests:docs/any-store/qplanner/audit/actionable_by_domain.json).
 These pin documented limitations (index/data trust boundaries) and prove that
 DropIndex + EnsureIndex rebuild recovers. Direct-namespace corruption uses the
 same internal pattern as index_corruption_test.go.

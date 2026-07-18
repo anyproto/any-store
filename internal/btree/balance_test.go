@@ -16,7 +16,7 @@ import (
 // the balance_quick harness (walkLeavesForFill / reportFillStats /
 // leafFillStats, btree_balance_quick_test.go) so before/after numbers are
 // directly comparable to the measurement in
-// docs/btree/plans/2026-05-23-balance-nonroot-3sibling.md.
+// any-store-tests:docs/any-store/btree/plans/2026-05-23-balance-nonroot-3sibling.md.
 //
 // The "random" workload is the home turf of 3-sibling redistribution: every
 // split that touches a low-fill neighbour re-packs that neighbour too, so the

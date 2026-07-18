@@ -1423,7 +1423,7 @@ func TestAudit02_Reversibility_ScalarGrowsToArray(t *testing.T) {
 
 // ── Index-maintenance audit (act-13..18) ──
 /*
-Audit tests for the "index-maintenance" domain (docs/qplanner/audit/actionable_by_domain.json).
+Audit tests for the "index-maintenance" domain (any-store-tests:docs/any-store/qplanner/audit/actionable_by_domain.json).
 
   act-13  Multi-index insert: a partial index write is rolled back atomically when a
           later index's unique check fails.

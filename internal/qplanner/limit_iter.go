@@ -102,10 +102,7 @@ func (it *LimitIter) CountDistinct() (int, error) {
 		}
 	}
 
-	n := distinct - remainingOffset
-	if n < 0 {
-		n = 0
-	}
+	n := max(distinct-remainingOffset, 0)
 	if it.Limit > 0 && n > it.Limit {
 		n = it.Limit
 	}

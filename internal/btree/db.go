@@ -155,7 +155,7 @@ type Options struct {
 	// (XXH3-128 trailer, 16 bytes per page). Mutually exclusive with
 	// Key and Codec — combining them returns an error from Open.
 	// Conceptually mirrors SQLite's cksumvfs extension. See
-	// docs/plans/2026-04-27-cksumvfs-port.md.
+	// docs/btree/specs/integrity.md.
 	Checksum bool
 
 	// OnIntegrityError, if non-nil, is fired by the installed codec
@@ -1512,9 +1512,7 @@ type ReadTx struct {
 	walSlot     int     // reader slot number (for endRead)
 	walMaxFrame uint32  // WAL snapshot for this transaction (TODO: migrate to walHdr.mxFrame)
 	// walHdr is the full SHM header snapshot captured at BeginRead time.
-	// Populated in parallel with walMaxFrame during the per-connection-hdr
-	// migration (see docs/superpowers/specs/2026-04-18-per-connection-hdr-design.md).
-	// Not yet consumed by production code.
+	// Populated in parallel with walMaxFrame.
 	walHdr WalIndexHdr
 
 	// Disk counters from page 1 at transaction start (for staleness detection).
@@ -1561,17 +1559,6 @@ func (tx *ReadTx) txDescendChild(childPgno uint32) (*page, error) {
 		return nil, ErrCorrupt
 	}
 	return tx.txGetPage(childPgno)
-}
-
-// readOverflow reads overflow chain data using the correct isolation level.
-// Writers use the shared cache (to see their own dirty pages).
-// Readers bypass the cache to avoid polluting it with stale snapshot data
-// that the writer could later read, causing on-disk corruption.
-func (tx *ReadTx) readOverflow(firstPgno uint32, buf []byte) error {
-	if tx.writable {
-		return tx.pager.readOverflowChainAt(firstPgno, buf, tx.walHdr.mxFrame)
-	}
-	return tx.pager.readOverflowChainReader(firstPgno, buf, tx.walHdr.mxFrame, tx.cache)
 }
 
 // AppendValue retrieves a value by key from the given namespace, appending it to buf.

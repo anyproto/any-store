@@ -2,10 +2,10 @@ package qplanner
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"math"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -688,8 +688,8 @@ func BuildPlan(params *PlanParams) *Plan {
 
 	// Sort candidates by cost ascending (skip when not collecting explain)
 	if collectExplain {
-		sort.Slice(candidates, func(i, j int) bool {
-			return candidates[i].Cost < candidates[j].Cost
+		slices.SortFunc(candidates, func(a, b CandidatePlan) int {
+			return cmp.Compare(a.Cost, b.Cost)
 		})
 	}
 
@@ -729,37 +729,13 @@ func BuildPlan(params *PlanParams) *Plan {
 // k-cut; Count's LimitIter.CountDistinct fast path computes correctly over the
 // stacked shape.)
 func buildVectorPlan(params *PlanParams) *Plan {
-	needSort := params.Sorter != nil
-	needFilter := params.Filter != nil && !isAllFilter(params.Filter)
-
 	dataCS := &CursorSource{Tx: params.Tx, Ns: params.DataNs}
-	var root Iterator = &VectorIter{
+	source := &VectorIter{
 		Spec: params.Vector,
 		Data: dataCS,
 		Buf:  params.Buf,
 	}
-	if needFilter {
-		root = &FilterIter{Source: root, Data: dataCS, Filter: params.Filter, Buf: params.Buf}
-	}
-	if params.Vector.K > 0 {
-		root = &LimitIter{Source: root, Limit: params.Vector.K}
-	}
-	if needSort {
-		root = &SortIter{
-			Source: root,
-			Data:   dataCS,
-			Sorter: params.Sorter,
-			Buf:    params.Buf,
-			TopK:   sortTopK(params),
-		}
-	}
-	if params.Limit > 0 || params.Offset > 0 {
-		root = &LimitIter{Source: root, Limit: params.Limit, Offset: params.Offset}
-	}
-
-	plan := &Plan{Root: root, Name: "KnnSearch", IndexName: params.Vector.IndexName}
-	setPlanRef(root, plan)
-	return plan
+	return buildSearchPlan(params, dataCS, source, params.Vector.K, "KnnSearch", params.Vector.IndexName)
 }
 
 // buildFtsPlan builds the iterator chain for a full-text query:
@@ -773,19 +749,31 @@ func buildVectorPlan(params *PlanParams) *Plan {
 // stream flows straight to LimitIter — no SortIter. An explicit sort on a real
 // field inserts a SortIter that re-orders the candidates.
 func buildFtsPlan(params *PlanParams) *Plan {
-	needSort := params.Sorter != nil
-	needFilter := params.Filter != nil && !isAllFilter(params.Filter)
-
 	dataCS := &CursorSource{Tx: params.Tx, Ns: params.DataNs}
-	var root Iterator = &FtsIter{
+	source := &FtsIter{
 		Spec: params.Fts,
 		Data: dataCS,
 		Buf:  params.Buf,
 	}
-	if needFilter {
+	return buildSearchPlan(params, dataCS, source, 0, "FtsSearch", params.Fts.IndexName)
+}
+
+// buildSearchPlan assembles the shared downstream chain of the search-source
+// plans (vector/fts):
+//
+//	source -> [FilterIter(residual)] -> [LimitIter{Limit:kLimit}] -> [SortIter] -> [LimitIter{Offset,Limit}]
+//
+// kLimit > 0 inserts the vector k-cut between the residual filter and the user
+// sort; fts passes 0 (no cut — FtsIter's stream is already score-ordered).
+func buildSearchPlan(params *PlanParams, dataCS *CursorSource, source Iterator, kLimit int, name, indexName string) *Plan {
+	root := source
+	if params.Filter != nil && !isAllFilter(params.Filter) {
 		root = &FilterIter{Source: root, Data: dataCS, Filter: params.Filter, Buf: params.Buf}
 	}
-	if needSort {
+	if kLimit > 0 {
+		root = &LimitIter{Source: root, Limit: kLimit}
+	}
+	if params.Sorter != nil {
 		root = &SortIter{
 			Source: root,
 			Data:   dataCS,
@@ -798,7 +786,7 @@ func buildFtsPlan(params *PlanParams) *Plan {
 		root = &LimitIter{Source: root, Limit: params.Limit, Offset: params.Offset}
 	}
 
-	plan := &Plan{Root: root, Name: "FtsSearch", IndexName: params.Fts.IndexName}
+	plan := &Plan{Root: root, Name: name, IndexName: indexName}
 	setPlanRef(root, plan)
 	return plan
 }
@@ -1013,13 +1001,8 @@ func indexPopulation(idx *CBOIndex, totalDocs float64) float64 {
 	if idx.Sketch == nil {
 		return totalDocs
 	}
-	level := idx.BoundFields - 1
-	if level < 0 {
-		level = 0
-	}
-	if level >= idx.Sketch.NumLevels() {
-		level = idx.Sketch.NumLevels() - 1
-	}
+	level := max(idx.BoundFields-1, 0)
+	level = min(level, idx.Sketch.NumLevels()-1)
 	if !sketchLevelTrusted(idx.Sketch, level) {
 		return totalDocs
 	}
@@ -1456,8 +1439,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	// doc-driven — hence above FetchIter) to filter duplicates before the
 	// sort/limit stages. Compound indexes were already deduped by the
 	// DocDedupIter inserted below the fetch (canonical-key selection across
-	// compound tuples is non-trivial — see
-	// docs/plans/2026-04-17-multikey-index-dedup.md — so they dedup by docId
+	// compound tuples is non-trivial, so they dedup by docId
 	// in first-occurrence order instead). Exactly one of the two wraps is
 	// present per chain; either way the stream reaching SortIter/LimitIter
 	// and the consumers is unique-by-doc, and no per-query map is allocated
@@ -1783,11 +1765,9 @@ func filterFieldsCoveredBy(f query.Filter, idxFields []string, hasFields *bool) 
 	switch ft := f.(type) {
 	case query.Key:
 		name := strings.Join(ft.Path, ".")
-		for _, idxF := range idxFields {
-			if idxF == name {
-				*hasFields = true
-				return true
-			}
+		if slices.Contains(idxFields, name) {
+			*hasFields = true
+			return true
 		}
 		return false
 	case query.And:
@@ -1820,10 +1800,8 @@ func collectUncoveredFilterFields(f query.Filter, coveredFields []string) []stri
 	switch ft := f.(type) {
 	case query.Key:
 		name := strings.Join(ft.Path, ".")
-		for _, cf := range coveredFields {
-			if cf == name {
-				return []string{} // covered
-			}
+		if slices.Contains(coveredFields, name) {
+			return []string{} // covered
 		}
 		return []string{name}
 	case query.And:

@@ -2609,8 +2609,9 @@ func TestWALReadFrameFaultHookDefaultsToNoop(t *testing.T) {
 	require.Nil(t, walReadFrameFaultHook.Load())
 }
 
-// TestWALVersionMismatchRefusesOpenWithoutTruncate guards Bug 10 (pre-beta
-// catalog): a checksum-valid WAL header whose version differs was previously
+// TestWALVersionMismatchRefusesOpenWithoutTruncate guards recoverLocked (see
+// docs/btree/NOTES.md#drift-2026-06-25-28-recoverlocked-truncates-the-wal-and-discards-committed-frames-on-a-cor):
+// a checksum-valid WAL header whose version differs was previously
 // collapsed into the corrupt-header path, which truncates the WAL — an older
 // binary opening a newer database would silently destroy committed
 // transactions. SQLite returns SQLITE_CANTOPEN here (walIndexRecover,
@@ -2674,7 +2675,8 @@ func TestWALVersionMismatchRefusesOpenWithoutTruncate(t *testing.T) {
 	require.NoError(t, db2.Close())
 }
 
-// TestOpenPage1WALReadErrorFailsOpen guards Bug 5 (pre-beta catalog):
+// TestOpenPage1WALReadErrorFailsOpen guards pager.open's page-1 refresh (see
+// docs/btree/NOTES.md#drift-2026-06-25-23-open-silently-ignores-a-wal-page-1-frame-read-failure-and-keeps-the-st):
 // pager.open's post-recovery page-1 header refresh used to swallow a
 // readFrame error and continue with the stale DB-file header — the next
 // commit would then serialize stale freelist pointers back into page 1,

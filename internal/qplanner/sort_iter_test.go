@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -210,7 +210,7 @@ func referenceWindow(t *testing.T, srt query.Sort, docs []*anyenc.Value, docIds 
 	for i := range docs {
 		all[i] = kd{key: sortKeyOf(t, srt, docs[i], docIds[i]), docId: docIds[i]}
 	}
-	sort.Slice(all, func(i, j int) bool { return bytes.Compare(all[i].key, all[j].key) < 0 })
+	slices.SortFunc(all, func(a, b kd) int { return bytes.Compare(a.key, b.key) })
 	var out [][]byte
 	end := len(all)
 	if limit > 0 && offset+limit < end {

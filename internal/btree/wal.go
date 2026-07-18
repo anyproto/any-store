@@ -49,7 +49,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"runtime"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1427,12 +1427,10 @@ type wal struct {
 	// If nil, lock failures return ErrBusy immediately (issue 1.7).
 	busyHandler BusyHandler
 
-	// Test hook — intentionally commented out to avoid a per-BeginWrite
-	// atomic.Load on the production hot path. Uncomment together with the
-	// matching check in beginWriteWithSnapshot to re-enable the two tests
-	// in busy_test.go (TestBeginWrite_SurfacesBusySnapshotAfterBoundedRetries,
-	// TestBeginWrite_BusySnapshotRoutesThroughBusyHandler).
-	// forceBusySnapshotForTest atomic.Bool
+	// forceBusySnapshotForTest makes beginWriteWithSnapshot fail with
+	// ErrBusySnapshot on every attempt. Checked only under
+	// -tags btreetesthooks (walTestHooks); compiles away otherwise.
+	forceBusySnapshotForTest atomic.Bool
 
 	// writerHdr is the writer's private copy of the SHM header, updated after
 	// each successful commit (writeFrames) and after re-sync in beginWrite().
@@ -1649,12 +1647,10 @@ func (w *wal) open() (err error) {
 // DRIFT: recovery takes WAL_CKPT_LOCK + WAL_RECOVER_LOCK beyond WAL_WRITE_LOCK. See docs/btree/NOTES.md#old-drift-ensureheader-triple-lock-recovery-gate
 //
 // ensureHeaderInitialized guarantees the SHM header is published and returns
-// a snapshot of it so callers can stamp it onto their per-tx walHdr. During
-// the per-connection-hdr migration (spec:
-// docs/superpowers/specs/2026-04-18-per-connection-hdr-design.md), the helper
-// still calls syncFromSHMLocked to update process-global writer state
-// (w.header.salt*, w.cksum1/2, w.nFrame, w.writerHdr). Later steps will
-// narrow that to writer paths only.
+// a snapshot of it so callers can stamp it onto their per-tx walHdr. It also
+// calls syncFromSHMLocked to update process-global writer state
+// (w.header.salt*, w.cksum1/2, w.nFrame, w.writerHdr); narrowing that to
+// writer paths only is a remaining per-connection-hdr migration step.
 //
 // The returned hdr is the live SHM header value at the moment of observation.
 // On error, the zero hdr is returned and the error signals the retry class.
@@ -2755,8 +2751,9 @@ func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot i
 	return WalIndexHdr{}, 0, 0, 0, ErrProtocol
 }
 
-// tryBeginRead attempts to acquire a reader slot and returns the current
-// max frame number. Returns errWALRetry if the WAL state changed between
+// tryBeginReadHdr attempts to acquire a reader slot and returns the current
+// max frame number plus the exact WAL header snapshot used to choose/validate
+// the reader slot. Returns errWALRetry if the WAL state changed between
 // reading metadata and acquiring the lock, signaling the caller to retry.
 //
 // The slot-0 read paths (both in-process and multi-process below) take the
@@ -2764,13 +2761,6 @@ func (w *wal) beginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot i
 // sentinel meaning "read nothing from the WAL" and must stay 0, matching
 // SQLite's walTryBeginRead slot-0 fast path (wal.c:3136-3157) and its
 // aReadMark[0]==0 invariant (wal.c:2159,361).
-func (w *wal) tryBeginRead() (maxFrame uint32, slot int, err error) {
-	_, maxFrame, _, slot, err = w.tryBeginReadHdr()
-	return maxFrame, slot, err
-}
-
-// tryBeginReadHdr is tryBeginRead plus the exact WAL header snapshot used to
-// choose/validate the reader slot.
 func (w *wal) tryBeginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
 	if w.inProcess || w.inMemory {
 		return w.tryBeginReadInProcessHdr()
@@ -2778,7 +2768,7 @@ func (w *wal) tryBeginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slo
 	return w.tryBeginReadMultiProcessHdr()
 }
 
-// tryBeginReadInProcess handles the in-process/in-memory path where all state
+// tryBeginReadInProcessHdr handles the in-process/in-memory path where all state
 // is in process-local atomics. There are no cross-PROCESS SHM races, but an
 // INTERNAL concurrent checkpoint (auto-checkpoint from Commit via
 // pager.tryCheckpoint, or DB.Checkpoint) runs WITHOUT pager.mu and can advance
@@ -2789,11 +2779,6 @@ func (w *wal) tryBeginReadHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slo
 // returns errWALRetry if either moved (mirrors SQLite walTryBeginRead's
 // post-lock re-check of aReadMark[mxI], wal.c:3239-3249). On retry the
 // nBackfill==mxFrame slot-0 fast path stays safe.
-func (w *wal) tryBeginReadInProcess() (maxFrame uint32, slot int, err error) {
-	_, maxFrame, _, slot, err = w.tryBeginReadInProcessHdr()
-	return maxFrame, slot, err
-}
-
 func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
 	mxFrame := w.index.mxCommitFrame.LoadLocal()
 	nBackfill := w.index.nBackfill.Load()
@@ -2895,7 +2880,7 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 	return hdr, mxFrame, nBackfill + 1, 0, nil
 }
 
-// tryBeginReadMultiProcess handles the multi-process path, matching SQLite's
+// tryBeginReadMultiProcessHdr handles the multi-process path, matching SQLite's
 // walTryBeginRead() (wal.c:3000-3252) step by step:
 //
 //  1. Read SHM header into a local copy (SQLite: walIndexReadHdr → walIndexTryHdr
@@ -2917,11 +2902,6 @@ func (w *wal) tryBeginReadInProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame ui
 //     process-local atomic for live-frontier users (liveMinFrame).
 //
 // DRIFT: reader-slot tie-break selects lowest slot; SQLite selects highest on equal marks See docs/btree/NOTES.md#drift-102-reader-slot-tie-break-selects-lowest-not-highest
-func (w *wal) tryBeginReadMultiProcess() (maxFrame uint32, slot int, err error) {
-	_, maxFrame, _, slot, err = w.tryBeginReadMultiProcessHdr()
-	return maxFrame, slot, err
-}
-
 func (w *wal) tryBeginReadMultiProcessHdr() (hdr WalIndexHdr, maxFrame, minFrame uint32, slot int, err error) {
 	// Step 1: Read SHM header into local copy (SQLite: walIndexReadHdr → walIndexTryHdr)
 	hdr, valid := w.index.readHeader()
@@ -3087,12 +3067,9 @@ func (w *wal) beginWrite() (stateChanged bool, err error) {
 // beginWriteWithSnapshot is the generalized form: caller supplies the
 // read snapshot for the BUSY_SNAPSHOT check. See beginWrite for semantics.
 func (w *wal) beginWriteWithSnapshot(readSnap WalIndexHdr) (stateChanged bool, err error) {
-	// Test hook — kept commented to avoid an atomic.Load on every BeginWrite.
-	// Uncomment with the matching field in the wal struct to run the two
-	// ErrBusySnapshot tests in busy_test.go.
-	// if w.forceBusySnapshotForTest.Load() {
-	// 	return false, ErrBusySnapshot
-	// }
+	if walTestHooks && w.forceBusySnapshotForTest.Load() {
+		return false, ErrBusySnapshot
+	}
 	if err := walBusyLock(w.index, w.busyHandler, lockWrite, lockExclusive); err != nil {
 		return false, err
 	}
@@ -3220,31 +3197,9 @@ func (w *wal) authoritativeMxFrame() uint32 {
 	return w.index.mxCommitFrame.LoadLocal()
 }
 
-// authoritativeNPage returns the committed database size in pages (the page
-// count carried by the last commit frame) from the most authoritative source.
-// It is the checkpoint-backfill counterpart of authoritativeMxFrame: where that
-// bounds which WAL frames are safe to copy, this bounds which target page
-// numbers are still logically in the committed image.
-//
-// In multi-process mode it reads hdr.nPage from the SHM header (written under
-// lockWrite by whichever process committed last), so we honor a peer's shrink
-// or grow rather than a stale process-local view. In single-process or
-// in-memory mode the in-process atomic w.index.maxPage is authoritative, and a
-// torn/invalid SHM read also falls back to it. Mirrors SQLite's
-// mxPage = pWal->hdr.nPage in walCheckpoint (wal.c:2228), which gates the
-// iDbpage>mxPage backfill skip (wal.c:2306).
-func (w *wal) authoritativeNPage() uint32 {
-	if !w.inProcess && !w.inMemory {
-		if hdr, valid := w.index.readHeader(); valid {
-			return hdr.nPage
-		}
-	}
-	return w.index.maxPage.Load()
-}
-
 // authoritativeMxFrameAndPage returns a CONSISTENT (mxFrame, nPage) pair from a
-// single authoritative snapshot. It is the combined form of authoritativeMxFrame
-// and authoritativeNPage, and MUST be used wherever both values feed the same
+// single authoritative snapshot. It pairs authoritativeMxFrame with the
+// committed page count, and MUST be used wherever both values feed the same
 // decision (e.g. the checkpoint full-backfill truncate): in multi-process mode
 // the two values come from a single readHeader() so a peer's PASSIVE-mode commit
 // cannot land between two separate header reads and yield a torn pair (mxFrame
@@ -3719,7 +3674,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 			pgnos = append(pgnos, pgno)
 		}
 		w.ckptPgnos = pgnos
-		sort.Slice(pgnos, func(a, b int) bool { return pgnos[a] < pgnos[b] })
+		slices.Sort(pgnos)
 
 		for _, pgno := range pgnos {
 			// Skip orphan frames past the committed DB size (iDbpage>mxPage,
@@ -3779,7 +3734,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 				pgnos = append(pgnos, pgno)
 			}
 			w.ckptPgnos = pgnos
-			sort.Slice(pgnos, func(a, b int) bool { return pgnos[a] < pgnos[b] })
+			slices.Sort(pgnos)
 
 			// BEGIN ENCRYPTION
 			// Checkpoint uses copy-verbatim: if a codec is installed, the WAL
@@ -3791,7 +3746,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 			// (key, pgno) pair only sees a given plaintext once per frame,
 			// since each new modification gets a fresh WAL frame with a fresh
 			// nonce — and (b) WAL ciphertext and DB-file ciphertext share
-			// codec, key, and layout. See docs/btree/plans/encryption-plan.md Task 8.
+			// codec, key, and layout. See any-store-tests:docs/any-store/btree/plans/encryption-plan.md Task 8.
 			// Matches SQLCipher wal.c:2309-2315 (OsRead → OsWrite with no
 			// codec hook between them).
 			// END ENCRYPTION

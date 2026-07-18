@@ -139,16 +139,6 @@ func setupCorruptBLarge(t *testing.T) (string, []byte, uint32, int) {
 	return path, template, rootPage, 1024
 }
 
-// restoreDB writes template bytes back to path and removes WAL/SHM files.
-func restoreDB(t *testing.T, path string, template []byte) {
-	t.Helper()
-	data := make([]byte, len(template))
-	copy(data, template)
-	require.NoError(t, os.WriteFile(path, data, 0644))
-	_ = os.Remove(path + "-wal")
-	_ = os.Remove(path + "-shm")
-}
-
 // pageOffset returns the byte offset within the DB file for the start of a
 // page's B-tree header. For page 1, this accounts for the 100-byte DB header.
 func pageOffset(pgno uint32, pageSize int) int {

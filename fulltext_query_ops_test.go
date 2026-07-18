@@ -14,7 +14,7 @@ import (
 
 // These tests exercise the Phase 1 query operators added on top of the v1
 // bag-of-words BM25: phrases, required (AND) / $defaultOperator, negation,
-// prefix expansion, and CJK implicit-phrase matching. See docs/fts/FTS-V2-PLAN.md.
+// prefix expansion, and CJK implicit-phrase matching. See any-store-tests:docs/any-store/fts/FTS-V2-PLAN.md.
 
 func ftsOpsColl(t *testing.T) (*fixture, Collection) {
 	fx := newFixture(t)

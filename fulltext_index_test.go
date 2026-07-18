@@ -506,7 +506,7 @@ func TestFtsSavepointRollbackKeepsEarlierPending(t *testing.T) {
 	assert.EqualValues(t, 1, ftsVocabDF(t, coll, "early"))
 }
 
-// TestFtsPendingSurvivesCollectionCloseMidTx guards pre-beta catalog BUG-01:
+// TestFtsPendingSurvivesCollectionCloseMidTx:
 // closing a collection between Insert and Commit removed it from
 // openedCollections, so the commit-time flushAllFtsPending never saw its
 // pending buffer — the document committed but its postings were silently

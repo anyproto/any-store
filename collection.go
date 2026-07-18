@@ -1429,8 +1429,7 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 // concurrent open returns it and fails fail-safe instead. A rollback un-closes
 // the handle: the btree restored the on-disk catalog, the map entry was never
 // touched, and Drop mutates no in-memory index set — so the handle is whole
-// again (this also heals the error path, which previously left it closed and
-// evicted).
+// again.
 func (c *collection) Drop(ctx context.Context) error {
 	return c.db.doWriteTxW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (err error) {
 		c.mu.Lock()
@@ -1825,20 +1824,4 @@ func (c *collection) persistSketches(tx *btree.WriteTx) error {
 		}
 	}
 	return nil
-}
-
-// loadByIdRead loads a document by ID using a read transaction
-func (c *collection) loadByIdRead(tx *btree.ReadTx, buf *syncpool.DocBuffer, id anyenc.Tuple) (it item, err error) {
-	buf.DocBuf, err = tx.AppendValue(c.ns, id, buf.DocBuf[:0])
-	if err != nil {
-		if errors.Is(err, btree.ErrKeyNotFound) {
-			return item{}, ErrDocNotFound
-		}
-		return
-	}
-	doc, err := buf.Parser.ParseOwned(buf.DocBuf)
-	if err != nil {
-		return
-	}
-	return c.newItem(doc)
 }

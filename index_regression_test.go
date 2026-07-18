@@ -1,8 +1,8 @@
 package anystore
 
 /*
-Regression tests for correctness bugs found by the docs/qplanner audit
-(see docs/qplanner/CORRECTIONS.md). Each test failed before its fix and
+Regression tests for correctness bugs found by the qplanner audit
+(see any-store-tests:docs/any-store/qplanner/CORRECTIONS.md). Each test failed before its fix and
 passes after. Fixes live in internal/qplanner/planner.go.
 
   bug-01  Mixed-direction compound index (a,-b) is stored with reverse-flagged

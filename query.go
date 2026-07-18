@@ -3,6 +3,7 @@ package anystore
 import (
 	"context"
 	"errors"
+	"slices"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/qplanner"
@@ -420,6 +421,73 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	if err != nil {
 		return
 	}
+	// The modifier is parsed above so a malformed one is surfaced even when
+	// the filter is unsatisfiable.
+	return q.bulkWrite(ctx, func(btWtx *btree.WriteTx, btx *btree.ReadTx, buf *syncpool.DocBuffer, ids [][]byte, result *ModifyResult) error {
+		modBuf := q.c.db.syncPool.GetDocBuf()
+		defer q.c.db.syncPool.ReleaseDocBuf(modBuf)
+
+		for _, id := range ids {
+			var getErr error
+			buf.DocBuf, getErr = btx.AppendValue(q.c.ns, id, buf.DocBuf[:0])
+			if getErr != nil {
+				return getErr
+			}
+			doc, parseErr := buf.Parser.ParseOwned(buf.DocBuf)
+			if parseErr != nil {
+				return parseErr
+			}
+
+			oldItem, itemErr := q.c.newItem(doc)
+			if itemErr != nil {
+				return itemErr
+			}
+
+			modBuf.Arena.Reset()
+			modifiedVal, isModified, modErr := mod.Modify(modBuf.Arena, copyItem(modBuf, oldItem).val)
+			if modErr != nil {
+				return modErr
+			}
+
+			result.Matched++
+			if !isModified {
+				continue
+			}
+
+			it, itemErr := q.c.newItem(modifiedVal)
+			if itemErr != nil {
+				return itemErr
+			}
+			if _, uErr := q.c.update(btWtx, it, oldItem); uErr != nil {
+				return uErr
+			}
+			result.Modified++
+		}
+		return nil
+	})
+}
+
+func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error) {
+	return q.bulkWrite(ctx, func(btWtx *btree.WriteTx, _ *btree.ReadTx, buf *syncpool.DocBuffer, ids [][]byte, result *ModifyResult) error {
+		for _, id := range ids {
+			if err := q.c.deleteItem(btWtx, buf, id); err != nil {
+				return err
+			}
+			result.Matched++
+			result.Modified++
+		}
+		return nil
+	})
+}
+
+// bulkWrite is the shared scaffolding of the bulk mutators (Update/Delete):
+// it compiles the query plan inside a write tx, materializes the distinct
+// target ids, releases the plan's cursors and hands the ids to mutate, which
+// applies the per-id mutation and accumulates result.
+func (q *collQuery) bulkWrite(ctx context.Context, mutate func(btWtx *btree.WriteTx, btx *btree.ReadTx, buf *syncpool.DocBuffer, ids [][]byte, result *ModifyResult) error) (result ModifyResult, err error) {
+	if err = q.c.alive(); err != nil {
+		return
+	}
 	qb, err := q.makeQuery()
 	if err != nil {
 		return
@@ -431,15 +499,14 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		return
 	}
 
-	// Fast path: filter provably matches no documents — nothing to update,
+	// Fast path: filter provably matches no documents — nothing to mutate,
 	// no write tx required. ModifyResult is the zero value (Matched=0,
-	// Modified=0); the modifier was already parsed above so a malformed
-	// modifier is still surfaced.
+	// Modified=0).
 	if q.unsatisfiable() {
 		return
 	}
 
-	// Reclaim tombstones this bulk update creates once it commits, mirroring the
+	// Reclaim tombstones this bulk write creates once it commits, mirroring the
 	// single-doc mutators. Registered before the commit defer so it runs after
 	// commit; no-ops inside a caller-managed tx (the guard in maybeAutoCompactVectors).
 	// Gated on an explicit commit, not on err == nil: err is still nil while a
@@ -457,9 +524,9 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		return
 	}
 	defer func() {
-		// A panic (a user modifier's bug) leaves err == nil, so keying the commit
-		// on err alone would durably persist the documents modified before it — a
-		// torn bulk update. Roll back, then re-panic.
+		// A panic (a user modifier's or filter's bug) leaves err == nil, so keying
+		// the commit on err alone would durably persist the documents mutated
+		// before it — a torn bulk write. Roll back, then re-panic.
 		if r := recover(); r != nil {
 			_ = tx.Rollback()
 			panic(r)
@@ -496,7 +563,7 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 		return
 	}
 
-	// Close-once: the plan must be closed before the write loop below (see the
+	// Close-once: the plan must be closed before the mutation loop (see the
 	// cursor-invalidation note), but a panic in a user Filter inside Next() would
 	// skip that call and strand the cursors' pinned pages. The deferred call
 	// covers the panic and error paths; Plan.Close is not idempotent, hence the
@@ -512,170 +579,16 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	defer closePlan()
 
 	// Materialize the distinct target ids, then release the plan's cursors
-	// BEFORE mutating ("can't modify while iterating"). Dedup ensures a bulk
-	// update over an array-indexed $in query doesn't apply the modifier twice
-	// to the same doc.
-	idsToUpdate, err := collectDistinctIDs(plan.Root)
-	if err != nil {
-		return
-	}
-	closePlan()
-
-	modBuf := q.c.db.syncPool.GetDocBuf()
-	defer q.c.db.syncPool.ReleaseDocBuf(modBuf)
-
-	var getErr error
-	for _, id := range idsToUpdate {
-		buf.DocBuf, getErr = btx.AppendValue(q.c.ns, id, buf.DocBuf[:0])
-		if getErr != nil {
-			err = getErr
-			return
-		}
-		doc, parseErr := buf.Parser.ParseOwned(buf.DocBuf)
-		if parseErr != nil {
-			err = parseErr
-			return
-		}
-
-		oldItem, itemErr := q.c.newItem(doc)
-		if itemErr != nil {
-			err = itemErr
-			return
-		}
-
-		modBuf.Arena.Reset()
-		modifiedVal, isModified, modErr := mod.Modify(modBuf.Arena, copyItem(modBuf, oldItem).val)
-		if modErr != nil {
-			err = modErr
-			return
-		}
-
-		result.Matched++
-		if !isModified {
-			continue
-		}
-
-		var it item
-		if it, err = q.c.newItem(modifiedVal); err != nil {
-			return
-		}
-		if _, err = q.c.update(btWtx, it, oldItem); err != nil {
-			return
-		}
-		result.Modified++
-	}
-	if result.Modified > 0 {
-		tx.SetModified()
-	}
-	return
-}
-
-func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error) {
-	if err = q.c.alive(); err != nil {
-		return
-	}
-	qb, err := q.makeQuery()
-	if err != nil {
-		return
-	}
-	defer qb.Close()
-
-	// Source validation precedes the unsatisfiable() short-circuit (see Iter).
-	if err = q.validateSources(); err != nil {
-		return
-	}
-
-	// Fast path: filter provably matches no documents — nothing to delete,
-	// no write tx required.
-	if q.unsatisfiable() {
-		return
-	}
-
-	// Reclaim tombstones this bulk delete creates once it commits, mirroring the
-	// single-doc mutators. Registered before the commit defer so it runs after
-	// commit; no-ops inside a caller-managed tx (the guard in maybeAutoCompactVectors).
-	// Gated on an explicit commit, not on err == nil: err is still nil while a
-	// panic unwinds, and compaction opens its own write tx — it must never run
-	// on a failed operation, let alone mid-panic.
-	committed := false
-	defer func() {
-		if committed {
-			q.c.maybeAutoCompactVectors(ctx)
-		}
-	}()
-
-	tx, err := q.c.db.WriteTx(ctx)
-	if err != nil {
-		return
-	}
-	defer func() {
-		// A panic in user filter code leaves err == nil, so keying the commit on
-		// err alone would durably persist the documents deleted before it — a torn
-		// bulk delete. Roll back, then re-panic.
-		if r := recover(); r != nil {
-			_ = tx.Rollback()
-			panic(r)
-		}
-		if err != nil {
-			_ = tx.Rollback()
-			return
-		}
-		if err = tx.Commit(); err == nil {
-			committed = true
-		}
-	}()
-
-	// Re-checked inside the tx scope: the begin-time staleness pass may have
-	// just invalidated the handle (see collection.alive) — the entry check
-	// alone would let this bulk write proceed through a stale handle.
-	if err = q.c.alive(); err != nil {
-		return
-	}
-
-	btWtx := tx.btreeWriteTx()
-	btx := tx.btreeReadTx()
-
-	buf := q.c.db.syncPool.GetDocBuf()
-	defer q.c.db.syncPool.ReleaseDocBuf(buf)
-
-	// The shared compiler: a bounded write must select exactly the documents
-	// the equivalent Iter returns — same sorter, same access-path detection
-	// ($text AND vector; an invalid vector clause errors here like it does on
-	// Iter instead of degrading to a literal filter).
-	plan, _, ferr := q.compilePlan(ctx, btx, buf, qb.idBounds, planOpts{forWrite: true})
-	if ferr != nil {
-		err = ferr
-		return
-	}
-
-	// Close-once: the plan must be closed before the delete loop below, but a
-	// panic in a user Filter inside Next() would skip that call and strand the
-	// cursors' pinned pages. See the matching comment in Update.
-	planClosed := false
-	closePlan := func() {
-		if !planClosed {
-			planClosed = true
-			plan.Close()
-		}
-	}
-	defer closePlan()
-
-	// Materialize the distinct target ids, then release the plan's cursors
 	// BEFORE mutating ("can't modify while iterating"). Dedup ensures a doc
-	// matched on multiple array values isn't deleted twice / counted twice.
-	idsToDelete, err := collectDistinctIDs(plan.Root)
+	// matched on multiple array values isn't mutated twice / counted twice.
+	ids, err := collectDistinctIDs(plan.Root)
 	if err != nil {
 		return
 	}
 	closePlan()
 
-	// Now delete collected docs
-	for _, id := range idsToDelete {
-		if err = q.c.deleteItem(btWtx, buf, id); err != nil {
-			return
-		}
-		result.Matched++
-		result.Modified++
+	if err = mutate(btWtx, btx, buf, ids, &result); err != nil {
+		return
 	}
 	if result.Modified > 0 {
 		tx.SetModified()
@@ -689,7 +602,7 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	}
 	// A parse error must be reported before anything else: Cond()/Sort() leave
 	// q.cond nil when they fail, which is indistinguishable from "no filter" to
-	// the fast path below — so a rejected query used to count the WHOLE
+	// the fast path below — the fast path would otherwise count the WHOLE
 	// collection with err=nil, while Iter/Update/Delete (which reach q.err via
 	// makeQuery) correctly errored. Count is the only verb that skips makeQuery.
 	if q.err != nil {
@@ -1039,19 +952,9 @@ func isUnsatisfiable(f query.Filter) bool {
 	case query.Key:
 		return isUnsatisfiable(ft.Filter)
 	case query.And:
-		for _, sub := range ft {
-			if isUnsatisfiable(sub) {
-				return true
-			}
-		}
-		return false
+		return slices.ContainsFunc(ft, isUnsatisfiable)
 	case *query.And:
-		for _, sub := range *ft {
-			if isUnsatisfiable(sub) {
-				return true
-			}
-		}
-		return false
+		return slices.ContainsFunc(*ft, isUnsatisfiable)
 	case query.Or:
 		if len(ft) == 0 {
 			return false
@@ -1284,7 +1187,7 @@ func (q *collQuery) buildCBOIndex(idx *index, br *qplanner.BoundsResult, sortFie
 	// WITHIN a run, not across runs, so claiming ExactSort for a suffix sort
 	// drops the SortIter and yields silently misordered rows — and, under Limit,
 	// the wrong rows. Break rather than skip: a later single-bound field must not
-	// re-extend the prefix past the multi-bound one. See BUG-26.
+	// re-extend the prefix past the multi-bound one.
 	//
 	// A sort that STARTS at the multi-bound field is still served by
 	// IndexSortMatch's matchAt() paths: the bound list is ascending and pairwise

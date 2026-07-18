@@ -319,7 +319,7 @@ func (it *IndexIter) skipOffset(n int) (remaining int, err error) {
 // value for an indexed field (the per-element keys of a nested array, and the
 // whole-value-as-tuple key of any multi-key doc). So a key with this prefix
 // exists in a single-field index iff that index has ever held a multi-key
-// (array) entry. See docs/specs/2026-05-28-i04-i05-fix-option-d-canonical-key-probe.md.
+// (array) entry. See docs/known-issues.md (I-04/I-05).
 var arrayPrefix = []byte{byte(anyenc.TypeArray)}
 
 // arrayPrefixInverted is the array tag for a REVERSE-flagged single-field index.

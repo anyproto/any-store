@@ -1606,6 +1606,8 @@ chained hash (`pcache.apHash []*page` + `page.hashNext`), a direct port of
   `pageSize` is immutable after Init, read without mutex via acquire semantics
   from the atomic load. Matches SQLite's mutex-free reads of `pcache1.isInit`
   and `pcache1.szSlot` (`pcache1.c:220-222`).
+  **Status:** the `Initialized()` accessor is removed as unused; the lock-free
+  atomic pattern it documented lives on in `pageSlab.initialized` / `Reset`.
 
 **Future Improvements:**
 - Shrink API (`sqlite3PcacheShrink` equivalent) for external memory pressure
@@ -1630,7 +1632,7 @@ with `inject.active=false` (`deleteRebalanceLeaf` → `balanceNonroot`, btree.go
 btree.c:8960). The former 2-way `leafSplitPoint` split survives only as the root-leaf fallback
 (`splitRootLeafAndInsert`); `balance_quick` is retained as the rightmost-append fast path
 (below). See `balance.go`'s header for the enumerated index-btree deviations, and
-`docs/btree/plans/2026-05-23-balance-nonroot-3sibling.md` /
+`any-store-tests:docs/any-store/btree/plans/2026-05-23-balance-nonroot-3sibling.md` /
 `2026-05-23-delete-time-rebalancing.md`. Deferred (optional): first-key divider advance on
 delete and retiring the now-dead `tryMergeLeaf`.
 
@@ -1894,7 +1896,7 @@ These SQLite features are intentionally absent:
 ## Online Backup (backup.go)
 
 Port of SQLite's `sqlite3_backup_*` API from `sqlite/src/backup.c`. See
-`docs/plans/2026-04-22-sqlite-backup-port.md` for the full drift
+`any-store-tests:docs/any-store/btree/plans/2026-04-22-sqlite-backup-port.md` for the full drift
 register and C↔Go coverage table. Key entry points:
 
 - `(*DB).BackupInit(src *DB) (*Backup, error)` -- ~ `sqlite3_backup_init`
@@ -3296,6 +3298,21 @@ of two `>= maxPages` and `>= minHashSize` (256, `pcache.go:156`). With the defau
 allocates 8192 buckets up front, and a larger configured cache allocates proportionally more. The consequence is a
 larger eager hash-table allocation at cache creation than SQLite's fixed 256-bucket seed — an intentional
 memory-vs-rehash tradeoff, now recorded in an in-code DRIFT comment at `pcache.go:134`.
+
+<a id="drift-131-build-tag-gated-test-fault-hooks"></a>
+### Drift: Build-Tag-Gated Test Fault Hooks
+- **Category:** platform-support  -  **Severity:** low
+- **Affected functions:** `test_hooks.go` (`internal/btree/test_hooks.go` `walTestHooks=false`, default build) /
+  `test_hooks_on.go` (`internal/btree/test_hooks_on.go` `walTestHooks=true`, tag `btreetesthooks`);
+  hook field `wal.forceBusySnapshotForTest` and its check in `wal.beginWriteWithSnapshot`;
+  consumers `busy_snapshot_hook_test.go` (BeginWrite bounded-retry + BusyHandler dispatch tests).
+
+SQLite compiles fault-injection helpers only under `SQLITE_TEST` (e.g. the busy/fault simulation hooks around
+`sqlite3InvokeBusyHandler`, `main.c:1700-1715`); production builds contain none of them. The Go port mirrors that
+with the `btreetesthooks` build tag: default builds define `const walTestHooks = false`, so
+`if walTestHooks && w.forceBusySnapshotForTest.Load()` is dead-code-eliminated and `BeginWrite` pays no atomic
+load; `-tags btreetesthooks` enables the hook and the two ErrBusySnapshot retry-contract tests. The drift is only
+the mechanism (build tag + const vs `#ifdef`); the gating structure follows upstream.
 
 ---
 

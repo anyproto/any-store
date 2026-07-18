@@ -126,10 +126,8 @@ func newFtsIndex(c *collection, info IndexInfo) (*ftsIndex, error) {
 		catalogKey: indexKey(c.name, info.Name)}
 	for _, field := range info.Fields {
 		fields, _ := parseIndexField(field)
-		for _, f := range fields {
-			if f == "" {
-				return nil, errors.New("fts: invalid index field: '" + field + "'")
-			}
+		if slices.Contains(fields, "") {
+			return nil, errors.New("fts: invalid index field: '" + field + "'")
 		}
 		fx.fieldPaths = append(fx.fieldPaths, fields)
 	}
@@ -471,15 +469,7 @@ func (fx *ftsIndex) termPostingsInto(dst map[string][]uint32, tokens []fts.Token
 // ---- IntDocID allocation & docmap -----------------------------------------
 
 func (fx *ftsIndex) readMetaUint(tx *btree.WriteTx, key []byte) (uint64, error) {
-	v, err := tx.Get(fx.nsMeta, key)
-	if err != nil {
-		if errors.Is(err, btree.ErrKeyNotFound) {
-			return 0, nil
-		}
-		return 0, err
-	}
-	n, _ := binary.Uvarint(v)
-	return n, nil
+	return ftsGetUint(&tx.ReadTx, fx.nsMeta, key)
 }
 
 func (fx *ftsIndex) putMetaUint(tx *btree.WriteTx, key []byte, n uint64) error {
@@ -493,10 +483,7 @@ func (fx *ftsIndex) addMetaDelta(tx *btree.WriteTx, key []byte, delta int64) err
 	if err != nil {
 		return err
 	}
-	next := int64(cur) + delta
-	if next < 0 {
-		next = 0
-	}
+	next := max(int64(cur)+delta, 0)
 	return fx.putMetaUint(tx, key, uint64(next))
 }
 
@@ -528,15 +515,7 @@ func ftsMapReverseKey(dst []byte, docID uint64) []byte {
 // lookupDocID returns the IntDocID for a string id, or ok=false if absent.
 func (fx *ftsIndex) lookupDocID(tx *btree.WriteTx, stringID []byte) (uint64, bool, error) {
 	fx.keyBuf = ftsMapForwardKey(fx.keyBuf, stringID)
-	v, err := tx.Get(fx.nsMap, fx.keyBuf)
-	if err != nil {
-		if errors.Is(err, btree.ErrKeyNotFound) {
-			return 0, false, nil
-		}
-		return 0, false, err
-	}
-	n, _ := binary.Uvarint(v)
-	return n, true, nil
+	return ftsGetUintOk(&tx.ReadTx, fx.nsMap, fx.keyBuf)
 }
 
 // ---- postings key ---------------------------------------------------------

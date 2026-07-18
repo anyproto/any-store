@@ -3,7 +3,7 @@ package query
 import (
 	"bytes"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -116,7 +116,7 @@ func (bs Bounds) Append(b Bound) Bounds {
 	}
 
 	result = append(result, b)
-	sort.Sort(result)
+	sortBounds(result)
 	return result
 }
 
@@ -126,7 +126,7 @@ func (bs Bounds) SortAndMerge() Bounds {
 	if len(bs) <= 1 {
 		return bs
 	}
-	sort.Sort(bs)
+	sortBounds(bs)
 	result := bs[:1] // reuse backing array, safe since result grows ≤ input
 	for _, b := range bs[1:] {
 		last := &result[len(result)-1]
@@ -195,16 +195,11 @@ func maxEndKey(a, b Bound) ([]byte, bool) {
 	return b.End, b.EndInclude
 }
 
-func (bs Bounds) Len() int {
-	return len(bs)
-}
-
-func (bs Bounds) Less(i, j int) bool {
-	return bytes.Compare(bs[i].Start, bs[j].Start) == -1
-}
-
-func (bs Bounds) Swap(i, j int) {
-	bs[i], bs[j] = bs[j], bs[i]
+// sortBounds orders bounds by Start key (unstable, Start only).
+func sortBounds(bs Bounds) {
+	slices.SortFunc(bs, func(a, b Bound) int {
+		return bytes.Compare(a.Start, b.Start)
+	})
 }
 
 // Contains reports whether val lies within any range in bs.

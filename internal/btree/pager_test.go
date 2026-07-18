@@ -6856,7 +6856,7 @@ func TestCov2_WriteHeader_FileError(t *testing.T) {
 }
 
 // ============================================================
-// Bug 15: page_size=0 in corrupt DB header causes panic
+// page_size=0 in corrupt DB header causes panic
 // ============================================================
 
 func TestCorruptPageSizeZero(t *testing.T) {

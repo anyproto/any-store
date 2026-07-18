@@ -263,7 +263,8 @@ type db struct {
 	// with a non-empty pending buffer. flushAllFtsPending / resetAllFtsPending
 	// enumerate openedCollections, so without this registry a Close() between
 	// Insert and Commit would silently drop the buffered postings — the doc
-	// commits but stays invisible to $text forever (pre-beta catalog BUG-01).
+	// commits but stays invisible to $text forever (guarded by
+	// TestFtsPendingSurvivesCollectionCloseMidTx).
 	// Guarded by db.mu; drained by the next flush or reset.
 	orphanFtsPending []*ftsIndex
 	closed           atomic.Bool
@@ -271,7 +272,6 @@ type db struct {
 	dirtyOnOpen             bool
 	dirtyQuickCheckDuration time.Duration
 	mu                      sync.Mutex
-	writeMu                 sync.Mutex
 }
 
 func collKey(name string) []byte {
@@ -1048,52 +1048,37 @@ func (db *db) doWriteTx(ctx context.Context, do func(tx *btree.WriteTx) error) e
 // commonTx.undo) so a rollback of this scope — or of any enclosing tx — leaves
 // the in-memory maps consistent with the reverted on-disk catalog.
 func (db *db) doWriteTxW(ctx context.Context, do func(wtx WriteTx, tx *btree.WriteTx) error) error {
+	return db.doWriteTxModifiedW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (bool, error) {
+		return true, do(wtx, tx)
+	})
+}
+
+// doWriteTxModifiedW is doWriteTxW whose callback also reports whether it
+// modified data (SetModified is skipped otherwise).
+func (db *db) doWriteTxModifiedW(ctx context.Context, do func(wtx WriteTx, tx *btree.WriteTx) (bool, error)) error {
 	tx, err := db.WriteTx(ctx)
 	if err != nil {
 		return err
 	}
-	// User code runs inside this tx (a query.Modifier, a DDL callback). A panic
-	// must not escape holding the btree write lock: BeginWrite has no ctx-cancel
-	// escape, so every later write — and Close() — would block forever. Roll back
-	// to release the lock, then re-panic so the caller still sees their bug.
+	// User code runs inside this tx (a query.Modifier — UpdateId/UpsertId call
+	// mod.Modify inside the callback — or a DDL callback). A panic must not
+	// escape holding the btree write lock: BeginWrite has no ctx-cancel escape,
+	// so every later write — and Close() — would block forever. Roll back to
+	// release the lock, then re-panic so the caller still sees their bug.
+	// Guarded by TestTxPanic_UpdateIdDoesNotWedgeDB and
+	// TestTxPanic_UpsertIdDoesNotWedgeDB.
 	//
 	// Deliberately not armed across Commit: both commit layers mark themselves
 	// done before doing any work (writeTx.Commit consumes the version CAS on
 	// entry and pools the commonTx; btree.WriteTx.Commit sets closed before
 	// pager.commit), so a rollback once commit has begun is a silent no-op on an
 	// already-recycled tx. A commit-time panic still leaks the lock — that needs
-	// the release moved into a defer inside btree.WriteTx.Commit; see BUG-14.
+	// the release moved into a defer inside btree.WriteTx.Commit (the abandoned-tx
+	// case is guarded by btree's TestWriteTxAbandonedDoesNotDeadlockClose).
 	//
 	// The rollback runs the undo log, whose closures take c.mu / db.mu: a
 	// callback must not panic while holding either with an explicit (non-defer)
 	// unlock, or the unwind deadlocks here.
-	committing := false
-	defer func() {
-		if r := recover(); r != nil {
-			if !committing {
-				_ = tx.Rollback()
-			}
-			panic(r)
-		}
-	}()
-	if err = do(tx, tx.btreeWriteTx()); err != nil {
-		return errors.Join(err, tx.Rollback())
-	}
-	tx.SetModified()
-	committing = true
-	return tx.Commit()
-}
-
-// doWriteTxModifiedW is doWriteTxModified with wrapper-tx access; see
-// doWriteTxW.
-func (db *db) doWriteTxModifiedW(ctx context.Context, do func(wtx WriteTx, tx *btree.WriteTx) (bool, error)) error {
-	tx, err := db.WriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	// Rollback-on-panic; see doWriteTxW for why the guard stops at Commit. This
-	// is the single-doc modifier path (UpdateId/UpsertId call mod.Modify inside
-	// the callback), the one BUG-34 reported as wedging the DB.
 	committing := false
 	defer func() {
 		if r := recover(); r != nil {
@@ -1701,8 +1686,8 @@ func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 		}
 	}
 	// Remove the per-index sketch and multikey records too. The sketch is
-	// keyed by collection name (previously leaked here); the multikey flag is
-	// keyed by the namespace name.
+	// keyed by collection name; the multikey flag is keyed by the namespace
+	// name.
 	for _, name := range idxNames {
 		_ = tx.Delete(db.systemNS, sketchKey(collName, name))
 		_ = tx.Delete(db.systemNS, multikeyKey(indexNsName(collName, name)))

@@ -1535,7 +1535,7 @@ func TestCheckpointBackfill_ShortWrite_NoError(t *testing.T) {
 // from the WAL. Zero silent corruption.
 //
 // (Previously this test opened a second in-process handle to the same path
-// while the first was still open, which the Bug-16 double-open guard at
+// while the first was still open, which the double-open guard at
 // db.go:385 rejects. It is restructured to close the first handle and recover
 // from a snapshot.)
 func TestCheckpointBackfill_ShortWrite_InlineRead(t *testing.T) {
@@ -1616,27 +1616,13 @@ func TestCheckpointBackfill_ShortWrite_InlineRead(t *testing.T) {
 }
 
 // ==========================================================================
-// Regression tests: reproduce the EXACT bugs fixed in recent commits.
-// These tests simulate the old buggy behavior to verify the fixes work.
+// Regression tests: failed-checkpoint WAL preservation.
 // ==========================================================================
 
-// TestRegression_Bug11_CloseUnconditionallyTruncatesWAL reproduces the Bug 11
-// scenario (fixed in be6af73): pager.close() unconditionally truncated the WAL
-// after a partial checkpoint, destroying uncopied frames.
-//
-// Old buggy code in pager.close():
-//
-//	cpErr := p.wal.checkpointPassive(p.file, p.master)
-//	_ = cpErr                // BUG: error ignored!
-//	p.wal.truncateFile()     // BUG: always truncated, even on failure!
-//
-// Fixed code:
-//
-//	cpErr := p.wal.checkpointPassive(p.file, p.master)
-//	if cpErr == nil {
-//	    p.wal.truncateFile() // Only truncate on success
-//	}
-func TestRegression_Bug11_CloseUnconditionallyTruncatesWAL(t *testing.T) {
+// TestRegression_CloseKeepsWALAfterFailedCheckpoint: pager.close truncates the
+// WAL only when its close-time checkpoint succeeds (gate at be6af73); a failed
+// checkpoint must leave every uncopied frame on disk for replay at reopen.
+func TestRegression_CloseKeepsWALAfterFailedCheckpoint(t *testing.T) {
 	dir := t.TempDir()
 	opts := DefaultOptions()
 	opts.DisableAutoCheckpoint = true
@@ -1657,7 +1643,7 @@ func TestRegression_Bug11_CloseUnconditionallyTruncatesWAL(t *testing.T) {
 	// Enable fault: close-time checkpoint will FAIL
 	ff.enableFault(0)
 
-	// Close the DB — the fix ensures WAL is NOT truncated
+	// Close the DB — the WAL must NOT be truncated
 	_ = db.Close()
 
 	// Verify WAL was preserved (NOT truncated)
@@ -1666,7 +1652,7 @@ func TestRegression_Bug11_CloseUnconditionallyTruncatesWAL(t *testing.T) {
 	require.NoError(t, err)
 	t.Logf("WAL size after close with fault: %d bytes", walInfo.Size())
 	assert.Greater(t, walInfo.Size(), int64(0),
-		"BUG 11 REGRESSION: WAL should NOT be truncated when checkpoint fails")
+		"WAL should NOT be truncated when checkpoint fails")
 
 	// Reopen: WAL recovery should replay all frames
 	ResetVFS()
@@ -1677,18 +1663,17 @@ func TestRegression_Bug11_CloseUnconditionallyTruncatesWAL(t *testing.T) {
 	verifyDocuments(t, db2, "data", 50)
 }
 
-// TestRegression_Bug11_Simulation is the regression test for the Bug 11 FIX
-// (pager.close truncate-gate at pager.go:2698; partial-checkpoint handling at
-// wal.go:2820-2840 and the backfill error path at wal.go:3271-3274).
+// TestRegression_PartialCheckpointKeepsBackfillAndWAL asserts the invariant: a
+// checkpoint that fails PARTWAY through backfill must leave nBackfill and the
+// WAL untouched (pager.close truncate-gate at pager.go:2698; partial-checkpoint
+// handling at wal.go:2820-2840 and the backfill error path at wal.go:3271-3274)
+// — otherwise the frames not yet copied to the DB file are discarded → data
+// loss on reopen.
 //
-// Bug 11 (old, buggy behavior) was: a checkpoint that failed PARTWAY through
-// backfill still let pager.close unconditionally truncate the WAL, discarding
-// the frames that had not yet been copied to the DB file → data loss on reopen.
-//
-// This test proves the bug stays fixed. It arranges a DB large enough that a
-// checkpoint backfills several distinct pages (~17 for 200 docs — see the
-// dedup in buildBackfillMap at wal.go:2862), injects a WriteAt fault that fires
-// after only 8 of those page-writes, and asserts the engine does the SAFE thing:
+// The test arranges a DB large enough that a checkpoint backfills several
+// distinct pages (~17 for 200 docs — see the dedup in buildBackfillMap at
+// wal.go:2862), injects a WriteAt fault that fires after only 8 of those
+// page-writes, and asserts the engine does the SAFE thing:
 //
 //   - the checkpoint returns the injected I/O error (backfill aborts);
 //   - nBackfill is NOT advanced past the safely-written prefix
@@ -1702,7 +1687,7 @@ func TestRegression_Bug11_CloseUnconditionallyTruncatesWAL(t *testing.T) {
 //
 // NOTE: nBackfillAttempted IS expected to advance to mxSafeFrame (wal.go:3133):
 // it is only a crash-safety hint and never causes recovery to skip frames.
-func TestRegression_Bug11_Simulation(t *testing.T) {
+func TestRegression_PartialCheckpointKeepsBackfillAndWAL(t *testing.T) {
 	dir := t.TempDir()
 	snapDir := t.TempDir()
 	opts := DefaultOptions()
@@ -1742,7 +1727,7 @@ func TestRegression_Bug11_Simulation(t *testing.T) {
 	// SAFE behavior #1: nBackfill must NOT advance past the written prefix.
 	nBackfillAfter := db.pager.wal.index.nBackfill.Load()
 	assert.Equal(t, nBackfillBefore, nBackfillAfter,
-		"BUG 11 REGRESSION: nBackfill must not advance after a failed checkpoint")
+		"nBackfill must not advance after a failed checkpoint")
 	t.Logf("After partial checkpoint: nBackfill=%d (unchanged), nBackfillAttempted=%d",
 		nBackfillAfter, db.pager.wal.index.nBackfillAttempted.Load())
 
@@ -1759,7 +1744,7 @@ func TestRegression_Bug11_Simulation(t *testing.T) {
 	walInfo, err := os.Stat(walSnap)
 	require.NoError(t, err)
 	assert.Greater(t, walInfo.Size(), int64(0),
-		"BUG 11 REGRESSION: WAL must remain intact after a failed checkpoint")
+		"WAL must remain intact after a failed checkpoint")
 	t.Logf("Crash-snapshot WAL size: %d bytes", walInfo.Size())
 
 	_ = db.Close()

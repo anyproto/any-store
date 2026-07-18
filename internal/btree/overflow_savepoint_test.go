@@ -17,7 +17,7 @@ import (
 )
 
 // TestOverflowSavepointCorruption exercises savepoint rollback/release with
-// overflow-sized values to reproduce Bug 9: zero-content overflow pages
+// overflow-sized values to reproduce zero-content overflow pages
 // after a clean commit. This test:
 // 1. Inserts/updates/deletes keys with values large enough to trigger overflow
 // 2. Uses savepoints with rollback and release

@@ -19,7 +19,7 @@ import (
 //
 // The port mirrors SQLite section-for-section; every block cites the btree.c
 // line it is derived from. The ONLY deviations from btree.c are the documented
-// ones from docs/btree/plans/2026-05-23-balance-nonroot-3sibling.md:
+// ones from any-store-tests:docs/any-store/btree/plans/2026-05-23-balance-nonroot-3sibling.md:
 //
 //  1. Index-btree only. any-store has no rowid / table-leaf path: page types are
 //     only pageTypeLeafIdx / pageTypeIntIdx (page.go:77-80). SQLite's tree-wide

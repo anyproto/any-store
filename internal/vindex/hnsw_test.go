@@ -1,10 +1,11 @@
 package vindex
 
 import (
+	"cmp"
 	"encoding/binary"
 	"math"
 	"math/rand"
-	"sort"
+	"slices"
 	"sync"
 	"testing"
 
@@ -50,7 +51,7 @@ func bruteTopK(vecs [][]float32, q []float32, k int) map[string]bool {
 	for i := range vecs {
 		all[i] = p{i, l2(q, vecs[i])}
 	}
-	sort.Slice(all, func(i, j int) bool { return all[i].d < all[j].d })
+	slices.SortFunc(all, func(a, b p) int { return cmp.Compare(a.d, b.d) })
 	out := map[string]bool{}
 	for i := 0; i < k && i < len(all); i++ {
 		out[string(docID(all[i].i))] = true

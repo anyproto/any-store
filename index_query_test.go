@@ -1253,7 +1253,7 @@ func TestIndex_Coverage_EmptySegmentInPathRejected(t *testing.T) {
 
 // TestAudit03_MultiBoundOverlap_* exercises the most important integration
 // invariant of the multi-key bit + dedup pipeline introduced on the `btree`
-// branch (see docs/plans/2026-04-29-multikey-bit-and-dedup-pipeline.md):
+// branch (see any-store-tests:docs/any-store/plans/2026-04-29-multikey-bit-and-dedup-pipeline.md):
 //
 //	A `$in` filter that produces multiple bounds, executed against a
 //	multi-key (array-valued) index whose documents have OVERLAPPING values
@@ -2128,7 +2128,7 @@ func TestAudit10_RangeMultiKey_LargeArray(t *testing.T) {
 
 // TestAudit11_*: degenerate `$in` shapes on a multi-key index.
 //
-// The dedup pipeline (docs/plans/2026-04-29-multikey-bit-and-dedup-pipeline.md)
+// The dedup pipeline (any-store-tests:docs/any-store/plans/2026-04-29-multikey-bit-and-dedup-pipeline.md)
 // splits IndexIter.CountEntries on len(Bounds):
 //
 //	len(Bounds) <= 1: page-batch CountUntil  (no per-entry walk, no seen-set)
@@ -2337,7 +2337,7 @@ func TestAudit11_SingletonIn_MultipleDocs(t *testing.T) {
 
 // ── Single-index audit (act-01/03/04) ──
 /*
-Audit tests for the "single-index" domain (docs/qplanner/audit/actionable_by_domain.json).
+Audit tests for the "single-index" domain (any-store-tests:docs/any-store/qplanner/audit/actionable_by_domain.json).
 
   act-01  $ne on an indexed scalar uses a two-bound seek and still includes
           null/missing (non-sparse): the index IS used (IndexScan, not FullScan),

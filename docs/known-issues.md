@@ -2,7 +2,7 @@
 
 Latent bugs discovered during code review but not yet fixed. Each entry includes a brief description, the affected code, the failure mode, the impact level (correctness vs performance vs predictability), and a fix sketch.
 
-Entries should be moved to a per-issue plan in `docs/plans/` when work starts on them.
+Entries should be moved to a per-issue plan in `any-store-tests:docs/any-store/plans/` when work starts on them.
 
 ---
 
@@ -132,7 +132,7 @@ uses it; actual seeks use it only for the primary key (array pks now rejected
 on write) and for indexes whose persisted `idx_mk:` record proves no fan-out
 entry was ever written (see index.markMultiKey / isScalarProven). Multikey and
 unknown indexes keep the wide bounds this entry mandates. Plan and tests:
-docs/plans/2026-07-10-bug02-two-sided-bounds-plan.md,
+any-store-tests:docs/any-store/plans/2026-07-10-bug02-two-sided-bounds-plan.md,
 multikey_flag_test.go, query/tight_bounds_test.go.
 
 **Discovered:** 2026-05-28, during the array-index multi-bound `$in` merge code review (4-agent review of `feat/array-index-multi-bound-in-merge`).
@@ -215,7 +215,7 @@ count it served (the pooling is the low-alloc win, and the map buckets dominate 
 ~3.5× the chunk bytes). The 4-agent review confirmed this retention is bounded and
 GC-reclaimable — no leak/corruption; a Put-time cap is a known follow-up. See the
 seen-set A/B in the `129ffc0` commit message and
-`docs/2026-05-29-array-index-sortdedup-summary.md`.
+`any-store-tests:docs/any-store/2026-05-29-array-index-sortdedup-summary.md`.
 
 **Discovered:** 2026-05-28, during the 4-agent review of `feat/array-index-multi-bound-in-merge`. Pre-existing on the `btree` baseline — not introduced by the merge feature.
 
@@ -338,7 +338,7 @@ re-insert the docs with scalar pks) before upgrading.
 
 ## I-07: `Count()` with `Limit`/`Offset` over a multi-key index disagrees with `Iter()`
 
-**Status: FIXED** on `bug02-two-sided-bounds` (2026-07-10, two-sided-bounds plan commit 4; see docs/plans/2026-07-10-bug02-two-sided-bounds-plan.md).
+**Status: FIXED** on `bug02-two-sided-bounds` (2026-07-10, two-sided-bounds plan commit 4; see any-store-tests:docs/any-store/plans/2026-07-10-bug02-two-sided-bounds-plan.md).
 `LimitIter.CountDistinct` (internal/qplanner/limit_iter.go) deduplicates BEFORE
 the cutoff: offset and limit apply to distinct-doc counts (early exit at
 Offset+Limit distinct), and the Count dispatch (query.go) routes any
@@ -395,7 +395,7 @@ Collection with a custom pk and a UNIQUE single-field index on `id` (random CID-
 
 **Impact: PERFORMANCE (severe, ~700× per lookup), PREDICTABILITY.** Answers stay correct. Any schema that uses a unique secondary index for point lookups on a large collection hits this once past the sketch resolution.
 
-**Reproducer:** `docs/repro/i10-unique-index-cbo/main.go` (self-contained sweep over doc count / payload size / id randomness; prints ms/get and per-value plan-flip counts; `PROFILE=1` writes cpu.prof).
+**Reproducer:** `any-store-tests:docs/any-store/repro/i10-unique-index-cbo/main.go` (self-contained sweep over doc count / payload size / id randomness; prints ms/get and per-value plan-flip counts; `PROFILE=1` writes cpu.prof).
 
 **Fix sketch:** for a full-key `$eq` (all index fields bound with equality) on an index with `Unique: true`, estimate ≤1 row regardless of the sketch. One condition in the estimator; no sketch change needed. (Same reasoning would also cap `$in` on a unique index at len(in).)
 
@@ -424,7 +424,7 @@ Collection with a custom pk and a UNIQUE single-field index on `id` (random CID-
 
 **Workaround (any-sync):** treat a failed create-space tx as poisoning the whole DB handle — close and reopen it before any retry.
 
-**Reproducer:** `docs/repro/i11-stale-handle-rollback/main.go` (post-fix it demonstrates the correct behavior: the re-acquired handle is fresh and the write lands in the right collection).
+**Reproducer:** `any-store-tests:docs/any-store/repro/i11-stale-handle-rollback/main.go` (post-fix it demonstrates the correct behavior: the re-acquired handle is fresh and the write lands in the right collection).
 
 **Status: FIXED** (2026-07-11, ddl-rollback-eviction). Empirically confirmed first: create "x" via `tx.Context()`, `tx.Rollback()`, create "y" (reuses x's freed root page), insert through the stale "x" handle → the document landed inside collection "y" (`y.FindId` returned it) while `IntegrityCheck` passed before AND after reopen — logical, not structural corruption. Before page reuse the write failed loudly (`btree: database is corrupt`); the silent phase started on reuse. Two additions to the write-up: (1) the trigger is broader than ambient-tx rollback — the handle is registered before `tx.Commit()`, so a failed top-level commit poisons it the same way (also covered by the fix); (2) "re-validate at tx begin" does NOT work: `checkStale` triggers on the schema cookie, which a rollback never bumps.
 

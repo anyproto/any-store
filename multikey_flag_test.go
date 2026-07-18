@@ -3,14 +3,9 @@ package anystore
 import (
 	"fmt"
 	"math/rand"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -393,7 +388,7 @@ func TestQuery_TightSeekDifferential(t *testing.T) {
 	}
 }
 
-// TestMultikeyFlag_ExplainShowsBothEnds is the explain-level BUG-02-shaped
+// TestMultikeyFlag_ExplainShowsBothEnds is the explain-level dropped-range-end
 // acceptance: both bounds ends survive to the executed plan for the pk and a
 // scalar secondary index.
 func TestMultikeyFlag_ExplainShowsBothEnds(t *testing.T) {
@@ -480,82 +475,4 @@ func TestMultikeyFlag_ScanCostPricedFromSeekBounds(t *testing.T) {
 	require.Contains(t, explain.Sql, "FullScan",
 		"an unproven index seeking wide must not be priced at the tight fraction: %s\n%s",
 		explain.Sql, explain.Plan)
-}
-
-// TestMultikeyFlagMultiprocess verifies the flag's cross-process contract: it
-// travels in the same btree commit as the fan-out entries, so a separate OS
-// process opening the file sees either both or neither — tight bounds before
-// the array commit, wide bounds (and the array doc in results) after.
-func TestMultikeyFlagMultiprocess(t *testing.T) {
-	if expect := os.Getenv("MK_MP_EXPECT"); expect != "" {
-		mkMpChild(t, os.Getenv("MK_MP_PATH"), expect)
-		return
-	}
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, "mk_mp.db")
-
-	db, err := Open(ctx, path, nil)
-	require.NoError(t, err)
-	defer db.Close()
-	coll, err := db.CreateCollection(ctx, "docs")
-	require.NoError(t, err)
-	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
-	require.NoError(t, coll.Insert(ctx,
-		anyenc.MustParseJson(`{"id":1,"a":1}`),
-		anyenc.MustParseJson(`{"id":2,"a":3}`),
-	))
-
-	runChild := func(expect string) {
-		t.Helper()
-		cmd := exec.Command(os.Args[0], "-test.run=^TestMultikeyFlagMultiprocess$", "-test.v=true")
-		cmd.Env = append(os.Environ(), "MK_MP_PATH="+path, "MK_MP_EXPECT="+expect)
-		done := make(chan struct{})
-		var out []byte
-		var cerr error
-		go func() { out, cerr = cmd.CombinedOutput(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(60 * time.Second):
-			_ = cmd.Process.Kill()
-			t.Fatalf("child timed out")
-		}
-		require.NoError(t, cerr, "child failed:\n%s", out)
-	}
-
-	// Scalar-only data committed: a fresh process must prove scalar and seek
-	// tight, counting exactly the in-range scalar doc.
-	runChild("tight=1")
-
-	// Commit fan-out entries; the flag travels in the same commit, so the
-	// next process must seek wide and include the array doc (6>2, 1<5).
-	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":4,"a":[6,1]}`)))
-	runChild("wide=2")
-}
-
-// mkMpChild opens the same DB file and asserts the bounds shape (via explain)
-// and the count for the two-sided range under an index hint.
-func mkMpChild(t *testing.T, path, expect string) {
-	db, err := Open(ctx, path, nil)
-	require.NoError(t, err)
-	defer db.Close()
-	coll, err := db.OpenCollection(ctx, "docs")
-	require.NoError(t, err)
-
-	kv := strings.SplitN(expect, "=", 2)
-	mode, wantCount := kv[0], kv[1]
-
-	hint := IndexHint{IndexName: "a", Boost: 1_000_000}
-	explain, err := coll.Find(twoSided).IndexHint(hint).Explain(ctx)
-	require.NoError(t, err)
-	require.Contains(t, explain.Sql, "IndexScan(a)", "child plan: %s", explain.Sql)
-	switch mode {
-	case "tight":
-		require.NotContains(t, explain.Sql, "inf]", "child expected tight bounds: %s", explain.Sql)
-	case "wide":
-		require.Contains(t, explain.Sql, "inf]", "child expected wide bounds: %s", explain.Sql)
-	}
-	n, err := coll.Find(twoSided).IndexHint(hint).Count(ctx)
-	require.NoError(t, err)
-	require.Equal(t, wantCount, strconv.Itoa(n), "child count")
 }

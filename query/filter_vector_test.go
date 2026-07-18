@@ -10,7 +10,7 @@ import (
 	"github.com/anyproto/any-store/v2/syncpool"
 )
 
-// Rule V (BUG-32): a vector is not a point on the scalar order.
+// Rule V: a vector is not a point on the scalar order.
 //
 // anyenc resolves cross-type comparisons on the type tag, and TypeVectorF32 (10)
 // sorts above every scalar tag (null=1 .. compressedObjectS2=9). That made every

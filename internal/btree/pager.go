@@ -1600,7 +1600,9 @@ func (p *pager) freePage(pgno uint32) error {
 		if len(p.savepoints) > 0 {
 			// With active savepoints, we MUST have a savepoint copy for rollback.
 			// If getWritablePage fails, propagate the error rather than silently
-			// creating a page without a savepoint copy (which would cause Bug 9).
+			// creating a page without a savepoint copy (a rollback would then
+			// leave the page with stale content — zero-content overflow-page
+			// corruption).
 			if debugTrace {
 				trace("freePage: getWritablePage(%d) failed with savepoints active: %v", pgno, err)
 			}
@@ -1738,7 +1740,7 @@ func (p *pager) allocateFromFreelist(nearby uint32) (*page, error) {
 		// ensuring the page is journaled for savepoint rollback regardless of
 		// the NOCONTENT flag. Without this, rolling back a savepoint would leave
 		// the page with its new data while the freelist header is restored to
-		// reference it — causing corruption (Bug 9).
+		// reference it — causing corruption.
 		if len(p.savepoints) > 0 {
 			if debugTrace {
 				trace("allocateFromFreelist: leaf pg=%d hasContent=false but savepoints=%d → getPageNoContent + savepoint copy", leafPgno, len(p.savepoints))
@@ -1749,11 +1751,11 @@ func (p *pager) allocateFromFreelist(nearby uint32) (*page, error) {
 			// read would hit EOF. Use a NOCONTENT fetch (no disk read) — matching
 			// SQLite's `noContent = !btreeGetHasContent(...)` path (btree.c:6725) —
 			// then journal the no-content state into the innermost savepoint so a
-			// rollback restores the page consistently with the freelist header
-			// (Bug 9). The previous getWritablePage here READ the page and failed
-			// with EOF, leaking the already-popped leaf: the caller
-			// (allocatePageNear) swallows the error and grows instead, leaving the
-			// page neither on the freelist nor referenced ("page N: never used").
+			// rollback restores the page consistently with the freelist header.
+			// A plain getWritablePage here would READ the page and fail with EOF,
+			// leaking the already-popped leaf: the caller (allocatePageNear)
+			// swallows the error and grows instead, leaving the page neither on
+			// the freelist nor referenced ("page N: never used").
 			pg, err := p.getPageNoContent(leafPgno)
 			if err != nil {
 				return nil, err

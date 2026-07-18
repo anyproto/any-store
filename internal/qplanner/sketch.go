@@ -256,10 +256,7 @@ func (s *IndexSketch) unmarshalV2(data []byte) {
 func (s *IndexSketch) unmarshalLegacy(data []byte) {
 	nWords := len(data) / 8
 	hasDocCount := nWords > s.Size
-	nBuckets := nWords
-	if nBuckets > s.Size {
-		nBuckets = s.Size
-	}
+	nBuckets := min(nWords, s.Size)
 	full := s.Levels - 1
 	base := full * s.Size
 	var sum uint64

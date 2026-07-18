@@ -414,8 +414,6 @@ func (pc *pcache) create(pgno uint32, createFlag int) *page {
 // resetPage initializes a page for use with the given pgno.
 // Clears data buffer and resets all fields. Called from create() after
 // obtaining a page struct from pFree, initBulk, or heap allocation.
-// Consolidates the page initialization that was previously duplicated
-// in three code paths within create().
 // DRIFT: resetPage zeroes page buffer on every creation; SQLite never zeroes at fetch/recycle See docs/btree/NOTES.md#drift-129-resetpage-zeroes-buffer-on-every-page-creation
 func (pc *pcache) resetPage(p *page, pgno uint32) {
 	clear(p.data)

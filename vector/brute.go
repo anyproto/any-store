@@ -1,7 +1,8 @@
 package vector
 
 import (
-	"sort"
+	"cmp"
+	"slices"
 )
 
 // SearchResult is one hit returned by a search: the caller's key and its
@@ -57,8 +58,8 @@ func (b *Brute) Search(query []float32, k int) []SearchResult {
 	for i := range b.keys {
 		results[i] = SearchResult{Key: b.keys[i], Distance: b.dist(query, b.vectorAt(i))}
 	}
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Distance < results[j].Distance
+	slices.SortFunc(results, func(a, b SearchResult) int {
+		return cmp.Compare(a.Distance, b.Distance)
 	})
 	if k > len(results) {
 		k = len(results)

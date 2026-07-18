@@ -126,7 +126,7 @@
   {
     "group": "incrblob_only",
     "category": "feature-not-ported",
-    "reason": "any-store exposes no incremental BLOB I/O API (sqlite3_blob_open/read/write/close); the BtCursor overflow cache and incrblob-cursor invalidation bookkeeping are unneeded. Note: online backup IS ported — see internal/btree/backup.go and docs/plans/2026-04-22-sqlite-backup-port.md.",
+    "reason": "any-store exposes no incremental BLOB I/O API (sqlite3_blob_open/read/write/close); the BtCursor overflow cache and incrblob-cursor invalidation bookkeeping are unneeded. Note: online backup IS ported — see internal/btree/backup.go and any-store-tests:docs/any-store/btree/plans/2026-04-22-sqlite-backup-port.md.",
     "funcs": [
       {
         "file": "btree.c",

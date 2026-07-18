@@ -147,31 +147,19 @@ func ivfNList(p *VectorParams, n int) int {
 	if p.NList > 0 {
 		return p.NList
 	}
-	nl := 4 * int(math.Sqrt(float64(n)))
-	if nl < 16 {
-		nl = 16
-	}
-	if nl > 65536 {
-		nl = 65536
-	}
+	nl := min(max(4*int(math.Sqrt(float64(n))), 16), 65536)
 	if minCells := n / 39; minCells >= 1 && nl > minCells {
 		nl = minCells // keep ≥~39 training points per centroid (FAISS floor)
 	}
 	if n > 0 && nl > n {
 		nl = n // can't have more cells than points
 	}
-	if nl < 1 {
-		nl = 1
-	}
-	return nl
+	return max(nl, 1)
 }
 
 // ivfStoreParams builds the vivf build/open parameters from VectorParams.
 func ivfStoreParams(p *VectorParams, n int) vivf.StoreParams {
-	closure := p.Closure
-	if closure < 1 {
-		closure = 1
-	}
+	closure := max(p.Closure, 1)
 	nprobe := p.NProbe
 	if nprobe < 1 {
 		nprobe = 16

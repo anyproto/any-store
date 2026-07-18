@@ -24,7 +24,7 @@ import (
 //
 // SQLite never hits this case (its invariants forbid removing a pinned page from
 // apHash), so pcache1Unpin adds to the LRU unconditionally; the inCache gate is
-// the v2-specific guard. See docs/btree/plans/2026-05-22-pcache-apHash-port.md.
+// the v2-specific guard. See any-store-tests:docs/any-store/btree/plans/2026-05-22-pcache-apHash-port.md.
 func TestPcacheGhostPage_ReleaseAfterRemovalWhilePinned(t *testing.T) {
 	t.Run("discard while pinned", func(t *testing.T) {
 		pc := newPcache(4096, 100, true)

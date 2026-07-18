@@ -5995,7 +5995,7 @@ func TestCountPageSelfReferentialInteriorCycle(t *testing.T) {
 // rightChild pointer (cellIdx == nCell).
 //
 // This is the structural precondition for the balance_quick fast path
-// (docs/btree/specs/2026-04-23-balance-quick-port-design.md §4-5).
+// (any-store-tests:docs/any-store/btree/specs/2026-04-23-balance-quick-port-design.md §4-5).
 func TestPath_CellIdxRightmost(t *testing.T) {
 	resetPageBufferPool()
 	dir := t.TempDir()

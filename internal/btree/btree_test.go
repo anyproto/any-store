@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -1758,7 +1758,7 @@ func TestMoveToChild_DescentNeverHitsZeroCellInterior(t *testing.T) {
 				s = append(s, keyOf(i))
 			}
 		}
-		sort.Slice(s, func(a, b int) bool { return bytes.Compare(s[a], s[b]) < 0 })
+		slices.SortFunc(s, bytes.Compare)
 		return s
 	}
 

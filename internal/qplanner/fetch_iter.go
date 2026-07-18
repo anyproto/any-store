@@ -87,10 +87,7 @@ func (it *FetchIter) Next() (key []byte, docId []byte, multiKey bool, err error)
 // never occurs in a consistent snapshot; CountEntries likewise counts by
 // index entry, so the skip stays consistent with Count.)
 func (it *FetchIter) skipOffset(n int) (remaining int, err error) {
-	if src, ok := it.Source.(offsetSkipper); ok {
-		return src.skipOffset(n)
-	}
-	return n, nil
+	return delegateSkipOffset(it.Source, n)
 }
 
 // Close releases resources by closing the source iterator.

@@ -41,11 +41,6 @@ type DistanceFunc func(a, b []float32) float32
 // the same kernel the index uses, so brute-force search ranks identically to ANN.
 func DistanceFor(m Metric) DistanceFunc { return distanceFor(m) }
 
-// SIMD reports whether a hand-written SIMD kernel was selected for this CPU.
-// False on arm without NEON, x86 without AVX2, and wasm — see vector/ARM.md and
-// vector/CROSS_HARDWARE.md.
-func SIMD() bool { return simd.Accelerated() }
-
 // distanceFor returns the best distance function for the metric. The L2/Dot/
 // Cosine kernels are selected once inside the simd package (SIMD or, on CPUs
 // without it, a pure-Go fallback), so there is nothing CPU-specific to branch on

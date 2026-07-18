@@ -9,6 +9,6 @@ All package documentation lives under [`docs/btree/`](../../docs/btree/):
 - **[NOTES.md](../../docs/btree/NOTES.md)** — drift catalog vs upstream SQLite. Source comments cite it as `docs/btree/NOTES.md §N`.
 - **[UPSTREAM.md](../../docs/btree/UPSTREAM.md)** — last-verified SQLite + SQLCipher upstream versions.
 - **[mappings/](../../docs/btree/mappings/)** — function-level coverage matrix (Go ↔ SQLite C).
-- **[plans/](../../docs/btree/plans/)** and **[specs/](../../docs/btree/specs/)** — implementation plans and design docs.
+- **[specs/integrity.md](../../docs/btree/specs/integrity.md)** — page-integrity codec design. Other plans and design docs live in `any-store-tests:docs/any-store/btree/{plans,specs}`.
 
 See [`docs/btree/README.md`](../../docs/btree/README.md) for the full overview.

@@ -795,6 +795,3 @@ func TestBackup_RestartsOnExternalProcessWrite(t *testing.T) {
 // page_slab.go:47). The check in BackupInit is trivial
 // (`dst.PageSize() != src.PageSize()`) and is exercised indirectly by
 // any future refactor that drops it — tests will break immediately.
-
-// fmt is imported for later tests; silence unused-import for now.
-var _ = fmt.Sprintf

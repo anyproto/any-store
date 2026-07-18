@@ -15,7 +15,7 @@ import (
 	"github.com/anyproto/any-store/v2/syncpool"
 )
 
-// BUG-34: user code (a query.Modifier, a query.Filter) runs inside the write tx.
+// User code (a query.Modifier, a query.Filter) runs inside the write tx.
 // A panic there used to escape without a Rollback, leaking the btree write lock
 // — BeginWrite has no ctx-cancel escape, so every later write, and Close(),
 // blocked forever. The bulk paths were worse: their finalizer committed when

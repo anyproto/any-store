@@ -125,14 +125,9 @@ func (p *PagedHNSW) Search(query []float32, k int) ([]SearchResult, error) {
 	for lc := g.topLayer; lc > 0; lc-- {
 		ep = p.greedyClosest(g, ep, lc, dist)
 	}
-	ef := g.EfSearch
-	if k > ef {
-		ef = k
-	}
+	ef := max(g.EfSearch, k)
 	found := p.searchLayer(g, ep, ef, 0, dist)
-	if k > len(found) {
-		k = len(found)
-	}
+	k = min(k, len(found))
 	out := make([]SearchResult, k)
 	for i := 0; i < k; i++ {
 		out[i] = SearchResult{Key: g.keys[found[i].id], Distance: found[i].dist}
