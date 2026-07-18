@@ -1917,12 +1917,24 @@ func (tx *ReadTx) DatabaseSize() uint32 {
 	return tx.pager.readerDbSizeBound(tx.cache)
 }
 
-// GetNamespace returns a Namespace handle for the given name.
-// Uses the transaction's WAL snapshot via getPageReader with the reader's
-// private cache. Safe to call concurrently with the writer goroutine.
+// GetNamespace returns a Namespace handle for the given name, respecting the
+// same page-visibility rule as txGetPage: a write transaction's embedded view
+// resolves through the writer cache and sees its own uncommitted
+// Create/Delete/RenameNamespace — read-your-writes for the master table,
+// matching data reads (SQLite reads sqlite_master through the shared pager
+// cache inside a write tx the same way; the snapshot-bounded master read on a
+// writable view was the drift, and it broke any reopen of namespaces touched
+// earlier in the same tx: resolution returned stale committed roots while
+// page reads took the writer path). A read transaction resolves at its WAL
+// snapshot via getPageReader with the reader's private cache; that branch is
+// safe to call concurrently with the writer goroutine, the writable branch is
+// writer-goroutine-only (the txGetPage contract).
 func (tx *ReadTx) GetNamespace(name string) (*Namespace, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
+	}
+	if tx.writable {
+		return tx.db.getNamespaceLocked(name)
 	}
 	return tx.db.getNamespaceAt(name, tx.walHdr.mxFrame, tx.cache)
 }
