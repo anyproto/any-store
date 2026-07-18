@@ -437,11 +437,11 @@ func TestAmbientReopenPendingRangeInvisible(t *testing.T) {
 	assert.False(t, explainHasIndex(explain, "nm"))
 }
 
-// The vector flavor of the mid-tx reopen: the graph namespaces created in
-// this tx resolve only through the writer path, which the vector open (vivf/
-// vindex OpenTx) does not use — the reopen fails cleanly rather than serving
-// a phantom, and after rollback nothing of the index remains.
-func TestAmbientReopenPendingVectorFailsClean(t *testing.T) {
+// The vector flavor of the mid-tx reopen: writable-aware namespace
+// resolution lets the reopen see the tx's own uncommitted graph namespaces,
+// and init's SchemaChanged stamp keeps the reloaded handle invisible to
+// concurrent readers — the phantom never escapes, even across a rollback.
+func TestAmbientReopenPendingVectorInvisible(t *testing.T) {
 	const dim = 8
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "docs")
@@ -459,15 +459,24 @@ func TestAmbientReopenPendingVectorFailsClean(t *testing.T) {
 		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 32},
 	}))
 	require.NoError(t, coll.Close())
-	_, err = fx.OpenCollection(tx.Context(), "docs")
-	require.Error(t, err,
-		"mid-tx reopen with same-tx uncommitted vector DDL must fail, never serve a phantom")
+	coll2, err := fx.OpenCollection(tx.Context(), "docs")
+	require.NoError(t, err)
+
+	// The ambient tx sees its own index through the reloaded handle.
+	hitsTx, err := vsearchCtx(tx.Context(), coll2, "v", vecs[7], 3, 32)
+	require.NoError(t, err)
+	assert.Len(t, hitsTx, 3)
+
+	// A concurrent reader must not: the graph exists only in the writer's
+	// uncommitted view.
+	_, err = vsearchCtx(ctx, coll2, "v", vecs[0], 3, 32)
+	assert.ErrorIs(t, err, ErrIndexNotFound)
+
 	require.NoError(t, tx.Rollback())
 
-	coll3, err := fx.OpenCollection(ctx, "docs")
-	require.NoError(t, err)
-	_, err = vsearchCtx(ctx, coll3, "v", vecs[0], 3, 32)
-	assert.ErrorIs(t, err, ErrNoVectorIndex)
+	// The rolled-back index never becomes visible.
+	_, err = vsearchCtx(ctx, coll2, "v", vecs[0], 3, 32)
+	assert.ErrorIs(t, err, ErrIndexNotFound)
 }
 
 // A stale reader on a redefined index (drop+recreate same name, different
