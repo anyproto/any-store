@@ -1182,11 +1182,7 @@ func findPrefix(pattern string) string {
 			break
 		}
 	}
-	var resultString string
-	for _, v := range result {
-		resultString += string(v)
-	}
-	return resultString
+	return string(result)
 }
 
 func isSpecialChar(char byte, specialChars string) bool {

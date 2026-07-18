@@ -27,10 +27,7 @@ func normalizeArgs(args []string) []string {
 	out := make([]string, 0, len(args))
 	for _, arg := range args {
 		if strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "--") {
-			name := strings.TrimPrefix(arg, "-")
-			if i := strings.IndexByte(name, '='); i >= 0 {
-				name = name[:i]
-			}
+			name, _, _ := strings.Cut(strings.TrimPrefix(arg, "-"), "=")
 			if longFlagNames[name] {
 				arg = "-" + arg
 			}

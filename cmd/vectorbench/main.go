@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
@@ -228,16 +229,16 @@ func runDisk(path string, cache, n, dim, ef, k, queries int, seed int64, m vecto
 
 func fileSizes(path string) string {
 	var total int64
-	parts := ""
+	var parts strings.Builder
 	for _, suf := range []string{"", "-wal"} {
 		if fi, err := os.Stat(path + suf); err == nil {
 			total += fi.Size()
 			if suf != "" {
-				parts += fmt.Sprintf(" +%s %.1fMiB", suf, float64(fi.Size())/(1<<20))
+				fmt.Fprintf(&parts, " +%s %.1fMiB", suf, float64(fi.Size())/(1<<20))
 			}
 		}
 	}
-	return fmt.Sprintf("%.1f MiB total%s", float64(total)/(1<<20), parts)
+	return fmt.Sprintf("%.1f MiB total%s", float64(total)/(1<<20), parts.String())
 }
 
 func distanceBench(dim int) {

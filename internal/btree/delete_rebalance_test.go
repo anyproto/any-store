@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"math/rand"
 	"path/filepath"
-	"sort"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -149,9 +149,7 @@ func TestDeleteRebalance_FillFactor(t *testing.T) {
 					survivors = append(survivors, keyOf(i))
 				}
 			}
-			sort.Slice(survivors, func(a, b int) bool {
-				return bytes.Compare(survivors[a], survivors[b]) < 0
-			})
+			slices.SortFunc(survivors, bytes.Compare)
 
 			db.pager.deleteRebalanceDispatchCount.Store(0)
 
@@ -463,9 +461,7 @@ func TestDeleteRebalance_EmptyLeafCascade(t *testing.T) {
 			survivors = append(survivors, binary.BigEndian.AppendUint32(nil, uint32(i)))
 		}
 	}
-	sort.Slice(survivors, func(a, b int) bool {
-		return bytes.Compare(survivors[a], survivors[b]) < 0
-	})
+	slices.SortFunc(survivors, bytes.Compare)
 
 	tx, err = db.BeginWrite()
 	require.NoError(t, err)

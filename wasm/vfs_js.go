@@ -13,12 +13,12 @@ func awaitPromise(promise js.Value) (js.Value, error) {
 	ch := make(chan struct{})
 	var result js.Value
 	var jsErr error
-	then := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+	then := js.FuncOf(func(this js.Value, args []js.Value) any {
 		result = args[0]
 		close(ch)
 		return nil
 	})
-	catch := js.FuncOf(func(this js.Value, args []js.Value) interface{} {
+	catch := js.FuncOf(func(this js.Value, args []js.Value) any {
 		jsErr = fmt.Errorf("%s", args[0].Call("toString").String())
 		close(ch)
 		return nil
@@ -38,12 +38,12 @@ func awaitIDBRequest(req js.Value) (js.Value, error) {
 	var result js.Value
 	var reqErr error
 
-	onSuccess := js.FuncOf(func(_ js.Value, args []js.Value) interface{} {
+	onSuccess := js.FuncOf(func(_ js.Value, args []js.Value) any {
 		result = args[0].Get("target").Get("result")
 		close(ch)
 		return nil
 	})
-	onError := js.FuncOf(func(_ js.Value, args []js.Value) interface{} {
+	onError := js.FuncOf(func(_ js.Value, args []js.Value) any {
 		errVal := req.Get("error")
 		if !errVal.IsNull() && !errVal.IsUndefined() {
 			reqErr = fmt.Errorf("indexeddb: %s", errVal.Call("toString").String())

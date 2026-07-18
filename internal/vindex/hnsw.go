@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -443,10 +444,7 @@ func (ix *Index) Insert(wtx *btree.WriteTx, docID []byte, vec []float32) error {
 			return err
 		}
 	}
-	start := mt.topLayer
-	if level < start {
-		start = level
-	}
+	start := min(mt.topLayer, level)
 
 	// Accumulate the new node's neighbours per layer and write its adjacency
 	// ONCE after connecting, instead of a read-modify-write per selected
@@ -513,10 +511,8 @@ func (ix *Index) addNeighbor(wtx *btree.WriteTx, s *searcher, a, b uint32, layer
 		return nil // a doesn't exist at this layer
 	}
 	list := nbrs[layer]
-	for _, x := range list {
-		if x == b {
-			return nil // already linked
-		}
+	if slices.Contains(list, b) {
+		return nil // already linked
 	}
 	capn := ix.maxConn(layer)
 	if len(list) < capn {

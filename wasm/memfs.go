@@ -232,7 +232,7 @@ func (fi *memFileInfo) Size() int64        { return fi.size }
 func (fi *memFileInfo) Mode() fs.FileMode  { return fi.mode }
 func (fi *memFileInfo) ModTime() time.Time { return fi.modTime }
 func (fi *memFileInfo) IsDir() bool        { return fi.isDir }
-func (fi *memFileInfo) Sys() interface{}   { return nil }
+func (fi *memFileInfo) Sys() any           { return nil }
 
 // mkdirSegments returns cumulative path segments for MkdirAll-style creation.
 // e.g. "/tmp/any-store-wasm" -> ["/tmp", "/tmp/any-store-wasm"]

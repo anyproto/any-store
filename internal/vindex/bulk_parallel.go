@@ -19,10 +19,7 @@ type buildSem struct{ ch chan struct{} }
 var curBuildSem atomic.Pointer[buildSem]
 
 func init() {
-	n := runtime.GOMAXPROCS(0)
-	if n < 1 {
-		n = 1
-	}
+	n := max(runtime.GOMAXPROCS(0), 1)
 	curBuildSem.Store(&buildSem{ch: make(chan struct{}, n)})
 }
 
@@ -169,7 +166,7 @@ var repairEfTune int
 func newPBuilder(ix *Index, n int) *pBuilder {
 	return &pBuilder{
 		ix: ix, m: ix.m, m0: ix.m0,
-		full: make([][]float32, n),
+		full:   make([][]float32, n),
 		levels: make([]int32, n), links: make([][]uint32, n),
 		cnt: make([][]uint16, n), locks: make([]sync.RWMutex, n),
 		repairEf: repairEf(ix),
@@ -187,11 +184,7 @@ func repairEf(ix *Index) int {
 	// A beam just wide enough to reselect the layer-0 degree (m0). Measured: recall
 	// is flat from here up to efConstruction, but build time isn't — so the narrow
 	// beam keeps recall parity at a fraction of the repair cost (best low-core scaling).
-	ef := ix.m0
-	if ef < 32 {
-		ef = 32
-	}
-	return ef
+	return max(ix.m0, 32)
 }
 
 func (b *pBuilder) slotsFor(level int32) int { return b.m0 + int(level)*b.m }
@@ -241,16 +234,8 @@ func (b *pBuilder) build(threads int) {
 	if threads <= 0 {
 		threads = cap(sem.ch)
 	}
-	if threads < 1 {
-		threads = 1
-	}
-	seedN := n/seedFraction + 1
-	if seedN < seedFloor {
-		seedN = seedFloor
-	}
-	if seedN > n {
-		seedN = n
-	}
+	threads = max(threads, 1)
+	seedN := min(max(n/seedFraction+1, seedFloor), n)
 	sc := &pScratch{}
 	for i := 1; i < seedN; i++ { // node 0 is the initial entry, already placed
 		b.insert(uint32(i), sc)
@@ -264,9 +249,7 @@ func (b *pBuilder) build(threads int) {
 	var next int64 = int64(seedN)
 	var wg sync.WaitGroup
 	for w := 0; w < threads; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			sem.ch <- struct{}{} // bound active workers to the shared budget
 			defer func() { <-sem.ch }()
 			lsc := &pScratch{}
@@ -277,7 +260,7 @@ func (b *pBuilder) build(threads int) {
 				}
 				b.insert(uint32(i), lsc)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }
@@ -300,10 +283,7 @@ func (b *pBuilder) repair(threads int) {
 		for lc := top; lc > level; lc-- {
 			ep = b.greedy(query, ep, lc, sc)
 		}
-		start := top
-		if level < start {
-			start = level
-		}
+		start := min(top, level)
 		for lc := start; lc >= 0; lc-- {
 			found := b.searchLayer(query, ep, b.repairEf, lc, sc)
 			found = b.selectHeuristic(found, b.capAt(lc), sc)
@@ -330,23 +310,21 @@ func (b *pBuilder) repair(threads int) {
 		}
 		return
 	}
-	var next int64
+	var next atomic.Int64
 	var wg sync.WaitGroup
 	for w := 0; w < threads; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			sem.ch <- struct{}{}
 			defer func() { <-sem.ch }()
 			sc := &pScratch{}
 			for {
-				i := atomic.AddInt64(&next, 1) - 1
+				i := next.Add(1) - 1
 				if int(i) >= n {
 					return
 				}
 				do(uint32(i), sc)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }
@@ -373,10 +351,7 @@ func (b *pBuilder) insert(label uint32, sc *pScratch) {
 	for lc := top; lc > level; lc-- {
 		ep = b.greedy(query, ep, lc, sc)
 	}
-	start := top
-	if level < start {
-		start = level
-	}
+	start := min(top, level)
 	for lc := start; lc >= 0; lc-- {
 		found := b.searchLayer(query, ep, b.ix.efC, lc, sc)
 		found = b.selectHeuristic(found, b.capAt(lc), sc)

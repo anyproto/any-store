@@ -3,6 +3,7 @@ package anystore
 import (
 	"context"
 	"errors"
+	"slices"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/internal/qplanner"
@@ -1039,19 +1040,9 @@ func isUnsatisfiable(f query.Filter) bool {
 	case query.Key:
 		return isUnsatisfiable(ft.Filter)
 	case query.And:
-		for _, sub := range ft {
-			if isUnsatisfiable(sub) {
-				return true
-			}
-		}
-		return false
+		return slices.ContainsFunc(ft, isUnsatisfiable)
 	case *query.And:
-		for _, sub := range *ft {
-			if isUnsatisfiable(sub) {
-				return true
-			}
-		}
-		return false
+		return slices.ContainsFunc(*ft, isUnsatisfiable)
 	case query.Or:
 		if len(ft) == 0 {
 			return false

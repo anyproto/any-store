@@ -476,10 +476,8 @@ func parseIndexField(s string) (fields []string, reverse bool) {
 func (idx *index) init() (err error) {
 	for _, field := range idx.info.Fields {
 		fields, reverse := parseIndexField(field)
-		for _, f := range fields {
-			if f == "" {
-				return fmt.Errorf("invalid index field: '%s'", field)
-			}
+		if slices.Contains(fields, "") {
+			return fmt.Errorf("invalid index field: '%s'", field)
 		}
 		idx.fieldNames = append(idx.fieldNames, strings.Join(fields, "."))
 		idx.fieldPaths = append(idx.fieldPaths, fields)

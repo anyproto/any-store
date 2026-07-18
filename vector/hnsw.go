@@ -254,14 +254,9 @@ func (h *HNSW) Search(query []float32, k int) []SearchResult {
 			elevator = &e
 			continue
 		}
-		ef := h.EfSearch
-		if k > ef {
-			ef = k
-		}
+		ef := max(h.EfSearch, k)
 		nodes := h.searchLayer(searchPoint, query, ef)
-		if k > len(nodes) {
-			k = len(nodes)
-		}
+		k = min(k, len(nodes))
 		out := make([]SearchResult, k)
 		for i := 0; i < k; i++ {
 			out[i] = SearchResult{Key: nodes[i].node.key, Distance: nodes[i].dist}

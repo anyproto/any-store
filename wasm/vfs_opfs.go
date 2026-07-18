@@ -326,4 +326,4 @@ func (fi *opfsFileInfo) Size() int64        { return fi.size }
 func (fi *opfsFileInfo) Mode() fs.FileMode  { return fi.mode }
 func (fi *opfsFileInfo) ModTime() time.Time { return time.Time{} }
 func (fi *opfsFileInfo) IsDir() bool        { return fi.isDir }
-func (fi *opfsFileInfo) Sys() interface{}   { return nil }
+func (fi *opfsFileInfo) Sys() any           { return nil }

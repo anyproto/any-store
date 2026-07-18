@@ -2,10 +2,10 @@ package qplanner
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"math"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -688,8 +688,8 @@ func BuildPlan(params *PlanParams) *Plan {
 
 	// Sort candidates by cost ascending (skip when not collecting explain)
 	if collectExplain {
-		sort.Slice(candidates, func(i, j int) bool {
-			return candidates[i].Cost < candidates[j].Cost
+		slices.SortFunc(candidates, func(a, b CandidatePlan) int {
+			return cmp.Compare(a.Cost, b.Cost)
 		})
 	}
 
@@ -1013,13 +1013,8 @@ func indexPopulation(idx *CBOIndex, totalDocs float64) float64 {
 	if idx.Sketch == nil {
 		return totalDocs
 	}
-	level := idx.BoundFields - 1
-	if level < 0 {
-		level = 0
-	}
-	if level >= idx.Sketch.NumLevels() {
-		level = idx.Sketch.NumLevels() - 1
-	}
+	level := max(idx.BoundFields-1, 0)
+	level = min(level, idx.Sketch.NumLevels()-1)
 	if !sketchLevelTrusted(idx.Sketch, level) {
 		return totalDocs
 	}
@@ -1783,11 +1778,9 @@ func filterFieldsCoveredBy(f query.Filter, idxFields []string, hasFields *bool) 
 	switch ft := f.(type) {
 	case query.Key:
 		name := strings.Join(ft.Path, ".")
-		for _, idxF := range idxFields {
-			if idxF == name {
-				*hasFields = true
-				return true
-			}
+		if slices.Contains(idxFields, name) {
+			*hasFields = true
+			return true
 		}
 		return false
 	case query.And:
@@ -1820,10 +1813,8 @@ func collectUncoveredFilterFields(f query.Filter, coveredFields []string) []stri
 	switch ft := f.(type) {
 	case query.Key:
 		name := strings.Join(ft.Path, ".")
-		for _, cf := range coveredFields {
-			if cf == name {
-				return []string{} // covered
-			}
+		if slices.Contains(coveredFields, name) {
+			return []string{} // covered
 		}
 		return []string{name}
 	case query.And:

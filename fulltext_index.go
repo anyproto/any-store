@@ -126,10 +126,8 @@ func newFtsIndex(c *collection, info IndexInfo) (*ftsIndex, error) {
 		catalogKey: indexKey(c.name, info.Name)}
 	for _, field := range info.Fields {
 		fields, _ := parseIndexField(field)
-		for _, f := range fields {
-			if f == "" {
-				return nil, errors.New("fts: invalid index field: '" + field + "'")
-			}
+		if slices.Contains(fields, "") {
+			return nil, errors.New("fts: invalid index field: '" + field + "'")
 		}
 		fx.fieldPaths = append(fx.fieldPaths, fields)
 	}
@@ -493,10 +491,7 @@ func (fx *ftsIndex) addMetaDelta(tx *btree.WriteTx, key []byte, delta int64) err
 	if err != nil {
 		return err
 	}
-	next := int64(cur) + delta
-	if next < 0 {
-		next = 0
-	}
+	next := max(int64(cur)+delta, 0)
 	return fx.putMetaUint(tx, key, uint64(next))
 }
 

@@ -98,10 +98,7 @@ func kmeansppInit(data [][]float32, k int, rng *rand.Rand) [][]float32 {
 			if lo >= n {
 				break
 			}
-			hi := lo + chunk
-			if hi > n {
-				hi = n
-			}
+			hi := min(lo+chunk, n)
 			wg.Add(1)
 			go func(t, lo, hi int) {
 				defer wg.Done()
@@ -159,10 +156,7 @@ func assignNearest(data [][]float32, cents [][]float32, assign []int32) {
 		if lo >= n {
 			break
 		}
-		hi := lo + chunk
-		if hi > n {
-			hi = n
-		}
+		hi := min(lo+chunk, n)
 		wg.Add(1)
 		go func(lo, hi int) {
 			defer wg.Done()

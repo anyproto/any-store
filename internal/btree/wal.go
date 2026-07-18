@@ -49,7 +49,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"runtime"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -3679,7 +3679,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 			pgnos = append(pgnos, pgno)
 		}
 		w.ckptPgnos = pgnos
-		sort.Slice(pgnos, func(a, b int) bool { return pgnos[a] < pgnos[b] })
+		slices.Sort(pgnos)
 
 		for _, pgno := range pgnos {
 			// Skip orphan frames past the committed DB size (iDbpage>mxPage,
@@ -3739,7 +3739,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 				pgnos = append(pgnos, pgno)
 			}
 			w.ckptPgnos = pgnos
-			sort.Slice(pgnos, func(a, b int) bool { return pgnos[a] < pgnos[b] })
+			slices.Sort(pgnos)
 
 			// BEGIN ENCRYPTION
 			// Checkpoint uses copy-verbatim: if a codec is installed, the WAL

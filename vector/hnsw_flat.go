@@ -221,10 +221,7 @@ func (h *FlatHNSW) addLocked(key uint64, vec []float32) {
 	}
 
 	// 2. for layers min(L, top)..0, search and connect.
-	start := h.topLayer
-	if L < start {
-		start = L
-	}
+	start := min(h.topLayer, L)
 	for lc := start; lc >= 0; lc-- {
 		found := h.searchLayer(vec, ep, h.EfConstruction, lc, sc)
 		m := h.M
@@ -431,14 +428,9 @@ func (h *FlatHNSW) Search(query []float32, k int) []SearchResult {
 	for lc := h.topLayer; lc > 0; lc-- {
 		ep = h.greedyClosest(query, ep, lc, sc)
 	}
-	ef := h.EfSearch
-	if k > ef {
-		ef = k
-	}
+	ef := max(h.EfSearch, k)
 	found := h.searchLayer(query, ep, ef, 0, sc)
-	if k > len(found) {
-		k = len(found)
-	}
+	k = min(k, len(found))
 	out := make([]SearchResult, k)
 	for i := 0; i < k; i++ {
 		out[i] = SearchResult{Key: h.keys[found[i].id], Distance: found[i].dist}

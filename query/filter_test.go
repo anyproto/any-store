@@ -1,6 +1,7 @@
 package query
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -618,7 +619,7 @@ func TestIn_IndexBounds(t *testing.T) {
 		require.Len(t, bs, 3)
 		// bounds should be sorted
 		for i := 1; i < len(bs); i++ {
-			assert.True(t, bs.Less(i-1, i), "bounds should be sorted")
+			assert.True(t, bytes.Compare(bs[i-1].Start, bs[i].Start) < 0, "bounds should be sorted")
 		}
 		// each bound is a point lookup
 		for _, b := range bs {

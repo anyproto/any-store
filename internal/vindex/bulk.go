@@ -3,6 +3,7 @@ package vindex
 import (
 	"encoding/binary"
 	"fmt"
+	"slices"
 
 	"github.com/anyproto/any-store/v2/internal/btree"
 )
@@ -170,10 +171,7 @@ func (b *ramBuilder) insert(label uint32, query []float32) {
 	for lc := b.top; lc > level; lc-- {
 		ep = b.greedyClosest(query, ep, lc)
 	}
-	start := b.top
-	if level < start {
-		start = level
-	}
+	start := min(b.top, level)
 	for lc := start; lc >= 0; lc-- {
 		found := b.searchLayer(query, ep, b.ix.efC, lc)
 		found = b.selectHeuristic(found, b.ix.maxConn(lc))
@@ -292,10 +290,8 @@ func (b *ramBuilder) addNeighbor(a, newID uint32, layer int32) {
 		return
 	}
 	list := b.nbrs[a][layer]
-	for _, x := range list {
-		if x == newID {
-			return
-		}
+	if slices.Contains(list, newID) {
+		return
 	}
 	capn := b.ix.maxConn(layer)
 	if len(list) < capn {
