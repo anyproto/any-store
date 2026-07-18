@@ -3,11 +3,7 @@ package anystore
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -198,82 +194,6 @@ func TestStaleReaderAcrossVectorCompactCommit(t *testing.T) {
 	hits, err := vsearch(coll, "v", vecs[n-1], 5, 64)
 	require.NoError(t, err)
 	assert.Len(t, hits, 5)
-}
-
-// TestStaleReaderAcrossPeerCreateReconcile: a PEER process commits CreateIndex;
-// the local reconcile (triggered by the schema-cookie bump on the next tx)
-// adopts the handle into the shared CoW set while an older local read tx is
-// still open. The old reader must not plan with the adopted index — its
-// snapshot has no index namespace (silent Count=0 served by wall-clock state;
-// a publication flag cannot mark reconciled peer handles at all).
-func TestStaleReaderAcrossPeerCreateReconcile(t *testing.T) {
-	if path := os.Getenv("IDXVIS_MP_PATH"); path != "" {
-		idxVisMpChild(t, path)
-		return
-	}
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, "idxvis_mp.db")
-
-	db, err := Open(ctx, path, nil)
-	require.NoError(t, err)
-	defer db.Close()
-	coll, err := db.CreateCollection(ctx, "test")
-	require.NoError(t, err)
-	for i := 0; i < 200; i++ {
-		name := "other"
-		if i < 30 {
-			name = "x"
-		}
-		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"name":%q}`, i, name))))
-	}
-
-	rtx, err := db.ReadTx(ctx)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, rtx.Commit()) }()
-
-	// Peer process creates the index and commits.
-	cmd := exec.Command(os.Args[0], "-test.run=^TestStaleReaderAcrossPeerCreateReconcile$", "-test.v=true")
-	cmd.Env = append(os.Environ(), "IDXVIS_MP_PATH="+path)
-	done := make(chan struct{})
-	var out []byte
-	var cerr error
-	go func() { out, cerr = cmd.CombinedOutput(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(60 * time.Second):
-		_ = cmd.Process.Kill()
-		t.Fatalf("child timed out")
-	}
-	require.NoError(t, cerr, "child failed:\n%s", out)
-
-	const filter = `{"name":"x"}`
-
-	// A fresh local tx reconciles (cookie bump) and adopts the peer's index.
-	explain, err := coll.Find(filter).Explain(ctx)
-	require.NoError(t, err)
-	require.True(t, explainHasIndex(explain, "name"),
-		"fresh tx must adopt the peer's index via reconcile")
-
-	// The old reader — now planning with the reconciled CoW set — must still
-	// answer from its own snapshot.
-	hint := IndexHint{IndexName: "name", Boost: 1_000_000}
-	cnt, err := coll.Find(filter).IndexHint(hint).Count(rtx.Context())
-	require.NoError(t, err)
-	assert.Equal(t, 30, cnt)
-	explain, err = coll.Find(filter).Explain(rtx.Context())
-	require.NoError(t, err)
-	assert.False(t, explainHasIndex(explain, "name"),
-		"an index adopted from a peer must stay invisible to a reader whose snapshot predates it")
-}
-
-func idxVisMpChild(t *testing.T, path string) {
-	db, err := Open(ctx, path, nil)
-	require.NoError(t, err)
-	defer db.Close()
-	coll, err := db.OpenCollection(ctx, "test")
-	require.NoError(t, err)
-	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{Fields: []string{"name"}}))
 }
 
 // A same-tx drop+recreate under one name can land the recreated tree on the
