@@ -34,7 +34,9 @@ type Query interface {
 	// IndexHint adds or removes boost for some indexes
 	IndexHint(hints ...IndexHint) Query
 
-	// Iter executes the query and returns an Iterator for the results.
+	// Iter executes the query and returns an Iterator for the results. See
+	// Iterator for the mutation-while-iterating contract (undefined,
+	// SQLite-style).
 	Iter(ctx context.Context) (Iterator, error)
 
 	// Count returns the number of documents matching the query.

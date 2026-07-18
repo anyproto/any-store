@@ -12,6 +12,15 @@ import (
 )
 
 // Iterator represents an iterator over query results.
+//
+// Mutating the iterated collection through the same write transaction while
+// the iterator is open (deleting or updating documents mid-loop) is
+// UNDEFINED, matching SQLite's same-connection isolation contract: live rows
+// may be skipped or returned more than once, silently. It never corrupts the
+// store and never surfaces an error. To mutate every matched document,
+// collect the ids during iteration and mutate after Close — any-store's own
+// Query.Update/Delete do exactly that internally — or use those verbs
+// directly.
 type Iterator interface {
 	// Next advances the iterator to the next document.
 	Next() bool

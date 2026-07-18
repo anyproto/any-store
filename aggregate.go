@@ -40,7 +40,8 @@ type AggQuery interface {
 	// Iter executes the pipeline and returns an Iterator over result
 	// documents. Score and Distance report 0 on aggregation iterators; for a
 	// full-text or vector $match prefix the values remain available as the
-	// _score / _distance document fields.
+	// _score / _distance document fields. See Iterator for the
+	// mutation-while-iterating contract (undefined, SQLite-style).
 	Iter(ctx context.Context) (Iterator, error)
 
 	// Count executes the pipeline and returns the number of result documents.
