@@ -409,3 +409,118 @@ func TestVectorIndex_CompactAmbientCommit_ConcurrentReader(t *testing.T) {
 	assert.Equal(t, idBytesOf(1), hits[0].DocId)
 	require.NoError(t, fx.IntegrityCheck(ctx))
 }
+
+// Chained same-tx DDL: CreateIndex then CompactVectorIndex in one ambient tx.
+// Requires writable-aware namespace resolution (the compact re-opens the
+// index it created earlier in this same tx). A concurrent reader during the
+// window errors exactly as before the DDL began (nothing committed to serve);
+// after commit the index answers.
+func TestVectorIndex_CreateThenCompactSameTx(t *testing.T) {
+	const dim = 8
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	vecs := vrand(30, dim, 3)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.CreateIndex(tx.Context(), IndexInfo{
+		Name:   "emb",
+		Kind:   IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 64},
+	}))
+	require.NoError(t, coll.CompactVectorIndex(tx.Context(), "emb"))
+
+	// The chain's committed tail is nil (created in this tx): a concurrent
+	// reader errors exactly as before the DDL began.
+	_, rerr := vsearch(coll, "v", vecs[0], 3, 64)
+	assert.ErrorIs(t, rerr, ErrIndexNotFound)
+
+	require.NoError(t, tx.Commit())
+
+	hits, err := vsearch(coll, "v", vecs[0], 3, 64)
+	require.NoError(t, err)
+	assert.Len(t, hits, 3)
+}
+
+// Chained same-tx DDL: CompactVectorIndex twice in one ambient tx. The second
+// compact re-opens namespaces the first one re-created (same-tx). A
+// concurrent reader during the whole window is served the ORIGINAL committed
+// handle through the prevTarget committed-tail chain and must see results
+// identical to the pre-tx state.
+func TestVectorIndex_CompactTwiceSameTx(t *testing.T) {
+	const dim = 8
+	const n = 40
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "emb",
+		Kind:   IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 64},
+	}))
+	vecs := vrand(n, dim, 7)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+	for i := 0; i < 10; i++ {
+		require.NoError(t, coll.DeleteId(ctx, i))
+	}
+	before, err := vsearch(coll, "v", vecs[n-1], 5, 64)
+	require.NoError(t, err)
+	require.Len(t, before, 5)
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.CompactVectorIndex(tx.Context(), "emb"))
+	// New tombstones inside the tx so the second compact has work.
+	for i := 10; i < 15; i++ {
+		require.NoError(t, coll.DeleteId(tx.Context(), i))
+	}
+	require.NoError(t, coll.CompactVectorIndex(tx.Context(), "emb"))
+
+	// Concurrent reader mid-window: the committed-tail chain serves the
+	// original handle — identical results to the pre-tx state.
+	during, err := vsearch(coll, "v", vecs[n-1], 5, 64)
+	require.NoError(t, err)
+	assert.Equal(t, before, during,
+		"a concurrent reader across chained compacts must see the committed state")
+
+	require.NoError(t, tx.Commit())
+
+	hits, err := vsearch(coll, "v", vecs[n-1], 5, 64)
+	require.NoError(t, err)
+	assert.Len(t, hits, 5)
+}
+
+// The IVF flavor of chained same-tx DDL (vivf.Rebuild re-opens through the
+// same writable-aware resolution).
+func TestVectorIndex_CreateThenCompactSameTxIVF(t *testing.T) {
+	const dim = 8
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	vecs := vrand(64, dim, 11)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.CreateIndex(tx.Context(), IndexInfo{
+		Name: "emb",
+		Kind: IndexKindVector,
+		Vector: &VectorParams{
+			Field: "v", Dim: dim, Metric: VectorL2, Mode: VectorModeIVFSQ, NProbe: 32,
+		},
+	}))
+	require.NoError(t, coll.CompactVectorIndex(tx.Context(), "emb"))
+	require.NoError(t, tx.Commit())
+
+	hits, err := vsearch(coll, "v", vecs[0], 3, 0)
+	require.NoError(t, err)
+	assert.Len(t, hits, 3)
+}
