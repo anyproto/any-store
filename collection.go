@@ -297,15 +297,39 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 		var idxs []*index
 		var ftsIdxs []*ftsIndex
 		var vidxs []*vectorIndex
+		// resolve binds index namespaces through the SAME view the stamp below
+		// describes: the writer's own view under an ambient write tx, else
+		// this tx's snapshot — never the db-level latest-committed lookup,
+		// which could hand back roots from a peer commit newer than the
+		// snapshot cookie stamped on the handle.
+		resolve := func(name string) (*btree.Namespace, error) {
+			if wtx != nil {
+				return wtx.GetNamespace(name)
+			}
+			return tx.GetNamespace(name)
+		}
+		// The loaded handles' visibility bound: the snapshot cookie — except
+		// under an ambient write tx that already changed schema, whose view
+		// may include its own uncommitted DDL (a mid-tx reopen after a
+		// same-tx CreateIndex): those handles are known visible only from the
+		// cookie the commit will publish. Over-stamping a committed handle by
+		// one is safe (the slow path admits its readers exactly);
+		// under-stamping an uncommitted one would leak it to every reader at
+		// the begin cookie.
+		validFrom := tx.DiskSchemaCookie()
+		if wtx != nil && wtx.SchemaChanged() {
+			validFrom++
+		}
 		for _, info := range idxInfos {
 			if isFulltext(info) {
 				fx, fErr := newFtsIndex(c, info)
 				if fErr != nil {
 					return fErr
 				}
-				if fErr = fx.bindNamespaces(getNamespace); fErr != nil {
+				if fErr = fx.bindNamespaces(resolve); fErr != nil {
 					return fErr
 				}
+				fx.validFromCookie = validFrom
 				ftsIdxs = append(ftsIdxs, fx)
 				continue
 			}
@@ -314,11 +338,12 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 				if viErr != nil {
 					return viErr
 				}
+				vi.validFromCookie = validFrom
 				vidxs = append(vidxs, vi)
 				continue
 			}
 			nsName := indexNsName(c.name, info.Name)
-			ns, nsErr := getNamespace(nsName)
+			ns, nsErr := resolve(nsName)
 			if nsErr != nil {
 				return nsErr
 			}
@@ -326,6 +351,7 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 			if idxErr != nil {
 				return idxErr
 			}
+			idx.validFromCookie = validFrom
 			c.loadSketchAtOpen(tx, idx)
 			idxs = append(idxs, idx)
 		}
@@ -941,31 +967,26 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 		defer c.mu.Unlock()
 		c.registerIndexSetRestore(wtx)
 		// The new handles' namespaces exist only in this tx's uncommitted
-		// view: mark them so concurrent readers on older snapshots don't plan
-		// with them (see visibleIndexes), and lift the mark only once the tx
-		// durably commits. A rollback discards the handles themselves via the
-		// registerIndexSetRestore undo, so no flag work is needed there.
+		// view: stamp them valid from the cookie this commit will publish —
+		// every create path MarkSchemaChanged, and SchemaCookie bumps exactly
+		// once per schema-changing commit, atomically with the DDL (the
+		// OP_Transaction analog, vdbe.c:4091-4192 in SQLite), so there is no
+		// commit→publication gap for readers to fall into. Concurrent readers
+		// on older snapshots fail the fast path and cannot resolve the new
+		// namespaces in their own snapshots (see visibleIndexes). A rollback
+		// discards the handles themselves via the registerIndexSetRestore
+		// undo.
+		validFrom := tx.DiskSchemaCookie() + 1
 		for _, idx := range newIndexes {
-			idx.uncommitted = &atomic.Bool{}
-			idx.uncommitted.Store(true)
+			idx.validFromCookie = validFrom
 		}
 		for _, fx := range newFtsIndexes {
-			fx.uncommitted.Store(true)
+			fx.validFromCookie = validFrom
 		}
 		for _, vi := range newVIndexes {
-			vi.uncommitted.Store(true)
+			vi.bindIdentity(c.name)
+			vi.validFromCookie = validFrom
 		}
-		wtx.onCommitPublish(func() {
-			for _, idx := range newIndexes {
-				idx.uncommitted.Store(false)
-			}
-			for _, fx := range newFtsIndexes {
-				fx.uncommitted.Store(false)
-			}
-			for _, vi := range newVIndexes {
-				vi.uncommitted.Store(false)
-			}
-		})
 		// Copy-on-write publish: build fresh slices (current snapshot + new
 		// indexes) and swap them in atomically so lock-free query readers always
 		// see a complete generation.
@@ -1331,7 +1352,8 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 		prevIdxs := c.loadIndexes()
 		next := make([]*index, len(prevIdxs))
 		for i, idx := range prevIdxs {
-			ns, nsErr := tx.GetNamespace(indexNsName(newName, idx.info.Name))
+			nsName := indexNsName(newName, idx.info.Name)
+			ns, nsErr := tx.GetNamespace(nsName)
 			if nsErr != nil {
 				if errors.Is(nsErr, btree.ErrNamespaceNotFound) {
 					// Legacy-broken index (pre-fix rename victim): the sweep
@@ -1341,7 +1363,7 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 				}
 				return nsErr
 			}
-			next[i] = idx.cloneWithNs(ns)
+			next[i] = idx.cloneWithNs(ns, nsName, indexKey(newName, idx.info.Name))
 		}
 		c.storeIndexes(next)
 
@@ -1747,6 +1769,12 @@ func (c *collection) reconcileIndexes(tx *btree.ReadTx) {
 			}
 			continue
 		}
+		// Reconcile runs at tx begin (checkStale), before any of this tx's
+		// writes: the adopted state is committed as of this snapshot, so its
+		// cookie is the exact visibility bound — an older concurrent reader
+		// resolves per-snapshot in visibleTo and correctly skips a peer index
+		// its snapshot predates.
+		idx.validFromCookie = tx.DiskSchemaCookie()
 		c.loadSketchAtOpen(tx, idx)
 		rebuilt = append(rebuilt, idx)
 		changed = true

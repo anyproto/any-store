@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"slices"
-	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
@@ -61,16 +60,25 @@ type ftsIndex struct {
 	nsDocinfo *btree.Namespace
 	nsPost    *btree.Namespace
 
+	// nsNames holds the five namespace names in bindNamespaces order, and
+	// catalogKey the index's system-namespace key — the identity of the
+	// generation this handle was built from, captured at construction/bind and
+	// immutable: visibleTo's slow path reads them lock-free, so it must never
+	// consult c.name, which a concurrent Rename mutates under c.mu (see
+	// index.nsName).
+	nsNames    [5]string
+	catalogKey []byte
+
 	az *fts.Analyzer
 
 	// pending is the per-tx write-back buffer (postings + vocab deltas), flushed
 	// at commit. See fulltext_pending.go.
 	pending ftsPending
 
-	// uncommitted: the creating DDL tx has not committed; other txs must not
-	// search through this handle (empty namespaces in their snapshots). Same
-	// contract as index.uncommitted — see there, visibleTo and visibleIndexes.
-	uncommitted atomic.Bool
+	// validFromCookie: earliest schema cookie at which this handle is KNOWN
+	// visible. Same contract as index.validFromCookie — see there, visibleTo
+	// and visibleIndexes.
+	validFromCookie uint32
 
 	// nFields is the number of indexed fields (== len(fieldPaths)); each token's
 	// field index keys into the FieldMask / per-field TF of the v2 postings.
@@ -112,7 +120,10 @@ type ftsIndex struct {
 }
 
 func newFtsIndex(c *collection, info IndexInfo) (*ftsIndex, error) {
-	fx := &ftsIndex{c: c, info: info, az: fts.NewAnalyzer()}
+	// Construction sites (init, reconcile, createFtsIndex) run on the writer
+	// or under c.mu, so reading c.name here is race-free (see catalogKey).
+	fx := &ftsIndex{c: c, info: info, az: fts.NewAnalyzer(),
+		catalogKey: indexKey(c.name, info.Name)}
 	for _, field := range info.Fields {
 		fields, _ := parseIndexField(field)
 		for _, f := range fields {
@@ -173,12 +184,14 @@ func (fx *ftsIndex) bindNamespaces(resolve func(name string) (*btree.Namespace, 
 		{ftsPartDocinfo, &fx.nsDocinfo},
 		{ftsPartPost, &fx.nsPost},
 	}
-	for _, p := range parts {
-		ns, e := resolve(ftsNsName(fx.c.name, fx.info.Name, p.name))
+	for i, p := range parts {
+		name := ftsNsName(fx.c.name, fx.info.Name, p.name)
+		ns, e := resolve(name)
 		if e != nil {
 			return e
 		}
 		*p.dst = ns
+		fx.nsNames[i] = name
 	}
 	return nil
 }
@@ -186,11 +199,37 @@ func (fx *ftsIndex) bindNamespaces(resolve func(name string) (*btree.Namespace, 
 func (fx *ftsIndex) Info() IndexInfo { return fx.info }
 
 // visibleTo reports whether the given tx may search through this handle — the
-// visibility gate of visibleIndexes, fts-shaped (see index.uncommitted): an
-// uncommitted handle is visible only to its creating write tx (single-writer:
-// any write-tx view).
+// visibility gate of visibleIndexes, fts-shaped (see index.visibleTo): fast
+// path on the write-tx view or a snapshot cookie at or past validFromCookie;
+// an older reader admits the handle only if its OWN snapshot still carries
+// this exact index — the catalog row matches the handle's full definition
+// AND all five namespaces resolve at the bound roots. All five, not just
+// meta: freelist reuse can land one recreated root on its freed predecessor's
+// page number, and a partial match would search this generation's postings
+// through another generation's vocab/docinfo. When everything matches, the
+// trees are the reader's own generation of this definition — exact. Anything
+// less → invisible → ErrNoFulltextIndex at the call sites, exactly as before
+// the CreateIndex began. (metaRootUnchanged has the opposite error bias —
+// keep a working index over a transient view — so the two checks stay
+// separate.)
 func (fx *ftsIndex) visibleTo(tx *btree.ReadTx) bool {
-	return !fx.uncommitted.Load() || tx.IsWriteTx()
+	if tx.IsWriteTx() || tx.DiskSchemaCookie() >= fx.validFromCookie {
+		return true
+	}
+	raw, err := tx.AppendValue(fx.c.db.systemNS, fx.catalogKey, nil)
+	if err != nil || !indexDefMatches(raw, fx.info) {
+		return false
+	}
+	for i, bound := range [...]*btree.Namespace{fx.nsMap, fx.nsMeta, fx.nsVocab, fx.nsDocinfo, fx.nsPost} {
+		if bound == nil || fx.nsNames[i] == "" {
+			return false
+		}
+		ns, nsErr := tx.GetNamespace(fx.nsNames[i])
+		if nsErr != nil || ns.RootPage() != bound.RootPage() {
+			return false
+		}
+	}
+	return true
 }
 
 // metaRootUnchanged reports whether the ftx: meta namespace still resolves to
@@ -202,7 +241,10 @@ func (fx *ftsIndex) metaRootUnchanged(tx *btree.ReadTx) bool {
 	if fx.nsMeta == nil {
 		return true
 	}
-	ns, err := tx.GetNamespace(ftsNsName(fx.c.name, fx.info.Name, ftsPartMeta))
+	// nsNames[1] = meta (bindNamespaces order); the captured name, not
+	// c.name, for consistency with visibleTo — reconcile holds c.mu, but the
+	// handle's own generation name is the one its roots belong to.
+	ns, err := tx.GetNamespace(fx.nsNames[1])
 	if err != nil {
 		return true
 	}
@@ -246,6 +288,12 @@ func (c *collection) reconcileFtsIndexesLocked(tx *btree.ReadTx, infos []IndexIn
 		fx, err := newFtsIndex(c, info)
 		if err == nil {
 			err = fx.bindNamespaces(tx.GetNamespace)
+			// Reconcile runs at tx begin (checkStale), before any of this tx's
+			// writes: the bound state is committed as of this snapshot, so its
+			// cookie is the exact visibility bound. An older concurrent reader
+			// resolves per-snapshot in visibleTo and correctly skips a peer
+			// index its snapshot predates.
+			fx.validFromCookie = tx.DiskSchemaCookie()
 		}
 		if err != nil {
 			// Not resolvable in this snapshot. With no existing object this is
