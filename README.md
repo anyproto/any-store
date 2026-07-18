@@ -7,7 +7,7 @@
 A **document-oriented embedded database** for Go with a MongoDB-like query language, built on an in-tree btree/pager/WAL storage engine derived from SQLite (aligned with its design, not a literal port — the on-disk format is our own).
 Schema-less documents, rich indexes, full-text and vector search, ACID transactions, multi-process access, page-level integrity and optional encryption — pure Go, no CGO.
 
-> ⚠️ **Status:** v2 is in alpha (`v2.0.0-alpha.x`) — APIs may still change. We actively dog-food the library in production and welcome early adopters & contributors.
+> **Status:** v2 is in beta (`v2.0.0-beta.x`) — the API is stabilizing; remaining changes before GA are expected to be minor. We actively dog-food the library in production and welcome early adopters & contributors.
 
 ## Features
 
