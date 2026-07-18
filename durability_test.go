@@ -344,7 +344,7 @@ func TestRecovery_ForceFlushWithTimeout(t *testing.T) {
 
 // TestSavepointOverflowCorruption replicates the crash test's savepoint-stress
 // pattern at the anystore level with documents large enough to trigger overflow
-// pages in the btree. This tests for Bug 9: zero-content overflow pages after
+// pages in the btree. This tests for zero-content overflow pages after
 // a clean commit with savepoint rollback.
 func TestSavepointOverflowCorruption(t *testing.T) {
 	btree.SetDebugOverflowReadErrors(true)
@@ -748,7 +748,8 @@ func snapshotState(m map[string]string) map[string]string {
 // --- from savepoint_overflow_stress_test.go ---
 
 // TestSavepointOverflowStress runs many iterations with random seeds,
-// close/reopen cycles, and large document counts to reproduce Bug 9.
+// close/reopen cycles, and large document counts to reproduce zero-content
+// overflow pages.
 func TestSavepointOverflowStress(t *testing.T) {
 	btree.SetDebugOverflowReadErrors(true)
 	defer btree.SetDebugOverflowReadErrors(false)
@@ -982,7 +983,8 @@ func stressVerify(t *testing.T, ctx context.Context, coll Collection, expected m
 // TestSavepointOverflowMultiIteration simulates the crash test pattern:
 // multiple iterations on the same DB, where some iterations "crash" (close
 // mid-transaction) and the DB is reopened for recovery. This tests whether
-// accumulated DB state from crash/recovery cycles can trigger Bug 9.
+// accumulated DB state from crash/recovery cycles can trigger zero-content
+// overflow pages.
 func TestSavepointOverflowMultiIteration(t *testing.T) {
 	btree.SetDebugOverflowReadErrors(true)
 	defer btree.SetDebugOverflowReadErrors(false)

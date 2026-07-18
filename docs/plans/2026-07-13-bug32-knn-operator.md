@@ -497,7 +497,7 @@ Rule V removes the (accidental) way to select vector-valued documents; give the 
 
 #### T1.6 — regression tests · **S**
 - `WT/query/filter_contract_test.go:22-36`: add `"vf": {"$eq": {"$vector":[1,2]}}` to `filterZoo`.
-- `/home/che/projects/any-store-tests/storetest/query_correctness_test.go`: **new** `TestBug32_VectorOrderingNeverMatchesEverything` — syntax-independent, permanent:
+- `/home/che/projects/any-store-tests/storetest/query_correctness_test.go`: **new** `TestVectorOrderingNeverMatchesEverything` — syntax-independent, permanent:
   1. Collection **with** a vector index on `v`, 20 packed-vector docs: `Find({"v":{"$gt":1}}).Delete(ctx)` → `Matched==0`, `Count==20`. Same for `$gte`/`$lt`/`$lte`.
   2. Collection with **no vector index at all**, 20 plain docs: `{"n":{"$lt":{"$vector":[0]}}}` and a **missing** field → parse error (T1.3); hand-built equivalents → `Matched==0`, `Count==20`.
   3. **`$not`/`$nor` rows** (below).
@@ -748,7 +748,7 @@ Also in T2.8:
 3. `verb coherence for $knn` — `Count`/`Update`/`Delete`/`Explain` all agree with `Iter`; `Delete` removes exactly those and nothing else
 
 New siblings:
-- `TestBug32_VectorOrderingNeverMatchesEverything` — **including the collection with NO vector index**, where `{"n":{"$lt":{"$vector":[0]}}}` (parse error) and its hand-built equivalent (`Matched==0`) must be no-ops. This is the widest form of the data-loss hole.
+- `TestVectorOrderingNeverMatchesEverything` — **including the collection with NO vector index**, where `{"n":{"$lt":{"$vector":[0]}}}` (parse error) and its hand-built equivalent (`Matched==0`) must be no-ops. This is the widest form of the data-loss hole.
 - `TestBug32_KnnDeleteIsBoundedByK` — 100 docs, `$k:5` → `Delete` removes exactly 5.
 - `TestBug32_KnnNoIndex` / `TestBug32_KnnAmbiguousIndex` — `ErrNoVectorIndex` / `ErrAmbiguousVectorIndex` on all five verbs.
 - `TestBug32_SortedLimitedDeleteMatchesIter` — Increment 1b, **no vectors involved**.

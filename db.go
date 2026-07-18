@@ -263,7 +263,8 @@ type db struct {
 	// with a non-empty pending buffer. flushAllFtsPending / resetAllFtsPending
 	// enumerate openedCollections, so without this registry a Close() between
 	// Insert and Commit would silently drop the buffered postings — the doc
-	// commits but stays invisible to $text forever (pre-beta catalog BUG-01).
+	// commits but stays invisible to $text forever (guarded by
+	// TestFtsPendingSurvivesCollectionCloseMidTx).
 	// Guarded by db.mu; drained by the next flush or reset.
 	orphanFtsPending []*ftsIndex
 	closed           atomic.Bool
@@ -1062,7 +1063,8 @@ func (db *db) doWriteTxW(ctx context.Context, do func(wtx WriteTx, tx *btree.Wri
 	// entry and pools the commonTx; btree.WriteTx.Commit sets closed before
 	// pager.commit), so a rollback once commit has begun is a silent no-op on an
 	// already-recycled tx. A commit-time panic still leaks the lock — that needs
-	// the release moved into a defer inside btree.WriteTx.Commit; see BUG-14.
+	// the release moved into a defer inside btree.WriteTx.Commit (the abandoned-tx
+	// case is guarded by btree's TestWriteTxAbandonedDoesNotDeadlockClose).
 	//
 	// The rollback runs the undo log, whose closures take c.mu / db.mu: a
 	// callback must not panic while holding either with an explicit (non-defer)
@@ -1093,7 +1095,8 @@ func (db *db) doWriteTxModifiedW(ctx context.Context, do func(wtx WriteTx, tx *b
 	}
 	// Rollback-on-panic; see doWriteTxW for why the guard stops at Commit. This
 	// is the single-doc modifier path (UpdateId/UpsertId call mod.Modify inside
-	// the callback), the one BUG-34 reported as wedging the DB.
+	// the callback), guarded by TestTxPanic_UpdateIdDoesNotWedgeDB and
+	// TestTxPanic_UpsertIdDoesNotWedgeDB.
 	committing := false
 	defer func() {
 		if r := recover(); r != nil {
@@ -1701,8 +1704,8 @@ func (db *db) removeCollection(tx *btree.WriteTx, collName string) error {
 		}
 	}
 	// Remove the per-index sketch and multikey records too. The sketch is
-	// keyed by collection name (previously leaked here); the multikey flag is
-	// keyed by the namespace name.
+	// keyed by collection name; the multikey flag is keyed by the namespace
+	// name.
 	for _, name := range idxNames {
 		_ = tx.Delete(db.systemNS, sketchKey(collName, name))
 		_ = tx.Delete(db.systemNS, multikeyKey(indexNsName(collName, name)))

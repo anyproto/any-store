@@ -60,8 +60,7 @@ var searchLeafOverflowProbe func(event int)
 //	            0..nCell-1  -> the i-th cell's leftChild was followed;
 //	            == nCell    -> descended via the page's rightChild.
 //	          This is exactly searchInterior's second return value
-//	          (see below), which was discarded at the call sites prior
-//	          to this refactor.
+//	          (see below).
 //	nCell   — pg.header.cellCount at descent time. Carried so that the
 //	          rightmost-child check (cellIdx == nCell) is O(1) without
 //	          re-reading the parent. Required by the balance_quick

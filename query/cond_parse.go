@@ -13,8 +13,8 @@ import (
 )
 
 // ErrVectorNotOrderable is returned when an ordering operator ($gt/$gte/$lt/$lte)
-// is given a vector operand. Vectors are not points on the scalar order (Rule V,
-// BUG-32): the anyenc tag order sorts every vector above every scalar, which made
+// is given a vector operand. Vectors are not points on the scalar order (Rule
+// V): the anyenc tag order sorts every vector above every scalar, which made
 // such a comparison true for every document — emptying the collection on Delete.
 // Equality ($eq/$ne) against a vector remains legal: it is byte equality.
 var ErrVectorNotOrderable = errors.New("any-store: a vector is not orderable")
@@ -351,7 +351,7 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 }
 
 func makeCompFilter(op Operator, v *anyenc.Value) (f Filter, err error) {
-	// Rule V (BUG-32) at the door: an ordering op against a vector operand is
+	// Rule V at the door: an ordering op against a vector operand is
 	// decidable syntactically, so reject it here rather than silently evaluating
 	// to false. This also stops it reflecting through $not, where a
 	// never-satisfiable inner predicate becomes match-all. Comp.Ok keeps the

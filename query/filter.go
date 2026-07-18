@@ -90,7 +90,7 @@ func (e *Comp) eqIsVector() bool {
 	return len(e.EqValue) > 0 && e.EqValue[0] == byte(anyenc.TypeVectorF32)
 }
 
-// Rule V (BUG-32): a vector is not a point on the scalar order.
+// Rule V: a vector is not a point on the scalar order.
 //
 // anyenc resolves a cross-type comparison on the type tag, and TypeVectorF32 (10)
 // sorts above every scalar tag (1..9). So an ordering op with a vector on either
@@ -161,7 +161,7 @@ func (e *Comp) Ok(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
 // null/true/false encode as the bare tag. Strings, binary, and nested
 // containers fall back to marshal + bytes.Compare.
 func (e *Comp) okScalar(v *anyenc.Value, docBuf *syncpool.DocBuffer) bool {
-	// Rule V (BUG-32), probe side: the stored value is the vector, as in
+	// Rule V, probe side: the stored value is the vector, as in
 	// {"v":{"$gt":1}}. See Comp.Ok for the rationale. Reached for a top-level
 	// value and for each element of an array — a vector nested deeper (inside an
 	// object, or inside an array compared whole) still resolves on the tag, the

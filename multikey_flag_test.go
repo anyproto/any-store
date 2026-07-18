@@ -393,7 +393,7 @@ func TestQuery_TightSeekDifferential(t *testing.T) {
 	}
 }
 
-// TestMultikeyFlag_ExplainShowsBothEnds is the explain-level BUG-02-shaped
+// TestMultikeyFlag_ExplainShowsBothEnds is the explain-level dropped-range-end
 // acceptance: both bounds ends survive to the executed plan for the pk and a
 // scalar secondary index.
 func TestMultikeyFlag_ExplainShowsBothEnds(t *testing.T) {

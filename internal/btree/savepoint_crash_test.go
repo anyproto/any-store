@@ -15,7 +15,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Bug 9: Crash-recovery corruption with savepoint-stress workload
+// Crash-recovery corruption with savepoint-stress workload
+// (zero-content overflow pages).
 //
 // STABLE EXTERNAL REPRO (100% reliable, requires the crash test harness
 // in any-store-tests/crashtest/):

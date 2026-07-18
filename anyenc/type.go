@@ -46,7 +46,7 @@ const (
 	// descending index on a vector-valued field AppendInverted's it into the key
 	// (see index.go writeValues), so 0xF5 must parse — when it did not, the
 	// reader failed to extract the docId from such a key and silently dropped
-	// every vector-valued row from a reverse-index scan (BUG-32 follow-up).
+	// every vector-valued row from a reverse-index scan.
 	iTypeVectorF32 = ^Type(10)
 	iTypeObjectID  = ^Type(11)
 )

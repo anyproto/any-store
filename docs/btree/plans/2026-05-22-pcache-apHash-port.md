@@ -200,7 +200,7 @@ a saved `hashNext` since `hashRemove` nils it). Keep these O(nPage).
   pinned pages — the ghost path), checkpoint, recovery, multiprocess, and the
   cache-spill/per-connection-pcache tests. Treat only the known pre-existing
   failures (`TestMinFrameFilter_*`, `TestCheckpointBackfill_ShortWrite_InlineRead`,
-  `TestRegression_Bug11_Simulation`, flaky `TestDb_Close/race`) as baseline —
+  `TestRegression_PartialCheckpointKeepsBackfillAndWAL`, flaky `TestDb_Close/race`) as baseline —
   verify each still fails identically on the pre-change commit.
 - `go test -tags vfs -race ./internal/btree/ -run 'Cache|Pcache|Spill|Evict|Cursor|Savepoint'`.
 - storetest crash subset:

@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Regression tests for BUG-18 (any-store-tests): tombstoning the HNSW entry
+// Regression tests: tombstoning the HNSW entry
 // point (update or delete of that doc) used to leave mt.entryLabel pointing at
 // a dead node; with no live neighbour to route through (one-doc collections,
 // or repeated entry churn) every subsequent search returned empty forever.

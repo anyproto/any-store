@@ -1430,7 +1430,7 @@ type wal struct {
 	// Test hook — intentionally commented out to avoid a per-BeginWrite
 	// atomic.Load on the production hot path. Uncomment together with the
 	// matching check in beginWriteWithSnapshot to re-enable the two tests
-	// in busy_test.go (TestBeginWrite_SurfacesBusySnapshotAfterBoundedRetries,
+	// in db_test.go (TestBeginWrite_SurfacesBusySnapshotAfterBoundedRetries,
 	// TestBeginWrite_BusySnapshotRoutesThroughBusyHandler).
 	// forceBusySnapshotForTest atomic.Bool
 
@@ -1649,12 +1649,10 @@ func (w *wal) open() (err error) {
 // DRIFT: recovery takes WAL_CKPT_LOCK + WAL_RECOVER_LOCK beyond WAL_WRITE_LOCK. See docs/btree/NOTES.md#old-drift-ensureheader-triple-lock-recovery-gate
 //
 // ensureHeaderInitialized guarantees the SHM header is published and returns
-// a snapshot of it so callers can stamp it onto their per-tx walHdr. During
-// the per-connection-hdr migration (spec:
-// docs/superpowers/specs/2026-04-18-per-connection-hdr-design.md), the helper
-// still calls syncFromSHMLocked to update process-global writer state
-// (w.header.salt*, w.cksum1/2, w.nFrame, w.writerHdr). Later steps will
-// narrow that to writer paths only.
+// a snapshot of it so callers can stamp it onto their per-tx walHdr. It also
+// calls syncFromSHMLocked to update process-global writer state
+// (w.header.salt*, w.cksum1/2, w.nFrame, w.writerHdr); narrowing that to
+// writer paths only is a remaining per-connection-hdr migration step.
 //
 // The returned hdr is the live SHM header value at the moment of observation.
 // On error, the zero hdr is returned and the error signals the retry class.
@@ -3089,7 +3087,7 @@ func (w *wal) beginWrite() (stateChanged bool, err error) {
 func (w *wal) beginWriteWithSnapshot(readSnap WalIndexHdr) (stateChanged bool, err error) {
 	// Test hook — kept commented to avoid an atomic.Load on every BeginWrite.
 	// Uncomment with the matching field in the wal struct to run the two
-	// ErrBusySnapshot tests in busy_test.go.
+	// ErrBusySnapshot tests in db_test.go.
 	// if w.forceBusySnapshotForTest.Load() {
 	// 	return false, ErrBusySnapshot
 	// }

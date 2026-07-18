@@ -12,7 +12,7 @@ import (
 	"github.com/anyproto/any-store/v2/query"
 )
 
-// BUG-32 / Rule V: no ordering comparison against a vector may ever match
+// Rule V: no ordering comparison against a vector may ever match
 // everything. Syntax-independent — this must hold no matter what the ANN query
 // syntax becomes.
 //
@@ -20,7 +20,7 @@ import (
 // resolves cross-type comparisons on the type tag, and TypeVectorF32 (10) sorts
 // above every scalar tag, so an ordering op with a vector operand was true for
 // every document — including ones where the field is absent.
-func TestBug32_VectorOrderingNeverMatchesEverything(t *testing.T) {
+func TestVectorOrderingNeverMatchesEverything(t *testing.T) {
 	t.Run("no vector index anywhere", func(t *testing.T) {
 		ctx := context.Background()
 		fx := newFixture(t)

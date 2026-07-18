@@ -689,7 +689,7 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 	}
 	// A parse error must be reported before anything else: Cond()/Sort() leave
 	// q.cond nil when they fail, which is indistinguishable from "no filter" to
-	// the fast path below — so a rejected query used to count the WHOLE
+	// the fast path below — the fast path would otherwise count the WHOLE
 	// collection with err=nil, while Iter/Update/Delete (which reach q.err via
 	// makeQuery) correctly errored. Count is the only verb that skips makeQuery.
 	if q.err != nil {
@@ -1284,7 +1284,7 @@ func (q *collQuery) buildCBOIndex(idx *index, br *qplanner.BoundsResult, sortFie
 	// WITHIN a run, not across runs, so claiming ExactSort for a suffix sort
 	// drops the SortIter and yields silently misordered rows — and, under Limit,
 	// the wrong rows. Break rather than skip: a later single-bound field must not
-	// re-extend the prefix past the multi-bound one. See BUG-26.
+	// re-extend the prefix past the multi-bound one.
 	//
 	// A sort that STARTS at the multi-bound field is still served by
 	// IndexSortMatch's matchAt() paths: the bound list is ascending and pairwise

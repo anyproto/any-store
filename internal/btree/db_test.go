@@ -3248,7 +3248,7 @@ func TestCov2_AppendValue_OverflowVarintErrors(t *testing.T) {
 	t.Skip("BUG: L663-672 structurally unreachable - getVarintSafe on same data that parseLeafCellWithSize already parsed")
 }
 
-// === Bug 14: WriteTx abandoned does not deadlock Close ===
+// === WriteTx abandoned does not deadlock Close ===
 
 func TestWriteTxAbandonedDoesNotDeadlockClose(t *testing.T) {
 	dir := t.TempDir()
@@ -3297,7 +3297,7 @@ func TestWriteTxInvalidatedByCloseReturnsErrClosed(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Put(ns, []byte("k"), []byte("v")))
 
-	// Close force-rolls-back the in-flight tx (Bug 14 path) and returns.
+	// Close force-rolls-back the in-flight tx (force-rollback path) and returns.
 	require.NoError(t, db.Close())
 
 	// The orphaned handle is still usable by its goroutine; every write
@@ -3340,7 +3340,7 @@ func TestWriteTxAbandonedThenNewWriteTxWorks(t *testing.T) {
 	}
 }
 
-// === Bug 16: Double open prevention ===
+// === Double open prevention ===
 
 func TestDoubleOpenReturnsError(t *testing.T) {
 	dir := t.TempDir()

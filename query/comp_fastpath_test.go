@@ -13,7 +13,7 @@ import (
 // and bytes.Compare against EqValue. okScalar must agree with it bit-for-bit
 // for every operator and every value pairing.
 //
-// It carries one deliberate divergence from raw bytes.Compare: Rule V (BUG-32).
+// It carries one deliberate divergence from raw bytes.Compare: Rule V.
 // The vector values stay in the matrix below precisely so the divergence stays
 // pinned — a vector is not a point on the scalar order, so an ordering op
 // against one is false on either side rather than resolving on the type tag.

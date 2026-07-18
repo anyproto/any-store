@@ -1512,9 +1512,7 @@ type ReadTx struct {
 	walSlot     int     // reader slot number (for endRead)
 	walMaxFrame uint32  // WAL snapshot for this transaction (TODO: migrate to walHdr.mxFrame)
 	// walHdr is the full SHM header snapshot captured at BeginRead time.
-	// Populated in parallel with walMaxFrame during the per-connection-hdr
-	// migration (see docs/superpowers/specs/2026-04-18-per-connection-hdr-design.md).
-	// Not yet consumed by production code.
+	// Populated in parallel with walMaxFrame.
 	walHdr WalIndexHdr
 
 	// Disk counters from page 1 at transaction start (for staleness detection).
