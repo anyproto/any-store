@@ -3299,6 +3299,21 @@ allocates 8192 buckets up front, and a larger configured cache allocates proport
 larger eager hash-table allocation at cache creation than SQLite's fixed 256-bucket seed — an intentional
 memory-vs-rehash tradeoff, now recorded in an in-code DRIFT comment at `pcache.go:134`.
 
+<a id="drift-131-build-tag-gated-test-fault-hooks"></a>
+### Drift: Build-Tag-Gated Test Fault Hooks
+- **Category:** platform-support  -  **Severity:** low
+- **Affected functions:** `test_hooks.go` (`internal/btree/test_hooks.go` `walTestHooks=false`, default build) /
+  `test_hooks_on.go` (`internal/btree/test_hooks_on.go` `walTestHooks=true`, tag `btreetesthooks`);
+  hook field `wal.forceBusySnapshotForTest` and its check in `wal.beginWriteWithSnapshot`;
+  consumers `busy_snapshot_hook_test.go` (BeginWrite bounded-retry + BusyHandler dispatch tests).
+
+SQLite compiles fault-injection helpers only under `SQLITE_TEST` (e.g. the busy/fault simulation hooks around
+`sqlite3InvokeBusyHandler`, `main.c:1700-1715`); production builds contain none of them. The Go port mirrors that
+with the `btreetesthooks` build tag: default builds define `const walTestHooks = false`, so
+`if walTestHooks && w.forceBusySnapshotForTest.Load()` is dead-code-eliminated and `BeginWrite` pays no atomic
+load; `-tags btreetesthooks` enables the hook and the two ErrBusySnapshot retry-contract tests. The drift is only
+the mechanism (build tag + const vs `#ifdef`); the gating structure follows upstream.
+
 ---
 
 ## Audit-Discovered Drifts (2026-06-25)
