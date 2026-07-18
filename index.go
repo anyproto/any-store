@@ -300,7 +300,16 @@ func indexNsName(collName, indexName string) string {
 }
 
 func newIndex(c *collection, info IndexInfo, ns *btree.Namespace) (idx *index, err error) {
-	idx = &index{info: info, c: c, ns: ns}
+	// Every construction site (init, reconcile, createIndex) runs on the
+	// writer or under c.mu, so reading c.name here is race-free; the captured
+	// identity is immutable afterwards (see the field comment).
+	idx = &index{
+		info:       info,
+		c:          c,
+		ns:         ns,
+		nsName:     indexNsName(c.name, info.Name),
+		catalogKey: indexKey(c.name, info.Name),
+	}
 	if err = idx.init(); err != nil {
 		return nil, err
 	}
@@ -338,22 +347,29 @@ type index struct {
 
 	cboInfo *qplanner.IndexInfo // cached CBO index info, built once during init
 
-	// uncommitted marks a handle published to the shared CoW snapshot by a DDL
-	// whose write tx has not committed yet (createIndexes publishes at
-	// execution time so same-tx writes maintain the new index). Its namespace
-	// exists only in the creator's uncommitted view, so every OTHER tx must
-	// not plan with it — a stale-snapshot reader seeking it would scan an
-	// empty namespace and return wrong results with no error (Count = 0 while
-	// Iter finds rows). Cleared by the creating tx's commit publication; a
-	// rollback discards the handle itself (registerIndexSetRestore).
+	// validFromCookie is the earliest schema cookie at which this handle is
+	// KNOWN visible: a reader whose snapshot cookie reaches it is guaranteed
+	// the index committed before its snapshot (SchemaCookie bumps exactly once
+	// per schema-changing commit, atomically with the DDL — the OP_Transaction
+	// analog). A DDL publishing mid-tx stamps its begin cookie + 1; handles
+	// built from a committed view (init, reconcile) stamp that view's cookie.
+	// An OLDER reader is not necessarily excluded — it falls back to resolving
+	// the handle's namespace in its own snapshot (see visibleTo).
 	//
-	// A pointer, SHARED by clones and immutable after creation (nil on
-	// reconcile-built handles == committed): a same-tx Rename republishes the
-	// pending index through cloneWithNs, and the creator's commit publication
-	// holds the original — only a shared flag also lifts the clone's mark.
-	// The Bool is written by the single writer and read lock-free by
-	// concurrent planners; see isUncommitted and visibleIndexes.
-	uncommitted *atomic.Bool
+	// Set before the CoW publish, immutable after (clones copy it); a rollback
+	// discards the handle itself (registerIndexSetRestore). Read lock-free by
+	// concurrent planners — a plain load, no atomics needed for an immutable
+	// field published via the CoW slice swap.
+	validFromCookie uint32
+	// nsName and catalogKey are the identity of the generation this handle was
+	// built from, captured at construction and immutable: visibleTo's slow
+	// path reads them lock-free, so it must never consult c.name, which a
+	// concurrent Rename mutates under c.mu. Rename clones carry the renamed
+	// identity (cloneWithNs); handles from before a rename keep the old one —
+	// correct for the only readers that consult it, whose snapshots predate
+	// this handle.
+	nsName     string
+	catalogKey []byte
 
 	keyBuf      anyenc.Tuple
 	keysBuf     []anyenc.Tuple
@@ -382,10 +398,34 @@ func (idx *index) loadPubSketch() *qplanner.IndexSketch { return idx.sketchPub.L
 // serialisation, like storeIndexes); readers need no lock.
 func (idx *index) storePubSketch(s *qplanner.IndexSketch) { idx.sketchPub.Store(s) }
 
-// isUncommitted reports whether this handle's creating DDL tx has not yet
-// committed; see the uncommitted field.
-func (idx *index) isUncommitted() bool {
-	return idx.uncommitted != nil && idx.uncommitted.Load()
+// visibleTo reports whether the given tx may plan with this handle. Fast
+// path: any write-tx view is the single writer's own (which must see its
+// uncommitted DDL for same-tx maintenance and queries), and a snapshot cookie
+// at or past validFromCookie proves the index committed before the snapshot.
+// Slow path: an older reader admits the handle only if its OWN snapshot still
+// carries this exact index — the catalog row at catalogKey matches the
+// handle's full definition AND the index namespace resolves at the bound
+// root. Both checks are required: root equality alone is a defeatable
+// identity proxy (freelist reuse can land a recreated tree on the freed old
+// root's page number), and definition equality alone does not prove the
+// handle's bound root means anything in the reader's snapshot. When both
+// hold, the tree at that root IS the reader's own generation of this
+// definition, so planning with it is exact even if the handle was built from
+// a later state. Anything less → invisible; the planner scans, which is
+// always correct. The stamp is a fast-path bound, not the exact commit point.
+func (idx *index) visibleTo(tx *btree.ReadTx) bool {
+	if tx.IsWriteTx() || tx.DiskSchemaCookie() >= idx.validFromCookie {
+		return true
+	}
+	raw, err := tx.AppendValue(idx.c.db.systemNS, idx.catalogKey, nil)
+	if err != nil || !indexDefMatches(raw, idx.info) {
+		return false
+	}
+	if idx.ns == nil {
+		return false
+	}
+	ns, nsErr := tx.GetNamespace(idx.nsName)
+	return nsErr == nil && ns.RootPage() == idx.ns.RootPage()
 }
 
 // cloneWithNs returns a copy of the index bound to a different namespace
@@ -395,11 +435,13 @@ func (idx *index) isUncommitted() bool {
 // The live sketch pointer is SHARED with the original: the single writer is
 // the only mutator, and after storeIndexes the writer path loads the clone.
 // Scratch buffers start zero and regrow lazily.
-func (idx *index) cloneWithNs(ns *btree.Namespace) *index {
+func (idx *index) cloneWithNs(ns *btree.Namespace, nsName string, catalogKey []byte) *index {
 	n := &index{
 		c:              idx.c,
 		info:           idx.info,
 		ns:             ns,
+		nsName:         nsName,
+		catalogKey:     catalogKey,
 		fieldNames:     idx.fieldNames,
 		fieldPaths:     idx.fieldPaths,
 		reverse:        idx.reverse,
@@ -415,10 +457,9 @@ func (idx *index) cloneWithNs(ns *btree.Namespace) *index {
 	cbo.Ns = ns
 	n.cboInfo = &cbo
 	n.sketchPub.Store(idx.loadPubSketch())
-	// Shared, not copied: a rename in the same tx as an uncommitted create
-	// keeps the pending state, and the creator's commit publication must lift
-	// it through the clone too.
-	n.uncommitted = idx.uncommitted
+	// A rename in the same tx as an uncommitted create keeps the pending
+	// visibility bound; the field is immutable, so a plain copy suffices.
+	n.validFromCookie = idx.validFromCookie
 	return n
 }
 
