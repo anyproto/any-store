@@ -1319,6 +1319,21 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 			root = &DocDedupIter{Source: root}
 		}
 
+		// Covering count over the unique point probes: when the bounds fully
+		// and exactly represent the filter (indexCoversFilter — every field in
+		// the bounded prefix, one predicate per field), the FilterIter
+		// re-evaluation below is redundant and its per-row doc fetch+parse is
+		// the entire cost of a counting $in/Eq over a unique index. Same
+		// elision as the IndexIter covering path below; SQLite analog: WHERE
+		// terms consumed by the index probe are marked TERM_CODED and never
+		// re-evaluated (whereterm.c disableTerm via wherecode.c
+		// codeAllEqualityTerms). Distinctness across bounds is preserved by
+		// the DocDedupIter wrap above (multikey-tagged entries) and by
+		// countPlanRoot's distinct consumers.
+		if params.CountOnly && indexCoversFilter(idx, params.Filter) {
+			return root
+		}
+
 		if needFilter {
 			root = &FilterIter{
 				Source: root,
@@ -2103,7 +2118,6 @@ func invertBytes(b []byte) []byte {
 	}
 	return out
 }
-
 
 // transformReverseBounds maps per-field bounds from ascending value space into
 // the inverted (stored) byte space used for a reverse-flagged index field.
