@@ -729,37 +729,13 @@ func BuildPlan(params *PlanParams) *Plan {
 // k-cut; Count's LimitIter.CountDistinct fast path computes correctly over the
 // stacked shape.)
 func buildVectorPlan(params *PlanParams) *Plan {
-	needSort := params.Sorter != nil
-	needFilter := params.Filter != nil && !isAllFilter(params.Filter)
-
 	dataCS := &CursorSource{Tx: params.Tx, Ns: params.DataNs}
-	var root Iterator = &VectorIter{
+	source := &VectorIter{
 		Spec: params.Vector,
 		Data: dataCS,
 		Buf:  params.Buf,
 	}
-	if needFilter {
-		root = &FilterIter{Source: root, Data: dataCS, Filter: params.Filter, Buf: params.Buf}
-	}
-	if params.Vector.K > 0 {
-		root = &LimitIter{Source: root, Limit: params.Vector.K}
-	}
-	if needSort {
-		root = &SortIter{
-			Source: root,
-			Data:   dataCS,
-			Sorter: params.Sorter,
-			Buf:    params.Buf,
-			TopK:   sortTopK(params),
-		}
-	}
-	if params.Limit > 0 || params.Offset > 0 {
-		root = &LimitIter{Source: root, Limit: params.Limit, Offset: params.Offset}
-	}
-
-	plan := &Plan{Root: root, Name: "KnnSearch", IndexName: params.Vector.IndexName}
-	setPlanRef(root, plan)
-	return plan
+	return buildSearchPlan(params, dataCS, source, params.Vector.K, "KnnSearch", params.Vector.IndexName)
 }
 
 // buildFtsPlan builds the iterator chain for a full-text query:
@@ -773,19 +749,31 @@ func buildVectorPlan(params *PlanParams) *Plan {
 // stream flows straight to LimitIter — no SortIter. An explicit sort on a real
 // field inserts a SortIter that re-orders the candidates.
 func buildFtsPlan(params *PlanParams) *Plan {
-	needSort := params.Sorter != nil
-	needFilter := params.Filter != nil && !isAllFilter(params.Filter)
-
 	dataCS := &CursorSource{Tx: params.Tx, Ns: params.DataNs}
-	var root Iterator = &FtsIter{
+	source := &FtsIter{
 		Spec: params.Fts,
 		Data: dataCS,
 		Buf:  params.Buf,
 	}
-	if needFilter {
+	return buildSearchPlan(params, dataCS, source, 0, "FtsSearch", params.Fts.IndexName)
+}
+
+// buildSearchPlan assembles the shared downstream chain of the search-source
+// plans (vector/fts):
+//
+//	source -> [FilterIter(residual)] -> [LimitIter{Limit:kLimit}] -> [SortIter] -> [LimitIter{Offset,Limit}]
+//
+// kLimit > 0 inserts the vector k-cut between the residual filter and the user
+// sort; fts passes 0 (no cut — FtsIter's stream is already score-ordered).
+func buildSearchPlan(params *PlanParams, dataCS *CursorSource, source Iterator, kLimit int, name, indexName string) *Plan {
+	root := source
+	if params.Filter != nil && !isAllFilter(params.Filter) {
 		root = &FilterIter{Source: root, Data: dataCS, Filter: params.Filter, Buf: params.Buf}
 	}
-	if needSort {
+	if kLimit > 0 {
+		root = &LimitIter{Source: root, Limit: kLimit}
+	}
+	if params.Sorter != nil {
 		root = &SortIter{
 			Source: root,
 			Data:   dataCS,
@@ -798,7 +786,7 @@ func buildFtsPlan(params *PlanParams) *Plan {
 		root = &LimitIter{Source: root, Limit: params.Limit, Offset: params.Offset}
 	}
 
-	plan := &Plan{Root: root, Name: "FtsSearch", IndexName: params.Fts.IndexName}
+	plan := &Plan{Root: root, Name: name, IndexName: indexName}
 	setPlanRef(root, plan)
 	return plan
 }

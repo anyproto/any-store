@@ -3,6 +3,8 @@ package vivf
 import (
 	"encoding/binary"
 	"math"
+
+	"github.com/anyproto/any-store/v2/internal/vecf"
 )
 
 // The re-rank store (:vec) and IVF-SQ cell store hold int8-quantized vectors
@@ -25,8 +27,8 @@ import (
 // `byte(q) ^ 0x80` (== q+128 mod 256); decode subtracts the bias back. This
 // mirrors — and for L2 goes beyond — internal/vindex/quant.go.
 
-// int8Bias is the offset-binary bias (see internal/vindex/quant.go).
-const int8Bias = 128
+// int8Bias is the offset-binary bias (see vecf.Int8Bias).
+const int8Bias = vecf.Int8Bias
 
 // int8RecordSize is the encoded size of one int8 record for the metric (L2
 // carries an extra f32 squared-norm).
@@ -40,47 +42,19 @@ func int8RecordSize(dim int, l2 bool) int {
 // encodeVecInt8 appends v's offset-binary int8 record to dst (reusing it) and
 // returns it. When l2 is set the per-vector squared norm ‖x‖² is stored too.
 func encodeVecInt8(dst []byte, v []float32, l2 bool) []byte {
-	var maxAbs float32
-	for _, x := range v {
-		if x < 0 {
-			x = -x
-		}
-		if x > maxAbs {
-			maxAbs = x
-		}
-	}
-	dst = dst[:0]
-	var sb [4]byte
-	scale := maxAbs / 127
-	binary.LittleEndian.PutUint32(sb[:], math.Float32bits(scale))
-	dst = append(dst, sb[:]...)
-	normSlot := -1
+	dst = append(dst[:0], 0, 0, 0, 0) // scale slot, back-patched below
+	var scale float32
 	if l2 {
-		normSlot = len(dst)
+		normSlot := len(dst)
 		dst = append(dst, 0, 0, 0, 0) // sqnorm placeholder, back-patched below
-	}
-	if maxAbs == 0 {
-		for range v {
-			dst = append(dst, 0x80) // q=0 -> bias byte; decode yields 0
-		}
-		return dst // sqnorm stays 0
-	}
-	inv := 127 / maxAbs
-	var sumSq float32 // Σ qᵢ² over the clamped components (== Σ(uᵢ−128)²)
-	for _, x := range v {
-		qi := int32(math.Round(float64(x * inv)))
-		if qi > 127 {
-			qi = 127
-		} else if qi < -127 {
-			qi = -127
-		}
-		dst = append(dst, byte(qi)^0x80) // offset-binary via sign-bit flip
-		sumSq += float32(qi) * float32(qi)
-	}
-	if l2 {
+		var sumSq float32
+		dst, scale, sumSq = vecf.QuantizeInt8Norm(dst, v)
 		sqnorm := scale * scale * sumSq // ‖x‖² of the dequantized vector
 		binary.LittleEndian.PutUint32(dst[normSlot:normSlot+4], math.Float32bits(sqnorm))
+	} else {
+		dst, scale = vecf.QuantizeInt8(dst, v)
 	}
+	binary.LittleEndian.PutUint32(dst[:4], math.Float32bits(scale))
 	return dst
 }
 
@@ -92,10 +66,7 @@ func decodeVecInt8(data []byte, dim int, l2 bool, dst []float32) []float32 {
 		off = 8
 	}
 	scale := math.Float32frombits(binary.LittleEndian.Uint32(data[:4]))
-	qb := data[off : off+dim]
-	for i := 0; i < dim; i++ {
-		dst[i] = (float32(qb[i]) - int8Bias) * scale
-	}
+	vecf.DequantizeInt8(dst[:dim], data[off:off+dim], scale)
 	return dst
 }
 

@@ -80,6 +80,16 @@ type offsetSkipper interface {
 	skipOffset(n int) (remaining int, err error)
 }
 
+// delegateSkipOffset forwards a skipOffset call to src when it implements
+// offsetSkipper; otherwise the full offset remains for the caller's per-row
+// path. Shared body of the 1:1 pass-through iterators' skipOffset methods.
+func delegateSkipOffset(src Iterator, n int) (remaining int, err error) {
+	if s, ok := src.(offsetSkipper); ok {
+		return s.skipOffset(n)
+	}
+	return n, nil
+}
+
 // Index entry value encoding (bitmask, 1 byte per entry):
 //
 //	bit 0 — multi-key: the document that produced this entry has more

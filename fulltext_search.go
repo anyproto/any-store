@@ -900,15 +900,21 @@ func postingsTermPrefix(dst []byte, term string) []byte {
 }
 
 func ftsGetUint(tx *btree.ReadTx, ns *btree.Namespace, key []byte) (uint64, error) {
+	n, _, err := ftsGetUintOk(tx, ns, key)
+	return n, err
+}
+
+// ftsGetUintOk is ftsGetUint reporting existence: an absent key is (0, false, nil).
+func ftsGetUintOk(tx *btree.ReadTx, ns *btree.Namespace, key []byte) (uint64, bool, error) {
 	v, err := tx.Get(ns, key)
 	if err != nil {
 		if errors.Is(err, btree.ErrKeyNotFound) {
-			return 0, nil
+			return 0, false, nil
 		}
-		return 0, err
+		return 0, false, err
 	}
 	n, _ := binary.Uvarint(v)
-	return n, nil
+	return n, true, nil
 }
 
 // ftsDocLenBuf returns the stored document length, using a caller-owned value buffer: the BM25

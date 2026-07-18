@@ -3,6 +3,8 @@ package vindex
 import (
 	"encoding/binary"
 	"math"
+
+	"github.com/anyproto/any-store/v2/internal/vecf"
 )
 
 // Quantization selects how vectors are stored in the :vec namespace. It is a
@@ -37,16 +39,9 @@ func vecRecordSize(dim int, q Quantization) int {
 	return dim * 4
 }
 
-// int8Bias is the offset-binary bias: a quantized component q ∈ [-127,127] is
-// stored as the unsigned byte q+128 ∈ [1,255]. Offset-binary (rather than signed
-// two's-complement) lets the UNSIGNED SIMD float×byte kernel compute the signed
-// dot via scale·(DotFloatByte(query,u) − bias·Σquery); see internal/simd. The
-// format has no on-disk back-compat constraint yet.
-//
-// Adding 128 mod 256 is exactly flipping the sign bit, so encode is the XOR
-// `byte(q) ^ 0x80` (cheaper and self-evidently reversible) and decode subtracts
-// the bias back off — the two are inverse on the full byte range.
-const int8Bias = 128
+// int8Bias is the offset-binary bias (see vecf.Int8Bias for the rationale).
+// The format has no on-disk back-compat constraint yet.
+const int8Bias = vecf.Int8Bias
 
 // encodeVec appends v's storage bytes to buf (reusing it) and returns the slice.
 // For QuantNone it is the raw float32 byte view; for QuantInt8 it is
@@ -56,37 +51,10 @@ func encodeVec(buf []byte, v []float32, q Quantization) []byte {
 	if q != QuantInt8 {
 		return append(buf[:0], f32bytes(v)...)
 	}
-	var maxAbs float32
-	for _, x := range v {
-		if x < 0 {
-			x = -x
-		}
-		if x > maxAbs {
-			maxAbs = x
-		}
-	}
-	buf = buf[:0]
-	var sb [4]byte
-	scale := maxAbs / 127
-	binary.LittleEndian.PutUint32(sb[:], math.Float32bits(scale))
-	buf = append(buf, sb[:]...)
-	if maxAbs == 0 {
-		// zero vector: q=0 -> byte 0x80 (decode yields 0; scale is 0 anyway).
-		for range v {
-			buf = append(buf, 0x80)
-		}
-		return buf
-	}
-	inv := 127 / maxAbs
-	for _, x := range v {
-		qi := int32(math.Round(float64(x * inv)))
-		if qi > 127 {
-			qi = 127
-		} else if qi < -127 {
-			qi = -127
-		}
-		buf = append(buf, byte(qi)^0x80) // offset-binary via sign-bit flip
-	}
+	buf = append(buf[:0], 0, 0, 0, 0) // scale slot, back-patched below
+	var scale float32
+	buf, scale = vecf.QuantizeInt8(buf, v)
+	binary.LittleEndian.PutUint32(buf[:4], math.Float32bits(scale))
 	return buf
 }
 
@@ -102,10 +70,7 @@ func decodeVecInto(data []byte, dim int, q Quantization, dst []float32) ([]float
 		return nil, false
 	}
 	scale := math.Float32frombits(binary.LittleEndian.Uint32(data[:4]))
-	qb := data[4:]
-	for i := 0; i < dim; i++ {
-		dst[i] = (float32(qb[i]) - int8Bias) * scale
-	}
+	vecf.DequantizeInt8(dst[:dim], data[4:], scale)
 	return dst, true
 }
 

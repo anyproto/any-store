@@ -4,7 +4,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
-	"unsafe"
+
+	"github.com/anyproto/any-store/v2/internal/vecf"
 )
 
 // On-disk record formats for the IVF-PQ namespaces (little-endian). Mirrors the
@@ -180,18 +181,9 @@ func cellKey(buf []byte, listID, label uint32) []byte {
 // cellKeyLabel extracts the label from a :cell key.
 func cellKeyLabel(key []byte) uint32 { return binary.BigEndian.Uint32(key[4:]) }
 
-// f32bytes / bytesAsF32 reinterpret float32 slices as host bytes (little-endian
-// amd64/arm64), as internal/vindex/codec.go does.
-func f32bytes(v []float32) []byte {
-	if len(v) == 0 {
-		return nil
-	}
-	return unsafe.Slice((*byte)(unsafe.Pointer(&v[0])), len(v)*4)
-}
+// f32bytes / bytesAsF32 are thin wrappers over the shared casts in
+// internal/vecf, kept for call-site brevity (like normalizeInto over
+// simd.NormalizeInto).
+func f32bytes(v []float32) []byte { return vecf.F32Bytes(v) }
 
-func bytesAsF32(b []byte, dim int) []float32 {
-	if len(b) < dim*4 {
-		return nil
-	}
-	return unsafe.Slice((*float32)(unsafe.Pointer(&b[0])), dim)
-}
+func bytesAsF32(b []byte, dim int) []float32 { return vecf.BytesAsF32(b, dim) }

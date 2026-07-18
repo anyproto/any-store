@@ -131,10 +131,7 @@ func (it *CanonicalKeyDedupIter) Next() (key []byte, docId []byte, multiKey bool
 //     offset is then applied by LimitIter on the deduped (logical-row)
 //     stream. So multi-key dedup correctness is fully preserved.
 func (it *CanonicalKeyDedupIter) skipOffset(n int) (remaining int, err error) {
-	if src, ok := it.Source.(offsetSkipper); ok {
-		return src.skipOffset(n)
-	}
-	return n, nil
+	return delegateSkipOffset(it.Source, n)
 }
 
 func (it *CanonicalKeyDedupIter) Close() {
@@ -212,10 +209,7 @@ func (it *DocDedupIter) Next() (key []byte, docId []byte, multiKey bool, err err
 // bypassed and no seen-set recording is missed. The skip stops at the first
 // multikey entry, from which normal Next() dedup resumes.
 func (it *DocDedupIter) skipOffset(n int) (remaining int, err error) {
-	if src, ok := it.Source.(offsetSkipper); ok {
-		return src.skipOffset(n)
-	}
-	return n, nil
+	return delegateSkipOffset(it.Source, n)
 }
 
 func (it *DocDedupIter) Close() {

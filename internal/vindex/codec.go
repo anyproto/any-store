@@ -4,7 +4,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
-	"unsafe"
+
+	"github.com/anyproto/any-store/v2/internal/vecf"
 )
 
 // On-disk record formats for the four namespaces. Integers are little-endian.
@@ -220,22 +221,12 @@ func decodeAllAdjInto(data []byte, dst [][]uint32) (level int32, deleted bool, n
 	return level, deleted, dst, nil
 }
 
-// f32bytes reinterprets a []float32 as its host byte view (write path).
-func f32bytes(v []float32) []byte {
-	if len(v) == 0 {
-		return nil
-	}
-	return unsafe.Slice((*byte)(unsafe.Pointer(&v[0])), len(v)*4)
-}
+// f32bytes / bytesAsF32 are thin wrappers over the shared casts in
+// internal/vecf, kept for call-site brevity (like normalizeInto over
+// simd.NormalizeInto).
+func f32bytes(v []float32) []byte { return vecf.F32Bytes(v) }
 
-// bytesAsF32 reinterprets a byte slice (length dim*4, 4-byte aligned) as
-// []float32 without copying (read path).
-func bytesAsF32(b []byte, dim int) []float32 {
-	if len(b) < dim*4 {
-		return nil
-	}
-	return unsafe.Slice((*float32)(unsafe.Pointer(&b[0])), dim)
-}
+func bytesAsF32(b []byte, dim int) []float32 { return vecf.BytesAsF32(b, dim) }
 
 func labelKey(buf []byte, label uint32) []byte {
 	buf = buf[:0]

@@ -207,19 +207,23 @@ func (w writeTx) Context() context.Context {
 	return w.ctx
 }
 
+// unwind reverts this tx's in-memory schema publications, then rolls the
+// btree tx back. The order matters: the btree releases the global write lock
+// inside Rollback, and a writer acquiring it in the gap would still see the
+// phantom state — or commit its own index-set swaps that a late undo would
+// then clobber. Running the undos first is safe: this tx's writes were never
+// reader-visible, so the restored snapshots match the committed on-disk state
+// throughout.
+func (w writeTx) unwind() error {
+	w.commonTx.runUndo(0)
+	w.commonTx.dropPubs(0)
+	return w.writeTx.Rollback()
+}
+
 func (w writeTx) Rollback() error {
 	if w.commonTx.version.CompareAndSwap(w.version, 0) {
 		defer txPool.Put(w.commonTx)
-		// Unwind in-memory schema publications BEFORE the btree rollback: the
-		// btree releases the global write lock inside Rollback, and a writer
-		// acquiring it in the gap would still see the phantom state — or
-		// commit its own index-set swaps that a late undo would then clobber.
-		// Running the undos first is safe: this tx's writes were never
-		// reader-visible, so the restored snapshots match the committed
-		// on-disk state throughout.
-		w.commonTx.runUndo(0)
-		w.commonTx.dropPubs(0)
-		return w.writeTx.Rollback()
+		return w.unwind()
 	}
 	return nil
 }
@@ -229,21 +233,17 @@ func (w writeTx) Commit() error {
 		defer txPool.Put(w.commonTx)
 		// Every non-committed exit below must unwind the in-memory schema
 		// publications, BEFORE its btree rollback releases the global write
-		// lock (see Rollback).
+		// lock (see unwind).
 		if w.modified {
 			w.writeTx.MarkDataChanged()
 			// Flush the full-text write-back buffer into this same tx BEFORE the
 			// btree commit, so postings commit atomically with the documents.
 			if err := w.db.flushAllFtsPending(w.writeTx); err != nil {
-				w.commonTx.runUndo(0)
-				w.commonTx.dropPubs(0)
-				_ = w.writeTx.Rollback()
+				_ = w.unwind()
 				return err
 			}
 			if err := w.db.persistAllDirtySketches(w.writeTx); err != nil {
-				w.commonTx.runUndo(0)
-				w.commonTx.dropPubs(0)
-				_ = w.writeTx.Rollback()
+				_ = w.unwind()
 				return err
 			}
 		}

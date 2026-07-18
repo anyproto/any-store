@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -465,70 +466,45 @@ func (c *Conn) Insert(cmd Cmd) (result string, err error) {
 }
 
 func (c *Conn) Upsert(cmd Cmd) (result string, err error) {
-	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
-	if err != nil {
+	if err = c.writeOne(cmd, anystore.Collection.UpsertOne); err != nil {
 		return
 	}
-	if len(cmd.Documents) == 0 {
-		return "", fmt.Errorf(`expected document`)
-	}
-	var doc *anyenc.Value
-	if doc, err = anyenc.ParseJson(string(cmd.Documents[0])); err != nil {
-		return
-	}
-	if err = coll.UpsertOne(mainCtx.Ctx(), doc); err != nil {
-		return
-	}
-	result = fmt.Sprintf("upserted")
-	return
+	return "upserted", nil
 }
 
 func (c *Conn) Update(cmd Cmd) (result string, err error) {
+	err = c.writeOne(cmd, anystore.Collection.UpdateOne)
+	return
+}
+
+// writeOne parses cmd's single document and runs a one-document verb
+// (UpdateOne/UpsertOne, passed as a method expression).
+func (c *Conn) writeOne(cmd Cmd, do func(anystore.Collection, context.Context, *anyenc.Value) error) (err error) {
 	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
 	if err != nil {
 		return
 	}
 	if len(cmd.Documents) == 0 {
-		return "", fmt.Errorf(`expected document`)
+		return fmt.Errorf(`expected document`)
 	}
 	var doc *anyenc.Value
 	if doc, err = anyenc.ParseJson(string(cmd.Documents[0])); err != nil {
 		return
 	}
-	if err = coll.UpdateOne(mainCtx.Ctx(), doc); err != nil {
-		return
-	}
-	return
+	return do(coll, mainCtx.Ctx(), doc)
 }
 
 func (c *Conn) UpdateId(cmd Cmd) (result string, err error) {
-	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
-	if err != nil {
-		return
-	}
-	if len(cmd.Documents) < 2 {
-		return "", fmt.Errorf(`expected id and modifier`)
-	}
-	id, err := anyenc.ParseJson(string(cmd.Documents[0]))
-	if err != nil {
-		return
-	}
-	modVal, err := anyenc.ParseJson(string(cmd.Documents[1]))
-	if err != nil {
-		return
-	}
-	mod, err := query.ParseModifier(modVal)
-	if err != nil {
-		return
-	}
-	res, err := coll.UpdateId(mainCtx.Ctx(), id, mod)
-	if err != nil {
-		return
-	}
-	return fmt.Sprintf("matched: %v, modified: %v", res.Matched, res.Modified), nil
+	return c.modifyId(cmd, anystore.Collection.UpdateId)
 }
 
 func (c *Conn) UpsertId(cmd Cmd) (result string, err error) {
+	return c.modifyId(cmd, anystore.Collection.UpsertId)
+}
+
+// modifyId parses cmd's (id, modifier) pair and runs an id-targeted verb
+// (UpdateId/UpsertId, passed as a method expression).
+func (c *Conn) modifyId(cmd Cmd, do func(anystore.Collection, context.Context, any, query.Modifier) (anystore.ModifyResult, error)) (result string, err error) {
 	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
 	if err != nil {
 		return
@@ -548,7 +524,7 @@ func (c *Conn) UpsertId(cmd Cmd) (result string, err error) {
 	if err != nil {
 		return
 	}
-	res, err := coll.UpsertId(mainCtx.Ctx(), id, mod)
+	res, err := do(coll, mainCtx.Ctx(), id, mod)
 	if err != nil {
 		return
 	}

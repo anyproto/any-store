@@ -469,15 +469,7 @@ func (fx *ftsIndex) termPostingsInto(dst map[string][]uint32, tokens []fts.Token
 // ---- IntDocID allocation & docmap -----------------------------------------
 
 func (fx *ftsIndex) readMetaUint(tx *btree.WriteTx, key []byte) (uint64, error) {
-	v, err := tx.Get(fx.nsMeta, key)
-	if err != nil {
-		if errors.Is(err, btree.ErrKeyNotFound) {
-			return 0, nil
-		}
-		return 0, err
-	}
-	n, _ := binary.Uvarint(v)
-	return n, nil
+	return ftsGetUint(&tx.ReadTx, fx.nsMeta, key)
 }
 
 func (fx *ftsIndex) putMetaUint(tx *btree.WriteTx, key []byte, n uint64) error {
@@ -523,15 +515,7 @@ func ftsMapReverseKey(dst []byte, docID uint64) []byte {
 // lookupDocID returns the IntDocID for a string id, or ok=false if absent.
 func (fx *ftsIndex) lookupDocID(tx *btree.WriteTx, stringID []byte) (uint64, bool, error) {
 	fx.keyBuf = ftsMapForwardKey(fx.keyBuf, stringID)
-	v, err := tx.Get(fx.nsMap, fx.keyBuf)
-	if err != nil {
-		if errors.Is(err, btree.ErrKeyNotFound) {
-			return 0, false, nil
-		}
-		return 0, false, err
-	}
-	n, _ := binary.Uvarint(v)
-	return n, true, nil
+	return ftsGetUintOk(&tx.ReadTx, fx.nsMap, fx.keyBuf)
 }
 
 // ---- postings key ---------------------------------------------------------

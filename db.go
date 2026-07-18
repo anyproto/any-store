@@ -1048,14 +1048,25 @@ func (db *db) doWriteTx(ctx context.Context, do func(tx *btree.WriteTx) error) e
 // commonTx.undo) so a rollback of this scope — or of any enclosing tx — leaves
 // the in-memory maps consistent with the reverted on-disk catalog.
 func (db *db) doWriteTxW(ctx context.Context, do func(wtx WriteTx, tx *btree.WriteTx) error) error {
+	return db.doWriteTxModifiedW(ctx, func(wtx WriteTx, tx *btree.WriteTx) (bool, error) {
+		return true, do(wtx, tx)
+	})
+}
+
+// doWriteTxModifiedW is doWriteTxW whose callback also reports whether it
+// modified data (SetModified is skipped otherwise).
+func (db *db) doWriteTxModifiedW(ctx context.Context, do func(wtx WriteTx, tx *btree.WriteTx) (bool, error)) error {
 	tx, err := db.WriteTx(ctx)
 	if err != nil {
 		return err
 	}
-	// User code runs inside this tx (a query.Modifier, a DDL callback). A panic
-	// must not escape holding the btree write lock: BeginWrite has no ctx-cancel
-	// escape, so every later write — and Close() — would block forever. Roll back
-	// to release the lock, then re-panic so the caller still sees their bug.
+	// User code runs inside this tx (a query.Modifier — UpdateId/UpsertId call
+	// mod.Modify inside the callback — or a DDL callback). A panic must not
+	// escape holding the btree write lock: BeginWrite has no ctx-cancel escape,
+	// so every later write — and Close() — would block forever. Roll back to
+	// release the lock, then re-panic so the caller still sees their bug.
+	// Guarded by TestTxPanic_UpdateIdDoesNotWedgeDB and
+	// TestTxPanic_UpsertIdDoesNotWedgeDB.
 	//
 	// Deliberately not armed across Commit: both commit layers mark themselves
 	// done before doing any work (writeTx.Commit consumes the version CAS on
@@ -1068,34 +1079,6 @@ func (db *db) doWriteTxW(ctx context.Context, do func(wtx WriteTx, tx *btree.Wri
 	// The rollback runs the undo log, whose closures take c.mu / db.mu: a
 	// callback must not panic while holding either with an explicit (non-defer)
 	// unlock, or the unwind deadlocks here.
-	committing := false
-	defer func() {
-		if r := recover(); r != nil {
-			if !committing {
-				_ = tx.Rollback()
-			}
-			panic(r)
-		}
-	}()
-	if err = do(tx, tx.btreeWriteTx()); err != nil {
-		return errors.Join(err, tx.Rollback())
-	}
-	tx.SetModified()
-	committing = true
-	return tx.Commit()
-}
-
-// doWriteTxModifiedW is doWriteTxModified with wrapper-tx access; see
-// doWriteTxW.
-func (db *db) doWriteTxModifiedW(ctx context.Context, do func(wtx WriteTx, tx *btree.WriteTx) (bool, error)) error {
-	tx, err := db.WriteTx(ctx)
-	if err != nil {
-		return err
-	}
-	// Rollback-on-panic; see doWriteTxW for why the guard stops at Commit. This
-	// is the single-doc modifier path (UpdateId/UpsertId call mod.Modify inside
-	// the callback), guarded by TestTxPanic_UpdateIdDoesNotWedgeDB and
-	// TestTxPanic_UpsertIdDoesNotWedgeDB.
 	committing := false
 	defer func() {
 		if r := recover(); r != nil {
