@@ -41,6 +41,15 @@ type vectorIndex struct {
 	// visible. Same contract as index.validFromCookie — see there, forTx and
 	// visibleIndexes.
 	validFromCookie uint32
+	// collName and catalogKey are the identity of the generation this handle
+	// was built from, captured at construction (bindIdentity) and immutable:
+	// forTx's slow path reads them lock-free, so it must never consult
+	// c.name, which a concurrent Rename mutates under c.mu. After a rename
+	// they intentionally keep the OLD name — the only readers that consult
+	// them hold snapshots that predate this handle, i.e. snapshots in which
+	// that old name is the correct one.
+	collName   string
+	catalogKey []byte
 	// prev is the handle this one replaced (compaction), still valid in every
 	// committed snapshot: while the compacting tx is uncommitted, a concurrent
 	// tx searches through prev instead (forTx resolves it by root against the
@@ -392,7 +401,23 @@ func (vi *vectorIndex) overThreshold(tx *btree.ReadTx) (bool, error) {
 
 // loadVectorIndex resolves an existing vector index from persisted info using
 // the provided read transaction (no nested read tx).
+// bindIdentity stamps the immutable generation identity (see the field
+// comments): every constructor funnel calls it before the handle is returned
+// or published, so forTx's lock-free slow path never reads c.name.
+func (vi *vectorIndex) bindIdentity(collName string) {
+	vi.collName = collName
+	vi.catalogKey = indexKey(collName, vi.info.Name)
+}
+
 func (c *collection) loadVectorIndex(tx *btree.ReadTx, info IndexInfo) (*vectorIndex, error) {
+	return c.loadVectorIndexAs(tx, c.name, info)
+}
+
+// loadVectorIndexAs opens the index from the given snapshot under collName —
+// the collection's name AS THAT SNAPSHOT knows it. forTx's transient rebuild
+// passes the handle's captured name, which may legitimately differ from
+// c.name (a later rename); init and reconcile go through loadVectorIndex.
+func (c *collection) loadVectorIndexAs(tx *btree.ReadTx, collName string, info IndexInfo) (*vectorIndex, error) {
 	if err := validateVectorParams(info.Vector); err != nil {
 		return nil, err
 	}
@@ -401,7 +426,7 @@ func (c *collection) loadVectorIndex(tx *btree.ReadTx, info IndexInfo) (*vectorI
 			// No on-disk graph to open — the index is metadata only.
 			return newVectorIndexFromVindex(c, info, nil), nil
 		}
-		prefix := vectorIndexNsPrefix(c.name, info.Name)
+		prefix := vectorIndexNsPrefix(collName, info.Name)
 		if info.Vector.Mode.isIVF() {
 			ivf, e := vivf.OpenTx(tx, prefix)
 			if e != nil {
@@ -409,7 +434,7 @@ func (c *collection) loadVectorIndex(tx *btree.ReadTx, info IndexInfo) (*vectorI
 			}
 			return newVectorIndexFromIVF(c, info, ivf), nil
 		}
-		ix, e := vindex.OpenTx(tx, prefix, vectorIndexSeed(c.name, info.Name))
+		ix, e := vindex.OpenTx(tx, prefix, vectorIndexSeed(collName, info.Name))
 		if e != nil {
 			return nil, e
 		}
@@ -421,10 +446,12 @@ func (c *collection) loadVectorIndex(tx *btree.ReadTx, info IndexInfo) (*vectorI
 	if err != nil {
 		return nil, err
 	}
-	// The opened state is visible from this snapshot's cookie on (init and
-	// reconcile call at tx begin, before any of this tx's writes; forTx's
-	// transient rebuild never republishes). A DDL path building mid-tx must
-	// re-stamp begin+1 — createIndexes' publish block does.
+	vi.bindIdentity(collName)
+	// The opened state is visible from this snapshot's cookie on (reconcile
+	// calls at tx begin, before any of this tx's writes; forTx's transient
+	// rebuild never republishes). A caller whose view may already hold
+	// uncommitted DDL must re-stamp begin+1 — init and createIndexes'
+	// publish block do.
 	vi.validFromCookie = tx.DiskSchemaCookie()
 	return vi, nil
 }
@@ -733,50 +760,36 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 	return spec, residual, nil
 }
 
-// resolvesIn reports whether this handle's meta namespace exists in the tx's
-// snapshot at the bound root — the slow visibility path for a reader whose
-// snapshot cookie predates validFromCookie (see index.visibleTo). Brute-force
-// handles have no namespaces: nothing resolvable proves existence, so they
-// are visible through the fast path only (an older reader errors, exactly as
-// before the create committed).
-func (vi *vectorIndex) resolvesIn(tx *btree.ReadTx) bool {
-	if vi.ix == nil && vi.ivf == nil {
-		return false
-	}
-	ns, err := tx.GetNamespace(vectorIndexNsPrefix(vi.c.name, vi.info.Name) + ":meta")
-	if err != nil {
-		return false
-	}
-	if vi.isIVF() {
-		return ns.RootPage() == vi.ivf.MetaRoot()
-	}
-	return ns.RootPage() == vi.ix.MetaRoot()
-}
-
 // forTx resolves the handle the given SCAN tx may search through — the
 // visibility gate of visibleIndexes, vector-shaped (see index.visibleTo).
-// Fast path: the write-tx view (single-writer: the creator's own), or a
-// snapshot cookie at or past validFromCookie. An older reader resolves
-// against its OWN snapshot: this handle's roots, then the pre-compaction
-// prev's (set only during the compacting tx's window), else a transient
-// handle opened from the reader's snapshot (post-commit stale reader on a
-// compacted index — prev is already cleared, but the reader's snapshot still
-// holds the pre-compaction state; rare, so the per-query open is acceptable).
-// Nothing resolvable — a fresh create the snapshot predates — errors exactly
-// as before the DDL began. Every branch preserves the mode (same info), so
-// the backend branch chosen at detect time stays valid for the result.
+// The write-tx view (single-writer: the creator's own) uses the handle as
+// resolved. A reader is served by generation INTERVAL, never by root-page
+// identity (page numbers are freelist-recycled, so a recreated root can
+// collide with the one a stale snapshot still holds): each handle in the
+// prev chain was the published handle for cookies [h.validFromCookie, next
+// generation), so the first h with cookie >= h.validFromCookie is exactly
+// the generation the reader's snapshot contains — the mid-compaction reader
+// lands on prev this way. A reader older than every held generation (prev
+// is cleared at the compaction's commit; init/reconcile restamp) is served
+// by a transient handle opened from its OWN snapshot, but only when the
+// snapshot's catalog row still carries this handle's exact definition —
+// which also guarantees the backend class, so the spec branch chosen at
+// detect time stays valid for the result. A definition the snapshot does
+// not carry errors exactly as before the index existed (the SQLITE_SCHEMA
+// posture: never serve old data under a new definition).
 func (vi *vectorIndex) forTx(tx *btree.ReadTx) (*vectorIndex, error) {
-	if tx.IsWriteTx() || tx.DiskSchemaCookie() >= vi.validFromCookie {
+	if tx.IsWriteTx() {
 		return vi, nil
 	}
-	if vi.resolvesIn(tx) {
-		return vi, nil
+	cookie := tx.DiskSchemaCookie()
+	for h := vi; h != nil; h = h.prev.Load() {
+		if cookie >= h.validFromCookie {
+			return h, nil
+		}
 	}
-	if prev := vi.prev.Load(); prev != nil && prev.resolvesIn(tx) {
-		return prev, nil
-	}
-	if !vi.mode.isBruteForce() {
-		if svi, err := vi.c.loadVectorIndex(tx, vi.info); err == nil {
+	raw, err := tx.AppendValue(vi.c.db.systemNS, vi.catalogKey, nil)
+	if err == nil && indexDefMatches(raw, vi.info) {
+		if svi, lerr := vi.c.loadVectorIndexAs(tx, vi.collName, vi.info); lerr == nil {
 			return svi, nil
 		}
 	}
@@ -1316,8 +1329,9 @@ func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) e
 		// Visibility (see forTx): until commit, the compacted roots exist
 		// only in this tx's view. The stamp is the cookie this commit will
 		// publish (MarkSchemaChanged above guarantees the bump) — a
-		// concurrent reader fails the fast path, cannot resolve the new
-		// roots in its snapshot, and searches through prev instead.
+		// concurrent reader fails the generation-interval walk on this
+		// handle and is served through prev instead.
+		nvi.bindIdentity(c.name)
 		nvi.validFromCookie = tx.DiskSchemaCookie() + 1
 		// prev must be a COMMITTED fallback: with chained same-tx DDL (create
 		// then compact, or compact twice) the replaced handle is itself

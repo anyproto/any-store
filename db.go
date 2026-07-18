@@ -796,7 +796,20 @@ func (db *db) openCollection(ctx context.Context, collectionName string) (Collec
 		return nil, err
 	}
 
-	coll, err := newCollection(ctx, db, collectionName)
+	// A reopen through an ambient write tx must bind and stamp through the
+	// WRITER'S view: the tx's own uncommitted DDL is visible only there (the
+	// embedded read view resolves committed namespaces only, so a mid-tx
+	// reopen after a same-tx CreateIndex would fail), and init stamps the
+	// loaded handles begin+1 when the tx already changed schema — an
+	// uncommitted index reloaded here must stay invisible to concurrent
+	// readers at the begin cookie.
+	var wtx *btree.WriteTx
+	if ctxTx := ctx.Value(ctxKeyTx); ctxTx != nil {
+		if w, ok := ctxTx.(WriteTx); ok && !w.Done() && w.instanceId() == db.instanceId {
+			wtx = w.btreeWriteTx()
+		}
+	}
+	coll, err := newCollection(ctx, db, collectionName, wtx)
 	if err != nil {
 		return nil, err
 	}

@@ -3,7 +3,7 @@
 **Repo:** `github.com/anyproto/any-store/v2`, branch `btree` @ `f8cbf6f` (post PR #140/#141 merge)
 **Companion test repo:** `../any-store-tests` (module `any-store-tests`, go.work → `../any-store`)
 **Bug doc:** `BUG-54-index-visibility-not-snapshot-based.md` in the test repo
-**Reference source:** sqlitec pinned `version-3.52.0` at `~/projects/sqlitec` (verified this groom); vdbe.c cites against that tag
+**Reference source:** sqlitec pinned `version-3.52.0` (verified this groom); vdbe.c cites against that tag
 
 **Goal (acceptance):** the bug doc flips to FIXED with stale-reader regression tests green across all three index kinds — tests the flag design structurally cannot pass: a read tx opened before a CreateIndex/Compact commit that queries after it gets snapshot-correct results (range: scan, correct Count/Find; fts: ErrNoFulltextIndex; vector create: ErrIndexNotFound; vector compact: correct candidates from its own snapshot). Plus a cross-process flavor in the test repo. benchstat neutral-or-better on hot query paths.
 
@@ -25,8 +25,8 @@ Every empirical claim below was verified on branch btree @ f8cbf6f.
 | 1 | Mechanism | Per-handle `validFromCookie uint32` — plain field, set before publish, immutable after. Visibility predicate: `tx.IsWriteTx() \|\| tx.DiskSchemaCookie() >= h.validFromCookie` → fast path (visible); else per-snapshot resolution (slow path, decision 4). Deletes: `index.uncommitted` + `isUncommitted` (index.go:341-356, 386-389), `ftsIndex.uncommitted` (fulltext_index.go:73), `vectorIndex.uncommitted` (vector_index.go:43), the flag-set + flag-clearing pubs (collection.go:948-968, vector_index.go:1283, 1297), `visibleTo`'s flag test (fulltext_index.go:192-194), and `forTx`'s flag/prev cross-load race dance (vector_index.go:731-747). |
 | 2 | Stamp values | Local DDL publish: `wtx.DiskSchemaCookie() + 1` — exact: all four DDL paths call `MarkSchemaChanged` (collection.go:1027, 1090; vector_index.go:425, 1264), `pager.commit` bumps `SchemaCookie` exactly once per schema-changing commit (pager.go:2338-2339), and the single writer holds the cross-process write lock, so no other commit interleaves. Reconcile/open/adopt sites: the building tx's `DiskSchemaCookie()` — the earliest cookie at which the handle is *known* visible; readers below it go through the slow path, which is exact. `cloneWithNs` copies the value (replaces the shared-pointer comment at index.go:418-421 — a plain immutable field needs no sharing). |
 | 3 | Fast path granularity | Per-handle compare inside the existing loops (visibleIndexes already iterates; a plain uint32 load+compare is cheaper than today's per-handle atomic loads). No collection-level watermark — nothing to maintain on rollback, and benchstat gets the final say. |
-| 4 | Slow path per kind | Reader cookie < validFrom → resolve against the reader's OWN snapshot via `tx.GetNamespace` (snapshot-scoped at the reader's mxFrame, internal/btree/db.go:1923-1928) + `RootPage()` compare. Range: `ix:C:I` root == `idx.ns.RootPage()` → visible, else invisible (planner scans → correct; precedent collection.go:1732-1734). Fts: `nsMeta` root match (rootUnchanged precedent, fulltext_index.go:202-209), else invisible → ErrNoFulltextIndex, the pre-DDL behavior. Vector: decision 5. Unresolvable-or-mismatch always degrades to the pre-DDL behavior — never a wrong answer. |
-| 5 | Vector slow path + prev policy | `forTx` slow path: head roots resolve in reader snapshot → head; else `prev` (non-nil only during the compaction tx window) roots resolve → prev; else **transient rebuild** `c.loadVectorIndex(readerTx, info)` (vector_index.go:393-417 — `vivf.OpenTx`/`vindex.OpenTx` already open from an arbitrary snapshot); open failure → ErrIndexNotFound (pre-DDL behavior, fresh-create case). `prev` lifecycle unchanged: committed-tail target at compact time (vector_index.go:1290-1294) stays as a cheap fast-serve of the mid-tx window; commit pub still clears it (no pinning of codebooks/caches — field-comment contract at vector_index.go:44-52 preserved). The transient handle is per-query and read-only; a per-tx memo is a later optimization if it ever shows on a profile. |
+| 4 | Slow path per kind | Reader cookie < validFrom → prove the reader's OWN snapshot still carries this exact index. Root-page equality alone is NOT identity — freelist reuse can land a recreated tree on its freed predecessor's page number (review-confirmed, all three kinds) — so admission requires the snapshot's catalog row to match the handle's full definition (`indexDefMatches` against the raw row at the handle's captured `catalogKey`) AND namespace-root match: range = the one `ix:` root; fts = ALL FIVE roots (a partial match would mix generations). Both together are exact: the tree at a name-matched root is the reader's own generation of that definition. Vector: decision 5 (no root proxy at all). Anything less degrades to the pre-DDL behavior — never a wrong answer. Handles capture `nsName`/`catalogKey`/`collName` at construction (immutable) so the lock-free slow paths never read `c.name`, which Rename mutates under c.mu. |
+| 5 | Vector slow path + prev policy | `forTx` serves readers by generation INTERVAL, never by root identity: each handle in the prev chain was the published handle for cookies `[h.validFromCookie, next)`, so the first `h` with `cookie >= h.validFromCookie` is exactly the reader's generation (the mid-compaction reader lands on prev this way). A reader older than every held generation gets a **transient rebuild** `loadVectorIndexAs(readerTx, capturedCollName, info)` — but only when the snapshot's catalog row matches the handle's exact definition, which also pins the backend class so the spec branch chosen at detect time stays valid; else ErrIndexNotFound (the SQLITE_SCHEMA posture: never serve old data under a new definition). `prev` lifecycle unchanged: committed-tail target at compact time stays; commit pub still clears it (no pinning of codebooks/caches). The transient handle is per-query and read-only; a per-tx memo is a later optimization if it ever shows on a profile. |
 | 6 | Window 2 (commit→runPubs gap) | Structurally closed: the cookie commits atomically with the DDL in page 1, and no pubs govern visibility anymore. `ddlUnwindGate` (tx.go:255-258) stays — it protects the failed-COMMIT unwind for new *writers*, a different job. |
 | 7 | Window 3 (cross-process, new) | Peer commits DDL → local `reconcileIndexes` (collection.go:1672) swaps freshly built handles into the shared CoW set → a still-open local reader on an older snapshot plans with them. Closed by decision 2's reconcile stamping: old reader → slow path → namespaces unresolvable in its snapshot → invisible. Added to the bug doc this groom. |
 | 8 | Rollback | `registerIndexSetRestore` (collection.go:1004-1024) unchanged — the set restore discards stamped handles wholesale; stamps need no undo work. The `indexSetDDLTxs` commit pub stays (it is set hygiene, not visibility). |
@@ -100,6 +100,24 @@ In-process (any-store repo; names descriptive, no bug numbers):
 6. Chained same-tx create+compact keeps passing (existing coverage from the compact committed-tail work).
 
 Cross-process (test repo, e2e): process A holds a long read tx; process B creates an index and commits; process A's *next* tx reconciles (cookie bump) while the old tx is still open; the old tx's query is snapshot-correct, the next tx uses the index. Per the multiprocess contract this is a first-class deployment shape, not an edge case.
+
+### Review amendments (2026-07-18, post high-effort review)
+
+- **Stamp under an ambient write tx**: `init`'s load stamps `begin+1` when
+  `wtx.SchemaChanged()` (new btree accessor) — a mid-tx collection reopen
+  after a same-tx CreateIndex would otherwise publish an uncommitted handle
+  stamped one too low (phantom visible at the begin cookie, surviving
+  rollback). Over-stamping a committed handle by one is safe: the slow path
+  admits its readers exactly.
+- **init bind source**: range/fts namespaces bind through the load tx's
+  snapshot (`resolve`), not the db-level latest-committed lookup — the bound
+  roots and the stamp must describe the same state.
+- **Brute-force slow path**: served via the catalog-gated transient rebuild
+  (`loadVectorIndexAs` returns the metadata-only handle), fixing the spurious
+  ErrIndexNotFound a restamped brute handle produced for older readers.
+- **Deleted**: `vectorIndex.resolvesIn` (root-proxy admission) — the interval
+  walk plus catalog-gated rebuild replaces it, which also resolves the
+  rootUnchanged-duplication cleanup.
 
 ### 5. Verification
 

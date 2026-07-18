@@ -297,18 +297,36 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 		var idxs []*index
 		var ftsIdxs []*ftsIndex
 		var vidxs []*vectorIndex
-		// The loaded handles reflect committed state as of this snapshot (a
-		// freshly created collection has no indexes yet, so a mid-tx load
-		// never sees this tx's own DDL): the snapshot cookie is their
-		// visibility bound. Vector handles are stamped by loadVectorIndex.
+		// resolve binds index namespaces through the SAME view the stamp below
+		// describes: the writer's own view under an ambient write tx, else
+		// this tx's snapshot — never the db-level latest-committed lookup,
+		// which could hand back roots from a peer commit newer than the
+		// snapshot cookie stamped on the handle.
+		resolve := func(name string) (*btree.Namespace, error) {
+			if wtx != nil {
+				return wtx.GetNamespace(name)
+			}
+			return tx.GetNamespace(name)
+		}
+		// The loaded handles' visibility bound: the snapshot cookie — except
+		// under an ambient write tx that already changed schema, whose view
+		// may include its own uncommitted DDL (a mid-tx reopen after a
+		// same-tx CreateIndex): those handles are known visible only from the
+		// cookie the commit will publish. Over-stamping a committed handle by
+		// one is safe (the slow path admits its readers exactly);
+		// under-stamping an uncommitted one would leak it to every reader at
+		// the begin cookie.
 		validFrom := tx.DiskSchemaCookie()
+		if wtx != nil && wtx.SchemaChanged() {
+			validFrom++
+		}
 		for _, info := range idxInfos {
 			if isFulltext(info) {
 				fx, fErr := newFtsIndex(c, info)
 				if fErr != nil {
 					return fErr
 				}
-				if fErr = fx.bindNamespaces(getNamespace); fErr != nil {
+				if fErr = fx.bindNamespaces(resolve); fErr != nil {
 					return fErr
 				}
 				fx.validFromCookie = validFrom
@@ -320,11 +338,12 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 				if viErr != nil {
 					return viErr
 				}
+				vi.validFromCookie = validFrom
 				vidxs = append(vidxs, vi)
 				continue
 			}
 			nsName := indexNsName(c.name, info.Name)
-			ns, nsErr := getNamespace(nsName)
+			ns, nsErr := resolve(nsName)
 			if nsErr != nil {
 				return nsErr
 			}
@@ -965,6 +984,7 @@ func (c *collection) createIndexes(ctx context.Context, ensure bool, info ...Ind
 			fx.validFromCookie = validFrom
 		}
 		for _, vi := range newVIndexes {
+			vi.bindIdentity(c.name)
 			vi.validFromCookie = validFrom
 		}
 		// Copy-on-write publish: build fresh slices (current snapshot + new
@@ -1332,7 +1352,8 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 		prevIdxs := c.loadIndexes()
 		next := make([]*index, len(prevIdxs))
 		for i, idx := range prevIdxs {
-			ns, nsErr := tx.GetNamespace(indexNsName(newName, idx.info.Name))
+			nsName := indexNsName(newName, idx.info.Name)
+			ns, nsErr := tx.GetNamespace(nsName)
 			if nsErr != nil {
 				if errors.Is(nsErr, btree.ErrNamespaceNotFound) {
 					// Legacy-broken index (pre-fix rename victim): the sweep
@@ -1342,7 +1363,7 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 				}
 				return nsErr
 			}
-			next[i] = idx.cloneWithNs(ns)
+			next[i] = idx.cloneWithNs(ns, nsName, indexKey(newName, idx.info.Name))
 		}
 		c.storeIndexes(next)
 

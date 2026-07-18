@@ -300,7 +300,16 @@ func indexNsName(collName, indexName string) string {
 }
 
 func newIndex(c *collection, info IndexInfo, ns *btree.Namespace) (idx *index, err error) {
-	idx = &index{info: info, c: c, ns: ns}
+	// Every construction site (init, reconcile, createIndex) runs on the
+	// writer or under c.mu, so reading c.name here is race-free; the captured
+	// identity is immutable afterwards (see the field comment).
+	idx = &index{
+		info:       info,
+		c:          c,
+		ns:         ns,
+		nsName:     indexNsName(c.name, info.Name),
+		catalogKey: indexKey(c.name, info.Name),
+	}
 	if err = idx.init(); err != nil {
 		return nil, err
 	}
@@ -352,6 +361,15 @@ type index struct {
 	// concurrent planners — a plain load, no atomics needed for an immutable
 	// field published via the CoW slice swap.
 	validFromCookie uint32
+	// nsName and catalogKey are the identity of the generation this handle was
+	// built from, captured at construction and immutable: visibleTo's slow
+	// path reads them lock-free, so it must never consult c.name, which a
+	// concurrent Rename mutates under c.mu. Rename clones carry the renamed
+	// identity (cloneWithNs); handles from before a rename keep the old one —
+	// correct for the only readers that consult it, whose snapshots predate
+	// this handle.
+	nsName     string
+	catalogKey []byte
 
 	keyBuf      anyenc.Tuple
 	keysBuf     []anyenc.Tuple
@@ -384,20 +402,30 @@ func (idx *index) storePubSketch(s *qplanner.IndexSketch) { idx.sketchPub.Store(
 // path: any write-tx view is the single writer's own (which must see its
 // uncommitted DDL for same-tx maintenance and queries), and a snapshot cookie
 // at or past validFromCookie proves the index committed before the snapshot.
-// Slow path: an older reader admits the handle only if its OWN snapshot
-// resolves the index namespace at the bound root (mirroring the reconcile
-// reuse check) — the stamp is a fast-path bound, not the exact commit point.
-// Unresolvable or root moved → invisible; the planner scans, which is always
-// correct.
+// Slow path: an older reader admits the handle only if its OWN snapshot still
+// carries this exact index — the catalog row at catalogKey matches the
+// handle's full definition AND the index namespace resolves at the bound
+// root. Both checks are required: root equality alone is a defeatable
+// identity proxy (freelist reuse can land a recreated tree on the freed old
+// root's page number), and definition equality alone does not prove the
+// handle's bound root means anything in the reader's snapshot. When both
+// hold, the tree at that root IS the reader's own generation of this
+// definition, so planning with it is exact even if the handle was built from
+// a later state. Anything less → invisible; the planner scans, which is
+// always correct. The stamp is a fast-path bound, not the exact commit point.
 func (idx *index) visibleTo(tx *btree.ReadTx) bool {
 	if tx.IsWriteTx() || tx.DiskSchemaCookie() >= idx.validFromCookie {
 		return true
 	}
+	raw, err := tx.AppendValue(idx.c.db.systemNS, idx.catalogKey, nil)
+	if err != nil || !indexDefMatches(raw, idx.info) {
+		return false
+	}
 	if idx.ns == nil {
 		return false
 	}
-	ns, err := tx.GetNamespace(indexNsName(idx.c.name, idx.info.Name))
-	return err == nil && ns.RootPage() == idx.ns.RootPage()
+	ns, nsErr := tx.GetNamespace(idx.nsName)
+	return nsErr == nil && ns.RootPage() == idx.ns.RootPage()
 }
 
 // cloneWithNs returns a copy of the index bound to a different namespace
@@ -407,11 +435,13 @@ func (idx *index) visibleTo(tx *btree.ReadTx) bool {
 // The live sketch pointer is SHARED with the original: the single writer is
 // the only mutator, and after storeIndexes the writer path loads the clone.
 // Scratch buffers start zero and regrow lazily.
-func (idx *index) cloneWithNs(ns *btree.Namespace) *index {
+func (idx *index) cloneWithNs(ns *btree.Namespace, nsName string, catalogKey []byte) *index {
 	n := &index{
 		c:              idx.c,
 		info:           idx.info,
 		ns:             ns,
+		nsName:         nsName,
+		catalogKey:     catalogKey,
 		fieldNames:     idx.fieldNames,
 		fieldPaths:     idx.fieldPaths,
 		reverse:        idx.reverse,

@@ -275,3 +275,273 @@ func idxVisMpChild(t *testing.T, path string) {
 	require.NoError(t, err)
 	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{Fields: []string{"name"}}))
 }
+
+// A same-tx drop+recreate under one name can land the recreated tree on the
+// freed old root's page number (freelist-first allocation), so root-page
+// equality alone would admit the pending handle to a concurrent reader whose
+// snapshot holds the OLD tree at that page — the catalog-identity half of the
+// slow path must exclude it (the snapshot's row carries the old definition).
+func TestConcurrentReaderAcrossDropRecreateSameTx(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{Name: "nm", Fields: []string{"a"}}))
+	for i := 0; i < 200; i++ {
+		a := "other"
+		if i < 30 {
+			a = "x"
+		}
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":%q,"b":"y%d"}`, i, a, i%7))))
+	}
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.DropIndex(tx.Context(), "nm"))
+	require.NoError(t, coll.CreateIndex(tx.Context(), IndexInfo{Name: "nm", Fields: []string{"b"}}))
+
+	// Concurrent reader during the window: the pending fields-b handle must
+	// not serve a fields-a query even if its recreated root reuses the freed
+	// page number the reader's snapshot still maps to the fields-a tree.
+	const filter = `{"a":"x"}`
+	hint := IndexHint{IndexName: "nm", Boost: 1_000_000}
+	cnt, err := coll.Find(filter).IndexHint(hint).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 30, cnt)
+	explain, err := coll.Find(filter).Explain(ctx)
+	require.NoError(t, err)
+	assert.False(t, explainHasIndex(explain, "nm"),
+		"a pending redefinition must not be a candidate for a concurrent reader")
+
+	require.NoError(t, tx.Commit())
+
+	cnt, err = coll.Find(`{"b":"y3"}`).Count(ctx)
+	require.NoError(t, err)
+	assert.NotZero(t, cnt)
+	explain, err = coll.Find(`{"b":"y3"}`).Explain(ctx)
+	require.NoError(t, err)
+	assert.True(t, explainHasIndex(explain, "nm"))
+}
+
+// Fts flavor of the same hazard: the five recreated namespaces can reuse
+// freed page numbers, and a partial or full root coincidence must never let
+// a concurrent reader search old postings through the new handle's field
+// configuration — the definition mismatch excludes it (ErrNoFulltextIndex).
+func TestConcurrentReaderAcrossFtsDropRecreateSameTx(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.CreateIndex(ctx, IndexInfo{Name: "t", Kind: IndexKindFulltext, Fields: []string{"body"}}))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"a","body":"london crash report","title":"weather"}`)))
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":"b","body":"paris sunshine","title":"london"}`)))
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.DropIndex(tx.Context(), "t"))
+	require.NoError(t, coll.CreateIndex(tx.Context(), IndexInfo{Name: "t", Kind: IndexKindFulltext, Fields: []string{"title"}}))
+
+	iter, err := coll.Find(`{"$text":{"$search":"london"}}`).Iter(ctx)
+	if err == nil {
+		for iter.Next() {
+		}
+		err = iter.Err()
+		require.NoError(t, iter.Close())
+	}
+	assert.ErrorIs(t, err, ErrNoFulltextIndex,
+		"a pending fts redefinition must be invisible, never garbled results")
+
+	require.NoError(t, tx.Commit())
+
+	ids, _ := collectIter(t, coll.Find(`{"$text":{"$search":"london"}}`))
+	assert.Equal(t, []string{"b"}, ids, "committed: the title index answers")
+}
+
+// A brute-force handle has no namespaces to resolve, but a stale reader whose
+// snapshot contains the committed index must still be served: the slow path
+// rebuilds from the snapshot's catalog row (metadata-only handle → scan).
+// Restamp trigger: collection reopened after an unrelated cookie bump.
+func TestStaleReaderBruteForceAfterReopen(t *testing.T) {
+	const dim = 8
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "emb",
+		Kind:   IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, Mode: VectorModeBruteForce},
+	}))
+	vecs := vrand(20, dim, 11)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+	require.NoError(t, coll.Close())
+
+	rtx, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rtx.Commit()) }()
+
+	// Unrelated schema commit bumps the cookie past the reader's snapshot.
+	_, err = fx.CreateCollection(ctx, "other")
+	require.NoError(t, err)
+
+	// Reopen stamps the reloaded handles at the newer cookie.
+	coll2, err := fx.OpenCollection(ctx, "docs")
+	require.NoError(t, err)
+
+	hits, err := vsearchCtx(rtx.Context(), coll2, "v", vecs[0], 3, 0)
+	require.NoError(t, err, "a committed brute-force index must serve a reader its snapshot contains")
+	assert.Len(t, hits, 3)
+}
+
+// A mid-tx collection reopen through an ambient write tx that already ran DDL
+// sees that tx's own uncommitted index: the reloaded handle must be stamped
+// for the COMMIT's cookie (init's SchemaChanged branch), or a concurrent
+// reader at the begin cookie would seek a namespace that exists only in the
+// writer's view — the phantom would even survive a rollback.
+func TestAmbientReopenPendingRangeInvisible(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	for i := 0; i < 50; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"a":"x%d"}`, i, i%5))))
+	}
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.CreateIndex(tx.Context(), IndexInfo{Name: "nm", Fields: []string{"a"}}))
+	require.NoError(t, coll.Close())
+	coll2, err := fx.OpenCollection(tx.Context(), "docs")
+	require.NoError(t, err)
+
+	// The ambient tx sees and uses its own index through the reloaded handle.
+	explainTx, err := coll2.Find(`{"a":"x1"}`).Explain(tx.Context())
+	require.NoError(t, err)
+	assert.True(t, explainHasIndex(explainTx, "nm"))
+
+	// A concurrent reader must not: correct count via scan, no candidate.
+	cnt, err := coll2.Find(`{"a":"x1"}`).IndexHint(IndexHint{IndexName: "nm", Boost: 1_000_000}).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 10, cnt)
+	explain, err := coll2.Find(`{"a":"x1"}`).Explain(ctx)
+	require.NoError(t, err)
+	assert.False(t, explainHasIndex(explain, "nm"),
+		"an index reloaded from the writer's uncommitted view must stay invisible to concurrent readers")
+
+	require.NoError(t, tx.Rollback())
+
+	// The rolled-back index never becomes visible.
+	cnt, err = coll2.Find(`{"a":"x1"}`).IndexHint(IndexHint{IndexName: "nm", Boost: 1_000_000}).Count(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 10, cnt)
+	explain, err = coll2.Find(`{"a":"x1"}`).Explain(ctx)
+	require.NoError(t, err)
+	assert.False(t, explainHasIndex(explain, "nm"))
+}
+
+// The vector flavor of the mid-tx reopen: the graph namespaces created in
+// this tx resolve only through the writer path, which the vector open (vivf/
+// vindex OpenTx) does not use — the reopen fails cleanly rather than serving
+// a phantom, and after rollback nothing of the index remains.
+func TestAmbientReopenPendingVectorFailsClean(t *testing.T) {
+	const dim = 8
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	vecs := vrand(20, dim, 5)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+
+	tx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.CreateIndex(tx.Context(), IndexInfo{
+		Name:   "emb",
+		Kind:   IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 32},
+	}))
+	require.NoError(t, coll.Close())
+	_, err = fx.OpenCollection(tx.Context(), "docs")
+	require.Error(t, err,
+		"mid-tx reopen with same-tx uncommitted vector DDL must fail, never serve a phantom")
+	require.NoError(t, tx.Rollback())
+
+	coll3, err := fx.OpenCollection(ctx, "docs")
+	require.NoError(t, err)
+	_, err = vsearchCtx(ctx, coll3, "v", vecs[0], 3, 32)
+	assert.ErrorIs(t, err, ErrNoVectorIndex)
+}
+
+// A stale reader on a redefined index (drop+recreate same name, different
+// definition) fails noisy: its snapshot's catalog row no longer matches the
+// current handle, and old data must never be served under a new definition
+// (the SQLITE_SCHEMA posture).
+func TestStaleReaderAcrossVectorDropRecreateDef(t *testing.T) {
+	const dim = 8
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "emb",
+		Kind:   IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 32},
+	}))
+	vecs := vrand(20, dim, 13)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+
+	rtx, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rtx.Commit()) }()
+
+	require.NoError(t, coll.DropIndex(ctx, "emb"))
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name:   "emb",
+		Kind:   IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, Mode: VectorModeBruteForce},
+	}))
+
+	_, err = vsearchCtx(rtx.Context(), coll, "v", vecs[0], 3, 32)
+	assert.ErrorIs(t, err, ErrIndexNotFound,
+		"a redefined index must fail noisy for a reader on the old definition's snapshot")
+
+	hits, err := vsearch(coll, "v", vecs[0], 3, 0)
+	require.NoError(t, err)
+	assert.Len(t, hits, 3)
+}
+
+// A same-definition drop+recreate moves the roots; the stale reader is served
+// by the transient rebuild from its OWN snapshot and must see exactly the
+// results it saw before the DDL — even if the recreated roots collide with
+// freed page numbers (the rebuild never trusts the handle's roots).
+func TestStaleReaderAcrossVectorSameDefRecreate(t *testing.T) {
+	const dim = 8
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "docs")
+	require.NoError(t, err)
+	info := IndexInfo{
+		Name:   "emb",
+		Kind:   IndexKindVector,
+		Vector: &VectorParams{Field: "v", Dim: dim, Metric: VectorL2, EfSearch: 64},
+	}
+	require.NoError(t, coll.EnsureIndex(ctx, info))
+	vecs := vrand(30, dim, 17)
+	for i, vc := range vecs {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(vecDocJSON(i, vc))))
+	}
+
+	rtx, err := fx.ReadTx(ctx)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rtx.Commit()) }()
+
+	before, err := vsearchCtx(rtx.Context(), coll, "v", vecs[29], 5, 64)
+	require.NoError(t, err)
+	require.Len(t, before, 5)
+
+	require.NoError(t, coll.DropIndex(ctx, "emb"))
+	require.NoError(t, coll.EnsureIndex(ctx, info))
+
+	after, err := vsearchCtx(rtx.Context(), coll, "v", vecs[29], 5, 64)
+	require.NoError(t, err)
+	assert.Equal(t, before, after,
+		"a reader's snapshot must serve identical results across a same-definition recreate")
+}

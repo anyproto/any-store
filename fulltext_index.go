@@ -60,6 +60,15 @@ type ftsIndex struct {
 	nsDocinfo *btree.Namespace
 	nsPost    *btree.Namespace
 
+	// nsNames holds the five namespace names in bindNamespaces order, and
+	// catalogKey the index's system-namespace key — the identity of the
+	// generation this handle was built from, captured at construction/bind and
+	// immutable: visibleTo's slow path reads them lock-free, so it must never
+	// consult c.name, which a concurrent Rename mutates under c.mu (see
+	// index.nsName).
+	nsNames    [5]string
+	catalogKey []byte
+
 	az *fts.Analyzer
 
 	// pending is the per-tx write-back buffer (postings + vocab deltas), flushed
@@ -111,7 +120,10 @@ type ftsIndex struct {
 }
 
 func newFtsIndex(c *collection, info IndexInfo) (*ftsIndex, error) {
-	fx := &ftsIndex{c: c, info: info, az: fts.NewAnalyzer()}
+	// Construction sites (init, reconcile, createFtsIndex) run on the writer
+	// or under c.mu, so reading c.name here is race-free (see catalogKey).
+	fx := &ftsIndex{c: c, info: info, az: fts.NewAnalyzer(),
+		catalogKey: indexKey(c.name, info.Name)}
 	for _, field := range info.Fields {
 		fields, _ := parseIndexField(field)
 		for _, f := range fields {
@@ -172,12 +184,14 @@ func (fx *ftsIndex) bindNamespaces(resolve func(name string) (*btree.Namespace, 
 		{ftsPartDocinfo, &fx.nsDocinfo},
 		{ftsPartPost, &fx.nsPost},
 	}
-	for _, p := range parts {
-		ns, e := resolve(ftsNsName(fx.c.name, fx.info.Name, p.name))
+	for i, p := range parts {
+		name := ftsNsName(fx.c.name, fx.info.Name, p.name)
+		ns, e := resolve(name)
 		if e != nil {
 			return e
 		}
 		*p.dst = ns
+		fx.nsNames[i] = name
 	}
 	return nil
 }
@@ -187,20 +201,35 @@ func (fx *ftsIndex) Info() IndexInfo { return fx.info }
 // visibleTo reports whether the given tx may search through this handle — the
 // visibility gate of visibleIndexes, fts-shaped (see index.visibleTo): fast
 // path on the write-tx view or a snapshot cookie at or past validFromCookie;
-// an older reader admits the handle only if its OWN snapshot resolves the
-// meta namespace at the bound root. Invisible → ErrNoFulltextIndex at the
-// call sites, exactly as before the CreateIndex began. (metaRootUnchanged has
-// the opposite error bias — keep a working index over a transient view — so
-// the two checks stay separate.)
+// an older reader admits the handle only if its OWN snapshot still carries
+// this exact index — the catalog row matches the handle's full definition
+// AND all five namespaces resolve at the bound roots. All five, not just
+// meta: freelist reuse can land one recreated root on its freed predecessor's
+// page number, and a partial match would search this generation's postings
+// through another generation's vocab/docinfo. When everything matches, the
+// trees are the reader's own generation of this definition — exact. Anything
+// less → invisible → ErrNoFulltextIndex at the call sites, exactly as before
+// the CreateIndex began. (metaRootUnchanged has the opposite error bias —
+// keep a working index over a transient view — so the two checks stay
+// separate.)
 func (fx *ftsIndex) visibleTo(tx *btree.ReadTx) bool {
 	if tx.IsWriteTx() || tx.DiskSchemaCookie() >= fx.validFromCookie {
 		return true
 	}
-	if fx.nsMeta == nil {
+	raw, err := tx.AppendValue(fx.c.db.systemNS, fx.catalogKey, nil)
+	if err != nil || !indexDefMatches(raw, fx.info) {
 		return false
 	}
-	ns, err := tx.GetNamespace(ftsNsName(fx.c.name, fx.info.Name, ftsPartMeta))
-	return err == nil && ns.RootPage() == fx.nsMeta.RootPage()
+	for i, bound := range [...]*btree.Namespace{fx.nsMap, fx.nsMeta, fx.nsVocab, fx.nsDocinfo, fx.nsPost} {
+		if bound == nil || fx.nsNames[i] == "" {
+			return false
+		}
+		ns, nsErr := tx.GetNamespace(fx.nsNames[i])
+		if nsErr != nil || ns.RootPage() != bound.RootPage() {
+			return false
+		}
+	}
+	return true
 }
 
 // metaRootUnchanged reports whether the ftx: meta namespace still resolves to
@@ -212,7 +241,10 @@ func (fx *ftsIndex) metaRootUnchanged(tx *btree.ReadTx) bool {
 	if fx.nsMeta == nil {
 		return true
 	}
-	ns, err := tx.GetNamespace(ftsNsName(fx.c.name, fx.info.Name, ftsPartMeta))
+	// nsNames[1] = meta (bindNamespaces order); the captured name, not
+	// c.name, for consistency with visibleTo — reconcile holds c.mu, but the
+	// handle's own generation name is the one its roots belong to.
+	ns, err := tx.GetNamespace(fx.nsNames[1])
 	if err != nil {
 		return true
 	}

@@ -2013,6 +2013,13 @@ func (tx *WriteTx) MarkDataChanged() {
 	tx.dataChanged = true
 }
 
+// SchemaChanged reports whether MarkSchemaChanged was called on this
+// transaction — i.e. whether its view may already include uncommitted schema
+// changes and its commit will bump the SchemaCookie.
+func (tx *WriteTx) SchemaChanged() bool {
+	return tx.schemaChanged
+}
+
 // MarkSchemaChanged signals that this transaction modifies schema, causing
 // SchemaCookie to be incremented on commit.
 func (tx *WriteTx) MarkSchemaChanged() {
