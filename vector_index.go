@@ -37,17 +37,19 @@ type vectorIndex struct {
 	// ivf is the btree-resident IVF-PQ index for VectorModeIVFPQ; nil otherwise.
 	ivf *vivf.StoreIndex
 
-	// uncommitted: the creating DDL tx (createIndexes or CompactVectorIndex)
-	// has not committed; other txs must not search through this handle. Same
-	// contract as index.uncommitted — see there and visibleIndexes.
-	uncommitted atomic.Bool
+	// validFromCookie: earliest schema cookie at which this handle is KNOWN
+	// visible. Same contract as index.validFromCookie — see there, forTx and
+	// visibleIndexes.
+	validFromCookie uint32
 	// prev is the handle this one replaced (compaction), still valid in every
-	// committed snapshot: while uncommitted, a non-creator tx searches through
-	// prev instead. Set before the CoW publish; cleared by the commit
-	// publication AFTER the uncommitted flag (that order lets forTx resolve
-	// the cross-load race, see there) so successive compactions do not chain
-	// and pin every predecessor handle for the life of the process. nil for a
-	// freshly created index (nothing to serve; the reader errors as it did
+	// committed snapshot: while the compacting tx is uncommitted, a concurrent
+	// tx searches through prev instead (forTx resolves it by root against the
+	// reader's snapshot). Set before the CoW publish; cleared by the commit
+	// publication so successive compactions do not chain and pin every
+	// predecessor's codebooks/caches for the life of the process — a reader
+	// whose snapshot predates the compaction commit is served by a transient
+	// rebuild from its own snapshot instead (see forTx). nil for a freshly
+	// created index (nothing committed to serve; the reader errors as it did
 	// before the DDL began).
 	prev atomic.Pointer[vectorIndex]
 }
@@ -394,26 +396,37 @@ func (c *collection) loadVectorIndex(tx *btree.ReadTx, info IndexInfo) (*vectorI
 	if err := validateVectorParams(info.Vector); err != nil {
 		return nil, err
 	}
-	if info.Vector.Mode.isBruteForce() {
-		// No on-disk graph to open — the index is metadata only.
-		return newVectorIndexFromVindex(c, info, nil), nil
-	}
-	prefix := vectorIndexNsPrefix(c.name, info.Name)
-	if info.Vector.Mode.isIVF() {
-		ivf, err := vivf.OpenTx(tx, prefix)
-		if err != nil {
-			return nil, err
+	vi, err := func() (*vectorIndex, error) {
+		if info.Vector.Mode.isBruteForce() {
+			// No on-disk graph to open — the index is metadata only.
+			return newVectorIndexFromVindex(c, info, nil), nil
 		}
-		return newVectorIndexFromIVF(c, info, ivf), nil
-	}
-	ix, err := vindex.OpenTx(tx, prefix, vectorIndexSeed(c.name, info.Name))
+		prefix := vectorIndexNsPrefix(c.name, info.Name)
+		if info.Vector.Mode.isIVF() {
+			ivf, e := vivf.OpenTx(tx, prefix)
+			if e != nil {
+				return nil, e
+			}
+			return newVectorIndexFromIVF(c, info, ivf), nil
+		}
+		ix, e := vindex.OpenTx(tx, prefix, vectorIndexSeed(c.name, info.Name))
+		if e != nil {
+			return nil, e
+		}
+		hybrid := info.Vector.Mode == VectorModeHybrid
+		ix.SetHybrid(hybrid)
+		ix.SetVectorCache(hybrid && info.Vector.HybridCacheVectors)
+		return newVectorIndexFromVindex(c, info, ix), nil
+	}()
 	if err != nil {
 		return nil, err
 	}
-	hybrid := info.Vector.Mode == VectorModeHybrid
-	ix.SetHybrid(hybrid)
-	ix.SetVectorCache(hybrid && info.Vector.HybridCacheVectors)
-	return newVectorIndexFromVindex(c, info, ix), nil
+	// The opened state is visible from this snapshot's cookie on (init and
+	// reconcile call at tx begin, before any of this tx's writes; forTx's
+	// transient rebuild never republishes). A DDL path building mid-tx must
+	// re-stamp begin+1 — createIndexes' publish block does.
+	vi.validFromCookie = tx.DiskSchemaCookie()
+	return vi, nil
 }
 
 // createVectorIndex creates a new vector index (namespaces + meta) and builds it
@@ -720,28 +733,52 @@ func (q *collQuery) detectKnnQuery() (*qplanner.VectorQuerySpec, query.Filter, e
 	return spec, residual, nil
 }
 
+// resolvesIn reports whether this handle's meta namespace exists in the tx's
+// snapshot at the bound root — the slow visibility path for a reader whose
+// snapshot cookie predates validFromCookie (see index.visibleTo). Brute-force
+// handles have no namespaces: nothing resolvable proves existence, so they
+// are visible through the fast path only (an older reader errors, exactly as
+// before the create committed).
+func (vi *vectorIndex) resolvesIn(tx *btree.ReadTx) bool {
+	if vi.ix == nil && vi.ivf == nil {
+		return false
+	}
+	ns, err := tx.GetNamespace(vectorIndexNsPrefix(vi.c.name, vi.info.Name) + ":meta")
+	if err != nil {
+		return false
+	}
+	if vi.isIVF() {
+		return ns.RootPage() == vi.ivf.MetaRoot()
+	}
+	return ns.RootPage() == vi.ix.MetaRoot()
+}
+
 // forTx resolves the handle the given SCAN tx may search through — the
-// visibility gate of visibleIndexes, vector-shaped. The creator's own write
-// tx (single-writer: any write-tx view) uses the handle as resolved. Another
-// tx during the uncommitted window falls back to prev — the pre-compaction
-// handle, whose namespaces its committed snapshot still holds — or, for a
-// freshly created index (prev == nil), errors exactly as it did before the
-// DDL began. The compact fallback preserves the mode, so the backend branch
-// chosen at detect time stays valid for prev.
+// visibility gate of visibleIndexes, vector-shaped (see index.visibleTo).
+// Fast path: the write-tx view (single-writer: the creator's own), or a
+// snapshot cookie at or past validFromCookie. An older reader resolves
+// against its OWN snapshot: this handle's roots, then the pre-compaction
+// prev's (set only during the compacting tx's window), else a transient
+// handle opened from the reader's snapshot (post-commit stale reader on a
+// compacted index — prev is already cleared, but the reader's snapshot still
+// holds the pre-compaction state; rare, so the per-query open is acceptable).
+// Nothing resolvable — a fresh create the snapshot predates — errors exactly
+// as before the DDL began. Every branch preserves the mode (same info), so
+// the backend branch chosen at detect time stays valid for the result.
 func (vi *vectorIndex) forTx(tx *btree.ReadTx) (*vectorIndex, error) {
-	if !vi.uncommitted.Load() || tx.IsWriteTx() {
+	if tx.IsWriteTx() || tx.DiskSchemaCookie() >= vi.validFromCookie {
 		return vi, nil
 	}
-	if prev := vi.prev.Load(); prev != nil {
+	if vi.resolvesIn(tx) {
+		return vi, nil
+	}
+	if prev := vi.prev.Load(); prev != nil && prev.resolvesIn(tx) {
 		return prev, nil
 	}
-	// A nil prev after observing uncommitted is either a fresh create
-	// (nothing to serve) or the commit publication ran between the two
-	// loads. The publication clears the flag BEFORE prev, so re-checking
-	// disambiguates: flag now down means the index just committed and this
-	// handle is servable after all.
-	if !vi.uncommitted.Load() {
-		return vi, nil
+	if !vi.mode.isBruteForce() {
+		if svi, err := vi.c.loadVectorIndex(tx, vi.info); err == nil {
+			return svi, nil
+		}
 	}
 	return nil, fmt.Errorf("%w: vector index %q", ErrIndexNotFound, vi.info.Name)
 }
@@ -1277,24 +1314,29 @@ func (c *collection) CompactVectorIndex(ctx context.Context, indexName string) e
 		// snapshot mid-tx.
 		c.registerIndexSetRestore(wtx)
 		// Visibility (see forTx): until commit, the compacted roots exist
-		// only in this tx's view — a concurrent reader searches through the
-		// replaced handle, whose namespaces its committed snapshot still
-		// holds. prev stays set past commit (see the field comment).
-		nvi.uncommitted.Store(true)
+		// only in this tx's view. The stamp is the cookie this commit will
+		// publish (MarkSchemaChanged above guarantees the bump) — a
+		// concurrent reader fails the fast path, cannot resolve the new
+		// roots in its snapshot, and searches through prev instead.
+		nvi.validFromCookie = tx.DiskSchemaCookie() + 1
 		// prev must be a COMMITTED fallback: with chained same-tx DDL (create
 		// then compact, or compact twice) the replaced handle is itself
-		// uncommitted and would route concurrent readers onto namespaces that
-		// exist only in this tx's view — inherit the chain's committed tail
-		// instead (nil when the index was created in this tx: nothing
-		// committed to serve, the reader errors as before the DDL began).
+		// pending this tx's commit (stamped past the begin cookie —
+		// single-writer, so only this tx can have published it) and would
+		// route concurrent readers onto namespaces that exist only in this
+		// tx's view — inherit the chain's committed tail instead (nil when
+		// the index was created in this tx: nothing committed to serve, the
+		// reader errors as before the DDL began).
 		prevTarget := vi
-		if vi.uncommitted.Load() {
+		if vi.validFromCookie > tx.DiskSchemaCookie() {
 			prevTarget = vi.prev.Load()
 		}
 		nvi.prev.Store(prevTarget)
 		wtx.onCommitPublish(func() {
-			// Flag before prev — forTx relies on this order (see there).
-			nvi.uncommitted.Store(false)
+			// Committed: readers at the new cookie resolve nvi on the fast
+			// path; drop the chain so predecessors are not pinned. A later
+			// reader on a pre-compaction snapshot is served by forTx's
+			// transient rebuild.
 			nvi.prev.Store(nil)
 		})
 		next := make([]*vectorIndex, len(cur))

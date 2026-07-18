@@ -125,29 +125,35 @@ func (q *collQuery) Sort(sorts ...any) Query {
 }
 
 // visibleIndexes filters the CoW index snapshot down to the handles the given
-// tx may plan with: handles whose creating DDL tx has not committed are
-// excluded (their namespaces exist only in the creator's uncommitted view — a
-// stale-snapshot reader that selected one would scan an empty namespace and
-// return wrong results with no error, e.g. Count = 0 while Iter finds rows,
-// for the whole DDL/backfill window). Single-writer makes the check
-// creator-free: while a pending handle exists, its creating write tx IS the
-// open write tx, so any write-tx view (IsWriteTx) is the creator's own —
-// which must keep seeing the index for same-tx queries — and every other tx
-// skips it. The common case (nothing pending) returns the snapshot unchanged.
+// tx may plan with — decided against the READER'S OWN snapshot, never
+// wall-clock publication state (the OP_Transaction analog; see
+// index.validFromCookie). A handle the snapshot does not contain would scan
+// an empty or foreign namespace and return wrong results with no error
+// (Count = 0 while Iter finds rows): a mid-DDL handle for every concurrent
+// reader, and equally a committed or reconcile-adopted handle for a reader
+// whose snapshot predates it — stale local readers across a local DDL commit
+// or a peer's. The common case (write-tx view, or every handle's stamp at or
+// below the snapshot cookie) returns the snapshot unchanged; only a reader
+// older than some stamp pays the per-handle namespace resolution in
+// visibleTo.
 func visibleIndexes(btx *btree.ReadTx, idxs []*index) []*index {
+	if btx.IsWriteTx() {
+		return idxs
+	}
+	cookie := btx.DiskSchemaCookie()
 	pending := false
 	for _, idx := range idxs {
-		if idx.isUncommitted() {
+		if cookie < idx.validFromCookie {
 			pending = true
 			break
 		}
 	}
-	if !pending || btx.IsWriteTx() {
+	if !pending {
 		return idxs
 	}
 	out := make([]*index, 0, len(idxs)-1)
 	for _, idx := range idxs {
-		if !idx.isUncommitted() {
+		if idx.visibleTo(btx) {
 			out = append(out, idx)
 		}
 	}

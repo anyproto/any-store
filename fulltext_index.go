@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"slices"
-	"sync/atomic"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/btree"
@@ -67,10 +66,10 @@ type ftsIndex struct {
 	// at commit. See fulltext_pending.go.
 	pending ftsPending
 
-	// uncommitted: the creating DDL tx has not committed; other txs must not
-	// search through this handle (empty namespaces in their snapshots). Same
-	// contract as index.uncommitted — see there, visibleTo and visibleIndexes.
-	uncommitted atomic.Bool
+	// validFromCookie: earliest schema cookie at which this handle is KNOWN
+	// visible. Same contract as index.validFromCookie — see there, visibleTo
+	// and visibleIndexes.
+	validFromCookie uint32
 
 	// nFields is the number of indexed fields (== len(fieldPaths)); each token's
 	// field index keys into the FieldMask / per-field TF of the v2 postings.
@@ -186,11 +185,22 @@ func (fx *ftsIndex) bindNamespaces(resolve func(name string) (*btree.Namespace, 
 func (fx *ftsIndex) Info() IndexInfo { return fx.info }
 
 // visibleTo reports whether the given tx may search through this handle — the
-// visibility gate of visibleIndexes, fts-shaped (see index.uncommitted): an
-// uncommitted handle is visible only to its creating write tx (single-writer:
-// any write-tx view).
+// visibility gate of visibleIndexes, fts-shaped (see index.visibleTo): fast
+// path on the write-tx view or a snapshot cookie at or past validFromCookie;
+// an older reader admits the handle only if its OWN snapshot resolves the
+// meta namespace at the bound root. Invisible → ErrNoFulltextIndex at the
+// call sites, exactly as before the CreateIndex began. (metaRootUnchanged has
+// the opposite error bias — keep a working index over a transient view — so
+// the two checks stay separate.)
 func (fx *ftsIndex) visibleTo(tx *btree.ReadTx) bool {
-	return !fx.uncommitted.Load() || tx.IsWriteTx()
+	if tx.IsWriteTx() || tx.DiskSchemaCookie() >= fx.validFromCookie {
+		return true
+	}
+	if fx.nsMeta == nil {
+		return false
+	}
+	ns, err := tx.GetNamespace(ftsNsName(fx.c.name, fx.info.Name, ftsPartMeta))
+	return err == nil && ns.RootPage() == fx.nsMeta.RootPage()
 }
 
 // metaRootUnchanged reports whether the ftx: meta namespace still resolves to
@@ -246,6 +256,12 @@ func (c *collection) reconcileFtsIndexesLocked(tx *btree.ReadTx, infos []IndexIn
 		fx, err := newFtsIndex(c, info)
 		if err == nil {
 			err = fx.bindNamespaces(tx.GetNamespace)
+			// Reconcile runs at tx begin (checkStale), before any of this tx's
+			// writes: the bound state is committed as of this snapshot, so its
+			// cookie is the exact visibility bound. An older concurrent reader
+			// resolves per-snapshot in visibleTo and correctly skips a peer
+			// index its snapshot predates.
+			fx.validFromCookie = tx.DiskSchemaCookie()
 		}
 		if err != nil {
 			// Not resolvable in this snapshot. With no existing object this is
