@@ -156,7 +156,7 @@ func (it *CanonicalKeyDedupIter) String() string {
 //
 // History: consumer-boundary dedup via the multiKey flag (planIterator.Next,
 // ForEachDistinct) replaced an earlier pipeline stage here — see
-// docs/plans/2026-04-29-multikey-bit-and-dedup-pipeline.md — but the boundary
+// any-store-tests:docs/any-store/plans/2026-04-29-multikey-bit-and-dedup-pipeline.md — but the boundary
 // sits ABOVE Sort/Limit, which is exactly where the slots are consumed. The
 // consumer dedup remains as the contract backstop; it sees multiKey=false
 // from this iterator and degenerates to a passthrough.

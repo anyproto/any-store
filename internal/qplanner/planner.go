@@ -1439,8 +1439,7 @@ func buildIndexSeekChain(params *PlanParams, idx *CBOIndex, needFilter, needSort
 	// doc-driven — hence above FetchIter) to filter duplicates before the
 	// sort/limit stages. Compound indexes were already deduped by the
 	// DocDedupIter inserted below the fetch (canonical-key selection across
-	// compound tuples is non-trivial — see
-	// docs/plans/2026-04-17-multikey-index-dedup.md — so they dedup by docId
+	// compound tuples is non-trivial, so they dedup by docId
 	// in first-occurrence order instead). Exactly one of the two wraps is
 	// present per chain; either way the stream reaching SortIter/LimitIter
 	// and the consumers is unique-by-doc, and no per-query map is allocated

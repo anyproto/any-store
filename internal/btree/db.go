@@ -155,7 +155,7 @@ type Options struct {
 	// (XXH3-128 trailer, 16 bytes per page). Mutually exclusive with
 	// Key and Codec — combining them returns an error from Open.
 	// Conceptually mirrors SQLite's cksumvfs extension. See
-	// docs/plans/2026-04-27-cksumvfs-port.md.
+	// docs/btree/specs/integrity.md.
 	Checksum bool
 
 	// OnIntegrityError, if non-nil, is fired by the installed codec

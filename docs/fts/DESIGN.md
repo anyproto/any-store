@@ -265,7 +265,7 @@ To guarantee a correct global top-k the search exhausts the query terms' chunks
 (cheap at our scale: decoding ~100k varint postings is single-digit ms). No
 index-intersection pushdown is built into the postings format.
 
-Phrase / CJK matching (**implemented**, Phase 1 — see `FTS-V2-PLAN.md`) is a
+Phrase / CJK matching (**implemented**, Phase 1 — see `any-store-tests:docs/any-store/fts/FTS-V2-PLAN.md`) is a
 zig-zag merge join on `IntDocID` across the phrase terms' chunks (`termStream`),
 then a positional adjacency check; it scores the phrase as a synthetic term
 (TF = adjacency count, IDF = Σ of constituent IDFs). A CJK run analyzes to
@@ -338,7 +338,7 @@ The real footprint lever is structural, not compression: a positionless
 (`DOCS_AND_FREQS_ONLY`) mode halves the postings (positions are ~50% of them).
 At ~19MB index for 29MB text (with positions), the index is already well-coded.
 
-Implemented since the original v1 cut (Phase 1, `FTS-V2-PLAN.md`): phrase /
+Implemented since the original v1 cut (Phase 1, `any-store-tests:docs/any-store/fts/FTS-V2-PLAN.md`): phrase /
 positional CJK matching; prefix search; boolean require/exclude (`$require` /
 `$exclude`) and `$defaultOperator`.
 

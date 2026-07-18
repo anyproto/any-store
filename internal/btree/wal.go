@@ -3751,7 +3751,7 @@ func (w *wal) checkpointWithMode(dbFile fileHandle, master *masterStore, mode Ch
 			// (key, pgno) pair only sees a given plaintext once per frame,
 			// since each new modification gets a fresh WAL frame with a fresh
 			// nonce — and (b) WAL ciphertext and DB-file ciphertext share
-			// codec, key, and layout. See docs/btree/plans/encryption-plan.md Task 8.
+			// codec, key, and layout. See any-store-tests:docs/any-store/btree/plans/encryption-plan.md Task 8.
 			// Matches SQLCipher wal.c:2309-2315 (OsRead → OsWrite with no
 			// codec hook between them).
 			// END ENCRYPTION

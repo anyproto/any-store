@@ -1625,7 +1625,7 @@ func TestAudit08_CompoundArrayArray_TwoDocsOverlap(t *testing.T) {
 
 // ── Compound-index audit (act-43/44) ──
 /*
-Audit tests for the "compound-index" domain (docs/qplanner/audit/actionable_by_domain.json).
+Audit tests for the "compound-index" domain (any-store-tests:docs/any-store/qplanner/audit/actionable_by_domain.json).
 Rewritten for the btree/v2 cost-based planner (the agent draft targeted SQLite EXPLAIN).
 
   act-43  Whole-tuple reverse of an all-ascending compound index IS realizable by a

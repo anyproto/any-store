@@ -53,7 +53,7 @@
     "sqlite": [
       "backup.c:sqlite3_backup_init"
     ],
-    "note": "minus the handle/name resolution (DRIFT #2 in docs/plans/2026-04-22-sqlite-backup-port.md): takes (dst, src *btree.DB) directly"
+    "note": "minus the handle/name resolution (DRIFT #2 in any-store-tests:docs/any-store/btree/plans/2026-04-22-sqlite-backup-port.md): takes (dst, src *btree.DB) directly"
   },
   "backup.go:putUint32BE": {
     "sqlite": [
@@ -230,7 +230,7 @@
       "btree.c:dropCell",
       "btree.c:sqlite3BtreeDelete"
     ],
-    "note": "now drives delete-time rebalancing: an underfull (\u003e2/3 free) non-empty leaf funnels through balanceNonroot (deleteRebalanceLeaf), matching the balance() call in sqlite3BtreeDelete (btree.c:10005-10010); also ports the cell-drop (dropCell/allocateSpace). Phase 1 — see docs/btree/plans/2026-05-23-delete-time-rebalancing.md"
+    "note": "now drives delete-time rebalancing: an underfull (\u003e2/3 free) non-empty leaf funnels through balanceNonroot (deleteRebalanceLeaf), matching the balance() call in sqlite3BtreeDelete (btree.c:10005-10010); also ports the cell-drop (dropCell/allocateSpace). Phase 1 — see any-store-tests:docs/any-store/btree/plans/2026-05-23-delete-time-rebalancing.md"
   },
   "btree.go:*btree.Get": {
     "sqlite": [],

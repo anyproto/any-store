@@ -1632,7 +1632,7 @@ with `inject.active=false` (`deleteRebalanceLeaf` → `balanceNonroot`, btree.go
 btree.c:8960). The former 2-way `leafSplitPoint` split survives only as the root-leaf fallback
 (`splitRootLeafAndInsert`); `balance_quick` is retained as the rightmost-append fast path
 (below). See `balance.go`'s header for the enumerated index-btree deviations, and
-`docs/btree/plans/2026-05-23-balance-nonroot-3sibling.md` /
+`any-store-tests:docs/any-store/btree/plans/2026-05-23-balance-nonroot-3sibling.md` /
 `2026-05-23-delete-time-rebalancing.md`. Deferred (optional): first-key divider advance on
 delete and retiring the now-dead `tryMergeLeaf`.
 
@@ -1896,7 +1896,7 @@ These SQLite features are intentionally absent:
 ## Online Backup (backup.go)
 
 Port of SQLite's `sqlite3_backup_*` API from `sqlite/src/backup.c`. See
-`docs/plans/2026-04-22-sqlite-backup-port.md` for the full drift
+`any-store-tests:docs/any-store/btree/plans/2026-04-22-sqlite-backup-port.md` for the full drift
 register and C↔Go coverage table. Key entry points:
 
 - `(*DB).BackupInit(src *DB) (*Backup, error)` -- ~ `sqlite3_backup_init`

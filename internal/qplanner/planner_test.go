@@ -1614,10 +1614,9 @@ func TestIndexIter_Coverage_DisjointBoundsTransition(t *testing.T) {
 // A code review of internal/qplanner/index_iter.go:100-174 shows every call
 // to cursor.First/Last/Next/Previous/Seek/Key wraps the result as
 // `if err := ...; err != nil { return nil, nil, err }` — the error is
-// surfaced on every path with no silent-truncation branch. This is tracked
-// as item 19 in docs/plans/2026-04-17-index-test-coverage-gaps.md; a
-// dedicated cursor interface (or an error-injecting exported helper on
-// btree.ReadTx) would be needed to write a direct unit test.
+// surfaced on every path with no silent-truncation branch. A dedicated
+// cursor interface (or an error-injecting exported helper on btree.ReadTx)
+// would be needed to write a direct unit test.
 func TestIndexIter_Next_Coverage_CursorErrorPropagation(t *testing.T) {
 	t.Skip("cannot inject *btree.Cursor error from outside btree package; " +
 		"see internal/qplanner/index_iter.go:100-174 for the propagation pathway")

@@ -20,7 +20,7 @@ import (
 // the outer tx back, let a later collection reuse the freed root page, then
 // use the original name again. Pre-fix, the stale handle stayed registered and
 // a write through it landed inside the OTHER collection while IntegrityCheck
-// stayed green (docs/repro/i11-stale-handle-rollback).
+// stayed green (any-store-tests:docs/any-store/repro/i11-stale-handle-rollback).
 func TestCreateCollectionRollback_EvictsHandle(t *testing.T) {
 	fx := newFixture(t)
 
