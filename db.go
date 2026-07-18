@@ -272,7 +272,6 @@ type db struct {
 	dirtyOnOpen             bool
 	dirtyQuickCheckDuration time.Duration
 	mu                      sync.Mutex
-	writeMu                 sync.Mutex
 }
 
 func collKey(name string) []byte {

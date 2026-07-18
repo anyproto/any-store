@@ -117,12 +117,6 @@ func (m VectorMode) String() string {
 	}
 }
 
-// isIVFPQ reports whether this mode is the btree-resident IVF-PQ index.
-func (m VectorMode) isIVFPQ() bool { return m == VectorModeIVFPQ }
-
-// isIVFSQ reports whether this mode is the btree-resident IVF-SQ index.
-func (m VectorMode) isIVFSQ() bool { return m == VectorModeIVFSQ }
-
 // isIVF reports whether this mode is an IVF index (PQ or SQ) — both share the
 // internal/vivf backend.
 func (m VectorMode) isIVF() bool { return m == VectorModeIVFPQ || m == VectorModeIVFSQ }
@@ -371,9 +365,8 @@ type index struct {
 	nsName     string
 	catalogKey []byte
 
-	keyBuf      anyenc.Tuple
-	keysBuf     []anyenc.Tuple
-	keysBufPrev []anyenc.Tuple
+	keyBuf  anyenc.Tuple
+	keysBuf []anyenc.Tuple
 	// keyBoundsBuf is parallel to keysBuf: keyBoundsBuf[k][L] is the byte offset
 	// in keysBuf[k] just past field L's encoding, so keysBuf[k][:keyBoundsBuf[k][L]]
 	// is the level-L prefix fed to the multi-level sketch.

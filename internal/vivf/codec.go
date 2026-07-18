@@ -180,16 +180,6 @@ func cellKey(buf []byte, listID, label uint32) []byte {
 // cellKeyLabel extracts the label from a :cell key.
 func cellKeyLabel(key []byte) uint32 { return binary.BigEndian.Uint32(key[4:]) }
 
-// cellKeyList extracts the listID from a :cell key.
-func cellKeyList(key []byte) uint32 { return binary.BigEndian.Uint32(key[0:]) }
-
-func labelKey(buf []byte, label uint32) []byte {
-	buf = buf[:0]
-	var b [4]byte
-	binary.BigEndian.PutUint32(b[:], label)
-	return append(buf, b[:]...)
-}
-
 // f32bytes / bytesAsF32 reinterpret float32 slices as host bytes (little-endian
 // amd64/arm64), as internal/vindex/codec.go does.
 func f32bytes(v []float32) []byte {

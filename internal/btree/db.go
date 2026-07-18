@@ -1561,17 +1561,6 @@ func (tx *ReadTx) txDescendChild(childPgno uint32) (*page, error) {
 	return tx.txGetPage(childPgno)
 }
 
-// readOverflow reads overflow chain data using the correct isolation level.
-// Writers use the shared cache (to see their own dirty pages).
-// Readers bypass the cache to avoid polluting it with stale snapshot data
-// that the writer could later read, causing on-disk corruption.
-func (tx *ReadTx) readOverflow(firstPgno uint32, buf []byte) error {
-	if tx.writable {
-		return tx.pager.readOverflowChainAt(firstPgno, buf, tx.walHdr.mxFrame)
-	}
-	return tx.pager.readOverflowChainReader(firstPgno, buf, tx.walHdr.mxFrame, tx.cache)
-}
-
 // AppendValue retrieves a value by key from the given namespace, appending it to buf.
 // Pass nil for buf to allocate a new slice (equivalent to Get).
 func (tx *ReadTx) AppendValue(ns *Namespace, key []byte, buf []byte) ([]byte, error) {

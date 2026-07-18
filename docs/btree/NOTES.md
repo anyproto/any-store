@@ -1606,6 +1606,8 @@ chained hash (`pcache.apHash []*page` + `page.hashNext`), a direct port of
   `pageSize` is immutable after Init, read without mutex via acquire semantics
   from the atomic load. Matches SQLite's mutex-free reads of `pcache1.isInit`
   and `pcache1.szSlot` (`pcache1.c:220-222`).
+  **Status:** the `Initialized()` accessor is removed as unused; the lock-free
+  atomic pattern it documented lives on in `pageSlab.initialized` / `Reset`.
 
 **Future Improvements:**
 - Shrink API (`sqlite3PcacheShrink` equivalent) for external memory pressure

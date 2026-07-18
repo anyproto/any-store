@@ -70,8 +70,7 @@ type StoreIndex struct {
 	// contiguous float32 view of its :cb blob (an arena) rather than nested slices:
 	// opening an index aliases the blob with zero extra allocation instead of
 	// building thousands of per-row/per-codeword slice headers (~m·256 for pqcb),
-	// and the hot loops read them contiguously. Row c of coarse is coarseRow(c);
-	// codeword j of PQ sub-quantizer m is pqSub(m, j).
+	// and the hot loops read them contiguously. Row c of coarse is coarseRow(c).
 	coarse []float32 // nlist·dim
 	pqcb   []float32 // m·pqK·dsub
 
@@ -163,13 +162,6 @@ type searcher struct {
 	byteDist bool
 	qsum     float32
 	qnorm2   float32
-}
-
-// pqSub returns the dsub-length codeword j of PQ sub-quantizer mm (a view into the
-// flat pqcb).
-func (ix *StoreIndex) pqSub(mm, j int) []float32 {
-	o := (mm*pqK + j) * ix.dsub
-	return ix.pqcb[o : o+ix.dsub]
 }
 
 // coarseRow returns coarse centroid c (a view into the flat coarse arena).

@@ -359,7 +359,6 @@ type pScratch struct {
 	out     []candidate
 	nbr     []uint32
 	sel     []candidate
-	naCand  []candidate
 }
 
 func (b *pBuilder) insert(label uint32, sc *pScratch) {

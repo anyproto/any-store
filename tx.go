@@ -281,8 +281,6 @@ func (w writeTx) Done() bool {
 	return w.commonTx.version.Load() != w.version
 }
 
-var savepointIds atomic.Uint64
-
 var savepointPool = &sync.Pool{
 	New: func() any {
 		return &savepointTx{}

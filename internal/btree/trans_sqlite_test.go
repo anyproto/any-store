@@ -89,19 +89,6 @@ func snapshotFromWriteTx(t *testing.T, tx *WriteTx, ns *Namespace) []kvPair {
 	return pairs
 }
 
-// snapshotsEqual compares two snapshots for exact equality.
-func snapshotsEqual(a, b []kvPair) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if !bytes.Equal(a[i].key, b[i].key) || !bytes.Equal(a[i].value, b[i].value) {
-			return false
-		}
-	}
-	return true
-}
-
 // requireSnapshotsEqual asserts two snapshots are exactly equal.
 func requireSnapshotsEqual(t *testing.T, expected, actual []kvPair, msg string) {
 	t.Helper()

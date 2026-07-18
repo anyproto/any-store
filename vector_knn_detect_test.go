@@ -426,10 +426,10 @@ func TestExplain_UnconsideredSourceIndexesCarryNoCost(t *testing.T) {
 	assert.True(t, sawVector, "the vector index must still be listed")
 }
 
-// opaqueWrapKnn and opaqueNotKnn are CUSTOM Filter implementations wrapping a
-// $knn clause — foreign types the detection walk cannot see through, by
-// construction (a walker only knows the library's own node types; arbitrary
-// user code is not introspectable).
+// opaqueWrapKnn is a CUSTOM Filter implementation wrapping a $knn clause — a
+// foreign type the detection walk cannot see through, by construction (a
+// walker only knows the library's own node types; arbitrary user code is not
+// introspectable).
 type opaqueWrapKnn struct{ inner query.Filter }
 
 func (w opaqueWrapKnn) Ok(v *anyenc.Value, b *syncpool.DocBuffer) bool { return w.inner.Ok(v, b) }
@@ -437,14 +437,6 @@ func (w opaqueWrapKnn) IndexBounds(_ string, bs query.Bounds) query.Bounds {
 	return bs
 }
 func (w opaqueWrapKnn) String() string { return "opaque" }
-
-type opaqueNotKnn struct{ inner query.Filter }
-
-func (w opaqueNotKnn) Ok(v *anyenc.Value, b *syncpool.DocBuffer) bool { return !w.inner.Ok(v, b) }
-func (w opaqueNotKnn) IndexBounds(_ string, bs query.Bounds) query.Bounds {
-	return bs
-}
-func (w opaqueNotKnn) String() string { return "opaqueNot" }
 
 // TestKnn_InsideCustomFilterFailsClosed pins the failure DIRECTIONS for a Knn
 // smuggled inside a custom Filter implementation, where detection is

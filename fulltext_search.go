@@ -911,12 +911,7 @@ func ftsGetUint(tx *btree.ReadTx, ns *btree.Namespace, key []byte) (uint64, erro
 	return n, nil
 }
 
-func ftsDocLen(tx *btree.ReadTx, ns *btree.Namespace, docID uint64) (uint32, error) {
-	dl, _, err := ftsDocLenBuf(tx, ns, docID, nil)
-	return dl, err
-}
-
-// ftsDocLenBuf is ftsDocLen with a caller-owned value buffer: the BM25
+// ftsDocLenBuf returns the stored document length, using a caller-owned value buffer: the BM25
 // accumulation loop calls it once per posting, and tx.Get's nil-buffer
 // AppendValue would allocate every time.
 func ftsDocLenBuf(tx *btree.ReadTx, ns *btree.Namespace, docID uint64, buf []byte) (uint32, []byte, error) {
@@ -977,7 +972,6 @@ func (q *collQuery) detectFtsQuery() (*qplanner.FtsQuerySpec, query.Filter, erro
 	}
 	return spec, residual, nil
 }
-
 
 // ftsSorter maps the query's sort to the planner's sorter for a $text query:
 // the default (nil) and the relevance projection {$meta:"textScore"} both yield
