@@ -42,9 +42,9 @@ type SortIter struct {
 	// liveBytes is the sum of keyLen over the entries currently in the heap.
 	// Used by the compaction guard to detect when arena waste (dead bytes left
 	// by evicted entries whose slot could not be reused in place) is large.
-	liveBytes int
-	order     []int // reusable scratch: live-entry indices sorted by arena offset (compaction)
-	PartiallySorted bool // leading index fields match sort order; pdqsort benefits automatically
+	liveBytes       int
+	order           []int // reusable scratch: live-entry indices sorted by arena offset (compaction)
+	PartiallySorted bool  // leading index fields match sort order; pdqsort benefits automatically
 	inited          bool
 	// rawSorter is Sorter's RawSort fast path, resolved once in collectAndSort.
 	// When the source yields no pre-parsed document, the sort key is built by
@@ -63,10 +63,10 @@ type SortIter struct {
 const sortRawFallbackMax = 8
 
 type sortEntry struct {
-	off      uint32 // offset into arena
-	keyLen   uint16 // total length (sort key + docId suffix)
-	docLen   uint16 // docId length (trailing portion)
-	multiKey uint8  // 1 = upstream marked this entry multiKey; 0 = unique. Forwarded as-is on emit so consumer-side DocDedup can skip the seen-set for unique streams.
+	off      uint32   // offset into arena
+	keyLen   uint16   // total length (sort key + docId suffix)
+	docLen   uint16   // docId length (trailing portion)
+	multiKey uint8    // 1 = upstream marked this entry multiKey; 0 = unique. Forwarded as-is on emit so consumer-side DocDedup can skip the seen-set for unique streams.
 	_        [3]uint8 // explicit padding so the struct size stays predictable across archs
 }
 
@@ -88,9 +88,10 @@ func (it *SortIter) Next() (key []byte, docId []byte, multiKey bool, err error) 
 
 	// Clear DocParsed so planIterator.Doc() does a lazy fetch by docId.
 	// collectAndSort() leaves DocParsed pointing at the last collected doc,
-	// which is NOT the doc for this sorted entry.
+	// which is NOT the doc for this sorted entry. DocRaw likewise.
 	if it.Plan != nil {
 		it.Plan.DocParsed = nil
+		it.Plan.DocRaw = nil
 	}
 
 	return docId, docId, e.multiKey == 1, nil
@@ -172,15 +173,22 @@ func (it *SortIter) collectAndSort() error {
 		doc := it.Plan.DocParsed
 		var raw []byte
 		if doc == nil {
-			// Cursor-free point lookup: avoids Cursor allocation
-			var verr error
-			it.Buf.DocBuf, verr = it.Data.AppendValue(docId, it.Buf.DocBuf[:0])
-			if verr != nil {
-				continue
-			}
-			if it.rawSorter != nil {
-				if d, derr := it.Buf.Parser.DecodedDoc(it.Buf.DocBuf); derr == nil {
-					raw = d
+			// Decoded bytes handed over by a RawForSort FullScanIter: the
+			// scan cursor already read the row, so no point lookup is needed.
+			if it.Plan.DocRaw != nil {
+				raw = it.Plan.DocRaw
+				it.Plan.DocRaw = nil
+			} else {
+				// Cursor-free point lookup: avoids Cursor allocation
+				var verr error
+				it.Buf.DocBuf, verr = it.Data.AppendValue(docId, it.Buf.DocBuf[:0])
+				if verr != nil {
+					continue
+				}
+				if it.rawSorter != nil {
+					if d, derr := it.Buf.Parser.DecodedDoc(it.Buf.DocBuf); derr == nil {
+						raw = d
+					}
 				}
 			}
 		}

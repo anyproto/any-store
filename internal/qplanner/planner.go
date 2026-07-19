@@ -49,6 +49,12 @@ type Plan struct {
 	Root      Iterator
 	DocParsed *anyenc.Value // set by FilterIter/FetchIter/FullScanIter after parsing
 
+	// DocRaw is the current row's decoded (s2-decompressed) document bytes,
+	// set by a RawForSort FullScanIter instead of parsing. Consumed — and
+	// cleared — by SortIter's raw sort-key path. Valid only until the next
+	// row's decode: the bytes live in the parser's decode buffer.
+	DocRaw []byte
+
 	// Distances is the per-document ANN distance sidecar for a vector query
 	// (docId bytes -> distance). Populated by VectorIter; consumed by the
 	// public iterator's Distance(). nil for non-vector plans.
@@ -1237,6 +1243,19 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 	}
 
 	if needSort && !idSorted {
+		// Filterless (nil/match-all) scan feeding a raw-capable sorter: the
+		// installed match-all filter would force a full parse of every row
+		// only to read the sort fields. Drop it and let the scan hand decoded
+		// bytes to the SortIter (Plan.DocRaw), whose RawSort path seeks just
+		// the sort fields. Rows are only ever accepted either way.
+		if !needFilter {
+			if fsi, isScan := root.(*FullScanIter); isScan {
+				if _, isRaw := params.Sorter.(query.RawSort); isRaw {
+					fsi.Filter = nil
+					fsi.RawForSort = true
+				}
+			}
+		}
 		root = &SortIter{
 			Source: root,
 			Data: &CursorSource{
