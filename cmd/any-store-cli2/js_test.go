@@ -285,6 +285,14 @@ func Test_Js(t *testing.T) {
 			},
 		})
 	})
+	t.Run("find with Knn constructor", func(t *testing.T) {
+		assertCmd(t, `db.coll.find({emb: Knn([1,2], 10, {ef: 200})})`, Cmd{
+			Cmd:        "find",
+			Collection: "coll",
+			// Key order is otto's JSON.stringify ordering; not semantically meaningful.
+			Query:      Query{Find: json.RawMessage(`{"emb":{"$knn":{"$ef":200,"$k":10,"$query":[1,2]}}}`)},
+		})
+	})
 	t.Run("findId with ObjectId constructor", func(t *testing.T) {
 		assertCmd(t, `db.coll.findId(ObjectId("0123456789abcdef01234567"))`, Cmd{
 			Cmd:        "findId",

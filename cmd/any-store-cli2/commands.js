@@ -22,7 +22,7 @@ function Vector(values) {
 // A bare Vector([...]) equality on a vector-indexed field is no longer an ANN
 // query (it errors, ErrLegacyVectorClause) — the k must be stated.
 function Knn(queryVec, k, opts) {
-    const clause = {"$query": queryVec, "$k": k};
+    var clause = {"$query": queryVec, "$k": k};
     if (opts && opts.ef !== undefined) {
         clause["$ef"] = opts.ef;
     }
