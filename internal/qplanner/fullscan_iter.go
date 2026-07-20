@@ -23,6 +23,11 @@ type FullScanIter struct {
 	Offset   int // batch-skip offset (only when Filter == nil)
 	Reverse  bool
 	started  bool
+	// RawForSort hands each row's decoded document bytes to the SortIter
+	// directly above via Plan.DocRaw instead of parsing it — the sort key is
+	// then extracted by the RawSort seek path. Set by the planner only for a
+	// filterless (nil/match-all) full scan feeding a RawSort sorter.
+	RawForSort bool
 	// rawFilter is Filter's RawFilter fast path, resolved once on the first
 	// Next (see checkFilter). nil when Filter doesn't implement it. The raw
 	// walk only pays off on REJECTED documents (accepted ones still get the
@@ -98,7 +103,7 @@ func (it *FullScanIter) nextNoBounds() (key []byte, docId []byte, multiKey bool,
 					return nil, nil, false, err
 				}
 				// FullScan walks the data namespace; docId is the primary key — unique by construction.
-			return k, k, false, nil
+				return k, k, false, nil
 			}
 		} else {
 			if it.Reverse {
@@ -255,6 +260,20 @@ func (it *FullScanIter) advanceBound() {
 
 func (it *FullScanIter) checkFilter() (ok bool, err error) {
 	if it.Filter == nil {
+		if it.RawForSort && it.Plan != nil {
+			// Load the row at the cursor and hand the decoded bytes to the
+			// SortIter above. A decode error leaves DocRaw nil: SortIter then
+			// falls back to its own point-lookup path, which reproduces the
+			// error handling of the non-raw pipeline.
+			it.Buf.DocBuf, err = it.cursor.AppendValue(it.Buf.DocBuf[:0])
+			if err != nil {
+				return false, err
+			}
+			it.Plan.DocRaw = nil
+			if raw, derr := it.Buf.Parser.DecodedDoc(it.Buf.DocBuf); derr == nil {
+				it.Plan.DocRaw = raw
+			}
+		}
 		return true, nil
 	}
 	it.Buf.DocBuf, err = it.cursor.AppendValue(it.Buf.DocBuf[:0])

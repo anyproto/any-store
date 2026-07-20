@@ -49,6 +49,12 @@ type Plan struct {
 	Root      Iterator
 	DocParsed *anyenc.Value // set by FilterIter/FetchIter/FullScanIter after parsing
 
+	// DocRaw is the current row's decoded (s2-decompressed) document bytes,
+	// set by a RawForSort FullScanIter instead of parsing. Consumed — and
+	// cleared — by SortIter's raw sort-key path. Valid only until the next
+	// row's decode: the bytes live in the parser's decode buffer.
+	DocRaw []byte
+
 	// Distances is the per-document ANN distance sidecar for a vector query
 	// (docId bytes -> distance). Populated by VectorIter; consumed by the
 	// public iterator's Distance(). nil for non-vector plans.
@@ -1237,6 +1243,19 @@ func buildFullScanChain(params *PlanParams, needFilter, needSort bool) Iterator 
 	}
 
 	if needSort && !idSorted {
+		// Filterless (nil/match-all) scan feeding a raw-capable sorter: the
+		// installed match-all filter would force a full parse of every row
+		// only to read the sort fields. Drop it and let the scan hand decoded
+		// bytes to the SortIter (Plan.DocRaw), whose RawSort path seeks just
+		// the sort fields. Rows are only ever accepted either way.
+		if !needFilter {
+			if fsi, isScan := root.(*FullScanIter); isScan {
+				if _, isRaw := params.Sorter.(query.RawSort); isRaw {
+					fsi.Filter = nil
+					fsi.RawForSort = true
+				}
+			}
+		}
 		root = &SortIter{
 			Source: root,
 			Data: &CursorSource{
@@ -1525,7 +1544,13 @@ func buildIndexScanChain(params *PlanParams, idx *CBOIndex, needFilter bool) Ite
 		Buf:    params.Buf,
 	}
 
-	if needFilter {
+	// Covering elision: when the index-side checks (bound prefix +
+	// IndexFilterIter equality fields) fully and exactly represent the
+	// filter, the FilterIter re-evaluation is redundant per accepted entry.
+	// Same principle as the covering count elision in buildIndexSeekChain;
+	// SQLite analog: index-consumed WHERE terms are TERM_CODED and never
+	// re-evaluated.
+	if needFilter && !indexScanCoversFilter(idx, coverFilters, params.Filter) {
 		root = &FilterIter{
 			Source: root,
 			Data:   scanDataSrc,
@@ -1681,6 +1706,40 @@ func indexCoversFilter(idx *CBOIndex, filter query.Filter) bool {
 	// And.IndexBounds then over-approximates and the fast path skips the
 	// FilterIter that would trim the result.
 	for _, field := range boundedFields {
+		if countFilterFieldPreds(filter, field) > 1 {
+			return false
+		}
+	}
+	return true
+}
+
+// indexScanCoversFilter reports whether an ordered-scan chain's index-side
+// checks fully and exactly represent filter, making the post-fetch FilterIter
+// redundant. Two enforcement channels cover a field: the contiguous bound
+// prefix (enforced by IndexIter's Bounds, exactly like indexCoversFilter) and
+// the IndexFilterIter equality fields (byte-equality on the stored key value;
+// coveringFilterFields only emits a field when its bounds are a single fixed
+// point, i.e. the predicate's exact image). Entry-level equality implies
+// doc-level match under array-element semantics, and per-doc duplicates are
+// handled by the dedup wraps that are present regardless of the FilterIter.
+// The single-predicate condition rejects fields whose combined bounds
+// over-approximate (see indexCoversFilter condition 2).
+func indexScanCoversFilter(idx *CBOIndex, coverFilters []IndexFieldFilter, filter query.Filter) bool {
+	if filter == nil || len(coverFilters) == 0 {
+		return false
+	}
+	var fields []string
+	if len(idx.Bounds) > 0 {
+		fields = append(fields, idx.Info.FieldNames[:min(idx.BoundFields, len(idx.Info.FieldNames))]...)
+	}
+	for _, f := range coverFilters {
+		fields = append(fields, idx.Info.FieldNames[f.FieldIdx])
+	}
+	hasFields := false
+	if ok := filterFieldsCoveredBy(filter, fields, &hasFields); !ok || !hasFields {
+		return false
+	}
+	for _, field := range fields {
 		if countFilterFieldPreds(filter, field) > 1 {
 			return false
 		}

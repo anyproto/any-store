@@ -2547,7 +2547,7 @@ func TestIndex_LimitOffset_OffsetLargerThanResultSet_InMemorySort(t *testing.T) 
 	t.Run("offset_equals_size", func(t *testing.T) {
 		ex, err := coll.Find(nil).Sort("a").Offset(10).Limit(5).Explain(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, "FullScan(filtered) -> TopK(15) -> Limit(offset=10,limit=5)", ex.Sql)
+		assert.Equal(t, "FullScan -> TopK(15) -> Limit(offset=10,limit=5)", ex.Sql)
 
 		got := collectA(coll.Find(nil).Sort("a").Offset(10).Limit(5))
 		assert.Len(t, got, 0)
@@ -2563,7 +2563,7 @@ func TestIndex_LimitOffset_OffsetLargerThanResultSet_InMemorySort(t *testing.T) 
 	t.Run("limit_larger_than_result", func(t *testing.T) {
 		ex, err := coll.Find(nil).Sort("a").Limit(100).Explain(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, "FullScan(filtered) -> TopK(100) -> Limit(100)", ex.Sql)
+		assert.Equal(t, "FullScan -> TopK(100) -> Limit(100)", ex.Sql)
 
 		got := collectA(coll.Find(nil).Sort("a").Limit(100))
 		assert.Equal(t, []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, got)
@@ -2617,7 +2617,7 @@ func TestIndex_LimitOffset_TopKStability_DuplicateKeys_NonIndexedSort(t *testing
 		// Confirm the eviction-active TopK path is taken (15 < 30 rows).
 		ex, err := coll.Find(nil).Sort("a").Offset(7).Limit(8).Explain(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, "FullScan(filtered) -> TopK(15) -> Limit(offset=7,limit=8)", ex.Sql)
+		assert.Equal(t, "FullScan -> TopK(15) -> Limit(offset=7,limit=8)", ex.Sql)
 
 		run1 := collectIDs(coll.Find(nil).Sort("a").Offset(7).Limit(8))
 		run2 := collectIDs(coll.Find(nil).Sort("a").Offset(7).Limit(8))
@@ -2725,7 +2725,7 @@ func TestIndex_LimitOffset_ExplainTokens_TopKvsSort(t *testing.T) {
 
 		ex, err := coll.Find(nil).Sort("a").Limit(5).Explain(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, "FullScan(filtered) -> TopK(5) -> Limit(5)", ex.Sql)
+		assert.Equal(t, "FullScan -> TopK(5) -> Limit(5)", ex.Sql)
 		assert.Contains(t, ex.Sql, "TopK(5)")
 		assert.NotContains(t, ex.Sql, "-> Sort")
 
@@ -2744,7 +2744,7 @@ func TestIndex_LimitOffset_ExplainTokens_TopKvsSort(t *testing.T) {
 
 		ex, err := coll.Find(nil).Sort("a").Explain(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, "FullScan(filtered) -> Sort", ex.Sql)
+		assert.Equal(t, "FullScan -> Sort", ex.Sql)
 		assert.Contains(t, ex.Sql, "-> Sort")
 		assert.NotContains(t, ex.Sql, "TopK")
 	})
@@ -2760,7 +2760,7 @@ func TestIndex_LimitOffset_ExplainTokens_TopKvsSort(t *testing.T) {
 
 		ex, err := coll.Find(nil).Sort("-a").Offset(5).Limit(5).Explain(ctx)
 		require.NoError(t, err)
-		assert.Equal(t, "FullScan(filtered) -> TopK(10) -> Limit(offset=5,limit=5)", ex.Sql)
+		assert.Equal(t, "FullScan -> TopK(10) -> Limit(offset=5,limit=5)", ex.Sql)
 		assert.Contains(t, ex.Sql, "TopK(10)")
 		assert.NotContains(t, ex.Sql, "-> Sort")
 	})
