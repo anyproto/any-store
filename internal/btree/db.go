@@ -819,14 +819,30 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 	localSC := db.localSchemaCookie.Load()
 	fcc := localFCC
 	sc := localSC
+	snapFCC, snapSC := localFCC, localSC
 	if readCounters {
-		// Read on-disk counters for staleness detection.
-		fcc, sc, err = db.pager.readHeaderCounters(maxFrame)
+		// Read on-disk counters for staleness detection (raised to the
+		// newest committed frame so peer commits are noticed).
+		var effMax uint32
+		fcc, sc, effMax, err = db.pager.readHeaderCountersRaised(maxFrame)
 		if err != nil {
 			db.pager.endRead(slot)
 			db.mu.RUnlock()
 			<-db.readerSem
 			return nil, err
+		}
+		// Snapshot-bounded pair: identical to the raised read unless the
+		// bound was actually raised (rare: begin racing a commit, or a
+		// pinned reader slot) — only then pay a second bounded read.
+		snapFCC, snapSC = fcc, sc
+		if effMax != maxFrame {
+			snapFCC, snapSC, err = db.pager.readHeaderCountersAt(maxFrame, minFrame)
+			if err != nil {
+				db.pager.endRead(slot)
+				db.mu.RUnlock()
+				<-db.readerSem
+				return nil, err
+			}
 		}
 	}
 
@@ -897,6 +913,8 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 	tx.diskSchemaCookie = sc
 	tx.localFileChangeCounter = localFCC
 	tx.localSchemaCookie = localSC
+	tx.snapFileChangeCounter = snapFCC
+	tx.snapSchemaCookie = snapSC
 	return tx, nil
 }
 
@@ -1032,6 +1050,10 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	tx.ReadTx.writable = true
 	tx.ReadTx.diskFileChangeCounter = fcc
 	tx.ReadTx.diskSchemaCookie = sc
+	// The write lock excludes concurrent commits: the writer's snapshot IS
+	// the latest state, so the snapshot-bounded pair equals the disk pair.
+	tx.ReadTx.snapFileChangeCounter = fcc
+	tx.ReadTx.snapSchemaCookie = sc
 	tx.ReadTx.localFileChangeCounter = db.localFileChangeCounter.Load()
 	tx.ReadTx.localSchemaCookie = db.localSchemaCookie.Load()
 	tx.dataChanged = false   // pool reuse safety
@@ -1529,6 +1551,15 @@ type ReadTx struct {
 	diskSchemaCookie       uint32
 	localFileChangeCounter uint32 // snapshot of DB's local value
 	localSchemaCookie      uint32 // snapshot of DB's local value
+	// Snapshot-bounded page-1 counters, baked at begin: what THIS tx's tree
+	// reads can actually see. Equal to the disk pair unless the begin-time
+	// read was raised past the snapshot (begin racing a commit, or a pinned
+	// reader slot) — the disk pair serves staleness DETECTION, this pair
+	// serves judgments about snapshot CONTENTS (visibility bounds, staleness
+	// consumption). On a counterless fast begin both pairs are the seeded
+	// local values (see BeginReadFast's contract).
+	snapFileChangeCounter uint32
+	snapSchemaCookie      uint32
 	closed                 bool
 	writable               bool // true when embedded in a WriteTx (MVCC: allows seeing dirty pages)
 }
@@ -1971,21 +2002,27 @@ func (tx *ReadTx) DiskSchemaCookie() uint32 {
 }
 
 // SnapshotHeaderCounters returns the page-1 FileChangeCount and SchemaCookie
-// as of THIS tx's snapshot (bounded by its begin-captured
-// [walMinFrame, walMaxFrame] window, both sides fixed for the tx's life —
-// SQLite's pWal->minFrame/mxFrame). Unlike
+// as of THIS tx's snapshot — baked at begin from the tx's captured
+// [walMinFrame, walMaxFrame] window, both sides fixed for the tx's life
+// (SQLite's pWal->minFrame/mxFrame). Unlike
 // DiskFileChangeCounter/DiskSchemaCookie — whose begin-time read is raised to
 // the newest committed frame so staleness detection notices peer commits —
 // these values never exceed what the tx's tree reads can actually see: a
 // begin that raced a commit, or a reader slot pinned to an older snapshot,
 // reports the older counters here. Judgments about snapshot contents (e.g.
 // whether a catalog key committed at cookie C must be visible) require this
-// bound, not the raised one.
+// bound, not the raised one. Field reads: no I/O, safe on hot paths.
 func (tx *ReadTx) SnapshotHeaderCounters() (fileChangeCount, schemaCookie uint32, err error) {
 	if tx.closed {
 		return 0, 0, ErrTxClosed
 	}
-	return tx.pager.readHeaderCountersAt(tx.walHdr.mxFrame, tx.walMinFrame)
+	return tx.snapFileChangeCounter, tx.snapSchemaCookie, nil
+}
+
+// SnapshotSchemaCookie is the schema-cookie half of SnapshotHeaderCounters
+// without the error plumbing — for per-query visibility checks.
+func (tx *ReadTx) SnapshotSchemaCookie() uint32 {
+	return tx.snapSchemaCookie
 }
 
 // Rollback ends the read transaction (for ReadTx, this is the same as commit).
