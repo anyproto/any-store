@@ -113,9 +113,10 @@ func (bt *btree) getPage(pgno uint32) (*page, error) {
 // moveToChild's `pPage->nCell<1 -> SQLITE_CORRUPT_PGNO` guard (btree.c:5477-5482,
 // inlined at btree.c:6253-6258). On a valid any-store tree this is unreachable —
 // the delete-rebalance cascade (completeMergeUpward) never persists a zero-cell
-// non-root interior, and a 0-cell interior root is the empty-tree sentinel that
-// callers handle before descending — so this is pure corruption-hardening (see
-// the drift-11 invariant test, docs/btree/NOTES.md#drift-11-movetochild-child-page-ncell-greater-than-equal-one-descent-).
+// non-root interior, and the one legal 0-cell interior is page 1 as root (the
+// skipped balance-shallower collapse), which callers route via rightChild before
+// descending — so this is pure corruption-hardening (see the drift-11 invariant
+// test, docs/btree/NOTES.md#drift-11-movetochild-child-page-ncell-greater-than-equal-one-descent-).
 // Without it, searchInterior on a corrupt n==0 interior would dereference the
 // cleared first cell-pointer slot as a bogus child pgno instead of routing to
 // rightChild; failing fast here yields ErrCorrupt instead of a wild descent.
@@ -745,6 +746,17 @@ func (bt *btree) interiorCellFullKey(data []byte, offset int, usableSize int) (k
 // with tests. It does not support overflow keys. Use bt.searchInterior instead.
 func searchInteriorPage(pg *page, key []byte) (childPgno uint32, cellIdx int, err error) {
 	n := int(pg.header.cellCount)
+	// 0-cell interior: the whole tree lives under rightChild. Legal only on
+	// page 1, where collapseSingleChild may skip the balance-shallower collapse
+	// (child too full to absorb the 100-byte header offset); anywhere else it is
+	// corruption. Mirrors moveToRoot (btree.c:5606-5613): `if( pRoot->pgno!=1 )
+	// return SQLITE_CORRUPT_BKPT` then descend into rightChild.
+	if n == 0 {
+		if pg.pgno != 1 {
+			return 0, 0, ErrCorrupt
+		}
+		return pg.header.rightChild, 0, nil
+	}
 	data := pg.data
 	dataLen := len(data)
 	cpOff := pg.cellPointerOffset()
@@ -801,6 +813,13 @@ func searchInteriorPage(pg *page, key []byte) (childPgno uint32, cellIdx int, er
 // with overflow key support. Used by ReadTx which doesn't have a btree struct.
 func searchInteriorWithOverflow(pg *page, key []byte, usableSize int, p *pager, walMaxFrame uint32, cache *pcache) (childPgno uint32, cellIdx int, err error) {
 	n := int(pg.header.cellCount)
+	// 0-cell interior: page 1 only, descend rightChild (see searchInteriorPage).
+	if n == 0 {
+		if pg.pgno != 1 {
+			return 0, 0, ErrCorrupt
+		}
+		return pg.header.rightChild, 0, nil
+	}
 	data := pg.data
 	dataLen := len(data)
 	cpOff := pg.cellPointerOffset()
@@ -1059,6 +1078,13 @@ func interiorFullKey(data []byte, offset int, usableSize int, p *pager, walMaxFr
 // DRIFT: descent omits moveToChild's per-child nCell>=1 corruption guard See docs/btree/NOTES.md#drift-11-movetochild-child-page-ncell-greater-than-equal-one-descent-
 func (bt *btree) searchInterior(pg *page, key []byte) (childPgno uint32, cellIdx int, err error) {
 	n := int(pg.header.cellCount)
+	// 0-cell interior: page 1 only, descend rightChild (see searchInteriorPage).
+	if n == 0 {
+		if pg.pgno != 1 {
+			return 0, 0, ErrCorrupt
+		}
+		return pg.header.rightChild, 0, nil
+	}
 	data := pg.data
 	dataLen := len(data)
 	cpOff := pg.cellPointerOffset()
@@ -2884,7 +2910,7 @@ func (bt *btree) deleteRebalanceLeaf(leafPgno uint32, path []pathEntry) error {
 // parent (rebuilt in place by balanceNonroot, so its page number is stable);
 // parentPath is the ancestor chain strictly above it.
 //
-//	(b) Balance-shallower (btree.c:8960-8985): if the merge emptied the parent's
+//	(b) Balance-shallower (btree.c:8942-8967): if the merge emptied the parent's
 //	    divider array it now has a single child. Collapse it — absorb the child
 //	    into this page and free the child, removing one tree level. This reuses
 //	    collapseSingleChild (the same operation finishParentRemoval performs for
@@ -2910,7 +2936,7 @@ func (bt *btree) completeMergeUpward(pgno uint32, parentPath []pathEntry) error 
 
 	nCell := int(pg.header.cellCount)
 
-	// (b) Balance-shallower — ROOT ONLY (SQLite gates on isRoot, btree.c:8960). A
+	// (b) Balance-shallower — ROOT ONLY (SQLite gates on isRoot, btree.c:8942). A
 	// 0-cell root has a single child: absorb it, dropping a tree level (uniformly,
 	// so all leaves stay equidistant from the new root). A NON-root 0-cell interior
 	// must NOT be collapsed in place — collapseSingleChild copies the child's header
@@ -3317,7 +3343,7 @@ func (bt *btree) removeChildFromParent(childPgno uint32, path []pathEntry) error
 			// asserted impossibility (a non-root single-child interior pointing
 			// at a freed page never persists: btree.c:9000-9004 frees surplus
 			// apOld pages only after editPage re-homes their cells, and the
-			// shallower collapse is isRoot-gated, btree.c:8960). Persisting the
+			// shallower collapse is isRoot-gated, btree.c:8942). Persisting the
 			// no-op would leave rightChild dangling at the freed page and
 			// double-free it downstream (collapseSingleChild getPage(freed) +
 			// freePage(freed)). Reject as corruption instead. Defensively
@@ -3349,7 +3375,7 @@ func (bt *btree) removeChildFromParent(childPgno uint32, path []pathEntry) error
 //   - otherwise: rebuild the interior page in place.
 func (bt *btree) finishParentRemoval(parentPg *page, cells []cellData, rightChild uint32) error {
 	// If parent is now an empty interior page (0 cells = single child), collapse —
-	// but ONLY at the root. Balance-shallower (SQLite btree.c:8960-8985) shortens
+	// but ONLY at the root. Balance-shallower (SQLite btree.c:8942-8967) shortens
 	// all leaves uniformly only when applied at the root. Collapsing a NON-root
 	// single-child interior in place (collapseSingleChild copies the child's
 	// header, incl. type) makes this subtree one level shallower than its siblings
@@ -3384,7 +3410,7 @@ func (bt *btree) finishParentRemoval(parentPg *page, cells []cellData, rightChil
 // empty-leaf-removal path) AND the delete-rebalance merge path
 // (rewriteParentAfterBalance), satisfying spec §4b ("reuse finishParentRemoval
 // for balance-shallower"). It is the any-store analogue of SQLite copyNodeContent
-// + freePage (btree.c:8984-8985 for the root, the do-loop grandparent gather for
+// + freePage (btree.c:8966-8967 for the root, the do-loop grandparent gather for
 // a non-root). It always releases parentPg.
 //
 // Page 1 needs special handling: it carries the 100-byte DB header, so cell
@@ -3392,8 +3418,13 @@ func (bt *btree) finishParentRemoval(parentPg *page, cells []cellData, rightChil
 // page header + cell pointers shift from offset 0 (child) to offset 100 (page 1).
 // The child was just rebuilt by rebuildInteriorPage / rebuildLeafPage and is
 // therefore already defragmented (content packed at the top), so SQLite's
-// explicit defragmentPage(apNew[0]) before the copy (btree.c:8977) is
+// explicit defragmentPage(apNew[0]) before the copy (btree.c:8960) is
 // unnecessary — spec §4b adaptation.
+//
+// When the child lacks the free bytes to absorb page 1's header offset, the
+// collapse is skipped (SQLite's `hdrOffset<=nFree` gate, btree.c:8942): parentPg
+// is rebuilt as a 0-cell interior whose rightChild is childPgno — page 1's legal
+// "virtual root" shape — and the child is NOT freed.
 func (bt *btree) collapseSingleChild(parentPg *page, childPgno uint32) error {
 	childPg, err := bt.getPage(childPgno)
 	if err != nil {
@@ -3408,6 +3439,28 @@ func (bt *btree) collapseSingleChild(parentPg *page, childPgno uint32) error {
 		iData := int(binary.BigEndian.Uint16(childPg.data[5:7]))
 		if iData == 0 {
 			iData = pageSize
+		}
+
+		// The child must have >= dbHeaderSize free bytes between its cell-pointer
+		// array and content area to absorb page 1's header offset — otherwise the
+		// shifted pointer array would overwrite cell content. SQLite gates the
+		// collapse on `pParent->hdrOffset <= apNew[0]->nFree` (btree.c:8942) and
+		// skips it when the child is too full: the root stays a legal 0-cell
+		// interior page with a single right child (moveToRoot's page-1-only
+		// virtual-root case, btree.c:5606-5613), and a later balance retries the
+		// collapse once the child has drained. The gap below equals SQLite's
+		// post-defragment nFree (btree.c:8960-8964 assert) when the child was
+		// just rebuilt packed (the merge path); on the empty-leaf-removal path
+		// the child may carry fragment bytes, making the gap an undercount of
+		// nFree — the skip is then merely conservative and a later balance
+		// collapses once the child drains. The copy itself is layout-exact
+		// either way (content bytes stay at their absolute offsets).
+		cpEnd := childPg.header.headerSize() + int(childPg.header.cellCount)*2
+		if iData-cpEnd < dbHeaderSize {
+			bt.pager.releasePage(childPg)
+			err = bt.rebuildInteriorPage(parentPg, nil, childPgno)
+			bt.pager.releasePage(parentPg)
+			return err
 		}
 
 		// Clear page 1 content area (preserve DB header).
@@ -3545,7 +3598,6 @@ func (c *Cursor) releasePages() {
 
 // First positions the cursor at the first (smallest) key.
 // DRIFT: descent omits moveToChild's per-child nCell>=1 corruption guard See docs/btree/NOTES.md#drift-11-movetochild-child-page-ncell-greater-than-equal-one-descent-
-// DRIFT: First/Last treat 0-cell interior (incl. non-page-1 root) as empty, not corrupt See docs/btree/NOTES.md#drift-13-empty-interior-root-treated-as-empty-btree-not-corruption
 func (c *Cursor) First() error {
 	c.releasePages()
 	c.stack = c.stack[:0]
@@ -3559,8 +3611,27 @@ func (c *Cursor) First() error {
 	// Descend to leftmost leaf (mirrors SQLite's moveToLeftmost via moveToChild).
 	for pg.header.isInterior() {
 		if pg.header.cellCount == 0 {
+			// 0-cell interior: page 1 only — the tree lives under rightChild
+			// (collapseSingleChild may skip the page-1 collapse); anywhere else
+			// it is corruption. Mirrors moveToRoot (btree.c:5606-5613). cellIdx
+			// 0 == cellCount is the rightChild position, matching Next/Prev
+			// frame semantics; descendChild rejects rightChild==0.
+			if pg.pgno != 1 {
+				c.bt.pager.releasePage(pg)
+				return ErrCorrupt
+			}
+			if len(c.stack) >= btCursorMaxDepth-1 {
+				c.bt.pager.releasePage(pg)
+				return ErrCorrupt
+			}
+			c.stack = append(c.stack, cursorFrame{pgno: pg.pgno, cellIdx: 0})
+			childPgno := pg.header.rightChild
 			c.bt.pager.releasePage(pg)
-			return nil
+			pg, err = c.bt.descendChild(childPgno)
+			if err != nil {
+				return err
+			}
+			continue
 		}
 		if len(c.stack) >= btCursorMaxDepth-1 {
 			c.bt.pager.releasePage(pg)
@@ -3592,7 +3663,6 @@ func (c *Cursor) First() error {
 
 // Last positions the cursor at the last (largest) key.
 // DRIFT: descent omits moveToChild's per-child nCell>=1 corruption guard See docs/btree/NOTES.md#drift-11-movetochild-child-page-ncell-greater-than-equal-one-descent-
-// DRIFT: First/Last treat 0-cell interior (incl. non-page-1 root) as empty, not corrupt See docs/btree/NOTES.md#drift-13-empty-interior-root-treated-as-empty-btree-not-corruption
 func (c *Cursor) Last() error {
 	c.releasePages()
 	c.stack = c.stack[:0]
@@ -3606,6 +3676,12 @@ func (c *Cursor) Last() error {
 	// Descend to rightmost leaf (mirrors SQLite's moveToRightmost via moveToChild).
 	for pg.header.isInterior() {
 		n := int(pg.header.cellCount)
+		// 0-cell interior: page 1 only (see Cursor.First / moveToRoot,
+		// btree.c:5606-5613). The rightChild descent below already routes it.
+		if n == 0 && pg.pgno != 1 {
+			c.bt.pager.releasePage(pg)
+			return ErrCorrupt
+		}
 		if len(c.stack) >= btCursorMaxDepth-1 {
 			c.bt.pager.releasePage(pg)
 			return ErrCorrupt

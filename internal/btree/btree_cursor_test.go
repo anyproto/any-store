@@ -474,33 +474,29 @@ func TestDelCurCov_NonRootEmptyInterior(t *testing.T) {
 	require.Equal(t, 0, countKeys(t, db, "t1"))
 }
 
-// TestCursorEmptyInteriorRootInvariant pins the empty-interior-root invariant:
-// a cursor must never land on (or stop short at) a 0-cell interior ROOT that
-// carries a NON-empty subtree while a populated path exists. First/Next treat
-// a 0-cell interior as terminal-empty (by design — see
-// docs/btree/NOTES.md#drift-13-empty-interior-root-treated-as-empty-btree-not-corruption);
-// that is only safe because the production Delete path never persists such a
-// shape on a populated path. This test pins both halves of that contract:
+// TestCursorEmptyInteriorRootInvariant pins the 0-cell-interior-root contract,
+// mirroring SQLite's moveToRoot (btree.c:5606-5613): the shape is a legal
+// "virtual root" ONLY on page 1 (where collapseSingleChild may skip the
+// balance-shallower collapse because the child cannot absorb the 100-byte
+// header offset); on any other page a 0-cell interior root is corruption
+// (`if( pRoot->pgno!=1 ) return SQLITE_CORRUPT_BKPT`, btree.c:5610). The test
+// pins both halves of that contract:
 //
-//  1. The synthetic shape the by-design treatment relies on being unreachable:
-//     a hand-built 0-cell interior root whose rightChild leads to real data.
-//     We assert exactly how First/Next vs Last/Previous diverge on it, so the
-//     asymmetry is tested and any change to the terminal-empty treatment is
-//     caught here rather than silently dropping data in production.
+//  1. Synthetic non-page-1 shape: a hand-built 0-cell interior root whose
+//     rightChild leads to real data must be rejected as ErrCorrupt by BOTH
+//     First and Last — never silently reported empty (which would hide live
+//     data) and never traversed as if valid.
 //
 //  2. The production invariant itself: a heavy, realistic delete cascade over a
 //     3-level tree, asserting after every commit that the full forward
 //     iteration (First+Next) returns the exact, complete remaining set. If any
 //     delete ever left a 0-cell interior root above live data on the leftmost
-//     path, First/Next would under-report here and the test would fail.
+//     path, First/Next would error or under-report here and the test would fail.
+//
+// The page-1 half of the contract (degenerate master root routed via
+// rightChild) is exercised by TestDeleteNamespaceMasterRootCollapse.
 func TestCursorEmptyInteriorRootInvariant(t *testing.T) {
-	// ---- Part 1: synthetic 0-cell interior root over a populated subtree ----
-	//
-	// Build the exact "legitimate degenerate interior" shape that
-	// IntegrityCheck accepts (integrity.go descends rightChild when nCells==0)
-	// and that Last descends: a 0-cell interior root whose rightChild is a leaf
-	// holding real keys. This shape is NOT produced by Delete; we construct it
-	// by hand purely to pin the documented First/Next-vs-Last asymmetry.
+	// ---- Part 1: synthetic 0-cell interior NON-page-1 root over data ----
 	func() {
 		p := tempPager(t)
 		rootPg, err := p.allocatePage()
@@ -530,42 +526,21 @@ func TestCursorEmptyInteriorRootInvariant(t *testing.T) {
 		p.releasePage(leafPg)
 		p.releasePage(rootPg)
 
-		// Last descends rightChild and reaches the real data: the subtree is
-		// genuinely non-empty and reachable. This is the case the by-design
-		// First/Next treatment must never silently drop in production.
+		// A 0-cell interior root on a non-page-1 page is corruption
+		// (btree.c:5610): both First and Last must reject it rather than
+		// report an empty tree (hiding the live subtree) or traverse it.
 		curLast := bt.NewCursor()
-		require.NoError(t, curLast.Last())
-		require.True(t, curLast.Valid(), "Last must descend a 0-cell interior root with a non-empty subtree")
-		k, err := curLast.Key()
-		require.NoError(t, err)
-		require.Equal(t, leafKeys[len(leafKeys)-1], k)
+		require.ErrorIs(t, curLast.Last(), ErrCorrupt, "Last must reject a non-page-1 0-cell interior root")
+		require.False(t, curLast.Valid())
 
-		// Walk all the way back with Previous and confirm we see every key.
-		seen := [][]byte{append([]byte(nil), k...)}
-		for {
-			require.NoError(t, curLast.Previous())
-			if !curLast.Valid() {
-				break
-			}
-			pk, perr := curLast.Key()
-			require.NoError(t, perr)
-			seen = append([][]byte{append([]byte(nil), pk...)}, seen...)
-		}
-		require.Equal(t, leafKeys, seen, "Last+Previous must enumerate the full subtree")
-
-		// First/Next treat the 0-cell interior root as terminal-empty (by
-		// design). Pinned here so the asymmetry is tested: if this ever flips
-		// to descending the subtree, that is a behavior change to review, not a
-		// silent regression. With an EMPTY leaf this is correct; with the
-		// non-empty leaf above it is the deliberately-tolerated divergence that
-		// is only safe because Delete never builds this shape (Part 2 proves
-		// the production path never does).
 		curFirst := bt.NewCursor()
-		require.NoError(t, curFirst.First())
-		require.False(t, curFirst.Valid(), "First treats a 0-cell interior root as terminal-empty (by design)")
-		// Next from an invalid/never-positioned cursor must stay empty.
-		require.NoError(t, curFirst.Next())
+		require.ErrorIs(t, curFirst.First(), ErrCorrupt, "First must reject a non-page-1 0-cell interior root")
 		require.False(t, curFirst.Valid())
+
+		// Seek descends via searchInterior, which applies the same gate.
+		curSeek := bt.NewCursor()
+		require.ErrorIs(t, curSeek.Seek(leafKeys[0]), ErrCorrupt, "Seek must reject a non-page-1 0-cell interior root")
+		require.False(t, curSeek.Valid())
 	}()
 
 	// ---- Part 2: production Delete cascade never lands on such a root ----

@@ -722,7 +722,7 @@ func (bt *btree) balanceNonroot(parentPg *page, parentIdx int, isRoot bool, pare
 		}
 	}
 
-	// ---- Step 12 (balance-shallower, btree.c:8960-8985) is NOT done in-line
+	// ---- Step 12 (balance-shallower, btree.c:8942-8967) is NOT done in-line
 	// here. When dispatched from the INSERT path the pooled cell count only grows
 	// (nNew>=nOld), so the parent never empties and Step 12 cannot apply. When
 	// dispatched from the DELETE/merge path (deleteRebalanceLeaf /
