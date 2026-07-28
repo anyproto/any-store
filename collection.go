@@ -328,7 +328,7 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 		// one is safe (the slow path admits its readers exactly);
 		// under-stamping an uncommitted one would leak it to every reader at
 		// the begin cookie.
-		validFrom := tx.DiskSchemaCookie()
+		validFrom := tx.SnapshotSchemaCookie()
 		if wtx != nil && wtx.SchemaChanged() {
 			validFrom++
 		}
@@ -1793,11 +1793,11 @@ func (c *collection) reconcileIndexes(tx *btree.ReadTx) {
 			continue
 		}
 		// Reconcile runs at tx begin (checkStale), before any of this tx's
-		// writes: the adopted state is committed as of this snapshot, so its
-		// cookie is the exact visibility bound — an older concurrent reader
-		// resolves per-snapshot in visibleTo and correctly skips a peer index
-		// its snapshot predates.
-		idx.validFromCookie = tx.DiskSchemaCookie()
+		// writes: the adopted state is committed as of this snapshot, so the
+		// SNAPSHOT cookie is the exact visibility bound (the raised one can
+		// exceed it) — an older concurrent reader resolves per-snapshot in
+		// visibleTo and correctly skips a peer index its snapshot predates.
+		idx.validFromCookie = tx.SnapshotSchemaCookie()
 		c.loadSketchAtOpen(tx, idx)
 		rebuilt = append(rebuilt, idx)
 		changed = true

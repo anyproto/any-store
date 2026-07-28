@@ -489,15 +489,7 @@ func (db *db) checkStale(tx *btree.ReadTx) {
 	if !tx.IsSchemaStale() && !tx.IsDataStale() {
 		return
 	}
-	snapFCC, snapSC := tx.DiskFileChangeCounter(), tx.DiskSchemaCookie()
-	if !tx.IsWriteTx() {
-		var err error
-		if snapFCC, snapSC, err = tx.SnapshotHeaderCounters(); err != nil {
-			// Cannot bound the snapshot: reconcile nothing, consume nothing —
-			// the verdict stays stale and the next begin retries.
-			return
-		}
-	}
+	snapFCC, snapSC := tx.SnapshotFileChangeCounter(), tx.SnapshotSchemaCookie()
 	if tx.IsSchemaStale() {
 		db.reconcileIndexSet(tx, snapSC)
 	}

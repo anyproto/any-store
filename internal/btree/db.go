@@ -2025,6 +2025,11 @@ func (tx *ReadTx) SnapshotSchemaCookie() uint32 {
 	return tx.snapSchemaCookie
 }
 
+// SnapshotFileChangeCounter is the change-counter half, same contract.
+func (tx *ReadTx) SnapshotFileChangeCounter() uint32 {
+	return tx.snapFileChangeCounter
+}
+
 // Rollback ends the read transaction (for ReadTx, this is the same as commit).
 func (tx *ReadTx) Rollback() error {
 	if tx.closed {

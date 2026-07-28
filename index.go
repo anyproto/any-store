@@ -407,7 +407,8 @@ func (idx *index) storePubSketch(s *qplanner.IndexSketch) { idx.sketchPub.Store(
 // a later state. Anything less → invisible; the planner scans, which is
 // always correct. The stamp is a fast-path bound, not the exact commit point.
 func (idx *index) visibleTo(tx *btree.ReadTx) bool {
-	if tx.IsWriteTx() || tx.DiskSchemaCookie() >= idx.validFromCookie {
+	// Snapshot cookie, not the raised begin-time one — see visibleIndexes.
+	if tx.IsWriteTx() || tx.SnapshotSchemaCookie() >= idx.validFromCookie {
 		return true
 	}
 	raw, err := tx.AppendValue(idx.c.db.systemNS, idx.catalogKey, nil)
