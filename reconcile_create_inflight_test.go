@@ -137,3 +137,59 @@ func TestReconcile_ReadTxSparesFreshlyRenamedHandle(t *testing.T) {
 	_, err = coll.Count(ctx)
 	require.NoError(t, err, "read-tx staleness pass invalidated a freshly renamed handle")
 }
+
+// The consumption pin: a stale pass on a reader whose snapshot predates
+// later DDL must consume only up to the SNAPSHOT counters — recording the
+// raised/live values would mark the later DDL as reconciled though this pass
+// never saw it, and no subsequent tx would ever reconcile it. The next begin
+// must still report schema staleness and converge.
+func TestCheckStale_ConsumesOnlySnapshotCounters(t *testing.T) {
+	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
+		t.Skip("staleness counters model cross-process commits; not applicable in-memory")
+	}
+	fx := newFixture(t)
+	dbi := fx.DB.(*db)
+
+	_, err := fx.CreateCollection(ctx, "seed")
+	require.NoError(t, err)
+
+	rtx, err := dbi.btreeDB.BeginRead()
+	require.NoError(t, err)
+	fcc, sc := rtx.DiskFileChangeCounter(), rtx.DiskSchemaCookie()
+	require.NoError(t, rtx.Rollback())
+
+	// Stale verdict baked at begin; snapshot predates the DDL below.
+	// Assertions run after each tx is released so a failure cannot leave a
+	// reader open (Close would block in the fixture cleanup).
+	dbi.btreeDB.UpdateLocalCounters(fcc, sc-1)
+	reader, err := dbi.btreeDB.BeginRead()
+	require.NoError(t, err)
+	readerStale := reader.IsSchemaStale()
+
+	later, err := fx.CreateCollection(ctx, "later")
+	require.NoError(t, err)
+
+	// The pass runs with a snapshot that lacks the create: it must neither
+	// invalidate the new handle nor consume the create's cookie bump.
+	dbi.checkStale(reader)
+	require.NoError(t, reader.Rollback())
+	require.True(t, readerStale)
+
+	next, err := dbi.btreeDB.BeginRead()
+	require.NoError(t, err)
+	nextStale := next.IsSchemaStale()
+	// A full-vision pass converges.
+	dbi.checkStale(next)
+	require.NoError(t, next.Rollback())
+	require.True(t, nextStale,
+		"stale pass must not consume DDL its snapshot never contained")
+
+	settled, err := dbi.btreeDB.BeginRead()
+	require.NoError(t, err)
+	settledStale := settled.IsSchemaStale()
+	require.NoError(t, settled.Rollback())
+	require.False(t, settledStale)
+
+	_, err = later.Count(ctx)
+	require.NoError(t, err)
+}
