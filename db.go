@@ -476,6 +476,7 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 //	  sketches over the (now reconciled) index set. A stale sketch only affects
 //	  which index the planner CHOOSES, never query RESULTS (the any-store analog
 //	  of sqlite_stat1), so it runs strictly after the structural reconcile.
+//
 // The begin-time disk counters driving the verdict are RAISED to the newest
 // committed frame (see btree.ReadTx.SnapshotHeaderCounters), so a read tx can
 // detect staleness its own snapshot does not yet contain — a begin racing a

@@ -2444,11 +2444,16 @@ pinned behind — reports counters its own snapshot cannot see. SQLite has no su
 (`sqlitec/src/btree.c:3785-3786`), and the `SQLITE_SCHEMA` reload consumes the cookie read
 through that same transaction (`sqlitec/src/prepare.c:288,293`) — detection, reload, and
 consumption are all snapshot-bounded. The raise is kept for cross-process staleness
-detection, but judgments about snapshot contents and the post-reconcile counter consumption
-must use `ReadTx.SnapshotHeaderCounters` (frame bound = the tx's own `walMaxFrame`), which
-restores the SQLite-aligned semantics; consuming the raised counters would mark peer DDL as
-reconciled that the reconcile snapshot never contained, silently detaching later write
-transactions from a peer-created index.
+detection, but judgments about snapshot contents must use the snapshot-bounded pair —
+`ReadTx.SnapshotHeaderCounters`/`SnapshotSchemaCookie`, baked at begin from the tx's captured
+`[minFrame, maxFrame]` window (a second bounded page-1 read is paid only when the detection
+read was actually raised) — which restores the SQLite-aligned semantics. Consumers: the
+staleness pass (reconcile + counter consumption — consuming the raised counters would mark
+peer DDL as reconciled that the reconcile snapshot never contained, silently detaching later
+write transactions from a peer-created index) and the index-visibility fast paths
+(`visibleIndexes`, range/fts `visibleTo`, `vectorIndex.forTx` — judging with the raised
+cookie admits an index whose namespace the snapshot cannot resolve, returning silently wrong
+query results).
 
 <a id="drift-47-checkpoint-omits-open-transaction-guard"></a>
 ### Drift: Checkpoint Omits Open Transaction Guard
