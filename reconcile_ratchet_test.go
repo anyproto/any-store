@@ -84,3 +84,34 @@ func TestReconcileRatchet_NoEvictionAfterCreate(t *testing.T) {
 	// The observed production symptom of the eviction: DropIndex not found.
 	require.NoError(t, coll.DropIndex(ctx, "a"))
 }
+
+// A rolled-back DDL tx must leave the ratchet where it was: the bump happens
+// only in the commit publication, which a rollback drops. A moved ratchet
+// would make later same-cookie staleness passes skip reconciles for state
+// that never committed.
+func TestReconcileRatchet_RollbackLeavesRatchetUntouched(t *testing.T) {
+	fx, dbi, coll := ratchetFixture(t)
+	before := coll.(*collection).indexSetCookie
+
+	wtx, err := fx.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(wtx.Context(), IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, wtx.Rollback())
+
+	cc := coll.(*collection)
+	require.Empty(t, cc.loadIndexes(), "rollback must restore the published set")
+	require.Equal(t, before, cc.indexSetCookie, "rollback must not move the ratchet")
+
+	// The unmoved ratchet must not block a genuine staleness reconcile at the
+	// unchanged cookie (peer-bump emulation), and real DDL still works.
+	rtx, err := dbi.btreeDB.BeginRead()
+	require.NoError(t, err)
+	fcc, sc := rtx.DiskFileChangeCounter(), rtx.DiskSchemaCookie()
+	require.NoError(t, rtx.Rollback())
+	dbi.btreeDB.UpdateLocalCounters(fcc, sc-1)
+	n, err := coll.Find(`{"a":{"$gte":0}}`).Count(ctx)
+	require.NoError(t, err)
+	require.Equal(t, 10, n)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+	require.NoError(t, coll.DropIndex(ctx, "a"))
+}
