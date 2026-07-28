@@ -476,14 +476,33 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 //	  sketches over the (now reconciled) index set. A stale sketch only affects
 //	  which index the planner CHOOSES, never query RESULTS (the any-store analog
 //	  of sqlite_stat1), so it runs strictly after the structural reconcile.
+// The begin-time disk counters driving the verdict are RAISED to the newest
+// committed frame (see btree.ReadTx.SnapshotHeaderCounters), so a read tx can
+// detect staleness its own snapshot does not yet contain — a begin racing a
+// commit, or a reader slot pinned behind. The pass therefore reconciles and
+// consumes only up to the SNAPSHOT counters: reconciling judges what this
+// snapshot can see, and recording anything newer as consumed would mark DDL
+// as reconciled that never was — later txs (including writers) would trust an
+// index set missing a peer's index and stop maintaining it. Left short, the
+// verdict stays stale and the next begin (with a newer snapshot) converges.
 func (db *db) checkStale(tx *btree.ReadTx) {
+	if !tx.IsSchemaStale() && !tx.IsDataStale() {
+		return
+	}
+	snapFCC, snapSC := tx.DiskFileChangeCounter(), tx.DiskSchemaCookie()
+	if !tx.IsWriteTx() {
+		var err error
+		if snapFCC, snapSC, err = tx.SnapshotHeaderCounters(); err != nil {
+			// Cannot bound the snapshot: reconcile nothing, consume nothing —
+			// the verdict stays stale and the next begin retries.
+			return
+		}
+	}
 	if tx.IsSchemaStale() {
-		db.reconcileIndexSet(tx)
+		db.reconcileIndexSet(tx, snapSC)
 	}
-	if tx.IsSchemaStale() || tx.IsDataStale() {
-		db.reloadSketches(tx)
-		db.btreeDB.UpdateLocalCounters(tx.DiskFileChangeCounter(), tx.DiskSchemaCookie())
-	}
+	db.reloadSketches(tx)
+	db.btreeDB.UpdateLocalCounters(snapFCC, snapSC)
 }
 
 // reconcileIndexSet rebuilds the in-memory index set of every open collection
@@ -495,7 +514,7 @@ func (db *db) checkStale(tx *btree.ReadTx) {
 // collection is reconciled under its own c.mu and the result published
 // atomically (copy-on-write), so lock-free query readers always observe a
 // complete index generation.
-func (db *db) reconcileIndexSet(tx *btree.ReadTx) {
+func (db *db) reconcileIndexSet(tx *btree.ReadTx, snapCookie uint32) {
 	type namedColl struct {
 		name string
 		c    *collection
@@ -519,6 +538,19 @@ func (db *db) reconcileIndexSet(tx *btree.ReadTx) {
 			// checking c.name against this tx's older snapshot would
 			// spuriously invalidate the handle, and reconciling its index
 			// set under the flipped name would publish an empty one.
+			continue
+		}
+		if !tx.IsWriteTx() && snapCookie < nc.c.validFromCookie.Load() {
+			// The snapshot predates the handle's visibility bound: a create
+			// or rename committed after — or is still committing while —
+			// this reader began, so its catalog key is legitimately absent
+			// here. Judging existence needs a snapshot at or past the bound
+			// (same tolerance rule as index.forTx); skip. snapCookie is the
+			// SNAPSHOT cookie, not the raised begin-time one — the raised
+			// value can exceed what this tx's reads see and would let the
+			// vanished check judge a handle whose catalog key sits in frames
+			// past the snapshot. A write tx always sees latest state and
+			// needs no skip.
 			continue
 		}
 		if db.collectionVanished(tx, nc.name, nc.c) {

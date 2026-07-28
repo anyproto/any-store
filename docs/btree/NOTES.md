@@ -2436,6 +2436,20 @@ tracking: a caller who forgets to call `MarkDataChanged`/`MarkSchemaChanged` wil
 cross-process change counters unbumped, so other connections' staleness checks silently fail
 to observe the change.
 
+A second divergence inside this surface: the begin-time counters behind
+`DiskFileChangeCounter`/`DiskSchemaCookie` are read with the frame bound RAISED to the newest
+committed frame (`pager.readHeaderCounters`), so a begin racing a commit — or a reader slot
+pinned behind — reports counters its own snapshot cannot see. SQLite has no such raise:
+`sqlite3BtreeBeginTrans` returns the cookie from the transaction's own page 1
+(`sqlitec/src/btree.c:3785-3786`), and the `SQLITE_SCHEMA` reload consumes the cookie read
+through that same transaction (`sqlitec/src/prepare.c:288,293`) — detection, reload, and
+consumption are all snapshot-bounded. The raise is kept for cross-process staleness
+detection, but judgments about snapshot contents and the post-reconcile counter consumption
+must use `ReadTx.SnapshotHeaderCounters` (frame bound = the tx's own `walMaxFrame`), which
+restores the SQLite-aligned semantics; consuming the raised counters would mark peer DDL as
+reconciled that the reconcile snapshot never contained, silently detaching later write
+transactions from a peer-created index.
+
 <a id="drift-47-checkpoint-omits-open-transaction-guard"></a>
 ### Drift: Checkpoint Omits Open Transaction Guard
 - **Category:** changed-logic  -  **Severity:** low

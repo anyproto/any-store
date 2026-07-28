@@ -166,6 +166,18 @@ type collection struct {
 	// the token with the collection).
 	catalogID []byte
 
+	// validFromCookie is the earliest schema cookie at which this handle's
+	// registered name is KNOWN to resolve to this collection on disk: the
+	// snapshot cookie at open, the commit cookie (begin+1) at create, and
+	// re-stamped to the commit cookie by Rename's publication. Same contract
+	// as index.validFromCookie. The staleness pass consults it: a read tx
+	// whose snapshot predates this bound cannot judge existence — the catalog
+	// key is legitimately absent there — and must skip the handle instead of
+	// invalidating it (see reconcileIndexSet). Atomic because Rename's commit
+	// publication stores it while lock-free staleness passes read it; taking
+	// c.mu there would invert the c.mu→db.mu order Rename establishes.
+	validFromCookie atomic.Uint32
+
 	// primaryKey is the document field whose value is the btree key. Resolved
 	// once in init (default "id") and never mutated after, so the data and query
 	// paths read it lock-free.
@@ -320,6 +332,11 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 		if wtx != nil && wtx.SchemaChanged() {
 			validFrom++
 		}
+		// The collection handle carries the same bound: for a create-in-flight
+		// (CreateCollection marks schema changed before init) this is the
+		// commit cookie, keeping the handle out of reach of staleness passes
+		// whose snapshot predates the create.
+		c.validFromCookie.Store(validFrom)
 		for _, info := range idxInfos {
 			if isFulltext(info) {
 				fx, fErr := newFtsIndex(c, info)
@@ -1382,7 +1399,14 @@ func (c *collection) Rename(ctx context.Context, newName string) error {
 		// handles — root pages are unchanged and nothing derives keys from
 		// their stale internal names; fts pending buffers flush at commit
 		// through those handles into the renamed namespaces.
+		renameValidFrom := tx.DiskSchemaCookie() + 1
 		wtx.onCommitPublish(func() {
+			// The registry key flips to newName, which resolves only in
+			// snapshots at or past this commit: raise the handle's visibility
+			// bound so an older-snapshot staleness pass skips it instead of
+			// invalidating a just-renamed live handle (keyNotFound on the new
+			// name). See reconcileIndexSet.
+			c.validFromCookie.Store(renameValidFrom)
 			c.db.mu.Lock()
 			if cur, ok := c.db.openedCollections[oldName]; ok && cur == Collection(c) {
 				delete(c.db.openedCollections, oldName)
