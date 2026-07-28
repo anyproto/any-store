@@ -494,8 +494,7 @@ func TestDelCurCov_NonRootEmptyInterior(t *testing.T) {
 //     path, First/Next would error or under-report here and the test would fail.
 //
 // The page-1 half of the contract (degenerate master root routed via
-// rightChild) is exercised end-to-end by TestDropSweepMasterRootCollapse in the
-// root package.
+// rightChild) is exercised by TestDeleteNamespaceMasterRootCollapse.
 func TestCursorEmptyInteriorRootInvariant(t *testing.T) {
 	// ---- Part 1: synthetic 0-cell interior NON-page-1 root over data ----
 	func() {
