@@ -2107,22 +2107,28 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 	} else if hdr, valid := p.wal.index.readHeader(); valid && hdr.mxFrame > effectiveMaxFrame {
 		effectiveMaxFrame = hdr.mxFrame
 	}
-	return p.readHeaderCountersAt(effectiveMaxFrame)
+	return p.readHeaderCountersAt(effectiveMaxFrame, p.wal.index.liveMinFrame())
 }
 
 // readHeaderCountersAt is readHeaderCounters WITHOUT the raise to the latest
-// committed frame: it reads page 1 strictly as of maxFrame, so a reader tx
-// passing its own walMaxFrame gets the counters its snapshot actually
-// contains. readHeaderCounters raises the bound to discover the true WAL
-// state for STALENESS DETECTION — the raised counters may exceed what the
-// caller's snapshot can see, and must not be used to judge snapshot contents.
-func (p *pager) readHeaderCountersAt(effectiveMaxFrame uint32) (fileChangeCount, schemaCookie uint32, err error) {
+// committed frame: it reads page 1 strictly within [minFrame, maxFrame], so
+// a reader tx passing its begin-captured bounds gets the counters its
+// snapshot actually contains. Both sides matter: the max side excludes
+// commits past the snapshot; the min side must be the snapshot's captured
+// floor, NOT liveMinFrame (see its doc) — a WAL restart racing a slot-0
+// reader recycles new-generation frame numbers below the old maxFrame, and
+// a live floor would admit them, serving post-restart counters.
+// readHeaderCounters raises the max bound (and may use the live floor: its
+// callers hold no snapshot to protect) to discover the true WAL state for
+// STALENESS DETECTION — those counters may exceed what a snapshot can see,
+// and must not be used to judge snapshot contents.
+func (p *pager) readHeaderCountersAt(effectiveMaxFrame, minFrame uint32) (fileChangeCount, schemaCookie uint32, err error) {
 	// Look up page 1's latest frame.
 	// walIndex.get() merges the local page map with SHM, preferring newer SHM
 	// frames. After an external state change, beginWrite rebuilds the local page
 	// map from the WAL so page-1 refreshes do not depend solely on SHM hashes.
 	if effectiveMaxFrame > 0 {
-		frame, gerr := p.wal.index.get(1, effectiveMaxFrame, p.wal.index.liveMinFrame())
+		frame, gerr := p.wal.index.get(1, effectiveMaxFrame, minFrame)
 		if gerr != nil {
 			// ErrCorrupt from a full/over-probed SHM hash chain is a hard error,
 			// not a "WAL has no page 1" miss: fail rather than reading stale

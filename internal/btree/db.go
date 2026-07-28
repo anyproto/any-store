@@ -890,6 +890,7 @@ func (db *DB) beginRead(readCounters bool) (*ReadTx, error) {
 	// Dual-write during per-connection-hdr migration. Step 5 will remove
 	// walMaxFrame; until then, tests still read it directly.
 	tx.walMaxFrame = maxFrame
+	tx.walMinFrame = minFrame
 	tx.walHdr = snapHdr
 	tx.walSlot = slot
 	tx.diskFileChangeCounter = fcc
@@ -1016,6 +1017,9 @@ func (db *DB) BeginWrite() (*WriteTx, error) {
 	tx.ReadTx.cache = nil // writer uses shared pcache, not a reader cache
 	tx.ReadTx.closed = false
 	tx.ReadTx.walMaxFrame = maxFrame
+	// Writers hold the write lock, so no restart can race: the live floor
+	// captured here stays valid for the tx's life.
+	tx.ReadTx.walMinFrame = db.pager.wal.index.liveMinFrame()
 	// Reuse the readSnap hdr captured above for BUSY_SNAPSHOT. In-process
 	// mode has readSnap=zero; synthesize minimal hdr so read paths consuming
 	// walHdr.mxFrame see the correct frame ceiling.
@@ -1511,6 +1515,11 @@ type ReadTx struct {
 	cache       *pcache // per-reader private page cache (nil for write transactions)
 	walSlot     int     // reader slot number (for endRead)
 	walMaxFrame uint32  // WAL snapshot for this transaction (TODO: migrate to walHdr.mxFrame)
+	// walMinFrame is the snapshot's checkpoint-frontier floor, captured at
+	// begin like SQLite's pWal->minFrame (slot-0: maxFrame+1). Fixed for the
+	// tx's life so a WAL restart cannot recycle new-generation frame numbers
+	// into the snapshot's [min, max] window — see wal.beginReadHdr.
+	walMinFrame uint32
 	// walHdr is the full SHM header snapshot captured at BeginRead time.
 	// Populated in parallel with walMaxFrame.
 	walHdr WalIndexHdr
@@ -1962,7 +1971,9 @@ func (tx *ReadTx) DiskSchemaCookie() uint32 {
 }
 
 // SnapshotHeaderCounters returns the page-1 FileChangeCount and SchemaCookie
-// as of THIS tx's snapshot (bounded by its walMaxFrame). Unlike
+// as of THIS tx's snapshot (bounded by its begin-captured
+// [walMinFrame, walMaxFrame] window, both sides fixed for the tx's life —
+// SQLite's pWal->minFrame/mxFrame). Unlike
 // DiskFileChangeCounter/DiskSchemaCookie — whose begin-time read is raised to
 // the newest committed frame so staleness detection notices peer commits —
 // these values never exceed what the tx's tree reads can actually see: a
@@ -1974,7 +1985,7 @@ func (tx *ReadTx) SnapshotHeaderCounters() (fileChangeCount, schemaCookie uint32
 	if tx.closed {
 		return 0, 0, ErrTxClosed
 	}
-	return tx.pager.readHeaderCountersAt(tx.walHdr.mxFrame)
+	return tx.pager.readHeaderCountersAt(tx.walHdr.mxFrame, tx.walMinFrame)
 }
 
 // Rollback ends the read transaction (for ReadTx, this is the same as commit).
