@@ -2107,7 +2107,16 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 	} else if hdr, valid := p.wal.index.readHeader(); valid && hdr.mxFrame > effectiveMaxFrame {
 		effectiveMaxFrame = hdr.mxFrame
 	}
+	return p.readHeaderCountersAt(effectiveMaxFrame)
+}
 
+// readHeaderCountersAt is readHeaderCounters WITHOUT the raise to the latest
+// committed frame: it reads page 1 strictly as of maxFrame, so a reader tx
+// passing its own walMaxFrame gets the counters its snapshot actually
+// contains. readHeaderCounters raises the bound to discover the true WAL
+// state for STALENESS DETECTION — the raised counters may exceed what the
+// caller's snapshot can see, and must not be used to judge snapshot contents.
+func (p *pager) readHeaderCountersAt(effectiveMaxFrame uint32) (fileChangeCount, schemaCookie uint32, err error) {
 	// Look up page 1's latest frame.
 	// walIndex.get() merges the local page map with SHM, preferring newer SHM
 	// frames. After an external state change, beginWrite rebuilds the local page

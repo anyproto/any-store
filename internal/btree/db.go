@@ -1961,6 +1961,22 @@ func (tx *ReadTx) DiskSchemaCookie() uint32 {
 	return tx.diskSchemaCookie
 }
 
+// SnapshotHeaderCounters returns the page-1 FileChangeCount and SchemaCookie
+// as of THIS tx's snapshot (bounded by its walMaxFrame). Unlike
+// DiskFileChangeCounter/DiskSchemaCookie — whose begin-time read is raised to
+// the newest committed frame so staleness detection notices peer commits —
+// these values never exceed what the tx's tree reads can actually see: a
+// begin that raced a commit, or a reader slot pinned to an older snapshot,
+// reports the older counters here. Judgments about snapshot contents (e.g.
+// whether a catalog key committed at cookie C must be visible) require this
+// bound, not the raised one.
+func (tx *ReadTx) SnapshotHeaderCounters() (fileChangeCount, schemaCookie uint32, err error) {
+	if tx.closed {
+		return 0, 0, ErrTxClosed
+	}
+	return tx.pager.readHeaderCountersAt(tx.walHdr.mxFrame)
+}
+
 // Rollback ends the read transaction (for ReadTx, this is the same as commit).
 func (tx *ReadTx) Rollback() error {
 	if tx.closed {
