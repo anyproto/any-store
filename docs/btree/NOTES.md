@@ -2132,23 +2132,6 @@ corruption. Because any-store only ever materializes index page types, the omitt
 is corruption-hardening rather than a functional intKey/index divergence; the inline
 DRIFT marker already sits at `btree.go:3563`.
 
-<a id="drift-13-empty-interior-root-treated-as-empty-btree-not-corruption"></a>
-### Drift: Empty Interior Root Treated As Empty Btree Not Corruption
-- **Category:** changed-logic  -  **Severity:** medium
-- **Affected functions:** `btree.go:*Cursor.First` (`internal/btree/btree.go:3477-3519`), `btree.go:*Cursor.Last` (`btree.go:3524-3559`).
-
-SQLite's `moveToRoot` treats a 0-cell interior root as a benign "virtual root" only
-when `pRoot->pgno==1`, and otherwise returns `SQLITE_CORRUPT_BKPT`
-(`btree.c:5606-5618`, with the `if( pRoot->pgno!=1 ) return SQLITE_CORRUPT_BKPT` guard at
-`btree.c:5610`): a non-page-1 interior root with zero cells is corruption. Go's
-`Cursor.First` descent loop, when it reaches a 0-cell interior page (root or deeper),
-does `releasePage(pg); return nil` and leaves the cursor invalid (`btree.go:3488-3492`),
-i.e. it silently reports an empty b-tree; `Cursor.Last`'s rightChild descent
-(`btree.go:3535-3549`) likewise has no `rootPage==1` guard. The consequence is that a
-corrupt zero-cell interior root is accepted as a benign empty cursor instead of being
-flagged `ErrCorrupt`, and First/Last are asymmetric on this case. An in-code DRIFT marker
-for this anchor now sits in the `Cursor.Last` doc comment (`btree.go:3522-3523`).
-
 <a id="drift-14-b-plus-tree-traversal-drops-interior-cell-keys-versus-sqlite"></a>
 ### Drift: B Plus Tree Traversal Drops Interior Cell Keys Versus SQLite B Tree
 - **Category:** changed-logic  -  **Severity:** none

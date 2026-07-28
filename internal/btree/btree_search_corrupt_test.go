@@ -325,8 +325,9 @@ func TestSearchCorrupt_SearchInteriorPage_CpBaseBeyondData(t *testing.T) {
 	p.releasePage(pg)
 }
 
-// TestSearchCorrupt_SearchInteriorPage_Lo0CpOff covers L693-695:
-// lo==0 after loop, cpOff+2 > dataLen. Use cellCount=0 + truncated data.
+// TestSearchCorrupt_SearchInteriorPage_Lo0CpOff: cellCount=0 on a non-page-1 interior now trips the 0-cell gate
+// (moveToRoot's page-1-only virtual root, btree.c:5610) before any cell-pointer
+// read; the crafted layout below is kept as extra hostile input.
 func TestSearchCorrupt_SearchInteriorPage_Lo0CpOff(t *testing.T) {
 	p := tempPager(t)
 	pg, err := p.allocatePage()
@@ -343,8 +344,9 @@ func TestSearchCorrupt_SearchInteriorPage_Lo0CpOff(t *testing.T) {
 	p.releasePage(pg)
 }
 
-// TestSearchCorrupt_SearchInteriorPage_Lo0InteriorCellKeyError covers L698-700:
-// lo==0, cell pointer valid but cell data corrupt. cellCount=0 so loop is skipped.
+// TestSearchCorrupt_SearchInteriorPage_Lo0InteriorCellKeyError: cellCount=0 on a non-page-1 interior now trips the 0-cell gate
+// (moveToRoot's page-1-only virtual root, btree.c:5610) before any cell-pointer
+// read; the crafted layout below is kept as extra hostile input.
 func TestSearchCorrupt_SearchInteriorPage_Lo0InteriorCellKeyError(t *testing.T) {
 	p := tempPager(t)
 	pg, err := p.allocatePage()
@@ -459,8 +461,9 @@ func TestSearchCorrupt_SearchInteriorWithOverflow_CpBaseBeyondData(t *testing.T)
 	p.releasePage(pg)
 }
 
-// TestSearchCorrupt_SearchInteriorWithOverflow_Lo0CpOff covers L749-751:
-// lo==0 after loop (cellCount=0), cpOff+2 > dataLen.
+// TestSearchCorrupt_SearchInteriorWithOverflow_Lo0CpOff: cellCount=0 on a non-page-1 interior now trips the 0-cell gate
+// (moveToRoot's page-1-only virtual root, btree.c:5610) before any cell-pointer
+// read; the crafted layout below is kept as extra hostile input.
 func TestSearchCorrupt_SearchInteriorWithOverflow_Lo0CpOff(t *testing.T) {
 	p := tempPager(t)
 	pg, err := p.allocatePage()
@@ -477,8 +480,9 @@ func TestSearchCorrupt_SearchInteriorWithOverflow_Lo0CpOff(t *testing.T) {
 	p.releasePage(pg)
 }
 
-// TestSearchCorrupt_SearchInteriorWithOverflow_Lo0OffPlus4 covers L753-755:
-// lo==0 after loop (cellCount=0), cell offset valid but off+4 > dataLen.
+// TestSearchCorrupt_SearchInteriorWithOverflow_Lo0OffPlus4: cellCount=0 on a non-page-1 interior now trips the 0-cell gate
+// (moveToRoot's page-1-only virtual root, btree.c:5610) before any cell-pointer
+// read; the crafted layout below is kept as extra hostile input.
 func TestSearchCorrupt_SearchInteriorWithOverflow_Lo0OffPlus4(t *testing.T) {
 	p := tempPager(t)
 	pg, err := p.allocatePage()
@@ -570,8 +574,9 @@ func TestSearchCorrupt_SearchInteriorWithOverflow_LoLtN_OffPlus4(t *testing.T) {
 // bt.searchInterior (btree method) corruption tests (L930-949)
 // =============================================================================
 
-// TestSearchCorrupt_BtSearchInterior_Lo0CpOff covers L930-932:
-// lo==0 after loop (cellCount=0), cpOff+2 > dataLen.
+// TestSearchCorrupt_BtSearchInterior_Lo0CpOff: cellCount=0 on a non-page-1 interior now trips the 0-cell gate
+// (moveToRoot's page-1-only virtual root, btree.c:5610) before any cell-pointer
+// read; the crafted layout below is kept as extra hostile input.
 func TestSearchCorrupt_BtSearchInterior_Lo0CpOff(t *testing.T) {
 	p := tempPager(t)
 	pg, err := p.allocatePage()
@@ -588,8 +593,9 @@ func TestSearchCorrupt_BtSearchInterior_Lo0CpOff(t *testing.T) {
 	p.releasePage(pg)
 }
 
-// TestSearchCorrupt_BtSearchInterior_Lo0InteriorCellFullKeyError covers L935-937:
-// lo==0 after loop (cellCount=0), interiorCellFullKey fails for cell 0.
+// TestSearchCorrupt_BtSearchInterior_Lo0InteriorCellFullKeyError: cellCount=0 on a non-page-1 interior now trips the 0-cell gate
+// (moveToRoot's page-1-only virtual root, btree.c:5610) before any cell-pointer
+// read; the crafted layout below is kept as extra hostile input.
 func TestSearchCorrupt_BtSearchInterior_Lo0InteriorCellFullKeyError(t *testing.T) {
 	p := tempPager(t)
 	pg, err := p.allocatePage()

@@ -3248,8 +3248,9 @@ func TestCursorFirstEmptyInterior(t *testing.T) {
 	p.releasePage(childPg)
 
 	cur := bt.NewCursor()
-	require.NoError(t, cur.First())
-	// First on interior with 0 cells returns without descending
+	// A 0-cell interior root is legal only on page 1 (moveToRoot,
+	// btree.c:5606-5613); anywhere else First rejects it as corruption.
+	assert.ErrorIs(t, cur.First(), ErrCorrupt)
 	assert.False(t, cur.Valid())
 }
 
