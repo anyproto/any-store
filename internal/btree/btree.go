@@ -3449,8 +3449,12 @@ func (bt *btree) collapseSingleChild(parentPg *page, childPgno uint32) error {
 		// interior page with a single right child (moveToRoot's page-1-only
 		// virtual-root case, btree.c:5606-5613), and a later balance retries the
 		// collapse once the child has drained. The gap below equals SQLite's
-		// post-defragment nFree (btree.c:8960-8964 assert): the child was just
-		// rebuilt packed, so there are no freeblocks or fragment bytes.
+		// post-defragment nFree (btree.c:8960-8964 assert) when the child was
+		// just rebuilt packed (the merge path); on the empty-leaf-removal path
+		// the child may carry fragment bytes, making the gap an undercount of
+		// nFree — the skip is then merely conservative and a later balance
+		// collapses once the child drains. The copy itself is layout-exact
+		// either way (content bytes stay at their absolute offsets).
 		cpEnd := childPg.header.headerSize() + int(childPg.header.cellCount)*2
 		if iData-cpEnd < dbHeaderSize {
 			bt.pager.releasePage(childPg)
