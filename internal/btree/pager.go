@@ -2093,12 +2093,21 @@ func (p *pager) committedCounters() (fileChangeCount, schemaCookie uint32) {
 // cross-process readers), but in single-process mode the Go map with its
 // RWMutex provides safe concurrent access.
 func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaCookie uint32, err error) {
+	fileChangeCount, schemaCookie, _, err = p.readHeaderCountersRaised(walMaxFrame)
+	return
+}
+
+// readHeaderCountersRaised is readHeaderCounters plus the effective frame
+// bound it actually used. beginRead consults it: when the bound was NOT
+// raised past the caller's walMaxFrame, the returned counters are also the
+// snapshot counters — no second read needed for the snapshot-bounded pair.
+func (p *pager) readHeaderCountersRaised(walMaxFrame uint32) (fileChangeCount, schemaCookie, effectiveMaxFrame uint32, err error) {
 	// Determine the effective max frame by checking the SHM header,
 	// which reflects writes from ALL processes sharing this database.
 	// For inProcess mode, the SHM header is not updated by writers
 	// (writeFrames skips writeHeader when inProcess=true), so we use
 	// the in-process walIndex.maxFrame directly.
-	effectiveMaxFrame := walMaxFrame
+	effectiveMaxFrame = walMaxFrame
 	if p.inProcess {
 		// Use mxCommitFrame (not maxFrame) so spilled uncommitted frames are invisible to readers.
 		if mf := p.wal.index.mxCommitFrame.LoadLocal(); mf > effectiveMaxFrame {
@@ -2107,7 +2116,8 @@ func (p *pager) readHeaderCounters(walMaxFrame uint32) (fileChangeCount, schemaC
 	} else if hdr, valid := p.wal.index.readHeader(); valid && hdr.mxFrame > effectiveMaxFrame {
 		effectiveMaxFrame = hdr.mxFrame
 	}
-	return p.readHeaderCountersAt(effectiveMaxFrame, p.wal.index.liveMinFrame())
+	fileChangeCount, schemaCookie, err = p.readHeaderCountersAt(effectiveMaxFrame, p.wal.index.liveMinFrame())
+	return
 }
 
 // readHeaderCountersAt is readHeaderCounters WITHOUT the raise to the latest

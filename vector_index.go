@@ -435,12 +435,12 @@ func (c *collection) loadVectorIndexAs(tx *btree.ReadTx, collName string, info I
 		return nil, err
 	}
 	vi.bindIdentity(collName)
-	// The opened state is visible from this snapshot's cookie on (reconcile
+	// The opened state is visible from this SNAPSHOT's cookie on (reconcile
 	// calls at tx begin, before any of this tx's writes; forTx's transient
-	// rebuild never republishes). A caller whose view may already hold
-	// uncommitted DDL must re-stamp begin+1 — init and createIndexes'
-	// publish block do.
-	vi.validFromCookie = tx.DiskSchemaCookie()
+	// rebuild never republishes; the raised begin-time cookie can exceed the
+	// snapshot). A caller whose view may already hold uncommitted DDL must
+	// re-stamp begin+1 — init and createIndexes' publish block do.
+	vi.validFromCookie = tx.SnapshotSchemaCookie()
 	return vi, nil
 }
 
@@ -769,7 +769,8 @@ func (vi *vectorIndex) forTx(tx *btree.ReadTx) (*vectorIndex, error) {
 	if tx.IsWriteTx() {
 		return vi, nil
 	}
-	cookie := tx.DiskSchemaCookie()
+	// Snapshot cookie, not the raised begin-time one — see visibleIndexes.
+	cookie := tx.SnapshotSchemaCookie()
 	for h := vi; h != nil; h = h.prev.Load() {
 		if cookie >= h.validFromCookie {
 			return h, nil

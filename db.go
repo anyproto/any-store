@@ -476,6 +476,7 @@ func (db *db) ReadTx(ctx context.Context) (ReadTx, error) {
 //	  sketches over the (now reconciled) index set. A stale sketch only affects
 //	  which index the planner CHOOSES, never query RESULTS (the any-store analog
 //	  of sqlite_stat1), so it runs strictly after the structural reconcile.
+//
 // The begin-time disk counters driving the verdict are RAISED to the newest
 // committed frame (see btree.ReadTx.SnapshotHeaderCounters), so a read tx can
 // detect staleness its own snapshot does not yet contain — a begin racing a
@@ -489,15 +490,7 @@ func (db *db) checkStale(tx *btree.ReadTx) {
 	if !tx.IsSchemaStale() && !tx.IsDataStale() {
 		return
 	}
-	snapFCC, snapSC := tx.DiskFileChangeCounter(), tx.DiskSchemaCookie()
-	if !tx.IsWriteTx() {
-		var err error
-		if snapFCC, snapSC, err = tx.SnapshotHeaderCounters(); err != nil {
-			// Cannot bound the snapshot: reconcile nothing, consume nothing —
-			// the verdict stays stale and the next begin retries.
-			return
-		}
-	}
+	snapFCC, snapSC := tx.SnapshotFileChangeCounter(), tx.SnapshotSchemaCookie()
 	if tx.IsSchemaStale() {
 		db.reconcileIndexSet(tx, snapSC)
 	}

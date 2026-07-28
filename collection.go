@@ -198,6 +198,17 @@ type collection struct {
 	// evict the writer's uncommitted indexes. See the guard in reconcileIndexes.
 	indexSetDDLTxs int
 
+	// indexSetCookie is the schema cookie the published index/fts/vector sets
+	// were last built from (a reconcile's snapshot cookie) or published at (a
+	// local DDL's commit cookie). Guarded by c.mu. One-way ratchet for the
+	// staleness pass: a pass whose snapshot is older must not republish —
+	// rebuilt from its older catalog it would resurrect a dropped index or
+	// evict a fresher one db-wide, and readers at current snapshots would
+	// plan against freed namespaces, silently returning wrong results. The
+	// skipped pass consumes only its snapshot counters (see checkStale), so
+	// the verdict stays stale and a fresher begin converges.
+	indexSetCookie uint32
+
 	closed atomic.Bool
 	// userClosed records that Close() was explicitly requested. Drop flips
 	// closed itself (CAS), which makes a Close() racing in AFTER the flip a
@@ -328,7 +339,7 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 		// one is safe (the slow path admits its readers exactly);
 		// under-stamping an uncommitted one would leak it to every reader at
 		// the begin cookie.
-		validFrom := tx.DiskSchemaCookie()
+		validFrom := tx.SnapshotSchemaCookie()
 		if wtx != nil && wtx.SchemaChanged() {
 			validFrom++
 		}
@@ -337,6 +348,9 @@ func (c *collection) init(ctx context.Context, wtx *btree.WriteTx) error {
 		// commit cookie, keeping the handle out of reach of staleness passes
 		// whose snapshot predates the create.
 		c.validFromCookie.Store(validFrom)
+		// The loaded sets are as-of the same bound: seed the publication
+		// ratchet (init runs before the handle is published; no c.mu needed).
+		c.indexSetCookie = validFrom
 		for _, info := range idxInfos {
 			if isFulltext(info) {
 				fx, fErr := newFtsIndex(c, info)
@@ -1046,6 +1060,12 @@ func (c *collection) registerIndexSetRestore(wtx WriteTx) {
 	// per outcome (commit → pubs, rollback/failed commit → undo), so the
 	// counter balances.
 	c.indexSetDDLTxs++
+	// The sets this tx publishes become committed state at its commit cookie
+	// (every caller marks schema changed; the cookie bumps once per commit):
+	// ratchet indexSetCookie there so an older-snapshot staleness pass cannot
+	// republish over them. The ratchet never moves mid-tx, so rollback has
+	// nothing to restore.
+	commitCookie := wtx.btreeWriteTx().DiskSchemaCookie() + 1
 	wtx.onRollbackUndo(func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -1057,6 +1077,9 @@ func (c *collection) registerIndexSetRestore(wtx WriteTx) {
 	wtx.onCommitPublish(func() {
 		c.mu.Lock()
 		c.indexSetDDLTxs--
+		if commitCookie > c.indexSetCookie {
+			c.indexSetCookie = commitCookie
+		}
 		c.mu.Unlock()
 	})
 }
@@ -1735,6 +1758,16 @@ func (c *collection) reconcileIndexes(tx *btree.ReadTx) {
 		return
 	}
 
+	snapSC := tx.SnapshotSchemaCookie()
+	if !tx.IsWriteTx() && snapSC < c.indexSetCookie {
+		// Publication ratchet (see the field): the published sets are newer
+		// than this pass's snapshot — republishing from the older catalog
+		// would resurrect dropped indexes or evict fresher ones. Skip; a
+		// fresher begin reconciles.
+		return
+	}
+	c.indexSetCookie = snapSC
+
 	cur := c.loadIndexes()
 	byName := make(map[string]*index, len(cur))
 	for _, idx := range cur {
@@ -1793,11 +1826,11 @@ func (c *collection) reconcileIndexes(tx *btree.ReadTx) {
 			continue
 		}
 		// Reconcile runs at tx begin (checkStale), before any of this tx's
-		// writes: the adopted state is committed as of this snapshot, so its
-		// cookie is the exact visibility bound — an older concurrent reader
-		// resolves per-snapshot in visibleTo and correctly skips a peer index
-		// its snapshot predates.
-		idx.validFromCookie = tx.DiskSchemaCookie()
+		// writes: the adopted state is committed as of this snapshot, so the
+		// SNAPSHOT cookie is the exact visibility bound (the raised one can
+		// exceed it) — an older concurrent reader resolves per-snapshot in
+		// visibleTo and correctly skips a peer index its snapshot predates.
+		idx.validFromCookie = tx.SnapshotSchemaCookie()
 		c.loadSketchAtOpen(tx, idx)
 		rebuilt = append(rebuilt, idx)
 		changed = true

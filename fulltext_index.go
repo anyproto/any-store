@@ -211,7 +211,8 @@ func (fx *ftsIndex) Info() IndexInfo { return fx.info }
 // keep a working index over a transient view — so the two checks stay
 // separate.)
 func (fx *ftsIndex) visibleTo(tx *btree.ReadTx) bool {
-	if tx.IsWriteTx() || tx.DiskSchemaCookie() >= fx.validFromCookie {
+	// Snapshot cookie, not the raised begin-time one — see visibleIndexes.
+	if tx.IsWriteTx() || tx.SnapshotSchemaCookie() >= fx.validFromCookie {
 		return true
 	}
 	raw, err := tx.AppendValue(fx.c.db.systemNS, fx.catalogKey, nil)
@@ -287,11 +288,12 @@ func (c *collection) reconcileFtsIndexesLocked(tx *btree.ReadTx, infos []IndexIn
 		if err == nil {
 			err = fx.bindNamespaces(tx.GetNamespace)
 			// Reconcile runs at tx begin (checkStale), before any of this tx's
-			// writes: the bound state is committed as of this snapshot, so its
-			// cookie is the exact visibility bound. An older concurrent reader
-			// resolves per-snapshot in visibleTo and correctly skips a peer
-			// index its snapshot predates.
-			fx.validFromCookie = tx.DiskSchemaCookie()
+			// writes: the bound state is committed as of this snapshot, so the
+			// SNAPSHOT cookie is the exact visibility bound (the raised one
+			// can exceed it). An older concurrent reader resolves
+			// per-snapshot in visibleTo and correctly skips a peer index its
+			// snapshot predates.
+			fx.validFromCookie = tx.SnapshotSchemaCookie()
 		}
 		if err != nil {
 			// Not resolvable in this snapshot. With no existing object this is

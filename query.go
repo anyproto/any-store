@@ -143,7 +143,12 @@ func visibleIndexes(btx *btree.ReadTx, idxs []*index) []*index {
 	if btx.IsWriteTx() {
 		return idxs
 	}
-	cookie := btx.DiskSchemaCookie()
+	// SNAPSHOT cookie, not DiskSchemaCookie: the begin-time disk read is
+	// raised past the snapshot when the begin races a commit or the reader
+	// slot pinned behind — judging with it admits an index whose namespace
+	// this snapshot cannot resolve, and the scan silently returns wrong
+	// results. Same bound as reconcileIndexSet's handle guard.
+	cookie := btx.SnapshotSchemaCookie()
 	pending := false
 	for _, idx := range idxs {
 		if cookie < idx.validFromCookie {
