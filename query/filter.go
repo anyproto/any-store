@@ -351,17 +351,17 @@ func (e *Comp) String() string {
 	var op string
 	switch e.CompOp {
 	case CompOpEq:
-		op = string(opBytesEq)
+		op = opName(opEq)
 	case CompOpGt:
-		op = string(opBytesGt)
+		op = opName(opGt)
 	case CompOpGte:
-		op = string(opBytesGte)
+		op = opName(opGte)
 	case CompOpLt:
-		op = string(opBytesLt)
+		op = opName(opLt)
 	case CompOpLte:
-		op = string(opBytesLte)
+		op = opName(opLte)
 	case CompOpNe:
-		op = string(opBytesNe)
+		op = opName(opNe)
 	}
 	a := &fastjson.Arena{}
 	p := parserPool.Get()

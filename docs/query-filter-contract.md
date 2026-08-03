@@ -111,3 +111,18 @@ build per query and carry no such guarantee.
     only entry; Mongo sorts `[]` before null — matching that would need a key
     encoding below `TypeNull` on disk), and cross-type order is anyenc tag
     order, not the BSON type order, as everywhere else in this engine.
+
+11. **Parse rejections are structured.** Every filter `ParseCondition`
+    rejects — unknown operator, wrong operand type, malformed `$and`/`$or`/
+    `$nor` array, bad `$regex`, … — is reported as a `*query.ParseError`
+    whose `Path` locates the offending key inside the filter document
+    (`"tags.$sizee"`, `"$and.1.price.$gt"`), `Op` names the operator at
+    fault, and `Reason` is a self-contained message. Finer classes stay
+    reachable through `errors.Is`: `ErrUnknownOperator` for vocabulary
+    misses, `ErrVectorNotOrderable` for ordering ops on vector operands. A
+    known operator in a position that does not accept it (`{"$eq":1}` at top
+    level) is deliberately NOT `ErrUnknownOperator`. The operator vocabulary
+    itself is data: `query.Operators()` returns exactly what the parser
+    recognizes, so callers advertising the grammar (docs, 400 payloads) never
+    hand-copy the list. Pinned by `query/errors_test.go` (`TestParseError`,
+    `TestParseConditionErrorsAreStructured`, `TestOperators`).
