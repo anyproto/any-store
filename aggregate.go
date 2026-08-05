@@ -8,6 +8,7 @@ import (
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/internal/aggregate"
+	"github.com/anyproto/any-store/v2/internal/btree"
 	"github.com/anyproto/any-store/v2/query"
 	"github.com/anyproto/any-store/v2/syncpool"
 )
@@ -143,21 +144,30 @@ func (q *aggQuery) validateInPipelineStages(rest aggregate.Pipeline) error {
 		loaded bool
 	)
 	for _, spec := range rest {
-		m, ok := spec.(aggregate.MatchSpec)
-		if !ok {
-			continue
-		}
-		if query.ContainsText(m.Filter) {
-			return errAggTextNotInPrefix
-		}
-		if query.ContainsKnn(m.Filter) {
-			return errAggVectorNotInPrefix
-		}
-		if !loaded {
-			vidxs, loaded = q.c.loadVectorIndexes(), true
-		}
-		if err := rejectLegacyVectorClause(m.Filter, vidxs); err != nil {
-			return err
+		switch sp := spec.(type) {
+		case aggregate.LookupSpec:
+			// $lookup is scoped to a self-join on the primary key: "from" may
+			// only name the aggregated collection (the parser can't know its
+			// name), and the "id" foreign field must actually be the pk.
+			if sp.From != "" && sp.From != q.c.name {
+				return fmt.Errorf("%w: from %q, aggregating %q", errAggLookupFrom, sp.From, q.c.name)
+			}
+			if q.c.primaryKey != "id" {
+				return fmt.Errorf("%w: collection %q's primary key is %q", errAggLookupPrimaryKey, q.c.name, q.c.primaryKey)
+			}
+		case aggregate.MatchSpec:
+			if query.ContainsText(sp.Filter) {
+				return errAggTextNotInPrefix
+			}
+			if query.ContainsKnn(sp.Filter) {
+				return errAggVectorNotInPrefix
+			}
+			if !loaded {
+				vidxs, loaded = q.c.loadVectorIndexes(), true
+			}
+			if err := rejectLegacyVectorClause(sp.Filter, vidxs); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -166,6 +176,8 @@ func (q *aggQuery) validateInPipelineStages(rest aggregate.Pipeline) error {
 var (
 	errAggTextNotInPrefix   = errors.New("any-store: aggregate: $text is only supported in the leading $match stages (the pushdown prefix)")
 	errAggVectorNotInPrefix = errors.New("any-store: aggregate: a vector ($knn) clause is only supported in the leading $match stages (the pushdown prefix)")
+	errAggLookupFrom        = errors.New(`any-store: aggregate: $lookup joins only the aggregated collection itself ("from" must match it or be omitted)`)
+	errAggLookupPrimaryKey  = errors.New(`any-store: aggregate: $lookup requires the primary key field "id"`)
 )
 
 func (q *aggQuery) Iter(ctx context.Context) (Iterator, error) {
@@ -186,10 +198,26 @@ func (q *aggQuery) Iter(ctx context.Context) (Iterator, error) {
 		return nil, err
 	}
 
+	var (
+		env      aggregate.Env
+		lookupTx ReadTx
+	)
+	if aggregate.HasLookup(rest) {
+		var btx *btree.ReadTx
+		if btx, lookupTx, err = q.lookupBtreeTx(ctx, inner); err != nil {
+			_ = inner.Close()
+			return nil, err
+		}
+		env.Lookup = q.c.lookupFunc(btx)
+	}
+
 	limits := q.limits.WithDefaults()
-	root, err := aggregate.Build(&sourceStage{iter: inner}, rest, limits)
+	root, err := aggregate.Build(&sourceStage{iter: inner}, rest, limits, env)
 	if err != nil {
 		_ = inner.Close()
+		if lookupTx != nil {
+			_ = lookupTx.Commit()
+		}
 		return nil, err
 	}
 
@@ -197,10 +225,11 @@ func (q *aggQuery) Iter(ctx context.Context) (Iterator, error) {
 	// it parses stored documents into.
 	buf := q.c.db.syncPool.GetDocBuf()
 	return &aggIterator{
-		root:  root,
-		inner: inner,
-		c:     q.c,
-		buf:   buf,
+		root:     root,
+		inner:    inner,
+		lookupTx: lookupTx,
+		c:        q.c,
+		buf:      buf,
 		actx: &aggregate.Ctx{
 			Context:  ctx,
 			RowArena: buf.Arena,
@@ -208,6 +237,45 @@ func (q *aggQuery) Iter(ctx context.Context) (Iterator, error) {
 			Mem:      aggregate.NewMemAccount(limits.MaxMemoryBytes),
 		},
 	}, nil
+}
+
+// lookupBtreeTx returns the btree read tx $lookup point reads run against:
+// the streaming iterator's own tx (same snapshot; the iterator holds it open
+// until Close, which happens after every stage — blocking ones included —
+// has finished). When the pushdown prefix is provably empty the iterator has
+// no tx at all, yet a $count downstream can still synthesize rows whose
+// fields feed $lookup — then a dedicated read tx is opened, returned as held
+// for aggIterator to release on Close.
+func (q *aggQuery) lookupBtreeTx(ctx context.Context, inner Iterator) (btx *btree.ReadTx, held ReadTx, err error) {
+	if pi, ok := inner.(*planIterator); ok {
+		return pi.tx.btreeReadTx(), nil, nil
+	}
+	tx, err := q.c.db.getReadTx(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err = q.c.alive(); err != nil {
+		_ = tx.Commit()
+		return nil, nil, err
+	}
+	return tx.btreeReadTx(), tx, nil
+}
+
+// lookupFunc serves $lookup point reads against btx. A missing key is a
+// non-match, not an error. The document is parsed owned into buf (stage-owned
+// scratch): valid until the stage reuses the same buf.
+func (c *collection) lookupFunc(btx *btree.ReadTx) aggregate.LookupFunc {
+	return func(key []byte, buf *syncpool.DocBuffer) (*anyenc.Value, error) {
+		var err error
+		buf.DocBuf, err = btx.AppendValue(c.ns, key, buf.DocBuf[:0])
+		if err != nil {
+			if errors.Is(err, btree.ErrKeyNotFound) {
+				return nil, nil
+			}
+			return nil, err
+		}
+		return buf.Parser.ParseOwned(buf.DocBuf)
+	}
 }
 
 func (q *aggQuery) Count(ctx context.Context) (count int, err error) {
@@ -300,14 +368,17 @@ type aggDoc struct {
 func (d aggDoc) Value() *anyenc.Value { return d.v }
 
 type aggIterator struct {
-	root   aggregate.Stage
-	inner  Iterator
-	actx   *aggregate.Ctx
-	c      *collection
-	buf    *syncpool.DocBuffer
-	cur    *anyenc.Value
-	err    error
-	closed bool
+	root  aggregate.Stage
+	inner Iterator
+	// lookupTx is the dedicated $lookup read tx opened when the inner
+	// iterator has none of its own (empty-prefix fast path); nil otherwise.
+	lookupTx ReadTx
+	actx     *aggregate.Ctx
+	c        *collection
+	buf      *syncpool.DocBuffer
+	cur      *anyenc.Value
+	err      error
+	closed   bool
 }
 
 func (it *aggIterator) Next() bool {
@@ -349,6 +420,9 @@ func (it *aggIterator) Close() error {
 	it.closed = true
 	it.root.Close()
 	err := it.inner.Close()
+	if it.lookupTx != nil {
+		err = errors.Join(err, it.lookupTx.Commit())
+	}
 	it.c.db.syncPool.ReleaseDocBuf(it.buf)
 	return err
 }

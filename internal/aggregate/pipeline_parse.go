@@ -89,6 +89,18 @@ type GroupSpec struct {
 	Accums []AccumSpec
 }
 
+// LookupSpec is a parsed $lookup stage, scoped to a self-join point lookup on
+// the primary key: From (optional) must name the aggregated collection itself
+// — the parser doesn't know that name, so the root package validates it at
+// execution setup — and the foreign field is always the primary key "id"
+// (enforced at parse time).
+type LookupSpec struct {
+	From       string // "" = self-join implied
+	LocalField string
+	LocalPath  []string
+	As         string
+}
+
 func (MatchSpec) stageSpec()     {}
 func (SortSpec) stageSpec()      {}
 func (SkipSpec) stageSpec()      {}
@@ -98,6 +110,7 @@ func (ProjectSpec) stageSpec()   {}
 func (AddFieldsSpec) stageSpec() {}
 func (UnwindSpec) stageSpec()    {}
 func (GroupSpec) stageSpec()     {}
+func (LookupSpec) stageSpec()    {}
 
 func (s MatchSpec) String() string {
 	parts := make([]string, 0, 1+len(s.Exprs))
@@ -172,6 +185,16 @@ func (s GroupSpec) String() string {
 	return b.String()
 }
 
+func (s LookupSpec) String() string {
+	var b strings.Builder
+	b.WriteString("$lookup {")
+	if s.From != "" {
+		fmt.Fprintf(&b, "%q:%q,", "from", s.From)
+	}
+	fmt.Fprintf(&b, `"localField":%q,"foreignField":"id","as":%q}`, s.LocalField, s.As)
+	return b.String()
+}
+
 func exprOrEmpty(e Expr) string {
 	if e == nil {
 		return "{}"
@@ -203,6 +226,7 @@ var stageParsers = map[string]func(*anyenc.Value) (StageSpec, error){
 	"$set":       parseAddFields, // alias
 	"$unwind":    parseUnwind,
 	"$group":     parseGroup,
+	"$lookup":    parseLookup,
 }
 
 // Stages returns the stage vocabulary accepted by the pipeline parser —
@@ -777,6 +801,88 @@ func parseAccum(name string, v *anyenc.Value) (AccumSpec, error) {
 	if perr != nil {
 		return AccumSpec{}, perr
 	}
+	return spec, nil
+}
+
+// parseLookup parses the $lookup stage, narrowed to a primary-key self-join:
+// {from?, localField, foreignField: "id", as}. The pipeline/let form and any
+// other foreignField are rejected — general cross-collection joins are out of
+// scope. foreignField may be omitted ("id" is the only legal value); a from
+// naming another collection parses fine and fails at execution setup, where
+// the aggregated collection's name is known.
+func parseLookup(v *anyenc.Value) (StageSpec, error) {
+	obj, err := v.Object()
+	if err != nil {
+		return nil, &query.ParseError{Op: "$lookup", Reason: "$lookup must be an object"}
+	}
+	var (
+		spec     LookupSpec
+		hasLocal bool
+		hasAs    bool
+		perr     error
+	)
+	obj.Visit(func(key []byte, val *anyenc.Value) {
+		if perr != nil {
+			return
+		}
+		switch string(key) {
+		case "from":
+			sb, e := val.StringBytes()
+			if e != nil {
+				perr = atPath(&query.ParseError{Op: "$lookup", Reason: "$lookup from must be a string collection name"}, "from")
+				return
+			}
+			spec.From = string(sb)
+		case "localField":
+			sb, e := val.StringBytes()
+			if e != nil || len(sb) == 0 {
+				perr = atPath(&query.ParseError{Op: "$lookup", Reason: "$lookup localField must be a non-empty string field path"}, "localField")
+				return
+			}
+			spec.LocalField = string(sb)
+			hasLocal = true
+		case "foreignField":
+			if sb, e := val.StringBytes(); e != nil || string(sb) != "id" {
+				perr = atPath(&query.ParseError{
+					Op:     "$lookup",
+					Reason: `only primary-key self-joins are supported: foreignField must be "id"`,
+				}, "foreignField")
+			}
+		case "as":
+			sb, e := val.StringBytes()
+			if e != nil {
+				perr = atPath(&query.ParseError{Op: "$lookup", Reason: "$lookup as must be a string field name"}, "as")
+				return
+			}
+			name := string(sb)
+			if ne := validateOutName(name); ne != nil {
+				perr = atPath(&query.ParseError{Op: "$lookup", Reason: "$lookup as: " + ne.Error()}, "as")
+				return
+			}
+			spec.As = name
+			hasAs = true
+		case "let", "pipeline":
+			perr = atPath(&query.ParseError{
+				Op:     "$lookup",
+				Reason: `pipeline-form $lookup is not supported: use {from?, localField, foreignField: "id", as}`,
+			}, string(key))
+		default:
+			perr = atPath(&query.ParseError{
+				Op:     "$lookup",
+				Reason: "unknown $lookup option: " + string(key),
+			}, string(key))
+		}
+	})
+	if perr != nil {
+		return nil, perr
+	}
+	if !hasLocal {
+		return nil, &query.ParseError{Op: "$lookup", Reason: "$lookup requires localField"}
+	}
+	if !hasAs {
+		return nil, &query.ParseError{Op: "$lookup", Reason: "$lookup requires as"}
+	}
+	spec.LocalPath = splitPath(spec.LocalField)
 	return spec, nil
 }
 

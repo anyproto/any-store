@@ -38,8 +38,10 @@ any JSON-marshalable Go value.
 | `$addFields` / `$set` | `{"$addFields": {"b": "$x.y"}}` | Overlays computed fields; an expression evaluating to missing removes the field. All expressions are evaluated against the **stage input** (Mongo): a field added by the same stage is not visible to its sibling expressions. |
 | `$unwind` | `"$tags"` or `{"path": "$tags", "preserveNullAndEmptyArrays": true}` | Default drops documents whose path is missing/null/empty; preserve emits them as-is (empty array: field removed). Non-array values pass through. |
 | `$group` | see below | Hash aggregation. |
+| `$lookup` | `{"$lookup": {"from"?: c, "localField": f, "foreignField": "id", "as": out}}` | Self-join point lookup on the primary key — see section 3.1. |
 
-Not supported in v1: `$lookup`, `$facet`, `$bucket`, exclusion projections,
+Not supported in v1: cross-collection and pipeline-form `$lookup` (see
+section 3.1), `$facet`, `$bucket`, exclusion projections,
 nested (dotted) output field names, and compute expression operators beyond
 the set of section 2 (`$dateToString`, `$toUpper`, ...) — the expression
 parser rejects unknown operators explicitly so they can be added compatibly
@@ -205,6 +207,51 @@ missing, keeps null), `$addToSet` (byte-equality dedup).
 > no int/long/decimal type tracking (divergence from Mongo, documented here
 > rather than half-emulated).
 
+## 3.1 $lookup: self-join point lookup
+
+```json
+{"$lookup": {"localField": "refs", "foreignField": "id", "as": "linked"}}
+```
+
+`$lookup` is scoped to the case the data model makes cheap: relation values
+are object ids and all objects live in one collection, so the join is a point
+lookup per streamed row. For each row it reads `localField` (any field path),
+resolves the value(s) as primary keys of the **same collection**, and sets
+`as` (same naming rules as `$project` outputs, replacing any existing field)
+to the array of matched full documents — always an array (Mongo semantics),
+empty when nothing matches.
+
+- `from` is optional; when present it must name the aggregated collection
+  itself — anything else fails `Iter`/`Count`/`Explain` with an error naming
+  both collections. `foreignField` is optional and must be `"id"` (the
+  primary key); any other value is a parse error. The pipeline/`let` form is
+  a parse error too.
+- A missing or **null** local value yields `[]`. Divergence from Mongo: the
+  primary key is never null, so `$lookup` never does Mongo's null-matching
+  join.
+- An **array** local value is set membership (Mongo semantics): elements are
+  deduplicated by first occurrence, and the output keeps first-occurrence
+  order (Mongo leaves the order unspecified). A null element is skipped; an
+  element of a type no stored key has (or a dangling id) simply doesn't
+  match — no error.
+- A document may match itself (single hop, no recursion).
+- Expression paths do not traverse into the `as` array: `"$linked.id"` yields
+  missing, unlike Mongo's array-collecting path semantics (pre-existing
+  expression behavior). `$unwind` the `as` field before referencing subfields
+  of the matched documents.
+- Point lookups run inside the **same snapshot** the pipeline streams from,
+  at any pipeline position — after `$group`, `localField` can name a group
+  key, resolving keys back to their documents:
+
+```json
+[{"$group": {"_id": "$assignee", "n": {"$count": {}}}},
+ {"$lookup": {"localField": "id", "as": "assigneeDoc"}}]
+```
+
+The stage is streaming and alloc-free in steady state for single-id lookups
+(fetched documents reuse per-stage buffers); an id array only allocates while
+growing the stage's high-water match count.
+
 ## 4. Pushdown: what the planner executes
 
 `Aggregate` splits the longest pushable prefix — `$match` chain (folded into
@@ -224,8 +271,8 @@ hands it to the regular query planner. That means:
   ordinary keys push down, the expressions run as a residual streaming `$match`
   (section 2.1) — visible in `Explain` as a `Stages:` entry.
 
-Pushdown stops at the first `$group`/`$project`/`$addFields`/`$unwind`/`$count`
-or any out-of-canonical-order stage; the remainder runs in-pipeline. An
+Pushdown stops at the first `$group`/`$project`/`$addFields`/`$unwind`/
+`$count`/`$lookup` or any out-of-canonical-order stage; the remainder runs in-pipeline. An
 in-pipeline `$sort` directly followed by `$skip`/`$limit` keeps only the top
 `skip+limit` rows (heap + packed arena, O(K) memory).
 

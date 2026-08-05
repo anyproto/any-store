@@ -58,7 +58,7 @@ func runPipeline(t *testing.T, src Stage, pipeline string, limits Limits) []stri
 	t.Helper()
 	specs, err := ParsePipeline(pipeline)
 	require.NoError(t, err)
-	root, err := Build(src, specs, limits)
+	root, err := Build(src, specs, limits, Env{})
 	require.NoError(t, err)
 	defer root.Close()
 	ctx := newTestCtx()
@@ -279,7 +279,7 @@ func TestCountStageCancellation(t *testing.T) {
 	ctx := newTestCtx()
 	ctx.Context = cctx
 
-	root, err := Build(&endlessSource{}, MustParsePipeline(`[{"$count": "n"}]`), Limits{})
+	root, err := Build(&endlessSource{}, MustParsePipeline(`[{"$count": "n"}]`), Limits{}, Env{})
 	require.NoError(t, err)
 	defer root.Close()
 	_, err = root.Next(ctx)
@@ -335,7 +335,7 @@ func TestStreamingStagesAllocFree(t *testing.T) {
 		{"$addFields": {"n2": "$o.n"}},
 		{"$unwind": "$t"},
 		{"$project": {"t": 1, "n2": 1, "pt": {"v": "$a"}}}
-	]`), Limits{})
+	]`), Limits{}, Env{})
 	require.NoError(t, err)
 	defer root.Close()
 	ctx := newTestCtx()
@@ -373,7 +373,7 @@ func TestMatchExprAllocFree(t *testing.T) {
 	}
 	root, err := Build(exprMatchFixture(), MustParsePipeline(`[
 		{"$match": {"$expr": {"$gt": ["$allocated", "$capacity"]}}}
-	]`), Limits{})
+	]`), Limits{}, Env{})
 	require.NoError(t, err)
 	defer root.Close()
 	ctx := newTestCtx()
@@ -398,7 +398,7 @@ func TestMatchExprAllocFree(t *testing.T) {
 func BenchmarkMatchExprStage(b *testing.B) {
 	root, err := Build(exprMatchFixture(), MustParsePipeline(`[
 		{"$match": {"$expr": {"$gt": ["$allocated", "$capacity"]}}}
-	]`), Limits{})
+	]`), Limits{}, Env{})
 	if err != nil {
 		b.Fatal(err)
 	}

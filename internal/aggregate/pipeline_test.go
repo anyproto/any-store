@@ -139,6 +139,14 @@ func TestSplitPrefix(t *testing.T) {
 	})
 }
 
+func TestBuildLookupRequiresEnv(t *testing.T) {
+	specs := MustParsePipeline(`[{"$lookup": {"localField": "a", "as": "d"}}]`)
+	assert.True(t, HasLookup(specs))
+	assert.False(t, HasLookup(specs[:0]))
+	_, err := Build(newSliceSource(), specs, Limits{}, Env{})
+	assert.ErrorContains(t, err, "requires an injected LookupFunc")
+}
+
 func TestExplainStages(t *testing.T) {
 	out := ExplainStages(MustParsePipeline(`[
 		{"$group": {"_id": "$a", "n": {"$count": {}}}},

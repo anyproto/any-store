@@ -1,6 +1,7 @@
 package aggregate
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -105,13 +106,15 @@ func ExplainStages(p Pipeline) string {
 
 // Build compiles parsed stage specs into an executable stage chain on top of
 // source. The source must reset Ctx.RowArena once per row it yields (it is
-// the default row owner).
+// the default row owner). env carries the execution hooks the root package
+// injects (the $lookup point-read function).
 //
-// Build also performs the arena-ownership analysis: $project / $addFields get
-// permission to reset RowArena before pulling (freeing the previous row) when
-// no stage below them keeps arena-allocated data alive across pulls. This
-// keeps the arena footprint O(row) under $unwind row multiplication.
-func Build(source Stage, specs Pipeline, limits Limits) (Stage, error) {
+// Build also performs the arena-ownership analysis: $project / $addFields /
+// $lookup get permission to reset RowArena before pulling (freeing the
+// previous row) when no stage below them keeps arena-allocated data alive
+// across pulls. This keeps the arena footprint O(row) under $unwind row
+// multiplication.
+func Build(source Stage, specs Pipeline, limits Limits, env Env) (Stage, error) {
 	limits = limits.WithDefaults()
 	cur := source
 	// rowOnArena: rows at this point of the chain may be (or contain)
@@ -162,6 +165,17 @@ func Build(source Stage, specs Pipeline, limits Limits) (Stage, error) {
 				heldOnArena = true
 			}
 			multiEmit = true
+		case LookupSpec:
+			if env.Lookup == nil {
+				return nil, errors.New("aggregate: $lookup requires an injected LookupFunc")
+			}
+			// $lookup overlays the "as" array (arena-allocated container) onto
+			// the document in place, like $addFields overlays computed fields:
+			// same arena-reset permission, same undo under upstream $unwind
+			// multi-emit (a later row of the same document must read localField
+			// from the stored fields, not the previous row's overlay).
+			cur = &LookupStage{Src: cur, Spec: sp, Lookup: env.Lookup, resetArena: !heldOnArena, undoOverlay: multiEmit}
+			rowOnArena = true
 		case GroupSpec:
 			cur = newGroupStage(cur, sp, limits)
 			// $group drains its upstream completely before emitting; emitted
@@ -180,6 +194,17 @@ func Build(source Stage, specs Pipeline, limits Limits) (Stage, error) {
 		}
 	}
 	return cur, nil
+}
+
+// HasLookup reports whether the pipeline contains a $lookup spec (the root
+// package injects Env.Lookup — and keeps a read tx for it — only then).
+func HasLookup(p Pipeline) bool {
+	for _, spec := range p {
+		if _, ok := spec.(LookupSpec); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // foldTopK returns skip+limit when an in-pipeline $sort is immediately

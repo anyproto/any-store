@@ -2,6 +2,7 @@ package aggregate
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -21,7 +22,7 @@ func TestParsePipeline(t *testing.T) {
 		assert.ErrorContains(t, err, "exactly one key")
 	})
 	t.Run("unknown stage", func(t *testing.T) {
-		_, err := ParsePipeline(`[{"$lookup":{}}]`)
+		_, err := ParsePipeline(`[{"$facet":{}}]`)
 		assert.ErrorContains(t, err, "unknown stage")
 	})
 	t.Run("stage error includes index", func(t *testing.T) {
@@ -300,6 +301,70 @@ func TestParseGroup(t *testing.T) {
 		assert.ErrorContains(t, err, "dotted")
 		_, err = ParsePipeline(`[{"$group": {"_id": null, "n": {"$sum": "$a", "$avg": "$a"}}}]`)
 		assert.ErrorContains(t, err, "must be an accumulator object")
+	})
+}
+
+func TestParseLookup(t *testing.T) {
+	t.Run("full form", func(t *testing.T) {
+		p := MustParsePipeline(`[{"$lookup": {"from": "objects", "localField": "links.to", "foreignField": "id", "as": "linked"}}]`)
+		s := p[0].(LookupSpec)
+		assert.Equal(t, "objects", s.From)
+		assert.Equal(t, "links.to", s.LocalField)
+		assert.Equal(t, []string{"links", "to"}, s.LocalPath)
+		assert.Equal(t, "linked", s.As)
+		assert.Equal(t, `$lookup {"from":"objects","localField":"links.to","foreignField":"id","as":"linked"}`, s.String())
+	})
+	t.Run("self form", func(t *testing.T) {
+		// from and foreignField are optional: self-join on "id" is implied.
+		p := MustParsePipeline(`[{"$lookup": {"localField": "ref", "as": "refDoc"}}]`)
+		s := p[0].(LookupSpec)
+		assert.Empty(t, s.From)
+		assert.Equal(t, `$lookup {"localField":"ref","foreignField":"id","as":"refDoc"}`, s.String())
+	})
+	t.Run("string round-trip", func(t *testing.T) {
+		for _, j := range []string{
+			`{"localField": "ref", "as": "d"}`,
+			`{"from": "c", "localField": "a.b", "foreignField": "id", "as": "out"}`,
+		} {
+			s := MustParsePipeline(`[{"$lookup": ` + j + `}]`)[0].String()
+			obj, ok := strings.CutPrefix(s, "$lookup ")
+			require.True(t, ok, s)
+			again := MustParsePipeline(`[{"$lookup": ` + obj + `}]`)[0].String()
+			assert.Equal(t, s, again)
+		}
+	})
+	t.Run("foreignField not id", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$lookup": {"localField": "a", "foreignField": "ref", "as": "d"}}]`)
+		assert.ErrorContains(t, err, "only primary-key self-joins")
+		var pe *query.ParseError
+		require.ErrorAs(t, err, &pe)
+		assert.Equal(t, "0.$lookup.foreignField", pe.Path)
+	})
+	t.Run("missing as", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$lookup": {"localField": "a"}}]`)
+		assert.ErrorContains(t, err, "requires as")
+	})
+	t.Run("missing localField", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$lookup": {"as": "d"}}]`)
+		assert.ErrorContains(t, err, "requires localField")
+	})
+	t.Run("pipeline form rejected", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$lookup": {"from": "c", "let": {"x": "$a"}, "pipeline": [], "as": "d"}}]`)
+		assert.ErrorContains(t, err, "pipeline-form $lookup is not supported")
+	})
+	t.Run("unknown option", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$lookup": {"localField": "a", "as": "d", "bogus": 1}}]`)
+		assert.ErrorContains(t, err, "unknown $lookup option")
+	})
+	t.Run("invalid as", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$lookup": {"localField": "a", "as": "$d"}}]`)
+		assert.ErrorContains(t, err, "must not start with $")
+		_, err = ParsePipeline(`[{"$lookup": {"localField": "a", "as": "d.e"}}]`)
+		assert.ErrorContains(t, err, "dotted")
+	})
+	t.Run("not an object", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$lookup": "x"}]`)
+		assert.ErrorContains(t, err, "must be an object")
 	})
 }
 
@@ -582,9 +647,15 @@ func TestPipelineParseError(t *testing.T) {
 		},
 		{
 			name:     "unknown stage",
-			json:     `[{"$lookup":{}}]`,
-			wantPath: "0.$lookup", wantOp: "$lookup",
-			wantReason: "unknown stage: $lookup", wantIs: query.ErrUnknownOperator,
+			json:     `[{"$facet":{}}]`,
+			wantPath: "0.$facet", wantOp: "$facet",
+			wantReason: "unknown stage: $facet", wantIs: query.ErrUnknownOperator,
+		},
+		{
+			name:     "$lookup foreignField not the pk",
+			json:     `[{"$lookup":{"localField":"a","foreignField":"ref","as":"d"}}]`,
+			wantPath: "0.$lookup.foreignField", wantOp: "$lookup",
+			wantReason: "only primary-key self-joins are supported",
 		},
 		{
 			name:     "bad filter in a later $match names the stage index",
@@ -836,8 +907,8 @@ func TestPipelineParseError(t *testing.T) {
 func TestStages(t *testing.T) {
 	stages := Stages()
 	assert.Equal(t, []string{
-		"$addFields", "$count", "$group", "$limit", "$match", "$project",
-		"$set", "$skip", "$sort", "$unwind",
+		"$addFields", "$count", "$group", "$limit", "$lookup", "$match",
+		"$project", "$set", "$skip", "$sort", "$unwind",
 	}, stages)
 
 	// The slice is a fresh copy: mutating it must not poison later calls.
