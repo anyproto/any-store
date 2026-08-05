@@ -156,4 +156,13 @@ func TestExplainStages(t *testing.T) {
 	assert.Contains(t, out, "1. $group")
 	assert.Contains(t, out, "topK 10")
 	assert.Contains(t, out, "3. $limit 10")
+
+	// The $sort+$limit fold is annotated inside $facet sub-pipelines too, so
+	// Explain never understates the retained set.
+	out = ExplainStages(MustParsePipeline(`[{"$facet": {
+		"top": [{"$sort": {"v": -1}}, {"$limit": 3}],
+		"n": [{"$count": "n"}]
+	}}]`))
+	assert.Contains(t, out, `"top":[$sort {"v":-1} (topK 3), $limit 3]`)
+	assert.Contains(t, out, `"n":[$count "n"]`)
 }

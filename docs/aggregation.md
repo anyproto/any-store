@@ -39,9 +39,10 @@ any JSON-marshalable Go value.
 | `$unwind` | `"$tags"` or `{"path": "$tags", "preserveNullAndEmptyArrays": true}` | Default drops documents whose path is missing/null/empty; preserve emits them as-is (empty array: field removed). Non-array values pass through. |
 | `$group` | see below | Hash aggregation. |
 | `$lookup` | `{"$lookup": {"from"?: c, "localField": f, "foreignField": "id", "as": out}}` | Self-join point lookup on the primary key — see section 3.1. |
+| `$facet` | `{"$facet": {"name": [stage...], ...}}` | Named sub-pipelines over one shared scan — see section 3.2. |
 
 Not supported in v1: cross-collection and pipeline-form `$lookup` (see
-section 3.1), `$facet`, `$bucket`, exclusion projections,
+section 3.1), `$bucket`, exclusion projections,
 nested (dotted) output field names, and compute expression operators beyond
 the set of section 2 (`$dateToString`, `$toUpper`, ...) — the expression
 parser rejects unknown operators explicitly so they can be added compatibly
@@ -252,6 +253,40 @@ The stage is streaming and alloc-free in steady state for single-id lookups
 (fetched documents reuse per-stage buffers); an id array only allocates while
 growing the stage's high-water match count.
 
+## 3.2 $facet: sub-pipelines over one scan
+
+```json
+[{"$match": {"space": "s1"}},
+ {"$facet": {
+     "total":  [{"$count": "n"}],
+     "byType": [{"$group": {"_id": "$type", "n": {"$count": {}}}}],
+     "recent": [{"$sort": {"modified": -1}}, {"$limit": 5}]
+ }}]
+```
+
+`$facet` feeds every input row to each named sub-pipeline and emits **exactly
+one document** `{"total": [...], "byType": [...], "recent": [...]}` — each
+field the full result array of its sub-pipeline. This is the dashboard
+pattern: N widgets over one shared scan instead of N independent scans.
+
+- At least one facet; names follow output-field naming rules; each value is a
+  non-empty pipeline of any supported stage **except `$facet` itself** (no
+  nesting, as in Mongo). `$lookup` inside a facet works, at the same
+  snapshot.
+- Empty input yields empty arrays (`$count` still emits its zero row, as it
+  does standalone).
+- A `$match` **before** `$facet` participates in prefix pushdown as usual —
+  that shared indexed scan is the point. A `$match` at the head of a
+  sub-pipeline filters the shared stream in-flight and never becomes index
+  bounds; `$text`/`$knn` are therefore rejected inside facets (section 4).
+- Facet result arrays are inherently buffered: their bytes count against the
+  shared memory budget (section 5). Sub-pipeline `$sort`/`$group` stages keep
+  their own bounds, including the `$sort`+`$limit` top-K fold.
+- Stages after `$facet` see the single result document (`$unwind` a facet
+  array to keep processing it).
+- The fan-out itself does not allocate per row; once every facet has
+  satisfied a `$limit`, the scan stops early.
+
 ## 4. Pushdown: what the planner executes
 
 `Aggregate` splits the longest pushable prefix — `$match` chain (folded into
@@ -272,7 +307,7 @@ hands it to the regular query planner. That means:
   (section 2.1) — visible in `Explain` as a `Stages:` entry.
 
 Pushdown stops at the first `$group`/`$project`/`$addFields`/`$unwind`/
-`$count`/`$lookup` or any out-of-canonical-order stage; the remainder runs in-pipeline. An
+`$count`/`$lookup`/`$facet` or any out-of-canonical-order stage; the remainder runs in-pipeline. An
 in-pipeline `$sort` directly followed by `$skip`/`$limit` keeps only the top
 `skip+limit` rows (heap + packed arena, O(K) memory).
 
@@ -298,8 +333,9 @@ Stages:
 ## 5. Limits and memory
 
 Streaming stages retain nothing and are allocation-free in steady state.
-Blocking stages (`$group`, in-pipeline `$sort`) retain data and are bounded;
-exceeding a bound aborts the iteration with a sentinel error:
+Blocking stages (`$group`, in-pipeline `$sort`, `$facet` result buffers)
+retain data and are bounded; exceeding a bound aborts the iteration with a
+sentinel error:
 
 | Bound | Default | Override | Error |
 |---|---|---|---|

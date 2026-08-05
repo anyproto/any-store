@@ -139,11 +139,21 @@ func (q *aggQuery) prefixQuery() (*collQuery, aggregate.Pipeline, error) {
 //     an in-pipeline $match — which compilePlan's guard never sees, because
 //     only the pushdown prefix reaches the compiler — must reject it itself.
 func (q *aggQuery) validateInPipelineStages(rest aggregate.Pipeline) error {
-	var (
-		vidxs  []*vectorIndex
-		loaded bool
-	)
-	for _, spec := range rest {
+	v := &aggStageValidator{q: q}
+	return v.validate(rest)
+}
+
+// aggStageValidator carries the lazily loaded vector-index list across the
+// recursive walk into $facet sub-pipelines.
+type aggStageValidator struct {
+	q      *aggQuery
+	vidxs  []*vectorIndex
+	loaded bool
+}
+
+func (val *aggStageValidator) validate(p aggregate.Pipeline) error {
+	q := val.q
+	for _, spec := range p {
 		switch sp := spec.(type) {
 		case aggregate.LookupSpec:
 			// $lookup is scoped to a self-join on the primary key: "from" may
@@ -162,11 +172,19 @@ func (q *aggQuery) validateInPipelineStages(rest aggregate.Pipeline) error {
 			if query.ContainsKnn(sp.Filter) {
 				return errAggVectorNotInPrefix
 			}
-			if !loaded {
-				vidxs, loaded = q.c.loadVectorIndexes(), true
+			if !val.loaded {
+				val.vidxs, val.loaded = q.c.loadVectorIndexes(), true
 			}
-			if err := rejectLegacyVectorClause(sp.Filter, vidxs); err != nil {
+			if err := rejectLegacyVectorClause(sp.Filter, val.vidxs); err != nil {
 				return err
+			}
+		case aggregate.FacetSpec:
+			// Facet sub-pipelines never reach the access planner: the same
+			// in-pipeline restrictions apply inside them.
+			for _, sub := range sp.Pipelines {
+				if err := val.validate(sub); err != nil {
+					return err
+				}
 			}
 		}
 	}

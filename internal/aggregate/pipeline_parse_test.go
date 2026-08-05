@@ -22,7 +22,7 @@ func TestParsePipeline(t *testing.T) {
 		assert.ErrorContains(t, err, "exactly one key")
 	})
 	t.Run("unknown stage", func(t *testing.T) {
-		_, err := ParsePipeline(`[{"$facet":{}}]`)
+		_, err := ParsePipeline(`[{"$bucket":{}}]`)
 		assert.ErrorContains(t, err, "unknown stage")
 	})
 	t.Run("stage error includes index", func(t *testing.T) {
@@ -368,6 +368,75 @@ func TestParseLookup(t *testing.T) {
 	})
 }
 
+func TestParseFacet(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		p := MustParsePipeline(`[{"$facet": {
+			"count": [{"$count": "n"}],
+			"top": [{"$match": {"v": {"$gte": 5}}}, {"$sort": {"v": -1}}, {"$limit": 2}]
+		}}]`)
+		s := p[0].(FacetSpec)
+		assert.Equal(t, []string{"count", "top"}, s.Names)
+		require.Len(t, s.Pipelines, 2)
+		assert.Len(t, s.Pipelines[0], 1)
+		assert.Len(t, s.Pipelines[1], 3)
+	})
+	t.Run("string", func(t *testing.T) {
+		p := MustParsePipeline(`[{"$facet": {"a": [{"$count": "n"}], "b": [{"$skip": 1}, {"$limit": 2}]}}]`)
+		assert.Equal(t, `$facet {"a":[$count "n"],"b":[$skip 1, $limit 2]}`, p[0].String())
+	})
+	t.Run("empty facet object", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$facet": {}}]`)
+		assert.ErrorContains(t, err, "requires at least one facet")
+	})
+	t.Run("not an object", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$facet": []}]`)
+		assert.ErrorContains(t, err, "$facet must be an object")
+	})
+	t.Run("empty sub-pipeline", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$facet": {"a": []}}]`)
+		assert.ErrorContains(t, err, "facet pipeline must not be empty")
+	})
+	t.Run("sub-pipeline not an array", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$facet": {"a": {"$count": "n"}}}]`)
+		assert.ErrorContains(t, err, "facet must be a pipeline array")
+	})
+	t.Run("nested facet rejected", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$facet": {"a": [{"$facet": {"b": [{"$count": "n"}]}}]}}]`)
+		assert.ErrorContains(t, err, "$facet cannot be nested")
+		var pe *query.ParseError
+		require.ErrorAs(t, err, &pe)
+		assert.Equal(t, "0.$facet.a.0", pe.Path)
+	})
+	t.Run("duplicate facet name", func(t *testing.T) {
+		// JSON input cannot express duplicate keys (the JSON parser keeps the
+		// last one); splice a second copy at the anyenc encoding level, like
+		// TestDuplicateStructuredParams.
+		base := anyenc.MustParseJson(`{"a":[{"$count":"n"}]}`).MarshalTo(nil)
+		kv := anyenc.MustParseJson(`{"a":[{"$skip":1}]}`).MarshalTo(nil)
+		v, perr := (&anyenc.Parser{}).Parse(append(base[:len(base)-1], kv[1:]...))
+		require.NoError(t, perr)
+		_, err := parseFacet(v)
+		assert.ErrorContains(t, err, "duplicate facet name: a")
+		var pe *query.ParseError
+		require.ErrorAs(t, err, &pe)
+		assert.Equal(t, "a", pe.Path)
+	})
+	t.Run("bad facet name", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$facet": {"$a": [{"$count": "n"}]}}]`)
+		assert.ErrorContains(t, err, "must not start with $")
+		_, err = ParsePipeline(`[{"$facet": {"a.b": [{"$count": "n"}]}}]`)
+		assert.ErrorContains(t, err, "dotted")
+	})
+	t.Run("sub-stage error path", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$facet": {"b": [{"$skip": 0}, {"$limit": 0}]}}]`)
+		assert.ErrorContains(t, err, "$limit must be a positive integer")
+		var pe *query.ParseError
+		require.ErrorAs(t, err, &pe)
+		assert.Equal(t, "0.$facet.b.1.$limit", pe.Path)
+		assert.Equal(t, "pipeline", pe.Source)
+	})
+}
+
 func TestParseExpr(t *testing.T) {
 	a := &anyenc.Arena{}
 	doc := anyenc.MustParseJson(`{"a": {"b": 7}, "s": "str", "arr": [1,2]}`)
@@ -647,9 +716,9 @@ func TestPipelineParseError(t *testing.T) {
 		},
 		{
 			name:     "unknown stage",
-			json:     `[{"$facet":{}}]`,
-			wantPath: "0.$facet", wantOp: "$facet",
-			wantReason: "unknown stage: $facet", wantIs: query.ErrUnknownOperator,
+			json:     `[{"$bucket":{}}]`,
+			wantPath: "0.$bucket", wantOp: "$bucket",
+			wantReason: "unknown stage: $bucket", wantIs: query.ErrUnknownOperator,
 		},
 		{
 			name:     "$lookup foreignField not the pk",
@@ -907,8 +976,8 @@ func TestPipelineParseError(t *testing.T) {
 func TestStages(t *testing.T) {
 	stages := Stages()
 	assert.Equal(t, []string{
-		"$addFields", "$count", "$group", "$limit", "$lookup", "$match",
-		"$project", "$set", "$skip", "$sort", "$unwind",
+		"$addFields", "$count", "$facet", "$group", "$limit", "$lookup",
+		"$match", "$project", "$set", "$skip", "$sort", "$unwind",
 	}, stages)
 
 	// The slice is a fresh copy: mutating it must not poison later calls.

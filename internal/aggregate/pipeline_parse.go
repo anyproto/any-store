@@ -3,6 +3,7 @@ package aggregate
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -89,6 +90,13 @@ type GroupSpec struct {
 	Accums []AccumSpec
 }
 
+// FacetSpec is a parsed $facet stage: named sub-pipelines fanned out over one
+// shared input stream. Names and Pipelines are parallel, in spec order.
+type FacetSpec struct {
+	Names     []string
+	Pipelines []Pipeline
+}
+
 // LookupSpec is a parsed $lookup stage, scoped to a self-join point lookup on
 // the primary key: From (optional) must name the aggregated collection itself
 // — the parser doesn't know that name, so the root package validates it at
@@ -111,6 +119,7 @@ func (AddFieldsSpec) stageSpec() {}
 func (UnwindSpec) stageSpec()    {}
 func (GroupSpec) stageSpec()     {}
 func (LookupSpec) stageSpec()    {}
+func (FacetSpec) stageSpec()     {}
 
 func (s MatchSpec) String() string {
 	parts := make([]string, 0, 1+len(s.Exprs))
@@ -195,6 +204,26 @@ func (s LookupSpec) String() string {
 	return b.String()
 }
 
+func (s FacetSpec) String() string {
+	var b strings.Builder
+	b.WriteString("$facet {")
+	for i, name := range s.Names {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "%q:[", name)
+		for j := range s.Pipelines[i] {
+			if j > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(stageString(s.Pipelines[i], j))
+		}
+		b.WriteByte(']')
+	}
+	b.WriteByte('}')
+	return b.String()
+}
+
 func exprOrEmpty(e Expr) string {
 	if e == nil {
 		return "{}"
@@ -227,6 +256,12 @@ var stageParsers = map[string]func(*anyenc.Value) (StageSpec, error){
 	"$unwind":    parseUnwind,
 	"$group":     parseGroup,
 	"$lookup":    parseLookup,
+}
+
+// $facet is registered in init: parseFacet recurses through parseStage, which
+// reads stageParsers — a literal entry would be an initialization cycle.
+func init() {
+	stageParsers["$facet"] = parseFacet
 }
 
 // Stages returns the stage vocabulary accepted by the pipeline parser —
@@ -883,6 +918,70 @@ func parseLookup(v *anyenc.Value) (StageSpec, error) {
 		return nil, &query.ParseError{Op: "$lookup", Reason: "$lookup requires as"}
 	}
 	spec.LocalPath = splitPath(spec.LocalField)
+	return spec, nil
+}
+
+// parseFacet parses {"$facet": {name: [stage...], ...}}: at least one facet,
+// names following output-field naming rules, each value a non-empty pipeline
+// array. $facet inside a facet is rejected (Mongo forbids nesting).
+//
+// SYN-129 exclusion point: when $merge/$out land, reject them inside facets
+// here too — side-effect stages must not run fanned out over a shared scan.
+func parseFacet(v *anyenc.Value) (StageSpec, error) {
+	obj, err := v.Object()
+	if err != nil {
+		return nil, &query.ParseError{Op: "$facet", Reason: "$facet must be an object of named pipelines"}
+	}
+	if obj.Len() == 0 {
+		return nil, &query.ParseError{Op: "$facet", Reason: "$facet requires at least one facet"}
+	}
+	var (
+		spec FacetSpec
+		perr error
+	)
+	obj.Visit(func(key []byte, val *anyenc.Value) {
+		if perr != nil {
+			return
+		}
+		name := string(key)
+		if e := validateOutName(name); e != nil {
+			perr = &query.ParseError{Op: "$facet", Reason: "$facet: " + e.Error()}
+			return
+		}
+		if slices.Contains(spec.Names, name) {
+			// Last-wins would silently execute both pipelines and discard one
+			// facet's results.
+			perr = atPath(&query.ParseError{Op: "$facet", Reason: "duplicate facet name: " + name}, name)
+			return
+		}
+		if val.Type() != anyenc.TypeArray {
+			perr = atPath(&query.ParseError{Op: "$facet", Reason: "facet must be a pipeline array"}, name)
+			return
+		}
+		arr, _ := val.Array()
+		if len(arr) == 0 {
+			perr = atPath(&query.ParseError{Op: "$facet", Reason: "facet pipeline must not be empty"}, name)
+			return
+		}
+		sub := make(Pipeline, 0, len(arr))
+		for i, el := range arr {
+			st, e := parseStage(el)
+			if e != nil {
+				perr = atPath(atPath(e, strconv.Itoa(i)), name)
+				return
+			}
+			if _, nested := st.(FacetSpec); nested {
+				perr = atPath(atPath(&query.ParseError{Op: "$facet", Reason: "$facet cannot be nested"}, strconv.Itoa(i)), name)
+				return
+			}
+			sub = append(sub, st)
+		}
+		spec.Names = append(spec.Names, name)
+		spec.Pipelines = append(spec.Pipelines, sub)
+	})
+	if perr != nil {
+		return nil, perr
+	}
 	return spec, nil
 }
 

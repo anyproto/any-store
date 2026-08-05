@@ -498,6 +498,156 @@ func TestCollection_AggregateLookup(t *testing.T) {
 	})
 }
 
+func TestCollection_Aggregate_Facet(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "widgets")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"cat"}}))
+	var docs []*anyenc.Value
+	const n = 40
+	for i := 0; i < n; i++ {
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(
+			`{"id":%d,"cat":"c%d","v":%d,"ref":%d}`, i, i%4, i, (i+1)%n)))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+
+	facets := map[string]string{
+		"count": `[{"$count": "n"}]`,
+		"byCat": `[{"$group": {"_id": "$cat", "total": {"$sum": "$v"}}}, {"$sort": {"id": 1}}]`,
+		"top3":  `[{"$sort": {"v": -1}}, {"$limit": 3}, {"$project": {"id": 1, "v": 1}}]`,
+		"high":  `[{"$match": {"v": {"$gte": 30}}}, {"$count": "n"}]`,
+	}
+	dashboard := fmt.Sprintf(`[{"$facet": {"count": %s, "byCat": %s, "top3": %s, "high": %s}}]`,
+		facets["count"], facets["byCat"], facets["top3"], facets["high"])
+
+	t.Run("dashboard equals standalone runs", func(t *testing.T) {
+		got := aggRows(t, coll, coll.Aggregate(dashboard))
+		require.Len(t, got, 1)
+		doc := anyenc.MustParseJson(got[0])
+		for name, sub := range facets {
+			want := aggRows(t, coll, coll.Aggregate(sub))
+			arr := doc.GetArray(name)
+			require.Len(t, arr, len(want), name)
+			for i, el := range arr {
+				assert.Equal(t, want[i], el.String(), name)
+			}
+		}
+	})
+
+	t.Run("empty input", func(t *testing.T) {
+		got := aggRows(t, coll, coll.Aggregate(
+			`[{"$match": {"id": {"$in": []}}}, `+dashboard[1:]))
+		assert.Equal(t, expectJson(t,
+			`{"count":[{"n":0}],"byCat":[],"top3":[],"high":[{"n":0}]}`,
+		), got)
+	})
+
+	t.Run("match before facet pushes down", func(t *testing.T) {
+		q := coll.Aggregate(`[
+			{"$match": {"cat": "c1"}},
+			{"$facet": {
+				"n": [{"$count": "n"}],
+				"sum": [{"$group": {"_id": null, "s": {"$sum": "$v"}}}]
+			}}
+		]`)
+		explain, eerr := q.Explain(ctx)
+		require.NoError(t, eerr)
+		var used bool
+		for _, ie := range explain.Indexes {
+			if ie.Used && ie.Name == "cat" {
+				used = true
+			}
+		}
+		assert.True(t, used, "the shared scan must use the pushed $match:\n%s", explain.Plan)
+		assert.Contains(t, explain.Plan, "Pushdown: filter=")
+		assert.Contains(t, explain.Plan, "$facet")
+		// c1: v = 1,5,...,37 — 10 docs, sum 190.
+		got := aggRows(t, coll, q)
+		assert.Equal(t, expectJson(t, `{"n":[{"n":10}],"sum":[{"id":null,"s":190}]}`), got)
+	})
+
+	t.Run("lookup inside a facet", func(t *testing.T) {
+		got := aggRows(t, coll, coll.Aggregate(`[
+			{"$match": {"id": 0}},
+			{"$facet": {
+				"linked": [{"$lookup": {"localField": "ref", "as": "r"}}, {"$project": {"id": 1, "r": 1}}],
+				"raw": [{"$project": {"id": 1}}]
+			}}
+		]`))
+		assert.Equal(t, expectJson(t,
+			`{"linked":[{"id":0,"r":[{"id":1,"cat":"c1","v":1,"ref":2}]}],"raw":[{"id":0}]}`,
+		), got)
+	})
+
+	t.Run("stages after facet", func(t *testing.T) {
+		got := aggRows(t, coll, coll.Aggregate(`[
+			{"$facet": {"count": [{"$count": "n"}]}},
+			{"$unwind": "$count"},
+			{"$project": {"total": "$count.n"}}
+		]`))
+		assert.Equal(t, expectJson(t, `{"total":40}`), got)
+	})
+
+	t.Run("memory limit applies to facet buffers", func(t *testing.T) {
+		_, err := coll.Aggregate(`[{"$facet": {"all": [{"$match": {}}]}}]`).
+			MemoryLimit(64).Count(ctx)
+		assert.ErrorIs(t, err, ErrAggMemoryLimitExceeded)
+	})
+}
+
+// BenchmarkAggregateFacetDashboard compares the one-scan $facet dashboard
+// against running its sub-pipelines as separate full scans (the pattern
+// $facet exists to replace).
+func BenchmarkAggregateFacetDashboard(b *testing.B) {
+	fx := newFixture(b)
+	coll, err := fx.CreateCollection(ctx, "widgets")
+	require.NoError(b, err)
+	tx, err := coll.WriteTx(ctx)
+	require.NoError(b, err)
+	const n = 10_000
+	for i := range n {
+		require.NoError(b, coll.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(
+			`{"id":%d,"cat":"c%d","v":%d,"pad":"%0256d"}`, i, i%16, i, i))))
+	}
+	require.NoError(b, tx.Commit())
+
+	subs := []string{
+		`[{"$count": "n"}]`,
+		`[{"$group": {"_id": "$cat", "total": {"$sum": "$v"}}}]`,
+		`[{"$sort": {"v": -1}}, {"$limit": 5}, {"$project": {"id": 1, "v": 1}}]`,
+		`[{"$match": {"v": {"$gte": 5000}}}, {"$count": "n"}]`,
+	}
+	facet := fmt.Sprintf(`[{"$facet": {"a": %s, "b": %s, "c": %s, "d": %s}}]`,
+		subs[0], subs[1], subs[2], subs[3])
+	run := func(b *testing.B, pipeline string) {
+		iter, ierr := coll.Aggregate(pipeline).Iter(ctx)
+		if ierr != nil {
+			b.Fatal(ierr)
+		}
+		for iter.Next() {
+		}
+		if cerr := iter.Err(); cerr != nil {
+			b.Fatal(cerr)
+		}
+		_ = iter.Close()
+	}
+
+	b.Run("facet", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			run(b, facet)
+		}
+	})
+	b.Run("separate", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			for _, sub := range subs {
+				run(b, sub)
+			}
+		}
+	})
+}
+
 // BenchmarkAggregateLookup measures the steady-state per-row cost of a
 // single-id $lookup over a warm store; the iterator reopen every n rows is
 // amortized noise.

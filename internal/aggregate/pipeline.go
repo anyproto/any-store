@@ -92,16 +92,23 @@ loop:
 // including the top-K annotation a following $skip/$limit folds into $sort.
 func ExplainStages(p Pipeline) string {
 	var b strings.Builder
-	for i, spec := range p {
-		s := spec.String()
-		if ss, ok := spec.(SortSpec); ok {
-			if k := foldTopK(p[i+1:]); k > 0 {
-				s = (&SortStage{Spec: ss, TopK: k}).String()
-			}
-		}
-		fmt.Fprintf(&b, "  %d. %s\n", i+1, s)
+	for i := range p {
+		fmt.Fprintf(&b, "  %d. %s\n", i+1, stageString(p, i))
 	}
 	return b.String()
+}
+
+// stageString renders p[i] for Explain output, annotating a $sort with the
+// (topK n) bound a following $skip/$limit folds in (Build applies the same
+// fold, so the rendering never understates the retained set). FacetSpec's
+// String uses it for sub-pipeline stages too.
+func stageString(p Pipeline, i int) string {
+	if ss, ok := p[i].(SortSpec); ok {
+		if k := foldTopK(p[i+1:]); k > 0 {
+			return (&SortStage{Spec: ss, TopK: k}).String()
+		}
+	}
+	return p[i].String()
 }
 
 // Build compiles parsed stage specs into an executable stage chain on top of
@@ -189,6 +196,28 @@ func Build(source Stage, specs Pipeline, limits Limits, env Env) (Stage, error) 
 			// Emitted rows are owned by the stage parser; nothing below stays
 			// live after the drain.
 			rowOnArena, heldOnArena, multiEmit = false, false, false
+		case FacetSpec:
+			// $facet fans each row out to N sub-pipelines and blocks until the
+			// stream ends. Ownership across the fan-out: every sub-pipeline is
+			// built (recursively, same analysis) on a private Ctx with its own
+			// arena, so sub-chain arena resets can never free the shared row or
+			// another facet's data; sub-stages that defer consumption already
+			// own their copies ($sort/$group marshal what they retain, and the
+			// facet marshals every emitted result doc immediately); sub-chains
+			// that mutate rows in place ($addFields/$lookup/$unwind before a
+			// row-rebuilding stage) are fed a private re-parse of the row, so
+			// the shared document reaches every facet unmodified — including
+			// when a mid-stream $limit finishes a chain before its undo runs.
+			// See stage_facet.go.
+			st, err := newFacetStage(cur, sp, limits, env)
+			if err != nil {
+				return nil, err
+			}
+			cur = st
+			// The single facet document is built after the drain (arrays on
+			// stage-owned parsers, wrapper object on RowArena); nothing below
+			// is live anymore.
+			rowOnArena, heldOnArena, multiEmit = true, false, false
 		default:
 			return nil, fmt.Errorf("aggregate: unsupported stage: %T", sp)
 		}
@@ -196,12 +225,20 @@ func Build(source Stage, specs Pipeline, limits Limits, env Env) (Stage, error) 
 	return cur, nil
 }
 
-// HasLookup reports whether the pipeline contains a $lookup spec (the root
-// package injects Env.Lookup — and keeps a read tx for it — only then).
+// HasLookup reports whether the pipeline contains a $lookup spec, including
+// inside $facet sub-pipelines (the root package injects Env.Lookup — and
+// keeps a read tx for it — only then).
 func HasLookup(p Pipeline) bool {
 	for _, spec := range p {
-		if _, ok := spec.(LookupSpec); ok {
+		switch sp := spec.(type) {
+		case LookupSpec:
 			return true
+		case FacetSpec:
+			for _, sub := range sp.Pipelines {
+				if HasLookup(sub) {
+					return true
+				}
+			}
 		}
 	}
 	return false
