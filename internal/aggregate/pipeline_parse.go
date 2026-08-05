@@ -1,6 +1,7 @@
 package aggregate
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -21,7 +22,14 @@ type StageSpec interface {
 	stageSpec()
 }
 
-type MatchSpec struct{ Filter query.Filter }
+// MatchSpec is a parsed $match stage: the ordinary query-filter part and the
+// $expr predicates, AND-ed together. Filter is index-eligible when the stage
+// sits in the pushdown prefix; Exprs are always residual per-document
+// predicates (Mongo semantics) — they never become index bounds.
+type MatchSpec struct {
+	Filter query.Filter // nil when the spec is pure $expr (or empty)
+	Exprs  []Expr       // nil when the spec has no $expr
+}
 
 type SortSpec struct {
 	Sort   query.Sorts
@@ -91,7 +99,23 @@ func (AddFieldsSpec) stageSpec() {}
 func (UnwindSpec) stageSpec()    {}
 func (GroupSpec) stageSpec()     {}
 
-func (s MatchSpec) String() string { return fmt.Sprintf("$match %s", s.Filter) }
+func (s MatchSpec) String() string {
+	parts := make([]string, 0, 1+len(s.Exprs))
+	if s.Filter != nil {
+		parts = append(parts, s.Filter.String())
+	}
+	for _, e := range s.Exprs {
+		parts = append(parts, fmt.Sprintf(`{"$expr":%s}`, e))
+	}
+	switch len(parts) {
+	case 0:
+		return "$match {}"
+	case 1:
+		return "$match " + parts[0]
+	default:
+		return fmt.Sprintf(`$match {"$and":[%s]}`, strings.Join(parts, ", "))
+	}
+}
 
 func (s SortSpec) String() string {
 	var b strings.Builder
@@ -263,7 +287,16 @@ func parseStage(v *anyenc.Value) (StageSpec, error) {
 	return spec, serr
 }
 
+// parseMatch parses a $match spec. $expr predicates (aggregation expressions
+// used as per-document conditions, Mongo semantics) are intercepted here — the
+// query package's filter grammar never learns about them. $expr is accepted at
+// the top level of the spec and inside top-level $and arrays (a conjunction
+// splits cleanly into a filter part and an expression part); under $or/$nor,
+// where no such split exists, it is rejected with a dedicated parse error.
 func parseMatch(v *anyenc.Value) (StageSpec, error) {
+	if v.Type() == anyenc.TypeObject && filterHasExpr(v) {
+		return splitMatchExpr(v)
+	}
 	f, err := query.ParseCondition(v)
 	if err != nil {
 		// Already a *query.ParseError with a filter-relative Path; parseStage
@@ -271,6 +304,188 @@ func parseMatch(v *anyenc.Value) (StageSpec, error) {
 		return nil, err
 	}
 	return MatchSpec{Filter: f}, nil
+}
+
+// filterHasExpr reports whether a filter object carries "$expr" at a filter
+// position: its top level or the elements of $and/$or/$nor arrays. Field
+// condition values are never descended into — a nested "$expr" key there is
+// plain equality data, not an operator.
+func filterHasExpr(v *anyenc.Value) bool {
+	if v.Type() != anyenc.TypeObject {
+		return false
+	}
+	obj, _ := v.Object()
+	var found bool
+	obj.Visit(func(key []byte, val *anyenc.Value) {
+		if found {
+			return
+		}
+		switch string(key) {
+		case "$expr":
+			found = true
+		case "$and", "$or", "$nor":
+			found = arrayHasExpr(val)
+		}
+	})
+	return found
+}
+
+func arrayHasExpr(v *anyenc.Value) bool {
+	if v.Type() != anyenc.TypeArray {
+		return false
+	}
+	arr, _ := v.Array()
+	for _, el := range arr {
+		if filterHasExpr(el) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitMatchExpr splits a $match spec containing $expr into the ordinary
+// filter part (delegated to the query parser) and the expression predicates.
+func splitMatchExpr(v *anyenc.Value) (StageSpec, error) {
+	rest, exprs, remap, err := stripExpr(&anyenc.Arena{}, v)
+	if err != nil {
+		return nil, err
+	}
+	spec := MatchSpec{Exprs: exprs}
+	if rest != nil {
+		if spec.Filter, err = query.ParseCondition(rest); err != nil {
+			return nil, remapAndPath(err, remap)
+		}
+	}
+	return spec, nil
+}
+
+// andRemap maps a stripped $and's kept element indices back to their original
+// positions in the user's spec ($expr-only elements are dropped, shifting the
+// rest). sub carries the remap of a kept element's own stripped $and, so
+// nested strips compose.
+type andRemap struct {
+	orig []int             // kept index -> original index
+	sub  map[int]*andRemap // kept index -> that element's remap, if stripped
+}
+
+// remapAndPath rewrites the leading "$and.<n>" segments of a *query.ParseError
+// Path from stripped-array indices back to the original spec's, so the error
+// points at the element the user wrote.
+func remapAndPath(err error, rm *andRemap) error {
+	if rm == nil {
+		return err
+	}
+	var pe *query.ParseError
+	if errors.As(err, &pe) {
+		pe.Path = rm.rewrite(pe.Path)
+	}
+	return err
+}
+
+func (rm *andRemap) rewrite(path string) string {
+	tail, ok := strings.CutPrefix(path, "$and.")
+	if !ok {
+		return path
+	}
+	idxStr, tail, hasTail := strings.Cut(tail, ".")
+	k, aerr := strconv.Atoi(idxStr)
+	if aerr != nil || k < 0 || k >= len(rm.orig) {
+		return path
+	}
+	head := "$and." + strconv.Itoa(rm.orig[k])
+	if !hasTail {
+		return head
+	}
+	if sub := rm.sub[k]; sub != nil {
+		tail = sub.rewrite(tail)
+	}
+	return head + "." + tail
+}
+
+// stripExpr parses out the $expr keys of a filter object (recursing into $and
+// elements) and rebuilds the object without them on a. A nil rest means every
+// key was $expr; remap tracks the original indices of kept $and elements for
+// error-path rewriting (remapAndPath).
+func stripExpr(a *anyenc.Arena, v *anyenc.Value) (rest *anyenc.Value, exprs []Expr, remap *andRemap, err error) {
+	obj, _ := v.Object() // callers verified v is an object
+	out := a.NewObject()
+	kept := 0
+	obj.Visit(func(key []byte, val *anyenc.Value) {
+		if err != nil {
+			return
+		}
+		switch string(key) {
+		case "$expr":
+			var e Expr
+			if e, err = ParseExpr(val); err != nil {
+				err = atPath(err, "$expr")
+				return
+			}
+			exprs = append(exprs, e)
+		case "$and":
+			if !arrayHasExpr(val) {
+				// No $expr inside (or a malformed $and, which the filter
+				// parser reports itself).
+				out.Set("$and", val)
+				kept++
+				return
+			}
+			arr, _ := val.Array()
+			restArr := a.NewArray()
+			rm := &andRemap{}
+			cnt := 0
+			for i, el := range arr {
+				if !filterHasExpr(el) {
+					restArr.SetArrayItem(cnt, el)
+					rm.orig = append(rm.orig, i)
+					cnt++
+					continue
+				}
+				subRest, subExprs, subRemap, subErr := stripExpr(a, el)
+				if subErr != nil {
+					err = atPath(atPath(subErr, strconv.Itoa(i)), "$and")
+					return
+				}
+				exprs = append(exprs, subExprs...)
+				if subRest != nil {
+					restArr.SetArrayItem(cnt, subRest)
+					rm.orig = append(rm.orig, i)
+					if subRemap != nil {
+						if rm.sub == nil {
+							rm.sub = map[int]*andRemap{}
+						}
+						rm.sub[cnt] = subRemap
+					}
+					cnt++
+				}
+			}
+			if cnt > 0 {
+				out.Set("$and", restArr)
+				kept++
+				remap = rm
+			}
+		case "$or", "$nor":
+			if arrayHasExpr(val) {
+				err = atPath(&query.ParseError{
+					Op:     "$expr",
+					Reason: "$expr is not supported under " + string(key) + ": use it at the top level of $match or inside $and",
+				}, string(key))
+				return
+			}
+			out.Set(string(key), val)
+			kept++
+		default:
+			out.Set(string(key), val)
+			kept++
+		}
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if kept == 0 {
+		return nil, exprs, nil, nil
+	}
+	return out, exprs, remap, nil
 }
 
 func parseSortStage(v *anyenc.Value) (StageSpec, error) {

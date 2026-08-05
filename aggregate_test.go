@@ -185,6 +185,85 @@ func TestCollection_Aggregate_IndexPushdown(t *testing.T) {
 	assert.Equal(t, expectJson(t, `{"id":"c1","top":[97,93,89]}`), got)
 }
 
+func TestCollection_Aggregate_ExprMatch(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"cat"}}))
+
+	var docs []*anyenc.Value
+	for i := 0; i < 100; i++ {
+		docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(
+			`{"id":%d,"cat":"c%d","allocated":%d,"capacity":50}`, i, i%4, i)))
+	}
+	require.NoError(t, coll.Insert(ctx, docs...))
+
+	t.Run("filter pushed, $expr residual", func(t *testing.T) {
+		q := coll.Aggregate(`[
+			{"$match": {"cat": "c1", "$expr": {"$gt": ["$allocated", "$capacity"]}}}
+		]`)
+		explain, err := q.Explain(ctx)
+		require.NoError(t, err)
+		var used bool
+		for _, ie := range explain.Indexes {
+			if ie.Used && ie.Name == "cat" {
+				used = true
+			}
+		}
+		assert.True(t, used, "the ordinary part must still use the cat index:\n%s", explain.Plan)
+		assert.Contains(t, explain.Plan, "Pushdown: filter=")
+		assert.NotContains(t, explain.Plan, `Pushdown: filter={"$expr"`)
+		assert.Contains(t, explain.Plan, `1. $match {"$expr":{$gt:[$allocated,$capacity]}}`)
+
+		// cat=c1: ids 1,5,...,97; allocated>50: 53,57,...,97 → 12 rows.
+		n, err := q.Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 12, n)
+	})
+
+	t.Run("pure $expr is a full scan with the residual applied", func(t *testing.T) {
+		q := coll.Aggregate(`[
+			{"$match": {"$expr": {"$gt": ["$allocated", "$capacity"]}}},
+			{"$count": "n"}
+		]`)
+		explain, err := q.Explain(ctx)
+		require.NoError(t, err)
+		for _, ie := range explain.Indexes {
+			assert.False(t, ie.Used, "pure $expr must not drive an index:\n%s", explain.Plan)
+		}
+		assert.NotContains(t, explain.Plan, "Pushdown: filter=")
+		assert.Contains(t, explain.Plan, `1. $match {"$expr"`)
+
+		got := aggRows(t, coll, q)
+		assert.Equal(t, expectJson(t, `{"n":49}`), got) // allocated 51..99
+	})
+
+	t.Run("residual respects in-pipeline limit", func(t *testing.T) {
+		// $limit after an $expr match must apply after the predicate, so it
+		// cannot be pushed into the access plan.
+		got := aggRows(t, coll, coll.Aggregate(`[
+			{"$match": {"$expr": {"$gt": ["$allocated", "$capacity"]}}},
+			{"$sort": {"allocated": 1}},
+			{"$limit": 2},
+			{"$project": {"allocated": 1}}
+		]`))
+		assert.Equal(t, expectJson(t, `{"allocated":51}`, `{"allocated":52}`), got)
+	})
+
+	t.Run("$expr against accumulator output", func(t *testing.T) {
+		got := aggRows(t, coll, coll.Aggregate(`[
+			{"$group": {"_id": "$cat", "n": {"$count": {}}, "over": {"$sum": {"$cond": [{"$gt": ["$allocated", "$capacity"]}, 1, 0]}}}},
+			{"$match": {"$expr": {"$gt": ["$over", 12]}}},
+			{"$sort": {"id": 1}}
+		]`))
+		require.NotEmpty(t, got)
+		for _, j := range got {
+			v := anyenc.MustParseJson(j)
+			assert.Greater(t, v.GetFloat64("over"), float64(12), j)
+		}
+	})
+}
+
 func TestCollection_Aggregate_FulltextPrefix(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "test")

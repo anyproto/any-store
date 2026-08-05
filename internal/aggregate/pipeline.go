@@ -25,10 +25,18 @@ type Prefix struct {
 // $skip/$limit does not commute, and out-of-order combinations are rare
 // enough that running them in-pipeline (correct, just unoptimized) beats
 // rewrite complexity.
+//
+// $expr predicates are never pushed into the access plan: a leading $match's
+// ordinary filter part enters the prefix (index-eligible) while its
+// expressions come back as a synthesized residual MatchSpec at the head of
+// the remaining stages. A following $sort may still be pushed — filtering a
+// sorted stream preserves its order — but $skip/$limit may not: they would
+// truncate before the residual predicate runs.
 func SplitPrefix(p Pipeline) (Prefix, Pipeline) {
 	var (
 		pre     Prefix
 		filters []query.Filter
+		exprs   []Expr
 		phase   int // 0: $match, 1: $sort, 2: $skip, 3: $limit
 		i       int
 	)
@@ -39,7 +47,10 @@ loop:
 			if phase > 0 {
 				break loop
 			}
-			filters = append(filters, sp.Filter)
+			if sp.Filter != nil {
+				filters = append(filters, sp.Filter)
+			}
+			exprs = append(exprs, sp.Exprs...)
 		case SortSpec:
 			if phase >= 1 {
 				break loop
@@ -47,13 +58,13 @@ loop:
 			pre.Sort = sp.Sort
 			phase = 1
 		case SkipSpec:
-			if phase >= 2 {
+			if phase >= 2 || len(exprs) > 0 {
 				break loop
 			}
 			pre.Skip = sp.N
 			phase = 2
 		case LimitSpec:
-			if phase >= 3 {
+			if phase >= 3 || len(exprs) > 0 {
 				break loop
 			}
 			pre.Limit = sp.N
@@ -69,7 +80,11 @@ loop:
 	default:
 		pre.Filter = query.And(filters)
 	}
-	return pre, p[i:]
+	rest := p[i:]
+	if len(exprs) > 0 {
+		rest = append(Pipeline{MatchSpec{Exprs: exprs}}, rest...)
+	}
+	return pre, rest
 }
 
 // ExplainStages renders the in-pipeline stage list for Explain output,
@@ -110,7 +125,15 @@ func Build(source Stage, specs Pipeline, limits Limits) (Stage, error) {
 	for i := 0; i < len(specs); i++ {
 		switch sp := specs[i].(type) {
 		case MatchSpec:
-			cur = &MatchStage{Src: cur, Filter: sp.Filter}
+			cur = &MatchStage{
+				Src:    cur,
+				Filter: sp.Filter,
+				Exprs:  sp.Exprs,
+				// Expression temporaries live on RowArena; free the previous
+				// row's before pulling the next one whenever nothing below
+				// holds arena data across pulls (same rule as $project).
+				resetArena: len(sp.Exprs) > 0 && !heldOnArena,
+			}
 		case SkipSpec:
 			cur = &SkipStage{Src: cur, N: sp.N}
 		case LimitSpec:

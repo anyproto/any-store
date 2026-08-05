@@ -30,7 +30,7 @@ any JSON-marshalable Go value.
 
 | Stage | Form | Notes |
 |---|---|---|
-| `$match` | `{"$match": <filter>}` | The full `Find()` filter language, including `$text` and `$knn` clauses. |
+| `$match` | `{"$match": <filter>}` | The full `Find()` filter language, including `$text` and `$knn` clauses, plus `$expr` (aggregation expressions as predicates — see section 2.1). |
 | `$sort` | `{"$sort": {"a": 1, "b.c": -1}}` | 1 ascending, -1 descending; anyenc value order across types; missing sorts as null. Stable. |
 | `$skip` / `$limit` | `{"$skip": 10}` / `{"$limit": 5}` | |
 | `$count` | `{"$count": "n"}` | Terminal: emits the single document `{"n": <count>}`. |
@@ -137,6 +137,44 @@ A single non-array operand is Mongo's shorthand for a one-element list
 > differences, `$add`/`$subtract` shifts) are float64: exact only up to 2^53
 > ms, i.e. within roughly year ±285,000.
 
+## 2.1 $expr: expressions as $match predicates
+
+`{"$match": {"$expr": E}}` evaluates the aggregation expression `E` per
+document and keeps the row when the result is truthy (`$cond` truthiness:
+`false`, `0`, `null`, missing → drop; everything else — including `""`, `[]`,
+`{}` — keep). This enables field-to-field predicates the filter language
+cannot express:
+
+```json
+{"$match": {"$expr": {"$gt": ["$allocated", "$capacity"]}}}
+```
+
+- `$expr` may coexist with ordinary filter keys — `{"$match": {"cat": "a",
+  "$expr": E}}` means `cat = "a" AND E` — and may appear inside a top-level
+  `$and` array (a conjunction splits cleanly). Under `$or`/`$nor` it is
+  rejected with a dedicated parse error, and inside a field condition
+  (`{"a": {"$not": {"$expr": ...}}}`) it is an unknown operator — no silent
+  misparse.
+- `$expr` is **always a residual per-document predicate** (Mongo semantics):
+  it never becomes index bounds. In a leading `$match`, the ordinary filter
+  keys are still pushed into the access plan (indexes, CBO) with the
+  expression applied as a residual on top; a pure-`$expr` `$match` at the
+  pipeline head is a full scan. A following `$sort` can still push (filtering
+  a sorted stream preserves order), but `$skip`/`$limit` stay in-pipeline —
+  they must apply after the predicate.
+- The same contract holds inside one `$match` mixing `$expr` with `$text` or
+  `$knn`: the ordinary keys reach the planner with the ranked source as usual,
+  while `$expr` filters **after** the ranked scan — for `$knn` that means
+  after the `$k`-bounded page, so it can shrink the result below `$k`.
+- After `$group`/`$project`/..., `$expr` sees that stage's output (e.g.
+  accumulator fields).
+- Evaluation is alloc-free in steady state, like the other streaming stages.
+
+`Find()` filters do **not** accept `$expr` — it is rejected as
+`unknown operator: $expr` (`query.ErrUnknownOperator`). Field-to-field
+predicates belong in an aggregation `$match`:
+`coll.Aggregate('[{"$match": {"$expr": ...}}]')`.
+
 ## 3. $group
 
 ```json
@@ -181,7 +219,10 @@ hands it to the regular query planner. That means:
   prefix denotes at most `$k` documents — downstream `$group`/`$count` stages
   aggregate exactly that page, never a silently `ef`-truncated stream;
 - `{"$match": {"x": {"$in": []}}}` short-circuits to an empty source with no
-  I/O.
+  I/O;
+- `$expr` predicates in the leading `$match` chain never enter the plan: the
+  ordinary keys push down, the expressions run as a residual streaming `$match`
+  (section 2.1) — visible in `Explain` as a `Stages:` entry.
 
 Pushdown stops at the first `$group`/`$project`/`$addFields`/`$unwind`/`$count`
 or any out-of-canonical-order stage; the remainder runs in-pipeline. An

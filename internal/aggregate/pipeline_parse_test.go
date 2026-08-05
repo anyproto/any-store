@@ -60,6 +60,97 @@ func TestParsePipeline(t *testing.T) {
 	})
 }
 
+func TestParseMatchExpr(t *testing.T) {
+	t.Run("pure expr", func(t *testing.T) {
+		p := MustParsePipeline(`[{"$match": {"$expr": {"$gt": ["$a", "$b"]}}}]`)
+		s := p[0].(MatchSpec)
+		assert.Nil(t, s.Filter)
+		require.Len(t, s.Exprs, 1)
+		assert.Equal(t, `$match {"$expr":{$gt:[$a,$b]}}`, s.String())
+	})
+	t.Run("mixed spec splits", func(t *testing.T) {
+		p := MustParsePipeline(`[{"$match": {"a": 1, "$expr": {"$gt": ["$x", "$y"]}}}]`)
+		s := p[0].(MatchSpec)
+		require.NotNil(t, s.Filter)
+		require.Len(t, s.Exprs, 1)
+		assert.Contains(t, s.String(), `"a"`)
+		assert.Contains(t, s.String(), `{"$expr":{$gt:[$x,$y]}}`)
+		assert.Contains(t, s.String(), `"$and"`)
+	})
+	t.Run("nested in top-level $and", func(t *testing.T) {
+		p := MustParsePipeline(`[{"$match": {"$and": [
+			{"a": 1},
+			{"$expr": {"$gt": ["$x", "$y"]}},
+			{"b": 2, "$expr": {"$eq": ["$p", "$q"]}}
+		]}}]`)
+		s := p[0].(MatchSpec)
+		require.NotNil(t, s.Filter)
+		require.Len(t, s.Exprs, 2)
+		assert.Equal(t, `{$gt:[$x,$y]}`, s.Exprs[0].String())
+		assert.Equal(t, `{$eq:[$p,$q]}`, s.Exprs[1].String())
+		fs := s.Filter.String()
+		assert.Contains(t, fs, `"a"`)
+		assert.Contains(t, fs, `"b"`)
+	})
+	t.Run("$and of only exprs leaves no filter", func(t *testing.T) {
+		p := MustParsePipeline(`[{"$match": {"$and": [
+			{"$expr": {"$gt": ["$x", 1]}},
+			{"$expr": {"$lt": ["$x", 9]}}
+		]}}]`)
+		s := p[0].(MatchSpec)
+		assert.Nil(t, s.Filter)
+		assert.Len(t, s.Exprs, 2)
+	})
+	t.Run("rejected under $or and $nor", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$match": {"$or": [{"a": 1}, {"$expr": {"$gt": ["$x", "$y"]}}]}}]`)
+		assert.ErrorContains(t, err, "$expr is not supported under $or")
+		assert.ErrorContains(t, err, "(at 0.$match.$or)")
+		_, err = ParsePipeline(`[{"$match": {"$nor": [{"$expr": true}]}}]`)
+		assert.ErrorContains(t, err, "$expr is not supported under $nor")
+		// Nested one level down inside $and still reports the $or placement.
+		_, err = ParsePipeline(`[{"$match": {"$and": [{"$or": [{"$expr": true}]}]}}]`)
+		assert.ErrorContains(t, err, "$expr is not supported under $or")
+		assert.ErrorContains(t, err, "(at 0.$match.$and.0.$or)")
+	})
+	t.Run("field-level $expr stays a filter error", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$match": {"a": {"$expr": 1}}}]`)
+		assert.ErrorContains(t, err, "unknown operator: $expr")
+		assert.ErrorIs(t, err, query.ErrUnknownOperator)
+	})
+	t.Run("$expr key deep inside an equality value is data", func(t *testing.T) {
+		p := MustParsePipeline(`[{"$match": {"a": {"b": {"$expr": 1}}}}]`)
+		s := p[0].(MatchSpec)
+		assert.NotNil(t, s.Filter)
+		assert.Empty(t, s.Exprs)
+	})
+	t.Run("expression parse error located", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$match": {"$expr": {"$bogus": 1}}}]`)
+		assert.ErrorContains(t, err, "unsupported expression operator: $bogus")
+		assert.ErrorContains(t, err, "(at 0.$match.$expr.$bogus)")
+		assert.ErrorIs(t, err, query.ErrUnknownOperator)
+	})
+	t.Run("stripped filter error still structured", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$match": {"$expr": true, "a": {"$sizee": 1}}}]`)
+		assert.ErrorContains(t, err, "unknown operator: $sizee")
+		assert.ErrorIs(t, err, query.ErrUnknownOperator)
+	})
+	t.Run("filter error keeps original $and indices", func(t *testing.T) {
+		// The $expr-only element 0 is stripped out before the filter parse;
+		// the error must still point at element 1 of the user's spec.
+		_, err := ParsePipeline(`[{"$match": {"$and": [{"$expr": true}, {"b": {"$sizee": 1}}]}}]`)
+		assert.ErrorContains(t, err, "unknown operator: $sizee")
+		assert.ErrorContains(t, err, "(at 0.$match.$and.1.b.$sizee)")
+	})
+	t.Run("nested $and filter error keeps original indices", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$match": {"$and": [
+			{"$expr": true},
+			{"$and": [{"$expr": true}, {"c": {"$bogus": 1}}]}
+		]}}]`)
+		assert.ErrorContains(t, err, "unknown operator: $bogus")
+		assert.ErrorContains(t, err, "(at 0.$match.$and.1.$and.1.c.$bogus)")
+	})
+}
+
 func TestParseSortStage(t *testing.T) {
 	t.Run("directions", func(t *testing.T) {
 		p := MustParsePipeline(`[{"$sort": {"a.b": 1, "c": -1}}]`)

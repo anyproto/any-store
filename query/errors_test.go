@@ -37,6 +37,15 @@ func TestParseError(t *testing.T) {
 			wantReason: "unknown operator", wantIs: ErrUnknownOperator,
 		},
 		{
+			// $expr is an aggregation-only operator: internal/aggregate
+			// intercepts it in $match before this parser runs. A plain Find
+			// filter rejects it as a vocabulary miss.
+			name: "aggregation $expr rejected in a plain filter",
+			json: `{"$expr":{"$gt":["$a","$b"]}}`,
+			wantPath: "$expr", wantOp: "$expr",
+			wantReason: "unknown operator: $expr", wantIs: ErrUnknownOperator,
+		},
+		{
 			name: "unknown operator under $and names the element index",
 			json: `{"$and":[{"a":1},{"b":{"$foo":2}}]}`,
 			wantPath: "$and.1.b.$foo", wantOp: "$foo",

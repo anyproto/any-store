@@ -18,7 +18,10 @@ import (
 // $limit in canonical order) is compiled into a regular query and executed by
 // the access planner — indexes, CBO, full-text ($text) and vector sources all
 // apply, including their _score/_distance virtual fields. The remaining
-// stages stream over the result inside the same read transaction.
+// stages stream over the result inside the same read transaction. $expr
+// predicates in $match are always residual per-document conditions: the
+// ordinary filter keys around them still push down, the expressions never
+// become index bounds (see docs/aggregation.md).
 //
 // An AggQuery and the Iterator it produces are single-goroutine (never shared
 // across goroutines): compiled expressions carry per-pipeline scratch state
