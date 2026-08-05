@@ -256,6 +256,8 @@ var stageParsers = map[string]func(*anyenc.Value) (StageSpec, error){
 	"$unwind":    parseUnwind,
 	"$group":     parseGroup,
 	"$lookup":    parseLookup,
+	"$merge":     parseMerge,
+	"$out":       parseOut,
 }
 
 // $facet is registered in init: parseFacet recurses through parseStage, which
@@ -310,6 +312,16 @@ func ParsePipeline(pipeline any) (Pipeline, error) {
 	for i, el := range arr {
 		spec, err := parseStage(el)
 		if err != nil {
+			return nil, withSource(atPath(err, strconv.Itoa(i)), "pipeline")
+		}
+		// $merge / $out write their side effect when the pipeline runs: any
+		// stage after them would silently see nothing (Mongo also requires
+		// them last).
+		if name := sinkName(spec); name != "" && i != len(arr)-1 {
+			err = atPath(&query.ParseError{
+				Op:     name,
+				Reason: name + " must be the last pipeline stage",
+			}, name)
 			return nil, withSource(atPath(err, strconv.Itoa(i)), "pipeline")
 		}
 		res = append(res, spec)
@@ -923,10 +935,9 @@ func parseLookup(v *anyenc.Value) (StageSpec, error) {
 
 // parseFacet parses {"$facet": {name: [stage...], ...}}: at least one facet,
 // names following output-field naming rules, each value a non-empty pipeline
-// array. $facet inside a facet is rejected (Mongo forbids nesting).
-//
-// SYN-129 exclusion point: when $merge/$out land, reject them inside facets
-// here too — side-effect stages must not run fanned out over a shared scan.
+// array. $facet inside a facet is rejected (Mongo forbids nesting), and so
+// are the $merge/$out sinks — side-effect stages must not run fanned out
+// over a shared scan.
 func parseFacet(v *anyenc.Value) (StageSpec, error) {
 	obj, err := v.Object()
 	if err != nil {
@@ -972,6 +983,10 @@ func parseFacet(v *anyenc.Value) (StageSpec, error) {
 			}
 			if _, nested := st.(FacetSpec); nested {
 				perr = atPath(atPath(&query.ParseError{Op: "$facet", Reason: "$facet cannot be nested"}, strconv.Itoa(i)), name)
+				return
+			}
+			if sn := sinkName(st); sn != "" {
+				perr = atPath(atPath(&query.ParseError{Op: sn, Reason: sn + " is not allowed inside $facet"}, strconv.Itoa(i)), name)
 				return
 			}
 			sub = append(sub, st)

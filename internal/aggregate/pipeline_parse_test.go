@@ -977,7 +977,8 @@ func TestStages(t *testing.T) {
 	stages := Stages()
 	assert.Equal(t, []string{
 		"$addFields", "$count", "$facet", "$group", "$limit", "$lookup",
-		"$match", "$project", "$set", "$skip", "$sort", "$unwind",
+		"$match", "$merge", "$out", "$project", "$set", "$skip", "$sort",
+		"$unwind",
 	}, stages)
 
 	// The slice is a fresh copy: mutating it must not poison later calls.
@@ -994,4 +995,143 @@ func TestAccumulators(t *testing.T) {
 
 	accums[0] = "$corrupted"
 	assert.Equal(t, "$addToSet", Accumulators()[0])
+}
+
+func TestParseOut(t *testing.T) {
+	t.Run("ok", func(t *testing.T) {
+		p := MustParsePipeline(`[{"$out": "target"}]`)
+		require.Len(t, p, 1)
+		assert.Equal(t, OutSpec{Coll: "target"}, p[0])
+		assert.Equal(t, `$out "target"`, p[0].String())
+	})
+	t.Run("db-qualified form rejected", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$out": {"db": "d", "coll": "c"}}]`)
+		assert.ErrorContains(t, err, "db-qualified form is not supported")
+	})
+	t.Run("empty name", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$out": ""}]`)
+		assert.ErrorContains(t, err, "must not be empty")
+	})
+	t.Run("must be last", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$out": "t"}, {"$limit": 1}]`)
+		assert.ErrorContains(t, err, "$out must be the last pipeline stage")
+		assert.ErrorContains(t, err, "(at 0.$out)")
+	})
+	t.Run("rejected inside facet", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$facet": {"f": [{"$out": "t"}]}}]`)
+		assert.ErrorContains(t, err, "$out is not allowed inside $facet")
+	})
+}
+
+func TestParseMerge(t *testing.T) {
+	t.Run("string shorthand", func(t *testing.T) {
+		p := MustParsePipeline(`[{"$merge": "target"}]`)
+		require.Len(t, p, 1)
+		assert.Equal(t, MergeSpec{Into: "target"}, p[0])
+		// Zero values are the defaults.
+		assert.Equal(t,
+			`$merge {"into":"target","on":"id","whenMatched":"merge","whenNotMatched":"insert"}`,
+			p[0].String())
+	})
+	t.Run("full object", func(t *testing.T) {
+		p := MustParsePipeline(`[{"$merge": {
+			"into": "t", "on": "id",
+			"whenMatched": "keepExisting", "whenNotMatched": "discard"
+		}}]`)
+		assert.Equal(t, MergeSpec{
+			Into:           "t",
+			WhenMatched:    MergeMatchedKeepExisting,
+			WhenNotMatched: MergeNotMatchedDiscard,
+		}, p[0])
+	})
+	t.Run("all enum values", func(t *testing.T) {
+		for name, want := range map[string]MergeWhenMatched{
+			"replace": MergeMatchedReplace, "keepExisting": MergeMatchedKeepExisting,
+			"merge": MergeMatchedMerge, "fail": MergeMatchedFail,
+		} {
+			p := MustParsePipeline(`[{"$merge": {"into": "t", "whenMatched": "` + name + `"}}]`)
+			assert.Equal(t, want, p[0].(MergeSpec).WhenMatched, name)
+		}
+		for name, want := range map[string]MergeWhenNotMatched{
+			"insert": MergeNotMatchedInsert, "discard": MergeNotMatchedDiscard,
+			"fail": MergeNotMatchedFail,
+		} {
+			p := MustParsePipeline(`[{"$merge": {"into": "t", "whenNotMatched": "` + name + `"}}]`)
+			assert.Equal(t, want, p[0].(MergeSpec).WhenNotMatched, name)
+		}
+	})
+	t.Run("string round-trip", func(t *testing.T) {
+		src := `[{"$merge": {"into": "t", "whenMatched": "replace", "whenNotMatched": "fail"}}]`
+		p := MustParsePipeline(src)
+		p2 := MustParsePipeline(`[{"$merge": ` + strings.TrimPrefix(p[0].String(), "$merge ") + `}]`)
+		assert.Equal(t, p[0], p2[0])
+	})
+	t.Run("into required", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$merge": {"whenMatched": "merge"}}]`)
+		assert.ErrorContains(t, err, "$merge requires into")
+	})
+	t.Run("db-qualified into rejected", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$merge": {"into": {"db": "d", "coll": "c"}}}]`)
+		assert.ErrorContains(t, err, "db-qualified form is not supported")
+	})
+	t.Run("on must be id", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$merge": {"into": "t", "on": "sku"}}]`)
+		assert.ErrorContains(t, err, `on must be "id"`)
+		_, err = ParsePipeline(`[{"$merge": {"into": "t", "on": ["id"]}}]`)
+		assert.ErrorContains(t, err, `on must be "id"`)
+	})
+	t.Run("bad whenMatched", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$merge": {"into": "t", "whenMatched": "upsert"}}]`)
+		assert.ErrorContains(t, err, "whenMatched must be one of")
+	})
+	t.Run("pipeline-form whenMatched rejected", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$merge": {"into": "t", "whenMatched": [{"$addFields": {"a": 1}}]}}]`)
+		assert.ErrorContains(t, err, "pipeline-form whenMatched is not supported")
+		_, err = ParsePipeline(`[{"$merge": {"into": "t", "let": {"new": "$$ROOT"}}}]`)
+		assert.ErrorContains(t, err, "not supported")
+	})
+	t.Run("bad whenNotMatched", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$merge": {"into": "t", "whenNotMatched": "replace"}}]`)
+		assert.ErrorContains(t, err, "whenNotMatched must be one of")
+	})
+	t.Run("unknown option", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$merge": {"into": "t", "nope": 1}}]`)
+		assert.ErrorContains(t, err, "unknown $merge option")
+	})
+	t.Run("must be last", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$match": {}}, {"$merge": "t"}, {"$limit": 1}]`)
+		assert.ErrorContains(t, err, "$merge must be the last pipeline stage")
+		assert.ErrorContains(t, err, "(at 1.$merge)")
+	})
+	t.Run("last is fine", func(t *testing.T) {
+		p := MustParsePipeline(`[{"$group": {"_id": "$c"}}, {"$merge": "t"}]`)
+		require.Len(t, p, 2)
+		sink, rest := CutSink(p)
+		assert.Equal(t, MergeSpec{Into: "t"}, sink)
+		require.Len(t, rest, 1)
+	})
+	t.Run("rejected inside facet", func(t *testing.T) {
+		_, err := ParsePipeline(`[{"$facet": {"f": [{"$limit": 1}, {"$merge": "t"}]}}]`)
+		assert.ErrorContains(t, err, "$merge is not allowed inside $facet")
+	})
+}
+
+func TestCutSink(t *testing.T) {
+	t.Run("no sink", func(t *testing.T) {
+		p := MustParsePipeline(`[{"$limit": 1}]`)
+		sink, rest := CutSink(p)
+		assert.Nil(t, sink)
+		assert.Equal(t, p, rest)
+	})
+	t.Run("empty", func(t *testing.T) {
+		sink, rest := CutSink(nil)
+		assert.Nil(t, sink)
+		assert.Nil(t, rest)
+	})
+	t.Run("out", func(t *testing.T) {
+		p := MustParsePipeline(`[{"$out": "t"}]`)
+		sink, rest := CutSink(p)
+		assert.Equal(t, OutSpec{Coll: "t"}, sink)
+		assert.Len(t, rest, 0)
+	})
 }

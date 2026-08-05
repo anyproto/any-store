@@ -50,9 +50,16 @@ type AggQuery interface {
 	// full-text or vector $match prefix the values remain available as the
 	// _score / _distance document fields. See Iterator for the
 	// mutation-while-iterating contract (undefined, SQLite-style).
+	//
+	// A pipeline ending in $merge/$out executes its write eagerly inside
+	// Iter, before it returns (Mongo's aggregate() semantics); the returned
+	// iterator yields zero rows, and Close without Next changes nothing —
+	// the write already happened. See docs/aggregation.md.
 	Iter(ctx context.Context) (Iterator, error)
 
 	// Count executes the pipeline and returns the number of result documents.
+	// For a $merge/$out pipeline it executes the write and returns the number
+	// of documents written to the target.
 	Count(ctx context.Context) (int, error)
 
 	// Explain returns the access plan of the pushed prefix and the list of
@@ -211,6 +218,19 @@ func (q *aggQuery) Iter(ctx context.Context) (Iterator, error) {
 	if err != nil {
 		return nil, err
 	}
+	if sink, readPart := aggregate.CutSink(rest); sink != nil {
+		// $merge/$out execute eagerly: the write happens here, and the
+		// returned iterator is the empty cursor (Mongo semantics).
+		if _, err = q.materialize(ctx, cq, readPart, sink); err != nil {
+			return nil, err
+		}
+		return &sinkIterator{}, nil
+	}
+	return q.iterRest(ctx, cq, rest)
+}
+
+// iterRest executes the in-pipeline stages over the pushed prefix's iterator.
+func (q *aggQuery) iterRest(ctx context.Context, cq *collQuery, rest aggregate.Pipeline) (*aggIterator, error) {
 	inner, err := cq.Iter(ctx)
 	if err != nil {
 		return nil, err
@@ -297,7 +317,21 @@ func (c *collection) lookupFunc(btx *btree.ReadTx) aggregate.LookupFunc {
 }
 
 func (q *aggQuery) Count(ctx context.Context) (count int, err error) {
-	iter, err := q.Iter(ctx)
+	if q.err != nil {
+		return 0, q.err
+	}
+	if err = ctx.Err(); err != nil {
+		return 0, err
+	}
+	cq, rest, err := q.prefixQuery()
+	if err != nil {
+		return 0, err
+	}
+	if sink, readPart := aggregate.CutSink(rest); sink != nil {
+		return q.materialize(ctx, cq, readPart, sink)
+	}
+	var iter Iterator
+	iter, err = q.iterRest(ctx, cq, rest)
 	if err != nil {
 		return 0, err
 	}

@@ -40,6 +40,8 @@ any JSON-marshalable Go value.
 | `$group` | see below | Hash aggregation. |
 | `$lookup` | `{"$lookup": {"from"?: c, "localField": f, "foreignField": "id", "as": out}}` | Self-join point lookup on the primary key — see section 3.1. |
 | `$facet` | `{"$facet": {"name": [stage...], ...}}` | Named sub-pipelines over one shared scan — see section 3.2. |
+| `$out` | `{"$out": "coll"}` | Replaces the target collection's contents with the results — see section 3.3. Must be the last stage; not allowed inside `$facet`. |
+| `$merge` | `{"$merge": {"into": c, "on"?: "id", "whenMatched"?: m, "whenNotMatched"?: n}}` or `{"$merge": "coll"}` | Upserts the results into the target by `id` — see section 3.3. Same placement rules as `$out`. |
 
 Not supported in v1: cross-collection and pipeline-form `$lookup` (see
 section 3.1), `$bucket`, exclusion projections,
@@ -287,6 +289,63 @@ pattern: N widgets over one shared scan instead of N independent scans.
 - The fan-out itself does not allocate per row; once every facet has
   satisfied a `$limit`, the scan stops early.
 
+## 3.3 $merge and $out: materialize into a collection
+
+```json
+[{"$group": {"_id": "$space", "total": {"$sum": "$bytes"}}},
+ {"$merge": {"into": "space_stats", "whenMatched": "replace"}}]
+```
+
+`$out` and `$merge` write the pipeline's results into a collection, making
+derived values ($group totals, computed fields) filterable, sortable and
+**indexable** like any stored documents — declare an index on the target and
+query the materialized field through it, instead of recomputing per client.
+
+Both must be the **last** pipeline stage (parse error otherwise, as in Mongo)
+and are rejected inside `$facet`. Neither may target the aggregated
+collection itself — `ErrAggregateIntoSource` (divergence: Mongo allows it
+with caveats; unsafe under our streaming-read-plus-write model). Only a plain
+collection name is accepted: Mongo's db-qualified form is a parse error. A
+missing target is created inside the same write transaction.
+
+**Execution model — buffer, then write.** The read pipeline runs to EOF in
+its own read snapshot, buffering results as raw marshaled bytes; the buffered
+bytes count against the `MemoryLimit` budget shared with the blocking stages
+(exceeding it fails with `ErrAggMemoryLimitExceeded` and writes nothing).
+Then **one write transaction** applies everything: target creation, the
+`$out` delete-and-insert, every `$merge` upsert. Other readers — same process
+or other processes — see the old contents or the new, never a mix, and any
+error rolls the entire write back (nothing partial persists). The two phases
+use different transactions: a write committed by someone else between them is
+overwritten (`$out`) or merged against (`$merge`).
+
+The write executes **eagerly inside `Iter`/`Count`** (Mongo's `aggregate()`
+semantics): `Iter` returns an empty cursor after the write already happened —
+`Close` without `Next` changes nothing — and `Count` returns the number of
+documents written (inserted, replaced or merged; `keepExisting`/`discard`
+skips and byte-identical replaces are not counted).
+
+**`$out`** replaces the target's contents: every existing document is deleted
+and every result inserted through the regular write path, so declared range,
+full-text and vector indexes survive and are rebuilt entry-by-entry within
+the same transaction. A result lacking the target's primary key fails like
+`Insert` (`ErrDocWithoutId`); duplicate result ids fail with `ErrDocExists`.
+An empty result set still creates/empties the target (Mongo).
+
+**`$merge`** upserts by primary key: `on` may only be `"id"` (parse error
+otherwise — primary-key scope, like `$lookup`) and the target's primary key
+must be `id`. Every result document must carry `id` (`ErrMergeNoId`).
+Options, with Mongo's defaults:
+
+| Option | Values (default first) |
+|---|---|
+| `whenMatched` | `"merge"` — overlay the result's **top-level** fields onto the existing document (fields the result lacks keep their values); `"replace"`; `"keepExisting"`; `"fail"` → `ErrMergeMatched` naming the id, whole write aborted. |
+| `whenNotMatched` | `"insert"`; `"discard"`; `"fail"` → `ErrMergeNotMatched` naming the id, whole write aborted. |
+
+The pipeline/`let` form of `whenMatched` is not supported (parse error). An
+empty result set is a pure no-op: nothing is written and a missing target is
+**not** created (unlike `$out`).
+
 ## 4. Pushdown: what the planner executes
 
 `Aggregate` splits the longest pushable prefix — `$match` chain (folded into
@@ -341,7 +400,7 @@ sentinel error:
 |---|---|---|---|
 | Unique `$group` keys | 50 000 | `GroupLimit(n)` | `ErrGroupLimitExceeded` |
 | `$push`/`$addToSet` length | 10 000 | `AccumArrayLimit(n)` | `ErrAccumArrayLimitExceeded` |
-| Retained bytes (all blocking stages) | 256 MiB | `MemoryLimit(n)` | `ErrAggMemoryLimitExceeded` |
+| Retained bytes (blocking stages + the `$merge`/`$out` result buffer) | 256 MiB | `MemoryLimit(n)` | `ErrAggMemoryLimitExceeded` |
 
 Negative values mean unlimited. There is no spill-to-disk: a pipeline that
 needs more than the budget should filter earlier or raise the limit
@@ -361,4 +420,6 @@ documents are valid **only until the next `Next()` call** (copy if you keep
 them). `Score()`/`Distance()` return 0 on aggregation iterators —
 for an FTS/vector prefix, read the `_score`/`_distance` fields off the
 documents instead. `Count(ctx)` runs the pipeline and counts results;
-`$count`-as-last-stage emits the count as a document instead.
+`$count`-as-last-stage emits the count as a document instead. A `$merge`/
+`$out` pipeline executes its write eagerly inside `Iter`/`Count` and yields
+zero rows; `Count` returns the documents written (section 3.3).
