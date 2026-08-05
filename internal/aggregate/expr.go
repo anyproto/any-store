@@ -13,10 +13,11 @@ import (
 //
 // Supported: field references ("$a.b.c"), literals ({"$literal": x} or any
 // plain value), document/array expressions (objects and arrays whose members
-// are themselves expressions, Mongo semantics), and the arithmetic/string
-// compute operators in exprOpParsers ($add, $round, $concat, ...). Remaining
-// compute operators ($cond, ...) are additive future work: composite Expr
-// implementations dispatched in ParseExpr.
+// are themselves expressions, Mongo semantics), and the compute operators in
+// exprOpParsers — arithmetic/string ($add, $round, $concat, ...), conditional
+// ($cond, $switch, $ifNull) and comparison ($eq ... $lte, $cmp). Remaining
+// compute operators (date/string transforms, ...) are additive future work:
+// composite Expr implementations dispatched in ParseExpr.
 type Expr interface {
 	// Eval returns the expression value for doc; nil means "missing".
 	// Results may be allocated on a; field refs alias doc (zero-copy) and are

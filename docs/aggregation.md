@@ -41,9 +41,9 @@ any JSON-marshalable Go value.
 
 Not supported in v1: `$lookup`, `$facet`, `$bucket`, exclusion projections,
 nested (dotted) output field names, and compute expression operators beyond
-the arithmetic/string set of section 2 (`$cond`, `$switch`, ...) — the
-expression parser rejects unknown operators explicitly so they can be added
-compatibly later.
+the set of section 2 (`$dateToString`, `$toUpper`, ...) — the expression
+parser rejects unknown operators explicitly so they can be added compatibly
+later.
 
 A pipeline that does not parse is rejected as a structured `*query.ParseError`
 with `Source` `"pipeline"`: `Path` locates the failure inside the pipeline
@@ -66,8 +66,9 @@ Inside `$project`/`$addFields` values, `$group` keys and accumulator arguments:
 - **Document/array expressions** — `{"x": "$a", "y": 1}` and `["$a", 1]`
   evaluate their members (Mongo expression-context rules); a missing member is
   omitted from objects and becomes null in arrays.
-- **Compute operators** — arithmetic and string expressions, composable to any
-  depth: `{"$add": ["$a", {"$multiply": ["$b", 2]}, 1]}`.
+- **Compute operators** — arithmetic, string, conditional and comparison
+  expressions, composable to any depth:
+  `{"$cond": [{"$lt": ["$a", 10]}, "low", {"$concat": ["$a", "!"]}]}`.
 
 | Operator | Form | Notes |
 |---|---|---|
@@ -76,16 +77,35 @@ Inside `$project`/`$addFields` values, `$group` keys and accumulator arguments:
 | `$abs` | `{"$abs": e}` | |
 | `$round` | `{"$round": [x, place?]}` | Half to even (banker's: `1.5`→`2`, `2.5`→`2`); `place` in `[-20, 100]`, default `0`, negative rounds left of the decimal point. |
 | `$concat` | `{"$concat": [e, ...]}` | String operands; an empty operand list yields `""`. |
+| `$cond` | `{"$cond": [if, then, else]}` or `{"$cond": {"if": e, "then": e, "else": e}}` | All three parts required. Lazy: only the taken branch is evaluated. Truthiness is Mongo's: `false`, `0`, `null`, missing → false; everything else — including `""`, `[]`, `{}` — true. |
+| `$switch` | `{"$switch": {"branches": [{"case": e, "then": e}, ...], "default": e?}}` | At least one branch; cases evaluate lazily in order, first truthy case wins; no match falls to `default`. |
+| `$ifNull` | `{"$ifNull": [e, e, ...]}` | At least two operands (Mongo 4.4 variadic form): the first non-null, non-missing value, else the last operand's value. Lazy left-to-right. |
+| `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte` | `{"$eq": [a, b]}` | Exactly two operands; `true`/`false` over any value types (see the comparison note below). |
+| `$cmp` | `{"$cmp": [a, b]}` | `-1`/`0`/`1`. |
 
 A single non-array operand is Mongo's shorthand for a one-element list
 (`{"$abs": "$x"}`); arity is checked at parse time with structured errors.
+
+> **Comparison order** is the engine's canonical anyenc value order — the same
+> order `$sort` and `$min`/`$max` use: values order by type tag first
+> (`null < number < string < false < true < array < object < ... < dateTime`),
+> then by value within a type (numbers numerically, strings bytewise, arrays
+> elementwise, objects by their marshaled bytes). This **differs from BSON's
+> canonical cross-type order** (where e.g. booleans sort after strings and
+> object comparison ignores field order) — object equality here is
+> field-order-sensitive, consistent with `$group` key equality. A missing
+> operand compares as `null` (`{"$eq": ["$nope", null]}` is `true`), and
+> `-0` equals `0`. Vector values order by their encoded bytes too (aligned
+> with `$sort`) — unlike query filters, where ordering operators against a
+> vector are always false (Rule V).
 
 > **Null instead of runtime errors** (divergence from Mongo): evaluation is
 > streaming with no per-document error channel, so conditions Mongo reports as
 > query errors yield `null` instead — a non-numeric operand of an arithmetic
 > operator, a non-string operand of `$concat`, division by zero, a non-finite
-> result (overflow, NaN), an out-of-range or non-integer `$round` place. Null
-> and missing operands also yield `null` (as in Mongo).
+> result (overflow, NaN), an out-of-range or non-integer `$round` place, and a
+> `$switch` with no matching case and no `default` (Mongo raises). Null and
+> missing operands also yield `null` (as in Mongo).
 >
 > `$round` precision is float64: values round by their binary double value
 > (`{"$round": [2.345, 2]}` is `2.35` — the stored double sits above the

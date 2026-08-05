@@ -1,6 +1,7 @@
 package aggregate
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"strconv"
@@ -26,6 +27,16 @@ func init() {
 		"$abs":      parseAbs,
 		"$round":    parseRound,
 		"$concat":   parseConcat,
+		"$cond":     parseCond,
+		"$switch":   parseSwitch,
+		"$ifNull":   parseIfNull,
+		"$eq":       func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpEq, v) },
+		"$ne":       func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpNe, v) },
+		"$gt":       func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpGt, v) },
+		"$gte":      func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpGte, v) },
+		"$lt":       func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpLt, v) },
+		"$lte":      func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpLte, v) },
+		"$cmp":      func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpCmp, v) },
 	}
 }
 
@@ -329,3 +340,364 @@ func (e *ConcatExpr) Eval(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, er
 }
 
 func (e *ConcatExpr) String() string { return opString("$concat", e.Args) }
+
+// truthy is Mongo's expression boolean coercion: false, 0, null, and missing
+// are false; everything else — including "" and empty arrays/objects — is true.
+func truthy(v *anyenc.Value) bool {
+	if v == nil {
+		return false
+	}
+	switch v.Type() {
+	case anyenc.TypeNull, anyenc.TypeFalse:
+		return false
+	case anyenc.TypeNumber:
+		f, _ := v.Float64()
+		return f != 0
+	}
+	return true
+}
+
+// CondExpr evaluates $cond in both spellings: [if, then, else] and
+// {"if":..., "then":..., "else":...} (all three required). Only the taken
+// branch is evaluated (lazy, Mongo semantics).
+type CondExpr struct {
+	If, Then, Else Expr
+}
+
+func parseCond(v *anyenc.Value) (Expr, error) {
+	if v.Type() == anyenc.TypeObject {
+		return parseCondObject(v)
+	}
+	args, err := parseOperands("$cond", v, 3, 3)
+	if err != nil {
+		return nil, err
+	}
+	return &CondExpr{If: args[0], Then: args[1], Else: args[2]}, nil
+}
+
+func parseCondObject(v *anyenc.Value) (Expr, error) {
+	e := &CondExpr{}
+	slots := map[string]*Expr{"if": &e.If, "then": &e.Then, "else": &e.Else}
+	obj, _ := v.Object()
+	var perr error
+	obj.Visit(func(key []byte, item *anyenc.Value) {
+		if perr != nil {
+			return
+		}
+		slot, ok := slots[string(key)]
+		if !ok {
+			perr = atPath(&query.ParseError{
+				Op:     "$cond",
+				Reason: "unknown $cond parameter: " + string(key),
+			}, string(key))
+			return
+		}
+		if *slot != nil {
+			perr = atPath(&query.ParseError{
+				Op:     "$cond",
+				Reason: "duplicate $cond parameter: " + string(key),
+			}, string(key))
+			return
+		}
+		sub, err := ParseExpr(item)
+		if err != nil {
+			perr = atPath(err, string(key))
+			return
+		}
+		*slot = sub
+	})
+	if perr != nil {
+		return nil, perr
+	}
+	if e.If == nil || e.Then == nil || e.Else == nil {
+		return nil, &query.ParseError{
+			Op:     "$cond",
+			Reason: "$cond object form requires 'if', 'then' and 'else'",
+		}
+	}
+	return e, nil
+}
+
+func (e *CondExpr) Eval(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, error) {
+	c, err := e.If.Eval(a, doc)
+	if err != nil {
+		return nil, err
+	}
+	if truthy(c) {
+		return e.Then.Eval(a, doc)
+	}
+	return e.Else.Eval(a, doc)
+}
+
+// String renders the canonical array spelling for both parsed forms.
+func (e *CondExpr) String() string { return opString("$cond", []Expr{e.If, e.Then, e.Else}) }
+
+// SwitchExpr evaluates $switch: cases run lazily in spec order and the first
+// truthy case selects its then branch. No match with no default is a Mongo
+// runtime error; with no per-document error channel the result is null
+// instead (see docs/aggregation.md).
+type SwitchExpr struct {
+	Cases   []Expr
+	Thens   []Expr
+	Default Expr // nil: no default
+}
+
+func parseSwitch(v *anyenc.Value) (Expr, error) {
+	if v.Type() != anyenc.TypeObject {
+		return nil, &query.ParseError{
+			Op:     "$switch",
+			Reason: "$switch requires an object with a 'branches' array",
+		}
+	}
+	e := &SwitchExpr{}
+	obj, _ := v.Object()
+	var (
+		perr     error
+		branches *anyenc.Value
+	)
+	obj.Visit(func(key []byte, item *anyenc.Value) {
+		if perr != nil {
+			return
+		}
+		switch string(key) {
+		case "branches":
+			branches = item
+		case "default":
+			sub, err := ParseExpr(item)
+			if err != nil {
+				perr = atPath(err, "default")
+				return
+			}
+			e.Default = sub
+		default:
+			perr = atPath(&query.ParseError{
+				Op:     "$switch",
+				Reason: "unknown $switch parameter: " + string(key),
+			}, string(key))
+		}
+	})
+	if perr != nil {
+		return nil, perr
+	}
+	if branches == nil || branches.Type() != anyenc.TypeArray {
+		return nil, &query.ParseError{
+			Op:     "$switch",
+			Reason: "$switch requires a 'branches' array",
+		}
+	}
+	items, _ := branches.Array()
+	if len(items) == 0 {
+		return nil, &query.ParseError{
+			Op:     "$switch",
+			Reason: "$switch requires at least one branch",
+		}
+	}
+	e.Cases = make([]Expr, len(items))
+	e.Thens = make([]Expr, len(items))
+	for i, item := range items {
+		caseE, thenE, err := parseSwitchBranch(item)
+		if err != nil {
+			return nil, atPath(atPath(err, strconv.Itoa(i)), "branches")
+		}
+		e.Cases[i], e.Thens[i] = caseE, thenE
+	}
+	return e, nil
+}
+
+func parseSwitchBranch(v *anyenc.Value) (caseE, thenE Expr, err error) {
+	if v.Type() != anyenc.TypeObject {
+		return nil, nil, &query.ParseError{
+			Op:     "$switch",
+			Reason: "$switch branch must be an object with 'case' and 'then'",
+		}
+	}
+	obj, _ := v.Object()
+	var perr error
+	obj.Visit(func(key []byte, item *anyenc.Value) {
+		if perr != nil {
+			return
+		}
+		var slot *Expr
+		switch string(key) {
+		case "case":
+			slot = &caseE
+		case "then":
+			slot = &thenE
+		default:
+			perr = atPath(&query.ParseError{
+				Op:     "$switch",
+				Reason: "unknown $switch branch parameter: " + string(key),
+			}, string(key))
+			return
+		}
+		if *slot != nil {
+			perr = atPath(&query.ParseError{
+				Op:     "$switch",
+				Reason: "duplicate $switch branch parameter: " + string(key),
+			}, string(key))
+			return
+		}
+		sub, e := ParseExpr(item)
+		if e != nil {
+			perr = atPath(e, string(key))
+			return
+		}
+		*slot = sub
+	})
+	if perr != nil {
+		return nil, nil, perr
+	}
+	if caseE == nil || thenE == nil {
+		return nil, nil, &query.ParseError{
+			Op:     "$switch",
+			Reason: "$switch branch requires 'case' and 'then'",
+		}
+	}
+	return caseE, thenE, nil
+}
+
+func (e *SwitchExpr) Eval(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, error) {
+	for i, c := range e.Cases {
+		v, err := c.Eval(a, doc)
+		if err != nil {
+			return nil, err
+		}
+		if truthy(v) {
+			return e.Thens[i].Eval(a, doc)
+		}
+	}
+	if e.Default != nil {
+		return e.Default.Eval(a, doc)
+	}
+	return a.NewNull(), nil
+}
+
+func (e *SwitchExpr) String() string {
+	var b strings.Builder
+	b.WriteString("{$switch:{branches:[")
+	for i := range e.Cases {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString("{case:")
+		b.WriteString(e.Cases[i].String())
+		b.WriteString(",then:")
+		b.WriteString(e.Thens[i].String())
+		b.WriteByte('}')
+	}
+	b.WriteByte(']')
+	if e.Default != nil {
+		b.WriteString(",default:")
+		b.WriteString(e.Default.String())
+	}
+	b.WriteString("}}")
+	return b.String()
+}
+
+// IfNullExpr evaluates $ifNull (variadic, Mongo 4.4 form, at least 2
+// operands): the first operand that is neither null nor missing, else the
+// last operand's value verbatim. Evaluation is lazy left-to-right.
+type IfNullExpr struct {
+	Args []Expr
+}
+
+func parseIfNull(v *anyenc.Value) (Expr, error) {
+	args, err := parseOperands("$ifNull", v, 2, 0)
+	if err != nil {
+		return nil, err
+	}
+	return &IfNullExpr{Args: args}, nil
+}
+
+func (e *IfNullExpr) Eval(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, error) {
+	last := len(e.Args) - 1
+	for _, arg := range e.Args[:last] {
+		v, err := arg.Eval(a, doc)
+		if err != nil {
+			return nil, err
+		}
+		if v != nil && v.Type() != anyenc.TypeNull {
+			return v, nil
+		}
+	}
+	return e.Args[last].Eval(a, doc)
+}
+
+func (e *IfNullExpr) String() string { return opString("$ifNull", e.Args) }
+
+// CompareOp identifies a comparison expression operator.
+type CompareOp uint8
+
+const (
+	CmpEq CompareOp = iota
+	CmpNe
+	CmpGt
+	CmpGte
+	CmpLt
+	CmpLte
+	CmpCmp // three-way: -1/0/1
+)
+
+var compareOpNames = [...]string{"$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$cmp"}
+
+func (op CompareOp) String() string { return compareOpNames[op] }
+
+// CompareExpr evaluates $eq/$ne/$gt/$gte/$lt/$lte ($cmp: -1/0/1) over any two
+// values in the engine's canonical cross-type order: bytes.Compare of the
+// marshaled anyenc encoding — the exact order $sort and $min/$max use. The
+// type tag leads the encoding, so types order by tag (null < number < string
+// < false < true < array < object < ... < dateTime; differs from BSON's
+// canonical order, see docs/aggregation.md); within a type the encoding is
+// order-preserving: numbers via the sortable float encoding (-0 normalized to
+// 0), strings bytewise, arrays elementwise, objects by marshaled bytes
+// (field-order-sensitive, consistent with $group key equality). $eq is
+// c == 0, so all seven operators agree by construction. A missing operand
+// marshals as the null tag: missing == null. Operands marshal into two
+// reusable per-expr scratch buffers (expressions are per-pipeline,
+// single-goroutine): alloc-free after warm-up.
+type CompareExpr struct {
+	Op   CompareOp
+	A, B Expr
+
+	bufA, bufB []byte // scratch, reused across Eval calls
+}
+
+func parseCompare(op CompareOp, v *anyenc.Value) (Expr, error) {
+	args, err := parseOperands(op.String(), v, 2, 2)
+	if err != nil {
+		return nil, err
+	}
+	return &CompareExpr{Op: op, A: args[0], B: args[1]}, nil
+}
+
+func (e *CompareExpr) Eval(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, error) {
+	av, err := e.A.Eval(a, doc)
+	if err != nil {
+		return nil, err
+	}
+	bv, err := e.B.Eval(a, doc)
+	if err != nil {
+		return nil, err
+	}
+	e.bufA = av.MarshalTo(e.bufA[:0]) // nil receiver marshals the null tag
+	e.bufB = bv.MarshalTo(e.bufB[:0])
+	c := bytes.Compare(e.bufA, e.bufB)
+	switch e.Op {
+	case CmpEq:
+		return a.NewBool(c == 0), nil
+	case CmpNe:
+		return a.NewBool(c != 0), nil
+	case CmpGt:
+		return a.NewBool(c > 0), nil
+	case CmpGte:
+		return a.NewBool(c >= 0), nil
+	case CmpLt:
+		return a.NewBool(c < 0), nil
+	case CmpLte:
+		return a.NewBool(c <= 0), nil
+	default: // CmpCmp
+		return a.NewNumberInt(c), nil
+	}
+}
+
+func (e *CompareExpr) String() string { return opString(e.Op.String(), []Expr{e.A, e.B}) }

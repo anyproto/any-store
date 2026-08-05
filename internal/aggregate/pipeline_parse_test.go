@@ -250,7 +250,7 @@ func TestParseExpr(t *testing.T) {
 		assert.Equal(t, float64(3), arr[2].GetFloat64())
 	})
 	t.Run("unsupported operator", func(t *testing.T) {
-		_, err := ParseExpr(anyenc.MustParseJson(`{"$cond": [true, 1, 2]}`))
+		_, err := ParseExpr(anyenc.MustParseJson(`{"$toUpper": "$a"}`))
 		assert.ErrorContains(t, err, "unsupported expression operator")
 	})
 	t.Run("mixed operator and fields", func(t *testing.T) {
@@ -280,6 +280,12 @@ func TestParseExprOperators(t *testing.T) {
 			{`{"$abs": ["$a"]}`, &AbsExpr{}},
 			{`{"$round": ["$a", 2]}`, &RoundExpr{}},
 			{`{"$concat": ["$a", "-"]}`, &ConcatExpr{}},
+			{`{"$cond": ["$a", 1, 2]}`, &CondExpr{}},
+			{`{"$cond": {"if": "$a", "then": 1, "else": 2}}`, &CondExpr{}},
+			{`{"$switch": {"branches": [{"case": "$a", "then": 1}]}}`, &SwitchExpr{}},
+			{`{"$ifNull": ["$a", 0]}`, &IfNullExpr{}},
+			{`{"$eq": ["$a", 1]}`, &CompareExpr{}},
+			{`{"$cmp": ["$a", "$b"]}`, &CompareExpr{}},
 		} {
 			e, err := ParseExpr(anyenc.MustParseJson(tc.json))
 			require.NoError(t, err, tc.json)
@@ -301,11 +307,44 @@ func TestParseExprOperators(t *testing.T) {
 			{`{"$round": "$a"}`, `{$round:[$a]}`},
 			{`{"$round": ["$a", -1]}`, `{$round:[$a,-1]}`},
 			{`{"$concat": ["$a", "-", "$b"]}`, `{$concat:[$a,"-",$b]}`},
+			// Both $cond spellings render the canonical array form.
+			{`{"$cond": [{"$lt": ["$a", 1]}, "$a", "$b"]}`, `{$cond:[{$lt:[$a,1]},$a,$b]}`},
+			{`{"$cond": {"if": "$a", "then": 1, "else": 2}}`, `{$cond:[$a,1,2]}`},
+			{`{"$switch": {"branches": [{"case": "$a", "then": 1}], "default": 0}}`,
+				`{$switch:{branches:[{case:$a,then:1}],default:0}}`},
+			{`{"$switch": {"branches": [{"case": true, "then": 1}, {"case": false, "then": 2}]}}`,
+				`{$switch:{branches:[{case:true,then:1},{case:false,then:2}]}}`},
+			{`{"$ifNull": ["$a", "$b", 0]}`, `{$ifNull:[$a,$b,0]}`},
+			{`{"$ne": ["$a", null]}`, `{$ne:[$a,null]}`},
+			{`{"$cmp": ["$a", "$b"]}`, `{$cmp:[$a,$b]}`},
 		} {
 			e, err := ParseExpr(anyenc.MustParseJson(tc.json))
 			require.NoError(t, err, tc.json)
 			assert.Equal(t, tc.want, e.String(), tc.json)
 		}
+	})
+}
+
+// TestDuplicateStructuredParams pins duplicate-key rejection in $cond object
+// form and $switch branches. JSON input cannot express duplicates (the JSON
+// parser keeps the last key), but raw anyenc objects can — splice a second
+// copy of a key at the encoding level (object = tag, kvs, EOS terminator).
+func TestDuplicateStructuredParams(t *testing.T) {
+	splice := func(t *testing.T, base, extra string) *anyenc.Value {
+		t.Helper()
+		m := anyenc.MustParseJson(base).MarshalTo(nil)
+		kv := anyenc.MustParseJson(extra).MarshalTo(nil)
+		v, err := (&anyenc.Parser{}).Parse(append(m[:len(m)-1], kv[1:]...))
+		require.NoError(t, err)
+		return v
+	}
+	t.Run("$cond object form", func(t *testing.T) {
+		_, err := parseCond(splice(t, `{"if":true,"then":1,"else":2}`, `{"if":false}`))
+		assert.ErrorContains(t, err, "duplicate $cond parameter: if")
+	})
+	t.Run("$switch branch", func(t *testing.T) {
+		_, _, err := parseSwitchBranch(splice(t, `{"case":true,"then":1}`, `{"then":2}`))
+		assert.ErrorContains(t, err, "duplicate $switch branch parameter: then")
 	})
 }
 
@@ -360,130 +399,184 @@ func TestPipelineParseError(t *testing.T) {
 		wantIs     error  // finer class sentinel, nil if none
 	}{
 		{
-			name: "pipeline not an array",
-			json: `{"$match":{}}`,
+			name:       "pipeline not an array",
+			json:       `{"$match":{}}`,
 			wantPath:   "",
 			wantReason: "pipeline must be an array of stages",
 		},
 		{
-			name: "stage not an object",
-			json: `[1]`,
+			name:       "stage not an object",
+			json:       `[1]`,
 			wantPath:   "0",
 			wantReason: "stage must be an object",
 		},
 		{
-			name: "stage with two keys",
-			json: `[{"$match":{},"$limit":1}]`,
+			name:       "stage with two keys",
+			json:       `[{"$match":{},"$limit":1}]`,
 			wantPath:   "0",
 			wantReason: "exactly one key",
 		},
 		{
-			name: "unknown stage",
-			json: `[{"$lookup":{}}]`,
+			name:     "unknown stage",
+			json:     `[{"$lookup":{}}]`,
 			wantPath: "0.$lookup", wantOp: "$lookup",
 			wantReason: "unknown stage: $lookup", wantIs: query.ErrUnknownOperator,
 		},
 		{
-			name: "bad filter in a later $match names the stage index",
-			json: `[{"$limit":1},{"$match":{"a":{"$foo":1}}}]`,
+			name:     "bad filter in a later $match names the stage index",
+			json:     `[{"$limit":1},{"$match":{"a":{"$foo":1}}}]`,
 			wantPath: "1.$match.a.$foo", wantOp: "$foo",
 			wantReason: "unknown operator", wantIs: query.ErrUnknownOperator,
 		},
 		{
-			name: "$sort bad direction",
-			json: `[{"$sort":{"a":2}}]`,
+			name:     "$sort bad direction",
+			json:     `[{"$sort":{"a":2}}]`,
 			wantPath: "0.$sort.a", wantOp: "$sort",
 			wantReason: "must be 1 or -1",
 		},
 		{
-			name: "$skip negative",
-			json: `[{"$limit":1},{"$skip":-1}]`,
+			name:     "$skip negative",
+			json:     `[{"$limit":1},{"$skip":-1}]`,
 			wantPath: "1.$skip", wantOp: "$skip",
 			wantReason: "$skip must be a non-negative integer",
 		},
 		{
-			name: "$count operator-like field name",
-			json: `[{"$count":"$x"}]`,
+			name:     "$count operator-like field name",
+			json:     `[{"$count":"$x"}]`,
 			wantPath: "0.$count", wantOp: "$count",
 			wantReason: "must not start with $",
 		},
 		{
-			name: "$project exclusion",
-			json: `[{"$project":{"a":0}}]`,
+			name:     "$project exclusion",
+			json:     `[{"$project":{"a":0}}]`,
 			wantPath: "0.$project.a", wantOp: "$project",
 			wantReason: "exclusion",
 		},
 		{
-			name: "unsupported expression operator",
-			json: `[{"$project":{"a":{"$cond":[true,1,2]}}}]`,
-			wantPath: "0.$project.a.$cond", wantOp: "$cond",
-			wantReason: "unsupported expression operator: $cond", wantIs: query.ErrUnknownOperator,
+			name:     "unsupported expression operator",
+			json:     `[{"$project":{"a":{"$toUpper":"$x"}}}]`,
+			wantPath: "0.$project.a.$toUpper", wantOp: "$toUpper",
+			wantReason: "unsupported expression operator: $toUpper", wantIs: query.ErrUnknownOperator,
 		},
 		{
-			name: "$subtract wrong arity",
-			json: `[{"$project":{"a":{"$subtract":[1]}}}]`,
+			name:     "$subtract wrong arity",
+			json:     `[{"$project":{"a":{"$subtract":[1]}}}]`,
 			wantPath: "0.$project.a.$subtract", wantOp: "$subtract",
 			wantReason: "$subtract requires exactly 2 operands, got 1",
 		},
 		{
-			name: "$round too many operands",
-			json: `[{"$project":{"a":{"$round":[1,2,3]}}}]`,
+			name:     "$round too many operands",
+			json:     `[{"$project":{"a":{"$round":[1,2,3]}}}]`,
 			wantPath: "0.$project.a.$round", wantOp: "$round",
 			wantReason: "$round requires 1 to 2 operands, got 3",
 		},
 		{
-			name: "$abs single-operand shorthand rejects two operands",
-			json: `[{"$project":{"a":{"$abs":[1,2]}}}]`,
+			name:     "$abs single-operand shorthand rejects two operands",
+			json:     `[{"$project":{"a":{"$abs":[1,2]}}}]`,
 			wantPath: "0.$project.a.$abs", wantOp: "$abs",
 			wantReason: "$abs requires exactly 1 operand, got 2",
 		},
 		{
-			name: "operator operand error names the element index",
-			json: `[{"$project":{"a":{"$add":["$x","$$y"]}}}]`,
+			name:     "$cond array wrong arity",
+			json:     `[{"$project":{"a":{"$cond":[true,1]}}}]`,
+			wantPath: "0.$project.a.$cond", wantOp: "$cond",
+			wantReason: "$cond requires exactly 3 operands, got 2",
+		},
+		{
+			name:     "$cond object form missing else",
+			json:     `[{"$project":{"a":{"$cond":{"if":true,"then":1}}}}]`,
+			wantPath: "0.$project.a.$cond", wantOp: "$cond",
+			wantReason: "$cond object form requires 'if', 'then' and 'else'",
+		},
+		{
+			name:     "$cond object form unknown parameter",
+			json:     `[{"$project":{"a":{"$cond":{"if":true,"then":1,"elze":2}}}}]`,
+			wantPath: "0.$project.a.$cond.elze", wantOp: "$cond",
+			wantReason: "unknown $cond parameter: elze",
+		},
+		{
+			name:     "$switch non-object operand",
+			json:     `[{"$project":{"a":{"$switch":[1]}}}]`,
+			wantPath: "0.$project.a.$switch", wantOp: "$switch",
+			wantReason: "$switch requires an object with a 'branches' array",
+		},
+		{
+			name:     "$switch empty branches",
+			json:     `[{"$project":{"a":{"$switch":{"branches":[]}}}}]`,
+			wantPath: "0.$project.a.$switch", wantOp: "$switch",
+			wantReason: "$switch requires at least one branch",
+		},
+		{
+			name:     "$switch branch missing then",
+			json:     `[{"$project":{"a":{"$switch":{"branches":[{"case":true,"then":1},{"case":false}]}}}}]`,
+			wantPath: "0.$project.a.$switch.branches.1", wantOp: "$switch",
+			wantReason: "$switch branch requires 'case' and 'then'",
+		},
+		{
+			name:     "$switch branch unknown parameter",
+			json:     `[{"$project":{"a":{"$switch":{"branches":[{"case":true,"themn":1}]}}}}]`,
+			wantPath: "0.$project.a.$switch.branches.0.themn", wantOp: "$switch",
+			wantReason: "unknown $switch branch parameter: themn",
+		},
+		{
+			name:     "$ifNull one operand",
+			json:     `[{"$project":{"a":{"$ifNull":["$x"]}}}]`,
+			wantPath: "0.$project.a.$ifNull", wantOp: "$ifNull",
+			wantReason: "$ifNull requires at least 2 operands, got 1",
+		},
+		{
+			name:     "$eq wrong arity",
+			json:     `[{"$project":{"a":{"$eq":[1,2,3]}}}]`,
+			wantPath: "0.$project.a.$eq", wantOp: "$eq",
+			wantReason: "$eq requires exactly 2 operands, got 3",
+		},
+		{
+			name:       "operator operand error names the element index",
+			json:       `[{"$project":{"a":{"$add":["$x","$$y"]}}}]`,
 			wantPath:   "0.$project.a.$add.1",
 			wantReason: "variables are not supported",
 		},
 		{
-			name: "shorthand operand error has no index segment",
-			json: `[{"$project":{"a":{"$abs":"$$x"}}}]`,
+			name:       "shorthand operand error has no index segment",
+			json:       `[{"$project":{"a":{"$abs":"$$x"}}}]`,
 			wantPath:   "0.$project.a.$abs",
 			wantReason: "variables are not supported",
 		},
 		{
-			name: "variable reference in expression",
-			json: `[{"$project":{"a":"$$now"}}]`,
+			name:       "variable reference in expression",
+			json:       `[{"$project":{"a":"$$now"}}]`,
 			wantPath:   "0.$project.a",
 			wantReason: "variables are not supported",
 		},
 		{
-			name: "expression error inside an array names the element index",
-			json: `[{"$project":{"a":["$x","$$y"]}}]`,
+			name:       "expression error inside an array names the element index",
+			json:       `[{"$project":{"a":["$x","$$y"]}}]`,
 			wantPath:   "0.$project.a.1",
 			wantReason: "variables are not supported",
 		},
 		{
 			// An option miss inside a known stage — like an unknown $text
 			// field in the filter grammar, deliberately not ErrUnknownOperator.
-			name: "unknown $unwind option",
-			json: `[{"$unwind":{"path":"$a","x":1}}]`,
+			name:     "unknown $unwind option",
+			json:     `[{"$unwind":{"path":"$a","x":1}}]`,
 			wantPath: "0.$unwind.x", wantOp: "$unwind",
 			wantReason: "unknown $unwind option: x",
 		},
 		{
-			name: "unknown accumulator",
-			json: `[{"$group":{"id":"$a","total":{"$summ":"$n"}}}]`,
+			name:     "unknown accumulator",
+			json:     `[{"$group":{"id":"$a","total":{"$summ":"$n"}}}]`,
 			wantPath: "0.$group.total.$summ", wantOp: "$summ",
 			wantReason: "unknown accumulator: $summ", wantIs: query.ErrUnknownOperator,
 		},
 		{
-			name: "$count accumulator with a non-empty argument",
-			json: `[{"$group":{"id":"$a","n":{"$count":1}}}]`,
+			name:     "$count accumulator with a non-empty argument",
+			json:     `[{"$group":{"id":"$a","n":{"$count":1}}}]`,
 			wantPath: "0.$group.n.$count", wantOp: "$count",
 			wantReason: "$count takes an empty object {}",
 		},
 		{
-			name: "$group key expression error",
-			json: `[{"$group":{"id":"$$v"}}]`,
+			name:       "$group key expression error",
+			json:       `[{"$group":{"id":"$$v"}}]`,
 			wantPath:   "0.$group.id",
 			wantReason: "variables are not supported",
 		},
