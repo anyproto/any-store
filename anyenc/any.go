@@ -2,6 +2,7 @@ package anyenc
 
 import (
 	"fmt"
+	"time"
 )
 
 // AppendAnyValue appends encoded value to b. Supports only simple go types.
@@ -71,6 +72,11 @@ func AppendAnyValue(b []byte, v any) []byte {
 		// tag + 12 raw bytes, no length prefix.
 		b = append(b, uint8(TypeObjectID))
 		return append(b, tv[:]...)
+	case time.Time:
+		// Must match Value.MarshalTo's TypeDateTime encoding byte-for-byte:
+		// tag + 8 offset-binary millis bytes, no length prefix.
+		b = append(b, uint8(TypeDateTime))
+		return appendDateTimeMillis(b, tv.UnixMilli())
 	default:
 		panic(fmt.Sprintf("TODO: make other types: %T", v))
 	}

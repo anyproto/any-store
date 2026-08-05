@@ -2,6 +2,7 @@ package anyenc
 
 import (
 	"encoding/base64"
+	"time"
 
 	"github.com/valyala/fastjson"
 )
@@ -14,6 +15,7 @@ import (
 //	{"$oid":    "<24-hex>"}   <-> TypeObjectID
 //	{"$binary": "<base64>"}   <-> TypeBinary
 //	{"$vector": [<numbers>]}  <-> TypeVectorF32
+//	{"$date":   "<RFC3339>"}  <-> TypeDateTime (decode also accepts Unix millis as a number)
 //
 // Decoding is lenient: a single-key object is read as a typed value only when
 // its payload is well-formed (valid hex / base64 / number array); otherwise it
@@ -25,7 +27,12 @@ const (
 	extTagObjectID = "$oid"
 	extTagBinary   = "$binary"
 	extTagVector   = "$vector"
+	extTagDate     = "$date"
 )
+
+// dateTimeJsonLayout renders UTC millisecond precision ("2026-08-05T17:00:00.000Z");
+// decoding accepts any RFC3339(Nano) string, truncated to millis.
+const dateTimeJsonLayout = "2006-01-02T15:04:05.000Z07:00"
 
 // extValueFromFastJson decodes a single-key Extended-JSON wrapper object into a
 // typed value, or returns nil if o is not a well-formed wrapper (the caller then
@@ -43,6 +50,18 @@ func (a *Arena) extValueFromFastJson(o *fastjson.Object) *Value {
 		}
 		if b, err := base64.StdEncoding.DecodeString(string(jv.GetStringBytes())); err == nil {
 			return a.NewBinary(b)
+		}
+		return nil
+	}
+	if jv := o.Get(extTagDate); jv != nil {
+		switch jv.Type() {
+		case fastjson.TypeString:
+			if t, err := time.Parse(time.RFC3339Nano, string(jv.GetStringBytes())); err == nil {
+				return a.NewDateTime(t)
+			}
+			return nil
+		case fastjson.TypeNumber:
+			return a.NewDateTimeMillis(int64(jv.GetFloat64()))
 		}
 		return nil
 	}

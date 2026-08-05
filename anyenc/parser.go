@@ -153,10 +153,10 @@ func parseValue(b []byte, c *cache, depth int) (v *Value, tail []byte, err error
 	// Explain Bound.String() path would, where a decode error renders harmlessly).
 	t0 := b[0]
 	// Inverted (reverse index-key) tags are the bitwise-NOT of a base type tag.
-	// Base types 1..11 invert to the contiguous run 0xF4..0xFE — including
+	// Base types 1..12 invert to the contiguous run 0xF3..0xFE — including
 	// iTypeVectorF32 (0xF5), which a descending index on a vector-valued field
 	// really does emit.
-	inverted := t0 >= byte(iTypeObjectID) && t0 <= byte(iTypeNull) // 0xF4..0xFE
+	inverted := t0 >= byte(iTypeDateTime) && t0 <= byte(iTypeNull) // 0xF3..0xFE
 	nt := Type(t0)
 	eos := byte(EOS)
 	if inverted {
@@ -215,6 +215,8 @@ func parseValue(b []byte, c *cache, depth int) (v *Value, tail []byte, err error
 		return parseVectorF32(b[1:], c, inverted)
 	case TypeObjectID:
 		return parseObjectID(b[1:], c)
+	case TypeDateTime:
+		return parseDateTime(b[1:], c)
 	case TypeObject:
 		// Depth is only checked when entering a container (scalars cannot
 		// recurse): corrupt bytes like a long run of array tags must produce
@@ -314,7 +316,7 @@ func parseObject(b []byte, c *cache, eos byte, depth int) (*Value, []byte, error
 // element terminator: EOS (0x00) for a normal array, ^EOS (0xFF) for an inverted
 // (reverse index-key) array. Each element is parsed by parseValue, which
 // self-normalizes inverted element tags; only the array's own terminator needs
-// the eos byte. An inverted element's leading tag (0xF4..0xFE) never collides
+// the eos byte. An inverted element's leading tag (0xF3..0xFE) never collides
 // with the inverted terminator 0xFF, so the b[0]==eos check is unambiguous.
 func parseArray(b []byte, c *cache, eos byte, depth int) (*Value, []byte, error) {
 	var a *Value

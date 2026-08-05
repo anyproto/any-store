@@ -2475,7 +2475,7 @@ func computeIndexBounds(idx *IndexInfo, lookup func(string) (query.Bounds, bool,
 // of v+"\x00..." (escaped NUL, see anyenc/escape.go), and such a key continues
 // with the escape tail — 0xFF after an ascending field, 0x00 after an
 // inverted (descending) one — while every key whose value IS v continues with
-// a docId/next-field type tag (0x01..0x0B or 0xF4..0xFE). lastFieldInverted
+// a docId/next-field type tag (0x01..0x0C or 0xF3..0xFE). lastFieldInverted
 // is the direction of the final field covered by p.
 func HasExactFieldPrefix(k, p []byte, lastFieldInverted bool) bool {
 	if !bytes.HasPrefix(k, p) {

@@ -16,6 +16,7 @@ const (
 	TypeObject    = Type(anyenc.TypeObject)
 	TypeVectorF32 = Type(anyenc.TypeVectorF32)
 	TypeObjectID  = Type(anyenc.TypeObjectID)
+	TypeDateTime  = Type(anyenc.TypeDateTime)
 )
 
 var stringToType = map[string]Type{}
@@ -35,7 +36,7 @@ func init() {
 // always false, so $type is the only way left to select vector-valued documents.
 var typeString = []string{
 	"", "null", "number", "string", "false", "true", "array", "object",
-	"", "", "vectorF32", "objectId",
+	"", "", "vectorF32", "objectId", "date",
 }
 
 func (t Type) String() string {

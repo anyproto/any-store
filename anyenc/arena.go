@@ -1,6 +1,10 @@
 package anyenc
 
-import "github.com/valyala/fastjson"
+import (
+	"time"
+
+	"github.com/valyala/fastjson"
+)
 
 // Arena may be used for fast creation and re-use of Values.
 //
@@ -101,6 +105,25 @@ func (a *Arena) NewObjectID(id ObjectID) *Value {
 	v := a.c.getValue()
 	v.t = TypeObjectID
 	v.v = append(v.v[:0], id[:]...)
+	return v
+}
+
+// NewDateTime returns a new dateTime value holding t, truncated to millisecond
+// precision (the storage granularity).
+//
+// The returned value is valid until Reset is called on a.
+func (a *Arena) NewDateTime(t time.Time) *Value {
+	return a.NewDateTimeMillis(t.UnixMilli())
+}
+
+// NewDateTimeMillis returns a new dateTime value holding the Unix-millisecond
+// timestamp ms.
+//
+// The returned value is valid until Reset is called on a.
+func (a *Arena) NewDateTimeMillis(ms int64) *Value {
+	v := a.c.getValue()
+	v.t = TypeDateTime
+	v.v = appendDateTimeMillis(v.v[:0], ms)
 	return v
 }
 
