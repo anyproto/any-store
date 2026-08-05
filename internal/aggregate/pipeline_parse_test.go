@@ -1,12 +1,14 @@
 package aggregate
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
 )
 
 func TestParsePipeline(t *testing.T) {
@@ -24,7 +26,7 @@ func TestParsePipeline(t *testing.T) {
 	})
 	t.Run("stage error includes index", func(t *testing.T) {
 		_, err := ParsePipeline(`[{"$limit":1},{"$skip":-1}]`)
-		assert.ErrorContains(t, err, "stage 1")
+		assert.ErrorContains(t, err, "(at 1.$skip)")
 	})
 	t.Run("full pipeline", func(t *testing.T) {
 		p, err := ParsePipeline(`[
@@ -300,4 +302,167 @@ func TestSpecStrings(t *testing.T) {
 	}
 	assert.Equal(t, `$sort {"a":1,"b":-1}`, p[1].String())
 	assert.Equal(t, `$unwind "$t"`, p[4].String())
+}
+
+// TestPipelineParseError pins the structured rejection contract for the
+// pipeline grammar: every rejection is a *query.ParseError with Source
+// "pipeline" whose Path's leading segment is the stage index — including
+// filter faults inside $match ("1.$match.a.$gt").
+func TestPipelineParseError(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		json       string
+		wantPath   string
+		wantOp     string
+		wantReason string // substring of Reason
+		wantIs     error  // finer class sentinel, nil if none
+	}{
+		{
+			name: "pipeline not an array",
+			json: `{"$match":{}}`,
+			wantPath:   "",
+			wantReason: "pipeline must be an array of stages",
+		},
+		{
+			name: "stage not an object",
+			json: `[1]`,
+			wantPath:   "0",
+			wantReason: "stage must be an object",
+		},
+		{
+			name: "stage with two keys",
+			json: `[{"$match":{},"$limit":1}]`,
+			wantPath:   "0",
+			wantReason: "exactly one key",
+		},
+		{
+			name: "unknown stage",
+			json: `[{"$lookup":{}}]`,
+			wantPath: "0.$lookup", wantOp: "$lookup",
+			wantReason: "unknown stage: $lookup", wantIs: query.ErrUnknownOperator,
+		},
+		{
+			name: "bad filter in a later $match names the stage index",
+			json: `[{"$limit":1},{"$match":{"a":{"$foo":1}}}]`,
+			wantPath: "1.$match.a.$foo", wantOp: "$foo",
+			wantReason: "unknown operator", wantIs: query.ErrUnknownOperator,
+		},
+		{
+			name: "$sort bad direction",
+			json: `[{"$sort":{"a":2}}]`,
+			wantPath: "0.$sort.a", wantOp: "$sort",
+			wantReason: "must be 1 or -1",
+		},
+		{
+			name: "$skip negative",
+			json: `[{"$limit":1},{"$skip":-1}]`,
+			wantPath: "1.$skip", wantOp: "$skip",
+			wantReason: "$skip must be a non-negative integer",
+		},
+		{
+			name: "$count operator-like field name",
+			json: `[{"$count":"$x"}]`,
+			wantPath: "0.$count", wantOp: "$count",
+			wantReason: "must not start with $",
+		},
+		{
+			name: "$project exclusion",
+			json: `[{"$project":{"a":0}}]`,
+			wantPath: "0.$project.a", wantOp: "$project",
+			wantReason: "exclusion",
+		},
+		{
+			name: "unsupported expression operator",
+			json: `[{"$project":{"a":{"$add":[1,2]}}}]`,
+			wantPath: "0.$project.a.$add", wantOp: "$add",
+			wantReason: "unsupported expression operator: $add", wantIs: query.ErrUnknownOperator,
+		},
+		{
+			name: "variable reference in expression",
+			json: `[{"$project":{"a":"$$now"}}]`,
+			wantPath:   "0.$project.a",
+			wantReason: "variables are not supported",
+		},
+		{
+			name: "expression error inside an array names the element index",
+			json: `[{"$project":{"a":["$x","$$y"]}}]`,
+			wantPath:   "0.$project.a.1",
+			wantReason: "variables are not supported",
+		},
+		{
+			// An option miss inside a known stage — like an unknown $text
+			// field in the filter grammar, deliberately not ErrUnknownOperator.
+			name: "unknown $unwind option",
+			json: `[{"$unwind":{"path":"$a","x":1}}]`,
+			wantPath: "0.$unwind.x", wantOp: "$unwind",
+			wantReason: "unknown $unwind option: x",
+		},
+		{
+			name: "unknown accumulator",
+			json: `[{"$group":{"id":"$a","total":{"$summ":"$n"}}}]`,
+			wantPath: "0.$group.total.$summ", wantOp: "$summ",
+			wantReason: "unknown accumulator: $summ", wantIs: query.ErrUnknownOperator,
+		},
+		{
+			name: "$count accumulator with a non-empty argument",
+			json: `[{"$group":{"id":"$a","n":{"$count":1}}}]`,
+			wantPath: "0.$group.n.$count", wantOp: "$count",
+			wantReason: "$count takes an empty object {}",
+		},
+		{
+			name: "$group key expression error",
+			json: `[{"$group":{"id":"$$v"}}]`,
+			wantPath:   "0.$group.id",
+			wantReason: "variables are not supported",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := ParsePipeline(tc.json)
+			require.Error(t, err)
+			assert.Nil(t, p)
+
+			var pe *query.ParseError
+			require.True(t, errors.As(err, &pe), "not a *query.ParseError: %v", err)
+			assert.Equal(t, "pipeline", pe.Source)
+			assert.Equal(t, tc.wantPath, pe.Path)
+			assert.Equal(t, tc.wantOp, pe.Op)
+			assert.Contains(t, pe.Reason, tc.wantReason)
+			assert.Contains(t, err.Error(), "parse pipeline: ")
+			if pe.Path != "" {
+				assert.Contains(t, err.Error(), "(at "+pe.Path+")")
+			}
+
+			if tc.wantIs != nil {
+				assert.True(t, errors.Is(err, tc.wantIs), "want errors.Is(%v)", tc.wantIs)
+			} else {
+				assert.False(t, errors.Is(err, query.ErrUnknownOperator))
+			}
+		})
+	}
+}
+
+// TestStages and TestAccumulators pin the exported vocabularies — same
+// snapshot contract as query's TestOperators: adding or removing an entry
+// must update them, which is the moment to update advertising consumers too.
+func TestStages(t *testing.T) {
+	stages := Stages()
+	assert.Equal(t, []string{
+		"$addFields", "$count", "$group", "$limit", "$match", "$project",
+		"$set", "$skip", "$sort", "$unwind",
+	}, stages)
+
+	// The slice is a fresh copy: mutating it must not poison later calls.
+	stages[0] = "$corrupted"
+	assert.Equal(t, "$addFields", Stages()[0])
+}
+
+func TestAccumulators(t *testing.T) {
+	accums := Accumulators()
+	assert.Equal(t, []string{
+		"$addToSet", "$avg", "$count", "$first", "$last", "$max", "$min",
+		"$push", "$sum",
+	}, accums)
+
+	accums[0] = "$corrupted"
+	assert.Equal(t, "$addToSet", Accumulators()[0])
 }

@@ -58,6 +58,19 @@ func (c *collection) Aggregate(pipeline any) AggQuery {
 	return q
 }
 
+// AggregateStages returns the stage vocabulary accepted by Aggregate's
+// pipeline parser — every stage key it recognizes ($set being $addFields'
+// alias), sorted and with the leading '$'. Like query.Operators, it is the
+// parser's own vocabulary exported as data: use it to advertise the grammar
+// (docs, error payloads) instead of hand-copying the list. A pipeline that
+// does not parse is reported as a *query.ParseError with Source "pipeline",
+// whose Path's leading segment is the failing stage's index.
+func AggregateStages() []string { return aggregate.Stages() }
+
+// AggregateAccumulators returns the $group accumulator vocabulary accepted by
+// Aggregate's pipeline parser, sorted and with the leading '$'.
+func AggregateAccumulators() []string { return aggregate.Accumulators() }
+
 type aggQuery struct {
 	c        *collection
 	pipeline aggregate.Pipeline

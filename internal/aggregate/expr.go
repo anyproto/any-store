@@ -2,9 +2,11 @@ package aggregate
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
 )
 
 // Expr is an aggregation expression evaluated against one document.
@@ -142,11 +144,11 @@ func ParseExpr(v *anyenc.Value) (Expr, error) {
 			return NewLiteralExpr(v)
 		}
 		if strings.HasPrefix(s, "$$") {
-			return nil, fmt.Errorf("aggregate: variables are not supported: %s", s)
+			return nil, &query.ParseError{Reason: "variables are not supported: " + s}
 		}
 		field := s[1:]
 		if field == "" {
-			return nil, fmt.Errorf("aggregate: empty field reference")
+			return nil, &query.ParseError{Reason: `empty field reference: "$"`}
 		}
 		return &FieldRefExpr{Field: field, Path: splitPath(field)}, nil
 	case anyenc.TypeObject:
@@ -166,20 +168,26 @@ func ParseExpr(v *anyenc.Value) (Expr, error) {
 			}
 			if len(key) > 0 && key[0] == '$' {
 				if opKey != "" || nonOpct > 0 {
-					perr = fmt.Errorf("aggregate: operator %s cannot be mixed with other fields", string(key))
+					perr = atPath(&query.ParseError{
+						Op:     string(key),
+						Reason: "operator " + string(key) + " cannot be mixed with other fields",
+					}, string(key))
 					return
 				}
 				opKey, opVal = string(key), item
 				return
 			}
 			if opKey != "" {
-				perr = fmt.Errorf("aggregate: operator %s cannot be mixed with other fields", opKey)
+				perr = atPath(&query.ParseError{
+					Op:     opKey,
+					Reason: "operator " + opKey + " cannot be mixed with other fields",
+				}, string(key))
 				return
 			}
 			nonOpct++
 			sub, e := ParseExpr(item)
 			if e != nil {
-				perr = e
+				perr = atPath(e, string(key))
 				return
 			}
 			names = append(names, string(key))
@@ -192,7 +200,13 @@ func ParseExpr(v *anyenc.Value) (Expr, error) {
 			if opKey == "$literal" {
 				return NewLiteralExpr(opVal)
 			}
-			return nil, fmt.Errorf("aggregate: unsupported expression operator: %s", opKey)
+			// A vocabulary miss: the expression-operator vocabulary is
+			// $literal alone in v1 (compute operators are future work).
+			return nil, atPath(&query.ParseError{
+				Op:     opKey,
+				Reason: "unsupported expression operator: " + opKey,
+				Err:    query.ErrUnknownOperator,
+			}, opKey)
 		}
 		return &ObjectExpr{Names: names, Exprs: exprs}, nil
 	case anyenc.TypeArray:
@@ -201,7 +215,7 @@ func ParseExpr(v *anyenc.Value) (Expr, error) {
 		for i, item := range arr {
 			sub, err := ParseExpr(item)
 			if err != nil {
-				return nil, err
+				return nil, atPath(err, strconv.Itoa(i))
 			}
 			exprs[i] = sub
 		}

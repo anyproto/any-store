@@ -61,27 +61,27 @@ func TestParseModifier(t *testing.T) {
 	testModCasesErr(t, []modifierCaseError{
 		{
 			mod: `{}`,
-			err: `empty modifier`,
+			err: `parse modifier: empty modifier`,
 		},
 		{
 			mod: `{"a":"b"}`,
-			err: `unknown modifier 'a'`,
+			err: `parse modifier: unknown modifier: a (at a)`,
 		},
 		{
 			mod: `[]`,
-			err: `value doesn't contain object; it contains array`,
+			err: `parse modifier: modifier must be an object`,
 		},
 		{
 			mod: `{"$set":{"$a":1}}`,
-			err: `unexpect identifier '$a'`,
+			err: `parse modifier: unexpected operator $a, expected a field path (at $set.$a)`,
 		},
 		{
 			mod: `{"$unset":{"$a":1}}`,
-			err: `unexpect identifier '$a'`,
+			err: `parse modifier: unexpected operator $a, expected a field path (at $unset.$a)`,
 		},
 		{
 			mod: `{"$inc":{"a":"not a num"}}`,
-			err: `not numeric value for $inc in field 'a'`,
+			err: `parse modifier: $inc requires a numeric value, got "not a num" (at $inc.a)`,
 		},
 	}...)
 
@@ -351,12 +351,12 @@ func TestModifierPop_Modify(t *testing.T) {
 			{
 				`{"$pop":{"arr":""}}`,
 				`{"arr":[1,2]}`,
-				`failed to pop item, value doesn't contain number; it contains string`,
+				`parse modifier: $pop must be 1 (last) or -1 (first), got "" (at $pop.arr)`,
 			},
 			{
 				`{"$pop":{"arr":2}}`,
 				`{"arr":[1,2]}`,
-				`failed to pop item: wrong argument`,
+				`parse modifier: $pop must be 1 (last) or -1 (first), got 2 (at $pop.arr)`,
 			},
 		}...)
 	})
@@ -494,12 +494,12 @@ func TestModifierPullAll_Modify(t *testing.T) {
 			{
 				`{"$pullAll":{"arr":1}}`,
 				`{"arr":"2"}`,
-				`failed to pop item, value doesn't contain array; it contains number`,
+				`parse modifier: $pullAll must be an array, got 1 (at $pullAll.arr)`,
 			},
 			{
 				`{"$pullAll":{"arr":1}}`,
 				`{"arr":[1,2,3,4,5]}`,
-				`failed to pop item, value doesn't contain array; it contains number`,
+				`parse modifier: $pullAll must be an array, got 1 (at $pullAll.arr)`,
 			},
 		}...)
 	})

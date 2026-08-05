@@ -230,3 +230,12 @@ func TestCollection_Aggregate_GroupOrderIndependent(t *testing.T) {
 		assert.InDelta(t, 143, n, 1, j)
 	}
 }
+
+// The vocabulary re-exports exist because internal/aggregate is unimportable
+// by consumers; the exact lists are pinned by that package's snapshot tests.
+func TestAggregateVocabularies(t *testing.T) {
+	assert.Contains(t, AggregateStages(), "$match")
+	assert.True(t, sort.StringsAreSorted(AggregateStages()))
+	assert.Contains(t, AggregateAccumulators(), "$sum")
+	assert.True(t, sort.StringsAreSorted(AggregateAccumulators()))
+}

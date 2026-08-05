@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -49,31 +50,7 @@ const (
 	opKnn
 )
 
-var (
-	opBytesPrefix = []byte("$")
-	opBytesAnd    = []byte("$and")
-	opBytesOr     = []byte("$or")
-	opBytesNe     = []byte("$ne")
-	opBytesIn     = []byte("$in")
-	opBytesNin    = []byte("$nin")
-	opBytesAll    = []byte("$all")
-	opBytesEq     = []byte("$eq")
-
-	opBytesGt  = []byte("$gt")
-	opBytesGte = []byte("$gte")
-
-	opBytesLt  = []byte("$lt")
-	opBytesLte = []byte("$lte")
-	opBytesNot = []byte("$not")
-	opBytesNor = []byte("$nor")
-
-	opBytesExists = []byte("$exists")
-	opBytesType   = []byte("$type")
-	opBytesRegexp = []byte("$regex")
-	opBytesSize   = []byte("$size")
-	opBytesText   = []byte("$text")
-	opBytesKnn    = []byte("$knn")
-)
+var opBytesPrefix = []byte("$")
 
 func MustParseCondition(cond any) Filter {
 	f, err := ParseCondition(cond)
@@ -100,16 +77,16 @@ func ParseCondition(cond any) (Filter, error) {
 
 func parseAndArray(v *anyenc.Value) (f Filter, err error) {
 	if v.Type() != anyenc.TypeArray {
-		return nil, fmt.Errorf("$and must be an array")
+		return nil, &ParseError{Op: "$and", Reason: "$and must be an array"}
 	}
 	arr, _ := v.Array()
 	var fs And
 	if len(arr) > 1 {
 		fs = make(And, 0, len(arr))
 	}
-	for _, el := range arr {
+	for i, el := range arr {
 		if f, err = parseAnd(el); err != nil {
-			return nil, err
+			return nil, atPath(err, strconv.Itoa(i))
 		}
 		if fs != nil {
 			fs = append(fs, f)
@@ -123,16 +100,16 @@ func parseAndArray(v *anyenc.Value) (f Filter, err error) {
 
 func parseOrArray(v *anyenc.Value) (f Filter, err error) {
 	if v.Type() != anyenc.TypeArray {
-		return nil, fmt.Errorf("$or must be an array")
+		return nil, &ParseError{Op: "$or", Reason: "$or must be an array"}
 	}
 	arr, _ := v.Array()
 	var fs Or
 	if len(arr) > 1 {
 		fs = make(Or, 0, len(arr))
 	}
-	for _, el := range arr {
+	for i, el := range arr {
 		if f, err = parseAnd(el); err != nil {
-			return nil, err
+			return nil, atPath(err, strconv.Itoa(i))
 		}
 		if fs != nil {
 			fs = append(fs, f)
@@ -146,13 +123,13 @@ func parseOrArray(v *anyenc.Value) (f Filter, err error) {
 
 func parseNorArray(v *anyenc.Value) (f Filter, err error) {
 	if v.Type() != anyenc.TypeArray {
-		return nil, fmt.Errorf("$or must be an array")
+		return nil, &ParseError{Op: "$nor", Reason: "$nor must be an array"}
 	}
 	arr, _ := v.Array()
 	fs := make(Nor, 0, len(arr))
-	for _, el := range arr {
+	for i, el := range arr {
 		if f, err = parseAnd(el); err != nil {
-			return nil, err
+			return nil, atPath(err, strconv.Itoa(i))
 		}
 		fs = append(fs, f)
 	}
@@ -161,7 +138,7 @@ func parseNorArray(v *anyenc.Value) (f Filter, err error) {
 
 func parseAnd(val *anyenc.Value) (res Filter, err error) {
 	if val.Type() != anyenc.TypeObject {
-		return nil, fmt.Errorf("query filter must be an object")
+		return nil, &ParseError{Reason: "query filter must be an object"}
 	}
 	obj, _ := val.Object()
 	var fs And
@@ -179,17 +156,26 @@ func parseAnd(val *anyenc.Value) (res Filter, err error) {
 		}
 		isOp, op, err = isOperator(key)
 		if err != nil {
+			err = atPath(err, string(key))
 			return
 		}
 		if isOp {
 			if !isTopLevel(op) {
-				err = fmt.Errorf("unknow top level operator: %s", string(key))
+				// isOperator has already recognized the key, so this fires for
+				// a KNOWN operator in a position that does not accept it (e.g.
+				// {"$eq": 1}) — a distinct fault from an unrecognized token,
+				// deliberately not wrapping ErrUnknownOperator.
+				err = atPath(&ParseError{
+					Op:     string(key),
+					Reason: "operator " + string(key) + " is not valid at the top level",
+				}, string(key))
 				return
 			}
 
 			switch op {
 			case opAnd:
 				if f, err = parseAndArray(v); err != nil {
+					err = atPath(err, string(key))
 					return
 				}
 				if fs != nil {
@@ -197,6 +183,7 @@ func parseAnd(val *anyenc.Value) (res Filter, err error) {
 				}
 			case opOr:
 				if f, err = parseOrArray(v); err != nil {
+					err = atPath(err, string(key))
 					return
 				}
 				if fs != nil {
@@ -204,6 +191,7 @@ func parseAnd(val *anyenc.Value) (res Filter, err error) {
 				}
 			case opNor:
 				if f, err = parseNorArray(v); err != nil {
+					err = atPath(err, string(key))
 					return
 				}
 				if fs != nil {
@@ -211,6 +199,7 @@ func parseAnd(val *anyenc.Value) (res Filter, err error) {
 				}
 			case opText:
 				if f, err = parseText(v); err != nil {
+					err = atPath(err, string(key))
 					return
 				}
 				if fs != nil {
@@ -221,6 +210,7 @@ func parseAnd(val *anyenc.Value) (res Filter, err error) {
 			}
 		} else {
 			if f, err = parseComp(string(key), v); err != nil {
+				err = atPath(err, string(key))
 				return
 			}
 			if fs != nil {
@@ -276,7 +266,7 @@ func parseCompObj(v *anyenc.Value) (Filter, error) {
 func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 	obj, e := val.Object()
 	if e != nil {
-		return false, nil, fmt.Errorf("expected object")
+		return false, nil, &ParseError{Reason: "expected an object of operators"}
 	}
 	var (
 		isOp     bool
@@ -296,15 +286,22 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 		}
 		isOp, op, err = isOperator(key)
 		if err != nil {
+			err = atPath(err, string(key))
 			return
 		}
 		if isOp {
 			if isTopLevel(op) {
-				err = fmt.Errorf("unexpected comparsion operator: %v", string(key))
+				err = atPath(&ParseError{
+					Op:     string(key),
+					Reason: "operator " + string(key) + " is not valid in a field condition",
+				}, string(key))
 				return
 			}
 			if hasNonOp {
-				err = fmt.Errorf("mixed operators and values")
+				err = atPath(&ParseError{
+					Op:     string(key),
+					Reason: "mixed operators and values",
+				}, string(key))
 				return
 			}
 			ok = true
@@ -312,6 +309,7 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 				hasKnn = true
 			}
 			if f, err = makeCompFilter(op, v); err != nil {
+				err = atPath(err, string(key))
 				return
 			}
 			if fs != nil {
@@ -320,7 +318,9 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 		} else {
 			hasNonOp = true
 			if ok {
-				err = fmt.Errorf("unexpected comparsion operator: %v", string(key))
+				err = atPath(&ParseError{
+					Reason: "mixed operators and values",
+				}, string(key))
 				return
 			}
 		}
@@ -334,7 +334,7 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 	// One JSON object, one operator. (Programmatic And{Key{f,Knn},Key{f,Comp}}
 	// stays legal — the residual builder strips by node identity.)
 	if hasKnn && obj.Len() > 1 {
-		return false, nil, errors.New("$knn must be the only operator on its field")
+		return false, nil, &ParseError{Op: "$knn", Reason: "$knn must be the only operator on its field"}
 	}
 	if hasNonOp {
 		return false, nil, nil
@@ -359,7 +359,11 @@ func makeCompFilter(op Operator, v *anyenc.Value) (f Filter, err error) {
 	switch op {
 	case opGt, opGte, opLt, opLte:
 		if v.Type() == anyenc.TypeVectorF32 {
-			return nil, fmt.Errorf("%w: use $eq for exact match, or a $vector index for similarity search", ErrVectorNotOrderable)
+			return nil, &ParseError{
+				Op:     opName(op),
+				Reason: ErrVectorNotOrderable.Error() + ": use $eq for exact match, or a $vector index for similarity search",
+				Err:    ErrVectorNotOrderable,
+			}
 		}
 	}
 	switch op {
@@ -403,15 +407,18 @@ func makeCompFilter(op Operator, v *anyenc.Value) (f Filter, err error) {
 		var isOp bool
 		not := Not{}
 		if isOp, not.Filter, err = parseCompObjOp(v); err != nil {
-			return nil, fmt.Errorf("%w for operator $not", err)
+			// No extra wrapping: the caller's visitor prefixes "$not" onto the
+			// ParseError path, which locates the failure better than the old
+			// "%w for operator $not" suffix did.
+			return nil, err
 		}
 		if !isOp {
-			return nil, fmt.Errorf("no operators found for $not")
+			return nil, &ParseError{Op: "$not", Reason: "no operators found for $not"}
 		}
 		// A Knn under Not would evaluate !false == match-all (fail-closed Ok
 		// reflected). Unrepresentable, at the door.
 		if ContainsKnn(not.Filter) {
-			return nil, errors.New("$knn is not allowed under $not")
+			return nil, &ParseError{Op: "$knn", Reason: "$knn is not allowed under $not"}
 		}
 		return not, nil
 	case opExists:
@@ -441,7 +448,7 @@ func parseKnn(v *anyenc.Value) (Filter, error) {
 		// NOTE: a sole-key {"$vector":[…]} object cannot even reach here as an
 		// object — anyenc decodes it into a TypeVectorF32 VALUE before the
 		// parser runs. That extjson landmine is why the payload key is $query.
-		return nil, errors.New(`$knn must be an object, e.g. {"$knn":{"$query":[...],"$k":10}}`)
+		return nil, &ParseError{Op: "$knn", Reason: `$knn must be an object, e.g. {"$knn":{"$query":[...],"$k":10}}`}
 	}
 	obj, _ := v.Object()
 	var (
@@ -454,19 +461,23 @@ func parseKnn(v *anyenc.Value) (Filter, error) {
 		if perr != nil {
 			return
 		}
+		// fail records a structured rejection located at this $knn sub-key.
+		fail := func(reason string) {
+			perr = atPath(&ParseError{Op: "$knn", Reason: reason}, string(key))
+		}
 		switch string(key) {
 		case "$query":
 			var ok bool
 			kn.Query, ok = anyenc.AppendFloat32s(val.MarshalTo(nil), nil)
 			if !ok {
-				perr = errors.New(`$knn: $query must be an array of numbers or {"$vector":[...]}`)
+				fail(`$knn: $query must be an array of numbers or {"$vector":[...]}`)
 				return
 			}
 			hasQuery = true
 		case "$k":
 			n, e := val.Int()
 			if e != nil || val.Type() != anyenc.TypeNumber || float64(n) != val.GetFloat64() || n < 1 || n > KnnMaxK {
-				perr = fmt.Errorf("$knn: $k must be an integer in [1, %d], got %v", KnnMaxK, val)
+				fail(fmt.Sprintf("$knn: $k must be an integer in [1, %d], got %v", KnnMaxK, val))
 				return
 			}
 			kn.K = n
@@ -474,39 +485,39 @@ func parseKnn(v *anyenc.Value) (Filter, error) {
 		case "$ef":
 			n, e := val.Int()
 			if e != nil || val.Type() != anyenc.TypeNumber || float64(n) != val.GetFloat64() || n > KnnMaxEf {
-				perr = fmt.Errorf("$knn: $ef must be an integer in [$k, %d], got %v", KnnMaxEf, val)
+				fail(fmt.Sprintf("$knn: $ef must be an integer in [$k, %d], got %v", KnnMaxEf, val))
 				return
 			}
 			kn.Ef = n
 		case "$index":
 			sb, e := val.StringBytes()
 			if e != nil {
-				perr = errors.New("$knn: $index must be a string")
+				fail("$knn: $index must be a string")
 				return
 			}
 			kn.Index = string(sb)
 		case "$vector":
-			perr = errors.New(`unknown $knn field: $vector (did you mean "$query"? $vector is the value-type wrapper: {"$query":{"$vector":[...]}})`)
+			fail(`unknown $knn field: $vector (did you mean "$query"? $vector is the value-type wrapper: {"$query":{"$vector":[...]}})`)
 		case "$maxDistance", "$minScore", "$prefilter", "$nprobe":
 			// Reserved so adding them later is non-breaking; rejected in v1.
-			perr = fmt.Errorf("$knn: %s is reserved and not supported", string(key))
+			fail(fmt.Sprintf("$knn: %s is reserved and not supported", string(key)))
 		default:
-			perr = fmt.Errorf("unknown $knn field: %s", string(key))
+			fail(fmt.Sprintf("unknown $knn field: %s", string(key)))
 		}
 	})
 	if perr != nil {
 		return nil, perr
 	}
 	if !hasQuery {
-		return nil, errors.New("$knn requires $query")
+		return nil, &ParseError{Op: "$knn", Reason: "$knn requires $query"}
 	}
 	if !hasK {
-		return nil, errors.New("$knn requires $k (the number of neighbours to select)")
+		return nil, &ParseError{Op: "$knn", Reason: "$knn requires $k (the number of neighbours to select)"}
 	}
 	// Range/finiteness rules live in ONE place, shared with the executor's
 	// detection walk (which validates programmatic NewKnn filters).
 	if err := kn.Validate(); err != nil {
-		return nil, err
+		return nil, &ParseError{Op: "$knn", Reason: err.Error(), Err: err}
 	}
 	return kn, nil
 }
@@ -528,7 +539,7 @@ func parseKnn(v *anyenc.Value) (Filter, error) {
 // Note the Text caveat: outside an FTS-driven query its Ok matches everything.
 func parseText(v *anyenc.Value) (Filter, error) {
 	if v.Type() != anyenc.TypeObject {
-		return nil, fmt.Errorf("$text must be an object, e.g. {\"$search\":\"...\"}")
+		return nil, &ParseError{Op: "$text", Reason: `$text must be an object, e.g. {"$search":"..."}`}
 	}
 	obj, _ := v.Object()
 	var (
@@ -539,6 +550,10 @@ func parseText(v *anyenc.Value) (Filter, error) {
 		excludeRaws []string
 		perr        error
 	)
+	// fail records a structured rejection located at the given $text sub-key.
+	fail := func(field, reason string) {
+		perr = atPath(&ParseError{Op: "$text", Reason: reason}, field)
+	}
 	// appendStrings reads a string or array-of-strings field into dst.
 	appendStrings := func(field string, val *anyenc.Value, dst []string) []string {
 		switch val.Type() {
@@ -550,14 +565,14 @@ func parseText(v *anyenc.Value) (Filter, error) {
 			for _, e := range arr {
 				sb, er := e.StringBytes()
 				if er != nil {
-					perr = fmt.Errorf("%s entries must be strings", field)
+					fail(field, field+" entries must be strings")
 					return dst
 				}
 				dst = append(dst, string(sb))
 			}
 			return dst
 		default:
-			perr = fmt.Errorf("%s must be a string or an array of strings", field)
+			fail(field, field+" must be a string or an array of strings")
 			return dst
 		}
 	}
@@ -569,14 +584,14 @@ func parseText(v *anyenc.Value) (Filter, error) {
 		case "$search":
 			sb, e := val.StringBytes()
 			if e != nil {
-				perr = fmt.Errorf("$search must be a string")
+				fail("$search", "$search must be a string")
 				return
 			}
 			search, hasS = string(sb), true
 		case "$defaultOperator":
 			sb, e := val.StringBytes()
 			if e != nil {
-				perr = fmt.Errorf("$defaultOperator must be a string (\"and\" or \"or\")")
+				fail("$defaultOperator", `$defaultOperator must be a string ("and" or "or")`)
 				return
 			}
 			switch strings.ToLower(string(sb)) {
@@ -585,7 +600,7 @@ func parseText(v *anyenc.Value) (Filter, error) {
 			case "or", "":
 				defaultAnd = false
 			default:
-				perr = fmt.Errorf("$defaultOperator must be \"and\" or \"or\", got %q", string(sb))
+				fail("$defaultOperator", fmt.Sprintf(`$defaultOperator must be "and" or "or", got %q`, string(sb)))
 			}
 		case "$require":
 			requireRaws = appendStrings("$require", val, requireRaws)
@@ -594,14 +609,14 @@ func parseText(v *anyenc.Value) (Filter, error) {
 		case "$language", "$caseSensitive", "$diacriticSensitive":
 			// accepted for Mongo compatibility, ignored in v1
 		default:
-			perr = fmt.Errorf("unknown $text field: %s", string(key))
+			fail(string(key), "unknown $text field: "+string(key))
 		}
 	})
 	if perr != nil {
 		return nil, perr
 	}
 	if !hasS {
-		return nil, fmt.Errorf("$text requires $search")
+		return nil, &ParseError{Op: "$text", Reason: "$text requires $search"}
 	}
 
 	clauses := ParseTextSearch(search) // all should
@@ -692,7 +707,7 @@ func appendTextClauses(dst []TextClause, raw string, op TextOp) []TextClause {
 func parseSize(v *anyenc.Value) (Filter, error) {
 	size, err := v.Int()
 	if err != nil {
-		return nil, fmt.Errorf("failed to extract size %w", err)
+		return nil, &ParseError{Op: "$size", Reason: "$size must be an integer", Err: err}
 	}
 	return Size{Size: int64(size)}, nil
 }
@@ -702,21 +717,21 @@ func parseRegexp(v *anyenc.Value) (Filter, error) {
 	case anyenc.TypeString:
 		exp, err := v.StringBytes()
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse regular exporession: %w", err)
+			return nil, &ParseError{Op: "$regex", Reason: "invalid regular expression: " + err.Error(), Err: err}
 		}
 		compiledRegexp, err := regexp.Compile(string(exp))
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse regular exporession: %w", err)
+			return nil, &ParseError{Op: "$regex", Reason: "invalid regular expression: " + err.Error(), Err: err}
 		}
 		return Regexp{Regexp: compiledRegexp}, nil
 	default:
-		return nil, fmt.Errorf("unexpetced type: %s", v.String())
+		return nil, &ParseError{Op: "$regex", Reason: "$regex must be a string, got " + v.String()}
 	}
 }
 
 func makeArrComp(op Operator, v *anyenc.Value) (Filter, error) {
 	if v.Type() != anyenc.TypeArray {
-		return nil, fmt.Errorf("expected array for %v operator", op)
+		return nil, &ParseError{Op: opName(op), Reason: opName(op) + " must be an array"}
 	}
 	switch op {
 	case opIn:
@@ -770,64 +785,32 @@ func parseType(v *anyenc.Value) (f Filter, err error) {
 		n, _ := v.Int()
 		tv := Type(n)
 		if (tv > TypeObject && tv != TypeObjectID && tv != TypeVectorF32) || tv < 0 {
-			return nil, fmt.Errorf("unexpected type: %d", n)
+			return nil, &ParseError{Op: "$type", Reason: fmt.Sprintf("unexpected type: %d", n)}
 		}
 		return TypeFilter{Type: anyenc.Type(tv)}, err
 	case anyenc.TypeString:
 		bs, _ := v.StringBytes()
 		tv, ok := stringToType[string(bs)]
 		if !ok {
-			return nil, fmt.Errorf("unexpected type: %s", string(bs))
+			return nil, &ParseError{Op: "$type", Reason: "unexpected type: " + string(bs)}
 		}
 		return TypeFilter{Type: anyenc.Type(tv)}, err
 	default:
-		return nil, fmt.Errorf("unexpetced type: %s", v.String())
+		return nil, &ParseError{Op: "$type", Reason: "$type must be a number or a string, got " + v.String()}
 	}
 }
 
 func isOperator(key []byte) (ok bool, op Operator, err error) {
 	if bytes.HasPrefix(key, opBytesPrefix) {
-		switch {
-		case bytes.Equal(key, opBytesIn):
-			return true, opIn, nil
-		case bytes.Equal(key, opBytesNin):
-			return true, opNin, nil
-		case bytes.Equal(key, opBytesOr):
-			return true, opOr, nil
-		case bytes.Equal(key, opBytesAnd):
-			return true, opAnd, nil
-		case bytes.Equal(key, opBytesAll):
-			return true, opAll, nil
-		case bytes.Equal(key, opBytesNe):
-			return true, opNe, nil
-		case bytes.Equal(key, opBytesNor):
-			return true, opNor, nil
-		case bytes.Equal(key, opBytesGt):
-			return true, opGt, nil
-		case bytes.Equal(key, opBytesGte):
-			return true, opGte, nil
-		case bytes.Equal(key, opBytesLt):
-			return true, opLt, nil
-		case bytes.Equal(key, opBytesLte):
-			return true, opLte, nil
-		case bytes.Equal(key, opBytesEq):
-			return true, opEq, nil
-		case bytes.Equal(key, opBytesNot):
-			return true, opNot, nil
-		case bytes.Equal(key, opBytesExists):
-			return true, opExists, nil
-		case bytes.Equal(key, opBytesType):
-			return true, opType, nil
-		case bytes.Equal(key, opBytesRegexp):
-			return true, opRegexp, nil
-		case bytes.Equal(key, opBytesSize):
-			return true, opSize, nil
-		case bytes.Equal(key, opBytesText):
-			return true, opText, nil
-		case bytes.Equal(key, opBytesKnn):
-			return true, opKnn, nil
-		default:
-			return true, 0, fmt.Errorf("unknow operator: %s", string(key))
+		// The map[string([]byte)] lookup does not allocate; this is the hot
+		// recognition path for every '$'-prefixed key.
+		if op, ok = operators[string(key)]; ok {
+			return true, op, nil
+		}
+		return true, 0, &ParseError{
+			Op:     string(key),
+			Reason: "unknown operator: " + string(key),
+			Err:    ErrUnknownOperator,
 		}
 	}
 	return false, 0, nil
