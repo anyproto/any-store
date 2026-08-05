@@ -72,8 +72,8 @@ Inside `$project`/`$addFields` values, `$group` keys and accumulator arguments:
 
 | Operator | Form | Notes |
 |---|---|---|
-| `$add`, `$multiply` | `{"$add": [e, ...]}` | Variadic; an empty operand list yields the identity (`0` / `1`). No date arithmetic yet: a dateTime operand is non-numeric → `null`. |
-| `$subtract`, `$divide` | `{"$subtract": [a, b]}` | Exactly two operands. `$divide` by zero → `null`. |
+| `$add`, `$multiply` | `{"$add": [e, ...]}` | Variadic; an empty operand list yields the identity (`0` / `1`). `$add` with exactly one dateTime operand among numbers shifts the date by their sum of millis; two dateTimes → `null`. `$multiply` is numeric-only. |
+| `$subtract`, `$divide` | `{"$subtract": [a, b]}` | Exactly two operands. `$subtract`: `[date, date]` → millis number, `[date, number]` → date, `[number, date]` → `null`. `$divide` by zero → `null`. |
 | `$abs` | `{"$abs": e}` | |
 | `$round` | `{"$round": [x, place?]}` | Half to even (banker's: `1.5`→`2`, `2.5`→`2`); `place` in `[-20, 100]`, default `0`, negative rounds left of the decimal point. |
 | `$concat` | `{"$concat": [e, ...]}` | String operands; an empty operand list yields `""`. |
@@ -82,6 +82,10 @@ Inside `$project`/`$addFields` values, `$group` keys and accumulator arguments:
 | `$ifNull` | `{"$ifNull": [e, e, ...]}` | At least two operands (Mongo 4.4 variadic form): the first non-null, non-missing value, else the last operand's value. Lazy left-to-right. |
 | `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte` | `{"$eq": [a, b]}` | Exactly two operands; `true`/`false` over any value types (see the comparison note below). |
 | `$cmp` | `{"$cmp": [a, b]}` | `-1`/`0`/`1`. |
+| `$dateAdd` | `{"$dateAdd": {"startDate": e, "unit": u, "amount": e, "timezone"?: tz}}` | Units: `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second`, `millisecond`. `year`/`quarter`/`month` are calendar-aware in the operative timezone and clamp the day of month (Jan 31 + 1 month = Feb 28); `week`/`day` add calendar days, preserving the local clock across DST; `hour` and smaller are fixed millis spans. Non-integral `amount` → `null`. |
+| `$dateDiff` | `{"$dateDiff": {"startDate": e, "endDate": e, "unit": u, "timezone"?: tz, "startOfWeek"?: w}}` | Signed count of unit-boundary **crossings**, not elapsed time (day diff of 23:59 → 00:01 is `1`). `year`…`day` cross local calendar boundaries; `hour` and smaller cross absolute-millis boundaries. `startOfWeek` (default `sunday`) applies to `week` only. |
+| `$dateTrunc` | `{"$dateTrunc": {"date": e, "unit": u, "binSize"?: n, "timezone"?: tz, "startOfWeek"?: w}}` | Truncates down to its `binSize`×`unit` bin (`binSize`: positive integer literal, default `1`). Bins anchor at Mongo's reference point 2000-01-01T00:00:00 in the operative timezone; `week` bins anchor at the first `startOfWeek` on or after 2000-01-01 (a Saturday). |
+| `$year`, `$week` | `{"$year": e}` or `{"$year": {"date": e, "timezone"?: tz}}` | `$week` is the Sunday-based week of year `0`–`53` (days before the year's first Sunday are week `0`) — not the ISO week. |
 
 A single non-array operand is Mongo's shorthand for a one-element list
 (`{"$abs": "$x"}`); arity is checked at parse time with structured errors.
@@ -111,6 +115,27 @@ A single non-array operand is Mongo's shorthand for a one-element list
 > (`{"$round": [2.345, 2]}` is `2.35` — the stored double sits above the
 > midpoint; `{"$round": [1.25, 1]}` is `1.2` — an exact tie, half to even),
 > and a `place` beyond float64 resolution returns the value unchanged.
+
+> **Date operators** work over the dateTime value type (`{"$date": ...}` in
+> JSON). `unit`, `timezone`, `startOfWeek` and `binSize` are **parse-time
+> literals** — an expression there is a parse error (divergence: Mongo
+> accepts dynamic values; a literal resolves the `*time.Location` once at
+> parse time). `timezone` is an Olson name (`"Europe/Berlin"`) or a fixed
+> offset (`"+02:00"`, `"-0500"`, `"+02"`); default UTC. A date operand
+> (`startDate`/`endDate`/`date`, and the date side of `$add`/`$subtract`)
+> that is null or missing → `null`, and any other non-dateTime type → `null`
+> too (divergence: Mongo errors — same no-error-channel rationale as above);
+> an unrepresentable result (overflow past the int64-millis range) is also
+> `null`. Around DST transitions: a computed wall time that a fall-back
+> repeats resolves to its **earlier** occurrence, one that a spring-forward
+> skips normalizes forward, and sub-day `$dateTrunc` subtracts the wall-clock
+> residue on the absolute timeline, so it stays monotone and idempotent
+> across the transition. `$dateDiff`'s `hour`/`minute`/`second` boundaries
+> are absolute UTC millis, so `timezone` affects `day` and larger units only.
+> `$dateDiff`, `$year` and `$week` return float64 numbers;
+> `$dateAdd`/`$dateTrunc` return dateTimes. Millis in numeric form (date
+> differences, `$add`/`$subtract` shifts) are float64: exact only up to 2^53
+> ms, i.e. within roughly year ±285,000.
 
 ## 3. $group
 

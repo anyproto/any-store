@@ -20,23 +20,28 @@ var exprOpParsers map[string]func(*anyenc.Value) (Expr, error)
 
 func init() {
 	exprOpParsers = map[string]func(*anyenc.Value) (Expr, error){
-		"$add":      func(v *anyenc.Value) (Expr, error) { return parseArith(OpAdd, v) },
-		"$subtract": func(v *anyenc.Value) (Expr, error) { return parseArith(OpSubtract, v) },
-		"$multiply": func(v *anyenc.Value) (Expr, error) { return parseArith(OpMultiply, v) },
-		"$divide":   func(v *anyenc.Value) (Expr, error) { return parseArith(OpDivide, v) },
-		"$abs":      parseAbs,
-		"$round":    parseRound,
-		"$concat":   parseConcat,
-		"$cond":     parseCond,
-		"$switch":   parseSwitch,
-		"$ifNull":   parseIfNull,
-		"$eq":       func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpEq, v) },
-		"$ne":       func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpNe, v) },
-		"$gt":       func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpGt, v) },
-		"$gte":      func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpGte, v) },
-		"$lt":       func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpLt, v) },
-		"$lte":      func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpLte, v) },
-		"$cmp":      func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpCmp, v) },
+		"$add":       func(v *anyenc.Value) (Expr, error) { return parseArith(OpAdd, v) },
+		"$subtract":  func(v *anyenc.Value) (Expr, error) { return parseArith(OpSubtract, v) },
+		"$multiply":  func(v *anyenc.Value) (Expr, error) { return parseArith(OpMultiply, v) },
+		"$divide":    func(v *anyenc.Value) (Expr, error) { return parseArith(OpDivide, v) },
+		"$abs":       parseAbs,
+		"$round":     parseRound,
+		"$concat":    parseConcat,
+		"$cond":      parseCond,
+		"$switch":    parseSwitch,
+		"$ifNull":    parseIfNull,
+		"$eq":        func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpEq, v) },
+		"$ne":        func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpNe, v) },
+		"$gt":        func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpGt, v) },
+		"$gte":       func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpGte, v) },
+		"$lt":        func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpLt, v) },
+		"$lte":       func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpLte, v) },
+		"$cmp":       func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpCmp, v) },
+		"$dateAdd":   parseDateAdd,
+		"$dateDiff":  parseDateDiff,
+		"$dateTrunc": parseDateTrunc,
+		"$year":      func(v *anyenc.Value) (Expr, error) { return parseDatePart(partYear, v) },
+		"$week":      func(v *anyenc.Value) (Expr, error) { return parseDatePart(partWeek, v) },
 	}
 }
 
@@ -104,10 +109,11 @@ func opString(op string, args []Expr) string {
 }
 
 // evalNumber evaluates sub as a numeric operand. ok=false means the operator
-// result is null: the operand is missing, null, or non-numeric (TypeDateTime
-// included — date arithmetic is future work). Mongo raises a runtime error
-// for non-numeric operands; streaming eval has no per-document error channel,
-// so null stands in (see docs/aggregation.md).
+// result is null: the operand is missing, null, or non-numeric. Mongo raises
+// a runtime error for non-numeric operands; streaming eval has no
+// per-document error channel, so null stands in (see docs/aggregation.md).
+// Date arithmetic never comes through here: $add/$subtract classify dateTime
+// operands themselves (evalAdd/evalSubtract).
 func evalNumber(sub Expr, a *anyenc.Arena, doc *anyenc.Value) (f float64, ok bool, err error) {
 	v, err := sub.Eval(a, doc)
 	if err != nil || v == nil || v.Type() != anyenc.TypeNumber {
@@ -140,11 +146,13 @@ var arithOpNames = [...]string{"$add", "$subtract", "$multiply", "$divide"}
 
 func (op ArithOp) String() string { return arithOpNames[op] }
 
-// ArithExpr evaluates $add/$subtract/$multiply/$divide over numeric operands.
-// Any missing, null, or non-numeric operand makes the result null, as do
-// division by zero and a non-finite result (Mongo errors for these; see
-// evalNumber). An empty operand list yields the operator's identity, Mongo
-// semantics ($add 0, $multiply 1).
+// ArithExpr evaluates $add/$subtract/$multiply/$divide over numeric operands,
+// plus Mongo's date arithmetic: $add with exactly one dateTime operand shifts
+// it by the numeric sum of millis, and $subtract handles [date, date] →
+// millis and [date, number] → date. Any other mix, a missing/null/non-numeric
+// operand, division by zero, overflow and a non-finite result make the result
+// null (Mongo errors for these; see evalNumber). An empty operand list yields
+// the operator's identity, Mongo semantics ($add 0, $multiply 1).
 type ArithExpr struct {
 	Op   ArithOp
 	Args []Expr
@@ -163,14 +171,19 @@ func parseArith(op ArithOp, v *anyenc.Value) (Expr, error) {
 }
 
 func (e *ArithExpr) Eval(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, error) {
-	if len(e.Args) == 0 {
+	switch {
+	case len(e.Args) == 0:
 		if e.Op == OpMultiply {
 			return a.NewNumberFloat64(1), nil
 		}
 		return a.NewNumberFloat64(0), nil // $add
+	case e.Op == OpAdd:
+		return e.evalAdd(a, doc)
+	case e.Op == OpSubtract:
+		return e.evalSubtract(a, doc)
 	}
-	// The first operand seeds the accumulator, so one loop serves both the
-	// variadic ($add/$multiply) and binary ($subtract/$divide) forms.
+	// $multiply/$divide: numeric operands only. The first operand seeds the
+	// accumulator, so one loop serves both the variadic and binary forms.
 	var acc float64
 	for i, arg := range e.Args {
 		f, ok, err := evalNumber(arg, a, doc)
@@ -184,21 +197,93 @@ func (e *ArithExpr) Eval(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, err
 			acc = f
 			continue
 		}
-		switch e.Op {
-		case OpAdd:
-			acc += f
-		case OpSubtract:
-			acc -= f
-		case OpMultiply:
-			acc *= f
-		case OpDivide:
+		if e.Op == OpDivide {
 			if f == 0 {
 				return a.NewNull(), nil
 			}
 			acc /= f
+		} else {
+			acc *= f
 		}
 	}
 	return newNumber(a, acc), nil
+}
+
+// evalAdd sums numeric operands; at most one dateTime operand shifts by that
+// sum of millis (fraction truncated). Two dateTimes, any other non-numeric
+// operand and overflow → null.
+func (e *ArithExpr) evalAdd(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, error) {
+	var (
+		acc    float64
+		dateMs int64
+		dates  int
+	)
+	for _, arg := range e.Args {
+		v, err := arg.Eval(a, doc)
+		if err != nil {
+			return nil, err
+		}
+		if v != nil && v.Type() == anyenc.TypeDateTime {
+			if dates++; dates > 1 {
+				return a.NewNull(), nil
+			}
+			dateMs, _ = v.DateTimeMillis()
+			continue
+		}
+		if v == nil || v.Type() != anyenc.TypeNumber {
+			return a.NewNull(), nil
+		}
+		f, _ := v.Float64()
+		acc += f
+	}
+	if dates == 0 {
+		return newNumber(a, acc), nil
+	}
+	res, ok := shiftMillis(dateMs, acc)
+	if !ok {
+		return a.NewNull(), nil
+	}
+	return a.NewDateTimeMillis(res), nil
+}
+
+// evalSubtract: [num, num] → number, [date, date] → millis number,
+// [date, num] → shifted date; [num, date] and any other mix → null (Mongo
+// errors).
+func (e *ArithExpr) evalSubtract(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, error) {
+	av, err := e.Args[0].Eval(a, doc)
+	if err != nil {
+		return nil, err
+	}
+	bv, err := e.Args[1].Eval(a, doc)
+	if err != nil {
+		return nil, err
+	}
+	aDate := av != nil && av.Type() == anyenc.TypeDateTime
+	switch {
+	case aDate && bv != nil && bv.Type() == anyenc.TypeDateTime:
+		ams, _ := av.DateTimeMillis()
+		bms, _ := bv.DateTimeMillis()
+		return newNumber(a, float64(ams)-float64(bms)), nil
+	case aDate:
+		if bv == nil || bv.Type() != anyenc.TypeNumber {
+			return a.NewNull(), nil
+		}
+		ams, _ := av.DateTimeMillis()
+		f, _ := bv.Float64()
+		res, ok := shiftMillis(ams, -f)
+		if !ok {
+			return a.NewNull(), nil
+		}
+		return a.NewDateTimeMillis(res), nil
+	default:
+		if av == nil || av.Type() != anyenc.TypeNumber ||
+			bv == nil || bv.Type() != anyenc.TypeNumber {
+			return a.NewNull(), nil
+		}
+		af, _ := av.Float64()
+		bf, _ := bv.Float64()
+		return newNumber(a, af-bf), nil
+	}
 }
 
 func (e *ArithExpr) String() string { return opString(e.Op.String(), e.Args) }

@@ -286,6 +286,11 @@ func TestParseExprOperators(t *testing.T) {
 			{`{"$ifNull": ["$a", 0]}`, &IfNullExpr{}},
 			{`{"$eq": ["$a", 1]}`, &CompareExpr{}},
 			{`{"$cmp": ["$a", "$b"]}`, &CompareExpr{}},
+			{`{"$dateAdd": {"startDate": "$a", "unit": "day", "amount": 1}}`, &DateAddExpr{}},
+			{`{"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "month"}}`, &DateDiffExpr{}},
+			{`{"$dateTrunc": {"date": "$a", "unit": "week"}}`, &DateTruncExpr{}},
+			{`{"$year": "$a"}`, &DatePartExpr{}},
+			{`{"$week": {"date": "$a", "timezone": "+02:00"}}`, &DatePartExpr{}},
 		} {
 			e, err := ParseExpr(anyenc.MustParseJson(tc.json))
 			require.NoError(t, err, tc.json)
@@ -317,6 +322,19 @@ func TestParseExprOperators(t *testing.T) {
 			{`{"$ifNull": ["$a", "$b", 0]}`, `{$ifNull:[$a,$b,0]}`},
 			{`{"$ne": ["$a", null]}`, `{$ne:[$a,null]}`},
 			{`{"$cmp": ["$a", "$b"]}`, `{$cmp:[$a,$b]}`},
+			{`{"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 5}}`,
+				`{$dateAdd:{startDate:$d,unit:"day",amount:5}}`},
+			// Spec order does not matter: String renders the canonical order.
+			{`{"$dateAdd": {"timezone": "Europe/Berlin", "amount": 1, "unit": "month", "startDate": "$d"}}`,
+				`{$dateAdd:{startDate:$d,unit:"month",amount:1,timezone:"Europe/Berlin"}}`},
+			{`{"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "week", "startOfWeek": "Monday"}}`,
+				`{$dateDiff:{startDate:$a,endDate:$b,unit:"week",startOfWeek:"Monday"}}`},
+			{`{"$dateTrunc": {"date": "$d", "unit": "day", "binSize": 14, "timezone": "+02:00"}}`,
+				`{$dateTrunc:{date:$d,unit:"day",binSize:14,timezone:"+02:00"}}`},
+			{`{"$dateTrunc": {"date": "$d", "unit": "hour"}}`, `{$dateTrunc:{date:$d,unit:"hour"}}`},
+			{`{"$year": "$d"}`, `{$year:[$d]}`},
+			{`{"$week": {"date": "$d", "timezone": "-05:00"}}`, `{$week:{date:$d,timezone:"-05:00"}}`},
+			{`{"$week": {"date": "$d"}}`, `{$week:[$d]}`},
 		} {
 			e, err := ParseExpr(anyenc.MustParseJson(tc.json))
 			require.NoError(t, err, tc.json)
@@ -345,6 +363,61 @@ func TestDuplicateStructuredParams(t *testing.T) {
 	t.Run("$switch branch", func(t *testing.T) {
 		_, _, err := parseSwitchBranch(splice(t, `{"case":true,"then":1}`, `{"then":2}`))
 		assert.ErrorContains(t, err, "duplicate $switch branch parameter: then")
+	})
+	t.Run("date operator object", func(t *testing.T) {
+		_, err := parseDateAdd(splice(t, `{"startDate":"$d","unit":"day","amount":1}`, `{"unit":"hour"}`))
+		assert.ErrorContains(t, err, "duplicate $dateAdd parameter: unit")
+	})
+}
+
+// TestParseDateOps covers the parse-time-literal contract of the date
+// operators beyond the structured-error table: unit/timezone/startOfWeek and
+// binSize must be literals of the right shape.
+func TestParseDateOps(t *testing.T) {
+	bad := func(t *testing.T, exprJson, contains string) {
+		t.Helper()
+		_, err := ParseExpr(anyenc.MustParseJson(exprJson))
+		assert.ErrorContains(t, err, contains, exprJson)
+	}
+	good := func(t *testing.T, exprJson string) {
+		t.Helper()
+		_, err := ParseExpr(anyenc.MustParseJson(exprJson))
+		assert.NoError(t, err, exprJson)
+	}
+
+	t.Run("binSize must be a positive integer", func(t *testing.T) {
+		bad(t, `{"$dateTrunc": {"date": "$d", "unit": "day", "binSize": 1.5}}`, "positive integer")
+		bad(t, `{"$dateTrunc": {"date": "$d", "unit": "day", "binSize": -2}}`, "positive integer")
+		bad(t, `{"$dateTrunc": {"date": "$d", "unit": "day", "binSize": "2"}}`, "positive integer")
+	})
+	t.Run("unit must be a literal string", func(t *testing.T) {
+		bad(t, `{"$dateAdd": {"startDate": "$d", "unit": 3, "amount": 1}}`, "literal string")
+		bad(t, `{"$dateAdd": {"startDate": "$d", "unit": {"$concat": ["da", "y"]}, "amount": 1}}`, "literal string")
+		bad(t, `{"$dateAdd": {"startDate": "$d", "unit": "$u", "amount": 1}}`, "literal string")
+	})
+	t.Run("timezone forms", func(t *testing.T) {
+		good(t, `{"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 1, "timezone": "+02"}}`)
+		good(t, `{"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 1, "timezone": "-0500"}}`)
+		good(t, `{"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 1, "timezone": "+14:00"}}`)
+		good(t, `{"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 1, "timezone": "UTC"}}`)
+		bad(t, `{"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 1, "timezone": "+2:00"}}`, "unknown timezone")
+		bad(t, `{"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 1, "timezone": "+25:00"}}`, "unknown timezone")
+		bad(t, `{"$dateAdd": {"startDate": "$d", "unit": "day", "amount": 1, "timezone": ""}}`, "unknown timezone")
+	})
+	t.Run("startOfWeek is case-insensitive", func(t *testing.T) {
+		good(t, `{"$dateDiff": {"startDate": "$a", "endDate": "$b", "unit": "week", "startOfWeek": "SUNDAY"}}`)
+		good(t, `{"$dateTrunc": {"date": "$d", "unit": "week", "startOfWeek": "Friday"}}`)
+	})
+	t.Run("missing required parameters", func(t *testing.T) {
+		bad(t, `{"$dateDiff": {"startDate": "$a", "unit": "day"}}`, "$dateDiff requires 'startDate', 'endDate' and 'unit'")
+		bad(t, `{"$dateTrunc": {"date": "$d"}}`, "$dateTrunc requires 'date' and 'unit'")
+	})
+	t.Run("$year/$week object form validates keys", func(t *testing.T) {
+		bad(t, `{"$year": {"Date": "$d"}}`, "unknown $year parameter: Date")
+		bad(t, `{"$year": {"timezone": "+01:00"}}`, "$year requires 'date'")
+		bad(t, `{"$week": {}}`, "$week requires 'date'")
+		bad(t, `{"$week": {"date": "$d", "startOfWeek": "monday"}}`, "unknown $week parameter: startOfWeek")
+		good(t, `{"$week": {"$literal": 1}}`) // $-keyed objects stay expressions
 	})
 }
 
@@ -529,6 +602,66 @@ func TestPipelineParseError(t *testing.T) {
 			json:     `[{"$project":{"a":{"$eq":[1,2,3]}}}]`,
 			wantPath: "0.$project.a.$eq", wantOp: "$eq",
 			wantReason: "$eq requires exactly 2 operands, got 3",
+		},
+		{
+			name:     "$dateAdd unknown unit",
+			json:     `[{"$project":{"a":{"$dateAdd":{"startDate":"$d","unit":"fortnight","amount":1}}}}]`,
+			wantPath: "0.$project.a.$dateAdd.unit", wantOp: "$dateAdd",
+			wantReason: "unknown $dateAdd unit: fortnight",
+		},
+		{
+			name:     "$dateAdd unknown timezone",
+			json:     `[{"$project":{"a":{"$dateAdd":{"startDate":"$d","unit":"day","amount":1,"timezone":"Mars/Olympus"}}}}]`,
+			wantPath: "0.$project.a.$dateAdd.timezone", wantOp: "$dateAdd",
+			wantReason: "unknown timezone: Mars/Olympus",
+		},
+		{
+			name:     "$dateAdd non-literal timezone",
+			json:     `[{"$project":{"a":{"$dateAdd":{"startDate":"$d","unit":"day","amount":1,"timezone":"$tz"}}}}]`,
+			wantPath: "0.$project.a.$dateAdd.timezone", wantOp: "$dateAdd",
+			wantReason: "$dateAdd 'timezone' must be a literal string",
+		},
+		{
+			name:     "$dateAdd missing amount",
+			json:     `[{"$project":{"a":{"$dateAdd":{"startDate":"$d","unit":"day"}}}}]`,
+			wantPath: "0.$project.a.$dateAdd", wantOp: "$dateAdd",
+			wantReason: "$dateAdd requires 'startDate', 'unit' and 'amount'",
+		},
+		{
+			name:     "$dateAdd unknown parameter",
+			json:     `[{"$project":{"a":{"$dateAdd":{"startDate":"$d","unit":"day","amount":1,"bogus":1}}}}]`,
+			wantPath: "0.$project.a.$dateAdd.bogus", wantOp: "$dateAdd",
+			wantReason: "unknown $dateAdd parameter: bogus",
+		},
+		{
+			name:     "$dateDiff non-object operand",
+			json:     `[{"$project":{"a":{"$dateDiff":["$a","$b"]}}}]`,
+			wantPath: "0.$project.a.$dateDiff", wantOp: "$dateDiff",
+			wantReason: "$dateDiff requires an object",
+		},
+		{
+			name:     "$dateDiff bad startOfWeek",
+			json:     `[{"$project":{"a":{"$dateDiff":{"startDate":"$a","endDate":"$b","unit":"week","startOfWeek":"caturday"}}}}]`,
+			wantPath: "0.$project.a.$dateDiff.startOfWeek", wantOp: "$dateDiff",
+			wantReason: "unknown $dateDiff startOfWeek: caturday",
+		},
+		{
+			name:     "$dateTrunc binSize zero",
+			json:     `[{"$project":{"a":{"$dateTrunc":{"date":"$d","unit":"day","binSize":0}}}}]`,
+			wantPath: "0.$project.a.$dateTrunc.binSize", wantOp: "$dateTrunc",
+			wantReason: "$dateTrunc 'binSize' must be a positive integer",
+		},
+		{
+			name:     "$year object form unknown parameter",
+			json:     `[{"$project":{"a":{"$year":{"date":"$d","startOfWeek":"monday"}}}}]`,
+			wantPath: "0.$project.a.$year.startOfWeek", wantOp: "$year",
+			wantReason: "unknown $year parameter: startOfWeek",
+		},
+		{
+			name:       "$dateAdd startDate expression error",
+			json:       `[{"$project":{"a":{"$dateAdd":{"startDate":"$$d","unit":"day","amount":1}}}}]`,
+			wantPath:   "0.$project.a.$dateAdd.startDate",
+			wantReason: "variables are not supported",
 		},
 		{
 			name:       "operator operand error names the element index",

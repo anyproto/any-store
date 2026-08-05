@@ -15,9 +15,10 @@ import (
 // plain value), document/array expressions (objects and arrays whose members
 // are themselves expressions, Mongo semantics), and the compute operators in
 // exprOpParsers — arithmetic/string ($add, $round, $concat, ...), conditional
-// ($cond, $switch, $ifNull) and comparison ($eq ... $lte, $cmp). Remaining
-// compute operators (date/string transforms, ...) are additive future work:
-// composite Expr implementations dispatched in ParseExpr.
+// ($cond, $switch, $ifNull), comparison ($eq ... $lte, $cmp) and date
+// ($dateAdd, $dateDiff, $dateTrunc, $year, $week). Remaining compute
+// operators (string transforms, ...) are additive future work: composite
+// Expr implementations dispatched in ParseExpr.
 type Expr interface {
 	// Eval returns the expression value for doc; nil means "missing".
 	// Results may be allocated on a; field refs alias doc (zero-copy) and are
