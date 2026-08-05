@@ -38,13 +38,13 @@ any JSON-marshalable Go value.
 | `$addFields` / `$set` | `{"$addFields": {"b": "$x.y"}}` | Overlays computed fields; an expression evaluating to missing removes the field. All expressions are evaluated against the **stage input** (Mongo): a field added by the same stage is not visible to its sibling expressions. |
 | `$unwind` | `"$tags"` or `{"path": "$tags", "preserveNullAndEmptyArrays": true}` | Default drops documents whose path is missing/null/empty; preserve emits them as-is (empty array: field removed). Non-array values pass through. |
 | `$group` | see below | Hash aggregation. |
-| `$lookup` | `{"$lookup": {"from"?: c, "localField": f, "foreignField": "id", "as": out}}` | Self-join point lookup on the primary key — see section 3.1. |
-| `$facet` | `{"$facet": {"name": [stage...], ...}}` | Named sub-pipelines over one shared scan — see section 3.2. |
-| `$out` | `{"$out": "coll"}` | Replaces the target collection's contents with the results — see section 3.3. Must be the last stage; not allowed inside `$facet`. |
-| `$merge` | `{"$merge": {"into": c, "on"?: "id", "whenMatched"?: m, "whenNotMatched"?: n}}` or `{"$merge": "coll"}` | Upserts the results into the target by `id` — see section 3.3. Same placement rules as `$out`. |
+| `$lookup` | `{"$lookup": {"from"?: c, "localField": f, "foreignField": "id", "as": out}}` | Self-join point lookup on the primary key — see section 4. |
+| `$facet` | `{"$facet": {"name": [stage...], ...}}` | Named sub-pipelines over one shared scan — see section 5. |
+| `$out` | `{"$out": "coll"}` | Replaces the target collection's contents with the results — see section 6. Must be the last stage; not allowed inside `$facet`. |
+| `$merge` | `{"$merge": {"into": c, "on"?: "id", "whenMatched"?: m, "whenNotMatched"?: n}}` or `{"$merge": "coll"}` | Upserts the results into the target by `id` — see section 6. Same placement rules as `$out`. |
 
 Not supported in v1: cross-collection and pipeline-form `$lookup` (see
-section 3.1), `$bucket`, exclusion projections,
+section 4), `$bucket`, exclusion projections,
 nested (dotted) output field names, and compute expression operators beyond
 the set of section 2 (`$dateToString`, `$toUpper`, ...) — the expression
 parser rejects unknown operators explicitly so they can be added compatibly
@@ -210,7 +210,7 @@ missing, keeps null), `$addToSet` (byte-equality dedup).
 > no int/long/decimal type tracking (divergence from Mongo, documented here
 > rather than half-emulated).
 
-## 3.1 $lookup: self-join point lookup
+## 4. $lookup: self-join point lookup
 
 ```json
 {"$lookup": {"localField": "refs", "foreignField": "id", "as": "linked"}}
@@ -255,7 +255,7 @@ The stage is streaming and alloc-free in steady state for single-id lookups
 (fetched documents reuse per-stage buffers); an id array only allocates while
 growing the stage's high-water match count.
 
-## 3.2 $facet: sub-pipelines over one scan
+## 5. $facet: sub-pipelines over one scan
 
 ```json
 [{"$match": {"space": "s1"}},
@@ -280,16 +280,16 @@ pattern: N widgets over one shared scan instead of N independent scans.
 - A `$match` **before** `$facet` participates in prefix pushdown as usual —
   that shared indexed scan is the point. A `$match` at the head of a
   sub-pipeline filters the shared stream in-flight and never becomes index
-  bounds; `$text`/`$knn` are therefore rejected inside facets (section 4).
+  bounds; `$text`/`$knn` are therefore rejected inside facets (section 7).
 - Facet result arrays are inherently buffered: their bytes count against the
-  shared memory budget (section 5). Sub-pipeline `$sort`/`$group` stages keep
+  shared memory budget (section 8). Sub-pipeline `$sort`/`$group` stages keep
   their own bounds, including the `$sort`+`$limit` top-K fold.
 - Stages after `$facet` see the single result document (`$unwind` a facet
   array to keep processing it).
 - The fan-out itself does not allocate per row; once every facet has
   satisfied a `$limit`, the scan stops early.
 
-## 3.3 $merge and $out: materialize into a collection
+## 6. $merge and $out: materialize into a collection
 
 ```json
 [{"$group": {"_id": "$space", "total": {"$sum": "$bytes"}}},
@@ -342,11 +342,16 @@ Options, with Mongo's defaults:
 | `whenMatched` | `"merge"` — overlay the result's **top-level** fields onto the existing document (fields the result lacks keep their values); `"replace"`; `"keepExisting"`; `"fail"` → `ErrMergeMatched` naming the id, whole write aborted. |
 | `whenNotMatched` | `"insert"`; `"discard"`; `"fail"` → `ErrMergeNotMatched` naming the id, whole write aborted. |
 
+The `"merge"` overlay preserves the existing document's field order (new
+fields append), so a merged document and a fresh insert with identical fields
+can differ in field order — observable to order-sensitive object comparison
+(`$cmp`, `$group` keys).
+
 The pipeline/`let` form of `whenMatched` is not supported (parse error). An
 empty result set is a pure no-op: nothing is written and a missing target is
 **not** created (unlike `$out`).
 
-## 4. Pushdown: what the planner executes
+## 7. Pushdown: what the planner executes
 
 `Aggregate` splits the longest pushable prefix — `$match` chain (folded into
 one `$and`), then at most one `$sort`, `$skip`, `$limit` *in that order* — and
@@ -389,7 +394,7 @@ Stages:
   1. $group {id:$cat,"top":{$push:$v}}
 ```
 
-## 5. Limits and memory
+## 8. Limits and memory
 
 Streaming stages retain nothing and are allocation-free in steady state.
 Blocking stages (`$group`, in-pipeline `$sort`, `$facet` result buffers)
@@ -413,7 +418,7 @@ iter, err := coll.Aggregate(pipeline).
     Iter(ctx)
 ```
 
-## 6. Iterator semantics
+## 9. Iterator semantics
 
 `Aggregate(...).Iter(ctx)` returns the same `Iterator` interface as `Find()`:
 documents are valid **only until the next `Next()` call** (copy if you keep
@@ -422,4 +427,6 @@ for an FTS/vector prefix, read the `_score`/`_distance` fields off the
 documents instead. `Count(ctx)` runs the pipeline and counts results;
 `$count`-as-last-stage emits the count as a document instead. A `$merge`/
 `$out` pipeline executes its write eagerly inside `Iter`/`Count` and yields
-zero rows; `Count` returns the documents written (section 3.3).
+zero rows; `Count` returns the documents written (section 6). An unclosed
+iterator pins its read transaction (the snapshot/WAL cannot advance past it) —
+always `Close` it.

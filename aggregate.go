@@ -49,7 +49,9 @@ type AggQuery interface {
 	// documents. Score and Distance report 0 on aggregation iterators; for a
 	// full-text or vector $match prefix the values remain available as the
 	// _score / _distance document fields. See Iterator for the
-	// mutation-while-iterating contract (undefined, SQLite-style).
+	// mutation-while-iterating contract (undefined, SQLite-style). An
+	// unclosed iterator pins its read transaction — the snapshot/WAL cannot
+	// advance past it — so always Close.
 	//
 	// A pipeline ending in $merge/$out executes its write eagerly inside
 	// Iter, before it returns (Mongo's aggregate() semantics); the returned
