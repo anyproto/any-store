@@ -270,6 +270,118 @@ func TestParseConditionErrorsAreStructured(t *testing.T) {
 	}
 }
 
+// TestParseModifierError pins the structured rejection contract for the
+// modifier grammar: same shape as filter rejections (*ParseError), with
+// Source "modifier" and Path locating the failing key inside the modifier
+// document.
+func TestParseModifierError(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		json       string
+		wantPath   string
+		wantOp     string
+		wantReason string // substring of Reason
+		wantIs     error  // finer class sentinel, nil if none
+	}{
+		{
+			name: "unknown modifier",
+			json: `{"a":"b"}`,
+			wantPath: "a", wantOp: "a",
+			wantReason: "unknown modifier: a", wantIs: ErrUnknownOperator,
+		},
+		{
+			name: "unknown $-modifier",
+			json: `{"$sett":{"a":1}}`,
+			wantPath: "$sett", wantOp: "$sett",
+			wantReason: "unknown modifier: $sett", wantIs: ErrUnknownOperator,
+		},
+		{
+			name: "modifier document not an object",
+			json: `[]`,
+			wantPath:   "",
+			wantReason: "modifier must be an object",
+		},
+		{
+			name: "empty modifier",
+			json: `{}`,
+			wantPath:   "",
+			wantReason: "empty modifier",
+		},
+		{
+			name: "modifier operand not an object",
+			json: `{"$set":1}`,
+			wantPath: "$set", wantOp: "$set",
+			wantReason: "$set must be an object of field paths",
+		},
+		{
+			// A '$'-key where a field path belongs is a position fault, not a
+			// vocabulary miss — deliberately not ErrUnknownOperator.
+			name: "operator in field-path position",
+			json: `{"$set":{"$a":1}}`,
+			wantPath: "$set.$a", wantOp: "$a",
+			wantReason: "unexpected operator $a",
+		},
+		{
+			name: "$inc operand not numeric",
+			json: `{"$inc":{"count":"x"}}`,
+			wantPath: "$inc.count", wantOp: "$inc",
+			wantReason: "$inc requires a numeric value",
+		},
+		{
+			name: "$rename target not a string",
+			json: `{"$rename":{"a":1}}`,
+			wantPath: "$rename.a", wantOp: "$rename",
+			wantReason: "$rename requires a string target field path",
+		},
+		{
+			name: "$pop argument out of range",
+			json: `{"$pop":{"arr":2}}`,
+			wantPath: "$pop.arr", wantOp: "$pop",
+			wantReason: "$pop must be 1 (last) or -1 (first)",
+		},
+		{
+			name: "$pullAll operand not an array",
+			json: `{"$pullAll":{"arr":1}}`,
+			wantPath: "$pullAll.arr", wantOp: "$pullAll",
+			wantReason: "$pullAll must be an array",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := ParseModifier(tc.json)
+			require.Error(t, err)
+			assert.Nil(t, m)
+
+			var pe *ParseError
+			require.True(t, errors.As(err, &pe), "not a *ParseError: %v", err)
+			assert.Equal(t, "modifier", pe.Source)
+			assert.Equal(t, tc.wantPath, pe.Path)
+			assert.Equal(t, tc.wantOp, pe.Op)
+			assert.Contains(t, pe.Reason, tc.wantReason)
+			assert.Contains(t, err.Error(), "parse modifier: ")
+
+			if tc.wantIs != nil {
+				assert.True(t, errors.Is(err, tc.wantIs), "want errors.Is(%v)", tc.wantIs)
+			} else {
+				assert.False(t, errors.Is(err, ErrUnknownOperator))
+			}
+		})
+	}
+}
+
+// TestModifierOperators pins the exported modifier vocabulary — same snapshot
+// contract as TestOperators.
+func TestModifierOperators(t *testing.T) {
+	ops := ModifierOperators()
+	assert.Equal(t, []string{
+		"$addToSet", "$inc", "$pop", "$pull", "$pullAll", "$push",
+		"$rename", "$set", "$unset",
+	}, ops)
+
+	// The slice is a fresh copy: mutating it must not poison later calls.
+	ops[0] = "$corrupted"
+	assert.Equal(t, "$addToSet", ModifierOperators()[0])
+}
+
 // TestOperators pins the exported vocabulary: exactly the operators the parser
 // recognizes, sorted, and returned as a fresh copy. The snapshot is
 // intentional — adding or removing an operator must update it, which is the

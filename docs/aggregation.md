@@ -44,6 +44,16 @@ nested (dotted) output field names, and compute expression operators
 (`$add`, `$cond`, ...) — the expression parser rejects them explicitly so they
 can be added compatibly later.
 
+A pipeline that does not parse is rejected as a structured `*query.ParseError`
+with `Source` `"pipeline"`: `Path` locates the failure inside the pipeline
+document with the stage index as the leading segment (`"1.$match.a.$gt"`),
+`Op` names the stage or operator at fault, and
+`errors.Is(err, query.ErrUnknownOperator)` identifies vocabulary misses —
+unknown stage, accumulator, or expression operator. The stage and accumulator
+vocabularies are exported as data (`anystore.AggregateStages()`,
+`anystore.AggregateAccumulators()`), so consumers advertising the grammar
+never hand-copy the lists.
+
 ## 2. Expressions
 
 Inside `$project`/`$addFields` values, `$group` keys and accumulator arguments:

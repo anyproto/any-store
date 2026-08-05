@@ -123,8 +123,6 @@ func parseOrArray(v *anyenc.Value) (f Filter, err error) {
 
 func parseNorArray(v *anyenc.Value) (f Filter, err error) {
 	if v.Type() != anyenc.TypeArray {
-		// The message used to say "$or must be an array" — a copy-paste slip
-		// that misdirected anyone debugging a bad $nor.
 		return nil, &ParseError{Op: "$nor", Reason: "$nor must be an array"}
 	}
 	arr, _ := v.Array()
@@ -362,9 +360,9 @@ func makeCompFilter(op Operator, v *anyenc.Value) (f Filter, err error) {
 	case opGt, opGte, opLt, opLte:
 		if v.Type() == anyenc.TypeVectorF32 {
 			return nil, &ParseError{
-				Op:      opName(op),
-				Reason:  ErrVectorNotOrderable.Error() + ": use $eq for exact match, or a $vector index for similarity search",
-				wrapped: ErrVectorNotOrderable,
+				Op:     opName(op),
+				Reason: ErrVectorNotOrderable.Error() + ": use $eq for exact match, or a $vector index for similarity search",
+				Err:    ErrVectorNotOrderable,
 			}
 		}
 	}
@@ -519,7 +517,7 @@ func parseKnn(v *anyenc.Value) (Filter, error) {
 	// Range/finiteness rules live in ONE place, shared with the executor's
 	// detection walk (which validates programmatic NewKnn filters).
 	if err := kn.Validate(); err != nil {
-		return nil, &ParseError{Op: "$knn", Reason: err.Error(), wrapped: err}
+		return nil, &ParseError{Op: "$knn", Reason: err.Error(), Err: err}
 	}
 	return kn, nil
 }
@@ -709,7 +707,7 @@ func appendTextClauses(dst []TextClause, raw string, op TextOp) []TextClause {
 func parseSize(v *anyenc.Value) (Filter, error) {
 	size, err := v.Int()
 	if err != nil {
-		return nil, &ParseError{Op: "$size", Reason: "$size must be an integer", wrapped: err}
+		return nil, &ParseError{Op: "$size", Reason: "$size must be an integer", Err: err}
 	}
 	return Size{Size: int64(size)}, nil
 }
@@ -719,11 +717,11 @@ func parseRegexp(v *anyenc.Value) (Filter, error) {
 	case anyenc.TypeString:
 		exp, err := v.StringBytes()
 		if err != nil {
-			return nil, &ParseError{Op: "$regex", Reason: "invalid regular expression: " + err.Error(), wrapped: err}
+			return nil, &ParseError{Op: "$regex", Reason: "invalid regular expression: " + err.Error(), Err: err}
 		}
 		compiledRegexp, err := regexp.Compile(string(exp))
 		if err != nil {
-			return nil, &ParseError{Op: "$regex", Reason: "invalid regular expression: " + err.Error(), wrapped: err}
+			return nil, &ParseError{Op: "$regex", Reason: "invalid regular expression: " + err.Error(), Err: err}
 		}
 		return Regexp{Regexp: compiledRegexp}, nil
 	default:
@@ -733,8 +731,6 @@ func parseRegexp(v *anyenc.Value) (Filter, error) {
 
 func makeArrComp(op Operator, v *anyenc.Value) (Filter, error) {
 	if v.Type() != anyenc.TypeArray {
-		// The old message rendered op with %v — the raw uint8, e.g. "expected
-		// array for 12 operator". Name it instead.
 		return nil, &ParseError{Op: opName(op), Reason: opName(op) + " must be an array"}
 	}
 	switch op {
@@ -812,9 +808,9 @@ func isOperator(key []byte) (ok bool, op Operator, err error) {
 			return true, op, nil
 		}
 		return true, 0, &ParseError{
-			Op:      string(key),
-			Reason:  "unknown operator: " + string(key),
-			wrapped: ErrUnknownOperator,
+			Op:     string(key),
+			Reason: "unknown operator: " + string(key),
+			Err:    ErrUnknownOperator,
 		}
 	}
 	return false, 0, nil

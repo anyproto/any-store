@@ -2,6 +2,8 @@ package aggregate
 
 import (
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -162,9 +164,50 @@ func MustParsePipeline(pipeline any) Pipeline {
 	return p
 }
 
+// stageParsers is the pipeline grammar's stage vocabulary as data: the single
+// source of truth for stage recognition. parseStage dispatches through it and
+// Stages exports it — so the parser, its errors, and the advertised
+// vocabulary cannot drift apart.
+var stageParsers = map[string]func(*anyenc.Value) (StageSpec, error){
+	"$match":     parseMatch,
+	"$sort":      parseSortStage,
+	"$skip":      parseSkip,
+	"$limit":     parseLimit,
+	"$count":     parseCount,
+	"$project":   parseProject,
+	"$addFields": parseAddFields,
+	"$set":       parseAddFields, // alias
+	"$unwind":    parseUnwind,
+	"$group":     parseGroup,
+}
+
+// Stages returns the stage vocabulary accepted by the pipeline parser —
+// every stage key ParsePipeline recognizes ($set is $addFields' alias),
+// sorted and with the leading '$'. The slice is a fresh copy: callers may
+// keep or mutate it. Use it to advertise the grammar (docs, error payloads)
+// instead of hand-copying the list.
+func Stages() []string {
+	res := make([]string, 0, len(stageParsers))
+	for name := range stageParsers {
+		res = append(res, name)
+	}
+	sort.Strings(res)
+	return res
+}
+
+// Accumulators returns the $group accumulator vocabulary, sorted and with the
+// leading '$'. The slice is a fresh copy: callers may keep or mutate it.
+func Accumulators() []string {
+	res := append([]string(nil), accumOpNames[:]...)
+	sort.Strings(res)
+	return res
+}
+
 // ParsePipeline parses a JSON-ish aggregation pipeline (any input accepted by
 // the same parser as Find conditions) into stage specs. The result is fully
-// detached from the input value.
+// detached from the input value. Rejections are reported as *query.ParseError
+// with Source "pipeline", whose Path's leading segment is the stage index
+// ("1.$match.a.$gt"); see query.ParseError.
 func ParsePipeline(pipeline any) (Pipeline, error) {
 	if pipeline == nil {
 		return nil, nil // empty pipeline: plain passthrough scan
@@ -177,14 +220,14 @@ func ParsePipeline(pipeline any) (Pipeline, error) {
 		return nil, err
 	}
 	if v.Type() != anyenc.TypeArray {
-		return nil, fmt.Errorf("aggregate: pipeline must be an array of stages")
+		return nil, &query.ParseError{Source: "pipeline", Reason: "pipeline must be an array of stages"}
 	}
 	arr, _ := v.Array()
 	res := make(Pipeline, 0, len(arr))
 	for i, el := range arr {
 		spec, err := parseStage(el)
 		if err != nil {
-			return nil, fmt.Errorf("aggregate: stage %d: %w", i, err)
+			return nil, withSource(atPath(err, strconv.Itoa(i)), "pipeline")
 		}
 		res = append(res, spec)
 	}
@@ -194,37 +237,27 @@ func ParsePipeline(pipeline any) (Pipeline, error) {
 func parseStage(v *anyenc.Value) (StageSpec, error) {
 	obj, err := v.Object()
 	if err != nil {
-		return nil, fmt.Errorf("stage must be an object")
+		return nil, &query.ParseError{Reason: "stage must be an object"}
 	}
 	if obj.Len() != 1 {
-		return nil, fmt.Errorf("stage must have exactly one key, got %d", obj.Len())
+		return nil, &query.ParseError{Reason: fmt.Sprintf("stage must have exactly one key, got %d", obj.Len())}
 	}
 	var (
 		spec StageSpec
 		serr error
 	)
 	obj.Visit(func(key []byte, val *anyenc.Value) {
-		switch string(key) {
-		case "$match":
-			spec, serr = parseMatch(val)
-		case "$sort":
-			spec, serr = parseSortStage(val)
-		case "$skip":
-			spec, serr = parseSkip(val)
-		case "$limit":
-			spec, serr = parseLimit(val)
-		case "$count":
-			spec, serr = parseCount(val)
-		case "$project":
-			spec, serr = parseProject(val)
-		case "$addFields", "$set":
-			spec, serr = parseAddFields(val)
-		case "$unwind":
-			spec, serr = parseUnwind(val)
-		case "$group":
-			spec, serr = parseGroup(val)
-		default:
-			serr = fmt.Errorf("unknown stage: %s", string(key))
+		parse, ok := stageParsers[string(key)]
+		if !ok {
+			serr = atPath(&query.ParseError{
+				Op:     string(key),
+				Reason: "unknown stage: " + string(key),
+				Err:    query.ErrUnknownOperator,
+			}, string(key))
+			return
+		}
+		if spec, serr = parse(val); serr != nil {
+			serr = atPath(serr, string(key))
 		}
 	})
 	return spec, serr
@@ -233,7 +266,9 @@ func parseStage(v *anyenc.Value) (StageSpec, error) {
 func parseMatch(v *anyenc.Value) (StageSpec, error) {
 	f, err := query.ParseCondition(v)
 	if err != nil {
-		return nil, fmt.Errorf("$match: %w", err)
+		// Already a *query.ParseError with a filter-relative Path; parseStage
+		// and ParsePipeline prefix "$match" and the stage index onto it.
+		return nil, err
 	}
 	return MatchSpec{Filter: f}, nil
 }
@@ -241,10 +276,10 @@ func parseMatch(v *anyenc.Value) (StageSpec, error) {
 func parseSortStage(v *anyenc.Value) (StageSpec, error) {
 	obj, err := v.Object()
 	if err != nil {
-		return nil, fmt.Errorf("$sort must be an object")
+		return nil, &query.ParseError{Op: "$sort", Reason: "$sort must be an object"}
 	}
 	if obj.Len() == 0 {
-		return nil, fmt.Errorf("$sort requires at least one field")
+		return nil, &query.ParseError{Op: "$sort", Reason: "$sort requires at least one field"}
 	}
 	var (
 		sorts  = make(query.Sorts, 0, obj.Len())
@@ -257,7 +292,10 @@ func parseSortStage(v *anyenc.Value) (StageSpec, error) {
 		}
 		dir, e := val.Int()
 		if e != nil || (dir != 1 && dir != -1) {
-			perr = fmt.Errorf("$sort value for %q must be 1 or -1", string(key))
+			perr = atPath(&query.ParseError{
+				Op:     "$sort",
+				Reason: fmt.Sprintf("$sort value for %q must be 1 or -1", string(key)),
+			}, string(key))
 			return
 		}
 		field := string(key)
@@ -278,7 +316,7 @@ func parseSortStage(v *anyenc.Value) (StageSpec, error) {
 func parseSkip(v *anyenc.Value) (StageSpec, error) {
 	n, err := v.Int()
 	if err != nil || n < 0 {
-		return nil, fmt.Errorf("$skip must be a non-negative integer")
+		return nil, &query.ParseError{Op: "$skip", Reason: "$skip must be a non-negative integer"}
 	}
 	return SkipSpec{N: n}, nil
 }
@@ -286,7 +324,7 @@ func parseSkip(v *anyenc.Value) (StageSpec, error) {
 func parseLimit(v *anyenc.Value) (StageSpec, error) {
 	n, err := v.Int()
 	if err != nil || n <= 0 {
-		return nil, fmt.Errorf("$limit must be a positive integer")
+		return nil, &query.ParseError{Op: "$limit", Reason: "$limit must be a positive integer"}
 	}
 	return LimitSpec{N: n}, nil
 }
@@ -294,11 +332,11 @@ func parseLimit(v *anyenc.Value) (StageSpec, error) {
 func parseCount(v *anyenc.Value) (StageSpec, error) {
 	sb, err := v.StringBytes()
 	if err != nil {
-		return nil, fmt.Errorf("$count must be a string field name")
+		return nil, &query.ParseError{Op: "$count", Reason: "$count must be a string field name"}
 	}
 	name := string(sb)
 	if err = validateOutName(name); err != nil {
-		return nil, fmt.Errorf("$count: %w", err)
+		return nil, &query.ParseError{Op: "$count", Reason: "$count: " + err.Error()}
 	}
 	return CountSpec{Field: name}, nil
 }
@@ -322,10 +360,10 @@ func parseAddFields(v *anyenc.Value) (StageSpec, error) {
 func parseProjectFields(v *anyenc.Value, stage string, allowInclude bool) ([]ProjectField, error) {
 	obj, err := v.Object()
 	if err != nil {
-		return nil, fmt.Errorf("%s must be an object", stage)
+		return nil, &query.ParseError{Op: stage, Reason: stage + " must be an object"}
 	}
 	if obj.Len() == 0 {
-		return nil, fmt.Errorf("%s requires at least one field", stage)
+		return nil, &query.ParseError{Op: stage, Reason: stage + " requires at least one field"}
 	}
 	var (
 		fields = make([]ProjectField, 0, obj.Len())
@@ -337,7 +375,7 @@ func parseProjectFields(v *anyenc.Value, stage string, allowInclude bool) ([]Pro
 		}
 		name := string(key)
 		if e := validateOutName(name); e != nil {
-			perr = fmt.Errorf("%s: %w", stage, e)
+			perr = &query.ParseError{Op: stage, Reason: stage + ": " + e.Error()}
 			return
 		}
 		var expr Expr
@@ -345,12 +383,15 @@ func parseProjectFields(v *anyenc.Value, stage string, allowInclude bool) ([]Pro
 		case allowInclude && isIncludeFlag(val, true):
 			expr = &FieldRefExpr{Field: name, Path: splitPath(name)}
 		case allowInclude && isIncludeFlag(val, false):
-			perr = fmt.Errorf("%s: exclusion (%q: 0) is not supported", stage, name)
+			perr = atPath(&query.ParseError{
+				Op:     stage,
+				Reason: fmt.Sprintf("exclusion (%q: 0) is not supported", name),
+			}, name)
 			return
 		default:
 			var e error
 			if expr, e = ParseExpr(val); e != nil {
-				perr = e
+				perr = atPath(e, name)
 				return
 			}
 		}
@@ -398,29 +439,35 @@ func parseUnwind(v *anyenc.Value) (StageSpec, error) {
 			case "path":
 				sb, e := val.StringBytes()
 				if e != nil {
-					perr = fmt.Errorf("$unwind path must be a string")
+					perr = atPath(&query.ParseError{Op: "$unwind", Reason: "$unwind path must be a string"}, "path")
 					return
 				}
 				pathStr = string(sb)
 			case "preserveNullAndEmptyArrays":
 				b, e := val.Bool()
 				if e != nil {
-					perr = fmt.Errorf("$unwind preserveNullAndEmptyArrays must be a boolean")
+					perr = atPath(&query.ParseError{Op: "$unwind", Reason: "$unwind preserveNullAndEmptyArrays must be a boolean"}, "preserveNullAndEmptyArrays")
 					return
 				}
 				preserve = b
 			default:
-				perr = fmt.Errorf("unknown $unwind option: %s", string(key))
+				// Like an unknown $text field in the filter grammar: an option
+				// miss inside a known operator, deliberately not
+				// ErrUnknownOperator.
+				perr = atPath(&query.ParseError{
+					Op:     "$unwind",
+					Reason: "unknown $unwind option: " + string(key),
+				}, string(key))
 			}
 		})
 		if perr != nil {
 			return nil, perr
 		}
 	default:
-		return nil, fmt.Errorf("$unwind must be a string or an object")
+		return nil, &query.ParseError{Op: "$unwind", Reason: "$unwind must be a string or an object"}
 	}
 	if !strings.HasPrefix(pathStr, "$") || len(pathStr) < 2 {
-		return nil, fmt.Errorf("$unwind path must start with $ and name a field")
+		return nil, &query.ParseError{Op: "$unwind", Reason: "$unwind path must start with $ and name a field"}
 	}
 	field := pathStr[1:]
 	return UnwindSpec{Field: field, Path: splitPath(field), PreserveNullAndEmptyArrays: preserve}, nil
@@ -429,7 +476,7 @@ func parseUnwind(v *anyenc.Value) (StageSpec, error) {
 func parseGroup(v *anyenc.Value) (StageSpec, error) {
 	obj, err := v.Object()
 	if err != nil {
-		return nil, fmt.Errorf("$group must be an object")
+		return nil, &query.ParseError{Op: "$group", Reason: "$group must be an object"}
 	}
 	var (
 		spec    GroupSpec
@@ -450,16 +497,18 @@ func parseGroup(v *anyenc.Value) (StageSpec, error) {
 				return
 			}
 			hasKey = true
-			spec.Key, perr = ParseExpr(val)
+			if spec.Key, perr = ParseExpr(val); perr != nil {
+				perr = atPath(perr, name)
+			}
 			return
 		}
 		if e := validateOutName(name); e != nil {
-			perr = fmt.Errorf("$group: %w", e)
+			perr = &query.ParseError{Op: "$group", Reason: "$group: " + e.Error()}
 			return
 		}
 		acc, e := parseAccum(name, val)
 		if e != nil {
-			perr = e
+			perr = atPath(e, name)
 			return
 		}
 		spec.Accums = append(spec.Accums, acc)
@@ -468,10 +517,10 @@ func parseGroup(v *anyenc.Value) (StageSpec, error) {
 		return nil, perr
 	}
 	if twoKeys {
-		return nil, fmt.Errorf("$group: both id and _id specified")
+		return nil, &query.ParseError{Op: "$group", Reason: "$group: both id and _id specified"}
 	}
 	if !hasKey {
-		return nil, fmt.Errorf("$group requires an id (or _id) key expression")
+		return nil, &query.ParseError{Op: "$group", Reason: "$group requires an id (or _id) key expression"}
 	}
 	return spec, nil
 }
@@ -479,7 +528,10 @@ func parseGroup(v *anyenc.Value) (StageSpec, error) {
 func parseAccum(name string, v *anyenc.Value) (AccumSpec, error) {
 	obj, err := v.Object()
 	if err != nil || obj.Len() != 1 {
-		return AccumSpec{}, fmt.Errorf("$group field %q must be an accumulator object like {\"$sum\": ...}", name)
+		return AccumSpec{}, &query.ParseError{
+			Op:     "$group",
+			Reason: fmt.Sprintf("$group field %q must be an accumulator object like {\"$sum\": ...}", name),
+		}
 	}
 	var (
 		spec = AccumSpec{Name: name}
@@ -488,18 +540,24 @@ func parseAccum(name string, v *anyenc.Value) (AccumSpec, error) {
 	obj.Visit(func(key []byte, val *anyenc.Value) {
 		op, ok := accumOpByName(string(key))
 		if !ok {
-			perr = fmt.Errorf("$group field %q: unknown accumulator: %s", name, string(key))
+			perr = atPath(&query.ParseError{
+				Op:     string(key),
+				Reason: "unknown accumulator: " + string(key),
+				Err:    query.ErrUnknownOperator,
+			}, string(key))
 			return
 		}
 		spec.Op = op
 		if op == AccumCount {
 			// {"$count": {}} — argument must be an empty object.
 			if o, e := val.Object(); e != nil || o.Len() != 0 {
-				perr = fmt.Errorf("$group field %q: $count takes an empty object {}", name)
+				perr = atPath(&query.ParseError{Op: "$count", Reason: "$count takes an empty object {}"}, string(key))
 			}
 			return
 		}
-		spec.Arg, perr = ParseExpr(val)
+		if spec.Arg, perr = ParseExpr(val); perr != nil {
+			perr = atPath(perr, string(key))
+		}
 	})
 	if perr != nil {
 		return AccumSpec{}, perr
