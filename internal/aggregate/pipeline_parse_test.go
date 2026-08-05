@@ -250,7 +250,7 @@ func TestParseExpr(t *testing.T) {
 		assert.Equal(t, float64(3), arr[2].GetFloat64())
 	})
 	t.Run("unsupported operator", func(t *testing.T) {
-		_, err := ParseExpr(anyenc.MustParseJson(`{"$add": [1, 2]}`))
+		_, err := ParseExpr(anyenc.MustParseJson(`{"$cond": [true, 1, 2]}`))
 		assert.ErrorContains(t, err, "unsupported expression operator")
 	})
 	t.Run("mixed operator and fields", func(t *testing.T) {
@@ -264,6 +264,48 @@ func TestParseExpr(t *testing.T) {
 	t.Run("empty field ref", func(t *testing.T) {
 		_, err := ParseExpr(anyenc.MustParseJson(`"$"`))
 		assert.ErrorContains(t, err, "empty field reference")
+	})
+}
+
+func TestParseExprOperators(t *testing.T) {
+	t.Run("operator kinds", func(t *testing.T) {
+		for _, tc := range []struct {
+			json string
+			want Expr
+		}{
+			{`{"$add": ["$a", 1]}`, &ArithExpr{}},
+			{`{"$subtract": ["$a", "$b"]}`, &ArithExpr{}},
+			{`{"$multiply": [2, 3]}`, &ArithExpr{}},
+			{`{"$divide": ["$a", 2]}`, &ArithExpr{}},
+			{`{"$abs": ["$a"]}`, &AbsExpr{}},
+			{`{"$round": ["$a", 2]}`, &RoundExpr{}},
+			{`{"$concat": ["$a", "-"]}`, &ConcatExpr{}},
+		} {
+			e, err := ParseExpr(anyenc.MustParseJson(tc.json))
+			require.NoError(t, err, tc.json)
+			assert.IsType(t, tc.want, e, tc.json)
+		}
+	})
+	t.Run("single non-array operand shorthand", func(t *testing.T) {
+		for _, j := range []string{`{"$abs": "$a"}`, `{"$round": "$a"}`, `{"$add": "$a"}`, `{"$concat": "$a"}`} {
+			_, err := ParseExpr(anyenc.MustParseJson(j))
+			assert.NoError(t, err, j)
+		}
+	})
+	t.Run("strings", func(t *testing.T) {
+		for _, tc := range []struct{ json, want string }{
+			{`{"$add": ["$a", {"$multiply": ["$b", 2]}, 1]}`, `{$add:[$a,{$multiply:[$b,2]},1]}`},
+			{`{"$subtract": ["$a", "$b"]}`, `{$subtract:[$a,$b]}`},
+			{`{"$divide": ["$a", 2]}`, `{$divide:[$a,2]}`},
+			{`{"$abs": "$a"}`, `{$abs:[$a]}`},
+			{`{"$round": "$a"}`, `{$round:[$a]}`},
+			{`{"$round": ["$a", -1]}`, `{$round:[$a,-1]}`},
+			{`{"$concat": ["$a", "-", "$b"]}`, `{$concat:[$a,"-",$b]}`},
+		} {
+			e, err := ParseExpr(anyenc.MustParseJson(tc.json))
+			require.NoError(t, err, tc.json)
+			assert.Equal(t, tc.want, e.String(), tc.json)
+		}
 	})
 }
 
@@ -373,9 +415,39 @@ func TestPipelineParseError(t *testing.T) {
 		},
 		{
 			name: "unsupported expression operator",
-			json: `[{"$project":{"a":{"$add":[1,2]}}}]`,
-			wantPath: "0.$project.a.$add", wantOp: "$add",
-			wantReason: "unsupported expression operator: $add", wantIs: query.ErrUnknownOperator,
+			json: `[{"$project":{"a":{"$cond":[true,1,2]}}}]`,
+			wantPath: "0.$project.a.$cond", wantOp: "$cond",
+			wantReason: "unsupported expression operator: $cond", wantIs: query.ErrUnknownOperator,
+		},
+		{
+			name: "$subtract wrong arity",
+			json: `[{"$project":{"a":{"$subtract":[1]}}}]`,
+			wantPath: "0.$project.a.$subtract", wantOp: "$subtract",
+			wantReason: "$subtract requires exactly 2 operands, got 1",
+		},
+		{
+			name: "$round too many operands",
+			json: `[{"$project":{"a":{"$round":[1,2,3]}}}]`,
+			wantPath: "0.$project.a.$round", wantOp: "$round",
+			wantReason: "$round requires 1 to 2 operands, got 3",
+		},
+		{
+			name: "$abs single-operand shorthand rejects two operands",
+			json: `[{"$project":{"a":{"$abs":[1,2]}}}]`,
+			wantPath: "0.$project.a.$abs", wantOp: "$abs",
+			wantReason: "$abs requires exactly 1 operand, got 2",
+		},
+		{
+			name: "operator operand error names the element index",
+			json: `[{"$project":{"a":{"$add":["$x","$$y"]}}}]`,
+			wantPath:   "0.$project.a.$add.1",
+			wantReason: "variables are not supported",
+		},
+		{
+			name: "shorthand operand error has no index segment",
+			json: `[{"$project":{"a":{"$abs":"$$x"}}}]`,
+			wantPath:   "0.$project.a.$abs",
+			wantReason: "variables are not supported",
 		},
 		{
 			name: "variable reference in expression",

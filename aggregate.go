@@ -19,6 +19,10 @@ import (
 // the access planner — indexes, CBO, full-text ($text) and vector sources all
 // apply, including their _score/_distance virtual fields. The remaining
 // stages stream over the result inside the same read transaction.
+//
+// An AggQuery and the Iterator it produces are single-goroutine (never shared
+// across goroutines): compiled expressions carry per-pipeline scratch state
+// (e.g. $concat's buffer) and are not reentrant.
 type AggQuery interface {
 	// GroupLimit overrides the maximum number of unique $group keys
 	// (default aggregate.DefaultGroupLimit; negative = unlimited).

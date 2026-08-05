@@ -104,6 +104,14 @@ func TestProjectStage(t *testing.T) {
 		got := runPipeline(t, src, `[{"$project": {"pt": {"a": "$x", "b": "$y"}}}]`, Limits{})
 		assert.Equal(t, jsonRows(t, `{"pt":{"a":1,"b":2}}`), got)
 	})
+	t.Run("compute operators", func(t *testing.T) {
+		src := newSliceSource(`{"id":1,"a":2,"b":3,"s":"x"}`, `{"id":2,"b":3,"s":"y"}`)
+		got := runPipeline(t, src, `[{"$project": {
+			"n": {"$add": ["$a", {"$multiply": ["$b", 2]}, 1]},
+			"s2": {"$concat": ["$s", "!"]}}}]`, Limits{})
+		// Missing "a" nulls the whole $add, Mongo null-propagation.
+		assert.Equal(t, jsonRows(t, `{"n":9,"s2":"x!"}`, `{"n":null,"s2":"y!"}`), got)
+	})
 }
 
 func TestAddFieldsStage(t *testing.T) {
@@ -182,7 +190,6 @@ func TestSkipLimitCountStages(t *testing.T) {
 		assert.Equal(t, jsonRows(t, `{"n":0}`), got)
 	})
 }
-
 
 func TestCountStageCancellation(t *testing.T) {
 	// An endless upstream must be interrupted by context cancellation.

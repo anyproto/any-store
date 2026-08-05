@@ -11,10 +11,11 @@ import (
 
 // Expr is an aggregation expression evaluated against one document.
 //
-// v1 supports field references ("$a.b.c"), literals ({"$literal": x} or any
-// plain value), and document/array expressions (objects and arrays whose
-// members are themselves expressions, Mongo semantics). Compute operators
-// ($add, $cond, ...) are additive future work: they become composite Expr
+// Supported: field references ("$a.b.c"), literals ({"$literal": x} or any
+// plain value), document/array expressions (objects and arrays whose members
+// are themselves expressions, Mongo semantics), and the arithmetic/string
+// compute operators in exprOpParsers ($add, $round, $concat, ...). Remaining
+// compute operators ($cond, ...) are additive future work: composite Expr
 // implementations dispatched in ParseExpr.
 type Expr interface {
 	// Eval returns the expression value for doc; nil means "missing".
@@ -133,9 +134,9 @@ func (e *ArrayExpr) String() string {
 
 // ParseExpr parses an aggregation expression value (Mongo expression-context
 // rules): "$path" strings are field references, {"$literal": x} is an escaped
-// literal, non-operator objects are document expressions, arrays are arrays of
-// expressions, everything else is a literal. Unknown $-operators are rejected
-// (compute operators are not supported in v1).
+// literal, single-key $-objects in exprOpParsers are compute operators,
+// non-operator objects are document expressions, arrays are arrays of
+// expressions, everything else is a literal. Unknown $-operators are rejected.
 func ParseExpr(v *anyenc.Value) (Expr, error) {
 	switch v.Type() {
 	case anyenc.TypeString:
@@ -200,8 +201,15 @@ func ParseExpr(v *anyenc.Value) (Expr, error) {
 			if opKey == "$literal" {
 				return NewLiteralExpr(opVal)
 			}
-			// A vocabulary miss: the expression-operator vocabulary is
-			// $literal alone in v1 (compute operators are future work).
+			if parse, ok := exprOpParsers[opKey]; ok {
+				e, err := parse(opVal)
+				if err != nil {
+					return nil, atPath(err, opKey)
+				}
+				return e, nil
+			}
+			// A vocabulary miss: neither the $literal escape nor a supported
+			// compute operator.
 			return nil, atPath(&query.ParseError{
 				Op:     opKey,
 				Reason: "unsupported expression operator: " + opKey,

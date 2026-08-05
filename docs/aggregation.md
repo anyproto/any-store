@@ -40,9 +40,10 @@ any JSON-marshalable Go value.
 | `$group` | see below | Hash aggregation. |
 
 Not supported in v1: `$lookup`, `$facet`, `$bucket`, exclusion projections,
-nested (dotted) output field names, and compute expression operators
-(`$add`, `$cond`, ...) — the expression parser rejects them explicitly so they
-can be added compatibly later.
+nested (dotted) output field names, and compute expression operators beyond
+the arithmetic/string set of section 2 (`$cond`, `$switch`, ...) — the
+expression parser rejects unknown operators explicitly so they can be added
+compatibly later.
 
 A pipeline that does not parse is rejected as a structured `*query.ParseError`
 with `Source` `"pipeline"`: `Path` locates the failure inside the pipeline
@@ -65,6 +66,31 @@ Inside `$project`/`$addFields` values, `$group` keys and accumulator arguments:
 - **Document/array expressions** — `{"x": "$a", "y": 1}` and `["$a", 1]`
   evaluate their members (Mongo expression-context rules); a missing member is
   omitted from objects and becomes null in arrays.
+- **Compute operators** — arithmetic and string expressions, composable to any
+  depth: `{"$add": ["$a", {"$multiply": ["$b", 2]}, 1]}`.
+
+| Operator | Form | Notes |
+|---|---|---|
+| `$add`, `$multiply` | `{"$add": [e, ...]}` | Variadic; an empty operand list yields the identity (`0` / `1`). No date arithmetic yet: a dateTime operand is non-numeric → `null`. |
+| `$subtract`, `$divide` | `{"$subtract": [a, b]}` | Exactly two operands. `$divide` by zero → `null`. |
+| `$abs` | `{"$abs": e}` | |
+| `$round` | `{"$round": [x, place?]}` | Half to even (banker's: `1.5`→`2`, `2.5`→`2`); `place` in `[-20, 100]`, default `0`, negative rounds left of the decimal point. |
+| `$concat` | `{"$concat": [e, ...]}` | String operands; an empty operand list yields `""`. |
+
+A single non-array operand is Mongo's shorthand for a one-element list
+(`{"$abs": "$x"}`); arity is checked at parse time with structured errors.
+
+> **Null instead of runtime errors** (divergence from Mongo): evaluation is
+> streaming with no per-document error channel, so conditions Mongo reports as
+> query errors yield `null` instead — a non-numeric operand of an arithmetic
+> operator, a non-string operand of `$concat`, division by zero, a non-finite
+> result (overflow, NaN), an out-of-range or non-integer `$round` place. Null
+> and missing operands also yield `null` (as in Mongo).
+>
+> `$round` precision is float64: values round by their binary double value
+> (`{"$round": [2.345, 2]}` is `2.35` — the stored double sits above the
+> midpoint; `{"$round": [1.25, 1]}` is `1.2` — an exact tie, half to even),
+> and a `place` beyond float64 resolution returns the value unchanged.
 
 ## 3. $group
 
