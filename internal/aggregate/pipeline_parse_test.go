@@ -538,8 +538,8 @@ func TestParseExprOperators(t *testing.T) {
 			{`{"$round": "$a"}`, `{$round:[$a]}`},
 			{`{"$round": ["$a", -1]}`, `{$round:[$a,-1]}`},
 			{`{"$concat": ["$a", "-", "$b"]}`, `{$concat:[$a,"-",$b]}`},
-			{`{"$replaceOne": {"replacement": "", "find": "any://", "input": "$rel"}}`,
-				`{$replaceOne:{input:$rel,find:"any://",replacement:""}}`},
+			{`{"$replaceOne": {"replacement": "", "find": "x://", "input": "$rel"}}`,
+				`{$replaceOne:{input:$rel,find:"x://",replacement:""}}`},
 			// Both $cond spellings render the canonical array form.
 			{`{"$cond": [{"$lt": ["$a", 1]}, "$a", "$b"]}`, `{$cond:[{$lt:[$a,1]},$a,$b]}`},
 			{`{"$cond": {"if": "$a", "then": 1, "else": 2}}`, `{$cond:[$a,1,2]}`},

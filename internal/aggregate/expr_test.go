@@ -567,7 +567,7 @@ func TestConcatExprEval(t *testing.T) {
 }
 
 func TestReplaceOneExprEval(t *testing.T) {
-	doc := anyenc.MustParseJson(`{"rel": "any://bafyrei123", "s": "abcabc", "n": 5, "nul": null}`)
+	doc := anyenc.MustParseJson(`{"rel": "x://id123", "s": "abcabc", "n": 5, "nul": null}`)
 	str := func(t *testing.T, exprJson string) string {
 		v := evalExprOn(t, exprJson, doc)
 		require.Equal(t, anyenc.TypeString, v.Type(), exprJson)
@@ -596,10 +596,8 @@ func TestReplaceOneExprEval(t *testing.T) {
 		assert.Equal(t, "Xabcabc", str(t, `{"$replaceOne": {"input": "$s", "find": "", "replacement": "X"}}`))
 		assert.Equal(t, "X", str(t, `{"$replaceOne": {"input": "", "find": "", "replacement": "X"}}`))
 	})
-	t.Run("relation URI prefix strip", func(t *testing.T) {
-		// The motivating case: any://<cid> relation values joined against bare
-		// cid primary keys.
-		assert.Equal(t, "bafyrei123", str(t, `{"$replaceOne": {"input": "$rel", "find": "any://", "replacement": ""}}`))
+	t.Run("literal prefix strip", func(t *testing.T) {
+		assert.Equal(t, "id123", str(t, `{"$replaceOne": {"input": "$rel", "find": "x://", "replacement": ""}}`))
 	})
 	t.Run("multibyte", func(t *testing.T) {
 		assert.Equal(t, "héllo ⇒ wörld", str(t, `{"$replaceOne": {"input": "héllo → wörld", "find": "→", "replacement": "⇒"}}`))
@@ -615,8 +613,8 @@ func TestReplaceOneExprEval(t *testing.T) {
 		null(t, `{"$replaceOne": {"input": "$s", "find": "a", "replacement": "$n"}}`)
 	})
 	t.Run("nests with other operators", func(t *testing.T) {
-		assert.Equal(t, "[bafyrei123]", str(t, `{"$concat": ["[",
-			{"$replaceOne": {"input": "$rel", "find": "any://", "replacement": ""}}, "]"]}`))
+		assert.Equal(t, "[id123]", str(t, `{"$concat": ["[",
+			{"$replaceOne": {"input": "$rel", "find": "x://", "replacement": ""}}, "]"]}`))
 		v := evalExprOn(t, `{"$cond": [{"$eq": ["$n", 5]},
 			{"$replaceOne": {"input": "$s", "find": "abc", "replacement": ""}}, "no"]}`, doc)
 		assert.Equal(t, "abc", string(v.GetStringBytes()))
@@ -1099,11 +1097,11 @@ func BenchmarkDateDiffExprEval(b *testing.B) {
 
 func BenchmarkReplaceOneExprEval(b *testing.B) {
 	e, err := ParseExpr(anyenc.MustParseJson(
-		`{"$replaceOne": {"input": "$rel", "find": "any://", "replacement": ""}}`))
+		`{"$replaceOne": {"input": "$rel", "find": "x://", "replacement": ""}}`))
 	if err != nil {
 		b.Fatal(err)
 	}
-	doc := anyenc.MustParseJson(`{"rel": "any://bafyreibn6euvvxn32rcqcuh5oq6zk2krebzkodw2cvytxbjqmnpdt3vzuq"}`)
+	doc := anyenc.MustParseJson(`{"rel": "x://longer-prefixed-identifier-value-0123456789"}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
 	b.ResetTimer()
