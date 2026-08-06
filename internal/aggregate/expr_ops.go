@@ -20,28 +20,29 @@ var exprOpParsers map[string]func(*anyenc.Value) (Expr, error)
 
 func init() {
 	exprOpParsers = map[string]func(*anyenc.Value) (Expr, error){
-		"$add":       func(v *anyenc.Value) (Expr, error) { return parseArith(OpAdd, v) },
-		"$subtract":  func(v *anyenc.Value) (Expr, error) { return parseArith(OpSubtract, v) },
-		"$multiply":  func(v *anyenc.Value) (Expr, error) { return parseArith(OpMultiply, v) },
-		"$divide":    func(v *anyenc.Value) (Expr, error) { return parseArith(OpDivide, v) },
-		"$abs":       parseAbs,
-		"$round":     parseRound,
-		"$concat":    parseConcat,
-		"$cond":      parseCond,
-		"$switch":    parseSwitch,
-		"$ifNull":    parseIfNull,
-		"$eq":        func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpEq, v) },
-		"$ne":        func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpNe, v) },
-		"$gt":        func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpGt, v) },
-		"$gte":       func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpGte, v) },
-		"$lt":        func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpLt, v) },
-		"$lte":       func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpLte, v) },
-		"$cmp":       func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpCmp, v) },
-		"$dateAdd":   parseDateAdd,
-		"$dateDiff":  parseDateDiff,
-		"$dateTrunc": parseDateTrunc,
-		"$year":      func(v *anyenc.Value) (Expr, error) { return parseDatePart(partYear, v) },
-		"$week":      func(v *anyenc.Value) (Expr, error) { return parseDatePart(partWeek, v) },
+		"$add":        func(v *anyenc.Value) (Expr, error) { return parseArith(OpAdd, v) },
+		"$subtract":   func(v *anyenc.Value) (Expr, error) { return parseArith(OpSubtract, v) },
+		"$multiply":   func(v *anyenc.Value) (Expr, error) { return parseArith(OpMultiply, v) },
+		"$divide":     func(v *anyenc.Value) (Expr, error) { return parseArith(OpDivide, v) },
+		"$abs":        parseAbs,
+		"$round":      parseRound,
+		"$concat":     parseConcat,
+		"$replaceOne": parseReplaceOne,
+		"$cond":       parseCond,
+		"$switch":     parseSwitch,
+		"$ifNull":     parseIfNull,
+		"$eq":         func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpEq, v) },
+		"$ne":         func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpNe, v) },
+		"$gt":         func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpGt, v) },
+		"$gte":        func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpGte, v) },
+		"$lt":         func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpLt, v) },
+		"$lte":        func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpLte, v) },
+		"$cmp":        func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpCmp, v) },
+		"$dateAdd":    parseDateAdd,
+		"$dateDiff":   parseDateDiff,
+		"$dateTrunc":  parseDateTrunc,
+		"$year":       func(v *anyenc.Value) (Expr, error) { return parseDatePart(partYear, v) },
+		"$week":       func(v *anyenc.Value) (Expr, error) { return parseDatePart(partWeek, v) },
 	}
 }
 
@@ -425,6 +426,103 @@ func (e *ConcatExpr) Eval(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, er
 }
 
 func (e *ConcatExpr) String() string { return opString("$concat", e.Args) }
+
+// ReplaceOneExpr evaluates $replaceOne: the first occurrence of find in input
+// replaced by replacement; no occurrence leaves input unchanged. Object form
+// only, all three parameters required (Mongo). A null or missing operand → null
+// (Mongo); a non-string operand → null too (Mongo errors; same rationale as
+// evalNumber — regex find is likewise out: no regex value type). An empty find
+// matches at position 0, prepending the replacement (Mongo behavior, its docs
+// leave the case unstated). The splice goes through a reusable scratch buffer
+// (per-pipeline, single-goroutine): alloc-free in steady state.
+type ReplaceOneExpr struct {
+	Input, Find, Replacement Expr
+
+	buf []byte // scratch, reused across Eval calls
+}
+
+func parseReplaceOne(v *anyenc.Value) (Expr, error) {
+	if v.Type() != anyenc.TypeObject {
+		return nil, &query.ParseError{
+			Op:     "$replaceOne",
+			Reason: "$replaceOne requires an object with 'input', 'find' and 'replacement'",
+		}
+	}
+	e := &ReplaceOneExpr{}
+	slots := map[string]*Expr{"input": &e.Input, "find": &e.Find, "replacement": &e.Replacement}
+	obj, _ := v.Object()
+	var perr error
+	obj.Visit(func(key []byte, item *anyenc.Value) {
+		if perr != nil {
+			return
+		}
+		slot, ok := slots[string(key)]
+		if !ok {
+			perr = atPath(&query.ParseError{
+				Op:     "$replaceOne",
+				Reason: "unknown $replaceOne parameter: " + string(key),
+			}, string(key))
+			return
+		}
+		if *slot != nil {
+			perr = atPath(&query.ParseError{
+				Op:     "$replaceOne",
+				Reason: "duplicate $replaceOne parameter: " + string(key),
+			}, string(key))
+			return
+		}
+		sub, err := ParseExpr(item)
+		if err != nil {
+			perr = atPath(err, string(key))
+			return
+		}
+		*slot = sub
+	})
+	if perr != nil {
+		return nil, perr
+	}
+	if e.Input == nil || e.Find == nil || e.Replacement == nil {
+		return nil, &query.ParseError{
+			Op:     "$replaceOne",
+			Reason: "$replaceOne requires 'input', 'find' and 'replacement'",
+		}
+	}
+	return e, nil
+}
+
+func (e *ReplaceOneExpr) Eval(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, error) {
+	in, err := e.Input.Eval(a, doc)
+	if err != nil {
+		return nil, err
+	}
+	fv, err := e.Find.Eval(a, doc)
+	if err != nil {
+		return nil, err
+	}
+	rv, err := e.Replacement.Eval(a, doc)
+	if err != nil {
+		return nil, err
+	}
+	if in == nil || in.Type() != anyenc.TypeString ||
+		fv == nil || fv.Type() != anyenc.TypeString ||
+		rv == nil || rv.Type() != anyenc.TypeString {
+		return a.NewNull(), nil
+	}
+	input, find := in.GetStringBytes(), fv.GetStringBytes()
+	idx := bytes.Index(input, find)
+	if idx < 0 {
+		return in, nil // no occurrence: input unchanged
+	}
+	e.buf = append(e.buf[:0], input[:idx]...)
+	e.buf = append(e.buf, rv.GetStringBytes()...)
+	e.buf = append(e.buf, input[idx+len(find):]...)
+	return a.NewStringBytes(e.buf), nil // NewStringBytes copies
+}
+
+func (e *ReplaceOneExpr) String() string {
+	return "{$replaceOne:{input:" + e.Input.String() + ",find:" + e.Find.String() +
+		",replacement:" + e.Replacement.String() + "}}"
+}
 
 // truthy is Mongo's expression boolean coercion: false, 0, null, and missing
 // are false; everything else — including "" and empty arrays/objects — is true.

@@ -505,6 +505,7 @@ func TestParseExprOperators(t *testing.T) {
 			{`{"$abs": ["$a"]}`, &AbsExpr{}},
 			{`{"$round": ["$a", 2]}`, &RoundExpr{}},
 			{`{"$concat": ["$a", "-"]}`, &ConcatExpr{}},
+			{`{"$replaceOne": {"input": "$a", "find": "x", "replacement": "y"}}`, &ReplaceOneExpr{}},
 			{`{"$cond": ["$a", 1, 2]}`, &CondExpr{}},
 			{`{"$cond": {"if": "$a", "then": 1, "else": 2}}`, &CondExpr{}},
 			{`{"$switch": {"branches": [{"case": "$a", "then": 1}]}}`, &SwitchExpr{}},
@@ -537,6 +538,8 @@ func TestParseExprOperators(t *testing.T) {
 			{`{"$round": "$a"}`, `{$round:[$a]}`},
 			{`{"$round": ["$a", -1]}`, `{$round:[$a,-1]}`},
 			{`{"$concat": ["$a", "-", "$b"]}`, `{$concat:[$a,"-",$b]}`},
+			{`{"$replaceOne": {"replacement": "", "find": "any://", "input": "$rel"}}`,
+				`{$replaceOne:{input:$rel,find:"any://",replacement:""}}`},
 			// Both $cond spellings render the canonical array form.
 			{`{"$cond": [{"$lt": ["$a", 1]}, "$a", "$b"]}`, `{$cond:[{$lt:[$a,1]},$a,$b]}`},
 			{`{"$cond": {"if": "$a", "then": 1, "else": 2}}`, `{$cond:[$a,1,2]}`},
@@ -592,6 +595,40 @@ func TestDuplicateStructuredParams(t *testing.T) {
 	t.Run("date operator object", func(t *testing.T) {
 		_, err := parseDateAdd(splice(t, `{"startDate":"$d","unit":"day","amount":1}`, `{"unit":"hour"}`))
 		assert.ErrorContains(t, err, "duplicate $dateAdd parameter: unit")
+	})
+	t.Run("$replaceOne", func(t *testing.T) {
+		_, err := parseReplaceOne(splice(t, `{"input":"a","find":"b","replacement":"c"}`, `{"find":"d"}`))
+		assert.ErrorContains(t, err, "duplicate $replaceOne parameter: find")
+	})
+}
+
+// TestParseReplaceOne covers the object-form contract: all three parameters
+// required, unknown keys rejected, the array spelling is not accepted.
+func TestParseReplaceOne(t *testing.T) {
+	bad := func(t *testing.T, exprJson, contains string) {
+		t.Helper()
+		_, err := ParseExpr(anyenc.MustParseJson(exprJson))
+		assert.ErrorContains(t, err, contains, exprJson)
+	}
+
+	t.Run("missing parameters", func(t *testing.T) {
+		bad(t, `{"$replaceOne": {"find": "a", "replacement": "b"}}`, "$replaceOne requires 'input', 'find' and 'replacement'")
+		bad(t, `{"$replaceOne": {"input": "$a", "replacement": "b"}}`, "$replaceOne requires")
+		bad(t, `{"$replaceOne": {"input": "$a", "find": "a"}}`, "$replaceOne requires")
+		bad(t, `{"$replaceOne": {}}`, "$replaceOne requires")
+	})
+	t.Run("unknown parameter", func(t *testing.T) {
+		bad(t, `{"$replaceOne": {"input": "$a", "find": "a", "replacement": "b", "bogus": 1}}`, "unknown $replaceOne parameter: bogus")
+	})
+	t.Run("array form rejected", func(t *testing.T) {
+		bad(t, `{"$replaceOne": ["$a", "x", "y"]}`, "requires an object")
+	})
+	t.Run("nested parse error located", func(t *testing.T) {
+		_, err := ParseExpr(anyenc.MustParseJson(`{"$replaceOne": {"input": "$a", "find": {"$bogus": 1}, "replacement": ""}}`))
+		require.Error(t, err)
+		var pe *query.ParseError
+		require.ErrorAs(t, err, &pe)
+		assert.Equal(t, "$replaceOne.find.$bogus", pe.Path)
 	})
 }
 

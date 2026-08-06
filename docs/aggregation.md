@@ -82,6 +82,7 @@ Inside `$project`/`$addFields` values, `$group` keys and accumulator arguments:
 | `$abs` | `{"$abs": e}` | |
 | `$round` | `{"$round": [x, place?]}` | Half to even (banker's: `1.5`→`2`, `2.5`→`2`); `place` in `[-20, 100]`, default `0`, negative rounds left of the decimal point. |
 | `$concat` | `{"$concat": [e, ...]}` | String operands; an empty operand list yields `""`. |
+| `$replaceOne` | `{"$replaceOne": {"input": e, "find": e, "replacement": e}}` | Replaces the **first** occurrence of `find` in `input`; no occurrence leaves `input` unchanged. All three required (object form only). An empty `find` matches at position 0 and prepends the replacement. Null/missing operands → `null` (as in Mongo); a non-string operand → `null` too (Mongo errors; regex `find` is not supported). The relation-URI idiom: `{"$replaceOne": {"input": "$rel", "find": "any://", "replacement": ""}}` strips a URI scheme off a stored id. |
 | `$cond` | `{"$cond": [if, then, else]}` or `{"$cond": {"if": e, "then": e, "else": e}}` | All three parts required. Lazy: only the taken branch is evaluated. Truthiness is Mongo's: `false`, `0`, `null`, missing → false; everything else — including `""`, `[]`, `{}` — true. |
 | `$switch` | `{"$switch": {"branches": [{"case": e, "then": e}, ...], "default": e?}}` | At least one branch; cases evaluate lazily in order, first truthy case wins; no match falls to `default`. |
 | `$ifNull` | `{"$ifNull": [e, e, ...]}` | At least two operands (Mongo 4.4 variadic form): the first non-null, non-missing value, else the last operand's value. Lazy left-to-right. |
@@ -111,7 +112,8 @@ A single non-array operand is Mongo's shorthand for a one-element list
 > **Null instead of runtime errors** (divergence from Mongo): evaluation is
 > streaming with no per-document error channel, so conditions Mongo reports as
 > query errors yield `null` instead — a non-numeric operand of an arithmetic
-> operator, a non-string operand of `$concat`, division by zero, a non-finite
+> operator, a non-string operand of `$concat` or `$replaceOne`, division by
+> zero, a non-finite
 > result (overflow, NaN), an out-of-range or non-integer `$round` place, and a
 > `$switch` with no matching case and no `default` (Mongo raises). Null and
 > missing operands also yield `null` (as in Mongo).

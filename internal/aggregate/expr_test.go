@@ -566,6 +566,63 @@ func TestConcatExprEval(t *testing.T) {
 	})
 }
 
+func TestReplaceOneExprEval(t *testing.T) {
+	doc := anyenc.MustParseJson(`{"rel": "any://bafyrei123", "s": "abcabc", "n": 5, "nul": null}`)
+	str := func(t *testing.T, exprJson string) string {
+		v := evalExprOn(t, exprJson, doc)
+		require.Equal(t, anyenc.TypeString, v.Type(), exprJson)
+		return string(v.GetStringBytes())
+	}
+	null := func(t *testing.T, exprJson string) {
+		v := evalExprOn(t, exprJson, doc)
+		require.NotNil(t, v, exprJson)
+		assert.Equal(t, anyenc.TypeNull, v.Type(), exprJson)
+	}
+
+	t.Run("match at start, middle, end", func(t *testing.T) {
+		assert.Equal(t, "Xcabc", str(t, `{"$replaceOne": {"input": "$s", "find": "ab", "replacement": "X"}}`))
+		assert.Equal(t, "aXabc", str(t, `{"$replaceOne": {"input": "$s", "find": "bc", "replacement": "X"}}`))
+		assert.Equal(t, "teX", str(t, `{"$replaceOne": {"input": "team", "find": "am", "replacement": "X"}}`))
+	})
+	t.Run("first occurrence only", func(t *testing.T) {
+		assert.Equal(t, "Xabc", str(t, `{"$replaceOne": {"input": "$s", "find": "abc", "replacement": "X"}}`))
+	})
+	t.Run("no occurrence leaves input unchanged", func(t *testing.T) {
+		assert.Equal(t, "abcabc", str(t, `{"$replaceOne": {"input": "$s", "find": "xyz", "replacement": "X"}}`))
+		assert.Equal(t, "", str(t, `{"$replaceOne": {"input": "", "find": "x", "replacement": "X"}}`))
+	})
+	t.Run("empty find matches at position 0 and prepends", func(t *testing.T) {
+		// Mongo behavior (unstated by its docs, pinned here).
+		assert.Equal(t, "Xabcabc", str(t, `{"$replaceOne": {"input": "$s", "find": "", "replacement": "X"}}`))
+		assert.Equal(t, "X", str(t, `{"$replaceOne": {"input": "", "find": "", "replacement": "X"}}`))
+	})
+	t.Run("relation URI prefix strip", func(t *testing.T) {
+		// The motivating case: any://<cid> relation values joined against bare
+		// cid primary keys.
+		assert.Equal(t, "bafyrei123", str(t, `{"$replaceOne": {"input": "$rel", "find": "any://", "replacement": ""}}`))
+	})
+	t.Run("multibyte", func(t *testing.T) {
+		assert.Equal(t, "héllo ⇒ wörld", str(t, `{"$replaceOne": {"input": "héllo → wörld", "find": "→", "replacement": "⇒"}}`))
+		assert.Equal(t, "hello world", str(t, `{"$replaceOne": {"input": "héllo wörld", "find": "éllo wö", "replacement": "ello wo"}}`))
+	})
+	t.Run("null, missing, non-string", func(t *testing.T) {
+		null(t, `{"$replaceOne": {"input": "$nul", "find": "a", "replacement": "b"}}`)
+		null(t, `{"$replaceOne": {"input": "$nope", "find": "a", "replacement": "b"}}`)
+		null(t, `{"$replaceOne": {"input": "$s", "find": "$nul", "replacement": "b"}}`)
+		null(t, `{"$replaceOne": {"input": "$s", "find": "a", "replacement": "$nul"}}`)
+		null(t, `{"$replaceOne": {"input": "$n", "find": "a", "replacement": "b"}}`)
+		null(t, `{"$replaceOne": {"input": "$s", "find": "$n", "replacement": "b"}}`)
+		null(t, `{"$replaceOne": {"input": "$s", "find": "a", "replacement": "$n"}}`)
+	})
+	t.Run("nests with other operators", func(t *testing.T) {
+		assert.Equal(t, "[bafyrei123]", str(t, `{"$concat": ["[",
+			{"$replaceOne": {"input": "$rel", "find": "any://", "replacement": ""}}, "]"]}`))
+		v := evalExprOn(t, `{"$cond": [{"$eq": ["$n", 5]},
+			{"$replaceOne": {"input": "$s", "find": "abc", "replacement": ""}}, "no"]}`, doc)
+		assert.Equal(t, "abc", string(v.GetStringBytes()))
+	})
+}
+
 // countingExpr wraps an Expr and counts Eval calls — the structural proof of
 // branch laziness for $cond/$switch/$ifNull.
 type countingExpr struct {
@@ -822,6 +879,8 @@ func TestExprEvalAllocFree(t *testing.T) {
 	for _, tc := range []struct{ name, json string }{
 		{"arith", `{"$add": ["$a", {"$multiply": ["$b", 2]}, 1]}`},
 		{"concat", `{"$concat": ["$s1", "$s2"]}`},
+		{"replaceOne", `{"$replaceOne": {"input": "$s1", "find": "l", "replacement": "L"}}`},
+		{"replaceOne no match", `{"$replaceOne": {"input": "$s1", "find": "zz", "replacement": "L"}}`},
 		{"cond over comparison", `{"$cond": [{"$lt": ["$a", "$b"]}, {"$add": ["$a", 1]}, "$b"]}`},
 		{"switch", `{"$switch": {"branches": [
 			{"case": {"$eq": ["$s1", "$s2"]}, "then": 1},
@@ -947,6 +1006,24 @@ func BenchmarkDateDiffExprEval(b *testing.B) {
 	}
 	doc := anyenc.MustParseJson(
 		`{"d": {"$date": "2026-03-28T12:00:00Z"}, "d2": {"$date": "2026-08-05T06:00:00Z"}}`)
+	a := &anyenc.Arena{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		a.Reset()
+		if _, err := e.Eval(a, doc); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkReplaceOneExprEval(b *testing.B) {
+	e, err := ParseExpr(anyenc.MustParseJson(
+		`{"$replaceOne": {"input": "$rel", "find": "any://", "replacement": ""}}`))
+	if err != nil {
+		b.Fatal(err)
+	}
+	doc := anyenc.MustParseJson(`{"rel": "any://bafyreibn6euvvxn32rcqcuh5oq6zk2krebzkodw2cvytxbjqmnpdt3vzuq"}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
 	b.ResetTimer()
