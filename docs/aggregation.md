@@ -95,6 +95,9 @@ Inside `$project`/`$addFields` values, `$group` keys and accumulator arguments:
 | `$round` | `{"$round": [x, place?]}` | Half to even (banker's: `1.5`→`2`, `2.5`→`2`); `place` in `[-20, 100]`, default `0`, negative rounds left of the decimal point. |
 | `$concat` | `{"$concat": [e, ...]}` | String operands; an empty operand list yields `""`. |
 | `$replaceOne` | `{"$replaceOne": {"input": e, "find": e, "replacement": e}}` | Replaces the **first** occurrence of `find` in `input`; no occurrence leaves `input` unchanged. All three required (object form only). An empty `find` matches at position 0 and prepends the replacement. Null/missing operands → `null` (as in Mongo); a non-string operand → `null` too (Mongo errors; regex `find` is not supported). |
+| `$replaceAll` | `{"$replaceAll": {"input": e, "find": e, "replacement": e}}` | Replaces **every** occurrence of `find`, left to right, non-overlapping; replaced regions are not rescanned. Same contract as `$replaceOne` otherwise; an empty `find` prepends the replacement **once** (pinned; Mongo docs leave the case unstated). |
+| `$split` | `{"$split": [string, delimiter]}` | Array of the substrings between delimiter occurrences: adjacent delimiters produce empty strings, no occurrence yields `[input]`. Exactly two operands; the delimiter must be a non-empty string — an empty **literal** delimiter is a parse error, a delimiter expression evaluating to `""` → `null` (Mongo errors at runtime; regex delimiters are not supported). |
+| `$trim`, `$ltrim`, `$rtrim` | `{"$trim": {"input": e, "chars"?: e}}` | Strips leading and trailing (`$ltrim`/`$rtrim`: one side) **code points** — UTF-8 aware, never mid-rune. Without `chars`: exactly Mongo's documented whitespace set (U+0000, U+0009–U+000D, U+0020, U+00A0, U+1680, U+2000–U+200A — not full Unicode `White_Space`). With `chars`: the set of code points in that string; `chars: ""` trims nothing (pinned; Mongo docs leave the case unstated). |
 | `$cond` | `{"$cond": [if, then, else]}` or `{"$cond": {"if": e, "then": e, "else": e}}` | All three parts required. Lazy: only the taken branch is evaluated. Truthiness is Mongo's: `false`, `0`, `null`, missing → false; everything else — including `""`, `[]`, `{}` — true. |
 | `$switch` | `{"$switch": {"branches": [{"case": e, "then": e}, ...], "default": e?}}` | At least one branch; cases evaluate lazily in order, first truthy case wins; no match falls to `default`. |
 | `$ifNull` | `{"$ifNull": [e, e, ...]}` | At least two operands (Mongo 4.4 variadic form): the first non-null, non-missing value, else the last operand's value. Lazy left-to-right. |
@@ -124,7 +127,10 @@ A single non-array operand is Mongo's shorthand for a one-element list
 > **Null instead of runtime errors** (divergence from Mongo): evaluation is
 > streaming with no per-document error channel, so conditions Mongo reports as
 > query errors yield `null` instead — a non-numeric operand of an arithmetic
-> operator, a non-string operand of `$concat` or `$replaceOne`, division by
+> operator, a non-string operand of a string operator (`$concat`,
+> `$replaceOne`/`$replaceAll`, `$split`, `$trim`/`$ltrim`/`$rtrim` — including
+> a `$trim` `chars` and a `$split` delimiter expression, where an empty-string
+> delimiter counts too), division by
 > zero, a non-finite
 > result (overflow, NaN), an out-of-range or non-integer `$round` place, and a
 > `$switch` with no matching case and no `default` (Mongo raises). Null and

@@ -621,6 +621,183 @@ func TestReplaceOneExprEval(t *testing.T) {
 	})
 }
 
+func TestReplaceAllExprEval(t *testing.T) {
+	doc := anyenc.MustParseJson(`{"s": "abcabcabc", "rel": "x://a x://b", "a4": "aaaa", "n": 5, "nul": null}`)
+	str := func(t *testing.T, exprJson string) string {
+		v := evalExprOn(t, exprJson, doc)
+		require.Equal(t, anyenc.TypeString, v.Type(), exprJson)
+		return string(v.GetStringBytes())
+	}
+	null := func(t *testing.T, exprJson string) {
+		v := evalExprOn(t, exprJson, doc)
+		require.NotNil(t, v, exprJson)
+		assert.Equal(t, anyenc.TypeNull, v.Type(), exprJson)
+	}
+
+	t.Run("every occurrence", func(t *testing.T) {
+		assert.Equal(t, "XXX", str(t, `{"$replaceAll": {"input": "$s", "find": "abc", "replacement": "X"}}`))
+		assert.Equal(t, "aXcaXcaXc", str(t, `{"$replaceAll": {"input": "$s", "find": "b", "replacement": "X"}}`))
+		assert.Equal(t, "acacac", str(t, `{"$replaceAll": {"input": "$s", "find": "b", "replacement": ""}}`))
+		assert.Equal(t, "a b", str(t, `{"$replaceAll": {"input": "$rel", "find": "x://", "replacement": ""}}`))
+	})
+	t.Run("left to right, non-overlapping", func(t *testing.T) {
+		assert.Equal(t, "XX", str(t, `{"$replaceAll": {"input": "$a4", "find": "aa", "replacement": "X"}}`))
+		assert.Equal(t, "Xa", str(t, `{"$replaceAll": {"input": "aaa", "find": "aa", "replacement": "X"}}`))
+	})
+	t.Run("replaced regions are not rescanned", func(t *testing.T) {
+		assert.Equal(t, "aaaa", str(t, `{"$replaceAll": {"input": "aa", "find": "a", "replacement": "aa"}}`))
+		assert.Equal(t, "abab", str(t, `{"$replaceAll": {"input": "ab", "find": "ab", "replacement": "abab"}}`))
+	})
+	t.Run("no occurrence leaves input unchanged", func(t *testing.T) {
+		assert.Equal(t, "abcabcabc", str(t, `{"$replaceAll": {"input": "$s", "find": "xyz", "replacement": "X"}}`))
+		assert.Equal(t, "", str(t, `{"$replaceAll": {"input": "", "find": "x", "replacement": "X"}}`))
+	})
+	t.Run("empty find matches at position 0 once and prepends", func(t *testing.T) {
+		// Same pin as $replaceOne (unstated by Mongo docs; per-position would loop).
+		assert.Equal(t, "Xabcabcabc", str(t, `{"$replaceAll": {"input": "$s", "find": "", "replacement": "X"}}`))
+		assert.Equal(t, "X", str(t, `{"$replaceAll": {"input": "", "find": "", "replacement": "X"}}`))
+	})
+	t.Run("multibyte", func(t *testing.T) {
+		assert.Equal(t, "héllo ⇒ wörld ⇒ x", str(t, `{"$replaceAll": {"input": "héllo → wörld → x", "find": "→", "replacement": "⇒"}}`))
+		assert.Equal(t, "heee", str(t, `{"$replaceAll": {"input": "hééé", "find": "é", "replacement": "e"}}`))
+	})
+	t.Run("null, missing, non-string", func(t *testing.T) {
+		null(t, `{"$replaceAll": {"input": "$nul", "find": "a", "replacement": "b"}}`)
+		null(t, `{"$replaceAll": {"input": "$nope", "find": "a", "replacement": "b"}}`)
+		null(t, `{"$replaceAll": {"input": "$s", "find": "$nul", "replacement": "b"}}`)
+		null(t, `{"$replaceAll": {"input": "$s", "find": "a", "replacement": "$nul"}}`)
+		null(t, `{"$replaceAll": {"input": "$n", "find": "a", "replacement": "b"}}`)
+		null(t, `{"$replaceAll": {"input": "$s", "find": "$n", "replacement": "b"}}`)
+		null(t, `{"$replaceAll": {"input": "$s", "find": "a", "replacement": "$n"}}`)
+	})
+	t.Run("nests with other operators", func(t *testing.T) {
+		assert.Equal(t, "[a b]", str(t, `{"$concat": ["[",
+			{"$replaceAll": {"input": "$rel", "find": "x://", "replacement": ""}}, "]"]}`))
+		v := evalExprOn(t, `{"$cond": [{"$eq": ["$n", 5]},
+			{"$replaceAll": {"input": "$s", "find": "abc", "replacement": "."}}, "no"]}`, doc)
+		assert.Equal(t, "...", string(v.GetStringBytes()))
+	})
+}
+
+func TestSplitExprEval(t *testing.T) {
+	doc := anyenc.MustParseJson(`{"csv": "a,b,,c", "d": ",", "empty": "", "s": "abc",
+		"arr": [{"tag": "x,y"}], "n": 5, "nul": null}`)
+	arr := func(t *testing.T, exprJson, wantJson string) {
+		t.Helper()
+		v := evalExprOn(t, exprJson, doc)
+		require.NotNil(t, v, exprJson)
+		require.Equal(t, anyenc.TypeArray, v.Type(), exprJson)
+		assert.Equal(t, anyenc.MustParseJson(wantJson).String(), v.String(), exprJson)
+	}
+	null := func(t *testing.T, exprJson string) {
+		v := evalExprOn(t, exprJson, doc)
+		require.NotNil(t, v, exprJson)
+		assert.Equal(t, anyenc.TypeNull, v.Type(), exprJson)
+	}
+
+	t.Run("basic split", func(t *testing.T) {
+		arr(t, `{"$split": ["June-15-2013", "-"]}`, `["June","15","2013"]`)
+		arr(t, `{"$split": ["$csv", "$d"]}`, `["a","b","","c"]`)
+	})
+	t.Run("adjacent, leading and trailing delimiters produce empties", func(t *testing.T) {
+		arr(t, `{"$split": ["a--b", "-"]}`, `["a","","b"]`)
+		arr(t, `{"$split": ["-a", "-"]}`, `["","a"]`)
+		arr(t, `{"$split": ["a-", "-"]}`, `["a",""]`)
+		arr(t, `{"$split": ["--", "-"]}`, `["","",""]`)
+	})
+	t.Run("no occurrence yields the input as one element", func(t *testing.T) {
+		arr(t, `{"$split": ["pea green boat", "owl"]}`, `["pea green boat"]`)
+		arr(t, `{"$split": ["", "-"]}`, `[""]`)
+	})
+	t.Run("multibyte", func(t *testing.T) {
+		arr(t, `{"$split": ["é→x→wörld", "→"]}`, `["é","x","wörld"]`)
+		arr(t, `{"$split": ["aéé b", "éé"]}`, `["a"," b"]`)
+	})
+	t.Run("null, missing, non-string", func(t *testing.T) {
+		null(t, `{"$split": ["$nul", "-"]}`)
+		null(t, `{"$split": ["$nope", "-"]}`)
+		null(t, `{"$split": ["$n", "-"]}`)
+		null(t, `{"$split": ["$s", "$nul"]}`)
+		null(t, `{"$split": ["$s", "$n"]}`)
+	})
+	t.Run("delimiter expression evaluating to empty is null", func(t *testing.T) {
+		// Mongo errors at runtime; only the literal spelling is a parse error.
+		null(t, `{"$split": ["$s", "$empty"]}`)
+	})
+	t.Run("nests with other operators", func(t *testing.T) {
+		arr(t, `{"$split": [{"$concat": ["$s", "-", "$s"]}, "-"]}`, `["abc","abc"]`)
+		arr(t, `{"$cond": [{"$eq": ["$n", 5]}, {"$split": ["$arr.0.tag", ","]}, "no"]}`,
+			`["x","y"]`)
+	})
+}
+
+func TestTrimExprEval(t *testing.T) {
+	doc := anyenc.MustParseJson(`{"pad": "  héllo  ",
+		"ws": "\u0000\t\n\u000b\f\r \u00a0\u1680\u2000\u2005\u200ax y\u200a\u00a0\r\n ",
+		"ideo": "\u3000x\u3000", "s": "abc", "chars": "ab", "n": 5, "nul": null}`)
+	str := func(t *testing.T, exprJson string) string {
+		v := evalExprOn(t, exprJson, doc)
+		require.Equal(t, anyenc.TypeString, v.Type(), exprJson)
+		return string(v.GetStringBytes())
+	}
+	null := func(t *testing.T, exprJson string) {
+		v := evalExprOn(t, exprJson, doc)
+		require.NotNil(t, v, exprJson)
+		assert.Equal(t, anyenc.TypeNull, v.Type(), exprJson)
+	}
+
+	t.Run("default whitespace set", func(t *testing.T) {
+		// Every code point from Mongo's documented table, incl. U+0000 and U+00A0.
+		assert.Equal(t, "x y", str(t, `{"$trim": {"input": "$ws"}}`))
+		assert.Equal(t, "héllo", str(t, `{"$trim": {"input": "$pad"}}`))
+		assert.Equal(t, "", str(t, `{"$trim": {"input": "  \t  "}}`))
+	})
+	t.Run("U+3000 is not in the default set", func(t *testing.T) {
+		// Mongo's table stops at U+200A: ideographic space survives...
+		assert.Equal(t, "\u3000x\u3000", str(t, `{"$trim": {"input": "$ideo"}}`))
+		// ...unless named in chars.
+		assert.Equal(t, "x", str(t, `{"$trim": {"input": "$ideo", "chars": "\u3000"}}`))
+	})
+	t.Run("ltrim and rtrim strip one side", func(t *testing.T) {
+		assert.Equal(t, "héllo  ", str(t, `{"$ltrim": {"input": "$pad"}}`))
+		assert.Equal(t, "  héllo", str(t, `{"$rtrim": {"input": "$pad"}}`))
+		assert.Equal(t, "ba", str(t, `{"$ltrim": {"input": "aba", "chars": "a"}}`))
+		assert.Equal(t, "ab", str(t, `{"$rtrim": {"input": "aba", "chars": "a"}}`))
+	})
+	t.Run("chars is a set of code points", func(t *testing.T) {
+		assert.Equal(t, "oodby", str(t, `{"$trim": {"input": "ggggoodbyeeeee", "chars": "ge"}}`))
+		assert.Equal(t, "c cba abc", str(t, `{"$ltrim": {"input": "abc cba abc", "chars": "$chars"}}`))
+	})
+	t.Run("chars is UTF-8 aware", func(t *testing.T) {
+		// Trimming a multibyte member never shreds a rune...
+		assert.Equal(t, "x", str(t, `{"$trim": {"input": "ééxéé", "chars": "é"}}`))
+		// ...and a single-byte member never bites into a multibyte rune.
+		assert.Equal(t, "héll", str(t, `{"$rtrim": {"input": "héllo", "chars": "o"}}`))
+		assert.Equal(t, "héllo", str(t, `{"$trim": {"input": "héllo", "chars": "\u00a9"}}`))
+	})
+	t.Run("empty chars trims nothing", func(t *testing.T) {
+		// Pinned: an empty set of code points (unstated by Mongo docs).
+		assert.Equal(t, " x ", str(t, `{"$trim": {"input": " x ", "chars": ""}}`))
+	})
+	t.Run("no strip leaves input unchanged", func(t *testing.T) {
+		assert.Equal(t, "abc", str(t, `{"$trim": {"input": "$s"}}`))
+	})
+	t.Run("null, missing, non-string", func(t *testing.T) {
+		null(t, `{"$trim": {"input": "$nul"}}`)
+		null(t, `{"$trim": {"input": "$nope"}}`)
+		null(t, `{"$trim": {"input": "$n"}}`)
+		null(t, `{"$ltrim": {"input": "$nul"}}`)
+		null(t, `{"$rtrim": {"input": "$nope"}}`)
+		null(t, `{"$trim": {"input": "$s", "chars": "$nul"}}`)
+		null(t, `{"$trim": {"input": "$s", "chars": "$nope"}}`)
+		null(t, `{"$trim": {"input": "$s", "chars": "$n"}}`)
+	})
+	t.Run("nests with other operators", func(t *testing.T) {
+		assert.Equal(t, "[héllo]", str(t, `{"$concat": ["[", {"$trim": {"input": "$pad"}}, "]"]}`))
+		assert.Equal(t, "héllo", str(t, `{"$trim": {"input": {"$concat": [" ", "$pad"]}}}`))
+	})
+}
+
 // countingExpr wraps an Expr and counts Eval calls — the structural proof of
 // branch laziness for $cond/$switch/$ifNull.
 type countingExpr struct {
@@ -924,6 +1101,7 @@ func TestExprEvalAllocFree(t *testing.T) {
 		t.Skip("benchmark-backed test")
 	}
 	doc := anyenc.MustParseJson(`{"a": 3, "b": 4, "s1": "héllo → w", "s2": "0123456789",
+		"csv": "alpha,beta,gamma,delta,epsilon", "pad": "\t  héllo wörld  ",
 		"arr": [{"v": 1}, {"v": 2}, {"v": 3}, {"x": 0}, {"v": 5}],
 		"d": {"$date": "2026-03-28T12:00:00Z"}, "d2": {"$date": "2026-08-05T06:00:00Z"}}`)
 	for _, tc := range []struct{ name, json string }{
@@ -932,6 +1110,14 @@ func TestExprEvalAllocFree(t *testing.T) {
 		{"concat", `{"$concat": ["$s1", "$s2"]}`},
 		{"replaceOne", `{"$replaceOne": {"input": "$s1", "find": "l", "replacement": "L"}}`},
 		{"replaceOne no match", `{"$replaceOne": {"input": "$s1", "find": "zz", "replacement": "L"}}`},
+		{"replaceAll", `{"$replaceAll": {"input": "$csv", "find": "a", "replacement": "A"}}`},
+		{"replaceAll no match", `{"$replaceAll": {"input": "$csv", "find": "zz", "replacement": "A"}}`},
+		{"split", `{"$split": ["$csv", ","]}`},
+		{"split no match", `{"$split": ["$csv", ";"]}`},
+		{"trim default set", `{"$trim": {"input": "$pad"}}`},
+		{"trim chars set", `{"$trim": {"input": "$csv", "chars": "aélon"}}`},
+		{"ltrim", `{"$ltrim": {"input": "$pad"}}`},
+		{"rtrim", `{"$rtrim": {"input": "$pad"}}`},
 		{"cond over comparison", `{"$cond": [{"$lt": ["$a", "$b"]}, {"$add": ["$a", 1]}, "$b"]}`},
 		{"switch", `{"$switch": {"branches": [
 			{"case": {"$eq": ["$s1", "$s2"]}, "then": 1},
@@ -1102,6 +1288,61 @@ func BenchmarkReplaceOneExprEval(b *testing.B) {
 		b.Fatal(err)
 	}
 	doc := anyenc.MustParseJson(`{"rel": "x://longer-prefixed-identifier-value-0123456789"}`)
+	a := &anyenc.Arena{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		a.Reset()
+		if _, err := e.Eval(a, doc); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkReplaceAllExprEval replaces 3 occurrences.
+func BenchmarkReplaceAllExprEval(b *testing.B) {
+	e, err := ParseExpr(anyenc.MustParseJson(
+		`{"$replaceAll": {"input": "$s", "find": "://", "replacement": "-"}}`))
+	if err != nil {
+		b.Fatal(err)
+	}
+	doc := anyenc.MustParseJson(`{"s": "one://two://three://tail-0123456789"}`)
+	a := &anyenc.Arena{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		a.Reset()
+		if _, err := e.Eval(a, doc); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkSplitExprEval splits into 5 parts.
+func BenchmarkSplitExprEval(b *testing.B) {
+	e, err := ParseExpr(anyenc.MustParseJson(`{"$split": ["$csv", ","]}`))
+	if err != nil {
+		b.Fatal(err)
+	}
+	doc := anyenc.MustParseJson(`{"csv": "alpha,beta,gamma,delta,epsilon"}`)
+	a := &anyenc.Arena{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		a.Reset()
+		if v, err := e.Eval(a, doc); err != nil || v == nil {
+			b.Fatal(v, err)
+		}
+	}
+}
+
+// BenchmarkTrimExprEval strips the default whitespace set from both sides.
+func BenchmarkTrimExprEval(b *testing.B) {
+	e, err := ParseExpr(anyenc.MustParseJson(`{"$trim": {"input": "$s"}}`))
+	if err != nil {
+		b.Fatal(err)
+	}
+	doc := anyenc.MustParseJson(`{"s": "\t  héllo wörld \r\n "}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
 	b.ResetTimer()

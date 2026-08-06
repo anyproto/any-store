@@ -506,6 +506,11 @@ func TestParseExprOperators(t *testing.T) {
 			{`{"$round": ["$a", 2]}`, &RoundExpr{}},
 			{`{"$concat": ["$a", "-"]}`, &ConcatExpr{}},
 			{`{"$replaceOne": {"input": "$a", "find": "x", "replacement": "y"}}`, &ReplaceOneExpr{}},
+			{`{"$replaceAll": {"input": "$a", "find": "x", "replacement": "y"}}`, &ReplaceAllExpr{}},
+			{`{"$split": ["$a", ","]}`, &SplitExpr{}},
+			{`{"$trim": {"input": "$a"}}`, &TrimExpr{}},
+			{`{"$ltrim": {"input": "$a", "chars": "x"}}`, &TrimExpr{}},
+			{`{"$rtrim": {"input": "$a"}}`, &TrimExpr{}},
 			{`{"$cond": ["$a", 1, 2]}`, &CondExpr{}},
 			{`{"$cond": {"if": "$a", "then": 1, "else": 2}}`, &CondExpr{}},
 			{`{"$switch": {"branches": [{"case": "$a", "then": 1}]}}`, &SwitchExpr{}},
@@ -540,6 +545,15 @@ func TestParseExprOperators(t *testing.T) {
 			{`{"$concat": ["$a", "-", "$b"]}`, `{$concat:[$a,"-",$b]}`},
 			{`{"$replaceOne": {"replacement": "", "find": "x://", "input": "$rel"}}`,
 				`{$replaceOne:{input:$rel,find:"x://",replacement:""}}`},
+			{`{"$replaceAll": {"replacement": "-", "find": "x://", "input": "$rel"}}`,
+				`{$replaceAll:{input:$rel,find:"x://",replacement:"-"}}`},
+			{`{"$split": ["$rel", ","]}`, `{$split:[$rel,","]}`},
+			{`{"$split": [{"$concat": ["$a", "$b"]}, "-"]}`, `{$split:[{$concat:[$a,$b]},"-"]}`},
+			// Spec order does not matter: String renders the canonical order.
+			{`{"$trim": {"chars": "x", "input": "$a"}}`, `{$trim:{input:$a,chars:"x"}}`},
+			{`{"$trim": {"input": "$a"}}`, `{$trim:{input:$a}}`},
+			{`{"$ltrim": {"input": "$a"}}`, `{$ltrim:{input:$a}}`},
+			{`{"$rtrim": {"input": "$a", "chars": "é "}}`, `{$rtrim:{input:$a,chars:"é "}}`},
 			// Both $cond spellings render the canonical array form.
 			{`{"$cond": [{"$lt": ["$a", 1]}, "$a", "$b"]}`, `{$cond:[{$lt:[$a,1]},$a,$b]}`},
 			{`{"$cond": {"if": "$a", "then": 1, "else": 2}}`, `{$cond:[$a,1,2]}`},
@@ -600,6 +614,14 @@ func TestDuplicateStructuredParams(t *testing.T) {
 		_, err := parseReplaceOne(splice(t, `{"input":"a","find":"b","replacement":"c"}`, `{"find":"d"}`))
 		assert.ErrorContains(t, err, "duplicate $replaceOne parameter: find")
 	})
+	t.Run("$replaceAll", func(t *testing.T) {
+		_, err := parseReplaceAll(splice(t, `{"input":"a","find":"b","replacement":"c"}`, `{"input":"d"}`))
+		assert.ErrorContains(t, err, "duplicate $replaceAll parameter: input")
+	})
+	t.Run("$trim", func(t *testing.T) {
+		_, err := parseTrim(TrimBoth, splice(t, `{"input":"a","chars":"b"}`, `{"chars":"c"}`))
+		assert.ErrorContains(t, err, "duplicate $trim parameter: chars")
+	})
 }
 
 // TestParseReplaceOne covers the object-form contract: all three parameters
@@ -629,6 +651,55 @@ func TestParseReplaceOne(t *testing.T) {
 		var pe *query.ParseError
 		require.ErrorAs(t, err, &pe)
 		assert.Equal(t, "$replaceOne.find.$bogus", pe.Path)
+	})
+}
+
+// TestParseStringOps covers the parse contracts of $replaceAll, $split and the
+// trim family: required/unknown parameters, arity, and the literal empty
+// $split delimiter (rejectable at parse time; an expression delimiter is a
+// runtime concern).
+func TestParseStringOps(t *testing.T) {
+	bad := func(t *testing.T, exprJson, contains string) {
+		t.Helper()
+		_, err := ParseExpr(anyenc.MustParseJson(exprJson))
+		assert.ErrorContains(t, err, contains, exprJson)
+	}
+
+	t.Run("$replaceAll object contract", func(t *testing.T) {
+		bad(t, `{"$replaceAll": {"find": "a", "replacement": "b"}}`, "$replaceAll requires 'input', 'find' and 'replacement'")
+		bad(t, `{"$replaceAll": {"input": "$a", "find": "a"}}`, "$replaceAll requires")
+		bad(t, `{"$replaceAll": {"input": "$a", "find": "a", "replacement": "b", "bogus": 1}}`, "unknown $replaceAll parameter: bogus")
+		bad(t, `{"$replaceAll": ["$a", "x", "y"]}`, "requires an object")
+	})
+	t.Run("$replaceAll nested parse error located", func(t *testing.T) {
+		_, err := ParseExpr(anyenc.MustParseJson(`{"$replaceAll": {"input": "$a", "find": {"$bogus": 1}, "replacement": ""}}`))
+		require.Error(t, err)
+		var pe *query.ParseError
+		require.ErrorAs(t, err, &pe)
+		assert.Equal(t, "$replaceAll.find.$bogus", pe.Path)
+	})
+	t.Run("$split arity", func(t *testing.T) {
+		bad(t, `{"$split": ["$a"]}`, "$split requires exactly 2 operands, got 1")
+		bad(t, `{"$split": ["$a", ",", "x"]}`, "got 3")
+		bad(t, `{"$split": "$a"}`, "got 1") // shorthand is a one-element list
+	})
+	t.Run("$split literal empty delimiter", func(t *testing.T) {
+		bad(t, `{"$split": ["$a", ""]}`, "$split delimiter must be a non-empty string")
+		bad(t, `{"$split": ["$a", {"$literal": ""}]}`, "$split delimiter must be a non-empty string")
+	})
+	t.Run("trim family object contract", func(t *testing.T) {
+		bad(t, `{"$trim": {"chars": "x"}}`, "$trim requires 'input'")
+		bad(t, `{"$ltrim": {}}`, "$ltrim requires 'input'")
+		bad(t, `{"$rtrim": {"input": "$a", "bogus": 1}}`, "unknown $rtrim parameter: bogus")
+		bad(t, `{"$trim": "$a"}`, "$trim requires an object with 'input' and optional 'chars'")
+		bad(t, `{"$rtrim": ["$a"]}`, "$rtrim requires an object")
+	})
+	t.Run("trim nested parse error located", func(t *testing.T) {
+		_, err := ParseExpr(anyenc.MustParseJson(`{"$trim": {"input": "$a", "chars": {"$bogus": 1}}}`))
+		require.Error(t, err)
+		var pe *query.ParseError
+		require.ErrorAs(t, err, &pe)
+		assert.Equal(t, "$trim.chars.$bogus", pe.Path)
 	})
 }
 

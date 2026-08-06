@@ -6,6 +6,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-store/v2/query"
@@ -28,6 +29,11 @@ func init() {
 		"$round":      parseRound,
 		"$concat":     parseConcat,
 		"$replaceOne": parseReplaceOne,
+		"$replaceAll": parseReplaceAll,
+		"$split":      parseSplit,
+		"$trim":       func(v *anyenc.Value) (Expr, error) { return parseTrim(TrimBoth, v) },
+		"$ltrim":      func(v *anyenc.Value) (Expr, error) { return parseTrim(TrimLeft, v) },
+		"$rtrim":      func(v *anyenc.Value) (Expr, error) { return parseTrim(TrimRight, v) },
 		"$cond":       parseCond,
 		"$switch":     parseSwitch,
 		"$ifNull":     parseIfNull,
@@ -107,6 +113,41 @@ func opString(op string, args []Expr) string {
 	}
 	b.WriteString("]}")
 	return b.String()
+}
+
+// parseParamObject fills slots from an object-form operator spec: each key
+// parses into its slot, unknown and duplicate keys are structured errors.
+// Required-slot checks stay with the caller.
+func parseParamObject(op string, v *anyenc.Value, slots map[string]*Expr) error {
+	obj, _ := v.Object()
+	var perr error
+	obj.Visit(func(key []byte, item *anyenc.Value) {
+		if perr != nil {
+			return
+		}
+		slot, ok := slots[string(key)]
+		if !ok {
+			perr = atPath(&query.ParseError{
+				Op:     op,
+				Reason: "unknown " + op + " parameter: " + string(key),
+			}, string(key))
+			return
+		}
+		if *slot != nil {
+			perr = atPath(&query.ParseError{
+				Op:     op,
+				Reason: "duplicate " + op + " parameter: " + string(key),
+			}, string(key))
+			return
+		}
+		sub, err := ParseExpr(item)
+		if err != nil {
+			perr = atPath(err, string(key))
+			return
+		}
+		*slot = sub
+	})
+	return perr
 }
 
 // evalNumber evaluates sub as a numeric operand. ok=false means the operator
@@ -441,51 +482,33 @@ type ReplaceOneExpr struct {
 	buf []byte // scratch, reused across Eval calls
 }
 
-func parseReplaceOne(v *anyenc.Value) (Expr, error) {
+// parseReplaceParams parses the shared $replaceOne/$replaceAll object form:
+// all three parameters required, unknown/duplicate keys rejected.
+func parseReplaceParams(op string, v *anyenc.Value) (input, find, repl Expr, err error) {
 	if v.Type() != anyenc.TypeObject {
-		return nil, &query.ParseError{
-			Op:     "$replaceOne",
-			Reason: "$replaceOne requires an object with 'input', 'find' and 'replacement'",
+		return nil, nil, nil, &query.ParseError{
+			Op:     op,
+			Reason: op + " requires an object with 'input', 'find' and 'replacement'",
 		}
 	}
+	slots := map[string]*Expr{"input": &input, "find": &find, "replacement": &repl}
+	if err = parseParamObject(op, v, slots); err != nil {
+		return nil, nil, nil, err
+	}
+	if input == nil || find == nil || repl == nil {
+		return nil, nil, nil, &query.ParseError{
+			Op:     op,
+			Reason: op + " requires 'input', 'find' and 'replacement'",
+		}
+	}
+	return input, find, repl, nil
+}
+
+func parseReplaceOne(v *anyenc.Value) (Expr, error) {
 	e := &ReplaceOneExpr{}
-	slots := map[string]*Expr{"input": &e.Input, "find": &e.Find, "replacement": &e.Replacement}
-	obj, _ := v.Object()
-	var perr error
-	obj.Visit(func(key []byte, item *anyenc.Value) {
-		if perr != nil {
-			return
-		}
-		slot, ok := slots[string(key)]
-		if !ok {
-			perr = atPath(&query.ParseError{
-				Op:     "$replaceOne",
-				Reason: "unknown $replaceOne parameter: " + string(key),
-			}, string(key))
-			return
-		}
-		if *slot != nil {
-			perr = atPath(&query.ParseError{
-				Op:     "$replaceOne",
-				Reason: "duplicate $replaceOne parameter: " + string(key),
-			}, string(key))
-			return
-		}
-		sub, err := ParseExpr(item)
-		if err != nil {
-			perr = atPath(err, string(key))
-			return
-		}
-		*slot = sub
-	})
-	if perr != nil {
-		return nil, perr
-	}
-	if e.Input == nil || e.Find == nil || e.Replacement == nil {
-		return nil, &query.ParseError{
-			Op:     "$replaceOne",
-			Reason: "$replaceOne requires 'input', 'find' and 'replacement'",
-		}
+	var err error
+	if e.Input, e.Find, e.Replacement, err = parseReplaceParams("$replaceOne", v); err != nil {
+		return nil, err
 	}
 	return e, nil
 }
@@ -522,6 +545,260 @@ func (e *ReplaceOneExpr) Eval(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value
 func (e *ReplaceOneExpr) String() string {
 	return "{$replaceOne:{input:" + e.Input.String() + ",find:" + e.Find.String() +
 		",replacement:" + e.Replacement.String() + "}}"
+}
+
+// ReplaceAllExpr evaluates $replaceAll: every occurrence of find in input
+// replaced by replacement, left to right, non-overlapping; replaced regions are
+// not rescanned. Same contract as ReplaceOneExpr otherwise: object form, all
+// three required, null/missing or non-string operand → null. An empty find
+// matches at position 0 once, prepending the replacement — same pin as
+// $replaceOne (Mongo docs leave the case unstated; a per-position match would
+// loop).
+type ReplaceAllExpr struct {
+	Input, Find, Replacement Expr
+
+	buf []byte // scratch, reused across Eval calls
+}
+
+func parseReplaceAll(v *anyenc.Value) (Expr, error) {
+	e := &ReplaceAllExpr{}
+	var err error
+	if e.Input, e.Find, e.Replacement, err = parseReplaceParams("$replaceAll", v); err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+func (e *ReplaceAllExpr) Eval(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, error) {
+	in, err := e.Input.Eval(a, doc)
+	if err != nil {
+		return nil, err
+	}
+	fv, err := e.Find.Eval(a, doc)
+	if err != nil {
+		return nil, err
+	}
+	rv, err := e.Replacement.Eval(a, doc)
+	if err != nil {
+		return nil, err
+	}
+	if in == nil || in.Type() != anyenc.TypeString ||
+		fv == nil || fv.Type() != anyenc.TypeString ||
+		rv == nil || rv.Type() != anyenc.TypeString {
+		return a.NewNull(), nil
+	}
+	input, find, rep := in.GetStringBytes(), fv.GetStringBytes(), rv.GetStringBytes()
+	if len(find) == 0 {
+		e.buf = append(e.buf[:0], rep...)
+		e.buf = append(e.buf, input...)
+		return a.NewStringBytes(e.buf), nil
+	}
+	idx := bytes.Index(input, find)
+	if idx < 0 {
+		return in, nil // no occurrence: input unchanged
+	}
+	e.buf = e.buf[:0]
+	for idx >= 0 {
+		e.buf = append(e.buf, input[:idx]...)
+		e.buf = append(e.buf, rep...)
+		input = input[idx+len(find):]
+		idx = bytes.Index(input, find)
+	}
+	e.buf = append(e.buf, input...)
+	return a.NewStringBytes(e.buf), nil // NewStringBytes copies
+}
+
+func (e *ReplaceAllExpr) String() string {
+	return "{$replaceAll:{input:" + e.Input.String() + ",find:" + e.Find.String() +
+		",replacement:" + e.Replacement.String() + "}}"
+}
+
+// SplitExpr evaluates $split [string, delimiter]: the array of substrings
+// between delimiter occurrences — adjacent delimiters produce empty strings,
+// no occurrence yields the whole input as a one-element array. The delimiter
+// must be a non-empty string: an empty literal delimiter is a parse error and
+// a delimiter expression evaluating to "" → null (Mongo errors at runtime;
+// no-error-channel policy — likewise a null/missing or non-string operand,
+// where Mongo errors for non-strings; regex delimiters are out: no regex value
+// type). Elements and the result array are arena-allocated per eval:
+// alloc-free in steady state.
+type SplitExpr struct {
+	Input, Delim Expr
+}
+
+func parseSplit(v *anyenc.Value) (Expr, error) {
+	args, err := parseOperands("$split", v, 2, 2)
+	if err != nil {
+		return nil, err
+	}
+	if lit, ok := args[1].(*LiteralExpr); ok &&
+		lit.v.Type() == anyenc.TypeString && len(lit.v.GetStringBytes()) == 0 {
+		return nil, &query.ParseError{
+			Op:     "$split",
+			Reason: "$split delimiter must be a non-empty string",
+		}
+	}
+	return &SplitExpr{Input: args[0], Delim: args[1]}, nil
+}
+
+func (e *SplitExpr) Eval(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, error) {
+	in, err := e.Input.Eval(a, doc)
+	if err != nil {
+		return nil, err
+	}
+	dv, err := e.Delim.Eval(a, doc)
+	if err != nil {
+		return nil, err
+	}
+	if in == nil || in.Type() != anyenc.TypeString ||
+		dv == nil || dv.Type() != anyenc.TypeString {
+		return a.NewNull(), nil
+	}
+	input, sep := in.GetStringBytes(), dv.GetStringBytes()
+	if len(sep) == 0 {
+		return a.NewNull(), nil // expression-produced empty delimiter
+	}
+	out := a.NewArray()
+	for n := 0; ; n++ {
+		idx := bytes.Index(input, sep)
+		if idx < 0 {
+			out.SetArrayItem(n, a.NewStringBytes(input))
+			return out, nil
+		}
+		out.SetArrayItem(n, a.NewStringBytes(input[:idx]))
+		input = input[idx+len(sep):]
+	}
+}
+
+func (e *SplitExpr) String() string { return opString("$split", []Expr{e.Input, e.Delim}) }
+
+// TrimMode selects which side(s) $trim/$ltrim/$rtrim strip.
+type TrimMode uint8
+
+const (
+	TrimBoth TrimMode = iota
+	TrimLeft
+	TrimRight
+)
+
+var trimModeNames = [...]string{"$trim", "$ltrim", "$rtrim"}
+
+func (m TrimMode) String() string { return trimModeNames[m] }
+
+// isTrimWhitespace is Mongo's documented default $trim set — exactly the code
+// points its manual lists (U+0000, U+0009–U+000D, U+0020, U+00A0, U+1680,
+// U+2000–U+200A), not Unicode White_Space: U+2028/2029/202F/205F/3000/FEFF are
+// not stripped.
+func isTrimWhitespace(r rune) bool {
+	switch r {
+	case 0x0000, 0x0009, 0x000A, 0x000B, 0x000C, 0x000D, 0x0020, 0x00A0, 0x1680:
+		return true
+	}
+	return r >= 0x2000 && r <= 0x200A
+}
+
+// TrimExpr evaluates $trim/$ltrim/$rtrim {input, chars?}: strips the leading
+// and/or trailing code points that appear in chars — whole runes, so a
+// multibyte member never shreds mid-character. Absent chars means the default
+// whitespace set (isTrimWhitespace); chars "" is an empty set and trims
+// nothing. A null/missing input, or a non-string input or chars → null (Mongo
+// errors for non-strings; no-error-channel policy). The chars set decodes into
+// a reusable rune scratch: alloc-free in steady state.
+type TrimExpr struct {
+	Mode  TrimMode
+	Input Expr
+	Chars Expr // nil: default whitespace set
+
+	set []rune // chars scratch, reused across Eval calls
+}
+
+func parseTrim(mode TrimMode, v *anyenc.Value) (Expr, error) {
+	op := mode.String()
+	if v.Type() != anyenc.TypeObject {
+		return nil, &query.ParseError{
+			Op:     op,
+			Reason: op + " requires an object with 'input' and optional 'chars'",
+		}
+	}
+	e := &TrimExpr{Mode: mode}
+	if err := parseParamObject(op, v, map[string]*Expr{"input": &e.Input, "chars": &e.Chars}); err != nil {
+		return nil, err
+	}
+	if e.Input == nil {
+		return nil, &query.ParseError{Op: op, Reason: op + " requires 'input'"}
+	}
+	return e, nil
+}
+
+// trims reports whether r is stripped: default whitespace set without chars,
+// the decoded chars set otherwise (linear scan — the set is small).
+func (e *TrimExpr) trims(r rune) bool {
+	if e.Chars == nil {
+		return isTrimWhitespace(r)
+	}
+	for _, c := range e.set {
+		if c == r {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *TrimExpr) Eval(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, error) {
+	in, err := e.Input.Eval(a, doc)
+	if err != nil {
+		return nil, err
+	}
+	if in == nil || in.Type() != anyenc.TypeString {
+		return a.NewNull(), nil
+	}
+	if e.Chars != nil {
+		cv, err := e.Chars.Eval(a, doc)
+		if err != nil {
+			return nil, err
+		}
+		if cv == nil || cv.Type() != anyenc.TypeString {
+			return a.NewNull(), nil
+		}
+		e.set = e.set[:0]
+		for b := cv.GetStringBytes(); len(b) > 0; {
+			r, size := utf8.DecodeRune(b)
+			e.set = append(e.set, r)
+			b = b[size:]
+		}
+	}
+	input := in.GetStringBytes()
+	s := input
+	if e.Mode != TrimRight {
+		for len(s) > 0 {
+			r, size := utf8.DecodeRune(s)
+			if !e.trims(r) {
+				break
+			}
+			s = s[size:]
+		}
+	}
+	if e.Mode != TrimLeft {
+		for len(s) > 0 {
+			r, size := utf8.DecodeLastRune(s)
+			if !e.trims(r) {
+				break
+			}
+			s = s[:len(s)-size]
+		}
+	}
+	if len(s) == len(input) {
+		return in, nil // nothing stripped: input unchanged
+	}
+	return a.NewStringBytes(s), nil
+}
+
+func (e *TrimExpr) String() string {
+	s := "{" + e.Mode.String() + ":{input:" + e.Input.String()
+	if e.Chars != nil {
+		s += ",chars:" + e.Chars.String()
+	}
+	return s + "}}"
 }
 
 // truthy is Mongo's expression boolean coercion: false, 0, null, and missing
@@ -561,36 +838,8 @@ func parseCond(v *anyenc.Value) (Expr, error) {
 func parseCondObject(v *anyenc.Value) (Expr, error) {
 	e := &CondExpr{}
 	slots := map[string]*Expr{"if": &e.If, "then": &e.Then, "else": &e.Else}
-	obj, _ := v.Object()
-	var perr error
-	obj.Visit(func(key []byte, item *anyenc.Value) {
-		if perr != nil {
-			return
-		}
-		slot, ok := slots[string(key)]
-		if !ok {
-			perr = atPath(&query.ParseError{
-				Op:     "$cond",
-				Reason: "unknown $cond parameter: " + string(key),
-			}, string(key))
-			return
-		}
-		if *slot != nil {
-			perr = atPath(&query.ParseError{
-				Op:     "$cond",
-				Reason: "duplicate $cond parameter: " + string(key),
-			}, string(key))
-			return
-		}
-		sub, err := ParseExpr(item)
-		if err != nil {
-			perr = atPath(err, string(key))
-			return
-		}
-		*slot = sub
-	})
-	if perr != nil {
-		return nil, perr
+	if err := parseParamObject("$cond", v, slots); err != nil {
+		return nil, err
 	}
 	if e.If == nil || e.Then == nil || e.Else == nil {
 		return nil, &query.ParseError{
