@@ -318,6 +318,10 @@ func (v *Value) MarshalTo(dst []byte) []byte {
 		// (unlike Binary/Vector); the width is a constant.
 		dst = append(dst, byte(TypeObjectID))
 		return append(dst, v.v...)
+	case TypeDateTime:
+		// Fixed 9 bytes: tag + 8 offset-binary millis bytes (see datetime.go).
+		dst = append(dst, byte(TypeDateTime))
+		return append(dst, v.v...)
 	}
 	return dst
 }
@@ -353,6 +357,8 @@ func (v *Value) estimateSize(limit int) int {
 		return 1 + 4 + len(v.v) // type + length + packed f32 data
 	case TypeObjectID:
 		return 1 + objectIDLen // type + 12 fixed bytes (no length header)
+	case TypeDateTime:
+		return 1 + dateTimeLen // type + 8 fixed bytes (no length header)
 	case TypeArray:
 		size := 2 // type + EOS
 		for _, av := range v.a {
@@ -471,6 +477,16 @@ func (v *Value) FastJson(a *fastjson.Arena) *fastjson.Value {
 	case TypeObjectID:
 		id, _ := v.ObjectID()
 		return extWrapFastJson(a, extTagObjectID, a.NewString(id.Hex()))
+	case TypeDateTime:
+		t, _ := v.DateTime()
+		// RFC3339 parses only years 0..9999; outside that range the string form
+		// would not round-trip, so emit the raw Unix millis (the decoder in
+		// extjson.go accepts {"$date": <number>}).
+		if y := t.Year(); y < 0 || y > 9999 {
+			ms, _ := v.DateTimeMillis()
+			return extWrapFastJson(a, extTagDate, a.NewNumberInt(int(ms)))
+		}
+		return extWrapFastJson(a, extTagDate, a.NewString(t.Format(dateTimeJsonLayout)))
 	case TypeArray:
 		arr := a.NewArray()
 		for i, av := range v.a {
@@ -522,6 +538,9 @@ func (v *Value) GoType() any {
 	case TypeObjectID:
 		id, _ := v.ObjectID()
 		return id.Hex()
+	case TypeDateTime:
+		t, _ := v.DateTime()
+		return t
 	case TypeArray:
 		res := make([]any, len(v.a))
 		for i, av := range v.a {

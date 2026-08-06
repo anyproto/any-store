@@ -101,7 +101,7 @@ func TestSortTopK(t *testing.T) {
 	t.Run("bounded memory", func(t *testing.T) {
 		rows := makeRows(20000)
 		specs := MustParsePipeline(`[{"$sort": {"v": 1}}, {"$limit": 5}]`)
-		root, err := Build(newSliceSource(rows...), specs, Limits{})
+		root, err := Build(newSliceSource(rows...), specs, Limits{}, Env{})
 		require.NoError(t, err)
 		defer root.Close()
 		ctx := newTestCtx()
@@ -125,7 +125,7 @@ func TestSortTopK(t *testing.T) {
 	t.Run("memory limit enforced on full sort", func(t *testing.T) {
 		rows := makeRows(5000)
 		specs := MustParsePipeline(`[{"$sort": {"v": 1}}]`)
-		root, err := Build(newSliceSource(rows...), specs, Limits{})
+		root, err := Build(newSliceSource(rows...), specs, Limits{}, Env{})
 		require.NoError(t, err)
 		defer root.Close()
 		ctx := newTestCtx()

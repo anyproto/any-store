@@ -58,7 +58,7 @@ func runPipeline(t *testing.T, src Stage, pipeline string, limits Limits) []stri
 	t.Helper()
 	specs, err := ParsePipeline(pipeline)
 	require.NoError(t, err)
-	root, err := Build(src, specs, limits)
+	root, err := Build(src, specs, limits, Env{})
 	require.NoError(t, err)
 	defer root.Close()
 	ctx := newTestCtx()
@@ -93,6 +93,98 @@ func TestMatchStage(t *testing.T) {
 	assert.Equal(t, jsonRows(t, `{"id":2,"a":5}`, `{"id":3,"a":10}`), got)
 }
 
+func TestMatchExprStage(t *testing.T) {
+	t.Run("field-to-field compare", func(t *testing.T) {
+		src := newSliceSource(
+			`{"id":1,"allocated":5,"capacity":10}`,
+			`{"id":2,"allocated":15,"capacity":10}`,
+			`{"id":3,"allocated":10,"capacity":10}`,
+		)
+		got := runPipeline(t, src, `[{"$match": {"$expr": {"$gt": ["$allocated", "$capacity"]}}}]`, Limits{})
+		assert.Equal(t, jsonRows(t, `{"id":2,"allocated":15,"capacity":10}`), got)
+	})
+	t.Run("truthiness", func(t *testing.T) {
+		// $cond truthiness: false, 0, null, missing → drop; everything else —
+		// including "", [] and {} — keeps the row.
+		src := newSliceSource(
+			`{"id":1,"f":false}`,
+			`{"id":2,"f":0}`,
+			`{"id":3,"f":null}`,
+			`{"id":4}`,
+			`{"id":5,"f":""}`,
+			`{"id":6,"f":[]}`,
+			`{"id":7,"f":{}}`,
+			`{"id":8,"f":1}`,
+		)
+		got := runPipeline(t, src, `[{"$match": {"$expr": "$f"}}]`, Limits{})
+		assert.Equal(t, jsonRows(t,
+			`{"id":5,"f":""}`,
+			`{"id":6,"f":[]}`,
+			`{"id":7,"f":{}}`,
+			`{"id":8,"f":1}`,
+		), got)
+	})
+	t.Run("mixed filter and expr", func(t *testing.T) {
+		src := newSliceSource(
+			`{"id":1,"cat":"a","x":2,"y":1}`,
+			`{"id":2,"cat":"b","x":2,"y":1}`,
+			`{"id":3,"cat":"a","x":1,"y":2}`,
+		)
+		got := runPipeline(t, src, `[{"$match": {"cat": "a", "$expr": {"$gt": ["$x", "$y"]}}}]`, Limits{})
+		assert.Equal(t, jsonRows(t, `{"id":1,"cat":"a","x":2,"y":1}`), got)
+	})
+	t.Run("multiple exprs are conjoined", func(t *testing.T) {
+		src := newSliceSource(
+			`{"id":1,"x":5}`,
+			`{"id":2,"x":15}`,
+			`{"id":3,"x":25}`,
+		)
+		got := runPipeline(t, src, `[{"$match": {"$and": [
+			{"$expr": {"$gt": ["$x", 10]}},
+			{"$expr": {"$lt": ["$x", 20]}}
+		]}}]`, Limits{})
+		assert.Equal(t, jsonRows(t, `{"id":2,"x":15}`), got)
+	})
+	t.Run("collected array compares whole", func(t *testing.T) {
+		// Implicit traversal yields the collected array; $eq compares it
+		// elementwise as one value.
+		src := newSliceSource(
+			`{"id":1,"a":[{"b":1},{"b":2}]}`,
+			`{"id":2,"a":[{"b":1},{"b":3}]}`,
+			`{"id":3,"a":[]}`,
+		)
+		got := runPipeline(t, src, `[{"$match": {"$expr": {"$eq": ["$a.b", {"$literal": [1, 2]}]}}}]`, Limits{})
+		assert.Equal(t, jsonRows(t, `{"id":1,"a":[{"b":1},{"b":2}]}`), got)
+	})
+	t.Run("after group referencing accumulator outputs", func(t *testing.T) {
+		src := newSliceSource(
+			`{"id":1,"cat":"a","v":10}`,
+			`{"id":2,"cat":"b","v":40}`,
+			`{"id":3,"cat":"a","v":30}`,
+			`{"id":4,"cat":"b","v":40}`,
+		)
+		got := runPipeline(t, src, `[
+			{"$group": {"_id": "$cat", "total": {"$sum": "$v"}, "n": {"$count": {}}}},
+			{"$match": {"$expr": {"$gt": ["$total", {"$multiply": ["$n", 25]}]}}}
+		]`, Limits{})
+		assert.Equal(t, jsonRows(t, `{"id":"b","total":80,"n":2}`), got)
+	})
+	t.Run("after sort with computing expr", func(t *testing.T) {
+		// The in-pipeline sort emits parser-owned rows and never resets the
+		// arena; the residual match's resetArena keeps eval temporaries O(row).
+		src := newSliceSource(
+			`{"id":1,"x":3,"y":1}`,
+			`{"id":2,"x":1,"y":1}`,
+			`{"id":3,"x":9,"y":1}`,
+		)
+		got := runPipeline(t, src, `[
+			{"$sort": {"x": -1}},
+			{"$match": {"$expr": {"$gt": [{"$add": ["$x", "$y"]}, 3]}}}
+		]`, Limits{})
+		assert.Equal(t, jsonRows(t, `{"id":3,"x":9,"y":1}`, `{"id":1,"x":3,"y":1}`), got)
+	})
+}
+
 func TestProjectStage(t *testing.T) {
 	t.Run("include, rename, literal, missing omitted", func(t *testing.T) {
 		src := newSliceSource(`{"id":1,"a":{"b":7},"c":"x"}`)
@@ -103,6 +195,24 @@ func TestProjectStage(t *testing.T) {
 		src := newSliceSource(`{"id":1,"x":1,"y":2}`)
 		got := runPipeline(t, src, `[{"$project": {"pt": {"a": "$x", "b": "$y"}}}]`, Limits{})
 		assert.Equal(t, jsonRows(t, `{"pt":{"a":1,"b":2}}`), got)
+	})
+	t.Run("compute operators", func(t *testing.T) {
+		src := newSliceSource(`{"id":1,"a":2,"b":3,"s":"x"}`, `{"id":2,"b":3,"s":"y"}`)
+		got := runPipeline(t, src, `[{"$project": {
+			"n": {"$add": ["$a", {"$multiply": ["$b", 2]}, 1]},
+			"s2": {"$concat": ["$s", "!"]}}}]`, Limits{})
+		// Missing "a" nulls the whole $add, Mongo null-propagation.
+		assert.Equal(t, jsonRows(t, `{"n":9,"s2":"x!"}`, `{"n":null,"s2":"y!"}`), got)
+	})
+	t.Run("implicit array traversal", func(t *testing.T) {
+		src := newSliceSource(
+			`{"id":1,"a":[{"b":1},{"b":2},{"c":3}]}`,
+			`{"id":2,"a":[]}`,
+			`{"id":3,"a":5}`,
+		)
+		got := runPipeline(t, src, `[{"$project": {"p": "$a.b"}}]`, Limits{})
+		// Collected array for docs, [] for empty/none, missing for a scalar.
+		assert.Equal(t, jsonRows(t, `{"p":[1,2]}`, `{"p":[]}`, `{}`), got)
 	})
 }
 
@@ -183,7 +293,6 @@ func TestSkipLimitCountStages(t *testing.T) {
 	})
 }
 
-
 func TestCountStageCancellation(t *testing.T) {
 	// An endless upstream must be interrupted by context cancellation.
 	cctx, cancel := context.WithCancel(context.Background())
@@ -191,7 +300,7 @@ func TestCountStageCancellation(t *testing.T) {
 	ctx := newTestCtx()
 	ctx.Context = cctx
 
-	root, err := Build(&endlessSource{}, MustParsePipeline(`[{"$count": "n"}]`), Limits{})
+	root, err := Build(&endlessSource{}, MustParsePipeline(`[{"$count": "n"}]`), Limits{}, Env{})
 	require.NoError(t, err)
 	defer root.Close()
 	_, err = root.Next(ctx)
@@ -247,7 +356,7 @@ func TestStreamingStagesAllocFree(t *testing.T) {
 		{"$addFields": {"n2": "$o.n"}},
 		{"$unwind": "$t"},
 		{"$project": {"t": 1, "n2": 1, "pt": {"v": "$a"}}}
-	]`), Limits{})
+	]`), Limits{}, Env{})
 	require.NoError(t, err)
 	defer root.Close()
 	ctx := newTestCtx()
@@ -268,4 +377,60 @@ func TestStreamingStagesAllocFree(t *testing.T) {
 		}
 	})
 	assert.Zero(t, res.AllocsPerOp(), "streaming stages must be alloc-free in steady state")
+}
+
+// exprMatchFixture is a realistic doc stream for $expr $match measurement:
+// one row matches the field-to-field predicate, one is discarded.
+func exprMatchFixture() *cyclingSource {
+	return &cyclingSource{rows: [][]byte{
+		anyenc.MustParseJson(`{"id":1,"name":"pool-a","allocated":150,"capacity":100,"tags":["x","y"],"meta":{"region":"eu","tier":2}}`).MarshalTo(nil),
+		anyenc.MustParseJson(`{"id":2,"name":"pool-b","allocated":40,"capacity":100,"tags":["z"],"meta":{"region":"us","tier":1}}`).MarshalTo(nil),
+	}}
+}
+
+func TestMatchExprAllocFree(t *testing.T) {
+	if testing.Short() {
+		t.Skip("benchmark-backed test")
+	}
+	root, err := Build(exprMatchFixture(), MustParsePipeline(`[
+		{"$match": {"$expr": {"$gt": ["$allocated", "$capacity"]}}}
+	]`), Limits{}, Env{})
+	require.NoError(t, err)
+	defer root.Close()
+	ctx := newTestCtx()
+
+	for i := 0; i < 1000; i++ {
+		if _, err := root.Next(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			v, err := root.Next(ctx)
+			if err != nil || v == nil {
+				b.Fatal(v, err)
+			}
+		}
+	})
+	assert.Zero(t, res.AllocsPerOp(), "$expr $match must be alloc-free in steady state")
+}
+
+func BenchmarkMatchExprStage(b *testing.B) {
+	root, err := Build(exprMatchFixture(), MustParsePipeline(`[
+		{"$match": {"$expr": {"$gt": ["$allocated", "$capacity"]}}}
+	]`), Limits{}, Env{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer root.Close()
+	ctx := newTestCtx()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		v, err := root.Next(ctx)
+		if err != nil || v == nil {
+			b.Fatal(v, err)
+		}
+	}
 }

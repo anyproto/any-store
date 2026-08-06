@@ -31,6 +31,12 @@ const (
 	// 13 bytes total. Unlike vectors, ObjectIDs are orderable and appear in
 	// index keys, so an inverted form (iTypeObjectID) exists for reverse indexes.
 	TypeObjectID = Type(11)
+	// TypeDateTime stores a Unix-millisecond timestamp as a fixed-width,
+	// memcmp-orderable value: the tag followed by 8 bytes of offset-binary
+	// big-endian int64 millis (sign bit flipped, so pre-1970 sorts first), 9
+	// bytes total. Orderable, appears in index keys; iTypeDateTime is the
+	// inverted form for reverse indexes.
+	TypeDateTime = Type(12)
 
 	iTypeNull               = ^Type(1)
 	iTypeNumber             = ^Type(2)
@@ -49,6 +55,7 @@ const (
 	// every vector-valued row from a reverse-index scan.
 	iTypeVectorF32 = ^Type(10)
 	iTypeObjectID  = ^Type(11)
+	iTypeDateTime  = ^Type(12)
 )
 
 const (
@@ -79,6 +86,8 @@ func (t Type) String() string {
 		return "vectorF32"
 	case TypeObjectID:
 		return "objectID"
+	case TypeDateTime:
+		return "dateTime"
 	default:
 		return fmt.Sprintf("unknown type: %d", t)
 	}

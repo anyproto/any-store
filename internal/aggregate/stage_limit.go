@@ -54,6 +54,7 @@ func (s *LimitStage) String() string { return LimitSpec{N: s.N}.String() }
 type CountStage struct {
 	Src   Stage
 	Field string
+	n     int // field, not a local: the count survives a facet-feed pause
 	done  bool
 }
 
@@ -61,7 +62,6 @@ func (s *CountStage) Next(ctx *Ctx) (*anyenc.Value, error) {
 	if s.done {
 		return nil, nil
 	}
-	var n int
 	for {
 		v, err := s.Src.Next(ctx)
 		if err != nil {
@@ -70,8 +70,8 @@ func (s *CountStage) Next(ctx *Ctx) (*anyenc.Value, error) {
 		if v == nil {
 			break
 		}
-		n++
-		if n%ctxCheckEvery == 0 {
+		s.n++
+		if s.n%ctxCheckEvery == 0 {
 			if cerr := ctx.Context.Err(); cerr != nil {
 				return nil, cerr
 			}
@@ -82,7 +82,7 @@ func (s *CountStage) Next(ctx *Ctx) (*anyenc.Value, error) {
 	// becomes the row owner for its single emission.
 	ctx.RowArena.Reset()
 	out := ctx.RowArena.NewObject()
-	out.Set(s.Field, ctx.RowArena.NewNumberInt(n))
+	out.Set(s.Field, ctx.RowArena.NewNumberInt(s.n))
 	return out, nil
 }
 

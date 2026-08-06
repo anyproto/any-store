@@ -55,6 +55,10 @@ func Equal(a, b *anyenc.Value) bool {
 		ai, _ := a.ObjectID()
 		bi, _ := b.ObjectID()
 		return ai == bi
+	case anyenc.TypeDateTime:
+		am, _ := a.DateTimeMillis()
+		bm, _ := b.DateTimeMillis()
+		return am == bm
 	}
 	return true
 }

@@ -32,6 +32,9 @@ func Copy(a *anyenc.Arena, v *anyenc.Value) *anyenc.Value {
 	case anyenc.TypeObjectID:
 		id, _ := v.ObjectID()
 		return a.NewObjectID(id)
+	case anyenc.TypeDateTime:
+		ms, _ := v.DateTimeMillis()
+		return a.NewDateTimeMillis(ms)
 	case anyenc.TypeArray:
 		arr := a.NewArray()
 		for i, av := range v.GetArray() {

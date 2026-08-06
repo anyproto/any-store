@@ -16,7 +16,7 @@ Schema-less documents, rich indexes, full-text and vector search, ACID transacti
 * **Cost-based planner** — index selection driven by btree page statistics and per-prefix selectivity sketches; `Explain()` shows the chosen plan and its candidates.
 * **Full-text search** — btree-resident inverted index with BM25 ranking via `$text`. See [docs/full-text-search.md](docs/full-text-search.md).
 * **Vector search** — btree-resident ANN indexes (IVF-PQ / IVF-SQ, HNSW, brute-force) via `$knn`. See [docs/vector-search.md](docs/vector-search.md) and [docs/vector-engine.md](docs/vector-engine.md).
-* **Aggregation** — MongoDB-style pipelines (`$match`, `$group`, `$sort`, `$unwind`, ...) with planner pushdown. See [docs/aggregation.md](docs/aggregation.md).
+* **Aggregation** — MongoDB-style pipelines: shaping (`$match`, `$group`, `$sort`, `$unwind`, `$facet`, ...), computed expressions (arithmetic, conditionals, comparisons, date math), field-to-field `$expr` predicates, primary-key `$lookup` joins, and materialization via `$merge`/`$out` — with planner pushdown. See [docs/aggregation.md](docs/aggregation.md).
 * **ACID transactions** — snapshot-isolated read transactions, single-writer write transactions.
 * **Multi-process** — SQLite-like contract: any number of OS processes may open, read and write the same database file at any time (WAL + shared-memory index, busy handling, cross-process DDL reconciliation).
 * **Durability** — idle auto-flush, explicit checkpointing, crash-safe WAL recovery, sentinel-triggered quick check after unclean shutdown.
@@ -155,7 +155,7 @@ res, _ := orders.Aggregate(`[
 ]`).Iter(ctx)
 ```
 
-`$match`/`$sort`/`$limit` prefixes are pushed down into the index planner; the rest streams through the pipeline.
+`$match`/`$sort`/`$limit` prefixes are pushed down into the index planner; the rest streams through the pipeline. Expressions compute derived values in `$project`/`$addFields`/`$group` (arithmetic, `$cond`/`$switch`, comparisons, `$dateDiff`-family date math over the first-class dateTime type); `$expr` brings field-to-field predicates into `$match`; `$lookup` resolves object-id relations as primary-key point lookups; `$facet` runs N sub-pipelines over one scan; `$merge`/`$out` materialize results into a collection where they are indexable like any other data. Operator reference and Mongo divergences: [docs/aggregation.md](docs/aggregation.md).
 
 ## Multi-process
 

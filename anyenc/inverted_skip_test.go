@@ -20,6 +20,8 @@ func invertedSkipCases(t *testing.T) []*Value {
 	a := &Arena{}
 	return []*Value{
 		a.NewObjectID(NewObjectID()),
+		a.NewDateTimeMillis(1754413200123),
+		a.NewDateTimeMillis(-62135596800000),
 		MustParseJson(`123`),
 		MustParseJson(`-456.75`),
 		MustParseJson(`0`),
