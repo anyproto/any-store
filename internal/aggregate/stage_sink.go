@@ -76,8 +76,9 @@ func (s MergeSpec) String() string {
 
 func (s OutSpec) String() string { return fmt.Sprintf("$out %q", s.Coll) }
 
-// sinkName returns the stage name of a sink spec, or "" for any other spec.
-func sinkName(s StageSpec) string {
+// SinkName returns the stage name of a sink spec ("$merge"/"$out"), or ""
+// for any other spec.
+func SinkName(s StageSpec) string {
 	switch s.(type) {
 	case MergeSpec:
 		return "$merge"
@@ -95,7 +96,7 @@ func CutSink(p Pipeline) (StageSpec, Pipeline) {
 		return nil, p
 	}
 	last := p[len(p)-1]
-	if sinkName(last) != "" {
+	if SinkName(last) != "" {
 		return last, p[:len(p)-1]
 	}
 	return nil, p

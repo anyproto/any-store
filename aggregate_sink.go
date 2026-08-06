@@ -39,6 +39,11 @@ var (
 	// coherent semantics for replacing the pipeline's own source.
 	ErrAggregateIntoSource = errors.New("any-store: aggregate: $merge/$out cannot target the aggregated collection")
 
+	// ErrAggregateReadOnly is returned by Iter/Count when a query marked
+	// ReadOnly carries a $merge/$out sink; the wrap names the stage.
+	// Nothing is read, created or written.
+	ErrAggregateReadOnly = errors.New("any-store: aggregate: read-only query cannot execute a write sink")
+
 	// ErrMergeNoId is returned when a $merge result document lacks the "id"
 	// field: without the key there is nothing to match on.
 	ErrMergeNoId = errors.New(`any-store: aggregate: $merge requires every result document to carry an "id" field`)

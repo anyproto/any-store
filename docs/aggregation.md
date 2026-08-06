@@ -327,6 +327,14 @@ semantics): `Iter` returns an empty cursor after the write already happened —
 documents written (inserted, replaced or merged; `keepExisting`/`discard`
 skips and byte-identical replaces are not counted).
 
+For read-only endpoints executing caller-supplied pipelines,
+`AggQuery.ReadOnly()` makes `Iter`/`Count` fail fast with
+`ErrAggregateReadOnly` (naming the stage) when the pipeline ends in
+`$merge`/`$out` — before any read work, target creation or write
+transaction; `Explain` stays available. A read transaction passed via
+context also blocks the sinks (`ErrTxIsReadOnly`), but only at write time —
+`ReadOnly()` is the cheap pre-flight.
+
 **`$out`** replaces the target's contents: every existing document is deleted
 and every result inserted through the regular write path, so declared range,
 full-text and vector indexes survive and are rebuilt entry-by-entry within

@@ -317,7 +317,7 @@ func ParsePipeline(pipeline any) (Pipeline, error) {
 		// $merge / $out write their side effect when the pipeline runs: any
 		// stage after them would silently see nothing (Mongo also requires
 		// them last).
-		if name := sinkName(spec); name != "" && i != len(arr)-1 {
+		if name := SinkName(spec); name != "" && i != len(arr)-1 {
 			err = atPath(&query.ParseError{
 				Op:     name,
 				Reason: name + " must be the last pipeline stage",
@@ -985,7 +985,7 @@ func parseFacet(v *anyenc.Value) (StageSpec, error) {
 				perr = atPath(atPath(&query.ParseError{Op: "$facet", Reason: "$facet cannot be nested"}, strconv.Itoa(i)), name)
 				return
 			}
-			if sn := sinkName(st); sn != "" {
+			if sn := SinkName(st); sn != "" {
 				perr = atPath(atPath(&query.ParseError{Op: sn, Reason: sn + " is not allowed inside $facet"}, strconv.Itoa(i)), name)
 				return
 			}

@@ -395,6 +395,59 @@ func TestAggregateSinkStagesExported(t *testing.T) {
 	_ = aggregate.MergeSpec{} // sink specs are part of the pipeline vocabulary
 }
 
+func TestCollection_AggregateReadOnly(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "src")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1,"v":10}`),
+		anyenc.MustParseJson(`{"id":2,"v":20}`),
+	))
+
+	t.Run("merge sink rejected, nothing created", func(t *testing.T) {
+		q := coll.Aggregate(`[
+			{"$group": {"_id": null, "s": {"$sum": "$v"}}},
+			{"$merge": "ro_merge"}
+		]`).ReadOnly()
+		_, err := q.Iter(ctx)
+		require.ErrorIs(t, err, ErrAggregateReadOnly)
+		assert.ErrorContains(t, err, "$merge")
+		_, err = q.Count(ctx)
+		assert.ErrorIs(t, err, ErrAggregateReadOnly)
+		// Fresh handle: the fail-fast must precede target creation.
+		_, err = fx.OpenCollection(ctx, "ro_merge")
+		assert.ErrorIs(t, err, ErrCollectionNotFound)
+	})
+
+	t.Run("out sink rejected", func(t *testing.T) {
+		_, err := coll.Aggregate(`[{"$out": "ro_out"}]`).ReadOnly().Iter(ctx)
+		require.ErrorIs(t, err, ErrAggregateReadOnly)
+		assert.ErrorContains(t, err, "$out")
+		_, err = fx.OpenCollection(ctx, "ro_out")
+		assert.ErrorIs(t, err, ErrCollectionNotFound)
+	})
+
+	t.Run("plain pipeline unaffected", func(t *testing.T) {
+		n, err := coll.Aggregate(`[{"$match": {"v": {"$gte": 10}}}]`).ReadOnly().Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 2, n)
+	})
+
+	t.Run("explain still allowed", func(t *testing.T) {
+		ex, err := coll.Aggregate(`[{"$out": "ro_explain"}]`).ReadOnly().Explain(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, ex.Plan, "$out")
+		_, err = fx.OpenCollection(ctx, "ro_explain")
+		assert.ErrorIs(t, err, ErrCollectionNotFound)
+	})
+
+	t.Run("without ReadOnly the sink still runs", func(t *testing.T) {
+		n, err := coll.Aggregate(`[{"$out": "rw_out"}]`).Count(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, 2, n)
+	})
+}
+
 func benchSinkFixture(b *testing.B, targetDocs int) (*fixture, Collection) {
 	b.Helper()
 	fx := newFixture(b)

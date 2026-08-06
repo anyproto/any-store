@@ -45,6 +45,15 @@ type AggQuery interface {
 	// prefix's query plan.
 	IndexHint(hints ...IndexHint) AggQuery
 
+	// ReadOnly marks the query read-only: Iter/Count on a pipeline
+	// containing $merge/$out then fail fast with ErrAggregateReadOnly —
+	// before any read work, target creation or write transaction. Explain
+	// stays available (it never writes). This is the cheap pre-flight for
+	// read-only gateway endpoints; a read transaction passed via context
+	// also blocks the sinks (ErrTxIsReadOnly), but only at write time,
+	// after the whole read phase ran.
+	ReadOnly() AggQuery
+
 	// Iter executes the pipeline and returns an Iterator over result
 	// documents. Score and Distance report 0 on aggregation iterators; for a
 	// full-text or vector $match prefix the values remain available as the
@@ -93,6 +102,7 @@ type aggQuery struct {
 	pipeline aggregate.Pipeline
 	limits   aggregate.Limits
 	hints    []IndexHint
+	readOnly bool
 	err      error
 }
 
@@ -114,6 +124,23 @@ func (q *aggQuery) MemoryLimit(bytes int) AggQuery {
 func (q *aggQuery) IndexHint(hints ...IndexHint) AggQuery {
 	q.hints = hints
 	return q
+}
+
+func (q *aggQuery) ReadOnly() AggQuery {
+	q.readOnly = true
+	return q
+}
+
+// checkReadOnly fails a ReadOnly query whose pipeline ends in a $merge/$out
+// sink — before any read work, target creation or write tx.
+func (q *aggQuery) checkReadOnly() error {
+	if !q.readOnly {
+		return nil
+	}
+	if sink, _ := aggregate.CutSink(q.pipeline); sink != nil {
+		return fmt.Errorf("%w: pipeline contains %s", ErrAggregateReadOnly, aggregate.SinkName(sink))
+	}
+	return nil
 }
 
 // prefixQuery compiles the pushable pipeline prefix into a regular collection
@@ -210,6 +237,9 @@ var (
 func (q *aggQuery) Iter(ctx context.Context) (Iterator, error) {
 	if q.err != nil {
 		return nil, q.err
+	}
+	if err := q.checkReadOnly(); err != nil {
+		return nil, err
 	}
 	// Blocking stages poll the context only every few thousand rows; an
 	// already-cancelled context should not start the pipeline at all.
@@ -321,6 +351,9 @@ func (c *collection) lookupFunc(btx *btree.ReadTx) aggregate.LookupFunc {
 func (q *aggQuery) Count(ctx context.Context) (count int, err error) {
 	if q.err != nil {
 		return 0, q.err
+	}
+	if err = q.checkReadOnly(); err != nil {
+		return 0, err
 	}
 	if err = ctx.Err(); err != nil {
 		return 0, err
