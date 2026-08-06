@@ -226,9 +226,12 @@ resolves the value(s) as primary keys of the **same collection**, and sets
 to the array of matched full documents — always an array (Mongo semantics),
 empty when nothing matches.
 
-- `from` is optional; when present it must name the aggregated collection
-  itself — anything else fails `Iter`/`Count`/`Explain` with an error naming
-  both collections. `foreignField` is optional and must be `"id"` (the
+- Omitting `from` is the canonical form — the stage is self-join-only, so
+  the source collection is implied. When present, `from` must equal the
+  aggregated collection's name; anything else fails `Iter`/`Count`/`Explain`
+  with an error naming both collections. Callers that hold only a logical
+  name for the collection (not the physical one) should omit `from`.
+  `foreignField` is optional and must be `"id"` (the
   primary key); any other value is a parse error. The pipeline/`let` form is
   a parse error too.
 - A missing or **null** local value yields `[]`. Divergence from Mongo: the
