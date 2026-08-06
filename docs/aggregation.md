@@ -65,7 +65,19 @@ never hand-copy the lists.
 Inside `$project`/`$addFields` values, `$group` keys and accumulator arguments:
 
 - **Field references** — `"$a.b.c"` (dot paths into the document; FTS/$knn
-  virtual fields work too: `"$_score"`, `"$_distance"`).
+  virtual fields work too: `"$_score"`, `"$_distance"`). Paths traverse
+  arrays implicitly (Mongo field-path semantics): when a non-numeric segment
+  meets an array, the remaining path is mapped over the array's **object**
+  elements and the non-missing results are collected, in order, into an
+  array — scalar/array elements and elements lacking the field are skipped
+  (no null padding), and the result is an array even when nothing collects
+  (`[]`, never missing). Collected values that are themselves arrays stay
+  nested (no flattening), and traversal repeats at each array level along
+  the path (`"$a.b.c"` through two array levels yields nested arrays). A
+  terminal segment returns the value as is: `"$a"` naming an array is the
+  whole array. Engine extension over Mongo: a **numeric** segment indexes an
+  array (`"$a.0"` is `a`'s first element; out of range → missing) instead of
+  collecting object fields named `"0"`.
 - **Literals** — any non-`$` value; `{"$literal": "$kept-verbatim"}` escapes a
   literal that starts with `$`.
 - **Document/array expressions** — `{"x": "$a", "y": 1}` and `["$a", 1]`
@@ -243,10 +255,10 @@ empty when nothing matches.
   element of a type no stored key has (or a dangling id) simply doesn't
   match — no error.
 - A document may match itself (single hop, no recursion).
-- Expression paths do not traverse into the `as` array: `"$linked.id"` yields
-  missing, unlike Mongo's array-collecting path semantics (pre-existing
-  expression behavior). `$unwind` the `as` field before referencing subfields
-  of the matched documents.
+- Expression paths traverse into the `as` array (implicit array traversal,
+  section 2): `"$linked.name"` collects the matched documents' `name` values
+  into an array without an `$unwind`. `$unwind`ing `as` first still works
+  when one row per match is wanted.
 - Point lookups run inside the **same snapshot** the pipeline streams from,
   at any pipeline position — after `$group`, `localField` can name a group
   key, resolving keys back to their documents:

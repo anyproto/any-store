@@ -868,6 +868,57 @@ func TestCompareExprEval(t *testing.T) {
 	})
 }
 
+func TestFieldRefTraversalEval(t *testing.T) {
+	doc := anyenc.MustParseJson(`{
+		"a": [{"b": 1}, {"b": 2}, {"c": 3}],
+		"e": [],
+		"mix": [1, {"b": 5}, [{"b": 9}], "x", null],
+		"nested": [{"b": [1, 2]}, {"b": 3}],
+		"deep": [{"b": [{"c": 1}, {"c": 2}]}, {"b": [{"c": 3}]}, {"x": 0}],
+		"o": {"b": [{"c": 7}]},
+		"sc": 5
+	}`)
+	for _, tc := range []struct {
+		name, ref string
+		want      string // "" = missing (nil)
+	}{
+		{"collects over array of docs", `"$a.b"`, `[1,2]`},
+		{"elements lacking the field are skipped", `"$a.c"`, `[3]`},
+		{"no element has the field: [] not missing", `"$a.z"`, `[]`},
+		{"empty array: [] not missing", `"$e.b"`, `[]`},
+		{"scalars and nested arrays among docs are skipped", `"$mix.b"`, `[5]`},
+		{"array values stay nested", `"$nested.b"`, `[[1,2],3]`},
+		{"traversal at each array level", `"$deep.b.c"`, `[[1,2],[3]]`},
+		{"array met mid-path after object", `"$o.b.c"`, `[7]`},
+		{"terminal segment keeps the whole array", `"$a"`, `[{"b":1},{"b":2},{"c":3}]`},
+		{"numeric segment indexes", `"$a.0"`, `{"b":1}`},
+		{"numeric segment then field", `"$a.0.b"`, `1`},
+		{"numeric segment out of range", `"$a.5"`, ""},
+		{"missing root", `"$zzz.b"`, ""},
+		{"scalar mid-path", `"$sc.b"`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := evalExprOn(t, tc.ref, doc)
+			if tc.want == "" {
+				assert.Nil(t, v)
+				return
+			}
+			require.NotNil(t, v)
+			assert.Equal(t, anyenc.MustParseJson(tc.want).String(), v.String())
+		})
+	}
+	t.Run("String is the original spelling", func(t *testing.T) {
+		e, err := ParseExpr(anyenc.MustParseJson(`"$a.b"`))
+		require.NoError(t, err)
+		assert.Equal(t, "$a.b", e.String())
+	})
+	t.Run("collected array feeds comparison", func(t *testing.T) {
+		v := evalExprOn(t, `{"$eq": ["$a.b", {"$literal": [1, 2]}]}`, doc)
+		require.NotNil(t, v)
+		assert.Equal(t, anyenc.TypeTrue, v.Type())
+	})
+}
+
 // TestExprEvalAllocFree pins the hot-path contract: operator evaluation
 // allocates nothing per document once the arena cache is warm.
 func TestExprEvalAllocFree(t *testing.T) {
@@ -875,9 +926,11 @@ func TestExprEvalAllocFree(t *testing.T) {
 		t.Skip("benchmark-backed test")
 	}
 	doc := anyenc.MustParseJson(`{"a": 3, "b": 4, "s1": "héllo → w", "s2": "0123456789",
+		"arr": [{"v": 1}, {"v": 2}, {"v": 3}, {"x": 0}, {"v": 5}],
 		"d": {"$date": "2026-03-28T12:00:00Z"}, "d2": {"$date": "2026-08-05T06:00:00Z"}}`)
 	for _, tc := range []struct{ name, json string }{
 		{"arith", `{"$add": ["$a", {"$multiply": ["$b", 2]}, 1]}`},
+		{"field traversal", `"$arr.v"`},
 		{"concat", `{"$concat": ["$s1", "$s2"]}`},
 		{"replaceOne", `{"$replaceOne": {"input": "$s1", "find": "l", "replacement": "L"}}`},
 		{"replaceOne no match", `{"$replaceOne": {"input": "$s1", "find": "zz", "replacement": "L"}}`},
@@ -939,6 +992,33 @@ func BenchmarkArithExprEval(b *testing.B) {
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// BenchmarkFieldRefEval compares a plain field ref against implicit array
+// traversal over a 5-element array of documents.
+func BenchmarkFieldRefEval(b *testing.B) {
+	doc := anyenc.MustParseJson(`{"p": 42,
+		"arr": [{"v": 1}, {"v": 2}, {"v": 3}, {"x": 0}, {"v": 5}]}`)
+	for _, tc := range []struct{ name, ref string }{
+		{"plain", `"$p"`},
+		{"traversal5", `"$arr.v"`},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			e, err := ParseExpr(anyenc.MustParseJson(tc.ref))
+			if err != nil {
+				b.Fatal(err)
+			}
+			a := &anyenc.Arena{}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				a.Reset()
+				if v, err := e.Eval(a, doc); err != nil || v == nil {
+					b.Fatal(v, err)
+				}
+			}
+		})
 	}
 }
 

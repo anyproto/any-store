@@ -145,6 +145,17 @@ func TestMatchExprStage(t *testing.T) {
 		]}}]`, Limits{})
 		assert.Equal(t, jsonRows(t, `{"id":2,"x":15}`), got)
 	})
+	t.Run("collected array compares whole", func(t *testing.T) {
+		// Implicit traversal yields the collected array; $eq compares it
+		// elementwise as one value.
+		src := newSliceSource(
+			`{"id":1,"a":[{"b":1},{"b":2}]}`,
+			`{"id":2,"a":[{"b":1},{"b":3}]}`,
+			`{"id":3,"a":[]}`,
+		)
+		got := runPipeline(t, src, `[{"$match": {"$expr": {"$eq": ["$a.b", {"$literal": [1, 2]}]}}}]`, Limits{})
+		assert.Equal(t, jsonRows(t, `{"id":1,"a":[{"b":1},{"b":2}]}`), got)
+	})
 	t.Run("after group referencing accumulator outputs", func(t *testing.T) {
 		src := newSliceSource(
 			`{"id":1,"cat":"a","v":10}`,
@@ -192,6 +203,16 @@ func TestProjectStage(t *testing.T) {
 			"s2": {"$concat": ["$s", "!"]}}}]`, Limits{})
 		// Missing "a" nulls the whole $add, Mongo null-propagation.
 		assert.Equal(t, jsonRows(t, `{"n":9,"s2":"x!"}`, `{"n":null,"s2":"y!"}`), got)
+	})
+	t.Run("implicit array traversal", func(t *testing.T) {
+		src := newSliceSource(
+			`{"id":1,"a":[{"b":1},{"b":2},{"c":3}]}`,
+			`{"id":2,"a":[]}`,
+			`{"id":3,"a":5}`,
+		)
+		got := runPipeline(t, src, `[{"$project": {"p": "$a.b"}}]`, Limits{})
+		// Collected array for docs, [] for empty/none, missing for a scalar.
+		assert.Equal(t, jsonRows(t, `{"p":[1,2]}`, `{"p":[]}`, `{}`), got)
 	})
 }
 

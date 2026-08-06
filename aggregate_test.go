@@ -380,6 +380,28 @@ func TestCollection_AggregateLookup(t *testing.T) {
 		), got)
 	})
 
+	t.Run("project traverses the as array without unwind", func(t *testing.T) {
+		// Implicit array traversal collects the matched docs' fields; the
+		// $unwind form remains available for one row per match.
+		got := aggRows(t, coll, coll.Aggregate(`[
+			{"$match": {"id": "a"}},
+			{"$lookup": {"localField": "refs", "as": "linked"}},
+			{"$project": {"id": 1, "cats": "$linked.cat"}}
+		]`))
+		assert.Equal(t, expectJson(t, `{"id":"a","cats":["g1","g2"]}`), got)
+
+		unwound := aggRows(t, coll, coll.Aggregate(`[
+			{"$match": {"id": "a"}},
+			{"$lookup": {"localField": "refs", "as": "linked"}},
+			{"$unwind": "$linked"},
+			{"$project": {"id": 1, "cat": "$linked.cat"}}
+		]`))
+		assert.Equal(t, expectJson(t,
+			`{"id":"a","cat":"g1"}`,
+			`{"id":"a","cat":"g2"}`,
+		), unwound)
+	})
+
 	t.Run("missing and null local", func(t *testing.T) {
 		got := aggRows(t, coll, coll.Aggregate(`[
 			{"$match": {"id": {"$in": ["a", 7]}}},

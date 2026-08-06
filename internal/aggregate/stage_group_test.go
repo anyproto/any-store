@@ -54,6 +54,23 @@ func TestGroupStage(t *testing.T) {
 		), got)
 	})
 
+	t.Run("traversed path key", func(t *testing.T) {
+		// Implicit array traversal: the collected array is the group key
+		// (compared marshaled, so equal collections group together).
+		src := newSliceSource(
+			`{"id":1,"a":[{"b":1},{"b":2}]}`,
+			`{"id":2,"a":[{"b":1},{"x":0},{"b":2}]}`,
+			`{"id":3,"a":[{"b":9}]}`,
+			`{"id":4,"a":[]}`,
+		)
+		got := runGroup(t, src, `[{"$group": {"_id": "$a.b", "n": {"$count": {}}}}]`, Limits{})
+		assert.Equal(t, sortedJsonRows(t,
+			`{"id":[1,2],"n":2}`,
+			`{"id":[9],"n":1}`,
+			`{"id":[],"n":1}`,
+		), got)
+	})
+
 	t.Run("constant key single group", func(t *testing.T) {
 		src := newSliceSource(`{"id":1,"v":1}`, `{"id":2,"v":2}`)
 		got := runGroup(t, src, `[{"$group": {"_id": null, "s": {"$sum": "$v"}}}]`, Limits{})
