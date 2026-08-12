@@ -136,6 +136,30 @@ func TestParseError(t *testing.T) {
 			wantReason: "$regex must be a string",
 		},
 		{
+			name: "$options without a sibling $regex",
+			json: `{"a":{"$options":"i"}}`,
+			wantPath: "a.$options", wantOp: "$options",
+			wantReason: "$options requires a $regex",
+		},
+		{
+			name: "$options operand not a string",
+			json: `{"a":{"$regex":"x","$options":1}}`,
+			wantPath: "a.$options", wantOp: "$options",
+			wantReason: "$options must be a string",
+		},
+		{
+			name: "$options unsupported flag",
+			json: `{"a":{"$regex":"x","$options":"ix"}}`,
+			wantPath: "a.$options", wantOp: "$options",
+			wantReason: "unsupported $options flag 'x'",
+		},
+		{
+			name: "$options at top level",
+			json: `{"$options":"i"}`,
+			wantPath: "$options", wantOp: "$options",
+			wantReason: "operator $options is not valid at the top level",
+		},
+		{
 			name: "$size operand not an integer",
 			json: `{"a":{"$size":"x"}}`,
 			wantPath: "a.$size", wantOp: "$size",
@@ -399,8 +423,8 @@ func TestOperators(t *testing.T) {
 	ops := Operators()
 	assert.Equal(t, []string{
 		"$all", "$and", "$eq", "$exists", "$gt", "$gte", "$in", "$knn",
-		"$lt", "$lte", "$ne", "$nin", "$nor", "$not", "$or", "$regex",
-		"$size", "$text", "$type",
+		"$lt", "$lte", "$ne", "$nin", "$nor", "$not", "$options", "$or",
+		"$regex", "$size", "$text", "$type",
 	}, ops)
 
 	// Every advertised operator is recognized by the parser, each as a

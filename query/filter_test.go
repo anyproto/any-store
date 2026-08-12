@@ -422,6 +422,25 @@ func TestRegexp(t *testing.T) {
 		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": "A"}`), nil))
 		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": "a"}`), nil))
 	})
+	t.Run("ok - $options: i", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$regex": "newsletter", "$options": "i"}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": "Newsletter weekly"}`), nil))
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": "my newsletter digest"}`), nil))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": "other"}`), nil))
+	})
+	t.Run("ok - $options before $regex", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$options": "i", "$regex": "^a"}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": "Abc"}`), nil))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": "bA"}`), nil))
+	})
+	t.Run("ok - empty $options is a plain $regex", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$regex": "a", "$options": ""}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": "a"}`), nil))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": "A"}`), nil))
+	})
 	t.Run("ok - array", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^(?i)a"}}`)
 		require.NoError(t, err)
@@ -448,6 +467,14 @@ func TestRegexp(t *testing.T) {
 	})
 	t.Run("index: ^(?i)prefix - no prefix", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^(?i)prefix"}}`)
+		require.NoError(t, err)
+		bounds := f.IndexBounds("name", Bounds{})
+		assert.Len(t, bounds, 0)
+	})
+	t.Run("index: ^prefix with $options i - no prefix", func(t *testing.T) {
+		// Case-insensitive matching must not narrow the scan to the
+		// literal-case prefix range.
+		f, err := ParseCondition(`{"name":{"$regex": "^prefix", "$options": "i"}}`)
 		require.NoError(t, err)
 		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 0)

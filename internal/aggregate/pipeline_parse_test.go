@@ -841,6 +841,12 @@ func TestPipelineParseError(t *testing.T) {
 			wantReason: "unknown operator", wantIs: query.ErrUnknownOperator,
 		},
 		{
+			name:     "$options fault inside $match names the stage index",
+			json:     `[{"$limit":1},{"$match":{"a":{"$regex":"x","$options":"!"}}}]`,
+			wantPath: "1.$match.a.$options", wantOp: "$options",
+			wantReason: "unsupported $options flag '!'",
+		},
+		{
 			name:     "$sort bad direction",
 			json:     `[{"$sort":{"a":2}}]`,
 			wantPath: "0.$sort.a", wantOp: "$sort",

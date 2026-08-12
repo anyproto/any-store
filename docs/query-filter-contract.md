@@ -112,7 +112,24 @@ build per query and carry no such guarantee.
     encoding below `TypeNull` on disk), and cross-type order is anyenc tag
     order, not the BSON type order, as everywhere else in this engine.
 
-11. **Parse rejections are structured.** Everything `ParseCondition`,
+11. **`$regex` is RE2, case-sensitive by default; `$options` is its only
+    modifier.** The pattern is compiled by Go's `regexp` (RE2 syntax — no
+    backreferences or lookarounds), unanchored, case-sensitive. Mongo-style
+    `{f: {"$regex": "...", "$options": "i"}}` is accepted with the flags RE2
+    shares with Mongo: `i` (case-insensitive), `m` (multiline `^`/`$`), `s`
+    (dot matches newline); Mongo's `x` and `u` are rejected (`ParseError`,
+    `Op: "$options"`). `$options` is in the operator vocabulary but is NOT a
+    predicate: it must accompany a `$regex` in the same condition object
+    (standalone or top-level use is a parse rejection), and it compiles into
+    the sibling `Regexp` filter — equivalent to prefixing the pattern with
+    `(?flags)`. Inline flag groups in the pattern itself remain legal.
+    Anchored-prefix index bounds (`^literal…`) are extracted only from
+    unflagged patterns: `$options` or a leading `^(?i)` keeps the scan wide,
+    since a case-folded prefix does not bound the index range. Pinned by
+    `TestRegexp` (query/filter_test.go) and the `$options` cases in
+    `TestParseError`.
+
+12. **Parse rejections are structured.** Everything `ParseCondition`,
     `ParseModifier`, and the aggregation pipeline parser reject — unknown
     operator, wrong operand type, malformed `$and`/`$or`/`$nor` array, bad
     `$regex`, unknown modifier, unknown stage, … — is reported as a

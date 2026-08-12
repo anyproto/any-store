@@ -48,6 +48,13 @@ const (
 	// opKnn is appended at the END of the block deliberately: it stays > _opVal
 	// (field-level for free via isTopLevel) and shifts no existing iota value.
 	opKnn
+
+	// opOptions is not a predicate: it is the Mongo-style modifier of a sibling
+	// $regex ({f: {"$regex": "...", "$options": "i"}}). It is in the vocabulary
+	// so the token is recognized (and advertised by Operators()), but it is
+	// consumed by parseCompObjOp's pre-scan, never by makeCompFilter. Appended
+	// at the end for the same iota-stability reason as opKnn.
+	opOptions
 )
 
 var opBytesPrefix = []byte("$")
@@ -275,6 +282,14 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 		hasKnn   bool
 	)
 
+	// $options is a modifier of a sibling $regex, not a predicate of its own, so
+	// it is resolved before the operator walk: validated here, applied inside
+	// parseRegexp, and skipped by the visitor below.
+	regexOptions, err := extractRegexpOptions(val)
+	if err != nil {
+		return false, nil, err
+	}
+
 	var fs And
 	if obj.Len() > 1 {
 		fs = make(And, 0, obj.Len())
@@ -297,6 +312,10 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 				}, string(key))
 				return
 			}
+			if op == opOptions {
+				// Already consumed by extractRegexpOptions; not a filter.
+				return
+			}
 			if hasNonOp {
 				err = atPath(&ParseError{
 					Op:     string(key),
@@ -308,7 +327,7 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 			if op == opKnn {
 				hasKnn = true
 			}
-			if f, err = makeCompFilter(op, v); err != nil {
+			if f, err = makeCompFilter(op, v, regexOptions); err != nil {
 				err = atPath(err, string(key))
 				return
 			}
@@ -350,7 +369,7 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 	return true, f, nil
 }
 
-func makeCompFilter(op Operator, v *anyenc.Value) (f Filter, err error) {
+func makeCompFilter(op Operator, v *anyenc.Value, regexOptions string) (f Filter, err error) {
 	// Rule V at the door: an ordering op against a vector operand is
 	// decidable syntactically, so reject it here rather than silently evaluating
 	// to false. This also stops it reflecting through $not, where a
@@ -426,7 +445,7 @@ func makeCompFilter(op Operator, v *anyenc.Value) (f Filter, err error) {
 	case opType:
 		return parseType(v)
 	case opRegexp:
-		return parseRegexp(v)
+		return parseRegexp(v, regexOptions)
 	case opSize:
 		return parseSize(v)
 	case opKnn:
@@ -712,14 +731,21 @@ func parseSize(v *anyenc.Value) (Filter, error) {
 	return Size{Size: int64(size)}, nil
 }
 
-func parseRegexp(v *anyenc.Value) (Filter, error) {
+func parseRegexp(v *anyenc.Value, options string) (Filter, error) {
 	switch v.Type() {
 	case anyenc.TypeString:
 		exp, err := v.StringBytes()
 		if err != nil {
 			return nil, &ParseError{Op: "$regex", Reason: "invalid regular expression: " + err.Error(), Err: err}
 		}
-		compiledRegexp, err := regexp.Compile(string(exp))
+		pattern := string(exp)
+		if options != "" {
+			// Prepending the flag group also keeps prefix index-bound extraction
+			// off for flagged patterns (extractPrefix requires a leading '^'),
+			// which is required for correctness at least under 'i'.
+			pattern = "(?" + options + ")" + pattern
+		}
+		compiledRegexp, err := regexp.Compile(pattern)
 		if err != nil {
 			return nil, &ParseError{Op: "$regex", Reason: "invalid regular expression: " + err.Error(), Err: err}
 		}
@@ -727,6 +753,42 @@ func parseRegexp(v *anyenc.Value) (Filter, error) {
 	default:
 		return nil, &ParseError{Op: "$regex", Reason: "$regex must be a string, got " + v.String()}
 	}
+}
+
+// extractRegexpOptions resolves a $options key in a field-condition object: it
+// must accompany a $regex sibling, be a string, and use only flags Go's RE2
+// shares with MongoDB — i (case-insensitive), m (multiline ^/$), s (dot matches
+// newline). Mongo's x and u have no RE2 equivalent and are rejected. Returns
+// the validated flag string ("" when $options is absent).
+func extractRegexpOptions(val *anyenc.Value) (string, error) {
+	opt := val.Get("$options")
+	if opt == nil {
+		return "", nil
+	}
+	if val.Get("$regex") == nil {
+		return "", atPath(&ParseError{
+			Op:     "$options",
+			Reason: "$options requires a $regex in the same condition object",
+		}, "$options")
+	}
+	if opt.Type() != anyenc.TypeString {
+		return "", atPath(&ParseError{
+			Op:     "$options",
+			Reason: "$options must be a string, got " + opt.String(),
+		}, "$options")
+	}
+	flags, _ := opt.StringBytes()
+	for _, c := range string(flags) {
+		switch c {
+		case 'i', 'm', 's':
+		default:
+			return "", atPath(&ParseError{
+				Op:     "$options",
+				Reason: fmt.Sprintf("unsupported $options flag %q; supported: i (case-insensitive), m (multiline), s (dot matches newline)", c),
+			}, "$options")
+		}
+	}
+	return string(flags), nil
 }
 
 func makeArrComp(op Operator, v *anyenc.Value) (Filter, error) {
