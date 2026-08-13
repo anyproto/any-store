@@ -147,6 +147,11 @@ build per query and carry no such guarantee.
     `ErrVectorNotOrderable` for ordering ops on vector operands. A known
     operator in a position that does not accept it (`{"$eq":1}` at top
     level, `{"$set":{"$a":1}}`) is deliberately NOT `ErrUnknownOperator`.
+    There is no swallow-and-fallback anywhere in the grammars: a `$pull`
+    object operand is a condition (as in Mongo), and a malformed one is a
+    rejection, never a literal-equality pull — a swallowed error would make
+    the same bytes mean different pulls across library versions in a
+    multi-process deployment.
     Each vocabulary is data: `query.Operators()`, `query.ModifierOperators()`,
     `anystore.AggregateStages()` and `anystore.AggregateAccumulators()`
     return exactly what the parsers recognize, so callers advertising a

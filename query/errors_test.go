@@ -401,6 +401,21 @@ func TestParseModifierError(t *testing.T) {
 			wantPath: "$pullAll.arr", wantOp: "$pullAll",
 			wantReason: "$pullAll must be an array",
 		},
+		{
+			// A malformed condition object under $pull is a rejection, not a
+			// silent literal-equality fallback: the same bytes must not mean
+			// different pulls across library versions.
+			name: "$pull malformed condition object",
+			json: `{"$pull":{"arr":{"$bogus":1}}}`,
+			wantPath: "$pull.arr.$bogus", wantOp: "$bogus",
+			wantReason: "unknown operator", wantIs: ErrUnknownOperator,
+		},
+		{
+			name: "$pull invalid $options flag",
+			json: `{"$pull":{"arr":{"$regex":"x","$options":"!"}}}`,
+			wantPath: "$pull.arr.$options", wantOp: "$options",
+			wantReason: "unsupported $options flag '!'",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m, err := ParseModifier(tc.json)
