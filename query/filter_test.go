@@ -479,6 +479,41 @@ func TestRegexp(t *testing.T) {
 		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 0)
 	})
+	t.Run("index: ^prefix with $options m - no prefix", func(t *testing.T) {
+		// Under m the anchor matches at any line start, so "x\nprefix"
+		// matches while sorting outside the literal prefix range.
+		f, err := ParseCondition(`{"name":{"$regex": "^prefix", "$options": "m"}}`)
+		require.NoError(t, err)
+		bounds := f.IndexBounds("name", Bounds{})
+		assert.Len(t, bounds, 0)
+	})
+	t.Run("index: ^prefix with $options s - keeps prefix", func(t *testing.T) {
+		// s only changes what '.' matches; it cannot affect a literal
+		// anchored prefix, so the narrow scan stays sound.
+		f, err := ParseCondition(`{"name":{"$regex": "^prefix", "$options": "s"}}`)
+		require.NoError(t, err)
+		bounds := f.IndexBounds("name", Bounds{})
+		assert.Len(t, bounds, 1)
+	})
+	t.Run("ok - duplicate $options keys are last-wins", func(t *testing.T) {
+		// Duplicate keys collapse last-wins in the JSON parser (standard JSON
+		// behavior, before operator validation); the surviving occurrence is
+		// then validated like any other.
+		f, err := ParseCondition(`{"name":{"$regex":"^a","$options":"!","$options":"i"}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": "Abc"}`), nil))
+		_, err = ParseCondition(`{"name":{"$regex":"^a","$options":"i","$options":"!"}}`)
+		require.Error(t, err)
+	})
+	t.Run("ok - $options String round-trip", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$regex":"^a","$options":"i"}}`)
+		require.NoError(t, err)
+		assert.Equal(t, `{"name": {"$regex": "^a", "$options": "i"}}`, f.String())
+		f2, err := ParseCondition(f.String())
+		require.NoError(t, err)
+		assert.True(t, f2.Ok(anyenc.MustParseJson(`{"name": "Abc"}`), nil))
+		assert.False(t, f2.Ok(anyenc.MustParseJson(`{"name": "bc"}`), nil))
+	})
 	t.Run("index: ^prefix\\.test - return prefix.test", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^prefix\.test"}}`)
 		require.NoError(t, err)

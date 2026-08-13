@@ -160,6 +160,29 @@ func TestParseError(t *testing.T) {
 			wantReason: "operator $options is not valid at the top level",
 		},
 		{
+			// Faults are reported in key order: a lexically-earlier unknown
+			// operator wins over a later $options misuse, keeping the
+			// ErrUnknownOperator class visible to recovery code.
+			name: "unknown operator before $options",
+			json: `{"a":{"$bogus":1,"$options":"i"}}`,
+			wantPath: "a.$bogus", wantOp: "$bogus",
+			wantReason: "unknown operator", wantIs: ErrUnknownOperator,
+		},
+		{
+			// The compile diagnostic quotes the pattern as written, not the
+			// rewritten one with the injected (?flags) group.
+			name: "$regex compile fault quotes the raw pattern",
+			json: `{"a":{"$regex":")","$options":"i"}}`,
+			wantPath: "a.$regex", wantOp: "$regex",
+			wantReason: "unexpected ): `)`",
+		},
+		{
+			name: "value key after $options",
+			json: `{"a":{"$options":"i","x":1}}`,
+			wantPath: "a.x",
+			wantReason: "mixed operators and values",
+		},
+		{
 			name: "$size operand not an integer",
 			json: `{"a":{"$size":"x"}}`,
 			wantPath: "a.$size", wantOp: "$size",

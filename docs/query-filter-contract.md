@@ -123,10 +123,13 @@ build per query and carry no such guarantee.
     (standalone or top-level use is a parse rejection), and it compiles into
     the sibling `Regexp` filter — equivalent to prefixing the pattern with
     `(?flags)`. Inline flag groups in the pattern itself remain legal.
-    Anchored-prefix index bounds (`^literal…`) are extracted only from
-    unflagged patterns: `$options` or a leading `^(?i)` keeps the scan wide,
-    since a case-folded prefix does not bound the index range. Pinned by
-    `TestRegexp` (query/filter_test.go) and the `$options` cases in
+    Duplicate `$options` keys collapse last-wins in the JSON parser (standard
+    JSON behavior); the surviving occurrence is validated like any other.
+    Anchored-prefix index bounds (`^literal…`) are suppressed exactly when a
+    flag can widen the match: `i` (case folding) and `m` (any-line anchoring)
+    keep the scan wide — via `$options` or a leading `^(?i)` in the pattern —
+    while `s` only changes what `.` matches and keeps the prefix bounds.
+    Pinned by `TestRegexp` (query/filter_test.go) and the `$options` cases in
     `TestParseError`.
 
 12. **Parse rejections are structured.** Everything `ParseCondition`,
