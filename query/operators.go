@@ -19,14 +19,15 @@ var operators = map[string]Operator{
 	"$lt":  opLt,
 	"$lte": opLte,
 
-	"$in":     opIn,
-	"$nin":    opNin,
-	"$all":    opAll,
-	"$not":    opNot,
-	"$exists": opExists,
-	"$type":   opType,
-	"$regex":  opRegexp,
-	"$size":   opSize,
+	"$in":      opIn,
+	"$nin":     opNin,
+	"$all":     opAll,
+	"$not":     opNot,
+	"$exists":  opExists,
+	"$type":    opType,
+	"$regex":   opRegexp,
+	"$options": opOptions,
+	"$size":    opSize,
 
 	"$knn": opKnn,
 }

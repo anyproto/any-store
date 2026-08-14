@@ -141,6 +141,8 @@ func TestFilterOkAllocFree(t *testing.T) {
 		{"size", `{"b": {"$size": 3}}`},
 		{"regexp", `{"c": {"$regex": "^te"}}`},
 		{"regexp array doc", `{"d": {"$regex": "^x"}}`},
+		{"regexp options i", `{"c": {"$regex": "^TE", "$options": "i"}}`},
+		{"regexp options s", `{"c": {"$regex": "^te.", "$options": "s"}}`},
 		{"nested path", `{"e.f": 1}`},
 		{"text", `{"$text": {"$search": "hello"}}`},
 		{"zoo", filterZoo},

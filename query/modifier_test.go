@@ -453,6 +453,12 @@ func TestModifierPull_Modify(t *testing.T) {
 				`{"arr":[6,7]}`,
 				true,
 			},
+			{
+				`{"$pull":{"arr": {"$regex":"^it","$options":"i"}}}`,
+				`{"arr": ["item","ITEM-2","x"]}`,
+				`{"arr":["x"]}`,
+				true,
+			},
 		}...)
 	})
 	t.Run("error", func(t *testing.T) {

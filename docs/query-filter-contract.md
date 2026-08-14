@@ -112,7 +112,27 @@ build per query and carry no such guarantee.
     encoding below `TypeNull` on disk), and cross-type order is anyenc tag
     order, not the BSON type order, as everywhere else in this engine.
 
-11. **Parse rejections are structured.** Everything `ParseCondition`,
+11. **`$regex` is RE2, case-sensitive by default; `$options` is its only
+    modifier.** The pattern is compiled by Go's `regexp` (RE2 syntax — no
+    backreferences or lookarounds), unanchored, case-sensitive. Mongo-style
+    `{f: {"$regex": "...", "$options": "i"}}` is accepted with the flags RE2
+    shares with Mongo: `i` (case-insensitive), `m` (multiline `^`/`$`), `s`
+    (dot matches newline); Mongo's `x` and `u` are rejected (`ParseError`,
+    `Op: "$options"`). `$options` is in the operator vocabulary but is NOT a
+    predicate: it must accompany a `$regex` in the same condition object
+    (standalone or top-level use is a parse rejection), and it compiles into
+    the sibling `Regexp` filter — equivalent to prefixing the pattern with
+    `(?flags)`. Inline flag groups in the pattern itself remain legal.
+    Duplicate `$options` keys collapse last-wins in the JSON parser (standard
+    JSON behavior); the surviving occurrence is validated like any other.
+    Anchored-prefix index bounds (`^literal…`) are suppressed exactly when a
+    flag can widen the match: `i` (case folding) and `m` (any-line anchoring)
+    keep the scan wide — via `$options` or a leading `^(?i)` in the pattern —
+    while `s` only changes what `.` matches and keeps the prefix bounds.
+    Pinned by `TestRegexp` (query/filter_test.go) and the `$options` cases in
+    `TestParseError`.
+
+12. **Parse rejections are structured.** Everything `ParseCondition`,
     `ParseModifier`, and the aggregation pipeline parser reject — unknown
     operator, wrong operand type, malformed `$and`/`$or`/`$nor` array, bad
     `$regex`, unknown modifier, unknown stage, … — is reported as a
@@ -127,6 +147,11 @@ build per query and carry no such guarantee.
     `ErrVectorNotOrderable` for ordering ops on vector operands. A known
     operator in a position that does not accept it (`{"$eq":1}` at top
     level, `{"$set":{"$a":1}}`) is deliberately NOT `ErrUnknownOperator`.
+    There is no swallow-and-fallback anywhere in the grammars: a `$pull`
+    object operand is a condition (as in Mongo), and a malformed one is a
+    rejection, never a literal-equality pull — a swallowed error would make
+    the same bytes mean different pulls across library versions in a
+    multi-process deployment.
     Each vocabulary is data: `query.Operators()`, `query.ModifierOperators()`,
     `anystore.AggregateStages()` and `anystore.AggregateAccumulators()`
     return exactly what the parsers recognize, so callers advertising a

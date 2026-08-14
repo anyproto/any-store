@@ -1101,6 +1101,13 @@ func (e TypeFilter) String() string {
 
 type Regexp struct {
 	Regexp *regexp.Regexp
+	// Options are the Mongo $options flags ("i", "m", "s") the parser baked
+	// into Regexp as a leading (?flags) group. i and m make an anchored
+	// ^literal prefix unsound as an index bound (case folding / any-line
+	// anchoring admit keys outside the literal range), so IndexBounds keeps
+	// the scan wide for them; s cannot affect a literal prefix and keeps the
+	// bounds.
+	Options string
 }
 
 func (r Regexp) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
@@ -1130,8 +1137,23 @@ func (r Regexp) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 	return r.Regexp.Match(exp)
 }
 
+// rawPattern strips the (?flags) group parseRegexp injected for Options,
+// recovering the pattern as written.
+func (r Regexp) rawPattern() string {
+	pattern := r.Regexp.String()
+	if r.Options != "" {
+		pattern = strings.TrimPrefix(pattern, "(?"+r.Options+")")
+	}
+	return pattern
+}
+
 func (r Regexp) IndexBounds(_ string, bs Bounds) (bounds Bounds) {
-	prefix := extractPrefix(r.Regexp.String())
+	if strings.ContainsAny(r.Options, "im") {
+		// See Options: a case-folded or any-line-anchored prefix does not
+		// bound the index range.
+		return bs
+	}
+	prefix := extractPrefix(r.rawPattern())
 	if prefix == "" {
 		return bs
 	}
@@ -1194,6 +1216,11 @@ func isSpecialChar(char byte, specialChars string) bool {
 	return false
 }
 
+// extractPrefix returns the literal prefix of an anchored (^…) pattern, "" if
+// none. SOUNDNESS: a pattern under i or m flags must never reach the prefix
+// fast path — Regexp.IndexBounds screens Options before calling, and a flag
+// group inlined in the pattern fails the '^' check here. Do not teach this
+// function to skip a leading (?…) group without consulting the flags.
 func extractPrefix(pattern string) string {
 	if !strings.HasPrefix(pattern, "^") || strings.HasPrefix(pattern, "^(?i)") {
 		return ""
@@ -1203,6 +1230,9 @@ func extractPrefix(pattern string) string {
 }
 
 func (r Regexp) String() string {
+	if r.Options != "" {
+		return fmt.Sprintf(`{"$regex": "%s", "$options": "%s"}`, r.rawPattern(), r.Options)
+	}
 	return fmt.Sprintf(`{"$regex": "%s"}`, r.Regexp.String())
 }
 

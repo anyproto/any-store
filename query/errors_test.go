@@ -136,6 +136,53 @@ func TestParseError(t *testing.T) {
 			wantReason: "$regex must be a string",
 		},
 		{
+			name: "$options without a sibling $regex",
+			json: `{"a":{"$options":"i"}}`,
+			wantPath: "a.$options", wantOp: "$options",
+			wantReason: "$options requires a $regex",
+		},
+		{
+			name: "$options operand not a string",
+			json: `{"a":{"$regex":"x","$options":1}}`,
+			wantPath: "a.$options", wantOp: "$options",
+			wantReason: "$options must be a string",
+		},
+		{
+			name: "$options unsupported flag",
+			json: `{"a":{"$regex":"x","$options":"ix"}}`,
+			wantPath: "a.$options", wantOp: "$options",
+			wantReason: "unsupported $options flag 'x'",
+		},
+		{
+			name: "$options at top level",
+			json: `{"$options":"i"}`,
+			wantPath: "$options", wantOp: "$options",
+			wantReason: "operator $options is not valid at the top level",
+		},
+		{
+			// Faults are reported in key order: a lexically-earlier unknown
+			// operator wins over a later $options misuse, keeping the
+			// ErrUnknownOperator class visible to recovery code.
+			name: "unknown operator before $options",
+			json: `{"a":{"$bogus":1,"$options":"i"}}`,
+			wantPath: "a.$bogus", wantOp: "$bogus",
+			wantReason: "unknown operator", wantIs: ErrUnknownOperator,
+		},
+		{
+			// The compile diagnostic quotes the pattern as written, not the
+			// rewritten one with the injected (?flags) group.
+			name: "$regex compile fault quotes the raw pattern",
+			json: `{"a":{"$regex":")","$options":"i"}}`,
+			wantPath: "a.$regex", wantOp: "$regex",
+			wantReason: "unexpected ): `)`",
+		},
+		{
+			name: "value key after $options",
+			json: `{"a":{"$options":"i","x":1}}`,
+			wantPath: "a.x",
+			wantReason: "mixed operators and values",
+		},
+		{
 			name: "$size operand not an integer",
 			json: `{"a":{"$size":"x"}}`,
 			wantPath: "a.$size", wantOp: "$size",
@@ -354,6 +401,21 @@ func TestParseModifierError(t *testing.T) {
 			wantPath: "$pullAll.arr", wantOp: "$pullAll",
 			wantReason: "$pullAll must be an array",
 		},
+		{
+			// A malformed condition object under $pull is a rejection, not a
+			// silent literal-equality fallback: the same bytes must not mean
+			// different pulls across library versions.
+			name: "$pull malformed condition object",
+			json: `{"$pull":{"arr":{"$bogus":1}}}`,
+			wantPath: "$pull.arr.$bogus", wantOp: "$bogus",
+			wantReason: "unknown operator", wantIs: ErrUnknownOperator,
+		},
+		{
+			name: "$pull invalid $options flag",
+			json: `{"$pull":{"arr":{"$regex":"x","$options":"!"}}}`,
+			wantPath: "$pull.arr.$options", wantOp: "$options",
+			wantReason: "unsupported $options flag '!'",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m, err := ParseModifier(tc.json)
@@ -399,8 +461,8 @@ func TestOperators(t *testing.T) {
 	ops := Operators()
 	assert.Equal(t, []string{
 		"$all", "$and", "$eq", "$exists", "$gt", "$gte", "$in", "$knn",
-		"$lt", "$lte", "$ne", "$nin", "$nor", "$not", "$or", "$regex",
-		"$size", "$text", "$type",
+		"$lt", "$lte", "$ne", "$nin", "$nor", "$not", "$options", "$or",
+		"$regex", "$size", "$text", "$type",
 	}, ops)
 
 	// Every advertised operator is recognized by the parser, each as a

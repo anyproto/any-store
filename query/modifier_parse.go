@@ -185,10 +185,13 @@ func newPullModifier(key []byte, v *anyenc.Value) (Modifier, error) {
 		fieldPath: strings.Split(string(key), "."),
 	}
 	if v.Type() == anyenc.TypeObject {
-		pull.filter, err = parseCompObj(v)
-		if err == nil {
-			return pull, nil
+		// An object operand is a condition, as in Mongo; a malformed one is a
+		// rejection, NOT a literal-equality fallback — a swallowed error here
+		// makes the same bytes mean different pulls across library versions.
+		if pull.filter, err = parseCompObj(v); err != nil {
+			return nil, err
 		}
+		return pull, nil
 	}
 	pull.val = v
 	return pull, nil

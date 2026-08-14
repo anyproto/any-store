@@ -48,6 +48,14 @@ const (
 	// opKnn is appended at the END of the block deliberately: it stays > _opVal
 	// (field-level for free via isTopLevel) and shifts no existing iota value.
 	opKnn
+
+	// opOptions is not a predicate: it is the Mongo-style modifier of a sibling
+	// $regex ({f: {"$regex": "...", "$options": "i"}}). It is in the vocabulary
+	// so the token is recognized (and advertised by Operators()), but it is
+	// consumed by parseCompObjOp's visitor and compiled into the sibling
+	// Regexp, never by makeCompFilter. Appended at the end for the same
+	// iota-stability reason as opKnn.
+	opOptions
 )
 
 var opBytesPrefix = []byte("$")
@@ -275,6 +283,17 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 		hasKnn   bool
 	)
 
+	// $options is a modifier of a sibling $regex, not a predicate of its own:
+	// the visitor validates each occurrence in place and every $regex operand
+	// is compiled AFTER the walk, so the pairing is key-order independent and
+	// faults are reported in key order.
+	var (
+		optionsSeen  bool
+		regexOptions string
+		regexVals    []*anyenc.Value
+		regexIdxs    []int // reserved slot in fs; -1 = the single f
+	)
+
 	var fs And
 	if obj.Len() > 1 {
 		fs = make(And, 0, obj.Len())
@@ -304,9 +323,36 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 				}, string(key))
 				return
 			}
+			if op == opOptions {
+				if optionsSeen {
+					// Unreachable via JSON (the parser collapses duplicate keys
+					// last-wins), but a hand-built anyenc object can carry
+					// duplicates — reject rather than guess which one applies.
+					err = atPath(&ParseError{
+						Op:     string(key),
+						Reason: "duplicate $options",
+					}, string(key))
+					return
+				}
+				optionsSeen = true
+				if regexOptions, err = parseRegexpOptions(v); err != nil {
+					err = atPath(err, string(key))
+				}
+				return
+			}
 			ok = true
 			if op == opKnn {
 				hasKnn = true
+			}
+			if op == opRegexp {
+				regexVals = append(regexVals, v)
+				if fs != nil {
+					regexIdxs = append(regexIdxs, len(fs))
+					fs = append(fs, nil)
+				} else {
+					regexIdxs = append(regexIdxs, -1)
+				}
+				return
 			}
 			if f, err = makeCompFilter(op, v); err != nil {
 				err = atPath(err, string(key))
@@ -317,7 +363,7 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 			}
 		} else {
 			hasNonOp = true
-			if ok {
+			if ok || optionsSeen {
 				err = atPath(&ParseError{
 					Reason: "mixed operators and values",
 				}, string(key))
@@ -327,6 +373,23 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 	})
 	if err != nil {
 		return false, nil, err
+	}
+	if optionsSeen && len(regexVals) == 0 {
+		return false, nil, atPath(&ParseError{
+			Op:     "$options",
+			Reason: "$options requires a $regex in the same condition object",
+		}, "$options")
+	}
+	for i, rv := range regexVals {
+		var rf Filter
+		if rf, err = parseRegexp(rv, regexOptions); err != nil {
+			return false, nil, atPath(err, "$regex")
+		}
+		if regexIdxs[i] >= 0 {
+			fs[regexIdxs[i]] = rf
+		} else {
+			f = rf
+		}
 	}
 	// A $knn is a ranked SOURCE, not a predicate: And{Knn, Comp} on one field
 	// would leave the Comp as a residual on a field the source already owns,
@@ -345,6 +408,12 @@ func parseCompObjOp(val *anyenc.Value) (ok bool, f Filter, err error) {
 		return false, nil, nil
 	}
 	if fs != nil {
+		// $options occupies a key but compiles into the sibling Regexp, so a
+		// canonical {"$regex":…,"$options":…} object holds one predicate —
+		// return it bare, not as a one-element And.
+		if len(fs) == 1 {
+			return true, fs[0], nil
+		}
 		return true, fs, nil
 	}
 	return true, f, nil
@@ -426,7 +495,9 @@ func makeCompFilter(op Operator, v *anyenc.Value) (f Filter, err error) {
 	case opType:
 		return parseType(v)
 	case opRegexp:
-		return parseRegexp(v)
+		// Unreached: parseCompObjOp defers $regex to pair it with $options.
+		// Kept so a future caller gets a plain regex, not the default arm.
+		return parseRegexp(v, "")
 	case opSize:
 		return parseSize(v)
 	case opKnn:
@@ -712,21 +783,52 @@ func parseSize(v *anyenc.Value) (Filter, error) {
 	return Size{Size: int64(size)}, nil
 }
 
-func parseRegexp(v *anyenc.Value) (Filter, error) {
+func parseRegexp(v *anyenc.Value, options string) (Filter, error) {
 	switch v.Type() {
 	case anyenc.TypeString:
 		exp, err := v.StringBytes()
 		if err != nil {
 			return nil, &ParseError{Op: "$regex", Reason: "invalid regular expression: " + err.Error(), Err: err}
 		}
-		compiledRegexp, err := regexp.Compile(string(exp))
+		pattern := string(exp)
+		// Compile the raw pattern first so diagnostics quote what the caller
+		// wrote, not the rewritten pattern with the injected flag group.
+		compiledRegexp, err := regexp.Compile(pattern)
 		if err != nil {
 			return nil, &ParseError{Op: "$regex", Reason: "invalid regular expression: " + err.Error(), Err: err}
+		}
+		if options != "" {
+			// Validated flags (i, m, s) cannot break a pattern that already
+			// compiled; the guard is defensive.
+			if compiledRegexp, err = regexp.Compile("(?" + options + ")" + pattern); err != nil {
+				return nil, &ParseError{Op: "$regex", Reason: "invalid regular expression: " + err.Error(), Err: err}
+			}
+			return Regexp{Regexp: compiledRegexp, Options: options}, nil
 		}
 		return Regexp{Regexp: compiledRegexp}, nil
 	default:
 		return nil, &ParseError{Op: "$regex", Reason: "$regex must be a string, got " + v.String()}
 	}
+}
+
+// parseRegexpOptions validates a $options operand: a string using only flags
+// Go's RE2 shares with MongoDB — i (case-insensitive), m (multiline ^/$), s
+// (dot matches newline). Mongo's x and u have no RE2 equivalent and are
+// rejected. The pairing with a sibling $regex is enforced by parseCompObjOp
+// after the key walk.
+func parseRegexpOptions(v *anyenc.Value) (string, error) {
+	flags, err := v.StringBytes()
+	if err != nil {
+		return "", &ParseError{Op: "$options", Reason: "$options must be a string, got " + v.String(), Err: err}
+	}
+	for _, c := range flags {
+		switch c {
+		case 'i', 'm', 's':
+		default:
+			return "", &ParseError{Op: "$options", Reason: fmt.Sprintf("unsupported $options flag %q; supported: i (case-insensitive), m (multiline), s (dot matches newline)", c)}
+		}
+	}
+	return string(flags), nil
 }
 
 func makeArrComp(op Operator, v *anyenc.Value) (Filter, error) {
