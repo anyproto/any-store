@@ -1,6 +1,8 @@
 package anystore
 
 import (
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -436,4 +438,105 @@ func TestCollQuery_IterReleasesTxOnQueryError(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("read blocked: Iter leaked the read connection")
 	}
+}
+
+func TestCollQuery_UpdateRollsBackOnError(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"u"}, Unique: true}))
+	require.NoError(t, coll.Insert(ctx,
+		anyenc.MustParseJson(`{"id":1, "u":1}`),
+		anyenc.MustParseJson(`{"id":2, "u":2}`),
+	))
+
+	// $set u:9 succeeds for the first doc, then collides with it on the second,
+	// so the update fails after having already written
+	_, err = coll.Find(nil).Update(ctx, `{"$set": {"u": 9}}`)
+	require.Error(t, err)
+
+	// the write of the first doc must not survive the failed update
+	doc, err := coll.FindId(ctx, 1)
+	require.NoError(t, err)
+	assert.Equal(t, float64(1), doc.Value().GetFloat64("u"))
+}
+
+func TestCollQuery_UpdateDeleteMarkTxModified(t *testing.T) {
+	// Update/Delete run their own write tx. Without SetModified the tx is
+	// released as EventReleaseWriteWithoutChanges, so the durability controller
+	// never marks the db dirty for writes made through a query.
+	insert := func(t *testing.T, fx *fixture, name string) Collection {
+		coll, err := fx.CreateCollection(ctx, name)
+		require.NoError(t, err)
+		require.NoError(t, coll.Insert(ctx,
+			anyenc.MustParseJson(`{"id":1, "a":1}`),
+			anyenc.MustParseJson(`{"id":2, "a":2}`),
+		))
+		return coll
+	}
+
+	// white-box: run inside a caller-supplied tx so the flag is observable
+	t.Run("update marks the tx", func(t *testing.T) {
+		fx := newFixture(t)
+		coll := insert(t, fx, "test")
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		res, err := coll.Find(nil).Update(tx.Context(), `{"$set": {"a": 42}}`)
+		require.NoError(t, err)
+		require.Equal(t, 2, res.Modified)
+		assert.True(t, tx.(writeTx).modified, "tx not marked modified")
+		require.NoError(t, tx.Commit())
+	})
+
+	t.Run("delete marks the tx", func(t *testing.T) {
+		fx := newFixture(t)
+		coll := insert(t, fx, "test")
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		res, err := coll.Find(nil).Delete(tx.Context())
+		require.NoError(t, err)
+		require.Equal(t, 2, res.Modified)
+		assert.True(t, tx.(writeTx).modified, "tx not marked modified")
+		require.NoError(t, tx.Commit())
+	})
+
+	t.Run("no match leaves the tx unmarked", func(t *testing.T) {
+		fx := newFixture(t)
+		coll := insert(t, fx, "test")
+		tx, err := fx.WriteTx(ctx)
+		require.NoError(t, err)
+		res, err := coll.Find(`{"a": 999}`).Update(tx.Context(), `{"$set": {"a": 42}}`)
+		require.NoError(t, err)
+		require.Equal(t, 0, res.Modified)
+		assert.False(t, tx.(writeTx).modified, "tx marked modified without writes")
+		require.NoError(t, tx.Commit())
+	})
+
+	// end-to-end: the sentinel file is the observable consequence of the
+	// EventReleaseWriteWithChanges the standalone tx must emit
+	t.Run("standalone update marks the db dirty", func(t *testing.T) {
+		conf := &Config{Durability: DurabilityConfig{Sentinel: true}}
+		tmpDir, err := os.MkdirTemp("", "any-store-*")
+		require.NoError(t, err)
+		dbPath := filepath.Join(tmpDir, "any-store-test.db")
+		sentinelPath := dbPath + ".lock"
+
+		fx := newFixturePath(t, tmpDir, conf)
+		insert(t, fx, "test")
+		// the inserts above mark the db dirty; closing clears the sentinel so
+		// the query update below is the only thing that can set it again
+		require.NoError(t, fx.DB.Close())
+		require.NoFileExists(t, sentinelPath)
+
+		reopened, err := Open(ctx, dbPath, conf)
+		require.NoError(t, err)
+		defer func() { _ = reopened.Close() }()
+		coll, err := reopened.OpenCollection(ctx, "test")
+		require.NoError(t, err)
+
+		res, err := coll.Find(nil).Update(ctx, `{"$set": {"a": 42}}`)
+		require.NoError(t, err)
+		require.Equal(t, 2, res.Modified)
+		assert.FileExists(t, sentinelPath, "query update did not mark the db dirty")
+	})
 }
