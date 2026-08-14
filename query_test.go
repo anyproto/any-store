@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -408,4 +409,31 @@ func TestFilterIn(t *testing.T) {
 		assert.Equal(t, 3, length)
 	})
 
+}
+
+func TestCollQuery_IterReleasesTxOnQueryError(t *testing.T) {
+	// With a single read connection, leaking the read tx on a failed Iter makes
+	// every subsequent read block forever in GetRead.
+	fx := newFixture(t, &Config{ReadConnections: 1})
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(`{"id":1, "a":1}`)))
+
+	// dropping the collection removes the underlying table, so preparing the
+	// query below fails inside Iter after the read tx has been acquired
+	require.NoError(t, coll.Drop(ctx))
+
+	_, err = coll.Find(nil).Iter(ctx)
+	require.Error(t, err)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = fx.GetCollectionNames(ctx)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("read blocked: Iter leaked the read connection")
+	}
 }
