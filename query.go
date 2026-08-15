@@ -136,9 +136,16 @@ func (q *collQuery) Iter(ctx context.Context) (iter Iterator, err error) {
 		qb.Close()
 		return
 	}
+	// the iterator owns tx on success and releases it on Close; until then any
+	// error path must release the connection back to the pool itself
+	defer func() {
+		if err != nil {
+			_ = tx.Commit()
+			qb.Close()
+		}
+	}()
 	stmt, err := tx.conn().Query(ctx, sqlRes)
 	if err != nil {
-		qb.Close()
 		return
 	}
 	for i, val := range qb.values {
