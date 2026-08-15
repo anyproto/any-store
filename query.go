@@ -182,9 +182,12 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	defer func() {
 		if err != nil {
 			_ = tx.Rollback()
-		} else {
-			err = tx.Commit()
+			return
 		}
+		if result.Modified > 0 {
+			tx.SetModified()
+		}
+		err = tx.Commit()
 	}()
 
 	if err = q.c.checkStmts(tx.Context(), tx.conn()); err != nil {
@@ -200,7 +203,11 @@ func (q *collQuery) Update(ctx context.Context, modifier any) (result ModifyResu
 	for i, val := range qb.values {
 		stmt.BindBytes(i+1, val)
 	}
-	iter := q.newIterator(stmt, tx, qb)
+	// tx ownership stays with the deferred commit/rollback above, so the
+	// iterator gets no tx: iterator.Close is deferred later and therefore runs
+	// first, and if it committed the tx the rollback below would find the tx
+	// already done and silently no-op
+	iter := q.newIterator(stmt, nil, qb)
 	defer func() {
 		_ = iter.Close()
 	}()
@@ -256,9 +263,12 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	defer func() {
 		if err != nil {
 			_ = tx.Rollback()
-		} else {
-			err = tx.Commit()
+			return
 		}
+		if result.Modified > 0 {
+			tx.SetModified()
+		}
+		err = tx.Commit()
 	}()
 
 	if err = q.c.checkStmts(tx.Context(), tx.conn()); err != nil {
@@ -274,7 +284,11 @@ func (q *collQuery) Delete(ctx context.Context) (result ModifyResult, err error)
 	for i, val := range qb.values {
 		stmt.BindBytes(i+1, val)
 	}
-	iter := q.newIterator(stmt, tx, qb)
+	// tx ownership stays with the deferred commit/rollback above, so the
+	// iterator gets no tx: iterator.Close is deferred later and therefore runs
+	// first, and if it committed the tx the rollback below would find the tx
+	// already done and silently no-op
+	iter := q.newIterator(stmt, nil, qb)
 	defer func() {
 		_ = iter.Close()
 	}()
