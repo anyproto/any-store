@@ -2,7 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/anyproto/any-store/v2.svg)](https://pkg.go.dev/github.com/anyproto/any-store/v2)
 [![Go Report Card](https://goreportcard.com/badge/github.com/anyproto/any-store/v2)](https://goreportcard.com/report/github.com/anyproto/any-store/v2)
-[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
 
 A **document-oriented embedded database** for Go with a MongoDB-like query language, built on an in-tree btree/pager/WAL storage engine derived from SQLite (aligned with its design, not a literal port — the on-disk format is our own).
 Schema-less documents, rich indexes, full-text and vector search, ACID transactions, multi-process access, page-level integrity and optional encryption — pure Go, no CGO.
@@ -218,6 +218,8 @@ db, _ := anystore.Open(ctx, "data.db", &anystore.Config{
 
 Whole-file page-level AEAD; bring-your-own key management via `EncryptionConfig.Codec`.
 
+An independent Go implementation following design conventions from [SQLCipher](https://www.zetetic.net/sqlcipher/) (BSD-3-Clause) — reserved-tail page overhead, the page-1 plaintext-prefix rule, PBKDF2-HMAC-SHA256 key derivation. No SQLCipher code is included; the cryptography is Go-native and uses AEAD rather than SQLCipher's encrypt-then-MAC construction. Not SQLCipher-compatible on disk. See [NOTICE.md](NOTICE.md).
+
 ## Documentation
 
 * **API reference** — [pkg.go.dev/github.com/anyproto/any-store/v2](https://pkg.go.dev/github.com/anyproto/any-store/v2)
@@ -238,4 +240,6 @@ Please read our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing.
 
 ## ⚖️ License
 
-Any Store is released under the MIT License — see [LICENSE](LICENSE) for details.
+Any Store is released under the MIT License — see [LICENSE.md](LICENSE.md).
+
+The storage engine derives from SQLite (public domain) and follows page-encryption design conventions from SQLCipher (BSD-3-Clause). Neither project's source is included. Attribution and scope: [NOTICE.md](NOTICE.md).
