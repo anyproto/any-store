@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -92,7 +94,37 @@ type DBStats struct {
 // Open opens a database at the specified path with the given configuration.
 // The config parameter can be nil for default settings.
 // Returns a DB instance or an error.
+// v2Magic is the file header any-store v2 writes at offset 0. It is 15 bytes;
+// v2 zero-fills the rest of the 16-byte header slot and validates only these
+// bytes. v1 files start with SQLite's own "SQLite format 3\x00" instead.
+const v2Magic = "BTree format 1\x00"
+
+// checkNotV2Database reports ErrV2Database when path holds an any-store v2
+// file. Without this, SQLite rejects it with an opaque "file is not a database".
+// Anything that is not a readable v2 header is left to the normal open path,
+// which also covers a missing file (Open creates one).
+func checkNotV2Database(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+	var hdr [len(v2Magic)]byte
+	if _, err = io.ReadFull(f, hdr[:]); err != nil {
+		return nil
+	}
+	if string(hdr[:]) == v2Magic {
+		return ErrV2Database
+	}
+	return nil
+}
+
 func Open(ctx context.Context, path string, config *Config) (DB, error) {
+	if err := checkNotV2Database(path); err != nil {
+		return nil, err
+	}
 	if config == nil {
 		config = &Config{}
 	}
