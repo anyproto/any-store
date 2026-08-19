@@ -7,9 +7,6 @@
 A **document‑oriented database** with a MongoDB‑like query language, running on top of a single SQLite file.
 Any Store brings schema‑less flexibility, rich indexes and ACID transactions to embedded Go applications.
 
-> ⚠️ **Status:** pre‑1.0 – APIs may change. We actively dog‑food the library in production and welcome early adopters & contributors.
-
-
 ## Features
 
 * **Mongo‑style queries** – `$in`, `$inc`, comparison & logical operators out of the box.
