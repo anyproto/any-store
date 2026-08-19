@@ -258,19 +258,25 @@ func (fx *fixture) finish() {
 func TestOpen_AnyStoreV2File(t *testing.T) {
 	dir := t.TempDir()
 
-	t.Run("v2 file is reported explicitly", func(t *testing.T) {
-		path := filepath.Join(dir, "v2.db")
-		// The header any-store v2 writes: the 15-byte magic, zero-filled to the
-		// 16-byte header slot. Verified against a real v2 file:
-		//   00000000: 4254 7265 6520 666f 726d 6174 2031 0000  BTree format 1..
-		page := make([]byte, 4096)
-		copy(page, "BTree format 1\x00")
-		require.NoError(t, os.WriteFile(path, page, 0o600))
+	// Both magics any-store v2 has written, each zero-filled to the 16-byte
+	// header field. Verified against real v2 files:
+	//   00000000: 616e 792d 7374 6f72 6520 7632 0000 0000  any-store v2....
+	//   00000000: 4254 7265 6520 666f 726d 6174 2031 0000  BTree format 1..
+	for _, tc := range []struct{ name, magic string }{
+		{"current magic", "any-store v2\x00"},
+		{"legacy magic", "BTree format 1\x00"},
+	} {
+		t.Run("v2 file is reported explicitly: "+tc.name, func(t *testing.T) {
+			path := filepath.Join(dir, tc.name+".db")
+			page := make([]byte, 4096)
+			copy(page, tc.magic)
+			require.NoError(t, os.WriteFile(path, page, 0o600))
 
-		db, err := Open(ctx, path, nil)
-		require.ErrorIs(t, err, ErrV2Database)
-		require.Nil(t, db)
-	})
+			db, err := Open(ctx, path, nil)
+			require.ErrorIs(t, err, ErrV2Database)
+			require.Nil(t, db)
+		})
+	}
 
 	t.Run("v1 file still opens", func(t *testing.T) {
 		path := filepath.Join(dir, "v1.db")

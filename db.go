@@ -94,10 +94,14 @@ type DBStats struct {
 // Open opens a database at the specified path with the given configuration.
 // The config parameter can be nil for default settings.
 // Returns a DB instance or an error.
-// v2Magic is the file header any-store v2 writes at offset 0. It is 15 bytes;
-// v2 zero-fills the rest of the 16-byte header slot and validates only these
-// bytes. v1 files start with SQLite's own "SQLite format 3\x00" instead.
-const v2Magic = "BTree format 1\x00"
+// any-store v2 writes a 16-byte magic at offset 0. v2Magic is what current v2
+// builds write; v2MagicLegacy was written before the format was renamed and is
+// still present in databases created by earlier builds. Both are zero-padded to
+// the full field width. v1 files start with SQLite's "SQLite format 3\x00".
+const (
+	v2Magic       = "any-store v2\x00\x00\x00\x00"
+	v2MagicLegacy = "BTree format 1\x00\x00"
+)
 
 // checkNotV2Database reports ErrV2Database when path holds an any-store v2
 // file. Without this, SQLite rejects it with an opaque "file is not a database".
@@ -115,7 +119,8 @@ func checkNotV2Database(path string) error {
 	if _, err = io.ReadFull(f, hdr[:]); err != nil {
 		return nil
 	}
-	if string(hdr[:]) == v2Magic {
+	switch string(hdr[:]) {
+	case v2Magic, v2MagicLegacy:
 		return ErrV2Database
 	}
 	return nil
