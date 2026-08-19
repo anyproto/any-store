@@ -8,6 +8,12 @@ import (
 	"syscall"
 )
 
+var (
+	osStat     = os.Stat
+	osOpenFile = os.OpenFile // returns *os.File (WriteString needed)
+	osRemove   = os.Remove
+)
+
 const lockFileSuffix = ".lock"
 
 var pid = fmt.Sprintf("%d", syscall.Getpid())
@@ -31,7 +37,7 @@ func (s *SentinelTracker) OnOpen(ctx context.Context) (dirty bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, err = os.Stat(s.path)
+	_, err = osStat(s.path)
 	if err == nil {
 		s.isDirty = true
 		return true, nil
@@ -53,12 +59,12 @@ func (s *SentinelTracker) MarkDirty() {
 	}
 
 	// Check if file already exists before trying to create
-	if _, err := os.Stat(s.path); err == nil {
+	if _, err := osStat(s.path); err == nil {
 		s.isDirty = true
 		return
 	}
 
-	file, err := os.OpenFile(s.path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0644)
+	file, err := osOpenFile(s.path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0644)
 	if err != nil {
 		if os.IsExist(err) {
 			s.isDirty = true
@@ -81,7 +87,7 @@ func (s *SentinelTracker) MarkClean() {
 		return
 	}
 
-	if err := os.Remove(s.path); err == nil || os.IsNotExist(err) {
+	if err := osRemove(s.path); err == nil || os.IsNotExist(err) {
 		s.isDirty = false
 	}
 }

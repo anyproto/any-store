@@ -1,0 +1,156 @@
+{
+  "data": [
+    {"id": 0, "a": 0},
+    {"id": 1, "a": 1},
+    {"id": 2, "a": 2},
+    {"id": 3, "a": 3},
+    {"id": 4, "a": 4},
+    {"id": 5, "a": 5},
+    {"id": 6, "a": 6},
+    {"id": 7, "a": 7},
+    {"id": 8, "a": 8},
+    {"id": 9, "a": 9},
+    {"id": 10, "a": 10},
+    {"id": 11, "a": 11},
+    {"id": 12, "a": 12},
+    {"id": 13, "a": 13},
+    {"id": 14, "a": 14},
+    {"id": 15, "a": 15},
+    {"id": 16, "a": 16},
+    {"id": 17, "a": 17},
+    {"id": 18, "a": 18},
+    {"id": 19, "a": 19}
+  ],
+  "indexes": [["a"]],
+  "tests": [
+    {
+      "name": "equality",
+      "cond": {"a": 5},
+      "expectedIds": [5]
+    },
+    {
+      "name": "range gt",
+      "cond": {"a": {"$gt": 3}},
+      "sort": ["a"],
+      "expectedIds": [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    },
+    {
+      "name": "range gte",
+      "cond": {"a": {"$gte": 3}},
+      "sort": ["a"],
+      "expectedIds": [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    },
+    {
+      "name": "range lt",
+      "cond": {"a": {"$lt": 5}},
+      "sort": ["a"],
+      "expectedIds": [0, 1, 2, 3, 4]
+    },
+    {
+      "name": "range lte",
+      "cond": {"a": {"$lte": 5}},
+      "sort": ["a"],
+      "expectedIds": [0, 1, 2, 3, 4, 5]
+    },
+    {
+      "name": "range gt-lt",
+      "cond": {"a": {"$gt": 3, "$lt": 7}},
+      "sort": ["a"],
+      "expectedIds": [4, 5, 6]
+    },
+    {
+      "name": "range gte-lte",
+      "cond": {"a": {"$gte": 3, "$lte": 7}},
+      "sort": ["a"],
+      "expectedIds": [3, 4, 5, 6, 7]
+    },
+    {
+      "name": "range gt-lte",
+      "cond": {"a": {"$gt": 3, "$lte": 7}},
+      "sort": ["a"],
+      "expectedIds": [4, 5, 6, 7]
+    },
+    {
+      "name": "range gte-lt",
+      "cond": {"a": {"$gte": 3, "$lt": 7}},
+      "sort": ["a"],
+      "expectedIds": [3, 4, 5, 6]
+    },
+    {
+      "name": "ne",
+      "cond": {"a": {"$ne": 5}},
+      "sort": ["a"],
+      "expectedIds": [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    },
+    {
+      "name": "ne count",
+      "cond": {"a": {"$ne": 5}},
+      "expectedCount": 19
+    },
+    {
+      "name": "in",
+      "cond": {"a": {"$in": [3, 7, 11]}},
+      "sort": ["a"],
+      "expectedIds": [3, 7, 11]
+    },
+    {
+      "name": "sort asc",
+      "sort": ["a"],
+      "expectedIds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    },
+    {
+      "name": "sort desc",
+      "sort": ["-a"],
+      "expectedIds": [19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+    },
+    {
+      "name": "range with sort asc",
+      "cond": {"a": {"$gt": 3, "$lt": 8}},
+      "sort": ["a"],
+      "expectedIds": [4, 5, 6, 7]
+    },
+    {
+      "name": "range with sort desc",
+      "cond": {"a": {"$gt": 3, "$lt": 8}},
+      "sort": ["-a"],
+      "expectedIds": [7, 6, 5, 4]
+    },
+    {
+      "name": "empty result",
+      "cond": {"a": 99},
+      "expectedIds": []
+    },
+    {
+      "name": "empty result range",
+      "cond": {"a": {"$gt": 100}},
+      "expectedCount": 0
+    },
+    {
+      "name": "all match",
+      "cond": {"a": {"$gte": 0, "$lte": 19}},
+      "sort": ["a"],
+      "expectedIds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+      "expectedCount": 20
+    },
+    {
+      "name": "equality uses IndexScan",
+      "cond": {"a": 5},
+      "expectedPlanContains": ["IndexScan"]
+    },
+    {
+      "name": "sort asc no mem sort",
+      "sort": ["a"],
+      "expectedPlanNotContains": ["Sort("]
+    },
+    {
+      "name": "sort desc no mem sort",
+      "sort": ["-a"],
+      "expectedPlanNotContains": ["Sort("]
+    },
+    {
+      "name": "range uses IndexScan",
+      "cond": {"a": {"$gt": 3}},
+      "expectedPlanContains": ["IndexScan"]
+    }
+  ]
+}

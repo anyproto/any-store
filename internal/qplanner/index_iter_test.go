@@ -1,0 +1,1540 @@
+package qplanner
+
+import (
+	"fmt"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/query"
+)
+
+// TestExtractDocId covers the corrupt-tuple fallback at index_iter.go:259-263
+// and the normal extraction path.
+func TestExtractDocId(t *testing.T) {
+	a := &anyenc.Arena{}
+
+	t.Run("normal_extraction", func(t *testing.T) {
+		var tuple anyenc.Tuple
+		tuple = tuple.Append(a.NewString("field0"))
+		tuple = tuple.Append(a.NewString("field1"))
+		docIdBytes := []byte("doc-42")
+		key := append(append([]byte{}, tuple...), docIdBytes...)
+		got := extractDocId(anyenc.Tuple(key), 2)
+		assert.Equal(t, docIdBytes, []byte(got))
+	})
+	t.Run("corrupt_tuple_returns_key", func(t *testing.T) {
+		// OffsetAfter on a garbage tuple returns error; extractDocId should
+		// return the original key as fallback (index_iter.go:261-263).
+		bad := anyenc.Tuple([]byte{0xff, 0xff, 0xff})
+		got := extractDocId(bad, 2)
+		assert.Equal(t, []byte(bad), []byte(got),
+			"corrupt tuple must return the original key as fallback")
+	})
+	t.Run("offset_equals_len_returns_key", func(t *testing.T) {
+		// Tuple with exactly N fields and no trailing docId suffix:
+		// offset == len(key), so the else branch at index_iter.go:268 fires.
+		var tuple anyenc.Tuple
+		tuple = tuple.Append(a.NewString("only-field"))
+		got := extractDocId(tuple, 1)
+		assert.Equal(t, []byte(tuple), []byte(got))
+	})
+}
+
+// TestIndexIter_String covers IndexIter.String with both forward/reverse and
+// with/without bounds.
+func TestIndexIter_String(t *testing.T) {
+	info := &IndexInfo{Name: "my_idx"}
+	t.Run("forward_no_bounds", func(t *testing.T) {
+		it := &IndexIter{IdxInfo: info}
+		s := it.String()
+		assert.Contains(t, s, "IndexScan(my_idx)")
+		assert.NotContains(t, s, "reverse")
+		assert.NotContains(t, s, "bounds=")
+	})
+	t.Run("reverse_with_bounds", func(t *testing.T) {
+		b := query.Bound{Start: []byte{1}, End: []byte{2}, StartInclude: true, EndInclude: true}
+		it := &IndexIter{IdxInfo: info, Reverse: true, Bounds: query.Bounds{b}}
+		s := it.String()
+		assert.Contains(t, s, "(reverse)")
+		assert.Contains(t, s, "bounds=")
+	})
+}
+
+// TestIndexIter_PerfBranches exercises index_iter.go perf guards and
+// asserts counters moved with a real btree-backed index scan.
+func TestIndexIter_PerfBranches(t *testing.T) {
+	resetPerfCounters()
+	setPerfCountersEnabled(true)
+	defer func() {
+		setPerfCountersEnabled(false)
+		resetPerfCounters()
+	}()
+
+	db, ns := coverageBtree(t, "idx_perf", []string{"key1", "key2", "key3"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx_perf", FieldNames: []string{"id"}},
+	}
+	defer it.Close()
+	for {
+		_, docId, _, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+	}
+
+	s := snapshotPerfCounters()
+	assert.Greater(t, s.IndexNextCalls, uint64(0), "IndexNextCalls must be incremented")
+	assert.Equal(t, uint64(3), s.IndexYields, "exactly 3 docs yielded")
+	assert.Greater(t, s.IndexNextNs, uint64(0), "IndexNextNs must accumulate timing")
+}
+
+// TestIndexIter_Forward_WithBounds exercises index_iter.go:86-107
+// (forward path with start bound and cursor.Next when StartInclude=false).
+func TestIndexIter_Forward_WithBounds(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_fwd_bounds",
+		[]string{"a", "b", "c", "d", "e"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	// Bounds: (b, d]  — exclusive start, inclusive end
+	bound := query.Bound{
+		Start:        anyenc.AppendAnyValue(nil, "b"),
+		End:          anyenc.AppendAnyValue(nil, "d"),
+		StartInclude: false,
+		EndInclude:   true,
+	}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx_range", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+	}
+	defer it.Close()
+	var got []string
+	for {
+		_, docId, _, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
+	}
+	assert.Equal(t, []string{"c", "d"}, got, "(b,d] must yield c then d in forward order")
+}
+
+// TestIndexIter_Reverse_NoBounds exercises the reverse no-bounds path
+// (index_iter.go:155-164).
+func TestIndexIter_Reverse_NoBounds(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_rev_nobounds", []string{"a", "b", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx_rev", FieldNames: []string{"id"}},
+		Reverse: true,
+	}
+	defer it.Close()
+	var got []string
+	for {
+		_, docId, _, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
+	}
+	assert.Equal(t, []string{"c", "b", "a"}, got,
+		"reverse no-bounds must yield descending order")
+}
+
+// TestIndexIter_Reverse_WithBounds exercises the reverse+bounds path.
+func TestIndexIter_Reverse_WithBounds(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_rev_bounds",
+		[]string{"a", "b", "c", "d", "e"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{
+		Start:        anyenc.AppendAnyValue(nil, "b"),
+		End:          anyenc.AppendAnyValue(nil, "d"),
+		StartInclude: true,
+		EndInclude:   true,
+	}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx_rev_range", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+		Reverse: true,
+	}
+	defer it.Close()
+	var got []string
+	for {
+		_, docId, _, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
+	}
+	assert.Equal(t, []string{"d", "c", "b"}, got,
+		"reverse [b,d] must yield d,c,b")
+}
+
+// TestIndexIter_CountEntries_WithBounds exercises the CountEntries batch
+// counter with bounds including exclusive-start.
+func TestIndexIter_CountEntries_WithBounds(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_count",
+		[]string{"a", "b", "c", "d", "e"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{
+		Start:        anyenc.AppendAnyValue(nil, "b"),
+		End:          anyenc.AppendAnyValue(nil, "d"),
+		StartInclude: false, // exercises the Next-past-start branch
+		EndInclude:   true,
+	}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx_count", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+	}
+	defer it.Close()
+	n, err := it.CountEntries()
+	require.NoError(t, err)
+	assert.Equal(t, 2, n, "(b,d] must count {c, d}")
+}
+
+// TestIndexIter_Forward_StartIncludeTrue covers the branch where the seek
+// lands exactly on Start AND StartInclude=true, so the no-skip path at
+// index_iter.go:91-96 short-circuits without calling cursor.Next.
+func TestIndexIter_Forward_StartIncludeTrue(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_start_incl", []string{"b", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{
+		Start:        anyenc.AppendAnyValue(nil, "b"),
+		StartInclude: true,
+	}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+	}
+	defer it.Close()
+	var got []string
+	for {
+		_, docId, _, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
+	}
+	assert.Equal(t, []string{"b", "c"}, got,
+		"[b,inf) must yield b,c in forward order (start inclusive)")
+}
+
+// TestIndexIter_Reverse_EndPastLastKey covers index_iter.go:64-67 — reverse
+// scan where Seek(End) lands past the last key, triggering cursor.Last() fallback.
+func TestIndexIter_Reverse_EndPastLastKey(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_rev_past_end", []string{"a", "b", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	// End = "z" — past every key. Seek("z") → invalid cursor → Last().
+	bound := query.Bound{
+		Start:        anyenc.AppendAnyValue(nil, "a"),
+		End:          anyenc.AppendAnyValue(nil, "zzz"),
+		StartInclude: true,
+		EndInclude:   true,
+	}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+		Reverse: true,
+	}
+	defer it.Close()
+	var got []string
+	for {
+		_, docId, _, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
+	}
+	assert.Equal(t, []string{"c", "b", "a"}, got,
+		"reverse [a,zzz] via Last() fallback must yield c,b,a")
+}
+
+// TestIndexIter_Reverse_EndExclusiveBackUp covers index_iter.go:74-78 — reverse
+// scan where Seek(End) lands exactly on End but EndInclude=false, so we
+// call Previous to back up.
+func TestIndexIter_Reverse_EndExclusiveBackUp(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_rev_excl_end", []string{"a", "b", "c", "d"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	// End = "c", EndInclude=false. Seek("c") lands on "c" (cmp==0), backs up.
+	bound := query.Bound{
+		Start:        anyenc.AppendAnyValue(nil, "a"),
+		End:          anyenc.AppendAnyValue(nil, "c"),
+		StartInclude: true,
+		EndInclude:   false,
+	}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+		Reverse: true,
+	}
+	defer it.Close()
+	var got []string
+	for {
+		_, docId, _, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
+	}
+	assert.Equal(t, []string{"b", "a"}, got,
+		"reverse [a,c) must yield b,a (c excluded, Previous back-up)")
+}
+
+// TestIndexIter_Reverse_NoEnd covers index_iter.go:82-84 — reverse scan
+// with empty End, falls through to cursor.Last().
+func TestIndexIter_Reverse_NoEnd(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_rev_no_end", []string{"a", "b", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{
+		Start:        anyenc.AppendAnyValue(nil, "a"),
+		End:          nil, // no upper bound
+		StartInclude: true,
+	}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+		Reverse: true,
+	}
+	defer it.Close()
+	var got []string
+	for {
+		_, docId, _, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
+	}
+	assert.Equal(t, []string{"c", "b", "a"}, got,
+		"reverse [a,inf] must yield c,b,a via Last() fallback")
+}
+
+// TestIndexIter_NoBounds_ReverseAlreadyStarted covers the reverse-no-bounds
+// `else { Previous }` branch (index_iter.go:166-175) by iterating multiple
+// times to reach the started=true loop branch.
+func TestIndexIter_NoBounds_ReverseAlreadyStarted(t *testing.T) {
+	db, ns := coverageBtree(t, "idx_rev_multistep", []string{"a", "b", "c"})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Reverse: true,
+	}
+	defer it.Close()
+
+	// Consume all entries to ensure the "started → Previous" branch fires.
+	var got []string
+	for {
+		_, docId, _, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		got = append(got, string(anyenc.MustParse(docId).GetStringBytes()))
+	}
+	assert.Equal(t, []string{"c", "b", "a"}, got)
+}
+
+// ---- Cursor error forcing via invalid namespace (rootPage=0) ----
+//
+// A zero-value *btree.Namespace has rootPage=0, which is the header page
+// and not a valid btree root. Cursor operations against it return
+// "btree: invalid page number" errors — perfect for covering the
+// cursor-error arms that are otherwise unreachable.
+
+// TestIndexIter_NoBounds_Forward_FirstErr covers index_iter.go:160 (First
+// error) via an invalid namespace.
+func TestIndexIter_NoBounds_Forward_FirstErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+	}
+	defer it.Close()
+	_, _, _, err = it.Next()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page",
+		"error must originate in the cursor call, not NewCursor/extractResult")
+}
+
+// TestIndexIter_NoBounds_Reverse_LastErr covers index_iter.go:156 (Last error).
+func TestIndexIter_NoBounds_Reverse_LastErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Reverse: true,
+	}
+	defer it.Close()
+	_, _, _, err = it.Next()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
+}
+
+// TestIndexIter_Bounded_Forward_SeekErr covers index_iter.go:87 (Seek(Start)
+// error).
+func TestIndexIter_Bounded_Forward_SeekErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{Start: anyenc.AppendAnyValue(nil, "a"), StartInclude: true}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+	}
+	defer it.Close()
+	_, _, _, err = it.Next()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
+}
+
+// TestIndexIter_Bounded_Forward_FirstErr covers index_iter.go:101-103 (First
+// error when Start is empty).
+func TestIndexIter_Bounded_Forward_FirstErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{End: anyenc.AppendAnyValue(nil, "z"), EndInclude: true}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+	}
+	defer it.Close()
+	_, _, _, err = it.Next()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
+}
+
+// TestIndexIter_Bounded_Reverse_SeekErr covers index_iter.go:60 (Seek(End) err).
+func TestIndexIter_Bounded_Reverse_SeekErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{End: anyenc.AppendAnyValue(nil, "z"), EndInclude: true}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+		Reverse: true,
+	}
+	defer it.Close()
+	_, _, _, err = it.Next()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
+}
+
+// TestIndexIter_Bounded_Reverse_LastErr covers index_iter.go:81-83 (Last error
+// when End is empty in reverse).
+func TestIndexIter_Bounded_Reverse_LastErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{Start: anyenc.AppendAnyValue(nil, "a"), StartInclude: true}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+		Reverse: true,
+	}
+	defer it.Close()
+	_, _, _, err = it.Next()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
+}
+
+// TestIndexIter_CountEntries_SeekErr covers CountEntries seek error paths.
+func TestIndexIter_CountEntries_SeekErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{Start: anyenc.AppendAnyValue(nil, "a"), StartInclude: true}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+	}
+	defer it.Close()
+	_, err = it.CountEntries()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
+}
+
+// TestIndexIter_CountEntries_FirstErr covers CountEntries First error path.
+func TestIndexIter_CountEntries_FirstErr(t *testing.T) {
+	db, _ := openIsolatedBtree(t, []string{"a"})
+	defer db.Close()
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	bound := query.Bound{End: anyenc.AppendAnyValue(nil, "z"), EndInclude: true}
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: invalidNamespace()},
+		IdxInfo: &IndexInfo{Name: "idx", FieldNames: []string{"id"}},
+		Bounds:  query.Bounds{bound},
+	}
+	defer it.Close()
+	_, err = it.CountEntries()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid page")
+}
+
+// indexEntryBtree opens an in-memory btree namespace and writes index-shaped
+// entries with explicit per-entry value bytes. Used to exercise the
+// EntryValueIsMultiKey decode path of IndexIter without depending on the
+// anystore package's insertKeys.
+func indexEntryBtree(t *testing.T, entries []indexEntry) (*btree.DB, *btree.Namespace) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ix.db")
+	db, err := btree.Open(path, btree.Options{PageSize: 4096, CacheSize: 128, InMemory: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("ix")
+	require.NoError(t, err)
+	for _, e := range entries {
+		key := append(append([]byte{}, anyenc.AppendAnyValue(nil, e.field)...), []byte(e.docId)...)
+		require.NoError(t, wtx.Put(ns, key, e.value))
+	}
+	require.NoError(t, wtx.Commit())
+	return db, ns
+}
+
+type indexEntry struct {
+	field string // single-field index: scalar field value
+	docId string
+	value []byte // per-entry value byte: nil (legacy), {0} scalar, {1} multi-key
+}
+
+type rawEntry struct {
+	key   []byte
+	value []byte
+}
+
+// rawKeyBtree opens an in-memory btree namespace and writes entries with
+// caller-supplied raw key bytes. Used to exercise indexProbeAnyMultiKey with
+// array (0x06) and object (0x07) leading bytes that anyenc.AppendAnyValue
+// (scalars only) cannot produce — array/object keys are built via
+// anyenc.MustParseJson(...).MarshalTo to avoid hand-coded byte drift.
+func rawKeyBtree(t *testing.T, entries []rawEntry) (*btree.DB, *btree.Namespace) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "ix.db")
+	db, err := btree.Open(path, btree.Options{PageSize: 4096, CacheSize: 128, InMemory: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+
+	wtx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns, err := wtx.CreateNamespace("ix")
+	require.NoError(t, err)
+	for _, e := range entries {
+		require.NoError(t, wtx.Put(ns, e.key, e.value))
+	}
+	require.NoError(t, wtx.Commit())
+	return db, ns
+}
+
+// TestIndexProbeAnyMultiKey pins the canonical-key probe: it returns true iff
+// the namespace contains an entry whose key starts with the array type tag
+// (0x06), which writeValues emits exactly for array-valued (multi-key) docs.
+func TestIndexProbeAnyMultiKey(t *testing.T) {
+	scalarStr := func(s, docId string) []byte {
+		return append(anyenc.AppendAnyValue(nil, s), []byte(docId)...)
+	}
+	scalarNum := func(n int, docId string) []byte {
+		return append(anyenc.AppendAnyValue(nil, n), []byte(docId)...)
+	}
+	jsonKey := func(json, docId string) []byte {
+		return append(anyenc.MustParseJson(json).MarshalTo(nil), []byte(docId)...)
+	}
+
+	// Sanity: the encodings carry the leading type tags the probe relies on.
+	require.Equal(t, byte(anyenc.TypeArray), jsonKey(`["a","b"]`, "d")[0])
+	require.Equal(t, byte(anyenc.TypeObject), jsonKey(`{"k":"v"}`, "d")[0])
+
+	cases := []struct {
+		name    string
+		entries []rawEntry
+		want    bool
+	}{
+		{"pure-scalar string (0x03)", []rawEntry{
+			{scalarStr("a", "d1"), IndexValueScalar},
+			{scalarStr("b", "d2"), IndexValueScalar},
+		}, false},
+		{"pure-scalar number (0x02)", []rawEntry{
+			{scalarNum(5, "d1"), IndexValueScalar},
+			{scalarNum(10, "d2"), IndexValueScalar},
+		}, false},
+		{"array entries (0x06)", []rawEntry{
+			{jsonKey(`["a","b"]`, "d1"), IndexValueMultiKey},
+		}, true},
+		{"mixed scalar + array", []rawEntry{
+			{scalarStr("a", "d1"), IndexValueScalar},
+			{jsonKey(`["a","b"]`, "d2"), IndexValueMultiKey},
+		}, true},
+		{"empty namespace", nil, false},
+		{"object-only (0x07, cursor lands past 0x06)", []rawEntry{
+			{jsonKey(`{"k":"v"}`, "d1"), IndexValueScalar},
+		}, false},
+		{"legacy nil-value array (probe reads key, not value)", []rawEntry{
+			{jsonKey(`["a","b"]`, "d1"), nil},
+		}, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, ns := rawKeyBtree(t, tc.entries)
+			rtx, err := db.BeginRead()
+			require.NoError(t, err)
+			defer func() { _ = rtx.Rollback() }()
+
+			got, err := indexProbeAnyMultiKey(&CursorSource{Tx: rtx, Ns: ns}, false)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// boundForValue builds the adjusted point bound the planner hands to the count
+// path for a single $in value: [v, v] with the End widened by 0xff
+// (AdjustBoundsForNonUnique) so the docId-suffixed entries (v, docId) written
+// by indexEntryBtree fall inside it.
+func boundForValue(v string) query.Bound {
+	k := anyenc.AppendAnyValue(nil, v)
+	end := append(append([]byte{}, k...), 0xff)
+	return query.Bound{Start: k, End: end, StartInclude: true, EndInclude: true}
+}
+
+func seenSetIter(rtx *btree.ReadTx, ns *btree.Namespace, bounds query.Bounds) *IndexIter {
+	return &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Bounds:  bounds,
+	}
+}
+
+// assertSeenSetCount runs countEntriesViaSeenSet in BOTH modes — blind
+// (Branch 4) and skip-scalar (Branch 2) — and asserts each yields want. The two
+// must always agree on the distinct-doc count.
+func assertSeenSetCount(t *testing.T, it *IndexIter, want int) {
+	t.Helper()
+	nBlind, err := it.countEntriesViaSeenSet(false)
+	require.NoError(t, err)
+	assert.Equal(t, want, nBlind, "blind seen-set count")
+	nSkip, err := it.countEntriesViaSeenSet(true)
+	require.NoError(t, err)
+	assert.Equal(t, want, nSkip, "skip-scalar seen-set count")
+}
+
+// TestCountEntriesViaSeenSet_Disjoint: three scalar docs each matching one
+// bound, no cross-bound overlap → distinct count == entry count.
+func TestCountEntriesViaSeenSet_Disjoint(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "d1", value: IndexValueScalar},
+		{field: "b", docId: "d2", value: IndexValueScalar},
+		{field: "c", docId: "d3", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := seenSetIter(rtx, ns, query.Bounds{boundForValue("a"), boundForValue("b"), boundForValue("c")})
+	defer it.Close()
+	assertSeenSetCount(t, it, 3)
+}
+
+// TestCountEntriesViaSeenSet_Overlapping: doc d1 (array [a,b]) appears under
+// both bounds → counted once; plus scalar d2.
+func TestCountEntriesViaSeenSet_Overlapping(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "d1", value: IndexValueMultiKey},
+		{field: "b", docId: "d1", value: IndexValueMultiKey},
+		{field: "a", docId: "d2", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := seenSetIter(rtx, ns, query.Bounds{boundForValue("a"), boundForValue("b")})
+	defer it.Close()
+	assertSeenSetCount(t, it, 2)
+}
+
+// TestCountEntriesViaSeenSet_MixedScalarArray is the cross-bound array shape at the unit
+// level: scalar docs d1 (a) and d2 (b) plus an array doc d3 ([a,b]) straddling
+// both bounds. Skip-scalar mode must count d1/d2 directly and dedup d3 → 3.
+func TestCountEntriesViaSeenSet_MixedScalarArray(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "d1", value: IndexValueScalar},
+		{field: "a", docId: "d3", value: IndexValueMultiKey},
+		{field: "b", docId: "d2", value: IndexValueScalar},
+		{field: "b", docId: "d3", value: IndexValueMultiKey},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := seenSetIter(rtx, ns, query.Bounds{boundForValue("a"), boundForValue("b")})
+	defer it.Close()
+	assertSeenSetCount(t, it, 3)
+}
+
+// TestCountEntriesViaSeenSet_HeavyOverlap200: 200 docs each with array [x,y];
+// every doc straddles both bounds → 200 distinct, not 400.
+func TestCountEntriesViaSeenSet_HeavyOverlap200(t *testing.T) {
+	entries := make([]indexEntry, 0, 400)
+	for i := 0; i < 200; i++ {
+		d := fmt.Sprintf("d%03d", i)
+		entries = append(entries,
+			indexEntry{field: "x", docId: d, value: IndexValueMultiKey},
+			indexEntry{field: "y", docId: d, value: IndexValueMultiKey},
+		)
+	}
+	db, ns := indexEntryBtree(t, entries)
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := seenSetIter(rtx, ns, query.Bounds{boundForValue("x"), boundForValue("y")})
+	defer it.Close()
+	assertSeenSetCount(t, it, 200)
+}
+
+// TestCountEntriesViaSeenSet_LegacyNilValue: legacy nil-value entries decode as
+// multi-key (EntryValueIsMultiKey(nil)==true), so skip-scalar mode does NOT skip
+// them — they dedup correctly, same as blind mode.
+func TestCountEntriesViaSeenSet_LegacyNilValue(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "d1", value: nil},
+		{field: "b", docId: "d1", value: nil},
+		{field: "a", docId: "d2", value: nil},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := seenSetIter(rtx, ns, query.Bounds{boundForValue("a"), boundForValue("b")})
+	defer it.Close()
+	assertSeenSetCount(t, it, 2)
+}
+
+// TestCountEntriesViaSeenSet_AllocsBudget pins the pooled set's steady state:
+// with a warmed pool and a reused IndexIter the per-count allocation is small
+// and independent of the distinct-doc count.
+func TestCountEntriesViaSeenSet_AllocsBudget(t *testing.T) {
+	entries := make([]indexEntry, 0, 200)
+	for i := 0; i < 100; i++ {
+		d := fmt.Sprintf("d%03d", i)
+		entries = append(entries,
+			indexEntry{field: "x", docId: d, value: IndexValueMultiKey},
+			indexEntry{field: "y", docId: d, value: IndexValueMultiKey},
+		)
+	}
+	db, ns := indexEntryBtree(t, entries)
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := seenSetIter(rtx, ns, query.Bounds{boundForValue("x"), boundForValue("y")})
+	defer it.Close()
+	// Warm the sync.Pool set (map buckets + chunks) and the cursor.
+	n, err := it.countEntriesViaSeenSet(false)
+	require.NoError(t, err)
+	require.Equal(t, 100, n)
+
+	avg := testing.AllocsPerRun(20, func() {
+		_, _ = it.countEntriesViaSeenSet(false)
+	})
+	assert.LessOrEqual(t, avg, float64(30),
+		"pooled seen-set should be low-alloc with a warmed pool, got %.1f", avg)
+}
+
+// TestPooledSeenSet_ChunkRolloverAndReuse exercises the unsafe chunked arena:
+// many distinct docIds force chunk rollovers; re-adding every key must report a
+// duplicate (proving keys interned across chunk boundaries stay valid — no
+// dangling unsafe.String); an oversized docId gets its own chunk; and reset()
+// reuse across a big→small workload keeps counts exact.
+func TestPooledSeenSet_ChunkRolloverAndReuse(t *testing.T) {
+	s := newPooledSeenSet()
+	key := func(i int) []byte { return []byte(fmt.Sprintf("docid-%010d", i)) } // ~16 bytes
+	const big = 10000                                                          // ~160 KiB of keys → several 64 KiB chunks → forces rollover
+
+	for round := 0; round < 5; round++ {
+		s.reset()
+		distinct := 0
+		for i := 0; i < big; i++ {
+			if s.add(key(i)) {
+				distinct++
+			}
+		}
+		require.Equalf(t, big, distinct, "round %d: distinct on first pass", round)
+		// Re-adding every key must dup — keys spanning multiple chunks stayed valid.
+		for i := 0; i < big; i++ {
+			require.Falsef(t, s.add(key(i)), "round %d: re-add key %d should be a duplicate", round, i)
+		}
+		// Oversized docId (> one chunk) gets a dedicated chunk and still dedups.
+		huge := make([]byte, seenChunkSize+100)
+		require.Truef(t, s.add(huge), "round %d: oversized first add", round)
+		require.Falsef(t, s.add(huge), "round %d: oversized re-add should dup", round)
+		// Shrink to a tiny workload, reusing the same set (chunks rewound).
+		s.reset()
+		small := 0
+		for i := 0; i < 3; i++ {
+			if s.add(key(i)) {
+				small++
+			}
+		}
+		require.Equalf(t, 3, small, "round %d: small reuse", round)
+	}
+}
+
+// TestCountEntries_Dispatch pins the 4-branch CountEntries routing using the
+// cached probe flags as route markers: Branch 3 (probe ran, false → batch),
+// Branch 4 (probe ran, true → sort-dedup), Branch 2 (probe NOT run → compound
+// sort-dedup). Each branch's count must also be correct.
+func TestCountEntries_Dispatch(t *testing.T) {
+	scalarStr := func(s, docId string) []byte {
+		return append(anyenc.AppendAnyValue(nil, s), []byte(docId)...)
+	}
+	jsonKey := func(json, docId string) []byte {
+		return append(anyenc.MustParseJson(json).MarshalTo(nil), []byte(docId)...)
+	}
+
+	t.Run("Branch3_PureScalar_PointLookup_Batch", func(t *testing.T) {
+		db, ns := rawKeyBtree(t, []rawEntry{
+			{scalarStr("a", "d1"), IndexValueScalar},
+			{scalarStr("b", "d2"), IndexValueScalar},
+			{scalarStr("c", "d3"), IndexValueScalar},
+		})
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+
+		it := &IndexIter{
+			Source:      &CursorSource{Tx: rtx, Ns: ns},
+			IdxInfo:     &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+			Bounds:      query.Bounds{boundForValue("a"), boundForValue("b")},
+			PointLookup: true,
+		}
+		defer it.Close()
+		n, err := it.CountEntries()
+		require.NoError(t, err)
+		assert.Equal(t, 2, n)
+		assert.True(t, it.indexHasMultiKeyProbed, "single-field PointLookup must run the probe")
+		assert.False(t, it.indexHasMultiKey, "pure-scalar → probe false → Branch 3 batch")
+	})
+
+	t.Run("Branch4_MultiKey_PointLookup_SortDedup", func(t *testing.T) {
+		// d3 = array ["a","b"]: per-element keys (a,d3),(b,d3) + canonical 0x06.
+		db, ns := rawKeyBtree(t, []rawEntry{
+			{scalarStr("a", "d1"), IndexValueScalar},
+			{scalarStr("a", "d3"), IndexValueMultiKey},
+			{scalarStr("b", "d2"), IndexValueScalar},
+			{scalarStr("b", "d3"), IndexValueMultiKey},
+			{jsonKey(`["a","b"]`, "d3"), IndexValueMultiKey}, // canonical key → probe true
+		})
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+
+		it := &IndexIter{
+			Source:      &CursorSource{Tx: rtx, Ns: ns},
+			IdxInfo:     &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+			Bounds:      query.Bounds{boundForValue("a"), boundForValue("b")},
+			PointLookup: true,
+		}
+		defer it.Close()
+		n, err := it.CountEntries()
+		require.NoError(t, err)
+		assert.Equal(t, 3, n, "d1, d2 scalar + d3 array straddling both bounds, deduped to one")
+		assert.True(t, it.indexHasMultiKeyProbed)
+		assert.True(t, it.indexHasMultiKey, "array entry present → probe true → Branch 4 sort-dedup")
+	})
+
+	t.Run("Branch2_Compound_SortDedup_NoProbe", func(t *testing.T) {
+		compoundKey := func(p int, tval, docId string) []byte {
+			k := anyenc.AppendAnyValue(nil, p)
+			k = anyenc.AppendAnyValue(k, tval)
+			return append(k, []byte(docId)...)
+		}
+		compoundBound := func(p int, tval string) query.Bound {
+			k := anyenc.AppendAnyValue(nil, p)
+			k = anyenc.AppendAnyValue(k, tval)
+			end := append(append([]byte{}, k...), 0xff)
+			return query.Bound{Start: k, End: end, StartInclude: true, EndInclude: true}
+		}
+		// Doc d1: {p:5, t:["a","b"]} → per-element entries (5,a,d1),(5,b,d1).
+		db, ns := rawKeyBtree(t, []rawEntry{
+			{compoundKey(5, "a", "d1"), IndexValueMultiKey},
+			{compoundKey(5, "b", "d1"), IndexValueMultiKey},
+		})
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+
+		it := &IndexIter{
+			Source:      &CursorSource{Tx: rtx, Ns: ns},
+			IdxInfo:     &IndexInfo{Name: "ix", FieldNames: []string{"p", "t"}},
+			Bounds:      query.Bounds{compoundBound(5, "a"), compoundBound(5, "b")},
+			PointLookup: true,
+		}
+		defer it.Close()
+		n, err := it.CountEntries()
+		require.NoError(t, err)
+		assert.Equal(t, 1, n, "compound array doc straddling both bounds counted once")
+		assert.False(t, it.indexHasMultiKeyProbed, "compound index must NOT run the probe (Branch 2)")
+	})
+
+	t.Run("Branch4_LegacyNilValue_PointLookup_SortDedup", func(t *testing.T) {
+		// Realistic legacy index: per-element keys AND the canonical 0x06
+		// whole-array key, all with nil (pre-value-byte) value bytes — the
+		// shape a pre-value-byte writer produced (writeValues has written the
+		// canonical key since before the value byte existed). The probe reads
+		// the key prefix, not the value, so the 0x06 keys are detected even
+		// though their values are nil. d1=[a,b], d2=[b,c] straddle the bounds.
+		db, ns := rawKeyBtree(t, []rawEntry{
+			{scalarStr("a", "d1"), nil},
+			{scalarStr("b", "d1"), nil},
+			{jsonKey(`["a","b"]`, "d1"), nil}, // canonical 0x06 key, nil value
+			{scalarStr("b", "d2"), nil},
+			{scalarStr("c", "d2"), nil},
+			{jsonKey(`["b","c"]`, "d2"), nil}, // canonical 0x06 key, nil value
+		})
+		rtx, err := db.BeginRead()
+		require.NoError(t, err)
+		defer func() { _ = rtx.Rollback() }()
+
+		it := &IndexIter{
+			Source:      &CursorSource{Tx: rtx, Ns: ns},
+			IdxInfo:     &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+			Bounds:      query.Bounds{boundForValue("a"), boundForValue("b"), boundForValue("c")},
+			PointLookup: true,
+		}
+		defer it.Close()
+		n, err := it.CountEntries()
+		require.NoError(t, err)
+		assert.Equal(t, 2, n, "legacy multi-key with canonical 0x06 keys dedups: d1{a,b}, d2{b,c}")
+		assert.True(t, it.indexHasMultiKeyProbed)
+		assert.True(t, it.indexHasMultiKey, "canonical 0x06 key (even nil-valued) → probe true → dedup")
+	})
+}
+
+// TestIndexIter_Next_DecodesMultiKeyBit_Scalar pins that an IndexIter walking
+// entries written with IndexValueScalar reports multiKey=false.
+func TestIndexIter_Next_DecodesMultiKeyBit_Scalar(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueScalar},
+		{field: "b", docId: "p2", value: IndexValueScalar},
+		{field: "c", docId: "p3", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	for i := 0; i < 3; i++ {
+		_, docId, mk, err := it.Next()
+		require.NoError(t, err)
+		require.NotNil(t, docId)
+		assert.False(t, mk, "scalar entry %d must report multiKey=false", i)
+	}
+}
+
+// TestIndexIter_Next_DecodesMultiKeyBit_MultiKey pins the multi-key decode.
+func TestIndexIter_Next_DecodesMultiKeyBit_MultiKey(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "tag-a", docId: "p1", value: IndexValueMultiKey},
+		{field: "tag-b", docId: "p1", value: IndexValueMultiKey},
+		{field: "tag-c", docId: "p1", value: IndexValueMultiKey},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	for i := 0; i < 3; i++ {
+		_, _, mk, err := it.Next()
+		require.NoError(t, err)
+		assert.True(t, mk, "multi-key entry %d must report multiKey=true", i)
+	}
+}
+
+// TestIndexIter_Next_DecodesMultiKeyBit_LegacyEmpty pins the safety
+// behaviour for entries written with empty values (pre-bit format): they
+// must report multiKey=true so the planner uses the dedup path.
+func TestIndexIter_Next_DecodesMultiKeyBit_LegacyEmpty(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: nil}, // legacy: nil value
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	_, _, mk, err := it.Next()
+	require.NoError(t, err)
+	assert.True(t, mk, "legacy entry (nil value) must report multiKey=true conservatively")
+}
+
+// TestEntryValueIsMultiKey covers the decode helper at every recognised
+// input shape: empty, scalar, multi-key, and a future-format byte with
+// reserved bits set.
+func TestEntryValueIsMultiKey(t *testing.T) {
+	cases := []struct {
+		name string
+		val  []byte
+		want bool
+	}{
+		{"empty", []byte{}, true},
+		{"nil", nil, true},
+		{"scalar", []byte{0x00}, false},
+		{"multikey", []byte{0x01}, true},
+		{"future_reserved_bits_only", []byte{0x02}, false}, // bit 0 clear → scalar
+		{"future_with_multikey", []byte{0x03}, true},       // bit 0 set
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			assert.Equal(t, c.want, EntryValueIsMultiKey(c.val))
+		})
+	}
+}
+
+// TestIndexIter_CountEntries_MultiBound_ScalarDocs pins the stream-count
+// path for multi-bound queries on indexes whose entries are all scalar
+// (no doc has more than one entry). No seen-set should be allocated; the
+// count equals the entry count.
+func TestIndexIter_CountEntries_MultiBound_ScalarDocs(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "x", docId: "p1", value: IndexValueScalar},
+		{field: "y", docId: "p2", value: IndexValueScalar},
+		{field: "z", docId: "p3", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	// Bounds use the standard non-unique adjustment: End gets a trailing
+	// 0xff so docId-suffixed entries within the value prefix are included.
+	// See AdjustBoundsForNonUnique.
+	mk := func(s string) []byte { return anyenc.AppendAnyValue(nil, s) }
+	mkEnd := func(s string) []byte { return append(anyenc.AppendAnyValue(nil, s), 0xff) }
+	_ = mkEnd
+	bounds := query.Bounds{
+		{Start: mk("x"), End: mkEnd("x"), StartInclude: true, EndInclude: true},
+		{Start: mk("y"), End: mkEnd("y"), StartInclude: true, EndInclude: true},
+		{Start: mk("z"), End: mkEnd("z"), StartInclude: true, EndInclude: true},
+	}
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Bounds:  bounds,
+	}
+	defer it.Close()
+
+	n, err := it.CountEntries()
+	require.NoError(t, err)
+	assert.Equal(t, 3, n, "3 distinct scalar docs across 3 bounds")
+}
+
+// TestIndexIter_CountEntries_MultiBound_MultiKeyDeduped pins that
+// overlapping multi-bound queries on a multi-key index dedup correctly:
+// a doc whose array values appear in multiple bounds is counted once.
+func TestIndexIter_CountEntries_MultiBound_MultiKeyDeduped(t *testing.T) {
+	// Doc p1 has array values "a" and "b" → 2 entries, both multi-key.
+	// Doc p2 has array values "b" and "c" → 2 entries, both multi-key.
+	// Query bounds {a, b, c} should count 2 distinct docs (p1, p2),
+	// not 4 entries.
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueMultiKey},
+		{field: "b", docId: "p1", value: IndexValueMultiKey},
+		{field: "b", docId: "p2", value: IndexValueMultiKey},
+		{field: "c", docId: "p2", value: IndexValueMultiKey},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	// Bounds use the standard non-unique adjustment: End gets a trailing
+	// 0xff so docId-suffixed entries within the value prefix are included.
+	// See AdjustBoundsForNonUnique.
+	mk := func(s string) []byte { return anyenc.AppendAnyValue(nil, s) }
+	mkEnd := func(s string) []byte { return append(anyenc.AppendAnyValue(nil, s), 0xff) }
+	_ = mkEnd
+	bounds := query.Bounds{
+		{Start: mk("a"), End: mkEnd("a"), StartInclude: true, EndInclude: true},
+		{Start: mk("b"), End: mkEnd("b"), StartInclude: true, EndInclude: true},
+		{Start: mk("c"), End: mkEnd("c"), StartInclude: true, EndInclude: true},
+	}
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Bounds:  bounds,
+	}
+	defer it.Close()
+
+	n, err := it.CountEntries()
+	require.NoError(t, err)
+	assert.Equal(t, 2, n, "p1 and p2 each counted once across overlapping bounds")
+}
+
+// TestIndexIter_CountEntries_MultiBound_Mixed pins the mixed case: some
+// docs have one entry (scalar bit), others multiple (multi-key bit). The
+// scalar entries stream-count without touching the seen-set; only the
+// multi-key entries dedup.
+func TestIndexIter_CountEntries_MultiBound_Mixed(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		// p1 has one scalar entry "a"
+		{field: "a", docId: "p1", value: IndexValueScalar},
+		// p2 has two multi-key entries "b" and "c"
+		{field: "b", docId: "p2", value: IndexValueMultiKey},
+		{field: "c", docId: "p2", value: IndexValueMultiKey},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	// Bounds use the standard non-unique adjustment: End gets a trailing
+	// 0xff so docId-suffixed entries within the value prefix are included.
+	// See AdjustBoundsForNonUnique.
+	mk := func(s string) []byte { return anyenc.AppendAnyValue(nil, s) }
+	mkEnd := func(s string) []byte { return append(anyenc.AppendAnyValue(nil, s), 0xff) }
+	_ = mkEnd
+	bounds := query.Bounds{
+		{Start: mk("a"), End: mkEnd("a"), StartInclude: true, EndInclude: true},
+		{Start: mk("b"), End: mkEnd("b"), StartInclude: true, EndInclude: true},
+		{Start: mk("c"), End: mkEnd("c"), StartInclude: true, EndInclude: true},
+	}
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Bounds:  bounds,
+	}
+	defer it.Close()
+
+	n, err := it.CountEntries()
+	require.NoError(t, err)
+	assert.Equal(t, 2, n, "p1 (scalar) + p2 (multi-key, deduped) = 2")
+}
+
+// TestIndexIter_CountEntries_MultiBound_LegacyEntries pins the
+// conservative path for legacy entries (nil value): treated as multi-key
+// and routed through the seen-set so a doc with multiple legacy entries
+// is counted once.
+func TestIndexIter_CountEntries_MultiBound_LegacyEntries(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: nil},
+		{field: "b", docId: "p1", value: nil},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	// Bounds use the standard non-unique adjustment: End gets a trailing
+	// 0xff so docId-suffixed entries within the value prefix are included.
+	// See AdjustBoundsForNonUnique.
+	mk := func(s string) []byte { return anyenc.AppendAnyValue(nil, s) }
+	mkEnd := func(s string) []byte { return append(anyenc.AppendAnyValue(nil, s), 0xff) }
+	_ = mkEnd
+	bounds := query.Bounds{
+		{Start: mk("a"), End: mkEnd("a"), StartInclude: true, EndInclude: true},
+		{Start: mk("b"), End: mkEnd("b"), StartInclude: true, EndInclude: true},
+	}
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Bounds:  bounds,
+	}
+	defer it.Close()
+
+	n, err := it.CountEntries()
+	require.NoError(t, err)
+	assert.Equal(t, 1, n,
+		"legacy entries are conservatively multi-key — p1's two entries dedup to 1")
+}
+
+// TestIndexIter_CountEntries_SingleBound_UsesBatchPath pins that the
+// single-bound count keeps the page-batch fast path (no value reads, no
+// seen-set). The multi-key bit is irrelevant here because within-doc
+// dedup ensures one entry per distinct value per doc.
+func TestIndexIter_CountEntries_SingleBound_UsesBatchPath(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "v", docId: "p1", value: IndexValueScalar},
+		{field: "v", docId: "p2", value: IndexValueScalar},
+		{field: "v", docId: "p3", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	// Bounds use the standard non-unique adjustment: End gets a trailing
+	// 0xff so docId-suffixed entries within the value prefix are included.
+	// See AdjustBoundsForNonUnique.
+	mk := func(s string) []byte { return anyenc.AppendAnyValue(nil, s) }
+	mkEnd := func(s string) []byte { return append(anyenc.AppendAnyValue(nil, s), 0xff) }
+	_ = mkEnd
+	bounds := query.Bounds{
+		{Start: mk("v"), End: mkEnd("v"), StartInclude: true, EndInclude: true},
+	}
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Bounds:  bounds,
+	}
+	defer it.Close()
+
+	n, err := it.CountEntries()
+	require.NoError(t, err)
+	assert.Equal(t, 3, n)
+}
+
+// drainIndexDocIds drains an IndexIter to completion, returning the docId
+// strings and the multiKey flag observed for each emitted entry.
+func drainIndexDocIds(t *testing.T, it *IndexIter) (ids []string, multi []bool) {
+	t.Helper()
+	for {
+		_, docId, mk, err := it.Next()
+		require.NoError(t, err)
+		if docId == nil {
+			break
+		}
+		ids = append(ids, string(docId))
+		multi = append(multi, mk)
+	}
+	return ids, multi
+}
+
+// TestIndexIter_SkipOffset_AllScalar verifies the cursor-level offset skip on
+// an unbounded single-field scalar index: skipOffset(k) absorbs exactly k
+// rows (remaining=0) and the subsequent Next() stream resumes at row k. This
+// is the fast path that streams OFFSET without fetching the skipped docs.
+func TestIndexIter_SkipOffset_AllScalar(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueScalar},
+		{field: "b", docId: "p2", value: IndexValueScalar},
+		{field: "c", docId: "p3", value: IndexValueScalar},
+		{field: "d", docId: "p4", value: IndexValueScalar},
+		{field: "e", docId: "p5", value: IndexValueScalar},
+		{field: "f", docId: "p6", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	remaining, err := it.skipOffset(3)
+	require.NoError(t, err)
+	assert.Equal(t, 0, remaining, "all 3 skipped entries are scalar → fully absorbed")
+
+	ids, _ := drainIndexDocIds(t, it)
+	assert.Equal(t, []string{"p4", "p5", "p6"}, ids,
+		"after skipping 3 scalar rows, the stream must resume at the 4th row")
+}
+
+// TestIndexIter_SkipOffset_PastEnd verifies that an offset beyond the entry
+// count skips everything and yields an empty stream, reporting the unskipped
+// remainder.
+func TestIndexIter_SkipOffset_PastEnd(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueScalar},
+		{field: "b", docId: "p2", value: IndexValueScalar},
+		{field: "c", docId: "p3", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	remaining, err := it.skipOffset(10)
+	require.NoError(t, err)
+	assert.Equal(t, 7, remaining, "only 3 scalar rows exist; 7 of the 10 are unskipped")
+
+	ids, _ := drainIndexDocIds(t, it)
+	assert.Empty(t, ids, "offset past the end yields nothing")
+}
+
+// TestIndexIter_SkipOffset_StopsAtMultiKey is the dangerous-case guard: when
+// the skip region contains a multi-key (array) entry, the fast skip MUST stop
+// at it, return the unskipped remainder, and leave the cursor ON that entry so
+// the dedup-aware path resolves the rest of the offset. Skipping multi-key
+// entries at the index level would mis-count logical rows.
+func TestIndexIter_SkipOffset_StopsAtMultiKey(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueScalar},    // skipped (scalar)
+		{field: "b", docId: "p2", value: IndexValueScalar},    // skipped (scalar)
+		{field: "m1", docId: "p3", value: IndexValueMultiKey}, // STOP here
+		{field: "m2", docId: "p3", value: IndexValueMultiKey},
+		{field: "z", docId: "p4", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	// Ask to skip 4. Two scalar entries are skipped, then the multi-key entry
+	// stops the fast skip: remaining = 4 - 2 = 2.
+	remaining, err := it.skipOffset(4)
+	require.NoError(t, err)
+	assert.Equal(t, 2, remaining, "stopped at the first multi-key entry after 2 scalar skips")
+
+	// The cursor must be left ON the multi-key entry, so Next() emits it first.
+	ids, multi := drainIndexDocIds(t, it)
+	assert.Equal(t, []string{"p3", "p3", "p4"}, ids,
+		"stream must resume exactly at the multi-key entry that stopped the skip")
+	assert.Equal(t, []bool{true, true, false}, multi,
+		"multiKey flags must be preserved through the handoff")
+}
+
+// TestIndexIter_SkipOffset_FirstEntryMultiKey verifies immediate bail when the
+// very first entry is multi-key: nothing is skipped and the full offset is
+// returned as remaining, with the cursor positioned at the first entry.
+func TestIndexIter_SkipOffset_FirstEntryMultiKey(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "m1", docId: "p1", value: IndexValueMultiKey},
+		{field: "m2", docId: "p1", value: IndexValueMultiKey},
+		{field: "z", docId: "p2", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	remaining, err := it.skipOffset(2)
+	require.NoError(t, err)
+	assert.Equal(t, 2, remaining, "first entry is multi-key → skip nothing")
+
+	ids, _ := drainIndexDocIds(t, it)
+	assert.Equal(t, []string{"p1", "p1", "p2"}, ids, "no entry consumed by the bailed skip")
+}
+
+// TestIndexIter_SkipOffset_LegacyEmptyBails verifies that a legacy empty value
+// byte (treated as multi-key for safety) stops the fast skip.
+func TestIndexIter_SkipOffset_LegacyEmptyBails(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueScalar},
+		{field: "b", docId: "p2", value: nil}, // legacy empty → multi-key for safety
+		{field: "c", docId: "p3", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	remaining, err := it.skipOffset(3)
+	require.NoError(t, err)
+	assert.Equal(t, 2, remaining, "1 scalar skipped, then legacy-empty entry stops the skip")
+
+	ids, _ := drainIndexDocIds(t, it)
+	assert.Equal(t, []string{"p2", "p3"}, ids)
+}
+
+// TestIndexIter_SkipOffset_Reverse verifies the cursor-level skip on a reverse
+// scan: it skips from the largest key backward.
+func TestIndexIter_SkipOffset_Reverse(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueScalar},
+		{field: "b", docId: "p2", value: IndexValueScalar},
+		{field: "c", docId: "p3", value: IndexValueScalar},
+		{field: "d", docId: "p4", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Reverse: true,
+	}
+	defer it.Close()
+
+	// Reverse order is d,c,b,a. Skip 2 → d,c skipped; resume at b,a.
+	remaining, err := it.skipOffset(2)
+	require.NoError(t, err)
+	assert.Equal(t, 0, remaining)
+
+	ids, _ := drainIndexDocIds(t, it)
+	assert.Equal(t, []string{"p2", "p1"}, ids, "reverse skip drops the 2 largest, resumes at b,a")
+}
+
+// TestIndexIter_SkipOffset_BoundedNoSkip verifies the conservative scope: a
+// bounded index scan does NOT fast-skip (returns the full offset), preserving
+// the safe fetch-then-skip path. The cursor is untouched, so a normal Next()
+// still walks the bounded range from the start.
+func TestIndexIter_SkipOffset_BoundedNoSkip(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueScalar},
+		{field: "b", docId: "p2", value: IndexValueScalar},
+		{field: "c", docId: "p3", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+		Bounds: query.Bounds{{
+			Start: anyenc.AppendAnyValue(nil, "a"), StartInclude: true,
+			End: append(anyenc.AppendAnyValue(nil, "c"), 0xff), EndInclude: true,
+		}},
+	}
+	defer it.Close()
+
+	remaining, err := it.skipOffset(2)
+	require.NoError(t, err)
+	assert.Equal(t, 2, remaining, "bounded scan must not fast-skip; returns full offset")
+
+	ids, _ := drainIndexDocIds(t, it)
+	assert.Equal(t, []string{"p1", "p2", "p3"}, ids, "Next() still walks the full bounded range")
+}
+
+// TestIndexIter_SkipOffset_ZeroAndNegative verifies the trivial guards.
+func TestIndexIter_SkipOffset_ZeroAndNegative(t *testing.T) {
+	db, ns := indexEntryBtree(t, []indexEntry{
+		{field: "a", docId: "p1", value: IndexValueScalar},
+	})
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	defer func() { _ = rtx.Rollback() }()
+
+	it := &IndexIter{
+		Source:  &CursorSource{Tx: rtx, Ns: ns},
+		IdxInfo: &IndexInfo{Name: "ix", FieldNames: []string{"f"}},
+	}
+	defer it.Close()
+
+	r0, err := it.skipOffset(0)
+	require.NoError(t, err)
+	assert.Equal(t, 0, r0)
+	rNeg, err := it.skipOffset(-5)
+	require.NoError(t, err)
+	assert.Equal(t, 0, rNeg)
+
+	// Cursor untouched: Next() still yields the single entry.
+	ids, _ := drainIndexDocIds(t, it)
+	assert.Equal(t, []string{"p1"}, ids)
+}

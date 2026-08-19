@@ -8,16 +8,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/anyproto/any-store/internal/driver"
+	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
 type Options struct {
 	AutoFlushEnable    bool
 	AutoFlushIdleAfter time.Duration
-	AutoFlushFunc      func(ctx context.Context, conn *driver.Conn) error
+	AutoFlushFunc      func(ctx context.Context, db *btree.DB) error
 
-	// AcquireWrite acquires write connection. If silent is true, won't trigger write events on release
-	AcquireWrite func(ctx context.Context, fn func(conn *driver.Conn) error) error
+	// AcquireWrite acquires write access to the database
+	AcquireWrite func(ctx context.Context, fn func(db *btree.DB) error) error
 	Sentinel     Sentinel
 	Logger       *log.Logger
 }
@@ -45,7 +45,6 @@ func NewController(opts Options) *Controller {
 	}
 
 	if opts.AutoFlushFunc == nil {
-		// This shouldn't happen in production, but provide a default for safety
 		flush, _ := NewFlushFunc(FlushModeCheckpointPassive)
 		opts.AutoFlushFunc = flush
 	}
@@ -54,7 +53,6 @@ func NewController(opts Options) *Controller {
 		opts: opts,
 	}
 	if opts.AutoFlushEnable {
-		// Create a stopped timer upfront - avoids all nil checks and races
 		c.timer = time.NewTimer(opts.AutoFlushIdleAfter)
 		if !c.timer.Stop() {
 			<-c.timer.C
@@ -73,7 +71,6 @@ func (c *Controller) OnOpen(ctx context.Context) (dirty bool, err error) {
 }
 
 // MarkCleanAfterCheck marks the DB as clean after a successful integrity check.
-// This should be called after quickcheck/integrity verification when no corruption is found.
 func (c *Controller) MarkCleanAfterCheck() {
 	if c.opts.Sentinel != nil {
 		c.opts.Sentinel.MarkClean()
@@ -115,11 +112,10 @@ func (c *Controller) Stop() error {
 	return nil
 }
 
-func (c *Controller) OnWriteEvent(event driver.EventType) {
-	if event == driver.EventReleaseWriteWithChanges && c.running.Load() {
+func (c *Controller) OnWriteEvent() {
+	if c.running.Load() {
 		c.lastWriteTime.Store(time.Now().UnixMilli())
 
-		// Mark DB as dirty on first write
 		if c.opts.Sentinel != nil {
 			c.opts.Sentinel.MarkDirty()
 		}
@@ -130,9 +126,7 @@ func (c *Controller) OnWriteEvent(event driver.EventType) {
 		c.timerMu.Lock()
 		defer c.timerMu.Unlock()
 
-		// Reset the timer
 		if !c.timer.Stop() {
-			// Drain the channel if timer already fired
 			select {
 			case <-c.timer.C:
 			default:
@@ -142,20 +136,18 @@ func (c *Controller) OnWriteEvent(event driver.EventType) {
 	}
 }
 
-// Flush perform fsync or WAL checkpoint (depends on FlushMode) on sqlite
+// Flush perform checkpoint on the btree database
 // When waitIdleDuration > 0, wait for waitIdleTime since the last write tx got released
 func (c *Controller) Flush(ctx context.Context, waitIdleDuration time.Duration, mode FlushMode) error {
 	if c == nil {
 		return fmt.Errorf("recovery is not enabled")
 	}
 
-	// Create custom flush function for this force flush
 	flushFunc, err := NewFlushFunc(mode)
 	if err != nil {
 		return fmt.Errorf("invalid flush mode: %w", err)
 	}
 
-	// Keep trying to flush with short idle threshold until successful or context cancelled
 	for {
 		select {
 		case <-ctx.Done():
@@ -169,16 +161,13 @@ func (c *Controller) Flush(ctx context.Context, waitIdleDuration time.Duration, 
 		}
 
 		if flushed {
-			// Successfully flushed
 			return nil
 		}
 
-		// Not idle enough yet, wait a bit and retry
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("force flush cancelled: %w", ctx.Err())
 		case <-time.After(10 * time.Millisecond):
-			// Short wait before retry
 		}
 	}
 }
@@ -197,16 +186,11 @@ func (c *Controller) autoFlushLoop() {
 					if c.opts.Logger != nil {
 						c.opts.Logger.Printf("Idle flush failed: %v", err)
 					}
-					// Re-arm timer for retry on error
 					c.timer.Reset(c.opts.AutoFlushIdleAfter)
 				} else if !flushed {
-					// We didn't flush because we're not idle anymore
-					// Re-arm timer to check again later
 					c.timer.Reset(c.opts.AutoFlushIdleAfter)
 				}
-				// If flushed successfully, don't re-arm - wait for next write event
 			} else {
-				// Not idle yet, re-arm timer
 				c.timer.Reset(c.opts.AutoFlushIdleAfter)
 			}
 		}
@@ -221,20 +205,17 @@ func (c *Controller) performFlushInternal(ctx context.Context, idleAfter time.Du
 	return c.performFlushInternalWithFunc(ctx, idleAfter, c.opts.AutoFlushFunc)
 }
 
-func (c *Controller) performFlushInternalWithFunc(ctx context.Context, idleAfter time.Duration, flushFunc func(context.Context, *driver.Conn) error) (bool, error) {
+func (c *Controller) performFlushInternalWithFunc(ctx context.Context, idleAfter time.Duration, flushFunc func(context.Context, *btree.DB) error) (bool, error) {
 	var flushed bool
 
-	// Use silent acquire to avoid triggering write events during flush operations
-	err := c.opts.AcquireWrite(ctx, func(conn *driver.Conn) error {
+	err := c.opts.AcquireWrite(ctx, func(db *btree.DB) error {
 		if idleAfter > 0 {
-			// Re-check if we're still idle after acquiring the connection
-			// Someone might have done writes while we were waiting
 			if c.timeSinceLastWrite() < idleAfter {
 				return nil
 			}
 		}
 
-		flushErr := flushFunc(ctx, conn)
+		flushErr := flushFunc(ctx, db)
 		if flushErr == nil {
 			flushed = true
 		}
@@ -246,7 +227,6 @@ func (c *Controller) performFlushInternalWithFunc(ctx context.Context, idleAfter
 		return false, err
 	}
 
-	// Only mark success and notify if we actually flushed
 	if flushed {
 		if c.opts.Logger != nil {
 			c.opts.Logger.Printf("db flush completed\n")

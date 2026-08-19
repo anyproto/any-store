@@ -1,0 +1,16 @@
+{
+  "data": [],
+  "indexes": [["a"]],
+  "tests": [
+    {
+      "name": "empty collection equality",
+      "cond": {"a": 1},
+      "expectedCount": 0
+    },
+    {
+      "name": "empty collection sort",
+      "sort": ["a"],
+      "expectedIds": []
+    }
+  ]
+}

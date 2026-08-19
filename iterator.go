@@ -3,107 +3,231 @@ package anystore
 import (
 	"errors"
 	"io"
-	"slices"
+	"time"
 
-	"github.com/anyproto/any-store/internal/driver"
-	"github.com/anyproto/any-store/syncpool"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/internal/qplanner"
+	"github.com/anyproto/any-store/v2/syncpool"
 )
 
 // Iterator represents an iterator over query results.
 //
-// Example of usage:
-//
-//	for iter.Next() {
-//	    doc, err := iter.Doc()
-//	    if err != nil {
-//	        log.Fatalf("error retrieving document: %v", err)
-//	    }
-//	    fmt.Println("Document:", doc.Value().String())
-//	}
-//	if err := iter.Close(); err != nil {
-//	    log.Fatalf("iteration error: %v", err)
-//	}
+// Mutating the iterated collection through the same write transaction while
+// the iterator is open (deleting or updating documents mid-loop) is
+// UNDEFINED, matching SQLite's same-connection isolation contract: live rows
+// may be skipped or returned more than once, silently. It never corrupts the
+// store and never surfaces an error. To mutate every matched document,
+// collect the ids during iteration and mutate after Close — any-store's own
+// Query.Update/Delete do exactly that internally — or use those verbs
+// directly.
 type Iterator interface {
 	// Next advances the iterator to the next document.
-	// Returns false if there are no more documents.
 	Next() bool
 
 	// Doc returns the current document.
-	// Returns an error if there is an issue retrieving the document.
 	Doc() (Doc, error)
 
-	// Err returns any error encountered during the lifetime of the iterator,
+	// Distance returns the vector distance of the current document to the query
+	// for a vector search (smaller is closer). It returns 0 for non-vector
+	// queries.
+	Distance() float32
+
+	// Score returns the BM25 relevance score of the current document for a $text
+	// search (larger is more relevant). It returns 0 for non-fts queries.
+	Score() float64
+
+	// Err returns any error encountered during the lifetime of the iterator.
 	Err() error
 
 	// Close closes the iterator and releases any associated resources.
-	// Returns an error if there is an issue closing the iterator or any other error encountered during its lifetime.
 	Close() error
 }
 
-type iterator struct {
-	tx     ReadTx
-	buf    *syncpool.DocBuffer
-	qb     *queryBuilder
-	err    error
-	closed bool
-	stmt   *driver.Stmt
+// planIterator wraps a qplanner.Plan to implement the public Iterator interface.
+type planIterator struct {
+	tx         ReadTx
+	err        error
+	plan       *qplanner.Plan
+	buf        *syncpool.DocBuffer
+	qb         *queryBuilder
+	data       *qplanner.CursorSource
+	dataCursor *btree.Cursor
+	docId      []byte
+	closed     bool
+	dedup      qplanner.DocDedup // lazy-allocated when upstream emits multiKey=true
+	distArena  anyenc.Arena      // _distance re-injection on the post-sort re-fetch path
 }
 
-func (i *iterator) Next() bool {
-	if i.err != nil {
+func (pi *planIterator) Next() bool {
+	if pi.err != nil || pi.closed {
 		return false
 	}
-	hasRow, stepErr := i.stmt.Step()
-	if stepErr != nil {
-		stepErr = replaceInterruptErr(stepErr)
-		i.err = stepErr
-		return false
+	for {
+		pi.plan.DocParsed = nil
+		_, docId, mk, err := pi.plan.Root.Next()
+		if err != nil {
+			pi.err = err
+			return false
+		}
+		if docId == nil {
+			return false
+		}
+		// Skip duplicates emitted by multi-key sources (e.g. an
+		// $in over an array index where a doc matches multiple bounds).
+		// multiKey=false is a hard guarantee from upstream; the helper
+		// bypasses the seen-set entirely in that case. This streaming pull
+		// loop is the twin of qplanner.ForEachDistinct (the batch consumer
+		// behind bulk writes and the generic count) — both must implement
+		// the identical Accept contract.
+		if !pi.dedup.Accept(docId, mk) {
+			continue
+		}
+		if pi.plan.DocParsed == nil || pi.plan.Distances != nil || pi.plan.Scores != nil {
+			// Copy docId when we'll need it in Doc() fallback, or to look up
+			// the distance/score sidecar for a vector/fts query.
+			pi.docId = append(pi.docId[:0], docId...)
+		}
+		return true
 	}
-	return hasRow
 }
 
-func (i *iterator) Doc() (Doc, error) {
-	if i.err != nil && !errors.Is(i.err, io.EOF) {
-		return nil, i.err
+// Distance returns the ANN distance of the current document for a vector query
+// (0 for non-vector queries).
+func (pi *planIterator) Distance() float32 {
+	if pi.plan == nil || pi.plan.Distances == nil {
+		return 0
 	}
-	l, err := i.stmt.ColumnLen(0)
-	if err != nil {
-		return nil, err
-	}
-	i.buf.DocBuf = slices.Grow(i.buf.DocBuf, l)[:l]
-	if _, err = i.stmt.ColumnBytes(0, i.buf.DocBuf); err != nil {
-		return nil, err
-	}
-	val, err := i.buf.Parser.Parse(i.buf.DocBuf)
-	if err != nil {
-		return nil, err
-	}
-	return newItem(val)
+	d, _ := pi.plan.Distances.Get(pi.docId)
+	return float32(d)
 }
 
-func (i *iterator) Err() error {
-	if i.err != nil && errors.Is(i.err, io.EOF) {
+// Score returns the BM25 relevance score of the current document for a $text
+// query (0 for non-fts queries).
+func (pi *planIterator) Score() float64 {
+	if pi.plan == nil || pi.plan.Scores == nil {
+		return 0
+	}
+	s, _ := pi.plan.Scores.Get(pi.docId)
+	return s
+}
+
+func (pi *planIterator) Doc() (Doc, error) {
+	perf := pipelinePerfEnabled()
+	if perf {
+		pipePerf.docCalls.Add(1)
+	}
+	if pi.err != nil && !errors.Is(pi.err, io.EOF) {
+		return nil, pi.err
+	}
+	var doc *anyenc.Value
+	if pi.plan.DocParsed != nil {
+		if perf {
+			pipePerf.docParsedHits.Add(1)
+		}
+		doc = pi.plan.DocParsed
+	} else {
+		if perf {
+			pipePerf.docFallbacks.Add(1)
+		}
+		if pi.dataCursor == nil {
+			pi.dataCursor = pi.data.NewCursor()
+		}
+		var seekStart time.Time
+		if perf {
+			seekStart = time.Now()
+		}
+		if err := pi.dataCursor.SeekExact(pi.docId); err != nil {
+			return nil, err
+		}
+		if perf {
+			pipePerf.docFallbackSeekNs.Add(perfSinceNs(seekStart))
+		}
+		val, err := pi.dataCursor.Value()
+		if err != nil {
+			return nil, err
+		}
+		pi.buf.DocBuf = append(pi.buf.DocBuf[:0], val...)
+		var parseStart time.Time
+		if perf {
+			parseStart = time.Now()
+		}
+		var perr error
+		doc, perr = pi.buf.Parser.ParseOwned(pi.buf.DocBuf)
+		if perf {
+			pipePerf.docFallbackParseNs.Add(perfSinceNs(parseStart))
+		}
+		if perr != nil {
+			return nil, perr
+		}
+		// Re-decorate the synthetic _distance on the re-fetch path: SortIter
+		// clears DocParsed on emit, so a sorted $knn result would otherwise
+		// hand back the raw stored document with the documented _distance
+		// field missing. The sidecar always exists on the read verb (the only
+		// verb with a Doc()), keyed by docId.
+		if pi.plan.Distances != nil {
+			if d, ok := pi.plan.Distances.Get(pi.docId); ok {
+				pi.distArena.Reset()
+				doc.Set(qplanner.DistanceField, pi.distArena.NewNumberFloat64(d))
+			}
+		}
+	}
+	return pi.qb.coll.newItem(doc)
+}
+
+func (pi *planIterator) Err() error {
+	if pi.err != nil && errors.Is(pi.err, io.EOF) {
 		return nil
 	}
-	return i.err
+	return pi.err
 }
 
-func (i *iterator) Close() (err error) {
-	if i.closed {
+func (pi *planIterator) Close() (err error) {
+	if pi.closed {
 		return ErrIterClosed
 	}
-	i.closed = true
-	if i.stmt != nil {
-		err = errors.Join(err, i.stmt.Close())
+	pi.closed = true
+	if pi.dataCursor != nil {
+		pi.dataCursor.Close()
 	}
-	if i.tx != nil {
-		err = errors.Join(err, i.tx.Commit())
+	if pi.plan != nil {
+		pi.plan.Close()
 	}
-	if i.buf != nil && i.qb != nil {
-		i.qb.coll.db.syncPool.ReleaseDocBuf(i.buf)
+	if pi.tx != nil {
+		err = errors.Join(err, pi.tx.Commit())
 	}
-	if i.qb != nil {
-		i.qb.Close()
+	if pi.buf != nil && pi.qb != nil {
+		pi.qb.coll.db.syncPool.ReleaseDocBuf(pi.buf)
+	}
+	if pi.qb != nil {
+		pi.qb.Close()
 	}
 	return
+}
+
+func (pi *planIterator) String() string {
+	return pi.plan.String()
+}
+
+// emptyIter is the public Iterator returned by Find().Iter() when the
+// filter is provably empty (see isUnsatisfiable in query.go). It opens
+// no transaction, allocates no buffers, and yields nothing — Next is
+// always false. Used to short-circuit Iter on filters like $in:[]
+// without paying for plan construction or any I/O.
+type emptyIter struct{ closed bool }
+
+func (e *emptyIter) Next() bool { return false }
+func (e *emptyIter) Doc() (Doc, error) {
+	return nil, ErrDocNotFound
+}
+func (e *emptyIter) Distance() float32 { return 0 }
+
+func (e *emptyIter) Score() float64 { return 0 }
+func (e *emptyIter) Err() error     { return nil }
+func (e *emptyIter) Close() error {
+	if e.closed {
+		return ErrIterClosed
+	}
+	e.closed = true
+	return nil
 }

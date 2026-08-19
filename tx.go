@@ -2,12 +2,10 @@ package anystore
 
 import (
 	"context"
-	"strconv"
 	"sync"
 	"sync/atomic"
-	"unsafe"
 
-	"github.com/anyproto/any-store/internal/driver"
+	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
 var txVersion atomic.Uint32
@@ -31,6 +29,19 @@ type WriteTx interface {
 	// SetModified marks the transaction as having made modifications
 	// used internally for sentinel mechanism
 	SetModified()
+
+	// onRollbackUndo registers a reversal of an in-memory schema publication;
+	// see commonTx.undo. Unexported: DDL-internal.
+	onRollbackUndo(f func())
+	undoLen() int
+	runUndo(from int)
+
+	// onCommitPublish registers an in-memory publication that must become
+	// visible only when the tx durably commits; see commonTx.pubs.
+	// Unexported: DDL-internal.
+	onCommitPublish(f func())
+	pubLen() int
+	dropPubs(from int)
 }
 
 // ReadTx represents a read-only transaction.
@@ -45,21 +56,107 @@ type ReadTx interface {
 	// Done returns true if the transaction is completed (committed or rolled back).
 	Done() bool
 
-	conn() *driver.Conn
+	btreeReadTx() *btree.ReadTx
+	btreeWriteTx() *btree.WriteTx
 	instanceId() string
+	dbRef() *db
 }
 
 type commonTx struct {
-	db      *db
-	ctx     context.Context
-	con     *driver.Conn
-	version atomic.Uint32
+	db       *db
+	ctx      context.Context
+	readTx   *btree.ReadTx
+	writeTx  *btree.WriteTx
+	version  atomic.Uint32
+	modified bool
 
-	modified bool // indicates if the writeConn made any actual modifications
+	// undo holds reversals of in-memory schema publications (collection
+	// registered in db.openedCollections, index set swaps, renames) made by DDL
+	// inside this tx. DDL must publish at execution time — not at top-level
+	// commit — because writes later in the SAME tx must see and maintain an
+	// index/collection created earlier in it. But a rollback then reverts the
+	// on-disk catalog without those maps, leaving handles whose cached root
+	// pages are freed — a later write through such a handle lands on whatever
+	// namespace reuses the page (silent cross-namespace corruption).
+	// Undos run in REVERSE order on rollback —
+	// full, failed-commit, or to a savepoint (savepointTx records a mark) —
+	// and are discarded on successful commit. Single-writer state: mutated
+	// only under the btree write lock, like the tx itself; runUndo must also
+	// execute while that lock is still held (see writeTx.Rollback).
+	undo []func()
+
+	// pubs are commit-time publications — the dual of undo: in-memory state
+	// changes that must become visible only once the tx durably commits.
+	// Rename's openedCollections re-key lives here: re-keying at execution
+	// time would let a concurrent OpenCollection(oldName) miss the map, pass
+	// the committed-snapshot catalog check, and register a duplicate live
+	// handle under the vacated name — one the in-process staleness pass never
+	// invalidates (own commits update localSchemaCookie). Pubs run in
+	// registration order after a successful btree commit and are dropped
+	// unrun on any rollback or failed commit; savepoint scoping mirrors
+	// undo (savepointTx records a mark, rollback-to-savepoint drops its
+	// scope's entries). Single-writer state, like undo.
+	pubs []func()
 }
 
-func (tx *commonTx) conn() *driver.Conn {
-	return tx.con
+func (tx *commonTx) onRollbackUndo(f func()) {
+	tx.undo = append(tx.undo, f)
+}
+
+func (tx *commonTx) onCommitPublish(f func()) {
+	tx.pubs = append(tx.pubs, f)
+}
+
+func (tx *commonTx) pubLen() int {
+	return len(tx.pubs)
+}
+
+// runPubs executes and discards all commit publications in registration
+// order. Called only after a successful btree commit.
+func (tx *commonTx) runPubs() {
+	for _, f := range tx.pubs {
+		f()
+	}
+	clear(tx.pubs)
+	tx.pubs = tx.pubs[:0]
+}
+
+// dropPubs discards publications [from:] without running them: their tx scope
+// rolled back, so the state they would publish never became durable.
+func (tx *commonTx) dropPubs(from int) {
+	clear(tx.pubs[from:])
+	tx.pubs = tx.pubs[:from]
+}
+
+func (tx *commonTx) undoLen() int {
+	return len(tx.undo)
+}
+
+// runUndo executes and discards undo entries [from:] in reverse registration
+// order, so nested publications (e.g. an index created on a collection created
+// in the same tx) unwind consistently. Executed slots are cleared so the
+// pooled commonTx does not pin the captured handles and index-set snapshots.
+func (tx *commonTx) runUndo(from int) {
+	for i := len(tx.undo) - 1; i >= from; i-- {
+		tx.undo[i]()
+	}
+	clear(tx.undo[from:])
+	tx.undo = tx.undo[:from]
+}
+
+// discardUndo drops all registered undos without running them: the commit
+// succeeded, so the publications they would revert are now durable.
+func (tx *commonTx) discardUndo() {
+	clear(tx.undo)
+	tx.undo = tx.undo[:0]
+}
+
+func (tx *commonTx) btreeReadTx() *btree.ReadTx {
+	return tx.readTx
+}
+
+func (tx *commonTx) btreeWriteTx() *btree.WriteTx {
+	return tx.writeTx
 }
 
 func (tx *commonTx) SetModified() {
@@ -68,6 +165,10 @@ func (tx *commonTx) SetModified() {
 
 func (tx *commonTx) instanceId() string {
 	return tx.db.instanceId
+}
+
+func (tx *commonTx) dbRef() *db {
+	return tx.db
 }
 
 var txPool = &sync.Pool{
@@ -87,9 +188,8 @@ func (r readTx) Context() context.Context {
 
 func (r readTx) Commit() error {
 	if r.commonTx.version.CompareAndSwap(r.version, 0) {
-		defer r.db.cm.ReleaseRead(r.con)
 		defer txPool.Put(r.commonTx)
-		return r.con.Commit(context.Background())
+		return r.readTx.Rollback()
 	}
 	return nil
 }
@@ -107,11 +207,23 @@ func (w writeTx) Context() context.Context {
 	return w.ctx
 }
 
+// unwind reverts this tx's in-memory schema publications, then rolls the
+// btree tx back. The order matters: the btree releases the global write lock
+// inside Rollback, and a writer acquiring it in the gap would still see the
+// phantom state — or commit its own index-set swaps that a late undo would
+// then clobber. Running the undos first is safe: this tx's writes were never
+// reader-visible, so the restored snapshots match the committed on-disk state
+// throughout.
+func (w writeTx) unwind() error {
+	w.commonTx.runUndo(0)
+	w.commonTx.dropPubs(0)
+	return w.writeTx.Rollback()
+}
+
 func (w writeTx) Rollback() error {
 	if w.commonTx.version.CompareAndSwap(w.version, 0) {
-		defer w.db.cm.ReleaseWriteWithOptions(w.con, true)
 		defer txPool.Put(w.commonTx)
-		return w.con.Rollback(context.Background())
+		return w.unwind()
 	}
 	return nil
 }
@@ -119,10 +231,47 @@ func (w writeTx) Rollback() error {
 func (w writeTx) Commit() error {
 	if w.commonTx.version.CompareAndSwap(w.version, 0) {
 		defer txPool.Put(w.commonTx)
-		err := w.con.Commit(context.Background())
-
-		// Use ReleaseWriteWithOptions with noChanges flag based on whether transaction made changes
-		w.db.cm.ReleaseWriteWithOptions(w.con, !w.modified)
+		// Every non-committed exit below must unwind the in-memory schema
+		// publications, BEFORE its btree rollback releases the global write
+		// lock (see unwind).
+		if w.modified {
+			w.writeTx.MarkDataChanged()
+			// Flush the full-text write-back buffer into this same tx BEFORE the
+			// btree commit, so postings commit atomically with the documents.
+			if err := w.db.flushAllFtsPending(w.writeTx); err != nil {
+				_ = w.unwind()
+				return err
+			}
+			if err := w.db.persistAllDirtySketches(w.writeTx); err != nil {
+				_ = w.unwind()
+				return err
+			}
+		}
+		// The btree commit releases the global write lock before returning an
+		// error, so a failed-commit unwind would run outside the critical
+		// section — hold the DDL-unwind gate (paired with newWriteTx) across
+		// commit + unwind so no new writer can observe the phantoms in the
+		// gap. Only needed when this tx actually registered undos.
+		if len(w.commonTx.undo) > 0 || len(w.commonTx.pubs) > 0 {
+			w.db.ddlUnwindGate.Lock()
+			defer w.db.ddlUnwindGate.Unlock()
+		}
+		err := w.writeTx.Commit()
+		if err == nil {
+			if w.modified {
+				w.db.recoveryController.OnWriteEvent()
+			}
+			w.commonTx.discardUndo()
+			// Commit publications run under the gate (when held): no new
+			// writer observes the pre-publication in-memory state after the
+			// on-disk state it describes became visible.
+			w.commonTx.runPubs()
+		} else {
+			// A failed btree commit leaves the catalog without this tx's DDL —
+			// unwind (under the gate), and its publications never happen.
+			w.commonTx.runUndo(0)
+			w.commonTx.dropPubs(0)
+		}
 		return err
 	}
 	return nil
@@ -132,8 +281,6 @@ func (w writeTx) Done() bool {
 	return w.commonTx.version.Load() != w.version
 }
 
-var savepointIds atomic.Uint64
-
 var savepointPool = &sync.Pool{
 	New: func() any {
 		return &savepointTx{}
@@ -141,19 +288,28 @@ var savepointPool = &sync.Pool{
 }
 
 func newSavepointTx(ctx context.Context, wrTx WriteTx) (WriteTx, error) {
-	tx := savepointPool.Get().(*savepointTx)
-	tx.reset(wrTx)
-	if err := tx.conn().Exec(ctx, unsafe.String(unsafe.SliceData(tx.createQuery), len(tx.createQuery)), nil, driver.StmtExecNoResults); err != nil {
+	btWtx := wrTx.btreeWriteTx()
+	// Flush buffered full-text writes BEFORE creating the savepoint, so their
+	// btree writes land outside its scope. This keeps the fts pending buffer
+	// savepoint-consistent: at every savepoint creation the buffer is empty, so
+	// after RollbackToSavepoint (a) the buffer holds only ops made inside the
+	// rolled-back scope (discarded by resetAllFtsPending), and (b) everything
+	// flushed after this point sits inside the scope and is reverted by the
+	// btree itself. Without this, buffered postings from before the savepoint
+	// survive its rollback and flush at outer commit — while the seq/docmap
+	// writes they depend on were reverted, attributing ghost postings to
+	// whichever document later reuses the IntDocID.
+	if err := wrTx.dbRef().flushAllFtsPending(btWtx); err != nil {
 		return nil, err
 	}
+	spId, err := btWtx.Savepoint()
+	if err != nil {
+		return nil, err
+	}
+	tx := savepointPool.Get().(*savepointTx)
+	tx.reset(wrTx, spId)
 	return savepointWrapper{savepointTx: tx, version: tx.version.Load()}, nil
 }
-
-const (
-	savepointCreateQuery   = "SAVEPOINT sp"
-	savepointReleaseQuery  = "RELEASE SAVEPOINT sp"
-	savepointRollbackQuery = "ROLLBACK TO SAVEPOINT sp"
-)
 
 type savepointWrapper struct {
 	*savepointTx
@@ -162,43 +318,30 @@ type savepointWrapper struct {
 
 type savepointTx struct {
 	WriteTx
-	id            uint64
-	createQuery   []byte
-	releaseQuery  []byte
-	rollbackQuery []byte
-	version       atomic.Uint32
+	savepointId int
+	// undoMark is the parent tx's undo length at savepoint creation: a
+	// rollback to this savepoint unwinds exactly the schema publications made
+	// inside its scope (entries [undoMark:]); a release keeps them registered
+	// on the parent so an outer rollback still unwinds them.
+	undoMark int
+	// pubMark scopes commit publications the same way: a rollback to this
+	// savepoint drops (unrun) the publications registered inside its scope.
+	pubMark int
+	version atomic.Uint32
 }
 
-func (tx *savepointTx) reset(wtx WriteTx) {
-	tx.id = savepointIds.Add(1)
+func (tx *savepointTx) reset(wtx WriteTx, spId int) {
 	tx.WriteTx = wtx
+	tx.savepointId = spId
+	tx.undoMark = wtx.undoLen()
+	tx.pubMark = wtx.pubLen()
 	tx.version.Store(newTxVersion())
-	if len(tx.createQuery) == 0 {
-		tx.createQuery = make([]byte, 0, len(savepointCreateQuery)+10)
-		tx.createQuery = append(tx.createQuery, []byte(savepointCreateQuery)...)
-		tx.createQuery = strconv.AppendUint(tx.createQuery, tx.id, 10)
-	} else {
-		tx.createQuery = strconv.AppendUint(tx.createQuery[:len(savepointCreateQuery)], tx.id, 10)
-	}
-	if len(tx.releaseQuery) == 0 {
-		tx.releaseQuery = make([]byte, 0, len(savepointReleaseQuery)+10)
-		tx.releaseQuery = append(tx.releaseQuery, []byte(savepointReleaseQuery)...)
-		tx.releaseQuery = strconv.AppendUint(tx.releaseQuery, tx.id, 10)
-	} else {
-		tx.releaseQuery = strconv.AppendUint(tx.releaseQuery[:len(savepointReleaseQuery)], tx.id, 10)
-	}
-	if len(tx.rollbackQuery) == 0 {
-		tx.rollbackQuery = make([]byte, 0, len(savepointRollbackQuery)+10)
-		tx.rollbackQuery = append(tx.rollbackQuery, []byte(savepointRollbackQuery)...)
-		tx.rollbackQuery = strconv.AppendUint(tx.rollbackQuery, tx.id, 10)
-	} else {
-		tx.rollbackQuery = strconv.AppendUint(tx.rollbackQuery[:len(savepointRollbackQuery)], tx.id, 10)
-	}
 }
 
 func (w savepointWrapper) Commit() error {
 	if w.savepointTx.version.CompareAndSwap(w.version, 0) {
-		if err := w.conn().Exec(context.TODO(), unsafe.String(unsafe.SliceData(w.releaseQuery), len(w.releaseQuery)), nil, driver.StmtExecNoResults); err != nil {
+		btWtx := w.WriteTx.btreeWriteTx()
+		if err := btWtx.ReleaseSavepoint(w.savepointId); err != nil {
 			return err
 		}
 		savepointPool.Put(w.savepointTx)
@@ -208,7 +351,22 @@ func (w savepointWrapper) Commit() error {
 
 func (w savepointWrapper) Rollback() error {
 	if w.savepointTx.version.CompareAndSwap(w.version, 0) {
-		if err := w.conn().Exec(context.TODO(), unsafe.String(unsafe.SliceData(w.rollbackQuery), len(w.rollbackQuery)), nil, driver.StmtExecNoResults); err != nil {
+		btWtx := w.WriteTx.btreeWriteTx()
+		db := w.WriteTx.dbRef()
+		err := btWtx.RollbackToSavepoint(w.savepointId)
+		// The fts pending buffers hold only ops made inside this savepoint's
+		// scope (they were flushed empty at its creation), and the btree state
+		// those ops were derived from has just been reverted — discard them.
+		// Both this and the undo unwind run even when RollbackToSavepoint
+		// fails: its error returns happen before any mutation, the outer tx is
+		// doomed either way, and matching the in-memory schema state to the
+		// last committed disk state is the conservative choice.
+		// RollbackToSavepoint keeps the write lock in all cases, so the unwind
+		// runs inside the critical section.
+		db.resetAllFtsPending()
+		w.WriteTx.runUndo(w.undoMark)
+		w.WriteTx.dropPubs(w.pubMark)
+		if err != nil {
 			return err
 		}
 		savepointPool.Put(w.savepointTx)

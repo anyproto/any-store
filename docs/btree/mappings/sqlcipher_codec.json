@@ -1,0 +1,165 @@
+{
+  "_about": {
+    "purpose": "Block-level mapping from each SQLCipher codec hook (any `#if[def] ... SQLITE_HAS_CODEC ...` block in ../sqlcipher/src) to its any-store Go counterpart. Used to verify every codec invocation site SQLCipher patches into stock SQLite has an equivalent in our btree port — and to make any intentional omission explicit.",
+    "format": "key = `file:linestart-lineend` (the `#if[def]` line through the matching `#endif` line). value = { code: [\"file.go:linestart-lineend\", …], note: \"…\" }. An empty `code` list means the hook is intentionally omitted; the `note` says why.",
+    "regenerate": "Hand-edited. The companion script `extract_codec_blocks` re-scans `../sqlcipher/src` and writes every block to `sqlcipher_codec_blocks.gen.json`; `mappings_diff` then surfaces blocks present upstream but missing here (`+ codec`) and rows here whose block no longer exists upstream (`- codec`). Add or remove rows whenever the diff is non-empty.",
+    "sources": "../sqlcipher/src is at v4.10.0 (or whatever ships in your local sqlcipher/ dir); ../sqlitec/src is the matching stock SQLite for context. Any-store deliberately differs from SQLCipher in shape (Go, no rollback journal, no sub-journal, no VACUUM, no SQL surface, single-fd-per-process WAL) — those drifts are recorded as `code: []` rows below.",
+    "out_of_scope_files": "extract_codec_blocks's default `-skip` list excludes files that are not codec hooks into stock SQLite but rather SQLCipher's own implementation: `crypto_cc.c` / `crypto_libtomcrypt.c` / `crypto_openssl.c` (alternate cipher backends), `sqlcipher.c` / `sqlcipher.h` (the SQLCipher core: KDF, HMAC, salt handling, codec_ctx — ~3.9k lines, all wrapped in one file-scope `#ifdef SQLITE_HAS_CODEC`), `tclsqlite.c` (TCL bindings), and `test*.c` (test harness). Any-store's moral equivalent of the `sqlcipher.{c,h}` body is the `Codec` interface (internal/btree/codec.go) plus the four bundled implementations: codec_aes.go, codec_chacha.go, codec_kdf.go, codec_cksum.go. Block-level mapping isn't useful at sqlcipher.c's scale — line numbers in a 3.9k-line file shift on every upstream change, and the architectural split is interface-level. Treat sqlcipher.c as 'replace, don't port'.",
+    "limitations": "This map covers ONLY blocks SQLCipher delineates with `#if[def] ... SQLITE_HAS_CODEC ...`. Silent edits to stock SQLite source not wrapped in a codec guard would not appear in this map; detecting those would require diffing ../sqlcipher/src against ../sqlitec/src on each upstream sync. Such silent edits are not currently audited — open a follow-up if a future SQLCipher version is suspected of containing them."
+  },
+  "wal.c:3966-3970": {
+    "code": [
+      "wal.go:2001-2016"
+    ],
+    "note": "walWriteOneFrame fresh-append codec hook. SQLCipher swaps p->pData for sqlcipherPagerCodec(p) before walWriteToLog. Go mirrors this in writeFrames' fresh-append branch — encryptPageWithCodec(codec, codecScratch, p.data, p.pgno) writes ciphertext (with cksum trailer / AEAD tag) into codecScratch, then walChecksum runs over that ciphertext and WriteAt persists it. Equivalent."
+  },
+  "wal.c:4155-4159": {
+    "code": [
+      "wal.go:1956-1974"
+    ],
+    "note": "walFrames in-tx frame-reuse codec hook — the page being overwritten in place at frame iWrite must be passed through the codec before WriteAt. Originally OMITTED from the Go port (writeFrames wrote p.data verbatim). Added 2026-04-28 after the bug surfaced as `decrypt page 2: encryption: page authentication failed` once a single page got dirtied → spilled → re-dirtied → reused within one transaction (multikey index build past ~150K docs filled the writer cache enough to repeat-spill the master btree). The reused frame contained plaintext + a junk trailer (the last 16 plaintext bytes of the page), so cksumCodec.Decrypt on read computed XXH3-128 over the plaintext body and got a mismatch. Now matches SQLCipher: encrypt p.data via encryptPageWithCodec → WriteAt the ciphertext."
+  },
+  "pager.c:413-422": {
+    "code": [
+      "codec.go:128-162"
+    ],
+    "note": "CODEC1 / CODEC2 macro definitions. SQLCipher uses these to in-place encrypt/decrypt page buffers in pager paths (return-and-bail or pass-through-if-no-codec). Go has the same passthrough semantics in encryptWith / decryptWith, plus the higher-level encryptPageWithCodec / decryptPageWithCodec that handle the page-1 plaintext-prefix carve-out. We don't use macros — Go's nil-codec branch in those helpers is the equivalent of the `#else` arm (`O = (char*)D`)."
+  },
+  "pager.c:714-719": {
+    "code": [
+      "pager.go:201-219",
+      "wal.go:1280-1293",
+      "pcache.go:81-95"
+    ],
+    "note": "Pager struct codec fields (xCodec, xCodecSizeChng, xCodecFree, pCodec). In Go the codec lives on the pager (codec, codecScratch, codecAEAD), and a copy is propagated to the wal struct (set in initNewDB / open) and to each pcache (per-tx scratch on first use). xCodecFree has no equivalent — Go's GC reclaims codec state. xCodecSizeChng has no equivalent because page size and reserved space are fixed at open."
+  },
+  "pager.c:835-837": {
+    "code": [],
+    "note": "sqlite3PagerDirectReadOk — direct subpage read fast path that bypasses the cache. SQLCipher disables it when a codec is installed (the read would skip decrypt). Any-store has no equivalent fast path; getPageWriter/getPageReader/readTempPage always go through decryptPageWithCodec. Drift, intentional."
+  },
+  "pager.c:1080-1082": {
+    "code": [],
+    "note": "setGetterMethod — selects getPageMMap when no codec is installed. Any-store has no separate mmap getter; the single getPage path reads via the OS file API and decrypts. Drift, intentional."
+  },
+  "pager.c:2290-2299": {
+    "code": [],
+    "note": "pagerReportSize — invokes xCodecSizeChng so the codec can re-derive per-page state when page size or reserved space changes. In any-store both are immutable after open (validated at Open / initNewDB), so no callback is ever needed. Drift, intentional."
+  },
+  "pager.c:2303-2315": {
+    "code": [],
+    "note": "sqlite3PagerAlignReserve (VACUUM target adjusts reserved bytes). Any-store has no VACUUM. Drift, intentional."
+  },
+  "pager.c:2370-2374": {
+    "code": [],
+    "note": "pager_playback_one_page jrnlEnc flag — selects whether journal pages are codec-encrypted. Any-store is WAL-only (no rollback journal, no sub-journal), so the entire pager_playback_one_page function and its codec hooks (this row, pager.c:2507-2513, pager.c:2522-2528, pager.c:2583-2585) have no port. Drift, intentional."
+  },
+  "pager.c:2507-2513": {
+    "code": [],
+    "note": "pager_playback_one_page — re-encrypt sub-journal page before writing to DB file (only when jrnlEnc==0, i.e. in-memory sub-journal). No port: any-store has no sub-journal. See pager.c:2368-2372."
+  },
+  "pager.c:2522-2528": {
+    "code": [],
+    "note": "pager_playback_one_page — backup hand-off during journal playback: decrypt-then-re-encrypt around sqlite3BackupUpdate when journal data was already encrypted. No port: any-store has no rollback-journal playback path. Backup is implemented separately (backup.go) and uses the writer's own page cache, where pages are already plaintext."
+  },
+  "pager.c:2583-2585": {
+    "code": [],
+    "note": "pager_playback_one_page — decode page just read from journal back into pcache (when jrnlEnc==1). No port: any-store has no rollback journal."
+  },
+  "pager.c:4334-4336": {
+    "code": [],
+    "note": "sqlite3PagerClose — invokes xCodecFree on close. GAP: the Codec interface (codec.go) has no Close / io.Closer method, so any codec holding external resources — KMS handle, HSM session, file descriptor, OS crypto context — leaks them when the DB closes. The bundled codecs (aes / chacha / cksum / kdf) are memory-only and fine under GC, but a third-party codec installed via Options.Codec has no shutdown signal. Add an optional Close() error to the Codec interface, type-assert it from db.Close, and call it after the pager has fully released the codec reference."
+  },
+  "pager.c:4681-4685": {
+    "code": [],
+    "note": "subjournalPage — encrypt page before writing to sub-journal (unless sub-journal is in-memory). No port: any-store has no sub-journal. Savepoint rollback uses an in-memory plaintext copy keyed off the writer cache (pager.go getWritablePage savepoint copy)."
+  },
+  "pager.c:5781-5783": {
+    "code": [],
+    "note": "getPageMMap assert(xCodec==0). No port: any-store has no separate mmap getter. See pager.c:1080-1082."
+  },
+  "pager.c:7258-7297": {
+    "code": [
+      "pager.go:499-511",
+      "pager.go:524-537",
+      "codec.go:149-181",
+      "codec_cksum.go:65-103"
+    ],
+    "note": "sqlcipherPagerSetCodec / sqlcipherPagerGetCodec / sqlcipherPagerCodec — install/retrieve the codec, and the WAL-side helper that returns a freshly-encrypted page buffer. Go's installCodec attaches the codec to the pager (and propagates it to the wal). The fresh-encrypted-buffer helper sqlcipherPagerCodec(p) is replaced by encryptPage(scratch, src, pgno) / encryptPageWithCodec — call sites (wal.go writeFrames fresh-append + reuse paths, pager.go initNewDB for page 1) thread their own scratch buffers in instead of allocating a fresh buffer per call."
+  },
+  "pager.c:8005-8021": {
+    "code": [],
+    "note": "sqlite3pager_is_sj_pgno / sqlite3pager_error / sqlite3pager_reset — sub-journal helpers exposed for SQLCipher's own modules. No port: any-store has no sub-journal."
+  },
+  "pager.h:149-151": {
+    "code": [],
+    "note": "Header declaration for sqlite3PagerAlignReserve (VACUUM-time reserved-bytes alignment). No port: pager.c:2303-2315 isn't ported either, so the declaration is unnecessary in Go (the pager type/methods are not exposed in a separate header)."
+  },
+  "pager.h:250-252": {
+    "code": [],
+    "note": "Header declaration for sqlcipherPagerCodec — gated on SQLITE_HAS_CODEC && !SQLITE_OMIT_WAL. No port: see pager.c:7258-7297 for the implementation rationale; declarations in Go are colocated with definitions."
+  },
+  "main.c:3318-3352": {
+    "code": [],
+    "note": "sqlite3CodecQueryParameters — parses `?key=`, `?hexkey=`, `?textkey=` URI parameters and forwards to sqlite3_key_v2. No port: any-store does not accept URI-encoded keys; callers pass the key on Options.Key (32 raw bytes) or supply a fully-built Codec via Options.Codec. URI parameter routing is intentionally outside the btree layer."
+  },
+  "main.c:3716-3718": {
+    "code": [],
+    "note": "openDatabase call site that invokes sqlite3CodecQueryParameters during connection open. No port: see main.c:3318-3352. any-store's btree.Open builds the codec from the supplied Options before opening the file."
+  },
+  "sqliteInt.h:5008-5012": {
+    "code": [],
+    "note": "Declaration / no-op fallback macro for sqlite3CodecQueryParameters in the global SQLite internal header. No port: see main.c:3318-3352. Header-vs-source split is a C concern with no Go analog (Go interfaces and method definitions live in the same package)."
+  },
+  "global.c:172-176": {
+    "code": [],
+    "note": "Default value of SQLITE_USE_URI: 1 if SQLITE_HAS_CODEC, 0 otherwise. No port: any-store does not parse URI strings — see main.c:3318-3352 for URI-key drift."
+  },
+  "malloc.c:173-181": {
+    "code": [],
+    "note": "sqlite3MallocInit installs sqlcipher_init_memmethods, which wraps every sqlite3_malloc / sqlite3_free so that freed bytes are zeroed before they go back on the heap. Defense against key / plaintext recovery from a freed heap region (forensic resistance). GAP: any-store has no equivalent. Go's runtime does not expose allocator interception, and the GC zeroes-on-allocate (next user of the page) but not on-free, so freed buffers can sit in heap until the next reuse — and if they leak into a goroutine stack that's later swapped, even longer. Concretely affected: codec key material held inside Codec implementations, the writer's codecScratch (pager.go:206-214) and per-cache codecScratch (pcache.go:81-95) which transiently hold plaintext pages, and the aeadScratch nonce/AAD buffers. Mitigations available today: codec implementations can wipe their own key bytes on Close (after we add a Close method, see pager.c:4334-4336). Wiping the pager-owned scratch buffers requires an explicit zeroing pass at db.Close, which is currently not done. Document this gap in the encryption notes; if forensic resistance is a requirement, a runtime.KeepAlive + explicit clear() on shutdown is the minimum."
+  },
+  "attach.c:230-272": {
+    "code": [],
+    "note": "ATTACH ... KEY 'x' — extracts the key argument from the SQL ATTACH statement, builds the attached connection, and forwards the key via sqlite3CodecAttach. No port: any-store has no SQL surface, no ATTACH semantics, and no per-connection multi-database namespace. Each *DB is opened independently with its own Options.Key/Options.Codec."
+  },
+  "backup.c:156-175": {
+    "code": [],
+    "note": "sqlite3_backup_init refuses cross-encryption-status backups (one DB keyed, the other plaintext) because SQLCipher copies pages verbatim and a mismatched codec would either leave ciphertext where plaintext is expected or vice versa. Any-store's backup (backup.go) does NOT copy verbatim: src.pager.getPageReader transparently runs the source codec's Decrypt before handing srcData to onePage, and the destination's writer cache → wal.writeFrames runs dst's codec's Encrypt at commit. So plaintext-src → encrypted-dst and encrypted-src → plaintext-dst both 'work' at the byte level. PARTIAL GAP, salt edition: any-store stores the KDF salt in dbHeader (page 1, bytes 24-32, see codec_kdf.go:SaltLen). backup.onePage copies page 1 verbatim from src to dst (after patching only the DatabaseSize field at offset 28), so the destination ends up with the SOURCE's salt baked into its own page 1. For raw-key codecs (Options.Codec / Options.Key bound directly) this is harmless. For KDF-derived codecs (passphrase + salt → key) the dst, on the next reopen, will re-derive its key from (dst's passphrase, src's salt) — wrong key, can't decrypt. SQLCipher's check rejects this case at Init; any-store currently does not. Either reject the cross-codec case in BackupInit, or refresh the salt on dst's page 1 after copy."
+  },
+  "backup.c:261-268": {
+    "code": [],
+    "note": "backupOnePage — capture src/dst reserved-bytes and codec presence so the page-size-change branch below (281-299) can reject incompatible backups. No port: any-store backup runs over already-decrypted in-memory pages (see backup.go), so reserved-bytes alignment is not a backup concern."
+  },
+  "backup.c:281-299": {
+    "code": [],
+    "note": "backupOnePage — refuses backup if src and dst page sizes differ AND a codec is present, or attempts to align dst reserved-bytes to src. No port: any-store enforces matching page size at backup setup (BackupInit), so this branch is unreachable. Drift, intentional."
+  },
+  "backup.c:801-803": {
+    "code": [],
+    "note": "sqlite3BtreeCopyFile — calls sqlite3PagerAlignReserve so dst reserved-bytes match src. No port: any-store has no equivalent CopyFile-from-btree primitive (backup is the only cross-DB copy path), and reserved-bytes alignment is enforced at BackupInit."
+  },
+  "pragma.c:444-446": {
+    "code": [],
+    "note": "PRAGMA key = '...' / PRAGMA hexkey = '...' — sets the encryption key for the DB. No port: any-store has no SQL surface. Keys are passed via Options.Key at Open time; rekey is not supported. See also pragma.c:520-525, pragma.c:2783-2829."
+  },
+  "pragma.c:520-525": {
+    "code": [],
+    "note": "PRAGMA rekey = '...' — re-encrypts the entire DB with a new key. GAP: any-store has no rekey API. The 'use backup' workaround only works for raw-key codecs and even then is awkward (copy through a fresh DB), and it does NOT work for KDF-derived codecs because page 1's salt gets copied verbatim and the destination ends up with the source's salt in its header (see backup.c:156-175 GAP note). Add a real Rekey path: walk every page through src.codec.Decrypt → dst.codec.Encrypt with a fresh salt for KDF codecs, written under a single tx so a crash leaves either the old or new key intact. This is a non-trivial feature but it's the only correct way to rotate a key today."
+  },
+  "pragma.c:2783-2829": {
+    "code": [],
+    "note": "PRAGMA cipher_*  family (cipher_version, cipher_provider, cipher_settings, cipher_default_kdf_iter, cipher_page_size, cipher_use_hmac, …). No port: any-store has no SQL surface. Comparable per-DB knobs are exposed on Options (PageSize, AutoCheckpointAfter, NoCommitSync, …); per-codec knobs (KDF iteration count, HMAC settings) live on the Codec implementation."
+  },
+  "vacuum.c:262-272": {
+    "code": [],
+    "note": "sqlite3RunVacuum — calls sqlite3PagerAlignReserve on the temp DB so its reserved-bytes match the source. No port: any-store has no VACUUM."
+  },
+  "util.c:1891-1912": {
+    "code": [],
+    "note": "sqlite3HexToBlob — converts SQL `x'hhhh'` BLOB-literal hex syntax to bytes. SQLCipher widens the gate (`!SQLITE_OMIT_BLOB_LITERAL || SQLITE_HAS_CODEC`) so the helper is also available even when blob literals are otherwise omitted, because the codec layer needs hex-string parsing for `PRAGMA hexkey = 'AABBCC…'`. No port: any-store has no SQL surface and consumes raw 32-byte keys via Options.Key — see pragma.c:444-446."
+  },
+  "sqlite.h.in:6776-6832": {
+    "code": [],
+    "note": "Public API: sqlite3_key / sqlite3_key_v2 / sqlite3_rekey / sqlite3_rekey_v2 / sqlite3_activate_see. SQLCipher's runtime entrypoints to install or rotate the encryption key on an open connection. PARTIAL GAP: keys ARE passed via Options.Key at btree.Open (sqlite3_key analog), but there is no rekey analog — see pragma.c:520-525. sqlite3_activate_see is a no-op (SEE is the closed-source SQLite Encryption Extension; SQLCipher provides this stub for binary compatibility). The any-store equivalent of sqlite3_key would be a (currently absent) DB.SetKey method that rebuilds the codec on an already-open DB; today the key is immutable post-Open."
+  }
+}

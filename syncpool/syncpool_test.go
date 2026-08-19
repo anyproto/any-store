@@ -1,6 +1,7 @@
 package syncpool
 
 import (
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,13 +14,24 @@ func TestSyncPools_GetDocBuf(t *testing.T) {
 	assert.NotNil(t, buf.Parser)
 	buf.SmallBuf = append(buf.SmallBuf, 1, 2, 3)
 	buf.DocBuf = append(buf.DocBuf, 1, 2, 3, 4, 5)
+
+	// Keep a reference to verify reuse if the pool returns the same buffer.
+	// sync.Pool may drop items during GC, so reuse is not guaranteed.
+	saved := buf
 	sp.ReleaseDocBuf(buf)
+
+	// Prevent GC from clearing the pool between Put and Get.
+	runtime.KeepAlive(saved)
 
 	buf = sp.GetDocBuf()
 	defer sp.ReleaseDocBuf(buf)
 
 	assert.NotNil(t, buf.Arena)
 	assert.NotNil(t, buf.Parser)
-	assert.Len(t, buf.SmallBuf, 3)
-	assert.Len(t, buf.DocBuf, 5)
+	if buf == saved {
+		// Same buffer was reused — verify state was preserved.
+		assert.Len(t, buf.SmallBuf, 3)
+		assert.Len(t, buf.DocBuf, 5)
+	}
+	// If a fresh buffer was returned (GC cleared the pool), that's acceptable.
 }

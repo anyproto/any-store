@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'cmd/any-store-cli/v*.*.*'
+      - 'cmd/any-store-cli2/v*.*.*'
 
 permissions: write-all
 

@@ -13,7 +13,7 @@ else
 endif
 
 build:
-	cd cmd/any-store-cli && GOOS=$(BUILD_GOOS) GOARCH=$(BUILD_GOARCH) go build -v $(TAGS) -o ../../bin/any-store-cli
+	cd cmd/any-store-cli2 && GOOS=$(BUILD_GOOS) GOARCH=$(BUILD_GOARCH) go build -v $(TAGS) -o ../../bin/any-store-cli2
 
 test:
 	go test ./... --cover $(TAGS)

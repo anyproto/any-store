@@ -1,13 +1,14 @@
 package query
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/syncpool"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/syncpool"
 )
 
 func TestComp(t *testing.T) {
@@ -216,6 +217,62 @@ func TestAnd(t *testing.T) {
 	})
 }
 
+// TestAndIndexBounds_SameFieldOverApprox pins the contract: And.IndexBounds
+// returns a SOUND OVER-APPROXIMATION (the first contributing conjunct's bounds),
+// NOT the intersection. Intersecting would be unsound for array/multi-key fields
+// (see And.IndexBounds and TestQueryCount_ArrayTwoSidedRange). Here two range
+// conjuncts on "a" yield just the first, [5,+inf), a superset a FilterIter trims.
+func TestAndIndexBounds_SameFieldOverApprox(t *testing.T) {
+	f, err := ParseCondition(`{"$and":[{"a":{"$gte":5}},{"a":{"$lte":10}}]}`)
+	require.NoError(t, err)
+	bs := f.IndexBounds("a", nil)
+	require.Len(t, bs, 1)
+	assert.Equal(t, []byte(newBoundKey(5)), []byte(bs[0].Start))
+	assert.True(t, bs[0].StartInclude)
+	assert.Empty(t, []byte(bs[0].End), "over-approx keeps the first conjunct's open upper bound (+inf), not the $lte")
+}
+
+// TestAndIndexBounds_InAndRange_OverApprox pins that an $in conjoined with a
+// range yields the full $in set (the first conjunct), NOT the in-values trimmed
+// to the range. The dropped $gte is re-applied by a FilterIter; for Count the
+// CountOnly fast path is gated off (indexCoversFilter rejects the 2-predicate
+// field) so the over-approx is never miscounted.
+func TestAndIndexBounds_InAndRange_OverApprox(t *testing.T) {
+	f, err := ParseCondition(`{"a":{"$in":[1,2,5,10]},"$and":[{"a":{"$gte":5}}]}`)
+	require.NoError(t, err)
+	bs := f.IndexBounds("a", nil)
+	require.Len(t, bs, 4, "all four $in values, not just those >= 5")
+	assert.Equal(t, []byte(newBoundKey(1)), []byte(bs[0].Start))
+	assert.Equal(t, []byte(newBoundKey(10)), []byte(bs[3].Start))
+}
+
+// TestAndIndexBounds_DisjointConjuncts_OverApproxNotEmpty pins that disjoint
+// conjuncts (no common value) do NOT collapse to empty bounds — they
+// over-approximate to the first conjunct's $in set. The CountOnly over-count
+// wrong answer is prevented instead at the planner gate
+// (indexCoversFilter rejects a >1-predicate field) and re-checked end-to-end by
+// TestQueryCount_AndConjunctionLostInCount.
+func TestAndIndexBounds_DisjointConjuncts_OverApproxNotEmpty(t *testing.T) {
+	f, err := ParseCondition(`{"a":{"$in":[1,2]},"$and":[{"a":{"$gte":5}}]}`)
+	require.NoError(t, err)
+	bs := f.IndexBounds("a", nil)
+	require.Len(t, bs, 2, "over-approx returns the $in bounds, never empty (would drop matches for array fields)")
+	assert.True(t, bs.Contains(newBoundKey(1)))
+	assert.True(t, bs.Contains(newBoundKey(2)))
+}
+
+// TestOrIndexBounds_DisjointAndBranch_SafeOverApprox pins that an And nested in
+// an Or stays an over-approximation: an unsatisfiable And branch must NOT
+// collapse the Or bounds to empty and drop the satisfiable a==1 disjunct. Index
+// bounds must always be a superset of the match set (a FilterIter re-checks them).
+func TestOrIndexBounds_DisjointAndBranch_SafeOverApprox(t *testing.T) {
+	f, err := ParseCondition(`{"$or":[{"a":1},{"$and":[{"a":{"$in":[1,2,3]}},{"a":{"$gte":5}}]}]}`)
+	require.NoError(t, err)
+	bs := f.IndexBounds("a", nil)
+	require.NotEmpty(t, bs, "Or bounds must not collapse to empty for a satisfiable query")
+	assert.True(t, bs.Contains(newBoundKey(1)), "bounds must include the matching value a=1")
+}
+
 func TestOr(t *testing.T) {
 	f, err := ParseCondition(`{"$or":[{"a":1},{"b":"2"}]}`)
 	require.NoError(t, err)
@@ -337,6 +394,19 @@ func TestTypeFilter(t *testing.T) {
 	})
 }
 
+func TestTypeFilter_ObjectID(t *testing.T) {
+	a := &anyenc.Arena{}
+	doc := a.NewObject()
+	doc.Set("a", a.NewObjectID(anyenc.NewObjectID()))
+
+	for _, spec := range []string{`{"a":{"$type":"objectId"}}`, `{"a":{"$type":11}}`} {
+		f, err := ParseCondition(spec)
+		require.NoError(t, err, spec)
+		assert.True(t, f.Ok(doc, nil), spec)
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"a":"x"}`), nil), spec)
+	}
+}
+
 func TestRegexp(t *testing.T) {
 	t.Run("ok", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "a"}}`)
@@ -351,6 +421,25 @@ func TestRegexp(t *testing.T) {
 		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": "baaa"}`), nil))
 		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": "A"}`), nil))
 		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": "a"}`), nil))
+	})
+	t.Run("ok - $options: i", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$regex": "newsletter", "$options": "i"}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": "Newsletter weekly"}`), nil))
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": "my newsletter digest"}`), nil))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": "other"}`), nil))
+	})
+	t.Run("ok - $options before $regex", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$options": "i", "$regex": "^a"}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": "Abc"}`), nil))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": "bA"}`), nil))
+	})
+	t.Run("ok - empty $options is a plain $regex", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$regex": "a", "$options": ""}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": "a"}`), nil))
+		assert.False(t, f.Ok(anyenc.MustParseJson(`{"name": "A"}`), nil))
 	})
 	t.Run("ok - array", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^(?i)a"}}`)
@@ -381,6 +470,49 @@ func TestRegexp(t *testing.T) {
 		require.NoError(t, err)
 		bounds := f.IndexBounds("name", Bounds{})
 		assert.Len(t, bounds, 0)
+	})
+	t.Run("index: ^prefix with $options i - no prefix", func(t *testing.T) {
+		// Case-insensitive matching must not narrow the scan to the
+		// literal-case prefix range.
+		f, err := ParseCondition(`{"name":{"$regex": "^prefix", "$options": "i"}}`)
+		require.NoError(t, err)
+		bounds := f.IndexBounds("name", Bounds{})
+		assert.Len(t, bounds, 0)
+	})
+	t.Run("index: ^prefix with $options m - no prefix", func(t *testing.T) {
+		// Under m the anchor matches at any line start, so "x\nprefix"
+		// matches while sorting outside the literal prefix range.
+		f, err := ParseCondition(`{"name":{"$regex": "^prefix", "$options": "m"}}`)
+		require.NoError(t, err)
+		bounds := f.IndexBounds("name", Bounds{})
+		assert.Len(t, bounds, 0)
+	})
+	t.Run("index: ^prefix with $options s - keeps prefix", func(t *testing.T) {
+		// s only changes what '.' matches; it cannot affect a literal
+		// anchored prefix, so the narrow scan stays sound.
+		f, err := ParseCondition(`{"name":{"$regex": "^prefix", "$options": "s"}}`)
+		require.NoError(t, err)
+		bounds := f.IndexBounds("name", Bounds{})
+		assert.Len(t, bounds, 1)
+	})
+	t.Run("ok - duplicate $options keys are last-wins", func(t *testing.T) {
+		// Duplicate keys collapse last-wins in the JSON parser (standard JSON
+		// behavior, before operator validation); the surviving occurrence is
+		// then validated like any other.
+		f, err := ParseCondition(`{"name":{"$regex":"^a","$options":"!","$options":"i"}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"name": "Abc"}`), nil))
+		_, err = ParseCondition(`{"name":{"$regex":"^a","$options":"i","$options":"!"}}`)
+		require.Error(t, err)
+	})
+	t.Run("ok - $options String round-trip", func(t *testing.T) {
+		f, err := ParseCondition(`{"name":{"$regex":"^a","$options":"i"}}`)
+		require.NoError(t, err)
+		assert.Equal(t, `{"name": {"$regex": "^a", "$options": "i"}}`, f.String())
+		f2, err := ParseCondition(f.String())
+		require.NoError(t, err)
+		assert.True(t, f2.Ok(anyenc.MustParseJson(`{"name": "Abc"}`), nil))
+		assert.False(t, f2.Ok(anyenc.MustParseJson(`{"name": "bc"}`), nil))
 	})
 	t.Run("index: ^prefix\\.test - return prefix.test", func(t *testing.T) {
 		f, err := ParseCondition(`{"name":{"$regex": "^prefix\.test"}}`)
@@ -475,6 +607,240 @@ func TestIn(t *testing.T) {
 		assert.False(t, f.Ok(doc, docBuf))
 	})
 
+	// $in is an OR of equalities: an array member of the set must match the
+	// WHOLE field array, mirroring Comp.Ok — an empty array can only match
+	// this way, and the index/Count path already includes these matches.
+	t.Run("ok whole array member", func(t *testing.T) {
+		f, err := ParseCondition(`{"b": {"$in": [[3,2,1], 9]}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(doc, docBuf))
+	})
+	t.Run("ok empty array member", func(t *testing.T) {
+		f, err := ParseCondition(`{"e": {"$in": [[], 9]}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"e":[]}`), docBuf))
+	})
+	t.Run("not ok different whole array", func(t *testing.T) {
+		f, err := ParseCondition(`{"b": {"$in": [[1,2,3]]}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(doc, docBuf))
+	})
+
+	// A null member matches a MISSING field, keeping $in consistent with
+	// {"$eq":null} (Comp.Ok probes encodedNull for a nil value) and with the
+	// index/Count path (a missing field is indexed under TypeNull, and
+	// In.IndexBounds emits a point bound for the null member).
+	t.Run("null member matches missing field", func(t *testing.T) {
+		f, err := ParseCondition(`{"x": {"$in": [null]}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(doc, docBuf))
+	})
+	t.Run("no null member: missing field not matched", func(t *testing.T) {
+		f, err := ParseCondition(`{"x": {"$in": [1, "y"]}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(doc, docBuf))
+	})
+	t.Run("null member matches explicit null", func(t *testing.T) {
+		f, err := ParseCondition(`{"x": {"$in": [null]}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"x":null}`), docBuf))
+	})
+	t.Run("null member matches null array element", func(t *testing.T) {
+		f, err := ParseCondition(`{"x": {"$in": [null]}}`)
+		require.NoError(t, err)
+		assert.True(t, f.Ok(anyenc.MustParseJson(`{"x":[null,1]}`), docBuf))
+	})
+	t.Run("hand-built In: nil probe by null membership", func(t *testing.T) {
+		withNull := In{Values: map[string]struct{}{string(encodedNull): {}}}
+		assert.True(t, withNull.Ok(nil, docBuf))
+		withoutNull := In{Values: map[string]struct{}{"x": {}}}
+		assert.False(t, withoutNull.Ok(nil, docBuf))
+	})
+	// Complements keep excluding missing fields: $nin parses to Nor-of-$eq
+	// (Comp already matches missing via encodedNull), and Not inverts Ok.
+	t.Run("nin null excludes missing field", func(t *testing.T) {
+		f, err := ParseCondition(`{"x": {"$nin": [null]}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(doc, docBuf))
+	})
+	t.Run("not-in null excludes missing field", func(t *testing.T) {
+		f, err := ParseCondition(`{"x": {"$not": {"$in": [null]}}}`)
+		require.NoError(t, err)
+		assert.False(t, f.Ok(doc, docBuf))
+	})
+}
+
+func TestIn_IndexBounds(t *testing.T) {
+	t.Run("point lookups", func(t *testing.T) {
+		in := NewInValue(
+			anyenc.MustParseJson(`1`),
+			anyenc.MustParseJson(`2`),
+			anyenc.MustParseJson(`3`),
+		)
+		bs := in.IndexBounds("a", nil)
+		require.Len(t, bs, 3)
+		// bounds should be sorted
+		for i := 1; i < len(bs); i++ {
+			assert.True(t, bytes.Compare(bs[i-1].Start, bs[i].Start) < 0, "bounds should be sorted")
+		}
+		// each bound is a point lookup
+		for _, b := range bs {
+			assert.True(t, b.StartInclude)
+			assert.True(t, b.EndInclude)
+			assert.Equal(t, b.Start, b.End)
+		}
+	})
+	t.Run("over limit returns input", func(t *testing.T) {
+		values := make(map[string]struct{}, orExpressionLimit+1)
+		for i := 0; i < orExpressionLimit+1; i++ {
+			values[string(anyenc.AppendAnyValue(nil, i))] = struct{}{}
+		}
+		in := In{Values: values}
+		input := Bounds{{Start: []byte{1}, End: []byte{2}, StartInclude: true, EndInclude: true}}
+		bs := in.IndexBounds("a", input)
+		assert.Equal(t, input, bs)
+	})
+	t.Run("duplicates are merged", func(t *testing.T) {
+		in := NewInValue(
+			anyenc.MustParseJson(`1`),
+			anyenc.MustParseJson(`1`),
+			anyenc.MustParseJson(`2`),
+		)
+		bs := in.IndexBounds("a", nil)
+		assert.Len(t, bs, 2)
+	})
+	t.Run("appends to existing bounds", func(t *testing.T) {
+		in := NewInValue(
+			anyenc.MustParseJson(`5`),
+		)
+		existing := Bounds{{
+			Start: anyenc.AppendAnyValue(nil, 1), End: anyenc.AppendAnyValue(nil, 1),
+			StartInclude: true, EndInclude: true,
+		}}
+		bs := in.IndexBounds("a", existing)
+		assert.Len(t, bs, 2)
+	})
+}
+
+func TestKey_IndexBounds(t *testing.T) {
+	t.Run("field match delegates to inner", func(t *testing.T) {
+		k := Key{
+			Path:   []string{"a"},
+			Filter: NewComp(CompOpEq, 1),
+		}
+		bs := k.IndexBounds("a", nil)
+		require.Len(t, bs, 1)
+		assert.Equal(t, anyenc.Tuple(anyenc.AppendAnyValue(nil, 1)), bs[0].Start)
+	})
+	t.Run("field mismatch returns input", func(t *testing.T) {
+		k := Key{
+			Path:   []string{"a"},
+			Filter: NewComp(CompOpEq, 1),
+		}
+		bs := k.IndexBounds("b", nil)
+		assert.Nil(t, bs)
+	})
+}
+
+func TestAll_IndexBounds(t *testing.T) {
+	a := All{}
+	input := Bounds{{Start: []byte{1}, End: []byte{2}}}
+	bs := a.IndexBounds("a", input)
+	assert.Equal(t, input, bs)
+
+	bs = a.IndexBounds("a", nil)
+	assert.Nil(t, bs)
+}
+
+func TestExists_IndexBounds(t *testing.T) {
+	e := Exists{}
+	input := Bounds{{Start: []byte{1}, End: []byte{2}}}
+	bs := e.IndexBounds("a", input)
+	assert.Equal(t, input, bs)
+
+	bs = e.IndexBounds("a", nil)
+	assert.Nil(t, bs)
+}
+
+func TestCompNe_IndexBounds(t *testing.T) {
+	cmp := NewComp(CompOpNe, 5)
+	bs := cmp.IndexBounds("a", nil)
+	require.Len(t, bs, 2)
+	val5 := anyenc.Tuple(anyenc.AppendAnyValue(nil, 5))
+	// first bound: (-inf, 5)
+	assert.Nil(t, bs[0].Start)
+	assert.Equal(t, val5, bs[0].End)
+	assert.False(t, bs[0].EndInclude)
+	// second bound: (5, inf)
+	assert.Equal(t, val5, bs[1].Start)
+	assert.Nil(t, bs[1].End)
+	assert.False(t, bs[1].StartInclude)
+}
+
+func TestOr_IndexBounds_NonOverlapping(t *testing.T) {
+	// Non-overlapping ranges from different branches stay separate
+	f, err := ParseCondition(`{"$or":[{"a":{"$lte":5}},{"a":{"$gte":10}}]}`)
+	require.NoError(t, err)
+	bs := f.IndexBounds("a", nil)
+	require.Len(t, bs, 2)
+	// first: (-inf, 5]
+	assert.Nil(t, bs[0].Start)
+	assert.Equal(t, anyenc.Tuple(anyenc.AppendAnyValue(nil, 5)), bs[0].End)
+	assert.True(t, bs[0].EndInclude)
+	// second: [10, inf)
+	assert.Equal(t, anyenc.Tuple(anyenc.AppendAnyValue(nil, 10)), bs[1].Start)
+	assert.True(t, bs[1].StartInclude)
+	assert.Nil(t, bs[1].End)
+}
+
+func BenchmarkIndexBounds(b *testing.B) {
+	b.Run("Comp/Eq", func(b *testing.B) {
+		cmp := NewComp(CompOpEq, 42)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			cmp.IndexBounds("a", nil)
+		}
+	})
+	b.Run("In/10", func(b *testing.B) {
+		benchInIndexBounds(b, 10)
+	})
+	b.Run("In/100", func(b *testing.B) {
+		benchInIndexBounds(b, 100)
+	})
+	b.Run("In/500", func(b *testing.B) {
+		benchInIndexBounds(b, 500)
+	})
+	b.Run("And/2fields", func(b *testing.B) {
+		f, _ := ParseCondition(`{"a":1, "b":2}`)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			f.IndexBounds("a", nil)
+		}
+	})
+	b.Run("Or/3branches", func(b *testing.B) {
+		f, _ := ParseCondition(`{"$or":[{"a":1},{"a":2},{"a":3}]}`)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			f.IndexBounds("a", nil)
+		}
+	})
+}
+
+func benchInIndexBounds(b *testing.B, n int) {
+	values := make([]*anyenc.Value, n)
+	a := &anyenc.Arena{}
+	for i := range values {
+		values[i] = a.NewNumberInt(i)
+	}
+	in := NewInValue(values...)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		in.IndexBounds("a", nil)
+	}
 }
 
 func BenchmarkFilter_Ok(b *testing.B) {
@@ -504,5 +870,74 @@ func BenchmarkFilter_Ok(b *testing.B) {
 	})
 	b.Run("all", func(b *testing.B) {
 		bench(b, `{"b":{"$all":[1,3]}}`)
+	})
+	b.Run("string eq", func(b *testing.B) {
+		bench(b, `{"c":"test"}`)
+	})
+	b.Run("string eq miss", func(b *testing.B) {
+		bench(b, `{"c":"other"}`)
+	})
+	b.Run("gt", func(b *testing.B) {
+		bench(b, `{"a":{"$gt":1}}`)
+	})
+	b.Run("ne", func(b *testing.B) {
+		bench(b, `{"a":{"$ne":5}}`)
+	})
+	b.Run("type miss", func(b *testing.B) {
+		bench(b, `{"c":2}`) // number filter against a string field
+	})
+}
+
+// --- Coverage tests from filter_size_coverage_test.go ---
+
+// TestSize_Coverage_IndexBoundsComposition verifies that $size contributes
+// no bounds of its own when composed with another indexed-field predicate
+// in an $and. The other field (id) must still drive IndexBounds as if $size
+// were absent, and the filter's Ok() must agree with a naive evaluation.
+// Covers query/filter.go:553-554 (Size.IndexBounds identity return).
+func TestSize_Coverage_IndexBoundsComposition(t *testing.T) {
+	// {$and: [{arr: {$size: 2}}, {id: {$gt: 10}}]}
+	f, err := ParseCondition(`{"$and": [{"arr": {"$size": 2}}, {"id": {"$gt": 10}}]}`)
+	require.NoError(t, err)
+
+	t.Run("bounds on id include the id range", func(t *testing.T) {
+		bs := f.IndexBounds("id", nil)
+		// id > 10 → one open-ended Bound with Start set, no End.
+		require.Len(t, bs, 1, "id > 10 must contribute exactly one Bound")
+		assert.NotEmpty(t, bs[0].Start, "id > 10 Bound must have a Start value")
+		assert.False(t, bs[0].StartInclude, "$gt is exclusive — StartInclude must be false")
+		assert.Empty(t, bs[0].End, "id > 10 Bound must be open-ended (no End)")
+	})
+
+	t.Run("bounds on arr do not include the $size term", func(t *testing.T) {
+		// $size.IndexBounds returns the input bounds unchanged; the AND
+		// evaluation therefore yields nil for field "arr".
+		bs := f.IndexBounds("arr", nil)
+		assert.Empty(t, bs,
+			"$size must contribute no bounds — IndexBounds('arr', nil) must stay empty")
+	})
+
+	t.Run("Ok matches naive filter over arr + id", func(t *testing.T) {
+		// Docs: naive filter = len(arr) == 2 AND id > 10.
+		cases := []struct {
+			json string
+			want bool
+		}{
+			{`{"id": 15, "arr": [1, 2]}`, true},      // size ok, id>10 ok
+			{`{"id": 5, "arr": [1, 2]}`, false},      // size ok, id fails
+			{`{"id": 15, "arr": [1]}`, false},        // size fails
+			{`{"id": 15, "arr": [1, 2, 3]}`, false},  // size fails
+			{`{"id": 15}`, false},                    // arr missing
+			{`{"id": 15, "arr": []}`, false},         // size == 0
+			{`{"id": 11, "arr": ["a", "b"]}`, true},  // exactly id>10
+			{`{"id": 10, "arr": ["a", "b"]}`, false}, // id == 10 not > 10
+			{`{"id": 100, "arr": ["x", "y"]}`, true}, // big id, size 2
+			{`{"id": 100, "arr": ["x"]}`, false},     // big id, size 1
+		}
+		for _, c := range cases {
+			doc := anyenc.MustParseJson(c.json)
+			got := f.Ok(doc, nil)
+			assert.Equal(t, c.want, got, "doc=%s", c.json)
+		}
 	})
 }

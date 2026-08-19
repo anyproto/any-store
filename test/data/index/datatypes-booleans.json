@@ -1,0 +1,32 @@
+{
+  "data": [
+    {"id": 0, "active": false},
+    {"id": 1, "active": true},
+    {"id": 2, "active": true},
+    {"id": 3, "active": false},
+    {"id": 4, "active": true},
+    {"id": 5, "active": true},
+    {"id": 6, "active": false},
+    {"id": 7, "active": true},
+    {"id": 8, "active": true},
+    {"id": 9, "active": false}
+  ],
+  "indexes": [["active"]],
+  "tests": [
+    {
+      "name": "equality true",
+      "cond": {"active": true},
+      "expectedCount": 6
+    },
+    {
+      "name": "equality false",
+      "cond": {"active": false},
+      "expectedCount": 4
+    },
+    {
+      "name": "uses index",
+      "cond": {"active": true},
+      "expectedPlanContains": ["IndexScan"]
+    }
+  ]
+}

@@ -14,6 +14,14 @@ func AppendFloat64(b []byte, f float64) []byte {
 	bytes := binary.BigEndian.AppendUint64(b, bits)
 	// handle negative numbers
 	if bits&(1<<63) != 0 {
+		// Normalize -0 to +0: equal floats must encode to identical key bytes
+		// (an index seek for 0 would miss -0 entries). The raw bytes of -0
+		// (0x80 00...) already equal the +0 ENCODING (sign-bit-flipped 0x00...),
+		// so skipping the flip below is exactly the normalization. The check
+		// lives in the negative branch so positive numbers pay nothing.
+		if bits == 1<<63 {
+			return bytes
+		}
 		// Flip all bits for negative numbers
 		for i := n; i < len(bytes); i++ {
 			bytes[i] = ^bytes[i]

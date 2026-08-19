@@ -1,0 +1,39 @@
+{
+  "data": [
+    {"id": 1, "val": null},
+    {"id": 2, "val": 42},
+    {"id": 3, "val": "hello"},
+    {"id": 4, "val": false},
+    {"id": 5, "val": true},
+    {"id": 6, "val": 0},
+    {"id": 7, "val": "abc"}
+  ],
+  "indexes": [["val"]],
+  "tests": [
+    {
+      "name": "null",
+      "cond": {"val": null},
+      "expectedCount": 1
+    },
+    {
+      "name": "integer",
+      "cond": {"val": 42},
+      "expectedCount": 1
+    },
+    {
+      "name": "string",
+      "cond": {"val": "hello"},
+      "expectedCount": 1
+    },
+    {
+      "name": "false",
+      "cond": {"val": false},
+      "expectedCount": 1
+    },
+    {
+      "name": "true",
+      "cond": {"val": true},
+      "expectedCount": 1
+    }
+  ]
+}

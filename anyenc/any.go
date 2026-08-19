@@ -2,6 +2,7 @@ package anyenc
 
 import (
 	"fmt"
+	"time"
 )
 
 // AppendAnyValue appends encoded value to b. Supports only simple go types.
@@ -12,12 +13,14 @@ func AppendAnyValue(b []byte, v any) []byte {
 
 	switch tv := v.(type) {
 	case string:
+		// Escape exactly like Value.MarshalTo, so keys built here (e.g. FindId)
+		// match keys built by marshaling the document.
 		b = append(b, uint8(TypeString))
-		b = append(b, []byte(tv)...)
+		b = appendEscaped(b, s2b(tv))
 		b = append(b, EOS)
 	case []byte:
 		b = append(b, uint8(TypeString))
-		b = append(b, tv...)
+		b = appendEscaped(b, tv)
 		b = append(b, EOS)
 	case uint:
 		b = append(b, uint8(TypeNumber))
@@ -63,6 +66,17 @@ func AppendAnyValue(b []byte, v any) []byte {
 		}
 	case *Value:
 		return tv.MarshalTo(b)
+	case ObjectID:
+		// Must match Value.MarshalTo's TypeObjectID encoding byte-for-byte so a
+		// key built here (e.g. FindId) equals the marshaled document's id field:
+		// tag + 12 raw bytes, no length prefix.
+		b = append(b, uint8(TypeObjectID))
+		return append(b, tv[:]...)
+	case time.Time:
+		// Must match Value.MarshalTo's TypeDateTime encoding byte-for-byte:
+		// tag + 8 offset-binary millis bytes, no length prefix.
+		b = append(b, uint8(TypeDateTime))
+		return appendDateTimeMillis(b, tv.UnixMilli())
 	default:
 		panic(fmt.Sprintf("TODO: make other types: %T", v))
 	}

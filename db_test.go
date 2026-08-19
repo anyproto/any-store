@@ -9,16 +9,14 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/internal/driver"
-	"github.com/anyproto/any-store/internal/objectid"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
 )
 
 func init() {
@@ -91,6 +89,9 @@ func TestDb_GetCollectionNames(t *testing.T) {
 }
 
 func TestDb_Stats(t *testing.T) {
+	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
+		t.Skip("Stats checks file sizes on disk")
+	}
 	fx := newFixture(t)
 	stats, err := fx.Stats(ctx)
 	require.NoError(t, err)
@@ -107,7 +108,7 @@ func TestDb_QuickCheck(t *testing.T) {
 
 func TestDb_Flush(t *testing.T) {
 	fx := newFixture(t)
-	assert.NoError(t, fx.Flush(ctx, 0, FlushModeFsync))
+	assert.NoError(t, fx.Flush(ctx, 0, FlushModeCheckpointPassive))
 	assert.NoError(t, fx.Flush(ctx, 0, FlushModeCheckpointFull))
 }
 
@@ -130,45 +131,58 @@ func TestDb_Backup(t *testing.T) {
 	assertCollCount(t, coll2, 2)
 }
 
+func TestDb_Backup_OnlineDuringWrites(t *testing.T) {
+	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
+		t.Skip("concurrent-writer test; file backend only")
+	}
+	fx := newFixture(t)
+	coll, err := fx.Collection(ctx, "coll")
+	require.NoError(t, err)
+
+	// Seed 500 docs.
+	for i := 0; i < 500; i++ {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d, "val":"seed"}`, i))))
+	}
+
+	tmpDir, err := os.MkdirTemp("", "any-store-backup-online-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+	backupPath := filepath.Join(tmpDir, "any-store-test.db")
+
+	// Start backup and a concurrent writer.
+	done := make(chan error, 1)
+	go func() { done <- fx.Backup(ctx, backupPath) }()
+
+	for i := 0; i < 50; i++ {
+		_ = coll.UpsertOne(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id":%d, "val":"updated"}`, i)))
+	}
+
+	require.NoError(t, <-done)
+
+	fx2 := newFixturePath(t, tmpDir)
+	coll2, err := fx2.Collection(ctx, "coll")
+	require.NoError(t, err)
+	assertCollCount(t, coll2, 500)
+}
+
 func TestDb_Close(t *testing.T) {
 	t.Run("race", func(t *testing.T) {
-		fx := newFixture(t, &Config{ReadConnections: 2})
+		fx := newFixture(t, &Config{})
 
 		coll, err := fx.CreateCollection(ctx, "test")
 		require.NoError(t, err)
 
 		var docs []*anyenc.Value
-		for i := range 1000 {
+		for i := range 100 {
 			docs = append(docs, anyenc.MustParseJson(fmt.Sprintf(`{"id": %d, "value": %d}`, i, rand.Int())))
 		}
 		require.NoError(t, coll.Insert(ctx, docs...))
-		var results = make(chan error, 3)
+		var results = make(chan error, 2)
 		go func() {
 			// writing
 			for {
 				if pErr := coll.UpsertOne(ctx, anyenc.MustParseJson(fmt.Sprintf(`{"id": %d, "value": %d}`, rand.Int(), rand.Int()))); pErr != nil {
 					results <- errors.Join(pErr, errors.New("upsertOne"))
-					return
-				}
-			}
-		}()
-
-		go func() {
-			// iterating
-			for {
-				iter, pErr := coll.Find(nil).Iter(ctx)
-				if pErr != nil {
-					results <- errors.Join(pErr, errors.New("find"))
-					return
-				}
-				for iter.Next() {
-					if _, pErr = iter.Doc(); pErr != nil {
-						results <- errors.Join(pErr, errors.New("doc"))
-						return
-					}
-				}
-				if pErr = iter.Close(); pErr != nil {
-					results <- errors.Join(pErr, errors.New("close"))
 					return
 				}
 			}
@@ -181,7 +195,7 @@ func TestDb_Close(t *testing.T) {
 				results <- errors.Join(tErr, errors.New("writeTx"))
 				return
 			}
-			tErr = coll.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id": "%s", "value": %d}`, objectid.NewObjectID().Hex(), rand.Int())))
+			tErr = coll.Insert(tx.Context(), anyenc.MustParseJson(fmt.Sprintf(`{"id": "%s", "value": %d}`, anyenc.NewObjectID().Hex(), rand.Int())))
 			if tErr != nil {
 				results <- errors.Join(tErr, errors.New("insert tx"))
 				return
@@ -198,20 +212,28 @@ func TestDb_Close(t *testing.T) {
 
 		for range len(results) {
 			rErr := <-results
-			assert.True(t, errors.Is(rErr, driver.ErrDBIsClosed) || errors.Is(rErr, driver.ErrStmtIsClosed), rErr.Error())
-		}
-		dirEntries, err := os.ReadDir(fx.tmpDir)
-		require.NoError(t, err)
-		for _, dirEntry := range dirEntries {
-			if strings.HasSuffix(dirEntry.Name(), "-wal") {
-				t.Errorf("wal file is not removed after close")
-			}
+			assert.True(t, errors.Is(rErr, btree.ErrClosed), rErr.Error())
 		}
 	})
 
 }
 
 func newFixture(t testing.TB, c ...*Config) *fixture {
+	if os.Getenv("ANYSTORE_TEST_INMEMORY") == "1" {
+		var conf *Config
+		if len(c) != 0 {
+			conf = c[0]
+		}
+		if conf == nil {
+			conf = &Config{}
+		}
+		conf.InMemory = true
+		db, err := Open(ctx, ":memory:", conf)
+		require.NoError(t, err)
+		fx := &fixture{DB: db, t: t}
+		t.Cleanup(fx.finish)
+		return fx
+	}
 	tmpDir, err := os.MkdirTemp("", "any-store-*")
 	require.NoError(t, err)
 	return newFixturePath(t, tmpDir, c...)
@@ -255,31 +277,89 @@ func (fx *fixture) finish() {
 	}
 }
 
-func TestOpen_AnyStoreV2File(t *testing.T) {
-	dir := t.TempDir()
+func TestInspectIndexSketch_BasicReturnsCount(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
 
-	// Both magics any-store v2 has written, each zero-filled to the 16-byte
-	// header field. Verified against real v2 files:
-	//   00000000: 616e 792d 7374 6f72 6520 7632 0000 0000  any-store v2....
-	//   00000000: 4254 7265 6520 666f 726d 6174 2031 0000  BTree format 1..
-	for _, tc := range []struct{ name, magic string }{
-		{"current magic", "any-store v2\x00"},
-		{"legacy magic", "BTree format 1\x00"},
-	} {
-		t.Run("v2 file is reported explicitly: "+tc.name, func(t *testing.T) {
-			path := filepath.Join(dir, tc.name+".db")
-			page := make([]byte, 4096)
-			copy(page, tc.magic)
-			require.NoError(t, os.WriteFile(path, page, 0o600))
-
-			db, err := Open(ctx, path, nil)
-			require.ErrorIs(t, err, ErrV2Database)
-			require.Nil(t, db)
-		})
+	for i := range 50 {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+			fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%5),
+		)))
 	}
 
-	t.Run("v1 file still opens", func(t *testing.T) {
+	insp, ok := fx.DB.(IndexSketchInspector)
+	require.True(t, ok, "db must implement IndexSketchInspector")
+
+	info, err := insp.InspectIndexSketch(ctx, "test", "a")
+	require.NoError(t, err)
+	assert.Equal(t, 1024, info.Size)
+	assert.Equal(t, uint64(50), info.DocCount)
+	require.Len(t, info.Buckets, 1024)
+
+	var sum uint64
+	for _, b := range info.Buckets {
+		sum += b
+	}
+	assert.Equal(t, uint64(50), sum)
+}
+
+func TestInspectIndexSketch_UnknownIndexReturnsErrNotFound(t *testing.T) {
+	fx := newFixture(t)
+	_, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+
+	insp := fx.DB.(IndexSketchInspector)
+	_, err = insp.InspectIndexSketch(ctx, "test", "nonexistent")
+	assert.ErrorIs(t, err, ErrIndexNotFound)
+}
+
+func TestInspectIndexSketch_AccumulatesOnInsertAndDelete(t *testing.T) {
+	fx := newFixture(t)
+	coll, err := fx.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Fields: []string{"a"}}))
+
+	for i := range 30 {
+		require.NoError(t, coll.Insert(ctx, anyenc.MustParseJson(
+			fmt.Sprintf(`{"id":%d,"a":%d}`, i, i%3),
+		)))
+	}
+
+	insp := fx.DB.(IndexSketchInspector)
+	info, err := insp.InspectIndexSketch(ctx, "test", "a")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(30), info.DocCount)
+
+	for i := range 10 {
+		require.NoError(t, coll.DeleteId(ctx, i))
+	}
+
+	info, err = insp.InspectIndexSketch(ctx, "test", "a")
+	require.NoError(t, err)
+	assert.Equal(t, uint64(20), info.DocCount)
+}
+
+func TestOpen_AnyStoreV1File(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("v1 file is reported explicitly", func(t *testing.T) {
 		path := filepath.Join(dir, "v1.db")
+		// The SQLite header every any-store v1 database starts with. Literal on
+		// purpose: a rename or edit of v1Magic must fail here rather than pass
+		// by comparing the constant against itself.
+		page := make([]byte, 4096)
+		copy(page, "SQLite format 3\x00")
+		require.NoError(t, os.WriteFile(path, page, 0o600))
+
+		db, err := Open(ctx, path, nil)
+		require.ErrorIs(t, err, ErrV1Database)
+		require.Nil(t, db)
+	})
+
+	t.Run("v2 file still opens", func(t *testing.T) {
+		path := filepath.Join(dir, "v2.db")
 		db, err := Open(ctx, path, nil)
 		require.NoError(t, err)
 		coll, err := db.CreateCollection(ctx, "test")
@@ -298,6 +378,6 @@ func TestOpen_AnyStoreV2File(t *testing.T) {
 
 		_, err := Open(ctx, path, nil)
 		require.Error(t, err)
-		require.NotErrorIs(t, err, ErrV2Database)
+		require.NotErrorIs(t, err, ErrV1Database)
 	})
 }

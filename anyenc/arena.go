@@ -1,6 +1,10 @@
 package anyenc
 
-import "github.com/valyala/fastjson"
+import (
+	"time"
+
+	"github.com/valyala/fastjson"
+)
 
 // Arena may be used for fast creation and re-use of Values.
 //
@@ -83,6 +87,46 @@ func (a *Arena) NewBinary(b []byte) *Value {
 	return v
 }
 
+// NewVectorF32 returns a new vector value holding a copy of vec, packed as
+// little-endian float32 bytes.
+//
+// The returned value is valid until Reset is called on a.
+func (a *Arena) NewVectorF32(vec []float32) *Value {
+	v := a.c.getValue()
+	v.t = TypeVectorF32
+	v.v = appendVectorF32LE(v.v[:0], vec)
+	return v
+}
+
+// NewObjectID returns a new objectID value holding id.
+//
+// The returned value is valid until Reset is called on a.
+func (a *Arena) NewObjectID(id ObjectID) *Value {
+	v := a.c.getValue()
+	v.t = TypeObjectID
+	v.v = append(v.v[:0], id[:]...)
+	return v
+}
+
+// NewDateTime returns a new dateTime value holding t, truncated to millisecond
+// precision (the storage granularity).
+//
+// The returned value is valid until Reset is called on a.
+func (a *Arena) NewDateTime(t time.Time) *Value {
+	return a.NewDateTimeMillis(t.UnixMilli())
+}
+
+// NewDateTimeMillis returns a new dateTime value holding the Unix-millisecond
+// timestamp ms.
+//
+// The returned value is valid until Reset is called on a.
+func (a *Arena) NewDateTimeMillis(ms int64) *Value {
+	v := a.c.getValue()
+	v.t = TypeDateTime
+	v.v = appendDateTimeMillis(v.v[:0], ms)
+	return v
+}
+
 // NewNumberFloat64 returns new number value containing f.
 //
 // The returned number is valid until Reset is called on a.
@@ -146,8 +190,16 @@ func (a *Arena) NewFromFastJson(jv *fastjson.Value) *Value {
 		}
 		return arr
 	case fastjson.TypeObject:
+		o := jv.GetObject()
+		// A single-key object whose key is a known tag and whose payload is
+		// well-formed is an Extended-JSON typed value, not a plain object.
+		if o.Len() == 1 {
+			if tv := a.extValueFromFastJson(o); tv != nil {
+				return tv
+			}
+		}
 		obj := a.NewObject()
-		jv.GetObject().Visit(func(key []byte, v *fastjson.Value) {
+		o.Visit(func(key []byte, v *fastjson.Value) {
 			obj.Set(string(key), a.NewFromFastJson(v))
 		})
 		return obj

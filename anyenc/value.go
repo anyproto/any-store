@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"unsafe"
 
+	"github.com/klauspost/compress/s2"
 	"github.com/valyala/fastjson"
 )
 
@@ -55,10 +56,6 @@ func (v *Value) Del(key string) {
 		return
 	}
 	if v.t == TypeArray {
-		idx, err := strconv.Atoi(key)
-		if err != nil || idx < 0 {
-			return
-		}
 		n, err := strconv.Atoi(key)
 		if err != nil || n < 0 || n >= len(v.a) {
 			return
@@ -276,7 +273,28 @@ func (v *Value) MarshalTo(dst []byte) []byte {
 		dst = append(dst, EOS)
 	case TypeString:
 		dst = append(dst, byte(TypeString))
-		dst = appendIgnoreEOS(dst, v.v...)
+		// Open-coded fused scan+copy (see escape.go): short NUL-free strings
+		// — the overwhelmingly common case — stream per byte exactly like the
+		// historical appendIgnoreEOS (bulk append would be a memmove call,
+		// slower for the typical 2-16 byte string). On an EOS hit, roll back
+		// and take the escaping cold path.
+		if len(v.v) > 32 {
+			dst = appendEscapedSlow(dst, v.v)
+		} else {
+			mark := len(dst)
+			dst = slices.Grow(dst, len(v.v)+1)
+			clean := true
+			for i := 0; i < len(v.v); i++ {
+				if v.v[i] == EOS {
+					clean = false
+					break
+				}
+				dst = append(dst, v.v[i])
+			}
+			if !clean {
+				dst = appendEscapedSlow(dst[:mark], v.v)
+			}
+		}
 		dst = append(dst, EOS)
 	case TypeNumber:
 		dst = append(dst, byte(TypeNumber))
@@ -291,19 +309,148 @@ func (v *Value) MarshalTo(dst []byte) []byte {
 		dst = append(dst, byte(TypeBinary))
 		dst = binary.BigEndian.AppendUint32(dst, uint32(len(v.v)))
 		return append(dst, v.v...)
+	case TypeVectorF32:
+		dst = append(dst, byte(TypeVectorF32))
+		dst = binary.BigEndian.AppendUint32(dst, uint32(len(v.v)))
+		return append(dst, v.v...)
+	case TypeObjectID:
+		// Fixed 13 bytes: tag + 12 raw big-endian bytes. No length prefix
+		// (unlike Binary/Vector); the width is a constant.
+		dst = append(dst, byte(TypeObjectID))
+		return append(dst, v.v...)
+	case TypeDateTime:
+		// Fixed 9 bytes: tag + 8 offset-binary millis bytes (see datetime.go).
+		dst = append(dst, byte(TypeDateTime))
+		return append(dst, v.v...)
 	}
 	return dst
+}
+
+// CompressMinSize is the minimum marshaled object size (in bytes) for S2 compression.
+// Below this threshold, compression overhead exceeds savings.
+const CompressMinSize = 256
+
+// IsSizeBigger reports whether the marshaled size of v exceeds n bytes.
+// It walks the value tree counting bytes without allocating or marshaling.
+func (v *Value) IsSizeBigger(n int) bool {
+	return v.estimateSize(n) > n
+}
+
+// estimateSize returns the marshaled size of v, but stops early once it exceeds
+// limit. Escape bytes (strings/keys containing EOS, keys with a reserved first
+// byte — see escape.go) are not counted, so the result is a lower bound; for the
+// compression-threshold heuristic an occasional underestimate is harmless.
+func (v *Value) estimateSize(limit int) int {
+	if v == nil {
+		return 1 // TypeNull
+	}
+	switch v.t {
+	case TypeNull, TypeTrue, TypeFalse:
+		return 1
+	case TypeNumber:
+		return 9 // type byte + 8 bytes float64
+	case TypeString:
+		return 1 + len(v.v) + 1 // type + data + EOS
+	case TypeBinary:
+		return 1 + 4 + len(v.v) // type + length + data
+	case TypeVectorF32:
+		return 1 + 4 + len(v.v) // type + length + packed f32 data
+	case TypeObjectID:
+		return 1 + objectIDLen // type + 12 fixed bytes (no length header)
+	case TypeDateTime:
+		return 1 + dateTimeLen // type + 8 fixed bytes (no length header)
+	case TypeArray:
+		size := 2 // type + EOS
+		for _, av := range v.a {
+			size += av.estimateSize(limit - size)
+			if size > limit {
+				return size
+			}
+		}
+		return size
+	case TypeObject:
+		size := 2 // type + EOS
+		for _, kv := range v.o.kvs {
+			if len(kv.key) == 0 {
+				size += 1 + 1 // emptyKey + EOS
+			} else {
+				size += len(kv.key) + 1 // key + EOS
+			}
+			size += kv.value.estimateSize(limit - size)
+			if size > limit {
+				return size
+			}
+		}
+		return size
+	default:
+		return 1
+	}
+}
+
+// MarshalCompressed marshals the value with S2 compression (objects only).
+// For non-object values or objects smaller than CompressMinSize, falls back to MarshalTo.
+// scratch is a reusable buffer for intermediate marshal; returns updated scratch for reuse.
+func (v *Value) MarshalCompressed(dst, scratch []byte) ([]byte, []byte) {
+	if v == nil || v.t != TypeObject || !v.IsSizeBigger(CompressMinSize) {
+		return v.MarshalTo(dst), scratch
+	}
+	// Marshal object into scratch
+	scratch = v.MarshalTo(scratch[:0])
+	headerStart := len(dst)
+	dst = append(dst, byte(TypeCompressedObjectS2))
+	dst = append(dst, 0, 0, 0, 0) // placeholder for compressed length
+	hdrLen := len(dst) - headerStart
+	// Ensure dst has enough capacity for s2 output
+	maxComp := s2.MaxEncodedLen(len(scratch))
+	if needed := len(dst) + maxComp; cap(dst) < needed {
+		newDst := make([]byte, len(dst), needed)
+		copy(newDst, dst)
+		dst = newDst
+	}
+	// Encode directly into dst tail (s2 writes from position 0 of its dst arg)
+	compressed := s2.Encode(dst[len(dst):], scratch)
+	// Keep-plain fallback: a high-entropy object (encrypted or pre-compressed
+	// payloads) S2-encodes to at least its plain size, and the compressed form
+	// additionally costs a full decode+copy on every future parse. The plain
+	// TypeObject encoding is already in scratch and every reader dispatches on
+	// the leading type byte, so storing it instead is byte-compatible with
+	// existing data and readers.
+	if len(compressed)+hdrLen >= len(scratch) {
+		dst = append(dst[:headerStart], scratch...)
+		return dst, scratch
+	}
+	dst = dst[:len(dst)+len(compressed)]
+	compLen := uint32(len(compressed))
+	binary.BigEndian.PutUint32(dst[headerStart+1:], compLen)
+	return dst, scratch
 }
 
 func (v *Value) marshalObject(dst []byte) []byte {
 	dst = append(dst, byte(TypeObject))
 	for _, kv := range v.o.kvs {
-		if len(kv.key) == 0 {
-			dst = append(dst, emptyKey)
+		// Open-coded fused scan+copy for the common key shape (see the
+		// TypeString case and escape.go); empty, reserved-leading-byte, long
+		// or NUL-containing keys take the cold path.
+		key := kv.key
+		if len(key) == 0 || len(key) > 32 || key[0] == EOS || key[0] == ^EOS {
+			dst = appendEscapedKey(dst, key)
 		} else {
-			dst = appendIgnoreEOS(dst, s2b(kv.key)...)
+			mark := len(dst)
+			dst = slices.Grow(dst, len(key)+1)
+			clean := true
+			for i := 0; i < len(key); i++ {
+				if key[i] == EOS {
+					clean = false
+					break
+				}
+				dst = append(dst, key[i])
+			}
+			if clean {
+				dst = append(dst, EOS)
+			} else {
+				dst = appendEscapedKey(dst[:mark], key)
+			}
 		}
-		dst = append(dst, EOS)
 		dst = kv.value.MarshalTo(dst)
 	}
 	return append(dst, EOS)
@@ -317,7 +464,29 @@ func (v *Value) FastJson(a *fastjson.Arena) *fastjson.Value {
 	case TypeString:
 		return a.NewStringBytes(v.v)
 	case TypeBinary:
-		return a.NewString(base64.StdEncoding.EncodeToString(v.v))
+		// Extended-JSON wrapper (see extjson.go) so the type round-trips through
+		// JSON; NewFromFastJson decodes {"$binary": "<base64>"} back to binary.
+		return extWrapFastJson(a, extTagBinary, a.NewString(base64.StdEncoding.EncodeToString(v.v)))
+	case TypeVectorF32:
+		fs := bytesAsF32(v.v)
+		arr := a.NewArray()
+		for i, f := range fs {
+			arr.SetArrayItem(i, a.NewNumberFloat64(float64(f)))
+		}
+		return extWrapFastJson(a, extTagVector, arr)
+	case TypeObjectID:
+		id, _ := v.ObjectID()
+		return extWrapFastJson(a, extTagObjectID, a.NewString(id.Hex()))
+	case TypeDateTime:
+		t, _ := v.DateTime()
+		// RFC3339 parses only years 0..9999; outside that range the string form
+		// would not round-trip, so emit the raw Unix millis (the decoder in
+		// extjson.go accepts {"$date": <number>}).
+		if y := t.Year(); y < 0 || y > 9999 {
+			ms, _ := v.DateTimeMillis()
+			return extWrapFastJson(a, extTagDate, a.NewNumberInt(int(ms)))
+		}
+		return extWrapFastJson(a, extTagDate, a.NewString(t.Format(dateTimeJsonLayout)))
 	case TypeArray:
 		arr := a.NewArray()
 		for i, av := range v.a {
@@ -359,6 +528,19 @@ func (v *Value) GoType() any {
 		return string(v.v)
 	case TypeBinary:
 		return append([]byte{}, v.v...)
+	case TypeVectorF32:
+		fs := bytesAsF32(v.v)
+		res := make([]any, len(fs))
+		for i, f := range fs {
+			res[i] = float64(f)
+		}
+		return res
+	case TypeObjectID:
+		id, _ := v.ObjectID()
+		return id.Hex()
+	case TypeDateTime:
+		t, _ := v.DateTime()
+		return t
 	case TypeArray:
 		res := make([]any, len(v.a))
 		for i, av := range v.a {
@@ -380,14 +562,4 @@ func (v *Value) GoType() any {
 	default:
 		panic(fmt.Errorf("unexpected type: %s", v.Type()))
 	}
-}
-
-func appendIgnoreEOS(slice []byte, elems ...byte) []byte {
-	slice = slices.Grow(slice, len(elems))
-	for i := range elems {
-		if elems[i] != EOS {
-			slice = append(slice, elems[i])
-		}
-	}
-	return slice
 }

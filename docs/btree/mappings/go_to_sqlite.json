@@ -1,0 +1,2533 @@
+{
+  "backup.go:*Backup.Finish": {
+    "sqlite": [
+      "backup.c:sqlite3_backup_finish"
+    ],
+    "note": "commits or rolls back the destination tx based on b.rc; releases backup state"
+  },
+  "backup.go:*Backup.PageCount": {
+    "sqlite": [
+      "backup.c:sqlite3_backup_pagecount"
+    ],
+    "note": ""
+  },
+  "backup.go:*Backup.Remaining": {
+    "sqlite": [
+      "backup.c:sqlite3_backup_remaining"
+    ],
+    "note": ""
+  },
+  "backup.go:*Backup.Step": {
+    "sqlite": [
+      "backup.c:sqlite3_backup_step"
+    ],
+    "note": "copies up to nPage pages; returns ErrBackupDone when source exhausted"
+  },
+  "backup.go:*Backup.finalize": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeSetVersion",
+      "btree.c:sqlite3BtreeUpdateMeta",
+      "pager.c:sqlite3PagerTruncateImage"
+    ],
+    "note": "pre-commit housekeeping at backup.c:417-541 — schema-cookie bump + truncate dst to nSrcPage; sqlite3BtreeSetVersion(pDest,2) is a no-op for any-store (dst initNewDB already sets WriteVersion=ReadVersion=2)"
+  },
+  "backup.go:*Backup.onePage": {
+    "sqlite": [
+      "backup.c:backupOnePage"
+    ],
+    "note": "page-size always equal (enforced at BackupInit) so the backup.c:251–276 loop collapses to one iteration"
+  },
+  "backup.go:*Backup.restart": {
+    "sqlite": [
+      "backup.c:sqlite3BackupRestart"
+    ],
+    "note": "called by source pager when WAL reset/page-cache invalidation makes already-copied tracking meaningless"
+  },
+  "backup.go:*Backup.update": {
+    "sqlite": [
+      "backup.c:backupUpdate"
+    ],
+    "note": "re-copies a page that was already backed up if it changed under us"
+  },
+  "backup.go:*DB.BackupInit": {
+    "sqlite": [
+      "backup.c:sqlite3_backup_init"
+    ],
+    "note": "minus the handle/name resolution (DRIFT #2 in any-store-tests:docs/any-store/btree/plans/2026-04-22-sqlite-backup-port.md): takes (dst, src *btree.DB) directly"
+  },
+  "backup.go:putUint32BE": {
+    "sqlite": [
+      "util.c:sqlite3Put4byte"
+    ],
+    "note": "big-endian u32 writer used for schema-cookie bump"
+  },
+  "balance.go:*btree.balanceNonroot": {
+    "sqlite": [
+      "btree.c:balance_nonroot"
+    ],
+    "note": "faithful port of balance_nonroot (btree.c:8248-9030), specialised to any-store's index btree; enumerated deviations in the balance.go header. Live path for both insert splits and delete-side merges"
+  },
+  "balance.go:*btree.freePageDeferred": {
+    "sqlite": [
+      "btree.c:freePage",
+      "btree.c:freePage2"
+    ],
+    "note": "frees surplus old siblings after a balance (btree.c:9000-9004); thin wrapper over pager.freePage"
+  },
+  "balance.go:*btree.parentDividerFullKey": {
+    "sqlite": [
+      "btree.c:balance_nonroot"
+    ],
+    "note": "reads the parent divider key (SQLite apDiv[i], btree.c:8359-8361); returns the key only since the splice re-derives child pointers"
+  },
+  "balance.go:*btree.rewriteParentAfterBalance": {
+    "sqlite": [
+      "btree.c:balance_nonroot",
+      "btree.c:editPage"
+    ],
+    "note": "editPage replacement (deviation 2): wholesale parent rebuild subsuming put4byte (btree.c:8759) and per-divider insertCell (btree.c:8888)"
+  },
+  "balance.go:*cellArray.cachedCellSize": {
+    "sqlite": [
+      "btree.c:cachedCellSize",
+      "btree.c:computeCellSize"
+    ],
+    "note": "lazy per-cell in-page size cache (btree.c:7619-7632)"
+  },
+  "balance.go:boundaryLeft": {
+    "sqlite": [
+      "btree.c:balance_nonroot"
+    ],
+    "note": "the (i\u003e0 ? cntNew[i-1] : 0) boundary guard (btree.c:8601, 8645)"
+  },
+  "btree.go:*Cursor.AppendValue": {
+    "sqlite": [
+      "btree.c:fetchPayload",
+      "btree.c:sqlite3BtreePayload"
+    ],
+    "note": ""
+  },
+  "btree.go:*Cursor.AppendValueByKey": {
+    "sqlite": [],
+    "note": ""
+  },
+  "btree.go:*Cursor.Close": {
+    "sqlite": [
+      "btree.c:btreeReleaseAllCursorPages",
+      "btree.c:sqlite3BtreeCloseCursor"
+    ],
+    "note": ""
+  },
+  "btree.go:*Cursor.CountUntil": {
+    "sqlite": [],
+    "note": "any-store range-count fast path batching by page"
+  },
+  "btree.go:*Cursor.First": {
+    "sqlite": [
+      "btree.c:moveToLeftmost",
+      "btree.c:moveToRoot",
+      "btree.c:sqlite3BtreeFirst"
+    ],
+    "note": ""
+  },
+  "btree.go:*Cursor.Key": {
+    "sqlite": [
+      "btree.c:fetchPayload",
+      "btree.c:sqlite3BtreePayload"
+    ],
+    "note": ""
+  },
+  "btree.go:*Cursor.Last": {
+    "sqlite": [
+      "btree.c:btreeLast",
+      "btree.c:moveToRightmost",
+      "btree.c:sqlite3BtreeLast"
+    ],
+    "note": ""
+  },
+  "btree.go:*Cursor.Next": {
+    "sqlite": [
+      "btree.c:btreeNext",
+      "btree.c:moveToLeftmost",
+      "btree.c:sqlite3BtreeNext"
+    ],
+    "note": ""
+  },
+  "btree.go:*Cursor.Previous": {
+    "sqlite": [
+      "btree.c:btreePrevious",
+      "btree.c:moveToRightmost",
+      "btree.c:sqlite3BtreePrevious"
+    ],
+    "note": ""
+  },
+  "btree.go:*Cursor.Seek": {
+    "sqlite": [
+      "btree.c:moveToChild",
+      "btree.c:moveToRoot",
+      "btree.c:sqlite3BtreeIndexMoveto"
+    ],
+    "note": ""
+  },
+  "btree.go:*Cursor.SeekExact": {
+    "sqlite": [],
+    "note": ""
+  },
+  "btree.go:*Cursor.SeekNear": {
+    "sqlite": [],
+    "note": "any-store pinned-leaf fast-path optimization"
+  },
+  "btree.go:*Cursor.Skip": {
+    "sqlite": [],
+    "note": "any-store batched forward skip; no SQLite counterpart"
+  },
+  "btree.go:*Cursor.SkipBackward": {
+    "sqlite": [],
+    "note": "any-store batched backward skip; no SQLite counterpart"
+  },
+  "btree.go:*Cursor.Valid": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeCursorIsValid",
+      "btree.c:sqlite3BtreeCursorIsValidNN",
+      "btree.c:sqlite3BtreeEof"
+    ],
+    "note": ""
+  },
+  "btree.go:*Cursor.Value": {
+    "sqlite": [
+      "btree.c:fetchPayload",
+      "btree.c:sqlite3BtreePayload"
+    ],
+    "note": ""
+  },
+  "btree.go:*Cursor.currentKeyEqual": {
+    "sqlite": [],
+    "note": ""
+  },
+  "btree.go:*Cursor.releasePages": {
+    "sqlite": [
+      "btree.c:btreeReleaseAllCursorPages"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.AppendValue": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeIndexMoveto",
+      "btree.c:sqlite3BtreePayload"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.Count": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeCount"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.Delete": {
+    "sqlite": [
+      "btree.c:allocateSpace",
+      "btree.c:balance_nonroot",
+      "btree.c:dropCell",
+      "btree.c:sqlite3BtreeDelete"
+    ],
+    "note": "now drives delete-time rebalancing: an underfull (\u003e2/3 free) non-empty leaf funnels through balanceNonroot (deleteRebalanceLeaf), matching the balance() call in sqlite3BtreeDelete (btree.c:10005-10010); also ports the cell-drop (dropCell/allocateSpace). Phase 1 — see any-store-tests:docs/any-store/btree/plans/2026-05-23-delete-time-rebalancing.md"
+  },
+  "btree.go:*btree.Get": {
+    "sqlite": [],
+    "note": ""
+  },
+  "btree.go:*btree.Has": {
+    "sqlite": [],
+    "note": ""
+  },
+  "btree.go:*btree.NewCursor": {
+    "sqlite": [
+      "btree.c:btreeCursor",
+      "btree.c:sqlite3BtreeCursor"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.Put": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeIndexMoveto",
+      "btree.c:sqlite3BtreeInsert"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.cellFullKey": {
+    "sqlite": [
+      "btree.c:accessPayload"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.collapseSingleChild": {
+    "sqlite": [
+      "btree.c:balance_nonroot",
+      "btree.c:copyNodeContent"
+    ],
+    "note": "balance-shallower: copies a single surviving child's content into the parent and frees it (copyNodeContent + freePage, btree.c:8977-8985); page-1 DB-header handling like finishParentRemoval"
+  },
+  "btree.go:*btree.collectInteriorCells": {
+    "sqlite": [],
+    "note": "any-store helper used by rebuild/balance paths"
+  },
+  "btree.go:*btree.collectLeafCells": {
+    "sqlite": [],
+    "note": "any-store helper used by rebuild/balance paths"
+  },
+  "btree.go:*btree.completeMergeUpward": {
+    "sqlite": [
+      "btree.c:balance_nonroot"
+    ],
+    "note": "delete-side: cascades parent under-fullness up the path and collapses a single-child root (balance-shallower, btree.c:8960-8985); any-store's analogue of balance()'s do-loop unwinding"
+  },
+  "btree.go:*btree.countPage": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeCount"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.deleteRebalanceInterior": {
+    "sqlite": [
+      "btree.c:balance_nonroot"
+    ],
+    "note": "interior analogue of deleteRebalanceLeaf: drives an underfull interior page through balanceNonroot with inject.active=false"
+  },
+  "btree.go:*btree.deleteRebalanceLeaf": {
+    "sqlite": [
+      "btree.c:balance_nonroot"
+    ],
+    "note": "drives an underfull (\u003e2/3 free) non-empty leaf through balanceNonroot with inject.active=false (k=nOld-1 merge), matching SQLite delete-merge via balance()-\u003ebalance_nonroot (btree.c:10010)"
+  },
+  "btree.go:*btree.finishParentRemoval": {
+    "sqlite": [
+      "btree.c:balance_nonroot",
+      "btree.c:copyNodeContent"
+    ],
+    "note": "shared delete-path tail (empty-leaf path): writes post-removal parent cells; 0-cell root collapse via copyNodeContent (btree.c:8148); non-root 0-cell interior left as a degenerate rightChild-only page for a later balance (root-gated per btree.c:8960)"
+  },
+  "btree.go:*btree.getPage": {
+    "sqlite": [],
+    "note": "reader/writer routing shim over pager"
+  },
+  "btree.go:*btree.insertIntoInterior": {
+    "sqlite": [],
+    "note": "any-store recursive-split helper (SQLite uses balance())"
+  },
+  "btree.go:*btree.insertIntoLeaf": {
+    "sqlite": [
+      "btree.c:allocateSpace",
+      "btree.c:insertCellFast"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.insertIntoLeafWithPath": {
+    "sqlite": [
+      "btree.c:allocateSpace",
+      "btree.c:insertCellFast"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.insertIntoPage": {
+    "sqlite": [],
+    "note": ""
+  },
+  "btree.go:*btree.insertIntoParent": {
+    "sqlite": [
+      "btree.c:balance"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.insertIntoParentWithPath": {
+    "sqlite": [
+      "btree.c:balance"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.insertLeafCellAt": {
+    "sqlite": [
+      "btree.c:allocateSpace",
+      "btree.c:fillInCell",
+      "btree.c:insertCell"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.insertSepIntoAncestor": {
+    "sqlite": [
+      "btree.c:balance"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.insertSepIntoInterior": {
+    "sqlite": [
+      "btree.c:balance_nonroot",
+      "btree.c:insertCell"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.interiorCellFullKey": {
+    "sqlite": [],
+    "note": ""
+  },
+  "btree.go:*btree.interiorUnderfull": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeDelete"
+    ],
+    "note": "the nFree*3 \u003e usable*2 rebalance gate, negated from btree.c:10005; decides the underfull-parent cascade after a delete-side merge"
+  },
+  "btree.go:*btree.leafUsedSpace": {
+    "sqlite": [],
+    "note": ""
+  },
+  "btree.go:*btree.rebuildInteriorPage": {
+    "sqlite": [
+      "btree.c:defragmentPage",
+      "btree.c:rebuildPage"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.rebuildLeafPage": {
+    "sqlite": [
+      "btree.c:defragmentPage",
+      "btree.c:rebuildPage"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.removeChildFromParent": {
+    "sqlite": [
+      "btree.c:balance_nonroot",
+      "btree.c:copyNodeContent"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.removeMergedRightSeparator": {
+    "sqlite": [
+      "btree.c:balance_nonroot",
+      "btree.c:dropCell"
+    ],
+    "note": "mergeRight separator removal: repoints the freed page's right-neighbor slot to the kept page, then drops the divider cell. Reachable only via the dead tryMergeLeaf"
+  },
+  "btree.go:*btree.searchInterior": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeIndexMoveto"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.searchLeaf": {
+    "sqlite": [],
+    "note": ""
+  },
+  "btree.go:*btree.splitLeafAndInsert": {
+    "sqlite": [
+      "btree.c:balance_nonroot"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.splitLeafAndInsertWithPath": {
+    "sqlite": [
+      "btree.c:balance_nonroot"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.splitLeafRightmostAppend": {
+    "sqlite": [
+      "btree.c:balance_quick"
+    ],
+    "note": "fast-path for rightmost-append splits — allocates one new sibling, leaves caller's full leaf untouched, hands the new cell to the new page"
+  },
+  "btree.go:*btree.splitRoot": {
+    "sqlite": [
+      "btree.c:balance_deeper",
+      "btree.c:copyNodeContent"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.splitRootLeafAndInsert": {
+    "sqlite": [
+      "btree.c:balance_deeper",
+      "btree.c:balance_nonroot"
+    ],
+    "note": "root-leaf overflow: balance_deeper (btree.c:9052-9097) then a 2-way split of the new child; retains the former splitLeafAndInsertWithPath body for the root case"
+  },
+  "btree.go:*btree.tryMergeLeaf": {
+    "sqlite": [
+      "btree.c:balance_nonroot"
+    ],
+    "note": "DEAD CODE: a non-faithful 2-page-only merge with no production caller (Delete rebalances via balanceNonroot/deleteRebalanceLeaf). Test-exercised only, pending retirement per the delete-rebalance plan; balance_nonroot cited as conceptual analogue only"
+  },
+  "btree.go:*btree.updateLeafCell": {
+    "sqlite": [
+      "btree.c:btreeOverwriteCell",
+      "btree.c:dropCell",
+      "btree.c:insertCell",
+      "btree.c:sqlite3BtreeInsert"
+    ],
+    "note": ""
+  },
+  "btree.go:*btree.usablePageSize": {
+    "sqlite": [],
+    "note": ""
+  },
+  "btree.go:SetDebugOverflowReadErrors": {
+    "sqlite": [],
+    "note": "any-store test-only debug toggle"
+  },
+  "btree.go:interiorCellKey": {
+    "sqlite": [],
+    "note": ""
+  },
+  "btree.go:interiorCellSize": {
+    "sqlite": [
+      "btree.c:cellSizePtr"
+    ],
+    "note": ""
+  },
+  "btree.go:interiorCellSizeWithOverflow": {
+    "sqlite": [
+      "btree.c:cellSizePtr"
+    ],
+    "note": ""
+  },
+  "btree.go:interiorFullKey": {
+    "sqlite": [
+      "btree.c:accessPayload"
+    ],
+    "note": ""
+  },
+  "btree.go:interiorSplitPoint": {
+    "sqlite": [
+      "btree.c:balance_nonroot"
+    ],
+    "note": ""
+  },
+  "btree.go:leafCellSize": {
+    "sqlite": [
+      "btree.c:cellSizePtrIdxLeaf"
+    ],
+    "note": ""
+  },
+  "btree.go:leafCellSizeFromLengths": {
+    "sqlite": [
+      "btree.c:cellSizePtrIdxLeaf"
+    ],
+    "note": ""
+  },
+  "btree.go:leafCellSizeWithOverflow": {
+    "sqlite": [
+      "btree.c:cellSizePtrIdxLeaf"
+    ],
+    "note": ""
+  },
+  "btree.go:leafFullKey": {
+    "sqlite": [
+      "btree.c:accessPayload"
+    ],
+    "note": ""
+  },
+  "btree.go:leafKeyAt": {
+    "sqlite": [],
+    "note": "any-store light key peek; no overflow"
+  },
+  "btree.go:leafSplitPoint": {
+    "sqlite": [
+      "btree.c:balance_nonroot"
+    ],
+    "note": ""
+  },
+  "btree.go:parseInteriorCell": {
+    "sqlite": [
+      "btree.c:btreeParseCell",
+      "btree.c:btreeParseCellPtrIndex"
+    ],
+    "note": ""
+  },
+  "btree.go:parseLeafCell": {
+    "sqlite": [
+      "btree.c:btreeParseCell",
+      "btree.c:btreeParseCellPtrIndex"
+    ],
+    "note": ""
+  },
+  "btree.go:parseLeafCellWithSize": {
+    "sqlite": [
+      "btree.c:btreeParseCell",
+      "btree.c:btreeParseCellPtrIndex"
+    ],
+    "note": ""
+  },
+  "btree.go:searchInteriorPage": {
+    "sqlite": [
+      "btree.c:indexCellCompare",
+      "btree.c:sqlite3BtreeIndexMoveto"
+    ],
+    "note": ""
+  },
+  "btree.go:searchInteriorWithOverflow": {
+    "sqlite": [
+      "btree.c:indexCellCompare",
+      "btree.c:sqlite3BtreeIndexMoveto"
+    ],
+    "note": ""
+  },
+  "btree.go:searchLeafPage": {
+    "sqlite": [
+      "btree.c:indexCellCompare",
+      "btree.c:sqlite3BtreeIndexMoveto"
+    ],
+    "note": ""
+  },
+  "btree.go:searchLeafWithOverflow": {
+    "sqlite": [
+      "btree.c:indexCellCompare",
+      "btree.c:sqlite3BtreeIndexMoveto"
+    ],
+    "note": ""
+  },
+  "btree.go:writeInteriorCell": {
+    "sqlite": [
+      "btree.c:fillInCell"
+    ],
+    "note": ""
+  },
+  "btree.go:writeInteriorCellOverflow": {
+    "sqlite": [
+      "btree.c:fillInCell"
+    ],
+    "note": ""
+  },
+  "btree.go:writeLeafCell": {
+    "sqlite": [
+      "btree.c:fillInCell"
+    ],
+    "note": ""
+  },
+  "btree.go:writeLeafCellOverflow": {
+    "sqlite": [
+      "btree.c:fillInCell"
+    ],
+    "note": ""
+  },
+  "codec.go:*noncePool.Draw": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec.go:*onErrorField.SetOnError": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec.go:*onErrorField.fire": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec.go:decryptPageWithCodec": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec.go:decryptWith": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec.go:encryptPageWithCodec": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec.go:encryptWith": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec.go:newNoncePool": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec.go:overheadOrZero": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_aes.go:*aesCodec.Decrypt": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_aes.go:*aesCodec.Encrypt": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_aes.go:*aesCodec.Overhead": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_aes.go:NewAESCodec": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_chacha.go:*chachaCodec.Decrypt": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_chacha.go:*chachaCodec.Encrypt": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_chacha.go:*chachaCodec.Overhead": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_chacha.go:NewChaCha20Poly1305Codec": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_chacha.go:NewXChaCha20Poly1305Codec": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_cksum.go:*cksumCodec.Decrypt": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_cksum.go:*cksumCodec.Encrypt": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_cksum.go:*cksumCodec.Overhead": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_cksum.go:*cksumCodec.SetVerify": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_cksum.go:*cksumCodec.VerifyOn": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_cksum.go:StampPageChecksum": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_cksum.go:VerifyPageChecksum": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_cksum.go:newCksumCodec": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_cksum.go:putUint128LE": {
+    "sqlite": [],
+    "note": ""
+  },
+  "codec_kdf.go:DeriveKey": {
+    "sqlite": [],
+    "note": ""
+  },
+  "db.go:*DB.BeginRead": {
+    "sqlite": [
+      "btree.c:btreeBeginTrans",
+      "btree.c:sqlite3BtreeBeginTrans",
+      "pager.c:pagerBeginReadTransaction"
+    ],
+    "note": ""
+  },
+  "db.go:*DB.BeginReadFast": {
+    "sqlite": [
+      "btree.c:btreeBeginTrans",
+      "btree.c:sqlite3BtreeBeginTrans",
+      "pager.c:pagerBeginReadTransaction"
+    ],
+    "note": "fast path skips page-1 counter read"
+  },
+  "db.go:*DB.BeginWrite": {
+    "sqlite": [
+      "btree.c:btreeBeginTrans",
+      "btree.c:sqlite3BtreeBeginTrans",
+      "wal.c:sqlite3WalBeginWriteTransaction"
+    ],
+    "note": ""
+  },
+  "db.go:*DB.Checkpoint": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeCheckpoint",
+      "pager.c:sqlite3PagerCheckpoint"
+    ],
+    "note": ""
+  },
+  "db.go:*DB.Close": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeClose",
+      "pager.c:sqlite3PagerClose"
+    ],
+    "note": ""
+  },
+  "db.go:*DB.CreateNamespace": {
+    "sqlite": [
+      "btree.c:btreeCreateTable",
+      "btree.c:sqlite3BtreeCreateTable"
+    ],
+    "note": ""
+  },
+  "db.go:*DB.DatabaseSize": {
+    "sqlite": [
+      "pager.c:sqlite3PagerPagecount"
+    ],
+    "note": "atomic page-count read (any-store keeps dbSize as atomic.Uint32 updated on allocate/truncate)"
+  },
+  "db.go:*DB.DeleteNamespace": {
+    "sqlite": [
+      "btree.c:btreeDropTable",
+      "btree.c:sqlite3BtreeDropTable"
+    ],
+    "note": ""
+  },
+  "db.go:*DB.GetNamespace": {
+    "sqlite": [],
+    "note": "any-store namespace lookup in master btree"
+  },
+  "db.go:*DB.HasOpenTransaction": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeTxnState"
+    ],
+    "note": "used by BackupInit to refuse when dst has an open write tx"
+  },
+  "db.go:*DB.LastAutoCheckpointError": {
+    "sqlite": [],
+    "note": ""
+  },
+  "db.go:*DB.ListNamespaces": {
+    "sqlite": [],
+    "note": "any-store master-table enumeration (SQLite does this via SQL over sqlite_master)"
+  },
+  "db.go:*DB.Options": {
+    "sqlite": [],
+    "note": "any-store accessor for the opened DB's Options (page size, cache size, sync flags, codec) — SQLite exposes these only through PRAGMA"
+  },
+  "db.go:*DB.PageSize": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeGetPageSize"
+    ],
+    "note": "page size is immutable after Open (set from Options.PageSize or read from the header)"
+  },
+  "db.go:*DB.Path": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeGetFilename",
+      "pager.c:sqlite3PagerFilename"
+    ],
+    "note": ""
+  },
+  "db.go:*DB.SetClosing": {
+    "sqlite": [],
+    "note": "any-store cooperative shutdown signal"
+  },
+  "db.go:*DB.UpdateLocalCounters": {
+    "sqlite": [],
+    "note": "any-store multi-process staleness bookkeeping"
+  },
+  "db.go:*DB.WriterCacheLen": {
+    "sqlite": [],
+    "note": "test helper"
+  },
+  "db.go:*DB.beginRead": {
+    "sqlite": [
+      "btree.c:btreeBeginTrans",
+      "btree.c:sqlite3BtreeBeginTrans",
+      "pager.c:pagerBeginReadTransaction",
+      "wal.c:sqlite3WalBeginReadTransaction"
+    ],
+    "note": ""
+  },
+  "db.go:*DB.freeTreePages": {
+    "sqlite": [
+      "btree.c:clearDatabasePage"
+    ],
+    "note": ""
+  },
+  "db.go:*DB.getNamespaceAt": {
+    "sqlite": [],
+    "note": "any-store namespace lookup"
+  },
+  "db.go:*DB.getNamespaceLocked": {
+    "sqlite": [],
+    "note": "any-store namespace lookup (writer view)"
+  },
+  "db.go:*DB.getReadTx": {
+    "sqlite": [],
+    "note": ""
+  },
+  "db.go:*DB.getWriteTx": {
+    "sqlite": [],
+    "note": ""
+  },
+  "db.go:*DB.putReadTx": {
+    "sqlite": [],
+    "note": ""
+  },
+  "db.go:*DB.putWriteTx": {
+    "sqlite": [],
+    "note": ""
+  },
+  "db.go:*DB.resolveNamespace": {
+    "sqlite": [],
+    "note": "any-store master-table traversal for namespace-\u003erootPage"
+  },
+  "db.go:*Namespace.Name": {
+    "sqlite": [],
+    "note": ""
+  },
+  "db.go:*Namespace.RootPage": {
+    "sqlite": [],
+    "note": ""
+  },
+  "db.go:*ReadTx.AppendSeekKey": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeIndexMoveto"
+    ],
+    "note": ""
+  },
+  "db.go:*ReadTx.AppendValue": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeIndexMoveto",
+      "btree.c:sqlite3BtreePayload"
+    ],
+    "note": ""
+  },
+  "db.go:*ReadTx.Count": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeCount"
+    ],
+    "note": ""
+  },
+  "db.go:*ReadTx.DiskFileChangeCounter": {
+    "sqlite": [],
+    "note": ""
+  },
+  "db.go:*ReadTx.DiskSchemaCookie": {
+    "sqlite": [],
+    "note": ""
+  },
+  "db.go:*ReadTx.Get": {
+    "sqlite": [],
+    "note": ""
+  },
+  "db.go:*ReadTx.GetNamespace": {
+    "sqlite": [],
+    "note": "any-store namespace handle lookup"
+  },
+  "db.go:*ReadTx.Has": {
+    "sqlite": [],
+    "note": "any-store existence-check wrapper"
+  },
+  "db.go:*ReadTx.IsDataStale": {
+    "sqlite": [],
+    "note": "any-store multi-process staleness check"
+  },
+  "db.go:*ReadTx.IsSchemaStale": {
+    "sqlite": [],
+    "note": "any-store multi-process staleness check"
+  },
+  "db.go:*ReadTx.NewCursor": {
+    "sqlite": [
+      "btree.c:btreeCursor",
+      "btree.c:sqlite3BtreeCursor"
+    ],
+    "note": ""
+  },
+  "db.go:*ReadTx.Rollback": {
+    "sqlite": [
+      "wal.c:sqlite3WalEndReadTransaction"
+    ],
+    "note": ""
+  },
+  "db.go:*ReadTx.SeekKey": {
+    "sqlite": [],
+    "note": ""
+  },
+  "db.go:*ReadTx.WalMaxFrame": {
+    "sqlite": [],
+    "note": ""
+  },
+  "db.go:*ReadTx.leftmostKeyAfter": {
+    "sqlite": [
+      "btree.c:moveToLeftmost"
+    ],
+    "note": ""
+  },
+  "db.go:*ReadTx.readOverflow": {
+    "sqlite": [],
+    "note": ""
+  },
+  "db.go:*ReadTx.txGetPage": {
+    "sqlite": [
+      "btree.c:btreeGetPage",
+      "btree.c:getAndInitPage"
+    ],
+    "note": ""
+  },
+  "db.go:*WriteTx.Commit": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeCommit",
+      "btree.c:sqlite3BtreeCommitPhaseOne",
+      "btree.c:sqlite3BtreeCommitPhaseTwo"
+    ],
+    "note": ""
+  },
+  "db.go:*WriteTx.CreateNamespace": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeCreateTable"
+    ],
+    "note": ""
+  },
+  "db.go:*WriteTx.Delete": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeDelete"
+    ],
+    "note": ""
+  },
+  "db.go:*WriteTx.DeleteNamespace": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeDropTable"
+    ],
+    "note": ""
+  },
+  "db.go:*WriteTx.GetNamespace": {
+    "sqlite": [],
+    "note": "any-store namespace handle lookup"
+  },
+  "db.go:*WriteTx.MarkDataChanged": {
+    "sqlite": [],
+    "note": "any-store explicit data-change signal (SQLite auto-tracks)"
+  },
+  "db.go:*WriteTx.MarkSchemaChanged": {
+    "sqlite": [],
+    "note": "any-store explicit schema-change signal (SQLite auto-tracks)"
+  },
+  "db.go:*WriteTx.Put": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeInsert"
+    ],
+    "note": ""
+  },
+  "db.go:*WriteTx.ReleaseSavepoint": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeSavepoint",
+      "pager.c:sqlite3PagerSavepoint"
+    ],
+    "note": ""
+  },
+  "db.go:*WriteTx.Rollback": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeRollback",
+      "pager.c:sqlite3PagerRollback"
+    ],
+    "note": ""
+  },
+  "db.go:*WriteTx.RollbackToSavepoint": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeSavepoint",
+      "pager.c:sqlite3PagerSavepoint"
+    ],
+    "note": ""
+  },
+  "db.go:*WriteTx.Savepoint": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeBeginStmt",
+      "pager.c:pagerOpenSavepoint",
+      "pager.c:sqlite3PagerOpenSavepoint"
+    ],
+    "note": ""
+  },
+  "db.go:DefaultOptions": {
+    "sqlite": [],
+    "note": ""
+  },
+  "db.go:Open": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeOpen",
+      "pager.c:sqlite3PagerOpen",
+      "wal.c:sqlite3WalOpen"
+    ],
+    "note": ""
+  },
+  "db.go:buildCodec": {
+    "sqlite": [],
+    "note": ""
+  },
+  "db.go:newCodecFromType": {
+    "sqlite": [],
+    "note": ""
+  },
+  "db.go:readInitialHeader": {
+    "sqlite": [],
+    "note": ""
+  },
+  "dbfile_lock_other.go:acquireSharedDBLock": {
+    "sqlite": [],
+    "note": ""
+  },
+  "dbfile_lock_other.go:downgradeDBLockToShared": {
+    "sqlite": [],
+    "note": ""
+  },
+  "dbfile_lock_other.go:tryUpgradeDBLockExclusive": {
+    "sqlite": [],
+    "note": ""
+  },
+  "dbfile_lock_unix.go:acquireSharedDBLock": {
+    "sqlite": [],
+    "note": ""
+  },
+  "dbfile_lock_unix.go:downgradeDBLockToShared": {
+    "sqlite": [],
+    "note": ""
+  },
+  "dbfile_lock_unix.go:flockNB": {
+    "sqlite": [],
+    "note": ""
+  },
+  "dbfile_lock_unix.go:tryUpgradeDBLockExclusive": {
+    "sqlite": [],
+    "note": ""
+  },
+  "debug_trace.go:trace": {
+    "sqlite": [],
+    "note": "Go-only no-op stub under !debugtrace build tag; debug tracing facility with no SQLite counterpart"
+  },
+  "debug_trace_on.go:init": {
+    "sqlite": [],
+    "note": "Go package-init that configures a stderr/file log.Logger gated by BTREE_TRACE env var; no SQLite analogue (SQLite uses sqlite3_config(SQLITE_CONFIG_LOG) callbacks, not package-level loggers)."
+  },
+  "debug_trace_on.go:trace": {
+    "sqlite": [],
+    "note": "Thin wrapper over log.Logger.Printf for build-tagged tracing; any-store-specific debug scaffolding with no SQLite origin."
+  },
+  "integrity.go:*DB.IntegrityCheck": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeIntegrityCheck"
+    ],
+    "note": ""
+  },
+  "integrity.go:*DB.IntegrityCheckN": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeIntegrityCheck"
+    ],
+    "note": ""
+  },
+  "integrity.go:*IntegrityError.Error": {
+    "sqlite": [],
+    "note": ""
+  },
+  "integrity.go:*integrityChecker.checkList": {
+    "sqlite": [
+      "btree.c:checkList"
+    ],
+    "note": ""
+  },
+  "integrity.go:*integrityChecker.checkPageCoverage": {
+    "sqlite": [
+      "btree.c:checkTreePage"
+    ],
+    "note": "extracted from inline coverage/fragmentation loop inside checkTreePage"
+  },
+  "integrity.go:*integrityChecker.checkRef": {
+    "sqlite": [
+      "btree.c:checkRef"
+    ],
+    "note": ""
+  },
+  "integrity.go:*integrityChecker.checkTreePage": {
+    "sqlite": [
+      "btree.c:checkTreePage"
+    ],
+    "note": ""
+  },
+  "integrity.go:*integrityChecker.getPage": {
+    "sqlite": [],
+    "note": ""
+  },
+  "integrity.go:*integrityChecker.isReferenced": {
+    "sqlite": [
+      "btree.c:getPageReferenced"
+    ],
+    "note": ""
+  },
+  "integrity.go:*integrityChecker.keyInBounds": {
+    "sqlite": [
+      "btree.c:checkTreePage"
+    ],
+    "note": "any-store analogue of checkTreePage's keyCanBeEqual/maxKey machinery (btree.c:10953-11029); enforces [lower, upper) under any-store's \u003c,\u003e= divider invariant"
+  },
+  "integrity.go:*integrityChecker.report": {
+    "sqlite": [
+      "btree.c:checkAppendMsg"
+    ],
+    "note": ""
+  },
+  "integrity.go:*integrityChecker.setReferenced": {
+    "sqlite": [
+      "btree.c:setPageReferenced"
+    ],
+    "note": ""
+  },
+  "integrity.go:*integrityChecker.tooManyErrors": {
+    "sqlite": [],
+    "note": ""
+  },
+  "integrity.go:heapInsert": {
+    "sqlite": [
+      "btree.c:btreeHeapInsert"
+    ],
+    "note": ""
+  },
+  "integrity.go:heapPull": {
+    "sqlite": [
+      "btree.c:btreeHeapPull"
+    ],
+    "note": ""
+  },
+  "integrity_sweep.go:*DB.CksumCodec": {
+    "sqlite": [],
+    "note": ""
+  },
+  "integrity_sweep.go:*DB.IntegrityMode": {
+    "sqlite": [],
+    "note": ""
+  },
+  "integrity_sweep.go:*DB.VerifyIntegrity": {
+    "sqlite": [],
+    "note": ""
+  },
+  "integrity_sweep.go:verifyAEADPage": {
+    "sqlite": [],
+    "note": ""
+  },
+  "integrity_sweep.go:verifyCksumPage": {
+    "sqlite": [],
+    "note": ""
+  },
+  "mmap_db.go:*dbMmap.enabled": {
+    "sqlite": [],
+    "note": ""
+  },
+  "mmap_db.go:*dbMmap.readAt": {
+    "sqlite": [],
+    "note": "mirrors os_unix.c unixFetch (not citable: os_unix.c is shm-filtered in the C allowlist)"
+  },
+  "mmap_db.go:*dbMmap.remap": {
+    "sqlite": [],
+    "note": "mirrors os_unix.c unixRemapfile (not citable: os_unix.c is shm-filtered in the C allowlist)"
+  },
+  "mmap_db.go:*dbMmap.unmap": {
+    "sqlite": [],
+    "note": "mirrors os_unix.c unixUnmapfile/unixUnfetch (not citable: os_unix.c is shm-filtered in the C allowlist)"
+  },
+  "mmap_db.go:fdFromFile": {
+    "sqlite": [],
+    "note": ""
+  },
+  "mmap_db.go:newDBMmap": {
+    "sqlite": [],
+    "note": "lazy-init wrapper; mapping deferred to first readAt miss. Mirrors os_unix.c unixMapfile (not citable: os_unix.c is shm-filtered in the C allowlist)"
+  },
+  "mmap_db_other.go:*dbMmap.enabled": {
+    "sqlite": [],
+    "note": ""
+  },
+  "mmap_db_other.go:*dbMmap.readAt": {
+    "sqlite": [],
+    "note": ""
+  },
+  "mmap_db_other.go:*dbMmap.remap": {
+    "sqlite": [],
+    "note": ""
+  },
+  "mmap_db_other.go:*dbMmap.unmap": {
+    "sqlite": [],
+    "note": ""
+  },
+  "mmap_db_other.go:newDBMmap": {
+    "sqlite": [],
+    "note": ""
+  },
+  "mxframe.go:*commitFrameCounter.CompareAndSwap": {
+    "sqlite": [],
+    "note": ""
+  },
+  "mxframe.go:*commitFrameCounter.LoadLocal": {
+    "sqlite": [],
+    "note": ""
+  },
+  "mxframe.go:*commitFrameCounter.Store": {
+    "sqlite": [],
+    "note": ""
+  },
+  "namespace_size.go:*ReadTx.NamespaceSize": {
+    "sqlite": [],
+    "note": "any-store physical-size introspection API; no SQLite analog (closest concept is the dbstat virtual table). Walks the namespace tree read-only"
+  },
+  "namespace_size.go:*btree.countOverflowChain": {
+    "sqlite": [],
+    "note": "counts pages in an overflow chain by following the 4-byte next pointer, for NamespaceSize; any-store-specific (cf. the overflow walk in checkList)"
+  },
+  "namespace_size.go:*btree.walkSize": {
+    "sqlite": [],
+    "note": "recursive page+payload accounting walk for NamespaceSize; structurally like checkTreePage's traversal but sizing, not validating — any-store-specific"
+  },
+  "namespace_size.go:NamespaceSize.TotalPages": {
+    "sqlite": [],
+    "note": "pure accessor on the NamespaceSize result (Pages + OverflowPages); any-store-specific"
+  },
+  "namespace_size.go:leafCellPayloadLen": {
+    "sqlite": [],
+    "note": "decodes full key/value payload lengths from a leaf cell for size accounting; the length-only slice of btreeParseCellPtr — any-store-specific helper"
+  },
+  "osfuncs.go:ResetOpenRegistry": {
+    "sqlite": [],
+    "note": "any-store VFS build-tag stub"
+  },
+  "osfuncs.go:ResetVFS": {
+    "sqlite": [],
+    "note": "any-store VFS build-tag stub"
+  },
+  "osfuncs.go:SetVFS": {
+    "sqlite": [],
+    "note": "any-store VFS build-tag stub"
+  },
+  "osfuncs.go:osOpenFile": {
+    "sqlite": [],
+    "note": "thin os.OpenFile wrapper"
+  },
+  "osfuncs_sync_linux.go:fdatasync": {
+    "sqlite": [],
+    "note": "Linux-specific syscall.Fdatasync wrapper; os_unix.c's fdatasync usage is inline (HAVE_FDATASYNC), not a canonical function in sqlite_funcs.json"
+  },
+  "osfuncs_sync_other.go:fdatasync": {
+    "sqlite": [],
+    "note": "non-Linux/non-vfs fallback wrapping os.File.Sync (portability shim, no direct SQLite origin)"
+  },
+  "osfuncs_vfs.go:ResetOpenRegistry": {
+    "sqlite": [],
+    "note": "any-store test hook to clear the process-global open-DB registry (crash-simulation tests skip Close)"
+  },
+  "osfuncs_vfs.go:ResetVFS": {
+    "sqlite": [],
+    "note": "any-store test hook to restore default VFS funcs"
+  },
+  "osfuncs_vfs.go:SetVFS": {
+    "sqlite": [],
+    "note": "any-store test hook to inject VFS overrides"
+  },
+  "osfuncs_vfs_js.go:init": {
+    "sqlite": [],
+    "note": ""
+  },
+  "page.go:*dbHeader.deserialize": {
+    "sqlite": [
+      "btree.c:lockBtree"
+    ],
+    "note": ""
+  },
+  "page.go:*dbHeader.serialize": {
+    "sqlite": [
+      "btree.c:newDatabase"
+    ],
+    "note": ""
+  },
+  "page.go:*page.cellPointerOffset": {
+    "sqlite": [],
+    "note": ""
+  },
+  "page.go:*page.contentAreaOffset": {
+    "sqlite": [
+      "btree.c:allocateSpace"
+    ],
+    "note": ""
+  },
+  "page.go:*page.getCellOffset": {
+    "sqlite": [],
+    "note": ""
+  },
+  "page.go:*page.getCellOffsetSafe": {
+    "sqlite": [],
+    "note": ""
+  },
+  "page.go:*page.setCellOffset": {
+    "sqlite": [],
+    "note": ""
+  },
+  "page.go:*page.usableSize": {
+    "sqlite": [],
+    "note": ""
+  },
+  "page.go:*pageHeader.deserialize": {
+    "sqlite": [
+      "btree.c:btreeInitPage",
+      "btree.c:decodeFlags"
+    ],
+    "note": ""
+  },
+  "page.go:*pageHeader.headerSize": {
+    "sqlite": [],
+    "note": ""
+  },
+  "page.go:*pageHeader.isInterior": {
+    "sqlite": [],
+    "note": ""
+  },
+  "page.go:*pageHeader.isLeaf": {
+    "sqlite": [],
+    "note": ""
+  },
+  "page.go:*pageHeader.serialize": {
+    "sqlite": [
+      "btree.c:zeroPage"
+    ],
+    "note": ""
+  },
+  "page.go:checksum": {
+    "sqlite": [],
+    "note": "CRC32 helper; SQLite uses custom walChecksumBytes in WAL only"
+  },
+  "page.go:getVarint": {
+    "sqlite": [
+      "util.c:sqlite3GetVarint",
+      "util.c:sqlite3GetVarint32"
+    ],
+    "note": "covers both the full 64-bit decode (sqlite3GetVarint) and the 32-bit fast path (sqlite3GetVarint32)"
+  },
+  "page.go:getVarintSafe": {
+    "sqlite": [],
+    "note": "bounds-checked wrapper around getVarint; same util.c decoder"
+  },
+  "page.go:localPayloadSize": {
+    "sqlite": [
+      "btree.c:btreePayloadToLocal"
+    ],
+    "note": ""
+  },
+  "page.go:maxLocalPayload": {
+    "sqlite": [],
+    "note": ""
+  },
+  "page.go:minLocalPayload": {
+    "sqlite": [],
+    "note": ""
+  },
+  "page.go:overflowPageUsable": {
+    "sqlite": [],
+    "note": ""
+  },
+  "page.go:putVarint": {
+    "sqlite": [
+      "util.c:putVarint64",
+      "util.c:sqlite3PutVarint"
+    ],
+    "note": "putVarint64 is the static encoder; sqlite3PutVarint the public wrapper (util.c)"
+  },
+  "page.go:varintSize": {
+    "sqlite": [
+      "util.c:sqlite3VarintLen"
+    ],
+    "note": "caps at 9 bytes for v\u003e=2^56; sqlite3VarintLen returns 10 for v\u003e=2^63 (disagreeing with its own putVarint64). Unreachable here — payload lengths capped at maxPayloadAlloc=1\u003c\u003c30"
+  },
+  "page_slab.go:*pageSlab.Get": {
+    "sqlite": [
+      "pcache1.c:pcache1Alloc"
+    ],
+    "note": ""
+  },
+  "page_slab.go:*pageSlab.Init": {
+    "sqlite": [
+      "pcache1.c:sqlite3PCacheBufferSetup"
+    ],
+    "note": ""
+  },
+  "page_slab.go:*pageSlab.Initialized": {
+    "sqlite": [],
+    "note": ""
+  },
+  "page_slab.go:*pageSlab.Put": {
+    "sqlite": [
+      "pcache1.c:pcache1Free"
+    ],
+    "note": ""
+  },
+  "page_slab.go:*pageSlab.Reset": {
+    "sqlite": [],
+    "note": ""
+  },
+  "page_slab.go:*pageSlab.UnderPressure": {
+    "sqlite": [
+      "pcache1.c:pcache1UnderMemoryPressure"
+    ],
+    "note": ""
+  },
+  "page_slab.go:ConfigPageCache": {
+    "sqlite": [
+      "pcache1.c:sqlite3PCacheBufferSetup"
+    ],
+    "note": ""
+  },
+  "page_slab.go:allocPageBuffer": {
+    "sqlite": [],
+    "note": "Go dispatcher between slab and sync.Pool allocators"
+  },
+  "page_slab.go:freePageBuffer": {
+    "sqlite": [],
+    "note": "Go dispatcher between slab and sync.Pool allocators"
+  },
+  "page_slab.go:initPageBufferPool": {
+    "sqlite": [],
+    "note": "any-store-only sync.Pool page-size tracking"
+  },
+  "page_slab.go:resetPageBufferPool": {
+    "sqlite": [],
+    "note": "test-only sync.Pool reset"
+  },
+  "pager.go:*masterStore.readPageInto": {
+    "sqlite": [],
+    "note": "InMemory mode backing store; emulates VFS disk reads"
+  },
+  "pager.go:*masterStore.writePage": {
+    "sqlite": [],
+    "note": "InMemory mode backing store; emulates VFS disk writes"
+  },
+  "pager.go:*pager.acquireTempPage": {
+    "sqlite": [
+      "btree.c:allocateTempSpace"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.allocateFromFreelist": {
+    "sqlite": [
+      "btree.c:allocateBtreePage"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.allocatePage": {
+    "sqlite": [
+      "btree.c:allocateBtreePage"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.allocatePageNear": {
+    "sqlite": [],
+    "note": ""
+  },
+  "pager.go:*pager.attachBackup": {
+    "sqlite": [
+      "pager.c:sqlite3PagerBackupPtr"
+    ],
+    "note": "attachBackupObject equivalent (backup.c:302–309); registers a Backup on pager.backups for update/restart dispatch"
+  },
+  "pager.go:*pager.beginRead": {
+    "sqlite": [
+      "pager.c:sqlite3PagerSharedLock"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.beginReadHdr": {
+    "sqlite": [],
+    "note": ""
+  },
+  "pager.go:*pager.beginWrite": {
+    "sqlite": [
+      "pager.c:sqlite3PagerBegin"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.checkpointWithMode": {
+    "sqlite": [
+      "pager.c:sqlite3PagerCheckpoint"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.close": {
+    "sqlite": [
+      "pager.c:sqlite3PagerClose"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.commit": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeUpdateMeta",
+      "pager.c:sqlite3PagerCommitPhaseOne",
+      "pager.c:sqlite3PagerCommitPhaseTwo"
+    ],
+    "note": "schema-cookie bump at pager.go:1864 (FileChangeCount at 1861) is the sqlite3BtreeUpdateMeta equivalent"
+  },
+  "pager.go:*pager.committedCounters": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeGetMeta"
+    ],
+    "note": "reads FileChangeCount/SchemaCookie from the writer-owned in-memory page-1 header, mirroring SQLite reading meta from the cached page-1 PgHdr rather than re-reading the WAL"
+  },
+  "pager.go:*pager.decryptPage": {
+    "sqlite": [],
+    "note": ""
+  },
+  "pager.go:*pager.detachBackup": {
+    "sqlite": [
+      "pager.c:sqlite3PagerBackupPtr"
+    ],
+    "note": "inverse of attachBackupObject; called by Backup.Finish (backup.c:589–597)"
+  },
+  "pager.go:*pager.dispatchBackupRestart": {
+    "sqlite": [
+      "backup.c:sqlite3BackupRestart"
+    ],
+    "note": "fans out a restart signal to all attached Backups when WAL reset or page-cache invalidation makes already-copied tracking meaningless"
+  },
+  "pager.go:*pager.dispatchBackupUpdate": {
+    "sqlite": [
+      "backup.c:backupUpdate"
+    ],
+    "note": "fans out the per-page update hook to all attached Backups after each committed write so already-copied pages stay current"
+  },
+  "pager.go:*pager.dontWrite": {
+    "sqlite": [
+      "pager.c:sqlite3PagerDontWrite"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.encryptPage": {
+    "sqlite": [],
+    "note": ""
+  },
+  "pager.go:*pager.endRead": {
+    "sqlite": [],
+    "note": ""
+  },
+  "pager.go:*pager.freeOverflowChain": {
+    "sqlite": [
+      "btree.c:clearCellOverflow"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.freePage": {
+    "sqlite": [
+      "btree.c:freePage",
+      "btree.c:freePage2"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.freeSavepointPageBuffers": {
+    "sqlite": [
+      "pager.c:releaseAllSavepoints"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.freelistMaxLeaves": {
+    "sqlite": [],
+    "note": ""
+  },
+  "pager.go:*pager.getHasContent": {
+    "sqlite": [
+      "btree.c:btreeGetHasContent"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.getPage": {
+    "sqlite": [
+      "btree.c:btreeGetPage",
+      "btree.c:getAndInitPage",
+      "pager.c:sqlite3PagerGet"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.getPageNoContent": {
+    "sqlite": [
+      "btree.c:btreeGetUnusedPage",
+      "pager.c:getPageNormal"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.getPageReader": {
+    "sqlite": [
+      "btree.c:btreeGetPage",
+      "btree.c:getAndInitPage",
+      "pager.c:getPageNormal",
+      "pager.c:sqlite3PagerGetData"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.getPageWriter": {
+    "sqlite": [
+      "btree.c:btreeGetPage",
+      "btree.c:getAndInitPage",
+      "pager.c:getPageNormal",
+      "pager.c:sqlite3PagerGetData"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.getWritablePage": {
+    "sqlite": [
+      "pager.c:pager_write",
+      "pager.c:sqlite3PagerWrite"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.initNewDB": {
+    "sqlite": [
+      "btree.c:newDatabase"
+    ],
+    "note": "any-store initializes empty page 1 at pager open; SQLite defers to btree layer"
+  },
+  "pager.go:*pager.installCodec": {
+    "sqlite": [],
+    "note": ""
+  },
+  "pager.go:*pager.open": {
+    "sqlite": [
+      "btree.c:lockBtree",
+      "pager.c:sqlite3PagerOpen"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.pagerError": {
+    "sqlite": [
+      "pager.c:pager_error"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.pagerStress": {
+    "sqlite": [
+      "pager.c:pagerStress"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.readDBPage": {
+    "sqlite": [],
+    "note": ""
+  },
+  "pager.go:*pager.readHeaderCounters": {
+    "sqlite": [],
+    "note": "any-store cross-process header read bypassing cache/index"
+  },
+  "pager.go:*pager.readOverflowAt": {
+    "sqlite": [
+      "btree.c:accessPayload",
+      "btree.c:getOverflowPage"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.readOverflowChainAt": {
+    "sqlite": [
+      "btree.c:accessPayload",
+      "btree.c:getOverflowPage"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.readOverflowChainReader": {
+    "sqlite": [
+      "btree.c:accessPayload",
+      "btree.c:getOverflowPage"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.readRawPage": {
+    "sqlite": [],
+    "note": ""
+  },
+  "pager.go:*pager.readTempPage": {
+    "sqlite": [
+      "pager.c:readDbPage"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.readWalFrameData": {
+    "sqlite": [
+      "wal.c:sqlite3WalReadFrame"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.recycleCellBuf": {
+    "sqlite": [],
+    "note": ""
+  },
+  "pager.go:*pager.recycleCellSlice": {
+    "sqlite": [],
+    "note": ""
+  },
+  "pager.go:*pager.recycleTempPage": {
+    "sqlite": [
+      "btree.c:freeTempSpace"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.refreshHeaderFromPage1": {
+    "sqlite": [],
+    "note": ""
+  },
+  "pager.go:*pager.releasePage": {
+    "sqlite": [
+      "btree.c:releasePage",
+      "btree.c:releasePageNotNull",
+      "pager.c:sqlite3PagerUnref"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.releaseSavepoint": {
+    "sqlite": [
+      "pager.c:sqlite3PagerSavepoint"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.rollback": {
+    "sqlite": [
+      "pager.c:sqlite3PagerRollback"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.rollbackForClose": {
+    "sqlite": [
+      "pager.c:pagerUnlockAndRollback"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.rollbackLocked": {
+    "sqlite": [
+      "pager.c:pager_end_transaction",
+      "pager.c:sqlite3PagerRollback"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.rollbackToSavepoint": {
+    "sqlite": [
+      "pager.c:pagerPlaybackSavepoint",
+      "pager.c:sqlite3PagerSavepoint",
+      "wal.c:sqlite3WalSavepointUndo"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.savepoint": {
+    "sqlite": [
+      "btree.c:sqlite3BtreeBeginStmt",
+      "pager.c:pagerOpenSavepoint",
+      "pager.c:sqlite3PagerOpenSavepoint",
+      "wal.c:sqlite3WalSavepoint"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.setHasContent": {
+    "sqlite": [
+      "btree.c:btreeSetHasContent"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.takeCellBuf": {
+    "sqlite": [],
+    "note": ""
+  },
+  "pager.go:*pager.takeCellSlice": {
+    "sqlite": [],
+    "note": ""
+  },
+  "pager.go:*pager.truncateTo": {
+    "sqlite": [
+      "pager.c:sqlite3PagerTruncateImage"
+    ],
+    "note": "backup destination shrink path (backup.c:530); discards writerCache pages beyond the new size"
+  },
+  "pager.go:*pager.tryCheckpoint": {
+    "sqlite": [
+      "pager.c:sqlite3PagerCheckpoint"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.usableSize": {
+    "sqlite": [],
+    "note": ""
+  },
+  "pager.go:*pager.withWriteLock": {
+    "sqlite": [],
+    "note": ""
+  },
+  "pager.go:*pager.writeOverflowChain": {
+    "sqlite": [
+      "btree.c:fillInCell"
+    ],
+    "note": ""
+  },
+  "pager.go:*pager.writeOverflowChainMulti": {
+    "sqlite": [
+      "btree.c:fillInCell"
+    ],
+    "note": ""
+  },
+  "pager.go:newPager": {
+    "sqlite": [
+      "pager.c:sqlite3PagerOpen"
+    ],
+    "note": ""
+  },
+  "pcache.go:*pcache.appendDirtyPages": {
+    "sqlite": [
+      "pcache.c:sqlite3PcacheDirtyList"
+    ],
+    "note": ""
+  },
+  "pcache.go:*pcache.clear": {
+    "sqlite": [
+      "pcache.c:sqlite3PcacheClear",
+      "pcache.c:sqlite3PcacheTruncate"
+    ],
+    "note": ""
+  },
+  "pcache.go:*pcache.create": {
+    "sqlite": [
+      "pcache.c:sqlite3PcacheFetch",
+      "pcache.c:sqlite3PcacheFetchStress",
+      "pcache1.c:pcache1Fetch",
+      "pcache1.c:pcache1FetchNoMutex",
+      "pcache1.c:pcache1FetchStage2"
+    ],
+    "note": "initial 'already cached?' probe via hashFind (pcache1FetchNoMutex); on allocate, hashInsert links into apHash (was pc.pages[pgno]=p). nPage replaces len(pages)."
+  },
+  "pcache.go:*pcache.destroy": {
+    "sqlite": [
+      "pcache.c:sqlite3PcacheClose",
+      "pcache1.c:pcache1Destroy"
+    ],
+    "note": ""
+  },
+  "pcache.go:*pcache.dirtyMoveToFront": {
+    "sqlite": [
+      "pcache.c:pcacheManageDirtyList"
+    ],
+    "note": ""
+  },
+  "pcache.go:*pcache.dirtyPages": {
+    "sqlite": [
+      "pcache.c:sqlite3PcacheDirtyList"
+    ],
+    "note": ""
+  },
+  "pcache.go:*pcache.discard": {
+    "sqlite": [
+      "pcache.c:sqlite3PcacheDrop",
+      "pcache1.c:pcache1FreePage",
+      "pcache1.c:pcache1RemoveFromHash"
+    ],
+    "note": "lookup via hashFind; hashRemove (pcache1RemoveFromHash) clears page.inCache so a still-pinned discarded page is not re-LRU'd on release"
+  },
+  "pcache.go:*pcache.evictOne": {
+    "sqlite": [
+      "pcache1.c:pcache1EnforceMaxPage",
+      "pcache1.c:pcache1RemoveFromHash"
+    ],
+    "note": "pops LRU tail then hashRemove (was delete(pc.pages, p.pgno))"
+  },
+  "pcache.go:*pcache.fetch": {
+    "sqlite": [
+      "pcache.c:sqlite3PcacheFetch",
+      "pcache1.c:pcache1Fetch",
+      "pcache1.c:pcache1FetchNoMutex"
+    ],
+    "note": "lookup via hashFind (chained-bucket probe, pcache1FetchNoMutex step 1) then pin + lruRemove on a clean hit (pcache1PinPage)"
+  },
+  "pcache.go:*pcache.findSpillVictim": {
+    "sqlite": [
+      "pcache.c:sqlite3PcacheFetchStress"
+    ],
+    "note": ""
+  },
+  "pcache.go:*pcache.hashFind": {
+    "sqlite": [
+      "pcache1.c:pcache1FetchNoMutex"
+    ],
+    "note": "chained-bucket probe apHash[pgno\u0026(nHash-1)] walked by hashNext, the read-only half of pcache1FetchNoMutex step 1 (pcache1.c:1009-1010); shared by fetch/create. Closes NOTES §9 drift #2."
+  },
+  "pcache.go:*pcache.hashInsert": {
+    "sqlite": [
+      "pcache1.c:pcache1FetchStage2",
+      "pcache1.c:pcache1ResizeHash"
+    ],
+    "note": "links page at bucket head, sets page.inCache, bumps nPage, resizes at load factor 1.0 (pcache1.c:894 nPage\u003e=nHash → pcache1ResizeHash)"
+  },
+  "pcache.go:*pcache.hashRemove": {
+    "sqlite": [
+      "pcache1.c:pcache1RemoveFromHash"
+    ],
+    "note": "unlinks page from its bucket chain and clears page.inCache (pcache1.c:601-613); the inCache flag is a v2 addition for pages removed while pinned (no SQLite equivalent — SQLite forbids that)"
+  },
+  "pcache.go:*pcache.initBulk": {
+    "sqlite": [
+      "pcache1.c:pcache1InitBulk"
+    ],
+    "note": ""
+  },
+  "pcache.go:*pcache.lruPrepend": {
+    "sqlite": [
+      "pcache1.c:pcache1Unpin"
+    ],
+    "note": ""
+  },
+  "pcache.go:*pcache.lruRemove": {
+    "sqlite": [
+      "pcache1.c:pcache1PinPage"
+    ],
+    "note": ""
+  },
+  "pcache.go:*pcache.makeClean": {
+    "sqlite": [
+      "pcache.c:sqlite3PcacheMakeClean"
+    ],
+    "note": ""
+  },
+  "pcache.go:*pcache.makeDirty": {
+    "sqlite": [
+      "pcache.c:sqlite3PcacheMakeDirty"
+    ],
+    "note": ""
+  },
+  "pcache.go:*pcache.release": {
+    "sqlite": [
+      "pcache.c:sqlite3PcacheRelease",
+      "pcache1.c:pcache1RemoveFromHash",
+      "pcache1.c:pcache1Unpin"
+    ],
+    "note": "gates LRU insert on page.inCache (field read) instead of the former second map lookup (pc.pages[p.pgno]==p); overfull path calls hashRemove (pcache1RemoveFromHash). SQLite's pcache1Unpin adds to LRU unconditionally (its invariants forbid removing a pinned page); the inCache gate is the v2 ghost-page guard."
+  },
+  "pcache.go:*pcache.resetPage": {
+    "sqlite": [
+      "pcache.c:pcacheFetchFinishWithInit"
+    ],
+    "note": ""
+  },
+  "pcache.go:*pcache.resizeHash": {
+    "sqlite": [
+      "pcache1.c:pcache1ResizeHash"
+    ],
+    "note": "doubles apHash and rehashes at load factor 1.0; power-of-two sizing (floor 256) so pgno\u0026(nHash-1) is a mask (pcache1.c:535-567)"
+  },
+  "pcache.go:*pcache.returnPageBuffer": {
+    "sqlite": [
+      "pcache1.c:pcache1FreePage"
+    ],
+    "note": ""
+  },
+  "pcache.go:*pcache.truncate": {
+    "sqlite": [
+      "pcache.c:sqlite3PcacheTruncate",
+      "pcache1.c:pcache1Truncate",
+      "pcache1.c:pcache1TruncateUnsafe"
+    ],
+    "note": ""
+  },
+  "pcache.go:hashSizeFor": {
+    "sqlite": [
+      "pcache1.c:pcache1ResizeHash"
+    ],
+    "note": "smallest power-of-two \u003e= n and \u003e= 256, matching pcache1ResizeHash's floor (pcache1.c:543)"
+  },
+  "pcache.go:newPcache": {
+    "sqlite": [
+      "pcache1.c:pcache1Create",
+      "pcache1.c:pcache1ResizeHash"
+    ],
+    "note": "seeds apHash to a power-of-two size (\u003e= maxPages, floor 256), mirroring pcache1Create which calls pcache1ResizeHash at creation (pcache1.c:789) to seed nHash=256"
+  },
+  "shm.go:*inProcessShm.close": {
+    "sqlite": [
+      "os_unix.c:unixShmUnmap"
+    ],
+    "note": ""
+  },
+  "shm.go:*inProcessShm.lock": {
+    "sqlite": [
+      "os_unix.c:unixShmLock"
+    ],
+    "note": ""
+  },
+  "shm.go:*inProcessShm.region": {
+    "sqlite": [
+      "os_unix.c:unixShmMap"
+    ],
+    "note": ""
+  },
+  "shm.go:*inProcessShm.unlock": {
+    "sqlite": [
+      "os_unix.c:unixShmLock"
+    ],
+    "note": ""
+  },
+  "shm.go:newHeapShm": {
+    "sqlite": [],
+    "note": "heap-backed shm constructor for single-process mode"
+  },
+  "shm_mmap.go:*mmapShm.close": {
+    "sqlite": [
+      "os_unix.c:unixShmUnmap"
+    ],
+    "note": ""
+  },
+  "shm_mmap.go:*mmapShm.fcntlLock": {
+    "sqlite": [
+      "os_unix.c:unixShmSystemLock"
+    ],
+    "note": ""
+  },
+  "shm_mmap.go:*mmapShm.lock": {
+    "sqlite": [
+      "os_unix.c:unixShmLock"
+    ],
+    "note": ""
+  },
+  "shm_mmap.go:*mmapShm.region": {
+    "sqlite": [
+      "os_unix.c:unixShmMap"
+    ],
+    "note": ""
+  },
+  "shm_mmap.go:*mmapShm.unlock": {
+    "sqlite": [
+      "os_unix.c:unixShmLock"
+    ],
+    "note": ""
+  },
+  "shm_mmap.go:newPlatformShm": {
+    "sqlite": [],
+    "note": ""
+  },
+  "shm_mmap.go:shmLockOffset": {
+    "sqlite": [],
+    "note": ""
+  },
+  "shm_other.go:*heapShm.close": {
+    "sqlite": [
+      "os_unix.c:unixShmUnmap"
+    ],
+    "note": ""
+  },
+  "shm_other.go:*heapShm.lock": {
+    "sqlite": [
+      "os_unix.c:unixShmLock"
+    ],
+    "note": ""
+  },
+  "shm_other.go:*heapShm.region": {
+    "sqlite": [
+      "os_unix.c:unixShmMap"
+    ],
+    "note": ""
+  },
+  "shm_other.go:*heapShm.unlock": {
+    "sqlite": [
+      "os_unix.c:unixShmLock"
+    ],
+    "note": ""
+  },
+  "shm_other.go:newPlatformShm": {
+    "sqlite": [],
+    "note": "heap-backed shm fallback for platforms without mmap support"
+  },
+  "wal.go:*WalIndexHdr.computeCksum": {
+    "sqlite": [
+      "wal.c:walChecksumBytes"
+    ],
+    "note": ""
+  },
+  "wal.go:*WalIndexHdr.deserialize": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*WalIndexHdr.serialize": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*wal.adoptSHMState": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*wal.authoritativeMxFrame": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*wal.beginRead": {
+    "sqlite": [
+      "wal.c:sqlite3WalBeginReadTransaction",
+      "wal.c:walBeginReadTransaction"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.beginReadHdr": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*wal.beginWrite": {
+    "sqlite": [
+      "wal.c:sqlite3WalBeginWriteTransaction"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.beginWriteWithSnapshot": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*wal.buildBackfillMap": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*wal.checkpoint": {
+    "sqlite": [
+      "wal.c:sqlite3WalCheckpoint"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.checkpointPassive": {
+    "sqlite": [
+      "wal.c:sqlite3WalCheckpoint"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.checkpointPost": {
+    "sqlite": [
+      "wal.c:walCheckpoint"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.checkpointWithMode": {
+    "sqlite": [
+      "wal.c:sqlite3WalCheckpoint",
+      "wal.c:walCheckpoint",
+      "wal.c:walIteratorInit",
+      "wal.c:walIteratorNext",
+      "wal.c:walMergesort"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.close": {
+    "sqlite": [
+      "wal.c:sqlite3WalClose"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.doResetWAL": {
+    "sqlite": [
+      "wal.c:walRestartHdr",
+      "wal.c:walRestartLog"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.endRead": {
+    "sqlite": [
+      "wal.c:sqlite3WalEndReadTransaction"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.endWrite": {
+    "sqlite": [
+      "wal.c:sqlite3WalEndWriteTransaction"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.ensureHeaderInitialized": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*wal.ensureHeaderInitializedInProcess": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*wal.flushHeader": {
+    "sqlite": [],
+    "note": "lazy WAL header flush on first write (any-store optimization)"
+  },
+  "wal.go:*wal.initHeaderStateLocked": {
+    "sqlite": [],
+    "note": "lazy WAL header init without disk write"
+  },
+  "wal.go:*wal.open": {
+    "sqlite": [
+      "wal.c:sqlite3WalOpen"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.readFrame": {
+    "sqlite": [
+      "wal.c:sqlite3WalReadFrame"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.readFramePgno": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*wal.readFrameRaw": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*wal.recoverLocked": {
+    "sqlite": [
+      "wal.c:walIndexRecover"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.resetIReCksumIfPast": {
+    "sqlite": [
+      "wal.c:sqlite3WalSavepointUndo"
+    ],
+    "note": "ports the iReCksum\u003emxFrame reset fragment of sqlite3WalSavepointUndo (wal.c:3849-3851)"
+  },
+  "wal.go:*wal.rewriteChecksums": {
+    "sqlite": [
+      "wal.c:walRewriteChecksums"
+    ],
+    "note": "in-tx frame-reuse checksum-chain rewrite (wal.c:3966-4009), called from writeFrames"
+  },
+  "wal.go:*wal.syncFromSHMLocked": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*wal.truncateFile": {
+    "sqlite": [
+      "wal.c:walLimitSize"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.tryBeginRead": {
+    "sqlite": [
+      "wal.c:walTryBeginRead"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.tryBeginReadHdr": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*wal.tryBeginReadInProcess": {
+    "sqlite": [
+      "wal.c:walTryBeginRead"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.tryBeginReadInProcessHdr": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*wal.tryBeginReadMultiProcess": {
+    "sqlite": [
+      "wal.c:walTryBeginRead"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.tryBeginReadMultiProcessHdr": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*wal.tryResetWALWithBusy": {
+    "sqlite": [
+      "wal.c:walRestartLog"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.writeFrames": {
+    "sqlite": [
+      "wal.c:sqlite3WalFrames",
+      "wal.c:walFrames",
+      "wal.c:walWriteOneFrame"
+    ],
+    "note": ""
+  },
+  "wal.go:*wal.writeFramesMem": {
+    "sqlite": [],
+    "note": "in-memory WAL fast path (no SQLite counterpart)"
+  },
+  "wal.go:*wal.writeHeader": {
+    "sqlite": [
+      "wal.c:walRestartHdr"
+    ],
+    "note": ""
+  },
+  "wal.go:*walFrame.deserialize": {
+    "sqlite": [
+      "wal.c:walDecodeFrame"
+    ],
+    "note": ""
+  },
+  "wal.go:*walFrame.serialize": {
+    "sqlite": [
+      "wal.c:walEncodeFrame"
+    ],
+    "note": ""
+  },
+  "wal.go:*walHeader.deserialize": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*walHeader.serialize": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*walIndex.close": {
+    "sqlite": [
+      "wal.c:walIndexClose"
+    ],
+    "note": ""
+  },
+  "wal.go:*walIndex.get": {
+    "sqlite": [
+      "wal.c:walFindFrame"
+    ],
+    "note": ""
+  },
+  "wal.go:*walIndex.getInTxRange": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*walIndex.getLatest": {
+    "sqlite": [],
+    "note": "cache-invalidation lookup; no direct SQLite counterpart"
+  },
+  "wal.go:*walIndex.lock": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*walIndex.readHeader": {
+    "sqlite": [
+      "wal.c:walIndexReadHdr",
+      "wal.c:walIndexTryHdr"
+    ],
+    "note": ""
+  },
+  "wal.go:*walIndex.reset": {
+    "sqlite": [
+      "wal.c:walRestartHdr"
+    ],
+    "note": ""
+  },
+  "wal.go:*walIndex.rollbackToFrame": {
+    "sqlite": [
+      "wal.c:walCleanupHash"
+    ],
+    "note": "walCleanupHash analogue — discards pageMap entries above the target frame. The in-tx checksum-chain rewrite is a separate, ported function (wal.rewriteChecksums \u003c- walRewriteChecksums)"
+  },
+  "wal.go:*walIndex.set": {
+    "sqlite": [
+      "wal.c:walIndexAppend"
+    ],
+    "note": ""
+  },
+  "wal.go:*walIndex.setBatch": {
+    "sqlite": [
+      "wal.c:walIndexAppend"
+    ],
+    "note": ""
+  },
+  "wal.go:*walIndex.shmCleanupFromFrame": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*walIndex.shmClearHash": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*walIndex.shmHashGet": {
+    "sqlite": [
+      "wal.c:walFindFrame",
+      "wal.c:walHash",
+      "wal.c:walHashGet",
+      "wal.c:walNextHash"
+    ],
+    "note": ""
+  },
+  "wal.go:*walIndex.shmHashWrite": {
+    "sqlite": [
+      "wal.c:walHash",
+      "wal.c:walIndexAppend",
+      "wal.c:walNextHash"
+    ],
+    "note": ""
+  },
+  "wal.go:*walIndex.shmNBackfill": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*walIndex.shmReadCkptInfo": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*walIndex.shmReadMark": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*walIndex.shmWriteCkptInfo": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*walIndex.shmWriteReadMark": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*walIndex.unlock": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:*walIndex.writeHeader": {
+    "sqlite": [
+      "wal.c:walIndexWriteHdr"
+    ],
+    "note": ""
+  },
+  "wal.go:DefaultBusyTimeout": {
+    "sqlite": [],
+    "note": "port of sqliteDefaultBusyCallback (main.c) — not in canonical sqlite_funcs list"
+  },
+  "wal.go:htFrameSegIdx": {
+    "sqlite": [
+      "wal.c:walFramePage"
+    ],
+    "note": ""
+  },
+  "wal.go:htPgnoOffset": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:htSegmentInfo": {
+    "sqlite": [
+      "wal.c:walHashGet"
+    ],
+    "note": ""
+  },
+  "wal.go:newWal": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:newWalIndex": {
+    "sqlite": [],
+    "note": ""
+  },
+  "wal.go:walBusyLock": {
+    "sqlite": [
+      "btree.c:btreeInvokeBusyHandler",
+      "wal.c:walBusyLock"
+    ],
+    "note": ""
+  },
+  "wal.go:walChecksum": {
+    "sqlite": [
+      "wal.c:walChecksumBytes"
+    ],
+    "note": ""
+  },
+  "wal.go:walChecksumNative": {
+    "sqlite": [
+      "wal.c:walChecksumBytes"
+    ],
+    "note": ""
+  },
+  "wal.go:walFrameChecksum": {
+    "sqlite": [
+      "wal.c:walChecksumBytes"
+    ],
+    "note": ""
+  },
+  "wal.go:walPageChecksum": {
+    "sqlite": [],
+    "note": "CRC32 helper (test-only); not used by WAL protocol"
+  },
+  "wal.go:walShmBarrier": {
+    "sqlite": [
+      "os_unix.c:unixShmBarrier",
+      "wal.c:walShmBarrier"
+    ],
+    "note": ""
+  }
+}

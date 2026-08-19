@@ -1,0 +1,1097 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+
+	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
+	_ "net/http/pprof"
+)
+
+func openConn(path string) (err error) {
+	db, err := anystore.Open(mainCtx.Ctx(), path, nil)
+	if err != nil {
+		return
+	}
+	j, err := newJs()
+	if err != nil {
+		return err
+	}
+	conn = &Conn{db: db, js: j}
+	if err = conn.makeAutocomplete(); err != nil {
+		_ = db.Close()
+		return
+	}
+	return
+}
+
+func init() {
+	go http.ListenAndServe(":6060", nil)
+}
+
+var conn *Conn
+
+type Conn struct {
+	db                anystore.DB
+	js                *js
+	autocomplete      []string
+	autocompleteDb    []string
+	autocompleteColl  []string
+	autocompleteQuery []string
+
+	// knownColls tracks which collections are currently registered in the JS
+	// context, so syncCollections can register/unregister only what changed.
+	knownColls map[string]struct{}
+
+	lastIter    anystore.Iterator
+	lastQuery   Query
+	lastPkField string
+}
+
+func (c *Conn) closeLastIter() {
+	if c.lastIter != nil {
+		_ = c.lastIter.Close()
+		c.lastIter = nil
+	}
+}
+
+// jsIdentRe matches names usable directly as JS identifiers (db.name). Other
+// names must be reached via bracket notation, e.g. db["my-coll"].
+var jsIdentRe = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
+
+// collAccessor returns the JS expression used to reach a collection, falling
+// back to bracket notation for names that aren't valid JS identifiers.
+func collAccessor(name string) string {
+	if jsIdentRe.MatchString(name) {
+		return "db." + name
+	}
+	return "db[" + strconv.Quote(name) + "]"
+}
+
+var collCommands = []string{"insert", "find", "findOne", "findId", "deleteId", "update", "updateId", "upsert", "upsertId", "aggregate", "ensureIndex", "dropIndex", "getIndexes", "rename", "drop", "count", "stats"}
+
+func (c *Conn) makeAutocomplete() (err error) {
+	collNames, err := c.db.GetCollectionNames(mainCtx.Ctx())
+	if err != nil {
+		return
+	}
+	c.syncCollections(collNames)
+	c.autocomplete = append(c.autocomplete[:0], "show collections", "show stats", "db.", "help", "it")
+	c.autocompleteDb = append(c.autocompleteDb[:0], "db.createCollection(", "db.backup(", "db.quickCheck()")
+	c.autocompleteQuery = append(c.autocompleteQuery[:0], "limit(", "offset(", "sort(", "hint(", "project(", "pretty()", "count()", "explain()", "delete()", "update(", "groupLimit(", "accumArrayLimit(", "memoryLimit(")
+	c.autocompleteColl = c.autocompleteColl[:0]
+	for _, collName := range collNames {
+		accessor := collAccessor(collName)
+		c.autocompleteDb = append(c.autocompleteDb, accessor+".")
+		for _, cmd := range collCommands {
+			c.autocompleteColl = append(c.autocompleteColl, accessor+"."+cmd+"(")
+		}
+	}
+	return nil
+}
+
+// syncCollections registers collections newly visible in the JS context and
+// unregisters ones that disappeared, so collections created or dropped by
+// another client are picked up without restarting the CLI.
+func (c *Conn) syncCollections(names []string) {
+	if c.knownColls == nil {
+		c.knownColls = make(map[string]struct{})
+	}
+	nameSet := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		nameSet[name] = struct{}{}
+		if _, ok := c.knownColls[name]; !ok {
+			c.js.RegisterCollection(name)
+			c.knownColls[name] = struct{}{}
+		}
+	}
+	for name := range c.knownColls {
+		if _, ok := nameSet[name]; !ok {
+			c.js.UnregisterCollection(name)
+			delete(c.knownColls, name)
+		}
+	}
+}
+
+func (c *Conn) Exec(cmdLine string) (result string, err error) {
+	var cmd Cmd
+	if strings.HasPrefix(cmdLine, "help") {
+		cmd.Cmd = "help"
+		cmd.Path = strings.TrimSpace(strings.TrimPrefix(cmdLine, "help"))
+		return c.ExecCmd(cmd)
+	}
+	if strings.HasPrefix(cmdLine, "db.") || strings.HasPrefix(cmdLine, "db[") {
+		// Refresh the collection registry first so collections created (or
+		// dropped) by another client are visible to the JS context.
+		_ = c.makeAutocomplete()
+		if cmd, err = c.js.GetQuery(cmdLine); err != nil {
+			return
+		}
+	} else {
+		cmd.Cmd = cmdLine
+	}
+	return c.ExecCmd(cmd)
+}
+
+func (c *Conn) ExecCmd(cmd Cmd) (result string, err error) {
+	if cmd.Cmd != "it" {
+		c.closeLastIter()
+	}
+	switch cmd.Cmd {
+	case "show collections":
+		return c.ShowCollections()
+	case "show stats":
+		return c.ShowStats()
+	case "quickCheck":
+		return c.QuickCheck()
+	case "createCollection":
+		return c.CreateCollection(cmd)
+	case "backup":
+		return c.Backup(cmd)
+	case "rename":
+		return c.Rename(cmd)
+	case "insert":
+		return c.Insert(cmd)
+	case "update":
+		return c.Update(cmd)
+	case "updateId":
+		return c.UpdateId(cmd)
+	case "upsert":
+		return c.Upsert(cmd)
+	case "upsertId":
+		return c.UpsertId(cmd)
+	case "count":
+		return c.Count(cmd)
+	case "stats":
+		return c.Stats(cmd)
+	case "find":
+		return c.Find(cmd)
+	case "aggregate":
+		return c.Aggregate(cmd)
+	case "findOne":
+		return c.FindOne(cmd)
+	case "findId":
+		return c.FindId(cmd)
+	case "deleteId":
+		return c.DeleteId(cmd)
+	case "ensureIndex":
+		return c.EnsureIndex(cmd)
+	case "dropIndex":
+		return c.DropIndex(cmd)
+	case "getIndexes":
+		return c.GetIndexes(cmd)
+	case "drop":
+		return c.Drop(cmd)
+	case "help":
+		return c.Help(cmd)
+	case "it":
+		return c.IterNext()
+	}
+	return "", fmt.Errorf("unexpected command: %s", cmd.Cmd)
+}
+
+var helpData = map[string]string{
+	"show collections": "Description: Show all collections in the database\nExample: show collections",
+	"show stats":       "Description: Show database statistics\nExample: show stats",
+	"quickCheck":       "Description: Perform a quick check of the database integrity\nExample: db.quickCheck()",
+	"createCollection": "Description: Create a new collection\nExample: db.createCollection(\"myCollection\")",
+	"backup":           "Description: Backup the database to a file\nExample: db.backup(\"backup.db\")",
+	"rename":           "Description: Rename the collection\nExample: db.collection.rename(\"newName\")",
+	"insert":           "Description: Insert one or more documents into a collection\nExample: db.collection.insert({id: \"1\", name: \"test\"})",
+	"update":           "Description: Update documents in a collection\nExample: db.collection.update({$set: {name: \"new name\"}})",
+	"updateId":         "Description: Update a document by ID with a modifier\nExample: db.collection.updateId(\"1\", {$set: {name: \"new name\"}})",
+	"upsert":           "Description: Upsert documents into a collection\nExample: db.collection.upsert({id: \"1\", name: \"test\"})",
+	"upsertId":         "Description: Upsert a document by ID with a modifier\nExample: db.collection.upsertId(\"1\", {$set: {name: \"new name\"}})",
+	"count":            "Description: Count documents in a collection\nExample: db.collection.count()",
+	"stats":            "Description: Show storage statistics for a collection (doc count, sizes, compression, per-index size and sketch distribution)\nExample: db.collection.stats()",
+	"find":             "Description: Find documents in a collection. A {$text: {$search: \"...\"}} clause runs a full-text search (requires a fulltext index); results are ranked by BM25 and carry a _score field\nExample: db.collection.find({name: \"test\"}).limit(10)\nExample: db.collection.find({$text: {$search: \"zeppelin disaster\"}}).limit(10)",
+	"aggregate":        "Description: Run a MongoDB-style aggregation pipeline ($match, $sort, $skip, $limit, $count, $project, $addFields/$set, $unwind, $group). Chain .pretty(), .count(), .explain(), .hint(), .groupLimit(n), .accumArrayLimit(n), .memoryLimit(bytes)\nExample: db.collection.aggregate([{$match: {status: \"published\"}}, {$unwind: \"$tags\"}, {$group: {_id: \"$tags\", n: {$count: {}}}}, {$sort: {n: -1}}])",
+	"groupLimit":       "Description: Override the maximum number of unique $group keys (default 50000, negative = unlimited)\nExample: db.collection.aggregate([{$group: {_id: \"$cat\"}}]).groupLimit(200000)",
+	"accumArrayLimit":  "Description: Override the maximum $push/$addToSet array length (default 10000, negative = unlimited)\nExample: db.collection.aggregate([{$group: {_id: \"$cat\", tags: {$push: \"$tag\"}}}]).accumArrayLimit(100000)",
+	"memoryLimit":      "Description: Override the retained-bytes budget of blocking stages ($group, in-pipeline $sort; default 256 MiB, negative = unlimited)\nExample: db.collection.aggregate([{$group: {_id: \"$cat\"}}]).memoryLimit(1073741824)",
+	"findOne":          "Description: Find one document in a collection\nExample: db.collection.findOne({id: \"1\"})",
+	"findId":           "Description: Find documents by ID\nExample: db.collection.findId(\"1\", \"2\")",
+	"deleteId":         "Description: Delete documents by ID\nExample: db.collection.deleteId(\"1\", \"2\")",
+	"ensureIndex":      "Description: Ensure an index exists on a collection. kind: \"fulltext\" creates a full-text (BM25) index over the listed text fields, queried with find({$text: {$search: \"...\"}})\nExample: db.collection.ensureIndex({name: \"indexName\", fields: [\"fieldName\"], unique: true})\nExample: db.collection.ensureIndex({name: \"fts\", kind: \"fulltext\", fields: [\"title\", \"body\"]})",
+	"dropIndex":        "Description: Drop an index from a collection\nExample: db.collection.dropIndex(\"indexName\")",
+	"getIndexes":       "Description: Get all indexes on a collection\nExample: db.collection.getIndexes()",
+	"drop":             "Description: Drop a collection\nExample: db.collection.drop()",
+	"limit":            "Description: Limit the number of documents returned by a query\nExample: db.collection.find({}).limit(10)",
+	"offset":           "Description: Skip a number of documents in a query\nExample: db.collection.find({}).offset(20)",
+	"sort":             "Description: Sort the documents returned by a query\nExample: db.collection.find({}).sort(\"name\", \"-age\")",
+	"hint":             "Description: Force the use of a specific index\nExample: db.collection.find({}).hint({indexName: 1})",
+	"project":          "Description: Specify the fields to return in a query\nExample: db.collection.find({}).project({name: 1, age: 1})",
+	"pretty":           "Description: Pretty-print the JSON output\nExample: db.collection.find({}).pretty()",
+	"explain":          "Description: Show the query execution plan\nExample: db.collection.find({}).explain()",
+	"delete":           "Description: Delete the documents matched by a query\nExample: db.collection.find({status: \"old\"}).delete()",
+}
+
+func (c *Conn) Help(cmd Cmd) (string, error) {
+	if cmd.Path == "" {
+		var sb strings.Builder
+		sb.WriteString("Available commands:\n")
+		sb.WriteString("  show collections\n")
+		sb.WriteString("  show stats\n")
+		sb.WriteString("  db\n")
+		sb.WriteString("    .createCollection(name)\n")
+		sb.WriteString("    .backup(path)\n")
+		sb.WriteString("    .quickCheck()\n")
+		sb.WriteString("    .{collection}\n")
+		sb.WriteString("      .insert(doc, ...)\n")
+		sb.WriteString("      .upsert(doc, ...)\n")
+		sb.WriteString("      .upsertId(id, mod)\n")
+		sb.WriteString("      .find(query)\n")
+		sb.WriteString("        .limit(n)\n")
+		sb.WriteString("        .offset(n)\n")
+		sb.WriteString("        .sort(field, ...)\n")
+		sb.WriteString("        .project(spec)\n")
+		sb.WriteString("        .hint(spec)\n")
+		sb.WriteString("        .count()\n")
+		sb.WriteString("        .explain()\n")
+		sb.WriteString("        .pretty()\n")
+		sb.WriteString("        .update(doc)\n")
+		sb.WriteString("        .delete()\n")
+		sb.WriteString("      .aggregate(pipeline)\n")
+		sb.WriteString("        .pretty()\n")
+		sb.WriteString("        .count()\n")
+		sb.WriteString("        .explain()\n")
+		sb.WriteString("        .hint(spec)\n")
+		sb.WriteString("        .groupLimit(n)\n")
+		sb.WriteString("        .accumArrayLimit(n)\n")
+		sb.WriteString("        .memoryLimit(bytes)\n")
+		sb.WriteString("      .findOne(query)\n")
+		sb.WriteString("      .findId(id, ...)\n")
+		sb.WriteString("      .update(updateDoc)\n")
+		sb.WriteString("      .updateId(id, mod)\n")
+		sb.WriteString("      .deleteId(id, ...)\n")
+		sb.WriteString("      .count()\n")
+		sb.WriteString("      .stats()\n")
+		sb.WriteString("      .ensureIndex(indexDef)\n")
+		sb.WriteString("      .dropIndex(name)\n")
+		sb.WriteString("      .getIndexes()\n")
+		sb.WriteString("      .rename(newName)\n")
+		sb.WriteString("      .drop()\n")
+		sb.WriteString("\nUse \"help {command}\" for more information on a specific command.")
+		return sb.String(), nil
+	}
+
+	if help, ok := helpData[cmd.Path]; ok {
+		return help, nil
+	}
+
+	// Try to match without "db.collection." or "db." prefix if the user typed that
+	cleanCmd := cmd.Path
+	if strings.HasPrefix(cleanCmd, "db.") {
+		parts := strings.Split(cleanCmd, ".")
+		if len(parts) > 1 {
+			cleanCmd = parts[len(parts)-1]
+		}
+	}
+	if help, ok := helpData[cleanCmd]; ok {
+		return help, nil
+	}
+
+	return "", fmt.Errorf("no help available for command: %s", cmd.Path)
+}
+
+func (c *Conn) Complete(line string) (result []string) {
+	lowerLine := strings.ToLower(line)
+	if strings.HasPrefix(lowerLine, "help ") {
+		prefix := line[:5]
+		toComplete := strings.ToLower(line[5:])
+		for cmd := range helpData {
+			if strings.HasPrefix(strings.ToLower(cmd), toComplete) {
+				result = append(result, prefix+cmd)
+			}
+		}
+		return
+	}
+	// Bracket-notation collection access, e.g. db["my-coll"].find(. Names are
+	// case-sensitive quoted strings, so match against the original line.
+	if strings.HasPrefix(line, "db[") {
+		for _, cmd := range c.autocompleteDb {
+			if strings.HasPrefix(cmd, line) {
+				result = append(result, cmd)
+			}
+		}
+		for _, cmd := range c.autocompleteColl {
+			if strings.HasPrefix(cmd, line) {
+				result = append(result, cmd)
+			}
+		}
+		return
+	}
+
+	if !strings.HasPrefix(lowerLine, "db.") {
+		for _, cmd := range c.autocomplete {
+			if strings.HasPrefix(cmd, lowerLine) {
+				result = append(result, cmd)
+			}
+		}
+		return
+	}
+
+	dotCount := strings.Count(lowerLine, ".")
+	if dotCount == 1 {
+		for _, cmd := range c.autocompleteDb {
+			if strings.HasPrefix(strings.ToLower(cmd), lowerLine) {
+				result = append(result, cmd)
+			}
+		}
+		return
+	}
+
+	// find the last dot or parenthesis
+	lastDot := strings.LastIndex(line, ".")
+	lastParen := strings.LastIndex(line, ")")
+
+	if lastDot > lastParen {
+		// we are after a dot, suggest methods
+		prefix := line[:lastDot+1]
+		toComplete := strings.ToLower(line[lastDot+1:])
+
+		// check if it's db.collection. or something else
+		if strings.Count(line, ".") == 2 && !strings.Contains(line, "(") {
+			for _, cmd := range c.autocompleteColl {
+				if strings.HasPrefix(strings.ToLower(cmd), lowerLine) {
+					result = append(result, cmd)
+				}
+			}
+		} else {
+			// suggest query methods
+			for _, cmd := range c.autocompleteQuery {
+				if strings.HasPrefix(cmd, toComplete) {
+					result = append(result, prefix+cmd)
+				}
+			}
+		}
+	} else {
+		// we might be in the middle of a command or at the start
+		for _, cmd := range c.autocompleteColl {
+			if strings.HasPrefix(strings.ToLower(cmd), lowerLine) {
+				result = append(result, cmd)
+			}
+		}
+	}
+
+	return
+}
+
+func (c *Conn) ShowCollections() (result string, err error) {
+	names, err := c.db.GetCollectionNames(mainCtx.Ctx())
+	if err != nil {
+		return "", err
+	}
+	return strings.Join(names, "\n"), nil
+}
+
+func (c *Conn) ShowStats() (result string, err error) {
+	stats, err := c.db.Stats(mainCtx.Ctx())
+	if err != nil {
+		return "", err
+	}
+	var buf = &strings.Builder{}
+	buf.WriteString(fmt.Sprintf("Collections:\t%d\n", stats.CollectionsCount))
+	buf.WriteString(fmt.Sprintf("Indexes:\t%d\n", stats.IndexesCount))
+	buf.WriteString(fmt.Sprintf("Data size:\t%d KiB\n", stats.DataSizeBytes/1024))
+	buf.WriteString(fmt.Sprintf("Total size:\t%d KiB\n", stats.TotalSizeBytes/1024))
+	if stats.DirtyOnOpen {
+		buf.WriteString(fmt.Sprintf("The database was not closed properly, quick check took %v\n", stats.DirtyQuickCheckDuration))
+	}
+	return buf.String(), nil
+}
+
+func (c *Conn) QuickCheck() (result string, err error) {
+	err = c.db.QuickCheck(mainCtx.Ctx())
+	if err != nil {
+		return "", err
+	}
+	return "ok", nil
+}
+
+func (c *Conn) CreateCollection(cmd Cmd) (result string, err error) {
+	_, err = c.db.CreateCollection(mainCtx.Ctx(), cmd.Collection)
+	if err == nil {
+		_ = c.makeAutocomplete()
+	}
+	return
+}
+
+func (c *Conn) Backup(cmd Cmd) (result string, err error) {
+	if cmd.Path == "" {
+		return "", fmt.Errorf("backup path is required")
+	}
+	err = c.db.Backup(mainCtx.Ctx(), cmd.Path)
+	if err != nil {
+		return "", err
+	}
+	return "ok", nil
+}
+
+func (c *Conn) Rename(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	if err = coll.Rename(mainCtx.Ctx(), cmd.Path); err != nil {
+		return
+	}
+	_ = c.makeAutocomplete()
+	return "ok", nil
+}
+
+func (c *Conn) Insert(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	var docs = make([]*anyenc.Value, len(cmd.Documents))
+	for i, d := range cmd.Documents {
+		if docs[i], err = anyenc.ParseJson(string(d)); err != nil {
+			return
+		}
+	}
+	if err = coll.Insert(mainCtx.Ctx(), docs...); err != nil {
+		return
+	}
+	result = fmt.Sprintf("inserted %d documents", len(cmd.Documents))
+	return
+}
+
+func (c *Conn) Upsert(cmd Cmd) (result string, err error) {
+	if err = c.writeOne(cmd, anystore.Collection.UpsertOne); err != nil {
+		return
+	}
+	return "upserted", nil
+}
+
+func (c *Conn) Update(cmd Cmd) (result string, err error) {
+	err = c.writeOne(cmd, anystore.Collection.UpdateOne)
+	return
+}
+
+// writeOne parses cmd's single document and runs a one-document verb
+// (UpdateOne/UpsertOne, passed as a method expression).
+func (c *Conn) writeOne(cmd Cmd, do func(anystore.Collection, context.Context, *anyenc.Value) error) (err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	if len(cmd.Documents) == 0 {
+		return fmt.Errorf(`expected document`)
+	}
+	var doc *anyenc.Value
+	if doc, err = anyenc.ParseJson(string(cmd.Documents[0])); err != nil {
+		return
+	}
+	return do(coll, mainCtx.Ctx(), doc)
+}
+
+func (c *Conn) UpdateId(cmd Cmd) (result string, err error) {
+	return c.modifyId(cmd, anystore.Collection.UpdateId)
+}
+
+func (c *Conn) UpsertId(cmd Cmd) (result string, err error) {
+	return c.modifyId(cmd, anystore.Collection.UpsertId)
+}
+
+// modifyId parses cmd's (id, modifier) pair and runs an id-targeted verb
+// (UpdateId/UpsertId, passed as a method expression).
+func (c *Conn) modifyId(cmd Cmd, do func(anystore.Collection, context.Context, any, query.Modifier) (anystore.ModifyResult, error)) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	if len(cmd.Documents) < 2 {
+		return "", fmt.Errorf(`expected id and modifier`)
+	}
+	id, err := anyenc.ParseJson(string(cmd.Documents[0]))
+	if err != nil {
+		return
+	}
+	modVal, err := anyenc.ParseJson(string(cmd.Documents[1]))
+	if err != nil {
+		return
+	}
+	mod, err := query.ParseModifier(modVal)
+	if err != nil {
+		return
+	}
+	res, err := do(coll, mainCtx.Ctx(), id, mod)
+	if err != nil {
+		return
+	}
+	return fmt.Sprintf("matched: %v, modified: %v", res.Matched, res.Modified), nil
+}
+
+func (c *Conn) Count(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	count, err := coll.Count(mainCtx.Ctx())
+	if err != nil {
+		return
+	}
+	result = fmt.Sprintf("%d", count)
+	return
+}
+
+func (c *Conn) Stats(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	st, err := coll.Stats(mainCtx.Ctx())
+	if err != nil {
+		return
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Collection:\t%s\n", st.Name)
+	fmt.Fprintf(&b, "Documents:\t%d\n", st.DocCount)
+	fmt.Fprintf(&b, "Stored docs:\t%s\n", formatKiB(st.StoredDocsBytes))
+	fmt.Fprintf(&b, "Uncompressed:\t%s\n", formatKiB(st.UncompressedDocsBytes))
+	if st.CompressionEnabled {
+		fmt.Fprintf(&b, "Compression:\tenabled (%.2fx)\n", st.CompressionRatio)
+	} else {
+		b.WriteString("Compression:\tdisabled\n")
+	}
+	fmt.Fprintf(&b, "Docs size:\t%s\n", formatKiB(st.DocsSizeBytes))
+	fmt.Fprintf(&b, "Indexes size:\t%s\n", formatKiB(st.IndexesSizeBytes))
+	if len(st.VectorIndexes) > 0 {
+		fmt.Fprintf(&b, "Vector indexes size:\t%s\n", formatKiB(st.VectorIndexesSizeBytes))
+	}
+	if len(st.FtsIndexes) > 0 {
+		fmt.Fprintf(&b, "Full-text indexes size:\t%s\n", formatKiB(st.FtsIndexesSizeBytes))
+	}
+	fmt.Fprintf(&b, "Total size:\t%s\n", formatKiB(st.TotalSizeBytes))
+
+	if len(st.Indexes) > 0 {
+		b.WriteString("\nIndexes:\n")
+		for _, idx := range st.Indexes {
+			name := idx.Name
+			if name == "" {
+				name = strings.Join(idx.Fields, ",")
+			}
+			flags := ""
+			if idx.Unique {
+				flags += " unique"
+			}
+			if idx.Sparse {
+				flags += " sparse"
+			}
+			fmt.Fprintf(&b, "  %s [%s]%s\n", name, strings.Join(idx.Fields, ","), flags)
+			fmt.Fprintf(&b, "    entries=%d  size=%s\n", idx.EntryCount, formatKiB(idx.SizeBytes))
+			fill := 0.0
+			if idx.SketchSize > 0 {
+				fill = idx.SketchDistribution.Fill * 100
+			}
+			fmt.Fprintf(&b, "    sketch: docs=%d  buckets=%d/%d (%.0f%% fill)\n",
+				idx.SketchDocCount, idx.SketchDistribution.NonEmptyBuckets, idx.SketchSize, fill)
+			d := idx.SketchDistribution
+			fmt.Fprintf(&b, "    distribution: max=%d  mean=%.1f  p50=%d p90=%d p99=%d  skew=%.1fx\n",
+				d.MaxBucket, d.MeanNonEmpty, d.P50, d.P90, d.P99, d.Skew)
+		}
+	}
+
+	if len(st.VectorIndexes) > 0 {
+		b.WriteString("\nVector indexes:\n")
+		for _, vx := range st.VectorIndexes {
+			fmt.Fprintf(&b, "  %s [%s] dim=%d metric=%s mode=%s quant=%s\n",
+				vx.Name, vx.Field, vx.Dim, vx.Metric, vx.Mode, vx.Quantization)
+			fmt.Fprintf(&b, "    nodes=%d  live=%d  deleted=%d  M=%d  efSearch=%d\n",
+				vx.NodeCount, vx.LiveCount, vx.DeletedCount, vx.M, vx.EfSearch)
+			fmt.Fprintf(&b, "    size=%s (vectors=%s graph=%s mapping=%s meta=%s)\n",
+				formatKiB(vx.SizeBytes), formatKiB(vx.VectorBytes), formatKiB(vx.GraphBytes),
+				formatKiB(vx.MappingBytes), formatKiB(vx.MetaBytes))
+		}
+	}
+
+	if len(st.FtsIndexes) > 0 {
+		b.WriteString("\nFull-text indexes:\n")
+		for _, fx := range st.FtsIndexes {
+			fmt.Fprintf(&b, "  %s [%s]\n", fx.Name, strings.Join(fx.Fields, ","))
+			fmt.Fprintf(&b, "    docs=%d  terms=%d  tokens=%d  avgdl=%.1f\n",
+				fx.DocCount, fx.VocabSize, fx.TotalTokens, fx.AvgDocLen)
+			fmt.Fprintf(&b, "    size=%s (postings=%s vocab=%s docmap=%s docinfo=%s meta=%s)\n",
+				formatKiB(fx.SizeBytes), formatKiB(fx.PostingsBytes), formatKiB(fx.VocabBytes),
+				formatKiB(fx.DocmapBytes), formatKiB(fx.DocinfoBytes), formatKiB(fx.MetaBytes))
+		}
+	}
+	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+// formatKiB renders a byte count in KiB, matching the "show stats" command.
+func formatKiB(bytes int) string {
+	return fmt.Sprintf("%d KiB", bytes/1024)
+}
+
+func (c *Conn) EnsureIndex(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	if len(cmd.Index.Fields) == 0 {
+		return "", fmt.Errorf("no index fields specified")
+	}
+	indexInfo := anystore.IndexInfo{
+		Name:   cmd.Index.Name,
+		Fields: cmd.Index.Fields,
+		Unique: cmd.Index.Unique,
+		Sparse: cmd.Index.Sparse,
+	}
+	switch cmd.Index.Kind {
+	case "", "range":
+	case "fulltext":
+		indexInfo.Kind = anystore.IndexKindFulltext
+	default:
+		return "", fmt.Errorf("unsupported index kind %q (supported: \"range\", \"fulltext\")", cmd.Index.Kind)
+	}
+	err = coll.EnsureIndex(mainCtx.Ctx(), indexInfo)
+	if err != nil {
+		return
+	}
+	return
+}
+
+func (c *Conn) DropIndex(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	if len(cmd.Index.Name) == 0 {
+		return "", fmt.Errorf("no index name specified")
+	}
+	err = coll.DropIndex(mainCtx.Ctx(), cmd.Index.Name)
+	if err != nil {
+		return
+	}
+	return
+}
+
+// indexDisplay is the CLI-facing shape of an IndexInfo: kind as a readable
+// string instead of the library's numeric enum.
+type indexDisplay struct {
+	Name   string   `json:"name"`
+	Fields []string `json:"fields"`
+	Unique bool     `json:"unique"`
+	Sparse bool     `json:"sparse"`
+	Kind   string   `json:"kind,omitempty"`
+}
+
+func indexKindString(kind anystore.IndexKind) string {
+	switch kind {
+	case anystore.IndexKindFulltext:
+		return "fulltext"
+	case anystore.IndexKindVector:
+		return "vector"
+	default:
+		return "" // range is the default; omitted
+	}
+}
+
+func (c *Conn) GetIndexes(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	indexes := coll.GetIndexes()
+	infos := make([]indexDisplay, len(indexes))
+	for i, idx := range indexes {
+		info := idx.Info()
+		infos[i] = indexDisplay{
+			Name:   info.Name,
+			Fields: info.Fields,
+			Unique: info.Unique,
+			Sparse: info.Sparse,
+			Kind:   indexKindString(info.Kind),
+		}
+	}
+	var b []byte
+	if b, err = json.MarshalIndent(infos, "", "  "); err != nil {
+		return
+	}
+	return string(b), nil
+}
+
+func (c *Conn) FindId(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	if len(cmd.Documents) != 1 {
+		return "", fmt.Errorf("you can specify only one id; got %d", len(cmd.Documents))
+	}
+	id, err := anyenc.ParseJson(string(cmd.Documents[0]))
+	if err != nil {
+		return
+	}
+	doc, err := coll.FindId(mainCtx.Ctx(), id)
+	if err != nil {
+		return
+	}
+
+	val := doc.Value()
+	if len(cmd.Query.Project) > 0 {
+		if val, err = applyProjection(val, cmd.Query.Project, coll.PrimaryKey()); err != nil {
+			return
+		}
+	}
+
+	if cmd.Query.Pretty {
+		result, err = prettyJson(val.String())
+	} else {
+		result = val.String()
+	}
+	return
+}
+
+func (c *Conn) DeleteId(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	if len(cmd.Documents) != 1 {
+		return "", fmt.Errorf("you can specify only one id; got %d", len(cmd.Documents))
+	}
+	id, err := anyenc.ParseJson(string(cmd.Documents[0]))
+	if err != nil {
+		return
+	}
+	err = coll.DeleteId(mainCtx.Ctx(), id)
+	if err != nil {
+		return
+	}
+	return
+}
+
+func (c *Conn) Drop(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	if err = coll.Drop(mainCtx.Ctx()); err != nil {
+		return "", err
+	}
+	_ = c.makeAutocomplete()
+	return
+}
+
+func (c *Conn) FindOne(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	var filter any
+	if len(cmd.Query.Find) > 0 {
+		if filter, err = anyenc.ParseJson(string(cmd.Query.Find)); err != nil {
+			return
+		}
+	}
+	q := coll.Find(filter)
+	q.Limit(1)
+
+	iter, err := q.Iter(mainCtx.Ctx())
+	if err != nil {
+		return "", err
+	}
+	defer iter.Close()
+	if iter.Next() {
+		var doc anystore.Doc
+		if doc, err = iter.Doc(); err != nil {
+			return "", err
+		}
+		err = c.printDoc(doc, cmd.Query, coll.PrimaryKey())
+	} else {
+		err = iter.Err()
+	}
+	return
+}
+
+func (c *Conn) printDoc(doc anystore.Doc, query Query, pkField string) error {
+	val := doc.Value()
+	var err error
+	if len(query.Project) > 0 {
+		if val, err = applyProjection(val, query.Project, pkField); err != nil {
+			return err
+		}
+	}
+	if query.Pretty {
+		res, err := prettyJson(val.String())
+		if err != nil {
+			return err
+		}
+		fmt.Println(res)
+	} else {
+		fmt.Println(val.String())
+	}
+	return nil
+}
+
+func (c *Conn) printIter(iter anystore.Iterator, query Query, first bool, pkField string) (string, error) {
+	batchSize := 30
+	count := 0
+
+	if !first {
+		doc, err := iter.Doc()
+		if err != nil {
+			return "", err
+		}
+		if err := c.printDoc(doc, query, pkField); err != nil {
+			return "", err
+		}
+		count++
+	}
+
+	for (query.Limit == 0 || count < query.Limit) && count < batchSize && iter.Next() {
+		doc, err := iter.Doc()
+		if err != nil {
+			return "", err
+		}
+		if err := c.printDoc(doc, query, pkField); err != nil {
+			return "", err
+		}
+		count++
+	}
+
+	if count == batchSize && (query.Limit == 0 || (query.Limit > 0 && count < query.Limit)) && iter.Next() {
+		fmt.Println("Type \"it\" for more")
+		c.lastIter = iter
+		c.lastQuery = query
+		c.lastPkField = pkField
+	} else {
+		if err := iter.Err(); err != nil {
+			return "", err
+		}
+		_ = iter.Close()
+	}
+	return "", nil
+}
+
+func (c *Conn) IterNext() (result string, err error) {
+	if c.lastIter == nil {
+		return "", fmt.Errorf("no active iterator")
+	}
+	iter := c.lastIter
+	query := c.lastQuery
+	pkField := c.lastPkField
+	c.lastIter = nil
+	return c.printIter(iter, query, false, pkField)
+}
+
+func (c *Conn) Find(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	var filter any
+	if len(cmd.Query.Find) > 0 {
+		if filter, err = anyenc.ParseJson(string(cmd.Query.Find)); err != nil {
+			return
+		}
+	}
+	q := coll.Find(filter)
+
+	if cmd.Query.Sort != nil {
+		q.Sort(toAnySlice(cmd.Query.Sort)...)
+	}
+	if cmd.Query.Limit > 0 {
+		q.Limit(uint(cmd.Query.Limit))
+	}
+	if cmd.Query.Offset > 0 {
+		q.Offset(uint(cmd.Query.Offset))
+	}
+	if cmd.Query.Hint != nil {
+		hints := []anystore.IndexHint{}
+		for idxName, boost := range cmd.Query.Hint {
+			hints = append(hints, anystore.IndexHint{
+				IndexName: idxName,
+				Boost:     boost,
+			})
+		}
+		q.IndexHint(hints...)
+	}
+
+	if cmd.Query.Count {
+		count, cErr := q.Count(mainCtx.Ctx())
+		if cErr != nil {
+			return "", cErr
+		}
+		result = fmt.Sprintf("%d", count)
+		return
+	}
+
+	if cmd.Query.Explain {
+		explain, cErr := q.Explain(mainCtx.Ctx())
+		if cErr != nil {
+			return "", cErr
+		}
+		result = explain.Plan
+		return
+	}
+
+	if cmd.Query.Update != nil {
+		res, cErr := q.Update(mainCtx.Ctx(), cmd.Query.Update)
+		if cErr != nil {
+			return "", cErr
+		}
+		fmt.Printf("Matched:\t%d\nModified:\t%d\n", res.Matched, res.Modified)
+		return
+	}
+
+	if cmd.Query.Delete {
+		res, cErr := q.Delete(mainCtx.Ctx())
+		if cErr != nil {
+			return "", cErr
+		}
+		fmt.Printf("Deleted:\t%d\n", res.Modified)
+		return
+	}
+
+	iter, err := q.Iter(mainCtx.Ctx())
+	if err != nil {
+		return "", err
+	}
+	return c.printIter(iter, cmd.Query, true, coll.PrimaryKey())
+}
+
+func (c *Conn) Aggregate(cmd Cmd) (result string, err error) {
+	coll, err := c.db.OpenCollection(mainCtx.Ctx(), cmd.Collection)
+	if err != nil {
+		return
+	}
+	switch {
+	case cmd.Query.Update != nil:
+		return "", fmt.Errorf("update() is not supported on aggregate()")
+	case cmd.Query.Delete:
+		return "", fmt.Errorf("delete() is not supported on aggregate(); use find().delete()")
+	case cmd.Query.Sort != nil:
+		return "", fmt.Errorf("sort() is not supported on aggregate(); use a {$sort: ...} stage")
+	case cmd.Query.Limit > 0 || cmd.Query.Offset > 0:
+		return "", fmt.Errorf("limit()/offset() are not supported on aggregate(); use {$limit: n}/{$skip: n} stages")
+	case len(cmd.Query.Project) > 0:
+		return "", fmt.Errorf("project() is not supported on aggregate(); use a {$project: ...} stage")
+	}
+
+	// Pass the pipeline as a JSON string: a json.RawMessage ([]byte) would be
+	// taken for a marshaled anyenc value.
+	var pipeline any
+	if len(cmd.Query.Pipeline) > 0 {
+		pipeline = string(cmd.Query.Pipeline)
+	}
+	q := coll.Aggregate(pipeline)
+	if cmd.Query.GroupLimit != 0 {
+		q.GroupLimit(cmd.Query.GroupLimit)
+	}
+	if cmd.Query.AccumArrayLimit != 0 {
+		q.AccumArrayLimit(cmd.Query.AccumArrayLimit)
+	}
+	if cmd.Query.MemoryLimit != 0 {
+		q.MemoryLimit(cmd.Query.MemoryLimit)
+	}
+	if cmd.Query.Hint != nil {
+		hints := []anystore.IndexHint{}
+		for idxName, boost := range cmd.Query.Hint {
+			hints = append(hints, anystore.IndexHint{
+				IndexName: idxName,
+				Boost:     boost,
+			})
+		}
+		q.IndexHint(hints...)
+	}
+
+	if cmd.Query.Count {
+		count, cErr := q.Count(mainCtx.Ctx())
+		if cErr != nil {
+			return "", cErr
+		}
+		result = fmt.Sprintf("%d", count)
+		return
+	}
+
+	if cmd.Query.Explain {
+		explain, cErr := q.Explain(mainCtx.Ctx())
+		if cErr != nil {
+			return "", cErr
+		}
+		result = explain.Plan
+		return
+	}
+
+	iter, err := q.Iter(mainCtx.Ctx())
+	if err != nil {
+		return "", err
+	}
+	return c.printIter(iter, cmd.Query, true, coll.PrimaryKey())
+}
+
+func prettyJson(s string) (string, error) {
+	var anyVal any
+	if err := json.Unmarshal([]byte(s), &anyVal); err != nil {
+		return "", err
+	}
+	res, err := json.MarshalIndent(anyVal, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(res), nil
+}
+
+func toAnySlice[T any](slice []T) []any {
+	res := make([]any, len(slice))
+	for i, v := range slice {
+		res[i] = v
+	}
+	return res
+}
+
+func applyProjection(val *anyenc.Value, projection json.RawMessage, pkField string) (*anyenc.Value, error) {
+	var projMap map[string]int
+	if err := json.Unmarshal(projection, &projMap); err != nil {
+		return nil, err
+	}
+	if len(projMap) == 0 {
+		return val, nil
+	}
+
+	obj, err := val.Object()
+	if err != nil {
+		return val, nil // Not an object, can't project
+	}
+
+	// Check if it's inclusion or exclusion projection
+	inclusion := false
+	for _, v := range projMap {
+		if v > 0 {
+			inclusion = true
+			break
+		}
+	}
+
+	arena := &anyenc.Arena{}
+	newVal := arena.NewObject()
+	if inclusion {
+		obj.Visit(func(k []byte, v *anyenc.Value) {
+			key := string(k)
+			if projMap[key] > 0 || key == pkField {
+				newVal.Set(key, v)
+			}
+		})
+	} else {
+		obj.Visit(func(k []byte, v *anyenc.Value) {
+			key := string(k)
+			if projMap[key] == 0 {
+				newVal.Set(key, v)
+			}
+		})
+	}
+	return newVal, nil
+}

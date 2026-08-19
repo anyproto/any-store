@@ -1,0 +1,235 @@
+package btree
+
+import (
+	"fmt"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestShmHashTableBasic(t *testing.T) {
+	wi, err := newWalIndex("", true) // in-process shm
+	require.NoError(t, err)
+	defer wi.close(false)
+
+	// Write some page→frame mappings
+	mustShmHashWrite(t, wi, 10, 1)
+	mustShmHashWrite(t, wi, 20, 2)
+	mustShmHashWrite(t, wi, 30, 3)
+
+	// Look them up via shm
+	assert.Equal(t, uint32(1), mustShmHashGet(t, wi, 10, 10, 1))
+	assert.Equal(t, uint32(2), mustShmHashGet(t, wi, 20, 10, 1))
+	assert.Equal(t, uint32(3), mustShmHashGet(t, wi, 30, 10, 1))
+
+	// Non-existent page
+	assert.Equal(t, uint32(0), mustShmHashGet(t, wi, 99, 10, 1))
+
+	// maxFrame limit: frame 3 is invisible when maxFrame=2
+	assert.Equal(t, uint32(0), mustShmHashGet(t, wi, 30, 2, 1))
+	assert.Equal(t, uint32(2), mustShmHashGet(t, wi, 20, 2, 1))
+}
+
+func TestShmHashTableOverwrite(t *testing.T) {
+	wi, err := newWalIndex("", true)
+	require.NoError(t, err)
+	defer wi.close(false)
+
+	// Page 10 written at frame 1, then overwritten at frame 5
+	mustShmHashWrite(t, wi, 10, 1)
+	mustShmHashWrite(t, wi, 10, 5)
+
+	// Should find the latest frame
+	assert.Equal(t, uint32(5), mustShmHashGet(t, wi, 10, 10, 1))
+
+	// With maxFrame=3, should find frame 1
+	assert.Equal(t, uint32(1), mustShmHashGet(t, wi, 10, 3, 1))
+}
+
+func TestShmHashTableCollision(t *testing.T) {
+	wi, err := newWalIndex("", true)
+	require.NoError(t, err)
+	defer wi.close(false)
+
+	// Insert many pages to force hash collisions
+	for i := uint32(1); i <= 1000; i++ {
+		mustShmHashWrite(t, wi, i*100, i)
+	}
+
+	// All should be findable
+	for i := uint32(1); i <= 1000; i++ {
+		got := mustShmHashGet(t, wi, i*100, 1000, 1)
+		assert.Equal(t, i, got, "page %d", i*100)
+	}
+}
+
+func TestShmHashTableMultiSegment(t *testing.T) {
+	wi, err := newWalIndex("", true)
+	require.NoError(t, err)
+	defer wi.close(false)
+
+	// Write enough frames to span multiple segments.
+	// Segment 0 holds frames 1..4062, segment 1 holds 4063..8158.
+	totalFrames := uint32(5000)
+	for f := uint32(1); f <= totalFrames; f++ {
+		pgno := f + 100 // arbitrary page numbers
+		mustShmHashWrite(t, wi, pgno, f)
+	}
+
+	// Verify all lookups work
+	for f := uint32(1); f <= totalFrames; f++ {
+		pgno := f + 100
+		got := mustShmHashGet(t, wi, pgno, totalFrames, 1)
+		assert.Equal(t, f, got, "frame for page %d", pgno)
+	}
+
+	// Verify maxFrame boundary at segment edge
+	assert.Equal(t, uint32(4062), mustShmHashGet(t, wi, 4062+100, 4062, 1))
+	assert.Equal(t, uint32(4063), mustShmHashGet(t, wi, 4063+100, totalFrames, 1))
+	assert.Equal(t, uint32(0), mustShmHashGet(t, wi, 4063+100, 4062, 1)) // beyond maxFrame
+}
+
+func TestShmHashTableClear(t *testing.T) {
+	wi, err := newWalIndex("", true)
+	require.NoError(t, err)
+	defer wi.close(false)
+
+	// Populate
+	for f := uint32(1); f <= 100; f++ {
+		mustShmHashWrite(t, wi, f, f)
+	}
+	assert.Equal(t, uint32(50), mustShmHashGet(t, wi, 50, 100, 1))
+
+	// Clear
+	wi.shmClearHash()
+
+	// Should not find anything
+	assert.Equal(t, uint32(0), mustShmHashGet(t, wi, 50, 100, 1))
+}
+
+func TestShmCkptInfo(t *testing.T) {
+	wi, err := newWalIndex("", true)
+	require.NoError(t, err)
+	defer wi.close(false)
+
+	// Set some values
+	wi.nBackfill.Store(42)
+	wi.aReadMark[0].Store(0)
+	wi.aReadMark[1].Store(100)
+	wi.aReadMark[2].Store(200)
+	wi.aReadMark[3].Store(readMarkNotUsed)
+	wi.aReadMark[4].Store(readMarkNotUsed)
+	shmWriteCkptInfoForTest(wi)
+
+	// Reset in-memory values
+	wi.nBackfill.Store(0)
+	for i := range wi.aReadMark {
+		wi.aReadMark[i].Store(0)
+	}
+
+	// Read back from shm
+	wi.shmReadCkptInfo()
+	assert.Equal(t, uint32(42), wi.nBackfill.Load())
+	assert.Equal(t, uint32(100), wi.aReadMark[1].Load())
+	assert.Equal(t, uint32(200), wi.aReadMark[2].Load())
+	assert.Equal(t, readMarkNotUsed, wi.aReadMark[3].Load())
+}
+
+func TestShmHashIntegrationWithSetBatch(t *testing.T) {
+	// Verify that set/setBatch write to shm hash tables
+	db, ns := tempDBWithNS(t, "data")
+
+	// Insert data which calls setBatch internally
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns2, _ := db.getNamespaceLocked("data")
+	for i := range 50 {
+		k := fmt.Appendf(nil, "key-%04d", i)
+		v := fmt.Appendf(nil, "val-%04d", i)
+		require.NoError(t, tx.Put(ns2, k, v))
+	}
+	require.NoError(t, tx.Commit())
+
+	// Verify we can look up pages via the shm hash tables
+	wi := db.pager.wal.index
+	maxFrame := wi.maxFrame.Load()
+
+	// The shm hash table returns the latest frame for a page (within maxFrame),
+	// which should match the last entry in the Go map's frame list.
+	wi.mu.RLock()
+	for pgno, frames := range wi.pageMap {
+		if len(frames) == 0 {
+			continue
+		}
+		latestFrame := frames[len(frames)-1]
+		shmFrame := mustShmHashGet(t, wi, pgno, maxFrame, 1)
+		assert.Equal(t, latestFrame, shmFrame, "page %d: map latest=%d shm=%d", pgno, latestFrame, shmFrame)
+	}
+	wi.mu.RUnlock()
+	_ = ns
+}
+
+func TestShmHashAfterCheckpoint(t *testing.T) {
+	db, ns := tempDBWithNS(t, "data")
+
+	// Insert data
+	tx, err := db.BeginWrite()
+	require.NoError(t, err)
+	ns2, _ := db.getNamespaceLocked("data")
+	for i := range 20 {
+		k := fmt.Appendf(nil, "key-%04d", i)
+		v := fmt.Appendf(nil, "val-%04d", i)
+		require.NoError(t, tx.Put(ns2, k, v))
+	}
+	require.NoError(t, tx.Commit())
+
+	// Checkpoint should clear hash tables on WAL reset
+	require.NoError(t, db.Checkpoint(CheckpointFull))
+
+	// After checkpoint + WAL reset, hash tables should be cleared
+	wi := db.pager.wal.index
+	maxFrame := wi.maxFrame.Load()
+
+	// If WAL was reset, maxFrame should be 0 and lookups return 0
+	if maxFrame == 0 {
+		assert.Equal(t, uint32(0), mustShmHashGet(t, wi, 1, 100, 1))
+	}
+
+	// Data should still be readable from DB
+	rtx, err := db.BeginRead()
+	require.NoError(t, err)
+	ns3, _ := db.getNamespaceLocked("data")
+	v, err := rtx.Get(ns3, []byte("key-0010"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("val-0010"), v)
+	require.NoError(t, rtx.Rollback())
+	_ = ns
+}
+
+func TestHtFrameSegIdx(t *testing.T) {
+	// Frame 1 → segment 0, index 0
+	seg, idx := htFrameSegIdx(1)
+	assert.Equal(t, 0, seg)
+	assert.Equal(t, 0, idx)
+
+	// Frame 4062 (htNPageOne) → segment 0, last index
+	seg, idx = htFrameSegIdx(htNPageOne)
+	assert.Equal(t, 0, seg)
+	assert.Equal(t, int(htNPageOne)-1, idx)
+
+	// Frame 4063 → segment 1, index 0
+	seg, idx = htFrameSegIdx(htNPageOne + 1)
+	assert.Equal(t, 1, seg)
+	assert.Equal(t, 0, idx)
+
+	// Frame 8158 (4062 + 4096) → segment 1, last index
+	seg, idx = htFrameSegIdx(htNPageOne + htNPage)
+	assert.Equal(t, 1, seg)
+	assert.Equal(t, htNPage-1, idx)
+
+	// Frame 8159 → segment 2, index 0
+	seg, idx = htFrameSegIdx(htNPageOne + htNPage + 1)
+	assert.Equal(t, 2, seg)
+	assert.Equal(t, 0, idx)
+}

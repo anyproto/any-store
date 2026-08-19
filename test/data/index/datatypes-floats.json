@@ -1,0 +1,30 @@
+{
+  "data": [
+    {"id": 0, "score": 1.5},
+    {"id": 1, "score": 2.7},
+    {"id": 2, "score": 0.1},
+    {"id": 3, "score": 3.14},
+    {"id": 4, "score": 2.0},
+    {"id": 5, "score": 9.99},
+    {"id": 6, "score": 0.5}
+  ],
+  "indexes": [["score"]],
+  "tests": [
+    {
+      "name": "range",
+      "cond": {"score": {"$gte": 1.0, "$lte": 3.0}},
+      "expectedCount": 3
+    },
+    {
+      "name": "sort asc",
+      "sort": ["score"],
+      "expectedIds": [2, 6, 0, 4, 1, 3, 5]
+    },
+    {
+      "name": "sort desc first",
+      "sort": ["-score"],
+      "limit": 1,
+      "expectedIds": [5]
+    }
+  ]
+}

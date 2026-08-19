@@ -1,0 +1,128 @@
+package qplanner
+
+import (
+	"fmt"
+
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/syncpool"
+)
+
+// DistanceField is the virtual field name under which a vector query exposes the
+// per-document distance. It is injected into the in-flight parsed document so
+// the existing FilterIter/SortIter can read it like any field, and is surfaced
+// on the public iterator via Distance().
+const DistanceField = "_distance"
+
+// VectorCandidate is one ANN result handed to the planner by the search closure.
+type VectorCandidate struct {
+	DocId    []byte
+	Distance float32
+}
+
+// VectorSearchFunc runs the ANN search on the given read tx and returns up to ef
+// candidates. Supplied by the anystore layer so qplanner stays free of any
+// vindex dependency.
+type VectorSearchFunc func(tx *btree.ReadTx, query []float32, ef int) ([]VectorCandidate, error)
+
+// VectorQuerySpec directs BuildPlan to build a vector-search ($knn) plan. When
+// present it is the SOLE source — all range-index/CBO selection is bypassed.
+type VectorQuerySpec struct {
+	Query []float32
+	// K is the $knn clause's mandatory neighbour count: the k-cut
+	// (LimitIter{Limit:K}) sits after the residual filter and before any user
+	// sort, bounding the denoted set to at most K documents on every verb.
+	K  int
+	Ef int
+	// IndexName is the resolved vector index, reported by Explain.
+	IndexName string
+	Search    VectorSearchFunc
+	// NeedDistances gates ONLY the Plan.Distances sidecar (Iterator.Distance()
+	// on the read verb). injectDistance is unconditional: the residual filter
+	// reads _distance from Plan.DocParsed on every verb, so gating the
+	// injection would turn a {"_distance":{"$lt":x}} residual into match-all
+	// (Comp.Ok(nil) is true for $lt against null) on Count/Update/Delete.
+	NeedDistances bool
+	// TotallyOrdered is true when Search returns candidates in (distance, docId)
+	// ascending order — a TOTAL order, ties included. All three backends (HNSW,
+	// IVF, brute-force) enforce it at the source; the planner then skips the
+	// SortIter for the default distance order and streams straight through. It
+	// must be total, not merely closest-first: the k-cut and pagination windows
+	// slice this sequence, so an under-specified tie order would make different
+	// verbs page different documents.
+	TotallyOrdered bool
+}
+
+// VectorIter is the source iterator for a vector query. On first Next it runs
+// the ANN search, then streams candidates: for each it fetches+parses the
+// document, injects the _distance virtual field, and records the distance in
+// Plan.Distances (so a post-sort re-fetch and the public Distance() still work).
+type VectorIter struct {
+	Spec *VectorQuerySpec
+	Data *CursorSource
+	Buf  *syncpool.DocBuffer
+	Plan *Plan
+
+	arena      anyenc.Arena
+	candidates []VectorCandidate
+	idx        int
+	inited     bool
+}
+
+func (it *VectorIter) Next() (key []byte, docId []byte, multiKey bool, err error) {
+	if !it.inited {
+		it.inited = true
+		it.candidates, err = it.Spec.Search(it.Data.Tx, it.Spec.Query, it.Spec.Ef)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		// The sidecar (public Distance()) is kept only when the verb asked for
+		// it; injectDistance below stays UNCONDITIONAL — see NeedDistances.
+		if it.Spec.NeedDistances && it.Plan != nil {
+			if it.Plan.Distances == nil {
+				it.Plan.Distances = &FloatSidecar{}
+			}
+			for _, c := range it.candidates {
+				it.Plan.Distances.Set(c.DocId, float64(c.Distance))
+			}
+		}
+	}
+
+	for it.idx < len(it.candidates) {
+		c := it.candidates[it.idx]
+		it.idx++
+
+		it.Buf.DocBuf, err = it.Data.AppendValue(c.DocId, it.Buf.DocBuf[:0])
+		if err != nil {
+			if err == btree.ErrKeyNotFound {
+				continue // doc gone since the index entry — skip
+			}
+			return nil, nil, false, err
+		}
+		doc, perr := it.Buf.Parser.ParseOwned(it.Buf.DocBuf)
+		if perr != nil {
+			return nil, nil, false, perr
+		}
+		if it.Plan != nil {
+			injectDistance(&it.arena, doc, c.Distance)
+			it.Plan.DocParsed = doc
+		}
+		return c.DocId, c.DocId, false, nil
+	}
+	return nil, nil, false, nil
+}
+
+// injectDistance sets the _distance virtual field on the in-flight document. The
+// arena is reset each call: the previous candidate's doc has already been
+// consumed downstream (SortIter copies the sort key into its own arena, and
+// FilterIter evaluates synchronously) by the time the next candidate is read.
+func injectDistance(arena *anyenc.Arena, doc *anyenc.Value, dist float32) {
+	arena.Reset()
+	doc.Set(DistanceField, arena.NewNumberFloat64(float64(dist)))
+}
+
+func (it *VectorIter) Close() {}
+
+func (it *VectorIter) String() string {
+	return fmt.Sprintf("KnnSearch(k=%d,ef=%d)", it.Spec.K, it.Spec.Ef)
+}

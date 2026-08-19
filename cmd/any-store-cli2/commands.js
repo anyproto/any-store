@@ -1,0 +1,395 @@
+// Extended-JSON type constructors (decoded on the Go side by extjson.go).
+// They serialize via JSON.stringify to type wrappers that carry anyenc's
+// non-JSON value types through the JSON transport, MongoDB-shell style:
+//   ObjectId("665f…")  -> {"$oid": "665f…"}      (12-byte object id)
+//   BinData("iVBO…")   -> {"$binary": "iVBO…"}   (base64-encoded bytes)
+//   Vector([0.1, 0.2]) -> {"$vector": [0.1, 0.2]} (float32 embedding)
+function ObjectId(hex) {
+    return {"$oid": hex};
+}
+
+function BinData(base64) {
+    return {"$binary": base64};
+}
+
+function Vector(values) {
+    return {"$vector": values};
+}
+
+// Knn builds the $knn ANN clause for a vector-indexed field:
+//   db.docs.find({emb: Knn([0.1, 0.2], 10)})
+//   db.docs.find({emb: Knn(vec, 10, {ef: 200, index: "emb"})})
+// A bare Vector([...]) equality on a vector-indexed field is no longer an ANN
+// query (it errors, ErrLegacyVectorClause) — the k must be stated.
+function Knn(queryVec, k, opts) {
+    var clause = {"$query": queryVec, "$k": k};
+    if (opts && opts.ef !== undefined) {
+        clause["$ef"] = opts.ef;
+    }
+    if (opts && opts.index !== undefined) {
+        clause["$index"] = opts.index;
+    }
+    return {"$knn": clause};
+}
+
+function DB() {}
+
+DB.prototype.createCollection = function (name) {
+    return {
+        result: function () {
+            return JSON.stringify({
+                cmd: 'createCollection',
+                collection: name,
+            })
+        }
+    }
+}
+
+DB.prototype.quickCheck = function () {
+    return {
+        result: function () {
+            return JSON.stringify({
+                cmd: 'quickCheck',
+            })
+        }
+    }
+}
+
+DB.prototype.backup = function (path) {
+    return {
+        result: function () {
+            return JSON.stringify({
+                cmd: 'backup',
+                path: path,
+            })
+        }
+    }
+}
+
+function Query(name) {
+    this.collection = name;
+    this.cmd = "find";
+    this.query = {};
+}
+
+Query.prototype.reset = function () {
+    this.query = {};
+    this.cmd = "find";
+    delete this.documents;
+}
+
+Query.prototype.limit = function (limit) {
+    this.query.limit = limit;
+    return this
+}
+
+Query.prototype.offset = function (offset) {
+    this.query.offset = offset;
+    return this
+}
+
+Query.prototype.sort = function (limit) {
+    this.query.sort = Array.prototype.slice.call(arguments);
+    return this
+}
+
+Query.prototype.hint = function (hint) {
+    this.query.hint = hint;
+    return this
+}
+
+Query.prototype.groupLimit = function (n) {
+    this.query.groupLimit = n;
+    return this
+}
+
+Query.prototype.accumArrayLimit = function (n) {
+    this.query.accumArrayLimit = n;
+    return this
+}
+
+Query.prototype.memoryLimit = function (bytes) {
+    this.query.memoryLimit = bytes;
+    return this
+}
+
+Query.prototype.project = function (project) {
+    this.query.project = project;
+    return this
+}
+
+Query.prototype.pretty = function () {
+    this.query.pretty = true;
+    return this
+}
+
+Query.prototype.count = function () {
+    this.query.count = true;
+    var res = JSON.stringify(this);
+    this.query = {};
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Query.prototype.explain = function () {
+    this.query.explain = true;
+    var res = JSON.stringify(this);
+    this.query = {};
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Query.prototype.delete = function () {
+    this.query.delete = true;
+    var res = JSON.stringify(this);
+    this.query = {};
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Query.prototype.update = function (upd) {
+    this.query.update = upd || {};
+    var res = JSON.stringify(this);
+    this.query = {};
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Query.prototype.result = function () {
+    var res = JSON.stringify(this);
+    this.reset();
+    return res
+}
+
+
+function Collection(name) {
+    this.collection = name;
+    this.index = {};
+    this.query = new Query(name);
+}
+
+Collection.prototype.find = function (condition) {
+    this.query.reset();
+    this.query.query.find = condition || {}
+    return this.query;
+}
+
+Collection.prototype.aggregate = function (pipeline) {
+    this.query.reset();
+    this.query.cmd = "aggregate";
+    var stages = Array.prototype.slice.call(arguments);
+    if (stages.length === 1 && Array.isArray(stages[0])) {
+        stages = stages[0];
+    }
+    this.query.query.pipeline = stages;
+    return this.query;
+}
+
+Collection.prototype.findOne = function (condition) {
+    this.query.reset();
+    this.query.query.find = condition || {}
+    this.query.query.limit = 1
+    this.query.query.pretty = true
+    this.query.cmd = "findOne"
+    var res = JSON.stringify(this.query);
+    this.query.cmd = "find";
+    this.query.reset();
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.count = function () {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "count",
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.stats = function () {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "stats",
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.getIndexes = function () {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "getIndexes",
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.rename = function (newName) {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "rename",
+        path: newName,
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.ensureIndex = function (index) {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "ensureIndex",
+        index: index,
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.dropIndex = function (indexName) {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "dropIndex",
+        index: {name:indexName},
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.drop = function () {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "drop",
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.insert = function () {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "insert",
+        documents: Array.prototype.slice.call(arguments)
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.upsert = function () {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "upsert",
+        documents: Array.prototype.slice.call(arguments)
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.update = function () {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "update",
+        documents: Array.prototype.slice.call(arguments)
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.updateId = function (id, mod) {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "updateId",
+        documents: [id, mod]
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.upsertId = function (id, mod) {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "upsertId",
+        documents: [id, mod]
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.deleteId = function () {
+    var res = JSON.stringify({
+        collection: this.collection,
+        cmd: "deleteId",
+        documents: Array.prototype.slice.call(arguments)
+    });
+    return {
+        result: function () {
+            return res
+        }
+    }
+}
+
+Collection.prototype.findId = function () {
+    this.query.cmd = "findId"
+    this.query.documents = Array.prototype.slice.call(arguments)
+    return this.query
+}
+
+var it = {
+    result: function () {
+        return JSON.stringify({
+            cmd: 'it',
+        })
+    }
+}
+
+var db = new DB();

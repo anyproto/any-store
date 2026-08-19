@@ -5,8 +5,8 @@ import (
 	"slices"
 	"strconv"
 
-	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/anyenc/anyencutil"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 )
 
 type Modifier interface {
@@ -112,7 +112,7 @@ func (m modifierRename) Modify(a *anyenc.Arena, v *anyenc.Value) (result *anyenc
 	})
 	if modified {
 		err = anyencutil.Walk(a, v, m.val, true, func(prevValue, newFieldValue *anyenc.Value) (res *anyenc.Value, err error) {
-			modified = !anyencutil.Equal(newFieldValue, oldFieldValue)
+			modified = modified || !anyencutil.Equal(newFieldValue, oldFieldValue)
 			return oldFieldValue, nil
 		})
 		if err != nil {

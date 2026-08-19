@@ -1,30 +1,22 @@
 package anystore
 
 import (
-	"context"
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/anyproto/any-store/anyenc"
-	"github.com/anyproto/any-store/internal/objectid"
-	"github.com/anyproto/any-store/query"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/internal/btree"
+	"github.com/anyproto/any-store/v2/query"
 )
-
-func assertCollCount(t testing.TB, c Collection, expected int) bool {
-	return assertCollCountCtx(ctx, t, c, expected)
-}
-
-func assertCollCountCtx(ctx context.Context, t testing.TB, c Collection, expected int) bool {
-	count, err := c.Count(ctx)
-	require.NoError(t, err)
-	return assert.Equal(t, expected, count)
-}
 
 func TestCollection_Drop(t *testing.T) {
 	fx := newFixture(t)
@@ -78,7 +70,7 @@ func TestCollection_Insert(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 2, count)
 
-		// expect count=0 outside tx
+		// MVCC: a separate read outside the write tx cannot see uncommitted writes
 		assertCollCount(t, coll, 0)
 
 		require.NoError(t, tx.Commit())
@@ -340,7 +332,7 @@ func BenchmarkCollection_Insert(b *testing.B) {
 	for range b.N {
 		a.Reset()
 		doc := a.NewObject()
-		doc.Set("id", a.NewString(objectid.NewObjectID().Hex()))
+		doc.Set("id", a.NewString(anyenc.NewObjectID().Hex()))
 		require.NoError(b, coll.Insert(ctx, doc))
 	}
 }
@@ -444,4 +436,319 @@ func BenchmarkCollection_InQuery(b *testing.B) {
 	for range b.N {
 		coll.Find(query).Count(ctx)
 	}
+}
+
+// setupLargeBlob inserts a single document with an ~sz-byte "payload"
+// field containing a deterministic byte pattern. Returns the collection
+// and the inserted doc id. The payload is written as a hex string so
+// anyenc serialization stays stable; hex doubles the on-disk size, so
+// pass sz/2 to get roughly sz bytes in the DB (close enough for a
+// micro-bench — the goal is to span many overflow pages, not hit an
+// exact size).
+func setupLargeBlob(b *testing.B, sz int) (*collection, int) {
+	b.Helper()
+	fx := newFixture(b)
+	coll, err := fx.CreateCollection(ctx, "blob")
+	require.NoError(b, err)
+
+	// Build a hex payload: 2 hex chars per input byte.
+	raw := make([]byte, sz/2)
+	for i := range raw {
+		raw[i] = byte(i * 17) // deterministic, non-repetitive
+	}
+	payload := fmt.Sprintf("%x", raw)
+
+	doc := anyenc.MustParseJson(fmt.Sprintf(`{"id": 1, "payload": "%s"}`, payload))
+	require.NoError(b, coll.Insert(ctx, doc))
+
+	// Force a checkpoint so the blob actually lives in the DB file
+	// (overflow chain anchored there), not only in the WAL. Eliminates
+	// WAL-vs-DB read path variance in the measurement.
+	require.NoError(b, fx.Flush(ctx, 0*time.Second, FlushModeCheckpointFull))
+
+	return coll.(*collection), 1
+}
+
+// BenchmarkOverflow10MB_FindId measures the cost of reading a ~10MB
+// blob value back via the public FindId API. Includes SHM hash lookup,
+// page reads, overflow chain walk, decompression (if any), anyenc
+// parse, and the Doc wrapper. A cpuprofile of this bench tells us
+// which part dominates.
+//
+// Run: go test -run='^$' -bench=BenchmarkOverflow10MB_FindId -benchmem -cpuprofile=/tmp/ovfl.prof
+func BenchmarkOverflow10MB_FindId(b *testing.B) {
+	coll, id := setupLargeBlob(b, 10<<20) // ~10MB
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		d, err := coll.FindId(ctx, id)
+		if err != nil {
+			b.Fatalf("FindId: %v", err)
+		}
+		_ = d.Value() // force materialization
+	}
+}
+
+// BenchmarkOverflow10MB_FindId_WithParser uses a reusable parser to
+// isolate parser-allocation cost from overflow-read cost. Delta
+// against the previous bench shows how much parser churn contributes.
+func BenchmarkOverflow10MB_FindId_WithParser(b *testing.B) {
+	coll, id := setupLargeBlob(b, 10<<20)
+
+	p := &anyenc.Parser{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		d, err := coll.FindIdWithParser(ctx, p, id)
+		if err != nil {
+			b.Fatalf("FindId: %v", err)
+		}
+		_ = d.Value()
+	}
+}
+
+// setupLargeBlobMmap is like setupLargeBlob but opens the DB with
+// MmapSize = 64 MiB. Used to measure the mmap-vs-ReadAt delta.
+func setupLargeBlobMmap(b *testing.B, sz int) (*collection, int) {
+	b.Helper()
+	fx := newFixture(b, &Config{MmapSize: 64 << 20})
+	coll, err := fx.CreateCollection(ctx, "blob")
+	require.NoError(b, err)
+
+	raw := make([]byte, sz/2)
+	for i := range raw {
+		raw[i] = byte(i * 17)
+	}
+	payload := fmt.Sprintf("%x", raw)
+
+	doc := anyenc.MustParseJson(fmt.Sprintf(`{"id": 1, "payload": "%s"}`, payload))
+	require.NoError(b, coll.Insert(ctx, doc))
+	require.NoError(b, fx.Flush(ctx, 0*time.Second, FlushModeCheckpointFull))
+
+	return coll.(*collection), 1
+}
+
+// BenchmarkOverflow10MB_FindId_Mmap is the mmap-enabled counterpart
+// to BenchmarkOverflow10MB_FindId. Delta against the baseline is the
+// measured value of the mmap change.
+func BenchmarkOverflow10MB_FindId_Mmap(b *testing.B) {
+	coll, id := setupLargeBlobMmap(b, 10<<20)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		d, err := coll.FindId(ctx, id)
+		if err != nil {
+			b.Fatalf("FindId: %v", err)
+		}
+		_ = d.Value()
+	}
+}
+
+// BenchmarkOverflow_SizeSweep_FindId scans blob sizes to expose how
+// per-op cost scales with overflow-chain length. Slope tells us
+// whether we're bound by the walk (linear in chain length) or by
+// payload size (linear in bytes copied) or by syscalls (linear in
+// pages).
+func BenchmarkOverflow_SizeSweep_FindId(b *testing.B) {
+	sizes := []int{
+		64 << 10,  // 64 KB — ~16 overflow pages
+		512 << 10, // 512 KB — ~128
+		2 << 20,   // 2 MB — ~512
+		10 << 20,  // 10 MB — ~2560
+	}
+	for _, sz := range sizes {
+		b.Run(fmt.Sprintf("sz=%dKB", sz>>10), func(b *testing.B) {
+			coll, id := setupLargeBlob(b, sz)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				d, err := coll.FindId(ctx, id)
+				if err != nil {
+					b.Fatalf("FindId: %v", err)
+				}
+				_ = d.Value()
+			}
+		})
+	}
+}
+
+// BenchmarkOverflow10MB_FindIdCold measures FindId on a 10MB blob
+// with per-iteration DB reopen. Reopening drops in-process caches
+// (pcache, mmap region) — what remains is whatever the OS page
+// cache serves. Exposes sequential-read layout wins that the
+// warm-cache variant hides.
+//
+// NOTE: fully evicting the OS page cache would require root +
+// platform-specific calls; this bench does not. Both before/after
+// see the same OS-cache conditions, so the comparison is fair for
+// measuring chain layout cost vs constant OS-cache overhead.
+func BenchmarkOverflow10MB_FindIdCold(b *testing.B) {
+	const sz = 10 << 20
+
+	tmpDir, err := os.MkdirTemp("", "bench-cold-*")
+	require.NoError(b, err)
+	b.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+	dbPath := filepath.Join(tmpDir, "bench.db")
+
+	// One-time setup: open, insert blob, checkpoint, close.
+	setupDB, err := Open(ctx, dbPath, nil)
+	require.NoError(b, err)
+	coll, err := setupDB.CreateCollection(ctx, "blob")
+	require.NoError(b, err)
+	raw := make([]byte, sz/2)
+	for i := range raw {
+		raw[i] = byte(i * 17)
+	}
+	payload := fmt.Sprintf("%x", raw)
+	doc := anyenc.MustParseJson(fmt.Sprintf(`{"id": 1, "payload": "%s"}`, payload))
+	require.NoError(b, coll.Insert(ctx, doc))
+	require.NoError(b, setupDB.Flush(ctx, 0*time.Second, FlushModeCheckpointFull))
+	require.NoError(b, setupDB.Close())
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		b.StopTimer()
+		db2, err := Open(ctx, dbPath, nil)
+		require.NoError(b, err)
+		coll2, err := db2.OpenCollection(ctx, "blob")
+		require.NoError(b, err)
+		b.StartTimer()
+
+		d, err := coll2.FindId(ctx, 1)
+		if err != nil {
+			b.Fatalf("FindId: %v", err)
+		}
+		_ = d.Value()
+
+		b.StopTimer()
+		require.NoError(b, db2.Close())
+		b.StartTimer()
+	}
+}
+
+// BenchmarkWAL_RepeatedDirtyWithinTx measures WAL file growth under
+// a workload that repeatedly updates the same documents within a
+// single transaction. Without frame-reuse, each update appends a
+// new WAL frame. With frame-reuse, the existing frame is overwritten
+// in place. Reports per-op time AND the resulting WAL file size at
+// the end of the run via the `wal_bytes` custom metric.
+func BenchmarkWAL_RepeatedDirtyWithinTx(b *testing.B) {
+	const (
+		nDocs    = 10
+		nUpdates = 20
+	)
+
+	tmpDir, err := os.MkdirTemp("", "bench-reuse-*")
+	require.NoError(b, err)
+	b.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+	dbPath := filepath.Join(tmpDir, "bench.db")
+
+	db, err := Open(ctx, dbPath, &Config{DisableAutoCheckpoint: true})
+	require.NoError(b, err)
+	b.Cleanup(func() { _ = db.Close() })
+	coll, err := db.CreateCollection(ctx, "docs")
+	require.NoError(b, err)
+
+	// Seed.
+	for i := range nDocs {
+		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"v":0,"payload":"%s"}`, i, strings.Repeat("x", 500)))
+		require.NoError(b, coll.Insert(ctx, doc))
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		tx, err := coll.WriteTx(ctx)
+		require.NoError(b, err)
+		for u := range nUpdates {
+			for i := range nDocs {
+				doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"v":%d,"payload":"%s"}`, i, u, strings.Repeat("x", 500)))
+				require.NoError(b, coll.UpsertOne(tx.Context(), doc))
+			}
+		}
+		require.NoError(b, tx.Commit())
+	}
+	b.StopTimer()
+
+	if info, err := os.Stat(dbPath + "-wal"); err == nil {
+		b.ReportMetric(float64(info.Size()), "wal_bytes")
+	}
+}
+
+// BenchmarkWAL_SpillHeavyRepeatedDirty forces page-cache spills via a
+// tiny CacheSize so the same dirty pages repeatedly hit writeFrames
+// within one tx — exactly the scenario where SQLite's frame-reuse
+// optimization (wal.c:4117-4156) eliminates WAL bloat. Without
+// reuse, each spill of pgno X appends a new frame; with reuse, the
+// existing in-tx frame is overwritten in place.
+//
+// Workload: enough distinct large docs to spread dirty pages well
+// past the cache (working set ≫ cache), then re-update every doc
+// inside a single tx so each spilled page must be re-spilled.
+//
+// Run BOTH variants to A/B-compare reuse savings:
+//
+//	go test -run=^$ -bench=BenchmarkWAL_SpillHeavyRepeatedDirty -benchtime=2x
+func BenchmarkWAL_SpillHeavyRepeatedDirty_NoReuse(b *testing.B) {
+	btree.DiagDisableReuse.Store(true)
+	b.Cleanup(func() { btree.DiagDisableReuse.Store(false) })
+	benchSpillHeavyRepeatedDirty(b)
+}
+
+func BenchmarkWAL_SpillHeavyRepeatedDirty(b *testing.B) {
+	btree.DiagDisableReuse.Store(false)
+	benchSpillHeavyRepeatedDirty(b)
+}
+
+func benchSpillHeavyRepeatedDirty(b *testing.B) {
+	const (
+		nDocs    = 1000
+		nUpdates = 5
+	)
+
+	tmpDir, err := os.MkdirTemp("", "bench-spill-*")
+	require.NoError(b, err)
+	b.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+	dbPath := filepath.Join(tmpDir, "bench.db")
+
+	// CacheSize=4: tiny cache → constant spills as each upsert
+	// dirties pages exceeding capacity.
+	cfg := &Config{DisableAutoCheckpoint: true, CacheSize: 4}
+	db, err := Open(ctx, dbPath, cfg)
+	require.NoError(b, err)
+	b.Cleanup(func() { _ = db.Close() })
+	coll, err := db.CreateCollection(ctx, "docs")
+	require.NoError(b, err)
+
+	for i := range nDocs {
+		doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"v":0,"payload":"%s"}`, i, strings.Repeat("x", 2000)))
+		require.NoError(b, coll.Insert(ctx, doc))
+	}
+
+	reuseStart := btree.DiagReuseFrames.Load()
+	appendStart := btree.DiagAppendFrames.Load()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		tx, err := coll.WriteTx(ctx)
+		require.NoError(b, err)
+		for u := range nUpdates {
+			for i := range nDocs {
+				doc := anyenc.MustParseJson(fmt.Sprintf(`{"id":%d,"v":%d,"payload":"%s"}`, i, u, strings.Repeat("x", 2000)))
+				require.NoError(b, coll.UpsertOne(tx.Context(), doc))
+			}
+		}
+		require.NoError(b, tx.Commit())
+	}
+	b.StopTimer()
+
+	if info, err := os.Stat(dbPath + "-wal"); err == nil {
+		b.ReportMetric(float64(info.Size()), "wal_bytes")
+	}
+	b.ReportMetric(float64(btree.DiagReuseFrames.Load()-reuseStart), "reuse")
+	b.ReportMetric(float64(btree.DiagAppendFrames.Load()-appendStart), "append")
 }

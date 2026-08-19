@@ -3,7 +3,7 @@ package anyencutil
 import (
 	"bytes"
 
-	"github.com/anyproto/any-store/anyenc"
+	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 type Value struct {
@@ -47,6 +47,18 @@ func Equal(a, b *anyenc.Value) bool {
 		return a.GetFloat64() == b.GetFloat64()
 	case anyenc.TypeBinary:
 		return bytes.Equal(a.GetBytes(), b.GetBytes())
+	case anyenc.TypeVectorF32:
+		// Single memcmp over the packed bytes: alloc-free, bit-exact.
+		return bytes.Equal(a.VectorBytes(), b.VectorBytes())
+	case anyenc.TypeObjectID:
+		// [12]byte is comparable; == is alloc-free and bit-exact.
+		ai, _ := a.ObjectID()
+		bi, _ := b.ObjectID()
+		return ai == bi
+	case anyenc.TypeDateTime:
+		am, _ := a.DateTimeMillis()
+		bm, _ := b.DateTimeMillis()
+		return am == bm
 	}
 	return true
 }
