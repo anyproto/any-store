@@ -153,9 +153,10 @@ func TestDBHeaderNotSQLiteCompatible(t *testing.T) {
 // any-store, those pages would be traversed with INDEX-cell layout, silently
 // misparsing payloads. any-store has no decodeFlags-equivalent load-time
 // page-type whitelist; the *only* thing that makes this case unreachable for
-// real SQLite files is that dbHeader.deserialize (page.go:239) rejects them at
-// header parse, before any page is ever loaded, because the 15-byte magic
-// prefix differs ("BTree format 1\000" vs SQLite's "SQLite format 3\000",
+// real SQLite files is that dbHeader.deserialize (page.go:246) rejects them at
+// header parse, before any page is ever loaded, because neither accepted magic
+// matches SQLite's over the full 16-byte field ("any-store v2\000" written,
+// "BTree format 1\000" still read, vs SQLite's "SQLite format 3\000",
 // NOTES.md:253). That rejection is an *assumed* invariant, not an explicit
 // whitelist — so we pin it here. A refactor that widens/weakens the magic
 // comparison (e.g. accepts SQLite's magic, or compares too few bytes) would
@@ -191,8 +192,13 @@ func TestDBHeaderRejectsGenuineSQLiteMagic(t *testing.T) {
 	// THE PINNED INVARIANT: a genuine-SQLite-magic header is rejected at parse,
 	// before any page (and thus any 5/13 table page) can be loaded.
 	var h dbHeader
-	assert.ErrorIs(t, h.deserialize(buf), ErrCorrupt,
+	err := h.deserialize(buf)
+	assert.Error(t, err,
 		"deserialize must reject a genuine SQLite header so real SQLite table pages (type 5/13) never reach the index-only readers")
+	assert.ErrorIs(t, err, ErrSQLiteFormat,
+		"a SQLite header is reported as an any-store v1 file, not as generic corruption")
+	assert.NotErrorIs(t, err, ErrCorrupt,
+		"a v1 database is intact, only older: callers that discard corrupt databases must not be told to throw it away")
 
 	// Positive control: restoring only the magic to any-store's value makes the
 	// very same buffer deserialize cleanly. This proves the magic bytes are the

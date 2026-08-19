@@ -6,6 +6,12 @@ var (
 	// ErrCorrupt indicates the database file is corrupted.
 	ErrCorrupt = errors.New("btree: database is corrupt")
 
+	// ErrSQLiteFormat reports a file carrying SQLite's header magic — an
+	// any-store v1 database. Deliberately NOT wrapping ErrCorrupt: the file is
+	// intact, only older, and a caller that responds to corruption by discarding
+	// and rebuilding the database must not be told to throw it away.
+	ErrSQLiteFormat = errors.New("btree: SQLite-format file (any-store v1 database)")
+
 	// ErrReadOnly indicates a write was attempted on a read-only transaction.
 	ErrReadOnly = errors.New("btree: read-only transaction")
 

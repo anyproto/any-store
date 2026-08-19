@@ -110,6 +110,11 @@ var (
 	ErrDBIsNotOpened       = errors.New("any-store: database is not opened")
 	ErrIncompatibleVersion = errors.New("any-store: incompatible version")
 
+	// ErrV1Database is returned by Open when the file was created by any-store
+	// v1, which is SQLite-backed and cannot be read by v2. See
+	// docs/migration-v1-to-v2.md for moving the data across.
+	ErrV1Database = errors.New("any-store: file is an any-store v1 database, not readable by v2; use github.com/anyproto/any-store or migrate (docs/migration-v1-to-v2.md)")
+
 	// ErrPageBufferNotInitialized is returned when UseGlobalPageBuffer is set
 	// but InitPageBuffer was not called before opening the database.
 	ErrPageBufferNotInitialized = errors.New("any-store: global page buffer not initialized (call InitPageBuffer first)")

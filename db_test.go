@@ -340,3 +340,44 @@ func TestInspectIndexSketch_AccumulatesOnInsertAndDelete(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, uint64(20), info.DocCount)
 }
+
+func TestOpen_AnyStoreV1File(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("v1 file is reported explicitly", func(t *testing.T) {
+		path := filepath.Join(dir, "v1.db")
+		// The SQLite header every any-store v1 database starts with. Literal on
+		// purpose: a rename or edit of v1Magic must fail here rather than pass
+		// by comparing the constant against itself.
+		page := make([]byte, 4096)
+		copy(page, "SQLite format 3\x00")
+		require.NoError(t, os.WriteFile(path, page, 0o600))
+
+		db, err := Open(ctx, path, nil)
+		require.ErrorIs(t, err, ErrV1Database)
+		require.Nil(t, db)
+	})
+
+	t.Run("v2 file still opens", func(t *testing.T) {
+		path := filepath.Join(dir, "v2.db")
+		db, err := Open(ctx, path, nil)
+		require.NoError(t, err)
+		coll, err := db.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		require.NoError(t, coll.Close())
+		require.NoError(t, db.Close())
+
+		db, err = Open(ctx, path, nil)
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+	})
+
+	t.Run("other garbage keeps the generic error", func(t *testing.T) {
+		path := filepath.Join(dir, "garbage.db")
+		require.NoError(t, os.WriteFile(path, []byte("this is not a database at all"), 0o600))
+
+		_, err := Open(ctx, path, nil)
+		require.Error(t, err)
+		require.NotErrorIs(t, err, ErrV1Database)
+	})
+}

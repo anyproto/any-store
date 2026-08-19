@@ -79,6 +79,9 @@ const (
 	// dbMagicV1 is the magic used before the rename. It is still accepted so that
 	// databases created by earlier v2 builds keep opening.
 	dbMagicV1 = "BTree format 1\x00\x00"
+	// sqliteMagic is the header any-store v1 databases start with. Recognised
+	// only so it can be reported distinctly; never accepted.
+	sqliteMagic = "SQLite format 3\x00"
 
 	// Page type flags (matching SQLite).
 	pageTypeIntIdx  = 2  // Interior index b-tree page
@@ -244,6 +247,9 @@ func (h *dbHeader) deserialize(buf []byte) error {
 	}
 
 	if magic := string(buf[0:16]); magic != dbMagicV2 && magic != dbMagicV1 {
+		if magic == sqliteMagic {
+			return ErrSQLiteFormat
+		}
 		return ErrCorrupt
 	}
 
