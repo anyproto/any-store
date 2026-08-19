@@ -27,7 +27,7 @@ func readIndexInfo(buf *syncpool.DocBuffer, stmt *sqlite.Stmt) (result []IndexIn
 			Name:   stmt.ColumnText(0),
 			Fields: fields,
 			Sparse: stmt.ColumnInt(2) != 0,
-			Unique: stmt.ColumnInt(2) != 0,
+			Unique: stmt.ColumnInt(3) != 0,
 		})
 	}
 }
