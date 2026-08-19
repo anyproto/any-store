@@ -52,6 +52,10 @@ var (
 
 	ErrDBIsNotOpened       = driver.ErrDBIsNotOpened
 	ErrIncompatibleVersion = driver.ErrIncompatibleVersion
+
+	// ErrV2Database is returned by Open when the file was created by any-store
+	// v2, which uses a different storage engine and cannot be read by v1.
+	ErrV2Database = errors.New("any-store: file is an any-store v2 database, not readable by v1; use github.com/anyproto/any-store/v2")
 )
 
 func replaceUniqErr(err, replaceTo error) error {

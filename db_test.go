@@ -254,3 +254,44 @@ func (fx *fixture) finish() {
 		}
 	}
 }
+
+func TestOpen_AnyStoreV2File(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("v2 file is reported explicitly", func(t *testing.T) {
+		path := filepath.Join(dir, "v2.db")
+		// The header any-store v2 writes: the 15-byte magic, zero-filled to the
+		// 16-byte header slot. Verified against a real v2 file:
+		//   00000000: 4254 7265 6520 666f 726d 6174 2031 0000  BTree format 1..
+		page := make([]byte, 4096)
+		copy(page, "BTree format 1\x00")
+		require.NoError(t, os.WriteFile(path, page, 0o600))
+
+		db, err := Open(ctx, path, nil)
+		require.ErrorIs(t, err, ErrV2Database)
+		require.Nil(t, db)
+	})
+
+	t.Run("v1 file still opens", func(t *testing.T) {
+		path := filepath.Join(dir, "v1.db")
+		db, err := Open(ctx, path, nil)
+		require.NoError(t, err)
+		coll, err := db.CreateCollection(ctx, "test")
+		require.NoError(t, err)
+		require.NoError(t, coll.Close())
+		require.NoError(t, db.Close())
+
+		db, err = Open(ctx, path, nil)
+		require.NoError(t, err)
+		require.NoError(t, db.Close())
+	})
+
+	t.Run("other garbage keeps the generic error", func(t *testing.T) {
+		path := filepath.Join(dir, "garbage.db")
+		require.NoError(t, os.WriteFile(path, []byte("this is not a database at all"), 0o600))
+
+		_, err := Open(ctx, path, nil)
+		require.Error(t, err)
+		require.NotErrorIs(t, err, ErrV2Database)
+	})
+}
