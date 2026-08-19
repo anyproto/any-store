@@ -1,5 +1,12 @@
 package btree
 
+// Page encryption in this package is an independent Go implementation that
+// follows design conventions from SQLCipher (BSD-3-Clause, Zetetic LLC) —
+// reserved-tail page overhead, the page-1 plaintext-prefix rule, and PBKDF2
+// key derivation — using Go-native AEAD primitives. No SQLCipher code is
+// included. Scope and attribution: NOTICE.md. Per-site provenance:
+// docs/btree/mappings/sqlcipher_codec.json.
+
 import (
 	"crypto/rand"
 	"errors"
