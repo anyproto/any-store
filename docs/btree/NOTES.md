@@ -218,7 +218,7 @@ Both implementations follow the same 100-byte layout:
 
 | Offset | Size | SQLite | Go |
 |--------|------|--------|-----|
-| 0 | 16 | `"SQLite format 3\000"` | `"BTree format 1\000"` |
+| 0 | 16 | `"SQLite format 3\000"` | `"any-store v2\000"`, zero-padded (reads also accept the legacy `"BTree format 1\000"`) |
 | 16 | 2 | Page size | Page size |
 | 18 | 1 | File format write version | File format write version |
 | 19 | 1 | File format read version | File format read version |
@@ -250,7 +250,7 @@ Both implementations follow the same 100-byte layout:
 
 | Aspect | SQLite | Go |
 |--------|--------|-----|
-| Magic string | `"SQLite format 3\000"` | `"BTree format 1\000"` |
+| Magic string | `"SQLite format 3\000"` | `"any-store v2\000"` written; `"BTree format 1\000"` still accepted |
 | Version number (offset 96) | SQLite library version (e.g., 3049000) | Hardcoded `1` |
 | Auto-vacuum field (offset 52) | Largest root B-tree page number | Always 0 |
 | Incremental vacuum (offset 64) | 0 or 1 | Always 0 |

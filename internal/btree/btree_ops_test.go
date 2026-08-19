@@ -1380,7 +1380,10 @@ func TestRebuildLeafPageOnPage1(t *testing.T) {
 
 	bt := &btree{pager: p, rootPage: 1, writable: true}
 	require.NoError(t, bt.rebuildLeafPage(pg, []cellData{{key: []byte("ns1"), value: []byte{0, 0, 0, 2}}}))
-	assert.Equal(t, byte('B'), pg.data[0])
+	// Page 1 carries the database header; the rebuild must not clobber it.
+	// Literal on purpose: a rename or edit of dbMagicV2 must fail here rather
+	// than pass by comparing the constant against itself.
+	assert.Equal(t, "any-store v2\x00\x00\x00\x00", string(pg.data[0:16]))
 	p.releasePage(pg)
 }
 
