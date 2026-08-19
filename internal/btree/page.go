@@ -5,7 +5,8 @@ package btree
 // Database header (first 100 bytes of page 1):
 //
 //	Offset  Size  Description
-//	0       16    Magic string "BTree format 1\000"
+//	0       16    Magic string "any-store v2\000" (zero-padded to 16;
+//	              "BTree format 1\000" still accepted, see dbMagicV1)
 //	16      2     Page size in bytes
 //	18      1     File format write version (1=legacy, 2=WAL)
 //	19      1     File format read version (1=legacy, 2=WAL)
@@ -71,7 +72,13 @@ const (
 	dbHeaderSize = 100
 
 	// Magic string identifying our database format.
-	dbMagic = "BTree format 1\x00"
+	// dbMagicV2 is the header magic written by newly created databases. The magic
+	// field is 16 bytes, so both constants are zero-padded to that width and the
+	// whole field is compared on read — no byte of it goes unchecked.
+	dbMagicV2 = "any-store v2\x00\x00\x00\x00"
+	// dbMagicV1 is the magic used before the rename. It is still accepted so that
+	// databases created by earlier v2 builds keep opening.
+	dbMagicV1 = "BTree format 1\x00\x00"
 
 	// Page type flags (matching SQLite).
 	pageTypeIntIdx  = 2  // Interior index b-tree page
@@ -180,9 +187,9 @@ type dbHeader struct {
 }
 
 // serialize writes the database header to the first 100 bytes of buf.
-// DRIFT: DB header: 'BTree format 1' magic, version=1, KDF salt at 72-87, auto/incr-vacuum fields z See docs/btree/NOTES.md#old-drift-db-file-header-magic-version-salt-vacuum
+// DRIFT: DB header: 'any-store v2' magic (legacy 'BTree format 1' still read), version=1, KDF salt at 72-87, auto/incr-vacuum fields z See docs/btree/NOTES.md#old-drift-db-file-header-magic-version-salt-vacuum
 func (h *dbHeader) serialize(buf []byte) {
-	copy(buf[0:16], dbMagic)
+	copy(buf[0:16], dbMagicV2)
 
 	var ps uint16
 	if h.PageSize >= 65536 {
@@ -236,7 +243,7 @@ func (h *dbHeader) deserialize(buf []byte) error {
 		return ErrCorrupt
 	}
 
-	if string(buf[0:15]) != dbMagic[:15] {
+	if magic := string(buf[0:16]); magic != dbMagicV2 && magic != dbMagicV1 {
 		return ErrCorrupt
 	}
 

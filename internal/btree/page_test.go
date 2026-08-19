@@ -30,8 +30,10 @@ func TestDBHeaderSerializeDeserialize(t *testing.T) {
 	buf := make([]byte, dbHeaderSize)
 	h.serialize(buf)
 
-	// Verify magic string (dbMagic is 15 bytes; byte 16 is the null terminator from zeroed buf)
-	assert.Equal(t, dbMagic, string(buf[0:len(dbMagic)]))
+	// New databases carry the v2 magic across the whole 16-byte field.
+	// Literal on purpose: a rename or edit of dbMagicV2 must fail here rather
+	// than pass by comparing the constant against itself.
+	assert.Equal(t, "any-store v2\x00\x00\x00\x00", string(buf[0:16]))
 
 	var h2 dbHeader
 	require.NoError(t, h2.deserialize(buf))
@@ -135,7 +137,8 @@ func TestOpenRejectsUsableSizeBelow480(t *testing.T) {
 }
 
 func TestDBHeaderNotSQLiteCompatible(t *testing.T) {
-	assert.NotEqual(t, "SQLite format 3\000", dbMagic)
+	assert.NotEqual(t, "SQLite format 3\000", dbMagicV2)
+	assert.NotEqual(t, "SQLite format 3\000", dbMagicV1)
 }
 
 // TestDBHeaderRejectsGenuineSQLiteMagic pins the assumed invariant that the
@@ -160,11 +163,13 @@ func TestDBHeaderNotSQLiteCompatible(t *testing.T) {
 func TestDBHeaderRejectsGenuineSQLiteMagic(t *testing.T) {
 	const sqliteMagic = "SQLite format 3\x00" // 16 bytes, the genuine SQLite header magic
 
-	// Guard: the two formats' 15-byte magic prefixes (the bytes deserialize
-	// actually compares) must differ. If a refactor ever made them coincide,
-	// the behavioral rejection below could not hold.
-	require.NotEqual(t, sqliteMagic[:15], dbMagic[:15],
-		"magic prefixes coincide: a genuine SQLite file (with 5/13 table pages) could be opened and traversed with index-cell layout")
+	// Guard: neither accepted magic may coincide with SQLite's over the 16 bytes
+	// deserialize compares. If a refactor ever made them coincide, the
+	// behavioral rejection below could not hold.
+	require.NotEqual(t, sqliteMagic, dbMagicV2,
+		"magic coincides with SQLite: a genuine SQLite file (with 5/13 table pages) could be opened and traversed with index-cell layout")
+	require.NotEqual(t, sqliteMagic, dbMagicV1,
+		"legacy magic coincides with SQLite: a genuine SQLite file (with 5/13 table pages) could be opened and traversed with index-cell layout")
 
 	// Build a header that is byte-for-byte acceptable to deserialize EXCEPT for
 	// its magic: start from a valid any-store header (valid page size, valid
@@ -192,8 +197,7 @@ func TestDBHeaderRejectsGenuineSQLiteMagic(t *testing.T) {
 	// Positive control: restoring only the magic to any-store's value makes the
 	// very same buffer deserialize cleanly. This proves the magic bytes are the
 	// gate (the test fails for the right reason, not because of unrelated bytes).
-	copy(buf[0:16], dbMagic)
-	buf[15] = 0 // dbMagic is 15 bytes; ensure byte 15 (null terminator) is zero
+	copy(buf[0:16], dbMagicV2)
 	var h2 dbHeader
 	assert.NoError(t, h2.deserialize(buf),
 		"buffer differing from a valid header only in the magic must parse once the any-store magic is restored")
@@ -388,4 +392,35 @@ func TestPageUsableSize(t *testing.T) {
 	pg := &page{data: make([]byte, 4096)}
 	assert.Equal(t, 4096, pg.usableSize(0))
 	assert.Equal(t, 4088, pg.usableSize(8))
+}
+
+// TestDBHeaderMagicWidth pins both magics to the width of the header field.
+// A constant longer than 16 bytes would silently overwrite the page size at
+// offset 16; a shorter one must be zero-padded so the full-field compare in
+// deserialize still matches what serialize wrote.
+func TestDBHeaderMagicWidth(t *testing.T) {
+	assert.Len(t, dbMagicV2, 16)
+	assert.Len(t, dbMagicV1, 16)
+}
+
+// TestDBHeaderAcceptsLegacyMagic guards backward compatibility: databases
+// created before the rename carry "BTree format 1\0" padded with a zero byte,
+// and must keep opening.
+func TestDBHeaderAcceptsLegacyMagic(t *testing.T) {
+	h := dbHeader{
+		PageSize:     4096,
+		WriteVersion: 2,
+		ReadVersion:  2,
+	}
+	buf := make([]byte, dbHeaderSize)
+	h.serialize(buf)
+	require.Equal(t, "any-store v2\x00\x00\x00\x00", string(buf[0:16]), "serialize must write the new magic")
+
+	// Rewrite the field exactly as an older build left it on disk: the 15-byte
+	// legacy magic copied into a zeroed buffer.
+	copy(buf[0:16], "BTree format 1\x00")
+
+	var h2 dbHeader
+	require.NoError(t, h2.deserialize(buf), "a database written by an earlier v2 build must still open")
+	assert.Equal(t, h.PageSize, h2.PageSize)
 }

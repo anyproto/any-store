@@ -1459,7 +1459,10 @@ func TestRebuildInteriorPageOnPage1(t *testing.T) {
 	}
 	bt.rebuildInteriorPage(pg, cells, 6)
 
-	assert.Equal(t, byte('B'), pg.data[0])
+	// Page 1 carries the database header; the rebuild must not clobber it.
+	// Literal on purpose: a rename or edit of dbMagicV2 must fail here rather
+	// than pass by comparing the constant against itself.
+	assert.Equal(t, "any-store v2\x00\x00\x00\x00", string(pg.data[0:16]))
 	assert.Equal(t, uint8(pageTypeIntIdx), pg.data[dbHeaderSize])
 
 	p.releasePage(pg)
