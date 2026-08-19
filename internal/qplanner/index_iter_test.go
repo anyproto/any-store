@@ -739,7 +739,7 @@ func TestCountEntriesViaSeenSet_Overlapping(t *testing.T) {
 	assertSeenSetCount(t, it, 2)
 }
 
-// TestCountEntriesViaSeenSet_MixedScalarArray is the I-05 shape at the unit
+// TestCountEntriesViaSeenSet_MixedScalarArray is the cross-bound array shape at the unit
 // level: scalar docs d1 (a) and d2 (b) plus an array doc d3 ([a,b]) straddling
 // both bounds. Skip-scalar mode must count d1/d2 directly and dedup d3 → 3.
 func TestCountEntriesViaSeenSet_MixedScalarArray(t *testing.T) {

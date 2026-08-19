@@ -177,9 +177,8 @@ func TestBuildPlan_SparseIndex_NeUsesIndex(t *testing.T) {
 }
 
 // TestIndexCoversFilter_RejectsUncoveredField is the defensive regression for
-// the I-04 field-coverage check: a filter touching a field not in the index is
-// never reported as covered, and empty index bounds are never covered. See
-// docs/known-issues.md (I-04).
+// the field-coverage check: a filter touching a field not in the index is
+// never reported as covered, and empty index bounds are never covered.
 func TestIndexCoversFilter_RejectsUncoveredField(t *testing.T) {
 	pointBound := query.Bounds{{
 		Start:        anyenc.AppendAnyValue(nil, 1),
@@ -204,15 +203,14 @@ func TestIndexCoversFilter_RejectsUncoveredField(t *testing.T) {
 		"empty bounds must not be reported as covered")
 }
 
-// TestIndexCoversFilter_GatesMultiPredicateField pins the I-04 fast-path gate.
+// TestIndexCoversFilter_GatesMultiPredicateField pins the CountOnly fast-path gate.
 // Once And.IndexBounds over-approximates (its bounds are a superset of the
 // matches — required for array/multi-key correctness, see And.IndexBounds), the
 // CountOnly fast path, which skips the FilterIter, is sound only when each
 // covered field carries a SINGLE predicate so the bounds equal the matches
 // exactly. A field with two predicates — a same-field $and, an inline
 // {$in,$gte}, or a two-sided range — must NOT be reported as covered. Single
-// predicates and compound point lookups stay covered. See docs/known-issues.md
-// (I-04).
+// predicates and compound point lookups stay covered.
 func TestIndexCoversFilter_GatesMultiPredicateField(t *testing.T) {
 	idxA := &CBOIndex{
 		Info:        &IndexInfo{Name: "a", FieldNames: []string{"a"}},

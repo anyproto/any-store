@@ -16,7 +16,7 @@ import (
 // time, and a rollback of the enclosing scope must unwind those publications
 // so no handle survives over a reverted (freed) catalog entry.
 
-// The I-11 corruption sequence: create a collection inside an ambient tx, roll
+// The corruption sequence: create a collection inside an ambient tx, roll
 // the outer tx back, let a later collection reuse the freed root page, then
 // use the original name again. Pre-fix, the stale handle stayed registered and
 // a write through it landed inside the OTHER collection while IntegrityCheck
@@ -274,7 +274,7 @@ func TestRenameThenDropRollback_HandleHeals(t *testing.T) {
 
 // The dual of the undo tests above: Drop's handle eviction is a COMMIT
 // publication (commonTx.pubs). Evicting at execution time opened the same
-// I-11 corruption through the concurrency side door: a concurrent
+// corruption through the concurrency side door: a concurrent
 // OpenCollection during the uncommitted-drop window re-registered a fresh
 // live handle against the still-committed catalog, the drop's commit freed
 // its root pages, and a later insert through it landed inside whichever

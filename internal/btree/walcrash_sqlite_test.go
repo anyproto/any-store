@@ -2,9 +2,9 @@
 Ported from SQLite: walcrash.test, pager1.test, wal6.test
 Sources:
 
-	/home/dev/work/sqlitec/test/walcrash.test
-	/home/dev/work/sqlitec/test/pager1.test
-	/home/dev/work/sqlitec/test/wal6.test
+	test/walcrash.test
+	test/pager1.test
+	test/wal6.test
 
 Test scenario:
 Ten WAL crash recovery, pager edge case, and MVCC tests:

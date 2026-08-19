@@ -1,6 +1,6 @@
 /*
 Ported from SQLite: walcksum.test
-Source: /home/dev/work/sqlitec/test/walcksum.test
+Source: test/walcksum.test
 
 Test scenario:
 Tests WAL checksum correctness. The original file covers endian-specific checksum

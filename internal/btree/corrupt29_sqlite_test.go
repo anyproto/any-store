@@ -2,12 +2,12 @@
 Ported from SQLite: corrupt2.test, corrupt3.test, corrupt4.test, corrupt6.test, corrupt7.test, corrupt9.test
 Sources:
 
-	/home/dev/work/sqlitec/test/corrupt2.test
-	/home/dev/work/sqlitec/test/corrupt3.test
-	/home/dev/work/sqlitec/test/corrupt4.test
-	/home/dev/work/sqlitec/test/corrupt6.test
-	/home/dev/work/sqlitec/test/corrupt7.test
-	/home/dev/work/sqlitec/test/corrupt9.test
+	test/corrupt2.test
+	test/corrupt3.test
+	test/corrupt4.test
+	test/corrupt6.test
+	test/corrupt7.test
+	test/corrupt9.test
 
 Test scenario:
 Combined corruption tests from six SQLite test files:

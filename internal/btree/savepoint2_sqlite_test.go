@@ -1,9 +1,9 @@
 /*
 Ported from SQLite: savepoint2.test, savepoint6.test, savepoint7.test
 Sources:
-  - /home/dev/work/sqlitec/test/savepoint2.test
-  - /home/dev/work/sqlitec/test/savepoint6.test
-  - /home/dev/work/sqlitec/test/savepoint7.test
+  - test/savepoint2.test
+  - test/savepoint6.test
+  - test/savepoint7.test
 
 Test scenario:
 savepoint7-3.*: Tests savepoint rollback with large (~804-byte) values at

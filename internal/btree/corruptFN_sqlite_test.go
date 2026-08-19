@@ -2,9 +2,9 @@
 Ported from SQLite: corruptI.test, corruptJ.test, corruptL.test
 Sources:
 
-	/home/dev/work/sqlitec/test/corruptI.test
-	/home/dev/work/sqlitec/test/corruptJ.test
-	/home/dev/work/sqlitec/test/corruptL.test
+	test/corruptI.test
+	test/corruptJ.test
+	test/corruptL.test
 
 Test scenario:
 Five corruption test cases from the corruptF-N test group:

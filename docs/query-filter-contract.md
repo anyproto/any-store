@@ -23,7 +23,7 @@ or the exported constructors (`NewComp`, `NewCompValue`, `NewInValue`):
 4. **Two bound channels.** `Filter.IndexBounds` is the WIDE channel: a sound
    over-approximation (superset of every matching doc's index entries) —
    `And` keeps only the first contributing same-field conjunct, which is what
-   keeps array/multi-key seeks correct (docs/known-issues.md I-04).
+   keeps array/multi-key seeks correct.
    `TightIndexBounds` (query/tight_bounds.go) is the TIGHT channel: same-field
    conjuncts interval-intersected via `Bounds.Intersect`, plus an explicit
    `empty` flag for provably-empty value sets. Tight bounds are safe for cost

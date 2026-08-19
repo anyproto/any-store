@@ -28,6 +28,26 @@ import (
 //     between levels. Exposed via EntryCount(L).
 //
 // All methods are safe for concurrent use via atomic operations.
+//
+// # Plan-time only
+//
+// A sketch read may decide a PLAN — which index to pick, what cost to assign,
+// what size to preallocate. It may NOT decide an ANSWER: no caller may treat a
+// zero Estimate as "no rows match" and skip the scan, or return GetDocCount as
+// a query result.
+//
+// The sketch is not snapshot-isolated, so it can disagree with the caller's
+// snapshot in either direction. A write tx mutates the live sketch before it
+// commits, and a rolled-back tx's deltas survive until the next write tx begins
+// (db.resetUncommittedSketches). A peer process's commits arrive only via the
+// advisory reload in db.checkStale, which is fail-soft: a decode error keeps
+// the stale copy. A plan-time read tolerates all of this — a wrong cost means a
+// slower query, and execution still runs against the snapshot. An answer-time
+// read does not: a wrong estimate of zero is a wrong answer.
+//
+// Making an answer-time read safe requires storing sketches in the btree under
+// a versioned key and consulting them through the snapshot. Freshness checks or
+// retries at the call site do not substitute — they only narrow the race.
 type IndexSketch struct {
 	// Buckets holds Levels*Size counts; level L occupies [L*Size:(L+1)*Size].
 	Buckets []uint64
@@ -135,6 +155,9 @@ func (s *IndexSketch) Decrement(level int, value []byte) {
 
 // Estimate returns the estimated count for the given encoded prefix value at the
 // given level. Out-of-range levels return 0.
+//
+// The result is a cost-model hint, never an answer — a zero is not proof that
+// no row matches. See the "Plan-time only" section of the IndexSketch doc.
 func (s *IndexSketch) Estimate(level int, value []byte) uint64 {
 	if !s.validLevel(level) {
 		return 0
@@ -173,6 +196,9 @@ func (s *IndexSketch) DecrementDocCount() {
 }
 
 // GetDocCount atomically returns the collection document count.
+//
+// The result is a cost-model hint (or a statistic to report), never a query
+// answer. See the "Plan-time only" section of the IndexSketch doc.
 func (s *IndexSketch) GetDocCount() uint64 {
 	return s.docCount.Load()
 }

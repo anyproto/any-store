@@ -1,6 +1,6 @@
 /*
 Ported from SQLite: corrupt.test
-Source: /home/dev/work/sqlitec/test/corrupt.test
+Source: test/corrupt.test
 
 Test scenario:
 Tests that the database engine does not crash or segfault when it encounters

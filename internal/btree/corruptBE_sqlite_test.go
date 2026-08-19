@@ -2,10 +2,10 @@
 Ported from SQLite: corruptB.test, corruptC.test, corruptD.test, corruptE.test
 Sources:
 
-	/home/dev/work/sqlitec/test/corruptB.test
-	/home/dev/work/sqlitec/test/corruptC.test
-	/home/dev/work/sqlitec/test/corruptD.test
-	/home/dev/work/sqlitec/test/corruptE.test
+	test/corruptB.test
+	test/corruptC.test
+	test/corruptD.test
+	test/corruptE.test
 
 Test scenario:
 Four corruption test files that exercise corruption detection in the B-tree layer:

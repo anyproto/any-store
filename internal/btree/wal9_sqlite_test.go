@@ -1,7 +1,7 @@
 /*
 Ported from SQLite: wal9.test, wal64k.test
-Source: /home/dev/work/sqlitec/test/wal9.test
-Source: /home/dev/work/sqlitec/test/wal64k.test
+Source: test/wal9.test
+Source: test/wal64k.test
 
 Test scenario:
 wal9.test: Tests a specific bug fix where an assert() failure occurred when a

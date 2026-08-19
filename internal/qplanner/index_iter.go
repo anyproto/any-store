@@ -319,7 +319,7 @@ func (it *IndexIter) skipOffset(n int) (remaining int, err error) {
 // value for an indexed field (the per-element keys of a nested array, and the
 // whole-value-as-tuple key of any multi-key doc). So a key with this prefix
 // exists in a single-field index iff that index has ever held a multi-key
-// (array) entry. See docs/known-issues.md (I-04/I-05).
+// (array) entry.
 var arrayPrefix = []byte{byte(anyenc.TypeArray)}
 
 // arrayPrefixInverted is the array tag for a REVERSE-flagged single-field index.
@@ -395,7 +395,7 @@ func indexProbeAnyMultiKey(cs *CursorSource, fieldReverse bool) (bool, error) {
 //	  value byte is not consulted. An array doc whose values straddle several
 //	  $in bounds is counted once.
 //
-// This is the I-05 fix: there is no peek-then-batch shortcut to misclassify a
+// There is deliberately no peek-then-batch shortcut: it would misclassify a
 // scalar-first bound that also holds multi-key entries.
 func (it *IndexIter) CountEntries() (int, error) {
 	if it.cursor == nil {

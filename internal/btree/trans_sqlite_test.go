@@ -2,9 +2,9 @@
 Ported from SQLite: trans.test, trans2.test, rollback2.test
 Sources:
 
-	/home/dev/work/sqlitec/test/trans.test
-	/home/dev/work/sqlitec/test/trans2.test
-	/home/dev/work/sqlitec/test/rollback2.test
+	test/trans.test
+	test/trans2.test
+	test/rollback2.test
 
 Test scenario:
 Tests transaction commit, rollback, and MVCC read isolation. Covers:

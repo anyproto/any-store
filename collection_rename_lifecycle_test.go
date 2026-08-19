@@ -10,7 +10,7 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 )
 
-// These tests guard the I-16 fix: Rename must re-key the btree namespaces and
+// These tests guard the Rename contract: it must re-key the btree namespaces and
 // the handle registry, not just the catalog metadata. The reopen tests use a
 // raw Open on a temp path (not newFixture) because they must survive a real
 // close/open cycle.
@@ -291,7 +291,7 @@ func TestRename_ThenDrop_NoOrphans(t *testing.T) {
 	require.NoError(t, fx.IntegrityCheck(ctx))
 }
 
-// The closed flag is finally checked by operations (I-11 residual): every op
+// The closed flag is finally checked by operations: every op
 // on a closed/dropped handle fails with ErrCollectionClosed, which also
 // matches ErrCollectionNotFound.
 func TestClosedHandleOpsFail(t *testing.T) {

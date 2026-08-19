@@ -1,6 +1,6 @@
 /*
 Ported from SQLite: wal2.test
-Source: /home/dev/work/sqlitec/test/wal2.test
+Source: test/wal2.test
 
 Test scenario:
 Tests advanced WAL mode behavior. The original file covers wal-index header corruption/recovery,

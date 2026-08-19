@@ -251,9 +251,10 @@ type db struct {
 	// returning its error (and a failed pager commit self-recovers to
 	// pagerOpen), so without this gate a writer beginning in that gap could
 	// still observe the phantom schema publications the unwind is about to
-	// revert — the I-11 corruption class. A tx that registered DDL undos holds
-	// the gate across btree Commit + unwind; newWriteTx passes through it once
-	// after acquiring the write lock. Plain data txs (no undos) skip it.
+	// revert — the stale-handle-over-freed-catalog corruption class. A tx that
+	// registered DDL undos holds the gate across btree Commit + unwind;
+	// newWriteTx passes through it once after acquiring the write lock. Plain
+	// data txs (no undos) skip it.
 	// The rollback and savepoint paths need no gate: their unwind runs while
 	// the btree write lock is still held.
 	ddlUnwindGate sync.Mutex
@@ -503,7 +504,8 @@ func (db *db) checkStale(tx *btree.ReadTx) {
 // See checkStale for the contract. A handle whose collection no longer exists
 // in the snapshot (renamed away or dropped by another process) is invalidated
 // instead of reconciled — reconciling it against an empty index set would
-// publish exactly the unindexed-write corruption of I-16. Each surviving
+// publish exactly the unindexed-write corruption a half-applied rename caused.
+// Each surviving
 // collection is reconciled under its own c.mu and the result published
 // atomically (copy-on-write), so lock-free query readers always observe a
 // complete index generation.
@@ -973,7 +975,7 @@ func (db *db) IntegrityCheck(ctx context.Context) (err error) {
 	// Catalog consistency: every cataloged collection must have its data
 	// namespace. A missing one is the signature of a rename performed by a
 	// pre-fix version (catalog re-keyed to the new name, data left under the
-	// old — see docs/known-issues.md I-16); its data survives as an orphan
+	// old); its data survives as an orphan
 	// namespace but the collection is unopenable until manually repaired.
 	return db.doReadTx(ctx, func(tx *btree.ReadTx) error {
 		names, lErr := db.listCollectionNames(tx)
@@ -983,7 +985,7 @@ func (db *db) IntegrityCheck(ctx context.Context) (err error) {
 		for _, name := range names {
 			if _, nsErr := tx.GetNamespace(name); nsErr != nil {
 				if errors.Is(nsErr, btree.ErrNamespaceNotFound) {
-					return fmt.Errorf("collection %q: data namespace missing (renamed by a pre-fix version, see docs/known-issues.md I-16); its data survives under the pre-rename namespace name", name)
+					return fmt.Errorf("collection %q: data namespace missing (renamed by a pre-fix version); its data survives under the pre-rename namespace name", name)
 				}
 				// Any other failure to resolve the namespace is itself an
 				// integrity problem — never mask it as a clean result.
@@ -1750,13 +1752,13 @@ func (db *db) renameCollection(tx *btree.WriteTx, oldName, newName string) error
 	}
 
 	// Data namespace: hard error if missing — "renaming" only the metadata of
-	// a contents-less collection would recreate the pre-fix I-16 breakage.
+	// a contents-less collection would recreate the pre-fix half-rename breakage.
 	if err = tx.RenameNamespace(oldName, newName); err != nil {
 		if errors.Is(err, btree.ErrNamespaceExists) {
 			return fmt.Errorf("rename %q -> %q: target namespace already exists: %w", oldName, newName, ErrCollectionExists)
 		}
 		if errors.Is(err, btree.ErrNamespaceNotFound) {
-			return fmt.Errorf("rename %q -> %q: data namespace missing (collection likely broken by a pre-fix rename, see docs/known-issues.md I-16): %w", oldName, newName, err)
+			return fmt.Errorf("rename %q -> %q: data namespace missing (collection likely broken by a pre-fix rename): %w", oldName, newName, err)
 		}
 		return err
 	}

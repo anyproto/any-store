@@ -1,6 +1,6 @@
 /*
 Ported from SQLite: btree01.test
-Source: /home/dev/work/sqlitec/test/btree01.test
+Source: test/btree01.test
 
 Test scenario:
 Exercises the b-tree balance() routine. Inserts rows with large blobs into

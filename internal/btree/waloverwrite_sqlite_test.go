@@ -1,6 +1,6 @@
 /*
 Ported from SQLite: waloverwrite.test
-Source: /home/dev/work/sqlitec/test/waloverwrite.test
+Source: test/waloverwrite.test
 
 Test scenario:
 Tests WAL frame overwriting behavior. When the same database page is written
