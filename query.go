@@ -685,7 +685,7 @@ func (q *collQuery) Count(ctx context.Context) (count int, err error) {
 //  1. LimitIter first: the Limit/Offset cutoffs must apply to DISTINCT docs,
 //     not raw entry rows — over a multi-key index LimitIter.Next skips/caps
 //     entries that later collapse in dedup, diverging from Iter
-//     (known-issues I-07). CountDistinct deduplicates before the cutoff.
+//     CountDistinct deduplicates before the cutoff.
 //  2. The covering batch count (IndexIter.CountEntries) handles multi-bound +
 //     multi-key dedup internally via the per-entry value byte.
 //  3. Otherwise the shared generic distinct loop.

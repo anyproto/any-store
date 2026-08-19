@@ -824,8 +824,8 @@ func (pc *pcache) returnPageBuffer(p *page) {
 // permanently — every subsequent call selects the same page 1 and nothing
 // ever spills. Backup hits exactly this: it copies page 1 first and releases
 // it, making it the oldest unpinned dirty page, after which the whole
-// destination accumulated dirty in memory (peak RSS ~ database size; see
-// docs/known-issues.md I-15). SQLite has no such guard because its page 1
+// destination accumulated dirty in memory (peak RSS ~ database size).
+// SQLite has no such guard because its page 1
 // stays pinned for the life of the tx — the same invariant break that
 // motivates pagerStress's explicit page-1 check.
 func (pc *pcache) findSpillVictim() *page {

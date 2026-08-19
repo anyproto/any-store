@@ -217,7 +217,7 @@ func TestAnd(t *testing.T) {
 	})
 }
 
-// TestAndIndexBounds_SameFieldOverApprox pins the I-04 contract: And.IndexBounds
+// TestAndIndexBounds_SameFieldOverApprox pins the contract: And.IndexBounds
 // returns a SOUND OVER-APPROXIMATION (the first contributing conjunct's bounds),
 // NOT the intersection. Intersecting would be unsound for array/multi-key fields
 // (see And.IndexBounds and TestQueryCount_ArrayTwoSidedRange). Here two range
@@ -248,8 +248,8 @@ func TestAndIndexBounds_InAndRange_OverApprox(t *testing.T) {
 
 // TestAndIndexBounds_DisjointConjuncts_OverApproxNotEmpty pins that disjoint
 // conjuncts (no common value) do NOT collapse to empty bounds — they
-// over-approximate to the first conjunct's $in set. The I-04 wrong-answer
-// (CountOnly over-count) is prevented instead at the planner gate
+// over-approximate to the first conjunct's $in set. The CountOnly over-count
+// wrong answer is prevented instead at the planner gate
 // (indexCoversFilter rejects a >1-predicate field) and re-checked end-to-end by
 // TestQueryCount_AndConjunctionLostInCount.
 func TestAndIndexBounds_DisjointConjuncts_OverApproxNotEmpty(t *testing.T) {

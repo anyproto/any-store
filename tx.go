@@ -77,8 +77,8 @@ type commonTx struct {
 	// index/collection created earlier in it. But a rollback then reverts the
 	// on-disk catalog without those maps, leaving handles whose cached root
 	// pages are freed — a later write through such a handle lands on whatever
-	// namespace reuses the page (silent cross-namespace corruption; see
-	// docs/known-issues.md I-11). Undos run in REVERSE order on rollback —
+	// namespace reuses the page (silent cross-namespace corruption).
+	// Undos run in REVERSE order on rollback —
 	// full, failed-commit, or to a savepoint (savepointTx records a mark) —
 	// and are discarded on successful commit. Single-writer state: mutated
 	// only under the btree write lock, like the tx itself; runUndo must also

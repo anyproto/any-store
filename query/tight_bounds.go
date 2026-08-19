@@ -16,7 +16,7 @@ import (
 // whole array independently, so {tags:{$gte:2,$lte:3}} matches {tags:[5,1]}
 // (5>=2 via one element, 1<=3 via another) with NO index entry in [2,3] — a
 // seek narrowed to the intersection silently drops the doc from Iter AND
-// Count (docs/known-issues.md I-04, revert ba92bc7). Tight bounds may drive:
+// Count. Tight bounds may drive:
 //   - cost/selectivity ESTIMATION: always (estimates cannot drop docs);
 //   - actual SEEKS: only when the scanned namespace provably holds no
 //     fan-out (multi-key) entries — the primary-key namespace (array pks are

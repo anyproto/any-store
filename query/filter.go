@@ -407,7 +407,7 @@ func (e And) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 // result must be a SUPERSET of the matching set so the index seek (and Iter)
 // never miss a doc.
 //
-// Intersecting conjunct bounds (the original I-04 fix) is UNSOUND for
+// Intersecting conjunct bounds is UNSOUND for
 // ARRAY/multi-key fields: array filter semantics match each conjunct against
 // the whole array independently, so a doc matches {$gte:2,$lte:3} when one
 // element is >=2 and a DIFFERENT element is <=3 — it need not have any element
@@ -421,7 +421,7 @@ func (e And) Ok(v *anyenc.Value, buf *syncpool.DocBuffer) bool {
 // these over-approx bounds are a strict superset of the matches. It is gated
 // separately: indexCoversFilter rejects a covered field carrying more than one
 // predicate, so the fast path is only taken when bounds exactly equal the
-// matches (a single In/Eq/range per field). See docs/known-issues.md (I-04).
+// matches (a single In/Eq/range per field).
 //
 // Consumers that can prove fan-out entries are absent (pk namespace, indexes
 // with a scalar-proven multikey flag) — or that only ESTIMATE — get the

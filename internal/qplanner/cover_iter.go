@@ -26,7 +26,7 @@ func (it *CoverIter) Next() (key []byte, docId []byte, multiKey bool, err error)
 	// so a multi-bound $in can match the SAME doc through several of its array
 	// values. Tag yielded entries multiKey so the DocDedupIter wrapped around
 	// multi-bound lookups (and any DocDedup consumer) collapses the
-	// cross-bound repeats (I-06). Dedup keys on docId, so a conservative
+	// cross-bound repeats. Dedup keys on docId, so a conservative
 	// index-level true never merges distinct docs. Single-bound lookups can't
 	// straddle bounds, so they keep the zero-cost multiKey=false.
 	if len(it.Bounds) > 1 && !it.multiKeyProbed {

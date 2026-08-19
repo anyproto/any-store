@@ -1679,7 +1679,7 @@ func AllBoundsFixed(bounds query.Bounds) bool {
 //     the fast path skips is exactly what trims the superset to the real
 //     matches (and for ARRAY fields the bounds MUST over-approximate; see
 //     query/filter.go:And.IndexBounds). So reject multi-predicate fields here
-//     and let the FilterIter path handle them. See docs/known-issues.md (I-04).
+//     and let the FilterIter path handle them.
 //
 // Zero-allocation: inline field matching, no maps or slices.
 func indexCoversFilter(idx *CBOIndex, filter query.Filter) bool {

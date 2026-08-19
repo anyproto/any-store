@@ -8739,7 +8739,7 @@ func TestPagerStress_Page1NeverSpilled_RegressionPin(t *testing.T) {
 	// when it is the oldest unpinned dirty page. pagerStress refuses page 1
 	// WITHOUT cleaning it, so a search that returned it would wedge the spill
 	// permanently on page 1 (nothing ever spills — the backup high-water-mark
-	// failure, see docs/known-issues.md I-15 and the page1-exclusion drift
+	// failure; see the page1-exclusion drift
 	// note). It must skip past page 1 to a later victim, or find none.
 	require.Equal(t, uint32(1), p.writerCache.dirtyTail.pgno,
 		"scenario setup: page 1 must be the oldest dirty page")

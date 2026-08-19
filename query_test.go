@@ -106,13 +106,14 @@ func TestCollQuery_Count(t *testing.T) {
 }
 
 // TestQueryCount_AndConjunctionLostInCount is the end-to-end regression pin
-// for I-04: an indexed CountOnly query whose same-field conjuncts are mutually
+// for the lost-conjunct class: an indexed CountOnly query whose same-field
+// conjuncts are mutually
 // exclusive must Count 0, matching Iter. Pre-fix, And.IndexBounds dropped the
 // $gte conjunct and the CountOnly fast path (which skips FilterIter for an
 // index that "covers" the filter) returned 2. The fix gates that fast path:
 // And.IndexBounds over-approximates and indexCoversFilter rejects the
 // 2-predicate field (unit gate: qplanner.TestIndexCoversFilter_GatesMultiPredicateField).
-// This test pins the fix at the public Count API. See docs/known-issues.md (I-04).
+// This test pins the fix at the public Count API.
 func TestQueryCount_AndConjunctionLostInCount(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "i04")
@@ -149,16 +150,16 @@ func TestQueryCount_AndConjunctionLostInCount(t *testing.T) {
 	}
 }
 
-// TestQueryCount_ArrayTwoSidedRange is the fail-before-fix gate for the I-04
-// follow-up: a two-sided range ($gte AND $lte) over an ARRAY/multi-key field.
+// TestQueryCount_ArrayTwoSidedRange is the fail-before-fix gate for the
+// array-range follow-up: a two-sided range ($gte AND $lte) over an
+// ARRAY/multi-key field.
 // Array filter semantics match each conjunct against the whole array
 // independently, so a doc matches if SOME element is >=lo AND SOME (possibly
 // different) element is <=hi. INTERSECTING the conjunct bounds (the original
-// I-04 fix) narrows the seek to [lo,hi] and misses docs like [5,1,4] (5>=2,
+// approach) narrows the seek to [lo,hi] and misses docs like [5,1,4] (5>=2,
 // 1<=3, but no element in [2,3]) — under-counting Count AND Iter. The fix makes
 // And.IndexBounds over-approximate (sound seek superset) and gates the CountOnly
 // fast path so it is not taken when bounds don't exactly capture the filter.
-// See docs/known-issues.md (I-04).
 func TestQueryCount_ArrayTwoSidedRange(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "arr_range")
@@ -198,13 +199,14 @@ func TestQueryCount_ArrayTwoSidedRange(t *testing.T) {
 	assert.Equal(t, 3, n, "Iter must agree with Count")
 }
 
-// TestQueryCount_ScalarFirstCrossBoundDedup is the fail-before-fix gate for
-// I-05: a mixed scalar/array index where a multi-key doc's array values
+// TestQueryCount_ScalarFirstCrossBoundDedup is the fail-before-fix gate for the
+// scalar-first cross-bound shape: a mixed scalar/array index where a multi-key
+// doc's array values
 // straddle two $in bounds and each bound's first entry is scalar. The pre-fix
 // countEntriesWithDedup peek-then-batch shortcut sees the scalar first entry,
 // batch-counts the whole bound (including the array doc's multi-key entry),
 // and double-counts the array doc → Count=4. The true distinct-doc count is 3,
-// and Iter returns 3. See docs/known-issues.md (I-05).
+// and Iter returns 3.
 func TestQueryCount_ScalarFirstCrossBoundDedup(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "i05")
@@ -224,7 +226,7 @@ func TestQueryCount_ScalarFirstCrossBoundDedup(t *testing.T) {
 
 	explain, err := coll.Find(filter).IndexHint(hint).Explain(ctx)
 	require.NoError(t, err)
-	require.Contains(t, explain.Sql, "IndexScan", "I-05 reproducer must take the index path; got: %s", explain.Sql)
+	require.Contains(t, explain.Sql, "IndexScan", "reproducer must take the index path; got: %s", explain.Sql)
 
 	assertQueryCount(t, coll.Find(filter).IndexHint(hint), 3)
 
@@ -240,12 +242,12 @@ func TestQueryCount_ScalarFirstCrossBoundDedup(t *testing.T) {
 }
 
 // TestQueryCount_UniqueIndex_MultiKeyData_DedupsCorrectly is the fail-before-fix
-// gate for I-06: a unique single-field index CAN hold an array doc (its elements
+// gate for the unique-index multi-key shape: a unique single-field index CAN
+// hold an array doc (its elements
 // are unique across docs). A multi-bound $in whose values are the doc's array
 // elements routes through the unique CoverIter shortcut, which pre-fix hardcoded
 // multiKey=false so DocDedup never collapsed the cross-bound repeats → Count=2.
-// The true distinct-doc count is 1, and Iter returns 1. See docs/known-issues.md
-// (I-06).
+// The true distinct-doc count is 1, and Iter returns 1.
 func TestQueryCount_UniqueIndex_MultiKeyData_DedupsCorrectly(t *testing.T) {
 	fx := newFixture(t)
 	coll, err := fx.CreateCollection(ctx, "i06")
@@ -262,7 +264,7 @@ func TestQueryCount_UniqueIndex_MultiKeyData_DedupsCorrectly(t *testing.T) {
 
 	explain, err := coll.Find(filter).IndexHint(hint).Explain(ctx)
 	require.NoError(t, err)
-	require.Contains(t, explain.Sql, "CoverLookup", "I-06 reproducer must take the unique CoverIter path; got: %s", explain.Sql)
+	require.Contains(t, explain.Sql, "CoverLookup", "reproducer must take the unique CoverIter path; got: %s", explain.Sql)
 
 	assertQueryCount(t, coll.Find(filter).IndexHint(hint), 1)
 
@@ -1239,7 +1241,7 @@ func TestQuery_ReverseMultiIntervalOrder_FullScan(t *testing.T) {
 	assert.Equal(t, []int{9, 5, 1}, got)
 }
 
-// TestQueryCount_LimitOffsetMultiKey is the known-issues I-07 regression gate:
+// TestQueryCount_LimitOffsetMultiKey is the regression gate:
 // Count with Limit/Offset over a multi-key index must agree with Iter. The
 // LimitIter cutoff used to apply to raw index-entry rows while doc dedup ran
 // only in the consumer loop, so limit capped entry-rows that then collapsed

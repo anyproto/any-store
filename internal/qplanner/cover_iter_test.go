@@ -77,7 +77,8 @@ func TestCoverIter_Next_PrefixMismatch(t *testing.T) {
 	assert.Nil(t, docId, "seek finds 'z' which lacks prefix 'b' → skip")
 }
 
-// TestCoverIter_MultiBound_MultiKey_SetsMultiKeyFlag pins the I-06 fix: a
+// TestCoverIter_MultiBound_MultiKey_SetsMultiKeyFlag pins the multi-key tagging
+// contract: a
 // multi-bound CoverIter over an index that holds an array (0x06) entry yields
 // multiKey=true (so DocDedup collapses cross-bound repeats); single-bound and
 // pure-scalar multi-bound keep the zero-cost multiKey=false.
