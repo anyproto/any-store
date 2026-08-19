@@ -1,6 +1,6 @@
 /*
 Ported from SQLite: insert.test, delete.test, delete3.test, delete4.test, zeroblob.test
-Source: /home/dev/work/sqlitec/test/delete.test, delete3.test, delete4.test, zeroblob.test
+Source: test/delete.test, delete3.test, delete4.test, zeroblob.test
 
 Test scenario:
 Exercises bulk insert, selective delete, large-value overflow pages, rollback of

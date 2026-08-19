@@ -1,6 +1,6 @@
 /*
 Ported from SQLite: wal3.test
-Source: /home/dev/work/sqlitec/test/wal3.test
+Source: test/wal3.test
 
 Test scenario:
 Tests WAL mode behavior when a rollback or savepoint rollback occurs,

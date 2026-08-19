@@ -2784,7 +2784,7 @@ already holds.
 ### Drift: WAL Recovery Does Not Pre Seed Read Mark Slot 1
 - **Category:** changed-logic  -  **Severity:** low
 - **Affected functions:** `wal.go:*wal.recoverLocked`
-  (`/Users/roma/anytype/any-store/internal/btree/wal.go:2006-2009`).
+  (`internal/btree/wal.go`, `recoverLocked`).
 
 After recovery SQLite seeds read-mark slot 1 with the recovered `mxFrame` so the first reader can immediately
 reuse it: `for(i=1;i<WAL_NREADER;i++){ ... if(i==1 && pWal->hdr.mxFrame){ pInfo->aReadMark[i]=pWal->hdr.mxFrame; } else { pInfo->aReadMark[i]=READMARK_NOT_USED; } ... }` (`wal.c:1576-1583`). Go's `recoverLocked`

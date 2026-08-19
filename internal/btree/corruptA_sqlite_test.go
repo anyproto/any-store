@@ -1,6 +1,6 @@
 /*
 Ported from SQLite: corruptA.test
-Source: /home/dev/work/sqlitec/test/corruptA.test
+Source: test/corruptA.test
 
 Test scenario:
 Tests that the database engine detects corrupt database file headers and returns

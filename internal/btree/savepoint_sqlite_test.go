@@ -1,6 +1,6 @@
 /*
 Ported from SQLite: savepoint.test
-Source: /home/dev/work/sqlitec/test/savepoint.test
+Source: test/savepoint.test
 
 Test scenario:
 Tests the SAVEPOINT, RELEASE, and ROLLBACK TO commands. Covers basic

@@ -1,9 +1,9 @@
 package btree
 
-// This file is a port of SQLite's online-backup API from
-// /home/dev/work/sqlitec/src/backup.c. Each function is annotated with
-// its C counterpart. Intentional drift from SQLite is documented in
-// any-store-tests:docs/any-store/btree/plans/2026-04-22-sqlite-backup-port.md under "Intentional DRIFT".
+// This file is a port of SQLite's online-backup API from src/backup.c. Each
+// function is annotated with its C counterpart. Intentional drift from SQLite
+// is documented under "Intentional DRIFT" in
+// any-store-tests:docs/any-store/btree/plans/2026-04-22-sqlite-backup-port.md.
 
 import (
 	"errors"

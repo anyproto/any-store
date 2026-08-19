@@ -12,8 +12,11 @@ Bump this file when re-syncing against a newer upstream.
   diverge on hash algorithm — see `specs/integrity.md`).
 
 Most ported sites in this package cite SQLite source filenames inline
-(e.g. `wal.c:3022-3056`, `pager.c:5507`). When updating to a newer SQLite
-release, grep for those references and re-validate behavior.
+(e.g. `wal.c:3022-3056`, `pager.c:5507`). Ported test files cite their origin
+the same way, rooted at the SQLite source tree (`test/wal.test`,
+`src/backup.c`) — never at a local checkout path, so the citation means the
+same thing on every machine. When updating to a newer SQLite release, grep for
+those references and re-validate behavior.
 
 ## SQLCipher
 

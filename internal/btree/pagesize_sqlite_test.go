@@ -1,6 +1,6 @@
 /*
 Ported from SQLite: pagesize.test
-Source: /home/dev/work/sqlitec/test/pagesize.test
+Source: test/pagesize.test
 
 Test scenario:
 Tests database operations across all valid page sizes {512, 1024, 2048, 4096,

@@ -1,6 +1,6 @@
 /*
 Ported from SQLite: wal.test
-Source: /home/dev/work/sqlitec/test/wal.test
+Source: test/wal.test
 
 Test scenario:
 Exercises WAL (Write-Ahead Logging) mode behavior including basic WAL file
