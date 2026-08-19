@@ -3,7 +3,7 @@ module github.com/anyproto/any-store/cmd/any-store-cli
 go 1.24.0
 
 require (
-	github.com/anyproto/any-store v0.4.4
+	github.com/anyproto/any-store v1.0.1
 	github.com/fatih/color v1.18.0
 	github.com/peterh/liner v1.2.2
 	github.com/robertkrimen/otto v0.5.1
@@ -23,7 +23,7 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
-	github.com/valyala/fastjson v1.6.7 // indirect
+	github.com/valyala/fastjson v1.6.10 // indirect
 	golang.org/x/exp v0.0.0-20251219203646-944ab1f22d93 // indirect
 	golang.org/x/sys v0.40.0 // indirect
 	golang.org/x/text v0.22.0 // indirect
