@@ -188,6 +188,9 @@ func Open(ctx context.Context, path string, config *Config) (DB, error) {
 		if errors.Is(err, btree.ErrPageSlabNotInitialized) {
 			return nil, ErrPageBufferNotInitialized
 		}
+		if errors.Is(err, btree.ErrSQLiteFormat) {
+			return nil, ErrV1Database
+		}
 		return nil, err
 	}
 	// ContinueOnIntegrityError only applies to checksum mode. AEAD mode
