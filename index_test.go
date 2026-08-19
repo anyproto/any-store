@@ -1,6 +1,7 @@
 package anystore
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -254,4 +255,52 @@ func Benchmark_fillKeysBuf(b *testing.B) {
 		}
 	})
 
+}
+
+// TestCollection_GetIndexes_FlagsRoundTrip guards the persisted index metadata
+// against the reader: Sparse and Unique are stored in separate columns and must
+// come back on their own fields after a reopen. Reading both from one column
+// silently reports every sparse index as unique and every non-sparse unique
+// index as non-unique, which breaks anything that reproduces index definitions.
+func TestCollection_GetIndexes_FlagsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "any-store-test.db")
+
+	want := []IndexInfo{
+		{Name: "plain", Fields: []string{"a"}},
+		{Name: "sparse", Fields: []string{"b"}, Sparse: true},
+		{Name: "unique", Fields: []string{"c"}, Unique: true},
+		{Name: "both", Fields: []string{"d"}, Sparse: true, Unique: true},
+	}
+
+	db, err := Open(ctx, path, nil)
+	require.NoError(t, err)
+	coll, err := db.CreateCollection(ctx, "test")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, want...))
+	require.NoError(t, coll.Close())
+	require.NoError(t, db.Close())
+
+	db, err = Open(ctx, path, nil)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, db.Close())
+	}()
+	coll, err = db.OpenCollection(ctx, "test")
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, coll.Close())
+	}()
+
+	got := make(map[string]IndexInfo)
+	for _, idx := range coll.GetIndexes() {
+		got[idx.Info().Name] = idx.Info()
+	}
+	require.Len(t, got, len(want))
+	for _, w := range want {
+		g, ok := got[w.Name]
+		require.True(t, ok, "index %s missing after reopen", w.Name)
+		assert.Equal(t, w.Fields, g.Fields, "index %s: fields", w.Name)
+		assert.Equal(t, w.Sparse, g.Sparse, "index %s: sparse", w.Name)
+		assert.Equal(t, w.Unique, g.Unique, "index %s: unique", w.Name)
+	}
 }
