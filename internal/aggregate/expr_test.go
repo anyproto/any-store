@@ -1194,6 +1194,10 @@ func TestExprEvalAllocFree(t *testing.T) {
 		{"replaceAll no match", `{"$replaceAll": {"input": "$csv", "find": "zz", "replacement": "A"}}`},
 		{"split", `{"$split": ["$csv", ","]}`},
 		{"split no match", `{"$split": ["$csv", ";"]}`},
+		{"strLenBytes", `{"$strLenBytes": "$s1"}`},
+		{"strLenCP", `{"$strLenCP": "$s1"}`},
+		{"size", `{"$size": "$arr"}`},
+		{"size of split", `{"$size": {"$split": ["$csv", ","]}}`},
 		{"trim default set", `{"$trim": {"input": "$pad"}}`},
 		{"trim chars set", `{"$trim": {"input": "$csv", "chars": "aélon"}}`},
 		{"ltrim", `{"$ltrim": {"input": "$pad"}}`},
@@ -1405,6 +1409,42 @@ func BenchmarkSplitExprEval(b *testing.B) {
 		b.Fatal(err)
 	}
 	doc := anyenc.MustParseJson(`{"csv": "alpha,beta,gamma,delta,epsilon"}`)
+	a := &anyenc.Arena{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		a.Reset()
+		if v, err := e.Eval(a, doc); err != nil || v == nil {
+			b.Fatal(v, err)
+		}
+	}
+}
+
+// BenchmarkStrLenExprEval counts code points of a multibyte string.
+func BenchmarkStrLenExprEval(b *testing.B) {
+	e, err := ParseExpr(anyenc.MustParseJson(`{"$strLenCP": "$s"}`))
+	if err != nil {
+		b.Fatal(err)
+	}
+	doc := anyenc.MustParseJson(`{"s": "héllo → wörld → 0123456789"}`)
+	a := &anyenc.Arena{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		a.Reset()
+		if v, err := e.Eval(a, doc); err != nil || v == nil {
+			b.Fatal(v, err)
+		}
+	}
+}
+
+// BenchmarkSizeExprEval counts the lines of a string via $size over $split.
+func BenchmarkSizeExprEval(b *testing.B) {
+	e, err := ParseExpr(anyenc.MustParseJson(`{"$size": {"$split": ["$notes", "\n"]}}`))
+	if err != nil {
+		b.Fatal(err)
+	}
+	doc := anyenc.MustParseJson(`{"notes": "alpha\nbeta\ngamma\ndelta\nepsilon"}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
 	b.ResetTimer()
