@@ -677,8 +677,9 @@ func (e *SplitExpr) String() string { return opString("$split", []Expr{e.Input, 
 
 // StrLenExpr evaluates $strLenBytes/$strLenCP: the length of the string
 // operand in UTF-8 bytes or code points. A missing, null, or non-string
-// operand → null (Mongo errors for non-strings; no-error-channel policy, see
-// evalNumber).
+// operand → null, and so is a $strLenCP operand that is not valid UTF-8
+// (Mongo errors for both; no-error-channel policy, see evalNumber).
+// $strLenBytes counts bytes verbatim, valid UTF-8 or not, as Mongo does.
 type StrLenExpr struct {
 	CP  bool // count code points ($strLenCP) instead of bytes ($strLenBytes)
 	Arg Expr
@@ -711,6 +712,9 @@ func (e *StrLenExpr) Eval(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, er
 	}
 	b := v.GetStringBytes()
 	if e.CP {
+		if !utf8.Valid(b) {
+			return a.NewNull(), nil
+		}
 		return a.NewNumberInt(utf8.RuneCount(b)), nil
 	}
 	return a.NewNumberInt(len(b)), nil

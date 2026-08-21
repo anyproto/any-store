@@ -766,6 +766,18 @@ func TestStrLenExprEval(t *testing.T) {
 	t.Run("nests with other operators", func(t *testing.T) {
 		assert.Equal(t, float64(7), num(t, `{"$strLenCP": {"$concat": ["$s", "-", "$s"]}}`))
 	})
+	t.Run("invalid UTF-8: $strLenCP is null, $strLenBytes counts bytes", func(t *testing.T) {
+		// Not representable in JSON: build the doc with raw string bytes.
+		a := &anyenc.Arena{}
+		bad := a.NewObject()
+		bad.Set("bad", a.NewStringBytes([]byte{0xff, 0xfe, 'a'}))
+		v := evalExprOn(t, `{"$strLenCP": "$bad"}`, bad)
+		require.NotNil(t, v)
+		assert.Equal(t, anyenc.TypeNull, v.Type())
+		v = evalExprOn(t, `{"$strLenBytes": "$bad"}`, bad)
+		require.Equal(t, anyenc.TypeNumber, v.Type())
+		assert.Equal(t, float64(3), v.GetFloat64())
+	})
 }
 
 func TestSizeExprEval(t *testing.T) {
