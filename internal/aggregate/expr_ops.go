@@ -21,34 +21,37 @@ var exprOpParsers map[string]func(*anyenc.Value) (Expr, error)
 
 func init() {
 	exprOpParsers = map[string]func(*anyenc.Value) (Expr, error){
-		"$add":        func(v *anyenc.Value) (Expr, error) { return parseArith(OpAdd, v) },
-		"$subtract":   func(v *anyenc.Value) (Expr, error) { return parseArith(OpSubtract, v) },
-		"$multiply":   func(v *anyenc.Value) (Expr, error) { return parseArith(OpMultiply, v) },
-		"$divide":     func(v *anyenc.Value) (Expr, error) { return parseArith(OpDivide, v) },
-		"$abs":        parseAbs,
-		"$round":      parseRound,
-		"$concat":     parseConcat,
-		"$replaceOne": parseReplaceOne,
-		"$replaceAll": parseReplaceAll,
-		"$split":      parseSplit,
-		"$trim":       func(v *anyenc.Value) (Expr, error) { return parseTrim(TrimBoth, v) },
-		"$ltrim":      func(v *anyenc.Value) (Expr, error) { return parseTrim(TrimLeft, v) },
-		"$rtrim":      func(v *anyenc.Value) (Expr, error) { return parseTrim(TrimRight, v) },
-		"$cond":       parseCond,
-		"$switch":     parseSwitch,
-		"$ifNull":     parseIfNull,
-		"$eq":         func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpEq, v) },
-		"$ne":         func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpNe, v) },
-		"$gt":         func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpGt, v) },
-		"$gte":        func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpGte, v) },
-		"$lt":         func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpLt, v) },
-		"$lte":        func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpLte, v) },
-		"$cmp":        func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpCmp, v) },
-		"$dateAdd":    parseDateAdd,
-		"$dateDiff":   parseDateDiff,
-		"$dateTrunc":  parseDateTrunc,
-		"$year":       func(v *anyenc.Value) (Expr, error) { return parseDatePart(partYear, v) },
-		"$week":       func(v *anyenc.Value) (Expr, error) { return parseDatePart(partWeek, v) },
+		"$add":         func(v *anyenc.Value) (Expr, error) { return parseArith(OpAdd, v) },
+		"$subtract":    func(v *anyenc.Value) (Expr, error) { return parseArith(OpSubtract, v) },
+		"$multiply":    func(v *anyenc.Value) (Expr, error) { return parseArith(OpMultiply, v) },
+		"$divide":      func(v *anyenc.Value) (Expr, error) { return parseArith(OpDivide, v) },
+		"$abs":         parseAbs,
+		"$round":       parseRound,
+		"$concat":      parseConcat,
+		"$replaceOne":  parseReplaceOne,
+		"$replaceAll":  parseReplaceAll,
+		"$split":       parseSplit,
+		"$trim":        func(v *anyenc.Value) (Expr, error) { return parseTrim(TrimBoth, v) },
+		"$ltrim":       func(v *anyenc.Value) (Expr, error) { return parseTrim(TrimLeft, v) },
+		"$rtrim":       func(v *anyenc.Value) (Expr, error) { return parseTrim(TrimRight, v) },
+		"$strLenBytes": func(v *anyenc.Value) (Expr, error) { return parseStrLen(false, v) },
+		"$strLenCP":    func(v *anyenc.Value) (Expr, error) { return parseStrLen(true, v) },
+		"$size":        parseSize,
+		"$cond":        parseCond,
+		"$switch":      parseSwitch,
+		"$ifNull":      parseIfNull,
+		"$eq":          func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpEq, v) },
+		"$ne":          func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpNe, v) },
+		"$gt":          func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpGt, v) },
+		"$gte":         func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpGte, v) },
+		"$lt":          func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpLt, v) },
+		"$lte":         func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpLte, v) },
+		"$cmp":         func(v *anyenc.Value) (Expr, error) { return parseCompare(CmpCmp, v) },
+		"$dateAdd":     parseDateAdd,
+		"$dateDiff":    parseDateDiff,
+		"$dateTrunc":   parseDateTrunc,
+		"$year":        func(v *anyenc.Value) (Expr, error) { return parseDatePart(partYear, v) },
+		"$week":        func(v *anyenc.Value) (Expr, error) { return parseDatePart(partWeek, v) },
 	}
 }
 
@@ -671,6 +674,80 @@ func (e *SplitExpr) Eval(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, err
 }
 
 func (e *SplitExpr) String() string { return opString("$split", []Expr{e.Input, e.Delim}) }
+
+// StrLenExpr evaluates $strLenBytes/$strLenCP: the length of the string
+// operand in UTF-8 bytes or code points. A missing, null, or non-string
+// operand → null, and so is a $strLenCP operand that is not valid UTF-8
+// (Mongo errors for both; no-error-channel policy, see evalNumber).
+// $strLenBytes counts bytes verbatim, valid UTF-8 or not, as Mongo does.
+type StrLenExpr struct {
+	CP  bool // count code points ($strLenCP) instead of bytes ($strLenBytes)
+	Arg Expr
+}
+
+func parseStrLen(cp bool, v *anyenc.Value) (Expr, error) {
+	e := &StrLenExpr{CP: cp}
+	args, err := parseOperands(e.op(), v, 1, 1)
+	if err != nil {
+		return nil, err
+	}
+	e.Arg = args[0]
+	return e, nil
+}
+
+func (e *StrLenExpr) op() string {
+	if e.CP {
+		return "$strLenCP"
+	}
+	return "$strLenBytes"
+}
+
+func (e *StrLenExpr) Eval(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, error) {
+	v, err := e.Arg.Eval(a, doc)
+	if err != nil {
+		return nil, err
+	}
+	if v == nil || v.Type() != anyenc.TypeString {
+		return a.NewNull(), nil
+	}
+	b := v.GetStringBytes()
+	if e.CP {
+		if !utf8.Valid(b) {
+			return a.NewNull(), nil
+		}
+		return a.NewNumberInt(utf8.RuneCount(b)), nil
+	}
+	return a.NewNumberInt(len(b)), nil
+}
+
+func (e *StrLenExpr) String() string { return opString(e.op(), []Expr{e.Arg}) }
+
+// SizeExpr evaluates $size: the number of elements in its array operand. A
+// missing, null, or non-array operand → null (Mongo errors; no-error-channel
+// policy, see evalNumber).
+type SizeExpr struct{ Arg Expr }
+
+func parseSize(v *anyenc.Value) (Expr, error) {
+	args, err := parseOperands("$size", v, 1, 1)
+	if err != nil {
+		return nil, err
+	}
+	return &SizeExpr{Arg: args[0]}, nil
+}
+
+func (e *SizeExpr) Eval(a *anyenc.Arena, doc *anyenc.Value) (*anyenc.Value, error) {
+	v, err := e.Arg.Eval(a, doc)
+	if err != nil {
+		return nil, err
+	}
+	if v == nil || v.Type() != anyenc.TypeArray {
+		return a.NewNull(), nil
+	}
+	items, _ := v.Array()
+	return a.NewNumberInt(len(items)), nil
+}
+
+func (e *SizeExpr) String() string { return opString("$size", []Expr{e.Arg}) }
 
 // TrimMode selects which side(s) $trim/$ltrim/$rtrim strip.
 type TrimMode uint8
