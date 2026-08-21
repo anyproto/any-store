@@ -511,6 +511,9 @@ func TestParseExprOperators(t *testing.T) {
 			{`{"$trim": {"input": "$a"}}`, &TrimExpr{}},
 			{`{"$ltrim": {"input": "$a", "chars": "x"}}`, &TrimExpr{}},
 			{`{"$rtrim": {"input": "$a"}}`, &TrimExpr{}},
+			{`{"$strLenBytes": ["$a"]}`, &StrLenExpr{}},
+			{`{"$strLenCP": "$a"}`, &StrLenExpr{}},
+			{`{"$size": ["$a"]}`, &SizeExpr{}},
 			{`{"$cond": ["$a", 1, 2]}`, &CondExpr{}},
 			{`{"$cond": {"if": "$a", "then": 1, "else": 2}}`, &CondExpr{}},
 			{`{"$switch": {"branches": [{"case": "$a", "then": 1}]}}`, &SwitchExpr{}},
@@ -554,6 +557,9 @@ func TestParseExprOperators(t *testing.T) {
 			{`{"$trim": {"input": "$a"}}`, `{$trim:{input:$a}}`},
 			{`{"$ltrim": {"input": "$a"}}`, `{$ltrim:{input:$a}}`},
 			{`{"$rtrim": {"input": "$a", "chars": "é "}}`, `{$rtrim:{input:$a,chars:"é "}}`},
+			{`{"$strLenBytes": "$a"}`, `{$strLenBytes:[$a]}`},
+			{`{"$strLenCP": "$a"}`, `{$strLenCP:[$a]}`},
+			{`{"$size": {"$split": ["$a", "-"]}}`, `{$size:[{$split:[$a,"-"]}]}`},
 			// Both $cond spellings render the canonical array form.
 			{`{"$cond": [{"$lt": ["$a", 1]}, "$a", "$b"]}`, `{$cond:[{$lt:[$a,1]},$a,$b]}`},
 			{`{"$cond": {"if": "$a", "then": 1, "else": 2}}`, `{$cond:[$a,1,2]}`},
@@ -893,6 +899,18 @@ func TestPipelineParseError(t *testing.T) {
 			json:     `[{"$project":{"a":{"$abs":[1,2]}}}]`,
 			wantPath: "0.$project.a.$abs", wantOp: "$abs",
 			wantReason: "$abs requires exactly 1 operand, got 2",
+		},
+		{
+			name:     "$size wrong arity",
+			json:     `[{"$project":{"a":{"$size":["$x","$y"]}}}]`,
+			wantPath: "0.$project.a.$size", wantOp: "$size",
+			wantReason: "$size requires exactly 1 operand, got 2",
+		},
+		{
+			name:     "$strLenCP wrong arity",
+			json:     `[{"$project":{"a":{"$strLenCP":[]}}}]`,
+			wantPath: "0.$project.a.$strLenCP", wantOp: "$strLenCP",
+			wantReason: "$strLenCP requires exactly 1 operand, got 0",
 		},
 		{
 			name:     "$cond array wrong arity",
