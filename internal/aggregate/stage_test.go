@@ -369,7 +369,7 @@ func TestStreamingStagesAllocFree(t *testing.T) {
 	}
 	res := testing.Benchmark(func(b *testing.B) {
 		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			v, err := root.Next(ctx)
 			if err != nil || v == nil {
 				b.Fatal(v, err)
@@ -406,7 +406,7 @@ func TestMatchExprAllocFree(t *testing.T) {
 	}
 	res := testing.Benchmark(func(b *testing.B) {
 		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			v, err := root.Next(ctx)
 			if err != nil || v == nil {
 				b.Fatal(v, err)
@@ -426,8 +426,7 @@ func BenchmarkMatchExprStage(b *testing.B) {
 	defer root.Close()
 	ctx := newTestCtx()
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		v, err := root.Next(ctx)
 		if err != nil || v == nil {
 			b.Fatal(v, err)

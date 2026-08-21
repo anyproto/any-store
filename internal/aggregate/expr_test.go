@@ -1233,7 +1233,7 @@ func TestExprEvalAllocFree(t *testing.T) {
 			}
 			res := testing.Benchmark(func(b *testing.B) {
 				b.ReportAllocs()
-				for i := 0; i < b.N; i++ {
+				for b.Loop() {
 					a.Reset()
 					v, err := e.Eval(a, doc)
 					if err != nil || v == nil {
@@ -1254,8 +1254,7 @@ func BenchmarkArithExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"a": 3, "b": 4}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
@@ -1279,8 +1278,7 @@ func BenchmarkFieldRefEval(b *testing.B) {
 			}
 			a := &anyenc.Arena{}
 			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				a.Reset()
 				if v, err := e.Eval(a, doc); err != nil || v == nil {
 					b.Fatal(v, err)
@@ -1298,8 +1296,7 @@ func BenchmarkCondExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"a": 3, "b": 4}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
@@ -1319,8 +1316,7 @@ func BenchmarkSwitchExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"a": 5}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
@@ -1337,8 +1333,7 @@ func BenchmarkDateAddExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"d": {"$date": "2026-03-28T12:00:00Z"}}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
@@ -1356,8 +1351,7 @@ func BenchmarkDateDiffExprEval(b *testing.B) {
 		`{"d": {"$date": "2026-03-28T12:00:00Z"}, "d2": {"$date": "2026-08-05T06:00:00Z"}}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
@@ -1374,8 +1368,7 @@ func BenchmarkReplaceOneExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"rel": "x://longer-prefixed-identifier-value-0123456789"}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
@@ -1393,8 +1386,7 @@ func BenchmarkReplaceAllExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"s": "one://two://three://tail-0123456789"}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
@@ -1411,8 +1403,7 @@ func BenchmarkSplitExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"csv": "alpha,beta,gamma,delta,epsilon"}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if v, err := e.Eval(a, doc); err != nil || v == nil {
 			b.Fatal(v, err)
@@ -1429,8 +1420,7 @@ func BenchmarkStrLenExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"s": "héllo → wörld → 0123456789"}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if v, err := e.Eval(a, doc); err != nil || v == nil {
 			b.Fatal(v, err)
@@ -1447,8 +1437,7 @@ func BenchmarkSizeExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"notes": "alpha\nbeta\ngamma\ndelta\nepsilon"}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if v, err := e.Eval(a, doc); err != nil || v == nil {
 			b.Fatal(v, err)
@@ -1465,8 +1454,7 @@ func BenchmarkTrimExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"s": "\t  héllo wörld \r\n "}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
@@ -1482,8 +1470,7 @@ func BenchmarkConcatExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"s1": "héllo → w", "s2": "0123456789"}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
