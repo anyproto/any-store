@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -419,5 +420,194 @@ func TestVectorIndex_Reopen(t *testing.T) {
 		for j := range post {
 			assert.Equal(t, pre[i][j].DocId, post[j].DocId, "result drift after reopen q%d", i)
 		}
+	}
+}
+
+// ---- $knn driver/probe plan duality ---------------------------------------
+
+// knnPlanHints force each $knn plan form: the vector index name forces the ANN
+// driver, the pk field the pk probe, a secondary index name its probe.
+var knnPlanHints = []struct {
+	name string
+	hint []IndexHint
+}{
+	{"cbo", nil},
+	{"driver", []IndexHint{{IndexName: "emb", Boost: 1 << 30}}},
+	{"probe-ids", []IndexHint{{IndexName: "id", Boost: 1 << 30}}},
+	{"probe-a", []IndexHint{{IndexName: "a", Boost: 1 << 30}}},
+}
+
+// knnProbeColl builds a brute-or-ANN collection with a secondary index on "a".
+func knnProbeColl(t *testing.T, mode VectorMode, n, dim int) (Collection, [][]float32) {
+	fx := newFixture(t)
+	t.Cleanup(fx.finish)
+	coll, err := fx.CreateCollection(ctx, "knnprobe")
+	require.NoError(t, err)
+	makeVectorIndex(t, coll, mode, dim)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
+	vecs := vrand(n, dim, 7)
+	for i, vc := range vecs {
+		doc := anyenc.MustParseJson(vecDocJSON(i, vc))
+		doc.Set("a", anyenc.MustParseJson(fmt.Sprintf("%d", i%10)))
+		require.NoError(t, coll.Insert(ctx, doc))
+	}
+	return coll, vecs
+}
+
+func collectKnn(t *testing.T, q Query) (ids []int, dists []float32) {
+	t.Helper()
+	iter, err := q.Iter(ctx)
+	require.NoError(t, err)
+	defer iter.Close()
+	for iter.Next() {
+		doc, derr := iter.Doc()
+		require.NoError(t, derr)
+		ids = append(ids, doc.Value().GetInt("id"))
+		dists = append(dists, iter.Distance())
+	}
+	require.NoError(t, iter.Err())
+	return ids, dists
+}
+
+// knnCond builds $knn + restriction conditions programmatically (the
+// production construction path).
+func knnCond(qv []float32, k int, extra query.Filter) query.Filter {
+	knn := vectorKnnFilter(qv, k)
+	if extra == nil {
+		return knn
+	}
+	return query.And{knn, extra}
+}
+
+func idInFilter(ids ...int) query.Filter {
+	vals := make([]*anyenc.Value, len(ids))
+	for i, id := range ids {
+		vals[i] = anyenc.MustParseJson(fmt.Sprintf("%d", id))
+	}
+	return query.Key{Path: []string{"id"}, Filter: query.NewInValue(vals...)}
+}
+
+// On the brute-force backend the driver is exact too, so every plan must
+// produce identical rows, order, and distances.
+func TestKnnProbe_BruteDifferential(t *testing.T) {
+	const dim, n, k = 12, 300, 8
+	coll, vecs := knnProbeColl(t, VectorModeBruteForce, n, dim)
+
+	conds := []query.Filter{
+		knnCond(vecs[5], k, idInFilter(3, 15, 27, 42, 55, 63, 78, 81, 99, 120, 150, 999)),
+		knnCond(vecs[5], k, query.MustParseCondition(`{"a":3}`)),
+		knnCond(vecs[9], k, nil),
+	}
+	for ci, cond := range conds {
+		var baseIds []int
+		var baseDists []float32
+		for _, p := range knnPlanHints {
+			q := coll.Find(cond)
+			if len(p.hint) > 0 {
+				q = q.IndexHint(p.hint...)
+			}
+			ids, dists := collectKnn(t, q)
+			if p.name == "cbo" {
+				baseIds, baseDists = ids, dists
+				continue
+			}
+			require.Equal(t, baseIds, ids, "cond %d plan %s: rows diverged", ci, p.name)
+			require.Equal(t, baseDists, dists, "cond %d plan %s: distances diverged", ci, p.name)
+		}
+	}
+}
+
+// Under a selective filter the exact probe must return the TRUE k nearest
+// filter survivors — computed here by a brute oracle — and the CBO must route
+// the restricted shapes to it. The ANN driver (post-filter) has no such
+// guarantee; this is the recall fix, not just the perf fix.
+func TestKnnProbe_ExactUnderFilter(t *testing.T) {
+	const dim, n, k = 12, 400, 10
+	coll, vecs := knnProbeColl(t, VectorModeBTree, n, dim)
+
+	// Oracle: true k nearest among docs with a == 3 (L2).
+	q := vecs[123]
+	type oc struct {
+		id int
+		d  float64
+	}
+	var all []oc
+	for i, vc := range vecs {
+		if i%10 != 3 {
+			continue
+		}
+		var sum float64
+		for d := 0; d < dim; d++ {
+			diff := float64(vc[d]) - float64(q[d])
+			sum += diff * diff
+		}
+		all = append(all, oc{i, sum})
+	}
+	slices.SortFunc(all, func(x, y oc) int {
+		if x.d != y.d {
+			return cmp.Compare(x.d, y.d)
+		}
+		return cmp.Compare(x.id, y.id)
+	})
+	want := make([]int, k)
+	for i := range want {
+		want[i] = all[i].id
+	}
+
+	cond := knnCond(q, k, query.MustParseCondition(`{"a":3}`))
+	ids, _ := collectKnn(t, coll.Find(cond).IndexHint(IndexHint{IndexName: "a", Boost: 1 << 30}))
+	assert.Equal(t, want, ids, "probe plan must return the exact filtered k-nearest")
+	assert.Len(t, ids, k, "probe plan must fill k when enough docs pass the filter")
+
+	ex, err := coll.Find(cond).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, ex.Plan+ex.Sql, "KnnProbe", "selective filter must route to the probe plan")
+
+	broad, err := coll.Find(knnCond(q, k, nil)).Explain(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, broad.Plan+broad.Sql, "KnnSearch", "unrestricted $knn must keep the ANN driver")
+}
+
+// A probe plan must honor _distance residual predicates and _distance sorts
+// exactly like the driver (brute backend: bit-exact).
+func TestKnnProbe_DistanceResidualAndSort(t *testing.T) {
+	const dim, n, k = 12, 200, 12
+	coll, vecs := knnProbeColl(t, VectorModeBruteForce, n, dim)
+
+	restriction := idInFilter(1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53)
+	base := knnCond(vecs[13], k, restriction)
+
+	var driverIds, probeIds []int
+	for _, p := range []string{"emb", "id"} {
+		q := coll.Find(base).IndexHint(IndexHint{IndexName: p, Boost: 1 << 30}).Sort("-_distance")
+		ids, dists := collectKnn(t, q)
+		for i := 1; i < len(dists); i++ {
+			assert.GreaterOrEqual(t, dists[i-1], dists[i], "descending distance order")
+		}
+		if p == "emb" {
+			driverIds = ids
+		} else {
+			probeIds = ids
+		}
+	}
+	assert.Equal(t, driverIds, probeIds, "sorted-by-distance rows must match across plans")
+}
+
+// Bounded writes select the same rows under either plan form.
+func TestKnnProbe_DeleteMatchesIterSelection(t *testing.T) {
+	const dim, n, k = 12, 200, 5
+	coll, vecs := knnProbeColl(t, VectorModeBruteForce, n, dim)
+
+	restriction := idInFilter(0, 10, 20, 30, 40, 50, 60, 70, 80, 90)
+	cond := knnCond(vecs[30], k, restriction)
+	expect, _ := collectKnn(t, coll.Find(cond))
+	require.Len(t, expect, k)
+
+	res, err := coll.Find(cond).IndexHint(IndexHint{IndexName: "id", Boost: 1 << 30}).Delete(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, k, res.Modified)
+	for _, id := range expect {
+		_, gerr := coll.FindId(ctx, id)
+		assert.ErrorIs(t, gerr, ErrDocNotFound, "doc %d must be deleted", id)
 	}
 }
