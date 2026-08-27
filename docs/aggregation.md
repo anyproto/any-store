@@ -97,6 +97,8 @@ Inside `$project`/`$addFields` values, `$group` keys and accumulator arguments:
 | `$replaceOne` | `{"$replaceOne": {"input": e, "find": e, "replacement": e}}` | Replaces the **first** occurrence of `find` in `input`; no occurrence leaves `input` unchanged. All three required (object form only). An empty `find` matches at position 0 and prepends the replacement. Null/missing operands → `null` (as in Mongo); a non-string operand → `null` too (Mongo errors; regex `find` is not supported). |
 | `$replaceAll` | `{"$replaceAll": {"input": e, "find": e, "replacement": e}}` | Replaces **every** occurrence of `find`, left to right, non-overlapping; replaced regions are not rescanned. Same contract as `$replaceOne` otherwise; an empty `find` prepends the replacement **once** (pinned; Mongo docs leave the case unstated). |
 | `$split` | `{"$split": [string, delimiter]}` | Array of the substrings between delimiter occurrences: adjacent delimiters produce empty strings, no occurrence yields `[input]`. Exactly two operands; the delimiter must be a non-empty string — an empty **literal** delimiter is a parse error, a delimiter expression evaluating to `""` → `null` (Mongo errors at runtime; regex delimiters are not supported). |
+| `$size` | `{"$size": e}` | Number of elements in the array operand. A null/missing or non-array operand → `null` (Mongo errors). `{"$size": {"$split": ["$notes", "\n"]}}` counts lines. |
+| `$strLenBytes`, `$strLenCP` | `{"$strLenCP": e}` | Length of the string operand in UTF-8 bytes (`$strLenBytes`) or code points (`$strLenCP`). A `$strLenCP` operand that is not valid UTF-8 → `null` (Mongo errors); `$strLenBytes` counts bytes verbatim, valid or not. |
 | `$trim`, `$ltrim`, `$rtrim` | `{"$trim": {"input": e, "chars"?: e}}` | Strips leading and trailing (`$ltrim`/`$rtrim`: one side) **code points** — UTF-8 aware, never mid-rune. Without `chars`: exactly Mongo's documented whitespace set (U+0000, U+0009–U+000D, U+0020, U+00A0, U+1680, U+2000–U+200A — not full Unicode `White_Space`). With `chars`: the set of code points in that string; `chars: ""` trims nothing (pinned; Mongo docs leave the case unstated). |
 | `$cond` | `{"$cond": [if, then, else]}` or `{"$cond": {"if": e, "then": e, "else": e}}` | All three parts required. Lazy: only the taken branch is evaluated. Truthiness is Mongo's: `false`, `0`, `null`, missing → false; everything else — including `""`, `[]`, `{}` — true. |
 | `$switch` | `{"$switch": {"branches": [{"case": e, "then": e}, ...], "default": e?}}` | At least one branch; cases evaluate lazily in order, first truthy case wins; no match falls to `default`. |
@@ -128,13 +130,17 @@ A single non-array operand is Mongo's shorthand for a one-element list
 > streaming with no per-document error channel, so conditions Mongo reports as
 > query errors yield `null` instead — a non-numeric operand of an arithmetic
 > operator, a non-string operand of a string operator (`$concat`,
-> `$replaceOne`/`$replaceAll`, `$split`, `$trim`/`$ltrim`/`$rtrim` — including
+> `$replaceOne`/`$replaceAll`, `$split`, `$strLenBytes`/`$strLenCP`,
+> `$trim`/`$ltrim`/`$rtrim` — including
 > a `$trim` `chars` and a `$split` delimiter expression, where an empty-string
-> delimiter counts too), division by
+> delimiter counts too), a non-array `$size` operand, a `$strLenCP` operand
+> that is not valid UTF-8, division by
 > zero, a non-finite
 > result (overflow, NaN), an out-of-range or non-integer `$round` place, and a
 > `$switch` with no matching case and no `default` (Mongo raises). Null and
-> missing operands also yield `null` (as in Mongo).
+> missing operands also yield `null` — as in Mongo, except for `$size` and
+> `$strLenBytes`/`$strLenCP`, where Mongo errors for null/missing operands
+> too.
 >
 > `$round` precision is float64: values round by their binary double value
 > (`{"$round": [2.345, 2]}` is `2.35` — the stored double sits above the

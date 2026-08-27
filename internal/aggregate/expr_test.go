@@ -731,6 +731,86 @@ func TestSplitExprEval(t *testing.T) {
 	})
 }
 
+func TestStrLenExprEval(t *testing.T) {
+	doc := anyenc.MustParseJson(`{"s": "abc", "multi": "héllo", "empty": "", "n": 5,
+		"arr": ["a"], "nul": null}`)
+	num := func(t *testing.T, exprJson string) float64 {
+		v := evalExprOn(t, exprJson, doc)
+		require.Equal(t, anyenc.TypeNumber, v.Type(), exprJson)
+		return v.GetFloat64()
+	}
+	null := func(t *testing.T, exprJson string) {
+		v := evalExprOn(t, exprJson, doc)
+		require.NotNil(t, v, exprJson)
+		assert.Equal(t, anyenc.TypeNull, v.Type(), exprJson)
+	}
+
+	t.Run("ascii: bytes and code points agree", func(t *testing.T) {
+		assert.Equal(t, float64(3), num(t, `{"$strLenBytes": "$s"}`))
+		assert.Equal(t, float64(3), num(t, `{"$strLenCP": "$s"}`))
+		assert.Equal(t, float64(0), num(t, `{"$strLenBytes": "$empty"}`))
+		assert.Equal(t, float64(0), num(t, `{"$strLenCP": "$empty"}`))
+	})
+	t.Run("multibyte: bytes and code points differ", func(t *testing.T) {
+		assert.Equal(t, float64(6), num(t, `{"$strLenBytes": "$multi"}`))
+		assert.Equal(t, float64(5), num(t, `{"$strLenCP": "$multi"}`))
+	})
+	t.Run("null, missing, non-string", func(t *testing.T) {
+		for _, op := range []string{"$strLenBytes", "$strLenCP"} {
+			null(t, `{"`+op+`": "$nul"}`)
+			null(t, `{"`+op+`": "$nope"}`)
+			null(t, `{"`+op+`": "$n"}`)
+			null(t, `{"`+op+`": "$arr"}`)
+		}
+	})
+	t.Run("nests with other operators", func(t *testing.T) {
+		assert.Equal(t, float64(7), num(t, `{"$strLenCP": {"$concat": ["$s", "-", "$s"]}}`))
+	})
+	t.Run("invalid UTF-8: $strLenCP is null, $strLenBytes counts bytes", func(t *testing.T) {
+		// Not representable in JSON: build the doc with raw string bytes.
+		a := &anyenc.Arena{}
+		bad := a.NewObject()
+		bad.Set("bad", a.NewStringBytes([]byte{0xff, 0xfe, 'a'}))
+		v := evalExprOn(t, `{"$strLenCP": "$bad"}`, bad)
+		require.NotNil(t, v)
+		assert.Equal(t, anyenc.TypeNull, v.Type())
+		v = evalExprOn(t, `{"$strLenBytes": "$bad"}`, bad)
+		require.Equal(t, anyenc.TypeNumber, v.Type())
+		assert.Equal(t, float64(3), v.GetFloat64())
+	})
+}
+
+func TestSizeExprEval(t *testing.T) {
+	doc := anyenc.MustParseJson(`{"tags": ["a", "b", "c"], "empty": [],
+		"nested": [[1, 2], [3]], "notes": "l1\nl2\nl3", "s": "abc", "n": 5, "nul": null}`)
+	num := func(t *testing.T, exprJson string) float64 {
+		v := evalExprOn(t, exprJson, doc)
+		require.Equal(t, anyenc.TypeNumber, v.Type(), exprJson)
+		return v.GetFloat64()
+	}
+	null := func(t *testing.T, exprJson string) {
+		v := evalExprOn(t, exprJson, doc)
+		require.NotNil(t, v, exprJson)
+		assert.Equal(t, anyenc.TypeNull, v.Type(), exprJson)
+	}
+
+	t.Run("array operand", func(t *testing.T) {
+		assert.Equal(t, float64(3), num(t, `{"$size": "$tags"}`))
+		assert.Equal(t, float64(0), num(t, `{"$size": "$empty"}`))
+		assert.Equal(t, float64(2), num(t, `{"$size": "$nested"}`))
+		assert.Equal(t, float64(2), num(t, `{"$size": [["x", "y"]]}`))
+	})
+	t.Run("null, missing, non-array", func(t *testing.T) {
+		null(t, `{"$size": "$nul"}`)
+		null(t, `{"$size": "$nope"}`)
+		null(t, `{"$size": "$s"}`)
+		null(t, `{"$size": "$n"}`)
+	})
+	t.Run("line count: size of split", func(t *testing.T) {
+		assert.Equal(t, float64(3), num(t, `{"$size": {"$split": ["$notes", "\n"]}}`))
+	})
+}
+
 func TestTrimExprEval(t *testing.T) {
 	doc := anyenc.MustParseJson(`{"pad": "  héllo  ",
 		"ws": "\u0000\t\n\u000b\f\r \u00a0\u1680\u2000\u2005\u200ax y\u200a\u00a0\r\n ",
@@ -1114,6 +1194,10 @@ func TestExprEvalAllocFree(t *testing.T) {
 		{"replaceAll no match", `{"$replaceAll": {"input": "$csv", "find": "zz", "replacement": "A"}}`},
 		{"split", `{"$split": ["$csv", ","]}`},
 		{"split no match", `{"$split": ["$csv", ";"]}`},
+		{"strLenBytes", `{"$strLenBytes": "$s1"}`},
+		{"strLenCP", `{"$strLenCP": "$s1"}`},
+		{"size", `{"$size": "$arr"}`},
+		{"size of split", `{"$size": {"$split": ["$csv", ","]}}`},
 		{"trim default set", `{"$trim": {"input": "$pad"}}`},
 		{"trim chars set", `{"$trim": {"input": "$csv", "chars": "aélon"}}`},
 		{"ltrim", `{"$ltrim": {"input": "$pad"}}`},
@@ -1149,7 +1233,7 @@ func TestExprEvalAllocFree(t *testing.T) {
 			}
 			res := testing.Benchmark(func(b *testing.B) {
 				b.ReportAllocs()
-				for i := 0; i < b.N; i++ {
+				for b.Loop() {
 					a.Reset()
 					v, err := e.Eval(a, doc)
 					if err != nil || v == nil {
@@ -1170,8 +1254,7 @@ func BenchmarkArithExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"a": 3, "b": 4}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
@@ -1195,8 +1278,7 @@ func BenchmarkFieldRefEval(b *testing.B) {
 			}
 			a := &anyenc.Arena{}
 			b.ReportAllocs()
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				a.Reset()
 				if v, err := e.Eval(a, doc); err != nil || v == nil {
 					b.Fatal(v, err)
@@ -1214,8 +1296,7 @@ func BenchmarkCondExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"a": 3, "b": 4}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
@@ -1235,8 +1316,7 @@ func BenchmarkSwitchExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"a": 5}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
@@ -1253,8 +1333,7 @@ func BenchmarkDateAddExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"d": {"$date": "2026-03-28T12:00:00Z"}}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
@@ -1272,8 +1351,7 @@ func BenchmarkDateDiffExprEval(b *testing.B) {
 		`{"d": {"$date": "2026-03-28T12:00:00Z"}, "d2": {"$date": "2026-08-05T06:00:00Z"}}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
@@ -1290,8 +1368,7 @@ func BenchmarkReplaceOneExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"rel": "x://longer-prefixed-identifier-value-0123456789"}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
@@ -1309,8 +1386,7 @@ func BenchmarkReplaceAllExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"s": "one://two://three://tail-0123456789"}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
@@ -1327,8 +1403,41 @@ func BenchmarkSplitExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"csv": "alpha,beta,gamma,delta,epsilon"}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
+		a.Reset()
+		if v, err := e.Eval(a, doc); err != nil || v == nil {
+			b.Fatal(v, err)
+		}
+	}
+}
+
+// BenchmarkStrLenExprEval counts code points of a multibyte string.
+func BenchmarkStrLenExprEval(b *testing.B) {
+	e, err := ParseExpr(anyenc.MustParseJson(`{"$strLenCP": "$s"}`))
+	if err != nil {
+		b.Fatal(err)
+	}
+	doc := anyenc.MustParseJson(`{"s": "héllo → wörld → 0123456789"}`)
+	a := &anyenc.Arena{}
+	b.ReportAllocs()
+	for b.Loop() {
+		a.Reset()
+		if v, err := e.Eval(a, doc); err != nil || v == nil {
+			b.Fatal(v, err)
+		}
+	}
+}
+
+// BenchmarkSizeExprEval counts the lines of a string via $size over $split.
+func BenchmarkSizeExprEval(b *testing.B) {
+	e, err := ParseExpr(anyenc.MustParseJson(`{"$size": {"$split": ["$notes", "\n"]}}`))
+	if err != nil {
+		b.Fatal(err)
+	}
+	doc := anyenc.MustParseJson(`{"notes": "alpha\nbeta\ngamma\ndelta\nepsilon"}`)
+	a := &anyenc.Arena{}
+	b.ReportAllocs()
+	for b.Loop() {
 		a.Reset()
 		if v, err := e.Eval(a, doc); err != nil || v == nil {
 			b.Fatal(v, err)
@@ -1345,8 +1454,7 @@ func BenchmarkTrimExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"s": "\t  héllo wörld \r\n "}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)
@@ -1362,8 +1470,7 @@ func BenchmarkConcatExprEval(b *testing.B) {
 	doc := anyenc.MustParseJson(`{"s1": "héllo → w", "s2": "0123456789"}`)
 	a := &anyenc.Arena{}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		a.Reset()
 		if _, err := e.Eval(a, doc); err != nil {
 			b.Fatal(err)

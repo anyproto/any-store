@@ -266,7 +266,7 @@ func TestGroupSteadyStateAllocs(t *testing.T) {
 	}
 	res := testing.Benchmark(func(b *testing.B) {
 		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			if _, err := stage.stepOne(ctx); err != nil {
 				b.Fatal(err)
 			}
