@@ -44,7 +44,9 @@ func ftsProbeColl(t *testing.T) (*fixture, Collection) {
 
 	vocab := []string{"alpha", "beta", "gamma", "delta", "omega", "prefixone", "prefixtwo", "prefixthree"}
 	var docs []string
-	for i := 0; i < 120; i++ {
+	// 300 docs: IntDocIDs span 3 postings chunks (chunk size 128), so the
+	// prober's single-chunk point-get is exercised against multi-chunk terms.
+	for i := 0; i < 300; i++ {
 		var words []string
 		for w, word := range vocab {
 			if i%(w+2) == 0 {
@@ -109,9 +111,14 @@ func ftsProbeQueries() []map[string]any {
 		text("$search", "uniq17"),
 		text("$search", "alpha beta gamma"),
 		text("$search", `"alpha beta"`),
+		text("$search", `"alpha"`), // quoted SINGLE token: driver routes to scanTerm
 		text("$search", "prefix*"),
+		text("$search", "alpha prefixon*"), // expansion overlapping a plain-term family
 		text("$search", "alpha", "$exclude", "beta"),
+		text("$search", "alpha", "$exclude", "prefix*"), // negated prefix
+		text("$search", "alpha", "$exclude", `"beta gamma"`),
 		text("$search", "alpha", "$require", "gamma"),
+		text("$search", "alpha", "$require", "nosuchterm"), // dead required clause: zero rows
 		text("$search", "alpha beta", "$defaultOperator", "and"),
 		text("$search", "alpha alpha beta"), // repeated term dedup
 		text("$search", "nosuchterm"),
@@ -284,6 +291,87 @@ func TestFtsProbe_PlanChoice(t *testing.T) {
 
 	eqA := map[string]any{"$text": map[string]any{"$search": "alpha"}, "a": 3}
 	assert.Contains(t, explain(eqA, 10), "FtsProbe", "selective index equality must probe")
+}
+
+// Weighted (BM25F) parity: per-field weights change the scored tf, a
+// zero-weight field contributes tf 0 yet still counts as presence for
+// matching, required bits, and exclusion — the prober must reproduce all of
+// it bit-exactly (a quoted single token routes through scanTerm, not the
+// phrase path). Non-default K1/B pin ftsResolveBM25 parity.
+func TestFtsProbe_WeightedDifferential(t *testing.T) {
+	fx := newFixture(t)
+	defer fx.finish()
+	coll, err := fx.CreateCollection(ctx, "wprobe")
+	require.NoError(t, err)
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{
+		Name: "ft", Kind: IndexKindFulltext, Fields: []string{"title", "body"},
+		Fulltext: &FulltextParams{Weights: map[string]float64{"title": 3, "body": 0}, K1: 1.6, B: 0.6},
+	}))
+	require.NoError(t, coll.EnsureIndex(ctx, IndexInfo{Name: "a", Fields: []string{"a"}}))
+	var docs []string
+	for i := 0; i < 150; i++ {
+		title, body := "doc", "pad filler"
+		if i%2 == 0 {
+			title = "alpha common"
+		}
+		if i%3 == 0 {
+			body = "beta only in body" // zero-weight field: presence without score
+		}
+		if i%5 == 0 {
+			title = "alpha beta adjacent"
+		}
+		docs = append(docs, fmt.Sprintf(`{"id":"w%03d","a":%d,"title":%q,"body":%q}`, i, i%10, title, body))
+	}
+	insertJSON(t, coll, docs...)
+
+	conds := []map[string]any{
+		{"$text": map[string]any{"$search": "beta"}},
+		{"$text": map[string]any{"$search": `"alpha"`}},
+		{"$text": map[string]any{"$search": "alpha", "$exclude": "beta"}},
+		{"$text": map[string]any{"$search": "alpha", "$require": "beta"}},
+		{"$text": map[string]any{"$search": `"alpha beta"`}},
+		{"$text": map[string]any{"$search": "alpha beta", "$defaultOperator": "and"}},
+	}
+	restrictions := []map[string]any{
+		{"a": 3},
+		{"id": map[string]any{"$in": func() []any {
+			var out []any
+			for i := 0; i < 40; i++ {
+				out = append(out, fmt.Sprintf("w%03d", i*3))
+			}
+			return out
+		}()}},
+	}
+	for _, c := range conds {
+		for _, r := range restrictions {
+			cond := map[string]any{}
+			for k, v := range c {
+				cond[k] = v
+			}
+			for k, v := range r {
+				cond[k] = v
+			}
+			assertSamePlanResults(t, coll, cond, 0, 0, nil)
+			assertSamePlanResults(t, coll, cond, 5, 0, nil)
+		}
+	}
+}
+
+// >64 required clauses exhaust the 64-bit mask; the tail degrades to ungated
+// OR identically on both sides.
+func TestFtsProbe_RequiredBitExhaustion(t *testing.T) {
+	fx, coll := ftsProbeColl(t)
+	defer fx.finish()
+	req := make([]any, 0, 70)
+	req = append(req, "alpha", "gamma")
+	for i := 0; i < 68; i++ {
+		req = append(req, fmt.Sprintf("filler%d", i)) // df==0 fillers
+	}
+	cond := map[string]any{
+		"$text": map[string]any{"$search": "", "$require": req},
+		"id":    map[string]any{"$in": manyIds(40)},
+	}
+	assertSamePlanResults(t, coll, cond, 0, 0, nil)
 }
 
 // Logical-work guard: a Count whose residual is covered by the probe driver

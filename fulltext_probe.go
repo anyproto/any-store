@@ -140,17 +140,30 @@ func (fx *ftsIndex) newFtsProber(tx *btree.ReadTx, text query.Text) (*ftsProber,
 			pg.dead = len(pg.terms) == 0
 			return pg, nil
 		}
-		pg.phrase = true
+		// Mirror scoreGroup's dispatch exactly: only a MULTI-token group is a
+		// phrase; a quoted clause that analyzes to one token is scored by the
+		// driver as a plain scanTerm (weighted TF), so the prober must route
+		// it through the per-term path too.
+		pg.phrase = len(g.terms) > 1
 		for _, t := range g.terms {
 			pt, terr := termOf(t, 0)
 			if terr != nil {
 				return pg, terr
 			}
-			if pt.df == 0 {
+			if pt.df == 0 && pg.phrase {
 				pg.dead = true // driver's scorePhrase: any absent term → no matches
 			}
 			pg.idfSum += pt.idf
 			pg.terms = append(pg.terms, pt)
+		}
+		if !pg.phrase {
+			dead := true
+			for _, pt := range pg.terms {
+				if pt.df > 0 {
+					dead = false
+				}
+			}
+			pg.dead = dead
 		}
 		return pg, nil
 	}
@@ -175,22 +188,24 @@ func (fx *ftsIndex) newFtsProber(tx *btree.ReadTx, text query.Text) (*ftsProber,
 }
 
 // termTF returns the term's frequency in document intId (the weighted
-// pseudo-frequency under BM25F, matching scanTerm's weighted branch), or 0 when
-// the document does not contain the term. Positions, when dst is non-nil, are
-// decoded into *dst for phrase adjacency.
-func (p *ftsProber) termTF(term string, intId uint64, dst *[]uint32) (float64, error) {
+// pseudo-frequency under BM25F, matching scanTerm's weighted branch) and
+// whether a posting for the document EXISTS. found is the driver's semantic
+// trigger: scanTerm scores/tombstones/sets required bits for every posting it
+// visits regardless of the computed tf (a zero-weight field yields tf == 0
+// with found == true), so callers must gate on found, never on tf > 0.
+// Positions, when dst is non-nil, are decoded into *dst for phrase adjacency.
+func (p *ftsProber) termTF(term string, intId uint64, dst *[]uint32) (tf float64, found bool, err error) {
 	p.keyBuf = postingsKey(p.keyBuf, term, fts.ChunkID(intId))
-	var err error
 	p.valBuf, err = p.tx.AppendValue(p.fx.nsPost, p.keyBuf, p.valBuf[:0])
 	if err != nil {
 		if errors.Is(err, btree.ErrKeyNotFound) {
-			return 0, nil
+			return 0, false, nil
 		}
-		return 0, err
+		return 0, false, err
 	}
-	it, err := p.e.chunkReader(p.valBuf)
-	if err != nil {
-		return 0, ftsMapFormatErr(err)
+	it, rerr := p.e.chunkReader(p.valBuf)
+	if rerr != nil {
+		return 0, false, ftsMapFormatErr(rerr)
 	}
 	for it.Next() {
 		docID := it.DocID()
@@ -200,7 +215,6 @@ func (p *ftsProber) termTF(term string, intId uint64, dst *[]uint32) (float64, e
 		if docID != intId {
 			continue
 		}
-		var tf float64
 		if p.e.weighted {
 			for f := 0; f < p.e.nFields; f++ {
 				if w := p.e.weights[f]; w != 0 {
@@ -216,11 +230,11 @@ func (p *ftsProber) termTF(term string, intId uint64, dst *[]uint32) (float64, e
 			*dst = it.AppendPositions((*dst)[:0])
 		}
 		if it.Err() != nil {
-			return 0, it.Err()
+			return 0, false, it.Err()
 		}
-		return tf, nil
+		return tf, true, nil
 	}
-	return 0, it.Err()
+	return 0, false, it.Err()
 }
 
 // phrasePresent reports the phrase's adjacency-confirmed occurrence count in
@@ -231,11 +245,13 @@ func (p *ftsProber) phraseCount(g *probeGroup, intId uint64) (uint32, error) {
 	}
 	lists := p.posBufB[:0]
 	for i, t := range g.terms {
-		tf, err := p.termTF(t.term, intId, &p.posBufs[i])
+		_, found, err := p.termTF(t.term, intId, &p.posBufs[i])
 		if err != nil {
 			return 0, err
 		}
-		if tf == 0 {
+		// Presence, not tf: the driver's scorePhrase matches on positions
+		// alone and never consults the (possibly zero-weighted) tf.
+		if !found {
 			p.posBufB = lists
 			return 0, nil
 		}
@@ -294,11 +310,13 @@ func (p *ftsProber) Probe(docId []byte) (score float64, intId uint64, ok bool, e
 		if pt.df == 0 {
 			continue
 		}
-		tf, terr := p.termTF(pt.term, intId, nil)
+		tf, hit, terr := p.termTF(pt.term, intId, nil)
 		if terr != nil {
 			return 0, 0, false, terr
 		}
-		if tf > 0 {
+		if hit {
+			// Presence-gated like scanTerm: a zero-weight-field posting still
+			// enters the doc (score += 0) and sets the required bit.
 			if err = add(pt.idf, tf, pt.reqBit); err != nil {
 				return 0, 0, false, err
 			}
@@ -326,11 +344,11 @@ func (p *ftsProber) Probe(docId []byte) (score float64, intId uint64, ok bool, e
 			if pt.df == 0 {
 				continue
 			}
-			tf, terr := p.termTF(pt.term, intId, nil)
+			tf, hit, terr := p.termTF(pt.term, intId, nil)
 			if terr != nil {
 				return 0, 0, false, terr
 			}
-			if tf > 0 {
+			if hit {
 				if err = add(pt.idf, tf, g.reqBit); err != nil {
 					return 0, 0, false, err
 				}
@@ -362,11 +380,11 @@ func (p *ftsProber) Probe(docId []byte) (score float64, intId uint64, ok bool, e
 			if pt.df == 0 {
 				continue
 			}
-			tf, terr := p.termTF(pt.term, intId, nil)
+			_, hit, terr := p.termTF(pt.term, intId, nil)
 			if terr != nil {
 				return 0, 0, false, terr
 			}
-			if tf > 0 {
+			if hit {
 				return 0, 0, false, nil
 			}
 		}
